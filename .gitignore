@@ -1,2 +1,53 @@
-yes
-yes.pub
+# SSH keys
+id_rsa
+id_rsa.pub
+*.pub
+
+# Logs
+*.log
+*.log.gz
+trino/data/var/log/
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+*.disabled
+
+# Java files
+*.jar
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker
+.docker/
+
+# Data files
+*.csv
+*.json
+*.parquet
+fbref_data/
+
+# Airflow
+airflow/logs/
+airflow/dags/__pycache__/

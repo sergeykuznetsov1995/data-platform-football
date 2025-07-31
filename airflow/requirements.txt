@@ -1,0 +1,4 @@
+pandas
+pyarrow
+fsspec
+hdfs  # Для работы с WebHDFS если понадобится

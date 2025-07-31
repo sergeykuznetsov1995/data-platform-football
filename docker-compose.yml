@@ -1,11 +1,11 @@
-version: '3.8'
-
 services:
   # PostgreSQL для Hive Metastore
   postgres:
     image: postgres:14
     container_name: postgres
     restart: always
+    networks:
+      - data-platform
     environment:
       POSTGRES_DB: metastore
       POSTGRES_USER: hive
@@ -15,71 +15,107 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
 
-  # Hadoop HDFS NameNode
+  # HDFS NameNode
   namenode:
     image: bde2020/hadoop-namenode:2.0.0-hadoop3.2.1-java8
     container_name: namenode
     restart: always
+    networks:
+      - data-platform
     environment:
       - CLUSTER_NAME=test-cluster
       - CORE_CONF_fs_defaultFS=hdfs://namenode:9000
     ports:
-      - "9870:9870" # Web UI
-      - "9000:9000" # HDFS port
+      - "9870:9870"
+      - "9000:9000"
     volumes:
       - namenode_data:/hadoop/dfs/name
 
-  # Hadoop HDFS DataNode
+  # HDFS DataNode
   datanode:
     image: bde2020/hadoop-datanode:2.0.0-hadoop3.2.1-java8
     container_name: datanode
     restart: always
+    networks:
+      - data-platform
     environment:
       - CORE_CONF_fs_defaultFS=hdfs://namenode:9000
     depends_on:
       - namenode
     ports:
-      - "9864:9864" # Web UI
+      - "9864:9864"
     volumes:
       - datanode_data:/hadoop/dfs/data
 
+
+
+
+
+
+
   # Hive Metastore
   hive-metastore:
-    image: bde2020/hive:2.3.2-postgresql-metastore
+    image: apache/hive:3.1.3
     container_name: hive-metastore
     restart: always
+    networks:
+      - data-platform
     depends_on:
       - postgres
       - namenode
     environment:
-      HIVE_METASTORE_URI: thrift://hive-metastore:9083
-      POSTGRES_HOST: postgres
-      POSTGRES_PORT: 5432
-      POSTGRES_DB: metastore
-      POSTGRES_USER: hive
-      POSTGRES_PASSWORD: hivepassword
-      CORE_CONF_fs_defaultFS: hdfs://namenode:9000
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_DB=metastore
+      - POSTGRES_USER=hive
+      - POSTGRES_PASSWORD=hivepassword
+      - CORE_CONF_fs_defaultFS=hdfs://namenode:9000
+      - SERVICE_NAME=metastore
     ports:
       - "9083:9083"
+    command: >
+      bash -c "
+      export HIVE_HOME=/opt/hive &&
+      export PATH=\$HIVE_HOME/bin:\$PATH &&
+      schematool -dbType postgres -initSchema &&
+      hive --service metastore --hiveconf hive.metastore.uris=thrift://0.0.0.0:9083 
+      --hiveconf hive.metastore.thrift.port=9083 
+      --hiveconf hive.metastore.warehouse.dir=/user/hive/warehouse 
+      --hiveconf hive.metastore.db.type=postgres 
+      --hiveconf hive.metastore.db.url=jdbc:postgresql://postgres:5432/metastore 
+      --hiveconf hive.metastore.db.user=hive 
+      --hiveconf hive.metastore.db.password=hivepassword 
+      --hiveconf hive.metastore.db.driver=org.postgresql.Driver"
 
   # Trino
   trino:
-    image: trinodb/trino:423
+    image: trinodb/trino:400
     container_name: trino
     restart: always
+    networks:
+      - data-platform
     depends_on:
       - hive-metastore
+      - namenode
+    environment:
+      - CORE_CONF_fs_defaultFS=hdfs://namenode:9000
+      - TRINO_JVM_CONFIG="-Xmx2G -Xms2G -XX:-UseBiasedLocking -XX:+UseG1GC -XX:G1HeapRegionSize=32M -XX:+ExplicitGCInvokesConcurrent -XX:+HeapDumpOnOutOfMemoryError -XX:+ExitOnOutOfMemoryError -XX:+UseGCOverheadLimit"
     ports:
-      - "8081:8080" # Web UI на 8081 хоста
+      - "8081:8080" # Trino Web UI
+      - "8443:8443" # Trino HTTPS
     volumes:
       - ./trino/etc:/etc/trino
       - ./trino/data:/var/trino/data
+
+
 
   # Spark
   spark:
     image: bitnami/spark:3
     container_name: spark
     restart: always
+    networks:
+      - data-platform
     depends_on:
       - namenode
     environment:
@@ -88,31 +124,57 @@ services:
       - SPARK_MASTER_URL=spark://spark:7077
       - CORE_CONF_fs_defaultFS=hdfs://namenode:9000
     ports:
-      - "8080:8080" # Spark Master UI
+      - "8080:8080"
       - "7077:7077"
     volumes:
       - spark_data:/bitnami/spark
 
+  # Airflow
   airflow:
-    image: apache/airflow:2.7.0
+    build:
+      context: ./airflow
     container_name: airflow
     restart: always
+    networks:
+      - data-platform
     depends_on:
       - spark
       - hive-metastore
     environment:
-      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
-      AIRFLOW__CORE__EXECUTOR: LocalExecutor
-      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://hive:hivepassword@postgres:5432/metastore
+      - AIRFLOW__CORE__EXECUTOR=LocalExecutor
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://hive:hivepassword@postgres:5432/metastore
+      - DOCKER_HOST=unix:///var/run/docker.sock
+      - AIRFLOW__CORE__DAG_DIR_LIST_INTERVAL=5
     ports:
       - "8082:8080"
     volumes:
       - ./airflow/dags:/opt/airflow/dags
-    command: webserver
+      - ./fbref_data:/opt/airflow/fbref_data
+      - /var/run/docker.sock:/var/run/docker.sock
+    command: >
+      bash -c "airflow db upgrade && airflow scheduler & airflow webserver"
 
+
+  # fbref-parser
+  fbref-parser:
+    build:
+      context: ./fbref_parser
+    container_name: fbref-parser
+    restart: always
+    networks:
+      - data-platform
+    depends_on:
+      - namenode
+    environment:
+      - HDFS_NAMENODE=namenode
+      - HDFS_PORT=9000
 
 volumes:
   postgres_data:
   namenode_data:
   datanode_data:
   spark_data:
+
+networks:
+  data-platform:
+    driver: bridge

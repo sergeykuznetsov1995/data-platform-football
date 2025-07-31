@@ -1,0 +1,7 @@
+pandas
+pyarrow
+snakebite-py3
+requests
+lxml
+beautifulsoup4
+hdfs
