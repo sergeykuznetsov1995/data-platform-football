@@ -67,11 +67,46 @@
   - Схемы версионируются, проверки выполняются в пайплайне.
 
 ### Фаза 7. Ingestion источников (минимум 1–2)
-- [ ] `dags/ingest_fbref.py`: загрузка HTML/JSON → HDFS `/data/raw/fbref/...` (gzip), идемпотентность
-- [ ] `dags/ingest_whoscored.py` или `ingest_statsbomb.py`
-- [ ] Механизмы rate-limit, retries, backoff; контроль дубликатов `(source, source_id, version)`
-- Критерии готовности:
-  - Ежедневный/еженедельный запуск наполняет `raw` без дублей.
+
+FBRef — декомпозиция (первый источник, игрок William Saliba `fbref_id=972aeb2a`):
+
+- [ ] 7.1 Контракты и модель данных
+  - [x] Определить целевые наборы: `silver_fbref_player_profile`, `silver_fbref_player_season_stats`
+  - [x] Черновые JSON Schema для обоих наборов (`schemas/fbref_*.schema.json`)
+  - [ ] Согласовать ключи: `(fbref_id, season, comp_name, squad)` и тех. поля `ingest_date`, `source_url`
+
+- [ ] 7.2 Извлечение и парсинг
+  - [ ] Исследование страницы и селекторов: IDs таблиц `all_stats_standard|shooting|passing|pass_types|gca|defense|possession|playing_time|misc`
+  - [ ] Реализовать парсер FBRef (секции → унифицированная wide-строка на (season, comp, squad))
+  - [ ] Нормализовать единицы измерения, очистка названий турниров (например, `1. Premier League` → `Premier League`)
+  - [ ] Идемпотентность, детерминированный output для одного `ingest_date`
+
+- [ ] 7.3 Хранилище RAW
+  - [ ] Сохранять сырые HTML снапшоты страницы (gzip) в `hdfs://.../data/raw/fbref/player=972aeb2a/ingest_date=YYYY-MM-DD/*.html.gz`
+  - [ ] Логгировать `source_url`, `retrieved_at`, `http_status`
+
+- [ ] 7.4 Серебряный слой (silver)
+  - [ ] Запись в Parquet: `hdfs://.../data/silver/fbref/player_season_stats/season=YYYY-YYYY/comp=.../*.parquet`
+  - [ ] Валидация против JSON Schema (`tools/validate_schema.py`)
+
+- [ ] 7.5 Оркестрация
+  - [ ] DAG `ingest_fbref.py` (schedule: weekly), retries + backoff, rate-limit
+  - [ ] Datasets/trigger на downstream ETL
+
+- [ ] 7.6 Дедупликация и версии
+  - [ ] Контроль дублей по `(fbref_id, season, comp_name, squad, data_version)`
+  - [ ] Хранить `ingest_date` в путях RAW, `data_version` в silver
+
+- [ ] 7.7 Тесты и образцы
+  - [x] Образ результата (NDJSON) для William Saliba: профиль и сезонные строки
+  - [ ] Юнит-тесты парсинга селекторов и нормализации
+
+Whoscored / StatsBomb — аналогичная декомпозиция после готовности FBRef.
+
+Критерии готовности (FBRef):
+- [ ] Есть RAW HTML снапшоты
+- [ ] Есть Parquet в `silver` по сезон/турнир
+- [ ] Валидация по схемам проходит, DAG выполняется по расписанию без дублей
 
 ### Фаза 8. ETL в silver
 - [ ] `spark_jobs/parse_fbref.py`: парсинг raw → нормализация → Parquet в `silver`

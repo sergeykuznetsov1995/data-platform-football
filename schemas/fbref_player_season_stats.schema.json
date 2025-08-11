@@ -1,0 +1,24 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "fbref_player_season_stats",
+  "type": "object",
+  "properties": {
+    "source": {"type": "string", "const": "fbref"},
+    "fbref_id": {"type": "string"},
+    "season": {"type": "string"},
+    "squad": {"type": "string"},
+    "league_country": {"type": ["string", "null"]},
+    "comp_name": {"type": "string"},
+    "position": {"type": ["string", "null"]},
+    "age_season": {"type": ["number", "null"]},
+    "minutes": {"type": ["integer", "null"]},
+    "games_played": {"type": ["integer", "null"]},
+    "games_starts": {"type": ["integer", "null"]},
+    "minutes_per_90s": {"type": ["number", "null"]},
+    "ingest_date": {"type": "string", "format": "date"},
+    "ingest_ts": {"type": "string", "format": "date-time"},
+    "source_url": {"type": "string"}
+  },
+  "required": ["source", "fbref_id", "season", "comp_name", "squad", "ingest_date", "ingest_ts", "source_url"],
+  "additionalProperties": true
+}

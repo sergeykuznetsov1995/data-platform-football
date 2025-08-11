@@ -1,0 +1,25 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "fbref_player_profile",
+  "type": "object",
+  "properties": {
+    "source": {"type": "string", "const": "fbref"},
+    "fbref_id": {"type": "string"},
+    "player_slug": {"type": "string"},
+    "full_name": {"type": "string"},
+    "known_as": {"type": ["string", "null"]},
+    "birth_date": {"type": ["string", "null"], "format": "date"},
+    "age": {"type": ["integer", "null"]},
+    "nationalities": {"type": "array", "items": {"type": "string"}},
+    "height_cm": {"type": ["integer", "null"]},
+    "weight_kg": {"type": ["integer", "null"]},
+    "foot": {"type": ["string", "null"]},
+    "positions": {"type": "array", "items": {"type": "string"}},
+    "current_club": {"type": ["string", "null"]},
+    "shirt_number": {"type": ["integer", "null"]},
+    "source_url": {"type": "string"},
+    "ingest_ts": {"type": "string", "format": "date-time"}
+  },
+  "required": ["source", "fbref_id", "player_slug", "full_name", "source_url", "ingest_ts"],
+  "additionalProperties": true
+}
