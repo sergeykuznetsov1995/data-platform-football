@@ -14,54 +14,54 @@
 ## Дорожная карта (фазы)
 
 ### Фаза 0. Подготовка репозитория и окружения
-- [ ] Создать каркас репо:
-  - [ ] `dags/`, `spark_jobs/`, `schemas/`, `sql/gold/`, `infra/` (compose, конфиги), `docs/`
-  - [ ] `Makefile` или `invoke` задачи для локального запуска
-  - [ ] `.env`, `.gitignore`, базовые линтеры/CI
-- [ ] Определить тома/пути: `/data/hdfs`, `/data/metastore-db`, `/opt/airflow/dags`, `/opt/airflow/logs`
-- [ ] Описать версии образов в compose (пиновать теги)
+- [x] Создать каркас репо:
+  - [x] `dags/`, `spark_jobs/`, `schemas/`, `sql/gold/`, `infra/` (compose, конфиги), `docs/`
+  - [x] `Makefile` или `invoke` задачи для локального запуска
+  - [x] `.env`, `.gitignore`, базовые линтеры/CI
+- [x] Определить тома/пути: `/data/hdfs`, `/data/metastore-db`, `/opt/airflow/dags`, `/opt/airflow/logs`
+- [x] Описать версии образов в compose (пиновать теги)
 - Критерии готовности:
   - Репозиторий собирается, базовые команды выполняются (`make up`, `make down`).
 
 ### Фаза 1. Хранилище: HDFS
-- [ ] Добавить сервисы `hdfs-namenode`, `hdfs-datanode` в `docker-compose.yml`
-- [ ] Пробросить тома `/data/hdfs`
-- [ ] Протестировать создание директорий `raw/silver/gold` в HDFS
+- [x] Добавить сервисы `hdfs-namenode`, `hdfs-datanode` в `docker-compose.yml`
+- [x] Пробросить тома `/data/hdfs`
+- [x] Протестировать создание директорий `raw/silver/gold` в HDFS
 - Критерии готовности:
   - Команда HDFS работает, слои доступны, права настроены.
 
 ### Фаза 2. Hive Metastore + БД метаданных
-- [ ] Сервис `metastore-db` (PostgreSQL/MySQL) с томом `/data/metastore-db`
-- [ ] Сервис `hive-metastore` и инициализация схемы
+- [x] Сервис `metastore-db` (PostgreSQL/MySQL) с томом `/data/metastore-db`
+- [x] Сервис `hive-metastore` и инициализация схемы
 - [ ] Проверить регистрацию тестовой таблицы в Metastore
 - Критерии готовности:
   - Таблицы создаются и видны из Metastore/Trino/Spark.
 
 ### Фаза 3. Trino (SQL/BI)
-- [ ] Сервис `trino` с `hive` коннектором на метастор
+- [x] Сервис `trino` с `hive` коннектором на метастор
 - [ ] Каталоги: доступ к `silver`/`gold`, `raw` только read-only
 - [ ] Smoke-тест: запрос к тестовой таблице
 - Критерии готовности:
   - Подключение из CLI/BI-клиента, базовые запросы выполняются.
 
 ### Фаза 4. Spark (ETL/ML)
-- [ ] Сервисы `spark-master`/`spark-worker` или образ для `spark-submit`
-- [ ] Конфиг Spark (`spark.sql.shuffle.partitions`, логирование)
+- [x] Сервисы `spark-master`/`spark-worker` или образ для `spark-submit`
+- [x] Конфиг Spark (`spark.sql.shuffle.partitions`, логирование)
 - [ ] Smoke-тест: job читает `raw`, пишет в `silver` Parquet
 - Критерии готовности:
   - Успешный запуск тестового Spark job, данные в `silver` видны в Trino.
 
 ### Фаза 5. Airflow (оркестрация)
-- [ ] `airflow-web`, `airflow-scheduler` (LocalExecutor)
-- [ ] Тома: `/opt/airflow/dags`, `/opt/airflow/logs`
+- [x] `airflow-web`, `airflow-scheduler` (LocalExecutor)
+- [x] Тома: `/opt/airflow/dags`, `/opt/airflow/logs`
 - [ ] Конфиг переменных окружения/коннекшенов (секреты через env/Docker secrets)
 - [ ] Базовые DAGи-шаблоны
 - Критерии готовности:
   - UI доступен, DAGи загружаются и запускаются по расписанию/вручную.
 
 ### Фаза 6. Схемы и стандарты
-- [ ] Каталог `schemas/*.json` для raw/silver/gold (JSON Schema/Avro)
-- [ ] Конвенции именования таблиц/полей; единицы измерения, timezone UTC
+- [x] Каталог `schemas/*.json` для raw/silver/gold (JSON Schema/Avro)
+- [x] Конвенции именования таблиц/полей; единицы измерения, timezone UTC
 - [ ] Реализация валидаторов схем в ETL
 - Критерии готовности:
   - Схемы версионируются, проверки выполняются в пайплайне.

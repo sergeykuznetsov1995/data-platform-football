@@ -1,0 +1,16 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "dim_player",
+  "type": "object",
+  "properties": {
+    "player_id": {"type": "integer"},
+    "full_name_canon": {"type": "string"},
+    "birth_date": {"type": "string", "format": "date"},
+    "country_code": {"type": "string"},
+    "height_cm": {"type": ["integer", "null"]},
+    "foot": {"type": ["string", "null"]},
+    "snapshot_date": {"type": "string", "format": "date"}
+  },
+  "required": ["player_id", "full_name_canon", "birth_date", "country_code", "snapshot_date"],
+  "additionalProperties": true
+}

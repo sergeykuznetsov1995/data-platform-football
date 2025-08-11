@@ -1,0 +1,17 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "fact_match",
+  "type": "object",
+  "properties": {
+    "match_id": {"type": "integer"},
+    "season": {"type": "string"},
+    "league": {"type": "string"},
+    "match_date": {"type": "string", "format": "date"},
+    "home_team_id": {"type": "integer"},
+    "away_team_id": {"type": "integer"},
+    "home_goals": {"type": "integer"},
+    "away_goals": {"type": "integer"}
+  },
+  "required": ["match_id", "season", "league", "match_date", "home_team_id", "away_team_id"],
+  "additionalProperties": true
+}
