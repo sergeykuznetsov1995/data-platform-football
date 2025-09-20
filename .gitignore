@@ -161,6 +161,8 @@ cython_debug/
 # IDE settings
 .vscode/
 .kiro/
+.claude/
+.playwright-mcp/
 
 # Project documentation (internal)
 CLAUDE.md
