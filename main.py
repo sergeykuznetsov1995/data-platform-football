@@ -117,41 +117,59 @@ def clean_final_dataframe(df):
         'Squad': 'squad',
         'Country': 'country',
         'Comp': 'competition',
-        'MP': 'matches_played',
-        'Playing Time_Starts': 'starts',
-        'Playing Time_Min': 'minutes',
-        'Playing Time_90s': 'minutes_90'
     }
     df = df.rename(columns=basic_renames)
 
-    # 3. Удаляем дублирующиеся Playing Time столбцы
-    print("   Удаляю дублирующиеся Playing Time столбцы...")
-    duplicate_pt_cols = [col for col in df.columns if col in [
-        'Playing Time_Min_playing_time', 'Playing Time_90s_playing_time'
-    ]]
-    df = df.drop(columns=duplicate_pt_cols)
-
-    # 4. Переименовываем остальные Playing Time столбцы
+    # 3. Переименовываем остальные Playing Time столбцы
     print("   Переименовываю Playing Time столбцы...")
     pt_renames = {
+        # Базовые Playing Time столбцы (теперь приходят из playing_time таблицы с префиксом)
+        'MP_playing_time': 'matches_played',
+        'Playing Time_MP_playing_time': 'matches_played',
+        'Starts_playing_time': 'starts',
+        'Playing Time_Starts_playing_time': 'starts',
+        'Min_playing_time': 'minutes',
+        'Playing Time_Min_playing_time': 'minutes',
+        '90s_playing_time': 'minutes_90',
+        'Playing Time_90s_playing_time': 'minutes_90',
+        # Остальные Playing Time столбцы
         'Playing Time_Mn/MP': 'minutes_per_match',
+        'Mn/MP_playing_time': 'minutes_per_match',
+        'Playing Time_Mn/MP_playing_time': 'minutes_per_match',
         'Playing Time_Min%_playing_time': 'minutes_pct',
+        'Min%_playing_time': 'minutes_pct',
         'Starts_Starts_playing_time': 'starts_total',
         'Starts_Mn/Start_playing_time': 'minutes_per_start',
+        'Mn/Start_playing_time': 'minutes_per_start',
         'Starts_Compl': 'matches_completed',
+        'Compl_playing_time': 'matches_completed',
+        'Starts_Compl_playing_time': 'matches_completed',
         'Subs_Subs_playing_time': 'subs_on',
+        'Subs_playing_time': 'subs_on',
         'Subs_Mn/Sub_playing_time': 'minutes_per_sub',
+        'Mn/Sub_playing_time': 'minutes_per_sub',
         'Subs_unSub_playing_time': 'subs_unused',
+        'unSub_playing_time': 'subs_unused',
         'Team Success_PPM_playing_time': 'team_points_per_match',
+        'PPM_playing_time': 'team_points_per_match',
         'Team Success_onG_playing_time': 'team_goals_for',
+        'onG_playing_time': 'team_goals_for',
         'Team Success_onGA_playing_time': 'team_goals_against',
+        'onGA_playing_time': 'team_goals_against',
         'Team Success_+/-_playing_time': 'team_goal_diff',
+        '+/-_playing_time': 'team_goal_diff',
         'Team Success_+/-90_playing_time': 'team_goal_diff_per90',
+        '+/-90_playing_time': 'team_goal_diff_per90',
         'Team Success_On-Off_playing_time': 'team_on_off',
+        'On-Off_playing_time': 'team_on_off',
         'Team Success (xG)_onxG_playing_time': 'team_xg_for',
+        'onxG_playing_time': 'team_xg_for_xg',
         'Team Success (xG)_onxGA_playing_time': 'team_xg_against',
+        'onxGA_playing_time': 'team_xg_against_xg',
         'Team Success (xG)_xG+/-_playing_time': 'team_xg_diff',
+        'xG+/-_playing_time': 'team_xg_diff',
         'Team Success (xG)_xG+/-90_playing_time': 'team_xg_diff_per90',
+        'xG+/-90_playing_time': 'team_xg_diff_per90',
         'Team Success (xG)_On-Off_playing_time': 'team_xg_on_off'
     }
 
@@ -160,7 +178,7 @@ def clean_final_dataframe(df):
     df = df.rename(columns=existing_pt_renames)
     print(f"   Переименовано {len(existing_pt_renames)} Playing Time столбцов")
 
-    # 5. Сокращаем суффиксы таблиц
+    # 4. Сокращаем суффиксы таблиц
     print("   Сокращаю суффиксы таблиц...")
     suffix_map = {
         '_shooting': '_sh',
@@ -183,7 +201,7 @@ def clean_final_dataframe(df):
 
     df.columns = new_columns
 
-    # 6. Полная конвертация в snake_case и замена специальных символов
+    # 5. Полная конвертация в snake_case и замена специальных символов
     print("   Конвертирую все названия столбцов в snake_case...")
 
     def convert_to_snake_case(column_name):
@@ -245,7 +263,7 @@ def clean_final_dataframe(df):
 
     print(f"   Конвертировано {len(df.columns)} названий столбцов в snake_case")
 
-    # 7. Очищаем значения данных
+    # 6. Очищаем значения данных
     print("   Очищаю значения данных...")
 
     # Очищаем Country (убираем префиксы типа "eng ENG" -> "ENG")
@@ -957,8 +975,30 @@ def parse_from_fbref(player_url=None, player_name=None, output_path=None, simple
                 # Исправляем проблематичные названия колонок с "Unnamed:"
                 table.columns = fix_column_names(table.columns)
 
+                # Удаляем столбцы Playing Time из других таблиц (оставляем только из playing_time)
+                if table_name != 'playing_time':
+                    # Паттерны для Playing Time столбцов в MultiIndex и обычных таблицах
+                    playing_time_patterns = [
+                        r'Playing[_ ]Time[_ ]',  # MultiIndex: "Playing Time_Starts", "Playing_Time_Starts" etc.
+                        r'^(MP|Starts|Min|90s|Mn/MP|Min%|Mn/Start|Compl)$',  # Точные совпадения
+                        r'Team_Success_',  # Team Success столбцы из Playing Time таблицы
+                        r'Subs_',  # Substitution-related columns
+                    ]
+
+                    # Ищем столбцы для удаления по паттернам
+                    cols_to_drop = []
+                    for col in table.columns:
+                        col_str = str(col)
+                        # Проверяем каждый паттерн
+                        if any(re.search(pattern, col_str, re.IGNORECASE) for pattern in playing_time_patterns):
+                            cols_to_drop.append(col)
+
+                    if cols_to_drop:
+                        table = table.drop(columns=cols_to_drop)
+                        print(f"   Удалено {len(cols_to_drop)} столбцов Playing Time из {table_name}: {cols_to_drop}")
+
                 # Добавляем префикс к колонкам (кроме ключевых)
-                key_columns = ['Season', 'Age', 'Squad', 'Country', 'Comp', 'LgRank', 'MP']
+                key_columns = ['Season', 'Age', 'Squad', 'Country', 'Comp', 'LgRank']
                 new_columns = []
 
                 for col in table.columns:
