@@ -168,7 +168,7 @@ cython_debug/
 CLAUDE.md
 
 # Data files (optional - uncomment if you don't want to track CSV files)
-# *.csv
+*.csv
 
 # OS generated files
 .DS_Store
