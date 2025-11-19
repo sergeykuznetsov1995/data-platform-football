@@ -157,11 +157,18 @@ class BaseParser(ABC):
             print(f"Объединяю с {table_name}: {table_df.shape}")
 
             if merge_keys:
-                try:
-                    merged_df = pd.merge(merged_df, table_df, on=merge_keys, how='left', suffixes=('', f'_dup_{table_name}'))
-                except Exception as e:
-                    print(f"⚠️ Ошибка при объединении {table_name}: {e}")
-                    # Try merging by index
+                # Check which merge keys are available in both tables
+                available_keys = [key for key in merge_keys if key in merged_df.columns and key in table_df.columns]
+
+                if available_keys:
+                    try:
+                        merged_df = pd.merge(merged_df, table_df, on=available_keys, how='left', suffixes=('', f'_dup_{table_name}'))
+                    except Exception as e:
+                        print(f"⚠️ Ошибка при объединении {table_name} по ключам {available_keys}: {e}")
+                        print(f"   Fallback: объединяю по индексу")
+                        merged_df = pd.concat([merged_df, table_df], axis=1)
+                else:
+                    print(f"⚠️ Нет общих ключевых колонок с {table_name}, объединяю по индексу")
                     merged_df = pd.concat([merged_df, table_df], axis=1)
             else:
                 merged_df = pd.concat([merged_df, table_df], axis=1)

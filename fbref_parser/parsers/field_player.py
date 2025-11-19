@@ -7,6 +7,7 @@ statistics from FBref.com, including support for individual players and full squ
 
 import pandas as pd
 import time
+import os
 from io import StringIO
 from typing import Dict, List, Optional
 
@@ -20,7 +21,7 @@ from ..core.table_detector import (
 )
 from ..core.column_processor import apply_field_player_renames
 from ..utils.url_helpers import extract_player_name_from_url
-from ..utils.file_helpers import get_output_path
+from ..utils.file_helpers import get_output_path, normalize_name
 from ..utils.squad_helpers import extract_field_player_links
 from ..constants import DEFAULT_OUTPUT_DIR_FIELD_PLAYERS
 
@@ -106,7 +107,7 @@ class FieldPlayerParser(BaseParser):
             expected_tables = ['standard', 'shooting', 'passing', 'pass_types', 'gca', 'defense', 'possession', 'playing_time', 'misc']
             missing_tables = [t for t in expected_tables if t not in key_tables]
 
-            if missing_tables and len(key_tables) >= 6:  # If at least 6 tables found
+            if missing_tables:  # Always try to find missing tables
                 print(f"\n⚠️ Найдено только {len(key_tables)} таблиц из {len(expected_tables)} ожидаемых")
                 print(f"Недостающие таблицы: {', '.join(missing_tables)}")
                 print("Пытаюсь найти недостающие таблицы по уникальным маркерам...")
@@ -167,9 +168,16 @@ class FieldPlayerParser(BaseParser):
                 print("Запускаю диагностику всех таблиц...")
                 analyze_all_tables(all_page_tables)
 
-            if not key_tables:
-                print("❌ Не найдено ни одной ключевой таблицы")
+            # Check if we have at least the 'standard' table (mandatory)
+            if 'standard' not in key_tables:
+                print("❌ Не найдена обязательная таблица STANDARD")
+                if not key_tables:
+                    print("   Не найдено ни одной ключевой таблицы")
                 return None
+
+            # Warn about missing tables but continue parsing
+            if final_missing:
+                print(f"⚠️ Продолжаю парсинг с {len(key_tables)} таблицами (отсутствуют: {', '.join(final_missing)})")
 
             print(f"\n🔗 Найдено {len(key_tables)} ключевых таблиц для объединения")
 
@@ -255,12 +263,27 @@ class FieldPlayerParser(BaseParser):
             player_links = player_links[:limit]
             print(f"⚠️ Ограничение: будет спаршено только {len(player_links)} игроков")
 
+        # Get list of existing files to skip already parsed players
+        existing_files = set()
+        if os.path.exists(DEFAULT_OUTPUT_DIR_FIELD_PLAYERS):
+            existing_files = set(os.listdir(DEFAULT_OUTPUT_DIR_FIELD_PLAYERS))
+
         successful_parses = 0
         failed_parses = 0
+        skipped_players = 0
 
         print(f"\n🔄 Начинаю парсинг {len(player_links)} полевых игроков...")
+        if existing_files:
+            print(f"📂 Найдено {len(existing_files)} существующих файлов - они будут пропущены")
 
         for i, (player_name, player_url) in enumerate(player_links, 1):
+            # Check if player file already exists
+            player_filename = f"{normalize_name(player_name)}.csv"
+            if player_filename in existing_files:
+                print(f"\n⏭️  Игрок {i}/{len(player_links)}: {player_name} - файл уже существует, пропускаю")
+                skipped_players += 1
+                continue
+
             print(f"\n📊 Парсинг игрока {i}/{len(player_links)}: {player_name}")
 
             try:
@@ -290,6 +313,7 @@ class FieldPlayerParser(BaseParser):
         # Final statistics
         print(f"\n🎉 Парсинг команды завершен!")
         print(f"✅ Успешно спаршено: {successful_parses} игроков")
+        print(f"⏭️  Пропущено (уже существуют): {skipped_players} игроков")
         print(f"❌ Ошибок при парсинге: {failed_parses} игроков")
         print(f"📁 Результаты сохранены в: {DEFAULT_OUTPUT_DIR_FIELD_PLAYERS}")
 

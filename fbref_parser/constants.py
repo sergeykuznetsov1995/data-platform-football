@@ -254,10 +254,48 @@ SNAKE_CASE_REPLACEMENTS = {
     'mn_per_sub': 'minutes_per_sub'
 }
 
-# Default HTTP headers for requests
+# User-Agent pool for rotation (prevents 403 errors from static UA)
+USER_AGENT_POOL = [
+    # Chrome Windows (most common)
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    # Chrome Mac
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    # Firefox Windows
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:122.0) Gecko/20100101 Firefox/122.0',
+    # Firefox Mac
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:122.0) Gecko/20100101 Firefox/122.0',
+    # Edge Windows
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0'
+]
+
+# Default HTTP headers for requests (Updated 2025-01 for FBref compatibility)
+# Enhanced headers to better mimic real browser behavior
 DEFAULT_HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+    'Accept-Language': 'en-US,en;q=0.9,ru;q=0.8',
+    'Accept-Encoding': 'gzip, deflate, br',
+    'Connection': 'keep-alive',
+    'Upgrade-Insecure-Requests': '1',
+    'Sec-Fetch-Dest': 'document',
+    'Sec-Fetch-Mode': 'navigate',
+    'Sec-Fetch-Site': 'none',
+    'Sec-Fetch-User': '?1',
+    'Sec-Ch-Ua': '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
+    'Sec-Ch-Ua-Mobile': '?0',
+    'Sec-Ch-Ua-Platform': '"Windows"',
+    'Cache-Control': 'max-age=0',
+    'DNT': '1'
 }
+
+# Rate limiting configuration (FBref allows 10 requests per minute)
+# Conservative delays for maximum safety and 24-hour ban avoidance
+MIN_REQUEST_DELAY = 6.0   # Minimum delay between requests (seconds)
+MAX_REQUEST_DELAY = 8.0   # Maximum delay between requests (seconds)
+MAX_REQUESTS_PER_MINUTE = 10  # FBref strict rate limit (Sports Reference policy)
+
+# Note: With jitter (10-20%), actual delays will be 6.6-9.6 seconds
+# This ensures we never exceed 10 requests/minute even with timing variations
 
 # Default output directory paths
 DEFAULT_OUTPUT_DIR_FIELD_PLAYERS = "/root/data_platform/test_arsenal_players"

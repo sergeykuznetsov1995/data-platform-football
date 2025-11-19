@@ -6,12 +6,11 @@ This module provides functions for extracting player links from squad pages:
 - Goalkeeper link extraction
 """
 
-import requests
 from bs4 import BeautifulSoup
 import re
 from typing import List, Tuple
 
-from ..constants import DEFAULT_HEADERS
+from ..core.scraper import FBrefScraper
 
 
 def extract_field_player_links(squad_url: str) -> List[Tuple[str, str]]:
@@ -30,8 +29,9 @@ def extract_field_player_links(squad_url: str) -> List[Tuple[str, str]]:
     print(f"🔍 Извлекаю ссылки на полевых игроков с: {squad_url}")
 
     try:
-        response = requests.get(squad_url, headers=DEFAULT_HEADERS)
-        response.raise_for_status()
+        # Use FBrefScraper with UA rotation and Cloudflare bypass
+        scraper = FBrefScraper()
+        response = scraper.fetch_page(squad_url)
 
         soup = BeautifulSoup(response.content, 'html.parser')
 
@@ -159,8 +159,9 @@ def extract_goalkeeper_links(squad_url: str) -> List[Tuple[str, str]]:
     print(f"🥅 Извлекаю ссылки на вратарей с: {squad_url}")
 
     try:
-        response = requests.get(squad_url, headers=DEFAULT_HEADERS)
-        response.raise_for_status()
+        # Use FBrefScraper with UA rotation and Cloudflare bypass
+        scraper = FBrefScraper()
+        response = scraper.fetch_page(squad_url)
 
         soup = BeautifulSoup(response.content, 'html.parser')
 

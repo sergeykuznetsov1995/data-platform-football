@@ -27,13 +27,27 @@ def identify_field_player_tables(all_page_tables: List[pd.DataFrame]) -> Dict[st
     key_tables = {}
 
     for i, table in enumerate(all_page_tables):
-        if len(table) < 10 or len(table.columns) < 10:
+        # Минимальные требования: хотя бы 3 строки и 6 колонок для статистических таблиц
+        # Снижено до минимума для поддержки молодых игроков с очень ограниченной статистикой
+        # Минимум: Season, Squad, MP, Gls, Ast, G+A = 6 колонок
+        if len(table) < 3 or len(table.columns) < 6:
             continue
 
         cols_str = str(table.columns).lower()
 
+        # ИСКЛЮЧАЕМ MATCH LOGS - таблицы с результатами отдельных матчей
+        # Match logs содержат: date, venue, opponent, result, match_report
+        is_match_log = any(marker in cols_str for marker in ['date', 'venue', 'opponent', 'result', 'match report'])
+        if is_match_log:
+            continue
+
         # Standard stats (main table)
-        if ('season' in cols_str or 'squad' in cols_str) and 'gls' in cols_str and 'ast' in cols_str:
+        # Поддержка разных вариантов названий колонок для разных лиг и уровней игроков
+        has_key_column = 'season' in cols_str or 'squad' in cols_str or 'age' in cols_str
+        has_goals = 'gls' in cols_str or 'goals' in cols_str or "'g'" in cols_str or "'goal" in cols_str
+        has_assists = 'ast' in cols_str or 'assists' in cols_str or "'a'" in cols_str
+
+        if has_key_column and has_goals and has_assists:
             if 'standard' not in key_tables:
                 key_tables['standard'] = (i, table)
                 print(f"✅ Найдена таблица STANDARD #{i}: {len(table)} строк, {len(table.columns)} колонок")
