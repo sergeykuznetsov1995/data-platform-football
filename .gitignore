@@ -183,3 +183,23 @@ Thumbs.db
 *.tmp
 *.temp
 *~
+
+# ===========================================
+# Project-specific ignores
+# ===========================================
+
+# Docker compose with secrets (use docker-compose.example.yml)
+docker-compose.yml
+
+# Parsed/scraped data
+/data/
+/test_arsenal_players/
+/test_arsenal_goalkeepers/
+*.parquet
+
+# Airflow logs (generated at runtime)
+/airflow/logs/
+
+# Hadoop data (runtime)
+/hadoop/datanode/
+/hadoop/namenode/

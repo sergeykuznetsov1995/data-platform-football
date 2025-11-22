@@ -298,8 +298,15 @@ MAX_REQUESTS_PER_MINUTE = 10  # FBref strict rate limit (Sports Reference policy
 # This ensures we never exceed 10 requests/minute even with timing variations
 
 # Default output directory paths
-DEFAULT_OUTPUT_DIR_FIELD_PLAYERS = "/root/data_platform/test_arsenal_players"
-DEFAULT_OUTPUT_DIR_GOALKEEPERS = "/root/data_platform/test_arsenal_goalkeepers"
+# Use /opt/airflow/data for Docker containers, fallback to local paths
+import os as _os
+_AIRFLOW_DATA = "/opt/airflow/data"
+if _os.path.exists(_AIRFLOW_DATA):
+    DEFAULT_OUTPUT_DIR_FIELD_PLAYERS = f"{_AIRFLOW_DATA}/field_players"
+    DEFAULT_OUTPUT_DIR_GOALKEEPERS = f"{_AIRFLOW_DATA}/goalkeepers"
+else:
+    DEFAULT_OUTPUT_DIR_FIELD_PLAYERS = "/root/data_platform/test_arsenal_players"
+    DEFAULT_OUTPUT_DIR_GOALKEEPERS = "/root/data_platform/test_arsenal_goalkeepers"
 
 # Default Arsenal squad URL
 DEFAULT_ARSENAL_SQUAD_URL = "https://fbref.com/en/squads/18bb7c10/2023-2024/Arsenal-Stats"

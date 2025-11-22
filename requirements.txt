@@ -1,0 +1,13 @@
+cloudscraper>=1.2.71
+tenacity>=8.0.0
+beautifulsoup4>=4.12.0
+pandas>=2.0.0
+lxml>=4.9.0
+
+# HDFS and Parquet support
+pyarrow>=14.0.0
+hdfs>=2.7.0
+requests>=2.31.0
+
+# Trino client
+trino>=0.328.0

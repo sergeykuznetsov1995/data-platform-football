@@ -16,7 +16,7 @@ from ..core.table_detector import identify_goalkeeper_tables
 from ..core.column_processor import apply_goalkeeper_renames
 from ..utils.file_helpers import get_output_path, normalize_name
 from ..utils.squad_helpers import extract_goalkeeper_links
-from ..constants import DEFAULT_OUTPUT_DIR_GOALKEEPERS
+from .. import constants
 
 
 class GoalkeeperParser(BaseParser):
@@ -222,7 +222,7 @@ class GoalkeeperParser(BaseParser):
             if player_data is not None and not player_data.empty:
                 # Save data to CSV
                 normalized_name = normalize_name(player_name)
-                output_path = f"{DEFAULT_OUTPUT_DIR_GOALKEEPERS}/{normalized_name}_goalkeeper_stats.csv"
+                output_path = f"{constants.DEFAULT_OUTPUT_DIR_GOALKEEPERS}/{normalized_name}_goalkeeper_stats.csv"
 
                 try:
                     player_data.to_csv(output_path, index=False, encoding='utf-8')
@@ -241,6 +241,6 @@ class GoalkeeperParser(BaseParser):
 
         print(f"\n🎯 Парсинг завершен!")
         print(f"✅ Успешно обработано: {successful_parses}/{len(goalkeeper_links)} вратарей")
-        print(f"📁 Файлы сохранены в: {DEFAULT_OUTPUT_DIR_GOALKEEPERS}")
+        print(f"📁 Файлы сохранены в: {constants.DEFAULT_OUTPUT_DIR_GOALKEEPERS}")
 
         return successful_parses

@@ -23,7 +23,7 @@ from ..core.column_processor import apply_field_player_renames
 from ..utils.url_helpers import extract_player_name_from_url
 from ..utils.file_helpers import get_output_path, normalize_name
 from ..utils.squad_helpers import extract_field_player_links
-from ..constants import DEFAULT_OUTPUT_DIR_FIELD_PLAYERS
+from .. import constants
 
 
 class FieldPlayerParser(BaseParser):
@@ -203,7 +203,7 @@ class FieldPlayerParser(BaseParser):
             if not output_path:
                 output_path = get_output_path(
                     player_name,
-                    output_dir=DEFAULT_OUTPUT_DIR_FIELD_PLAYERS if simple_filename else None,
+                    output_dir=constants.DEFAULT_OUTPUT_DIR_FIELD_PLAYERS if simple_filename else None,
                     simple_filename=simple_filename
                 )
 
@@ -265,8 +265,8 @@ class FieldPlayerParser(BaseParser):
 
         # Get list of existing files to skip already parsed players
         existing_files = set()
-        if os.path.exists(DEFAULT_OUTPUT_DIR_FIELD_PLAYERS):
-            existing_files = set(os.listdir(DEFAULT_OUTPUT_DIR_FIELD_PLAYERS))
+        if os.path.exists(constants.DEFAULT_OUTPUT_DIR_FIELD_PLAYERS):
+            existing_files = set(os.listdir(constants.DEFAULT_OUTPUT_DIR_FIELD_PLAYERS))
 
         successful_parses = 0
         failed_parses = 0
@@ -315,6 +315,6 @@ class FieldPlayerParser(BaseParser):
         print(f"✅ Успешно спаршено: {successful_parses} игроков")
         print(f"⏭️  Пропущено (уже существуют): {skipped_players} игроков")
         print(f"❌ Ошибок при парсинге: {failed_parses} игроков")
-        print(f"📁 Результаты сохранены в: {DEFAULT_OUTPUT_DIR_FIELD_PLAYERS}")
+        print(f"📁 Результаты сохранены в: {constants.DEFAULT_OUTPUT_DIR_FIELD_PLAYERS}")
 
         return successful_parses

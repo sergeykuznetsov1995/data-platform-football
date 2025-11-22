@@ -1,0 +1,281 @@
+# Docker Compose for Data Platform (Football Statistics)
+#
+# SETUP INSTRUCTIONS:
+# 1. Copy this file: cp docker-compose.example.yml docker-compose.yml
+# 2. Copy .env.example to .env and fill in your secrets
+# 3. Run: docker-compose up -d
+#
+# Services:
+# - Airflow (webserver, scheduler, worker, triggerer)
+# - PostgreSQL (metadata database)
+# - Redis (Celery broker)
+# - HDFS (namenode, datanode)
+# - Hive Metastore
+# - Trino (coordinator, worker)
+
+x-airflow-common:
+  &airflow-common
+  image: apache/airflow:2.10.4-python3.11
+  environment:
+    &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: CeleryExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:${POSTGRES_PASSWORD:-airflow}@postgres/airflow
+    AIRFLOW__CELERY__RESULT_BACKEND: db+postgresql://airflow:${POSTGRES_PASSWORD:-airflow}@postgres/airflow
+    AIRFLOW__CELERY__BROKER_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+    AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW__CORE__FERNET_KEY:-}
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+    AIRFLOW__API__AUTH_BACKENDS: 'airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session'
+    AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: 'true'
+    AIRFLOW_UID: ${AIRFLOW_UID:-50000}
+    _PIP_ADDITIONAL_REQUIREMENTS: cloudscraper>=1.2.71 tenacity>=8.0.0 beautifulsoup4>=4.12.0 pandas>=2.0.0 lxml>=4.9.0 pyarrow>=14.0.0 hdfs>=2.7.0 trino>=0.328.0
+  volumes:
+    - ./airflow/dags:/opt/airflow/dags
+    - ./airflow/logs:/opt/airflow/logs
+    - ./airflow/config:/opt/airflow/config
+    - ./airflow/plugins:/opt/airflow/plugins
+    - ./fbref_parser:/opt/airflow/fbref_parser
+    - ./requirements.txt:/requirements.txt
+    - ./data:/opt/airflow/data
+    - .:/root/data_platform
+  user: "${AIRFLOW_UID:-50000}:0"
+  depends_on:
+    &airflow-common-depends-on
+    redis:
+      condition: service_healthy
+    postgres:
+      condition: service_healthy
+
+services:
+  postgres:
+    image: postgres:13
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-airflow}
+      POSTGRES_DB: airflow
+    volumes:
+      - postgres-db-volume:/var/lib/postgresql/data
+      - ./sql/init-metastore.sql:/docker-entrypoint-initdb.d/init-metastore.sql
+    ports:
+      - "127.0.0.1:5432:5432"
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 10s
+      retries: 5
+      start_period: 5s
+    restart: always
+
+  redis:
+    image: redis:7.2-bookworm
+    command: redis-server --requirepass ${REDIS_PASSWORD} --protected-mode yes
+    ports:
+      - "127.0.0.1:6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 10s
+      timeout: 30s
+      retries: 50
+      start_period: 30s
+    restart: always
+
+  # ============ HDFS Services ============
+  namenode:
+    image: bde2020/hadoop-namenode:2.0.0-hadoop3.2.1-java8
+    container_name: namenode
+    environment:
+      - CLUSTER_NAME=data_platform
+      - CORE_CONF_fs_defaultFS=hdfs://namenode:8020
+      - CORE_CONF_hadoop_http_staticuser_user=root
+      - HDFS_CONF_dfs_webhdfs_enabled=true
+      - HDFS_CONF_dfs_permissions_enabled=false
+      - HDFS_CONF_dfs_replication=1
+    volumes:
+      - hdfs-namenode:/hadoop/dfs/name
+      - ./hadoop/core-site.xml:/etc/hadoop/core-site.xml
+      - ./hadoop/hdfs-site.xml:/etc/hadoop/hdfs-site.xml
+    ports:
+      - "9870:9870"
+      - "8020:8020"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://$$(hostname -i):9870 || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    restart: always
+
+  datanode:
+    image: bde2020/hadoop-datanode:2.0.0-hadoop3.2.1-java8
+    container_name: datanode
+    environment:
+      - CORE_CONF_fs_defaultFS=hdfs://namenode:8020
+      - HDFS_CONF_dfs_datanode_data_dir=/hadoop/dfs/data
+      - HDFS_CONF_dfs_replication=1
+    volumes:
+      - hdfs-datanode:/hadoop/dfs/data
+      - ./hadoop/core-site.xml:/etc/hadoop/core-site.xml
+      - ./hadoop/hdfs-site.xml:/etc/hadoop/hdfs-site.xml
+    ports:
+      - "9864:9864"
+    depends_on:
+      namenode:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://$$(hostname -i):9864 || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    restart: always
+
+  # ============ Hive Metastore ============
+  hive-metastore:
+    image: bde2020/hive:2.3.2-postgresql-metastore
+    container_name: hive-metastore
+    environment:
+      - HIVE_SITE_CONF_javax_jdo_option_ConnectionURL=jdbc:postgresql://postgres:5432/metastore
+      - HIVE_SITE_CONF_javax_jdo_option_ConnectionDriverName=org.postgresql.Driver
+      - HIVE_SITE_CONF_javax_jdo_option_ConnectionUserName=airflow
+      - HIVE_SITE_CONF_javax_jdo_option_ConnectionPassword=${POSTGRES_PASSWORD:-airflow}
+      - HIVE_SITE_CONF_datanucleus_autoCreateSchema=true
+      - HIVE_SITE_CONF_hive_metastore_uris=thrift://hive-metastore:9083
+      - HDFS_CONF_fs_defaultFS=hdfs://namenode:8020
+    volumes:
+      - ./hadoop/core-site.xml:/opt/hive/conf/core-site.xml
+      - ./hadoop/hdfs-site.xml:/opt/hive/conf/hdfs-site.xml
+    ports:
+      - "9083:9083"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      namenode:
+        condition: service_healthy
+      datanode:
+        condition: service_healthy
+    command: /opt/hive/bin/hive --service metastore
+    restart: always
+
+  # ============ Trino Services ============
+  trino-coordinator:
+    image: trinodb/trino:435
+    container_name: trino-coordinator
+    volumes:
+      - ./trino/etc/config.properties:/etc/trino/config.properties
+      - ./trino/etc/jvm.config:/etc/trino/jvm.config
+      - ./trino/etc/node.properties:/etc/trino/node.properties
+      - ./trino/etc/catalog/hive.properties:/etc/trino/catalog/hive.properties
+    ports:
+      - "8085:8085"
+    depends_on:
+      - hive-metastore
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8085/v1/info"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    restart: always
+
+  trino-worker:
+    image: trinodb/trino:435
+    container_name: trino-worker
+    volumes:
+      - ./trino/etc/config-worker.properties:/etc/trino/config.properties
+      - ./trino/etc/jvm.config:/etc/trino/jvm.config
+      - ./trino/etc/node.properties:/etc/trino/node.properties
+      - ./trino/etc/catalog/hive.properties:/etc/trino/catalog/hive.properties
+    depends_on:
+      trino-coordinator:
+        condition: service_healthy
+    restart: always
+
+  # ============ Airflow Services ============
+  airflow-webserver:
+    <<: *airflow-common
+    command: webserver
+    ports:
+      - "0.0.0.0:8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8974/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-worker:
+    <<: *airflow-common
+    command: celery worker
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - 'celery --app airflow.providers.celery.executors.celery_executor.app inspect ping -d "celery@$${HOSTNAME}" || celery --app airflow.executors.celery_executor.app inspect ping -d "celery@$${HOSTNAME}"'
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    environment:
+      <<: *airflow-common-env
+      DUMB_INIT_SETSID: "0"
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-triggerer:
+    <<: *airflow-common
+    command: triggerer
+    healthcheck:
+      test: ["CMD-SHELL", 'airflow jobs check --job-type TriggererJob --hostname "$${HOSTNAME}"']
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-init:
+    <<: *airflow-common
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        if [[ -f /requirements.txt ]]; then
+          pip install --no-cache-dir -r /requirements.txt
+        fi
+        exec /entrypoint airflow version
+    environment:
+      <<: *airflow-common-env
+      _AIRFLOW_DB_MIGRATE: 'true'
+      _AIRFLOW_WWW_USER_CREATE: 'true'
+      _AIRFLOW_WWW_USER_USERNAME: ${_AIRFLOW_WWW_USER_USERNAME:-airflow}
+      _AIRFLOW_WWW_USER_PASSWORD: ${_AIRFLOW_WWW_USER_PASSWORD:-airflow}
+    user: "0:0"
+
+volumes:
+  postgres-db-volume:
+  hdfs-namenode:
+  hdfs-datanode:
