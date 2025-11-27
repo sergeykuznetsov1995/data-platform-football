@@ -1,8 +1,8 @@
 """
-FBref Premier League parsing utilities for Airflow DAG
+FBref Russian Premier League parsing utilities for Airflow DAG
 
-This module provides helper functions for parsing Premier League squad data:
-- Extracting all Premier League team URLs from the league page
+This module provides helper functions for parsing Russian Premier League squad data:
+- Extracting all Russian Premier League team URLs from the league page
 - Parsing both field players and goalkeepers for a given squad
 - Handling file organization and error reporting
 
@@ -18,7 +18,8 @@ from typing import Dict, List, Tuple
 from bs4 import BeautifulSoup
 
 # Add project root to path to import fbref_parser
-PROJECT_ROOT = "/opt/airflow"
+# Use /opt/airflow for Docker, /root/data_platform for local testing
+PROJECT_ROOT = "/opt/airflow" if os.path.exists("/opt/airflow/fbref_parser") else "/root/data_platform"
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
@@ -28,28 +29,28 @@ from fbref_parser.utils.file_helpers import normalize_name
 
 
 # Constants
-PREMIER_LEAGUE_URL = "https://fbref.com/en/comps/9/Premier-League-Stats"
-PREMIER_LEAGUE_DATA_DIR = "/opt/airflow/data/premier_league"
+PREMIER_LEAGUE_URL = "https://fbref.com/en/comps/30/Russian-Premier-League-Stats"
+PREMIER_LEAGUE_DATA_DIR = "/opt/airflow/data/russian_premier_league"
 
 
 def get_premier_league_squads() -> List[Dict[str, str]]:
     """
-    Extract all Premier League team names and squad URLs from league page
+    Extract all Russian Premier League team names and squad URLs from league page
 
-    Parses the Premier League standings table to get links to all 20 teams.
+    Parses the Russian Premier League standings table to get links to all 16 teams.
 
     Returns:
         List of dicts with team_name and squad_url:
         [
-            {"team_name": "Arsenal", "squad_url": "https://fbref.com/..."},
-            {"team_name": "Manchester City", "squad_url": "https://..."},
+            {"team_name": "Zenit", "squad_url": "https://fbref.com/..."},
+            {"team_name": "Spartak Moscow", "squad_url": "https://..."},
             ...
         ]
 
     Raises:
-        Exception: If unable to fetch or parse the Premier League page
+        Exception: If unable to fetch or parse the Russian Premier League page
     """
-    print(f"🏴󠁧󠁢󠁥󠁮󠁧󠁿 Извлекаю список команд Premier League с: {PREMIER_LEAGUE_URL}")
+    print(f"🇷🇺 Извлекаю список команд Russian Premier League с: {PREMIER_LEAGUE_URL}")
 
     try:
         # Use FBrefScraper with rate limiting and CloudFlare bypass
@@ -61,7 +62,8 @@ def get_premier_league_squads() -> List[Dict[str, str]]:
         # Find the league table - try multiple possible IDs
         league_table = None
         possible_table_ids = [
-            'results2024-202591_overall',  # Current season format
+            'results2024-2025301_overall',  # Current season format for RPL
+            'results2024-202530_overall',
             'results2024-2025_overall',
             'results_overall',
             'stats_squads_standard_for'  # Alternative: squad stats table
@@ -126,17 +128,17 @@ def get_premier_league_squads() -> List[Dict[str, str]]:
                         'squad_url': squad_url
                     })
 
-        print(f"\n✅ Найдено {len(squads)} команд Premier League:")
+        print(f"\n✅ Найдено {len(squads)} команд Russian Premier League:")
         for squad in squads:
             print(f"   - {squad['team_name']}")
 
-        if len(squads) != 20:
-            print(f"\n⚠️ ВНИМАНИЕ: Ожидалось 20 команд, но найдено {len(squads)}")
+        if len(squads) != 16:
+            print(f"\n⚠️ ВНИМАНИЕ: Ожидалось 16 команд, но найдено {len(squads)}")
 
         return squads
 
     except Exception as e:
-        print(f"❌ Ошибка при извлечении списка команд Premier League: {e}")
+        print(f"❌ Ошибка при извлечении списка команд Russian Premier League: {e}")
         raise
 
 
@@ -163,7 +165,7 @@ def parse_squad_all_players(squad_info: Dict[str, str]) -> Dict[str, any]:
             "total_players": 28,
             "field_players_failed": 0,
             "goalkeepers_failed": 0,
-            "output_dir": "/root/data_platform/data/premier_league/Arsenal"
+            "output_dir": "/root/data_platform/data/russian_premier_league/Zenit"
         }
 
     Raises:
@@ -270,11 +272,11 @@ def parse_squad_all_players(squad_info: Dict[str, str]) -> Dict[str, any]:
 
 # For local testing
 if __name__ == "__main__":
-    print("🧪 Тестирование модуля fbref_premier_league_utils")
+    print("🧪 Тестирование модуля fbref_russian_premier_league_utils")
 
-    # Test 1: Extract Premier League squads
+    # Test 1: Extract Russian Premier League squads
     print("\n" + "="*80)
-    print("TEST 1: Извлечение списка команд Premier League")
+    print("TEST 1: Извлечение списка команд Russian Premier League")
     print("="*80)
 
     try:

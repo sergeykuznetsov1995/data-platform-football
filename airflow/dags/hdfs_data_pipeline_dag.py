@@ -45,6 +45,47 @@ WEBHDFS_URL = "http://namenode:9870/webhdfs/v1"
 PARQUET_OUTPUT_DIR = "/opt/airflow/data/parquet"
 
 
+def apply_schema_to_dataframe(df):
+    """
+    Apply consistent schema to DataFrame - convert all int columns to DOUBLE.
+
+    This ensures Parquet schema matches Trino DDL expectations.
+
+    Problem:
+    - Pandas auto-detects int64 for columns like 'starts_total', 'mp', 'age'
+    - DDL defines these as DOUBLE
+    - Different teams may have NaN values causing schema inconsistency
+    - Trino can't read mixed int64/double across partitions
+
+    Solution:
+    - Explicitly convert ALL int64 columns to float64 (DOUBLE in Trino)
+    - This allows NaN values and ensures schema consistency
+
+    Data verified:
+    - Field players: minutes, matches_completed contain NaN
+    - Goalkeepers: 215 of 260 numeric columns contain NaN
+
+    Args:
+        df: pandas DataFrame to transform
+
+    Returns:
+        DataFrame with all integer columns converted to float64
+    """
+    import pandas as pd
+
+    # Convert ALL integer columns to float64 to handle NaN and match DDL
+    for col in df.columns:
+        # Skip string columns
+        if col in ['season', 'squad', 'country', 'competition', 'player_name', 'team', 'lgrank']:
+            continue
+
+        # Convert any integer type to float64
+        if df[col].dtype in ['int64', 'int32', 'int16', 'int8']:
+            df[col] = df[col].astype('float64')
+
+    return df
+
+
 default_args = {
     'owner': 'data_platform',
     'depends_on_past': False,
@@ -185,6 +226,11 @@ def hdfs_data_pipeline():
 
                 if dfs:
                     combined_df = pd.concat(dfs, ignore_index=True)
+
+                    # Apply schema transformations to ensure all int64 columns become float64 (DOUBLE)
+                    # This matches Trino DDL and handles NaN values correctly
+                    combined_df = apply_schema_to_dataframe(combined_df)
+
                     output_path = os.path.join(
                         PARQUET_OUTPUT_DIR, 'field_players', f'team={team}', 'data.parquet'
                     )
@@ -213,6 +259,11 @@ def hdfs_data_pipeline():
 
                 if dfs:
                     combined_df = pd.concat(dfs, ignore_index=True)
+
+                    # Apply schema transformations to ensure all int64 columns become float64 (DOUBLE)
+                    # This matches Trino DDL and handles NaN values correctly
+                    combined_df = apply_schema_to_dataframe(combined_df)
+
                     output_path = os.path.join(
                         PARQUET_OUTPUT_DIR, 'goalkeepers', f'team={team}', 'data.parquet'
                     )

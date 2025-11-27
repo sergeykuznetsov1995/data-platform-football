@@ -1,14 +1,14 @@
 """
-Airflow DAG for parsing all Premier League players from FBref.com
+Airflow DAG for parsing all Russian Premier League players from FBref.com
 
-This DAG orchestrates the complete parsing of all 20 Premier League teams,
+This DAG orchestrates the complete parsing of all 16 Russian Premier League teams,
 including both field players and goalkeepers for the 2024-2025 season.
 
 Schedule: Manual trigger only (schedule=None)
-Expected runtime: ~60 minutes for full parsing of ~500 players
+Expected runtime: ~50 minutes for full parsing of ~400 players
 
 Architecture:
-    1. extract_premier_league_squads: Fetch list of all 20 teams
+    1. extract_premier_league_squads: Fetch list of all 16 teams
     2. parse_squad_players (dynamic): Parse each team in parallel
     3. report_results: Aggregate and display final statistics
 
@@ -18,13 +18,12 @@ Rate Limiting:
     - Complies with FBref's 10 requests/minute limit
 
 Output Structure:
-    /root/data_platform/data/premier_league/
-        arsenal/
-            bukayo_saka.csv
-            martin_odegaard.csv
+    /root/data_platform/data/russian_premier_league/
+        zenit/
+            player_name.csv
             ...
-        manchester_city/
-            erling_haaland.csv
+        spartak_moscow/
+            player_name.csv
             ...
         ...
 
@@ -43,7 +42,7 @@ from typing import Dict, List
 import logging
 
 # Import utility functions from same directory
-from fbref_premier_league_utils import get_premier_league_squads, parse_squad_all_players
+from fbref_russian_premier_league_utils import get_premier_league_squads, parse_squad_all_players
 
 
 # DAG default arguments
@@ -59,22 +58,22 @@ default_args = {
 
 
 @dag(
-    dag_id='fbref_premier_league_parser',
+    dag_id='fbref_russian_premier_league_parser',
     default_args=default_args,
-    description='Parse all Premier League 2024-2025 players (field + goalkeepers) from FBref.com',
+    description='Parse all Russian Premier League 2024-2025 players (field + goalkeepers) from FBref.com',
     schedule=None,  # Manual trigger only
     start_date=datetime(2024, 11, 20),
     catchup=False,
     max_active_runs=1,  # Only one instance at a time
-    tags=['fbref', 'premier_league', 'scraping', 'football'],
+    tags=['fbref', 'russian_premier_league', 'scraping', 'football'],
     doc_md=__doc__,
 )
 def fbref_premier_league_parser():
     """
-    Main DAG for parsing Premier League player statistics from FBref.com
+    Main DAG for parsing Russian Premier League player statistics from FBref.com
 
     This DAG implements a robust, rate-limited scraping pipeline that:
-    - Extracts all 20 Premier League team URLs
+    - Extracts all 16 Russian Premier League team URLs
     - Dynamically creates parsing tasks for each team
     - Parses both field players and goalkeepers
     - Aggregates results and reports statistics
@@ -83,10 +82,10 @@ def fbref_premier_league_parser():
     @task(
         task_id='extract_premier_league_squads',
         doc_md="""
-        Extract list of all Premier League teams and their squad URLs
+        Extract list of all Russian Premier League teams and their squad URLs
 
-        This task scrapes the Premier League standings page to get links
-        to all 20 teams' squad pages. Uses FBrefScraper with CloudFlare
+        This task scrapes the Russian Premier League standings page to get links
+        to all 16 teams' squad pages. Uses FBrefScraper with CloudFlare
         bypass and rate limiting.
 
         Returns:
@@ -97,22 +96,22 @@ def fbref_premier_league_parser():
     )
     def extract_premier_league_squads() -> List[Dict[str, str]]:
         """
-        Fetch all Premier League team URLs from league page
+        Fetch all Russian Premier League team URLs from league page
 
         Returns:
-            List of 20 dicts: [{"team_name": "Arsenal", "squad_url": "https://..."}, ...]
+            List of 16 dicts: [{"team_name": "Zenit", "squad_url": "https://..."}, ...]
         """
         logging.info("="*80)
-        logging.info("TASK: Extract Premier League Squads")
+        logging.info("TASK: Extract Russian Premier League Squads")
         logging.info("="*80)
 
         try:
             squads = get_premier_league_squads()
 
-            logging.info(f"\n✅ Successfully extracted {len(squads)} Premier League teams")
+            logging.info(f"\n✅ Successfully extracted {len(squads)} Russian Premier League teams")
 
-            if len(squads) != 20:
-                logging.warning(f"⚠️ Expected 20 teams but found {len(squads)}")
+            if len(squads) != 16:
+                logging.warning(f"⚠️ Expected 16 teams but found {len(squads)}")
 
             # Log team names for verification
             logging.info("\n📋 Teams to be parsed:")
@@ -122,7 +121,7 @@ def fbref_premier_league_parser():
             return squads
 
         except Exception as e:
-            logging.error(f"❌ Failed to extract Premier League squads: {e}")
+            logging.error(f"❌ Failed to extract Russian Premier League squads: {e}")
             raise
 
     @task(
@@ -242,7 +241,7 @@ def fbref_premier_league_parser():
         }
 
         # Print detailed report
-        logging.info("\n" + "🏆 PREMIER LEAGUE PARSING SUMMARY")
+        logging.info("\n" + "🏆 RUSSIAN PREMIER LEAGUE PARSING SUMMARY")
         logging.info("="*80)
         logging.info(f"\n📊 OVERALL STATISTICS:")
         logging.info(f"   Teams processed: {total_teams}")
@@ -277,9 +276,9 @@ def fbref_premier_league_parser():
             logging.info(f"   Average squad size: {avg_team_size:.1f} players")
 
         logging.info("\n" + "="*80)
-        logging.info("🎉 PREMIER LEAGUE PARSING COMPLETED!")
+        logging.info("🎉 RUSSIAN PREMIER LEAGUE PARSING COMPLETED!")
         logging.info("="*80)
-        logging.info(f"📁 Output directory: /root/data_platform/data/premier_league/")
+        logging.info(f"📁 Output directory: /opt/airflow/data/russian_premier_league/")
 
         return summary
 
@@ -298,10 +297,10 @@ dag_instance = fbref_premier_league_parser()
 
 # Documentation for Airflow UI
 """
-## FBref Premier League Parser DAG
+## FBref Russian Premier League Parser DAG
 
 ### Overview
-This DAG parses all players from all 20 Premier League teams for the 2024-2025 season.
+This DAG parses all players from all 16 Russian Premier League teams for the 2024-2025 season.
 
 ### Prerequisites
 1. **FBref Pool**: Create pool in Airflow UI
@@ -320,18 +319,17 @@ This DAG parses all players from all 20 Premier League teams for the 2024-2025 s
 - **Limit**: Complies with FBref's 10 requests/minute restriction
 
 ### Expected Runtime
-- **First run**: ~60 minutes (parsing ~500 players)
+- **First run**: ~50 minutes (parsing ~400 players)
 - **Subsequent runs**: Much faster (skips existing files)
 
 ### Output Structure
 ```
-/root/data_platform/data/premier_league/
-├── arsenal/
-│   ├── bukayo_saka.csv
-│   ├── martin_odegaard.csv
+/opt/airflow/data/russian_premier_league/
+├── zenit/
+│   ├── player_name.csv
 │   └── ...
-├── manchester_city/
-│   ├── erling_haaland.csv
+├── spartak_moscow/
+│   ├── player_name.csv
 │   └── ...
 └── ...
 ```
