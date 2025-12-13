@@ -6,11 +6,16 @@ This module provides functions for extracting player links from squad pages:
 - Goalkeeper link extraction
 """
 
-from bs4 import BeautifulSoup
+import logging
 import re
 from typing import List, Tuple
 
+from bs4 import BeautifulSoup
+
 from ..core.scraper import FBrefScraper
+
+
+logger = logging.getLogger(__name__)
 
 
 def extract_field_player_links(squad_url: str) -> List[Tuple[str, str]]:
@@ -37,31 +42,92 @@ def extract_field_player_links(squad_url: str) -> List[Tuple[str, str]]:
 
         # Find all tables on page
         all_tables = soup.find_all('table')
+        logger.debug(f"Squad URL: {squad_url}")
+        logger.debug(f"Found {len(all_tables)} tables on page")
 
-        # Find standard stats table
+        # Extract league_id from squad URL for league-specific table IDs
+        # URL format: /en/squads/{squad_id}/{team-name}-Stats
+        league_id = None
+        try:
+            # Some squad pages might have league info in URL or metadata
+            # For now, we'll try common IDs and expand dynamically
+            pass
+        except:
+            pass
+
+        # Find standard stats table - try multiple strategies
         standard_stats_table = soup.find('table', {'id': 'all_stats_standard'})
 
         # If not found by exact ID, try alternative variants
         if not standard_stats_table:
-            # Try other possible IDs - start with most likely
-            alternative_ids = ['stats_standard_9', 'stats_standard', 'stats_standard_combined']
+            # Try other possible IDs - expanded list for different leagues
+            alternative_ids = [
+                'stats_standard_9', 'stats_standard', 'stats_standard_combined',
+                'stats_standard_dom_lg',  # Domestic league
+                # Try any table with 'stats' and 'standard' in ID
+            ]
             for alt_id in alternative_ids:
                 standard_stats_table = soup.find('table', {'id': alt_id})
                 if standard_stats_table:
+                    logger.debug(f"Found table with ID: {alt_id}")
                     break
 
-            # If still not found, try search by header content
+            # Try partial match on table ID
             if not standard_stats_table:
                 for table in all_tables:
-                    headers = table.find_all(['th', 'td'])
-                    header_text = ' '.join([h.get_text().strip() for h in headers[:10]])
-                    if any(keyword in header_text.lower() for keyword in ['player', 'nation', 'pos', 'age', 'mp', 'starts']):
+                    table_id = table.get('id', '')
+                    if 'stats' in table_id and 'standard' in table_id:
                         standard_stats_table = table
+                        logger.debug(f"Found table via partial match: {table_id}")
+                        break
+
+            # If still not found, try search by header content (more aggressive)
+            if not standard_stats_table:
+                for table in all_tables:
+                    thead = table.find('thead')
+                    if not thead:
+                        continue
+
+                    headers = thead.find_all(['th', 'td'])
+                    header_text = ' '.join([h.get_text().strip().lower() for h in headers[:15]])
+
+                    # Must have 'player' and at least 2 more keywords
+                    required = ['player']
+                    optional = ['nation', 'pos', 'position', 'age', 'mp', 'starts', 'matches played']
+
+                    has_required = all(keyword in header_text for keyword in required)
+                    has_optional = sum(1 for keyword in optional if keyword in header_text) >= 2
+
+                    if has_required and has_optional:
+                        standard_stats_table = table
+                        logger.debug(f"Found table via header content: {header_text[:100]}")
                         break
 
         if not standard_stats_table:
             print("❌ Не найдена таблица стандартной статистики")
+            logger.error(f"No standard stats table found. Available tables: {[t.get('id', 'no-id') for t in all_tables[:10]]}")
             return []
+
+        logger.debug(f"Using standard stats table with ID: {standard_stats_table.get('id', 'no-id')}")
+
+        # CRITICAL: Dynamically determine position column index
+        # Different leagues may have different column orders
+        pos_index = None
+        header = standard_stats_table.find('thead')
+        if header:
+            headers = header.find_all(['th', 'td'])
+            for idx, th in enumerate(headers):
+                text = th.get_text().strip().lower()
+                # Check for position indicators
+                if text in ['pos', 'position', 'positn', 'posi']:
+                    pos_index = idx
+                    logger.debug(f"Found Position column at index {pos_index}")
+                    break
+
+        if pos_index is None:
+            # Fallback to index 2 (standard for most leagues)
+            pos_index = 2
+            logger.warning(f"Position column not found in header, using default index {pos_index}")
 
         player_links = []
 
@@ -96,9 +162,16 @@ def extract_field_player_links(squad_url: str) -> List[Tuple[str, str]]:
                 # First cell contains player name and link
                 player_cell = cells[0]
 
-                # Position usually in 3rd column (index 2)
-                position_cell = cells[2] if len(cells) > 2 else None
-                position = position_cell.get_text(strip=True) if position_cell else ""
+                # Use dynamically determined position column index
+                position_cell = cells[pos_index] if len(cells) > pos_index else None
+                if not position_cell:
+                    # If position cell not found, skip this row
+                    continue
+
+                position = position_cell.get_text(strip=True)
+                if not position:
+                    # Empty position, skip
+                    continue
 
                 # Skip goalkeepers
                 if 'GK' in position.upper():

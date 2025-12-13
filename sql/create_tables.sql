@@ -1,19 +1,19 @@
--- Trino DDL for Premier League Football Statistics
+-- Trino DDL for All Leagues Football Statistics
 -- Auto-generated from actual Parquet schema
 -- Execute via Trino CLI or Python trino client
 
 -- Create schema
-CREATE SCHEMA IF NOT EXISTS hive.premier_league
-WITH (location = 'hdfs://namenode:8020/data/premier_league');
+CREATE SCHEMA IF NOT EXISTS hive.all_leagues
+WITH (location = 'hdfs://namenode:8020/data/all_leagues');
 
 -- =====================================
 -- FIELD PLAYERS TABLE
 -- =====================================
 
-DROP TABLE IF EXISTS hive.premier_league.field_players;
+DROP TABLE IF EXISTS hive.all_leagues.field_players;
 
--- Field Players: 179 columns
-CREATE TABLE IF NOT EXISTS hive.premier_league.field_players (
+-- Field Players: 180 columns (added league column)
+CREATE TABLE IF NOT EXISTS hive.all_leagues.field_players (
     season VARCHAR,
     age DOUBLE,
     squad VARCHAR,
@@ -192,22 +192,23 @@ CREATE TABLE IF NOT EXISTS hive.premier_league.field_players (
     outcomes_off_pt DOUBLE,
     outcomes_blocks_pt DOUBLE,
     player_name VARCHAR,
+    league VARCHAR,
     team VARCHAR
 )
 WITH (
     format = 'PARQUET',
-    partitioned_by = ARRAY['team'],
-    external_location = 'hdfs://namenode:8020/data/premier_league/field_players'
+    partitioned_by = ARRAY['league', 'team'],
+    external_location = 'hdfs://namenode:8020/data/all_leagues/field_players'
 );
 
 -- =====================================
 -- GOALKEEPERS TABLE
 -- =====================================
 
-DROP TABLE IF EXISTS hive.premier_league.goalkeepers;
+DROP TABLE IF EXISTS hive.all_leagues.goalkeepers;
 
--- Goalkeepers: 258 columns
-CREATE TABLE IF NOT EXISTS hive.premier_league.goalkeepers (
+-- Goalkeepers: 259 columns (added league column)
+CREATE TABLE IF NOT EXISTS hive.all_leagues.goalkeepers (
     season VARCHAR,
     age DOUBLE,
     squad VARCHAR,
@@ -465,25 +466,48 @@ CREATE TABLE IF NOT EXISTS hive.premier_league.goalkeepers (
     performance_pkcon_defense DOUBLE,
     performance_og_defense DOUBLE,
     lgrank VARCHAR,
+    league VARCHAR,
     team VARCHAR
 )
 WITH (
     format = 'PARQUET',
-    partitioned_by = ARRAY['team'],
-    external_location = 'hdfs://namenode:8020/data/premier_league/goalkeepers'
+    partitioned_by = ARRAY['league', 'team'],
+    external_location = 'hdfs://namenode:8020/data/all_leagues/goalkeepers'
 );
 
 -- =====================================
 -- PARTITION SYNC (run after data upload)
 -- =====================================
 
-CALL system.sync_partition_metadata('premier_league', 'field_players', 'FULL');
-CALL system.sync_partition_metadata('premier_league', 'goalkeepers', 'FULL');
+CALL system.sync_partition_metadata('all_leagues', 'field_players', 'FULL');
+CALL system.sync_partition_metadata('all_leagues', 'goalkeepers', 'FULL');
 
 -- =====================================
 -- EXAMPLE QUERIES
 -- =====================================
 
--- SELECT * FROM hive.premier_league.field_players WHERE team = 'arsenal' LIMIT 10;
--- SELECT player_name, performance_gls, performance_ast FROM hive.premier_league.field_players ORDER BY performance_gls DESC LIMIT 10;
--- SELECT team, SUM(performance_gls) as goals FROM hive.premier_league.field_players GROUP BY team ORDER BY goals DESC;
+-- All leagues data
+-- SELECT * FROM hive.all_leagues.field_players LIMIT 10;
+-- SELECT * FROM hive.all_leagues.goalkeepers LIMIT 10;
+
+-- Filter by specific league
+-- SELECT * FROM hive.all_leagues.field_players WHERE league = 'a_league_men' LIMIT 10;
+-- SELECT * FROM hive.all_leagues.field_players WHERE league = 'premier_league' AND team = 'arsenal';
+
+-- Top scorers across all leagues
+-- SELECT league, player_name, performance_gls, performance_ast
+-- FROM hive.all_leagues.field_players
+-- ORDER BY performance_gls DESC LIMIT 20;
+
+-- Goals by team within a league
+-- SELECT team, SUM(performance_gls) as goals
+-- FROM hive.all_leagues.field_players
+-- WHERE league = 'premier_league'
+-- GROUP BY team
+-- ORDER BY goals DESC;
+
+-- Cross-league comparison
+-- SELECT league, COUNT(*) as players, AVG(performance_gls) as avg_goals
+-- FROM hive.all_leagues.field_players
+-- GROUP BY league
+-- ORDER BY avg_goals DESC;

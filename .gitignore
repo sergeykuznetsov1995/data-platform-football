@@ -164,8 +164,8 @@ cython_debug/
 .claude/
 .playwright-mcp/
 
-# Project documentation (internal)
-CLAUDE.md
+# Project documentation (internal) - exclude ALL markdown files
+*.md
 
 # Data files (optional - uncomment if you don't want to track CSV files)
 *.csv

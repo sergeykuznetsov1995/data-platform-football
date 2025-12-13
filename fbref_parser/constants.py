@@ -316,3 +316,28 @@ DUPLICATE_90S_COLUMNS = [
     '90s_shooting', '90s_passing', '90s_pass_types',
     '90s_defense', '90s_gca', '90s_possession', '90s_misc'
 ]
+
+# === League Discovery Configuration ===
+FBREF_COMPETITIONS_URL = "https://fbref.com/en/comps/"
+
+LEAGUE_TIER_HEADERS = {
+    '1st': 'Domestic Leagues - 1st Tier',
+    '2nd': 'Domestic Leagues - 2nd Tier',
+    '3rd': 'Domestic Leagues - 3rd Tier and Lower'
+}
+
+# Metadata cache configuration
+METADATA_CACHE_DIR = "/opt/airflow/cache" if _os.path.exists("/opt/airflow") else "/root/data_platform/cache"
+METADATA_CACHE_FILE = f"{METADATA_CACHE_DIR}/leagues_metadata.json"
+METADATA_CACHE_MAX_AGE_HOURS = 168  # 7 days
+
+# All leagues data directory
+ALL_LEAGUES_DATA_DIR = "/opt/airflow/data/leagues" if _os.path.exists("/opt/airflow") else "/root/data_platform/data/leagues"
+
+# Possible league table IDs for standings extraction
+LEAGUE_TABLE_IDS = [
+    'results{season}{league_id}_overall',
+    'results{season}_overall',
+    'results_overall',
+    'stats_squads_standard_for'
+]

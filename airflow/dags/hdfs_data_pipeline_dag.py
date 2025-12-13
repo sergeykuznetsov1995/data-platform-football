@@ -39,10 +39,14 @@ import os
 
 
 # Constants
-LOCAL_DATA_DIR = "/opt/airflow/data/premier_league"
-HDFS_BASE_PATH = "/data/premier_league"
+LOCAL_DATA_DIR = "/opt/airflow/data/leagues"
+HDFS_BASE_PATH = "/data/all_leagues"
 WEBHDFS_URL = "http://namenode:9870/webhdfs/v1"
 PARQUET_OUTPUT_DIR = "/opt/airflow/data/parquet"
+TRINO_HOST = "trino-coordinator"
+TRINO_PORT = 8085
+TRINO_CATALOG = "hive"
+TRINO_SCHEMA = "all_leagues"
 
 
 def apply_schema_to_dataframe(df):
@@ -56,22 +60,29 @@ def apply_schema_to_dataframe(df):
     - DDL defines these as DOUBLE
     - Different teams may have NaN values causing schema inconsistency
     - Trino can't read mixed int64/double across partitions
+    - CRITICAL: Some CSV files have numeric season values (2019, 2020) that pandas reads as int64
 
     Solution:
     - Explicitly convert ALL int64 columns to float64 (DOUBLE in Trino)
+    - Force convert season to string (handles cases where pandas reads it as int64)
     - This allows NaN values and ensures schema consistency
 
     Data verified:
     - Field players: minutes, matches_completed contain NaN
     - Goalkeepers: 215 of 260 numeric columns contain NaN
+    - Season can be int64 in CSV files with numeric values (e.g., 2019 instead of 2019-2020)
 
     Args:
         df: pandas DataFrame to transform
 
     Returns:
-        DataFrame with all integer columns converted to float64
+        DataFrame with all integer columns converted to float64 and season as string
     """
     import pandas as pd
+
+    # CRITICAL FIX: Force season to string (handles numeric season values like 2019)
+    if 'season' in df.columns:
+        df['season'] = df['season'].astype(str)
 
     # Convert ALL integer columns to float64 to handle NaN and match DDL
     for col in df.columns:
@@ -116,55 +127,65 @@ def hdfs_data_pipeline():
     @task(task_id='scan_local_data')
     def scan_local_data() -> Dict[str, List[str]]:
         """
-        Scan local data directory for CSV files
+        Scan local data directory for CSV files from all leagues
 
         Returns:
-            Dict with 'field_players' and 'goalkeepers' lists of file paths
+            Dict with 'field_players', 'goalkeepers', and 'leagues' lists
         """
         logging.info("=" * 80)
-        logging.info("TASK: Scan Local Data")
+        logging.info("TASK: Scan Local Data (All Leagues)")
         logging.info("=" * 80)
 
         result = {
             'field_players': [],
             'goalkeepers': [],
-            'teams': []
+            'leagues': []
         }
 
         if not os.path.exists(LOCAL_DATA_DIR):
             logging.warning(f"Data directory not found: {LOCAL_DATA_DIR}")
             return result
 
-        teams = [d for d in os.listdir(LOCAL_DATA_DIR)
-                 if os.path.isdir(os.path.join(LOCAL_DATA_DIR, d))]
+        # Iterate through leagues
+        leagues = [d for d in os.listdir(LOCAL_DATA_DIR)
+                   if os.path.isdir(os.path.join(LOCAL_DATA_DIR, d))]
 
-        for team in teams:
-            team_dir = os.path.join(LOCAL_DATA_DIR, team)
-            result['teams'].append(team)
+        for league_name in leagues:
+            league_path = os.path.join(LOCAL_DATA_DIR, league_name)
+            result['leagues'].append(league_name)
 
-            # Field players
-            fp_dir = os.path.join(team_dir, 'field_players')
-            if os.path.exists(fp_dir):
-                for f in os.listdir(fp_dir):
-                    if f.endswith('.csv'):
-                        result['field_players'].append({
-                            'team': team,
-                            'file': os.path.join(fp_dir, f),
-                            'player': f.replace('.csv', '')
-                        })
+            # Iterate through teams in each league
+            teams = [d for d in os.listdir(league_path)
+                     if os.path.isdir(os.path.join(league_path, d))]
 
-            # Goalkeepers
-            gk_dir = os.path.join(team_dir, 'goalkeepers')
-            if os.path.exists(gk_dir):
-                for f in os.listdir(gk_dir):
-                    if f.endswith('.csv'):
-                        result['goalkeepers'].append({
-                            'team': team,
-                            'file': os.path.join(gk_dir, f),
-                            'player': f.replace('.csv', '')
-                        })
+            for team_name in teams:
+                team_path = os.path.join(league_path, team_name)
 
-        logging.info(f"Found {len(result['teams'])} teams")
+                # Field players
+                fp_dir = os.path.join(team_path, 'field_players')
+                if os.path.exists(fp_dir):
+                    for f in os.listdir(fp_dir):
+                        if f.endswith('.csv'):
+                            result['field_players'].append({
+                                'league': league_name,
+                                'team': team_name,
+                                'file': os.path.join(fp_dir, f),
+                                'player': f.replace('.csv', '')
+                            })
+
+                # Goalkeepers
+                gk_dir = os.path.join(team_path, 'goalkeepers')
+                if os.path.exists(gk_dir):
+                    for f in os.listdir(gk_dir):
+                        if f.endswith('.csv'):
+                            result['goalkeepers'].append({
+                                'league': league_name,
+                                'team': team_name,
+                                'file': os.path.join(gk_dir, f),
+                                'player': f.replace('.csv', '')
+                            })
+
+        logging.info(f"Found {len(result['leagues'])} leagues")
         logging.info(f"Found {len(result['field_players'])} field player files")
         logging.info(f"Found {len(result['goalkeepers'])} goalkeeper files")
 
@@ -199,29 +220,34 @@ def hdfs_data_pipeline():
             'errors': []
         }
 
-        # Group files by team
+        # Group files by (league, team)
         teams_fp = {}
         for item in scan_result.get('field_players', []):
+            league = item['league']
             team = item['team']
-            if team not in teams_fp:
-                teams_fp[team] = []
-            teams_fp[team].append(item)
+            key = (league, team)
+            if key not in teams_fp:
+                teams_fp[key] = []
+            teams_fp[key].append(item)
 
         teams_gk = {}
         for item in scan_result.get('goalkeepers', []):
+            league = item['league']
             team = item['team']
-            if team not in teams_gk:
-                teams_gk[team] = []
-            teams_gk[team].append(item)
+            key = (league, team)
+            if key not in teams_gk:
+                teams_gk[key] = []
+            teams_gk[key].append(item)
 
-        # Convert field players by team
-        for team, files in teams_fp.items():
+        # Convert field players by (league, team)
+        for (league, team), files in teams_fp.items():
             try:
                 dfs = []
                 for item in files:
                     df = pd.read_csv(item['file'])
                     df['player_name'] = item['player']
                     df['team'] = team
+                    df['league'] = league
                     dfs.append(df)
 
                 if dfs:
@@ -232,29 +258,32 @@ def hdfs_data_pipeline():
                     combined_df = apply_schema_to_dataframe(combined_df)
 
                     output_path = os.path.join(
-                        PARQUET_OUTPUT_DIR, 'field_players', f'team={team}', 'data.parquet'
+                        PARQUET_OUTPUT_DIR, 'field_players',
+                        f'league={league}', f'team={team}', 'data.parquet'
                     )
                     os.makedirs(os.path.dirname(output_path), exist_ok=True)
                     combined_df.to_parquet(output_path, index=False, compression='snappy')
                     result['field_players_parquet'].append({
+                        'league': league,
                         'team': team,
                         'path': output_path,
                         'rows': len(combined_df),
                         'players': len(files)
                     })
-                    logging.info(f"Created Parquet for {team} field players: {len(combined_df)} rows")
+                    logging.info(f"Created Parquet for {league}/{team} field players: {len(combined_df)} rows")
             except Exception as e:
-                logging.error(f"Error converting {team} field players: {e}")
-                result['errors'].append(f"field_players/{team}: {str(e)}")
+                logging.error(f"Error converting {league}/{team} field players: {e}")
+                result['errors'].append(f"field_players/{league}/{team}: {str(e)}")
 
-        # Convert goalkeepers by team
-        for team, files in teams_gk.items():
+        # Convert goalkeepers by (league, team)
+        for (league, team), files in teams_gk.items():
             try:
                 dfs = []
                 for item in files:
                     df = pd.read_csv(item['file'])
                     df['player_name'] = item['player']
                     df['team'] = team
+                    df['league'] = league
                     dfs.append(df)
 
                 if dfs:
@@ -265,20 +294,22 @@ def hdfs_data_pipeline():
                     combined_df = apply_schema_to_dataframe(combined_df)
 
                     output_path = os.path.join(
-                        PARQUET_OUTPUT_DIR, 'goalkeepers', f'team={team}', 'data.parquet'
+                        PARQUET_OUTPUT_DIR, 'goalkeepers',
+                        f'league={league}', f'team={team}', 'data.parquet'
                     )
                     os.makedirs(os.path.dirname(output_path), exist_ok=True)
                     combined_df.to_parquet(output_path, index=False, compression='snappy')
                     result['goalkeepers_parquet'].append({
+                        'league': league,
                         'team': team,
                         'path': output_path,
                         'rows': len(combined_df),
                         'players': len(files)
                     })
-                    logging.info(f"Created Parquet for {team} goalkeepers: {len(combined_df)} rows")
+                    logging.info(f"Created Parquet for {league}/{team} goalkeepers: {len(combined_df)} rows")
             except Exception as e:
-                logging.error(f"Error converting {team} goalkeepers: {e}")
-                result['errors'].append(f"goalkeepers/{team}: {str(e)}")
+                logging.error(f"Error converting {league}/{team} goalkeepers: {e}")
+                result['errors'].append(f"goalkeepers/{league}/{team}: {str(e)}")
 
         logging.info(f"Created {len(result['field_players_parquet'])} field player Parquet files")
         logging.info(f"Created {len(result['goalkeepers_parquet'])} goalkeeper Parquet files")
@@ -338,9 +369,10 @@ def hdfs_data_pipeline():
 
         # Upload field players
         for item in parquet_result.get('field_players_parquet', []):
+            league = item['league']
             team = item['team']
             local_path = item['path']
-            hdfs_path = f"{HDFS_BASE_PATH}/field_players/team={team}/data.parquet"
+            hdfs_path = f"{HDFS_BASE_PATH}/field_players/league={league}/team={team}/data.parquet"
 
             if upload_file(local_path, hdfs_path):
                 result['uploaded_field_players'] += 1
@@ -351,9 +383,10 @@ def hdfs_data_pipeline():
 
         # Upload goalkeepers
         for item in parquet_result.get('goalkeepers_parquet', []):
+            league = item['league']
             team = item['team']
             local_path = item['path']
-            hdfs_path = f"{HDFS_BASE_PATH}/goalkeepers/team={team}/data.parquet"
+            hdfs_path = f"{HDFS_BASE_PATH}/goalkeepers/league={league}/team={team}/data.parquet"
 
             if upload_file(local_path, hdfs_path):
                 result['uploaded_goalkeepers'] += 1
@@ -367,32 +400,117 @@ def hdfs_data_pipeline():
 
         return result
 
+    @task(task_id='sync_partitions')
+    def sync_partitions(upload_result: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Synchronize partition metadata in Trino/Hive after HDFS upload
+
+        This ensures Trino can see all partitions (leagues/teams) that were uploaded to HDFS.
+        Without this step, Trino only sees partitions that existed when tables were created.
+
+        Args:
+            upload_result: Dict with upload statistics
+
+        Returns:
+            Dict with sync results
+        """
+        import trino
+
+        logging.info("=" * 80)
+        logging.info("TASK: Sync Partition Metadata")
+        logging.info("=" * 80)
+
+        result = {
+            'field_players_synced': False,
+            'goalkeepers_synced': False,
+            'errors': []
+        }
+
+        try:
+            # Connect to Trino coordinator
+            conn = trino.dbapi.connect(
+                host=TRINO_HOST,
+                port=TRINO_PORT,
+                user='airflow',
+                catalog=TRINO_CATALOG,
+                schema=TRINO_SCHEMA,
+            )
+            cursor = conn.cursor()
+
+            # Sync field_players table partitions
+            try:
+                logging.info("Syncing field_players table partitions...")
+                cursor.execute("CALL system.sync_partition_metadata('all_leagues', 'field_players', 'FULL')")
+                result['field_players_synced'] = True
+                logging.info("✅ field_players partitions synced successfully")
+            except Exception as e:
+                error_msg = f"Failed to sync field_players: {str(e)}"
+                logging.error(error_msg)
+                result['errors'].append(error_msg)
+
+            # Sync goalkeepers table partitions
+            try:
+                logging.info("Syncing goalkeepers table partitions...")
+                cursor.execute("CALL system.sync_partition_metadata('all_leagues', 'goalkeepers', 'FULL')")
+                result['goalkeepers_synced'] = True
+                logging.info("✅ goalkeepers partitions synced successfully")
+            except Exception as e:
+                error_msg = f"Failed to sync goalkeepers: {str(e)}"
+                logging.error(error_msg)
+                result['errors'].append(error_msg)
+
+            cursor.close()
+            conn.close()
+
+            logging.info(f"\n📊 SYNC SUMMARY:")
+            logging.info(f"   Field players synced: {result['field_players_synced']}")
+            logging.info(f"   Goalkeepers synced: {result['goalkeepers_synced']}")
+
+            if result['errors']:
+                logging.warning(f"\n⚠️ ERRORS ({len(result['errors'])}):")
+                for error in result['errors']:
+                    logging.warning(f"   - {error}")
+
+        except Exception as e:
+            error_msg = f"Failed to connect to Trino: {str(e)}"
+            logging.error(error_msg)
+            result['errors'].append(error_msg)
+            raise
+
+        return result
+
     @task(task_id='report_upload_results')
     def report_upload_results(
         scan_result: Dict,
         parquet_result: Dict,
-        upload_result: Dict
+        upload_result: Dict,
+        sync_result: Dict | None = None
     ) -> Dict[str, Any]:
         """
         Generate final report of the upload process
         """
         logging.info("=" * 80)
-        logging.info("HDFS DATA PIPELINE - FINAL REPORT")
+        logging.info("HDFS DATA PIPELINE - FINAL REPORT (ALL LEAGUES)")
         logging.info("=" * 80)
 
         summary = {
-            'teams_processed': len(scan_result.get('teams', [])),
+            'leagues_processed': len(scan_result.get('leagues', [])),
             'csv_field_players': len(scan_result.get('field_players', [])),
             'csv_goalkeepers': len(scan_result.get('goalkeepers', [])),
             'parquet_field_players': len(parquet_result.get('field_players_parquet', [])),
             'parquet_goalkeepers': len(parquet_result.get('goalkeepers_parquet', [])),
             'hdfs_uploaded_fp': upload_result.get('uploaded_field_players', 0),
             'hdfs_uploaded_gk': upload_result.get('uploaded_goalkeepers', 0),
+            'sync_field_players': bool(sync_result and sync_result.get('field_players_synced')),
+            'sync_goalkeepers': bool(sync_result and sync_result.get('goalkeepers_synced')),
             'errors': parquet_result.get('errors', []) + upload_result.get('errors', [])
         }
 
+        if sync_result:
+            summary['errors'].extend(sync_result.get('errors', []))
+
         logging.info(f"\n📊 SUMMARY:")
-        logging.info(f"   Teams processed: {summary['teams_processed']}")
+        logging.info(f"   Leagues processed: {summary['leagues_processed']}")
         logging.info(f"\n📁 CSV FILES:")
         logging.info(f"   Field players: {summary['csv_field_players']}")
         logging.info(f"   Goalkeepers: {summary['csv_goalkeepers']}")
@@ -402,6 +520,9 @@ def hdfs_data_pipeline():
         logging.info(f"\n☁️ HDFS UPLOADS:")
         logging.info(f"   Field players: {summary['hdfs_uploaded_fp']}")
         logging.info(f"   Goalkeepers: {summary['hdfs_uploaded_gk']}")
+        logging.info(f"\n🗃️ PARTITION SYNC:")
+        logging.info(f"   Field players: {summary['sync_field_players']}")
+        logging.info(f"   Goalkeepers: {summary['sync_goalkeepers']}")
 
         if summary['errors']:
             logging.warning(f"\n⚠️ ERRORS ({len(summary['errors'])}):")
@@ -410,8 +531,13 @@ def hdfs_data_pipeline():
 
         logging.info(f"\n🔗 HDFS PATH: hdfs://namenode:8020{HDFS_BASE_PATH}")
         logging.info(f"🌐 TRINO ACCESS:")
-        logging.info(f"   SELECT * FROM hive.premier_league.field_players")
-        logging.info(f"   SELECT * FROM hive.premier_league.goalkeepers")
+        logging.info(f"   SELECT * FROM hive.all_leagues.field_players LIMIT 10;")
+        logging.info(f"   SELECT * FROM hive.all_leagues.goalkeepers LIMIT 10;")
+        logging.info(f"\n📈 EXAMPLE QUERIES:")
+        logging.info(f"   -- Filter by league:")
+        logging.info(f"   SELECT * FROM hive.all_leagues.field_players WHERE league = 'a_league_men';")
+        logging.info(f"   -- Top scorers across all leagues:")
+        logging.info(f"   SELECT league, player_name, performance_gls FROM hive.all_leagues.field_players ORDER BY performance_gls DESC LIMIT 20;")
 
         logging.info("\n" + "=" * 80)
         logging.info("HDFS DATA PIPELINE COMPLETED!")
@@ -423,7 +549,8 @@ def hdfs_data_pipeline():
     scan = scan_local_data()
     parquet = convert_to_parquet(scan)
     upload = upload_to_hdfs(parquet)
-    report = report_upload_results(scan, parquet, upload)
+    sync = sync_partitions(upload)
+    report = report_upload_results(scan, parquet, upload, sync)
 
     return report
 
