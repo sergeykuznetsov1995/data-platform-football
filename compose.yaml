@@ -1,0 +1,396 @@
+# =============================================================================
+# Data Platform - Docker Compose
+# Medallion Architecture: Bronze -> Silver -> Gold
+# =============================================================================
+
+name: data-platform
+
+x-airflow-common: &airflow-common
+  build:
+    context: ./docker/images/airflow
+    dockerfile: Dockerfile
+  environment:
+    &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: ${AIRFLOW__CORE__EXECUTOR}
+    AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW__CORE__FERNET_KEY}
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: ${AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION}
+    AIRFLOW__CORE__LOAD_EXAMPLES: ${AIRFLOW__CORE__LOAD_EXAMPLES}
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: ${AIRFLOW__DATABASE__SQL_ALCHEMY_CONN}
+    AIRFLOW__CELERY__RESULT_BACKEND: ${AIRFLOW__CELERY__RESULT_BACKEND}
+    AIRFLOW__CELERY__BROKER_URL: ${AIRFLOW__CELERY__BROKER_URL}
+    AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW__WEBSERVER__SECRET_KEY}
+    AIRFLOW__WEBSERVER__EXPOSE_CONFIG: ${AIRFLOW__WEBSERVER__EXPOSE_CONFIG}
+    SPARK_MASTER_URL: ${SPARK_MASTER_URL}
+    JAVA_HOME: /usr/lib/jvm/java-17-openjdk-amd64
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - ./logs:/opt/airflow/logs
+    - ./spark_jobs:/opt/airflow/spark_jobs
+    - ./configs/spark:/opt/spark/conf
+  networks:
+    - data-platform-net
+  depends_on:
+    postgres:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+
+services:
+  # ===========================================================================
+  # HDFS - Distributed File System
+  # ===========================================================================
+  namenode:
+    build:
+      context: ./docker/images/hdfs
+      dockerfile: Dockerfile
+    container_name: namenode
+    hostname: namenode
+    environment:
+      - CLUSTER_NAME=data-platform
+      - HDFS_NAMENODE_USER=root
+      - HDFS_DATANODE_USER=root
+      - HDFS_SECONDARYNAMENODE_USER=root
+    ports:
+      - "9870:9870"  # Web UI
+      - "9000:9000"  # HDFS port
+    volumes:
+      - namenode_data:/hadoop/dfs/name
+      - ./configs/hdfs:/opt/hadoop/etc/hadoop
+    networks:
+      - data-platform-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://namenode:9870/"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    command: ["hdfs", "namenode"]
+
+  datanode1:
+    build:
+      context: ./docker/images/hdfs
+      dockerfile: Dockerfile
+    container_name: datanode1
+    hostname: datanode1
+    environment:
+      - HDFS_NAMENODE_USER=root
+      - HDFS_DATANODE_USER=root
+    volumes:
+      - datanode1_data:/hadoop/dfs/data
+      - ./configs/hdfs:/opt/hadoop/etc/hadoop
+    networks:
+      - data-platform-net
+    depends_on:
+      namenode:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://$(hostname):9864/ || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    command: ["hdfs", "datanode"]
+
+  datanode2:
+    build:
+      context: ./docker/images/hdfs
+      dockerfile: Dockerfile
+    container_name: datanode2
+    hostname: datanode2
+    environment:
+      - HDFS_NAMENODE_USER=root
+      - HDFS_DATANODE_USER=root
+    volumes:
+      - datanode2_data:/hadoop/dfs/data
+      - ./configs/hdfs:/opt/hadoop/etc/hadoop
+    networks:
+      - data-platform-net
+    depends_on:
+      namenode:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://$(hostname):9864/ || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    command: ["hdfs", "datanode"]
+
+  # ===========================================================================
+  # PostgreSQL - Metadata Storage
+  # ===========================================================================
+  postgres:
+    image: postgres:16-alpine
+    container_name: postgres
+    hostname: postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      AIRFLOW_DB_PASSWORD: ${AIRFLOW_DB_PASSWORD}
+      HIVE_METASTORE_DB_PASSWORD: ${HIVE_METASTORE_DB_PASSWORD}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./docker/images/postgres/init-databases.sh:/docker-entrypoint-initdb.d/init-databases.sh
+    networks:
+      - data-platform-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # ===========================================================================
+  # Hive Metastore
+  # ===========================================================================
+  hive-metastore:
+    build:
+      context: ./docker/images/hive
+      dockerfile: Dockerfile
+    container_name: hive-metastore
+    hostname: hive-metastore
+    environment:
+      SERVICE_NAME: metastore
+      DB_DRIVER: postgres
+      SERVICE_OPTS: >-
+        -Djavax.jdo.option.ConnectionDriverName=org.postgresql.Driver
+        -Djavax.jdo.option.ConnectionURL=jdbc:postgresql://postgres:5432/hive_metastore
+        -Djavax.jdo.option.ConnectionUserName=hive
+        -Djavax.jdo.option.ConnectionPassword=${HIVE_METASTORE_DB_PASSWORD}
+    ports:
+      - "9083:9083"
+    volumes:
+      - ./configs/hive:/opt/hive/conf
+      - hive_warehouse:/user/hive/warehouse
+    networks:
+      - data-platform-net
+    depends_on:
+      postgres:
+        condition: service_healthy
+      namenode:
+        condition: service_healthy
+      datanode1:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'echo > /dev/tcp/localhost/9083'"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
+
+  # ===========================================================================
+  # Spark Cluster
+  # ===========================================================================
+  spark-master:
+    build:
+      context: ./docker/images/spark
+      dockerfile: Dockerfile
+    container_name: spark-master
+    hostname: spark-master
+    environment:
+      - SPARK_MODE=master
+      - SPARK_MASTER_HOST=spark-master
+      - SPARK_MASTER_PORT=7077
+      - SPARK_MASTER_WEBUI_PORT=8080
+    ports:
+      - "8080:8080"  # Web UI
+      - "7077:7077"  # Spark Master
+    volumes:
+      - ./configs/spark:/opt/spark/conf
+      - ./spark_jobs:/opt/spark_jobs
+    networks:
+      - data-platform-net
+    depends_on:
+      hive-metastore:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.master.Master"]
+
+  spark-worker-1:
+    build:
+      context: ./docker/images/spark
+      dockerfile: Dockerfile
+    container_name: spark-worker-1
+    hostname: spark-worker-1
+    environment:
+      - SPARK_MODE=worker
+      - SPARK_MASTER_URL=spark://spark-master:7077
+      - SPARK_WORKER_MEMORY=2G
+      - SPARK_WORKER_CORES=2
+    volumes:
+      - ./configs/spark:/opt/spark/conf
+      - ./spark_jobs:/opt/spark_jobs
+    networks:
+      - data-platform-net
+    depends_on:
+      spark-master:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8081/"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.worker.Worker", "spark://spark-master:7077"]
+
+  spark-worker-2:
+    build:
+      context: ./docker/images/spark
+      dockerfile: Dockerfile
+    container_name: spark-worker-2
+    hostname: spark-worker-2
+    environment:
+      - SPARK_MODE=worker
+      - SPARK_MASTER_URL=spark://spark-master:7077
+      - SPARK_WORKER_MEMORY=2G
+      - SPARK_WORKER_CORES=2
+    volumes:
+      - ./configs/spark:/opt/spark/conf
+      - ./spark_jobs:/opt/spark_jobs
+    networks:
+      - data-platform-net
+    depends_on:
+      spark-master:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8081/"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.worker.Worker", "spark://spark-master:7077"]
+
+  # ===========================================================================
+  # Redis - Celery Broker for Airflow
+  # ===========================================================================
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    hostname: redis
+    command: redis-server --requirepass ${REDIS_PASSWORD}
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - data-platform-net
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ===========================================================================
+  # Airflow
+  # ===========================================================================
+  airflow-init:
+    <<: *airflow-common
+    container_name: airflow-init
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        airflow db migrate
+        airflow users create \
+          --username $${_AIRFLOW_WWW_USER_USERNAME} \
+          --password $${_AIRFLOW_WWW_USER_PASSWORD} \
+          --firstname Admin \
+          --lastname User \
+          --role Admin \
+          --email admin@example.com || true
+        echo "Airflow initialization complete"
+    environment:
+      <<: *airflow-common-env
+      _AIRFLOW_WWW_USER_USERNAME: ${_AIRFLOW_WWW_USER_USERNAME}
+      _AIRFLOW_WWW_USER_PASSWORD: ${_AIRFLOW_WWW_USER_PASSWORD}
+    restart: "no"
+
+  airflow-webserver:
+    <<: *airflow-common
+    container_name: airflow-webserver
+    command: webserver
+    ports:
+      - "8081:8080"
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+      spark-master:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    restart: unless-stopped
+
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: airflow-scheduler
+    command: scheduler
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "airflow jobs check --job-type SchedulerJob --hostname \"$${HOSTNAME}\""]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    restart: unless-stopped
+
+  # ===========================================================================
+  # Trino - Distributed SQL Query Engine
+  # ===========================================================================
+  trino:
+    image: trinodb/trino:479
+    container_name: trino
+    hostname: trino
+    ports:
+      - "8082:8080"
+    volumes:
+      - ./configs/trino:/etc/trino
+    networks:
+      - data-platform-net
+    depends_on:
+      hive-metastore:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/v1/info"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+# =============================================================================
+# Networks
+# =============================================================================
+networks:
+  data-platform-net:
+    driver: bridge
+    name: data-platform-net
+
+# =============================================================================
+# Volumes
+# =============================================================================
+volumes:
+  namenode_data:
+    name: namenode_data
+  datanode1_data:
+    name: datanode1_data
+  datanode2_data:
+    name: datanode2_data
+  postgres_data:
+    name: postgres_data
+  hive_warehouse:
+    name: hive_warehouse
+  redis_data:
+    name: redis_data
