@@ -1,0 +1,31 @@
+# =============================================================================
+# Airflow Python Dependencies (Compatible with Airflow 2.10.4)
+# =============================================================================
+
+# Apache providers (latest for Airflow 2.x)
+apache-airflow-providers-apache-spark==4.11.1
+apache-airflow-providers-postgres==5.13.1
+apache-airflow-providers-redis==3.8.0
+apache-airflow-providers-celery==3.8.5
+apache-airflow-providers-http==4.13.2
+
+# PySpark
+pyspark==3.5.3
+
+# Data processing
+pandas>=2.0.0
+numpy>=1.24.0
+pyarrow>=14.0.0
+
+# HTTP and API clients
+requests>=2.31.0
+beautifulsoup4>=4.12.0
+lxml>=5.0.0
+
+# Database connectors
+psycopg2-binary>=2.9.9
+redis>=5.0.0
+
+# Utilities
+python-dotenv>=1.0.0
+tenacity>=8.2.0

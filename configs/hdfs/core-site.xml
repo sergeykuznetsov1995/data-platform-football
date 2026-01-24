@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<?xml-stylesheet type="text/xsl" href="configuration.xsl"?>
+<!--
+  Data Platform - HDFS Core Configuration
+-->
+<configuration>
+    <!-- Default filesystem -->
+    <property>
+        <name>fs.defaultFS</name>
+        <value>hdfs://namenode:9000</value>
+    </property>
+
+    <!-- Trash configuration -->
+    <property>
+        <name>fs.trash.interval</name>
+        <value>1440</value>
+        <description>Number of minutes after which a trash checkpoint is deleted (24 hours)</description>
+    </property>
+
+    <!-- I/O settings -->
+    <property>
+        <name>io.file.buffer.size</name>
+        <value>131072</value>
+    </property>
+
+    <!-- Proxy user settings for Hive -->
+    <property>
+        <name>hadoop.proxyuser.hive.hosts</name>
+        <value>*</value>
+    </property>
+    <property>
+        <name>hadoop.proxyuser.hive.groups</name>
+        <value>*</value>
+    </property>
+
+    <!-- Proxy user settings for root -->
+    <property>
+        <name>hadoop.proxyuser.root.hosts</name>
+        <value>*</value>
+    </property>
+    <property>
+        <name>hadoop.proxyuser.root.groups</name>
+        <value>*</value>
+    </property>
+</configuration>
