@@ -42,7 +42,23 @@ hdfs dfs -chmod -R 777 /data
 hdfs dfs -chmod -R 777 /user
 hdfs dfs -chmod -R 777 /tmp
 
+# Create Iceberg warehouse directory
+hdfs dfs -mkdir -p /user/hive/warehouse/iceberg
+hdfs dfs -mkdir -p /user/hive/warehouse/iceberg/bronze
+hdfs dfs -mkdir -p /user/hive/warehouse/iceberg/silver
+hdfs dfs -mkdir -p /user/hive/warehouse/iceberg/gold
+
+# Create Spark events directory
+hdfs dfs -mkdir -p /tmp/spark-events
+
+# Set permissions for Iceberg warehouse
+hdfs dfs -chmod -R 777 /user/hive/warehouse/iceberg
+hdfs dfs -chmod -R 777 /tmp/spark-events
+
 echo "Medallion Architecture directories created successfully!"
 echo ""
 echo "Directory structure:"
 hdfs dfs -ls -R /data | head -30
+echo ""
+echo "Iceberg warehouse:"
+hdfs dfs -ls /user/hive/warehouse/iceberg

@@ -1,0 +1,30 @@
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_functions = ["test_*"]
+markers = [
+    "integration: tests with real HTTP requests to external sources",
+    "slow: slow tests (>10 seconds)",
+    "cloudflare: tests requiring Selenium for Cloudflare bypass",
+    "flaky: tests that may fail due to external service issues",
+    "tor: tests requiring Tor proxy on port 9050",
+    "soccerdata: tests requiring soccerdata library",
+]
+filterwarnings = [
+    "ignore::DeprecationWarning",
+    "ignore::PendingDeprecationWarning",
+]
+# timeout = 120  # Requires pytest-timeout plugin
+
+[tool.coverage.run]
+source = ["scrapers"]
+omit = ["tests/*", "*/__pycache__/*"]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+]
