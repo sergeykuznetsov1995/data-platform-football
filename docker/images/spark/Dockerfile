@@ -24,4 +24,12 @@ ENV SPARK_HOME=/opt/spark
 ENV PATH=$SPARK_HOME/bin:$SPARK_HOME/sbin:$PATH
 ENV SPARK_NO_DAEMONIZE=true
 
+# Iceberg Spark runtime
+RUN curl -fsSL "https://repo1.maven.org/maven2/org/apache/iceberg/iceberg-spark-runtime-3.5_2.12/1.4.3/iceberg-spark-runtime-3.5_2.12-1.4.3.jar" \
+    -o /opt/spark/jars/iceberg-spark-runtime-3.5_2.12-1.4.3.jar
+
+# AWS bundle for S3 compatibility (optional, but useful)
+RUN curl -fsSL "https://repo1.maven.org/maven2/org/apache/iceberg/iceberg-aws-bundle/1.4.3/iceberg-aws-bundle-1.4.3.jar" \
+    -o /opt/spark/jars/iceberg-aws-bundle-1.4.3.jar
+
 WORKDIR /opt/spark

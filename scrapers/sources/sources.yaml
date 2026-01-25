@@ -1,0 +1,176 @@
+# Data source configuration for football scrapers
+# ================================================
+
+sources:
+  fbref:
+    name: FBref
+    url: https://fbref.com
+    rate_limit:
+      requests_per_minute: 20
+      burst_size: 5
+    retry:
+      max_attempts: 3
+      max_delay: 60
+    circuit_breaker:
+      fail_max: 5
+      reset_timeout: 300
+    features:
+      - schedule
+      - player_stats
+      - team_stats
+      - shooting
+      - passing
+      - keeper
+      - shot_events
+    coverage:
+      leagues: all
+      seasons: "2017-present"
+      data_quality: high
+
+  understat:
+    name: Understat
+    url: https://understat.com
+    rate_limit:
+      requests_per_minute: 30
+      burst_size: 10
+    retry:
+      max_attempts: 3
+      max_delay: 60
+    features:
+      - schedule
+      - player_stats
+      - team_stats
+      - shots
+    coverage:
+      leagues:
+        - ENG-Premier League
+        - ESP-La Liga
+        - GER-Bundesliga
+        - ITA-Serie A
+        - FRA-Ligue 1
+        - RUS-Premier League
+      seasons: "2014-present"
+      data_quality: high
+
+  whoscored:
+    name: WhoScored
+    url: https://www.whoscored.com
+    rate_limit:
+      requests_per_minute: 10
+      burst_size: 2
+    retry:
+      max_attempts: 2
+      max_delay: 120
+    circuit_breaker:
+      fail_max: 3
+      reset_timeout: 600
+    requires_selenium: true
+    cloudflare_protected: true
+    features:
+      - events_spadl
+      - player_ratings
+      - match_stats
+    coverage:
+      leagues: all
+      seasons: "2009-present"
+      data_quality: very_high
+
+  fotmob:
+    name: FotMob
+    url: https://www.fotmob.com
+    rate_limit:
+      requests_per_minute: 30
+      burst_size: 10
+    features:
+      - schedule
+      - player_stats
+      - team_stats
+      - lineups
+    coverage:
+      leagues: all
+      seasons: "2018-present"
+      data_quality: high
+
+  sofascore:
+    name: SofaScore
+    url: https://www.sofascore.com
+    rate_limit:
+      requests_per_minute: 20
+      burst_size: 5
+    features:
+      - schedule
+      - player_stats
+      - player_ratings
+      - team_stats
+    coverage:
+      leagues: all
+      seasons: "2010-present"
+      data_quality: high
+
+  sofifa:
+    name: SoFIFA
+    url: https://sofifa.com
+    rate_limit:
+      requests_per_minute: 30
+      burst_size: 10
+    features:
+      - players
+      - teams
+      - attributes
+    coverage:
+      fifa_versions: "07-24"
+      data_quality: medium
+
+  clubelo:
+    name: ClubElo
+    url: http://clubelo.com
+    rate_limit:
+      requests_per_minute: 60
+      burst_size: 20
+    features:
+      - elo_ratings
+      - team_history
+    coverage:
+      leagues: european
+      seasons: "1960-present"
+      data_quality: high
+
+  espn:
+    name: ESPN
+    url: https://www.espn.com
+    rate_limit:
+      requests_per_minute: 30
+      burst_size: 10
+    features:
+      - schedule
+      - standings
+    coverage:
+      leagues: all
+      seasons: "2000-present"
+      data_quality: medium
+
+  matchhistory:
+    name: Football-Data.co.uk
+    url: https://www.football-data.co.uk
+    rate_limit:
+      requests_per_minute: 30
+      burst_size: 10
+    features:
+      - match_results
+      - betting_odds
+    coverage:
+      leagues: european
+      seasons: "1993-present"
+      data_quality: high
+
+# Default settings
+defaults:
+  rate_limit:
+    requests_per_minute: 20
+    burst_size: 5
+  retry:
+    max_attempts: 3
+    max_delay: 60
+  circuit_breaker:
+    fail_max: 5
+    reset_timeout: 60

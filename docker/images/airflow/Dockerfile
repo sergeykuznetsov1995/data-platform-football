@@ -10,6 +10,26 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     netcat-openbsd \
     && rm -rf /var/lib/apt/lists/*
 
+# Chrome/Chromium for Selenium (headless browser automation)
+# Xvfb for virtual display (bypasses Cloudflare headless detection)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    chromium \
+    chromium-driver \
+    fonts-liberation \
+    libasound2 \
+    libatk-bridge2.0-0 \
+    libdrm2 \
+    libgbm1 \
+    libnspr4 \
+    libnss3 \
+    libxkbcommon0 \
+    xdg-utils \
+    xvfb \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV CHROME_BIN=/usr/bin/chromium
+ENV CHROMEDRIVER_PATH=/usr/bin/chromedriver
+
 # Set Java environment
 ENV JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
 ENV PATH=$JAVA_HOME/bin:$PATH
@@ -31,6 +51,14 @@ ENV PYSPARK_DRIVER_PYTHON=python3
 # Download PostgreSQL JDBC driver for Spark
 RUN curl -fsSL "https://jdbc.postgresql.org/download/postgresql-42.7.4.jar" \
     -o ${SPARK_HOME}/jars/postgresql-42.7.4.jar
+
+# Iceberg Spark runtime for PySpark jobs
+RUN curl -fsSL "https://repo1.maven.org/maven2/org/apache/iceberg/iceberg-spark-runtime-3.5_2.12/1.4.3/iceberg-spark-runtime-3.5_2.12-1.4.3.jar" \
+    -o ${SPARK_HOME}/jars/iceberg-spark-runtime-3.5_2.12-1.4.3.jar
+
+# AWS bundle for S3 compatibility
+RUN curl -fsSL "https://repo1.maven.org/maven2/org/apache/iceberg/iceberg-aws-bundle/1.4.3/iceberg-aws-bundle-1.4.3.jar" \
+    -o ${SPARK_HOME}/jars/iceberg-aws-bundle-1.4.3.jar
 
 # Create directories
 RUN mkdir -p /opt/airflow/spark_jobs /opt/airflow/dags /opt/airflow/logs

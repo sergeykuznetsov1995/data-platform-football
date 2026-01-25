@@ -1,0 +1,87 @@
+# League configuration for football data scrapers
+# ================================================
+
+# Top 5 European leagues
+top5:
+  - ENG-Premier League
+  - ESP-La Liga
+  - GER-Bundesliga
+  - ITA-Serie A
+  - FRA-Ligue 1
+
+# Extended European leagues
+european:
+  - ENG-Premier League
+  - ESP-La Liga
+  - GER-Bundesliga
+  - ITA-Serie A
+  - FRA-Ligue 1
+  - NED-Eredivisie
+  - POR-Primeira Liga
+  - RUS-Premier League
+  - BEL-First Division A
+  - TUR-Super Lig
+  - UKR-Premier League
+
+# English leagues
+england:
+  - ENG-Premier League
+  - ENG-Championship
+  - ENG-League One
+  - ENG-League Two
+
+# Default leagues for scraping
+default:
+  - ENG-Premier League
+
+# League metadata
+metadata:
+  ENG-Premier League:
+    country: England
+    level: 1
+    teams: 20
+    matches_per_season: 380
+    fbref_id: 9
+    whoscored_id: 2
+    sofascore_id: 17
+    espn_id: eng.1
+
+  ESP-La Liga:
+    country: Spain
+    level: 1
+    teams: 20
+    matches_per_season: 380
+    fbref_id: 12
+    whoscored_id: 4
+    sofascore_id: 8
+    espn_id: esp.1
+
+  GER-Bundesliga:
+    country: Germany
+    level: 1
+    teams: 18
+    matches_per_season: 306
+    fbref_id: 20
+    whoscored_id: 3
+    sofascore_id: 35
+    espn_id: ger.1
+
+  ITA-Serie A:
+    country: Italy
+    level: 1
+    teams: 20
+    matches_per_season: 380
+    fbref_id: 11
+    whoscored_id: 5
+    sofascore_id: 23
+    espn_id: ita.1
+
+  FRA-Ligue 1:
+    country: France
+    level: 1
+    teams: 18
+    matches_per_season: 306
+    fbref_id: 13
+    whoscored_id: 22
+    sofascore_id: 34
+    espn_id: fra.1

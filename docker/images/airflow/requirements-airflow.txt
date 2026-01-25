@@ -29,3 +29,19 @@ redis>=5.0.0
 # Utilities
 python-dotenv>=1.0.0
 tenacity>=8.2.0
+
+# =============================================================================
+# Soccerdata and Web Scraping
+# =============================================================================
+soccerdata>=1.8.8
+undetected-chromedriver>=3.5.0
+selenium>=4.15.0
+cloudscraper>=1.2.71
+pyvirtualdisplay>=3.0  # Xvfb wrapper for Cloudflare bypass
+
+# Resilience patterns
+pybreaker>=1.2.0
+PySocks>=1.7.1
+
+# Apache Iceberg
+pyiceberg[hive]>=0.7.0
