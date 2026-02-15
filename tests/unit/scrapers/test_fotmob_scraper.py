@@ -1,5 +1,5 @@
 """
-Unit tests for FotMobSeleniumScraper.
+Unit tests for FotMobScraper.
 
 Tests scraper logic with mocked HTTP responses.
 """
@@ -11,14 +11,14 @@ import pandas as pd
 import pytest
 
 
-class TestFotMobSeleniumScraperUnit:
-    """Unit tests for FotMobSeleniumScraper."""
+class TestFotMobScraperUnit:
+    """Unit tests for FotMobScraper."""
 
     @pytest.fixture
     def scraper_class(self):
         """Get scraper class without instantiating."""
-        from scrapers.fotmob_selenium_scraper import FotMobSeleniumScraper
-        return FotMobSeleniumScraper
+        from scrapers.fotmob_scraper import FotMobScraper
+        return FotMobScraper
 
     @pytest.fixture
     def mock_scraper(self, scraper_class):
@@ -310,7 +310,7 @@ class TestFotMobLeagueMapping:
 
     def test_major_leagues_present(self):
         """Test that all major leagues are mapped."""
-        from scrapers.fotmob_selenium_scraper import FotMobSeleniumScraper
+        from scrapers.fotmob_scraper import FotMobScraper
 
         major_leagues = [
             'ENG-Premier League',
@@ -321,5 +321,5 @@ class TestFotMobLeagueMapping:
         ]
 
         for league in major_leagues:
-            assert league in FotMobSeleniumScraper.LEAGUE_IDS
-            assert FotMobSeleniumScraper.LEAGUE_IDS[league] is not None
+            assert league in FotMobScraper.LEAGUE_IDS
+            assert FotMobScraper.LEAGUE_IDS[league] is not None

@@ -8,6 +8,7 @@ and Iceberg table writing.
 """
 
 import logging
+import os
 import uuid
 from abc import ABC, abstractmethod
 from datetime import datetime
@@ -88,6 +89,7 @@ class BaseScraper(ABC):
         seasons: Optional[List[int]] = None,
         config_path: Optional[str] = None,
         proxy: Optional[str] = None,
+        proxy_file: Optional[str] = None,
         no_cache: bool = False,
         rate_limit: Optional[int] = None,
     ):
@@ -99,12 +101,14 @@ class BaseScraper(ABC):
             seasons: List of seasons to scrape (e.g., [2023, 2024])
             config_path: Path to YAML config file
             proxy: Proxy server URL
+            proxy_file: Path to file with proxies (format: host:port:user:pass)
             no_cache: Disable caching
             rate_limit: Custom rate limit (requests per minute)
         """
         self.leagues = leagues or []
         self.seasons = seasons or []
         self.proxy = proxy
+        self.proxy_file = proxy_file
         self.no_cache = no_cache
 
         # Load configuration
@@ -117,7 +121,12 @@ class BaseScraper(ABC):
         self._iceberg_writer = IcebergWriter()
         self._proxy_manager: Optional[ProxyManager] = None
 
-        if proxy:
+        # Initialize proxy manager from file or single proxy URL
+        if proxy_file and os.path.exists(proxy_file):
+            self._proxy_manager = ProxyManager(rotation_strategy='random')
+            count = self._proxy_manager.load_from_file_custom_format(proxy_file)
+            logger.info(f"Loaded {count} proxies from {proxy_file}")
+        elif proxy:
             self._proxy_manager = ProxyManager()
             self._proxy_manager.add_proxy_url(proxy)
 
@@ -367,26 +376,61 @@ class SeleniumScraper(BaseScraper):
     Base class for scrapers requiring Selenium browser automation.
 
     Used for sources with Cloudflare protection or JavaScript rendering.
+
+    Supports two modes:
+    1. Selenium with undetected-chromedriver (default)
+    2. FlareSolverr - external service for solving Cloudflare challenges
     """
 
     def __init__(
         self,
         headless: bool = True,
+        use_xvfb: bool = False,
+        proxy_file: Optional[str] = None,
+        use_flaresolverr: bool = False,
+        flaresolverr_url: str = "http://flaresolverr:8191",
         **kwargs
     ):
-        super().__init__(**kwargs)
+        """
+        Initialize Selenium scraper.
+
+        Args:
+            headless: Run browser in headless mode
+            use_xvfb: Use Xvfb for virtual display
+            proxy_file: Path to file with proxies
+            use_flaresolverr: Use FlareSolverr instead of Selenium
+            flaresolverr_url: URL of FlareSolverr service
+            **kwargs: Additional arguments for BaseScraper
+        """
+        super().__init__(proxy_file=proxy_file, **kwargs)
 
         self.headless = headless
+        self.use_xvfb = use_xvfb
+        self.use_flaresolverr = use_flaresolverr
+        self.flaresolverr_url = flaresolverr_url
         self._browser = None
 
     def _get_browser(self):
-        """Get or create browser instance."""
+        """Get or create browser instance with proxy support."""
         if self._browser is None:
             from scrapers.base.cloudflare_bypass import CloudflareBypass
 
+            # Get proxy URL from manager or direct proxy
+            proxy_url = None
+            if self._proxy_manager and self._proxy_manager.total_count > 0:
+                proxy_obj = self._proxy_manager.get_proxy()
+                if proxy_obj:
+                    proxy_url = proxy_obj.url
+                    logger.info(f"Using proxy: {proxy_obj.host}:{proxy_obj.port}")
+            elif self.proxy:
+                proxy_url = self.proxy
+
             self._browser = CloudflareBypass(
                 headless=self.headless,
-                proxy=self.proxy,
+                use_xvfb=self.use_xvfb,
+                proxy=proxy_url,
+                use_flaresolverr=self.use_flaresolverr,
+                flaresolverr_url=self.flaresolverr_url,
             )
 
         return self._browser

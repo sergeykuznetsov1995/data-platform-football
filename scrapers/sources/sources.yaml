@@ -5,6 +5,8 @@ sources:
   fbref:
     name: FBref
     url: https://fbref.com
+    requires_selenium: true
+    cloudflare_protected: true
     rate_limit:
       requests_per_minute: 20
       burst_size: 5
@@ -141,6 +143,12 @@ sources:
     rate_limit:
       requests_per_minute: 30
       burst_size: 10
+    retry:
+      max_attempts: 3
+      max_delay: 60
+    circuit_breaker:
+      fail_max: 5
+      reset_timeout: 300
     features:
       - schedule
       - standings
@@ -155,6 +163,12 @@ sources:
     rate_limit:
       requests_per_minute: 30
       burst_size: 10
+    retry:
+      max_attempts: 3
+      max_delay: 60
+    circuit_breaker:
+      fail_max: 5
+      reset_timeout: 300
     features:
       - match_results
       - betting_odds

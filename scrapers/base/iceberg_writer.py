@@ -2,38 +2,34 @@
 Iceberg Writer
 ==============
 
-Writes DataFrames to Apache Iceberg tables through Hive Metastore.
+Writes DataFrames directly to Apache Iceberg tables via Trino INSERT.
 Supports partitioning, schema evolution, and ACID transactions.
+
+Storage Pipeline:
+    DataFrame → Trino INSERT INTO iceberg.{schema}.{table}
+
+Benefits of Iceberg:
+    - Time Travel: query historical snapshots
+    - Schema Evolution: add/rename columns without rewrite
+    - ACID: DELETE, UPDATE, MERGE support
+    - Automatic file management
 """
 
 import logging
+import os
 import uuid
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import List, Optional, Tuple
 
 import pandas as pd
 import pyarrow as pa
-import pyarrow.parquet as pq
 
 logger = logging.getLogger(__name__)
-
-# Try to import pyiceberg - may not be available in all environments
-try:
-    from pyiceberg.catalog import load_catalog
-    from pyiceberg.schema import Schema as IcebergSchema
-    from pyiceberg.partitioning import PartitionSpec, PartitionField
-    from pyiceberg.transforms import IdentityTransform
-    from pyiceberg.table import Table
-    from pyiceberg.exceptions import NoSuchTableError, NoSuchNamespaceError
-    PYICEBERG_AVAILABLE = True
-except ImportError:
-    PYICEBERG_AVAILABLE = False
-    logger.warning("PyIceberg not available, using fallback Spark SQL writer")
 
 
 class IcebergWriter:
     """
-    Writes DataFrames to Iceberg tables via Hive Metastore.
+    Writes DataFrames directly to Iceberg tables via Trino INSERT.
 
     Usage:
         writer = IcebergWriter()
@@ -53,104 +49,77 @@ class IcebergWriter:
 
     def __init__(
         self,
-        catalog_name: str = 'iceberg',
-        metastore_uri: str = 'thrift://hive-metastore:9083',
-        warehouse_path: str = 'hdfs://namenode:9000/user/hive/warehouse/iceberg',
+        trino_host: str = None,
+        trino_port: int = None,
+        catalog: str = 'iceberg',
     ):
         """
         Initialize Iceberg writer.
 
         Args:
-            catalog_name: Name of the Iceberg catalog
-            metastore_uri: Hive Metastore Thrift URI
-            warehouse_path: HDFS path for warehouse
+            trino_host: Trino coordinator hostname (default from env or 'trino')
+            trino_port: Trino coordinator port (default from env or 8080)
+            catalog: Iceberg catalog name
         """
-        self.catalog_name = catalog_name
-        self.metastore_uri = metastore_uri
-        self.warehouse_path = warehouse_path
+        self.trino_host = trino_host or os.environ.get('TRINO_HOST', 'trino')
+        self.trino_port = trino_port or int(os.environ.get('TRINO_PORT', 8080))
+        self.catalog = catalog
+        self._trino_manager = None
 
-        self._catalog = None
-        self._spark = None
+    def _get_trino_manager(self):
+        """Get or create TrinoTableManager."""
+        if self._trino_manager is None:
+            from scrapers.base.trino_manager import TrinoTableManager
 
-    @property
-    def catalog(self):
-        """Get or create the Iceberg catalog."""
-        if self._catalog is None:
-            if PYICEBERG_AVAILABLE:
-                self._catalog = load_catalog(
-                    self.catalog_name,
-                    **{
-                        'type': 'hive',
-                        'uri': self.metastore_uri,
-                        'warehouse': self.warehouse_path,
-                    }
-                )
-            else:
-                raise RuntimeError("PyIceberg not available")
-        return self._catalog
-
-    def _get_spark(self):
-        """Get or create SparkSession for fallback operations."""
-        if self._spark is None:
-            from pyspark.sql import SparkSession
-
-            self._spark = SparkSession.builder \
-                .appName("IcebergWriter") \
-                .config("spark.sql.extensions", "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions") \
-                .config("spark.sql.catalog.iceberg", "org.apache.iceberg.spark.SparkCatalog") \
-                .config("spark.sql.catalog.iceberg.type", "hive") \
-                .config("spark.sql.catalog.iceberg.uri", self.metastore_uri) \
-                .getOrCreate()
-
-        return self._spark
+            self._trino_manager = TrinoTableManager(
+                host=self.trino_host,
+                port=self.trino_port,
+                catalog=self.catalog,
+            )
+        return self._trino_manager
 
     def namespace_exists(self, database: str) -> bool:
-        """Check if namespace (database) exists."""
+        """Check if namespace (database/schema) exists."""
         try:
-            if PYICEBERG_AVAILABLE:
-                namespaces = self.catalog.list_namespaces()
-                return (database,) in namespaces
-            else:
-                spark = self._get_spark()
-                result = spark.sql(f"SHOW DATABASES LIKE '{database}'").collect()
-                return len(result) > 0
+            trino = self._get_trino_manager()
+            return trino.schema_exists(database)
         except Exception as e:
-            logger.error(f"Error checking namespace: {e}")
+            logger.warning(f"Could not check namespace existence: {e}")
             return False
 
     def create_namespace(self, database: str) -> None:
         """Create namespace if it doesn't exist."""
-        if self.namespace_exists(database):
-            return
-
         try:
-            if PYICEBERG_AVAILABLE:
-                self.catalog.create_namespace(database)
-            else:
-                spark = self._get_spark()
-                spark.sql(f"CREATE DATABASE IF NOT EXISTS iceberg.{database}")
-            logger.info(f"Created namespace: {database}")
+            trino = self._get_trino_manager()
+            trino.create_schema(database)
         except Exception as e:
-            logger.error(f"Error creating namespace: {e}")
-            raise
+            logger.warning(f"Could not create namespace: {e}")
 
     def table_exists(self, database: str, table: str) -> bool:
-        """Check if table exists."""
+        """Check if Iceberg table exists."""
         try:
-            if PYICEBERG_AVAILABLE:
-                self.catalog.load_table(f"{database}.{table}")
-                return True
-            else:
-                spark = self._get_spark()
-                result = spark.sql(
-                    f"SHOW TABLES IN iceberg.{database} LIKE '{table}'"
-                ).collect()
-                return len(result) > 0
-        except (NoSuchTableError, Exception):
+            trino = self._get_trino_manager()
+            return trino.table_exists(database, table)
+        except Exception as e:
+            logger.warning(f"Could not check table existence: {e}")
             return False
 
     def _pandas_to_arrow(self, df: pd.DataFrame) -> pa.Table:
-        """Convert pandas DataFrame to PyArrow Table."""
+        """Convert pandas DataFrame to PyArrow Table.
+
+        Handles timestamp[ns] conversion for PyIceberg compatibility.
+        """
+        df = df.copy()
+
+        # Convert timestamp columns to microseconds for Iceberg compatibility
+        for col in df.columns:
+            if pd.api.types.is_datetime64_any_dtype(df[col]):
+                # Handle timezone-aware datetimes by converting to UTC and removing timezone
+                if hasattr(df[col], 'dt') and df[col].dt.tz is not None:
+                    df[col] = df[col].dt.tz_convert('UTC').dt.tz_localize(None)
+                # Convert to datetime64[us] which Iceberg supports
+                df[col] = df[col].astype('datetime64[us]')
+
         return pa.Table.from_pandas(df, preserve_index=False)
 
     def _add_metadata_columns(
@@ -177,7 +146,7 @@ class IcebergWriter:
         source: Optional[str] = None,
     ) -> str:
         """
-        Write DataFrame to Iceberg table.
+        Write DataFrame to Iceberg table via Trino INSERT.
 
         Args:
             df: Pandas DataFrame to write
@@ -193,91 +162,81 @@ class IcebergWriter:
         """
         if df.empty:
             logger.warning(f"Empty DataFrame, skipping write to {database}.{table}")
-            return f"iceberg.{database}.{table}"
+            return f"{self.catalog}.{database}.{table}"
 
         # Add metadata columns if requested
         if add_metadata:
             df = self._add_metadata_columns(df, source or table)
 
-        # Ensure namespace exists
-        self.create_namespace(database)
-
-        full_table_name = f"iceberg.{database}.{table}"
-
         try:
-            if PYICEBERG_AVAILABLE:
-                return self._write_with_pyiceberg(
-                    df, database, table, partition_spec, mode
-                )
-            else:
-                return self._write_with_spark(
-                    df, database, table, partition_spec, mode
-                )
+            return self._write_to_iceberg(
+                df, database, table, partition_spec, mode=mode
+            )
         except Exception as e:
-            logger.error(f"Error writing to {full_table_name}: {e}")
+            logger.error(f"Error writing to {database}.{table}: {e}")
             raise
 
-    def _write_with_pyiceberg(
+    def _write_to_iceberg(
         self,
         df: pd.DataFrame,
         database: str,
         table: str,
         partition_spec: Optional[List[Tuple[str, str]]],
-        mode: str,
+        mode: str = 'append',
     ) -> str:
-        """Write using PyIceberg API."""
-        table_id = f"{database}.{table}"
+        """
+        Write DataFrame directly to Iceberg via Trino INSERT.
+
+        Data flow:
+            1. Create Iceberg table if not exists
+            2. INSERT data via Trino VALUES clause
+            3. Iceberg manages files automatically in HDFS
+
+        Args:
+            df: DataFrame to write
+            database: Target database (e.g., 'bronze')
+            table: Target table name
+            partition_spec: Optional partition specification [(col, transform), ...]
+            mode: Write mode ('append', 'overwrite')
+
+        Returns:
+            Full table identifier (e.g., 'iceberg.bronze.clubelo_ratings')
+        """
+        from scrapers.base.trino_manager import TrinoTableManager, TrinoError
+
+        trino = self._get_trino_manager()
+        full_table = f"{self.catalog}.{database}.{table}"
+
+        # Convert DataFrame for Arrow schema extraction
         arrow_table = self._pandas_to_arrow(df)
 
-        if not self.table_exists(database, table):
-            # Create table with schema
-            iceberg_table = self.catalog.create_table(
-                identifier=table_id,
-                schema=arrow_table.schema,
+        # Create table if not exists
+        if not trino.table_exists(database, table):
+            columns = trino.arrow_schema_to_trino(arrow_table.schema)
+            partition_cols = [col for col, _ in partition_spec] if partition_spec else None
+
+            trino.create_iceberg_table(
+                schema=database,
+                table=table,
+                columns=columns,
+                partition_columns=partition_cols,
             )
-            logger.info(f"Created Iceberg table: {table_id}")
-        else:
-            iceberg_table = self.catalog.load_table(table_id)
+            logger.info(f"Created Iceberg table: {full_table}")
 
-        # Append data
-        iceberg_table.append(arrow_table)
-
-        logger.info(f"Wrote {len(df)} rows to {table_id}")
-        return f"iceberg.{table_id}"
-
-    def _write_with_spark(
-        self,
-        df: pd.DataFrame,
-        database: str,
-        table: str,
-        partition_spec: Optional[List[Tuple[str, str]]],
-        mode: str,
-    ) -> str:
-        """Write using Spark SQL as fallback."""
-        spark = self._get_spark()
-
-        # Convert pandas to Spark DataFrame
-        spark_df = spark.createDataFrame(df)
-
-        full_table_name = f"iceberg.{database}.{table}"
-
-        # Build write query
-        writer = spark_df.writeTo(full_table_name)
-
-        if partition_spec:
-            partition_cols = [col for col, _ in partition_spec]
-            writer = writer.partitionedBy(*partition_cols)
-
+        # Handle overwrite mode by deleting existing data
         if mode == 'overwrite':
-            writer.createOrReplace()
-        else:
-            if self.table_exists(database, table):
-                writer.append()
-            else:
-                writer.create()
+            try:
+                trino._execute(f"DELETE FROM {full_table}")
+                logger.info(f"Deleted existing data from {full_table}")
+            except TrinoError as e:
+                # Table might be empty or not support DELETE
+                logger.warning(f"Could not delete existing data: {e}")
 
-        logger.info(f"Wrote {len(df)} rows to {full_table_name}")
-        return full_table_name
+        # Insert data
+        rows_inserted = trino.insert_dataframe(database, table, df)
+        logger.info(f"Inserted {rows_inserted} rows into {full_table}")
+
+        return full_table
 
     def create_table_if_not_exists(
         self,
@@ -291,86 +250,25 @@ class IcebergWriter:
         Create Iceberg table if it doesn't exist.
 
         Args:
-            database: Target database
+            database: Database name
             table: Table name
-            schema: PyArrow schema for the table
-            partition_spec: Partition specification
-            comment: Table comment/description
+            schema: PyArrow schema for table columns
+            partition_spec: Optional partition specification
+            comment: Optional table comment (not used currently)
         """
-        if self.table_exists(database, table):
-            logger.debug(f"Table {database}.{table} already exists")
-            return
+        trino = self._get_trino_manager()
 
-        self.create_namespace(database)
+        if not trino.table_exists(database, table):
+            columns = trino.arrow_schema_to_trino(schema)
+            partition_cols = [col for col, _ in partition_spec] if partition_spec else None
 
-        table_id = f"{database}.{table}"
-
-        if PYICEBERG_AVAILABLE:
-            self.catalog.create_table(
-                identifier=table_id,
-                schema=schema,
+            trino.create_iceberg_table(
+                schema=database,
+                table=table,
+                columns=columns,
+                partition_columns=partition_cols,
             )
-        else:
-            # Use Spark SQL to create table
-            spark = self._get_spark()
-
-            # Build CREATE TABLE statement
-            columns = []
-            for field in schema:
-                spark_type = self._arrow_to_spark_type(field.type)
-                columns.append(f"`{field.name}` {spark_type}")
-
-            columns_str = ", ".join(columns)
-
-            partition_clause = ""
-            if partition_spec:
-                partition_cols = ", ".join(col for col, _ in partition_spec)
-                partition_clause = f"PARTITIONED BY ({partition_cols})"
-
-            sql = f"""
-                CREATE TABLE IF NOT EXISTS iceberg.{database}.{table} (
-                    {columns_str}
-                )
-                USING iceberg
-                {partition_clause}
-            """
-            spark.sql(sql)
-
-        logger.info(f"Created Iceberg table: {table_id}")
-
-    def _arrow_to_spark_type(self, arrow_type: pa.DataType) -> str:
-        """Convert PyArrow type to Spark SQL type string."""
-        type_map = {
-            pa.int8(): 'TINYINT',
-            pa.int16(): 'SMALLINT',
-            pa.int32(): 'INT',
-            pa.int64(): 'BIGINT',
-            pa.float32(): 'FLOAT',
-            pa.float64(): 'DOUBLE',
-            pa.string(): 'STRING',
-            pa.bool_(): 'BOOLEAN',
-            pa.date32(): 'DATE',
-            pa.date64(): 'DATE',
-        }
-
-        if arrow_type in type_map:
-            return type_map[arrow_type]
-
-        if pa.types.is_timestamp(arrow_type):
-            return 'TIMESTAMP'
-        if pa.types.is_decimal(arrow_type):
-            return f'DECIMAL({arrow_type.precision}, {arrow_type.scale})'
-        if pa.types.is_list(arrow_type):
-            inner = self._arrow_to_spark_type(arrow_type.value_type)
-            return f'ARRAY<{inner}>'
-        if pa.types.is_struct(arrow_type):
-            fields = [
-                f"`{f.name}`: {self._arrow_to_spark_type(f.type)}"
-                for f in arrow_type
-            ]
-            return f"STRUCT<{', '.join(fields)}>"
-
-        return 'STRING'  # Default fallback
+            logger.info(f"Created Iceberg table: {self.catalog}.{database}.{table}")
 
     def read_table(
         self,
@@ -381,7 +279,7 @@ class IcebergWriter:
         limit: Optional[int] = None,
     ) -> pd.DataFrame:
         """
-        Read data from Iceberg table.
+        Read data from Iceberg table via Trino.
 
         Args:
             database: Database name
@@ -393,36 +291,49 @@ class IcebergWriter:
         Returns:
             Pandas DataFrame
         """
-        spark = self._get_spark()
-
-        full_table_name = f"iceberg.{database}.{table}"
+        trino = self._get_trino_manager()
+        full_table = f"{self.catalog}.{database}.{table}"
 
         if columns:
-            cols = ", ".join(f"`{c}`" for c in columns)
+            cols = ", ".join(f'"{c}"' for c in columns)
         else:
             cols = "*"
 
-        sql = f"SELECT {cols} FROM {full_table_name}"
+        sql = f"SELECT {cols} FROM {full_table}"
 
         if filter_expr:
             sql += f" WHERE {filter_expr}"
         if limit:
             sql += f" LIMIT {limit}"
 
-        return spark.sql(sql).toPandas()
+        result = trino.execute_query(sql)
+
+        # Convert to DataFrame
+        if result:
+            # Get column names from cursor description
+            cursor = trino.connection.cursor()
+            cursor.execute(sql)
+            col_names = [desc[0] for desc in cursor.description]
+            cursor.close()
+            return pd.DataFrame(result, columns=col_names)
+
+        return pd.DataFrame()
 
     def get_table_history(
         self,
         database: str,
         table: str
     ) -> pd.DataFrame:
-        """Get table snapshot history for time travel."""
-        spark = self._get_spark()
-        full_table_name = f"iceberg.{database}.{table}"
+        """Get table snapshot history for time travel via Trino."""
+        trino = self._get_trino_manager()
 
-        return spark.sql(
-            f"SELECT * FROM {full_table_name}.history"
-        ).toPandas()
+        # Iceberg snapshots metadata table
+        sql = f'SELECT * FROM {self.catalog}.{database}."{table}$snapshots"'
+        result = trino.execute_query(sql)
+
+        if result:
+            return pd.DataFrame(result)
+        return pd.DataFrame()
 
     def read_snapshot(
         self,
@@ -430,35 +341,38 @@ class IcebergWriter:
         table: str,
         snapshot_id: int,
     ) -> pd.DataFrame:
-        """Read table at specific snapshot (time travel)."""
-        spark = self._get_spark()
-        full_table_name = f"iceberg.{database}.{table}"
+        """Read table at specific snapshot (time travel) via Trino."""
+        trino = self._get_trino_manager()
+        full_table = f"{self.catalog}.{database}.{table}"
 
-        return spark.sql(
-            f"SELECT * FROM {full_table_name} VERSION AS OF {snapshot_id}"
-        ).toPandas()
+        sql = f"SELECT * FROM {full_table} FOR VERSION AS OF {snapshot_id}"
+        result = trino.execute_query(sql)
+
+        if result:
+            return pd.DataFrame(result)
+        return pd.DataFrame()
 
     def compact_table(self, database: str, table: str) -> None:
-        """Run compaction on table to merge small files."""
-        spark = self._get_spark()
-        full_table_name = f"iceberg.{database}.{table}"
+        """Run compaction on table to merge small files via Trino."""
+        trino = self._get_trino_manager()
+        full_table = f"{self.catalog}.{database}.{table}"
 
-        spark.sql(f"CALL iceberg.system.rewrite_data_files('{full_table_name}')")
-        logger.info(f"Compacted table: {full_table_name}")
+        # Trino Iceberg optimize procedure
+        sql = f"ALTER TABLE {full_table} EXECUTE optimize"
+        trino._execute(sql)
+        logger.info(f"Compacted table: {full_table}")
 
     def expire_snapshots(
         self,
         database: str,
         table: str,
-        older_than: str = "7 days"
+        retention_days: int = 7
     ) -> None:
-        """Expire old snapshots to reclaim storage."""
-        spark = self._get_spark()
-        full_table_name = f"iceberg.{database}.{table}"
+        """Expire old snapshots to reclaim storage via Trino."""
+        trino = self._get_trino_manager()
+        full_table = f"{self.catalog}.{database}.{table}"
 
-        spark.sql(
-            f"CALL iceberg.system.expire_snapshots("
-            f"table => '{full_table_name}', "
-            f"older_than => TIMESTAMP '{older_than}')"
-        )
-        logger.info(f"Expired snapshots older than {older_than} for {full_table_name}")
+        # Trino Iceberg expire_snapshots procedure
+        sql = f"ALTER TABLE {full_table} EXECUTE expire_snapshots(retention_threshold => '{retention_days}d')"
+        trino._execute(sql)
+        logger.info(f"Expired snapshots older than {retention_days} days for {full_table}")

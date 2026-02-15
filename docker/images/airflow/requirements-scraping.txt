@@ -1,0 +1,69 @@
+# =============================================================================
+# Web Scraping Dependencies (installed separately to avoid pip backtracking)
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# [rich] Rich library upgrade (required by soccerdata>=1.8.8)
+# Base Airflow image has rich 13.x, but soccerdata requires >=14.0.0
+# Must be installed FIRST to upgrade rich before soccerdata installation
+# -----------------------------------------------------------------------------
+rich>=14.0.0
+
+# -----------------------------------------------------------------------------
+# [soccerdata] Football data scraping library
+# Brings seleniumbase as dependency
+# -----------------------------------------------------------------------------
+soccerdata>=1.8.8
+
+# -----------------------------------------------------------------------------
+# [selenium] Selenium tools (for Cloudflare bypass)
+# Don't pin selenium - let soccerdata/seleniumbase dictate version
+# -----------------------------------------------------------------------------
+undetected-chromedriver>=3.5.0
+cloudscraper>=1.2.71
+
+# -----------------------------------------------------------------------------
+# [curl_cffi] Chrome TLS fingerprint impersonation (patches soccerdata)
+# Used for bypassing Cloudflare by impersonating real browser TLS fingerprint
+# -----------------------------------------------------------------------------
+curl_cffi>=0.7.0
+
+# Pin markdown-it-py to reduce backtracking with rich>=14
+markdown-it-py==3.0.0
+mdit-py-plugins==0.4.2
+
+# -----------------------------------------------------------------------------
+# [display] Xvfb wrapper for Cloudflare bypass
+# -----------------------------------------------------------------------------
+pyvirtualdisplay>=3.0
+
+# -----------------------------------------------------------------------------
+# [proxy] SOCKS proxy support
+# -----------------------------------------------------------------------------
+PySocks>=1.7.1
+
+# -----------------------------------------------------------------------------
+# [nodriver] Advanced Cloudflare bypass (successor to undetected-chromedriver)
+# Uses async API and better fingerprint evasion
+# -----------------------------------------------------------------------------
+nodriver>=0.32
+
+# -----------------------------------------------------------------------------
+# [nodriver-cf-verify] Cloudflare Turnstile automatic bypass plugin for nodriver
+# Clicks Turnstile checkbox automatically instead of passive waiting
+# https://github.com/KlozetLabs/nodriver-cf-bypass
+# Note: Bundled locally in scrapers/base/browser/nodriver_cf_verify/
+# -----------------------------------------------------------------------------
+
+# -----------------------------------------------------------------------------
+# [opencv] OpenCV for native nodriver tab.cf_verify() method
+# Enables image-based Turnstile checkbox detection as fallback
+# -----------------------------------------------------------------------------
+opencv-python-headless>=4.8.0
+
+# -----------------------------------------------------------------------------
+# [DrissionPage] CDP-based browser automation WITHOUT WebDriver protocol
+# Key advantage: No WebDriver signature that Cloudflare detects
+# Used as primary bypass before falling back to nodriver
+# -----------------------------------------------------------------------------
+DrissionPage>=4.1.0

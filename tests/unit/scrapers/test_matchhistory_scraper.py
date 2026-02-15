@@ -1,5 +1,5 @@
 """
-Unit tests for MatchHistoryDirectScraper.
+Unit tests for MatchHistoryScraper.
 
 Tests scraper logic with mocked HTTP responses.
 """
@@ -11,14 +11,14 @@ import pandas as pd
 import pytest
 
 
-class TestMatchHistoryDirectScraperUnit:
-    """Unit tests for MatchHistoryDirectScraper."""
+class TestMatchHistoryScraperUnit:
+    """Unit tests for MatchHistoryScraper."""
 
     @pytest.fixture
     def scraper_class(self):
         """Get scraper class without instantiating."""
-        from scrapers.matchhistory_direct_scraper import MatchHistoryDirectScraper
-        return MatchHistoryDirectScraper
+        from scrapers.matchhistory_scraper import MatchHistoryScraper
+        return MatchHistoryScraper
 
     @pytest.fixture
     def mock_scraper(self, scraper_class):
@@ -238,7 +238,7 @@ class TestMatchHistoryLeagueMapping:
 
     def test_major_leagues_present(self):
         """Test that all major leagues are mapped."""
-        from scrapers.matchhistory_direct_scraper import MatchHistoryDirectScraper
+        from scrapers.matchhistory_scraper import MatchHistoryScraper
 
         major_leagues = [
             'ENG-Premier League',
@@ -249,12 +249,12 @@ class TestMatchHistoryLeagueMapping:
         ]
 
         for league in major_leagues:
-            assert league in MatchHistoryDirectScraper.LEAGUE_CODES
-            assert MatchHistoryDirectScraper.LEAGUE_CODES[league] is not None
+            assert league in MatchHistoryScraper.LEAGUE_CODES
+            assert MatchHistoryScraper.LEAGUE_CODES[league] is not None
 
     def test_secondary_leagues_present(self):
         """Test that secondary leagues are mapped."""
-        from scrapers.matchhistory_direct_scraper import MatchHistoryDirectScraper
+        from scrapers.matchhistory_scraper import MatchHistoryScraper
 
         secondary_leagues = [
             'ENG-Championship',
@@ -265,7 +265,7 @@ class TestMatchHistoryLeagueMapping:
         ]
 
         for league in secondary_leagues:
-            assert league in MatchHistoryDirectScraper.LEAGUE_CODES
+            assert league in MatchHistoryScraper.LEAGUE_CODES
 
 
 class TestMatchHistoryColumnMapping:
@@ -273,7 +273,7 @@ class TestMatchHistoryColumnMapping:
 
     def test_basic_columns_mapped(self):
         """Test that basic columns are mapped."""
-        from scrapers.matchhistory_direct_scraper import MatchHistoryDirectScraper
+        from scrapers.matchhistory_scraper import MatchHistoryScraper
 
         expected_mappings = {
             'Date': 'match_date',
@@ -284,11 +284,11 @@ class TestMatchHistoryColumnMapping:
         }
 
         for original, expected in expected_mappings.items():
-            assert MatchHistoryDirectScraper.COLUMN_MAPPING[original] == expected
+            assert MatchHistoryScraper.COLUMN_MAPPING[original] == expected
 
     def test_odds_columns_mapped(self):
         """Test that betting odds columns are mapped."""
-        from scrapers.matchhistory_direct_scraper import MatchHistoryDirectScraper
+        from scrapers.matchhistory_scraper import MatchHistoryScraper
 
         odds_mappings = {
             'B365H': 'odds_home_b365',
@@ -297,4 +297,4 @@ class TestMatchHistoryColumnMapping:
         }
 
         for original, expected in odds_mappings.items():
-            assert MatchHistoryDirectScraper.COLUMN_MAPPING[original] == expected
+            assert MatchHistoryScraper.COLUMN_MAPPING[original] == expected

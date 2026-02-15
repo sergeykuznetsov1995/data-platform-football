@@ -186,3 +186,4 @@ logs/
 *.pem
 *.key
 credentials/
+proxys.txt

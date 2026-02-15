@@ -2,7 +2,7 @@
 WhoScored Scraper
 =================
 
-Scraper for WhoScored event data with Selenium browser automation.
+Main scraper class for WhoScored event data with Selenium browser automation.
 Converts event data to SPADL (Soccer Player Action Description Language) format.
 
 Source: https://www.whoscored.com
@@ -15,12 +15,15 @@ import json
 import logging
 import re
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import pandas as pd
 
 from scrapers.base.base_scraper import SeleniumScraper
 from scrapers.base.cloudflare_bypass import CloudflareBypass
+from scrapers.whoscored.constants import LEAGUE_CONFIG, KNOWN_SEASON_IDS, BASE_URL, EVENT_TYPE_MAPPING
+from scrapers.whoscored.spadl_converter import event_to_spadl, convert_coordinates
+from scrapers.whoscored.page_navigator import PageNavigator
 
 logger = logging.getLogger(__name__)
 
@@ -52,45 +55,11 @@ class WhoScoredScraper(SeleniumScraper):
     SOURCE_NAME = 'whoscored'
     DEFAULT_RATE_LIMIT = 10  # Very conservative due to Cloudflare
 
-    BASE_URL = 'https://www.whoscored.com'
-
-    # SPADL pitch dimensions (in meters)
-    SPADL_PITCH_LENGTH = 105.0
-    SPADL_PITCH_WIDTH = 68.0
-
-    # WhoScored uses 100x100 coordinate system
-    WS_COORD_MAX = 100.0
-
-    # Event type mapping to SPADL actions
-    EVENT_TYPE_MAPPING = {
-        'Pass': 'pass',
-        'Cross': 'cross',
-        'Throw-in': 'throw_in',
-        'FreekickShort': 'freekick_short',
-        'Corner': 'corner_crossed',
-        'TakeOn': 'take_on',
-        'Foul': 'foul',
-        'Tackle': 'tackle',
-        'Interception': 'interception',
-        'Shot': 'shot',
-        'ShotOnPost': 'shot',
-        'MissedShots': 'shot',
-        'SavedShot': 'shot',
-        'Goal': 'shot',
-        'Clearance': 'clearance',
-        'BallTouch': 'dribble',
-        'Aerial': 'non_action',
-        'OffsidePass': 'pass',
-    }
-
-    # League URL slugs
-    LEAGUE_SLUGS = {
-        'ENG-Premier League': 'England-Premier-League',
-        'ESP-La Liga': 'Spain-LaLiga',
-        'GER-Bundesliga': 'Germany-Bundesliga',
-        'ITA-Serie A': 'Italy-Serie-A',
-        'FRA-Ligue 1': 'France-Ligue-1',
-    }
+    # Re-export constants for backwards compatibility
+    LEAGUE_CONFIG = LEAGUE_CONFIG
+    KNOWN_SEASON_IDS = KNOWN_SEASON_IDS
+    BASE_URL = BASE_URL
+    EVENT_TYPE_MAPPING = EVENT_TYPE_MAPPING
 
     def __init__(
         self,
@@ -99,6 +68,15 @@ class WhoScoredScraper(SeleniumScraper):
         headless: bool = False,  # Recommended False for WhoScored
         **kwargs
     ):
+        """
+        Initialize WhoScored scraper.
+
+        Args:
+            leagues: List of league names to scrape
+            seasons: List of season years (e.g., 2024 for 2024/2025)
+            headless: Whether to run browser headless (False recommended)
+            **kwargs: Additional arguments passed to SeleniumScraper
+        """
         super().__init__(
             leagues=leagues,
             seasons=seasons,
@@ -106,16 +84,67 @@ class WhoScoredScraper(SeleniumScraper):
             **kwargs
         )
         self._match_cache: Dict[str, Dict] = {}
+        self._navigator: Optional[PageNavigator] = None
+        # Backwards compatibility: expose season cache
+        self._season_cache: Dict = {}
 
     def _get_browser(self) -> CloudflareBypass:
         """Get browser with WhoScored-specific configuration."""
         if self._browser is None:
+            # Get proxy from proxy_manager if available
+            proxy_url = None
+            if hasattr(self, 'proxy_manager') and self.proxy_manager:
+                proxy_url = self.proxy_manager.get_proxy()
+            elif hasattr(self, 'proxy') and self.proxy:
+                proxy_url = self.proxy
+
             self._browser = CloudflareBypass(
                 headless=self.headless,
-                proxy=self.proxy,
+                use_xvfb=getattr(self, 'use_xvfb', False),
+                proxy=proxy_url,
                 page_load_timeout=60,  # WhoScored can be slow
+                use_flaresolverr=getattr(self, 'use_flaresolverr', False),
+                flaresolverr_url=getattr(self, 'flaresolverr_url', 'http://flaresolverr:8191'),
             )
         return self._browser
+
+    def _get_navigator(self) -> PageNavigator:
+        """Get page navigator instance."""
+        if self._navigator is None:
+            self._navigator = PageNavigator(
+                browser=self._get_browser(),
+                use_flaresolverr=getattr(self, 'use_flaresolverr', False),
+            )
+        return self._navigator
+
+    # Delegate methods for backwards compatibility and testing
+    def _build_fixtures_url(self, league: str, season_id: str, stage_id: str) -> str:
+        """Build URL for fixtures page (delegated to PageNavigator)."""
+        return self._get_navigator().build_fixtures_url(league, season_id, stage_id)
+
+    def _build_tournament_url(self, league: str) -> str:
+        """Build URL for tournament main page (delegated to PageNavigator)."""
+        return self._get_navigator().build_tournament_url(league)
+
+    def _get_season_stage_ids(self, league: str, season: int):
+        """Get season/stage IDs (delegated to PageNavigator)."""
+        return self._get_navigator().get_season_stage_ids(league, season)
+
+    def _extract_match_urls_from_page(self):
+        """Extract match URLs from current page (delegated to PageNavigator)."""
+        return self._get_navigator().extract_match_urls_from_page()
+
+    def _navigate_to_previous_dates(self) -> bool:
+        """Navigate to previous dates (delegated to PageNavigator)."""
+        return self._get_navigator().navigate_to_previous_dates()
+
+    def _convert_coordinates(self, x: float, y: float):
+        """Convert WhoScored coordinates to SPADL format."""
+        return convert_coordinates(x, y)
+
+    def _event_to_spadl(self, event, match_info):
+        """Convert WhoScored event to SPADL format."""
+        return event_to_spadl(event, match_info)
 
     def _navigate_to_match(self, match_url: str) -> bool:
         """
@@ -153,7 +182,7 @@ class WhoScoredScraper(SeleniumScraper):
         Extract match data from page JavaScript.
 
         Returns:
-            Match data dictionary
+            Match data dictionary or None if extraction failed
         """
         browser = self._get_browser()
 
@@ -185,141 +214,6 @@ class WhoScoredScraper(SeleniumScraper):
             logger.error(f"Error extracting match data: {e}")
             return None
 
-    def _convert_coordinates(
-        self,
-        x: float,
-        y: float
-    ) -> Tuple[float, float]:
-        """
-        Convert WhoScored coordinates to SPADL format.
-
-        WhoScored uses 0-100 scale, SPADL uses meters (105x68).
-
-        Args:
-            x: X coordinate (0-100)
-            y: Y coordinate (0-100)
-
-        Returns:
-            Tuple of (x, y) in SPADL coordinates
-        """
-        spadl_x = (x / self.WS_COORD_MAX) * self.SPADL_PITCH_LENGTH
-        spadl_y = (y / self.WS_COORD_MAX) * self.SPADL_PITCH_WIDTH
-
-        return spadl_x, spadl_y
-
-    def _event_to_spadl(
-        self,
-        event: Dict[str, Any],
-        match_info: Dict[str, Any]
-    ) -> Dict[str, Any]:
-        """
-        Convert WhoScored event to SPADL format.
-
-        Args:
-            event: Raw WhoScored event
-            match_info: Match metadata
-
-        Returns:
-            SPADL formatted event
-        """
-        event_type = event.get('type', {}).get('displayName', 'Unknown')
-        qualifiers = {
-            q.get('type', {}).get('displayName', ''): q.get('value')
-            for q in event.get('qualifiers', [])
-        }
-
-        # Convert coordinates
-        start_x, start_y = 0.0, 0.0
-        end_x, end_y = 0.0, 0.0
-
-        if 'x' in event and 'y' in event:
-            start_x, start_y = self._convert_coordinates(
-                event.get('x', 0), event.get('y', 0)
-            )
-
-        if 'endX' in event and 'endY' in event:
-            end_x, end_y = self._convert_coordinates(
-                event.get('endX', event.get('x', 0)),
-                event.get('endY', event.get('y', 0))
-            )
-        else:
-            end_x, end_y = start_x, start_y
-
-        # Determine SPADL action type
-        action_type = self.EVENT_TYPE_MAPPING.get(event_type, 'non_action')
-
-        # Special cases
-        if 'Penalty' in qualifiers:
-            action_type = 'shot_penalty'
-        elif 'FreekickTaken' in qualifiers and event_type == 'Shot':
-            action_type = 'shot_freekick'
-        elif 'CornerTaken' in qualifiers:
-            if 'ShortCorner' in qualifiers:
-                action_type = 'corner_short'
-            else:
-                action_type = 'corner_crossed'
-
-        # Determine result
-        outcome = event.get('outcomeType', {}).get('displayName', 'Unknown')
-        if outcome == 'Successful':
-            result = 'success'
-        elif 'Goal' in event_type or event.get('isGoal'):
-            result = 'success'
-        elif 'OwnGoal' in qualifiers:
-            result = 'owngoal'
-        elif outcome == 'Unsuccessful':
-            result = 'fail'
-        else:
-            result = 'fail'
-
-        # Determine body part
-        bodypart = 'foot'
-        if 'Head' in qualifiers:
-            bodypart = 'head'
-        elif 'OtherBodyPart' in qualifiers:
-            bodypart = 'other'
-
-        # Calculate time in seconds
-        minute = event.get('minute', 0)
-        second = event.get('second', 0)
-        period = event.get('period', {}).get('value', 1)
-
-        if period == 1:
-            time_seconds = minute * 60 + second
-        else:
-            time_seconds = 45 * 60 + (minute - 45) * 60 + second
-
-        return {
-            'league': match_info.get('league'),
-            'season': match_info.get('season'),
-            'game_id': match_info.get('match_id'),
-            'match_date': match_info.get('match_date'),
-            'home_team': match_info.get('home_team'),
-            'away_team': match_info.get('away_team'),
-            'home_team_id': match_info.get('home_team_id'),
-            'away_team_id': match_info.get('away_team_id'),
-            'event_id': event.get('id'),
-            'period_id': period,
-            'time_seconds': time_seconds,
-            'team_id': event.get('teamId'),
-            'team': match_info.get('home_team') if event.get('teamId') == match_info.get('home_team_id') else match_info.get('away_team'),
-            'player_id': event.get('playerId'),
-            'player': event.get('playerName', ''),
-            'start_x': start_x,
-            'start_y': start_y,
-            'end_x': end_x,
-            'end_y': end_y,
-            'action_type': action_type,
-            'result': result,
-            'bodypart': bodypart,
-            'original_event_type': event_type,
-            'original_outcome_type': outcome,
-            'is_goal': event.get('isGoal', False),
-            'is_own_goal': 'OwnGoal' in qualifiers,
-            'is_assist': 'IntentionalGoalAssist' in qualifiers or 'IntentionalAssist' in qualifiers,
-            'is_key_pass': 'KeyPass' in qualifiers,
-        }
-
     def read_match_events(
         self,
         match_url: str,
@@ -335,7 +229,7 @@ class WhoScoredScraper(SeleniumScraper):
             season: Season year
 
         Returns:
-            DataFrame with SPADL events
+            DataFrame with SPADL events or None if extraction failed
         """
         logger.info(f"Fetching WhoScored events: {match_url}")
 
@@ -373,7 +267,7 @@ class WhoScoredScraper(SeleniumScraper):
 
             for event in events:
                 try:
-                    spadl_event = self._event_to_spadl(event, match_info)
+                    spadl_event = event_to_spadl(event, match_info)
                     spadl_events.append(spadl_event)
                 except Exception as e:
                     logger.debug(f"Error converting event: {e}")
@@ -393,25 +287,24 @@ class WhoScoredScraper(SeleniumScraper):
     def get_match_urls(
         self,
         league: str,
-        season: int
+        season: int,
+        max_pages: int = 50
     ) -> List[str]:
         """
         Get list of match URLs for a league and season.
 
+        Navigates through the fixtures page and collects all match URLs
+        by paginating backwards through the dates.
+
         Args:
-            league: League name
-            season: Season year
+            league: League name (e.g., 'ENG-Premier League')
+            season: Season year (e.g., 2024 for 2024/2025 season)
+            max_pages: Maximum number of pages to navigate (default: 50)
 
         Returns:
-            List of match URLs
+            List of unique match URLs sorted alphabetically
         """
-        # This would typically scrape the fixtures page
-        # For now, return empty list as this requires additional implementation
-        logger.warning(
-            "get_match_urls not fully implemented - "
-            "provide match URLs directly"
-        )
-        return []
+        return self._get_navigator().get_match_urls(league, season, max_pages)
 
     def scrape_match(
         self,
@@ -428,7 +321,7 @@ class WhoScoredScraper(SeleniumScraper):
             season: Season year
 
         Returns:
-            Dictionary with table path
+            Dictionary with table path or empty dict if failed
         """
         df = self.read_match_events(match_url, league, season)
 
@@ -444,10 +337,7 @@ class WhoScoredScraper(SeleniumScraper):
 
     def scrape_all(self) -> Dict[str, str]:
         """
-        Scrape all WhoScored data.
-
-        Note: This requires match URLs to be provided or
-        get_match_urls to be implemented.
+        Scrape all WhoScored data for configured leagues and seasons.
 
         Returns:
             Dictionary mapping data type to Iceberg table path
@@ -487,31 +377,3 @@ class WhoScoredScraper(SeleniumScraper):
 
         logger.info(f"WhoScored scrape complete: {list(results.keys())}")
         return results
-
-
-# SPADL action type definitions for reference
-SPADL_ACTIONS = {
-    'pass': 'Normal pass in open play',
-    'cross': 'Cross into the box',
-    'throw_in': 'Throw in',
-    'freekick_crossed': 'Freekick crossed into the box',
-    'freekick_short': 'Short freekick',
-    'corner_crossed': 'Corner crossed into the box',
-    'corner_short': 'Short corner',
-    'take_on': 'Dribble past opponent',
-    'foul': 'Foul',
-    'tackle': 'Tackle',
-    'interception': 'Interception',
-    'shot': 'Shot from open play',
-    'shot_penalty': 'Penalty kick',
-    'shot_freekick': 'Direct freekick on goal',
-    'keeper_save': 'Goalkeeper save',
-    'keeper_claim': 'Goalkeeper catch',
-    'keeper_punch': 'Goalkeeper punch',
-    'keeper_pick_up': 'Goalkeeper picks up ball',
-    'clearance': 'Clearance',
-    'bad_touch': 'Bad touch / loss of possession',
-    'non_action': 'Non-action (aerial duel, etc.)',
-    'dribble': 'Dribble / carry',
-    'goalkick': 'Goal kick',
-}

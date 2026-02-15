@@ -9,6 +9,7 @@ x-airflow-common: &airflow-common
   build:
     context: ./docker/images/airflow
     dockerfile: Dockerfile
+  shm_size: '512m'  # Chrome uses /dev/shm for IPC; Docker default 64MB causes crashes
   environment:
     &airflow-common-env
     AIRFLOW__CORE__EXECUTOR: ${AIRFLOW__CORE__EXECUTOR}
@@ -27,6 +28,9 @@ x-airflow-common: &airflow-common
     - ./logs:/opt/airflow/logs
     - ./spark_jobs:/opt/airflow/spark_jobs
     - ./configs/spark:/opt/spark/conf
+    - ./scrapers:/opt/airflow/scrapers
+    - ./scripts:/opt/airflow/scripts
+    - ./proxys.txt:/opt/airflow/proxys.txt:ro
   networks:
     - data-platform-net
   depends_on:
@@ -289,6 +293,72 @@ services:
       retries: 5
 
   # ===========================================================================
+  # FlareSolverr - Cloudflare Bypass Service
+  # ===========================================================================
+  flaresolverr:
+    image: ghcr.io/flaresolverr/flaresolverr:v3.3.21
+    container_name: flaresolverr
+    hostname: flaresolverr
+    environment:
+      - LOG_LEVEL=info
+      - LOG_HTML=false
+      # HEADLESS=true обязателен в Docker (нет X-сервера)
+      # Основной метод обхода Cloudflare - undetected-chromedriver + Xvfb в Airflow
+      - HEADLESS=true
+      # Увеличены таймауты для сложных Cloudflare JS challenges (fallback)
+      - MAX_TIMEOUT=300000
+      - BROWSER_TIMEOUT=180000
+      - TZ=UTC
+    ports:
+      - "8191:8191"
+    networks:
+      - data-platform-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8191/health"]
+      interval: 30s
+      timeout: 15s
+      retries: 5
+      start_period: 90s
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+          cpus: '2.0'
+        reservations:
+          memory: 2G
+          cpus: '1.0'
+
+  # ===========================================================================
+  # Tor Proxy - Alternative for Cloudflare bypass
+  # ===========================================================================
+  tor:
+    image: dperson/torproxy:latest
+    container_name: tor
+    hostname: tor
+    ports:
+      - "9150:9050"   # SOCKS5 proxy (mapped to 9150 to avoid conflict)
+      - "9151:9051"   # Control port
+    networks:
+      - data-platform-net
+    environment:
+      - TOR_NewCircuitPeriod=30
+      - TOR_MaxCircuitDirtiness=60
+    healthcheck:
+      test: ["CMD-SHELL", "curl --socks5 localhost:9050 -s https://check.torproject.org/api/ip | grep -q IsTor || exit 1"]
+      interval: 60s
+      timeout: 30s
+      retries: 3
+      start_period: 60s
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 128M
+
+  # ===========================================================================
   # Airflow
   # ===========================================================================
   airflow-init:
@@ -313,6 +383,31 @@ services:
       _AIRFLOW_WWW_USER_PASSWORD: ${_AIRFLOW_WWW_USER_PASSWORD}
     restart: "no"
 
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: airflow-scheduler
+    command: scheduler
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+      airflow-webserver:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "airflow jobs check --job-type SchedulerJob --hostname \"$${HOSTNAME}\""]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 12G
+        reservations:
+          memory: 4G
+    # Swap as safety buffer for memory spikes
+    memswap_limit: 16G
+
   airflow-webserver:
     <<: *airflow-common
     container_name: airflow-webserver
@@ -322,8 +417,6 @@ services:
     depends_on:
       airflow-init:
         condition: service_completed_successfully
-      spark-master:
-        condition: service_healthy
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
       interval: 30s
@@ -331,21 +424,12 @@ services:
       retries: 5
       start_period: 60s
     restart: unless-stopped
-
-  airflow-scheduler:
-    <<: *airflow-common
-    container_name: airflow-scheduler
-    command: scheduler
-    depends_on:
-      airflow-init:
-        condition: service_completed_successfully
-    healthcheck:
-      test: ["CMD-SHELL", "airflow jobs check --job-type SchedulerJob --hostname \"$${HOSTNAME}\""]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-      start_period: 60s
-    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+        reservations:
+          memory: 1G
 
   # ===========================================================================
   # Trino - Distributed SQL Query Engine
@@ -354,6 +438,8 @@ services:
     image: trinodb/trino:479
     container_name: trino
     hostname: trino
+    environment:
+      - HADOOP_CONF_DIR=/etc/trino
     ports:
       - "8082:8080"
     volumes:

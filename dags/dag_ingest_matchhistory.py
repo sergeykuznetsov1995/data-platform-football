@@ -3,7 +3,8 @@ MatchHistory Data Ingestion DAG
 ===============================
 
 Airflow DAG for scraping historical match data from football-data.co.uk.
-Uses direct HTTP requests with Selenium fallback.
+Uses BashOperator to run scraper in isolated subprocess,
+avoiding LocalExecutor memory issues.
 
 Schedules daily at 8 AM UTC (after other scrapers).
 
@@ -13,105 +14,19 @@ Data collected:
 - Betting odds from multiple bookmakers
 - Match statistics (shots, corners, fouls, cards)
 
-All data is written to Iceberg Bronze layer tables.
+All data is written to Iceberg Bronze layer tables (via Parquet fallback).
 """
 
 from datetime import datetime, timedelta
 from typing import Any, Dict, List
 
 from airflow import DAG
+from airflow.exceptions import AirflowException
+from airflow.operators.bash import BashOperator
 from airflow.operators.python import PythonOperator
-from airflow.utils.task_group import TaskGroup
 
-# Default arguments for all tasks
-default_args = {
-    'owner': 'data-platform',
-    'depends_on_past': False,
-    'email_on_failure': False,
-    'email_on_retry': False,
-    'retries': 2,
-    'retry_delay': timedelta(minutes=5),
-    'execution_timeout': timedelta(hours=1),
-}
-
-# Configuration
-LEAGUES = [
-    'ENG-Premier League',
-    'ENG-Championship',
-    'ESP-La Liga',
-    'GER-Bundesliga',
-    'ITA-Serie A',
-    'FRA-Ligue 1',
-]
-
-# Current season (adjust as needed)
-CURRENT_SEASON = 2024
-
-
-def scrape_match_results(**context) -> Dict[str, Any]:
-    """
-    Scrape match results from football-data.co.uk.
-
-    Returns:
-        Dictionary with scraping results
-    """
-    import logging
-    from scrapers.matchhistory_direct_scraper import MatchHistoryDirectScraper
-
-    logger = logging.getLogger(__name__)
-
-    leagues = context.get('params', {}).get('leagues', LEAGUES)
-    season = context.get('params', {}).get('season', CURRENT_SEASON)
-
-    logger.info(f"Starting MatchHistory scrape: leagues={leagues}, season={season}")
-
-    results = {'tables': [], 'rows': 0, 'errors': [], 'league_details': {}}
-
-    try:
-        with MatchHistoryDirectScraper(
-            leagues=leagues,
-            seasons=[season],
-            headless=True,
-            use_xvfb=True,
-        ) as scraper:
-            all_matches = []
-
-            for league in leagues:
-                try:
-                    df = scraper.read_games(league, season)
-                    if df is not None and not df.empty:
-                        # Calculate odds statistics
-                        df = scraper.calculate_odds_stats(df)
-                        all_matches.append(df)
-                        results['league_details'][league] = len(df)
-                        results['rows'] += len(df)
-                        logger.info(f"Fetched {len(df)} matches for {league}")
-                    else:
-                        results['errors'].append(f"No data for {league}")
-                except Exception as e:
-                    error_msg = f"Error scraping {league}: {e}"
-                    logger.error(error_msg)
-                    results['errors'].append(error_msg)
-
-            # Save combined results
-            if all_matches:
-                import pandas as pd
-                combined_df = pd.concat(all_matches, ignore_index=True)
-                table_path = scraper.save_to_iceberg(
-                    df=combined_df,
-                    table_name='matchhistory_results',
-                    partition_cols=['league', 'season'],
-                )
-                results['tables'].append(table_path)
-                logger.info(f"Saved {len(combined_df)} total rows")
-
-    except Exception as e:
-        logger.error(f"Failed to initialize scraper: {e}")
-        results['errors'].append(str(e))
-        raise
-
-    logger.info(f"MatchHistory scrape complete: {results['rows']} total rows")
-    return results
+from utils.config import LEAGUES, CURRENT_SEASON, SCHEDULES, DAG_TAGS
+from utils.default_args import SELENIUM_ARGS
 
 
 def validate_data(**context) -> Dict[str, Any]:
@@ -121,25 +36,34 @@ def validate_data(**context) -> Dict[str, Any]:
     Returns:
         Validation results
     """
+    import json
     import logging
+
     logger = logging.getLogger(__name__)
 
-    # Get results from upstream task
-    ti = context['ti']
-    scrape_result = ti.xcom_pull(task_ids='scrape_match_results')
+    try:
+        with open('/tmp/matchhistory_result.json', 'r') as f:
+            scrape_result = json.load(f)
+    except FileNotFoundError:
+        logger.error("Results file not found - scraping may have failed")
+        raise AirflowException("Results file not found - scraping failed")
+    except json.JSONDecodeError as e:
+        logger.error(f"Invalid JSON in results: {e}")
+        raise AirflowException(f"Invalid JSON in results: {e}")
 
     validation = {
         'status': 'success',
         'warnings': [],
         'summary': {
-            'total_rows': scrape_result.get('rows', 0) if scrape_result else 0,
-            'leagues_scraped': len(scrape_result.get('league_details', {})) if scrape_result else 0,
-            'league_details': scrape_result.get('league_details', {}) if scrape_result else {},
+            'total_rows': scrape_result.get('rows', 0),
+            'leagues_scraped': len(scrape_result.get('league_details', {})),
+            'league_details': scrape_result.get('league_details', {}),
+            'tables': scrape_result.get('tables', []),
         }
     }
 
     # Check for errors
-    if scrape_result and scrape_result.get('errors'):
+    if scrape_result.get('errors'):
         validation['warnings'] = scrape_result['errors']
         validation['status'] = 'partial_success' if validation['summary']['total_rows'] > 0 else 'failed'
 
@@ -158,6 +82,9 @@ def validate_data(**context) -> Dict[str, Any]:
     if validation['warnings']:
         logger.warning(f"Warnings: {validation['warnings']}")
 
+    if validation['status'] == 'failed':
+        raise AirflowException(f"Validation failed: {validation.get('warnings', [])}")
+
     return validation
 
 
@@ -168,13 +95,19 @@ def generate_stats_report(**context) -> Dict[str, Any]:
     Returns:
         Statistics report
     """
+    import json
     import logging
+
     logger = logging.getLogger(__name__)
 
-    ti = context['ti']
-    scrape_result = ti.xcom_pull(task_ids='scrape_match_results')
+    try:
+        with open('/tmp/matchhistory_result.json', 'r') as f:
+            scrape_result = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        logger.warning("No data to generate report")
+        return {'status': 'skipped', 'reason': 'no data'}
 
-    if not scrape_result or scrape_result.get('rows', 0) == 0:
+    if scrape_result.get('rows', 0) == 0:
         logger.warning("No data to generate report")
         return {'status': 'skipped', 'reason': 'no data'}
 
@@ -191,43 +124,76 @@ def generate_stats_report(**context) -> Dict[str, Any]:
     return report
 
 
+# Build arguments for bash command
+leagues_str = ','.join(LEAGUES)
+
 # DAG definition
 with DAG(
     dag_id='dag_ingest_matchhistory',
-    default_args=default_args,
+    default_args=SELENIUM_ARGS,
     description='Ingest historical match data from football-data.co.uk',
-    schedule_interval='0 8 * * *',  # Daily at 8 AM UTC
+    schedule=SCHEDULES.get('dag_ingest_matchhistory', '0 8 * * *'),
     start_date=datetime(2024, 1, 1),
     catchup=False,
-    tags=['scraping', 'matchhistory', 'bronze', 'football', 'odds'],
+    tags=DAG_TAGS.get('matchhistory', ['scraping', 'matchhistory', 'bronze', 'football', 'odds']),
     max_active_runs=1,
     params={
         'leagues': LEAGUES,
         'season': CURRENT_SEASON,
     },
+    doc_md="""
+    ## MatchHistory Data Ingestion
+
+    This DAG scrapes historical match data from football-data.co.uk.
+
+    ### Architecture
+
+    Uses BashOperator to run scraper in isolated subprocess,
+    preventing LocalExecutor fork memory issues.
+
+    ### Data Collected
+
+    - **Match Results**: Home/away goals, half-time scores
+    - **Betting Odds**: Odds from multiple bookmakers (Bet365, Pinnacle, etc.)
+    - **Match Stats**: Shots, corners, fouls, cards
+
+    ### Notes
+
+    - Uses Selenium with xvfb for headless browser operation
+    - Written to Parquet fallback (PyIceberg disabled for stability)
+    """,
 ) as dag:
 
-    # Task: Scrape match results
-    scrape_match_results_task = PythonOperator(
+    scrape_data_task = BashOperator(
         task_id='scrape_match_results',
-        python_callable=scrape_match_results,
-        provide_context=True,
+        bash_command=f"""
+cd /opt/airflow && \\
+python dags/scripts/run_matchhistory_scraper.py \\
+    --leagues "{leagues_str}" \\
+    --season {CURRENT_SEASON} \\
+    --output /tmp/matchhistory_result.json \\
+    --headless \\
+    --use-xvfb
+""",
+        env={
+            'PYTHONPATH': '/opt/airflow:/opt/airflow/dags',
+            'PATH': '/usr/local/bin:/usr/bin:/bin:/home/airflow/.local/bin',
+            'HOME': '/home/airflow',
+            'DISPLAY': ':99',
+        },
     )
 
-    # Task: Validate data
     validate_data_task = PythonOperator(
         task_id='validate_data',
         python_callable=validate_data,
-        provide_context=True,
-        trigger_rule='all_done',  # Run even if upstream fails
+        
+        trigger_rule='all_done',
     )
 
-    # Task: Generate stats report
     generate_report_task = PythonOperator(
         task_id='generate_stats_report',
         python_callable=generate_stats_report,
-        provide_context=True,
+        
     )
 
-    # Dependencies
-    scrape_match_results_task >> validate_data_task >> generate_report_task
+    scrape_data_task >> validate_data_task >> generate_report_task

@@ -1,4 +1,4 @@
-FROM apache/airflow:2.10.4-python3.11
+FROM apache/airflow:2.7.3-python3.11
 
 USER root
 
@@ -8,6 +8,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     procps \
     curl \
     netcat-openbsd \
+    git \
     && rm -rf /var/lib/apt/lists/*
 
 # Chrome/Chromium for Selenium (headless browser automation)
@@ -25,6 +26,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxkbcommon0 \
     xdg-utils \
     xvfb \
+    xauth \
     && rm -rf /var/lib/apt/lists/*
 
 ENV CHROME_BIN=/usr/bin/chromium
@@ -61,14 +63,25 @@ RUN curl -fsSL "https://repo1.maven.org/maven2/org/apache/iceberg/iceberg-aws-bu
     -o ${SPARK_HOME}/jars/iceberg-aws-bundle-1.4.3.jar
 
 # Create directories
-RUN mkdir -p /opt/airflow/spark_jobs /opt/airflow/dags /opt/airflow/logs
+RUN mkdir -p /opt/airflow/spark_jobs /opt/airflow/dags /opt/airflow/logs /opt/airflow/scrapers
+
+# Add custom paths to PYTHONPATH for DAG imports
+ENV PYTHONPATH="/opt/airflow/dags:/opt/airflow/scrapers:/opt/airflow:${PYTHONPATH}"
 
 # Switch to airflow user for pip installs
 USER airflow
 
-# Copy and install Python requirements
-COPY requirements-airflow.txt /tmp/requirements-airflow.txt
-RUN pip install --no-cache-dir -r /tmp/requirements-airflow.txt
+# ===== СТАДИЯ 1: Airflow 2.7.x (уже включен в базовый образ) =====
+# Базовый образ apache/airflow:2.7.3-python3.11 уже содержит Airflow
+# Дополнительная установка Airflow не требуется
+
+# ===== СТАДИЯ 2: Core dependencies (Airflow providers, data processing) =====
+COPY requirements.txt /tmp/requirements.txt
+RUN pip install --no-cache-dir -r /tmp/requirements.txt
+
+# ===== СТАДИЯ 3: Scraping dependencies (installed separately to avoid conflicts) =====
+COPY requirements-scraping.txt /tmp/requirements-scraping.txt
+RUN pip install --no-cache-dir -r /tmp/requirements-scraping.txt
 
 # Set working directory
 WORKDIR /opt/airflow

@@ -4,12 +4,16 @@ testpaths = ["tests"]
 python_files = ["test_*.py"]
 python_functions = ["test_*"]
 markers = [
+    "unit: fast isolated unit tests without external dependencies",
     "integration: tests with real HTTP requests to external sources",
     "slow: slow tests (>10 seconds)",
     "cloudflare: tests requiring Selenium for Cloudflare bypass",
     "flaky: tests that may fail due to external service issues",
     "tor: tests requiring Tor proxy on port 9050",
     "soccerdata: tests requiring soccerdata library",
+    "scraper: tests for web scrapers",
+    "real_request: tests making real HTTP requests",
+    "flaresolverr: tests requiring FlareSolverr service",
 ]
 filterwarnings = [
     "ignore::DeprecationWarning",

@@ -16,29 +16,33 @@ Sources:
 - ESPN: Schedules, results
 - MatchHistory: Historical match data
 
-Recommended Scrapers (Selenium-based):
-- FBrefSeleniumScraper: For FBref data (bypasses Cloudflare)
-- FotMobSeleniumScraper: For FotMob data (handles session cookies)
-- MatchHistoryDirectScraper: For football-data.co.uk (with Selenium fallback)
+Main Scrapers:
+- FBrefScraper: For FBref data (bypasses Cloudflare via Selenium)
+- SoccerdataFBrefScraper: Lightweight FBref scraper using soccerdata + Tor
+- FotMobScraper: For FotMob data (handles session cookies via Selenium)
+- MatchHistoryScraper: For football-data.co.uk (with Selenium fallback)
 - WhoScoredScraper: For WhoScored data (bypasses Cloudflare)
 """
 
-from scrapers.base.base_scraper import BaseScraper, SeleniumScraper
+from scrapers.base.base_scraper import BaseScraper, SeleniumScraper, SoccerdataScraper
 from scrapers.base.iceberg_writer import IcebergWriter
-from scrapers.fbref_selenium_scraper import FBrefSeleniumScraper
-from scrapers.fotmob_selenium_scraper import FotMobSeleniumScraper
-from scrapers.matchhistory_direct_scraper import MatchHistoryDirectScraper
-from scrapers.whoscored_scraper import WhoScoredScraper
+from scrapers.fbref import FBrefScraper
+from scrapers.soccerdata_fbref_scraper import SoccerdataFBrefScraper
+from scrapers.fotmob_scraper import FotMobScraper
+from scrapers.matchhistory_scraper import MatchHistoryScraper
+from scrapers.whoscored import WhoScoredScraper
 
 __all__ = [
     # Base classes
     'BaseScraper',
     'SeleniumScraper',
+    'SoccerdataScraper',
     'IcebergWriter',
-    # Recommended scrapers (Selenium-based)
-    'FBrefSeleniumScraper',
-    'FotMobSeleniumScraper',
-    'MatchHistoryDirectScraper',
+    # Main scrapers
+    'FBrefScraper',
+    'SoccerdataFBrefScraper',  # Lightweight Tor-based scraper
+    'FotMobScraper',
+    'MatchHistoryScraper',
     'WhoScoredScraper',
 ]
 

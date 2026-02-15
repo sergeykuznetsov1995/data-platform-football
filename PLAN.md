@@ -97,6 +97,61 @@ docker compose exec trino trino --execute "SELECT * FROM hive.default.test_table
 | TASK-018 | Scraper для MatchHistory | web-scraping-expert | S | TASK-009 |
 | TASK-019 | Rate limiter + retry + circuit breaker | web-scraping-expert | M | TASK-009 |
 | TASK-020 | Unit тесты для scrapers | testing-agent | M | TASK-010..018 |
+| TASK-020a | **Интеграционные тесты scrapers (реальные запросы)** | web-scraping-expert | M | TASK-020 |
+
+### TASK-020a: Интеграционное тестирование scrapers
+
+**Цель:** Проверить, что все 9 скраперов реально получают данные от источников.
+
+**Важно:** Unit-тесты (TASK-020) используют моки и не проверяют реальные HTTP-запросы. Интеграционные тесты должны:
+1. Сделать реальный запрос к каждому источнику
+2. Проверить, что данные получены (HTTP 200, DataFrame не пустой)
+3. Проверить обход Cloudflare защиты (WhoScored, SofaScore)
+4. Проверить корректность rate limiting
+
+**Тест-план:**
+
+| Источник | Сложность защиты | Тест |
+|----------|------------------|------|
+| FBref | Низкая | `read_schedule()` возвращает DataFrame |
+| Understat | Средняя (JS) | `read_shots()` возвращает данные |
+| WhoScored | Высокая (Cloudflare) | `_navigate_to_match()` проходит |
+| FotMob | Средняя | `read_schedule()` работает |
+| SofaScore | Высокая (rate limit) | Запрос с задержкой проходит |
+| SoFIFA | Низкая | `read_players()` возвращает данные |
+| ClubElo | Низкая | `read_by_date()` работает |
+| ESPN | Низкая | API отвечает |
+| MatchHistory | Низкая | CSV загружается |
+
+**Файл:** `tests/integration/scrapers/test_real_requests.py`
+
+```python
+import pytest
+from scrapers.fbref_scraper import FBrefScraper
+
+@pytest.mark.integration
+@pytest.mark.slow
+def test_fbref_real_request():
+    """Проверяем, что FBref отвечает реальными данными."""
+    scraper = FBrefScraper(
+        leagues=['ENG-Premier League'],
+        seasons=[2024]
+    )
+    df = scraper.read_schedule()
+
+    assert df is not None, "FBref не вернул данные"
+    assert len(df) > 0, "DataFrame пустой"
+    assert 'home_team' in df.columns, "Отсутствует колонка home_team"
+```
+
+**Запуск:**
+```bash
+# Только интеграционные тесты
+pytest tests/integration/scrapers/ -v -m integration
+
+# С реальными запросами (медленно, ~5 минут)
+pytest tests/integration/scrapers/ -v -m "integration and slow"
+```
 
 **Критерии проверки Фазы 2:**
 ```bash
@@ -163,6 +218,71 @@ docker compose exec airflow-scheduler airflow dags state dag_ingest_fbref $(date
 # Тесты DAGs
 pytest tests/integration/dags/ -v
 # All passed
+```
+
+---
+
+### Фаза 3.5: Storage Layer (HDFS + Hive/Trino DDL)
+
+**Основные агенты:** docker-expert, trino-specialist, web-scraping-expert, testing-agent
+
+**Проблема:** Данные из скраперов записывались только локально в `/tmp/parquet_fallback/`, не попадая в HDFS и не регистрируясь в Hive Metastore. PyIceberg отключён из-за OOM проблем.
+
+**Решение:** WebHDFS + Trino DDL — минимум зависимостей, без JVM, использует готовую инфраструктуру.
+
+| ID | Задача | Агент | Сложность | Зависимости | Статус |
+|----|--------|-------|-----------|-------------|--------|
+| TASK-033a | Создать HDFSClient (WebHDFS) | web-scraping-expert | M | TASK-008 | ✅ |
+| TASK-033b | Создать TrinoTableManager | trino-specialist | M | TASK-007 | ✅ |
+| TASK-033c | Переписать IcebergWriter._write_parquet_fallback() | spark-data-engineer | M | TASK-033a, TASK-033b | ✅ |
+| TASK-033d | Добавить зависимость trino в requirements | docker-expert | S | TASK-006 | ✅ |
+| TASK-033e | Обновить конфигурацию Trino (hive.properties) | trino-specialist | S | TASK-007 | ✅ |
+| TASK-033f | Создать скрипт инициализации init_storage.py | docker-expert | S | TASK-033a, TASK-033b | ✅ |
+| TASK-033g | Unit тесты HDFSClient и TrinoTableManager | testing-agent | M | TASK-033a, TASK-033b | ✅ |
+| TASK-033h | Интеграционное тестирование storage pipeline | testing-agent | M | TASK-033c..033g | ✅ |
+
+**Созданные файлы:**
+- `scrapers/base/hdfs_client.py` — WebHDFS клиент без JVM
+- `scrapers/base/trino_manager.py` — управление Hive external tables через Trino
+- `scripts/init_storage.py` — инициализация HDFS директорий и Hive схем
+- `tests/unit/scrapers/test_hdfs_client.py` — unit тесты HDFSClient
+- `tests/unit/scrapers/test_trino_manager.py` — unit тесты TrinoTableManager
+- `tests/integration/test_storage_pipeline.py` — интеграционные тесты pipeline
+
+**Изменённые файлы:**
+- `scrapers/base/iceberg_writer.py` — новый `_write_parquet_fallback()` с HDFS + Trino
+- `scrapers/base/__init__.py` — экспорт HDFSClient и TrinoTableManager
+- `docker/images/airflow/requirements.txt` — добавлен `trino>=0.328.0`
+- `configs/trino/catalog/hive.properties` — настройки external tables
+- `Makefile` — добавлен target `init-storage`
+
+**Новый поток данных:**
+```
+DataFrame → PyArrow → Local Parquet → WebHDFS upload → Trino CREATE TABLE → hive.{schema}.{table}
+```
+
+**Критерии проверки Фазы 3.5:**
+```bash
+# 1. Пересобрать образ Airflow
+make up-build
+
+# 2. Инициализировать хранилище
+make init-storage
+
+# 3. Запустить DAG
+docker compose exec airflow-webserver airflow dags trigger dag_ingest_fbref
+
+# 4. Проверить данные в HDFS
+docker compose exec namenode hdfs dfs -ls /data/bronze/fbref/
+
+# 5. Проверить таблицы в Trino
+docker compose exec trino trino --execute "SHOW TABLES FROM hive.bronze"
+docker compose exec trino trino --execute "SELECT COUNT(*) FROM hive.bronze.fbref_schedule"
+
+# 6. Запустить тесты
+pytest tests/unit/scrapers/test_hdfs_client.py -v
+pytest tests/unit/scrapers/test_trino_manager.py -v
+pytest tests/integration/test_storage_pipeline.py -v -m integration
 ```
 
 ---
@@ -374,20 +494,21 @@ ruff check . && mypy . && black --check .
 
 ---
 
-## Сводная таблица: 68 задач, 10 агентов
+## Сводная таблица: 77 задач, 10 агентов
 
 | Фаза | Задачи | Основные агенты | Кол-во |
 |------|--------|-----------------|--------|
 | 1. Инфраструктура | TASK-001..008 | docker-expert, trino-specialist | 8 |
-| 2. Scrapers | TASK-009..020 | web-scraping-expert, testing-agent | 12 |
+| 2. Scrapers | TASK-009..020a | web-scraping-expert, testing-agent | 13 |
 | 3. Airflow DAGs | TASK-021..032 | airflow-expert, testing-agent | 12 |
+| 3.5. Storage Layer | TASK-033a..033h | docker-expert, trino-specialist, testing-agent | 8 |
 | 4. Silver Layer | TASK-033..043 | spark-data-engineer, airflow-expert, testing-agent | 11 |
 | 5. Gold Layer | TASK-044..053 | spark-data-engineer, airflow-expert, testing-agent | 10 |
 | 6. Data Quality | TASK-054..059 | data-quality-agent, airflow-expert | 6 |
 | 7. Trino | TASK-060..063 | trino-specialist | 4 |
 | 8. Документация | TASK-064..068 | все | 5 |
 
-**Итого:** 68 задач
+**Итого:** 77 задач
 
 ---
 
@@ -396,7 +517,7 @@ ruff check . && mypy . && black --check .
 | Агент | Задачи | Кол-во |
 |-------|--------|--------|
 | docker-expert | TASK-001..008, TASK-064 | 9 |
-| web-scraping-expert | TASK-009..019 | 11 |
+| web-scraping-expert | TASK-009..019, TASK-020a | 12 |
 | airflow-expert | TASK-021..032, TASK-042, TASK-052, TASK-057..059 | 17 |
 | spark-data-engineer | TASK-033..041, TASK-044..051 | 17 |
 | trino-specialist | TASK-007, TASK-060..063 | 5 |
