@@ -1,0 +1,83 @@
+# =============================================================================
+# Data Platform Dependencies
+# =============================================================================
+# Combined requirements for Airflow workers with scraping capabilities.
+# Airflow itself is installed separately with constraints.
+# =============================================================================
+
+
+# -----------------------------------------------------------------------------
+# [airflow-core] Pin Airflow version to prevent automatic upgrade to 3.x
+# Base image already has 2.7.3, but providers may try to upgrade it
+# -----------------------------------------------------------------------------
+# Pin connexion to avoid PyYAML<6 requirement (won't build on Python 3.11)
+connexion[flask,swagger-ui]==2.14.2
+apache-airflow==2.7.3
+
+# -----------------------------------------------------------------------------
+# [airflow-providers] Apache Airflow Providers
+# Compatible with Airflow 2.7.x (pinned versions to avoid 3.x requirements)
+# -----------------------------------------------------------------------------
+apache-airflow-providers-apache-spark==4.0.1
+apache-airflow-providers-redis==3.3.2
+apache-airflow-providers-http==4.5.2
+
+
+# -----------------------------------------------------------------------------
+# [spark] PySpark
+# -----------------------------------------------------------------------------
+pyspark==3.5.3
+
+
+# -----------------------------------------------------------------------------
+# [data-processing] Data Processing & Analytics
+# -----------------------------------------------------------------------------
+pandas>=2.0.0
+numpy>=1.24.0
+pyarrow>=14.0.0
+
+
+# -----------------------------------------------------------------------------
+# [http] HTTP Clients & Parsing
+# -----------------------------------------------------------------------------
+requests>=2.31.0
+beautifulsoup4>=4.12.0
+lxml>=5.0.0
+
+
+# -----------------------------------------------------------------------------
+# [database] Database Connectors
+# -----------------------------------------------------------------------------
+psycopg2-binary>=2.9.9
+redis>=4.5.2,<5.0.0
+
+# Trino Python client for DDL operations
+trino>=0.328.0
+
+
+# -----------------------------------------------------------------------------
+# [resilience] Resilience Patterns
+# -----------------------------------------------------------------------------
+tenacity>=8.2.0
+pybreaker>=1.2.0
+
+
+# -----------------------------------------------------------------------------
+# [iceberg] Apache Iceberg
+# DISABLED: PyIceberg causes OOM and dependency conflicts
+# Using WebHDFS + Trino DDL instead (see scrapers/base/iceberg_writer.py)
+# -----------------------------------------------------------------------------
+# pyiceberg[hive]>=0.10.0
+
+
+# -----------------------------------------------------------------------------
+# [scraping] Web Scraping Dependencies
+# NOTE: Moved to requirements-scraping.txt (installed in separate RUN layer)
+# to avoid pip backtracking issues with rich version conflicts
+# -----------------------------------------------------------------------------
+
+
+# -----------------------------------------------------------------------------
+# [utils] Utilities
+# -----------------------------------------------------------------------------
+python-dotenv>=1.0.0

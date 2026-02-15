@@ -1,13 +1,12 @@
 # =============================================================================
-# Airflow Python Dependencies (Compatible with Airflow 2.10.4)
+# Airflow Providers и Data Processing
+# (Airflow устанавливается отдельно с constraints)
 # =============================================================================
 
-# Apache providers (latest for Airflow 2.x)
-apache-airflow-providers-apache-spark==4.11.1
-apache-airflow-providers-postgres==5.13.1
-apache-airflow-providers-redis==3.8.0
-apache-airflow-providers-celery==3.8.5
-apache-airflow-providers-http==4.13.2
+# Apache providers (compatible with Airflow 2.7.x)
+apache-airflow-providers-apache-spark==4.0.1
+apache-airflow-providers-redis==3.3.2
+apache-airflow-providers-http==4.5.2
 
 # PySpark
 pyspark==3.5.3
@@ -30,18 +29,8 @@ redis>=5.0.0
 python-dotenv>=1.0.0
 tenacity>=8.2.0
 
-# =============================================================================
-# Soccerdata and Web Scraping
-# =============================================================================
-soccerdata>=1.8.8
-undetected-chromedriver>=3.5.0
-selenium>=4.15.0
-cloudscraper>=1.2.71
-pyvirtualdisplay>=3.0  # Xvfb wrapper for Cloudflare bypass
-
 # Resilience patterns
 pybreaker>=1.2.0
-PySocks>=1.7.1
 
 # Apache Iceberg
 pyiceberg[hive]>=0.7.0

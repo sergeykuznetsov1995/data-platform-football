@@ -52,7 +52,7 @@ class SofaScoreScraper(SoccerdataScraper):
         if self._reader is None:
             try:
                 import soccerdata as sd
-                self._reader = sd.SofaScore(
+                self._reader = sd.Sofascore(
                     leagues=self.leagues,
                     seasons=self.seasons,
                     **self._sd_kwargs
@@ -85,97 +85,67 @@ class SofaScoreScraper(SoccerdataScraper):
             logger.error(f"Error reading schedule: {e}")
             return None
 
-    def read_team_season_stats(self) -> Optional[pd.DataFrame]:
+    def read_league_table(self) -> Optional[pd.DataFrame]:
         """
-        Read team season statistics.
+        Read league table (standings).
 
         Returns:
-            DataFrame with team stats
+            DataFrame with league standings
         """
         reader = self._get_reader()
-        logger.info("Fetching SofaScore team stats")
+        logger.info("Fetching SofaScore league table")
 
         try:
-            df = self._execute_with_resilience(reader.read_team_season_stats)
+            df = self._execute_with_resilience(reader.read_league_table)
 
             if df is not None and not df.empty:
                 df = df.reset_index()
-                df = self._add_metadata(df, 'team_stats')
+                df = self._add_metadata(df, 'league_table')
 
             return df
 
         except Exception as e:
-            logger.error(f"Error reading team stats: {e}")
+            logger.error(f"Error reading league table: {e}")
             return None
+
+    def read_team_season_stats(self) -> Optional[pd.DataFrame]:
+        """
+        Read team season statistics.
+
+        Note: Sofascore doesn't have this method in soccerdata.
+        Returns league table instead.
+        """
+        return self.read_league_table()
 
     def read_player_season_stats(self) -> Optional[pd.DataFrame]:
         """
         Read player season statistics.
 
-        Returns:
-            DataFrame with player stats
+        Note: Sofascore doesn't have this method in soccerdata.
+        Returns None.
         """
-        reader = self._get_reader()
-        logger.info("Fetching SofaScore player stats")
-
-        try:
-            df = self._execute_with_resilience(reader.read_player_season_stats)
-
-            if df is not None and not df.empty:
-                df = df.reset_index()
-                df = self._add_metadata(df, 'player_stats')
-
-            return df
-
-        except Exception as e:
-            logger.error(f"Error reading player stats: {e}")
-            return None
+        logger.info("Sofascore player stats not available in soccerdata")
+        return None
 
     def read_team_match_stats(self) -> Optional[pd.DataFrame]:
         """
         Read team match-level statistics.
 
-        Returns:
-            DataFrame with team match stats
+        Note: Sofascore doesn't have this method in soccerdata.
+        Returns None.
         """
-        reader = self._get_reader()
-        logger.info("Fetching SofaScore team match stats")
-
-        try:
-            df = self._execute_with_resilience(reader.read_team_match_stats)
-
-            if df is not None and not df.empty:
-                df = df.reset_index()
-                df = self._add_metadata(df, 'team_match_stats')
-
-            return df
-
-        except Exception as e:
-            logger.error(f"Error reading team match stats: {e}")
-            return None
+        logger.info("Sofascore team match stats not available in soccerdata")
+        return None
 
     def read_player_match_stats(self) -> Optional[pd.DataFrame]:
         """
         Read player match-level statistics with ratings.
 
-        Returns:
-            DataFrame with player match stats
+        Note: Sofascore doesn't have this method in soccerdata.
+        Returns None.
         """
-        reader = self._get_reader()
-        logger.info("Fetching SofaScore player match stats")
-
-        try:
-            df = self._execute_with_resilience(reader.read_player_match_stats)
-
-            if df is not None and not df.empty:
-                df = df.reset_index()
-                df = self._add_metadata(df, 'player_match_stats')
-
-            return df
-
-        except Exception as e:
-            logger.error(f"Error reading player match stats: {e}")
-            return None
+        logger.info("Sofascore player match stats not available in soccerdata")
+        return None
 
     def scrape_schedule(self) -> Dict[str, str]:
         """Scrape match schedule."""
@@ -189,17 +159,21 @@ class SofaScoreScraper(SoccerdataScraper):
             return {'schedule': table_path}
         return {}
 
-    def scrape_team_stats(self) -> Dict[str, str]:
-        """Scrape team stats."""
-        df = self.read_team_season_stats()
+    def scrape_league_table(self) -> Dict[str, str]:
+        """Scrape league table (standings)."""
+        df = self.read_league_table()
         if df is not None and not df.empty:
             table_path = self.save_to_iceberg(
                 df=df,
-                table_name='sofascore_team_stats',
+                table_name='sofascore_league_table',
                 partition_cols=['league', 'season'],
             )
-            return {'team_stats': table_path}
+            return {'league_table': table_path}
         return {}
+
+    def scrape_team_stats(self) -> Dict[str, str]:
+        """Scrape team stats (alias for league table)."""
+        return self.scrape_league_table()
 
     def scrape_player_stats(self) -> Dict[str, str]:
         """Scrape player stats."""
@@ -242,17 +216,9 @@ class SofaScoreScraper(SoccerdataScraper):
         schedule_results = self.scrape_schedule()
         results.update(schedule_results)
 
-        # Scrape team stats
-        team_results = self.scrape_team_stats()
-        results.update(team_results)
-
-        # Scrape player stats
-        player_results = self.scrape_player_stats()
-        results.update(player_results)
-
-        # Scrape player ratings
-        ratings_results = self.scrape_player_ratings()
-        results.update(ratings_results)
+        # Scrape league table (standings)
+        table_results = self.scrape_league_table()
+        results.update(table_results)
 
         logger.info(f"SofaScore scrape complete: {list(results.keys())}")
         return results

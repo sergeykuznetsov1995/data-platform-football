@@ -1,5 +1,5 @@
 """
-Integration tests for FotMobSeleniumScraper.
+Integration tests for FotMobScraper.
 
 Tests actual HTTP requests to FotMob API.
 Requires network connectivity and Chrome/Selenium.
@@ -11,8 +11,8 @@ import pytest
 @pytest.mark.integration
 @pytest.mark.cloudflare
 @pytest.mark.slow
-class TestFotMobSeleniumIntegration:
-    """Integration tests for FotMobSeleniumScraper with real HTTP."""
+class TestFotMobScraperIntegration:
+    """Integration tests for FotMobScraper with real HTTP."""
 
     @pytest.fixture
     def scraper(self, undetected_chrome_available, network_available, minimal_leagues, minimal_seasons):
@@ -22,9 +22,9 @@ class TestFotMobSeleniumIntegration:
         if not network_available:
             pytest.skip("No network connectivity")
 
-        from scrapers.fotmob_selenium_scraper import FotMobSeleniumScraper
+        from scrapers.fotmob_scraper import FotMobScraper
 
-        scraper = FotMobSeleniumScraper(
+        scraper = FotMobScraper(
             leagues=minimal_leagues,
             seasons=minimal_seasons,
             headless=True,
@@ -100,7 +100,7 @@ class TestFotMobSeleniumIntegration:
 
 @pytest.mark.integration
 @pytest.mark.slow
-class TestFotMobSeleniumMultiLeague:
+class TestFotMobScraperMultiLeague:
     """Test scraping multiple leagues."""
 
     @pytest.fixture
@@ -111,9 +111,9 @@ class TestFotMobSeleniumMultiLeague:
         if not network_available:
             pytest.skip("No network connectivity")
 
-        from scrapers.fotmob_selenium_scraper import FotMobSeleniumScraper
+        from scrapers.fotmob_scraper import FotMobScraper
 
-        scraper = FotMobSeleniumScraper(
+        scraper = FotMobScraper(
             leagues=['ENG-Premier League', 'ESP-La Liga'],
             seasons=[2024],
             headless=True,

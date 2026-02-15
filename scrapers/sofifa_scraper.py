@@ -40,7 +40,7 @@ class SoFIFAScraper(SoccerdataScraper):
         self,
         leagues: Optional[List[str]] = None,
         seasons: Optional[List[int]] = None,
-        versions: Optional[List[str]] = None,
+        versions: str = 'latest',
         **kwargs
     ):
         """
@@ -49,10 +49,10 @@ class SoFIFAScraper(SoccerdataScraper):
         Args:
             leagues: List of leagues (used for filtering)
             seasons: List of seasons (not used, use versions instead)
-            versions: List of FIFA versions to scrape (e.g., ['24', '23'])
+            versions: FIFA versions - "latest", "all", or version IDs from URL
         """
         super().__init__(leagues=leagues, seasons=seasons, **kwargs)
-        self.versions = versions or ['24']
+        self.versions = versions
         self._reader = None
 
     def _get_reader(self):
@@ -163,21 +163,10 @@ class SoFIFAScraper(SoccerdataScraper):
         if not self.leagues or df is None or df.empty:
             return df
 
-        # Map league names to SoFIFA league names
-        league_mapping = {
-            'ENG-Premier League': 'English Premier League',
-            'ESP-La Liga': 'Spain Primera Division',
-            'GER-Bundesliga': 'German 1. Bundesliga',
-            'ITA-Serie A': 'Italian Serie A',
-            'FRA-Ligue 1': 'French Ligue 1',
-        }
-
-        sofifa_leagues = [
-            league_mapping.get(l, l) for l in self.leagues
-        ]
-
+        # SoFIFA returns league names in the same format we use (e.g., 'ENG-Premier League')
+        # No mapping needed
         if 'league' in df.columns:
-            return df[df['league'].isin(sofifa_leagues)]
+            return df[df['league'].isin(self.leagues)]
 
         return df
 

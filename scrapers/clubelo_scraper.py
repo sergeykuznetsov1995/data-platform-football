@@ -87,7 +87,10 @@ class ClubEloScraper(SoccerdataScraper):
         reader = self._get_reader()
 
         if date_val is None:
-            date_val = date.today()
+            date_val = datetime.now()
+        elif isinstance(date_val, date) and not isinstance(date_val, datetime):
+            # soccerdata >= 1.8.8 requires datetime, not date
+            date_val = datetime.combine(date_val, datetime.min.time())
 
         logger.info(f"Fetching ClubElo ratings for {date_val}")
 

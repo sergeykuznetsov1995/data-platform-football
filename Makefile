@@ -2,7 +2,7 @@
 # Data Platform - Makefile
 # =============================================================================
 
-.PHONY: help build up down restart logs ps clean health test-spark test-trino init-hdfs shell-spark shell-airflow shell-trino
+.PHONY: help build up down restart logs ps clean health test-spark test-trino init-hdfs init-storage shell-spark shell-airflow shell-trino test-fbref-curl test-fbref-soccerdata test-fbref-nodriver test-fbref-full test-proxy-stats test-fbref-sticky
 
 # Default target
 help:
@@ -17,13 +17,22 @@ help:
 	@echo "  make clean        - Remove all containers and volumes"
 	@echo "  make health       - Check health of all services"
 	@echo ""
-	@echo "  make init-hdfs    - Initialize HDFS Medallion directories"
+	@echo "  make init-hdfs    - Initialize HDFS Medallion directories (legacy)"
+	@echo "  make init-storage - Initialize HDFS + Hive schemas (recommended)"
 	@echo "  make test-spark   - Run Spark integration test"
 	@echo "  make test-trino   - Run Trino integration test"
 	@echo ""
 	@echo "  make shell-spark  - Open shell in Spark master"
 	@echo "  make shell-airflow - Open shell in Airflow webserver"
 	@echo "  make shell-trino  - Open shell in Trino"
+	@echo ""
+	@echo "FBref Scraping Tests:"
+	@echo "  make test-fbref-curl      - Test curl_cffi with residential proxy"
+	@echo "  make test-fbref-soccerdata - Test soccerdata scraper"
+	@echo "  make test-fbref-nodriver  - Test nodriver (browser) fallback"
+	@echo "  make test-fbref-full      - Run full test pipeline"
+	@echo "  make test-fbref-sticky    - Test with custom sticky sessions (STICKY_REQUESTS=N)"
+	@echo "  make test-proxy-stats     - Show proxy pool statistics"
 
 # Build images
 build:
@@ -92,10 +101,15 @@ health:
 	@echo "=== Redis ==="
 	@docker compose exec -T redis redis-cli -a redis123 ping 2>/dev/null | grep -q PONG && echo "OK: Redis ready" || echo "FAIL: Redis not ready"
 
-# Initialize HDFS directories
+# Initialize HDFS directories (legacy - uses shell script)
 init-hdfs:
 	@echo "Initializing HDFS Medallion directories..."
 	docker compose exec namenode /usr/local/bin/init-medallion.sh
+
+# Initialize storage (HDFS + Hive schemas via Python)
+init-storage:
+	@echo "Initializing storage (HDFS directories + Hive schemas)..."
+	docker compose exec airflow-scheduler python /opt/airflow/scripts/init_storage.py
 
 # Test Spark integration
 test-spark:
@@ -136,3 +150,111 @@ urls:
 	@echo "  Spark Master:   http://localhost:8080"
 	@echo "  Airflow:        http://localhost:8081 (admin/admin)"
 	@echo "  Trino:          http://localhost:8082"
+
+# =============================================================================
+# FBref Scraping Tests
+# =============================================================================
+
+# Test curl_cffi with residential proxy (basic test)
+test-fbref-curl:
+	@echo "Testing FBref with curl_cffi + residential proxy..."
+	@docker compose exec airflow-webserver python -c "\
+from curl_cffi.requests import Session; \
+import random; \
+proxies = open('/opt/airflow/proxys.txt').readlines(); \
+proxy = random.choice(proxies).strip(); \
+host, port, user, pwd = proxy.split(':'); \
+proxy_url = f'http://{user}:{pwd}@{host}:{port}'; \
+s = Session(impersonate='chrome120'); \
+s.proxies = {'http': proxy_url, 'https': proxy_url}; \
+print(f'Using proxy: {host}:{port}'); \
+r = s.get('https://api.ipify.org?format=json'); \
+print(f'Proxy IP: {r.json()}'); \
+r = s.get('https://fbref.com/en/comps/9/schedule/Premier-League-Scores-and-Fixtures'); \
+print(f'FBref Status: {r.status_code}'); \
+print(f'Has tables: {\"<table\" in r.text}'); \
+print(f'Cloudflare blocked: {\"challenge\" in r.text.lower() or \"just a moment\" in r.text.lower()}'); \
+print(f'Content length: {len(r.text)} chars'); \
+"
+
+# Test soccerdata scraper (HTTP-based)
+test-fbref-soccerdata:
+	@echo "Testing FBref soccerdata scraper..."
+	docker compose exec airflow-webserver python dags/scripts/run_fbref_scraper.py \
+		--scraper-type soccerdata \
+		--proxy-file /opt/airflow/proxys.txt \
+		--mode match_data \
+		--match-data-type schedule \
+		--leagues "ENG-Premier League" \
+		--season 2025 \
+		--output /tmp/test_fbref_soccerdata.json \
+		--verbose
+
+# Test nodriver fallback (browser-based)
+test-fbref-nodriver:
+	@echo "Testing FBref with nodriver fallback..."
+	docker compose exec airflow-webserver python dags/scripts/run_fbref_scraper.py \
+		--scraper-type selenium \
+		--use-nodriver \
+		--proxy-file /opt/airflow/proxys.txt \
+		--mode match_data \
+		--match-data-type schedule \
+		--leagues "ENG-Premier League" \
+		--season 2025 \
+		--output /tmp/test_fbref_nodriver.json \
+		--verbose
+
+# Full FBref test pipeline (curl_cffi -> nodriver fallback)
+test-fbref-full:
+	@echo "Running full FBref test pipeline..."
+	@echo ""
+	@echo "=== Step 1: Test curl_cffi ==="
+	@$(MAKE) test-fbref-curl || true
+	@echo ""
+	@echo "=== Step 2: Test soccerdata scraper ==="
+	@$(MAKE) test-fbref-soccerdata || true
+	@echo ""
+	@echo "=== Step 3: Test nodriver fallback ==="
+	@$(MAKE) test-fbref-nodriver || true
+	@echo ""
+	@echo "Full FBref test pipeline completed!"
+
+# Test proxy pool statistics
+test-proxy-stats:
+	@echo "Testing proxy pool statistics..."
+	@docker compose exec airflow-webserver python -c "\
+from scrapers.utils.proxy_manager import ProxyManager, ProxyType; \
+import json; \
+pm = ProxyManager(cooldown_seconds=60.0); \
+pm.load_from_file_custom_format('/opt/airflow/proxys.txt'); \
+print(f'Loaded {pm.total_count} proxies'); \
+stats = pm.get_stats(); \
+print(json.dumps({k: v for k, v in stats.items() if k != 'proxies'}, indent=2)); \
+print(f'\\nFirst 5 proxies:'); \
+for p in stats['proxies'][:5]: \
+    print(f'  {p[\"host\"]}:{p[\"port\"]} - success_rate={p[\"success_rate\"]}'); \
+"
+
+# Test with custom sticky requests setting
+test-fbref-sticky:
+	@echo "Testing FBref with custom sticky session settings..."
+	@echo "STICKY_REQUESTS=$${STICKY_REQUESTS:-5}"
+	@docker compose exec airflow-webserver python -c "\
+from scrapers.soccerdata_fbref_scraper import SoccerdataFBrefScraper; \
+import os; \
+sticky = int(os.environ.get('STICKY_REQUESTS', '5')); \
+print(f'Testing with sticky_requests={sticky}'); \
+scraper = SoccerdataFBrefScraper( \
+    leagues=['ENG-Premier League'], \
+    seasons=[2025], \
+    use_tor=False, \
+    proxy_file='/opt/airflow/proxys.txt' \
+); \
+scraper._max_sticky_requests = sticky; \
+df = scraper.read_schedule(); \
+print(f'Schedule rows: {len(df) if df is not None else 0}'); \
+print('Proxy stats:'); \
+import json; \
+print(json.dumps(scraper.get_proxy_stats(), indent=2, default=str)); \
+scraper.close(); \
+"

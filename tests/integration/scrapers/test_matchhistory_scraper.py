@@ -1,5 +1,5 @@
 """
-Integration tests for MatchHistoryDirectScraper.
+Integration tests for MatchHistoryScraper.
 
 Tests actual HTTP requests to football-data.co.uk.
 Requires network connectivity.
@@ -10,8 +10,8 @@ import pytest
 
 @pytest.mark.integration
 @pytest.mark.slow
-class TestMatchHistoryDirectIntegration:
-    """Integration tests for MatchHistoryDirectScraper with real HTTP."""
+class TestMatchHistoryScraperIntegration:
+    """Integration tests for MatchHistoryScraper with real HTTP."""
 
     @pytest.fixture
     def scraper(self, network_available, minimal_leagues, minimal_seasons):
@@ -19,9 +19,9 @@ class TestMatchHistoryDirectIntegration:
         if not network_available:
             pytest.skip("No network connectivity")
 
-        from scrapers.matchhistory_direct_scraper import MatchHistoryDirectScraper
+        from scrapers.matchhistory_scraper import MatchHistoryScraper
 
-        scraper = MatchHistoryDirectScraper(
+        scraper = MatchHistoryScraper(
             leagues=minimal_leagues,
             seasons=minimal_seasons,
             headless=True,
@@ -107,9 +107,9 @@ class TestMatchHistorySeleniumFallback:
         if not undetected_chrome_available:
             pytest.skip("undetected-chromedriver not available")
 
-        from scrapers.matchhistory_direct_scraper import MatchHistoryDirectScraper
+        from scrapers.matchhistory_scraper import MatchHistoryScraper
 
-        scraper = MatchHistoryDirectScraper(
+        scraper = MatchHistoryScraper(
             leagues=['ENG-Premier League'],
             seasons=[2024],
             headless=True,
@@ -144,9 +144,9 @@ class TestMatchHistoryMultiLeague:
         if not network_available:
             pytest.skip("No network connectivity")
 
-        from scrapers.matchhistory_direct_scraper import MatchHistoryDirectScraper
+        from scrapers.matchhistory_scraper import MatchHistoryScraper
 
-        scraper = MatchHistoryDirectScraper(
+        scraper = MatchHistoryScraper(
             leagues=['ENG-Premier League', 'ESP-La Liga'],
             seasons=[2024],
             headless=True,

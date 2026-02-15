@@ -129,16 +129,18 @@ class UnderstatScraper(SoccerdataScraper):
 
     def read_team_season_stats(self) -> Optional[pd.DataFrame]:
         """
-        Read team season statistics.
+        Read team match statistics (aggregated by team).
+
+        Note: Understat doesn't have read_team_season_stats, using read_team_match_stats instead.
 
         Returns:
             DataFrame with team xG stats
         """
         reader = self._get_reader()
-        logger.info("Fetching Understat team season stats")
+        logger.info("Fetching Understat team match stats")
 
         try:
-            df = self._execute_with_resilience(reader.read_team_season_stats)
+            df = self._execute_with_resilience(reader.read_team_match_stats)
 
             if df is not None and not df.empty:
                 df = df.reset_index()
@@ -177,24 +179,42 @@ class UnderstatScraper(SoccerdataScraper):
         """
         Read shot-level event data with xG.
 
+        Note: soccerdata has a bug with multiple leagues, so we fetch per league.
+
         Returns:
             DataFrame with shot events including coordinates and xG
         """
-        reader = self._get_reader()
+        import soccerdata as sd
+
         logger.info("Fetching Understat shot events")
 
-        try:
-            df = self._execute_with_resilience(reader.read_shot_events)
+        all_shots = []
 
-            if df is not None and not df.empty:
-                df = df.reset_index()
-                df = self._add_metadata(df, 'shots')
+        # Fetch shots per league to avoid soccerdata bug with multiple leagues
+        for league in self.leagues:
+            try:
+                logger.info(f"Fetching shots for {league}")
+                reader = sd.Understat(
+                    leagues=[league],
+                    seasons=self.seasons,
+                    **self._sd_kwargs
+                )
+                df = self._execute_with_resilience(reader.read_shot_events)
 
-            return df
+                if df is not None and not df.empty:
+                    df = df.reset_index()
+                    all_shots.append(df)
 
-        except Exception as e:
-            logger.error(f"Error reading shot events: {e}")
+            except Exception as e:
+                logger.warning(f"Error reading shots for {league}: {e}")
+                continue
+
+        if not all_shots:
             return None
+
+        df = pd.concat(all_shots, ignore_index=True)
+        df = self._add_metadata(df, 'shots')
+        return df
 
     def read_team_match_stats(self) -> Optional[pd.DataFrame]:
         """

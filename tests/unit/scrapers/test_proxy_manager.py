@@ -6,13 +6,16 @@ import pytest
 from unittest.mock import MagicMock, patch
 import tempfile
 import os
+import time
 
 from scrapers.utils.proxy_manager import (
     Proxy,
     ProxyType,
     ProxyManager,
     ProxyManagerConfig,
+    ErrorType,
     create_proxy_manager,
+    classify_error,
 )
 
 
@@ -76,6 +79,40 @@ class TestProxy:
         proxy = Proxy(host='test', port=8080)
         proxy.record_failure()
         assert proxy.failure_count == 1
+
+    def test_record_failure_with_error_type(self):
+        """Test recording failure with error type classification."""
+        proxy = Proxy(host='test', port=8080)
+        proxy.record_failure(error_type='rate_limit')
+        proxy.record_failure(error_type='rate_limit')
+        proxy.record_failure(error_type='cloudflare')
+
+        assert proxy.failure_count == 3
+        assert proxy.error_counts['rate_limit'] == 2
+        assert proxy.error_counts['cloudflare'] == 1
+
+    def test_record_response_time(self):
+        """Test recording response time for performance tracking."""
+        proxy = Proxy(host='test', port=8080)
+        proxy.record_response_time(1.5)
+        proxy.record_response_time(2.0)
+        proxy.record_response_time(2.5)
+
+        assert len(proxy.response_times) == 3
+        assert proxy.avg_response_time == 2.0
+
+    def test_get_error_summary(self):
+        """Test error summary generation."""
+        proxy = Proxy(host='test', port=8080)
+        assert proxy.get_error_summary() == "no errors"
+
+        proxy.record_failure(error_type='forbidden')
+        proxy.record_failure(error_type='forbidden')
+        proxy.record_failure(error_type='cloudflare')
+
+        summary = proxy.get_error_summary()
+        assert 'forbidden:2' in summary
+        assert 'cloudflare:1' in summary
 
     def test_mark_banned(self):
         proxy = Proxy(host='test', port=8080)
@@ -189,6 +226,143 @@ class TestProxyManager:
         assert 'total' in stats
         assert 'available' in stats
         assert 'proxies' in stats
+        assert 'error_type_totals' in stats
+        assert 'in_cooldown' in stats
+
+    def test_cooldown_respected(self):
+        """Test that cooldown is respected between proxy uses."""
+        manager = ProxyManager(cooldown_seconds=0.5)  # Short cooldown for test
+        manager.add_proxy('proxy1.example.com', 8080)
+
+        proxy1 = manager.get_proxy()
+        proxy1.last_used = time.time()
+
+        # Immediately try to get proxy - should still return same one (only one available)
+        proxy2 = manager.get_proxy(respect_cooldown=True)
+        assert proxy2.host == proxy1.host
+
+        # Wait for cooldown
+        time.sleep(0.6)
+        proxy3 = manager.get_proxy(respect_cooldown=True)
+        assert proxy3.host == proxy1.host
+
+    def test_cooldown_multiple_proxies(self):
+        """Test cooldown with multiple proxies."""
+        manager = ProxyManager(cooldown_seconds=1.0)
+        manager.add_proxy('proxy1.example.com', 8080)
+        manager.add_proxy('proxy2.example.com', 8080)
+
+        # Get first proxy and mark as used
+        proxy1 = manager.get_proxy(respect_cooldown=True)
+        proxy1.last_used = time.time()
+
+        # Get second proxy (should be different because first is in cooldown)
+        proxy2 = manager.get_proxy(respect_cooldown=True)
+        assert proxy2.host != proxy1.host
+
+    def test_record_result_with_error_type(self):
+        """Test recording result with error type classification."""
+        manager = ProxyManager()
+        manager.add_proxy('proxy1.example.com', 8080)
+
+        proxy = manager.get_proxy()
+        manager.record_result(proxy, success=False, error_type='rate_limit')
+        manager.record_result(proxy, success=False, error_type='cloudflare')
+
+        assert proxy.error_counts['rate_limit'] == 1
+        assert proxy.error_counts['cloudflare'] == 1
+
+    def test_cloudflare_ban_threshold(self):
+        """Test that proxy is banned quickly for Cloudflare blocks."""
+        manager = ProxyManager()
+        manager.config.cloudflare_ban_threshold = 2
+        manager.config.min_success_rate = 0.0  # Disable success rate banning for this test
+        manager.add_proxy('proxy1.example.com', 8080)
+
+        proxy = manager.get_proxy()
+
+        # First Cloudflare failure - should not trigger ban yet
+        manager.record_result(proxy, success=False, error_type='cloudflare')
+        # Note: After first failure, success_rate drops to 0 which would trigger ban
+        # So we need to set min_success_rate to 0 to test cloudflare_ban_threshold
+
+        # Second Cloudflare failure - should trigger ban
+        manager.record_result(proxy, success=False, error_type='cloudflare')
+        assert proxy.is_banned is True
+        assert proxy.error_counts.get('cloudflare', 0) == 2
+
+    def test_get_best_proxies(self):
+        """Test getting best performing proxies."""
+        manager = ProxyManager()
+        manager.add_proxy('proxy1.example.com', 8080)
+        manager.add_proxy('proxy2.example.com', 8080)
+        manager.add_proxy('proxy3.example.com', 8080)
+
+        # Set different success rates
+        manager._proxies[0].success_count = 8
+        manager._proxies[0].failure_count = 2  # 80% success
+        manager._proxies[1].success_count = 5
+        manager._proxies[1].failure_count = 5  # 50% success
+        manager._proxies[2].success_count = 9
+        manager._proxies[2].failure_count = 1  # 90% success
+
+        best = manager.get_best_proxies(limit=2)
+        assert len(best) == 2
+        assert best[0].host == 'proxy3.example.com'  # 90% success
+        assert best[1].host == 'proxy1.example.com'  # 80% success
+
+    def test_get_cooldown_status(self):
+        """Test getting cooldown status for proxies."""
+        manager = ProxyManager(cooldown_seconds=60.0)
+        manager.add_proxy('proxy1.example.com', 8080)
+        manager.add_proxy('proxy2.example.com', 8080)
+
+        # Mark first proxy as recently used
+        manager._proxies[0].last_used = time.time()
+
+        status = manager.get_cooldown_status()
+        assert 'proxy1.example.com:8080' in status
+        assert status['proxy1.example.com:8080'] > 0  # In cooldown
+        assert status['proxy2.example.com:8080'] == 0  # Not in cooldown
+
+    def test_get_http_proxy_url_with_auth(self):
+        """Test get_http_proxy_url returns proper HTTP format with auth."""
+        manager = ProxyManager()
+        manager.add_proxy(
+            'proxy.example.com',
+            8080,
+            username='user',
+            password='pass'
+        )
+
+        http_url = manager.get_http_proxy_url()
+        assert http_url == 'http://user:pass@proxy.example.com:8080'
+
+    def test_get_http_proxy_url_without_auth(self):
+        """Test get_http_proxy_url returns proper HTTP format without auth."""
+        manager = ProxyManager()
+        manager.add_proxy('proxy.example.com', 8080)
+
+        http_url = manager.get_http_proxy_url()
+        assert http_url == 'http://proxy.example.com:8080'
+
+    def test_get_http_proxy_url_no_proxies(self):
+        """Test get_http_proxy_url returns None when no proxies."""
+        manager = ProxyManager()
+
+        http_url = manager.get_http_proxy_url()
+        assert http_url is None
+
+    def test_get_http_proxy_url_all_banned(self):
+        """Test get_http_proxy_url returns None when all proxies banned."""
+        manager = ProxyManager()
+        manager.add_proxy('proxy.example.com', 8080)
+
+        # Ban the proxy
+        manager._proxies[0].mark_banned()
+
+        http_url = manager.get_http_proxy_url()
+        assert http_url is None
 
     def test_load_from_file(self):
         manager = ProxyManager()
@@ -238,3 +412,49 @@ class TestProxyType:
         assert ProxyType.SOCKS4.value == 'socks4'
         assert ProxyType.SOCKS5.value == 'socks5'
         assert ProxyType.TOR.value == 'tor'
+
+
+class TestErrorType:
+    """Tests for ErrorType enum."""
+
+    def test_error_types(self):
+        assert ErrorType.RATE_LIMIT.value == 'rate_limit'
+        assert ErrorType.FORBIDDEN.value == 'forbidden'
+        assert ErrorType.CLOUDFLARE.value == 'cloudflare'
+        assert ErrorType.TIMEOUT.value == 'timeout'
+        assert ErrorType.CONNECTION.value == 'connection'
+        assert ErrorType.UNKNOWN.value == 'unknown'
+
+
+class TestClassifyError:
+    """Tests for classify_error function."""
+
+    def test_rate_limit_errors(self):
+        assert classify_error("HTTP 429 Too Many Requests") == 'rate_limit'
+        assert classify_error("Rate limit exceeded") == 'rate_limit'
+        assert classify_error("too many requests") == 'rate_limit'
+
+    def test_forbidden_errors(self):
+        assert classify_error("HTTP 403 Forbidden") == 'forbidden'
+        assert classify_error("Access denied") == 'forbidden'
+        assert classify_error("FORBIDDEN") == 'forbidden'
+
+    def test_cloudflare_errors(self):
+        assert classify_error("Cloudflare challenge") == 'cloudflare'
+        assert classify_error("CAPTCHA required") == 'cloudflare'
+        assert classify_error("Checking your browser") == 'cloudflare'
+        assert classify_error("Just a moment") == 'cloudflare'
+        assert classify_error("turnstile challenge") == 'cloudflare'
+
+    def test_timeout_errors(self):
+        assert classify_error("Request timeout") == 'timeout'
+        assert classify_error("Connection timed out") == 'timeout'
+
+    def test_connection_errors(self):
+        assert classify_error("Connection refused") == 'connection'
+        assert classify_error("Network unreachable") == 'connection'
+        assert classify_error("Connection reset") == 'connection'
+
+    def test_unknown_errors(self):
+        assert classify_error("Some random error") == 'unknown'
+        assert classify_error("") == 'unknown'
