@@ -49,7 +49,7 @@ def main():
 
     try:
         # Import here to avoid issues at module load time
-        from scrapers.clubelo_scraper import ClubEloScraper
+        from scrapers.clubelo import ClubEloScraper
 
         with ClubEloScraper(leagues=leagues) as scraper:
             today = datetime.now()

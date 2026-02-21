@@ -28,30 +28,28 @@ import json
 import logging
 import os
 import sys
+from datetime import datetime
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
-)
 logger = logging.getLogger(__name__)
 
+# Noisy third-party loggers to suppress to WARNING level
+_NOISY_LOGGERS = [
+    'nodriver', 'uc', 'urllib3', 'websockets', 'asyncio',
+    'selenium', 'undetected_chromedriver', 'hpack', 'httpx',
+]
 
-def check_flaresolverr_health(url: str, timeout: int = 30) -> bool:
-    """Check if FlareSolverr is healthy before starting."""
-    import requests
-    try:
-        response = requests.get(f"{url.rstrip('/')}/health", timeout=timeout)
-        if response.status_code == 200:
-            data = response.json()
-            if data.get('status') == 'ok':
-                logger.info(f"FlareSolverr health check passed: {data}")
-                return True
-        logger.warning(f"FlareSolverr health check failed: {response.text}")
-        return False
-    except Exception as e:
-        logger.error(f"FlareSolverr health check error: {e}")
-        return False
+
+def _configure_logging(verbose: bool = False) -> None:
+    """Configure logging level and suppress noisy third-party loggers."""
+    level = logging.DEBUG if verbose else logging.INFO
+    logging.basicConfig(
+        level=level,
+        format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S',
+    )
+    if not verbose:
+        for name in _NOISY_LOGGERS:
+            logging.getLogger(name).setLevel(logging.WARNING)
 
 
 def check_tor_health(host: str = 'tor', port: int = 9050, timeout: int = 30) -> bool:
@@ -147,11 +145,13 @@ def main():
         default='ENG-Premier League',
         help='Comma-separated list of leagues'
     )
+    _now = datetime.now()
+    _current_season = _now.year if _now.month >= 8 else _now.year - 1
     parser.add_argument(
         '--season',
         type=int,
-        default=2024,
-        help='Season year'
+        default=_current_season,
+        help='Season year (default: current season)'
     )
     parser.add_argument(
         '--output',
@@ -178,17 +178,6 @@ def main():
         action='store_true',
         default=True,
         help='Use xvfb for virtual display (selenium scraper)'
-    )
-    parser.add_argument(
-        '--use-flaresolverr',
-        action='store_true',
-        help='Use FlareSolverr for Cloudflare bypass instead of Selenium'
-    )
-    parser.add_argument(
-        '--flaresolverr-url',
-        type=str,
-        default='http://flaresolverr:8191',
-        help='FlareSolverr service URL'
     )
     parser.add_argument(
         '--use-nodriver',
@@ -309,7 +298,15 @@ def main():
         default=50,
         help='Maximum matches to scrape per league/season (0 = no limit, selenium only)'
     )
+    parser.add_argument(
+        '--verbose',
+        action='store_true',
+        help='Enable DEBUG logging (default: INFO with noisy loggers suppressed)'
+    )
     args = parser.parse_args()
+
+    # Configure logging AFTER parsing args so --verbose takes effect
+    _configure_logging(verbose=args.verbose)
 
     leagues = [l.strip() for l in args.leagues.split(',')]
 
@@ -334,8 +331,6 @@ def main():
     # ==========================================================================
     if args.scraper_type == 'nodriver':
         logger.info("Using nodriver scraper (Cloudflare Turnstile bypass)")
-        bronze_dir = os.environ.get('FBREF_BRONZE_DIR', '/tmp/bronze/fbref')
-        os.makedirs(bronze_dir, exist_ok=True)
         logger.info(f"Headless: {args.headless}, use_xvfb: {args.use_xvfb}")
         logger.info(f"Cloudflare wait: {args.cloudflare_wait}s, cf-verify retries: {args.cf_verify_retries}")
         logger.info(f"Content timeout: {args.content_timeout}s")
@@ -347,7 +342,7 @@ def main():
         results['diagnostics']['content_timeout'] = args.content_timeout
 
         try:
-            from scrapers.nodriver_fbref_scraper import NodriverFBrefScraper
+            from scrapers.nodriver_fbref import NodriverFBrefScraper
 
             with NodriverFBrefScraper(
                 leagues=leagues,
@@ -378,26 +373,17 @@ def main():
                         data_category=args.data_category,
                     )
 
-                    if scrape_result.get('data') is not None:
-                        # Save to HDFS/file
-                        output_path = f"{bronze_dir}/{args.data_category}_{args.stat_type}"
-                        df = scrape_result['data']
-                        df.to_parquet(f"{output_path}.parquet", index=False)
-                        results['tables'] = [output_path]
-                        results['rows'] = scrape_result['rows']
-                        logger.info(f"Saved {scrape_result['rows']} rows to {output_path}")
-                    else:
-                        results['tables'] = []
-                        results['rows'] = 0
-
+                    results['tables'] = list(scrape_result.values())
                     results['stat_type'] = args.stat_type
                     results['data_category'] = args.data_category
-                    results['diagnostics']['scraper_stats'] = scrape_result.get('stats', {})
+                    results['diagnostics']['scraper_stats'] = scraper.get_stats()
 
-                    if scrape_result['rows'] == 0:
+                    logger.info(f"Single stat scrape completed: {list(scrape_result.keys())}")
+
+                    if not scrape_result:
                         error_msg = (
                             f"No data collected for {args.data_category}_{args.stat_type}. "
-                            f"Stats: {scrape_result.get('stats', {})}"
+                            f"Stats: {scraper.get_stats()}"
                         )
                         logger.error(error_msg)
                         results['errors'].append(error_msg)
@@ -420,87 +406,34 @@ def main():
                         logger.info("Scraping schedule...")
                         scrape_result = scraper.scrape_schedule()
 
-                        if scrape_result.get('data') is not None:
-                            output_path = f"{bronze_dir}/schedule"
-                            df = scrape_result['data']
-                            df.to_parquet(f"{output_path}.parquet", index=False)
-                            results['tables'] = [output_path]
-                            results['rows'] = scrape_result['rows']
-                            logger.info(f"Saved {scrape_result['rows']} schedule rows")
-                        else:
-                            results['tables'] = []
-                            results['rows'] = 0
+                        results['tables'] = list(scrape_result.values())
+                        results['match_data_type'] = args.match_data_type
+                        results['diagnostics']['scraper_stats'] = scraper.get_stats()
+
+                        logger.info(f"Schedule scrape completed: {list(scrape_result.keys())}")
+
+                        if not scrape_result:
                             error_msg = "No schedule data collected"
                             logger.error(error_msg)
                             results['errors'].append(error_msg)
-
-                        results['match_data_type'] = args.match_data_type
-                        results['diagnostics']['scraper_stats'] = scrape_result.get('stats', {})
 
                 # =============================================================
                 # MODE: full (not recommended for nodriver - use single_stat)
                 # =============================================================
                 else:  # mode == 'full'
-                    logger.warning(
-                        "Full mode with nodriver is not recommended due to memory usage. "
-                        "Using sequential single_stat collection instead."
+                    logger.info(
+                        "Full mode with nodriver: sequential collection "
+                        "(schedule → player → team → keeper stats)"
                     )
 
-                    from scrapers.fbref.constants import PLAYER_STAT_TYPES, TEAM_STAT_TYPES, KEEPER_STAT_TYPES
+                    scrape_results = scraper.scrape_all()
 
-                    all_tables = []
-
-                    # Collect schedule
-                    logger.info("Collecting schedule...")
-                    sched_result = scraper.scrape_schedule()
-                    if sched_result.get('data') is not None:
-                        output_path = f"{bronze_dir}/schedule"
-                        sched_result['data'].to_parquet(f"{output_path}.parquet", index=False)
-                        all_tables.append(output_path)
-
-                    # Collect player stats (one at a time)
-                    for stat_type in PLAYER_STAT_TYPES:
-                        logger.info(f"Collecting player_{stat_type}...")
-                        try:
-                            stat_result = scraper.scrape_single_stat_type(stat_type, 'player')
-                            if stat_result.get('data') is not None:
-                                output_path = f"{bronze_dir}/player_{stat_type}"
-                                stat_result['data'].to_parquet(f"{output_path}.parquet", index=False)
-                                all_tables.append(output_path)
-                        except Exception as e:
-                            logger.error(f"Error collecting player_{stat_type}: {e}")
-                            continue
-
-                    # Collect team stats
-                    for stat_type in TEAM_STAT_TYPES:
-                        logger.info(f"Collecting team_{stat_type}...")
-                        try:
-                            stat_result = scraper.scrape_single_stat_type(stat_type, 'team')
-                            if stat_result.get('data') is not None:
-                                output_path = f"{bronze_dir}/team_{stat_type}"
-                                stat_result['data'].to_parquet(f"{output_path}.parquet", index=False)
-                                all_tables.append(output_path)
-                        except Exception as e:
-                            logger.error(f"Error collecting team_{stat_type}: {e}")
-                            continue
-
-                    # Collect keeper stats
-                    for stat_type in KEEPER_STAT_TYPES:
-                        logger.info(f"Collecting keeper_{stat_type}...")
-                        try:
-                            stat_result = scraper.scrape_single_stat_type(stat_type, 'keeper')
-                            if stat_result.get('data') is not None:
-                                output_path = f"{bronze_dir}/keeper_{stat_type}"
-                                stat_result['data'].to_parquet(f"{output_path}.parquet", index=False)
-                                all_tables.append(output_path)
-                        except Exception as e:
-                            logger.error(f"Error collecting keeper_{stat_type}: {e}")
-                            continue
-
-                    results['tables'] = all_tables
+                    results['tables'] = list(scrape_results.values())
                     results['diagnostics']['scraper_stats'] = scraper.get_stats()
 
-                    logger.info(f"Full scrape completed: {len(all_tables)} tables saved")
+                    logger.info(
+                        f"Full scrape completed: {len(scrape_results)} tables saved to Iceberg"
+                    )
 
         except ImportError as e:
             logger.error(f"Failed to import NodriverFBrefScraper: {e}")
@@ -540,7 +473,7 @@ def main():
             results['diagnostics']['tor_healthy'] = True
 
         try:
-            from scrapers.soccerdata_fbref_scraper import SoccerdataFBrefScraper
+            from scrapers.soccerdata_fbref import SoccerdataFBrefScraper
 
             with SoccerdataFBrefScraper(
                 leagues=leagues,
@@ -666,21 +599,7 @@ def main():
     else:  # scraper_type == 'selenium'
         logger.info("Using Selenium scraper (browser-based)")
         logger.info(f"Headless: {args.headless}, use_xvfb: {args.use_xvfb}")
-        logger.info(f"Use FlareSolverr: {args.use_flaresolverr}, URL: {args.flaresolverr_url}")
         logger.info(f"Use nodriver: {args.use_nodriver}, cloudflare_wait: {args.nodriver_cloudflare_wait}s")
-
-        # Pre-flight check for FlareSolverr if enabled
-        if args.use_flaresolverr:
-            logger.info(f"Checking FlareSolverr health at {args.flaresolverr_url}...")
-            if not check_flaresolverr_health(args.flaresolverr_url):
-                error_msg = f"FlareSolverr is not healthy at {args.flaresolverr_url}"
-                logger.error(error_msg)
-                results['errors'].append(error_msg)
-                results['diagnostics']['flaresolverr_healthy'] = False
-                with open(args.output, 'w') as f:
-                    json.dump(results, f)
-                sys.exit(1)
-            results['diagnostics']['flaresolverr_healthy'] = True
 
         # Add nodriver diagnostics
         if args.use_nodriver:
@@ -697,8 +616,6 @@ def main():
                 headless=args.headless,
                 use_xvfb=args.use_xvfb,
                 proxy_file=args.proxy_file,
-                use_flaresolverr=args.use_flaresolverr,
-                flaresolverr_url=args.flaresolverr_url,
                 use_nodriver=args.use_nodriver,
                 nodriver_cloudflare_wait=args.nodriver_cloudflare_wait,
             ) as scraper:

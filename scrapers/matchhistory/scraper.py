@@ -21,14 +21,9 @@ import pandas as pd
 import requests
 
 from scrapers.base.base_scraper import SeleniumScraper
-from scrapers.base.cloudflare_bypass import CloudflareBypass
+from scrapers.base.browser import CloudflareBypass
 
 logger = logging.getLogger(__name__)
-
-
-# Alias for backwards compatibility
-MatchHistoryDirectScraper = None  # Will be set after class definition
-
 
 class MatchHistoryScraper(SeleniumScraper):
     """
@@ -479,7 +474,3 @@ class MatchHistoryScraper(SeleniumScraper):
             self._session = None
 
         super().close()
-
-
-# Backwards compatibility alias
-MatchHistoryDirectScraper = MatchHistoryScraper

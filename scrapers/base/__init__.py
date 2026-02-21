@@ -10,7 +10,6 @@ Modules:
 - hdfs_client: HDFSClient for WebHDFS operations (legacy, optional)
 - trino_manager: TrinoTableManager for Iceberg tables
 - browser/: Browser automation package (CloudflareBypass)
-- flaresolverr_client: FlareSolverr client for Cloudflare bypass
 """
 
 from scrapers.base.base_scraper import BaseScraper, SeleniumScraper
@@ -18,7 +17,6 @@ from scrapers.base.iceberg_writer import IcebergWriter
 from scrapers.base.hdfs_client import HDFSClient, HDFSError
 from scrapers.base.trino_manager import TrinoTableManager, TrinoError
 from scrapers.base.browser import CloudflareBypass, browser_session, BrowserConfig
-from scrapers.base.flaresolverr_client import FlareSolverrClient
 
 __all__ = [
     'BaseScraper',
@@ -31,5 +29,4 @@ __all__ = [
     'CloudflareBypass',
     'BrowserConfig',
     'browser_session',
-    'FlareSolverrClient',
 ]

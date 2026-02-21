@@ -70,7 +70,7 @@ class TestFBrefScraper:
     @pytest.fixture
     def scraper(self, mock_dependencies, mock_soccerdata_fbref):
         """Create FBrefScraper instance."""
-        from scrapers.fbref_scraper import FBrefScraper
+        from scrapers.fbref import FBrefScraper
 
         return FBrefScraper(
             leagues=['ENG-Premier League'],
@@ -134,7 +134,7 @@ class TestFBrefScraper:
 
     def test_stat_types_default(self, mock_dependencies, mock_soccerdata_fbref):
         """Test default stat types."""
-        from scrapers.fbref_scraper import FBrefScraper
+        from scrapers.fbref import FBrefScraper
 
         scraper = FBrefScraper(leagues=['ENG-Premier League'], seasons=[2024])
 
@@ -149,7 +149,7 @@ class TestFBrefScraperStatTypes:
 
     def test_all_stat_types(self):
         """Test all stat types are defined."""
-        from scrapers.fbref_scraper import FBrefScraper
+        from scrapers.fbref import FBrefScraper
 
         expected_types = [
             'standard', 'shooting', 'passing', 'passing_types',
@@ -161,7 +161,7 @@ class TestFBrefScraperStatTypes:
             assert stat_type in FBrefScraper.STAT_TYPES
 
 
-class TestFBrefSeleniumScraperConstants:
+class TestFBrefScraperConstants:
     """Tests for FBref Selenium scraper constants."""
 
     def test_league_ids_exist(self):
@@ -259,7 +259,7 @@ class TestFBrefUrlBuilder:
         assert '2024-2025' in url
 
 
-class TestFBrefSeleniumScraperMethods:
+class TestFBrefScraperMethods:
     """Tests for FBref Selenium scraper methods without actually scraping."""
 
     @pytest.fixture
@@ -269,7 +269,7 @@ class TestFBrefSeleniumScraperMethods:
              patch('scrapers.base.base_scraper.get_retry_policy') as mock_rp, \
              patch('scrapers.base.base_scraper.get_circuit_breaker') as mock_cb, \
              patch('scrapers.base.base_scraper.IcebergWriter') as mock_iw, \
-             patch('scrapers.base.cloudflare_bypass.CloudflareBypass') as mock_browser:
+             patch('scrapers.base.browser.cloudflare_bypass.CloudflareBypass') as mock_browser:
 
             mock_rl.return_value = MagicMock()
             mock_rl.return_value.acquire.return_value = True
@@ -416,7 +416,7 @@ class TestFBrefScraperMemoryEfficientMethods:
              patch('scrapers.base.base_scraper.get_retry_policy') as mock_rp, \
              patch('scrapers.base.base_scraper.get_circuit_breaker') as mock_cb, \
              patch('scrapers.base.base_scraper.IcebergWriter') as mock_iw, \
-             patch('scrapers.base.cloudflare_bypass.CloudflareBypass') as mock_browser:
+             patch('scrapers.base.browser.cloudflare_bypass.CloudflareBypass') as mock_browser:
 
             mock_rl.return_value = MagicMock()
             mock_rl.return_value.acquire.return_value = True
@@ -735,7 +735,7 @@ class TestFBrefScraperCombinedMatchData:
              patch('scrapers.base.base_scraper.get_retry_policy') as mock_rp, \
              patch('scrapers.base.base_scraper.get_circuit_breaker') as mock_cb, \
              patch('scrapers.base.base_scraper.IcebergWriter') as mock_iw, \
-             patch('scrapers.base.cloudflare_bypass.CloudflareBypass') as mock_browser:
+             patch('scrapers.base.browser.cloudflare_bypass.CloudflareBypass') as mock_browser:
 
             mock_rl.return_value = MagicMock()
             mock_rl.return_value.acquire.return_value = True
@@ -791,6 +791,7 @@ class TestFBrefScraperCombinedMatchData:
             seasons=[2024],
         )
 
+        scraper._read_schedule_from_iceberg = MagicMock(return_value=None)
         scraper.read_schedule = MagicMock(return_value=None)
 
         result = scraper.scrape_combined_match_data(max_matches=5)
@@ -798,7 +799,11 @@ class TestFBrefScraperCombinedMatchData:
         assert isinstance(result, dict)
 
     def test_scrape_combined_match_data_collects_all_data_types(self, mock_scraper_dependencies):
-        """Test that combined method collects shot_events, match_events, lineups."""
+        """Test that combined method collects shot_events, match_events, lineups.
+
+        _process_single_match uses Parse Once optimization:
+        it calls _fetch_page once, then parsers directly (not read_* methods).
+        """
         from scrapers.fbref.scraper import FBrefScraper
 
         scraper = FBrefScraper(
@@ -817,42 +822,39 @@ class TestFBrefScraperCombinedMatchData:
         })
 
         sample_shots = pd.DataFrame({
-            'match_id': ['match1'],
             'player': ['Saka'],
             'xG': [0.5],
-            'league': ['ENG-Premier League'],
-            'season': [2024],
         })
 
         sample_events = pd.DataFrame({
-            'match_id': ['match1'],
             'event_type': ['goal'],
             'minute': [45],
-            'league': ['ENG-Premier League'],
-            'season': [2024],
         })
 
         sample_lineups = pd.DataFrame({
-            'match_id': ['match1'],
             'team': ['Arsenal'],
             'player': ['Ramsdale'],
-            'league': ['ENG-Premier League'],
-            'season': [2024],
         })
 
-        scraper.read_schedule = MagicMock(return_value=sample_schedule)
-        scraper.read_shot_events = MagicMock(return_value=sample_shots)
-        scraper.read_match_events = MagicMock(return_value=sample_events)
-        scraper.read_lineup = MagicMock(return_value=sample_lineups)
+        # Mock HTML with tables so validation passes
+        fake_html = '<html><body><table id="shots"><tr><td>data</td></tr></table></body></html>'
+
+        scraper._read_schedule_from_iceberg = MagicMock(return_value=sample_schedule)
+        scraper._fetch_page = MagicMock(return_value=fake_html)
+        scraper._get_existing_match_ids = MagicMock(return_value=set())
         scraper.save_to_iceberg = MagicMock(return_value='iceberg.bronze.test')
         scraper._cleanup_after_league = MagicMock()
+        scraper._add_metadata = MagicMock(side_effect=lambda df, _: df)
 
-        result = scraper.scrape_combined_match_data(max_matches=2)
+        with patch('scrapers.fbref.data_readers.parse_shots_table', return_value=sample_shots), \
+             patch('scrapers.fbref.data_readers.parse_events_from_scorebox', return_value=sample_events), \
+             patch('scrapers.fbref.data_readers.parse_lineup_table', return_value=sample_lineups), \
+             patch('scrapers.fbref.data_readers.extract_tables_from_comments', return_value={}):
 
-        # Verify all three read methods were called
-        scraper.read_shot_events.assert_called()
-        scraper.read_match_events.assert_called()
-        scraper.read_lineup.assert_called()
+            result = scraper.scrape_combined_match_data(max_matches=2)
+
+        # Verify _fetch_page was called for each match
+        assert scraper._fetch_page.call_count >= 2
 
         # Verify all three data types were saved
         assert 'shot_events' in result
@@ -868,6 +870,51 @@ class TestFBrefScraperCombinedMatchData:
         default_max_matches = sig.parameters['max_matches'].default
 
         assert default_max_matches == 50
+
+    def test_scrape_combined_uses_iceberg_schedule(self, mock_scraper_dependencies):
+        """Test that scrape_combined reads schedule from Iceberg first."""
+        from scrapers.fbref.scraper import FBrefScraper
+
+        scraper = FBrefScraper(leagues=['ENG-Premier League'], seasons=[2024])
+
+        sample_schedule = pd.DataFrame({
+            'Date': ['2024-01-01'], 'Home': ['Arsenal'], 'Away': ['Chelsea'],
+            'match_url': ['https://fbref.com/en/matches/abc123/Match-Report'],
+            'match_id': ['abc123'],
+            'league': ['ENG-Premier League'], 'season': [2024],
+        })
+
+        scraper._read_schedule_from_iceberg = MagicMock(return_value=sample_schedule)
+        scraper.read_schedule = MagicMock()  # should NOT be called
+        scraper._get_existing_match_ids = MagicMock(return_value=set())
+        scraper._fetch_page = MagicMock(return_value='<html><body></body></html>')
+        scraper.save_to_iceberg = MagicMock(return_value='iceberg.bronze.test')
+        scraper._cleanup_after_league = MagicMock()
+
+        with patch('scrapers.fbref.data_readers.parse_shots_table', return_value=pd.DataFrame()), \
+             patch('scrapers.fbref.data_readers.parse_events_from_scorebox', return_value=pd.DataFrame()), \
+             patch('scrapers.fbref.data_readers.parse_lineup_table', return_value=pd.DataFrame()), \
+             patch('scrapers.fbref.data_readers.extract_tables_from_comments', return_value={}):
+            scraper.scrape_combined_match_data(max_matches=1)
+
+        scraper._read_schedule_from_iceberg.assert_called_once_with('ENG-Premier League', 2024)
+        scraper.read_schedule.assert_not_called()  # Iceberg worked → no HTTP fallback
+
+    def test_scrape_combined_falls_back_to_http(self, mock_scraper_dependencies):
+        """Test HTTP fallback when Iceberg has no schedule."""
+        from scrapers.fbref.scraper import FBrefScraper
+
+        scraper = FBrefScraper(leagues=['ENG-Premier League'], seasons=[2024])
+
+        scraper._read_schedule_from_iceberg = MagicMock(return_value=None)
+        scraper.read_schedule = MagicMock(return_value=None)
+        scraper._cleanup_after_league = MagicMock()
+
+        result = scraper.scrape_combined_match_data(max_matches=1)
+
+        scraper._read_schedule_from_iceberg.assert_called_once()
+        scraper.read_schedule.assert_called_once()  # Iceberg failed → HTTP called
+        assert isinstance(result, dict)
 
     def test_runner_accepts_combined_match_data_mode(self):
         """Test that runner script accepts --mode combined_match_data."""

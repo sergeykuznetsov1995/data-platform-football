@@ -63,25 +63,13 @@ def main():
         default=True,
         help='Use xvfb for virtual display'
     )
-    parser.add_argument(
-        '--use-flaresolverr',
-        action='store_true',
-        default=False,
-        help='Use FlareSolverr instead of local Selenium'
-    )
-    parser.add_argument(
-        '--flaresolverr-url',
-        type=str,
-        default='http://flaresolverr:8191',
-        help='FlareSolverr service URL'
-    )
     args = parser.parse_args()
 
     leagues = [l.strip() for l in args.leagues.split(',')]
     match_urls = [u.strip() for u in args.match_urls.split(',') if u.strip()] if args.match_urls else []
 
     logger.info(f"Starting WhoScored scraper: leagues={leagues}, season={args.season}")
-    logger.info(f"Headless: {args.headless}, use_xvfb: {args.use_xvfb}, use_flaresolverr: {args.use_flaresolverr}")
+    logger.info(f"Headless: {args.headless}, use_xvfb: {args.use_xvfb}")
     if match_urls:
         logger.info(f"Specific match URLs: {len(match_urls)}")
 
@@ -101,8 +89,6 @@ def main():
             seasons=[args.season],
             headless=args.headless,
             use_xvfb=args.use_xvfb,
-            use_flaresolverr=args.use_flaresolverr,
-            flaresolverr_url=args.flaresolverr_url,
         ) as scraper:
             all_events = []
 

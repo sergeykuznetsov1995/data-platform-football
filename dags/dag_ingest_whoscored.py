@@ -145,7 +145,7 @@ with DAG(
 
     ### Notes
 
-    - Uses FlareSolverr for Cloudflare bypass (more reliable than local Selenium)
+    - Uses Selenium with undetected-chromedriver for Cloudflare bypass
     - Written to Parquet fallback (PyIceberg disabled for stability)
     """,
 ) as dag:
@@ -158,8 +158,8 @@ python dags/scripts/run_whoscored_scraper.py \\
     --leagues "{leagues_str}" \\
     --season {CURRENT_SEASON} \\
     --output /tmp/whoscored_result.json \\
-    --use-flaresolverr \\
-    --flaresolverr-url http://flaresolverr:8191
+    --headless \\
+    --use-xvfb
 """,
         env={
             'PYTHONPATH': '/opt/airflow:/opt/airflow/dags',

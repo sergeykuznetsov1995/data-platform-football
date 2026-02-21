@@ -135,6 +135,30 @@ class IcebergWriter:
         df['_batch_id'] = batch_id or str(uuid.uuid4())
         return df
 
+    def _evolve_schema(self, trino, database: str, table: str, arrow_schema) -> None:
+        """
+        Add missing columns to existing Iceberg table (schema evolution).
+
+        Compares DataFrame columns with existing table columns and issues
+        ALTER TABLE ADD COLUMN for any new columns. Existing columns that
+        are absent from the DataFrame are left as-is (INSERT fills them with NULL).
+
+        Args:
+            trino: TrinoTableManager instance
+            database: Database/schema name
+            table: Table name
+            arrow_schema: PyArrow schema of the incoming DataFrame
+        """
+        existing_cols = trino.get_table_columns(database, table)
+        existing_col_names = {c.lower() for c in existing_cols}
+
+        new_columns = trino.arrow_schema_to_trino(arrow_schema)
+
+        for col_name, col_type in new_columns.items():
+            if col_name.lower() not in existing_col_names:
+                trino.add_column(database, table, col_name, col_type)
+                logger.info(f'Schema evolution: added column "{col_name}" {col_type}')
+
     def write_dataframe(
         self,
         df: pd.DataFrame,
@@ -222,6 +246,10 @@ class IcebergWriter:
                 partition_columns=partition_cols,
             )
             logger.info(f"Created Iceberg table: {full_table}")
+
+        # Schema evolution — add missing columns to existing table
+        if trino.table_exists(database, table):
+            self._evolve_schema(trino, database, table, arrow_table.schema)
 
         # Handle overwrite mode by deleting existing data
         if mode == 'overwrite':

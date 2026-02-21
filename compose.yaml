@@ -293,43 +293,6 @@ services:
       retries: 5
 
   # ===========================================================================
-  # FlareSolverr - Cloudflare Bypass Service
-  # ===========================================================================
-  flaresolverr:
-    image: ghcr.io/flaresolverr/flaresolverr:v3.3.21
-    container_name: flaresolverr
-    hostname: flaresolverr
-    environment:
-      - LOG_LEVEL=info
-      - LOG_HTML=false
-      # HEADLESS=true обязателен в Docker (нет X-сервера)
-      # Основной метод обхода Cloudflare - undetected-chromedriver + Xvfb в Airflow
-      - HEADLESS=true
-      # Увеличены таймауты для сложных Cloudflare JS challenges (fallback)
-      - MAX_TIMEOUT=300000
-      - BROWSER_TIMEOUT=180000
-      - TZ=UTC
-    ports:
-      - "8191:8191"
-    networks:
-      - data-platform-net
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8191/health"]
-      interval: 30s
-      timeout: 15s
-      retries: 5
-      start_period: 90s
-    restart: unless-stopped
-    deploy:
-      resources:
-        limits:
-          memory: 4G
-          cpus: '2.0'
-        reservations:
-          memory: 2G
-          cpus: '1.0'
-
-  # ===========================================================================
   # Tor Proxy - Alternative for Cloudflare bypass
   # ===========================================================================
   tor:

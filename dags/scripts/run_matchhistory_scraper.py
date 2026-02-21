@@ -69,7 +69,7 @@ def main():
 
     try:
         import pandas as pd
-        from scrapers.matchhistory_scraper import MatchHistoryScraper
+        from scrapers.matchhistory import MatchHistoryScraper
 
         with MatchHistoryScraper(
             leagues=leagues,

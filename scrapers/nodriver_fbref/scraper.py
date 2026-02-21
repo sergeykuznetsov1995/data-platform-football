@@ -40,6 +40,7 @@ from bs4 import BeautifulSoup
 from scrapers.base.browser.nodriver_bypass import NodriverBypass, SlowProxyError
 from scrapers.fbref.constants import (
     BASE_URL,
+    FBREF_UNCOMMENT_TABLES_JS,
     LEAGUE_IDS,
     PLAYER_STAT_TYPES,
     TEAM_STAT_TYPES,
@@ -62,12 +63,13 @@ from scrapers.fbref.html_parser import (
     parse_events_from_scorebox,
     diagnose_html_structure,
 )
+from scrapers.base.base_scraper import BaseScraper
 from scrapers.utils.proxy_manager import ProxyManager, ProxyType
 
 logger = logging.getLogger(__name__)
 
 
-class NodriverFBrefScraper:
+class NodriverFBrefScraper(BaseScraper):
     """
     FBref scraper using nodriver for Cloudflare bypass.
 
@@ -88,64 +90,6 @@ class NodriverFBrefScraper:
 
     SOURCE_NAME = 'fbref'
     DEFAULT_RATE_LIMIT = DEFAULT_RATE_LIMIT
-
-    # JavaScript to uncomment FBref statistical tables and collect diagnostics.
-    # FBref stores stat tables inside HTML comments (<!-- <table>...</table> -->)
-    # inside various container divs. JavaScript on the page should uncomment them,
-    # but through proxies the JS files may not load or execute in time.
-    # This script:
-    # 1. Collects diagnostics about page state
-    # 2. Finds ALL comment nodes containing <table> anywhere in the document
-    # 3. Uncomments them by replacing the comment with actual DOM elements
-    FBREF_UNCOMMENT_TABLES_JS = """
-    (function() {
-        var diag = {
-            url: window.location.href,
-            title: document.title,
-            readyState: document.readyState,
-            tables: document.querySelectorAll('table').length,
-            allDivs: document.querySelectorAll('div[id^="all_"]').length,
-            bodyLen: document.body ? document.body.innerHTML.length : 0,
-            scripts: document.querySelectorAll('script').length,
-            scriptsSrc: document.querySelectorAll('script[src]').length,
-            comments: 0,
-            uncommented: 0
-        };
-
-        // Walk DOM to find comment nodes containing tables
-        try {
-            var walker = document.createTreeWalker(
-                document.body || document,
-                NodeFilter.SHOW_COMMENT, null, false
-            );
-            var commentsToReplace = [];
-            var node;
-            while (node = walker.nextNode()) {
-                diag.comments++;
-                if (node.data && node.data.indexOf('<table') !== -1) {
-                    commentsToReplace.push(node);
-                }
-            }
-            commentsToReplace.forEach(function(comment) {
-                var parent = comment.parentNode;
-                if (parent) {
-                    var temp = document.createElement('div');
-                    temp.innerHTML = comment.data;
-                    while (temp.firstChild) {
-                        parent.insertBefore(temp.firstChild, comment);
-                    }
-                    parent.removeChild(comment);
-                    diag.uncommented++;
-                }
-            });
-        } catch(e) {
-            diag.walkerError = e.message;
-        }
-
-        diag.tablesAfter = document.querySelectorAll('table').length;
-        return JSON.stringify(diag);
-    })()
-    """
 
     # Memory management - reduced to prevent OOM on limited RAM systems
     MAX_PAGES_BEFORE_RESTART = 10  # Was 30, restart more often to free memory
@@ -188,8 +132,15 @@ class NodriverFBrefScraper:
             cf_verify_max_retries: Maximum retries for cf-verify plugin
             content_timeout: Timeout for content extraction (seconds, default 45).
         """
-        self.leagues = leagues or ['ENG-Premier League']
-        self.seasons = seasons or [2024]
+        # proxy_file=None in super — nodriver manages its own ProxyManager
+        # with weighted strategy, min_success_rate=0.3, cooldown_seconds=30.0
+        super().__init__(
+            leagues=leagues or ['ENG-Premier League'],
+            seasons=seasons or [2024],
+            proxy_file=None,
+            rate_limit=self.DEFAULT_RATE_LIMIT,
+        )
+
         self.proxy_file = proxy_file
         self.headless = headless
         self.use_xvfb = use_xvfb
@@ -199,8 +150,7 @@ class NodriverFBrefScraper:
         self.cf_verify_max_retries = cf_verify_max_retries
         self.content_timeout = content_timeout
 
-        # Initialize proxy manager
-        self._proxy_manager: Optional[ProxyManager] = None
+        # Initialize proxy manager (nodriver-specific: weighted strategy)
         if proxy_file:
             self._init_proxy_manager(proxy_file)
 
@@ -209,13 +159,11 @@ class NodriverFBrefScraper:
         self._pages_fetched = 0
         self._last_request_time = 0.0
 
-        # Statistics
-        self._stats = {
-            'successes': 0,
-            'failures': 0,
+        # Extend BaseScraper stats with nodriver-specific keys
+        self._stats.update({
             'cloudflare_blocked': 0,
             'proxy_rotations': 0,
-        }
+        })
 
         logger.info(
             f"NodriverFBrefScraper initialized: "
@@ -241,13 +189,13 @@ class NodriverFBrefScraper:
             proxy_str = self._proxy_manager.get_nodriver_proxy_string()
             if proxy_str:
                 self._stats['proxy_rotations'] += 1
-                logger.info(f"Using proxy: {proxy_str.split(':')[0]}:****")
+                logger.debug(f"Using proxy: {proxy_str.split(':')[0]}:****")
                 return proxy_str
         return None
 
     def _create_browser(
         self,
-        slow_proxy_threshold: float = 15.0,
+        slow_proxy_threshold: float = 45.0,
         max_retries: int = None,
         wait_for_selector_timeout: float = 60.0,
     ) -> NodriverBypass:
@@ -270,11 +218,11 @@ class NodriverFBrefScraper:
             # wait_for_content_js removed: polling via evaluate hangs when Runtime
             # is unresponsive after CF bypass. Tables from HTML comments are extracted
             # in Python by extract_tables_from_comments() regardless.
-            pre_content_js=self.FBREF_UNCOMMENT_TABLES_JS,
+            pre_content_js=FBREF_UNCOMMENT_TABLES_JS,
             slow_proxy_threshold=slow_proxy_threshold,
         )
 
-        logger.info(
+        logger.debug(
             f"Created nodriver browser: "
             f"headless={self.headless}, use_xvfb={self.use_xvfb}, "
             f"cloudflare_wait={self.cloudflare_wait}s, "
@@ -357,12 +305,12 @@ class NodriverFBrefScraper:
                 page_load_timeout=self.PAGE_LOAD_TIMEOUT,
             )
 
-            logger.info(f"DrissionPage attempt: {url}")
+            logger.debug(f"DrissionPage attempt: {url}")
             html = bypass.get_page(url)
 
             if html and not self._is_cloudflare_blocked(html):
                 if '<table' in html or len(html) > 5000:
-                    logger.info(f"DrissionPage success: {url} ({len(html)} bytes)")
+                    logger.debug(f"DrissionPage success: {url} ({len(html)} bytes)")
                     self._stats['successes'] += 1
 
                     # Record success for proxy
@@ -417,7 +365,7 @@ class NodriverFBrefScraper:
         # DrissionPage does NOT support authenticated proxies - it will go direct!
         drissionpage_available = True
         if proxy_requires_auth:
-            logger.info(
+            logger.debug(
                 "Skipping DrissionPage: proxy requires authentication "
                 "(DrissionPage does not support proxy auth)"
             )
@@ -426,7 +374,7 @@ class NodriverFBrefScraper:
             try:
                 html = self._fetch_with_drissionpage(url)
                 if html:
-                    logger.info("DrissionPage SUCCESS")
+                    logger.debug("DrissionPage SUCCESS")
                     return html
                 logger.warning("DrissionPage returned None, falling back to nodriver")
             except ImportError:
@@ -434,7 +382,7 @@ class NodriverFBrefScraper:
                 logger.warning("DrissionPage not available, using nodriver only")
 
         if drissionpage_available:
-            logger.info("DrissionPage failed, falling back to nodriver...")
+            logger.debug("DrissionPage failed, falling back to nodriver...")
 
         # Phase 2: Fallback to nodriver with retry
         for cf_attempt in range(max_cf_retries):
@@ -490,8 +438,8 @@ class NodriverFBrefScraper:
                         diag_path = f'/tmp/fbref_incomplete_cf{cf_attempt}.html'
                         with open(diag_path, 'w', encoding='utf-8') as f:
                             f.write(html)
-                        logger.info(f"Saved incomplete page to {diag_path}")
-                        logger.info(f"Page start: {html[:300]}")
+                        logger.debug(f"Saved incomplete page to {diag_path}")
+                        logger.debug(f"Page start: {html[:300]}")
                     except Exception as e:
                         logger.warning(f"Failed to save diagnostic page: {e}")
                     self._stats['failures'] += 1
@@ -589,15 +537,6 @@ class NodriverFBrefScraper:
         html_lower = html.lower()
         return any(indicator in html_lower for indicator in cloudflare_indicators)
 
-    def _add_metadata(self, df: pd.DataFrame, table_type: str) -> pd.DataFrame:
-        """Add scraping metadata to DataFrame."""
-        import datetime
-
-        df['_source'] = self.SOURCE_NAME
-        df['_scraped_at'] = datetime.datetime.utcnow().isoformat()
-        df['_table_type'] = table_type
-        return df
-
     # =========================================================================
     # Data Collection Methods
     # =========================================================================
@@ -641,6 +580,15 @@ class NodriverFBrefScraper:
                 f"Tables: {diagnosis['table_ids'][:5]}"
             )
             return None
+
+        # Extract match URLs (pd.read_html loses href attributes)
+        from scrapers.fbref.html_parser import extract_match_urls_from_schedule
+        match_urls = extract_match_urls_from_schedule(soup, comment_tables, season_str, comp_id)
+        df['match_url'] = df.index.map(match_urls) if match_urls else None
+        if match_urls:
+            logger.debug(f"Extracted {len(match_urls)} match URLs from schedule")
+        else:
+            logger.warning(f"No match URLs extracted from schedule HTML for {league} {season}")
 
         df['league'] = league
         df['season'] = season
@@ -786,21 +734,20 @@ class NodriverFBrefScraper:
         self,
         stat_type: str,
         data_category: str,
-    ) -> Dict[str, Any]:
+    ) -> Dict[str, str]:
         """
         Scrape single stat_type for all configured leagues/seasons.
 
         Memory-efficient method that collects only one stat_type at a time.
+        Saves results to Iceberg table.
 
         Args:
             stat_type: One of PLAYER_STAT_TYPES, TEAM_STAT_TYPES, KEEPER_STAT_TYPES
             data_category: One of 'player', 'team', 'keeper'
 
         Returns:
-            Dictionary with:
-            - 'data': Combined DataFrame
-            - 'rows': Number of rows collected
-            - 'stats': Scraping statistics
+            Dictionary mapping entity name to Iceberg table path,
+            e.g., {'player_stats': 'iceberg.bronze.fbref_player_stats'}
         """
         logger.info(
             f"Starting scrape: {data_category}_{stat_type} "
@@ -841,25 +788,30 @@ class NodriverFBrefScraper:
             # Memory cleanup after each league
             gc.collect()
 
-        # Combine results
-        result = {
-            'data': None,
-            'rows': 0,
-            'stats': self._stats.copy(),
-        }
+        result: Dict[str, str] = {}
 
         if all_data:
             combined_df = pd.concat(all_data, ignore_index=True)
-            result['data'] = combined_df
-            result['rows'] = len(combined_df)
+            table_name = f"fbref_{data_category}_{stat_type}"
+            table_path = self.save_to_iceberg(
+                combined_df, table_name, partition_cols=['league', 'season']
+            )
+            entity_key = f"{data_category}_{stat_type}"
+            result[entity_key] = table_path
             logger.info(
-                f"Completed {data_category}_{stat_type}: {len(combined_df)} total rows"
+                f"Completed {entity_key}: {len(combined_df)} total rows → {table_path}"
             )
 
         return result
 
-    def scrape_schedule(self) -> Dict[str, Any]:
-        """Scrape schedules for all configured leagues/seasons."""
+    def scrape_schedule(self) -> Dict[str, str]:
+        """
+        Scrape schedules for all configured leagues/seasons.
+
+        Returns:
+            Dictionary mapping entity name to Iceberg table path,
+            e.g., {'schedule': 'iceberg.bronze.fbref_schedule'}
+        """
         logger.info(f"Scraping schedules for {self.leagues} x {self.seasons}")
 
         all_data = []
@@ -876,37 +828,70 @@ class NodriverFBrefScraper:
 
             gc.collect()
 
-        result = {
-            'data': None,
-            'rows': 0,
-            'stats': self._stats.copy(),
-        }
+        result: Dict[str, str] = {}
 
         if all_data:
             combined_df = pd.concat(all_data, ignore_index=True)
-            result['data'] = combined_df
-            result['rows'] = len(combined_df)
+            table_path = self.save_to_iceberg(
+                combined_df, 'fbref_schedule', partition_cols=['league', 'season']
+            )
+            result['schedule'] = table_path
 
         return result
+
+    def scrape_all(self) -> Dict[str, str]:
+        """
+        Scrape all data for configured leagues and seasons.
+
+        Collects schedule, player stats, team stats, and keeper stats
+        sequentially to manage memory. Each step saves to Iceberg.
+
+        Returns:
+            Dictionary mapping data type to Iceberg table path.
+        """
+        all_results: Dict[str, str] = {}
+
+        # Schedule
+        logger.info("Collecting schedule...")
+        all_results.update(self.scrape_schedule())
+
+        # Player stats
+        for stat_type in PLAYER_STAT_TYPES:
+            logger.info(f"Collecting player_{stat_type}...")
+            try:
+                all_results.update(self.scrape_single_stat_type(stat_type, 'player'))
+            except Exception as e:
+                logger.error(f"Error collecting player_{stat_type}: {e}")
+
+        # Team stats
+        for stat_type in TEAM_STAT_TYPES:
+            logger.info(f"Collecting team_{stat_type}...")
+            try:
+                all_results.update(self.scrape_single_stat_type(stat_type, 'team'))
+            except Exception as e:
+                logger.error(f"Error collecting team_{stat_type}: {e}")
+
+        # Keeper stats
+        for stat_type in KEEPER_STAT_TYPES:
+            logger.info(f"Collecting keeper_{stat_type}...")
+            try:
+                all_results.update(self.scrape_single_stat_type(stat_type, 'keeper'))
+            except Exception as e:
+                logger.error(f"Error collecting keeper_{stat_type}: {e}")
+
+        logger.info(f"Full scrape completed: {len(all_results)} tables saved")
+        return all_results
 
     def close(self) -> None:
         """Close browser and cleanup resources."""
         self._close_browser()
         gc.collect()
         logger.info(f"NodriverFBrefScraper closed. Stats: {self._stats}")
+        super().close()
 
     def get_stats(self) -> Dict[str, Any]:
         """Get scraping statistics."""
-        stats = self._stats.copy()
+        stats = super().get_stats()
         if self._proxy_manager:
             stats['proxy_stats'] = self._proxy_manager.get_stats()
         return stats
-
-    def __enter__(self):
-        """Context manager entry."""
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        """Context manager exit."""
-        self.close()
-        return False

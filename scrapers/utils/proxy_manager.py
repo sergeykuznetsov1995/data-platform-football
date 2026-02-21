@@ -10,11 +10,14 @@ Features:
 - Detailed statistics by error type (rate_limit, forbidden, cloudflare)
 - Success rate tracking per proxy
 - Automatic proxy banning after consecutive failures
+- Pre-validation via TCP connect test (filter dead proxies at load time)
 """
 
 import logging
 import random
+import socket
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, List, Optional
@@ -352,6 +355,73 @@ class ProxyManager:
 
         logger.info(f"Loaded {count} proxies from {filepath} (custom format)")
         return count
+
+    def validate_proxies(
+        self,
+        timeout: float = 5.0,
+        max_workers: int = 50,
+        ban_failed: bool = True,
+    ) -> Dict[str, int]:
+        """
+        Pre-validate all proxies with a fast TCP connect test.
+
+        Tests each proxy by opening a TCP socket to host:port.
+        Dead proxies (connection refused/timeout) are banned immediately
+        so they won't be used during scraping.
+
+        Args:
+            timeout: TCP connect timeout in seconds (default 5s).
+            max_workers: Max parallel validation threads (default 50).
+            ban_failed: Whether to ban proxies that fail validation.
+
+        Returns:
+            Dict with counts: {'alive': N, 'dead': N, 'total': N}
+        """
+        if not self._proxies:
+            return {'alive': 0, 'dead': 0, 'total': 0}
+
+        def _test_proxy(proxy: Proxy) -> bool:
+            """Test if proxy accepts TCP connections."""
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(timeout)
+                sock.connect((proxy.host, proxy.port))
+                sock.close()
+                return True
+            except (socket.timeout, ConnectionRefusedError, OSError):
+                return False
+
+        alive = 0
+        dead = 0
+        total = len(self._proxies)
+
+        logger.info(f"Validating {total} proxies (TCP connect, timeout={timeout}s)...")
+
+        with ThreadPoolExecutor(max_workers=min(max_workers, total)) as executor:
+            future_to_proxy = {
+                executor.submit(_test_proxy, proxy): proxy
+                for proxy in self._proxies
+            }
+            for future in as_completed(future_to_proxy):
+                proxy = future_to_proxy[future]
+                try:
+                    is_alive = future.result()
+                    if is_alive:
+                        alive += 1
+                    else:
+                        dead += 1
+                        if ban_failed:
+                            proxy.mark_banned()
+                except Exception:
+                    dead += 1
+                    if ban_failed:
+                        proxy.mark_banned()
+
+        logger.info(
+            f"Proxy validation complete: {alive} alive, {dead} dead "
+            f"out of {total} total"
+        )
+        return {'alive': alive, 'dead': dead, 'total': total}
 
     def get_proxy(self, respect_cooldown: bool = True) -> Optional[Proxy]:
         """

@@ -19,7 +19,7 @@ class TestNodriverBypassInit:
         bypass = NodriverBypass()
 
         assert bypass.use_cf_verify is True
-        assert bypass.cf_verify_max_retries == 10
+        assert bypass.cf_verify_max_retries == 5
         assert bypass.cf_verify_interval == 2.0
 
     @pytest.mark.unit
@@ -487,7 +487,7 @@ class TestWaitForCloudflare:
                 await bypass._wait_for_cloudflare()
 
         # Verify cf-verify was called with correct params
-        mock_cfv_class.assert_called_once_with(_browser_tab=bypass._page, _debug=True)
+        mock_cfv_class.assert_called_once_with(_browser_tab=bypass._page, _debug=False)
         mock_cfv_instance.verify.assert_called_once()
 
     @pytest.mark.asyncio
@@ -880,8 +880,8 @@ class TestRuntimeHungBehavior:
         bypass._page.evaluate = mock_evaluate
         bypass._page.select = AsyncMock(side_effect=asyncio.TimeoutError())
 
-        # Mock _get_html_with_fallback to return valid HTML
-        bypass._get_html_with_fallback = AsyncMock(
+        # Mock _get_html_hung_runtime (called when _runtime_hung=True)
+        bypass._get_html_hung_runtime = AsyncMock(
             return_value="<html>" + "x" * 20000 + "</html>"
         )
 
@@ -918,7 +918,8 @@ class TestRuntimeHungBehavior:
         bypass._page.evaluate = mock_evaluate
         bypass._page.select = AsyncMock(side_effect=asyncio.TimeoutError())
 
-        bypass._get_html_with_fallback = AsyncMock(
+        # Mock _get_html_hung_runtime (called when _runtime_hung=True)
+        bypass._get_html_hung_runtime = AsyncMock(
             return_value="<html>" + "z" * 20000 + "</html>"
         )
 
@@ -979,7 +980,8 @@ class TestStealthJSInjection:
         assert 'navigator.languages' in js
         assert 'window.chrome' in js
         assert 'Notification.permission' in js
-        assert 'contentWindow' in js  # iframe patch
+        # iframe contentWindow patch removed — it triggers Cloudflare anti-bot
+        assert 'contentWindow' not in js
 
     @pytest.mark.asyncio
     @pytest.mark.unit

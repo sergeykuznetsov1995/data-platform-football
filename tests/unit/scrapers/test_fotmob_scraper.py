@@ -17,7 +17,7 @@ class TestFotMobScraperUnit:
     @pytest.fixture
     def scraper_class(self):
         """Get scraper class without instantiating."""
-        from scrapers.fotmob_scraper import FotMobScraper
+        from scrapers.fotmob import FotMobScraper
         return FotMobScraper
 
     @pytest.fixture
@@ -310,7 +310,7 @@ class TestFotMobLeagueMapping:
 
     def test_major_leagues_present(self):
         """Test that all major leagues are mapped."""
-        from scrapers.fotmob_scraper import FotMobScraper
+        from scrapers.fotmob import FotMobScraper
 
         major_leagues = [
             'ENG-Premier League',

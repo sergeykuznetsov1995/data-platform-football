@@ -187,3 +187,9 @@ logs/
 *.key
 credentials/
 proxys.txt
+
+# Documentation (local only)
+CLAUDE.md
+PLAN.md
+docs/
+scrapers/README.md

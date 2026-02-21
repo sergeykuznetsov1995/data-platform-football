@@ -53,7 +53,7 @@ def main():
     }
 
     try:
-        from scrapers.espn_scraper import ESPNScraper
+        from scrapers.espn import ESPNScraper
 
         with ESPNScraper(leagues=leagues, seasons=[args.season]) as scraper:
             # Scrape schedule

@@ -83,7 +83,7 @@ class TestSoccerdataFBrefScraperInit:
 
     def test_init_with_default_params(self, mock_base_dependencies, mock_soccerdata):
         """Test initialization with default parameters."""
-        from scrapers.soccerdata_fbref_scraper import SoccerdataFBrefScraper
+        from scrapers.soccerdata_fbref import SoccerdataFBrefScraper
 
         scraper = SoccerdataFBrefScraper(
             leagues=['ENG-Premier League'],
@@ -97,7 +97,7 @@ class TestSoccerdataFBrefScraperInit:
 
     def test_init_with_tor_enabled(self, mock_base_dependencies, mock_soccerdata):
         """Test initialization with Tor enabled."""
-        from scrapers.soccerdata_fbref_scraper import SoccerdataFBrefScraper
+        from scrapers.soccerdata_fbref import SoccerdataFBrefScraper
 
         scraper = SoccerdataFBrefScraper(
             leagues=['ENG-Premier League'],
@@ -116,7 +116,7 @@ class TestSoccerdataFBrefScraperInit:
 
     def test_init_with_tor_disabled(self, mock_base_dependencies, mock_soccerdata):
         """Test initialization with Tor disabled."""
-        from scrapers.soccerdata_fbref_scraper import SoccerdataFBrefScraper
+        from scrapers.soccerdata_fbref import SoccerdataFBrefScraper
 
         scraper = SoccerdataFBrefScraper(
             leagues=['ENG-Premier League'],
@@ -128,7 +128,7 @@ class TestSoccerdataFBrefScraperInit:
 
     def test_init_with_custom_tor_host(self, mock_base_dependencies, mock_soccerdata):
         """Test initialization with custom Tor host."""
-        from scrapers.soccerdata_fbref_scraper import SoccerdataFBrefScraper
+        from scrapers.soccerdata_fbref import SoccerdataFBrefScraper
 
         scraper = SoccerdataFBrefScraper(
             leagues=['ENG-Premier League'],
@@ -142,7 +142,7 @@ class TestSoccerdataFBrefScraperInit:
 
     def test_init_with_localhost_tor(self, mock_base_dependencies, mock_soccerdata):
         """Test initialization with localhost Tor."""
-        from scrapers.soccerdata_fbref_scraper import SoccerdataFBrefScraper
+        from scrapers.soccerdata_fbref import SoccerdataFBrefScraper
 
         scraper = SoccerdataFBrefScraper(
             leagues=['ENG-Premier League'],
@@ -160,7 +160,7 @@ class TestSoccerdataFBrefScraperProxyConfig:
 
     def test_configure_proxy_with_tor(self, mock_base_dependencies, mock_soccerdata):
         """Test proxy configuration with Tor."""
-        from scrapers.soccerdata_fbref_scraper import SoccerdataFBrefScraper
+        from scrapers.soccerdata_fbref import SoccerdataFBrefScraper
 
         scraper = SoccerdataFBrefScraper(
             leagues=['ENG-Premier League'],
@@ -175,7 +175,7 @@ class TestSoccerdataFBrefScraperProxyConfig:
 
     def test_configure_proxy_without_tor_no_proxies(self, mock_base_dependencies, mock_soccerdata):
         """Test proxy configuration without Tor and no proxies."""
-        from scrapers.soccerdata_fbref_scraper import SoccerdataFBrefScraper
+        from scrapers.soccerdata_fbref import SoccerdataFBrefScraper
 
         scraper = SoccerdataFBrefScraper(
             leagues=['ENG-Premier League'],
@@ -193,7 +193,7 @@ class TestSoccerdataFBrefScraperReader:
 
     def test_get_reader_lazy_init(self, mock_base_dependencies, mock_soccerdata):
         """Test that reader is lazily initialized."""
-        from scrapers.soccerdata_fbref_scraper import SoccerdataFBrefScraper
+        from scrapers.soccerdata_fbref import SoccerdataFBrefScraper
 
         scraper = SoccerdataFBrefScraper(
             leagues=['ENG-Premier League'],
@@ -212,7 +212,7 @@ class TestSoccerdataFBrefScraperReader:
 
     def test_get_reader_caches_instance(self, mock_base_dependencies, mock_soccerdata):
         """Test that reader instance is cached."""
-        from scrapers.soccerdata_fbref_scraper import SoccerdataFBrefScraper
+        from scrapers.soccerdata_fbref import SoccerdataFBrefScraper
 
         scraper = SoccerdataFBrefScraper(
             leagues=['ENG-Premier League'],
@@ -229,7 +229,7 @@ class TestSoccerdataFBrefScraperReader:
 
     def test_reset_reader(self, mock_base_dependencies, mock_soccerdata):
         """Test that reset_reader clears the cached instance."""
-        from scrapers.soccerdata_fbref_scraper import SoccerdataFBrefScraper
+        from scrapers.soccerdata_fbref import SoccerdataFBrefScraper
 
         scraper = SoccerdataFBrefScraper(
             leagues=['ENG-Premier League'],
@@ -250,7 +250,7 @@ class TestSoccerdataFBrefScraperReadSchedule:
 
     def test_read_schedule_success(self, mock_base_dependencies, mock_soccerdata):
         """Test successful schedule reading."""
-        from scrapers.soccerdata_fbref_scraper import SoccerdataFBrefScraper
+        from scrapers.soccerdata_fbref import SoccerdataFBrefScraper
 
         scraper = SoccerdataFBrefScraper(
             leagues=['ENG-Premier League'],
@@ -269,7 +269,7 @@ class TestSoccerdataFBrefScraperReadSchedule:
 
     def test_read_schedule_empty_result(self, mock_base_dependencies, mock_soccerdata):
         """Test schedule reading with empty result."""
-        from scrapers.soccerdata_fbref_scraper import SoccerdataFBrefScraper
+        from scrapers.soccerdata_fbref import SoccerdataFBrefScraper
 
         mock_soccerdata['reader'].read_schedule.return_value = pd.DataFrame()
 
@@ -283,7 +283,7 @@ class TestSoccerdataFBrefScraperReadSchedule:
 
     def test_read_schedule_error_handling(self, mock_base_dependencies, mock_soccerdata):
         """Test schedule reading with error."""
-        from scrapers.soccerdata_fbref_scraper import SoccerdataFBrefScraper
+        from scrapers.soccerdata_fbref import SoccerdataFBrefScraper
 
         mock_soccerdata['reader'].read_schedule.side_effect = Exception("Network error")
 
@@ -301,7 +301,7 @@ class TestSoccerdataFBrefScraperReadPlayerStats:
 
     def test_read_player_stats_success(self, mock_base_dependencies, mock_soccerdata):
         """Test successful player stats reading."""
-        from scrapers.soccerdata_fbref_scraper import SoccerdataFBrefScraper
+        from scrapers.soccerdata_fbref import SoccerdataFBrefScraper
 
         scraper = SoccerdataFBrefScraper(
             leagues=['ENG-Premier League'],
@@ -319,7 +319,7 @@ class TestSoccerdataFBrefScraperReadPlayerStats:
 
     def test_read_player_stats_stat_type_mapping(self, mock_base_dependencies, mock_soccerdata):
         """Test stat type mapping from internal to soccerdata names."""
-        from scrapers.soccerdata_fbref_scraper import SoccerdataFBrefScraper
+        from scrapers.soccerdata_fbref import SoccerdataFBrefScraper
 
         scraper = SoccerdataFBrefScraper(
             leagues=['ENG-Premier League'],
@@ -343,7 +343,7 @@ class TestSoccerdataFBrefScraperReadTeamStats:
 
     def test_read_team_stats_success(self, mock_base_dependencies, mock_soccerdata):
         """Test successful team stats reading."""
-        from scrapers.soccerdata_fbref_scraper import SoccerdataFBrefScraper
+        from scrapers.soccerdata_fbref import SoccerdataFBrefScraper
 
         scraper = SoccerdataFBrefScraper(
             leagues=['ENG-Premier League'],
@@ -364,7 +364,7 @@ class TestSoccerdataFBrefScraperReadKeeperStats:
 
     def test_read_keeper_stats_success(self, mock_base_dependencies, mock_soccerdata):
         """Test successful keeper stats reading."""
-        from scrapers.soccerdata_fbref_scraper import SoccerdataFBrefScraper
+        from scrapers.soccerdata_fbref import SoccerdataFBrefScraper
 
         # Mock keeper stats response
         mock_soccerdata['reader'].read_player_season_stats.return_value = pd.DataFrame({
@@ -387,7 +387,7 @@ class TestSoccerdataFBrefScraperReadKeeperStats:
 
     def test_read_keeper_stats_advanced(self, mock_base_dependencies, mock_soccerdata):
         """Test reading advanced keeper stats."""
-        from scrapers.soccerdata_fbref_scraper import SoccerdataFBrefScraper
+        from scrapers.soccerdata_fbref import SoccerdataFBrefScraper
 
         scraper = SoccerdataFBrefScraper(
             leagues=['ENG-Premier League'],
@@ -406,7 +406,7 @@ class TestSoccerdataFBrefScraperScrapeSingleStatType:
 
     def test_scrape_single_stat_type_player(self, mock_base_dependencies, mock_soccerdata):
         """Test scraping single player stat type."""
-        from scrapers.soccerdata_fbref_scraper import SoccerdataFBrefScraper
+        from scrapers.soccerdata_fbref import SoccerdataFBrefScraper
 
         scraper = SoccerdataFBrefScraper(
             leagues=['ENG-Premier League'],
@@ -424,7 +424,7 @@ class TestSoccerdataFBrefScraperScrapeSingleStatType:
 
     def test_scrape_single_stat_type_team(self, mock_base_dependencies, mock_soccerdata):
         """Test scraping single team stat type."""
-        from scrapers.soccerdata_fbref_scraper import SoccerdataFBrefScraper
+        from scrapers.soccerdata_fbref import SoccerdataFBrefScraper
 
         scraper = SoccerdataFBrefScraper(
             leagues=['ENG-Premier League'],
@@ -441,7 +441,7 @@ class TestSoccerdataFBrefScraperScrapeSingleStatType:
 
     def test_scrape_single_stat_type_keeper(self, mock_base_dependencies, mock_soccerdata):
         """Test scraping single keeper stat type."""
-        from scrapers.soccerdata_fbref_scraper import SoccerdataFBrefScraper
+        from scrapers.soccerdata_fbref import SoccerdataFBrefScraper
 
         # Mock keeper stats response
         mock_soccerdata['reader'].read_player_season_stats.return_value = pd.DataFrame({
@@ -464,7 +464,7 @@ class TestSoccerdataFBrefScraperScrapeSingleStatType:
 
     def test_scrape_single_stat_type_empty_result(self, mock_base_dependencies, mock_soccerdata):
         """Test scraping with empty result."""
-        from scrapers.soccerdata_fbref_scraper import SoccerdataFBrefScraper
+        from scrapers.soccerdata_fbref import SoccerdataFBrefScraper
 
         mock_soccerdata['reader'].read_player_season_stats.return_value = pd.DataFrame()
 
@@ -486,7 +486,7 @@ class TestSoccerdataFBrefScraperScrapeMatchData:
 
     def test_scrape_match_data_schedule(self, mock_base_dependencies, mock_soccerdata):
         """Test scraping schedule data."""
-        from scrapers.soccerdata_fbref_scraper import SoccerdataFBrefScraper
+        from scrapers.soccerdata_fbref import SoccerdataFBrefScraper
 
         scraper = SoccerdataFBrefScraper(
             leagues=['ENG-Premier League'],
@@ -500,7 +500,7 @@ class TestSoccerdataFBrefScraperScrapeMatchData:
 
     def test_scrape_match_data_unsupported_type(self, mock_base_dependencies, mock_soccerdata):
         """Test scraping unsupported match data type."""
-        from scrapers.soccerdata_fbref_scraper import SoccerdataFBrefScraper
+        from scrapers.soccerdata_fbref import SoccerdataFBrefScraper
 
         scraper = SoccerdataFBrefScraper(
             leagues=['ENG-Premier League'],
@@ -519,7 +519,7 @@ class TestSoccerdataFBrefScraperScrapeAll:
 
     def test_scrape_all_basic(self, mock_base_dependencies, mock_soccerdata):
         """Test full scrape with basic options."""
-        from scrapers.soccerdata_fbref_scraper import SoccerdataFBrefScraper
+        from scrapers.soccerdata_fbref import SoccerdataFBrefScraper
 
         scraper = SoccerdataFBrefScraper(
             leagues=['ENG-Premier League'],
@@ -538,7 +538,7 @@ class TestSoccerdataFBrefScraperScrapeAll:
 
     def test_scrape_all_with_extended_stats(self, mock_base_dependencies, mock_soccerdata):
         """Test full scrape with extended stats."""
-        from scrapers.soccerdata_fbref_scraper import SoccerdataFBrefScraper
+        from scrapers.soccerdata_fbref import SoccerdataFBrefScraper
 
         scraper = SoccerdataFBrefScraper(
             leagues=['ENG-Premier League'],
@@ -561,7 +561,7 @@ class TestSoccerdataFBrefScraperContextManager:
 
     def test_context_manager(self, mock_base_dependencies, mock_soccerdata):
         """Test using scraper as context manager."""
-        from scrapers.soccerdata_fbref_scraper import SoccerdataFBrefScraper
+        from scrapers.soccerdata_fbref import SoccerdataFBrefScraper
 
         with SoccerdataFBrefScraper(
             leagues=['ENG-Premier League'],
@@ -573,7 +573,7 @@ class TestSoccerdataFBrefScraperContextManager:
 
     def test_close_clears_reader(self, mock_base_dependencies, mock_soccerdata):
         """Test that close() clears the reader."""
-        from scrapers.soccerdata_fbref_scraper import SoccerdataFBrefScraper
+        from scrapers.soccerdata_fbref import SoccerdataFBrefScraper
 
         scraper = SoccerdataFBrefScraper(
             leagues=['ENG-Premier League'],
@@ -594,7 +594,7 @@ class TestSoccerdataFBrefScraperConstants:
 
     def test_stat_types_defined(self, mock_base_dependencies, mock_soccerdata):
         """Test that stat types are defined."""
-        from scrapers.soccerdata_fbref_scraper import SoccerdataFBrefScraper
+        from scrapers.soccerdata_fbref import SoccerdataFBrefScraper
 
         assert hasattr(SoccerdataFBrefScraper, 'PLAYER_STAT_TYPES')
         assert hasattr(SoccerdataFBrefScraper, 'TEAM_STAT_TYPES')
@@ -602,13 +602,13 @@ class TestSoccerdataFBrefScraperConstants:
 
     def test_source_name(self, mock_base_dependencies, mock_soccerdata):
         """Test source name is fbref."""
-        from scrapers.soccerdata_fbref_scraper import SoccerdataFBrefScraper
+        from scrapers.soccerdata_fbref import SoccerdataFBrefScraper
 
         assert SoccerdataFBrefScraper.SOURCE_NAME == 'fbref'
 
     def test_default_rate_limit(self, mock_base_dependencies, mock_soccerdata):
         """Test default rate limit is set."""
-        from scrapers.soccerdata_fbref_scraper import SoccerdataFBrefScraper
+        from scrapers.soccerdata_fbref import SoccerdataFBrefScraper
 
         assert hasattr(SoccerdataFBrefScraper, 'DEFAULT_RATE_LIMIT')
         assert SoccerdataFBrefScraper.DEFAULT_RATE_LIMIT > 0

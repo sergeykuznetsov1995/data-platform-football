@@ -38,7 +38,7 @@ def proxy_file():
 @pytest.fixture
 def scraper(proxy_file):
     """Create NodriverFBrefScraper instance."""
-    from scrapers.nodriver_fbref_scraper import NodriverFBrefScraper
+    from scrapers.nodriver_fbref import NodriverFBrefScraper
 
     scraper = NodriverFBrefScraper(
         leagues=['ENG-Premier League'],
@@ -46,9 +46,9 @@ def scraper(proxy_file):
         proxy_file=proxy_file,
         headless=True,
         use_xvfb=True,
-        cloudflare_wait=90.0,
-        max_retries=3,
-        cf_verify_max_retries=10,
+        cloudflare_wait=30.0,
+        max_retries=2,
+        cf_verify_max_retries=5,
     )
 
     yield scraper

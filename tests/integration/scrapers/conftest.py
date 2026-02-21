@@ -189,7 +189,7 @@ def understat_scraper(soccerdata_available, minimal_leagues, minimal_seasons):
     if not soccerdata_available:
         pytest.skip("soccerdata library not installed")
 
-    from scrapers.understat_scraper import UnderstatScraper
+    from scrapers.understat import UnderstatScraper
 
     scraper = UnderstatScraper(
         leagues=minimal_leagues,
@@ -205,7 +205,7 @@ def fotmob_scraper(soccerdata_available, minimal_leagues, minimal_seasons):
     if not soccerdata_available:
         pytest.skip("soccerdata library not installed")
 
-    from scrapers.fotmob_scraper import FotMobScraper
+    from scrapers.fotmob import FotMobScraper
 
     scraper = FotMobScraper(
         leagues=minimal_leagues,
@@ -221,7 +221,7 @@ def espn_scraper(soccerdata_available, minimal_leagues, minimal_seasons):
     if not soccerdata_available:
         pytest.skip("soccerdata library not installed")
 
-    from scrapers.espn_scraper import ESPNScraper
+    from scrapers.espn import ESPNScraper
 
     scraper = ESPNScraper(
         leagues=minimal_leagues,
@@ -237,7 +237,7 @@ def matchhistory_scraper(soccerdata_available, minimal_leagues, minimal_seasons)
     if not soccerdata_available:
         pytest.skip("soccerdata library not installed")
 
-    from scrapers.matchhistory_scraper import MatchHistoryScraper
+    from scrapers.matchhistory import MatchHistoryScraper
 
     scraper = MatchHistoryScraper(
         leagues=minimal_leagues,
@@ -253,7 +253,7 @@ def clubelo_scraper(soccerdata_available, minimal_leagues):
     if not soccerdata_available:
         pytest.skip("soccerdata library not installed")
 
-    from scrapers.clubelo_scraper import ClubEloScraper
+    from scrapers.clubelo import ClubEloScraper
 
     scraper = ClubEloScraper(
         leagues=minimal_leagues,
@@ -274,7 +274,7 @@ def fbref_scraper_with_tor(soccerdata_available, tor_available, minimal_leagues,
     if not tor_available:
         pytest.skip("Tor not available on port 9050")
 
-    from scrapers.fbref_scraper import FBrefScraper
+    from scrapers.fbref import FBrefScraper
 
     scraper = FBrefScraper(
         leagues=minimal_leagues,
@@ -293,7 +293,7 @@ def sofascore_scraper_with_tor(soccerdata_available, tor_available, minimal_leag
     if not tor_available:
         pytest.skip("Tor not available on port 9050")
 
-    from scrapers.sofascore_scraper import SofaScoreScraper
+    from scrapers.sofascore import SofaScoreScraper
 
     scraper = SofaScoreScraper(
         leagues=minimal_leagues,
@@ -312,7 +312,7 @@ def sofifa_scraper_with_tor(soccerdata_available, tor_available, minimal_version
     if not tor_available:
         pytest.skip("Tor not available on port 9050")
 
-    from scrapers.sofifa_scraper import SoFIFAScraper
+    from scrapers.sofifa import SoFIFAScraper
 
     scraper = SoFIFAScraper(
         versions=minimal_versions,
@@ -334,7 +334,7 @@ def whoscored_scraper(soccerdata_available, undetected_chrome_available, minimal
     if not undetected_chrome_available:
         pytest.skip("undetected-chromedriver not available")
 
-    from scrapers.whoscored_scraper import WhoScoredScraper
+    from scrapers.whoscored import WhoScoredScraper
 
     scraper = WhoScoredScraper(
         leagues=minimal_leagues,
@@ -346,66 +346,12 @@ def whoscored_scraper(soccerdata_available, undetected_chrome_available, minimal
 
 
 @pytest.fixture
-def fbref_selenium_scraper(undetected_chrome_available, minimal_leagues, minimal_seasons):
-    """FBref Selenium scraper (recommended)."""
-    if not undetected_chrome_available:
-        pytest.skip("undetected-chromedriver not available")
-
-    from scrapers.fbref_selenium_scraper import FBrefSeleniumScraper
-
-    scraper = FBrefSeleniumScraper(
-        leagues=minimal_leagues,
-        seasons=minimal_seasons,
-        headless=True,
-        use_xvfb=True,
-    )
-    yield scraper
-    scraper.close()
-
-
-@pytest.fixture
-def fotmob_selenium_scraper(undetected_chrome_available, minimal_leagues, minimal_seasons):
-    """FotMob Selenium scraper (recommended)."""
-    if not undetected_chrome_available:
-        pytest.skip("undetected-chromedriver not available")
-
-    from scrapers.fotmob_selenium_scraper import FotMobSeleniumScraper
-
-    scraper = FotMobSeleniumScraper(
-        leagues=minimal_leagues,
-        seasons=minimal_seasons,
-        headless=True,
-        use_xvfb=True,
-    )
-    yield scraper
-    scraper.close()
-
-
-@pytest.fixture
-def matchhistory_direct_scraper(network_available, minimal_leagues, minimal_seasons):
-    """MatchHistory direct scraper (recommended)."""
-    if not network_available:
-        pytest.skip("No network connectivity")
-
-    from scrapers.matchhistory_direct_scraper import MatchHistoryDirectScraper
-
-    scraper = MatchHistoryDirectScraper(
-        leagues=minimal_leagues,
-        seasons=minimal_seasons,
-        headless=True,
-        use_xvfb=True,
-    )
-    yield scraper
-    scraper.close()
-
-
-@pytest.fixture
 def cloudflare_bypass(undetected_chrome_available):
     """CloudflareBypass instance for direct testing."""
     if not undetected_chrome_available:
         pytest.skip("undetected-chromedriver not available")
 
-    from scrapers.base.cloudflare_bypass import CloudflareBypass
+    from scrapers.base.browser import CloudflareBypass
 
     bypass = CloudflareBypass(headless=True)
     yield bypass

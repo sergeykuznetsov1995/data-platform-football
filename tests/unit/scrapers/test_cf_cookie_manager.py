@@ -326,7 +326,7 @@ class TestCFCookieManagerFetchCookies:
         mock_cookies[2].value = 'not_cf_cookie'
 
         with patch(
-            'scrapers.base.browser.cf_cookie_manager.NodriverBypass'
+            'scrapers.base.browser.nodriver_bypass.NodriverBypass'
         ) as MockBypass:
             mock_instance = AsyncMock()
             mock_instance._browser = MagicMock()
@@ -344,7 +344,7 @@ class TestCFCookieManagerFetchCookies:
     async def test_fetch_cookies_error_returns_empty(self, cf_cookie_manager):
         """Test that errors during fetch return empty dict."""
         with patch(
-            'scrapers.base.browser.cf_cookie_manager.NodriverBypass'
+            'scrapers.base.browser.nodriver_bypass.NodriverBypass'
         ) as MockBypass:
             mock_instance = AsyncMock()
             mock_instance.start = AsyncMock(side_effect=Exception("Browser error"))

@@ -17,7 +17,7 @@ class TestMatchHistoryScraperUnit:
     @pytest.fixture
     def scraper_class(self):
         """Get scraper class without instantiating."""
-        from scrapers.matchhistory_scraper import MatchHistoryScraper
+        from scrapers.matchhistory import MatchHistoryScraper
         return MatchHistoryScraper
 
     @pytest.fixture
@@ -238,7 +238,7 @@ class TestMatchHistoryLeagueMapping:
 
     def test_major_leagues_present(self):
         """Test that all major leagues are mapped."""
-        from scrapers.matchhistory_scraper import MatchHistoryScraper
+        from scrapers.matchhistory import MatchHistoryScraper
 
         major_leagues = [
             'ENG-Premier League',
@@ -254,7 +254,7 @@ class TestMatchHistoryLeagueMapping:
 
     def test_secondary_leagues_present(self):
         """Test that secondary leagues are mapped."""
-        from scrapers.matchhistory_scraper import MatchHistoryScraper
+        from scrapers.matchhistory import MatchHistoryScraper
 
         secondary_leagues = [
             'ENG-Championship',
@@ -273,7 +273,7 @@ class TestMatchHistoryColumnMapping:
 
     def test_basic_columns_mapped(self):
         """Test that basic columns are mapped."""
-        from scrapers.matchhistory_scraper import MatchHistoryScraper
+        from scrapers.matchhistory import MatchHistoryScraper
 
         expected_mappings = {
             'Date': 'match_date',
@@ -288,7 +288,7 @@ class TestMatchHistoryColumnMapping:
 
     def test_odds_columns_mapped(self):
         """Test that betting odds columns are mapped."""
-        from scrapers.matchhistory_scraper import MatchHistoryScraper
+        from scrapers.matchhistory import MatchHistoryScraper
 
         odds_mappings = {
             'B365H': 'odds_home_b365',

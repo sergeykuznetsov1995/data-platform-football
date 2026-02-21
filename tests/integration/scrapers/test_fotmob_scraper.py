@@ -22,7 +22,7 @@ class TestFotMobScraperIntegration:
         if not network_available:
             pytest.skip("No network connectivity")
 
-        from scrapers.fotmob_scraper import FotMobScraper
+        from scrapers.fotmob import FotMobScraper
 
         scraper = FotMobScraper(
             leagues=minimal_leagues,
@@ -111,7 +111,7 @@ class TestFotMobScraperMultiLeague:
         if not network_available:
             pytest.skip("No network connectivity")
 
-        from scrapers.fotmob_scraper import FotMobScraper
+        from scrapers.fotmob import FotMobScraper
 
         scraper = FotMobScraper(
             leagues=['ENG-Premier League', 'ESP-La Liga'],

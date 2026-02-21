@@ -14,7 +14,7 @@ Key features:
 - curl_cffi patch for Chrome TLS fingerprint impersonation
 
 Usage:
-    from scrapers.soccerdata_fbref_scraper import SoccerdataFBrefScraper
+    from scrapers.soccerdata_fbref import SoccerdataFBrefScraper
 
     # With Tor (recommended)
     scraper = SoccerdataFBrefScraper(

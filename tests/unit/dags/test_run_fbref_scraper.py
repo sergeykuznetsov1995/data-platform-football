@@ -40,7 +40,7 @@ class TestExitCodeLogic:
         """Run the scraper main function and return exit code."""
         sys.argv = ['run_fbref_scraper.py'] + args
 
-        with patch('scrapers.soccerdata_fbref_scraper.SoccerdataFBrefScraper', mock_scraper_class):
+        with patch('scrapers.soccerdata_fbref.SoccerdataFBrefScraper', mock_scraper_class):
             import importlib
             import dags.scripts.run_fbref_scraper as scraper_module
             importlib.reload(scraper_module)
@@ -193,7 +193,7 @@ class TestSingleStatExitCode:
         """Run the scraper main function and return exit code."""
         sys.argv = ['run_fbref_scraper.py'] + args
 
-        with patch('scrapers.soccerdata_fbref_scraper.SoccerdataFBrefScraper', mock_scraper_class):
+        with patch('scrapers.soccerdata_fbref.SoccerdataFBrefScraper', mock_scraper_class):
             import importlib
             import dags.scripts.run_fbref_scraper as scraper_module
             importlib.reload(scraper_module)

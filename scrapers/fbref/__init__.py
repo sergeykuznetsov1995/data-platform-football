@@ -21,7 +21,7 @@ Usage:
     result = scraper.scrape_all()
 """
 
-from scrapers.fbref.scraper import FBrefScraper, FBrefSeleniumScraper
+from scrapers.fbref.scraper import FBrefScraper
 from scrapers.fbref.constants import (
     BASE_URL,
     LEAGUE_IDS,
@@ -47,7 +47,6 @@ from scrapers.fbref.html_parser import (
 __all__ = [
     # Main scraper
     'FBrefScraper',
-    'FBrefSeleniumScraper',  # Backwards compatibility alias
     # Constants
     'BASE_URL',
     'LEAGUE_IDS',

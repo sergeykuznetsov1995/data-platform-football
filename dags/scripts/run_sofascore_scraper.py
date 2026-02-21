@@ -53,7 +53,7 @@ def main():
     }
 
     try:
-        from scrapers.sofascore_scraper import SofaScoreScraper
+        from scrapers.sofascore import SofaScoreScraper
 
         with SofaScoreScraper(leagues=leagues, seasons=[args.season]) as scraper:
             # Scrape schedule

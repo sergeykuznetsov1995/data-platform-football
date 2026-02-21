@@ -18,8 +18,11 @@
 
 import asyncio
 import json
+import logging
 from datetime import datetime
 from typing import Optional, Any, Union
+
+logger = logging.getLogger(__name__)
 
 
 class CFLibUtil:
@@ -33,7 +36,7 @@ class CFLibUtil:
             import nodriver
         # Issue with nodriver related to a missing encoding declaration in the network.py file
         except SyntaxError as e:
-            print(f"[ERROR - CFLibUtil]: A syntax error occurred while importing the nodriver library. Try updating nodriver or use zendriver instead: {e}")
+            logger.error(f"A syntax error occurred while importing the nodriver library. Try updating nodriver or use zendriver instead: {e}")
             nodriver = None
         except ImportError:
             nodriver = None
@@ -85,7 +88,7 @@ class CFLogger:
         if not self.debug:
             return
 
-        print(f"({datetime.now().strftime('%Y-%m-%d %H:%M:%S')}) [{self.class_name}]: {_message}")
+        logger.debug(f"[{self.class_name}]: {_message}")
 
 
 class CFUtil:
