@@ -661,7 +661,6 @@ class TestWhoScoredSeasonCache:
             scraper.BASE_URL = WhoScoredScraper.BASE_URL
             scraper._season_cache = {}
             scraper._browser = None
-            scraper.use_flaresolverr = False
 
             # Mock _get_browser - should NOT be called if known IDs exist
             mock_browser = MagicMock()

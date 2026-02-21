@@ -24,10 +24,6 @@ Usage:
     with browser_session(headless=False) as browser:
         html = browser.get_page("https://example.com")
 
-    # FlareSolverr mode
-    with browser_session(use_flaresolverr=True) as browser:
-        html = browser.get_page("https://example.com")
-
     # Nodriver mode (better Cloudflare bypass)
     from scrapers.base.browser import NodriverBypass, nodriver_session
 
@@ -117,27 +113,18 @@ __all__ = [
 def browser_session(
     headless: bool = True,
     proxy: Optional[str] = None,
-    use_flaresolverr: bool = False,
-    flaresolverr_url: str = "http://flaresolverr:8191",
     **kwargs
 ):
     """
     Context manager for browser sessions.
 
     Usage:
-        # Selenium mode
         with browser_session(headless=False) as browser:
-            html = browser.get_page(url)
-
-        # FlareSolverr mode
-        with browser_session(use_flaresolverr=True) as browser:
             html = browser.get_page(url)
     """
     browser = CloudflareBypass(
         headless=headless,
         proxy=proxy,
-        use_flaresolverr=use_flaresolverr,
-        flaresolverr_url=flaresolverr_url,
         **kwargs
     )
     try:

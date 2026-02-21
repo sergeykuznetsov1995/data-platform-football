@@ -27,9 +27,9 @@ Main Scrapers:
 from scrapers.base.base_scraper import BaseScraper, SeleniumScraper, SoccerdataScraper
 from scrapers.base.iceberg_writer import IcebergWriter
 from scrapers.fbref import FBrefScraper
-from scrapers.soccerdata_fbref_scraper import SoccerdataFBrefScraper
-from scrapers.fotmob_scraper import FotMobScraper
-from scrapers.matchhistory_scraper import MatchHistoryScraper
+from scrapers.soccerdata_fbref import SoccerdataFBrefScraper
+from scrapers.fotmob import FotMobScraper
+from scrapers.matchhistory import MatchHistoryScraper
 from scrapers.whoscored import WhoScoredScraper
 
 __all__ = [

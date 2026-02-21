@@ -20,7 +20,7 @@ from typing import Any, Dict, List, Optional
 import pandas as pd
 
 from scrapers.base.base_scraper import SeleniumScraper
-from scrapers.base.cloudflare_bypass import CloudflareBypass
+from scrapers.base.browser import CloudflareBypass
 from scrapers.whoscored.constants import LEAGUE_CONFIG, KNOWN_SEASON_IDS, BASE_URL, EVENT_TYPE_MAPPING
 from scrapers.whoscored.spadl_converter import event_to_spadl, convert_coordinates
 from scrapers.whoscored.page_navigator import PageNavigator
@@ -103,8 +103,6 @@ class WhoScoredScraper(SeleniumScraper):
                 use_xvfb=getattr(self, 'use_xvfb', False),
                 proxy=proxy_url,
                 page_load_timeout=60,  # WhoScored can be slow
-                use_flaresolverr=getattr(self, 'use_flaresolverr', False),
-                flaresolverr_url=getattr(self, 'flaresolverr_url', 'http://flaresolverr:8191'),
             )
         return self._browser
 
@@ -113,7 +111,6 @@ class WhoScoredScraper(SeleniumScraper):
         if self._navigator is None:
             self._navigator = PageNavigator(
                 browser=self._get_browser(),
-                use_flaresolverr=getattr(self, 'use_flaresolverr', False),
             )
         return self._navigator
 

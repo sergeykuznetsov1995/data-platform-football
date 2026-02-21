@@ -13,14 +13,14 @@ Architecture:
 - TaskGroup player_stats: 9 SEQUENTIAL tasks (one per stat_type)
 - TaskGroup team_stats: 9 SEQUENTIAL tasks (one per stat_type)
 - TaskGroup keeper_stats: 2 SEQUENTIAL tasks (keeper, keeper_adv)
-- TaskGroup match_data: schedule → match_all_data (OPTIMIZED)
+- TaskGroup match_data: schedule -> match_all_data (OPTIMIZED)
 - validate_all_data: final validation
 
 OPTIMIZATION (Feb 2026):
-- Before: schedule → shot_events → match_events → lineups (4 tasks, 3N page loads)
-- After:  schedule → match_all_data (2 tasks, N page loads)
-- HTTP requests reduction: 3x (e.g., 1141 → 381 for 380 matches)
-- Time reduction: ~2-4 hours → ~15-25 minutes
+- Before: schedule -> shot_events -> match_events -> lineups (4 tasks, 3N page loads)
+- After:  schedule -> match_all_data (2 tasks, N page loads)
+- HTTP requests reduction: 3x (e.g., 1141 -> 381 for 380 matches)
+- Time reduction: ~2-4 hours -> ~15-25 minutes
 
 Each stat_type is saved to a separate Iceberg table:
 - fbref_player_{stat_type} (9 tables)
@@ -38,34 +38,30 @@ NOTE: As of 2025-2026, FBref uses Cloudflare Turnstile CAPTCHA.
 """
 
 from datetime import datetime, timedelta
-from typing import Any, Dict, List
 
 from airflow import DAG
-from airflow.exceptions import AirflowException
-from airflow.operators.bash import BashOperator
 from airflow.operators.python import PythonOperator
 from airflow.utils.task_group import TaskGroup
-
 from airflow.operators.empty import EmptyOperator
 
 from utils.config import LEAGUES, CURRENT_SEASON, SCHEDULES, DAG_TAGS
 from utils.default_args import SELENIUM_ARGS
+from utils.fbref_tasks import (
+    create_single_stat_task,
+    create_match_data_task,
+    create_combined_match_data_task,
+)
+from utils.fbref_callbacks import (
+    prewarm_cf_cookies,
+    validate_all_data,
+)
 
-
-# Stat types for each data category
-PLAYER_STAT_TYPES = [
-    'stats', 'shooting', 'passing', 'passing_types',
-    'gca', 'defense', 'possession', 'playingtime', 'misc'
-]
-
-TEAM_STAT_TYPES = [
-    'stats', 'shooting', 'passing', 'passing_types',
-    'gca', 'defense', 'possession', 'playingtime', 'misc'
-]
-
-KEEPER_STAT_TYPES = ['keeper', 'keeper_adv']
-
-MATCH_DATA_TYPES = ['schedule', 'shot_events', 'match_events', 'lineups']
+from scrapers.fbref.constants import (
+    PLAYER_STAT_TYPES,
+    TEAM_STAT_TYPES,
+    KEEPER_STAT_TYPES,
+    MATCH_DATA_TYPES,
+)
 
 # =============================================================================
 # SCRAPER CONFIGURATION
@@ -94,17 +90,13 @@ USE_TOR = False  # Tor is blocked by FBref
 TOR_HOST = 'tor'
 TOR_PORT = 9050
 
-# FlareSolverr settings (deprecated - cannot solve modern Cloudflare)
-USE_FLARESOLVERR = False  # Disabled: FlareSolverr is outdated
-FLARESOLVERR_URL = 'http://flaresolverr:8191'
-
 # Selenium browser settings
 USE_XVFB = True  # Xvfb virtual display to bypass headless detection
 HEADLESS = True  # Headless mode with Xvfb
 
 # Nodriver settings (PRIMARY for Cloudflare Turnstile bypass)
 USE_NODRIVER = True  # Use nodriver with cf-verify plugin
-NODRIVER_CLOUDFLARE_WAIT = 30.0  # Wait time for Cloudflare challenge (successful bypass takes ~10s)
+NODRIVER_CLOUDFLARE_WAIT = 30.0  # Wait time for Cloudflare challenge
 NODRIVER_CONTENT_TIMEOUT = 45.0  # Timeout for content extraction (increased for CDP DOM fallback)
 NODRIVER_MAX_RETRIES = 2  # Per-proxy retries (fail fast, rotate proxy instead)
 NODRIVER_CF_VERIFY_RETRIES = 6  # Maximum cf-verify plugin retries
@@ -135,513 +127,61 @@ CF_COOKIE_PREWARM_ATTEMPTS = 5
 # Proxy configuration
 PROXY_FILE = '/opt/airflow/proxys.txt'  # Path to proxy file in container
 
+# =============================================================================
+# COMMON TASK KWARGS (passed to all task factory functions)
+# =============================================================================
+# Bundled into a dict to avoid repeating the same kwargs in every call.
+COMMON_TASK_KWARGS = dict(
+    leagues_str=','.join(LEAGUES),
+    season=CURRENT_SEASON,
+    scraper_type=DEFAULT_SCRAPER_TYPE,
+    use_tor=USE_TOR,
+    tor_host=TOR_HOST,
+    tor_port=TOR_PORT,
+    use_xvfb=USE_XVFB,
+    headless=HEADLESS,
+    use_nodriver=USE_NODRIVER,
+    nodriver_cloudflare_wait=NODRIVER_CLOUDFLARE_WAIT,
+    nodriver_content_timeout=NODRIVER_CONTENT_TIMEOUT,
+    nodriver_max_retries=NODRIVER_MAX_RETRIES,
+    nodriver_cf_verify_retries=NODRIVER_CF_VERIFY_RETRIES,
+    proxy_file=PROXY_FILE,
+)
 
-def prewarm_cf_cookies(**context) -> Dict[str, Any]:
-    """
-    Pre-solve Cloudflare Turnstile before starting scraper tasks.
+# Subset of kwargs for combined match data task (doesn't use all options)
+COMBINED_MATCH_KWARGS = dict(
+    leagues_str=','.join(LEAGUES),
+    season=CURRENT_SEASON,
+    use_xvfb=USE_XVFB,
+    headless=HEADLESS,
+    use_nodriver=USE_NODRIVER,
+    nodriver_cloudflare_wait=NODRIVER_CLOUDFLARE_WAIT,
+    proxy_file=PROXY_FILE,
+)
 
-    Uses nodriver + cf-verify plugin to obtain cf_clearance cookies,
-    then stores them in XCom for use by scraper tasks.
 
-    Returns:
-        Dictionary with success status and cookie info
-    """
-    import logging
-
-    logger = logging.getLogger(__name__)
-    logger.info("Pre-warming CF cookies for FBref...")
-
-    result = {
-        'success': False,
-        'cookie_count': 0,
-        'cookies': {},
-        'error': None,
-    }
-
-    try:
-        from scrapers.base.browser.cf_cookie_manager import CFCookieManager
-        from scrapers.utils.proxy_manager import ProxyManager, ProxyType
-    except ImportError as e:
-        logger.error(f"Failed to import required modules: {e}")
-        result['error'] = str(e)
-        return result
-
-    try:
-        # Load proxies
-        proxy_manager = ProxyManager()
-        proxy_manager.load_from_file_custom_format(PROXY_FILE, ProxyType.HTTP)
-        logger.info(f"Loaded {proxy_manager.total_count} proxies for CF prewarm")
-
-        # Create CF cookie manager with optimized settings
-        manager = CFCookieManager(
-            cache_ttl_minutes=CF_COOKIE_CACHE_TTL_MINUTES,
-            use_cf_verify=USE_CF_VERIFY_PLUGIN,
-            cf_verify_max_retries=CF_VERIFY_MAX_RETRIES,
-            cf_verify_interval=CF_VERIFY_INTERVAL,
-            use_xvfb=USE_XVFB,
+def _build_sequential_stat_group(stat_types, data_category):
+    """Build a list of sequential stat tasks within a TaskGroup context."""
+    tasks = []
+    prev_task = None
+    for stat_type in stat_types:
+        task = create_single_stat_task(
+            stat_type=stat_type,
+            data_category=data_category,
+            **COMMON_TASK_KWARGS,
         )
-
-        # Get cookies with retry across different proxies
-        cookies = manager.get_cookies_with_retry_sync(
-            url="https://fbref.com/en/",
-            proxy_manager=proxy_manager,
-            max_attempts=CF_COOKIE_PREWARM_ATTEMPTS,
-        )
-
-        if cookies and 'cf_clearance' in cookies:
-            # Success - push cookies to XCom for scraper tasks
-            context['ti'].xcom_push(key='cf_cookies', value=cookies)
-            result['success'] = True
-            result['cookie_count'] = len(cookies)
-            result['cookies'] = list(cookies.keys())
-            logger.info(
-                f"CF prewarm successful: {len(cookies)} cookies obtained: "
-                f"{list(cookies.keys())}"
-            )
-        else:
-            logger.warning(
-                f"CF prewarm failed - no cf_clearance cookie obtained. "
-                f"Got cookies: {list(cookies.keys()) if cookies else 'none'}"
-            )
-            result['error'] = 'No cf_clearance cookie obtained'
-
-    except Exception as e:
-        logger.error(f"CF prewarm failed with exception: {e}")
-        result['error'] = str(e)
-
-    return result
+        # Chain tasks sequentially to prevent OOM
+        if prev_task is not None:
+            prev_task >> task
+        prev_task = task
+        tasks.append(task)
+    return tasks
 
 
-def validate_all_data(**context) -> Dict[str, Any]:
-    """
-    Validate all scraped data from all TaskGroups.
+# =============================================================================
+# DAG DEFINITION
+# =============================================================================
 
-    Returns:
-        Validation results
-    """
-    import json
-    import logging
-    import os
-    from pathlib import Path
-
-    logger = logging.getLogger(__name__)
-
-    validation = {
-        'status': 'success',
-        'warnings': [],
-        'tables_collected': [],
-        'errors': [],
-    }
-
-    # Check all result files
-    result_files_pattern = '/tmp/fbref_*.json'
-    result_dir = Path('/tmp')
-
-    for result_file in result_dir.glob('fbref_*.json'):
-        try:
-            with open(result_file, 'r') as f:
-                result = json.load(f)
-
-            tables = result.get('tables', [])
-            errors = result.get('errors', [])
-
-            if tables:
-                validation['tables_collected'].extend(tables)
-
-            if errors:
-                validation['errors'].extend(errors)
-                validation['warnings'].append(
-                    f"{result_file.name}: {len(errors)} error(s)"
-                )
-
-        except (FileNotFoundError, json.JSONDecodeError) as e:
-            validation['warnings'].append(f"Error reading {result_file}: {e}")
-
-    # Check minimum data thresholds
-    total_tables = len(validation['tables_collected'])
-
-    # We expect at least:
-    # - 9 player tables + 9 team tables + 2 keeper tables + 4 match data tables = 24 tables
-    # But some may fail, so we accept >= 10 as partial success
-    if total_tables == 0:
-        validation['status'] = 'failed'
-        validation['warnings'].append('No tables were collected')
-    elif total_tables < 10:
-        validation['status'] = 'partial_success'
-        validation['warnings'].append(
-            f"Only {total_tables} tables collected (expected ~24)"
-        )
-    else:
-        logger.info(f"Collected {total_tables} tables successfully")
-
-    if validation['errors']:
-        if validation['status'] == 'success':
-            validation['status'] = 'partial_success'
-
-    logger.info(f"Validation complete: {validation['status']}")
-    logger.info(f"Tables collected: {total_tables}")
-
-    if validation['warnings']:
-        logger.warning(f"Warnings: {validation['warnings']}")
-
-    if validation['status'] == 'failed':
-        raise AirflowException(f"Validation failed: {validation}")
-
-    return validation
-
-
-def create_single_stat_task(
-    stat_type: str,
-    data_category: str,
-    leagues_str: str,
-    season: int,
-    scraper_type: str = DEFAULT_SCRAPER_TYPE,
-    use_tor: bool = USE_TOR,
-    use_flaresolverr: bool = USE_FLARESOLVERR,
-    flaresolverr_url: str = FLARESOLVERR_URL,
-    use_xvfb: bool = USE_XVFB,
-    headless: bool = HEADLESS,
-    use_nodriver: bool = USE_NODRIVER,
-    nodriver_cloudflare_wait: float = NODRIVER_CLOUDFLARE_WAIT,
-    nodriver_content_timeout: float = NODRIVER_CONTENT_TIMEOUT,
-    nodriver_max_retries: int = NODRIVER_MAX_RETRIES,
-    nodriver_cf_verify_retries: int = NODRIVER_CF_VERIFY_RETRIES,
-    proxy_file: str = None,
-) -> BashOperator:
-    """
-    Create a BashOperator task for collecting a single stat_type.
-
-    Args:
-        stat_type: The stat type to collect
-        data_category: player, team, or keeper
-        leagues_str: Comma-separated leagues string
-        season: Season year
-        scraper_type: 'nodriver' (recommended), 'soccerdata' (deprecated), 'selenium'
-        use_tor: Use Tor proxy for soccerdata scraper (deprecated)
-        use_flaresolverr: Use FlareSolverr for Cloudflare bypass (deprecated)
-        flaresolverr_url: FlareSolverr service URL (deprecated)
-        use_xvfb: Use Xvfb virtual display
-        headless: Run browser in headless mode
-        use_nodriver: Use nodriver (for selenium scraper type)
-        nodriver_cloudflare_wait: Time to wait for Cloudflare challenge (seconds)
-        nodriver_max_retries: Maximum page load retries
-        nodriver_cf_verify_retries: Maximum cf-verify plugin retries
-        proxy_file: Path to file with proxy list (format: host:port:user:pass)
-
-    Returns:
-        BashOperator task
-    """
-    task_id = f'{data_category}_{stat_type}'
-    output_file = f'/tmp/fbref_{task_id}.json'
-
-    # Build command based on scraper type
-    if scraper_type == 'nodriver':
-        # nodriver: Browser-based with cf-verify plugin for Turnstile bypass
-        nodriver_args = []
-        if headless:
-            nodriver_args.append('--headless')
-        if use_xvfb:
-            nodriver_args.append('--use-xvfb')
-        if proxy_file:
-            nodriver_args.append(f'--proxy-file {proxy_file}')
-        nodriver_args.append(f'--cloudflare-wait {nodriver_cloudflare_wait}')
-        nodriver_args.append(f'--content-timeout {nodriver_content_timeout}')
-        nodriver_args.append(f'--max-retries {nodriver_max_retries}')
-        nodriver_args.append(f'--cf-verify-retries {nodriver_cf_verify_retries}')
-
-        bash_command = f"""
-cd /opt/airflow && \\
-python dags/scripts/run_fbref_scraper.py \\
-    --scraper-type nodriver \\
-    {' '.join(nodriver_args)} \\
-    --mode single_stat \\
-    --stat-type {stat_type} \\
-    --data-category {data_category} \\
-    --leagues "{leagues_str}" \\
-    --season {season} \\
-    --output {output_file}
-"""
-
-    elif scraper_type == 'soccerdata':
-        # soccerdata: DEPRECATED - blocked by Cloudflare Turnstile
-        tor_args = f'--use-tor --tor-host {TOR_HOST} --tor-port {TOR_PORT}' if use_tor else ''
-        proxy_args = f'--proxy-file {proxy_file}' if proxy_file else ''
-        bash_command = f"""
-cd /opt/airflow && \\
-python dags/scripts/run_fbref_scraper.py \\
-    --scraper-type soccerdata \\
-    {tor_args} \\
-    {proxy_args} \\
-    --mode single_stat \\
-    --stat-type {stat_type} \\
-    --data-category {data_category} \\
-    --leagues "{leagues_str}" \\
-    --season {season} \\
-    --output {output_file}
-"""
-    else:
-        # selenium: Browser-based scraper with undetected-chromedriver
-        if use_flaresolverr:
-            selenium_args = f'--use-flaresolverr --flaresolverr-url {flaresolverr_url}'
-        else:
-            selenium_args_list = []
-            if headless:
-                selenium_args_list.append('--headless')
-            if use_xvfb:
-                selenium_args_list.append('--use-xvfb')
-            if use_nodriver:
-                selenium_args_list.append('--use-nodriver')
-                selenium_args_list.append(f'--nodriver-cloudflare-wait {nodriver_cloudflare_wait}')
-            if proxy_file:
-                selenium_args_list.append(f'--proxy-file {proxy_file}')
-            selenium_args = ' '.join(selenium_args_list)
-
-        bash_command = f"""
-cd /opt/airflow && \\
-python dags/scripts/run_fbref_scraper.py \\
-    --scraper-type selenium \\
-    {selenium_args} \\
-    --mode single_stat \\
-    --stat-type {stat_type} \\
-    --data-category {data_category} \\
-    --leagues "{leagues_str}" \\
-    --season {season} \\
-    --output {output_file}
-"""
-
-    return BashOperator(
-        task_id=task_id,
-        bash_command=bash_command,
-        env={
-            'PYTHONPATH': '/opt/airflow:/opt/airflow/dags',
-            'PATH': '/usr/local/bin:/usr/bin:/bin:/home/airflow/.local/bin',
-            'HOME': '/home/airflow',
-            'DISPLAY': ':99',
-        },
-    )
-
-
-def create_match_data_task(
-    data_type: str,
-    leagues_str: str,
-    season: int,
-    max_matches: int = 0,
-    scraper_type: str = DEFAULT_SCRAPER_TYPE,
-    use_tor: bool = USE_TOR,
-    use_flaresolverr: bool = USE_FLARESOLVERR,
-    flaresolverr_url: str = FLARESOLVERR_URL,
-    use_xvfb: bool = USE_XVFB,
-    headless: bool = HEADLESS,
-    use_nodriver: bool = USE_NODRIVER,
-    nodriver_cloudflare_wait: float = NODRIVER_CLOUDFLARE_WAIT,
-    nodriver_content_timeout: float = NODRIVER_CONTENT_TIMEOUT,
-    nodriver_max_retries: int = NODRIVER_MAX_RETRIES,
-    nodriver_cf_verify_retries: int = NODRIVER_CF_VERIFY_RETRIES,
-    proxy_file: str = None,
-) -> BashOperator:
-    """
-    Create a BashOperator task for collecting match-level data.
-
-    Args:
-        data_type: schedule, shot_events, match_events, or lineups
-        leagues_str: Comma-separated leagues string
-        season: Season year
-        max_matches: Maximum matches per league (0 = unlimited)
-        scraper_type: 'nodriver' (recommended), 'soccerdata' (deprecated), 'selenium'
-        use_tor: Use Tor proxy for soccerdata scraper (deprecated)
-        use_flaresolverr: Use FlareSolverr for Cloudflare bypass (deprecated)
-        flaresolverr_url: FlareSolverr service URL (deprecated)
-        use_xvfb: Use Xvfb virtual display
-        headless: Run browser in headless mode
-        use_nodriver: Use nodriver (for selenium scraper type)
-        nodriver_cloudflare_wait: Time to wait for Cloudflare challenge (seconds)
-        nodriver_max_retries: Maximum page load retries
-        nodriver_cf_verify_retries: Maximum cf-verify plugin retries
-        proxy_file: Path to file with proxy list (format: host:port:user:pass)
-
-    Returns:
-        BashOperator task
-
-    Note:
-        For match data types other than 'schedule', nodriver scraper only
-        supports 'schedule'. Use selenium for detailed match-level data
-        (shot_events, match_events, lineups).
-    """
-    task_id = f'match_{data_type}'
-    output_file = f'/tmp/fbref_{task_id}.json'
-
-    # For detailed match data, fall back to selenium (nodriver only supports schedule)
-    effective_scraper = scraper_type
-    if data_type in ['shot_events', 'match_events', 'lineups']:
-        if scraper_type in ['nodriver', 'soccerdata']:
-            effective_scraper = 'selenium'
-
-    # Build command based on scraper type
-    if effective_scraper == 'nodriver':
-        # nodriver: Browser-based with cf-verify plugin for Turnstile bypass
-        nodriver_args = []
-        if headless:
-            nodriver_args.append('--headless')
-        if use_xvfb:
-            nodriver_args.append('--use-xvfb')
-        if proxy_file:
-            nodriver_args.append(f'--proxy-file {proxy_file}')
-        nodriver_args.append(f'--cloudflare-wait {nodriver_cloudflare_wait}')
-        nodriver_args.append(f'--content-timeout {nodriver_content_timeout}')
-        nodriver_args.append(f'--max-retries {nodriver_max_retries}')
-        nodriver_args.append(f'--cf-verify-retries {nodriver_cf_verify_retries}')
-
-        bash_command = f"""
-cd /opt/airflow && \\
-python dags/scripts/run_fbref_scraper.py \\
-    --scraper-type nodriver \\
-    {' '.join(nodriver_args)} \\
-    --mode match_data \\
-    --match-data-type {data_type} \\
-    --leagues "{leagues_str}" \\
-    --season {season} \\
-    --output {output_file}
-"""
-
-    elif effective_scraper == 'soccerdata':
-        # soccerdata: DEPRECATED - blocked by Cloudflare Turnstile
-        tor_args = f'--use-tor --tor-host {TOR_HOST} --tor-port {TOR_PORT}' if use_tor else ''
-        proxy_args = f'--proxy-file {proxy_file}' if proxy_file else ''
-        bash_command = f"""
-cd /opt/airflow && \\
-python dags/scripts/run_fbref_scraper.py \\
-    --scraper-type soccerdata \\
-    {tor_args} \\
-    {proxy_args} \\
-    --mode match_data \\
-    --match-data-type {data_type} \\
-    --leagues "{leagues_str}" \\
-    --season {season} \\
-    --output {output_file}
-"""
-    else:
-        # selenium: Browser-based scraper with undetected-chromedriver
-        if use_flaresolverr:
-            selenium_args = f'--use-flaresolverr --flaresolverr-url {flaresolverr_url}'
-        else:
-            selenium_args_list = []
-            if headless:
-                selenium_args_list.append('--headless')
-            if use_xvfb:
-                selenium_args_list.append('--use-xvfb')
-            if use_nodriver:
-                selenium_args_list.append('--use-nodriver')
-                selenium_args_list.append(f'--nodriver-cloudflare-wait {nodriver_cloudflare_wait}')
-            if proxy_file:
-                selenium_args_list.append(f'--proxy-file {proxy_file}')
-            selenium_args = ' '.join(selenium_args_list)
-
-        bash_command = f"""
-cd /opt/airflow && \\
-python dags/scripts/run_fbref_scraper.py \\
-    --scraper-type selenium \\
-    {selenium_args} \\
-    --mode match_data \\
-    --match-data-type {data_type} \\
-    --leagues "{leagues_str}" \\
-    --season {season} \\
-    --max-matches {max_matches} \\
-    --output {output_file}
-"""
-
-    return BashOperator(
-        task_id=task_id,
-        bash_command=bash_command,
-        env={
-            'PYTHONPATH': '/opt/airflow:/opt/airflow/dags',
-            'PATH': '/usr/local/bin:/usr/bin:/bin:/home/airflow/.local/bin',
-            'HOME': '/home/airflow',
-            'DISPLAY': ':99',
-        },
-    )
-
-
-def create_combined_match_data_task(
-    leagues_str: str,
-    season: int,
-    max_matches: int = 50,
-    use_xvfb: bool = USE_XVFB,
-    headless: bool = HEADLESS,
-    use_nodriver: bool = USE_NODRIVER,
-    nodriver_cloudflare_wait: float = NODRIVER_CLOUDFLARE_WAIT,
-    proxy_file: str = None,
-) -> BashOperator:
-    """
-    Create a BashOperator task for collecting ALL match-level data in one pass.
-
-    This task collects shot_events, match_events, and lineups simultaneously,
-    reducing HTTP requests by 3x compared to separate tasks.
-
-    Optimization:
-    - Before: schedule → shot_events → match_events → lineups (3 separate passes)
-    - After: schedule → match_all_data (1 combined pass)
-
-    HTTP requests reduction:
-    - Before: 1 + 380 + 380 + 380 = 1141 requests (for 380 matches)
-    - After: 1 + 380 = 381 requests (3x reduction)
-
-    Args:
-        leagues_str: Comma-separated leagues string
-        season: Season year
-        max_matches: Maximum matches per league (default 50 for reasonable runtime)
-        use_xvfb: Use Xvfb virtual display
-        headless: Run browser in headless mode
-        use_nodriver: Use nodriver (for selenium scraper type)
-        nodriver_cloudflare_wait: Time to wait for Cloudflare challenge (seconds)
-        proxy_file: Path to file with proxy list (format: host:port:user:pass)
-
-    Returns:
-        BashOperator task
-    """
-    task_id = 'match_all_data'
-    output_file = '/tmp/fbref_match_all_data.json'
-
-    # Build selenium args (combined_match_data uses selenium with nodriver)
-    selenium_args_list = []
-    if headless:
-        selenium_args_list.append('--headless')
-    if use_xvfb:
-        selenium_args_list.append('--use-xvfb')
-    if use_nodriver:
-        selenium_args_list.append('--use-nodriver')
-        selenium_args_list.append(f'--nodriver-cloudflare-wait {nodriver_cloudflare_wait}')
-    if proxy_file:
-        selenium_args_list.append(f'--proxy-file {proxy_file}')
-    selenium_args = ' '.join(selenium_args_list)
-
-    bash_command = f"""
-cd /opt/airflow && \\
-python dags/scripts/run_fbref_scraper.py \\
-    --scraper-type selenium \\
-    {selenium_args} \\
-    --mode combined_match_data \\
-    --leagues "{leagues_str}" \\
-    --season {season} \\
-    --max-matches {max_matches} \\
-    --output {output_file}
-"""
-
-    return BashOperator(
-        task_id=task_id,
-        bash_command=bash_command,
-        env={
-            'PYTHONPATH': '/opt/airflow:/opt/airflow/dags',
-            'PATH': '/usr/local/bin:/usr/bin:/bin:/home/airflow/.local/bin',
-            'HOME': '/home/airflow',
-            'DISPLAY': ':99',
-        },
-    )
-
-
-# Build arguments
-leagues_str = ','.join(LEAGUES)
-
-# DAG definition
 with DAG(
     dag_id='dag_ingest_fbref',
     default_args=SELENIUM_ARGS,
@@ -693,8 +233,8 @@ with DAG(
     - Better fingerprint evasion and Cloudflare Turnstile bypass
     - Uses Xvfb virtual display to avoid headless detection
 
-    **Note:** Tor and FlareSolverr are no longer effective against FBref's
-    Cloudflare protection. Residential proxies are now required.
+    **Note:** Tor is no longer effective against FBref's Cloudflare protection.
+    Residential proxies are now required.
 
     ### Configuration
 
@@ -748,7 +288,7 @@ with DAG(
     Test the scraper with soccerdata and residential proxy rotation:
     ```bash
     docker compose exec airflow-webserver python -c "
-    from scrapers.soccerdata_fbref_scraper import SoccerdataFBrefScraper
+    from scrapers.soccerdata_fbref import SoccerdataFBrefScraper
 
     s = SoccerdataFBrefScraper(
         leagues=['ENG-Premier League'],
@@ -795,10 +335,8 @@ with DAG(
 ) as dag:
 
     # =========================================================================
-    # Start Task (заменяет FlareSolverrSensor, т.к. используем undetected-chromedriver)
+    # Start Task
     # =========================================================================
-    # FlareSolverr теперь не используется напрямую - вместо него
-    # используется undetected-chromedriver + Xvfb для обхода Cloudflare
     start = EmptyOperator(task_id='start')
 
     # =========================================================================
@@ -809,6 +347,15 @@ with DAG(
     prewarm_task = PythonOperator(
         task_id='prewarm_cf_cookies',
         python_callable=prewarm_cf_cookies,
+        op_kwargs=dict(
+            proxy_file=PROXY_FILE,
+            cache_ttl_minutes=CF_COOKIE_CACHE_TTL_MINUTES,
+            use_cf_verify=USE_CF_VERIFY_PLUGIN,
+            cf_verify_max_retries=CF_VERIFY_MAX_RETRIES,
+            cf_verify_interval=CF_VERIFY_INTERVAL,
+            use_xvfb=USE_XVFB,
+            max_attempts=CF_COOKIE_PREWARM_ATTEMPTS,
+        ),
         retries=2,
         retry_delay=timedelta(seconds=120),
     ) if CF_COOKIE_PREWARM else None
@@ -817,94 +364,19 @@ with DAG(
     # TaskGroup: Player Stats (9 SEQUENTIAL tasks to prevent OOM)
     # =========================================================================
     with TaskGroup(group_id='player_stats') as player_stats_group:
-        player_tasks = []
-        prev_task = None
-        for stat_type in PLAYER_STAT_TYPES:
-            task = create_single_stat_task(
-                stat_type=stat_type,
-                data_category='player',
-                leagues_str=leagues_str,
-                season=CURRENT_SEASON,
-                scraper_type=DEFAULT_SCRAPER_TYPE,
-                use_tor=USE_TOR,
-                use_flaresolverr=USE_FLARESOLVERR,
-                flaresolverr_url=FLARESOLVERR_URL,
-                use_xvfb=USE_XVFB,
-                headless=HEADLESS,
-                use_nodriver=USE_NODRIVER,
-                nodriver_cloudflare_wait=NODRIVER_CLOUDFLARE_WAIT,
-                nodriver_content_timeout=NODRIVER_CONTENT_TIMEOUT,
-                nodriver_max_retries=NODRIVER_MAX_RETRIES,
-                nodriver_cf_verify_retries=NODRIVER_CF_VERIFY_RETRIES,
-                proxy_file=PROXY_FILE,
-            )
-            # Chain tasks sequentially to prevent OOM
-            if prev_task is not None:
-                prev_task >> task
-            prev_task = task
-            player_tasks.append(task)
+        player_tasks = _build_sequential_stat_group(PLAYER_STAT_TYPES, 'player')
 
     # =========================================================================
     # TaskGroup: Team Stats (9 SEQUENTIAL tasks to prevent OOM)
     # =========================================================================
     with TaskGroup(group_id='team_stats') as team_stats_group:
-        team_tasks = []
-        prev_task = None
-        for stat_type in TEAM_STAT_TYPES:
-            task = create_single_stat_task(
-                stat_type=stat_type,
-                data_category='team',
-                leagues_str=leagues_str,
-                season=CURRENT_SEASON,
-                scraper_type=DEFAULT_SCRAPER_TYPE,
-                use_tor=USE_TOR,
-                use_flaresolverr=USE_FLARESOLVERR,
-                flaresolverr_url=FLARESOLVERR_URL,
-                use_xvfb=USE_XVFB,
-                headless=HEADLESS,
-                use_nodriver=USE_NODRIVER,
-                nodriver_cloudflare_wait=NODRIVER_CLOUDFLARE_WAIT,
-                nodriver_content_timeout=NODRIVER_CONTENT_TIMEOUT,
-                nodriver_max_retries=NODRIVER_MAX_RETRIES,
-                nodriver_cf_verify_retries=NODRIVER_CF_VERIFY_RETRIES,
-                proxy_file=PROXY_FILE,
-            )
-            # Chain tasks sequentially to prevent OOM
-            if prev_task is not None:
-                prev_task >> task
-            prev_task = task
-            team_tasks.append(task)
+        team_tasks = _build_sequential_stat_group(TEAM_STAT_TYPES, 'team')
 
     # =========================================================================
     # TaskGroup: Keeper Stats (2 SEQUENTIAL tasks to prevent OOM)
     # =========================================================================
     with TaskGroup(group_id='keeper_stats') as keeper_stats_group:
-        keeper_tasks = []
-        prev_task = None
-        for stat_type in KEEPER_STAT_TYPES:
-            task = create_single_stat_task(
-                stat_type=stat_type,
-                data_category='keeper',
-                leagues_str=leagues_str,
-                season=CURRENT_SEASON,
-                scraper_type=DEFAULT_SCRAPER_TYPE,
-                use_tor=USE_TOR,
-                use_flaresolverr=USE_FLARESOLVERR,
-                flaresolverr_url=FLARESOLVERR_URL,
-                use_xvfb=USE_XVFB,
-                headless=HEADLESS,
-                use_nodriver=USE_NODRIVER,
-                nodriver_cloudflare_wait=NODRIVER_CLOUDFLARE_WAIT,
-                nodriver_content_timeout=NODRIVER_CONTENT_TIMEOUT,
-                nodriver_max_retries=NODRIVER_MAX_RETRIES,
-                nodriver_cf_verify_retries=NODRIVER_CF_VERIFY_RETRIES,
-                proxy_file=PROXY_FILE,
-            )
-            # Chain tasks sequentially to prevent OOM
-            if prev_task is not None:
-                prev_task >> task
-            prev_task = task
-            keeper_tasks.append(task)
+        keeper_tasks = _build_sequential_stat_group(KEEPER_STAT_TYPES, 'keeper')
 
     # =========================================================================
     # TaskGroup: Match Data (OPTIMIZED - combined task for 3x efficiency)
@@ -913,45 +385,27 @@ with DAG(
     # that each iterate through all matches (3N page loads), we use ONE combined task
     # that collects all data in a single pass (N page loads = 3x reduction).
     #
-    # Before: schedule → shot_events → match_events → lineups
+    # Before: schedule -> shot_events -> match_events -> lineups
     #         HTTP requests: 1 + 380 + 380 + 380 = 1141 (for 380 matches)
     #
-    # After:  schedule → match_all_data
+    # After:  schedule -> match_all_data
     #         HTTP requests: 1 + 380 = 381 (3x reduction)
     # =========================================================================
     with TaskGroup(group_id='match_data') as match_data_group:
         # Schedule task uses nodriver
         schedule_task = create_match_data_task(
             data_type='schedule',
-            leagues_str=leagues_str,
-            season=CURRENT_SEASON,
-            scraper_type=DEFAULT_SCRAPER_TYPE,
-            use_tor=USE_TOR,
-            use_flaresolverr=USE_FLARESOLVERR,
-            flaresolverr_url=FLARESOLVERR_URL,
-            use_xvfb=USE_XVFB,
-            headless=HEADLESS,
-            use_nodriver=USE_NODRIVER,
-            nodriver_cloudflare_wait=NODRIVER_CLOUDFLARE_WAIT,
-            nodriver_max_retries=NODRIVER_MAX_RETRIES,
-            nodriver_cf_verify_retries=NODRIVER_CF_VERIFY_RETRIES,
-            proxy_file=PROXY_FILE,
+            **COMMON_TASK_KWARGS,
         )
 
         # Combined match data task: collects shot_events, match_events, lineups
         # in ONE pass through matches (3x efficiency vs separate tasks)
         match_all_task = create_combined_match_data_task(
-            leagues_str=leagues_str,
-            season=CURRENT_SEASON,
             max_matches=0,  # 0 = no limit, process all matches
-            use_xvfb=USE_XVFB,
-            headless=HEADLESS,
-            use_nodriver=USE_NODRIVER,
-            nodriver_cloudflare_wait=NODRIVER_CLOUDFLARE_WAIT,
-            proxy_file=PROXY_FILE,
+            **COMBINED_MATCH_KWARGS,
         )
 
-        # schedule → match_all_data
+        # schedule -> match_all_data
         schedule_task >> match_all_task
 
     # =========================================================================

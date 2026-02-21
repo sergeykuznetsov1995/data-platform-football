@@ -47,7 +47,7 @@ logger = logging.getLogger(__name__)
 @pytest.fixture
 def fbref_scraper():
     """Create FBrefScraper instance for testing."""
-    from scrapers.fbref_scraper import FBrefScraper
+    from scrapers.fbref import FBrefScraper
 
     scraper = FBrefScraper(
         leagues=['ENG-Premier League'],
@@ -528,7 +528,7 @@ class TestFBrefCleanup:
 
     def test_context_manager_cleanup(self):
         """Test that context manager properly cleans up."""
-        from scrapers.fbref_scraper import FBrefScraper
+        from scrapers.fbref import FBrefScraper
 
         with FBrefScraper(
             leagues=['ENG-Premier League'],
@@ -547,159 +547,6 @@ class TestFBrefCleanup:
         # Should not raise even if browser was never created
         fbref_scraper.close()
         assert fbref_scraper._browser is None
-
-
-class TestFlareSolverrIntegration:
-    """Integration tests for FlareSolverr mode."""
-
-    @pytest.fixture
-    def fbref_scraper_flaresolverr(self):
-        """Create FBrefScraper instance using FlareSolverr."""
-        from scrapers.fbref_scraper import FBrefScraper
-
-        scraper = FBrefScraper(
-            leagues=['ENG-Premier League'],
-            seasons=[2024],
-            headless=True,
-            use_flaresolverr=True,
-            flaresolverr_url='http://flaresolverr:8191',
-        )
-        yield scraper
-        scraper.close()
-
-    @pytest.mark.flaresolverr
-    def test_flaresolverr_health_check(self):
-        """Test FlareSolverr health check."""
-        from scrapers.base.flaresolverr_client import FlareSolverrClient
-
-        client = FlareSolverrClient(base_url='http://flaresolverr:8191')
-        is_healthy = client.health_check(verbose=True)
-
-        logger.info(f"FlareSolverr health check result: {is_healthy}")
-
-        # This test may fail if FlareSolverr is not running
-        # Mark as skip instead of fail in that case
-        if not is_healthy:
-            pytest.skip("FlareSolverr is not available")
-
-        assert is_healthy
-
-    @pytest.mark.flaresolverr
-    def test_flaresolverr_version_info(self):
-        """Test getting FlareSolverr version info."""
-        from scrapers.base.flaresolverr_client import FlareSolverrClient
-
-        client = FlareSolverrClient(base_url='http://flaresolverr:8191')
-        version_info = client.get_version_info()
-
-        if version_info is None:
-            pytest.skip("FlareSolverr is not available")
-
-        logger.info(f"FlareSolverr version info: {version_info}")
-        assert 'status' in version_info
-
-    @pytest.mark.flaresolverr
-    @pytest.mark.slow
-    def test_flaresolverr_simple_request(self):
-        """Test a simple request through FlareSolverr."""
-        from scrapers.base.flaresolverr_client import FlareSolverrClient
-
-        client = FlareSolverrClient(base_url='http://flaresolverr:8191')
-
-        if not client.health_check():
-            pytest.skip("FlareSolverr is not available")
-
-        try:
-            # Use a simple page that doesn't require Cloudflare bypass
-            html = client.get_html(
-                'https://example.com',
-                max_timeout=30000
-            )
-
-            assert html is not None
-            assert len(html) > 0
-            assert 'Example Domain' in html
-
-            logger.info(f"FlareSolverr request successful, HTML length: {len(html)}")
-
-        except Exception as e:
-            logger.error(f"FlareSolverr request failed: {e}")
-            pytest.skip(f"FlareSolverr request failed: {e}")
-
-    @pytest.mark.flaresolverr
-    @pytest.mark.slow
-    @pytest.mark.real_request
-    def test_flaresolverr_fbref_request(self):
-        """Test FlareSolverr can fetch FBref page."""
-        from scrapers.base.flaresolverr_client import FlareSolverrClient
-
-        client = FlareSolverrClient(
-            base_url='http://flaresolverr:8191',
-            max_timeout=120000  # 2 minutes for Cloudflare challenge
-        )
-
-        if not client.health_check():
-            pytest.skip("FlareSolverr is not available")
-
-        try:
-            html = client.get_html(
-                'https://fbref.com/en/comps/9/schedule/Premier-League-Scores-and-Fixtures',
-                max_timeout=120000
-            )
-
-            assert html is not None
-            html_len = len(html)
-            has_tables = '<table' in html
-
-            # Check if we're still blocked by Cloudflare
-            cloudflare_blocked = any(
-                cf in html.lower()
-                for cf in ['just a moment', 'checking your browser', 'challenge-running']
-            )
-
-            logger.info(
-                f"FBref request: length={html_len}, "
-                f"has_tables={has_tables}, "
-                f"cloudflare_blocked={cloudflare_blocked}"
-            )
-
-            if cloudflare_blocked:
-                pytest.skip("FlareSolverr could not bypass Cloudflare protection")
-
-            assert has_tables, "No tables found in HTML - page may be blocked"
-            assert html_len > 10000, f"HTML too short ({html_len}), may be error page"
-
-        except Exception as e:
-            logger.error(f"FlareSolverr FBref request failed: {e}")
-            pytest.skip(f"FlareSolverr FBref request failed: {e}")
-
-    @pytest.mark.flaresolverr
-    @pytest.mark.slow
-    @pytest.mark.real_request
-    def test_fbref_scraper_with_flaresolverr(self, fbref_scraper_flaresolverr):
-        """Test FBref scraper using FlareSolverr mode."""
-        from scrapers.base.flaresolverr_client import FlareSolverrClient
-
-        client = FlareSolverrClient(base_url='http://flaresolverr:8191')
-        if not client.health_check():
-            pytest.skip("FlareSolverr is not available")
-
-        try:
-            df = fbref_scraper_flaresolverr.read_schedule('ENG-Premier League', 2024)
-
-            if df is None:
-                logger.warning("Schedule data is None - Cloudflare may have blocked request")
-                pytest.skip("Could not fetch schedule data - Cloudflare block suspected")
-
-            assert isinstance(df, pd.DataFrame)
-            assert len(df) > 0
-
-            logger.info(f"FlareSolverr mode: parsed {len(df)} schedule rows")
-            logger.info(f"Columns: {list(df.columns)}")
-
-        except Exception as e:
-            logger.error(f"FBref scraper with FlareSolverr failed: {e}")
-            pytest.skip(f"FBref scraper with FlareSolverr failed: {e}")
 
 
 class TestHTMLDiagnostics:

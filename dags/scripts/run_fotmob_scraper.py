@@ -69,7 +69,7 @@ def main():
     }
 
     try:
-        from scrapers.fotmob_scraper import FotMobScraper
+        from scrapers.fotmob import FotMobScraper
 
         with FotMobScraper(
             leagues=leagues,

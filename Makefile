@@ -240,7 +240,7 @@ test-fbref-sticky:
 	@echo "Testing FBref with custom sticky session settings..."
 	@echo "STICKY_REQUESTS=$${STICKY_REQUESTS:-5}"
 	@docker compose exec airflow-webserver python -c "\
-from scrapers.soccerdata_fbref_scraper import SoccerdataFBrefScraper; \
+from scrapers.soccerdata_fbref import SoccerdataFBrefScraper; \
 import os; \
 sticky = int(os.environ.get('STICKY_REQUESTS', '5')); \
 print(f'Testing with sticky_requests={sticky}'); \

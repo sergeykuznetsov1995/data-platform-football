@@ -13,7 +13,6 @@ markers = [
     "soccerdata: tests requiring soccerdata library",
     "scraper: tests for web scrapers",
     "real_request: tests making real HTTP requests",
-    "flaresolverr: tests requiring FlareSolverr service",
 ]
 filterwarnings = [
     "ignore::DeprecationWarning",

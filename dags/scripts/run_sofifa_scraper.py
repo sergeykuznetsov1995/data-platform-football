@@ -55,7 +55,7 @@ def main():
     }
 
     try:
-        from scrapers.sofifa_scraper import SoFIFAScraper
+        from scrapers.sofifa import SoFIFAScraper
 
         with SoFIFAScraper(leagues=leagues, versions=versions) as scraper:
             # Scrape players

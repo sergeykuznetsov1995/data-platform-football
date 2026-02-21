@@ -55,7 +55,7 @@ def main():
     }
 
     try:
-        from scrapers.understat_scraper import UnderstatScraper
+        from scrapers.understat import UnderstatScraper
 
         with UnderstatScraper(leagues=leagues, seasons=[args.season]) as scraper:
             # Scrape schedule

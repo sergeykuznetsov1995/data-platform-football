@@ -19,7 +19,7 @@ class TestMatchHistoryScraperIntegration:
         if not network_available:
             pytest.skip("No network connectivity")
 
-        from scrapers.matchhistory_scraper import MatchHistoryScraper
+        from scrapers.matchhistory import MatchHistoryScraper
 
         scraper = MatchHistoryScraper(
             leagues=minimal_leagues,
@@ -107,7 +107,7 @@ class TestMatchHistorySeleniumFallback:
         if not undetected_chrome_available:
             pytest.skip("undetected-chromedriver not available")
 
-        from scrapers.matchhistory_scraper import MatchHistoryScraper
+        from scrapers.matchhistory import MatchHistoryScraper
 
         scraper = MatchHistoryScraper(
             leagues=['ENG-Premier League'],
@@ -144,7 +144,7 @@ class TestMatchHistoryMultiLeague:
         if not network_available:
             pytest.skip("No network connectivity")
 
-        from scrapers.matchhistory_scraper import MatchHistoryScraper
+        from scrapers.matchhistory import MatchHistoryScraper
 
         scraper = MatchHistoryScraper(
             leagues=['ENG-Premier League', 'ESP-La Liga'],

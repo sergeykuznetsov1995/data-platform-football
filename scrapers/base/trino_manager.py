@@ -240,6 +240,91 @@ WITH (
         self._execute(sql)
         logger.info(f"Created Iceberg table: {self.catalog}.{schema}.{table}")
 
+    def _format_sql_value(self, val, target_type: str = '') -> str:
+        """
+        Format a Python value as a SQL literal, casting to match the target column type.
+
+        When target_type is known (from DESCRIBE TABLE), the value is cast to match
+        the table schema. This prevents TYPE_MISMATCH errors when pandas changes
+        column dtypes between runs (e.g., int→float due to NaN).
+
+        Args:
+            val: Python value from DataFrame row
+            target_type: Trino column type (e.g., 'bigint', 'varchar', 'double')
+
+        Returns:
+            SQL literal string
+        """
+        if pd.isna(val):
+            return "NULL"
+
+        tt = target_type.upper()
+
+        # When target type is known, cast value to match table schema
+        if tt:
+            if tt.startswith('VARCHAR') or tt.startswith('CHAR'):
+                escaped = str(val).replace("'", "''")
+                return f"'{escaped}'"
+
+            if tt in ('BIGINT', 'INTEGER', 'SMALLINT', 'TINYINT'):
+                try:
+                    return f"CAST({int(val)} AS {tt})"
+                except (ValueError, TypeError, OverflowError):
+                    return "NULL"
+
+            if tt in ('DOUBLE', 'REAL'):
+                try:
+                    float_val = float(val)
+                    if np.isnan(float_val) or np.isinf(float_val):
+                        return "NULL"
+                    return f"CAST({float_val} AS {tt})"
+                except (ValueError, TypeError):
+                    return "NULL"
+
+            if tt.startswith('DECIMAL'):
+                try:
+                    return f"CAST({val} AS {tt})"
+                except (ValueError, TypeError):
+                    return "NULL"
+
+            if tt == 'BOOLEAN':
+                return "TRUE" if val else "FALSE"
+
+            if tt == 'DATE':
+                if isinstance(val, (date, datetime, pd.Timestamp)):
+                    if isinstance(val, datetime):
+                        return f"DATE '{val.strftime('%Y-%m-%d')}'"
+                    return f"DATE '{val}'"
+                return f"DATE '{val}'"
+
+            if 'TIMESTAMP' in tt:
+                if isinstance(val, (datetime, pd.Timestamp)):
+                    ts_str = val.strftime('%Y-%m-%d %H:%M:%S.%f')
+                    return f"TIMESTAMP '{ts_str}'"
+                return f"TIMESTAMP '{val}'"
+
+        # Fallback: infer type from Python value (used when table types unknown)
+        if isinstance(val, str):
+            escaped = val.replace("'", "''")
+            return f"'{escaped}'"
+        elif isinstance(val, date) and not isinstance(val, datetime):
+            return f"DATE '{val}'"
+        elif isinstance(val, (datetime, pd.Timestamp)):
+            ts_str = val.strftime('%Y-%m-%d %H:%M:%S.%f')
+            return f"TIMESTAMP '{ts_str}'"
+        elif isinstance(val, bool):
+            # Must check bool before int (bool is subclass of int)
+            return "TRUE" if val else "FALSE"
+        elif isinstance(val, (int, np.integer)):
+            return f"CAST({val} AS BIGINT)"
+        elif isinstance(val, (float, np.floating)):
+            if np.isnan(val) or np.isinf(val):
+                return "NULL"
+            return f"CAST({val} AS DOUBLE)"
+        else:
+            escaped = str(val).replace("'", "''")
+            return f"'{escaped}'"
+
     def insert_dataframe(
         self,
         schema: str,
@@ -249,6 +334,10 @@ WITH (
     ) -> int:
         """
         Insert DataFrame rows into Iceberg table via VALUES clause.
+
+        Fetches actual table column types to cast values correctly,
+        preventing TYPE_MISMATCH errors when pandas changes dtypes
+        between runs (e.g., int column becomes float due to NaN).
 
         Args:
             schema: Schema name
@@ -263,6 +352,14 @@ WITH (
             logger.warning(f"Empty DataFrame, skipping insert to {schema}.{table}")
             return 0
 
+        # Fetch actual table column types for type-safe casting
+        table_col_types: Dict[str, str] = {}
+        try:
+            raw_types = self.get_table_columns(schema, table)
+            table_col_types = {k.lower(): v for k, v in raw_types.items()}
+        except Exception as e:
+            logger.debug(f"Could not fetch table column types: {e}")
+
         total_inserted = 0
         columns = ', '.join(f'"{c}"' for c in df.columns)
 
@@ -275,39 +372,8 @@ WITH (
                 values = []
                 for col in df.columns:
                     val = row[col]
-                    if pd.isna(val):
-                        values.append("NULL")
-                    elif isinstance(val, str):
-                        # Escape single quotes
-                        escaped = val.replace("'", "''")
-                        values.append(f"'{escaped}'")
-                    elif isinstance(val, date) and not isinstance(val, datetime):
-                        # Date without time - use DATE literal
-                        values.append(f"DATE '{val}'")
-                    elif isinstance(val, (datetime, pd.Timestamp)):
-                        # Handle timezone-aware timestamps
-                        if hasattr(val, 'tzinfo') and val.tzinfo is not None:
-                            # Convert to UTC and format
-                            ts_str = val.strftime('%Y-%m-%d %H:%M:%S.%f')
-                            values.append(f"TIMESTAMP '{ts_str}'")
-                        else:
-                            ts_str = val.strftime('%Y-%m-%d %H:%M:%S.%f')
-                            values.append(f"TIMESTAMP '{ts_str}'")
-                    elif isinstance(val, bool):
-                        # Must check bool before int (bool is subclass of int)
-                        values.append("TRUE" if val else "FALSE")
-                    elif isinstance(val, (int, np.integer)):
-                        # Cast to BIGINT for consistency with table schema
-                        values.append(f"CAST({val} AS BIGINT)")
-                    elif isinstance(val, (float, np.floating)):
-                        if np.isnan(val) or np.isinf(val):
-                            values.append("NULL")
-                        else:
-                            values.append(f"CAST({val} AS DOUBLE)")
-                    else:
-                        # Fallback: convert to string
-                        escaped = str(val).replace("'", "''")
-                        values.append(f"'{escaped}'")
+                    target_type = table_col_types.get(col.lower(), '')
+                    values.append(self._format_sql_value(val, target_type))
                 rows.append(f"({', '.join(values)})")
 
             values_sql = ",\n".join(rows)
@@ -365,6 +431,20 @@ VALUES
         except TrinoError as e:
             # Procedure might not exist or table not partitioned
             logger.warning(f"Could not sync partitions: {e}")
+
+    def add_column(self, schema: str, table: str, column: str, column_type: str) -> None:
+        """
+        Add a column to an existing Iceberg table.
+
+        Args:
+            schema: Schema name
+            table: Table name
+            column: Column name
+            column_type: Trino type (e.g., 'VARCHAR', 'BIGINT', 'DOUBLE')
+        """
+        sql = f'ALTER TABLE {self.catalog}.{schema}.{table} ADD COLUMN "{column}" {column_type}'
+        self._execute(sql)
+        logger.info(f'Added column "{column}" {column_type} to {self.catalog}.{schema}.{table}')
 
     def get_table_columns(self, schema: str, table: str) -> Dict[str, str]:
         """

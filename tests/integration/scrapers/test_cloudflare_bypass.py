@@ -145,7 +145,7 @@ class TestBrowserSession:
         if not undetected_chrome_available:
             pytest.skip("undetected-chromedriver not available")
 
-        from scrapers.base.cloudflare_bypass import browser_session
+        from scrapers.base.browser import browser_session
 
         with browser_session(headless=True) as browser:
             html = browser.get_page('https://www.google.com', cloudflare_wait=1.0)
@@ -172,7 +172,7 @@ class TestCloudflareBypassWithProxy:
         if not tor_available:
             pytest.skip("Tor not available")
 
-        from scrapers.base.cloudflare_bypass import CloudflareBypass
+        from scrapers.base.browser import CloudflareBypass
 
         bypass = CloudflareBypass(
             headless=True,
@@ -196,7 +196,7 @@ class TestBrowserConfig:
 
     def test_default_config(self):
         """Test default browser configuration."""
-        from scrapers.base.cloudflare_bypass import BrowserConfig
+        from scrapers.base.browser import BrowserConfig
 
         config = BrowserConfig()
 
@@ -209,7 +209,7 @@ class TestBrowserConfig:
 
     def test_custom_config(self):
         """Test custom browser configuration."""
-        from scrapers.base.cloudflare_bypass import BrowserConfig
+        from scrapers.base.browser import BrowserConfig
 
         config = BrowserConfig(
             headless=False,

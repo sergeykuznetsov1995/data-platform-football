@@ -72,7 +72,7 @@ class TestUnderstatScraper:
     @pytest.fixture
     def scraper(self, mock_dependencies, mock_soccerdata_understat):
         """Create UnderstatScraper instance."""
-        from scrapers.understat_scraper import UnderstatScraper
+        from scrapers.understat import UnderstatScraper
 
         return UnderstatScraper(
             leagues=['ENG-Premier League'],
@@ -90,7 +90,7 @@ class TestUnderstatScraper:
 
     def test_supported_leagues_filter(self, mock_dependencies, mock_soccerdata_understat):
         """Test that unsupported leagues are filtered out."""
-        from scrapers.understat_scraper import UnderstatScraper
+        from scrapers.understat import UnderstatScraper
 
         scraper = UnderstatScraper(
             leagues=['ENG-Premier League', 'USA-MLS'],  # MLS not supported
@@ -140,7 +140,7 @@ class TestUnderstatSupportedLeagues:
 
     def test_supported_leagues_list(self):
         """Test supported leagues are defined."""
-        from scrapers.understat_scraper import UnderstatScraper
+        from scrapers.understat import UnderstatScraper
 
         assert 'ENG-Premier League' in UnderstatScraper.SUPPORTED_LEAGUES
         assert 'ESP-La Liga' in UnderstatScraper.SUPPORTED_LEAGUES

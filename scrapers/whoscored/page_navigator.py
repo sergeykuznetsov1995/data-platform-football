@@ -18,7 +18,7 @@ from selenium.common.exceptions import (
 )
 
 from scrapers.whoscored.constants import BASE_URL, LEAGUE_CONFIG, KNOWN_SEASON_IDS
-from scrapers.base.cloudflare_bypass import CloudflareBypass
+from scrapers.base.browser import CloudflareBypass
 
 logger = logging.getLogger(__name__)
 
@@ -32,16 +32,14 @@ class PageNavigator:
     - Pagination through fixtures
     """
 
-    def __init__(self, browser: CloudflareBypass, use_flaresolverr: bool = False):
+    def __init__(self, browser: CloudflareBypass):
         """
         Initialize navigator.
 
         Args:
             browser: CloudflareBypass browser instance
-            use_flaresolverr: Whether FlareSolverr mode is enabled
         """
         self._browser = browser
-        self._use_flaresolverr = use_flaresolverr
         # Cache for season/stage IDs: (league, season) -> (season_id, stage_id)
         self._season_cache: Dict[Tuple[str, int], Tuple[str, str]] = {}
 
@@ -127,14 +125,6 @@ class PageNavigator:
             self._season_cache[cache_key] = ids
             logger.info(f"Using known season/stage IDs for {league} {season}: {ids}")
             return ids
-
-        # Check if browser supports interaction (FlareSolverr doesn't)
-        if self._use_flaresolverr:
-            logger.warning(
-                f"FlareSolverr mode cannot interact with dropdowns. "
-                f"No known IDs for {league} {season}."
-            )
-            return None
 
         # Try to fetch dynamically via Selenium
         tournament_url = self.build_tournament_url(league)

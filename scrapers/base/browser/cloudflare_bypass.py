@@ -4,10 +4,6 @@ Cloudflare Bypass
 
 Selenium-based browser automation for bypassing Cloudflare protection.
 Uses undetected-chromedriver to avoid bot detection.
-
-Supports two modes:
-1. Selenium with undetected-chromedriver (default)
-2. FlareSolverr - external service for solving Cloudflare challenges
 """
 
 import logging
@@ -19,14 +15,6 @@ from typing import Any, Dict, List, Optional
 from scrapers.base.browser.driver_factory import BrowserConfig, DriverFactory
 
 logger = logging.getLogger(__name__)
-
-# Try to import FlareSolverr client
-try:
-    from scrapers.base.flaresolverr_client import FlareSolverrClient
-    FLARESOLVERR_AVAILABLE = True
-except ImportError:
-    FLARESOLVERR_AVAILABLE = False
-    logger.debug("FlareSolverr client not available")
 
 # Try to import selenium
 try:
@@ -47,19 +35,12 @@ class CloudflareBypass:
     """
     Browser automation for bypassing Cloudflare and other protections.
 
-    Supports two modes:
-    1. Selenium with undetected-chromedriver (default)
-    2. FlareSolverr - external service for solving Cloudflare challenges
+    Uses Selenium with undetected-chromedriver.
 
     Usage:
-        # Selenium mode (default)
         with CloudflareBypass(headless=False) as browser:
             html = browser.get_page("https://whoscored.com/...")
             data = browser.execute_script("return window.__INITIAL_STATE__")
-
-        # FlareSolverr mode
-        with CloudflareBypass(use_flaresolverr=True) as browser:
-            html = browser.get_page("https://whoscored.com/...")
     """
 
     def __init__(
@@ -69,8 +50,6 @@ class CloudflareBypass:
         proxy: Optional[str] = None,
         user_agent: Optional[str] = None,
         page_load_timeout: int = 30,
-        use_flaresolverr: bool = False,
-        flaresolverr_url: str = "http://flaresolverr:8191",
     ):
         """
         Initialize browser.
@@ -81,22 +60,10 @@ class CloudflareBypass:
             proxy: Proxy server URL
             user_agent: Custom user agent string
             page_load_timeout: Page load timeout in seconds
-            use_flaresolverr: Use FlareSolverr instead of Selenium
-            flaresolverr_url: URL of FlareSolverr service
         """
-        self.use_flaresolverr = use_flaresolverr
-        self.flaresolverr_url = flaresolverr_url
-        self._flaresolverr_client: Optional['FlareSolverrClient'] = None
-
-        # FlareSolverr mode doesn't require Selenium
-        if not use_flaresolverr and not SELENIUM_AVAILABLE:
+        if not SELENIUM_AVAILABLE:
             raise ImportError(
-                "Selenium is required for CloudflareBypass (non-FlareSolverr mode)"
-            )
-
-        if use_flaresolverr and not FLARESOLVERR_AVAILABLE:
-            raise ImportError(
-                "FlareSolverr client is required for FlareSolverr mode"
+                "Selenium is required for CloudflareBypass"
             )
 
         self.config = BrowserConfig(
@@ -140,7 +107,6 @@ class CloudflareBypass:
 
     def _create_driver(self):
         """Create browser driver instance."""
-        # Start Xvfb if configured
         if self.config.use_xvfb:
             self._start_xvfb()
 
@@ -164,17 +130,7 @@ class CloudflareBypass:
         return False
 
     def close(self) -> None:
-        """Close the browser, Xvfb, FlareSolverr session, and cleanup temp files."""
-        # Close FlareSolverr session if active
-        if self._flaresolverr_client is not None:
-            try:
-                if self._flaresolverr_client.session_id:
-                    self._flaresolverr_client.destroy_session()
-            except Exception as e:
-                logger.warning(f"Error closing FlareSolverr session: {e}")
-            finally:
-                self._flaresolverr_client = None
-
+        """Close the browser, Xvfb, and cleanup temp files."""
         if self._driver is not None:
             try:
                 self._driver.quit()
@@ -183,7 +139,6 @@ class CloudflareBypass:
             finally:
                 self._driver = None
 
-        # Stop Xvfb if running
         self._stop_xvfb()
 
         # Cleanup proxy extension temp directory
@@ -197,42 +152,6 @@ class CloudflareBypass:
                     logger.debug(f"Cleaned up proxy extension: {extension_dir}")
             except Exception as e:
                 logger.warning(f"Error cleaning up proxy extension: {e}")
-
-    def _get_flaresolverr_client(self) -> 'FlareSolverrClient':
-        """Get or create FlareSolverr client."""
-        if self._flaresolverr_client is None:
-            self._flaresolverr_client = FlareSolverrClient(
-                base_url=self.flaresolverr_url,
-                max_timeout=self.config.page_load_timeout * 1000
-            )
-        return self._flaresolverr_client
-
-    def _get_page_flaresolverr(
-        self,
-        url: str,
-        proxy: Optional[str] = None,
-        max_timeout: Optional[int] = None
-    ) -> str:
-        """
-        Get page using FlareSolverr.
-
-        Args:
-            url: URL to fetch
-            proxy: Proxy URL (overrides config proxy)
-            max_timeout: Timeout in milliseconds
-
-        Returns:
-            Page HTML source
-        """
-        client = self._get_flaresolverr_client()
-        proxy_url = proxy or self.config.proxy
-
-        timeout_ms = max_timeout or (self.config.page_load_timeout * 1000)
-
-        logger.info(f"FlareSolverr: fetching {url}")
-        html = client.get_html(url, proxy=proxy_url, max_timeout=timeout_ms)
-
-        return html
 
     def get_page(
         self,
@@ -253,10 +172,6 @@ class CloudflareBypass:
         Returns:
             Page HTML source
         """
-        # Use FlareSolverr if enabled
-        if self.use_flaresolverr:
-            return self._get_page_flaresolverr(url)
-
         logger.debug(f"Navigating to: {url}")
 
         self.driver.get(url)
@@ -278,7 +193,6 @@ class CloudflareBypass:
             wait_time: Time to wait for automatic resolution
             url: Current page URL (unused, kept for backward compatibility)
         """
-        # Check for common Cloudflare indicators
         cloudflare_selectors = [
             '#challenge-running',
             '#challenge-stage',
@@ -288,14 +202,12 @@ class CloudflareBypass:
             '.ray_id',
         ]
 
-        # Turnstile-specific selectors
         turnstile_selectors = [
             '.cf-turnstile',
             'iframe[src*="challenges.cloudflare.com"]',
             '#turnstile-wrapper',
         ]
 
-        # Cloudflare page title patterns
         cloudflare_titles = [
             'just a moment',
             'please wait',
@@ -310,7 +222,6 @@ class CloudflareBypass:
         while time.time() - start_time < wait_time:
             elapsed = time.time() - start_time
 
-            # Check page title for Cloudflare indicators
             try:
                 title = self.driver.title.lower()
                 is_cloudflare_page = any(
@@ -327,7 +238,6 @@ class CloudflareBypass:
             except Exception:
                 pass
 
-            # Check for Cloudflare elements
             cloudflare_found = False
             for selector in cloudflare_selectors + turnstile_selectors:
                 try:
@@ -345,7 +255,6 @@ class CloudflareBypass:
                 time.sleep(check_interval)
                 continue
 
-            # No Cloudflare indicators found - page is ready
             logger.debug("Cloudflare challenge completed")
             return
 

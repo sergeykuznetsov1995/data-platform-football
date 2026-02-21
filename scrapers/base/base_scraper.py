@@ -126,6 +126,13 @@ class BaseScraper(ABC):
             self._proxy_manager = ProxyManager(rotation_strategy='random')
             count = self._proxy_manager.load_from_file_custom_format(proxy_file)
             logger.info(f"Loaded {count} proxies from {proxy_file}")
+            # Pre-validate proxies to filter out dead ones early
+            if count > 10:
+                stats = self._proxy_manager.validate_proxies(timeout=5.0)
+                logger.info(
+                    f"Proxy pre-validation: {stats['alive']} alive, "
+                    f"{stats['dead']} dead out of {stats['total']}"
+                )
         elif proxy:
             self._proxy_manager = ProxyManager()
             self._proxy_manager.add_proxy_url(proxy)
@@ -377,9 +384,7 @@ class SeleniumScraper(BaseScraper):
 
     Used for sources with Cloudflare protection or JavaScript rendering.
 
-    Supports two modes:
-    1. Selenium with undetected-chromedriver (default)
-    2. FlareSolverr - external service for solving Cloudflare challenges
+    Uses Selenium with undetected-chromedriver for Cloudflare bypass.
     """
 
     def __init__(
@@ -387,8 +392,6 @@ class SeleniumScraper(BaseScraper):
         headless: bool = True,
         use_xvfb: bool = False,
         proxy_file: Optional[str] = None,
-        use_flaresolverr: bool = False,
-        flaresolverr_url: str = "http://flaresolverr:8191",
         **kwargs
     ):
         """
@@ -398,22 +401,18 @@ class SeleniumScraper(BaseScraper):
             headless: Run browser in headless mode
             use_xvfb: Use Xvfb for virtual display
             proxy_file: Path to file with proxies
-            use_flaresolverr: Use FlareSolverr instead of Selenium
-            flaresolverr_url: URL of FlareSolverr service
             **kwargs: Additional arguments for BaseScraper
         """
         super().__init__(proxy_file=proxy_file, **kwargs)
 
         self.headless = headless
         self.use_xvfb = use_xvfb
-        self.use_flaresolverr = use_flaresolverr
-        self.flaresolverr_url = flaresolverr_url
         self._browser = None
 
     def _get_browser(self):
         """Get or create browser instance with proxy support."""
         if self._browser is None:
-            from scrapers.base.cloudflare_bypass import CloudflareBypass
+            from scrapers.base.browser import CloudflareBypass
 
             # Get proxy URL from manager or direct proxy
             proxy_url = None
@@ -429,8 +428,6 @@ class SeleniumScraper(BaseScraper):
                 headless=self.headless,
                 use_xvfb=self.use_xvfb,
                 proxy=proxy_url,
-                use_flaresolverr=self.use_flaresolverr,
-                flaresolverr_url=self.flaresolverr_url,
             )
 
         return self._browser

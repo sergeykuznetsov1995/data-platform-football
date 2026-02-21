@@ -26,14 +26,9 @@ import pandas as pd
 import requests
 
 from scrapers.base.base_scraper import SeleniumScraper
-from scrapers.base.cloudflare_bypass import CloudflareBypass
+from scrapers.base.browser import CloudflareBypass
 
 logger = logging.getLogger(__name__)
-
-
-# Alias for backwards compatibility
-FotMobSeleniumScraper = None  # Will be set after class definition
-
 
 class FotMobScraper(SeleniumScraper):
     """
@@ -595,7 +590,3 @@ class FotMobScraper(SeleniumScraper):
             self._session = None
 
         super().close()
-
-
-# Backwards compatibility alias
-FotMobSeleniumScraper = FotMobScraper
