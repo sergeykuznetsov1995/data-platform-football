@@ -17,11 +17,12 @@ class TestIcebergWriterInit:
     def test_init_default_values(self):
         """Test IcebergWriter default initialization values."""
         with patch.dict('sys.modules', {'trino': MagicMock(), 'trino.dbapi': MagicMock()}):
-            from scrapers.base.iceberg_writer import IcebergWriter
-            writer = IcebergWriter()
-            assert writer.trino_host == 'trino'
-            assert writer.trino_port == 8080
-            assert writer.catalog == 'iceberg'
+            with patch.dict('os.environ', {}, clear=False):
+                from scrapers.base.iceberg_writer import IcebergWriter
+                writer = IcebergWriter()
+                assert writer.trino_host == 'trino'
+                assert writer.trino_port is None  # TrinoTableManager decides port based on auth mode
+                assert writer.catalog == 'iceberg'
 
     def test_init_custom_values(self):
         """Test IcebergWriter custom initialization values."""
@@ -43,7 +44,7 @@ class TestIcebergWriterInit:
                 from scrapers.base.iceberg_writer import IcebergWriter
                 writer = IcebergWriter()
                 assert writer.trino_host == 'env-trino'
-                assert writer.trino_port == 8888
+                assert writer.trino_port is None  # TRINO_PORT resolved by TrinoTableManager, not IcebergWriter
 
 
 class TestIcebergWriterMetadata:
@@ -370,6 +371,138 @@ class TestIcebergWriterTableOperations:
             sql = mock_trino._execute.call_args[0][0]
             assert 'expire_snapshots' in sql
             assert '14d' in sql
+
+
+class TestIcebergWriterMetadataRecovery:
+    """Tests for ICEBERG_INVALID_METADATA recovery logic."""
+
+    def test_evolve_schema_triggers_recovery(self):
+        """get_table_columns raises ICEBERG_INVALID_METADATA → drop+create+hdfs_clean called, insert succeeds."""
+        with patch.dict('sys.modules', {'trino': MagicMock(), 'trino.dbapi': MagicMock()}):
+            from scrapers.base.iceberg_writer import IcebergWriter
+            from scrapers.base.trino_manager import TrinoError
+            writer = IcebergWriter()
+
+            # Simulate: table_exists=True, but get_table_columns fails with ICEBERG_INVALID_METADATA
+            cause = Exception("Error accessing metadata file")
+            cause.error_name = 'ICEBERG_INVALID_METADATA'
+            metadata_error = TrinoError("SQL execution failed")
+            metadata_error.__cause__ = cause
+
+            mock_trino = MagicMock()
+            mock_trino.table_exists.return_value = True
+            mock_trino.get_table_columns.side_effect = metadata_error
+            mock_trino.arrow_schema_to_trino.return_value = {'col1': 'BIGINT'}
+            mock_trino.insert_dataframe.return_value = 3
+            writer._trino_manager = mock_trino
+
+            df = pd.DataFrame({'col1': [1, 2, 3]})
+
+            with patch('scrapers.base.iceberg_writer.IcebergWriter._clean_hdfs_table_dir') as mock_clean:
+                result = writer._write_to_iceberg(df, 'bronze', 'test_table', None)
+
+                # Recovery: drop + hdfs_clean + create should have been called
+                mock_trino.drop_table.assert_called_once_with('bronze', 'test_table', if_exists=True)
+                mock_clean.assert_called_once_with('bronze', 'test_table')
+                mock_trino.create_iceberg_table.assert_called_once()
+                # Insert should still proceed
+                mock_trino.insert_dataframe.assert_called_once()
+                assert result == 'iceberg.bronze.test_table'
+
+    def test_reraises_non_metadata_errors(self):
+        """Regular TrinoError in _evolve_schema → drop NOT called, error re-raised."""
+        with patch.dict('sys.modules', {'trino': MagicMock(), 'trino.dbapi': MagicMock()}):
+            from scrapers.base.iceberg_writer import IcebergWriter
+            from scrapers.base.trino_manager import TrinoError
+            writer = IcebergWriter()
+
+            regular_error = TrinoError("Connection refused")
+
+            mock_trino = MagicMock()
+            mock_trino.table_exists.return_value = True
+            mock_trino.get_table_columns.side_effect = regular_error
+            mock_trino.arrow_schema_to_trino.return_value = {'col1': 'BIGINT'}
+            writer._trino_manager = mock_trino
+
+            df = pd.DataFrame({'col1': [1, 2, 3]})
+
+            with pytest.raises(TrinoError, match="Connection refused"):
+                writer._write_to_iceberg(df, 'bronze', 'test_table', None)
+
+            mock_trino.drop_table.assert_not_called()
+
+    def test_recovery_fails_propagates(self):
+        """drop_table also fails → error propagated to caller."""
+        with patch.dict('sys.modules', {'trino': MagicMock(), 'trino.dbapi': MagicMock()}):
+            from scrapers.base.iceberg_writer import IcebergWriter
+            from scrapers.base.trino_manager import TrinoError
+            writer = IcebergWriter()
+
+            cause = Exception("Error accessing metadata file")
+            cause.error_name = 'ICEBERG_INVALID_METADATA'
+            metadata_error = TrinoError("SQL execution failed")
+            metadata_error.__cause__ = cause
+
+            mock_trino = MagicMock()
+            mock_trino.table_exists.return_value = True
+            mock_trino.get_table_columns.side_effect = metadata_error
+            mock_trino.arrow_schema_to_trino.return_value = {'col1': 'BIGINT'}
+            mock_trino.drop_table.side_effect = TrinoError("DROP failed: permission denied")
+            writer._trino_manager = mock_trino
+
+            df = pd.DataFrame({'col1': [1, 2, 3]})
+
+            with pytest.raises(TrinoError, match="DROP failed"):
+                writer._write_to_iceberg(df, 'bronze', 'test_table', None)
+
+    def test_clean_hdfs_deletes_orphaned_dirs_with_uuid(self):
+        """_clean_hdfs_table_dir deletes dirs matching table name and table-{uuid} pattern."""
+        with patch.dict('sys.modules', {'trino': MagicMock(), 'trino.dbapi': MagicMock()}):
+            from scrapers.base.iceberg_writer import IcebergWriter
+            writer = IcebergWriter()
+
+            mock_hdfs = MagicMock()
+            mock_hdfs.exists.return_value = True
+            mock_hdfs.list_dir.return_value = [
+                {'name': 'fbref_player_stats', 'type': 'DIRECTORY'},
+                {'name': 'fbref_player_stats-abc123', 'type': 'DIRECTORY'},
+                {'name': 'fbref_player_stats-def456', 'type': 'DIRECTORY'},
+                {'name': 'fbref_schedule', 'type': 'DIRECTORY'},
+            ]
+
+            with patch('scrapers.base.hdfs_client.HDFSClient', return_value=mock_hdfs):
+                writer._clean_hdfs_table_dir('bronze', 'fbref_player_stats')
+
+                assert mock_hdfs.delete.call_count == 3
+                deleted_paths = [c[0][0] for c in mock_hdfs.delete.call_args_list]
+                assert '/user/hive/warehouse/bronze.db/fbref_player_stats' in deleted_paths
+                assert '/user/hive/warehouse/bronze.db/fbref_player_stats-abc123' in deleted_paths
+                assert '/user/hive/warehouse/bronze.db/fbref_player_stats-def456' in deleted_paths
+
+    def test_clean_hdfs_skips_nonexistent_schema_dir(self):
+        """_clean_hdfs_table_dir does nothing if schema dir doesn't exist."""
+        with patch.dict('sys.modules', {'trino': MagicMock(), 'trino.dbapi': MagicMock()}):
+            from scrapers.base.iceberg_writer import IcebergWriter
+            writer = IcebergWriter()
+
+            mock_hdfs = MagicMock()
+            mock_hdfs.exists.return_value = False
+
+            with patch('scrapers.base.hdfs_client.HDFSClient', return_value=mock_hdfs):
+                writer._clean_hdfs_table_dir('bronze', 'fbref_player_stats')
+
+                mock_hdfs.delete.assert_not_called()
+                mock_hdfs.list_dir.assert_not_called()
+
+    def test_clean_hdfs_failure_does_not_raise(self):
+        """_clean_hdfs_table_dir logs warning but does not raise on HDFS errors."""
+        with patch.dict('sys.modules', {'trino': MagicMock(), 'trino.dbapi': MagicMock()}):
+            from scrapers.base.iceberg_writer import IcebergWriter
+            writer = IcebergWriter()
+
+            with patch('scrapers.base.hdfs_client.HDFSClient', side_effect=ConnectionError("HDFS down")):
+                # Should not raise — best-effort cleanup
+                writer._clean_hdfs_table_dir('bronze', 'fbref_player_stats')
 
 
 class TestIcebergWriterReadOperations:

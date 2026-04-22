@@ -832,8 +832,26 @@ class NodriverFBrefScraper(BaseScraper):
 
         if all_data:
             combined_df = pd.concat(all_data, ignore_index=True)
+
+            # JSON fallback for match_all_data (Trino-independent)
+            for league in self.leagues:
+                for season in self.seasons:
+                    league_df = combined_df[
+                        (combined_df['league'] == league)
+                        & (combined_df['season'] == season)
+                    ]
+                    if not league_df.empty:
+                        safe_league = league.replace(' ', '_').replace('-', '_')
+                        path = f'/tmp/fbref_schedule_{safe_league}_{season}.json'
+                        league_df.to_json(path, orient='records', date_format='iso')
+                        logger.info(
+                            f"Schedule JSON fallback: {path} ({len(league_df)} rows)"
+                        )
+
             table_path = self.save_to_iceberg(
-                combined_df, 'fbref_schedule', partition_cols=['league', 'season']
+                combined_df, 'fbref_schedule',
+                partition_cols=['league', 'season'],
+                replace_partitions=['league', 'season'],
             )
             result['schedule'] = table_path
 

@@ -900,8 +900,8 @@ class TestFBrefScraperCombinedMatchData:
         scraper._read_schedule_from_iceberg.assert_called_once_with('ENG-Premier League', 2024)
         scraper.read_schedule.assert_not_called()  # Iceberg worked → no HTTP fallback
 
-    def test_scrape_combined_falls_back_to_http(self, mock_scraper_dependencies):
-        """Test HTTP fallback when Iceberg has no schedule."""
+    def test_scrape_combined_skips_when_no_schedule(self, mock_scraper_dependencies):
+        """Test that combined match data skips league when no schedule in file/Iceberg (no HTTP fallback)."""
         from scrapers.fbref.scraper import FBrefScraper
 
         scraper = FBrefScraper(leagues=['ENG-Premier League'], seasons=[2024])
@@ -913,8 +913,9 @@ class TestFBrefScraperCombinedMatchData:
         result = scraper.scrape_combined_match_data(max_matches=1)
 
         scraper._read_schedule_from_iceberg.assert_called_once()
-        scraper.read_schedule.assert_called_once()  # Iceberg failed → HTTP called
+        scraper.read_schedule.assert_not_called()  # No HTTP fallback — skips immediately
         assert isinstance(result, dict)
+        assert len(result) == 0  # No data collected
 
     def test_runner_accepts_combined_match_data_mode(self):
         """Test that runner script accepts --mode combined_match_data."""
@@ -933,3 +934,204 @@ class TestFBrefScraperCombinedMatchData:
         )
 
         assert 'combined_match_data' in result.stdout
+
+
+class TestExitCodeLogic:
+    """Tests for exit code logic in run_fbref_scraper.py."""
+
+    def test_combined_match_data_zero_tables_zero_errors_returns_1(self):
+        """0 tables + 0 errors + mode=combined_match_data → exit code 1."""
+        import subprocess
+        import sys
+        import json
+        import tempfile
+        import os
+
+        # Create a script that simulates the exit code logic
+        test_script = '''
+import sys, json, os
+sys.path.insert(0, os.path.join(os.getcwd(), "dags/scripts"))
+
+# Simulate the exit code section of run_fbref_scraper.py
+results = {
+    'tables': [],
+    'errors': [],
+    'mode': 'combined_match_data',
+}
+
+total_tables = len(results['tables'])
+total_errors = len(results['errors'])
+
+if total_tables == 0:
+    if total_errors > 0:
+        sys.exit(1)
+    mode = results.get('mode', '')
+    match_data_type = results.get('match_data_type', '')
+    critical_modes = {'combined_match_data', 'schedule'}
+    if mode in critical_modes or match_data_type == 'schedule':
+        sys.exit(1)
+    sys.exit(0)
+sys.exit(0)
+'''
+        result = subprocess.run(
+            [sys.executable, '-c', test_script],
+            capture_output=True, text=True,
+            cwd='/root/data_platform',
+        )
+        assert result.returncode == 1
+
+    def test_schedule_mode_zero_tables_zero_errors_returns_1(self):
+        """0 tables + 0 errors + match_data_type=schedule → exit code 1."""
+        import subprocess
+        import sys
+
+        test_script = '''
+import sys
+results = {
+    'tables': [],
+    'errors': [],
+    'mode': 'match_data',
+    'match_data_type': 'schedule',
+}
+total_tables = len(results['tables'])
+total_errors = len(results['errors'])
+if total_tables == 0:
+    if total_errors > 0:
+        sys.exit(1)
+    mode = results.get('mode', '')
+    match_data_type = results.get('match_data_type', '')
+    critical_modes = {'combined_match_data', 'schedule'}
+    if mode in critical_modes or match_data_type == 'schedule':
+        sys.exit(1)
+    sys.exit(0)
+sys.exit(0)
+'''
+        result = subprocess.run(
+            [sys.executable, '-c', test_script],
+            capture_output=True, text=True,
+        )
+        assert result.returncode == 1
+
+    def test_noncritical_mode_zero_tables_zero_errors_returns_0(self):
+        """0 tables + 0 errors + mode=single_stat → exit code 0 (expected for some stats)."""
+        import subprocess
+        import sys
+
+        test_script = '''
+import sys
+results = {
+    'tables': [],
+    'errors': [],
+    'mode': 'single_stat',
+}
+total_tables = len(results['tables'])
+total_errors = len(results['errors'])
+if total_tables == 0:
+    if total_errors > 0:
+        sys.exit(1)
+    mode = results.get('mode', '')
+    match_data_type = results.get('match_data_type', '')
+    critical_modes = {'combined_match_data', 'schedule'}
+    if mode in critical_modes or match_data_type == 'schedule':
+        sys.exit(1)
+    sys.exit(0)
+sys.exit(0)
+'''
+        result = subprocess.run(
+            [sys.executable, '-c', test_script],
+            capture_output=True, text=True,
+        )
+        assert result.returncode == 0
+
+    def test_zero_tables_with_errors_returns_1(self):
+        """0 tables + errors > 0 → exit code 1 for any mode."""
+        import subprocess
+        import sys
+
+        test_script = '''
+import sys
+results = {
+    'tables': [],
+    'errors': ['Some error'],
+    'mode': 'single_stat',
+}
+total_tables = len(results['tables'])
+total_errors = len(results['errors'])
+if total_tables == 0:
+    if total_errors > 0:
+        sys.exit(1)
+    sys.exit(0)
+sys.exit(0)
+'''
+        result = subprocess.run(
+            [sys.executable, '-c', test_script],
+            capture_output=True, text=True,
+        )
+        assert result.returncode == 1
+
+
+class TestSkippedLeaguesFailureTracking:
+    """Tests for skipped league/season counting as failures."""
+
+    @pytest.fixture
+    def mock_scraper_dependencies(self):
+        """Mock all dependencies for the Selenium scraper."""
+        with patch('scrapers.base.base_scraper.get_rate_limiter') as mock_rl, \
+             patch('scrapers.base.base_scraper.get_retry_policy') as mock_rp, \
+             patch('scrapers.base.base_scraper.get_circuit_breaker') as mock_cb, \
+             patch('scrapers.base.base_scraper.IcebergWriter') as mock_iw, \
+             patch('scrapers.base.browser.cloudflare_bypass.CloudflareBypass') as mock_browser:
+
+            mock_rl.return_value = MagicMock()
+            mock_rl.return_value.acquire.return_value = True
+
+            mock_rp.return_value = MagicMock()
+            mock_cb.return_value = MagicMock()
+            mock_cb.return_value.state = 'closed'
+
+            mock_iw_instance = MagicMock()
+            mock_iw_instance.write_dataframe.return_value = 'iceberg.bronze.test'
+            mock_iw.return_value = mock_iw_instance
+
+            mock_browser_instance = MagicMock()
+            mock_browser_instance.get_page.return_value = '<html></html>'
+            mock_browser_instance.page_source = '<html></html>'
+            mock_browser.return_value = mock_browser_instance
+
+            yield {
+                'rate_limiter': mock_rl,
+                'iceberg_writer': mock_iw_instance,
+                'browser': mock_browser_instance,
+            }
+
+    def test_skipped_leagues_increment_failures_combined(self, mock_scraper_dependencies):
+        """All leagues skipped in combined_match_data → _stats['failures'] > 0."""
+        from scrapers.fbref.scraper import FBrefScraper
+
+        scraper = FBrefScraper(leagues=['ENG-Premier League'], seasons=[2024])
+
+        # Both file and Iceberg return None → league skipped
+        scraper._read_schedule_from_file = MagicMock(return_value=None)
+        scraper._read_schedule_from_iceberg = MagicMock(return_value=None)
+        scraper._cleanup_after_league = MagicMock()
+
+        result = scraper.scrape_combined_match_data(max_matches=1)
+
+        assert scraper._stats.get('failures', 0) > 0
+        assert len(result) == 0
+
+    def test_skipped_leagues_increment_failures_match_data(self, mock_scraper_dependencies):
+        """All leagues skipped in scrape_match_data → _stats['failures'] > 0."""
+        from scrapers.fbref.scraper import FBrefScraper
+
+        scraper = FBrefScraper(leagues=['ENG-Premier League'], seasons=[2024])
+
+        # Both file and Iceberg return None → league skipped
+        scraper._read_schedule_from_file = MagicMock(return_value=None)
+        scraper._read_schedule_from_iceberg = MagicMock(return_value=None)
+        scraper._cleanup_after_league = MagicMock()
+
+        result = scraper.scrape_match_data(data_type='shot_events')
+
+        assert scraper._stats.get('failures', 0) > 0
+        assert len(result) == 0

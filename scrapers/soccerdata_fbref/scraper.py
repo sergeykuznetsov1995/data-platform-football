@@ -1125,10 +1125,12 @@ class SoccerdataFBrefScraper(SoccerdataScraper):
                 if 'season' not in df.columns and len(self.seasons) == 1:
                     df['season'] = self.seasons[0]
 
+                _has_partitions = 'league' in df.columns and 'season' in df.columns
                 table_path = self.save_to_iceberg(
                     df=df,
                     table_name='fbref_schedule',
-                    partition_cols=['league', 'season'] if 'league' in df.columns and 'season' in df.columns else None,
+                    partition_cols=['league', 'season'] if _has_partitions else None,
+                    replace_partitions=['league', 'season'] if _has_partitions else None,
                 )
                 results['schedule'] = table_path
                 logger.info(f"Saved {len(df)} schedule rows via soccerdata")
@@ -1177,10 +1179,15 @@ class SoccerdataFBrefScraper(SoccerdataScraper):
             # Schedule
             schedule_df = self.read_schedule()
             if schedule_df is not None and not schedule_df.empty:
+                _sched_has_partitions = (
+                    'league' in schedule_df.columns
+                    and 'season' in schedule_df.columns
+                )
                 table_path = self.save_to_iceberg(
                     df=schedule_df,
                     table_name='fbref_schedule',
-                    partition_cols=['league', 'season'] if 'league' in schedule_df.columns else None,
+                    partition_cols=['league', 'season'] if _sched_has_partitions else None,
+                    replace_partitions=['league', 'season'] if _sched_has_partitions else None,
                 )
                 results['schedule'] = table_path
 

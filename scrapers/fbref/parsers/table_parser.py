@@ -83,6 +83,16 @@ MULTIINDEX_PREFIXES = [
     'Away_',
     'Opponent_',
     'vs_',
+    # Playing Time subcategories
+    'Starts_',
+    'Subs_',
+    'Team Success_',
+    'Team Success (xG)_',
+    # Passing Types subcategories
+    'Corner Kicks_',
+    'Outcomes_',
+    'Height_',
+    'Body Parts_',
 ]
 
 
@@ -166,6 +176,15 @@ def normalize_column_names(df: pd.DataFrame) -> pd.DataFrame:
     if rename_map:
         df = df.rename(columns=rename_map)
         logger.debug(f"Normalized {len(rename_map)} column names: {list(rename_map.items())[:5]}...")
+
+    # Diagnostic: log columns that may still have unstripped prefixes
+    remaining_prefixed = [
+        c for c in df.columns
+        if '_' in str(c) and not str(c).startswith('_')
+        and str(c).lower() not in ('player_id', 'team_id', 'stat_type')
+    ]
+    if remaining_prefixed:
+        logger.info(f"Columns with potential unstripped prefixes: {remaining_prefixed[:10]}")
 
     return df
 

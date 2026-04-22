@@ -87,9 +87,18 @@ class FBrefScraper(
     DEFAULT_RATE_LIMIT = DEFAULT_RATE_LIMIT
 
     # Memory management constants
-    MAX_PAGES_BEFORE_BROWSER_RESTART = 30  # Restart browser to prevent memory/FD leaks
-    MAX_CACHE_SIZE = 30  # Maximum pages to keep in cache
-    MAX_SLOW_PROXY_RETRIES = 3  # Retry with new proxy on SlowProxyError
+    # 100→40→150→200: network blocking (nodriver_bypass.BLOCKED_URL_PATTERNS) reduces Chrome
+    # memory usage by blocking images/CSS/fonts, allowing less frequent restarts.
+    # Fewer restarts = fewer Cloudflare bypasses = less proxy traffic (each CF = ~1-2 MB).
+    # 200 is safe with 12G scheduler memory + aggressive cache trim (MAX_CACHE_SIZE=5).
+    MAX_PAGES_BEFORE_BROWSER_RESTART = 200
+    # 30→5: page cache barely helps with unique match URLs — aggressive trim saves ~25 MB
+    MAX_CACHE_SIZE = 5
+    # 1→5: with aggressive timeout-ban (proxy_manager.timeout_ban_threshold=1),
+    # dead proxies are removed from rotation after 1 timeout, so retrying picks
+    # fresh ones. 5 attempts cycle through enough alive proxies to salvage the
+    # match even when ~50% of the pool is unhealthy.
+    MAX_SLOW_PROXY_RETRIES = 5
 
     # Re-export constants for backwards compatibility
     BASE_URL = BASE_URL
@@ -138,16 +147,26 @@ class FBrefScraper(
         self._pages_fetched: int = 0  # Counter for browser restart
         self._nodriver_browser = None  # Separate instance for nodriver
 
+        # Real traffic accumulator base — preserves bytes across browser
+        # restarts (each new nodriver browser resets its counter to 0).
+        # Flushed in _close_browser() before browser goes away.
+        self._real_traffic_base_bytes: int = 0
+        self._real_traffic_base_requests: int = 0
+
         # Consecutive fetch failure tracking for automatic proxy rotation
+        # 3→15: higher MAX_SLOW_PROXY_RETRIES already handles dead proxies per URL;
+        # this counter is a last-resort systemic guard, don't let it restart the
+        # browser on a transient series of dead proxies.
         self._consecutive_fetch_failures: int = 0
-        self.MAX_CONSECUTIVE_FAILURES = 3
+        self.MAX_CONSECUTIVE_FAILURES = 15
+        self._current_proxy_obj = None  # Track current proxy for result recording
 
         # HTTP session state (for match pages after initial CF bypass)
         self._http_session = None
         self._http_cookies_time: Optional[float] = None
         self._http_request_count: int = 0
         self.HTTP_COOKIE_TTL_MINUTES = 25  # CF cookies live ~30 min, refresh at 25
-        self.HTTP_MAX_REQUESTS = 50  # Re-extract cookies every N requests
+        self.HTTP_MAX_REQUESTS = 150  # Re-extract cookies every N requests
 
     # ------------------------------------------------------------------
     # URL helper delegates (backwards compatibility)
@@ -454,6 +473,7 @@ class FBrefScraper(
                 df=combined_df,
                 table_name='fbref_schedule',
                 partition_cols=['league', 'season'],
+                replace_partitions=['league', 'season'],
             )
             results['schedule'] = table_path
 
@@ -546,6 +566,16 @@ class FBrefScraper(
                 partition_cols=['league', 'season'],
             )
             results['team_match_stats'] = table_path
+
+        stats = self.get_stats()
+        bytes_total = stats.get('bytes_downloaded', 0)
+        pages_total = stats.get('pages_downloaded', 0)
+        logger.info(
+            f"FBref traffic summary: {pages_total} pages, "
+            f"{bytes_total/1024/1024:.1f} MB downloaded"
+        )
+        for ptype, pbytes in stats.get('bytes_by_page_type', {}).items():
+            logger.info(f"  {ptype}: {pbytes/1024/1024:.1f} MB")
 
         logger.info(f"FBref scrape complete: {list(results.keys())}")
         return results

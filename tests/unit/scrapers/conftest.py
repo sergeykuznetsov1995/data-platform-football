@@ -2,6 +2,7 @@
 Pytest fixtures for scraper tests.
 """
 
+import os
 import sys
 from pathlib import Path
 
@@ -14,6 +15,12 @@ import pandas as pd
 import pytest
 from datetime import date, datetime
 from unittest.mock import MagicMock, patch
+
+
+@pytest.fixture(autouse=True)
+def set_trino_password(monkeypatch):
+    """Set TRINO_PASSWORD for all tests that create TrinoTableManager."""
+    monkeypatch.setenv('TRINO_PASSWORD', 'test_password')
 
 
 @pytest.fixture

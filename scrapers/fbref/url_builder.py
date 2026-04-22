@@ -84,9 +84,13 @@ def get_stats_url(
     url_stat_type_mapping = {
         'keeper': 'keepers',           # FBref uses plural 'keepers'
         'keeper_adv': 'keepersadv',    # FBref uses 'keepersadv'
-        'playingtime': 'playing_time', # FBref uses 'playing_time' with underscore
+        'playingtime': 'playingtime',  # FBref uses 'playingtime' (no underscore) for player URL
     }
     url_stat_type = url_stat_type_mapping.get(stat_type, stat_type)
+
+    # For playingtime squad stats, FBref uses 'playing_time' with underscore
+    if stat_type == 'playingtime' and for_squads:
+        url_stat_type = 'playing_time'
 
     # Both squad and player stats use the same URL structure
     return (

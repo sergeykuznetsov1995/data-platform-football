@@ -63,10 +63,12 @@ TEAM_STAT_TYPES = [
 
 # Match data types
 MATCH_DATA_TYPES = [
-    'schedule',        # Match schedule
-    'shot_events',     # Shot-level events
-    'match_events',    # Match events (goals, cards, subs)
-    'lineups',         # Match lineups
+    'schedule',            # Match schedule
+    'shot_events',         # Shot-level events
+    'match_events',        # Match events (goals, cards, subs)
+    'lineups',             # Match lineups
+    'match_team_stats',    # Per-match team stats (team_stats + team_stats_extra)
+    'match_player_stats',  # Per-match player stats (summary/passing/defense/...)
 ]
 
 # Default rate limit (requests per minute)

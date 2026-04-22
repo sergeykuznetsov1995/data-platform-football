@@ -408,6 +408,17 @@ class FBrefDataMergerMixin:
                     mid = str(url).split('/matches/')[-1].split('/')[0]
                     match_ids.append(mid)
 
+        # Deduplicate match IDs preserving order
+        seen = set()
+        unique_ids = []
+        for mid in match_ids:
+            if mid not in seen:
+                seen.add(mid)
+                unique_ids.append(mid)
+        if len(unique_ids) < len(match_ids):
+            logger.info(f"Deduplicated match IDs: {len(match_ids)} -> {len(unique_ids)} unique")
+        match_ids = unique_ids
+
         if max_matches is not None:
             match_ids = match_ids[:max_matches]
 
