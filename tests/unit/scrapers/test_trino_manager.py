@@ -13,12 +13,13 @@ class TestTrinoTableManagerInit:
     def test_init_default_values(self):
         """Test default initialization values."""
         with patch.dict('sys.modules', {'trino': MagicMock(), 'trino.dbapi': MagicMock()}):
-            from scrapers.base.trino_manager import TrinoTableManager
-            manager = TrinoTableManager()
-            assert manager.host == 'trino'
-            assert manager.port == 8080
-            assert manager.user == 'airflow'
-            assert manager.catalog == 'iceberg'
+            with patch.dict('os.environ', {}, clear=False):
+                from scrapers.base.trino_manager import TrinoTableManager
+                manager = TrinoTableManager()
+                assert manager.host == 'trino'
+                assert manager.port == 8443
+                assert manager.user == 'airflow'
+                assert manager.catalog == 'iceberg'
 
     def test_init_custom_values(self):
         """Test custom initialization values."""
@@ -331,7 +332,8 @@ class TestTrinoTableManagerInsertDataFrame:
             result = manager.insert_dataframe('bronze', 'test_table', df)
 
             assert result == 2
-            mock_cursor.execute.assert_called_once()
+            # 1 DESCRIBE (get_table_columns) + 1 INSERT = 2 calls
+            assert mock_cursor.execute.call_count == 2
             call_sql = mock_cursor.execute.call_args[0][0]
             assert 'INSERT INTO iceberg.bronze.test_table' in call_sql
             assert 'Arsenal' in call_sql
@@ -422,8 +424,8 @@ class TestTrinoTableManagerInsertDataFrame:
             result = manager.insert_dataframe('bronze', 'test_table', df, batch_size=2)
 
             assert result == 5
-            # Should have 3 batches: [A,B], [C,D], [E]
-            assert mock_cursor.execute.call_count == 3
+            # 1 DESCRIBE (get_table_columns) + 3 INSERT batches: [A,B], [C,D], [E] = 4 calls
+            assert mock_cursor.execute.call_count == 4
 
 
 class TestTrinoTableManagerDropTable:
@@ -618,3 +620,160 @@ class TestTrinoError:
             from scrapers.base.trino_manager import TrinoError
             error = TrinoError("Test error message")
             assert str(error) == "Test error message"
+
+
+class TestIsIcebergInvalidMetadata:
+    """Tests for _is_iceberg_invalid_metadata helper."""
+
+    def test_detects_iceberg_invalid_metadata(self):
+        """TrinoError with TrinoExternalError(ICEBERG_INVALID_METADATA) cause → True."""
+        with patch.dict('sys.modules', {'trino': MagicMock(), 'trino.dbapi': MagicMock()}):
+            from scrapers.base.trino_manager import TrinoError, _is_iceberg_invalid_metadata
+
+            # Simulate TrinoExternalError with error_name attribute
+            cause = Exception("Error accessing metadata file")
+            cause.error_name = 'ICEBERG_INVALID_METADATA'
+
+            error = TrinoError("SQL execution failed")
+            error.__cause__ = cause
+
+            assert _is_iceberg_invalid_metadata(error) is True
+
+    def test_detects_iceberg_missing_metadata(self):
+        """TrinoError with TrinoExternalError(ICEBERG_MISSING_METADATA) cause → True."""
+        with patch.dict('sys.modules', {'trino': MagicMock(), 'trino.dbapi': MagicMock()}):
+            from scrapers.base.trino_manager import TrinoError, _is_iceberg_invalid_metadata
+
+            cause = Exception("Metadata not found in metadata location")
+            cause.error_name = 'ICEBERG_MISSING_METADATA'
+
+            error = TrinoError("SQL execution failed")
+            error.__cause__ = cause
+
+            assert _is_iceberg_invalid_metadata(error) is True
+
+    def test_returns_false_for_other_errors(self):
+        """TrinoError with different error_name → False."""
+        with patch.dict('sys.modules', {'trino': MagicMock(), 'trino.dbapi': MagicMock()}):
+            from scrapers.base.trino_manager import TrinoError, _is_iceberg_invalid_metadata
+
+            cause = Exception("Some other error")
+            cause.error_name = 'GENERIC_INTERNAL_ERROR'
+
+            error = TrinoError("SQL execution failed")
+            error.__cause__ = cause
+
+            assert _is_iceberg_invalid_metadata(error) is False
+
+    def test_returns_false_for_plain_exception(self):
+        """Plain ValueError without error_name → False."""
+        with patch.dict('sys.modules', {'trino': MagicMock(), 'trino.dbapi': MagicMock()}):
+            from scrapers.base.trino_manager import _is_iceberg_invalid_metadata
+
+            error = ValueError("something went wrong")
+            assert _is_iceberg_invalid_metadata(error) is False
+
+
+class TestTrinoTableManagerConnectionRetry:
+    """Tests for connection retry logic."""
+
+    def test_connect_with_retry_success_first_attempt(self):
+        """Test successful connection on first attempt."""
+        with patch.dict('sys.modules', {'trino': MagicMock(), 'trino.dbapi': MagicMock()}):
+            from scrapers.base.trino_manager import TrinoTableManager
+
+            manager = TrinoTableManager()
+
+            mock_conn = MagicMock()
+            mock_cursor = MagicMock()
+            mock_cursor.fetchall.return_value = [(1,)]
+            mock_conn.cursor.return_value = mock_cursor
+
+            with patch.object(manager, '_create_connection', return_value=mock_conn):
+                manager._connect_with_retry()
+
+            assert manager._conn is mock_conn
+            mock_cursor.execute.assert_called_once_with('SELECT 1')
+
+    def test_connect_with_retry_fails_then_succeeds(self):
+        """Test connection fails first attempt, succeeds on second."""
+        with patch.dict('sys.modules', {'trino': MagicMock(), 'trino.dbapi': MagicMock()}):
+            from scrapers.base.trino_manager import TrinoTableManager
+
+            manager = TrinoTableManager()
+            manager._CONNECT_BACKOFF = (0, 0, 0)
+
+            mock_conn_good = MagicMock()
+            mock_cursor_good = MagicMock()
+            mock_cursor_good.fetchall.return_value = [(1,)]
+            mock_conn_good.cursor.return_value = mock_cursor_good
+
+            with patch.object(
+                manager, '_create_connection',
+                side_effect=[Exception("Connection refused"), mock_conn_good]
+            ):
+                manager._connect_with_retry()
+
+            assert manager._conn is mock_conn_good
+
+    def test_connect_with_retry_all_attempts_fail(self):
+        """Test all connection attempts fail → TrinoError raised."""
+        with patch.dict('sys.modules', {'trino': MagicMock(), 'trino.dbapi': MagicMock()}):
+            from scrapers.base.trino_manager import TrinoTableManager, TrinoError
+
+            manager = TrinoTableManager()
+            manager._CONNECT_BACKOFF = (0, 0, 0)
+
+            with patch.object(
+                manager, '_create_connection',
+                side_effect=Exception("Connection refused")
+            ):
+                with pytest.raises(TrinoError, match="Failed to connect to Trino after"):
+                    manager._connect_with_retry()
+
+    def test_reset_connection(self):
+        """Test _reset_connection closes and clears connection."""
+        with patch.dict('sys.modules', {'trino': MagicMock(), 'trino.dbapi': MagicMock()}):
+            from scrapers.base.trino_manager import TrinoTableManager
+            manager = TrinoTableManager()
+            mock_conn = MagicMock()
+            manager._conn = mock_conn
+
+            manager._reset_connection()
+
+            mock_conn.close.assert_called_once()
+            assert manager._conn is None
+
+    def test_execute_retries_on_connection_error(self):
+        """Test _execute resets connection and retries on Connection refused."""
+        with patch.dict('sys.modules', {'trino': MagicMock(), 'trino.dbapi': MagicMock()}):
+            from scrapers.base.trino_manager import TrinoTableManager
+
+            manager = TrinoTableManager()
+
+            # First call: raise Connection refused
+            mock_cursor_bad = MagicMock()
+            mock_cursor_bad.execute.side_effect = Exception("Connection refused")
+
+            # Second call: succeed
+            mock_cursor_good = MagicMock()
+            mock_cursor_good.fetchall.return_value = [(1,)]
+
+            mock_conn1 = MagicMock()
+            mock_conn1.cursor.return_value = mock_cursor_bad
+
+            mock_conn2 = MagicMock()
+            mock_conn2.cursor.return_value = mock_cursor_good
+
+            manager._conn = mock_conn1
+
+            # After reset, _connect_with_retry should set new conn
+            with patch.object(manager, '_connect_with_retry') as mock_retry:
+                def set_good_conn():
+                    manager._conn = mock_conn2
+                mock_retry.side_effect = set_good_conn
+
+                result = manager._execute('SELECT 1', fetch=True)
+
+                assert result == [(1,)]
+                mock_retry.assert_called_once()

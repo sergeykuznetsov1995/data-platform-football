@@ -43,7 +43,13 @@
     <!-- Permissions -->
     <property>
         <name>dfs.permissions.enabled</name>
-        <value>false</value>
+        <value>true</value>
+    </property>
+
+    <!-- Default umask: owner rwx, group r-x, others none -->
+    <property>
+        <name>fs.permissions.umask-mode</name>
+        <value>027</value>
     </property>
 
     <!-- Safe mode exit threshold -->

@@ -7,6 +7,7 @@ Chrome doesn't support proxy authentication via command line,
 so we create temporary extensions that handle auth.
 """
 
+import json
 import os
 import tempfile
 import zipfile
@@ -56,25 +57,30 @@ def create_proxy_auth_extension(
 """
 
     background_js = """
-var config = {
+var proxyConfig = {
     mode: "fixed_servers",
     rules: {
         singleProxy: {
             scheme: "http",
-            host: "%s",
-            port: parseInt(%s)
+            host: """ + json.dumps(str(proxy_host)) + """,
+            port: parseInt(""" + json.dumps(str(proxy_port)) + """)
         },
         bypassList: ["localhost"]
     }
 };
 
-chrome.proxy.settings.set({value: config, scope: "regular"}, function() {});
+var proxyAuth = {
+    username: """ + json.dumps(str(proxy_user)) + """,
+    password: """ + json.dumps(str(proxy_pass)) + """
+};
+
+chrome.proxy.settings.set({value: proxyConfig, scope: "regular"}, function() {});
 
 function callbackFn(details) {
     return {
         authCredentials: {
-            username: "%s",
-            password: "%s"
+            username: proxyAuth.username,
+            password: proxyAuth.password
         }
     };
 }
@@ -84,24 +90,39 @@ chrome.webRequest.onAuthRequired.addListener(
     {urls: ["<all_urls>"]},
     ['blocking']
 );
-""" % (proxy_host, proxy_port, proxy_user, proxy_pass)
 
-    # Create temp directory for extension
+function updateProxy(host, port, username, password) {
+    proxyAuth.username = username;
+    proxyAuth.password = password;
+    proxyConfig.rules.singleProxy.host = host;
+    proxyConfig.rules.singleProxy.port = parseInt(port);
+    chrome.proxy.settings.set({value: proxyConfig, scope: "regular"}, function() {});
+    return "ok";
+}
+"""
+
+    # Create temp directory for extension with restricted permissions
     extension_dir = tempfile.mkdtemp(prefix='chrome_proxy_')
+    os.chmod(extension_dir, 0o700)
 
-    # Write manifest.json
-    with open(os.path.join(extension_dir, 'manifest.json'), 'w') as f:
+    # Write manifest.json with restricted permissions
+    manifest_path = os.path.join(extension_dir, 'manifest.json')
+    with open(manifest_path, 'w') as f:
         f.write(manifest_json)
+    os.chmod(manifest_path, 0o600)
 
-    # Write background.js
-    with open(os.path.join(extension_dir, 'background.js'), 'w') as f:
+    # Write background.js with restricted permissions (contains credentials)
+    bg_path = os.path.join(extension_dir, 'background.js')
+    with open(bg_path, 'w') as f:
         f.write(background_js)
+    os.chmod(bg_path, 0o600)
 
     # Create zip file
     zip_path = os.path.join(extension_dir, 'proxy_auth.zip')
     with zipfile.ZipFile(zip_path, 'w') as zf:
-        zf.write(os.path.join(extension_dir, 'manifest.json'), 'manifest.json')
-        zf.write(os.path.join(extension_dir, 'background.js'), 'background.js')
+        zf.write(manifest_path, 'manifest.json')
+        zf.write(bg_path, 'background.js')
+    os.chmod(zip_path, 0o600)
 
     return zip_path
 

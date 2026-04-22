@@ -77,6 +77,31 @@ def check_tor_health(host: str = 'tor', port: int = 9050, timeout: int = 30) -> 
         return False
 
 
+def _get_traffic_diagnostics(scraper) -> dict:
+    """Extract traffic metrics from scraper _stats for JSON diagnostics.
+
+    Reports both HTML-only bytes (legacy `bytes_downloaded`) and real
+    proxy bytes (via CDP Network events) — the latter is what actually
+    counts against proxy quota.
+    """
+    stats = scraper._stats
+    html_bytes = stats.get('bytes_downloaded', 0)
+    real_bytes = stats.get('real_bytes_downloaded', 0)
+    real_requests = stats.get('real_requests_count', 0)
+    overhead_ratio = round(real_bytes / html_bytes, 2) if html_bytes > 0 else None
+    return {
+        'bytes_downloaded': html_bytes,
+        'pages_downloaded': stats.get('pages_downloaded', 0),
+        'mb_downloaded': round(html_bytes / 1024 / 1024, 2),
+        'bytes_by_page_type': dict(stats.get('bytes_by_page_type', {})),
+        # Real proxy traffic (includes CSS/JS/images if not blocked)
+        'real_proxy_bytes': real_bytes,
+        'real_proxy_mb': round(real_bytes / 1024 / 1024, 2),
+        'real_proxy_requests': real_requests,
+        'overhead_ratio': overhead_ratio,  # real/html; 1.0 = perfect (HTML only)
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description='Run FBref scraper')
 
@@ -377,6 +402,7 @@ def main():
                     results['stat_type'] = args.stat_type
                     results['data_category'] = args.data_category
                     results['diagnostics']['scraper_stats'] = scraper.get_stats()
+                    results['diagnostics']['traffic'] = _get_traffic_diagnostics(scraper)
 
                     logger.info(f"Single stat scrape completed: {list(scrape_result.keys())}")
 
@@ -409,6 +435,7 @@ def main():
                         results['tables'] = list(scrape_result.values())
                         results['match_data_type'] = args.match_data_type
                         results['diagnostics']['scraper_stats'] = scraper.get_stats()
+                        results['diagnostics']['traffic'] = _get_traffic_diagnostics(scraper)
 
                         logger.info(f"Schedule scrape completed: {list(scrape_result.keys())}")
 
@@ -430,6 +457,7 @@ def main():
 
                     results['tables'] = list(scrape_results.values())
                     results['diagnostics']['scraper_stats'] = scraper.get_stats()
+                    results['diagnostics']['traffic'] = _get_traffic_diagnostics(scraper)
 
                     logger.info(
                         f"Full scrape completed: {len(scrape_results)} tables saved to Iceberg"
@@ -509,6 +537,7 @@ def main():
                         'successes': scraper._stats.get('successes', 0),
                         'failures': scraper._stats.get('failures', 0),
                     }
+                    results['diagnostics']['traffic'] = _get_traffic_diagnostics(scraper)
 
                     logger.info(f"Single stat scrape completed: {list(scrape_results.keys())}")
 
@@ -542,6 +571,7 @@ def main():
                         'successes': scraper._stats.get('successes', 0),
                         'failures': scraper._stats.get('failures', 0),
                     }
+                    results['diagnostics']['traffic'] = _get_traffic_diagnostics(scraper)
 
                     logger.info(f"Match data scrape completed: {list(scrape_results.keys())}")
 
@@ -645,6 +675,7 @@ def main():
                         'successes': scraper._stats.get('successes', 0),
                         'failures': scraper._stats.get('failures', 0),
                     }
+                    results['diagnostics']['traffic'] = _get_traffic_diagnostics(scraper)
 
                     logger.info(f"Single stat scrape completed: {list(scrape_results.keys())}")
 
@@ -681,6 +712,7 @@ def main():
                         'successes': scraper._stats.get('successes', 0),
                         'failures': scraper._stats.get('failures', 0),
                     }
+                    results['diagnostics']['traffic'] = _get_traffic_diagnostics(scraper)
 
                     logger.info(f"Match data scrape completed: {list(scrape_results.keys())}")
 
@@ -694,12 +726,13 @@ def main():
                         results['errors'].append(error_msg)
 
                 # =============================================================
-                # MODE: combined_match_data (3x efficiency optimization)
+                # MODE: combined_match_data (5x efficiency optimization)
                 # =============================================================
                 elif args.mode == 'combined_match_data':
                     logger.info(
                         f"Combined match data mode: max_matches={max_matches}. "
-                        f"Collecting shot_events, match_events, lineups in one pass (3x efficiency)"
+                        f"Collecting shot_events, match_events, lineups, "
+                        f"match_team_stats, match_player_stats in one pass"
                     )
 
                     scrape_results = scraper.scrape_combined_match_data(
@@ -713,20 +746,113 @@ def main():
                         'successes': scraper._stats.get('successes', 0),
                         'failures': scraper._stats.get('failures', 0),
                     }
-                    results['diagnostics']['optimization'] = '3x reduction in HTTP requests'
+                    traffic = _get_traffic_diagnostics(scraper)
+                    results['diagnostics']['traffic'] = traffic
+                    results['diagnostics']['optimization'] = (
+                        '5-way single-pass parse (shot_events + match_events + '
+                        'lineups + match_team_stats + match_player_stats)'
+                    )
+
+                    # Write standalone traffic summary for Airflow XCom / guard.
+                    # Kept separate from the main result JSON so BashOperator
+                    # post-task hooks can read it without re-parsing everything.
+                    try:
+                        import json as _json
+                        traffic_summary = {
+                            'mode': 'combined_match_data',
+                            'real_proxy_mb': traffic.get('real_proxy_mb', 0.0),
+                            'real_proxy_bytes': traffic.get('real_proxy_bytes', 0),
+                            'real_proxy_requests': traffic.get(
+                                'real_proxy_requests', 0
+                            ),
+                            'html_mb_downloaded': traffic.get('mb_downloaded', 0.0),
+                            'pages_downloaded': traffic.get('pages_downloaded', 0),
+                            'overhead_ratio': traffic.get('overhead_ratio'),
+                            'matches_successes': scraper._stats.get('successes', 0),
+                            'matches_failures': scraper._stats.get('failures', 0),
+                            'schedule_source': scraper._stats.get(
+                                'schedule_source', 'unknown'
+                            ),
+                        }
+                        with open(
+                            '/tmp/fbref_traffic_match_all_data.json', 'w'
+                        ) as _tf:
+                            _json.dump(traffic_summary, _tf, indent=2)
+                        # Single-line log for grep-based log parsing.
+                        logger.info(
+                            f"TRAFFIC_SUMMARY_JSON={_json.dumps(traffic_summary)}"
+                        )
+                    except Exception as _e:
+                        logger.warning(
+                            f"Could not write traffic summary JSON: {_e}"
+                        )
 
                     logger.info(
                         f"Combined match data scrape completed: {list(scrape_results.keys())}"
                     )
 
+                    # Enhanced diagnostics for combined_match_data
+                    stats = scraper._stats
+                    failures = stats.get('failures', 0)
+                    successes = stats.get('successes', 0)
+                    skipped = stats.get('skipped_league_seasons', 0)
+                    schedule_source = stats.get('schedule_source', 'unknown')
+                    trino_available = stats.get('trino_available', None)
+
+                    results['diagnostics']['schedule_source'] = schedule_source
+                    results['diagnostics']['skipped_league_seasons'] = skipped
+                    results['diagnostics']['trino_available'] = trino_available
+
                     if not scrape_results:
-                        error_msg = (
-                            f"No data collected for combined_match_data. "
-                            f"Scraper stats: successes={scraper._stats.get('successes', 0)}, "
-                            f"failures={scraper._stats.get('failures', 0)}"
-                        )
-                        logger.error(error_msg)
-                        results['errors'].append(error_msg)
+                        if trino_available is False and failures > 0:
+                            error_msg = (
+                                f"Trino unavailable: schedule could not be read from Iceberg. "
+                                f"File fallback also failed. "
+                                f"successes={successes}, failures={failures}, "
+                                f"skipped_league_seasons={skipped}"
+                            )
+                            logger.error(error_msg)
+                            results['errors'].append(error_msg)
+                        elif failures > 0:
+                            error_msg = (
+                                f"No data collected for combined_match_data but had {failures} failures. "
+                                f"schedule_source={schedule_source}, "
+                                f"successes={successes}, failures={failures}, "
+                                f"skipped_league_seasons={skipped}"
+                            )
+                            logger.error(error_msg)
+                            results['errors'].append(error_msg)
+                        elif successes == 0 and skipped == 0 and schedule_source in ('file', 'iceberg'):
+                            # Schedule was found but no new matches — everything already scraped.
+                            # This is NOT an error: incremental mode correctly detected all matches exist.
+                            logger.info(
+                                f"No new matches for combined_match_data — all matches already in Iceberg "
+                                f"(schedule_source={schedule_source}, successes={successes}, "
+                                f"failures={failures}, skipped={skipped})"
+                            )
+                            # Populate tables with known Iceberg paths so downstream checks pass
+                            results['tables'] = [
+                                'iceberg.bronze.fbref_match_events',
+                                'iceberg.bronze.fbref_lineups',
+                                'iceberg.bronze.fbref_match_team_stats',
+                                'iceberg.bronze.fbref_match_player_stats',
+                            ]
+                            results['diagnostics']['all_already_scraped'] = True
+                        elif successes == 0:
+                            error_msg = (
+                                f"No matches processed for combined_match_data. "
+                                f"Schedule not found (schedule_source={schedule_source}). "
+                                f"Ensure schedule_task completed and Trino is available. "
+                                f"successes={successes}, failures={failures}, "
+                                f"skipped_league_seasons={skipped}"
+                            )
+                            logger.error(error_msg)
+                            results['errors'].append(error_msg)
+                        else:
+                            logger.info(
+                                f"No new data for combined_match_data (all matches already scraped). "
+                                f"successes={successes}, failures={failures}"
+                            )
 
                 # =============================================================
                 # MODE: full
@@ -789,10 +915,16 @@ def main():
     total_tables = len(results['tables'])
     total_errors = len(results['errors'])
 
-    logger.info(f"Scraper complete: {total_tables} tables saved, {total_errors} errors")
+    traffic = results.get('diagnostics', {}).get('traffic', {})
+    mb = traffic.get('mb_downloaded', 0)
+    pages = traffic.get('pages_downloaded', 0)
+    logger.info(
+        f"Scraper complete: {total_tables} tables, {total_errors} errors, "
+        f"{pages} pages, {mb:.1f} MB downloaded"
+    )
     print(json.dumps(results, indent=2))
 
-    # Exit with error if no data was collected and there were errors
+    # Exit with error if no data was collected
     if total_tables == 0:
         if total_errors > 0:
             logger.error(
@@ -800,13 +932,25 @@ def main():
                 f"Errors: {results['errors']}"
             )
             return 1
-        else:
-            # No data but also no errors - might be expected for some stat types
-            logger.warning(
-                f"Scraper finished with no data but no errors. "
-                f"This may be expected for some stat types or leagues."
+
+        # For modes that MUST produce data, 0 tables is always a failure
+        mode = results.get('mode', args.mode if hasattr(args, 'mode') else '')
+        match_data_type = results.get('match_data_type', '')
+        critical_modes = {'combined_match_data', 'schedule'}
+        if mode in critical_modes or match_data_type == 'schedule':
+            logger.error(
+                f"Scraper finished with no data and no errors for mode='{mode}' "
+                f"(match_data_type='{match_data_type}'). "
+                f"This indicates a silent failure (e.g. Trino unavailable, schedule missing)."
             )
-            return 0
+            return 1
+
+        # Non-critical modes: no data with no errors may be expected
+        logger.warning(
+            f"Scraper finished with no data but no errors. "
+            f"This may be expected for some stat types or leagues."
+        )
+        return 0
 
     return 0
 

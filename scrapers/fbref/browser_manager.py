@@ -19,6 +19,7 @@ import gc
 import logging
 import os
 import random
+import re
 import time
 from typing import Dict, Optional
 
@@ -27,6 +28,13 @@ from scrapers.base.browser.nodriver_stealth import WINDOW_SIZES
 from scrapers.fbref.constants import FBREF_UNCOMMENT_TABLES_JS
 
 logger = logging.getLogger(__name__)
+
+# Match pages must contain at least one stats_*_summary table — without it
+# parse_player_match_stats_tables silently returns None. Matches the raw HTML
+# (tables may be in DOM or inside HTML comments).
+_MATCH_SUMMARY_RE = re.compile(
+    r'<table[^>]*\bid="stats_[a-f0-9]+_summary[a-z_]*"'
+)
 
 # Chrome 120 User-Agent (must match container's Chromium for TLS fingerprint)
 _CHROME120_UA = (
@@ -112,12 +120,19 @@ class FBrefBrowserMixin:
         if self._proxy_manager and self._proxy_manager.total_count > 0:
             proxy_obj = self._proxy_manager.get_proxy()
             if proxy_obj:
+                self._current_proxy_obj = proxy_obj
                 logger.debug(
                     f"Using proxy for FBref: {proxy_obj.host}:{proxy_obj.port}"
                 )
                 return proxy_obj.url
         elif self.proxy:
             return self.proxy
+        return None
+
+    def _get_current_nodriver_proxy_url(self) -> Optional[str]:
+        """Get the proxy URL currently used by the nodriver browser instance."""
+        if self._nodriver_browser is not None and self._nodriver_browser.proxy:
+            return self._nodriver_browser.proxy
         return None
 
     # ------------------------------------------------------------------
@@ -147,18 +162,33 @@ class FBrefBrowserMixin:
                 use_xvfb=False,  # Mixin manages Xvfb, not NodriverBypass
                 proxy=proxy_url,
                 cloudflare_wait=self.nodriver_cloudflare_wait,
-                page_load_timeout=20.0,
-                max_retries=2,
+                page_load_timeout=10.0,      # 40→20→10: dead proxy detected in 10s
+                max_retries=1,               # 2→1: retry with same proxy useless for CF block
                 use_cf_verify=True,
                 pre_content_js=FBREF_UNCOMMENT_TABLES_JS,
                 content_timeout=30.0,
-                slow_proxy_threshold=15.0,
+                slow_proxy_threshold=15.0,   # 25→15: normal load 5-8s, 15s is suspicious
             )
             logger.debug(
                 f"Initialized nodriver browser (headless={self.headless}, "
                 f"xvfb={xvfb_running}, "
                 f"cloudflare_wait={self.nodriver_cloudflare_wait}s)"
             )
+
+            # Reuse previously exported CF cookies to skip CF challenge after
+            # a restart on the same proxy. Safe because proxy/UA are unchanged
+            # (cf_clearance is bound to IP + UA).
+            cached = getattr(self, '_cached_cf_cookies', None)
+            if cached:
+                try:
+                    n = self._nodriver_browser.inject_cookies_sync(cached)
+                    if n:
+                        logger.info(
+                            f"Reused {n} cached CF cookies across restart "
+                            f"(saves ~1-2 MB of proxy traffic per restart)"
+                        )
+                except Exception as e:
+                    logger.debug(f"CF cookie reuse failed (will re-solve): {e}")
         return self._nodriver_browser
 
     def _get_browser(self) -> CloudflareBypass:
@@ -181,6 +211,7 @@ class FBrefBrowserMixin:
     def _extract_cookies_from_nodriver(self) -> dict:
         """Extract all cookies from the running nodriver browser."""
         if self._nodriver_browser is None or self._nodriver_browser._browser is None:
+            logger.info("Cannot extract cookies: nodriver browser not running")
             return {}
 
         try:
@@ -191,30 +222,36 @@ class FBrefBrowserMixin:
             async def _get_cookies_with_timeout():
                 return await asyncio.wait_for(
                     self._nodriver_browser._browser.cookies.get_all(),
-                    timeout=10.0,
+                    timeout=5.0,
                 )
 
             all_cookies = loop.run_until_complete(_get_cookies_with_timeout())
 
             cookies = {}
+            cf_cookie_names = []
             for cookie in all_cookies:
                 name = cookie.name if hasattr(cookie, 'name') else cookie.get('name', '')
                 value = cookie.value if hasattr(cookie, 'value') else cookie.get('value', '')
                 if name:
                     cookies[name] = value
+                    if 'cf' in name.lower():
+                        cf_cookie_names.append(name)
 
-            logger.debug(f"Extracted {len(cookies)} cookies from nodriver browser")
+            logger.info(
+                f"Extracted {len(cookies)} cookies from nodriver "
+                f"(CF cookies: {cf_cookie_names or 'none'})"
+            )
             return cookies
 
         except asyncio.TimeoutError:
-            logger.debug("Timeout extracting cookies from nodriver (10s)")
+            logger.warning("Timeout extracting cookies from nodriver (5s)")
             return {}
         except Exception as e:
-            logger.debug(f"Could not extract cookies from nodriver: {e}")
+            logger.warning(f"Could not extract cookies from nodriver: {e}")
             return {}
 
-    def _create_http_session(self, cookies: dict):
-        """Create curl_cffi session with chrome120 impersonation and cookies."""
+    def _create_http_session(self, cookies: dict, proxy_url: Optional[str] = None):
+        """Create curl_cffi session with chrome120 impersonation, cookies and proxy."""
         from curl_cffi.requests import Session
 
         session = Session(impersonate='chrome120')
@@ -228,27 +265,38 @@ class FBrefBrowserMixin:
             'Sec-Fetch-Mode': 'navigate',
             'Sec-Fetch-Site': 'same-origin',
         })
+
+        if proxy_url:
+            session.proxies = {
+                'http': proxy_url,
+                'https': proxy_url,
+            }
+            logger.info(f"HTTP session using proxy: {proxy_url.split('@')[-1] if '@' in proxy_url else proxy_url}")
+
         return session
 
     def _try_init_http_session(self) -> None:
-        """Try to initialize HTTP session with cookies from nodriver browser."""
+        """Try to initialize HTTP session with cookies and proxy from nodriver browser."""
         cookies = self._extract_cookies_from_nodriver()
         if not cookies:
             return
 
         # Need at least cf_clearance for Cloudflare-protected pages
-        has_cf = any('cf' in name.lower() for name in cookies)
-        if not has_cf:
-            logger.debug("No CF cookies found, HTTP session not initialized")
+        cf_names = [name for name in cookies if 'cf' in name.lower()]
+        if not cf_names:
+            logger.info("No CF cookies found, HTTP session not initialized")
             return
 
+        # Get proxy from nodriver — CF cookies are IP-bound
+        proxy_url = self._get_current_nodriver_proxy_url()
+
         try:
-            self._http_session = self._create_http_session(cookies)
+            self._http_session = self._create_http_session(cookies, proxy_url=proxy_url)
             self._http_cookies_time = time.time()
             self._http_request_count = 0
             logger.info(
                 f"HTTP session initialized with {len(cookies)} cookies "
-                f"(cf_clearance present)"
+                f"(CF: {cf_names}, proxy: {'yes' if proxy_url else 'no'})"
             )
         except Exception as e:
             logger.warning(f"Failed to create HTTP session: {e}")
@@ -315,7 +363,45 @@ class FBrefBrowserMixin:
     # Page fetching
     # ------------------------------------------------------------------
 
-    def _fetch_page(self, url: str, use_cache: bool = True) -> Optional[str]:
+    def _track_download(self, html_len: int, page_type: str = 'other') -> None:
+        """Track downloaded bytes and page count in _stats.
+
+        Syncs real proxy traffic stats from nodriver_browser (CDP
+        Network.loadingFinished tracks actual bytes received through proxy,
+        including CSS/JS/images that HTML-size tracking doesn't see).
+        """
+        self._stats['bytes_downloaded'] += html_len
+        self._stats['pages_downloaded'] += 1
+        self._stats['bytes_by_page_type'][page_type] = (
+            self._stats['bytes_by_page_type'].get(page_type, 0) + html_len
+        )
+        self._sync_real_traffic_stats()
+
+    def _sync_real_traffic_stats(self) -> None:
+        """Sync real proxy traffic from nodriver browser to scraper stats.
+
+        nodriver browser accumulates bytes within a single session. On
+        browser restart the counter resets, so we flush current values into
+        `_real_traffic_base` before restart. This method reads current
+        session value and adds it to the persisted base.
+        """
+        if not (self._nodriver_browser is not None
+                and hasattr(self._nodriver_browser, 'get_real_traffic_stats')):
+            return
+        try:
+            real = self._nodriver_browser.get_real_traffic_stats()
+            session_bytes = real.get('real_bytes_downloaded', 0)
+            session_reqs = real.get('real_requests_count', 0)
+            self._stats['real_bytes_downloaded'] = (
+                self._real_traffic_base_bytes + session_bytes
+            )
+            self._stats['real_requests_count'] = (
+                self._real_traffic_base_requests + session_reqs
+            )
+        except Exception:
+            pass
+
+    def _fetch_page(self, url: str, use_cache: bool = True, page_type: str = 'other') -> Optional[str]:
         """
         Fetch page HTML with caching support.
 
@@ -325,6 +411,7 @@ class FBrefBrowserMixin:
         Args:
             url: URL to fetch
             use_cache: Whether to use page cache
+            page_type: Page category for traffic tracking (schedule, player_stat, etc.)
 
         Returns:
             Page HTML or None
@@ -339,26 +426,6 @@ class FBrefBrowserMixin:
             try:
                 # Rate limiting
                 self._rate_limiter.acquire()
-
-                # For match pages — try HTTP first (faster, ~0.5s vs ~3-5s)
-                if (
-                    '/en/matches/' in url
-                    and self.use_nodriver
-                    and self._http_session is not None
-                    and not self._http_cookies_expired()
-                ):
-                    html = self._fetch_page_http(url)
-                    if html:
-                        # Skip browser validation — HTTP validation already done
-                        if use_cache:
-                            self._page_cache[url] = html
-                            self._manage_cache_size()
-                        self._stats['successes'] += 1
-                        self._consecutive_fetch_failures = 0
-                        return html
-                    else:
-                        logger.info("HTTP fetch failed for match page, falling back to nodriver")
-                        self._http_session = None  # Reset — cookies likely expired
 
                 # Use nodriver if enabled
                 if self.use_nodriver:
@@ -380,6 +447,7 @@ class FBrefBrowserMixin:
                         f"length={html_len}, has_tables={has_tables}, "
                         f"cloudflare_blocked={has_cloudflare}"
                     )
+
 
                     if has_cloudflare:
                         logger.warning(
@@ -410,10 +478,36 @@ class FBrefBrowserMixin:
                             )
                             self._stats['failures'] += 1
                             return None
+
+                    # Match pages must contain at least one stats_*_summary table.
+                    # Without it, parse_player_match_stats_tables silently returns
+                    # None while lineups parse fine — data loss is invisible.
+                    # We saw ~5% of match fetches return 200KB truncated HTML with
+                    # lineup tables but no summary tables.
+                    if page_type == 'match':
+                        if not _MATCH_SUMMARY_RE.search(html):
+                            proxy_desc = (
+                                f"{self._current_proxy_obj.host}:{self._current_proxy_obj.port}"
+                                if self._current_proxy_obj else 'no-proxy'
+                            )
+                            logger.warning(
+                                f"Match page missing stats_*_summary table: {url}, "
+                                f"len={html_len}, proxy={proxy_desc}. "
+                                f"Treating as incomplete load."
+                            )
+                            self._stats['failures'] += 1
+                            return None
                 else:
                     logger.warning(f"Empty HTML returned for {url}")
                     self._stats['failures'] += 1
                     return None
+
+                # Track successful download
+                self._track_download(html_len, page_type)
+                logger.info(
+                    f"Fetched {url}: {html_len:,} bytes "
+                    f"(total: {self._stats['bytes_downloaded']/1024/1024:.1f} MB)"
+                )
 
                 if use_cache:
                     self._page_cache[url] = html
@@ -421,28 +515,56 @@ class FBrefBrowserMixin:
 
                 self._stats['successes'] += 1
                 self._consecutive_fetch_failures = 0
+                if self._proxy_manager and self._current_proxy_obj:
+                    self._proxy_manager.record_result(
+                        self._current_proxy_obj, success=True,
+                    )
                 self._maybe_restart_browser()
 
-                # After successful nodriver fetch — init HTTP session if not yet
-                if self.use_nodriver and self._http_session is None:
-                    self._try_init_http_session()
+                # DO NOT init HTTP session after nodriver fetch.
+                # Cookie extraction via cookies.get_all() corrupts nodriver
+                # event loop, causing next page.get() to hang for 40s.
+                # All pages go through nodriver directly (~8s each).
 
                 return html
 
             except SlowProxyError as e:
                 self._stats['failures'] += 1
-                self._close_browser()
-                if slow_retry < self.MAX_SLOW_PROXY_RETRIES - 1:
-                    wait = 2 * (slow_retry + 1)
-                    logger.warning(
+                dead_proxy_desc = (
+                    f"{self._current_proxy_obj.host}:{self._current_proxy_obj.port}"
+                    if self._current_proxy_obj else 'no-proxy'
+                )
+                if self._proxy_manager and self._current_proxy_obj:
+                    self._proxy_manager.record_result(
+                        self._current_proxy_obj, success=False,
+                        error_type='timeout',
+                    )
+                logger.warning(
+                    f"SlowProxyError on {url}: proxy={dead_proxy_desc}, "
+                    f"attempt={slow_retry + 1}/{self.MAX_SLOW_PROXY_RETRIES}"
+                )
+
+                # Try changing proxy via CDP without browser restart
+                proxy_changed = self._try_change_proxy_nodriver()
+
+                if proxy_changed:
+                    logger.info(
                         f"SlowProxyError ({slow_retry + 1}/{self.MAX_SLOW_PROXY_RETRIES}): "
-                        f"{e} — retrying with new proxy in {wait}s"
+                        f"{e} — proxy changed via CDP, retrying immediately"
                     )
-                    time.sleep(wait)
                 else:
-                    logger.error(
-                        f"All {self.MAX_SLOW_PROXY_RETRIES} proxy attempts failed for {url}"
-                    )
+                    self._close_browser()
+                    if slow_retry < self.MAX_SLOW_PROXY_RETRIES - 1:
+                        wait = 2 * (slow_retry + 1)
+                        logger.warning(
+                            f"SlowProxyError ({slow_retry + 1}/{self.MAX_SLOW_PROXY_RETRIES}): "
+                            f"{e} — retrying with new proxy in {wait}s"
+                        )
+                        time.sleep(wait)
+                    else:
+                        logger.error(
+                            f"All {self.MAX_SLOW_PROXY_RETRIES} proxy attempts failed for {url}"
+                        )
                 continue
 
             except Exception as e:
@@ -475,8 +597,7 @@ class FBrefBrowserMixin:
                 cloudflare_wait=self.nodriver_cloudflare_wait,
             )
         except SlowProxyError as e:
-            logger.warning(f"Proxy timeout for {url}: {e} — forcing browser restart")
-            self._close_browser()
+            logger.warning(f"Proxy timeout for {url}: {e}")
             raise
 
         # get_page() already returns fully loaded HTML after Cloudflare bypass
@@ -527,6 +648,47 @@ class FBrefBrowserMixin:
             logger.info(f"Cache trimmed: removed {len(keys_to_remove)} old entries")
 
     # ------------------------------------------------------------------
+    # Dynamic proxy change (without browser restart)
+    # ------------------------------------------------------------------
+
+    def _try_change_proxy_nodriver(self) -> bool:
+        """Try to change proxy via CDP without restarting the browser.
+
+        Gets a new proxy from the proxy manager and updates the proxy extension
+        via CDP. Saves ~10s per rotation (no browser restart + no CF bypass).
+
+        Returns:
+            True if proxy changed successfully, False if browser restart needed.
+        """
+        if not self._nodriver_browser or not self._proxy_manager:
+            logger.warning(
+                f"CDP proxy change unavailable: "
+                f"browser={'alive' if self._nodriver_browser else 'None'}, "
+                f"proxy_manager={'yes' if self._proxy_manager else 'None'}"
+            )
+            return False
+
+        proxy_obj = self._proxy_manager.get_proxy()
+        if not proxy_obj:
+            logger.debug("No available proxy for CDP change")
+            return False
+
+        new_proxy_url = proxy_obj.url
+        success = self._nodriver_browser.change_proxy_sync(new_proxy_url)
+
+        if success:
+            self._current_proxy_obj = proxy_obj
+            # Reset HTTP session since proxy changed
+            self._http_session = None
+            logger.info(
+                f"Proxy changed via CDP to {proxy_obj.host}:{proxy_obj.port} "
+                f"(no browser restart)"
+            )
+        else:
+            logger.warning("CDP proxy change failed, will restart browser")
+        return success
+
+    # ------------------------------------------------------------------
     # Browser restart / close
     # ------------------------------------------------------------------
 
@@ -537,12 +699,18 @@ class FBrefBrowserMixin:
             logger.info(
                 f"Restarting browser after {self._pages_fetched} pages to prevent memory leaks"
             )
-            self._close_browser()
+            # Keep HTTP session — same proxy, cookies still valid
+            self._close_browser(reset_http=False)
             self._pages_fetched = 0
             gc.collect()
 
-    def _close_browser(self) -> None:
+    def _close_browser(self, reset_http: bool = True) -> None:
         """Close browser and clean up resources.
+
+        Args:
+            reset_http: If True, also reset the HTTP session. Set to False
+                when restarting browser for memory reasons (same proxy,
+                cookies still valid).
 
         Note: Does NOT stop the shared Xvfb display — it survives across
         browser restarts. Call _stop_shared_xvfb() for final cleanup.
@@ -557,14 +725,52 @@ class FBrefBrowserMixin:
 
         # Close nodriver browser (Xvfb is managed separately)
         if self._nodriver_browser is not None:
+            # Cache CF cookies for next restart (same-proxy reuse avoids
+            # re-solving CF Turnstile, saving 1-2 MB of proxy traffic).
+            # Only meaningful when proxy/UA stay the same (reset_http=False).
+            if not reset_http:
+                try:
+                    cookies = self._nodriver_browser.export_cf_cookies_sync()
+                    if cookies:
+                        self._cached_cf_cookies = cookies
+                        logger.info(
+                            f"Cached {len(cookies)} CF cookies for next restart"
+                        )
+                except Exception as e:
+                    logger.debug(f"Could not cache CF cookies: {e}")
+            else:
+                self._cached_cf_cookies = None
+
+            # Flush session traffic stats to persistent base BEFORE closing
+            # (nodriver browser counters reset on restart).
+            try:
+                real = self._nodriver_browser.get_real_traffic_stats()
+                self._real_traffic_base_bytes += real.get('real_bytes_downloaded', 0)
+                self._real_traffic_base_requests += real.get('real_requests_count', 0)
+                if real.get('real_bytes_downloaded', 0) > 0:
+                    logger.info(
+                        f"Session proxy traffic: "
+                        f"{real['real_bytes_downloaded'] / 1024 / 1024:.1f} MB "
+                        f"over {real['real_requests_count']} requests "
+                        f"(total accumulated: "
+                        f"{self._real_traffic_base_bytes / 1024 / 1024:.1f} MB)"
+                    )
+            except Exception as e:
+                logger.debug(f"Could not flush traffic stats: {e}")
+
             try:
                 self._nodriver_browser.close_sync()
             except Exception as e:
                 logger.warning(f"Error closing nodriver browser: {e}")
             self._nodriver_browser = None
 
-        # Reset HTTP session (cookies are bound to the browser session)
-        self._http_session = None
+            # After browser close, stats in _stats reflect accumulated base only
+            self._stats['real_bytes_downloaded'] = self._real_traffic_base_bytes
+            self._stats['real_requests_count'] = self._real_traffic_base_requests
+
+        # Reset HTTP session only when proxy changes (SlowProxyError, explicit close)
+        if reset_http:
+            self._http_session = None
 
     def _close_all(self) -> None:
         """Close browser AND shared Xvfb (final cleanup)."""

@@ -8,9 +8,11 @@ plus the memory-efficient ``scrape_single_stat_type``,
 """
 
 import gc
+import json
 import logging
+import os
 import time
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set
 
 import pandas as pd
 from bs4 import BeautifulSoup
@@ -37,6 +39,7 @@ from scrapers.fbref.html_parser import (
     parse_lineup_table,
     parse_events_from_scorebox,
     parse_team_match_stats_table,
+    parse_player_match_stats_tables,
     diagnose_html_structure,
 )
 
@@ -89,7 +92,7 @@ class FBrefDataReaderMixin:
         url = get_schedule_url(league, season)
         logger.debug(f"Fetching FBref schedule: {url}")
 
-        html = self._fetch_page(url)
+        html = self._fetch_page(url, page_type='schedule')
         if not html:
             logger.error(f"Failed to fetch HTML for schedule: {league} {season}")
             return None
@@ -186,7 +189,7 @@ class FBrefDataReaderMixin:
         url = get_stats_url(league, season, stat_type, for_squads=True)
         logger.debug(f"Fetching FBref team stats ({stat_type}): {url}")
 
-        html = self._fetch_page(url)
+        html = self._fetch_page(url, page_type='team_stat')
         if not html:
             return None
 
@@ -237,7 +240,7 @@ class FBrefDataReaderMixin:
         url = get_stats_url(league, season, stat_type, for_squads=False)
         logger.debug(f"Fetching FBref player stats ({stat_type}): {url}")
 
-        html = self._fetch_page(url)
+        html = self._fetch_page(url, page_type='player_stat')
         if not html:
             return None
 
@@ -294,7 +297,7 @@ class FBrefDataReaderMixin:
         url = get_stats_url(league, season, stat_type, for_squads=False)
         logger.debug(f"Fetching FBref keeper stats ({stat_type}): {url}")
 
-        html = self._fetch_page(url)
+        html = self._fetch_page(url, page_type='keeper_stat')
         if not html:
             return None
 
@@ -351,7 +354,7 @@ class FBrefDataReaderMixin:
         url = f"{BASE_URL}/en/matches/{match_id}"
         logger.debug(f"Fetching FBref match stats: {url}")
 
-        html = self._fetch_page(url, use_cache=False)
+        html = self._fetch_page(url, use_cache=False, page_type='match')
         if not html:
             return None
 
@@ -423,7 +426,7 @@ class FBrefDataReaderMixin:
         url = f"{BASE_URL}/en/matches/{match_id}"
         logger.debug(f"Fetching FBref shot events: {url}")
 
-        html = self._fetch_page(url, use_cache=True)  # Cache since match page used for multiple reads
+        html = self._fetch_page(url, use_cache=True, page_type='match')  # Cache since match page used for multiple reads
         if not html:
             return None
 
@@ -475,7 +478,7 @@ class FBrefDataReaderMixin:
         url = f"{BASE_URL}/en/matches/{match_id}"
         logger.debug(f"Fetching FBref match events: {url}")
 
-        html = self._fetch_page(url, use_cache=True)
+        html = self._fetch_page(url, use_cache=True, page_type='match')
         if not html:
             return None
 
@@ -525,13 +528,14 @@ class FBrefDataReaderMixin:
         url = f"{BASE_URL}/en/matches/{match_id}"
         logger.debug(f"Fetching FBref lineups: {url}")
 
-        html = self._fetch_page(url, use_cache=True)
+        html = self._fetch_page(url, use_cache=True, page_type='match')
         if not html:
             return None
 
         soup = BeautifulSoup(html, 'html.parser')
+        comment_tables = extract_tables_from_comments(soup)
 
-        df = parse_lineup_table(soup)
+        df = parse_lineup_table(soup, comment_tables=comment_tables)
 
         if df is None or df.empty:
             logger.debug(f"No lineup data found for match {match_id}")
@@ -572,7 +576,7 @@ class FBrefDataReaderMixin:
         url = f"{BASE_URL}/en/matches/{match_id}"
         logger.debug(f"Fetching FBref team match stats: {url}")
 
-        html = self._fetch_page(url, use_cache=True)
+        html = self._fetch_page(url, use_cache=True, page_type='match')
         if not html:
             return None
 
@@ -692,8 +696,9 @@ class FBrefDataReaderMixin:
     # ------------------------------------------------------------------
 
     # Batch save interval — save accumulated data every N matches
-    # to prevent data loss on crash and limit memory usage
-    BATCH_SAVE_INTERVAL = 50
+    # to prevent data loss on crash and limit memory usage.
+    # 50→20: reduce memory pressure (OOM killer hit 2G scheduler limit at ~200 matches)
+    BATCH_SAVE_INTERVAL = 20
 
     def _process_single_match(
         self,
@@ -703,24 +708,28 @@ class FBrefDataReaderMixin:
         all_shot_events: List[pd.DataFrame],
         all_match_events: List[pd.DataFrame],
         all_lineups: List[pd.DataFrame],
-    ) -> bool:
+        all_match_team_stats: List[pd.DataFrame] = None,
+        all_match_player_stats: List[pd.DataFrame] = None,
+    ) -> Set[str]:
         """
-        Process a single match page: extract shots, events, lineups.
+        Process a single match page: extract shots, events, lineups,
+        team match stats, and player match stats.
 
         Parses HTML once with BeautifulSoup and calls parsers directly,
-        avoiding 3x redundant BS4 parsing that read_* methods would do.
+        avoiding redundant BS4 parsing that read_* methods would do.
 
-        Returns True if at least one data type was successfully extracted.
+        Returns set of successfully extracted data type names
+        (e.g. {'lineups', 'match_player_stats'}).  Empty set on total failure.
         """
         url = f"{BASE_URL}/en/matches/{match_id}"
-        html = self._fetch_page(url, use_cache=True)
+        html = self._fetch_page(url, use_cache=True, page_type='match')
         if not html:
-            return False
+            return set()
 
-        # ONE BS4 parse + ONE comment table extraction (instead of 3x)
+        # ONE BS4 parse + ONE comment table extraction
         soup = BeautifulSoup(html, 'html.parser')
         comment_tables = extract_tables_from_comments(soup)
-        got_data = False
+        got_types: Set[str] = set()
 
         # Shot events (needs comment_tables for shots table)
         shots_df = parse_shots_table(soup, comment_tables)
@@ -730,7 +739,7 @@ class FBrefDataReaderMixin:
             shots_df['season'] = season
             shots_df = self._add_metadata(shots_df, 'shot_events')
             all_shot_events.append(shots_df)
-            got_data = True
+            got_types.add('shot_events')
 
         # Match events (from scorebox — no comment_tables needed)
         events_df = parse_events_from_scorebox(soup)
@@ -740,24 +749,64 @@ class FBrefDataReaderMixin:
             events_df['season'] = season
             events_df = self._add_metadata(events_df, 'match_events')
             all_match_events.append(events_df)
-            got_data = True
+            got_types.add('match_events')
 
-        # Lineups (from div.lineup — no comment_tables needed)
-        lineup_df = parse_lineup_table(soup)
+        # Lineups (positions enriched from stats summary comment_tables)
+        lineup_df = parse_lineup_table(soup, comment_tables=comment_tables)
         if lineup_df is not None and not lineup_df.empty:
             lineup_df['match_id'] = match_id
             lineup_df['league'] = league
             lineup_df['season'] = season
             lineup_df = self._add_metadata(lineup_df, 'lineups')
             all_lineups.append(lineup_df)
-            got_data = True
+            got_types.add('lineups')
+
+        # Team match stats (div#team_stats + div#team_stats_extra)
+        if all_match_team_stats is not None:
+            team_stats_df = parse_team_match_stats_table(soup, comment_tables)
+            if team_stats_df is not None and not team_stats_df.empty:
+                team_stats_df['match_id'] = match_id
+                team_stats_df['league'] = league
+                team_stats_df['season'] = season
+                team_stats_df = self._add_metadata(team_stats_df, 'match_team_stats')
+                all_match_team_stats.append(team_stats_df)
+                got_types.add('match_team_stats')
+
+        # Player match stats (stats_*_summary tables)
+        if all_match_player_stats is not None:
+            player_match_df = parse_player_match_stats_tables(soup, comment_tables)
+            if player_match_df is not None and not player_match_df.empty:
+                player_match_df['match_id'] = match_id
+                player_match_df['league'] = league
+                player_match_df['season'] = season
+                player_match_df = self._add_metadata(player_match_df, 'match_player_stats')
+                all_match_player_stats.append(player_match_df)
+                got_types.add('match_player_stats')
 
         # Free memory: decompose soup tree and remove from cache
         soup.decompose()
         del comment_tables
         self._page_cache.pop(url, None)
 
-        return got_data
+        return got_types
+
+    def _save_fallback_json(
+        self,
+        df: pd.DataFrame,
+        data_type: str,
+        results: Dict[str, str],
+    ) -> None:
+        """Save DataFrame to JSON fallback when Iceberg/Trino is unavailable."""
+        ts = int(time.time())
+        path = f'/tmp/fbref_batch_{data_type}_{ts}.json'
+        try:
+            df.to_json(path, orient='records', date_format='iso')
+            results[f'{data_type}_fallback'] = path
+            logger.warning(
+                f"Saved {len(df)} {data_type} rows to JSON fallback: {path}"
+            )
+        except Exception as fallback_err:
+            logger.error(f"Failed to save JSON fallback for {data_type}: {fallback_err}")
 
     def _batch_save_match_data(
         self,
@@ -766,85 +815,148 @@ class FBrefDataReaderMixin:
         all_lineups: List[pd.DataFrame],
         results: Dict[str, str],
         batch_label: str = "",
+        all_match_team_stats: List[pd.DataFrame] = None,
+        all_match_player_stats: List[pd.DataFrame] = None,
     ) -> None:
         """
         Save accumulated match data to Iceberg and clear the lists.
 
         This is called periodically (every BATCH_SAVE_INTERVAL matches)
         and at the end of processing to prevent data loss on crash.
+
+        On Trino/connection errors, saves data to JSON fallback files
+        so collected data is not lost.
         """
         saved_count = 0
 
-        if all_shot_events:
-            combined_df = pd.concat(all_shot_events, ignore_index=True)
-            table_path = self.save_to_iceberg(
-                df=combined_df,
-                table_name='fbref_shot_events',
-                partition_cols=['league', 'season'],
-            )
-            results['shot_events'] = table_path
-            saved_count += len(combined_df)
-            logger.info(f"Batch save{batch_label}: {len(combined_df)} shot events rows")
-            all_shot_events.clear()
+        save_items = [
+            (all_shot_events, 'fbref_shot_events', 'shot_events'),
+            (all_match_events, 'fbref_match_events', 'match_events'),
+            (all_lineups, 'fbref_lineups', 'lineups'),
+            (all_match_team_stats, 'fbref_match_team_stats', 'match_team_stats'),
+            (all_match_player_stats, 'fbref_match_player_stats', 'match_player_stats'),
+        ]
 
-        if all_match_events:
-            combined_df = pd.concat(all_match_events, ignore_index=True)
-            table_path = self.save_to_iceberg(
-                df=combined_df,
-                table_name='fbref_match_events',
-                partition_cols=['league', 'season'],
-            )
-            results['match_events'] = table_path
-            saved_count += len(combined_df)
-            logger.info(f"Batch save{batch_label}: {len(combined_df)} match events rows")
-            all_match_events.clear()
+        for data_list, table_name, result_key in save_items:
+            if not data_list:
+                continue
 
-        if all_lineups:
-            combined_df = pd.concat(all_lineups, ignore_index=True)
-            table_path = self.save_to_iceberg(
-                df=combined_df,
-                table_name='fbref_lineups',
-                partition_cols=['league', 'season'],
-            )
-            results['lineups'] = table_path
-            saved_count += len(combined_df)
-            logger.info(f"Batch save{batch_label}: {len(combined_df)} lineups rows")
-            all_lineups.clear()
+            combined_df = pd.concat(data_list, ignore_index=True)
+            try:
+                table_path = self.save_to_iceberg(
+                    df=combined_df,
+                    table_name=table_name,
+                    partition_cols=['league', 'season'],
+                )
+                results[result_key] = table_path
+                saved_count += len(combined_df)
+                logger.info(
+                    f"Batch save{batch_label}: {len(combined_df)} {result_key} rows"
+                )
+            except Exception as e:
+                error_str = str(e)
+                is_conn_error = any(
+                    msg in error_str
+                    for msg in ('Connection refused', 'Connection reset',
+                                'Failed to connect', 'TrinoError')
+                )
+                if is_conn_error:
+                    logger.error(
+                        f"Trino unavailable during batch save of {result_key}: {e}"
+                    )
+                else:
+                    logger.error(
+                        f"Error saving {result_key} to Iceberg: {e}",
+                        exc_info=True,
+                    )
+                self._save_fallback_json(combined_df, result_key, results)
+            finally:
+                data_list.clear()
 
         if saved_count > 0:
             gc.collect()
 
-    def _get_existing_match_ids(self, league: str, season: int) -> set:
-        """Query Iceberg for match_ids already collected.
+    def _load_match_id_sets(self, league: str, season: int) -> Dict[str, set]:
+        """Read match_id sets from authoritative bronze tables.
 
-        Uses fbref_lineups as the source of truth because it is reliably
-        populated for every scraped match (unlike shot_events which can be
-        empty when no shot data is available on the page).
+        Returns:
+            {'player_stats': set[str], 'lineups': set[str]} — either set may
+            be empty if the table is missing or unreadable.
+
+        ``player_stats`` is the authoritative skip-source: it's written last
+        in ``_batch_save_match_data`` and is also what Silver depends on. If
+        a match has lineups but no player_stats, it was scraped by an old
+        version of the pipeline (before match_player_stats was added) and
+        must be re-scraped — see :meth:`_get_existing_match_ids`.
         """
+        result = {'player_stats': set(), 'lineups': set()}
+
         try:
             if not hasattr(self, '_iceberg_writer') or self._iceberg_writer is None:
                 from scrapers.base.iceberg_writer import IcebergWriter
                 self._iceberg_writer = IcebergWriter()
-
-            if not self._iceberg_writer.table_exists('bronze', 'fbref_lineups'):
-                return set()
-
-            df = self._iceberg_writer.read_table(
-                database='bronze',
-                table='fbref_lineups',
-                columns=['match_id'],
-                filter_expr=f"league = '{league}' AND season = {season}",
-            )
-            if df is not None and not df.empty:
-                ids = set(df['match_id'].unique())
-                logger.info(
-                    f"Found {len(ids)} existing match IDs in Iceberg (lineups) "
-                    f"for {league} {season}"
-                )
-                return ids
         except Exception as e:
-            logger.warning(f"Could not query existing match IDs: {e}")
-        return set()
+            logger.warning(f"IcebergWriter init failed: {e}")
+            return result
+
+        filter_expr = f"league = '{league}' AND season = {season}"
+
+        for table, key in (
+            ('fbref_match_player_stats', 'player_stats'),
+            ('fbref_lineups', 'lineups'),
+        ):
+            try:
+                if not self._iceberg_writer.table_exists('bronze', table):
+                    logger.info(f"Table {table} does not exist (first run?)")
+                    continue
+                df = self._iceberg_writer.read_table(
+                    database='bronze',
+                    table=table,
+                    columns=['match_id'],
+                    filter_expr=filter_expr,
+                )
+                if df is not None and not df.empty:
+                    result[key] = set(df['match_id'].astype(str).unique())
+            except Exception as e:
+                logger.warning(f"Could not read {table}: {e}")
+
+        return result
+
+    def _get_existing_match_ids(
+        self,
+        league: str,
+        season: int,
+        schedule_df: Optional[pd.DataFrame] = None,  # noqa: ARG002
+    ) -> set:
+        """Return set of match_ids safe to skip.
+
+        Skip rule: a match is skipped iff its match_id is present in
+        ``fbref_match_player_stats``. That table is the last write of
+        ``_batch_save_match_data`` and is the authoritative signal that the
+        full 5-way single-pass parse succeeded.
+
+        Why not include ``fbref_lineups`` in a union (as previous Hybrid
+        attempt did)? Pre-existing rows in ``lineups`` were written by older
+        scraper versions before ``match_player_stats`` extraction was added
+        (see e.g. EPL 2016-2021: 380 lineups vs 0 player_stats). A union
+        skip would silently lock those matches out of ever getting
+        per-player stats. Keeping the rule strictly tied to player_stats
+        preserves correctness while still skipping all matches the new
+        pipeline has fully ingested.
+
+        ``schedule_df`` is accepted for API compatibility but not used —
+        the rule is no longer date-dependent.
+        """
+        sets = self._load_match_id_sets(league, season)
+        stats_ids = sets['player_stats']
+        lineup_ids = sets['lineups']
+
+        logger.info(
+            f"Existing IDs (player_stats authoritative): "
+            f"player_stats={len(stats_ids)}, lineups={len(lineup_ids)}, "
+            f"skip={len(stats_ids)} for {league} {season}"
+        )
+        return stats_ids
 
     def _read_schedule_from_iceberg(self, league: str, season: int) -> Optional[pd.DataFrame]:
         """Read schedule from Iceberg (saved by schedule_task) instead of HTTP to FBref."""
@@ -890,15 +1002,85 @@ class FBrefDataReaderMixin:
                 )
                 return None
 
+            # fbref_schedule is INSERT-only: every schedule_task run appends
+            # the full season fixture list (~380 rows). Without dedup the
+            # table has 10x copies for active seasons (e.g. EPL 2025: 4335
+            # rows / 310 unique). Keep the latest version of each match_url
+            # (FBref edits the schedule for postponements/reschedules).
+            raw_count = len(df)
+            if '_ingested_at' in df.columns:
+                df = df.sort_values('_ingested_at', kind='mergesort')
+            df = df.drop_duplicates(subset=['match_url'], keep='last')
+            non_null_urls = df['match_url'].dropna()
+
             logger.info(
-                f"Iceberg: read {len(df)} schedule rows for {league} {season} "
-                f"({len(non_null_urls)} with match_url)"
+                f"Iceberg: read {raw_count} schedule rows for {league} {season}, "
+                f"deduped to {len(df)} ({len(non_null_urls)} with match_url)"
             )
             return df
 
         except Exception as e:
-            logger.warning(f"Iceberg: could not read schedule: {e}")
+            # Distinguish Trino connectivity errors from data errors
+            error_str = str(e)
+            is_connection_error = any(
+                msg in error_str
+                for msg in ('Connection refused', 'Connection reset',
+                            'Connection aborted', 'Failed to connect')
+            )
+            if is_connection_error:
+                logger.error(
+                    f"Iceberg: Trino unavailable — cannot read schedule: {e}",
+                    exc_info=True,
+                )
+            elif 'TrinoError' in type(e).__name__ or 'trino' in type(e).__module__:
+                logger.error(
+                    f"Iceberg: Trino query error reading schedule: {e}",
+                    exc_info=True,
+                )
+            else:
+                logger.warning(
+                    f"Iceberg: unexpected error reading schedule: {e}",
+                    exc_info=True,
+                )
         return None
+
+    def _read_schedule_from_file(
+        self, league: str, season: int
+    ) -> Optional[pd.DataFrame]:
+        """Read schedule from JSON file saved by schedule_task."""
+        safe_league = league.replace(' ', '_').replace('-', '_')
+        path = f'/tmp/fbref_schedule_{safe_league}_{season}.json'
+
+        if not os.path.exists(path):
+            logger.debug(f"Schedule JSON not found: {path}")
+            return None
+
+        try:
+            df = pd.read_json(path, orient='records')
+            if df.empty:
+                logger.warning(f"Schedule JSON is empty: {path}")
+                return None
+
+            if 'match_url' not in df.columns:
+                logger.warning(f"Schedule JSON missing 'match_url' column: {path}")
+                return None
+
+            non_null_urls = df['match_url'].dropna()
+            if non_null_urls.empty:
+                logger.warning(
+                    f"Schedule JSON has {len(df)} rows but all match_url are NULL"
+                )
+                return None
+
+            logger.info(
+                f"File: read {len(df)} schedule rows for {league} {season} "
+                f"from {path} ({len(non_null_urls)} with match_url)"
+            )
+            return df
+
+        except Exception as e:
+            logger.warning(f"File: could not read schedule from {path}: {e}")
+            return None
 
     # ------------------------------------------------------------------
     # Combined match data: main method
@@ -908,17 +1090,18 @@ class FBrefDataReaderMixin:
         self,
         max_matches: Optional[int] = 50,
         incremental: bool = True,
+        deadline_minutes: int = 230,
     ) -> Dict[str, str]:
         """
         Memory-efficient: scrape ALL match-level data in one pass.
 
-        Collects shot_events, match_events, and lineups simultaneously
-        by visiting each match page only once. This reduces HTTP requests
-        by 3x compared to separate scrape_match_data() calls.
+        Collects shot_events, match_events, lineups, match_team_stats,
+        and match_player_stats simultaneously by visiting each match page
+        only once.
 
         Features:
-        - Parse Once: single BS4 parse per match (3x reduction)
-        - Incremental: skips matches already in Iceberg (via shot_events table)
+        - Parse Once: single BS4 parse per match
+        - Incremental: skips matches already in Iceberg (via lineups table)
         - Batch saving every BATCH_SAVE_INTERVAL matches (prevents data loss)
         - Failed match retry with browser restart (recovers ~50-70%)
 
@@ -928,51 +1111,107 @@ class FBrefDataReaderMixin:
 
         Returns:
             Dictionary mapping data_type to Iceberg table path
-            Keys: 'shot_events', 'match_events', 'lineups'
+            Keys: 'shot_events', 'match_events', 'lineups',
+                  'match_team_stats', 'match_player_stats'
         """
         logger.info(
             f"Starting combined match data scrape: "
             f"max_matches={max_matches}, leagues={self.leagues}, seasons={self.seasons}"
         )
 
+        # Pre-flight Trino probe: fail fast if Trino is unreachable
+        # (avoids 18+ seconds of retries per league/season in _read_schedule_from_iceberg)
+        try:
+            if not hasattr(self, '_iceberg_writer') or self._iceberg_writer is None:
+                from scrapers.base.iceberg_writer import IcebergWriter
+                self._iceberg_writer = IcebergWriter()
+
+            trino_mgr = self._iceberg_writer._get_trino_manager()
+            cursor = trino_mgr.connection.cursor()
+            cursor.execute('SELECT 1')
+            cursor.fetchall()
+            cursor.close()
+            self._stats['trino_available'] = True
+            logger.info("Pre-flight Trino probe: OK")
+        except Exception as e:
+            self._stats['trino_available'] = False
+            logger.warning(
+                f"Pre-flight Trino probe failed: {e}. "
+                f"Will rely on file fallback for schedule."
+            )
+
+        _deadline = time.time() + deadline_minutes * 60
+
         all_shot_events = []
         all_match_events = []
         all_lineups = []
+        all_match_team_stats = []
+        all_match_player_stats = []
 
         total_matches_processed = 0
         total_pages_fetched = 0
+        total_league_seasons = 0
+        skipped_league_seasons = 0
         results = {}
+
+        # Shared kwargs for _batch_save_match_data
+        batch_kw = dict(
+            all_match_team_stats=all_match_team_stats,
+            all_match_player_stats=all_match_player_stats,
+        )
 
         for league in self.leagues:
             for season in self.seasons:
+                total_league_seasons += 1
                 try:
-                    # Try Iceberg first (schedule already saved by schedule_task)
-                    schedule_df = self._read_schedule_from_iceberg(league, season)
+                    # 3-level fallback: file → Iceberg → HTTP
+                    schedule_df = self._read_schedule_from_file(league, season)
 
                     if schedule_df is not None and not schedule_df.empty:
+                        self._stats['schedule_source'] = 'file'
                         logger.info(
-                            f"Using schedule from Iceberg for {league} {season} "
+                            f"Using schedule from file for {league} {season} "
                             f"({len(schedule_df)} rows)"
                         )
                     else:
-                        # Fallback: HTTP request to FBref
-                        logger.warning(
-                            f"Schedule not in Iceberg for {league} {season}, "
-                            f"falling back to FBref HTTP"
+                        schedule_df = self._read_schedule_from_iceberg(
+                            league, season
                         )
-                        schedule_df = self.read_schedule(league, season)
+                        if schedule_df is not None and not schedule_df.empty:
+                            self._stats['schedule_source'] = 'iceberg'
+                            logger.info(
+                                f"Using schedule from Iceberg for {league} "
+                                f"{season} ({len(schedule_df)} rows)"
+                            )
+                        else:
+                            self._stats['schedule_source'] = 'none'
+                            logger.error(
+                                f"Schedule not available from file/Iceberg for {league} {season}. "
+                                f"Ensure schedule_task completed. Skipping."
+                            )
+                            skipped_league_seasons += 1
+                            self._stats['failures'] = self._stats.get('failures', 0) + 1
+                            self._stats['skipped_league_seasons'] = skipped_league_seasons
+                            continue
 
                     if schedule_df is None or schedule_df.empty:
+                        self._stats['schedule_source'] = 'none'
                         logger.warning(
                             f"No schedule found for {league} {season}, "
                             f"skipping match data collection"
                         )
+                        skipped_league_seasons += 1
+                        self._stats['failures'] = self._stats.get('failures', 0) + 1
+                        self._stats['skipped_league_seasons'] = skipped_league_seasons
                         continue
 
                     logger.info(f"Extracting match IDs from schedule ({len(schedule_df)} rows)...")
                     match_ids = self._extract_match_ids(schedule_df, max_matches)
+                    del schedule_df  # Free ~1MB DataFrame
 
-                    # Incremental: skip matches already in Iceberg
+                    # Incremental: skip matches already in fbref_match_player_stats.
+                    # See _get_existing_match_ids — that table is the
+                    # authoritative output of the combined-pass pipeline.
                     if incremental:
                         existing_ids = self._get_existing_match_ids(league, season)
                         new_match_ids = [
@@ -1003,28 +1242,61 @@ class FBrefDataReaderMixin:
                         self._nodriver_browser.restart_browser()
 
                     failed_match_ids = []
+                    # Matches where page loaded but match_player_stats was missing
+                    # (e.g. lineups parsed OK, but stats_*_summary table absent).
+                    # These need a retry too — without it, holes in
+                    # fbref_match_player_stats persist across DAG runs.
+                    partial_match_ids = []
+                    # 20→50: with per-URL retries and proxy rotation most
+                    # transient failures recover; keep circuit breaker only as
+                    # a safety net for systemic outages (proxy pool dead, CF ban).
+                    MAX_CONSECUTIVE_FAILURES = 50
+                    consecutive_failures = 0
 
                     for idx, match_id in enumerate(match_ids):
                         logger.info(f"Processing match {idx+1}/{len(match_ids)}: {match_id}")
                         try:
-                            got_data = self._process_single_match(
+                            got_types = self._process_single_match(
                                 match_id, league, season,
                                 all_shot_events, all_match_events, all_lineups,
+                                all_match_team_stats, all_match_player_stats,
                             )
 
-                            if got_data:
+                            if got_types:
                                 total_matches_processed += 1
+                                consecutive_failures = 0
+                                if 'match_player_stats' not in got_types:
+                                    partial_match_ids.append(match_id)
+                                    logger.warning(
+                                        f"Partial data for match {match_id}: "
+                                        f"got {got_types}, missing match_player_stats"
+                                    )
                             else:
                                 failed_match_ids.append(match_id)
+                                consecutive_failures += 1
                                 logger.warning(
                                     f"No data extracted for match {match_id}, "
-                                    f"will retry later"
+                                    f"will retry later ({consecutive_failures}/{MAX_CONSECUTIVE_FAILURES} consecutive failures)"
                                 )
+                                if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                                    logger.error(
+                                        f"Circuit breaker: {consecutive_failures} consecutive failures. "
+                                        f"Stopping match processing for {league} {season}."
+                                    )
+                                    break
 
                             total_pages_fetched += 1
 
                             # Rate limiting between matches
-                            time.sleep(1)
+                            time.sleep(0.5)
+
+                            # Check internal deadline
+                            if time.time() > _deadline:
+                                logger.warning(
+                                    f"Deadline {deadline_minutes}m reached after {idx+1}/{len(match_ids)} matches. "
+                                    f"Saving {total_matches_processed} matches processed so far."
+                                )
+                                break
 
                             # Batch save every N matches to prevent data loss
                             if (idx + 1) % self.BATCH_SAVE_INTERVAL == 0:
@@ -1032,7 +1304,11 @@ class FBrefDataReaderMixin:
                                     all_shot_events, all_match_events, all_lineups,
                                     results,
                                     batch_label=f" (after {idx+1}/{len(match_ids)} matches)",
+                                    **batch_kw,
                                 )
+                                # Aggressive memory reclaim after batch save
+                                # (scheduler has only 2G limit — OOM killer target)
+                                gc.collect()
 
                         except Exception as e:
                             logger.error(
@@ -1041,38 +1317,44 @@ class FBrefDataReaderMixin:
                             failed_match_ids.append(match_id)
                             continue
 
-                    # Retry failed matches with browser restart
-                    if failed_match_ids:
+                    # Retry failed + partial matches with browser restart.
+                    # Partial = page loaded but match_player_stats missing;
+                    # without retry these holes persist across DAG runs.
+                    retry_ids = failed_match_ids + partial_match_ids
+                    if retry_ids and time.time() <= _deadline:
                         logger.info(
-                            f"Retrying {len(failed_match_ids)} failed matches "
+                            f"Retrying {len(retry_ids)} matches "
+                            f"({len(failed_match_ids)} failed + {len(partial_match_ids)} partial) "
                             f"with browser restart ({league}, {season})"
                         )
                         if self.use_nodriver and self._nodriver_browser is not None:
                             self._nodriver_browser.restart_browser()
 
                         recovered = 0
-                        for match_id in failed_match_ids:
+                        for match_id in retry_ids:
                             try:
-                                got_data = self._process_single_match(
+                                got_types = self._process_single_match(
                                     match_id, league, season,
                                     all_shot_events, all_match_events, all_lineups,
+                                    all_match_team_stats, all_match_player_stats,
                                 )
-                                if got_data:
+                                if got_types and 'match_player_stats' in got_types:
                                     recovered += 1
-                                    total_matches_processed += 1
+                                    if match_id in failed_match_ids:
+                                        total_matches_processed += 1
                                 time.sleep(1)
                             except Exception as e:
                                 logger.debug(f"Retry failed for match {match_id}: {e}")
 
                         logger.info(
-                            f"Retry complete: recovered {recovered}/{len(failed_match_ids)} matches"
+                            f"Retry complete: recovered {recovered}/{len(retry_ids)} matches (player_stats)"
                         )
-
                     # Save remaining data after each league/season
                     self._batch_save_match_data(
                         all_shot_events, all_match_events, all_lineups,
                         results,
                         batch_label=f" (end of {league} {season})",
+                        **batch_kw,
                     )
 
                 except Exception as e:
@@ -1084,16 +1366,24 @@ class FBrefDataReaderMixin:
                         all_shot_events, all_match_events, all_lineups,
                         results,
                         batch_label=f" (error recovery for {league} {season})",
+                        **batch_kw,
                     )
                     continue
                 finally:
                     # Memory cleanup after each league/season
                     self._cleanup_after_league()
 
+        if skipped_league_seasons == total_league_seasons and total_league_seasons > 0:
+            logger.error(
+                f"All {total_league_seasons} league/season combinations were skipped "
+                f"(schedule unavailable). No match data collected."
+            )
+
         logger.info(
             f"Combined match data scrape complete: "
             f"{total_matches_processed} matches processed, "
-            f"{total_pages_fetched} pages fetched (3x reduction vs separate calls), "
+            f"{total_pages_fetched} pages fetched, "
+            f"skipped {skipped_league_seasons}/{total_league_seasons} league/seasons, "
             f"tables saved: {list(results.keys())}"
         )
 
@@ -1150,10 +1440,30 @@ class FBrefDataReaderMixin:
 
             if all_schedules:
                 combined_df = pd.concat(all_schedules, ignore_index=True)
+
+                # JSON fallback for match_all_data (Trino-independent)
+                for league in self.leagues:
+                    for season in self.seasons:
+                        league_df = combined_df[
+                            (combined_df['league'] == league)
+                            & (combined_df['season'] == season)
+                        ]
+                        if not league_df.empty:
+                            safe_league = league.replace(' ', '_').replace('-', '_')
+                            path = f'/tmp/fbref_schedule_{safe_league}_{season}.json'
+                            league_df.to_json(
+                                path, orient='records', date_format='iso'
+                            )
+                            logger.info(
+                                f"Schedule JSON fallback: {path} "
+                                f"({len(league_df)} rows)"
+                            )
+
                 table_path = self.save_to_iceberg(
                     df=combined_df,
                     table_name='fbref_schedule',
                     partition_cols=['league', 'season'],
+                    replace_partitions=['league', 'season'],
                 )
                 results['schedule'] = table_path
                 logger.info(f"Saved {len(combined_df)} schedule rows")
@@ -1162,31 +1472,46 @@ class FBrefDataReaderMixin:
 
         # For other data types, we need match IDs from schedule first
         all_data = []
+        total_league_seasons = 0
+        skipped_league_seasons = 0
 
         for league in self.leagues:
             for season in self.seasons:
+                total_league_seasons += 1
                 try:
-                    # Try Iceberg first (schedule already saved by schedule_task)
-                    schedule_df = self._read_schedule_from_iceberg(league, season)
+                    # 3-level fallback: file → Iceberg → HTTP
+                    schedule_df = self._read_schedule_from_file(league, season)
 
                     if schedule_df is not None and not schedule_df.empty:
                         logger.info(
-                            f"Using schedule from Iceberg for {league} {season} "
+                            f"Using schedule from file for {league} {season} "
                             f"({len(schedule_df)} rows)"
                         )
                     else:
-                        # Fallback: HTTP request to FBref
-                        logger.warning(
-                            f"Schedule not in Iceberg for {league} {season}, "
-                            f"falling back to FBref HTTP"
+                        schedule_df = self._read_schedule_from_iceberg(
+                            league, season
                         )
-                        schedule_df = self.read_schedule(league, season)
+                        if schedule_df is not None and not schedule_df.empty:
+                            logger.info(
+                                f"Using schedule from Iceberg for {league} "
+                                f"{season} ({len(schedule_df)} rows)"
+                            )
+                        else:
+                            logger.error(
+                                f"Schedule not available from file/Iceberg for {league} {season}. "
+                                f"Ensure schedule_task completed. Skipping."
+                            )
+                            skipped_league_seasons += 1
+                            self._stats['failures'] = self._stats.get('failures', 0) + 1
+                            continue
 
                     if schedule_df is None or schedule_df.empty:
                         logger.warning(
                             f"No schedule found for {league} {season}, "
                             f"skipping match data collection"
                         )
+                        skipped_league_seasons += 1
+                        self._stats['failures'] = self._stats.get('failures', 0) + 1
                         continue
 
                     match_ids = self._extract_match_ids(schedule_df, max_matches)
@@ -1246,5 +1571,11 @@ class FBrefDataReaderMixin:
             )
         else:
             logger.warning(f"No data collected for {data_type}")
+
+        if skipped_league_seasons == total_league_seasons and total_league_seasons > 0:
+            logger.error(
+                f"All {total_league_seasons} league/season combinations were skipped "
+                f"for {data_type} (schedule unavailable). No data collected."
+            )
 
         return results

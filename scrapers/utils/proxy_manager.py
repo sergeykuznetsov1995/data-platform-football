@@ -14,6 +14,7 @@ Features:
 """
 
 import logging
+import os
 import random
 import socket
 import time
@@ -72,6 +73,19 @@ class Proxy:
         auth = ''
         if self.username and self.password:
             auth = f'{self.username}:{self.password}@'
+
+        protocol = self.proxy_type.value
+        if self.proxy_type == ProxyType.TOR:
+            protocol = 'socks5'
+
+        return f'{protocol}://{auth}{self.host}:{self.port}'
+
+    @property
+    def masked_url(self) -> str:
+        """Get proxy URL with credentials masked for safe logging."""
+        auth = ''
+        if self.username and self.password:
+            auth = '****:****@'
 
         protocol = self.proxy_type.value
         if self.proxy_type == ProxyType.TOR:
@@ -139,7 +153,7 @@ class Proxy:
     def mark_banned(self) -> None:
         """Mark proxy as banned."""
         self.is_banned = True
-        logger.warning(f"Proxy {self.host}:{self.port} marked as banned")
+        logger.warning(f"Proxy {self.masked_url} marked as banned")
 
     def get_error_summary(self) -> str:
         """Get summary of errors for this proxy."""
@@ -161,6 +175,7 @@ class ProxyManagerConfig:
 
     # Additional settings for FBref scraping
     cloudflare_ban_threshold: int = 2  # Ban faster for Cloudflare blocks
+    timeout_ban_threshold: int = 1  # Ban after first timeout — dead proxies should not linger in rotation
     rate_limit_cooldown_multiplier: float = 2.0  # Longer cooldown after rate limit
 
 
@@ -291,7 +306,7 @@ class ProxyManager:
                         self.add_proxy_url(line)
                         count += 1
                     except Exception as e:
-                        logger.warning(f"Failed to parse proxy: {line}: {e}")
+                        logger.warning(f"Failed to parse proxy URL: {e}")
 
         logger.info(f"Loaded {count} proxies from {filepath}")
         return count
@@ -338,7 +353,7 @@ class ProxyManager:
                         )
                         count += 1
                     except (ValueError, TypeError) as e:
-                        logger.warning(f"Failed to parse proxy line: {line}: {e}")
+                        logger.warning(f"Failed to parse proxy line: {parts[0]}:{parts[1]}:****: {e}")
                 elif len(parts) == 2:
                     # Simple host:port format without auth
                     try:
@@ -349,9 +364,9 @@ class ProxyManager:
                         )
                         count += 1
                     except (ValueError, TypeError) as e:
-                        logger.warning(f"Failed to parse proxy line: {line}: {e}")
+                        logger.warning(f"Failed to parse proxy line: {parts[0]}:{parts[1]}: {e}")
                 else:
-                    logger.warning(f"Invalid proxy format: {line}")
+                    logger.warning(f"Invalid proxy format (unexpected field count)")
 
         logger.info(f"Loaded {count} proxies from {filepath} (custom format)")
         return count
@@ -519,6 +534,16 @@ class ProxyManager:
                 proxy.mark_banned()
                 return
 
+            # Ban immediately on timeout — dead proxies waste ~10s each and
+            # round-robin keeps picking them until ban_threshold=5 consecutive.
+            timeout_failures = proxy.error_counts.get('timeout', 0)
+            if timeout_failures >= self.config.timeout_ban_threshold:
+                logger.warning(
+                    f"Proxy {proxy_key} banned after {timeout_failures} timeout(s)"
+                )
+                proxy.mark_banned()
+                return
+
             # Check if should ban based on consecutive failures
             if self._consecutive_failures[proxy_key] >= self.config.ban_threshold:
                 proxy.mark_banned()
@@ -628,8 +653,7 @@ class ProxyManager:
             'error_type_totals': self._get_error_type_totals(),
             'proxies': [
                 {
-                    'host': p.host,
-                    'port': p.port,
+                    'proxy': p.masked_url,
                     'success_rate': round(p.success_rate, 3),
                     'is_banned': p.is_banned,
                     'success_count': p.success_count,
@@ -699,8 +723,9 @@ class ProxyManager:
             from stem import Signal
             from stem.control import Controller
 
+            tor_password = os.environ.get('TOR_CONTROL_PASSWORD', '')
             with Controller.from_port(port=self.config.tor_control_port) as controller:
-                controller.authenticate()
+                controller.authenticate(password=tor_password)
                 controller.signal(Signal.NEWNYM)
                 logger.info("Tor identity rotated")
                 return True

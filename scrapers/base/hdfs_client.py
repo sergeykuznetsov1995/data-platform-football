@@ -8,12 +8,32 @@ No JVM dependencies required.
 
 import logging
 import os
+import posixpath
 from typing import List, Optional
 from urllib.parse import quote
 
 import requests
 
 logger = logging.getLogger(__name__)
+
+
+def _validate_hdfs_path(path: str) -> str:
+    """
+    Validate and normalize HDFS path to prevent path traversal attacks.
+
+    Args:
+        path: HDFS path
+
+    Returns:
+        Normalized path
+
+    Raises:
+        ValueError: If path contains traversal patterns
+    """
+    normalized = posixpath.normpath(path)
+    if '..' in normalized.split('/'):
+        raise ValueError(f"Path traversal detected in HDFS path: {path!r}")
+    return normalized
 
 
 class HDFSClient:
@@ -72,6 +92,9 @@ class HDFSClient:
 
     def _url(self, path: str, op: str, **params) -> str:
         """Build WebHDFS URL."""
+        # Validate path against traversal attacks
+        path = _validate_hdfs_path(path)
+
         # Ensure path starts with /
         if not path.startswith('/'):
             path = '/' + path

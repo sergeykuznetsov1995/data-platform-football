@@ -43,6 +43,7 @@ from airflow import DAG
 from airflow.operators.python import PythonOperator
 from airflow.utils.task_group import TaskGroup
 from airflow.operators.empty import EmptyOperator
+from airflow.operators.trigger_dagrun import TriggerDagRunOperator
 
 from utils.config import LEAGUES, CURRENT_SEASON, SCHEDULES, DAG_TAGS
 from utils.default_args import SELENIUM_ARGS
@@ -50,10 +51,12 @@ from utils.fbref_tasks import (
     create_single_stat_task,
     create_match_data_task,
     create_combined_match_data_task,
+    create_trino_health_check_task,
 )
 from utils.fbref_callbacks import (
     prewarm_cf_cookies,
     validate_all_data,
+    check_traffic_guard,
 )
 
 from scrapers.fbref.constants import (
@@ -133,7 +136,7 @@ PROXY_FILE = '/opt/airflow/proxys.txt'  # Path to proxy file in container
 # Bundled into a dict to avoid repeating the same kwargs in every call.
 COMMON_TASK_KWARGS = dict(
     leagues_str=','.join(LEAGUES),
-    season=CURRENT_SEASON,
+    season="{{ params.season }}",
     scraper_type=DEFAULT_SCRAPER_TYPE,
     use_tor=USE_TOR,
     tor_host=TOR_HOST,
@@ -151,7 +154,7 @@ COMMON_TASK_KWARGS = dict(
 # Subset of kwargs for combined match data task (doesn't use all options)
 COMBINED_MATCH_KWARGS = dict(
     leagues_str=','.join(LEAGUES),
-    season=CURRENT_SEASON,
+    season="{{ params.season }}",
     use_xvfb=USE_XVFB,
     headless=HEADLESS,
     use_nodriver=USE_NODRIVER,
@@ -187,7 +190,7 @@ with DAG(
     default_args=SELENIUM_ARGS,
     description='Memory-efficient FBref data ingestion with TaskGroup architecture',
     schedule=SCHEDULES.get('dag_ingest_fbref', '0 6 * * *'),
-    start_date=datetime(2024, 1, 1),
+    start_date=datetime(2026, 2, 16),
     catchup=False,
     tags=DAG_TAGS.get('fbref', ['scraping', 'fbref', 'bronze', 'football', 'selenium']),
     max_active_runs=1,
@@ -262,11 +265,11 @@ with DAG(
     │   └── keeper_keeper_adv
     ├── TaskGroup: match_data (OPTIMIZED)
     │   ├── match_schedule
-    │   └── match_all_data (combined: shot_events + match_events + lineups)
+    │   └── match_all_data (combined: 5 data types in single pass)
     └── validate_all_data
     ```
 
-    ### Tables Created (24 tables)
+    ### Tables Created (26 tables)
 
     **Player Stats (9 tables):**
     - fbref_player_stats, fbref_player_shooting, fbref_player_passing
@@ -280,8 +283,9 @@ with DAG(
     **Keeper Stats (2 tables):**
     - fbref_keeper_keeper, fbref_keeper_keeper_adv
 
-    **Match Data (4 tables):**
+    **Match Data (6 tables):**
     - fbref_schedule, fbref_shot_events, fbref_match_events, fbref_lineups
+    - fbref_match_team_stats, fbref_match_player_stats
 
     ### Testing with soccerdata + residential proxies (recommended)
 
@@ -379,23 +383,33 @@ with DAG(
         keeper_tasks = _build_sequential_stat_group(KEEPER_STAT_TYPES, 'keeper')
 
     # =========================================================================
-    # TaskGroup: Match Data (OPTIMIZED - combined task for 3x efficiency)
+    # TaskGroup: Match Data (OPTIMIZED - combined task for 5x efficiency)
     # =========================================================================
-    # OPTIMIZATION: Instead of 3 separate tasks (shot_events, match_events, lineups)
-    # that each iterate through all matches (3N page loads), we use ONE combined task
-    # that collects all data in a single pass (N page loads = 3x reduction).
+    # OPTIMIZATION: Instead of 5 separate tasks (shot_events, match_events,
+    # lineups, match_team_stats, match_player_stats) that would each iterate
+    # through all matches (5N page loads), we use ONE combined task that
+    # collects all 5 data types from a single HTML page per match.
     #
-    # Before: schedule -> shot_events -> match_events -> lineups
-    #         HTTP requests: 1 + 380 + 380 + 380 = 1141 (for 380 matches)
+    # Before (naive): 5N page loads for 5 data types
+    # After (combined): N page loads, HTML parsed 5 times in memory
     #
-    # After:  schedule -> match_all_data
-    #         HTTP requests: 1 + 380 = 381 (3x reduction)
+    # Real numbers for 380 matches:
+    #   schedule + match_all_data = 1 + 380 = 381 HTTP requests
     # =========================================================================
     with TaskGroup(group_id='match_data') as match_data_group:
+        # Pre-flight: verify Trino is reachable before schedule/match tasks
+        trino_check = create_trino_health_check_task()
+
         # Schedule task uses nodriver
         schedule_task = create_match_data_task(
             data_type='schedule',
             **COMMON_TASK_KWARGS,
+        )
+
+        # Second Trino check: verify Trino is still up after schedule task
+        # (Trino may have crashed between schedule and match_all_data)
+        trino_check_2 = create_trino_health_check_task(
+            task_id='check_trino_before_match',
         )
 
         # Combined match data task: collects shot_events, match_events, lineups
@@ -405,8 +419,19 @@ with DAG(
             **COMBINED_MATCH_KWARGS,
         )
 
-        # schedule -> match_all_data
-        schedule_task >> match_all_task
+        # trino_check -> schedule -> trino_check_2 -> match_all_data -> traffic_guard
+        #
+        # traffic_guard reads /tmp/fbref_traffic_match_all_data.json written by
+        # match_all_task and fails if real_proxy_mb exceeds the Airflow
+        # Variable `fbref_proxy_mb_threshold` (default 500). Push XCom keys:
+        # real_proxy_mb, real_proxy_requests, matches_scraped.
+        traffic_guard = PythonOperator(
+            task_id='traffic_guard',
+            python_callable=check_traffic_guard,
+            trigger_rule='all_done',  # always inspect traffic, even on upstream fail
+        )
+
+        trino_check >> schedule_task >> trino_check_2 >> match_all_task >> traffic_guard
 
     # =========================================================================
     # Validation Task
@@ -418,10 +443,20 @@ with DAG(
     )
 
     # =========================================================================
-    # Dependencies: Start -> Prewarm -> TaskGroups SEQUENTIAL -> Validate
+    # Trigger Silver DAG after ingestion completes
+    # =========================================================================
+    trigger_silver = TriggerDagRunOperator(
+        task_id='trigger_silver_transform',
+        trigger_dag_id='dag_transform_fbref_silver',
+        wait_for_completion=False,
+        reset_dag_run=True,
+    )
+
+    # =========================================================================
+    # Dependencies: Start -> Prewarm -> TaskGroups SEQUENTIAL -> Validate -> Trigger Silver
     # Changed from parallel to sequential execution to prevent OOM
     # =========================================================================
     if CF_COOKIE_PREWARM and prewarm_task:
-        start >> prewarm_task >> player_stats_group >> team_stats_group >> keeper_stats_group >> match_data_group >> validate_task
+        start >> prewarm_task >> player_stats_group >> team_stats_group >> keeper_stats_group >> match_data_group >> validate_task >> trigger_silver
     else:
-        start >> player_stats_group >> team_stats_group >> keeper_stats_group >> match_data_group >> validate_task
+        start >> player_stats_group >> team_stats_group >> keeper_stats_group >> match_data_group >> validate_task >> trigger_silver

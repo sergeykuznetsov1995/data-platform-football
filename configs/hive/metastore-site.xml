@@ -56,9 +56,9 @@
         <value>false</value>
     </property>
 
-    <!-- Disable schema verification for first run -->
+    <!-- Enable schema verification for integrity -->
     <property>
         <name>hive.metastore.schema.verification</name>
-        <value>false</value>
+        <value>true</value>
     </property>
 </configuration>

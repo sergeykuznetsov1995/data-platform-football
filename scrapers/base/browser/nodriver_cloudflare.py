@@ -94,7 +94,7 @@ async def wait_for_cloudflare(
                     _interval_between_retries=cf_verify_interval,
                     _reload_page_after_n_retries=5  # Reload after 5 failed clicks for fresh challenge token
                 ),
-                timeout=cloudflare_wait
+                timeout=min(cloudflare_wait, 15.0)  # CF bypass works in ~8s or not at all
             )
 
             if result:
@@ -112,7 +112,7 @@ async def wait_for_cloudflare(
             logger.warning(f"CFVerify error: {e}, trying opencv-based approach...")
 
     # Fallback: try opencv template matching with human-like behavior (max 2 attempts)
-    for attempt in range(min(2, cf_verify_max_retries)):
+    for attempt in range(1):  # 1 opencv attempt (reduced from 2)
         try:
             # Check if already passed
             html = await page.get_content()
@@ -176,7 +176,8 @@ async def wait_for_cloudflare(
     check_interval = 3
     elapsed = 0
 
-    while elapsed < cloudflare_wait:
+    max_passive = min(cloudflare_wait, 6.0)
+    while elapsed < max_passive:
         html = await page.get_content()
 
         if not is_cloudflare_blocked(html):

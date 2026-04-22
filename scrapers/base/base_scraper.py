@@ -144,6 +144,13 @@ class BaseScraper(ABC):
             'successes': 0,
             'failures': 0,
             'tables_written': [],
+            'bytes_downloaded': 0,       # HTML-only bytes (from _track_download)
+            'pages_downloaded': 0,
+            'bytes_by_page_type': {},
+            # Real proxy traffic (via CDP Network events) — includes all
+            # resources actually fetched through proxy, before blocking.
+            'real_bytes_downloaded': 0,
+            'real_requests_count': 0,
         }
 
         logger.info(
@@ -246,6 +253,7 @@ class BaseScraper(ABC):
         table_name: str,
         partition_cols: Optional[List[str]] = None,
         database: str = 'bronze',
+        replace_partitions: Optional[List[str]] = None,
     ) -> str:
         """
         Save DataFrame to Iceberg table in Bronze layer.
@@ -255,6 +263,11 @@ class BaseScraper(ABC):
             table_name: Target table name (e.g., 'fbref_schedule')
             partition_cols: Columns to partition by
             database: Target database (default: 'bronze')
+            replace_partitions: When set (e.g. ``['league', 'season']``),
+                deletes existing rows matching the unique partition-key
+                tuples present in ``df`` BEFORE inserting. Gives
+                partition-replace semantics instead of plain append.
+                Used by schedule writers to prevent INSERT-only duplication.
 
         Returns:
             Full table identifier
@@ -268,18 +281,61 @@ class BaseScraper(ABC):
         if partition_cols:
             partition_spec = [(col, 'identity') for col in partition_cols]
 
+        delete_filter = (
+            self._build_partition_delete_filter(df, replace_partitions)
+            if replace_partitions else None
+        )
+
         table_path = self._iceberg_writer.write_dataframe(
             df=df,
             database=database,
             table=table_name,
             partition_spec=partition_spec,
             source=self.SOURCE_NAME,
+            delete_filter=delete_filter,
         )
 
         self._stats['tables_written'].append(table_path)
         logger.info(f"Saved {len(df)} rows to {table_path}")
 
         return table_path
+
+    @staticmethod
+    def _build_partition_delete_filter(
+        df: pd.DataFrame,
+        partition_cols: List[str],
+    ) -> Optional[str]:
+        """Build a SQL WHERE clause matching every (partition_cols) tuple
+        present in ``df``. Returns None if any required column is missing
+        or no usable rows remain.
+
+        String values are single-quote-escaped; numeric values stay raw.
+        NaN/None partition values are dropped.
+        """
+        missing = [c for c in partition_cols if c not in df.columns]
+        if missing:
+            logger.warning(
+                f"replace_partitions={partition_cols} requested but missing "
+                f"columns: {missing}. Falling back to plain append."
+            )
+            return None
+
+        unique = df[partition_cols].drop_duplicates().dropna()
+        if unique.empty:
+            return None
+
+        clauses = []
+        for _, row in unique.iterrows():
+            parts = []
+            for col in partition_cols:
+                val = row[col]
+                if isinstance(val, str):
+                    safe = val.replace("'", "''")
+                    parts.append(f"{col} = '{safe}'")
+                else:
+                    parts.append(f"{col} = {val}")
+            clauses.append('(' + ' AND '.join(parts) + ')')
+        return ' OR '.join(clauses)
 
     @abstractmethod
     def scrape_all(self) -> Dict[str, str]:
@@ -294,8 +350,19 @@ class BaseScraper(ABC):
 
     def get_stats(self) -> Dict[str, Any]:
         """Get scraping statistics."""
+        bytes_total = self._stats.get('bytes_downloaded', 0)
+        if bytes_total >= 1024 * 1024 * 1024:
+            traffic_human = f"{bytes_total / 1024 / 1024 / 1024:.2f} GB"
+        elif bytes_total >= 1024 * 1024:
+            traffic_human = f"{bytes_total / 1024 / 1024:.1f} MB"
+        elif bytes_total >= 1024:
+            traffic_human = f"{bytes_total / 1024:.1f} KB"
+        else:
+            traffic_human = f"{bytes_total} B"
+
         return {
             **self._stats,
+            'traffic_human': traffic_human,
             'circuit_breaker_state': self._circuit_breaker.state,
             'rate_limiter_tokens': self._rate_limiter.available_tokens,
         }
@@ -308,6 +375,9 @@ class BaseScraper(ABC):
             'successes': 0,
             'failures': 0,
             'tables_written': [],
+            'bytes_downloaded': 0,
+            'pages_downloaded': 0,
+            'bytes_by_page_type': {},
         }
 
     def close(self) -> None:

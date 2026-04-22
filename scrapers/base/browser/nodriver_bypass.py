@@ -31,6 +31,7 @@ Cloudflare detection/bypass/HTML extraction: see nodriver_cloudflare.py
 
 import asyncio
 import logging
+import os
 import random
 from typing import Optional
 
@@ -207,6 +208,55 @@ class NodriverBypass:
         self._loop = None
         self._xvfb_display = None
 
+        # Real proxy traffic tracking (via CDP Network.loadingFinished events)
+        # Tracks actual bytes received through proxy including all resources
+        # (HTML, CSS, JS, images, etc.) — distinct from HTML-only size tracked
+        # at browser_manager level.
+        self._real_bytes_downloaded = 0
+        self._real_requests_count = 0
+        # Set to True after network blocking has been set up on current page
+        self._network_blocking_active = False
+
+    # Chrome DevTools Protocol URL patterns to block non-essential resources
+    # from being fetched through the proxy. FBref scraper uses BS4 parsing
+    # which only needs HTML — no styles, no images, no tracking.
+    #
+    # CRITICAL: Do NOT block:
+    # - JS from fbref.com (needed for FBREF_UNCOMMENT_TABLES_JS and initial page JS)
+    # - JS from cloudflare.com / challenges.cloudflare.com (needed for CF bypass)
+    # - HTML documents (the main content)
+    BLOCKED_URL_PATTERNS = [
+        # Images — FBref has club crests, player photos, flags
+        "*.jpg", "*.jpeg", "*.png", "*.gif", "*.webp",
+        "*.svg", "*.ico", "*.bmp", "*.tiff",
+        # Fonts — Google Fonts and custom fonts
+        "*.woff", "*.woff2", "*.ttf", "*.otf", "*.eot",
+        # Media — embedded videos on some match pages
+        "*.mp4", "*.webm", "*.mp3", "*.ogg", "*.m4a", "*.flv",
+        # CSS — parser doesn't need layout/styles
+        "*.css",
+        # Analytics & tracking
+        "*google-analytics.com*", "*googletagmanager.com*",
+        "*doubleclick.net*", "*googlesyndication.com*",
+        "*googleadservices.com*", "*googletagservices.com*",
+        "*facebook.net*", "*connect.facebook.net*",
+        "*facebook.com/tr*",
+        "*twitter.com/i/*", "*platform.twitter.com*",
+        "*cdn.ampproject.org*", "*amazon-adsystem.com*",
+        "*adsafeprotected.com*", "*adsrvr.org*",
+        "*scorecardresearch.com*", "*quantserve.com*",
+        # Additional 3rd-party trackers / RUM / heatmaps (Apr 2026).
+        # Reduces proxy traffic by ~5-10% per match page. Do NOT add
+        # challenges.cloudflare.com or turnstile.cloudflare.com here —
+        # they are required for CF bypass.
+        "*cloudflareinsights.com*", "*static.cloudflareinsights.com*",
+        "*newrelic.com*", "*nr-data.net*",
+        "*hotjar.com*", "*segment.io*", "*mixpanel.com*",
+        "*snap.licdn.com*", "*bat.bing.com*",
+        "*hs-scripts.com*", "*hs-analytics.net*",
+        "*/ads/*",
+    ]
+
     # ------------------------------------------------------------------ #
     #  Xvfb management                                                    #
     # ------------------------------------------------------------------ #
@@ -267,17 +317,25 @@ class NodriverBypass:
         except Exception as e:
             logger.debug(f"Chrome process cleanup: {e}")
 
-        # Clean up leftover temp directories
+        # Clean up leftover temp directories (with symlink protection)
         import glob
         import shutil
         for d in glob.glob('/tmp/uc_*'):
             try:
-                shutil.rmtree(d, ignore_errors=True)
+                if os.path.islink(d):
+                    logger.warning(f"Skipping symlink in cleanup: {d}")
+                    continue
+                if os.path.isdir(d):
+                    shutil.rmtree(d, ignore_errors=True)
             except Exception:
                 pass
         for d in glob.glob('/tmp/extension_*'):
             try:
-                shutil.rmtree(d, ignore_errors=True)
+                if os.path.islink(d):
+                    logger.warning(f"Skipping symlink in cleanup: {d}")
+                    continue
+                if os.path.isdir(d):
+                    shutil.rmtree(d, ignore_errors=True)
             except Exception:
                 pass
 
@@ -380,7 +438,185 @@ class NodriverBypass:
         # help mask headless fingerprint.
         await inject_stealth_js(self._page)
 
+        # Enable Network domain for real traffic tracking.
+        # Network.setBlockedURLs is NOT called here — it's applied later
+        # (after CF challenge succeeds) to avoid breaking CF fingerprinting.
+        try:
+            await self._enable_network_tracking()
+        except Exception as e:
+            logger.warning(f"Could not enable network tracking: {e}")
+
         logger.debug("Nodriver browser started successfully")
+
+    # ------------------------------------------------------------------ #
+    #  Network tracking & resource blocking (CDP)                         #
+    # ------------------------------------------------------------------ #
+
+    async def _enable_network_tracking(self):
+        """Enable CDP Network domain and subscribe to loadingFinished events.
+
+        This tracks real bytes received through the proxy (including all
+        resources: HTML, CSS, JS, images, fonts). Distinct from HTML-only
+        tracking at browser_manager level.
+        """
+        if self._page is None:
+            return
+        try:
+            import nodriver.cdp.network as cdp_network
+        except ImportError:
+            logger.debug("nodriver.cdp.network not available")
+            return
+
+        # Enable Network domain
+        await self._page.send(cdp_network.enable())
+
+        # Subscribe to loadingFinished — fires for every completed response
+        # with the actual encoded bytes received (post-decompression).
+        def _on_loading_finished(event):
+            try:
+                self._real_bytes_downloaded += int(event.encoded_data_length or 0)
+                self._real_requests_count += 1
+            except Exception:
+                pass
+
+        self._page.add_handler(cdp_network.LoadingFinished, _on_loading_finished)
+        logger.debug("Network.loadingFinished tracking enabled")
+
+    async def _setup_network_blocking(self):
+        """Apply CDP Network.setBlockedURLs to block non-essential resources.
+
+        Called AFTER successful Cloudflare bypass — blocking resources during
+        CF challenge would break fingerprinting (CF needs fonts/CSS to render
+        its widget correctly).
+
+        Reduces real proxy traffic by ~60-80% (no images/fonts/CSS downloads).
+        """
+        if self._page is None or self._network_blocking_active:
+            return
+        try:
+            import nodriver.cdp.network as cdp_network
+        except ImportError:
+            return
+
+        try:
+            await self._page.send(
+                cdp_network.set_blocked_ur_ls(urls=self.BLOCKED_URL_PATTERNS)
+            )
+            self._network_blocking_active = True
+            logger.debug(
+                f"Network blocking active: {len(self.BLOCKED_URL_PATTERNS)} patterns"
+            )
+        except Exception as e:
+            logger.warning(f"Failed to set blocked URLs: {e}")
+
+    def get_real_traffic_stats(self) -> dict:
+        """Return real proxy traffic stats tracked via CDP Network events."""
+        return {
+            'real_bytes_downloaded': self._real_bytes_downloaded,
+            'real_requests_count': self._real_requests_count,
+        }
+
+    # ------------------------------------------------------------------ #
+    #  CF cookie export/inject (cross-restart reuse)                     #
+    # ------------------------------------------------------------------ #
+
+    async def export_cf_cookies(self, domain: str = ".fbref.com") -> list:
+        """Export CF-related cookies via CDP.
+
+        Returns a list of cookie dicts (name/value/domain/path/expires/secure/
+        httpOnly/sameSite) ready to be fed back into `inject_cookies()` on a
+        later browser instance.
+        """
+        if self._browser is None:
+            return []
+        try:
+            all_cookies = await asyncio.wait_for(
+                self._browser.cookies.get_all(), timeout=5.0
+            )
+        except Exception as e:
+            logger.debug(f"export_cf_cookies: {e}")
+            return []
+
+        keep = {"cf_clearance", "__cf_bm", "cf_chl_opt"}
+        result = []
+        for c in all_cookies:
+            name = c.name if hasattr(c, 'name') else c.get('name', '')
+            if name not in keep:
+                continue
+            value = c.value if hasattr(c, 'value') else c.get('value', '')
+            c_domain = c.domain if hasattr(c, 'domain') else c.get('domain', domain)
+            path = c.path if hasattr(c, 'path') else c.get('path', '/')
+            expires = getattr(c, 'expires', None) or (c.get('expires') if isinstance(c, dict) else None)
+            result.append({
+                "name": name,
+                "value": value,
+                "domain": c_domain or domain,
+                "path": path or "/",
+                "expires": expires,
+                "secure": True,
+                "httpOnly": True,
+            })
+        return result
+
+    async def inject_cookies(self, cookies: list) -> int:
+        """Inject cookies into the running browser via CDP Network.setCookie.
+
+        Must be called AFTER `await self.start()` (self._page set), BEFORE
+        the first navigation to the target domain. Returns number of cookies
+        successfully set.
+        """
+        if not cookies or self._page is None:
+            return 0
+        try:
+            import nodriver.cdp.network as cdp_network
+        except ImportError:
+            return 0
+
+        injected = 0
+        for c in cookies:
+            try:
+                await self._page.send(
+                    cdp_network.set_cookie(
+                        name=c["name"],
+                        value=c["value"],
+                        domain=c.get("domain", ".fbref.com"),
+                        path=c.get("path", "/"),
+                        secure=c.get("secure", True),
+                        http_only=c.get("httpOnly", True),
+                    )
+                )
+                injected += 1
+            except Exception as e:
+                logger.debug(f"inject_cookies: could not set {c.get('name')}: {e}")
+        if injected:
+            logger.info(
+                f"Injected {injected} cached CF cookies — expecting to skip CF challenge"
+            )
+        return injected
+
+    def export_cf_cookies_sync(self, domain: str = ".fbref.com") -> list:
+        """Synchronous wrapper for export_cf_cookies()."""
+        if self._browser is None:
+            return []
+        loop = self._get_or_create_loop()
+        try:
+            return loop.run_until_complete(self.export_cf_cookies(domain))
+        except Exception as e:
+            logger.debug(f"export_cf_cookies_sync: {e}")
+            return []
+
+    def inject_cookies_sync(self, cookies: list) -> int:
+        """Synchronous wrapper for inject_cookies(). Starts browser if needed."""
+        if not cookies:
+            return 0
+        loop = self._get_or_create_loop()
+        try:
+            if self._page is None:
+                loop.run_until_complete(self.start())
+            return loop.run_until_complete(self.inject_cookies(cookies))
+        except Exception as e:
+            logger.debug(f"inject_cookies_sync: {e}")
+            return 0
 
     # ------------------------------------------------------------------ #
     #  Proxy helpers                                                      #
@@ -442,6 +678,107 @@ class NodriverBypass:
         return proxy
 
     # ------------------------------------------------------------------ #
+    #  Dynamic proxy change (without browser restart)                     #
+    # ------------------------------------------------------------------ #
+
+    # Max time for entire CDP proxy change operation (prevents hangs)
+    _CDP_PROXY_CHANGE_TIMEOUT = 5.0
+
+    async def _find_extension_tab(self):
+        """Find the proxy extension's background page tab via CDP targets.
+
+        Wrapped in a timeout to prevent hangs when CDP websocket is stuck.
+        """
+        if not self._browser:
+            return None
+        try:
+            await asyncio.wait_for(self._browser.update_targets(), timeout=2.0)
+            for tab in self._browser.targets:
+                if hasattr(tab, 'target') and tab.target.type_ == 'background_page':
+                    return tab
+        except asyncio.TimeoutError:
+            logger.debug("update_targets() timed out")
+        except Exception as e:
+            logger.debug(f"Error finding extension tab: {e}")
+        return None
+
+    async def change_proxy(self, new_proxy: str) -> bool:
+        """Change proxy without browser restart via CDP.
+
+        Updates the proxy extension's config and auth credentials by calling
+        updateProxy() in the extension's background page context.
+
+        All CDP operations are wrapped in timeouts to prevent hangs.
+
+        Args:
+            new_proxy: New proxy string (host:port:user:pass or URL format)
+
+        Returns:
+            True if proxy changed successfully, False otherwise
+        """
+        if not self._browser:
+            return False
+
+        proxy_info = self._parse_proxy(new_proxy)
+        if not proxy_info.get('username'):
+            logger.debug("Cannot change proxy via CDP: no-auth proxy uses --proxy-server flag")
+            return False
+
+        try:
+            ext_tab = await self._find_extension_tab()
+            if not ext_tab:
+                logger.debug("Extension background page not found in targets")
+                return False
+
+            # Connect to extension tab if not connected (with timeout)
+            if not ext_tab.websocket or ext_tab.closed:
+                await asyncio.wait_for(ext_tab.connect(), timeout=2.0)
+
+            # Call updateProxy() in the extension context (with timeout)
+            import json as _json
+            js = (
+                f"updateProxy("
+                f"{_json.dumps(proxy_info['host'])}, "
+                f"{proxy_info['port']}, "
+                f"{_json.dumps(proxy_info['username'])}, "
+                f"{_json.dumps(proxy_info['password'])})"
+            )
+            result = await asyncio.wait_for(ext_tab.evaluate(js), timeout=2.0)
+            logger.info(
+                f"Proxy changed via CDP to {proxy_info['host']}:{proxy_info['port']} "
+                f"(result={result})"
+            )
+            self.proxy = new_proxy
+            return True
+
+        except asyncio.TimeoutError:
+            logger.warning("CDP proxy change timed out — falling back to browser restart")
+            return False
+        except Exception as e:
+            logger.warning(f"Failed to change proxy via CDP: {e}")
+            return False
+
+    def change_proxy_sync(self, new_proxy: str) -> bool:
+        """Synchronous wrapper for change_proxy() with overall timeout."""
+        loop = self._get_or_create_loop()
+        try:
+            return loop.run_until_complete(
+                asyncio.wait_for(
+                    self.change_proxy(new_proxy),
+                    timeout=self._CDP_PROXY_CHANGE_TIMEOUT,
+                )
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"CDP proxy change exceeded overall timeout "
+                f"{self._CDP_PROXY_CHANGE_TIMEOUT}s"
+            )
+            return False
+        except Exception as e:
+            logger.warning(f"Sync proxy change failed: {e}")
+            return False
+
+    # ------------------------------------------------------------------ #
     #  Navigation & content retrieval                                     #
     # ------------------------------------------------------------------ #
 
@@ -471,6 +808,13 @@ class NodriverBypass:
                 # Check if Cloudflare bypass succeeded
                 if not self._is_cloudflare_blocked(html):
                     logger.info(f"Successfully loaded page: {url} (attempt {attempt + 1})")
+                    # Apply network blocking after first successful CF bypass.
+                    # Blocking earlier would break CF fingerprinting (needs CSS/fonts).
+                    if not self._network_blocking_active:
+                        try:
+                            await self._setup_network_blocking()
+                        except Exception as e:
+                            logger.warning(f"Could not activate network blocking: {e}")
                     return html
 
                 logger.warning(
@@ -543,7 +887,7 @@ class NodriverBypass:
                 try:
                     await asyncio.wait_for(
                         self._wait_for_cloudflare(),
-                        timeout=self.cloudflare_wait + 30  # cloudflare_wait + buffer
+                        timeout=self.cloudflare_wait + 10  # buffer reduced: +30→+10
                     )
                 except asyncio.TimeoutError:
                     logger.warning(f"[DIAG] _wait_for_cloudflare() timed out, continuing anyway")
@@ -574,7 +918,7 @@ class NodriverBypass:
             # HTML download may still be in progress after initial DOM elements appear.
             # If evaluate hangs here, we set _runtime_hung flag and skip JS-dependent steps.
             _runtime_hung = False
-            readystate_timeout = 15.0  # 15s max for readyState check (reduced from 30s)
+            readystate_timeout = 8.0  # 8s max for readyState check (reduced from 15s)
             try:
                 logger.debug("[DIAG] Waiting for document.readyState === 'complete'...")
                 for _rs_attempt in range(int(readystate_timeout / 2)):
@@ -865,6 +1209,9 @@ class NodriverBypass:
             finally:
                 self._browser = None
                 self._page = None
+                # Reset network blocking state — fresh browser starts unblocked
+                # to allow Cloudflare bypass (which needs CSS/fonts/JS).
+                self._network_blocking_active = False
                 # Aggressive garbage collection to free Chromium memory
                 # Double collect handles circular references
                 import gc
@@ -920,6 +1267,7 @@ class NodriverBypass:
 
         self._browser = None
         self._page = None
+        self._network_blocking_active = False
         # Aggressive garbage collection after restart
         import gc
         gc.collect()
