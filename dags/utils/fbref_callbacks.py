@@ -111,7 +111,12 @@ def validate_all_data(**context) -> Dict[str, Any]:
     Validate all scraped data from all TaskGroups.
 
     Checks /tmp/fbref_*.json result files and validates minimum
-    data thresholds (at least 10 out of expected ~24 tables).
+    data thresholds (at least 12 out of expected ~26 tables).
+
+    Expected tables (26 total):
+    - 9 player stats + 9 team stats + 2 keeper stats = 20
+    - 6 match data: schedule, shot_events, match_events, lineups,
+      match_team_stats, match_player_stats
 
     Args:
         **context: Airflow context (passed by PythonOperator)
@@ -135,15 +140,39 @@ def validate_all_data(**context) -> Dict[str, Any]:
         'warnings': [],
         'tables_collected': [],
         'errors': [],
+        'fallback_files': [],
+        'missing_match_tables': [],
     }
 
-    # Check all result files
+    # Check for fallback JSON files (created when Trino was unavailable during batch save)
     result_dir = Path('/tmp')
 
+    for fallback_file in result_dir.glob('fbref_batch_*.json'):
+        validation['fallback_files'].append(str(fallback_file))
+        logger.warning(
+            f"Fallback JSON detected: {fallback_file.name} — "
+            f"data was saved locally because Trino was unavailable during batch save. "
+            f"This data needs to be re-ingested into Iceberg."
+        )
+
+    if validation['fallback_files']:
+        validation['warnings'].append(
+            f"{len(validation['fallback_files'])} fallback JSON file(s) found — "
+            f"Trino was unavailable during batch save"
+        )
+
+    # Check all result files
     for result_file in result_dir.glob('fbref_*.json'):
+        # Skip fallback files (already handled above)
+        if result_file.name.startswith('fbref_batch_'):
+            continue
         try:
             with open(result_file, 'r') as f:
                 result = json.load(f)
+
+            if not isinstance(result, dict):
+                logger.debug(f"Skipping {result_file.name}: not a result dict")
+                continue
 
             tables = result.get('tables', [])
             errors = result.get('errors', [])
@@ -163,19 +192,39 @@ def validate_all_data(**context) -> Dict[str, Any]:
     # Check minimum data thresholds
     total_tables = len(validation['tables_collected'])
 
-    # We expect at least:
-    # - 9 player tables + 9 team tables + 2 keeper tables + 4 match data tables = 24 tables
-    # But some may fail, so we accept >= 10 as partial success
+    # We expect 26 tables in total:
+    # - 9 player tables + 9 team tables + 2 keeper tables = 20
+    # - 6 match data tables (schedule, shot_events, match_events, lineups,
+    #   match_team_stats, match_player_stats)
+    # Some may fail — we accept >= 12 as partial success.
     if total_tables == 0:
         validation['status'] = 'failed'
         validation['warnings'].append('No tables were collected')
-    elif total_tables < 10:
+    elif total_tables < 12:
         validation['status'] = 'partial_success'
         validation['warnings'].append(
-            f"Only {total_tables} tables collected (expected ~24)"
+            f"Only {total_tables} tables collected (expected ~26)"
         )
     else:
         logger.info(f"Collected {total_tables} tables successfully")
+
+    # Explicit check for the two new match-level tables added in Feb 2026.
+    # Silver DAG (fbref_match_enriched.sql) depends on them — missing data
+    # here will cascade into CTAS failures downstream.
+    required_match_tables = {
+        'fbref_match_team_stats',
+        'fbref_match_player_stats',
+        'fbref_shot_events',
+        'fbref_match_events',
+        'fbref_lineups',
+    }
+    tables_set = set(validation['tables_collected'])
+    for tbl in required_match_tables:
+        if tbl not in tables_set:
+            validation['missing_match_tables'].append(tbl)
+            validation['warnings'].append(
+                f"Missing match table: {tbl} — Silver CTAS may fail"
+            )
 
     if validation['errors']:
         if validation['status'] == 'success':
@@ -191,3 +240,83 @@ def validate_all_data(**context) -> Dict[str, Any]:
         raise AirflowException(f"Validation failed: {validation}")
 
     return validation
+
+
+def check_traffic_guard(**context) -> Dict[str, Any]:
+    """Read `/tmp/fbref_traffic_match_all_data.json`, push metrics to XCom,
+    and raise when proxy traffic exceeds the configured threshold.
+
+    Threshold is read from Airflow Variable ``fbref_proxy_mb_threshold``
+    (default 500 MB). Set it via:
+        airflow variables set fbref_proxy_mb_threshold 800
+
+    Behaviour:
+    - Missing JSON file is a warning (task may have failed before writing).
+    - Threshold breach raises AirflowException (hard fail — user is paying
+      $4/GB, so crossing the budget matters).
+    - Uses module-level imports only from airflow + stdlib (no scrapers/
+      import — keeps Airflow scheduler process slim per CLAUDE.md).
+    """
+    import json
+    import logging
+    from pathlib import Path
+
+    from airflow.exceptions import AirflowException
+    from airflow.models import Variable
+
+    logger = logging.getLogger(__name__)
+
+    summary_path = Path('/tmp/fbref_traffic_match_all_data.json')
+
+    if not summary_path.exists():
+        logger.warning(
+            f"Traffic summary not found at {summary_path}. "
+            f"match_all_data task may have failed before writing it."
+        )
+        return {'status': 'missing', 'real_proxy_mb': None}
+
+    try:
+        with open(summary_path) as f:
+            summary = json.load(f)
+    except (json.JSONDecodeError, OSError) as e:
+        logger.warning(f"Could not read traffic summary: {e}")
+        return {'status': 'unreadable', 'real_proxy_mb': None}
+
+    real_mb = float(summary.get('real_proxy_mb') or 0.0)
+    requests = int(summary.get('real_proxy_requests') or 0)
+    successes = int(summary.get('matches_successes') or 0)
+
+    # Push to XCom so Airflow UI / downstream tasks can read current run cost.
+    ti = context.get('ti') or context.get('task_instance')
+    if ti is not None:
+        ti.xcom_push(key='real_proxy_mb', value=real_mb)
+        ti.xcom_push(key='real_proxy_requests', value=requests)
+        ti.xcom_push(key='matches_scraped', value=successes)
+
+    try:
+        threshold_mb = float(
+            Variable.get('fbref_proxy_mb_threshold', default_var='500')
+        )
+    except (ValueError, TypeError):
+        threshold_mb = 500.0
+
+    logger.info(
+        f"Traffic guard: real_proxy_mb={real_mb:.2f}, "
+        f"requests={requests}, matches={successes}, "
+        f"threshold={threshold_mb:.2f} MB"
+    )
+
+    if real_mb > threshold_mb:
+        raise AirflowException(
+            f"Proxy traffic {real_mb:.2f} MB exceeded threshold "
+            f"{threshold_mb:.2f} MB. Review Airflow Variable "
+            f"`fbref_proxy_mb_threshold` or investigate the run."
+        )
+
+    return {
+        'status': 'ok',
+        'real_proxy_mb': real_mb,
+        'real_proxy_requests': requests,
+        'matches_scraped': successes,
+        'threshold_mb': threshold_mb,
+    }

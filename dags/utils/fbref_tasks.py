@@ -7,9 +7,18 @@ Factory functions that create Airflow BashOperator tasks for FBref data collecti
 - create_single_stat_task: Creates a task for one stat_type (player/team/keeper)
 - create_match_data_task: Creates a task for one match data type (schedule, shot_events, etc.)
 - create_combined_match_data_task: Creates a combined task for all match-level data in one pass
+- create_trino_health_check_task: Creates a pre-flight Trino connectivity check
 """
 
+import logging
+import os
+import time
+from datetime import timedelta
+
 from airflow.operators.bash import BashOperator
+from airflow.operators.python import PythonOperator
+
+logger = logging.getLogger(__name__)
 
 
 # Common environment variables for all FBref scraper tasks
@@ -18,6 +27,9 @@ TASK_ENV = {
     'PATH': '/usr/local/bin:/usr/bin:/bin:/home/airflow/.local/bin',
     'HOME': '/home/airflow',
     'DISPLAY': ':99',
+    'TRINO_HOST': os.environ.get('TRINO_HOST', 'trino'),
+    'TRINO_PORT': os.environ.get('TRINO_PORT', '8443'),
+    'TRINO_PASSWORD': os.environ.get('TRINO_PASSWORD', ''),
 }
 
 
@@ -270,6 +282,7 @@ def create_single_stat_task(
         task_id=task_id,
         bash_command=bash_command,
         env=TASK_ENV,
+        append_env=True,
     )
 
 
@@ -375,6 +388,7 @@ def create_match_data_task(
         task_id=task_id,
         bash_command=bash_command,
         env=TASK_ENV,
+        append_env=True,
     )
 
 
@@ -435,4 +449,83 @@ def create_combined_match_data_task(
         task_id=task_id,
         bash_command=bash_command,
         env=TASK_ENV,
+        append_env=True,
+        execution_timeout=timedelta(hours=4),
+    )
+
+
+def _check_trino_health(**kwargs):
+    """Check Trino connectivity with retries.
+
+    Uses direct `import trino` to avoid heavy scrapers/__init__.py imports
+    (which pull in nodriver, selenium, soccerdata, etc. — ~1.5GB RAM).
+    """
+    import trino as trino_client
+
+    host = os.environ.get('TRINO_HOST', 'trino')
+    port = int(os.environ.get('TRINO_PORT', 8443))
+    user = os.environ.get('TRINO_USER', 'airflow')
+    password = os.environ.get('TRINO_PASSWORD', '')
+
+    max_attempts = 5
+    backoff_base = 10  # seconds
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            connect_kwargs = dict(
+                host=host,
+                port=port,
+                user=user,
+                catalog='iceberg',
+            )
+            if password:
+                connect_kwargs.update(
+                    http_scheme='https',
+                    auth=trino_client.auth.BasicAuthentication(user, password),
+                    verify=False,
+                )
+
+            conn = trino_client.dbapi.connect(**connect_kwargs)
+            cursor = conn.cursor()
+            cursor.execute('SELECT 1')
+            result = cursor.fetchall()
+            cursor.close()
+            conn.close()
+
+            if result and result[0][0] == 1:
+                logger.info(f"Trino health check passed on attempt {attempt}")
+                return True
+
+        except Exception as e:
+            backoff = backoff_base * attempt
+            logger.warning(
+                f"Trino health check attempt {attempt}/{max_attempts} failed: {e}. "
+                f"Retrying in {backoff}s..."
+            )
+            if attempt < max_attempts:
+                time.sleep(backoff)
+
+    raise ConnectionError(
+        f"Trino is not available after {max_attempts} attempts. "
+        f"Host: {host}:{port}"
+    )
+
+
+def create_trino_health_check_task(
+    task_id: str = 'check_trino_health',
+) -> PythonOperator:
+    """Create a pre-flight task to verify Trino is reachable.
+
+    This prevents downstream tasks from silently producing 0 results
+    when Trino is unavailable (schedule read from Iceberg fails → all
+    leagues skipped → 0 data → exit code 0).
+
+    Args:
+        task_id: Unique task ID (allows multiple health checks in one DAG).
+    """
+    return PythonOperator(
+        task_id=task_id,
+        python_callable=_check_trino_health,
+        retries=2,
+        retry_delay=timedelta(seconds=30),
     )
