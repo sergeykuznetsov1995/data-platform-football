@@ -14,7 +14,7 @@ RUN curl -fsSL "https://jdbc.postgresql.org/download/postgresql-42.7.4.jar" \
     -o /opt/spark/jars/postgresql-42.7.4.jar
 
 # Create spark-events directory
-RUN mkdir -p /tmp/spark-events && chmod 777 /tmp/spark-events
+RUN mkdir -p /tmp/spark-events && chmod 755 /tmp/spark-events
 
 # Create conf directory if not exists
 RUN mkdir -p /opt/spark/conf
@@ -32,4 +32,12 @@ RUN curl -fsSL "https://repo1.maven.org/maven2/org/apache/iceberg/iceberg-spark-
 RUN curl -fsSL "https://repo1.maven.org/maven2/org/apache/iceberg/iceberg-aws-bundle/1.4.3/iceberg-aws-bundle-1.4.3.jar" \
     -o /opt/spark/jars/iceberg-aws-bundle-1.4.3.jar
 
+# Create non-root spark user and set ownership
+RUN groupadd -r spark 2>/dev/null || true && \
+    useradd -r -g spark -d /opt/spark -s /bin/bash spark 2>/dev/null || true && \
+    mkdir -p /opt/spark/work && \
+    chown -R spark:spark /opt/spark /tmp/spark-events
+
 WORKDIR /opt/spark
+
+USER spark
