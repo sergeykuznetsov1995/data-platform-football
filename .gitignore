@@ -185,11 +185,24 @@ logs/
 # Secrets
 *.pem
 *.key
+*.jks
+*.p12
+password.db
 credentials/
 proxys.txt
+configs/trino/certs/
 
 # Documentation (local only)
 CLAUDE.md
 PLAN.md
 docs/
 scrapers/README.md
+
+# Local ad-hoc SQL (not part of pipeline; only dags/sql/ is tracked)
+/sql/
+
+# Local screenshots / scratch images
+/screen/
+/image.png
+/image*.png
+/image\ copy*.png
