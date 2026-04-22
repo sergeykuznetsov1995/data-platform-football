@@ -10,12 +10,16 @@ Storage Pipeline:
 """
 
 import logging
+import os
+import time
 from datetime import date, datetime
 from typing import Any, Dict, List, Optional
 
 import numpy as np
 import pandas as pd
 import pyarrow as pa
+
+from scrapers.base.sql_validator import validate_identifier, validate_catalog_qualified_name
 
 logger = logging.getLogger(__name__)
 
@@ -57,57 +61,159 @@ class TrinoTableManager:
     def __init__(
         self,
         host: str = 'trino',
-        port: int = 8080,
+        port: int = None,
         user: str = 'airflow',
         catalog: str = 'iceberg',
     ):
-        """
-        Initialize Trino Table Manager.
-
-        Args:
-            host: Trino coordinator hostname
-            port: Trino coordinator port
-            user: Trino user
-            catalog: Default catalog (iceberg)
-        """
         if not TRINO_AVAILABLE:
             raise RuntimeError("trino package not installed. Run: pip install trino")
 
         self.host = host
-        self.port = port
         self.user = user
         self.catalog = catalog
+        self._password = os.environ.get('TRINO_PASSWORD')
+        if self._password:
+            self.port = port or int(os.environ.get('TRINO_PORT', 8443))
+        else:
+            self.port = port or int(os.environ.get('TRINO_PORT', 8080))
+            logger.info("TRINO_PASSWORD not set, connecting via HTTP (no auth)")
         self._conn = None
+
+    # Retry settings for connection
+    _CONNECT_RETRIES = 3
+    _CONNECT_BACKOFF = (3, 5, 10)  # seconds (reduced from 5, 10, 20)
+
+    # Class-level fail-fast cache: if Trino was unreachable in this process,
+    # skip retries to avoid wasting 18+ seconds per call
+    _trino_unreachable = False
 
     @property
     def connection(self):
-        """Get or create Trino connection."""
+        """Get or create Trino connection with retry logic."""
         if self._conn is None:
-            self._conn = trino.dbapi.connect(
+            if TrinoTableManager._trino_unreachable:
+                raise TrinoError(
+                    f"Trino fast-fail: previously detected as unreachable "
+                    f"at {self.host}:{self.port}. "
+                    f"Skipping retry to avoid delays."
+                )
+            self._connect_with_retry()
+        return self._conn
+
+    def _create_connection(self):
+        """Create a new Trino connection."""
+        if self._password:
+            return trino.dbapi.connect(
+                host=self.host,
+                port=self.port,
+                user=self.user,
+                catalog=self.catalog,
+                http_scheme='https',
+                auth=trino.auth.BasicAuthentication(self.user, self._password),
+                verify=False,  # self-signed certificate
+            )
+        else:
+            return trino.dbapi.connect(
                 host=self.host,
                 port=self.port,
                 user=self.user,
                 catalog=self.catalog,
             )
-        return self._conn
+
+    def _connect_with_retry(self):
+        """Connect to Trino with retry and exponential backoff."""
+        last_error = None
+        for attempt in range(self._CONNECT_RETRIES):
+            try:
+                conn = self._create_connection()
+                # Test connection with simple query
+                cursor = conn.cursor()
+                cursor.execute('SELECT 1')
+                cursor.fetchall()
+                cursor.close()
+                self._conn = conn
+                TrinoTableManager._trino_unreachable = False
+                if attempt > 0:
+                    logger.info(f"Trino connection established on attempt {attempt + 1}")
+                return
+            except Exception as e:
+                last_error = e
+                if attempt < self._CONNECT_RETRIES - 1:
+                    backoff = self._CONNECT_BACKOFF[min(attempt, len(self._CONNECT_BACKOFF) - 1)]
+                    logger.warning(
+                        f"Trino connection attempt {attempt + 1}/{self._CONNECT_RETRIES} failed: {e}. "
+                        f"Retrying in {backoff}s..."
+                    )
+                    time.sleep(backoff)
+                else:
+                    logger.warning(
+                        f"Trino connection attempt {attempt + 1}/{self._CONNECT_RETRIES} failed: {e}. "
+                        f"No more retries."
+                    )
+
+        TrinoTableManager._trino_unreachable = True
+        raise TrinoError(
+            f"Failed to connect to Trino after {self._CONNECT_RETRIES} attempts: {last_error}"
+        )
+
+    def _reset_connection(self):
+        """Reset the connection (close existing, will reconnect on next use).
+
+        Also resets the fast-fail cache so that the next access to
+        ``self.connection`` will attempt a fresh ``_connect_with_retry``.
+        """
+        if self._conn is not None:
+            try:
+                self._conn.close()
+            except Exception:
+                pass
+            self._conn = None
+        TrinoTableManager._trino_unreachable = False
+
+    _CONNECTION_ERRORS = ('Connection refused', 'Connection reset', 'Connection aborted')
 
     def _execute(self, sql: str, fetch: bool = False) -> Optional[List[Any]]:
-        """Execute SQL statement."""
-        cursor = self.connection.cursor()
-        try:
-            logger.debug(f"Executing SQL: {sql}")
-            cursor.execute(sql)
+        """Execute SQL statement.
 
-            if fetch:
-                return cursor.fetchall()
-            return None
+        Always consumes query results to prevent USER_CANCELED errors.
+        Trino Python client cancels queries on cursor.close() if results
+        are not fully consumed.
 
-        except Exception as e:
-            logger.error(f"SQL execution error: {e}\nSQL: {sql}")
-            raise TrinoError(f"SQL execution failed: {e}") from e
+        On connection errors, resets connection and retries once.
+        """
+        for attempt in range(2):
+            cursor = self.connection.cursor()
+            try:
+                logger.debug(f"Executing SQL: {sql[:200]}...")
+                cursor.execute(sql)
 
-        finally:
-            cursor.close()
+                if fetch:
+                    return cursor.fetchall()
+
+                # Consume results even for DDL/DML to ensure query completes
+                try:
+                    cursor.fetchall()
+                except Exception:
+                    pass
+                return None
+
+            except Exception as e:
+                error_str = str(e)
+                is_conn_error = any(msg in error_str for msg in self._CONNECTION_ERRORS)
+
+                if is_conn_error and attempt == 0:
+                    logger.warning(
+                        f"Connection error during SQL execution: {e}. "
+                        f"Resetting connection and retrying..."
+                    )
+                    self._reset_connection()
+                    continue
+
+                logger.error(f"SQL execution error: {e}\nSQL (truncated): {sql[:500]}")
+                raise TrinoError(f"SQL execution failed: {e}") from e
+
+            finally:
+                cursor.close()
 
     def create_schema(self, schema: str) -> None:
         """
@@ -116,7 +222,8 @@ class TrinoTableManager:
         Args:
             schema: Schema name (e.g., 'bronze', 'silver', 'gold')
         """
-        sql = f"CREATE SCHEMA IF NOT EXISTS {self.catalog}.{schema}"
+        qualified = validate_catalog_qualified_name(self.catalog, schema)
+        sql = f"CREATE SCHEMA IF NOT EXISTS {qualified}"
 
         try:
             self._execute(sql)
@@ -127,6 +234,7 @@ class TrinoTableManager:
 
     def schema_exists(self, schema: str) -> bool:
         """Check if schema exists."""
+        validate_identifier(schema, "schema")
         sql = f"SHOW SCHEMAS FROM {self.catalog} LIKE '{schema}'"
         result = self._execute(sql, fetch=True)
         return len(result) > 0
@@ -142,7 +250,9 @@ class TrinoTableManager:
         Returns:
             True if table exists
         """
-        sql = f"SHOW TABLES FROM {self.catalog}.{schema} LIKE '{table}'"
+        qualified = validate_catalog_qualified_name(self.catalog, schema)
+        validate_identifier(table, "table")
+        sql = f"SHOW TABLES FROM {qualified} LIKE '{table}'"
 
         try:
             result = self._execute(sql, fetch=True)
@@ -175,6 +285,8 @@ class TrinoTableManager:
         # Ensure schema exists
         self.create_schema(schema)
 
+        qualified = validate_catalog_qualified_name(self.catalog, schema, table)
+
         # Build column definitions (quote names to handle reserved keywords like 'from', 'to')
         col_defs = [f'    "{name}" {dtype}' for name, dtype in columns.items()]
 
@@ -189,7 +301,7 @@ class TrinoTableManager:
         # Build CREATE TABLE statement
         exists_clause = "IF NOT EXISTS " if if_not_exists else ""
 
-        sql = f"""CREATE TABLE {exists_clause}{self.catalog}.{schema}.{table} (
+        sql = f"""CREATE TABLE {exists_clause}{qualified} (
 {columns_sql}
 )
 WITH (
@@ -225,15 +337,18 @@ WITH (
         col_defs = [f'    "{name}" {dtype}' for name, dtype in columns.items()]
         columns_sql = ",\n".join(col_defs)
 
+        qualified = validate_catalog_qualified_name(self.catalog, schema, table)
         exists_clause = "IF NOT EXISTS " if if_not_exists else ""
 
         # Iceberg partitioning syntax
         partition_clause = ""
         if partition_columns:
+            for pc in partition_columns:
+                validate_identifier(pc, "partition column")
             cols = ", ".join(f"'{c}'" for c in partition_columns)
             partition_clause = f"\nWITH (partitioning = ARRAY[{cols}])"
 
-        sql = f"""CREATE TABLE {exists_clause}{self.catalog}.{schema}.{table} (
+        sql = f"""CREATE TABLE {exists_clause}{qualified} (
 {columns_sql}
 ){partition_clause}"""
 
@@ -360,6 +475,8 @@ WITH (
         except Exception as e:
             logger.debug(f"Could not fetch table column types: {e}")
 
+        qualified = validate_catalog_qualified_name(self.catalog, schema, table)
+
         total_inserted = 0
         columns = ', '.join(f'"{c}"' for c in df.columns)
 
@@ -378,7 +495,7 @@ WITH (
 
             values_sql = ",\n".join(rows)
 
-            sql = f"""INSERT INTO {self.catalog}.{schema}.{table} ({columns})
+            sql = f"""INSERT INTO {qualified} ({columns})
 VALUES
 {values_sql}"""
 
@@ -401,8 +518,9 @@ VALUES
             table: Table name
             if_exists: Add IF EXISTS clause
         """
+        qualified = validate_catalog_qualified_name(self.catalog, schema, table)
         exists_clause = "IF EXISTS " if if_exists else ""
-        sql = f"DROP TABLE {exists_clause}{self.catalog}.{schema}.{table}"
+        sql = f"DROP TABLE {exists_clause}{qualified}"
 
         self._execute(sql)
         logger.info(f"Dropped table: {self.catalog}.{schema}.{table}")
@@ -418,6 +536,8 @@ VALUES
             schema: Schema name
             table: Table name
         """
+        validate_identifier(schema, "schema")
+        validate_identifier(table, "table")
         # For Hive connector, we use sync_partition_metadata procedure
         sql = f"""CALL {self.catalog}.system.sync_partition_metadata(
     schema_name => '{schema}',
@@ -442,7 +562,8 @@ VALUES
             column: Column name
             column_type: Trino type (e.g., 'VARCHAR', 'BIGINT', 'DOUBLE')
         """
-        sql = f'ALTER TABLE {self.catalog}.{schema}.{table} ADD COLUMN "{column}" {column_type}'
+        qualified = validate_catalog_qualified_name(self.catalog, schema, table)
+        sql = f'ALTER TABLE {qualified} ADD COLUMN "{column}" {column_type}'
         self._execute(sql)
         logger.info(f'Added column "{column}" {column_type} to {self.catalog}.{schema}.{table}')
 
@@ -457,7 +578,8 @@ VALUES
         Returns:
             Dict of column_name -> type
         """
-        sql = f"DESCRIBE {self.catalog}.{schema}.{table}"
+        qualified = validate_catalog_qualified_name(self.catalog, schema, table)
+        sql = f"DESCRIBE {qualified}"
         result = self._execute(sql, fetch=True)
 
         columns = {}
@@ -629,3 +751,31 @@ VALUES
 class TrinoError(Exception):
     """Trino operation error."""
     pass
+
+
+_ICEBERG_METADATA_ERRORS = frozenset({
+    'ICEBERG_INVALID_METADATA',
+    'ICEBERG_MISSING_METADATA',
+})
+
+
+def _is_iceberg_invalid_metadata(error: Exception) -> bool:
+    """
+    Check if error is caused by corrupted/missing Iceberg metadata.
+
+    Matches both ICEBERG_INVALID_METADATA and ICEBERG_MISSING_METADATA
+    error names. Walks the __cause__ chain because _execute() wraps the
+    original TrinoExternalError in TrinoError via 'raise ... from e'.
+
+    Args:
+        error: Exception to check
+
+    Returns:
+        True if Iceberg metadata error found in cause chain
+    """
+    cause = error
+    while cause is not None:
+        if getattr(cause, 'error_name', None) in _ICEBERG_METADATA_ERRORS:
+            return True
+        cause = getattr(cause, '__cause__', None)
+    return False
