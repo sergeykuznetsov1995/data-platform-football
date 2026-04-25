@@ -1,0 +1,70 @@
+# =============================================================================
+# OpenMetadata description: iceberg.gold.fct_player_match
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.gold.fct_player_match
+  description: |
+    Per-player перформанс в матче: голы, ассисты, удары, минуты, карточки,
+    отборы, фолы. Один игрок = одна строка на матч. Источник для
+    feat_player_form и для отчётов по индивидуальной статистике.
+  tags:
+    - Tier.Gold
+    - Domain.Football
+    - PII.Low
+columns:
+  - name: match_id
+    description: ID матча (FK -> dim_match.match_id).
+  - name: player_id
+    description: ID игрока (FK -> dim_player.player_id).
+  - name: team_id
+    description: Канонический ID команды игрока в матче (FK -> dim_team.team_id).
+  - name: team_name
+    description: Имя команды как в источнике (для отладки).
+  - name: team_side
+    description: Сторона команды — "home" или "away".
+  - name: position
+    description: Позиция игрока в этом матче.
+  - name: minutes
+    description: Сыгранные минуты.
+  - name: goals
+    description: Голы игрока в матче.
+  - name: assists
+    description: Ассисты игрока в матче.
+  - name: shots
+    description: Удары игрока.
+  - name: shots_on_target
+    description: Удары в створ.
+  - name: penalty_goals
+    description: Забитые пенальти.
+  - name: penalty_attempts
+    description: Попытки пенальти.
+  - name: yellow_cards
+    description: Жёлтые карточки.
+  - name: red_cards
+    description: Красные карточки.
+  - name: tackles_won
+    description: Выигранные единоборства/отборы.
+  - name: interceptions
+    description: Перехваты.
+  - name: fouls_committed
+    description: Совершённые фолы.
+  - name: fouls_drawn
+    description: Заработанные фолы.
+  - name: offsides
+    description: Офсайды.
+  - name: own_goals
+    description: Автоголы.
+  - name: league
+    description: Лига.
+  - name: season
+    description: Сезон.
+relationships:
+  - from: match_id
+    to: trino_iceberg.iceberg.gold.dim_match.match_id
+    type: FOREIGN_KEY
+  - from: player_id
+    to: trino_iceberg.iceberg.gold.dim_player.player_id
+    type: FOREIGN_KEY
+  - from: team_id
+    to: trino_iceberg.iceberg.gold.dim_team.team_id
+    type: FOREIGN_KEY

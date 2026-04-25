@@ -113,6 +113,39 @@ def telegram_on_success(context: Dict[str, Any]) -> None:
         logger.warning(f"telegram_on_success swallowed: {e}")
 
 
+def send_telegram_message(message: str, level: str = "info") -> bool:
+    """Send an arbitrary message to Telegram (no Airflow context required).
+
+    Use this for ad-hoc notifications from inside task callables (e.g.
+    Superset alert bridge in dag_superset_alerts). For DAG-level
+    on_failure callbacks, prefer ``telegram_on_failure``.
+
+    Args:
+        message: Message body. May contain HTML (<b>, <code>, <a href>);
+            anything <4000 chars will be passed through, longer messages
+            are truncated by ``_send_telegram``.
+        level: Severity tag prepended to the message — one of
+            ``info``, ``warning``, ``error``, ``critical``.
+
+    Returns:
+        True if Telegram accepted the message, False otherwise (missing
+        creds, HTTP error, network error). Never raises.
+    """
+    try:
+        env = _get_var('ALERT_ENV', 'dev')
+        emoji = {
+            'info': 'ℹ️',
+            'warning': '⚠️',
+            'error': '❌',
+            'critical': '🔥',
+        }.get(level.lower(), 'ℹ️')
+        prefix = f"<b>[{env}] {emoji} {level.upper()}</b>\n"
+        return _send_telegram(prefix + message)
+    except Exception as e:
+        logger.warning(f"send_telegram_message swallowed: {e}")
+        return False
+
+
 def telegram_dq_summary(report, header: str = "DQ report") -> None:
     """Post a DQ run_checks() report to Telegram.
 

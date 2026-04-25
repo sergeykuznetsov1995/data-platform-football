@@ -1,0 +1,73 @@
+# =============================================================================
+# OpenMetadata 1.5.x — Trino Metadata Ingestion Workflow
+# =============================================================================
+# Schema: openmetadata-spec/.../entity/services/connections/database/trinoConnection.json
+#
+# Purpose: discover catalogs / schemas / tables in `iceberg` catalog (bronze,
+# silver, gold) and push the resulting metadata to OpenMetadata REST API.
+#
+# Run:
+#   docker compose exec openmetadata-ingestion \
+#     metadata ingest -c /opt/configs/trino_ingestion.yaml
+#
+# Required env vars (resolved by `metadata` CLI from container env):
+#   TRINO_OPENMETADATA_PASSWORD — Trino BASIC auth password for `openmetadata` user
+#   OM_JWT_TOKEN                — JWT for ingestion-bot (Settings → Bots → ingestion-bot)
+# =============================================================================
+
+source:
+  type: trino
+  serviceName: trino_iceberg
+  serviceConnection:
+    config:
+      type: Trino
+      # SQLAlchemy driver scheme — default `trino` is correct for trino-python-client.
+      scheme: trino
+      hostPort: trino:8443
+      username: openmetadata
+      # OpenMetadata 1.5.x auth model: nested `authType` discriminator.
+      # basicAuth.json schema → { password: <string> }
+      authType:
+        password: "${TRINO_OPENMETADATA_PASSWORD}"
+      catalog: iceberg
+      # SSL: cluster runs HTTPS with self-signed cert (configs/trino/certs/keystore.jks),
+      # so disable strict verification. For prod, mount the cert into the ingestion
+      # container and switch to `validate-ssl` + `sslConfig.caCertificate`.
+      verifySSL: no-ssl
+      # connectionArguments are forwarded to sqlalchemy.create_engine(...) → trino-python.
+      # `http_scheme=https` forces HTTPS; `verify=false` disables cert chain checks.
+      connectionArguments:
+        http_scheme: https
+        verify: false
+  sourceConfig:
+    config:
+      type: DatabaseMetadata
+      # Only ingest the three Medallion schemas; ignore default/information_schema/system.
+      schemaFilterPattern:
+        includes:
+          - "^bronze$"
+          - "^silver$"
+          - "^gold$"
+      # Skip Trino/Iceberg internal/temp tables (anything starting with underscore).
+      tableFilterPattern:
+        excludes:
+          - "^_.*"
+      includeTables: true
+      includeViews: false
+      # Soft-delete tables that disappeared from Trino on the next run.
+      markDeletedTables: true
+      # We use bronze/silver/gold across catalogs in the future — keep filters per schema.
+      includeOwners: false
+      includeTags: true
+
+sink:
+  type: metadata-rest
+  config: {}
+
+workflowConfig:
+  loggerLevel: INFO
+  openMetadataServerConfig:
+    hostPort: http://openmetadata-server:8585/api
+    authProvider: openmetadata
+    securityConfig:
+      jwtToken: "${OM_JWT_TOKEN}"

@@ -180,6 +180,8 @@ services:
       POSTGRES_DB: ${POSTGRES_DB}
       AIRFLOW_DB_PASSWORD: ${AIRFLOW_DB_PASSWORD}
       HIVE_METASTORE_DB_PASSWORD: ${HIVE_METASTORE_DB_PASSWORD}
+      SUPERSET_DB_PASSWORD: ${SUPERSET_DB_PASSWORD}
+      OPENMETADATA_DB_PASSWORD: ${OPENMETADATA_DB_PASSWORD}
     ports:
       - "127.0.0.1:5432:5432"
     volumes:
@@ -576,6 +578,311 @@ services:
         reservations:
           memory: 1G
 
+  # ===========================================================================
+  # Superset - BI / Dashboards
+  # ===========================================================================
+  superset:
+    image: apache/superset:4.1.1
+    container_name: superset
+    hostname: superset
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETGID
+      - SETUID
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      trino:
+        condition: service_started
+    networks:
+      - frontend
+      - backend
+    ports:
+      - "127.0.0.1:8088:8088"
+    environment:
+      SUPERSET_SECRET_KEY: ${SUPERSET_SECRET_KEY}
+      DATABASE_URL: postgresql+psycopg2://superset:${SUPERSET_DB_PASSWORD}@postgres:5432/superset
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_DB: 2
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+      SUPERSET_ADMIN_PASSWORD: ${SUPERSET_ADMIN_PASSWORD}
+      TRINO_SUPERSET_PASSWORD: ${TRINO_SUPERSET_PASSWORD}
+      PYTHONPATH: /app/pythonpath:/app/pythonpath_dev
+    volumes:
+      - ./configs/superset/superset_config.py:/app/pythonpath/superset_config.py:ro
+      - ./configs/superset/bootstrap.sh:/app/pythonpath/bootstrap.sh:ro
+      - ./configs/superset/datasources.yaml:/app/pythonpath/datasources.yaml:ro
+      - ./configs/superset/import_datasources.py:/app/pythonpath/import_datasources.py:ro
+      - ./configs/superset/dashboards:/app/pythonpath/dashboards:ro
+      - superset_home:/app/superset_home
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8088/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    deploy:
+      resources:
+        limits:
+          memory: 1500M
+        reservations:
+          memory: 512M
+
+  superset-worker:
+    image: apache/superset:4.1.1
+    container_name: superset-worker
+    hostname: superset-worker
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETGID
+      - SETUID
+    command: ["celery", "--app=superset.tasks.celery_app:app", "worker", "--pool=prefork", "-O", "fair", "-c", "4"]
+    depends_on:
+      superset:
+        condition: service_healthy
+    networks:
+      - backend
+    environment:
+      SUPERSET_SECRET_KEY: ${SUPERSET_SECRET_KEY}
+      DATABASE_URL: postgresql+psycopg2://superset:${SUPERSET_DB_PASSWORD}@postgres:5432/superset
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_DB: 2
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+      TRINO_SUPERSET_PASSWORD: ${TRINO_SUPERSET_PASSWORD}
+      PYTHONPATH: /app/pythonpath:/app/pythonpath_dev
+    volumes:
+      - ./configs/superset/superset_config.py:/app/pythonpath/superset_config.py:ro
+      - ./configs/superset/bootstrap.sh:/app/pythonpath/bootstrap.sh:ro
+      - ./configs/superset/datasources.yaml:/app/pythonpath/datasources.yaml:ro
+      - ./configs/superset/import_datasources.py:/app/pythonpath/import_datasources.py:ro
+      - ./configs/superset/dashboards:/app/pythonpath/dashboards:ro
+      - superset_home:/app/superset_home
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 500M
+        reservations:
+          memory: 256M
+
+  superset-beat:
+    image: apache/superset:4.1.1
+    container_name: superset-beat
+    hostname: superset-beat
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETGID
+      - SETUID
+    command: ["celery", "--app=superset.tasks.celery_app:app", "beat", "--pidfile", "/tmp/celerybeat.pid", "-f", "/tmp/celery_beat.log"]
+    depends_on:
+      superset-worker:
+        condition: service_started
+    networks:
+      - backend
+    environment:
+      SUPERSET_SECRET_KEY: ${SUPERSET_SECRET_KEY}
+      DATABASE_URL: postgresql+psycopg2://superset:${SUPERSET_DB_PASSWORD}@postgres:5432/superset
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_DB: 2
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+      PYTHONPATH: /app/pythonpath:/app/pythonpath_dev
+    volumes:
+      - ./configs/superset/superset_config.py:/app/pythonpath/superset_config.py:ro
+      - ./configs/superset/bootstrap.sh:/app/pythonpath/bootstrap.sh:ro
+      - ./configs/superset/datasources.yaml:/app/pythonpath/datasources.yaml:ro
+      - ./configs/superset/import_datasources.py:/app/pythonpath/import_datasources.py:ro
+      - ./configs/superset/dashboards:/app/pythonpath/dashboards:ro
+      - superset_home:/app/superset_home
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 200M
+        reservations:
+          memory: 64M
+
+  # ===========================================================================
+  # Elasticsearch - search backend for OpenMetadata
+  # ===========================================================================
+  elasticsearch:
+    image: elasticsearch:8.11.4
+    container_name: elasticsearch
+    hostname: elasticsearch
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETGID
+      - SETUID
+      - DAC_OVERRIDE
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - ES_JAVA_OPTS=-Xms512m -Xmx512m
+      - cluster.name=openmetadata-cluster
+      - bootstrap.memory_lock=false
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+    volumes:
+      - es_data:/usr/share/elasticsearch/data
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9200/_cluster/health | grep -q -E '\"status\":\"(yellow|green)\"'"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+        reservations:
+          memory: 512M
+
+  # ===========================================================================
+  # OpenMetadata - Data Catalog & Lineage
+  # ===========================================================================
+  openmetadata-server:
+    image: openmetadata/server:1.5.0
+    container_name: openmetadata-server
+    hostname: openmetadata-server
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETGID
+      - SETUID
+      - DAC_OVERRIDE
+    depends_on:
+      postgres:
+        condition: service_healthy
+      elasticsearch:
+        condition: service_healthy
+    networks:
+      - frontend
+      - backend
+    ports:
+      - "127.0.0.1:8585:8585"
+      - "127.0.0.1:8586:8586"
+    environment:
+      # Database (Postgres)
+      DB_DRIVER_CLASS: org.postgresql.Driver
+      DB_SCHEME: postgresql
+      DB_USE_SSL: "false"
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_USER: openmetadata
+      DB_USER_PASSWORD: ${OPENMETADATA_DB_PASSWORD}
+      OM_DATABASE: openmetadata
+      # Search (Elasticsearch)
+      ELASTICSEARCH_HOST: elasticsearch
+      ELASTICSEARCH_PORT: 9200
+      ELASTICSEARCH_SCHEME: http
+      ELASTICSEARCH_USER: ""
+      ELASTICSEARCH_PASSWORD: ""
+      SEARCH_TYPE: elasticsearch
+      # Authentication / Authorization (basic auth, single admin)
+      AUTHENTICATION_PROVIDER: basic
+      AUTHENTICATION_AUTHORITY: https://accounts.google.com
+      AUTHORIZER_CLASS_NAME: org.openmetadata.service.security.DefaultAuthorizer
+      AUTHORIZER_REQUEST_FILTER: org.openmetadata.service.security.JwtFilter
+      AUTHORIZER_ADMIN_PRINCIPALS: "[admin]"
+      AUTHORIZER_PRINCIPAL_DOMAIN: openmetadata.org
+      AUTHORIZER_INGESTION_PRINCIPALS: "[ingestion-bot]"
+      AUTHORIZER_ENFORCE_PRINCIPAL_DOMAIN: "false"
+      AUTHORIZER_ENABLE_SECURE_SOCKET_CONNECTION: "false"
+      # Server
+      OPENMETADATA_CLUSTER_NAME: openmetadata
+      SERVER_PORT: 8585
+      SERVER_ADMIN_PORT: 8586
+      LOG_LEVEL: INFO
+      # Migrations on startup
+      MIGRATION_LIMIT_PARAM: 1200
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8586/healthcheck | grep -q '\"healthy\":true' || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 180s
+    deploy:
+      resources:
+        limits:
+          memory: 1500M
+        reservations:
+          memory: 768M
+
+  openmetadata-ingestion:
+    image: openmetadata/ingestion:1.5.0
+    container_name: openmetadata-ingestion
+    hostname: openmetadata-ingestion
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETGID
+      - SETUID
+      - DAC_OVERRIDE
+    depends_on:
+      openmetadata-server:
+        condition: service_started
+    networks:
+      - backend
+    # Standalone CLI container — used to run `metadata ingest -c /opt/configs/<file>.yaml`
+    # on demand. Keep it alive so users can `docker compose exec openmetadata-ingestion bash`.
+    entrypoint: ["/bin/bash", "-c"]
+    command: ["echo 'OpenMetadata ingestion container ready. Use: docker compose exec openmetadata-ingestion metadata ingest -c /opt/configs/<file>.yaml'; tail -f /dev/null"]
+    environment:
+      OM_HOST_PORT: http://openmetadata-server:8585/api
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      PYTHONUNBUFFERED: "1"
+      # Resolved by `metadata ingest` CLI when expanding ${VAR} in YAML configs.
+      # Empty defaults are intentional — workflows fail with a clear error
+      # ("OM_JWT_TOKEN is empty") instead of silently using "${OM_JWT_TOKEN}"
+      # as a literal token string.
+      TRINO_OPENMETADATA_PASSWORD: ${TRINO_OPENMETADATA_PASSWORD:-}
+      OM_JWT_TOKEN: ${OM_JWT_TOKEN:-}
+    volumes:
+      - ./configs/openmetadata:/opt/configs:ro
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 800M
+        reservations:
+          memory: 256M
+
 # =============================================================================
 # Networks
 # =============================================================================
@@ -609,3 +916,7 @@ volumes:
     name: hive_warehouse
   redis_data:
     name: redis_data
+  superset_home:
+    name: superset_home
+  es_data:
+    name: es_data
