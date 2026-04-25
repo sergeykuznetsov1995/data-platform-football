@@ -152,6 +152,64 @@ class TestRunSilverTransform:
                 trino_host='localhost',
             )
 
+    def test_add_timestamp_true_injects_silver_created_at(self, tmp_path):
+        """Default behaviour: CTAS wraps SELECT and injects _silver_created_at."""
+        sql_file = tmp_path / "test.sql"
+        sql_file.write_text("SELECT 1 AS x")
+
+        mock_conn, mock_cursor = self._make_conn(
+            fetchall_side_effect=[[], [], [], [[1]]]
+        )
+
+        self._run_transform(
+            mock_conn, sql_file,
+            table_name='t', trino_host='localhost',
+            add_timestamp=True,
+        )
+
+        ctas_sql = mock_cursor.execute.call_args_list[2][0][0]
+        assert "CURRENT_TIMESTAMP AS _silver_created_at" in ctas_sql
+        # Wrap-style: outer SELECT around the user SELECT
+        assert "FROM (" in ctas_sql
+
+    def test_add_timestamp_false_omits_silver_created_at(self, tmp_path):
+        """Gold-on-Gold (e.g. fct_match_train SELECT m.*) must NOT inject the
+        timestamp — it would raise DUPLICATE_COLUMN_NAME because m.* already
+        carries it. Verifies the wrapper is bypassed entirely."""
+        sql_file = tmp_path / "test.sql"
+        sql_file.write_text("SELECT m.* FROM iceberg.gold.fct_match m")
+
+        mock_conn, mock_cursor = self._make_conn(
+            fetchall_side_effect=[[], [], [], [[1]]]
+        )
+
+        self._run_transform(
+            mock_conn, sql_file,
+            table_name='t', trino_host='localhost',
+            add_timestamp=False,
+        )
+
+        ctas_sql = mock_cursor.execute.call_args_list[2][0][0]
+        assert "_silver_created_at" not in ctas_sql
+        assert "CURRENT_TIMESTAMP" not in ctas_sql
+        # The user SELECT is inlined directly (no FROM (...) wrapping)
+        assert "SELECT m.* FROM iceberg.gold.fct_match m" in ctas_sql
+
+    def test_add_timestamp_default_is_true(self, tmp_path):
+        """Backward-compat: omitting add_timestamp behaves like add_timestamp=True."""
+        sql_file = tmp_path / "test.sql"
+        sql_file.write_text("SELECT 1 AS x")
+
+        mock_conn, mock_cursor = self._make_conn(
+            fetchall_side_effect=[[], [], [], [[1]]]
+        )
+
+        # No add_timestamp kwarg → default
+        self._run_transform(mock_conn, sql_file, table_name='t', trino_host='localhost')
+
+        ctas_sql = mock_cursor.execute.call_args_list[2][0][0]
+        assert "_silver_created_at" in ctas_sql
+
 
 class TestValidateSilverTables:
     """Tests for validate_silver_tables function."""
@@ -263,128 +321,116 @@ class TestCheckBronzeTableExists:
 
 
 class TestValidateSilverQuality:
-    """Tests for validate_silver_quality function."""
+    """Tests for validate_silver_quality (now backed by data_quality.CHECK API)."""
 
     def _make_conn(self, fetchall_side_effect=None):
         mock_conn = MagicMock()
         mock_cursor = MagicMock()
         mock_conn.cursor.return_value = mock_cursor
         if fetchall_side_effect is not None:
-            mock_cursor.fetchall.side_effect = fetchall_side_effect
+            mock_cursor.fetchone.side_effect = fetchall_side_effect
         return mock_conn, mock_cursor
 
-    def test_null_rate_passes(self):
+    def test_default_check_list_includes_critical_checks(self):
+        """Default Silver check list must include ERROR severity for PK/uniqueness/ref_integrity."""
         mod = _import_silver_tasks()
-        # total=100, nulls=2 → 2% NULL, threshold 5% → pass
-        mock_conn, _ = self._make_conn(fetchall_side_effect=[[[100, 2]]])
+        checks = mod._build_silver_checks(schema='silver')
 
-        checks = [
-            {'type': 'null_rate', 'table': 'fbref_player_season_profile', 'column': 'mp', 'max_null_pct': 5.0},
-        ]
-        with patch.object(mod, '_get_trino_connection', return_value=mock_conn):
-            result = mod.validate_silver_quality(checks=checks)
+        kinds = {c.kind for c in checks}
+        assert 'no_nulls' in kinds
+        assert 'no_duplicates' in kinds
+        assert 'ref_integrity' in kinds
+        assert 'freshness' in kinds
+        assert 'value_range' in kinds
+
+        # All PK / uniqueness / ref_integrity checks must be ERROR
+        for c in checks:
+            if c.kind in {'no_nulls', 'no_duplicates', 'ref_integrity'}:
+                assert c.severity == 'ERROR', (
+                    f"{c.name} must be ERROR (got {c.severity}) — "
+                    f"dirty data must not flow to Gold"
+                )
+            if c.kind in {'freshness', 'value_range'}:
+                assert c.severity == 'WARNING', (
+                    f"{c.name} expected WARNING (got {c.severity})"
+                )
+
+    def test_freshness_covers_all_silver_tables(self):
+        """Each Silver table must have a freshness check."""
+        mod = _import_silver_tasks()
+        checks = mod._build_silver_checks(schema='silver')
+
+        fresh_tables = {
+            c.params['table'] for c in checks if c.kind == 'freshness'
+        }
+        # 6 core tables (shot_events excluded — Bronze may be absent)
+        for t in [
+            'silver.fbref_match_enriched',
+            'silver.fbref_player_season_profile',
+            'silver.fbref_keeper_profile',
+            'silver.fbref_player_match_stats',
+            'silver.fbref_match_events',
+            'silver.fbref_match_lineups',
+        ]:
+            assert t in fresh_tables, f"missing freshness check for {t}"
+
+        # All freshness checks use the bronze ingestion timestamp column
+        for c in checks:
+            if c.kind == 'freshness':
+                assert c.params['ts_col'] == '_bronze_ingested_at'
+                assert c.params['max_age_hours'] == 48
+
+    def test_passing_checks_returns_summary(self):
+        """When all checks pass, validate_silver_quality returns a summary dict."""
+        mod = _import_silver_tasks()
+        from utils.data_quality import CHECK
+
+        # Single passing no_duplicates check (returns 0 dups)
+        mock_conn, _ = self._make_conn(fetchall_side_effect=[(0,)])
+
+        with patch('utils.data_quality._get_conn', return_value=mock_conn):
+            result = mod.validate_silver_quality(
+                checks=[CHECK.no_duplicates('silver.fbref_match_enriched', pk=['match_id'])],
+                raise_on_error=True,
+            )
 
         assert result['passed'] == 1
-        assert result['warnings'] == []
+        assert result['total'] == 1
+        assert result['errors'] == []
 
-    def test_null_rate_warns(self):
+    def test_error_check_raises(self):
+        """ERROR-severity failures raise (AirflowException or RuntimeError)."""
         mod = _import_silver_tasks()
-        # total=100, nulls=10 → 10% NULL, threshold 5% → warning
-        mock_conn, _ = self._make_conn(fetchall_side_effect=[[[100, 10]]])
+        from utils.data_quality import CHECK
 
-        checks = [
-            {'type': 'null_rate', 'table': 'fbref_player_season_profile', 'column': 'mp', 'max_null_pct': 5.0},
-        ]
-        with patch.object(mod, '_get_trino_connection', return_value=mock_conn):
-            result = mod.validate_silver_quality(checks=checks)
+        # Returns 5 duplicates → ERROR check fails
+        mock_conn, _ = self._make_conn(fetchall_side_effect=[(5,)])
 
-        assert result['passed'] == 0
+        with patch('utils.data_quality._get_conn', return_value=mock_conn):
+            with pytest.raises((RuntimeError, Exception), match='DQ failed'):
+                mod.validate_silver_quality(
+                    checks=[CHECK.no_duplicates(
+                        'silver.fbref_match_enriched', pk=['match_id'],
+                    )],
+                    raise_on_error=True,
+                )
+
+    def test_warning_does_not_raise(self):
+        """WARNING-severity failures are logged but don't raise."""
+        mod = _import_silver_tasks()
+        from utils.data_quality import CHECK
+
+        # 100 rows outside range → WARNING fail, no raise
+        mock_conn, _ = self._make_conn(fetchall_side_effect=[(100,)])
+
+        with patch('utils.data_quality._get_conn', return_value=mock_conn):
+            result = mod.validate_silver_quality(
+                checks=[CHECK.value_range(
+                    'silver.fbref_keeper_profile', 'save_pct',
+                    min_val=0, max_val=100, severity='WARNING',
+                )],
+                raise_on_error=True,
+            )
+
+        assert result['errors'] == []
         assert len(result['warnings']) == 1
-        assert '10.0% NULL' in result['warnings'][0]
-
-    def test_ref_integrity_passes(self):
-        mod = _import_silver_tasks()
-        # 0 orphan keys → pass
-        mock_conn, _ = self._make_conn(fetchall_side_effect=[[[0]]])
-
-        checks = [
-            {'type': 'ref_integrity', 'child': 'fbref_player_match_stats', 'parent': 'fbref_match_enriched', 'key': 'match_id'},
-        ]
-        with patch.object(mod, '_get_trino_connection', return_value=mock_conn):
-            result = mod.validate_silver_quality(checks=checks)
-
-        assert result['passed'] == 1
-        assert result['warnings'] == []
-
-    def test_ref_integrity_warns(self):
-        mod = _import_silver_tasks()
-        # 5 orphan keys → warning
-        mock_conn, _ = self._make_conn(fetchall_side_effect=[[[5]]])
-
-        checks = [
-            {'type': 'ref_integrity', 'child': 'fbref_player_match_stats', 'parent': 'fbref_match_enriched', 'key': 'match_id'},
-        ]
-        with patch.object(mod, '_get_trino_connection', return_value=mock_conn):
-            result = mod.validate_silver_quality(checks=checks)
-
-        assert result['passed'] == 0
-        assert len(result['warnings']) == 1
-        assert '5 orphan' in result['warnings'][0]
-
-    def test_range_passes(self):
-        mod = _import_silver_tasks()
-        # 0 violations → pass
-        mock_conn, _ = self._make_conn(fetchall_side_effect=[[[0]]])
-
-        checks = [
-            {'type': 'range', 'table': 'fbref_player_season_profile', 'column': 'goals', 'min': 0},
-        ]
-        with patch.object(mod, '_get_trino_connection', return_value=mock_conn):
-            result = mod.validate_silver_quality(checks=checks)
-
-        assert result['passed'] == 1
-        assert result['warnings'] == []
-
-    def test_range_warns(self):
-        mod = _import_silver_tasks()
-        # 3 violations → warning
-        mock_conn, _ = self._make_conn(fetchall_side_effect=[[[3]]])
-
-        checks = [
-            {'type': 'range', 'table': 'fbref_keeper_profile', 'column': 'save_pct', 'min': 0, 'max': 100},
-        ]
-        with patch.object(mod, '_get_trino_connection', return_value=mock_conn):
-            result = mod.validate_silver_quality(checks=checks)
-
-        assert result['passed'] == 0
-        assert len(result['warnings']) == 1
-        assert '3 row(s)' in result['warnings'][0]
-
-    def test_query_error_handled(self):
-        mod = _import_silver_tasks()
-        mock_conn, mock_cursor = self._make_conn()
-        mock_cursor.execute.side_effect = Exception("Table not found")
-
-        checks = [
-            {'type': 'null_rate', 'table': 'fbref_player_season_profile', 'column': 'mp', 'max_null_pct': 5.0},
-        ]
-        with patch.object(mod, '_get_trino_connection', return_value=mock_conn):
-            result = mod.validate_silver_quality(checks=checks)
-
-        assert result['passed'] == 0
-        assert len(result['errors']) == 1
-        mock_conn.close.assert_called_once()
-
-    def test_empty_table_warns(self):
-        mod = _import_silver_tasks()
-        # total=0, nulls=0 → empty table → warning
-        mock_conn, _ = self._make_conn(fetchall_side_effect=[[[0, 0]]])
-
-        checks = [
-            {'type': 'null_rate', 'table': 'fbref_player_season_profile', 'column': 'mp', 'max_null_pct': 5.0},
-        ]
-        with patch.object(mod, '_get_trino_connection', return_value=mock_conn):
-            result = mod.validate_silver_quality(checks=checks)
-
-        assert len(result['warnings']) == 1
-        assert 'empty' in result['warnings'][0]

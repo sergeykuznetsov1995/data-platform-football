@@ -2,7 +2,7 @@
 # Data Platform - Makefile
 # =============================================================================
 
-.PHONY: help build up down restart logs ps clean health test-spark test-trino init-hdfs init-storage shell-spark shell-airflow shell-trino test-fbref-curl test-fbref-soccerdata test-fbref-nodriver test-fbref-full test-proxy-stats test-fbref-sticky
+.PHONY: help build up down restart logs ps clean health test-spark test-trino init-hdfs init-storage shell-spark shell-airflow shell-trino test-fbref-curl test-fbref-nodriver test-fbref-full test-proxy-stats
 
 # Default target
 help:
@@ -28,10 +28,8 @@ help:
 	@echo ""
 	@echo "FBref Scraping Tests:"
 	@echo "  make test-fbref-curl      - Test curl_cffi with residential proxy"
-	@echo "  make test-fbref-soccerdata - Test soccerdata scraper"
 	@echo "  make test-fbref-nodriver  - Test nodriver (browser) fallback"
 	@echo "  make test-fbref-full      - Run full test pipeline"
-	@echo "  make test-fbref-sticky    - Test with custom sticky sessions (STICKY_REQUESTS=N)"
 	@echo "  make test-proxy-stats     - Show proxy pool statistics"
 
 # Build images
@@ -177,19 +175,6 @@ print(f'Cloudflare blocked: {\"challenge\" in r.text.lower() or \"just a moment\
 print(f'Content length: {len(r.text)} chars'); \
 "
 
-# Test soccerdata scraper (HTTP-based)
-test-fbref-soccerdata:
-	@echo "Testing FBref soccerdata scraper..."
-	docker compose exec airflow-webserver python dags/scripts/run_fbref_scraper.py \
-		--scraper-type soccerdata \
-		--proxy-file /opt/airflow/proxys.txt \
-		--mode match_data \
-		--match-data-type schedule \
-		--leagues "ENG-Premier League" \
-		--season 2025 \
-		--output /tmp/test_fbref_soccerdata.json \
-		--verbose
-
 # Test nodriver fallback (browser-based)
 test-fbref-nodriver:
 	@echo "Testing FBref with nodriver fallback..."
@@ -211,10 +196,7 @@ test-fbref-full:
 	@echo "=== Step 1: Test curl_cffi ==="
 	@$(MAKE) test-fbref-curl || true
 	@echo ""
-	@echo "=== Step 2: Test soccerdata scraper ==="
-	@$(MAKE) test-fbref-soccerdata || true
-	@echo ""
-	@echo "=== Step 3: Test nodriver fallback ==="
+	@echo "=== Step 2: Test nodriver fallback ==="
 	@$(MAKE) test-fbref-nodriver || true
 	@echo ""
 	@echo "Full FBref test pipeline completed!"
@@ -235,26 +217,3 @@ for p in stats['proxies'][:5]: \
     print(f'  {p[\"host\"]}:{p[\"port\"]} - success_rate={p[\"success_rate\"]}'); \
 "
 
-# Test with custom sticky requests setting
-test-fbref-sticky:
-	@echo "Testing FBref with custom sticky session settings..."
-	@echo "STICKY_REQUESTS=$${STICKY_REQUESTS:-5}"
-	@docker compose exec airflow-webserver python -c "\
-from scrapers.soccerdata_fbref import SoccerdataFBrefScraper; \
-import os; \
-sticky = int(os.environ.get('STICKY_REQUESTS', '5')); \
-print(f'Testing with sticky_requests={sticky}'); \
-scraper = SoccerdataFBrefScraper( \
-    leagues=['ENG-Premier League'], \
-    seasons=[2025], \
-    use_tor=False, \
-    proxy_file='/opt/airflow/proxys.txt' \
-); \
-scraper._max_sticky_requests = sticky; \
-df = scraper.read_schedule(); \
-print(f'Schedule rows: {len(df) if df is not None else 0}'); \
-print('Proxy stats:'); \
-import json; \
-print(json.dumps(scraper.get_proxy_stats(), indent=2, default=str)); \
-scraper.close(); \
-"

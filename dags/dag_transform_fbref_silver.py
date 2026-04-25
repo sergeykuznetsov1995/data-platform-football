@@ -42,6 +42,7 @@ from typing import Any, Dict
 
 from airflow import DAG
 from airflow.operators.python import PythonOperator
+from airflow.operators.trigger_dagrun import TriggerDagRunOperator
 from airflow.utils.task_group import TaskGroup
 
 from utils.default_args import SILVER_ARGS
@@ -86,6 +87,11 @@ SILVER_TRANSFORMS = [
         'dags/sql/silver/fbref_shot_events.sql',
         'fbref_shot_events',
     ),
+    (
+        'team_season_profile',
+        'dags/sql/silver/fbref_team_season_profile.sql',
+        'fbref_team_season_profile',
+    ),
 ]
 
 # Expected minimum row counts per Silver table (for validation)
@@ -97,6 +103,7 @@ SILVER_MIN_ROWS = {
     'fbref_match_events': 50,
     'fbref_match_lineups': 100,
     'fbref_shot_events': 50,
+    'fbref_team_season_profile': 10,
 }
 
 # Bronze tables that may not exist yet — skip transform with warning if absent
@@ -189,27 +196,104 @@ def _validate_silver_quality(**context) -> Dict[str, Any]:
     """
     PythonOperator callable — run data quality checks on Silver tables.
 
-    Severity: WARNING only — does not fail the pipeline.
+    Critical checks (ERROR): no_nulls on PKs, PK uniqueness, referential
+    integrity. Failures raise AirflowException so dirty data never reaches Gold.
+    Soft checks (WARNING): freshness, value ranges (logged, not blocking).
     """
     import logging
 
-    from utils.silver_tasks import validate_silver_quality
+    from utils.alerts import telegram_dq_summary
+    from utils.data_quality import CHECK, run_checks
 
     logger = logging.getLogger(__name__)
 
-    result = validate_silver_quality()
+    # Freshness threshold: ingestion runs weekly (Monday). 48h gives a 2-day
+    # post-ingest grace window in which Silver should always be fresh; outside
+    # that window staleness is expected, so the severity stays WARNING.
+    FRESH_HOURS = 48
 
-    logger.info(
-        f"Silver quality: {result['passed']}/{result['total_checks']} passed, "
-        f"{len(result['warnings'])} warnings, {len(result['errors'])} errors"
-    )
+    checks = [
+        # Primary-key nulls — ERROR (joins/dedup logic break otherwise)
+        CHECK.no_nulls('silver.fbref_match_enriched', cols=['match_id', 'date']),
+        CHECK.no_nulls('silver.fbref_player_season_profile', cols=['player_id', 'league', 'season']),
+        CHECK.no_nulls('silver.fbref_keeper_profile', cols=['player_id', 'league', 'season']),
+        CHECK.no_nulls('silver.fbref_player_match_stats', cols=['match_id']),
+        CHECK.no_nulls('silver.fbref_match_events', cols=['match_id']),
+        CHECK.no_nulls('silver.fbref_match_lineups', cols=['match_id', 'player_id']),
+        CHECK.no_nulls('silver.fbref_team_season_profile', cols=['team', 'league', 'season']),
 
-    for w in result['warnings']:
-        logger.warning(f"  QUALITY WARNING: {w}")
-    for e in result['errors']:
-        logger.error(f"  QUALITY ERROR: {e}")
+        # PK uniqueness — ERROR (duplicates would explode downstream joins / facts)
+        CHECK.no_duplicates('silver.fbref_match_enriched', pk=['match_id']),
+        CHECK.no_duplicates('silver.fbref_player_season_profile', pk=['player_id', 'league', 'season']),
+        CHECK.no_duplicates('silver.fbref_keeper_profile', pk=['player_id', 'league', 'season']),
+        CHECK.no_duplicates('silver.fbref_match_lineups', pk=['match_id', 'player_id']),
+        CHECK.no_duplicates('silver.fbref_team_season_profile', pk=['team', 'league', 'season']),
+        # player_match_stats rows can repeat across player+match when player switches teams
+        # mid-game (rare); team is part of the natural key.
+        CHECK.no_duplicates(
+            'silver.fbref_player_match_stats',
+            pk=['match_id', 'player_id', 'team'],
+            where='player_id IS NOT NULL',
+        ),
+        CHECK.no_duplicates(
+            'silver.fbref_match_events',
+            pk=['match_id', 'minute', 'player_id', 'event_type'],
+            where='player_id IS NOT NULL',
+        ),
 
-    return result
+        # Referential integrity — ERROR (orphans would silently drop in fact joins)
+        CHECK.ref_integrity('silver.fbref_player_match_stats', 'silver.fbref_match_enriched', 'match_id'),
+        CHECK.ref_integrity('silver.fbref_match_events', 'silver.fbref_match_enriched', 'match_id'),
+        CHECK.ref_integrity('silver.fbref_match_lineups', 'silver.fbref_match_enriched', 'match_id'),
+
+        # Freshness — WARNING (ingestion is weekly; >48h after Monday is normal mid-week)
+        CHECK.freshness('silver.fbref_match_enriched', ts_col='_bronze_ingested_at',
+                        max_age_hours=FRESH_HOURS, severity='WARNING'),
+        CHECK.freshness('silver.fbref_player_season_profile', ts_col='_bronze_ingested_at',
+                        max_age_hours=FRESH_HOURS, severity='WARNING'),
+        CHECK.freshness('silver.fbref_keeper_profile', ts_col='_bronze_ingested_at',
+                        max_age_hours=FRESH_HOURS, severity='WARNING'),
+        CHECK.freshness('silver.fbref_player_match_stats', ts_col='_bronze_ingested_at',
+                        max_age_hours=FRESH_HOURS, severity='WARNING'),
+        CHECK.freshness('silver.fbref_match_events', ts_col='_bronze_ingested_at',
+                        max_age_hours=FRESH_HOURS, severity='WARNING'),
+        CHECK.freshness('silver.fbref_match_lineups', ts_col='_bronze_ingested_at',
+                        max_age_hours=FRESH_HOURS, severity='WARNING'),
+        CHECK.freshness('silver.fbref_team_season_profile', ts_col='_bronze_ingested_at',
+                        max_age_hours=FRESH_HOURS, severity='WARNING'),
+
+        # Value ranges — WARNING (legitimate outliers possible; for monitoring only)
+        CHECK.value_range('silver.fbref_player_season_profile', 'goals', min_val=0, severity='WARNING'),
+        CHECK.value_range('silver.fbref_player_season_profile', 'minutes',
+                          min_val=0, max_val=5000, severity='WARNING'),
+        CHECK.value_range('silver.fbref_keeper_profile', 'save_pct',
+                          min_val=0, max_val=100, severity='WARNING'),
+        CHECK.value_range('silver.fbref_team_season_profile', 'possession',
+                          min_val=0, max_val=100, severity='WARNING'),
+        CHECK.value_range('silver.fbref_team_season_profile', 'goals',
+                          min_val=0, severity='WARNING'),
+    ]
+
+    # Run with raise_on_error=False so we can push a summary before failing.
+    report = run_checks(checks, raise_on_error=False)
+    logger.info(f"Silver DQ: {report.summary()}")
+
+    # Telegram summary (no-op if token not configured)
+    telegram_dq_summary(report, header="Silver DQ")
+
+    if report.errors:
+        from airflow.exceptions import AirflowException
+        raise AirflowException(
+            f"Silver DQ failed: {len(report.errors)} error(s). "
+            + "; ".join(f"{r.name}: {r.details or r.error}" for r in report.errors[:5])
+        )
+
+    return {
+        'passed': len(report.passed),
+        'total': len(report.results),
+        'errors': [r.name for r in report.errors],
+        'warnings': [r.name for r in report.warnings],
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -260,11 +344,10 @@ with DAG(
     ### Data Quality Checks
 
     After transforms and row count validation, the pipeline runs quality checks:
-    - **Null rate**: Critical columns must have < N% NULL values
-    - **Referential integrity**: Child table keys must exist in parent
-    - **Business logic**: Values within expected ranges (goals >= 0, etc.)
-
-    Quality checks are WARNING-only and do not block the pipeline.
+    - **PK NULLs / uniqueness** (ERROR): blocks the DAG to prevent dirty data flowing to Gold
+    - **Referential integrity** (ERROR): orphan match_id in child tables fails the run
+    - **Freshness** (WARNING): `_bronze_ingested_at` within 48h of Monday ingest
+    - **Value ranges** (WARNING): outliers for monitoring, do not block
 
     ### Manual Trigger
 
@@ -307,6 +390,16 @@ with DAG(
     )
 
     # =========================================================================
+    # Trigger Gold layer after Silver DQ passes
+    # =========================================================================
+    trigger_gold = TriggerDagRunOperator(
+        task_id='trigger_gold',
+        trigger_dag_id='dag_transform_fbref_gold',
+        wait_for_completion=False,
+        reset_dag_run=True,
+    )
+
+    # =========================================================================
     # Dependencies
     # =========================================================================
-    transforms_group >> validate_silver >> validate_quality
+    transforms_group >> validate_silver >> validate_quality >> trigger_gold

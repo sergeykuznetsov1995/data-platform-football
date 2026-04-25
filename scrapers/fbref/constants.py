@@ -21,14 +21,19 @@ LEAGUE_IDS = {
 }
 
 # Available stat types for players (outfield)
+#
+# Removed (Apr 2026) — FBref restricted these stats: tables exist but ALL cells
+# are empty (`<td class="iz"></td>`). Verified by counting NULL/empty rows in
+# iceberg.bronze.fbref_player_{passing,passing_types,gca,defense,possession}:
+# 22617/22617 rows had no data. See MEMORY.md "FBref Data Availability".
+#   - 'passing'        — 22617 empty rows
+#   - 'passing_types'  — 22617 empty rows
+#   - 'gca'            — 22617 empty rows
+#   - 'defense'        — 22603 empty rows
+#   - 'possession'     — 22617 empty rows
 PLAYER_STAT_TYPES = [
     'stats',           # Standard stats
     'shooting',        # Shooting stats
-    'passing',         # Passing stats
-    'passing_types',   # Pass types
-    'gca',             # Goal and shot creation
-    'defense',         # Defensive actions
-    'possession',      # Possession stats
     'playingtime',     # Playing time
     'misc',            # Miscellaneous
 ]
@@ -40,23 +45,20 @@ KEEPER_STAT_TYPES = [
 ]
 
 # Player match-level stat types (per-game statistics)
+#
+# Removed (Apr 2026) for the same reason as PLAYER_STAT_TYPES — the underlying
+# season-aggregated stats are gone, so per-match versions are also empty.
 PLAYER_MATCH_STAT_TYPES = [
     'summary',         # Basic match summary
-    'passing',         # Match passing stats
-    'defense',         # Match defense stats
-    'possession',      # Match possession stats
-    'misc',            # Match misc stats
 ]
 
 # Available stat types for teams (squads)
+#
+# Removed (Apr 2026) — same restriction as players: tables exist with
+# squad/90s/# pl filled but ALL stat cells empty (820 rows, 0 non-null).
 TEAM_STAT_TYPES = [
     'stats',           # Standard stats
     'shooting',        # Shooting stats
-    'passing',         # Passing stats
-    'passing_types',   # Pass types
-    'gca',             # Goal and shot creation
-    'defense',         # Defensive actions
-    'possession',      # Possession stats
     'playingtime',     # Playing time
     'misc',            # Miscellaneous
 ]

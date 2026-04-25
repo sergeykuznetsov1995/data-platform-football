@@ -6,10 +6,11 @@ FBref Scraper Runner Script
 Standalone script to run FBref scraper.
 Called from Airflow via BashOperator to avoid memory issues with PythonOperator.
 
-Supports three scraper types:
+Supports two scraper types:
 1. nodriver (default, recommended) - Browser-based with Cloudflare Turnstile bypass
-2. soccerdata - Lightweight HTTP-based scraper (DEPRECATED: blocked by Cloudflare)
-3. selenium - Browser-based with undetected-chromedriver
+2. selenium - Browser-based with undetected-chromedriver (used for combined
+   match-level data: shot_events, match_events, lineups, match_team_stats,
+   match_player_stats)
 
 Usage:
     # Using nodriver (recommended for Cloudflare Turnstile)
@@ -19,8 +20,9 @@ Usage:
     python run_fbref_scraper.py --scraper-type nodriver --cloudflare-wait 120 --cf-verify-retries 15
 
 NOTE: As of 2025-2026, FBref uses Cloudflare Turnstile CAPTCHA.
-      soccerdata (curl_cffi) does NOT work because it cannot execute JavaScript.
-      nodriver with cf-verify plugin is the recommended solution.
+      The deprecated soccerdata/curl_cffi scraper was removed (Apr 2026) —
+      it cannot execute JavaScript, so it never bypassed the Turnstile.
+      nodriver with cf-verify plugin is the only HTTP-replacement that works.
 """
 
 import argparse
@@ -50,31 +52,6 @@ def _configure_logging(verbose: bool = False) -> None:
     if not verbose:
         for name in _NOISY_LOGGERS:
             logging.getLogger(name).setLevel(logging.WARNING)
-
-
-def check_tor_health(host: str = 'tor', port: int = 9050, timeout: int = 30) -> bool:
-    """Check if Tor proxy is healthy before starting."""
-    import requests
-    try:
-        proxies = {
-            'http': f'socks5h://{host}:{port}',
-            'https': f'socks5h://{host}:{port}',
-        }
-        response = requests.get(
-            'https://check.torproject.org/api/ip',
-            proxies=proxies,
-            timeout=timeout
-        )
-        if response.status_code == 200:
-            data = response.json()
-            if data.get('IsTor', False):
-                logger.info(f"Tor health check passed: IP={data.get('IP')}")
-                return True
-        logger.warning(f"Tor health check failed: {response.text}")
-        return False
-    except Exception as e:
-        logger.error(f"Tor health check error: {e}")
-        return False
 
 
 def _get_traffic_diagnostics(scraper) -> dict:
@@ -109,28 +86,10 @@ def main():
     parser.add_argument(
         '--scraper-type',
         type=str,
-        choices=['nodriver', 'soccerdata', 'selenium'],
+        choices=['nodriver', 'selenium'],
         default='nodriver',
-        help='Scraper type: nodriver (recommended, Cloudflare Turnstile bypass), '
-             'soccerdata (deprecated, blocked by Cloudflare), '
-             'selenium (undetected-chromedriver)'
-    )
-    parser.add_argument(
-        '--use-tor',
-        action='store_true',
-        help='Use Tor proxy for anonymization (soccerdata scraper)'
-    )
-    parser.add_argument(
-        '--tor-host',
-        type=str,
-        default='tor',
-        help='Tor service hostname (default: tor for Docker)'
-    )
-    parser.add_argument(
-        '--tor-port',
-        type=int,
-        default=9050,
-        help='Tor SOCKS5 port (default: 9050)'
+        help='Scraper type: nodriver (recommended, Cloudflare Turnstile bypass) '
+             'or selenium (undetected-chromedriver, used for combined match data)'
     )
 
     # === Mode selection ===
@@ -146,7 +105,7 @@ def main():
         '--stat-type',
         type=str,
         default=None,
-        help='Stat type for single_stat mode (stats, shooting, passing, passing_types, gca, defense, possession, playingtime, misc, keeper, keeper_adv)'
+        help='Stat type for single_stat mode (stats, shooting, playingtime, misc, keeper, keeper_adv)'
     )
     parser.add_argument(
         '--data-category',
@@ -337,7 +296,6 @@ def main():
 
     logger.info(f"Starting FBref scraper: scraper_type={args.scraper_type}, mode={args.mode}")
     logger.info(f"Leagues: {leagues}, Season: {args.season}")
-    logger.info(f"Use Tor: {args.use_tor}, Tor host: {args.tor_host}:{args.tor_port}")
     logger.info(f"Proxy file: {args.proxy_file}")
 
     results = {
@@ -471,153 +429,6 @@ def main():
 
         except Exception as e:
             logger.error(f"Nodriver scraper failed: {e}", exc_info=True)
-            results['errors'].append(str(e))
-            with open(args.output, 'w') as f:
-                json.dump(results, f)
-            sys.exit(1)
-
-    # ==========================================================================
-    # Soccerdata scraper (DEPRECATED - blocked by Cloudflare)
-    # ==========================================================================
-    elif args.scraper_type == 'soccerdata':
-        logger.warning(
-            "WARNING: soccerdata scraper is DEPRECATED and will fail on FBref. "
-            "Cloudflare Turnstile requires JavaScript execution. "
-            "Use --scraper-type nodriver instead."
-        )
-        logger.info("Using soccerdata scraper (lightweight, DEPRECATED)")
-
-        # Pre-flight check for Tor if enabled
-        if args.use_tor:
-            logger.info(f"Checking Tor health at {args.tor_host}:{args.tor_port}...")
-            if not check_tor_health(args.tor_host, args.tor_port):
-                error_msg = f"Tor is not healthy at {args.tor_host}:{args.tor_port}"
-                logger.error(error_msg)
-                results['errors'].append(error_msg)
-                results['diagnostics']['tor_healthy'] = False
-                with open(args.output, 'w') as f:
-                    json.dump(results, f)
-                sys.exit(1)
-            results['diagnostics']['tor_healthy'] = True
-
-        try:
-            from scrapers.soccerdata_fbref import SoccerdataFBrefScraper
-
-            with SoccerdataFBrefScraper(
-                leagues=leagues,
-                seasons=[args.season],
-                use_tor=args.use_tor,
-                tor_host=args.tor_host,
-                tor_port=args.tor_port,
-                proxy_file=args.proxy_file,
-            ) as scraper:
-
-                # =============================================================
-                # MODE: single_stat
-                # =============================================================
-                if args.mode == 'single_stat':
-                    if not args.stat_type:
-                        raise ValueError("--stat-type is required for single_stat mode")
-
-                    logger.info(
-                        f"Single stat mode: category={args.data_category}, "
-                        f"stat_type={args.stat_type}"
-                    )
-
-                    scrape_results = scraper.scrape_single_stat_type(
-                        stat_type=args.stat_type,
-                        data_category=args.data_category,
-                    )
-
-                    results['tables'] = list(scrape_results.values())
-                    results['stat_type'] = args.stat_type
-                    results['data_category'] = args.data_category
-
-                    results['diagnostics']['scraper_stats'] = {
-                        'successes': scraper._stats.get('successes', 0),
-                        'failures': scraper._stats.get('failures', 0),
-                    }
-                    results['diagnostics']['traffic'] = _get_traffic_diagnostics(scraper)
-
-                    logger.info(f"Single stat scrape completed: {list(scrape_results.keys())}")
-
-                    if not scrape_results:
-                        error_msg = (
-                            f"No data collected for {args.data_category}_{args.stat_type}. "
-                            f"Scraper stats: successes={scraper._stats.get('successes', 0)}, "
-                            f"failures={scraper._stats.get('failures', 0)}"
-                        )
-                        logger.error(error_msg)
-                        results['errors'].append(error_msg)
-
-                # =============================================================
-                # MODE: match_data
-                # =============================================================
-                elif args.mode == 'match_data':
-                    if not args.match_data_type:
-                        raise ValueError("--match-data-type is required for match_data mode")
-
-                    logger.info(f"Match data mode: type={args.match_data_type}")
-
-                    scrape_results = scraper.scrape_match_data(
-                        data_type=args.match_data_type,
-                        max_matches=max_matches,
-                    )
-
-                    results['tables'] = list(scrape_results.values())
-                    results['match_data_type'] = args.match_data_type
-
-                    results['diagnostics']['scraper_stats'] = {
-                        'successes': scraper._stats.get('successes', 0),
-                        'failures': scraper._stats.get('failures', 0),
-                    }
-                    results['diagnostics']['traffic'] = _get_traffic_diagnostics(scraper)
-
-                    logger.info(f"Match data scrape completed: {list(scrape_results.keys())}")
-
-                    if not scrape_results:
-                        # Check if we should treat this as an error
-                        failures = scraper._stats.get('failures', 0)
-                        if failures > 0 or args.match_data_type == 'schedule':
-                            # schedule should always return data; failures indicate real errors
-                            error_msg = (
-                                f"No data collected for match_data/{args.match_data_type}. "
-                                f"Scraper stats: successes={scraper._stats.get('successes', 0)}, "
-                                f"failures={failures}"
-                            )
-                            logger.error(error_msg)
-                            results['errors'].append(error_msg)
-                        else:
-                            # For soccerdata, some match data types are not supported
-                            logger.warning(
-                                f"Match data type '{args.match_data_type}' not supported by soccerdata. "
-                                f"Use --scraper-type selenium for detailed match data."
-                            )
-
-                # =============================================================
-                # MODE: full
-                # =============================================================
-                else:  # mode == 'full'
-                    include_extended = args.extended_stats and not args.no_extended_stats
-                    include_keeper = args.keeper_stats and not args.no_keeper_stats
-                    include_team_stats_extended = args.team_stats_extended and not args.no_team_stats_extended
-
-                    logger.info(
-                        f"Full mode (soccerdata): extended={include_extended}, "
-                        f"keeper={include_keeper}, team_extended={include_team_stats_extended}"
-                    )
-
-                    scrape_results = scraper.scrape_all(
-                        include_extended_stats=include_extended,
-                        include_keeper_stats=include_keeper,
-                        include_team_stats_extended=include_team_stats_extended,
-                    )
-
-                    results['tables'] = list(scrape_results.values())
-                    logger.info(f"Full scrape completed. Tables saved: {list(scrape_results.keys())}")
-
-        except Exception as e:
-            logger.error(f"Soccerdata scraper failed: {e}", exc_info=True)
             results['errors'].append(str(e))
             with open(args.output, 'w') as f:
                 json.dump(results, f)

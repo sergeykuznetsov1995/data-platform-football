@@ -182,24 +182,43 @@ class TestFBrefScraperConstants:
             assert 'slug' in LEAGUE_IDS[league]
 
     def test_player_stat_types(self):
-        """Test that PLAYER_STAT_TYPES is defined."""
+        """Test that PLAYER_STAT_TYPES is defined.
+
+        Note (Apr 2026): passing, passing_types, gca, defense, possession
+        were removed because FBref restricted those stats — tables were 100%
+        empty.
+        """
         from scrapers.fbref.constants import PLAYER_STAT_TYPES
 
-        expected = ['stats', 'shooting', 'passing', 'passing_types',
-                    'gca', 'defense', 'possession', 'playingtime', 'misc']
+        expected = ['stats', 'shooting', 'playingtime', 'misc']
 
         for stat_type in expected:
             assert stat_type in PLAYER_STAT_TYPES
 
+        # Sanity-check: removed stat_types must NOT be present.
+        for removed in ('passing', 'passing_types', 'gca', 'defense', 'possession'):
+            assert removed not in PLAYER_STAT_TYPES, (
+                f"{removed!r} was removed (FBref returns empty cells); "
+                "do not re-add without re-checking iceberg.bronze counts."
+            )
+
     def test_team_stat_types(self):
-        """Test that TEAM_STAT_TYPES is defined."""
+        """Test that TEAM_STAT_TYPES is defined.
+
+        Note (Apr 2026): same stat_types as PLAYER_STAT_TYPES were removed.
+        """
         from scrapers.fbref.constants import TEAM_STAT_TYPES
 
-        expected = ['stats', 'shooting', 'passing', 'passing_types',
-                    'gca', 'defense', 'possession', 'playingtime', 'misc']
+        expected = ['stats', 'shooting', 'playingtime', 'misc']
 
         for stat_type in expected:
             assert stat_type in TEAM_STAT_TYPES
+
+        for removed in ('passing', 'passing_types', 'gca', 'defense', 'possession'):
+            assert removed not in TEAM_STAT_TYPES, (
+                f"{removed!r} was removed (FBref returns empty cells); "
+                "do not re-add without re-checking iceberg.bronze counts."
+            )
 
     def test_keeper_stat_types(self):
         """Test that KEEPER_STAT_TYPES is defined."""

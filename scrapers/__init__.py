@@ -17,17 +17,22 @@ Sources:
 - MatchHistory: Historical match data
 
 Main Scrapers:
-- FBrefScraper: For FBref data (bypasses Cloudflare via Selenium)
-- SoccerdataFBrefScraper: Lightweight FBref scraper using soccerdata + Tor
+- FBrefScraper: Selenium-based FBref scraper (used for match-level data:
+  shot_events, match_events, lineups, match_team_stats, match_player_stats)
+- NodriverFBrefScraper: Primary FBref scraper for season-level stats and
+  schedule (nodriver + cf-verify Cloudflare Turnstile bypass).
 - FotMobScraper: For FotMob data (handles session cookies via Selenium)
 - MatchHistoryScraper: For football-data.co.uk (with Selenium fallback)
 - WhoScoredScraper: For WhoScored data (bypasses Cloudflare)
+
+Note (Apr 2026): SoccerdataFBrefScraper was removed — curl_cffi cannot bypass
+Cloudflare Turnstile, so the scraper was non-functional in production.
 """
 
 from scrapers.base.base_scraper import BaseScraper, SeleniumScraper, SoccerdataScraper
 from scrapers.base.iceberg_writer import IcebergWriter
 from scrapers.fbref import FBrefScraper
-from scrapers.soccerdata_fbref import SoccerdataFBrefScraper
+from scrapers.nodriver_fbref import NodriverFBrefScraper
 from scrapers.fotmob import FotMobScraper
 from scrapers.matchhistory import MatchHistoryScraper
 from scrapers.whoscored import WhoScoredScraper
@@ -40,7 +45,7 @@ __all__ = [
     'IcebergWriter',
     # Main scrapers
     'FBrefScraper',
-    'SoccerdataFBrefScraper',  # Lightweight Tor-based scraper
+    'NodriverFBrefScraper',
     'FotMobScraper',
     'MatchHistoryScraper',
     'WhoScoredScraper',
