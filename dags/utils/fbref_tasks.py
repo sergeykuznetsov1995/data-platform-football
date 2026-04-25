@@ -87,49 +87,6 @@ python dags/scripts/run_fbref_scraper.py \\
 """
 
 
-def _build_soccerdata_command(
-    mode: str,
-    leagues_str: str,
-    season: int,
-    output_file: str,
-    use_tor: bool,
-    tor_host: str,
-    tor_port: int,
-    proxy_file: str | None,
-    stat_type: str | None = None,
-    data_category: str | None = None,
-    match_data_type: str | None = None,
-) -> str:
-    """Build bash command for soccerdata scraper type (deprecated)."""
-    tor_args = f'--use-tor --tor-host {tor_host} --tor-port {tor_port}' if use_tor else ''
-    proxy_args = f'--proxy-file {proxy_file}' if proxy_file else ''
-
-    mode_args = ''
-    if mode == 'single_stat':
-        mode_args = (
-            f'--mode single_stat \\\n'
-            f'    --stat-type {stat_type} \\\n'
-            f'    --data-category {data_category}'
-        )
-    elif mode == 'match_data':
-        mode_args = (
-            f'--mode match_data \\\n'
-            f'    --match-data-type {match_data_type}'
-        )
-
-    return f"""
-cd /opt/airflow && \\
-python dags/scripts/run_fbref_scraper.py \\
-    --scraper-type soccerdata \\
-    {tor_args} \\
-    {proxy_args} \\
-    {mode_args} \\
-    --leagues "{leagues_str}" \\
-    --season {season} \\
-    --output {output_file}
-"""
-
-
 def _build_selenium_command(
     mode: str,
     leagues_str: str,
@@ -195,9 +152,6 @@ def create_single_stat_task(
     leagues_str: str,
     season: int,
     scraper_type: str = 'nodriver',
-    use_tor: bool = False,
-    tor_host: str = 'tor',
-    tor_port: int = 9050,
     use_xvfb: bool = True,
     headless: bool = True,
     use_nodriver: bool = True,
@@ -206,19 +160,22 @@ def create_single_stat_task(
     nodriver_max_retries: int = 2,
     nodriver_cf_verify_retries: int = 6,
     proxy_file: str | None = None,
+    # Compatibility kwargs accepted but no longer used (Apr 2026):
+    # the soccerdata branch was removed because curl_cffi cannot bypass
+    # Cloudflare Turnstile. Kept here so existing call sites do not break.
+    use_tor: bool = False,
+    tor_host: str = 'tor',
+    tor_port: int = 9050,
 ) -> BashOperator:
     """
     Create a BashOperator task for collecting a single stat_type.
 
     Args:
-        stat_type: The stat type to collect (e.g., 'stats', 'shooting', 'passing')
+        stat_type: The stat type to collect (e.g., 'stats', 'shooting')
         data_category: 'player', 'team', or 'keeper'
         leagues_str: Comma-separated leagues string
         season: Season year
-        scraper_type: 'nodriver' (recommended), 'soccerdata' (deprecated), 'selenium'
-        use_tor: Use Tor proxy for soccerdata scraper (deprecated)
-        tor_host: Tor SOCKS5 proxy host
-        tor_port: Tor SOCKS5 proxy port
+        scraper_type: 'nodriver' (recommended) or 'selenium'
         use_xvfb: Use Xvfb virtual display
         headless: Run browser in headless mode
         use_nodriver: Use nodriver (for selenium scraper type)
@@ -231,6 +188,10 @@ def create_single_stat_task(
     Returns:
         BashOperator task
     """
+    # use_tor / tor_host / tor_port were used by the deprecated soccerdata
+    # scraper. Silently ignore them (compat-only).
+    del use_tor, tor_host, tor_port
+
     task_id = f'{data_category}_{stat_type}'
     output_file = f'/tmp/fbref_{task_id}.json'
 
@@ -247,19 +208,6 @@ def create_single_stat_task(
             content_timeout=nodriver_content_timeout,
             max_retries=nodriver_max_retries,
             cf_verify_retries=nodriver_cf_verify_retries,
-            stat_type=stat_type,
-            data_category=data_category,
-        )
-    elif scraper_type == 'soccerdata':
-        bash_command = _build_soccerdata_command(
-            mode='single_stat',
-            leagues_str=leagues_str,
-            season=season,
-            output_file=output_file,
-            use_tor=use_tor,
-            tor_host=tor_host,
-            tor_port=tor_port,
-            proxy_file=proxy_file,
             stat_type=stat_type,
             data_category=data_category,
         )
@@ -292,9 +240,6 @@ def create_match_data_task(
     season: int,
     max_matches: int = 0,
     scraper_type: str = 'nodriver',
-    use_tor: bool = False,
-    tor_host: str = 'tor',
-    tor_port: int = 9050,
     use_xvfb: bool = True,
     headless: bool = True,
     use_nodriver: bool = True,
@@ -303,6 +248,12 @@ def create_match_data_task(
     nodriver_max_retries: int = 2,
     nodriver_cf_verify_retries: int = 6,
     proxy_file: str | None = None,
+    # Compatibility kwargs accepted but no longer used (Apr 2026):
+    # the soccerdata branch was removed because curl_cffi cannot bypass
+    # Cloudflare Turnstile.
+    use_tor: bool = False,
+    tor_host: str = 'tor',
+    tor_port: int = 9050,
 ) -> BashOperator:
     """
     Create a BashOperator task for collecting match-level data.
@@ -312,10 +263,7 @@ def create_match_data_task(
         leagues_str: Comma-separated leagues string
         season: Season year
         max_matches: Maximum matches per league (0 = unlimited)
-        scraper_type: 'nodriver' (recommended), 'soccerdata' (deprecated), 'selenium'
-        use_tor: Use Tor proxy for soccerdata scraper (deprecated)
-        tor_host: Tor SOCKS5 proxy host
-        tor_port: Tor SOCKS5 proxy port
+        scraper_type: 'nodriver' (recommended) or 'selenium'
         use_xvfb: Use Xvfb virtual display
         headless: Run browser in headless mode
         use_nodriver: Use nodriver (for selenium scraper type)
@@ -333,13 +281,15 @@ def create_match_data_task(
         supports 'schedule'. Use selenium for detailed match-level data
         (shot_events, match_events, lineups).
     """
+    del use_tor, tor_host, tor_port  # legacy soccerdata kwargs, ignored
+
     task_id = f'match_{data_type}'
     output_file = f'/tmp/fbref_{task_id}.json'
 
     # For detailed match data, fall back to selenium (nodriver only supports schedule)
     effective_scraper = scraper_type
     if data_type in ['shot_events', 'match_events', 'lineups']:
-        if scraper_type in ['nodriver', 'soccerdata']:
+        if scraper_type == 'nodriver':
             effective_scraper = 'selenium'
 
     if effective_scraper == 'nodriver':
@@ -355,18 +305,6 @@ def create_match_data_task(
             content_timeout=nodriver_content_timeout,
             max_retries=nodriver_max_retries,
             cf_verify_retries=nodriver_cf_verify_retries,
-            match_data_type=data_type,
-        )
-    elif effective_scraper == 'soccerdata':
-        bash_command = _build_soccerdata_command(
-            mode='match_data',
-            leagues_str=leagues_str,
-            season=season,
-            output_file=output_file,
-            use_tor=use_tor,
-            tor_host=tor_host,
-            tor_port=tor_port,
-            proxy_file=proxy_file,
             match_data_type=data_type,
         )
     else:

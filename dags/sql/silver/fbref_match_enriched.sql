@@ -27,7 +27,25 @@
 
 WITH sch_raw AS (
     SELECT *,
-           REGEXP_EXTRACT(match_url, '/matches/([a-f0-9]+)/', 1) AS match_id
+           -- Real FBref match_id is a hex slug from /matches/<id>/.
+           -- For FUTURE fixtures FBref hasn't published a match page yet, so match_url is empty.
+           -- We synthesise a deterministic pseudo-id so future matches survive Silver/Gold and
+           -- can be served by predictions_input. Prefix 'fut_' guarantees zero collision with
+           -- real hex slugs and makes them trivially identifiable in downstream layers.
+           --
+           -- Hash inputs (in priority order):
+           --   1) gameweek + season + home + away  — stable across reschedules of date/time
+           --   2) date + home + away                — fallback when gameweek is NULL/empty
+           -- XXHASH64 is Trino-native, faster than MD5 and gives a compact 16-hex-char id.
+           COALESCE(
+               NULLIF(REGEXP_EXTRACT(match_url, '/matches/([a-f0-9]+)/', 1), ''),
+               'fut_' || LOWER(TO_HEX(XXHASH64(TO_UTF8(
+                   COALESCE(NULLIF(CAST(wk AS VARCHAR), ''), CAST(date AS VARCHAR))
+                   || '|' || COALESCE(CAST(season AS VARCHAR), '')
+                   || '|' || COALESCE(CAST(home AS VARCHAR), '')
+                   || '|' || COALESCE(CAST(away AS VARCHAR), '')
+               ))))
+           ) AS match_id
     FROM iceberg.bronze.fbref_schedule
 ),
 
@@ -168,3 +186,8 @@ LEFT JOIN events_agg ea
 LEFT JOIN lineups_agg la
     ON  sch.match_id = la.match_id
 WHERE sch.rn = 1
+  -- match_id is now ALWAYS non-NULL thanks to the COALESCE in sch_raw (real id or 'fut_<xxhash>').
+  -- We still filter out rows missing the date (junk) and the literal header row that the FBref
+  -- HTML parser occasionally captures.
+  AND sch.date IS NOT NULL
+  AND LOWER(sch.date) <> 'date'

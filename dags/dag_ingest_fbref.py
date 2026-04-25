@@ -4,14 +4,14 @@ FBref Data Ingestion DAG (Refactored + Optimized)
 
 Memory-efficient DAG for scraping football statistics from FBref.
 
-Supports three scraper backends:
+Supports two scraper backends:
 1. nodriver (default, recommended) - Browser-based with Cloudflare Turnstile bypass
-2. soccerdata (deprecated) - HTTP-based, blocked by Cloudflare Turnstile
-3. selenium - Browser-based with undetected-chromedriver
+2. selenium - Browser-based with undetected-chromedriver (used for combined
+   match-level data only)
 
 Architecture:
-- TaskGroup player_stats: 9 SEQUENTIAL tasks (one per stat_type)
-- TaskGroup team_stats: 9 SEQUENTIAL tasks (one per stat_type)
+- TaskGroup player_stats: 4 SEQUENTIAL tasks (stats, shooting, playingtime, misc)
+- TaskGroup team_stats: 4 SEQUENTIAL tasks (same as player_stats)
 - TaskGroup keeper_stats: 2 SEQUENTIAL tasks (keeper, keeper_adv)
 - TaskGroup match_data: schedule -> match_all_data (OPTIMIZED)
 - validate_all_data: final validation
@@ -22,16 +22,18 @@ OPTIMIZATION (Feb 2026):
 - HTTP requests reduction: 3x (e.g., 1141 -> 381 for 380 matches)
 - Time reduction: ~2-4 hours -> ~15-25 minutes
 
-Each stat_type is saved to a separate Iceberg table:
-- fbref_player_{stat_type} (9 tables)
-- fbref_team_{stat_type} (9 tables)
-- fbref_keeper_{stat_type} (2 tables)
-- fbref_schedule, fbref_shot_events, fbref_match_events, fbref_lineups
+CLEANUP (Apr 2026):
+- Removed 5 player/team stat_types (passing, passing_types, gca, defense,
+  possession) — FBref restricted these stats; tables were 100% empty.
+- Removed deprecated soccerdata branch — curl_cffi cannot bypass Cloudflare
+  Turnstile, so the scraper was non-functional.
 
-Scraper types:
-- nodriver + cf-verify: Recommended for Cloudflare Turnstile bypass (2025-2026)
-- soccerdata: DEPRECATED - blocked by Cloudflare (curl_cffi cannot execute JS)
-- selenium: Alternative with undetected-chromedriver
+Each stat_type is saved to a separate Iceberg table:
+- fbref_player_{stat_type} (4 tables)
+- fbref_team_{stat_type} (4 tables)
+- fbref_keeper_{stat_type} (2 tables)
+- fbref_schedule, fbref_shot_events, fbref_match_events, fbref_lineups,
+  fbref_match_team_stats, fbref_match_player_stats
 
 NOTE: As of 2025-2026, FBref uses Cloudflare Turnstile CAPTCHA.
       Only nodriver with cf-verify plugin can bypass this automatically.
@@ -79,19 +81,13 @@ from scrapers.fbref.constants import (
 # 4. Sequential execution to prevent OOM
 #
 # IMPORTANT: 2captcha and paid services are NOT used.
-#            soccerdata/curl_cffi does NOT work (cannot execute JavaScript).
 # =============================================================================
 
-# Scraper type: 'nodriver' (recommended), 'soccerdata' (deprecated), 'selenium'
-# NOTE: As of Feb 2026, FBref uses Cloudflare Turnstile CAPTCHA.
-# Only nodriver with cf-verify plugin can bypass this automatically.
-# soccerdata (curl_cffi) DOES NOT work - it cannot execute JavaScript.
-DEFAULT_SCRAPER_TYPE = 'nodriver'  # cf-verify plugin for Turnstile bypass
-
-# Tor proxy settings (blocked by FBref Cloudflare)
-USE_TOR = False  # Tor is blocked by FBref
-TOR_HOST = 'tor'
-TOR_PORT = 9050
+# Scraper type: 'nodriver' (recommended) or 'selenium'
+# Only nodriver with cf-verify plugin can bypass Cloudflare Turnstile
+# automatically. selenium is used for combined match-level data
+# (shot_events, match_events, lineups, match_team_stats, match_player_stats).
+DEFAULT_SCRAPER_TYPE = 'nodriver'
 
 # Selenium browser settings
 USE_XVFB = True  # Xvfb virtual display to bypass headless detection
@@ -124,7 +120,7 @@ CF_COOKIE_CACHE_TTL_MINUTES = 25  # Slightly less than 30min CF cookie lifetime
 # =============================================================================
 # Pre-solve Cloudflare Turnstile before starting scraper tasks
 # Reduces 403 errors by having valid cookies ready
-CF_COOKIE_PREWARM = False  # Disabled for soccerdata mode to prevent OOM
+CF_COOKIE_PREWARM = False  # Disabled to prevent OOM during ingestion
 CF_COOKIE_PREWARM_ATTEMPTS = 5
 
 # Proxy configuration
@@ -138,9 +134,6 @@ COMMON_TASK_KWARGS = dict(
     leagues_str=','.join(LEAGUES),
     season="{{ params.season }}",
     scraper_type=DEFAULT_SCRAPER_TYPE,
-    use_tor=USE_TOR,
-    tor_host=TOR_HOST,
-    tor_port=TOR_PORT,
     use_xvfb=USE_XVFB,
     headless=HEADLESS,
     use_nodriver=USE_NODRIVER,
@@ -199,8 +192,7 @@ with DAG(
         'leagues': LEAGUES,
         'season': CURRENT_SEASON,
         'max_matches': 0,  # 0 = no limit
-        'scraper_type': DEFAULT_SCRAPER_TYPE,  # 'soccerdata' or 'selenium'
-        'use_tor': USE_TOR,  # Use Tor proxy for soccerdata
+        'scraper_type': DEFAULT_SCRAPER_TYPE,  # 'nodriver' or 'selenium'
     },
     doc_md="""
     ## FBref Data Ingestion (Refactored + Optimized)
@@ -243,7 +235,6 @@ with DAG(
 
     Set in DAG params or edit constants in source:
     - `DEFAULT_SCRAPER_TYPE`: 'nodriver' (recommended) or 'selenium'
-    - `USE_TOR`: False (Tor is blocked by FBref)
     - `PROXY_FILE`: Path to proxy file (format: host:port:user:pass)
     - `USE_NODRIVER`: True - Use nodriver for selenium scraper
     - `NODRIVER_CLOUDFLARE_WAIT`: 90.0 - Time to wait for Cloudflare challenge
@@ -254,11 +245,9 @@ with DAG(
 
     ```
     dag_ingest_fbref
-    ├── TaskGroup: player_stats (9 SEQUENTIAL tasks)
-    │   ├── player_stats, player_shooting, player_passing
-    │   ├── player_passing_types, player_gca, player_defense
-    │   └── player_possession, player_playingtime, player_misc
-    ├── TaskGroup: team_stats (9 SEQUENTIAL tasks)
+    ├── TaskGroup: player_stats (4 SEQUENTIAL tasks)
+    │   └── player_stats, player_shooting, player_playingtime, player_misc
+    ├── TaskGroup: team_stats (4 SEQUENTIAL tasks)
     │   └── (same stat_types as player)
     ├── TaskGroup: keeper_stats (2 SEQUENTIAL tasks)
     │   ├── keeper_keeper
@@ -269,16 +258,18 @@ with DAG(
     └── validate_all_data
     ```
 
-    ### Tables Created (26 tables)
+    Note (Apr 2026): passing, passing_types, gca, defense, possession were
+    removed — FBref restricted these stats and the tables were 100% empty.
 
-    **Player Stats (9 tables):**
-    - fbref_player_stats, fbref_player_shooting, fbref_player_passing
-    - fbref_player_passing_types, fbref_player_gca, fbref_player_defense
-    - fbref_player_possession, fbref_player_playingtime, fbref_player_misc
+    ### Tables Created (16 tables)
 
-    **Team Stats (9 tables):**
-    - fbref_team_stats, fbref_team_shooting, fbref_team_passing
-    - etc.
+    **Player Stats (4 tables):**
+    - fbref_player_stats, fbref_player_shooting
+    - fbref_player_playingtime, fbref_player_misc
+
+    **Team Stats (4 tables):**
+    - fbref_team_stats, fbref_team_shooting
+    - fbref_team_playingtime, fbref_team_misc
 
     **Keeper Stats (2 tables):**
     - fbref_keeper_keeper, fbref_keeper_keeper_adv
@@ -287,23 +278,20 @@ with DAG(
     - fbref_schedule, fbref_shot_events, fbref_match_events, fbref_lineups
     - fbref_match_team_stats, fbref_match_player_stats
 
-    ### Testing with soccerdata + residential proxies (recommended)
+    ### Testing nodriver scraper with residential proxies
 
-    Test the scraper with soccerdata and residential proxy rotation:
+    Test the scraper end-to-end via the runner CLI (preferred — exercises the
+    same code path as the DAG):
     ```bash
-    docker compose exec airflow-webserver python -c "
-    from scrapers.soccerdata_fbref import SoccerdataFBrefScraper
-
-    s = SoccerdataFBrefScraper(
-        leagues=['ENG-Premier League'],
-        seasons=[2025],
-        use_tor=False,
-        proxy_file='/opt/airflow/proxys.txt',
-        no_cache=True
-    )
-    df = s.read_schedule()
-    print(f'Schedule rows: {len(df) if df is not None else 0}')
-    "
+    docker compose exec airflow-webserver python dags/scripts/run_fbref_scraper.py \\
+        --scraper-type nodriver \\
+        --proxy-file /opt/airflow/proxys.txt \\
+        --mode single_stat \\
+        --stat-type stats \\
+        --data-category player \\
+        --leagues "ENG-Premier League" \\
+        --season 2025 \\
+        --output /tmp/test_nodriver_player_stats.json
     ```
 
     ### Testing proxy connectivity

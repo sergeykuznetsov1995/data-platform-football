@@ -89,8 +89,12 @@ class WhoScoredScraper(SeleniumScraper):
         self._season_cache: Dict = {}
 
     def _get_browser(self) -> CloudflareBypass:
-        """Get browser with WhoScored-specific configuration."""
-        if self._browser is None:
+        """Get browser with WhoScored-specific configuration.
+
+        Uses ``getattr`` so the lazy initializer is safe when ``__init__``
+        was bypassed (unit tests).
+        """
+        if getattr(self, '_browser', None) is None:
             # Get proxy from proxy_manager if available
             proxy_url = None
             if hasattr(self, 'proxy_manager') and self.proxy_manager:
@@ -107,11 +111,23 @@ class WhoScoredScraper(SeleniumScraper):
         return self._browser
 
     def _get_navigator(self) -> PageNavigator:
-        """Get page navigator instance."""
-        if self._navigator is None:
+        """Get page navigator instance.
+
+        Uses ``getattr`` with a default so the lazy initializer also works
+        when ``__init__`` was bypassed (e.g. unit tests that patch ``__init__``
+        with a no-op to construct a partially-mocked scraper).
+
+        Shares ``self._season_cache`` with the navigator so that the scraper
+        and the navigator stay in sync (the scraper is the source of truth).
+        """
+        if getattr(self, '_navigator', None) is None:
             self._navigator = PageNavigator(
                 browser=self._get_browser(),
             )
+            # Share the season cache so both sides see the same entries.
+            if getattr(self, '_season_cache', None) is None:
+                self._season_cache = {}
+            self._navigator._season_cache = self._season_cache
         return self._navigator
 
     # Delegate methods for backwards compatibility and testing
@@ -124,7 +140,34 @@ class WhoScoredScraper(SeleniumScraper):
         return self._get_navigator().build_tournament_url(league)
 
     def _get_season_stage_ids(self, league: str, season: int):
-        """Get season/stage IDs (delegated to PageNavigator)."""
+        """Get season/stage IDs.
+
+        Order of resolution (cheapest first, browser is last resort):
+          1. ``self._season_cache`` (in-memory cache, source of truth)
+          2. ``KNOWN_SEASON_IDS`` (static fallback, no network)
+          3. ``PageNavigator.get_season_stage_ids`` (Selenium navigation)
+
+        Steps 1-2 must not instantiate a browser, so they run before
+        ``_get_navigator()`` is called.
+        """
+        cache_key = (league, season)
+
+        # 1. In-memory cache hit
+        season_cache = getattr(self, '_season_cache', None)
+        if season_cache and cache_key in season_cache:
+            return season_cache[cache_key]
+
+        # 2. Static known IDs — populate cache and return without browser
+        known = getattr(self, 'KNOWN_SEASON_IDS', KNOWN_SEASON_IDS)
+        if cache_key in known:
+            ids = known[cache_key]
+            if season_cache is None:
+                self._season_cache = {}
+                season_cache = self._season_cache
+            season_cache[cache_key] = ids
+            return ids
+
+        # 3. Last resort — fall back to Selenium-driven navigator
         return self._get_navigator().get_season_stage_ids(league, season)
 
     def _extract_match_urls_from_page(self):
@@ -301,6 +344,16 @@ class WhoScoredScraper(SeleniumScraper):
         Returns:
             List of unique match URLs sorted alphabetically
         """
+        # Validate league before triggering browser/navigator creation,
+        # so unsupported leagues exit cheaply with a warning (no Selenium).
+        league_config = getattr(self, 'LEAGUE_CONFIG', LEAGUE_CONFIG)
+        if league not in league_config:
+            logger.warning(
+                f"League not supported: {league}. "
+                f"Supported: {list(league_config.keys())}"
+            )
+            return []
+
         return self._get_navigator().get_match_urls(league, season, max_pages)
 
     def scrape_match(

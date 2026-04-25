@@ -55,13 +55,16 @@ SCHEDULES: Dict[str, str] = {
     'dag_transform_fbref_silver': None,     # Trigger only (after ingestion)
 }
 
-# Minimum row thresholds for validation
+# Minimum row thresholds for validation (per single DagRun = 1 league x 1 season).
+# Consumed by utils.validators.validate_scrape_results, where each task_id maps
+# to a single ingest call. Currently LEAGUES=['ENG-Premier League'] and
+# CURRENT_SEASON is one season, so values below are sized for 1 APL season.
 MIN_ROW_THRESHOLDS: Dict[str, int] = {
-    'schedule': 100,
-    'player_stats': 100,
-    'team_stats': 50,
-    'shots': 500,
-    'elo_ratings': 100,
+    'schedule': 350,        # 380 APL matches/season, allow ~5-10% missing/postponed
+    'player_stats': 500,    # ~600-800 unique player-season rows expected, ~25% margin
+    'team_stats': 18,       # 20 APL clubs, allow ~10% missing per rare stat_type
+    'shots': 8000,          # ~10k shots/season, ~20% margin
+    'elo_ratings': 100,     # ClubElo not in FBref-only roadmap; left unchanged
 }
 
 # Tags for DAG organization

@@ -112,6 +112,7 @@ def run_silver_transform(
     partition_columns: Optional[List[str]] = None,
     trino_host: str = None,
     trino_port: int = None,
+    add_timestamp: bool = True,
 ) -> Dict[str, Any]:
     """
     Execute a Silver-layer transformation: DROP existing table + CTAS.
@@ -192,15 +193,26 @@ def run_silver_transform(
             cols = ", ".join(f"'{c}'" for c in partition_columns)
             partition_clause = f"WITH (partitioning = ARRAY[{cols}])\n"
 
-        ctas_sql = (
-            f"CREATE TABLE {full_table}\n"
-            f"{partition_clause}"
-            f"AS\n"
-            f"SELECT *, CURRENT_TIMESTAMP AS _silver_created_at\n"
-            f"FROM (\n"
-            f"{select_sql}\n"
-            f")"
-        )
+        # Gold-on-Gold transforms (e.g. fct_match_train SELECT m.* FROM gold.fct_match)
+        # already carry _silver_created_at via m.* — re-adding it would raise
+        # DUPLICATE_COLUMN_NAME. Such callers pass add_timestamp=False.
+        if add_timestamp:
+            ctas_sql = (
+                f"CREATE TABLE {full_table}\n"
+                f"{partition_clause}"
+                f"AS\n"
+                f"SELECT *, CURRENT_TIMESTAMP AS _silver_created_at\n"
+                f"FROM (\n"
+                f"{select_sql}\n"
+                f")"
+            )
+        else:
+            ctas_sql = (
+                f"CREATE TABLE {full_table}\n"
+                f"{partition_clause}"
+                f"AS\n"
+                f"{select_sql}"
+            )
 
         logger.info(f"Executing CTAS for {full_table} ...")
         _execute(conn, ctas_sql)
@@ -271,192 +283,122 @@ def check_bronze_table_exists(
 # ---------------------------------------------------------------------------
 # Data Quality Checks
 # ---------------------------------------------------------------------------
+#
+# The Silver DAG (`dag_transform_fbref_silver._validate_silver_quality`) is the
+# canonical entry point and uses the typed `CHECK` API from `data_quality.py`
+# with ERROR severity for PK / ref_integrity violations so dirty data never
+# reaches Gold.
+#
+# `QUALITY_CHECKS` and `validate_silver_quality()` below remain for ad-hoc
+# operational use (e.g. shell, REPL, manual reruns) and now mirror the DAG:
+# critical checks raise, freshness / ranges are WARNING.
 
-QUALITY_CHECKS = [
-    # Null rate checks (max_null_pct = max allowed % of NULLs)
-    {'type': 'null_rate', 'table': 'fbref_player_season_profile', 'column': 'player_id', 'max_null_pct': 1.0},
-    {'type': 'null_rate', 'table': 'fbref_player_season_profile', 'column': 'mp', 'max_null_pct': 5.0},
-    {'type': 'null_rate', 'table': 'fbref_player_season_profile', 'column': 'goals', 'max_null_pct': 5.0},
-    {'type': 'null_rate', 'table': 'fbref_player_season_profile', 'column': 'assists', 'max_null_pct': 5.0},
-    {'type': 'null_rate', 'table': 'fbref_player_season_profile', 'column': 'minutes', 'max_null_pct': 5.0},
-    {'type': 'null_rate', 'table': 'fbref_match_enriched', 'column': 'match_id', 'max_null_pct': 0.0},
-    {'type': 'null_rate', 'table': 'fbref_match_enriched', 'column': 'date', 'max_null_pct': 5.0},
-    # Referential integrity
-    {'type': 'ref_integrity', 'child': 'fbref_player_match_stats', 'parent': 'fbref_match_enriched', 'key': 'match_id'},
-    {'type': 'ref_integrity', 'child': 'fbref_match_events', 'parent': 'fbref_match_enriched', 'key': 'match_id'},
-    {'type': 'ref_integrity', 'child': 'fbref_match_lineups', 'parent': 'fbref_match_enriched', 'key': 'match_id'},
-    # Business logic range checks
-    {'type': 'range', 'table': 'fbref_player_season_profile', 'column': 'goals', 'min': 0},
-    {'type': 'range', 'table': 'fbref_player_season_profile', 'column': 'minutes', 'min': 0, 'max': 5000},
-    {'type': 'range', 'table': 'fbref_keeper_profile', 'column': 'save_pct', 'min': 0, 'max': 100},
-    {'type': 'range', 'table': 'fbref_shot_events', 'column': 'xg', 'min': 0, 'max': 1},
-]
+# Freshness threshold: ingestion runs weekly (Monday). 48h covers the
+# post-ingest grace window; mid-week staleness is normal and stays WARNING.
+_FRESH_HOURS = 48
+
+
+def _build_silver_checks(schema: str = 'silver'):
+    """Construct the canonical Silver DQ check list.
+
+    Imported lazily so `silver_tasks` keeps working in callers that don't
+    have `data_quality` on the path (e.g. unit tests that mock the module).
+    """
+    from utils.data_quality import CHECK
+
+    return [
+        # ---- ERROR: PK NULLs (joins / dedup logic break otherwise) ----
+        CHECK.no_nulls(f'{schema}.fbref_match_enriched',        cols=['match_id', 'date']),
+        CHECK.no_nulls(f'{schema}.fbref_player_season_profile', cols=['player_id', 'league', 'season']),
+        CHECK.no_nulls(f'{schema}.fbref_keeper_profile',        cols=['player_id', 'league', 'season']),
+        CHECK.no_nulls(f'{schema}.fbref_player_match_stats',    cols=['match_id']),
+        CHECK.no_nulls(f'{schema}.fbref_match_events',          cols=['match_id']),
+        CHECK.no_nulls(f'{schema}.fbref_match_lineups',         cols=['match_id', 'player_id']),
+        CHECK.no_nulls(f'{schema}.fbref_team_season_profile',   cols=['team', 'league', 'season']),
+
+        # ---- ERROR: PK uniqueness (duplicates explode downstream facts) ----
+        CHECK.no_duplicates(f'{schema}.fbref_match_enriched',        pk=['match_id']),
+        CHECK.no_duplicates(f'{schema}.fbref_player_season_profile', pk=['player_id', 'league', 'season']),
+        CHECK.no_duplicates(f'{schema}.fbref_keeper_profile',        pk=['player_id', 'league', 'season']),
+        CHECK.no_duplicates(f'{schema}.fbref_match_lineups',         pk=['match_id', 'player_id']),
+        CHECK.no_duplicates(f'{schema}.fbref_team_season_profile',   pk=['team', 'league', 'season']),
+        CHECK.no_duplicates(
+            f'{schema}.fbref_player_match_stats',
+            pk=['match_id', 'player_id', 'team'],
+            where='player_id IS NOT NULL',
+        ),
+        CHECK.no_duplicates(
+            f'{schema}.fbref_match_events',
+            pk=['match_id', 'minute', 'player_id', 'event_type'],
+            where='player_id IS NOT NULL',
+        ),
+
+        # ---- ERROR: Referential integrity (orphans drop silently in joins) ----
+        CHECK.ref_integrity(f'{schema}.fbref_player_match_stats', f'{schema}.fbref_match_enriched', 'match_id'),
+        CHECK.ref_integrity(f'{schema}.fbref_match_events',       f'{schema}.fbref_match_enriched', 'match_id'),
+        CHECK.ref_integrity(f'{schema}.fbref_match_lineups',      f'{schema}.fbref_match_enriched', 'match_id'),
+
+        # ---- WARNING: Freshness (weekly ingest; >48h is normal mid-week) ----
+        CHECK.freshness(f'{schema}.fbref_match_enriched',        ts_col='_bronze_ingested_at',
+                        max_age_hours=_FRESH_HOURS, severity='WARNING'),
+        CHECK.freshness(f'{schema}.fbref_player_season_profile', ts_col='_bronze_ingested_at',
+                        max_age_hours=_FRESH_HOURS, severity='WARNING'),
+        CHECK.freshness(f'{schema}.fbref_keeper_profile',        ts_col='_bronze_ingested_at',
+                        max_age_hours=_FRESH_HOURS, severity='WARNING'),
+        CHECK.freshness(f'{schema}.fbref_player_match_stats',    ts_col='_bronze_ingested_at',
+                        max_age_hours=_FRESH_HOURS, severity='WARNING'),
+        CHECK.freshness(f'{schema}.fbref_match_events',          ts_col='_bronze_ingested_at',
+                        max_age_hours=_FRESH_HOURS, severity='WARNING'),
+        CHECK.freshness(f'{schema}.fbref_match_lineups',         ts_col='_bronze_ingested_at',
+                        max_age_hours=_FRESH_HOURS, severity='WARNING'),
+        CHECK.freshness(f'{schema}.fbref_team_season_profile',   ts_col='_bronze_ingested_at',
+                        max_age_hours=_FRESH_HOURS, severity='WARNING'),
+
+        # ---- WARNING: Value ranges (legitimate outliers possible) ----
+        CHECK.value_range(f'{schema}.fbref_player_season_profile', 'goals',
+                          min_val=0, severity='WARNING'),
+        CHECK.value_range(f'{schema}.fbref_player_season_profile', 'minutes',
+                          min_val=0, max_val=5000, severity='WARNING'),
+        CHECK.value_range(f'{schema}.fbref_keeper_profile', 'save_pct',
+                          min_val=0, max_val=100, severity='WARNING'),
+        CHECK.value_range(f'{schema}.fbref_team_season_profile', 'possession',
+                          min_val=0, max_val=100, severity='WARNING'),
+        CHECK.value_range(f'{schema}.fbref_team_season_profile', 'goals',
+                          min_val=0, severity='WARNING'),
+    ]
 
 
 def validate_silver_quality(
-    checks: List[Dict[str, Any]] = None,
+    checks: Optional[List[Any]] = None,
     schema: str = 'silver',
+    raise_on_error: bool = True,
 ) -> Dict[str, Any]:
-    """Run data quality checks on Silver tables.
+    """Run Silver DQ checks via the universal `data_quality` framework.
 
-    Checks include:
-    - Null rate: % of NULLs in a column must be below threshold
-    - Referential integrity: child table keys must exist in parent table
-    - Range: numeric column values must be within expected bounds
+    PK NULLs / uniqueness / referential integrity are ERROR severity and
+    raise ``AirflowException`` (or ``RuntimeError`` outside Airflow) on
+    failure. Freshness and value-range violations are WARNING and only logged.
 
-    Severity is WARNING — checks log issues but do not raise exceptions.
+    Args:
+        checks: Override the default check list (must be `Check` instances).
+        schema: Iceberg schema name (default 'silver').
+        raise_on_error: Re-raise on ERROR-severity failures (default True).
 
     Returns:
-        Dictionary with check results: passed, warnings, errors.
+        Dict with `passed`, `total`, `errors`, `warnings`.
     """
+    from utils.data_quality import run_checks
+
     if checks is None:
-        checks = QUALITY_CHECKS
+        checks = _build_silver_checks(schema=schema)
 
-    conn = _get_trino_connection()
-    result = {
-        'passed': 0,
-        'warnings': [],
-        'errors': [],
-        'total_checks': len(checks),
+    report = run_checks(checks, raise_on_error=raise_on_error)
+    return {
+        'passed': len(report.passed),
+        'total': len(report.results),
+        'errors': [r.name for r in report.errors],
+        'warnings': [r.name for r in report.warnings],
     }
-
-    try:
-        for check in checks:
-            check_type = check.get('type', 'null_rate')
-            try:
-                if check_type == 'null_rate':
-                    _check_null_rate(conn, check, schema, result)
-                elif check_type == 'ref_integrity':
-                    _check_ref_integrity(conn, check, schema, result)
-                elif check_type == 'range':
-                    _check_range(conn, check, schema, result)
-                else:
-                    logger.warning(f"Unknown quality check type: {check_type}")
-            except Exception as e:
-                msg = f"Quality check error ({check}): {e}"
-                result['errors'].append(msg)
-                logger.error(msg)
-    finally:
-        conn.close()
-
-    logger.info(
-        f"Silver quality checks complete: "
-        f"{result['passed']}/{result['total_checks']} passed, "
-        f"{len(result['warnings'])} warnings, {len(result['errors'])} errors"
-    )
-    return result
-
-
-def _check_null_rate(conn, check, schema, result):
-    """Check that NULL percentage in a column is below threshold."""
-    table = check['table']
-    column = check['column']
-    max_null_pct = check['max_null_pct']
-    _validate_identifier(table, "table")
-    _validate_identifier(column, "column")
-
-    full_table = f"iceberg.{schema}.{table}"
-    rows = _execute(
-        conn,
-        f"SELECT "
-        f"COUNT(*) AS total, "
-        f"COUNT(*) FILTER (WHERE {column} IS NULL) AS nulls "
-        f"FROM {full_table}",
-        fetch=True,
-    )
-    if not rows or rows[0][0] == 0:
-        result['warnings'].append(f"null_rate: {table}.{column} — table empty")
-        return
-
-    total, nulls = rows[0]
-    null_pct = 100.0 * nulls / total
-
-    if null_pct > max_null_pct:
-        msg = (
-            f"null_rate: {table}.{column} — "
-            f"{null_pct:.1f}% NULL (threshold {max_null_pct}%)"
-        )
-        result['warnings'].append(msg)
-        logger.warning(f"Silver quality: {msg}")
-    else:
-        result['passed'] += 1
-        logger.info(f"Silver quality OK: {table}.{column} — {null_pct:.1f}% NULL")
-
-
-def _check_ref_integrity(conn, check, schema, result):
-    """Check that child table keys exist in parent table."""
-    child = check['child']
-    parent = check['parent']
-    key = check['key']
-    _validate_identifier(child, "table")
-    _validate_identifier(parent, "table")
-    _validate_identifier(key, "column")
-
-    child_table = f"iceberg.{schema}.{child}"
-    parent_table = f"iceberg.{schema}.{parent}"
-
-    rows = _execute(
-        conn,
-        f"SELECT COUNT(DISTINCT c.{key}) "
-        f"FROM {child_table} c "
-        f"LEFT JOIN {parent_table} p ON c.{key} = p.{key} "
-        f"WHERE p.{key} IS NULL AND c.{key} IS NOT NULL",
-        fetch=True,
-    )
-    orphan_count = rows[0][0] if rows else 0
-
-    if orphan_count > 0:
-        msg = (
-            f"ref_integrity: {child}.{key} — "
-            f"{orphan_count} orphan key(s) not in {parent}"
-        )
-        result['warnings'].append(msg)
-        logger.warning(f"Silver quality: {msg}")
-    else:
-        result['passed'] += 1
-        logger.info(f"Silver quality OK: {child}.{key} → {parent}")
-
-
-def _check_range(conn, check, schema, result):
-    """Check that column values are within expected range."""
-    table = check['table']
-    column = check['column']
-    min_val = check.get('min')
-    max_val = check.get('max')
-    _validate_identifier(table, "table")
-    _validate_identifier(column, "column")
-
-    full_table = f"iceberg.{schema}.{table}"
-
-    conditions = []
-    if min_val is not None:
-        conditions.append(f"{column} < {min_val}")
-    if max_val is not None:
-        conditions.append(f"{column} > {max_val}")
-
-    if not conditions:
-        return
-
-    where_clause = " OR ".join(conditions)
-    rows = _execute(
-        conn,
-        f"SELECT COUNT(*) FROM {full_table} "
-        f"WHERE {column} IS NOT NULL AND ({where_clause})",
-        fetch=True,
-    )
-    violations = rows[0][0] if rows else 0
-
-    range_desc = f"[{min_val}, {max_val}]" if max_val is not None else f">= {min_val}"
-    if violations > 0:
-        msg = (
-            f"range: {table}.{column} — "
-            f"{violations} row(s) outside {range_desc}"
-        )
-        result['warnings'].append(msg)
-        logger.warning(f"Silver quality: {msg}")
-    else:
-        result['passed'] += 1
-        logger.info(f"Silver quality OK: {table}.{column} within {range_desc}")
 
 
 def _resolve_sql_path(sql_file: str) -> Path:
