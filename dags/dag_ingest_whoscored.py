@@ -2,94 +2,116 @@
 WhoScored Data Ingestion DAG
 ============================
 
-Airflow DAG for scraping match event data from WhoScored.
-Uses BashOperator to run scraper in isolated subprocess,
-avoiding LocalExecutor memory issues.
+W3 (Wave 3) — soccerdata-backed ingest with Selenium under the hood.
 
-Uses Selenium with Cloudflare bypass for data collection.
+Schedule: weekly (Monday 04:00 UTC) — events table is heavy (~600k rows /
+season for APL), so daily ingest is overkill.
 
-Schedules daily at 10 AM UTC.
+The new :class:`WhoScoredScraper` exposes 4 high-level methods which are
+called sequentially inside ONE BashOperator (single browser session — keeps
+Cloudflare cookies hot, avoids re-bypass cost):
 
-IMPORTANT: WhoScored uses aggressive Cloudflare protection.
-Recommended to run with headless=False for better success rate.
+    * scrape_schedule()         — fixtures + integer game_id  (full N seasons)
+    * scrape_missing_players()  — pre-match injuries / suspensions
+    * scrape_season_stages()    — cup/league stage metadata
+    * scrape_events()           — Opta events for the LATEST season only
+                                  (`match_ids=None` → reader picks max(seasons))
 
-Data collected:
-- Match events in SPADL format (passes, shots, tackles, etc.)
-
-All data is written to Iceberg Bronze layer tables (via Parquet fallback).
+Validation runs as TWO Trino COUNT(*) tasks against MIN_ROW_THRESHOLDS so a
+crash in events doesn't mask a healthy schedule write.
 """
 
 from datetime import datetime, timedelta
-from typing import Any, Dict, List
+from typing import Any, Dict
 
+import requests.exceptions as _req_exc
 from airflow import DAG
 from airflow.exceptions import AirflowException
 from airflow.operators.bash import BashOperator
 from airflow.operators.python import PythonOperator
+from trino.exceptions import TrinoConnectionError
 
-from utils.config import LEAGUES, CURRENT_SEASON, SCHEDULES, DAG_TAGS
+from utils.config import (
+    DAG_TAGS,
+    LEAGUES,
+    MIN_ROW_THRESHOLDS,
+    SCHEDULES,
+    SEASONS_STR,
+)
 from utils.default_args import SELENIUM_ARGS
 
 
-# Extended timeout for WhoScored due to Cloudflare
+# Extended timeout for WhoScored due to Cloudflare + heavy events scrape.
 WHOSCORED_ARGS = {
     **SELENIUM_ARGS,
-    'execution_timeout': timedelta(hours=4),
+    'execution_timeout': timedelta(hours=6),
     'retries': 3,
     'retry_delay': timedelta(minutes=15),
 }
 
 
-def validate_data(**context) -> Dict[str, Any]:
-    """
-    Validate scraped data quality.
+def _bronze_count(table_name: str) -> int:
+    """Count rows in iceberg.bronze.{table_name} via Trino."""
+    from utils.silver_tasks import _get_trino_connection, _validate_identifier
 
-    Returns:
-        Validation results
-    """
-    import json
+    _validate_identifier(table_name, "table")
+    conn = _get_trino_connection()
+    try:
+        cur = conn.cursor()
+        try:
+            cur.execute(f"SELECT COUNT(*) FROM iceberg.bronze.{table_name}")
+            row = cur.fetchall()
+            return int(row[0][0]) if row else 0
+        finally:
+            cur.close()
+    finally:
+        conn.close()
+
+
+def _validate_table(table_name: str, threshold_key: str) -> Dict[str, Any]:
+    """Run a row-count check against MIN_ROW_THRESHOLDS for one Bronze table."""
     import logging
 
     logger = logging.getLogger(__name__)
+    threshold = MIN_ROW_THRESHOLDS.get(threshold_key, 0)
 
     try:
-        with open('/tmp/whoscored_result.json', 'r') as f:
-            scrape_result = json.load(f)
-    except FileNotFoundError:
-        logger.error("Results file not found - scraping may have failed")
-        raise AirflowException("Results file not found - scraping failed")
-    except json.JSONDecodeError as e:
-        logger.error(f"Invalid JSON in results: {e}")
-        raise AirflowException(f"Invalid JSON in results: {e}")
+        rows = _bronze_count(table_name)
+    except (TrinoConnectionError, _req_exc.ConnectionError) as e:
+        # Trino unreachable (container down, DNS not resolving, network) — infra
+        # issue, not data. Distinct message helps on-call separate scope from a
+        # missing/empty table. Airflow retries (3×15min via WHOSCORED_ARGS) cover
+        # the recovery window once `restart: unless-stopped` brings Trino back.
+        logger.error(f"Trino unreachable while counting {table_name}: {e}")
+        raise AirflowException(
+            f"Trino unreachable (infra issue, not data): {e}"
+        ) from e
+    except Exception as e:
+        # If the Bronze table doesn't exist (first run, cancelled subtask), the
+        # COUNT(*) raises. Surface as a hard validation failure.
+        logger.error(f"COUNT(*) failed for {table_name}: {e}")
+        raise AirflowException(
+            f"Bronze table iceberg.bronze.{table_name} unavailable: {e}"
+        ) from e
 
-    validation = {
-        'status': 'success',
-        'warnings': [],
-        'summary': {
-            'total_events': scrape_result.get('rows', 0),
-            'matches_scraped': scrape_result.get('matches_scraped', 0),
-            'tables': scrape_result.get('tables', []),
-        }
-    }
+    summary = {'table': table_name, 'rows': rows, 'threshold': threshold}
+    logger.info(f"Validation: {summary}")
 
-    if scrape_result.get('errors'):
-        validation['warnings'] = scrape_result['errors']
-        validation['status'] = 'partial_success' if validation['summary']['total_events'] > 0 else 'failed'
+    if rows < threshold:
+        raise AirflowException(
+            f"{table_name}: {rows} rows < threshold {threshold} (seasons={SEASONS_STR})"
+        )
+    return summary
 
-    # WhoScored often has issues, so we're lenient with thresholds
-    if validation['summary']['matches_scraped'] == 0:
-        validation['warnings'].append("No matches scraped - possible Cloudflare blocking")
 
-    logger.info(f"Data validation complete: {validation['status']}")
-    logger.info(f"Summary: {validation['summary']}")
+def validate_schedule(**context) -> Dict[str, Any]:
+    """Hard threshold check for whoscored_schedule (5 seasons APL ~ 1900 rows)."""
+    return _validate_table('whoscored_schedule', 'whoscored_schedule')
 
-    if validation['warnings']:
-        logger.warning(f"Warnings: {validation['warnings']}")
 
-    if validation['status'] == 'failed':
-        raise AirflowException(f"Validation failed: {validation.get('warnings', [])}")
-
-    return validation
+def validate_events(**context) -> Dict[str, Any]:
+    """Hard threshold check for whoscored_events (1 latest season ~ 500k rows)."""
+    return _validate_table('whoscored_events', 'whoscored_events')
 
 
 # Build arguments for bash command
@@ -99,80 +121,79 @@ leagues_str = ','.join(LEAGUES)
 with DAG(
     dag_id='dag_ingest_whoscored',
     default_args=WHOSCORED_ARGS,
-    description='Ingest match events from WhoScored (SPADL format)',
-    schedule=SCHEDULES.get('dag_ingest_whoscored', '0 10 * * *'),
+    description='Ingest WhoScored fixtures + Opta events (weekly, latest season events only)',
+    schedule=SCHEDULES.get('dag_ingest_whoscored', '0 4 * * 1'),
     start_date=datetime(2024, 1, 1),
     catchup=False,
     tags=DAG_TAGS.get('whoscored', ['scraping', 'whoscored', 'bronze', 'selenium', 'spadl']),
     max_active_runs=1,
     params={
         'leagues': LEAGUES,
-        'season': CURRENT_SEASON,
-        'match_urls': [],  # Optionally provide specific URLs
-        'headless': False,  # Recommended False for WhoScored
+        'seasons': SEASONS_STR,
     },
-    doc_md="""
-    ## WhoScored Data Ingestion
+    doc_md=f"""
+    ## WhoScored Data Ingestion (W3, weekly)
 
-    This DAG scrapes match event data from WhoScored and converts it to SPADL format.
+    Soccerdata-backed scraper running under headless Chromium 120 inside the
+    Airflow container. Schedule: `{SCHEDULES.get('dag_ingest_whoscored')}`.
 
-    ### Architecture
+    ### Pipeline
 
-    Uses BashOperator to run scraper in isolated subprocess,
-    preventing LocalExecutor fork memory issues.
+    A single BashOperator runs `run_whoscored_scraper.py` which sequentially
+    calls (one browser session — keeps Cloudflare cookies hot):
 
-    ### Important Notes
+    1. `scrape_schedule()`         — full {SEASONS_STR} fixtures
+    2. `scrape_missing_players()`  — pre-match injuries
+    3. `scrape_season_stages()`    — cup/league stages
+    4. `scrape_events()`           — **latest season only** (heaviest task)
 
-    - **Cloudflare Protection**: WhoScored uses aggressive bot protection.
-      Set `headless=False` for better success rate.
-    - **Rate Limiting**: Very conservative (10 requests/min) to avoid blocks.
-    - **Timeout**: Extended to 4 hours due to potential Cloudflare delays.
+    ### Why latest-season events only
 
-    ### Parameters
+    Events are ~600k rows / season for APL — 5 seasons would push past 3M and
+    take many hours under Cloudflare-throttled scraping. `scrape_events()`
+    with `match_ids=None` automatically picks `max(seasons)`.
 
-    - `leagues`: List of leagues to scrape
-    - `season`: Season year (e.g., 2024)
-    - `match_urls`: Optional list of specific match URLs to scrape
-    - `headless`: Whether to run browser in headless mode (default: False)
+    Threshold `whoscored_events = 500_000` is sized for one season + buffer.
 
-    ### SPADL Format
+    ### Validation
 
-    Events are converted to SPADL (Soccer Player Action Description Language) format:
-    - Standardized action types (pass, shot, tackle, etc.)
-    - Coordinates in meters (105x68 pitch)
-    - Result (success/fail/owngoal)
-    - Body part used
+    Row counts are checked via Trino COUNT(*) (NOT via JSON output) so a crash
+    in `scrape_events` doesn't mask a healthy schedule write:
 
-    ### Notes
-
-    - Uses Selenium with undetected-chromedriver for Cloudflare bypass
-    - Written to Parquet fallback (PyIceberg disabled for stability)
+    * `validate_schedule` — hard threshold ~1700 rows (5 seasons)
+    * `validate_events`   — hard threshold 500k rows (latest season)
     """,
 ) as dag:
 
-    scrape_events_task = BashOperator(
-        task_id='scrape_match_events',
-        bash_command=f"""
-cd /opt/airflow && \\
-python dags/scripts/run_whoscored_scraper.py \\
-    --leagues "{leagues_str}" \\
-    --season {CURRENT_SEASON} \\
-    --output /tmp/whoscored_result.json \\
-    --headless \\
-    --use-xvfb
-""",
+    scrape_task = BashOperator(
+        task_id='scrape_whoscored',
+        bash_command=(
+            'cd /opt/airflow && '
+            f'python dags/scripts/run_whoscored_scraper.py '
+            f'--leagues "{leagues_str}" '
+            f'--seasons "{SEASONS_STR}" '
+            f'--proxy-file "" '
+            f'--flaresolverr-url http://flaresolverr:8191 '
+            f'--output /tmp/whoscored_result.json'
+        ),
         env={
             'PYTHONPATH': '/opt/airflow:/opt/airflow/dags',
             'PATH': '/usr/local/bin:/usr/bin:/bin:/home/airflow/.local/bin',
             'HOME': '/home/airflow',
         },
+        append_env=True,
     )
 
-    validate_data_task = PythonOperator(
-        task_id='validate_data',
-        python_callable=validate_data,
-        
+    validate_schedule_task = PythonOperator(
+        task_id='validate_schedule',
+        python_callable=validate_schedule,
         trigger_rule='all_done',
     )
 
-    scrape_events_task >> validate_data_task
+    validate_events_task = PythonOperator(
+        task_id='validate_events',
+        python_callable=validate_events,
+        trigger_rule='all_done',
+    )
+
+    scrape_task >> [validate_schedule_task, validate_events_task]

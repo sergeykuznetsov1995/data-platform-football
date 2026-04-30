@@ -3,19 +3,39 @@
 WhoScored Scraper Runner Script
 ===============================
 
-Standalone script to run WhoScored scraper.
-Called from Airflow via BashOperator to avoid memory issues with PythonOperator.
+Standalone script to run :class:`WhoScoredScraper`. Called from Airflow via
+BashOperator to avoid memory issues with PythonOperator.
 
-Uses Selenium with Cloudflare bypass for data collection.
+The new soccerdata-backed WhoScoredScraper exposes 4 high-level methods:
+    * scrape_schedule()         — fixtures (full N seasons)
+    * scrape_missing_players()  — pre-match injury / suspension list
+    * scrape_season_stages()    — cup vs league stage metadata
+    * scrape_events()           — per-match Opta events; defaults to
+                                  the latest configured season because
+                                  events are heavy (~600k rows / season).
 
-IMPORTANT: WhoScored uses aggressive Cloudflare protection.
-Recommended to run with headless=False for better success rate.
+W3 contract:
+    --leagues       CSV (default: "ENG-Premier League")
+    --seasons       CSV (default: "2024")
+    --season        legacy single int alias for --seasons
+    --skip-events   skip the heaviest task (`scrape_events`)
+    --output        JSON output path (default: /tmp/whoscored_result.json)
+
+JSON output (stable contract):
+    {
+      "rows":             int,        # totals (best-effort; tables remains the source of truth)
+      "errors":           [str, ...],
+      "tables":           [str, ...],
+      "tables_by_entity": {entity: table_path, ...},
+    }
 """
 
 import argparse
 import json
 import logging
+import os
 import sys
+from typing import List
 
 logging.basicConfig(
     level=logging.INFO,
@@ -25,121 +45,149 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def main():
+def _parse_seasons(args: argparse.Namespace) -> List[int]:
+    if args.seasons:
+        return [int(s.strip()) for s in args.seasons.split(',') if s.strip()]
+    return [int(args.season)]
+
+
+def main() -> int:
     parser = argparse.ArgumentParser(description='Run WhoScored scraper')
     parser.add_argument(
         '--leagues',
         type=str,
         default='ENG-Premier League',
-        help='Comma-separated list of leagues'
+        help='Comma-separated list of leagues',
+    )
+    parser.add_argument(
+        '--seasons',
+        type=str,
+        default='',
+        help='Comma-separated list of season start years (e.g. "2021,2022,2023,2024,2025")',
     )
     parser.add_argument(
         '--season',
         type=int,
         default=2024,
-        help='Season year'
+        help='[Legacy] Single season — used only if --seasons is not provided',
+    )
+    parser.add_argument(
+        '--skip-events',
+        action='store_true',
+        default=False,
+        help='Skip the heaviest task (scrape_events). Useful for fast smoke runs.',
+    )
+    parser.add_argument(
+        '--events-only',
+        action='store_true',
+        default=False,
+        help=(
+            'Run ONLY scrape_events (skip schedule/missing_players/season_stages). '
+            'scrape_events reads game_ids from already-populated '
+            'iceberg.bronze.whoscored_schedule, so this is safe when schedule has been '
+            'ingested in a prior run and the soccerdata read_schedule path is failing.'
+        ),
     )
     parser.add_argument(
         '--output',
         type=str,
         default='/tmp/whoscored_result.json',
-        help='Output file for results'
-    )
-    parser.add_argument(
-        '--match-urls',
-        type=str,
-        default='',
-        help='Comma-separated list of specific match URLs to scrape'
+        help='Output file for results',
     )
     parser.add_argument(
         '--headless',
         action='store_true',
-        default=False,
-        help='Run browser in headless mode (not recommended for WhoScored)'
+        default=True,
+        help='Run browser in headless mode (Discovery confirmed headless=True works)',
     )
     parser.add_argument(
-        '--use-xvfb',
-        action='store_true',
-        default=True,
-        help='Use xvfb for virtual display'
+        '--max-matches',
+        type=int,
+        default=None,
+        help='Cap events scrape to N matches (smoke / verification runs)',
+    )
+    parser.add_argument(
+        '--proxy-file',
+        type=str,
+        default='/opt/airflow/proxys.txt',
+        help=(
+            'Path to file with proxies (format: host:port:user:pass). '
+            'Required for events scraping — WhoScored Cloudflare blocks per-IP.'
+        ),
+    )
+    parser.add_argument(
+        '--flaresolverr-url',
+        type=str,
+        default=os.environ.get('FLARESOLVERR_URL', 'http://flaresolverr:8191'),
+        help='Base URL of FlareSolverr instance.',
     )
     args = parser.parse_args()
 
-    leagues = [l.strip() for l in args.leagues.split(',')]
-    match_urls = [u.strip() for u in args.match_urls.split(',') if u.strip()] if args.match_urls else []
-
-    logger.info(f"Starting WhoScored scraper: leagues={leagues}, season={args.season}")
-    logger.info(f"Headless: {args.headless}, use_xvfb: {args.use_xvfb}")
-    if match_urls:
-        logger.info(f"Specific match URLs: {len(match_urls)}")
+    leagues = [l.strip() for l in args.leagues.split(',') if l.strip()]
+    seasons = _parse_seasons(args)
+    logger.info(
+        f"Starting WhoScored scraper: leagues={leagues}, seasons={seasons}, "
+        f"skip_events={args.skip_events}, headless={args.headless}, "
+        f"proxy_file={args.proxy_file}, flaresolverr_url={args.flaresolverr_url}"
+    )
 
     results = {
-        'tables': [],
         'rows': 0,
         'errors': [],
-        'matches_scraped': 0
+        'tables': [],
+        'tables_by_entity': {},
     }
 
     try:
-        import pandas as pd
+        # Lazy import to avoid pulling scrapers/__init__.py side-effects at parse time.
         from scrapers.whoscored import WhoScoredScraper
 
         with WhoScoredScraper(
             leagues=leagues,
-            seasons=[args.season],
+            seasons=seasons,
             headless=args.headless,
-            use_xvfb=args.use_xvfb,
+            proxy_file=args.proxy_file,
+            flaresolverr_url=args.flaresolverr_url,
         ) as scraper:
-            all_events = []
-
-            # If specific match URLs provided, use them
-            if match_urls:
-                urls_to_scrape = match_urls
+            if args.events_only:
+                logger.info("--events-only set: skipping schedule/missing/stages")
             else:
-                # Try to get URLs from scraper (if implemented)
-                urls_to_scrape = []
-                for league in leagues:
-                    try:
-                        league_urls = scraper.get_match_urls(league, args.season)
-                        urls_to_scrape.extend([
-                            (url, league, args.season) for url in league_urls
-                        ])
-                        logger.info(f"Found {len(league_urls)} match URLs for {league}")
-                    except Exception as e:
-                        logger.warning(f"Could not get match URLs for {league}: {e}")
-
-            # Scrape each match
-            for item in urls_to_scrape:
-                if isinstance(item, tuple):
-                    url, league, season = item
-                else:
-                    url = item
-                    league = leagues[0] if leagues else 'Unknown'
-                    season = args.season
-
+                # 1. Schedule (cheap, required)
                 try:
-                    df = scraper.read_match_events(url, league, season)
-                    if df is not None and not df.empty:
-                        all_events.append(df)
-                        results['matches_scraped'] += 1
-                        logger.info(f"Scraped {len(df)} events from {url}")
-
+                    out = scraper.scrape_schedule() or {}
+                    _merge(results, out)
                 except Exception as e:
-                    error_msg = f"Error scraping {url}: {e}"
-                    logger.error(error_msg)
-                    results['errors'].append(error_msg)
+                    logger.error(f"scrape_schedule failed: {e}", exc_info=True)
+                    results['errors'].append(f"schedule: {e}")
 
-            # Save combined events
-            if all_events:
-                combined_df = pd.concat(all_events, ignore_index=True)
-                table_path = scraper.save_to_iceberg(
-                    df=combined_df,
-                    table_name='whoscored_events_spadl',
-                    partition_cols=['league', 'season'],
-                )
-                results['tables'].append(table_path)
-                results['rows'] = len(combined_df)
-                logger.info(f"Saved {len(combined_df)} total events")
+                # 2. Missing players (cheap)
+                try:
+                    out = scraper.scrape_missing_players() or {}
+                    _merge(results, out)
+                except Exception as e:
+                    logger.error(f"scrape_missing_players failed: {e}", exc_info=True)
+                    results['errors'].append(f"missing_players: {e}")
+
+                # 3. Season stages (cheap)
+                try:
+                    out = scraper.scrape_season_stages() or {}
+                    _merge(results, out)
+                except Exception as e:
+                    logger.error(f"scrape_season_stages failed: {e}", exc_info=True)
+                    results['errors'].append(f"season_stages: {e}")
+
+            # 4. Events (heavy — only latest season; can be skipped)
+            if args.skip_events:
+                logger.info("--skip-events set: not calling scrape_events()")
+            else:
+                try:
+                    out = scraper.scrape_events(
+                        max_matches=args.max_matches,
+                    ) or {}
+                    _merge(results, out)
+                except Exception as e:
+                    logger.error(f"scrape_events failed: {e}", exc_info=True)
+                    results['errors'].append(f"events: {e}")
 
     except Exception as e:
         logger.error(f"Scraper failed: {e}", exc_info=True)
@@ -148,13 +196,27 @@ def main():
             json.dump(results, f)
         sys.exit(1)
 
-    # Write results
+    # `rows` cannot be precisely known per task without an extra Trino round-trip;
+    # downstream validators rely on Trino COUNT(*) checks against MIN_ROW_THRESHOLDS,
+    # so we leave `rows` at 0 and surface the table list instead.
     with open(args.output, 'w') as f:
         json.dump(results, f)
 
-    logger.info(f"Scraper complete: {results['rows']} rows from {results['matches_scraped']} matches")
+    logger.info(
+        f"Scraper complete: tables={len(results['tables'])}, errors={len(results['errors'])}"
+    )
     print(json.dumps(results))
     return 0
+
+
+def _merge(results: dict, entity_to_path: dict) -> None:
+    """Fold a {entity: table_path} dict from a scrape_* method into the runner result."""
+    for entity, path in entity_to_path.items():
+        if not path:
+            continue
+        results['tables_by_entity'][entity] = path
+        if path not in results['tables']:
+            results['tables'].append(path)
 
 
 if __name__ == '__main__':

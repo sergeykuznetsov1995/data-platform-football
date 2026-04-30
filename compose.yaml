@@ -67,6 +67,7 @@ services:
       dockerfile: Dockerfile
     container_name: namenode
     hostname: namenode
+    restart: unless-stopped
     environment:
       - CLUSTER_NAME=data-platform
       - HDFS_NAMENODE_USER=root
@@ -100,6 +101,7 @@ services:
       dockerfile: Dockerfile
     container_name: datanode1
     hostname: datanode1
+    restart: unless-stopped
     environment:
       - HDFS_NAMENODE_USER=root
       - HDFS_DATANODE_USER=root
@@ -131,6 +133,7 @@ services:
       dockerfile: Dockerfile
     container_name: datanode2
     hostname: datanode2
+    restart: unless-stopped
     environment:
       - HDFS_NAMENODE_USER=root
       - HDFS_DATANODE_USER=root
@@ -211,6 +214,7 @@ services:
       dockerfile: Dockerfile
     container_name: hive-metastore
     hostname: hive-metastore
+    restart: unless-stopped
     security_opt:
       - no-new-privileges:true
     cap_drop:
@@ -502,11 +506,11 @@ services:
     deploy:
       resources:
         limits:
-          memory: 2G
+          memory: 4G
         reservations:
           memory: 1G
-    # Swap as safety buffer for memory spikes
-    memswap_limit: 4G
+    # Swap as safety buffer for memory spikes (matches the limit above).
+    memswap_limit: 6G
 
   airflow-webserver:
     <<: *airflow-common
@@ -542,6 +546,7 @@ services:
     image: trinodb/trino:479
     container_name: trino
     hostname: trino
+    restart: unless-stopped
     security_opt:
       - no-new-privileges:true
     cap_drop:
@@ -882,6 +887,45 @@ services:
           memory: 800M
         reservations:
           memory: 256M
+
+  # ===========================================================================
+  # FlareSolverr - Cloudflare challenge solver (proxy over Chromium)
+  # Used by WhoScored events scraper via HTTP at port 8191
+  # ===========================================================================
+  flaresolverr:
+    image: ghcr.io/flaresolverr/flaresolverr:v3.3.21
+    container_name: flaresolverr
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETGID
+      - SETUID
+    ports:
+      - "127.0.0.1:8191:8191"
+    environment:
+      LOG_LEVEL: info
+      LOG_HTML: "false"
+      CAPTCHA_SOLVER: none
+      TZ: UTC
+    shm_size: "1g"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8191/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 256M
+    networks:
+      - backend
 
 # =============================================================================
 # Networks
