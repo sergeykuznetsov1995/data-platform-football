@@ -41,16 +41,28 @@ for p in (str(PROJECT_ROOT), str(DAGS_DIR)):
 # 2. Install minimal Airflow stubs BEFORE any test imports a DAG module.
 # ---------------------------------------------------------------------------
 def _install_airflow_stubs() -> None:
-    """Idempotent — only inject stubs if real Airflow is missing."""
+    """Idempotent — only inject stubs if real Airflow is missing.
+
+    NOTE: ``/root/data_platform/airflow`` exists as a namespace package
+    (config/plugins dirs only) and Python eagerly loads it into
+    ``sys.modules['airflow']``. We must therefore *evict* any existing
+    ``airflow*`` entries before installing our stubs, otherwise
+    ``sys.modules.setdefault`` is a no-op and the namespace package wins.
+    """
     try:
-        import airflow  # noqa: F401
-        # Even if a top-level airflow package exists, the submodules we
-        # need may not — the import below will raise and we fall through.
+        # If a real Airflow with the APIs we need is installed, leave it.
         from airflow.decorators import dag as _real_dag  # noqa: F401
         from airflow.models import Variable as _real_var  # noqa: F401
+        from airflow.operators.bash import BashOperator as _real_bash  # noqa: F401
         return
     except Exception:
         pass
+
+    # Evict any partial / namespace-package ``airflow`` entries so our
+    # ``sys.modules[...] = stub_mod`` writes below are authoritative.
+    for _name in list(sys.modules):
+        if _name == "airflow" or _name.startswith("airflow."):
+            del sys.modules[_name]
 
     # ---- airflow + airflow.decorators -----------------------------------
     airflow_mod = types.ModuleType("airflow")
@@ -60,6 +72,11 @@ def _install_airflow_stubs() -> None:
     operators_mod = types.ModuleType("airflow.operators")
     operators_python_mod = types.ModuleType("airflow.operators.python")
     operators_trigger_mod = types.ModuleType("airflow.operators.trigger_dagrun")
+    operators_bash_mod = types.ModuleType("airflow.operators.bash")
+    sensors_mod = types.ModuleType("airflow.sensors")
+    sensors_ext_mod = types.ModuleType("airflow.sensors.external_task")
+    utils_mod = types.ModuleType("airflow.utils")
+    utils_tg_mod = types.ModuleType("airflow.utils.task_group")
 
     def _dag_decorator(*dargs, **dkwargs):
         """Pass-through @dag decorator.
@@ -146,16 +163,96 @@ def _install_airflow_stubs() -> None:
 
     operators_trigger_mod.TriggerDagRunOperator = _TriggerDagRunOperator
 
+    # ---- airflow.operators.bash.BashOperator ----------------------------
+    # Records every ctor kwarg so tests can assert on `append_env`,
+    # `bash_command`, `env`, etc. exactly the same way a real BashOperator
+    # would expose them.
+    class _BashOperator:
+        # Class-level registry — every instance appends itself so DAG-load
+        # tests can inspect the operators that were created.
+        _instances: list = []
+
+        def __init__(self, *a, **kw):
+            self.task_id = kw.get("task_id", "stub")
+            self.bash_command = kw.get("bash_command")
+            self.env = kw.get("env")
+            self.append_env = kw.get("append_env", False)
+            self._init_kwargs = dict(kw)
+            _BashOperator._instances.append(self)
+
+        def __rshift__(self, other):
+            return other
+
+        def __lshift__(self, other):
+            return other
+
+    operators_bash_mod.BashOperator = _BashOperator
+
+    # ---- airflow.sensors.external_task.ExternalTaskSensor ---------------
+    class _ExternalTaskSensor(_PythonOperator):
+        pass
+
+    sensors_ext_mod.ExternalTaskSensor = _ExternalTaskSensor
+
+    # ---- airflow.utils.task_group.TaskGroup -----------------------------
+    class _TaskGroup:
+        def __init__(self, *a, **kw):
+            self.group_id = kw.get("group_id", a[0] if a else "stub")
+            self.children = []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        # Real Airflow TaskGroup supports >> / << for cross-group deps;
+        # the smoke-tested DAGs do `tg1 >> tg2 >> task3`. Make these
+        # no-ops so import doesn't blow up.
+        def __rshift__(self, other):
+            return other
+
+        def __lshift__(self, other):
+            return other
+
+    utils_tg_mod.TaskGroup = _TaskGroup
+
+    # ---- airflow.DAG context manager ------------------------------------
+    # Real Airflow exposes DAG at the top level (`from airflow import DAG`)
+    # AND as `airflow.models.DAG`. Provide a no-op context manager so
+    # `with DAG(...) as dag:` blocks execute their body for kwarg capture.
+    class _StubDAG:
+        def __init__(self, *a, **kw):
+            self._dag_kwargs = dict(kw)
+            self.dag_id = kw.get("dag_id")
+            self.schedule = kw.get("schedule")
+            self.tags = kw.get("tags", [])
+            self.tasks = []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    airflow_mod.DAG = _StubDAG
+    models_mod.DAG = _StubDAG
+
     # ---- register --------------------------------------------------------
-    sys.modules.setdefault("airflow", airflow_mod)
-    sys.modules.setdefault("airflow.decorators", decorators_mod)
-    sys.modules.setdefault("airflow.models", models_mod)
-    sys.modules.setdefault("airflow.exceptions", exceptions_mod)
-    sys.modules.setdefault("airflow.operators", operators_mod)
-    sys.modules.setdefault("airflow.operators.python", operators_python_mod)
-    sys.modules.setdefault(
-        "airflow.operators.trigger_dagrun", operators_trigger_mod
-    )
+    # Use direct assignment (not setdefault) — there may be a stale namespace
+    # package already in sys.modules; we want our stubs to win.
+    sys.modules["airflow"] = airflow_mod
+    sys.modules["airflow.decorators"] = decorators_mod
+    sys.modules["airflow.models"] = models_mod
+    sys.modules["airflow.exceptions"] = exceptions_mod
+    sys.modules["airflow.operators"] = operators_mod
+    sys.modules["airflow.operators.python"] = operators_python_mod
+    sys.modules["airflow.operators.trigger_dagrun"] = operators_trigger_mod
+    sys.modules["airflow.operators.bash"] = operators_bash_mod
+    sys.modules["airflow.sensors"] = sensors_mod
+    sys.modules["airflow.sensors.external_task"] = sensors_ext_mod
+    sys.modules["airflow.utils"] = utils_mod
+    sys.modules["airflow.utils.task_group"] = utils_tg_mod
 
     # Cross-link so `from airflow.decorators import dag` works through
     # both the ``airflow`` package and the explicit submodule path.
@@ -163,6 +260,13 @@ def _install_airflow_stubs() -> None:
     airflow_mod.models = models_mod
     airflow_mod.exceptions = exceptions_mod
     airflow_mod.operators = operators_mod
+    operators_mod.python = operators_python_mod
+    operators_mod.bash = operators_bash_mod
+    operators_mod.trigger_dagrun = operators_trigger_mod
+    airflow_mod.sensors = sensors_mod
+    airflow_mod.utils = utils_mod
+    sensors_mod.external_task = sensors_ext_mod
+    utils_mod.task_group = utils_tg_mod
 
 
 _install_airflow_stubs()
