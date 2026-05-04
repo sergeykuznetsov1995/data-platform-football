@@ -50,7 +50,8 @@ def main():
         'schedule_rows': 0,
         'shots_rows': 0,
         'player_stats_rows': 0,
-        'team_stats_rows': 0,
+        'team_match_stats_rows': 0,
+        'player_match_stats_rows': 0,
         'errors': []
     }
 
@@ -109,20 +110,35 @@ def main():
                 logger.error(error_msg)
                 results['errors'].append(error_msg)
 
-            # Scrape team stats
+            # Scrape team match-level stats (xG/xGA per match)
             try:
-                df = scraper.read_team_season_stats()
+                df = scraper.read_team_match_stats()
                 if df is not None and not df.empty:
                     table_path = scraper.save_to_iceberg(
                         df=df,
-                        table_name='understat_teams',
+                        table_name='understat_team_match_stats',
                         partition_cols=['league', 'season'],
                     )
                     results['tables'].append(table_path)
-                    results['team_stats_rows'] = len(df)
-                    logger.info(f"Saved {len(df)} team stats")
+                    results['team_match_stats_rows'] = len(df)
+                    logger.info(f"Saved {len(df)} team match stats")
             except Exception as e:
-                error_msg = f"Team stats scraping failed: {e}"
+                error_msg = f"Team match stats scraping failed: {e}"
+                logger.error(error_msg)
+                results['errors'].append(error_msg)
+
+            # Scrape per-match player stats (Silver layer requires this for xG joins)
+            try:
+                pm_results = scraper.scrape_player_match_stats()
+                if pm_results:
+                    pm_table = pm_results.get('player_match_stats')
+                    if pm_table:
+                        results['tables'].append(pm_table)
+                        # Row count is recorded inside the wrapper; surface a marker.
+                        results['player_match_stats_rows'] = 1
+                        logger.info(f"Saved player_match_stats to {pm_table}")
+            except Exception as e:
+                error_msg = f"Player match stats scraping failed: {e}"
                 logger.error(error_msg)
                 results['errors'].append(error_msg)
 
@@ -141,11 +157,12 @@ def main():
         results['schedule_rows'] +
         results['shots_rows'] +
         results['player_stats_rows'] +
-        results['team_stats_rows']
+        results['team_match_stats_rows'] +
+        results['player_match_stats_rows']
     )
     logger.info(f"Scraper complete: {total_rows} total rows")
     print(json.dumps(results))
-    return 0
+    return 1 if results.get('errors') else 0
 
 
 if __name__ == '__main__':

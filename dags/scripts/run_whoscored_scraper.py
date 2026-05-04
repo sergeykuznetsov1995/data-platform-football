@@ -206,7 +206,7 @@ def main() -> int:
         f"Scraper complete: tables={len(results['tables'])}, errors={len(results['errors'])}"
     )
     print(json.dumps(results))
-    return 0
+    return 1 if results.get('errors') else 0
 
 
 def _merge(results: dict, entity_to_path: dict) -> None:
