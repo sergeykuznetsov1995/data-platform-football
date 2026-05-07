@@ -51,6 +51,10 @@ FEAT_TEAM_FORM_ROLLING_COLS = [
     'l5_goals_against_std',
     'l5_points_std',
     'l5_form_trend',
+    # E5: rolling avg # of confirmed unavailable players over L5. Same
+    # skip_first_n=5 mask — point-in-time leakage risk is identical to
+    # other rolling features here.
+    'unavailable_count_l5',
 ]
 
 # feat_team_h2h — partition (team_id, opponent_id) ORDER BY date, mask h2h_rn > 1
@@ -231,6 +235,12 @@ def validate_gold_quality() -> Dict[str, Any]:
         CHECK.no_duplicates('gold.feat_team_xg_form', pk=['match_id', 'team_id']),
         CHECK.no_duplicates('gold.feat_player_form',  pk=['match_id', 'player_id']),
         CHECK.no_duplicates('gold.match_outcomes',    pk=['match_id']),
+        # E5: composite PK guards against double-listing the same player as
+        # absent for the same match. Empty fallback (0 rows) passes trivially.
+        CHECK.no_duplicates(
+            'gold.fct_player_unavailable',
+            pk=['match_id', 'team_id', 'player_id_canonical'],
+        ),
         # T4.1: ML splits — match_id is the PK in both tables.
         CHECK.no_duplicates('gold.fct_match_train',   pk=['match_id']),
         CHECK.no_duplicates('gold.fct_match_test',    pk=['match_id']),
@@ -254,6 +264,11 @@ def validate_gold_quality() -> Dict[str, Any]:
                        cols=['match_id', 'season', 'date', 'result_1x2']),
         CHECK.no_nulls('gold.fct_match_test',
                        cols=['match_id', 'season', 'date', 'result_1x2']),
+        # E5: required keys. NB: `team_id` is intentionally NOT here — cross-
+        # source slug mismatches (Wolves/Wolverhampton) leave it NULL by design;
+        # coverage is observed via the WARNING-severity row_count check below.
+        CHECK.no_nulls('gold.fct_player_unavailable',
+                       cols=['match_id', 'match_date', 'player_id_canonical']),
 
         # ========== Referential integrity — ERROR ==========
         CHECK.ref_integrity('gold.fct_team_match',   'gold.dim_match', 'match_id'),
@@ -265,6 +280,9 @@ def validate_gold_quality() -> Dict[str, Any]:
         # T4.1: ML splits must trace back to dim_match (and through it, to Silver).
         CHECK.ref_integrity('gold.fct_match_train',   'gold.dim_match', 'match_id'),
         CHECK.ref_integrity('gold.fct_match_test',    'gold.dim_match', 'match_id'),
+        # E5: every unavailability row must point at a real Gold match.
+        # SQL already filters bridge failures, so 0 orphans by construction.
+        CHECK.ref_integrity('gold.fct_player_unavailable', 'gold.dim_match', 'match_id'),
 
         # ========== Point-in-time correctness — ERROR (guard against leakage) ==========
         # For first N matches of the partition every rolling feature MUST be NULL.
@@ -368,6 +386,39 @@ def validate_gold_quality() -> Dict[str, Any]:
         # outer envelope (best APL team vs worst over 5 matches).
         CHECK.value_range('gold.feat_team_xg_form', 'xg_diff_l5_avg',
                           min_val=-8, max_val=8, severity='WARNING'),
+
+        # ========== E5: fct_player_unavailable observability — WARNING ==========
+        # Bronze whoscored_missing_players has been collected since 2021 (APL);
+        # upper bound 2030 leaves several seasons of headroom.
+        CHECK.value_range('gold.fct_player_unavailable', 'season',
+                          min_val=2021, max_val=2030, severity='WARNING'),
+
+        # Cross-source team_id coverage. WhoScored team_name -> team_slug is
+        # best-effort (e.g. "Wolverhampton" vs "Wolves" leaves team_id NULL).
+        # 200 ≈ ~10% of a typical season — surfaces the issue without paging
+        # during a known-broken alias state. The CHECK registry has no
+        # two-tier coverage primitive yet, so we use a hard row count.
+        # Tighten once _team_aliases work absorbs the residual mismatches.
+        CHECK.row_count(
+            'gold.fct_player_unavailable',
+            min_rows=0, max_rows=200,
+            where='team_id IS NULL',
+            severity='WARNING',
+            name='coverage[fct_player_unavailable.team_id non-NULL]',
+        ),
+
+        # Cross-source player_id resolution coverage. Players that didn't
+        # match dim_player get a synthetic 'ws_<id>' fallback (D4); counting
+        # those tells us how much of the WhoScored player namespace is still
+        # un-bridged. Generous threshold until E1 xref_player ships a proper
+        # crosswalk.
+        CHECK.row_count(
+            'gold.fct_player_unavailable',
+            min_rows=0, max_rows=1500,
+            where="player_id_canonical LIKE 'ws_%'",
+            severity='WARNING',
+            name='coverage[fct_player_unavailable.player_id_canonical resolved]',
+        ),
     ]
 
     report = run_checks(checks, raise_on_error=False)

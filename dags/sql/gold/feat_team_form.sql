@@ -20,42 +20,68 @@
 --                  match_seq is a per-team monotonically increasing sequence
 --                  (ROW_NUMBER), so slope units are "points per match".
 --
--- Sources: iceberg.gold.fct_team_match
+-- Availability (added E5 / T3):
+--   unavailable_count_l5 — AVG(unavailable_count) over L5 window. Sourced from
+--                          gold.fct_player_unavailable aggregated per
+--                          (match_id, team_id). Missing rows COALESCE to 0 so
+--                          they do not produce NULL gaps inside the window.
+--                          Same masking rule (match_rn > 5) for strict
+--                          point-in-time semantics.
+--
+-- Sources: iceberg.gold.fct_team_match, iceberg.gold.fct_player_unavailable
 -- PK: (match_id, team_id)
 -- Partitioning: (league, season)
 -- =============================================================================
 
-WITH base AS (
+WITH team_unavail AS (
+    -- E5: per (match_id, team_id) count of confirmed unavailable players.
     SELECT
         match_id,
         team_id,
-        opponent_id,
-        date,
-        gameweek,
-        is_home,
-        goals_for,
-        goals_against,
-        shots,
-        shots_on_target,
-        possession,
-        points,
-        result,
-        league,
-        season,
+        CAST(COUNT(*) AS INTEGER) AS unavailable_count
+    FROM iceberg.gold.fct_player_unavailable
+    WHERE player_id_canonical IS NOT NULL
+      AND match_id  IS NOT NULL
+      AND team_id   IS NOT NULL
+    GROUP BY match_id, team_id
+),
+base AS (
+    SELECT
+        tm.match_id,
+        tm.team_id,
+        tm.opponent_id,
+        tm.date,
+        tm.gameweek,
+        tm.is_home,
+        tm.goals_for,
+        tm.goals_against,
+        tm.shots,
+        tm.shots_on_target,
+        tm.possession,
+        tm.points,
+        tm.result,
+        tm.league,
+        tm.season,
+        -- E5: missing -> 0 so window AVG stays defined ("no confirmed
+        -- unavailability data" is semantically 0, not NULL).
+        COALESCE(tu.unavailable_count, 0) AS unavailable_count,
         ROW_NUMBER() OVER (
-            PARTITION BY team_id, season
-            ORDER BY date, match_id
+            PARTITION BY tm.team_id, tm.season
+            ORDER BY tm.date, tm.match_id
         ) AS match_rn,
         -- Independent variable for REGR_SLOPE: monotonic per (team_id, season).
         -- Equivalent to match_rn but kept as a separate column for clarity —
         -- units of slope become "points per match".
         CAST(
             ROW_NUMBER() OVER (
-                PARTITION BY team_id, season
-                ORDER BY date, match_id
+                PARTITION BY tm.team_id, tm.season
+                ORDER BY tm.date, tm.match_id
             ) AS DOUBLE
         ) AS match_seq
-    FROM iceberg.gold.fct_team_match
+    FROM iceberg.gold.fct_team_match tm
+    LEFT JOIN team_unavail tu
+        ON  tu.match_id = tm.match_id
+        AND tu.team_id  = tm.team_id
 ),
 rolled AS (
     SELECT
@@ -76,6 +102,9 @@ rolled AS (
         STDDEV_SAMP(CAST(points        AS DOUBLE)) OVER w AS l5_points_std_raw,
         -- T3.3: form trend (linear regression slope of points over match_seq)
         REGR_SLOPE(CAST(points AS DOUBLE), match_seq) OVER w AS l5_form_trend_raw,
+        -- E5: rolling availability — avg # of confirmed unavailable players
+        -- over the prior 5 matches.
+        AVG(CAST(unavailable_count AS DOUBLE)) OVER w AS l5_unavailable_count_avg_raw,
         LAG(date, 1) OVER (
             PARTITION BY team_id, season
             ORDER BY date, match_id
@@ -110,6 +139,8 @@ SELECT
     CASE WHEN match_rn > 5 THEN l5_points_std_raw        END AS l5_points_std,
     -- T3.3: trend (NULL for first 5 rows per partition)
     CASE WHEN match_rn > 5 THEN l5_form_trend_raw        END AS l5_form_trend,
+    -- E5: availability rolling average (NULL for first 5 rows per partition)
+    CASE WHEN match_rn > 5 THEN l5_unavailable_count_avg_raw END AS unavailable_count_l5,
     match_rn                                                    AS matches_played_so_far,
     DATE_DIFF('day', prev_match_date, date)                     AS rest_days,
     league,

@@ -1,0 +1,78 @@
+-- =============================================================================
+-- Silver: whoscored_player_unavailable
+-- =============================================================================
+-- Per-match player unavailability, sourced from WhoScored "missing players".
+-- One row per (match_id, team, ws_player_id).
+--
+-- Sources:
+--   iceberg.bronze.whoscored_missing_players  (mp)
+--   iceberg.bronze.whoscored_schedule         (s)  — joined for match_date
+--
+-- Architectural filters (D3 + D5):
+--   * status = 'confirmed' (case-insensitive)        — no rumours
+--   * reason <> 'International duty'                 — D3: national-team call-ups
+--                                                       are not a "form" signal
+--   * player_id IS NOT NULL                          — rows without a stable id
+--                                                       cannot be deduped or joined
+-- =============================================================================
+
+WITH mp_dedup AS (
+    SELECT
+        mp.league,
+        mp.season,
+        mp.game,
+        mp.team,
+        mp.player_id,
+        mp.player,
+        mp.reason,
+        mp.status,
+        mp._ingested_at,
+        ROW_NUMBER() OVER (
+            PARTITION BY mp.game, mp.team, mp.player_id
+            ORDER BY mp._ingested_at DESC
+        ) AS rn
+    FROM iceberg.bronze.whoscored_missing_players mp
+    WHERE LOWER(mp.status) = 'confirmed'
+      AND (mp.reason IS NULL OR mp.reason <> 'International duty')
+      AND mp.player_id IS NOT NULL
+),
+
+sch_dedup AS (
+    -- Schedule may carry multiple snapshots; date doesn't change once published,
+    -- so keep the latest per (league, season, game).
+    SELECT
+        league,
+        season,
+        game,
+        date,
+        ROW_NUMBER() OVER (
+            PARTITION BY league, season, game
+            ORDER BY _ingested_at DESC
+        ) AS rn
+    FROM iceberg.bronze.whoscored_schedule
+)
+
+SELECT
+    -- ========= Identity =========
+    mp.game                                AS match_id,
+    TRY_CAST(s.date AS DATE)               AS match_date,
+
+    -- ========= Source attributes =========
+    mp.league,
+    TRY_CAST(mp.season AS INTEGER)         AS season,
+    mp.team                                AS team_name,
+    mp.player_id                           AS ws_player_id,
+    mp.player                              AS player_name,
+    mp.reason,
+    mp.status,
+
+    -- ========= Lineage =========
+    mp._ingested_at                        AS _bronze_ingested_at
+
+FROM mp_dedup mp
+LEFT JOIN sch_dedup s
+    ON  s.league = mp.league
+    AND s.season = mp.season
+    AND s.game   = mp.game
+    AND s.rn     = 1
+WHERE mp.rn = 1

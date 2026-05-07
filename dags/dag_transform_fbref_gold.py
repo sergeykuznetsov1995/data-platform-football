@@ -41,6 +41,7 @@ Gold Tables
 - ``gold.dim_match``          — match attributes + ML targets
 - ``gold.fct_team_match``     — long-form team metrics per match
 - ``gold.fct_player_match``   — player metrics per match
+- ``gold.fct_player_unavailable`` — confirmed absences (E5; from WhoScored)
 - ``gold.match_outcomes``     — labels-only target table (1X2/BTTS/totals) for backtesting
 - ``gold.fct_match``          — wide form with pre-match features (ready for ML)
 - ``gold.feat_team_form``     — rolling team form (last 5, point-in-time safe)
@@ -83,10 +84,22 @@ STAGE_2_DIMS = [
 STAGE_3_FACTS = [
     ('fct_team_match',   'dags/sql/gold/fct_team_match.sql',   'fct_team_match',   ['league', 'season']),
     ('fct_player_match', 'dags/sql/gold/fct_player_match.sql', 'fct_player_match', ['league', 'season']),
+    # E5: must run before Stage 4 — feat_team_form joins it for unavailable_count_l5.
+    ('fct_player_unavailable', 'dags/sql/gold/fct_player_unavailable.sql',
+     'fct_player_unavailable', ['league', 'season']),
     # Labels-only target table — kept separate from `fct_match` so backtesting
     # can join targets to features without leakage.
     ('match_outcomes',   'dags/sql/gold/match_outcomes.sql',   'match_outcomes',   ['league', 'season']),
 ]
+
+# Tables in STAGE_3 with optional Silver sources. Same mechanism as
+# STAGE_4_FALLBACKS — runner routes CTAS to fallback SQL when source is absent.
+STAGE_3_FALLBACKS = {
+    'fct_player_unavailable': {
+        'fallback_sql_file': 'dags/sql/gold/fct_player_unavailable_empty.sql',
+        'require_silver':    ['whoscored_player_unavailable'],
+    },
+}
 
 STAGE_4_FEATS = [
     ('feat_team_form',    'dags/sql/gold/feat_team_form.sql',    'feat_team_form',    ['league', 'season']),
@@ -192,17 +205,27 @@ with DAG(
                            'partition_cols': pcols},
             )
 
-    # Stage 3: base facts (long-form)
+    # Stage 3: base facts (long-form). Some tables degrade gracefully via
+    # STAGE_3_FALLBACKS when their optional Silver source is missing.
     with TaskGroup(group_id='s3_facts') as g3:
         for task_id, sql_file, table_name, pcols in STAGE_3_FACTS:
+            kwargs = {
+                'sql_file': sql_file,
+                'table_name': table_name,
+                'partition_cols': pcols,
+            }
+            fb = STAGE_3_FALLBACKS.get(task_id)
+            if fb:
+                kwargs['fallback_sql_file'] = fb['fallback_sql_file']
+                kwargs['require_silver']    = fb['require_silver']
             PythonOperator(
                 task_id=task_id,
                 python_callable=_run_transform,
-                op_kwargs={'sql_file': sql_file, 'table_name': table_name,
-                           'partition_cols': pcols},
+                op_kwargs=kwargs,
             )
 
-    # Stage 4: rolling features (depend on fct_team_match, fct_player_match)
+    # Stage 4: rolling features (depend on fct_team_match, fct_player_match).
+    # STAGE_4_FALLBACKS handles the same graceful-degrade pattern as Stage 3.
     with TaskGroup(group_id='s4_features') as g4:
         for task_id, sql_file, table_name, pcols in STAGE_4_FEATS:
             kwargs = {
@@ -210,8 +233,6 @@ with DAG(
                 'table_name': table_name,
                 'partition_cols': pcols,
             }
-            # Optional graceful-degrade for transforms whose Silver source
-            # may be absent (e.g. feat_team_xg_form ← silver.fbref_shot_events).
             fb = STAGE_4_FALLBACKS.get(task_id)
             if fb:
                 kwargs['fallback_sql_file'] = fb['fallback_sql_file']
