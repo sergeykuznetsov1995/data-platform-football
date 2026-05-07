@@ -29,7 +29,7 @@ from utils.silver_tasks import _get_trino_connection
 logger = logging.getLogger(__name__)
 
 DEFAULT_SCHEMAS: Tuple[str, ...] = ("bronze", "silver", "gold")
-DEFAULT_RETENTION = "7d"
+DEFAULT_RETENTION = "30d"
 
 # High-churn tables — daily DAGs do delete-then-insert, so even a 7-day
 # retention leaves >14 stale snapshots between weekly sweeps. Run a separate
@@ -115,7 +115,7 @@ def maintain_iceberg_tables(
 
     Args:
         schemas: which Iceberg schemas to walk (default bronze/silver/gold).
-        retention_threshold: '7d' for weekly, '3d' for daily high-churn.
+        retention_threshold: '30d' for weekly, '3d' for daily high-churn.
             Requires `iceberg.{expire-snapshots,remove-orphan-files}.min-retention`
             in `configs/trino/catalog/iceberg.properties` to allow it.
         table_filter: if set, only tables whose short name is in this set
