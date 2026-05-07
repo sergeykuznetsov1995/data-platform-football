@@ -214,6 +214,34 @@ class CHECK:
         )
 
     @staticmethod
+    def canonical_completeness(
+        table: str,
+        canonical_col: str,
+        severity: str = 'ERROR',
+        name: Optional[str] = None,
+    ) -> Check:
+        """Schema-versioning completeness check (R0.4).
+
+        Asserts that every row with a non-NULL ``<base>_canonical`` value
+        also carries a non-NULL ``<base>_source`` and ``<base>_version``.
+        See ``docs/research/R0.4_schema_versioning.md`` for the contract.
+
+        ``canonical_col`` must end with ``_canonical``; the base name is
+        derived by stripping that suffix (e.g. ``venue_canonical → venue``).
+        Offender count > 0 fails the check (severity=ERROR by default).
+        """
+        if not canonical_col.endswith('_canonical'):
+            raise ValueError(
+                f"canonical_col must end with '_canonical', got: {canonical_col!r}"
+            )
+        return Check(
+            name=name or f"canonical_completeness[{table}.{canonical_col}]",
+            kind='canonical_completeness',
+            params={'table': table, 'canonical_col': canonical_col},
+            severity=severity,
+        )
+
+    @staticmethod
     def point_in_time(
         table: str,
         feature_col: str,
@@ -395,6 +423,48 @@ def _run_value_range(conn, check: Check) -> Dict[str, Any]:
     }
 
 
+def _run_canonical_completeness(conn, check: Check) -> Dict[str, Any]:
+    """R0.4: rows with non-NULL ``<base>_canonical`` MUST have non-NULL
+    ``<base>_source`` and ``<base>_version``.
+
+    Mirrors the shape of ``_run_no_nulls``: derive the three column names,
+    run a single COUNT(*) over the offending predicate, build a CheckResult
+    payload. Offender count > 0 fails the check.
+    """
+    p = check.params
+    table = _qualify(p['table'])
+    canonical_col = _safe_ident(p['canonical_col'], "column")
+    if not canonical_col.endswith('_canonical'):
+        # Defensive: factory already validates this, but the runner is
+        # callable directly via the registry so re-check at the boundary.
+        raise ValueError(
+            f"canonical_col must end with '_canonical', got: {canonical_col!r}"
+        )
+    base = canonical_col[: -len('_canonical')]
+    source_col = _safe_ident(f"{base}_source", "column")
+    version_col = _safe_ident(f"{base}_version", "column")
+
+    sql = (
+        f"SELECT COUNT(*) AS offenders FROM {table} "
+        f"WHERE {canonical_col} IS NOT NULL "
+        f"AND ({source_col} IS NULL OR {version_col} IS NULL)"
+    )
+    row = _fetchone(conn, sql)
+    offenders = row[0] if row else 0
+    return {
+        'passed': offenders == 0,
+        'details': (
+            f"all rows with {canonical_col} carry {source_col} + {version_col}"
+            if offenders == 0
+            else (
+                f"{offenders} row(s) with non-NULL {canonical_col} are missing "
+                f"{source_col} and/or {version_col}"
+            )
+        ),
+        'value': offenders,
+    }
+
+
 def _run_point_in_time(conn, check: Check) -> Dict[str, Any]:
     p = check.params
     table = _qualify(p['table'])
@@ -432,6 +502,7 @@ _RUNNERS = {
     'no_nulls': _run_no_nulls,
     'ref_integrity': _run_ref_integrity,
     'value_range': _run_value_range,
+    'canonical_completeness': _run_canonical_completeness,
     'point_in_time': _run_point_in_time,
 }
 
