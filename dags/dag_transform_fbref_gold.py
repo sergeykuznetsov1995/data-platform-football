@@ -39,6 +39,11 @@ Gold Tables
 - ``gold.dim_team``           — team dimension
 - ``gold.dim_player``         — player dimension
 - ``gold.dim_match``          — match attributes + ML targets
+- ``gold.dim_venue``          — venue master-data (E2)
+- ``gold.dim_referee``        — referee master-data (E2)
+- ``gold.dim_standings``      — SofaScore league-table snapshot (E2)
+- ``gold.dim_competition``    — competition master-data from leagues.yaml (E2)
+- ``gold.dim_season``         — season master-data with valid_from/valid_to (E2)
 - ``gold.fct_team_match``     — long-form team metrics per match
 - ``gold.fct_player_match``   — player metrics per match
 - ``gold.fct_player_unavailable`` — confirmed absences (E5; from WhoScored)
@@ -79,6 +84,32 @@ STAGE_2_DIMS = [
     ('dim_team',   'dags/sql/gold/dim_team.sql',   'dim_team',   ['league', 'season']),
     ('dim_player', 'dags/sql/gold/dim_player.sql', 'dim_player', ['league', 'season']),
     ('dim_match',  'dags/sql/gold/dim_match.sql',  'dim_match',  ['league', 'season']),
+]
+
+# E2: master-data dims that are NOT partitioned by (league, season).
+# Three are read straight from a static .sql file (Bronze-sourced); the other
+# two (dim_competition, dim_season) are rendered from config via
+# utils.dim_loaders before CTAS — see STAGE_2B_MASTER_DIMS_INLINE below.
+#
+# dim_standings IS partitioned by (league, season) because Bronze emits one
+# snapshot per league/season. The other four are tiny static reference tables
+# (~5-30 rows) so partitioning would just create empty manifest noise.
+STAGE_2B_MASTER_DIMS_SQL = [
+    # (task_id, sql_file, table_name, partition_cols)
+    ('dim_venue',     'dags/sql/gold/dim_venue.sql',     'dim_venue',     None),
+    ('dim_referee',   'dags/sql/gold/dim_referee.sql',   'dim_referee',   None),
+    ('dim_standings', 'dags/sql/gold/dim_standings.sql', 'dim_standings', ['league', 'season']),
+]
+
+# Inline-rendered master dims (Jinja .sql.j2 templates -> tempfile -> CTAS).
+# Renderer functions are looked up by name at TaskGroup-build time so the
+# top-level DAG body stays import-light (no eager import of dim_loaders -> yaml).
+STAGE_2B_MASTER_DIMS_INLINE = [
+    # (task_id, renderer_name, template_path, table_name, partition_cols)
+    ('dim_competition', 'render_dim_competition_sql',
+     'dags/sql/gold/dim_competition.sql.j2', 'dim_competition', None),
+    ('dim_season',      'render_dim_season_sql',
+     'dags/sql/gold/dim_season.sql.j2',      'dim_season',      None),
 ]
 
 STAGE_3_FACTS = [
@@ -205,6 +236,47 @@ with DAG(
                            'partition_cols': pcols},
             )
 
+    # Stage 2b: master-data dims (E2). Three Bronze-sourced + two
+    # config-rendered. NOT in s2_dimensions because:
+    #   * dim_team / dim_player / dim_match are FBref-driven and partitioned
+    #     by (league, season); the master dims have a different shape (mostly
+    #     un-partitioned, some come from YAML / Python config).
+    #   * Keeping a separate group makes the Airflow UI mirror the medallion
+    #     plan (E2 is "master-data dims") and keeps blast radius tight if
+    #     Phase B's SQL needs to be re-run independently.
+    with TaskGroup(group_id='s2b_master_dims') as g2b:
+        for task_id, sql_file, table_name, pcols in STAGE_2B_MASTER_DIMS_SQL:
+            PythonOperator(
+                task_id=task_id,
+                python_callable=_run_transform,
+                op_kwargs={'sql_file': sql_file, 'table_name': table_name,
+                           'partition_cols': pcols},
+            )
+
+        # Inline-rendered dims: lazy-import the renderer registry inside the
+        # TaskGroup body (NOT at module top) so DAG parse stays cheap and
+        # doesn't pull in PyYAML for unrelated DAGs in the same DagBag.
+        from utils.dim_loaders import (
+            render_dim_competition_sql,
+            render_dim_season_sql,
+            run_inline_ctas,
+        )
+        _RENDERERS = {
+            'render_dim_competition_sql': render_dim_competition_sql,
+            'render_dim_season_sql':      render_dim_season_sql,
+        }
+        for task_id, renderer_name, tpl, table_name, pcols in STAGE_2B_MASTER_DIMS_INLINE:
+            PythonOperator(
+                task_id=task_id,
+                python_callable=run_inline_ctas,
+                op_kwargs={
+                    'renderer':     _RENDERERS[renderer_name],
+                    'template_sql': tpl,
+                    'table_name':   table_name,
+                    'partition_cols': pcols,
+                },
+            )
+
     # Stage 3: base facts (long-form). Some tables degrade gracefully via
     # STAGE_3_FALLBACKS when their optional Silver source is missing.
     with TaskGroup(group_id='s3_facts') as g3:
@@ -275,4 +347,4 @@ with DAG(
         python_callable=_quality,
     )
 
-    g1 >> g2 >> g3 >> g4 >> g5 >> g6 >> validate_row_counts >> validate_quality
+    g1 >> g2 >> g2b >> g3 >> g4 >> g5 >> g6 >> validate_row_counts >> validate_quality

@@ -1,0 +1,38 @@
+# =============================================================================
+# OpenMetadata description: iceberg.gold.dim_referee
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.gold.dim_referee
+  description: |
+    Справочник судей, извлекаемый из FBref schedule. Одна строка на referee_id
+    с ASCII-нормализацией имени (известное ограничение: `Çakır`≠`Cakir` —
+    фикс в R8 follow-up). В v1 referee_source всегда 'fbref'; поддержка
+    альтернативных источников добавится при расширении охвата.
+  tags:
+    - Tier.Gold
+    - Domain.Football
+    - PII.None
+columns:
+  - name: referee_id
+    description: Канонический ID судьи (`ref_<xxhash64>` от ASCII-нормализованного имени).
+  - name: referee_canonical
+    description: Каноническое имя судьи после ASCII-нормализации.
+  - name: referee_source
+    description: Источник имени судьи; в v1 всегда 'fbref'.
+  - name: referee_version
+    description: Версия схемы канонизации судьи (R0.4 schema-versioning).
+  - name: referee_slug
+    description: URL-friendly slug канонического имени судьи.
+  - name: n_matches
+    description: Количество матчей, отсуженных этим арбитром.
+  - name: first_seen_date
+    description: Дата первого матча с этим судьёй.
+  - name: last_seen_date
+    description: Дата последнего матча с этим судьёй.
+  - name: leagues
+    description: Массив лиг, в которых судья работал.
+  - name: seasons
+    description: Массив сезонов, в которых судья появлялся.
+  - name: _silver_created_at
+    description: Технический timestamp создания строки в Silver-слое.
+relationships: []

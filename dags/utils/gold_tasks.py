@@ -134,7 +134,18 @@ def run_gold_transform(
         Same dict as ``run_silver_transform``. When fallback fires, the dict
         has ``status='success'`` and an extra ``fallback=True`` key so the
         caller / Airflow log makes the degraded state obvious.
+
+    Note on ``partition_columns``:
+        Unlike ``run_silver_transform`` (which silently defaults to
+        ``['league', 'season']`` when ``None`` is passed), Gold honours
+        ``None`` as **no partitioning** — required for global dims
+        (``dim_venue``, ``dim_referee``, ``dim_competition``, ``dim_season``)
+        whose row count is too small to justify partitioning, and whose
+        schema may not even contain ``league``/``season`` columns.
     """
+    if partition_columns is None:
+        partition_columns = []
+
     if fallback_sql_file and require_silver:
         missing = [
             t for t in require_silver
@@ -210,6 +221,89 @@ def _append_train_test_disjointness_check(report) -> None:
             error=str(e),
         ))
         logger.exception("disjointness check raised")
+    finally:
+        conn.close()
+
+
+def _append_dim_standings_coverage_check(report) -> None:
+    """E2: append a two-tier coverage CheckResult for dim_standings.
+
+    Measures the fraction of standings rows whose team_id was resolved via
+    the canonical resolver (``team_id_source = 'fbref_canonical'``) vs the
+    fallback (``'sofascore_orphan'``). Uses two-tier severity:
+
+      * ``coverage >= 95%`` -> OK
+      * ``50% <= coverage < 95%`` -> WARNING (drop in resolver match-rate)
+      * ``coverage < 50%`` -> ERROR-grade signal, but the check is wired as
+        WARNING per the E2 spec (orphans are tracked, not blocking).
+
+    Implemented inline (mirroring ``_append_train_test_disjointness_check``)
+    because the universal CHECK registry has no two-tier ``coverage``
+    primitive yet — see CLAUDE.md Gold/DQ section. When ``coverage()``
+    lands in ``data_quality.py`` this helper should be folded into the
+    main check list.
+    """
+    from utils.data_quality import CheckResult, _get_conn
+
+    name = "coverage[dim_standings.team_id_source='fbref_canonical']"
+    sql = (
+        "SELECT "
+        "  COUNT(*) AS total, "
+        "  COUNT_IF(team_id_source = 'fbref_canonical') AS resolved "
+        "FROM iceberg.gold.dim_standings"
+    )
+
+    conn = _get_conn()
+    try:
+        cur = conn.cursor()
+        try:
+            cur.execute(sql)
+            row = cur.fetchone()
+        finally:
+            cur.close()
+        total, resolved = (row[0], row[1]) if row else (0, 0)
+        ratio = (resolved / total) if total else 0.0
+        ratio_pct = round(ratio * 100, 2)
+
+        if total == 0:
+            # No standings yet — surfaced separately by row_count check.
+            passed = True
+            details = "dim_standings is empty — coverage skipped"
+        elif ratio >= 0.95:
+            passed = True
+            details = (
+                f"resolved={resolved}/{total} ({ratio_pct}%) >= 95% — OK"
+            )
+        elif ratio >= 0.50:
+            passed = False
+            details = (
+                f"resolved={resolved}/{total} ({ratio_pct}%) in [50%, 95%) — "
+                "resolver match-rate degraded"
+            )
+        else:
+            passed = False
+            details = (
+                f"resolved={resolved}/{total} ({ratio_pct}%) < 50% — "
+                "resolver largely failing; check _team_aliases coverage"
+            )
+
+        report.results.append(CheckResult(
+            name=name,
+            kind='coverage',
+            severity='WARNING',  # spec: WARNING-only — orphans are tracked
+            passed=passed,
+            details=details,
+            value=ratio,
+        ))
+    except Exception as e:
+        report.results.append(CheckResult(
+            name=name,
+            kind='coverage',
+            severity='WARNING',
+            passed=False,
+            error=str(e),
+        ))
+        logger.exception("dim_standings coverage check raised")
     finally:
         conn.close()
 
@@ -419,6 +513,78 @@ def validate_gold_quality() -> Dict[str, Any]:
             severity='WARNING',
             name='coverage[fct_player_unavailable.player_id_canonical resolved]',
         ),
+
+        # ============================================================
+        # E2: master-data dims (dim_venue / dim_referee / dim_standings /
+        # dim_competition / dim_season). Mirrors the existing dim_match /
+        # dim_team / dim_player block but adapted to the E2 PK shapes and
+        # the R0.4 (_canonical, _source, _version) schema-versioning trio.
+        # ============================================================
+
+        # ----- E2: PK uniqueness — ERROR -----
+        CHECK.no_duplicates('gold.dim_venue',       pk=['venue_id']),
+        CHECK.no_duplicates('gold.dim_referee',     pk=['referee_id']),
+        # Composite PK — one standings row per (league, season, team).
+        CHECK.no_duplicates('gold.dim_standings',   pk=['league', 'season', 'team_id']),
+        CHECK.no_duplicates('gold.dim_competition', pk=['competition_id']),
+        CHECK.no_duplicates('gold.dim_season',      pk=['season_id']),
+
+        # ----- E2: NOT NULL on PKs + critical attrs — ERROR -----
+        CHECK.no_nulls('gold.dim_venue',       cols=['venue_id', 'venue_canonical']),
+        CHECK.no_nulls('gold.dim_referee',     cols=['referee_id', 'referee_canonical']),
+        # dim_standings has no canonical column — its source-tracking is via
+        # team_id_source (covered by the coverage check below). Here we just
+        # guarantee the PK trio + the load-bearing numeric attrs are present.
+        CHECK.no_nulls('gold.dim_standings',
+                       cols=['league', 'season', 'team_id', 'points', 'mp']),
+        CHECK.no_nulls('gold.dim_competition',
+                       cols=['competition_id', 'competition_name']),
+        CHECK.no_nulls('gold.dim_season',
+                       cols=['season_id', 'season_start_year',
+                             'valid_from', 'valid_to']),
+
+        # ----- E2: ref_integrity dim_standings.team_id → dim_team — ERROR -----
+        # Soft FK: rows whose team_id_source='sofascore_orphan' are intentionally
+        # NOT in dim_team (resolver couldn't match — they are tracked but not
+        # joined). Only the canonical-resolved rows must point at a real
+        # dim_team key. Implemented as row_count(max_rows=0) over the
+        # offending predicate because the universal CHECK.ref_integrity has
+        # no WHERE-filter mode (yet).
+        # Severity = WARNING (not ERROR) because the upstream entity_xref
+        # alias coverage (`_team_aliases.sql`) is incomplete by design —
+        # SofaScore variants like 'Liverpool FC' map to a distinct
+        # `liverpool_fc` canonical_id whereas dim_team uses `liverpool`.
+        # Closing those gaps is E1's job (xref refactor → Silver), not E2's.
+        # The orphan share is also surfaced via the coverage WARNING below.
+        CHECK.row_count(
+            'gold.dim_standings', min_rows=0, max_rows=0,
+            where=("team_id_source = 'fbref_canonical' "
+                   "AND team_id NOT IN (SELECT team_id FROM iceberg.gold.dim_team)"),
+            severity='WARNING',
+            name='ref_integrity[dim_standings.team_id->dim_team]',
+        ),
+
+        # ----- E2: schema-versioning completeness (R0.4) — ERROR -----
+        # Every row with a non-NULL <base>_canonical MUST also carry
+        # <base>_source and <base>_version. Catches schema regressions
+        # where a CTAS forgets to populate the trio.
+        # NB: dim_competition / dim_season are intentionally included even
+        # though their canonical = literal column — serves as a regression
+        # guard for future v2 schema bumps.
+        CHECK.canonical_completeness('gold.dim_venue',       'venue_canonical'),
+        CHECK.canonical_completeness('gold.dim_referee',     'referee_canonical'),
+        CHECK.canonical_completeness('gold.dim_competition', 'competition_canonical'),
+        CHECK.canonical_completeness('gold.dim_season',      'season_canonical'),
+
+        # ----- E2: value-range sanity (WARNING) -----
+        # APL has 38 matches/season (max 46 across other supported leagues).
+        # Points hard ceiling: 38 * 3 = 114 -> round to 120 for safety margin.
+        CHECK.value_range('gold.dim_standings', 'points',
+                          min_val=0, max_val=120, severity='WARNING'),
+        CHECK.value_range('gold.dim_standings', 'mp',
+                          min_val=0, max_val=46,  severity='WARNING'),
+        CHECK.value_range('gold.dim_standings', 'position',
+                          min_val=1, max_val=24,  severity='WARNING'),
     ]
 
     report = run_checks(checks, raise_on_error=False)
@@ -428,6 +594,12 @@ def validate_gold_quality() -> Dict[str, Any]:
     # cross-table set-difference primitive yet. Failure is ERROR-grade: if
     # train and test overlap, every reported metric becomes invalid.
     _append_train_test_disjointness_check(report)
+
+    # E2: two-tier coverage check on dim_standings.team_id resolver hit-rate.
+    # Inline because the universal CHECK registry has no two-tier coverage
+    # primitive yet (see helper docstring). WARNING-only — orphans are
+    # intentionally retained with team_id_source='sofascore_orphan'.
+    _append_dim_standings_coverage_check(report)
 
     logger.info(f"Gold DQ: {report.summary()}")
 
@@ -584,6 +756,24 @@ def validate_gold_row_counts() -> Dict[str, Any]:
         # safe even if only the current season is materialized.
         CHECK.row_count('gold.fct_match_train',  min_rows=1500),
         CHECK.row_count('gold.fct_match_test',   min_rows=75),
+
+        # ===== E2: master-data dim row-count floors =====
+        # dim_venue: APL has ~20 active stadiums per season; 9+ seasons of
+        # history with promotion/relegation churn comfortably exceeds 20 unique.
+        CHECK.row_count('gold.dim_venue',     min_rows=20),
+        # dim_referee: typically ~30+ active EPL match officials across history.
+        CHECK.row_count('gold.dim_referee',   min_rows=30),
+        # dim_standings: at least one snapshot of the current 18-team table
+        # (relaxed to 18 to cover early-season / partial loads — historical
+        # snapshots will multiply this by season).
+        CHECK.row_count('gold.dim_standings', min_rows=18),
+        # dim_competition: derived from leagues.yaml — currently 5 supported
+        # leagues. Hard equality (min=max=5) detects drift the moment the
+        # leagues list changes without a corresponding CTAS update.
+        CHECK.row_count('gold.dim_competition', min_rows=5, max_rows=5),
+        # dim_season: derived from SEASONS list — currently 5 seasons in
+        # rotation. Same drift-detection contract as dim_competition.
+        CHECK.row_count('gold.dim_season',      min_rows=5, max_rows=5),
     ]
     report = run_checks(checks, raise_on_error=False)
     logger.info(f"Gold row counts: {report.summary()}")

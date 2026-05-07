@@ -1,0 +1,56 @@
+# =============================================================================
+# OpenMetadata description: iceberg.gold.dim_standings
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.gold.dim_standings
+  description: |
+    Snapshot турнирной таблицы из SofaScore (post-deduction points; учёт
+    очковых санкций deferred до R7). PK = (league, season, team_id).
+    team_id резолвится через entity_xref в canonical FBref-id, либо
+    помечается как orphan ('ss_<slug>') если нет соответствия — поле
+    team_id_source служит lineage-маркером для downstream-логики.
+  tags:
+    - Tier.Gold
+    - Domain.Football
+    - PII.None
+columns:
+  - name: league
+    description: Лига турнира (часть PK).
+  - name: season
+    description: Сезон (часть PK).
+  - name: team_id
+    description: ID команды — canonical FBref-id или orphan 'ss_<slug>' (FK -> dim_team.team_id когда team_id_source='fbref_canonical').
+  - name: team_id_source
+    description: Lineage-маркер источника team_id ('fbref_canonical' | 'sofascore_orphan').
+  - name: team_name_raw
+    description: Имя команды как оно пришло из SofaScore (до канонизации).
+  - name: mp
+    description: Сыгранные матчи (matches played).
+  - name: wins
+    description: Количество побед.
+  - name: draws
+    description: Количество ничьих.
+  - name: losses
+    description: Количество поражений.
+  - name: goals_for
+    description: Забитые голы за сезон.
+  - name: goals_against
+    description: Пропущенные голы за сезон.
+  - name: goal_diff
+    description: Разница мячей (goals_for - goals_against).
+  - name: points
+    description: Очки в таблице (post-deduction; R7 deferred).
+  - name: position
+    description: Текущая позиция в таблице на момент snapshot.
+  - name: points_per_game
+    description: Среднее количество очков за матч (points / mp).
+  - name: snapshot_at
+    description: Timestamp снятия snapshot из SofaScore.
+  - name: as_of_date
+    description: Дата, на которую актуальна турнирная таблица.
+  - name: _silver_created_at
+    description: Технический timestamp создания строки в Silver-слое.
+relationships:
+  - from: team_id
+    to: trino_iceberg.iceberg.gold.dim_team.team_id
+    type: FOREIGN_KEY

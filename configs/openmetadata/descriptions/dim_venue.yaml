@@ -1,0 +1,47 @@
+# =============================================================================
+# OpenMetadata description: iceberg.gold.dim_venue
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.gold.dim_venue
+  description: |
+    Канонический справочник стадионов, объединённый из FBref и ESPN. Одна строка
+    на venue_id (`venue_<xxhash64>` от LOWER(TRIM(имя))), используется как
+    источник истины для атрибутации матчей к локациям. Поддерживает
+    schema-versioning по R0.4 (поля venue_canonical/_source/_version);
+    city и country — placeholder под R8 follow-up enrichment.
+  tags:
+    - Tier.Gold
+    - Domain.Football
+    - PII.None
+columns:
+  - name: venue_id
+    description: Канонический ID стадиона (`venue_<xxhash64>` от нормализованного имени).
+  - name: venue_canonical
+    description: Каноническое имя стадиона после нормализации (LOWER+TRIM, schema R0.4).
+  - name: venue_source
+    description: Источник, из которого взято каноническое имя ('fbref' | 'espn').
+  - name: venue_version
+    description: Версия схемы канонизации стадиона (R0.4 schema-versioning).
+  - name: venue_fbref
+    description: Имя стадиона как оно встречается в FBref schedule.
+  - name: venue_espn
+    description: Имя стадиона как оно встречается в ESPN.
+  - name: venue_slug
+    description: URL-friendly slug канонического имени (для UI и поиска).
+  - name: city
+    description: Город (placeholder, будет заполнен в R8 enrichment follow-up).
+  - name: country
+    description: Страна (placeholder, будет заполнен в R8 enrichment follow-up).
+  - name: n_matches
+    description: Количество матчей, сыгранных на этом стадионе (по всем сезонам).
+  - name: first_seen_date
+    description: Дата первого матча, привязанного к этому стадиону.
+  - name: last_seen_date
+    description: Дата последнего матча, привязанного к этому стадиону.
+  - name: league
+    description: Лига, в рамках которой стадион встречается (для партиционирования).
+  - name: season
+    description: Сезон, в рамках которого стадион встречается.
+  - name: _silver_created_at
+    description: Технический timestamp создания строки в Silver-слое.
+relationships: []
