@@ -18,6 +18,7 @@ Check types
 - ref_integrity  — child.key exists in parent.key
 - value_range    — column values within [min, max]
 - point_in_time  — rolling feature is NULL for first N rows per partition
+- scd2_no_overlap— SCD-2 validity intervals do not overlap within a key
 
 Typical usage
 -------------
@@ -268,6 +269,45 @@ class CHECK:
             severity=severity,
         )
 
+    @staticmethod
+    def scd2_no_overlap(
+        table: str,
+        pk_cols: List[str],
+        valid_from_col: str = 'valid_from',
+        valid_to_col: str = 'valid_to',
+        severity: str = 'ERROR',
+        name: Optional[str] = None,
+    ) -> Check:
+        """SCD-2 timeline integrity check.
+
+        Asserts that for every business key (``pk_cols``) the validity
+        intervals ``[valid_from, valid_to)`` do not overlap. NULL
+        ``valid_to`` is interpreted as the open-ended (current) row.
+
+        Used by SCD-2 dimensions such as ``dim_manager`` (Phase C.4),
+        ``dim_player_contract``, ``dim_team_kit``, etc. Adjacent stints
+        sharing an endpoint (``t1.valid_to == t2.valid_from``) are OK
+        because intervals are closed-open.
+
+        ``pk_cols`` MUST be non-empty — it defines the partition (timeline)
+        within which overlaps are forbidden. Different partitions with
+        date-overlapping rows are independent timelines and are NOT a
+        violation.
+        """
+        if not pk_cols:
+            raise ValueError("scd2_no_overlap requires at least one pk_col")
+        return Check(
+            name=name or f"scd2_no_overlap[{table}({','.join(pk_cols)})]",
+            kind='scd2_no_overlap',
+            params={
+                'table': table,
+                'pk_cols': pk_cols,
+                'valid_from_col': valid_from_col,
+                'valid_to_col': valid_to_col,
+            },
+            severity=severity,
+        )
+
 
 # ---------------------------------------------------------------------------
 # Check runners (one per kind)
@@ -495,6 +535,70 @@ def _run_point_in_time(conn, check: Check) -> Dict[str, Any]:
     }
 
 
+def _run_scd2_no_overlap(conn, check: Check) -> Dict[str, Any]:
+    """SCD-2 overlap check: count timeline overlaps within each partition.
+
+    For every business key (``pk_cols``) we self-join the table and count
+    pairs of rows whose validity intervals overlap. We use the standard
+    closed-open ``[valid_from, valid_to)`` interpretation:
+
+        overlap iff t1.valid_from < COALESCE(t2.valid_to, '9999-12-31')
+                  AND COALESCE(t1.valid_to, '9999-12-31') > t2.valid_from
+
+    To avoid double-counting symmetric pairs and self-matches we add a
+    strict tiebreaker on ``valid_from`` (``t1.valid_from < t2.valid_from``).
+    Rows that share the same ``valid_from`` for the same partition are also
+    considered overlapping (equal intervals) — caught via an OR-branch on
+    ``t1.valid_from = t2.valid_from`` plus a tiebreaker on ``valid_to`` to
+    keep the count deterministic.
+    """
+    p = check.params
+    table = _qualify(p['table'])
+    pk_cols = [_safe_ident(c, "column") for c in p['pk_cols']]
+    if not pk_cols:
+        raise ValueError("scd2_no_overlap requires at least one pk_col")
+    vf = _safe_ident(p['valid_from_col'], "column")
+    vt = _safe_ident(p['valid_to_col'], "column")
+
+    pk_match = " AND ".join(f"t1.{c} = t2.{c}" for c in pk_cols)
+    # Closed-open overlap predicate. Open-ended valid_to => +infinity.
+    open_end = "DATE '9999-12-31'"
+    overlap_pred = (
+        f"t1.{vf} < COALESCE(t2.{vt}, {open_end}) "
+        f"AND COALESCE(t1.{vt}, {open_end}) > t2.{vf}"
+    )
+    # Tiebreaker — count each unordered overlapping pair once.
+    # If valid_from differs: take the strictly-earlier row as t1.
+    # If valid_from is equal (duplicate-start overlap): break ties by
+    # valid_to (NULL last) so each pair contributes exactly once.
+    tiebreaker = (
+        f"(t1.{vf} < t2.{vf} "
+        f"OR (t1.{vf} = t2.{vf} "
+        f"    AND COALESCE(t1.{vt}, {open_end}) < COALESCE(t2.{vt}, {open_end})))"
+    )
+
+    sql = (
+        f"SELECT COUNT(*) AS overlaps "
+        f"FROM {table} t1 "
+        f"JOIN {table} t2 "
+        f"  ON {pk_match} "
+        f" AND {tiebreaker} "
+        f"WHERE {overlap_pred}"
+    )
+    row = _fetchone(conn, sql)
+    overlaps = row[0] if row else 0
+    pk_list = ", ".join(pk_cols)
+    return {
+        'passed': overlaps == 0,
+        'details': (
+            f"no SCD-2 overlaps for ({pk_list})"
+            if overlaps == 0
+            else f"{overlaps} overlapping interval pair(s) for ({pk_list})"
+        ),
+        'value': overlaps,
+    }
+
+
 _RUNNERS = {
     'row_count': _run_row_count,
     'no_duplicates': _run_no_duplicates,
@@ -504,6 +608,7 @@ _RUNNERS = {
     'value_range': _run_value_range,
     'canonical_completeness': _run_canonical_completeness,
     'point_in_time': _run_point_in_time,
+    'scd2_no_overlap': _run_scd2_no_overlap,
 }
 
 
