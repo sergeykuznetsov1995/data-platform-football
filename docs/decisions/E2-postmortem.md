@@ -117,3 +117,51 @@ Tests: **56/56 unit pass** в 0.40s; 9 integration smoke SKIP cleanly когда
   - Добавить `Liverpool FC → liverpool` в `_team_aliases.sql` (или generalize via SUBSTR normalization).
   - Materialize `silver.sofascore_league_standings` чтобы `dim_standings` мог читать из Silver вместо Bronze.
 - The `partition_columns=None → []` semantics override в `run_gold_transform` теперь permanent — E1/E3/E4 наследуют это.
+
+---
+
+## E2 follow-up: rebase onto E0/E5 + R0.2c FALLBACK (2026-05-08)
+
+**Этап завершён**: 2026-05-08
+**Контекст**: пользователь выбрал "Rebase + close deferred" — cherry-pick `37d13fe` onto `feature/medallion-e0-on-e5` (E0 cleanup + E5 player_unavailable already merged) + закрыть `dim_manager` через R0.2c (FotMob lineup endpoint) + defer `dim_stage`.
+
+### Что сделано
+
+| # | Задача | Артефакт |
+|---|---|---|
+| A | Cherry-pick `37d13fe` (5 dim'ов) onto E0/E5 ветку | commit `cc1c026` на `feature/medallion-e0-on-e5` |
+| A | Resolve 3 конфликта union-merge: `dag_transform_fbref_gold.py`, `gold_tasks.py`, `tests/unit/dags/conftest.py` | резолюция в commit `cc1c026` |
+| A | Verify pytest на хосте — **820 passed** (включая 11 E2 topology + 7 E5 DQ + 41 E2 SQL/DQ + остальные baseline) | host pytest |
+| A | Verify DagBag в Airflow контейнере — `dag_transform_fbref_gold` парсится (22 tasks: 5 E2 + E5 fct_player_unavailable + остальные) | container smoke |
+| C.3 | New universal DQ primitive `CHECK.scd2_no_overlap()` + 10 unit тестов | commit `fe36c57` |
+
+### Что отложено (R0.2c FALLBACK)
+
+| Item | Куда | Причина |
+|---|---|---|
+| **dim_manager (SCD-2)** | Phase 1.5 (R0.2a FBref parser path) | R0.2c (FotMob endpoint) hardened с feasibility-audit: `/api/matchDetails` → 404, `/api/data/matchDetails` → 403 (CF/x-mas), Next.js `_next/data` содержит только translations. Soccerdata reference broken. Playwright MCP в airflow-scheduler контейнере не имеет browser/proxy outbound. Полная разведка требует production-grade Playwright стенд (separate iteration). |
+| **dim_stage** | E8a / Phase 1.5 | `whoscored_season_stages.stage` всё NULL — без изменений vs original postmortem. APL-MVP не требует. |
+| **C.1/C.2/C.4/C.5** (dim_manager.sql + DAG wiring + DQ check + tests) | Phase 1.5 | Зависели от B.3 (`bronze.fotmob_lineups` populated). FALLBACK обнуляет цепочку. |
+| **B.2/B.3/B.4** (FotMob `read_lineup` + ingest + DQ) | Phase 1.5 | Зависели от B.1 verdict. FALLBACK обнуляет. |
+
+### Что узнали (input для Phase 1.5)
+
+1. **R0.2c FotMob path не free anymore** — `/api/matchDetails` removed; альтернатив без production-grade Playwright нет. R0.2a FBref parser единственная feasibility-confirmed опция для dim_manager.
+2. **Soccerdata FotMob match-details broken** — cookie server `46.101.91.154:6006` не отвечает; tls_requests path тоже падает. Affects future FotMob extensions: lineups / managers / ratings — все требуют свежий browser-side bypass.
+3. **`scd2_no_overlap()` primitive ready for reuse** — следующий SCD-2 dim получает DQ check «free». 10 тестов pass; runner использует closed-open `[from, to)` с deterministic tiebreaker через `valid_from`.
+4. **3-conflict cherry-pick pattern works** — union-merge для `STAGE_3_FACTS/FALLBACKS` (E5) + `STAGE_2B_*` (E2) в DAG file, plus `validate_gold_quality()` checks list. Все на разных hunks → trivial merge. Same pattern переиспользуется когда E1 / E3 будут rebased на ту же ветку.
+5. **Cherry-pick без багажа работает** — `37d13fe` оказался clean E2-only commit (28 файлов), без whoscored / postgres / bi-catalog work из соседних коммитов на `feature/medallion-e2-dims`.
+
+### Final scope для текущей E2-итерации (2026-05-08)
+
+- **5 master-data dims в Gold**: `dim_venue` (43 rows), `dim_referee` (44), `dim_standings` (20), `dim_competition` (5), `dim_season` (5) — все с canonical/source/version trio.
+- **`s2b_master_dims` TaskGroup** в `dag_transform_fbref_gold` между s2_dimensions и s3_facts.
+- **DQ extension**: `CHECK.canonical_completeness()` (E2) + `CHECK.scd2_no_overlap()` (готов для Phase 1.5 dim_manager).
+- **`partition_columns=None → []` semantics override** permanent.
+- **dim_manager + dim_stage** — explicitly deferred to Phase 1.5 / E8a.
+- **OpenMetadata YAML** — все 5 описаний versioned; live-deploy blocked by pre-existing `apply_descriptions.py` TagFQN bug (не E2 scope).
+
+### DQ-baseline (после rebase)
+
+- Pre-merge: pytest **820 passed** на хосте; 0 errors; 19/19 DQ существующих + 10 SCD-2 новых + 41 E2 SQL/DQ + 11 E2 DAG topology.
+- Production: после merge на master + первый green run `validate_gold_quality()` ожидаемо 101/102 (1 known WARNING — `Liverpool FC` alias gap, передаётся в E1).

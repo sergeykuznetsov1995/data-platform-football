@@ -289,17 +289,19 @@ Prototype в `scripts/r2_resolver_proto.py` (FBref как spine, unidecode norma
 - **NEW**: запустить `scripts/audit_gold_usage.py` (R0.5) для baseline-снимка какие таблицы реально читаются.
 - **NEW**: cost-projection (R0.3) → определить current HDFS usage % и выставить storage guard threshold.
 
-### E2 — Master-data dims (3-5 дней) — _was: после E1, теперь первый_
+### E2 — Master-data dims (3-5 дней) — _was: после E1, теперь первый_ — **Phase A done 2026-05-08**
 
 **Зависит от**: R0.1 (coverage), R0.2a (manager parser), R6 (Tier 2, может идти параллельно), R7, R8.
 
-- `dim_referee` (FBref schedule + ESPN matchsheet, fuzzy resolution на R8 алгоритме).
-- `dim_manager` SCD-2 (требует **R0.2a FBref scraper extension** — добавить parser для home_manager/away_manager).
-- `dim_standings` (SofaScore league_table snapshot — не derive!).
-- `dim_venue` (FBref schedule).
-- `dim_competition`, `dim_season`, `dim_stage` (small dims из конфигов).
+- ✅ `dim_referee` (FBref schedule + ESPN matchsheet, fuzzy resolution отложено в R8).
+- ⏸️ `dim_manager` SCD-2 — **deferred to Phase 1.5** (R0.2c FALLBACK — FotMob endpoint hardened; см. `docs/research/R0.2_scraper_extensions.md` recon update). R0.2a FBref parser path остаётся feasibility-confirmed для Phase 1.5 reattempt.
+- ✅ `dim_standings` (SofaScore league_table snapshot — не derive!).
+- ✅ `dim_venue` (FBref schedule).
+- ✅ `dim_competition`, ✅ `dim_season`, ⏸️ `dim_stage` (`whoscored_season_stages.stage` всё NULL → defer to E8a).
 
-**DoD**: PK uniqueness, ref_integrity 100%, SCD-2 stint без overlap'ов, новые dim'ы в OpenMetadata.
+**DoD текущей итерации**: 5 dim'ов merged onto `feature/medallion-e0-on-e5` (commit `cc1c026`); 820 pytest passed; DagBag green в Airflow контейнере; `CHECK.scd2_no_overlap()` primitive готов для Phase 1.5 dim_manager re-attempt. Postmortem `docs/decisions/E2-postmortem.md` секция «E2 follow-up: rebase onto E0/E5 + R0.2c FALLBACK».
+
+**Verdict 2026-05-08** — 5 of 7 dims в production; SCD-2 + stage отложены без блокирования E1/E3/E5.
 
 ### E5 — Player availability (2-3 дня) — _**MOVED EARLIER** (was после E4)_ — **DONE 2026-05-07**
 
