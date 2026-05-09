@@ -2,7 +2,7 @@
 # Data Platform - Makefile
 # =============================================================================
 
-.PHONY: help build up down restart logs ps clean health test-spark test-trino init-hdfs init-storage shell-spark shell-airflow shell-trino test-fbref-curl test-fbref-nodriver test-fbref-full test-proxy-stats
+.PHONY: help build up down restart logs ps clean health test-spark test-trino init-hdfs init-storage shell-spark shell-airflow shell-trino test-fbref-curl test-fbref-nodriver test-fbref-full test-proxy-stats superset-import superset-dashboards
 
 # Default target
 help:
@@ -217,3 +217,11 @@ for p in stats['proxies'][:5]: \
     print(f'  {p[\"host\"]}:{p[\"port\"]} - success_rate={p[\"success_rate\"]}'); \
 "
 
+
+# Re-import Superset datasets from datasources.yaml
+superset-import:
+	docker compose exec superset python /app/configs/superset/import_datasources.py
+
+# Re-import Superset dashboards from dashboards/*.py
+superset-dashboards:
+	docker compose exec superset python /app/configs/superset/import_dashboards.py

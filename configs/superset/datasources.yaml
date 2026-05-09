@@ -1,0 +1,261 @@
+---
+# =============================================================================
+# Superset datasources — declarative source of truth
+# =============================================================================
+# Декларативное описание подключений и датасетов Superset.
+# Применяется через configs/superset/import_datasources.py при bootstrap.
+#
+# Формат — нативный для Superset 4.x: одна database, плоский список tables.
+# В Superset 4.x официальный CLI `superset import_datasources` принимает только
+# ZIP-архивы (см. https://github.com/apache/superset/blob/master/docs/admin_docs/
+# configuration/importing-exporting-datasources.mdx). Поэтому bootstrap.sh
+# использует Python-имплантат, который читает этот YAML и создаёт объекты
+# через Superset SDK (SupersetSecurityManager + SqlaTable).
+#
+# При первом импорте `sqlalchemy_uri` будет заменён на боевой URI с паролем
+# из переменной окружения TRINO_SUPERSET_PASSWORD (см. bootstrap.sh).
+# =============================================================================
+
+databases:
+  - database_name: trino_iceberg
+    # Boilerplate URI без пароля; bootstrap.sh подставит реальный пароль через
+    # `superset set-database-uri`.
+    sqlalchemy_uri: trino://superset@trino:8443/iceberg
+    expose_in_sqllab: true
+    allow_ctas: false
+    allow_cvas: false
+    allow_dml: false
+    allow_run_async: true
+    cache_timeout: 3600
+    extra: |
+      {
+        "metadata_params": {},
+        "engine_params": {
+          "connect_args": {
+            "http_scheme": "https",
+            "verify": false,
+            "source": "superset"
+          },
+          "pool_pre_ping": true,
+          "pool_recycle": 1800
+        },
+        "schemas_allowed_for_file_upload": []
+      }
+
+    tables:
+
+      # -----------------------------------------------------------------------
+      # Cross-reference / dimensions
+      # -----------------------------------------------------------------------
+      - table_name: entity_xref
+        schema: gold
+        description: |
+          Кросс-референс внешних ID источников к каноническим ID платформы.
+          Используется как "клей" между источниками (FBref, Understat и т.д.).
+          Источник истины для team_id, player_id, match_id в Gold-слое.
+        default_endpoint: null
+        cache_timeout: 1800
+
+      - table_name: dim_team
+        schema: gold
+        description: |
+          Канонический справочник команд по сезонам (одна строка на team-league-season).
+          Используется как FK target из fct_match, fct_team_match, feat_team_*.
+        default_endpoint: null
+        cache_timeout: 3600
+
+      - table_name: dim_player
+        schema: gold
+        description: |
+          Канонический справочник игроков по сезонам. PK (player_id, season).
+          Используется как FK target из fct_player_match, feat_player_form.
+        default_endpoint: null
+        cache_timeout: 3600
+
+      - table_name: dim_match
+        schema: gold
+        description: |
+          Размерность матча: дата, тур, домашняя/гостевая команды, счёт, исход 1X2.
+          PK match_id. Источник для всех fct_* и feat_*-таблиц.
+        default_endpoint: null
+        cache_timeout: 3600
+
+      # -----------------------------------------------------------------------
+      # Facts
+      # -----------------------------------------------------------------------
+      - table_name: fct_match
+        schema: gold
+        description: |
+          Wide-form факт-таблица для ML: один матч = одна строка с
+          home/away pre-match form, H2H и xG-фичами. ML-таргеты result_1x2,
+          total_goals, btts. Готова к обучению моделей 1X2, BTTS, totals.
+        default_endpoint: null
+        cache_timeout: 1800
+
+      - table_name: fct_team_match
+        schema: gold
+        description: |
+          Long-form факт: одна строка на (match_id, team_id) — обе команды матча.
+          Источник rolling-фич (feat_team_form, feat_team_h2h).
+        default_endpoint: null
+        cache_timeout: 1800
+
+      - table_name: fct_player_match
+        schema: gold
+        description: |
+          Per-player перформанс в матче: голы, ассисты, минуты, удары, карточки.
+          Источник для feat_player_form.
+        default_endpoint: null
+        cache_timeout: 1800
+
+      # -----------------------------------------------------------------------
+      # Features
+      # -----------------------------------------------------------------------
+      - table_name: feat_team_form
+        schema: gold
+        description: |
+          Rolling-фичи команды по последним 5 матчам (point-in-time safe).
+          Включает avg/std/trend по голам, ударам, поссессии, очкам.
+          Первые 5 матчей сезона — NULL для предотвращения лика.
+        default_endpoint: null
+        cache_timeout: 1800
+
+      - table_name: feat_team_h2h
+        schema: gold
+        description: |
+          Head-to-head фичи: rolling-агрегация последних 5 встреч пары команд.
+          PK (match_id, team_id, opponent_id). Excludes current match.
+        default_endpoint: null
+        cache_timeout: 1800
+
+      - table_name: feat_player_form
+        schema: gold
+        description: |
+          Rolling-фичи игрока за последние 5 матчей.
+          Голы, ассисты, удары, минуты — avg по L5; sum для голов/карточек.
+          Первые 5 появлений сезона — NULL.
+        default_endpoint: null
+        cache_timeout: 1800
+
+      - table_name: feat_team_xg_form
+        schema: gold
+        description: |
+          xG/xA rolling-форма команды (Understat L5).
+          xg_for_l5, xg_against_l5, xg_diff_l5. Источник для фичей ML.
+        default_endpoint: null
+        cache_timeout: 1800
+
+      - table_name: feat_referee_bias
+        schema: gold
+        description: |
+          Per-(referee, season, league) bias-метрики: cards_per_match,
+          home_win_pct, penalty_rate. Используется в mart_referee_dashboard.
+        default_endpoint: null
+        cache_timeout: 3600
+
+      - table_name: feat_team_event_style
+        schema: gold
+        description: |
+          Per-(team, season, league) распределение SPADL action_canonical
+          и success_rate. Источник для тактических разрезов.
+        default_endpoint: null
+        cache_timeout: 3600
+
+      # -----------------------------------------------------------------------
+      # E3/E4 facts (event-level + narrow facts)
+      # -----------------------------------------------------------------------
+      - table_name: fct_event
+        schema: gold
+        description: |
+          Event-grain факт (~695k строк): SPADL-канонизированные события
+          WhoScored с x/y координатами (0-100). Источник mart_event_heatmap.
+          PK (event_id_canonical). Партиции (league, season).
+        default_endpoint: null
+        cache_timeout: 3600
+
+      - table_name: fct_shot
+        schema: gold
+        description: |
+          Shot-grain факт с xG (Understat). Один удар = одна строка.
+          Содержит player_id, assist_player_id, xg, is_goal, x/y. Партиции (league, season).
+        default_endpoint: null
+        cache_timeout: 3600
+
+      - table_name: fct_lineup
+        schema: gold
+        description: |
+          Стартовые составы и замены (ESPN). Per-(match, team, player).
+          Используется для расчёта minutes_played и tactical analytics.
+        default_endpoint: null
+        cache_timeout: 3600
+
+      - table_name: fct_goal
+        schema: gold
+        description: |
+          Per-goal факт: scorer, assist, minute, is_penalty, is_own_goal.
+          Источник: fct_shot is_goal=true ∪ FBref own-goal annotations.
+        default_endpoint: null
+        cache_timeout: 3600
+
+      - table_name: fct_card
+        schema: gold
+        description: |
+          Per-card факт: yellow/red/second_yellow, минута, игрок, команда.
+          Источник: silver.match_cards.
+        default_endpoint: null
+        cache_timeout: 3600
+
+      - table_name: fct_match_odds
+        schema: gold
+        description: |
+          Pre-match букмекерские коэффициенты 1X2 + totals + BTTS
+          (football-data.co.uk). Используется как baseline для ML.
+        default_endpoint: null
+        cache_timeout: 3600
+
+      - table_name: fct_match_rating
+        schema: gold
+        description: |
+          Per-(match, player) рейтинг SofaScore (0-10). Источник
+          для performance-аналитики и aggregated team performance.
+        default_endpoint: null
+        cache_timeout: 3600
+
+      - table_name: fct_player_unavailable
+        schema: gold
+        description: |
+          Travail/injuries/suspensions: per-(match, player, reason).
+          Источник: silver.whoscored_missing_players. E5.
+        default_endpoint: null
+        cache_timeout: 3600
+
+      # -----------------------------------------------------------------------
+      # E7 marts (BI-ready denormalized views)
+      # -----------------------------------------------------------------------
+      - table_name: mart_scouting_radar
+        schema: gold
+        description: |
+          Per-(player, match) scouting view с denormalized player_name/position.
+          xG, xA, key_passes, defensive_actions + L5 rolling метрики
+          (point-in-time safe, NULL для первых 5 матчей).
+          Источник для дашборда Scouting Radar.
+        default_endpoint: null
+        cache_timeout: 1800
+
+      - table_name: mart_referee_dashboard
+        schema: gold
+        description: |
+          Per-(referee, season, league) сводка: cards_per_match,
+          yellows/reds/penalties/goals per match, home_win_pct.
+          Источник для дашборда Referee Dashboard.
+        default_endpoint: null
+        cache_timeout: 3600
+
+      - table_name: mart_event_heatmap
+        schema: gold
+        description: |
+          Per-(team, season, league, zone_x, zone_y, action_canonical)
+          распределение событий и success_rate. Грид 12×8 поверх 0-100 пола.
+          Источник для дашборда Event Heatmap.
+        default_endpoint: null
+        cache_timeout: 3600
