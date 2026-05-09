@@ -214,3 +214,105 @@ class TestE1DagImports:
             "trigger_silver_xref must have at least one upstream task "
             "(should depend on Bronze ingestion completion)"
         )
+
+
+# ---------------------------------------------------------------------------
+# E1.5 cutover tests — Gold DAG must still import + the 6 cutover SQL files
+# must parse cleanly (no Trino round-trip).
+# ---------------------------------------------------------------------------
+
+
+# 6 SQL files migrated from gold.entity_xref → silver.xref_team in T2 (E1.5).
+CUTOVER_SQL_FILES = (
+    "dim_team.sql",
+    "dim_match.sql",
+    "dim_player.sql",
+    "dim_standings.sql",
+    "fct_player_match.sql",
+    "match_outcomes.sql",
+)
+
+
+@pytest.mark.integration
+class TestE15CutoverGoldDagImports:
+    """Verify dag_transform_fbref_gold still parses post-cutover and the
+    6 migrated SQL files are syntactically loadable.
+
+    We do NOT spin up Trino — just DagBag parse + raw file parse.
+    """
+
+    GOLD_SQL_DIR = Path(__file__).resolve().parents[2] / "dags" / "sql" / "gold"
+
+    def test_fbref_gold_dag_loads_clean(self, dag_bag):
+        """``dag_transform_fbref_gold`` must parse with no import errors
+        related to the Gold DAG file. silver.xref_* SQL is read by the
+        DAG via gold_tasks at runtime, so a parse-time import error here
+        usually means a typo in the DAG wiring, not the SQL files.
+        """
+        relevant = {
+            k: v for k, v in dag_bag.import_errors.items()
+            if "fbref_gold" in k
+        }
+        assert relevant == {}, (
+            "dag_transform_fbref_gold has DAG-import errors: "
+            + "; ".join(f"{k}: {v}" for k, v in relevant.items())
+        )
+
+        dag_id = "dag_transform_fbref_gold"
+        assert dag_id in dag_bag.dags, (
+            f"DAG '{dag_id}' missing after E1.5 cutover. "
+            f"Loaded: {sorted(dag_bag.dags.keys())}"
+        )
+
+    def test_cutover_sql_files_exist_and_readable(self):
+        """Every one of the 6 cutover SQL files must exist + be UTF-8
+        decodable. Catches accidental deletion / binary corruption."""
+        for fname in CUTOVER_SQL_FILES:
+            path = self.GOLD_SQL_DIR / fname
+            assert path.exists(), (
+                f"Cutover SQL file {fname} missing at {path}"
+            )
+            text = path.read_text(encoding="utf-8")
+            assert text.strip(), f"{fname} is empty"
+
+    def test_cutover_sql_files_have_select(self):
+        """Every cutover SQL must contain a SELECT statement (gold_tasks
+        expects pure SELECT, wraps in CTAS at runtime). Non-empty SELECT
+        is the cheapest sanity check that the file parses 'enough' for
+        the DAG to inject it into a Trino CTAS without a syntax error."""
+        for fname in CUTOVER_SQL_FILES:
+            text = (self.GOLD_SQL_DIR / fname).read_text(encoding="utf-8")
+            assert "SELECT" in text.upper(), (
+                f"{fname} is missing a SELECT statement"
+            )
+
+    def test_cutover_sql_files_reference_silver_xref(self):
+        """Every cutover SQL except dim_player must reference
+        ``iceberg.silver.xref_team``. dim_player applies the canonical
+        prefix inline (no JOIN), so it's the documented exception.
+        """
+        no_join_files = {"dim_player.sql"}
+        for fname in CUTOVER_SQL_FILES:
+            text = (self.GOLD_SQL_DIR / fname).read_text(encoding="utf-8")
+            if fname in no_join_files:
+                continue
+            assert "iceberg.silver.xref_team" in text, (
+                f"{fname} must reference iceberg.silver.xref_team after "
+                "the E1.5 cutover"
+            )
+
+    def test_cutover_sql_files_no_legacy_entity_xref(self):
+        """No cutover SQL may reference ``gold.entity_xref`` in
+        executable SQL. Header comments may legitimately mention it as a
+        "Migrated from gold.entity_xref ..." breadcrumb — strip
+        ``-- ...`` lines first."""
+        for fname in CUTOVER_SQL_FILES:
+            text = (self.GOLD_SQL_DIR / fname).read_text(encoding="utf-8")
+            non_comment = "\n".join(
+                line for line in text.splitlines()
+                if not line.lstrip().startswith("--")
+            )
+            assert "gold.entity_xref" not in non_comment, (
+                f"{fname} still references gold.entity_xref in "
+                "executable SQL — E1.5 cutover incomplete"
+            )

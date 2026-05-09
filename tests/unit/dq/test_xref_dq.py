@@ -431,7 +431,13 @@ def test_parity_legacy_absent_returns_marker(duck_conn, monkeypatch):
 
 
 def test_maybe_alert_parity_below_threshold(monkeypatch):
-    """Diff totals below threshold → no Telegram call."""
+    """All branches below threshold → no Telegram call.
+
+    With the T4 alert split (REGRESSION on gold_only > 0, INFO on cid_diff
+    growth, THRESHOLD on total >= diff_threshold) the ONLY way to get a
+    no-op outcome is: gold_only=0 everywhere AND team.cid_diff <= baseline+
+    tolerance AND total < diff_threshold for every entity.
+    """
     sent: list = []
 
     def fake_send_telegram(*_a, **_kw):
@@ -443,11 +449,13 @@ def test_maybe_alert_parity_below_threshold(monkeypatch):
     )
 
     parity = {
-        'team':   {'silver_only': 5, 'gold_only': 2, 'cid_diff': 0,
+        # silver_only is allowed at any size (Silver expands beyond legacy).
+        # gold_only MUST be 0 — otherwise REGRESSION fires.
+        'team':   {'silver_only': 5, 'gold_only': 0, 'cid_diff': 0,
                    'verdict': 'DIFF_DETECTED', 'canonical_id_match_pct': 0.99},
         'match':  {'silver_only': 0, 'gold_only': 0, 'cid_diff': 0,
                    'verdict': 'PARITY_OK', 'canonical_id_match_pct': 1.0},
-        'player': {'silver_only': 10, 'gold_only': 5, 'cid_diff': 0,
+        'player': {'silver_only': 10, 'gold_only': 0, 'cid_diff': 0,
                    'verdict': 'DIFF_DETECTED', 'canonical_id_match_pct': 0.99},
     }
     alerted = xref_dq.maybe_alert_parity(parity, diff_threshold=100)
@@ -480,3 +488,162 @@ def test_maybe_alert_parity_above_threshold(monkeypatch):
     assert alerted is True
     assert len(sent) == 1
     assert 'parity' in sent[0].lower()
+
+
+# ===========================================================================
+# E1.5 post-cutover checks (T4 deliverable)
+# ===========================================================================
+
+def test_post_cutover_check_dim_team_ref_silver():
+    """build_e1_5_post_cutover_checks emits a WHERE-based ref_integrity
+    check on dim_team.team_id ⊆ silver.xref_team(source='fbref').
+
+    The runner uses ``row_count(max=0, where=...)`` because the universal
+    CHECK.ref_integrity primitive has no WHERE-filter mode (yet).
+    """
+    checks = xref_dq.build_e1_5_post_cutover_checks()
+    target = [
+        c for c in checks
+        if c.name == 'ref_integrity[dim_team.team_id->silver.xref_team(fbref)]'
+    ]
+    assert len(target) == 1, "Expected exactly one dim_team→silver.xref_team check"
+    chk = target[0]
+    assert chk.kind == 'row_count'
+    assert chk.severity == 'WARNING', "Prep PR — WARNING during gate-watch"
+    assert chk.params['table'] == 'iceberg.gold.dim_team'
+    assert chk.params['min_rows'] == 0
+    assert chk.params['max_rows'] == 0
+    where = chk.params['where']
+    # SQL must reference the silver source-of-truth and filter by FBref.
+    assert 'iceberg.silver.xref_team' in where
+    assert "source = 'fbref'" in where
+    assert 'team_id NOT IN' in where
+
+
+def test_post_cutover_canonical_format_checks_present():
+    """dim_player.player_id and fct_player_match.player_id must both be
+    guarded against canonical-prefix drift (regex '^fb_').
+
+    These live in build_e1_5_post_cutover_checks at WARNING severity until
+    the cutover-merge follow-up PR.
+    """
+    checks = xref_dq.build_e1_5_post_cutover_checks()
+    fmt = [c for c in checks if 'canonical_format' in c.name]
+    assert len(fmt) == 2, f"Expected 2 canonical_format checks, got {len(fmt)}"
+    names = {c.name for c in fmt}
+    assert 'canonical_format[dim_player.player_id]' in names
+    assert 'canonical_format[fct_player_match.player_id]' in names
+    for c in fmt:
+        assert c.kind == 'row_count'
+        assert c.severity == 'WARNING'
+        assert "regexp_like(player_id, '^fb_.+')" in c.params['where']
+
+
+def test_post_cutover_six_checks_total():
+    """Sanity: 6 checks total — 4 ref_integrity + 2 canonical_format."""
+    checks = xref_dq.build_e1_5_post_cutover_checks()
+    assert len(checks) == 6
+    # All checks ship at WARNING in the prep PR.
+    assert all(c.severity == 'WARNING' for c in checks)
+
+
+def test_telegram_alert_on_gold_only_regression(monkeypatch):
+    """gold_only > 0 anywhere → REGRESSION-tagged Telegram message.
+
+    This is a NEW alert branch (prior to T4 there was only the threshold
+    branch). gold_only > 0 means a row exists in legacy but disappeared in
+    Silver xref → the new SQL refactor lost coverage during gate-watch.
+    """
+    sent: list = []
+
+    def fake_send_telegram(message, **_kw):
+        sent.append(message)
+        return True
+
+    monkeypatch.setattr(
+        'utils.alerts._send_telegram', fake_send_telegram, raising=False
+    )
+
+    parity = {
+        # team has a single legacy-only row — regression!
+        'team':   {'silver_only': 0, 'gold_only': 1, 'cid_diff': 0,
+                   'verdict': 'DIFF_DETECTED', 'canonical_id_match_pct': 0.99},
+        'match':  {'silver_only': 0, 'gold_only': 0, 'cid_diff': 0,
+                   'verdict': 'PARITY_OK', 'canonical_id_match_pct': 1.0},
+        'player': {'silver_only': 0, 'gold_only': 0, 'cid_diff': 0,
+                   'verdict': 'PARITY_OK', 'canonical_id_match_pct': 1.0},
+    }
+    alerted = xref_dq.maybe_alert_parity(parity, diff_threshold=100)
+    assert alerted is True
+    # At least one of the messages must carry the REGRESSION tag.
+    assert any('REGRESSION' in m for m in sent), \
+        f"Expected REGRESSION-tagged alert, got messages: {sent}"
+
+
+def test_telegram_alert_on_cid_diff_growth(monkeypatch):
+    """team.cid_diff > baseline + tolerance → INFO cid_diff_growth message.
+
+    Baseline (2026-05-09) is 43; default tolerance is 5 → trigger at >48.
+    """
+    sent: list = []
+
+    def fake_send_telegram(message, **_kw):
+        sent.append(message)
+        return True
+
+    monkeypatch.setattr(
+        'utils.alerts._send_telegram', fake_send_telegram, raising=False
+    )
+
+    # team.cid_diff = 60 — clearly above 43 + 5
+    # Pre-cutover the legacy player row uses raw player_id while silver uses
+    # 'fb_<id>', so EVERY FBref player row appears as cid_diff. The default
+    # diff_threshold=100 is sized for this state — to isolate the cid_diff
+    # growth branch we keep player diffs below 100 in the fixture.
+    parity = {
+        'team':   {'silver_only': 0, 'gold_only': 0, 'cid_diff': 60,
+                   'verdict': 'DIFF_DETECTED', 'canonical_id_match_pct': 0.85},
+        'match':  {'silver_only': 0, 'gold_only': 0, 'cid_diff': 0,
+                   'verdict': 'PARITY_OK', 'canonical_id_match_pct': 1.0},
+        'player': {'silver_only': 0, 'gold_only': 0, 'cid_diff': 0,
+                   'verdict': 'PARITY_OK', 'canonical_id_match_pct': 1.0},
+    }
+    alerted = xref_dq.maybe_alert_parity(
+        parity, diff_threshold=100, cid_diff_growth_threshold=5,
+    )
+    assert alerted is True
+    # At least one of the messages must carry the cid_diff_growth INFO tag.
+    assert any('cid_diff_growth' in m for m in sent), \
+        f"Expected cid_diff_growth INFO alert, got messages: {sent}"
+    # AND it should NOT include the REGRESSION tag (no gold_only).
+    assert not any('REGRESSION' in m for m in sent), \
+        f"Did not expect REGRESSION tag, got messages: {sent}"
+
+
+def test_telegram_alert_baseline_no_growth_no_alert(monkeypatch):
+    """team.cid_diff at baseline (43) → no growth alert, no threshold alert.
+
+    Establishes that the baseline state itself does NOT spam during the
+    gate-watch window — alerts only fire on drift FROM baseline.
+    """
+    sent: list = []
+
+    def fake_send_telegram(message, **_kw):
+        sent.append(message)
+        return True
+
+    monkeypatch.setattr(
+        'utils.alerts._send_telegram', fake_send_telegram, raising=False
+    )
+
+    parity = {
+        'team':   {'silver_only': 0, 'gold_only': 0, 'cid_diff': 43,
+                   'verdict': 'DIFF_DETECTED', 'canonical_id_match_pct': 0.785},
+        'match':  {'silver_only': 0, 'gold_only': 0, 'cid_diff': 0,
+                   'verdict': 'PARITY_OK', 'canonical_id_match_pct': 1.0},
+        'player': {'silver_only': 0, 'gold_only': 0, 'cid_diff': 0,
+                   'verdict': 'PARITY_OK', 'canonical_id_match_pct': 1.0},
+    }
+    alerted = xref_dq.maybe_alert_parity(parity, diff_threshold=100)
+    assert alerted is False
+    assert sent == []

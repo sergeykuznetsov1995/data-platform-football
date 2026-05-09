@@ -3,30 +3,155 @@ Unit tests for Gold ``dim_standings`` SQL logic (E2 — 2026-05).
 
 Reads ``bronze.sofascore_league_table`` (APPEND-mode snapshots) directly,
 deduplicates to the latest ``_ingested_at`` per (league, season, team),
-LEFT JOINs ``gold.entity_xref`` to resolve the SofaScore team name to a
-canonical ``team_id``, and emits one row per (league, season, team).
+LEFT JOINs ``silver.xref_team`` (post-E1.5 cutover) to resolve the
+SofaScore team name to a canonical ``team_id``, and emits one row per
+(league, season, team).
 
 Resolution path:
-    matched -> team_id = entity_xref.canonical_id, team_id_source='fbref_canonical'
-    orphan  -> team_id = 'ss_<slug>',              team_id_source='sofascore_orphan'
+    matched -> team_id = xref_team.canonical_id, team_id_source='fbref_canonical'
+    orphan  -> team_id = 'ss_<slug>',            team_id_source='sofascore_orphan'
 
-Strategy: Trino → DuckDB transpile via sqlglot, fixture rows in an
-in-memory schema, then assert on the result set.
+Two test layers:
+  * ``TestDimStandingsLogic`` (legacy) — Trino → DuckDB transpile via
+    sqlglot; fixture rows in-memory; assert on the result set.
+  * ``TestDimStandingsCutoverStructure`` (E1.5 prep) — regex sanity over
+    the raw SQL pinning down the silver.xref_team migration so the
+    structure can't drift even if DuckDB transpile breaks.
 """
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
 
 
-sqlglot = pytest.importorskip("sqlglot")
-duckdb = pytest.importorskip("duckdb")
-
-
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 SQL_PATH = PROJECT_ROOT / "dags" / "sql" / "gold" / "dim_standings.sql"
+
+
+def _read_sql() -> str:
+    return SQL_PATH.read_text(encoding="utf-8")
+
+
+def _strip_comments(sql: str) -> str:
+    return "\n".join(
+        line for line in sql.splitlines()
+        if not line.lstrip().startswith("--")
+    )
+
+
+# ---------------------------------------------------------------------------
+# E1.5 cutover structural tests — no engine, pure regex over raw SQL.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestDimStandingsCutoverStructure:
+    """Regex sanity over ``dim_standings.sql`` post-E1.5 cutover."""
+
+    def test_join_uses_silver_xref_team(self):
+        """JOIN must hit silver.xref_team, not gold.entity_xref."""
+        sql = _strip_comments(_read_sql())
+        assert "iceberg.silver.xref_team" in sql, (
+            "dim_standings.sql must JOIN iceberg.silver.xref_team after "
+            "the E1.5 cutover"
+        )
+
+    def test_no_legacy_entity_xref_in_executable_sql(self):
+        sql = _strip_comments(_read_sql())
+        assert "gold.entity_xref" not in sql, (
+            "dim_standings.sql must NOT reference gold.entity_xref in "
+            "executable SQL after E1.5 cutover"
+        )
+
+    def test_join_filters_sofascore_source(self):
+        """JOIN must filter `source = 'sofascore'`."""
+        sql = _read_sql()
+        assert re.search(
+            r"\.source\s*=\s*'sofascore'", sql, re.IGNORECASE,
+        ) or re.search(
+            r"source\s*=\s*'sofascore'", sql, re.IGNORECASE,
+        ), (
+            "dim_standings.sql must filter `source = 'sofascore'` on the "
+            "silver.xref_team join"
+        )
+
+    def test_join_includes_league_predicate(self):
+        """JOIN must constrain league (xref_team is per-(source, source_id,
+        league, season) — without league predicate we get 1.5-4x fan-out)."""
+        sql = _read_sql()
+        # Allow either `x.league = s.league` or unaliased forms.
+        assert re.search(
+            r"\.league\s*=\s*s\.league", sql, re.IGNORECASE,
+        ) or re.search(
+            r"\bleague\s*=\s*s\.league", sql, re.IGNORECASE,
+        ), (
+            "dim_standings.sql must include a `league = s.league` "
+            "predicate in the silver.xref_team join"
+        )
+
+    def test_join_includes_season_predicate(self):
+        """xref_team.season is varchar — JOIN must use season_slug
+        (the raw 'YYYY' label) rather than the bigint season."""
+        sql = _read_sql()
+        # We accept any predicate that compares xref season to s.season_slug
+        # OR a CAST(s.season AS varchar) form.
+        has_slug = re.search(
+            r"season\s*=\s*s\.season_slug", sql, re.IGNORECASE,
+        )
+        has_cast = re.search(
+            r"season\s*=\s*CAST\s*\(\s*s\.season\s+AS\s+varchar\s*\)",
+            sql, re.IGNORECASE,
+        )
+        assert has_slug or has_cast, (
+            "dim_standings.sql must include a season predicate on the "
+            "silver.xref_team JOIN — either `season = s.season_slug` or "
+            "`season = CAST(s.season AS varchar)`"
+        )
+
+    def test_orphan_fallback_ss_prefix_regex(self):
+        """Orphan fallback regex: `'ss_' || lower(regexp_replace(...))` must
+        survive the cutover — silver.xref_team's orphan namespace is
+        per-source ('ss_' for SofaScore)."""
+        sql = _read_sql()
+        # Tolerant matcher — accept any whitespace, single or double-quoted
+        # regex literal in regexp_replace.
+        pattern = re.compile(
+            r"'ss_'\s*\|\|\s*lower\s*\(\s*regexp_replace\s*\(",
+            re.IGNORECASE,
+        )
+        assert pattern.search(sql), (
+            "dim_standings.sql must keep the `'ss_' || "
+            "lower(regexp_replace(...))` orphan fallback"
+        )
+
+    def test_team_id_source_branch_labels(self):
+        """The CASE branch labels (fbref_canonical / sofascore_orphan)
+        must remain stable — downstream marts/DQ depend on the exact
+        string values."""
+        sql = _read_sql()
+        assert "'fbref_canonical'" in sql, (
+            "dim_standings.sql must keep the 'fbref_canonical' label"
+        )
+        assert "'sofascore_orphan'" in sql, (
+            "dim_standings.sql must keep the 'sofascore_orphan' label"
+        )
+
+    def test_migration_breadcrumb_in_header(self):
+        sql = _read_sql()
+        assert "Migrated from gold.entity_xref to silver.xref_team in E1.5" in sql, (
+            "dim_standings.sql must keep the E1.5 migration breadcrumb"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Legacy DuckDB-transpile tests — preserved as-is from E2.
+# ---------------------------------------------------------------------------
+
+sqlglot = pytest.importorskip("sqlglot")
+duckdb = pytest.importorskip("duckdb")
 
 
 def _translate(sql_text: str) -> str:
@@ -43,7 +168,7 @@ def _translate(sql_text: str) -> str:
 
 def _bootstrap(con) -> None:
     con.execute("CREATE SCHEMA IF NOT EXISTS bronze")
-    con.execute("CREATE SCHEMA IF NOT EXISTS gold")
+    con.execute("CREATE SCHEMA IF NOT EXISTS silver")
 
     # bronze.sofascore_league_table (APPEND mode):
     # team / mp / w / d / l / gf / ga / gd / pts / season ('YYYY' format) / league
@@ -82,24 +207,28 @@ def _bootstrap(con) -> None:
          TIMESTAMP '2026-04-27 06:00:00')
     """)
 
-    # gold.entity_xref — minimal columns the JOIN touches.
-    # 2 of the 3 teams resolved -> canonical_id; the 3rd (Arsenal) is an orphan.
+    # silver.xref_team (post-E1.5 cutover) — minimal columns the JOIN touches.
+    # Note: season is VARCHAR (the season_slug — '2425') unlike the legacy
+    # gold.entity_xref where it was BIGINT. This is intentional: silver
+    # xref tables use the raw season-slug per the documented contract.
+    # 2 of the 3 teams resolved -> canonical_id; Arsenal is an orphan.
     con.execute("""
-        CREATE TABLE gold.entity_xref (
-            entity_type VARCHAR,
+        CREATE TABLE silver.xref_team (
             source VARCHAR,
             source_id VARCHAR,
             canonical_id VARCHAR,
+            display_name VARCHAR,
             league VARCHAR,
-            season BIGINT
+            season VARCHAR,
+            confidence VARCHAR
         )
     """)
     con.execute("""
-        INSERT INTO gold.entity_xref VALUES
-        ('team', 'sofascore', 'Manchester City', 'manchester_city',
-         'ENG-Premier League', 2024),
-        ('team', 'sofascore', 'Liverpool',       'liverpool',
-         'ENG-Premier League', 2024)
+        INSERT INTO silver.xref_team VALUES
+        ('sofascore', 'Manchester City', 'manchester_city', 'Manchester City',
+         'ENG-Premier League', '2425', 'name_alias'),
+        ('sofascore', 'Liverpool',       'liverpool',       'Liverpool',
+         'ENG-Premier League', '2425', 'name_alias')
     """)
 
 
@@ -147,7 +276,7 @@ class TestDimStandingsLogic:
         assert by_position[2]["team_name_raw"] == "Arsenal"
 
     def test_resolved_team_uses_canonical_id(self, gold_rows):
-        """When entity_xref has a row, team_id = canonical_id and
+        """When silver.xref_team has a row, team_id = canonical_id and
         team_id_source = 'fbref_canonical'."""
         resolved = [r for r in gold_rows
                     if r["team_id_source"] == "fbref_canonical"]
@@ -159,7 +288,7 @@ class TestDimStandingsLogic:
         assert ids["Liverpool"] == "liverpool"
 
     def test_orphan_team_uses_ss_prefix(self, gold_rows):
-        """When entity_xref has no match, team_id = 'ss_<slug>' and
+        """When silver.xref_team has no match, team_id = 'ss_<slug>' and
         team_id_source = 'sofascore_orphan'."""
         orphans = [r for r in gold_rows
                    if r["team_id_source"] == "sofascore_orphan"]
