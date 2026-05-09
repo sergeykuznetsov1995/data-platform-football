@@ -4,44 +4,66 @@
 table:
   fullyQualifiedName: trino_iceberg.iceberg.gold.dim_match
   description: |
-    Dimension table for matches. One row per match with canonical home/away
-    team IDs, score, 1X2 result, total goals, BTTS flag, completeness flag,
-    referee + venue. Spine source: FBref schedule joined through entity_xref.
+    Размерность матча: дата, тур, домашняя/гостевая команды, счёт, исход 1X2.
+    Один матч = одна строка (PK match_id). Источник истины для всех fct_*
+    и feat_*-таблиц, ссылающихся на match_id. Включает производные поля
+    result_1x2, total_goals, btts, is_completed.
   tags:
     - Tier.Gold
     - Domain.Football
     - PII.None
 columns:
   - name: match_id
-    description: Canonical match identifier (FBref match URL hash).
-  - name: home_team_id
-    description: FK -> dim_team.team_id (home team canonical id).
-  - name: away_team_id
-    description: FK -> dim_team.team_id (away team canonical id).
-  - name: home_team_name
-    description: Display name of the home team.
-  - name: away_team_name
-    description: Display name of the away team.
-  - name: result_1x2
-    description: "Match outcome: 'H' / 'D' / 'A' (NULL if not played)."
-  - name: total_goals
-    description: home_score + away_score (NULL until match completes).
-  - name: btts
-    description: TRUE if both teams scored at least one goal.
-  - name: is_completed
-    description: TRUE when both home_score and away_score are non-NULL.
+    description: Канонический ID матча (FBref match_id).
+  - name: date
+    description: Дата матча (UTC date).
+  - name: gameweek
+    description: Номер тура чемпионата.
+  - name: time
+    description: Время начала (локальное, как у источника).
+  - name: venue
+    description: Стадион проведения матча.
   - name: referee
-    description: Referee display name (raw string, not normalised — see dim_referee).
+    description: Имя судьи.
+  - name: attendance
+    description: Посещаемость (число зрителей).
+  - name: home_team_id
+    description: Канонический ID домашней команды (FK -> dim_team.team_id).
+  - name: away_team_id
+    description: Канонический ID гостевой команды (FK -> dim_team.team_id).
+  - name: home_team_name
+    description: Имя домашней команды (для отладки/UI).
+  - name: away_team_name
+    description: Имя гостевой команды (для отладки/UI).
+  - name: home_score
+    description: Голы домашней команды.
+  - name: away_score
+    description: Голы гостевой команды.
+  - name: result_1x2
+    description: Исход 1X2 — 'H' (home wins) | 'A' (away wins) | 'D' (draw). NULL до окончания матча.
+  - name: total_goals
+    description: Сумма голов в матче (home_score + away_score).
+  - name: btts
+    description: Both Teams To Score — обе команды забили (boolean).
+  - name: is_completed
+    description: Матч сыгран и счёт известен (boolean).
   - name: league
-    description: League slug (e.g. 'ENG-Premier League').
+    description: Лига.
   - name: season
-    description: Season slug (e.g. '2425').
+    description: Сезон.
 relationships:
-  - from: trino_iceberg.iceberg.gold.dim_match
-    to:   trino_iceberg.iceberg.gold.dim_team
+  - from: match_id
+    to: trino_iceberg.iceberg.gold.fct_match.match_id
     type: FOREIGN_KEY
-    description: home_team_id / away_team_id -> dim_team.team_id
-  - from: trino_iceberg.iceberg.gold.dim_match
-    to:   trino_iceberg.iceberg.gold.dim_referee
+  - from: match_id
+    to: trino_iceberg.iceberg.gold.fct_team_match.match_id
     type: FOREIGN_KEY
-    description: referee (after normalisation) -> dim_referee.referee_canonical
+  - from: match_id
+    to: trino_iceberg.iceberg.gold.fct_player_match.match_id
+    type: FOREIGN_KEY
+  - from: home_team_id
+    to: trino_iceberg.iceberg.gold.dim_team.team_id
+    type: FOREIGN_KEY
+  - from: away_team_id
+    to: trino_iceberg.iceberg.gold.dim_team.team_id
+    type: FOREIGN_KEY

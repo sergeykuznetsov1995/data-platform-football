@@ -53,6 +53,7 @@ def validate_data(**context) -> Dict[str, Any]:
         'warnings': [],
         'summary': {
             'ratings_rows': ratings_result.get('rows', 0),
+            'history_rows': ratings_result.get('history_rows', 0),
             'rating_date': ratings_result.get('rating_date'),
             'tables': ratings_result.get('tables', []),
         }
@@ -60,7 +61,11 @@ def validate_data(**context) -> Dict[str, Any]:
 
     if ratings_result.get('errors'):
         validation['warnings'] = ratings_result['errors']
-        validation['status'] = 'partial_success' if validation['summary']['ratings_rows'] > 0 else 'failed'
+        validation['status'] = (
+            'partial_success'
+            if validation['summary']['ratings_rows'] > 0
+            else 'failed'
+        )
 
     # ClubElo should have ratings for many clubs
     if validation['summary']['ratings_rows'] < 100:
@@ -138,6 +143,8 @@ python dags/scripts/run_clubelo_scraper.py \
             'PATH': '/usr/local/bin:/usr/bin:/bin:/home/airflow/.local/bin',
             'HOME': '/home/airflow',
         },
+        append_env=True,
+        execution_timeout=timedelta(minutes=30),
     )
 
     validate_data_task = PythonOperator(

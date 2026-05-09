@@ -1,0 +1,209 @@
+"""
+FlareSolverr Client
+===================
+
+Lightweight HTTP client for the FlareSolverr REST API. Used by Cloudflare-protected
+scrapers (e.g. WhoScored events) to fetch HTML through a long-lived browser session
+that holds CF state inside the FlareSolverr container.
+"""
+
+import logging
+import uuid
+from typing import Optional, Tuple
+
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+logger = logging.getLogger(__name__)
+
+
+class FlareSolverrError(Exception):
+    """Generic FlareSolverr operation error."""
+    pass
+
+
+class FlareSolverrTimeout(FlareSolverrError):
+    """Raised when the FlareSolverr endpoint times out or is unreachable."""
+    pass
+
+
+class FlareSolverrCFChallengeFailed(FlareSolverrError):
+    """Raised when FlareSolverr cannot solve a Cloudflare/Turnstile challenge."""
+    pass
+
+
+_CF_MARKERS = ("cloudflare", "challenge", "turnstile")
+
+
+class FlareSolverrClient:
+    """HTTP wrapper around FlareSolverr `/v1` and `/health` endpoints."""
+
+    def __init__(
+        self,
+        url: str = "http://flaresolverr:8191",
+        default_timeout: float = 90.0,
+        default_max_timeout_ms: int = 60_000,
+    ) -> None:
+        self.url = url.rstrip("/")
+        self.default_timeout = default_timeout
+        self.default_max_timeout_ms = default_max_timeout_ms
+        self._session: Optional[requests.Session] = None
+        self._auto_session_id: Optional[str] = None
+
+    @property
+    def session(self) -> requests.Session:
+        """Lazily build a requests Session with retry on network errors."""
+        if self._session is None:
+            session = requests.Session()
+            retry = Retry(
+                total=2,
+                backoff_factor=1.5,
+                status_forcelist=(502, 503, 504),
+                allowed_methods=frozenset(["GET", "POST"]),
+                raise_on_status=False,
+            )
+            adapter = HTTPAdapter(max_retries=retry)
+            session.mount("http://", adapter)
+            session.mount("https://", adapter)
+            self._session = session
+        return self._session
+
+    @session.setter
+    def session(self, value: requests.Session) -> None:
+        self._session = value
+
+    @session.deleter
+    def session(self) -> None:
+        self._session = None
+
+    def _post(self, payload: dict, timeout: Optional[float] = None) -> dict:
+        """POST to /v1 and translate transport/protocol errors to typed exceptions."""
+        endpoint = f"{self.url}/v1"
+        cmd = payload.get("cmd", "?")
+        logger.debug(f"FlareSolverr POST {endpoint} cmd={cmd}")
+
+        try:
+            response = self.session.post(
+                endpoint,
+                json=payload,
+                timeout=timeout or self.default_timeout,
+            )
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+            logger.warning(f"FlareSolverr transport error (cmd={cmd}): {e}")
+            raise FlareSolverrTimeout(f"FlareSolverr unreachable: {e}") from e
+        except requests.exceptions.RequestException as e:
+            logger.warning(f"FlareSolverr request error (cmd={cmd}): {e}")
+            raise FlareSolverrError(f"FlareSolverr request failed: {e}") from e
+
+        if not response.ok:
+            body = response.text[:300]
+            logger.warning(
+                f"FlareSolverr HTTP {response.status_code} (cmd={cmd}): {body}"
+            )
+            lower = body.lower()
+            if "challenge" in lower or "cloudflare" in lower or "turnstile" in lower:
+                raise FlareSolverrCFChallengeFailed(
+                    f"FlareSolverr HTTP {response.status_code}: {body}"
+                )
+            raise FlareSolverrError(
+                f"FlareSolverr HTTP {response.status_code}: {body}"
+            )
+
+        try:
+            data = response.json()
+        except ValueError as e:
+            raise FlareSolverrError(f"FlareSolverr returned non-JSON: {e}") from e
+
+        if data.get("status") == "error":
+            message = str(data.get("message", "unknown error"))
+            lowered = message.lower()
+            if any(marker in lowered for marker in _CF_MARKERS):
+                logger.warning(f"FlareSolverr CF challenge failed (cmd={cmd}): {message}")
+                raise FlareSolverrCFChallengeFailed(message)
+            logger.warning(f"FlareSolverr error (cmd={cmd}): {message}")
+            raise FlareSolverrError(message)
+
+        return data
+
+    def health(self) -> bool:
+        """Return True if /health responds 200, False on any error."""
+        try:
+            response = self.session.get(
+                f"{self.url}/health",
+                timeout=self.default_timeout,
+            )
+            return response.status_code == 200
+        except requests.exceptions.RequestException:
+            return False
+
+    def create_session(self, session_id: str, proxy_url: Optional[str] = None) -> None:
+        """Create a named FlareSolverr browser session, optionally bound to a proxy."""
+        payload: dict = {"cmd": "sessions.create", "session": session_id}
+        if proxy_url:
+            payload["proxy"] = {"url": proxy_url}
+        self._post(payload)
+        logger.info(
+            f"FlareSolverr session created: {session_id}"
+            f"{' (proxy=' + proxy_url + ')' if proxy_url else ''}"
+        )
+
+    def destroy_session(self, session_id: str) -> None:
+        """Destroy a session; idempotent — never raises if the session is gone."""
+        payload = {"cmd": "sessions.destroy", "session": session_id}
+        try:
+            self._post(payload)
+            logger.info(f"FlareSolverr session destroyed: {session_id}")
+        except FlareSolverrError as e:
+            logger.debug(f"FlareSolverr destroy_session({session_id}) ignored: {e}")
+
+    def list_sessions(self) -> list[str]:
+        """List active FlareSolverr session IDs."""
+        data = self._post({"cmd": "sessions.list"})
+        return list(data.get("sessions", []))
+
+    def get(
+        self,
+        url: str,
+        session_id: str,
+        max_timeout_ms: Optional[int] = None,
+        return_only_cookies: bool = False,
+    ) -> dict:
+        """GET via FlareSolverr; returns the `solution` subdict (html, cookies, ...)."""
+        payload: dict = {
+            "cmd": "request.get",
+            "url": url,
+            "session": session_id,
+            "maxTimeout": max_timeout_ms or self.default_max_timeout_ms,
+        }
+        if return_only_cookies:
+            payload["returnOnlyCookies"] = True
+
+        timeout = (max_timeout_ms / 1000.0 + 30.0) if max_timeout_ms else self.default_timeout
+        data = self._post(payload, timeout=timeout)
+        solution = data.get("solution") or {}
+        return {
+            "html": solution.get("response", ""),
+            "cookies": solution.get("cookies", []),
+            "userAgent": solution.get("userAgent", ""),
+            "status": solution.get("status", 0),
+        }
+
+    def __enter__(self) -> Tuple["FlareSolverrClient", str]:
+        session_id = f"fs-{uuid.uuid4().hex[:8]}"
+        self.create_session(session_id)
+        self._auto_session_id = session_id
+        return self, session_id
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> bool:
+        if self._auto_session_id is not None:
+            try:
+                self.destroy_session(self._auto_session_id)
+            except Exception as e:
+                logger.warning(
+                    f"FlareSolverr __exit__ destroy_session failed "
+                    f"({self._auto_session_id}): {e}"
+                )
+            finally:
+                self._auto_session_id = None
+        return False

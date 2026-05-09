@@ -1,981 +1,587 @@
 """
-Unit tests for WhoScored scraper.
+Unit tests for WhoScoredScraper (hybrid soccerdata + FlareSolverr — 2026-04).
 
-Tests cover:
-- LEAGUE_CONFIG structure validation
-- URL building methods (_build_fixtures_url, _build_tournament_url)
-- Match URL extraction from HTML
-- get_match_urls behavior for unsupported leagues
-- Season cache usage
+Architecture under test:
+
+* ``scrape_schedule`` / ``scrape_missing_players`` / ``scrape_season_stages``
+  — soccerdata-backed via ``EnhancedWhoScored``.
+* ``scrape_events`` — bypasses soccerdata. Pulls ``(game_id, league, season,
+  game)`` from ``iceberg.bronze.whoscored_schedule``, then fetches each
+  match's ``matchCentreData`` via :class:`FlareSolverrClient` (CF resolved
+  once per session) and parses with ``parse_matchcentre_to_events_df``.
+
+These tests stub every cross-module call so the suite stays fully offline.
 """
 
+from __future__ import annotations
+
+from unittest.mock import MagicMock, patch
+
+import pandas as pd
 import pytest
-import re
-from unittest.mock import MagicMock, patch, PropertyMock
 
 
-# =============================================================================
-# Test Classes
-# =============================================================================
+# -----------------------------------------------------------------------------
+# Shared dependency / soccerdata mocks.
+# -----------------------------------------------------------------------------
+@pytest.fixture
+def mock_base_dependencies():
+    with patch('scrapers.base.base_scraper.get_rate_limiter') as mock_rl, \
+         patch('scrapers.base.base_scraper.get_retry_policy') as mock_rp, \
+         patch('scrapers.base.base_scraper.get_circuit_breaker') as mock_cb, \
+         patch('scrapers.base.base_scraper.IcebergWriter') as mock_iw:
 
-
-class TestWhoScoredLeagueConfig:
-    """Tests for LEAGUE_CONFIG structure and validation."""
-
-    @pytest.fixture
-    def mock_dependencies(self):
-        """Mock all scraper dependencies."""
-        with patch('scrapers.base.base_scraper.get_rate_limiter') as mock_rl, \
-             patch('scrapers.base.base_scraper.get_retry_policy') as mock_rp, \
-             patch('scrapers.base.base_scraper.get_circuit_breaker') as mock_cb, \
-             patch('scrapers.base.base_scraper.IcebergWriter') as mock_iw:
-
-            mock_rl.return_value = MagicMock()
-            mock_rp.return_value = MagicMock()
-            mock_cb.return_value = MagicMock()
-
-            mock_iw_instance = MagicMock()
-            mock_iw_instance.write_dataframe.return_value = 'iceberg.bronze.test'
-            mock_iw.return_value = mock_iw_instance
-
-            yield
-
-    @pytest.mark.unit
-    def test_league_config_has_required_keys(self, mock_dependencies):
-        """
-        Test that LEAGUE_CONFIG contains all required keys for each league.
-
-        Each league config must have:
-        - region_id (int): WhoScored region identifier
-        - tournament_id (int): WhoScored tournament identifier
-        - slug (str): URL-friendly league name slug
-        """
-        from scrapers.whoscored import WhoScoredScraper
-
-        required_keys = {'region_id', 'tournament_id', 'slug'}
-
-        for league, config in WhoScoredScraper.LEAGUE_CONFIG.items():
-            for key in required_keys:
-                assert key in config, (
-                    f"League '{league}' is missing required key '{key}'"
-                )
-
-    @pytest.mark.unit
-    def test_all_leagues_have_valid_ids(self, mock_dependencies):
-        """
-        Test that all leagues have valid integer IDs and string slugs.
-
-        Validates:
-        - region_id is a positive integer
-        - tournament_id is a positive integer
-        - slug is a non-empty string
-        """
-        from scrapers.whoscored import WhoScoredScraper
-
-        for league, config in WhoScoredScraper.LEAGUE_CONFIG.items():
-            # region_id must be positive int
-            assert isinstance(config['region_id'], int), (
-                f"League '{league}': region_id must be int, "
-                f"got {type(config['region_id'])}"
-            )
-            assert config['region_id'] > 0, (
-                f"League '{league}': region_id must be positive"
-            )
-
-            # tournament_id must be positive int
-            assert isinstance(config['tournament_id'], int), (
-                f"League '{league}': tournament_id must be int, "
-                f"got {type(config['tournament_id'])}"
-            )
-            assert config['tournament_id'] > 0, (
-                f"League '{league}': tournament_id must be positive"
-            )
-
-            # slug must be non-empty string
-            assert isinstance(config['slug'], str), (
-                f"League '{league}': slug must be str, "
-                f"got {type(config['slug'])}"
-            )
-            assert len(config['slug']) > 0, (
-                f"League '{league}': slug must be non-empty"
-            )
-
-    @pytest.mark.unit
-    def test_expected_leagues_are_configured(self, mock_dependencies):
-        """
-        Test that major European leagues are configured.
-
-        At minimum, the Top 5 leagues should be supported:
-        - English Premier League
-        - Spanish La Liga
-        - German Bundesliga
-        - Italian Serie A
-        - French Ligue 1
-        """
-        from scrapers.whoscored import WhoScoredScraper
-
-        expected_leagues = [
-            'ENG-Premier League',
-            'ESP-La Liga',
-            'GER-Bundesliga',
-            'ITA-Serie A',
-            'FRA-Ligue 1',
-        ]
-
-        for league in expected_leagues:
-            assert league in WhoScoredScraper.LEAGUE_CONFIG, (
-                f"Expected league '{league}' not found in LEAGUE_CONFIG"
-            )
-
-
-class TestWhoScoredUrlBuilding:
-    """Tests for URL building methods."""
-
-    @pytest.fixture
-    def mock_dependencies(self):
-        """Mock all scraper dependencies."""
-        with patch('scrapers.base.base_scraper.get_rate_limiter') as mock_rl, \
-             patch('scrapers.base.base_scraper.get_retry_policy') as mock_rp, \
-             patch('scrapers.base.base_scraper.get_circuit_breaker') as mock_cb, \
-             patch('scrapers.base.base_scraper.IcebergWriter') as mock_iw:
-
-            mock_rl.return_value = MagicMock()
-            mock_rp.return_value = MagicMock()
-            mock_cb.return_value = MagicMock()
-
-            mock_iw_instance = MagicMock()
-            mock_iw_instance.write_dataframe.return_value = 'iceberg.bronze.test'
-            mock_iw.return_value = mock_iw_instance
-
-            yield
-
-    @pytest.fixture
-    def scraper(self, mock_dependencies):
-        """Create WhoScoredScraper instance with mocked dependencies."""
-        from scrapers.whoscored import WhoScoredScraper
-
-        return WhoScoredScraper(
-            leagues=['ENG-Premier League'],
-            seasons=[2024],
-            headless=True
+        mock_rl.return_value = MagicMock()
+        mock_rl.return_value.acquire.return_value = True
+        mock_rp.return_value = MagicMock()
+        mock_rp.return_value.execute.side_effect = (
+            lambda f, *a, **k: f(*a, **k)
+        )
+        mock_cb.return_value = MagicMock()
+        mock_cb.return_value.call.side_effect = (
+            lambda f, *a, **k: f(*a, **k)
         )
 
-    @pytest.mark.unit
-    def test_build_fixtures_url(self, scraper):
-        """
-        Test correct formation of fixtures page URL.
-
-        Given league, season_id and stage_id, should produce URL in format:
-        https://www.whoscored.com/Regions/{region_id}/Tournaments/{tournament_id}/
-        Seasons/{season_id}/Stages/{stage_id}/Fixtures/{slug}
-        """
-        # Input
-        league = 'ENG-Premier League'
-        season_id = '9155'
-        stage_id = '20934'
-
-        # Expected output
-        expected_url = (
-            'https://www.whoscored.com/Regions/252/Tournaments/2/'
-            'Seasons/9155/Stages/20934/Fixtures/england-premier-league'
+        mock_iw_instance = MagicMock()
+        mock_iw_instance.write_dataframe.return_value = (
+            'iceberg.bronze.test'
         )
+        mock_iw.return_value = mock_iw_instance
+        yield mock_iw_instance
 
-        # Act
-        result = scraper._build_fixtures_url(league, season_id, stage_id)
 
-        # Assert
-        assert result == expected_url
+@pytest.fixture
+def mock_enhanced_whoscored():
+    """Patch ``EnhancedWhoScored`` (used for schedule / missing_players /
+    season_stages). Returns the (cls_mock, instance_mock) pair so tests can
+    set up per-method return values."""
+    reader = MagicMock()
+    reader.read_schedule.return_value = pd.DataFrame()
+    reader.read_missing_players.return_value = pd.DataFrame()
+    reader.read_season_stages.return_value = pd.DataFrame()
 
-    @pytest.mark.unit
-    def test_build_fixtures_url_spanish_league(self, scraper):
-        """Test fixtures URL building for La Liga."""
-        league = 'ESP-La Liga'
-        season_id = '8681'
-        stage_id = '19895'
-
-        expected_url = (
-            'https://www.whoscored.com/Regions/206/Tournaments/4/'
-            'Seasons/8681/Stages/19895/Fixtures/spain-laliga'
-        )
-
-        result = scraper._build_fixtures_url(league, season_id, stage_id)
-
-        assert result == expected_url
-
-    @pytest.mark.unit
-    def test_build_tournament_url(self, scraper):
-        """
-        Test correct formation of tournament main page URL.
-
-        Given league name, should produce URL in format:
-        https://www.whoscored.com/Regions/{region_id}/Tournaments/{tournament_id}/
-        """
-        # Input
-        league = 'ENG-Premier League'
-
-        # Expected output
-        expected_url = 'https://www.whoscored.com/Regions/252/Tournaments/2/'
-
-        # Act
-        result = scraper._build_tournament_url(league)
-
-        # Assert
-        assert result == expected_url
-
-    @pytest.mark.unit
-    def test_build_tournament_url_german_league(self, scraper):
-        """Test tournament URL building for Bundesliga."""
-        league = 'GER-Bundesliga'
-
-        expected_url = 'https://www.whoscored.com/Regions/81/Tournaments/3/'
-
-        result = scraper._build_tournament_url(league)
-
-        assert result == expected_url
-
-    @pytest.mark.unit
-    def test_build_fixtures_url_unsupported_league(self, scraper):
-        """
-        Test that ValueError is raised for unsupported league.
-
-        When league is not in LEAGUE_CONFIG, _build_fixtures_url should
-        raise ValueError with descriptive message.
-        """
-        unsupported_league = 'ARG-Primera Division'
-        season_id = '1234'
-        stage_id = '5678'
-
-        with pytest.raises(ValueError) as exc_info:
-            scraper._build_fixtures_url(unsupported_league, season_id, stage_id)
-
-        assert 'not supported' in str(exc_info.value).lower()
-        assert unsupported_league in str(exc_info.value)
-
-    @pytest.mark.unit
-    def test_build_tournament_url_unsupported_league(self, scraper):
-        """
-        Test that ValueError is raised for unsupported league in tournament URL.
-        """
-        unsupported_league = 'RUS-Premier Liga'
-
-        with pytest.raises(ValueError) as exc_info:
-            scraper._build_tournament_url(unsupported_league)
-
-        assert 'not supported' in str(exc_info.value).lower()
-
-    @pytest.mark.unit
-    @pytest.mark.parametrize('league,expected_region,expected_tournament', [
-        ('ENG-Premier League', 252, 2),
-        ('ESP-La Liga', 206, 4),
-        ('GER-Bundesliga', 81, 3),
-        ('ITA-Serie A', 108, 5),
-        ('FRA-Ligue 1', 74, 22),
-    ])
-    def test_build_tournament_url_all_leagues(
-        self, scraper, league, expected_region, expected_tournament
+    cls_mock = MagicMock(return_value=reader)
+    with patch(
+        'scrapers.whoscored.whoscored_patched.EnhancedWhoScored', cls_mock
     ):
-        """Test tournament URL contains correct region and tournament IDs."""
-        result = scraper._build_tournament_url(league)
-
-        assert f'/Regions/{expected_region}/' in result
-        assert f'/Tournaments/{expected_tournament}/' in result
+        yield cls_mock, reader
 
 
-class TestWhoScoredUrlExtraction:
-    """Tests for URL extraction from HTML."""
+# -----------------------------------------------------------------------------
+# Tests
+# -----------------------------------------------------------------------------
+@pytest.mark.unit
+class TestWhoScoredInit:
+    """Constructor + class hierarchy."""
 
-    @pytest.fixture
-    def mock_html(self):
-        """
-        Sample HTML fixture with various match links.
-
-        Contains:
-        - 2 links with /Live/ pattern (valid)
-        - 1 link with /MatchReport/ pattern (valid)
-        - 1 unrelated link (should be ignored)
-        """
-        return '''
-        <html>
-        <head><title>WhoScored Fixtures</title></head>
-        <body>
-            <div class="fixtures">
-                <a href="/Matches/1234567/Live/England-Premier-League-2024-2025-Team-A-Team-B">Match 1</a>
-                <a href="/Matches/1234568/Live/England-Premier-League-2024-2025-Team-C-Team-D">Match 2</a>
-                <a href="/Matches/1234569/MatchReport/Some-Match">Match 3</a>
-                <a href="/some-other-link">Not a match</a>
-                <a href="/Statistics/England-Premier-League">Statistics page</a>
-            </div>
-        </body>
-        </html>
-        '''
-
-    @pytest.fixture
-    def mock_html_with_show_links(self):
-        """HTML fixture with /Show/ pattern links."""
-        return '''
-        <html>
-        <body>
-            <a href="/Matches/9999991/Show/England-Premier-League-2024-2025-Match-1">Show 1</a>
-            <a href="/Matches/9999992/Live/England-Premier-League-2024-2025-Match-2">Live 1</a>
-        </body>
-        </html>
-        '''
-
-    @pytest.fixture
-    def mock_dependencies(self):
-        """Mock all scraper dependencies."""
-        with patch('scrapers.base.base_scraper.get_rate_limiter') as mock_rl, \
-             patch('scrapers.base.base_scraper.get_retry_policy') as mock_rp, \
-             patch('scrapers.base.base_scraper.get_circuit_breaker') as mock_cb, \
-             patch('scrapers.base.base_scraper.IcebergWriter') as mock_iw:
-
-            mock_rl.return_value = MagicMock()
-            mock_rp.return_value = MagicMock()
-            mock_cb.return_value = MagicMock()
-
-            mock_iw_instance = MagicMock()
-            mock_iw_instance.write_dataframe.return_value = 'iceberg.bronze.test'
-            mock_iw.return_value = mock_iw_instance
-
-            yield
-
-    @pytest.mark.unit
-    def test_extract_match_urls_from_html(self, mock_html, mock_dependencies):
-        """
-        Test extraction of match URLs from HTML content.
-
-        Should extract URLs containing /Matches/ pattern with:
-        - /Live/
-        - /MatchReport/
-        - /Show/
-
-        Should ignore other links.
-        """
+    def test_instantiation(
+        self, mock_base_dependencies, mock_enhanced_whoscored
+    ):
         from scrapers.whoscored import WhoScoredScraper
 
-        # Create mock browser with driver
-        mock_driver = MagicMock()
-        mock_browser = MagicMock()
-        mock_browser.driver = mock_driver
-
-        # Create mock elements for each selector
-        def create_mock_element(href):
-            elem = MagicMock()
-            elem.get_attribute.return_value = href
-            return elem
-
-        # Setup find_elements to return appropriate links for each selector
-        def mock_find_elements(by, selector):
-            if '/Live/' in selector:
-                return [
-                    create_mock_element('/Matches/1234567/Live/England-Premier-League-2024-2025-Team-A-Team-B'),
-                    create_mock_element('/Matches/1234568/Live/England-Premier-League-2024-2025-Team-C-Team-D'),
-                ]
-            elif '/MatchReport/' in selector:
-                return [
-                    create_mock_element('/Matches/1234569/MatchReport/Some-Match'),
-                ]
-            elif '/Show/' in selector:
-                return []
-            return []
-
-        mock_driver.find_elements.side_effect = mock_find_elements
-
-        # Create scraper and inject mock browser
-        with patch.object(WhoScoredScraper, '__init__', lambda x, **kwargs: None):
-            scraper = WhoScoredScraper()
-            scraper.LEAGUE_CONFIG = WhoScoredScraper.LEAGUE_CONFIG
-            scraper.BASE_URL = WhoScoredScraper.BASE_URL
-            scraper._browser = mock_browser
-
-            # Act
-            result = scraper._extract_match_urls_from_page()
-
-        # Assert - should find 3 match URLs
-        assert len(result) == 3
-
-        # Verify URLs are normalized (prefixed with BASE_URL)
-        for url in result:
-            assert url.startswith('https://www.whoscored.com') or url.startswith('/Matches/')
-
-    @pytest.mark.unit
-    def test_extract_match_urls_filters_non_match_links(self, mock_dependencies):
-        """Test that non-match links are filtered out."""
-        from scrapers.whoscored import WhoScoredScraper
-
-        mock_driver = MagicMock()
-        mock_browser = MagicMock()
-        mock_browser.driver = mock_driver
-
-        # Return no matches for any selector (simulating page with no matches)
-        mock_driver.find_elements.return_value = []
-
-        with patch.object(WhoScoredScraper, '__init__', lambda x, **kwargs: None):
-            scraper = WhoScoredScraper()
-            scraper.LEAGUE_CONFIG = WhoScoredScraper.LEAGUE_CONFIG
-            scraper.BASE_URL = WhoScoredScraper.BASE_URL
-            scraper._browser = mock_browser
-
-            result = scraper._extract_match_urls_from_page()
-
-        assert len(result) == 0
-
-    @pytest.mark.unit
-    def test_extract_match_urls_handles_stale_elements(self, mock_dependencies):
-        """Test graceful handling of StaleElementReferenceException."""
-        from selenium.common.exceptions import StaleElementReferenceException
-        from scrapers.whoscored import WhoScoredScraper
-
-        mock_driver = MagicMock()
-        mock_browser = MagicMock()
-        mock_browser.driver = mock_driver
-
-        # Create element that raises exception
-        stale_element = MagicMock()
-        stale_element.get_attribute.side_effect = StaleElementReferenceException('stale')
-
-        # Create valid element
-        valid_element = MagicMock()
-        valid_element.get_attribute.return_value = '/Matches/123/Live/Test'
-
-        mock_driver.find_elements.return_value = [stale_element, valid_element]
-
-        with patch.object(WhoScoredScraper, '__init__', lambda x, **kwargs: None):
-            scraper = WhoScoredScraper()
-            scraper.LEAGUE_CONFIG = WhoScoredScraper.LEAGUE_CONFIG
-            scraper.BASE_URL = WhoScoredScraper.BASE_URL
-            scraper._browser = mock_browser
-
-            # Should not raise, should skip stale element
-            result = scraper._extract_match_urls_from_page()
-
-        # Should have found the valid element
-        assert len(result) >= 1
-
-
-class TestWhoScoredGetMatchUrls:
-    """Tests for get_match_urls method."""
-
-    @pytest.fixture
-    def mock_dependencies(self):
-        """Mock all scraper dependencies."""
-        with patch('scrapers.base.base_scraper.get_rate_limiter') as mock_rl, \
-             patch('scrapers.base.base_scraper.get_retry_policy') as mock_rp, \
-             patch('scrapers.base.base_scraper.get_circuit_breaker') as mock_cb, \
-             patch('scrapers.base.base_scraper.IcebergWriter') as mock_iw:
-
-            mock_rl.return_value = MagicMock()
-            mock_rp.return_value = MagicMock()
-            mock_cb.return_value = MagicMock()
-
-            mock_iw_instance = MagicMock()
-            mock_iw_instance.write_dataframe.return_value = 'iceberg.bronze.test'
-            mock_iw.return_value = mock_iw_instance
-
-            yield
-
-    @pytest.mark.unit
-    def test_get_match_urls_unsupported_league(self, mock_dependencies, caplog):
-        """
-        Test that unsupported league returns empty list and logs warning.
-
-        When league is not in LEAGUE_CONFIG:
-        - Should return empty list []
-        - Should log a warning message
-        - Should NOT raise an exception
-        """
-        import logging
-        from scrapers.whoscored import WhoScoredScraper
-
-        with patch.object(WhoScoredScraper, '__init__', lambda x, **kwargs: None):
-            scraper = WhoScoredScraper()
-            scraper.LEAGUE_CONFIG = WhoScoredScraper.LEAGUE_CONFIG
-            scraper.BASE_URL = WhoScoredScraper.BASE_URL
-            scraper.leagues = ['UKR-Premier League']
-            scraper.seasons = [2024]
-            scraper._season_cache = {}
-
-            with caplog.at_level(logging.WARNING):
-                result = scraper.get_match_urls('UKR-Premier League', 2024)
-
-            # Should return empty list
-            assert result == []
-
-            # Should log warning about unsupported league
-            assert any('not supported' in record.message.lower()
-                      for record in caplog.records)
-
-    @pytest.mark.unit
-    def test_get_match_urls_returns_sorted_list(self, mock_dependencies):
-        """Test that get_match_urls returns sorted list of unique URLs."""
-        from scrapers.whoscored import WhoScoredScraper
-
-        mock_browser = MagicMock()
-        mock_browser.get_page.return_value = '<html></html>'
-        mock_browser.driver = MagicMock()
-
-        # Mock extract to return unsorted URLs
-        unsorted_urls = {
-            'https://whoscored.com/Matches/3/Live/C',
-            'https://whoscored.com/Matches/1/Live/A',
-            'https://whoscored.com/Matches/2/Live/B',
-        }
-
-        with patch.object(WhoScoredScraper, '__init__', lambda x, **kwargs: None):
-            scraper = WhoScoredScraper()
-            scraper.LEAGUE_CONFIG = WhoScoredScraper.LEAGUE_CONFIG
-            scraper.BASE_URL = WhoScoredScraper.BASE_URL
-            scraper._browser = mock_browser
-            scraper._season_cache = {('ENG-Premier League', 2024): ('9155', '20934')}
-
-            with patch.object(scraper, '_get_browser', return_value=mock_browser), \
-                 patch.object(scraper, '_extract_match_urls_from_page', return_value=unsorted_urls), \
-                 patch.object(scraper, '_navigate_to_previous_dates', return_value=False):
-
-                result = scraper.get_match_urls('ENG-Premier League', 2024, max_pages=1)
-
-        # Should be sorted
-        assert result == sorted(result)
-
-
-class TestWhoScoredSeasonCache:
-    """Tests for season/stage ID caching functionality."""
-
-    @pytest.fixture
-    def mock_dependencies(self):
-        """Mock all scraper dependencies."""
-        with patch('scrapers.base.base_scraper.get_rate_limiter') as mock_rl, \
-             patch('scrapers.base.base_scraper.get_retry_policy') as mock_rp, \
-             patch('scrapers.base.base_scraper.get_circuit_breaker') as mock_cb, \
-             patch('scrapers.base.base_scraper.IcebergWriter') as mock_iw:
-
-            mock_rl.return_value = MagicMock()
-            mock_rp.return_value = MagicMock()
-            mock_cb.return_value = MagicMock()
-
-            mock_iw_instance = MagicMock()
-            mock_iw_instance.write_dataframe.return_value = 'iceberg.bronze.test'
-            mock_iw.return_value = mock_iw_instance
-
-            yield
-
-    @pytest.mark.unit
-    def test_season_cache_usage(self, mock_dependencies):
-        """
-        Test that season/stage IDs are cached and reused.
-
-        When _get_season_stage_ids is called twice for same league/season:
-        - First call should fetch from browser
-        - Second call should use cache (no browser interaction)
-        """
-        from scrapers.whoscored import WhoScoredScraper
-
-        mock_browser = MagicMock()
-        mock_browser.get_page.return_value = '<html></html>'
-        mock_browser.current_url = 'https://whoscored.com/Regions/252/Tournaments/2/Seasons/9155/Stages/20934/'
-        mock_browser.driver = MagicMock()
-
-        # Mock season dropdown
-        mock_option = MagicMock()
-        mock_option.text = '2024/2025'
-        mock_option.get_attribute.return_value = '/Seasons/9155/'
-
-        mock_select = MagicMock()
-        mock_select.find_elements.return_value = [mock_option]
-        mock_browser.driver.find_element.return_value = mock_select
-
-        with patch.object(WhoScoredScraper, '__init__', lambda x, **kwargs: None):
-            scraper = WhoScoredScraper()
-            scraper.LEAGUE_CONFIG = WhoScoredScraper.LEAGUE_CONFIG
-            scraper.BASE_URL = WhoScoredScraper.BASE_URL
-            scraper._browser = mock_browser
-            scraper._season_cache = {}
-
-            with patch.object(scraper, '_get_browser', return_value=mock_browser):
-                # First call - should hit browser
-                result1 = scraper._get_season_stage_ids('ENG-Premier League', 2024)
-
-                # Manually populate cache (simulating successful first call)
-                scraper._season_cache[('ENG-Premier League', 2024)] = ('9155', '20934')
-
-                # Reset call count
-                mock_browser.get_page.reset_mock()
-
-                # Second call - should use cache
-                result2 = scraper._get_season_stage_ids('ENG-Premier League', 2024)
-
-            # Both should return same result
-            assert result2 == ('9155', '20934')
-
-            # Browser should NOT be called second time (used cache)
-            mock_browser.get_page.assert_not_called()
-
-    @pytest.mark.unit
-    def test_season_cache_key_format(self, mock_dependencies):
-        """Test that cache key is tuple of (league, season)."""
-        from scrapers.whoscored import WhoScoredScraper
-
-        with patch.object(WhoScoredScraper, '__init__', lambda x, **kwargs: None):
-            scraper = WhoScoredScraper()
-            scraper._season_cache = {}
-
-            # Populate cache
-            cache_key = ('ENG-Premier League', 2024)
-            scraper._season_cache[cache_key] = ('9155', '20934')
-
-            # Verify key format
-            assert cache_key in scraper._season_cache
-            assert scraper._season_cache[cache_key] == ('9155', '20934')
-
-    @pytest.mark.unit
-    def test_season_cache_different_seasons(self, mock_dependencies):
-        """Test that different seasons have separate cache entries."""
-        from scrapers.whoscored import WhoScoredScraper
-
-        with patch.object(WhoScoredScraper, '__init__', lambda x, **kwargs: None):
-            scraper = WhoScoredScraper()
-            scraper._season_cache = {}
-
-            # Add entries for different seasons
-            scraper._season_cache[('ENG-Premier League', 2024)] = ('9155', '20934')
-            scraper._season_cache[('ENG-Premier League', 2023)] = ('8618', '19793')
-
-            # Verify separate entries
-            assert scraper._season_cache[('ENG-Premier League', 2024)] == ('9155', '20934')
-            assert scraper._season_cache[('ENG-Premier League', 2023)] == ('8618', '19793')
-
-    @pytest.mark.unit
-    def test_known_season_ids_fallback(self, mock_dependencies):
-        """
-        Test that KNOWN_SEASON_IDS is used as fallback when available.
-
-        When cache is empty but KNOWN_SEASON_IDS has the league/season,
-        should return the known IDs without browser interaction.
-        """
-        from scrapers.whoscored import WhoScoredScraper
-
-        with patch.object(WhoScoredScraper, '__init__', lambda x, **kwargs: None):
-            scraper = WhoScoredScraper()
-            scraper.LEAGUE_CONFIG = WhoScoredScraper.LEAGUE_CONFIG
-            scraper.KNOWN_SEASON_IDS = WhoScoredScraper.KNOWN_SEASON_IDS
-            scraper.BASE_URL = WhoScoredScraper.BASE_URL
-            scraper._season_cache = {}
-            scraper._browser = None
-
-            # Mock _get_browser - should NOT be called if known IDs exist
-            mock_browser = MagicMock()
-            with patch.object(scraper, '_get_browser', return_value=mock_browser) as get_browser_mock:
-                # Check if 2024 season is in known IDs
-                if ('ENG-Premier League', 2024) in scraper.KNOWN_SEASON_IDS:
-                    result = scraper._get_season_stage_ids('ENG-Premier League', 2024)
-
-                    # Should use known IDs, not call browser
-                    assert result is not None
-                    assert result == scraper.KNOWN_SEASON_IDS[('ENG-Premier League', 2024)]
-                    # Browser should NOT be called when known IDs exist
-                    get_browser_mock.assert_not_called()
-
-    @pytest.mark.unit
-    def test_known_season_ids_structure(self):
-        """Test that KNOWN_SEASON_IDS has correct structure."""
-        from scrapers.whoscored import WhoScoredScraper
-
-        for key, value in WhoScoredScraper.KNOWN_SEASON_IDS.items():
-            # Key should be (league, season) tuple
-            assert isinstance(key, tuple)
-            assert len(key) == 2
-            league, season = key
-            assert isinstance(league, str)
-            assert isinstance(season, int)
-            assert league in WhoScoredScraper.LEAGUE_CONFIG
-
-            # Value should be (season_id, stage_id) tuple of strings
-            assert isinstance(value, tuple)
-            assert len(value) == 2
-            season_id, stage_id = value
-            assert isinstance(season_id, str)
-            assert isinstance(stage_id, str)
-            assert season_id.isdigit()
-            assert stage_id.isdigit()
-
-
-class TestWhoScoredScraper:
-    """General tests for WhoScoredScraper initialization and attributes."""
-
-    @pytest.fixture
-    def mock_dependencies(self):
-        """Mock all scraper dependencies."""
-        with patch('scrapers.base.base_scraper.get_rate_limiter') as mock_rl, \
-             patch('scrapers.base.base_scraper.get_retry_policy') as mock_rp, \
-             patch('scrapers.base.base_scraper.get_circuit_breaker') as mock_cb, \
-             patch('scrapers.base.base_scraper.IcebergWriter') as mock_iw:
-
-            mock_rl.return_value = MagicMock()
-            mock_rp.return_value = MagicMock()
-            mock_cb.return_value = MagicMock()
-
-            mock_iw_instance = MagicMock()
-            mock_iw_instance.write_dataframe.return_value = 'iceberg.bronze.test'
-            mock_iw.return_value = mock_iw_instance
-
-            yield
-
-    @pytest.fixture
-    def scraper(self, mock_dependencies):
-        """Create WhoScoredScraper instance."""
-        from scrapers.whoscored import WhoScoredScraper
-
-        return WhoScoredScraper(
-            leagues=['ENG-Premier League'],
-            seasons=[2024],
-            headless=True
+        scraper = WhoScoredScraper(
+            leagues=['ENG-Premier League'], seasons=[2024, 2025]
         )
 
-    @pytest.mark.unit
-    def test_init(self, scraper):
-        """Test WhoScoredScraper initialization."""
         assert scraper.leagues == ['ENG-Premier League']
-        assert scraper.seasons == [2024]
-        assert scraper.headless is True
-
-    @pytest.mark.unit
-    def test_source_name(self, scraper):
-        """Test source name is set correctly."""
+        assert scraper.seasons == [2024, 2025]
         assert scraper.SOURCE_NAME == 'whoscored'
 
-    @pytest.mark.unit
-    def test_default_rate_limit(self, scraper):
-        """Test conservative rate limit for WhoScored."""
-        assert scraper.DEFAULT_RATE_LIMIT == 10
-
-    @pytest.mark.unit
-    def test_base_url(self, scraper):
-        """Test BASE_URL is set correctly."""
-        assert scraper.BASE_URL == 'https://www.whoscored.com'
-
-    @pytest.mark.unit
-    def test_match_cache_initialized(self, scraper):
-        """Test that match cache is initialized as empty dict."""
-        assert hasattr(scraper, '_match_cache')
-        assert isinstance(scraper._match_cache, dict)
-
-    @pytest.mark.unit
-    def test_season_cache_initialized(self, scraper):
-        """Test that season cache is initialized as empty dict."""
-        assert hasattr(scraper, '_season_cache')
-        assert isinstance(scraper._season_cache, dict)
-
-
-class TestWhoScoredCoordinateConversion:
-    """Tests for coordinate conversion methods."""
-
-    @pytest.fixture
-    def mock_dependencies(self):
-        """Mock all scraper dependencies."""
-        with patch('scrapers.base.base_scraper.get_rate_limiter') as mock_rl, \
-             patch('scrapers.base.base_scraper.get_retry_policy') as mock_rp, \
-             patch('scrapers.base.base_scraper.get_circuit_breaker') as mock_cb, \
-             patch('scrapers.base.base_scraper.IcebergWriter') as mock_iw:
-
-            mock_rl.return_value = MagicMock()
-            mock_rp.return_value = MagicMock()
-            mock_cb.return_value = MagicMock()
-
-            mock_iw_instance = MagicMock()
-            mock_iw_instance.write_dataframe.return_value = 'iceberg.bronze.test'
-            mock_iw.return_value = mock_iw_instance
-
-            yield
-
-    @pytest.fixture
-    def scraper(self, mock_dependencies):
-        """Create WhoScoredScraper instance."""
+    def test_mro_includes_soccerdatascraper(self):
+        """WhoScoredScraper inherits SoccerdataScraper (not SeleniumScraper)."""
+        from scrapers.base.base_scraper import SoccerdataScraper, SeleniumScraper
         from scrapers.whoscored import WhoScoredScraper
 
-        return WhoScoredScraper(
-            leagues=['ENG-Premier League'],
-            seasons=[2024],
-            headless=True
-        )
+        assert SoccerdataScraper in WhoScoredScraper.__mro__
+        assert SeleniumScraper not in WhoScoredScraper.__mro__
 
-    @pytest.mark.unit
-    def test_convert_coordinates(self, scraper):
-        """Test coordinate conversion to SPADL format."""
-        # WhoScored uses 0-100, SPADL uses 105x68 meters
-        spadl_x, spadl_y = scraper._convert_coordinates(50, 50)
-
-        assert spadl_x == 52.5  # 105 / 2
-        assert spadl_y == 34.0  # 68 / 2
-
-    @pytest.mark.unit
-    def test_convert_coordinates_corners(self, scraper):
-        """Test coordinate conversion at corners."""
-        # Top-left
-        x, y = scraper._convert_coordinates(0, 0)
-        assert x == 0.0
-        assert y == 0.0
-
-        # Bottom-right
-        x, y = scraper._convert_coordinates(100, 100)
-        assert x == 105.0
-        assert y == 68.0
-
-
-class TestWhoScoredEventConversion:
-    """Tests for event to SPADL conversion."""
-
-    @pytest.fixture
-    def mock_dependencies(self):
-        """Mock all scraper dependencies."""
-        with patch('scrapers.base.base_scraper.get_rate_limiter') as mock_rl, \
-             patch('scrapers.base.base_scraper.get_retry_policy') as mock_rp, \
-             patch('scrapers.base.base_scraper.get_circuit_breaker') as mock_cb, \
-             patch('scrapers.base.base_scraper.IcebergWriter') as mock_iw:
-
-            mock_rl.return_value = MagicMock()
-            mock_rp.return_value = MagicMock()
-            mock_cb.return_value = MagicMock()
-
-            mock_iw_instance = MagicMock()
-            mock_iw_instance.write_dataframe.return_value = 'iceberg.bronze.test'
-            mock_iw.return_value = mock_iw_instance
-
-            yield
-
-    @pytest.fixture
-    def scraper(self, mock_dependencies):
-        """Create WhoScoredScraper instance."""
+    def test_legacy_single_season_kwarg(
+        self, mock_base_dependencies, mock_enhanced_whoscored
+    ):
         from scrapers.whoscored import WhoScoredScraper
 
-        return WhoScoredScraper(
-            leagues=['ENG-Premier League'],
-            seasons=[2024],
-            headless=True
+        scraper = WhoScoredScraper(
+            leagues=['ENG-Premier League'], season=2025
+        )
+        assert scraper.seasons == [2025]
+
+
+@pytest.mark.unit
+class TestWhoScoredGetReader:
+    """``_get_reader`` returns the patched soccerdata reader."""
+
+    def test_get_reader_uses_enhanced_whoscored(
+        self, mock_base_dependencies, mock_enhanced_whoscored
+    ):
+        cls_mock, reader = mock_enhanced_whoscored
+        from scrapers.whoscored import WhoScoredScraper
+
+        scraper = WhoScoredScraper(
+            leagues=['ENG-Premier League'], seasons=[2024]
         )
 
-    @pytest.mark.unit
-    def test_event_type_mapping(self, scraper):
-        """Test event type mapping to SPADL."""
-        assert scraper.EVENT_TYPE_MAPPING['Pass'] == 'pass'
-        assert scraper.EVENT_TYPE_MAPPING['Shot'] == 'shot'
-        assert scraper.EVENT_TYPE_MAPPING['Tackle'] == 'tackle'
-        assert scraper.EVENT_TYPE_MAPPING['Cross'] == 'cross'
+        result = scraper._get_reader()
+        assert result is reader
 
-    @pytest.mark.unit
-    def test_event_to_spadl_pass(self, scraper):
-        """Test converting pass event to SPADL."""
-        event = {
-            'id': 12345,
-            'type': {'displayName': 'Pass'},
-            'outcomeType': {'displayName': 'Successful'},
-            'x': 50,
-            'y': 50,
-            'endX': 70,
-            'endY': 40,
-            'minute': 15,
-            'second': 30,
-            'period': {'value': 1},
-            'teamId': 1,
-            'playerId': 101,
-            'playerName': 'Test Player',
-            'qualifiers': [],
+        cls_mock.assert_called_once()
+        call_kwargs = cls_mock.call_args.kwargs
+        assert call_kwargs['leagues'] == ['ENG-Premier League']
+        assert call_kwargs['seasons'] == [2024]
+        assert call_kwargs['headless'] is True
+
+    def test_get_reader_is_cached(
+        self, mock_base_dependencies, mock_enhanced_whoscored
+    ):
+        cls_mock, _ = mock_enhanced_whoscored
+        from scrapers.whoscored import WhoScoredScraper
+
+        scraper = WhoScoredScraper(
+            leagues=['ENG-Premier League'], seasons=[2024]
+        )
+        scraper._get_reader()
+        scraper._get_reader()
+        assert cls_mock.call_count == 1
+
+
+@pytest.mark.unit
+class TestWhoScoredScrapeSchedule:
+    def test_scrape_schedule_writes_correct_table(
+        self, mock_base_dependencies, mock_enhanced_whoscored
+    ):
+        from scrapers.whoscored import WhoScoredScraper
+
+        _, reader = mock_enhanced_whoscored
+        idx = pd.MultiIndex.from_tuples(
+            [('ENG-Premier League', '2425', 'Arsenal-Wolves')],
+            names=['league', 'season', 'game'],
+        )
+        reader.read_schedule.return_value = pd.DataFrame(
+            {'game_id': [1234567]}, index=idx
+        )
+
+        scraper = WhoScoredScraper(
+            leagues=['ENG-Premier League'], seasons=[2024]
+        )
+
+        save_mock = MagicMock(return_value='iceberg.bronze.whoscored_schedule')
+        with patch.object(scraper, 'save_to_iceberg', save_mock):
+            result = scraper.scrape_schedule()
+
+        reader.read_schedule.assert_called_once()
+        kwargs = save_mock.call_args.kwargs
+        assert kwargs['table_name'] == 'whoscored_schedule'
+        assert kwargs['partition_cols'] == ['league', 'season']
+        assert result == {'schedule': 'iceberg.bronze.whoscored_schedule'}
+
+
+@pytest.mark.unit
+class TestWhoScoredScrapeMissingPlayersAndSeasonStages:
+    def test_scrape_missing_players(
+        self, mock_base_dependencies, mock_enhanced_whoscored
+    ):
+        from scrapers.whoscored import WhoScoredScraper
+
+        _, reader = mock_enhanced_whoscored
+        reader.read_missing_players.return_value = pd.DataFrame({
+            'player': ['Foden'], 'reason': ['injury'],
+        })
+
+        scraper = WhoScoredScraper(
+            leagues=['ENG-Premier League'], seasons=[2024]
+        )
+        save_mock = MagicMock(
+            return_value='iceberg.bronze.whoscored_missing_players'
+        )
+        with patch.object(scraper, 'save_to_iceberg', save_mock):
+            result = scraper.scrape_missing_players()
+
+        reader.read_missing_players.assert_called_once()
+        kwargs = save_mock.call_args.kwargs
+        assert kwargs['table_name'] == 'whoscored_missing_players'
+        assert result == {
+            'missing_players': 'iceberg.bronze.whoscored_missing_players'
         }
 
-        match_info = {
-            'league': 'ENG-Premier League',
-            'season': 2024,
-            'match_id': 999,
-            'home_team': 'Arsenal',
-            'away_team': 'Chelsea',
-            'home_team_id': 1,
-            'away_team_id': 2,
+    def test_scrape_season_stages(
+        self, mock_base_dependencies, mock_enhanced_whoscored
+    ):
+        from scrapers.whoscored import WhoScoredScraper
+
+        _, reader = mock_enhanced_whoscored
+        reader.read_season_stages.return_value = pd.DataFrame({
+            'stage': ['Regular Season'],
+        })
+
+        scraper = WhoScoredScraper(
+            leagues=['ENG-Premier League'], seasons=[2024]
+        )
+        save_mock = MagicMock(
+            return_value='iceberg.bronze.whoscored_season_stages'
+        )
+        with patch.object(scraper, 'save_to_iceberg', save_mock):
+            result = scraper.scrape_season_stages()
+
+        reader.read_season_stages.assert_called_once()
+        kwargs = save_mock.call_args.kwargs
+        assert kwargs['table_name'] == 'whoscored_season_stages'
+        assert result == {
+            'season_stages': 'iceberg.bronze.whoscored_season_stages'
         }
 
-        spadl = scraper._event_to_spadl(event, match_info)
 
-        assert spadl['action_type'] == 'pass'
-        assert spadl['result'] == 'success'
-        assert spadl['start_x'] == 52.5
-        assert spadl['bodypart'] == 'foot'
+# -----------------------------------------------------------------------------
+# Events: FlareSolverr-backed flow.
+# -----------------------------------------------------------------------------
+def _make_meta_row(game_id: int, league: str, season: str, game_name: str):
+    return (game_id, league, season, game_name)
 
-    @pytest.mark.unit
-    def test_event_to_spadl_header(self, scraper):
-        """Test converting header event to SPADL."""
-        event = {
-            'id': 12346,
-            'type': {'displayName': 'Shot'},
-            'outcomeType': {'displayName': 'Successful'},
-            'x': 90,
-            'y': 50,
-            'minute': 45,
-            'second': 0,
-            'period': {'value': 1},
-            'teamId': 1,
-            'playerId': 101,
-            'playerName': 'Test Player',
-            'qualifiers': [{'type': {'displayName': 'Head'}}],
-            'isGoal': True,
+
+def _events_df(mid: int) -> pd.DataFrame:
+    idx = pd.MultiIndex.from_tuples(
+        [('ENG-Premier League', '2425', f'game-{mid}')],
+        names=['league', 'season', 'game'],
+    )
+    return pd.DataFrame(
+        {'game_id': [mid], 'minute': [10], 'type': ['Goal']},
+        index=idx,
+    )
+
+
+def _patch_events_pipeline(scraper, meta, fetch_side_effect):
+    """Patch every cross-module dep used by scrape_events."""
+    from scrapers.whoscored import scraper as scraper_mod
+    from scrapers.whoscored import events_fetcher as ef_mod
+
+    save_mock = MagicMock(return_value='iceberg.bronze.whoscored_events')
+    client_instance = MagicMock()
+    client_cls = MagicMock(return_value=client_instance)
+
+    fetch_mock = MagicMock()
+    if isinstance(fetch_side_effect, list) or callable(fetch_side_effect):
+        fetch_mock.side_effect = fetch_side_effect
+    elif isinstance(fetch_side_effect, BaseException) or (
+        isinstance(fetch_side_effect, type)
+        and issubclass(fetch_side_effect, BaseException)
+    ):
+        fetch_mock.side_effect = fetch_side_effect
+    else:
+        fetch_mock.return_value = fetch_side_effect
+
+    parse_mock = MagicMock(side_effect=lambda data, **kw: _events_df(kw['game_id']))
+
+    cms = [
+        patch.object(scraper, '_read_events_metadata_from_bronze', return_value=meta),
+        patch.object(scraper, '_fetch_existing_event_game_ids', return_value=set()),
+        patch.object(scraper, '_close_reader'),
+        patch.object(scraper, 'save_to_iceberg', save_mock),
+        patch.object(scraper_mod, 'FlareSolverrClient', client_cls),
+        patch.object(ef_mod, 'fetch_match_events_via_flaresolverr', fetch_mock),
+        patch.object(ef_mod, 'parse_matchcentre_to_events_df', parse_mock),
+    ]
+    return cms, save_mock, client_instance, fetch_mock
+
+
+@pytest.mark.unit
+class TestWhoScoredScrapeEventsViaFlaresolverr:
+    """End-to-end coverage of scrape_events on top of FlareSolverr."""
+
+    def test_constructor_accepts_flaresolverr_url(
+        self, mock_base_dependencies, mock_enhanced_whoscored
+    ):
+        from scrapers.whoscored import WhoScoredScraper
+
+        s = WhoScoredScraper(
+            leagues=['ENG-Premier League'],
+            seasons=[2024],
+            flaresolverr_url='http://x:1234',
+        )
+        assert s.flaresolverr_url == 'http://x:1234'
+
+        s2 = WhoScoredScraper(leagues=['ENG-Premier League'], seasons=[2024])
+        assert s2.flaresolverr_url is None
+
+    def test_session_lifecycle_create_and_destroy(
+        self, mock_base_dependencies, mock_enhanced_whoscored
+    ):
+        from scrapers.whoscored import WhoScoredScraper
+
+        meta = [
+            _make_meta_row(1, 'ENG-Premier League', '2425', 'g1'),
+            _make_meta_row(2, 'ENG-Premier League', '2425', 'g2'),
+        ]
+        scraper = WhoScoredScraper(leagues=['ENG-Premier League'], seasons=[2024])
+
+        cms, save_mock, client, fetch_mock = _patch_events_pipeline(
+            scraper, meta, fetch_side_effect={'events': [{}]}
+        )
+        with cms[0], cms[1], cms[2], cms[3], cms[4], cms[5], cms[6]:
+            result = scraper.scrape_events(match_ids=[1, 2], chunk_size=1)
+
+        assert client.create_session.call_count >= 1
+        assert client.destroy_session.call_count >= 1
+        assert fetch_mock.call_count == 2
+        assert save_mock.called
+        assert result == {'events': 'iceberg.bronze.whoscored_events'}
+
+    def test_session_recycle_every_n_matches(
+        self, mock_base_dependencies, mock_enhanced_whoscored, monkeypatch
+    ):
+        from scrapers.whoscored import WhoScoredScraper
+
+        monkeypatch.setattr(WhoScoredScraper, 'EVENTS_SESSION_RECREATE_EVERY', 2)
+        meta = [
+            _make_meta_row(i, 'ENG-Premier League', '2425', f'g{i}')
+            for i in range(1, 6)
+        ]
+        scraper = WhoScoredScraper(leagues=['ENG-Premier League'], seasons=[2024])
+
+        cms, _, client, _ = _patch_events_pipeline(
+            scraper, meta, fetch_side_effect={'events': [{}]}
+        )
+        with cms[0], cms[1], cms[2], cms[3], cms[4], cms[5], cms[6]:
+            scraper.scrape_events(match_ids=[1, 2, 3, 4, 5], chunk_size=10)
+
+        # initial create + 2 mid-loop recycles = 3
+        assert client.create_session.call_count == 3
+        # 2 mid-loop destroys + 1 final destroy = 3
+        assert client.destroy_session.call_count == 3
+
+    def test_retries_on_cf_challenge_recycles_session(
+        self, mock_base_dependencies, mock_enhanced_whoscored
+    ):
+        from scrapers.base.flaresolverr_client import FlareSolverrCFChallengeFailed
+        from scrapers.whoscored import WhoScoredScraper
+
+        meta = [_make_meta_row(7, 'ENG-Premier League', '2425', 'g7')]
+        scraper = WhoScoredScraper(leagues=['ENG-Premier League'], seasons=[2024])
+
+        cms, save_mock, client, _ = _patch_events_pipeline(
+            scraper, meta,
+            fetch_side_effect=[
+                FlareSolverrCFChallengeFailed('Cloudflare challenge'),
+                {'events': [{}]},
+            ],
+        )
+        with cms[0], cms[1], cms[2], cms[3], cms[4], cms[5], cms[6]:
+            scraper.scrape_events(match_ids=[7], chunk_size=1)
+
+        # initial create + recycle on CF = at least 2
+        assert client.create_session.call_count >= 2
+        assert save_mock.called
+
+    def test_retries_on_timeout_recycles_session(
+        self, mock_base_dependencies, mock_enhanced_whoscored
+    ):
+        from scrapers.base.flaresolverr_client import FlareSolverrTimeout
+        from scrapers.whoscored import WhoScoredScraper
+
+        meta = [_make_meta_row(8, 'ENG-Premier League', '2425', 'g8')]
+        scraper = WhoScoredScraper(leagues=['ENG-Premier League'], seasons=[2024])
+
+        cms, save_mock, client, _ = _patch_events_pipeline(
+            scraper, meta,
+            fetch_side_effect=[
+                FlareSolverrTimeout('timeout'),
+                {'events': [{}]},
+            ],
+        )
+        with cms[0], cms[1], cms[2], cms[3], cms[4], cms[5], cms[6]:
+            scraper.scrape_events(match_ids=[8], chunk_size=1)
+
+        assert client.create_session.call_count >= 2
+        assert save_mock.called
+
+    def test_no_recycle_on_generic_error(
+        self, mock_base_dependencies, mock_enhanced_whoscored, monkeypatch
+    ):
+        from scrapers.base.flaresolverr_client import FlareSolverrError
+        from scrapers.whoscored import WhoScoredScraper
+
+        monkeypatch.setattr(WhoScoredScraper, 'EVENTS_MAX_PROXY_RETRIES', 2)
+        meta = [_make_meta_row(9, 'ENG-Premier League', '2425', 'g9')]
+        scraper = WhoScoredScraper(leagues=['ENG-Premier League'], seasons=[2024])
+
+        cms, save_mock, client, _ = _patch_events_pipeline(
+            scraper, meta, fetch_side_effect=FlareSolverrError('boom'),
+        )
+        with cms[0], cms[1], cms[2], cms[3], cms[4], cms[5], cms[6]:
+            scraper.scrape_events(match_ids=[9], chunk_size=1)
+
+        # generic errors do NOT recycle
+        assert client.create_session.call_count == 1
+        # match given up — nothing saved to Iceberg
+        assert not save_mock.called
+
+    def test_gives_up_after_max_retries(
+        self, mock_base_dependencies, mock_enhanced_whoscored, monkeypatch
+    ):
+        from scrapers.base.flaresolverr_client import FlareSolverrCFChallengeFailed
+        from scrapers.whoscored import WhoScoredScraper
+
+        monkeypatch.setattr(WhoScoredScraper, 'EVENTS_MAX_PROXY_RETRIES', 2)
+        meta = [_make_meta_row(11, 'ENG-Premier League', '2425', 'g11')]
+        scraper = WhoScoredScraper(leagues=['ENG-Premier League'], seasons=[2024])
+
+        cms, save_mock, client, _ = _patch_events_pipeline(
+            scraper, meta, fetch_side_effect=FlareSolverrCFChallengeFailed('CF'),
+        )
+        with cms[0], cms[1], cms[2], cms[3], cms[4], cms[5], cms[6]:
+            scraper.scrape_events(match_ids=[11], chunk_size=1)
+
+        assert not save_mock.called
+        # final destroy still ran
+        assert client.destroy_session.called
+
+
+@pytest.mark.unit
+class TestFetchMatchEventsViaFlaresolverr:
+    """Standalone tests for the events_fetcher entry-point."""
+
+    def _html_with_data(self, n: int = 1) -> str:
+        events = ','.join(['{"id":1}'] * n)
+        return (
+            '<html><script>'
+            'require.config.params["args"] = {'
+            'matchId: 123, '
+            'matchCentreData: {"events":[' + events + '],"home":{},"away":{}}'
+            '};'
+            '</script></html>'
+        )
+
+    def test_returns_data_on_status_200(self):
+        from scrapers.whoscored.events_fetcher import (
+            fetch_match_events_via_flaresolverr,
+        )
+
+        client = MagicMock()
+        client.get.return_value = {
+            'html': self._html_with_data(),
+            'cookies': [], 'userAgent': 'Mozilla', 'status': 200,
         }
+        out = fetch_match_events_via_flaresolverr(client, 123, 'sess-1')
+        assert out is not None
+        assert 'events' in out
 
-        match_info = {
-            'league': 'ENG-Premier League',
-            'season': 2024,
-            'match_id': 999,
+    def test_returns_none_on_non_200(self):
+        from scrapers.whoscored.events_fetcher import (
+            fetch_match_events_via_flaresolverr,
+        )
+
+        client = MagicMock()
+        client.get.return_value = {
+            'html': '<html></html>',
+            'cookies': [], 'userAgent': 'Mozilla', 'status': 403,
         }
+        assert fetch_match_events_via_flaresolverr(client, 123, 'sess-1') is None
 
-        spadl = scraper._event_to_spadl(event, match_info)
+    def test_returns_none_when_match_centre_missing(self):
+        from scrapers.whoscored.events_fetcher import (
+            fetch_match_events_via_flaresolverr,
+        )
 
-        assert spadl['action_type'] == 'shot'
-        assert spadl['bodypart'] == 'head'
-        assert spadl['is_goal'] is True
-
-    @pytest.mark.unit
-    def test_event_to_spadl_penalty(self, scraper):
-        """Test converting penalty event to SPADL."""
-        event = {
-            'id': 12347,
-            'type': {'displayName': 'Shot'},
-            'outcomeType': {'displayName': 'Successful'},
-            'x': 90,
-            'y': 50,
-            'minute': 78,
-            'second': 0,
-            'period': {'value': 2},
-            'teamId': 1,
-            'playerId': 101,
-            'qualifiers': [{'type': {'displayName': 'Penalty'}}],
-            'isGoal': True,
+        client = MagicMock()
+        client.get.return_value = {
+            'html': '<html><body>no data</body></html>',
+            'cookies': [], 'userAgent': 'Mozilla', 'status': 200,
         }
-
-        match_info = {'league': 'Test', 'season': 2024, 'match_id': 1}
-
-        spadl = scraper._event_to_spadl(event, match_info)
-
-        assert spadl['action_type'] == 'shot_penalty'
+        assert fetch_match_events_via_flaresolverr(client, 123, 'sess-1') is None
 
 
-class TestSPADLDefinitions:
-    """Tests for SPADL action definitions."""
+# -----------------------------------------------------------------------------
+# Events parser standalone unit tests.
+# -----------------------------------------------------------------------------
+@pytest.mark.unit
+class TestEventsParser:
+    def test_parse_matchcentre_minimal(self):
+        from scrapers.whoscored.events_fetcher import (
+            parse_matchcentre_to_events_df,
+        )
 
-    @pytest.mark.unit
-    def test_spadl_actions_defined(self):
-        """Test SPADL actions are defined."""
-        from scrapers.whoscored import SPADL_ACTIONS
+        data = {
+            'events': [
+                {
+                    'eventId': 1,
+                    'minute': 10,
+                    'second': 5,
+                    'expandedMinute': 10,
+                    'type': {'displayName': 'Pass'},
+                    'outcomeType': {'displayName': 'Successful'},
+                    'teamId': 13,
+                    'playerId': 100,
+                    'x': 50.0,
+                    'y': 50.0,
+                    'isTouch': True,
+                    'period': {'displayName': 'FirstHalf'},
+                },
+            ],
+            'playerIdNameDictionary': {'100': 'Player A'},
+            'home': {'teamId': 13, 'name': 'Arsenal'},
+            'away': {'teamId': 167, 'name': 'Manchester City'},
+        }
+        df = parse_matchcentre_to_events_df(
+            data,
+            league='ENG-Premier League',
+            season='2425',
+            game_id=999,
+            game_name='2025-04-29 Arsenal-Manchester City',
+        )
 
-        assert 'pass' in SPADL_ACTIONS
-        assert 'shot' in SPADL_ACTIONS
-        assert 'tackle' in SPADL_ACTIONS
-        assert 'dribble' in SPADL_ACTIONS
+        assert not df.empty
+        # Index = (league, season, game)
+        assert df.index.names == ['league', 'season', 'game']
+        # MultiIndex first row matches inputs
+        idx0 = df.index[0]
+        assert idx0 == (
+            'ENG-Premier League', '2425',
+            '2025-04-29 Arsenal-Manchester City',
+        )
+        # Player + team resolution
+        assert df.iloc[0]['player'] == 'Player A'
+        assert df.iloc[0]['team'] == 'Arsenal'
+        # Nested-dict flattening for 'type' / 'period' / 'outcome_type'
+        assert df.iloc[0]['type'] == 'Pass'
+        assert df.iloc[0]['period'] == 'FirstHalf'
+        assert df.iloc[0]['outcome_type'] == 'Successful'
 
-    @pytest.mark.unit
-    def test_spadl_actions_have_descriptions(self):
-        """Test all SPADL actions have non-empty descriptions."""
-        from scrapers.whoscored import SPADL_ACTIONS
-
-        for action, description in SPADL_ACTIONS.items():
-            assert isinstance(description, str), (
-                f"Action '{action}' description must be string"
+    def test_parse_empty_returns_empty_df(self):
+        from scrapers.whoscored.events_fetcher import (
+            parse_matchcentre_to_events_df,
+        )
+        for bad in (None, {}, {'events': []}):
+            df = parse_matchcentre_to_events_df(
+                bad,
+                league='ENG-Premier League',
+                season='2425',
+                game_id=1,
+                game_name='x',
             )
-            assert len(description) > 0, (
-                f"Action '{action}' must have non-empty description"
-            )
+            assert df.empty
+
+    def test_parse_camelcase_to_snake(self):
+        from scrapers.whoscored.events_fetcher import (
+            parse_matchcentre_to_events_df,
+        )
+        data = {
+            'events': [{'expandedMinute': 12, 'goalMouthY': 33.0}],
+            'playerIdNameDictionary': {},
+            'home': {'teamId': 1, 'name': 'H'},
+            'away': {'teamId': 2, 'name': 'A'},
+        }
+        df = parse_matchcentre_to_events_df(
+            data, league='X', season='2425', game_id=1, game_name='g',
+        )
+        assert df.iloc[0]['expanded_minute'] == 12
+        assert df.iloc[0]['goal_mouth_y'] == 33.0
+
+
+@pytest.mark.unit
+class TestWhoScoredSeasonHelper:
+    @pytest.mark.parametrize('season,expected', [
+        (2024, '2425'),
+        (2023, '2324'),
+        (1999, '9900'),
+        (2099, '9900'),
+    ])
+    def test_season_to_soccerdata_str(self, season, expected):
+        from scrapers.whoscored.scraper import _season_to_soccerdata_str
+        assert _season_to_soccerdata_str(season) == expected

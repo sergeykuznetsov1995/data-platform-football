@@ -1,0 +1,71 @@
+# =============================================================================
+# OpenMetadata 1.5.x — Trino Lineage Workflow
+# =============================================================================
+# Reads recent Trino query history (system.runtime.queries on the coordinator)
+# and parses CTAS / INSERT statements to auto-build Bronze → Silver → Gold lineage.
+#
+# Prerequisite: `trino_ingestion.yaml` must be run first so OpenMetadata has the
+# table catalog populated — query parser matches table names against existing
+# entities to draw edges.
+#
+# Run:
+#   docker compose exec openmetadata-ingestion \
+#     metadata ingest -c /opt/configs/trino_lineage.yaml
+#
+# IMPORTANT: Trino's `system.runtime.queries` is in-memory and bounded by
+# `query.max-history` (default 100) and `query.min-expire-age` (default 10m).
+# At our cluster size (1 coordinator) and DAG cadence (Silver+Gold ~17 CTAS daily),
+# the default 100-query window is ENOUGH only if lineage runs at least every few
+# hours. If you increase ingestion volume, raise `query.max-history` in
+# configs/trino/config.properties (see README).
+# =============================================================================
+
+source:
+  type: trino-lineage
+  serviceName: trino_iceberg
+  serviceConnection:
+    config:
+      type: Trino
+      scheme: trino
+      hostPort: trino:8443
+      username: openmetadata
+      authType:
+        password: "${TRINO_OPENMETADATA_PASSWORD}"
+      catalog: iceberg
+      verifySSL: no-ssl
+      connectionArguments:
+        http_scheme: https
+        verify: false
+  sourceConfig:
+    config:
+      type: DatabaseLineage
+      # Lookback window in days. With sequential daily DAG runs, 1 day is enough.
+      queryLogDuration: 1
+      # Hard cap on the number of queries fetched from system.runtime.queries.
+      resultLimit: 1000
+      # Process CTAS/INSERT lineage between bronze/silver/gold; skip system schemas.
+      schemaFilterPattern:
+        includes:
+          - "^bronze$"
+          - "^silver$"
+          - "^gold$"
+      # We don't have views in the medallion stack, but keep flag explicit.
+      processViewLineage: false
+      processQueryLineage: true
+      processStoredProcedureLineage: false
+      # SqlGlot handles Trino dialect well (CTAS, WITH, window functions used in Gold).
+      parsingTimeoutLimit: 300
+      # Filter out OpenMetadata's own probe queries from lineage analysis.
+      filterCondition: "query NOT LIKE '%information_schema%' AND query NOT LIKE '%system.runtime%'"
+
+sink:
+  type: metadata-rest
+  config: {}
+
+workflowConfig:
+  loggerLevel: INFO
+  openMetadataServerConfig:
+    hostPort: http://openmetadata-server:8585/api
+    authProvider: openmetadata
+    securityConfig:
+      jwtToken: "${OM_JWT_TOKEN}"

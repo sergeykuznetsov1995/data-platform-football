@@ -4,40 +4,70 @@
 table:
   fullyQualifiedName: trino_iceberg.iceberg.gold.feat_team_form
   description: |
-    Per-(team, match) rolling form features over the last 5 matches: goals,
-    shots, possession, points, wins/draws/losses, std-dev signals + rest_days
-    since previous fixture. Point-in-time safe (NULL for first 5 matches).
+    Rolling-фичи команды по последним 5 матчам, рассчитанные строго PRE-match
+    (window 5 PRECEDING AND 1 PRECEDING — текущий матч исключён).
+    Включает средние, std-dev и trend (REGR_SLOPE) — три измерения формы:
+    уровень / стабильность / направление. Первые 5 матчей сезона = NULL
+    (point-in-time safety, защита от data leakage в ML).
   tags:
     - Tier.Gold
     - Domain.Football
     - PII.None
+    - UseCase.ML
 columns:
   - name: match_id
-    description: FK -> dim_match.match_id.
+    description: PK part 1 — ID матча (FK -> dim_match.match_id).
   - name: team_id
-    description: FK -> dim_team.team_id.
+    description: PK part 2 — ID команды (FK -> dim_team.team_id).
   - name: opponent_id
-    description: FK -> dim_team.team_id.
+    description: ID соперника в этом матче (FK -> dim_team.team_id).
+  - name: date
+    description: Дата матча.
+  - name: gameweek
+    description: Номер тура.
   - name: is_home
-    description: TRUE if team played at home in this match.
+    description: Играла ли команда дома (boolean).
   - name: l5_goals_for_avg
-    description: Trailing 5-match avg goals scored.
+    description: Среднее голов забито за L5 предыдущих матчей.
   - name: l5_goals_against_avg
-    description: Trailing 5-match avg goals conceded.
+    description: Среднее голов пропущено за L5.
+  - name: l5_shots_avg
+    description: Среднее ударов за L5.
+  - name: l5_sot_avg
+    description: Среднее ударов в створ за L5.
+  - name: l5_possession_avg
+    description: Среднее владения за L5 (%).
   - name: l5_form_points
-    description: Sum of points (3W/1D/0L) over trailing 5 matches.
+    description: Очки за L5 (0..15).
+  - name: l5_wins
+    description: Число побед за L5.
+  - name: l5_losses
+    description: Число поражений за L5.
+  - name: l5_draws
+    description: Число ничьих за L5.
+  - name: l5_goals_for_std
+    description: STDDEV_SAMP голов забито (волатильность атаки).
+  - name: l5_goals_against_std
+    description: STDDEV_SAMP голов пропущено (волатильность обороны).
+  - name: l5_points_std
+    description: STDDEV_SAMP очков (стабильность результата).
   - name: l5_form_trend
-    description: Slope of points over trailing 5 matches (improving / declining).
-  - name: rest_days
-    description: Days since previous fixture for this team.
+    description: REGR_SLOPE очков по match_seq — тренд формы (положительный = подъём).
   - name: matches_played_so_far
-    description: Cumulative match count so far this season.
+    description: Сколько матчей сыграно к этому моменту в сезоне.
+  - name: rest_days
+    description: Дней отдыха между текущим и предыдущим матчем.
   - name: league
-    description: League slug.
+    description: Лига.
   - name: season
-    description: Season slug.
+    description: Сезон.
 relationships:
-  - from: trino_iceberg.iceberg.gold.feat_team_form
-    to:   trino_iceberg.iceberg.gold.dim_team
+  - from: match_id
+    to: trino_iceberg.iceberg.gold.dim_match.match_id
     type: FOREIGN_KEY
-    description: team_id -> dim_team.team_id
+  - from: team_id
+    to: trino_iceberg.iceberg.gold.dim_team.team_id
+    type: FOREIGN_KEY
+  - from: opponent_id
+    to: trino_iceberg.iceberg.gold.dim_team.team_id
+    type: FOREIGN_KEY

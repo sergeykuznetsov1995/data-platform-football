@@ -4,34 +4,39 @@
 table:
   fullyQualifiedName: trino_iceberg.iceberg.gold.dim_player
   description: |
-    Dimension table for players, FBref-derived. Grain: one row per
-    (player_id, season). MAX-aggregated profile attributes (nation, position,
-    born_year, last_team) are stable per season; cross-source player
-    cross-matching is NOT performed at this layer (Understat players carry an
-    'u_<id>' canonical — known limitation).
+    Канонический справочник игроков по сезонам. PK (player_id, season).
+    Учитывает что игрок может менять команду внутри сезона (берём last_team
+    через MAX). Возраст и позиция — снимок на момент последнего обновления
+    в Silver. Используется как FK target из fct_player_match и feat_player_form.
   tags:
     - Tier.Gold
     - Domain.Football
-    - PII.None
+    - PII.Low
 columns:
   - name: player_id
-    description: Canonical player ID (FBref player slug).
+    description: Стабильный FBref player_id (хеш, присвоенный источником).
   - name: player_name
-    description: Player display name.
+    description: Полное имя игрока (PII.Low — публично известное лицо).
+    tags:
+      - PII.Low
   - name: nation
-    description: Country code / nationality.
+    description: Национальность (трёхбуквенный код, например ENG, FRA).
   - name: position
-    description: Primary on-field position (FBref convention, e.g. 'FW', 'MF', 'DF', 'GK').
+    description: Позиция игрока (GK / DF / MF / FW; может комбинироваться, "DF,MF").
   - name: born_year
-    description: Year of birth (4-digit).
+    description: Год рождения. PII.Low — широкодоступная информация.
+    tags:
+      - PII.Low
   - name: last_team
-    description: Last squad observed for this player in the season.
+    description: Последняя команда игрока в сезоне.
   - name: league
-    description: League slug.
+    description: Лига сезона.
   - name: season
-    description: Season slug (PK component).
+    description: Сезон.
 relationships:
-  - from: trino_iceberg.iceberg.gold.dim_player
-    to:   trino_iceberg.iceberg.gold.dim_team
+  - from: player_id
+    to: trino_iceberg.iceberg.gold.fct_player_match.player_id
     type: FOREIGN_KEY
-    description: last_team (slug) -> dim_team.team_id
+  - from: player_id
+    to: trino_iceberg.iceberg.gold.feat_player_form.player_id
+    type: FOREIGN_KEY

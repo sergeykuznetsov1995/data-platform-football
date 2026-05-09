@@ -4,20 +4,36 @@
 table:
   fullyQualifiedName: trino_iceberg.iceberg.gold.dim_team
   description: |
-    Dimension table for teams. Grain: one row per (team_id, league, season).
-    Canonical team identity comes from entity_xref (legacy) / silver.xref_team
-    (E1 cutover pending) — alias resolution against configs/medallion/team_aliases.yaml.
+    Канонический справочник команд. Одна строка на (team_id, league, season),
+    что позволяет отражать перемещения команды между лигами (промоушн/релегейшн).
+    Используется как FK target из fct_match (home/away), fct_team_match,
+    feat_team_form и feat_team_h2h.
   tags:
     - Tier.Gold
     - Domain.Football
     - PII.None
 columns:
   - name: team_id
-    description: Canonical team ID (lowercase slug, e.g. 'manchester_united').
+    description: Канонический ID команды (генерируется entity_xref как нормализованное имя).
   - name: team_name
-    description: Display name (e.g. 'Manchester United').
+    description: Полное имя команды как в источнике (например 'Manchester United').
   - name: league
-    description: League slug.
+    description: Лига сезона.
   - name: season
-    description: Season slug.
-relationships: []
+    description: Сезон; команда может присутствовать в нескольких сезонах.
+relationships:
+  - from: team_id
+    to: trino_iceberg.iceberg.gold.fct_match.home_team_id
+    type: FOREIGN_KEY
+  - from: team_id
+    to: trino_iceberg.iceberg.gold.fct_match.away_team_id
+    type: FOREIGN_KEY
+  - from: team_id
+    to: trino_iceberg.iceberg.gold.fct_team_match.team_id
+    type: FOREIGN_KEY
+  - from: team_id
+    to: trino_iceberg.iceberg.gold.feat_team_form.team_id
+    type: FOREIGN_KEY
+  - from: team_id
+    to: trino_iceberg.iceberg.gold.feat_team_h2h.team_id
+    type: FOREIGN_KEY

@@ -2,7 +2,7 @@
 # Data Platform - Makefile
 # =============================================================================
 
-.PHONY: help build up down restart logs ps clean health test-spark test-trino init-hdfs init-storage shell-spark shell-airflow shell-trino test-fbref-curl test-fbref-nodriver test-fbref-full test-proxy-stats superset-import superset-dashboards
+.PHONY: help build up down restart logs ps clean health test-spark test-trino init-hdfs init-storage shell-spark shell-airflow shell-trino test-fbref-curl test-fbref-nodriver test-fbref-full test-proxy-stats up-bi up-catalog down-bi down-catalog superset-init superset-import superset-dashboards om-ingest-trino om-lineage-trino om-apply-descriptions logs-superset logs-om shell-superset shell-om
 
 # Default target
 help:
@@ -31,6 +31,21 @@ help:
 	@echo "  make test-fbref-nodriver  - Test nodriver (browser) fallback"
 	@echo "  make test-fbref-full      - Run full test pipeline"
 	@echo "  make test-proxy-stats     - Show proxy pool statistics"
+	@echo ""
+	@echo "BI / Catalog:"
+	@echo "  make up-bi                - Start Superset stack (web + worker + beat)"
+	@echo "  make up-catalog           - Start OpenMetadata stack (server + ingestion + ES)"
+	@echo "  make down-bi              - Stop Superset stack"
+	@echo "  make down-catalog         - Stop OpenMetadata stack"
+	@echo "  make superset-init        - Bootstrap Superset (admin + datasources + dashboards)"
+	@echo "  make superset-import      - Import only datasources (no admin/db upgrade)"
+	@echo "  make om-ingest-trino      - Run OpenMetadata Trino schema ingestion"
+	@echo "  make om-lineage-trino     - Run OpenMetadata Trino lineage workflow"
+	@echo "  make om-apply-descriptions- Apply YAML table descriptions to OpenMetadata"
+	@echo "  make logs-superset        - Tail Superset web logs"
+	@echo "  make logs-om              - Tail OpenMetadata server logs"
+	@echo "  make shell-superset       - Open shell in Superset container"
+	@echo "  make shell-om             - Open shell in OpenMetadata server container"
 
 # Build images
 build:
@@ -148,6 +163,8 @@ urls:
 	@echo "  Spark Master:   http://localhost:8080"
 	@echo "  Airflow:        http://localhost:8081 (admin/admin)"
 	@echo "  Trino:          http://localhost:8082"
+	@echo "  Superset:       http://localhost:8088"
+	@echo "  OpenMetadata:   http://localhost:8585"
 
 # =============================================================================
 # FBref Scraping Tests
@@ -217,20 +234,63 @@ for p in stats['proxies'][:5]: \
     print(f'  {p[\"host\"]}:{p[\"port\"]} - success_rate={p[\"success_rate\"]}'); \
 "
 
+# =============================================================================
+# BI / Catalog (Superset + OpenMetadata)
+# =============================================================================
 
-# Re-import Superset datasets from datasources.yaml
+# Start Superset stack (web + worker + beat)
+up-bi:
+	@docker compose up -d superset superset-worker superset-beat
+
+# Start OpenMetadata stack (server + ingestion + Elasticsearch)
+up-catalog:
+	@docker compose up -d elasticsearch openmetadata-server openmetadata-ingestion
+
+# Stop Superset stack
+down-bi:
+	@docker compose stop superset superset-worker superset-beat
+
+# Stop OpenMetadata stack
+down-catalog:
+	@docker compose stop openmetadata-server openmetadata-ingestion elasticsearch
+
+# Bootstrap Superset (creates admin, runs db upgrade, imports datasources/dashboards)
+superset-init:
+	@docker compose exec superset bash /app/pythonpath/bootstrap.sh
+
+# Import only datasources (skip admin/db upgrade)
 superset-import:
-	docker compose exec superset python /app/configs/superset/import_datasources.py
+	@docker compose exec superset python /app/pythonpath/import_datasources.py
 
-# Re-import Superset dashboards from dashboards/*.py
+# E7: Import declarative dashboards from configs/superset/dashboards/*.py
 superset-dashboards:
-	docker compose exec superset python /app/configs/superset/import_dashboards.py
+	@docker compose exec superset python /app/pythonpath/import_dashboards.py
 
-om-apply-descriptions:  ## Apply YAML descriptions to OpenMetadata via REST API
-	docker compose exec airflow-webserver python /opt/airflow/configs/openmetadata/apply_descriptions.py
+# Run OpenMetadata Trino schema ingestion workflow
+om-ingest-trino:
+	@docker compose exec openmetadata-ingestion metadata ingest -c /opt/configs/trino_ingestion.yaml
 
-om-ingest-trino:  ## Trigger OpenMetadata Trino metadata ingestion (manual via UI for now)
-	@echo "TODO: trigger via OpenMetadata UI Pipeline -> Add Trino service -> Run"
+# Run OpenMetadata Trino lineage workflow
+om-lineage-trino:
+	@docker compose exec openmetadata-ingestion metadata ingest -c /opt/configs/trino_lineage.yaml
 
-om-lineage-trino:  ## Trigger OpenMetadata Trino lineage extraction (manual)
-	@echo "TODO: trigger via OpenMetadata UI Pipeline -> Lineage workflow"
+# Apply YAML-based table descriptions to OpenMetadata
+om-apply-descriptions:
+	@docker compose exec openmetadata-ingestion python /opt/configs/apply_descriptions.py
+
+# Tail Superset web logs
+logs-superset:
+	@docker compose logs -f --tail=100 superset
+
+# Tail OpenMetadata server logs
+logs-om:
+	@docker compose logs -f --tail=100 openmetadata-server
+
+# Open shell in Superset container
+shell-superset:
+	@docker compose exec superset bash
+
+# Open shell in OpenMetadata server container
+shell-om:
+	@docker compose exec openmetadata-server bash
+

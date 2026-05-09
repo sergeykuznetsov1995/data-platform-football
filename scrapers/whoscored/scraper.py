@@ -2,428 +2,514 @@
 WhoScored Scraper
 =================
 
-Main scraper class for WhoScored event data with Selenium browser automation.
-Converts event data to SPADL (Soccer Player Action Description Language) format.
+Hybrid scraper for WhoScored (2026-04 architecture):
+
+* **schedule / missing_players / season_stages** — soccerdata-backed via
+  :class:`scrapers.whoscored.whoscored_patched.EnhancedWhoScored`
+  (subclass with ``script_timeout=120s``, otherwise stock seleniumbase).
+* **events** — bypasses soccerdata entirely. game_ids and game metadata
+  are pulled from ``iceberg.bronze.whoscored_schedule`` (already populated
+  by ``scrape_schedule``). Each match's ``matchCentreData`` JSON is fetched
+  through :class:`scrapers.base.flaresolverr_client.FlareSolverrClient`
+  (a separate FlareSolverr microservice that holds the CF state), then
+  parsed into the standard events DataFrame via
+  :func:`scrapers.whoscored.events_fetcher.parse_matchcentre_to_events_df`.
+
+Why hybrid: the seleniumbase driver soccerdata uses no longer survives the
+WhoScored Cloudflare challenge — script_timeout fires before bypass and the
+5×retry full-driver-restart loop never writes to Iceberg. Schedule still
+works (the Cloudflare hit happens on per-match pages); events do not.
+FlareSolverr keeps a single Cloudflare-cleared browser session open and
+handles each match as a short HTTP fetch.
 
 Source: https://www.whoscored.com
-
-NOTE: WhoScored requires browser automation due to Cloudflare protection.
-This scraper should be run with headless=False for best results.
 """
 
-import json
 import logging
-import re
-import time
-from typing import Any, Dict, List, Optional
+import os
+import uuid
+from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 
-from scrapers.base.base_scraper import SeleniumScraper
-from scrapers.base.browser import CloudflareBypass
-from scrapers.whoscored.constants import LEAGUE_CONFIG, KNOWN_SEASON_IDS, BASE_URL, EVENT_TYPE_MAPPING
-from scrapers.whoscored.spadl_converter import event_to_spadl, convert_coordinates
-from scrapers.whoscored.page_navigator import PageNavigator
+from scrapers.base.base_scraper import SoccerdataScraper
+from scrapers.base.flaresolverr_client import (
+    FlareSolverrCFChallengeFailed,
+    FlareSolverrClient,
+    FlareSolverrError,
+    FlareSolverrTimeout,
+)
 
 logger = logging.getLogger(__name__)
 
 
-class WhoScoredScraper(SeleniumScraper):
+def _season_to_soccerdata_str(season: int) -> str:
+    """Convert int year (2024) to soccerdata short season format ('2425')."""
+    start = int(season) % 100
+    end = (int(season) + 1) % 100
+    return f"{start:02d}{end:02d}"
+
+
+class WhoScoredScraper(SoccerdataScraper):
     """
-    Scraper for WhoScored event data using Selenium.
+    Hybrid soccerdata + FlareSolverr scraper for WhoScored.
 
-    WhoScored provides:
-    - Detailed match events (passes, shots, tackles, etc.)
-    - Player ratings
-    - Match statistics
-    - Heat maps data
+    Tables produced (Bronze, partitioned by ``(league, season)``):
 
-    Events are converted to SPADL format for standardization.
+    * ``whoscored_schedule`` — fixtures + status + integer ``game_id``.
+    * ``whoscored_missing_players`` — pre-match injury / suspension list.
+    * ``whoscored_season_stages`` — cup vs league stage metadata.
+    * ``whoscored_events`` — per-match Opta events (~1500-2000 rows/match).
 
-    IMPORTANT: WhoScored uses Cloudflare protection. Use headless=False
-    for better success rate.
+    Usage::
 
-    Usage:
         scraper = WhoScoredScraper(
             leagues=['ENG-Premier League'],
-            seasons=[2024],
-            headless=False  # Recommended
+            seasons=[2024, 2025],
         )
-        result = scraper.scrape_all()
+        scraper.scrape_all()
     """
 
     SOURCE_NAME = 'whoscored'
-    DEFAULT_RATE_LIMIT = 10  # Very conservative due to Cloudflare
+    DEFAULT_RATE_LIMIT = 10  # conservative — Cloudflare under selenium
 
-    # Re-export constants for backwards compatibility
-    LEAGUE_CONFIG = LEAGUE_CONFIG
-    KNOWN_SEASON_IDS = KNOWN_SEASON_IDS
-    BASE_URL = BASE_URL
-    EVENT_TYPE_MAPPING = EVENT_TYPE_MAPPING
+    # Per-match retry budget when FlareSolverr surfaces a CF challenge or timeout.
+    # Rotation happens reactively — on failure — by destroying the FS session and
+    # creating a new one with a fresh proxy.
+    EVENTS_MAX_PROXY_RETRIES = 3
+    # Recreate the FlareSolverr session every N matches. Empirical: FS
+    # solves CF on session creation, but the same cookie set gets flagged
+    # by Cloudflare after ~5–10 WhoScored requests, so anything above ~10
+    # turns each subsequent request into a 60 s challenge timeout.
+    EVENTS_SESSION_RECREATE_EVERY = 10
 
     def __init__(
         self,
         leagues: Optional[List[str]] = None,
         seasons: Optional[List[int]] = None,
-        headless: bool = False,  # Recommended False for WhoScored
-        **kwargs
-    ):
-        """
-        Initialize WhoScored scraper.
+        season: Optional[int] = None,
+        headless: bool = True,
+        flaresolverr_url: Optional[str] = None,
+        **kwargs,
+    ) -> None:
+        if seasons is None and season is not None:
+            seasons = [season]
+        super().__init__(leagues=leagues, seasons=seasons, **kwargs)
 
-        Args:
-            leagues: List of league names to scrape
-            seasons: List of season years (e.g., 2024 for 2024/2025)
-            headless: Whether to run browser headless (False recommended)
-            **kwargs: Additional arguments passed to SeleniumScraper
+        self.headless = headless
+        self.flaresolverr_url = flaresolverr_url
+        self._reader = None
+        # Tracks the currently-active proxy so record_result() can credit it.
+        self._current_proxy_obj = None
+
+    # ---------- Reader ----------
+
+    def _get_reader(self):
+        """Build the underlying ``EnhancedWhoScored`` reader once.
+
+        Used **only** for schedule / missing_players / season_stages —
+        events scraping uses FlareSolverr via :meth:`scrape_events`.
         """
-        super().__init__(
-            leagues=leagues,
-            seasons=seasons,
-            headless=headless,
-            **kwargs
+        if self._reader is None:
+            try:
+                from scrapers.whoscored.whoscored_patched import EnhancedWhoScored
+            except ImportError:  # pragma: no cover — install-time issue
+                logger.error("soccerdata is not installed in this environment")
+                raise
+
+            kwargs = dict(self._sd_kwargs)
+            kwargs.setdefault('headless', self.headless)
+            self._reader = EnhancedWhoScored(
+                leagues=self.leagues,
+                seasons=self.seasons,
+                **kwargs,
+            )
+        return self._reader
+
+    def _close_reader(self) -> None:
+        """Quit the underlying selenium driver before events scraping starts.
+
+        soccerdata's selenium driver consumes ~500 MB; release it before
+        we open the FlareSolverr session so the airflow worker stays slim.
+        """
+        if self._reader is None:
+            return
+        try:
+            driver = getattr(self._reader, '_driver', None)
+            if driver is not None:
+                driver.quit()
+                logger.info("WhoScored: soccerdata selenium driver closed")
+        except Exception as e:
+            logger.warning(f"WhoScored: error closing reader: {e}")
+        finally:
+            self._reader = None
+
+    # ---------- Scrape methods ----------
+
+    def _save(
+        self,
+        df: Optional[pd.DataFrame],
+        table_name: str,
+        entity_type: str,
+    ) -> Optional[str]:
+        """Reset MultiIndex, attach metadata, write Bronze partition."""
+        if df is None or df.empty:
+            logger.warning(f"WhoScored: empty DataFrame for {table_name}")
+            return None
+        df = df.reset_index()
+        df = self._add_metadata(df, entity_type)
+        return self.save_to_iceberg(
+            df=df,
+            table_name=table_name,
+            partition_cols=['league', 'season'],
+            replace_partitions=['league', 'season'],
         )
-        self._match_cache: Dict[str, Dict] = {}
-        self._navigator: Optional[PageNavigator] = None
-        # Backwards compatibility: expose season cache
-        self._season_cache: Dict = {}
 
-    def _get_browser(self) -> CloudflareBypass:
-        """Get browser with WhoScored-specific configuration.
+    def scrape_schedule(self) -> Dict[str, str]:
+        """Fixtures for all configured (league, season) pairs."""
+        logger.info("WhoScored: read_schedule()")
+        df = self._safe_call('read_schedule')
+        path = self._save(df, 'whoscored_schedule', 'schedule')
+        return {'schedule': path} if path else {}
 
-        Uses ``getattr`` so the lazy initializer is safe when ``__init__``
-        was bypassed (unit tests).
-        """
-        if getattr(self, '_browser', None) is None:
-            # Get proxy from proxy_manager if available
-            proxy_url = None
-            if hasattr(self, 'proxy_manager') and self.proxy_manager:
-                proxy_url = self.proxy_manager.get_proxy()
-            elif hasattr(self, 'proxy') and self.proxy:
-                proxy_url = self.proxy
+    def scrape_missing_players(self) -> Dict[str, str]:
+        """Injuries / suspensions per match (pre-game)."""
+        logger.info("WhoScored: read_missing_players()")
+        df = self._safe_call('read_missing_players')
+        path = self._save(df, 'whoscored_missing_players', 'missing_players')
+        return {'missing_players': path} if path else {}
 
-            self._browser = CloudflareBypass(
-                headless=self.headless,
-                use_xvfb=getattr(self, 'use_xvfb', False),
-                proxy=proxy_url,
-                page_load_timeout=60,  # WhoScored can be slow
-            )
-        return self._browser
+    def scrape_season_stages(self) -> Dict[str, str]:
+        """Cup-vs-league stage metadata."""
+        logger.info("WhoScored: read_season_stages()")
+        df = self._safe_call('read_season_stages')
+        path = self._save(df, 'whoscored_season_stages', 'season_stages')
+        return {'season_stages': path} if path else {}
 
-    def _get_navigator(self) -> PageNavigator:
-        """Get page navigator instance.
+    # ---------- Events: FlareSolverr-based ----------
 
-        Uses ``getattr`` with a default so the lazy initializer also works
-        when ``__init__`` was bypassed (e.g. unit tests that patch ``__init__``
-        with a no-op to construct a partially-mocked scraper).
+    def _read_events_metadata_from_bronze(
+        self, target_season: Optional[str] = None
+    ) -> List[Tuple[int, str, str, str]]:
+        """Pull (game_id, league, season, game) tuples from bronze.whoscored_schedule.
 
-        Shares ``self._season_cache`` with the navigator so that the scraper
-        and the navigator stay in sync (the scraper is the source of truth).
-        """
-        if getattr(self, '_navigator', None) is None:
-            self._navigator = PageNavigator(
-                browser=self._get_browser(),
-            )
-            # Share the season cache so both sides see the same entries.
-            if getattr(self, '_season_cache', None) is None:
-                self._season_cache = {}
-            self._navigator._season_cache = self._season_cache
-        return self._navigator
-
-    # Delegate methods for backwards compatibility and testing
-    def _build_fixtures_url(self, league: str, season_id: str, stage_id: str) -> str:
-        """Build URL for fixtures page (delegated to PageNavigator)."""
-        return self._get_navigator().build_fixtures_url(league, season_id, stage_id)
-
-    def _build_tournament_url(self, league: str) -> str:
-        """Build URL for tournament main page (delegated to PageNavigator)."""
-        return self._get_navigator().build_tournament_url(league)
-
-    def _get_season_stage_ids(self, league: str, season: int):
-        """Get season/stage IDs.
-
-        Order of resolution (cheapest first, browser is last resort):
-          1. ``self._season_cache`` (in-memory cache, source of truth)
-          2. ``KNOWN_SEASON_IDS`` (static fallback, no network)
-          3. ``PageNavigator.get_season_stage_ids`` (Selenium navigation)
-
-        Steps 1-2 must not instantiate a browser, so they run before
-        ``_get_navigator()`` is called.
-        """
-        cache_key = (league, season)
-
-        # 1. In-memory cache hit
-        season_cache = getattr(self, '_season_cache', None)
-        if season_cache and cache_key in season_cache:
-            return season_cache[cache_key]
-
-        # 2. Static known IDs — populate cache and return without browser
-        known = getattr(self, 'KNOWN_SEASON_IDS', KNOWN_SEASON_IDS)
-        if cache_key in known:
-            ids = known[cache_key]
-            if season_cache is None:
-                self._season_cache = {}
-                season_cache = self._season_cache
-            season_cache[cache_key] = ids
-            return ids
-
-        # 3. Last resort — fall back to Selenium-driven navigator
-        return self._get_navigator().get_season_stage_ids(league, season)
-
-    def _extract_match_urls_from_page(self):
-        """Extract match URLs from current page (delegated to PageNavigator)."""
-        return self._get_navigator().extract_match_urls_from_page()
-
-    def _navigate_to_previous_dates(self) -> bool:
-        """Navigate to previous dates (delegated to PageNavigator)."""
-        return self._get_navigator().navigate_to_previous_dates()
-
-    def _convert_coordinates(self, x: float, y: float):
-        """Convert WhoScored coordinates to SPADL format."""
-        return convert_coordinates(x, y)
-
-    def _event_to_spadl(self, event, match_info):
-        """Convert WhoScored event to SPADL format."""
-        return event_to_spadl(event, match_info)
-
-    def _navigate_to_match(self, match_url: str) -> bool:
-        """
-        Navigate to match page and wait for data to load.
+        Replaces a Cloudflare-prone ``read_schedule`` round-trip during events
+        scraping. Filters by current ``self.leagues`` + ``self.seasons``.
 
         Args:
-            match_url: Full match URL
-
-        Returns:
-            True if successful
+            target_season: Optional 'YYZZ' season; if set, restricts the
+                returned tuples to that season only.
         """
-        browser = self._get_browser()
+        from scrapers.base.trino_manager import TrinoTableManager
 
-        try:
-            html = browser.get_page(
-                match_url,
-                wait_for_selector='#player-table-statistics-body',
-                wait_timeout=30,
-                cloudflare_wait=10.0,
-            )
-
-            # Check if page loaded correctly
-            if 'matchCentreData' in html or 'incidentEvents' in html:
-                return True
-
-            logger.warning(f"Match data not found on page: {match_url}")
-            return False
-
-        except Exception as e:
-            logger.error(f"Error navigating to match: {e}")
-            return False
-
-    def _extract_match_data(self) -> Optional[Dict[str, Any]]:
-        """
-        Extract match data from page JavaScript.
-
-        Returns:
-            Match data dictionary or None if extraction failed
-        """
-        browser = self._get_browser()
-
-        try:
-            # Try to extract matchCentreData from page
-            script = """
-            if (typeof matchCentreData !== 'undefined') {
-                return JSON.stringify(matchCentreData);
-            }
-            return null;
-            """
-            result = browser.execute_script(script)
-
-            if result:
-                return json.loads(result)
-
-            # Alternative: extract from script tags
-            page_source = browser.page_source
-            pattern = r'matchCentreData\s*=\s*(\{.*?\});'
-            match = re.search(pattern, page_source, re.DOTALL)
-
-            if match:
-                return json.loads(match.group(1))
-
-            logger.warning("Could not extract matchCentreData")
-            return None
-
-        except Exception as e:
-            logger.error(f"Error extracting match data: {e}")
-            return None
-
-    def read_match_events(
-        self,
-        match_url: str,
-        league: str,
-        season: int
-    ) -> Optional[pd.DataFrame]:
-        """
-        Read and convert match events to SPADL format.
-
-        Args:
-            match_url: Full match URL
-            league: League name
-            season: Season year
-
-        Returns:
-            DataFrame with SPADL events or None if extraction failed
-        """
-        logger.info(f"Fetching WhoScored events: {match_url}")
-
-        try:
-            # Navigate to match page
-            if not self._navigate_to_match(match_url):
-                return None
-
-            # Wait for dynamic content
-            time.sleep(2)
-
-            # Extract match data
-            match_data = self._extract_match_data()
-            if not match_data:
-                return None
-
-            # Extract match info
-            home_team = match_data.get('home', {})
-            away_team = match_data.get('away', {})
-
-            match_info = {
-                'league': league,
-                'season': season,
-                'match_id': match_data.get('matchId'),
-                'match_date': match_data.get('startDate', '').split('T')[0],
-                'home_team': home_team.get('name'),
-                'away_team': away_team.get('name'),
-                'home_team_id': home_team.get('teamId'),
-                'away_team_id': away_team.get('teamId'),
-            }
-
-            # Convert events to SPADL
-            events = match_data.get('events', [])
-            spadl_events = []
-
-            for event in events:
-                try:
-                    spadl_event = event_to_spadl(event, match_info)
-                    spadl_events.append(spadl_event)
-                except Exception as e:
-                    logger.debug(f"Error converting event: {e}")
-                    continue
-
-            if spadl_events:
-                df = pd.DataFrame(spadl_events)
-                df = self._add_metadata(df, 'events_spadl')
-                return df
-
-            return None
-
-        except Exception as e:
-            logger.error(f"Error reading match events: {e}")
-            return None
-
-    def get_match_urls(
-        self,
-        league: str,
-        season: int,
-        max_pages: int = 50
-    ) -> List[str]:
-        """
-        Get list of match URLs for a league and season.
-
-        Navigates through the fixtures page and collects all match URLs
-        by paginating backwards through the dates.
-
-        Args:
-            league: League name (e.g., 'ENG-Premier League')
-            season: Season year (e.g., 2024 for 2024/2025 season)
-            max_pages: Maximum number of pages to navigate (default: 50)
-
-        Returns:
-            List of unique match URLs sorted alphabetically
-        """
-        # Validate league before triggering browser/navigator creation,
-        # so unsupported leagues exit cheaply with a warning (no Selenium).
-        league_config = getattr(self, 'LEAGUE_CONFIG', LEAGUE_CONFIG)
-        if league not in league_config:
-            logger.warning(
-                f"League not supported: {league}. "
-                f"Supported: {list(league_config.keys())}"
-            )
+        leagues = list(self.leagues or [])
+        season_strs = [_season_to_soccerdata_str(s) for s in (self.seasons or [])]
+        if target_season:
+            season_strs = [s for s in season_strs if s == target_season]
+        if not leagues or not season_strs:
             return []
 
-        return self._get_navigator().get_match_urls(league, season, max_pages)
+        leagues_in = ", ".join(f"'{l}'" for l in leagues)
+        seasons_in = ", ".join(f"'{s}'" for s in season_strs)
+        sql = (
+            "SELECT game_id, league, season, game "
+            "FROM iceberg.bronze.whoscored_schedule "
+            f"WHERE league IN ({leagues_in}) AND season IN ({seasons_in}) "
+            "AND game_id IS NOT NULL"
+        )
+        mgr = TrinoTableManager()
+        try:
+            rows = mgr._execute(sql, fetch=True)
+        except Exception as e:
+            msg = str(e)
+            if 'TABLE_NOT_FOUND' in msg or 'does not exist' in msg:
+                logger.warning("bronze.whoscored_schedule does not exist yet")
+                return []
+            raise
+        out: List[Tuple[int, str, str, str]] = []
+        for r in rows or []:
+            if r[0] is None:
+                continue
+            out.append((int(r[0]), str(r[1]), str(r[2]), str(r[3])))
+        return out
 
-    def scrape_match(
+    def scrape_events(
         self,
-        match_url: str,
-        league: str,
-        season: int
+        match_ids: Optional[List[int]] = None,
+        chunk_size: int = 50,
+        skip_existing: bool = True,
+        max_matches: Optional[int] = None,
     ) -> Dict[str, str]:
-        """
-        Scrape a single match.
+        """Per-match Opta events via FlareSolverr, with resumable incremental save.
+
+        Unlike the previous soccerdata-backed implementation, this method:
+
+        * Pulls ``(game_id, league, season, game)`` tuples directly from
+          ``iceberg.bronze.whoscored_schedule`` (no ``read_schedule`` retry
+          loop). The schedule task must have run successfully first.
+        * Fetches each match's ``matchCentreData`` JSON through
+          :class:`FlareSolverrClient` (single CF challenge per session).
+        * Parses JSON into the soccerdata events schema in-process — no
+          on-disk cache, no soccerdata invocation for events.
 
         Args:
-            match_url: Full match URL
-            league: League name
-            season: Season year
-
-        Returns:
-            Dictionary with table path or empty dict if failed
+            match_ids: Optional explicit list. If None, picks latest season
+                from bronze schedule.
+            chunk_size: Save to Iceberg every N matches (default 50).
+            skip_existing: If True, skip game_ids already in bronze.
+            max_matches: Optional cap (smoke / verification runs).
         """
-        df = self.read_match_events(match_url, league, season)
-
-        if df is not None and not df.empty:
-            table_path = self.save_to_iceberg(
-                df=df,
-                table_name='whoscored_events_spadl',
-                partition_cols=['league', 'season'],
-            )
-            return {'events': table_path}
-
-        return {}
-
-    def scrape_all(self) -> Dict[str, str]:
-        """
-        Scrape all WhoScored data for configured leagues and seasons.
-
-        Returns:
-            Dictionary mapping data type to Iceberg table path
-        """
-        logger.info(
-            f"Starting WhoScored scrape: leagues={self.leagues}, seasons={self.seasons}"
+        from scrapers.whoscored.events_fetcher import (
+            fetch_match_events_via_flaresolverr,
+            parse_matchcentre_to_events_df,
         )
 
-        results = {}
-        all_events = []
-
-        for league in self.leagues:
-            for season in self.seasons:
-                match_urls = self.get_match_urls(league, season)
-
-                for url in match_urls:
-                    try:
-                        df = self.read_match_events(url, league, season)
-                        if df is not None and not df.empty:
-                            all_events.append(df)
-
-                        # Rate limiting between matches
-                        time.sleep(5)
-
-                    except Exception as e:
-                        logger.error(f"Error scraping match {url}: {e}")
-                        continue
-
-        if all_events:
-            combined_df = pd.concat(all_events, ignore_index=True)
-            table_path = self.save_to_iceberg(
-                df=combined_df,
-                table_name='whoscored_events_spadl',
-                partition_cols=['league', 'season'],
+        # 1. Resolve game_ids + per-match metadata.
+        target_season_str = (
+            _season_to_soccerdata_str(max(self.seasons))
+            if self.seasons and match_ids is None
+            else None
+        )
+        meta = self._read_events_metadata_from_bronze(target_season_str)
+        if not meta:
+            logger.warning(
+                "WhoScored: no rows in bronze.whoscored_schedule — run "
+                "scrape_schedule first. Skipping events."
             )
-            results['events'] = table_path
+            return {}
 
-        logger.info(f"WhoScored scrape complete: {list(results.keys())}")
+        meta_by_id: Dict[int, Tuple[int, str, str, str]] = {m[0]: m for m in meta}
+        if match_ids is not None:
+            ids = [int(mid) for mid in match_ids if int(mid) in meta_by_id]
+        else:
+            ids = list(meta_by_id.keys())
+
+        # 2. Resume — skip already-saved.
+        if skip_existing and ids:
+            try:
+                done = self._fetch_existing_event_game_ids()
+                if done:
+                    before = len(ids)
+                    ids = [mid for mid in ids if mid not in done]
+                    logger.info(
+                        f"WhoScored: skip_existing — {before - len(ids)} of "
+                        f"{before} already in bronze, {len(ids)} remaining"
+                    )
+            except Exception as e:
+                logger.warning(f"WhoScored: skip_existing check failed: {e}")
+
+        if max_matches is not None:
+            ids = ids[: int(max_matches)]
+            logger.info(f"WhoScored: capped to first {len(ids)} matches")
+
+        if not ids:
+            logger.info("WhoScored: nothing to fetch (all matches already in bronze)")
+            return {
+                'events': f'{self._iceberg_writer.catalog}.bronze.whoscored_events'
+            }
+
+        # 3. Make sure the soccerdata selenium driver is gone before we open
+        # a FlareSolverr session (saves on container memory).
+        self._close_reader()
+
+        # 4. Iterate via FlareSolverr.
+        total = len(ids)
+        logger.info(
+            f"WhoScored: fetching events via FlareSolverr for {total} matches "
+            f"(recreate session every {self.EVENTS_SESSION_RECREATE_EVERY}, "
+            f"rotate proxy reactively on CF challenge / timeout)"
+        )
+
+        path: Optional[str] = None
+        chunk: List[pd.DataFrame] = []
+
+        def _pick_proxy_url() -> Optional[str]:
+            """Pull a proxy from ProxyManager (preferred) or fall back to
+            the legacy single ``self.proxy`` env."""
+            if self._proxy_manager and self._proxy_manager.total_count > 0:
+                proxy_obj = self._proxy_manager.get_proxy()
+                if proxy_obj:
+                    self._current_proxy_obj = proxy_obj
+                    return proxy_obj.url
+            if self.proxy:
+                return self._build_proxy_url()
+            return None
+
+        fs_url = self.flaresolverr_url or os.environ.get(
+            "FLARESOLVERR_URL", "http://flaresolverr:8191"
+        )
+        client = FlareSolverrClient(url=fs_url)
+        session_id = f"whoscored-{uuid.uuid4().hex[:8]}"
+        client.create_session(session_id, proxy_url=_pick_proxy_url())
+        logger.info(
+            f"WhoScored: FlareSolverr session started — {session_id} via {fs_url}"
+        )
+
+        def _recycle_session() -> None:
+            """Destroy current FS session and open a fresh one with a new proxy.
+
+            Mutates the enclosing ``session_id`` (via ``nonlocal``). Used both
+            for the periodic mid-loop recycle and as recovery after a CF
+            challenge / timeout.
+            """
+            nonlocal session_id
+            try:
+                client.destroy_session(session_id)
+            except FlareSolverrError:
+                pass
+            session_id = f"whoscored-{uuid.uuid4().hex[:8]}"
+            client.create_session(session_id, proxy_url=_pick_proxy_url())
+
+        try:
+            for i, mid in enumerate(ids, 1):
+                meta_row = meta_by_id[mid]
+                _, league, season, game_name = meta_row
+
+                # Periodic FS session recycle — guards against FS bug #1128
+                # (cookies stale after long sessions) and the FS memory leak.
+                if i > 1 and (i - 1) % self.EVENTS_SESSION_RECREATE_EVERY == 0:
+                    logger.info(
+                        f"WhoScored: recycling FS session at match {i}/{total}"
+                    )
+                    _recycle_session()
+
+                # Per-match fetch with CF/timeout → recreate session → retry.
+                data = None
+                for attempt in range(self.EVENTS_MAX_PROXY_RETRIES):
+                    try:
+                        data = fetch_match_events_via_flaresolverr(
+                            client, mid, session_id
+                        )
+                        if (
+                            self._proxy_manager
+                            and self._current_proxy_obj is not None
+                        ):
+                            self._proxy_manager.record_result(
+                                self._current_proxy_obj, success=True
+                            )
+                        break
+                    except (FlareSolverrTimeout, FlareSolverrCFChallengeFailed) as e:
+                        error_type = (
+                            'cf_challenge'
+                            if isinstance(e, FlareSolverrCFChallengeFailed)
+                            else 'timeout'
+                        )
+                        if (
+                            self._proxy_manager
+                            and self._current_proxy_obj is not None
+                        ):
+                            self._proxy_manager.record_result(
+                                self._current_proxy_obj,
+                                success=False,
+                                error_type=error_type,
+                            )
+                        logger.warning(
+                            f"WhoScored: {error_type} on match {mid} "
+                            f"(attempt {attempt + 1}/"
+                            f"{self.EVENTS_MAX_PROXY_RETRIES}): {e}"
+                        )
+                        _recycle_session()
+                    except FlareSolverrError as e:
+                        logger.warning(
+                            f"WhoScored: FlareSolverr error on match {mid} "
+                            f"(attempt {attempt + 1}/"
+                            f"{self.EVENTS_MAX_PROXY_RETRIES}): {e}"
+                        )
+
+                if data is None:
+                    logger.warning(
+                        f"WhoScored: gave up on match {mid} after retries "
+                        f"({i}/{total})"
+                    )
+                    continue
+
+                df = parse_matchcentre_to_events_df(
+                    data,
+                    league=league,
+                    season=season,
+                    game_id=mid,
+                    game_name=game_name,
+                )
+                if df is not None and not df.empty:
+                    chunk.append(df.reset_index())
+                else:
+                    logger.warning(
+                        f"WhoScored: no events parsed for game_id={mid} "
+                        f"({i}/{total})"
+                    )
+
+                if len(chunk) >= chunk_size or i == total:
+                    if chunk:
+                        combined = pd.concat(chunk, ignore_index=True)
+                        combined = self._add_metadata(combined, 'events')
+                        path = self.save_to_iceberg(
+                            df=combined,
+                            table_name='whoscored_events',
+                            partition_cols=['league', 'season'],
+                        )
+                        logger.info(
+                            f"WhoScored: saved chunk @ {i}/{total} "
+                            f"({len(combined)} rows)"
+                        )
+                        chunk = []
+        finally:
+            try:
+                client.destroy_session(session_id)
+            except FlareSolverrError as e:
+                logger.warning(f"WhoScored: final FS session destroy failed: {e}")
+
+        if path is None:
+            logger.warning("WhoScored: events scrape produced no rows")
+            return {}
+        return {'events': path}
+
+    # ---------- Helpers ----------
+
+    def _build_proxy_url(self) -> Optional[str]:
+        """Convert ``self.proxy`` (``host:port:user:pass``) to an HTTP proxy URL."""
+        if not self.proxy:
+            return None
+        parts = self.proxy.split(':')
+        if len(parts) == 4:
+            host, port, user, pw = parts
+            return f"http://{user}:{pw}@{host}:{port}"
+        return self.proxy
+
+    def _fetch_existing_event_game_ids(self) -> set:
+        """Query bronze.whoscored_events for already-saved game_ids."""
+        from scrapers.base.trino_manager import TrinoTableManager
+        season_strs = [
+            _season_to_soccerdata_str(s) for s in (self.seasons or [])
+        ]
+        leagues = list(self.leagues or [])
+        if not season_strs or not leagues:
+            return set()
+        leagues_in = ", ".join(f"'{l}'" for l in leagues)
+        seasons_in = ", ".join(f"'{s}'" for s in season_strs)
+        sql = (
+            f"SELECT DISTINCT game_id "
+            f"FROM iceberg.bronze.whoscored_events "
+            f"WHERE league IN ({leagues_in}) AND season IN ({seasons_in})"
+        )
+        mgr = TrinoTableManager()
+        try:
+            rows = mgr._execute(sql, fetch=True)
+        except Exception as e:
+            msg = str(e)
+            if 'TABLE_NOT_FOUND' in msg or 'does not exist' in msg:
+                return set()
+            raise
+        return {int(r[0]) for r in (rows or []) if r[0] is not None}
+
+    def scrape_all(self) -> Dict[str, str]:
+        """Full ingest: schedule → missing_players → season_stages → events."""
+        logger.info(
+            f"WhoScored scrape_all: leagues={self.leagues}, seasons={self.seasons}"
+        )
+        results: Dict[str, str] = {}
+        results.update(self.scrape_schedule())
+        results.update(self.scrape_missing_players())
+        results.update(self.scrape_season_stages())
+        results.update(self.scrape_events())
+        logger.info(f"WhoScored scrape_all done: {list(results.keys())}")
         return results
