@@ -67,6 +67,7 @@ def main():
                         df=df,
                         table_name='understat_schedule',
                         partition_cols=['league', 'season'],
+                        replace_partitions=['league', 'season'],
                     )
                     results['tables'].append(table_path)
                     results['schedule_rows'] = len(df)
@@ -84,6 +85,7 @@ def main():
                         df=df,
                         table_name='understat_shots',
                         partition_cols=['league', 'season'],
+                        replace_partitions=['league', 'season'],
                     )
                     results['tables'].append(table_path)
                     results['shots_rows'] = len(df)
@@ -101,6 +103,7 @@ def main():
                         df=df,
                         table_name='understat_players',
                         partition_cols=['league', 'season'],
+                        replace_partitions=['league', 'season'],
                     )
                     results['tables'].append(table_path)
                     results['player_stats_rows'] = len(df)
@@ -118,6 +121,7 @@ def main():
                         df=df,
                         table_name='understat_team_match_stats',
                         partition_cols=['league', 'season'],
+                        replace_partitions=['league', 'season'],
                     )
                     results['tables'].append(table_path)
                     results['team_match_stats_rows'] = len(df)
