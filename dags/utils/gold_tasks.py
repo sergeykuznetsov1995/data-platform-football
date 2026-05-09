@@ -13,11 +13,33 @@ heavyweight ``scrapers/__init__.py`` in Airflow workers (~1.5 GB RAM).
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List, Optional
+import time
+from typing import Any, Dict, List, Optional, Tuple
 
-from utils.silver_tasks import check_bronze_table_exists, run_silver_transform
+from utils.silver_tasks import (
+    _execute,
+    _get_trino_connection,
+    _resolve_sql_path,
+    _validate_identifier,
+    check_bronze_table_exists,
+    run_silver_transform,
+)
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Per-partition INSERT runner — sentinel for WHERE-clause injection
+# ---------------------------------------------------------------------------
+# SQL files consumed by ``run_gold_partition_inserts`` MUST contain exactly
+# one occurrence of this marker on a line by itself (or as the only content
+# of a comment line). At runtime the marker is replaced with a concrete
+# ``WHERE league = '...' AND season = '...'`` clause built from the partition
+# tuple. We deliberately use a comment marker (``--``) so the file is still
+# valid SQL when opened in an editor or run manually with no replacement
+# applied (the unreplaced template would fail the WHERE-required contract,
+# which is the intended fail-loud behaviour).
+PARTITION_FILTER_SENTINEL = "-- WHERE_PARTITION_FILTER_HERE"
 
 
 # ---------------------------------------------------------------------------
@@ -102,6 +124,40 @@ FEAT_PLAYER_FORM_ROLLING_COLS = [
     'l5_reds_sum',
 ]
 
+# E6 / W2: feat_referee_bias — partition (referee_id, season) ORDER BY date,
+# mask ref_match_rn > 5. Each column is a rolling stat over the referee's last
+# 10 completed matches (within season). Same point-in-time semantics as the
+# other feat_* tables: first 5 matches of a referee's season carry NULL to
+# avoid leakage during early-season fitting.
+FEAT_REFEREE_BIAS_ROLLING_COLS = [
+    'ref_yellow_per_match_l10',
+    'ref_red_per_match_l10',
+    'ref_cards_per_match_l10',
+    'ref_goals_per_match_l10',
+    'ref_home_win_rate_l10',
+    'ref_pen_per_match_l10',
+]
+
+# E6 / W3: feat_team_event_style — partition (team_id, season) ORDER BY date,
+# mask match_rn > 5. All columns are share/rate metrics derived from
+# silver.whoscored_events_spadl rolling over the team's last 5 matches.
+# Bounded in [0, 1] (share = fraction of team's actions of given type, or
+# success_rate = share of successful actions). NB: skip_first_n=5 — share
+# numerators are unstable for the first ~5 matches when sample sizes are
+# small, so the SQL masks them to NULL and the DQ enforces the mask.
+FEAT_TEAM_EVENT_STYLE_ROLLING_COLS = [
+    'pass_share_l5_avg',
+    'dribble_share_l5_avg',
+    'tackle_share_l5_avg',
+    'interception_share_l5_avg',
+    'cross_share_l5_avg',
+    'shot_share_l5_avg',
+    'success_rate_l5_avg',
+    'set_piece_share_l5_avg',
+    'open_play_share_l5_avg',
+    'header_share_l5_avg',
+]
+
 
 def run_gold_transform(
     sql_file: str,
@@ -175,6 +231,675 @@ def run_gold_transform(
         partition_columns=partition_columns,
         add_timestamp=add_timestamp,
     )
+
+
+# ---------------------------------------------------------------------------
+# E3.6: per-partition INSERT runner (opt-in for backfills / multi-competition)
+# ---------------------------------------------------------------------------
+#
+# DESIGN NOTES
+# ------------
+# * Default Gold path stays ``run_gold_transform`` (DROP + CTAS). It is
+#   atomic for the *whole* table and faster for full rebuilds; ideal for
+#   the current scope (APL/2526, single season).
+# * ``run_gold_partition_inserts`` is opt-in for situations where DROP is
+#   destructive: backfilling a *historical* season into a Gold table that
+#   already serves the current season, or expanding to a new competition
+#   alongside existing data. Trino R4 verdict: per-partition INSERT,
+#   528K rows / 2.7s wall-clock.
+# * Idempotency is achieved with DELETE-then-INSERT scoped to the partition
+#   keys. Iceberg in our Trino catalog supports row-level DELETE on
+#   partition columns — so reruns of the same (league, season) are safe.
+# * Resumability: ``start_from_partition`` lets the caller skip partitions
+#   that were already completed in a previous run. Semantics — exclusive:
+#   "the named partition was *successfully* finished, resume *after* it".
+# * Per-partition DQ (``per_partition_checks``) runs AFTER the INSERT.
+#   On ERROR-severity failure the partition is rolled back (DELETE again).
+#   ``raise_on_partition_failure`` controls whether the runner aborts the
+#   whole sweep or logs and continues with the next partition.
+# * SQL injection — ``partition_keys`` are validated as identifiers; the
+#   *values* are escaped via single-quote doubling (Trino-standard).
+#   Length cap on values so no monster strings ever land in the WHERE.
+
+
+# Hard cap on partition-value string length. APL season codes ('2526') and
+# league names ('ENG-Premier League') are well under this; the cap exists
+# only as a defence-in-depth shield against accidental injection of huge
+# literals via a misuse of the API.
+_MAX_PARTITION_VALUE_LEN = 128
+
+
+def _safe_partition_value(value: str, key: str) -> str:
+    """Escape a partition VALUE for inline use in a Trino WHERE clause.
+
+    Identifiers (table / column names) are validated by ``_validate_identifier``;
+    values cannot use that path because they may legitimately contain spaces,
+    hyphens or apostrophes (e.g. ``'ENG-Premier League'``, ``"O'Higgins"``).
+
+    We:
+      1. require ``str`` type and bounded length;
+      2. reject characters that have no place in a literal we trust to inline
+         — control chars, NUL, semicolons, comment markers — even if Trino
+         would tolerate them;
+      3. double single quotes to produce a valid Trino string literal.
+    """
+    if not isinstance(value, str):
+        raise ValueError(
+            f"partition value for {key!r} must be str, got {type(value).__name__}"
+        )
+    if not value:
+        raise ValueError(f"partition value for {key!r} must be non-empty")
+    if len(value) > _MAX_PARTITION_VALUE_LEN:
+        raise ValueError(
+            f"partition value for {key!r} too long: "
+            f"{len(value)} chars (max {_MAX_PARTITION_VALUE_LEN})"
+        )
+    # Block characters that should never appear in a partition literal.
+    # NB: backslash is allowed (Trino does not interpret it specially in
+    # standard string literals when ``escape`` is unset), but control
+    # characters and SQL-comment / statement-terminator tokens are not.
+    if any(ch in value for ch in ('\x00', '\n', '\r', '\t', ';')):
+        raise ValueError(
+            f"partition value for {key!r} contains forbidden chars: {value!r}"
+        )
+    if '--' in value or '/*' in value or '*/' in value:
+        raise ValueError(
+            f"partition value for {key!r} contains SQL comment marker: {value!r}"
+        )
+    return value.replace("'", "''")
+
+
+def _build_partition_filter(
+    partition_keys: Tuple[str, ...],
+    partition_values: Tuple[str, ...],
+) -> str:
+    """Build a ``league = 'X' AND season = 'Y'`` predicate (no leading WHERE).
+
+    The leading WHERE is the caller's job: that way the same builder serves
+    both ``DELETE FROM t WHERE <pred>`` and ``... WHERE <pred>`` injection
+    into a SELECT body, and the sentinel replacement preserves the comment
+    line's leading whitespace.
+    """
+    if len(partition_keys) != len(partition_values):
+        raise ValueError(
+            f"partition_keys / values length mismatch: "
+            f"{len(partition_keys)} vs {len(partition_values)}"
+        )
+    parts: List[str] = []
+    for k, v in zip(partition_keys, partition_values):
+        _validate_identifier(k, "partition column")
+        parts.append(f"{k} = '{_safe_partition_value(v, k)}'")
+    return " AND ".join(parts)
+
+
+def _read_select_template(sql_file: str) -> str:
+    """Read the SELECT SQL template and verify the partition-filter sentinel.
+
+    The file MUST contain exactly one occurrence of
+    ``PARTITION_FILTER_SENTINEL`` — that is where the runner injects the
+    ``WHERE league=... AND season=...`` predicate. Zero occurrences is a
+    contract violation (caller is using the wrong runner or forgot the
+    marker); more than one is ambiguous and rejected for the same reason.
+    """
+    sql_path = _resolve_sql_path(sql_file)
+    text = sql_path.read_text(encoding='utf-8').strip()
+    if not text:
+        raise ValueError(f"SQL file is empty: {sql_path}")
+    if text.endswith(';'):
+        text = text[:-1].rstrip()
+    occurrences = text.count(PARTITION_FILTER_SENTINEL)
+    if occurrences == 0:
+        raise ValueError(
+            f"SQL file {sql_path} must contain the sentinel "
+            f"{PARTITION_FILTER_SENTINEL!r} where the WHERE-clause should be "
+            f"injected. Place it on a line by itself, e.g.:\n"
+            f"  -- ... your SELECT body ...\n"
+            f"  {PARTITION_FILTER_SENTINEL}\n"
+        )
+    if occurrences > 1:
+        raise ValueError(
+            f"SQL file {sql_path} contains {occurrences} occurrences of "
+            f"{PARTITION_FILTER_SENTINEL!r}; expected exactly one."
+        )
+    return text
+
+
+def _read_ddl(ddl_file: str) -> str:
+    """Read the DDL file (CREATE TABLE IF NOT EXISTS ...) verbatim.
+
+    The DDL is run once at the top of the sweep. It MUST be idempotent
+    (``IF NOT EXISTS``) — if the table is already there the statement is
+    a Trino no-op. Trailing semicolons stripped to keep ``_execute()``
+    happy (the trino-python client expects a single statement per call).
+    """
+    sql_path = _resolve_sql_path(ddl_file)
+    text = sql_path.read_text(encoding='utf-8').strip()
+    if not text:
+        raise ValueError(f"DDL file is empty: {sql_path}")
+    if text.endswith(';'):
+        text = text[:-1].rstrip()
+    upper = text.upper()
+    if 'CREATE TABLE' not in upper or 'IF NOT EXISTS' not in upper:
+        raise ValueError(
+            f"DDL file {sql_path} must contain 'CREATE TABLE ... IF NOT EXISTS' "
+            f"to remain idempotent across reruns."
+        )
+    return text
+
+
+def run_gold_partition_inserts(
+    *,
+    sql_file: str,
+    table_name: str,
+    ddl_file: str,
+    partitions: List[Tuple[str, str]],
+    partition_keys: Tuple[str, ...] = ('league', 'season'),
+    skip_existing: bool = False,
+    per_partition_checks: Optional[List[Any]] = None,
+    raise_on_partition_failure: bool = True,
+    start_from_partition: Optional[Tuple[str, str]] = None,
+    catalog: str = 'iceberg',
+    schema: str = 'gold',
+) -> Dict[str, Any]:
+    """Idempotent per-partition INSERT runner for backfills and multi-competition.
+
+    This is the **opt-in** Gold runner used by E3.5 (3 historical APL seasons
+    backfill) and E8 (multi-competition expansion). For the default E3 path
+    (``APL/2526`` only), use ``run_gold_transform`` — DROP+CTAS is faster and
+    atomic at the table level.
+
+    Flow per partition (key1, key2[, ...]):
+
+      1. **Idempotency** — ``DELETE FROM gold.{table} WHERE <partition_filter>``
+         removes any prior data for these partition keys. Iceberg supports
+         row-level deletes on partition columns; the operation is metadata-only
+         when the predicate aligns with the partitioning spec.
+      2. **INSERT** — ``INSERT INTO gold.{table} SELECT ... WHERE <partition_filter>``
+         The SELECT body is taken from ``sql_file`` with the
+         ``PARTITION_FILTER_SENTINEL`` comment replaced by the concrete
+         WHERE-predicate.
+      3. **Per-partition DQ** — if ``per_partition_checks`` is provided, the
+         checks are run against the freshly inserted partition. Any
+         ERROR-severity failure triggers a rollback (re-DELETE) of the
+         partition; the sweep then either aborts (default) or skips to the
+         next partition (``raise_on_partition_failure=False``).
+
+    The DDL file is executed **once** at the top of the sweep with
+    ``IF NOT EXISTS`` semantics — establishes the empty Iceberg table with
+    correct schema + partitioning if not already present, otherwise no-op.
+
+    SQL template contract
+    ---------------------
+    The SELECT-side ``sql_file`` must contain exactly one occurrence of the
+    sentinel comment ``-- WHERE_PARTITION_FILTER_HERE`` (see
+    ``PARTITION_FILTER_SENTINEL``) on a line by itself. At execute time the
+    runner replaces it with the concrete predicate, e.g.::
+
+        SELECT ... FROM iceberg.silver.fct_event
+        -- WHERE_PARTITION_FILTER_HERE        <-- becomes:
+        WHERE league = 'ENG-Premier League' AND season = '2324'
+
+    Parameters
+    ----------
+    sql_file : str
+        Path to the SELECT-only SQL file (containing the sentinel).
+    table_name : str
+        Target Gold table name (e.g. ``'fct_event'``).
+    ddl_file : str
+        Path to the ``CREATE TABLE IF NOT EXISTS`` statement.
+    partitions : List[Tuple[str, str]]
+        Ordered list of (key1, key2, ...) tuples to process. Tuple arity
+        must match ``partition_keys``.
+    partition_keys : Tuple[str, ...]
+        Identifier names of the partitioning columns (default
+        ``('league', 'season')``).
+    skip_existing : bool, default False
+        If True, skip partitions that already have rows in the target.
+        Used for resume-without-overwrite semantics.
+    per_partition_checks : Optional[List[Check]]
+        Universal-DQ checks to run after each partition's INSERT. ERRORs
+        trigger rollback of *that* partition.
+    raise_on_partition_failure : bool, default True
+        If True, the first failed partition aborts the sweep and re-raises.
+        If False, the runner logs the failure, records it in the result and
+        continues with the next partition (best-effort backfill mode).
+    start_from_partition : Optional[Tuple[str, str]]
+        If set, all partitions up to and INCLUDING this tuple are skipped.
+        Resume semantics: "this partition was already completed, start
+        AFTER it". Useful for re-running a backfill that died midway.
+    catalog : str, default 'iceberg'
+    schema : str, default 'gold'
+
+    Returns
+    -------
+    Dict[str, Any]
+        ``{
+            'partitions_processed': int,
+            'partitions_skipped': List[Tuple],
+            'partitions_failed': List[Tuple],
+            'total_rows_inserted': int,
+            'duration_per_partition': List[float],
+            'status': 'success' | 'partial' | 'failed',
+        }``
+
+    Raises
+    ------
+    AirflowException / RuntimeError
+        On per-partition DQ ERROR if ``raise_on_partition_failure=True``,
+        or on Trino-level execution failures (which are always fatal —
+        they indicate connectivity / permission problems, not data issues).
+    """
+    # ---- Argument validation up front ------------------------------------
+    _validate_identifier(catalog, "catalog")
+    _validate_identifier(schema, "schema")
+    _validate_identifier(table_name, "table")
+    if not partition_keys:
+        raise ValueError("partition_keys must be a non-empty tuple")
+    for pk in partition_keys:
+        _validate_identifier(pk, "partition column")
+    if not partitions:
+        raise ValueError("partitions list is empty — nothing to do")
+    arity = len(partition_keys)
+    for p in partitions:
+        if not isinstance(p, tuple) or len(p) != arity:
+            raise ValueError(
+                f"each partition must be a tuple of length {arity} "
+                f"(matching partition_keys), got {p!r}"
+            )
+
+    full_table = f"{catalog}.{schema}.{table_name}"
+
+    # Read templates BEFORE opening the connection — fail fast on bad files.
+    select_template = _read_select_template(sql_file)
+    ddl_sql = _read_ddl(ddl_file)
+
+    # ---- Resume logic ----------------------------------------------------
+    # Start AFTER the named partition (exclusive). If it isn't in the list
+    # we treat that as a hard error — the caller is asking to resume from
+    # a partition that wasn't queued, almost certainly a bug.
+    work: List[Tuple[str, ...]] = list(partitions)
+    if start_from_partition is not None:
+        try:
+            idx = work.index(tuple(start_from_partition))
+        except ValueError:
+            raise ValueError(
+                f"start_from_partition={start_from_partition!r} not present in "
+                f"partitions list (cannot resume after an unknown partition)"
+            )
+        skipped_resume = work[: idx + 1]
+        work = work[idx + 1:]
+        logger.info(
+            "Resume mode: skipping %d partition(s) up to and including %r",
+            len(skipped_resume), start_from_partition,
+        )
+
+    # ---- Result accumulator ---------------------------------------------
+    result: Dict[str, Any] = {
+        'partitions_processed': 0,
+        'partitions_skipped': [],
+        'partitions_failed': [],
+        'total_rows_inserted': 0,
+        'duration_per_partition': [],
+        'status': 'pending',
+    }
+
+    conn = _get_trino_connection(catalog=catalog)
+    try:
+        # ---- 1. Ensure schema + table exist (idempotent) ----------------
+        _execute(conn, f"CREATE SCHEMA IF NOT EXISTS {catalog}.{schema}")
+        logger.info("Schema ensured: %s.%s", catalog, schema)
+        logger.info("Running DDL (idempotent IF NOT EXISTS): %s", ddl_file)
+        _execute(conn, ddl_sql)
+
+        # ---- 2. Iterate partitions --------------------------------------
+        for partition in work:
+            t0 = time.monotonic()
+            partition_filter = _build_partition_filter(partition_keys, partition)
+            partition_label = ", ".join(
+                f"{k}={v!r}" for k, v in zip(partition_keys, partition)
+            )
+            logger.info("=== Partition %s ===", partition_label)
+
+            try:
+                # 2a. skip_existing — bail out if data already there.
+                if skip_existing:
+                    cnt_sql = (
+                        f"SELECT COUNT(*) FROM {full_table} WHERE {partition_filter}"
+                    )
+                    rows = _execute(conn, cnt_sql, fetch=True)
+                    existing = rows[0][0] if rows else 0
+                    if existing > 0:
+                        logger.info(
+                            "skip_existing=True and partition already has "
+                            "%d rows — skipping", existing,
+                        )
+                        result['partitions_skipped'].append(partition)
+                        result['duration_per_partition'].append(
+                            time.monotonic() - t0
+                        )
+                        continue
+
+                # 2b. Idempotency DELETE — wipe any prior rows for this key.
+                delete_sql = f"DELETE FROM {full_table} WHERE {partition_filter}"
+                logger.info("DELETE (idempotency): %s", delete_sql)
+                _execute(conn, delete_sql)
+
+                # 2c. INSERT INTO ... SELECT (with sentinel replaced).
+                where_clause = f"WHERE {partition_filter}"
+                select_sql = select_template.replace(
+                    PARTITION_FILTER_SENTINEL, where_clause
+                )
+                insert_sql = f"INSERT INTO {full_table}\n{select_sql}"
+                logger.info("INSERT into %s for %s", full_table, partition_label)
+                _execute(conn, insert_sql)
+
+                # 2d. Row-count after insert (observability + return value).
+                rows = _execute(
+                    conn,
+                    f"SELECT COUNT(*) FROM {full_table} WHERE {partition_filter}",
+                    fetch=True,
+                )
+                inserted = rows[0][0] if rows else 0
+                logger.info(
+                    "Partition %s inserted: %d row(s)", partition_label, inserted,
+                )
+
+                # 2e. Per-partition DQ (if requested).
+                if per_partition_checks:
+                    dq_failed = _run_partition_dq(
+                        per_partition_checks, partition_label,
+                    )
+                    if dq_failed:
+                        # Rollback this partition — re-DELETE so the table
+                        # never carries data that failed validation.
+                        logger.error(
+                            "Per-partition DQ failed for %s — rolling back",
+                            partition_label,
+                        )
+                        _execute(conn, delete_sql)
+                        raise RuntimeError(
+                            f"Per-partition DQ ERROR for {partition_label}: "
+                            + "; ".join(dq_failed)
+                        )
+
+                result['partitions_processed'] += 1
+                result['total_rows_inserted'] += int(inserted)
+                result['duration_per_partition'].append(time.monotonic() - t0)
+
+            except Exception as e:
+                duration = time.monotonic() - t0
+                result['duration_per_partition'].append(duration)
+                result['partitions_failed'].append(partition)
+                logger.error(
+                    "Partition %s FAILED after %.2fs: %s",
+                    partition_label, duration, e,
+                )
+                if raise_on_partition_failure:
+                    result['status'] = 'failed'
+                    raise
+                # Best-effort: continue with the next partition.
+                continue
+
+        # All partitions handled.
+        if result['partitions_failed']:
+            result['status'] = 'partial'
+        else:
+            result['status'] = 'success'
+
+    finally:
+        conn.close()
+
+    logger.info(
+        "Per-partition INSERT done: %d processed, %d skipped, %d failed, "
+        "%d total rows.",
+        result['partitions_processed'],
+        len(result['partitions_skipped']),
+        len(result['partitions_failed']),
+        result['total_rows_inserted'],
+    )
+    return result
+
+
+# ---------------------------------------------------------------------------
+# E3.5: wrapper-style per-partition INSERT (no sentinel required)
+# ---------------------------------------------------------------------------
+#
+# DESIGN
+# ------
+# ``run_gold_partition_inserts`` (above) requires the SQL file to contain
+# the ``-- WHERE_PARTITION_FILTER_HERE`` sentinel — letting Trino push the
+# predicate INSIDE the SELECT body. That gives the best partition pruning
+# but requires every Gold SQL to be aware of it.
+#
+# ``run_gold_partition_insert_wrapped`` (this function) is the unblocked
+# alternative: it wraps the *original* SELECT verbatim as
+# ``SELECT * FROM (<orig>) AS __src WHERE league=... AND season=...`` and
+# inserts that. ZERO modification of the SQL files needed. Trino's
+# optimiser usually pushes the partition predicate down past the outer
+# wrapper anyway (verified for fct_event/fct_shot/fct_lineup); the
+# performance delta vs the sentinel path is small for E3 backfill scale.
+#
+# Both runners produce identical idempotency semantics (DELETE-then-INSERT).
+# Use the sentinel path for huge-scale repeated backfills (E8 multi-comp);
+# use the wrapper path for E3.5 (3 historical APL seasons).
+
+
+def run_gold_partition_insert_wrapped(
+    sql_file: str,
+    table_name: str,
+    partition_values: Dict[str, str],
+    partition_columns: Optional[List[str]] = None,
+    catalog: str = 'iceberg',
+    schema: str = 'gold',
+    add_timestamp: bool = True,
+) -> Dict[str, Any]:
+    """Idempotent per-partition INSERT for a Gold table (wrapper-style).
+
+    Sister of ``run_gold_partition_inserts`` that does NOT require the
+    SQL file to carry the ``-- WHERE_PARTITION_FILTER_HERE`` sentinel.
+    Wraps the original SELECT verbatim as
+    ``SELECT * FROM (<orig>) WHERE league=... AND season=...``.
+
+    Used by ``dag_e3_backfill`` to materialise a single (league, season)
+    slice of ``gold.fct_event`` / ``gold.fct_shot`` / ``gold.fct_lineup``
+    without touching other partitions.
+
+    Flow:
+      1. CREATE SCHEMA IF NOT EXISTS — idempotent.
+      2. If target table doesn't exist, bootstrap via a partition-scoped
+         CTAS so the runner always has a target to INSERT into.
+      3. DELETE FROM <table> WHERE <partition_filter>  — idempotency.
+      4. INSERT INTO <table>
+           SELECT *, CURRENT_TIMESTAMP AS _silver_created_at
+             FROM (<orig SELECT>) AS __src
+            WHERE <partition_filter>
+      5. Return row count for the partition.
+
+    Idempotency
+    -----------
+    Re-running this function for the same (league, season) tuple produces
+    the same final state (DELETE-then-INSERT). Failure mid-flight leaves
+    the partition in an unknown state — caller is expected to retry the
+    same task.
+
+    Parameters
+    ----------
+    sql_file : str
+        Path to the SELECT-only SQL file.
+    table_name : str
+        Target Gold table (e.g. 'fct_event').
+    partition_values : Dict[str, str]
+        Concrete values for partition columns,
+        e.g. ``{'league': 'ENG-Premier League', 'season': '2324'}``.
+    partition_columns : Optional[List[str]]
+        Partition column names (default ``['league', 'season']``).
+    catalog, schema : str
+        Iceberg target (default 'iceberg' / 'gold').
+    add_timestamp : bool
+        Append ``CURRENT_TIMESTAMP AS _silver_created_at`` to the wrapped
+        SELECT (default True — matches the production E3 behaviour).
+    """
+    from utils.silver_tasks import (
+        _build_silver_partition_filter,
+        _execute,
+        _get_trino_connection,
+        _resolve_sql_path,
+        _validate_identifier,
+    )
+
+    if partition_columns is None:
+        partition_columns = ['league', 'season']
+
+    _validate_identifier(catalog, "catalog")
+    _validate_identifier(schema, "schema")
+    _validate_identifier(table_name, "table")
+    for pc in partition_columns:
+        _validate_identifier(pc, "partition column")
+
+    if set(partition_values.keys()) != set(partition_columns):
+        raise ValueError(
+            f"partition_values keys must equal partition_columns. "
+            f"Got keys={sorted(partition_values.keys())}, "
+            f"expected={sorted(partition_columns)}"
+        )
+
+    full_table = f"{catalog}.{schema}.{table_name}"
+    keys_ordered = list(partition_columns)
+    values_ordered = [partition_values[k] for k in keys_ordered]
+    partition_filter = _build_silver_partition_filter(keys_ordered, values_ordered)
+    partition_label = ", ".join(
+        f"{k}={v!r}" for k, v in zip(keys_ordered, values_ordered)
+    )
+
+    # Read SELECT body
+    sql_path = _resolve_sql_path(sql_file)
+    select_sql = sql_path.read_text(encoding='utf-8').strip()
+    if not select_sql:
+        raise ValueError(f"SQL file is empty: {sql_path}")
+    if select_sql.endswith(';'):
+        select_sql = select_sql[:-1].rstrip()
+
+    result: Dict[str, Any] = {
+        'table': full_table,
+        'partition': dict(partition_values),
+        'rows_inserted': 0,
+        'status': 'pending',
+        'bootstrap': False,
+    }
+
+    conn = _get_trino_connection(catalog=catalog)
+    try:
+        _execute(conn, f"CREATE SCHEMA IF NOT EXISTS {catalog}.{schema}")
+
+        exists_rows = _execute(
+            conn,
+            f"SHOW TABLES FROM {catalog}.{schema} LIKE '{table_name}'",
+            fetch=True,
+        )
+        target_exists = bool(exists_rows and len(exists_rows) > 0)
+
+        if not target_exists:
+            logger.warning(
+                "%s does not exist — bootstrapping via partition-scoped CTAS (%s).",
+                full_table, partition_label,
+            )
+            wrapped = (
+                f"SELECT * FROM (\n{select_sql}\n) AS __src\n"
+                f"WHERE {partition_filter}"
+            )
+            partition_clause = ''
+            if partition_columns:
+                cols = ", ".join(f"'{c}'" for c in partition_columns)
+                partition_clause = f"WITH (partitioning = ARRAY[{cols}])\n"
+            if add_timestamp:
+                ctas_sql = (
+                    f"CREATE TABLE {full_table}\n"
+                    f"{partition_clause}"
+                    f"AS\n"
+                    f"SELECT *, CURRENT_TIMESTAMP AS _silver_created_at\n"
+                    f"FROM (\n{wrapped}\n)"
+                )
+            else:
+                ctas_sql = (
+                    f"CREATE TABLE {full_table}\n"
+                    f"{partition_clause}"
+                    f"AS\n"
+                    f"{wrapped}"
+                )
+            logger.info("Bootstrap CTAS for %s [%s]", full_table, partition_label)
+            _execute(conn, ctas_sql)
+            result['bootstrap'] = True
+        else:
+            delete_sql = f"DELETE FROM {full_table} WHERE {partition_filter}"
+            logger.info("DELETE (idempotency): %s", delete_sql)
+            _execute(conn, delete_sql)
+
+            wrapped = (
+                f"SELECT * FROM (\n{select_sql}\n) AS __src\n"
+                f"WHERE {partition_filter}"
+            )
+            if add_timestamp:
+                insert_select = (
+                    f"SELECT *, CURRENT_TIMESTAMP AS _silver_created_at "
+                    f"FROM (\n{wrapped}\n) AS __src_ts"
+                )
+            else:
+                insert_select = wrapped
+            insert_sql = f"INSERT INTO {full_table}\n{insert_select}"
+            logger.info("INSERT into %s for %s", full_table, partition_label)
+            _execute(conn, insert_sql)
+
+        cnt_rows = _execute(
+            conn,
+            f"SELECT COUNT(*) FROM {full_table} WHERE {partition_filter}",
+            fetch=True,
+        )
+        rows_inserted = cnt_rows[0][0] if cnt_rows else 0
+        result['rows_inserted'] = int(rows_inserted)
+        result['status'] = 'success'
+        logger.info(
+            "Gold partition INSERT done: %s [%s] => %d rows",
+            full_table, partition_label, rows_inserted,
+        )
+
+    except Exception as e:
+        result['status'] = 'failed'
+        result['error'] = str(e)
+        logger.error(
+            "Gold partition INSERT FAILED for %s [%s]: %s",
+            full_table, partition_label, e,
+        )
+        raise RuntimeError(
+            f"Gold partition INSERT failed for {full_table} [{partition_label}]: {e}"
+        ) from e
+    finally:
+        conn.close()
+
+    return result
+
+
+def _run_partition_dq(
+    checks: List[Any],
+    partition_label: str,
+) -> List[str]:
+    """Run the supplied DQ checks; return a list of ERROR-severity failure
+    descriptions (empty list = all good).
+
+    Each check is expected to be a ``utils.data_quality.Check`` instance.
+    The function intentionally swallows the ``run_checks`` raise (we pass
+    ``raise_on_error=False``) so that the caller can perform a
+    rollback DELETE before re-raising — losing the chance to clean up
+    would defeat the per-partition atomicity guarantee.
+    """
+    from utils.data_quality import run_checks
+
+    report = run_checks(checks, raise_on_error=False)
+    logger.info(
+        "Per-partition DQ for %s: %s", partition_label, report.summary(),
+    )
+    if not report.errors:
+        return []
+    return [f"{r.name}: {r.details or r.error}" for r in report.errors]
 
 
 def _append_train_test_disjointness_check(report) -> None:
@@ -515,6 +1240,113 @@ def validate_gold_quality() -> Dict[str, Any]:
         ),
 
         # ============================================================
+        # E6 / W2: feat_referee_bias — referee rolling stats over L10 matches
+        # (within season). PK (referee_id, match_id), partition (season).
+        # Mirrors the feat_team_form block: PK uniqueness + no_nulls on keys
+        # + ref_integrity to dim_match + point-in-time leakage guard for every
+        # registered rolling column + WARNING-severity domain bounds.
+        # ============================================================
+
+        # ----- E6: row-count soft floor — WARNING -----
+        # 5 seasons × ~30 matches/season × ~25 ref-season rows ≈ 100 floor.
+        # WARNING (not ERROR) — historical seasons may not all be backfilled
+        # in MVP environments.
+        CHECK.row_count('gold.feat_referee_bias', min_rows=100,
+                        severity='WARNING'),
+
+        # ----- E6: PK uniqueness — ERROR -----
+        CHECK.no_duplicates('gold.feat_referee_bias',
+                            pk=['referee_id', 'match_id']),
+
+        # ----- E6: NOT NULL on PKs + temporal/partition keys — ERROR -----
+        CHECK.no_nulls('gold.feat_referee_bias',
+                       cols=['referee_id', 'match_id', 'date', 'season']),
+
+        # ----- E6: ref_integrity feat_referee_bias.match_id → dim_match — ERROR -----
+        CHECK.ref_integrity('gold.feat_referee_bias',
+                            'gold.dim_match', 'match_id'),
+
+        # ----- E6: point-in-time leakage guard — ERROR -----
+        # SQL masks rolling cols at ref_match_rn > 5 within (referee_id, season).
+        # Same skip_first_n=5 contract as the other feat_* tables: leakage
+        # triggers DQ failure before Gold ships features to the model.
+        *(
+            CHECK.point_in_time(
+                'gold.feat_referee_bias',
+                feature_col=col,
+                partition_by=['referee_id', 'season'],
+                order_by='date',
+                skip_first_n=5,
+            )
+            for col in FEAT_REFEREE_BIAS_ROLLING_COLS
+        ),
+
+        # ----- E6: value-range sanity (WARNING) -----
+        # Domain heuristics for APL referees (single-match upper bounds across
+        # rolling L10 averages). Tight enough to catch Bronze parser
+        # regressions but loose enough not to flag legitimate outliers.
+        CHECK.value_range('gold.feat_referee_bias', 'ref_yellow_per_match_l10',
+                          min_val=0, max_val=6, severity='WARNING'),
+        CHECK.value_range('gold.feat_referee_bias', 'ref_red_per_match_l10',
+                          min_val=0, max_val=1, severity='WARNING'),
+        CHECK.value_range('gold.feat_referee_bias', 'ref_cards_per_match_l10',
+                          min_val=0, max_val=8, severity='WARNING'),
+        CHECK.value_range('gold.feat_referee_bias', 'ref_home_win_rate_l10',
+                          min_val=0, max_val=1, severity='WARNING'),
+
+        # ============================================================
+        # E6 / W3: feat_team_event_style — share/rate metrics from
+        # whoscored_events_spadl, rolling L5 within (team_id, season).
+        # PK (match_id, team_id), partition (league, season). Mirrors
+        # feat_team_form block; all columns are bounded in [0, 1].
+        # ============================================================
+
+        # ----- E6: row-count soft floor — WARNING -----
+        # ~380 APL matches × 2 teams/match × 5 seasons / sparse coverage ≈
+        # 1000 floor for the rolling (post-mask) population.
+        CHECK.row_count('gold.feat_team_event_style', min_rows=1000,
+                        severity='WARNING'),
+
+        # ----- E6: PK uniqueness — ERROR -----
+        CHECK.no_duplicates('gold.feat_team_event_style',
+                            pk=['match_id', 'team_id']),
+
+        # ----- E6: NOT NULL on PKs + temporal/partition keys — ERROR -----
+        CHECK.no_nulls('gold.feat_team_event_style',
+                       cols=['match_id', 'team_id', 'date', 'season']),
+
+        # ----- E6: ref_integrity feat_team_event_style.match_id → dim_match — ERROR -----
+        CHECK.ref_integrity('gold.feat_team_event_style',
+                            'gold.dim_match', 'match_id'),
+
+        # ----- E6: point-in-time leakage guard — ERROR -----
+        # SQL masks rolling cols at match_rn > 5 within (team_id, season).
+        *(
+            CHECK.point_in_time(
+                'gold.feat_team_event_style',
+                feature_col=col,
+                partition_by=['team_id', 'season'],
+                order_by='date',
+                skip_first_n=5,
+            )
+            for col in FEAT_TEAM_EVENT_STYLE_ROLLING_COLS
+        ),
+
+        # ----- E6: value-range sanity (WARNING) -----
+        # All columns are shares (fraction of team's actions of given type)
+        # or success_rate (share of successful actions). Hard bound [0, 1]
+        # — anything outside indicates Silver SPADL parser regression.
+        *(
+            CHECK.value_range(
+                'gold.feat_team_event_style',
+                column=col,
+                min_val=0, max_val=1,
+                severity='WARNING',
+            )
+            for col in FEAT_TEAM_EVENT_STYLE_ROLLING_COLS
+        ),
+
+        # ============================================================
         # E2: master-data dims (dim_venue / dim_referee / dim_standings /
         # dim_competition / dim_season). Mirrors the existing dim_match /
         # dim_team / dim_player block but adapted to the E2 PK shapes and
@@ -694,6 +1526,91 @@ def validate_predictions_input() -> Dict[str, Any]:
     }
 
 
+def validate_predictions_input_v2() -> Dict[str, Any]:
+    """E6 / T4.2-v2 — DQ check on the dual-run v2 predictions snapshot.
+
+    Mirrors :func:`validate_predictions_input` but adds a schema-parity check
+    against ``fct_match_train`` / ``fct_match_test`` so the inference snapshot
+    cannot drift away from the feature contract used at training time. Drift
+    in column set or types is a silent killer for the model — a NEW column
+    introduced in train but missing from predictions_input_v2 means the
+    serve-side pipeline imputes ``NULL`` and quietly degrades predictions.
+
+    The set of columns that legitimately differ between the three tables is
+    enumerated explicitly:
+
+    * ``_silver_created_at`` — every Gold table stamps its own load time;
+    * targets present only in train/test snapshots (``home_score``,
+      ``away_score``, ``result_1x2``, ``total_goals``, ``btts``,
+      ``is_completed``, plus the derived classification labels); these are
+      not knowable for an upcoming fixture so predictions_input_v2 omits
+      them by design.
+
+    The ``CHECK.schema_parity`` primitive itself is added in W5b. If this
+    function is invoked before W5b lands, ``run_checks`` will surface a
+    clear ImportError / AttributeError — picked up by W8 unit tests + W9
+    verification, fail-loud-and-early as designed.
+    """
+    from utils.alerts import telegram_dq_summary
+    from utils.data_quality import CHECK, run_checks
+
+    checks = [
+        # ===== ERROR: PK + critical keys =====
+        CHECK.no_duplicates('gold.predictions_input_v2', pk=['match_id']),
+        CHECK.no_nulls(
+            'gold.predictions_input_v2',
+            cols=['match_id', 'date', 'season',
+                  'home_team_id', 'away_team_id'],
+        ),
+
+        # ===== WARNING: row count =====
+        # Empty week is plausible (international break, off-season). min_rows=0
+        # so a fixture-less window passes; cutoff stays in the WARNING freshness
+        # check instead of paging on-call.
+        CHECK.row_count('gold.predictions_input_v2', min_rows=0,
+                        severity='WARNING'),
+
+        # ===== ERROR: schema parity vs train/test =====
+        # train/test/predictions_input_v2 must share the same feature surface
+        # (modulo targets, which serve-time data cannot have). Drift here =
+        # silent prediction degradation.
+        CHECK.schema_parity(
+            tables=['gold.fct_match_train',
+                    'gold.fct_match_test',
+                    'gold.predictions_input_v2'],
+            ignore_cols=[
+                # Per-table load timestamp — not part of the feature contract.
+                '_silver_created_at',
+                # Match-outcome columns — known only after the match is played,
+                # so predictions_input_v2 (upcoming fixtures) has no values.
+                'home_score', 'away_score', 'result_1x2', 'total_goals',
+                'btts', 'is_completed',
+                # Derived classification targets present only in train/test.
+                'over_2_5', 'over_3_5', 'home_win', 'draw', 'away_win',
+            ],
+            severity='ERROR',
+        ),
+    ]
+
+    report = run_checks(checks, raise_on_error=False)
+    logger.info(f"Predictions input v2 DQ: {report.summary()}")
+    telegram_dq_summary(report, header="Predictions v2 DQ")
+
+    if report.errors:
+        from airflow.exceptions import AirflowException
+        raise AirflowException(
+            f"Predictions input v2 DQ failed: {len(report.errors)} error(s). "
+            + "; ".join(f"{r.name}: {r.details or r.error}" for r in report.errors[:5])
+        )
+
+    return {
+        'passed': len(report.passed),
+        'total': len(report.results),
+        'errors': [r.name for r in report.errors],
+        'warnings': [r.name for r in report.warnings],
+    }
+
+
 def count_predictions_input() -> Dict[str, Any]:
     """T4.2: log the inference snapshot row count for observability.
 
@@ -774,6 +1691,18 @@ def validate_gold_row_counts() -> Dict[str, Any]:
         # dim_season: derived from SEASONS list — currently 5 seasons in
         # rotation. Same drift-detection contract as dim_competition.
         CHECK.row_count('gold.dim_season',      min_rows=5, max_rows=5),
+
+        # ===== E7: dashboard mart row-count floors =====
+        # mart_scouting_radar: ≥800 player-season radars (FBref-only APL,
+        # ~1000-2000/season after MIN_MINUTES filter; floor stays generous).
+        CHECK.row_count('gold.mart_scouting_radar',    min_rows=800),
+        # mart_referee_dashboard: ≥40 referee-season rows (~30 active EPL
+        # refs across 9+ seasons of history easily clears 40).
+        CHECK.row_count('gold.mart_referee_dashboard', min_rows=40),
+        # mart_event_heatmap: ≥80 (zone, action_canonical, league, season)
+        # buckets. WhoScored events cover only the recent seasons; floor
+        # tuned to a single season's worth of populated cells.
+        CHECK.row_count('gold.mart_event_heatmap',     min_rows=80),
     ]
     report = run_checks(checks, raise_on_error=False)
     logger.info(f"Gold row counts: {report.summary()}")

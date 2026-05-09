@@ -53,6 +53,8 @@ Gold Tables
 - ``gold.feat_team_xg_form``  — rolling team xG / PSxG (L5 + L10, point-in-time safe)
 - ``gold.feat_team_h2h``      — rolling head-to-head (last 5)
 - ``gold.feat_player_form``   — rolling player form (last 5)
+- ``gold.feat_referee_bias``  — rolling referee bias (cards/pens per match, L10/L20; E6)
+- ``gold.feat_team_event_style`` — rolling team event-style profile from SPADL (L5; E6)
 - ``gold.fct_match_train``    — ML train split (earliest ~80% completed per season)
 - ``gold.fct_match_test``     — ML test split (latest ~20% completed per season)
 """
@@ -142,6 +144,25 @@ STAGE_4_FEATS = [
     ('feat_team_xg_form', 'dags/sql/gold/feat_team_xg_form.sql', 'feat_team_xg_form', ['league', 'season']),
     ('feat_team_h2h',     'dags/sql/gold/feat_team_h2h.sql',     'feat_team_h2h',     ['league', 'season']),
     ('feat_player_form',  'dags/sql/gold/feat_player_form.sql',  'feat_player_form',  ['league', 'season']),
+    # E6 W6: referee-bias rolling features. Reads ONLY gold tables
+    # (dim_match.referee + fct_card / fct_goal); has no Silver dependency, so
+    # it is intentionally NOT registered in STAGE_4_FALLBACKS — the
+    # *_empty.sql exists on disk as a manual safety-net for the rare case
+    # where dim_match.referee is wholly empty, but the runner never reaches
+    # for it automatically. Partitioned by season only (referee identity
+    # crosses leagues, so a per-league partition would shard each ref's
+    # rolling window).
+    ('feat_referee_bias',
+     'dags/sql/gold/feat_referee_bias.sql',
+     'feat_referee_bias',
+     ['season']),
+    # E6 W6: team event-style rolling features. Reads
+    # silver.whoscored_events_spadl (optional Silver source — falls back to
+    # feat_team_event_style_empty.sql when whoscored Silver is absent).
+    ('feat_team_event_style',
+     'dags/sql/gold/feat_team_event_style.sql',
+     'feat_team_event_style',
+     ['league', 'season']),
 ]
 
 # Tables in STAGE_4 that depend on optional Silver sources. When the listed
@@ -151,6 +172,10 @@ STAGE_4_FALLBACKS = {
     'feat_team_xg_form': {
         'fallback_sql_file': 'dags/sql/gold/feat_team_xg_form_empty.sql',
         'require_silver':    ['fbref_shot_events'],
+    },
+    'feat_team_event_style': {
+        'fallback_sql_file': 'dags/sql/gold/feat_team_event_style_empty.sql',
+        'require_silver':    ['whoscored_events_spadl'],
     },
 }
 
@@ -163,6 +188,37 @@ STAGE_5_MARTS = [
 STAGE_6_ML_SPLITS = [
     ('fct_match_train', 'dags/sql/gold/fct_match_train.sql', 'fct_match_train', ['season']),
     ('fct_match_test',  'dags/sql/gold/fct_match_test.sql',  'fct_match_test',  ['season']),
+]
+
+# E7 T3: BI / dashboard-facing marts. Sit AFTER all dims/facts/features
+# because they cross-join Gold facts (fct_shot, fct_event, fct_card,
+# fct_goal, fct_player_match, dim_match, dim_player, dim_team, dim_referee).
+# E3/E4 facts (fct_shot/event/card/goal) are produced by sister DAGs
+# (dag_transform_e3, dag_transform_e4) which the master pipeline runs
+# *before* dag_transform_fbref_gold — so by the time STAGE_7 fires they
+# are guaranteed present. Each mart has an `_empty.sql` fallback for
+# environments missing the underlying Silver source (e.g. WhoScored
+# events for the heatmap).
+STAGE_7_DASHBOARD_MARTS = [
+    # (task_id, sql_file, table_name, partition_cols, fallback_sql, require_silver)
+    ('mart_scouting_radar',
+     'dags/sql/gold/mart_scouting_radar.sql',
+     'mart_scouting_radar',
+     ['league', 'season'],
+     'dags/sql/gold/mart_scouting_radar_empty.sql',
+     ['fbref_shot_events']),
+    ('mart_referee_dashboard',
+     'dags/sql/gold/mart_referee_dashboard.sql',
+     'mart_referee_dashboard',
+     ['season'],
+     'dags/sql/gold/mart_referee_dashboard_empty.sql',
+     None),
+    ('mart_event_heatmap',
+     'dags/sql/gold/mart_event_heatmap.sql',
+     'mart_event_heatmap',
+     ['league', 'season'],
+     'dags/sql/gold/mart_event_heatmap_empty.sql',
+     ['whoscored_events_spadl']),
 ]
 
 
@@ -337,6 +393,25 @@ with DAG(
                            'partition_cols': pcols, 'add_timestamp': False},
             )
 
+    # Stage 7: dashboard-facing marts (E7). Built last because they read
+    # cross-cutting Gold facts (incl. E3/E4 outputs from sister DAGs).
+    with TaskGroup(group_id='s7_dashboard_marts') as g7:
+        for task_id, sql_file, table_name, pcols, fb_sql, req_silver in STAGE_7_DASHBOARD_MARTS:
+            kwargs = {
+                'sql_file': sql_file,
+                'table_name': table_name,
+                'partition_cols': pcols,
+            }
+            if fb_sql:
+                kwargs['fallback_sql_file'] = fb_sql
+            if req_silver:
+                kwargs['require_silver'] = req_silver
+            PythonOperator(
+                task_id=task_id,
+                python_callable=_run_transform,
+                op_kwargs=kwargs,
+            )
+
     validate_row_counts = PythonOperator(
         task_id='validate_gold_row_counts',
         python_callable=_row_counts,
@@ -347,4 +422,4 @@ with DAG(
         python_callable=_quality,
     )
 
-    g1 >> g2 >> g2b >> g3 >> g4 >> g5 >> g6 >> validate_row_counts >> validate_quality
+    g1 >> g2 >> g2b >> g3 >> g4 >> g5 >> g6 >> g7 >> validate_row_counts >> validate_quality
