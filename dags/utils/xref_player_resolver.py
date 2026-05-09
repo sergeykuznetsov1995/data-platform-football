@@ -211,12 +211,16 @@ def canonical_team_for_resolver(
 # Spine index + cascade
 # ---------------------------------------------------------------------------
 class _FBrefSpine:
-    """In-memory FBref player index, keyed by canonical team.
+    """In-memory FBref player index, keyed by (season, canonical team).
 
     Two lookup paths:
-      * ``by_id``       — exact match on FBref ``player_id``.
+      * ``by_id``       — exact match on FBref ``player_id`` (season-agnostic;
+        first-seen row wins, since canonical_id is per-player not per-season).
       * ``by_team``     — list of (normalized_name, player_id) pairs per
-        canonical team, used for fuzzy lookup within a team bucket.
+        ``(season, canonical_team)`` bucket. Multi-season: a player who
+        moved clubs (e.g. Cole Palmer Man City->Chelsea) appears in both
+        ``('2324', 'Manchester City')`` and ``('2425', 'Chelsea')`` buckets.
+      * ``norm_to_id``  — keyed by ``(name_norm, season, canonical_team)``.
     """
 
     __slots__ = ('by_id', 'by_team', 'norm_to_id')
@@ -225,19 +229,24 @@ class _FBrefSpine:
         # row keys: 'player_id', 'player_name', 'canonical_team' (already
         # canonicalised by caller — keeps cascade pure of YAML access).
         self.by_id: Dict[str, Dict[str, Any]] = {}
-        self.by_team: Dict[str, List[Tuple[str, str]]] = {}
-        self.norm_to_id: Dict[Tuple[str, str], str] = {}
+        self.by_team: Dict[Tuple[str, str], List[Tuple[str, str]]] = {}
+        self.norm_to_id: Dict[Tuple[str, str, str], str] = {}
 
         for row in fbref_rows:
             pid = row['player_id']
-            if not pid or pid in self.by_id:
+            if not pid:
                 continue
-            self.by_id[pid] = row
+            if pid not in self.by_id:
+                self.by_id[pid] = row
             team = row.get('canonical_team') or ''
+            season = row.get('season') or ''
             n = normalize_name(row.get('player_name'))
-            if team:
-                self.by_team.setdefault(team, []).append((n, pid))
-                self.norm_to_id[(n, team)] = pid
+            if team and season:
+                bucket = self.by_team.setdefault((season, team), [])
+                if any(b_pid == pid for _, b_pid in bucket):
+                    continue
+                bucket.append((n, pid))
+                self.norm_to_id[(n, season, team)] = pid
 
     def find_by_id(self, source_id: str) -> Optional[str]:
         """Tier-1: exact FBref player_id match."""
@@ -247,17 +256,18 @@ class _FBrefSpine:
         self,
         name: Optional[str],
         canonical_team: Optional[str],
+        season: Optional[str] = None,
     ) -> Tuple[Optional[str], float]:
-        """Tier-2: fuzzy name match within a canonical-team bucket.
+        """Tier-2: fuzzy name match within a (season, canonical-team) bucket.
 
         Returns ``(player_id, score)`` if best score ≥ :data:`NAME_THRESHOLD`,
         else ``(None, best_score_seen)`` — the raw best score is preserved
         so orphan rows can still record "we tried, here's how close it got"
         for downstream debugging.
         """
-        if not canonical_team:
+        if not canonical_team or not season:
             return None, 0.0
-        cands = self.by_team.get(canonical_team)
+        cands = self.by_team.get((season, canonical_team))
         if not cands:
             return None, 0.0
 
@@ -315,7 +325,7 @@ def cascade_resolve(
         return f'fb_{fid}', 'exact', None
 
     # Tier-2: name + canonical-team fuzzy match.
-    fid, score = spine.find_by_name_team(name, team)
+    fid, score = spine.find_by_name_team(name, team, candidate.get('season'))
     if fid:
         return f'fb_{fid}', 'name_team', score
 
@@ -448,9 +458,17 @@ def _fetch_fbref_players(
     out: List[Dict[str, Any]] = []
     seen: set = set()
     for pid, name, squad, lg, season in rows:
-        if pid in seen:
+        season_slug = _fbref_year_to_slug(season)
+        # Dedup by (pid, squad, season): mid-season transfers (e.g. Palmer
+        # Man City->Chelsea in 2023-24) produce two FBref rows in the same
+        # season — keep both so spine carries the player in both team
+        # buckets. Without squad in the key Understat candidates seeking
+        # the post-transfer club get false orphan'd (broke Cole Palmer
+        # known-pair regression).
+        key = (str(pid), squad, season_slug)
+        if key in seen:
             continue
-        seen.add(pid)
+        seen.add(key)
         out.append(
             {
                 'source': 'fbref',
@@ -460,7 +478,7 @@ def _fetch_fbref_players(
                 'raw_team_name': squad,
                 'canonical_team': canonical_team_for_resolver(squad, 'fbref'),
                 'league': lg,
-                'season': season,
+                'season': season_slug,
             }
         )
     return out
@@ -729,6 +747,12 @@ def _slug_to_fbref_year(slug: int) -> int:
     if slug < 100:
         raise ValueError(f"season slug must be 4-digit yyXX (got {slug})")
     return (slug // 100) + 2000
+
+
+def _fbref_year_to_slug(year) -> str:
+    """Inverse of _slug_to_fbref_year. 2024 -> '2425', '2024' -> '2425'."""
+    y = int(year)
+    return f"{(y - 2000):02d}{(y - 2000 + 1):02d}"
 
 
 def _split_seasons(slugs: List[int]) -> Tuple[List[int], List[str]]:

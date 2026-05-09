@@ -146,30 +146,35 @@ def fbref_spine() -> "xpr._FBrefSpine":
             'source_id': 'bc7dc64d',
             'player_name': 'Bukayo Saka',
             'canonical_team': 'Arsenal',
+            'season': '2425',
         },
         {
             'player_id': 'e342ad68',
             'source_id': 'e342ad68',
             'player_name': 'Mohamed Salah',
             'canonical_team': 'Liverpool',
+            'season': '2425',
         },
         {
             'player_id': '5ad50391',
             'source_id': '5ad50391',
             'player_name': 'Joško Gvardiol',
             'canonical_team': 'Manchester City',
+            'season': '2425',
         },
         {
             'player_id': '92e7e919',
             'source_id': '92e7e919',
             'player_name': 'Son Heung-min',
             'canonical_team': 'Tottenham Hotspur',
+            'season': '2425',
         },
         {
             'player_id': 'e06683ca',
             'source_id': 'e06683ca',
             'player_name': 'Virgil van Dijk',
             'canonical_team': 'Liverpool',
+            'season': '2425',
         },
     ]
     return xpr._FBrefSpine(rows)
@@ -183,6 +188,7 @@ class TestCascadeResolve:
             'source_id': 'bc7dc64d',
             'player_name': 'Whatever',
             'canonical_team': 'Arsenal',
+            'season': '2425',
         }
         cid, conf, score = xpr.cascade_resolve(cand, fbref_spine)
         assert cid == 'fb_bc7dc64d'
@@ -196,6 +202,7 @@ class TestCascadeResolve:
             'source_id': '12345',
             'player_name': 'Josko Gvardiol',
             'canonical_team': 'Manchester City',
+            'season': '2425',
         }
         cid, conf, score = xpr.cascade_resolve(cand, fbref_spine)
         assert cid == 'fb_5ad50391'
@@ -210,6 +217,7 @@ class TestCascadeResolve:
             'source_id': '777',
             'player_name': 'Heung-Min Son',
             'canonical_team': 'Tottenham Hotspur',
+            'season': '2425',
         }
         cid, conf, score = xpr.cascade_resolve(cand, fbref_spine)
         assert cid == 'fb_92e7e919'
@@ -223,6 +231,7 @@ class TestCascadeResolve:
             'source_id': '999',
             'player_name': 'Bukayo Saka',
             'canonical_team': 'Liverpool',  # FBref Saka is at Arsenal
+            'season': '2425',
         }
         cid, conf, score = xpr.cascade_resolve(cand, fbref_spine)
         assert cid == 'us_999'
@@ -235,6 +244,7 @@ class TestCascadeResolve:
             'source_id': '321',
             'player_name': 'Random Person',
             'canonical_team': 'Arsenal',
+            'season': '2425',
         }
         cid, conf, score = xpr.cascade_resolve(cand, fbref_spine)
         assert cid == 'ws_321'
@@ -248,9 +258,160 @@ class TestCascadeResolve:
             'source_id': '1',
             'player_name': 'Random Person',
             'canonical_team': 'Arsenal',
+            'season': '2425',
         }
         with pytest.raises(KeyError):
             xpr.cascade_resolve(cand, fbref_spine)
+
+
+# ---------------------------------------------------------------------------
+# Multi-season spine indexing (per-season buckets)
+# ---------------------------------------------------------------------------
+class TestMultiSeasonSpine:
+    def test_player_in_multiple_season_buckets(self):
+        # Cole Palmer: Man City 23-24, then Chelsea 24-25 — both buckets.
+        rows = [
+            {
+                'player_id': 'abc12345',
+                'source_id': 'abc12345',
+                'player_name': 'Cole Palmer',
+                'canonical_team': 'Manchester City',
+                'season': '2324',
+            },
+            {
+                'player_id': 'abc12345',
+                'source_id': 'abc12345',
+                'player_name': 'Cole Palmer',
+                'canonical_team': 'Chelsea',
+                'season': '2425',
+            },
+        ]
+        spine = xpr._FBrefSpine(rows)
+        assert ('2324', 'Manchester City') in spine.by_team
+        assert ('2425', 'Chelsea') in spine.by_team
+
+        # 24-25 Chelsea lookup hits the Chelsea bucket.
+        cand_2425 = {
+            'source': 'understat',
+            'source_id': '2222',
+            'player_name': 'Cole Palmer',
+            'canonical_team': 'Chelsea',
+            'season': '2425',
+        }
+        cid, conf, score = xpr.cascade_resolve(cand_2425, spine)
+        assert cid == 'fb_abc12345'
+        assert conf == 'name_team'
+        assert score >= xpr.NAME_THRESHOLD
+
+        # 23-24 Man City lookup hits the Man City bucket.
+        cand_2324 = {
+            'source': 'understat',
+            'source_id': '1111',
+            'player_name': 'Cole Palmer',
+            'canonical_team': 'Manchester City',
+            'season': '2324',
+        }
+        cid, conf, score = xpr.cascade_resolve(cand_2324, spine)
+        assert cid == 'fb_abc12345'
+        assert conf == 'name_team'
+        assert score >= xpr.NAME_THRESHOLD
+
+    def test_understat_seeking_other_season_bucket_is_orphan(self):
+        # Player exists in 24-25 but not 25-26 — same-team lookup in
+        # the missing season must NOT leak across into orphan match.
+        rows = [
+            {
+                'player_id': 'def67890',
+                'source_id': 'def67890',
+                'player_name': 'Mads Hermansen',
+                'canonical_team': 'Leicester City',
+                'season': '2425',
+            },
+        ]
+        spine = xpr._FBrefSpine(rows)
+        cand = {
+            'source': 'understat',
+            'source_id': '999',
+            'player_name': 'Mads Hermansen',
+            'canonical_team': 'Leicester City',
+            'season': '2526',
+        }
+        cid, conf, _ = xpr.cascade_resolve(cand, spine)
+        assert cid == 'us_999'
+        assert conf == 'orphan'
+
+    def test_dedup_within_season(self):
+        # Repeated enrichment must not double-add to the same bucket.
+        rows = [
+            {
+                'player_id': 'ghi54321',
+                'source_id': 'ghi54321',
+                'player_name': 'Test Player',
+                'canonical_team': 'Arsenal',
+                'season': '2425',
+            },
+            {
+                'player_id': 'ghi54321',
+                'source_id': 'ghi54321',
+                'player_name': 'Test Player',
+                'canonical_team': 'Arsenal',
+                'season': '2425',
+            },
+        ]
+        spine = xpr._FBrefSpine(rows)
+        assert len(spine.by_team[('2425', 'Arsenal')]) == 1
+
+    def test_mid_season_transfer_within_same_season(self):
+        # FBref Bronze stores two rows for a player who transferred mid-season
+        # (e.g. Palmer 2023-24: Man City row + Chelsea row). Spine MUST place
+        # the player in BOTH (season, team) buckets so candidates from either
+        # source-side post-/pre-transfer team resolve correctly.
+        rows = [
+            {
+                'player_id': 'pal12345',
+                'source_id': 'pal12345',
+                'player_name': 'Cole Palmer',
+                'canonical_team': 'Manchester City',
+                'season': '2324',
+            },
+            {
+                'player_id': 'pal12345',
+                'source_id': 'pal12345',
+                'player_name': 'Cole Palmer',
+                'canonical_team': 'Chelsea',
+                'season': '2324',
+            },
+        ]
+        spine = xpr._FBrefSpine(rows)
+        assert ('2324', 'Manchester City') in spine.by_team
+        assert ('2324', 'Chelsea') in spine.by_team
+        # Understat side has only the post-transfer club — must still resolve.
+        cand = {
+            'source': 'understat',
+            'source_id': 'u_palmer_2324',
+            'player_name': 'Cole Palmer',
+            'canonical_team': 'Chelsea',
+            'season': '2324',
+        }
+        cid, conf, score = xpr.cascade_resolve(cand, spine)
+        assert cid == 'fb_pal12345'
+        assert conf == 'name_team'
+        assert score >= xpr.NAME_THRESHOLD
+
+    def test_legacy_known_pairs_still_pass(self, fbref_spine):
+        # Backward-compat regression guard: single-season fixture still
+        # resolves a known pair (Joško Gvardiol @ Man City 24-25).
+        cand = {
+            'source': 'understat',
+            'source_id': '12345',
+            'player_name': 'Josko Gvardiol',
+            'canonical_team': 'Manchester City',
+            'season': '2425',
+        }
+        cid, conf, score = xpr.cascade_resolve(cand, fbref_spine)
+        assert cid == 'fb_5ad50391'
+        assert conf == 'name_team'
+        assert score >= xpr.NAME_THRESHOLD
 
 
 # ---------------------------------------------------------------------------
