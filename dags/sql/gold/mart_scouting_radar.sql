@@ -123,3 +123,4 @@ SELECT
 FROM rolled r
 LEFT JOIN iceberg.gold.dim_player dp
        ON dp.player_id = r.player_id
+      AND dp.season    = r.season

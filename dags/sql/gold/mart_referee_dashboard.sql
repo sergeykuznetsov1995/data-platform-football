@@ -69,7 +69,7 @@ per_match AS (
 
 SELECT
     pm.referee_id,
-    dr.referee_name,
+    dr.referee_canonical AS referee_name,
     pm.season,
     pm.league,
     COUNT(*)                                                       AS matches_officiated,
@@ -84,6 +84,6 @@ LEFT JOIN iceberg.gold.dim_referee dr
        ON dr.referee_id = pm.referee_id
 GROUP BY
     pm.referee_id,
-    dr.referee_name,
+    dr.referee_canonical,
     pm.season,
     pm.league
