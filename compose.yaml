@@ -42,6 +42,9 @@ x-airflow-common: &airflow-common
     - ./logs:/opt/airflow/logs
     - ./spark_jobs:/opt/airflow/spark_jobs
     - ./configs/spark:/opt/spark/conf
+    # E1 medallion config: team_aliases.yaml + competitions.yaml — read-only
+    # for utils/medallion_config.py (default CONFIG_DIR=/opt/airflow/configs/medallion)
+    - ./configs/medallion:/opt/airflow/configs/medallion:ro
     - ./scrapers:/opt/airflow/scrapers
     - ./scripts:/opt/airflow/scripts
     - ./proxys.txt:/opt/airflow/proxys.txt:ro
@@ -587,7 +590,7 @@ services:
   # Superset - BI / Dashboards
   # ===========================================================================
   superset:
-    image: apache/superset:4.1.1
+    image: data-platform/superset:4.1.1
     container_name: superset
     hostname: superset
     security_opt:
@@ -642,7 +645,7 @@ services:
           memory: 512M
 
   superset-worker:
-    image: apache/superset:4.1.1
+    image: data-platform/superset:4.1.1
     container_name: superset-worker
     hostname: superset-worker
     security_opt:
@@ -684,7 +687,7 @@ services:
           memory: 256M
 
   superset-beat:
-    image: apache/superset:4.1.1
+    image: data-platform/superset:4.1.1
     container_name: superset-beat
     hostname: superset-beat
     security_opt:

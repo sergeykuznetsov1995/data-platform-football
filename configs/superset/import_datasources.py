@@ -31,10 +31,12 @@ from typing import Any
 import yaml
 
 # pylint: disable=import-error  # imports resolved at runtime inside Superset image
-from superset import db, security_manager  # type: ignore
+# NOTE: superset.connectors.sqla.models / superset.models.core touch
+# `current_app.config` at MODULE-IMPORT time, so importing them before
+# create_app() raises "Working outside of application context". We defer
+# those heavy imports into main() (after app_context push). Only the lightweight
+# `create_app` is imported here.
 from superset.app import create_app  # type: ignore
-from superset.connectors.sqla.models import SqlaTable  # type: ignore
-from superset.models.core import Database  # type: ignore
 
 logging.basicConfig(
     level=os.environ.get("SUPERSET_LOG_LEVEL", "INFO"),
@@ -142,6 +144,13 @@ def main(yaml_path: Path) -> int:
 
     app = create_app()
     with app.app_context():
+        # Deferred imports — require active app context (see module header).
+        # pylint: disable=import-outside-toplevel
+        global db, security_manager, SqlaTable, Database  # noqa: PLW0603
+        from superset import db, security_manager  # type: ignore  # noqa: F401
+        from superset.connectors.sqla.models import SqlaTable  # type: ignore  # noqa: F401
+        from superset.models.core import Database  # type: ignore  # noqa: F401
+
         # Гарантируем существование security manager (создаст роли при первом запуске)
         _ = security_manager
         for db_spec in spec["databases"]:
