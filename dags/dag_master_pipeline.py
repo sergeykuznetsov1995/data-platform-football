@@ -177,6 +177,19 @@ with DAG(
     7. **ESPN** (12:00 UTC) - soccerdata library
     8. **ClubElo** (13:00 UTC) - ELO ratings
 
+    ### E4: Narrow event facts (Silver + Gold)
+
+    After `dag_transform_e3` finishes, `dag_transform_e4` materialises the
+    E4 narrow facts: Silver `match_cards` / `match_substitutions` /
+    `matchhistory_match_odds` / `sofascore_player_ratings` → Gold
+    `fct_goal` / `fct_card` / `fct_substitution` / `fct_match_odds` /
+    `fct_match_rating` → `validate_e4`. It depends on `silver.xref_*`
+    (E1) and `gold.fct_shot` (E3) and runs sequentially
+    (`max_active_tasks=1`) for OOM safety. The Sofascore Silver task is
+    bronze-guarded — it skips if `bronze.sofascore_player_ratings` is
+    absent (R0.2B partial-backfill scenarios) so the rest of the chain
+    keeps moving.
+
     ### Notes
 
     - Each DAG is triggered with `wait_for_completion=True`
@@ -210,11 +223,37 @@ with DAG(
             prev_task = trigger_task
             trigger_tasks.append(trigger_task)
 
+    # =========================================================================
+    # E4 medallion-redesign: Narrow event facts (Silver + Gold)
+    # =========================================================================
+    # Runs AFTER `dag_transform_e3` (E3) so the E4 builders can:
+    #   * read fresh `silver.xref_match` / `silver.xref_team` /
+    #     `silver.xref_player` rows (produced by xref step);
+    #   * source `gold.fct_goal` from the `gold.fct_shot` baseline
+    #     materialised by E3.
+    #
+    # The E4 DAG itself runs sequentially (`max_active_tasks=1`) for OOM
+    # safety; here we simply trigger it with the same wait/parity policy as
+    # the xref / E3 steps. `failed_states=[]` keeps master pipeline
+    # resilient: an E4 failure surfaces via `validate_e4`'s
+    # on_failure_callback (Telegram) but does not block the daily summary.
+    trigger_e4_transforms = TriggerDagRunOperator(
+        task_id='trigger_e4_transforms',
+        trigger_dag_id='dag_transform_e4',
+        wait_for_completion=True,
+        poke_interval=30,
+        allowed_states=['success', 'failed'],
+        failed_states=[],
+        reset_dag_run=True,
+        execution_date='{{ ds }}',
+        trigger_rule='all_done',  # Run even if E3 step degraded
+    )
+
     # Check overall pipeline success
     check_success_task = PythonOperator(
         task_id='check_pipeline_success',
         python_callable=check_pipeline_success,
-        
+
         trigger_rule='all_done',
     )
 
@@ -222,8 +261,8 @@ with DAG(
     generate_report_task = PythonOperator(
         task_id='generate_pipeline_report',
         python_callable=generate_pipeline_report,
-        
+
     )
 
     # Dependencies
-    triggers_group >> check_success_task >> generate_report_task
+    triggers_group >> trigger_e4_transforms >> check_success_task >> generate_report_task
