@@ -1041,6 +1041,7 @@ def validate_gold_quality() -> Dict[str, Any]:
     """
     from utils.alerts import telegram_dq_summary
     from utils.data_quality import CHECK, run_checks
+    from utils.xref_dq import build_e1_5_post_cutover_checks
 
     checks = [
         # ========== PK uniqueness — ERROR ==========
@@ -1503,6 +1504,17 @@ def validate_gold_quality() -> Dict[str, Any]:
         # least one event landed in the bin. Zero indicates a bug.
         CHECK.value_range('gold.mart_event_heatmap', 'event_count',
                           min_val=1, severity='ERROR'),
+
+        # ============================================================
+        # E1.5: post-cutover ref_integrity / canonical-format checks
+        # (silver.xref_team is the source-of-truth; player_id MUST start
+        # with 'fb_'). All severity=WARNING in this prep PR — operate as
+        # observability during the ≥3-day green-parity gate-watch window.
+        # See dags/utils/xref_dq.py::build_e1_5_post_cutover_checks for
+        # the full list (6 checks). After cutover-merge a follow-up PR
+        # may tighten the team-level check to ERROR severity.
+        # ============================================================
+        *build_e1_5_post_cutover_checks(),
     ]
 
     report = run_checks(checks, raise_on_error=False)

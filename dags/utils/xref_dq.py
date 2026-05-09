@@ -274,6 +274,129 @@ def build_all_xref_checks() -> List[Check]:
 
 
 # ---------------------------------------------------------------------------
+# E1.5 post-cutover ref_integrity / canonical-format checks
+# ---------------------------------------------------------------------------
+
+def build_e1_5_post_cutover_checks() -> List[Check]:
+    """Forward-looking DQ checks for the E1.5 cutover.
+
+    These checks validate that Gold consumers correctly resolve to the new
+    Silver xref source-of-truth. They are wired into Gold validate_gold_quality
+    in the **prep PR** at severity=WARNING so we observe the diff during the
+    ≥3-day green-parity gate-watch window without breaking the DAG. After
+    cutover-merge a follow-up PR may tighten the team-level check to ERROR.
+
+    Six checks (all severity=WARNING in this prep PR):
+
+    1. ``ref_integrity[dim_team.team_id->silver.xref_team(fbref).canonical_id]``
+       — Gold dim_team.team_id must trace back to silver.xref_team for the
+       FBref source slice. Implemented as ``row_count(max=0)`` over the
+       offending predicate because the universal ``CHECK.ref_integrity``
+       has no WHERE-filter mode.
+
+    2. ``ref_integrity[fct_player_match.team_id->dim_team]`` — narrow
+       ref_integrity check that catches team_id slug drift introduced when
+       SQL files cut over from gold.entity_xref → silver.xref_team.
+
+    3-4. ``ref_integrity[match_outcomes.{home,away}_team_id->dim_team]`` —
+        same intent, narrower scope. match_outcomes is the ML-label
+        source-of-truth so a regression here invalidates target labels.
+
+    5-6. Canonical-format guards on ``dim_player.player_id`` and
+        ``fct_player_match.player_id`` — both MUST start with ``fb_``
+        post-cutover (FBref is the player spine). Implemented via
+        ``regexp_like`` over a row_count(max=0) predicate.
+
+    Severity rationale
+    ------------------
+    All six checks ship at WARNING during the gate-watch window (2026-05-09
+    → 2026-05-12+). A non-zero offender count surfaces in Telegram via
+    ``telegram_dq_summary`` without raising. After cutover the team-level
+    check (#1) is the first candidate for ERROR-severity tightening — see
+    ``docs/decisions/E1.5-cutover-prep.md``.
+
+    NOTE: This builder does NOT modify ``dags/utils/data_quality.py`` —
+    every check leverages an existing primitive (``row_count`` with WHERE).
+    """
+    checks: List[Check] = [
+        # 1) dim_team.team_id ⊆ silver.xref_team.canonical_id (source='fbref')
+        CHECK.row_count(
+            table='iceberg.gold.dim_team',
+            min_rows=0,
+            max_rows=0,
+            where=(
+                "team_id NOT IN ("
+                "SELECT canonical_id FROM iceberg.silver.xref_team "
+                "WHERE source = 'fbref'"
+                ")"
+            ),
+            severity='WARNING',
+            name='ref_integrity[dim_team.team_id->silver.xref_team(fbref)]',
+        ),
+
+        # 2) fct_player_match.team_id ⊆ dim_team.team_id
+        CHECK.row_count(
+            table='iceberg.gold.fct_player_match',
+            min_rows=0,
+            max_rows=0,
+            where=(
+                "team_id IS NOT NULL "
+                "AND team_id NOT IN (SELECT team_id FROM iceberg.gold.dim_team)"
+            ),
+            severity='WARNING',
+            name='ref_integrity[fct_player_match.team_id->dim_team]',
+        ),
+
+        # 3) match_outcomes.home_team_id ⊆ dim_team.team_id
+        CHECK.row_count(
+            table='iceberg.gold.match_outcomes',
+            min_rows=0,
+            max_rows=0,
+            where=(
+                "home_team_id IS NOT NULL "
+                "AND home_team_id NOT IN (SELECT team_id FROM iceberg.gold.dim_team)"
+            ),
+            severity='WARNING',
+            name='ref_integrity[match_outcomes.home_team_id->dim_team]',
+        ),
+
+        # 4) match_outcomes.away_team_id ⊆ dim_team.team_id
+        CHECK.row_count(
+            table='iceberg.gold.match_outcomes',
+            min_rows=0,
+            max_rows=0,
+            where=(
+                "away_team_id IS NOT NULL "
+                "AND away_team_id NOT IN (SELECT team_id FROM iceberg.gold.dim_team)"
+            ),
+            severity='WARNING',
+            name='ref_integrity[match_outcomes.away_team_id->dim_team]',
+        ),
+
+        # 5) dim_player.player_id matches '^fb_' regex
+        CHECK.row_count(
+            table='iceberg.gold.dim_player',
+            min_rows=0,
+            max_rows=0,
+            where="NOT regexp_like(player_id, '^fb_.+')",
+            severity='WARNING',
+            name='canonical_format[dim_player.player_id]',
+        ),
+
+        # 6) fct_player_match.player_id matches '^fb_' regex
+        CHECK.row_count(
+            table='iceberg.gold.fct_player_match',
+            min_rows=0,
+            max_rows=0,
+            where="player_id IS NOT NULL AND NOT regexp_like(player_id, '^fb_.+')",
+            severity='WARNING',
+            name='canonical_format[fct_player_match.player_id]',
+        ),
+    ]
+    return checks
+
+
+# ---------------------------------------------------------------------------
 # Orphan-rate evaluation (runs after the standard DQ pass)
 # ---------------------------------------------------------------------------
 
@@ -581,11 +704,25 @@ def parity_check_xref_player_vs_gold() -> Dict[str, Any]:
 # Telegram alert helper (private send via alerts._send_telegram)
 # ---------------------------------------------------------------------------
 
-def _send_parity_alert(parity_summary: Dict[str, Dict[str, Any]]) -> None:
+# Baseline parity numbers captured 2026-05-09 (data/audit/e1_parity_2026-05-09.json).
+# cid_diff for team is 43 (alias-canonicalisation drift, intended — see
+# docs/decisions/E1.5-cutover-prep.md). Growth beyond
+# ``43 + cid_diff_growth_threshold`` during the gate-watch window triggers an
+# INFO Telegram message.
+_PARITY_BASELINE_TEAM_CID_DIFF = 43
+
+
+def _send_parity_alert(parity_summary: Dict[str, Dict[str, Any]],
+                       header: str = "E1 dual-run parity",
+                       extra_tag: str = "") -> None:
     """Send a one-line Telegram message summarising parity verdicts.
 
     Uses ``alerts._send_telegram`` directly (no public ``send_telegram_message``
     surface in ``alerts.py``). Always swallows exceptions.
+
+    ``extra_tag`` is appended to the header (e.g. "REGRESSION", "INFO") so
+    the same renderer powers normal threshold alerts AND the E1.5 gate-watch
+    regression / cid_diff_growth alerts.
     """
     try:
         # private-OK: T6 dual-run parity uses lo-fi telegram; alerts.py only
@@ -593,7 +730,8 @@ def _send_parity_alert(parity_summary: Dict[str, Dict[str, Any]]) -> None:
         # _dq_summary). A public wrapper for arbitrary messages is TBD.
         from utils.alerts import _send_telegram  # type: ignore[attr-defined]  # noqa: PLC2701
         env = os.environ.get('ALERT_ENV', 'dev')
-        lines = [f"<b>[{env}] E1 dual-run parity</b>"]
+        tag = f" [{extra_tag}]" if extra_tag else ""
+        lines = [f"<b>[{env}] {header}{tag}</b>"]
         for entity, p in parity_summary.items():
             verdict = p.get('verdict', '?')
             pct = p.get('canonical_id_match_pct', 1.0) * 100
@@ -610,12 +748,51 @@ def _send_parity_alert(parity_summary: Dict[str, Dict[str, Any]]) -> None:
 
 
 def maybe_alert_parity(parity_summary: Dict[str, Dict[str, Any]],
-                       diff_threshold: int = 100) -> bool:
-    """Send Telegram parity alert if total diff for any entity exceeds threshold.
+                       diff_threshold: int = 100,
+                       cid_diff_growth_threshold: int = 5) -> bool:
+    """Send Telegram parity alert(s) for the E1 dual-run / E1.5 gate-watch window.
 
-    Returns True if an alert was actually sent (sent=False if all diffs
-    below threshold or telegram credentials missing).
+    Three independent alert branches (most-severe-first ordering on send):
+
+    1. **REGRESSION (RED)** — any entity has ``gold_only > 0``: a row exists
+       in the legacy ``gold.entity_xref`` but is MISSING from the new Silver
+       xref. This is the highest-severity gate-watch signal because it means
+       the new SQL refactor lost coverage. Sent as a separate message tagged
+       ``[REGRESSION]``.
+
+    2. **THRESHOLD (default)** — ``silver_only + gold_only + cid_diff >=
+       diff_threshold`` (default 100; currently sized to the ``43`` cid_diff
+       baseline + headroom).
+
+       TODO E1.5: после cutover снизить до 10 — see
+       docs/decisions/E1.5-cutover-prep.md. Default stays at 100 in this
+       prep PR to avoid spamming during the gate-watch window with the
+       expected 43-row cid_diff baseline.
+
+    3. **CID_DIFF_GROWTH (INFO)** — team.cid_diff > baseline (43) +
+       ``cid_diff_growth_threshold`` (default 5) — i.e. > 48. Surfaces
+       additional alias-canonicalisation drift introduced after baseline
+       so we notice early without firing the louder THRESHOLD alert.
+
+    Returns True if at least one alert was sent (False on missing creds /
+    no-op). Never raises.
     """
+    sent_any = False
+
+    # ---- 1) REGRESSION: gold_only > 0 anywhere ----
+    has_regression = any(
+        int(p.get('gold_only', 0)) > 0
+        for p in parity_summary.values()
+    )
+    if has_regression:
+        _send_parity_alert(
+            parity_summary,
+            header="E1 dual-run parity",
+            extra_tag="REGRESSION",
+        )
+        sent_any = True
+
+    # ---- 2) THRESHOLD: total diff per-entity ----
     significant = False
     for entity, p in parity_summary.items():
         diff_total = (
@@ -628,5 +805,20 @@ def maybe_alert_parity(parity_summary: Dict[str, Dict[str, Any]],
             break
     if significant:
         _send_parity_alert(parity_summary)
-        return True
-    return False
+        sent_any = True
+
+    # ---- 3) CID_DIFF_GROWTH (INFO): team.cid_diff > baseline + tolerance ----
+    team = parity_summary.get('team') or {}
+    team_cid_diff = int(team.get('cid_diff', 0))
+    if team_cid_diff > _PARITY_BASELINE_TEAM_CID_DIFF + cid_diff_growth_threshold:
+        _send_parity_alert(
+            parity_summary,
+            header="E1 dual-run parity",
+            extra_tag=(
+                f"INFO cid_diff_growth team.cid_diff={team_cid_diff} "
+                f"baseline={_PARITY_BASELINE_TEAM_CID_DIFF}"
+            ),
+        )
+        sent_any = True
+
+    return sent_any
