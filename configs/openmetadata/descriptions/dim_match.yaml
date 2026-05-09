@@ -1,0 +1,47 @@
+# =============================================================================
+# OpenMetadata description: iceberg.gold.dim_match
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.gold.dim_match
+  description: |
+    Dimension table for matches. One row per match with canonical home/away
+    team IDs, score, 1X2 result, total goals, BTTS flag, completeness flag,
+    referee + venue. Spine source: FBref schedule joined through entity_xref.
+  tags:
+    - Tier.Gold
+    - Domain.Football
+    - PII.None
+columns:
+  - name: match_id
+    description: Canonical match identifier (FBref match URL hash).
+  - name: home_team_id
+    description: FK -> dim_team.team_id (home team canonical id).
+  - name: away_team_id
+    description: FK -> dim_team.team_id (away team canonical id).
+  - name: home_team_name
+    description: Display name of the home team.
+  - name: away_team_name
+    description: Display name of the away team.
+  - name: result_1x2
+    description: "Match outcome: 'H' / 'D' / 'A' (NULL if not played)."
+  - name: total_goals
+    description: home_score + away_score (NULL until match completes).
+  - name: btts
+    description: TRUE if both teams scored at least one goal.
+  - name: is_completed
+    description: TRUE when both home_score and away_score are non-NULL.
+  - name: referee
+    description: Referee display name (raw string, not normalised — see dim_referee).
+  - name: league
+    description: League slug (e.g. 'ENG-Premier League').
+  - name: season
+    description: Season slug (e.g. '2425').
+relationships:
+  - from: trino_iceberg.iceberg.gold.dim_match
+    to:   trino_iceberg.iceberg.gold.dim_team
+    type: FOREIGN_KEY
+    description: home_team_id / away_team_id -> dim_team.team_id
+  - from: trino_iceberg.iceberg.gold.dim_match
+    to:   trino_iceberg.iceberg.gold.dim_referee
+    type: FOREIGN_KEY
+    description: referee (after normalisation) -> dim_referee.referee_canonical

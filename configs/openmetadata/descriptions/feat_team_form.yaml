@@ -1,0 +1,43 @@
+# =============================================================================
+# OpenMetadata description: iceberg.gold.feat_team_form
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.gold.feat_team_form
+  description: |
+    Per-(team, match) rolling form features over the last 5 matches: goals,
+    shots, possession, points, wins/draws/losses, std-dev signals + rest_days
+    since previous fixture. Point-in-time safe (NULL for first 5 matches).
+  tags:
+    - Tier.Gold
+    - Domain.Football
+    - PII.None
+columns:
+  - name: match_id
+    description: FK -> dim_match.match_id.
+  - name: team_id
+    description: FK -> dim_team.team_id.
+  - name: opponent_id
+    description: FK -> dim_team.team_id.
+  - name: is_home
+    description: TRUE if team played at home in this match.
+  - name: l5_goals_for_avg
+    description: Trailing 5-match avg goals scored.
+  - name: l5_goals_against_avg
+    description: Trailing 5-match avg goals conceded.
+  - name: l5_form_points
+    description: Sum of points (3W/1D/0L) over trailing 5 matches.
+  - name: l5_form_trend
+    description: Slope of points over trailing 5 matches (improving / declining).
+  - name: rest_days
+    description: Days since previous fixture for this team.
+  - name: matches_played_so_far
+    description: Cumulative match count so far this season.
+  - name: league
+    description: League slug.
+  - name: season
+    description: Season slug.
+relationships:
+  - from: trino_iceberg.iceberg.gold.feat_team_form
+    to:   trino_iceberg.iceberg.gold.dim_team
+    type: FOREIGN_KEY
+    description: team_id -> dim_team.team_id

@@ -225,3 +225,12 @@ superset-import:
 # Re-import Superset dashboards from dashboards/*.py
 superset-dashboards:
 	docker compose exec superset python /app/configs/superset/import_dashboards.py
+
+om-apply-descriptions:  ## Apply YAML descriptions to OpenMetadata via REST API
+	docker compose exec airflow-webserver python /opt/airflow/configs/openmetadata/apply_descriptions.py
+
+om-ingest-trino:  ## Trigger OpenMetadata Trino metadata ingestion (manual via UI for now)
+	@echo "TODO: trigger via OpenMetadata UI Pipeline -> Add Trino service -> Run"
+
+om-lineage-trino:  ## Trigger OpenMetadata Trino lineage extraction (manual)
+	@echo "TODO: trigger via OpenMetadata UI Pipeline -> Lineage workflow"

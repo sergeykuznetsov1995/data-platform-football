@@ -1,0 +1,37 @@
+# =============================================================================
+# OpenMetadata description: iceberg.gold.dim_player
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.gold.dim_player
+  description: |
+    Dimension table for players, FBref-derived. Grain: one row per
+    (player_id, season). MAX-aggregated profile attributes (nation, position,
+    born_year, last_team) are stable per season; cross-source player
+    cross-matching is NOT performed at this layer (Understat players carry an
+    'u_<id>' canonical — known limitation).
+  tags:
+    - Tier.Gold
+    - Domain.Football
+    - PII.None
+columns:
+  - name: player_id
+    description: Canonical player ID (FBref player slug).
+  - name: player_name
+    description: Player display name.
+  - name: nation
+    description: Country code / nationality.
+  - name: position
+    description: Primary on-field position (FBref convention, e.g. 'FW', 'MF', 'DF', 'GK').
+  - name: born_year
+    description: Year of birth (4-digit).
+  - name: last_team
+    description: Last squad observed for this player in the season.
+  - name: league
+    description: League slug.
+  - name: season
+    description: Season slug (PK component).
+relationships:
+  - from: trino_iceberg.iceberg.gold.dim_player
+    to:   trino_iceberg.iceberg.gold.dim_team
+    type: FOREIGN_KEY
+    description: last_team (slug) -> dim_team.team_id

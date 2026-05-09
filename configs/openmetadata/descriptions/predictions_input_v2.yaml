@@ -1,0 +1,52 @@
+# =============================================================================
+# OpenMetadata description: iceberg.gold.predictions_input_v2
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.gold.predictions_input_v2
+  description: |
+    Inference feature snapshot, V2 schema (E6). Strict superset of
+    predictions_input (v1): mirrors all v1 columns + 6 referee-bias L10 cols
+    + 20 team-event-style L5 cols (10 home + 10 away) = 106 columns.
+    Filter: is_completed=FALSE, date in [today, today+7d]. Materialised by
+    dag_serve_predictions every 2h. Active version selected by Airflow Variable
+    `predictions_serving_active_version` (v1 | v2).
+  tags:
+    - Tier.Gold
+    - Domain.Football
+    - PII.None
+columns:
+  - name: match_id
+    description: FK -> dim_match.match_id (PK).
+  - name: home_team_id
+    description: FK -> dim_team.team_id (home team).
+  - name: away_team_id
+    description: FK -> dim_team.team_id (away team).
+  - name: date
+    description: Match date.
+  - name: ref_yellow_per_match_l10
+    description: Trailing 10-match referee yellow card rate (E6 addition vs v1).
+  - name: ref_cards_per_match_l10
+    description: Trailing 10-match referee total card rate.
+  - name: home_pass_share_l5_avg
+    description: Trailing 5-match home-team pass share (E6 event-style addition).
+  - name: away_pass_share_l5_avg
+    description: Trailing 5-match away-team pass share.
+  - name: home_shot_share_l5_avg
+    description: Trailing 5-match home-team shot share.
+  - name: away_shot_share_l5_avg
+    description: Trailing 5-match away-team shot share.
+  - name: season
+    description: Season slug (partition).
+relationships:
+  - from: trino_iceberg.iceberg.gold.predictions_input_v2
+    to:   trino_iceberg.iceberg.gold.dim_match
+    type: FOREIGN_KEY
+    description: match_id -> dim_match.match_id
+  - from: trino_iceberg.iceberg.gold.predictions_input_v2
+    to:   trino_iceberg.iceberg.gold.feat_referee_bias
+    type: FOREIGN_KEY
+    description: ref_*_l10 columns sourced from feat_referee_bias.
+  - from: trino_iceberg.iceberg.gold.predictions_input_v2
+    to:   trino_iceberg.iceberg.gold.feat_team_event_style
+    type: FOREIGN_KEY
+    description: home/away_*_share_l5_avg columns sourced from feat_team_event_style.

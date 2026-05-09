@@ -1,0 +1,49 @@
+# =============================================================================
+# OpenMetadata description: iceberg.gold.fct_shot
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.gold.fct_shot
+  description: |
+    Shot-level fact. Source: silver.understat_shot_events bridged to FBref
+    matches via cross-source xG join. Carries Understat xG and canonical
+    body_part / situation / result enums. Grain: one row per shot_id.
+  tags:
+    - Tier.Gold
+    - Domain.Football
+    - PII.None
+columns:
+  - name: shot_id
+    description: Understat shot identifier (PK).
+  - name: match_id_canonical
+    description: FK -> dim_match.match_id (FBref-canonical, post xref join).
+  - name: team_id_canonical
+    description: FK -> dim_team.team_id (shooting team).
+  - name: player_id_canonical
+    description: FK -> dim_player.player_id (shooter; 'u_<id>' if cross-match failed).
+  - name: assist_player_id_canonical
+    description: FK -> dim_player.player_id (assist provider; NULL if no assist).
+  - name: minute
+    description: Match minute.
+  - name: x
+    description: Shot X coordinate (Understat 0-100 scale).
+  - name: y
+    description: Shot Y coordinate (Understat 0-100 scale).
+  - name: xg
+    description: Expected goals value (Understat model).
+  - name: body_part_canonical
+    description: Canonical body part (head / left_foot / right_foot / other_body).
+  - name: situation_canonical
+    description: Canonical situation (open_play / set_piece / penalty / corner_kick / free_kick / direct_free_kick).
+  - name: result_canonical
+    description: Canonical result (goal / saved / missed / blocked / post / own_goal).
+  - name: is_goal
+    description: TRUE when result_canonical IN ('goal', 'own_goal').
+relationships:
+  - from: trino_iceberg.iceberg.gold.fct_shot
+    to:   trino_iceberg.iceberg.gold.dim_match
+    type: FOREIGN_KEY
+    description: match_id_canonical -> dim_match.match_id
+  - from: trino_iceberg.iceberg.gold.fct_shot
+    to:   trino_iceberg.iceberg.gold.dim_player
+    type: FOREIGN_KEY
+    description: player_id_canonical -> dim_player.player_id

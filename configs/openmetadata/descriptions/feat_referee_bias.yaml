@@ -1,0 +1,39 @@
+# =============================================================================
+# OpenMetadata description: iceberg.gold.feat_referee_bias
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.gold.feat_referee_bias
+  description: |
+    Per-match referee rolling-bias features (E6). 10-match trailing window
+    (ROWS BETWEEN 10 PRECEDING AND 1 PRECEDING) per referee, point-in-time
+    safe (NULL for first 5 appearances). Used by predictions_input_v2.
+  tags:
+    - Tier.Gold
+    - Domain.Football
+    - PII.None
+columns:
+  - name: referee_id
+    description: FK -> dim_referee.referee_id.
+  - name: match_id
+    description: FK -> dim_match.match_id.
+  - name: ref_yellow_per_match_l10
+    description: Trailing 10-match avg yellow cards (NULL if <5 prior matches).
+  - name: ref_red_per_match_l10
+    description: Trailing 10-match avg red cards.
+  - name: ref_cards_per_match_l10
+    description: Trailing 10-match avg total cards (yellows + reds).
+  - name: ref_goals_per_match_l10
+    description: Trailing 10-match avg total goals scored in matches officiated.
+  - name: ref_home_win_rate_l10
+    description: Trailing 10-match home-win rate (proxy for home bias).
+  - name: ref_pen_per_match_l10
+    description: Trailing 10-match avg penalties awarded.
+  - name: league
+    description: League slug.
+  - name: season
+    description: Season slug.
+relationships:
+  - from: trino_iceberg.iceberg.gold.feat_referee_bias
+    to:   trino_iceberg.iceberg.gold.dim_referee
+    type: FOREIGN_KEY
+    description: referee_id -> dim_referee.referee_id

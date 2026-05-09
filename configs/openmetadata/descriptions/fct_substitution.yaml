@@ -1,0 +1,36 @@
+# =============================================================================
+# OpenMetadata description: iceberg.gold.fct_substitution
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.gold.fct_substitution
+  description: |
+    Narrow fact for substitutions (E4). Source: silver.match_substitutions.
+    Grain: substitution_canonical (xxhash64 of match_id|minute|player_in|player_out).
+  tags:
+    - Tier.Gold
+    - Domain.Football
+    - PII.None
+columns:
+  - name: substitution_canonical
+    description: Logical PK.
+  - name: match_id_canonical
+    description: FK -> dim_match.match_id.
+  - name: team_id_canonical
+    description: FK -> dim_team.team_id.
+  - name: player_in_canonical
+    description: FK -> dim_player.player_id (substitute coming on).
+  - name: player_out_canonical
+    description: FK -> dim_player.player_id (player coming off).
+  - name: minute
+    description: Match minute the substitution was made.
+  - name: substitution_source
+    description: Source label.
+  - name: league
+    description: League slug.
+  - name: season
+    description: Season (BIGINT).
+relationships:
+  - from: trino_iceberg.iceberg.gold.fct_substitution
+    to:   trino_iceberg.iceberg.gold.dim_match
+    type: FOREIGN_KEY
+    description: match_id_canonical -> dim_match.match_id
