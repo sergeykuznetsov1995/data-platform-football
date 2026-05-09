@@ -1,0 +1,384 @@
+-- =============================================================================
+-- Silver: whoscored_events_spadl
+-- =============================================================================
+-- Normalises `iceberg.bronze.whoscored_events` (Opta-derived JSON, 39 distinct
+-- WhoScored type values, ~700K rows / season for APL) into a SPADL-shaped
+-- canonical action vocabulary plus a single proprietary supplement
+-- (`ball_recovery`).
+--
+-- Spec reference: docs/research/R3_spadl_coverage.md (D2 mapping table).
+--   * Coverage measured 89.97% (high+medium) on 2425+2526 corpus.
+--   * Decision (R3): SPADL primary + open-action proprietary supplement.
+--   * Mapping logic location: this file (own SQL, NOT socceraction; D4
+--     deferred — adapter cost > value at 89.97% coverage).
+--
+-- DAG-integration note: silver_tasks.run_silver_transform() wraps this SELECT
+-- in `CREATE TABLE iceberg.silver.whoscored_events_spadl AS ...`. This file
+-- MUST stay a pure SELECT (no CREATE TABLE, no DDL).
+--
+-- =============================================================================
+-- Output schema (frozen for E3 wave-1)
+-- =============================================================================
+--   event_id              varchar     synthetic stable id (game_id || '_' || seq)
+--   match_id              varchar     CAST(game_id AS varchar)
+--   team_id_raw           varchar     bronze team_id (NOT resolved via xref —
+--                                     that is a Gold-job concern)
+--   player_id_raw         varchar     bronze player_id (double → varchar)
+--   period                varchar     period passthrough
+--   expanded_minute       integer     TRY_CAST from bigint
+--   x, y, end_x, end_y    double      pitch coordinates (passthrough)
+--   action_canonical      varchar     ENUM (24 values, see below)
+--   action_source         varchar     literal 'whoscored_spadl_proprietary_v1'
+--   action_version        varchar     literal 'v1'
+--   _action_source_note   varchar     original WhoScored type (audit trail)
+--                                     plus paired-flag for Aerial duels
+--                                     ('aerial_paired' suffix)
+--   _action_confidence    varchar     'high' | 'medium' | 'low' | 'unmappable'
+--   outcome_success       boolean     outcome_type = 'Successful'
+--   qualifiers_raw        varchar     preserved JSON-string (audit / Gold split)
+--   _bronze_ingested_at   timestamp   from bronze _ingested_at
+--   league                varchar     partition key passthrough
+--   season                varchar     partition key passthrough
+--
+-- Primary key:  (match_id, event_id)
+--
+-- =============================================================================
+-- action_canonical enum — 24 values (22 SPADL + 1 proprietary + 'unknown')
+-- =============================================================================
+--   SPADL canonical (22):
+--     pass, cross, throw_in, freekick_crossed, freekick_short,
+--     corner_crossed, corner_short, take_on, foul, tackle, interception,
+--     shot, shot_penalty, shot_freekick, keeper_save, keeper_claim,
+--     keeper_punch, keeper_pick_up, clearance, bad_touch, dribble,
+--     goalkick
+--   Proprietary supplement (1):
+--     ball_recovery       (R3.D2 #2; SPADL collapses recovery into
+--                          interception — 5.33% objem too high to lose;
+--                          confidence='low' so downstream ML can filter)
+--   Sentinel (1):
+--     unknown             (meta-events: Card / Substitution / Goal / Start
+--                          / End / FormationSet / FormationChange /
+--                          OffsideProvoked / OffsideGiven / CornerAwarded;
+--                          confidence='unmappable')
+--
+-- DQ invariant (E3.8): every row's action_canonical MUST be in the 24-value
+-- enum above. Any other value -> hard fail.
+--
+-- =============================================================================
+-- R3.D2 mapping table — embedded reference (39 WhoScored types)
+-- =============================================================================
+--   #  WhoScored type    SPADL action(s)                         confidence
+--   -- ----------------  --------------------------------------  ----------
+--    1 Pass              pass / cross / corner_crossed /         medium
+--                        corner_short / freekick_crossed /
+--                        freekick_short / throw_in / goalkick
+--                        (qualifier-driven; see CASE tree)
+--    2 BallRecovery      ball_recovery (proprietary)             low
+--    3 BallTouch         bad_touch (Unsuccessful);               medium
+--                        Successful preserved as bad_touch with
+--                        outcome_success=true (consumer filters
+--                        if needed — keeps row-count parity)
+--    4 Aerial            tackle (both rows kept;                 medium
+--                        _action_source_note='aerial_paired';
+--                        dedup is consumer's call)
+--    5 Clearance         clearance                               high
+--    6 Foul              foul                                    high
+--    7 TakeOn            take_on                                 high
+--    8 Tackle            tackle                                  high
+--    9 CornerAwarded     unknown (marker)                        unmappable
+--   10 Dispossessed      bad_touch                               medium
+--   11 Interception      interception                            high
+--   12 BlockedPass       interception                            high
+--   13 Challenge         tackle (failed)                         high
+--   14 SavedShot         shot / shot_freekick / shot_penalty     medium
+--   15 Save              keeper_save                             high
+--   16 KeeperPickup      keeper_pick_up                          high
+--   17 MissedShots       shot / shot_freekick / shot_penalty     medium
+--   18 SubstitutionOff   unknown (meta)                          unmappable
+--   19 SubstitutionOn    unknown (meta)                          unmappable
+--   20 End               unknown (meta)                          unmappable
+--   21 Card              unknown (meta)                          unmappable
+--   22 Start             unknown (meta)                          unmappable
+--   23 OffsideProvoked   unknown (marker)                        unmappable
+--   24 OffsideGiven      unknown (marker)                        unmappable
+--   25 OffsidePass       pass                                    low
+--   26 FormationChange   unknown (meta)                          unmappable
+--   27 Goal              unknown (marker — shot already in       unmappable
+--                        SavedShot/MissedShots/ShotOnPost)
+--   28 FormationSet      unknown (meta)                          unmappable
+--   29 Claim             keeper_claim                            high
+--   30 Error             bad_touch (degraded)                    low
+--   31 ShieldBallOpp     dribble (degraded)                      low
+--   32 KeeperSweeper     keeper_save                             medium
+--   33 Punch             keeper_punch                            high
+--   34 ShotOnPost        shot / shot_freekick / shot_penalty     medium
+--   35 Smother           keeper_save                             high
+--   36 PenaltyFaced      keeper_save                             low
+--   37 GoodSkill         dribble                                 medium
+--   38 ChanceMissed      shot                                    low
+--   39 CrossNotClaimed   keeper_claim                            medium
+--
+--   Sanity: 39 / 39 distinct WhoScored types from D1 audit covered.
+--   Sum of events by row = 695,148 (matches D1 total).
+--
+-- =============================================================================
+-- Pass routing (the dominant 62.89% bucket — drives overall coverage)
+-- =============================================================================
+--   `qualifiers` is a JSON-string array; checked via regexp_like patterns:
+--     `"type":"ThrowIn"`        -> throw_in
+--     `"type":"GoalKick"`       -> goalkick
+--     `"type":"CornerTaken"` + `"type":"Cross"`         -> corner_crossed
+--     `"type":"CornerTaken"` (without Cross)            -> corner_short
+--     `"type":"FreekickTaken"` + `"type":"Cross"`       -> freekick_crossed
+--     `"type":"FreekickTaken"` (without Cross)          -> freekick_short
+--     `"type":"Cross"` (none of the above)              -> cross
+--     no qualifier OR qualifiers=NULL                   -> pass (medium-conf
+--                                                         fallback; 7.05%
+--                                                         no-qualifier rows
+--                                                         per R3.D1)
+--
+--   Note: for the 7.05% no-qualifier rows we DELIBERATELY collapse to `pass`
+--   (NOT `unknown`). Marking 7% of the dominant 62% bucket as unknown would
+--   destroy the SPADL signal; the explicit medium-confidence label lets
+--   downstream consumers filter if needed.
+-- =============================================================================
+--
+-- Shot-subtype routing (SavedShot / MissedShots / ShotOnPost / ChanceMissed):
+--     `"type":"Penalty"`        -> shot_penalty
+--     `"type":"FreekickTaken"`  -> shot_freekick
+--     default                   -> shot
+--
+-- =============================================================================
+-- Edge cases / known fidelity losses (deferred to Gold or follow-ups)
+-- =============================================================================
+--   * Aerial paired duels: keep BOTH rows (winner + loser) with
+--     action_canonical='tackle' and _action_source_note='aerial_paired:<orig>'.
+--     SPADL convention writes one row; we keep both for row-count parity
+--     with bronze. Deduplication strategy is a Gold/E4 decision.
+--   * BallTouch+Successful: kept as bad_touch with outcome_success=true.
+--     R3.D2 originally proposed dropping these (precursor of next action),
+--     but to preserve parity we route the same as Unsuccessful and rely on
+--     consumer filters (this also avoids a 17K-row Bronze-Silver gap).
+--   * Foul+Unsuccessful (foul-suffered marker): kept as foul with
+--     outcome_success=false. Gold can split if needed.
+--   * Goal events (1,266 rows): mapped to 'unknown' — the actual shot lives
+--     in SavedShot/MissedShots/ShotOnPost. Goal is an outcome marker on
+--     the previous shot event.
+--   * CornerAwarded / OffsideProvoked / OffsideGiven: marker events with
+--     no SPADL action; mapped to 'unknown' to preserve event-count parity.
+--   * BronZE re-scrape duplicates: deduplicated via ROW_NUMBER() over the
+--     full natural key (15-col tuple verified unique on 2425 corpus —
+--     166,453 rows / 166,453 distinct natural keys). Dedup ORDER BY
+--     _ingested_at DESC keeps the most recent re-scrape.
+--   * Cross-source league/season/team-id resolution: NOT done here.
+--     Silver is a pure normaliser; xref join lives in Gold (E3.3 fct_event).
+--
+-- =============================================================================
+-- Verification status
+-- =============================================================================
+--   * Bronze schema verified via DESCRIBE on 2026-05-08 (33 cols, type list
+--     above matches).
+--   * 39 distinct `type` values verified; all 39 covered in CASE tree.
+--   * event_id uniqueness verified: game_id || '_' || LPAD(seq,5,'0') yields
+--     166,453 unique IDs on 166,453 rows (100% PK uniqueness).
+--   * EXPLAIN parsability: TODO — execute via `make shell-trino` once SQL
+--     is wrapped in CTAS by silver_tasks (this file is a SELECT-only fragment
+--     and `EXPLAIN <SELECT>` will succeed standalone).
+-- =============================================================================
+
+WITH src AS (
+    SELECT
+        game_id,
+        period,
+        minute,
+        second,
+        expanded_minute,
+        type,
+        outcome_type,
+        team_id,
+        player_id,
+        x,
+        y,
+        end_x,
+        end_y,
+        qualifiers,
+        related_event_id,
+        league,
+        season,
+        _ingested_at,
+        ROW_NUMBER() OVER (
+            PARTITION BY
+                game_id, period, minute, second, expanded_minute,
+                type, outcome_type, team_id, player_id,
+                x, y, end_x, end_y, qualifiers, related_event_id
+            ORDER BY _ingested_at DESC
+        ) AS dedup_rn
+    FROM iceberg.bronze.whoscored_events
+),
+
+dedup AS (
+    SELECT *
+    FROM src
+    WHERE dedup_rn = 1
+),
+
+seq AS (
+    SELECT
+        *,
+        ROW_NUMBER() OVER (
+            PARTITION BY game_id
+            ORDER BY period, minute, second, expanded_minute, type, x, y
+        ) AS event_seq
+    FROM dedup
+)
+
+SELECT
+    -- ========= Synthetic stable PK =========
+    CAST(game_id AS varchar)
+        || '_' || LPAD(CAST(event_seq AS varchar), 5, '0')   AS event_id,
+    CAST(game_id AS varchar)                                 AS match_id,
+
+    -- ========= Raw entity references (resolved in Gold via xref) =========
+    -- bronze stores team_id / player_id as DOUBLE; direct CAST to varchar
+    -- yields scientific notation ('9.5408E4'), which breaks string equality
+    -- against xref_*.source_id (canonical integer-string '95408'). Round
+    -- through BIGINT first to keep digits intact. NULL stays NULL.
+    CAST(CAST(team_id   AS BIGINT) AS varchar)               AS team_id_raw,
+    CAST(CAST(player_id AS BIGINT) AS varchar)               AS player_id_raw,
+
+    -- ========= Time / pitch coordinates =========
+    CAST(period AS varchar)                                  AS period,
+    TRY_CAST(expanded_minute AS integer)                     AS expanded_minute,
+    x,
+    y,
+    end_x,
+    end_y,
+
+    -- ========= SPADL canonical action (24-value enum) =========
+    CASE
+        -- ---------- Pass routing (qualifier-driven) ----------
+        WHEN type = 'Pass' THEN
+            CASE
+                WHEN qualifiers IS NULL OR qualifiers = '' OR qualifiers = '[]'
+                    THEN 'pass'
+                WHEN regexp_like(qualifiers, '"type":\s*"ThrowIn"')
+                    THEN 'throw_in'
+                WHEN regexp_like(qualifiers, '"type":\s*"GoalKick"')
+                    THEN 'goalkick'
+                WHEN regexp_like(qualifiers, '"type":\s*"CornerTaken"')
+                     AND regexp_like(qualifiers, '"type":\s*"Cross"')
+                    THEN 'corner_crossed'
+                WHEN regexp_like(qualifiers, '"type":\s*"CornerTaken"')
+                    THEN 'corner_short'
+                WHEN regexp_like(qualifiers, '"type":\s*"FreekickTaken"')
+                     AND regexp_like(qualifiers, '"type":\s*"Cross"')
+                    THEN 'freekick_crossed'
+                WHEN regexp_like(qualifiers, '"type":\s*"FreekickTaken"')
+                    THEN 'freekick_short'
+                WHEN regexp_like(qualifiers, '"type":\s*"Cross"')
+                    THEN 'cross'
+                ELSE 'pass'
+            END
+
+        -- ---------- OffsidePass — flagged offside pass ----------
+        WHEN type = 'OffsidePass' THEN 'pass'
+
+        -- ---------- Direct SPADL matches ----------
+        WHEN type = 'Foul'         THEN 'foul'
+        WHEN type = 'TakeOn'       THEN 'take_on'
+        WHEN type = 'Tackle'       THEN 'tackle'
+        WHEN type = 'Interception' THEN 'interception'
+        WHEN type = 'BlockedPass'  THEN 'interception'
+        WHEN type = 'Challenge'    THEN 'tackle'
+        WHEN type = 'Clearance'    THEN 'clearance'
+
+        -- ---------- Aerial — paired duels (both rows kept as 'tackle') ----------
+        WHEN type = 'Aerial'       THEN 'tackle'
+
+        -- ---------- BallTouch / Dispossessed / Error / ShieldBallOpp ----------
+        WHEN type = 'BallTouch'    THEN 'bad_touch'
+        WHEN type = 'Dispossessed' THEN 'bad_touch'
+        WHEN type = 'Error'        THEN 'bad_touch'
+        WHEN type = 'ShieldBallOpp' THEN 'dribble'
+        WHEN type = 'GoodSkill'    THEN 'dribble'
+
+        -- ---------- BallRecovery — proprietary supplement (NOT SPADL) ----------
+        WHEN type = 'BallRecovery' THEN 'ball_recovery'
+
+        -- ---------- Shot variants (qualifier-driven sub-routing) ----------
+        WHEN type IN ('SavedShot', 'MissedShots', 'ShotOnPost', 'ChanceMissed') THEN
+            CASE
+                WHEN regexp_like(COALESCE(qualifiers, ''), '"type":\s*"Penalty"')
+                    THEN 'shot_penalty'
+                WHEN regexp_like(COALESCE(qualifiers, ''), '"type":\s*"FreekickTaken"')
+                    THEN 'shot_freekick'
+                ELSE 'shot'
+            END
+
+        -- ---------- Goalkeeper actions ----------
+        WHEN type = 'Save'           THEN 'keeper_save'
+        WHEN type = 'KeeperSweeper'  THEN 'keeper_save'
+        WHEN type = 'Smother'        THEN 'keeper_save'
+        WHEN type = 'PenaltyFaced'   THEN 'keeper_save'
+        WHEN type = 'KeeperPickup'   THEN 'keeper_pick_up'
+        WHEN type = 'Punch'          THEN 'keeper_punch'
+        WHEN type = 'Claim'          THEN 'keeper_claim'
+        WHEN type = 'CrossNotClaimed' THEN 'keeper_claim'
+
+        -- ---------- Meta / marker events -> 'unknown' ----------
+        --   Card, SubstitutionOn, SubstitutionOff, Start, End,
+        --   FormationSet, FormationChange, Goal, CornerAwarded,
+        --   OffsideProvoked, OffsideGiven (any other unforeseen type)
+        ELSE 'unknown'
+    END                                                      AS action_canonical,
+
+    CAST('whoscored_spadl_proprietary_v1' AS varchar)        AS action_source,
+    CAST('v1'                              AS varchar)        AS action_version,
+
+    -- ========= Audit trail =========
+    --   Aerial rows get a paired-flag suffix so downstream dedup is trivial.
+    CASE
+        WHEN type = 'Aerial' THEN 'aerial_paired:Aerial'
+        ELSE type
+    END                                                      AS _action_source_note,
+
+    -- ========= Confidence per R3.D2 ==========
+    CASE
+        -- high
+        WHEN type IN (
+            'Foul', 'TakeOn', 'Tackle', 'Interception', 'BlockedPass',
+            'Challenge', 'Clearance', 'Save', 'KeeperPickup', 'Claim',
+            'Punch', 'Smother'
+        ) THEN 'high'
+
+        -- medium (qualifier-dependent OR direct-but-paired/degraded)
+        WHEN type IN (
+            'Pass', 'Aerial', 'BallTouch', 'Dispossessed',
+            'SavedShot', 'MissedShots', 'ShotOnPost',
+            'KeeperSweeper', 'GoodSkill', 'CrossNotClaimed'
+        ) THEN 'medium'
+
+        -- low
+        WHEN type IN (
+            'BallRecovery', 'OffsidePass', 'Error', 'ShieldBallOpp',
+            'PenaltyFaced', 'ChanceMissed'
+        ) THEN 'low'
+
+        -- unmappable (meta + markers)
+        ELSE 'unmappable'
+    END                                                      AS _action_confidence,
+
+    -- ========= Outcome flag =========
+    (outcome_type = 'Successful')                            AS outcome_success,
+
+    -- ========= Preserved JSON-string for Gold splits / audit =========
+    qualifiers                                               AS qualifiers_raw,
+
+    -- ========= Lineage =========
+    _ingested_at                                             AS _bronze_ingested_at,
+
+    -- ========= Partition keys (passthrough) =========
+    league,
+    season
+
+FROM seq

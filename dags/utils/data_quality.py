@@ -19,6 +19,7 @@ Check types
 - value_range    — column values within [min, max]
 - point_in_time  — rolling feature is NULL for first N rows per partition
 - scd2_no_overlap— SCD-2 validity intervals do not overlap within a key
+- schema_parity  — column_name+data_type sets match across N tables (train/inference parity)
 
 Typical usage
 -------------
@@ -184,13 +185,17 @@ class CHECK:
         child: str,
         parent: str,
         key: str,
+        parent_key: Optional[str] = None,
         severity: str = 'ERROR',
         name: Optional[str] = None,
     ) -> Check:
+        """Child.key must exist in parent.key (or parent.parent_key when names differ)."""
+        pk = parent_key or key
+        suffix = key if pk == key else f"{key}->{pk}"
         return Check(
-            name=name or f"ref_integrity[{child}.{key}->{parent}]",
+            name=name or f"ref_integrity[{child}.{suffix}->{parent}]",
             kind='ref_integrity',
-            params={'child': child, 'parent': parent, 'key': key},
+            params={'child': child, 'parent': parent, 'key': key, 'parent_key': pk},
             severity=severity,
         )
 
@@ -266,6 +271,50 @@ class CHECK:
                 'order_by': order_by,
                 'skip_first_n': skip_first_n,
             },
+            severity=severity,
+        )
+
+    @staticmethod
+    def schema_parity(
+        tables: List[str],
+        ignore_cols: Optional[List[str]] = None,
+        severity: str = 'ERROR',
+        name: Optional[str] = None,
+    ) -> 'Check':
+        """Schema parity across N tables (column_name + data_type).
+
+        PASSES if (after removing ``ignore_cols``) the column_name+data_type
+        sets are identical across all ``tables``. FAILS otherwise with detail
+        listing missing columns and data-type mismatches per table.
+
+        Use case: enforce train/inference schema parity for ML pipelines —
+        e.g. assert that ``gold.fct_match_train``, ``gold.fct_match_test``
+        and ``gold.predictions_input_v2`` carry the same feature columns
+        (modulo target/lineage cols passed via ``ignore_cols``).
+
+        ``tables`` items must have the form ``'<schema>.<table>'`` (catalog
+        is assumed to be ``iceberg``, mirroring the rest of this module).
+        At least 2 tables must be supplied — a parity check on a single
+        table is meaningless and raises ``ValueError`` at factory time.
+        ``ignore_cols`` is applied uniformly to every table before the set
+        comparison; pass it the union of columns that legitimately differ.
+        """
+        if not tables or len(tables) < 2:
+            raise ValueError(
+                f"schema_parity requires at least 2 tables, got {len(tables) if tables else 0}"
+            )
+        # Validate table reference format up front so misuse fails loud.
+        _table_ref_re = re.compile(r'^[a-z_][a-z0-9_]*\.[a-z_][a-z0-9_]*$')
+        for t in tables:
+            if not isinstance(t, str) or not _table_ref_re.match(t):
+                raise ValueError(
+                    f"schema_parity table must match '<schema>.<table>' (lowercase), got: {t!r}"
+                )
+        ignore = list(ignore_cols or [])
+        return Check(
+            name=name or f"schema_parity[{','.join(tables)}]",
+            kind='schema_parity',
+            params={'tables': list(tables), 'ignore_cols': ignore},
             severity=severity,
         )
 
@@ -420,16 +469,17 @@ def _run_ref_integrity(conn, check: Check) -> Dict[str, Any]:
     child = _qualify(p['child'])
     parent = _qualify(p['parent'])
     key = _safe_ident(p['key'], "column")
+    parent_key = _safe_ident(p.get('parent_key') or p['key'], "column")
     sql = (
         f"SELECT COUNT(DISTINCT c.{key}) FROM {child} c "
-        f"LEFT JOIN {parent} p ON c.{key} = p.{key} "
-        f"WHERE p.{key} IS NULL AND c.{key} IS NOT NULL"
+        f"LEFT JOIN {parent} p ON c.{key} = p.{parent_key} "
+        f"WHERE p.{parent_key} IS NULL AND c.{key} IS NOT NULL"
     )
     row = _fetchone(conn, sql)
     orphan = row[0] if row else 0
     return {
         'passed': orphan == 0,
-        'details': f"{orphan} orphan key(s) in {child}.{key} not in {parent}",
+        'details': f"{orphan} orphan key(s) in {child}.{key} not in {parent}.{parent_key}",
         'value': orphan,
     }
 
@@ -599,6 +649,151 @@ def _run_scd2_no_overlap(conn, check: Check) -> Dict[str, Any]:
     }
 
 
+def _fetch_schema(conn, table: str) -> List[tuple]:
+    """Return ``[(column_name, data_type), ...]`` for ``schema.table``.
+
+    Reads from ``iceberg.information_schema.columns`` ordered by
+    ``ordinal_position`` so the returned list preserves table layout.
+    Raises ``ValueError`` if ``table`` does not match the strict
+    ``'<schema>.<table>'`` shape (defensive boundary against SQL injection
+    even though the factory has already validated the format).
+
+    Returns ``[]`` if the table does not exist in the catalog — the runner
+    treats that as a violation against the reference set so missing tables
+    surface as a clear error rather than a silent pass.
+    """
+    if not isinstance(table, str) or '.' not in table:
+        raise ValueError(f"schema_parity table must be 'schema.table', got: {table!r}")
+    schema_name, _, table_name = table.partition('.')
+    schema_ident = _safe_ident(schema_name, "schema")
+    table_ident = _safe_ident(table_name, "table")
+    sql = (
+        "SELECT column_name, data_type "
+        "FROM iceberg.information_schema.columns "
+        f"WHERE table_schema = '{schema_ident}' "
+        f"AND table_name = '{table_ident}' "
+        "ORDER BY ordinal_position"
+    )
+    cur = conn.cursor()
+    try:
+        cur.execute(sql)
+        rows = cur.fetchall() or []
+    finally:
+        cur.close()
+    # Each row is (column_name, data_type) — coerce to plain str tuples.
+    return [(str(r[0]), str(r[1])) for r in rows]
+
+
+def _run_schema_parity(conn, check: Check) -> Dict[str, Any]:
+    """Schema parity across N tables (column_name + data_type).
+
+    Algorithm:
+      1) Fetch ``[(name, type), ...]`` for each table from
+         ``iceberg.information_schema.columns``.
+      2) Drop ``ignore_cols`` (case-sensitive, by column name only) from
+         every table's set.
+      3) Use the FIRST table as the reference. For every other table,
+         compute (a) names missing relative to ref, (b) extra names not in
+         ref, (c) type mismatches on common names.
+      4) PASS iff every other table is a perfect match on names+types.
+
+    Edge cases:
+      - <2 tables: factory rejects (ValueError) so this branch is unreachable
+        in practice; runner re-checks defensively.
+      - Missing table: ``information_schema.columns`` returns 0 rows ⇒
+        the table looks like an "empty" set. We surface that explicitly in
+        the message ("0 columns — table missing or empty?") so the operator
+        can distinguish a missing table from a real schema drift.
+      - Empty intersection of columns after ignore_cols: still a FAIL because
+        the sets are not "identical" — we report the table-level diff.
+    """
+    p = check.params
+    tables: List[str] = p['tables']
+    ignore_cols = set(p.get('ignore_cols') or [])
+    if len(tables) < 2:
+        return {
+            'passed': False,
+            'details': f"schema_parity needs >=2 tables, got {len(tables)}",
+            'value': len(tables),
+        }
+
+    # 1) Fetch raw schemas.
+    schemas: Dict[str, List[tuple]] = {}
+    for t in tables:
+        schemas[t] = _fetch_schema(conn, t)
+
+    # 2) Filter ignore_cols and build per-table dict {name: type}.
+    filtered: Dict[str, Dict[str, str]] = {
+        t: {c: dt for c, dt in cols if c not in ignore_cols}
+        for t, cols in schemas.items()
+    }
+
+    # 3) Compare every non-ref table against the reference (first).
+    ref_table = tables[0]
+    ref_map = filtered[ref_table]
+    ref_names = set(ref_map.keys())
+    diffs: List[str] = []
+
+    # Surface tables that came back empty — likely missing in catalog.
+    for t, cols in schemas.items():
+        if not cols:
+            diffs.append(
+                f"  - '{t}' returned 0 columns — table missing from "
+                f"iceberg.information_schema.columns or no columns visible"
+            )
+
+    for t in tables[1:]:
+        other_map = filtered[t]
+        other_names = set(other_map.keys())
+
+        missing = sorted(ref_names - other_names)
+        extra = sorted(other_names - ref_names)
+        type_mismatches = []
+        for col in sorted(ref_names & other_names):
+            if ref_map[col] != other_map[col]:
+                type_mismatches.append(
+                    f"'{col}': {ref_table}={ref_map[col]} vs {t}={other_map[col]}"
+                )
+
+        if missing:
+            diffs.append(
+                f"  - '{t}' MISSING columns relative to '{ref_table}': {missing}"
+            )
+        if extra:
+            diffs.append(
+                f"  - '{t}' has EXTRA columns not in '{ref_table}': {extra}"
+            )
+        if type_mismatches:
+            diffs.append(
+                f"  - '{t}' type mismatch vs '{ref_table}': "
+                + "; ".join(type_mismatches)
+            )
+
+    if not diffs:
+        # Sanity: also verify col count agrees (catches all-types-renamed edge
+        # cases the loop above already covers, but explicit summary is nicer).
+        ref_cnt = len(ref_map)
+        return {
+            'passed': True,
+            'details': (
+                f"schema parity OK across {len(tables)} tables "
+                f"({ref_cnt} cols compared, {len(ignore_cols)} ignored)"
+            ),
+            'value': 0,
+        }
+
+    msg = (
+        f"Schema parity FAILED across {len(tables)} tables "
+        f"(reference='{ref_table}', ignore_cols={sorted(ignore_cols)}):\n"
+        + "\n".join(diffs)
+    )
+    return {
+        'passed': False,
+        'details': msg,
+        'value': len(diffs),
+    }
+
+
 _RUNNERS = {
     'row_count': _run_row_count,
     'no_duplicates': _run_no_duplicates,
@@ -609,6 +804,7 @@ _RUNNERS = {
     'canonical_completeness': _run_canonical_completeness,
     'point_in_time': _run_point_in_time,
     'scd2_no_overlap': _run_scd2_no_overlap,
+    'schema_parity': _run_schema_parity,
 }
 
 

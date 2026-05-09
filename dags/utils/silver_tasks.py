@@ -241,6 +241,286 @@ def run_silver_transform(
     return result
 
 
+# ---------------------------------------------------------------------------
+# E3.5: per-partition INSERT runner for Silver (wrapper-style)
+# ---------------------------------------------------------------------------
+#
+# DESIGN
+# ------
+# Mirrors ``gold_tasks.run_gold_partition_inserts`` but for Silver tables.
+# Used by ``dag_e3_backfill`` to materialise a single (season, league) slice
+# of ``silver.whoscored_events_spadl`` and ``silver.espn_lineup`` without
+# touching other partitions (production E3 DAG keeps using the DROP+CTAS
+# ``run_silver_transform`` for full rebuilds).
+#
+# Two engines are offered:
+#   * ``run_silver_partition_insert``           (this function) — *wrapper*
+#     style. Reads the original SELECT verbatim, then wraps it as
+#     ``SELECT * FROM (<orig>) WHERE league=... AND season=...``. ZERO
+#     modification of the SQL files needed — works on every existing
+#     Silver SELECT. Slightly less efficient than sentinel-based pushdown
+#     (the inner SELECT scans all bronze rows then filters at the outer
+#     layer; Trino's optimiser usually pushes the predicate down anyway).
+#   * Sentinel-style would inject the WHERE inside the SELECT body via the
+#     ``-- WHERE_PARTITION_FILTER_HERE`` marker (see ``gold_tasks``).
+#     Skipped here because Silver SQL files don't have the sentinel yet —
+#     wrapper approach is unblocked and equally correct.
+#
+# IDEMPOTENCY
+# -----------
+# The runner ALWAYS performs DELETE-FROM ... WHERE <partition_filter> before
+# the INSERT, so re-running the task for the same (season, league) tuple
+# produces the same final state. The DDL is run once with IF NOT EXISTS;
+# *if* the target table doesn't exist yet, we fall back to creating it via
+# ``run_silver_transform`` first (a one-time bootstrap path) so the runner
+# always has a target to INSERT into.
+
+
+# Hard cap on partition value length — same shield as Gold.
+_MAX_PARTITION_VALUE_LEN_SILVER = 128
+
+
+def _safe_silver_value(value: str, key: str) -> str:
+    """Escape a partition VALUE for inline use in a Trino predicate.
+
+    Mirrors :func:`utils.gold_tasks._safe_partition_value` — kept inline here
+    to avoid a circular ``silver_tasks → gold_tasks`` import.
+    """
+    if not isinstance(value, str):
+        raise ValueError(
+            f"partition value for {key!r} must be str, got {type(value).__name__}"
+        )
+    if not value:
+        raise ValueError(f"partition value for {key!r} must be non-empty")
+    if len(value) > _MAX_PARTITION_VALUE_LEN_SILVER:
+        raise ValueError(
+            f"partition value for {key!r} too long: "
+            f"{len(value)} chars (max {_MAX_PARTITION_VALUE_LEN_SILVER})"
+        )
+    if any(ch in value for ch in ('\x00', '\n', '\r', '\t', ';')):
+        raise ValueError(
+            f"partition value for {key!r} contains forbidden chars: {value!r}"
+        )
+    if '--' in value or '/*' in value or '*/' in value:
+        raise ValueError(
+            f"partition value for {key!r} contains SQL comment marker: {value!r}"
+        )
+    return value.replace("'", "''")
+
+
+def _build_silver_partition_filter(
+    partition_keys: List[str],
+    partition_values: List[str],
+) -> str:
+    """Build ``league = 'X' AND season = 'Y'`` predicate (no leading WHERE)."""
+    if len(partition_keys) != len(partition_values):
+        raise ValueError(
+            f"partition_keys / values length mismatch: "
+            f"{len(partition_keys)} vs {len(partition_values)}"
+        )
+    parts: List[str] = []
+    for k, v in zip(partition_keys, partition_values):
+        _validate_identifier(k, "partition column")
+        parts.append(f"{k} = '{_safe_silver_value(v, k)}'")
+    return " AND ".join(parts)
+
+
+def run_silver_partition_insert(
+    sql_file: str,
+    table_name: str,
+    partition_values: Dict[str, str],
+    schema: str = 'silver',
+    catalog: str = 'iceberg',
+    partition_columns: Optional[List[str]] = None,
+    trino_host: str = None,
+    trino_port: int = None,
+    add_timestamp: bool = True,
+) -> Dict[str, Any]:
+    """Idempotent per-partition INSERT for a Silver table (wrapper-style).
+
+    Used by ``dag_e3_backfill`` to materialise a single (league, season) slice
+    of Silver E3 tables without touching other partitions.
+
+    Flow:
+      1. CREATE SCHEMA IF NOT EXISTS — idempotent.
+      2. If target table doesn't exist yet, fall back to
+         :func:`run_silver_transform` to bootstrap it (DROP+CTAS for the
+         partition only — produces a single-partition table that subsequent
+         partition-runs append to).
+      3. DELETE FROM <table> WHERE <partition_filter>  — idempotency.
+      4. INSERT INTO <table>
+           SELECT *, CURRENT_TIMESTAMP AS _silver_created_at
+             FROM (<orig SELECT>) AS __src
+            WHERE <partition_filter>
+      5. Return row count for the partition.
+
+    Parameters
+    ----------
+    sql_file : str
+        Path to the SELECT-only SQL file (no sentinel needed).
+    table_name : str
+        Target Silver table (e.g. 'whoscored_events_spadl').
+    partition_values : Dict[str, str]
+        Concrete values for partition columns, e.g. ``{'league': 'ENG-Premier League',
+        'season': '2324'}``.
+    schema, catalog : str
+        Iceberg target (default 'silver' / 'iceberg').
+    partition_columns : Optional[List[str]]
+        Partition column names (default ``['league', 'season']``).
+    add_timestamp : bool
+        Whether to append ``CURRENT_TIMESTAMP AS _silver_created_at`` to the
+        wrapped SELECT — must match what the original CTAS would do, otherwise
+        downstream ``_silver_created_at IS NOT NULL`` DQ checks regress.
+
+    Returns
+    -------
+    Dict[str, Any]
+        ``{table, rows_inserted, partition, status, bootstrap}``.
+        ``bootstrap=True`` means the table was created in this call (no prior
+        rows for the other partitions existed).
+    """
+    if partition_columns is None:
+        partition_columns = ['league', 'season']
+
+    _validate_identifier(catalog, "catalog")
+    _validate_identifier(schema, "schema")
+    _validate_identifier(table_name, "table")
+    for pc in partition_columns:
+        _validate_identifier(pc, "partition column")
+
+    # Validate every partition value is provided
+    if set(partition_values.keys()) != set(partition_columns):
+        raise ValueError(
+            f"partition_values keys must equal partition_columns. "
+            f"Got keys={sorted(partition_values.keys())}, "
+            f"expected={sorted(partition_columns)}"
+        )
+
+    full_table = f"{catalog}.{schema}.{table_name}"
+    keys_ordered = list(partition_columns)
+    values_ordered = [partition_values[k] for k in keys_ordered]
+    partition_filter = _build_silver_partition_filter(keys_ordered, values_ordered)
+    partition_label = ", ".join(f"{k}={v!r}" for k, v in zip(keys_ordered, values_ordered))
+
+    # Read SELECT body
+    sql_path = _resolve_sql_path(sql_file)
+    select_sql = sql_path.read_text(encoding='utf-8').strip()
+    if not select_sql:
+        raise ValueError(f"SQL file is empty: {sql_path}")
+    if select_sql.endswith(';'):
+        select_sql = select_sql[:-1].rstrip()
+
+    result: Dict[str, Any] = {
+        'table': full_table,
+        'partition': dict(partition_values),
+        'rows_inserted': 0,
+        'status': 'pending',
+        'bootstrap': False,
+    }
+
+    conn = _get_trino_connection(host=trino_host, port=trino_port, catalog=catalog)
+    try:
+        # 1. Ensure schema exists.
+        _execute(conn, f"CREATE SCHEMA IF NOT EXISTS {catalog}.{schema}")
+
+        # 2. Check if target table exists. If not, bootstrap via run_silver_transform
+        #    (CTAS the slice for THIS partition only). The wrapped INSERT path needs
+        #    a target table to write to.
+        exists_rows = _execute(
+            conn,
+            f"SHOW TABLES FROM {catalog}.{schema} LIKE '{table_name}'",
+            fetch=True,
+        )
+        target_exists = bool(exists_rows and len(exists_rows) > 0)
+
+        if not target_exists:
+            logger.warning(
+                "%s does not exist — bootstrapping via run_silver_transform "
+                "scoped to the requested partition (%s).",
+                full_table, partition_label,
+            )
+            # Bootstrap: a fresh CTAS scoped to (this partition). We synthesise
+            # a wrapped SELECT so that the freshly-created table only contains
+            # the requested partition. Subsequent partition runs will INSERT.
+            wrapped = (
+                f"SELECT * FROM (\n{select_sql}\n) AS __src\n"
+                f"WHERE {partition_filter}"
+            )
+            partition_clause = ''
+            if partition_columns:
+                cols = ", ".join(f"'{c}'" for c in partition_columns)
+                partition_clause = f"WITH (partitioning = ARRAY[{cols}])\n"
+
+            if add_timestamp:
+                ctas_sql = (
+                    f"CREATE TABLE {full_table}\n"
+                    f"{partition_clause}"
+                    f"AS\n"
+                    f"SELECT *, CURRENT_TIMESTAMP AS _silver_created_at\n"
+                    f"FROM (\n{wrapped}\n)"
+                )
+            else:
+                ctas_sql = (
+                    f"CREATE TABLE {full_table}\n"
+                    f"{partition_clause}"
+                    f"AS\n"
+                    f"{wrapped}"
+                )
+            logger.info("Bootstrap CTAS for %s [%s]", full_table, partition_label)
+            _execute(conn, ctas_sql)
+            result['bootstrap'] = True
+        else:
+            # 3. Idempotency DELETE — wipe any prior rows for this partition.
+            delete_sql = f"DELETE FROM {full_table} WHERE {partition_filter}"
+            logger.info("DELETE (idempotency): %s", delete_sql)
+            _execute(conn, delete_sql)
+
+            # 4. INSERT INTO ... SELECT, wrapped + filtered.
+            wrapped = (
+                f"SELECT * FROM (\n{select_sql}\n) AS __src\n"
+                f"WHERE {partition_filter}"
+            )
+            if add_timestamp:
+                insert_select = (
+                    f"SELECT *, CURRENT_TIMESTAMP AS _silver_created_at "
+                    f"FROM (\n{wrapped}\n) AS __src_ts"
+                )
+            else:
+                insert_select = wrapped
+            insert_sql = f"INSERT INTO {full_table}\n{insert_select}"
+            logger.info("INSERT into %s for %s", full_table, partition_label)
+            _execute(conn, insert_sql)
+
+        # 5. Row count for THIS partition (observability).
+        cnt_rows = _execute(
+            conn,
+            f"SELECT COUNT(*) FROM {full_table} WHERE {partition_filter}",
+            fetch=True,
+        )
+        rows_inserted = cnt_rows[0][0] if cnt_rows else 0
+        result['rows_inserted'] = int(rows_inserted)
+        result['status'] = 'success'
+        logger.info(
+            "Silver partition INSERT done: %s [%s] => %d rows",
+            full_table, partition_label, rows_inserted,
+        )
+
+    except Exception as e:
+        result['status'] = 'failed'
+        result['error'] = str(e)
+        logger.error(
+            "Silver partition INSERT FAILED for %s [%s]: %s",
+            full_table, partition_label, e,
+        )
+        raise RuntimeError(
+            f"Silver partition INSERT failed for {full_table} [{partition_label}]: {e}"
+        ) from e
+    finally:
+        conn.close()
+
+    return result
+
+
 def check_bronze_table_exists(
     table_name: str,
     schema: str = 'bronze',
