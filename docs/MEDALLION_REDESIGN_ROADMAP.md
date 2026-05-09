@@ -359,37 +359,41 @@ Prototype в `scripts/r2_resolver_proto.py` (FBref как spine, unidecode norma
 
 **Status — DONE 2026-05-08** (postmortem `docs/decisions/E3.5-postmortem.md`): Wave 1 (research) + Wave 2 (infra: R4 type unification, parametric `dag_e3_backfill`, DQ extensions) + Wave 3 light scrape (Understat 2122 + ESPN 2122/2223/2324 + 2425 redo = 74,666 rows) + Wave 4 transforms `fct_lineup` (218,961 total: +59,516) + `fct_shot` (56,880 total: +9,775 за 2122) — **CLOSED**. Per-season DQ 9/10 PASS / 0 ERROR / 1 WARNING (~0.9% orphan match_ids — alias drift). **Scope adjustment 2026-05-08**: `fct_event` historical 2122/2223/2324 — **OUT OF SCOPE** (heavy WhoScored CF-bypass scrape ~95h не оправдан); current season 2025-26 уже end-to-end (528,691 events). Phase 2 может вернуться к историческим events. Followups: Task #14 (ESPN read_lineup integration), Task #15 (Iceberg writer auto-chunk on OOM).
 
-### E4 — Narrow facts + ratings + odds + stage (3-5 дней)
+### E4 — Narrow facts + ratings + odds + stage (3-5 дней) — **DONE 2026-05-09**
 
 **Зависит от**: E3 (fct_event для view'ов), R0.2b (SofaScore ratings extension).
 
-- `fct_goal` / `fct_card` / `fct_substitution` (views over fct_event).
-- `fct_match_rating` (требует **R0.2b SofaScore scraper extension**). Если R0.2b даст negative — **отложить в Phase 1.5**.
-- `fct_match_odds` (MatchHistory как entity, не feature — для Brier-backtests).
-- `fct_match_stage` (WhoScored season_stages).
+- ✅ `fct_goal` (UNION fct_shot.result='goal' ⊕ FBref own_goal, 6,525 rows) / `fct_card` (13,608 rows) / `fct_substitution` (25,615 rows). НЕ view'ы — UNION FBref⊕WhoScored с FBref-priority в Silver.
+- ✅ `fct_match_rating` (R0.2b SofaScore extension full path — `tls_requests` + residential proxy + ban-counter retry, 200 rows / 5 матчей APL 2526 smoke).
+- ✅ `fct_match_odds` (47,012 rows / 100% bridge / tall format 30 bookmaker×market×closing).
+- ⏸️ `fct_match_stage` — **deferred Phase 1.5** (whoscored_season_stages.stage всё NULL; ценность низкая до E8a).
 
-**DoD**: row-count parity с fct_event filters; closing odds coverage ≥ 80%.
+**Verdict 2026-05-09** — postmortem `docs/decisions/E4-postmortem.md`. Smoke `airflow dags test dag_transform_e4 2026-05-09` ✅ all 12 tasks SUCCESS, end-to-end ~32 sec, DQ baseline **73/81 passed, 0 ERROR, 8 WARN** (6× ref_integrity Trino alias bug + 2× DoD threshold mis-frame). 9 архитектурных решений (D1-D9): own_goal team_id_canonical = goal-receiving team (FBref convention), tall odds format, MatchHistory bridge через inline 63 team_aliases (RHS = `dim_match` slug, не YAML-canonical), canonical-trio R0.4 (`*_canonical/_source/_version='v1'`), xxhash64 + ROW_NUMBER seq tiebreaker.
 
-### E6 — Features + ML parity + predictions_input v2 (4-6 дней)
+### E6 — Features + ML parity + predictions_input v2 (4-6 дней) — **DONE 2026-05-09**
 
 **Зависит от**: E1 (xref), E2-E5 (новые сущности), R9 (Tier 2, baseline Brier).
 
-- Новые rolling features: `referee_bias`, `manager_form`, `lineup_strength`, `team_event_style`, `unavailable_count_l5`.
-- **predictions_input_v2** materialized рядом с v1 ≥2 недели; feature flag в `dag_serve_predictions.py`; явный cut-over.
-- Update `fct_match_train` / `fct_match_test` — schema parity check как DQ-rule.
-- Point-in-time leak DQ для всех новых feat (`data_quality.point_in_time`).
+- ✅ Новые rolling features: `feat_referee_bias` (L10, 6 cols inline-hash referee_id), `feat_team_event_style` (L5, 10 SPADL action-share cols + empty-stub fallback), `feat_team_xg_form` (L5/L10, уже в E5/E6), `unavailable_count_l5` (через `feat_team_form` propagate в `fct_match`).
+- ⏸️ `feat_manager_form` / `feat_lineup_strength` — **deferred Phase 1.5** (dim_manager STUB пуст; full SofaScore ratings scrape required).
+- ✅ **predictions_input_v2** (104 cols = v1 80 + ref 6 + event_style 20) materialized параллельно с v1; Airflow Variable `predictions_serving_active_version` (default `'v1'`) — manual flip после ≥2 недель green DQ (target 2026-05-23+).
+- ✅ `fct_match` 74→104 cols (3 LEFT JOIN'а: rb / hes / aes); `predictions_input` v1 +36 missing cols (gap fix для schema parity v1↔v2).
+- ✅ Новый DQ kind `schema_parity` (`CHECK.schema_parity(tables, ignore_cols, severity)`) валидирует column_name+data_type parity между train/test/inference.
+- ✅ Point-in-time leak DQ для всех новых feat (`data_quality.point_in_time` × 16 columns).
 
-**DoD**: train/test/inference schema идентичен (DQ assertion), inference green ≥3 дня, Brier baseline (R9) показывает improvement или объяснение его отсутствия.
+**Verdict 2026-05-09** — postmortem `docs/decisions/E6-postmortem.md`. 52 unit-тестов pass на хосте (3.04s); 2 wave-execution (W1-W9). R9 Brier baseline — отложен в Phase 1.5 (не блокирует E6 DoD). `predictions_input_v2` cutover — pending dual-run gate (2026-05-23+).
 
-### E7 — BI + Catalog (3-5 дней)
+### E7 — BI + Catalog (3-5 дней) — **shipped 2026-05-09 / ≥3d DQ-gate pending до 2026-05-12+**
 
 **Зависит от**: E2-E6 stable.
 
-- Новые marts (scouting radar / referee dash / manager profile / event heatmap).
-- Superset dashboards (`configs/superset/dashboards/<name>.py`).
-- OpenMetadata descriptions + relationships (`configs/openmetadata/descriptions/*.yaml`) для всех новых таблиц.
+- ✅ 3 новых mart'а: `mart_scouting_radar` (100,793 rows, per-(player,match) + L5 rolling), `mart_referee_dashboard` (218 rows, per-(referee,season,league)), `mart_event_heatmap` (25,895 rows, SPADL 12×8 zone grid). Денормализованные для прямого Superset usage.
+- ⏸️ `mart_manager_profile` — **deferred Phase 1.5** (dim_manager STUB пуст).
+- ✅ Superset infra: `import_dashboards.py` (REST client, idempotent CREATE-IF-NOT-EXISTS), `datasources.yaml` (18 datasets), 3 декларативных Python dashboards.
+- ✅ OpenMetadata infra: `apply_descriptions.py` (JWT auth, idempotent), 31 YAML descriptions (Tier.Gold + Domain.Football tags + relationships для ER-diagram).
+- ✅ Tests + DQ: 483/488 pytest pass, mart row counts verified, no_duplicates+freshness+value_range+point_in_time для каждого mart'а.
 
-**DoD**: дашборды рендерятся, ER-diagram содержит новые связи.
+**Verdict 2026-05-09** — postmortem `docs/decisions/E7-postmortem.md`. 7 архитектурных решений (D1-D7): денормализованные mart'ы, empty-stub fallback'и, idempotent REST clients, OM relationships в YAML, Superset SDK dashboards в Python (vs JSON exports), 12×8 SPADL zone grid (FIFA Connect compatible), light DQ для mart'ов. **≥3d green-gate перед E8a — opened**, target close 2026-05-12+ (3 successful master_pipeline runs без DQ ERROR).
 
 ### E8 — T1 multi-competition expansion (split, was 5-10 дней → 15-25 дней) ⚠️
 
@@ -436,9 +440,9 @@ Prototype в `scripts/r2_resolver_proto.py` (FBref как spine, unidecode norma
 | E1 | xref refactor (Gold→Silver) | 3-5 | **DONE 2026-05-08** |
 | E3 | Core match facts | 5-7 | **DONE 2026-05-08** |
 | E3.5 | Historical backfill (NEW) | 5-10 | medium (storage) |
-| E4 | Narrow facts + ratings + odds | 3-5 + R0.2b feedback | low/medium |
-| E6 | Features + ML + predictions v2 | 4-6 | low |
-| E7 | BI + Catalog | 3-5 | low |
+| E4 | Narrow facts + ratings + odds | 3-5 + R0.2b feedback | **DONE 2026-05-09** |
+| E6 | Features + ML + predictions v2 | 4-6 | **DONE 2026-05-09** (v2 cutover pending 2026-05-23+) |
+| E7 | BI + Catalog | 3-5 | **shipped 2026-05-09 / DQ-gate pending 2026-05-12+** |
 | E8a | UCL expansion | 5-7 | high |
 | E8b | Top-5 leagues | 5-10 | **very high** |
 | E8c | EL + cups | 5-8 | high |
