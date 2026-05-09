@@ -517,10 +517,12 @@ class TestResolveAll:
             self._src_row('whoscored', '999', 'Saka Bukayo', 'Arsenal'),
         ]
 
-        rows, stats = xpr._resolve_all(fb, us, ws)
+        rows, review, stats = xpr._resolve_all(fb, us, ws)
 
         # Total rows = 2 fb + 2 us + 1 ws.
         assert len(rows) == 5
+        # No ambiguity in this fixture (each name resolves uniquely).
+        assert review == []
 
         # FBref rows are spine — all 'exact'.
         fb_rows = [r for r in rows if r['source'] == 'fbref']
@@ -541,16 +543,22 @@ class TestResolveAll:
         assert ws_row['canonical_id'] == 'fb_bc7dc64d'
         assert ws_row['confidence'] == 'name_team'
 
-        # Stats ledger
-        assert stats['fbref'] == {'total': 2, 'resolved': 2, 'orphan': 0}
-        assert stats['understat'] == {'total': 2, 'resolved': 1, 'orphan': 1}
-        assert stats['whoscored'] == {'total': 1, 'resolved': 1, 'orphan': 0}
+        # Stats ledger — v2 cascade tracks 'ambiguous' alongside 'orphan'.
+        assert stats['fbref'] == {
+            'total': 2, 'resolved': 2, 'orphan': 0, 'ambiguous': 0,
+        }
+        assert stats['understat'] == {
+            'total': 2, 'resolved': 1, 'orphan': 1, 'ambiguous': 0,
+        }
+        assert stats['whoscored'] == {
+            'total': 1, 'resolved': 1, 'orphan': 0, 'ambiguous': 0,
+        }
 
     def test_orphan_prefix_per_source(self):
         fb = [self._fb_row('aaa', 'Some Name', 'Arsenal')]
         us = [self._src_row('understat', 'u_only', 'Nobody Match', 'Arsenal')]
         ws = [self._src_row('whoscored', 'w_only', 'Nobody Match', 'Arsenal')]
-        rows, _ = xpr._resolve_all(fb, us, ws)
+        rows, _review, _stats = xpr._resolve_all(fb, us, ws)
         orphans = {r['source']: r['canonical_id'] for r in rows
                    if r['confidence'] == 'orphan'}
         assert orphans == {

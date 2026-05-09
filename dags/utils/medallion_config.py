@@ -61,6 +61,7 @@ CONFIG_DIR = Path(
 
 TEAM_ALIASES_FILE = 'team_aliases.yaml'
 COMPETITIONS_FILE = 'competitions.yaml'
+PLAYER_ALIASES_FILE = 'player_aliases.yaml'
 
 # Sentinel for "no source filter" — distinct from None which means "include
 # generic + all sources merged" in get_team_alias_pairs. We pass the bucket
@@ -100,6 +101,71 @@ def _validate_team_aliases_schema(doc: Dict) -> None:
             raise MedallionConfigError(
                 f"team_aliases.yaml: teams[{i}] ({t.get('canonical_name')}) "
                 f"missing/invalid 'aliases'"
+            )
+
+
+def _validate_player_aliases_schema(doc: Dict) -> None:
+    """Minimal structural validation of player_aliases.yaml.
+
+    Allowed top-level shape::
+
+        aliases: []                           # empty list — valid
+        aliases:
+          - source: understat
+            source_id: "12345"
+            fbref_player_id: "abcdef12"
+            season: "2425" | "*"
+            reason: "..."                     # optional
+
+    Required fields per entry: ``source``, ``source_id``, ``fbref_player_id``,
+    ``season``. ``reason`` is optional but encouraged. Unknown keys are
+    permitted (forward-compatibility) but flagged via ValueError if the
+    required keys are missing.
+    """
+    if not isinstance(doc, dict) or 'aliases' not in doc:
+        raise MedallionConfigError(
+            "player_aliases.yaml: missing top-level 'aliases' key"
+        )
+    aliases = doc['aliases']
+    if aliases is None:
+        return  # treat null as empty list — equivalent to []
+    if not isinstance(aliases, list):
+        raise MedallionConfigError(
+            "player_aliases.yaml: 'aliases' must be a list"
+        )
+    required = ('source', 'source_id', 'fbref_player_id', 'season')
+    for i, entry in enumerate(aliases):
+        if not isinstance(entry, dict):
+            raise MedallionConfigError(
+                f"player_aliases.yaml: aliases[{i}] must be a mapping"
+            )
+        for key in required:
+            if key not in entry:
+                raise MedallionConfigError(
+                    f"player_aliases.yaml: aliases[{i}] missing required "
+                    f"key {key!r}"
+                )
+        # Source/source_id/fbref_player_id must be non-empty strings.
+        for key in ('source', 'source_id', 'fbref_player_id'):
+            val = entry[key]
+            if not isinstance(val, str) or not val.strip():
+                raise MedallionConfigError(
+                    f"player_aliases.yaml: aliases[{i}].{key} "
+                    f"must be a non-empty string (got {val!r})"
+                )
+        # season must be a 4-digit slug OR the literal "*"
+        season_raw = entry['season']
+        if not isinstance(season_raw, (str, int)):
+            raise MedallionConfigError(
+                f"player_aliases.yaml: aliases[{i}].season "
+                f"must be a string slug or int (got {season_raw!r})"
+            )
+        season_str = str(season_raw)
+        if season_str != '*' and not re.fullmatch(r'\d{4}', season_str):
+            raise MedallionConfigError(
+                f"player_aliases.yaml: aliases[{i}].season "
+                f"must be 4-digit slug (e.g. '2425') or '*' "
+                f"(got {season_str!r})"
             )
 
 
@@ -153,6 +219,23 @@ def load_competitions() -> Dict:
     path = str(CONFIG_DIR / COMPETITIONS_FILE)
     doc = _read_yaml(path)
     _validate_competitions_schema(doc)
+    return doc
+
+
+def load_player_aliases() -> Dict:
+    """Return the parsed player_aliases.yaml (with schema sanity-check).
+
+    Missing file is treated as ``{'aliases': []}`` — the v2 resolver tier-3
+    is purely additive and an absent YAML file simply means "no overrides".
+    """
+    path = str(CONFIG_DIR / PLAYER_ALIASES_FILE)
+    if not Path(path).exists():
+        return {'aliases': []}
+    doc = _read_yaml(path)
+    _validate_player_aliases_schema(doc)
+    # Normalise null aliases to empty list.
+    if doc.get('aliases') is None:
+        doc = {**doc, 'aliases': []}
     return doc
 
 
@@ -317,6 +400,73 @@ def get_team_alias_sql_values(
         for raw, canonical in pairs
     ]
     return ',\n'.join(lines).lstrip()
+
+
+# ---------------------------------------------------------------------------
+# Player aliases — query helper for the v2 resolver tier-3 fallback
+# ---------------------------------------------------------------------------
+
+def get_player_alias(
+    source: str,
+    source_id: str,
+    season: str,
+) -> Optional[str]:
+    """Look up a hand-curated FBref player_id override for ``(source, source_id, season)``.
+
+    The v2 resolver consults this AFTER all algorithmic tiers fail (surname,
+    token_set, nicknames). Empty YAML / missing file is the common case at
+    E1; this function returns ``None`` cleanly.
+
+    Lookup precedence:
+      1. Exact (source, source_id, season) match.
+      2. (source, source_id, '*') wildcard match — used when an alias is
+         valid across all configured seasons.
+
+    Returns:
+        FBref player_id WITHOUT the ``fb_`` prefix (caller prepends), or
+        ``None`` if no entry matches.
+    """
+    if not source or not source_id:
+        return None
+    sid = str(source_id)
+    season_str = str(season) if season is not None else ''
+    doc = load_player_aliases()
+    aliases = doc.get('aliases') or []
+
+    exact: Optional[str] = None
+    wildcard: Optional[str] = None
+    for entry in aliases:
+        if entry['source'] != source:
+            continue
+        if str(entry['source_id']) != sid:
+            continue
+        entry_season = str(entry['season'])
+        if entry_season == season_str:
+            exact = entry['fbref_player_id']
+            break
+        if entry_season == '*':
+            wildcard = entry['fbref_player_id']
+    return exact if exact is not None else wildcard
+
+
+def get_player_alias_pairs() -> List[Dict[str, str]]:
+    """Return the full list of player alias entries (for tests/diagnostics).
+
+    Each item is a dict with keys ``source, source_id, fbref_player_id,
+    season, reason``. Output is a fresh list — callers may mutate freely.
+    """
+    doc = load_player_aliases()
+    aliases = doc.get('aliases') or []
+    return [
+        {
+            'source': str(e['source']),
+            'source_id': str(e['source_id']),
+            'fbref_player_id': str(e['fbref_player_id']),
+            'season': str(e['season']),
+            'reason': str(e.get('reason', '')),
+        }
+        for e in aliases
+    ]
 
 
 # ---------------------------------------------------------------------------

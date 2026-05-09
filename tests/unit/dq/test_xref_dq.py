@@ -239,13 +239,35 @@ def test_xref_manager_zero_rows():
 
 
 def test_xref_player_confidence_enum_full():
-    """xref_player confidence enum includes all 5 cascade tiers."""
+    """xref_player confidence enum includes all v2-resolver cascade tiers.
+
+    The R2-followup v2 resolver introduced four additional tier labels
+    (surname-anchor, token_set subset, nicknames dict, player_aliases YAML)
+    plus retained two reserved STUBs (jersey / dob) and the orphan terminal.
+    'ambiguous' is INTENTIONALLY excluded — clerical-review rows must land
+    in silver.xref_player_review, never in xref_player itself.
+    """
     checks = xref_dq.build_xref_player_checks()
     enum_checks = [c for c in checks if 'enum_compliance' in c.name and 'confidence' in c.name]
     assert len(enum_checks) == 1
     where = enum_checks[0].params['where']
-    for tier in ['exact', 'name_team', 'name_team_jersey', 'name_team_dob', 'orphan']:
-        assert f"'{tier}'" in where
+    for tier in [
+        'exact',
+        'name_team',
+        'name_team_surname',
+        'name_team_subset',
+        'name_team_nickname',
+        'name_team_alias',
+        'name_team_jersey',
+        'name_team_dob',
+        'orphan',
+    ]:
+        assert f"'{tier}'" in where, f"missing tier {tier!r} in enum allow-list"
+    # 'ambiguous' must NOT be in the xref_player allow-list — see docstring.
+    assert "'ambiguous'" not in where, (
+        "xref_player allow-list must NOT include 'ambiguous' — "
+        "Fellegi-Sunter clerical-review band routes to xref_player_review."
+    )
 
 
 def test_xref_player_canonical_id_format_check():
@@ -259,10 +281,55 @@ def test_xref_player_canonical_id_format_check():
 
 
 def test_build_all_xref_checks_aggregates():
-    """Aggregated list ≥ 16 checks (4 team + 5 match + 5 referee + 2 manager + 6 player)."""
+    """Aggregated list now also includes xref_player_review (5 checks).
+
+    Original T6 spec was ≥15; v2 adds 5 review checks → ≥20 total.
+    """
     checks = xref_dq.build_all_xref_checks()
-    # The exact target is per the T6 spec: ≥15
-    assert len(checks) >= 15, f"Expected ≥15 checks, got {len(checks)}"
+    assert len(checks) >= 20, f"Expected ≥20 checks, got {len(checks)}"
+
+
+# ---------------------------------------------------------------------------
+# xref_player_review (R2-followup v2 sibling)
+# ---------------------------------------------------------------------------
+def test_xref_player_review_checks_minimum_set():
+    checks = xref_dq.build_xref_player_review_checks()
+    # row_count + no_duplicates + no_nulls + 2× enum_compliance
+    kinds = [c.kind for c in checks]
+    assert 'row_count' in kinds
+    assert 'no_duplicates' in kinds
+    assert 'no_nulls' in kinds
+    enum_checks = [c for c in checks if 'enum_compliance' in c.name]
+    assert len(enum_checks) == 2, f"expected 2 enum checks, got {len(enum_checks)}"
+
+
+def test_xref_player_review_rule_enum():
+    checks = xref_dq.build_xref_player_review_checks()
+    rule_checks = [c for c in checks if 'enum_compliance' in c.name and '.rule' in c.name]
+    assert len(rule_checks) == 1
+    where = rule_checks[0].params['where']
+    for rule in ['surname_collision', 'token_set_band', 'nickname_collision']:
+        assert f"'{rule}'" in where
+
+
+def test_xref_player_review_source_enum_excludes_fbref():
+    """FBref is the spine — never appears in review queue."""
+    checks = xref_dq.build_xref_player_review_checks()
+    src_checks = [c for c in checks if 'enum_compliance' in c.name and '.source' in c.name]
+    assert len(src_checks) == 1
+    where = src_checks[0].params['where']
+    assert "'fbref'" not in where, "fbref must not be in review-source allow-list"
+    for src in ['understat', 'whoscored', 'sofascore']:
+        assert f"'{src}'" in where
+
+
+def test_xref_player_review_row_count_soft_ceiling():
+    """Soft ceiling 200 rows across the entire review table."""
+    checks = xref_dq.build_xref_player_review_checks()
+    rc = [c for c in checks if c.kind == 'row_count' and 'enum' not in c.name]
+    assert len(rc) == 1
+    assert rc[0].params['min_rows'] == 0
+    assert rc[0].params['max_rows'] == 200
 
 
 def test_check_enum_compliance_helper_basic():

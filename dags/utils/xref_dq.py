@@ -234,9 +234,18 @@ def build_xref_player_checks() -> List[Check]:
         CHECK.no_nulls(table, cols=['canonical_id', 'source', 'source_id']),
 
         # confidence — mirror the resolver cascade tier names verbatim.
+        # 'name_team_surname' / 'name_team_subset' / 'name_team_nickname' /
+        # 'name_team_alias' added by R2-followup v2 resolver. 'name_team_jersey'
+        # / 'name_team_dob' remain reserved STUBs (Bronze does not yet expose
+        # cross-source jersey/DOB consistently). 'ambiguous' is INTENTIONALLY
+        # NOT in this list — Fellegi-Sunter clerical-review rows must land in
+        # silver.xref_player_review, not xref_player. An 'ambiguous' value
+        # here is therefore a DQ ERROR by design.
         check_enum_compliance(
             table, 'confidence',
-            allowed=['exact', 'name_team', 'name_team_jersey',
+            allowed=['exact', 'name_team', 'name_team_surname',
+                     'name_team_subset', 'name_team_nickname',
+                     'name_team_alias', 'name_team_jersey',
                      'name_team_dob', 'orphan'],
             severity='ERROR',
         ),
@@ -262,14 +271,68 @@ def build_xref_player_checks() -> List[Check]:
     ]
 
 
+def build_xref_player_review_checks() -> List[Check]:
+    """DQ for ``iceberg.silver.xref_player_review`` (R2-followup v2 sibling).
+
+    The review table holds Fellegi-Sunter clerical-review band rows — source
+    candidates that the resolver flagged ambiguous (multiple candidates
+    surfaced by surname-anchor / token_set / nickname tiers). It is intended
+    to stay SMALL: a healthy resolver run produces ≤30 rows per (league,
+    season). Significantly more rows is a signal that thresholds are
+    miscalibrated or that the spine is missing entries.
+
+    Checks:
+      * row_count(min=0, max=200) — soft ceiling at 200 across the whole
+        table. APL has 4 in-scope seasons × 3 sources, so 200 leaves
+        meaningful headroom while still alarming on runaway growth.
+      * no_duplicates on ``(source, source_id, league, season)`` — the
+        resolver may legitimately surface the same source row across
+        multiple seasons but never twice in the same season.
+      * no_nulls on identifying columns.
+      * enum compliance on ``rule`` — must match the rule labels emitted
+        by the cascade (``surname_collision``, ``token_set_band``,
+        ``nickname_collision``).
+      * enum compliance on ``source`` — three v2-supported sources.
+    """
+    table = 'iceberg.silver.xref_player_review'
+    return [
+        CHECK.row_count(table, min_rows=0, max_rows=200),
+
+        CHECK.no_duplicates(
+            table,
+            pk=['source', 'source_id', 'league', 'season'],
+        ),
+
+        CHECK.no_nulls(
+            table,
+            cols=['source', 'source_id', 'rule', 'league', 'season',
+                  'detected_at'],
+        ),
+
+        check_enum_compliance(
+            table, 'rule',
+            allowed=['surname_collision', 'token_set_band',
+                     'nickname_collision'],
+            severity='ERROR',
+        ),
+
+        check_enum_compliance(
+            table, 'source',
+            allowed=['understat', 'whoscored', 'sofascore'],
+            severity='ERROR',
+        ),
+    ]
+
+
 def build_all_xref_checks() -> List[Check]:
-    """Aggregate DQ checks for all 5 xref tables."""
+    """Aggregate DQ checks for all 5 xref tables + review sibling."""
     return (
         build_xref_team_checks()
         + build_xref_match_checks()
         + build_xref_referee_checks()
         + build_xref_manager_checks()
         + build_xref_player_checks()
+        + build_xref_player_review_checks()
     )
 
 

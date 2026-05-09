@@ -1,0 +1,26 @@
+# player_aliases.yaml — final-tier override for the v2 player resolver.
+#
+# Hand-curated mapping for residual non-Anglo / locale-specific name forms
+# that are not covered by the upstream tiers:
+#   - surname-anchor (Levenshtein <= 1)
+#   - token_set_ratio >= 95
+#   - nicknames PyPI package (~1100 English short<->full pairs)
+#
+# Keep this file SMALL (<= 30 entries). Growth beyond ~30 is a signal that
+# a structural tier rule is missing or that a locale-specific nickname
+# package should be introduced (Spanish/Portuguese/French short forms).
+#
+# Schema:
+#   aliases:
+#     - source: understat | whoscored | sofascore | fotmob | matchhistory
+#       source_id: "<the source's player_id, varchar>"
+#       fbref_player_id: "<FBref player_id, WITHOUT the 'fb_' prefix>"
+#       season: "<4-digit slug, e.g. '2425'>"  | "*"  (any season)
+#       reason: "<short comment for the reviewer>"
+#
+# Lookup contract (see utils.medallion_config.get_player_alias):
+#   * (source, source_id, season) is matched first.
+#   * If no row matches the exact season, a row with season='*' is tried.
+#   * Returns the FBref player_id without 'fb_' prefix, or None.
+
+aliases: []

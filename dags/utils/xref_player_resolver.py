@@ -79,10 +79,32 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 DEFAULT_TARGET_TABLE = 'iceberg.silver.xref_player'
 
+#: Iceberg sibling table for the Fellegi-Sunter clerical-review band — rows
+#: that the v2 cascade flagged as ambiguous (multiple equally-good candidates
+#: in a (season, canonical_team) bucket, or token_set scores in 88-94 grey
+#: zone) land here, NEVER in xref_player. Maintained by the same resolver run.
+DEFAULT_REVIEW_TABLE = 'iceberg.silver.xref_player_review'
+
 #: token_sort_ratio threshold (0-100). 90 was tuned on the R2 algo spike —
 #: catches typical accent / dash / order-of-tokens variants without leaking
 #: cross-player false positives. Do NOT lower without rerunning the spike.
 NAME_THRESHOLD: float = 90.0
+
+#: token_set_ratio thresholds for the v2 R2-followup cascade tier.
+#: ≥ TOKEN_SET_AUTO     — auto-link with confidence='name_team_subset'
+#: TOKEN_SET_BAND_LOW   ≤ score < TOKEN_SET_AUTO  → ambiguous (review queue)
+#: Below TOKEN_SET_BAND_LOW — no signal, fall through to next tier.
+TOKEN_SET_AUTO: float = 95.0
+TOKEN_SET_BAND_LOW: float = 88.0
+
+#: Maximum Levenshtein distance allowed on the surname (last token) for
+#: tier 2.3 surname-anchor matching. 1 catches typical typos (Roberson↔Robertson)
+#: without leaking distinct surnames into each other.
+SURNAME_LEVENSHTEIN_MAX: int = 1
+
+#: Minimum surname length for tier 2.3. Below 4 chars Levenshtein≤1 produces
+#: too many false matches (Cole/Cone/Cool, Saka/Sako).
+SURNAME_MIN_LEN: int = 4
 
 #: Sources covered at E1. ``sofascore`` and ``fotmob`` are deferred to the
 #: R0.2 follow-up (Bronze tables for those sources do not yet expose a
@@ -289,50 +311,325 @@ class _FBrefSpine:
             return best_id, best_score
         return None, best_score
 
+    # -----------------------------------------------------------------
+    # v2 cascade tiers (R2-followup)
+    # -----------------------------------------------------------------
+    # Each tier method returns a (player_id, score, candidates) triple
+    # where ``candidates`` is the list of (player_id, name, score) tuples
+    # that satisfied the tier rule. Convention:
+    #   * exactly 1 candidate  -> player_id is set, candidates has 1 item
+    #   * >1 candidates        -> player_id=None, score=0.0, ambiguous
+    #   * 0 candidates / no-op -> player_id=None, score=0.0, candidates=[]
+    # The "ambiguous" / "no-op" cases are distinguishable by ``len(candidates)``.
+
+    def find_by_surname(
+        self,
+        name: Optional[str],
+        canonical_team: Optional[str],
+        season: Optional[str] = None,
+    ) -> Tuple[Optional[str], float, List[Tuple[str, str, float]]]:
+        """Tier 2.3: surname-anchor with Levenshtein≤1 on the last token.
+
+        Source name's final token must equal the FBref candidate's final
+        token, OR be within :data:`SURNAME_LEVENSHTEIN_MAX` edit distance
+        (only when both surnames have ≥ :data:`SURNAME_MIN_LEN` chars —
+        below that threshold edit-distance is too forgiving).
+
+        Uniqueness guard: > 1 surnames-match in the same bucket → ambiguous.
+        """
+        if not canonical_team or not season:
+            return None, 0.0, []
+        cands = self.by_team.get((season, canonical_team))
+        if not cands:
+            return None, 0.0, []
+
+        n = normalize_name(name)
+        if not n:
+            return None, 0.0, []
+        n_tokens = n.split()
+        if not n_tokens:
+            return None, 0.0, []
+        n_last = n_tokens[-1]
+        if len(n_last) < SURNAME_MIN_LEN:
+            return None, 0.0, []
+
+        from rapidfuzz.distance import Levenshtein  # type: ignore
+
+        matches: List[Tuple[str, str, float]] = []
+        for cn, fid in cands:
+            cn_tokens = cn.split()
+            if not cn_tokens:
+                continue
+            cn_last = cn_tokens[-1]
+            if n_last == cn_last:
+                matches.append((fid, cn, 100.0))
+            elif (
+                len(cn_last) >= SURNAME_MIN_LEN
+                and Levenshtein.distance(n_last, cn_last) <= SURNAME_LEVENSHTEIN_MAX
+            ):
+                matches.append((fid, cn, 99.0))
+
+        if len(matches) == 1:
+            fid, _cn, score = matches[0]
+            return fid, score, matches
+        return None, 0.0, matches
+
+    def find_by_token_set(
+        self,
+        name: Optional[str],
+        canonical_team: Optional[str],
+        season: Optional[str] = None,
+    ) -> Tuple[Optional[str], float, List[Tuple[str, str, float]], str]:
+        """Tier 2.5 / 2.6: ``token_set_ratio`` with two thresholds.
+
+        Returns ``(player_id, score, candidates, kind)`` where ``kind`` is:
+
+        * ``'auto'``           — exactly one candidate scored ≥ TOKEN_SET_AUTO.
+        * ``'ambiguous_band'`` — candidates exist in either the auto-link OR
+          the band 88-94 zone, but not a unique 95+ match (Fellegi-Sunter
+          clerical-review band — caller must NOT auto-merge).
+        * ``'none'``           — no candidate scored ≥ TOKEN_SET_BAND_LOW.
+
+        ``token_set_ratio`` returns 100 when one string is a token-subset of
+        the other ("Pape Sarr" ⊂ "Pape Matar Sarr"), so this tier closes the
+        single most-impactful failure mode of the v1 resolver (subset names).
+        """
+        if not canonical_team or not season:
+            return None, 0.0, [], 'none'
+        cands = self.by_team.get((season, canonical_team))
+        if not cands:
+            return None, 0.0, [], 'none'
+
+        n = normalize_name(name)
+        if not n:
+            return None, 0.0, [], 'none'
+
+        from rapidfuzz import fuzz  # type: ignore
+
+        auto: List[Tuple[str, str, float]] = []
+        band: List[Tuple[str, str, float]] = []
+        for cn, fid in cands:
+            score = float(fuzz.token_set_ratio(n, cn))
+            if score >= TOKEN_SET_AUTO:
+                auto.append((fid, cn, score))
+            elif score >= TOKEN_SET_BAND_LOW:
+                band.append((fid, cn, score))
+
+        if len(auto) == 1:
+            fid, _cn, score = auto[0]
+            return fid, score, auto, 'auto'
+        if auto:
+            # >1 candidates at 95+ — ambiguous
+            return None, 0.0, auto, 'ambiguous_band'
+        if band:
+            # 88-94 — Fellegi-Sunter clerical-review band, never auto-link
+            return None, 0.0, band, 'ambiguous_band'
+        return None, 0.0, [], 'none'
+
+    def find_by_nickname(
+        self,
+        name: Optional[str],
+        canonical_team: Optional[str],
+        season: Optional[str] = None,
+        nn: Any = None,
+    ) -> Tuple[Optional[str], List[Tuple[str, str, float]]]:
+        """Tier 2.7: ``nicknames`` PyPI dict over first-name pairs.
+
+        Asymmetric Splink #2206 rule: A's first-name in ``nn.nicknames_of(B)``
+        OR vice versa, OR canonical-of pair. Surnames MUST already match
+        (last token equality) — without this guard the tier produces
+        cross-player matches via common nicknames.
+        """
+        if nn is None or not canonical_team or not season:
+            return None, []
+        cands = self.by_team.get((season, canonical_team))
+        if not cands:
+            return None, []
+
+        n = normalize_name(name)
+        if not n:
+            return None, []
+        n_tokens = n.split()
+        if len(n_tokens) < 2:
+            return None, []
+        n_first, n_last = n_tokens[0], n_tokens[-1]
+
+        matches: List[Tuple[str, str, float]] = []
+        for cn, fid in cands:
+            cn_tokens = cn.split()
+            if len(cn_tokens) < 2:
+                continue
+            cn_first, cn_last = cn_tokens[0], cn_tokens[-1]
+            if n_last != cn_last:
+                continue
+            if _nickname_match(n_first, cn_first, nn):
+                matches.append((fid, cn, 100.0))
+
+        if len(matches) == 1:
+            return matches[0][0], matches
+        return None, matches
+
+
+def _nickname_match(a: str, b: str, nn: Any) -> bool:
+    """Asymmetric ``nicknames``-pkg pair check (Splink discussion #2206 rule).
+
+    True if either ``a`` is a nickname / canonical of ``b``, or vice versa.
+    Equality short-circuits to True. The ``nicknames`` package emits names
+    in title-case ({"Andrew", "Andre"}), while the resolver normalises
+    everything to lower-case via :func:`normalize_name` — so we case-fold
+    the package's output before comparison. Empty / unknown lookup yields
+    an empty set, which falls through cleanly to the next branch.
+
+    Args:
+        a, b: normalised lower-case first names.
+        nn: a ``nicknames.NickNamer`` instance (caller manages lifecycle).
+    """
+    if a == b:
+        return True
+    if a in {x.lower() for x in nn.nicknames_of(b)}:
+        return True
+    if b in {x.lower() for x in nn.nicknames_of(a)}:
+        return True
+    if a in {x.lower() for x in nn.canonicals_of(b)}:
+        return True
+    if b in {x.lower() for x in nn.canonicals_of(a)}:
+        return True
+    return False
+
+
+def _alias_lookup(
+    source: str,
+    source_id: str,
+    season: Optional[str],
+) -> Optional[str]:
+    """Tier-3 fallback: hand-curated ``player_aliases.yaml`` override.
+
+    Returns the FBref player_id (without ``fb_`` prefix) or None when no
+    entry covers ``(source, source_id, season)``. Lazy-imports
+    :mod:`utils.medallion_config` so DAG-parse cost stays cheap.
+
+    A missing YAML or empty list is the common case at E1 — the tier
+    simply no-ops.
+    """
+    if not source or not source_id:
+        return None
+    from utils.medallion_config import get_player_alias  # lazy
+
+    return get_player_alias(source, str(source_id), str(season or ''))
+
 
 def cascade_resolve(
     candidate: Dict[str, Any],
     spine: _FBrefSpine,
-) -> Tuple[str, str, Optional[float]]:
-    """Run the tier cascade for a single non-FBref candidate row.
+    *,
+    nn: Any = None,
+    ambiguity_out: Optional[Dict[str, Any]] = None,
+) -> Tuple[Optional[str], str, Optional[float]]:
+    """Run the v2 tier cascade for a single non-FBref candidate row.
 
     Args:
         candidate: dict with keys ``source``, ``source_id``, ``player_name``,
-            ``canonical_team``.
+            ``canonical_team`` (and ``season`` for the per-season buckets).
         spine: prebuilt :class:`_FBrefSpine`.
+        nn: optional ``nicknames.NickNamer`` instance to enable tier 2.7.
+            When ``None`` the nickname tier is skipped (the existing legacy
+            test suite passes ``nn=None`` so behaviour stays unchanged for
+            non-nickname kingpins).
+        ambiguity_out: optional dict mutated by the cascade when a tier
+            returns ambiguous (multiple candidates in the same bucket).
+            Keys populated: ``rule``, ``candidates`` (list of
+            ``(player_id, name, score)`` tuples), ``best_score``. When
+            ``None`` (default) ambiguous candidates simply produce
+            ``(None, 'ambiguous', None)`` and the caller decides whether
+            to escalate or drop.
 
     Returns:
         ``(canonical_id, confidence, match_score)``.
 
-        * ``confidence='exact'``     -> ``match_score`` is None (FBref id hit).
-        * ``confidence='name_team'`` -> ``match_score`` is the rapidfuzz score.
-        * ``confidence='orphan'``    -> ``match_score`` is best score seen
-          (may be None if team bucket was empty, else float).
+        * ``confidence='exact'``               — ``match_score`` is None.
+        * ``confidence='name_team'``           — token_sort_ratio≥90 win.
+        * ``confidence='name_team_surname'``   — surname-anchor + Levenshtein≤1.
+        * ``confidence='name_team_subset'``    — token_set_ratio≥95.
+        * ``confidence='name_team_nickname'``  — first-name nickname pair
+                                                + surname match.
+        * ``confidence='name_team_alias'``     — player_aliases.yaml lookup.
+        * ``confidence='orphan'``              — no tier matched. ``match_score``
+                                                is best score seen at tier-2.
+        * ``confidence='ambiguous'``           — a fuzzy/dict tier had >1
+                                                candidate; ``canonical_id`` is
+                                                ``None`` and the row must
+                                                land in ``xref_player_review``.
 
-    The function is a *pure* function over ``(candidate, spine)`` — kept
-    that way deliberately so unit tests can assert exact behaviour without
-    any Trino mock.
+    Pure function over ``(candidate, spine, nn, ambiguity_out)`` so unit
+    tests can assert exact behaviour without any Trino mock.
     """
     src = candidate['source']
     sid = str(candidate['source_id'])
     name = candidate.get('player_name')
     team = candidate.get('canonical_team')
+    season = candidate.get('season')
 
-    # Tier-1: exact id (FBref-id collision across sources is rare but
-    # checked first so we don't waste a fuzzy pass).
+    # Tier-1: exact FBref-id match.
     fid = spine.find_by_id(sid)
     if fid:
         return f'fb_{fid}', 'exact', None
 
-    # Tier-2: name + canonical-team fuzzy match.
-    fid, score = spine.find_by_name_team(name, team, candidate.get('season'))
+    # Tier-2: legacy token_sort_ratio ≥ NAME_THRESHOLD.
+    fid, name_team_score = spine.find_by_name_team(name, team, season)
     if fid:
-        return f'fb_{fid}', 'name_team', score
+        return f'fb_{fid}', 'name_team', name_team_score
 
-    # Tiers 3-4 are stubs (no jersey / DOB cross-source data) — fall through
-    # to orphan. Schema reserves the confidence labels for forward-compat.
+    # Tier 2.3: surname-anchor with Levenshtein on the last token.
+    fid, surname_score, surname_cands = spine.find_by_surname(name, team, season)
+    if fid:
+        return f'fb_{fid}', 'name_team_surname', surname_score
+    if len(surname_cands) > 1:
+        if ambiguity_out is not None:
+            ambiguity_out.update({
+                'rule': 'surname_collision',
+                'candidates': surname_cands,
+                'best_score': max(c[2] for c in surname_cands),
+            })
+        return None, 'ambiguous', None
+
+    # Tier 2.5 / 2.6: token_set_ratio (subset / 88-94 band).
+    fid, ts_score, ts_cands, ts_kind = spine.find_by_token_set(name, team, season)
+    if fid:
+        return f'fb_{fid}', 'name_team_subset', ts_score
+    if ts_kind == 'ambiguous_band':
+        if ambiguity_out is not None:
+            ambiguity_out.update({
+                'rule': 'token_set_band',
+                'candidates': ts_cands,
+                'best_score': max((c[2] for c in ts_cands), default=0.0),
+            })
+        return None, 'ambiguous', None
+
+    # Tier 2.7: nicknames dict (only if NickNamer instance was supplied).
+    fid, nick_cands = spine.find_by_nickname(name, team, season, nn=nn)
+    if fid:
+        return f'fb_{fid}', 'name_team_nickname', 100.0
+    if len(nick_cands) > 1:
+        if ambiguity_out is not None:
+            ambiguity_out.update({
+                'rule': 'nickname_collision',
+                'candidates': nick_cands,
+                'best_score': 100.0,
+            })
+        return None, 'ambiguous', None
+
+    # Tier 3: hand-curated player_aliases.yaml.
+    alias_pid = _alias_lookup(src, sid, season)
+    if alias_pid:
+        return f'fb_{alias_pid}', 'name_team_alias', 100.0
+
+    # Else: orphan. Preserve best score from tier-2 (best fuzzy attempt).
     prefix = _orphan_prefix(src)
-    return f'{prefix}_{sid}', 'orphan', (score if score > 0 else None)
+    return (
+        f'{prefix}_{sid}',
+        'orphan',
+        name_team_score if name_team_score > 0 else None,
+    )
 
 
 def _orphan_prefix(source: str) -> str:
@@ -587,7 +884,14 @@ def _value_tuple(row: Dict[str, Any]) -> str:
 
 
 def _create_target_table(conn, target_table: str) -> None:
-    """DROP + CREATE the Iceberg target. Partitioned by (league, season)."""
+    """DROP + CREATE the Iceberg target. Partitioned by (league, season).
+
+    A no-op ``SELECT COUNT(*)`` is appended after CREATE — without it Trino's
+    in-session HMS cache occasionally yields ``Table UUID does not match``
+    (cache holds the pre-DROP UUID) or ``Table not found`` (cache hasn't
+    seen the CREATE yet) on the immediately-following INSERT. The COUNT(*)
+    forces the session to re-bind the table → fresh UUID resolves cleanly.
+    """
     _execute(conn, f"DROP TABLE IF EXISTS {target_table}")
     _execute(
         conn,
@@ -610,6 +914,45 @@ def _create_target_table(conn, target_table: str) -> None:
         )
         """,
     )
+    _execute(conn, f"SELECT COUNT(*) FROM {target_table}", fetch=True)
+
+
+def _create_review_table(conn, review_table: str) -> None:
+    """DROP + CREATE the Iceberg ``xref_player_review`` table.
+
+    Schema mirrors the Fellegi-Sunter clerical-review band: each row carries
+    the source's identifying tuple plus the candidate set (FBref ids and
+    display names) and the rule label that flagged the ambiguity. Reviewers
+    consume this through Superset / BI to disambiguate manually before
+    eventual promotion into ``xref_player`` (or to extend ``player_aliases.yaml``
+    so the next resolver run auto-resolves the case).
+    """
+    _execute(conn, f"DROP TABLE IF EXISTS {review_table}")
+    _execute(
+        conn,
+        f"""
+        CREATE TABLE {review_table} (
+            source           varchar,
+            source_id        varchar,
+            display_name     varchar,
+            raw_team_name    varchar,
+            canonical_team   varchar,
+            league           varchar,
+            season           varchar,
+            candidates       array(varchar),
+            candidate_names  array(varchar),
+            rule             varchar,
+            score            double,
+            detected_at      timestamp(6) with time zone
+        )
+        WITH (
+            format = 'PARQUET',
+            partitioning = ARRAY['league', 'season']
+        )
+        """,
+    )
+    # Force HMS cache refresh — see _create_target_table for rationale.
+    _execute(conn, f"SELECT COUNT(*) FROM {review_table}", fetch=True)
 
 
 def _insert_rows(
@@ -643,29 +986,169 @@ def _insert_rows(
     return written
 
 
+def _sql_array(values: List[str]) -> str:
+    """Render a Python list-of-str as a Trino ARRAY literal.
+
+    Empty input yields ``CAST(ARRAY[] AS array(varchar))`` so Iceberg can
+    infer the element type even when no values are present (avoids
+    ``ARRAY[]`` of element-type unknown which Trino rejects).
+    """
+    if not values:
+        return "CAST(ARRAY[] AS array(varchar))"
+    parts = [_sql_str(v) for v in values]
+    return f"ARRAY[{', '.join(parts)}]"
+
+
+def _sql_timestamp(ts: Any) -> str:
+    """Render a datetime / iso-string as a Trino ``TIMESTAMP(6) WITH TIME ZONE``.
+
+    Accepts ``datetime`` (uses isoformat), ``str`` (assumed ISO-8601 already
+    safe), or ``None`` → falls back to ``CURRENT_TIMESTAMP`` so reviewers
+    always have a non-null detection timestamp.
+    """
+    if ts is None:
+        return "CURRENT_TIMESTAMP"
+    if hasattr(ts, 'isoformat'):
+        return f"from_iso8601_timestamp('{ts.isoformat()}')"
+    return f"from_iso8601_timestamp('{_sql_escape(str(ts))}')"
+
+
+def _value_tuple_review(row: Dict[str, Any]) -> str:
+    return (
+        '('
+        f"{_sql_str(row['source'])}, "
+        f"{_sql_str(row['source_id'])}, "
+        f"{_sql_str(row['display_name'])}, "
+        f"{_sql_str(row['raw_team_name'])}, "
+        f"{_sql_str(row['canonical_team'])}, "
+        f"{_sql_str(row['league'])}, "
+        f"{_sql_str(row['season'])}, "
+        f"{_sql_array(row.get('candidates') or [])}, "
+        f"{_sql_array(row.get('candidate_names') or [])}, "
+        f"{_sql_str(row['rule'])}, "
+        f"{_sql_double(row.get('score'))}, "
+        f"{_sql_timestamp(row.get('detected_at'))}"
+        ')'
+    )
+
+
+def _insert_review_rows(
+    conn,
+    review_table: str,
+    rows: List[Dict[str, Any]],
+    chunk_size: int,
+) -> int:
+    """Batched insert into ``xref_player_review``. Returns rows written."""
+    if not rows:
+        return 0
+    written = 0
+    cols = (
+        'source, source_id, display_name, raw_team_name, canonical_team, '
+        'league, season, candidates, candidate_names, rule, score, detected_at'
+    )
+    for i in range(0, len(rows), chunk_size):
+        chunk = rows[i : i + chunk_size]
+        values_sql = ',\n'.join(_value_tuple_review(r) for r in chunk)
+        _execute(
+            conn,
+            f"INSERT INTO {review_table} ({cols}) VALUES {values_sql}",
+        )
+        written += len(chunk)
+        logger.info(
+            "  wrote %d/%d review rows",
+            min(i + chunk_size, len(rows)),
+            len(rows),
+        )
+    return written
+
+
 # ---------------------------------------------------------------------------
 # Build the materialised rows
 # ---------------------------------------------------------------------------
+def _build_review_row(
+    candidate: Dict[str, Any],
+    ambiguity_info: Dict[str, Any],
+    detected_at: Any,
+) -> Dict[str, Any]:
+    """Shape a Fellegi-Sunter clerical-review row for ``xref_player_review``.
+
+    ``ambiguity_info`` is the dict mutated by ``cascade_resolve`` when a
+    tier returned ambiguous. The wire-format here is the SQL row that
+    ``_insert_review_rows`` will eventually emit.
+    """
+    cands: List[Tuple[str, str, float]] = ambiguity_info.get('candidates', []) or []
+    return {
+        'source': candidate['source'],
+        'source_id': str(candidate['source_id']),
+        'display_name': candidate.get('player_name'),
+        'raw_team_name': candidate.get('raw_team_name'),
+        'canonical_team': candidate.get('canonical_team'),
+        'league': candidate.get('league'),
+        'season': candidate.get('season'),
+        'candidates': [str(pid) for pid, _name, _score in cands],
+        'candidate_names': [str(_name) for _pid, _name, _score in cands],
+        'rule': str(ambiguity_info.get('rule', 'unknown')),
+        'score': float(ambiguity_info.get('best_score', 0.0) or 0.0),
+        'detected_at': detected_at,
+    }
+
+
 def _resolve_all(
     fb_rows: List[Dict[str, Any]],
     us_rows: List[Dict[str, Any]],
     ws_rows: List[Dict[str, Any]],
-) -> Tuple[List[Dict[str, Any]], Dict[str, Dict[str, int]]]:
-    """Apply the cascade across all 3 sources. Returns (rows, per_source_stats).
+    *,
+    nn: Any = None,
+    detected_at: Any = None,
+) -> Tuple[
+    List[Dict[str, Any]],
+    List[Dict[str, Any]],
+    Dict[str, Dict[str, int]],
+]:
+    """Apply the cascade across all 3 sources.
 
-    ``per_source_stats`` shape:
-        {'fbref':     {'total': N, 'resolved': N, 'orphan': 0},
-         'understat': {'total': N, 'resolved': X, 'orphan': Y},
-         'whoscored': {'total': N, 'resolved': X, 'orphan': Y}}
+    Returns ``(xref_rows, review_rows, per_source_stats)``.
+
+    ``per_source_stats`` shape::
+
+        {'fbref':     {'total': N, 'resolved': N, 'orphan': 0,  'ambiguous': 0},
+         'understat': {'total': N, 'resolved': X, 'orphan': Y,  'ambiguous': Z},
+         'whoscored': {'total': N, 'resolved': X, 'orphan': Y,  'ambiguous': Z}}
+
+    NB: ``total = resolved + orphan + ambiguous``. Ambiguous candidates are
+    NOT inserted into ``xref_player`` — they live in ``xref_player_review``
+    until a human reviewer (or a future tier-rule extension) disambiguates.
+
+    Args:
+        nn: optional ``nicknames.NickNamer`` instance used by tier 2.7.
+        detected_at: timestamp written into ``xref_player_review.detected_at``.
+            Defaults to ``time.time()`` rendered as ``datetime`` at write
+            time inside :func:`_insert_review_rows` if left as ``None``.
     """
     spine = _FBrefSpine(fb_rows)
     out: List[Dict[str, Any]] = []
+    review: List[Dict[str, Any]] = []
     stats: Dict[str, Dict[str, int]] = {
-        s: {'total': 0, 'resolved': 0, 'orphan': 0} for s in SOURCES
+        s: {'total': 0, 'resolved': 0, 'orphan': 0, 'ambiguous': 0}
+        for s in SOURCES
     }
 
     # FBref spine: every FBref player IS canonical.
+    #
+    # Dedup by ``(player_id, season)`` BEFORE emission — the spine intentionally
+    # keeps multiple ``(player_id, squad, season)`` rows for mid-season transfers
+    # so the bucket index reaches both clubs (Cole Palmer Man-City→Chelsea), but
+    # ``xref_player``'s PK is ``(source, source_id, league, season)``. Without
+    # this dedup a transferred player produces 2 rows with the same PK and the
+    # downstream DQ ``no_duplicates`` check fails. The "lost" information is
+    # the secondary canonical_team for the season — which is recoverable from
+    # ``bronze.fbref_player_stats`` directly when needed.
+    seen_fb_keys: set = set()
     for row in fb_rows:
+        key = (row['player_id'], row['season'])
+        if key in seen_fb_keys:
+            continue
+        seen_fb_keys.add(key)
         out.append(
             {
                 'canonical_id': f"fb_{row['player_id']}",
@@ -686,7 +1169,17 @@ def _resolve_all(
     # Cascade for non-FBref sources.
     for src_rows in (us_rows, ws_rows):
         for row in src_rows:
-            cid, conf, score = cascade_resolve(row, spine)
+            ambiguity_info: Dict[str, Any] = {}
+            cid, conf, score = cascade_resolve(
+                row, spine, nn=nn, ambiguity_out=ambiguity_info
+            )
+            stats[row['source']]['total'] += 1
+
+            if conf == 'ambiguous':
+                review.append(_build_review_row(row, ambiguity_info, detected_at))
+                stats[row['source']]['ambiguous'] += 1
+                continue
+
             out.append(
                 {
                     'canonical_id': cid,
@@ -701,13 +1194,12 @@ def _resolve_all(
                     'canonical_team': row['canonical_team'],
                 }
             )
-            stats[row['source']]['total'] += 1
             if conf == 'orphan':
                 stats[row['source']]['orphan'] += 1
             else:
                 stats[row['source']]['resolved'] += 1
 
-    return out, stats
+    return out, review, stats
 
 
 def _verify_known_pairs(rows: List[Dict[str, Any]]) -> Tuple[int, int]:
@@ -798,6 +1290,25 @@ def _default_seasons_from_config(league: str) -> List[int]:
 # ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
+def _build_nicknamer() -> Any:
+    """Instantiate ``nicknames.NickNamer`` lazily.
+
+    Returns ``None`` when the package is unavailable so the cascade simply
+    skips tier 2.7 rather than crashing — useful for environments where
+    the medallion image hasn't been rebuilt yet (dev / smoke).
+    """
+    try:
+        from nicknames import NickNamer  # type: ignore
+    except Exception as e:  # pragma: no cover — exercised at deploy boundary
+        logger.warning(
+            "nicknames package unavailable (%s); tier 2.7 (nickname dict) "
+            "will be skipped this run.",
+            e,
+        )
+        return None
+    return NickNamer()
+
+
 def run_resolver(
     target_table: str = DEFAULT_TARGET_TABLE,
     league: str = 'ENG-Premier League',
@@ -805,11 +1316,14 @@ def run_resolver(
     *,
     chunk_size: int = DEFAULT_CHUNK_SIZE,
     drop_before_insert: bool = True,
+    review_table: str = DEFAULT_REVIEW_TABLE,
+    materialize_review: bool = True,
 ) -> Dict[str, Any]:
     """Full pipeline: read 3 Bronze sources -> resolve -> write Iceberg.
 
     Args:
-        target_table: Fully-qualified Iceberg table (catalog.schema.table).
+        target_table: Fully-qualified Iceberg table for the canonical
+            xref_player rows.
         league: League id from ``competitions.yaml``. Currently only
             ``ENG-Premier League`` is in scope (E1 baseline).
         seasons: List of season slugs (e.g. ``[2425]`` for 2024-25). Use
@@ -821,20 +1335,30 @@ def run_resolver(
             DROP TABLE + CREATE + INSERT. Set False only if you want to
             run the resolver as a smoke-test without rewriting Iceberg
             (mostly useful in dual-run validation).
+        review_table: Fully-qualified Iceberg table for the Fellegi-Sunter
+            clerical-review band rows.
+        materialize_review: If True (default), DROP+CREATE+INSERT the
+            review table from the same run. Set False only when running
+            against a fixture where review rows aren't expected.
 
     Returns:
         Summary dict::
 
             {
-                'target_table': 'iceberg.silver.xref_player',
+                'target_table':  'iceberg.silver.xref_player',
+                'review_table':  'iceberg.silver.xref_player_review',
                 'rows_inserted': 1615,
+                'review_inserted': 8,
                 'per_source': {
                     'fbref':     {'total': 562, 'resolved': 562,
-                                  'orphan': 0,  'rejection_pct': 0.0},
-                    'understat': {'total': 562, 'resolved': 546,
-                                  'orphan': 16, 'rejection_pct': 2.8},
-                    'whoscored': {'total': 491, 'resolved': 475,
-                                  'orphan': 16, 'rejection_pct': 3.3},
+                                  'orphan': 0,  'ambiguous': 0,
+                                  'rejection_pct': 0.0,
+                                  'review_pct': 0.0},
+                    'understat': {'total': 562, 'resolved': 549,
+                                  'orphan': 9,  'ambiguous': 4,
+                                  'rejection_pct': 1.6,
+                                  'review_pct':    0.7},
+                    ...
                 },
                 'known_pair_pass_rate': '10/10',
                 'duration_sec': 7.4,
@@ -844,21 +1368,27 @@ def run_resolver(
         ResolverError: when the known-pair regression check returns
             < KNOWN_PAIR_MIN_PASS (8/10).
     """
+    from datetime import datetime, timezone
+
     started = time.time()
+    detected_at = datetime.now(tz=timezone.utc)
 
     if seasons is None:
         seasons = _default_seasons_from_config(league)
     fbref_seasons, source_seasons = _split_seasons(seasons)
 
     logger.info(
-        "Starting xref_player resolver: target=%s league=%s "
+        "Starting xref_player v2 resolver: target=%s review=%s league=%s "
         "seasons=%s (fbref=%s, source=%s)",
         target_table,
+        review_table,
         league,
         seasons,
         fbref_seasons,
         source_seasons,
     )
+
+    nn = _build_nicknamer()
 
     conn = _get_trino_connection()
     try:
@@ -875,8 +1405,14 @@ def run_resolver(
         logger.info("  %d WhoScored players", len(ws))
 
         logger.info("Resolving identities ...")
-        rows, stats = _resolve_all(fb, us, ws)
-        logger.info("  produced %d xref rows", len(rows))
+        rows, review_rows, stats = _resolve_all(
+            fb, us, ws, nn=nn, detected_at=detected_at
+        )
+        logger.info(
+            "  produced %d xref rows, %d review rows",
+            len(rows),
+            len(review_rows),
+        )
 
         # Regression guard — done before INSERT so a failure aborts without
         # touching the Iceberg table.
@@ -891,11 +1427,25 @@ def run_resolver(
             )
 
         rows_inserted = 0
+        review_inserted = 0
         if drop_before_insert:
             logger.info("Rewriting Iceberg target %s ...", target_table)
             _create_target_table(conn, target_table)
             rows_inserted = _insert_rows(conn, target_table, rows, chunk_size)
             logger.info("  inserted %d rows into %s", rows_inserted, target_table)
+
+            if materialize_review:
+                logger.info("Rewriting Iceberg review %s ...", review_table)
+                _create_review_table(conn, review_table)
+                if review_rows:
+                    review_inserted = _insert_review_rows(
+                        conn, review_table, review_rows, chunk_size
+                    )
+                logger.info(
+                    "  inserted %d review rows into %s",
+                    review_inserted,
+                    review_table,
+                )
         else:
             logger.info(
                 "drop_before_insert=False — skipping Iceberg write "
@@ -912,19 +1462,24 @@ def run_resolver(
     per_source: Dict[str, Dict[str, Any]] = {}
     for src, st in stats.items():
         total = st['total']
-        rejection_pct = (
-            round(100.0 * st['orphan'] / total, 2) if total else 0.0
-        )
+        ambiguous = st.get('ambiguous', 0)
+        orphan = st['orphan']
+        rejection_pct = round(100.0 * orphan / total, 2) if total else 0.0
+        review_pct = round(100.0 * ambiguous / total, 2) if total else 0.0
         per_source[src] = {
             'total': total,
             'resolved': st['resolved'],
-            'orphan': st['orphan'],
+            'orphan': orphan,
+            'ambiguous': ambiguous,
             'rejection_pct': rejection_pct,
+            'review_pct': review_pct,
         }
 
     summary = {
         'target_table': target_table,
+        'review_table': review_table,
         'rows_inserted': rows_inserted,
+        'review_inserted': review_inserted,
         'per_source': per_source,
         'known_pair_pass_rate': f"{known_passed}/{known_total}",
         'duration_sec': round(time.time() - started, 2),
