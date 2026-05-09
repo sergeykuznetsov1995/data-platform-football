@@ -333,6 +333,33 @@ Prototype в `scripts/r2_resolver_proto.py` (FBref как spine, unidecode norma
 
 **Next**: E1.5 cutover (≥3 дня green-parity на FBref subset → replace `gold.entity_xref` references в `dim_match`/`dim_team`/`dim_player`/`feat_*` на `silver.xref_*`).
 
+### E1.5 — xref cutover (1-2 дня) — **PREP DONE 2026-05-09 / EXECUTE pending gate ≥2026-05-12**
+
+**Зависит от**: E1 завершён (2026-05-08), gate `≥3 дня green parity на FBref-only subset` (target ≈ 2026-05-12+).
+
+**Prep-фаза (DONE 2026-05-09)** — branch `feature/medallion-e1_5-xref-cutover` со всем готовым к merge:
+- ✅ 6 Gold SQL переписаны на silver.xref_*: `dim_team / dim_match / dim_player / dim_standings / fct_player_match / match_outcomes` (`trino-specialist`); per-JOIN season-predicate enforced; `'fb_'` prefix в dim_player + fct_player_match.player_id.
+- ✅ `feat_team_event_style.sql` — ADR-комментарий обновлён (line 80 `gold.entity_xref(source='fbref')` → `silver.xref_team(source='fbref')`).
+- ✅ `dag_transform_fbref_gold.py` docstring помечает `entity_xref` как legacy + scheduled drop в follow-up PR (`airflow-expert`).
+- ✅ `xref_dq.py` +6 ref_integrity check'ов (`build_e1_5_post_cutover_checks`) + 3 alert branches REGRESSION/THRESHOLD/CID_DIFF_GROWTH (`data-quality-agent`); все WARNING severity в prep-PR (promotion в ERROR — backlog).
+- ✅ Tests +49 unit (5 новых SQL test файлов), +5 integration (`testing-agent`); pytest baseline 268 → 317.
+- ✅ `data-platform-architect` impact-analysis: `docs/decisions/E1.5-cutover-prep.md` — 47 alias-drift rows + downstream blast-radius + risk register + rollback runbook.
+- ✅ Smoke runbook: `docs/decisions/E1.5-smoke-runbook.md` — 9 секций (pre-merge sanity / gate-watch / pre-execute checklist / spot-check queries / rollback).
+- ✅ Postmortem skeleton: `docs/decisions/E1.5-cutover-postmortem.md` (заполняется после execute).
+- ✅ Parity baseline: `data/audit/e1_parity_2026-05-09.json` (team cid_diff=43, match cid_match=100%, player LEGACY_ABSENT).
+- ✅ Code-simplifier: 2 точечных правки (magic-number doc + sql_dir constant); security-auditor: 0 findings.
+
+**Sequence of PRs**:
+1. **PR-1** (этот prep) — merge сразу: refactor + DQ + tests + docs. Не меняет prod data (silver.xref_* уже стабильны).
+2. **PR-2** (execute) — после открытия gate'а (≥3 дня `team.gold_only=0` и `team.cid_diff ≤ 48`). Merge → first Gold run перепишет canonical_ids всех cascade-таблиц через DROP+CREATE pattern.
+3. **PR-3** (cleanup) — после ≥1 успешного Gold run на silver-canonical (~2026-05-13+): drop `STAGE_1_XREF` из `dag_transform_fbref_gold.py`, удалить `dags/sql/gold/entity_xref.sql`, снизить `diff_threshold` 100→10.
+
+**DoD**:
+- Все 6 Gold-таблиц + cascade пересозданы с silver-canonical team_ids (`manchester_united` НЕ `manchester_utd`).
+- dim_player.player_id format = `fb_<player_id>` (E3/E4 alignment).
+- 6 ref_integrity check'ов: dim_team/match_outcomes/fct_player_match → dim_team — все ≥99.5%.
+- Spot-check queries (smoke-runbook § 4) — pass.
+
 ### E3 — Core match facts (5-7 дней + 5-10 дней backfill = E3.5) — **DONE 2026-05-08**
 
 **Зависит от**: R3 (SPADL decision-tree), R4 (Trino vs Spark), R0.4 (schema versioning), E1 (xref готов).
@@ -438,6 +465,7 @@ Prototype в `scripts/r2_resolver_proto.py` (FBref как spine, unidecode norma
 | E2 | Master-data dims (manager scraper ext.) | 3-5 + R0.2a feedback | medium |
 | E5 | Player availability | 2-3 | **DONE 2026-05-07** |
 | E1 | xref refactor (Gold→Silver) | 3-5 | **DONE 2026-05-08** |
+| E1.5 | xref cutover (Gold→Silver references) | 1-2 | **PREP DONE 2026-05-09 / EXECUTE pending gate ≥2026-05-12** |
 | E3 | Core match facts | 5-7 | **DONE 2026-05-08** |
 | E3.5 | Historical backfill (NEW) | 5-10 | medium (storage) |
 | E4 | Narrow facts + ratings + odds | 3-5 + R0.2b feedback | **DONE 2026-05-09** |
