@@ -474,10 +474,11 @@ class TestEmptyFallbackSchemaParity:
             )
 
     def test_empty_business_keys_have_expected_types(self):
-        """match_id+referee_id+league = varchar; date = date; season = varchar."""
+        """match_id+referee_id+league = varchar; date = date; season = bigint
+        (matches dim_match.season — year-of-start integer)."""
         types = _extract_empty_select_types(_read_sql(EMPTY_SQL_PATH))
         assert types.get("referee_id") == "varchar"
         assert types.get("match_id") == "varchar"
         assert types.get("date") == "date"
         assert types.get("league") == "varchar"
-        assert types.get("season") == "varchar"
+        assert types.get("season") == "bigint"

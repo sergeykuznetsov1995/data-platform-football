@@ -75,10 +75,10 @@ class TestCheckCounts:
         assert len(espn) == 4
 
     def test_gold_e3_total_check_count(self):
-        """Gold builders total: fct_event (10) + fct_shot (8) + fct_lineup (8) = 26."""
+        """Gold builders total: fct_event (10) + fct_shot (7) + fct_lineup (8) = 25."""
         checks = e3_dq.build_gold_e3_checks()
-        assert len(checks) == 26, (
-            f"Gold E3 expected 26 checks, got {len(checks)}: "
+        assert len(checks) == 25, (
+            f"Gold E3 expected 25 checks, got {len(checks)}: "
             f"{[c.name for c in checks]}"
         )
 
@@ -95,15 +95,16 @@ class TestCheckCounts:
         assert len(fct_event) == 10
 
     def test_gold_fct_shot_count(self):
-        """fct_shot has 8 checks (incl. 1 ref_integrity which uses 'child'
-        param, not 'table'). Match by table OR child fragment."""
+        """fct_shot has 7 checks: no_duplicates, no_nulls, ref_integrity (uses
+        'child' param, not 'table'), value_range[xg], row_count,
+        shot_orphan_player_rate, freshness. Match by table OR child fragment."""
         checks = e3_dq.build_gold_e3_checks()
         fct_shot = [
             c for c in checks
             if c.params.get("table") == "iceberg.gold.fct_shot"
             or c.params.get("child") == "gold.fct_shot"
         ]
-        assert len(fct_shot) == 8
+        assert len(fct_shot) == 7
 
     def test_gold_fct_lineup_count(self):
         checks = e3_dq.build_gold_e3_checks()
@@ -115,9 +116,9 @@ class TestCheckCounts:
         assert len(fct_lineup) == 8
 
     def test_build_all_e3_checks_total(self):
-        """13 silver + 26 gold = 39 total E3 standard DQ checks."""
+        """13 silver + 25 gold = 38 total E3 standard DQ checks."""
         all_checks = e3_dq.build_all_e3_checks()
-        assert len(all_checks) == 39
+        assert len(all_checks) == 38
 
 
 # ===========================================================================
@@ -242,7 +243,10 @@ class TestErrorSeverityChecks:
         assert len(ref) == 1
         assert ref[0].severity == "ERROR"
 
-    def test_fct_lineup_ref_integrity_is_error(self):
+    def test_fct_lineup_ref_integrity_is_warning_until_e15_cutover(self):
+        """fct_lineup ref_integrity → silver.xref_match is WARNING (not ERROR)
+        until E1.5 cutover bridges fct_event.match_id_canonical from
+        'whoscored_raw' v0_unbridged to canonical IDs (E3 postmortem)."""
         checks = e3_dq.build_gold_e3_checks()
         ref = [
             c for c in checks
@@ -250,7 +254,7 @@ class TestErrorSeverityChecks:
             and c.params.get("child") == "gold.fct_lineup"
         ]
         assert len(ref) == 1
-        assert ref[0].severity == "ERROR"
+        assert ref[0].severity == "WARNING"
 
     def test_fct_lineup_fbref_coverage_dominant_is_error(self):
         checks = e3_dq.build_gold_e3_checks()
@@ -258,13 +262,14 @@ class TestErrorSeverityChecks:
         assert len(coverage) == 1
         assert coverage[0].severity == "ERROR"
 
-    def test_xg_xa_value_range_present_with_zero_one_bounds(self):
-        """xG/xA bounds [0, 1] — out-of-bounds = upstream model regression.
+    def test_xg_value_range_present_with_zero_one_bounds(self):
+        """xG bounds [0, 1] — out-of-bounds = upstream model regression.
 
         Severity is value_range default (WARNING) in the current builder; if
         it is ever escalated to ERROR per ML-poisoning concerns, update this
         test to match. We DO assert the [0, 1] bounds because those numbers
-        are the load-bearing ones.
+        are the load-bearing ones. xa is not materialized in fct_shot —
+        Understat assist xG lives on fct_player_match instead.
         """
         checks = e3_dq.build_gold_e3_checks()
         xg_check = next(
@@ -275,14 +280,6 @@ class TestErrorSeverityChecks:
         )
         assert xg_check.params["min"] == 0
         assert xg_check.params["max"] == 1
-        xa_check = next(
-            c for c in checks
-            if c.kind == "value_range"
-            and c.params.get("table") == "iceberg.gold.fct_shot"
-            and c.params.get("column") == "xa"
-        )
-        assert xa_check.params["min"] == 0
-        assert xa_check.params["max"] == 1
 
 
 class TestWarningSeverityChecks:
@@ -438,11 +435,12 @@ class TestOrphanAndCoverageGuards:
         assert len(ln) == 1
 
     def test_spadl_unknown_rate_capped(self):
-        """spadl_coverage_unknown_rate must cap at 20K rows (R3 baseline)."""
+        """spadl_coverage_unknown_rate must cap at 40K rows (R3 baseline 17.5K
+        with headroom for 5-season backfill)."""
         checks = e3_dq.build_silver_e3_checks()
         unk = next(c for c in checks if c.name == "spadl_coverage_unknown_rate")
         assert unk.severity == "ERROR"
-        assert unk.params["max_rows"] == 20_000
+        assert unk.params["max_rows"] == 40_000
 
 
 # ===========================================================================

@@ -59,14 +59,14 @@ def test_pk_grouping(sql_text: str) -> None:
     pattern = re.compile(
         r"GROUP\s+BY\s+"
         r"\s*pm\.referee_id\s*,\s*"
-        r"dr\.referee_name\s*,\s*"
+        r"dr\.referee_canonical\s*,\s*"
         r"pm\.season\s*,\s*"
         r"pm\.league",
         re.IGNORECASE | re.DOTALL,
     )
     assert pattern.search(sql_text), (
-        "Expected `GROUP BY pm.referee_id, dr.referee_name, pm.season, pm.league` "
-        "to enforce PK uniqueness"
+        "Expected `GROUP BY pm.referee_id, dr.referee_canonical, pm.season, pm.league` "
+        "to enforce PK uniqueness (referee_canonical aliased AS referee_name in SELECT)"
     )
 
 
