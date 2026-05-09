@@ -1,0 +1,419 @@
+"""
+Silver xref Transformation DAG  (Medallion E1 / T4)
+====================================================
+
+Materialises the five Silver-layer cross-reference tables that are the
+source-of-truth for canonical entity identity across the platform:
+
+    iceberg.silver.xref_team      — 8-source team alias map (pure SQL CTAS)
+    iceberg.silver.xref_match     — match-id spine (FBref-only at MVP)
+    iceberg.silver.xref_referee   — referee names from FBref + MatchHistory
+    iceberg.silver.xref_manager   — empty STUB (schema-only; populated in 1.5)
+    iceberg.silver.xref_player    — fuzzy resolver across FBref/Understat/WhoScored
+
+Topology
+--------
+    start_marker
+        |
+        v
+    TaskGroup: xref_transforms  (4 sequential pure-SQL CTAS)
+        ├── xref_team       — render Jinja .sql.j2 + run_silver_transform
+        ├── xref_match      — run_silver_transform
+        ├── xref_referee    — run_silver_transform
+        └── xref_manager    — run_silver_transform   (zero-row STUB OK)
+        |
+        v
+    xref_player             — Python: utils.xref_player_resolver.run_resolver()
+        |
+        v
+    validate_xref           — DQ row counts + PK uniqueness
+        |
+        v
+    end_marker
+
+Trigger model
+-------------
+``schedule=None`` — the DAG is triggered after Bronze ingestion finishes
+(see ``dag_master_pipeline`` integration). xref tables are intentionally
+INDEPENDENT of FBref Silver: re-running this DAG does not require the
+existing fbref Silver to be fresh.
+
+Dual-run policy
+---------------
+Gold ``entity_xref`` DAG-task remains in place (see
+``dag_transform_fbref_gold.py``). For ≥3 days both will run side-by-side
+and a parity validator (T6) will diff the canonical-id columns. Only after
+parity is green will Gold dims be re-pointed at ``silver.xref_*``.
+
+Notes for maintainers
+---------------------
+* xref_team is a Jinja template (``.sql.j2``); team-alias VALUES are
+  injected by ``utils.medallion_config.render_sql_template`` at task time.
+  The rendered SQL is written to a tempfile and passed to
+  ``run_silver_transform`` (which already supports absolute paths).
+* xref_player is **NOT** a Trino CTAS — it is a Python pipeline (rapidfuzz
+  + unidecode) materialised via INSERT VALUES. ``run_resolver`` does its
+  own DROP+CREATE+INSERT inside one Trino connection.
+* ``xref_manager`` is intentionally zero-row at E1 (R0.2c FALLBACK
+  pending). Materialising the empty table protects downstream JOINs.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import tempfile
+from datetime import datetime
+from typing import Any, Dict
+
+from airflow import DAG
+from airflow.operators.empty import EmptyOperator
+from airflow.operators.python import PythonOperator
+from airflow.utils.task_group import TaskGroup
+
+from utils.default_args import SILVER_ARGS
+
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Pure-SQL xref transforms (xref_team handled separately due to Jinja)
+# ---------------------------------------------------------------------------
+# (task_id, sql_file relative to /opt/airflow/, target table name)
+PURE_SQL_XREF_TRANSFORMS = [
+    (
+        'xref_match',
+        'dags/sql/silver/xref_match.sql',
+        'xref_match',
+    ),
+    (
+        'xref_referee',
+        'dags/sql/silver/xref_referee.sql',
+        'xref_referee',
+    ),
+    (
+        'xref_manager',
+        'dags/sql/silver/xref_manager.sql',
+        'xref_manager',
+    ),
+]
+
+
+# ---------------------------------------------------------------------------
+# Task callables — imports are inside callables so DAG parse stays cheap
+# ---------------------------------------------------------------------------
+
+def _run_xref_team(**context) -> Dict[str, Any]:
+    """Render the xref_team Jinja template and run it as a Silver CTAS.
+
+    The template embeds team-alias VALUES via
+    ``medallion_config.render_sql_template`` — we render to a tempfile so
+    we can re-use the existing ``run_silver_transform`` (which accepts
+    absolute paths and handles DROP+CREATE+SCHEMA bookkeeping).
+
+    The tempfile is removed in the ``finally`` block regardless of CTAS
+    success — leaking temp files in /tmp would slowly fill the scheduler.
+    """
+    from pathlib import Path
+
+    from utils.medallion_config import (
+        get_team_alias_sql_values,
+        render_sql_template,
+    )
+    from utils.silver_tasks import run_silver_transform
+
+    template_path = Path('/opt/airflow/dags/sql/silver/xref_team.sql.j2')
+    if not template_path.exists():
+        raise FileNotFoundError(f"xref_team template not found: {template_path}")
+
+    rendered_sql = render_sql_template(
+        template_path,
+        team_aliases_values_sql=get_team_alias_sql_values(),
+    )
+    logger.info(
+        "Rendered xref_team.sql.j2 — %d chars (template embeds %d alias pairs)",
+        len(rendered_sql),
+        rendered_sql.count("),\n"),  # rough alias-row counter for log only
+    )
+
+    with tempfile.NamedTemporaryFile(
+        mode='w',
+        suffix='_xref_team.sql',
+        delete=False,
+        encoding='utf-8',
+    ) as tmp:
+        tmp.write(rendered_sql)
+        tmp_path = tmp.name
+
+    try:
+        result = run_silver_transform(
+            sql_file=tmp_path,
+            table_name='xref_team',
+            schema='silver',
+        )
+        logger.info(
+            "xref_team CTAS complete: %d rows in %s",
+            result.get('rows', 0),
+            result.get('table'),
+        )
+        return result
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError as e:
+            logger.warning("Failed to cleanup temp file %s: %s", tmp_path, e)
+
+
+def _run_pure_sql_xref(sql_file: str, table_name: str, **context) -> Dict[str, Any]:
+    """Generic CTAS runner for xref_match / xref_referee / xref_manager.
+
+    These three are pure-SELECT files (no Jinja) so we can call
+    ``run_silver_transform`` directly with the relative path.
+    """
+    from utils.silver_tasks import run_silver_transform
+
+    result = run_silver_transform(
+        sql_file=sql_file,
+        table_name=table_name,
+        schema='silver',
+    )
+    logger.info(
+        "%s CTAS complete: %d rows in %s",
+        table_name,
+        result.get('rows', 0),
+        result.get('table'),
+    )
+    return result
+
+
+def _run_xref_player(**context) -> Dict[str, Any]:
+    """Run the Python xref_player resolver (T3 deliverable).
+
+    Materialises ``iceberg.silver.xref_player`` from FBref + Understat +
+    WhoScored Bronze data. ``run_resolver`` raises ``ResolverError`` if
+    the known-pair regression check (10/10 APL anchors) drops below 8/10
+    — that aborts the DAG before partial data lands.
+
+    Summary dict is pushed to XCom for the downstream parity check (T6)
+    to consume.
+    """
+    from utils.xref_player_resolver import run_resolver
+
+    summary = run_resolver(
+        target_table='iceberg.silver.xref_player',
+        league='ENG-Premier League',
+        seasons=None,                # all configured seasons (E1: APL only)
+        chunk_size=500,
+        drop_before_insert=True,
+    )
+
+    logger.info("xref_player resolver summary: %s", summary)
+    context['ti'].xcom_push(key='resolver_summary', value=summary)
+    return summary
+
+
+def _validate_xref(**context) -> Dict[str, Any]:
+    """Run extended DQ + dual-run parity for the 5 xref tables (T6).
+
+    Phase 1 — standard DQ via :mod:`utils.xref_dq.build_all_xref_checks`
+    Phase 2 — orphan-rate per source for xref_team / xref_player
+              (synthetic CheckResults appended to the report)
+    Phase 3 — dual-run parity Silver vs legacy gold.entity_xref
+              (informational; does NOT raise; surfaced via XCom + Telegram)
+
+    Severity model:
+      * Phase 1 ERROR-checks raise ``AirflowException``.
+      * Phase 2 orphan-rate ERROR (>25% in any source) raises.
+      * Phase 3 parity diffs NEVER raise (E1 dual-run policy ≥3 days).
+
+    XCom outputs:
+      * key=``parity_summary`` — dict {team, match, player → diff metrics}
+      * key=``orphan_rates``    — dict {team, player → per-source verdicts}
+    """
+    from airflow.exceptions import AirflowException
+
+    from utils.alerts import telegram_dq_summary
+    from utils.data_quality import CheckResult, run_checks
+    from utils.xref_dq import (
+        build_all_xref_checks,
+        evaluate_orphan_rate_per_source,
+        maybe_alert_parity,
+        parity_check_xref_match_vs_gold,
+        parity_check_xref_player_vs_gold,
+        parity_check_xref_team_vs_gold,
+    )
+
+    # ------------------------------------------------------------------
+    # Phase 1 — standard DQ on all 5 xref tables (16+ checks)
+    # ------------------------------------------------------------------
+    report = run_checks(build_all_xref_checks(), raise_on_error=False)
+    logger.info("Phase 1 — xref DQ: %s", report.summary())
+
+    # ------------------------------------------------------------------
+    # Phase 2 — orphan-rate per source (team + player)
+    # ------------------------------------------------------------------
+    orphan_rates: Dict[str, Any] = {}
+    for entity, table in (
+        ('team', 'iceberg.silver.xref_team'),
+        ('player', 'iceberg.silver.xref_player'),
+    ):
+        try:
+            res = evaluate_orphan_rate_per_source(
+                table=table,
+                warning_threshold=10.0,   # ≤10%      — OK
+                error_threshold=25.0,     # 10–25%    — WARNING; >25% — ERROR
+            )
+        except Exception as e:
+            logger.exception("orphan_rate evaluation failed for %s", table)
+            report.results.append(CheckResult(
+                name=f"orphan_rate[{table}]",
+                kind='coverage',
+                severity='WARNING',
+                passed=False,
+                error=str(e),
+            ))
+            orphan_rates[entity] = {'error': str(e)}
+            continue
+
+        verdict = res['verdict']
+        passed = verdict == 'OK'
+        # Map verdict to CheckResult severity. 'OK' falls through to WARNING
+        # because severity is ignored downstream when passed=True.
+        if verdict == 'ERROR':
+            severity = 'ERROR'
+        else:
+            severity = 'WARNING'
+        report.results.append(CheckResult(
+            name=f"orphan_rate[{table}]",
+            kind='coverage',
+            severity=severity,
+            passed=passed,
+            details=(
+                f"verdict={verdict}, overall={res['overall_pct']}%, "
+                f"breaches={res['breaches']}"
+            ),
+            value=res['overall_pct'],
+        ))
+        orphan_rates[entity] = res
+
+    context['ti'].xcom_push(key='orphan_rates', value=orphan_rates)
+
+    # ------------------------------------------------------------------
+    # Telegram summary (Phase 1 + Phase 2 combined)
+    # ------------------------------------------------------------------
+    telegram_dq_summary(report, header="Silver xref DQ (E1)")
+
+    # ------------------------------------------------------------------
+    # Phase 1 + 2 ERROR escalation (raise BEFORE parity)
+    # ------------------------------------------------------------------
+    if report.errors:
+        raise AirflowException(
+            f"xref DQ failed: {len(report.errors)} error(s). "
+            + "; ".join(
+                f"{r.name}: {r.details or r.error}"
+                for r in report.errors[:5]
+            )
+        )
+
+    # ------------------------------------------------------------------
+    # Phase 3 — dual-run parity (informational; does NOT raise)
+    # ------------------------------------------------------------------
+    try:
+        parity_summary = {
+            'team':   parity_check_xref_team_vs_gold(),
+            'match':  parity_check_xref_match_vs_gold(),
+            'player': parity_check_xref_player_vs_gold(),
+        }
+    except Exception as e:
+        logger.exception("dual-run parity check failed; not blocking the DAG")
+        parity_summary = {'error': str(e)}
+
+    context['ti'].xcom_push(key='parity_summary', value=parity_summary)
+
+    # Telegram alert ONLY when significant diff detected (≥100 rows)
+    try:
+        alerted = maybe_alert_parity(parity_summary, diff_threshold=100)
+        if alerted:
+            logger.warning("Dual-run parity alert sent to Telegram")
+    except Exception as e:
+        logger.warning("parity Telegram alert swallowed: %s", e)
+
+    return {
+        'passed': len(report.passed),
+        'total': len(report.results),
+        'errors': [r.name for r in report.errors],
+        'warnings': [r.name for r in report.warnings],
+        'parity_summary': parity_summary,
+        'orphan_rates': orphan_rates,
+    }
+
+
+# ---------------------------------------------------------------------------
+# DAG definition
+# ---------------------------------------------------------------------------
+
+with DAG(
+    dag_id='dag_transform_xref',
+    default_args=SILVER_ARGS,
+    description=(
+        'Materialise Silver xref_* tables (team/match/referee/manager/player) '
+        'from Bronze. E1 medallion redesign — runs before fbref Silver.'
+    ),
+    schedule=None,           # Triggered (see master pipeline integration)
+    start_date=datetime(2026, 5, 1),
+    catchup=False,
+    tags=['silver', 'xref', 'medallion-e1', 'transform'],
+    max_active_runs=1,
+    max_active_tasks=1,      # Sequential — same OOM-safety reasoning as fbref Silver
+    doc_md=__doc__,
+) as dag:
+
+    start = EmptyOperator(task_id='start_marker')
+
+    # =========================================================================
+    # TaskGroup: xref CTAS transforms (sequential pure-SQL — max_active_tasks=1)
+    # =========================================================================
+    with TaskGroup(group_id='xref_transforms') as transforms_group:
+        # xref_team is a Jinja template (.sql.j2) — handled by dedicated callable
+        xref_team_task = PythonOperator(
+            task_id='xref_team',
+            python_callable=_run_xref_team,
+        )
+
+        # xref_match / xref_referee / xref_manager — plain SELECT files
+        prev = xref_team_task
+        for task_id, sql_file, table_name in PURE_SQL_XREF_TRANSFORMS:
+            t = PythonOperator(
+                task_id=task_id,
+                python_callable=_run_pure_sql_xref,
+                op_kwargs={
+                    'sql_file': sql_file,
+                    'table_name': table_name,
+                },
+            )
+            prev >> t
+            prev = t
+
+    # =========================================================================
+    # xref_player — Python resolver (rapidfuzz / unidecode, NOT a Trino CTAS)
+    # =========================================================================
+    xref_player_task = PythonOperator(
+        task_id='xref_player',
+        python_callable=_run_xref_player,
+    )
+
+    # =========================================================================
+    # Validation — DQ row counts + PK uniqueness
+    # =========================================================================
+    validate_task = PythonOperator(
+        task_id='validate_xref',
+        python_callable=_validate_xref,
+        trigger_rule='all_success',  # Skip validation if any xref task failed
+    )
+
+    end = EmptyOperator(task_id='end_marker')
+
+    # =========================================================================
+    # Dependencies
+    # =========================================================================
+    start >> transforms_group >> xref_player_task >> validate_task >> end

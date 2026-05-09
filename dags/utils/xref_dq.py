@@ -1,0 +1,632 @@
+"""
+DQ checks + dual-run parity validators for Silver xref-tables (E1).
+==================================================================
+
+This module is the T6 deliverable of the Medallion E1 redesign. It is
+consumed by ``dag_transform_xref.validate_xref`` and is intentionally
+**read-only** with respect to Iceberg — every query is a SELECT.
+
+Two responsibilities
+--------------------
+1. **Per-table DQ checks** (PK uniqueness, NULL guards, enum compliance,
+   row-count, coverage). Built on the existing universal
+   :mod:`utils.data_quality` primitives — we do NOT modify
+   ``data_quality.py``. Enum / coverage are implemented as targeted
+   ``CHECK.row_count`` invocations with a ``WHERE`` predicate that
+   selects offending rows; offender count > 0 fails the check.
+
+2. **Dual-run parity** (E1 policy: ≥3 days side-by-side with the legacy
+   ``gold.entity_xref`` table). The parity functions return diff metrics
+   without raising — diffs are surfaced via Telegram and XCom and
+   investigated manually before the E1.5 cutover.
+
+Confidence allow-lists (SOURCE OF TRUTH for enum compliance)
+------------------------------------------------------------
+Verified against the SQL files on 2026-05-08:
+
+* ``xref_team``     — {``name_alias``, ``orphan``}
+* ``xref_match``    — {``exact``}
+* ``xref_referee``  — {``name_normalize``}
+* ``xref_player``   — {``exact``, ``name_team``, ``name_team_jersey``,
+                       ``name_team_dob``, ``orphan``}  (jersey/dob are
+                       reserved STUBS but allowed in the enum so adding
+                       a single tier later does not require touching DQ.)
+
+Sources (xref_team / xref_referee / xref_match / xref_player) values
+are also enforced via enum checks against the documented schema.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+from typing import Any, Dict, List, Optional
+
+from utils.data_quality import CHECK, Check, _get_conn, _qualify  # type: ignore[attr-defined]
+
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Enum / coverage helpers (built on row_count + WHERE — NO data_quality.py edits)
+# ---------------------------------------------------------------------------
+
+def check_enum_compliance(
+    table: str,
+    column: str,
+    allowed: List[str],
+    severity: str = 'ERROR',
+    name: Optional[str] = None,
+) -> Check:
+    """Return a Check that fails if ``column`` has any value outside ``allowed``.
+
+    Implemented as ``row_count(min=0, max=0, WHERE col NOT IN (...))``.
+    A NULL in ``column`` is **not** an enum violation by definition (we
+    have dedicated ``no_nulls`` checks for required columns); the WHERE
+    predicate uses ``column NOT IN (...)`` which already filters NULL.
+    """
+    if not allowed:
+        raise ValueError("check_enum_compliance requires a non-empty allowed list")
+    # Quote each value as a SQL string literal; reject embedded quote
+    # characters early to keep the predicate safe for f-string interpolation.
+    safe_vals: List[str] = []
+    for v in allowed:
+        if not isinstance(v, str) or "'" in v or ';' in v or '--' in v:
+            raise ValueError(f"Unsafe enum value: {v!r}")
+        safe_vals.append(f"'{v}'")
+    allowed_csv = ", ".join(safe_vals)
+    short = table.split('.')[-1]
+    return CHECK.row_count(
+        table=table,
+        min_rows=0,
+        max_rows=0,
+        where=f"{column} NOT IN ({allowed_csv})",
+        severity=severity,
+        name=name or f"enum_compliance[{short}.{column}]",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Per-table DQ definitions
+# ---------------------------------------------------------------------------
+
+def build_xref_team_checks() -> List[Check]:
+    """DQ for ``iceberg.silver.xref_team``.
+
+    Orphan-rate (coverage-style) is **not** in this list — ratios cannot
+    be expressed via ``row_count``. Instead the DAG callable runs
+    :func:`evaluate_orphan_rate_per_source` after the standard checks
+    and appends a synthetic CheckResult to the report.
+
+    Row count is bounded above as well — a runaway UNION of duplicate
+    rows would silently inflate the table; an upper bound flags it.
+    """
+    table = 'iceberg.silver.xref_team'
+    return [
+        # Row count: 8 sources × ~50 distinct teams across seasons — min 400.
+        # Upper bound 5000 covers 5 seasons of growth before triggering.
+        CHECK.row_count(table, min_rows=400, max_rows=5000),
+
+        # PK uniqueness — guaranteed by SQL GROUP BY but DQ-enforced.
+        CHECK.no_duplicates(
+            table,
+            pk=['source', 'source_id', 'league', 'season'],
+        ),
+
+        # Required columns must be non-NULL.
+        CHECK.no_nulls(table, cols=['canonical_id', 'source', 'source_id']),
+
+        # Enum compliance — confidence ∈ {'name_alias', 'orphan'}
+        check_enum_compliance(
+            table, 'confidence',
+            allowed=['name_alias', 'orphan'],
+            severity='ERROR',
+        ),
+
+        # Source enum (8 sources documented in xref_team.sql.j2)
+        check_enum_compliance(
+            table, 'source',
+            allowed=['fbref', 'understat', 'whoscored', 'sofascore',
+                     'fotmob', 'matchhistory', 'clubelo', 'espn'],
+            severity='ERROR',
+        ),
+    ]
+
+
+def build_xref_match_checks() -> List[Check]:
+    """DQ for ``iceberg.silver.xref_match``."""
+    table = 'iceberg.silver.xref_match'
+    return [
+        # 5 seasons × ~380 APL fixtures — min 1900. Upper bound 30k allows
+        # multi-league expansion before tripping.
+        CHECK.row_count(table, min_rows=1900, max_rows=30000),
+
+        CHECK.no_duplicates(table, pk=['canonical_id']),
+
+        CHECK.no_nulls(table, cols=['canonical_id', 'source', 'source_id']),
+
+        # E1 MVP — only fbref source materialised
+        check_enum_compliance(
+            table, 'source',
+            allowed=['fbref'],
+            severity='ERROR',
+        ),
+
+        # Confidence is always 'exact' for match xref (match_id authoritative)
+        check_enum_compliance(
+            table, 'confidence',
+            allowed=['exact'],
+            severity='ERROR',
+        ),
+    ]
+
+
+def build_xref_referee_checks() -> List[Check]:
+    """DQ for ``iceberg.silver.xref_referee``."""
+    table = 'iceberg.silver.xref_referee'
+    return [
+        CHECK.row_count(table, min_rows=200, max_rows=5000),
+
+        CHECK.no_duplicates(
+            table,
+            pk=['source', 'source_id', 'league', 'season'],
+        ),
+
+        CHECK.no_nulls(table, cols=['canonical_id', 'source', 'source_id']),
+
+        check_enum_compliance(
+            table, 'source',
+            allowed=['fbref', 'matchhistory'],
+            severity='ERROR',
+        ),
+
+        check_enum_compliance(
+            table, 'confidence',
+            allowed=['name_normalize'],
+            severity='ERROR',
+        ),
+    ]
+
+
+def build_xref_manager_checks() -> List[Check]:
+    """DQ for ``iceberg.silver.xref_manager`` — STUB phase.
+
+    R0.2c FALLBACK pending — table is intentionally zero-row. ANY row
+    landing in this table at E1 = bug.
+    """
+    table = 'iceberg.silver.xref_manager'
+    return [
+        # Hard zero-row guard. ERROR if anything appears.
+        CHECK.row_count(
+            table=table,
+            min_rows=0,
+            max_rows=0,
+            severity='ERROR',
+        ),
+        # Defence-in-depth: even if a row sneaks past the row_count guard,
+        # its PK columns must obey the schema contract.
+        CHECK.no_duplicates(
+            table,
+            pk=['source', 'source_id', 'league', 'season'],
+        ),
+    ]
+
+
+def build_xref_player_checks() -> List[Check]:
+    """DQ for ``iceberg.silver.xref_player``.
+
+    Confidence allow-list aligned with ``xref_player_resolver.py`` cascade.
+    Orphan-rate per source is evaluated separately by
+    :func:`evaluate_orphan_rate_per_source`; the results are appended to
+    the run report by the DAG callable (see ``dag_transform_xref``).
+    """
+    table = 'iceberg.silver.xref_player'
+    return [
+        # T3 hotfix produced ~1500 rows for ENG-Premier League; lower bound
+        # 400 stays conservative. Upper bound 50k allows multi-season growth.
+        CHECK.row_count(table, min_rows=400, max_rows=50000),
+
+        CHECK.no_duplicates(
+            table,
+            pk=['source', 'source_id', 'league', 'season'],
+        ),
+
+        CHECK.no_nulls(table, cols=['canonical_id', 'source', 'source_id']),
+
+        # confidence — mirror the resolver cascade tier names verbatim.
+        check_enum_compliance(
+            table, 'confidence',
+            allowed=['exact', 'name_team', 'name_team_jersey',
+                     'name_team_dob', 'orphan'],
+            severity='ERROR',
+        ),
+
+        # source enum — 3 sources at E1 (FBref / Understat / WhoScored)
+        check_enum_compliance(
+            table, 'source',
+            allowed=['fbref', 'understat', 'whoscored'],
+            severity='ERROR',
+        ),
+
+        # canonical_id format guard — must start with one of the 4 known
+        # prefixes (fb_/us_/ws_/ss_). Regex via Trino regexp_like.
+        # We express this as a row_count of offending rows.
+        CHECK.row_count(
+            table=table,
+            min_rows=0,
+            max_rows=0,
+            where="NOT regexp_like(canonical_id, '^(fb|us|ws|ss)_.+$')",
+            severity='ERROR',
+            name='canonical_id_format[xref_player]',
+        ),
+    ]
+
+
+def build_all_xref_checks() -> List[Check]:
+    """Aggregate DQ checks for all 5 xref tables."""
+    return (
+        build_xref_team_checks()
+        + build_xref_match_checks()
+        + build_xref_referee_checks()
+        + build_xref_manager_checks()
+        + build_xref_player_checks()
+    )
+
+
+# ---------------------------------------------------------------------------
+# Orphan-rate evaluation (runs after the standard DQ pass)
+# ---------------------------------------------------------------------------
+
+def evaluate_orphan_rate_per_source(
+    table: str = 'iceberg.silver.xref_player',
+    warning_threshold: float = 10.0,
+    error_threshold: float = 25.0,
+) -> Dict[str, Any]:
+    """Compute orphan-rate per ``source`` for an xref table and classify.
+
+    Returns a dict::
+
+        {
+            'per_source': {
+                'fbref': {'total': N, 'orphans': K, 'pct': X.X, 'verdict': 'OK'},
+                ...
+            },
+            'overall_pct': float,
+            'verdict': 'OK' | 'WARNING' | 'ERROR',
+            'breaches': [{'source': str, 'pct': float, 'verdict': str}, ...],
+        }
+
+    Verdict semantics:
+      * pct ≤ warning_threshold        — OK
+      * warning < pct ≤ error          — WARNING
+      * pct > error_threshold          — ERROR
+
+    NOTE: This function does NOT raise. Callers decide whether to escalate.
+    """
+    qualified = _qualify(table)
+    sql = (
+        "SELECT source, "
+        "       COUNT(*) AS total, "
+        "       COUNT_IF(confidence = 'orphan') AS orphans "
+        f"FROM {qualified} "
+        "GROUP BY source"
+    )
+    conn = _get_conn()
+    try:
+        cur = conn.cursor()
+        try:
+            cur.execute(sql)
+            rows = cur.fetchall()
+        finally:
+            cur.close()
+    finally:
+        conn.close()
+
+    per_source: Dict[str, Dict[str, Any]] = {}
+    breaches: List[Dict[str, Any]] = []
+    overall_total = 0
+    overall_orphans = 0
+    overall_verdict = 'OK'
+
+    for src, total, orphans in rows:
+        pct = (100.0 * orphans / total) if total else 0.0
+        if pct > error_threshold:
+            verdict = 'ERROR'
+        elif pct > warning_threshold:
+            verdict = 'WARNING'
+        else:
+            verdict = 'OK'
+
+        per_source[src] = {
+            'total': int(total),
+            'orphans': int(orphans),
+            'pct': round(pct, 2),
+            'verdict': verdict,
+        }
+        if verdict != 'OK':
+            breaches.append({'source': src, 'pct': round(pct, 2), 'verdict': verdict})
+        overall_total += int(total)
+        overall_orphans += int(orphans)
+
+        # Promote overall verdict to the strictest seen
+        if verdict == 'ERROR':
+            overall_verdict = 'ERROR'
+        elif verdict == 'WARNING' and overall_verdict == 'OK':
+            overall_verdict = 'WARNING'
+
+    overall_pct = (100.0 * overall_orphans / overall_total) if overall_total else 0.0
+    return {
+        'per_source': per_source,
+        'overall_pct': round(overall_pct, 2),
+        'verdict': overall_verdict,
+        'breaches': breaches,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Dual-run parity validators (Silver xref vs legacy gold.entity_xref)
+# ---------------------------------------------------------------------------
+
+# Map silver canonical_id → legacy gold canonical_id formula.
+# In legacy gold.entity_xref, team canonical_id was
+# ``LOWER(REGEXP_REPLACE(team_name, '[^a-zA-Z0-9]+', '_'))`` derived
+# directly from the FBref team name; player canonical_id was the FBref
+# player_id (no prefix); match canonical_id was the FBref match_id.
+#
+# Silver xref applies the YAML alias map first, so for FBref-only rows
+# whose raw name is NOT in the alias YAML the canonical_id will differ:
+# legacy uses the raw FBref name, Silver uses the canonical_name. Hence
+# parity for "FBref-only" team rows requires the raw name to either be
+# in the alias map (canonical_name set) or absent (orphan, prefix
+# 'fb_<slug>'). We do NOT try to bridge formulas here — the Silver value
+# is the new source-of-truth; we simply REPORT the diff.
+
+def _parity_diff_query(silver_table: str, legacy_entity_type: str) -> str:
+    """Build the FULL OUTER JOIN diff SQL for one entity type."""
+    silver_q = _qualify(silver_table)
+    return f"""
+WITH gold_legacy AS (
+    SELECT
+        source,
+        source_id,
+        canonical_id AS legacy_cid,
+        league,
+        CAST(season AS varchar) AS season
+    FROM iceberg.gold.entity_xref
+    WHERE entity_type = '{legacy_entity_type}'
+),
+silver_new AS (
+    SELECT
+        source,
+        source_id,
+        canonical_id AS new_cid,
+        league,
+        CAST(season AS varchar) AS season
+    FROM {silver_q}
+)
+SELECT
+    COALESCE(gl.source,    sn.source)    AS source,
+    COALESCE(gl.source_id, sn.source_id) AS source_id,
+    COALESCE(gl.league,    sn.league)    AS league,
+    COALESCE(gl.season,    sn.season)    AS season,
+    gl.legacy_cid,
+    sn.new_cid,
+    CASE
+        WHEN gl.legacy_cid IS NULL                THEN 'silver_only'
+        WHEN sn.new_cid    IS NULL                THEN 'gold_only'
+        WHEN gl.legacy_cid = sn.new_cid           THEN 'match'
+        ELSE                                            'cid_diff'
+    END AS diff_kind
+FROM gold_legacy gl
+FULL OUTER JOIN silver_new sn
+    ON  gl.source    = sn.source
+    AND gl.source_id = sn.source_id
+    AND gl.league    = sn.league
+    AND COALESCE(gl.season, '') = COALESCE(sn.season, '')
+"""
+
+
+def _legacy_table_exists() -> bool:
+    """Return True iff iceberg.gold.entity_xref exists.
+
+    During the dual-run period the table MUST exist; this guard exists for
+    pre-cutover edge cases (e.g. running parity in a fresh environment).
+    """
+    sql = (
+        "SELECT COUNT(*) FROM information_schema.tables "
+        "WHERE table_catalog = 'iceberg' "
+        "AND table_schema = 'gold' "
+        "AND table_name = 'entity_xref'"
+    )
+    conn = _get_conn()
+    try:
+        cur = conn.cursor()
+        try:
+            cur.execute(sql)
+            row = cur.fetchone()
+        finally:
+            cur.close()
+        return bool(row and row[0])
+    finally:
+        conn.close()
+
+
+def _run_parity(silver_table: str, legacy_entity_type: str) -> Dict[str, Any]:
+    """Generic parity runner used by ``parity_check_xref_*`` wrappers.
+
+    Returns the same shape as documented in
+    :func:`parity_check_xref_team_vs_gold`.
+    """
+    base = {
+        'silver_rows': 0,
+        'gold_legacy_rows': 0,
+        'matched_pairs': 0,
+        'silver_only': 0,
+        'gold_only': 0,
+        'cid_diff': 0,
+        'canonical_id_match_pct': 1.0,
+        'sample_diffs': [],
+        'verdict': 'PARITY_OK',
+    }
+
+    if not _legacy_table_exists():
+        base['verdict'] = 'LEGACY_ABSENT'
+        base['sample_diffs'] = [{'note': 'iceberg.gold.entity_xref does not exist'}]
+        return base
+
+    sql = _parity_diff_query(silver_table, legacy_entity_type)
+    conn = _get_conn()
+    try:
+        cur = conn.cursor()
+        try:
+            cur.execute(sql)
+            rows = cur.fetchall()
+        finally:
+            cur.close()
+    finally:
+        conn.close()
+
+    silver_only = 0
+    gold_only = 0
+    cid_diff = 0
+    matched = 0
+    sample_diffs: List[Dict[str, Any]] = []
+    silver_rows = 0
+    gold_rows = 0
+
+    for src, sid, league, season, legacy_cid, new_cid, diff_kind in rows:
+        if legacy_cid is not None:
+            gold_rows += 1
+        if new_cid is not None:
+            silver_rows += 1
+
+        if diff_kind == 'match':
+            matched += 1
+        else:
+            if diff_kind == 'silver_only':
+                silver_only += 1
+            elif diff_kind == 'gold_only':
+                gold_only += 1
+            elif diff_kind == 'cid_diff':
+                cid_diff += 1
+            if len(sample_diffs) < 10:
+                sample_diffs.append({
+                    'source': src,
+                    'source_id': sid,
+                    'league': league,
+                    'season': season,
+                    'legacy_cid': legacy_cid,
+                    'new_cid': new_cid,
+                    'diff_kind': diff_kind,
+                })
+
+    matched_pairs = matched + cid_diff
+    cid_match_pct = (matched / matched_pairs) if matched_pairs else 1.0
+
+    diff_total = silver_only + gold_only + cid_diff
+    verdict = 'PARITY_OK' if diff_total == 0 else 'DIFF_DETECTED'
+
+    return {
+        'silver_rows': silver_rows,
+        'gold_legacy_rows': gold_rows,
+        'matched_pairs': matched_pairs,
+        'silver_only': silver_only,
+        'gold_only': gold_only,
+        'cid_diff': cid_diff,
+        'canonical_id_match_pct': round(cid_match_pct, 4),
+        'sample_diffs': sample_diffs,
+        'verdict': verdict,
+    }
+
+
+def parity_check_xref_team_vs_gold() -> Dict[str, Any]:
+    """Diff ``silver.xref_team`` vs ``gold.entity_xref`` (entity_type='team').
+
+    Output keys::
+
+        silver_rows              — rows present in silver_new
+        gold_legacy_rows         — rows present in gold legacy
+        matched_pairs            — (source, source_id, league, season) keys in both
+        silver_only              — keys present only in Silver  (expected during
+                                   dual-run: Silver expands beyond FBref)
+        gold_only                — keys present only in legacy Gold (REGRESSION risk)
+        cid_diff                 — same key, different canonical_id
+        canonical_id_match_pct   — matched / matched_pairs ∈ [0, 1]
+        sample_diffs             — first 10 diffs, for XCom/Telegram debug
+        verdict                  — 'PARITY_OK' if no diffs, else 'DIFF_DETECTED'
+                                   (or 'LEGACY_ABSENT' if entity_xref dropped)
+
+    Does NOT raise. Dual-run policy is informational at E1.
+    """
+    return _run_parity('iceberg.silver.xref_team', 'team')
+
+
+def parity_check_xref_match_vs_gold() -> Dict[str, Any]:
+    """Diff ``silver.xref_match`` vs ``gold.entity_xref`` (entity_type='match')."""
+    return _run_parity('iceberg.silver.xref_match', 'match')
+
+
+def parity_check_xref_player_vs_gold() -> Dict[str, Any]:
+    """Diff ``silver.xref_player`` vs ``gold.entity_xref`` (entity_type='player').
+
+    Note: legacy entity_xref player rows use ``canonical_id = player_id``
+    (no ``fb_`` prefix), while Silver uses ``fb_<player_id>``. Therefore
+    every FBref-only row will have ``cid_diff`` until E1.5 cutover. The
+    verdict is informational — ``cid_diff > 0`` is EXPECTED here.
+    """
+    return _run_parity('iceberg.silver.xref_player', 'player')
+
+
+# ---------------------------------------------------------------------------
+# Telegram alert helper (private send via alerts._send_telegram)
+# ---------------------------------------------------------------------------
+
+def _send_parity_alert(parity_summary: Dict[str, Dict[str, Any]]) -> None:
+    """Send a one-line Telegram message summarising parity verdicts.
+
+    Uses ``alerts._send_telegram`` directly (no public ``send_telegram_message``
+    surface in ``alerts.py``). Always swallows exceptions.
+    """
+    try:
+        # private-OK: T6 dual-run parity uses lo-fi telegram; alerts.py only
+        # exposes context-aware callbacks (telegram_on_failure/_success/
+        # _dq_summary). A public wrapper for arbitrary messages is TBD.
+        from utils.alerts import _send_telegram  # type: ignore[attr-defined]  # noqa: PLC2701
+        env = os.environ.get('ALERT_ENV', 'dev')
+        lines = [f"<b>[{env}] E1 dual-run parity</b>"]
+        for entity, p in parity_summary.items():
+            verdict = p.get('verdict', '?')
+            pct = p.get('canonical_id_match_pct', 1.0) * 100
+            lines.append(
+                f"  <code>{entity}</code>: {verdict} "
+                f"(cid match {pct:.1f}%, "
+                f"silver_only={p.get('silver_only', 0)}, "
+                f"gold_only={p.get('gold_only', 0)}, "
+                f"cid_diff={p.get('cid_diff', 0)})"
+            )
+        _send_telegram("\n".join(lines))
+    except Exception as e:
+        logger.warning(f"_send_parity_alert swallowed: {e}")
+
+
+def maybe_alert_parity(parity_summary: Dict[str, Dict[str, Any]],
+                       diff_threshold: int = 100) -> bool:
+    """Send Telegram parity alert if total diff for any entity exceeds threshold.
+
+    Returns True if an alert was actually sent (sent=False if all diffs
+    below threshold or telegram credentials missing).
+    """
+    significant = False
+    for entity, p in parity_summary.items():
+        diff_total = (
+            int(p.get('silver_only', 0))
+            + int(p.get('gold_only', 0))
+            + int(p.get('cid_diff', 0))
+        )
+        if diff_total >= diff_threshold:
+            significant = True
+            break
+    if significant:
+        _send_parity_alert(parity_summary)
+        return True
+    return False

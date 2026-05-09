@@ -1,0 +1,170 @@
+-- =============================================================================
+-- Silver: xref_team   (Jinja-template — `.sql.j2`)
+-- =============================================================================
+-- Maps source-specific team-name → canonical team_id across 8 sources.
+--
+-- This template renders ONE `{{ team_aliases_values_sql }}` placeholder which
+-- is filled by `dags.utils.medallion_config.get_team_alias_sql_values()`.
+-- The placeholder must produce a comma-separated list of two-tuples in the
+-- form `('raw_name', 'canonical_name'), ...`. See `medallion_config.py`
+-- (T1 deliverable) for escape rules and the public-API contract.
+--
+-- DAG-integration note: T4 will wrap this SELECT in
+-- `CREATE TABLE iceberg.silver.xref_team AS ...` via
+-- `silver_tasks.run_silver_transform()`, after rendering through
+-- `medallion_config.render_sql_template()`. This file MUST stay a pure
+-- SELECT — do not add `CREATE TABLE` here.
+--
+-- =============================================================================
+-- Schema (frozen for E1 dual-run)
+-- =============================================================================
+--   canonical_id   varchar  -- 'wolverhampton_wanderers' | 'fb_<slug>' | 'mh_<slug>' | ...
+--   source         varchar  -- 'fbref' | 'understat' | 'whoscored' | 'sofascore' |
+--                              'fotmob' | 'matchhistory' | 'clubelo' | 'espn'
+--   source_id      varchar  -- raw team-name as it appears in Bronze
+--   display_name   varchar  -- canonical_name when aliased, else source_id
+--   league         varchar  -- partitioning hint (e.g. 'ENG-Premier League')
+--   season         varchar  -- partitioning hint, normalised to varchar
+--   confidence     varchar  -- 'name_alias' (matched in YAML) | 'orphan' (no match)
+--   match_score    double   -- always NULL for team xref (fuzzy lives in T3 player)
+--
+-- Testable invariants (T5):
+--   * PK = (source, source_id, league, season) — guaranteed by final GROUP BY.
+--   * All 8 sources are represented in the UNION ALL below; T5 should
+--     SELECT DISTINCT source FROM iceberg.silver.xref_team and assert
+--     that the set equals the 8 prefixes documented above.
+--   * canonical_id is NEVER NULL (CASE branch covers every source).
+--   * confidence ∈ {'name_alias', 'orphan'}.
+--
+-- =============================================================================
+-- Bronze column-name reference (verified via DESCRIBE on 2026-05-08)
+-- =============================================================================
+--   fbref_schedule        : home, away, league, season (BIGINT — needs CAST)
+--   understat_schedule    : home_team, away_team, league, season (varchar)
+--   whoscored_schedule    : home_team, away_team, league, season (varchar)
+--                          (NB: whoscored_events has only `team`, not home/away)
+--   sofascore_schedule    : home_team, away_team, league, season (varchar)
+--   fotmob_schedule       : home_team, away_team, league, season (BIGINT)
+--   matchhistory_games    : hometeam, awayteam, league, season (BIGINT)
+--                          (NB: lowercase, single-token — NOT CamelCase)
+--   clubelo_ratings       : team, league (no season — see CAST(NULL AS varchar))
+--                          (clubelo_team_history has no league either; we
+--                           prefer clubelo_ratings as the team-name source)
+--   espn_schedule         : home_team, away_team, league, season (varchar)
+-- =============================================================================
+
+WITH aliases AS (
+    SELECT raw_name, canonical_name
+    FROM (VALUES
+        {{ team_aliases_values_sql }}
+    ) AS t(raw_name, canonical_name)
+),
+
+raw_teams AS (
+    -- ===== fbref (home/away from schedule) =====
+    SELECT 'fbref' AS source, home AS source_id, league, CAST(season AS varchar) AS season
+      FROM iceberg.bronze.fbref_schedule WHERE home IS NOT NULL
+    UNION
+    SELECT 'fbref' AS source, away AS source_id, league, CAST(season AS varchar) AS season
+      FROM iceberg.bronze.fbref_schedule WHERE away IS NOT NULL
+
+    UNION
+    -- ===== understat =====
+    SELECT 'understat' AS source, home_team AS source_id, league, CAST(season AS varchar) AS season
+      FROM iceberg.bronze.understat_schedule WHERE home_team IS NOT NULL
+    UNION
+    SELECT 'understat' AS source, away_team AS source_id, league, CAST(season AS varchar) AS season
+      FROM iceberg.bronze.understat_schedule WHERE away_team IS NOT NULL
+
+    UNION
+    -- ===== whoscored (using schedule, not events) =====
+    SELECT 'whoscored' AS source, home_team AS source_id, league, CAST(season AS varchar) AS season
+      FROM iceberg.bronze.whoscored_schedule WHERE home_team IS NOT NULL
+    UNION
+    SELECT 'whoscored' AS source, away_team AS source_id, league, CAST(season AS varchar) AS season
+      FROM iceberg.bronze.whoscored_schedule WHERE away_team IS NOT NULL
+
+    UNION
+    -- ===== sofascore =====
+    SELECT 'sofascore' AS source, home_team AS source_id, league, CAST(season AS varchar) AS season
+      FROM iceberg.bronze.sofascore_schedule WHERE home_team IS NOT NULL
+    UNION
+    SELECT 'sofascore' AS source, away_team AS source_id, league, CAST(season AS varchar) AS season
+      FROM iceberg.bronze.sofascore_schedule WHERE away_team IS NOT NULL
+
+    UNION
+    -- ===== fotmob =====
+    SELECT 'fotmob' AS source, home_team AS source_id, league, CAST(season AS varchar) AS season
+      FROM iceberg.bronze.fotmob_schedule WHERE home_team IS NOT NULL
+    UNION
+    SELECT 'fotmob' AS source, away_team AS source_id, league, CAST(season AS varchar) AS season
+      FROM iceberg.bronze.fotmob_schedule WHERE away_team IS NOT NULL
+
+    UNION
+    -- ===== matchhistory (lowercase columns: hometeam, awayteam) =====
+    SELECT 'matchhistory' AS source, hometeam AS source_id, league, CAST(season AS varchar) AS season
+      FROM iceberg.bronze.matchhistory_games WHERE hometeam IS NOT NULL
+    UNION
+    SELECT 'matchhistory' AS source, awayteam AS source_id, league, CAST(season AS varchar) AS season
+      FROM iceberg.bronze.matchhistory_games WHERE awayteam IS NOT NULL
+
+    UNION
+    -- ===== clubelo (column name is `team`; no season column → NULL) =====
+    SELECT 'clubelo' AS source, team AS source_id, league, CAST(NULL AS varchar) AS season
+      FROM iceberg.bronze.clubelo_ratings
+     WHERE team IS NOT NULL
+       AND league = 'ENG-Premier League'   -- ClubElo trackет всю English pyramid; фильтруем не-APL
+
+    UNION
+    -- ===== espn =====
+    SELECT 'espn' AS source, home_team AS source_id, league, CAST(season AS varchar) AS season
+      FROM iceberg.bronze.espn_schedule WHERE home_team IS NOT NULL
+    UNION
+    SELECT 'espn' AS source, away_team AS source_id, league, CAST(season AS varchar) AS season
+      FROM iceberg.bronze.espn_schedule WHERE away_team IS NOT NULL
+),
+
+resolved AS (
+    SELECT
+        rt.source,
+        rt.source_id,
+        rt.league,
+        rt.season,
+        a.canonical_name,
+        CASE WHEN a.canonical_name IS NOT NULL THEN 'name_alias' ELSE 'orphan' END
+            AS confidence
+    FROM raw_teams rt
+    LEFT JOIN aliases a
+      ON a.raw_name = rt.source_id
+)
+
+SELECT
+    CASE
+        WHEN canonical_name IS NOT NULL
+          THEN LOWER(REGEXP_REPLACE(canonical_name, '[^a-zA-Z0-9]+', '_'))
+        ELSE
+            CASE source
+                WHEN 'fbref'        THEN 'fb_'
+                WHEN 'understat'    THEN 'us_'
+                WHEN 'whoscored'    THEN 'ws_'
+                WHEN 'sofascore'    THEN 'ss_'
+                WHEN 'fotmob'       THEN 'fm_'
+                WHEN 'matchhistory' THEN 'mh_'
+                WHEN 'clubelo'      THEN 'ce_'
+                WHEN 'espn'         THEN 'es_'
+            END
+            || LOWER(REGEXP_REPLACE(source_id, '[^a-zA-Z0-9]+', '_'))
+    END                                       AS canonical_id,
+    source,
+    source_id,
+    COALESCE(canonical_name, source_id)       AS display_name,
+    league,
+    season,
+    MIN(confidence)                           AS confidence,
+    CAST(NULL AS double)                      AS match_score
+FROM resolved
+GROUP BY
+    -- canonical_id is a deterministic function of (source, source_id, canonical_name)
+    -- so grouping by (source, source_id, league, season, canonical_name) is enough
+    -- to enforce the documented PK and dedupe identical rows from the UNION.
+    1, source, source_id, league, season, canonical_name

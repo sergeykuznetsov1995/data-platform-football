@@ -1,0 +1,135 @@
+# =============================================================================
+# Medallion competition catalog (E1)
+# =============================================================================
+# Каталог competitions для cross-source xref/feature pipelines.
+# В E1 заполнен только APL (in_scope=true). Остальные — stub'ы для E8a/b/c.
+#
+# Sources priority здесь — это ТОЛЬКО факт того, что источник существует
+# для competition'a. Per-metric primary/fallback (xG vs goals vs cards)
+# живёт в Gold SQL, не в YAML. См. R1 verdict
+# (docs/MEDALLION_REDESIGN_ROADMAP.md L574-L580).
+#
+# Season ID convention: 4-digit slug — 2024-25 -> 2425, 2025-26 -> 2526
+# (matches Bronze season convention from utils.config.get_current_season).
+#
+# Field reference:
+#   id                — competition slug, совпадает с Bronze.league string
+#   name              — human-readable name
+#   tier              — 1 = top flight (only tier=1 currently)
+#   seasons           — list of {id, format, team_count, start, end}
+#   sources.primary   — sources с >80% coverage (R0.1 verdict)
+#   sources.fallback  — sources с partial coverage / per-metric fallback
+#   in_scope          — true = currently materialized in Gold; false = stub
+#   notes             — rationale, deferral target
+# =============================================================================
+
+competitions:
+  - id: "ENG-Premier League"
+    name: "English Premier League"
+    tier: 1
+    seasons:
+      - id: 2122
+        format: "league_round_robin"
+        team_count: 20
+        start: "2021-08-13"
+        end: "2022-05-22"
+      - id: 2223
+        format: "league_round_robin"
+        team_count: 20
+        start: "2022-08-05"
+        end: "2023-05-28"
+      - id: 2324
+        format: "league_round_robin"
+        team_count: 20
+        start: "2023-08-11"
+        end: "2024-05-19"
+      - id: 2425
+        format: "league_round_robin"
+        team_count: 20
+        start: "2024-08-16"
+        end: "2025-05-25"
+      - id: 2526
+        format: "league_round_robin"
+        team_count: 20
+        start: "2025-08-15"
+        end: "2026-05-24"
+    sources:
+      primary: ["fbref", "understat"]
+      fallback:
+        - "whoscored"
+        - "sofascore"
+        - "fotmob"
+        - "matchhistory"
+        - "espn"
+        - "clubelo"
+    in_scope: true
+
+  - id: "EUR-Champions League"
+    name: "UEFA Champions League"
+    tier: 1
+    seasons: []
+    sources:
+      primary: []
+      fallback: []
+    in_scope: false
+    notes: "stub for E8a (UCL expansion); ~125 matches/season"
+
+  - id: "ESP-La Liga"
+    name: "Spanish La Liga"
+    tier: 1
+    seasons: []
+    sources:
+      primary: []
+      fallback: []
+    in_scope: false
+    notes: "stub for E8b (Top-5 European leagues)"
+
+  - id: "ITA-Serie A"
+    name: "Italian Serie A"
+    tier: 1
+    seasons: []
+    sources:
+      primary: []
+      fallback: []
+    in_scope: false
+    notes: "stub for E8b (Top-5 European leagues)"
+
+  - id: "GER-Bundesliga"
+    name: "German Bundesliga"
+    tier: 1
+    seasons: []
+    sources:
+      primary: []
+      fallback: []
+    in_scope: false
+    notes: "stub for E8b (Top-5 European leagues)"
+
+  - id: "FRA-Ligue 1"
+    name: "French Ligue 1"
+    tier: 1
+    seasons: []
+    sources:
+      primary: []
+      fallback: []
+    in_scope: false
+    notes: "stub for E8b (Top-5 European leagues)"
+
+  - id: "NED-Eredivisie"
+    name: "Dutch Eredivisie"
+    tier: 1
+    seasons: []
+    sources:
+      primary: []
+      fallback: []
+    in_scope: false
+    notes: "stub for E8b (Top-5 sister league — Understat covers it)"
+
+  - id: "EUR-Europa League"
+    name: "UEFA Europa League"
+    tier: 1
+    seasons: []
+    sources:
+      primary: []
+      fallback: []
+    in_scope: false
+    notes: "stub for E8c (EL + cup competitions)"
