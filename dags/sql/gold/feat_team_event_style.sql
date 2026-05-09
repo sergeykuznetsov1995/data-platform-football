@@ -77,9 +77,10 @@
 -- =============================================================================
 -- fct_event.team_id_canonical resolves WhoScored team_id_raw (numeric Opta) →
 -- FBref-canonical team_id via xref_team(source='whoscored'). fct_team_match.team_id
--- and dim_match.home_team_id/away_team_id come from gold.entity_xref(source='fbref')
--- canonical_id. Both pipelines feed the same canonical universe (silver.xref_team)
--- so canonical_ids ARE comparable post-resolution. Orphan WhoScored teams
+-- and dim_match.home_team_id/away_team_id come from silver.xref_team(source='fbref')
+-- canonical_id (post-E1.5 cutover; previously gold.entity_xref). Both pipelines
+-- feed the same canonical universe (silver.xref_team) so canonical_ids ARE
+-- comparable post-resolution. Orphan WhoScored teams
 -- (xref_team has no row) emit team_id_canonical=NULL on fct_event side and the
 -- aggregation per (game_id, team_id_canonical) drops those rows naturally.
 -- This is acceptable: orphan-team coverage gap surfaces in DQ on the empty

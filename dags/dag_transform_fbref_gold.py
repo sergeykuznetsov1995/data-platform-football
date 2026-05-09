@@ -10,10 +10,11 @@ Architecture
     Triggered by dag_transform_fbref_silver (or manual trigger)
         |
         v
-    entity_xref (teams, players, matches)
+    entity_xref (legacy, dual-run with silver.xref_* — drop in E1.5 follow-up PR)
         |
         v
-    dim_team, dim_player, dim_match (parallel-safe, but sequential to save RAM)
+    dim_team, dim_player, dim_match (read silver.xref_* since E1.5;
+                                     parallel-safe, but sequential to save RAM)
         |
         v
     fct_team_match, fct_player_match, match_outcomes
@@ -35,13 +36,18 @@ usage predictable on a dev-sized Trino (5 GB container / 3.5 GB heap).
 
 Gold Tables
 -----------
-- ``gold.entity_xref``        — cross-source ID map (MVP: FBref only)
-- ``gold.dim_team``           — team dimension
-- ``gold.dim_player``         — player dimension
+- ``gold.entity_xref``        — cross-source ID map (legacy; superseded by
+                                silver.xref_team/match/referee/manager/player;
+                                pending drop after E1.5 cutover)
+- ``gold.dim_team``           — team dimension (reads silver.xref_team since E1.5)
+- ``gold.dim_player``         — player dimension (canonical_id format
+                                'fb_<player_id>' since E1.5)
 - ``gold.dim_match``          — match attributes + ML targets
+                                (reads silver.xref_team since E1.5)
 - ``gold.dim_venue``          — venue master-data (E2)
 - ``gold.dim_referee``        — referee master-data (E2)
 - ``gold.dim_standings``      — SofaScore league-table snapshot (E2)
+                                (reads silver.xref_team(source='sofascore') since E1.5)
 - ``gold.dim_competition``    — competition master-data from leagues.yaml (E2)
 - ``gold.dim_season``         — season master-data with valid_from/valid_to (E2)
 - ``gold.fct_team_match``     — long-form team metrics per match

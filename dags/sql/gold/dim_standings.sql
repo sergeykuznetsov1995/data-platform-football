@@ -4,15 +4,17 @@
 -- Per-(league, season, team) league table snapshot from SofaScore. One row per
 -- team per league/season. Carries position, points, goals, GD, points-per-game.
 --
--- Source:       iceberg.bronze.sofascore_league_table
+-- Source:       iceberg.bronze.sofascore_league_table + iceberg.silver.xref_team
 -- PK:           (league, season, team_id)
 -- Partitioning: (league, season)   -- passed by run_gold_transform()
 --
--- Team resolution:
---   LEFT JOIN iceberg.gold.entity_xref on (entity_type='team', source='sofascore')
---   * matched   -> team_id = entity_xref.canonical_id, team_id_source='fbref_canonical'
---   * orphan    -> team_id = 'ss_<slug>',              team_id_source='sofascore_orphan'
---   Orphan prefix mirrors entity_xref.sql convention for unresolved sources.
+-- Team resolution (Migrated from gold.entity_xref to silver.xref_team in E1.5,
+--                  2026-05-09 prep):
+--   LEFT JOIN iceberg.silver.xref_team on (source='sofascore')
+--   * matched   -> team_id = xref_team.canonical_id, team_id_source='fbref_canonical'
+--   * orphan    -> team_id = 'ss_<slug>',            team_id_source='sofascore_orphan'
+--   Orphan prefix mirrors the 'ss_' source-prefix convention enforced by
+--   silver.xref_team for unresolved sofascore teams (see xref_team.sql.j2).
 --
 -- Source-of-truth selection (R0.4 schema versioning):
 --   team_id_source   carries the resolution path (no separate _source/_version
@@ -31,13 +33,16 @@
 --     order in the league-table feed but does not store the rank column.
 --   * points_per_game uses NULLIF(mp, 0) to guard against zero-game teams.
 --   * SofaScore 'season' is encoded as 4-char label ('2526') -> normalized to
---     BIGINT 2025 to align with silver/FBref season type.
+--     BIGINT 2025 to align with silver/FBref season type. The raw '2526' slug
+--     is retained as season_slug for the silver.xref_team JOIN (which keys on
+--     varchar season).
 -- =============================================================================
 
 with standings_raw as (
     select
         league,
         try_cast(substr(season, 1, 2) as bigint) + 2000  as season,
+        season                                            as season_slug,
         team                                              as team_name_raw,
         cast(mp as integer)                               as mp,
         cast(w  as integer)                               as wins,
@@ -61,6 +66,7 @@ standings_latest as (
     select
         league,
         season,
+        season_slug,
         team_name_raw,
         mp,
         wins,
@@ -81,12 +87,11 @@ resolved as (
         s.*,
         x.canonical_id                                    as canonical_team_id
     from standings_latest s
-    left join iceberg.gold.entity_xref x
-      on  x.entity_type = 'team'
-      and x.source      = 'sofascore'
+    left join iceberg.silver.xref_team x
+      on  x.source      = 'sofascore'
       and x.source_id   = s.team_name_raw
       and x.league      = s.league
-      and x.season      = s.season
+      and x.season      = s.season_slug
 )
 
 select
