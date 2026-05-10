@@ -134,31 +134,60 @@ def build_xref_team_checks() -> List[Check]:
 
 
 def build_xref_match_checks() -> List[Check]:
-    """DQ for ``iceberg.silver.xref_match``."""
-    table = 'iceberg.silver.xref_match'
-    return [
-        # 5 seasons × ~380 APL fixtures — min 1900. Upper bound 30k allows
-        # multi-league expansion before tripping.
-        CHECK.row_count(table, min_rows=1900, max_rows=30000),
+    """DQ for ``iceberg.silver.xref_match`` (Phase B — 7-source cascade).
 
-        CHECK.no_duplicates(table, pk=['canonical_id']),
+    Source enum covers FBref spine + 6 cascaded sources. PK is composite
+    ``(canonical_id, source)`` because the same FBref canonical legitimately
+    appears under multiple ``source`` values (the bridged rows). Per-source
+    bridge coverage is enforced via ``CHECK.coverage`` with the universal
+    two-tier semantics: ``ratio = COUNT_IF(confidence != 'orphan') / COUNT(*)``.
+    """
+    table = 'iceberg.silver.xref_match'
+    sources = [
+        'fbref', 'whoscored', 'understat', 'sofascore',
+        'fotmob', 'matchhistory', 'espn',
+    ]
+    checks: List[Check] = [
+        # 5 seasons × ~380 APL fixtures × 7 sources ≈ 13K; cap 60K with headroom.
+        CHECK.row_count(table, min_rows=1900, max_rows=60_000),
+
+        # PK is composite — bridged sources share canonical_id with FBref.
+        CHECK.no_duplicates(table, pk=['canonical_id', 'source']),
 
         CHECK.no_nulls(table, cols=['canonical_id', 'source', 'source_id']),
 
-        # E1 MVP — only fbref source materialised
         check_enum_compliance(
             table, 'source',
-            allowed=['fbref'],
+            allowed=sources,
             severity='ERROR',
         ),
 
-        # Confidence is always 'exact' for match xref (match_id authoritative)
+        # 'exact' = FBref spine, 'date_team_match' = bridged cascade row,
+        # 'orphan' = source row with no FBref counterpart.
         check_enum_compliance(
             table, 'confidence',
-            allowed=['exact'],
+            allowed=['exact', 'date_team_match', 'orphan'],
             severity='ERROR',
         ),
     ]
+
+    # Per-source bridge coverage (skip fbref — it's the spine, always 'exact').
+    # Two-tier semantics via the data_quality coverage runner:
+    #   ratio >= 0.95 -> OK; 0.80-0.95 -> WARNING; <0.80 -> ERROR.
+    for src in sources:
+        if src == 'fbref':
+            continue
+        checks.append(CHECK.coverage(
+            table=table,
+            condition="confidence != 'orphan'",
+            where=f"source = '{src}'",
+            warn_threshold=0.95,
+            error_threshold=0.80,
+            severity='WARNING',  # runner promotes to ERROR when ratio < 0.80
+            name=f'bridge_coverage[xref_match.{src}]',
+        ))
+
+    return checks
 
 
 def build_xref_referee_checks() -> List[Check]:

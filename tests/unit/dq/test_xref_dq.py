@@ -206,16 +206,56 @@ def test_build_xref_team_source_enum_8_sources():
         assert f"'{src}'" in where
 
 
-def test_xref_match_only_fbref():
-    """E1 MVP: xref_match source enum allow-list = ['fbref']."""
+def test_xref_match_seven_sources():
+    """Task 2.1 (Phase B): xref_match cascade allows 7 sources."""
     checks = xref_dq.build_xref_match_checks()
     src_checks = [c for c in checks if 'enum_compliance' in c.name and '.source' in c.name]
     assert len(src_checks) == 1
     where = src_checks[0].params['where']
-    assert "'fbref'" in where
-    # No other sources allowed
-    for forbidden in ['understat', 'whoscored', 'sofascore']:
-        assert f"'{forbidden}'" not in where
+    for src in ['fbref', 'whoscored', 'understat', 'sofascore',
+                'fotmob', 'matchhistory', 'espn']:
+        assert f"'{src}'" in where
+    # clubelo is intentionally NOT in xref_match (no match-grain bronze)
+    assert "'clubelo'" not in where
+
+
+def test_xref_match_confidence_three_tier():
+    """Phase B confidence enum = {exact, date_team_match, orphan}."""
+    checks = xref_dq.build_xref_match_checks()
+    enum_checks = [c for c in checks if 'enum_compliance' in c.name and 'confidence' in c.name]
+    assert len(enum_checks) == 1
+    where = enum_checks[0].params['where']
+    for tier in ['exact', 'date_team_match', 'orphan']:
+        assert f"'{tier}'" in where
+
+
+def test_xref_match_pk_composite():
+    """PK is now (canonical_id, source) — same FBref hex appears under
+    multiple source values when bridged."""
+    checks = xref_dq.build_xref_match_checks()
+    dup_checks = [c for c in checks if c.kind == 'no_duplicates']
+    assert len(dup_checks) == 1
+    assert dup_checks[0].params['pk'] == ['canonical_id', 'source']
+
+
+def test_xref_match_coverage_checks_per_source():
+    """Six bridge_coverage checks (one per non-fbref source) with two-tier thresholds."""
+    checks = xref_dq.build_xref_match_checks()
+    cov_checks = [c for c in checks if c.kind == 'coverage' and 'bridge_coverage' in c.name]
+    assert len(cov_checks) == 6, (
+        f"Expected 6 per-source coverage checks (whoscored/understat/sofascore/"
+        f"fotmob/matchhistory/espn), got {len(cov_checks)}"
+    )
+    names = {c.name for c in cov_checks}
+    for src in ['whoscored', 'understat', 'sofascore', 'fotmob', 'matchhistory', 'espn']:
+        assert f'bridge_coverage[xref_match.{src}]' in names
+
+    # Verify thresholds: warn=0.95, error=0.80
+    for c in cov_checks:
+        assert c.params['warn_threshold'] == 0.95
+        assert c.params['error_threshold'] == 0.80
+        assert "confidence != 'orphan'" in c.params['condition']
+        assert c.params['where'].startswith("source = '")
 
 
 def test_xref_referee_source_enum():
