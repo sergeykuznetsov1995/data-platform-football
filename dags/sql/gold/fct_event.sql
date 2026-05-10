@@ -23,8 +23,9 @@
 -- Output schema (frozen for E3 wave-1 — see plan R3.E3.3)
 -- =============================================================================
 --   match_id_canonical    varchar     resolved match canonical (see ADR #1)
---   match_id_source       varchar     'whoscored_raw' (cross-source bridging deferred)
---   match_id_version      varchar     'v0_unbridged' (will become 'v1' after Phase B)
+--   match_id_source       varchar     'fbref' when bridged via silver.xref_match,
+--                                     else 'whoscored_raw' (orphan)
+--   match_id_version      varchar     'v1' when bridged, else 'v0_unbridged' (orphan)
 --   event_id              varchar     passthrough from silver (synthetic stable PK)
 --   team_id_canonical     varchar     via xref_team — orphan-tolerant LEFT JOIN
 --   team_id_source        varchar     'whoscored'
@@ -53,26 +54,24 @@
 -- ADR — architectural decisions documented inline
 -- =============================================================================
 --
--- ADR-1: match_id bridging — DEFERRED to Phase B (post-E1.5)
--- ----------------------------------------------------------
--- E1 D6 fixes `xref_match` as FBref-only (`source='fbref'`, no whoscored
--- mapping). Bridging WhoScored game_id → FBref match_id requires a
--- materialised `xref_team` + `(date, home_canonical_id, away_canonical_id)`
--- fuzzy join — that follow-up CTAS lives in Phase B (between E1.5 and E3
--- per the E1 postmortem deferred-list).
+-- ADR-1: match_id bridging — Phase B SHIPPED
+-- ------------------------------------------
+-- silver.xref_match now carries one row per WhoScored game (source='whoscored').
+-- Bridged rows expose the FBref canonical hex; rows that have no FBref
+-- counterpart (mid-week / non-APL fixture not in FBref spine) carry an
+-- orphan canonical of the form 'ws_<game_id>' with confidence='orphan'.
 --
--- Decision for E3.3: emit `match_id_canonical = raw match_id` with
--- `match_id_source='whoscored_raw'` and `match_id_version='v0_unbridged'`.
--- The version label is the load-bearing signal for downstream consumers:
--- after Phase B ships, fct_event will rebuild with `_version='v1'` and
--- canonical IDs swapped to FBref hex. R0.4 schema-versioning rules cover
--- the migration runbook (Iceberg ADD COLUMN is backward-compatible; CTAS
--- rebuild rewrites Parquet).
+-- This CTAS LEFT JOINs xref_match and resolves the triplet:
+--   * match_id_canonical = COALESCE(xm.canonical_id, e.match_id)
+--   * match_id_source    = 'fbref' when bridged AND non-orphan, else 'whoscored_raw'
+--   * match_id_version   = 'v1'    when bridged AND non-orphan, else 'v0_unbridged'
 --
--- Why not LEFT JOIN xref_match anyway? It would always return NULL on the
--- whoscored side (no rows with source='whoscored'), forcing every consumer
--- to COALESCE(canonical, raw). Embedding the raw id directly with an
--- explicit version label is cleaner and matches the R0.4 pattern.
+-- The orphan branch preserves R3.D5 row-count parity (ADR-4) — silver-level
+-- whoscored events with no FBref bridge still flow through Gold.
+--
+-- ref_integrity for match_id_canonical → silver.xref_match.canonical_id is
+-- now ENABLED in `dags/utils/e3_dq.py::_build_fct_event_checks` because
+-- every WhoScored game_id has a row in xref_match (bridged or orphan).
 --
 -- ADR-2: team_id_raw bridge through bronze.whoscored_events
 -- ---------------------------------------------------------
@@ -160,12 +159,24 @@ SELECT
     -- ============================================================
     -- match identity (R0.4 canonical / source / version triplet)
     -- ============================================================
-    -- ADR-1: bridging to FBref match_id deferred to Phase B; emit
-    -- raw whoscored game_id with explicit unbridged version label
-    -- so downstream consumers can detect and migrate atomically.
-    e.match_id                                   AS match_id_canonical,
-    CAST('whoscored_raw'   AS varchar)           AS match_id_source,
-    CAST('v0_unbridged'    AS varchar)           AS match_id_version,
+    -- ADR-1: bridged via silver.xref_match LEFT JOIN. When the cascade
+    -- found a FBref counterpart for this whoscored game we emit FBref
+    -- hex + ('fbref','v1'). When no counterpart was found, xm.canonical_id
+    -- is the orphan-prefixed 'ws_<id>' (confidence='orphan'); we surface
+    -- it as match_id_canonical for ref_integrity but keep the legacy
+    -- ('whoscored_raw','v0_unbridged') labels so downstream consumers
+    -- can detect unbridged rows.
+    COALESCE(xm.canonical_id, e.match_id)        AS match_id_canonical,
+    CASE
+        WHEN xm.canonical_id IS NOT NULL AND xm.confidence != 'orphan'
+            THEN CAST('fbref'         AS varchar)
+        ELSE CAST('whoscored_raw' AS varchar)
+    END                                          AS match_id_source,
+    CASE
+        WHEN xm.canonical_id IS NOT NULL AND xm.confidence != 'orphan'
+            THEN CAST('v1'            AS varchar)
+        ELSE CAST('v0_unbridged'  AS varchar)
+    END                                          AS match_id_version,
 
     -- ============================================================
     -- event_id passthrough (silver guarantees PK uniqueness)
@@ -251,3 +262,14 @@ LEFT JOIN iceberg.silver.xref_player xp
    AND xp.source_id = e.player_id_raw
    AND xp.league    = e.league
    AND xp.season    = e.season
+
+-- ---- match xref (whoscored game_id -> FBref hex via Phase B cascade) ----
+-- Phase B (Task 2.1) materialises a 7-source xref_match. For every WhoScored
+-- game silver.xref_match has a row (bridged FBref or orphan-prefixed
+-- 'ws_<id>'), so the JOIN here resolves match_id_canonical to a non-NULL
+-- value matched by ref_integrity.
+LEFT JOIN iceberg.silver.xref_match xm
+    ON xm.source    = 'whoscored'
+   AND xm.source_id = e.match_id
+   AND xm.league    = e.league
+   AND xm.season    = e.season

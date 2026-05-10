@@ -75,24 +75,31 @@ class TestCheckCounts:
         assert len(espn) == 4
 
     def test_gold_e3_total_check_count(self):
-        """Gold builders total: fct_event (10) + fct_shot (7) + fct_lineup (8) = 25."""
+        """Gold builders total: fct_event (11) + fct_shot (7) + fct_lineup (8) = 26.
+
+        fct_event grew by 1 check in Task 2.1 — Phase B re-enabled the
+        ``ref_integrity[fct_event.match_id_canonical -> silver.xref_match]``
+        gate that was disabled during the v0_unbridged interim.
+        """
         checks = e3_dq.build_gold_e3_checks()
-        assert len(checks) == 25, (
-            f"Gold E3 expected 25 checks, got {len(checks)}: "
+        assert len(checks) == 26, (
+            f"Gold E3 expected 26 checks, got {len(checks)}: "
             f"{[c.name for c in checks]}"
         )
 
     def test_gold_fct_event_count(self):
-        """Gold fct_event has 10 checks. Some custom-named ones address
-        ``orphan_team_rate``, ``orphan_player_rate_non_meta``,
-        ``schema_version_literal_drift[fct_event]`` — count by table attr.
+        """Gold fct_event has 11 checks: 10 standard + ref_integrity (Phase B).
+        Some custom-named ones address ``orphan_team_rate``,
+        ``orphan_player_rate_non_meta``, ``schema_version_literal_drift[fct_event]``.
+        Match by table OR child fragment (ref_integrity uses 'child' param).
         """
         checks = e3_dq.build_gold_e3_checks()
         fct_event = [
             c for c in checks
             if c.params.get("table") == "iceberg.gold.fct_event"
+            or c.params.get("child") == "gold.fct_event"
         ]
-        assert len(fct_event) == 10
+        assert len(fct_event) == 11
 
     def test_gold_fct_shot_count(self):
         """fct_shot has 7 checks: no_duplicates, no_nulls, ref_integrity (uses
@@ -116,9 +123,9 @@ class TestCheckCounts:
         assert len(fct_lineup) == 8
 
     def test_build_all_e3_checks_total(self):
-        """13 silver + 25 gold = 38 total E3 standard DQ checks."""
+        """13 silver + 26 gold = 39 total E3 standard DQ checks (Task 2.1)."""
         all_checks = e3_dq.build_all_e3_checks()
-        assert len(all_checks) == 38
+        assert len(all_checks) == 39
 
 
 # ===========================================================================
