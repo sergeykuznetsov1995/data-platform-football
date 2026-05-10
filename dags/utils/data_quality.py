@@ -17,6 +17,8 @@ Check types
 - no_nulls       — listed columns have zero NULLs
 - ref_integrity  — child.key exists in parent.key
 - value_range    — column values within [min, max]
+- coverage       — two-tier: COUNT_IF(condition)/COUNT(*) vs warn/error thresholds
+- canonical_completeness — <base>_canonical IS NOT NULL implies <base>_source/_version NOT NULL
 - point_in_time  — rolling feature is NULL for first N rows per partition
 - scd2_no_overlap— SCD-2 validity intervals do not overlap within a key
 - schema_parity  — column_name+data_type sets match across N tables (train/inference parity)
@@ -244,6 +246,56 @@ class CHECK:
             name=name or f"canonical_completeness[{table}.{canonical_col}]",
             kind='canonical_completeness',
             params={'table': table, 'canonical_col': canonical_col},
+            severity=severity,
+        )
+
+    @staticmethod
+    def coverage(
+        table: str,
+        column: Optional[str] = None,
+        condition: Optional[str] = None,
+        where: Optional[str] = None,
+        warn_threshold: float = 0.80,
+        error_threshold: float = 0.50,
+        severity: str = 'WARNING',
+        name: Optional[str] = None,
+    ) -> Check:
+        """Two-tier coverage check.
+
+        Measures ``COUNT_IF(condition) / COUNT(*)`` over ``table`` (optionally
+        filtered by ``where``). Severity is determined by the runner at
+        runtime — overriding the static ``severity`` param:
+
+            ratio >= warn_threshold (default 0.80)  -> passed=True
+            error_threshold <= ratio < warn         -> WARNING
+            ratio < error_threshold (default 0.50)  -> ERROR
+
+        Either ``column`` (shortcut for ``<column> IS NOT NULL``) or
+        ``condition`` (explicit predicate) must be provided.
+        """
+        if column is None and condition is None:
+            raise ValueError("coverage() requires either 'column' or 'condition'")
+        if condition is None:
+            col = _safe_ident(column, "column")
+            condition = f"{col} IS NOT NULL"
+        # Inline-SQL safety guard, identical to _where_clause shape
+        if ';' in condition or '--' in condition or '/*' in condition:
+            raise ValueError(f"Unsafe condition: {condition!r}")
+        if not (0.0 <= error_threshold <= warn_threshold <= 1.0):
+            raise ValueError(
+                f"thresholds must satisfy 0 <= error <= warn <= 1, "
+                f"got error={error_threshold}, warn={warn_threshold}"
+            )
+        return Check(
+            name=name or f"coverage[{table}: {condition}]",
+            kind='coverage',
+            params={
+                'table': table,
+                'condition': condition,
+                'where': where,
+                'warn_threshold': warn_threshold,
+                'error_threshold': error_threshold,
+            },
             severity=severity,
         )
 
@@ -510,6 +562,70 @@ def _run_value_range(conn, check: Check) -> Dict[str, Any]:
         'passed': violations == 0,
         'details': f"{violations} row(s) outside {rng}",
         'value': violations,
+    }
+
+
+def _run_coverage(conn, check: Check) -> Dict[str, Any]:
+    """Two-tier coverage check (see ``CHECK.coverage``).
+
+    SQL: ``SELECT COUNT(*), COUNT_IF(<condition>) FROM <table> [WHERE <where>]``.
+
+    Returns ``severity`` in the result dict so ``run_checks`` can override
+    the static check.severity based on the observed ratio:
+      * ratio >= warn_threshold  -> passed=True (severity unchanged)
+      * error_threshold <= ratio -> passed=False, severity='WARNING'
+      * ratio <  error_threshold -> passed=False, severity='ERROR'
+
+    Empty table (total=0) is treated as 0% coverage and fails with WARNING —
+    the absence of data is a quality issue but not severe enough to halt
+    Gold runs (use a separate ``row_count`` check for hard floor).
+    """
+    p = check.params
+    table = _qualify(p['table'])
+    cond = p['condition']
+    if ';' in cond or '--' in cond or '/*' in cond:
+        # Defensive — factory already validated, but the runner is callable
+        # via the registry so we re-check at the boundary.
+        raise ValueError(f"Unsafe condition: {cond!r}")
+    where_sql = _where_clause(p.get('where'))
+    sql = f"SELECT COUNT(*), COUNT_IF({cond}) FROM {table}{where_sql}"
+    row = _fetchone(conn, sql)
+    total, covered = (int(row[0] or 0), int(row[1] or 0)) if row else (0, 0)
+    warn = float(p['warn_threshold'])
+    err = float(p['error_threshold'])
+
+    if total == 0:
+        return {
+            'passed': False,
+            'severity': 'WARNING',
+            'value': 0.0,
+            'details': f"empty table — coverage = 0% (0/0); condition: {cond}",
+        }
+    ratio = covered / total
+    pct = f"{ratio * 100:.1f}%"
+    if ratio >= warn:
+        return {
+            'passed': True,
+            'value': ratio,
+            'details': f"coverage = {pct} ({covered}/{total}, ≥ {warn * 100:.0f}% target)",
+        }
+    if ratio >= err:
+        return {
+            'passed': False,
+            'severity': 'WARNING',
+            'value': ratio,
+            'details': (
+                f"coverage = {pct} ({covered}/{total}) below {warn * 100:.0f}% "
+                f"target (≥ {err * 100:.0f}% floor)"
+            ),
+        }
+    return {
+        'passed': False,
+        'severity': 'ERROR',
+        'value': ratio,
+        'details': (
+            f"coverage = {pct} ({covered}/{total}) below {err * 100:.0f}% floor"
+        ),
     }
 
 
@@ -801,6 +917,7 @@ _RUNNERS = {
     'no_nulls': _run_no_nulls,
     'ref_integrity': _run_ref_integrity,
     'value_range': _run_value_range,
+    'coverage': _run_coverage,
     'canonical_completeness': _run_canonical_completeness,
     'point_in_time': _run_point_in_time,
     'scd2_no_overlap': _run_scd2_no_overlap,
@@ -868,8 +985,12 @@ def run_checks(
                 continue
             try:
                 out = runner(conn, chk)
+                # Allow runners to override severity at runtime (used by
+                # two-tier coverage check). Fall back to the check's static
+                # severity for runners that don't return one.
+                effective_severity = out.get('severity', chk.severity)
                 report.results.append(CheckResult(
-                    name=chk.name, kind=chk.kind, severity=chk.severity,
+                    name=chk.name, kind=chk.kind, severity=effective_severity,
                     passed=out['passed'], details=out['details'], value=out.get('value'),
                 ))
             except Exception as e:
