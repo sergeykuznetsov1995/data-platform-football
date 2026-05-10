@@ -516,12 +516,64 @@ def _run_no_nulls(conn, check: Check) -> Dict[str, Any]:
     }
 
 
+def _columns_of(conn, fully_qualified_table: str) -> Optional[set]:
+    """Set of column names for ``catalog.schema.table``. Returns:
+      * ``None`` if ``information_schema.columns`` is unreachable (e.g. tests
+        using DuckDB as a Trino stub) — caller falls back to running the
+        underlying SQL and reporting the engine error directly.
+      * empty ``set()`` if the table exists in catalog terms but has no rows.
+      * a populated ``set`` of column names otherwise.
+    """
+    try:
+        parts = fully_qualified_table.split('.')
+        schema_table = f"{parts[1]}.{parts[2]}" if len(parts) == 3 else fully_qualified_table
+        return {c for c, _ in _fetch_schema(conn, schema_table)}
+    except Exception:
+        return None
+
+
 def _run_ref_integrity(conn, check: Check) -> Dict[str, Any]:
     p = check.params
     child = _qualify(p['child'])
     parent = _qualify(p['parent'])
     key = _safe_ident(p['key'], "column")
     parent_key = _safe_ident(p.get('parent_key') or p['key'], "column")
+
+    # Pre-flight: catch missing column / table BEFORE the orphan SQL so the
+    # operator sees a readable CheckResult instead of an opaque
+    # ``TrinoUserError COLUMN_NOT_FOUND``. E4 postmortem (2026-05-09) surfaced
+    # 6× false-WARN of this exact shape: call sites passed key='match_id_canonical'
+    # without parent_key, and the default parent_key=key didn't match
+    # dim_match.match_id. The hint below names the typical fix.
+    #
+    # When information_schema is unreachable (None), we skip the pre-flight
+    # entirely and let the orphan SQL fail naturally — preserves backward
+    # compatibility with the DuckDB-stub tests.
+    child_cols = _columns_of(conn, child)
+    parent_cols = _columns_of(conn, parent)
+    if child_cols is not None and parent_cols is not None:
+        if not child_cols:
+            return {'passed': False, 'value': None,
+                    'details': f"child table not found in catalog: {child}"}
+        if not parent_cols:
+            return {'passed': False, 'value': None,
+                    'details': f"parent table not found in catalog: {parent}"}
+        missing = []
+        if key not in child_cols:
+            missing.append(f"{child}.{key}")
+        if parent_key not in parent_cols:
+            missing.append(f"{parent}.{parent_key}")
+        if missing:
+            return {
+                'passed': False,
+                'value': None,
+                'details': (
+                    f"column(s) not found in catalog: {', '.join(missing)}. "
+                    f"Hint: pass explicit parent_key= when parent uses a different "
+                    f"column name (e.g. parent_key='match_id' when key='match_id_canonical')."
+                ),
+            }
+
     sql = (
         f"SELECT COUNT(DISTINCT c.{key}) FROM {child} c "
         f"LEFT JOIN {parent} p ON c.{key} = p.{parent_key} "

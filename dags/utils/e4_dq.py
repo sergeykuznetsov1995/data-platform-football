@@ -497,10 +497,13 @@ def _build_gold_fct_goal_checks() -> List[Check]:
         ),
 
         # ref_integrity to dim_match — WARNING (Phase B bridging).
+        # parent_key='match_id' because dim_match.match_id is the canonical
+        # column (no '_canonical' suffix); see E4 postmortem 2026-05-09.
         CHECK.ref_integrity(
             child='gold.fct_goal',
             parent='gold.dim_match',
             key='match_id_canonical',
+            parent_key='match_id',
             severity='WARNING',
         ),
 
@@ -587,6 +590,7 @@ def _build_gold_fct_card_checks() -> List[Check]:
             child='gold.fct_card',
             parent='gold.dim_match',
             key='match_id_canonical',
+            parent_key='match_id',
             severity='WARNING',
         ),
 
@@ -661,6 +665,7 @@ def _build_gold_fct_substitution_checks() -> List[Check]:
             child='gold.fct_substitution',
             parent='gold.dim_match',
             key='match_id_canonical',
+            parent_key='match_id',
             severity='WARNING',
         ),
 
@@ -768,6 +773,7 @@ def _build_gold_fct_match_odds_checks() -> List[Check]:
             child='gold.fct_match_odds',
             parent='gold.dim_match',
             key='match_id_canonical',
+            parent_key='match_id',
             severity='WARNING',
         ),
 
@@ -839,6 +845,7 @@ def _build_gold_fct_match_rating_checks() -> List[Check]:
             child='gold.fct_match_rating',
             parent='gold.dim_player',
             key='player_id_canonical',
+            parent_key='player_id',
             severity='WARNING',
         ),
 
@@ -847,6 +854,7 @@ def _build_gold_fct_match_rating_checks() -> List[Check]:
             child='gold.fct_match_rating',
             parent='gold.dim_match',
             key='match_id_canonical',
+            parent_key='match_id',
             severity='WARNING',
         ),
 
