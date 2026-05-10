@@ -124,6 +124,15 @@ SILVER_E3_TRANSFORMS = [
         'dags/sql/silver/espn_lineup.sql',
         'espn_lineup',
     ),
+    (
+        # B1 extension: per-(canonical_id, league, season) aggregate of
+        # WhoScored event-level metrics. Reads silver.whoscored_events_spadl
+        # so MUST run after the spadl task (sequential silver_e3 group
+        # guarantees this).
+        'whoscored_player_season_aggregate',
+        'dags/sql/silver/whoscored_player_season_aggregate.sql',
+        'whoscored_player_season_aggregate',
+    ),
 ]
 
 GOLD_E3_TRANSFORMS = [
