@@ -10,9 +10,6 @@ Architecture
     Triggered by dag_transform_fbref_silver (or manual trigger)
         |
         v
-    entity_xref (legacy, dual-run with silver.xref_* — drop in E1.5 follow-up PR)
-        |
-        v
     dim_team, dim_player, dim_match (read silver.xref_* since E1.5;
                                      parallel-safe, but sequential to save RAM)
         |
@@ -36,9 +33,6 @@ usage predictable on a dev-sized Trino (5 GB container / 3.5 GB heap).
 
 Gold Tables
 -----------
-- ``gold.entity_xref``        — cross-source ID map (legacy; superseded by
-                                silver.xref_team/match/referee/manager/player;
-                                pending drop after E1.5 cutover)
 - ``gold.dim_team``           — team dimension (reads silver.xref_team since E1.5)
 - ``gold.dim_player``         — player dimension (canonical_id format
                                 'fb_<player_id>' since E1.5)
@@ -81,12 +75,8 @@ from utils.default_args import SILVER_ARGS
 # ---------------------------------------------------------------------------
 # (task_id, sql_file, table_name, partition_cols)
 #
-# Order matters: dim_* and entity_xref must be built before fct_* which
-# reference them; feat_* depend on fct_team_match; fct_match depends on feat_*.
-
-STAGE_1_XREF = [
-    ('entity_xref', 'dags/sql/gold/entity_xref.sql', 'entity_xref', ['league', 'season']),
-]
+# Order matters: dim_* must be built before fct_* which reference them;
+# feat_* depend on fct_team_match; fct_match depends on feat_*.
 
 STAGE_2_DIMS = [
     ('dim_team',   'dags/sql/gold/dim_team.sql',   'dim_team',   ['league', 'season']),
@@ -278,17 +268,7 @@ with DAG(
     doc_md=__doc__,
 ) as dag:
 
-    # Stage 1: cross-reference table (built first — dims depend on it)
-    with TaskGroup(group_id='s1_entity_xref') as g1:
-        for task_id, sql_file, table_name, pcols in STAGE_1_XREF:
-            PythonOperator(
-                task_id=task_id,
-                python_callable=_run_transform,
-                op_kwargs={'sql_file': sql_file, 'table_name': table_name,
-                           'partition_cols': pcols},
-            )
-
-    # Stage 2: dimensions
+    # Stage 2: dimensions (read silver.xref_* directly since E1.5)
     with TaskGroup(group_id='s2_dimensions') as g2:
         for task_id, sql_file, table_name, pcols in STAGE_2_DIMS:
             PythonOperator(
@@ -428,4 +408,4 @@ with DAG(
         python_callable=_quality,
     )
 
-    g1 >> g2 >> g2b >> g3 >> g4 >> g5 >> g6 >> g7 >> validate_row_counts >> validate_quality
+    g2 >> g2b >> g3 >> g4 >> g5 >> g6 >> g7 >> validate_row_counts >> validate_quality

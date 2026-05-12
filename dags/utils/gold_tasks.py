@@ -1761,7 +1761,6 @@ def validate_gold_row_counts() -> Dict[str, Any]:
         CHECK.row_count('gold.dim_player',       min_rows=1000),
         CHECK.row_count('gold.fct_player_match', min_rows=50000),
         CHECK.row_count('gold.feat_player_form', min_rows=50000),
-        CHECK.row_count('gold.entity_xref',      min_rows=2000),
         CHECK.row_count('gold.match_outcomes',   min_rows=3000),
         # T4.1: ML splits — soft floors. Tighten after first production run.
         # FBref-only ENG-PL: ~380 completed matches/season; with 9+ seasons
