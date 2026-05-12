@@ -22,6 +22,10 @@ PLAYER_ID_PATTERN = re.compile(r'/players/([a-f0-9]{8})/')
 # Format: /squads/{8-char-hash}/Team-Name or /en/squads/{8-char-hash}/Team-Name
 TEAM_ID_PATTERN = re.compile(r'/squads/([a-f0-9]{8})/')
 
+# Pattern for extracting manager_id from FBref manager links
+# Format: /managers/{8-char-hash}/Manager-Name or /en/managers/{8-char-hash}/Manager-Name
+MANAGER_ID_PATTERN = re.compile(r'/managers/([a-f0-9]{8})/')
+
 
 def extract_player_ids_from_table(
     table: BeautifulSoup,

@@ -19,7 +19,10 @@ from scrapers.fbref.parsers.table_parser import (
     _parse_table_element,
     _table_has_player_header,
 )
-from scrapers.fbref.parsers.id_extractors import PLAYER_ID_PATTERN
+from scrapers.fbref.parsers.id_extractors import (
+    MANAGER_ID_PATTERN,
+    PLAYER_ID_PATTERN,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -965,3 +968,111 @@ def parse_player_match_stats_tables(
         f"from {len(all_dfs)} summary tables"
     )
     return combined
+
+
+# Match scorebox label "Manager:" / "Manager :" / "MANAGER:" etc.
+# FBref's current scorebox renders the label as
+# ``<div class="datapoint"><strong>Manager</strong>: Name</div>`` —
+# BeautifulSoup's get_text(separator=' ') yields ``"Manager : Name"`` with
+# a space before the colon, so the regex must tolerate optional spaces.
+_MANAGER_LABEL_RE = re.compile(r'^\s*Manager\s*:\s*(.+?)\s*$', re.IGNORECASE)
+
+
+def _norm_name(s: Optional[str]) -> Optional[str]:
+    """Normalise a person's name extracted from FBref HTML.
+
+    FBref uses U+00A0 (non-breaking space) inside multi-word names
+    ("Arne Slot"). Downstream xref normalisation
+    (``LOWER(REGEXP_REPLACE(name, '[^a-zA-Z0-9]+', '_'))``) collapses
+    those to underscores anyway, but raw Bronze rows look weird in
+    SELECT * output if the NBSP leaks through. Replace with a regular
+    space and trim whitespace.
+    """
+    if s is None:
+        return None
+    s = s.replace(' ', ' ').strip()
+    return s or None
+
+
+def parse_match_managers(soup: BeautifulSoup) -> Optional[pd.DataFrame]:
+    """Parse home/away managers from the FBref match-page scorebox.
+
+    The current FBref scorebox renders each team in a
+    ``<div class="scorebox_team">`` block. Inside that block manager info
+    sits in
+    ``<div class="datapoint"><strong>Manager</strong>: <Name></div>``.
+    Older fixtures sometimes wrap the name in an ``<a href="/managers/...">``
+    link; we capture that ``manager_fbref_id`` when present but treat it
+    as optional.
+
+    Returns a DataFrame with one row per team side. ``manager_name`` /
+    ``manager_fbref_id`` are NULL when the scorebox does not list a manager
+    for that side (rare; happens on a few historical fixtures). Returning
+    NULL rows instead of skipping keeps Bronze schema-stable and lets the
+    Silver layer surface the gap via DQ rather than silently dropping.
+
+    Args:
+        soup: BeautifulSoup of the match page.
+
+    Returns:
+        DataFrame with columns ``side``, ``team``, ``manager_name``,
+        ``manager_fbref_id``. ``None`` if no scorebox at all (caller treats
+        that as parse failure, not as "no managers").
+    """
+    scorebox = soup.find('div', class_='scorebox')
+    if not scorebox:
+        return None
+
+    # Prefer the modern markup (scorebox_team / scorebox_team_b1 etc.).
+    # Fall back to the first two direct ``<div>`` children for legacy or
+    # synthetic fixtures used in unit tests.
+    team_blocks = scorebox.find_all('div', class_='scorebox_team')
+    if not team_blocks:
+        team_blocks = [
+            c for c in scorebox.find_all('div', recursive=False)
+            if 'scorebox_meta' not in (c.get('class') or [])
+        ][:2]
+    team_blocks = team_blocks[:2]
+    if not team_blocks:
+        return None
+
+    team_names = _extract_team_names_from_scorebox(soup)
+    sides = ['home', 'away']
+    rows = []
+
+    for i, block in enumerate(team_blocks):
+        side = sides[i] if i < len(sides) else f'team_{i + 1}'
+        team = team_names.get(side, '')
+
+        manager_name: Optional[str] = None
+        manager_id: Optional[str] = None
+
+        for div in block.find_all('div'):
+            label_match = _MANAGER_LABEL_RE.match(div.get_text(' ', strip=True))
+            if not label_match:
+                continue
+            manager_name = _norm_name(label_match.group(1))
+            link = div.find('a', href=lambda x: x and '/managers/' in str(x))
+            if link is not None:
+                href = link.get('href', '')
+                m = MANAGER_ID_PATTERN.search(href)
+                if m:
+                    manager_id = m.group(1)
+                # Prefer the link text as canonical name (drops trailing
+                # punctuation / extra whitespace from the surrounding div).
+                link_text = _norm_name(link.get_text(strip=True))
+                if link_text:
+                    manager_name = link_text
+            break
+
+        rows.append({
+            'side': side,
+            'team': team,
+            'manager_name': manager_name,
+            'manager_fbref_id': manager_id,
+        })
+
+    if not rows:
+        return None
+
+    return pd.DataFrame(rows)
