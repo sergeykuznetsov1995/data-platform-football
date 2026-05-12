@@ -296,10 +296,17 @@ TENURE: Dict[Tuple[str, int], List[Tuple[str, str | None]]] = {
         ("Rob Edwards", "2025-11-22"),
     ],
 
-    # Chelsea: Maresca departed 1 Jan 2026; Liam Rosenior appointed soon after
+    # Chelsea (chaotic — 4 stints):
+    # Maresca departed 1 Jan 2026 → Calum McFarlane interim ~2 matches
+    # (Man City 1-1, Fulham 2-1 loss) → Rosenior appointed 6 Jan 2026,
+    # sacked 22 Apr 2026 (107 days, after 5 consecutive PL defeats without
+    # scoring — first time since 1912) → McFarlane interim again until
+    # end of season (U21 head coach, "thrown in at deep end again")
     ("Chelsea", 2025): [
         ("Enzo Maresca", None),
-        ("Liam Rosenior", "2026-01-02"),
+        ("Calum McFarlane", "2026-01-02"),
+        ("Liam Rosenior", "2026-01-17"),
+        ("Calum McFarlane", "2026-04-22"),
     ],
 
     # Manchester Utd: Amorim sacked 5 Jan 2026;
