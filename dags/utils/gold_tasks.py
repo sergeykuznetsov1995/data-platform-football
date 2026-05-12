@@ -1420,6 +1420,53 @@ def validate_gold_quality() -> Dict[str, Any]:
                           min_val=1, max_val=24,  severity='WARNING'),
 
         # ============================================================
+        # E2 Phase 1.5: dim_manager — SCD-2 head-coach dimension
+        # (one row per manager × team × stint). Source =
+        # silver.xref_manager × silver.xref_team × bronze.fbref_match_managers.
+        # ============================================================
+
+        # ----- dim_manager: PK uniqueness — ERROR -----
+        # Composite PK: (manager_id_canonical, team_id_canonical, valid_from).
+        # The triple distinguishes returning managers (Mourinho-Chelsea-2004
+        # vs Mourinho-Chelsea-2013) which share the first two components.
+        CHECK.no_duplicates(
+            'gold.dim_manager',
+            pk=['manager_id_canonical', 'team_id_canonical', 'valid_from'],
+        ),
+
+        # ----- dim_manager: NOT NULL on PKs + display_name — ERROR -----
+        CHECK.no_nulls(
+            'gold.dim_manager',
+            cols=['manager_id_canonical', 'team_id_canonical',
+                  'valid_from', 'display_name'],
+        ),
+
+        # ----- dim_manager: SCD-2 timeline integrity — ERROR -----
+        # Closed-open intervals [valid_from, valid_to). For a single team
+        # at any given date there can be at most ONE active manager.
+        # Adjacent stints sharing an endpoint are OK.
+        CHECK.scd2_no_overlap(
+            'gold.dim_manager',
+            pk_cols=['team_id_canonical'],
+        ),
+
+        # ----- dim_manager: ref_integrity → silver.xref_manager — ERROR -----
+        CHECK.ref_integrity(
+            'gold.dim_manager',
+            'silver.xref_manager',
+            'manager_id_canonical',
+            parent_key='canonical_id',
+        ),
+
+        # ----- dim_manager: ref_integrity → silver.xref_team — ERROR -----
+        CHECK.ref_integrity(
+            'gold.dim_manager',
+            'silver.xref_team',
+            'team_id_canonical',
+            parent_key='canonical_id',
+        ),
+
+        # ============================================================
         # E7 / T7: BI dashboard marts — DQ guards complementing the
         # row_count floors registered in validate_gold_row_counts().
         # PK uniqueness ERROR + value-range / freshness WARNINGs +
@@ -1778,6 +1825,11 @@ def validate_gold_row_counts() -> Dict[str, Any]:
         CHECK.row_count('gold.dim_venue',     min_rows=20),
         # dim_referee: typically ~30+ active EPL match officials across history.
         CHECK.row_count('gold.dim_referee',   min_rows=30),
+        # dim_manager: SCD-2, one row per manager × team × stint. APL has
+        # ~30-50 distinct head coaches across 8 seasons (2017-18 → 2024-25)
+        # with frequent in-season changes; ~50 stint rows is a conservative
+        # floor that still catches a wholly empty table.
+        CHECK.row_count('gold.dim_manager',   min_rows=20),
         # dim_standings: at least one snapshot of the current 18-team table
         # (relaxed to 18 to cover early-season / partial loads — historical
         # snapshots will multiply this by season).

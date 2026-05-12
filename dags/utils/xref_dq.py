@@ -218,25 +218,34 @@ def build_xref_referee_checks() -> List[Check]:
 
 
 def build_xref_manager_checks() -> List[Check]:
-    """DQ for ``iceberg.silver.xref_manager`` — STUB phase.
+    """DQ for ``iceberg.silver.xref_manager`` — Phase 1.5 single-source spine.
 
-    R0.2c FALLBACK pending — table is intentionally zero-row. ANY row
-    landing in this table at E1 = bug.
+    Source = FBref scorebox parser (bronze.fbref_match_managers). Bounds
+    sized for APL across 8 seasons (2017-18 … 2024-25): ~30-50 distinct
+    managers × per-season presence ≈ 60-200 rows. Upper bound is generous
+    for future multi-league or multi-source expansion.
     """
     table = 'iceberg.silver.xref_manager'
     return [
-        # Hard zero-row guard. ERROR if anything appears.
-        CHECK.row_count(
-            table=table,
-            min_rows=0,
-            max_rows=0,
-            severity='ERROR',
-        ),
-        # Defence-in-depth: even if a row sneaks past the row_count guard,
-        # its PK columns must obey the schema contract.
+        CHECK.row_count(table, min_rows=20, max_rows=2000),
+
         CHECK.no_duplicates(
             table,
             pk=['source', 'source_id', 'league', 'season'],
+        ),
+
+        CHECK.no_nulls(table, cols=['canonical_id', 'source', 'source_id']),
+
+        check_enum_compliance(
+            table, 'source',
+            allowed=['fbref'],
+            severity='ERROR',
+        ),
+
+        check_enum_compliance(
+            table, 'confidence',
+            allowed=['name_normalize'],
+            severity='ERROR',
         ),
     ]
 

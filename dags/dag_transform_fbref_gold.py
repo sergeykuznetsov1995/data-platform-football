@@ -106,6 +106,7 @@ STAGE_2B_MASTER_DIMS_SQL = [
     # (task_id, sql_file, table_name, partition_cols)
     ('dim_venue',     'dags/sql/gold/dim_venue.sql',     'dim_venue',     None),
     ('dim_referee',   'dags/sql/gold/dim_referee.sql',   'dim_referee',   None),
+    ('dim_manager',   'dags/sql/gold/dim_manager.sql',   'dim_manager',   None),
     ('dim_standings', 'dags/sql/gold/dim_standings.sql', 'dim_standings', ['league', 'season']),
 ]
 

@@ -1,18 +1,17 @@
 """
-Unit tests for ``dags/sql/silver/xref_manager.sql`` — STUB validation (T5/E1).
+Unit tests for ``dags/sql/silver/xref_manager.sql`` — Phase 1.5 (E2).
 
-xref_manager is intentionally an empty placeholder until the R0.2c FotMob
-``coachId`` endpoint hardening or the R0.2a FBref match-page parser lands.
-The CTAS materialises a zero-row table with the correct column shape so:
+Strategy
+--------
+Pure regex/keyword sanity over the raw SQL — same approach as
+``test_xref_referee_sql.py`` and ``test_xref_team_sql.py``.
 
-  1. T4 DAG-task does not branch on "table exists?"
-  2. T5 schema-drift tests can validate the column set today.
-  3. Downstream JOINs in Gold never panic with "relation not found".
-
-We assert:
-  * ``WHERE 1 = 0`` (or equivalent always-false predicate) → row_count = 0.
-  * Schema columns match the union schema (xref_team / xref_referee / xref_match).
-  * Header explicitly documents the STUB / Phase-1.5 deferral.
+Documented invariants we exercise:
+  * source ∈ {'fbref'} only (single-source spine at Phase 1.5).
+  * canonical_id = LOWER(REGEXP_REPLACE(manager_name, '[^a-zA-Z0-9]+', '_')).
+  * confidence == 'name_normalize' for every row.
+  * Reads bronze.fbref_match_managers (the new Bronze landing table).
+  * NULL/empty manager_name is filtered out.
 """
 
 from __future__ import annotations
@@ -34,78 +33,84 @@ def _read_sql() -> str:
 pytestmark = pytest.mark.unit
 
 
-class TestXrefManagerStub:
-    """The STUB must materialise zero rows with the right schema."""
+class TestXrefManagerStructure:
+    """Regex/keyword sanity over ``xref_manager.sql``."""
 
-    def test_always_false_predicate(self):
-        """Stub guarantees zero rows via WHERE 1=0 or equivalent."""
-        sql_lower = _read_sql().lower()
-        # Any always-false predicate is fine — accept the documented forms.
-        ok = (
-            "where 1=0" in sql_lower
-            or "where 1 = 0" in sql_lower
-            or "where false" in sql_lower
-        )
-        assert ok, (
-            "xref_manager.sql must use WHERE 1=0 / WHERE 1 = 0 / WHERE FALSE "
-            "to guarantee zero rows in the STUB CTAS"
-        )
+    def test_single_source_fbref(self):
+        """Phase 1.5 spine: FBref only."""
+        sql = _read_sql().lower()
+        assert "'fbref'" in sql, "missing 'fbref' source literal"
 
-    def test_schema_columns_present(self):
-        """All 8 documented schema columns appear as `AS <col>` aliases."""
-        sql = _read_sql()
-        expected_cols = [
-            "canonical_id",
-            "source",
-            "source_id",
-            "display_name",
-            "league",
-            "season",
-            "confidence",
-            "match_score",
-        ]
-        for col in expected_cols:
+    def test_no_other_sources_emitted(self):
+        """xref_manager must NOT emit any source label other than 'fbref'."""
+        sql = _read_sql().lower()
+        for forbidden in [
+            "'understat'", "'whoscored'", "'sofascore'",
+            "'fotmob'", "'matchhistory'", "'clubelo'", "'espn'",
+        ]:
             pattern = re.compile(
-                r"AS\s+" + re.escape(col) + r"\b",
+                re.escape(forbidden) + r"\s+as\s+source",
                 re.IGNORECASE,
             )
-            assert pattern.search(sql), (
-                f"schema column {col!r} missing as `AS {col}` alias in "
-                "xref_manager.sql STUB — Gold dim_manager will JOIN against "
-                "this column set"
+            assert not pattern.search(sql), (
+                f"source label {forbidden} must not be emitted in xref_manager — "
+                "Phase 1.5 is FBref-only (FotMob coachId hardened, others have "
+                "no manager metadata in Bronze)"
             )
 
-    def test_column_types_match_union_schema(self):
-        """All NULL casts use the documented column types (varchar / double)."""
-        sql = _read_sql()
-        # 7 varchar columns + 1 double column (match_score)
-        assert "CAST(NULL AS varchar)" in sql or "CAST(NULL AS VARCHAR)" in sql, (
-            "expected at least one CAST(NULL AS varchar) for the textual "
-            "columns (canonical_id, source, source_id, display_name, league, "
-            "season, confidence)"
-        )
-        assert "CAST(NULL AS double)" in sql or "CAST(NULL AS DOUBLE)" in sql, (
-            "expected CAST(NULL AS double) for the match_score column — "
-            "schema must match xref_team / xref_referee"
+    def test_reads_bronze_fbref_match_managers(self):
+        """SELECT reads from iceberg.bronze.fbref_match_managers."""
+        sql_lower = _read_sql().lower()
+        assert "iceberg.bronze.fbref_match_managers" in sql_lower, (
+            "xref_manager must read from bronze.fbref_match_managers — the "
+            "table populated by parsers/finders.py::parse_match_managers"
         )
 
-    def test_documented_as_stub(self):
-        """Header comment must explicitly tag this as a STUB / deferred work."""
-        sql_lower = _read_sql().lower()
-        # Accept any of the documented anchors.
-        anchors = ["stub", "phase 1.5", "r0.2c", "r0.2a"]
-        assert any(a in sql_lower for a in anchors), (
-            "xref_manager.sql header must explicitly mark itself as STUB / "
-            "Phase 1.5 / R0.2c / R0.2a so future readers know why the table "
-            "is empty by design"
+    def test_canonical_id_normalize_pattern(self):
+        """canonical_id = LOWER(REGEXP_REPLACE(<name>, '[^a-zA-Z0-9]+', '_'))."""
+        sql = _read_sql()
+        pattern = re.compile(
+            r"LOWER\s*\(\s*REGEXP_REPLACE",
+            re.IGNORECASE,
         )
+        assert pattern.search(sql), (
+            "expected canonical_id derivation via "
+            "LOWER(REGEXP_REPLACE(manager_name, '[^a-zA-Z0-9]+', '_'))"
+        )
+
+    def test_canonical_id_regex_uses_alphanumeric_class(self):
+        """Normalize regex collapses non-alphanumerics to underscore."""
+        sql = _read_sql()
+        assert "[^a-zA-Z0-9]+" in sql, (
+            "expected regex character class `[^a-zA-Z0-9]+` for normalize"
+        )
+
+    def test_confidence_name_normalize(self):
+        """confidence must be the literal 'name_normalize' (no alias map)."""
+        sql = _read_sql()
+        assert "'name_normalize'" in sql, (
+            "expected confidence='name_normalize' — manager xref has no alias "
+            "map yet at Phase 1.5"
+        )
+
+    def test_match_score_null(self):
+        """match_score must be NULL — no fuzzy matching at Phase 1.5."""
+        sql = _read_sql()
+        assert (
+            "CAST(NULL AS double)" in sql
+            or "CAST(NULL AS DOUBLE)" in sql
+        ), "match_score must be CAST(NULL AS double) for xref_manager"
+
+    def test_season_cast_to_varchar(self):
+        """Bronze stores season as BIGINT — cast to varchar to match union."""
+        sql = _read_sql()
+        assert (
+            "CAST(season AS varchar)" in sql
+            or "CAST(season as varchar)" in sql
+        ), "expected CAST(season AS varchar) for unified Silver schema"
 
     def test_pure_select_no_create_table(self):
-        """File stays a pure SELECT — silver_tasks wraps in CTAS.
-
-        Strip ``-- ...`` comments first; the header references
-        ``CREATE TABLE iceberg.silver.xref_manager`` in a documentation note.
-        """
+        """File stays a pure SELECT — silver_tasks wraps in CTAS."""
         non_comment = "\n".join(
             line for line in _read_sql().splitlines()
             if not line.lstrip().startswith("--")
@@ -114,31 +119,45 @@ class TestXrefManagerStub:
             "xref_manager.sql must stay pure SELECT in executable SQL"
         )
 
-    def test_no_bronze_table_references(self):
-        """STUB must not query any Bronze table — ``WHERE 1=0`` prunes the read.
-
-        Sanity: leaving a real FROM iceberg.bronze.* clause would charge the
-        planner with a Trino split it can't avoid; the STUB pattern is to
-        SELECT literal NULLs without a FROM clause at all.
-        """
-        sql_lower = _read_sql().lower()
-        assert "iceberg.bronze." not in sql_lower, (
-            "xref_manager STUB must not reference Bronze tables — use literal "
-            "NULL casts only so Phase 1.5 can swap in real reads cleanly"
-        )
-
-    def test_match_count_eight_columns(self):
-        """SELECT list has exactly 8 columns to match xref_team/referee schema."""
+    def test_filters_null_and_empty_manager(self):
+        """`WHERE manager_name IS NOT NULL AND manager_name <> ''`."""
         sql = _read_sql()
-        # Count `AS <col>` aliases — the canonical way to count SELECT outputs.
-        as_aliases = re.findall(
-            r"AS\s+(canonical_id|source|source_id|display_name|league|"
-            r"season|confidence|match_score)\b",
-            sql,
-            re.IGNORECASE,
+        assert "IS NOT NULL" in sql.upper(), (
+            "expected NULL-filter on manager_name column"
         )
-        unique_aliases = set(a.lower() for a in as_aliases)
-        assert len(unique_aliases) == 8, (
-            f"expected 8 distinct AS-aliases (xref union schema), got "
-            f"{len(unique_aliases)}: {sorted(unique_aliases)}"
+        assert "<> ''" in sql or "!= ''" in sql, (
+            "expected empty-string filter on manager_name column"
+        )
+
+    def test_schema_columns_present(self):
+        """All 8 documented schema columns appear in SELECT — either as
+        ``AS <col>`` alias or as a bare reference (``league``, ``season``).
+        """
+        sql = _read_sql()
+        expected_aliased = [
+            "canonical_id", "source", "source_id", "display_name",
+            "confidence", "match_score",
+        ]
+        for col in expected_aliased:
+            pattern = re.compile(
+                r"AS\s+" + re.escape(col) + r"\b",
+                re.IGNORECASE,
+            )
+            assert pattern.search(sql), (
+                f"schema column {col!r} missing as `AS {col}` alias in "
+                "xref_manager.sql — Gold dim_manager will JOIN against this column"
+            )
+        # ``league`` and ``season`` come from Bronze with the right name,
+        # so the SQL forwards them bare (matches xref_referee.sql convention).
+        for col in ("league", "season"):
+            assert re.search(rf"\b{col}\b", sql, re.IGNORECASE), (
+                f"schema column {col!r} missing from xref_manager.sql SELECT"
+            )
+
+    def test_pk_grouping_present(self):
+        """GROUP BY enforces the documented PK = (source, source_id, league, season)."""
+        sql_lower = _read_sql().lower()
+        assert "group by" in sql_lower, (
+            "expected GROUP BY clause to act as DISTINCT for the (source, "
+            "source_id, league, season) PK contract"
         )

@@ -267,15 +267,64 @@ def test_xref_referee_source_enum():
     assert "'matchhistory'" in where
 
 
-def test_xref_manager_zero_rows():
-    """STUB phase — xref_manager must have a row_count(min=0, max=0) ERROR."""
+def test_xref_manager_phase_15_checks():
+    """Phase 1.5 — xref_manager populated from FBref scorebox parser.
+
+    The STUB-phase guard (row_count min=max=0) is replaced by the regular
+    cross-source xref check set: row count bounds, PK uniqueness, NOT NULL
+    on canonical, source enum {fbref}, confidence enum {name_normalize}.
+    """
     checks = xref_dq.build_xref_manager_checks()
-    rc = [c for c in checks if c.kind == 'row_count']
-    assert any(
-        c.params.get('min_rows') == 0 and c.params.get('max_rows') == 0
-        and c.severity == 'ERROR'
-        for c in rc
+
+    # Row count: positive lower bound (Phase 1.5 must produce rows).
+    # NB: enum_compliance uses kind='row_count' under the hood, so we
+    # filter by name (the dedicated row_count check has no enum prefix).
+    rc = [c for c in checks if c.kind == 'row_count' and 'enum_compliance' not in c.name]
+    assert len(rc) == 1
+    assert rc[0].params.get('min_rows', 0) > 0, (
+        "Phase 1.5 xref_manager must require min_rows > 0 — STUB guard "
+        "(row_count min=max=0) was retired when bronze.fbref_match_managers "
+        "started landing rows"
     )
+
+    # PK uniqueness on (source, source_id, league, season).
+    pk = [c for c in checks if c.kind == 'no_duplicates']
+    assert len(pk) == 1
+    assert pk[0].params['pk'] == ['source', 'source_id', 'league', 'season']
+
+    # NOT NULL on canonical / source / source_id.
+    nn = [c for c in checks if c.kind == 'no_nulls']
+    assert len(nn) == 1
+    assert set(nn[0].params['cols']) >= {'canonical_id', 'source', 'source_id'}
+
+    # Source enum: FBref-only at Phase 1.5.
+    src_enum = [
+        c for c in checks
+        if 'enum_compliance' in c.name and '.source' in c.name
+    ]
+    assert len(src_enum) == 1
+    where_src = src_enum[0].params['where']
+    assert "'fbref'" in where_src
+    for forbidden in ['understat', 'whoscored', 'sofascore', 'fotmob',
+                      'matchhistory', 'clubelo', 'espn']:
+        assert f"'{forbidden}'" not in where_src, (
+            f"Phase 1.5 xref_manager source enum must NOT include "
+            f"{forbidden!r} — FBref-only spine"
+        )
+
+    # Confidence enum: name_normalize only at Phase 1.5.
+    conf_enum = [
+        c for c in checks
+        if 'enum_compliance' in c.name and 'confidence' in c.name
+    ]
+    assert len(conf_enum) == 1
+    where_conf = conf_enum[0].params['where']
+    assert "'name_normalize'" in where_conf
+    for forbidden in ['exact', 'name_team', 'orphan', 'ambiguous']:
+        assert f"'{forbidden}'" not in where_conf, (
+            f"Phase 1.5 xref_manager confidence enum must NOT include "
+            f"{forbidden!r} — only name_normalize is currently produced"
+        )
 
 
 def test_xref_player_confidence_enum_full():

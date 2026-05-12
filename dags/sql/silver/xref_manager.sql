@@ -1,54 +1,48 @@
 -- =============================================================================
--- Silver: xref_manager   (STUB — empty placeholder)
+-- Silver: xref_manager
 -- =============================================================================
--- Manager (head-coach) xref is intentionally empty at E1.
+-- Manager (head-coach) cross-reference. Single-source spine (FBref) at
+-- Phase 1.5; mirror UNION blocks can be added later when a second source
+-- with stable manager metadata appears (FotMob `/coachId` was hardened
+-- 2026-05-08, see feedback_fotmob_endpoint_hardened.md).
 --
--- Why empty?
---   E2 dim_manager was deferred to Phase 1.5 (R0.2c FALLBACK):
---     * R0.2c attempt — FotMob `/match/<id>?coachId=...` endpoint hardening
---       — partially fixed but still flaky on legacy fixtures.
---     * R0.2a fallback — FBref match-page parser — not yet implemented.
---   Until either path lands a stable Bronze source, no row can be emitted.
---   See:  docs/decisions/E2-postmortem.md  +  feedback_fotmob_endpoint_hardened.md
+-- Source: iceberg.bronze.fbref_match_managers (populated by FBref scorebox
+-- parser, scrapers/fbref/parsers/finders.py::parse_match_managers).
 --
--- Why materialise the table at all?
---   Downstream Gold dims (dim_manager / fct_team_match.head_coach_id)
---   will JOIN against `iceberg.silver.xref_manager`. Materialising it as
---   an empty table with the correct schema means:
---     1. T4 DAG-task does not branch on "table exists?" — the CTAS just
---        produces zero rows.
---     2. T5 schema-drift tests can validate the column set today and
---        flag a regression the moment Phase 1.5 starts populating it.
---     3. JOINs in downstream code never panic with "relation not found".
---
--- DAG-integration note: T4 will wrap this SELECT in
+-- DAG-integration note: T4 wraps this SELECT in
 -- `CREATE TABLE iceberg.silver.xref_manager AS ...` via
 -- `silver_tasks.run_silver_transform()`. This file MUST stay a pure SELECT.
 --
 -- =============================================================================
--- Schema (frozen for E1 dual-run; identical to xref_team / xref_referee)
+-- Schema (frozen — identical to xref_team / xref_referee)
 -- =============================================================================
---   canonical_id   varchar
---   source         varchar
---   source_id      varchar
---   display_name   varchar
+--   canonical_id   varchar  -- LOWER(REGEXP_REPLACE(name, '[^a-zA-Z0-9]+','_'))
+--   source         varchar  -- 'fbref'
+--   source_id      varchar  -- raw manager_name as stored in Bronze
+--   display_name   varchar  -- == source_id (no canonical names yet)
 --   league         varchar
---   season         varchar
---   confidence     varchar
---   match_score    double
+--   season         varchar  -- normalised (Bronze stores BIGINT)
+--   confidence     varchar  -- always 'name_normalize' (no alias map yet)
+--   match_score    double   -- always NULL
 --
--- Testable invariants (T5):
---   * row_count == 0   (WHERE 1=0 guarantees this).
---   * Schema (column names + types) matches xref_team and xref_referee.
+-- Testable invariants (T5 / xref_dq.build_xref_manager_checks):
+--   * PK = (source, source_id, league, season).
+--   * canonical_id is NEVER NULL.
+--   * source ∈ {'fbref'}.
+--   * confidence == 'name_normalize' for every row.
 -- =============================================================================
 
 SELECT
-    CAST(NULL AS varchar)  AS canonical_id,
-    CAST(NULL AS varchar)  AS source,
-    CAST(NULL AS varchar)  AS source_id,
-    CAST(NULL AS varchar)  AS display_name,
-    CAST(NULL AS varchar)  AS league,
-    CAST(NULL AS varchar)  AS season,
-    CAST(NULL AS varchar)  AS confidence,
-    CAST(NULL AS double)   AS match_score
-WHERE 1 = 0
+    LOWER(REGEXP_REPLACE(manager_name, '[^a-zA-Z0-9]+', '_'))  AS canonical_id,
+    'fbref'                                                     AS source,
+    manager_name                                                AS source_id,
+    manager_name                                                AS display_name,
+    league,
+    CAST(season AS varchar)                                     AS season,
+    'name_normalize'                                            AS confidence,
+    CAST(NULL AS double)                                        AS match_score
+FROM iceberg.bronze.fbref_match_managers
+WHERE manager_name IS NOT NULL AND manager_name <> ''
+GROUP BY
+    -- GROUP BY all output columns — also serves as DISTINCT
+    1, manager_name, league, season

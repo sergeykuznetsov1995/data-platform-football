@@ -316,3 +316,85 @@ class TestE15CutoverGoldDagImports:
                 f"{fname} still references gold.entity_xref in "
                 "executable SQL — E1.5 cutover incomplete"
             )
+
+
+@pytest.mark.integration
+class TestE2DimManagerWiring:
+    """E2 Phase 1.5 — dim_manager + xref_manager + bronze parser landing.
+
+    No Trino / DagBag spin-up — pure file/parse checks. Verifies the
+    plumbing is in place so Phase 1.5 ingestion can run end-to-end.
+    """
+
+    PROJ_ROOT = Path(__file__).resolve().parents[2]
+    SILVER_SQL = PROJ_ROOT / "dags" / "sql" / "silver" / "xref_manager.sql"
+    GOLD_SQL = PROJ_ROOT / "dags" / "sql" / "gold" / "dim_manager.sql"
+    GOLD_DAG = PROJ_ROOT / "dags" / "dag_transform_fbref_gold.py"
+    XREF_DQ = PROJ_ROOT / "dags" / "utils" / "xref_dq.py"
+    GOLD_TASKS = PROJ_ROOT / "dags" / "utils" / "gold_tasks.py"
+
+    def test_xref_manager_sql_reads_bronze_table(self):
+        """xref_manager.sql must read bronze.fbref_match_managers — the new
+        Phase 1.5 Bronze landing table."""
+        text = self.SILVER_SQL.read_text(encoding="utf-8")
+        assert "iceberg.bronze.fbref_match_managers" in text, (
+            "xref_manager.sql must source from bronze.fbref_match_managers "
+            "(populated by parsers/finders.py::parse_match_managers)"
+        )
+
+    def test_dim_manager_sql_exists_and_uses_scd2(self):
+        """gold/dim_manager.sql exists and uses LAG/LEAD window functions for SCD-2."""
+        assert self.GOLD_SQL.exists(), (
+            "Gold dim_manager.sql missing — Phase 1.5 plumbing incomplete"
+        )
+        text = self.GOLD_SQL.read_text(encoding="utf-8")
+        assert "LAG(manager_canonical_id)" in text, (
+            "dim_manager.sql must use LAG over team timeline to detect "
+            "stint boundaries"
+        )
+        assert "LEAD(valid_from)" in text, (
+            "dim_manager.sql must use LEAD to compute closed-open valid_to"
+        )
+        assert "iceberg.silver.xref_manager" in text, (
+            "dim_manager.sql must JOIN against silver.xref_manager for "
+            "canonical manager identity"
+        )
+        assert "iceberg.silver.xref_team" in text, (
+            "dim_manager.sql must JOIN against silver.xref_team for "
+            "canonical team identity"
+        )
+
+    def test_dim_manager_registered_in_gold_dag(self):
+        """The Gold DAG must declare dim_manager in STAGE_2B_MASTER_DIMS_SQL."""
+        text = self.GOLD_DAG.read_text(encoding="utf-8")
+        # Non-comment line that registers dim_manager. Match on the SQL
+        # path so a stray docstring mention does not trick the assertion.
+        assert "dags/sql/gold/dim_manager.sql" in text, (
+            "dag_transform_fbref_gold.py must register dim_manager.sql "
+            "in STAGE_2B_MASTER_DIMS_SQL"
+        )
+
+    def test_xref_dq_no_zero_row_guard_for_manager(self):
+        """build_xref_manager_checks() must NOT carry the STUB-phase
+        row_count(min=max=0) guard anymore — Phase 1.5 produces rows.
+        """
+        text = self.XREF_DQ.read_text(encoding="utf-8")
+        # Locate the function body and inspect the row_count signature.
+        # Cheaper than dynamic import (which needs Airflow).
+        idx = text.index("def build_xref_manager_checks")
+        body = text[idx:idx + 2000]
+        assert "min_rows=0,\n            max_rows=0," not in body, (
+            "build_xref_manager_checks still asserts zero rows — Phase 1.5 "
+            "should require min_rows > 0"
+        )
+
+    def test_gold_tasks_validates_dim_manager_scd2(self):
+        """validate_gold_quality must include scd2_no_overlap for dim_manager."""
+        text = self.GOLD_TASKS.read_text(encoding="utf-8")
+        assert "gold.dim_manager" in text, (
+            "validate_gold_quality must reference gold.dim_manager"
+        )
+        assert "scd2_no_overlap" in text, (
+            "validate_gold_quality must call CHECK.scd2_no_overlap for the "
+            "dim_manager timeline integrity guard"
+        )

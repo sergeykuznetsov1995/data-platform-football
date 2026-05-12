@@ -3,8 +3,8 @@ Topology tests for ``dags/dag_transform_fbref_gold.py`` — E2 master-data
 dims (2026-05).
 
 Verifies the integration of the new ``s2b_master_dims`` TaskGroup:
-  * 5 new task IDs exist (``dim_venue``, ``dim_referee``, ``dim_standings``,
-    ``dim_competition``, ``dim_season``).
+  * 6 new task IDs exist (``dim_venue``, ``dim_referee``, ``dim_manager``,
+    ``dim_standings``, ``dim_competition``, ``dim_season``).
   * The group is downstream of ``s2_dimensions`` (specifically the
     pre-existing ``dim_team``/``dim_player``/``dim_match`` tasks).
   * The group is upstream of the s3 facts (``fct_team_match`` etc.).
@@ -91,11 +91,12 @@ class TestE2DagLoad:
 
 @pytest.mark.unit
 class TestE2NewTaskIds:
-    """The 5 new master-data dim task IDs exist in the DAG."""
+    """The 6 new master-data dim task IDs exist in the DAG."""
 
     EXPECTED_E2_TASK_IDS = {
         "s2b_master_dims.dim_venue",
         "s2b_master_dims.dim_referee",
+        "s2b_master_dims.dim_manager",
         "s2b_master_dims.dim_standings",
         "s2b_master_dims.dim_competition",
         "s2b_master_dims.dim_season",
