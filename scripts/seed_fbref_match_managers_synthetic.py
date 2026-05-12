@@ -161,7 +161,7 @@ TENURE: Dict[Tuple[str, int], List[Tuple[str, str | None]]] = {
     ("Everton", 2021): [("Rafael Benitez", None), ("Frank Lampard", "2022-01-31")],
     ("Everton", 2022): [("Frank Lampard", None), ("Sean Dyche", "2023-01-30")],
     ("Everton", 2023): [("Sean Dyche", None)],
-    ("Everton", 2024): [("Sean Dyche", None)],
+    ("Everton", 2024): [("Sean Dyche", None), ("David Moyes", "2025-01-11")],
 
     # ===== Brentford (promoted 2021) =====
     ("Brentford", 2021): [("Thomas Frank", None)],
@@ -248,6 +248,82 @@ TENURE: Dict[Tuple[str, int], List[Tuple[str, str | None]]] = {
 
     # ===== Ipswich Town =====
     ("Ipswich Town", 2024): [("Kieran McKenna", None)],
+
+    # =========================================================================
+    # 2025-26 SEASON (current). is_current=True for the latest stint in each
+    # team. Tenures sourced from Wikipedia / Sky Sports / club statements
+    # as of 2026-05-12. Promoted clubs: Burnley (Parker), Leeds (Farke),
+    # Sunderland (Le Bris). Relegated 2024-25: Ipswich, Leicester, Southampton.
+    # =========================================================================
+
+    ("Arsenal", 2025):            [("Mikel Arteta", None)],
+    ("Liverpool", 2025):          [("Arne Slot", None)],
+    ("Manchester City", 2025):    [("Pep Guardiola", None)],
+    ("Aston Villa", 2025):        [("Unai Emery", None)],
+    ("Newcastle United", 2025):   [("Eddie Howe", None)],
+    ("Brighton", 2025):           [("Fabian Hurzeler", None)],
+    ("Crystal Palace", 2025):     [("Oliver Glasner", None)],
+    ("Fulham", 2025):             [("Marco Silva", None)],
+    ("Bournemouth", 2025):        [("Andoni Iraola", None)],
+
+    # Everton: David Moyes returned 11 Jan 2025 — continued through 2025-26
+    ("Everton", 2025): [("David Moyes", None)],
+
+    # Brentford: Thomas Frank departed for Tottenham (12 Jun 2025);
+    # Keith Andrews appointed 27 Jun 2025 (was Frank's set-piece coach)
+    ("Brentford", 2025): [("Keith Andrews", None)],
+
+    # Tottenham: Postecoglou sacked end of 2024-25 (after winning UEL!);
+    # Thomas Frank appointed 12 Jun 2025; sacked early Feb 2026;
+    # Igor Tudor caretaker (13 Feb); sacked 29 Mar 2026; De Zerbi (30 Mar)
+    ("Tottenham Hotspur", 2025): [
+        ("Thomas Frank", None),
+        ("Igor Tudor", "2026-02-13"),
+        ("Roberto De Zerbi", "2026-03-30"),
+    ],
+
+    # West Ham: Potter (since Jan 2025) — sacked 27 Sep 2025;
+    # Nuno Espirito Santo appointed 27 Sep 2025 (first match vs Everton 29 Sep)
+    ("West Ham United", 2025): [
+        ("Graham Potter", None),
+        ("Nuno Espirito Santo", "2025-09-29"),
+    ],
+
+    # Wolves: Pereira (since Dec 2024) — sacked 1 Nov 2025;
+    # Rob Edwards appointed 16 Nov 2025 (first match 22 Nov vs Crystal Palace)
+    ("Wolves", 2025): [
+        ("Vitor Pereira", None),
+        ("Rob Edwards", "2025-11-22"),
+    ],
+
+    # Chelsea: Maresca departed 1 Jan 2026; Liam Rosenior appointed soon after
+    ("Chelsea", 2025): [
+        ("Enzo Maresca", None),
+        ("Liam Rosenior", "2026-01-02"),
+    ],
+
+    # Manchester Utd: Amorim sacked 5 Jan 2026;
+    # Darren Fletcher 2 games interim; Michael Carrick appointed 13 Jan 2026
+    ("Manchester Utd", 2025): [
+        ("Ruben Amorim", None),
+        ("Michael Carrick", "2026-01-13"),
+    ],
+
+    # Nottingham Forest: FOUR managers in one season (PL record):
+    # Nuno (sacked 8 Sep) → Postecoglou (9 Sep → sacked 18 Oct, shortest
+    # permanent PL manager) → Sean Dyche (21 Oct → sacked 12 Feb) →
+    # Vitor Pereira (15 Feb 2026, from sacked Wolves)
+    ("Nottingham Forest", 2025): [
+        ("Nuno Espirito Santo", None),
+        ("Ange Postecoglou", "2025-09-09"),
+        ("Sean Dyche", "2025-10-21"),
+        ("Vitor Pereira", "2026-02-15"),
+    ],
+
+    # ===== Promoted teams for 2025-26 =====
+    ("Burnley", 2025):       [("Scott Parker", None)],
+    ("Leeds United", 2025):  [("Daniel Farke", None)],
+    ("Sunderland", 2025):    [("Regis Le Bris", None)],
 }
 
 
@@ -300,7 +376,7 @@ def main():
         SELECT match_id, date, home, away, league, season
         FROM iceberg.silver.fbref_match_enriched
         WHERE (home IN ({teams_sql}) OR away IN ({teams_sql}))
-          AND season BETWEEN 2018 AND 2024
+          AND season BETWEEN 2018 AND 2025
         ORDER BY date
     """)
     matches = cur.fetchall()
