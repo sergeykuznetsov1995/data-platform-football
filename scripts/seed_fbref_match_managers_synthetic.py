@@ -328,7 +328,13 @@ TENURE: Dict[Tuple[str, int], List[Tuple[str, str | None]]] = {
     ],
 
     # ===== Promoted teams for 2025-26 =====
-    ("Burnley", 2025):       [("Scott Parker", None)],
+    # Burnley: Parker left by mutual consent 30 Apr 2026 (8 days after PL
+    # relegation confirmed via 0-1 vs Man City); Mike Jackson took over
+    # as caretaker for the final 4 fixtures (starting vs Leeds)
+    ("Burnley", 2025): [
+        ("Scott Parker", None),
+        ("Mike Jackson", "2026-05-01"),
+    ],
     ("Leeds United", 2025):  [("Daniel Farke", None)],
     ("Sunderland", 2025):    [("Regis Le Bris", None)],
 }
