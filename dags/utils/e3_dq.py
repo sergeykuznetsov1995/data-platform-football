@@ -607,19 +607,19 @@ def _build_espn_lineup_checks() -> List[Check]:
 # ---------------------------------------------------------------------------
 
 def _build_fct_event_checks() -> List[Check]:
-    """DQ for ``iceberg.gold.fct_event`` (E3.3).
+    """DQ for ``iceberg.gold.fct_event`` (E3.3 / Task 2.1).
 
-    NOTE on ref_integrity for match_id_canonical
-    --------------------------------------------
-    E3.3 ADR-1: this fact carries ``match_id`` as a literal passthrough
-    (``'whoscored_raw'``) at v0 because ``silver.xref_match`` only knows
-    FBref ids in E1 MVP. We therefore CANNOT enforce
-    ``match_id_canonical → xref_match`` ref_integrity here. The TODO in
-    the module docstring tracks re-enabling this after E1.5 cutover.
+    ref_integrity for match_id_canonical
+    ------------------------------------
+    Phase B (Task 2.1) shipped a 7-source ``silver.xref_match`` cascade,
+    so every WhoScored game has a row in xref_match (bridged-fbref or
+    orphan-prefixed ``ws_<id>``). The ref_integrity check on
+    ``fct_event.match_id_canonical → silver.xref_match.canonical_id`` is
+    now ENABLED at ERROR severity.
 
     Orphan-rate proxies
     -------------------
-    Until ref_integrity is on, we surrogate via two non-strict checks:
+    Two complementary non-strict guards:
       * ``orphan_team_rate``   — team_id_canonical IS NULL    (alias-YAML drift)
       * ``orphan_player_rate_non_meta`` — player_id_canonical IS NULL on
         non-meta events (Card/Goal/Sub may legitimately have NULL player
@@ -636,6 +636,17 @@ def _build_fct_event_checks() -> List[Check]:
             table,
             cols=['match_id_canonical', 'event_id', 'action_canonical',
                   'action_source', 'action_version'],
+        ),
+
+        # Phase B: match_id_canonical resolves to silver.xref_match.canonical_id
+        # via xm LEFT JOIN. Orphan rows still satisfy ref_integrity because
+        # the cascade emits a 'ws_<game_id>' row in xref_match per WhoScored game.
+        CHECK.ref_integrity(
+            child='gold.fct_event',
+            parent='silver.xref_match',
+            key='match_id_canonical',
+            parent_key='canonical_id',
+            severity='ERROR',
         ),
 
         # Volume — Bronze→Silver→Gold passthrough, expect ~Silver count.

@@ -36,6 +36,12 @@ LEAGUES: List[str] = [
 # Current season (dynamically calculated)
 CURRENT_SEASON: int = get_current_season()
 
+# Last 5 seasons as 4-digit CSV ("2122,2223,2324,2425,2526") — WhoScored multi-season ingest.
+SEASONS_STR: str = ','.join(
+    f"{(CURRENT_SEASON - off) % 100:02d}{(CURRENT_SEASON - off + 1) % 100:02d}"
+    for off in range(4, -1, -1)
+)
+
 # SoFIFA versions (FIFA game versions)
 # Valid values: "latest", "all", or list of version IDs from URL (e.g., 230034)
 SOFIFA_VERSIONS: str = 'latest'
