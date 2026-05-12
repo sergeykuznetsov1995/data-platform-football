@@ -24,6 +24,12 @@
 --   valid_from <= season_end AND (valid_to IS NULL OR valid_to > season_start)
 -- rather than equality on dim_manager.season.
 --
+-- is_current semantics: only TRUE if (a) this is the latest stint of the team
+-- AND (b) the team has matches in the GLOBAL latest season of bronze data.
+-- Without (b) a relegated team's last PL manager would erroneously be flagged
+-- as current (e.g. Van Nistelrooy @ Leicester after the 2024-25 relegation,
+-- Rob Edwards @ Luton after their 2023-24 relegation, etc.).
+--
 -- KNOWN LIMITATION: a manager who quit Team A and later returned to the same
 -- team will produce TWO stints with the same (manager_id_canonical,
 -- team_id_canonical) pair distinguished by valid_from. PK includes
@@ -140,15 +146,44 @@ with_valid_to AS (
             PARTITION BY team_canonical_id ORDER BY valid_from
         )                                                 AS valid_to
     FROM stint_boundaries
+),
+
+-- Per-team latest season + last-match-date — used to (a) close stints for
+-- relegated teams that have no matches in the global latest season and
+-- (b) gate is_current.
+team_last_match AS (
+    SELECT team_canonical_id,
+           MAX(season)     AS team_max_season,
+           MAX(match_date) AS team_last_match_date
+    FROM manager_match_log_resolved
+    GROUP BY team_canonical_id
+),
+
+global_max AS (
+    SELECT MAX(season) AS global_max_season FROM manager_match_log_resolved
 )
 
 SELECT
-    manager_canonical_id                                  AS manager_id_canonical,
-    display_name,
-    team_canonical_id                                     AS team_id_canonical,
-    league,
-    season,
-    valid_from,
-    valid_to,
-    valid_to IS NULL                                      AS is_current
-FROM with_valid_to
+    wvt.manager_canonical_id                              AS manager_id_canonical,
+    wvt.display_name,
+    wvt.team_canonical_id                                 AS team_id_canonical,
+    wvt.league,
+    wvt.season,
+    wvt.valid_from,
+    -- If team is not in the latest global season (relegated / left dataset),
+    -- close the still-open stint with team's last match date + 1 day so the
+    -- closed-open interval semantics stay intact and downstream "manager X
+    -- in season Y" JOINs work correctly.
+    CASE
+        WHEN wvt.valid_to IS NULL AND tlm.team_max_season < g.global_max_season
+            THEN CAST(DATE_ADD('day', 1, tlm.team_last_match_date) AS DATE)
+        ELSE wvt.valid_to
+    END                                                   AS valid_to,
+    -- is_current only when (a) this is the latest stint of the team AND
+    -- (b) the team has matches in the latest global season.
+    (wvt.valid_to IS NULL AND tlm.team_max_season = g.global_max_season)
+                                                          AS is_current
+FROM with_valid_to wvt
+INNER JOIN team_last_match tlm
+    ON tlm.team_canonical_id = wvt.team_canonical_id
+CROSS JOIN global_max g

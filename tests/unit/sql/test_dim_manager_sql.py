@@ -110,11 +110,15 @@ def _bootstrap(con) -> None:
         ("ars2020a", league, 2020, "Arsenal", "home", "Mikel Arteta", "2020-09-12"),
         ("ars2021a", league, 2021, "Arsenal", "home", "Mikel Arteta", "2021-08-13"),
 
-        # Liverpool — same manager Klopp across two seasons -> ONE stint
+        # Liverpool — same manager Klopp across three seasons -> ONE stint.
+        # The 2021 match keeps Liverpool's team_max_season aligned with
+        # Arsenal's (global max=2021) so the new "team must have matches in
+        # the latest global season for is_current=True" gate keeps Klopp open.
         ("liv2018a", league, 2018, "Liverpool", "home", "Jurgen Klopp", "2018-08-12"),
         ("liv2018b", league, 2018, "Liverpool", "home", "Jurgen Klopp", "2018-12-01"),
         ("liv2019a", league, 2019, "Liverpool", "home", "Jurgen Klopp", "2019-08-09"),
         ("liv2020a", league, 2020, "Liverpool", "home", "Jurgen Klopp", "2020-09-12"),
+        ("liv2021a", league, 2021, "Liverpool", "home", "Jurgen Klopp", "2021-08-14"),
     ]
 
     for r in rows:
@@ -134,7 +138,8 @@ def _bootstrap(con) -> None:
     managers_seasons = {
         ("Unai Emery", 2018), ("Unai Emery", 2019),
         ("Mikel Arteta", 2019), ("Mikel Arteta", 2020), ("Mikel Arteta", 2021),
-        ("Jurgen Klopp", 2018), ("Jurgen Klopp", 2019), ("Jurgen Klopp", 2020),
+        ("Jurgen Klopp", 2018), ("Jurgen Klopp", 2019),
+        ("Jurgen Klopp", 2020), ("Jurgen Klopp", 2021),
     }
     for name, season in managers_seasons:
         canonical = name.lower().replace(" ", "_")
@@ -147,7 +152,8 @@ def _bootstrap(con) -> None:
     teams_seasons = {
         ("Arsenal", 2018), ("Arsenal", 2019),
         ("Arsenal", 2020), ("Arsenal", 2021),
-        ("Liverpool", 2018), ("Liverpool", 2019), ("Liverpool", 2020),
+        ("Liverpool", 2018), ("Liverpool", 2019),
+        ("Liverpool", 2020), ("Liverpool", 2021),
     }
     for team, season in teams_seasons:
         canonical = team.lower()
