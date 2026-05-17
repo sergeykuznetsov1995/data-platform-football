@@ -133,6 +133,16 @@ SILVER_E3_TRANSFORMS = [
         'dags/sql/silver/whoscored_player_season_aggregate.sql',
         'whoscored_player_season_aggregate',
     ),
+    (
+        # Per-(canonical_id, league, season) aggregate of Understat player
+        # season metrics. Reads bronze.understat_players directly and joins
+        # silver.xref_player for canonical_id resolution -- so it must run
+        # AFTER xref_player has been materialised by dag_transform_xref.
+        # Provides the Understat-side feed for gold.fct_player_season_stats.
+        'understat_player_season_aggregate',
+        'dags/sql/silver/understat_player_season_aggregate.sql',
+        'understat_player_season_aggregate',
+    ),
 ]
 
 GOLD_E3_TRANSFORMS = [
