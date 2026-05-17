@@ -42,123 +42,6 @@ logger = logging.getLogger(__name__)
 PARTITION_FILTER_SENTINEL = "-- WHERE_PARTITION_FILTER_HERE"
 
 
-# ---------------------------------------------------------------------------
-# Point-in-time leakage protection — rolling-feature column registries
-# ---------------------------------------------------------------------------
-# Each feat_* table masks rolling columns to NULL for the first N rows per
-# partition (see CASE WHEN match_rn > N in dags/sql/gold/feat_*.sql). DQ
-# verifies that mask is intact by counting non-NULL values where rn <= N.
-#
-# Keep these lists in sync with the SELECT lists of the corresponding SQL
-# files. New rolling column added in SQL? Add it here too — otherwise a
-# regression that drops the CASE-WHEN mask ships silently.
-#
-# Columns are grouped by SQL file. (table, partition_by, order_by, skip_n)
-# is shared across all columns in a group.
-
-# feat_team_form — partition (team_id, season) ORDER BY date, mask match_rn > 5
-FEAT_TEAM_FORM_ROLLING_COLS = [
-    # T1.x baseline averages
-    'l5_goals_for_avg',
-    'l5_goals_against_avg',
-    'l5_shots_avg',
-    'l5_sot_avg',
-    'l5_possession_avg',
-    'l5_form_points',
-    'l5_wins',
-    'l5_losses',
-    'l5_draws',
-    # T3.3 volatility + trend
-    'l5_goals_for_std',
-    'l5_goals_against_std',
-    'l5_points_std',
-    'l5_form_trend',
-    # E5: rolling avg # of confirmed unavailable players over L5. Same
-    # skip_first_n=5 mask — point-in-time leakage risk is identical to
-    # other rolling features here.
-    'unavailable_count_l5',
-]
-
-# feat_team_h2h — partition (team_id, opponent_id) ORDER BY date, mask h2h_rn > 1
-# NB: NO season in partition — head-to-head is a cross-season relationship.
-# skip_first_n=1 (not 5) because h2h has at most ~2 matches/season per pair.
-FEAT_TEAM_H2H_ROLLING_COLS = [
-    'h2h_goals_diff_avg',
-    'h2h_goals_for_avg',
-    'h2h_goals_against_avg',
-    'h2h_wins',
-    'h2h_losses',
-    'h2h_draws',
-]
-
-# feat_team_xg_form — partition (team_id, season) ORDER BY match_date, mask match_rn > 5
-# Both L5 and L10 columns share skip_first_n=5 — see SQL header for trade-off
-# rationale (APL 38-match seasons make >10 mask too restrictive).
-FEAT_TEAM_XG_FORM_ROLLING_COLS = [
-    # L5
-    'xg_for_l5_avg',
-    'xg_against_l5_avg',
-    'xg_diff_l5_avg',
-    'psxg_for_l5_avg',
-    'psxg_against_l5_avg',
-    'psxg_diff_l5_avg',
-    # L10
-    'xg_for_l10_avg',
-    'xg_against_l10_avg',
-    'xg_diff_l10_avg',
-    'psxg_for_l10_avg',
-    'psxg_against_l10_avg',
-    'psxg_diff_l10_avg',
-]
-
-# feat_player_form — partition (player_id, season) ORDER BY match_id, mask appearance_rn > 5
-FEAT_PLAYER_FORM_ROLLING_COLS = [
-    'l5_minutes_avg',
-    'l5_goals_avg',
-    'l5_assists_avg',
-    'l5_shots_avg',
-    'l5_sot_avg',
-    'l5_goals_sum',
-    'l5_assists_sum',
-    'l5_yellows_sum',
-    'l5_reds_sum',
-]
-
-# E6 / W2: feat_referee_bias — partition (referee_id, season) ORDER BY date,
-# mask ref_match_rn > 5. Each column is a rolling stat over the referee's last
-# 10 completed matches (within season). Same point-in-time semantics as the
-# other feat_* tables: first 5 matches of a referee's season carry NULL to
-# avoid leakage during early-season fitting.
-FEAT_REFEREE_BIAS_ROLLING_COLS = [
-    'ref_yellow_per_match_l10',
-    'ref_red_per_match_l10',
-    'ref_cards_per_match_l10',
-    'ref_goals_per_match_l10',
-    'ref_home_win_rate_l10',
-    'ref_pen_per_match_l10',
-]
-
-# E6 / W3: feat_team_event_style — partition (team_id, season) ORDER BY date,
-# mask match_rn > 5. All columns are share/rate metrics derived from
-# silver.whoscored_events_spadl rolling over the team's last 5 matches.
-# Bounded in [0, 1] (share = fraction of team's actions of given type, or
-# success_rate = share of successful actions). NB: skip_first_n=5 — share
-# numerators are unstable for the first ~5 matches when sample sizes are
-# small, so the SQL masks them to NULL and the DQ enforces the mask.
-FEAT_TEAM_EVENT_STYLE_ROLLING_COLS = [
-    'pass_share_l5_avg',
-    'dribble_share_l5_avg',
-    'tackle_share_l5_avg',
-    'interception_share_l5_avg',
-    'cross_share_l5_avg',
-    'shot_share_l5_avg',
-    'success_rate_l5_avg',
-    'set_piece_share_l5_avg',
-    'open_play_share_l5_avg',
-    'header_share_l5_avg',
-]
-
-
 def run_gold_transform(
     sql_file: str,
     table_name: str,
@@ -173,9 +56,9 @@ def run_gold_transform(
     DROP+CTAS flow, same connection settings, same partitioning API.
 
     Optional graceful-degrade mode for transforms that depend on optional
-    Silver tables (e.g. ``feat_team_xg_form`` requires ``silver.fbref_shot_events``,
-    which may be absent in MVP environments where the Bronze ``fbref_shot_events``
-    isn't ingested yet).
+    Silver tables (e.g. ``fct_player_unavailable`` requires
+    ``silver.whoscored_player_unavailable``, which may be absent in MVP
+    environments where the Bronze source isn't ingested yet).
 
     Args:
         fallback_sql_file: Alternative SQL to run when any of ``require_silver``
@@ -902,54 +785,6 @@ def _run_partition_dq(
     return [f"{r.name}: {r.details or r.error}" for r in report.errors]
 
 
-def _append_train_test_disjointness_check(report) -> None:
-    """Append a disjointness CheckResult for fct_match_train vs fct_match_test.
-
-    WHY a custom Trino query: the universal CHECK registry does not (yet)
-    expose a cross-table INNER-JOIN-COUNT primitive. The check is small,
-    deterministic and important enough to inline here.
-
-    Mutates ``report.results`` in place — same dataclass shape as run_checks().
-    """
-    from utils.data_quality import CheckResult, _get_conn
-
-    name = 'disjointness[fct_match_train ∩ fct_match_test]'
-    sql = (
-        "SELECT COUNT(*) FROM iceberg.gold.fct_match_train tr "
-        "INNER JOIN iceberg.gold.fct_match_test te "
-        "ON tr.match_id = te.match_id"
-    )
-
-    conn = _get_conn()
-    try:
-        cur = conn.cursor()
-        try:
-            cur.execute(sql)
-            row = cur.fetchone()
-        finally:
-            cur.close()
-        overlap = row[0] if row else 0
-        report.results.append(CheckResult(
-            name=name,
-            kind='disjointness',
-            severity='ERROR',
-            passed=(overlap == 0),
-            details=f"{overlap} match_id(s) appear in BOTH train and test",
-            value=overlap,
-        ))
-    except Exception as e:
-        report.results.append(CheckResult(
-            name=name,
-            kind='disjointness',
-            severity='ERROR',
-            passed=False,
-            error=str(e),
-        ))
-        logger.exception("disjointness check raised")
-    finally:
-        conn.close()
-
-
 def _append_dim_standings_coverage_check(report) -> None:
     """E2: append a two-tier coverage CheckResult for dim_standings.
 
@@ -1050,10 +885,6 @@ def validate_gold_quality() -> Dict[str, Any]:
         CHECK.no_duplicates('gold.dim_player',       pk=['player_id', 'season']),
         CHECK.no_duplicates('gold.fct_team_match',   pk=['match_id', 'team_id']),
         CHECK.no_duplicates('gold.fct_player_match', pk=['match_id', 'player_id']),
-        CHECK.no_duplicates('gold.fct_match',        pk=['match_id']),
-        CHECK.no_duplicates('gold.feat_team_form',    pk=['match_id', 'team_id']),
-        CHECK.no_duplicates('gold.feat_team_xg_form', pk=['match_id', 'team_id']),
-        CHECK.no_duplicates('gold.feat_player_form',  pk=['match_id', 'player_id']),
         CHECK.no_duplicates('gold.match_outcomes',    pk=['match_id']),
         # E5: composite PK guards against double-listing the same player as
         # absent for the same match. Empty fallback (0 rows) passes trivially.
@@ -1061,29 +892,13 @@ def validate_gold_quality() -> Dict[str, Any]:
             'gold.fct_player_unavailable',
             pk=['match_id', 'team_id', 'player_id_canonical'],
         ),
-        # T4.1: ML splits — match_id is the PK in both tables.
-        CHECK.no_duplicates('gold.fct_match_train',   pk=['match_id']),
-        CHECK.no_duplicates('gold.fct_match_test',    pk=['match_id']),
 
         # ========== No NULLs in PKs — ERROR ==========
         CHECK.no_nulls('gold.dim_match',       cols=['match_id', 'date']),
         CHECK.no_nulls('gold.fct_team_match',  cols=['match_id', 'team_id', 'opponent_id']),
-        CHECK.no_nulls('gold.fct_match',       cols=['match_id', 'home_team_id', 'away_team_id']),
         # match_outcomes is the source-of-truth for ML labels — PK + temporal
         # keys MUST be present, otherwise downstream backtests silently misalign.
         CHECK.no_nulls('gold.match_outcomes',  cols=['match_id', 'season', 'match_date']),
-        # feat_team_xg_form keys/temporal columns — required for honest joins / windowing.
-        CHECK.no_nulls('gold.feat_team_xg_form',
-                       cols=['match_id', 'team_id', 'season', 'match_date']),
-        # T4.1: ML splits — PK + season partition key + temporal column + the
-        # primary classification target MUST all be present (the split only
-        # contains completed matches, so result_1x2 cannot be NULL).
-        # NB: in fct_match the temporal column is `date` (inherited from dim_match),
-        # not `match_date` (which is the name in match_outcomes).
-        CHECK.no_nulls('gold.fct_match_train',
-                       cols=['match_id', 'season', 'date', 'result_1x2']),
-        CHECK.no_nulls('gold.fct_match_test',
-                       cols=['match_id', 'season', 'date', 'result_1x2']),
         # E5: required keys. NB: `team_id` is intentionally NOT here — cross-
         # source slug mismatches (Wolves/Wolverhampton) leave it NULL by design;
         # coverage is observed via the WARNING-severity row_count check below.
@@ -1093,80 +908,15 @@ def validate_gold_quality() -> Dict[str, Any]:
         # ========== Referential integrity — ERROR ==========
         CHECK.ref_integrity('gold.fct_team_match',   'gold.dim_match', 'match_id'),
         CHECK.ref_integrity('gold.fct_player_match', 'gold.dim_match', 'match_id'),
-        CHECK.ref_integrity('gold.fct_match',        'gold.dim_match', 'match_id'),
-        CHECK.ref_integrity('gold.feat_team_form',    'gold.dim_match', 'match_id'),
-        CHECK.ref_integrity('gold.feat_team_xg_form', 'gold.dim_match', 'match_id'),
         CHECK.ref_integrity('gold.match_outcomes',    'gold.dim_match', 'match_id'),
-        # T4.1: ML splits must trace back to dim_match (and through it, to Silver).
-        CHECK.ref_integrity('gold.fct_match_train',   'gold.dim_match', 'match_id'),
-        CHECK.ref_integrity('gold.fct_match_test',    'gold.dim_match', 'match_id'),
         # E5: every unavailability row must point at a real Gold match.
         # SQL already filters bridge failures, so 0 orphans by construction.
         CHECK.ref_integrity('gold.fct_player_unavailable', 'gold.dim_match', 'match_id'),
-
-        # ========== Point-in-time correctness — ERROR (guard against leakage) ==========
-        # For first N matches of the partition every rolling feature MUST be NULL.
-        # Anything else means future data leaked into the feature window — silently
-        # inflated training metrics, broken ML reliability. Severity stays ERROR
-        # so the DAG fails before Gold ships features to the model.
-        #
-        # Column lists live in module-level constants (FEAT_*_ROLLING_COLS) so the
-        # registry stays explicit (no SQL parsing magic) but adding a column is a
-        # one-line change. T3.4 closed coverage gaps: previously only a sample of
-        # rolling cols was checked, now every masked column is enforced.
-        *(
-            CHECK.point_in_time(
-                'gold.feat_team_form',
-                feature_col=col,
-                partition_by=['team_id', 'season'],
-                order_by='date',
-                skip_first_n=5,
-            )
-            for col in FEAT_TEAM_FORM_ROLLING_COLS
-        ),
-        # h2h: partition is (team_id, opponent_id) — h2h is cross-season; mask
-        # is h2h_rn > 1 (first encounter has no prior). skip_first_n=1.
-        *(
-            CHECK.point_in_time(
-                'gold.feat_team_h2h',
-                feature_col=col,
-                partition_by=['team_id', 'opponent_id'],
-                order_by='date',
-                skip_first_n=1,
-            )
-            for col in FEAT_TEAM_H2H_ROLLING_COLS
-        ),
-        # xG / PSxG rolling features (L5 + L10).
-        # SQL masks both L5 and L10 features at match_rn > 5 (deliberate trade-off:
-        # an APL season has 38 matches; demanding 10 prior would null ~26% of rows).
-        # So skip_first_n=5 applies uniformly to BOTH window sizes.
-        *(
-            CHECK.point_in_time(
-                'gold.feat_team_xg_form',
-                feature_col=col,
-                partition_by=['team_id', 'season'],
-                order_by='match_date',
-                skip_first_n=5,
-            )
-            for col in FEAT_TEAM_XG_FORM_ROLLING_COLS
-        ),
-        *(
-            CHECK.point_in_time(
-                'gold.feat_player_form',
-                feature_col=col,
-                partition_by=['player_id', 'season'],
-                order_by='match_id',
-                skip_first_n=5,
-            )
-            for col in FEAT_PLAYER_FORM_ROLLING_COLS
-        ),
 
         # ========== Value ranges — WARNING ==========
         CHECK.value_range('gold.fct_team_match', 'goals_for',  min_val=0, max_val=20,
                           severity='WARNING'),
         CHECK.value_range('gold.fct_team_match', 'possession', min_val=0, max_val=100,
-                          severity='WARNING'),
-        CHECK.value_range('gold.fct_match',      'total_goals', min_val=0, max_val=20,
                           severity='WARNING'),
         # Targets sanity — only meaningful for completed matches; outliers
         # outside [0, 20] indicate parser regression in Silver score extraction.
@@ -1176,36 +926,6 @@ def validate_gold_quality() -> Dict[str, Any]:
                           where='is_completed = true', severity='WARNING'),
         CHECK.value_range('gold.match_outcomes', 'away_score', min_val=0, max_val=20,
                           where='is_completed = true', severity='WARNING'),
-        # T3.3: volatility / trend sanity bounds (WARNING — domain heuristics)
-        # Std-dev of goals over 5 matches very rarely exceeds 5 in real data.
-        CHECK.value_range('gold.feat_team_form', 'l5_goals_for_std',
-                          min_val=0, max_val=5, severity='WARNING'),
-        CHECK.value_range('gold.feat_team_form', 'l5_goals_against_std',
-                          min_val=0, max_val=5, severity='WARNING'),
-        # Points std bounded by max swing over 5 games (~1.6 in extreme cases).
-        CHECK.value_range('gold.feat_team_form', 'l5_points_std',
-                          min_val=0, max_val=5, severity='WARNING'),
-        # Slope = points/match. Empirically stays within +/- 1.5 even for
-        # dramatic form swings (3 -> 0 across 5 matches gives ~ -0.6 slope).
-        CHECK.value_range('gold.feat_team_form', 'l5_form_trend',
-                          min_val=-1.5, max_val=1.5, severity='WARNING'),
-        # T3.2: xG sanity bounds. Single-match xG above ~6 is exceptional but
-        # plausible (e.g. 8-0 routs); rolling AVG above 8 across 5 matches is
-        # essentially impossible — if it appears something has gone wrong
-        # in the shot_events parser. WARNING (not ERROR) since the bound is
-        # a domain heuristic, not a hard invariant.
-        CHECK.value_range('gold.feat_team_xg_form', 'xg_for_l5_avg',
-                          min_val=0, max_val=8, severity='WARNING'),
-        CHECK.value_range('gold.feat_team_xg_form', 'xg_against_l5_avg',
-                          min_val=0, max_val=8, severity='WARNING'),
-        CHECK.value_range('gold.feat_team_xg_form', 'xg_for_l10_avg',
-                          min_val=0, max_val=8, severity='WARNING'),
-        CHECK.value_range('gold.feat_team_xg_form', 'psxg_for_l5_avg',
-                          min_val=0, max_val=8, severity='WARNING'),
-        # xG diff is bounded by xG itself; +/- 8 over a rolling window is the
-        # outer envelope (best APL team vs worst over 5 matches).
-        CHECK.value_range('gold.feat_team_xg_form', 'xg_diff_l5_avg',
-                          min_val=-8, max_val=8, severity='WARNING'),
 
         # ========== E5: fct_player_unavailable observability — WARNING ==========
         # Bronze whoscored_missing_players has been collected since 2021 (APL);
@@ -1241,113 +961,6 @@ def validate_gold_quality() -> Dict[str, Any]:
         ),
 
         # ============================================================
-        # E6 / W2: feat_referee_bias — referee rolling stats over L10 matches
-        # (within season). PK (referee_id, match_id), partition (season).
-        # Mirrors the feat_team_form block: PK uniqueness + no_nulls on keys
-        # + ref_integrity to dim_match + point-in-time leakage guard for every
-        # registered rolling column + WARNING-severity domain bounds.
-        # ============================================================
-
-        # ----- E6: row-count soft floor — WARNING -----
-        # 5 seasons × ~30 matches/season × ~25 ref-season rows ≈ 100 floor.
-        # WARNING (not ERROR) — historical seasons may not all be backfilled
-        # in MVP environments.
-        CHECK.row_count('gold.feat_referee_bias', min_rows=100,
-                        severity='WARNING'),
-
-        # ----- E6: PK uniqueness — ERROR -----
-        CHECK.no_duplicates('gold.feat_referee_bias',
-                            pk=['referee_id', 'match_id']),
-
-        # ----- E6: NOT NULL on PKs + temporal/partition keys — ERROR -----
-        CHECK.no_nulls('gold.feat_referee_bias',
-                       cols=['referee_id', 'match_id', 'date', 'season']),
-
-        # ----- E6: ref_integrity feat_referee_bias.match_id → dim_match — ERROR -----
-        CHECK.ref_integrity('gold.feat_referee_bias',
-                            'gold.dim_match', 'match_id'),
-
-        # ----- E6: point-in-time leakage guard — ERROR -----
-        # SQL masks rolling cols at ref_match_rn > 5 within (referee_id, season).
-        # Same skip_first_n=5 contract as the other feat_* tables: leakage
-        # triggers DQ failure before Gold ships features to the model.
-        *(
-            CHECK.point_in_time(
-                'gold.feat_referee_bias',
-                feature_col=col,
-                partition_by=['referee_id', 'season'],
-                order_by='date',
-                skip_first_n=5,
-            )
-            for col in FEAT_REFEREE_BIAS_ROLLING_COLS
-        ),
-
-        # ----- E6: value-range sanity (WARNING) -----
-        # Domain heuristics for APL referees (single-match upper bounds across
-        # rolling L10 averages). Tight enough to catch Bronze parser
-        # regressions but loose enough not to flag legitimate outliers.
-        CHECK.value_range('gold.feat_referee_bias', 'ref_yellow_per_match_l10',
-                          min_val=0, max_val=6, severity='WARNING'),
-        CHECK.value_range('gold.feat_referee_bias', 'ref_red_per_match_l10',
-                          min_val=0, max_val=1, severity='WARNING'),
-        CHECK.value_range('gold.feat_referee_bias', 'ref_cards_per_match_l10',
-                          min_val=0, max_val=8, severity='WARNING'),
-        CHECK.value_range('gold.feat_referee_bias', 'ref_home_win_rate_l10',
-                          min_val=0, max_val=1, severity='WARNING'),
-
-        # ============================================================
-        # E6 / W3: feat_team_event_style — share/rate metrics from
-        # whoscored_events_spadl, rolling L5 within (team_id, season).
-        # PK (match_id, team_id), partition (league, season). Mirrors
-        # feat_team_form block; all columns are bounded in [0, 1].
-        # ============================================================
-
-        # ----- E6: row-count soft floor — WARNING -----
-        # ~380 APL matches × 2 teams/match × 5 seasons / sparse coverage ≈
-        # 1000 floor for the rolling (post-mask) population.
-        CHECK.row_count('gold.feat_team_event_style', min_rows=1000,
-                        severity='WARNING'),
-
-        # ----- E6: PK uniqueness — ERROR -----
-        CHECK.no_duplicates('gold.feat_team_event_style',
-                            pk=['match_id', 'team_id']),
-
-        # ----- E6: NOT NULL on PKs + temporal/partition keys — ERROR -----
-        CHECK.no_nulls('gold.feat_team_event_style',
-                       cols=['match_id', 'team_id', 'date', 'season']),
-
-        # ----- E6: ref_integrity feat_team_event_style.match_id → dim_match — ERROR -----
-        CHECK.ref_integrity('gold.feat_team_event_style',
-                            'gold.dim_match', 'match_id'),
-
-        # ----- E6: point-in-time leakage guard — ERROR -----
-        # SQL masks rolling cols at match_rn > 5 within (team_id, season).
-        *(
-            CHECK.point_in_time(
-                'gold.feat_team_event_style',
-                feature_col=col,
-                partition_by=['team_id', 'season'],
-                order_by='date',
-                skip_first_n=5,
-            )
-            for col in FEAT_TEAM_EVENT_STYLE_ROLLING_COLS
-        ),
-
-        # ----- E6: value-range sanity (WARNING) -----
-        # All columns are shares (fraction of team's actions of given type)
-        # or success_rate (share of successful actions). Hard bound [0, 1]
-        # — anything outside indicates Silver SPADL parser regression.
-        *(
-            CHECK.value_range(
-                'gold.feat_team_event_style',
-                column=col,
-                min_val=0, max_val=1,
-                severity='WARNING',
-            )
-            for col in FEAT_TEAM_EVENT_STYLE_ROLLING_COLS
-        ),
-
-        # ============================================================
         # E2: master-data dims (dim_venue / dim_referee / dim_standings /
         # dim_competition / dim_season). Mirrors the existing dim_match /
         # dim_team / dim_player block but adapted to the E2 PK shapes and
@@ -1376,19 +989,17 @@ def validate_gold_quality() -> Dict[str, Any]:
                        cols=['season_id', 'season_start_year',
                              'valid_from', 'valid_to']),
 
-        # ----- E2: ref_integrity dim_standings.team_id → dim_team — ERROR -----
+        # ----- E2: ref_integrity dim_standings.team_id → dim_team — WARNING -----
         # Soft FK: rows whose team_id_source='sofascore_orphan' are intentionally
         # NOT in dim_team (resolver couldn't match — they are tracked but not
         # joined). Only the canonical-resolved rows must point at a real
         # dim_team key. Implemented as row_count(max_rows=0) over the
         # offending predicate because the universal CHECK.ref_integrity has
         # no WHERE-filter mode (yet).
-        # Severity = WARNING (not ERROR) because the upstream entity_xref
-        # alias coverage (`_team_aliases.sql`) is incomplete by design —
-        # SofaScore variants like 'Liverpool FC' map to a distinct
-        # `liverpool_fc` canonical_id whereas dim_team uses `liverpool`.
-        # Closing those gaps is E1's job (xref refactor → Silver), not E2's.
-        # The orphan share is also surfaced via the coverage WARNING below.
+        # Severity = WARNING (not ERROR) because the upstream alias coverage
+        # is incomplete by design — SofaScore variants like 'Liverpool FC'
+        # map to a distinct `liverpool_fc` canonical_id whereas dim_team uses
+        # `liverpool`. The orphan share is surfaced via the coverage WARNING.
         CHECK.row_count(
             'gold.dim_standings', min_rows=0, max_rows=0,
             where=("team_id_source = 'fbref_canonical' "
@@ -1467,90 +1078,194 @@ def validate_gold_quality() -> Dict[str, Any]:
         ),
 
         # ============================================================
-        # E7 / T7: BI dashboard marts — DQ guards complementing the
-        # row_count floors registered in validate_gold_row_counts().
-        # PK uniqueness ERROR + value-range / freshness WARNINGs +
-        # point-in-time leakage guard for mart_scouting_radar.xg_l5.
+        # T4: dim_player_attributes — cross-source snapshot per canonical
+        # player. Additive относительно dim_player (per-season FBref-only).
+        # FotMob coverage низкая (~40%) потому что FotMob Bronze покрывает
+        # только APL 2025, а FBref-spine — все сезоны (history). Coverage
+        # thresholds выставлены под реальный baseline; tighten после
+        # подключения R3 источников (Sofascore/Transfermarkt).
         # ============================================================
+        CHECK.no_duplicates('gold.dim_player_attributes',
+                            pk=['player_id_canonical']),
+        CHECK.no_nulls('gold.dim_player_attributes',
+                       cols=['player_id_canonical']),
+        CHECK.ref_integrity(
+            'gold.dim_player_attributes',
+            'silver.xref_player',
+            'player_id_canonical',
+            parent_key='canonical_id',
+        ),
+        CHECK.value_range('gold.dim_player_attributes', 'height_cm_fotmob',
+                          min_val=140, max_val=220, severity='WARNING'),
+        CHECK.coverage('gold.dim_player_attributes', column='height_cm_fotmob',
+                       warn_threshold=0.30, error_threshold=0.15),
+        CHECK.coverage('gold.dim_player_attributes', column='dob_fotmob',
+                       warn_threshold=0.30, error_threshold=0.15),
+        CHECK.coverage('gold.dim_player_attributes', column='foot_fotmob',
+                       warn_threshold=0.30, error_threshold=0.15),
 
-        # ----- E7: mart_scouting_radar — PK uniqueness — ERROR -----
-        # SQL declares (player_id, season, league, match_id) as PK in the
-        # header, but (player_id, match_id) is the unique tuple — season +
-        # league are passthrough partition keys (one row per appearance).
-        CHECK.no_duplicates('gold.mart_scouting_radar',
-                            pk=['player_id', 'match_id']),
+        # ============================================================
+        # T5: fct_player_season_stats — cross-source per-season stats.
+        # FBref-spine + FotMob bridge через silver.xref_player. Outfield
+        # only (вратари в fct_keeper_season_stats). Business-витрина:
+        # PK + ref_integrity ERROR; audit-diff чеки переехали в _audit.
+        # ============================================================
+        CHECK.no_duplicates('gold.fct_player_season_stats',
+                            pk=['player_id_canonical', 'league', 'season']),
+        CHECK.no_nulls('gold.fct_player_season_stats',
+                       cols=['player_id_canonical', 'league', 'season']),
+        CHECK.ref_integrity(
+            'gold.fct_player_season_stats',
+            'gold.dim_player_attributes',
+            'player_id_canonical',
+            parent_key='player_id_canonical',
+        ),
+        # WS/US value-range plausibility (ERROR severity на явных
+        # bounded-domain метриках; nullable by design — LEFT JOIN). NULL
+        # passes (no coverage assertion здесь).
+        CHECK.value_range('gold.fct_player_season_stats', 'expected_goals_understat',
+                          min_val=0, max_val=60, severity='ERROR'),
+        CHECK.value_range('gold.fct_player_season_stats', 'non_penalty_xg',
+                          min_val=0, max_val=60, severity='ERROR'),
+        CHECK.value_range('gold.fct_player_season_stats', 'pass_pct_whoscored',
+                          min_val=0, max_val=100, severity='ERROR'),
+        CHECK.value_range('gold.fct_player_season_stats', 'tackle_pct_whoscored',
+                          min_val=0, max_val=100, severity='ERROR'),
+        CHECK.value_range('gold.fct_player_season_stats', 'take_on_pct_whoscored',
+                          min_val=0, max_val=100, severity='ERROR'),
 
-        # ----- E7: mart_scouting_radar — freshness — WARNING -----
-        # `match_date` is a DATE (not a load timestamp): used here as the
-        # most recent fixture played. Threshold = 2 days (48h) accommodates
-        # international breaks while still surfacing parser regressions.
-        CHECK.freshness('gold.mart_scouting_radar', ts_col='match_date',
-                        max_age_hours=48, severity='WARNING'),
-
-        # ----- E7: mart_scouting_radar — value-range — WARNING -----
-        # Single-match xG headroom: penalties are 0.79; legitimate top
-        # outliers (e.g. multiple big chances) rarely exceed 2.5; cap at 5
-        # leaves headroom for unusual matches without flagging real data.
-        CHECK.value_range('gold.mart_scouting_radar', 'xg',
-                          min_val=0, max_val=5, severity='WARNING'),
-        CHECK.value_range('gold.mart_scouting_radar', 'xa',
-                          min_val=0, max_val=5, severity='WARNING'),
-
-        # ----- E7: mart_scouting_radar — point-in-time — ERROR -----
-        # SQL masks xg_l5 / xa_l5 / shots_l5 / defensive_l5 at
-        # appearance_rn > 5 within (player_id, season). Ordered by
-        # (match_date, match_id). Leakage triggers DAG failure before
-        # Gold ships features to BI.
-        CHECK.point_in_time(
-            'gold.mart_scouting_radar',
-            feature_col='xg_l5',
-            partition_by=['player_id', 'season'],
-            order_by='match_date',
-            skip_first_n=5,
+        # ============================================================
+        # T5: fct_keeper_season_stats — keeper-variant. Зеркальный набор.
+        # ============================================================
+        CHECK.no_duplicates('gold.fct_keeper_season_stats',
+                            pk=['player_id_canonical', 'league', 'season']),
+        CHECK.no_nulls('gold.fct_keeper_season_stats',
+                       cols=['player_id_canonical', 'league', 'season']),
+        CHECK.ref_integrity(
+            'gold.fct_keeper_season_stats',
+            'gold.dim_player_attributes',
+            'player_id_canonical',
+            parent_key='player_id_canonical',
         ),
 
-        # ----- E7: mart_referee_dashboard — PK uniqueness — ERROR -----
-        CHECK.no_duplicates('gold.mart_referee_dashboard',
-                            pk=['referee_id', 'season', 'league']),
-
-        # ----- E7: mart_referee_dashboard — value-range -----
-        # cards_per_match: typical EPL window is 2-5; cap at 15 leaves
-        # headroom for derby outliers. WARNING — a soft heuristic.
-        CHECK.value_range('gold.mart_referee_dashboard', 'cards_per_match',
-                          min_val=0, max_val=15, severity='WARNING'),
-        # home_win_pct is a fraction in [0, 1]. Boundary check is ERROR:
-        # values outside the unit interval indicate an aggregation bug.
-        CHECK.value_range('gold.mart_referee_dashboard', 'home_win_pct',
-                          min_val=0, max_val=1, severity='ERROR'),
-        # matches_officiated >= 1 — a referee-season row only exists if
-        # the ref appeared at least once. Zero or negative would mean an
-        # empty GROUP that survived the LEFT JOIN — definitely a bug.
-        CHECK.value_range('gold.mart_referee_dashboard', 'matches_officiated',
-                          min_val=1, severity='ERROR'),
-
-        # ----- E7: mart_event_heatmap — PK uniqueness — ERROR -----
-        CHECK.no_duplicates(
-            'gold.mart_event_heatmap',
-            pk=['team_id', 'season', 'league', 'zone_x', 'zone_y',
-                'action_canonical'],
+        # ============================================================
+        # T5 audit: fct_player_season_stats_audit — DQ-таблица для
+        # cross-source согласованности FBref vs FotMob по HARD_FACT.
+        # INNER JOIN на оба источника → rows только где обе стороны не-NULL.
+        # ERROR: PK uniqueness, ref к main fct (audit ⊆ main fct).
+        # WARNING: audit-diff coverage ≥95% rows укладываются в threshold
+        #          (план «<5% beyond» в acceptance). Threshold per metric:
+        #          1 для счётных событий, 90 для minutes.
+        # ============================================================
+        CHECK.no_duplicates('gold.fct_player_season_stats_audit',
+                            pk=['player_id_canonical', 'league', 'season']),
+        CHECK.no_nulls('gold.fct_player_season_stats_audit',
+                       cols=['player_id_canonical', 'league', 'season']),
+        CHECK.ref_integrity(
+            'gold.fct_player_season_stats_audit',
+            'gold.fct_player_season_stats',
+            'player_id_canonical',
+            parent_key='player_id_canonical',
         ),
+        # 8 audit-diff coverage WARNING-only (error_threshold=0). Audit —
+        # observability, не gate; ERROR ломал бы DAG при нормальных
+        # cross-source расхождениях (например FotMob не отдаёт нулевой
+        # penalty_won → diff=NULL для большинства rows). NULL diff
+        # засчитывается как "not measured" (passed) — не ошибка.
+        CHECK.coverage('gold.fct_player_season_stats_audit',
+                       condition='ABS(matches_diff_fotmob) <= 1 OR matches_diff_fotmob IS NULL',
+                       warn_threshold=0.95, error_threshold=0.0,
+                       name='audit_diff[fct_player_season_stats_audit.matches]'),
+        CHECK.coverage('gold.fct_player_season_stats_audit',
+                       condition='ABS(minutes_diff_fotmob) <= 90 OR minutes_diff_fotmob IS NULL',
+                       warn_threshold=0.95, error_threshold=0.0,
+                       name='audit_diff[fct_player_season_stats_audit.minutes]'),
+        CHECK.coverage('gold.fct_player_season_stats_audit',
+                       condition='ABS(goals_diff_fotmob) <= 1 OR goals_diff_fotmob IS NULL',
+                       warn_threshold=0.95, error_threshold=0.0,
+                       name='audit_diff[fct_player_season_stats_audit.goals]'),
+        CHECK.coverage('gold.fct_player_season_stats_audit',
+                       condition='ABS(assists_diff_fotmob) <= 1 OR assists_diff_fotmob IS NULL',
+                       warn_threshold=0.95, error_threshold=0.0,
+                       name='audit_diff[fct_player_season_stats_audit.assists]'),
+        CHECK.coverage('gold.fct_player_season_stats_audit',
+                       condition='ABS(yellow_cards_diff_fotmob) <= 1 OR yellow_cards_diff_fotmob IS NULL',
+                       warn_threshold=0.95, error_threshold=0.0,
+                       name='audit_diff[fct_player_season_stats_audit.yellow_cards]'),
+        CHECK.coverage('gold.fct_player_season_stats_audit',
+                       condition='ABS(red_cards_diff_fotmob) <= 1 OR red_cards_diff_fotmob IS NULL',
+                       warn_threshold=0.95, error_threshold=0.0,
+                       name='audit_diff[fct_player_season_stats_audit.red_cards]'),
+        CHECK.coverage('gold.fct_player_season_stats_audit',
+                       condition='ABS(penalties_won_diff_fotmob) <= 1 OR penalties_won_diff_fotmob IS NULL',
+                       warn_threshold=0.95, error_threshold=0.0,
+                       name='audit_diff[fct_player_season_stats_audit.penalties_won]'),
+        CHECK.coverage('gold.fct_player_season_stats_audit',
+                       condition='ABS(penalties_conceded_diff_fotmob) <= 1 OR penalties_conceded_diff_fotmob IS NULL',
+                       warn_threshold=0.95, error_threshold=0.0,
+                       name='audit_diff[fct_player_season_stats_audit.penalties_conceded]'),
+        # ----- WhoScored audit (1: только matches есть в event-aggregate) -----
+        CHECK.coverage('gold.fct_player_season_stats_audit',
+                       condition='ABS(matches_diff_whoscored) <= 1 OR matches_diff_whoscored IS NULL',
+                       warn_threshold=0.95, error_threshold=0.0,
+                       name='audit_diff[fct_player_season_stats_audit.matches_whoscored]'),
+        # ----- Understat audit (6) -----
+        CHECK.coverage('gold.fct_player_season_stats_audit',
+                       condition='ABS(matches_diff_understat) <= 1 OR matches_diff_understat IS NULL',
+                       warn_threshold=0.95, error_threshold=0.0,
+                       name='audit_diff[fct_player_season_stats_audit.matches_understat]'),
+        CHECK.coverage('gold.fct_player_season_stats_audit',
+                       condition='ABS(minutes_diff_understat) <= 90 OR minutes_diff_understat IS NULL',
+                       warn_threshold=0.95, error_threshold=0.0,
+                       name='audit_diff[fct_player_season_stats_audit.minutes_understat]'),
+        CHECK.coverage('gold.fct_player_season_stats_audit',
+                       condition='ABS(goals_diff_understat) <= 1 OR goals_diff_understat IS NULL',
+                       warn_threshold=0.95, error_threshold=0.0,
+                       name='audit_diff[fct_player_season_stats_audit.goals_understat]'),
+        CHECK.coverage('gold.fct_player_season_stats_audit',
+                       condition='ABS(assists_diff_understat) <= 1 OR assists_diff_understat IS NULL',
+                       warn_threshold=0.95, error_threshold=0.0,
+                       name='audit_diff[fct_player_season_stats_audit.assists_understat]'),
+        CHECK.coverage('gold.fct_player_season_stats_audit',
+                       condition='ABS(yellow_cards_diff_understat) <= 1 OR yellow_cards_diff_understat IS NULL',
+                       warn_threshold=0.95, error_threshold=0.0,
+                       name='audit_diff[fct_player_season_stats_audit.yellow_cards_understat]'),
+        CHECK.coverage('gold.fct_player_season_stats_audit',
+                       condition='ABS(red_cards_diff_understat) <= 1 OR red_cards_diff_understat IS NULL',
+                       warn_threshold=0.95, error_threshold=0.0,
+                       name='audit_diff[fct_player_season_stats_audit.red_cards_understat]'),
 
-        # ----- E7: mart_event_heatmap — bin safety — ERROR -----
-        # zone_x / zone_y are SQL-clamped to [0, 11] / [0, 7] via
-        # LEAST/GREATEST. Anything outside means the binning formula
-        # regressed (e.g. divisor change, missing GREATEST). Hard ERROR.
-        CHECK.value_range('gold.mart_event_heatmap', 'zone_x',
-                          min_val=0, max_val=11, severity='ERROR'),
-        CHECK.value_range('gold.mart_event_heatmap', 'zone_y',
-                          min_val=0, max_val=7,  severity='ERROR'),
-        # success_rate is AVG of a boolean cast to double — strictly in
-        # [0, 1]. Boundary breach = aggregation regression.
-        CHECK.value_range('gold.mart_event_heatmap', 'success_rate',
-                          min_val=0, max_val=1, severity='ERROR'),
-        # event_count >= 1 — the GROUP BY guarantees a row only when at
-        # least one event landed in the bin. Zero indicates a bug.
-        CHECK.value_range('gold.mart_event_heatmap', 'event_count',
-                          min_val=1, severity='ERROR'),
+        # ============================================================
+        # T5 audit: fct_keeper_season_stats_audit — keeper variant.
+        # ============================================================
+        CHECK.no_duplicates('gold.fct_keeper_season_stats_audit',
+                            pk=['player_id_canonical', 'league', 'season']),
+        CHECK.no_nulls('gold.fct_keeper_season_stats_audit',
+                       cols=['player_id_canonical', 'league', 'season']),
+        CHECK.ref_integrity(
+            'gold.fct_keeper_season_stats_audit',
+            'gold.fct_keeper_season_stats',
+            'player_id_canonical',
+            parent_key='player_id_canonical',
+        ),
+        CHECK.coverage('gold.fct_keeper_season_stats_audit',
+                       condition='ABS(matches_diff_fotmob) <= 1 OR matches_diff_fotmob IS NULL',
+                       warn_threshold=0.95, error_threshold=0.0,
+                       name='audit_diff[fct_keeper_season_stats_audit.matches]'),
+        CHECK.coverage('gold.fct_keeper_season_stats_audit',
+                       condition='ABS(minutes_diff_fotmob) <= 90 OR minutes_diff_fotmob IS NULL',
+                       warn_threshold=0.95, error_threshold=0.0,
+                       name='audit_diff[fct_keeper_season_stats_audit.minutes]'),
+        CHECK.coverage('gold.fct_keeper_season_stats_audit',
+                       condition='ABS(clean_sheets_diff_fotmob) <= 1 OR clean_sheets_diff_fotmob IS NULL',
+                       warn_threshold=0.95, error_threshold=0.0,
+                       name='audit_diff[fct_keeper_season_stats_audit.clean_sheets]'),
+        # WhoScored saves diff (SPADL keeper_save vs FBref `saves` — разная
+        # дефиниция; threshold выше: ±5 reasonable cross-source noise).
+        CHECK.coverage('gold.fct_keeper_season_stats_audit',
+                       condition='ABS(saves_diff_whoscored) <= 5 OR saves_diff_whoscored IS NULL',
+                       warn_threshold=0.90, error_threshold=0.0,
+                       name='audit_diff[fct_keeper_season_stats_audit.saves_whoscored]'),
 
         # ============================================================
         # E1.5: post-cutover ref_integrity / canonical-format checks
@@ -1565,12 +1280,6 @@ def validate_gold_quality() -> Dict[str, Any]:
     ]
 
     report = run_checks(checks, raise_on_error=False)
-
-    # T4.1: ad-hoc disjointness — train and test splits must not share any
-    # match_id. Implemented out-of-band because the CHECK registry has no
-    # cross-table set-difference primitive yet. Failure is ERROR-grade: if
-    # train and test overlap, every reported metric becomes invalid.
-    _append_train_test_disjointness_check(report)
 
     # E2: two-tier coverage check on dim_standings.team_id resolver hit-rate.
     # Inline because the universal CHECK registry has no two-tier coverage
@@ -1597,195 +1306,6 @@ def validate_gold_quality() -> Dict[str, Any]:
     }
 
 
-def validate_predictions_input() -> Dict[str, Any]:
-    """T4.2: validate the inference snapshot ``gold.predictions_input``.
-
-    Contract — the table must:
-      * have a unique PK on match_id (one row per upcoming fixture);
-      * carry non-null PK / temporal / team-id keys (joins on serve side);
-      * keep ``date`` strictly inside [CURRENT_DATE, CURRENT_DATE + 7 days];
-      * keep features fresh — the feat_team_form lineage stamp must not lag
-        more than 6 hours (DAG runs every 2 h; >6 h means 3 missed cycles).
-
-    WARNING-only: row count below 1 (legitimate during international break /
-    off-season — must not page on-call).
-    """
-    from utils.alerts import telegram_dq_summary
-    from utils.data_quality import CHECK, run_checks
-
-    checks = [
-        # ===== ERROR: PK + critical keys =====
-        CHECK.no_duplicates('gold.predictions_input', pk=['match_id']),
-        CHECK.no_nulls(
-            'gold.predictions_input',
-            cols=['match_id', 'date', 'home_team_id', 'away_team_id'],
-        ),
-
-        # ===== ERROR: temporal window sanity =====
-        # Re-uses row_count with max_rows=0 + a WHERE that selects rows
-        # OUTSIDE the allowed window. Anything > 0 means the SELECT filter
-        # regressed and we are about to ship stale or far-future fixtures.
-        CHECK.row_count(
-            'gold.predictions_input',
-            min_rows=0, max_rows=0,
-            where="date < CURRENT_DATE OR date > CURRENT_DATE + INTERVAL '7' DAY",
-            severity='ERROR',
-            name='date_window[predictions_input.date in [today, today+7d]]',
-        ),
-
-        # ===== WARNING: row count =====
-        # Empty week is plausible (international break, off-season); only
-        # surface as WARNING so a fixture-less week does not page on-call.
-        CHECK.row_count(
-            'gold.predictions_input', min_rows=1,
-            severity='WARNING',
-        ),
-
-        # ===== WARNING: feature freshness =====
-        # Inference DAG runs every 2 h; feat_team_form should be rebuilt at
-        # least once per Gold cycle. >6 h stale means upstream Gold missed
-        # several cycles — flag, but do not fail (model can still serve on
-        # slightly older features for one tick).
-        CHECK.freshness(
-            'gold.feat_team_form', ts_col='_silver_created_at',
-            max_age_hours=6, severity='WARNING',
-        ),
-    ]
-
-    report = run_checks(checks, raise_on_error=False)
-    logger.info(f"Predictions input DQ: {report.summary()}")
-    telegram_dq_summary(report, header="Predictions DQ")
-
-    if report.errors:
-        from airflow.exceptions import AirflowException
-        raise AirflowException(
-            f"Predictions input DQ failed: {len(report.errors)} error(s). "
-            + "; ".join(f"{r.name}: {r.details or r.error}" for r in report.errors[:5])
-        )
-
-    return {
-        'passed': len(report.passed),
-        'total': len(report.results),
-        'errors': [r.name for r in report.errors],
-        'warnings': [r.name for r in report.warnings],
-    }
-
-
-def validate_predictions_input_v2() -> Dict[str, Any]:
-    """E6 / T4.2-v2 — DQ check on the dual-run v2 predictions snapshot.
-
-    Mirrors :func:`validate_predictions_input` but adds a schema-parity check
-    against ``fct_match_train`` / ``fct_match_test`` so the inference snapshot
-    cannot drift away from the feature contract used at training time. Drift
-    in column set or types is a silent killer for the model — a NEW column
-    introduced in train but missing from predictions_input_v2 means the
-    serve-side pipeline imputes ``NULL`` and quietly degrades predictions.
-
-    The set of columns that legitimately differ between the three tables is
-    enumerated explicitly:
-
-    * ``_silver_created_at`` — every Gold table stamps its own load time;
-    * targets present only in train/test snapshots (``home_score``,
-      ``away_score``, ``result_1x2``, ``total_goals``, ``btts``,
-      ``is_completed``, plus the derived classification labels); these are
-      not knowable for an upcoming fixture so predictions_input_v2 omits
-      them by design.
-
-    The ``CHECK.schema_parity`` primitive itself is added in W5b. If this
-    function is invoked before W5b lands, ``run_checks`` will surface a
-    clear ImportError / AttributeError — picked up by W8 unit tests + W9
-    verification, fail-loud-and-early as designed.
-    """
-    from utils.alerts import telegram_dq_summary
-    from utils.data_quality import CHECK, run_checks
-
-    checks = [
-        # ===== ERROR: PK + critical keys =====
-        CHECK.no_duplicates('gold.predictions_input_v2', pk=['match_id']),
-        CHECK.no_nulls(
-            'gold.predictions_input_v2',
-            cols=['match_id', 'date', 'season',
-                  'home_team_id', 'away_team_id'],
-        ),
-
-        # ===== WARNING: row count =====
-        # Empty week is plausible (international break, off-season). min_rows=0
-        # so a fixture-less window passes; cutoff stays in the WARNING freshness
-        # check instead of paging on-call.
-        CHECK.row_count('gold.predictions_input_v2', min_rows=0,
-                        severity='WARNING'),
-
-        # ===== ERROR: schema parity vs train/test =====
-        # train/test/predictions_input_v2 must share the same feature surface
-        # (modulo targets, which serve-time data cannot have). Drift here =
-        # silent prediction degradation.
-        CHECK.schema_parity(
-            tables=['gold.fct_match_train',
-                    'gold.fct_match_test',
-                    'gold.predictions_input_v2'],
-            ignore_cols=[
-                # Per-table load timestamp — not part of the feature contract.
-                '_silver_created_at',
-                # Match-outcome columns — known only after the match is played,
-                # so predictions_input_v2 (upcoming fixtures) has no values.
-                'home_score', 'away_score', 'result_1x2', 'total_goals',
-                'btts', 'is_completed',
-                # Derived classification targets present only in train/test.
-                'over_2_5', 'over_3_5', 'home_win', 'draw', 'away_win',
-            ],
-            severity='ERROR',
-        ),
-    ]
-
-    report = run_checks(checks, raise_on_error=False)
-    logger.info(f"Predictions input v2 DQ: {report.summary()}")
-    telegram_dq_summary(report, header="Predictions v2 DQ")
-
-    if report.errors:
-        from airflow.exceptions import AirflowException
-        raise AirflowException(
-            f"Predictions input v2 DQ failed: {len(report.errors)} error(s). "
-            + "; ".join(f"{r.name}: {r.details or r.error}" for r in report.errors[:5])
-        )
-
-    return {
-        'passed': len(report.passed),
-        'total': len(report.results),
-        'errors': [r.name for r in report.errors],
-        'warnings': [r.name for r in report.warnings],
-    }
-
-
-def count_predictions_input() -> Dict[str, Any]:
-    """T4.2: log the inference snapshot row count for observability.
-
-    Lightweight task — surfaces "how many fixtures the model will score in
-    the next 7 days" in the Airflow log + XCom. No assertions; pure metric.
-    """
-    from utils.data_quality import _get_conn
-
-    conn = _get_conn()
-    try:
-        cur = conn.cursor()
-        try:
-            cur.execute(
-                "SELECT COUNT(*), MIN(date), MAX(date) "
-                "FROM iceberg.gold.predictions_input"
-            )
-            row = cur.fetchone() or (0, None, None)
-        finally:
-            cur.close()
-    finally:
-        conn.close()
-
-    n, dmin, dmax = row
-    logger.info(
-        f"predictions_input: {n} upcoming fixture(s) "
-        f"(date range: {dmin} .. {dmax})"
-    )
-    return {'count': n, 'date_min': str(dmin), 'date_max': str(dmax)}
-
-
 def validate_gold_row_counts() -> Dict[str, Any]:
     """Sanity check: Gold tables have expected row counts."""
     from utils.data_quality import CHECK, run_checks
@@ -1797,27 +1317,24 @@ def validate_gold_row_counts() -> Dict[str, Any]:
     checks = [
         CHECK.row_count('gold.dim_match',        min_rows=3000),
         CHECK.row_count('gold.fct_team_match',   min_rows=6000),
-        CHECK.row_count('gold.fct_match',        min_rows=3000),
-        CHECK.row_count('gold.feat_team_form',    min_rows=6000),
-        # feat_team_xg_form built from optional shot_events Silver — may be
-        # empty if shot_events isn't materialized. Use 0 floor to avoid hard
-        # failure during MVP rollout; raise once shot_events ingestion is GA.
-        CHECK.row_count('gold.feat_team_xg_form', min_rows=0),
-        CHECK.row_count('gold.feat_team_h2h',     min_rows=6000),
         CHECK.row_count('gold.dim_team',         min_rows=50),
         CHECK.row_count('gold.dim_player',       min_rows=1000),
+        # T4: cross-source attribute snapshot — one row per FBref-spine player
+        # canonical_id (all seasons union). Floor ~1000 = dim_player baseline.
+        CHECK.row_count('gold.dim_player_attributes', min_rows=1000),
+        # T5: cross-source per-season stats. Outfield baseline ≈2551 rows
+        # (5 сезонов APL × ~500 outfield); floor 400 с запасом на partition
+        # gaps. Keeper baseline ≈204; floor 50.
+        CHECK.row_count('gold.fct_player_season_stats', min_rows=400),
+        CHECK.row_count('gold.fct_keeper_season_stats', min_rows=50),
+        # T5 audit: subset main fct (INNER JOIN на оба источника). FotMob
+        # покрывает только 2025/26 → audit-row только для пересечения.
+        # Outfield baseline ≈270 rows (2025/26 only); floor 100.
+        # Keeper baseline ≈25; floor 10.
+        CHECK.row_count('gold.fct_player_season_stats_audit', min_rows=100),
+        CHECK.row_count('gold.fct_keeper_season_stats_audit', min_rows=10),
         CHECK.row_count('gold.fct_player_match', min_rows=50000),
-        CHECK.row_count('gold.feat_player_form', min_rows=50000),
-        CHECK.row_count('gold.entity_xref',      min_rows=2000),
         CHECK.row_count('gold.match_outcomes',   min_rows=3000),
-        # T4.1: ML splits — soft floors. Tighten after first production run.
-        # FBref-only ENG-PL: ~380 completed matches/season; with 9+ seasons
-        # historical the train side easily clears 1500. Test side is per-season
-        # (~76 rows from latest season alone — but historical seasons add up
-        # to ~684). 75 is the absolute minimum (1 season's tail) and stays
-        # safe even if only the current season is materialized.
-        CHECK.row_count('gold.fct_match_train',  min_rows=1500),
-        CHECK.row_count('gold.fct_match_test',   min_rows=75),
 
         # ===== E2: master-data dim row-count floors =====
         # dim_venue: APL has ~20 active stadiums per season; 9+ seasons of
@@ -1841,18 +1358,6 @@ def validate_gold_row_counts() -> Dict[str, Any]:
         # dim_season: derived from SEASONS list — currently 5 seasons in
         # rotation. Same drift-detection contract as dim_competition.
         CHECK.row_count('gold.dim_season',      min_rows=5, max_rows=5),
-
-        # ===== E7: dashboard mart row-count floors =====
-        # mart_scouting_radar: ≥800 player-season radars (FBref-only APL,
-        # ~1000-2000/season after MIN_MINUTES filter; floor stays generous).
-        CHECK.row_count('gold.mart_scouting_radar',    min_rows=800),
-        # mart_referee_dashboard: ≥40 referee-season rows (~30 active EPL
-        # refs across 9+ seasons of history easily clears 40).
-        CHECK.row_count('gold.mart_referee_dashboard', min_rows=40),
-        # mart_event_heatmap: ≥80 (zone, action_canonical, league, season)
-        # buckets. WhoScored events cover only the recent seasons; floor
-        # tuned to a single season's worth of populated cells.
-        CHECK.row_count('gold.mart_event_heatmap',     min_rows=80),
     ]
     report = run_checks(checks, raise_on_error=False)
     logger.info(f"Gold row counts: {report.summary()}")

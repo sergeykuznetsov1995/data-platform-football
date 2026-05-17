@@ -413,6 +413,36 @@ class TestMultiSeasonSpine:
         assert conf == 'name_team'
         assert score >= xpr.NAME_THRESHOLD
 
+    def test_issue_15_saka_2526_understat_resolves(self):
+        """Issue #15 regression: Saka 2025/26 understat must resolve via name_team.
+
+        Reported symptom — silver.xref_player had no understat row for
+        canonical_id='fb_bc7dc64d', season='2526'. Root cause was operational
+        (stale xref relative to Bronze, not a cascade defect), but we lock the
+        cascade contract here so a future regression of token_sort_ratio
+        tuning or spine-bucket layout immediately fails the unit suite.
+        """
+        spine = xpr._FBrefSpine([
+            {
+                'player_id': 'bc7dc64d',
+                'source_id': 'bc7dc64d',
+                'player_name': 'Bukayo Saka',
+                'canonical_team': 'Arsenal',
+                'season': '2526',
+            },
+        ])
+        cand = {
+            'source': 'understat',
+            'source_id': '7322',
+            'player_name': 'Bukayo Saka',
+            'canonical_team': 'Arsenal',
+            'season': '2526',
+        }
+        cid, conf, score = xpr.cascade_resolve(cand, spine)
+        assert cid == 'fb_bc7dc64d'
+        assert conf == 'name_team'
+        assert score >= xpr.NAME_THRESHOLD
+
 
 # ---------------------------------------------------------------------------
 # _verify_known_pairs (regression guard)

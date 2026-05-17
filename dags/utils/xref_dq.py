@@ -588,6 +588,145 @@ def evaluate_orphan_rate_per_source(
 
 
 # ---------------------------------------------------------------------------
+# Bronze-vs-xref freshness gap (Issue #15 regression guard)
+# ---------------------------------------------------------------------------
+
+#: Default Bronze tables consulted by :func:`evaluate_bronze_xref_freshness_gap`.
+#: Each entry: (source_label, fully_qualified_bronze_table).
+DEFAULT_FRESHNESS_BRONZE_TABLES = (
+    ('understat', 'iceberg.bronze.understat_players'),
+    ('fotmob', 'iceberg.bronze.fotmob_player_stats'),
+)
+
+
+def evaluate_bronze_xref_freshness_gap(
+    bronze_tables=DEFAULT_FRESHNESS_BRONZE_TABLES,
+    xref_table: str = 'iceberg.silver.xref_player',
+    warning_lag_hours: float = 24.0,
+    error_lag_hours: float = 72.0,
+) -> Dict[str, Any]:
+    """Compare Bronze player-table freshness against xref_player snapshot age.
+
+    Issue #15 regression guard. ``silver.xref_player`` is materialised via a
+    full DROP+CREATE+INSERT by :mod:`utils.xref_player_resolver`. If the
+    resolver DAG (``dag_transform_xref``) is paused or stalls, recently-ingested
+    Bronze players are silently absent from xref → downstream Gold facts get
+    NULL canonical_id and orphan-rate metrics look healthy because the row
+    never made it into the table at all (not even as an orphan).
+
+    Symptom from Issue #15 (2026-05-17):
+        * bronze.understat_players: 532 rows for season='2526' (incl. Bukayo Saka)
+        * silver.xref_player: 267 rows for (understat, '2526') — Saka missing
+        * Last resolver snapshot: 2026-05-15 14:54
+        * Last understat 2526 Bronze ingest: 2026-05-17 09:00
+        * Resulting Gold Understat coverage stuck at 50.30%
+
+    Methodology
+    -----------
+    For each (source, bronze_table) pair we compute MAX(_ingested_at) per
+    season and compare against MAX(committed_at) of the xref table's snapshot
+    history. A positive lag means Bronze has data the resolver has not yet
+    processed.
+
+    Args:
+        bronze_tables: Iterable of (source_label, qualified_bronze_table).
+            Defaults to Understat + FotMob; WhoScored excluded because the
+            resolver reads players from ``bronze.whoscored_events`` which is
+            too large to scan freshness-per-season cheaply.
+        xref_table: Iceberg table whose snapshot timestamp represents the
+            last successful resolver run.
+        warning_lag_hours: Lag above this — WARNING.
+        error_lag_hours: Lag above this — ERROR.
+
+    Returns:
+        dict::
+
+            {
+                'xref_max_committed_at': datetime | None,
+                'per_partition': [
+                    {'source': str, 'season': str, 'bronze_max_ts': datetime,
+                     'lag_hours': float, 'verdict': 'OK'|'WARNING'|'ERROR'},
+                    ...
+                ],
+                'verdict': 'OK' | 'WARNING' | 'ERROR',
+                'breaches': [...],  # entries with non-OK verdict
+            }
+
+    Does NOT raise — caller decides whether to escalate.
+    """
+    # Snapshot view name must NOT be sanitised by _safe_ident — it contains '$'.
+    # We hardcode the schema/table parts; only the literal table name is
+    # parameterised via xref_table.
+    qualified = _qualify(xref_table)
+    cat, schema, tbl = qualified.split('.')
+    snapshots_view = f'{cat}.{schema}."{tbl}$snapshots"'
+
+    conn = _get_conn()
+    try:
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                f"SELECT MAX(committed_at) FROM {snapshots_view}"
+            )
+            row = cur.fetchone()
+            xref_max = row[0] if row else None
+
+            per_partition: List[Dict[str, Any]] = []
+            for source_label, bronze_table in bronze_tables:
+                bronze_qualified = _qualify(bronze_table)
+                cur.execute(
+                    "SELECT CAST(season AS varchar) AS season_str, "
+                    "       MAX(_ingested_at) AS bronze_max "
+                    f"FROM {bronze_qualified} "
+                    "GROUP BY season"
+                )
+                for season_str, bronze_max in cur.fetchall():
+                    if bronze_max is None or xref_max is None:
+                        lag_hours = None
+                    else:
+                        delta = bronze_max - xref_max.replace(tzinfo=bronze_max.tzinfo)
+                        lag_hours = delta.total_seconds() / 3600.0
+
+                    if lag_hours is None or lag_hours <= 0:
+                        verdict = 'OK'
+                    elif lag_hours > error_lag_hours:
+                        verdict = 'ERROR'
+                    elif lag_hours > warning_lag_hours:
+                        verdict = 'WARNING'
+                    else:
+                        verdict = 'OK'
+
+                    per_partition.append({
+                        'source': source_label,
+                        'season': season_str,
+                        'bronze_max_ts': bronze_max,
+                        'lag_hours': (
+                            round(lag_hours, 2) if lag_hours is not None else None
+                        ),
+                        'verdict': verdict,
+                    })
+        finally:
+            cur.close()
+    finally:
+        conn.close()
+
+    breaches = [p for p in per_partition if p['verdict'] != 'OK']
+    if any(p['verdict'] == 'ERROR' for p in per_partition):
+        overall = 'ERROR'
+    elif any(p['verdict'] == 'WARNING' for p in per_partition):
+        overall = 'WARNING'
+    else:
+        overall = 'OK'
+
+    return {
+        'xref_max_committed_at': xref_max,
+        'per_partition': per_partition,
+        'verdict': overall,
+        'breaches': breaches,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Dual-run parity validators (Silver xref vs legacy gold.entity_xref)
 # ---------------------------------------------------------------------------
 

@@ -1,0 +1,357 @@
+"""
+SoFIFA reader that fetches pages through FlareSolverr instead of Selenium.
+
+soccerdata 1.9.0 ships with seleniumbase + undetected-chromedriver for SoFIFA
+(PR #932), but the resulting headless driver does not click the Cloudflare
+Turnstile checkbox automatically — sofifa.com keeps returning the challenge
+HTML even after 5x retries (verified 2026-05-12). FlareSolverr (Camoufox-based,
+already used by WhoScored events) passes the Turnstile reliably, so this
+subclass keeps all of soccerdata's SoFIFA parsing intact and only swaps the
+HTTP transport layer.
+
+Wire up via env var ``FLARESOLVERR_URL`` (default ``http://flaresolverr:8191``)
+or the ``flaresolverr_url`` kwarg on ``SoFIFAScraper``.
+"""
+from __future__ import annotations
+
+import html as html_module
+import io
+import logging
+import re
+import uuid
+from pathlib import Path
+from typing import IO, Iterable, List, Optional, Union
+
+import soccerdata as sd
+
+from scrapers.base.flaresolverr_client import (
+    FlareSolverrCFChallengeFailed,
+    FlareSolverrClient,
+    FlareSolverrTabCrashed,
+)
+
+logger = logging.getLogger(__name__)
+
+# Recreate the FlareSolverr session every N requests to dodge an internal
+# Chromium tab crash on sofifa.com SPA pages (FS v3.4.6 / Chrome 142). The
+# crash is not docker-OOM (~150MiB usage at crash), it's Chromium internal —
+# observed between request #3 and #10 of a session, 2026-05-13. 4 sits below
+# the observed lower bound so rotation almost always lands before crash;
+# rotation cost is ~15s per cycle (fresh CF challenge per session = ~12s +
+# bootstrap fetch). Player_ratings (~545 requests) was failing at 8 because
+# the [1..7] window inside every session was wide enough to hit the crash.
+SESSION_RECREATE_EVERY = 4
+
+_PRE_BODY_RE = re.compile(r"<pre[^>]*>(.*?)</pre>", re.DOTALL | re.IGNORECASE)
+
+
+def _force_english(url: str) -> str:
+    """Append ``hl=en-US`` to sofifa.com URLs so the page comes back in English.
+
+    sofifa.com geolocates the request and serves the page in the local language
+    of the egress IP (e.g. Dutch from EU datacenter IPs). soccerdata's
+    ``read_player_ratings`` parses scores by searching for English text labels
+    ("Overall rating", "Dribbling", ...) via XPath ``contains(text, ...)``,
+    so a non-English page yields ~all-NULL attribute columns. The ``hl=``
+    query parameter overrides geo-locale; an ``<link rel="alternate"
+    hreflang="en" href="...?hl=en-US">`` in the page itself documents the API.
+    """
+    if 'hl=' in url:
+        return url
+    sep = '&' if '?' in url else '?'
+    return f"{url}{sep}hl=en-US"
+
+
+def _extract_pre_body(html: str) -> str:
+    """Extract JSON body from FlareSolverr's <pre>-wrapped HTML response.
+
+    FlareSolverr renders all responses through Chromium, which displays raw
+    JSON inside `<html><body><pre>{...}</pre></body></html>`. soccerdata's
+    SoFIFA reader expects the cached file to be valid JSON, so for `.json`
+    filepaths we strip the wrapper and HTML-unescape the body.
+    """
+    match = _PRE_BODY_RE.search(html)
+    if match:
+        return html_module.unescape(match.group(1))
+    return html  # already plain (no wrapper) — pass through
+
+
+class FlareSolverrSoFIFAReader(sd.SoFIFA):
+    """soccerdata SoFIFA reader that fetches HTML via FlareSolverr."""
+
+    def __init__(
+        self,
+        flaresolverr_url: str = "http://flaresolverr:8191",
+        proxy: Optional[str] = None,
+        max_timeout_ms: int = 90_000,
+        versions: Union[str, int, List[int]] = "latest",
+        no_cache: bool = False,
+        no_store: bool = False,
+        data_dir: Optional[Path] = None,
+        leagues: Optional[Union[str, List[str]]] = None,
+        session_recreate_every: int = SESSION_RECREATE_EVERY,
+    ):
+        # FlareSolverr session must exist BEFORE sd.SoFIFA.__init__ runs,
+        # because that constructor calls self.read_versions() which goes
+        # through our _download_and_save right away.
+        self._fs_client = FlareSolverrClient(url=flaresolverr_url)
+        self._session_id = self._new_session_id()
+        self._max_timeout_ms = max_timeout_ms
+        self._proxy_url = proxy
+        self._request_count = 0
+        self._session_recreate_every = session_recreate_every
+        self._session_closed = False
+        self._fs_client.create_session(self._session_id, proxy_url=proxy)
+        logger.info("FlareSolverr session %s created", self._session_id)
+
+        kw = dict(
+            versions=versions,
+            no_cache=no_cache,
+            no_store=no_store,
+            proxy=None,  # proxy now lives inside the FlareSolverr session
+            leagues=leagues,
+        )
+        if data_dir is not None:
+            kw["data_dir"] = data_dir
+        super().__init__(**kw)
+
+    @staticmethod
+    def _new_session_id() -> str:
+        return f"sofifa-{uuid.uuid4().hex[:8]}"
+
+    @classmethod
+    def _all_leagues(cls) -> dict[str, str]:
+        """Delegate league lookup to ``sd.SoFIFA``.
+
+        soccerdata's ``BaseReader._all_leagues`` keys ``LEAGUE_DICT`` by
+        ``cls.__name__``. Our subclass would search for the literal
+        ``'FlareSolverrSoFIFAReader'`` and find nothing — every league would
+        be rejected as invalid. Forward the call to the canonical parent.
+        """
+        return sd.SoFIFA._all_leagues()
+
+    def _init_webdriver(self):
+        # Selenium not needed — FlareSolverr owns the browser.
+        return None
+
+    def read_player_ratings(self, team=None, player=None) -> "pd.DataFrame":
+        """Override soccerdata.SoFIFA.read_player_ratings to inject ``player_id``.
+
+        Upstream returns a DataFrame keyed by player NAME and sorted by name,
+        which makes merging back to ``player_id`` unreliable: rating-page
+        names ("James Philip Milner") often differ from catalogue names
+        ("James Milner"). We replicate the upstream loop verbatim and add
+        ``player_id`` to the per-row dict so it propagates as a real column.
+
+        Source mirror: ``soccerdata/sofifa.py:375-493``.
+        """
+        import pandas as pd
+        from itertools import product
+        from lxml import html as _html
+        from soccerdata._common import standardize_colnames
+
+        SO_FIFA_API = "https://sofifa.com"
+        urlmask = SO_FIFA_API + "/player/{}/?r={}&set=true"
+        filemask = "player_{}_{}.html"
+
+        if player is None:
+            players = self.read_players(team=team).index.unique()
+        elif isinstance(player, int):
+            players = [player]
+        else:
+            players = player
+
+        score_labels = [
+            "Overall rating", "Potential", "Crossing", "Finishing",
+            "Heading accuracy", "Short passing", "Volleys", "Dribbling",
+            "Curve", "FK Accuracy", "Long passing", "Ball control",
+            "Acceleration", "Sprint speed", "Agility", "Reactions",
+            "Balance", "Shot power", "Jumping", "Stamina", "Strength",
+            "Long shots", "Aggression", "Interceptions", "Positioning",
+            "Vision", "Penalties", "Composure", "Defensive awareness",
+            "Standing tackle", "Sliding tackle",
+            "GK Diving", "GK Handling", "GK Kicking",
+            "GK Positioning", "GK Reflexes",
+        ]
+
+        ratings: list[dict] = []
+        iterator = list(product(self.versions.iterrows(), players))
+        for i, ((version_id, version), pid) in enumerate(iterator):
+            logger.info(
+                "[%s/%s] Retrieving ratings for player ID %s in %s edition",
+                i + 1, len(iterator), pid, version["update"],
+            )
+            filepath = self.data_dir / filemask.format(pid, version_id)
+            url = urlmask.format(pid, version_id)
+            reader = self.get(url, filepath)
+            tree = _html.parse(reader, parser=_html.HTMLParser(encoding="utf8"))
+            node_player_name = tree.xpath("//div[contains(@class, 'profile')]/h1")
+            if not node_player_name:
+                logger.warning("player %s: no profile h1 found, skipping", pid)
+                continue
+            node = node_player_name[0]
+            before_br = node.xpath("string(./text()[1])").strip()
+            after_br = node.xpath("string(./br/following-sibling::text()[1])").strip()
+            scores: dict = {
+                "player_id": int(pid),
+                "player": before_br if before_br else after_br,
+                **version.to_dict(),
+            }
+            for s in score_labels:
+                value = None
+                for xpath in (
+                    f"//p[.//text()[contains(.,'{s}')]]/span/em",
+                    f"//div[contains(.,'{s}')]/em",
+                    f"//li[not(self::script)][.//text()[contains(.,'{s}')]]/em",
+                ):
+                    nodes = tree.xpath(xpath)
+                    if nodes:
+                        value = nodes[0].text.strip()
+                        break
+                scores[s] = value
+            ratings.append(scores)
+
+        return (
+            pd.DataFrame(ratings)
+            .pipe(standardize_colnames)
+            .set_index(["player"])
+            .sort_index()
+        )
+
+    def _maybe_recreate_session(self) -> None:
+        if self._request_count <= 0:
+            return
+        if self._request_count % self._session_recreate_every != 0:
+            return
+        self._rotate_session(reason=f"scheduled after {self._request_count} requests")
+
+    def _rotate_session(self, reason: str) -> None:
+        """Destroy current session and create a fresh one. Idempotent on errors."""
+        old = self._session_id
+        try:
+            self._fs_client.destroy_session(old)
+        except Exception as e:
+            logger.warning("destroy_session(%s) before rotation failed: %s", old, e)
+        self._session_id = self._new_session_id()
+        self._fs_client.create_session(self._session_id, proxy_url=self._proxy_url)
+        logger.info("Rotated FlareSolverr session %s -> %s (%s)", old, self._session_id, reason)
+
+    # Max consecutive crash/timeout retries before propagating the error.
+    # 3 covers the observed worst-case of two crashes in a row during long
+    # player_ratings iteration; higher values risk infinite loops on dead URLs.
+    _max_recoveries: int = 3
+
+    def _fs_get_with_recovery(self, url: str) -> dict:
+        """Call ``fs_client.get(url)`` with session rotation on tab crash / CF timeout."""
+        import time
+        attempt = 0
+        while True:
+            try:
+                return self._fs_client.get(
+                    url,
+                    self._session_id,
+                    max_timeout_ms=self._max_timeout_ms,
+                    disable_media=True,
+                )
+            except (FlareSolverrTabCrashed, FlareSolverrCFChallengeFailed) as e:
+                attempt += 1
+                if attempt > self._max_recoveries:
+                    logger.error("Recovery exhausted (%d attempts) for %s: %s", attempt, url, e)
+                    raise
+                reason = "tab crash" if isinstance(e, FlareSolverrTabCrashed) else "CF challenge timeout"
+                # Linear backoff (3s, 6s, 9s) — gives FS Chromium time to
+                # release the crashed tab's memory before we hit it again.
+                backoff = 3.0 * attempt
+                logger.warning(
+                    "%s on %s (attempt %d/%d), sleeping %.1fs then rotating session: %s",
+                    reason, url, attempt, self._max_recoveries, backoff, e,
+                )
+                time.sleep(backoff)
+                self._rotate_session(reason=f"{reason} attempt {attempt}")
+
+    def _download_and_save(
+        self,
+        url: str,
+        filepath: Optional[Path] = None,
+        var: Optional[Union[str, Iterable[str]]] = None,
+    ) -> IO[bytes]:
+        if var is not None:
+            raise NotImplementedError(
+                "FlareSolverrSoFIFAReader does not support JS variable extraction "
+                "(used by FBref's get_page, never by SoFIFA)."
+            )
+
+        self._maybe_recreate_session()
+        url = _force_english(url)
+
+        # Retry on tab crash or CF challenge timeout with rotation: Chromium
+        # 142 crashes the tab unpredictably on sofifa.com SPA pages even at
+        # low memory; sometimes a fresh session's Turnstile challenge also
+        # times out after 90s. In both cases recovery is the same — destroy
+        # session + create fresh one. We retry up to ``_max_recoveries``
+        # times because the first retry can crash again (observed 2026-05-13:
+        # ~2 consecutive crashes during long player_ratings iteration). The
+        # backoff between retries lets FlareSolverr's old Chromium release
+        # memory before we hit it again. soccerdata caches successful HTML
+        # on disk so the previous request progress is not lost.
+        response = self._fs_get_with_recovery(url)
+
+        html = response.get("html") or ""
+        status = response.get("status", 0)
+
+        if "_cf_chl_opt" in html or "Just a moment" in html:
+            raise FlareSolverrCFChallengeFailed(
+                f"Cloudflare challenge HTML returned for {url} (status={status})"
+            )
+        if not html:
+            raise ConnectionError(f"FlareSolverr returned empty body for {url}")
+
+        # FlareSolverr always returns rendered HTML, even for JSON endpoints
+        # (it wraps the JSON body inside `<html><body><pre>...</pre></body></html>`).
+        # soccerdata.SoFIFA.read_leagues() calls `json.load(filepath)` on the
+        # cached file, so for `.json` filepaths we must strip the wrapper.
+        if filepath is not None and str(filepath).endswith(".json"):
+            body = _extract_pre_body(html).encode("utf-8")
+        else:
+            body = html.encode("utf-8")
+
+        if not self.no_store and filepath is not None:
+            filepath.parent.mkdir(parents=True, exist_ok=True)
+            with filepath.open(mode="wb") as fh:
+                fh.write(body)
+
+        self._request_count += 1
+        return io.BytesIO(body)
+
+    def _validate_page(self, url: str) -> str:
+        # Defensive: in BaseSeleniumReader this is called after driver.get(url).
+        # Our overridden _download_and_save bypasses the driver path, so this
+        # should never run. Fail loud rather than NPE on self._driver.
+        raise RuntimeError(
+            "_validate_page should not be called in FlareSolverrSoFIFAReader "
+            f"(url={url})"
+        )
+
+    def close(self) -> None:
+        if self._session_closed:
+            return
+        try:
+            self._fs_client.destroy_session(self._session_id)
+            logger.info("Destroyed FlareSolverr session %s", self._session_id)
+        except Exception as e:
+            logger.warning("destroy_session(%s) at close failed: %s", self._session_id, e)
+        finally:
+            self._session_closed = True
+
+    def __enter__(self) -> "FlareSolverrSoFIFAReader":
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> bool:
+        self.close()
+        return False
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass

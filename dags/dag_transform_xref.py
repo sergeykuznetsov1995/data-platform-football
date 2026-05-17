@@ -236,6 +236,7 @@ def _validate_xref(**context) -> Dict[str, Any]:
     from utils.data_quality import CheckResult, run_checks
     from utils.xref_dq import (
         build_all_xref_checks,
+        evaluate_bronze_xref_freshness_gap,
         evaluate_orphan_rate_per_source,
         maybe_alert_parity,
         parity_check_xref_match_vs_gold,
@@ -299,12 +300,41 @@ def _validate_xref(**context) -> Dict[str, Any]:
     context['ti'].xcom_push(key='orphan_rates', value=orphan_rates)
 
     # ------------------------------------------------------------------
-    # Telegram summary (Phase 1 + Phase 2 combined)
+    # Phase 2.5 — Bronze-vs-xref freshness gap (Issue #15 regression guard)
+    # ------------------------------------------------------------------
+    try:
+        freshness = evaluate_bronze_xref_freshness_gap()
+        verdict = freshness['verdict']
+        passed = verdict == 'OK'
+        severity = 'ERROR' if verdict == 'ERROR' else 'WARNING'
+        report.results.append(CheckResult(
+            name='bronze_xref_freshness[xref_player]',
+            kind='freshness',
+            severity=severity,
+            passed=passed,
+            details=(
+                f"verdict={verdict}, xref_committed={freshness['xref_max_committed_at']}, "
+                f"breaches={freshness['breaches']}"
+            ),
+        ))
+        context['ti'].xcom_push(key='bronze_xref_freshness', value=freshness)
+    except Exception as e:
+        logger.exception("bronze-xref freshness evaluation failed")
+        report.results.append(CheckResult(
+            name='bronze_xref_freshness[xref_player]',
+            kind='freshness',
+            severity='WARNING',
+            passed=False,
+            error=str(e),
+        ))
+
+    # ------------------------------------------------------------------
+    # Telegram summary (Phase 1 + Phase 2 + Phase 2.5 combined)
     # ------------------------------------------------------------------
     telegram_dq_summary(report, header="Silver xref DQ (E1)")
 
     # ------------------------------------------------------------------
-    # Phase 1 + 2 ERROR escalation (raise BEFORE parity)
+    # Phase 1 + 2 + 2.5 ERROR escalation (raise BEFORE parity)
     # ------------------------------------------------------------------
     if report.errors:
         raise AirflowException(
