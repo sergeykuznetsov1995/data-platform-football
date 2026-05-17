@@ -97,47 +97,54 @@ SELECT
     fm.primary_position                                  AS position_fotmob,
 
     -- ========= HARD_FACT overlap (FBref→FotMob→WhoScored→Understat) =========
+    -- Integer counters get CAST(... AS BIGINT) — COALESCE across heterogenous
+    -- source types (FBref's `mp` is varchar, FotMob `matches_played` is bigint,
+    -- Understat `games_played` is bigint) was promoting them to double, which
+    -- produced ugly `90.0` / `3.0` values in BI tools. Rates / xG / xA stay
+    -- double but are ROUND'd to 2 decimals for readability — matches the
+    -- precision actually consumed by football analytics (xG papers, fbref,
+    -- Understat all publish to two decimals).
     -- WhoScored event-aggregate отдаёт только matches_seen (нет
     -- minutes/goals/assists/cards/penalties на season-уровне).
     -- Understat покрывает matches/minutes/goals/assists/cards.
-    COALESCE(fb.mp,                  fm.matches_played, ws.matches_seen, us.games_played) AS matches,
-    COALESCE(fb.minutes,             fm.minutes_played, us.minutes_played)               AS minutes,
-    COALESCE(fb.goals,               fm.goals,          us.goals)                        AS goals,
-    COALESCE(fb.assists,             fm.assists,        us.assists)                      AS assists,
-    COALESCE(fb.yellow_cards,        fm.yellow_cards,   us.yellow_cards)                 AS yellow_cards,
-    COALESCE(fb.red_cards,           fm.red_cards,      us.red_cards)                    AS red_cards,
-    COALESCE(fb.penalties_won,       fm.penalties_won)        AS penalties_won,
-    COALESCE(fb.penalties_conceded,  fm.penalties_conceded)   AS penalties_conceded,
+    CAST(COALESCE(fb.mp,                  fm.matches_played, ws.matches_seen, us.games_played) AS BIGINT) AS matches,
+    CAST(COALESCE(fb.minutes,             fm.minutes_played, us.minutes_played)               AS BIGINT) AS minutes,
+    CAST(COALESCE(fb.goals,               fm.goals,          us.goals)                        AS BIGINT) AS goals,
+    CAST(COALESCE(fb.assists,             fm.assists,        us.assists)                      AS BIGINT) AS assists,
+    CAST(COALESCE(fb.yellow_cards,        fm.yellow_cards,   us.yellow_cards)                 AS BIGINT) AS yellow_cards,
+    CAST(COALESCE(fb.red_cards,           fm.red_cards,      us.red_cards)                    AS BIGINT) AS red_cards,
+    CAST(COALESCE(fb.penalties_won,       fm.penalties_won)        AS BIGINT) AS penalties_won,
+    CAST(COALESCE(fb.penalties_conceded,  fm.penalties_conceded)   AS BIGINT) AS penalties_conceded,
 
     -- ========= UNIQUE_FBREF (12) =========
     fb.complete_matches,
     fb.starts,
     fb.subs,
     fb.plus_minus,
-    fb.points_per_match,
-    fb.on_off_impact,
+    ROUND(fb.points_per_match, 2)                        AS points_per_match,
+    ROUND(fb.on_off_impact, 2)                           AS on_off_impact,
     fb.shots,
     fb.shots_on_target,
-    fb.goals_per_shot,
+    ROUND(fb.goals_per_shot, 2)                          AS goals_per_shot,
     fb.crosses,
     fb.offsides,
     fb.own_goals,
 
     -- ========= UNIQUE_FOTMOB (14) =========
-    fm.expected_goals,
-    fm.expected_assists,
-    fm.expected_goals_on_target,
-    fm.big_chances_created,
-    fm.big_chances_missed,
-    fm.chances_created,
-    fm.fotmob_rating,
-    fm.defensive_actions_per_90,
-    fm.clearances_per_90,
-    fm.recoveries_per_90,
-    fm.blocks_per_90,
-    fm.accurate_passes_per_90,
-    fm.accurate_long_balls_per_90,
-    fm.successful_dribbles_per_90,
+    ROUND(fm.expected_goals, 2)                          AS expected_goals,
+    ROUND(fm.expected_assists, 2)                        AS expected_assists,
+    ROUND(fm.expected_goals_on_target, 2)                AS expected_goals_on_target,
+    ROUND(fm.big_chances_created, 2)                     AS big_chances_created,
+    ROUND(fm.big_chances_missed, 2)                      AS big_chances_missed,
+    ROUND(fm.chances_created, 2)                         AS chances_created,
+    ROUND(fm.fotmob_rating, 2)                           AS fotmob_rating,
+    ROUND(fm.defensive_actions_per_90, 2)                AS defensive_actions_per_90,
+    ROUND(fm.clearances_per_90, 2)                       AS clearances_per_90,
+    ROUND(fm.recoveries_per_90, 2)                       AS recoveries_per_90,
+    ROUND(fm.blocks_per_90, 2)                           AS blocks_per_90,
+    ROUND(fm.accurate_passes_per_90, 2)                  AS accurate_passes_per_90,
+    ROUND(fm.accurate_long_balls_per_90, 2)              AS accurate_long_balls_per_90,
+    ROUND(fm.successful_dribbles_per_90, 2)              AS successful_dribbles_per_90,
 
     -- ========= UNIQUE_WHOSCORED (13) =========
     ws.dribbles                                          AS dribbles_whoscored,
@@ -151,18 +158,18 @@ SELECT
     ws.clearances                                        AS clearances_whoscored,
     ws.fouls_committed                                   AS fouls_committed_whoscored,
     ws.touches_in_box                                    AS touches_in_box_whoscored,
-    ws.avg_x                                             AS avg_x_whoscored,
-    ws.avg_y                                             AS avg_y_whoscored,
+    ROUND(ws.avg_x, 2)                                   AS avg_x_whoscored,
+    ROUND(ws.avg_y, 2)                                   AS avg_y_whoscored,
 
     -- ========= UNIQUE_UNDERSTAT (8) =========
     -- xG/xA дублируются с FotMob, поэтому suffix `_understat` для явности.
     -- npxG/xg_chain/xg_buildup — Understat-exclusive, без суффикса.
-    us.expected_goals                                    AS expected_goals_understat,
-    us.expected_assists                                  AS expected_assists_understat,
+    ROUND(us.expected_goals, 2)                          AS expected_goals_understat,
+    ROUND(us.expected_assists, 2)                        AS expected_assists_understat,
     us.non_penalty_goals                                 AS non_penalty_goals_understat,
-    us.non_penalty_xg                                    AS non_penalty_xg,
-    us.xg_chain                                          AS xg_chain,
-    us.xg_buildup                                        AS xg_buildup,
+    ROUND(us.non_penalty_xg, 2)                          AS non_penalty_xg,
+    ROUND(us.xg_chain, 2)                                AS xg_chain,
+    ROUND(us.xg_buildup, 2)                              AS xg_buildup,
     us.key_passes                                        AS key_passes_understat,
     us.shots                                             AS shots_understat,
 
