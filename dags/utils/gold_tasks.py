@@ -1123,10 +1123,13 @@ def validate_gold_quality() -> Dict[str, Any]:
         # WS/US value-range plausibility (ERROR severity на явных
         # bounded-domain метриках; nullable by design — LEFT JOIN). NULL
         # passes (no coverage assertion здесь).
-        CHECK.value_range('gold.fct_player_season_stats', 'expected_goals_understat',
-                          min_val=0, max_val=60, severity='ERROR'),
+        # NB: expected_goals_understat dropped per R4 ADR — diff переехал в audit.
         CHECK.value_range('gold.fct_player_season_stats', 'non_penalty_xg',
                           min_val=0, max_val=60, severity='ERROR'),
+        CHECK.value_range('gold.fct_player_season_stats', 'expected_goals',
+                          min_val=0, max_val=60, severity='ERROR'),
+        CHECK.value_range('gold.fct_player_season_stats', 'expected_assists',
+                          min_val=0, max_val=30, severity='ERROR'),
         CHECK.value_range('gold.fct_player_season_stats', 'pass_pct_whoscored',
                           min_val=0, max_val=100, severity='ERROR'),
         CHECK.value_range('gold.fct_player_season_stats', 'tackle_pct_whoscored',
@@ -1234,6 +1237,22 @@ def validate_gold_quality() -> Dict[str, Any]:
                        condition='ABS(red_cards_diff_understat) <= 1 OR red_cards_diff_understat IS NULL',
                        warn_threshold=0.95, error_threshold=0.0,
                        name='audit_diff[fct_player_season_stats_audit.red_cards_understat]'),
+        # ----- R4 overlap-метрики audit (3; xG/xA = FotMob - Understat, shots = FBref - Understat) -----
+        # Thresholds from R4 ADR bias analysis (mean_diff ~-0.22, std ~0.56):
+        # 2.0 ≈ |mean| + 3σ для xG/xA; shots median=0, p95=1, но outliers до -32 (multi-tournament players)
+        # → 5 для shots WARNING level.
+        CHECK.coverage('gold.fct_player_season_stats_audit',
+                       condition='ABS(xg_diff_understat) <= 2.0 OR xg_diff_understat IS NULL',
+                       warn_threshold=0.95, error_threshold=0.0,
+                       name='audit_diff[fct_player_season_stats_audit.xg_understat]'),
+        CHECK.coverage('gold.fct_player_season_stats_audit',
+                       condition='ABS(xa_diff_understat) <= 2.0 OR xa_diff_understat IS NULL',
+                       warn_threshold=0.95, error_threshold=0.0,
+                       name='audit_diff[fct_player_season_stats_audit.xa_understat]'),
+        CHECK.coverage('gold.fct_player_season_stats_audit',
+                       condition='ABS(shots_diff_understat) <= 5 OR shots_diff_understat IS NULL',
+                       warn_threshold=0.95, error_threshold=0.0,
+                       name='audit_diff[fct_player_season_stats_audit.shots_understat]'),
 
         # ============================================================
         # T5 audit: fct_keeper_season_stats_audit — keeper variant.

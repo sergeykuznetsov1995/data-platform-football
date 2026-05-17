@@ -69,7 +69,7 @@ class TestFctPlayerSeasonStatsAuditSql:
             assert re.search(rf"\b{col}\b", sql)
 
     def test_audit_diff_columns(self):
-        """15 audit-diff: 8 FotMob + 1 WhoScored + 6 Understat."""
+        """18 audit-diff: 8 FotMob + 1 WhoScored + 9 Understat (6 HARD_FACT + 3 R4 overlap)."""
         sql = _read_sql()
         audit_cols = [
             # FotMob (8)
@@ -83,13 +83,17 @@ class TestFctPlayerSeasonStatsAuditSql:
             'penalties_conceded_diff_fotmob',
             # WhoScored (1; только matches есть в event-aggregate)
             'matches_diff_whoscored',
-            # Understat (6)
+            # Understat HARD_FACT (6)
             'matches_diff_understat',
             'minutes_diff_understat',
             'goals_diff_understat',
             'assists_diff_understat',
             'yellow_cards_diff_understat',
             'red_cards_diff_understat',
+            # R4 overlap (3): xG/xA = FotMob - Understat, shots = FBref - Understat.
+            'xg_diff_understat',
+            'xa_diff_understat',
+            'shots_diff_understat',
         ]
         for col in audit_cols:
             assert re.search(rf"\bAS\s+{col}\b", sql, re.IGNORECASE), (

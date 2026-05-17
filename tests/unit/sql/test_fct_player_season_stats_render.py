@@ -180,18 +180,29 @@ class TestFctPlayerSeasonStatsSql:
             )
 
     def test_unique_understat_columns_present(self):
-        """UNIQUE_UNDERSTAT метрики — xG/xA/build-up. xG/xA с suffix
-        `_understat` чтобы не пересекаться с FotMob expected_goals."""
+        """UNIQUE_UNDERSTAT метрики после R4 cleanup: npxG / xg_chain / xg_buildup /
+        non_penalty_goals_understat / key_passes_understat. Overlap-метрики
+        (expected_goals_understat, expected_assists_understat, shots_understat)
+        dropped per R4 ADR — diff переехал в audit-таблицу."""
         sql = _read_sql()
         unique_us = [
-            'expected_goals_understat', 'expected_assists_understat',
             'non_penalty_goals_understat', 'non_penalty_xg',
             'xg_chain', 'xg_buildup',
-            'key_passes_understat', 'shots_understat',
+            'key_passes_understat',
         ]
         for col in unique_us:
             assert re.search(rf"\bAS\s+{col}\b", sql, re.IGNORECASE), (
                 f"UNIQUE_UNDERSTAT column `{col}` must be projected"
+            )
+
+    def test_understat_overlap_columns_dropped(self):
+        """R4 cleanup: overlap-колонки (xG/xA/shots) больше НЕ должны
+        проектироваться в main fct — canonical из FotMob/FBref."""
+        sql = _read_sql()
+        for col in ('expected_goals_understat', 'expected_assists_understat', 'shots_understat'):
+            assert not re.search(rf"\bAS\s+{col}\b", sql, re.IGNORECASE), (
+                f"R4 cleanup: column `{col}` should NOT be projected — "
+                f"canonical source is FotMob/FBref. Diff stays in audit-таблице."
             )
 
     def test_ws_us_join_uses_season_slug(self):

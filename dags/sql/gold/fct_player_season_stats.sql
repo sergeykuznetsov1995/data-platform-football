@@ -47,9 +47,9 @@
 -- UNIQUE_WHOSCORED (13): dribbles, take_on_pct, bad_touches, pass_pct, tackles_won,
 --                        tackle_pct, interceptions, ball_recoveries, clearances,
 --                        fouls_committed, touches_in_box, avg_x, avg_y.
--- UNIQUE_UNDERSTAT (8): expected_goals_understat, expected_assists_understat,
---                       non_penalty_goals_understat, non_penalty_xg, xg_chain,
---                       xg_buildup, key_passes_understat, shots_understat.
+-- UNIQUE_UNDERSTAT (5): non_penalty_goals_understat, non_penalty_xg, xg_chain,
+--                       xg_buildup, key_passes_understat.
+--                       (xG/xA/shots removed per R4 ADR — canonical = FotMob/FBref.)
 --
 -- Cross-source audit-diff (FBref - FotMob per HARD_FACT) вынесены в отдельную
 -- таблицу `gold.fct_player_season_stats_audit` чтобы не загромождать business-витрину
@@ -154,17 +154,15 @@ SELECT
     ws.avg_x                                             AS avg_x_whoscored,
     ws.avg_y                                             AS avg_y_whoscored,
 
-    -- ========= UNIQUE_UNDERSTAT (8) =========
-    -- xG/xA дублируются с FotMob, поэтому suffix `_understat` для явности.
-    -- npxG/xg_chain/xg_buildup — Understat-exclusive, без суффикса.
-    us.expected_goals                                    AS expected_goals_understat,
-    us.expected_assists                                  AS expected_assists_understat,
+    -- ========= UNIQUE_UNDERSTAT (5) =========
+    -- xG/xA/shots overlap-метрики removed per R4 ADR (docs/decisions/R4-overlap-metrics-source-of-truth.md):
+    -- canonical xG/xA — FotMob (expected_goals/expected_assists), canonical shots — FBref (shots).
+    -- Diff vs Understat сохранён в fct_player_season_stats_audit для observability.
     us.non_penalty_goals                                 AS non_penalty_goals_understat,
     us.non_penalty_xg                                    AS non_penalty_xg,
     us.xg_chain                                          AS xg_chain,
     us.xg_buildup                                        AS xg_buildup,
     us.key_passes                                        AS key_passes_understat,
-    us.shots                                             AS shots_understat,
 
     -- ========= Lineage =========
     CURRENT_TIMESTAMP                                    AS _gold_created_at

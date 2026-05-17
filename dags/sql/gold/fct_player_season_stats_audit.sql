@@ -11,12 +11,14 @@
 -- на FBref AND FotMob). Это даёт чистый сигнал "оба источника измерили этого
 -- игрока в этом сезоне" без NULL-шума от FBref-only исторических сезонов.
 --
--- Audit columns: diff = FBref - <source> для каждого HARD_FACT.
+-- Audit columns: diff = FBref - <source> для HARD_FACT + overlap-метрик (R4 ADR).
 --   * FotMob diff (8): INNER JOIN — все 8 HARD_FACT.
 --   * WhoScored diff (1): LEFT JOIN — только matches_diff_whoscored (WS
 --                         event-aggregate не отдаёт остальные HARD_FACT).
---   * Understat diff (6): LEFT JOIN — matches/minutes/goals/assists/
---                         yellow_cards/red_cards.
+--   * Understat diff (9): LEFT JOIN — matches/minutes/goals/assists/
+--                         yellow_cards/red_cards + xG/xA/shots (R4 overlap).
+--                         xg/xa diff = FotMob - Understat (canonical = FotMob).
+--                         shots diff = FBref - Understat (canonical = FBref).
 -- Используются:
 --   1. DQ coverage WARNING (`audit_diff[...]`) — ABS(diff) <= threshold у ≥95% rows.
 --   2. Engineer-debug при «голы не сходятся в дашборде».
@@ -79,13 +81,18 @@ SELECT
     -- ========= WhoScored diff (1; LEFT JOIN → NULL if WS отсутствует) =========
     (CAST(fb.mp                 AS DOUBLE) - CAST(ws.matches_seen       AS DOUBLE)) AS matches_diff_whoscored,
 
-    -- ========= Understat diff (6; LEFT JOIN → NULL if US отсутствует) =========
+    -- ========= Understat diff (9; LEFT JOIN → NULL if US отсутствует) =========
+    -- HARD_FACT diff (6) — fb - us:
     (CAST(fb.mp                 AS DOUBLE) - CAST(us.games_played       AS DOUBLE)) AS matches_diff_understat,
     (CAST(fb.minutes            AS DOUBLE) - CAST(us.minutes_played     AS DOUBLE)) AS minutes_diff_understat,
     (CAST(fb.goals              AS DOUBLE) - CAST(us.goals              AS DOUBLE)) AS goals_diff_understat,
     (CAST(fb.assists            AS DOUBLE) - CAST(us.assists            AS DOUBLE)) AS assists_diff_understat,
     (CAST(fb.yellow_cards       AS DOUBLE) - CAST(us.yellow_cards       AS DOUBLE)) AS yellow_cards_diff_understat,
     (CAST(fb.red_cards          AS DOUBLE) - CAST(us.red_cards          AS DOUBLE)) AS red_cards_diff_understat,
+    -- R4 overlap-метрики (xG/xA: canonical=FotMob → fm-us; shots: canonical=FBref → fb-us):
+    (CAST(fm.expected_goals     AS DOUBLE) - CAST(us.expected_goals    AS DOUBLE)) AS xg_diff_understat,
+    (CAST(fm.expected_assists   AS DOUBLE) - CAST(us.expected_assists  AS DOUBLE)) AS xa_diff_understat,
+    (CAST(fb.shots              AS DOUBLE) - CAST(us.shots             AS DOUBLE)) AS shots_diff_understat,
 
     -- ========= Lineage =========
     CURRENT_TIMESTAMP                                    AS _gold_created_at
