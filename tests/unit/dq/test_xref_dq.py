@@ -509,6 +509,151 @@ def test_orphan_rate_handles_empty_table(duck_conn):
     assert res['breaches'] == []
 
 
+# ===========================================================================
+# Bronze-vs-xref freshness gap (Issue #15 regression guard)
+# ===========================================================================
+
+class _MockCursor:
+    """Replays a scripted sequence of (sql_substring → rows) tuples.
+
+    Matches by the FIRST substring found in the executed SQL — order matters,
+    so the script must list queries in execution order. Tests construct the
+    script per scenario.
+    """
+
+    def __init__(self, script):
+        self._script = list(script)
+        self._last_rows = []
+
+    def execute(self, sql):
+        for needle, rows in self._script:
+            if needle in sql:
+                self._last_rows = rows
+                self._script.remove((needle, rows))
+                return self
+        raise AssertionError(f"Unscripted SQL: {sql[:200]}")
+
+    def fetchone(self):
+        return self._last_rows[0] if self._last_rows else None
+
+    def fetchall(self):
+        return list(self._last_rows)
+
+    def close(self):
+        pass
+
+
+class _MockConn:
+    def __init__(self, script):
+        self._script = script
+
+    def cursor(self):
+        return _MockCursor(self._script)
+
+    def close(self):
+        pass
+
+
+def _patch_freshness_conn(monkeypatch, script):
+    """Bind a scripted _MockConn into xref_dq's freshness evaluator."""
+    monkeypatch.setattr(
+        xref_dq, "_get_conn",
+        lambda *_a, **_kw: _MockConn(script),
+    )
+
+
+def test_bronze_xref_freshness_ok_when_xref_fresher_than_bronze(monkeypatch):
+    """xref_player committed AFTER all Bronze ingests — no lag → OK verdict."""
+    from datetime import datetime, timezone
+
+    xref_ts = datetime(2026, 5, 17, 14, 0, tzinfo=timezone.utc)
+    us_ts = datetime(2026, 5, 17, 9, 0)
+    fm_ts = datetime(2026, 5, 17, 7, 0)
+    _patch_freshness_conn(monkeypatch, [
+        ('xref_player$snapshots', [(xref_ts,)]),
+        ('iceberg.bronze.understat_players', [('2526', us_ts)]),
+        ('iceberg.bronze.fotmob_player_stats', [('2526', fm_ts)]),
+    ])
+
+    res = xref_dq.evaluate_bronze_xref_freshness_gap()
+
+    assert res['verdict'] == 'OK'
+    assert res['breaches'] == []
+    assert len(res['per_partition']) == 2
+    for p in res['per_partition']:
+        assert p['verdict'] == 'OK'
+        assert p['lag_hours'] <= 0
+
+
+def test_bronze_xref_freshness_warning_when_bronze_ahead(monkeypatch):
+    """Issue #15 reproduction: Bronze US 2026-05-17 09:00, xref 2026-05-15 14:54.
+
+    Lag ≈ 42h → above warning_lag_hours=24, below error_lag_hours=72 → WARNING.
+    """
+    from datetime import datetime, timezone
+
+    xref_ts = datetime(2026, 5, 15, 14, 54, tzinfo=timezone.utc)
+    us_ts = datetime(2026, 5, 17, 9, 0)
+    fm_ts = datetime(2026, 5, 17, 7, 0)
+    _patch_freshness_conn(monkeypatch, [
+        ('xref_player$snapshots', [(xref_ts,)]),
+        ('iceberg.bronze.understat_players', [('2526', us_ts)]),
+        ('iceberg.bronze.fotmob_player_stats', [('2526', fm_ts)]),
+    ])
+
+    res = xref_dq.evaluate_bronze_xref_freshness_gap()
+
+    assert res['verdict'] == 'WARNING'
+    assert len(res['breaches']) == 2
+    us = next(p for p in res['per_partition'] if p['source'] == 'understat')
+    assert us['lag_hours'] > 24
+    assert us['lag_hours'] < 72
+    assert us['verdict'] == 'WARNING'
+
+
+def test_bronze_xref_freshness_error_when_lag_exceeds_3_days(monkeypatch):
+    """Worst-case staleness: 5-day-old xref → ERROR escalation."""
+    from datetime import datetime, timezone
+
+    xref_ts = datetime(2026, 5, 10, 0, 0, tzinfo=timezone.utc)
+    us_ts = datetime(2026, 5, 17, 9, 0)
+    _patch_freshness_conn(monkeypatch, [
+        ('xref_player$snapshots', [(xref_ts,)]),
+        ('iceberg.bronze.understat_players', [('2526', us_ts)]),
+        ('iceberg.bronze.fotmob_player_stats', []),
+    ])
+
+    res = xref_dq.evaluate_bronze_xref_freshness_gap()
+
+    assert res['verdict'] == 'ERROR'
+    us = next(p for p in res['per_partition'] if p['source'] == 'understat')
+    assert us['lag_hours'] > 72
+    assert us['verdict'] == 'ERROR'
+
+
+def test_bronze_xref_freshness_handles_empty_xref_snapshots(monkeypatch):
+    """Cold-start: xref never materialised → MAX(committed_at) IS NULL.
+
+    Evaluator must not crash — partitions emit lag_hours=None / verdict=OK
+    (no signal to alert on without a baseline).
+    """
+    from datetime import datetime
+
+    us_ts = datetime(2026, 5, 17, 9, 0)
+    _patch_freshness_conn(monkeypatch, [
+        ('xref_player$snapshots', [(None,)]),
+        ('iceberg.bronze.understat_players', [('2526', us_ts)]),
+        ('iceberg.bronze.fotmob_player_stats', []),
+    ])
+
+    res = xref_dq.evaluate_bronze_xref_freshness_gap()
+
+    assert res['verdict'] == 'OK'
+    assert res['xref_max_committed_at'] is None
+    us = next(p for p in res['per_partition'] if p['source'] == 'understat')
+    assert us['lag_hours'] is None
+
+
 def test_parity_check_team_returns_metrics_shape(duck_conn):
     """Empty Silver + empty Gold → matched=0 silver_only=0 gold_only=0."""
     res = xref_dq.parity_check_xref_team_vs_gold()
