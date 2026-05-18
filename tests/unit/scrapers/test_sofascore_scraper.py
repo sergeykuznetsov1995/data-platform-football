@@ -361,3 +361,58 @@ class TestMatchStatsFlatten:
         assert SofaScoreScraper._flatten_match_stats(
             '1', {'statistics': [{'period': 'ALL'}]}
         ) == []
+
+
+class TestPlayerSeasonStatsFlatten:
+    """Tests for the per-(player, season) flattener (#24)."""
+
+    def test_happy_path(self):
+        from scrapers.sofascore.scraper import SofaScoreScraper
+        payload = {
+            'team': {'id': 1, 'name': 'Team X'},
+            'statistics': {
+                'rating': 7.42,
+                'totalGoals': 12,
+                'totalAssists': 5,
+                'expectedGoals': 10.8,
+                'minutesPlayed': 2800,
+            },
+        }
+        row = SofaScoreScraper._flatten_player_season_stats(
+            '11111', 17, 76986, payload,
+        )
+        assert row is not None
+        assert row['player_id'] == '11111'
+        assert row['unique_tournament_id'] == 17
+        assert row['sofascore_season_id'] == 76986
+        assert row['team_id'] == 1
+        assert row['team_name'] == 'Team X'
+        assert row['rating'] == 7.42
+        assert row['total_goals'] == 12
+        assert row['total_assists'] == 5
+        assert row['expected_goals'] == 10.8
+        assert row['minutes_played'] == 2800
+
+    def test_garbage(self):
+        from scrapers.sofascore.scraper import SofaScoreScraper
+        assert (
+            SofaScoreScraper._flatten_player_season_stats('1', 17, 1, None)
+            is None
+        )
+        row = SofaScoreScraper._flatten_player_season_stats('1', 17, 1, {})
+        assert row is not None
+        assert row['player_id'] == '1'
+
+
+class TestSofaScoreTournamentMap:
+    """Sanity for the league → unique_tournament_id static map (#24)."""
+
+    def test_known_leagues(self):
+        from scrapers.sofascore.scraper import SOFASCORE_TOURNAMENT_MAP
+        # Premier League is the canonical reference (APL probe #19).
+        assert SOFASCORE_TOURNAMENT_MAP['ENG-Premier League'] == 17
+        # Other Big 5 leagues should be present.
+        assert 'ESP-La Liga' in SOFASCORE_TOURNAMENT_MAP
+        assert 'GER-Bundesliga' in SOFASCORE_TOURNAMENT_MAP
+        assert 'ITA-Serie A' in SOFASCORE_TOURNAMENT_MAP
+        assert 'FRA-Ligue 1' in SOFASCORE_TOURNAMENT_MAP
