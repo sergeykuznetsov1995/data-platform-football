@@ -245,7 +245,10 @@ class SofaScoreScraper(SoccerdataScraper):
 
             client, proxy_obj = self._build_tls_session()
             try:
-                resp = client.get(url, timeout=20)
+                # (connect, read) — keep wall-clock per attempt < 15s so a
+                # hung proxy rotates instead of stalling the whole backfill
+                # (issue #30).
+                resp = client.get(url, timeout=(5.0, 8.0))
                 last_status = resp.status_code
                 if resp.status_code == 200:
                     if proxy_obj is not None:
@@ -487,6 +490,7 @@ class SofaScoreScraper(SoccerdataScraper):
                 df=df,
                 table_name='sofascore_schedule',
                 partition_cols=['league', 'season'],
+                replace_partitions=['league', 'season'],
             )
             return {'schedule': table_path}
         return {}
@@ -499,6 +503,7 @@ class SofaScoreScraper(SoccerdataScraper):
                 df=df,
                 table_name='sofascore_league_table',
                 partition_cols=['league', 'season'],
+                replace_partitions=['league', 'season'],
             )
             return {'league_table': table_path}
         return {}

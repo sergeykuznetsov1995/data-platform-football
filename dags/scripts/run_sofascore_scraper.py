@@ -287,6 +287,7 @@ def _run_legacy(
                         df=df,
                         table_name='sofascore_schedule',
                         partition_cols=['league', 'season'],
+                        replace_partitions=['league', 'season'],
                     )
                     results['tables'].append(table_path)
                     results['schedule_rows'] = len(df)
@@ -303,6 +304,7 @@ def _run_legacy(
                         df=df,
                         table_name='sofascore_league_table',
                         partition_cols=['league', 'season'],
+                        replace_partitions=['league', 'season'],
                     )
                     results['tables'].append(table_path)
                     results['league_table_rows'] = len(df)
