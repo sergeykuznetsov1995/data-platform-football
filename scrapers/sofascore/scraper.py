@@ -1503,6 +1503,174 @@ class SofaScoreScraper(SoccerdataScraper):
         )
         return df
 
+    # ------------------------------------------------------------------
+    # #23 player_profile — snapshot (height, foot, dob, nationality, ...)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _flatten_player_profile(payload: dict) -> Optional[Dict]:
+        """Project ``/player/{id}`` payload into a snapshot row.
+
+        SofaScore wraps the relevant data under a top-level ``player``
+        key — we project a fixed set of identity / biographical fields.
+        Unlike the stats-flatteners we don't auto-flatten the rest of
+        the player object: it contains marketing fields (userCount,
+        retiredStatus) we don't need in Bronze.
+        """
+        if not isinstance(payload, dict):
+            return None
+
+        player = payload.get('player')
+        if not isinstance(player, dict):
+            return None
+
+        pid = player.get('id')
+        if pid is None:
+            return None
+
+        dob_ts = player.get('dateOfBirthTimestamp')
+        dob = None
+        if isinstance(dob_ts, (int, float)) and dob_ts > 0:
+            try:
+                dob = datetime.utcfromtimestamp(int(dob_ts)).date().isoformat()
+            except (OverflowError, OSError, ValueError):
+                dob = None
+
+        nationality = player.get('nationality')
+        country = player.get('country') or {}
+        if not nationality and isinstance(country, dict):
+            nationality = country.get('name')
+
+        team = player.get('team') or {}
+
+        return {
+            'player_id': str(int(pid)) if isinstance(pid, (int, float)) else str(pid),
+            'name': player.get('name'),
+            'short_name': player.get('shortName'),
+            'slug': player.get('slug'),
+            'position': player.get('position'),
+            'jersey_number': player.get('jerseyNumber'),
+            'shirt_number': player.get('shirtNumber'),
+            'height_cm': player.get('height'),
+            'preferred_foot': player.get('preferredFoot'),
+            'date_of_birth': dob,
+            'nationality': nationality,
+            'country_code': (country or {}).get('alpha2') if isinstance(country, dict) else None,
+            'current_team_id': team.get('id'),
+            'current_team_name': team.get('name'),
+            'retired': bool(player.get('retired')) if player.get('retired') is not None else None,
+        }
+
+    def _fetch_player_profile_payload(
+        self,
+        player_id: str,
+        max_attempts: int = 3,
+    ) -> Optional[dict]:
+        url = f"{_SOFASCORE_API}{_PLAYER_PROFILE_PATH.format(player_id=player_id)}"
+        return self._fetch_json_endpoint(
+            url=url,
+            max_attempts=max_attempts,
+            label='player_profile',
+            context={'player_id': player_id},
+        )
+
+    def read_player_profile(
+        self,
+        league: str,
+        season: int,
+        player_ids: Optional[List[str]] = None,
+        limit: Optional[int] = None,
+    ) -> pd.DataFrame:
+        """Fetch per-player biographical snapshot from
+        ``/api/v1/player/{id}``.
+
+        Snapshot grain: 1 row per (player_id) per (league, season)
+        partition. Cross-source validation against FotMob T4
+        ``gold.dim_player_attributes`` lives in Silver, not here.
+        """
+        anchor_cols = [
+            'player_id', 'name', 'short_name', 'slug', 'position',
+            'jersey_number', 'shirt_number', 'height_cm', 'preferred_foot',
+            'date_of_birth', 'nationality', 'country_code',
+            'current_team_id', 'current_team_name', 'retired',
+            'league', 'season',
+        ]
+
+        season_str = str(season)
+        if len(season_str) == 4 and season_str.isdigit():
+            season_short = f"{season_str[2:4]}{int(season_str[2:4]) + 1:02d}"
+        else:
+            season_short = season_str
+
+        if player_ids is None:
+            player_ids = self._resolve_player_ids_from_bronze(
+                league, season_short, limit=limit,
+            )
+
+        if not player_ids:
+            logger.warning(
+                "%s: no player_ids resolved for player_profile "
+                "(league=%s season=%s).",
+                R0_2B_FALLBACK_MARKER, league, season_short,
+            )
+            return pd.DataFrame(columns=anchor_cols + ['_ingested_at'])
+
+        if limit:
+            player_ids = list(player_ids)[: int(limit)]
+
+        logger.info(
+            "Fetching SofaScore player_profile for %d players (league=%s season=%s)",
+            len(player_ids), league, season,
+        )
+
+        all_rows: List[Dict] = []
+        consecutive_failures = 0
+        max_consecutive = 100
+
+        for idx, pid in enumerate(player_ids, start=1):
+            payload = self._fetch_player_profile_payload(str(pid))
+            if payload is None:
+                consecutive_failures += 1
+                if consecutive_failures >= max_consecutive:
+                    logger.error(
+                        "%s: %d consecutive player_profile failures.",
+                        R0_2B_FALLBACK_MARKER, consecutive_failures,
+                    )
+                    break
+                continue
+
+            consecutive_failures = 0
+            row = self._flatten_player_profile(payload)
+            if row is not None:
+                all_rows.append(row)
+
+            if idx % 100 == 0:
+                logger.info(
+                    "player_profile progress: %d/%d players",
+                    idx, len(player_ids),
+                )
+
+        if not all_rows:
+            logger.warning(
+                "%s: zero player_profile rows materialised across %d players.",
+                R0_2B_FALLBACK_MARKER, len(player_ids),
+            )
+            return pd.DataFrame(columns=anchor_cols + ['_ingested_at'])
+
+        df = pd.DataFrame(all_rows)
+        df['league'] = league
+        df['season'] = season_short
+        df['_ingested_at'] = datetime.utcnow()
+        df['_source'] = self.SOURCE_NAME
+        df['_entity_type'] = 'player_profile'
+        df['_batch_id'] = self._batch_id
+
+        logger.info(
+            "Materialised %d player_profile rows for %d players",
+            len(df), df['player_id'].nunique(),
+        )
+        return df
+
     def scrape_schedule(self) -> Dict[str, str]:
         """Scrape match schedule."""
         df = self.read_schedule()

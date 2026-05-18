@@ -27,6 +27,9 @@ Supported entities:
                        ``/player/{pid}/unique-tournament/{ut}/season/{s}/
                        statistics/overall`` (#24). Resolves
                        ``(ut_id, season_id)`` once per run.
+- ``player_profile``  : biographical snapshot per player (height, foot,
+                       dob, nationality, current team) via
+                       ``/api/v1/player/{id}`` (#23).
 
 Exit codes:
     0 — scrape completed successfully (>= 1 row written)
@@ -65,6 +68,7 @@ ENTITY_SHOTMAP = 'shotmap'
 ENTITY_EVENT_PLAYER_STATS = 'event_player_stats'
 ENTITY_MATCH_STATS = 'match_stats'
 ENTITY_PLAYER_SEASON_STATS = 'player_season_stats'
+ENTITY_PLAYER_PROFILE = 'player_profile'
 
 VALID_ENTITIES = {
     ENTITY_SCHEDULE,
@@ -74,6 +78,7 @@ VALID_ENTITIES = {
     ENTITY_EVENT_PLAYER_STATS,
     ENTITY_MATCH_STATS,
     ENTITY_PLAYER_SEASON_STATS,
+    ENTITY_PLAYER_PROFILE,
 }
 
 
@@ -586,6 +591,106 @@ def _run_player_season_stats(
     return 0
 
 
+def _run_player_profile(
+    leagues: List[str],
+    season: int,
+    limit: Optional[int],
+    output_path: str,
+) -> int:
+    """#23 — biographical snapshot per player (height, foot, dob,
+    nationality, current team). One HTTP call per player.
+
+    Player ids are pulled from ``bronze.sofascore_player_ratings``;
+    snapshot grain (1 row per player) partitioned by (league, season).
+    """
+    from scrapers.sofascore import SofaScoreScraper
+    from scrapers.sofascore.scraper import R0_2B_FALLBACK_MARKER
+
+    league = leagues[0]
+    season_str = str(season)
+    if len(season_str) == 4 and season_str.isdigit():
+        season_short = f"{season_str[2:4]}{int(season_str[2:4]) + 1:02d}"
+    else:
+        season_short = season_str
+
+    results = {
+        'entity': ENTITY_PLAYER_PROFILE,
+        'tables': [],
+        'rows': 0,
+        'players_with_rows': 0,
+        'fallback': False,
+        'fallback_reason': None,
+        'errors': [],
+    }
+
+    proxy_file = os.environ.get('PROXY_FILE', '/opt/airflow/proxys.txt')
+    if not os.path.exists(proxy_file):
+        proxy_file = None
+
+    try:
+        with SofaScoreScraper(
+            leagues=[league],
+            seasons=[season],
+            proxy_file=proxy_file,
+        ) as scraper:
+            df = scraper.read_player_profile(
+                league=league,
+                season=int(season),
+                limit=limit,
+            )
+
+            if df is None or df.empty:
+                last_err = getattr(scraper, '_last_endpoint_error', None)
+                reason = 'empty_payload'
+                if last_err:
+                    status = last_err.get('status')
+                    if status == 403:
+                        reason = 'http_403'
+                    elif status == 429:
+                        reason = 'http_429'
+                    elif status is None:
+                        reason = 'transport_error'
+                    else:
+                        reason = f'http_{status}'
+
+                logger.error(
+                    "%s: player_profile unavailable — reason=%s",
+                    R0_2B_FALLBACK_MARKER, reason,
+                )
+                results['fallback'] = True
+                results['fallback_reason'] = reason
+                results['errors'].append(
+                    f'{R0_2B_FALLBACK_MARKER}: {reason}'
+                )
+                _write_results(output_path, results)
+                return 2
+
+            table_path = scraper.save_to_iceberg(
+                df=df,
+                table_name='sofascore_player_profile',
+                partition_cols=['league', 'season'],
+                replace_partitions=['league', 'season'],
+            )
+            results['tables'].append(table_path)
+            results['rows'] = int(len(df))
+            results['players_with_rows'] = int(df['player_id'].nunique())
+            logger.info(
+                "Saved %d player_profile rows for %d players -> %s",
+                results['rows'], results['players_with_rows'], table_path,
+            )
+
+    except Exception as e:
+        logger.error(
+            "player_profile scrape failed hard: %s", e, exc_info=True,
+        )
+        results['errors'].append(str(e))
+        _write_results(output_path, results)
+        return 1
+
+    _write_results(output_path, results)
+    return 0
+
+
 def _write_results(path: str, payload: dict) -> None:
     """Persist runner results to disk for Airflow XCom pickup."""
     try:
@@ -758,6 +863,14 @@ def main():
 
     if entity == ENTITY_PLAYER_SEASON_STATS:
         return _run_player_season_stats(
+            leagues=leagues,
+            season=args.season,
+            limit=args.limit,
+            output_path=args.output,
+        )
+
+    if entity == ENTITY_PLAYER_PROFILE:
+        return _run_player_profile(
             leagues=leagues,
             season=args.season,
             limit=args.limit,

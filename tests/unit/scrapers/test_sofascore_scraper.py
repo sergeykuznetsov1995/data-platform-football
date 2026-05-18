@@ -416,3 +416,73 @@ class TestSofaScoreTournamentMap:
         assert 'GER-Bundesliga' in SOFASCORE_TOURNAMENT_MAP
         assert 'ITA-Serie A' in SOFASCORE_TOURNAMENT_MAP
         assert 'FRA-Ligue 1' in SOFASCORE_TOURNAMENT_MAP
+
+
+class TestPlayerProfileFlatten:
+    """Tests for the per-player biographical snapshot flattener (#23)."""
+
+    def test_happy_path(self):
+        from scrapers.sofascore.scraper import SofaScoreScraper
+        # dateOfBirthTimestamp = 1990-01-01 00:00 UTC = 631152000
+        payload = {
+            'player': {
+                'id': 11111,
+                'name': 'John Doe',
+                'shortName': 'J. Doe',
+                'slug': 'john-doe',
+                'position': 'F',
+                'jerseyNumber': '9',
+                'shirtNumber': 9,
+                'height': 182,
+                'preferredFoot': 'Right',
+                'dateOfBirthTimestamp': 631152000,
+                'nationality': 'England',
+                'country': {'name': 'England', 'alpha2': 'EN'},
+                'team': {'id': 1, 'name': 'Team X'},
+                'retired': False,
+            }
+        }
+        row = SofaScoreScraper._flatten_player_profile(payload)
+        assert row is not None
+        assert row['player_id'] == '11111'
+        assert row['name'] == 'John Doe'
+        assert row['short_name'] == 'J. Doe'
+        assert row['slug'] == 'john-doe'
+        assert row['position'] == 'F'
+        assert row['shirt_number'] == 9
+        assert row['height_cm'] == 182
+        assert row['preferred_foot'] == 'Right'
+        assert row['date_of_birth'] == '1990-01-01'
+        assert row['nationality'] == 'England'
+        assert row['country_code'] == 'EN'
+        assert row['current_team_id'] == 1
+        assert row['current_team_name'] == 'Team X'
+        assert row['retired'] is False
+
+    def test_garbage(self):
+        from scrapers.sofascore.scraper import SofaScoreScraper
+        assert SofaScoreScraper._flatten_player_profile(None) is None
+        assert SofaScoreScraper._flatten_player_profile({}) is None
+        # No player.id → None
+        assert SofaScoreScraper._flatten_player_profile({'player': {'name': 'X'}}) is None
+
+    def test_dob_fallback_when_timestamp_invalid(self):
+        from scrapers.sofascore.scraper import SofaScoreScraper
+        payload = {
+            'player': {'id': 1, 'dateOfBirthTimestamp': None},
+        }
+        row = SofaScoreScraper._flatten_player_profile(payload)
+        assert row is not None
+        assert row['date_of_birth'] is None
+
+    def test_country_fallback_for_nationality(self):
+        from scrapers.sofascore.scraper import SofaScoreScraper
+        payload = {
+            'player': {
+                'id': 1,
+                'country': {'name': 'Brazil', 'alpha2': 'BR'},
+            }
+        }
+        row = SofaScoreScraper._flatten_player_profile(payload)
+        assert row['nationality'] == 'Brazil'
+        assert row['country_code'] == 'BR'

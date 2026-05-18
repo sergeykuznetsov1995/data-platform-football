@@ -34,6 +34,7 @@ SHOTMAP_RESULT_PATH = '/tmp/sofascore_shotmap_result.json'
 EVENT_PLAYER_STATS_RESULT_PATH = '/tmp/sofascore_event_player_stats_result.json'
 MATCH_STATS_RESULT_PATH = '/tmp/sofascore_match_stats_result.json'
 PLAYER_SEASON_STATS_RESULT_PATH = '/tmp/sofascore_player_season_stats_result.json'
+PLAYER_PROFILE_RESULT_PATH = '/tmp/sofascore_player_profile_result.json'
 
 # Smoke caps used by the daily DAG to keep the first runs of new event-grain
 # entities bounded. Full season backfill (no cap) is a separate, manually
@@ -48,6 +49,8 @@ MATCH_STATS_DAILY_LIMIT = 50
 # player_season_stats is per-player (1 HTTP call/player) — 50 players smoke.
 # Full season ≈ 700 players ≈ 35 min at 20 req/min.
 PLAYER_SEASON_STATS_DAILY_LIMIT = 50
+# player_profile is per-player (1 HTTP call/player) — snapshot grain.
+PLAYER_PROFILE_DAILY_LIMIT = 50
 
 
 def _load_result(path: str, logger) -> Dict[str, Any]:
@@ -80,6 +83,7 @@ def validate_data(**context) -> Dict[str, Any]:
     eps_result = _load_result(EVENT_PLAYER_STATS_RESULT_PATH, logger)
     match_stats_result = _load_result(MATCH_STATS_RESULT_PATH, logger)
     pss_result = _load_result(PLAYER_SEASON_STATS_RESULT_PATH, logger)
+    pp_result = _load_result(PLAYER_PROFILE_RESULT_PATH, logger)
 
     if not schedule_result:
         raise AirflowException(
@@ -107,6 +111,9 @@ def validate_data(**context) -> Dict[str, Any]:
             'player_season_stats_rows': pss_result.get('rows', 0),
             'player_season_stats_players': pss_result.get('players_with_rows', 0),
             'player_season_stats_fallback': pss_result.get('fallback', False),
+            'player_profile_rows': pp_result.get('rows', 0),
+            'player_profile_players': pp_result.get('players_with_rows', 0),
+            'player_profile_fallback': pp_result.get('fallback', False),
             'tables': (
                 schedule_result.get('tables', [])
                 + ratings_result.get('tables', [])
@@ -114,6 +121,7 @@ def validate_data(**context) -> Dict[str, Any]:
                 + eps_result.get('tables', [])
                 + match_stats_result.get('tables', [])
                 + pss_result.get('tables', [])
+                + pp_result.get('tables', [])
             ),
         }
     }
@@ -125,6 +133,7 @@ def validate_data(**context) -> Dict[str, Any]:
     errors.extend(eps_result.get('errors', []) or [])
     errors.extend(match_stats_result.get('errors', []) or [])
     errors.extend(pss_result.get('errors', []) or [])
+    errors.extend(pp_result.get('errors', []) or [])
     if errors:
         validation['warnings'] = errors
         total_rows = sum([
@@ -135,6 +144,7 @@ def validate_data(**context) -> Dict[str, Any]:
             validation['summary']['event_player_stats_rows'],
             validation['summary']['match_stats_rows'],
             validation['summary']['player_season_stats_rows'],
+            validation['summary']['player_profile_rows'],
         ])
         validation['status'] = 'partial_success' if total_rows > 0 else 'failed'
 
@@ -227,6 +237,22 @@ def validate_data(**context) -> Dict[str, Any]:
             validation['warnings'].append(
                 f"Low player_season_stats row count: "
                 f"{validation['summary']['player_season_stats_rows']} < 20"
+            )
+
+    # player_profile: 1 row per player. Smoke cap = 50.
+    if validation['summary']['player_profile_rows'] < 20:
+        if validation['summary']['player_profile_fallback']:
+            validation['warnings'].append(
+                f"player_profile R0.2B_FALLBACK: rows="
+                f"{validation['summary']['player_profile_rows']} players="
+                f"{validation['summary']['player_profile_players']}"
+            )
+            if validation['status'] == 'success':
+                validation['status'] = 'partial_success'
+        else:
+            validation['warnings'].append(
+                f"Low player_profile row count: "
+                f"{validation['summary']['player_profile_rows']} < 20"
             )
 
     logger.info(f"Data validation complete: {validation['status']}")
@@ -402,6 +428,31 @@ exit $rc
         },
     )
 
+    # #23 — biographical snapshot per player. Cheap, runs after ratings.
+    scrape_player_profile_task = BashOperator(
+        task_id='scrape_player_profile',
+        bash_command=f"""
+cd /opt/airflow && \\
+python dags/scripts/run_sofascore_scraper.py \\
+    --entity player_profile \\
+    --league "{LEAGUES[0]}" \\
+    --season {CURRENT_SEASON} \\
+    --limit {PLAYER_PROFILE_DAILY_LIMIT} \\
+    --output {PLAYER_PROFILE_RESULT_PATH}
+rc=$?
+if [ $rc -eq 2 ]; then
+    echo "R0.2B_FALLBACK exit-code 2 (player_profile) — propagating as soft success."
+    exit 0
+fi
+exit $rc
+""",
+        env={
+            'PYTHONPATH': '/opt/airflow:/opt/airflow/dags',
+            'PATH': '/usr/local/bin:/usr/bin:/bin:/home/airflow/.local/bin',
+            'HOME': '/home/airflow',
+        },
+    )
+
     # #21 — per-(match, player) Opta stats. Depends on fresh
     # bronze.sofascore_player_ratings (provides the player_id list per match).
     scrape_event_player_stats_task = BashOperator(
@@ -435,19 +486,21 @@ exit $rc
     )
 
     # schedule writes match_ids → ratings (depends on schedule),
-    # then [shotmap, match_stats] run in parallel (both only need schedule),
-    # then [event_player_stats, player_season_stats] (both need ratings for
-    # player_id list),
+    # then [shotmap, match_stats] in parallel (both need only schedule),
+    # then [event_player_stats, player_season_stats, player_profile]
+    # in parallel (all three need ratings for player_id list),
     # then validate_data on all_done.
     scrape_data_task >> scrape_player_ratings_task
     scrape_data_task >> scrape_shotmap_task
     scrape_data_task >> scrape_match_stats_task
     scrape_player_ratings_task >> scrape_event_player_stats_task
     scrape_player_ratings_task >> scrape_player_season_stats_task
+    scrape_player_ratings_task >> scrape_player_profile_task
     [
         scrape_player_ratings_task,
         scrape_shotmap_task,
         scrape_match_stats_task,
         scrape_event_player_stats_task,
         scrape_player_season_stats_task,
+        scrape_player_profile_task,
     ] >> validate_data_task
