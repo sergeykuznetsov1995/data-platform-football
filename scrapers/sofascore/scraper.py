@@ -8,13 +8,65 @@ Source: https://www.sofascore.com
 """
 
 import logging
+import re
 import time
 from datetime import datetime
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 
 from scrapers.base.base_scraper import SoccerdataScraper
+
+
+# camelCase -> snake_case for Bronze column names.
+_CAMEL_RE_1 = re.compile(r'([A-Z]+)([A-Z][a-z])')
+_CAMEL_RE_2 = re.compile(r'([a-z\d])([A-Z])')
+
+
+def _camel_to_snake(name: str) -> str:
+    """Convert a camelCase / PascalCase key to snake_case.
+
+    Examples:
+        ``goalsPrevented`` -> ``goals_prevented``
+        ``XGOnTarget``     -> ``xg_on_target``
+        ``totalAttemptAssist`` -> ``total_attempt_assist``
+    """
+    s1 = _CAMEL_RE_1.sub(r'\1_\2', name)
+    return _CAMEL_RE_2.sub(r'\1_\2', s1).lower()
+
+
+def _coerce_scalar(v):
+    """Coerce a JSON value to a Bronze-safe scalar.
+
+    SofaScore stats often nest a structure like
+    ``{"value": 3, "previousValue": 2, ...}`` for richer UI rendering.
+    For Bronze we only keep the canonical ``value``; richer payloads
+    can be re-derived from raw JSON if ever needed.
+    """
+    if isinstance(v, dict):
+        # Most common SofaScore shape: {"key": "...", "value": ...}.
+        if 'value' in v:
+            return _coerce_scalar(v['value'])
+        return None
+    if isinstance(v, (list, tuple)):
+        return None
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)):
+        return v
+    if v is None:
+        return None
+    # String — try numeric upcast (SofaScore returns e.g. "12.4" for some
+    # rating sub-stats). Fall back to the raw string.
+    s = str(v).strip()
+    if not s:
+        return None
+    try:
+        if '.' in s:
+            return float(s)
+        return int(s)
+    except (TypeError, ValueError):
+        return s
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +75,7 @@ logger = logging.getLogger(__name__)
 _SOFASCORE_API = "https://api.sofascore.com/api/v1"
 _LINEUPS_PATH = "/event/{event_id}/lineups"
 _SHOTMAP_PATH = "/event/{event_id}/shotmap"
+_EVENT_PLAYER_STATS_PATH = "/event/{event_id}/player/{player_id}/statistics"
 
 # R0.2b — graceful-fallback marker emitted when the lineups endpoint
 # is structurally unavailable (HTTP 403 / quota empty / repeated timeouts).
@@ -723,6 +776,258 @@ class SofaScoreScraper(SoccerdataScraper):
 
         logger.info(
             "Materialised %d shot rows across %d unique matches",
+            len(df), df['match_id'].nunique(),
+        )
+        return df
+
+    # ------------------------------------------------------------------
+    # #21 event_player_stats — per-match per-player Opta-rich metrics
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _flatten_event_player_stats(
+        match_id: str,
+        player_id: str,
+        payload: dict,
+    ) -> Optional[Dict]:
+        """Project the per-(match, player) ``statistics`` block into a
+        single flat row.
+
+        Schema per row: ``match_id, player_id, team_id, is_home,
+        position, position_specific, captain, substitute, <40+ snake_case
+        Opta metrics>``. Unknown SofaScore keys auto-flatten through
+        :func:`_camel_to_snake`. We tag the entity_type / source / batch
+        downstream of this helper.
+        """
+        if not isinstance(payload, dict):
+            return None
+
+        player = payload.get('player') or {}
+        team = payload.get('team') or {}
+        stats = payload.get('statistics') or {}
+        extra = payload.get('extra') or {}
+
+        row: Dict = {
+            'match_id': str(match_id),
+            'player_id': str(player_id),
+            'team_id': team.get('id'),
+            'team_name': team.get('name'),
+            'is_home': bool(extra.get('isHome')) if extra.get('isHome') is not None else None,
+            'position': payload.get('position') or player.get('position') or None,
+            'position_specific': stats.get('position') or None,
+            'captain': bool(extra.get('captain')) if extra.get('captain') is not None else None,
+            'substitute': bool(extra.get('substitute')) if extra.get('substitute') is not None else None,
+        }
+
+        # Auto-flatten every numeric/scalar statistic. Drop the redundant
+        # `position` re-export (already projected above) and the rating
+        # alias we surface explicitly below.
+        for raw_key, raw_val in stats.items():
+            if raw_key == 'position':
+                continue
+            snake = _camel_to_snake(str(raw_key))
+            if snake in row:
+                # Don't overwrite anchor columns (player_id, team_id, ...).
+                continue
+            row[snake] = _coerce_scalar(raw_val)
+
+        # Convenience aliases — rating is the most-queried metric.
+        if 'rating' not in row and stats.get('rating') is not None:
+            try:
+                row['rating'] = float(stats['rating'])
+            except (TypeError, ValueError):
+                row['rating'] = None
+
+        return row
+
+    def _fetch_event_player_stats_payload(
+        self,
+        event_id: str,
+        player_id: str,
+        max_attempts: int = 3,
+    ) -> Optional[dict]:
+        url = f"{_SOFASCORE_API}{_EVENT_PLAYER_STATS_PATH.format(event_id=event_id, player_id=player_id)}"
+        return self._fetch_json_endpoint(
+            url=url,
+            max_attempts=max_attempts,
+            label='event_player_stats',
+            context={'event_id': event_id, 'player_id': player_id},
+        )
+
+    def _resolve_match_players_from_bronze(
+        self,
+        league: str,
+        season_short: str,
+    ) -> Dict[str, List[str]]:
+        """Group player_ids by match_id from bronze.sofascore_player_ratings.
+
+        Returns ``{match_id: [player_id, ...]}``. Empty dict if Trino
+        unavailable or the ratings partition is missing — caller emits
+        the R0.2B_FALLBACK marker.
+        """
+        try:
+            import os
+            import trino
+            import trino.auth as trino_auth
+        except ImportError as e:  # pragma: no cover - import guard
+            logger.error("trino client unavailable: %s", e)
+            return {}
+
+        user = os.environ.get('TRINO_USER', 'airflow')
+        password = os.environ.get('TRINO_PASSWORD')
+
+        try:
+            if password:
+                conn = trino.dbapi.connect(
+                    host=os.environ.get('TRINO_HOST', 'trino'),
+                    port=int(os.environ.get('TRINO_PORT', 8443)),
+                    user=user,
+                    catalog='iceberg',
+                    http_scheme='https',
+                    auth=trino_auth.BasicAuthentication(user, password),
+                    verify=False,
+                )
+            else:
+                conn = trino.dbapi.connect(
+                    host=os.environ.get('TRINO_HOST', 'trino'),
+                    port=int(os.environ.get('TRINO_PORT', 8080)),
+                    user=user,
+                    catalog='iceberg',
+                )
+
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT match_id, player_id "
+                "FROM iceberg.bronze.sofascore_player_ratings "
+                "WHERE league = ? AND CAST(season AS varchar) = ?",
+                (league, season_short),
+            )
+            rows = cur.fetchall()
+        except Exception as e:
+            logger.warning(
+                "Could not resolve (match, player) pairs from bronze: %s", e,
+            )
+            return {}
+
+        grouped: Dict[str, List[str]] = {}
+        for mid, pid in rows:
+            if mid is None or pid is None:
+                continue
+            grouped.setdefault(str(mid), []).append(str(pid))
+        return grouped
+
+    def read_event_player_stats(
+        self,
+        league: str,
+        season: int,
+        match_ids: Optional[List[str]] = None,
+        player_ids_by_match: Optional[Dict[str, List[str]]] = None,
+        limit: Optional[int] = None,
+    ) -> pd.DataFrame:
+        """Fetch per-(match, player) Opta-rich stats from
+        ``/api/v1/event/{id}/player/{pid}/statistics``.
+
+        Player ids are resolved from ``bronze.sofascore_player_ratings``
+        (players who actually entered the pitch) unless explicitly
+        provided — calling SofaScore with random pids returns 404 and
+        wastes the proxy budget.
+        """
+        anchor_cols = [
+            'match_id', 'player_id', 'team_id', 'team_name', 'is_home',
+            'position', 'position_specific', 'captain', 'substitute',
+            'league', 'season',
+        ]
+
+        season_str = str(season)
+        if len(season_str) == 4 and season_str.isdigit():
+            season_short = f"{season_str[2:4]}{int(season_str[2:4]) + 1:02d}"
+        else:
+            season_short = season_str
+
+        if player_ids_by_match is None:
+            player_ids_by_match = self._resolve_match_players_from_bronze(
+                league, season_short,
+            )
+
+        if not player_ids_by_match:
+            logger.warning(
+                "No (match, player) pairs in bronze.sofascore_player_ratings "
+                "for league=%s season=%s — event_player_stats skipped.",
+                league, season_short,
+            )
+            return pd.DataFrame(columns=anchor_cols + ['_ingested_at'])
+
+        if match_ids is not None:
+            wanted = {str(m) for m in match_ids}
+            player_ids_by_match = {
+                m: p for m, p in player_ids_by_match.items() if m in wanted
+            }
+
+        if limit:
+            # Cap by *match count* (not request count) so smoke runs stay
+            # predictable. A single match ≈ 25 played players ≈ 25 HTTP
+            # calls; rate-limited to 20 req/min → ~1.25 min/match.
+            wanted = list(player_ids_by_match.keys())[: int(limit)]
+            player_ids_by_match = {m: player_ids_by_match[m] for m in wanted}
+
+        total_calls = sum(len(p) for p in player_ids_by_match.values())
+        logger.info(
+            "Fetching SofaScore event_player_stats: %d matches, %d "
+            "(match, player) calls (league=%s season=%s)",
+            len(player_ids_by_match), total_calls, league, season,
+        )
+
+        all_rows: List[Dict] = []
+        consecutive_failures = 0
+        max_consecutive = 200
+
+        call_idx = 0
+        for mid, pids in player_ids_by_match.items():
+            for pid in pids:
+                call_idx += 1
+                payload = self._fetch_event_player_stats_payload(str(mid), str(pid))
+                if payload is None:
+                    consecutive_failures += 1
+                    if consecutive_failures >= max_consecutive:
+                        logger.error(
+                            "%s: %d consecutive event_player_stats failures — "
+                            "aborting early.",
+                            R0_2B_FALLBACK_MARKER, consecutive_failures,
+                        )
+                        break
+                    continue
+
+                consecutive_failures = 0
+                row = self._flatten_event_player_stats(str(mid), str(pid), payload)
+                if row is not None:
+                    all_rows.append(row)
+
+                if call_idx % 100 == 0:
+                    logger.info(
+                        "event_player_stats progress: %d/%d calls",
+                        call_idx, total_calls,
+                    )
+            else:
+                continue
+            break  # propagate inner break on circuit-breaker trip
+
+        if not all_rows:
+            logger.warning(
+                "%s: zero event_player_stats rows materialised (calls=%d).",
+                R0_2B_FALLBACK_MARKER, total_calls,
+            )
+            return pd.DataFrame(columns=anchor_cols + ['_ingested_at'])
+
+        df = pd.DataFrame(all_rows)
+        df['league'] = league
+        df['season'] = season_short
+        df['_ingested_at'] = datetime.utcnow()
+        df['_source'] = self.SOURCE_NAME
+        df['_entity_type'] = 'event_player_stats'
+        df['_batch_id'] = self._batch_id
+
+        logger.info(
+            "Materialised %d event_player_stats rows across %d unique matches",
             len(df), df['match_id'].nunique(),
         )
         return df

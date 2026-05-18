@@ -31,11 +31,15 @@ from utils.default_args import DEFAULT_ARGS
 SCHEDULE_RESULT_PATH = '/tmp/sofascore_result.json'
 PLAYER_RATINGS_RESULT_PATH = '/tmp/sofascore_player_ratings_result.json'
 SHOTMAP_RESULT_PATH = '/tmp/sofascore_shotmap_result.json'
+EVENT_PLAYER_STATS_RESULT_PATH = '/tmp/sofascore_event_player_stats_result.json'
 
 # Smoke caps used by the daily DAG to keep the first runs of new event-grain
 # entities bounded. Full season backfill (no cap) is a separate, manually
 # triggered run — see `memory/project_sofascore_bronze_cherry_pick_*.md`.
 SHOTMAP_DAILY_LIMIT = 50
+# event_player_stats is per-(match, player): a match averages ~25 players,
+# so 10 matches ≈ 250 HTTP calls, ~12.5 min at 20 req/min.
+EVENT_PLAYER_STATS_DAILY_LIMIT = 10
 
 
 def _load_result(path: str, logger) -> Dict[str, Any]:
@@ -65,6 +69,7 @@ def validate_data(**context) -> Dict[str, Any]:
     schedule_result = _load_result(SCHEDULE_RESULT_PATH, logger)
     ratings_result = _load_result(PLAYER_RATINGS_RESULT_PATH, logger)
     shotmap_result = _load_result(SHOTMAP_RESULT_PATH, logger)
+    eps_result = _load_result(EVENT_PLAYER_STATS_RESULT_PATH, logger)
 
     if not schedule_result:
         raise AirflowException(
@@ -83,10 +88,14 @@ def validate_data(**context) -> Dict[str, Any]:
             'shotmap_rows': shotmap_result.get('rows', 0),
             'shotmap_matches': shotmap_result.get('matches_with_rows', 0),
             'shotmap_fallback': shotmap_result.get('fallback', False),
+            'event_player_stats_rows': eps_result.get('rows', 0),
+            'event_player_stats_matches': eps_result.get('matches_with_rows', 0),
+            'event_player_stats_fallback': eps_result.get('fallback', False),
             'tables': (
                 schedule_result.get('tables', [])
                 + ratings_result.get('tables', [])
                 + shotmap_result.get('tables', [])
+                + eps_result.get('tables', [])
             ),
         }
     }
@@ -95,6 +104,7 @@ def validate_data(**context) -> Dict[str, Any]:
     errors.extend(schedule_result.get('errors', []) or [])
     errors.extend(ratings_result.get('errors', []) or [])
     errors.extend(shotmap_result.get('errors', []) or [])
+    errors.extend(eps_result.get('errors', []) or [])
     if errors:
         validation['warnings'] = errors
         total_rows = sum([
@@ -102,6 +112,7 @@ def validate_data(**context) -> Dict[str, Any]:
             validation['summary']['league_table_rows'],
             validation['summary']['player_ratings_rows'],
             validation['summary']['shotmap_rows'],
+            validation['summary']['event_player_stats_rows'],
         ])
         validation['status'] = 'partial_success' if total_rows > 0 else 'failed'
 
@@ -146,6 +157,22 @@ def validate_data(**context) -> Dict[str, Any]:
             validation['warnings'].append(
                 f"Low shotmap row count: "
                 f"{validation['summary']['shotmap_rows']} < 50"
+            )
+
+    # event_player_stats: 10 matches × ~25 played players ≈ 250 rows.
+    if validation['summary']['event_player_stats_rows'] < 50:
+        if validation['summary']['event_player_stats_fallback']:
+            validation['warnings'].append(
+                f"event_player_stats R0.2B_FALLBACK: rows="
+                f"{validation['summary']['event_player_stats_rows']} matches="
+                f"{validation['summary']['event_player_stats_matches']}"
+            )
+            if validation['status'] == 'success':
+                validation['status'] = 'partial_success'
+        else:
+            validation['warnings'].append(
+                f"Low event_player_stats row count: "
+                f"{validation['summary']['event_player_stats_rows']} < 50"
             )
 
     logger.info(f"Data validation complete: {validation['status']}")
@@ -268,10 +295,42 @@ exit $rc
         },
     )
 
+    # #21 — per-(match, player) Opta stats. Depends on fresh
+    # bronze.sofascore_player_ratings (provides the player_id list per match).
+    scrape_event_player_stats_task = BashOperator(
+        task_id='scrape_event_player_stats',
+        bash_command=f"""
+cd /opt/airflow && \\
+python dags/scripts/run_sofascore_scraper.py \\
+    --entity event_player_stats \\
+    --league "{LEAGUES[0]}" \\
+    --season {CURRENT_SEASON} \\
+    --limit {EVENT_PLAYER_STATS_DAILY_LIMIT} \\
+    --output {EVENT_PLAYER_STATS_RESULT_PATH}
+rc=$?
+if [ $rc -eq 2 ]; then
+    echo "R0.2B_FALLBACK exit-code 2 (event_player_stats) — propagating as soft success."
+    exit 0
+fi
+exit $rc
+""",
+        env={
+            'PYTHONPATH': '/opt/airflow:/opt/airflow/dags',
+            'PATH': '/usr/local/bin:/usr/bin:/bin:/home/airflow/.local/bin',
+            'HOME': '/home/airflow',
+        },
+    )
+
     validate_data_task = PythonOperator(
         task_id='validate_data',
         python_callable=validate_data,
         trigger_rule='all_done',
     )
 
-    scrape_data_task >> scrape_player_ratings_task >> scrape_shotmap_task >> validate_data_task
+    (
+        scrape_data_task
+        >> scrape_player_ratings_task
+        >> scrape_shotmap_task
+        >> scrape_event_player_stats_task
+        >> validate_data_task
+    )

@@ -163,3 +163,87 @@ class TestShotmapFlatten:
                 'xgot': None,
             }
         ]
+
+
+class TestCamelToSnake:
+    """Sanity tests for the snake_case normalizer used by #21/#23/#24."""
+
+    def test_basic(self):
+        from scrapers.sofascore.scraper import _camel_to_snake
+        assert _camel_to_snake('goalsPrevented') == 'goals_prevented'
+        assert _camel_to_snake('accuratePass') == 'accurate_pass'
+        assert _camel_to_snake('expectedAssists') == 'expected_assists'
+
+    def test_consecutive_capitals(self):
+        from scrapers.sofascore.scraper import _camel_to_snake
+        # XGOnTarget keeps the leading abbreviation intact, splits at the
+        # first lowercase boundary.
+        assert _camel_to_snake('XGOnTarget') == 'xg_on_target'
+
+    def test_already_snake(self):
+        from scrapers.sofascore.scraper import _camel_to_snake
+        assert _camel_to_snake('already_snake') == 'already_snake'
+
+
+class TestEventPlayerStatsFlatten:
+    """Tests for the per-(match, player) Opta stats flattener (#21)."""
+
+    def _payload(self):
+        return {
+            'player': {'id': 11111, 'name': 'Player A'},
+            'team': {'id': 1, 'name': 'Team X'},
+            'position': 'F',
+            'extra': {
+                'isHome': True,
+                'captain': True,
+                'substitute': False,
+            },
+            'statistics': {
+                'rating': '7.8',
+                'goalsPrevented': 0.42,
+                'accuratePass': 35,
+                'totalPass': 40,
+                'expectedAssists': {'value': 0.21, 'previousValue': 0.10},
+                # Pure dict without 'value' → None
+                'noisyStruct': {'foo': 'bar'},
+                'position': 'CF',  # Should be skipped (re-export)
+            },
+        }
+
+    def test_flatten_happy_path(self):
+        from scrapers.sofascore.scraper import SofaScoreScraper
+
+        row = SofaScoreScraper._flatten_event_player_stats(
+            '14023925', '11111', self._payload(),
+        )
+        assert row is not None
+        assert row['match_id'] == '14023925'
+        assert row['player_id'] == '11111'
+        assert row['team_id'] == 1
+        assert row['team_name'] == 'Team X'
+        assert row['is_home'] is True
+        assert row['captain'] is True
+        assert row['substitute'] is False
+        assert row['position'] == 'F'
+
+        # snake_case auto-flatten
+        assert row['rating'] == 7.8
+        assert row['goals_prevented'] == 0.42
+        assert row['accurate_pass'] == 35
+        assert row['total_pass'] == 40
+        # struct with `value` → unwrapped
+        assert row['expected_assists'] == 0.21
+        # struct without `value` → None
+        assert row['noisy_struct'] is None
+        # The 'position' key inside statistics is the re-export and must
+        # not clobber the anchor column.
+        assert row['position'] == 'F'
+
+    def test_garbage_payload(self):
+        from scrapers.sofascore.scraper import SofaScoreScraper
+        assert SofaScoreScraper._flatten_event_player_stats('1', '1', None) is None
+        # Empty payload still produces an anchor-only row (no stats).
+        row = SofaScoreScraper._flatten_event_player_stats('1', '1', {})
+        assert row is not None
+        assert row['match_id'] == '1'
+        assert row['player_id'] == '1'

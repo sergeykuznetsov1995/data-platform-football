@@ -16,6 +16,11 @@ Supported entities:
                        so each run refreshes the partition wholesale.
 - ``shotmap``         : per-shot coords + xG + situation via
                        ``/api/v1/event/{id}/shotmap`` (issue #22).
+- ``event_player_stats``: per-(match, player) Opta-rich stats via
+                       ``/api/v1/event/{id}/player/{pid}/statistics`` (#21).
+                       Player ids are resolved from
+                       ``bronze.sofascore_player_ratings`` — that table
+                       must be fresh before this entity runs.
 
 Exit codes:
     0 — scrape completed successfully (>= 1 row written)
@@ -51,12 +56,14 @@ ENTITY_SCHEDULE = 'schedule'
 ENTITY_LEAGUE_TABLE = 'league_table'
 ENTITY_PLAYER_RATINGS = 'player_ratings'
 ENTITY_SHOTMAP = 'shotmap'
+ENTITY_EVENT_PLAYER_STATS = 'event_player_stats'
 
 VALID_ENTITIES = {
     ENTITY_SCHEDULE,
     ENTITY_LEAGUE_TABLE,
     ENTITY_PLAYER_RATINGS,
     ENTITY_SHOTMAP,
+    ENTITY_EVENT_PLAYER_STATS,
 }
 
 
@@ -418,6 +425,33 @@ def _run_shotmap(
     )
 
 
+def _run_event_player_stats(
+    leagues: List[str],
+    season: int,
+    limit: Optional[int],
+    output_path: str,
+) -> int:
+    """#21 — per-(match, player) Opta-rich stats. Reads
+    ``(match_id, player_id)`` pairs from
+    ``bronze.sofascore_player_ratings`` and writes to
+    ``iceberg.bronze.sofascore_event_player_stats``.
+
+    Note: ``limit`` is interpreted as *match count*, not request count.
+    Each match averages ~25 played players; at 20 req/min that's
+    roughly 75 seconds per match.
+    """
+    return _run_event_endpoint(
+        entity=ENTITY_EVENT_PLAYER_STATS,
+        table_name='sofascore_event_player_stats',
+        scraper_method='read_event_player_stats',
+        pk_col='match_id',
+        leagues=leagues,
+        season=season,
+        limit=limit,
+        output_path=output_path,
+    )
+
+
 def _write_results(path: str, payload: dict) -> None:
     """Persist runner results to disk for Airflow XCom pickup."""
     try:
@@ -566,6 +600,14 @@ def main():
 
     if entity == ENTITY_SHOTMAP:
         return _run_shotmap(
+            leagues=leagues,
+            season=args.season,
+            limit=args.limit,
+            output_path=args.output,
+        )
+
+    if entity == ENTITY_EVENT_PLAYER_STATS:
+        return _run_event_player_stats(
             leagues=leagues,
             season=args.season,
             limit=args.limit,
