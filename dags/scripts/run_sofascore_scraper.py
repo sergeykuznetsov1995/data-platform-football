@@ -21,6 +21,8 @@ Supported entities:
                        Player ids are resolved from
                        ``bronze.sofascore_player_ratings`` — that table
                        must be fresh before this entity runs.
+- ``match_stats``     : team-level per-(match, period, stat) long-form
+                       rows from ``/api/v1/event/{id}/statistics`` (#25).
 
 Exit codes:
     0 — scrape completed successfully (>= 1 row written)
@@ -57,6 +59,7 @@ ENTITY_LEAGUE_TABLE = 'league_table'
 ENTITY_PLAYER_RATINGS = 'player_ratings'
 ENTITY_SHOTMAP = 'shotmap'
 ENTITY_EVENT_PLAYER_STATS = 'event_player_stats'
+ENTITY_MATCH_STATS = 'match_stats'
 
 VALID_ENTITIES = {
     ENTITY_SCHEDULE,
@@ -64,6 +67,7 @@ VALID_ENTITIES = {
     ENTITY_PLAYER_RATINGS,
     ENTITY_SHOTMAP,
     ENTITY_EVENT_PLAYER_STATS,
+    ENTITY_MATCH_STATS,
 }
 
 
@@ -452,6 +456,28 @@ def _run_event_player_stats(
     )
 
 
+def _run_match_stats(
+    leagues: List[str],
+    season: int,
+    limit: Optional[int],
+    output_path: str,
+) -> int:
+    """#25 — team-level per-(match, period, stat) statistics.
+    One HTTP call per match; long-form rows so the Bronze table doesn't
+    need re-shaping when SofaScore introduces a new metric.
+    """
+    return _run_event_endpoint(
+        entity=ENTITY_MATCH_STATS,
+        table_name='sofascore_match_stats',
+        scraper_method='read_match_stats',
+        pk_col='match_id',
+        leagues=leagues,
+        season=season,
+        limit=limit,
+        output_path=output_path,
+    )
+
+
 def _write_results(path: str, payload: dict) -> None:
     """Persist runner results to disk for Airflow XCom pickup."""
     try:
@@ -608,6 +634,14 @@ def main():
 
     if entity == ENTITY_EVENT_PLAYER_STATS:
         return _run_event_player_stats(
+            leagues=leagues,
+            season=args.season,
+            limit=args.limit,
+            output_path=args.output,
+        )
+
+    if entity == ENTITY_MATCH_STATS:
+        return _run_match_stats(
             leagues=leagues,
             season=args.season,
             limit=args.limit,

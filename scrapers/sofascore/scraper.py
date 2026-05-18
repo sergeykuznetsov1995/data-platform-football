@@ -76,6 +76,7 @@ _SOFASCORE_API = "https://api.sofascore.com/api/v1"
 _LINEUPS_PATH = "/event/{event_id}/lineups"
 _SHOTMAP_PATH = "/event/{event_id}/shotmap"
 _EVENT_PLAYER_STATS_PATH = "/event/{event_id}/player/{player_id}/statistics"
+_MATCH_STATS_PATH = "/event/{event_id}/statistics"
 
 # R0.2b — graceful-fallback marker emitted when the lineups endpoint
 # is structurally unavailable (HTTP 403 / quota empty / repeated timeouts).
@@ -1028,6 +1029,171 @@ class SofaScoreScraper(SoccerdataScraper):
 
         logger.info(
             "Materialised %d event_player_stats rows across %d unique matches",
+            len(df), df['match_id'].nunique(),
+        )
+        return df
+
+    # ------------------------------------------------------------------
+    # #25 match_stats — per-(period, group, stat) team-level metrics
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _flatten_match_stats(match_id: str, payload: dict) -> List[Dict]:
+        """Project ``/event/{id}/statistics`` into long-form rows.
+
+        SofaScore returns ``statistics: [{period, groups: [{groupName,
+        statisticsItems: [...]}, ...]}, ...]`` — we emit one row per
+        ``(match_id, period, stat_group, stat_name)`` so Silver can
+        pivot without unnesting JSON. Both raw text values
+        (``home``/``away`` — e.g. ``"55%"``, ``"3 (1)"``) and numeric
+        canonicals (``homeValue``/``awayValue``) are surfaced.
+        """
+        rows: List[Dict] = []
+        if not isinstance(payload, dict):
+            return rows
+
+        periods = payload.get('statistics') or []
+        if not isinstance(periods, list):
+            return rows
+
+        def _f(v):
+            if v is None:
+                return None
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                return None
+
+        for period_block in periods:
+            if not isinstance(period_block, dict):
+                continue
+            period = period_block.get('period') or 'ALL'
+
+            for group_block in (period_block.get('groups') or []):
+                if not isinstance(group_block, dict):
+                    continue
+                stat_group = group_block.get('groupName')
+
+                for item in (group_block.get('statisticsItems') or []):
+                    if not isinstance(item, dict):
+                        continue
+                    rows.append({
+                        'match_id': str(match_id),
+                        'period': str(period),
+                        'stat_group': stat_group,
+                        'stat_name': item.get('name'),
+                        'stat_key': item.get('key') or item.get('statisticsType'),
+                        'home_value': _f(item.get('homeValue')),
+                        'away_value': _f(item.get('awayValue')),
+                        'home_text': (
+                            str(item.get('home')) if item.get('home') is not None else None
+                        ),
+                        'away_text': (
+                            str(item.get('away')) if item.get('away') is not None else None
+                        ),
+                        'compare_code': item.get('compareCode'),
+                        'value_type': item.get('valueType'),
+                    })
+
+        return rows
+
+    def _fetch_match_stats_payload(
+        self,
+        event_id: str,
+        max_attempts: int = 3,
+    ) -> Optional[dict]:
+        url = f"{_SOFASCORE_API}{_MATCH_STATS_PATH.format(event_id=event_id)}"
+        return self._fetch_json_endpoint(
+            url=url,
+            max_attempts=max_attempts,
+            label='match_stats',
+            context={'event_id': event_id},
+        )
+
+    def read_match_stats(
+        self,
+        league: str,
+        season: int,
+        match_ids: Optional[List[str]] = None,
+        limit: Optional[int] = None,
+    ) -> pd.DataFrame:
+        """Fetch per-match team-level statistics from
+        ``/api/v1/event/{id}/statistics`` and emit long-form rows.
+
+        Long-form (one row per (match, period, group, stat)) is chosen
+        over wide-form because SofaScore evolves its stat catalogue
+        without notice — adding a new metric must not require a Bronze
+        schema migration.
+        """
+        cols = [
+            'match_id', 'period', 'stat_group', 'stat_name', 'stat_key',
+            'home_value', 'away_value', 'home_text', 'away_text',
+            'compare_code', 'value_type', 'league', 'season',
+        ]
+
+        if match_ids is None:
+            match_ids = self._resolve_match_ids(league, season)
+
+        if not match_ids:
+            logger.warning(
+                "No match_ids resolved for match_stats (league=%s season=%s).",
+                league, season,
+            )
+            return pd.DataFrame(columns=cols + ['_ingested_at'])
+
+        if limit:
+            match_ids = list(match_ids)[: int(limit)]
+
+        logger.info(
+            "Fetching SofaScore match_stats for %d matches (league=%s season=%s)",
+            len(match_ids), league, season,
+        )
+
+        all_rows: List[Dict] = []
+        consecutive_failures = 0
+        max_consecutive = 100
+
+        for idx, mid in enumerate(match_ids, start=1):
+            payload = self._fetch_match_stats_payload(str(mid))
+            if payload is None:
+                consecutive_failures += 1
+                if consecutive_failures >= max_consecutive:
+                    logger.error(
+                        "%s: %d consecutive match_stats failures — aborting.",
+                        R0_2B_FALLBACK_MARKER, consecutive_failures,
+                    )
+                    break
+                continue
+
+            consecutive_failures = 0
+            all_rows.extend(self._flatten_match_stats(str(mid), payload))
+
+            if idx % 25 == 0:
+                logger.info("match_stats progress: %d/%d matches", idx, len(match_ids))
+
+        if not all_rows:
+            logger.warning(
+                "%s: zero match_stats rows materialised across %d matches.",
+                R0_2B_FALLBACK_MARKER, len(match_ids),
+            )
+            return pd.DataFrame(columns=cols + ['_ingested_at'])
+
+        df = pd.DataFrame(all_rows)
+        df['league'] = league
+
+        season_str = str(season)
+        if len(season_str) == 4 and season_str.isdigit():
+            season_short = f"{season_str[2:4]}{int(season_str[2:4]) + 1:02d}"
+        else:
+            season_short = season_str
+        df['season'] = season_short
+        df['_ingested_at'] = datetime.utcnow()
+        df['_source'] = self.SOURCE_NAME
+        df['_entity_type'] = 'match_stats'
+        df['_batch_id'] = self._batch_id
+
+        logger.info(
+            "Materialised %d match_stats rows across %d unique matches",
             len(df), df['match_id'].nunique(),
         )
         return df

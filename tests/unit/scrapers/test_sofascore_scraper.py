@@ -247,3 +247,117 @@ class TestEventPlayerStatsFlatten:
         assert row is not None
         assert row['match_id'] == '1'
         assert row['player_id'] == '1'
+
+
+class TestMatchStatsFlatten:
+    """Tests for the team-level per-(match, period, stat) flattener (#25)."""
+
+    def _payload(self):
+        return {
+            'statistics': [
+                {
+                    'period': 'ALL',
+                    'groups': [
+                        {
+                            'groupName': 'Possession',
+                            'statisticsItems': [
+                                {
+                                    'name': 'Ball possession',
+                                    'key': 'ballPossession',
+                                    'home': '55%',
+                                    'away': '45%',
+                                    'homeValue': 55,
+                                    'awayValue': 45,
+                                    'compareCode': 1,
+                                    'valueType': 'percent',
+                                },
+                            ],
+                        },
+                        {
+                            'groupName': 'Shots',
+                            'statisticsItems': [
+                                {
+                                    'name': 'Total shots',
+                                    'key': 'totalShotsOnGoal',
+                                    'home': '14',
+                                    'away': '7',
+                                    'homeValue': 14,
+                                    'awayValue': 7,
+                                    'compareCode': 1,
+                                    'valueType': 'count',
+                                },
+                                {
+                                    'name': 'Expected goals',
+                                    'key': 'expectedGoals',
+                                    'home': '1.8',
+                                    'away': '0.6',
+                                    'homeValue': 1.8,
+                                    'awayValue': 0.6,
+                                    'compareCode': 1,
+                                    'valueType': 'decimal',
+                                },
+                            ],
+                        },
+                    ],
+                },
+                {
+                    'period': '1ST',
+                    'groups': [
+                        {
+                            'groupName': 'Possession',
+                            'statisticsItems': [
+                                {
+                                    'name': 'Ball possession',
+                                    'key': 'ballPossession',
+                                    'home': '58%',
+                                    'away': '42%',
+                                    'homeValue': 58,
+                                    'awayValue': 42,
+                                    'compareCode': 1,
+                                    'valueType': 'percent',
+                                },
+                            ],
+                        },
+                    ],
+                },
+            ]
+        }
+
+    def test_flatten_happy_path(self):
+        from scrapers.sofascore.scraper import SofaScoreScraper
+
+        rows = SofaScoreScraper._flatten_match_stats('14023925', self._payload())
+        # 3 in ALL (1 possession + 2 shots) + 1 in 1ST = 4
+        assert len(rows) == 4
+
+        bp_all = next(
+            r for r in rows
+            if r['period'] == 'ALL' and r['stat_name'] == 'Ball possession'
+        )
+        assert bp_all['match_id'] == '14023925'
+        assert bp_all['stat_group'] == 'Possession'
+        assert bp_all['stat_key'] == 'ballPossession'
+        assert bp_all['home_value'] == 55.0
+        assert bp_all['away_value'] == 45.0
+        assert bp_all['home_text'] == '55%'
+        assert bp_all['away_text'] == '45%'
+
+        xg = next(r for r in rows if r['stat_name'] == 'Expected goals')
+        assert xg['home_value'] == 1.8
+        assert xg['away_value'] == 0.6
+
+        bp_1st = next(
+            r for r in rows
+            if r['period'] == '1ST' and r['stat_name'] == 'Ball possession'
+        )
+        assert bp_1st['home_value'] == 58.0
+
+    def test_flatten_handles_garbage(self):
+        from scrapers.sofascore.scraper import SofaScoreScraper
+        assert SofaScoreScraper._flatten_match_stats('1', None) == []
+        assert SofaScoreScraper._flatten_match_stats('1', {}) == []
+        assert SofaScoreScraper._flatten_match_stats('1', {'statistics': 'oops'}) == []
+        # Period with no groups → no rows.
+        assert SofaScoreScraper._flatten_match_stats(
+            '1', {'statistics': [{'period': 'ALL'}]}
+        ) == []
