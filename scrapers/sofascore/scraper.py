@@ -522,10 +522,10 @@ class SofaScoreScraper(SoccerdataScraper):
 
         Bronze layout: ``iceberg.bronze.sofascore_player_ratings`` is
         partitioned by ``(league, season)``. The daily DAG passes the
-        full set of finished matches for the season, so we use
-        ``replace_partitions=True`` to keep one row per
-        ``(match_id, player_id, _ingested_at)`` and avoid append-only
-        drift — see ``memory/feedback_replace_partitions_required.md``.
+        full set of finished matches for the season, so we pass
+        ``replace_partitions=['league', 'season']`` to replace each
+        partition wholesale and avoid append-only drift — see
+        ``memory/feedback_replace_partitions_required.md``.
         """
         target_league = league or (self.leagues[0] if self.leagues else None)
         target_season = season if season is not None else (
@@ -551,7 +551,7 @@ class SofaScoreScraper(SoccerdataScraper):
             df=df,
             table_name='sofascore_player_ratings',
             partition_cols=['league', 'season'],
-            replace_partitions=True,
+            replace_partitions=['league', 'season'],
         )
         return {'player_ratings': table_path}
 

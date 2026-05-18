@@ -12,8 +12,8 @@ Supported entities:
 - ``player_ratings``  : per-match player ratings (Opta 0.0-10.0) via
                        the public ``/api/v1/event/{id}/lineups`` endpoint.
                        Daily DAG passes the full set of finished matches;
-                       writer uses ``replace_partitions=True`` so each run
-                       refreshes ``(league, season)`` partition wholly.
+                       writer uses ``replace_partitions=['league', 'season']``
+                       so each run refreshes the partition wholesale.
 
 Exit codes:
     0 — scrape completed successfully (>= 1 row written)
@@ -228,7 +228,7 @@ def _run_player_ratings(
                 df=df,
                 table_name='sofascore_player_ratings',
                 partition_cols=['league', 'season'],
-                replace_partitions=True,
+                replace_partitions=['league', 'season'],
             )
             results['tables'].append(table_path)
             results['rows'] = int(len(df))
