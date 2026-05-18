@@ -11,8 +11,9 @@ Supported entities:
 - ``league_table``    : standings snapshot
 - ``player_ratings``  : per-match player ratings (Opta 0.0-10.0) via
                        the public ``/api/v1/event/{id}/lineups`` endpoint.
-                       APPEND-only snapshots — every run adds rows tagged
-                       with ``_ingested_at``.
+                       Daily DAG passes the full set of finished matches;
+                       writer uses ``replace_partitions=True`` so each run
+                       refreshes ``(league, season)`` partition wholly.
 
 Exit codes:
     0 — scrape completed successfully (>= 1 row written)
@@ -227,8 +228,7 @@ def _run_player_ratings(
                 df=df,
                 table_name='sofascore_player_ratings',
                 partition_cols=['league', 'season'],
-                # APPEND mode — snapshots per _ingested_at, no
-                # delete-then-insert (R0.2b roadmap requirement).
+                replace_partitions=True,
             )
             results['tables'].append(table_path)
             results['rows'] = int(len(df))

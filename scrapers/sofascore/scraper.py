@@ -422,7 +422,7 @@ class SofaScoreScraper(SoccerdataScraper):
 
         all_rows: List[Dict] = []
         consecutive_failures = 0
-        max_consecutive = 5  # circuit-trip threshold per scrape call
+        max_consecutive = 100  # preventive; live probe 2026-05-18 (#19) shows endpoint stable
 
         for idx, mid in enumerate(match_ids, start=1):
             payload = self._fetch_lineup_payload(str(mid))
@@ -521,9 +521,11 @@ class SofaScoreScraper(SoccerdataScraper):
         """Scrape per-match player ratings via the lineups REST endpoint.
 
         Bronze layout: ``iceberg.bronze.sofascore_player_ratings`` is
-        partitioned by ``(league, season)`` and APPEND-only — each scrape
-        is a snapshot tagged with ``_ingested_at`` so re-runs add new
-        rows rather than mutating history.
+        partitioned by ``(league, season)``. The daily DAG passes the
+        full set of finished matches for the season, so we use
+        ``replace_partitions=True`` to keep one row per
+        ``(match_id, player_id, _ingested_at)`` and avoid append-only
+        drift — see ``memory/feedback_replace_partitions_required.md``.
         """
         target_league = league or (self.leagues[0] if self.leagues else None)
         target_season = season if season is not None else (
@@ -549,8 +551,7 @@ class SofaScoreScraper(SoccerdataScraper):
             df=df,
             table_name='sofascore_player_ratings',
             partition_cols=['league', 'season'],
-            # APPEND mode: each scrape is a snapshot, do NOT
-            # delete-then-insert (we want history per _ingested_at).
+            replace_partitions=True,
         )
         return {'player_ratings': table_path}
 

@@ -17,7 +17,7 @@ All data is written to Iceberg Bronze layer tables (via Parquet fallback).
 """
 
 from datetime import datetime, timedelta
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 from airflow import DAG
 from airflow.exceptions import AirflowException
@@ -28,54 +28,94 @@ from utils.config import LEAGUES, CURRENT_SEASON, SCHEDULES, DAG_TAGS
 from utils.default_args import DEFAULT_ARGS
 
 
+SCHEDULE_RESULT_PATH = '/tmp/sofascore_result.json'
+PLAYER_RATINGS_RESULT_PATH = '/tmp/sofascore_player_ratings_result.json'
+
+
+def _load_result(path: str, logger) -> Dict[str, Any]:
+    """Load a runner JSON output. Missing file → empty dict (treated as failure)."""
+    import json
+
+    try:
+        with open(path, 'r') as f:
+            return json.load(f)
+    except FileNotFoundError:
+        logger.error("Results file %s not found", path)
+        return {}
+    except json.JSONDecodeError as e:
+        logger.error("Invalid JSON in %s: %s", path, e)
+        return {}
+
+
 def validate_data(**context) -> Dict[str, Any]:
     """
-    Validate scraped data quality.
-
-    Returns:
-        Validation results
+    Validate scraped data quality across both scrape tasks (schedule+league_table
+    and player_ratings).
     """
-    import json
     import logging
 
     logger = logging.getLogger(__name__)
 
-    try:
-        with open('/tmp/sofascore_result.json', 'r') as f:
-            scrape_result = json.load(f)
-    except FileNotFoundError:
-        logger.error("Results file not found - scraping may have failed")
-        raise AirflowException("Results file not found - scraping failed")
-    except json.JSONDecodeError as e:
-        logger.error(f"Invalid JSON in results: {e}")
-        raise AirflowException(f"Invalid JSON in results: {e}")
+    schedule_result = _load_result(SCHEDULE_RESULT_PATH, logger)
+    ratings_result = _load_result(PLAYER_RATINGS_RESULT_PATH, logger)
+
+    if not schedule_result:
+        raise AirflowException(
+            f"Schedule results file {SCHEDULE_RESULT_PATH} missing or unreadable"
+        )
 
     validation = {
         'status': 'success',
         'warnings': [],
         'summary': {
-            'schedule_rows': scrape_result.get('schedule_rows', 0),
-            'team_stats_rows': scrape_result.get('team_stats_rows', 0),
-            'player_stats_rows': scrape_result.get('player_stats_rows', 0),
-            'tables': scrape_result.get('tables', []),
+            'schedule_rows': schedule_result.get('schedule_rows', 0),
+            'league_table_rows': schedule_result.get('league_table_rows', 0),
+            'player_ratings_rows': ratings_result.get('rows', 0),
+            'player_ratings_matches': ratings_result.get('matches_with_ratings', 0),
+            'player_ratings_fallback': ratings_result.get('fallback', False),
+            'tables': (
+                schedule_result.get('tables', []) + ratings_result.get('tables', [])
+            ),
         }
     }
 
-    if scrape_result.get('errors'):
-        validation['warnings'] = scrape_result['errors']
+    errors: List[str] = []
+    errors.extend(schedule_result.get('errors', []) or [])
+    errors.extend(ratings_result.get('errors', []) or [])
+    if errors:
+        validation['warnings'] = errors
         total_rows = sum([
             validation['summary']['schedule_rows'],
-            validation['summary']['team_stats_rows'],
-            validation['summary']['player_stats_rows'],
+            validation['summary']['league_table_rows'],
+            validation['summary']['player_ratings_rows'],
         ])
         validation['status'] = 'partial_success' if total_rows > 0 else 'failed'
 
-    # Check minimum thresholds
+    # Minimum thresholds
     if validation['summary']['schedule_rows'] < 100:
         validation['warnings'].append("Low schedule row count - possible scraping issue")
 
-    if validation['summary']['team_stats_rows'] < 50:
-        validation['warnings'].append("Low team stats row count - possible scraping issue")
+    if validation['summary']['league_table_rows'] < 10:
+        validation['warnings'].append("Low league_table row count - possible scraping issue")
+
+    # APL has ~300 matches/season; ratings emit ~25K rows. Anything < 300 rows
+    # means we scraped at most a handful of matches → DAG defect or hard CF block.
+    if validation['summary']['player_ratings_rows'] < 300:
+        if validation['summary']['player_ratings_fallback']:
+            validation['warnings'].append(
+                f"player_ratings R0.2B_FALLBACK: rows="
+                f"{validation['summary']['player_ratings_rows']} matches="
+                f"{validation['summary']['player_ratings_matches']}"
+            )
+            # Fallback is a soft failure — keep status non-failed so dependent
+            # DAGs see partial_success, not hard-fail.
+            if validation['status'] == 'success':
+                validation['status'] = 'partial_success'
+        else:
+            validation['warnings'].append(
+                f"Low player_ratings row count: "
+                f"{validation['summary']['player_ratings_rows']} < 300"
+            )
 
     logger.info(f"Data validation complete: {validation['status']}")
     logger.info(f"Summary: {validation['summary']}")
@@ -136,7 +176,33 @@ cd /opt/airflow && \\
 python dags/scripts/run_sofascore_scraper.py \\
     --leagues "{leagues_str}" \\
     --season {CURRENT_SEASON} \\
-    --output /tmp/sofascore_result.json
+    --output {SCHEDULE_RESULT_PATH}
+""",
+        env={
+            'PYTHONPATH': '/opt/airflow:/opt/airflow/dags',
+            'PATH': '/usr/local/bin:/usr/bin:/bin:/home/airflow/.local/bin',
+            'HOME': '/home/airflow',
+        },
+    )
+
+    # R0.2B player_ratings: depends on freshly written bronze.sofascore_schedule
+    # (runner reads finished match_ids from there). Exit code 2 = graceful
+    # R0.2B_FALLBACK; treat as success at the bash level so validate_data runs.
+    scrape_player_ratings_task = BashOperator(
+        task_id='scrape_player_ratings',
+        bash_command=f"""
+cd /opt/airflow && \\
+python dags/scripts/run_sofascore_scraper.py \\
+    --entity player_ratings \\
+    --league "{LEAGUES[0]}" \\
+    --season {CURRENT_SEASON} \\
+    --output {PLAYER_RATINGS_RESULT_PATH}
+rc=$?
+if [ $rc -eq 2 ]; then
+    echo "R0.2B_FALLBACK exit-code 2 — propagating as soft success."
+    exit 0
+fi
+exit $rc
 """,
         env={
             'PYTHONPATH': '/opt/airflow:/opt/airflow/dags',
@@ -148,8 +214,7 @@ python dags/scripts/run_sofascore_scraper.py \\
     validate_data_task = PythonOperator(
         task_id='validate_data',
         python_callable=validate_data,
-        
         trigger_rule='all_done',
     )
 
-    scrape_data_task >> validate_data_task
+    scrape_data_task >> scrape_player_ratings_task >> validate_data_task
