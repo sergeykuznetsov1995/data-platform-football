@@ -222,20 +222,38 @@ class SofaScoreScraper(SoccerdataScraper):
         client = tls_requests.Client(proxy=proxy_url) if proxy_url else tls_requests.Client()
         return client, proxy_obj
 
-    def _fetch_lineup_payload(
+    def _fetch_json_endpoint(
         self,
-        event_id: str,
+        url: str,
         max_attempts: int = 3,
+        label: str = 'endpoint',
+        context: Optional[Dict] = None,
     ) -> Optional[dict]:
-        """Fetch /event/{id}/lineups JSON with proxy rotation + retry.
+        """Generic GET → JSON over SofaScore's public REST API with proxy
+        rotation, rate-limit, retry, and graceful 404.
 
-        Returns ``None`` after exhausting attempts. Uses the platform's
-        rate limiter to stay well under SofaScore's burst threshold.
+        Parameters
+        ----------
+        url : str
+            Fully-qualified request URL.
+        max_attempts : int
+            Retry budget; matches ``_fetch_lineup_payload`` historical
+            behaviour (3 attempts, exponential backoff on 429).
+        label : str
+            Short tag used in log lines (e.g. ``"lineups"``, ``"shotmap"``).
+        context : dict | None
+            Extra fields stored on ``self._last_endpoint_error`` for
+            R0.2B_FALLBACK classification by the runner (e.g.
+            ``{'event_id': '123'}``).
+
+        Returns
+        -------
+        dict | None
+            Parsed JSON on 200. ``None`` on 404 (legitimate-empty) or
+            after exhausted attempts (structural failure).
         """
         import tls_requests
         from scrapers.utils.proxy_manager import ErrorType
-
-        url = f"{_SOFASCORE_API}{_LINEUPS_PATH.format(event_id=event_id)}"
 
         last_status = None
         last_error = None
@@ -259,8 +277,8 @@ class SofaScoreScraper(SoccerdataScraper):
                     except Exception as parse_err:  # pragma: no cover - defensive
                         last_error = f"json_decode: {parse_err}"
                         logger.warning(
-                            "Lineups payload not JSON for event %s: %s",
-                            event_id, parse_err,
+                            "%s payload not JSON (%s): %s",
+                            label, context or url, parse_err,
                         )
                         break
                 if resp.status_code == 403:
@@ -273,9 +291,10 @@ class SofaScoreScraper(SoccerdataScraper):
                     last_error = "HTTP 429 rate-limited"
                     time.sleep(2 ** attempt)
                 elif resp.status_code == 404:
-                    # Not all events expose lineups (cancelled / TBD) —
-                    # treat as legitimate empty.
-                    logger.info("Lineups not exposed for event %s (404)", event_id)
+                    # Some events / players / seasons don't expose the
+                    # resource (cancelled match, retired player) — treat
+                    # as legitimate empty.
+                    logger.info("%s not exposed (%s) — 404", label, context or url)
                     self._stats['successes'] += 1
                     return None
                 else:
@@ -297,19 +316,49 @@ class SofaScoreScraper(SoccerdataScraper):
                     pass
 
             logger.warning(
-                "Lineups attempt %d/%d failed for event %s: %s",
-                attempt, max_attempts, event_id, last_error,
+                "%s attempt %d/%d failed (%s): %s",
+                label, attempt, max_attempts, context or url, last_error,
             )
 
         self._stats['failures'] += 1
         # Surface the structural reason so the runner can decide whether
-        # to emit the R0.2B_FALLBACK marker.
-        self._last_lineup_error = {
-            'event_id': event_id,
+        # to emit the R0.2B_FALLBACK marker. Stored under a single rolling
+        # attribute so any endpoint helper can classify the last failure.
+        self._last_endpoint_error = {
+            'label': label,
             'status': last_status,
             'error': last_error,
+            **(context or {}),
         }
         return None
+
+    def _fetch_lineup_payload(
+        self,
+        event_id: str,
+        max_attempts: int = 3,
+    ) -> Optional[dict]:
+        """Fetch /event/{id}/lineups JSON via the generic endpoint helper.
+
+        Thin wrapper around :meth:`_fetch_json_endpoint` that preserves
+        the historical ``self._last_lineup_error`` attribute the
+        R0.2B player_ratings runner classifies fallbacks against.
+        """
+        url = f"{_SOFASCORE_API}{_LINEUPS_PATH.format(event_id=event_id)}"
+        payload = self._fetch_json_endpoint(
+            url=url,
+            max_attempts=max_attempts,
+            label='lineups',
+            context={'event_id': event_id},
+        )
+        if payload is None:
+            err = getattr(self, '_last_endpoint_error', None)
+            if err is not None:
+                self._last_lineup_error = {
+                    'event_id': event_id,
+                    'status': err.get('status'),
+                    'error': err.get('error'),
+                }
+        return payload
 
     @staticmethod
     def _flatten_lineup_side(
