@@ -22,6 +22,7 @@ logger = logging.getLogger(__name__)
 # SofaScore public REST API
 _SOFASCORE_API = "https://api.sofascore.com/api/v1"
 _LINEUPS_PATH = "/event/{event_id}/lineups"
+_SHOTMAP_PATH = "/event/{event_id}/shotmap"
 
 # R0.2b — graceful-fallback marker emitted when the lineups endpoint
 # is structurally unavailable (HTTP 403 / quota empty / repeated timeouts).
@@ -527,6 +528,201 @@ class SofaScoreScraper(SoccerdataScraper):
 
         logger.info(
             "Materialised %d player-rating rows across %d unique matches",
+            len(df), df['match_id'].nunique(),
+        )
+        return df
+
+    # ------------------------------------------------------------------
+    # #22 event shotmap — per-shot xG / coords / situation / body part
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _flatten_shotmap(match_id: str, payload: dict) -> List[Dict]:
+        """Project the ``shotmap`` block into one row per shot.
+
+        Schema per row:
+            match_id, shot_id, player_id, team_id, is_home, minute,
+            added_time, period, situation, shot_type, body_part,
+            outcome, x, y, goal_x, goal_y, xg, xgot
+        """
+        rows: List[Dict] = []
+        if not isinstance(payload, dict):
+            return rows
+
+        shots = payload.get('shotmap') or []
+        if not isinstance(shots, list):
+            return rows
+
+        def _f(v):
+            try:
+                return float(v) if v is not None else None
+            except (TypeError, ValueError):
+                return None
+
+        def _i(v):
+            try:
+                return int(v) if v is not None else None
+            except (TypeError, ValueError):
+                return None
+
+        for shot in shots:
+            if not isinstance(shot, dict):
+                continue
+
+            sid = shot.get('id')
+            if sid is None:
+                # Fall back to composite (match, time, player) so that
+                # downstream PK stays unique even when SofaScore omits id.
+                player = shot.get('player') or {}
+                sid = (
+                    f"{match_id}-"
+                    f"{shot.get('time', 'NA')}-"
+                    f"{player.get('id', 'NA')}-"
+                    f"{shot.get('addedTime', 0)}"
+                )
+            shot_id_str = (
+                str(int(sid)) if isinstance(sid, (int, float)) and not isinstance(sid, bool)
+                else str(sid)
+            )
+
+            player = shot.get('player') or {}
+            pid = player.get('id')
+            player_id_str = (
+                str(int(pid)) if isinstance(pid, (int, float)) and pid is not None
+                else (str(pid) if pid is not None else None)
+            )
+
+            coords = shot.get('playerCoordinates') or {}
+            goal = shot.get('goalMouthCoordinates') or {}
+
+            rows.append({
+                'match_id': str(match_id),
+                'shot_id': shot_id_str,
+                'player_id': player_id_str,
+                'team_id': _i(shot.get('teamId') or (shot.get('team') or {}).get('id')),
+                'is_home': bool(shot.get('isHome')) if shot.get('isHome') is not None else None,
+                'minute': _i(shot.get('time')),
+                'added_time': _i(shot.get('addedTime')),
+                'period': _i(shot.get('reversedPeriodCount') or shot.get('period')),
+                # SofaScore taxonomy: incidentType=goal/miss/save/post/block,
+                # shotType=header/leftFoot/rightFoot/other,
+                # bodyPart=head/leftFoot/rightFoot/other (richer than shotType
+                # but not always populated), situation=open-play/corner/free-kick/penalty,
+                # goalType (populated for incidentType=goal): regular/own/penalty.
+                'shot_type': shot.get('shotType') or None,
+                'situation': shot.get('situation') or None,
+                'body_part': shot.get('bodyPart') or None,
+                'outcome': shot.get('incidentType') or None,
+                'goal_type': shot.get('goalType') or None,
+                'x': _f(coords.get('x')),
+                'y': _f(coords.get('y')),
+                'goal_x': _f(goal.get('x')),
+                'goal_y': _f(goal.get('y')),
+                'xg': _f(shot.get('xg') if shot.get('xg') is not None else shot.get('expectedGoals')),
+                'xgot': _f(shot.get('xgot') if shot.get('xgot') is not None else shot.get('expectedGoalsOnTarget')),
+            })
+
+        return rows
+
+    def _fetch_shotmap_payload(
+        self,
+        event_id: str,
+        max_attempts: int = 3,
+    ) -> Optional[dict]:
+        url = f"{_SOFASCORE_API}{_SHOTMAP_PATH.format(event_id=event_id)}"
+        return self._fetch_json_endpoint(
+            url=url,
+            max_attempts=max_attempts,
+            label='shotmap',
+            context={'event_id': event_id},
+        )
+
+    def read_shotmap(
+        self,
+        league: str,
+        season: int,
+        match_ids: Optional[List[str]] = None,
+        limit: Optional[int] = None,
+    ) -> pd.DataFrame:
+        """Fetch per-shot data (coords + xG + situation + body part) from
+        ``/api/v1/event/{id}/shotmap`` for the given match ids.
+
+        Returns an empty DataFrame on graceful fallback (runner emits
+        ``R0.2B_FALLBACK`` and exits with code 2).
+        """
+        cols = [
+            'match_id', 'shot_id', 'player_id', 'team_id', 'is_home',
+            'minute', 'added_time', 'period', 'shot_type', 'situation',
+            'body_part', 'outcome', 'goal_type', 'x', 'y', 'goal_x',
+            'goal_y', 'xg', 'xgot', 'league', 'season',
+        ]
+
+        if match_ids is None:
+            match_ids = self._resolve_match_ids(league, season)
+
+        if not match_ids:
+            logger.warning(
+                "No match_ids resolved for shotmap (league=%s season=%s).",
+                league, season,
+            )
+            return pd.DataFrame(columns=cols + ['_ingested_at'])
+
+        if limit:
+            match_ids = list(match_ids)[: int(limit)]
+
+        logger.info(
+            "Fetching SofaScore shotmap for %d matches (league=%s season=%s)",
+            len(match_ids), league, season,
+        )
+
+        all_rows: List[Dict] = []
+        consecutive_failures = 0
+        max_consecutive = 100
+
+        for idx, mid in enumerate(match_ids, start=1):
+            payload = self._fetch_shotmap_payload(str(mid))
+            if payload is None:
+                consecutive_failures += 1
+                if consecutive_failures >= max_consecutive:
+                    logger.error(
+                        "%s: %d consecutive shotmap fetch failures — aborting.",
+                        R0_2B_FALLBACK_MARKER, consecutive_failures,
+                    )
+                    break
+                continue
+
+            consecutive_failures = 0
+            all_rows.extend(self._flatten_shotmap(str(mid), payload))
+
+            if idx % 25 == 0:
+                logger.info("Shotmap progress: %d/%d matches", idx, len(match_ids))
+
+        if not all_rows:
+            logger.warning(
+                "%s: zero shotmap rows materialised across %d matches.",
+                R0_2B_FALLBACK_MARKER, len(match_ids),
+            )
+            return pd.DataFrame(columns=cols + ['_ingested_at'])
+
+        df = pd.DataFrame(all_rows)
+        df['league'] = league
+
+        # Match the slug used by the schedule writer (soccerdata short form
+        # 'YYZZ', e.g. 2025 -> '2526'). Mismatch would split the partition
+        # and break replace_partitions dedup — see issue #27.
+        season_str = str(season)
+        if len(season_str) == 4 and season_str.isdigit():
+            season_short = f"{season_str[2:4]}{int(season_str[2:4]) + 1:02d}"
+        else:
+            season_short = season_str
+        df['season'] = season_short
+        df['_ingested_at'] = datetime.utcnow()
+        df['_source'] = self.SOURCE_NAME
+        df['_entity_type'] = 'event_shotmap'
+        df['_batch_id'] = self._batch_id
+
+        logger.info(
+            "Materialised %d shot rows across %d unique matches",
             len(df), df['match_id'].nunique(),
         )
         return df

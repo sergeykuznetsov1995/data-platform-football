@@ -38,3 +38,128 @@ class TestSofaScoreScraper:
     def test_rate_limit(self, scraper):
         """Test SofaScore rate limit."""
         assert scraper.DEFAULT_RATE_LIMIT == 20
+
+
+class TestShotmapFlatten:
+    """Pure-function tests for the shotmap payload flattener (#22)."""
+
+    def _payload(self):
+        """Minimal but realistic SofaScore shotmap response."""
+        return {
+            'shotmap': [
+                {
+                    'id': 101,
+                    'player': {'id': 11111, 'name': 'Player A'},
+                    'teamId': 1,
+                    'isHome': True,
+                    'time': 12,
+                    'addedTime': 0,
+                    'reversedPeriodCount': 1,
+                    'shotType': 'rightFoot',
+                    'situation': 'open-play',
+                    'bodyPart': 'rightFoot',
+                    'incidentType': 'goal',
+                    'goalType': 'regular',
+                    'playerCoordinates': {'x': 88.5, 'y': 50.0},
+                    'goalMouthCoordinates': {'x': 100.0, 'y': 52.3},
+                    'xg': 0.72,
+                    'xgot': 0.84,
+                },
+                {
+                    'id': 102,
+                    'player': {'id': 22222, 'name': 'Player B'},
+                    'teamId': 2,
+                    'isHome': False,
+                    'time': 45,
+                    'addedTime': 2,
+                    'reversedPeriodCount': 1,
+                    'shotType': 'header',
+                    'situation': 'corner',
+                    'bodyPart': 'head',
+                    'incidentType': 'save',
+                    'goalType': None,
+                    'playerCoordinates': {'x': 92.1, 'y': 48.5},
+                    'goalMouthCoordinates': {'x': 100.0, 'y': 51.2},
+                    'xg': 0.11,
+                    'xgot': None,
+                },
+                # Missing id → composite fallback
+                {
+                    'player': {'id': 33333},
+                    'teamId': 1,
+                    'isHome': True,
+                    'time': 78,
+                    'shotType': 'leftFoot',
+                    'incidentType': 'miss',
+                    'xg': 0.04,
+                },
+            ]
+        }
+
+    def test_flatten_happy_path(self):
+        from scrapers.sofascore.scraper import SofaScoreScraper
+
+        rows = SofaScoreScraper._flatten_shotmap('14023925', self._payload())
+        assert len(rows) == 3
+
+        goal = rows[0]
+        assert goal['match_id'] == '14023925'
+        assert goal['shot_id'] == '101'
+        assert goal['player_id'] == '11111'
+        assert goal['team_id'] == 1
+        assert goal['is_home'] is True
+        assert goal['minute'] == 12
+        assert goal['period'] == 1
+        assert goal['shot_type'] == 'rightFoot'
+        assert goal['situation'] == 'open-play'
+        assert goal['body_part'] == 'rightFoot'
+        assert goal['outcome'] == 'goal'
+        assert goal['goal_type'] == 'regular'
+        assert goal['x'] == 88.5
+        assert goal['y'] == 50.0
+        assert goal['xg'] == 0.72
+        assert goal['xgot'] == 0.84
+
+    def test_flatten_missing_id_falls_back_to_composite(self):
+        from scrapers.sofascore.scraper import SofaScoreScraper
+
+        rows = SofaScoreScraper._flatten_shotmap('14023925', self._payload())
+        third = rows[2]
+        # composite: match-time-player-addedTime
+        assert third['shot_id'] == '14023925-78-33333-0'
+        assert third['player_id'] == '33333'
+        assert third['outcome'] == 'miss'
+        # xgot absent → None
+        assert third['xgot'] is None
+
+    def test_flatten_handles_garbage(self):
+        from scrapers.sofascore.scraper import SofaScoreScraper
+
+        # Non-dict payload, missing shotmap key, non-list shotmap.
+        assert SofaScoreScraper._flatten_shotmap('1', None) == []
+        assert SofaScoreScraper._flatten_shotmap('1', {}) == []
+        assert SofaScoreScraper._flatten_shotmap('1', {'shotmap': 'oops'}) == []
+        assert SofaScoreScraper._flatten_shotmap('1', {'shotmap': [{}]}) == [
+            # Empty dict still yields a row with mostly None values + composite shot_id
+            {
+                'match_id': '1',
+                'shot_id': '1-NA-NA-0',
+                'player_id': None,
+                'team_id': None,
+                'is_home': None,
+                'minute': None,
+                'added_time': None,
+                'period': None,
+                'shot_type': None,
+                'situation': None,
+                'body_part': None,
+                'outcome': None,
+                'goal_type': None,
+                'x': None,
+                'y': None,
+                'goal_x': None,
+                'goal_y': None,
+                'xg': None,
+                'xgot': None,
+            }
+        ]

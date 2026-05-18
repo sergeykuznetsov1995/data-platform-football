@@ -14,6 +14,8 @@ Supported entities:
                        Daily DAG passes the full set of finished matches;
                        writer uses ``replace_partitions=['league', 'season']``
                        so each run refreshes the partition wholesale.
+- ``shotmap``         : per-shot coords + xG + situation via
+                       ``/api/v1/event/{id}/shotmap`` (issue #22).
 
 Exit codes:
     0 — scrape completed successfully (>= 1 row written)
@@ -48,8 +50,14 @@ logger = logging.getLogger(__name__)
 ENTITY_SCHEDULE = 'schedule'
 ENTITY_LEAGUE_TABLE = 'league_table'
 ENTITY_PLAYER_RATINGS = 'player_ratings'
+ENTITY_SHOTMAP = 'shotmap'
 
-VALID_ENTITIES = {ENTITY_SCHEDULE, ENTITY_LEAGUE_TABLE, ENTITY_PLAYER_RATINGS}
+VALID_ENTITIES = {
+    ENTITY_SCHEDULE,
+    ENTITY_LEAGUE_TABLE,
+    ENTITY_PLAYER_RATINGS,
+    ENTITY_SHOTMAP,
+}
 
 
 def _resolve_match_ids_from_bronze(
@@ -248,6 +256,168 @@ def _run_player_ratings(
     return 0
 
 
+def _run_event_endpoint(
+    *,
+    entity: str,
+    table_name: str,
+    scraper_method: str,
+    pk_col: str,
+    leagues: List[str],
+    season: int,
+    limit: Optional[int],
+    output_path: str,
+    extra_kwargs: Optional[dict] = None,
+) -> int:
+    """Generic event-grain runner: shotmap, event_player_stats, match_stats.
+
+    All three follow the same flow:
+
+    1. Resolve finished match_ids from ``bronze.sofascore_schedule``.
+    2. Loop over matches, call ``scraper.<scraper_method>(...)``.
+    3. Write to ``iceberg.bronze.<table_name>`` with
+       ``replace_partitions=['league', 'season']``.
+    4. Return exit code 2 on empty payload (R0.2B_FALLBACK semantics).
+
+    ``extra_kwargs`` is forwarded to the scraper method (e.g.
+    ``player_ids`` for event_player_stats).
+    """
+    from scrapers.sofascore import SofaScoreScraper
+    from scrapers.sofascore.scraper import R0_2B_FALLBACK_MARKER
+
+    league = leagues[0]
+    season_str = str(season)
+    if len(season_str) == 4 and season_str.isdigit():
+        season_short = f"{season_str[2:4]}{int(season_str[2:4]) + 1:02d}"
+    else:
+        season_short = season_str
+
+    logger.info(
+        "%s: league=%s season=%s (short=%s) limit=%s",
+        entity, league, season, season_short, limit,
+    )
+
+    match_ids = _resolve_match_ids_from_bronze(league, season_short, limit)
+    if not match_ids:
+        match_ids = _resolve_match_ids_from_bronze(league, season_str, limit)
+
+    results = {
+        'entity': entity,
+        'tables': [],
+        'rows': 0,
+        'matches_attempted': len(match_ids),
+        'matches_with_rows': 0,
+        'fallback': False,
+        'fallback_reason': None,
+        'errors': [],
+    }
+
+    if not match_ids:
+        logger.error(
+            "%s: no match_ids in bronze.sofascore_schedule for "
+            "league=%s season=%s — run schedule scrape first.",
+            R0_2B_FALLBACK_MARKER, league, season_short,
+        )
+        results['fallback'] = True
+        results['fallback_reason'] = 'no_match_ids_in_bronze'
+        results['errors'].append(f'{R0_2B_FALLBACK_MARKER}: no_match_ids')
+        _write_results(output_path, results)
+        return 2
+
+    proxy_file = os.environ.get('PROXY_FILE', '/opt/airflow/proxys.txt')
+    if not os.path.exists(proxy_file):
+        logger.warning(
+            "Proxy file %s not found — SofaScore is likely to 403 "
+            "without residential proxy.", proxy_file,
+        )
+        proxy_file = None
+
+    try:
+        with SofaScoreScraper(
+            leagues=[league],
+            seasons=[season],
+            proxy_file=proxy_file,
+        ) as scraper:
+            method = getattr(scraper, scraper_method)
+            kwargs = {
+                'league': league,
+                'season': int(season),
+                'match_ids': match_ids,
+                'limit': limit,
+            }
+            kwargs.update(extra_kwargs or {})
+            df = method(**kwargs)
+
+            if df is None or df.empty:
+                last_err = getattr(scraper, '_last_endpoint_error', None)
+                reason = 'empty_payload'
+                if last_err:
+                    status = last_err.get('status')
+                    if status == 403:
+                        reason = 'http_403'
+                    elif status == 429:
+                        reason = 'http_429'
+                    elif status is None:
+                        reason = 'transport_error'
+                    else:
+                        reason = f'http_{status}'
+
+                logger.error(
+                    "%s: %s unavailable — reason=%s detail=%s",
+                    R0_2B_FALLBACK_MARKER, entity, reason, last_err,
+                )
+                results['fallback'] = True
+                results['fallback_reason'] = reason
+                results['errors'].append(f'{R0_2B_FALLBACK_MARKER}: {reason}')
+                _write_results(output_path, results)
+                return 2
+
+            table_path = scraper.save_to_iceberg(
+                df=df,
+                table_name=table_name,
+                partition_cols=['league', 'season'],
+                replace_partitions=['league', 'season'],
+            )
+            results['tables'].append(table_path)
+            results['rows'] = int(len(df))
+            if pk_col in df.columns:
+                results['matches_with_rows'] = int(df[pk_col].nunique())
+            logger.info(
+                "Saved %d %s rows -> %s",
+                results['rows'], entity, table_path,
+            )
+
+    except Exception as e:
+        logger.error("%s scrape failed hard: %s", entity, e, exc_info=True)
+        results['errors'].append(str(e))
+        _write_results(output_path, results)
+        return 1
+
+    _write_results(output_path, results)
+    return 0
+
+
+def _run_shotmap(
+    leagues: List[str],
+    season: int,
+    limit: Optional[int],
+    output_path: str,
+) -> int:
+    """#22 — per-shot xG / coords / situation. Reads finished match_ids
+    from bronze.sofascore_schedule and writes to
+    ``iceberg.bronze.sofascore_event_shotmap``.
+    """
+    return _run_event_endpoint(
+        entity=ENTITY_SHOTMAP,
+        table_name='sofascore_event_shotmap',
+        scraper_method='read_shotmap',
+        pk_col='match_id',
+        leagues=leagues,
+        season=season,
+        limit=limit,
+        output_path=output_path,
+    )
+
+
 def _write_results(path: str, payload: dict) -> None:
     """Persist runner results to disk for Airflow XCom pickup."""
     try:
@@ -388,6 +558,14 @@ def main():
 
     if entity == ENTITY_PLAYER_RATINGS:
         return _run_player_ratings(
+            leagues=leagues,
+            season=args.season,
+            limit=args.limit,
+            output_path=args.output,
+        )
+
+    if entity == ENTITY_SHOTMAP:
+        return _run_shotmap(
             leagues=leagues,
             season=args.season,
             limit=args.limit,
