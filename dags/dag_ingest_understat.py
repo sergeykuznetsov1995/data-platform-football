@@ -156,12 +156,13 @@ python dags/scripts/run_understat_scraper.py \\
             'PATH': '/usr/local/bin:/usr/bin:/bin:/home/airflow/.local/bin',
             'HOME': '/home/airflow',
         },
+        append_env=True,
     )
 
     validate_data_task = PythonOperator(
         task_id='validate_data',
         python_callable=validate_data,
-        
+
         trigger_rule='all_done',
     )
 

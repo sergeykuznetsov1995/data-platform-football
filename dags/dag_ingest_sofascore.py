@@ -321,6 +321,7 @@ python dags/scripts/run_sofascore_scraper.py \\
             'PATH': '/usr/local/bin:/usr/bin:/bin:/home/airflow/.local/bin',
             'HOME': '/home/airflow',
         },
+        append_env=True,
     )
 
     # R0.2B player_ratings: depends on freshly written bronze.sofascore_schedule
@@ -347,6 +348,7 @@ exit $rc
             'PATH': '/usr/local/bin:/usr/bin:/bin:/home/airflow/.local/bin',
             'HOME': '/home/airflow',
         },
+        append_env=True,
     )
 
     # #22 — per-shot xG/coords/situation. Capped at SHOTMAP_DAILY_LIMIT matches
@@ -373,6 +375,7 @@ exit $rc
             'PATH': '/usr/local/bin:/usr/bin:/bin:/home/airflow/.local/bin',
             'HOME': '/home/airflow',
         },
+        append_env=True,
     )
 
     # #25 — team-level per-match stats (per-period long-form). Reads
@@ -400,6 +403,7 @@ exit $rc
             'PATH': '/usr/local/bin:/usr/bin:/bin:/home/airflow/.local/bin',
             'HOME': '/home/airflow',
         },
+        append_env=True,
     )
 
     # #24 — season-aggregate per-player Opta stats. Depends on fresh
@@ -426,6 +430,7 @@ exit $rc
             'PATH': '/usr/local/bin:/usr/bin:/bin:/home/airflow/.local/bin',
             'HOME': '/home/airflow',
         },
+        append_env=True,
     )
 
     # #23 — biographical snapshot per player. Cheap, runs after ratings.
@@ -451,6 +456,7 @@ exit $rc
             'PATH': '/usr/local/bin:/usr/bin:/bin:/home/airflow/.local/bin',
             'HOME': '/home/airflow',
         },
+        append_env=True,
     )
 
     # #21 — per-(match, player) Opta stats. Depends on fresh
@@ -477,6 +483,7 @@ exit $rc
             'PATH': '/usr/local/bin:/usr/bin:/bin:/home/airflow/.local/bin',
             'HOME': '/home/airflow',
         },
+        append_env=True,
     )
 
     validate_data_task = PythonOperator(
