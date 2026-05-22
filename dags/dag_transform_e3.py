@@ -143,6 +143,16 @@ SILVER_E3_TRANSFORMS = [
         'dags/sql/silver/understat_player_season_aggregate.sql',
         'understat_player_season_aggregate',
     ),
+    (
+        # T6: SofaScore per-(canonical_id, league, season) aggregate.
+        # Reads bronze.sofascore_player_season_stats + silver.xref_player
+        # (source='sofascore') — MUST run after dag_transform_xref has
+        # materialised the SofaScore bridge rows. Provides the SofaScore
+        # feed for gold.fct_player_season_stats.
+        'sofascore_player_season_aggregate',
+        'dags/sql/silver/sofascore_player_season_aggregate.sql',
+        'sofascore_player_season_aggregate',
+    ),
 ]
 
 GOLD_E3_TRANSFORMS = [
