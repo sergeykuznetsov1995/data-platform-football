@@ -30,12 +30,9 @@ source:
       authType:
         password: "${TRINO_OPENMETADATA_PASSWORD}"
       catalog: iceberg
-      # SSL: cluster runs HTTPS with self-signed cert (configs/trino/certs/keystore.jks),
-      # so disable strict verification. For prod, mount the cert into the ingestion
-      # container and switch to `validate-ssl` + `sslConfig.caCertificate`.
-      verifySSL: no-ssl
-      # connectionArguments are forwarded to sqlalchemy.create_engine(...) → trino-python.
-      # `http_scheme=https` forces HTTPS; `verify=false` disables cert chain checks.
+      # SSL: cluster runs HTTPS with self-signed cert. OM 1.5.x dropped the
+      # top-level `verifySSL` field from TrinoConnection schema; SSL verify
+      # control is forwarded via SQLAlchemy `connectionArguments` only.
       connectionArguments:
         http_scheme: https
         verify: false
