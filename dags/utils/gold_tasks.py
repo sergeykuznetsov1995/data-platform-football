@@ -1120,18 +1120,31 @@ def validate_gold_quality() -> Dict[str, Any]:
             'player_id_canonical',
             parent_key='player_id_canonical',
         ),
-        # WS/US value-range plausibility (ERROR severity на явных
-        # bounded-domain метриках; nullable by design — LEFT JOIN). NULL
-        # passes (no coverage assertion здесь).
+        # Value-range plausibility — bounded domain метрики (ERROR на нарушение
+        # домена). T6: HARD_FACT pct metrics single-column (COALESCE WS→SS),
+        # MODELED xG/rating with per-source suffix.
         CHECK.value_range('gold.fct_player_season_stats', 'expected_goals_understat',
                           min_val=0, max_val=60, severity='ERROR'),
-        CHECK.value_range('gold.fct_player_season_stats', 'non_penalty_xg',
+        CHECK.value_range('gold.fct_player_season_stats', 'non_penalty_xg_understat',
                           min_val=0, max_val=60, severity='ERROR'),
-        CHECK.value_range('gold.fct_player_season_stats', 'pass_pct_whoscored',
+        CHECK.value_range('gold.fct_player_season_stats', 'pass_pct',
                           min_val=0, max_val=100, severity='ERROR'),
-        CHECK.value_range('gold.fct_player_season_stats', 'tackle_pct_whoscored',
+        CHECK.value_range('gold.fct_player_season_stats', 'tackle_pct',
                           min_val=0, max_val=100, severity='ERROR'),
-        CHECK.value_range('gold.fct_player_season_stats', 'take_on_pct_whoscored',
+        CHECK.value_range('gold.fct_player_season_stats', 'take_on_pct',
+                          min_val=0, max_val=100, severity='ERROR'),
+        # T6 — SofaScore rating (Opta-style 0-10 scale). ERROR — рейтинг
+        # вне диапазона указывает на ingest regression или schema drift.
+        CHECK.value_range('gold.fct_player_season_stats', 'rating_sofascore',
+                          min_val=0, max_val=10, severity='ERROR'),
+        # SofaScore pct metrics — единые HARD_FACT в [0, 100] (ERROR).
+        CHECK.value_range('gold.fct_player_season_stats', 'ground_duels_won_pct',
+                          min_val=0, max_val=100, severity='ERROR'),
+        CHECK.value_range('gold.fct_player_season_stats', 'aerial_duels_won_pct',
+                          min_val=0, max_val=100, severity='ERROR'),
+        CHECK.value_range('gold.fct_player_season_stats', 'total_duels_won_pct',
+                          min_val=0, max_val=100, severity='ERROR'),
+        CHECK.value_range('gold.fct_player_season_stats', 'goal_conversion_pct',
                           min_val=0, max_val=100, severity='ERROR'),
 
         # ============================================================

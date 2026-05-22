@@ -92,6 +92,18 @@ STAGE_2_DIMS = [
     ('dim_team',   'dags/sql/gold/dim_team.sql',   'dim_team',   ['league', 'season']),
     ('dim_player', 'dags/sql/gold/dim_player.sql', 'dim_player', ['league', 'season']),
     ('dim_match',  'dags/sql/gold/dim_match.sql',  'dim_match',  ['league', 'season']),
+    # T5 wiring restore + T6 SofaScore. Player-season block ОТСЮДА depends
+    # on Silver per-source aggregates (FBref/FotMob/WS/US/SofaScore) which
+    # are produced by dag_transform_e3 ahead of this DAG via master pipeline.
+    # dim_player_attributes — snapshot-grain (один row per canonical_id),
+    # season не в SELECT. Без partition cols.
+    ('dim_player_attributes',     'dags/sql/gold/dim_player_attributes.sql',
+     'dim_player_attributes',     None),
+    ('fct_player_season_stats',   'dags/sql/gold/fct_player_season_stats.sql',
+     'fct_player_season_stats',   ['league', 'season']),
+    ('fct_player_season_stats_audit',
+     'dags/sql/gold/fct_player_season_stats_audit.sql',
+     'fct_player_season_stats_audit', ['league', 'season']),
 ]
 
 # E2: master-data dims that are NOT partitioned by (league, season).
