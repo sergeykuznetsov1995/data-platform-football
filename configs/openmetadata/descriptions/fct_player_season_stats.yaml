@@ -1,0 +1,179 @@
+# =============================================================================
+# OpenMetadata description: iceberg.gold.fct_player_season_stats
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.gold.fct_player_season_stats
+  description: |
+    Wide per-season per-player stats объединяющие 5 источников
+    (FBref / FotMob / WhoScored / Understat / SofaScore) через silver.xref_player.
+
+    Правило выбора колонок (см. docs/research/RX_cross_source_player_profile.md
+    D3 + docs/research/RX2_xg_source_selection.md):
+
+      * HARD_FACT (счётные event-метрики, identical definition): single
+        column через variadic COALESCE(fb→fm→ws→us→ss). FBref — primary
+        spine. Cross-source diff'ы хранятся в gold.fct_player_season_stats_audit.
+      * MODELED (разные модели у разных платформ): xG публикуется с
+        per-source suffix — три разные модели (FotMob StatsBomb-derived,
+        Understat own, SofaScore Opta-derived). После RX2 verdict может
+        свернуться в single `expected_goals`.
+      * RATING: SofaScore (Opta-derived) выбран как единственный источник —
+        FotMob rating дропнут из business-fct, cross-source diff
+        остаётся в audit-таблице.
+      * UNIQUE_<source>: метрика отсутствует у других источников →
+        single column без суффикса.
+
+    Зерно: (player_id_canonical, league, season). Outfield-only (вратари
+    в fct_keeper_season_stats). Partitioning: (league, season).
+  tags:
+    - Tier.Gold
+    - Domain.Football
+    - PII.Low
+columns:
+  # ─── Identity ───
+  - name: player_id_canonical
+    description: Канонический ID игрока (PK part). FK → dim_player_attributes.
+  - name: league
+    description: Лига (partition key).
+  - name: season
+    description: Сезон в bigint формате (2025 == 2025/26). Partition key.
+  - name: primary_team_name
+    description: Команда per-season (COALESCE FBref → FotMob).
+  - name: position_fbref
+    description: Позиция из FBref (DF/MF/FW/GK).
+  - name: position_fotmob
+    description: Позиция из FotMob (другая шкала классификации).
+
+  # ─── HARD_FACT (key metrics — single column COALESCE) ───
+  - name: matches
+    description: Matches played (COALESCE FBref → FotMob → WhoScored → Understat).
+  - name: minutes
+    description: Minutes played (COALESCE FBref → FotMob → Understat).
+  - name: goals
+    description: Голы (COALESCE FBref → FotMob → Understat).
+  - name: assists
+    description: Ассисты (COALESCE FBref → FotMob → Understat).
+  - name: yellow_cards
+    description: Жёлтые карточки.
+  - name: red_cards
+    description: Красные карточки.
+  - name: shots
+    description: Все удары (COALESCE FBref → FotMob → WS → Understat → SofaScore).
+  - name: shots_on_target
+    description: Удары в створ.
+  - name: interceptions
+    description: Перехваты (COALESCE FBref → FotMob → WhoScored → SofaScore).
+  - name: tackles_won
+    description: Выигранные отборы.
+  - name: tackles_attempted
+    description: Все попытки отбора.
+  - name: successful_dribbles
+    description: Успешные дриблинги (COALESCE FotMob → WhoScored → SofaScore).
+  - name: key_passes
+    description: Передачи под удар (COALESCE Understat → SofaScore).
+  - name: non_penalty_goals
+    description: Голы без пенальти (COALESCE Understat → derived FBref).
+  - name: pass_pct
+    description: Pass accuracy % (COALESCE WhoScored → SofaScore — расхождение моделей ≤2%, приемлемо).
+  - name: take_on_pct
+    description: Take-on / dribble success %.
+  - name: tackle_pct
+    description: Tackle success %.
+
+  # ─── MODELED (per-source suffix, будут свернуты после RX2) ───
+  - name: expected_goals_fotmob
+    description: xG модель FotMob (StatsBomb-derived). После RX2 может стать `expected_goals`.
+  - name: expected_goals_understat
+    description: xG модель Understat (proprietary). Историческая глубина 2014+.
+  - name: expected_goals_sofascore
+    description: xG модель SofaScore (Opta-derived). Полный coverage текущего сезона.
+  - name: expected_assists_fotmob
+    description: xA модель FotMob.
+  - name: expected_assists_understat
+    description: xA модель Understat.
+  - name: expected_goals_on_target
+    description: xGOT (FotMob proprietary).
+  - name: non_penalty_xg_understat
+    description: Non-penalty xG (Understat-only).
+  - name: xg_chain_understat
+    description: xG Chain — суммарный xG атак с участием игрока (Understat-only).
+  - name: xg_buildup_understat
+    description: xG Buildup — xG Chain без своих shots/assists (Understat-only).
+  - name: rating_sofascore
+    description: SofaScore rating (0-10, Opta-style). Единственный rating-источник.
+
+  # ─── UNIQUE_FBREF (FBref-only метрики) ───
+  - name: complete_matches
+    description: Полные матчи (FBref-only).
+  - name: starts
+    description: Стартовые составы (FBref-only).
+  - name: subs
+    description: Выходы на замену.
+  - name: plus_minus
+    description: Plus/minus.
+  - name: points_per_match
+    description: Points per match (FBref).
+  - name: goals_per_shot
+    description: Голы на удар.
+
+  # ─── UNIQUE_FOTMOB ───
+  - name: defensive_actions
+    description: Composite defensive actions (FotMob proprietary).
+  - name: big_chances_created
+    description: Big chances created (FotMob).
+  - name: big_chances_missed
+    description: Big chances missed (FotMob).
+  - name: chances_created
+    description: Chances created (FotMob).
+
+  # ─── UNIQUE_WHOSCORED ───
+  - name: bad_touches
+    description: Плохие касания / потери (WhoScored-only).
+  - name: touches_in_box
+    description: Касания в чужой штрафной (WhoScored-only).
+  - name: avg_x
+    description: Средняя X-координата действий (WhoScored).
+  - name: avg_y
+    description: Средняя Y-координата действий (WhoScored).
+
+  # ─── UNIQUE_SOFASCORE (key only — duels / errors / goal structure) ───
+  - name: ground_duels_won
+    description: Выигранные наземные дуэли (SofaScore-only).
+  - name: aerial_duels_won
+    description: Выигранные верховые дуэли.
+  - name: total_duels_won
+    description: Все выигранные дуэли.
+  - name: errors_lead_to_goal
+    description: Ошибки, приведшие к голу (критическая дефенсивная метрика).
+  - name: errors_lead_to_shot
+    description: Ошибки, приведшие к удару соперника.
+  - name: touches
+    description: Все касания мяча (SofaScore-only).
+  - name: dispossessed
+    description: Потери мяча через отбор.
+  - name: possession_lost
+    description: Все потери владения.
+  - name: shots_inside_box
+    description: Удары из чужой штрафной.
+  - name: shots_outside_box
+    description: Удары из-за штрафной.
+  - name: goals_inside_box
+    description: Голы из чужой штрафной.
+  - name: goals_outside_box
+    description: Голы из-за штрафной.
+  - name: headed_goals
+    description: Голы головой.
+  - name: left_foot_goals
+    description: Голы левой ногой.
+  - name: right_foot_goals
+    description: Голы правой ногой.
+  - name: goal_conversion_pct
+    description: "% конверсии ударов в голы."
+
+  - name: _gold_created_at
+    description: Технический timestamp создания строки в Gold-слое.
+relationships:
+  - from: player_id_canonical
+    to: trino_iceberg.iceberg.gold.dim_player_attributes.player_id_canonical
+    type: FOREIGN_KEY
+    description: N:1 — атрибуты игрока (snapshot per canonical_id).
