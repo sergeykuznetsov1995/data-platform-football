@@ -254,7 +254,7 @@ class TestCascadeResolve:
         # Defensive: orphan-prefix lookup is hard-coded so a typo blows up
         # rather than silently emitting a malformed canonical_id.
         cand = {
-            'source': 'fotmob',  # not in {'understat','whoscored','sofascore'}
+            'source': 'tranfermarkt',  # not in resolver SOURCES
             'source_id': '1',
             'player_name': 'Random Person',
             'canonical_team': 'Arsenal',
@@ -547,7 +547,7 @@ class TestResolveAll:
             self._src_row('whoscored', '999', 'Saka Bukayo', 'Arsenal'),
         ]
 
-        rows, review, stats = xpr._resolve_all(fb, us, ws)
+        rows, review, stats = xpr._resolve_all(fb, us, ws, [])
 
         # Total rows = 2 fb + 2 us + 1 ws.
         assert len(rows) == 5
@@ -588,7 +588,7 @@ class TestResolveAll:
         fb = [self._fb_row('aaa', 'Some Name', 'Arsenal')]
         us = [self._src_row('understat', 'u_only', 'Nobody Match', 'Arsenal')]
         ws = [self._src_row('whoscored', 'w_only', 'Nobody Match', 'Arsenal')]
-        rows, _review, _stats = xpr._resolve_all(fb, us, ws)
+        rows, _review, _stats = xpr._resolve_all(fb, us, ws, [])
         orphans = {r['source']: r['canonical_id'] for r in rows
                    if r['confidence'] == 'orphan'}
         assert orphans == {

@@ -460,7 +460,8 @@ class TestBackwardCompat:
         }]
         us = [_candidate('understat', 'u1', 'Some Player', 'Arsenal')]
         ws: List[Dict] = []
-        result = xpr._resolve_all(fb, us, ws)
+        ss: List[Dict] = []
+        result = xpr._resolve_all(fb, us, ws, ss)
         assert isinstance(result, tuple)
         assert len(result) == 3
         rows, review, stats = result

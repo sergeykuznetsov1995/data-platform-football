@@ -288,21 +288,21 @@ def build_xref_player_checks() -> List[Check]:
             severity='ERROR',
         ),
 
-        # source enum — 3 sources at E1 (FBref / Understat / WhoScored)
+        # source enum — 5 sources (T6 added SofaScore + restored FotMob).
         check_enum_compliance(
             table, 'source',
-            allowed=['fbref', 'understat', 'whoscored'],
+            allowed=['fbref', 'understat', 'whoscored', 'fotmob', 'sofascore'],
             severity='ERROR',
         ),
 
-        # canonical_id format guard — must start with one of the 4 known
-        # prefixes (fb_/us_/ws_/ss_). Regex via Trino regexp_like.
+        # canonical_id format guard — must start with one of the 5 known
+        # prefixes (fb_/us_/ws_/fm_/ss_). Regex via Trino regexp_like.
         # We express this as a row_count of offending rows.
         CHECK.row_count(
             table=table,
             min_rows=0,
             max_rows=0,
-            where="NOT regexp_like(canonical_id, '^(fb|us|ws|ss)_.+$')",
+            where="NOT regexp_like(canonical_id, '^(fb|us|ws|fm|ss)_.+$')",
             severity='ERROR',
             name='canonical_id_format[xref_player]',
         ),
@@ -356,7 +356,7 @@ def build_xref_player_review_checks() -> List[Check]:
 
         check_enum_compliance(
             table, 'source',
-            allowed=['understat', 'whoscored', 'sofascore'],
+            allowed=['understat', 'whoscored', 'fotmob', 'sofascore'],
             severity='ERROR',
         ),
     ]

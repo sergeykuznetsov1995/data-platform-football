@@ -28,7 +28,8 @@ Pipeline
    batched INSERT (500 rows per VALUES tuple to stay within Trino SQL
    length limits).
 5. Known-pair regression guard — 10 hand-picked APL 2024-25 players must
-   resolve into a single ``canonical_id`` across all 3 sources. Pass-rate
+   resolve into a single ``canonical_id`` across FBref/Understat/WhoScored
+   (SofaScore intentionally excluded from regression at T6). Pass-rate
    < 8/10 raises :class:`ResolverError`.
 
 Why Python (not pure SQL)?
@@ -106,11 +107,11 @@ SURNAME_LEVENSHTEIN_MAX: int = 1
 #: too many false matches (Cole/Cone/Cool, Saka/Sako).
 SURNAME_MIN_LEN: int = 4
 
-#: Sources covered at E1. ``sofascore`` and ``fotmob`` are deferred to the
-#: R0.2 follow-up (Bronze tables for those sources do not yet expose a
-#: stable per-player id row). ``sofifa`` has its own season-alignment
-#: problem (FIFA seasons != football seasons) and is a separate effort.
-SOURCES: Tuple[str, ...] = ('fbref', 'understat', 'whoscored')
+#: Sources covered. ``sofifa`` has its own season-alignment problem
+#: (FIFA seasons != football seasons) and is a separate effort.
+SOURCES: Tuple[str, ...] = (
+    'fbref', 'understat', 'whoscored', 'fotmob', 'sofascore',
+)
 
 #: Default batch size for ``INSERT INTO ... VALUES (...)``. 500 fits
 #: comfortably under Trino's default ``query.max-length`` (≈ 16 MB) for
@@ -641,6 +642,7 @@ def _orphan_prefix(source: str) -> str:
     return {
         'understat': 'us',
         'whoscored': 'ws',
+        'fotmob':    'fm',
         'sofascore': 'ss',
     }[source]
 
@@ -839,6 +841,91 @@ def _fetch_whoscored_players(
                 'player_name': name,
                 'raw_team_name': team,
                 'canonical_team': canonical_team_for_resolver(team, 'whoscored'),
+                'league': lg,
+                'season': season,
+            }
+        )
+    return out
+
+
+def _fetch_fotmob_players(
+    conn, league: str, fbref_seasons: List[int]
+) -> List[Dict[str, Any]]:
+    """Read FotMob player anchor rows for the resolver cascade.
+
+    Bronze ``fotmob_player_details`` carries player_id + name + primary_team
+    per (league, season=bigint). Season is the FBref-style year-of-start
+    (e.g. 2025 for 2025/26) — convert to slug ('2526') before emission so
+    the spine index keys agree with Understat/WhoScored.
+    """
+    sql = f"""
+        SELECT player_id, name, primary_team_name, league, season
+        FROM iceberg.bronze.fotmob_player_details
+        WHERE league = '{_sql_escape(league)}'
+          AND season IN ({_seasons_in_clause(fbref_seasons)})
+          AND COALESCE(is_coach, false) = false
+          AND name IS NOT NULL
+        GROUP BY player_id, name, primary_team_name, league, season
+    """
+    rows = _execute(conn, sql, fetch=True) or []
+    out: List[Dict[str, Any]] = []
+    seen: set = set()
+    for pid, name, team, lg, season in rows:
+        if pid in seen:
+            continue
+        seen.add(pid)
+        season_slug = _fbref_year_to_slug(season)
+        out.append(
+            {
+                'source': 'fotmob',
+                'source_id': str(pid),
+                'player_name': name,
+                'raw_team_name': team,
+                'canonical_team': canonical_team_for_resolver(team, 'fotmob'),
+                'league': lg,
+                'season': season_slug,
+            }
+        )
+    return out
+
+
+def _fetch_sofascore_players(
+    conn, league: str, source_seasons: List[str]
+) -> List[Dict[str, Any]]:
+    """Read SofaScore player anchor rows for the resolver cascade.
+
+    Bronze ``sofascore_player_season_stats`` does NOT carry a player_name
+    column (the season-stats flattener only emits team_name + IDs + stats).
+    The display name needed for the fuzzy ``name_team`` tier comes from a
+    LEFT JOIN to ``bronze.sofascore_player_profile`` which DOES carry
+    ``name`` / ``short_name``. If profile is sparse, the cascade will
+    silently fall through to orphan — that is expected.
+    """
+    sql = f"""
+        SELECT
+            CAST(b.player_id AS varchar) AS pid,
+            COALESCE(MAX(p.name), MAX(p.short_name)) AS player_name,
+            MAX(b.team_name) AS team,
+            b.league,
+            b.season
+        FROM iceberg.bronze.sofascore_player_season_stats b
+        LEFT JOIN iceberg.bronze.sofascore_player_profile p
+          ON p.player_id = b.player_id
+        WHERE b.league = '{_sql_escape(league)}'
+          AND b.season IN ({_seasons_in_clause(source_seasons)})
+          AND b.player_id IS NOT NULL
+        GROUP BY CAST(b.player_id AS varchar), b.league, b.season
+    """
+    rows = _execute(conn, sql, fetch=True) or []
+    out: List[Dict[str, Any]] = []
+    for pid, name, team, lg, season in rows:
+        out.append(
+            {
+                'source': 'sofascore',
+                'source_id': pid,
+                'player_name': name,
+                'raw_team_name': team,
+                'canonical_team': canonical_team_for_resolver(team, 'sofascore'),
                 'league': lg,
                 'season': season,
             }
@@ -1097,6 +1184,8 @@ def _resolve_all(
     fb_rows: List[Dict[str, Any]],
     us_rows: List[Dict[str, Any]],
     ws_rows: List[Dict[str, Any]],
+    ss_rows: List[Dict[str, Any]],
+    fm_rows: Optional[List[Dict[str, Any]]] = None,
     *,
     nn: Any = None,
     detected_at: Any = None,
@@ -1105,7 +1194,7 @@ def _resolve_all(
     List[Dict[str, Any]],
     Dict[str, Dict[str, int]],
 ]:
-    """Apply the cascade across all 3 sources.
+    """Apply the cascade across all 5 sources.
 
     Returns ``(xref_rows, review_rows, per_source_stats)``.
 
@@ -1113,7 +1202,9 @@ def _resolve_all(
 
         {'fbref':     {'total': N, 'resolved': N, 'orphan': 0,  'ambiguous': 0},
          'understat': {'total': N, 'resolved': X, 'orphan': Y,  'ambiguous': Z},
-         'whoscored': {'total': N, 'resolved': X, 'orphan': Y,  'ambiguous': Z}}
+         'whoscored': {'total': N, 'resolved': X, 'orphan': Y,  'ambiguous': Z},
+         'fotmob':    {'total': N, 'resolved': X, 'orphan': Y,  'ambiguous': Z},
+         'sofascore': {'total': N, 'resolved': X, 'orphan': Y,  'ambiguous': Z}}
 
     NB: ``total = resolved + orphan + ambiguous``. Ambiguous candidates are
     NOT inserted into ``xref_player`` — they live in ``xref_player_review``
@@ -1167,7 +1258,8 @@ def _resolve_all(
         stats['fbref']['resolved'] += 1
 
     # Cascade for non-FBref sources.
-    for src_rows in (us_rows, ws_rows):
+    fm_rows = fm_rows or []
+    for src_rows in (us_rows, ws_rows, fm_rows, ss_rows):
         for row in src_rows:
             ambiguity_info: Dict[str, Any] = {}
             cid, conf, score = cascade_resolve(
@@ -1208,6 +1300,14 @@ def _verify_known_pairs(rows: List[Dict[str, Any]]) -> Tuple[int, int]:
 
     Done in-memory rather than as a Trino query so the regression check
     works even when the INSERT step is mocked out (e.g. unit tests).
+
+    NOTE: SofaScore intentionally excluded from the regression set —
+    first full backfill may not produce 10/10 SofaScore matches against
+    the FBref known-pair canonical_ids (player name JOIN-ed from
+    sofascore_player_profile which may be sparse). FotMob also excluded
+    from the strict assertion (separate ingest, sparser name match).
+    Their resolution rate is verified via per-source stats (logged) and
+    orphan-rate DQ.
     """
     by_cid: Dict[str, set] = {}
     for r in rows:
@@ -1319,7 +1419,7 @@ def run_resolver(
     review_table: str = DEFAULT_REVIEW_TABLE,
     materialize_review: bool = True,
 ) -> Dict[str, Any]:
-    """Full pipeline: read 3 Bronze sources -> resolve -> write Iceberg.
+    """Full pipeline: read 5 Bronze sources -> resolve -> write Iceberg.
 
     Args:
         target_table: Fully-qualified Iceberg table for the canonical
@@ -1404,9 +1504,17 @@ def run_resolver(
         ws = _fetch_whoscored_players(conn, league, source_seasons)
         logger.info("  %d WhoScored players", len(ws))
 
+        logger.info("Reading FotMob players ...")
+        fm = _fetch_fotmob_players(conn, league, fbref_seasons)
+        logger.info("  %d FotMob players", len(fm))
+
+        logger.info("Reading SofaScore players ...")
+        ss = _fetch_sofascore_players(conn, league, source_seasons)
+        logger.info("  %d SofaScore players", len(ss))
+
         logger.info("Resolving identities ...")
         rows, review_rows, stats = _resolve_all(
-            fb, us, ws, nn=nn, detected_at=detected_at
+            fb, us, ws, ss, fm, nn=nn, detected_at=detected_at
         )
         logger.info(
             "  produced %d xref rows, %d review rows",
