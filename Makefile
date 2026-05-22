@@ -2,14 +2,16 @@
 # Data Platform - Makefile
 # =============================================================================
 
-.PHONY: help build up down restart logs ps clean health test-spark test-trino init-hdfs init-storage shell-spark shell-airflow shell-trino test-fbref-curl test-fbref-nodriver test-fbref-full test-proxy-stats up-bi up-catalog down-bi down-catalog superset-init superset-import superset-dashboards om-ingest-trino om-lineage-trino om-apply-descriptions logs-superset logs-om shell-superset shell-om
+.PHONY: help build up up-lite up-full up-build down restart logs ps clean health test-spark test-trino init-hdfs init-storage shell-spark shell-airflow shell-trino test-fbref-curl test-fbref-nodriver test-fbref-full test-proxy-stats up-bi up-catalog down-bi down-catalog superset-init superset-import superset-dashboards om-ingest-trino om-lineage-trino om-apply-descriptions logs-superset logs-om shell-superset shell-om
 
 # Default target
 help:
 	@echo "Data Platform Commands:"
 	@echo ""
 	@echo "  make build        - Build all Docker images"
-	@echo "  make up           - Start all services"
+	@echo "  make up           - Start ALL services (core + heavy: spark, OM, ES, superset-worker/beat, tor)"
+	@echo "  make up-lite      - Start CORE only (saves ~4GB RAM; recommended on 11GB VM)"
+	@echo "  make up-full      - Alias for 'make up' (all services)"
 	@echo "  make down         - Stop all services"
 	@echo "  make restart      - Restart all services"
 	@echo "  make logs         - Show logs (use SERVICE=name for specific)"
@@ -51,25 +53,37 @@ help:
 build:
 	docker compose build
 
-# Start services
+# Start services (FULL: core + heavy profile = spark, OM, ES, superset-worker/beat, tor)
 up:
+	docker compose --profile heavy up -d
+	@echo ""
+	@echo "Waiting for services to start..."
+	@sleep 10
+	@$(MAKE) ps
+
+# Start services with build (FULL)
+up-build:
+	docker compose --profile heavy up -d --build
+	@echo ""
+	@echo "Waiting for services to start..."
+	@sleep 10
+	@$(MAKE) ps
+
+# Start LITE stack (core only: HDFS + Hive + Postgres + Redis + Airflow + Trino + Superset + FlareSolverr).
+# Skips: spark-*, superset-worker/beat, elasticsearch, openmetadata-*, tor. Use when RAM-constrained.
+up-lite:
 	docker compose up -d
 	@echo ""
 	@echo "Waiting for services to start..."
 	@sleep 10
 	@$(MAKE) ps
 
-# Start services with build
-up-build:
-	docker compose up -d --build
-	@echo ""
-	@echo "Waiting for services to start..."
-	@sleep 10
-	@$(MAKE) ps
+# Alias for clarity
+up-full: up
 
-# Stop services
+# Stop services (includes heavy profile so nothing is left orphaned)
 down:
-	docker compose down
+	docker compose --profile heavy down
 
 # Restart services
 restart:

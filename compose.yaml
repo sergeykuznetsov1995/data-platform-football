@@ -268,6 +268,7 @@ services:
   # Spark Cluster
   # ===========================================================================
   spark-master:
+    profiles: ["heavy"]
     build:
       context: ./docker/images/spark
       dockerfile: Dockerfile
@@ -312,6 +313,7 @@ services:
           memory: 256M
 
   spark-worker-1:
+    profiles: ["heavy"]
     build:
       context: ./docker/images/spark
       dockerfile: Dockerfile
@@ -353,6 +355,7 @@ services:
           memory: 256M
 
   spark-worker-2:
+    profiles: ["heavy"]
     build:
       context: ./docker/images/spark
       dockerfile: Dockerfile
@@ -431,6 +434,7 @@ services:
   # Tor Proxy - Alternative for Cloudflare bypass
   # ===========================================================================
   tor:
+    profiles: ["heavy"]
     image: dperson/torproxy:0.3.1
     container_name: tor
     hostname: tor
@@ -645,6 +649,7 @@ services:
           memory: 512M
 
   superset-worker:
+    profiles: ["heavy"]
     image: data-platform/superset:4.1.1
     container_name: superset-worker
     hostname: superset-worker
@@ -687,6 +692,7 @@ services:
           memory: 256M
 
   superset-beat:
+    profiles: ["heavy"]
     image: data-platform/superset:4.1.1
     container_name: superset-beat
     hostname: superset-beat
@@ -731,6 +737,7 @@ services:
   # Elasticsearch - search backend for OpenMetadata
   # ===========================================================================
   elasticsearch:
+    profiles: ["heavy"]
     image: elasticsearch:8.11.4
     container_name: elasticsearch
     hostname: elasticsearch
@@ -778,6 +785,7 @@ services:
   # OpenMetadata - Data Catalog & Lineage
   # ===========================================================================
   openmetadata-server:
+    profiles: ["heavy"]
     image: openmetadata/server:1.5.0
     container_name: openmetadata-server
     hostname: openmetadata-server
@@ -850,6 +858,7 @@ services:
           memory: 768M
 
   openmetadata-ingestion:
+    profiles: ["heavy"]
     image: openmetadata/ingestion:1.5.0
     container_name: openmetadata-ingestion
     hostname: openmetadata-ingestion
