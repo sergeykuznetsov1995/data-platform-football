@@ -153,6 +153,15 @@ SILVER_E3_TRANSFORMS = [
         'dags/sql/silver/sofascore_player_season_aggregate.sql',
         'sofascore_player_season_aggregate',
     ),
+    (
+        # Time-invariant атрибуты игрока (height, foot, dob, nationality)
+        # из SofaScore. Снепшот-таблица per (player_id, league, season)
+        # с подтянутым canonical_id из silver.xref_player — feeds the
+        # SofaScore-block в gold.dim_player_attributes.
+        'sofascore_player_profile',
+        'dags/sql/silver/sofascore_player_profile.sql',
+        'sofascore_player_profile',
+    ),
 ]
 
 GOLD_E3_TRANSFORMS = [

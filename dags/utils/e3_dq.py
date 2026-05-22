@@ -877,14 +877,42 @@ def _build_fct_lineup_checks() -> List[Check]:
 # Public builder API
 # ---------------------------------------------------------------------------
 
+def _build_sofascore_player_profile_checks() -> List[Check]:
+    """DQ for ``iceberg.silver.sofascore_player_profile``.
+
+    Snapshot-grain (one row per (player_id, league, season)) с canonical_id
+    bridge через silver.xref_player. Coverage thresholds отражают APL
+    2025/26 (526 rows, 95% canonical match при первой материализации).
+    """
+    table = 'iceberg.silver.sofascore_player_profile'
+    return [
+        CHECK.no_duplicates(
+            table,
+            pk=['player_id', 'league', 'season'],
+        ),
+        CHECK.no_nulls(
+            table,
+            cols=['player_id', 'league', 'season'],
+        ),
+        CHECK.row_count(table, min_rows=400, severity='WARNING'),
+        # Physical attribute bounds — high outliers flag ingest regression.
+        CHECK.value_range(
+            table, 'height_cm',
+            min_val=140, max_val=220, severity='WARNING',
+        ),
+    ]
+
+
 def build_silver_e3_checks() -> List[Check]:
     """Return DQ checks for Silver E3 tables.
 
-    Composition: ``whoscored_events_spadl`` + ``espn_lineup``.
+    Composition: ``whoscored_events_spadl`` + ``espn_lineup`` +
+    ``sofascore_player_profile``.
     """
     return (
         _build_whoscored_events_spadl_checks()
         + _build_espn_lineup_checks()
+        + _build_sofascore_player_profile_checks()
     )
 
 
