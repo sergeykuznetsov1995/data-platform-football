@@ -127,3 +127,15 @@ SQLLAB_ASYNC_TIME_LIMIT_SEC = 600
 # -----------------------------------------------------------------------------
 ENABLE_TIME_ROTATE = True
 LOG_LEVEL = os.environ.get("SUPERSET_LOG_LEVEL", "INFO")
+
+# -----------------------------------------------------------------------------
+# Session persistence — make login survive browser close (cookie gets Expires)
+# Without this, Flask default = browser-session cookie → tab close = re-login.
+# PERMANENT_SESSION_LIFETIME (Superset default = 7d) only applies when permanent.
+# -----------------------------------------------------------------------------
+def FLASK_APP_MUTATOR(app):
+    from flask import session
+
+    @app.before_request
+    def _make_session_permanent() -> None:
+        session.permanent = True
