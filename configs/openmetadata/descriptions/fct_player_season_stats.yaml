@@ -80,19 +80,17 @@ columns:
   - name: tackle_pct
     description: Tackle success %.
 
-  # ─── MODELED (per-source suffix, будут свернуты после RX2) ───
-  - name: expected_goals_fotmob
-    description: xG модель FotMob (StatsBomb-derived). После RX2 может стать `expected_goals`.
-  - name: expected_goals_understat
-    description: xG модель Understat (proprietary). Историческая глубина 2014+.
-  - name: expected_goals_sofascore
-    description: xG модель SofaScore (Opta-derived). Полный coverage текущего сезона.
-  - name: expected_assists_fotmob
-    description: xA модель FotMob.
-  - name: expected_assists_understat
-    description: xA модель Understat.
+  # ─── MODELED (single column after RX2) ───
+  - name: expected_goals
+    description: |
+      xG через COALESCE(Understat → FotMob → SofaScore). Understat — primary
+      источник (coverage 99% в APL 2025/26, r≥0.989 с другими). Cross-source
+      diff'ы хранятся в fct_player_season_stats_audit для DQ-мониторинга.
+      См. docs/research/RX2_xg_source_selection.md.
+  - name: expected_assists
+    description: xA через COALESCE(Understat → FotMob). Single column after RX2.
   - name: expected_goals_on_target
-    description: xGOT (FotMob proprietary).
+    description: xGOT (FotMob proprietary — нет аналогов у других источников).
   - name: non_penalty_xg_understat
     description: Non-penalty xG (Understat-only).
   - name: xg_chain_understat

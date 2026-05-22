@@ -1133,7 +1133,7 @@ def validate_gold_quality() -> Dict[str, Any]:
         # Value-range plausibility — bounded domain метрики (ERROR на нарушение
         # домена). T6: HARD_FACT pct metrics single-column (COALESCE WS→SS),
         # MODELED xG/rating with per-source suffix.
-        CHECK.value_range('gold.fct_player_season_stats', 'expected_goals_understat',
+        CHECK.value_range('gold.fct_player_season_stats', 'expected_goals',
                           min_val=0, max_val=60, severity='ERROR'),
         CHECK.value_range('gold.fct_player_season_stats', 'non_penalty_xg_understat',
                           min_val=0, max_val=60, severity='ERROR'),

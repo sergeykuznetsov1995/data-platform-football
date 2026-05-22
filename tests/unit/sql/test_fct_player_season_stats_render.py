@@ -188,19 +188,35 @@ class TestFctPlayerSeasonStatsSql:
                 f"UNIQUE_SOFASCORE column `{col}` must come from ss."
             )
 
-    def test_modeled_xg_per_source_suffixes(self):
-        """MODELED — xG публикуется с per-source suffix, потому что три
-        источника используют разные модели (FotMob StatsBomb-derived,
-        Understat own, SofaScore Opta-derived). После RX2 research одна
-        из этих колонок может быть свёрнута в single `expected_goals`."""
+    def test_xg_single_column_after_rx2(self):
+        """RX2 verdict: xG свёрнут в single `expected_goals` через
+        COALESCE(us → fm → ss). Per-source suffix колонки удалены."""
         sql = _read_sql()
-        for col in (
+        # Single-column expected_goals + expected_assists должны присутствовать.
+        for col in ('expected_goals', 'expected_assists'):
+            assert re.search(
+                rf"COALESCE\([^)]*\)\s*,?\s*2?\)?\s+AS\s+{col}\b",
+                sql, re.IGNORECASE,
+            ) or re.search(rf"\bAS\s+{col}\b", sql, re.IGNORECASE), (
+                f"`{col}` must be projected as a single COALESCE column"
+            )
+        # Per-source suffix колонки удалены из business-fct.
+        for stale in (
             'expected_goals_fotmob',
-            'expected_goals_understat',
             'expected_goals_sofascore',
+            'expected_assists_fotmob',
+        ):
+            assert not re.search(rf"\bAS\s+{stale}\b", sql, re.IGNORECASE), (
+                f"`{stale}` must be removed from business fct (RX2 verdict)"
+            )
+        # Understat-unique метрики остаются с суффиксом (нет overlap с другими).
+        for col in (
+            'non_penalty_xg_understat',
+            'xg_chain_understat',
+            'xg_buildup_understat',
         ):
             assert re.search(rf"\bAS\s+{col}\b", sql, re.IGNORECASE), (
-                f"MODELED xG column `{col}` must be projected"
+                f"Understat-unique `{col}` must be projected"
             )
 
     def test_ws_us_join_uses_season_slug(self):

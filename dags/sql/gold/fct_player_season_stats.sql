@@ -10,12 +10,13 @@
 --   * HARD_FACT (счётные event-метрики, identical definition) →
 --     single column через COALESCE(fb→fm→ws→us→ss). FBref — primary spine.
 --     Cross-source diff'ы выносятся в `fct_player_season_stats_audit`.
---   * MODELED (разные модели) → суффикс `_<source>` оставляется
---     (xG: FotMob vs Understat vs SofaScore — три разные модели; будет
---      свёрнут в single column после RX2 research).
---   * RATING: SofaScore (Opta-derived) выбран как единственный источник —
---     FotMob rating дропнут из business-fct; cross-source diff остаётся
---     в audit-таблице.
+--   * MODELED — два решения после исследований:
+--     - xG / xA: Understat выбран как primary (RX2 — coverage 99% vs
+--       82-85%; r≥0.989 между источниками). Single column через
+--       COALESCE(us → fm → ss).
+--     - RATING: SofaScore (Opta-derived) выбран как единственный источник —
+--       FotMob rating дропнут из business-fct; cross-source diff остаётся
+--       в audit-таблице.
 --   * UNIQUE_<source> (метрика отсутствует у других) → single column,
 --     без суффикса.
 --
@@ -119,14 +120,17 @@ SELECT
     ROUND(ss.accurate_crosses_pct, 2)                                                  AS accurate_crosses_pct,
     ROUND(ss.accurate_long_balls_pct, 2)                                               AS accurate_long_balls_pct,
 
-    -- ========= MODELED (разные модели у разных платформ → суффиксы) =========
-    -- xG: FotMob (StatsBomb-derived), Understat (own), SofaScore (Opta-derived).
-    -- xA: FotMob, Understat. Rating: FotMob (own 0-10), SofaScore (Opta 0-10).
-    ROUND(fm.expected_goals, 2)                          AS expected_goals_fotmob,
-    ROUND(us.expected_goals, 2)                          AS expected_goals_understat,
-    ROUND(ss.expected_goals, 2)                          AS expected_goals_sofascore,
-    ROUND(fm.expected_assists, 2)                        AS expected_assists_fotmob,
-    ROUND(us.expected_assists, 2)                        AS expected_assists_understat,
+    -- ========= MODELED — после RX2: xG/xA single column =========
+    -- Understat выбран как primary источник (coverage 99% vs 82-85%; r≥0.989
+    -- между источниками — choice almost lossless). COALESCE fallback
+    -- us → fm → ss catches the ~1% Understat-gap (U21 / backup minutes).
+    -- Cross-source diff'ы (FBref - <source> aren't applicable here; the
+    -- relevant diff is us vs fm vs ss) хранятся в fct_player_season_stats_audit.
+    -- См. docs/research/RX2_xg_source_selection.md.
+    ROUND(COALESCE(us.expected_goals, fm.expected_goals, ss.expected_goals), 2)   AS expected_goals,
+    ROUND(COALESCE(us.expected_assists, fm.expected_assists), 2)                  AS expected_assists,
+    -- expected_goals_on_target / xG-Chain / xG-Buildup — source-unique
+    -- метрики (нет аналогов у других провайдеров), single column как UNIQUE_*.
     ROUND(fm.expected_goals_on_target, 2)                AS expected_goals_on_target,
     ROUND(us.non_penalty_xg, 2)                          AS non_penalty_xg_understat,
     ROUND(us.xg_chain, 2)                                AS xg_chain_understat,
