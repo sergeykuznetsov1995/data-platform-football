@@ -1,10 +1,9 @@
 """Render-smoke for ``dags/sql/gold/fct_player_season_stats.sql``.
 
-T5: cross-source per-season stats per canonical player. FBref-spine + FotMob
-bridge через silver.xref_player. Outfield only (вратари в
-fct_keeper_season_stats). Wide single-column для overlap (FBref primary,
-COALESCE FotMob); UNIQUE_FBREF / UNIQUE_FOTMOB — own column; audit
-`<metric>_diff_fotmob` для калибровки расхождений.
+T6: cross-source per-season stats per canonical player across 5 sources
+(FBref/FotMob/WhoScored/Understat/SofaScore). FBref-spine; HARD_FACT
+metrics single-column через variadic COALESCE; UNIQUE_<source> single
+column; MODELED metrics (xG/xA/rating) keep per-source suffix.
 """
 
 from __future__ import annotations
@@ -96,31 +95,31 @@ class TestFctPlayerSeasonStatsSql:
                 f"PK column `{col}` must be projected"
             )
 
-    def test_eight_hard_fact_coalesce_columns(self):
-        """8 HARD_FACT overlap метрик публикуются single-column через COALESCE
-        (FBref primary, FotMob+WS+US fallback). Цепочка variadic — regex
-        принимает 2-arg (penalties_*) и 3/4-arg для остальных."""
+    def test_hard_fact_coalesce_columns(self):
+        """HARD_FACT overlap метрик публикуются single-column через variadic
+        COALESCE. FBref primary spine; cascade fb→fm→ws→us→ss (subset of
+        sources per metric — depends on what each source materialises).
+        Regex принимает любой N-arg COALESCE начиная с fb.<col>."""
         sql = _read_sql()
         hard_facts = [
-            ('mp', 'matches_played', 'matches'),
-            ('minutes', 'minutes_played', 'minutes'),
-            ('goals', 'goals', 'goals'),
-            ('assists', 'assists', 'assists'),
-            ('yellow_cards', 'yellow_cards', 'yellow_cards'),
-            ('red_cards', 'red_cards', 'red_cards'),
-            ('penalties_won', 'penalties_won', 'penalties_won'),
-            ('penalties_conceded', 'penalties_conceded', 'penalties_conceded'),
+            ('mp', 'matches'),
+            ('minutes', 'minutes'),
+            ('goals', 'goals'),
+            ('assists', 'assists'),
+            ('yellow_cards', 'yellow_cards'),
+            ('red_cards', 'red_cards'),
+            ('penalties_won', 'penalties_won'),
+            ('penalties_conceded', 'penalties_conceded'),
         ]
-        for fb_col, fm_col, alias in hard_facts:
-            # Variadic COALESCE: FBref primary, FotMob fallback, + optional
-            # additional fallbacks (ws.*, us.*). Закрывающая скобка может
-            # стоять сразу после fm.<col> или после доп. источников.
+        for fb_col, alias in hard_facts:
+            # Variadic COALESCE starting with fb.<fb_col>, ending with
+            # AS <alias>. Outer CAST(... AS BIGINT) wrapper is fine — the
+            # COALESCE-AS span is matched inside.
             pattern = (
-                rf"COALESCE\s*\(\s*fb\.{fb_col}\s*,\s*fm\.{fm_col}"
-                rf"(?:\s*,[^)]+)?\s*\)\s+AS\s+{alias}\b"
+                rf"COALESCE\s*\(\s*fb\.{fb_col}\b[^)]*\)[^,]*?\bAS\s+{alias}\b"
             )
-            assert re.search(pattern, sql, re.IGNORECASE), (
-                f"HARD_FACT `{alias}` must be COALESCE(fb.{fb_col}, fm.{fm_col}, ...)"
+            assert re.search(pattern, sql, re.IGNORECASE | re.DOTALL), (
+                f"HARD_FACT `{alias}` must be COALESCE(fb.{fb_col}, ...) AS {alias}"
             )
 
     def test_no_audit_diff_columns(self):
@@ -149,15 +148,12 @@ class TestFctPlayerSeasonStatsSql:
             )
 
     def test_unique_fotmob_columns_present(self):
-        """UNIQUE_FOTMOB метрики должны идти как single column из FotMob."""
+        """UNIQUE_FOTMOB метрики, отсутствующие у других источников."""
         sql = _read_sql()
         unique_fotmob = [
-            'expected_goals', 'expected_assists', 'expected_goals_on_target',
+            'defensive_actions',
             'big_chances_created', 'big_chances_missed', 'chances_created',
-            'fotmob_rating',
-            'defensive_actions_per_90', 'clearances_per_90', 'recoveries_per_90',
-            'blocks_per_90', 'accurate_passes_per_90', 'accurate_long_balls_per_90',
-            'successful_dribbles_per_90',
+            'poss_won_final_third',
         ]
         for col in unique_fotmob:
             assert re.search(rf"fm\.{col}\b", sql, re.IGNORECASE), (
@@ -165,33 +161,46 @@ class TestFctPlayerSeasonStatsSql:
             )
 
     def test_unique_whoscored_columns_present(self):
-        """UNIQUE_WHOSCORED метрики — single column из silver WS aggregate."""
+        """UNIQUE_WHOSCORED метрики, отсутствующие у других источников."""
         sql = _read_sql()
         unique_ws = [
-            'dribbles_whoscored', 'take_on_pct_whoscored', 'bad_touches_whoscored',
-            'pass_pct_whoscored', 'tackles_won_whoscored', 'tackle_pct_whoscored',
-            'interceptions_whoscored', 'ball_recoveries_whoscored',
-            'clearances_whoscored', 'fouls_committed_whoscored',
-            'touches_in_box_whoscored', 'avg_x_whoscored', 'avg_y_whoscored',
+            'bad_touches', 'touches_in_box', 'avg_x', 'avg_y',
         ]
         for col in unique_ws:
-            assert re.search(rf"\bAS\s+{col}\b", sql, re.IGNORECASE), (
-                f"UNIQUE_WHOSCORED column `{col}` must be projected"
+            assert re.search(rf"\bws\.{col}\b", sql, re.IGNORECASE), (
+                f"UNIQUE_WHOSCORED column `{col}` must come from ws."
             )
 
-    def test_unique_understat_columns_present(self):
-        """UNIQUE_UNDERSTAT метрики — xG/xA/build-up. xG/xA с suffix
-        `_understat` чтобы не пересекаться с FotMob expected_goals."""
+    def test_unique_sofascore_columns_present(self):
+        """UNIQUE_SOFASCORE — ground/aerial/total duels, errors_lead_to_*,
+        touches/dispossessed, goal+shot breakdowns. Single-column из ss."""
         sql = _read_sql()
-        unique_us = [
-            'expected_goals_understat', 'expected_assists_understat',
-            'non_penalty_goals_understat', 'non_penalty_xg',
-            'xg_chain', 'xg_buildup',
-            'key_passes_understat', 'shots_understat',
+        unique_ss = [
+            'ground_duels_won', 'aerial_duels_won', 'total_duels_won',
+            'errors_lead_to_goal', 'errors_lead_to_shot',
+            'touches', 'dispossessed', 'possession_lost',
+            'shots_off_target', 'shots_inside_box', 'shots_outside_box',
+            'goals_inside_box', 'goals_outside_box',
+            'headed_goals', 'left_foot_goals', 'right_foot_goals',
         ]
-        for col in unique_us:
+        for col in unique_ss:
+            assert re.search(rf"\bss\.{col}\b", sql, re.IGNORECASE), (
+                f"UNIQUE_SOFASCORE column `{col}` must come from ss."
+            )
+
+    def test_modeled_xg_per_source_suffixes(self):
+        """MODELED — xG публикуется с per-source suffix, потому что три
+        источника используют разные модели (FotMob StatsBomb-derived,
+        Understat own, SofaScore Opta-derived). После RX2 research одна
+        из этих колонок может быть свёрнута в single `expected_goals`."""
+        sql = _read_sql()
+        for col in (
+            'expected_goals_fotmob',
+            'expected_goals_understat',
+            'expected_goals_sofascore',
+        ):
             assert re.search(rf"\bAS\s+{col}\b", sql, re.IGNORECASE), (
-                f"UNIQUE_UNDERSTAT column `{col}` must be projected"
+                f"MODELED xG column `{col}` must be projected"
             )
 
     def test_ws_us_join_uses_season_slug(self):

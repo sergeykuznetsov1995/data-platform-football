@@ -2,36 +2,28 @@
 -- Gold: fct_player_season_stats_audit
 -- =============================================================================
 --
--- DQ-audit таблица для cross-source согласованности FBref vs FotMob по
--- HARD_FACT метрикам в `gold.fct_player_season_stats`. НЕ business-витрина:
--- содержит ТОЛЬКО технические diff-колонки + PK.
+-- DQ-audit таблица для cross-source согласованности по HARD_FACT метрикам в
+-- `gold.fct_player_season_stats`. НЕ business-витрина: содержит ТОЛЬКО
+-- технические diff-колонки + PK.
+--
+-- Convention: diff = FBref - <source> для каждого HARD_FACT (FBref — primary
+-- spine). Если у FBref нет данной HARD_FACT (clearances, ball_recoveries,
+-- blocks, dribbles_attempted, total_passes, accurate_passes, accurate_long_balls,
+-- key_passes, accurate_crosses, tackles_attempted) — primary = FotMob; diff =
+-- FotMob - <source>.
 --
 -- Зерно: (player_id_canonical, league, season). Один row per канонический
 -- игрок × лига × сезон, **только когда обе стороны имеют запись** (INNER JOIN
--- на FBref AND FotMob). Это даёт чистый сигнал "оба источника измерили этого
--- игрока в этом сезоне" без NULL-шума от FBref-only исторических сезонов.
+-- FBref ∩ FotMob — symmetric to main fct INNER FBref). WhoScored/Understat/
+-- SofaScore — LEFT JOIN → diff = NULL когда источник отсутствует.
 --
--- Audit columns: diff = FBref - <source> для каждого HARD_FACT.
---   * FotMob diff (8): INNER JOIN — все 8 HARD_FACT.
---   * WhoScored diff (1): LEFT JOIN — только matches_diff_whoscored (WS
---                         event-aggregate не отдаёт остальные HARD_FACT).
---   * Understat diff (6): LEFT JOIN — matches/minutes/goals/assists/
---                         yellow_cards/red_cards.
--- Используются:
---   1. DQ coverage WARNING (`audit_diff[...]`) — ABS(diff) <= threshold у ≥95% rows.
+-- Использование:
+--   1. DQ coverage WARNING — ABS(diff) <= threshold у ≥95% rows.
 --   2. Engineer-debug при «голы не сходятся в дашборде».
---   3. R1 калибровка: измерить p95/p99 → R1_cross_source_thresholds.md.
+--   3. R1 калибровка thresholds → docs/research/R1_cross_source_thresholds.md.
 --
--- Источники (читаем заново из Silver, НЕ из gold.fct_player_season_stats —
--- это держит audit-таблицу независимой от business-витрины и сохраняет
--- one-hop правило для Gold):
---   silver.xref_player                          (canonical_id spine)
---   silver.fbref_player_season_profile          (fb.* HARD_FACT)
---   silver.fotmob_player_season_profile         (fm.* HARD_FACT)
---
--- Связь с `gold.fct_player_season_stats`:
---   audit-таблица — subset main таблицы (только rows с обоими источниками).
---   PK совпадает → JOIN ON (player_id_canonical, league, season).
+-- ⚠️ Audit-таблица читает Silver заново (НЕ gold.fct_player_season_stats):
+--   one-hop правило (memory: project_gold_cleanup_2026-05-12).
 -- =============================================================================
 
 WITH
@@ -40,7 +32,7 @@ xref_fbref AS (
         canonical_id,
         source_id                                         AS fbref_player_id,
         league,
-        season                                            AS season_slug,  -- varchar '2526' (для WS/US JOIN)
+        season                                            AS season_slug,
         2000 + CAST(SUBSTR(season, 1, 2) AS BIGINT)      AS season_year
     FROM iceberg.silver.xref_player
     WHERE source = 'fbref'
@@ -64,28 +56,75 @@ SELECT
     xf.league                                            AS league,
     xf.season_year                                       AS season,
 
-    -- ========= Audit (8 HARD_FACT diff: FBref - FotMob) =========
-    -- INNER JOIN гарантирует что обе стороны не-NULL, поэтому diff
-    -- всегда заполнен. Это упрощает DQ-чек coverage без `OR diff IS NULL`.
-    (CAST(fb.mp                 AS DOUBLE) - CAST(fm.matches_played     AS DOUBLE)) AS matches_diff_fotmob,
-    (CAST(fb.minutes            AS DOUBLE) - CAST(fm.minutes_played     AS DOUBLE)) AS minutes_diff_fotmob,
-    (CAST(fb.goals              AS DOUBLE) - CAST(fm.goals              AS DOUBLE)) AS goals_diff_fotmob,
-    (CAST(fb.assists            AS DOUBLE) - CAST(fm.assists            AS DOUBLE)) AS assists_diff_fotmob,
-    (CAST(fb.yellow_cards       AS DOUBLE) - CAST(fm.yellow_cards       AS DOUBLE)) AS yellow_cards_diff_fotmob,
-    (CAST(fb.red_cards          AS DOUBLE) - CAST(fm.red_cards          AS DOUBLE)) AS red_cards_diff_fotmob,
-    (CAST(fb.penalties_won      AS DOUBLE) - CAST(fm.penalties_won      AS DOUBLE)) AS penalties_won_diff_fotmob,
+    -- ========= FotMob diff (INNER JOIN — всегда non-NULL) =========
+    -- HARD_FACT pairs с FBref-spine
+    (CAST(fb.mp                 AS DOUBLE) - CAST(fm.matches_played   AS DOUBLE)) AS matches_diff_fotmob,
+    (CAST(fb.minutes            AS DOUBLE) - CAST(fm.minutes_played   AS DOUBLE)) AS minutes_diff_fotmob,
+    (CAST(fb.goals              AS DOUBLE) - CAST(fm.goals            AS DOUBLE)) AS goals_diff_fotmob,
+    (CAST(fb.assists            AS DOUBLE) - CAST(fm.assists          AS DOUBLE)) AS assists_diff_fotmob,
+    (CAST(fb.yellow_cards       AS DOUBLE) - CAST(fm.yellow_cards     AS DOUBLE)) AS yellow_cards_diff_fotmob,
+    (CAST(fb.red_cards          AS DOUBLE) - CAST(fm.red_cards        AS DOUBLE)) AS red_cards_diff_fotmob,
+    (CAST(fb.penalties_won      AS DOUBLE) - CAST(fm.penalties_won    AS DOUBLE)) AS penalties_won_diff_fotmob,
     (CAST(fb.penalties_conceded AS DOUBLE) - CAST(fm.penalties_conceded AS DOUBLE)) AS penalties_conceded_diff_fotmob,
+    (CAST(fb.shots              AS DOUBLE) - CAST(fm.shots            AS DOUBLE)) AS shots_diff_fotmob,
+    (CAST(fb.shots_on_target    AS DOUBLE) - CAST(fm.shots_on_target  AS DOUBLE)) AS shots_on_target_diff_fotmob,
+    (CAST(fb.interceptions      AS DOUBLE) - CAST(fm.interceptions    AS DOUBLE)) AS interceptions_diff_fotmob,
+    (CAST(fb.fouls_committed    AS DOUBLE) - CAST(fm.fouls_committed  AS DOUBLE)) AS fouls_committed_diff_fotmob,
 
-    -- ========= WhoScored diff (1; LEFT JOIN → NULL if WS отсутствует) =========
-    (CAST(fb.mp                 AS DOUBLE) - CAST(ws.matches_seen       AS DOUBLE)) AS matches_diff_whoscored,
+    -- ========= WhoScored diff (LEFT JOIN → NULL if absent) =========
+    (CAST(fb.mp              AS DOUBLE) - CAST(ws.matches_seen      AS DOUBLE)) AS matches_diff_whoscored,
+    (CAST(fb.shots           AS DOUBLE) - CAST(ws.shots_total       AS DOUBLE)) AS shots_diff_whoscored,
+    (CAST(fb.shots_on_target AS DOUBLE) - CAST(ws.shots_on_target_proxy AS DOUBLE)) AS shots_on_target_diff_whoscored,
+    (CAST(fb.interceptions   AS DOUBLE) - CAST(ws.interceptions     AS DOUBLE)) AS interceptions_diff_whoscored,
+    (CAST(fb.tackles_won     AS DOUBLE) - CAST(ws.tackle_won        AS DOUBLE)) AS tackles_won_diff_whoscored,
+    (CAST(fb.fouls_committed AS DOUBLE) - CAST(ws.fouls_committed   AS DOUBLE)) AS fouls_committed_diff_whoscored,
+    -- FBref не отдаёт clearances/ball_recoveries/blocks/pass_total/accurate_passes:
+    -- primary = FotMob, diff = FotMob - WS
+    (CAST(fm.clearances      AS DOUBLE) - CAST(ws.clearances        AS DOUBLE)) AS clearances_diff_whoscored,
+    (CAST(fm.ball_recoveries AS DOUBLE) - CAST(ws.ball_recoveries   AS DOUBLE)) AS ball_recoveries_diff_whoscored,
+    (CAST(fm.accurate_passes AS DOUBLE) - CAST(ws.pass_ok           AS DOUBLE)) AS accurate_passes_diff_whoscored,
+    (CAST(fm.successful_dribbles AS DOUBLE) - CAST(ws.takeon_won    AS DOUBLE)) AS successful_dribbles_diff_whoscored,
 
-    -- ========= Understat diff (6; LEFT JOIN → NULL if US отсутствует) =========
-    (CAST(fb.mp                 AS DOUBLE) - CAST(us.games_played       AS DOUBLE)) AS matches_diff_understat,
-    (CAST(fb.minutes            AS DOUBLE) - CAST(us.minutes_played     AS DOUBLE)) AS minutes_diff_understat,
-    (CAST(fb.goals              AS DOUBLE) - CAST(us.goals              AS DOUBLE)) AS goals_diff_understat,
-    (CAST(fb.assists            AS DOUBLE) - CAST(us.assists            AS DOUBLE)) AS assists_diff_understat,
-    (CAST(fb.yellow_cards       AS DOUBLE) - CAST(us.yellow_cards       AS DOUBLE)) AS yellow_cards_diff_understat,
-    (CAST(fb.red_cards          AS DOUBLE) - CAST(us.red_cards          AS DOUBLE)) AS red_cards_diff_understat,
+    -- ========= Understat diff (LEFT JOIN → NULL if absent) =========
+    (CAST(fb.mp           AS DOUBLE) - CAST(us.games_played   AS DOUBLE)) AS matches_diff_understat,
+    (CAST(fb.minutes      AS DOUBLE) - CAST(us.minutes_played AS DOUBLE)) AS minutes_diff_understat,
+    (CAST(fb.goals        AS DOUBLE) - CAST(us.goals          AS DOUBLE)) AS goals_diff_understat,
+    (CAST(fb.assists      AS DOUBLE) - CAST(us.assists        AS DOUBLE)) AS assists_diff_understat,
+    (CAST(fb.yellow_cards AS DOUBLE) - CAST(us.yellow_cards   AS DOUBLE)) AS yellow_cards_diff_understat,
+    (CAST(fb.red_cards    AS DOUBLE) - CAST(us.red_cards      AS DOUBLE)) AS red_cards_diff_understat,
+    (CAST(fb.shots        AS DOUBLE) - CAST(us.shots          AS DOUBLE)) AS shots_diff_understat,
+
+    -- ========= SofaScore diff (LEFT JOIN → NULL if absent) =========
+    (CAST(fb.goals              AS DOUBLE) - CAST(ss.goals_inside_box + ss.goals_outside_box AS DOUBLE)) AS goals_diff_sofascore,
+    (CAST(fb.penalties_won      AS DOUBLE) - CAST(ss.penalty_won      AS DOUBLE)) AS penalties_won_diff_sofascore,
+    (CAST(fb.penalties_conceded AS DOUBLE) - CAST(ss.penalty_conceded AS DOUBLE)) AS penalties_conceded_diff_sofascore,
+    (CAST(fb.penalty_goals      AS DOUBLE) - CAST(ss.penalty_goals    AS DOUBLE)) AS penalty_goals_diff_sofascore,
+    (CAST(fb.shots              AS DOUBLE) - CAST(ss.total_shots      AS DOUBLE)) AS shots_diff_sofascore,
+    (CAST(fb.shots_on_target    AS DOUBLE) - CAST(ss.shots_on_target  AS DOUBLE)) AS shots_on_target_diff_sofascore,
+    (CAST(fb.interceptions      AS DOUBLE) - CAST(ss.interceptions    AS DOUBLE)) AS interceptions_diff_sofascore,
+    (CAST(fb.tackles_won        AS DOUBLE) - CAST(ss.tackles_won      AS DOUBLE)) AS tackles_won_diff_sofascore,
+    (CAST(fb.fouls_committed    AS DOUBLE) - CAST(ss.fouls            AS DOUBLE)) AS fouls_committed_diff_sofascore,
+    (CAST(fb.fouls_drawn        AS DOUBLE) - CAST(ss.was_fouled       AS DOUBLE)) AS fouls_drawn_diff_sofascore,
+    (CAST(fb.offsides           AS DOUBLE) - CAST(ss.offsides         AS DOUBLE)) AS offsides_diff_sofascore,
+    (CAST(fb.crosses            AS DOUBLE) - CAST(ss.total_crosses    AS DOUBLE)) AS crosses_diff_sofascore,
+    -- FBref не отдаёт clearances/ball_recoveries/blocks/key_passes/passes:
+    -- primary = FotMob или Understat, diff = primary - SS
+    (CAST(fm.clearances         AS DOUBLE) - CAST(ss.clearances       AS DOUBLE)) AS clearances_diff_sofascore,
+    (CAST(fm.ball_recoveries    AS DOUBLE) - CAST(ss.ball_recoveries  AS DOUBLE)) AS ball_recoveries_diff_sofascore,
+    (CAST(fm.blocks             AS DOUBLE) - CAST(ss.blocks           AS DOUBLE)) AS blocks_diff_sofascore,
+    (CAST(fm.accurate_passes    AS DOUBLE) - CAST(ss.accurate_passes  AS DOUBLE)) AS accurate_passes_diff_sofascore,
+    (CAST(fm.accurate_long_balls AS DOUBLE) - CAST(ss.accurate_long_balls AS DOUBLE)) AS accurate_long_balls_diff_sofascore,
+    (CAST(fm.successful_dribbles AS DOUBLE) - CAST(ss.dribbles        AS DOUBLE)) AS successful_dribbles_diff_sofascore,
+    (CAST(us.key_passes         AS DOUBLE) - CAST(ss.key_passes       AS DOUBLE)) AS key_passes_diff_sofascore,
+
+    -- ========= MODELED xG diff (different models, expected to disagree) =========
+    -- Эти diff'ы для калибровки разных xG-моделей. Хранятся в audit чтобы DS-
+    -- команда могла строить корреляции между моделями.
+    ROUND(CAST(fm.expected_goals  AS DOUBLE) - CAST(us.expected_goals AS DOUBLE), 4) AS xg_diff_fotmob_understat,
+    ROUND(CAST(fm.expected_goals  AS DOUBLE) - CAST(ss.expected_goals AS DOUBLE), 4) AS xg_diff_fotmob_sofascore,
+    ROUND(CAST(us.expected_goals  AS DOUBLE) - CAST(ss.expected_goals AS DOUBLE), 4) AS xg_diff_understat_sofascore,
+    ROUND(CAST(fm.expected_assists AS DOUBLE) - CAST(us.expected_assists AS DOUBLE), 4) AS xa_diff_fotmob_understat,
+    ROUND(CAST(fm.fotmob_rating   AS DOUBLE) - CAST(ss.rating         AS DOUBLE), 4) AS rating_diff_fotmob_sofascore,
 
     -- ========= Lineage =========
     CURRENT_TIMESTAMP                                    AS _gold_created_at
@@ -103,9 +142,6 @@ INNER JOIN iceberg.silver.fotmob_player_season_profile fm
     ON  fm.player_id = xfm.fotmob_player_id
     AND fm.league    = xfm.league
     AND fm.season    = xfm.season_year
--- WhoScored / Understat LEFT JOIN (НЕ INNER): сохраняем FotMob-INNER семантику
--- main fct (audit-coverage = FBref ∩ FotMob), а WS/US диффы — добавка с
--- nullable значениями. Coverage DQ-чеки фильтруют NULL через `OR <col> IS NULL`.
 LEFT JOIN iceberg.silver.whoscored_player_season_aggregate ws
     ON  ws.canonical_id = xf.canonical_id
     AND ws.league       = xf.league
@@ -114,5 +150,8 @@ LEFT JOIN iceberg.silver.understat_player_season_aggregate us
     ON  us.canonical_id = xf.canonical_id
     AND us.league       = xf.league
     AND us.season       = xf.season_slug
--- Outfield-only: симметрично с main fct (исключаем GK).
+LEFT JOIN iceberg.silver.sofascore_player_season_aggregate ss
+    ON  ss.canonical_id = xf.canonical_id
+    AND ss.league       = xf.league
+    AND ss.season       = xf.season_slug
 WHERE fb.pos IS NULL OR fb.pos NOT LIKE '%GK%'
