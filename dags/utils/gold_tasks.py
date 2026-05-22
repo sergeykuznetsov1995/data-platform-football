@@ -1103,6 +1103,16 @@ def validate_gold_quality() -> Dict[str, Any]:
                        warn_threshold=0.30, error_threshold=0.15),
         CHECK.coverage('gold.dim_player_attributes', column='foot_fotmob',
                        warn_threshold=0.30, error_threshold=0.15),
+        # SofaScore block — coverage ниже FotMob потому что Bronze покрывает
+        # только current APL season (~500 игроков из ~1200 в FBref-spine).
+        CHECK.value_range('gold.dim_player_attributes', 'height_cm_sofascore',
+                          min_val=140, max_val=220, severity='WARNING'),
+        CHECK.coverage('gold.dim_player_attributes', column='height_cm_sofascore',
+                       warn_threshold=0.30, error_threshold=0.15),
+        CHECK.coverage('gold.dim_player_attributes', column='dob_sofascore',
+                       warn_threshold=0.30, error_threshold=0.15),
+        CHECK.coverage('gold.dim_player_attributes', column='foot_sofascore',
+                       warn_threshold=0.30, error_threshold=0.15),
 
         # ============================================================
         # T5: fct_player_season_stats — cross-source per-season stats.
