@@ -49,33 +49,53 @@ bronze_dedup AS (
     WHERE rn = 1
 )
 
+-- Понятная грань: иногда Understat трекает одного игрока под двумя
+-- player_id (e.g. Harrison Reed 910 + 6827). Resolver правильно мапит
+-- оба на один canonical_id, но JOIN получает 2 строки на
+-- (canonical_id, league, season). Берём «активную» запись — с большим
+-- количеством minutes — остальные дропаются.
 SELECT
-    xp.canonical_id,
+    canonical_id,
+    games_played, minutes_played, goals, assists,
+    yellow_cards, red_cards,
+    expected_goals, expected_assists,
+    non_penalty_goals, non_penalty_xg, xg_chain, xg_buildup,
+    key_passes, shots,
+    league, season
+FROM (
+    SELECT
+        xp.canonical_id,
 
-    -- ========= HARD_FACT (for COALESCE on Gold layer) =========
-    b.matches                            AS games_played,
-    b.minutes                            AS minutes_played,
-    b.goals                              AS goals,
-    b.assists                            AS assists,
-    b.yellow_cards                       AS yellow_cards,
-    b.red_cards                          AS red_cards,
+        -- ========= HARD_FACT (for COALESCE on Gold layer) =========
+        b.matches                            AS games_played,
+        b.minutes                            AS minutes_played,
+        b.goals                              AS goals,
+        b.assists                            AS assists,
+        b.yellow_cards                       AS yellow_cards,
+        b.red_cards                          AS red_cards,
 
-    -- ========= UNIQUE_UNDERSTAT (xG / xA / build-up) =========
-    b.xg                                 AS expected_goals,
-    b.xa                                 AS expected_assists,
-    b.np_goals                           AS non_penalty_goals,
-    b.np_xg                              AS non_penalty_xg,
-    b.xg_chain                           AS xg_chain,
-    b.xg_buildup                         AS xg_buildup,
-    b.key_passes                         AS key_passes,
-    b.shots                              AS shots,
+        -- ========= UNIQUE_UNDERSTAT (xG / xA / build-up) =========
+        b.xg                                 AS expected_goals,
+        b.xa                                 AS expected_assists,
+        b.np_goals                           AS non_penalty_goals,
+        b.np_xg                              AS non_penalty_xg,
+        b.xg_chain                           AS xg_chain,
+        b.xg_buildup                         AS xg_buildup,
+        b.key_passes                         AS key_passes,
+        b.shots                              AS shots,
 
-    -- ========= Partition keys =========
-    b.league,
-    b.season
+        -- ========= Partition keys =========
+        b.league,
+        b.season,
 
-FROM bronze_dedup b
-JOIN xp
-  ON CAST(b.player_id AS varchar) = xp.source_id
- AND b.league = xp.league
- AND b.season = xp.season
+        ROW_NUMBER() OVER (
+            PARTITION BY xp.canonical_id, b.league, b.season
+            ORDER BY b.minutes DESC NULLS LAST, b.player_id
+        ) AS canonical_rn
+    FROM bronze_dedup b
+    JOIN xp
+      ON CAST(b.player_id AS varchar) = xp.source_id
+     AND b.league = xp.league
+     AND b.season = xp.season
+)
+WHERE canonical_rn = 1

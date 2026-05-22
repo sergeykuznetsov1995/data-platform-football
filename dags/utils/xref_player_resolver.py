@@ -798,9 +798,17 @@ def _fetch_understat_players(
     out: List[Dict[str, Any]] = []
     seen: set = set()
     for pid, name, team, lg, season in rows:
-        if pid in seen:
+        # Dedup by (pid, team, season): same player_id may legitimately
+        # appear in multiple seasons (and across teams within a season for
+        # mid-season transfers). Without (team, season) in the key, the
+        # first encountered row wins and every other (season, team) row
+        # for this player_id is dropped — orphaning Understat anchors for
+        # all non-first seasons. Bug introduced 2026-05-09 (E1), parity
+        # fix for FBref shipped same day but never applied to Understat.
+        key = (pid, team, season)
+        if key in seen:
             continue
-        seen.add(pid)
+        seen.add(key)
         out.append(
             {
                 'source': 'understat',
@@ -871,10 +879,15 @@ def _fetch_fotmob_players(
     out: List[Dict[str, Any]] = []
     seen: set = set()
     for pid, name, team, lg, season in rows:
-        if pid in seen:
-            continue
-        seen.add(pid)
+        # Dedup by (pid, team, season) — same reasoning as
+        # _fetch_understat_players above. Bronze fotmob_player_details
+        # is partitioned by season (bigint), so each season is a distinct
+        # snapshot; multi-season players need separate xref rows.
         season_slug = _fbref_year_to_slug(season)
+        key = (str(pid), team, season_slug)
+        if key in seen:
+            continue
+        seen.add(key)
         out.append(
             {
                 'source': 'fotmob',
