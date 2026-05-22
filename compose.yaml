@@ -845,7 +845,7 @@ services:
       MIGRATION_LIMIT_PARAM: 1200
     restart: unless-stopped
     healthcheck:
-      test: ["CMD-SHELL", "curl -fsS http://localhost:8586/healthcheck | grep -q '\"healthy\":true' || exit 1"]
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8586/healthcheck | grep -q '\"healthy\":true' || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 10
