@@ -11,8 +11,11 @@
 --     single column через COALESCE(fb→fm→ws→us→ss). FBref — primary spine.
 --     Cross-source diff'ы выносятся в `fct_player_season_stats_audit`.
 --   * MODELED (разные модели) → суффикс `_<source>` оставляется
---     (xG: FotMob vs Understat vs SofaScore — три разные модели;
---      rating: fotmob_rating vs rating_sofascore — две разные шкалы).
+--     (xG: FotMob vs Understat vs SofaScore — три разные модели; будет
+--      свёрнут в single column после RX2 research).
+--   * RATING: SofaScore (Opta-derived) выбран как единственный источник —
+--     FotMob rating дропнут из business-fct; cross-source diff остаётся
+--     в audit-таблице.
 --   * UNIQUE_<source> (метрика отсутствует у других) → single column,
 --     без суффикса.
 --
@@ -128,7 +131,9 @@ SELECT
     ROUND(us.non_penalty_xg, 2)                          AS non_penalty_xg_understat,
     ROUND(us.xg_chain, 2)                                AS xg_chain_understat,
     ROUND(us.xg_buildup, 2)                              AS xg_buildup_understat,
-    ROUND(fm.fotmob_rating, 2)                           AS rating_fotmob,
+    -- Rating: SofaScore (Opta) выбран как единственный источник для
+    -- business-витрины. Cross-source diff с FotMob по-прежнему доступен
+    -- в gold.fct_player_season_stats_audit (rating_diff_fotmob_sofascore).
     ROUND(ss.rating, 2)                                  AS rating_sofascore,
 
     -- ========= UNIQUE_FBREF =========
