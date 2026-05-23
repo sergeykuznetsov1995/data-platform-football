@@ -58,6 +58,7 @@ SCHEDULES: Dict[str, str] = {
     'dag_ingest_clubelo': '0 13 * * *',      # 13:00 UTC daily
     'dag_ingest_sofifa': '0 6 * * 0',        # 6:00 UTC Sunday (weekly)
     'dag_ingest_transfermarkt': '0 4 * * 1', # 4:00 UTC Monday (weekly)
+    'dag_ingest_capology': '0 5 * * 1',      # 5:00 UTC Monday (weekly)
     'dag_master_pipeline': '0 14 * * *',     # 14:00 UTC daily
     'dag_transform_fbref_silver': None,     # Trigger only (after ingestion)
 }
@@ -86,6 +87,7 @@ DAG_TAGS: Dict[str, List[str]] = {
     'clubelo': ['scraping', 'clubelo', 'bronze', 'football', 'elo'],
     'sofifa': ['scraping', 'sofifa', 'bronze', 'football', 'fifa'],
     'transfermarkt': ['scraping', 'transfermarkt', 'bronze', 'football'],
+    'capology': ['scraping', 'capology', 'bronze', 'football', 'salaries'],
     'master': ['orchestration', 'master', 'pipeline'],
     'silver_fbref': ['transform', 'fbref', 'silver', 'football', 'trino'],
 }
