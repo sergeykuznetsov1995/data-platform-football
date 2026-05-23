@@ -208,37 +208,64 @@ class FBrefBrowserMixin:
     # HTTP session (curl_cffi with CF cookies from nodriver)
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _cdp_get_cookies_raw(urls=None):
+        """Custom CDP generator returning RAW cookie dicts.
+
+        Mirrors nodriver.cdp.network.get_cookies() but returns json['cookies']
+        as plain dicts, bypassing Cookie.from_json which raises TypeError on
+        Chromium 120 responses in nodriver 0.48.1 (the unhandled exception in
+        Connection._listener corrupts the event loop and the next page.get()
+        hangs ~40s). Repro: scripts/research/repro_nodriver_cookies_hang.py
+        (Method D, 2026-05-23) — see docs/research/fbref-scraper-speedup.md.
+        """
+        params: dict = {}
+        if urls is not None:
+            params['urls'] = list(urls)
+        json = yield {'method': 'Network.getCookies', 'params': params}
+        if isinstance(json, dict):
+            return json.get('cookies', [])
+        return []
+
     def _extract_cookies_from_nodriver(self) -> dict:
-        """Extract all cookies from the running nodriver browser."""
-        if self._nodriver_browser is None or self._nodriver_browser._browser is None:
-            logger.info("Cannot extract cookies: nodriver browser not running")
+        """Extract all cookies from the running nodriver browser via raw CDP.
+
+        Uses _cdp_get_cookies_raw to bypass the broken Cookie.from_json parser
+        in nodriver 0.48.1. Returns {name: value} dict with all cookies (CF
+        + session). Returns {} on any failure — caller should treat as 'no
+        HTTP fast-path available' and stick to nodriver.
+        """
+        if self._nodriver_browser is None or self._nodriver_browser._page is None:
+            logger.info("Cannot extract cookies: nodriver browser/page not running")
             return {}
 
         try:
-            import asyncio
             loop = self._nodriver_browser._get_or_create_loop()
 
-            # Use wait_for to avoid hanging on pending nodriver tasks
             async def _get_cookies_with_timeout():
                 return await asyncio.wait_for(
-                    self._nodriver_browser._browser.cookies.get_all(),
+                    self._nodriver_browser._page.send(
+                        self._cdp_get_cookies_raw(urls=["https://fbref.com/"])
+                    ),
                     timeout=5.0,
                 )
 
-            all_cookies = loop.run_until_complete(_get_cookies_with_timeout())
+            raw_cookies = loop.run_until_complete(_get_cookies_with_timeout())
 
-            cookies = {}
+            cookies: dict = {}
             cf_cookie_names = []
-            for cookie in all_cookies:
-                name = cookie.name if hasattr(cookie, 'name') else cookie.get('name', '')
-                value = cookie.value if hasattr(cookie, 'value') else cookie.get('value', '')
+            for c in raw_cookies or []:
+                if not isinstance(c, dict):
+                    continue
+                name = c.get('name', '')
+                value = c.get('value', '')
                 if name:
                     cookies[name] = value
                     if 'cf' in name.lower():
                         cf_cookie_names.append(name)
 
             logger.info(
-                f"Extracted {len(cookies)} cookies from nodriver "
+                f"Extracted {len(cookies)} cookies from nodriver via raw CDP "
                 f"(CF cookies: {cf_cookie_names or 'none'})"
             )
             return cookies
@@ -427,11 +454,29 @@ class FBrefBrowserMixin:
                 # Rate limiting
                 self._rate_limiter.acquire()
 
-                # Use nodriver if enabled
-                if self.use_nodriver:
-                    html = self._fetch_page_nodriver(url)
-                else:
-                    html = self._fetch_page_selenium(url)
+                # HTTP fast-path: if we already have a live cf_clearance from a
+                # previous nodriver fetch, try curl_cffi first (~1-2s vs ~8-15s).
+                # Falls back to nodriver on CF challenge or incomplete HTML.
+                html = None
+                if (
+                    self.use_nodriver
+                    and self._http_session is not None
+                    and not self._http_cookies_expired()
+                ):
+                    html = self._fetch_page_http(url)
+                    if html is not None:
+                        self._stats.setdefault('http_fetch_ok', 0)
+                        self._stats['http_fetch_ok'] += 1
+                    else:
+                        self._stats.setdefault('http_fetch_fallback', 0)
+                        self._stats['http_fetch_fallback'] += 1
+
+                # Fallback / first-time path: nodriver (or selenium)
+                if html is None:
+                    if self.use_nodriver:
+                        html = self._fetch_page_nodriver(url)
+                    else:
+                        html = self._fetch_page_selenium(url)
 
                 # Diagnostic logging
                 if html:
@@ -521,10 +566,13 @@ class FBrefBrowserMixin:
                     )
                 self._maybe_restart_browser()
 
-                # DO NOT init HTTP session after nodriver fetch.
-                # Cookie extraction via cookies.get_all() corrupts nodriver
-                # event loop, causing next page.get() to hang for 40s.
-                # All pages go through nodriver directly (~8s each).
+                # Lazy-init HTTP fast-path after first successful nodriver fetch.
+                # Raw CDP extraction (_cdp_get_cookies_raw) bypasses the broken
+                # Cookie.from_json in nodriver 0.48.1 so the event loop is not
+                # corrupted. Subsequent _fetch_page() calls will try HTTP first
+                # and fall back to nodriver on CF challenge.
+                if self._http_session is None:
+                    self._try_init_http_session()
 
                 return html
 

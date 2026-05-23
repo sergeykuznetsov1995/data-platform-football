@@ -520,18 +520,43 @@ class NodriverBypass:
     #  CF cookie export/inject (cross-restart reuse)                     #
     # ------------------------------------------------------------------ #
 
+    @staticmethod
+    def _cdp_get_cookies_raw(urls=None):
+        """Custom CDP generator returning raw cookie dicts.
+
+        nodriver 0.48.1's Cookie.from_json raises TypeError on Chromium 120
+        responses (string indices must be integers), and the unhandled
+        exception in Connection._listener corrupts the event loop so the next
+        page.get() hangs ~40s. We bypass the parser by mirroring
+        nodriver.cdp.network.get_cookies() but returning json['cookies'] as-is.
+        Repro: scripts/research/repro_nodriver_cookies_hang.py (Method D,
+        2026-05-23). See docs/research/fbref-scraper-speedup.md.
+        """
+        params: dict = {}
+        if urls is not None:
+            params['urls'] = list(urls)
+        json = yield {'method': 'Network.getCookies', 'params': params}
+        if isinstance(json, dict):
+            return json.get('cookies', [])
+        return []
+
     async def export_cf_cookies(self, domain: str = ".fbref.com") -> list:
-        """Export CF-related cookies via CDP.
+        """Export CF-related cookies via raw CDP (bypasses Cookie.from_json bug).
 
         Returns a list of cookie dicts (name/value/domain/path/expires/secure/
         httpOnly/sameSite) ready to be fed back into `inject_cookies()` on a
         later browser instance.
         """
-        if self._browser is None:
+        if self._browser is None or self._page is None:
             return []
         try:
             all_cookies = await asyncio.wait_for(
-                self._browser.cookies.get_all(), timeout=5.0
+                self._page.send(
+                    self._cdp_get_cookies_raw(
+                        urls=[f"https://{domain.lstrip('.')}/"]
+                    )
+                ),
+                timeout=5.0,
             )
         except Exception as e:
             logger.debug(f"export_cf_cookies: {e}")
@@ -539,20 +564,18 @@ class NodriverBypass:
 
         keep = {"cf_clearance", "__cf_bm", "cf_chl_opt"}
         result = []
-        for c in all_cookies:
-            name = c.name if hasattr(c, 'name') else c.get('name', '')
+        for c in all_cookies or []:
+            if not isinstance(c, dict):
+                continue
+            name = c.get('name', '')
             if name not in keep:
                 continue
-            value = c.value if hasattr(c, 'value') else c.get('value', '')
-            c_domain = c.domain if hasattr(c, 'domain') else c.get('domain', domain)
-            path = c.path if hasattr(c, 'path') else c.get('path', '/')
-            expires = getattr(c, 'expires', None) or (c.get('expires') if isinstance(c, dict) else None)
             result.append({
                 "name": name,
-                "value": value,
-                "domain": c_domain or domain,
-                "path": path or "/",
-                "expires": expires,
+                "value": c.get('value', ''),
+                "domain": c.get('domain') or domain,
+                "path": c.get('path', '/') or "/",
+                "expires": c.get('expires'),
                 "secure": True,
                 "httpOnly": True,
             })
