@@ -103,8 +103,13 @@ databases:
       - table_name: fct_player_match
         schema: gold
         description: |
-          Per-player перформанс в матче: голы, ассисты, минуты, удары, карточки.
-          Источник для feat_player_form.
+          Multi-source per-match player stats (FBref + SofaScore + Understat + WhoScored).
+          PK: (match_id_canonical, player_id_canonical) — cross-source canonical через xref_*.
+          FBref-метрики: голы, ассисты, минуты, удары, карточки, отборы, перехваты.
+          SofaScore: rating (0-10), ground_duels_won, aerial_duels_won.
+          Understat: expected_goals, expected_assists, key_passes.
+          WhoScored: dribbles.
+          Источник для feat_player_form и per-match timeline-аналитики.
         default_endpoint: null
         cache_timeout: 1800
 

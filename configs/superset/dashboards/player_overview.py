@@ -11,7 +11,9 @@
 #   5-6. Защита: Top tackles+interceptions, DF/MF table
 #   7-8. Дисциплина: Top cards, Top penalties
 #   9-10. Минуты и форма: Top minutes, Top SofaScore rating
-#   11. Full player summary table
+#   11-12. Per-match timeline (Saka-кейс): xG/xA, рейтинг, ключевые передачи
+#         — связаны с фильтром «Игрок» (multi-source fct_player_match, issue #46)
+#   13. Full player summary table
 #
 # Season is hard-coded in virtual datasets — column type differs by source:
 #   - FBref / dim_player  -> bigint 2025
@@ -182,20 +184,26 @@ def _metric(label: str, agg: str, col: str | None, sql: str | None = None) -> di
 def _build_virtual_datasets(ctx: _Ctx, database: Any) -> dict[str, Any]:
     schema = "gold"
 
+    # NB: post issue #46, fct_player_match.PK = (match_id_canonical, player_id_canonical).
+    # JOIN-key для dim_player.player_id (вида 'fb_*') = player_id_canonical (то же
+    # семейство id'шников для FBref-узнанных игроков). Для cross-source-only игроков
+    # (SofaScore/Understat-only) JOIN вернёт NULL → COALESCE покажет сырой canonical id.
     v_player_match_named = f"""\
 SELECT
-  fpm.player_id,
-  COALESCE(dp.player_name, fpm.player_id) AS player_name,
+  fpm.player_id_canonical AS player_id,
+  COALESCE(dp.player_name, fpm.player_id_canonical) AS player_name,
   COALESCE(dp.position, fpm.position) AS position,
   REGEXP_EXTRACT(COALESCE(dp.position, fpm.position), '^([A-Z]{{2}})') AS position_primary,
-  fpm.team_name, fpm.match_id, fpm.minutes, fpm.goals, fpm.assists,
+  fpm.team_name,
+  fpm.match_id_canonical AS match_id,
+  fpm.minutes, fpm.goals, fpm.assists,
   fpm.shots, fpm.shots_on_target, fpm.penalty_goals, fpm.penalty_attempts,
   fpm.yellow_cards, fpm.red_cards, fpm.tackles_won, fpm.interceptions,
   fpm.fouls_committed, fpm.fouls_drawn, fpm.offsides, fpm.own_goals,
   fpm.league, fpm.season
 FROM iceberg.gold.fct_player_match fpm
 LEFT JOIN iceberg.gold.dim_player dp
-  ON dp.player_id = fpm.player_id
+  ON dp.player_id = fpm.player_id_canonical
  AND dp.season    = fpm.season
  AND dp.league    = fpm.league
 WHERE fpm.season = {SEASON_FBREF}
@@ -220,11 +228,11 @@ WHERE s.season = '{SEASON_OTHER_STR}'
 
     v_player_goals_vs_xg = f"""\
 WITH fbref_agg AS (
-  SELECT player_id, SUM(goals) AS goals, SUM(minutes) AS minutes,
+  SELECT player_id_canonical AS player_id, SUM(goals) AS goals, SUM(minutes) AS minutes,
          SUM(shots) AS shots, ARBITRARY(team_name) AS team_name
   FROM iceberg.gold.fct_player_match
   WHERE season = {SEASON_FBREF} AND league = '{LEAGUE}'
-  GROUP BY player_id
+  GROUP BY player_id_canonical
 ),
 xg_agg AS (
   SELECT player_id_canonical AS player_id, SUM(xg) AS xg
@@ -275,7 +283,8 @@ WHERE fmr.season = {SEASON_OTHER_INT}
 
     v_player_summary = f"""\
 WITH fbref AS (
-  SELECT player_id, COUNT(DISTINCT match_id) AS matches, SUM(minutes) AS minutes,
+  SELECT player_id_canonical AS player_id,
+         COUNT(DISTINCT match_id_canonical) AS matches, SUM(minutes) AS minutes,
          SUM(goals) AS goals, SUM(assists) AS assists, SUM(shots) AS shots,
          SUM(shots_on_target) AS sot, SUM(tackles_won) AS tackles_won,
          SUM(interceptions) AS interceptions, SUM(yellow_cards) AS yellow_cards,
@@ -284,7 +293,7 @@ WITH fbref AS (
          ARBITRARY(team_name) AS team_name
   FROM iceberg.gold.fct_player_match
   WHERE season = {SEASON_FBREF} AND league = '{LEAGUE}'
-  GROUP BY player_id
+  GROUP BY player_id_canonical
 ),
 xg_cte AS (
   SELECT player_id_canonical AS player_id, SUM(xg) AS total_xg
@@ -322,6 +331,41 @@ LEFT JOIN iceberg.gold.dim_player dp
  AND dp.season    = {SEASON_FBREF}
  AND dp.league    = '{LEAGUE}'"""
 
+    # Per-match timeline (Saka-кейс): x = дата матча, y = xG/xA/rating/key_passes
+    # из multi-source fct_player_match (post issue #46).
+    # JOIN с dim_match даёт ось времени; player_name берём из dim_player по
+    # FBref-canonical (для cross-source-only игроков покажем сырой canonical id).
+    v_player_match_timeline = f"""\
+SELECT
+  fpm.player_id_canonical AS player_id,
+  COALESCE(dp.player_name, fpm.player_id_canonical) AS player_name,
+  COALESCE(dp.position, fpm.position) AS position,
+  REGEXP_EXTRACT(COALESCE(dp.position, fpm.position), '^([A-Z]{{2}})') AS position_primary,
+  fpm.team_name,
+  fpm.match_id_canonical AS match_id,
+  dm.date AS match_date,
+  fpm.minutes,
+  fpm.goals,
+  fpm.assists,
+  fpm.expected_goals,
+  fpm.expected_assists,
+  fpm.rating,
+  fpm.key_passes,
+  fpm.dribbles,
+  fpm.ground_duels_won,
+  fpm.aerial_duels_won,
+  fpm.league,
+  fpm.season
+FROM iceberg.gold.fct_player_match fpm
+LEFT JOIN iceberg.gold.dim_match dm
+  ON dm.match_id = fpm.match_id_canonical
+LEFT JOIN iceberg.gold.dim_player dp
+  ON dp.player_id = fpm.player_id_canonical
+ AND dp.season    = fpm.season
+ AND dp.league    = fpm.league
+WHERE fpm.season = {SEASON_FBREF}
+  AND fpm.league = '{LEAGUE}'"""
+
     return {
         "v_player_match_named": _ensure_virtual_dataset(
             ctx, database, schema, "v_player_match_named", v_player_match_named
@@ -337,6 +381,9 @@ LEFT JOIN iceberg.gold.dim_player dp
         ),
         "v_player_season_summary_2025": _ensure_virtual_dataset(
             ctx, database, schema, "v_player_season_summary_2025", v_player_summary
+        ),
+        "v_player_match_timeline_2025": _ensure_virtual_dataset(
+            ctx, database, schema, "v_player_match_timeline_2025", v_player_match_timeline
         ),
     }
 
@@ -549,6 +596,66 @@ def _build_slices(ctx: _Ctx, database: Any) -> list[Any]:
         },
     ))
 
+    # --- Per-match timeline (Saka-кейс) -----------------------------------
+    # Эти чарты осмысленны только в связке с filter'ом "Игрок": без него на
+    # одном line-графике будут сотни кривых. См. _build_native_filters.
+    slices.append(_make_slice(ctx,
+        "xG / xA по матчам", "echarts_timeseries_line",
+        vds["v_player_match_timeline_2025"],
+        {
+            "x_axis": "match_date",
+            "metrics": [
+                _metric("SUM(xG)", "SUM", "expected_goals"),
+                _metric("SUM(xA)", "SUM", "expected_assists"),
+            ],
+            "groupby": ["player_name"],
+            "row_limit": 5000,
+            "show_legend": True,
+            "rich_tooltip": True,
+            "x_axis_title": "Дата матча",
+            "y_axis_title": "xG / xA",
+            "y_axis_format": ".2f",
+        },
+    ))
+
+    slices.append(_make_slice(ctx,
+        "Рейтинг по матчам (SofaScore)", "echarts_timeseries_line",
+        vds["v_player_match_timeline_2025"],
+        {
+            "x_axis": "match_date",
+            "metrics": [_metric("AVG(rating)", "AVG", "rating")],
+            "groupby": ["player_name"],
+            "row_limit": 5000,
+            "show_legend": True,
+            "rich_tooltip": True,
+            "x_axis_title": "Дата матча",
+            "y_axis_title": "Рейтинг (0-10)",
+            "y_axis_format": ".2f",
+            "adhoc_filters": [{
+                "expressionType": "SIMPLE",
+                "subject": "rating",
+                "operator": "IS NOT NULL",
+                "clause": "WHERE",
+            }],
+        },
+    ))
+
+    slices.append(_make_slice(ctx,
+        "Ключевые передачи по матчам", "dist_bar",
+        vds["v_player_match_timeline_2025"],
+        {
+            "metrics": [_metric("SUM(key_passes)", "SUM", "key_passes")],
+            "groupby": ["match_date"],
+            "row_limit": 100,
+            "order_desc": False,
+            "show_legend": False,
+            "show_bar_value": True,
+            "x_ticks_layout": "45°",
+            "bottom_margin": 80,
+            "y_axis_format": "SMART_NUMBER",
+        },
+    ))
+
     # --- Сводка ------------------------------------------------------------
     slices.append(_make_slice(ctx,
         "Сводная таблица игроков", "table", vds["v_player_season_summary_2025"],
@@ -647,7 +754,16 @@ def _build_position_json(slices: list[Any]) -> dict[str, Any]:
     children.append(_markdown("### Минуты и форма", height=3))
     children.append(_row([_chart(slices[12], 6), _chart(slices[13], 6)]))
 
-    children.append(_row([_chart(slices[14], 12, height=80)]))
+    children.append(_markdown(
+        "### Per-match timeline\n"
+        "Выберите игрока через фильтр «Игрок» в шапке, чтобы увидеть его "
+        "форму матч за матчем (xG/xA, рейтинг SofaScore, ключевые передачи).",
+        height=4,
+    ))
+    children.append(_row([_chart(slices[14], 6, height=55), _chart(slices[15], 6, height=55)]))
+    children.append(_row([_chart(slices[16], 12, height=50)]))
+
+    children.append(_row([_chart(slices[17], 12, height=80)]))
 
     pos[grid_id]["children"] = children
     return pos
@@ -660,7 +776,7 @@ def _build_native_filters(
     slices: list[Any],
     filter_dataset_id: int,
 ) -> list[dict[str, Any]]:
-    """Two dashboard-level filters: Position, Team.
+    """Three dashboard-level filters: Position, Team, Player.
 
     Scope is set per-filter based on which slices have the column. KPI slices
     on physical fct_* tables don't have `position_primary` (a synthesised
@@ -680,10 +796,15 @@ def _build_native_filters(
     chart_ids_all = [slc.id for slc in slices]
     # All slices now use virtual datasets that expose `position_primary`, so
     # the position filter applies everywhere. `team_name` is missing only on
-    # the xG/rating virtuals (slices 2, 3, 5, 13).
-    team_idxs = [0, 1, 4, 6, 7, 8, 9, 10, 11, 12, 14]
+    # the xG/rating-only virtuals (slices 5, 13). Timeline virtuals (14, 15, 16)
+    # expose `team_name` (v_player_match_timeline_2025).
+    # "Игрок" фильтр применяется ТОЛЬКО к timeline-чартам (14, 15, 16) — на
+    # сезон-агрегатах он не имеет смысла (там и так всё разбито по player_name).
+    team_idxs = [0, 1, 4, 6, 7, 8, 9, 10, 11, 12, 14, 15, 16, 17]
+    player_idxs = [14, 15, 16]
     position_chart_ids = chart_ids_all
     team_chart_ids = [slices[i].id for i in team_idxs]
+    player_chart_ids = [slices[i].id for i in player_idxs]
 
     def _filter(
         fid: str, name: str, column: str, multiple: bool,
@@ -718,6 +839,8 @@ def _build_native_filters(
                 multiple=True, target_chart_ids=position_chart_ids),
         _filter("NATIVE_FILTER-team", "Команда", "team_name",
                 multiple=True, target_chart_ids=team_chart_ids),
+        _filter("NATIVE_FILTER-player", "Игрок", "player_name",
+                multiple=True, target_chart_ids=player_chart_ids),
     ]
 
 
