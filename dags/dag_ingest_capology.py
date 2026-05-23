@@ -173,4 +173,54 @@ exit $rc
         trigger_rule='all_done',
     )
 
-    scrape_salaries_task >> validate_task
+    def _validate_bronze_quality(**ctx) -> None:
+        """Trino-level CHECK gate over bronze.capology_player_salaries.
+
+        WARNING-severity in the MVP so CAPOLOGY_FALLBACK soft-exits don't
+        fail the gate; promote individual checks to ERROR after a few
+        green weekly runs.
+        """
+        from utils.data_quality import CHECK, run_checks
+
+        season_short = (
+            f"{str(CURRENT_SEASON)[2:4]}"
+            f"{(int(str(CURRENT_SEASON)[2:4]) + 1) % 100:02d}"
+        )
+        where = (
+            f"league = '{LEAGUES[0]}' AND season = '{season_short}' "
+            f"AND currency = '{DEFAULT_CURRENCY}'"
+        )
+        checks = [
+            CHECK.row_count(
+                'bronze.capology_player_salaries',
+                min_rows=400, where=where, severity='WARNING',
+            ),
+            CHECK.no_duplicates(
+                'bronze.capology_player_salaries',
+                pk=['league', 'season', 'currency', 'player_slug', 'club_slug'],
+                where=where, severity='WARNING',
+            ),
+            CHECK.no_nulls(
+                'bronze.capology_player_salaries',
+                cols=['player_slug', 'player_name'],
+                where=where, severity='WARNING',
+            ),
+            CHECK.freshness(
+                'bronze.capology_player_salaries',
+                ts_col='_ingested_at', max_age_hours=48,
+                where=where, severity='WARNING',
+            ),
+        ]
+        report = run_checks(checks, raise_on_error=False)
+        import logging
+        logging.getLogger(__name__).info(
+            "validate_bronze_quality: %s", report.summary(),
+        )
+
+    validate_bronze_quality_task = PythonOperator(
+        task_id='validate_bronze_quality',
+        python_callable=_validate_bronze_quality,
+        trigger_rule='all_done',
+    )
+
+    scrape_salaries_task >> validate_task >> validate_bronze_quality_task

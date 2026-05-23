@@ -279,10 +279,66 @@ exit $rc
         trigger_rule='all_done',
     )
 
+    def _validate_bronze_quality(**ctx) -> None:
+        """Trino-level CHECK gate over the 3 Transfermarkt Bronze tables.
+
+        All checks are WARNING-severity in the MVP — a TM_FALLBACK soft
+        exit upstream would otherwise (legitimately) fail row_count /
+        freshness here. Promote individual checks to ERROR after a few
+        green weekly runs.
+        """
+        from utils.data_quality import CHECK, run_checks
+
+        season_short = (
+            f"{str(CURRENT_SEASON)[2:4]}"
+            f"{(int(str(CURRENT_SEASON)[2:4]) + 1) % 100:02d}"
+        )
+        where = f"league = '{LEAGUES[0]}' AND season = '{season_short}'"
+        checks = [
+            CHECK.row_count(
+                'bronze.transfermarkt_players',
+                min_rows=400, where=where, severity='WARNING',
+            ),
+            CHECK.no_duplicates(
+                'bronze.transfermarkt_players',
+                pk=['league', 'season', 'player_id'],
+                where=where, severity='WARNING',
+            ),
+            CHECK.no_nulls(
+                'bronze.transfermarkt_players',
+                cols=['player_id', 'name'],
+                where=where, severity='WARNING',
+            ),
+            CHECK.freshness(
+                'bronze.transfermarkt_players',
+                ts_col='_ingested_at', max_age_hours=48,
+                where=where, severity='WARNING',
+            ),
+            CHECK.row_count(
+                'bronze.transfermarkt_market_value_history',
+                min_rows=500, where=where, severity='WARNING',
+            ),
+            CHECK.row_count(
+                'bronze.transfermarkt_transfers',
+                min_rows=50, where=where, severity='WARNING',
+            ),
+        ]
+        report = run_checks(checks, raise_on_error=False)
+        import logging
+        logging.getLogger(__name__).info(
+            "validate_bronze_quality: %s", report.summary(),
+        )
+
+    validate_bronze_quality_task = PythonOperator(
+        task_id='validate_bronze_quality',
+        python_callable=_validate_bronze_quality,
+        trigger_rule='all_done',
+    )
+
     scrape_players_task >> scrape_mv_history_task
     scrape_players_task >> scrape_transfers_task
     [
         scrape_players_task,
         scrape_mv_history_task,
         scrape_transfers_task,
-    ] >> validate_task
+    ] >> validate_task >> validate_bronze_quality_task
