@@ -1,0 +1,127 @@
+{
+  "label": "track_a_v3",
+  "matches_attempted": 10,
+  "matches_succeeded": 10,
+  "total_seconds": 337.05,
+  "mean_seconds": 33.64,
+  "p50_seconds": 33.24,
+  "p95_seconds": 49.12,
+  "success_rate": 1.0,
+  "http_fetch_ok_total": 0,
+  "http_fetch_fallback_total": 0,
+  "real_bytes_mb": 25.51,
+  "real_requests": 643,
+  "scraper_failures": 9,
+  "per_match": [
+    {
+      "i": 1,
+      "path": "/en/matches/a071faa8/Liverpool-Bournemouth-August-15-2025-Premier-League",
+      "seconds": 21.32,
+      "bytes": 369996,
+      "success": true,
+      "http_fetch_ok_cumul": 0,
+      "http_fetch_fallback_cumul": 0,
+      "successes_cumul": 1,
+      "failures_cumul": 0
+    },
+    {
+      "i": 2,
+      "path": "/en/matches/bbdf4739/Aston-Villa-Newcastle-United-August-16-2025-Premier-League",
+      "seconds": 33.59,
+      "bytes": 352930,
+      "success": true,
+      "http_fetch_ok_cumul": 0,
+      "http_fetch_fallback_cumul": 0,
+      "successes_cumul": 2,
+      "failures_cumul": 1
+    },
+    {
+      "i": 3,
+      "path": "/en/matches/e1058522/Sunderland-West-Ham-United-August-16-2025-Premier-League",
+      "seconds": 49.12,
+      "bytes": 359662,
+      "success": true,
+      "http_fetch_ok_cumul": 0,
+      "http_fetch_fallback_cumul": 0,
+      "successes_cumul": 3,
+      "failures_cumul": 2
+    },
+    {
+      "i": 4,
+      "path": "/en/matches/57c49bae/Brighton-and-Hove-Albion-Fulham-August-16-2025-Premier-League",
+      "seconds": 33.32,
+      "bytes": 370603,
+      "success": true,
+      "http_fetch_ok_cumul": 0,
+      "http_fetch_fallback_cumul": 0,
+      "successes_cumul": 4,
+      "failures_cumul": 3
+    },
+    {
+      "i": 5,
+      "path": "/en/matches/d41bb8b3/Tottenham-Hotspur-Burnley-August-16-2025-Premier-League",
+      "seconds": 32.94,
+      "bytes": 367493,
+      "success": true,
+      "http_fetch_ok_cumul": 0,
+      "http_fetch_fallback_cumul": 0,
+      "successes_cumul": 5,
+      "failures_cumul": 4
+    },
+    {
+      "i": 6,
+      "path": "/en/matches/8613020d/Wolverhampton-Wanderers-Manchester-City-August-16-2025-Premier-League",
+      "seconds": 33.24,
+      "bytes": 370746,
+      "success": true,
+      "http_fetch_ok_cumul": 0,
+      "http_fetch_fallback_cumul": 0,
+      "successes_cumul": 6,
+      "failures_cumul": 5
+    },
+    {
+      "i": 7,
+      "path": "/en/matches/2185fc64/Chelsea-Crystal-Palace-August-17-2025-Premier-League",
+      "seconds": 33.05,
+      "bytes": 358742,
+      "success": true,
+      "http_fetch_ok_cumul": 0,
+      "http_fetch_fallback_cumul": 0,
+      "successes_cumul": 7,
+      "failures_cumul": 6
+    },
+    {
+      "i": 8,
+      "path": "/en/matches/855f8b5e/Nottingham-Forest-Brentford-August-17-2025-Premier-League",
+      "seconds": 33.19,
+      "bytes": 363469,
+      "success": true,
+      "http_fetch_ok_cumul": 0,
+      "http_fetch_fallback_cumul": 0,
+      "successes_cumul": 8,
+      "failures_cumul": 7
+    },
+    {
+      "i": 9,
+      "path": "/en/matches/643d26fd/Manchester-United-Arsenal-August-17-2025-Premier-League",
+      "seconds": 33.24,
+      "bytes": 366774,
+      "success": true,
+      "http_fetch_ok_cumul": 0,
+      "http_fetch_fallback_cumul": 0,
+      "successes_cumul": 9,
+      "failures_cumul": 8
+    },
+    {
+      "i": 10,
+      "path": "/en/matches/0701e218/Leeds-United-Everton-August-18-2025-Premier-League",
+      "seconds": 33.39,
+      "bytes": 359844,
+      "success": true,
+      "http_fetch_ok_cumul": 0,
+      "http_fetch_fallback_cumul": 0,
+      "successes_cumul": 10,
+      "failures_cumul": 9
+    }
+  ]
+}
