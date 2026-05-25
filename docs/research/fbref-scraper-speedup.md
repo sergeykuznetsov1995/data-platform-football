@@ -259,27 +259,65 @@ idempotent через sentinel-атрибут.
 5. ✅ Unit-тест `tests/unit/scrapers/test_nodriver_parser_patch.py`
    (4 кейса: swallow / passthrough / idempotency / non-dict input).
 
-### Bench post-patch (заполняется после прогона)
+### Bench post-patch (2026-05-25)
 
-> Прогон: `docker exec -e BENCH_LABEL=patched airflow-webserver bash -c \
->   "cd /opt/airflow && python scripts/research/bench_fbref_fetch.py"` \
-> → `/tmp/bench_fbref_patched.json`.
-> Repro: `docker exec airflow-webserver bash -c \
->   "cd /opt/airflow && python scripts/research/repro_nodriver_cookies_hang.py"` \
-> → `/tmp/nodriver_cookies_repro_v2.json`.
+10-match APL 2025/26 inside `airflow-webserver`, residential pool.proxys.io.
+Patch sentinel verified active в контейнере
+(`__data_platform_parse_json_event_patched__=True`, `parse_json_event=_safe`).
 
 | Метрика | baseline | track-A (cookie only) | patched (cookie + parser swallow) |
 |---|---|---|---|
-| mean s/match | 31.69 | 33.64 | _TBD_ |
-| p50 s/match | 31.92 | 32.85 | _TBD_ |
-| p95 s/match | 39.45 | 42.30 | _TBD_ |
-| http_fetch_ok | 0/10 | 0/10 | _TBD ≥ 8/10 expected_ |
-| success_rate | 1.0 | 1.0 | _TBD_ |
+| mean s/match | 31.69 | 33.64 | **34.23** |
+| p50 s/match | 31.92 | 32.85 | 35.92 |
+| p95 s/match | 39.45 | 42.30 | 38.65 |
+| http_fetch_ok | 0/10 | 0/10 | **0/10** |
+| http_fetch_fallback | 0/10 | 0/10 | 0/10 |
+| success_rate | 1.0 | 1.0 | 0.8 |
 
-Acceptance criteria issue #52: `mean ≤ 10 s/match` (≥3× speedup) и
-`http_fetch_ok ≥ 8/10`. Если bench не достигает порога — diagnose
-по DEBUG-логу patch'а (`nodriver parser regression swallowed (method=...)`),
-возможен follow-up на bump nodriver 0.50+.
+Raw: `/tmp/bench_fbref_patched.json`.
+
+### Что показывает bench
+
+Smoke-проверка в контейнере подтверждает, что broken
+`Network.responseReceivedExtraInfo` payload теперь возвращает `None`
+вместо `KeyError: 'charset'`, и unhandled exceptions в
+`Connection._listener` больше не копятся. **Но HTTP fast-path всё
+равно не активируется**: одноматчевый DEBUG-прогон даёт строку
+
+```
+scrapers.fbref.browser_manager: Timeout extracting cookies from nodriver (5s)
+```
+
+То есть `_try_init_http_session()` → `_extract_cookies_from_nodriver()`
+→ `page.send(_cdp_get_cookies_raw(...))` не возвращается за 5 s, хотя
+парсер обёрнут и `_listener` чистый. Это **другая** проблема — скорее
+всего на уровне `page.send` / target-session routing в nodriver
+(возможно, ответ Chromium приходит на другую CDP-сессию), а не в
+JSON-парсинге. Patch необходим (закрывает изначальный root cause), но
+не достаточен.
+
+### Acceptance status issue #52
+
+- [x] Monkey-patch применён, не ломает CF bypass / proxy rotation
+      (62 регрессионных теста + 4 unit-теста зелёные, smoke в контейнере OK).
+- [x] Repro `repro_nodriver_cookies_hang.py` — `hang_detected=false`
+      для method (d), `next_page_get=0.62 s = baseline`.
+- [ ] Bench `mean ≤ 10 s/match` + `http_fetch_ok ≥ 8/10` — **не достигнуты**,
+      blocker за пределами scope этого patch'а (см. follow-up).
+- [x] `docs/research/fbref-scraper-speedup.md` обновлён финальными числами.
+
+### Follow-up (отдельный issue)
+
+«**FBref HTTP fast-path: `page.send` cookie extraction times out даже
+с parse_json_event safety patch'ем**».
+Диагноз требует:
+1. Проверить, какие CDP-сообщения реально приходят в `_listener` после
+   успешного nodriver fetch'а (DEBUG-trap на `_listener._handle`).
+2. Проверить, на каком target/session sent `Network.getCookies` request
+   и куда приходит response.
+3. Кандидаты на починку: `_connection.send_raw` вместо generator'а,
+   `browser.cookies.get_all` после patch'а (теперь безопасный), или
+   bump nodriver 0.50+.
 
 ## Track B/C/D — короткие выводы (без бенчмарков)
 
