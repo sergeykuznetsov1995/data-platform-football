@@ -1,0 +1,42 @@
+-- =============================================================================
+-- Gold: dim_season  (Jinja template, rendered by dim_loaders.py)
+-- =============================================================================
+-- Static dimension of football seasons. One row per season_id.
+-- Sourced from a fixed range computed by dim_loaders (typically last 10 seasons
+-- + the current one), with valid_from/valid_to anchored to Aug 1 / Jul 31.
+--
+-- Source:       constants in dags/utils/dim_loaders.py -> rendered into VALUES
+--               rows by render_dim_season_sql()
+-- PK:           season_id  (e.g. '2024-25')
+-- Partitioning: NONE  (≤20-row config-driven dim)
+--
+-- Source-of-truth selection (R0.4 schema versioning):
+--   season_canonical = season_id    (config label, no alternative)
+--   season_source    = 'config'
+--   season_version   = 'v1'
+--
+-- Conventions:
+--   season_id          'YYYY-YY'  (e.g. '2024-25')   -- canonical PK
+--   season_label       'YYYY/YY'  (e.g. '2024/25')   -- BI-friendly display
+--   valid_from         DATE 'YYYY-08-01' (start_year)
+--   valid_to           DATE 'YYYY-07-31' (end_year)
+--   is_current         BOOLEAN — at most one row should be TRUE
+--
+-- The {{ rows }} placeholder is substituted by render_dim_season_sql() in
+-- Phase C; one tuple per season the platform supports.
+-- =============================================================================
+
+select * from (values
+{{ rows }}
+) as t(
+    season_id,            -- PK e.g. '2024-25'
+    season_start_year,    -- e.g. 2024
+    season_end_year,      -- e.g. 2025
+    season_label,         -- e.g. '2024/25'
+    valid_from,           -- DATE 'YYYY-08-01'
+    valid_to,             -- DATE 'YYYY-07-31'
+    is_current,           -- BOOLEAN
+    season_canonical,     -- == season_id
+    season_source,        -- 'config'
+    season_version        -- 'v1'
+)

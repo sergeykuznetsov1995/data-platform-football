@@ -1,0 +1,478 @@
+# =============================================================================
+# Cross-source team-name aliases — APL clubs (E1)
+# =============================================================================
+# Список clubs с per-source raw-name variants → canonical_name.
+# canonical_name следует Wikipedia "official name" convention.
+#
+# Структура одной записи:
+#   - canonical_name: <official Wikipedia name>
+#     aliases:
+#       _generic:    [list of raw_names that may appear in any source — UNION pool]
+#       fbref:       [list, optional]    # full names with spaces (mostly canonical)
+#       understat:   [list, optional]    # full names with spaces (mostly canonical)
+#       sofascore:   [list, optional]    # full names; some short ("Wolverhampton")
+#       matchhistory:[list, optional]    # short forms ('Wolves', 'Spurs', "Nott'm Forest")
+#       clubelo:     [list, optional]    # camelCase URL-style ('ManCity', 'WestHam')
+#       fotmob:      [list, optional]
+#       espn:        [list, optional]
+#       whoscored:   [list, optional]
+#     competition_scope: [list of competition.id where this alias-set is valid]
+#
+# Why _generic?
+#   The original `_team_aliases.sql` lists `(raw, canonical)` pairs without
+#   source attribution. Those pairs MUST keep working source-agnostic so the
+#   loader can produce the same UNION VALUES that the legacy SQL produced.
+#   Source-specific buckets exist for future per-source filtering (E8a/b/c
+#   когда захочется ограничить ClubElo camelCase только этим источником).
+#
+# Why competition_scope: ["ENG-Premier League"] for everything?
+#   E1 материализует APL-only. UCL (E8a) и Top-5 (E8b) добавят свои
+#   alias-blocks с другим scope. Не трогать сейчас.
+#
+# Source-specific naming notes (kept here so a future maintainer doesn't
+# chase the same dragons twice):
+#   * FBref       — full names with spaces, mostly canonical
+#   * Understat   — full names with spaces, mostly canonical
+#   * SofaScore   — full names; "Wolverhampton" is short for "Wolverhampton Wanderers"
+#   * MatchHistory (football-data.co.uk) — short forms: 'Wolves', 'Spurs',
+#                   'Man United', "Nott'm Forest"
+#   * ClubElo     — camelCase URL-style: 'ManCity', 'ManUnited', 'WestHam',
+#                   'CrystalPalace', 'NottinghamForest', 'AstonVilla',
+#                   'SheffieldUnited', 'LeicesterCity', 'NorwichCity',
+#                   'IpswichTown', 'LutonTown', 'WestBromwich', 'WatfordFC',
+#                   'LeedsUnited', 'NewcastleUnited'
+#
+# Apostrophe handling: YAML strings with apostrophes are written using
+# double-quoted form, e.g. "Nott'm Forest". The loader is responsible for
+# escaping apostrophes (`'` -> `''`) when emitting Trino SQL VALUES.
+# =============================================================================
+
+teams:
+  # ====== Wolverhampton Wanderers ======
+  - canonical_name: "Wolverhampton Wanderers"
+    aliases:
+      _generic:
+        - "Wolves"
+        - "Wolverhampton"
+        - "Wolverhampton Wanderers"
+      fbref: ["Wolverhampton Wanderers"]
+      understat: ["Wolverhampton Wanderers"]
+      sofascore: ["Wolverhampton"]
+      matchhistory: ["Wolves"]
+      clubelo: ["WolverhamptonWanderers"]
+      fotmob: ["Wolves"]
+      espn: ["Wolverhampton Wanderers"]
+      whoscored: ["Wolves"]
+    competition_scope: ["ENG-Premier League"]
+
+  # ====== Tottenham Hotspur ======
+  - canonical_name: "Tottenham Hotspur"
+    aliases:
+      _generic:
+        - "Spurs"
+        - "Tottenham"
+        - "Tottenham Hotspur"
+      fbref: ["Tottenham Hotspur"]
+      understat: ["Tottenham"]
+      sofascore: ["Tottenham Hotspur"]
+      matchhistory: ["Tottenham"]
+      clubelo: ["Tottenham"]
+      fotmob: ["Tottenham"]
+      espn: ["Tottenham Hotspur"]
+      whoscored: ["Tottenham"]
+    competition_scope: ["ENG-Premier League"]
+
+  # ====== Manchester United ======
+  - canonical_name: "Manchester United"
+    aliases:
+      _generic:
+        - "Man Utd"
+        - "Man United"
+        - "Manchester Utd"
+        - "Manchester United"
+        - "ManUnited"
+        - "ManUtd"
+      fbref: ["Manchester Utd"]
+      understat: ["Manchester United"]
+      sofascore: ["Manchester United"]
+      matchhistory: ["Man United"]
+      clubelo: ["ManUnited"]
+      fotmob: ["Man United"]
+      espn: ["Manchester United"]
+      whoscored: ["Manchester United"]
+    competition_scope: ["ENG-Premier League"]
+
+  # ====== Manchester City ======
+  - canonical_name: "Manchester City"
+    aliases:
+      _generic:
+        - "Man City"
+        - "Manchester City"
+        - "ManCity"
+      fbref: ["Manchester City"]
+      understat: ["Manchester City"]
+      sofascore: ["Manchester City"]
+      matchhistory: ["Man City"]
+      clubelo: ["ManCity"]
+      fotmob: ["Man City"]
+      espn: ["Manchester City"]
+      whoscored: ["Manchester City"]
+    competition_scope: ["ENG-Premier League"]
+
+  # ====== Newcastle United ======
+  - canonical_name: "Newcastle United"
+    aliases:
+      _generic:
+        - "Newcastle"
+        - "Newcastle Utd"
+        - "Newcastle United"
+        - "NewcastleUnited"
+      fbref: ["Newcastle Utd"]
+      understat: ["Newcastle United"]
+      sofascore: ["Newcastle"]
+      matchhistory: ["Newcastle"]
+      clubelo: ["NewcastleUnited"]
+      fotmob: ["Newcastle"]
+      espn: ["Newcastle United"]
+      whoscored: ["Newcastle"]
+    competition_scope: ["ENG-Premier League"]
+
+  # ====== Nottingham Forest ======
+  - canonical_name: "Nottingham Forest"
+    aliases:
+      _generic:
+        - "Nott'm Forest"
+        - "Nottingham"
+        - "Nottingham Forest"
+        - "NottinghamForest"
+      fbref: ["Nott'ham Forest"]
+      understat: ["Nottingham Forest"]
+      sofascore: ["Nottingham Forest"]
+      matchhistory: ["Nott'm Forest"]
+      clubelo: ["NottinghamForest"]
+      fotmob: ["Nott'm Forest"]
+      espn: ["Nottingham Forest"]
+      whoscored: ["Nottingham Forest"]
+    competition_scope: ["ENG-Premier League"]
+
+  # ====== Leicester City ======
+  - canonical_name: "Leicester City"
+    aliases:
+      _generic:
+        - "Leicester"
+        - "Leicester City"
+        - "LeicesterCity"
+      fbref: ["Leicester City"]
+      understat: ["Leicester"]
+      sofascore: ["Leicester City"]
+      matchhistory: ["Leicester"]
+      clubelo: ["LeicesterCity"]
+      fotmob: ["Leicester"]
+      espn: ["Leicester City"]
+      whoscored: ["Leicester"]
+    competition_scope: ["ENG-Premier League"]
+
+  # ====== Leeds United ======
+  - canonical_name: "Leeds United"
+    aliases:
+      _generic:
+        - "Leeds"
+        - "Leeds United"
+        - "LeedsUnited"
+      fbref: ["Leeds United"]
+      understat: ["Leeds"]
+      sofascore: ["Leeds United"]
+      matchhistory: ["Leeds"]
+      clubelo: ["LeedsUnited"]
+      fotmob: ["Leeds"]
+      espn: ["Leeds United"]
+      whoscored: ["Leeds"]
+    competition_scope: ["ENG-Premier League"]
+
+  # ====== West Ham United ======
+  - canonical_name: "West Ham United"
+    aliases:
+      _generic:
+        - "West Ham"
+        - "West Ham United"
+        - "WestHam"
+      fbref: ["West Ham"]
+      understat: ["West Ham"]
+      sofascore: ["West Ham United"]
+      matchhistory: ["West Ham"]
+      clubelo: ["WestHam"]
+      fotmob: ["West Ham"]
+      espn: ["West Ham United"]
+      whoscored: ["West Ham"]
+    competition_scope: ["ENG-Premier League"]
+
+  # ====== Brighton and Hove Albion ======
+  - canonical_name: "Brighton and Hove Albion"
+    aliases:
+      _generic:
+        - "Brighton"
+        - "Brighton & Hove Albion"
+        - "Brighton and Hove Albion"
+      fbref: ["Brighton"]
+      understat: ["Brighton"]
+      sofascore: ["Brighton & Hove Albion"]
+      matchhistory: ["Brighton"]
+      clubelo: ["Brighton"]
+      fotmob: ["Brighton"]
+      espn: ["Brighton & Hove Albion"]
+      whoscored: ["Brighton"]
+    competition_scope: ["ENG-Premier League"]
+
+  # ====== Norwich City ======
+  - canonical_name: "Norwich City"
+    aliases:
+      _generic:
+        - "Norwich"
+        - "Norwich City"
+        - "NorwichCity"
+      fbref: ["Norwich City"]
+      understat: ["Norwich"]
+      sofascore: ["Norwich City"]
+      matchhistory: ["Norwich"]
+      clubelo: ["NorwichCity"]
+      fotmob: ["Norwich"]
+      espn: ["Norwich City"]
+      whoscored: ["Norwich"]
+    competition_scope: ["ENG-Premier League"]
+
+  # ====== Sheffield United ======
+  - canonical_name: "Sheffield United"
+    aliases:
+      _generic:
+        - "Sheff Utd"
+        - "Sheffield Utd"
+        - "Sheffield United"
+        - "SheffieldUnited"
+      fbref: ["Sheffield Utd"]
+      understat: ["Sheffield United"]
+      sofascore: ["Sheffield United"]
+      matchhistory: ["Sheffield United"]
+      clubelo: ["SheffieldUnited"]
+      fotmob: ["Sheffield Utd"]
+      espn: ["Sheffield United"]
+      whoscored: ["Sheffield United"]
+    competition_scope: ["ENG-Premier League"]
+
+  # ====== Brentford ======
+  - canonical_name: "Brentford"
+    aliases:
+      _generic: ["Brentford"]
+      fbref: ["Brentford"]
+      understat: ["Brentford"]
+      sofascore: ["Brentford"]
+      matchhistory: ["Brentford"]
+      clubelo: ["Brentford"]
+      fotmob: ["Brentford"]
+      espn: ["Brentford"]
+      whoscored: ["Brentford"]
+    competition_scope: ["ENG-Premier League"]
+
+  # ====== AFC Bournemouth ======
+  - canonical_name: "AFC Bournemouth"
+    aliases:
+      _generic:
+        - "Bournemouth"
+        - "AFC Bournemouth"
+      fbref: ["Bournemouth"]
+      understat: ["Bournemouth"]
+      sofascore: ["AFC Bournemouth"]
+      matchhistory: ["Bournemouth"]
+      clubelo: ["Bournemouth"]
+      fotmob: ["Bournemouth"]
+      espn: ["AFC Bournemouth"]
+      whoscored: ["Bournemouth"]
+    competition_scope: ["ENG-Premier League"]
+
+  # ====== Cardiff City ======
+  - canonical_name: "Cardiff City"
+    aliases:
+      _generic:
+        - "Cardiff"
+        - "Cardiff City"
+      fbref: ["Cardiff City"]
+      understat: ["Cardiff"]
+      sofascore: ["Cardiff City"]
+      matchhistory: ["Cardiff"]
+      clubelo: ["Cardiff"]
+      fotmob: ["Cardiff City"]
+      espn: ["Cardiff City"]
+      whoscored: ["Cardiff"]
+    competition_scope: ["ENG-Premier League"]
+
+  # ====== Hull City ======
+  - canonical_name: "Hull City"
+    aliases:
+      _generic:
+        - "Hull"
+        - "Hull City"
+      fbref: ["Hull City"]
+      understat: ["Hull"]
+      sofascore: ["Hull City"]
+      matchhistory: ["Hull"]
+      clubelo: ["Hull"]
+      fotmob: ["Hull City"]
+      espn: ["Hull City"]
+      whoscored: ["Hull"]
+    competition_scope: ["ENG-Premier League"]
+
+  # ====== Stoke City ======
+  - canonical_name: "Stoke City"
+    aliases:
+      _generic:
+        - "Stoke"
+        - "Stoke City"
+      fbref: ["Stoke City"]
+      understat: ["Stoke"]
+      sofascore: ["Stoke City"]
+      matchhistory: ["Stoke"]
+      clubelo: ["Stoke"]
+      fotmob: ["Stoke City"]
+      espn: ["Stoke City"]
+      whoscored: ["Stoke"]
+    competition_scope: ["ENG-Premier League"]
+
+  # ====== Swansea City ======
+  - canonical_name: "Swansea City"
+    aliases:
+      _generic:
+        - "Swansea"
+        - "Swansea City"
+      fbref: ["Swansea City"]
+      understat: ["Swansea"]
+      sofascore: ["Swansea City"]
+      matchhistory: ["Swansea"]
+      clubelo: ["Swansea"]
+      fotmob: ["Swansea City"]
+      espn: ["Swansea City"]
+      whoscored: ["Swansea"]
+    competition_scope: ["ENG-Premier League"]
+
+  # ====== Watford ======
+  - canonical_name: "Watford"
+    aliases:
+      _generic:
+        - "Watford"
+        - "WatfordFC"
+      fbref: ["Watford"]
+      understat: ["Watford"]
+      sofascore: ["Watford"]
+      matchhistory: ["Watford"]
+      clubelo: ["WatfordFC"]
+      fotmob: ["Watford"]
+      espn: ["Watford"]
+      whoscored: ["Watford"]
+    competition_scope: ["ENG-Premier League"]
+
+  # ====== West Bromwich Albion ======
+  - canonical_name: "West Bromwich Albion"
+    aliases:
+      _generic:
+        - "West Brom"
+        - "West Bromwich"
+        - "West Bromwich Albion"
+      fbref: ["West Brom"]
+      understat: ["West Bromwich Albion"]
+      sofascore: ["West Bromwich Albion"]
+      matchhistory: ["West Brom"]
+      clubelo: ["WestBromwich"]
+      fotmob: ["West Brom"]
+      espn: ["West Bromwich Albion"]
+      whoscored:
+        - "West Brom"
+        - "West Bromwich Albion"
+    competition_scope: ["ENG-Premier League"]
+
+  # ====== Aston Villa ======
+  - canonical_name: "Aston Villa"
+    aliases:
+      _generic:
+        - "Aston Villa"
+        - "AstonVilla"
+      fbref: ["Aston Villa"]
+      understat: ["Aston Villa"]
+      sofascore: ["Aston Villa"]
+      matchhistory: ["Aston Villa"]
+      clubelo: ["AstonVilla"]
+      fotmob: ["Aston Villa"]
+      espn: ["Aston Villa"]
+      whoscored: ["Aston Villa"]
+    competition_scope: ["ENG-Premier League"]
+
+  # ====== Crystal Palace ======
+  - canonical_name: "Crystal Palace"
+    aliases:
+      _generic:
+        - "Crystal Palace"
+        - "CrystalPalace"
+      fbref: ["Crystal Palace"]
+      understat: ["Crystal Palace"]
+      sofascore: ["Crystal Palace"]
+      matchhistory: ["Crystal Palace"]
+      clubelo: ["CrystalPalace"]
+      fotmob: ["Crystal Palace"]
+      espn: ["Crystal Palace"]
+      whoscored: ["Crystal Palace"]
+    competition_scope: ["ENG-Premier League"]
+
+  # ====== Always-canonical clubs (no known variants — included for
+  #        idempotency: any canonical form passed through the alias lookup
+  #        must resolve to itself, otherwise COALESCE falls through to the
+  #        regex normalisation path).
+
+  - canonical_name: "Arsenal"
+    aliases:
+      _generic: ["Arsenal"]
+    competition_scope: ["ENG-Premier League"]
+
+  - canonical_name: "Burnley"
+    aliases:
+      _generic: ["Burnley"]
+    competition_scope: ["ENG-Premier League"]
+
+  - canonical_name: "Chelsea"
+    aliases:
+      _generic: ["Chelsea"]
+    competition_scope: ["ENG-Premier League"]
+
+  - canonical_name: "Everton"
+    aliases:
+      _generic: ["Everton"]
+    competition_scope: ["ENG-Premier League"]
+
+  - canonical_name: "Fulham"
+    aliases:
+      _generic: ["Fulham"]
+    competition_scope: ["ENG-Premier League"]
+
+  - canonical_name: "Liverpool"
+    aliases:
+      _generic: ["Liverpool"]
+    competition_scope: ["ENG-Premier League"]
+
+  - canonical_name: "Luton Town"
+    aliases:
+      _generic:
+        - "Luton Town"
+        - "Luton"
+        - "LutonTown"
+      whoscored: ["Luton"]
+      understat: ["Luton"]
+    competition_scope: ["ENG-Premier League"]
+
+  - canonical_name: "Southampton"
+    aliases:
+      _generic: ["Southampton"]
+    competition_scope: ["ENG-Premier League"]
+
+  - canonical_name: "Ipswich Town"
+    aliases:
+      _generic:
+        - "Ipswich Town"
+        - "Ipswich"
+        - "IpswichTown"
+    competition_scope: ["ENG-Premier League"]

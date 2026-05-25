@@ -38,3 +38,451 @@ class TestSofaScoreScraper:
     def test_rate_limit(self, scraper):
         """Test SofaScore rate limit."""
         assert scraper.DEFAULT_RATE_LIMIT == 20
+
+
+class TestShotmapFlatten:
+    """Pure-function tests for the shotmap payload flattener (#22)."""
+
+    def _payload(self):
+        """Minimal but realistic SofaScore shotmap response."""
+        return {
+            'shotmap': [
+                {
+                    'id': 101,
+                    'player': {'id': 11111, 'name': 'Player A'},
+                    'teamId': 1,
+                    'isHome': True,
+                    'time': 12,
+                    'addedTime': 0,
+                    'reversedPeriodCount': 1,
+                    'shotType': 'rightFoot',
+                    'situation': 'open-play',
+                    'bodyPart': 'rightFoot',
+                    'incidentType': 'goal',
+                    'goalType': 'regular',
+                    'playerCoordinates': {'x': 88.5, 'y': 50.0},
+                    'goalMouthCoordinates': {'x': 100.0, 'y': 52.3},
+                    'xg': 0.72,
+                    'xgot': 0.84,
+                },
+                {
+                    'id': 102,
+                    'player': {'id': 22222, 'name': 'Player B'},
+                    'teamId': 2,
+                    'isHome': False,
+                    'time': 45,
+                    'addedTime': 2,
+                    'reversedPeriodCount': 1,
+                    'shotType': 'header',
+                    'situation': 'corner',
+                    'bodyPart': 'head',
+                    'incidentType': 'save',
+                    'goalType': None,
+                    'playerCoordinates': {'x': 92.1, 'y': 48.5},
+                    'goalMouthCoordinates': {'x': 100.0, 'y': 51.2},
+                    'xg': 0.11,
+                    'xgot': None,
+                },
+                # Missing id → composite fallback
+                {
+                    'player': {'id': 33333},
+                    'teamId': 1,
+                    'isHome': True,
+                    'time': 78,
+                    'shotType': 'leftFoot',
+                    'incidentType': 'miss',
+                    'xg': 0.04,
+                },
+            ]
+        }
+
+    def test_flatten_happy_path(self):
+        from scrapers.sofascore.scraper import SofaScoreScraper
+
+        rows = SofaScoreScraper._flatten_shotmap('14023925', self._payload())
+        assert len(rows) == 3
+
+        goal = rows[0]
+        assert goal['match_id'] == '14023925'
+        assert goal['shot_id'] == '101'
+        assert goal['player_id'] == '11111'
+        assert goal['team_id'] == 1
+        assert goal['is_home'] is True
+        assert goal['minute'] == 12
+        assert goal['period'] == 1
+        assert goal['shot_type'] == 'rightFoot'
+        assert goal['situation'] == 'open-play'
+        assert goal['body_part'] == 'rightFoot'
+        assert goal['outcome'] == 'goal'
+        assert goal['goal_type'] == 'regular'
+        assert goal['x'] == 88.5
+        assert goal['y'] == 50.0
+        assert goal['xg'] == 0.72
+        assert goal['xgot'] == 0.84
+
+    def test_flatten_missing_id_falls_back_to_composite(self):
+        from scrapers.sofascore.scraper import SofaScoreScraper
+
+        rows = SofaScoreScraper._flatten_shotmap('14023925', self._payload())
+        third = rows[2]
+        # composite: match-time-player-addedTime
+        assert third['shot_id'] == '14023925-78-33333-0'
+        assert third['player_id'] == '33333'
+        assert third['outcome'] == 'miss'
+        # xgot absent → None
+        assert third['xgot'] is None
+
+    def test_flatten_handles_garbage(self):
+        from scrapers.sofascore.scraper import SofaScoreScraper
+
+        # Non-dict payload, missing shotmap key, non-list shotmap.
+        assert SofaScoreScraper._flatten_shotmap('1', None) == []
+        assert SofaScoreScraper._flatten_shotmap('1', {}) == []
+        assert SofaScoreScraper._flatten_shotmap('1', {'shotmap': 'oops'}) == []
+        assert SofaScoreScraper._flatten_shotmap('1', {'shotmap': [{}]}) == [
+            # Empty dict still yields a row with mostly None values + composite shot_id
+            {
+                'match_id': '1',
+                'shot_id': '1-NA-NA-0',
+                'player_id': None,
+                'team_id': None,
+                'is_home': None,
+                'minute': None,
+                'added_time': None,
+                'period': None,
+                'shot_type': None,
+                'situation': None,
+                'body_part': None,
+                'outcome': None,
+                'goal_type': None,
+                'x': None,
+                'y': None,
+                'goal_x': None,
+                'goal_y': None,
+                'xg': None,
+                'xgot': None,
+            }
+        ]
+
+
+class TestCamelToSnake:
+    """Sanity tests for the snake_case normalizer used by #21/#23/#24."""
+
+    def test_basic(self):
+        from scrapers.sofascore.scraper import _camel_to_snake
+        assert _camel_to_snake('goalsPrevented') == 'goals_prevented'
+        assert _camel_to_snake('accuratePass') == 'accurate_pass'
+        assert _camel_to_snake('expectedAssists') == 'expected_assists'
+
+    def test_consecutive_capitals(self):
+        from scrapers.sofascore.scraper import _camel_to_snake
+        # XGOnTarget keeps the leading abbreviation intact, splits at the
+        # first lowercase boundary.
+        assert _camel_to_snake('XGOnTarget') == 'xg_on_target'
+
+    def test_already_snake(self):
+        from scrapers.sofascore.scraper import _camel_to_snake
+        assert _camel_to_snake('already_snake') == 'already_snake'
+
+
+class TestEventPlayerStatsFlatten:
+    """Tests for the per-(match, player) Opta stats flattener (#21)."""
+
+    def _payload(self):
+        return {
+            'player': {'id': 11111, 'name': 'Player A'},
+            'team': {'id': 1, 'name': 'Team X'},
+            'position': 'F',
+            'extra': {
+                'isHome': True,
+                'captain': True,
+                'substitute': False,
+            },
+            'statistics': {
+                'rating': '7.8',
+                'goalsPrevented': 0.42,
+                'accuratePass': 35,
+                'totalPass': 40,
+                'expectedAssists': {'value': 0.21, 'previousValue': 0.10},
+                # Pure dict without 'value' → None
+                'noisyStruct': {'foo': 'bar'},
+                'position': 'CF',  # Should be skipped (re-export)
+            },
+        }
+
+    def test_flatten_happy_path(self):
+        from scrapers.sofascore.scraper import SofaScoreScraper
+
+        row = SofaScoreScraper._flatten_event_player_stats(
+            '14023925', '11111', self._payload(),
+        )
+        assert row is not None
+        assert row['match_id'] == '14023925'
+        assert row['player_id'] == '11111'
+        assert row['team_id'] == 1
+        assert row['team_name'] == 'Team X'
+        assert row['is_home'] is True
+        assert row['captain'] is True
+        assert row['substitute'] is False
+        assert row['position'] == 'F'
+
+        # snake_case auto-flatten
+        assert row['rating'] == 7.8
+        assert row['goals_prevented'] == 0.42
+        assert row['accurate_pass'] == 35
+        assert row['total_pass'] == 40
+        # struct with `value` → unwrapped
+        assert row['expected_assists'] == 0.21
+        # struct without `value` → None
+        assert row['noisy_struct'] is None
+        # The 'position' key inside statistics is the re-export and must
+        # not clobber the anchor column.
+        assert row['position'] == 'F'
+
+    def test_garbage_payload(self):
+        from scrapers.sofascore.scraper import SofaScoreScraper
+        assert SofaScoreScraper._flatten_event_player_stats('1', '1', None) is None
+        # Empty payload still produces an anchor-only row (no stats).
+        row = SofaScoreScraper._flatten_event_player_stats('1', '1', {})
+        assert row is not None
+        assert row['match_id'] == '1'
+        assert row['player_id'] == '1'
+
+
+class TestMatchStatsFlatten:
+    """Tests for the team-level per-(match, period, stat) flattener (#25)."""
+
+    def _payload(self):
+        return {
+            'statistics': [
+                {
+                    'period': 'ALL',
+                    'groups': [
+                        {
+                            'groupName': 'Possession',
+                            'statisticsItems': [
+                                {
+                                    'name': 'Ball possession',
+                                    'key': 'ballPossession',
+                                    'home': '55%',
+                                    'away': '45%',
+                                    'homeValue': 55,
+                                    'awayValue': 45,
+                                    'compareCode': 1,
+                                    'valueType': 'percent',
+                                },
+                            ],
+                        },
+                        {
+                            'groupName': 'Shots',
+                            'statisticsItems': [
+                                {
+                                    'name': 'Total shots',
+                                    'key': 'totalShotsOnGoal',
+                                    'home': '14',
+                                    'away': '7',
+                                    'homeValue': 14,
+                                    'awayValue': 7,
+                                    'compareCode': 1,
+                                    'valueType': 'count',
+                                },
+                                {
+                                    'name': 'Expected goals',
+                                    'key': 'expectedGoals',
+                                    'home': '1.8',
+                                    'away': '0.6',
+                                    'homeValue': 1.8,
+                                    'awayValue': 0.6,
+                                    'compareCode': 1,
+                                    'valueType': 'decimal',
+                                },
+                            ],
+                        },
+                    ],
+                },
+                {
+                    'period': '1ST',
+                    'groups': [
+                        {
+                            'groupName': 'Possession',
+                            'statisticsItems': [
+                                {
+                                    'name': 'Ball possession',
+                                    'key': 'ballPossession',
+                                    'home': '58%',
+                                    'away': '42%',
+                                    'homeValue': 58,
+                                    'awayValue': 42,
+                                    'compareCode': 1,
+                                    'valueType': 'percent',
+                                },
+                            ],
+                        },
+                    ],
+                },
+            ]
+        }
+
+    def test_flatten_happy_path(self):
+        from scrapers.sofascore.scraper import SofaScoreScraper
+
+        rows = SofaScoreScraper._flatten_match_stats('14023925', self._payload())
+        # 3 in ALL (1 possession + 2 shots) + 1 in 1ST = 4
+        assert len(rows) == 4
+
+        bp_all = next(
+            r for r in rows
+            if r['period'] == 'ALL' and r['stat_name'] == 'Ball possession'
+        )
+        assert bp_all['match_id'] == '14023925'
+        assert bp_all['stat_group'] == 'Possession'
+        assert bp_all['stat_key'] == 'ballPossession'
+        assert bp_all['home_value'] == 55.0
+        assert bp_all['away_value'] == 45.0
+        assert bp_all['home_text'] == '55%'
+        assert bp_all['away_text'] == '45%'
+
+        xg = next(r for r in rows if r['stat_name'] == 'Expected goals')
+        assert xg['home_value'] == 1.8
+        assert xg['away_value'] == 0.6
+
+        bp_1st = next(
+            r for r in rows
+            if r['period'] == '1ST' and r['stat_name'] == 'Ball possession'
+        )
+        assert bp_1st['home_value'] == 58.0
+
+    def test_flatten_handles_garbage(self):
+        from scrapers.sofascore.scraper import SofaScoreScraper
+        assert SofaScoreScraper._flatten_match_stats('1', None) == []
+        assert SofaScoreScraper._flatten_match_stats('1', {}) == []
+        assert SofaScoreScraper._flatten_match_stats('1', {'statistics': 'oops'}) == []
+        # Period with no groups → no rows.
+        assert SofaScoreScraper._flatten_match_stats(
+            '1', {'statistics': [{'period': 'ALL'}]}
+        ) == []
+
+
+class TestPlayerSeasonStatsFlatten:
+    """Tests for the per-(player, season) flattener (#24)."""
+
+    def test_happy_path(self):
+        from scrapers.sofascore.scraper import SofaScoreScraper
+        payload = {
+            'team': {'id': 1, 'name': 'Team X'},
+            'statistics': {
+                'rating': 7.42,
+                'totalGoals': 12,
+                'totalAssists': 5,
+                'expectedGoals': 10.8,
+                'minutesPlayed': 2800,
+            },
+        }
+        row = SofaScoreScraper._flatten_player_season_stats(
+            '11111', 17, 76986, payload,
+        )
+        assert row is not None
+        assert row['player_id'] == '11111'
+        assert row['unique_tournament_id'] == 17
+        assert row['sofascore_season_id'] == 76986
+        assert row['team_id'] == 1
+        assert row['team_name'] == 'Team X'
+        assert row['rating'] == 7.42
+        assert row['total_goals'] == 12
+        assert row['total_assists'] == 5
+        assert row['expected_goals'] == 10.8
+        assert row['minutes_played'] == 2800
+
+    def test_garbage(self):
+        from scrapers.sofascore.scraper import SofaScoreScraper
+        assert (
+            SofaScoreScraper._flatten_player_season_stats('1', 17, 1, None)
+            is None
+        )
+        row = SofaScoreScraper._flatten_player_season_stats('1', 17, 1, {})
+        assert row is not None
+        assert row['player_id'] == '1'
+
+
+class TestSofaScoreTournamentMap:
+    """Sanity for the league → unique_tournament_id static map (#24)."""
+
+    def test_known_leagues(self):
+        from scrapers.sofascore.scraper import SOFASCORE_TOURNAMENT_MAP
+        # Premier League is the canonical reference (APL probe #19).
+        assert SOFASCORE_TOURNAMENT_MAP['ENG-Premier League'] == 17
+        # Other Big 5 leagues should be present.
+        assert 'ESP-La Liga' in SOFASCORE_TOURNAMENT_MAP
+        assert 'GER-Bundesliga' in SOFASCORE_TOURNAMENT_MAP
+        assert 'ITA-Serie A' in SOFASCORE_TOURNAMENT_MAP
+        assert 'FRA-Ligue 1' in SOFASCORE_TOURNAMENT_MAP
+
+
+class TestPlayerProfileFlatten:
+    """Tests for the per-player biographical snapshot flattener (#23)."""
+
+    def test_happy_path(self):
+        from scrapers.sofascore.scraper import SofaScoreScraper
+        # dateOfBirthTimestamp = 1990-01-01 00:00 UTC = 631152000
+        payload = {
+            'player': {
+                'id': 11111,
+                'name': 'John Doe',
+                'shortName': 'J. Doe',
+                'slug': 'john-doe',
+                'position': 'F',
+                'jerseyNumber': '9',
+                'shirtNumber': 9,
+                'height': 182,
+                'preferredFoot': 'Right',
+                'dateOfBirthTimestamp': 631152000,
+                'nationality': 'England',
+                'country': {'name': 'England', 'alpha2': 'EN'},
+                'team': {'id': 1, 'name': 'Team X'},
+                'retired': False,
+            }
+        }
+        row = SofaScoreScraper._flatten_player_profile(payload)
+        assert row is not None
+        assert row['player_id'] == '11111'
+        assert row['name'] == 'John Doe'
+        assert row['short_name'] == 'J. Doe'
+        assert row['slug'] == 'john-doe'
+        assert row['position'] == 'F'
+        assert row['shirt_number'] == 9
+        assert row['height_cm'] == 182
+        assert row['preferred_foot'] == 'Right'
+        assert row['date_of_birth'] == '1990-01-01'
+        assert row['nationality'] == 'England'
+        assert row['country_code'] == 'EN'
+        assert row['current_team_id'] == 1
+        assert row['current_team_name'] == 'Team X'
+        assert row['retired'] is False
+
+    def test_garbage(self):
+        from scrapers.sofascore.scraper import SofaScoreScraper
+        assert SofaScoreScraper._flatten_player_profile(None) is None
+        assert SofaScoreScraper._flatten_player_profile({}) is None
+        # No player.id → None
+        assert SofaScoreScraper._flatten_player_profile({'player': {'name': 'X'}}) is None
+
+    def test_dob_fallback_when_timestamp_invalid(self):
+        from scrapers.sofascore.scraper import SofaScoreScraper
+        payload = {
+            'player': {'id': 1, 'dateOfBirthTimestamp': None},
+        }
+        row = SofaScoreScraper._flatten_player_profile(payload)
+        assert row is not None
+        assert row['date_of_birth'] is None
+
+    def test_country_fallback_for_nationality(self):
+        from scrapers.sofascore.scraper import SofaScoreScraper
+        payload = {
+            'player': {
+                'id': 1,
+                'country': {'name': 'Brazil', 'alpha2': 'BR'},
+            }
+        }
+        row = SofaScoreScraper._flatten_player_profile(payload)
+        assert row['nationality'] == 'Brazil'
+        assert row['country_code'] == 'BR'

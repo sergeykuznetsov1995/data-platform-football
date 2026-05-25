@@ -1,0 +1,64 @@
+# =============================================================================
+# OpenMetadata description: iceberg.gold.fct_team_match
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.gold.fct_team_match
+  description: |
+    Long-form факт: одна строка на (match_id, team_id) — обе стороны матча
+    представлены отдельно. Является источником для rolling-фич
+    (feat_team_form, feat_team_h2h) и для отчётов по командной метрике.
+    Дублирование снимается ключом team_id, но физически каждый матч в таблице
+    дважды (с домашней и гостевой стороны).
+  tags:
+    - Tier.Gold
+    - Domain.Football
+    - PII.None
+columns:
+  - name: match_id
+    description: ID матча (FK -> dim_match.match_id).
+  - name: team_id
+    description: ID команды (FK -> dim_team.team_id).
+  - name: opponent_id
+    description: ID соперника в этом матче.
+  - name: date
+    description: Дата матча.
+  - name: gameweek
+    description: Номер тура.
+  - name: is_home
+    description: TRUE если команда играла дома, FALSE если в гостях.
+  - name: goals_for
+    description: Голы команды в этом матче.
+  - name: goals_against
+    description: Голы соперника в этом матче.
+  - name: shots
+    description: Удары команды.
+  - name: shots_on_target
+    description: Удары команды в створ.
+  - name: possession
+    description: Владение мячом (%).
+  - name: yellow_cards
+    description: Жёлтые карточки команды.
+  - name: red_cards
+    description: Красные карточки команды.
+  - name: saves
+    description: Сейвы вратаря команды.
+  - name: points
+    description: Очки за матч (3 / 1 / 0).
+  - name: result
+    description: Результат с т.з. команды — 'W' / 'D' / 'L'.
+  - name: is_completed
+    description: Матч сыгран.
+  - name: league
+    description: Лига.
+  - name: season
+    description: Сезон.
+relationships:
+  - from: match_id
+    to: trino_iceberg.iceberg.gold.dim_match.match_id
+    type: FOREIGN_KEY
+  - from: team_id
+    to: trino_iceberg.iceberg.gold.dim_team.team_id
+    type: FOREIGN_KEY
+  - from: opponent_id
+    to: trino_iceberg.iceberg.gold.dim_team.team_id
+    type: FOREIGN_KEY

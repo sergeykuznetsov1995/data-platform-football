@@ -67,8 +67,15 @@ SELECT
     m.home_l5_wins,
     m.home_l5_losses,
     m.home_l5_draws,
+    -- T3.3: home volatility + trend
+    m.home_l5_goals_for_std,
+    m.home_l5_goals_against_std,
+    m.home_l5_points_std,
+    m.home_l5_form_trend,
     m.home_matches_played_so_far,
     m.home_rest_days,
+    -- E5: rolling player availability count
+    m.home_unavailable_count_l5,
     -- Away pre-match form (last 5)
     m.away_l5_goals_for_avg,
     m.away_l5_goals_against_avg,
@@ -79,8 +86,15 @@ SELECT
     m.away_l5_wins,
     m.away_l5_losses,
     m.away_l5_draws,
+    -- T3.3: away volatility + trend
+    m.away_l5_goals_for_std,
+    m.away_l5_goals_against_std,
+    m.away_l5_points_std,
+    m.away_l5_form_trend,
     m.away_matches_played_so_far,
     m.away_rest_days,
+    -- E5: rolling player availability count
+    m.away_unavailable_count_l5,
     -- H2H from home perspective
     m.h2h_goals_diff_avg,
     m.h2h_goals_for_avg,
@@ -89,13 +103,39 @@ SELECT
     m.h2h_home_losses,
     m.h2h_draws,
     m.h2h_matches_prior,
+    -- T3.2: home xG / PSxG rolling (L5, L10)
+    m.home_xg_for_l5_avg,
+    m.home_xg_against_l5_avg,
+    m.home_xg_diff_l5_avg,
+    m.home_psxg_for_l5_avg,
+    m.home_psxg_against_l5_avg,
+    m.home_psxg_diff_l5_avg,
+    m.home_xg_for_l10_avg,
+    m.home_xg_against_l10_avg,
+    m.home_xg_diff_l10_avg,
+    m.home_psxg_for_l10_avg,
+    m.home_psxg_against_l10_avg,
+    m.home_psxg_diff_l10_avg,
+    -- T3.2: away xG / PSxG rolling (L5, L10)
+    m.away_xg_for_l5_avg,
+    m.away_xg_against_l5_avg,
+    m.away_xg_diff_l5_avg,
+    m.away_psxg_for_l5_avg,
+    m.away_psxg_against_l5_avg,
+    m.away_psxg_diff_l5_avg,
+    m.away_xg_for_l10_avg,
+    m.away_xg_against_l10_avg,
+    m.away_xg_diff_l10_avg,
+    m.away_psxg_for_l10_avg,
+    m.away_psxg_against_l10_avg,
+    m.away_psxg_diff_l10_avg,
     -- Partition keys
     m.league,
     m.season
-    -- NB: T3.2 (xG/PSxG L5+L10) and T3.3 (volatility/trend std + form_trend)
-    -- columns are NOT yet present in the live fct_match materialisation
-    -- (Gold DAG hasn't been re-run since those features were added). Once
-    -- fct_match is rebuilt, append the new home_*/away_* columns here.
+    -- NB: E6 features (ref_*_l10 referee bias + home/away_*_share_l5_avg event
+    -- style) are deliberately NOT projected here. predictions_input (v1) is the
+    -- frozen legacy schema for the existing model server; predictions_input_v2
+    -- is the dual-write target carrying E6 fields. See W4 / W7 plan.
 FROM iceberg.gold.fct_match m
 WHERE m.is_completed = FALSE
   AND m.date BETWEEN CURRENT_DATE AND CURRENT_DATE + INTERVAL '7' DAY

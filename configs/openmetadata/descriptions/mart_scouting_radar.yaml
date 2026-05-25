@@ -1,0 +1,57 @@
+# =============================================================================
+# OpenMetadata description: iceberg.gold.mart_scouting_radar
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.gold.mart_scouting_radar
+  description: |
+    BI mart for player scouting radar charts (E7). Per-(player, match) profile
+    with rolling L5 metrics (xG/xA/shots/defensive). Source: fct_player_match
+    + fct_shot xG aggregation. Point-in-time safe (NULL for first 5 matches).
+  tags:
+    - Tier.Gold
+    - Domain.Football
+    - PII.None
+columns:
+  - name: player_id
+    description: FK -> dim_player.player_id (PK component).
+  - name: player_name
+    description: Player display name.
+  - name: position
+    description: Player position (FW / MF / DF / GK).
+  - name: team_id
+    description: FK -> dim_team.team_id.
+  - name: match_id
+    description: FK -> dim_match.match_id (PK component).
+  - name: match_date
+    description: Match date.
+  - name: minutes
+    description: Minutes played in this match.
+  - name: goals
+    description: Goals scored in this match.
+  - name: assists
+    description: Assists in this match.
+  - name: xg
+    description: xG accumulated in this match (from fct_shot).
+  - name: xa
+    description: xA accumulated in this match.
+  - name: xg_l5
+    description: Trailing 5-match avg xG (NULL for first 5 appearances).
+  - name: xa_l5
+    description: Trailing 5-match avg xA.
+  - name: shots_l5
+    description: Trailing 5-match avg shots.
+  - name: defensive_l5
+    description: Trailing 5-match avg defensive actions (tackles + interceptions).
+  - name: league
+    description: League slug.
+  - name: season
+    description: Season slug.
+relationships:
+  - from: trino_iceberg.iceberg.gold.mart_scouting_radar
+    to:   trino_iceberg.iceberg.gold.dim_player
+    type: FOREIGN_KEY
+    description: player_id -> dim_player.player_id
+  - from: trino_iceberg.iceberg.gold.mart_scouting_radar
+    to:   trino_iceberg.iceberg.gold.dim_match
+    type: FOREIGN_KEY
+    description: match_id -> dim_match.match_id

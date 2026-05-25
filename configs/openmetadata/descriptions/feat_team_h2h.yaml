@@ -1,0 +1,55 @@
+# =============================================================================
+# OpenMetadata description: iceberg.gold.feat_team_h2h
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.gold.feat_team_h2h
+  description: |
+    Head-to-head фичи: rolling-агрегация последних 5 встреч пары команд.
+    PK (match_id, team_id, opponent_id). Считается point-in-time safe
+    (текущий матч исключён). Полезно для моделей 1X2/totals — фактор
+    "истории противостояний". h2h_matches_prior > 0 — сигнал что фичи
+    рассчитаны не по пустому окну.
+  tags:
+    - Tier.Gold
+    - Domain.Football
+    - PII.None
+    - UseCase.ML
+columns:
+  - name: match_id
+    description: PK part 1 — ID матча (FK -> dim_match.match_id).
+  - name: team_id
+    description: PK part 2 — ID команды-владельца строки (FK -> dim_team.team_id).
+  - name: opponent_id
+    description: PK part 3 — ID соперника (FK -> dim_team.team_id).
+  - name: date
+    description: Дата матча.
+  - name: gameweek
+    description: Номер тура.
+  - name: h2h_goals_diff_avg
+    description: Средняя разница голов в очных встречах (с т.з. team_id).
+  - name: h2h_goals_for_avg
+    description: Среднее голов забито в очных встречах.
+  - name: h2h_goals_against_avg
+    description: Среднее голов пропущено в очных встречах.
+  - name: h2h_wins
+    description: Победы team_id в L5 очных встречах.
+  - name: h2h_losses
+    description: Поражения team_id в L5 очных встречах.
+  - name: h2h_draws
+    description: Ничьи в L5 очных встречах.
+  - name: h2h_matches_prior
+    description: Сколько очных встреч было до текущей (для интерпретации NULL'ов).
+  - name: league
+    description: Лига.
+  - name: season
+    description: Сезон.
+relationships:
+  - from: match_id
+    to: trino_iceberg.iceberg.gold.dim_match.match_id
+    type: FOREIGN_KEY
+  - from: team_id
+    to: trino_iceberg.iceberg.gold.dim_team.team_id
+    type: FOREIGN_KEY
+  - from: opponent_id
+    to: trino_iceberg.iceberg.gold.dim_team.team_id
+    type: FOREIGN_KEY

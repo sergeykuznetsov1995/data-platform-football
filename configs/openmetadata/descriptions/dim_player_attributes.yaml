@@ -1,0 +1,75 @@
+# =============================================================================
+# OpenMetadata description: iceberg.gold.dim_player_attributes
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.gold.dim_player_attributes
+  description: |
+    Cross-source snapshot per игрок — один row per canonical_id. Time-invariant
+    атрибуты (dob, height, foot, nationality, контракт) с per-source колонками
+    без winning-value logic — потребитель выбирает источник. FBref-spine:
+    WHERE source='fbref' AND confidence != 'orphan'. SofaScore-side читает
+    silver.sofascore_player_profile (canonical_id уже подтянут в Silver).
+    НЕ заменяет gold.dim_player (per-season, FBref-only). См. docs/research/
+    RX_cross_source_player_profile.md для полного rationale (D1-D4 решений).
+  tags:
+    - Tier.Gold
+    - Domain.Football
+    - PII.Low
+columns:
+  - name: player_id_canonical
+    description: Канонический ID игрока (`fb_<xxhash64>` для FBref-spine). PK.
+  - name: player_name_canonical
+    description: COALESCE(FBref → FotMob → SofaScore) — name fallback chain.
+    tags:
+      - PII.Low
+  - name: current_team_name
+    description: Команда из FBref (per-spine, 100% coverage).
+  - name: born_year_fbref
+    description: Год рождения из FBref (year-only — FBref не отдаёт точную дату).
+    tags:
+      - PII.Low
+  - name: dob_fotmob
+    description: Полная дата рождения из FotMob (date_of_birth).
+    tags:
+      - PII.Low
+  - name: dob_sofascore
+    description: Полная дата рождения из SofaScore /player/{id} (cross-validation для dob_fotmob).
+    tags:
+      - PII.Low
+  - name: nationality_fbref
+    description: Национальность из FBref (per-season snapshot, latest сезон).
+  - name: nationality_fotmob
+    description: Национальность из FotMob (snapshot).
+  - name: nationality_sofascore
+    description: Национальность из SofaScore (snapshot из /player/{id}).
+  - name: country_code_fotmob
+    description: ISO 3166-1 alpha-2 код страны из FotMob.
+  - name: country_code_sofascore
+    description: ISO 3166-1 alpha-2 код страны из SofaScore (country.alpha2).
+  - name: height_cm_fotmob
+    description: Рост в см из FotMob team_squad (≈93% coverage APL 2025).
+  - name: height_cm_sofascore
+    description: Рост в см из SofaScore /player/{id} (≈99% coverage APL 2025).
+  - name: foot_fotmob
+    description: Ведущая нога из FotMob (Right/Left/Both).
+  - name: foot_sofascore
+    description: Ведущая нога из SofaScore (preferredFoot, обычно совпадает с FotMob).
+  - name: shirt_number_fotmob
+    description: Номер на футболке из FotMob (текущий сезон).
+  - name: shirt_number_sofascore
+    description: Номер на футболке из SofaScore /player/{id}.
+  - name: retired_sofascore
+    description: Флаг "ушёл из футбола" из SofaScore (boolean, может быть NULL).
+  - name: contract_end_fotmob
+    description: Дата окончания контракта (FotMob; slowly-changing, as-of-latest-ingest).
+  - name: current_market_value_eur_fotmob
+    description: Текущая рыночная стоимость EUR из FotMob market_values_json.timeline (latest точка).
+  - name: market_value_currency_fotmob
+    description: Валюта рыночной стоимости (обычно EUR).
+  - name: _gold_created_at
+    description: Технический timestamp создания строки в Gold-слое.
+relationships:
+  - from: player_id_canonical
+    to: trino_iceberg.iceberg.gold.fct_player_season_stats.player_id_canonical
+    type: FOREIGN_KEY
+    description: 1:N — per-season stats для каждого игрока.

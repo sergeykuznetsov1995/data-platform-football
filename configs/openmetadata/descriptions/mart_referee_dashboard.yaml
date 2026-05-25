@@ -1,0 +1,41 @@
+# =============================================================================
+# OpenMetadata description: iceberg.gold.mart_referee_dashboard
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.gold.mart_referee_dashboard
+  description: |
+    BI mart for referee profile dashboards (E7). Per-(referee, season, league)
+    summary: cards/match, goals/match, home-win%, penalties/match. Denormalised
+    referee_name to skip dim_referee JOIN in Superset.
+  tags:
+    - Tier.Gold
+    - Domain.Football
+    - PII.None
+columns:
+  - name: referee_id
+    description: FK -> dim_referee.referee_id (PK component).
+  - name: referee_name
+    description: Referee display name (denormalised).
+  - name: season
+    description: Season slug (PK component).
+  - name: league
+    description: League slug (PK component).
+  - name: matches_officiated
+    description: Number of matches officiated in this (season, league).
+  - name: cards_per_match
+    description: Avg total cards (yellow + red) per match.
+  - name: yellows_per_match
+    description: Avg yellow cards per match.
+  - name: reds_per_match
+    description: Avg red + second-yellow cards per match.
+  - name: goals_per_match
+    description: Avg total goals per match officiated.
+  - name: penalties_per_match
+    description: Avg penalties awarded per match.
+  - name: home_win_pct
+    description: Share of matches won by the home team (proxy for home bias).
+relationships:
+  - from: trino_iceberg.iceberg.gold.mart_referee_dashboard
+    to:   trino_iceberg.iceberg.gold.dim_referee
+    type: FOREIGN_KEY
+    description: referee_id -> dim_referee.referee_id

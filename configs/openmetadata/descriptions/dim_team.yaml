@@ -1,0 +1,39 @@
+# =============================================================================
+# OpenMetadata description: iceberg.gold.dim_team
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.gold.dim_team
+  description: |
+    Канонический справочник команд. Одна строка на (team_id, league, season),
+    что позволяет отражать перемещения команды между лигами (промоушн/релегейшн).
+    Используется как FK target из fct_match (home/away), fct_team_match,
+    feat_team_form и feat_team_h2h.
+  tags:
+    - Tier.Gold
+    - Domain.Football
+    - PII.None
+columns:
+  - name: team_id
+    description: Канонический ID команды (генерируется entity_xref как нормализованное имя).
+  - name: team_name
+    description: Полное имя команды как в источнике (например 'Manchester United').
+  - name: league
+    description: Лига сезона.
+  - name: season
+    description: Сезон; команда может присутствовать в нескольких сезонах.
+relationships:
+  - from: team_id
+    to: trino_iceberg.iceberg.gold.fct_match.home_team_id
+    type: FOREIGN_KEY
+  - from: team_id
+    to: trino_iceberg.iceberg.gold.fct_match.away_team_id
+    type: FOREIGN_KEY
+  - from: team_id
+    to: trino_iceberg.iceberg.gold.fct_team_match.team_id
+    type: FOREIGN_KEY
+  - from: team_id
+    to: trino_iceberg.iceberg.gold.feat_team_form.team_id
+    type: FOREIGN_KEY
+  - from: team_id
+    to: trino_iceberg.iceberg.gold.feat_team_h2h.team_id
+    type: FOREIGN_KEY

@@ -1,0 +1,40 @@
+# =============================================================================
+# OpenMetadata description: iceberg.gold.fct_card
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.gold.fct_card
+  description: |
+    Narrow fact for cards (E4). Source: silver.match_cards (FBref + WhoScored
+    union). Grain: card_canonical (xxhash64 of match_id|minute|player|card_type).
+  tags:
+    - Tier.Gold
+    - Domain.Football
+    - PII.None
+columns:
+  - name: card_canonical
+    description: Logical PK (xxhash64-based, includes player + card_type for tiebreak).
+  - name: match_id_canonical
+    description: FK -> dim_match.match_id.
+  - name: team_id_canonical
+    description: FK -> dim_team.team_id.
+  - name: player_id_canonical
+    description: FK -> dim_player.player_id (carded player).
+  - name: minute
+    description: Match minute.
+  - name: card_type
+    description: "Enum: yellow / red / second_yellow."
+  - name: card_source
+    description: Source label ('fbref' / 'whoscored').
+  - name: league
+    description: League slug.
+  - name: season
+    description: Season (BIGINT).
+relationships:
+  - from: trino_iceberg.iceberg.gold.fct_card
+    to:   trino_iceberg.iceberg.gold.dim_match
+    type: FOREIGN_KEY
+    description: match_id_canonical -> dim_match.match_id
+  - from: trino_iceberg.iceberg.gold.fct_card
+    to:   trino_iceberg.iceberg.gold.dim_player
+    type: FOREIGN_KEY
+    description: player_id_canonical -> dim_player.player_id

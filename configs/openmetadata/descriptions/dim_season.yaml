@@ -1,0 +1,38 @@
+# =============================================================================
+# OpenMetadata description: iceberg.gold.dim_season
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.gold.dim_season
+  description: |
+    Справочник сезонов на основе списка `SEASONS` из `dags/utils/config.py`.
+    Поля valid_from/valid_to синтетические (Aug-Jul, стандартное европейское
+    окно сезона); точные даты старта/конца уточняются в E1 на основе FBref
+    schedule. is_current помечает активный сезон по календарю.
+  tags:
+    - Tier.Gold
+    - Domain.Football
+    - PII.None
+columns:
+  - name: season_id
+    description: Канонический ID сезона (например '2025-2026').
+  - name: season_start_year
+    description: Год начала сезона (например 2025).
+  - name: season_end_year
+    description: Год окончания сезона (например 2026).
+  - name: season_label
+    description: Человекочитаемая метка сезона (например '2025/26').
+  - name: valid_from
+    description: Синтетическая дата старта сезона (1 августа start_year; уточняется в E1).
+  - name: valid_to
+    description: Синтетическая дата окончания сезона (31 июля end_year; уточняется в E1).
+  - name: is_current
+    description: TRUE если сезон активен на сегодняшнюю дату (по valid_from/valid_to).
+  - name: season_canonical
+    description: Каноническая форма season-кода после нормализации (R0.4 schema-versioning).
+  - name: season_source
+    description: Источник определения сезона ('config' в v1).
+  - name: season_version
+    description: Версия схемы канонизации сезона (R0.4 schema-versioning).
+  - name: _silver_created_at
+    description: Технический timestamp создания строки в Silver-слое.
+relationships: []

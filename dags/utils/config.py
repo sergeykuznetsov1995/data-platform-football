@@ -36,6 +36,12 @@ LEAGUES: List[str] = [
 # Current season (dynamically calculated)
 CURRENT_SEASON: int = get_current_season()
 
+# Last 5 seasons as 4-digit CSV ("2122,2223,2324,2425,2526") — WhoScored multi-season ingest.
+SEASONS_STR: str = ','.join(
+    f"{(CURRENT_SEASON - off) % 100:02d}{(CURRENT_SEASON - off + 1) % 100:02d}"
+    for off in range(4, -1, -1)
+)
+
 # SoFIFA versions (FIFA game versions)
 # Valid values: "latest", "all", or list of version IDs from URL (e.g., 230034)
 SOFIFA_VERSIONS: str = 'latest'
@@ -51,6 +57,8 @@ SCHEDULES: Dict[str, str] = {
     'dag_ingest_espn': '0 12 * * *',         # 12:00 UTC daily
     'dag_ingest_clubelo': '0 13 * * *',      # 13:00 UTC daily
     'dag_ingest_sofifa': '0 6 * * 0',        # 6:00 UTC Sunday (weekly)
+    'dag_ingest_transfermarkt': '0 4 * * 1', # 4:00 UTC Monday (weekly)
+    'dag_ingest_capology': '0 5 * * 1',      # 5:00 UTC Monday (weekly)
     'dag_master_pipeline': '0 14 * * *',     # 14:00 UTC daily
     'dag_transform_fbref_silver': None,     # Trigger only (after ingestion)
 }
@@ -78,6 +86,8 @@ DAG_TAGS: Dict[str, List[str]] = {
     'espn': ['scraping', 'espn', 'bronze', 'football'],
     'clubelo': ['scraping', 'clubelo', 'bronze', 'football', 'elo'],
     'sofifa': ['scraping', 'sofifa', 'bronze', 'football', 'fifa'],
+    'transfermarkt': ['scraping', 'transfermarkt', 'bronze', 'football'],
+    'capology': ['scraping', 'capology', 'bronze', 'football', 'salaries'],
     'master': ['orchestration', 'master', 'pipeline'],
     'silver_fbref': ['transform', 'fbref', 'silver', 'football', 'trino'],
 }

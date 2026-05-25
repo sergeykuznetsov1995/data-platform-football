@@ -22,6 +22,7 @@ from scrapers.fbref.parsers.table_parser import (
 from scrapers.fbref.parsers.id_extractors import (
     PLAYER_ID_PATTERN,
     TEAM_ID_PATTERN,
+    MANAGER_ID_PATTERN,
     extract_player_ids_from_table,
     extract_team_ids_from_table,
     extract_match_urls_from_schedule,
@@ -37,6 +38,7 @@ from scrapers.fbref.parsers.finders import (
     parse_events_from_scorebox,
     parse_team_match_stats_table,
     parse_player_match_stats_tables,
+    parse_match_managers,
 )
 
 __all__ = [
@@ -44,6 +46,7 @@ __all__ = [
     'MULTIINDEX_PREFIXES',
     'PLAYER_ID_PATTERN',
     'TEAM_ID_PATTERN',
+    'MANAGER_ID_PATTERN',
     # table_parser
     'normalize_column_names',
     'extract_tables_from_comments',
@@ -64,4 +67,5 @@ __all__ = [
     'parse_events_from_scorebox',
     'parse_team_match_stats_table',
     'parse_player_match_stats_tables',
+    'parse_match_managers',
 ]

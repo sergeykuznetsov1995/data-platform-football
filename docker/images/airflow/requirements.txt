@@ -81,3 +81,13 @@ pybreaker>=1.2.0
 # [utils] Utilities
 # -----------------------------------------------------------------------------
 python-dotenv>=1.0.0
+
+# -----------------------------------------------------------------------------
+# [medallion] E1 player identity resolver (xref_player_resolver.py)
+# rapidfuzz ships rapidfuzz.distance.Levenshtein → no need for python-Levenshtein.
+# nicknames provides ~1100 English short↔full first-name pairs (Andy/Andrew,
+# Matty/Matthew, Bob/Robert) for the R2-followup v2 cascade tier.
+# -----------------------------------------------------------------------------
+rapidfuzz>=3.13.0
+Unidecode>=1.3.0
+nicknames>=1.0.0,<2.0.0

@@ -1,0 +1,36 @@
+# =============================================================================
+# OpenMetadata description: iceberg.gold.fct_match_odds
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.gold.fct_match_odds
+  description: |
+    Pre-match betting odds (E4). Source: silver.matchhistory_match_odds
+    (football-data.co.uk). One row per (match, bookmaker, market, closing_flag).
+  tags:
+    - Tier.Gold
+    - Domain.Football
+    - PII.None
+columns:
+  - name: odds_canonical
+    description: Logical PK (xxhash64 over match|bookmaker|market|closing_flag).
+  - name: match_id_canonical
+    description: FK -> dim_match.match_id.
+  - name: bookmaker
+    description: Bookmaker code (e.g. 'B365', 'PSC').
+  - name: market
+    description: Market type (e.g. 'home_win', 'draw', 'away_win', 'over_25').
+  - name: odd_value
+    description: Decimal odds value.
+  - name: closing_flag
+    description: TRUE for closing-line odds, FALSE for opening.
+  - name: odds_source
+    description: Source label ('matchhistory').
+  - name: league
+    description: League slug.
+  - name: season
+    description: Season (BIGINT).
+relationships:
+  - from: trino_iceberg.iceberg.gold.fct_match_odds
+    to:   trino_iceberg.iceberg.gold.dim_match
+    type: FOREIGN_KEY
+    description: match_id_canonical -> dim_match.match_id

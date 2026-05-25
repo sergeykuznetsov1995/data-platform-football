@@ -92,6 +92,14 @@ SILVER_TRANSFORMS = [
         'dags/sql/silver/fbref_team_season_profile.sql',
         'fbref_team_season_profile',
     ),
+    # E5: WhoScored confirmed-absences feed (per-match player unavailability).
+    # Reads bronze.whoscored_missing_players + bronze.whoscored_schedule.
+    # Optional Bronze — see OPTIONAL_BRONZE_TABLES below.
+    (
+        'whoscored_player_unavailable',
+        'dags/sql/silver/whoscored_player_unavailable.sql',
+        'whoscored_player_unavailable',
+    ),
 ]
 
 # Expected minimum row counts per Silver table (for validation)
@@ -104,11 +112,22 @@ SILVER_MIN_ROWS = {
     'fbref_match_lineups': 100,
     'fbref_shot_events': 50,
     'fbref_team_season_profile': 10,
+    # E5: ~20-50 confirmed absences/gameweek across APL → 100 rows is a
+    # conservative floor for a season's worth. Threshold is intentionally
+    # not strict — the table is in OPTIONAL_BRONZE_TABLES so it's excluded
+    # from `validate_silver` row-count enforcement (see _validate_silver).
+    'whoscored_player_unavailable': 100,
 }
 
-# Bronze tables that may not exist yet — skip transform with warning if absent
+# Bronze tables that may not exist yet — skip transform with warning if absent.
+# Silver-table-name -> Bronze-table-name. The Silver task graceful-skips when
+# the listed Bronze table is absent in iceberg.bronze.
 OPTIONAL_BRONZE_TABLES = {
-    'fbref_shot_events': 'fbref_shot_events',  # Silver table -> Bronze table
+    'fbref_shot_events': 'fbref_shot_events',
+    # E5: WhoScored ingest is paused on some deployments (see
+    # project_whoscored_cloudflare.md) — Silver must skip gracefully when the
+    # Bronze source is absent rather than failing the whole DAG.
+    'whoscored_player_unavailable': 'whoscored_missing_players',
 }
 
 
@@ -125,7 +144,6 @@ def _run_transform(sql_file: str, table_name: str, **context) -> Dict[str, Any]:
     """
     from utils.silver_tasks import check_bronze_table_exists, run_silver_transform
 
-    # Check if Bronze source table is optional and may not exist
     bronze_table = OPTIONAL_BRONZE_TABLES.get(table_name)
     if bronze_table:
         import logging
@@ -204,6 +222,7 @@ def _validate_silver_quality(**context) -> Dict[str, Any]:
 
     from utils.alerts import telegram_dq_summary
     from utils.data_quality import CHECK, run_checks
+    from utils.silver_tasks import check_bronze_table_exists
 
     logger = logging.getLogger(__name__)
 
@@ -274,6 +293,39 @@ def _validate_silver_quality(**context) -> Dict[str, Any]:
                           min_val=0, severity='WARNING'),
     ]
 
+    # E5: WhoScored unavailability is optional Bronze (see OPTIONAL_BRONZE_TABLES).
+    # Probe before appending checks — otherwise run_checks records SQL failures
+    # as ERRORs and raises in deployments where the WhoScored DAG is paused.
+    if check_bronze_table_exists(
+        table_name='whoscored_player_unavailable', schema='silver',
+    ):
+        # `team_name` is part of the natural key — a player can change clubs
+        # mid-season, so (match_id, player_id) alone isn't cross-team unique.
+        checks.extend([
+            CHECK.no_nulls(
+                'silver.whoscored_player_unavailable',
+                cols=['match_id', 'team_name', 'ws_player_id', 'match_date'],
+            ),
+            CHECK.no_duplicates(
+                'silver.whoscored_player_unavailable',
+                pk=['match_id', 'team_name', 'ws_player_id'],
+            ),
+            # 168h (7d) tolerance — WhoScored ingest is weekly and sometimes
+            # paused (project_whoscored_cloudflare.md); staleness past that
+            # is observable but not a blocker for Gold.
+            CHECK.freshness(
+                'silver.whoscored_player_unavailable',
+                ts_col='_bronze_ingested_at',
+                max_age_hours=168,
+                severity='WARNING',
+            ),
+        ])
+    else:
+        logger.warning(
+            "silver.whoscored_player_unavailable not found — skipping E5 DQ "
+            "checks (Bronze whoscored_missing_players likely paused)."
+        )
+
     # Run with raise_on_error=False so we can push a summary before failing.
     report = run_checks(checks, raise_on_error=False)
     logger.info(f"Silver DQ: {report.summary()}")
@@ -331,6 +383,7 @@ with DAG(
     | `fbref_match_events` | Detailed match events | match_events |
     | `fbref_match_lineups` | Detailed lineup entries | lineups |
     | `fbref_shot_events` | Per-shot xG data (optional) | shot_events |
+    | `whoscored_player_unavailable` | Confirmed player absences per match (optional) | whoscored_missing_players |
 
     ### Transformations Applied
 

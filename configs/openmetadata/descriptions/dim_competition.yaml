@@ -1,0 +1,44 @@
+# =============================================================================
+# OpenMetadata description: iceberg.gold.dim_competition
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.gold.dim_competition
+  description: |
+    Каталог известных лиг (5 строк, источник — `scrapers/sources/leagues.yaml`).
+    Это статический каталог, а не active-set: ребилд при E8 expansion
+    не требуется, новые лиги просто добавляются строками. Содержит mapping
+    competition_id → external IDs всех источников (FBref, WhoScored, SofaScore, ESPN).
+  tags:
+    - Tier.Gold
+    - Domain.Football
+    - PII.None
+columns:
+  - name: competition_id
+    description: Канонический ID лиги (например 'eng-premier-league').
+  - name: competition_name
+    description: Полное имя лиги (например 'Premier League').
+  - name: country
+    description: Страна проведения лиги (ISO code или полное название).
+  - name: competition_level
+    description: Уровень лиги (top-flight, second-tier и т.д.).
+  - name: n_teams
+    description: Количество команд в лиге за сезон.
+  - name: matches_per_season
+    description: Ожидаемое количество матчей за сезон (n_teams * (n_teams-1)).
+  - name: fbref_id
+    description: ID лиги в FBref (например '9' для Premier League).
+  - name: whoscored_id
+    description: ID лиги в WhoScored.
+  - name: sofascore_id
+    description: ID лиги в SofaScore.
+  - name: espn_id
+    description: ID лиги в ESPN (slug или числовой ID).
+  - name: competition_canonical
+    description: Каноническое имя лиги после нормализации (R0.4 schema-versioning).
+  - name: competition_source
+    description: Первичный источник определения лиги ('config' | 'fbref').
+  - name: competition_version
+    description: Версия схемы канонизации лиги (R0.4 schema-versioning).
+  - name: _silver_created_at
+    description: Технический timestamp создания строки в Silver-слое.
+relationships: []

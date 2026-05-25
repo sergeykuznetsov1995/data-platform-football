@@ -1,0 +1,46 @@
+# =============================================================================
+# OpenMetadata description: iceberg.gold.fct_event
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.gold.fct_event
+  description: |
+    Core SPADL-canonicalised event fact (~695k rows). Source:
+    silver.whoscored_events_spadl. Grain: one row per (match_id, event_id).
+    `match_id_canonical` is currently a `'whoscored_raw'` literal v0_unbridged
+    until E1.5 (xref_match cross-source bridge) ships.
+  tags:
+    - Tier.Gold
+    - Domain.Football
+    - PII.None
+columns:
+  - name: match_id_canonical
+    description: Canonical match ID (v0_unbridged — WhoScored game_id literal until E1.5).
+  - name: event_id
+    description: WhoScored per-match event sequence id.
+  - name: team_id_canonical
+    description: FK -> dim_team.team_id (event team).
+  - name: player_id_canonical
+    description: FK -> dim_player.player_id (event player; NULL for non-player events).
+  - name: minute
+    description: Expanded minute (90+ injury time included).
+  - name: x
+    description: Event start X coordinate, SPADL convention 0-100.
+  - name: y
+    description: Event start Y coordinate, SPADL convention 0-100.
+  - name: action_canonical
+    description: SPADL canonical action type (24 values, 89.97% coverage of WhoScored event types).
+  - name: outcome_success
+    description: Boolean — TRUE if action succeeded.
+  - name: league
+    description: League slug (partition).
+  - name: season
+    description: Season slug (partition).
+relationships:
+  - from: trino_iceberg.iceberg.gold.fct_event
+    to:   trino_iceberg.iceberg.gold.dim_team
+    type: FOREIGN_KEY
+    description: team_id_canonical -> dim_team.team_id
+  - from: trino_iceberg.iceberg.gold.fct_event
+    to:   trino_iceberg.iceberg.gold.dim_player
+    type: FOREIGN_KEY
+    description: player_id_canonical -> dim_player.player_id

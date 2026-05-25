@@ -479,32 +479,48 @@ WITH (
 
         total_inserted = 0
         columns = ', '.join(f'"{c}"' for c in df.columns)
+        header = f"INSERT INTO {qualified} ({columns})\nVALUES\n"
 
-        # Process in batches to avoid SQL size limits
-        for batch_start in range(0, len(df), batch_size):
-            batch_df = df.iloc[batch_start:batch_start + batch_size]
-            rows = []
+        # Trino's `query.max-length` defaults to 1,000,000 bytes; leave headroom
+        # for wide schemas (e.g. sofascore_player_season_stats ~150 cols).
+        sql_byte_budget = 900_000
 
-            for _, row in batch_df.iterrows():
-                values = []
-                for col in df.columns:
-                    val = row[col]
-                    target_type = table_col_types.get(col.lower(), '')
-                    values.append(self._format_sql_value(val, target_type))
-                rows.append(f"({', '.join(values)})")
+        pending_rows: List[str] = []
+        pending_bytes = len(header)
+        batch_num = 0
 
-            values_sql = ",\n".join(rows)
-
-            sql = f"""INSERT INTO {qualified} ({columns})
-VALUES
-{values_sql}"""
-
-            self._execute(sql)
-            total_inserted += len(batch_df)
+        def _flush() -> None:
+            nonlocal pending_rows, pending_bytes, total_inserted, batch_num
+            if not pending_rows:
+                return
+            batch_num += 1
+            self._execute(header + ",\n".join(pending_rows))
+            total_inserted += len(pending_rows)
             logger.debug(
-                f"Inserted batch {batch_start // batch_size + 1}: "
-                f"{len(batch_df)} rows into {self.catalog}.{schema}.{table}"
+                f"Inserted batch {batch_num}: {len(pending_rows)} rows "
+                f"({pending_bytes} bytes SQL) into "
+                f"{self.catalog}.{schema}.{table}"
             )
+            pending_rows = []
+            pending_bytes = len(header)
+
+        for _, row in df.iterrows():
+            values = []
+            for col in df.columns:
+                val = row[col]
+                target_type = table_col_types.get(col.lower(), '')
+                values.append(self._format_sql_value(val, target_type))
+            row_sql = f"({', '.join(values)})"
+            # +2 accounts for the ",\n" separator before the next row.
+            if pending_rows and (
+                pending_bytes + len(row_sql) + 2 > sql_byte_budget
+                or len(pending_rows) >= batch_size
+            ):
+                _flush()
+            pending_rows.append(row_sql)
+            pending_bytes += len(row_sql) + 2
+
+        _flush()
 
         logger.info(f"Inserted {total_inserted} rows into {self.catalog}.{schema}.{table}")
         return total_inserted

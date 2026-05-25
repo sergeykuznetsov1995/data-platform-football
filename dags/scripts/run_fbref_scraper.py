@@ -283,6 +283,14 @@ def main():
         help='Maximum matches to scrape per league/season (0 = no limit, selenium only)'
     )
     parser.add_argument(
+        '--no-incremental',
+        action='store_true',
+        help='[combined_match_data mode] Re-scrape matches even if they '
+             'already exist in fbref_match_player_stats. Required when '
+             'a NEW Bronze table (e.g. fbref_match_managers) needs to be '
+             'backfilled for already-scraped matches.'
+    )
+    parser.add_argument(
         '--verbose',
         action='store_true',
         help='Enable DEBUG logging (default: INFO with noisy loggers suppressed)'
@@ -548,6 +556,7 @@ def main():
 
                     scrape_results = scraper.scrape_combined_match_data(
                         max_matches=max_matches,
+                        incremental=not args.no_incremental,
                     )
 
                     results['tables'] = list(scrape_results.values())
