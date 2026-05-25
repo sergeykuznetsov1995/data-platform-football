@@ -64,6 +64,41 @@ nodriver = None
 CFVerify = None
 
 
+_NODRIVER_PATCH_SENTINEL = "__data_platform_parse_json_event_patched__"
+
+
+def _apply_nodriver_parser_safety_patch():
+    """Swallow exceptions from broken CDP parsers in nodriver 0.48.1.
+
+    Without this, `Response.from_json` (`KeyError: 'charset'`) and
+    `Cookie.from_json` (`TypeError`) accumulate as unhandled exceptions
+    in the background `Connection._listener` task. The event loop ends
+    up corrupted, and the FBref HTTP fast-path hangs on the next
+    `page.get()`. See `memory/feedback_nodriver_048_parser_regressions.md`
+    and `docs/research/fbref-scraper-speedup.md`.
+    """
+    import nodriver.cdp.util as _u
+
+    if getattr(_u, _NODRIVER_PATCH_SENTINEL, False):
+        return
+
+    _orig = _u.parse_json_event
+
+    def _safe(json):
+        try:
+            return _orig(json)
+        except Exception as exc:  # noqa: BLE001 — intentional swallow
+            logger.debug(
+                "nodriver parser regression swallowed (method=%s): %s",
+                (json or {}).get("method") if isinstance(json, dict) else None,
+                exc,
+            )
+            return None
+
+    _u.parse_json_event = _safe
+    setattr(_u, _NODRIVER_PATCH_SENTINEL, True)
+
+
 def _import_nodriver():
     """Lazy import nodriver to allow graceful degradation."""
     global nodriver
@@ -75,6 +110,7 @@ def _import_nodriver():
             raise ImportError(
                 "nodriver is not installed. Install it with: pip install nodriver>=0.32"
             ) from e
+        _apply_nodriver_parser_safety_patch()
     return nodriver
 
 
