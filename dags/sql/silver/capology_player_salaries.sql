@@ -1,0 +1,90 @@
+-- =============================================================================
+-- Silver: capology_player_salaries
+-- =============================================================================
+--
+-- Snapshot зарплат игроков из Capology: weekly_gross_gbp, status, флаги
+-- active/loan/verified. Один row per (player_slug, league, season) — snapshot
+-- grain совпадает с Bronze после фильтра currency='GBP' + (active OR loan).
+-- `canonical_id` подтягивается через silver.xref_player (source='capology',
+-- non-orphan) и материализуется как сторонний ключ для Gold-витрин уровня
+-- fct_player_season_stats (привязка salary→canonical player).
+--
+-- Bronze schema (типы корректные после парсера, см.
+-- scrapers/capology/scraper.py:461-525):
+--   player_slug, player_name, club_slug, club_name (varchar),
+--   position, status, currency (varchar),
+--   active, loan, verified (boolean),
+--   age, weekly_gross_gbp, annual_gross_gbp (integer; salary через accounting.formatMoney),
+--   weekly_net_gbp / bonus_* / total_* / adjusted_* / country_code — не переносим,
+--   league, season (varchar short-form '2526'), _ingested_at (timestamp).
+--   Bronze partitioning = (league, season, currency).
+--
+-- Notes:
+--   * (league, season) JOIN predicate против xref_player MANDATORY
+--     (CLAUDE.md / feedback_xref_join_season_predicate.md).
+--   * Filter (active = true OR loan = true) — симметрия с xref_player_resolver
+--     (см. _fetch_capology_players); Bronze несёт ~28% inactive строк
+--     (release/academy/youth) без FBref counterpart, отбрасываем до Silver.
+--   * Filter currency = 'GBP' — MVP single-currency; EUR/USD расширение
+--     отдельным issue после backfill.
+--   * canonical_id остаётся NULLable: Capology orphan rate ≈ 10.5% live APL
+--     2025/26 (55/526, per feedback_xref_player_tm_capology.md). DoD ≤7% —
+--     aspirational, требует resolver-tune (followup issue).
+--   * Bronze ingest mode = replace_partitions → ROW_NUMBER dedup defensive.
+--   * annual_gross_gbp = weekly_gross_gbp * 52 (per issue #63 DoD); Bronze
+--     annual_gross_gbp игнорируется ради формульной консистентности.
+-- =============================================================================
+
+WITH bronze_dedup AS (
+    SELECT *
+    FROM (
+        SELECT
+            b.*,
+            ROW_NUMBER() OVER (
+                PARTITION BY player_slug, league, season
+                ORDER BY _ingested_at DESC
+            ) AS rn
+        FROM iceberg.bronze.capology_player_salaries b
+        WHERE player_slug IS NOT NULL
+          AND currency = 'GBP'
+          AND (active = true OR loan = true)
+    )
+    WHERE rn = 1
+),
+
+xp AS (
+    SELECT canonical_id, source_id, league, season
+    FROM iceberg.silver.xref_player
+    WHERE source = 'capology'
+      AND confidence <> 'orphan'
+)
+
+SELECT
+    b.player_slug,
+    xp.canonical_id,
+    b.player_name,
+    b.club_slug,
+    b.club_name,
+    b.position,
+
+    CAST(b.weekly_gross_gbp AS DECIMAL(12,2))           AS weekly_gross_gbp,
+    CAST(b.weekly_gross_gbp * 52 AS DECIMAL(14,2))      AS annual_gross_gbp,
+
+    CAST(b.age AS INTEGER)                              AS age,
+    b.status,
+    b.active,
+    b.loan,
+    b.verified,
+    b.currency,
+
+    b._ingested_at                                      AS _bronze_ingested_at,
+
+    -- Partition keys last (matching writer convention).
+    b.league,
+    b.season
+
+FROM bronze_dedup b
+LEFT JOIN xp
+    ON xp.source_id = b.player_slug
+   AND xp.league    = b.league
+   AND xp.season    = b.season
