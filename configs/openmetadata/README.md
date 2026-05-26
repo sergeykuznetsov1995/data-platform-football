@@ -8,15 +8,19 @@ build ER diagrams).
 ## Workflow
 
 ```
-1) ingest          (schema discovery from Trino) — creates table entities in OM
-2) apply           (this dir)                    — patches descriptions/tags/relationships
-3) lineage         (Trino query history → edges) — wires fct→dim → mart→fct
+0) bootstrap       (this dir, one-time per OM instance) — creates Tier/Domain/PII/UseCase classifications + tags
+1) ingest          (schema discovery from Trino)        — creates table entities in OM
+2) apply           (this dir)                           — patches descriptions/tags/relationships
+3) lineage         (Trino query history → edges)        — wires fct→dim → mart→fct
 ```
 
 Cadence:
+- `om-bootstrap`: one-time per OM instance (and after `docker compose down openmetadata-server -v`); idempotent, safe to re-run.
 - `om-ingest-trino`: ad-hoc after a schema change in Gold.
 - `om-apply-descriptions`: after editing any YAML here (idempotent, safe to re-run).
 - `om-lineage-trino`: nightly (Trino query history rolls up the latest day).
+
+> Without `om-bootstrap`, `om-apply-descriptions` returns `PATCH HTTP 404: tag instance for Tier.Gold not found` on every YAML — the tag FQNs referenced in `tags:` must exist as real OM tags first.
 
 ## JWT setup
 
@@ -31,13 +35,20 @@ Cadence:
    export OPENMETADATA_JWT_TOKEN='<paste token>'
    ```
 
-3. Verify with `--dry-run` (no HTTP, just renders patches):
+3. One-time bootstrap of classifications/tags:
 
    ```bash
-   make om-apply-descriptions  # runs apply_descriptions.py inside airflow-webserver
+   make om-bootstrap   # creates Tier{Bronze,Silver,Gold} / Domain.Football / PII.{None,Low} / UseCase.ML
+   ```
+
+4. Apply YAML descriptions:
+
+   ```bash
+   make om-apply-descriptions  # runs apply_descriptions.py inside openmetadata-ingestion
    ```
 
 `HTTP 404` on a table = not yet ingested → re-run `om-ingest-trino`.
+`HTTP 404: tag instance for X not found` on every YAML = classifications not bootstrapped → run `make om-bootstrap`.
 `HTTP 401` = bad / expired JWT → re-issue.
 
 ## YAML format

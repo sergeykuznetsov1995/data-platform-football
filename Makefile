@@ -292,6 +292,11 @@ om-lineage-trino:
 om-apply-descriptions:
 	@docker compose exec openmetadata-ingestion python /opt/configs/apply_descriptions.py
 
+# Bootstrap OpenMetadata classifications (Tier / Domain / PII / UseCase) — idempotent.
+# Reads JWT from OPENMETADATA_JWT_TOKEN, falling back to OM_JWT_TOKEN (already in compose env).
+om-bootstrap:
+	@docker compose exec openmetadata-ingestion python /opt/configs/bootstrap_classifications.py
+
 # Tail Superset web logs
 logs-superset:
 	@docker compose logs -f --tail=100 superset
