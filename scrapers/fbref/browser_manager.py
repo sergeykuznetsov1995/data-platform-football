@@ -321,9 +321,12 @@ class FBrefBrowserMixin:
             self._http_session = self._create_http_session(cookies, proxy_url=proxy_url)
             self._http_cookies_time = time.time()
             self._http_request_count = 0
+            cf_clearance_preview = cookies.get('cf_clearance', '')[:16]
             logger.info(
                 f"HTTP session initialized with {len(cookies)} cookies "
-                f"(CF: {cf_names}, proxy: {'yes' if proxy_url else 'no'})"
+                f"(CF: {cf_names}, cf_clearance={cf_clearance_preview!r}..., "
+                f"proxy: {self._sanitize_proxy_url(proxy_url) or 'none'}, "
+                f"impersonate=chrome120)"
             )
         except Exception as e:
             logger.warning(f"Failed to create HTTP session: {e}")
@@ -342,6 +345,70 @@ class FBrefBrowserMixin:
             return True
         return False
 
+    @staticmethod
+    def _sanitize_proxy_url(proxy_url: Optional[str]) -> Optional[str]:
+        """Strip credentials from proxy URL for safe logging (host:port only)."""
+        if not proxy_url:
+            return None
+        return proxy_url.split('@', 1)[-1] if '@' in proxy_url else proxy_url
+
+    def _record_http_diag(
+        self,
+        url: str,
+        status: Optional[int],
+        html_len: int,
+        reason: str,
+        headers=None,
+        html_preview: str = "",
+        exception: str = "",
+    ) -> None:
+        """Record HTTP fast-path failure detail. Logs INFO for first 3, JSON-collects all.
+
+        Used by issue #65 diagnostics. The `http_fetch_diag` list lands in the
+        bench JSON via scripts/research/bench_fbref_fetch.py so root cause
+        (TLS fingerprint / proxy mismatch / cookie expiration) can be triaged
+        offline.
+        """
+        cookies_age_min = None
+        if self._http_cookies_time is not None:
+            cookies_age_min = round((time.time() - self._http_cookies_time) / 60.0, 2)
+
+        hdrs = headers or {}
+        record = {
+            "url": url,
+            "status": status,
+            "html_len": html_len,
+            "reason": reason,
+            "server": hdrs.get("Server") or hdrs.get("server"),
+            "cf_ray": hdrs.get("cf-ray") or hdrs.get("CF-RAY"),
+            "cf_mitigated": hdrs.get("cf-mitigated") or hdrs.get("CF-Mitigated"),
+            "content_encoding": hdrs.get("Content-Encoding") or hdrs.get("content-encoding"),
+            "content_length": hdrs.get("Content-Length") or hdrs.get("content-length"),
+            "cookies_age_min": cookies_age_min,
+            "request_n": self._http_request_count,
+        }
+        if html_preview:
+            record["html_preview"] = html_preview[:500]
+        if exception:
+            record["exception"] = exception
+
+        self._stats.setdefault("http_fetch_diag", []).append(record)
+
+        logged = self._stats.setdefault("http_fetch_diag_logged", 0)
+        if logged < 3:
+            self._stats["http_fetch_diag_logged"] = logged + 1
+            logger.info(
+                f"[http-fast-path] FAIL reason={reason} url={url} "
+                f"status={status} cf_mitigated={record['cf_mitigated']} "
+                f"cf_ray={record['cf_ray']} server={record['server']} "
+                f"len={html_len} cookies_age_min={cookies_age_min} "
+                f"req_n={self._http_request_count}"
+            )
+            if html_preview:
+                logger.info(f"[http-fast-path] preview: {html_preview[:300]!r}")
+            if exception:
+                logger.info(f"[http-fast-path] exception: {exception}")
+
     def _fetch_page_http(self, url: str) -> Optional[str]:
         """Fetch page via HTTP (curl_cffi) using CF cookies from nodriver."""
         if self._http_session is None:
@@ -352,11 +419,21 @@ class FBrefBrowserMixin:
             self._http_request_count += 1
 
             if response.status_code != 200:
-                logger.debug(f"HTTP fetch got status {response.status_code} for {url}")
+                self._record_http_diag(
+                    url, response.status_code, len(response.text or ""),
+                    reason="non_200",
+                    headers=response.headers,
+                    html_preview=(response.text or "")[:500],
+                )
                 return None
 
             html = response.text
             if not html:
+                self._record_http_diag(
+                    url, response.status_code, 0,
+                    reason="empty_body",
+                    headers=response.headers,
+                )
                 return None
 
             # Validate: must have tables (real FBref page)
@@ -367,13 +444,23 @@ class FBrefBrowserMixin:
             ])
 
             if has_cloudflare:
-                logger.debug(f"HTTP fetch got Cloudflare challenge for {url}")
+                self._record_http_diag(
+                    url, response.status_code, len(html),
+                    reason="cf_challenge_in_body",
+                    headers=response.headers,
+                    html_preview=html[:500],
+                )
                 return None
 
             if not has_tables and len(html) < 50000:
                 has_comment_tables = '<!--' in html and '<table' in html
                 if not has_comment_tables:
-                    logger.debug(f"HTTP fetch got incomplete page for {url}")
+                    self._record_http_diag(
+                        url, response.status_code, len(html),
+                        reason="incomplete_no_tables",
+                        headers=response.headers,
+                        html_preview=html[:500],
+                    )
                     return None
 
             logger.debug(
@@ -383,7 +470,11 @@ class FBrefBrowserMixin:
             return html
 
         except Exception as e:
-            logger.debug(f"HTTP fetch failed for {url}: {e}")
+            self._record_http_diag(
+                url, status=None, html_len=0,
+                reason="exception",
+                exception=f"{type(e).__name__}: {e}",
+            )
             return None
 
     # ------------------------------------------------------------------
