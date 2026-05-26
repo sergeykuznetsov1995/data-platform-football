@@ -16,8 +16,9 @@ Data collected:
 All data is written to Iceberg Bronze layer tables (via Parquet fallback).
 """
 
+import os
 from datetime import datetime, timedelta
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from airflow import DAG
 from airflow.exceptions import AirflowException
@@ -36,21 +37,31 @@ MATCH_STATS_RESULT_PATH = '/tmp/sofascore_match_stats_result.json'
 PLAYER_SEASON_STATS_RESULT_PATH = '/tmp/sofascore_player_season_stats_result.json'
 PLAYER_PROFILE_RESULT_PATH = '/tmp/sofascore_player_profile_result.json'
 
-# Smoke caps used by the daily DAG to keep the first runs of new event-grain
-# entities bounded. Full season backfill (no cap) is a separate, manually
-# triggered run — see `memory/project_sofascore_bronze_cherry_pick_*.md`.
-SHOTMAP_DAILY_LIMIT = 50
-# event_player_stats is per-(match, player): a match averages ~25 players,
-# so 10 matches ≈ 250 HTTP calls, ~12.5 min at 20 req/min.
-EVENT_PLAYER_STATS_DAILY_LIMIT = 10
-# match_stats is per-match (1 HTTP call/match) — cheap, lifts to 50 like
-# shotmap.
-MATCH_STATS_DAILY_LIMIT = 50
-# player_season_stats is per-player (1 HTTP call/player) — 50 players smoke.
-# Full season ≈ 700 players ≈ 35 min at 20 req/min.
-PLAYER_SEASON_STATS_DAILY_LIMIT = 50
-# player_profile is per-player (1 HTTP call/player) — snapshot grain.
-PLAYER_PROFILE_DAILY_LIMIT = 50
+
+def _env_int(name: str) -> Optional[int]:
+    """Read an int from ENV; empty / unparseable / non-positive → None."""
+    raw = os.environ.get(name, '').strip()
+    if not raw:
+        return None
+    try:
+        v = int(raw)
+    except ValueError:
+        return None
+    return v if v > 0 else None
+
+
+# Per-endpoint safety knobs. Default = None (no cap, full coverage).
+# Override via ENV on dev / staging to keep runs bounded. Issue #69.
+SHOTMAP_DAILY_LIMIT = _env_int('SS_SHOTMAP_LIMIT')
+EVENT_PLAYER_STATS_DAILY_LIMIT = _env_int('SS_EPS_LIMIT')
+MATCH_STATS_DAILY_LIMIT = _env_int('SS_MATCH_STATS_LIMIT')
+PLAYER_SEASON_STATS_DAILY_LIMIT = _env_int('SS_PSS_LIMIT')
+PLAYER_PROFILE_DAILY_LIMIT = _env_int('SS_PP_LIMIT')
+
+
+def _limit_arg(limit: Optional[int]) -> str:
+    """Render ``--limit N`` only when limit is set; else empty string."""
+    return f"--limit {int(limit)}" if limit else ""
 
 
 def _load_result(path: str, logger) -> Dict[str, Any]:
@@ -174,9 +185,9 @@ def validate_data(**context) -> Dict[str, Any]:
                 f"{validation['summary']['player_ratings_rows']} < 300"
             )
 
-    # Shotmap: smoke daily cap = 50 matches × ~10 shots/match ≈ 500 rows.
-    # Hard threshold kept loose (50) until the daily cap is removed.
-    if validation['summary']['shotmap_rows'] < 50:
+    # Shotmap: full APL season ≈ 380 matches × ~25 shots/match ≈ 9.5K rows.
+    # WARN-only threshold = 300 (issue #69; covers first few gameweeks too).
+    if validation['summary']['shotmap_rows'] < 300:
         if validation['summary']['shotmap_fallback']:
             validation['warnings'].append(
                 f"shotmap R0.2B_FALLBACK: rows="
@@ -188,11 +199,12 @@ def validate_data(**context) -> Dict[str, Any]:
         else:
             validation['warnings'].append(
                 f"Low shotmap row count: "
-                f"{validation['summary']['shotmap_rows']} < 50"
+                f"{validation['summary']['shotmap_rows']} < 300"
             )
 
-    # event_player_stats: 10 matches × ~25 played players ≈ 250 rows.
-    if validation['summary']['event_player_stats_rows'] < 50:
+    # event_player_stats: full APL season ≈ 380 matches × ~25 played players
+    # ≈ 9.5K rows. WARN-only threshold = 10K (issue #69).
+    if validation['summary']['event_player_stats_rows'] < 10000:
         if validation['summary']['event_player_stats_fallback']:
             validation['warnings'].append(
                 f"event_player_stats R0.2B_FALLBACK: rows="
@@ -204,11 +216,12 @@ def validate_data(**context) -> Dict[str, Any]:
         else:
             validation['warnings'].append(
                 f"Low event_player_stats row count: "
-                f"{validation['summary']['event_player_stats_rows']} < 50"
+                f"{validation['summary']['event_player_stats_rows']} < 10000"
             )
 
-    # match_stats: 50 matches × 3 periods × ~10 groups × ~5 stats ≈ 7.5K rows.
-    if validation['summary']['match_stats_rows'] < 100:
+    # match_stats: full APL season ≈ 380 matches × 3 periods × ~30 stats
+    # ≈ 34K rows. WARN-only threshold = 10K (issue #69).
+    if validation['summary']['match_stats_rows'] < 10000:
         if validation['summary']['match_stats_fallback']:
             validation['warnings'].append(
                 f"match_stats R0.2B_FALLBACK: rows="
@@ -220,11 +233,12 @@ def validate_data(**context) -> Dict[str, Any]:
         else:
             validation['warnings'].append(
                 f"Low match_stats row count: "
-                f"{validation['summary']['match_stats_rows']} < 100"
+                f"{validation['summary']['match_stats_rows']} < 10000"
             )
 
-    # player_season_stats: 1 row per player. Smoke cap = 50.
-    if validation['summary']['player_season_stats_rows'] < 20:
+    # player_season_stats: 1 row per player. APL ≈ 526 active players.
+    # WARN-only threshold = 400 (issue #69).
+    if validation['summary']['player_season_stats_rows'] < 400:
         if validation['summary']['player_season_stats_fallback']:
             validation['warnings'].append(
                 f"player_season_stats R0.2B_FALLBACK: rows="
@@ -236,11 +250,12 @@ def validate_data(**context) -> Dict[str, Any]:
         else:
             validation['warnings'].append(
                 f"Low player_season_stats row count: "
-                f"{validation['summary']['player_season_stats_rows']} < 20"
+                f"{validation['summary']['player_season_stats_rows']} < 400"
             )
 
-    # player_profile: 1 row per player. Smoke cap = 50.
-    if validation['summary']['player_profile_rows'] < 20:
+    # player_profile: 1 row per player. APL ≈ 526 active players.
+    # WARN-only threshold = 400 (issue #69).
+    if validation['summary']['player_profile_rows'] < 400:
         if validation['summary']['player_profile_fallback']:
             validation['warnings'].append(
                 f"player_profile R0.2B_FALLBACK: rows="
@@ -252,7 +267,7 @@ def validate_data(**context) -> Dict[str, Any]:
         else:
             validation['warnings'].append(
                 f"Low player_profile row count: "
-                f"{validation['summary']['player_profile_rows']} < 20"
+                f"{validation['summary']['player_profile_rows']} < 400"
             )
 
     logger.info(f"Data validation complete: {validation['status']}")
@@ -299,6 +314,22 @@ with DAG(
     - **Schedule**: Match dates, teams, scores, venues
     - **Team Stats**: Season-level team statistics
     - **Player Stats**: Season-level player statistics
+
+    ### Daily limits (issue #69)
+
+    No per-endpoint cap by default. Override via ENV on dev/staging:
+    `SS_SHOTMAP_LIMIT`, `SS_EPS_LIMIT`, `SS_MATCH_STATS_LIMIT`,
+    `SS_PSS_LIMIT`, `SS_PP_LIMIT` (positive int → cap).
+
+    ### Skip-existing (event-grain)
+
+    `shotmap`, `event_player_stats`, `match_stats` skip match_ids already
+    materialised in their bronze table → APPEND mode. Snapshot endpoints
+    (`player_season_stats`, `player_profile`) keep full refresh
+    (`replace_partitions=['league','season']`).
+
+    **Manual full refresh**: `TRUNCATE iceberg.bronze.sofascore_<table>`
+    via `make shell-trino`, then trigger the DAG.
 
     ### Notes
 
@@ -351,8 +382,9 @@ exit $rc
         append_env=True,
     )
 
-    # #22 — per-shot xG/coords/situation. Capped at SHOTMAP_DAILY_LIMIT matches
-    # for the first weeks; lift after stable 7-day run (see memory).
+    # #22 — per-shot xG/coords/situation. No daily cap by default (#69);
+    # set `SS_SHOTMAP_LIMIT` ENV to bound on dev. Skip-existing in runner
+    # keeps steady-state runs cheap.
     scrape_shotmap_task = BashOperator(
         task_id='scrape_shotmap',
         bash_command=f"""
@@ -361,7 +393,7 @@ python dags/scripts/run_sofascore_scraper.py \\
     --entity shotmap \\
     --league "{LEAGUES[0]}" \\
     --season {CURRENT_SEASON} \\
-    --limit {SHOTMAP_DAILY_LIMIT} \\
+    {_limit_arg(SHOTMAP_DAILY_LIMIT)} \\
     --output {SHOTMAP_RESULT_PATH}
 rc=$?
 if [ $rc -eq 2 ]; then
@@ -380,7 +412,7 @@ exit $rc
 
     # #25 — team-level per-match stats (per-period long-form). Reads
     # match_ids from bronze.sofascore_schedule; runs in parallel with
-    # shotmap (independent of player_ratings).
+    # shotmap (independent of player_ratings). No daily cap by default (#69).
     scrape_match_stats_task = BashOperator(
         task_id='scrape_match_stats',
         bash_command=f"""
@@ -389,7 +421,7 @@ python dags/scripts/run_sofascore_scraper.py \\
     --entity match_stats \\
     --league "{LEAGUES[0]}" \\
     --season {CURRENT_SEASON} \\
-    --limit {MATCH_STATS_DAILY_LIMIT} \\
+    {_limit_arg(MATCH_STATS_DAILY_LIMIT)} \\
     --output {MATCH_STATS_RESULT_PATH}
 rc=$?
 if [ $rc -eq 2 ]; then
@@ -408,6 +440,7 @@ exit $rc
 
     # #24 — season-aggregate per-player Opta stats. Depends on fresh
     # bronze.sofascore_player_ratings (provides DISTINCT player_ids).
+    # Snapshot grain — full refresh every run (no skip-existing).
     scrape_player_season_stats_task = BashOperator(
         task_id='scrape_player_season_stats',
         bash_command=f"""
@@ -416,7 +449,7 @@ python dags/scripts/run_sofascore_scraper.py \\
     --entity player_season_stats \\
     --league "{LEAGUES[0]}" \\
     --season {CURRENT_SEASON} \\
-    --limit {PLAYER_SEASON_STATS_DAILY_LIMIT} \\
+    {_limit_arg(PLAYER_SEASON_STATS_DAILY_LIMIT)} \\
     --output {PLAYER_SEASON_STATS_RESULT_PATH}
 rc=$?
 if [ $rc -eq 2 ]; then
@@ -434,6 +467,7 @@ exit $rc
     )
 
     # #23 — biographical snapshot per player. Cheap, runs after ratings.
+    # Snapshot grain — full refresh every run (no skip-existing).
     scrape_player_profile_task = BashOperator(
         task_id='scrape_player_profile',
         bash_command=f"""
@@ -442,7 +476,7 @@ python dags/scripts/run_sofascore_scraper.py \\
     --entity player_profile \\
     --league "{LEAGUES[0]}" \\
     --season {CURRENT_SEASON} \\
-    --limit {PLAYER_PROFILE_DAILY_LIMIT} \\
+    {_limit_arg(PLAYER_PROFILE_DAILY_LIMIT)} \\
     --output {PLAYER_PROFILE_RESULT_PATH}
 rc=$?
 if [ $rc -eq 2 ]; then
@@ -461,6 +495,8 @@ exit $rc
 
     # #21 — per-(match, player) Opta stats. Depends on fresh
     # bronze.sofascore_player_ratings (provides the player_id list per match).
+    # No daily cap by default (#69); runner skip-existing keeps steady-state
+    # runs ~10 min.
     scrape_event_player_stats_task = BashOperator(
         task_id='scrape_event_player_stats',
         bash_command=f"""
@@ -469,7 +505,7 @@ python dags/scripts/run_sofascore_scraper.py \\
     --entity event_player_stats \\
     --league "{LEAGUES[0]}" \\
     --season {CURRENT_SEASON} \\
-    --limit {EVENT_PLAYER_STATS_DAILY_LIMIT} \\
+    {_limit_arg(EVENT_PLAYER_STATS_DAILY_LIMIT)} \\
     --output {EVENT_PLAYER_STATS_RESULT_PATH}
 rc=$?
 if [ $rc -eq 2 ]; then
