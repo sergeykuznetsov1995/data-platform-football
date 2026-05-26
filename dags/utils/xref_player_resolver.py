@@ -111,6 +111,7 @@ SURNAME_MIN_LEN: int = 4
 #: (FIFA seasons != football seasons) and is a separate effort.
 SOURCES: Tuple[str, ...] = (
     'fbref', 'understat', 'whoscored', 'fotmob', 'sofascore',
+    'transfermarkt', 'capology',
 )
 
 #: Default batch size for ``INSERT INTO ... VALUES (...)``. 500 fits
@@ -640,10 +641,12 @@ def _orphan_prefix(source: str) -> str:
     and means a typo in a source name surfaces as an immediate KeyError.
     """
     return {
-        'understat': 'us',
-        'whoscored': 'ws',
-        'fotmob':    'fm',
-        'sofascore': 'ss',
+        'understat':     'us',
+        'whoscored':     'ws',
+        'fotmob':        'fm',
+        'sofascore':     'ss',
+        'transfermarkt': 'tm',
+        'capology':      'cap',
     }[source]
 
 
@@ -946,6 +949,109 @@ def _fetch_sofascore_players(
     return out
 
 
+def _fetch_transfermarkt_players(
+    conn, league: str, source_seasons: List[str]
+) -> List[Dict[str, Any]]:
+    """Read Transfermarkt player anchor rows for the resolver cascade.
+
+    Bronze ``transfermarkt_players`` is a per-season snapshot (one row per
+    (player_id, league, season)) with rich attributes — for the resolver
+    we only need name + current_club_name + season; the rest is consumed
+    by the downstream Silver CTAS (#60).
+
+    Season is stored as the 4-digit slug ('2526') matching Understat /
+    WhoScored / SofaScore conventions, so no slug conversion is needed.
+    """
+    sql = f"""
+        SELECT
+            player_id,
+            name,
+            current_club_name,
+            league,
+            season
+        FROM iceberg.bronze.transfermarkt_players
+        WHERE league = '{_sql_escape(league)}'
+          AND season IN ({_seasons_in_clause(source_seasons)})
+          AND player_id IS NOT NULL
+          AND name IS NOT NULL
+        GROUP BY player_id, name, current_club_name, league, season
+    """
+    rows = _execute(conn, sql, fetch=True) or []
+    out: List[Dict[str, Any]] = []
+    seen: set = set()
+    for pid, name, team, lg, season in rows:
+        key = (str(pid), team, season)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(
+            {
+                'source': 'transfermarkt',
+                'source_id': str(pid),
+                'player_name': name,
+                'raw_team_name': team,
+                'canonical_team': canonical_team_for_resolver(team, 'transfermarkt'),
+                'league': lg,
+                'season': season,
+            }
+        )
+    return out
+
+
+def _fetch_capology_players(
+    conn, league: str, source_seasons: List[str]
+) -> List[Dict[str, Any]]:
+    """Read Capology salary-snapshot anchors for the resolver cascade.
+
+    Bronze ``capology_player_salaries`` is keyed by player_slug + club_slug
+    + season + currency; we filter to a single currency to avoid 3× row
+    inflation when EUR/USD partitions land (MVP: GBP only).
+
+    Multi-club edge case: a player who changed clubs mid-season has TWO
+    rows (one per club). The fuzzy-match tier uses (season, canonical_team)
+    buckets so each row still tries to match its FBref counterpart inside
+    its own club bucket — both rows will resolve to the same canonical_id
+    on success, and the (source, source_id, league, season) dedup in
+    ``xref_player`` PK collapses them.
+    """
+    # Filter to roster-active or on-loan players. Bronze carries ~28% of
+    # rows with status='Inactive' (released, youth, academy) — these have
+    # no FBref / Understat / WhoScored counterpart and would silently
+    # inflate the orphan rate by structural ~30pp. Active+loan keeps the
+    # set comparable to the other 6 sources' rostered-only output.
+    sql = f"""
+        SELECT
+            player_slug,
+            MAX(player_name) AS player_name,
+            MAX(club_name)   AS club_name,
+            league,
+            season
+        FROM iceberg.bronze.capology_player_salaries
+        WHERE league = '{_sql_escape(league)}'
+          AND season IN ({_seasons_in_clause(source_seasons)})
+          AND currency = 'GBP'
+          AND player_slug IS NOT NULL
+          AND player_name IS NOT NULL
+          AND (active = true OR loan = true)
+        GROUP BY player_slug, league, season
+    """
+    rows = _execute(conn, sql, fetch=True) or []
+    out: List[Dict[str, Any]] = []
+    for slug, name, team, lg, season in rows:
+        out.append(
+            {
+                'source': 'capology',
+                'source_id': slug,
+                'player_name': name,
+                'raw_team_name': team,
+                'canonical_team': canonical_team_for_resolver(team, 'capology'),
+                'league': lg,
+                'season': season,
+            }
+        )
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Trino write helpers
 # ---------------------------------------------------------------------------
@@ -1199,6 +1305,8 @@ def _resolve_all(
     ws_rows: List[Dict[str, Any]],
     ss_rows: List[Dict[str, Any]],
     fm_rows: Optional[List[Dict[str, Any]]] = None,
+    tm_rows: Optional[List[Dict[str, Any]]] = None,
+    cap_rows: Optional[List[Dict[str, Any]]] = None,
     *,
     nn: Any = None,
     detected_at: Any = None,
@@ -1272,7 +1380,9 @@ def _resolve_all(
 
     # Cascade for non-FBref sources.
     fm_rows = fm_rows or []
-    for src_rows in (us_rows, ws_rows, fm_rows, ss_rows):
+    tm_rows = tm_rows or []
+    cap_rows = cap_rows or []
+    for src_rows in (us_rows, ws_rows, fm_rows, ss_rows, tm_rows, cap_rows):
         for row in src_rows:
             ambiguity_info: Dict[str, Any] = {}
             cid, conf, score = cascade_resolve(
@@ -1525,9 +1635,17 @@ def run_resolver(
         ss = _fetch_sofascore_players(conn, league, source_seasons)
         logger.info("  %d SofaScore players", len(ss))
 
+        logger.info("Reading Transfermarkt players ...")
+        tm = _fetch_transfermarkt_players(conn, league, source_seasons)
+        logger.info("  %d Transfermarkt players", len(tm))
+
+        logger.info("Reading Capology players ...")
+        cap = _fetch_capology_players(conn, league, source_seasons)
+        logger.info("  %d Capology players", len(cap))
+
         logger.info("Resolving identities ...")
         rows, review_rows, stats = _resolve_all(
-            fb, us, ws, ss, fm, nn=nn, detected_at=detected_at
+            fb, us, ws, ss, fm, tm, cap, nn=nn, detected_at=detected_at
         )
         logger.info(
             "  produced %d xref rows, %d review rows",
