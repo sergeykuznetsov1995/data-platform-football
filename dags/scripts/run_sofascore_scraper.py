@@ -82,6 +82,69 @@ VALID_ENTITIES = {
 }
 
 
+def _trino_connect():
+    """Open a Trino dbapi connection from env. Returns None on import error."""
+    try:
+        import trino
+        import trino.auth as trino_auth
+    except ImportError as e:
+        logger.error("trino client unavailable: %s", e)
+        return None
+
+    user = os.environ.get('TRINO_USER', 'airflow')
+    password = os.environ.get('TRINO_PASSWORD')
+    if password:
+        return trino.dbapi.connect(
+            host=os.environ.get('TRINO_HOST', 'trino'),
+            port=int(os.environ.get('TRINO_PORT', 8443)),
+            user=user,
+            catalog='iceberg',
+            http_scheme='https',
+            auth=trino_auth.BasicAuthentication(user, password),
+            verify=False,
+        )
+    return trino.dbapi.connect(
+        host=os.environ.get('TRINO_HOST', 'trino'),
+        port=int(os.environ.get('TRINO_PORT', 8080)),
+        user=user,
+        catalog='iceberg',
+    )
+
+
+def _existing_match_ids_in_bronze(
+    table: str,
+    league: str,
+    season_short: str,
+) -> set:
+    """Return distinct ``match_id`` strings already materialised in
+    ``iceberg.bronze.<table>`` for the given partition.
+
+    Returns an empty set when the table does not yet exist (first run)
+    or any Trino-side error occurs — caller then treats input as fully
+    new. Issue #69 skip-existing path.
+    """
+    conn = _trino_connect()
+    if conn is None:
+        return set()
+    try:
+        cur = conn.cursor()
+        sql = (
+            f"SELECT DISTINCT CAST(match_id AS varchar) "
+            f"FROM iceberg.bronze.{table} "
+            f"WHERE league = ? AND CAST(season AS varchar) = ?"
+        )
+        cur.execute(sql, (league, season_short))
+        rows = cur.fetchall()
+        return {r[0] for r in rows if r and r[0] is not None}
+    except Exception as e:
+        logger.warning(
+            "skip-existing probe on bronze.%s failed (%s) — treating "
+            "all input match_ids as new.",
+            table, e,
+        )
+        return set()
+
+
 def _resolve_match_ids_from_bronze(
     league: str,
     season: str,
@@ -292,13 +355,14 @@ def _run_event_endpoint(
 ) -> int:
     """Generic event-grain runner: shotmap, event_player_stats, match_stats.
 
-    All three follow the same flow:
+    Flow:
 
     1. Resolve finished match_ids from ``bronze.sofascore_schedule``.
-    2. Loop over matches, call ``scraper.<scraper_method>(...)``.
-    3. Write to ``iceberg.bronze.<table_name>`` with
-       ``replace_partitions=['league', 'season']``.
-    4. Return exit code 2 on empty payload (R0.2B_FALLBACK semantics).
+    2. Skip match_ids already in ``bronze.<table_name>`` (issue #69).
+    3. Loop over remaining matches, call ``scraper.<scraper_method>(...)``.
+    4. Write to ``iceberg.bronze.<table_name>`` in APPEND mode
+       (delta-only; replace_partitions is unsafe here).
+    5. Return exit code 2 on empty payload (R0.2B_FALLBACK semantics).
 
     ``extra_kwargs`` is forwarded to the scraper method (e.g.
     ``player_ids`` for event_player_stats).
@@ -344,6 +408,34 @@ def _run_event_endpoint(
         results['errors'].append(f'{R0_2B_FALLBACK_MARKER}: no_match_ids')
         _write_results(output_path, results)
         return 2
+
+    # Skip-existing (#69): match_ids already in this endpoint's bronze
+    # are immutable past-result data — refetching wastes the proxy budget.
+    # First run (table absent) returns empty set → fetch all.
+    existing = _existing_match_ids_in_bronze(table_name, league, season_short)
+    if not existing:
+        existing = _existing_match_ids_in_bronze(table_name, league, season_str)
+    matches_total = len(match_ids)
+    new_match_ids = [m for m in match_ids if str(m) not in existing]
+    skipped = matches_total - len(new_match_ids)
+    logger.info(
+        "%s skip-existing: %d/%d matches already in bronze.%s; fetching %d new.",
+        entity, skipped, matches_total, table_name, len(new_match_ids),
+    )
+    results['matches_skipped_existing'] = skipped
+    results['matches_attempted'] = len(new_match_ids)
+
+    if not new_match_ids:
+        logger.info(
+            "%s: no new match_ids to fetch (bronze.%s already covers all "
+            "schedule matches for league=%s season=%s).",
+            entity, table_name, league, season_short,
+        )
+        results['skipped_existing'] = True
+        _write_results(output_path, results)
+        return 0
+
+    match_ids = new_match_ids
 
     proxy_file = os.environ.get('PROXY_FILE', '/opt/airflow/proxys.txt')
     if not os.path.exists(proxy_file):
@@ -393,11 +485,14 @@ def _run_event_endpoint(
                 _write_results(output_path, results)
                 return 2
 
+            # Skip-existing guarantees the fetched DataFrame contains only
+            # NEW match_ids (no overlap with bronze) → safe APPEND
+            # without replace_partitions. Past matches in bronze are
+            # preserved across runs. Issue #69.
             table_path = scraper.save_to_iceberg(
                 df=df,
                 table_name=table_name,
                 partition_cols=['league', 'season'],
-                replace_partitions=['league', 'season'],
             )
             results['tables'].append(table_path)
             results['rows'] = int(len(df))
