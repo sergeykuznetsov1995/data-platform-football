@@ -596,6 +596,51 @@ class TestResolveAll:
             'whoscored': 'ws_w_only',
         }
 
+    def test_transfermarkt_capology_cascade(self):
+        # FBref spine — Saka anchor.
+        fb = [self._fb_row('bc7dc64d', 'Bukayo Saka', 'Arsenal')]
+        # TM row: same name + team -> resolves to Saka.
+        tm_match = self._src_row(
+            'transfermarkt', '433177', 'Bukayo Saka', 'Arsenal',
+        )
+        # TM row: name doesn't match anything -> orphan with 'tm_' prefix.
+        tm_orphan = self._src_row(
+            'transfermarkt', '999999', 'Unknown Player', 'Arsenal',
+        )
+        # Capology row: matches Saka by name+team.
+        cap_match = self._src_row(
+            'capology', 'bukayo-saka', 'Bukayo Saka', 'Arsenal',
+        )
+        cap_orphan = self._src_row(
+            'capology', 'unknown-slug', 'Random Guy', 'Arsenal',
+        )
+
+        rows, _review, stats = xpr._resolve_all(
+            fb, [], [], [], None, [tm_match, tm_orphan], [cap_match, cap_orphan],
+        )
+
+        by_src = {(r['source'], r['source_id']): r for r in rows}
+
+        # TM resolved + TM orphan
+        assert by_src[('transfermarkt', '433177')]['canonical_id'] == 'fb_bc7dc64d'
+        assert by_src[('transfermarkt', '433177')]['confidence'] == 'name_team'
+        assert by_src[('transfermarkt', '999999')]['canonical_id'] == 'tm_999999'
+        assert by_src[('transfermarkt', '999999')]['confidence'] == 'orphan'
+
+        # Capology resolved + Capology orphan
+        assert by_src[('capology', 'bukayo-saka')]['canonical_id'] == 'fb_bc7dc64d'
+        assert by_src[('capology', 'bukayo-saka')]['confidence'] == 'name_team'
+        assert by_src[('capology', 'unknown-slug')]['canonical_id'] == 'cap_unknown-slug'
+        assert by_src[('capology', 'unknown-slug')]['confidence'] == 'orphan'
+
+        # Stats ledger gained two new keys.
+        assert stats['transfermarkt'] == {
+            'total': 2, 'resolved': 1, 'orphan': 1, 'ambiguous': 0,
+        }
+        assert stats['capology'] == {
+            'total': 2, 'resolved': 1, 'orphan': 1, 'ambiguous': 0,
+        }
+
 
 # ---------------------------------------------------------------------------
 # Season helpers
