@@ -64,6 +64,41 @@ nodriver = None
 CFVerify = None
 
 
+_NODRIVER_PATCH_SENTINEL = "__data_platform_parse_json_event_patched__"
+
+
+def _apply_nodriver_parser_safety_patch():
+    """Swallow exceptions from broken CDP parsers in nodriver 0.48.1.
+
+    Without this, `Response.from_json` (`KeyError: 'charset'`) and
+    `Cookie.from_json` (`TypeError`) accumulate as unhandled exceptions
+    in the background `Connection._listener` task. The event loop ends
+    up corrupted, and the FBref HTTP fast-path hangs on the next
+    `page.get()`. See `memory/feedback_nodriver_048_parser_regressions.md`
+    and `docs/research/fbref-scraper-speedup.md`.
+    """
+    import nodriver.cdp.util as _u
+
+    if getattr(_u, _NODRIVER_PATCH_SENTINEL, False):
+        return
+
+    _orig = _u.parse_json_event
+
+    def _safe(json):
+        try:
+            return _orig(json)
+        except Exception as exc:  # noqa: BLE001 — intentional swallow
+            logger.debug(
+                "nodriver parser regression swallowed (method=%s): %s",
+                (json or {}).get("method") if isinstance(json, dict) else None,
+                exc,
+            )
+            return None
+
+    _u.parse_json_event = _safe
+    setattr(_u, _NODRIVER_PATCH_SENTINEL, True)
+
+
 def _import_nodriver():
     """Lazy import nodriver to allow graceful degradation."""
     global nodriver
@@ -75,6 +110,7 @@ def _import_nodriver():
             raise ImportError(
                 "nodriver is not installed. Install it with: pip install nodriver>=0.32"
             ) from e
+        _apply_nodriver_parser_safety_patch()
     return nodriver
 
 
@@ -520,18 +556,43 @@ class NodriverBypass:
     #  CF cookie export/inject (cross-restart reuse)                     #
     # ------------------------------------------------------------------ #
 
+    @staticmethod
+    def _cdp_get_cookies_raw(urls=None):
+        """Custom CDP generator returning raw cookie dicts.
+
+        nodriver 0.48.1's Cookie.from_json raises TypeError on Chromium 120
+        responses (string indices must be integers), and the unhandled
+        exception in Connection._listener corrupts the event loop so the next
+        page.get() hangs ~40s. We bypass the parser by mirroring
+        nodriver.cdp.network.get_cookies() but returning json['cookies'] as-is.
+        Repro: scripts/research/repro_nodriver_cookies_hang.py (Method D,
+        2026-05-23). See docs/research/fbref-scraper-speedup.md.
+        """
+        params: dict = {}
+        if urls is not None:
+            params['urls'] = list(urls)
+        json = yield {'method': 'Network.getCookies', 'params': params}
+        if isinstance(json, dict):
+            return json.get('cookies', [])
+        return []
+
     async def export_cf_cookies(self, domain: str = ".fbref.com") -> list:
-        """Export CF-related cookies via CDP.
+        """Export CF-related cookies via raw CDP (bypasses Cookie.from_json bug).
 
         Returns a list of cookie dicts (name/value/domain/path/expires/secure/
         httpOnly/sameSite) ready to be fed back into `inject_cookies()` on a
         later browser instance.
         """
-        if self._browser is None:
+        if self._browser is None or self._page is None:
             return []
         try:
             all_cookies = await asyncio.wait_for(
-                self._browser.cookies.get_all(), timeout=5.0
+                self._page.send(
+                    self._cdp_get_cookies_raw(
+                        urls=[f"https://{domain.lstrip('.')}/"]
+                    )
+                ),
+                timeout=5.0,
             )
         except Exception as e:
             logger.debug(f"export_cf_cookies: {e}")
@@ -539,20 +600,18 @@ class NodriverBypass:
 
         keep = {"cf_clearance", "__cf_bm", "cf_chl_opt"}
         result = []
-        for c in all_cookies:
-            name = c.name if hasattr(c, 'name') else c.get('name', '')
+        for c in all_cookies or []:
+            if not isinstance(c, dict):
+                continue
+            name = c.get('name', '')
             if name not in keep:
                 continue
-            value = c.value if hasattr(c, 'value') else c.get('value', '')
-            c_domain = c.domain if hasattr(c, 'domain') else c.get('domain', domain)
-            path = c.path if hasattr(c, 'path') else c.get('path', '/')
-            expires = getattr(c, 'expires', None) or (c.get('expires') if isinstance(c, dict) else None)
             result.append({
                 "name": name,
-                "value": value,
-                "domain": c_domain or domain,
-                "path": path or "/",
-                "expires": expires,
+                "value": c.get('value', ''),
+                "domain": c.get('domain') or domain,
+                "path": c.get('path', '/') or "/",
+                "expires": c.get('expires'),
                 "secure": True,
                 "httpOnly": True,
             })
@@ -1224,14 +1283,24 @@ class NodriverBypass:
         self._cleanup_chrome_processes()
 
     def _get_or_create_loop(self) -> asyncio.AbstractEventLoop:
-        """Get existing event loop or create a new one."""
+        """Get existing event loop or create a new one.
+
+        Caches the loop on self._loop. Without caching, each sync entry point
+        (get_page, get_sync, _extract_cookies_from_nodriver, ...) created a
+        fresh loop via new_event_loop(); the nodriver Connection._listener
+        task created on the FIRST loop got orphaned on subsequent calls, so
+        Connection.send awaited a future no one resolved → 5–30s timeouts
+        across the FBref HTTP fast-path bench (issue #57, 2026-05-25).
+        """
         try:
-            loop = asyncio.get_running_loop()
+            return asyncio.get_running_loop()
         except RuntimeError:
-            # No running loop - create new one
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-        return loop
+            pass
+        if self._loop is not None and not self._loop.is_closed():
+            return self._loop
+        self._loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self._loop)
+        return self._loop
 
     def restart_browser(self):
         """

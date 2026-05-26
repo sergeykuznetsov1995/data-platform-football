@@ -1,0 +1,92 @@
+{
+  "nodriver_version": "0.48.1",
+  "proxy_masked": "http://****:****@pool.proxys.io:10000",
+  "landing_url": "https://fbref.com/en/comps/9/Premier-League-Stats",
+  "next_url": "https://fbref.com/en/comps/9/2024-2025/2024-2025-Premier-League-Stats",
+  "hang_threshold_seconds": 20.0,
+  "baseline": {
+    "phase": "baseline",
+    "landing": {
+      "attempts": [
+        {
+          "attempt": 1,
+          "seconds": 37.15,
+          "html_size": 31889,
+          "has_table": false,
+          "cf_blocked": true
+        },
+        {
+          "attempt": 2,
+          "seconds": 33.8,
+          "html_size": 31910,
+          "has_table": false,
+          "cf_blocked": true
+        },
+        {
+          "attempt": 3,
+          "seconds": 34.32,
+          "html_size": 31910,
+          "has_table": false,
+          "cf_blocked": true
+        }
+      ],
+      "landing_seconds": 121.27,
+      "html_size": 31910,
+      "has_table": false,
+      "cf_blocked": true,
+      "landing_error": null
+    },
+    "method": "baseline_no_extraction",
+    "next_page_get_seconds": 0.62,
+    "hang_detected": false,
+    "readyState": "complete"
+  },
+  "baseline_page_get_seconds": 0.62,
+  "method_d_cdp_raw_safe": {
+    "phase": "method_d_cdp_raw_safe",
+    "landing": {
+      "attempts": [
+        {
+          "attempt": 1,
+          "seconds": 36.05,
+          "html_size": 31889,
+          "has_table": false,
+          "cf_blocked": true
+        },
+        {
+          "attempt": 2,
+          "seconds": 36.92,
+          "html_size": 31910,
+          "has_table": false,
+          "cf_blocked": true
+        },
+        {
+          "attempt": 3,
+          "seconds": 36.56,
+          "html_size": 31889,
+          "has_table": false,
+          "cf_blocked": true
+        }
+      ],
+      "landing_seconds": 125.53,
+      "html_size": 31889,
+      "has_table": false,
+      "cf_blocked": true,
+      "landing_error": null
+    },
+    "method": "page.send(custom raw get_cookies)",
+    "extract_seconds": 0.0,
+    "cookies_count": 2,
+    "cf_cookies": [
+      "__cf_bm"
+    ],
+    "sample_names": [
+      "__cf_bm",
+      "cf_chl_rc_ni"
+    ],
+    "next_page_get_seconds": 0.62,
+    "hang_detected": false,
+    "readyState": "complete"
+  },
+  "conclusion": "method_d_cdp_raw_safe works (next_page_get=0.62s, baseline=0.62s, hang_threshold=20.0s)"
+}
