@@ -1014,6 +1014,11 @@ def _fetch_capology_players(
     on success, and the (source, source_id, league, season) dedup in
     ``xref_player`` PK collapses them.
     """
+    # Filter to roster-active or on-loan players. Bronze carries ~28% of
+    # rows with status='Inactive' (released, youth, academy) — these have
+    # no FBref / Understat / WhoScored counterpart and would silently
+    # inflate the orphan rate by structural ~30pp. Active+loan keeps the
+    # set comparable to the other 6 sources' rostered-only output.
     sql = f"""
         SELECT
             player_slug,
@@ -1027,6 +1032,7 @@ def _fetch_capology_players(
           AND currency = 'GBP'
           AND player_slug IS NOT NULL
           AND player_name IS NOT NULL
+          AND (active = true OR loan = true)
         GROUP BY player_slug, league, season
     """
     rows = _execute(conn, sql, fetch=True) or []
