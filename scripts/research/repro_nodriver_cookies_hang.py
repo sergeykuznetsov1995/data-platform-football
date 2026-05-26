@@ -16,6 +16,11 @@ Methods:
  (a) await browser.cookies.get_all()                            # high-level API
  (b) await page.send(nodriver.cdp.network.get_cookies())        # raw CDP
  (c) await page.evaluate("document.cookie")                     # JS string (no HttpOnly!)
+ (d) await page.send(_get_cookies_raw_generator())              # raw CDP, bypass Cookie.from_json
+ (e) (d) wrapped in a websocket recv/send trap to reveal which
+     session/id Chromium answers on — surfaces accumulation effect
+     by running TWO sequential extracts on the same browser, the way
+     production scraper does for 10 matches in a row.
 
 Run inside the airflow-webserver container:
   docker exec -i airflow-webserver bash -c "cd /opt/airflow && \
@@ -350,6 +355,255 @@ async def extract_via_js_eval(bp: NodriverBypass) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Method (e): websocket trap + sequential extracts (issue #57)
+# ---------------------------------------------------------------------------
+
+def install_ws_trap(connection) -> tuple[list[dict], Any]:
+    """Wrap connection.websocket recv/send to log every raw CDP message.
+
+    `connection` is a nodriver Tab (which inherits Connection); its
+    `_websocket` attribute holds the websockets.asyncio ClientConnection.
+
+    Surfaces:
+      - On which sessionId the response to Network.getCookies actually arrives
+        (issue #57 hypothesis: it answers on a different session than _page.send
+        is listening on).
+      - Whether unhandled-id responses or broken events accumulate between
+        the first and the second extract on the same browser (production
+        does 10 matches in a row on one browser).
+
+    Returns (captured, uninstall). `captured` is a list of dicts, mutated
+    live as messages flow.
+    """
+    captured: list[dict] = []
+    ws = connection._websocket  # actual websockets ClientConnection
+    if ws is None:
+        log.warning("install_ws_trap: connection._websocket is None — trap skipped")
+        return captured, lambda: None
+    orig_recv = ws.recv
+    orig_send = ws.send
+
+    def _summarize(msg) -> dict | None:
+        try:
+            data = json.loads(msg) if isinstance(msg, (str, bytes, bytearray)) else None
+        except Exception:
+            return None
+        if not isinstance(data, dict):
+            return None
+        return {
+            "method": data.get("method"),
+            "session_id": data.get("sessionId"),
+            "id": data.get("id"),
+            "has_error": "error" in data,
+            "is_response": "id" in data and "method" not in data,
+            "size": len(msg) if hasattr(msg, "__len__") else 0,
+        }
+
+    async def trap_recv(*args, **kwargs):
+        msg = await orig_recv(*args, **kwargs)
+        info = _summarize(msg)
+        if info is not None:
+            info["direction"] = "recv"
+            info["ts"] = round(time.monotonic(), 4)
+            captured.append(info)
+        return msg
+
+    async def trap_send(msg, *args, **kwargs):
+        info = _summarize(msg)
+        if info is not None:
+            info["direction"] = "send"
+            info["ts"] = round(time.monotonic(), 4)
+            captured.append(info)
+        return await orig_send(msg, *args, **kwargs)
+
+    # Instance-level attribute shadows the bound method on the class.
+    ws.recv = trap_recv  # type: ignore[method-assign]
+    ws.send = trap_send  # type: ignore[method-assign]
+
+    def uninstall():
+        # Delete instance attrs so the original bound methods on the class
+        # are exposed again.
+        for attr in ("recv", "send"):
+            try:
+                delattr(ws, attr)
+            except Exception:  # noqa: BLE001
+                pass
+
+    return captured, uninstall
+
+
+def _analyze_trap(captured: list[dict], window: tuple[float, float]) -> dict:
+    """Return diagnostic summary for the window [start_ts, end_ts]."""
+    lo, hi = window
+    in_window = [m for m in captured if lo <= m.get("ts", 0) <= hi]
+
+    # Outbound Network.getCookies (request) — pick the LAST one in window.
+    sent_get_cookies = [
+        m for m in in_window
+        if m.get("direction") == "send" and m.get("method") == "Network.getCookies"
+    ]
+    request = sent_get_cookies[-1] if sent_get_cookies else None
+    req_id = request.get("id") if request else None
+    req_session = request.get("session_id") if request else None
+
+    # Inbound response to that id.
+    response = None
+    if req_id is not None:
+        for m in in_window:
+            if m.get("direction") == "recv" and m.get("id") == req_id:
+                response = m
+                break
+
+    # Other inbound noise during the window — useful for accumulation diag.
+    inbound_methods: dict[str, int] = {}
+    for m in in_window:
+        if m.get("direction") == "recv" and m.get("method"):
+            inbound_methods[m["method"]] = inbound_methods.get(m["method"], 0) + 1
+
+    sessions_seen = sorted({
+        str(m.get("session_id"))
+        for m in in_window
+        if m.get("session_id") is not None
+    })
+
+    return {
+        "msgs_in_window": len(in_window),
+        "request_id": req_id,
+        "request_session_id": req_session,
+        "response_present": response is not None,
+        "response_session_id": response.get("session_id") if response else None,
+        "session_mismatch": (
+            response is not None
+            and req_session != response.get("session_id")
+        ),
+        "inbound_event_counts": inbound_methods,
+        "distinct_sessions_seen": sessions_seen,
+    }
+
+
+async def extract_via_cdp_raw_safe_trapped(bp: NodriverBypass) -> dict[str, Any]:
+    """Method (e): method (d) extract wrapped in websocket trap.
+
+    Runs TWO extracts in sequence on the SAME browser — between them we
+    navigate to NEXT_URL — to surface the production accumulation effect
+    (10 matches in a row on one scraper instance).
+    """
+    res: dict[str, Any] = {"method": "page.send(custom raw) + ws trap + 2× sequential"}
+    # Trap on the tab's websocket — bp._page is a nodriver Tab (Connection).
+    captured, uninstall = install_ws_trap(bp._page)
+    try:
+        # --- Extract #1 (immediately after landing) ---------------------------
+        t0 = time.monotonic()
+        attempt1: dict[str, Any] = {"label": "extract_1_after_landing"}
+        try:
+            cookies = await asyncio.wait_for(
+                bp._page.send(_get_cookies_raw_generator(urls=["https://fbref.com/"])),
+                timeout=8.0,
+            )
+            attempt1["extract_seconds"] = round(time.monotonic() - t0, 2)
+            cookies = cookies or []
+            cf_names = [
+                c.get("name") for c in cookies
+                if isinstance(c, dict) and c.get("name") in CF_COOKIE_NAMES
+            ]
+            attempt1["cookies_count"] = len(cookies)
+            attempt1["cf_cookies"] = sorted(set(cf_names))
+        except asyncio.TimeoutError:
+            attempt1["extract_seconds"] = round(time.monotonic() - t0, 2)
+            attempt1["error"] = "TimeoutError after 8s"
+        except Exception as e:  # noqa: BLE001
+            attempt1["extract_seconds"] = round(time.monotonic() - t0, 2)
+            attempt1["error"] = f"{type(e).__name__}: {e}"
+        attempt1["trap"] = _analyze_trap(captured, (t0, time.monotonic()))
+        res["attempt_1"] = attempt1
+        log.info(
+            f"  extract#1: {attempt1.get('extract_seconds')}s, "
+            f"cookies={attempt1.get('cookies_count')}, "
+            f"req_session={attempt1['trap'].get('request_session_id')}, "
+            f"resp_present={attempt1['trap'].get('response_present')}, "
+            f"resp_session={attempt1['trap'].get('response_session_id')}, "
+            f"mismatch={attempt1['trap'].get('session_mismatch')}, "
+            f"error={attempt1.get('error')}"
+        )
+
+        # --- Navigation to NEXT_URL (mimics production multi-match loop) -----
+        nav_t0 = time.monotonic()
+        try:
+            await asyncio.wait_for(bp._page.get(NEXT_URL), timeout=90)
+            res["intermediate_nav_seconds"] = round(time.monotonic() - nav_t0, 2)
+        except Exception as e:  # noqa: BLE001
+            res["intermediate_nav_error"] = f"{type(e).__name__}: {e}"
+            res["intermediate_nav_seconds"] = round(time.monotonic() - nav_t0, 2)
+        # Small settle so Chromium issues Network.responseReceivedExtraInfo
+        # events that historically broke Cookie.from_json.
+        await asyncio.sleep(2.0)
+
+        # --- Extract #2 (after second navigation, same browser) --------------
+        t1 = time.monotonic()
+        attempt2: dict[str, Any] = {"label": "extract_2_after_navigation"}
+        try:
+            cookies = await asyncio.wait_for(
+                bp._page.send(_get_cookies_raw_generator(urls=["https://fbref.com/"])),
+                timeout=8.0,
+            )
+            attempt2["extract_seconds"] = round(time.monotonic() - t1, 2)
+            cookies = cookies or []
+            cf_names = [
+                c.get("name") for c in cookies
+                if isinstance(c, dict) and c.get("name") in CF_COOKIE_NAMES
+            ]
+            attempt2["cookies_count"] = len(cookies)
+            attempt2["cf_cookies"] = sorted(set(cf_names))
+        except asyncio.TimeoutError:
+            attempt2["extract_seconds"] = round(time.monotonic() - t1, 2)
+            attempt2["error"] = "TimeoutError after 8s"
+        except Exception as e:  # noqa: BLE001
+            attempt2["extract_seconds"] = round(time.monotonic() - t1, 2)
+            attempt2["error"] = f"{type(e).__name__}: {e}"
+        attempt2["trap"] = _analyze_trap(captured, (t1, time.monotonic()))
+        res["attempt_2"] = attempt2
+        log.info(
+            f"  extract#2: {attempt2.get('extract_seconds')}s, "
+            f"cookies={attempt2.get('cookies_count')}, "
+            f"req_session={attempt2['trap'].get('request_session_id')}, "
+            f"resp_present={attempt2['trap'].get('response_present')}, "
+            f"resp_session={attempt2['trap'].get('response_session_id')}, "
+            f"mismatch={attempt2['trap'].get('session_mismatch')}, "
+            f"error={attempt2.get('error')}"
+        )
+
+        # Surface the production-relevant signal as top-level keys so the
+        # bench-like conclusion logic in main() can reason about hang.
+        # We treat method (e) as "succeeded" iff BOTH extracts returned
+        # cookies — that is what production needs.
+        a1, a2 = res["attempt_1"], res["attempt_2"]
+        ok_1 = bool(a1.get("cookies_count")) and not a1.get("error")
+        ok_2 = bool(a2.get("cookies_count")) and not a2.get("error")
+        res["extract_seconds"] = (a1.get("extract_seconds") or 0) + (a2.get("extract_seconds") or 0)
+        res["cookies_count"] = (a2 if ok_2 else a1).get("cookies_count", 0)
+        res["cf_cookies"] = (a2 if ok_2 else a1).get("cf_cookies", [])
+        if not ok_1 or not ok_2:
+            res["error"] = (
+                f"extract_1={'OK' if ok_1 else a1.get('error') or 'no cookies'}, "
+                f"extract_2={'OK' if ok_2 else a2.get('error') or 'no cookies'}"
+            )
+
+        # Bound the message log to avoid bloating the report — keep first
+        # 50 and last 50 messages for inspection.
+        msgs = captured
+        if len(msgs) > 100:
+            res["captured_first_50"] = msgs[:50]
+            res["captured_last_50"] = msgs[-50:]
+            res["captured_total"] = len(msgs)
+        else:
+            res["captured_all"] = msgs
+            res["captured_total"] = len(msgs)
+    finally:
+        uninstall()
+    return res
+
+
+# ---------------------------------------------------------------------------
 # Phase runner
 # ---------------------------------------------------------------------------
 
@@ -426,10 +680,20 @@ async def main() -> None:
         "method_d_cdp_raw_safe", proxy, extract_via_cdp_raw_safe
     )
 
+    # Method E (issue #57): method (d) wrapped in websocket trap +
+    # TWO sequential extracts on the same browser. The first extract
+    # mimics method (d). The second extract — after a navigation —
+    # reproduces the production accumulation pattern (10-match loop).
+    # Per-attempt trap analysis shows whether Network.getCookies
+    # response arrives on the same sessionId we sent on.
+    report["method_e_trap_2x"] = await run_phase(
+        "method_e_trap_2x", proxy, extract_via_cdp_raw_safe_trapped
+    )
+
     # Conclusion
     baseline = report["baseline"].get("next_page_get_seconds") or 0
     candidates = []
-    for key in ("method_d_cdp_raw_safe",):
+    for key in ("method_d_cdp_raw_safe", "method_e_trap_2x"):
         m = report[key]
         nxt = m.get("next_page_get_seconds")
         hang = m.get("hang_detected", True)

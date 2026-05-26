@@ -340,3 +340,95 @@ JSON-парсинге. Patch необходим (закрывает изнача
    если post-patch bench не достигает 3× speedup.
 3. Follow-up issue: «Track D constant tuning» — отдельные PR'ы.
 4. Follow-up issue: «evaluate ScraperFC.FBref / soccerdata alternatives» — priority p3.
+
+---
+
+## Issue #57: `page.send` timeout — diagnosed and fixed (2026-05-25)
+
+### Method (e) repro: routing проверен и НЕ виноват
+
+`scripts/research/repro_nodriver_cookies_hang.py::extract_via_cdp_raw_safe_trapped`
+оборачивает `_page._websocket.recv/send` в trap, делает ДВА последовательных
+extract'а через method (d) generator с навигацией между ними. Результат
+(fresh browser, no CF block):
+
+| Attempt | extract_s | cookies | req_session | resp_present | resp_session | mismatch |
+|---|---|---|---|---|---|---|
+| 1 | 0.0 | 1 | None | False (race) | None | False |
+| 2 | 0.0 | 1 | None | True | None | False |
+
+Все 63 захваченных CDP-сообщения шли на `session_id=None` (default page
+session). Никакого target-session mismatch'а нет, исходная гипотеза issue
+не подтвердилась.
+
+### Production bench: оба connection-уровня одинаково hang'ят
+
+Первый production-fix attempt — bump `_extract_cookies_from_nodriver`
+timeout 5s → 30s: **ВСЕ 10 extract'ов hit 30s timeout** (`http_fetch_ok=0/10`).
+Второй attempt — primary `browser.connection.send(Storage.getCookies)` +
+fallback `_page.send(Network.getCookies)`: **оба пути timeout'ят за 10s
+каждый** (`Both Storage and Network getCookies timed out`).
+
+### Корень: cached-loop bug в `_get_or_create_loop`
+
+`scrapers/base/browser/nodriver_bypass.py::_get_or_create_loop` создавал
+свежий `asyncio.new_event_loop()` на каждый sync entry point (`get_page`,
+`_extract_cookies_from_nodriver`, ...). nodriver `Connection._listener`
+task созданный на ПЕРВОМ loop становился orphaned на каждом следующем
+вызове — `Connection.send` посылал команду, await'ил Future, но никто на
+новом loop'е не дёргал `tx(**message)`. Browser fetches «работали» только
+потому что Connection.send делал implicit reconnect при `closed=True`
+(websocket рвался при смене loop'а), и каждый раз создавался свежий
+listener. Cookie extract же шёл сразу после успешного fetch — websocket
+ещё «жив» с точки зрения `closed`, reconnect не происходил, listener
+оставался orphaned.
+
+Fix — кэшировать loop на `self._loop`:
+
+```python
+def _get_or_create_loop(self) -> asyncio.AbstractEventLoop:
+    try:
+        return asyncio.get_running_loop()
+    except RuntimeError:
+        pass
+    if self._loop is not None and not self._loop.is_closed():
+        return self._loop
+    self._loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(self._loop)
+    return self._loop
+```
+
+### Bench results post-fix (`BENCH_LABEL=cached_loop`)
+
+| Метрика | baseline | patched (#52) | **cached_loop (#57)** |
+|---|---|---|---|
+| mean s/match | 31.69 | 34.23 | **9.67** ✅ |
+| p50 s/match | 31.92 | 35.92 | 9.16 |
+| p95 s/match | 39.45 | 38.65 | 14.84 |
+| success_rate | 1.0 | 0.8 | **1.0** ✅ |
+| http_fetch_ok | 0/10 | 0/10 | **0/10** ❌ |
+| http_fetch_fallback | 0/10 | 0/10 | 9/10 |
+| total_seconds | 340.62 | — | **97.46** |
+
+Acceptance issue #57:
+- [x] `mean ≤ 10 s/match` (9.67s, **3.5× speedup** от 34s) — **DONE**
+- [x] `success_rate = 1.0` (10/10) — **DONE**
+- [ ] `http_fetch_ok ≥ 8/10` — **NOT DONE**, но другой root cause:
+      cookies теперь extract'ятся OK (`Extracted 4 cookies: cf_clearance + __cf_bm`),
+      curl_cffi HTTP-request с этими cookies всё равно проваливается
+      (CF challenge или incomplete-HTML triggers `http_fetch_fallback`).
+      Скорее всего fingerprint mismatch curl_cffi `chrome120` impersonation
+      vs реальный Chromium 120. **Отдельный follow-up issue**.
+
+Raw bench: `/tmp/bench_fbref_cached_loop.json`.
+
+### Что отложено в follow-up
+
+- HTTP fast-path activation (`http_fetch_ok > 0`) — curl_cffi не проходит
+  CF gate даже с валидными cookies. Возможные направления: TLS-fingerprint
+  ближе к Chromium 120 (curl-impersonate update), копировать User-Agent +
+  Accept-Encoding из Chromium точнее, отказаться от curl_cffi в пользу
+  Camoufox-через-FlareSolverr.
+- Eventually drop `_get_or_create_loop` sync-bridge entirely и перевести
+  scraper на native asyncio (нodriver был спроектирован под `uc.loop()`).
+  Нынешний кэш-фикс — surgical patch, не архитектурный.

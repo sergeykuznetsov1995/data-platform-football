@@ -1283,14 +1283,24 @@ class NodriverBypass:
         self._cleanup_chrome_processes()
 
     def _get_or_create_loop(self) -> asyncio.AbstractEventLoop:
-        """Get existing event loop or create a new one."""
+        """Get existing event loop or create a new one.
+
+        Caches the loop on self._loop. Without caching, each sync entry point
+        (get_page, get_sync, _extract_cookies_from_nodriver, ...) created a
+        fresh loop via new_event_loop(); the nodriver Connection._listener
+        task created on the FIRST loop got orphaned on subsequent calls, so
+        Connection.send awaited a future no one resolved → 5–30s timeouts
+        across the FBref HTTP fast-path bench (issue #57, 2026-05-25).
+        """
         try:
-            loop = asyncio.get_running_loop()
+            return asyncio.get_running_loop()
         except RuntimeError:
-            # No running loop - create new one
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-        return loop
+            pass
+        if self._loop is not None and not self._loop.is_closed():
+            return self._loop
+        self._loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self._loop)
+        return self._loop
 
     def restart_browser(self):
         """
