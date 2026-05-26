@@ -1,0 +1,98 @@
+-- =============================================================================
+-- Silver: transfermarkt_transfers   (Jinja-template — `.sql.j2`)
+-- =============================================================================
+--
+-- Event-grain трансферов из Transfermarkt: один row per (player_id,
+-- transfer_date, from_club_id, to_club_id). Player резолвится через
+-- silver.xref_player, клубы (from/to) — через inline-render
+-- configs/medallion/team_aliases.yaml (тот же `{{ team_aliases_values_sql }}`
+-- placeholder, что в xref_team.sql.j2; см. medallion_config.py:364).
+--
+-- Bronze source (см. scrapers/transfermarkt/scraper.py:407-446):
+--   player_id (varchar), transfer_date (date), season (varchar — current
+--     scrape window, не транс-event season), from_club_id/from_club_name,
+--     to_club_id/to_club_name (varchar), fee_text (varchar — raw '€30.00m'),
+--     fee_eur (int|NULL), market_value_eur (int|NULL), is_upcoming (bool),
+--     league (varchar), season (varchar — short '2526'),
+--     _ingested_at (timestamp).
+--
+-- Notes:
+--   * canonical_id NULLable: TM имеет U21 / loan-out / новых, не покрытых
+--     FBref-spine'ом (≈10% per feedback_xref_player_tm_capology.md).
+--   * silver.xref_team НЕ содержит source='transfermarkt' (UNION 8 источников
+--     без TM) — поэтому JOIN by-name через xref_team бессмыслен. Используем
+--     прямой alias map: APL клубы матчатся через _generic-бакет
+--     (Wolves, Spurs, Nott'm Forest, …); неевропейские (PSG, Man City — wait,
+--     Man City тоже APL — non-APL клубы типа PSG/Real Madrid) могут давать
+--     NULL → высокий orphan на team-резолве (WARNING-only per DoD).
+--   * canonical_id для club строится тем же CASE, что в xref_team.sql.j2:
+--     LOWER(REGEXP_REPLACE(canonical_name, '[^a-zA-Z0-9]+', '_'))
+--   * Bronze ingest mode = replace_partitions → ROW_NUMBER dedup defensive.
+--   * (league, season) JOIN predicate на xref_player MANDATORY
+--     (feedback_xref_join_season_predicate.md).
+-- =============================================================================
+
+WITH aliases AS (
+    SELECT raw_name, canonical_name
+    FROM (VALUES
+        {{ team_aliases_values_sql }}
+    ) AS t(raw_name, canonical_name)
+),
+
+bronze_dedup AS (
+    SELECT *
+    FROM (
+        SELECT
+            b.*,
+            ROW_NUMBER() OVER (
+                PARTITION BY player_id, transfer_date, from_club_id, to_club_id
+                ORDER BY _ingested_at DESC
+            ) AS rn
+        FROM iceberg.bronze.transfermarkt_transfers b
+        WHERE player_id IS NOT NULL
+          AND transfer_date IS NOT NULL
+    )
+    WHERE rn = 1
+),
+
+xp AS (
+    SELECT canonical_id, source_id, league, season
+    FROM iceberg.silver.xref_player
+    WHERE source = 'transfermarkt'
+      AND confidence <> 'orphan'
+)
+
+SELECT
+    xp.canonical_id,
+    b.player_id,
+    b.transfer_date,
+
+    CASE WHEN a_from.canonical_name IS NOT NULL
+         THEN LOWER(REGEXP_REPLACE(a_from.canonical_name, '[^a-zA-Z0-9]+', '_'))
+    END                                                AS from_club_id_canonical,
+    CASE WHEN a_to.canonical_name IS NOT NULL
+         THEN LOWER(REGEXP_REPLACE(a_to.canonical_name, '[^a-zA-Z0-9]+', '_'))
+    END                                                AS to_club_id_canonical,
+
+    b.from_club_name,
+    b.to_club_name,
+
+    CAST(b.fee_eur AS BIGINT)                          AS fee_eur,
+    CAST(b.market_value_eur AS BIGINT)                 AS market_value_eur,
+    b.is_upcoming,
+
+    b._ingested_at                                     AS _bronze_ingested_at,
+
+    -- Partition keys last (matching writer convention).
+    b.league,
+    b.season
+
+FROM bronze_dedup b
+LEFT JOIN xp
+    ON xp.source_id = b.player_id
+   AND xp.league    = b.league
+   AND xp.season    = b.season
+LEFT JOIN aliases a_from
+    ON a_from.raw_name = b.from_club_name
+LEFT JOIN aliases a_to
+    ON a_to.raw_name = b.to_club_name
