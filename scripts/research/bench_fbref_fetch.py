@@ -121,16 +121,19 @@ def main() -> None:
         ),
         "real_requests": final_stats.get("real_requests_count", 0),
         "scraper_failures": final_stats.get("failures", 0),
+        "http_fetch_diag": final_stats.get("http_fetch_diag", []),
         "per_match": per_match,
     }
 
     Path(REPORT_PATH).write_text(json.dumps(report, indent=2, default=str))
     print("\n========= BENCH SUMMARY =========")
     print(json.dumps(
-        {k: v for k, v in report.items() if k != "per_match"},
+        {k: v for k, v in report.items() if k not in ("per_match", "http_fetch_diag")},
         indent=2, default=str,
     ))
-    print(f"\nFull report: {REPORT_PATH}")
+    diag_count = len(report.get("http_fetch_diag", []))
+    print(f"\nhttp_fetch_diag records: {diag_count} (see JSON for details)")
+    print(f"Full report: {REPORT_PATH}")
 
 
 if __name__ == "__main__":
