@@ -908,6 +908,16 @@ def validate_gold_quality() -> Dict[str, Any]:
         # ========== Referential integrity — ERROR ==========
         CHECK.ref_integrity('gold.fct_team_match',   'gold.dim_match', 'match_id'),
         CHECK.ref_integrity('gold.fct_player_match', 'gold.dim_match', 'match_id'),
+        # issue #46: fct_player_match теперь multi-source с player_id_canonical
+        # — добавляем ref_integrity к dim_player_attributes (snapshot grain per
+        # canonical_id, T4). Без `parent_key=` так как обе таблицы используют
+        # одну и ту же колонку player_id_canonical.
+        CHECK.ref_integrity(
+            'gold.fct_player_match',
+            'gold.dim_player_attributes',
+            'player_id_canonical',
+            parent_key='player_id_canonical',
+        ),
         CHECK.ref_integrity('gold.match_outcomes',    'gold.dim_match', 'match_id'),
         # E5: every unavailability row must point at a real Gold match.
         # SQL already filters bridge failures, so 0 orphans by construction.
@@ -918,6 +928,19 @@ def validate_gold_quality() -> Dict[str, Any]:
                           severity='WARNING'),
         CHECK.value_range('gold.fct_team_match', 'possession', min_val=0, max_val=100,
                           severity='WARNING'),
+
+        # ----- issue #46: fct_player_match multi-source xG/xA/rating sanity -----
+        # xG/xA per single match: top observed values редко превышают 3.0 даже
+        # для хет-триков; верхний bound 5.0 ловит явные парсер-выбросы (xG=999)
+        # без false-positive'ов. Не value_range на goals/assists (могут быть
+        # 4+ в редких матчах) и minutes (FBref гарантирует [0, 120]).
+        CHECK.value_range('gold.fct_player_match', 'expected_goals',
+                          min_val=0, max_val=5, severity='WARNING'),
+        CHECK.value_range('gold.fct_player_match', 'expected_assists',
+                          min_val=0, max_val=5, severity='WARNING'),
+        # rating: SofaScore-источник, шкала [0, 10]; NULL для матчей без оценки.
+        CHECK.value_range('gold.fct_player_match', 'rating',
+                          min_val=0, max_val=10, severity='WARNING'),
         # Targets sanity — only meaningful for completed matches; outliers
         # outside [0, 20] indicate parser regression in Silver score extraction.
         CHECK.value_range('gold.match_outcomes', 'total_goals', min_val=0, max_val=20,
@@ -1291,6 +1314,245 @@ def validate_gold_quality() -> Dict[str, Any]:
                        name='audit_diff[fct_keeper_season_stats_audit.saves_whoscored]'),
 
         # ============================================================
+        # issue #46 audit: fct_player_match_audit — cross-source diff на
+        # match-grain между FBref (primary spine), SofaScore (INNER secondary
+        # spine), Understat (LEFT) и WhoScored (LEFT). 50 diff-колонок:
+        # 18 SS + 8 US + 22 WS + 2 modeled xG/xA.
+        # WARNING-only по convention (feedback_audit_in_separate_table): audit
+        # никогда не должен ERROR-фейлить pipeline — `error_threshold=0.0`.
+        # Thresholds: ±1 для целочисленных, ±90 для minutes, ±0.5 для xG/xA.
+        # NULL diff = "источник отсутствует" (не ошибка) → засчитывается как
+        # passed через `OR <col> IS NULL`.
+        # ============================================================
+        CHECK.no_duplicates('gold.fct_player_match_audit',
+                            pk=['match_id_canonical', 'player_id_canonical']),
+        CHECK.no_nulls('gold.fct_player_match_audit',
+                       cols=['match_id_canonical', 'player_id_canonical']),
+        # audit ⊆ main fct (INNER FBref ∩ SofaScore) → каждая audit-строка
+        # должна находить парную строку в gold.fct_player_match.
+        CHECK.ref_integrity(
+            'gold.fct_player_match_audit',
+            'gold.fct_player_match',
+            'player_id_canonical',
+            parent_key='player_id_canonical',
+        ),
+
+        # ----- SofaScore diff (18 checks, INNER spine: всегда non-NULL) -----
+        CHECK.coverage('gold.fct_player_match_audit',
+                       condition='ABS(minutes_diff_ss) <= 90 OR minutes_diff_ss IS NULL',
+                       warn_threshold=0.95, error_threshold=0.0,
+                       name='audit_diff[fct_player_match_audit.minutes_ss]'),
+        CHECK.coverage('gold.fct_player_match_audit',
+                       condition='ABS(goals_diff_ss) <= 1 OR goals_diff_ss IS NULL',
+                       warn_threshold=0.95, error_threshold=0.0,
+                       name='audit_diff[fct_player_match_audit.goals_ss]'),
+        CHECK.coverage('gold.fct_player_match_audit',
+                       condition='ABS(assists_diff_ss) <= 1 OR assists_diff_ss IS NULL',
+                       warn_threshold=0.95, error_threshold=0.0,
+                       name='audit_diff[fct_player_match_audit.assists_ss]'),
+        CHECK.coverage('gold.fct_player_match_audit',
+                       condition='ABS(own_goals_diff_ss) <= 1 OR own_goals_diff_ss IS NULL',
+                       warn_threshold=0.95, error_threshold=0.0,
+                       name='audit_diff[fct_player_match_audit.own_goals_ss]'),
+        CHECK.coverage('gold.fct_player_match_audit',
+                       condition='ABS(shots_diff_ss) <= 1 OR shots_diff_ss IS NULL',
+                       warn_threshold=0.95, error_threshold=0.0,
+                       name='audit_diff[fct_player_match_audit.shots_ss]'),
+        CHECK.coverage('gold.fct_player_match_audit',
+                       condition='ABS(shots_on_target_diff_ss) <= 1 OR shots_on_target_diff_ss IS NULL',
+                       warn_threshold=0.95, error_threshold=0.0,
+                       name='audit_diff[fct_player_match_audit.shots_on_target_ss]'),
+        CHECK.coverage('gold.fct_player_match_audit',
+                       condition='ABS(yellow_cards_diff_ss) <= 1 OR yellow_cards_diff_ss IS NULL',
+                       warn_threshold=0.95, error_threshold=0.0,
+                       name='audit_diff[fct_player_match_audit.yellow_cards_ss]'),
+        CHECK.coverage('gold.fct_player_match_audit',
+                       condition='ABS(red_cards_diff_ss) <= 1 OR red_cards_diff_ss IS NULL',
+                       warn_threshold=0.95, error_threshold=0.0,
+                       name='audit_diff[fct_player_match_audit.red_cards_ss]'),
+        CHECK.coverage('gold.fct_player_match_audit',
+                       condition='ABS(crosses_diff_ss) <= 1 OR crosses_diff_ss IS NULL',
+                       warn_threshold=0.95, error_threshold=0.0,
+                       name='audit_diff[fct_player_match_audit.crosses_ss]'),
+        CHECK.coverage('gold.fct_player_match_audit',
+                       condition='ABS(fouls_committed_diff_ss) <= 1 OR fouls_committed_diff_ss IS NULL',
+                       warn_threshold=0.95, error_threshold=0.0,
+                       name='audit_diff[fct_player_match_audit.fouls_committed_ss]'),
+        CHECK.coverage('gold.fct_player_match_audit',
+                       condition='ABS(fouls_drawn_diff_ss) <= 1 OR fouls_drawn_diff_ss IS NULL',
+                       warn_threshold=0.95, error_threshold=0.0,
+                       name='audit_diff[fct_player_match_audit.fouls_drawn_ss]'),
+        CHECK.coverage('gold.fct_player_match_audit',
+                       condition='ABS(offsides_diff_ss) <= 1 OR offsides_diff_ss IS NULL',
+                       warn_threshold=0.95, error_threshold=0.0,
+                       name='audit_diff[fct_player_match_audit.offsides_ss]'),
+        CHECK.coverage('gold.fct_player_match_audit',
+                       condition='ABS(tackles_won_diff_ss) <= 1 OR tackles_won_diff_ss IS NULL',
+                       warn_threshold=0.95, error_threshold=0.0,
+                       name='audit_diff[fct_player_match_audit.tackles_won_ss]'),
+        CHECK.coverage('gold.fct_player_match_audit',
+                       condition='ABS(interceptions_diff_ss) <= 1 OR interceptions_diff_ss IS NULL',
+                       warn_threshold=0.95, error_threshold=0.0,
+                       name='audit_diff[fct_player_match_audit.interceptions_ss]'),
+        CHECK.coverage('gold.fct_player_match_audit',
+                       condition='ABS(penalty_goals_diff_ss) <= 1 OR penalty_goals_diff_ss IS NULL',
+                       warn_threshold=0.95, error_threshold=0.0,
+                       name='audit_diff[fct_player_match_audit.penalty_goals_ss]'),
+        CHECK.coverage('gold.fct_player_match_audit',
+                       condition='ABS(penalty_attempts_diff_ss) <= 1 OR penalty_attempts_diff_ss IS NULL',
+                       warn_threshold=0.95, error_threshold=0.0,
+                       name='audit_diff[fct_player_match_audit.penalty_attempts_ss]'),
+        CHECK.coverage('gold.fct_player_match_audit',
+                       condition='ABS(penalties_won_diff_ss) <= 1 OR penalties_won_diff_ss IS NULL',
+                       warn_threshold=0.95, error_threshold=0.0,
+                       name='audit_diff[fct_player_match_audit.penalties_won_ss]'),
+        CHECK.coverage('gold.fct_player_match_audit',
+                       condition='ABS(penalties_conceded_diff_ss) <= 1 OR penalties_conceded_diff_ss IS NULL',
+                       warn_threshold=0.95, error_threshold=0.0,
+                       name='audit_diff[fct_player_match_audit.penalties_conceded_ss]'),
+
+        # ----- Understat diff (8 checks, LEFT JOIN → NULL допустим) -----
+        CHECK.coverage('gold.fct_player_match_audit',
+                       condition='ABS(minutes_diff_us) <= 90 OR minutes_diff_us IS NULL',
+                       warn_threshold=0.95, error_threshold=0.0,
+                       name='audit_diff[fct_player_match_audit.minutes_us]'),
+        CHECK.coverage('gold.fct_player_match_audit',
+                       condition='ABS(goals_diff_us) <= 1 OR goals_diff_us IS NULL',
+                       warn_threshold=0.95, error_threshold=0.0,
+                       name='audit_diff[fct_player_match_audit.goals_us]'),
+        CHECK.coverage('gold.fct_player_match_audit',
+                       condition='ABS(assists_diff_us) <= 1 OR assists_diff_us IS NULL',
+                       warn_threshold=0.95, error_threshold=0.0,
+                       name='audit_diff[fct_player_match_audit.assists_us]'),
+        CHECK.coverage('gold.fct_player_match_audit',
+                       condition='ABS(own_goals_diff_us) <= 1 OR own_goals_diff_us IS NULL',
+                       warn_threshold=0.95, error_threshold=0.0,
+                       name='audit_diff[fct_player_match_audit.own_goals_us]'),
+        CHECK.coverage('gold.fct_player_match_audit',
+                       condition='ABS(shots_diff_us) <= 1 OR shots_diff_us IS NULL',
+                       warn_threshold=0.95, error_threshold=0.0,
+                       name='audit_diff[fct_player_match_audit.shots_us]'),
+        CHECK.coverage('gold.fct_player_match_audit',
+                       condition='ABS(yellow_cards_diff_us) <= 1 OR yellow_cards_diff_us IS NULL',
+                       warn_threshold=0.95, error_threshold=0.0,
+                       name='audit_diff[fct_player_match_audit.yellow_cards_us]'),
+        CHECK.coverage('gold.fct_player_match_audit',
+                       condition='ABS(red_cards_diff_us) <= 1 OR red_cards_diff_us IS NULL',
+                       warn_threshold=0.95, error_threshold=0.0,
+                       name='audit_diff[fct_player_match_audit.red_cards_us]'),
+        # key_passes_diff_ss_us: SS - US (FBref на match-grain не отдаёт)
+        CHECK.coverage('gold.fct_player_match_audit',
+                       condition='ABS(key_passes_diff_ss_us) <= 1 OR key_passes_diff_ss_us IS NULL',
+                       warn_threshold=0.95, error_threshold=0.0,
+                       name='audit_diff[fct_player_match_audit.key_passes_ss_us]'),
+
+        # ----- WhoScored diff (22 checks, LEFT JOIN → NULL допустим) -----
+        # FBref vs WS (HARD_FACT pairs):
+        CHECK.coverage('gold.fct_player_match_audit',
+                       condition='ABS(goals_diff_ws) <= 1 OR goals_diff_ws IS NULL',
+                       warn_threshold=0.95, error_threshold=0.0,
+                       name='audit_diff[fct_player_match_audit.goals_ws]'),
+        CHECK.coverage('gold.fct_player_match_audit',
+                       condition='ABS(shots_diff_ws) <= 1 OR shots_diff_ws IS NULL',
+                       warn_threshold=0.95, error_threshold=0.0,
+                       name='audit_diff[fct_player_match_audit.shots_ws]'),
+        CHECK.coverage('gold.fct_player_match_audit',
+                       condition='ABS(shots_on_target_diff_ws) <= 1 OR shots_on_target_diff_ws IS NULL',
+                       warn_threshold=0.95, error_threshold=0.0,
+                       name='audit_diff[fct_player_match_audit.shots_on_target_ws]'),
+        CHECK.coverage('gold.fct_player_match_audit',
+                       condition='ABS(yellow_cards_diff_ws) <= 1 OR yellow_cards_diff_ws IS NULL',
+                       warn_threshold=0.95, error_threshold=0.0,
+                       name='audit_diff[fct_player_match_audit.yellow_cards_ws]'),
+        CHECK.coverage('gold.fct_player_match_audit',
+                       condition='ABS(red_cards_diff_ws) <= 1 OR red_cards_diff_ws IS NULL',
+                       warn_threshold=0.95, error_threshold=0.0,
+                       name='audit_diff[fct_player_match_audit.red_cards_ws]'),
+        CHECK.coverage('gold.fct_player_match_audit',
+                       condition='ABS(crosses_diff_ws) <= 1 OR crosses_diff_ws IS NULL',
+                       warn_threshold=0.95, error_threshold=0.0,
+                       name='audit_diff[fct_player_match_audit.crosses_ws]'),
+        CHECK.coverage('gold.fct_player_match_audit',
+                       condition='ABS(fouls_committed_diff_ws) <= 1 OR fouls_committed_diff_ws IS NULL',
+                       warn_threshold=0.95, error_threshold=0.0,
+                       name='audit_diff[fct_player_match_audit.fouls_committed_ws]'),
+        CHECK.coverage('gold.fct_player_match_audit',
+                       condition='ABS(fouls_drawn_diff_ws) <= 1 OR fouls_drawn_diff_ws IS NULL',
+                       warn_threshold=0.95, error_threshold=0.0,
+                       name='audit_diff[fct_player_match_audit.fouls_drawn_ws]'),
+        CHECK.coverage('gold.fct_player_match_audit',
+                       condition='ABS(offsides_diff_ws) <= 1 OR offsides_diff_ws IS NULL',
+                       warn_threshold=0.95, error_threshold=0.0,
+                       name='audit_diff[fct_player_match_audit.offsides_ws]'),
+        CHECK.coverage('gold.fct_player_match_audit',
+                       condition='ABS(tackles_won_diff_ws) <= 1 OR tackles_won_diff_ws IS NULL',
+                       warn_threshold=0.95, error_threshold=0.0,
+                       name='audit_diff[fct_player_match_audit.tackles_won_ws]'),
+        CHECK.coverage('gold.fct_player_match_audit',
+                       condition='ABS(interceptions_diff_ws) <= 1 OR interceptions_diff_ws IS NULL',
+                       warn_threshold=0.95, error_threshold=0.0,
+                       name='audit_diff[fct_player_match_audit.interceptions_ws]'),
+        # SS vs WS (FBref не отдаёт key_passes/passes/tackles/clearances/...
+        # на match-grain → diff = SS - WS). Threshold ±1 — могут шуметь сильнее
+        # на passes/touches; калибровка thresholds = followup после первого run.
+        CHECK.coverage('gold.fct_player_match_audit',
+                       condition='ABS(key_passes_diff_ss_ws) <= 1 OR key_passes_diff_ss_ws IS NULL',
+                       warn_threshold=0.95, error_threshold=0.0,
+                       name='audit_diff[fct_player_match_audit.key_passes_ss_ws]'),
+        CHECK.coverage('gold.fct_player_match_audit',
+                       condition='ABS(passes_diff_ss_ws) <= 1 OR passes_diff_ss_ws IS NULL',
+                       warn_threshold=0.95, error_threshold=0.0,
+                       name='audit_diff[fct_player_match_audit.passes_ss_ws]'),
+        CHECK.coverage('gold.fct_player_match_audit',
+                       condition='ABS(passes_completed_diff_ss_ws) <= 1 OR passes_completed_diff_ss_ws IS NULL',
+                       warn_threshold=0.95, error_threshold=0.0,
+                       name='audit_diff[fct_player_match_audit.passes_completed_ss_ws]'),
+        CHECK.coverage('gold.fct_player_match_audit',
+                       condition='ABS(tackles_diff_ss_ws) <= 1 OR tackles_diff_ss_ws IS NULL',
+                       warn_threshold=0.95, error_threshold=0.0,
+                       name='audit_diff[fct_player_match_audit.tackles_ss_ws]'),
+        CHECK.coverage('gold.fct_player_match_audit',
+                       condition='ABS(clearances_diff_ss_ws) <= 1 OR clearances_diff_ss_ws IS NULL',
+                       warn_threshold=0.95, error_threshold=0.0,
+                       name='audit_diff[fct_player_match_audit.clearances_ss_ws]'),
+        CHECK.coverage('gold.fct_player_match_audit',
+                       condition='ABS(ball_recoveries_diff_ss_ws) <= 1 OR ball_recoveries_diff_ss_ws IS NULL',
+                       warn_threshold=0.95, error_threshold=0.0,
+                       name='audit_diff[fct_player_match_audit.ball_recoveries_ss_ws]'),
+        CHECK.coverage('gold.fct_player_match_audit',
+                       condition='ABS(dribbles_attempted_diff_ss_ws) <= 1 OR dribbles_attempted_diff_ss_ws IS NULL',
+                       warn_threshold=0.95, error_threshold=0.0,
+                       name='audit_diff[fct_player_match_audit.dribbles_attempted_ss_ws]'),
+        CHECK.coverage('gold.fct_player_match_audit',
+                       condition='ABS(dribbles_won_diff_ss_ws) <= 1 OR dribbles_won_diff_ss_ws IS NULL',
+                       warn_threshold=0.95, error_threshold=0.0,
+                       name='audit_diff[fct_player_match_audit.dribbles_won_ss_ws]'),
+        CHECK.coverage('gold.fct_player_match_audit',
+                       condition='ABS(aerials_won_diff_ss_ws) <= 1 OR aerials_won_diff_ss_ws IS NULL',
+                       warn_threshold=0.95, error_threshold=0.0,
+                       name='audit_diff[fct_player_match_audit.aerials_won_ss_ws]'),
+        CHECK.coverage('gold.fct_player_match_audit',
+                       condition='ABS(touches_diff_ss_ws) <= 1 OR touches_diff_ss_ws IS NULL',
+                       warn_threshold=0.95, error_threshold=0.0,
+                       name='audit_diff[fct_player_match_audit.touches_ss_ws]'),
+        CHECK.coverage('gold.fct_player_match_audit',
+                       condition='ABS(dispossessed_diff_ss_ws) <= 1 OR dispossessed_diff_ss_ws IS NULL',
+                       warn_threshold=0.95, error_threshold=0.0,
+                       name='audit_diff[fct_player_match_audit.dispossessed_ss_ws]'),
+
+        # ----- MODELED xG / xA diff (US ↔ SS, разные модели) -----
+        # Threshold ±0.5 — разные xG модели обычно отличаются <0.3 на shot,
+        # суммарно по матчу редко >0.5.
+        CHECK.coverage('gold.fct_player_match_audit',
+                       condition='ABS(xg_diff_us_ss) <= 0.5 OR xg_diff_us_ss IS NULL',
+                       warn_threshold=0.95, error_threshold=0.0,
+                       name='audit_diff[fct_player_match_audit.xg_us_ss]'),
+        CHECK.coverage('gold.fct_player_match_audit',
+                       condition='ABS(xa_diff_us_ss) <= 0.5 OR xa_diff_us_ss IS NULL',
+                       warn_threshold=0.95, error_threshold=0.0,
+                       name='audit_diff[fct_player_match_audit.xa_us_ss]'),
+
+        # ============================================================
         # E1.5: post-cutover ref_integrity / canonical-format checks
         # (silver.xref_team is the source-of-truth; player_id MUST start
         # with 'fb_'). All severity=WARNING in this prep PR — operate as
@@ -1356,7 +1618,17 @@ def validate_gold_row_counts() -> Dict[str, Any]:
         # Keeper baseline ≈25; floor 10.
         CHECK.row_count('gold.fct_player_season_stats_audit', min_rows=100),
         CHECK.row_count('gold.fct_keeper_season_stats_audit', min_rows=10),
-        CHECK.row_count('gold.fct_player_match', min_rows=50000),
+        # issue #46: multi-source это column-wise обогащение spine, не
+        # row-wise разрастание. Floor 10000 с запасом под orphan-drops в
+        # xref-bridge JOIN'ах (Understat/WhoScored LEFT JOIN допускают
+        # NULL, но фильтр fb.match_id/fb.player_id IS NOT NULL сохраняет
+        # FBref-spine). Baseline ≈14-15K на APL 5 сезонов.
+        CHECK.row_count('gold.fct_player_match', min_rows=10000),
+        # issue #46 audit: INNER FBref ∩ SofaScore — pewer rows than main.
+        # SofaScore cherry-pick покрывает APL 2024/25 + 2025/26 (~526 игроков
+        # на сезон × ~38 матчей × ~22 в составе ≈ 22000 audit-rows). Floor 1000
+        # с запасом на тестовые/частичные backfill'ы.
+        CHECK.row_count('gold.fct_player_match_audit', min_rows=1000),
         CHECK.row_count('gold.match_outcomes',   min_rows=3000),
 
         # ===== E2: master-data dim row-count floors =====

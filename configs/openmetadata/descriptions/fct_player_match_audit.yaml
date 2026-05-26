@@ -1,0 +1,177 @@
+# =============================================================================
+# OpenMetadata description: iceberg.gold.fct_player_match_audit
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.gold.fct_player_match_audit
+  description: |
+    Cross-source DQ-audit таблица для gold.fct_player_match. НЕ business-витрина:
+    содержит ТОЛЬКО технические diff-колонки + PK.
+
+    Grain: (match_id_canonical, player_id_canonical) — совпадает с fct_player_match.
+    Только строки с пересечением FBref ∩ SofaScore (INNER JOIN spine).
+    Understat / WhoScored — LEFT JOIN → diff = NULL при отсутствии записи.
+
+    Формула diff:
+      * FBref-metric diff: fb.<metric> - <source>.<metric>
+      * SS-metric diff (когда FBref не отдаёт метрику на match-grain):
+        ss.<metric> - ws.<metric>  (e.g. key_passes, passes, touches)
+      * Modeled diff: us.<metric> - ss.<metric>  (разные xG-модели)
+
+    Использование:
+      1. DQ coverage WARNING — ABS(diff) <= threshold у ≥95% rows.
+      2. Engineer-debug при «голы по матчу не сходятся в дашборде».
+      3. Калибровка thresholds → docs/research/R1_cross_source_thresholds.md.
+
+    WARNING-only DQ (error_threshold=0.0): таблица не блокирует pipeline.
+    Читает Silver напрямую (НЕ gold.fct_player_match) — one-hop Gold rule.
+  tags:
+    - Tier.Gold
+    - Domain.Football
+    - PII.Low
+columns:
+  # ─── PK ───
+  - name: match_id_canonical
+    description: |
+      Канонический ID матча (PK part). COALESCE(xref_match.canonical_id, fb.match_id).
+      FK → gold.fct_player_match.match_id_canonical.
+  - name: player_id_canonical
+    description: |
+      Канонический ID игрока (PK part). Из silver.xref_player (source='fbref',
+      confidence <> 'orphan').
+      FK → gold.fct_player_match.player_id_canonical.
+
+  # ─── SofaScore diff (INNER JOIN — non-NULL для всех строк) ───
+  - name: minutes_diff_ss
+    description: "Diff минут: fb.minutes - ss.minutes_played. INNER JOIN — всегда non-NULL."
+  - name: goals_diff_ss
+    description: "Diff голов: fb.goals - ss.goals."
+  - name: assists_diff_ss
+    description: "Diff ассистов: fb.assists - ss.assists."
+  - name: own_goals_diff_ss
+    description: "Diff автоголов: fb.own_goals - ss.own_goals."
+  - name: shots_diff_ss
+    description: "Diff ударов: fb.shots - ss.shots."
+  - name: shots_on_target_diff_ss
+    description: "Diff ударов в створ: fb.shots_on_target - ss.shots_on_target."
+  - name: yellow_cards_diff_ss
+    description: "Diff жёлтых карточек: fb.yellow_cards - ss.yellow_cards."
+  - name: red_cards_diff_ss
+    description: "Diff красных карточек: fb.red_cards - ss.red_cards."
+  - name: crosses_diff_ss
+    description: "Diff навесов: fb.crosses - ss.crosses."
+  - name: fouls_committed_diff_ss
+    description: "Diff фолов: fb.fouls_committed - ss.fouls_committed."
+  - name: fouls_drawn_diff_ss
+    description: "Diff заработанных фолов: fb.fouls_drawn - ss.fouls_drawn."
+  - name: offsides_diff_ss
+    description: "Diff офсайдов: fb.offsides - ss.offsides."
+  - name: tackles_won_diff_ss
+    description: "Diff выигранных отборов: fb.tackles_won - ss.tackles_won."
+  - name: interceptions_diff_ss
+    description: "Diff перехватов: fb.interceptions - ss.interceptions."
+  - name: penalty_goals_diff_ss
+    description: |
+      Diff пенальти: fb.penalty_goals - ss.penalties_won. Осторожно: FBref
+      считает penalty_goals (забитые), SofaScore — penalties_won (заработанные).
+      Семантика разная; diff используется для coverage-проверки, не для бизнес-анализа.
+  - name: penalty_attempts_diff_ss
+    description: |
+      Diff попыток пенальти: fb.penalty_attempts - ss.penalties_missed.
+      Осторожно: разная семантика (attempts vs missed).
+  - name: penalties_won_diff_ss
+    description: "Diff заработанных пенальти: fb.penalties_won - ss.penalties_won."
+  - name: penalties_conceded_diff_ss
+    description: "Diff допущенных пенальти: fb.penalties_conceded - ss.penalties_conceded."
+
+  # ─── Understat diff (LEFT JOIN → NULL если нет записи) ───
+  - name: minutes_diff_us
+    description: "Diff минут: fb.minutes - us.minutes_played. NULL если Understat-запись отсутствует."
+  - name: goals_diff_us
+    description: "Diff голов: fb.goals - us.goals. NULL если Understat-запись отсутствует."
+  - name: assists_diff_us
+    description: "Diff ассистов: fb.assists - us.assists."
+  - name: own_goals_diff_us
+    description: "Diff автоголов: fb.own_goals - us.own_goals."
+  - name: shots_diff_us
+    description: "Diff ударов: fb.shots - us.shots."
+  - name: yellow_cards_diff_us
+    description: "Diff жёлтых карточек: fb.yellow_cards - us.yellow_cards."
+  - name: red_cards_diff_us
+    description: "Diff красных карточек: fb.red_cards - us.red_cards."
+  - name: key_passes_diff_ss_us
+    description: |
+      Diff передач под удар: ss.key_passes - us.key_passes.
+      FBref не отдаёт key_passes на match-grain → diff строится по SS (вторичный spine).
+
+  # ─── WhoScored diff (LEFT JOIN → NULL если нет записи) ───
+  - name: goals_diff_ws
+    description: "Diff голов: fb.goals - ws.goals. NULL если WhoScored-запись отсутствует."
+  - name: shots_diff_ws
+    description: "Diff ударов: fb.shots - ws.shots."
+  - name: shots_on_target_diff_ws
+    description: "Diff ударов в створ: fb.shots_on_target - ws.shots_on_target."
+  - name: yellow_cards_diff_ws
+    description: "Diff жёлтых карточек: fb.yellow_cards - ws.yellow_cards."
+  - name: red_cards_diff_ws
+    description: "Diff красных карточек: fb.red_cards - ws.red_cards."
+  - name: crosses_diff_ws
+    description: "Diff навесов: fb.crosses - ws.crosses."
+  - name: fouls_committed_diff_ws
+    description: "Diff фолов: fb.fouls_committed - ws.fouls_committed."
+  - name: fouls_drawn_diff_ws
+    description: "Diff заработанных фолов: fb.fouls_drawn - ws.fouls_drawn."
+  - name: offsides_diff_ws
+    description: "Diff офсайдов: fb.offsides - ws.offsides."
+  - name: tackles_won_diff_ws
+    description: "Diff выигранных отборов: fb.tackles_won - ws.tackles_won."
+  - name: interceptions_diff_ws
+    description: "Diff перехватов: fb.interceptions - ws.interceptions."
+  - name: key_passes_diff_ss_ws
+    description: |
+      Diff передач под удар: ss.key_passes - ws.key_passes.
+      FBref не отдаёт key_passes на match-grain → базовый spine = SofaScore.
+  - name: passes_diff_ss_ws
+    description: "Diff передач: ss.passes - ws.passes. SS-spine (FBref не отдаёт passes на match-grain)."
+  - name: passes_completed_diff_ss_ws
+    description: "Diff точных передач: ss.passes_completed - ws.passes_completed."
+  - name: tackles_diff_ss_ws
+    description: "Diff отборов (total): ss.tackles - ws.tackles."
+  - name: clearances_diff_ss_ws
+    description: "Diff выносов: ss.clearances - ws.clearances."
+  - name: ball_recoveries_diff_ss_ws
+    description: "Diff подборов: ss.ball_recoveries - ws.ball_recoveries."
+  - name: dribbles_attempted_diff_ss_ws
+    description: "Diff попыток дриблинга: ss.dribbles_attempted - ws.dribbles_attempted."
+  - name: dribbles_won_diff_ss_ws
+    description: "Diff успешных дриблингов: ss.dribbles_won - ws.dribbles_won."
+  - name: aerials_won_diff_ss_ws
+    description: "Diff верховых дуэлей: ss.aerial_duels_won - ws.aerials_won."
+  - name: touches_diff_ss_ws
+    description: "Diff касаний: ss.touches - ws.touches."
+  - name: dispossessed_diff_ss_ws
+    description: "Diff потерь через отбор: ss.dispossessed - ws.dispossessed."
+
+  # ─── MODELED xG / xA diff (кросс-модельные diff'ы) ───
+  - name: xg_diff_us_ss
+    description: |
+      Кросс-модельный diff xG: us.xg - ss.xg (ROUND 4 знака).
+      Understat-модель vs SofaScore/Opta-модель. Расхождение ожидаемо
+      (разные методологии xG). NULL если Understat-запись отсутствует.
+  - name: xa_diff_us_ss
+    description: |
+      Кросс-модельный diff xA: us.xa - ss.xa (ROUND 4 знака).
+      NULL если Understat-запись отсутствует.
+
+  # ─── Lineage ───
+  - name: _gold_created_at
+    description: Технический timestamp создания строки в Gold-слое.
+
+relationships:
+  - from: match_id_canonical
+    to: trino_iceberg.iceberg.gold.fct_player_match.match_id_canonical
+    type: FOREIGN_KEY
+    description: N:1 — business-витрина с тем же grain.
+  - from: player_id_canonical
+    to: trino_iceberg.iceberg.gold.fct_player_match.player_id_canonical
+    type: FOREIGN_KEY
+    description: N:1 — business-витрина с тем же grain.

@@ -134,6 +134,17 @@ SILVER_E3_TRANSFORMS = [
         'whoscored_player_season_aggregate',
     ),
     (
+        # issue #46: per-(canonical_id, match_id, league, season) WhoScored
+        # match-level aggregate. Aggregates bronze.whoscored_events by
+        # (game_id, player_id) — shots/passes/tackles/interceptions/fouls/
+        # duels/dribbles via COUNT FILTER. Feeds the WhoScored block of
+        # gold.fct_player_match. MUST run after dag_transform_xref (joins
+        # silver.xref_player / xref_match) and after the spadl task.
+        'whoscored_player_match_aggregate',
+        'dags/sql/silver/whoscored_player_match_aggregate.sql',
+        'whoscored_player_match_aggregate',
+    ),
+    (
         # Per-(canonical_id, league, season) aggregate of Understat player
         # season metrics. Reads bronze.understat_players directly and joins
         # silver.xref_player for canonical_id resolution -- so it must run
@@ -144,6 +155,15 @@ SILVER_E3_TRANSFORMS = [
         'understat_player_season_aggregate',
     ),
     (
+        # issue #46: per-(canonical_id, match_id, league, season) Understat
+        # match-level aggregate. Passthrough из bronze.understat_player_match_stats
+        # с dedup ROW_NUMBER. Feeds Understat block of gold.fct_player_match.
+        # MUST run after dag_transform_xref (joins silver.xref_player / xref_match).
+        'understat_player_match_aggregate',
+        'dags/sql/silver/understat_player_match_aggregate.sql',
+        'understat_player_match_aggregate',
+    ),
+    (
         # T6: SofaScore per-(canonical_id, league, season) aggregate.
         # Reads bronze.sofascore_player_season_stats + silver.xref_player
         # (source='sofascore') — MUST run after dag_transform_xref has
@@ -152,6 +172,16 @@ SILVER_E3_TRANSFORMS = [
         'sofascore_player_season_aggregate',
         'dags/sql/silver/sofascore_player_season_aggregate.sql',
         'sofascore_player_season_aggregate',
+    ),
+    (
+        # issue #46: per-(canonical_id, match_id, league, season) SofaScore
+        # match-level aggregate. Passthrough из bronze.sofascore_event_player_stats
+        # (statistics struct уже flattened) с dedup ROW_NUMBER. Feeds SofaScore
+        # block of gold.fct_player_match (rating, xg, xa, shots, touches и т.п.).
+        # MUST run after dag_transform_xref (joins silver.xref_player / xref_match).
+        'sofascore_player_match_aggregate',
+        'dags/sql/silver/sofascore_player_match_aggregate.sql',
+        'sofascore_player_match_aggregate',
     ),
     (
         # Time-invariant атрибуты игрока (height, foot, dob, nationality)

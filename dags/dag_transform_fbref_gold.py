@@ -136,6 +136,12 @@ STAGE_2B_MASTER_DIMS_INLINE = [
 STAGE_3_FACTS = [
     ('fct_team_match',   'dags/sql/gold/fct_team_match.sql',   'fct_team_match',   ['league', 'season']),
     ('fct_player_match', 'dags/sql/gold/fct_player_match.sql', 'fct_player_match', ['league', 'season']),
+    # issue #46: cross-source DQ-audit для fct_player_match. INNER JOIN всех
+    # 4 источников (FBref/SofaScore/Understat/WhoScored) с diff-колонками
+    # `<metric>_diff_<source>` для anomaly detection. WARNING-only DQ.
+    # Same pattern as fct_player_season_stats_audit (STAGE_2_DIMS).
+    ('fct_player_match_audit', 'dags/sql/gold/fct_player_match_audit.sql',
+     'fct_player_match_audit', ['league', 'season']),
     # E5: must run before Stage 4 — feat_team_form joins it for unavailable_count_l5.
     ('fct_player_unavailable', 'dags/sql/gold/fct_player_unavailable.sql',
      'fct_player_unavailable', ['league', 'season']),
