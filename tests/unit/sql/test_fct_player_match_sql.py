@@ -254,3 +254,125 @@ class TestFctPlayerMatchSql:
             "fct_player_match.sql must NOT reference gold.entity_xref "
             "after E1.5 cutover; use silver.xref_player / silver.xref_match"
         )
+
+    def test_understat_bridge_has_no_row_number_workaround(self):
+        """Issue #70: после dedup в silver.xref_player на уровне resolver'а
+        Gold-bridge для Understat не должен делать ROW_NUMBER. Симметричен
+        с sofascore/whoscored/fotmob bridges."""
+        sql = _read_sql()
+        # Вычленяем тело CTE `xref_us_player AS (...)` и проверяем его
+        # отдельно — другие части файла могут законно содержать ROW_NUMBER
+        # (например, dedup внутри SilverWindowFunctions).
+        match = re.search(
+            r"xref_us_player\s+AS\s*\((.*?)\)\s*,",
+            sql, re.IGNORECASE | re.DOTALL,
+        )
+        assert match, "CTE `xref_us_player` not found in fct_player_match.sql"
+        body = match.group(1)
+        assert not re.search(r"\bROW_NUMBER\s*\(", body, re.IGNORECASE), (
+            "xref_us_player must NOT contain ROW_NUMBER dedup (issue #70 fix). "
+            "Silver resolver guarantees ≤1 understat source_id per "
+            "(canonical, league, season); bridge becomes a plain SELECT DISTINCT."
+        )
+        assert re.search(r"\bSELECT\s+DISTINCT\b", body, re.IGNORECASE), (
+            "xref_us_player must use SELECT DISTINCT (symmetric with ss/ws bridges)"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Issue #70 — fan-out contract via DuckDB synthetic
+# ---------------------------------------------------------------------------
+class TestUnderstatBridgeFanOutContract:
+    """Sanity-prove the understat bridge: it tolerates a well-formed
+    `silver.xref_player` (one source_id per canonical+league+season) and
+    fans out when that invariant breaks. The fan-out path is the regression
+    `silver.xref_player_resolver._dedup_canonical_per_season` prevents.
+
+    This isolates the understat bridge logic in DuckDB instead of trying
+    to render the full fct_player_match.sql (too many CTEs / Trino-only
+    idioms for an in-process driver).
+    """
+
+    @staticmethod
+    def _setup_duckdb(con) -> None:
+        # Spine: one match, one player_id_canonical = 'fb_harrison_reed'.
+        con.execute(
+            "CREATE TABLE spine (match_id_canonical VARCHAR, "
+            "player_id_canonical VARCHAR, league VARCHAR, season_slug VARCHAR)"
+        )
+        con.execute(
+            "INSERT INTO spine VALUES "
+            "('m1', 'fb_harrison_reed', 'ENG-Premier League', '2526')"
+        )
+
+    @staticmethod
+    def _xref_table(con, rows) -> None:
+        con.execute(
+            "CREATE TABLE xref_player (canonical_id VARCHAR, source VARCHAR, "
+            "source_id VARCHAR, league VARCHAR, season VARCHAR, confidence VARCHAR)"
+        )
+        for r in rows:
+            con.execute(
+                "INSERT INTO xref_player VALUES (?, ?, ?, ?, ?, ?)",
+                r,
+            )
+
+    _BRIDGE_SQL = """
+    WITH xref_us_player AS (
+        SELECT DISTINCT
+            canonical_id,
+            source_id AS us_player_id,
+            league,
+            season AS season_slug
+        FROM xref_player
+        WHERE source = 'understat'
+          AND confidence <> 'orphan'
+    )
+    SELECT spine.match_id_canonical, spine.player_id_canonical
+    FROM spine
+    LEFT JOIN xref_us_player b
+      ON b.canonical_id = spine.player_id_canonical
+     AND b.league = spine.league
+     AND b.season_slug = spine.season_slug
+    """
+
+    def test_well_formed_xref_one_row_per_pk(self):
+        """Когда Silver dedup отработал — xref_player содержит ровно одну
+        understat-строку per (canonical, league, season) — bridge даёт 1 row."""
+        duckdb = pytest.importorskip("duckdb")
+        con = duckdb.connect()
+        try:
+            self._setup_duckdb(con)
+            self._xref_table(con, [
+                ('fb_harrison_reed', 'understat', '6827',
+                 'ENG-Premier League', '2526', 'name_team'),
+            ])
+            rows = con.execute(self._BRIDGE_SQL).fetchall()
+            assert len(rows) == 1
+            assert rows[0] == ('m1', 'fb_harrison_reed')
+        finally:
+            con.close()
+
+    def test_unfixed_xref_fan_out_demonstrates_regression(self):
+        """Контракт: ЕСЛИ кто-то обойдёт _dedup_canonical_per_season и
+        запишет 2 understat source_id для одного canonical в одном сезоне
+        — текущий bridge (без ROW_NUMBER) fan-out 2×. Этот тест защищает
+        от reintroduction'а старого hack'а: с настоящим
+        ROW_NUMBER-workaround'ом он бы давал 1 row здесь, а наш фикс
+        приводит к 2 row — что и фиксируется как ожидаемое поведение."""
+        duckdb = pytest.importorskip("duckdb")
+        con = duckdb.connect()
+        try:
+            self._setup_duckdb(con)
+            self._xref_table(con, [
+                ('fb_harrison_reed', 'understat', '910',
+                 'ENG-Premier League', '2526', 'name_team'),
+                ('fb_harrison_reed', 'understat', '6827',
+                 'ENG-Premier League', '2526', 'name_team'),
+            ])
+            rows = con.execute(self._BRIDGE_SQL).fetchall()
+            # 2 → подтверждает что Gold SQL полагается на Silver dedup;
+            # хак-ROW_NUMBER здесь бы вернул 1 (но мы его убрали).
+            assert len(rows) == 2
+        finally:
+            con.close()

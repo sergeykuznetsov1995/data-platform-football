@@ -306,6 +306,29 @@ def build_xref_player_checks() -> List[Check]:
             severity='ERROR',
             name='canonical_id_format[xref_player]',
         ),
+
+        # Issue #70: prevent the fan-out pattern that prompted the Gold
+        # ROW_NUMBER hack. A single canonical_id legitimately has one
+        # source_id per (source, league, season); >1 means a Gold JOIN on
+        # (source, source_id) without (league, season) will fan-out 2×.
+        # Dedup is enforced in xref_player_resolver._dedup_canonical_per_season;
+        # this gate makes regressions visible.
+        CHECK.row_count(
+            table=table,
+            min_rows=0,
+            max_rows=0,
+            where=(
+                "(canonical_id, source, league, season) IN ("
+                "SELECT canonical_id, source, league, season "
+                "FROM iceberg.silver.xref_player "
+                "WHERE confidence <> 'orphan' "
+                "GROUP BY canonical_id, source, league, season "
+                "HAVING COUNT(DISTINCT source_id) > 1"
+                ") AND confidence <> 'orphan'"
+            ),
+            severity='ERROR',
+            name='no_duplicates_per_canonical_season[xref_player]',
+        ),
     ]
 
 

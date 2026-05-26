@@ -369,6 +369,33 @@ def test_xref_player_canonical_id_format_check():
     assert "fb|us|ws|ss" in where
 
 
+def test_xref_player_no_duplicates_per_canonical_season_check():
+    """Issue #70 acceptance: a row_count(max=0) ERROR-severity check guards
+    against canonical_id fan-out at source level. The dedup itself happens in
+    xref_player_resolver._dedup_canonical_per_season; this check makes
+    regressions visible if someone bypasses the resolver path."""
+    checks = xref_dq.build_xref_player_checks()
+    dup_checks = [
+        c for c in checks
+        if 'no_duplicates_per_canonical_season' in c.name
+    ]
+    assert len(dup_checks) == 1, (
+        "Expected exactly 1 no_duplicates_per_canonical_season check"
+    )
+    chk = dup_checks[0]
+    assert chk.kind == 'row_count'
+    assert chk.severity == 'ERROR'
+    assert chk.params['min_rows'] == 0
+    assert chk.params['max_rows'] == 0
+    where = chk.params['where']
+    # The WHERE filters rows whose (canonical_id, source, league, season)
+    # appears more than once with distinct source_ids — the exact fan-out
+    # pattern that prompted the Gold ROW_NUMBER hack we just removed.
+    assert "COUNT(DISTINCT source_id) > 1" in where
+    assert "GROUP BY canonical_id, source, league, season" in where
+    assert "confidence <> 'orphan'" in where
+
+
 def test_build_all_xref_checks_aggregates():
     """Aggregated list now also includes xref_player_review (5 checks).
 
