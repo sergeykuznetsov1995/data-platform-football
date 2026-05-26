@@ -19,6 +19,7 @@ from airflow import DAG
 from airflow.exceptions import AirflowException
 from airflow.operators.bash import BashOperator
 from airflow.operators.python import PythonOperator
+from airflow.operators.trigger_dagrun import TriggerDagRunOperator
 
 from utils.config import CURRENT_SEASON, DAG_TAGS, LEAGUES, SCHEDULES
 from utils.default_args import DEFAULT_ARGS
@@ -223,4 +224,14 @@ exit $rc
         trigger_rule='all_done',
     )
 
-    scrape_salaries_task >> validate_task >> validate_bronze_quality_task
+    # Cascade Bronze→Silver: triggers dag_transform_capology_silver
+    # (issue #63). wait_for_completion=False keeps Bronze DAG short; the
+    # Silver DAG runs its own DQ gate.
+    trigger_silver_task = TriggerDagRunOperator(
+        task_id='trigger_silver',
+        trigger_dag_id='dag_transform_capology_silver',
+        wait_for_completion=False,
+        reset_dag_run=True,
+    )
+
+    scrape_salaries_task >> validate_task >> validate_bronze_quality_task >> trigger_silver_task
