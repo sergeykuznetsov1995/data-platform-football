@@ -205,7 +205,11 @@ SELECT
     ROUND(CAST(us.xa AS DOUBLE) - CAST(ss.xa AS DOUBLE), 4) AS xa_diff_us_ss,
 
     -- ========= Lineage =========
-    CURRENT_TIMESTAMP                                      AS _gold_created_at
+    CURRENT_TIMESTAMP                                      AS _gold_created_at,
+
+    -- ========= Partition keys (must be last for Iceberg partitioning) =========
+    xfp.league                                             AS league,
+    xfp.season_slug                                        AS season
 
 FROM xref_fbref_player xfp
 INNER JOIN iceberg.silver.fbref_player_match_stats fb
