@@ -93,26 +93,18 @@ xref_ss_match AS (
 ),
 
 -- ===== Understat bridges =====
--- Understat exposes 2 source_id per canonical for some players (Harrison Reed
--- 910/6827, etc. — see issue #50 risk list). ROW_NUMBER dedup keeps a single
--- us_player_id per (canonical, league, season) to prevent fan-out 2×.
+-- Issue #70: silver.xref_player resolver dedups duplicate source_ids per
+-- (canonical, league, season) at source, so this CTE matches the symmetric
+-- SofaScore / WhoScored / FotMob bridges below.
 xref_us_player AS (
-    SELECT canonical_id, us_player_id, league, season_slug
-    FROM (
-        SELECT
-            canonical_id,
-            source_id                                       AS us_player_id,
-            league,
-            season                                          AS season_slug,
-            ROW_NUMBER() OVER (
-                PARTITION BY canonical_id, league, season
-                ORDER BY source_id
-            ) AS rn
-        FROM iceberg.silver.xref_player
-        WHERE source = 'understat'
-          AND confidence <> 'orphan'
-    )
-    WHERE rn = 1
+    SELECT DISTINCT
+        canonical_id,
+        source_id                                          AS us_player_id,
+        league,
+        season                                             AS season_slug
+    FROM iceberg.silver.xref_player
+    WHERE source = 'understat'
+      AND confidence <> 'orphan'
 ),
 
 xref_us_match AS (

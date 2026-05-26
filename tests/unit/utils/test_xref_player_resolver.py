@@ -709,3 +709,96 @@ class TestSqlHelpers:
         assert out.startswith("('fb_xyz', 'understat', 'u1', 'O''Reilly', ")
         assert out.endswith(", 'Spurs', 'Tottenham Hotspur')")
         assert 'CAST(92.5 AS DOUBLE)' in out
+
+
+# ---------------------------------------------------------------------------
+# Issue #70 — _dedup_canonical_per_season
+# ---------------------------------------------------------------------------
+def _xrow(
+    canonical_id: str,
+    source: str,
+    source_id: str,
+    *,
+    bronze_signal: float = -1.0,
+    confidence: str = 'name_team',
+    league: str = 'ENG-Premier League',
+    season: str = '2526',
+) -> dict:
+    """Minimal xref-row fixture for dedup tests."""
+    return {
+        'canonical_id': canonical_id,
+        'source': source,
+        'source_id': source_id,
+        'display_name': source_id,
+        'league': league,
+        'season': season,
+        'confidence': confidence,
+        'match_score': 95.0,
+        'raw_team_name': 'Fulham',
+        'canonical_team': 'fulham',
+        'bronze_signal': bronze_signal,
+    }
+
+
+class TestDedupCanonicalPerSeason:
+    def test_noop_when_one_row_per_group(self):
+        rows = [
+            _xrow('fb_a', 'understat', '910'),
+            _xrow('fb_b', 'understat', '6827'),
+            _xrow('fb_c', 'whoscored', '111'),
+        ]
+        out, removed = xpr._dedup_canonical_per_season(rows)
+        assert len(out) == 3
+        assert removed == {}
+
+    def test_harrison_reed_pair_keeps_larger_bronze_signal(self):
+        # Real-world #70 case: same canonical_id, 2 understat source_ids,
+        # 6827 (primary club) has more minutes than 910 (legacy profile).
+        old = _xrow('fb_harrison_reed', 'understat', '910', bronze_signal=120.0)
+        new = _xrow('fb_harrison_reed', 'understat', '6827', bronze_signal=2100.0)
+        out, removed = xpr._dedup_canonical_per_season([old, new])
+        assert len(out) == 1
+        assert out[0]['source_id'] == '6827'
+        assert removed == {'understat': 1}
+
+    def test_tie_on_bronze_signal_falls_back_to_max_source_id(self):
+        # When the signal proxy ties (e.g. both unavailable -1), the larger
+        # numeric source_id wins. This is the Transfermarkt / Capology path.
+        a = _xrow('fb_x', 'transfermarkt', '111', bronze_signal=-1.0)
+        b = _xrow('fb_x', 'transfermarkt', '999', bronze_signal=-1.0)
+        out, removed = xpr._dedup_canonical_per_season([a, b])
+        assert len(out) == 1
+        assert out[0]['source_id'] == '999'
+        assert removed == {'transfermarkt': 1}
+
+    def test_orphans_pass_through_unchanged(self):
+        # Orphan rows carry source-private canonical_ids (e.g. orphan:us:foo)
+        # so collisions on (canonical, source) are NOT the fan-out pattern
+        # this function targets. Keep them all.
+        orphan_a = _xrow('orphan:us:foo', 'understat', '1', confidence='orphan')
+        orphan_b = _xrow('orphan:us:bar', 'understat', '2', confidence='orphan')
+        out, removed = xpr._dedup_canonical_per_season([orphan_a, orphan_b])
+        assert len(out) == 2
+        assert removed == {}
+
+    def test_multi_source_collision_only_affects_offending_group(self):
+        # Same canonical_id collides on understat (3 rows → 1) but FotMob
+        # contributes a separate, lone row that must survive untouched.
+        u1 = _xrow('fb_p', 'understat', '10', bronze_signal=50.0)
+        u2 = _xrow('fb_p', 'understat', '20', bronze_signal=1000.0)
+        u3 = _xrow('fb_p', 'understat', '30', bronze_signal=200.0)
+        fm = _xrow('fb_p', 'fotmob', '777', bronze_signal=900.0)
+        out, removed = xpr._dedup_canonical_per_season([u1, u2, u3, fm])
+        assert len(out) == 2
+        winners = {(r['source'], r['source_id']) for r in out}
+        assert winners == {('understat', '20'), ('fotmob', '777')}
+        assert removed == {'understat': 2}
+
+    def test_different_seasons_keep_distinct_rows(self):
+        # PK includes season — same canonical+source across two seasons must
+        # produce two rows, no dedup.
+        s1 = _xrow('fb_p', 'understat', '5', season='2425', bronze_signal=2000.0)
+        s2 = _xrow('fb_p', 'understat', '5', season='2526', bronze_signal=2100.0)
+        out, removed = xpr._dedup_canonical_per_season([s1, s2])
+        assert len(out) == 2
+        assert removed == {}

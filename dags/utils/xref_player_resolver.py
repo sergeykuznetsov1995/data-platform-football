@@ -781,6 +781,10 @@ def _fetch_fbref_players(
                 'canonical_team': canonical_team_for_resolver(squad, 'fbref'),
                 'league': lg,
                 'season': season_slug,
+                # FBref is the canonical spine; one canonical_id never has
+                # multiple FBref source_ids per (league, season) so the
+                # dedup tiebreaker never fires. Sentinel kept for uniformity.
+                'bronze_signal': -1.0,
             }
         )
     return out
@@ -789,8 +793,17 @@ def _fetch_fbref_players(
 def _fetch_understat_players(
     conn, league: str, source_seasons: List[str]
 ) -> List[Dict[str, Any]]:
+    # ``minutes`` is a season-level column on bronze.understat_players; used
+    # as the dedup tiebreaker in _dedup_canonical_per_season (issue #70) so
+    # the row tied to the player's primary club wins when one canonical_id
+    # maps to multiple Understat source_ids (Harrison Reed 910/6827).
     sql = f"""
-        SELECT CAST(player_id AS varchar) AS pid, player, team, league, season
+        SELECT CAST(player_id AS varchar) AS pid,
+               player,
+               team,
+               league,
+               season,
+               CAST(COALESCE(MAX(minutes), 0) AS DOUBLE) AS bronze_signal
         FROM iceberg.bronze.understat_players
         WHERE league = '{_sql_escape(league)}'
           AND season IN ({_seasons_in_clause(source_seasons)})
@@ -800,7 +813,7 @@ def _fetch_understat_players(
     rows = _execute(conn, sql, fetch=True) or []
     out: List[Dict[str, Any]] = []
     seen: set = set()
-    for pid, name, team, lg, season in rows:
+    for pid, name, team, lg, season, signal in rows:
         # Dedup by (pid, team, season): same player_id may legitimately
         # appear in multiple seasons (and across teams within a season for
         # mid-season transfers). Without (team, season) in the key, the
@@ -821,6 +834,7 @@ def _fetch_understat_players(
                 'canonical_team': canonical_team_for_resolver(team, 'understat'),
                 'league': lg,
                 'season': season,
+                'bronze_signal': float(signal) if signal is not None else 0.0,
             }
         )
     return out
@@ -829,12 +843,16 @@ def _fetch_understat_players(
 def _fetch_whoscored_players(
     conn, league: str, source_seasons: List[str]
 ) -> List[Dict[str, Any]]:
+    # COUNT(DISTINCT game_id) is the games-played proxy used as the dedup
+    # tiebreaker in _dedup_canonical_per_season (issue #70). WhoScored is
+    # event-grain; no native minutes column on bronze.whoscored_events.
     sql = f"""
         SELECT CAST(CAST(player_id AS bigint) AS varchar) AS pid,
                MAX(player) AS player,
                MAX(team) AS team,
                league,
-               season
+               season,
+               CAST(COUNT(DISTINCT CAST(game_id AS bigint)) AS DOUBLE) AS bronze_signal
         FROM iceberg.bronze.whoscored_events
         WHERE league = '{_sql_escape(league)}'
           AND season IN ({_seasons_in_clause(source_seasons)})
@@ -844,7 +862,7 @@ def _fetch_whoscored_players(
     """
     rows = _execute(conn, sql, fetch=True) or []
     out: List[Dict[str, Any]] = []
-    for pid, name, team, lg, season in rows:
+    for pid, name, team, lg, season, signal in rows:
         out.append(
             {
                 'source': 'whoscored',
@@ -854,6 +872,7 @@ def _fetch_whoscored_players(
                 'canonical_team': canonical_team_for_resolver(team, 'whoscored'),
                 'league': lg,
                 'season': season,
+                'bronze_signal': float(signal) if signal is not None else 0.0,
             }
         )
     return out
@@ -869,19 +888,44 @@ def _fetch_fotmob_players(
     (e.g. 2025 for 2025/26) — convert to slug ('2526') before emission so
     the spine index keys agree with Understat/WhoScored.
     """
+    # Minutes-played proxy from bronze.fotmob_player_stats (long format with
+    # stat_name='mins_played'). Used as dedup tiebreaker in
+    # _dedup_canonical_per_season (issue #70). NULL fallback to 0.0.
     sql = f"""
-        SELECT player_id, name, primary_team_name, league, season
-        FROM iceberg.bronze.fotmob_player_details
-        WHERE league = '{_sql_escape(league)}'
-          AND season IN ({_seasons_in_clause(fbref_seasons)})
-          AND COALESCE(is_coach, false) = false
-          AND name IS NOT NULL
-        GROUP BY player_id, name, primary_team_name, league, season
+        WITH mins AS (
+            SELECT
+                player_id,
+                league,
+                season,
+                MAX(CASE WHEN stat_name = 'mins_played'
+                         THEN TRY_CAST(stat_value AS DOUBLE) END) AS minutes_played
+            FROM iceberg.bronze.fotmob_player_stats
+            WHERE league = '{_sql_escape(league)}'
+              AND season IN ({_seasons_in_clause(fbref_seasons)})
+            GROUP BY player_id, league, season
+        )
+        SELECT d.player_id,
+               d.name,
+               d.primary_team_name,
+               d.league,
+               d.season,
+               COALESCE(m.minutes_played, 0.0) AS bronze_signal
+        FROM iceberg.bronze.fotmob_player_details d
+        LEFT JOIN mins m
+          ON m.player_id = d.player_id
+         AND m.league = d.league
+         AND m.season = d.season
+        WHERE d.league = '{_sql_escape(league)}'
+          AND d.season IN ({_seasons_in_clause(fbref_seasons)})
+          AND COALESCE(d.is_coach, false) = false
+          AND d.name IS NOT NULL
+        GROUP BY d.player_id, d.name, d.primary_team_name, d.league, d.season,
+                 COALESCE(m.minutes_played, 0.0)
     """
     rows = _execute(conn, sql, fetch=True) or []
     out: List[Dict[str, Any]] = []
     seen: set = set()
-    for pid, name, team, lg, season in rows:
+    for pid, name, team, lg, season, signal in rows:
         # Dedup by (pid, team, season) — same reasoning as
         # _fetch_understat_players above. Bronze fotmob_player_details
         # is partitioned by season (bigint), so each season is a distinct
@@ -900,6 +944,7 @@ def _fetch_fotmob_players(
                 'canonical_team': canonical_team_for_resolver(team, 'fotmob'),
                 'league': lg,
                 'season': season_slug,
+                'bronze_signal': float(signal) if signal is not None else 0.0,
             }
         )
     return out
@@ -917,16 +962,36 @@ def _fetch_sofascore_players(
     ``name`` / ``short_name``. If profile is sparse, the cascade will
     silently fall through to orphan — that is expected.
     """
+    # Minutes-played proxy via SUM over bronze.sofascore_event_player_stats
+    # (per-match grain). Used as dedup tiebreaker in
+    # _dedup_canonical_per_season (issue #70). NULL fallback to 0.0.
     sql = f"""
+        WITH mins AS (
+            SELECT
+                player_id,
+                league,
+                season,
+                SUM(TRY_CAST(minutes_played AS DOUBLE)) AS minutes_played
+            FROM iceberg.bronze.sofascore_event_player_stats
+            WHERE league = '{_sql_escape(league)}'
+              AND season IN ({_seasons_in_clause(source_seasons)})
+              AND player_id IS NOT NULL
+            GROUP BY player_id, league, season
+        )
         SELECT
             CAST(b.player_id AS varchar) AS pid,
             COALESCE(MAX(p.name), MAX(p.short_name)) AS player_name,
             MAX(b.team_name) AS team,
             b.league,
-            b.season
+            b.season,
+            COALESCE(MAX(m.minutes_played), 0.0) AS bronze_signal
         FROM iceberg.bronze.sofascore_player_season_stats b
         LEFT JOIN iceberg.bronze.sofascore_player_profile p
           ON p.player_id = b.player_id
+        LEFT JOIN mins m
+          ON m.player_id = b.player_id
+         AND m.league = b.league
+         AND m.season = b.season
         WHERE b.league = '{_sql_escape(league)}'
           AND b.season IN ({_seasons_in_clause(source_seasons)})
           AND b.player_id IS NOT NULL
@@ -934,7 +999,7 @@ def _fetch_sofascore_players(
     """
     rows = _execute(conn, sql, fetch=True) or []
     out: List[Dict[str, Any]] = []
-    for pid, name, team, lg, season in rows:
+    for pid, name, team, lg, season, signal in rows:
         out.append(
             {
                 'source': 'sofascore',
@@ -944,6 +1009,7 @@ def _fetch_sofascore_players(
                 'canonical_team': canonical_team_for_resolver(team, 'sofascore'),
                 'league': lg,
                 'season': season,
+                'bronze_signal': float(signal) if signal is not None else 0.0,
             }
         )
     return out
@@ -993,6 +1059,10 @@ def _fetch_transfermarkt_players(
                 'canonical_team': canonical_team_for_resolver(team, 'transfermarkt'),
                 'league': lg,
                 'season': season,
+                # No minutes/games proxy on Transfermarkt Bronze; dedup
+                # tiebreaker degenerates to source_id ordering for any
+                # canonical collisions (none observed as of issue #70).
+                'bronze_signal': -1.0,
             }
         )
     return out
@@ -1047,6 +1117,9 @@ def _fetch_capology_players(
                 'canonical_team': canonical_team_for_resolver(team, 'capology'),
                 'league': lg,
                 'season': season,
+                # No minutes proxy on Capology Bronze; dedup tiebreaker
+                # degenerates to source_id ordering.
+                'bronze_signal': -1.0,
             }
         )
     return out
@@ -1373,6 +1446,9 @@ def _resolve_all(
                 'match_score': None,
                 'raw_team_name': row['raw_team_name'],
                 'canonical_team': row['canonical_team'],
+                # In-memory only — consumed by _dedup_canonical_per_season,
+                # not written to Iceberg (_value_tuple skips it).
+                'bronze_signal': row.get('bronze_signal', -1.0),
             }
         )
         stats['fbref']['total'] += 1
@@ -1407,6 +1483,9 @@ def _resolve_all(
                     'match_score': score,
                     'raw_team_name': row['raw_team_name'],
                     'canonical_team': row['canonical_team'],
+                    # In-memory only — consumed by _dedup_canonical_per_season,
+                    # not written to Iceberg (_value_tuple skips it).
+                    'bronze_signal': row.get('bronze_signal', -1.0),
                 }
             )
             if conf == 'orphan':
@@ -1415,6 +1494,71 @@ def _resolve_all(
                 stats[row['source']]['resolved'] += 1
 
     return out, review, stats
+
+
+def _dedup_canonical_per_season(
+    rows: List[Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
+    """Collapse multiple ``source_id`` rows per ``(canonical_id, source,
+    league, season)`` down to one (issue #70).
+
+    A single canonical_id can legitimately bind to several source_ids in the
+    same season — Understat exposes Harrison Reed as both 910 and 6827, FotMob
+    profiles get split across in-season transfers, etc. When a downstream Gold
+    fact JOINs ``silver.xref_player`` on ``(source, source_id)`` without
+    ``(league, season)``, the duplicate rows fan-out 2×; the prior workaround
+    was a ROW_NUMBER CTE inside ``fct_player_match.sql``.
+
+    Tiebreaker (largest wins):
+      1. ``bronze_signal`` — minutes_played / games proxy from each source's
+         Bronze. ``-1.0`` sentinel for sources with no proxy (TM, Capology)
+         degenerates this rank.
+      2. ``int(source_id)`` if the string is purely numeric, else 0.
+      3. lexicographic ``source_id`` — last-resort deterministic order.
+
+    Orphan rows (``confidence == 'orphan'``) are passed through unchanged —
+    their canonical_id is source-private (``orphan:<...>``) so they cannot
+    fan-out a real canonical in Gold.
+
+    Returns ``(deduped_rows, removed_per_source)``.
+    """
+    from collections import defaultdict
+
+    out: List[Dict[str, Any]] = []
+    groups: Dict[Tuple[str, str, str, str], List[Dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        if row.get('confidence') == 'orphan':
+            out.append(row)
+            continue
+        key = (
+            row['canonical_id'],
+            row['source'],
+            row['league'],
+            str(row['season']),
+        )
+        groups[key].append(row)
+
+    def _tie_key(r: Dict[str, Any]) -> Tuple[float, int, str]:
+        sig = r.get('bronze_signal')
+        sig_f = float(sig) if sig is not None else -1.0
+        sid_raw = r.get('source_id') or ''
+        sid_str = str(sid_raw)
+        try:
+            sid_int = int(sid_str)
+        except (TypeError, ValueError):
+            sid_int = 0
+        return (sig_f, sid_int, sid_str)
+
+    removed: Dict[str, int] = defaultdict(int)
+    for members in groups.values():
+        if len(members) == 1:
+            out.append(members[0])
+            continue
+        winner = max(members, key=_tie_key)
+        out.append(winner)
+        removed[winner['source']] += len(members) - 1
+
+    return out, dict(removed)
 
 
 def _verify_known_pairs(rows: List[Dict[str, Any]]) -> Tuple[int, int]:
@@ -1653,6 +1797,15 @@ def run_resolver(
             len(review_rows),
         )
 
+        # Issue #70: collapse multi-source_id-per-canonical fan-out at the
+        # source so downstream Gold facts don't need ROW_NUMBER hacks.
+        rows, dedup_removed = _dedup_canonical_per_season(rows)
+        if dedup_removed:
+            logger.info(
+                "  dedup_canonical_per_season removed %s",
+                dedup_removed,
+            )
+
         # Regression guard — done before INSERT so a failure aborts without
         # touching the Iceberg table.
         # Bind to dedicated names so the per-source `total` rebind below
@@ -1720,6 +1873,7 @@ def run_resolver(
         'rows_inserted': rows_inserted,
         'review_inserted': review_inserted,
         'per_source': per_source,
+        'dedup_removed_per_source': dedup_removed,
         'known_pair_pass_rate': f"{known_passed}/{known_total}",
         'duration_sec': round(time.time() - started, 2),
     }
