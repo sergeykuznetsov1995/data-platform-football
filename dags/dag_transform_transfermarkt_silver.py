@@ -13,7 +13,8 @@ Architecture:
         |
         v
     TaskGroup: silver_transforms
-        └── players  — typed player snapshot with canonical_id
+        ├── players  — typed player snapshot with canonical_id
+        └── market_value_history  — typed MV timeline with canonical_id
         |
         v
     validate_silver  — row count checks
@@ -22,7 +23,8 @@ Architecture:
     validate_silver_quality  — DQ checks (PK, ref integrity WARNING, ranges, orphan coverage)
 
 Silver Tables Created:
-    iceberg.silver.transfermarkt_players  — typed snapshot + canonical_id (issue #60)
+    iceberg.silver.transfermarkt_players               — typed snapshot + canonical_id (issue #60)
+    iceberg.silver.transfermarkt_market_value_history  — typed MV timeline + canonical_id (issue #61)
 """
 
 from datetime import datetime
@@ -44,12 +46,21 @@ SILVER_TRANSFORMS = [
         'dags/sql/silver/transfermarkt_players.sql',
         'transfermarkt_players',
     ),
+    (
+        'market_value_history',
+        'dags/sql/silver/transfermarkt_market_value_history.sql',
+        'transfermarkt_market_value_history',
+    ),
 ]
 
 # Expected minimum row counts per Silver table (for validation)
-# APL 2025/26 Bronze = 528 rows; DoD floor = 400.
+# transfermarkt_players: APL 2025/26 Bronze = 528 rows; DoD floor = 400.
+# transfermarkt_market_value_history: ~21 точка на игрока × 528 ≈ 10 888
+#   rows full-state APL 2025/26; live floor = 1000 защищает от broken CTAS,
+#   DoD-инвариант ≥5000 проверяется отдельным DQ check (issue #61).
 SILVER_MIN_ROWS = {
     'transfermarkt_players': 400,
+    'transfermarkt_market_value_history': 1000,
 }
 
 
@@ -175,6 +186,75 @@ def _validate_silver_quality(**context) -> Dict[str, Any]:
             'silver.transfermarkt_players', 'current_market_value_eur',
             min_val=0, severity='WARNING',
         ),
+
+        # ---------------------------------------------------------------
+        # silver.transfermarkt_market_value_history (issue #61)
+        # ---------------------------------------------------------------
+        # DoD row_count floor — WARNING (Bronze ingest догоняет постепенно
+        # из-за rate-limit ceapi endpoint; full APL = ~10 888 rows).
+        CHECK.row_count(
+            'silver.transfermarkt_market_value_history',
+            min_rows=5000, severity='WARNING',
+        ),
+
+        # PK + critical NULLs — ERROR. canonical_id EXCLUDED (TM orphan
+        # rate ≈ 10% — see coverage check below).
+        CHECK.no_nulls(
+            'silver.transfermarkt_market_value_history',
+            cols=['player_id', 'mv_date', 'value_eur', 'league', 'season'],
+        ),
+
+        # Bronze-grain dedup — ERROR (defensive against replace_partitions
+        # double-write).
+        CHECK.no_duplicates(
+            'silver.transfermarkt_market_value_history',
+            pk=['player_id', 'mv_date', 'league', 'season'],
+        ),
+
+        # DoD canonical-grain dedup — ERROR. WHERE filter обязателен:
+        # canonical_id NULL для orphans, иначе чек упадёт на множественных
+        # NULL-ах. См. feedback_xref_player_tm_capology.md.
+        CHECK.no_duplicates(
+            'silver.transfermarkt_market_value_history',
+            pk=['canonical_id', 'mv_date'],
+            where='canonical_id IS NOT NULL',
+        ),
+
+        # canonical_id coverage — sibling-policy (как players).
+        CHECK.coverage(
+            'silver.transfermarkt_market_value_history',
+            column='canonical_id',
+            warn_threshold=0.88,
+            error_threshold=0.80,
+            severity='WARNING',
+            name='canonical_coverage[silver.transfermarkt_market_value_history]',
+        ),
+
+        # Ref integrity to xref_player — WARNING.
+        CHECK.ref_integrity(
+            'silver.transfermarkt_market_value_history',
+            'silver.xref_player',
+            'canonical_id',
+            severity='WARNING',
+        ),
+
+        # Freshness — WARNING. DoD: ≤14 дней (336h).
+        CHECK.freshness(
+            'silver.transfermarkt_market_value_history',
+            ts_col='_bronze_ingested_at',
+            max_age_hours=336,
+            severity='WARNING',
+        ),
+
+        # Value ranges — WARNING.
+        CHECK.value_range(
+            'silver.transfermarkt_market_value_history', 'value_eur',
+            min_val=0, severity='WARNING',
+        ),
+        CHECK.value_range(
+            'silver.transfermarkt_market_value_history', 'age',
+            min_val=14, max_val=50, severity='WARNING',
+        ),
     ]
 
     # Run with raise_on_error=False so the Telegram summary always lands.
@@ -229,6 +309,7 @@ with DAG(
     | Table | Description | Bronze sources |
     |-------|-------------|----------------|
     | `transfermarkt_players` | Typed player snapshot + canonical_id (issue #60) | `transfermarkt_players` |
+    | `transfermarkt_market_value_history` | Typed MV timeline + canonical_id (issue #61) | `transfermarkt_market_value_history` |
 
     ### Data Quality Checks
 
