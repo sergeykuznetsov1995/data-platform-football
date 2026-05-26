@@ -63,10 +63,12 @@ SELECT
     blocked_scoring_attempt                AS shots_blocked,
     shot_off_target                        AS shots_off_target,
 
-    -- Cards (SofaScore: `received_yellow_card`, `received_red_card` flags
-    -- per-row; some payloads expose counters as 0/1)
-    received_yellow_card                   AS yellow_cards,
-    received_red_card                      AS red_cards,
+    -- Cards: SofaScore `event_player_stats` Bronze не отдаёт received_yellow_card /
+    -- received_red_card — карточки приходят только через `match_cards` / `event_incidents`
+    -- стрим (вне scope этого Silver). Оставляем NULL — downstream Gold берёт fb.yellow/red
+    -- из FBref или ws.* из WhoScored.
+    CAST(NULL AS DOUBLE)                   AS yellow_cards,
+    CAST(NULL AS DOUBLE)                   AS red_cards,
 
     -- Crosses
     total_cross                            AS crosses,
@@ -114,7 +116,9 @@ SELECT
     penalty_won                            AS penalties_won,
     penalty_conceded                       AS penalties_conceded,
     penalty_miss                           AS penalties_missed,
-    penalty_goal                           AS penalty_goals,
+    -- penalty_goal не emit'ится в `event_player_stats` (приходит через `goal_assist`+penalty incident).
+    -- Оставляем NULL; downstream Gold может реализовать derive если потребуется.
+    CAST(NULL AS DOUBLE)                   AS penalty_goals,
     penalty_save                           AS penalty_saves,
 
     -- ========= Ground duels (SofaScore-derived: total - aerial) =========

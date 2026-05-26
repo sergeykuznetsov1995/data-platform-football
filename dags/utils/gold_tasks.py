@@ -884,7 +884,9 @@ def validate_gold_quality() -> Dict[str, Any]:
         CHECK.no_duplicates('gold.dim_team',         pk=['team_id', 'season']),
         CHECK.no_duplicates('gold.dim_player',       pk=['player_id', 'season']),
         CHECK.no_duplicates('gold.fct_team_match',   pk=['match_id', 'team_id']),
-        CHECK.no_duplicates('gold.fct_player_match', pk=['match_id', 'player_id']),
+        # issue #46: fct_player_match теперь multi-source, PK переименована
+        # match_id → match_id_canonical, player_id → player_id_canonical.
+        CHECK.no_duplicates('gold.fct_player_match', pk=['match_id_canonical', 'player_id_canonical']),
         CHECK.no_duplicates('gold.match_outcomes',    pk=['match_id']),
         # E5: composite PK guards against double-listing the same player as
         # absent for the same match. Empty fallback (0 rows) passes trivially.
@@ -907,7 +909,11 @@ def validate_gold_quality() -> Dict[str, Any]:
 
         # ========== Referential integrity — ERROR ==========
         CHECK.ref_integrity('gold.fct_team_match',   'gold.dim_match', 'match_id'),
-        CHECK.ref_integrity('gold.fct_player_match', 'gold.dim_match', 'match_id'),
+        # issue #46: ref_integrity на dim_match — child = match_id_canonical, parent = match_id.
+        CHECK.ref_integrity(
+            'gold.fct_player_match', 'gold.dim_match',
+            'match_id_canonical', parent_key='match_id',
+        ),
         # issue #46: fct_player_match теперь multi-source с player_id_canonical
         # — добавляем ref_integrity к dim_player_attributes (snapshot grain per
         # canonical_id, T4). Без `parent_key=` так как обе таблицы используют

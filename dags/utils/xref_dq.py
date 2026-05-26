@@ -435,14 +435,16 @@ def build_e1_5_post_cutover_checks() -> List[Check]:
             name='ref_integrity[dim_team.team_id->silver.xref_team(fbref)]',
         ),
 
-        # 2) fct_player_match.team_id ⊆ dim_team.team_id
+        # 2) fct_player_match.team_id_canonical ⊆ dim_team.team_id
+        # issue #46: fct_player_match теперь multi-source, колонка переименована
+        # team_id → team_id_canonical.
         CHECK.row_count(
             table='iceberg.gold.fct_player_match',
             min_rows=0,
             max_rows=0,
             where=(
-                "team_id IS NOT NULL "
-                "AND team_id NOT IN (SELECT team_id FROM iceberg.gold.dim_team)"
+                "team_id_canonical IS NOT NULL "
+                "AND team_id_canonical NOT IN (SELECT team_id FROM iceberg.gold.dim_team)"
             ),
             severity='WARNING',
             name='ref_integrity[fct_player_match.team_id->dim_team]',
@@ -484,12 +486,13 @@ def build_e1_5_post_cutover_checks() -> List[Check]:
             name='canonical_format[dim_player.player_id]',
         ),
 
-        # 6) fct_player_match.player_id matches '^fb_' regex
+        # 6) fct_player_match.player_id_canonical matches '^fb_' regex
+        # issue #46: переименование player_id → player_id_canonical.
         CHECK.row_count(
             table='iceberg.gold.fct_player_match',
             min_rows=0,
             max_rows=0,
-            where="player_id IS NOT NULL AND NOT regexp_like(player_id, '^fb_.+')",
+            where="player_id_canonical IS NOT NULL AND NOT regexp_like(player_id_canonical, '^fb_.+')",
             severity='WARNING',
             name='canonical_format[fct_player_match.player_id]',
         ),
