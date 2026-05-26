@@ -13,8 +13,9 @@ Architecture:
         |
         v
     TaskGroup: silver_transforms
-        ├── players  — typed player snapshot with canonical_id
-        └── market_value_history  — typed MV timeline with canonical_id
+        ├── players              — typed player snapshot with canonical_id
+        ├── market_value_history — typed MV timeline with canonical_id
+        └── transfers            — typed transfer events + player/club canonical_ids
         |
         v
     validate_silver  — row count checks
@@ -25,8 +26,12 @@ Architecture:
 Silver Tables Created:
     iceberg.silver.transfermarkt_players               — typed snapshot + canonical_id (issue #60)
     iceberg.silver.transfermarkt_market_value_history  — typed MV timeline + canonical_id (issue #61)
+    iceberg.silver.transfermarkt_transfers             — typed transfer events + canonical_ids (issue #62)
 """
 
+import logging
+import os
+import tempfile
 from datetime import datetime
 from typing import Any, Dict
 
@@ -36,10 +41,15 @@ from airflow.utils.task_group import TaskGroup
 
 from utils.default_args import SILVER_ARGS
 
+logger = logging.getLogger(__name__)
+
 # ---------------------------------------------------------------------------
 # Silver transform definitions
 # ---------------------------------------------------------------------------
-# Each entry: (task_id, sql_file relative to /opt/airflow/, target table name)
+# Each entry: (task_id, sql_file relative to /opt/airflow/, target table name).
+# When sql_file ends with `.sql.j2`, _run_transform renders it via
+# medallion_config.render_sql_template() before passing to run_silver_transform
+# (same pattern as dag_transform_xref._run_xref_team).
 SILVER_TRANSFORMS = [
     (
         'players',
@@ -51,6 +61,11 @@ SILVER_TRANSFORMS = [
         'dags/sql/silver/transfermarkt_market_value_history.sql',
         'transfermarkt_market_value_history',
     ),
+    (
+        'transfers',
+        'dags/sql/silver/transfermarkt_transfers.sql.j2',
+        'transfermarkt_transfers',
+    ),
 ]
 
 # Expected minimum row counts per Silver table (for validation)
@@ -58,9 +73,12 @@ SILVER_TRANSFORMS = [
 # transfermarkt_market_value_history: ~21 точка на игрока × 528 ≈ 10 888
 #   rows full-state APL 2025/26; live floor = 1000 защищает от broken CTAS,
 #   DoD-инвариант ≥5000 проверяется отдельным DQ check (issue #61).
+# transfermarkt_transfers: ~8 events на игрока × 528 ≈ 4 116 rows APL
+#   2025/26; DoD floor = 1000 (issue #62).
 SILVER_MIN_ROWS = {
     'transfermarkt_players': 400,
     'transfermarkt_market_value_history': 1000,
+    'transfermarkt_transfers': 1000,
 }
 
 
@@ -69,14 +87,65 @@ SILVER_MIN_ROWS = {
 # ---------------------------------------------------------------------------
 
 def _run_transform(sql_file: str, table_name: str, **context) -> Dict[str, Any]:
-    """PythonOperator callable — run a single Silver CTAS transform."""
+    """PythonOperator callable — run a single Silver CTAS transform.
+
+    If sql_file ends with `.sql.j2`, render it through
+    ``medallion_config.render_sql_template`` (embedding the team-alias
+    VALUES via ``{{ team_aliases_values_sql }}``) and pass the rendered
+    SQL to ``run_silver_transform`` via a tempfile. This mirrors the
+    pattern used in ``dag_transform_xref._run_xref_team``.
+    """
+    from pathlib import Path
+
     from utils.silver_tasks import run_silver_transform
 
-    return run_silver_transform(
-        sql_file=sql_file,
-        table_name=table_name,
-        schema='silver',
+    if not sql_file.endswith('.sql.j2'):
+        return run_silver_transform(
+            sql_file=sql_file,
+            table_name=table_name,
+            schema='silver',
+        )
+
+    from utils.medallion_config import (
+        get_team_alias_sql_values,
+        render_sql_template,
     )
+
+    template_path = Path('/opt/airflow') / sql_file
+    if not template_path.exists():
+        raise FileNotFoundError(f"Silver template not found: {template_path}")
+
+    rendered_sql = render_sql_template(
+        template_path,
+        team_aliases_values_sql=get_team_alias_sql_values(),
+    )
+    logger.info(
+        "Rendered %s — %d chars (%d alias pairs embedded)",
+        template_path.name,
+        len(rendered_sql),
+        rendered_sql.count("),\n"),
+    )
+
+    with tempfile.NamedTemporaryFile(
+        mode='w',
+        suffix=f'_{table_name}.sql',
+        delete=False,
+        encoding='utf-8',
+    ) as tmp:
+        tmp.write(rendered_sql)
+        tmp_path = tmp.name
+
+    try:
+        return run_silver_transform(
+            sql_file=tmp_path,
+            table_name=table_name,
+            schema='silver',
+        )
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError as e:
+            logger.warning("Failed to cleanup temp file %s: %s", tmp_path, e)
 
 
 def _validate_silver(**context) -> Dict[str, Any]:
@@ -255,6 +324,90 @@ def _validate_silver_quality(**context) -> Dict[str, Any]:
             'silver.transfermarkt_market_value_history', 'age',
             min_val=14, max_val=50, severity='WARNING',
         ),
+
+        # ---------------------------------------------------------------
+        # silver.transfermarkt_transfers (issue #62)
+        # ---------------------------------------------------------------
+        # DoD row_count floor — WARNING (full APL 2025/26 ≈ 4 116 rows;
+        # 1000 защищает от broken CTAS / scrape regression).
+        CHECK.row_count(
+            'silver.transfermarkt_transfers',
+            min_rows=1000, severity='WARNING',
+        ),
+
+        # PK + critical NULLs — ERROR. canonical_id EXCLUDED (TM orphan
+        # rate ≈10% по xref_player_resolver).
+        CHECK.no_nulls(
+            'silver.transfermarkt_transfers',
+            cols=['player_id', 'transfer_date', 'league', 'season'],
+        ),
+
+        # PK uniqueness — ERROR. Natural key is per-event:
+        # (player_id, transfer_date, from_club_name, to_club_name). Per
+        # DoD spec — orphan rows (canonical_id NULL) don't break this
+        # since PK doesn't include canonical_id.
+        CHECK.no_duplicates(
+            'silver.transfermarkt_transfers',
+            pk=['player_id', 'transfer_date', 'from_club_name', 'to_club_name'],
+        ),
+
+        # canonical_id coverage (player) — sibling-policy. DoD: ≤5%
+        # orphan → ≥95% non-orphan. warn_threshold=0.95, error=0.85.
+        CHECK.coverage(
+            'silver.transfermarkt_transfers',
+            column='canonical_id',
+            warn_threshold=0.95,
+            error_threshold=0.85,
+            severity='WARNING',
+            name='canonical_coverage[silver.transfermarkt_transfers]',
+        ),
+
+        # Ref integrity to xref_player — WARNING.
+        CHECK.ref_integrity(
+            'silver.transfermarkt_transfers',
+            'silver.xref_player',
+            'canonical_id',
+            severity='WARNING',
+        ),
+
+        # Team canonical coverage — WARNING-only (per DoD: TM transfers
+        # contain non-APL клубы которые xref_team / team_aliases.yaml
+        # не покрывают; high orphan tolerated for observability).
+        CHECK.coverage(
+            'silver.transfermarkt_transfers',
+            column='from_club_id_canonical',
+            warn_threshold=0.0,
+            error_threshold=0.0,
+            severity='WARNING',
+            name='canonical_coverage[silver.transfermarkt_transfers.from_club_id_canonical]',
+        ),
+        CHECK.coverage(
+            'silver.transfermarkt_transfers',
+            column='to_club_id_canonical',
+            warn_threshold=0.0,
+            error_threshold=0.0,
+            severity='WARNING',
+            name='canonical_coverage[silver.transfermarkt_transfers.to_club_id_canonical]',
+        ),
+
+        # Freshness — WARNING (weekly ingest, 48h grace).
+        CHECK.freshness(
+            'silver.transfermarkt_transfers',
+            ts_col='_bronze_ingested_at',
+            max_age_hours=FRESH_HOURS,
+            severity='WARNING',
+        ),
+
+        # Value ranges — WARNING. fee_eur может быть NULL (free transfer);
+        # value_range игнорирует NULL по definition.
+        CHECK.value_range(
+            'silver.transfermarkt_transfers', 'fee_eur',
+            min_val=0, severity='WARNING',
+        ),
+        CHECK.value_range(
+            'silver.transfermarkt_transfers', 'market_value_eur',
+            min_val=0, severity='WARNING',
+        ),
     ]
 
     # Run with raise_on_error=False so the Telegram summary always lands.
@@ -310,6 +463,7 @@ with DAG(
     |-------|-------------|----------------|
     | `transfermarkt_players` | Typed player snapshot + canonical_id (issue #60) | `transfermarkt_players` |
     | `transfermarkt_market_value_history` | Typed MV timeline + canonical_id (issue #61) | `transfermarkt_market_value_history` |
+    | `transfermarkt_transfers` | Typed transfer events + player/club canonical_ids (issue #62) | `transfermarkt_transfers` |
 
     ### Data Quality Checks
 
