@@ -145,6 +145,26 @@ SILVER_E3_TRANSFORMS = [
         'whoscored_player_match_aggregate',
     ),
     (
+        # T6.3 (#92): per-(match_id, team_id) WhoScored team match-aggregate.
+        # GROUP BY on silver.whoscored_events_spadl — pass/take-on/tackle/
+        # interception/shot/foul/spatial counters via COUNT_IF. Feeds the
+        # WhoScored block of gold.fct_team_match v2 (#95). MUST run after
+        # whoscored_events_spadl. MUST run BEFORE whoscored_team_season
+        # (which rolls up from this table).
+        'whoscored_team_match',
+        'dags/sql/silver/whoscored_team_match.sql',
+        'whoscored_team_match',
+    ),
+    (
+        # T6.3 (#92): per-(team_id, league, season) WhoScored team
+        # season-aggregate. SUM rollup из silver.whoscored_team_match —
+        # pct/share recomputed at season grain from SUM(ok)/SUM(total).
+        # Feeds WhoScored block of gold.fct_team_season_stats (#94).
+        'whoscored_team_season',
+        'dags/sql/silver/whoscored_team_season.sql',
+        'whoscored_team_season',
+    ),
+    (
         # Per-(canonical_id, league, season) aggregate of Understat player
         # season metrics. Reads bronze.understat_players directly and joins
         # silver.xref_player for canonical_id resolution -- so it must run
