@@ -1142,6 +1142,23 @@ def validate_gold_quality() -> Dict[str, Any]:
                        warn_threshold=0.30, error_threshold=0.15),
         CHECK.coverage('gold.dim_player_attributes', column='foot_sofascore',
                        warn_threshold=0.30, error_threshold=0.15),
+        # Transfermarkt block — Bronze covers APL 2025/26 only, поэтому coverage
+        # в full FBref-spine (~5+ сезонов истории) низкая как у FotMob/SS.
+        # Бизнес-DoD >80% применим к APL 2025/26 cohort (verify-SQL отдельно).
+        CHECK.value_range('gold.dim_player_attributes', 'height_cm_tm',
+                          min_val=140, max_val=220, severity='WARNING'),
+        CHECK.coverage('gold.dim_player_attributes', column='height_cm_tm',
+                       warn_threshold=0.30, error_threshold=0.15),
+        CHECK.coverage('gold.dim_player_attributes', column='dob_tm',
+                       warn_threshold=0.30, error_threshold=0.15),
+        CHECK.coverage('gold.dim_player_attributes', column='foot_tm',
+                       warn_threshold=0.30, error_threshold=0.15),
+        CHECK.value_range('gold.dim_player_attributes',
+                          'current_market_value_eur_tm',
+                          min_val=0, max_val=300_000_000, severity='WARNING'),
+        CHECK.coverage('gold.dim_player_attributes',
+                       column='current_market_value_eur_tm',
+                       warn_threshold=0.30, error_threshold=0.15),
 
         # ============================================================
         # T5: fct_player_season_stats — cross-source per-season stats.

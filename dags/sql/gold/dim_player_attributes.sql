@@ -13,6 +13,10 @@
 --   - SofaScore-side: silver.sofascore_player_profile уже несёт canonical_id
 --     (заполняется при материализации Silver), JOIN напрямую без xref hop;
 --     MAX_BY(..., season) сворачивает до одного row per canonical_id.
+--   - Transfermarkt-side: тот же паттерн что SofaScore — canonical_id уже в
+--     silver.transfermarkt_players, JOIN напрямую без xref hop. TM — primary
+--     источник для height_cm (parsed с официального club profile) и
+--     current_market_value_eur (EUR, не USD-конверсия FotMob).
 --   - Attributes published per source с суффиксом источника. Никаких
 --     "правильных" значений — потребитель решает сам. contract_end /
 --     market_value — slowly-changing, snapshot "as-of-latest-ingest"
@@ -86,6 +90,29 @@ sofascore_latest AS (
     GROUP BY canonical_id
 ),
 
+-- TM-side: silver.transfermarkt_players уже содержит canonical_id (LEFT JOIN
+-- xref_player в Silver, source='transfermarkt' non-orphan). GROUP BY
+-- canonical_id + MAX_BY(season) сворачивает snapshot до одного row на
+-- канонического игрока (как для SofaScore — без xref hop в Gold).
+-- contract_until / current_market_value_eur / mv_last_update — slowly-changing,
+-- snapshot "as-of-latest-ingest"; full MV timeline → fct_player_market_value
+-- (issue #11).
+transfermarkt_latest AS (
+    SELECT
+        canonical_id,
+        MAX_BY(name,                     season) AS player_name,
+        MAX_BY(height_cm,                season) AS height_cm,
+        MAX_BY(dob,                      season) AS dob,
+        MAX_BY(foot,                     season) AS foot,
+        MAX_BY(nationality,              season) AS nationality,
+        MAX_BY(current_market_value_eur, season) AS current_market_value_eur,
+        MAX_BY(mv_last_update,           season) AS mv_last_update,
+        MAX_BY(contract_until,           season) AS contract_until
+    FROM iceberg.silver.transfermarkt_players
+    WHERE canonical_id IS NOT NULL
+    GROUP BY canonical_id
+),
+
 -- FBref-spine: один row per canonical_id. FBref не имеет 'orphan' confidence
 -- (по построению resolver'а — FBref игроки всегда 'exact'), но фильтр оставлен
 -- для symmetry на случай будущей логики.
@@ -119,7 +146,7 @@ xref_fotmob_latest AS (
 
 SELECT
     xf.canonical_id                                    AS player_id_canonical,
-    COALESCE(fb.player_name, fm.player_name, ss.player_name)
+    COALESCE(fb.player_name, fm.player_name, ss.player_name, tm.player_name)
                                                        AS player_name_canonical,
 
     -- Current club — единый источник FBref (spine 100% coverage,
@@ -152,6 +179,16 @@ SELECT
     fm.current_market_value_eur                        AS current_market_value_eur_fotmob,
     fm.market_value_currency                           AS market_value_currency_fotmob,
 
+    -- Transfermarkt block (snapshot, as-of-latest-ingest). Primary source
+    -- for height_cm (parsed from official club profile) и MV в EUR.
+    tm.height_cm                                       AS height_cm_tm,
+    tm.dob                                             AS dob_tm,
+    tm.foot                                            AS foot_tm,
+    tm.nationality                                     AS nationality_tm,
+    tm.current_market_value_eur                        AS current_market_value_eur_tm,
+    tm.mv_last_update                                  AS mv_last_update_tm,
+    tm.contract_until                                  AS contract_until_tm,
+
     CURRENT_TIMESTAMP                                  AS _gold_created_at
 
 FROM xref_fbref xf
@@ -163,3 +200,5 @@ LEFT JOIN fotmob_latest fm
     ON fm.player_id = xfm.fotmob_player_id
 LEFT JOIN sofascore_latest ss
     ON ss.canonical_id = xf.canonical_id
+LEFT JOIN transfermarkt_latest tm
+    ON tm.canonical_id = xf.canonical_id
