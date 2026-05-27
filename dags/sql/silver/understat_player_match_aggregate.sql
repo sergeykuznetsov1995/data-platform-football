@@ -10,7 +10,8 @@
 -- aggregation needed, only dedup + rename.
 --
 -- Sources:
---   bronze.understat_player_match_stats
+--   bronze.understat_player_match_stats — per-(match, player) aggregate
+--   bronze.understat_shots              — shot-grain, used to derive penalty info
 --
 -- Notes:
 --   * Understat exposes only forward + midfielder metrics (no defence/duels)
@@ -25,6 +26,13 @@
 --   * `yellow_card`/`red_card` (singular) → `yellow_cards`/`red_cards` plural
 --     for cross-source alignment.
 --   * Season convention: passthrough varchar slug (matches xref_player).
+--   * `non_penalty_xg` / `non_penalty_goals` (issue #103): soccerdata's
+--     `read_player_match_stats` does NOT extract `npxG` (only `read_player_
+--     season_stats` does), so Bronze has no native field. Compute via
+--     `bronze.understat_shots`: soccerdata `SHOT_SITUATIONS` dict omits the
+--     'Penalty' key → penalty shots arrive with `situation IS NULL`, all
+--     pinned at xg=0.7612. We filter `situation IS NULL AND xg > 0.7` to be
+--     resilient against future NULL-situation drift (other categories).
 -- =============================================================================
 
 WITH bronze_dedup AS (
@@ -41,40 +49,57 @@ WITH bronze_dedup AS (
           AND player_id IS NOT NULL
     )
     WHERE rn = 1
+),
+
+shot_penalty_aggr AS (
+    SELECT
+        game_id,
+        player_id,
+        SUM(xg)        AS penalty_xg,
+        COUNT(*) FILTER (WHERE result = 'Goal') AS penalty_goals
+    FROM iceberg.bronze.understat_shots
+    WHERE game_id   IS NOT NULL
+      AND player_id IS NOT NULL
+      AND situation IS NULL           -- soccerdata maps 'Penalty' → NULL
+      AND xg > 0.7                    -- penalty xG fixed at 0.7612 in Understat
+    GROUP BY 1, 2
 )
 
 SELECT
     -- ========= Identification =========
-    CAST(game_id AS varchar)               AS match_id,
-    CAST(player_id AS varchar)             AS player_id,
-    player,
-    CAST(team_id AS varchar)               AS team_id,
+    CAST(b.game_id AS varchar)             AS match_id,
+    CAST(b.player_id AS varchar)           AS player_id,
+    b.player,
+    CAST(b.team_id AS varchar)             AS team_id,
     CAST(NULL AS varchar)                  AS team_side,
-    position,
+    b.position,
 
     -- ========= HARD_FACT (FBref-aligned names) =========
-    CAST(minutes AS INTEGER)               AS minutes_played,
-    CAST(goals AS INTEGER)                 AS goals,
-    CAST(own_goals AS INTEGER)             AS own_goals,
-    CAST(shots AS INTEGER)                 AS shots,
-    CAST(yellow_cards AS INTEGER)          AS yellow_cards,
-    CAST(red_cards AS INTEGER)             AS red_cards,
-    CAST(assists AS INTEGER)               AS assists,
-    CAST(key_passes AS INTEGER)            AS key_passes,
+    CAST(b.minutes AS INTEGER)             AS minutes_played,
+    CAST(b.goals AS INTEGER)               AS goals,
+    CAST(b.own_goals AS INTEGER)           AS own_goals,
+    CAST(b.shots AS INTEGER)               AS shots,
+    CAST(b.yellow_cards AS INTEGER)        AS yellow_cards,
+    CAST(b.red_cards AS INTEGER)           AS red_cards,
+    CAST(b.assists AS INTEGER)             AS assists,
+    CAST(b.key_passes AS INTEGER)          AS key_passes,
 
     -- ========= MODELED (xG / xA / build-up) =========
-    xg                                     AS xg,
-    xa                                     AS xa,
-    CAST(NULL AS INTEGER)                  AS non_penalty_goals,
-    CAST(NULL AS DOUBLE)                   AS non_penalty_xg,
-    xg_chain,
-    xg_buildup,
+    b.xg                                                                   AS xg,
+    b.xa                                                                   AS xa,
+    CAST(b.goals AS INTEGER) - COALESCE(spa.penalty_goals, 0)              AS non_penalty_goals,
+    GREATEST(0.0, b.xg - COALESCE(spa.penalty_xg, 0.0))                    AS non_penalty_xg,
+    b.xg_chain,
+    b.xg_buildup,
 
     -- ========= Lineage =========
-    _ingested_at                           AS _bronze_ingested_at,
+    b._ingested_at                         AS _bronze_ingested_at,
 
     -- ========= Partition keys =========
-    league,
-    season
+    b.league,
+    b.season
 
-FROM bronze_dedup
+FROM bronze_dedup b
+LEFT JOIN shot_penalty_aggr spa
+       ON spa.game_id   = b.game_id
+      AND spa.player_id = b.player_id
