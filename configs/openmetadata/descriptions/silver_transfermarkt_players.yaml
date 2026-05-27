@@ -1,0 +1,63 @@
+# =============================================================================
+# OpenMetadata description: iceberg.silver.transfermarkt_players
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.silver.transfermarkt_players
+  description: |
+    Типизированный snapshot игроков из Transfermarkt с привязкой к canonical_id.
+    Один row per (player_id, league, season) — snapshot-grain совпадает с
+    Bronze. canonical_id LEFT JOIN через silver.xref_player
+    (source='transfermarkt', confidence<>'orphan'); orphan rate ≈10.2% APL
+    2025/26 — TM покрывает loan-out, U21, новые трансферы без FBref-strата.
+    Источник: bronze.transfermarkt_players (ingest weekly Mon 04:00 UTC).
+  tags:
+    - Tier.Silver
+    - Domain.Football
+    - PII.Low
+columns:
+  - name: player_id
+    description: Стабильный Transfermarkt player_id (numeric varchar).
+  - name: canonical_id
+    description: |
+      Канонический ID игрока из silver.xref_player. NULL для TM-only
+      игроков (~10% orphan rate).
+  - name: name
+    description: Полное имя игрока (PII.Low — публично известное лицо).
+    tags:
+      - PII.Low
+  - name: slug
+    description: URL-slug игрока на transfermarkt.com (e.g., "harry-kane").
+  - name: position
+    description: Позиция (Goalkeeper / Centre-Back / Striker / ...).
+  - name: dob
+    description: Дата рождения. PII.Low.
+    tags:
+      - PII.Low
+  - name: age
+    description: Возраст на момент snapshot.
+  - name: height_cm
+    description: Рост в сантиметрах (150..220, иначе DQ-WARNING).
+  - name: foot
+    description: Рабочая нога (left / right / both).
+  - name: nationality
+    description: Национальность по паспорту.
+  - name: contract_until
+    description: Дата окончания текущего контракта.
+  - name: current_market_value_eur
+    description: Актуальный рыночный value в евро (BIGINT).
+  - name: mv_last_update
+    description: Дата последнего обновления market_value на TM.
+  - name: current_club_id
+    description: TM ID текущего клуба.
+  - name: current_club_name
+    description: Название текущего клуба (как на TM, до alias-нормализации).
+  - name: _bronze_ingested_at
+    description: Timestamp ingest'а Bronze.
+  - name: league
+    description: Лига (partition key).
+  - name: season
+    description: Сезон short-form '2526' (partition key).
+relationships:
+  - from: canonical_id
+    to: trino_iceberg.iceberg.silver.xref_player.canonical_id
+    type: FOREIGN_KEY
