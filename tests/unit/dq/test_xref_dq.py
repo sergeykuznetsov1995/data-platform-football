@@ -360,13 +360,18 @@ def test_xref_player_confidence_enum_full():
 
 
 def test_xref_player_canonical_id_format_check():
-    """xref_player must enforce canonical_id ^(fb|us|ws|ss)_.+ regex."""
+    """xref_player must enforce canonical_id ^(fb|us|ws|fm|ss|tm|cap)_.+ regex.
+
+    Prefixes match :func:`xref_player_resolver._orphan_prefix`. Issue #104
+    added ``tm`` (Transfermarkt) and ``cap`` (Capology) after the resolver
+    side of issue #43 / #59 shipped without updating this DQ gate.
+    """
     checks = xref_dq.build_xref_player_checks()
     fmt_checks = [c for c in checks if 'canonical_id_format' in c.name]
     assert len(fmt_checks) == 1
     where = fmt_checks[0].params['where']
     assert "regexp_like" in where
-    assert "fb|us|ws|ss" in where
+    assert "fb|us|ws|fm|ss|tm|cap" in where
 
 
 def test_xref_player_no_duplicates_per_canonical_season_check():
@@ -435,7 +440,8 @@ def test_xref_player_review_source_enum_excludes_fbref():
     assert len(src_checks) == 1
     where = src_checks[0].params['where']
     assert "'fbref'" not in where, "fbref must not be in review-source allow-list"
-    for src in ['understat', 'whoscored', 'sofascore']:
+    for src in ['understat', 'whoscored', 'sofascore', 'fotmob',
+                'transfermarkt', 'capology']:
         assert f"'{src}'" in where
 
 
