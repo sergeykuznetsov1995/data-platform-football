@@ -22,31 +22,26 @@ class TestFotMobScraperUnit:
 
     @pytest.fixture
     def mock_scraper(self, scraper_class):
-        """Create scraper with mocked browser."""
-        with patch.object(scraper_class, '_get_browser'):
-            with patch.object(scraper_class, '_obtain_cookies'):
-                scraper = scraper_class(
-                    leagues=['ENG-Premier League'],
-                    seasons=[2024],
-                    headless=True,
-                )
-                scraper._cookies_obtained = True
-                scraper._session = MagicMock()
-                yield scraper
-                scraper.close()
+        """Create scraper with mocked HTTP session."""
+        scraper = scraper_class(
+            leagues=['ENG-Premier League'],
+            seasons=[2024],
+        )
+        scraper._session = MagicMock()
+        yield scraper
+        scraper.close()
 
     def test_init(self, scraper_class):
         """Test scraper initialization."""
-        with patch.object(scraper_class, '_get_browser'):
-            with patch.object(scraper_class, '_obtain_cookies'):
-                scraper = scraper_class(
-                    leagues=['ENG-Premier League'],
-                    seasons=[2024],
-                )
-                assert scraper.SOURCE_NAME == 'fotmob'
-                assert scraper.leagues == ['ENG-Premier League']
-                assert scraper.seasons == [2024]
-                scraper.close()
+        scraper = scraper_class(
+            leagues=['ENG-Premier League'],
+            seasons=[2024],
+        )
+        assert scraper.SOURCE_NAME == 'fotmob'
+        assert scraper.leagues == ['ENG-Premier League']
+        assert scraper.seasons == [2024]
+        assert scraper.API_BASE == 'https://www.fotmob.com/api/data'
+        scraper.close()
 
     def test_format_season(self, mock_scraper):
         """Test season formatting."""
@@ -74,24 +69,17 @@ class TestFotMobScraperUnit:
         assert result == {'data': 'test'}
         mock_scraper._session.get.assert_called()
 
-    def test_fetch_api_json_403_refresh_cookies(self, mock_scraper):
-        """Test cookie refresh on 403."""
-        mock_response_403 = MagicMock()
-        mock_response_403.status_code = 403
+    def test_fetch_api_json_404_returns_none(self, mock_scraper):
+        """404 (and any non-200) exhausts retries and returns None."""
+        mock_response_404 = MagicMock()
+        mock_response_404.status_code = 404
 
-        mock_response_ok = MagicMock()
-        mock_response_ok.status_code = 200
-        mock_response_ok.json.return_value = {'success': True}
+        mock_scraper._session.get.return_value = mock_response_404
 
-        # First call returns 403, second call succeeds
-        mock_scraper._session.get.side_effect = [mock_response_403, mock_response_ok]
+        result = mock_scraper._fetch_api_json('test-endpoint', retry_count=2)
 
-        with patch.object(mock_scraper, '_obtain_cookies') as mock_obtain:
-            result = mock_scraper._fetch_api_json('test-endpoint')
-
-            # Cookies should be refreshed
-            mock_obtain.assert_called_once()
-            assert result == {'success': True}
+        assert result is None
+        assert mock_scraper._session.get.call_count == 2
 
     def test_read_schedule_parses_data(self, mock_scraper):
         """Test schedule parsing from API response."""
