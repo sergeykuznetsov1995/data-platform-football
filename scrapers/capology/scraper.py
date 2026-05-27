@@ -28,6 +28,7 @@ Source: https://www.capology.com
 
 from __future__ import annotations
 
+import html
 import logging
 import re
 from datetime import datetime
@@ -134,13 +135,19 @@ _PLAYER_NAME_FROM_A_RE = re.compile(r">([^<>][^<>]*)</a>")
 
 
 def _extract_anchor_text(html_snippet: str) -> Optional[str]:
-    """``<a class='...'>...<img/>Erling Haaland</a>`` → ``Erling Haaland``."""
+    """``<a class='...'>...<img/>Erling Haaland</a>`` → ``Erling Haaland``.
+
+    HTML entities в Capology rendered names (``Jake O&#39;Brien``,
+    ``Bj&ouml;rn``) идут как `&#NN;` / `&name;` — без unescape резолвер
+    видит сырой `Jake O&#39;Brien` и token_sort vs FBref ``Jake O'Brien``
+    падает ниже 90 (issue #84, 4 orphans фиксились этой строкой).
+    """
     if not html_snippet:
         return None
     # The display text is whatever sits between the trailing img and </a>.
     # Fall back to last >...< chunk if there's no img.
     m = re.search(r'>([^<>]+)</a>', html_snippet)
-    return m.group(1).strip() if m else None
+    return html.unescape(m.group(1).strip()) if m else None
 
 
 def _parse_row_block(block: str) -> Optional[Dict]:
