@@ -566,6 +566,70 @@ def _build_whoscored_events_spadl_checks() -> List[Check]:
 
 
 # ---------------------------------------------------------------------------
+# Silver — whoscored_team_match / whoscored_team_season (T6.3, #92)
+# ---------------------------------------------------------------------------
+
+def _build_whoscored_team_match_checks() -> List[Check]:
+    """DQ for ``iceberg.silver.whoscored_team_match`` (T6.3 / #92).
+
+    Match-grain aggregate of ``silver.whoscored_events_spadl`` GROUP BY
+    (match_id, team_id, league, season). Feeds the WhoScored block of
+    Gold ``fct_team_match`` v2 (#95).
+
+    Volume floor: 380 APL matches × 2 teams = 760 rows/season; multi-season
+    backfill ~3K-5K. Min 600 (WARNING) covers partial-backfill scenarios.
+    """
+    table = 'iceberg.silver.whoscored_team_match'
+    return [
+        CHECK.no_duplicates(
+            table,
+            pk=['match_id', 'team_id', 'league', 'season'],
+        ),
+        CHECK.no_nulls(
+            table,
+            cols=['match_id', 'team_id', 'league', 'season'],
+        ),
+        CHECK.row_count(table, min_rows=600, severity='WARNING'),
+        CHECK.freshness(
+            table=table,
+            ts_col='_silver_created_at',
+            max_age_hours=48,
+            severity='WARNING',
+        ),
+    ]
+
+
+def _build_whoscored_team_season_checks() -> List[Check]:
+    """DQ for ``iceberg.silver.whoscored_team_season`` (T6.3 / #92).
+
+    Season-grain rollup из ``silver.whoscored_team_match`` GROUP BY
+    (team_id, league, season). Feeds the WhoScored block of Gold
+    ``fct_team_season_stats`` (#94).
+
+    Volume floor: 20 APL teams per season; multi-season backfill ≈ 140.
+    Min 20 (WARNING) is a single-season floor.
+    """
+    table = 'iceberg.silver.whoscored_team_season'
+    return [
+        CHECK.no_duplicates(
+            table,
+            pk=['team_id', 'league', 'season'],
+        ),
+        CHECK.no_nulls(
+            table,
+            cols=['team_id', 'league', 'season', 'matches_seen'],
+        ),
+        CHECK.row_count(table, min_rows=20, severity='WARNING'),
+        CHECK.freshness(
+            table=table,
+            ts_col='_silver_created_at',
+            max_age_hours=48,
+            severity='WARNING',
+        ),
+    ]
+
+
+# ---------------------------------------------------------------------------
 # Silver — espn_lineup
 # ---------------------------------------------------------------------------
 
@@ -907,16 +971,98 @@ def _build_sofascore_player_profile_checks() -> List[Check]:
     ]
 
 
+def _build_sofascore_team_match_checks() -> List[Check]:
+    """DQ for ``iceberg.silver.sofascore_team_match`` (T6.4 / issue #93).
+
+    Two rows per match (home + away) — PIVOT of ``bronze.sofascore_match_stats``
+    (period='ALL') + ``bronze.sofascore_schedule`` (outcome) + LEFT JOIN
+    ``silver.sofascore_player_match_aggregate`` (minutes/assists rollup).
+    APL 2025/26 baseline: 380 matches × 2 sides = 760 rows.
+
+    PK is ``(match_id, team_id)`` — native SofaScore IDs; Gold (#95) bridges
+    via ``silver.xref_team(source='sofascore')``.
+    """
+    table = 'iceberg.silver.sofascore_team_match'
+    return [
+        CHECK.no_duplicates(
+            table,
+            pk=['match_id', 'team_id'],
+            severity='ERROR',
+        ),
+        CHECK.no_nulls(
+            table,
+            cols=['match_id', 'team_id', 'opponent_id', 'league', 'season'],
+            severity='ERROR',
+        ),
+        # APL floor: 380 matches × 2 sides = 760 (allow slack for partial backfills).
+        CHECK.row_count(
+            table,
+            min_rows=700,
+            where="league = 'ENG-Premier League' AND season = '2526'",
+            severity='ERROR',
+        ),
+        # Core SofaScore metrics should be present for almost every match.
+        CHECK.no_nulls(
+            table,
+            cols=['expected_goals', 'total_passes', 'corner_kicks'],
+            severity='WARNING',
+        ),
+        CHECK.freshness(
+            table,
+            ts_col='_bronze_ingested_at',
+            max_age_hours=72,
+            severity='WARNING',
+        ),
+    ]
+
+
+def _build_sofascore_team_season_checks() -> List[Check]:
+    """DQ for ``iceberg.silver.sofascore_team_season`` (T6.4 / issue #93).
+
+    SUM/AVG rollup from ``silver.sofascore_team_match`` — 20 teams per APL season.
+    """
+    table = 'iceberg.silver.sofascore_team_season'
+    return [
+        CHECK.no_duplicates(
+            table,
+            pk=['team_id', 'league', 'season'],
+            severity='ERROR',
+        ),
+        CHECK.no_nulls(
+            table,
+            cols=['team_id', 'league', 'season'],
+            severity='ERROR',
+        ),
+        # Issue #93 acceptance: 20 APL clubs per season (allow ≥18 for early backfills).
+        CHECK.row_count(
+            table,
+            min_rows=18,
+            where="league = 'ENG-Premier League' AND season = '2526'",
+            severity='ERROR',
+        ),
+        CHECK.freshness(
+            table,
+            ts_col='_bronze_ingested_at',
+            max_age_hours=72,
+            severity='WARNING',
+        ),
+    ]
+
+
 def build_silver_e3_checks() -> List[Check]:
     """Return DQ checks for Silver E3 tables.
 
-    Composition: ``whoscored_events_spadl`` + ``espn_lineup`` +
-    ``sofascore_player_profile``.
+    Composition: ``whoscored_events_spadl`` + WhoScored team aggregates (T6.3) +
+    ``espn_lineup`` + ``sofascore_player_profile`` + SofaScore team aggregates (T6.4).
     """
     return (
         _build_whoscored_events_spadl_checks()
+        + _build_whoscored_team_match_checks()
+        + _build_whoscored_team_season_checks()
         + _build_espn_lineup_checks()
         + _build_sofascore_player_profile_checks()
+        + _build_sofascore_team_match_checks()
+        + _build_sofascore_team_season_checks()
     )
 
 
