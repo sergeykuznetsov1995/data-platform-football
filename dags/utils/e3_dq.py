@@ -1049,16 +1049,96 @@ def _build_sofascore_team_season_checks() -> List[Check]:
     ]
 
 
+def _build_understat_team_match_checks() -> List[Check]:
+    """DQ for ``iceberg.silver.understat_team_match`` (T6.2 / #91).
+
+    UNION ALL unpivot of ``bronze.understat_team_match_stats`` (wide-form),
+    joined to ``silver.xref_team`` (source='understat'). APL 2024/25:
+    380 matches × 2 sides = 760 rows. 2025/26 is intentionally looser
+    (promotee orphans, ≤5% — see MEMORY.md «silver.xref_team 78.5%»).
+    """
+    table = 'iceberg.silver.understat_team_match'
+    return [
+        CHECK.no_duplicates(
+            table,
+            pk=['match_id', 'team_id_canonical'],
+            severity='ERROR',
+        ),
+        CHECK.no_nulls(
+            table,
+            cols=['match_id', 'team_id_canonical', 'team_id', 'league', 'season'],
+            severity='ERROR',
+        ),
+        CHECK.no_nulls(
+            table,
+            cols=['xg', 'xg_against'],
+            severity='ERROR',
+        ),
+        CHECK.row_count(
+            table,
+            min_rows=760,
+            where="league = 'ENG-Premier League' AND season = '2425'",
+            severity='ERROR',
+        ),
+        CHECK.freshness(
+            table,
+            ts_col='_bronze_ingested_at',
+            max_age_hours=48,
+            severity='ERROR',
+        ),
+    ]
+
+
+def _build_understat_team_season_checks() -> List[Check]:
+    """DQ for ``iceberg.silver.understat_team_season`` (T6.2 / #91).
+
+    Rollup of ``silver.understat_team_match``; 20 APL clubs / season=2425.
+    """
+    table = 'iceberg.silver.understat_team_season'
+    return [
+        CHECK.no_duplicates(
+            table,
+            pk=['team_id_canonical', 'league', 'season'],
+            severity='ERROR',
+        ),
+        CHECK.no_nulls(
+            table,
+            cols=['team_id_canonical', 'league', 'season'],
+            severity='ERROR',
+        ),
+        CHECK.no_nulls(
+            table,
+            cols=['xg', 'xg_against'],
+            severity='ERROR',
+        ),
+        CHECK.row_count(
+            table,
+            min_rows=20,
+            where="league = 'ENG-Premier League' AND season = '2425'",
+            severity='ERROR',
+        ),
+        CHECK.freshness(
+            table,
+            ts_col='_bronze_ingested_at',
+            max_age_hours=48,
+            severity='ERROR',
+        ),
+    ]
+
+
 def build_silver_e3_checks() -> List[Check]:
     """Return DQ checks for Silver E3 tables.
 
     Composition: ``whoscored_events_spadl`` + WhoScored team aggregates (T6.3) +
+    Understat team aggregates (T6.2) +
     ``espn_lineup`` + ``sofascore_player_profile`` + SofaScore team aggregates (T6.4).
     """
     return (
         _build_whoscored_events_spadl_checks()
         + _build_whoscored_team_match_checks()
         + _build_whoscored_team_season_checks()
+        + _build_understat_team_match_checks()
+        + _build_understat_team_season_checks()
         + _build_espn_lineup_checks()
         + _build_sofascore_player_profile_checks()
         + _build_sofascore_team_match_checks()
