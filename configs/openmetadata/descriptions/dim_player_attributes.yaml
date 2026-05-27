@@ -9,7 +9,10 @@ table:
     без winning-value logic — потребитель выбирает источник. FBref-spine:
     WHERE source='fbref' AND confidence != 'orphan'. SofaScore-side читает
     silver.sofascore_player_profile (canonical_id уже подтянут в Silver).
-    НЕ заменяет gold.dim_player (per-season, FBref-only). См. docs/research/
+    Transfermarkt-side читает silver.transfermarkt_players (canonical_id
+    также подтянут в Silver) — primary источник для height_cm и
+    current_market_value_eur (EUR, не USD-конверсия). НЕ заменяет
+    gold.dim_player (per-season, FBref-only). См. docs/research/
     RX_cross_source_player_profile.md для полного rationale (D1-D4 решений).
   tags:
     - Tier.Gold
@@ -66,6 +69,22 @@ columns:
     description: Текущая рыночная стоимость EUR из FotMob market_values_json.timeline (latest точка).
   - name: market_value_currency_fotmob
     description: Валюта рыночной стоимости (обычно EUR).
+  - name: height_cm_tm
+    description: Рост в см из Transfermarkt (парсинг с официального профиля клуба, наиболее точный из источников).
+  - name: dob_tm
+    description: Полная дата рождения из Transfermarkt.
+    tags:
+      - PII.Low
+  - name: foot_tm
+    description: Ведущая нога из Transfermarkt (right/left/both).
+  - name: nationality_tm
+    description: Национальность из Transfermarkt (full country name, не ISO code).
+  - name: current_market_value_eur_tm
+    description: Текущая рыночная стоимость EUR из Transfermarkt (primary use-case; snapshot as-of-latest-ingest, full timeline в gold.fct_player_market_value — issue #11).
+  - name: mv_last_update_tm
+    description: Дата последнего обновления market value на Transfermarkt.
+  - name: contract_until_tm
+    description: Дата окончания контракта из Transfermarkt (slowly-changing, snapshot).
   - name: _gold_created_at
     description: Технический timestamp создания строки в Gold-слое.
 relationships:
