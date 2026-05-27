@@ -12,7 +12,7 @@
 #
 # Schema:
 #   aliases:
-#     - source: understat | whoscored | sofascore | fotmob | matchhistory
+#     - source: understat | whoscored | sofascore | fotmob | matchhistory | transfermarkt | capology
 #       source_id: "<the source's player_id, varchar>"
 #       fbref_player_id: "<FBref player_id, WITHOUT the 'fb_' prefix>"
 #       season: "<4-digit slug, e.g. '2425'>"  | "*"  (any season)
@@ -23,4 +23,12 @@
 #   * If no row matches the exact season, a row with season='*' is tried.
 #   * Returns the FBref player_id without 'fb_' prefix, or None.
 
-aliases: []
+aliases:
+  # Issue #84 — Capology "Jamie Bynoe-Gittens" (full legal surname) vs
+  # FBref "Jamie Gittens" (display-only short surname). Same player; token_set
+  # 81.25 < 95, surname-anchor fails (Bynoe-Gittens vs Gittens distinct tokens).
+  - source: capology
+    source_id: "jamie-bynoe-gittens-38207"
+    fbref_player_id: "10745192"
+    season: "*"
+    reason: "Bynoe-Gittens (Capology) ↔ Gittens (FBref) surname extension"

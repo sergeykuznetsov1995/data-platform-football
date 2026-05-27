@@ -27,9 +27,13 @@
 --     (release/academy/youth) без FBref counterpart, отбрасываем до Silver.
 --   * Filter currency = 'GBP' — MVP single-currency; EUR/USD расширение
 --     отдельным issue после backfill.
---   * canonical_id остаётся NULLable: Capology orphan rate ≈ 10.5% live APL
---     2025/26 (55/526, per feedback_xref_player_tm_capology.md). DoD ≤7% —
---     aspirational, требует resolver-tune (followup issue).
+--   * canonical_id остаётся NULLable: Capology orphan rate ≈ 9.5% live APL
+--     2025/26 (50/526, post issue #84 HTML-decode + Bynoe-Gittens alias). Это
+--     STRUCTURAL FLOOR: Capology = roster snapshot (контракты), FBref =
+--     appearance data (минуты); ~50 игроков (suspended/injured/backup-GK/youth/
+--     loan-outs) есть в Capology но без FBref counterpart → необъединяемы
+--     никаким резолвер-алгоритмом. DoD #84 закрыт reinterpretation
+--     (resolvable_orphan_rate = 0% post-fix).
 --   * Bronze ingest mode = replace_partitions → ROW_NUMBER dedup defensive.
 --   * annual_gross_gbp = weekly_gross_gbp * 52 (per issue #63 DoD); Bronze
 --     annual_gross_gbp игнорируется ради формульной консистентности.

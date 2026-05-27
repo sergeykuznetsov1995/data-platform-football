@@ -41,6 +41,12 @@ class TestExtractAnchorText:
         ("<a href='x'>Plain Name</a>", "Plain Name"),
         ("", None),
         (None, None),
+        # Issue #84: HTML entities в rendered names. Без unescape Capology
+        # отдаёт `Jake O&#39;Brien` и резолвер не находит FBref counterpart
+        # (token_sort score падает на запятой/апострофе ниже 90).
+        ("<a href='/p/jake-o-brien/'><img/>Jake O&#39;Brien</a>", "Jake O'Brien"),
+        ("<a href='/p/matt-o-riley/'><img/>Matt O&#39;Riley</a>", "Matt O'Riley"),
+        ("<a href='/p/x/'>Bj&ouml;rn Engels</a>", "Björn Engels"),
     ])
     def test_extract(self, snippet, expected):
         assert _extract_anchor_text(snippet) == expected
