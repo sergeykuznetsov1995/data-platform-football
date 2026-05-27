@@ -212,6 +212,26 @@ SILVER_E3_TRANSFORMS = [
         'dags/sql/silver/sofascore_player_profile.sql',
         'sofascore_player_profile',
     ),
+    (
+        # T6.4 (#93): per-(match_id, team_id) SofaScore team match-aggregate.
+        # PIVOT bronze.sofascore_match_stats (long-form, period='ALL') +
+        # JOIN bronze.sofascore_schedule (goals_for/against) +
+        # LEFT JOIN silver.sofascore_player_match_aggregate (minutes/assists).
+        # Feeds SofaScore block of gold.fct_team_match v2 (#95).
+        # MUST run after sofascore_player_match_aggregate. MUST run BEFORE
+        # sofascore_team_season (which rolls up from this table).
+        'sofascore_team_match',
+        'dags/sql/silver/sofascore_team_match.sql',
+        'sofascore_team_match',
+    ),
+    (
+        # T6.4 (#93): per-(team_id, league, season) SofaScore team
+        # season-aggregate. SUM/AVG rollup из silver.sofascore_team_match.
+        # Feeds SofaScore block of gold.fct_team_season_stats (#94).
+        'sofascore_team_season',
+        'dags/sql/silver/sofascore_team_season.sql',
+        'sofascore_team_season',
+    ),
 ]
 
 GOLD_E3_TRANSFORMS = [
