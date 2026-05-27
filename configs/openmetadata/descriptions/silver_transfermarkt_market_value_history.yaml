@@ -1,0 +1,43 @@
+# =============================================================================
+# OpenMetadata description: iceberg.silver.transfermarkt_market_value_history
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.silver.transfermarkt_market_value_history
+  description: |
+    Time-series рыночной стоимости игроков. Один row per (player_id,
+    mv_date, league, season) — точка timeline = snapshot MV на конкретную
+    дату с club_name/age. Открывает путь к Gold fct_player_market_value
+    (issue #11). canonical_id NULLable: TM orphan rate ≈10% APL 2025/26.
+    mv_date может уходить глубоко в прошлое (timeline за всю карьеру),
+    при этом partition season = current ingest season.
+    Источник: bronze.transfermarkt_market_value_history (ceapi JSON через
+    weekly TM ingest).
+  tags:
+    - Tier.Silver
+    - Domain.Football
+    - PII.Low
+columns:
+  - name: player_id
+    description: Transfermarkt player_id.
+  - name: canonical_id
+    description: |
+      Канонический ID игрока из silver.xref_player. NULL для TM-only
+      игроков.
+  - name: mv_date
+    description: Дата фиксации market_value (исторический snapshot).
+  - name: value_eur
+    description: Рыночный value в евро на дату mv_date (BIGINT).
+  - name: club_name
+    description: Клуб игрока на момент mv_date (snapshot).
+  - name: age
+    description: Возраст игрока на дату mv_date.
+  - name: _bronze_ingested_at
+    description: Timestamp ingest'а Bronze.
+  - name: league
+    description: Лига (partition key, текущая лига ingest'а).
+  - name: season
+    description: Сезон short-form '2526' (partition key, current ingest window).
+relationships:
+  - from: canonical_id
+    to: trino_iceberg.iceberg.silver.xref_player.canonical_id
+    type: FOREIGN_KEY

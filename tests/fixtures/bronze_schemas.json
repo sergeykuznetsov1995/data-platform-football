@@ -1,9 +1,41 @@
 {
-  "snapshot_at": "2026-05-26T13:06:01+00:00",
+  "snapshot_at": "2026-05-27T06:36:43+00:00",
   "missing_tables": [
     "fbref_shot_events"
   ],
   "tables": {
+    "bronze.capology_player_salaries": {
+      "columns": {
+        "_batch_id": "varchar",
+        "_entity_type": "varchar",
+        "_ingested_at": "timestamp(6)",
+        "_source": "varchar",
+        "active": "boolean",
+        "adjusted_total_gross_gbp": "bigint",
+        "adjusted_total_net_gbp": "bigint",
+        "age": "bigint",
+        "annual_gross_gbp": "bigint",
+        "annual_net_gbp": "bigint",
+        "bonus_gross_gbp": "double",
+        "bonus_net_gbp": "double",
+        "club_name": "varchar",
+        "club_slug": "varchar",
+        "country_code": "varchar",
+        "currency": "varchar",
+        "league": "varchar",
+        "loan": "boolean",
+        "player_name": "varchar",
+        "player_slug": "varchar",
+        "position": "varchar",
+        "season": "varchar",
+        "status": "varchar",
+        "total_gross_gbp": "bigint",
+        "total_net_gbp": "bigint",
+        "verified": "boolean",
+        "weekly_gross_gbp": "bigint",
+        "weekly_net_gbp": "bigint"
+      }
+    },
     "bronze.clubelo_ratings": {
       "columns": {
         "_batch_id": "varchar",

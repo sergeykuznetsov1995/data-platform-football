@@ -209,12 +209,27 @@ with DAG(
     absent (R0.2B partial-backfill scenarios) so the rest of the chain
     keeps moving.
 
+    ### Transfermarkt + Capology Silver (issue #64)
+
+    After E4, the master pipeline kicks off `dag_transform_transfermarkt_silver`
+    and `dag_transform_capology_silver` in parallel. Both are trigger-only
+    (`schedule=None`) and re-materialise Silver tables from already-fetched
+    Bronze rows — they do NOT re-scrape upstream. Bronze ingest runs on its
+    own weekly Monday cron (`dag_ingest_transfermarkt` 04:00 UTC,
+    `dag_ingest_capology` 05:00 UTC); the daily Silver refresh here picks up
+    fresh `silver.xref_player` rows from E1 so canonical_id coverage stays
+    aligned even when xref grows mid-week. Same `failed_states=[]` /
+    `trigger_rule='all_done'` policy as E1-E4 to keep the daily summary
+    resilient.
+
     ### Notes
 
     - Each DAG is triggered with `wait_for_completion=True`
     - Pipeline continues even if some DAGs fail
     - Final report summarizes all DAG statuses
     - SoFIFA runs weekly (Sunday) and is not included here
+    - Transfermarkt/Capology Bronze run weekly (Monday); master only re-
+      materialises their Silver tables daily (idempotent CTAS, no re-scrape)
     """,
 ) as dag:
 
@@ -319,6 +334,42 @@ with DAG(
         trigger_rule='all_done',  # Run even if E3 step degraded
     )
 
+    # =========================================================================
+    # Transfermarkt + Capology Silver (issue #64)
+    # =========================================================================
+    # Bronze ingest runs weekly (Mon 04:00/05:00 UTC); the master pipeline
+    # only re-materialises Silver tables daily. CTAS is idempotent (DROP +
+    # CREATE) and reads from `iceberg.bronze.*` + fresh `silver.xref_player`
+    # from E1, so canonical_id coverage stays aligned even on days when
+    # Bronze did not refresh.
+    #
+    # Triggered in parallel after E4 (TM/Capology Silver does not depend on
+    # gold.fct_* outputs from E3/E4) but kept downstream of E1 because both
+    # DAGs LEFT JOIN `silver.xref_player` for canonical_id.
+    trigger_silver_transfermarkt = TriggerDagRunOperator(
+        task_id='trigger_silver_transfermarkt',
+        trigger_dag_id='dag_transform_transfermarkt_silver',
+        wait_for_completion=True,
+        poke_interval=30,
+        allowed_states=['success', 'failed'],
+        failed_states=[],
+        reset_dag_run=True,
+        execution_date='{{ ds }}',
+        trigger_rule='all_done',
+    )
+
+    trigger_silver_capology = TriggerDagRunOperator(
+        task_id='trigger_silver_capology',
+        trigger_dag_id='dag_transform_capology_silver',
+        wait_for_completion=True,
+        poke_interval=30,
+        allowed_states=['success', 'failed'],
+        failed_states=[],
+        reset_dag_run=True,
+        execution_date='{{ ds }}',
+        trigger_rule='all_done',
+    )
+
     # Check overall pipeline success
     check_success_task = PythonOperator(
         task_id='check_pipeline_success',
@@ -335,4 +386,6 @@ with DAG(
     )
 
     # Dependencies
-    triggers_group >> trigger_xref_task >> trigger_e3_transforms >> trigger_e4_transforms >> check_success_task >> generate_report_task
+    triggers_group >> trigger_xref_task >> trigger_e3_transforms >> trigger_e4_transforms
+    trigger_e4_transforms >> [trigger_silver_transfermarkt, trigger_silver_capology]
+    [trigger_silver_transfermarkt, trigger_silver_capology] >> check_success_task >> generate_report_task

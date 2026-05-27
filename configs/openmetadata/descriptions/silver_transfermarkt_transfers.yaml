@@ -1,0 +1,53 @@
+# =============================================================================
+# OpenMetadata description: iceberg.silver.transfermarkt_transfers
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.silver.transfermarkt_transfers
+  description: |
+    Event-grain трансферов игроков. Один row per (player_id, transfer_date,
+    from_club_id, to_club_id). Player резолвится через silver.xref_player;
+    клубы (from/to) — через inline-rendered team_aliases.yaml (тот же
+    placeholder, что в xref_team.sql.j2). Не-APL клубы (PSG, Real Madrid)
+    могут давать NULL на team-резолве — WARNING-only по DoD.
+    Источник: bronze.transfermarkt_transfers (ceapi transferHistory JSON).
+  tags:
+    - Tier.Silver
+    - Domain.Football
+    - PII.Low
+columns:
+  - name: canonical_id
+    description: |
+      Канонический ID игрока из silver.xref_player. NULL для TM-only игроков
+      (≈10% orphan rate).
+  - name: player_id
+    description: Transfermarkt player_id.
+  - name: transfer_date
+    description: Дата трансфера.
+  - name: from_club_id_canonical
+    description: |
+      Canonical slug клуба-отдающего (через alias-map). NULL если клуб не
+      покрыт team_aliases.yaml (non-APL).
+  - name: to_club_id_canonical
+    description: |
+      Canonical slug клуба-принимающего. NULL если клуб не в team_aliases
+      (non-APL).
+  - name: from_club_name
+    description: Raw name отдающего клуба (как на TM).
+  - name: to_club_name
+    description: Raw name принимающего клуба.
+  - name: fee_eur
+    description: Сумма трансфера в евро (BIGINT, NULL для free/loan).
+  - name: market_value_eur
+    description: Market value игрока на момент трансфера (BIGINT).
+  - name: is_upcoming
+    description: True если трансфер ещё не завершён (announced/agreed).
+  - name: _bronze_ingested_at
+    description: Timestamp ingest'а Bronze.
+  - name: league
+    description: Лига (partition key, scope текущего ingest'а).
+  - name: season
+    description: Сезон short-form '2526' (partition key, current ingest window).
+relationships:
+  - from: canonical_id
+    to: trino_iceberg.iceberg.silver.xref_player.canonical_id
+    type: FOREIGN_KEY
