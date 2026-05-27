@@ -288,21 +288,24 @@ def build_xref_player_checks() -> List[Check]:
             severity='ERROR',
         ),
 
-        # source enum — 5 sources (T6 added SofaScore + restored FotMob).
+        # source enum — 7 sources (issue #43 added Transfermarkt + Capology
+        # on top of FBref / Understat / WhoScored / FotMob / SofaScore).
         check_enum_compliance(
             table, 'source',
-            allowed=['fbref', 'understat', 'whoscored', 'fotmob', 'sofascore'],
+            allowed=['fbref', 'understat', 'whoscored', 'fotmob', 'sofascore',
+                     'transfermarkt', 'capology'],
             severity='ERROR',
         ),
 
-        # canonical_id format guard — must start with one of the 5 known
-        # prefixes (fb_/us_/ws_/fm_/ss_). Regex via Trino regexp_like.
-        # We express this as a row_count of offending rows.
+        # canonical_id format guard — must start with one of the 7 known
+        # prefixes (fb_/us_/ws_/fm_/ss_/tm_/cap_); see
+        # xref_player_resolver._orphan_prefix. Regex via Trino regexp_like;
+        # we express this as a row_count of offending rows.
         CHECK.row_count(
             table=table,
             min_rows=0,
             max_rows=0,
-            where="NOT regexp_like(canonical_id, '^(fb|us|ws|fm|ss)_.+$')",
+            where="NOT regexp_like(canonical_id, '^(fb|us|ws|fm|ss|tm|cap)_.+$')",
             severity='ERROR',
             name='canonical_id_format[xref_player]',
         ),
@@ -353,7 +356,8 @@ def build_xref_player_review_checks() -> List[Check]:
       * enum compliance on ``rule`` — must match the rule labels emitted
         by the cascade (``surname_collision``, ``token_set_band``,
         ``nickname_collision``).
-      * enum compliance on ``source`` — three v2-supported sources.
+      * enum compliance on ``source`` — six cascaded sources (everything
+        except the FBref spine, which never lands in clerical review).
     """
     table = 'iceberg.silver.xref_player_review'
     return [
@@ -379,7 +383,8 @@ def build_xref_player_review_checks() -> List[Check]:
 
         check_enum_compliance(
             table, 'source',
-            allowed=['understat', 'whoscored', 'fotmob', 'sofascore'],
+            allowed=['understat', 'whoscored', 'fotmob', 'sofascore',
+                     'transfermarkt', 'capology'],
             severity='ERROR',
         ),
     ]
