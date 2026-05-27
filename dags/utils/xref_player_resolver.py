@@ -888,21 +888,23 @@ def _fetch_fotmob_players(
     (e.g. 2025 for 2025/26) — convert to slug ('2526') before emission so
     the spine index keys agree with Understat/WhoScored.
     """
-    # Minutes-played proxy from bronze.fotmob_player_stats (long format with
-    # stat_name='mins_played'). Used as dedup tiebreaker in
-    # _dedup_canonical_per_season (issue #70). NULL fallback to 0.0.
+    # Minutes-played proxy from bronze.fotmob_player_stats (native
+    # `minutes_played` column; long-format `stat_name='mins_played'` retired
+    # together with `player_id` → `participant_id` rename, issue #88).
+    # Used as dedup tiebreaker in _dedup_canonical_per_season (issue #70).
+    # NULL fallback to 0.0. CAST to VARCHAR mirrors silver
+    # fotmob_player_season_profile.sql so JOIN keys agree with player_details.
     sql = f"""
         WITH mins AS (
             SELECT
-                player_id,
+                CAST(participant_id AS VARCHAR) AS player_id,
                 league,
                 season,
-                MAX(CASE WHEN stat_name = 'mins_played'
-                         THEN TRY_CAST(stat_value AS DOUBLE) END) AS minutes_played
+                MAX(minutes_played) AS minutes_played
             FROM iceberg.bronze.fotmob_player_stats
             WHERE league = '{_sql_escape(league)}'
               AND season IN ({_seasons_in_clause(fbref_seasons)})
-            GROUP BY player_id, league, season
+            GROUP BY participant_id, league, season
         )
         SELECT d.player_id,
                d.name,
