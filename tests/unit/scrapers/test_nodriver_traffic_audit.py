@@ -5,9 +5,12 @@ Covers:
 - Counter initialisation in __init__.
 - get_real_traffic_stats() shape (per-resource-type / CF / restart).
 - restart_browser(reason=...) / close_sync(reason=...) increment.
+- Resource-type detection via CDP requestWillBeSent/responseReceived/
+  loadingFinished events (issue #116 fix).
 """
 
 import asyncio
+from types import SimpleNamespace
 
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -137,3 +140,102 @@ class TestRestartReasonPropagation:
         bypass.close_sync(reason='page_limit')
 
         assert dict(bypass._restart_reasons) == {'page_limit': 1}
+
+
+class _FakeType:
+    """Mimics nodriver ResourceType enum — only `.name` is read by handlers."""
+
+    def __init__(self, name):
+        self.name = name
+
+
+def _evt(**kw):
+    """Build a duck-typed CDP event (handlers use getattr exclusively)."""
+    return SimpleNamespace(**kw)
+
+
+def _setup_handlers():
+    """Drive _enable_network_tracking() against a mocked Page and return
+    the three captured callbacks keyed by CDP event class name."""
+    from scrapers.base.browser.nodriver_bypass import NodriverBypass
+
+    bypass = NodriverBypass()
+    bypass._page = MagicMock()
+    bypass._page.send = AsyncMock()
+
+    captured: dict = {}
+
+    def fake_add_handler(event_cls, fn):
+        captured[event_cls.__name__] = fn
+
+    bypass._page.add_handler = fake_add_handler
+
+    asyncio.run(bypass._enable_network_tracking())
+    return bypass, captured
+
+
+class TestResourceTypeDetection:
+    """Issue #116: _real_bytes_by_resource_type must break down traffic
+    by Document/Script/XHR/... instead of dumping everything into 'Other'."""
+
+    @pytest.mark.unit
+    def test_request_will_be_sent_fills_cache_before_loading_finished(self):
+        bypass, h = _setup_handlers()
+
+        h['RequestWillBeSent'](_evt(request_id='R1', type_=_FakeType('Document')))
+        h['LoadingFinished'](_evt(request_id='R1', encoded_data_length=1000))
+
+        assert dict(bypass._real_bytes_by_resource_type) == {'Document': 1000}
+        assert dict(bypass._real_requests_by_resource_type) == {'Document': 1}
+        assert bypass._resource_type_cache_misses == 0
+
+    @pytest.mark.unit
+    def test_loading_finished_without_request_misses_to_other(self):
+        bypass, h = _setup_handlers()
+
+        h['LoadingFinished'](_evt(request_id='R2', encoded_data_length=500))
+
+        assert dict(bypass._real_bytes_by_resource_type) == {'Other': 500}
+        assert bypass._resource_type_cache_misses == 1
+
+    @pytest.mark.unit
+    def test_response_received_overrides_request_will_be_sent(self):
+        # Redirect chains: requestWillBeSent reports Document, but the final
+        # response carries XHR. Last writer must win.
+        bypass, h = _setup_handlers()
+
+        h['RequestWillBeSent'](_evt(request_id='R3', type_=_FakeType('Document')))
+        h['ResponseReceived'](_evt(request_id='R3', type_=_FakeType('XHR')))
+        h['LoadingFinished'](_evt(request_id='R3', encoded_data_length=200))
+
+        assert dict(bypass._real_bytes_by_resource_type) == {'XHR': 200}
+        assert bypass._resource_type_cache_misses == 0
+
+    @pytest.mark.unit
+    def test_enum_normalisation_strips_dotted_path(self):
+        # Cover both shapes nodriver may emit: enum-with-.name and bare
+        # 'ResourceType.X' string.
+        bypass, h = _setup_handlers()
+
+        h['RequestWillBeSent'](_evt(request_id='R4', type_=_FakeType('Script')))
+        h['LoadingFinished'](_evt(request_id='R4', encoded_data_length=10))
+
+        h['RequestWillBeSent'](_evt(request_id='R5', type_='ResourceType.Stylesheet'))
+        h['LoadingFinished'](_evt(request_id='R5', encoded_data_length=20))
+
+        assert dict(bypass._real_bytes_by_resource_type) == {
+            'Script': 10,
+            'Stylesheet': 20,
+        }
+
+    @pytest.mark.unit
+    def test_cache_miss_counter_published_in_stats(self):
+        bypass, h = _setup_handlers()
+
+        h['RequestWillBeSent'](_evt(request_id='R6', type_=_FakeType('Document')))
+        h['LoadingFinished'](_evt(request_id='R6', encoded_data_length=100))
+        h['LoadingFinished'](_evt(request_id='R7', encoded_data_length=50))  # miss
+
+        stats = bypass.get_real_traffic_stats()
+        assert stats['resource_type_cache_misses'] == 1
+        assert stats['real_bytes_by_resource_type'] == {'Document': 100, 'Other': 50}

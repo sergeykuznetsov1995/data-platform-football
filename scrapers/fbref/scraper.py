@@ -162,6 +162,9 @@ class FBrefScraper(
         self._cf_challenges_passed_base: int = 0
         self._cf_challenges_failed_base: int = 0
         self._restart_reasons_base: _Counter = _Counter()
+        # Issue #116: cumulative count of loadingFinished events that found
+        # no cached resource_type (diagnostic for CDP cache hit-rate).
+        self._resource_type_cache_misses_base: int = 0
 
         # Consecutive fetch failure tracking for automatic proxy rotation
         # 3→15: higher MAX_SLOW_PROXY_RETRIES already handles dead proxies per URL;

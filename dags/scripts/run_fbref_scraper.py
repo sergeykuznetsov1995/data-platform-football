@@ -104,6 +104,12 @@ def _get_traffic_diagnostics(scraper) -> dict:
         'cf_challenges_passed': int(stats.get('cf_challenges_passed', 0) or 0),
         'cf_challenges_failed': int(stats.get('cf_challenges_failed', 0) or 0),
         'restart_reasons': dict(stats.get('restart_reasons', {}) or {}),
+        # Issue #116 — diagnostic: count of loadingFinished events with no
+        # cached resource_type (should stay near 0 with the requestWillBeSent
+        # subscription in place).
+        'resource_type_cache_misses': int(
+            stats.get('resource_type_cache_misses', 0) or 0
+        ),
     }
 
 
@@ -147,6 +153,7 @@ def _write_traffic_summary(
         'cf_challenges_passed': traffic.get('cf_challenges_passed', 0),
         'cf_challenges_failed': traffic.get('cf_challenges_failed', 0),
         'restart_reasons': traffic.get('restart_reasons', {}),
+        'resource_type_cache_misses': traffic.get('resource_type_cache_misses', 0),
         'html_mb_downloaded': traffic.get('mb_downloaded', 0.0),
         'pages_downloaded': traffic.get('pages_downloaded', 0),
         'overhead_ratio': traffic.get('overhead_ratio'),
