@@ -73,7 +73,13 @@ def _validate_table(table_name: str, threshold_key: str) -> Dict[str, Any]:
     import logging
 
     logger = logging.getLogger(__name__)
-    threshold = MIN_ROW_THRESHOLDS.get(threshold_key, 0)
+    try:
+        threshold = MIN_ROW_THRESHOLDS[threshold_key]
+    except KeyError as e:
+        raise AirflowException(
+            f"MIN_ROW_THRESHOLDS missing key '{threshold_key}' — refusing silent-pass. "
+            f"Add a threshold in dags/utils/config.py before re-running."
+        ) from e
 
     try:
         rows = _bronze_count(table_name)
