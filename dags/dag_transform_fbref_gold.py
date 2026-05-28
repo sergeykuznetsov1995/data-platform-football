@@ -53,6 +53,8 @@ Gold Tables
 - ``gold.fct_team_match``     — long-form team metrics per match
 - ``gold.fct_player_match``   — player metrics per match
 - ``gold.fct_player_unavailable`` — confirmed absences (E5; from WhoScored)
+- ``gold.fct_player_market_value`` — FotMob market_value timeline per player×date
+                                     (issue #11; bridge via silver.xref_player)
 - ``gold.match_outcomes``     — labels-only target table (1X2/BTTS/totals) for backtesting
 - ``gold.fct_match``          — wide form with pre-match features (ready for ML)
 - ``gold.feat_team_form``     — rolling team form (last 5, point-in-time safe)
@@ -145,6 +147,11 @@ STAGE_3_FACTS = [
     # E5: must run before Stage 4 — feat_team_form joins it for unavailable_count_l5.
     ('fct_player_unavailable', 'dags/sql/gold/fct_player_unavailable.sql',
      'fct_player_unavailable', ['league', 'season']),
+    # issue #11: FotMob market_value timeline (per-player, per-date).
+    # Источник — silver.fotmob_player_market_value_history (Bronze UNNEST).
+    # Bridge FotMob→canonical через silver.xref_player(source='fotmob').
+    ('fct_player_market_value', 'dags/sql/gold/fct_player_market_value.sql',
+     'fct_player_market_value', ['league', 'season']),
     # Labels-only target table — kept separate from `fct_match` so backtesting
     # can join targets to features without leakage.
     ('match_outcomes',   'dags/sql/gold/match_outcomes.sql',   'match_outcomes',   ['league', 'season']),
@@ -156,6 +163,12 @@ STAGE_3_FALLBACKS = {
     'fct_player_unavailable': {
         'fallback_sql_file': 'dags/sql/gold/fct_player_unavailable_empty.sql',
         'require_silver':    ['whoscored_player_unavailable'],
+    },
+    # issue #11: market_value Silver source может отсутствовать в MVP env
+    # без FotMob ingest. Fallback держит контракт пустой таблицы.
+    'fct_player_market_value': {
+        'fallback_sql_file': 'dags/sql/gold/fct_player_market_value_empty.sql',
+        'require_silver':    ['fotmob_player_market_value_history'],
     },
 }
 

@@ -1161,6 +1161,36 @@ def validate_gold_quality() -> Dict[str, Any]:
                        warn_threshold=0.30, error_threshold=0.15),
 
         # ============================================================
+        # issue #11: fct_player_market_value — FotMob MV timeline per
+        # (player_id_canonical, value_date, league, season). Cross-season
+        # дубликаты исторических точек ожидаемы (FotMob отдаёт history в
+        # каждом ingest-snapshot) — PK включает (league, season).
+        # ============================================================
+        CHECK.no_duplicates('gold.fct_player_market_value',
+                            pk=['player_id_canonical', 'value_date',
+                                'league', 'season']),
+        CHECK.no_nulls('gold.fct_player_market_value',
+                       cols=['player_id_canonical', 'value_date',
+                             'market_value_eur', 'league', 'season']),
+        CHECK.ref_integrity(
+            'gold.fct_player_market_value',
+            'gold.dim_player_attributes',
+            'player_id_canonical',
+            parent_key='player_id_canonical',
+        ),
+        CHECK.value_range('gold.fct_player_market_value', 'market_value_eur',
+                          min_val=0, max_val=500_000_000, severity='ERROR'),
+        # Coverage `current_market_value_eur_fotmob` в dim_player_attributes:
+        # бизнес-DoD issue #11 ≥50% применим к APL 2025/26 cohort, но dim
+        # содержит full FBref-spine (~28K canonical_id × все сезоны истории),
+        # а FotMob Bronze покрывает только current APL — measured baseline
+        # ~1.6%. Threshold выставлен под реальную форму spine; WARNING-only,
+        # detects полный регресс FotMob ingest.
+        CHECK.coverage('gold.dim_player_attributes',
+                       column='current_market_value_eur_fotmob',
+                       warn_threshold=0.05, error_threshold=0.01),
+
+        # ============================================================
         # T5: fct_player_season_stats — cross-source per-season stats.
         # FBref-spine + FotMob bridge через silver.xref_player. Outfield
         # only (вратари в fct_keeper_season_stats). Business-витрина:
@@ -1635,6 +1665,9 @@ def validate_gold_row_counts() -> Dict[str, Any]:
         # gaps. Keeper baseline ≈204; floor 50.
         CHECK.row_count('gold.fct_player_season_stats', min_rows=400),
         CHECK.row_count('gold.fct_keeper_season_stats', min_rows=50),
+        # issue #11: FotMob market_value timeline — ~500 игроков × несколько
+        # точек, APL 2025/26 floor ≥1000.
+        CHECK.row_count('gold.fct_player_market_value', min_rows=1000),
         # T5 audit: subset main fct (INNER JOIN на оба источника). FotMob
         # покрывает только 2025/26 → audit-row только для пересечения.
         # Outfield baseline ≈270 rows (2025/26 only); floor 100.

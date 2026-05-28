@@ -59,15 +59,26 @@ SILVER_TRANSFORMS = [
         'dags/sql/silver/fotmob_keeper_profile.sql',
         'fotmob_keeper_profile',
     ),
+    # issue #11: timeline market_value из bronze.fotmob_player_details
+    # .market_values_json (UNNEST). Питает gold.fct_player_market_value.
+    (
+        'player_market_value_history',
+        'dags/sql/silver/fotmob_player_market_value_history.sql',
+        'fotmob_player_market_value_history',
+    ),
 ]
 
 # FotMob Bronze coverage: только сезон 2025 (572 player в details, ~10K rows
 # в stats long-table). Без тренеров (-20) outfield+keeper = 552 row;
 # outfield = ~487 row, GK = ~65 row.
+#
+# market_value_history: ~500 игроков × несколько точек FotMob timeline (полная
+# история каждого player); APL 2025/26 floor ≥1000.
 SILVER_MIN_ROWS = {
     'fotmob_player_season_profile': 450,
     'fotmob_player_profile': 500,
     'fotmob_keeper_profile': 40,
+    'fotmob_player_market_value_history': 1000,
 }
 
 
@@ -244,6 +255,36 @@ def _validate_silver_quality(**context) -> Dict[str, Any]:
             'fotmob_rating',
             min_val=0,
             max_val=10,
+            severity='WARNING',
+        ),
+
+        # --- player_market_value_history (timeline MV из market_values_json) ---
+        # issue #11: один row per (player_id, value_date, league, season).
+        # ERROR: no-NULL на PK, no-duplicates на PK, row_count floor.
+        # WARNING: value_range plausibility, freshness.
+        CHECK.no_nulls(
+            'silver.fotmob_player_market_value_history',
+            cols=['player_id', 'value_date', 'league', 'season'],
+        ),
+        CHECK.no_duplicates(
+            'silver.fotmob_player_market_value_history',
+            pk=['player_id', 'value_date', 'league', 'season'],
+        ),
+        CHECK.row_count(
+            'silver.fotmob_player_market_value_history',
+            min_rows=1000,
+        ),
+        CHECK.freshness(
+            'silver.fotmob_player_market_value_history',
+            ts_col='_bronze_ingested_at',
+            max_age_hours=FRESH_HOURS,
+            severity='WARNING',
+        ),
+        CHECK.value_range(
+            'silver.fotmob_player_market_value_history',
+            'market_value_eur',
+            min_val=0,
+            max_val=500_000_000,
             severity='WARNING',
         ),
     ]

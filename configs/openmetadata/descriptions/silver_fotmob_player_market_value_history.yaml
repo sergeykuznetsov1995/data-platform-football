@@ -1,0 +1,36 @@
+# =============================================================================
+# OpenMetadata description: iceberg.silver.fotmob_player_market_value_history
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.silver.fotmob_player_market_value_history
+  description: |
+    Time-series рыночной стоимости игроков из FotMob. Один row per
+    (player_id, value_date, league, season) — UNNEST из
+    bronze.fotmob_player_details.market_values_json
+    (`{"values": [{"date", "value", "currency"}, ...]}`).
+    Питает gold.fct_player_market_value (issue #11). canonical_id
+    резолвится только в Gold (через silver.xref_player WHERE source='fotmob')
+    — Silver остаётся pure-shaping слоем bronze→silver. Cross-season
+    дубликаты исторических точек ожидаемы: FotMob отдаёт всю history
+    в каждом ingest-snapshot, поэтому player в нескольких сезонах APL
+    даст одну и ту же точку timeline в каждой партиции — выбирай
+    WHERE season = (MAX) для «last view».
+  tags:
+    - Tier.Silver
+    - Domain.Football
+    - PII.Low
+columns:
+  - name: player_id
+    description: FotMob player_id (varchar; из bronze.fotmob_player_details).
+  - name: value_date
+    description: Дата фиксации market_value (historical snapshot, может быть глубоко в прошлом).
+  - name: market_value_eur
+    description: Рыночная стоимость в EUR на value_date (BIGINT).
+  - name: currency
+    description: Валюта (обычно EUR; в редких случаях иная).
+  - name: _bronze_ingested_at
+    description: Timestamp Bronze ingest'а (для freshness + cross-source dedup).
+  - name: league
+    description: Лига (partition key, текущая лига ingest'а).
+  - name: season
+    description: Сезон bigint (e.g. 2025) — partition key, current ingest window.
