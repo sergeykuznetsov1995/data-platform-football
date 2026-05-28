@@ -1,0 +1,64 @@
+{
+  "mode": "combined_match_data",
+  "label": "match_all_data",
+  "real_proxy_mb": 2.74,
+  "real_proxy_bytes": 2869816,
+  "real_proxy_requests": 64,
+  "real_proxy_mb_by_resource_type": {
+    "DOCUMENT": 0.055,
+    "SCRIPT": 0.803,
+    "OTHER": 0.033,
+    "IMAGE": 0.126,
+    "XHR": 1.68,
+    "STYLESHEET": 0.035,
+    "FETCH": 0.005
+  },
+  "real_proxy_requests_by_resource_type": {
+    "DOCUMENT": 2,
+    "SCRIPT": 11,
+    "OTHER": 8,
+    "IMAGE": 31,
+    "XHR": 7,
+    "STYLESHEET": 2,
+    "FETCH": 3
+  },
+  "cf_challenge_attempts": 1,
+  "cf_challenges_passed": 1,
+  "cf_challenges_failed": 0,
+  "restart_reasons": {},
+  "resource_type_cache_misses": 0,
+  "html_mb_downloaded": 2.06,
+  "pages_downloaded": 10,
+  "overhead_ratio": 1.33,
+  "http_mb_downloaded": 1.719,
+  "http_requests_count": 9,
+  "http_mb_by_resource_type": {
+    "Document": 1.719
+  },
+  "http_requests_by_resource_type": {
+    "Document": 9
+  },
+  "total_proxy_mb_by_resource_type": {
+    "DOCUMENT": 0.055,
+    "SCRIPT": 0.803,
+    "OTHER": 0.033,
+    "IMAGE": 0.126,
+    "XHR": 1.68,
+    "STYLESHEET": 0.035,
+    "FETCH": 0.005,
+    "Document": 1.719
+  },
+  "total_proxy_requests_by_resource_type": {
+    "DOCUMENT": 2,
+    "SCRIPT": 11,
+    "OTHER": 8,
+    "IMAGE": 31,
+    "XHR": 7,
+    "STYLESHEET": 2,
+    "FETCH": 3,
+    "Document": 9
+  },
+  "matches_successes": 10,
+  "matches_failures": 0,
+  "schedule_source": "file"
+}
