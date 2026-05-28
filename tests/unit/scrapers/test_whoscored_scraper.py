@@ -1,10 +1,11 @@
 """
-Unit tests for WhoScoredScraper (hybrid soccerdata + FlareSolverr — 2026-04).
+Unit tests for WhoScoredScraper (FlareSolverr-backed — 2026-05).
 
 Architecture under test:
 
 * ``scrape_schedule`` / ``scrape_missing_players`` / ``scrape_season_stages``
-  — soccerdata-backed via ``EnhancedWhoScored``.
+  — soccerdata reader with HTTP transport swapped out for FlareSolverr via
+  ``FlareSolverrWhoScoredReader`` (subclass of ``sd.WhoScored``).
 * ``scrape_events`` — bypasses soccerdata. Pulls ``(game_id, league, season,
   game)`` from ``iceberg.bronze.whoscored_schedule``, then fetches each
   match's ``matchCentreData`` via :class:`FlareSolverrClient` (CF resolved
@@ -52,9 +53,9 @@ def mock_base_dependencies():
 
 @pytest.fixture
 def mock_enhanced_whoscored():
-    """Patch ``EnhancedWhoScored`` (used for schedule / missing_players /
-    season_stages). Returns the (cls_mock, instance_mock) pair so tests can
-    set up per-method return values."""
+    """Patch ``FlareSolverrWhoScoredReader`` (used for schedule /
+    missing_players / season_stages). Returns the (cls_mock, instance_mock)
+    pair so tests can set up per-method return values."""
     reader = MagicMock()
     reader.read_schedule.return_value = pd.DataFrame()
     reader.read_missing_players.return_value = pd.DataFrame()
@@ -62,7 +63,8 @@ def mock_enhanced_whoscored():
 
     cls_mock = MagicMock(return_value=reader)
     with patch(
-        'scrapers.whoscored.whoscored_patched.EnhancedWhoScored', cls_mock
+        'scrapers.whoscored.flaresolverr_reader.FlareSolverrWhoScoredReader',
+        cls_mock,
     ):
         yield cls_mock, reader
 
@@ -108,16 +110,18 @@ class TestWhoScoredInit:
 
 @pytest.mark.unit
 class TestWhoScoredGetReader:
-    """``_get_reader`` returns the patched soccerdata reader."""
+    """``_get_reader`` returns the patched FlareSolverr-backed reader."""
 
-    def test_get_reader_uses_enhanced_whoscored(
+    def test_get_reader_uses_flaresolverr_reader(
         self, mock_base_dependencies, mock_enhanced_whoscored
     ):
         cls_mock, reader = mock_enhanced_whoscored
         from scrapers.whoscored import WhoScoredScraper
 
         scraper = WhoScoredScraper(
-            leagues=['ENG-Premier League'], seasons=[2024]
+            leagues=['ENG-Premier League'],
+            seasons=[2024],
+            flaresolverr_url='http://flaresolverr:8191',
         )
 
         result = scraper._get_reader()
@@ -127,7 +131,8 @@ class TestWhoScoredGetReader:
         call_kwargs = cls_mock.call_args.kwargs
         assert call_kwargs['leagues'] == ['ENG-Premier League']
         assert call_kwargs['seasons'] == [2024]
-        assert call_kwargs['headless'] is True
+        assert call_kwargs['flaresolverr_url'] == 'http://flaresolverr:8191'
+        assert call_kwargs['proxy'] is None
 
     def test_get_reader_is_cached(
         self, mock_base_dependencies, mock_enhanced_whoscored
@@ -141,6 +146,44 @@ class TestWhoScoredGetReader:
         scraper._get_reader()
         scraper._get_reader()
         assert cls_mock.call_count == 1
+
+
+@pytest.mark.unit
+class TestWhoScoredSerializeNestedColumns:
+    """``_serialize_nested_columns`` defends against trino_manager's
+    ``pd.isna(val)`` crash on list/dict values from soccerdata schedule."""
+
+    def test_json_encodes_lists_and_dicts(self):
+        from scrapers.whoscored import WhoScoredScraper
+        df = pd.DataFrame({
+            'game_id': [1, 2],
+            'incidents': [[{'minute': '37', 'type': 1}], []],
+            'bets': [{'home': 1.5}, {'away': 2.1}],
+            'home_team': ['Arsenal', 'Chelsea'],
+        })
+        result = WhoScoredScraper._serialize_nested_columns(df)
+        # nested cols serialised to JSON strings
+        assert result['incidents'].tolist() == [
+            '[{"minute": "37", "type": 1}]', '[]'
+        ]
+        assert result['bets'].tolist() == [
+            '{"home": 1.5}', '{"away": 2.1}'
+        ]
+        # scalar cols unchanged
+        assert result['home_team'].tolist() == ['Arsenal', 'Chelsea']
+        assert result['game_id'].tolist() == [1, 2]
+
+    def test_nulls_preserved_in_nested_columns(self):
+        """NaN entries in a column with any list/dict must stay NaN."""
+        from scrapers.whoscored import WhoScoredScraper
+        import numpy as np
+        df = pd.DataFrame({
+            'incidents': [[{'a': 1}], np.nan, []],
+        })
+        result = WhoScoredScraper._serialize_nested_columns(df)
+        assert result['incidents'][0] == '[{"a": 1}]'
+        assert pd.isna(result['incidents'][1])
+        assert result['incidents'][2] == '[]'
 
 
 @pytest.mark.unit

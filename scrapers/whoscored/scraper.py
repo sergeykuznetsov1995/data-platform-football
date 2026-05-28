@@ -2,29 +2,31 @@
 WhoScored Scraper
 =================
 
-Hybrid scraper for WhoScored (2026-04 architecture):
+FlareSolverr-backed scraper for WhoScored (2026-05 architecture):
 
-* **schedule / missing_players / season_stages** — soccerdata-backed via
-  :class:`scrapers.whoscored.whoscored_patched.EnhancedWhoScored`
-  (subclass with ``script_timeout=120s``, otherwise stock seleniumbase).
+* **schedule / missing_players / season_stages** — soccerdata reader with
+  its HTTP transport swapped out for FlareSolverr via
+  :class:`scrapers.whoscored.flaresolverr_reader.FlareSolverrWhoScoredReader`.
+  Same parsing/normalisation as upstream soccerdata; only the per-URL fetch
+  goes through the FS-managed Chromium session.
 * **events** — bypasses soccerdata entirely. game_ids and game metadata
-  are pulled from ``iceberg.bronze.whoscored_schedule`` (already populated
-  by ``scrape_schedule``). Each match's ``matchCentreData`` JSON is fetched
-  through :class:`scrapers.base.flaresolverr_client.FlareSolverrClient`
-  (a separate FlareSolverr microservice that holds the CF state), then
-  parsed into the standard events DataFrame via
+  are pulled from ``iceberg.bronze.whoscored_schedule`` (populated by
+  ``scrape_schedule`` in this same scraper). Each match's
+  ``matchCentreData`` JSON is fetched through
+  :class:`scrapers.base.flaresolverr_client.FlareSolverrClient`, then parsed
+  into the standard events DataFrame via
   :func:`scrapers.whoscored.events_fetcher.parse_matchcentre_to_events_df`.
 
-Why hybrid: the seleniumbase driver soccerdata uses no longer survives the
-WhoScored Cloudflare challenge — script_timeout fires before bypass and the
-5×retry full-driver-restart loop never writes to Iceberg. Schedule still
-works (the Cloudflare hit happens on per-match pages); events do not.
-FlareSolverr keeps a single Cloudflare-cleared browser session open and
-handles each match as a short HTTP fetch.
+Why FlareSolverr everywhere: the seleniumbase driver soccerdata used to
+ship no longer survives the WhoScored Cloudflare challenge — script_timeout
+fires before bypass and the 5×retry full-driver-restart loop never writes
+to Iceberg. FlareSolverr (Camoufox) keeps a single Cloudflare-cleared
+browser session open and serves each request as a short HTTP fetch.
 
 Source: https://www.whoscored.com
 """
 
+import json
 import logging
 import os
 import uuid
@@ -105,40 +107,42 @@ class WhoScoredScraper(SoccerdataScraper):
     # ---------- Reader ----------
 
     def _get_reader(self):
-        """Build the underlying ``EnhancedWhoScored`` reader once.
+        """Build the FlareSolverr-backed soccerdata WhoScored reader once.
 
-        Used **only** for schedule / missing_players / season_stages —
-        events scraping uses FlareSolverr via :meth:`scrape_events`.
+        Used for schedule / missing_players / season_stages. Events scraping
+        uses its own FlareSolverr session via :meth:`scrape_events` —
+        keeping the two sessions independent simplifies session-rotation
+        bookkeeping.
         """
         if self._reader is None:
-            try:
-                from scrapers.whoscored.whoscored_patched import EnhancedWhoScored
-            except ImportError:  # pragma: no cover — install-time issue
-                logger.error("soccerdata is not installed in this environment")
-                raise
+            from scrapers.whoscored.flaresolverr_reader import (
+                FlareSolverrWhoScoredReader,
+            )
 
-            kwargs = dict(self._sd_kwargs)
-            kwargs.setdefault('headless', self.headless)
-            self._reader = EnhancedWhoScored(
+            fs_url = self.flaresolverr_url or os.environ.get(
+                "FLARESOLVERR_URL", "http://flaresolverr:8191"
+            )
+            self._reader = FlareSolverrWhoScoredReader(
+                flaresolverr_url=fs_url,
+                proxy=self._build_proxy_url(),
                 leagues=self.leagues,
                 seasons=self.seasons,
-                **kwargs,
             )
         return self._reader
 
     def _close_reader(self) -> None:
-        """Quit the underlying selenium driver before events scraping starts.
+        """Release the FlareSolverr session held by the reader, if any.
 
-        soccerdata's selenium driver consumes ~500 MB; release it before
-        we open the FlareSolverr session so the airflow worker stays slim.
+        Called before events scraping opens its own FS session so we don't
+        leak a long-lived schedule session on the FS service.
         """
         if self._reader is None:
             return
         try:
-            driver = getattr(self._reader, '_driver', None)
-            if driver is not None:
-                driver.quit()
-                logger.info("WhoScored: soccerdata selenium driver closed")
+            close = getattr(self._reader, "close", None)
+            if callable(close):
+                close()
+                logger.info("WhoScored: schedule FlareSolverr session closed")
         except Exception as e:
             logger.warning(f"WhoScored: error closing reader: {e}")
         finally:
@@ -157,6 +161,7 @@ class WhoScoredScraper(SoccerdataScraper):
             logger.warning(f"WhoScored: empty DataFrame for {table_name}")
             return None
         df = df.reset_index()
+        df = self._serialize_nested_columns(df)
         df = self._add_metadata(df, entity_type)
         return self.save_to_iceberg(
             df=df,
@@ -164,6 +169,33 @@ class WhoScoredScraper(SoccerdataScraper):
             partition_cols=['league', 'season'],
             replace_partitions=['league', 'season'],
         )
+
+    @staticmethod
+    def _serialize_nested_columns(df: pd.DataFrame) -> pd.DataFrame:
+        """JSON-encode columns that contain ``list`` / ``dict`` values.
+
+        soccerdata's WhoScored ``read_schedule`` returns nested types in
+        columns like ``incidents`` and ``bets``. The Bronze schema stores
+        them as ``varchar``, and ``trino_manager._format_sql_value`` calls
+        ``pd.isna(val)`` which raises ``ValueError`` on array-shaped values.
+        Serialising to JSON strings here keeps the cache file shape stable
+        and lets downstream Trino INSERTs round-trip the data unchanged.
+        """
+        for col in df.columns:
+            non_null = df[col].dropna()
+            if non_null.empty:
+                continue
+            has_nested = non_null.apply(
+                lambda v: isinstance(v, (list, dict))
+            ).any()
+            if not has_nested:
+                continue
+            df[col] = df[col].apply(
+                lambda v: json.dumps(v, default=str)
+                if isinstance(v, (list, dict))
+                else v
+            )
+        return df
 
     def scrape_schedule(self) -> Dict[str, str]:
         """Fixtures for all configured (league, season) pairs."""
