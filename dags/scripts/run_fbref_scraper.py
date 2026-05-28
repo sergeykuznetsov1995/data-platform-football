@@ -465,6 +465,22 @@ def main():
                     results['diagnostics']['scraper_stats'] = scraper.get_stats()
                     results['diagnostics']['traffic'] = _get_traffic_diagnostics(scraper)
 
+                    # Issue #44: also emit traffic JSON from the nodriver-only
+                    # code path (the selenium branch has its own equivalent).
+                    _stat_label = f"{args.data_category}_{args.stat_type}"
+                    _write_traffic_summary(
+                        scraper,
+                        label=_stat_label,
+                        mode='single_stat',
+                        extra={
+                            'stat_type': args.stat_type,
+                            'data_category': args.data_category,
+                            'successes': scraper._stats.get('successes', 0),
+                            'failures': scraper._stats.get('failures', 0),
+                        },
+                        explicit_path=args.traffic_output,
+                    )
+
                     logger.info(f"Single stat scrape completed: {list(scrape_result.keys())}")
 
                     if not scrape_result:
@@ -497,6 +513,20 @@ def main():
                         results['match_data_type'] = args.match_data_type
                         results['diagnostics']['scraper_stats'] = scraper.get_stats()
                         results['diagnostics']['traffic'] = _get_traffic_diagnostics(scraper)
+
+                        # Issue #44: emit traffic JSON for the schedule task
+                        # (nodriver-only path — selenium path handles its own).
+                        _write_traffic_summary(
+                            scraper,
+                            label=f"match_{args.match_data_type}",
+                            mode='match_data',
+                            extra={
+                                'match_data_type': args.match_data_type,
+                                'successes': scraper._stats.get('successes', 0),
+                                'failures': scraper._stats.get('failures', 0),
+                            },
+                            explicit_path=args.traffic_output,
+                        )
 
                         logger.info(f"Schedule scrape completed: {list(scrape_result.keys())}")
 
