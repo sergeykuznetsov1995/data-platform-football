@@ -12,8 +12,15 @@ rich>=14.0.0
 # -----------------------------------------------------------------------------
 # [soccerdata] Football data scraping library
 # Brings seleniumbase as dependency
+#
+# Pinned to 1.8.8 (issue #67): 1.9.0 migrated FBref to BaseSeleniumReader,
+# которая в нашем airflow image не пробивает CF на fbref.com (требует
+# python3-tk для uc_gui_click_captcha + ломается с residential proxies
+# через host_resolver_rules). Decision: HOLD до появления overridable
+# _validate_page timeout / passive Turnstile bypass в seleniumbase.
+# Research-doc: docs/research/issue_67_soccerdata_19_fbref_migration.md
 # -----------------------------------------------------------------------------
-soccerdata>=1.8.8
+soccerdata==1.8.8
 
 # -----------------------------------------------------------------------------
 # [selenium] Selenium tools (for Cloudflare bypass)
