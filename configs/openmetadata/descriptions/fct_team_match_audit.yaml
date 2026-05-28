@@ -1,0 +1,106 @@
+# =============================================================================
+# OpenMetadata description: iceberg.gold.fct_team_match_audit
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.gold.fct_team_match_audit
+  description: |
+    Cross-source DQ-audit таблица для gold.fct_team_match. НЕ business-витрина:
+    содержит ТОЛЬКО технические diff-колонки + PK.
+
+    Grain: (match_id_canonical, team_id_canonical). Только строки с пересечением
+    FBref ∩ Understat (INNER JOIN spine, design doc §8.3). SofaScore / WhoScored
+    — LEFT JOIN → diff = NULL при отсутствии записи.
+
+    WS-блок ожидаемо NULL для current seasons (2425/2526) — bridge
+    bronze.whoscored_schedule (team_id NUMERIC ↔ NAME) заполнен только для
+    season='2021'. Followup → issue #120 (canonical resolve в Silver).
+
+    Формула diff:
+      * FBref-metric diff: fb.<metric> - <source>.<metric>
+      * SS-metric diff (когда FBref не отдаёт метрику на team-grain — fouls):
+        ss.<metric> - ws.<metric>
+      * Modeled diff: us.<metric> - ss.<metric>  (разные xG-модели)
+
+    Использование:
+      1. DQ coverage WARNING — ABS(diff) <= threshold у ≥90-95% rows.
+      2. Engineer-debug при «голы по матчу не сходятся в дашборде».
+      3. Калибровка thresholds → docs/research/R1_cross_source_thresholds.md.
+
+    WARNING-only DQ (error_threshold=0.0): таблица не блокирует pipeline.
+    Читает Silver напрямую (НЕ gold.fct_team_match) — one-hop Gold rule.
+  tags:
+    - Tier.Gold
+    - Domain.Football
+    - PII.None
+columns:
+  # ─── PK ───
+  - name: match_id_canonical
+    description: |
+      Канонический ID матча (PK part). Равен fb.match_id (FBref hex), который
+      для source='fbref' является canonical_id в silver.xref_match.
+      FK → gold.fct_team_match.match_id.
+  - name: team_id_canonical
+    description: |
+      Канонический ID команды (PK part). Из silver.xref_team (source='fbref',
+      confidence <> 'orphan').
+      FK → gold.fct_team_match.team_id.
+
+  # ─── Understat diff (INNER spine — non-NULL для всех строк) ───
+  - name: goals_for_diff_us
+    description: "Diff забитых голов: fb.goals_for - us.goals. INNER JOIN — всегда non-NULL."
+  - name: goals_against_diff_us
+    description: "Diff пропущенных голов: fb.goals_against - us.goals_against."
+  - name: xg_diff_us_ss
+    description: |
+      Кросс-модельный diff xG: us.xg - ss.expected_goals (ROUND 4 знака).
+      Understat-модель vs SofaScore/Opta. Расхождение ожидаемо (разные методологии).
+      NULL если SofaScore-запись отсутствует.
+  - name: xga_diff_us_ss
+    description: |
+      Кросс-модельный diff xGA: us.xg_against - ss.expected_goals_against (ROUND 4).
+      NULL если SofaScore-запись отсутствует.
+
+  # ─── SofaScore diff (LEFT JOIN → NULL если нет записи) ───
+  - name: goals_for_diff_ss
+    description: "Diff забитых голов: fb.goals_for - ss.goals_for. NULL если SS отсутствует."
+  - name: goals_against_diff_ss
+    description: "Diff пропущенных голов: fb.goals_against - ss.goals_against."
+  - name: shots_diff_ss
+    description: "Diff ударов: fb.shots - ss.total_shots."
+  - name: shots_on_target_diff_ss
+    description: "Diff ударов в створ: fb.shots_on_target - ss.shots_on_target."
+  - name: yellow_cards_diff_ss
+    description: "Diff жёлтых карточек: fb.yellow_cards - ss.yellow_cards."
+  - name: red_cards_diff_ss
+    description: "Diff красных карточек: fb.red_cards - ss.red_cards."
+  - name: possession_diff_ss
+    description: |
+      Diff владения мячом (%): fb.possession - ss.possession_pct.
+      Разные методологии (FBref считает на open-play, SS — total). Threshold ±5%.
+
+  # ─── WhoScored diff (LEFT JOIN → NULL ожидается для current seasons; #120) ───
+  - name: shots_diff_ws
+    description: "Diff ударов: fb.shots - ws.shots_total. NULL для current seasons (#120)."
+  - name: shots_on_target_diff_ws
+    description: |
+      Diff ударов в створ: fb.shots_on_target - ws.shots_on_target_proxy.
+      WS proxy = SPADL shot с outcome_success (приближение, не точное shots-on-target).
+      NULL для current seasons (#120).
+  - name: fouls_diff_ss_ws
+    description: |
+      Diff фолов: ss.fouls - ws.fouls_committed. FBref не отдаёт team-fouls на
+      match-grain → spine = SofaScore. NULL для current seasons (#120).
+
+  # ─── Lineage ───
+  - name: _gold_created_at
+    description: Технический timestamp создания строки в Gold-слое.
+
+relationships:
+  - from: match_id_canonical
+    to: trino_iceberg.iceberg.gold.fct_team_match.match_id
+    type: FOREIGN_KEY
+    description: N:1 — business-витрина с тем же grain (v1 column name).
+  - from: team_id_canonical
+    to: trino_iceberg.iceberg.gold.fct_team_match.team_id
+    type: FOREIGN_KEY
+    description: N:1 — business-витрина с тем же grain (v1 column name).

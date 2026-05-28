@@ -5,19 +5,26 @@ table:
   fullyQualifiedName: trino_iceberg.iceberg.gold.fct_team_match
   description: |
     Long-form факт: одна строка на (match_id, team_id) — обе стороны матча
-    представлены отдельно. Является источником для rolling-фич
-    (feat_team_form, feat_team_h2h) и для отчётов по командной метрике.
-    Дублирование снимается ключом team_id, но физически каждый матч в таблице
-    дважды (с домашней и гостевой стороны).
+    представлены отдельно. Источник для rolling-фич (feat_team_form,
+    feat_team_h2h, feat_team_event_style) и BI-отчётов по командным метрикам.
+
+    v2 (issue #95, T6 wave): 4-source консолидация — FBref (spine) + Understat
+    (xG/pressing) + WhoScored (event-aggregates) + SofaScore (passes/duels).
+    Все v1 FBref колонки сохранены под прежними именами (backwards-compat).
+    Кросс-источниковые diff'ы вынесены в gold.fct_team_match_audit (WARNING DQ).
+
+    Грейн: (match_id, team_id) — физически каждый матч в таблице дважды
+    (с домашней и гостевой стороны).
   tags:
     - Tier.Gold
     - Domain.Football
     - PII.None
 columns:
+  # ===== v1 columns (preserved) =====
   - name: match_id
-    description: ID матча (FK -> dim_match.match_id).
+    description: ID матча (FK -> dim_match.match_id). FBref hex canonical.
   - name: team_id
-    description: ID команды (FK -> dim_team.team_id).
+    description: ID команды (FK -> dim_team.team_id). Canonical (через xref_team).
   - name: opponent_id
     description: ID соперника в этом матче.
   - name: date
@@ -27,31 +34,101 @@ columns:
   - name: is_home
     description: TRUE если команда играла дома, FALSE если в гостях.
   - name: goals_for
-    description: Голы команды в этом матче.
+    description: Голы команды в этом матче (FBref).
   - name: goals_against
-    description: Голы соперника в этом матче.
+    description: Голы соперника в этом матче (FBref).
   - name: shots
-    description: Удары команды.
+    description: Удары команды (FBref).
   - name: shots_on_target
-    description: Удары команды в створ.
+    description: Удары команды в створ (FBref).
   - name: possession
-    description: Владение мячом (%).
+    description: Владение мячом, % (FBref).
   - name: yellow_cards
-    description: Жёлтые карточки команды.
+    description: Жёлтые карточки команды (FBref).
   - name: red_cards
-    description: Красные карточки команды.
+    description: Красные карточки команды (FBref).
   - name: saves
-    description: Сейвы вратаря команды.
+    description: Сейвы вратаря команды (FBref).
   - name: points
-    description: Очки за матч (3 / 1 / 0).
+    description: Очки за матч (3 / 1 / 0). Computed.
   - name: result
-    description: Результат с т.з. команды — 'W' / 'D' / 'L'.
+    description: Результат с т.з. команды — 'W' / 'D' / 'L'. Computed.
   - name: is_completed
     description: Матч сыгран.
+  # ===== v2 MODELED (xG primary = Understat per RX2; SS fallback) =====
+  - name: expected_goals
+    description: |
+      Ожидаемые голы команды (xG). Источник: Understat primary (RX2 —
+      coverage 99%, r≥0.99); SofaScore fallback. NULL для матчей без US/SS.
+  - name: expected_goals_against
+    description: |
+      xG, пропущенные командой. Источник: Understat (xg_against) primary,
+      SofaScore (expected_goals_against) fallback.
+  - name: expected_assists
+    description: |
+      Ожидаемые ассисты (xA). Reserved per design doc §6.2 — текущие Silver
+      US/SS team-match не отдают xA на team-grain; колонка NULL до FotMob
+      Phase 2 (#97).
+  - name: npxg
+    description: Non-penalty xG (Understat-only, US.npxg).
+  # ===== v2 UNIQUE_UNDERSTAT (pressing / depth) =====
+  - name: ppda
+    description: Passes Per Defensive Action (Understat). Метрика прессинга —
+      низкое значение = более интенсивный прессинг (типично 5-15 для топ-команд).
+  - name: deep_completions
+    description: |
+      Кол-во точных пасов / передач в зону <20м от ворот соперника
+      (Understat). Маркер атакующей глубины.
+  # ===== v2 UNIQUE_WHOSCORED (SPADL event aggregates) =====
+  # NB: текущие сезоны (2425/2526) ожидаемо NULL до issue #120 — bridge
+  # bronze.whoscored_schedule (team_id NUMERIC ↔ NAME) заполнен только для '2021'.
+  - name: pass_total
+    description: Всего пасов команды (WhoScored SPADL). NULL для current seasons (#120).
+  - name: pass_ok
+    description: Точные пасы (WhoScored). NULL для current seasons (#120).
+  - name: pass_pct
+    description: Точность пасов, % (WhoScored). NULL для current seasons (#120).
+  - name: tackle_att
+    description: Попытки отбора (WhoScored). NULL для current seasons (#120).
+  - name: tackle_won
+    description: Выигранные отборы (WhoScored). NULL для current seasons (#120).
+  - name: takeon_att
+    description: Попытки обводки 1v1 (WhoScored). NULL для current seasons (#120).
+  - name: takeon_won
+    description: Успешные обводки (WhoScored). NULL для current seasons (#120).
+  - name: touches_in_box
+    description: |
+      Касания мяча в штрафной соперника (WhoScored). Маркер атакующей
+      угрозы. NULL для current seasons (#120).
+  - name: key_passes_ws
+    description: |
+      Ключевые пасы (WhoScored). Суффикс _ws — SofaScore тоже отдаёт
+      key_passes но на player-grain, во избежание name-conflict в будущем.
+      NULL для current seasons (#120).
+  # ===== v2 UNIQUE_SOFASCORE (passes / duels / breakdowns) =====
+  - name: total_passes
+    description: Всего пасов команды (SofaScore). Альтернативный счётчик от WS.
+  - name: accurate_passes
+    description: Точные пасы (SofaScore).
+  - name: accurate_passes_pct
+    description: Точность пасов, % (SofaScore).
+  - name: corner_kicks
+    description: Угловые удары (SofaScore).
+  - name: fouls_ss
+    description: Фолы команды (SofaScore). Суффикс _ss — FBref не отдаёт team-fouls.
+  - name: offsides_ss
+    description: Офсайды (SofaScore). Суффикс _ss по той же причине.
+  - name: ground_duels_won
+    description: Выигранные единоборства на земле (SofaScore).
+  - name: aerial_duels_won
+    description: Выигранные верховые единоборства (SofaScore).
+  # ===== Lineage =====
+  - name: _gold_created_at
+    description: Время материализации CTAS (UTC).
   - name: league
     description: Лига.
   - name: season
-    description: Сезон.
+    description: Сезон (bigint year-start, e.g. 2025 для 2025/26).
 relationships:
   - from: match_id
     to: trino_iceberg.iceberg.gold.dim_match.match_id
