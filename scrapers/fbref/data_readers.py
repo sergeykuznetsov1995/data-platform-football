@@ -1256,7 +1256,7 @@ class FBrefDataReaderMixin:
                     # (browser can become unresponsive after Cloudflare bypass)
                     if self.use_nodriver and self._nodriver_browser is not None:
                         logger.info("Restarting nodriver browser before match page scraping...")
-                        self._nodriver_browser.restart_browser()
+                        self._nodriver_browser.restart_browser(reason='post_schedule')
 
                     failed_match_ids = []
                     # Matches where page loaded but match_player_stats was missing
@@ -1346,7 +1346,7 @@ class FBrefDataReaderMixin:
                             f"with browser restart ({league}, {season})"
                         )
                         if self.use_nodriver and self._nodriver_browser is not None:
-                            self._nodriver_browser.restart_browser()
+                            self._nodriver_browser.restart_browser(reason='retry_failed_matches')
 
                         recovered = 0
                         for match_id in retry_ids:

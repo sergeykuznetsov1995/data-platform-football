@@ -242,13 +242,28 @@ def validate_all_data(**context) -> Dict[str, Any]:
     return validation
 
 
-def check_traffic_guard(**context) -> Dict[str, Any]:
-    """Read `/tmp/fbref_traffic_match_all_data.json`, push metrics to XCom,
-    and raise when proxy traffic exceeds the configured threshold.
+def check_traffic_guard(
+    traffic_path: str = '/tmp/fbref_traffic_match_all_data.json',
+    label: str = 'match_all_data',
+    threshold_variable: str = 'fbref_proxy_mb_threshold',
+    default_threshold_mb: float = 500.0,
+    **context,
+) -> Dict[str, Any]:
+    """Read a per-task traffic summary, push metrics to XCom, and raise when
+    real proxy MB exceeds the configured threshold.
 
-    Threshold is read from Airflow Variable ``fbref_proxy_mb_threshold``
-    (default 500 MB). Set it via:
-        airflow variables set fbref_proxy_mb_threshold 800
+    Issue #44: this callable is now parameterized so it can guard ANY task
+    in the FBref DAG, not only `match_all_data`. Each task writes its own
+    `/tmp/fbref_traffic_<label>.json` and the guard reads it.
+
+    Threshold lookup order:
+      1. Airflow Variable ``fbref_proxy_mb_threshold_<label>`` (per-task).
+      2. Airflow Variable ``fbref_proxy_mb_threshold`` (global fallback).
+      3. ``default_threshold_mb`` argument (500 by default).
+
+    Set via:
+        airflow variables set fbref_proxy_mb_threshold_player_stats 60
+        airflow variables set fbref_proxy_mb_threshold 800  # global
 
     Behaviour:
     - Missing JSON file is a warning (task may have failed before writing).
@@ -256,6 +271,15 @@ def check_traffic_guard(**context) -> Dict[str, Any]:
       $4/GB, so crossing the budget matters).
     - Uses module-level imports only from airflow + stdlib (no scrapers/
       import — keeps Airflow scheduler process slim per CLAUDE.md).
+
+    Args:
+        traffic_path: Path to the per-task traffic JSON.
+        label: Short identifier used for per-task Variable lookup and XCom
+            keys. Should match the suffix in the JSON filename
+            (e.g. `match_all_data`, `match_schedule`, `player_stats`).
+        threshold_variable: Name of the global Airflow Variable used as
+            fallback when the per-task one is missing.
+        default_threshold_mb: Fallback when both Variables are missing.
     """
     import json
     import logging
@@ -266,25 +290,36 @@ def check_traffic_guard(**context) -> Dict[str, Any]:
 
     logger = logging.getLogger(__name__)
 
-    summary_path = Path('/tmp/fbref_traffic_match_all_data.json')
+    summary_path = Path(traffic_path)
 
     if not summary_path.exists():
         logger.warning(
             f"Traffic summary not found at {summary_path}. "
-            f"match_all_data task may have failed before writing it."
+            f"Upstream task ({label}) may have failed before writing it."
         )
-        return {'status': 'missing', 'real_proxy_mb': None}
+        return {'status': 'missing', 'label': label, 'real_proxy_mb': None}
 
     try:
         with open(summary_path) as f:
             summary = json.load(f)
     except (json.JSONDecodeError, OSError) as e:
-        logger.warning(f"Could not read traffic summary: {e}")
-        return {'status': 'unreadable', 'real_proxy_mb': None}
+        logger.warning(f"Could not read traffic summary {summary_path}: {e}")
+        return {'status': 'unreadable', 'label': label, 'real_proxy_mb': None}
 
     real_mb = float(summary.get('real_proxy_mb') or 0.0)
     requests = int(summary.get('real_proxy_requests') or 0)
-    successes = int(summary.get('matches_successes') or 0)
+    # `matches_successes` only exists in combined_match_data summaries;
+    # other modes ship `successes` instead. Fall back to either.
+    successes = int(
+        summary.get('matches_successes')
+        or summary.get('successes')
+        or 0
+    )
+    cf_attempts = int(summary.get('cf_challenge_attempts') or 0)
+    cf_passed = int(summary.get('cf_challenges_passed') or 0)
+    cf_failed = int(summary.get('cf_challenges_failed') or 0)
+    restart_reasons = summary.get('restart_reasons') or {}
+    mb_by_rtype = summary.get('real_proxy_mb_by_resource_type') or {}
 
     # Push to XCom so Airflow UI / downstream tasks can read current run cost.
     ti = context.get('ti') or context.get('task_instance')
@@ -292,31 +327,49 @@ def check_traffic_guard(**context) -> Dict[str, Any]:
         ti.xcom_push(key='real_proxy_mb', value=real_mb)
         ti.xcom_push(key='real_proxy_requests', value=requests)
         ti.xcom_push(key='matches_scraped', value=successes)
+        ti.xcom_push(key='cf_challenge_attempts', value=cf_attempts)
+        ti.xcom_push(key='cf_challenges_passed', value=cf_passed)
+        ti.xcom_push(key='cf_challenges_failed', value=cf_failed)
+        ti.xcom_push(key='restart_reasons', value=restart_reasons)
+        ti.xcom_push(key='real_proxy_mb_by_resource_type', value=mb_by_rtype)
 
-    try:
-        threshold_mb = float(
-            Variable.get('fbref_proxy_mb_threshold', default_var='500')
+    # Per-task threshold takes precedence over the global one.
+    per_task_var = f"{threshold_variable}_{label}"
+    raw_threshold = Variable.get(per_task_var, default_var=None)
+    if raw_threshold is None:
+        raw_threshold = Variable.get(
+            threshold_variable, default_var=str(default_threshold_mb)
         )
+    try:
+        threshold_mb = float(raw_threshold)
     except (ValueError, TypeError):
-        threshold_mb = 500.0
+        threshold_mb = default_threshold_mb
 
     logger.info(
-        f"Traffic guard: real_proxy_mb={real_mb:.2f}, "
-        f"requests={requests}, matches={successes}, "
-        f"threshold={threshold_mb:.2f} MB"
+        f"Traffic guard [{label}]: real_proxy_mb={real_mb:.2f}, "
+        f"requests={requests}, successes={successes}, "
+        f"cf_attempts={cf_attempts}/passed={cf_passed}/failed={cf_failed}, "
+        f"restarts={dict(restart_reasons)}, threshold={threshold_mb:.2f} MB"
     )
 
     if real_mb > threshold_mb:
         raise AirflowException(
-            f"Proxy traffic {real_mb:.2f} MB exceeded threshold "
+            f"Proxy traffic {real_mb:.2f} MB for {label} exceeded threshold "
             f"{threshold_mb:.2f} MB. Review Airflow Variable "
-            f"`fbref_proxy_mb_threshold` or investigate the run."
+            f"`{per_task_var}` or `{threshold_variable}`, or investigate "
+            f"the run."
         )
 
     return {
         'status': 'ok',
+        'label': label,
         'real_proxy_mb': real_mb,
         'real_proxy_requests': requests,
         'matches_scraped': successes,
+        'cf_challenge_attempts': cf_attempts,
+        'cf_challenges_passed': cf_passed,
+        'cf_challenges_failed': cf_failed,
+        'restart_reasons': dict(restart_reasons),
+        'real_proxy_mb_by_resource_type': dict(mb_by_rtype),
         'threshold_mb': threshold_mb,
     }

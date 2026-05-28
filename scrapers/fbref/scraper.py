@@ -152,6 +152,16 @@ class FBrefScraper(
         # Flushed in _close_browser() before browser goes away.
         self._real_traffic_base_bytes: int = 0
         self._real_traffic_base_requests: int = 0
+        # Issue #44: per-resource-type breakdown + CF/restart counters,
+        # also flushed in _close_browser() so per-process totals survive
+        # browser restarts.
+        from collections import Counter as _Counter
+        self._real_traffic_base_bytes_by_rtype: _Counter = _Counter()
+        self._real_traffic_base_requests_by_rtype: _Counter = _Counter()
+        self._cf_challenge_attempts_base: int = 0
+        self._cf_challenges_passed_base: int = 0
+        self._cf_challenges_failed_base: int = 0
+        self._restart_reasons_base: _Counter = _Counter()
 
         # Consecutive fetch failure tracking for automatic proxy rotation
         # 3→15: higher MAX_SLOW_PROXY_RETRIES already handles dead proxies per URL;
