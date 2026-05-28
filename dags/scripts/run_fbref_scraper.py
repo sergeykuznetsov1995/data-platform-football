@@ -31,6 +31,7 @@ import logging
 import os
 import sys
 from datetime import datetime
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -60,23 +61,107 @@ def _get_traffic_diagnostics(scraper) -> dict:
     Reports both HTML-only bytes (legacy `bytes_downloaded`) and real
     proxy bytes (via CDP Network events) — the latter is what actually
     counts against proxy quota.
+
+    Issue #44: also surfaces per-resource-type breakdown, CF challenge
+    counters, and browser-restart reason counts so downstream tooling
+    (traffic_guard, audit report) can attribute MB/run to specific
+    code paths.
     """
+    # Pull a fresh snapshot first — flushes mid-session counters into _stats.
+    if hasattr(scraper, '_update_real_traffic_stats'):
+        try:
+            scraper._update_real_traffic_stats()
+        except Exception:
+            pass
+
     stats = scraper._stats
     html_bytes = stats.get('bytes_downloaded', 0)
     real_bytes = stats.get('real_bytes_downloaded', 0)
     real_requests = stats.get('real_requests_count', 0)
     overhead_ratio = round(real_bytes / html_bytes, 2) if html_bytes > 0 else None
+
+    # Per-resource-type breakdown in MB (rounded) for readability; also
+    # keep raw bytes for downstream math.
+    bytes_by_rtype = dict(stats.get('real_bytes_by_resource_type', {}) or {})
+    reqs_by_rtype = dict(stats.get('real_requests_by_resource_type', {}) or {})
+    mb_by_rtype = {k: round(v / 1024 / 1024, 3) for k, v in bytes_by_rtype.items()}
+
     return {
         'bytes_downloaded': html_bytes,
         'pages_downloaded': stats.get('pages_downloaded', 0),
         'mb_downloaded': round(html_bytes / 1024 / 1024, 2),
-        'bytes_by_page_type': dict(stats.get('bytes_by_page_type', {})),
+        'bytes_by_page_type': dict(stats.get('bytes_by_page_type', {}) or {}),
         # Real proxy traffic (includes CSS/JS/images if not blocked)
         'real_proxy_bytes': real_bytes,
         'real_proxy_mb': round(real_bytes / 1024 / 1024, 2),
         'real_proxy_requests': real_requests,
         'overhead_ratio': overhead_ratio,  # real/html; 1.0 = perfect (HTML only)
+        # Issue #44 — new fields.
+        'real_proxy_bytes_by_resource_type': bytes_by_rtype,
+        'real_proxy_mb_by_resource_type': mb_by_rtype,
+        'real_proxy_requests_by_resource_type': reqs_by_rtype,
+        'cf_challenge_attempts': int(stats.get('cf_challenge_attempts', 0) or 0),
+        'cf_challenges_passed': int(stats.get('cf_challenges_passed', 0) or 0),
+        'cf_challenges_failed': int(stats.get('cf_challenges_failed', 0) or 0),
+        'restart_reasons': dict(stats.get('restart_reasons', {}) or {}),
     }
+
+
+def _write_traffic_summary(
+    scraper,
+    label: str,
+    mode: str,
+    extra: Optional[dict] = None,
+    explicit_path: Optional[str] = None,
+) -> None:
+    """Write `/tmp/fbref_traffic_<label>.json` for ANY entity.
+
+    Previously only `combined_match_data` produced this file. Issue #44
+    extends coverage to schedule, single_stat (player/team/keeper) so the
+    per-task `traffic_guard` can attribute MB to each step of the DAG.
+
+    Args:
+        scraper: The active scraper (used for _stats + traffic metrics).
+        label: Short identifier baked into the filename (e.g. 'match_all_data',
+            'match_schedule', 'player_stats', 'keeper_keeper_adv').
+        mode: Echoed into the JSON (matches the CLI --mode value).
+        extra: Optional per-mode keys to merge in (e.g. matches_successes).
+        explicit_path: Override the default `/tmp/fbref_traffic_<label>.json`.
+    """
+    import json as _json
+
+    traffic = _get_traffic_diagnostics(scraper)
+    payload = {
+        'mode': mode,
+        'label': label,
+        'real_proxy_mb': traffic.get('real_proxy_mb', 0.0),
+        'real_proxy_bytes': traffic.get('real_proxy_bytes', 0),
+        'real_proxy_requests': traffic.get('real_proxy_requests', 0),
+        'real_proxy_mb_by_resource_type': traffic.get(
+            'real_proxy_mb_by_resource_type', {}
+        ),
+        'real_proxy_requests_by_resource_type': traffic.get(
+            'real_proxy_requests_by_resource_type', {}
+        ),
+        'cf_challenge_attempts': traffic.get('cf_challenge_attempts', 0),
+        'cf_challenges_passed': traffic.get('cf_challenges_passed', 0),
+        'cf_challenges_failed': traffic.get('cf_challenges_failed', 0),
+        'restart_reasons': traffic.get('restart_reasons', {}),
+        'html_mb_downloaded': traffic.get('mb_downloaded', 0.0),
+        'pages_downloaded': traffic.get('pages_downloaded', 0),
+        'overhead_ratio': traffic.get('overhead_ratio'),
+    }
+    if extra:
+        payload.update(extra)
+
+    path = explicit_path or f'/tmp/fbref_traffic_{label}.json'
+    try:
+        with open(path, 'w') as fh:
+            _json.dump(payload, fh, indent=2)
+        # Single-line log mirrors the existing TRAFFIC_SUMMARY_JSON= grep target.
+        logger.info(f"TRAFFIC_SUMMARY_JSON={_json.dumps(payload)}")
+    except Exception as e:
+        logger.warning(f"Could not write traffic summary JSON to {path}: {e}")
 
 
 def main():
@@ -295,6 +380,16 @@ def main():
         action='store_true',
         help='Enable DEBUG logging (default: INFO with noisy loggers suppressed)'
     )
+    parser.add_argument(
+        '--traffic-output',
+        type=str,
+        default=None,
+        help='[Issue #44] Override the auto-generated path '
+             '/tmp/fbref_traffic_<label>.json where the per-task traffic '
+             'summary (real_proxy_mb, per-resource-type, CF challenges, '
+             'restart reasons) is written. Useful when one bash command '
+             'should not clobber the file from a previous step.'
+    )
     args = parser.parse_args()
 
     # Configure logging AFTER parsing args so --verbose takes effect
@@ -496,6 +591,22 @@ def main():
                     }
                     results['diagnostics']['traffic'] = _get_traffic_diagnostics(scraper)
 
+                    # Issue #44: emit /tmp/fbref_traffic_<category>_<stat>.json
+                    # so per-task traffic_guard can read it.
+                    _stat_label = f"{args.data_category}_{args.stat_type}"
+                    _write_traffic_summary(
+                        scraper,
+                        label=_stat_label,
+                        mode='single_stat',
+                        extra={
+                            'stat_type': args.stat_type,
+                            'data_category': args.data_category,
+                            'successes': scraper._stats.get('successes', 0),
+                            'failures': scraper._stats.get('failures', 0),
+                        },
+                        explicit_path=args.traffic_output,
+                    )
+
                     logger.info(f"Single stat scrape completed: {list(scrape_results.keys())}")
 
                     if not scrape_results:
@@ -532,6 +643,22 @@ def main():
                         'failures': scraper._stats.get('failures', 0),
                     }
                     results['diagnostics']['traffic'] = _get_traffic_diagnostics(scraper)
+
+                    # Issue #44: emit /tmp/fbref_traffic_match_<type>.json
+                    # for schedule / shot_events / etc. — currently only
+                    # `schedule` is wired into the DAG, but the file pattern
+                    # is uniform.
+                    _write_traffic_summary(
+                        scraper,
+                        label=f"match_{args.match_data_type}",
+                        mode='match_data',
+                        extra={
+                            'match_data_type': args.match_data_type,
+                            'successes': scraper._stats.get('successes', 0),
+                            'failures': scraper._stats.get('failures', 0),
+                        },
+                        explicit_path=args.traffic_output,
+                    )
 
                     logger.info(f"Match data scrape completed: {list(scrape_results.keys())}")
 
@@ -573,39 +700,23 @@ def main():
                         'lineups + match_team_stats + match_player_stats)'
                     )
 
-                    # Write standalone traffic summary for Airflow XCom / guard.
-                    # Kept separate from the main result JSON so BashOperator
-                    # post-task hooks can read it without re-parsing everything.
-                    try:
-                        import json as _json
-                        traffic_summary = {
-                            'mode': 'combined_match_data',
-                            'real_proxy_mb': traffic.get('real_proxy_mb', 0.0),
-                            'real_proxy_bytes': traffic.get('real_proxy_bytes', 0),
-                            'real_proxy_requests': traffic.get(
-                                'real_proxy_requests', 0
-                            ),
-                            'html_mb_downloaded': traffic.get('mb_downloaded', 0.0),
-                            'pages_downloaded': traffic.get('pages_downloaded', 0),
-                            'overhead_ratio': traffic.get('overhead_ratio'),
+                    # Issue #44: use shared helper so combined_match_data,
+                    # single_stat and match_data emit the same schema. Filename
+                    # stays `/tmp/fbref_traffic_match_all_data.json` for
+                    # backward compatibility with existing traffic_guard.
+                    _write_traffic_summary(
+                        scraper,
+                        label='match_all_data',
+                        mode='combined_match_data',
+                        extra={
                             'matches_successes': scraper._stats.get('successes', 0),
                             'matches_failures': scraper._stats.get('failures', 0),
                             'schedule_source': scraper._stats.get(
                                 'schedule_source', 'unknown'
                             ),
-                        }
-                        with open(
-                            '/tmp/fbref_traffic_match_all_data.json', 'w'
-                        ) as _tf:
-                            _json.dump(traffic_summary, _tf, indent=2)
-                        # Single-line log for grep-based log parsing.
-                        logger.info(
-                            f"TRAFFIC_SUMMARY_JSON={_json.dumps(traffic_summary)}"
-                        )
-                    except Exception as _e:
-                        logger.warning(
-                            f"Could not write traffic summary JSON: {_e}"
-                        )
+                        },
+                        explicit_path=args.traffic_output,
+                    )
 
                     logger.info(
                         f"Combined match data scrape completed: {list(scrape_results.keys())}"

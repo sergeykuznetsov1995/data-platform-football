@@ -33,6 +33,7 @@ import asyncio
 import logging
 import os
 import random
+from collections import Counter
 from typing import Optional
 
 from scrapers.base.browser.nodriver_stealth import (
@@ -250,6 +251,22 @@ class NodriverBypass:
         # at browser_manager level.
         self._real_bytes_downloaded = 0
         self._real_requests_count = 0
+        # Per-resource-type breakdown (Document / Script / XHR / Stylesheet /
+        # Image / Font / Other). Filled via Network.responseReceived which
+        # carries the resource_type — loadingFinished only has request_id +
+        # encoded bytes, so we cache the mapping. Issue #44.
+        self._real_bytes_by_resource_type: Counter = Counter()
+        self._real_requests_by_resource_type: Counter = Counter()
+        self._request_resource_types: dict = {}
+        # CF bypass counters: attempt = entered get(), passed = first time
+        # we see non-CF HTML (i.e. _setup_network_blocking() runs),
+        # failed = exhausted max_retries with CF still blocking. Issue #44.
+        self._cf_challenge_attempts = 0
+        self._cf_challenges_passed = 0
+        self._cf_challenges_failed = 0
+        # Counter of restart/close reasons (slow_proxy / consecutive_failures /
+        # page_limit / retry_failed_matches / explicit). Issue #44.
+        self._restart_reasons: Counter = Counter()
         # Set to True after network blocking has been set up on current page
         self._network_blocking_active = False
 
@@ -506,17 +523,39 @@ class NodriverBypass:
         # Enable Network domain
         await self._page.send(cdp_network.enable())
 
+        # Subscribe to responseReceived to cache (request_id -> resource_type).
+        # loadingFinished fires later with the actual encoded bytes but does
+        # not carry resource_type; we look it up from this cache. Issue #44.
+        def _on_response_received(event):
+            try:
+                rid = getattr(event, 'request_id', None)
+                rtype = getattr(event, 'type_', None) or getattr(event, 'type', None)
+                # nodriver wraps resource_type as an enum-ish object — str() it
+                rtype_str = str(rtype) if rtype is not None else 'Other'
+                if rid is not None:
+                    self._request_resource_types[rid] = rtype_str
+            except Exception:
+                pass
+
         # Subscribe to loadingFinished — fires for every completed response
         # with the actual encoded bytes received (post-decompression).
         def _on_loading_finished(event):
             try:
-                self._real_bytes_downloaded += int(event.encoded_data_length or 0)
+                size = int(event.encoded_data_length or 0)
+                self._real_bytes_downloaded += size
                 self._real_requests_count += 1
+                # Resolve resource type from responseReceived cache; default
+                # to "Other" for entries that slipped (preflights etc).
+                rid = getattr(event, 'request_id', None)
+                rtype = self._request_resource_types.pop(rid, 'Other') if rid is not None else 'Other'
+                self._real_bytes_by_resource_type[rtype] += size
+                self._real_requests_by_resource_type[rtype] += 1
             except Exception:
                 pass
 
+        self._page.add_handler(cdp_network.ResponseReceived, _on_response_received)
         self._page.add_handler(cdp_network.LoadingFinished, _on_loading_finished)
-        logger.debug("Network.loadingFinished tracking enabled")
+        logger.debug("Network.responseReceived + loadingFinished tracking enabled")
 
     async def _setup_network_blocking(self):
         """Apply CDP Network.setBlockedURLs to block non-essential resources.
@@ -546,10 +585,21 @@ class NodriverBypass:
             logger.warning(f"Failed to set blocked URLs: {e}")
 
     def get_real_traffic_stats(self) -> dict:
-        """Return real proxy traffic stats tracked via CDP Network events."""
+        """Return real proxy traffic stats tracked via CDP Network events.
+
+        Issue #44: includes per-resource-type breakdown, CF challenge counters,
+        and restart-reason counters so the audit can attribute MB/run to
+        specific code paths.
+        """
         return {
             'real_bytes_downloaded': self._real_bytes_downloaded,
             'real_requests_count': self._real_requests_count,
+            'real_bytes_by_resource_type': dict(self._real_bytes_by_resource_type),
+            'real_requests_by_resource_type': dict(self._real_requests_by_resource_type),
+            'cf_challenge_attempts': self._cf_challenge_attempts,
+            'cf_challenges_passed': self._cf_challenges_passed,
+            'cf_challenges_failed': self._cf_challenges_failed,
+            'restart_reasons': dict(self._restart_reasons),
         }
 
     # ------------------------------------------------------------------ #
@@ -859,6 +909,11 @@ class NodriverBypass:
 
         html = ""
         last_error = None
+        # Issue #44: count CF attempts/passes/failures for traffic audit.
+        # One get() call = one attempt regardless of internal retries (CF
+        # bypass is binary — either the proxy gets past it or not).
+        cf_was_blocking = False  # tracked across attempts
+        self._cf_challenge_attempts += 1
 
         for attempt in range(self.max_retries):
             try:
@@ -874,7 +929,14 @@ class NodriverBypass:
                             await self._setup_network_blocking()
                         except Exception as e:
                             logger.warning(f"Could not activate network blocking: {e}")
+                        # Count a CF pass only when blocking flips from inactive
+                        # to active — i.e. fresh browser successfully cleared
+                        # the challenge. Subsequent pages in the same session
+                        # do not retrigger CF on FBref.
+                        self._cf_challenges_passed += 1
                     return html
+                else:
+                    cf_was_blocking = True
 
                 logger.warning(
                     f"Cloudflare still blocking (attempt {attempt + 1}/{self.max_retries})"
@@ -906,6 +968,8 @@ class NodriverBypass:
             logger.warning(
                 f"Cloudflare challenge not passed after {self.max_retries} attempts"
             )
+            if cf_was_blocking:
+                self._cf_challenges_failed += 1
             return html
 
         # If no HTML at all, raise the last error
@@ -1233,14 +1297,24 @@ class NodriverBypass:
     #  Browser close & lifecycle                                          #
     # ------------------------------------------------------------------ #
 
-    async def close(self):
+    async def close(self, reason: str = 'explicit'):
         """Close the browser asynchronously with aggressive memory cleanup.
 
         Uses direct await on connection.disconnect() instead of browser.stop()
         which creates a fire-and-forget task via create_task(). The fire-and-forget
         approach causes "Task was destroyed but it is pending!" warnings when
         close/restart is called frequently (e.g., after each match page).
+
+        Args:
+            reason: Why the browser is being closed — used for traffic-audit
+                attribution (issue #44). Accepted values: 'explicit',
+                'slow_proxy', 'page_limit', 'consecutive_failures',
+                'retry_failed_matches'. Free-form strings are tolerated.
         """
+        # Issue #44: count close-reason BEFORE teardown so the counter
+        # survives the subsequent _browser = None assignment.
+        if self._browser is not None:
+            self._restart_reasons[reason] += 1
         if self._browser is not None:
             try:
                 # Directly await connection disconnect instead of self._browser.stop()
@@ -1302,16 +1376,20 @@ class NodriverBypass:
         asyncio.set_event_loop(self._loop)
         return self._loop
 
-    def restart_browser(self):
+    def restart_browser(self, reason: str = 'explicit'):
         """
         Restart the browser synchronously.
 
         This is useful when browser becomes unresponsive after Cloudflare bypass.
         Drains pending async tasks after close to prevent "Task was destroyed" warnings.
+
+        Args:
+            reason: Why the browser is being restarted — propagated to close()
+                for the traffic-audit restart_reasons counter (issue #44).
         """
         loop = self._get_or_create_loop()
         try:
-            loop.run_until_complete(self.close())
+            loop.run_until_complete(self.close(reason=reason))
         except Exception as e:
             logger.warning(f"Error during browser restart close: {e}")
 
@@ -1407,11 +1485,16 @@ class NodriverBypass:
             if cloudflare_wait is not None:
                 self.cloudflare_wait = original_wait
 
-    def close_sync(self):
-        """Close browser synchronously with memory cleanup."""
+    def close_sync(self, reason: str = 'explicit'):
+        """Close browser synchronously with memory cleanup.
+
+        Args:
+            reason: Why the browser is being closed — propagated to close()
+                for the traffic-audit restart_reasons counter (issue #44).
+        """
         if self._browser is not None:
             loop = self._get_or_create_loop()
-            loop.run_until_complete(self.close())
+            loop.run_until_complete(self.close(reason=reason))
             # Extra garbage collection for sync close
             import gc
             gc.collect()

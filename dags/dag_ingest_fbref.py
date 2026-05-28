@@ -156,8 +156,34 @@ COMBINED_MATCH_KWARGS = dict(
 )
 
 
+def _make_traffic_guard(label: str, group_suffix: str = '') -> PythonOperator:
+    """Create a parameterized traffic_guard task for one entity.
+
+    Issue #44: every traffic-heavy task gets its own guard reading
+    `/tmp/fbref_traffic_<label>.json`. Per-task threshold can be set via
+    `fbref_proxy_mb_threshold_<label>` Airflow Variable; falls back to
+    the global `fbref_proxy_mb_threshold`.
+    """
+    task_id = f'traffic_guard_{label}{group_suffix}'
+    return PythonOperator(
+        task_id=task_id,
+        python_callable=check_traffic_guard,
+        op_kwargs={
+            'traffic_path': f'/tmp/fbref_traffic_{label}.json',
+            'label': label,
+        },
+        trigger_rule='all_done',  # always inspect traffic, even on upstream fail
+    )
+
+
 def _build_sequential_stat_group(stat_types, data_category):
-    """Build a list of sequential stat tasks within a TaskGroup context."""
+    """Build a list of sequential stat tasks within a TaskGroup context.
+
+    Issue #44: each stat task is followed by a traffic_guard sibling
+    reading `/tmp/fbref_traffic_<data_category>_<stat>.json`. The guards
+    are chained between consecutive stats so a budget breach short-circuits
+    the rest of the group (concurrency=1, so this preserves order).
+    """
     tasks = []
     prev_task = None
     for stat_type in stat_types:
@@ -166,11 +192,16 @@ def _build_sequential_stat_group(stat_types, data_category):
             data_category=data_category,
             **COMMON_TASK_KWARGS,
         )
-        # Chain tasks sequentially to prevent OOM
+        label = f'{data_category}_{stat_type}'
+        guard = _make_traffic_guard(label=label)
+        task >> guard
+        # Chain tasks sequentially to prevent OOM (now via the guard so
+        # XCom from the guard is visible before the next stat starts).
         if prev_task is not None:
             prev_task >> task
-        prev_task = task
+        prev_task = guard
         tasks.append(task)
+        tasks.append(guard)
     return tasks
 
 
@@ -394,6 +425,11 @@ with DAG(
             **COMMON_TASK_KWARGS,
         )
 
+        # Issue #44: guard on schedule's own CF/asset traffic. The schedule
+        # task starts a fresh browser, so its CF bypass dominates the
+        # per-task MB and was previously unattributed.
+        schedule_guard = _make_traffic_guard(label='match_schedule')
+
         # Second Trino check: verify Trino is still up after schedule task
         # (Trino may have crashed between schedule and match_all_data)
         trino_check_2 = create_trino_health_check_task(
@@ -407,19 +443,14 @@ with DAG(
             **COMBINED_MATCH_KWARGS,
         )
 
-        # trino_check -> schedule -> trino_check_2 -> match_all_data -> traffic_guard
-        #
         # traffic_guard reads /tmp/fbref_traffic_match_all_data.json written by
         # match_all_task and fails if real_proxy_mb exceeds the Airflow
-        # Variable `fbref_proxy_mb_threshold` (default 500). Push XCom keys:
-        # real_proxy_mb, real_proxy_requests, matches_scraped.
-        traffic_guard = PythonOperator(
-            task_id='traffic_guard',
-            python_callable=check_traffic_guard,
-            trigger_rule='all_done',  # always inspect traffic, even on upstream fail
-        )
+        # Variable `fbref_proxy_mb_threshold_match_all_data` (or the global
+        # `fbref_proxy_mb_threshold`, default 500). Push XCom keys:
+        # real_proxy_mb, real_proxy_requests, matches_scraped, cf_*, restart_*.
+        traffic_guard = _make_traffic_guard(label='match_all_data')
 
-        trino_check >> schedule_task >> trino_check_2 >> match_all_task >> traffic_guard
+        trino_check >> schedule_task >> schedule_guard >> trino_check_2 >> match_all_task >> traffic_guard
 
     # =========================================================================
     # Validation Task

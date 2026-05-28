@@ -516,6 +516,33 @@ class FBrefBrowserMixin:
             self._stats['real_requests_count'] = (
                 self._real_traffic_base_requests + session_reqs
             )
+            # Issue #44: expose per-resource-type + CF + restart breakdown.
+            # We add current-session counters on top of accumulated base so
+            # mid-run reads (e.g. progress logs) reflect the live total.
+            bytes_by_rtype = dict(self._real_traffic_base_bytes_by_rtype)
+            reqs_by_rtype = dict(self._real_traffic_base_requests_by_rtype)
+            for k, v in (real.get('real_bytes_by_resource_type') or {}).items():
+                bytes_by_rtype[k] = bytes_by_rtype.get(k, 0) + v
+            for k, v in (real.get('real_requests_by_resource_type') or {}).items():
+                reqs_by_rtype[k] = reqs_by_rtype.get(k, 0) + v
+            self._stats['real_bytes_by_resource_type'] = bytes_by_rtype
+            self._stats['real_requests_by_resource_type'] = reqs_by_rtype
+            self._stats['cf_challenge_attempts'] = (
+                self._cf_challenge_attempts_base
+                + int(real.get('cf_challenge_attempts', 0) or 0)
+            )
+            self._stats['cf_challenges_passed'] = (
+                self._cf_challenges_passed_base
+                + int(real.get('cf_challenges_passed', 0) or 0)
+            )
+            self._stats['cf_challenges_failed'] = (
+                self._cf_challenges_failed_base
+                + int(real.get('cf_challenges_failed', 0) or 0)
+            )
+            restart_reasons = dict(self._restart_reasons_base)
+            for k, v in (real.get('restart_reasons') or {}).items():
+                restart_reasons[k] = restart_reasons.get(k, 0) + v
+            self._stats['restart_reasons'] = restart_reasons
         except Exception:
             pass
 
@@ -692,7 +719,7 @@ class FBrefBrowserMixin:
                         f"{e} — proxy changed via CDP, retrying immediately"
                     )
                 else:
-                    self._close_browser()
+                    self._close_browser(reason='slow_proxy')
                     if slow_retry < self.MAX_SLOW_PROXY_RETRIES - 1:
                         wait = 2 * (slow_retry + 1)
                         logger.warning(
@@ -714,7 +741,7 @@ class FBrefBrowserMixin:
                         f"{self._consecutive_fetch_failures} consecutive fetch failures "
                         f"— restarting browser for proxy rotation"
                     )
-                    self._close_browser()
+                    self._close_browser(reason='consecutive_failures')
                     self._consecutive_fetch_failures = 0
                 logger.error(f"Error fetching page {url}: {e}", exc_info=True)
                 return None
@@ -839,17 +866,21 @@ class FBrefBrowserMixin:
                 f"Restarting browser after {self._pages_fetched} pages to prevent memory leaks"
             )
             # Keep HTTP session — same proxy, cookies still valid
-            self._close_browser(reset_http=False)
+            self._close_browser(reset_http=False, reason='page_limit')
             self._pages_fetched = 0
             gc.collect()
 
-    def _close_browser(self, reset_http: bool = True) -> None:
+    def _close_browser(self, reset_http: bool = True, reason: str = 'explicit') -> None:
         """Close browser and clean up resources.
 
         Args:
             reset_http: If True, also reset the HTTP session. Set to False
                 when restarting browser for memory reasons (same proxy,
                 cookies still valid).
+            reason: Why the browser is being closed — passed through to
+                NodriverBypass.close_sync() for the restart_reasons counter
+                (issue #44). Accepted: 'slow_proxy', 'consecutive_failures',
+                'page_limit', 'retry_failed_matches', 'explicit'.
 
         Note: Does NOT stop the shared Xvfb display — it survives across
         browser restarts. Call _stop_shared_xvfb() for final cleanup.
@@ -886,19 +917,33 @@ class FBrefBrowserMixin:
                 real = self._nodriver_browser.get_real_traffic_stats()
                 self._real_traffic_base_bytes += real.get('real_bytes_downloaded', 0)
                 self._real_traffic_base_requests += real.get('real_requests_count', 0)
+                # Issue #44: flush per-resource-type + CF + restart counters
+                # so they survive the browser teardown. The NodriverBypass
+                # instance's own _restart_reasons already includes the
+                # current close (incremented in close()), so this captures it.
+                for k, v in (real.get('real_bytes_by_resource_type') or {}).items():
+                    self._real_traffic_base_bytes_by_rtype[k] += v
+                for k, v in (real.get('real_requests_by_resource_type') or {}).items():
+                    self._real_traffic_base_requests_by_rtype[k] += v
+                self._cf_challenge_attempts_base += int(real.get('cf_challenge_attempts', 0) or 0)
+                self._cf_challenges_passed_base += int(real.get('cf_challenges_passed', 0) or 0)
+                self._cf_challenges_failed_base += int(real.get('cf_challenges_failed', 0) or 0)
+                for k, v in (real.get('restart_reasons') or {}).items():
+                    self._restart_reasons_base[k] += v
                 if real.get('real_bytes_downloaded', 0) > 0:
                     logger.info(
                         f"Session proxy traffic: "
                         f"{real['real_bytes_downloaded'] / 1024 / 1024:.1f} MB "
                         f"over {real['real_requests_count']} requests "
                         f"(total accumulated: "
-                        f"{self._real_traffic_base_bytes / 1024 / 1024:.1f} MB)"
+                        f"{self._real_traffic_base_bytes / 1024 / 1024:.1f} MB) "
+                        f"reason={reason}"
                     )
             except Exception as e:
                 logger.debug(f"Could not flush traffic stats: {e}")
 
             try:
-                self._nodriver_browser.close_sync()
+                self._nodriver_browser.close_sync(reason=reason)
             except Exception as e:
                 logger.warning(f"Error closing nodriver browser: {e}")
             self._nodriver_browser = None
@@ -906,6 +951,17 @@ class FBrefBrowserMixin:
             # After browser close, stats in _stats reflect accumulated base only
             self._stats['real_bytes_downloaded'] = self._real_traffic_base_bytes
             self._stats['real_requests_count'] = self._real_traffic_base_requests
+            # Issue #44: same for per-resource-type + CF + restart counters.
+            self._stats['real_bytes_by_resource_type'] = dict(
+                self._real_traffic_base_bytes_by_rtype
+            )
+            self._stats['real_requests_by_resource_type'] = dict(
+                self._real_traffic_base_requests_by_rtype
+            )
+            self._stats['cf_challenge_attempts'] = self._cf_challenge_attempts_base
+            self._stats['cf_challenges_passed'] = self._cf_challenges_passed_base
+            self._stats['cf_challenges_failed'] = self._cf_challenges_failed_base
+            self._stats['restart_reasons'] = dict(self._restart_reasons_base)
 
         # Reset HTTP session only when proxy changes (SlowProxyError, explicit close)
         if reset_http:
