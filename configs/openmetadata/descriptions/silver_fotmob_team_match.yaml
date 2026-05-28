@@ -1,0 +1,117 @@
+# =============================================================================
+# OpenMetadata description: iceberg.silver.fotmob_team_match
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.silver.fotmob_team_match
+  description: |
+    Per-(match, team) team-level stats из FotMob. Два row per match —
+    home и away стороны отдельно. Источник: bronze.fotmob_match_details:
+      * stats_json (`Periods.All.stats[group].stats[stat]`) — HARD_FACT
+        counters (possession, shots, passes, fouls, cards) + xG family
+        (expected_goals / npxg / xGOT).
+      * player_stats_json (per-player) — SUM(xA) per teamId для
+        `expected_assists` (FotMob НЕ отдаёт team-grain xA в stats_json,
+        только per-player; это raison d'être issue #97 — закрытие
+        пробела `expected_assists` в gold.fct_team_match).
+    Goals_for/goals_against — из bronze top-level home_score/away_score.
+    Питает gold.fct_team_match (5-source расширение) и audit-таблицу
+    — Phase B issue #97.
+    Дедупликация: ROW_NUMBER per (match_id, league, season) ORDER BY
+    _ingested_at DESC; PK (match_id, team_id, league, season).
+  tags:
+    - Tier.Silver
+    - Domain.Football
+    - PII.None
+columns:
+  - name: match_id
+    description: FotMob match_id (varchar; SCALAR из bronze.fotmob_match_details).
+  - name: team_id
+    description: FotMob team_id (varchar). NUMERIC bronze ID — bridge на canonical через silver.xref_team source='fotmob'.
+  - name: opponent_id
+    description: ID соперника в этом матче (FotMob team_id).
+  - name: is_home
+    description: TRUE если команда играла дома, FALSE если в гостях.
+  - name: goals_for
+    description: Голы команды в матче (из bronze top-level home_score/away_score).
+  - name: goals_against
+    description: Голы соперника в матче.
+  - name: possession_pct
+    description: Владение мячом, % (FotMob BallPossesion).
+  - name: total_shots
+    description: Всего ударов (FotMob total_shots).
+  - name: shots_on_target
+    description: Удары в створ (FotMob ShotsOnTarget).
+  - name: shots_off_target
+    description: Удары мимо створа (FotMob ShotsOffTarget).
+  - name: blocked_shots
+    description: Заблокированные удары (FotMob blocked_shots).
+  - name: shots_inside_box
+    description: Удары из штрафной (FotMob shots_inside_box).
+  - name: shots_outside_box
+    description: Удары вне штрафной (FotMob shots_outside_box).
+  - name: total_passes
+    description: Всего пасов команды (FotMob passes).
+  - name: accurate_passes
+    description: Точные пасы (FotMob accurate_passes — parsed из "N (M%)").
+  - name: accurate_passes_pct
+    description: Точность пасов, % (computed = 100 * accurate / total).
+  - name: yellow_cards
+    description: Жёлтые карточки команды (FotMob).
+  - name: red_cards
+    description: Красные карточки команды (FotMob).
+  - name: fouls
+    description: Фолы команды (FotMob).
+  - name: offsides
+    description: Офсайды (FotMob).
+  - name: corner_kicks
+    description: Угловые удары (FotMob corners).
+  - name: tackles
+    description: Отборы (FotMob matchstats.headers.tackles).
+  - name: interceptions
+    description: Перехваты (FotMob interceptions).
+  - name: clearances
+    description: Выносы (FotMob clearances).
+  - name: saves
+    description: Сейвы вратаря команды (FotMob keeper_saves).
+  - name: expected_goals
+    description: |
+      Ожидаемые голы команды (xG). FotMob expected_goals из
+      stats_json. По FotMob модели — корреляция r≥0.99 с
+      Understat (см. memory RX2).
+  - name: npxg
+    description: Non-penalty xG (FotMob expected_goals_non_penalty).
+  - name: xgot
+    description: |
+      xG on target — модельная "ожидаемая ценность" точно пробитого
+      удара (FotMob expected_goals_on_target). UNIQUE_FOTMOB — нет
+      у US/SS на team-grain. Cross-source валидация невозможна.
+  - name: expected_assists
+    description: |
+      Ожидаемые ассисты (xA) команды — SUM xA всех игроков команды
+      из bronze.fotmob_match_details.player_stats_json. Главная
+      causa creandi для issue #97: ни Understat, ни SofaScore не
+      отдают team-grain xA, FotMob единственный источник.
+  - name: expected_goals_player_sum
+    description: |
+      Sanity-метрика: SUM(xG) по всем игрокам команды (player-level
+      из player_stats_json). Должен быть ≈ expected_goals (team-level
+      из stats_json) в пределах округления — используется для
+      cross-check FotMob внутренней согласованности.
+  - name: big_chances
+    description: |
+      Big chances (FotMob big_chance). UNIQUE_FOTMOB качественная
+      метрика — нет у других team-match источников.
+  - name: big_chances_missed
+    description: Big chances missed (FotMob big_chance_missed_title).
+  - name: touches_in_box
+    description: Касания в штрафной соперника (FotMob touches_opp_box).
+  - name: _bronze_ingested_at
+    description: Timestamp Bronze ingest'а (для freshness + cross-source dedup).
+  - name: league
+    description: Лига (partition key).
+  - name: season
+    description: |
+      Сезон — slug ('2526' для 2025/26), вычисляется из bronze season
+      bigint через LPAD(MOD(season,100))||LPAD(MOD(season+1,100)).
+      Унифицирует partition с другими Silver team-match таблицами
+      (sofascore/whoscored/understat).
