@@ -934,6 +934,20 @@ def validate_gold_quality() -> Dict[str, Any]:
                           severity='WARNING'),
         CHECK.value_range('gold.fct_team_match', 'possession', min_val=0, max_val=100,
                           severity='WARNING'),
+        # issue #95: v2 multi-source columns. xG/xGA/NPxG per team-match rarely
+        # exceed 6 (extreme top-tier blowouts ≈4); cap at 10 to catch parser
+        # regressions (xG=999) without false-positives. ppda upper bound 50
+        # (high-press teams ≈8, ultra-passive 30+). NULL for non-FBref games.
+        CHECK.value_range('gold.fct_team_match', 'expected_goals',
+                          min_val=0, max_val=10, severity='WARNING'),
+        CHECK.value_range('gold.fct_team_match', 'expected_goals_against',
+                          min_val=0, max_val=10, severity='WARNING'),
+        CHECK.value_range('gold.fct_team_match', 'npxg',
+                          min_val=0, max_val=10, severity='WARNING'),
+        CHECK.value_range('gold.fct_team_match', 'ppda',
+                          min_val=0, max_val=50, severity='WARNING'),
+        CHECK.value_range('gold.fct_team_match', 'accurate_passes_pct',
+                          min_val=0, max_val=100, severity='WARNING'),
 
         # ----- issue #46: fct_player_match multi-source xG/xA/rating sanity -----
         # xG/xA per single match: top observed values редко превышают 3.0 даже
@@ -1710,6 +1724,88 @@ def validate_gold_quality() -> Dict[str, Any]:
                        condition='ABS(xa_diff_us_ss) <= 0.5 OR xa_diff_us_ss IS NULL',
                        warn_threshold=0.95, error_threshold=0.0,
                        name='audit_diff[fct_player_match_audit.xa_us_ss]'),
+
+        # ============================================================
+        # issue #95 audit: fct_team_match_audit — cross-source diff на
+        # team-match-grain между FBref (primary spine), Understat (INNER
+        # secondary spine, per design doc §8.3), SofaScore (LEFT) и
+        # WhoScored (LEFT). WS-блок ожидаемо NULL для current seasons до
+        # резолва canonical_id в Silver (followup #120) — IS NULL ветка в
+        # coverage condition прячет это от WARN-носа.
+        # Thresholds: ±1 для integer counters, ±5 для possession, ±0.5 для xG.
+        # ============================================================
+        CHECK.no_duplicates('gold.fct_team_match_audit',
+                            pk=['match_id_canonical', 'team_id_canonical']),
+        CHECK.no_nulls('gold.fct_team_match_audit',
+                       cols=['match_id_canonical', 'team_id_canonical']),
+        # audit ⊆ main fct (INNER FBref ∩ US) → каждая audit-строка должна
+        # находить парную (match_id, team_id) в gold.fct_team_match. main fct
+        # PK uses match_id/team_id (v1 names), audit uses *_canonical, но
+        # значения идентичны (для source='fbref' canonical == raw).
+        CHECK.ref_integrity('gold.fct_team_match_audit', 'gold.fct_team_match',
+                            'match_id_canonical', parent_key='match_id'),
+
+        # ----- Understat diff (INNER spine — всегда non-NULL) -----
+        CHECK.coverage('gold.fct_team_match_audit',
+                       condition='ABS(goals_for_diff_us) <= 1 OR goals_for_diff_us IS NULL',
+                       warn_threshold=0.95, error_threshold=0.0,
+                       name='audit_diff[fct_team_match_audit.goals_for_us]'),
+        CHECK.coverage('gold.fct_team_match_audit',
+                       condition='ABS(goals_against_diff_us) <= 1 OR goals_against_diff_us IS NULL',
+                       warn_threshold=0.95, error_threshold=0.0,
+                       name='audit_diff[fct_team_match_audit.goals_against_us]'),
+        CHECK.coverage('gold.fct_team_match_audit',
+                       condition='ABS(xg_diff_us_ss) <= 0.5 OR xg_diff_us_ss IS NULL',
+                       warn_threshold=0.90, error_threshold=0.0,
+                       name='audit_diff[fct_team_match_audit.xg_us_ss]'),
+        CHECK.coverage('gold.fct_team_match_audit',
+                       condition='ABS(xga_diff_us_ss) <= 0.5 OR xga_diff_us_ss IS NULL',
+                       warn_threshold=0.90, error_threshold=0.0,
+                       name='audit_diff[fct_team_match_audit.xga_us_ss]'),
+
+        # ----- SofaScore diff (LEFT — NULL допустим) -----
+        CHECK.coverage('gold.fct_team_match_audit',
+                       condition='ABS(goals_for_diff_ss) <= 1 OR goals_for_diff_ss IS NULL',
+                       warn_threshold=0.95, error_threshold=0.0,
+                       name='audit_diff[fct_team_match_audit.goals_for_ss]'),
+        CHECK.coverage('gold.fct_team_match_audit',
+                       condition='ABS(goals_against_diff_ss) <= 1 OR goals_against_diff_ss IS NULL',
+                       warn_threshold=0.95, error_threshold=0.0,
+                       name='audit_diff[fct_team_match_audit.goals_against_ss]'),
+        CHECK.coverage('gold.fct_team_match_audit',
+                       condition='ABS(shots_diff_ss) <= 2 OR shots_diff_ss IS NULL',
+                       warn_threshold=0.90, error_threshold=0.0,
+                       name='audit_diff[fct_team_match_audit.shots_ss]'),
+        CHECK.coverage('gold.fct_team_match_audit',
+                       condition='ABS(shots_on_target_diff_ss) <= 2 OR shots_on_target_diff_ss IS NULL',
+                       warn_threshold=0.90, error_threshold=0.0,
+                       name='audit_diff[fct_team_match_audit.shots_on_target_ss]'),
+        CHECK.coverage('gold.fct_team_match_audit',
+                       condition='ABS(yellow_cards_diff_ss) <= 1 OR yellow_cards_diff_ss IS NULL',
+                       warn_threshold=0.95, error_threshold=0.0,
+                       name='audit_diff[fct_team_match_audit.yellow_cards_ss]'),
+        CHECK.coverage('gold.fct_team_match_audit',
+                       condition='ABS(red_cards_diff_ss) <= 1 OR red_cards_diff_ss IS NULL',
+                       warn_threshold=0.95, error_threshold=0.0,
+                       name='audit_diff[fct_team_match_audit.red_cards_ss]'),
+        CHECK.coverage('gold.fct_team_match_audit',
+                       condition='ABS(possession_diff_ss) <= 5 OR possession_diff_ss IS NULL',
+                       warn_threshold=0.90, error_threshold=0.0,
+                       name='audit_diff[fct_team_match_audit.possession_ss]'),
+
+        # ----- WhoScored diff (LEFT — NULL expected для current seasons; #120) -----
+        CHECK.coverage('gold.fct_team_match_audit',
+                       condition='ABS(shots_diff_ws) <= 2 OR shots_diff_ws IS NULL',
+                       warn_threshold=0.90, error_threshold=0.0,
+                       name='audit_diff[fct_team_match_audit.shots_ws]'),
+        CHECK.coverage('gold.fct_team_match_audit',
+                       condition='ABS(shots_on_target_diff_ws) <= 2 OR shots_on_target_diff_ws IS NULL',
+                       warn_threshold=0.90, error_threshold=0.0,
+                       name='audit_diff[fct_team_match_audit.shots_on_target_ws]'),
+        CHECK.coverage('gold.fct_team_match_audit',
+                       condition='ABS(fouls_diff_ss_ws) <= 2 OR fouls_diff_ss_ws IS NULL',
+                       warn_threshold=0.90, error_threshold=0.0,
+                       name='audit_diff[fct_team_match_audit.fouls_ss_ws]'),
 
         # ============================================================
         # E1.5: post-cutover ref_integrity / canonical-format checks
