@@ -6,7 +6,7 @@ FotMob Scraper Runner Script
 Standalone script to run FotMob scraper.
 Called from Airflow via BashOperator to avoid memory issues with PythonOperator.
 
-Uses Selenium with Cloudflare bypass for data collection.
+Pure HTTP — hits FotMob's public ``/api/data/leagues`` endpoint, no browser.
 """
 
 import argparse
@@ -42,23 +42,10 @@ def main():
         default='/tmp/fotmob_result.json',
         help='Output file for results'
     )
-    parser.add_argument(
-        '--headless',
-        action='store_true',
-        default=True,
-        help='Run browser in headless mode'
-    )
-    parser.add_argument(
-        '--use-xvfb',
-        action='store_true',
-        default=True,
-        help='Use xvfb for virtual display'
-    )
     args = parser.parse_args()
 
     leagues = [l.strip() for l in args.leagues.split(',')]
     logger.info(f"Starting FotMob scraper: leagues={leagues}, season={args.season}")
-    logger.info(f"Headless: {args.headless}, use_xvfb: {args.use_xvfb}")
 
     results = {
         'tables': [],
@@ -74,8 +61,6 @@ def main():
         with FotMobScraper(
             leagues=leagues,
             seasons=[args.season],
-            headless=args.headless,
-            use_xvfb=args.use_xvfb,
         ) as scraper:
             # Scrape schedule for each league
             for league in leagues:
@@ -86,6 +71,7 @@ def main():
                             df=df,
                             table_name='fotmob_schedule',
                             partition_cols=['league', 'season'],
+                            replace_partitions=['league', 'season'],
                         )
                         results['tables'].append(table_path)
                         results['schedule_rows'] += len(df)
@@ -104,6 +90,7 @@ def main():
                             df=df,
                             table_name='fotmob_team_stats',
                             partition_cols=['league', 'season'],
+                            replace_partitions=['league', 'season'],
                         )
                         results['tables'].append(table_path)
                         results['team_stats_rows'] += len(df)
@@ -122,6 +109,7 @@ def main():
                             df=df,
                             table_name='fotmob_player_stats',
                             partition_cols=['league', 'season'],
+                            replace_partitions=['league', 'season'],
                         )
                         results['tables'].append(table_path)
                         results['player_stats_rows'] += len(df)

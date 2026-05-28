@@ -2,18 +2,15 @@
 FotMob Scraper
 ==============
 
-Scraper for FotMob football data using Selenium with Cloudflare bypass.
-FotMob provides comprehensive football statistics including:
+Pure-HTTP scraper for FotMob football data. The public ``/api/data``
+endpoints return JSON without Cloudflare gating or session cookies.
+
+Provides:
 - Match schedules and results
 - Team season statistics
 - Player season statistics
-- Match lineups and events
 
 Source: https://www.fotmob.com
-
-NOTE: FotMob uses session cookies for API access. This scraper uses
-undetected-chromedriver to obtain valid session cookies, then makes
-direct API calls.
 """
 
 import json
@@ -25,29 +22,22 @@ from typing import Any, Dict, List, Optional
 import pandas as pd
 import requests
 
-from scrapers.base.base_scraper import SeleniumScraper
-from scrapers.base.browser import CloudflareBypass
+from scrapers.base.base_scraper import BaseScraper
 
 logger = logging.getLogger(__name__)
 
-class FotMobScraper(SeleniumScraper):
+class FotMobScraper(BaseScraper):
     """
-    Scraper for FotMob data using Selenium with Cloudflare bypass.
+    Pure-HTTP scraper for FotMob data.
 
-    FotMob provides:
-    - Match schedules and scores
-    - Team season statistics
-    - Player season statistics
-    - Match lineups
-
-    The scraper uses Selenium to obtain session cookies from FotMob,
-    then uses those cookies to make direct API calls.
+    FotMob exposes a public ``/api/data/leagues`` endpoint that returns
+    JSON with fixtures, league table, and player stat leaderboards in a
+    single payload. No Cloudflare bypass, no cookies, minimal UA.
 
     Usage:
         scraper = FotMobScraper(
             leagues=['ENG-Premier League'],
             seasons=[2024],
-            headless=True
         )
         result = scraper.scrape_all()
     """
@@ -56,7 +46,7 @@ class FotMobScraper(SeleniumScraper):
     DEFAULT_RATE_LIMIT = 30  # requests per minute
 
     BASE_URL = 'https://www.fotmob.com'
-    API_BASE = 'https://www.fotmob.com/api'
+    API_BASE = 'https://www.fotmob.com/api/data'
 
     # League configuration with FotMob league IDs
     LEAGUE_IDS = {
@@ -76,8 +66,6 @@ class FotMobScraper(SeleniumScraper):
         self,
         leagues: Optional[List[str]] = None,
         seasons: Optional[List[int]] = None,
-        headless: bool = True,
-        use_xvfb: bool = True,
         **kwargs
     ):
         """
@@ -86,30 +74,14 @@ class FotMobScraper(SeleniumScraper):
         Args:
             leagues: List of leagues to scrape
             seasons: List of seasons to scrape (e.g., [2023, 2024])
-            headless: Run browser in headless mode
-            use_xvfb: Use Xvfb virtual display to bypass headless detection
-            **kwargs: Additional arguments for SeleniumScraper
+            **kwargs: Additional arguments for BaseScraper
         """
         super().__init__(
             leagues=leagues,
             seasons=seasons,
-            headless=headless,
-            **kwargs
+            **kwargs,
         )
-        self.use_xvfb = use_xvfb
         self._session: Optional[requests.Session] = None
-        self._cookies_obtained = False
-
-    def _get_browser(self) -> CloudflareBypass:
-        """Get browser with FotMob-specific configuration."""
-        if self._browser is None:
-            self._browser = CloudflareBypass(
-                headless=self.headless,
-                use_xvfb=self.use_xvfb,
-                proxy=self.proxy,
-                page_load_timeout=45,
-            )
-        return self._browser
 
     def _format_season(self, season: int) -> str:
         """
@@ -126,57 +98,17 @@ class FotMobScraper(SeleniumScraper):
         return f"{season}/{season + 1}"
 
     def _get_session(self) -> requests.Session:
-        """Get or create requests session with FotMob cookies."""
+        """Get or create requests session for FotMob's public JSON API."""
         if self._session is None:
             self._session = requests.Session()
             self._session.headers.update({
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'User-Agent': 'Mozilla/5.0 (compatible; data-platform-football/1.0)',
                 'Accept': 'application/json, text/plain, */*',
                 'Accept-Language': 'en-US,en;q=0.9',
                 'Referer': self.BASE_URL,
                 'Origin': self.BASE_URL,
             })
-
-        if not self._cookies_obtained:
-            self._obtain_cookies()
-
         return self._session
-
-    def _obtain_cookies(self) -> None:
-        """Obtain session cookies from FotMob using Selenium."""
-        logger.info("Obtaining FotMob session cookies via Selenium")
-
-        try:
-            browser = self._get_browser()
-
-            # Navigate to FotMob to get cookies
-            browser.get_page(
-                self.BASE_URL,
-                wait_timeout=20,
-                cloudflare_wait=8.0,
-            )
-
-            # Additional wait for page to fully load
-            time.sleep(3)
-
-            # Get cookies from browser
-            cookies = browser.get_cookies()
-
-            # Transfer cookies to requests session
-            for cookie in cookies:
-                self._session.cookies.set(
-                    cookie['name'],
-                    cookie['value'],
-                    domain=cookie.get('domain', '.fotmob.com'),
-                    path=cookie.get('path', '/'),
-                )
-
-            self._cookies_obtained = True
-            logger.info(f"Obtained {len(cookies)} cookies from FotMob")
-
-        except Exception as e:
-            logger.error(f"Error obtaining FotMob cookies: {e}")
-            raise
 
     def _fetch_api_json(
         self,
@@ -209,15 +141,12 @@ class FotMobScraper(SeleniumScraper):
                     self._stats['successes'] += 1
                     return response.json()
 
-                elif response.status_code == 403:
-                    # Cookies expired, refresh them
-                    logger.warning("FotMob API returned 403, refreshing cookies")
-                    self._cookies_obtained = False
-                    self._obtain_cookies()
-                    continue
-
-                else:
-                    logger.warning(f"FotMob API returned {response.status_code}")
+                logger.warning(
+                    f"FotMob API returned {response.status_code} for {url} "
+                    f"params={params}"
+                )
+                if attempt < retry_count - 1:
+                    time.sleep(2 ** attempt)
 
             except requests.exceptions.RequestException as e:
                 logger.error(f"Request error: {e}")
@@ -559,6 +488,7 @@ class FotMobScraper(SeleniumScraper):
                 df=combined_df,
                 table_name='fotmob_schedule',
                 partition_cols=['league', 'season'],
+                replace_partitions=['league', 'season'],
             )
             results['schedule'] = table_path
 
@@ -568,6 +498,7 @@ class FotMobScraper(SeleniumScraper):
                 df=combined_df,
                 table_name='fotmob_team_stats',
                 partition_cols=['league', 'season'],
+                replace_partitions=['league', 'season'],
             )
             results['team_stats'] = table_path
 
@@ -577,6 +508,7 @@ class FotMobScraper(SeleniumScraper):
                 df=combined_df,
                 table_name='fotmob_player_stats',
                 partition_cols=['league', 'season'],
+                replace_partitions=['league', 'season'],
             )
             results['player_stats'] = table_path
 
@@ -588,5 +520,3 @@ class FotMobScraper(SeleniumScraper):
         if self._session:
             self._session.close()
             self._session = None
-
-        super().close()
