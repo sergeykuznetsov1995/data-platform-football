@@ -51,6 +51,9 @@ Gold Tables
 - ``gold.dim_competition``    — competition master-data from leagues.yaml (E2)
 - ``gold.dim_season``         — season master-data with valid_from/valid_to (E2)
 - ``gold.fct_team_match``     — long-form team metrics per match
+- ``gold.fct_team_season_stats`` — cross-source per-season team stats (T6.4 #94;
+                                FBref+Understat+WhoScored+SofaScore via xref_team)
+- ``gold.fct_team_season_stats_audit`` — DQ-audit diff'ы для fct_team_season_stats
 - ``gold.fct_player_match``   — player metrics per match
 - ``gold.fct_player_unavailable`` — confirmed absences (E5; from WhoScored)
 - ``gold.fct_player_market_value`` — FotMob market_value timeline per player×date
@@ -106,6 +109,15 @@ STAGE_2_DIMS = [
     ('fct_player_season_stats_audit',
      'dags/sql/gold/fct_player_season_stats_audit.sql',
      'fct_player_season_stats_audit', ['league', 'season']),
+    # T6.4 (#94) — cross-source team season facts + audit.
+    # 4-source (FBref spine + Understat + WhoScored + SofaScore) merged via
+    # silver.xref_team. Audit is WARNING-only and isolates HARD_FACT diffs
+    # from the business mart. Mirrors fct_player_season_stats pattern above.
+    ('fct_team_season_stats',     'dags/sql/gold/fct_team_season_stats.sql',
+     'fct_team_season_stats',     ['league', 'season']),
+    ('fct_team_season_stats_audit',
+     'dags/sql/gold/fct_team_season_stats_audit.sql',
+     'fct_team_season_stats_audit', ['league', 'season']),
 ]
 
 # E2: master-data dims that are NOT partitioned by (league, season).

@@ -1367,6 +1367,112 @@ def validate_gold_quality() -> Dict[str, Any]:
                        name='audit_diff[fct_keeper_season_stats_audit.saves_whoscored]'),
 
         # ============================================================
+        # T6.4 (#94): fct_team_season_stats — cross-source per-season team
+        # stats. FBref-spine + Understat/WhoScored/SofaScore через
+        # silver.xref_team. PK + ref_integrity (→ dim_team) ERROR; pct и
+        # MODELED value-range ERROR на нарушение домена.
+        # ============================================================
+        CHECK.no_duplicates('gold.fct_team_season_stats',
+                            pk=['team_id_canonical', 'league', 'season']),
+        CHECK.no_nulls('gold.fct_team_season_stats',
+                       cols=['team_id_canonical', 'league', 'season']),
+        CHECK.ref_integrity(
+            'gold.fct_team_season_stats',
+            'gold.dim_team',
+            'team_id_canonical',
+            parent_key='team_id',
+        ),
+        # MODELED xG/xA — bounded domain on season-level (≤ ~150 for top APL teams).
+        CHECK.value_range('gold.fct_team_season_stats', 'expected_goals',
+                          min_val=0, max_val=150, severity='ERROR'),
+        CHECK.value_range('gold.fct_team_season_stats', 'expected_goals_against',
+                          min_val=0, max_val=150, severity='ERROR'),
+        CHECK.value_range('gold.fct_team_season_stats', 'npxg',
+                          min_val=0, max_val=150, severity='ERROR'),
+        # Pct metrics — все в [0, 100] (ERROR).
+        CHECK.value_range('gold.fct_team_season_stats', 'possession_pct',
+                          min_val=0, max_val=100, severity='ERROR'),
+        CHECK.value_range('gold.fct_team_season_stats', 'save_pct',
+                          min_val=0, max_val=100, severity='ERROR'),
+        CHECK.value_range('gold.fct_team_season_stats', 'pass_pct',
+                          min_val=0, max_val=100, severity='ERROR'),
+        CHECK.value_range('gold.fct_team_season_stats', 'takeon_pct',
+                          min_val=0, max_val=100, severity='ERROR'),
+        CHECK.value_range('gold.fct_team_season_stats', 'accurate_passes_pct',
+                          min_val=0, max_val=100, severity='ERROR'),
+        CHECK.value_range('gold.fct_team_season_stats', 'possession_pct_avg',
+                          min_val=0, max_val=100, severity='ERROR'),
+        CHECK.value_range('gold.fct_team_season_stats', 'ground_duels_won_pct',
+                          min_val=0, max_val=100, severity='ERROR'),
+        CHECK.value_range('gold.fct_team_season_stats', 'aerial_duels_won_pct',
+                          min_val=0, max_val=100, severity='ERROR'),
+        CHECK.value_range('gold.fct_team_season_stats', 'total_duels_won_pct',
+                          min_val=0, max_val=100, severity='ERROR'),
+        CHECK.value_range('gold.fct_team_season_stats', 'accurate_long_balls_pct',
+                          min_val=0, max_val=100, severity='ERROR'),
+        CHECK.value_range('gold.fct_team_season_stats', 'set_piece_share_pct',
+                          min_val=0, max_val=100, severity='ERROR'),
+
+        # ============================================================
+        # T6.4 (#94) audit: fct_team_season_stats_audit — cross-source DQ
+        # для HARD_FACT diff'ов. INNER FBref ∩ Understat (primary secondary),
+        # LEFT WS/SS. WARNING-only — audit observability, не gate. Threshold
+        # ±1 для целочисленных событий, ±0.5 для xG-derived (RX2 r ≥ 0.99).
+        # NULL diff = "источник отсутствует" → засчитывается как passed.
+        # ============================================================
+        CHECK.no_duplicates('gold.fct_team_season_stats_audit',
+                            pk=['team_id_canonical', 'league', 'season']),
+        CHECK.no_nulls('gold.fct_team_season_stats_audit',
+                       cols=['team_id_canonical', 'league', 'season']),
+        CHECK.ref_integrity(
+            'gold.fct_team_season_stats_audit',
+            'gold.fct_team_season_stats',
+            'team_id_canonical',
+            parent_key='team_id_canonical',
+        ),
+        # ----- Understat diff (INNER spine: всегда non-NULL) -----
+        CHECK.coverage('gold.fct_team_season_stats_audit',
+                       condition='ABS(matches_diff_understat) <= 1 OR matches_diff_understat IS NULL',
+                       warn_threshold=0.95, error_threshold=0.0,
+                       name='audit_diff[fct_team_season_stats_audit.matches_understat]'),
+        CHECK.coverage('gold.fct_team_season_stats_audit',
+                       condition='ABS(goals_diff_understat) <= 1 OR goals_diff_understat IS NULL',
+                       warn_threshold=0.95, error_threshold=0.0,
+                       name='audit_diff[fct_team_season_stats_audit.goals_understat]'),
+        CHECK.coverage('gold.fct_team_season_stats_audit',
+                       condition='ABS(goals_against_diff_understat) <= 1 OR goals_against_diff_understat IS NULL',
+                       warn_threshold=0.95, error_threshold=0.0,
+                       name='audit_diff[fct_team_season_stats_audit.goals_against_understat]'),
+        # Understat не отдаёт shots count в season — no shots_diff_understat check.
+        # ----- WhoScored diff (LEFT, NULL when absent) -----
+        CHECK.coverage('gold.fct_team_season_stats_audit',
+                       condition='ABS(matches_diff_whoscored) <= 1 OR matches_diff_whoscored IS NULL',
+                       warn_threshold=0.95, error_threshold=0.0,
+                       name='audit_diff[fct_team_season_stats_audit.matches_whoscored]'),
+        CHECK.coverage('gold.fct_team_season_stats_audit',
+                       condition='ABS(shots_diff_whoscored) <= 2 OR shots_diff_whoscored IS NULL',
+                       warn_threshold=0.85, error_threshold=0.0,
+                       name='audit_diff[fct_team_season_stats_audit.shots_whoscored]'),
+        # ----- SofaScore diff (LEFT) -----
+        CHECK.coverage('gold.fct_team_season_stats_audit',
+                       condition='ABS(matches_diff_sofascore) <= 1 OR matches_diff_sofascore IS NULL',
+                       warn_threshold=0.95, error_threshold=0.0,
+                       name='audit_diff[fct_team_season_stats_audit.matches_sofascore]'),
+        CHECK.coverage('gold.fct_team_season_stats_audit',
+                       condition='ABS(goals_diff_sofascore) <= 1 OR goals_diff_sofascore IS NULL',
+                       warn_threshold=0.95, error_threshold=0.0,
+                       name='audit_diff[fct_team_season_stats_audit.goals_sofascore]'),
+        CHECK.coverage('gold.fct_team_season_stats_audit',
+                       condition='ABS(shots_diff_sofascore) <= 1 OR shots_diff_sofascore IS NULL',
+                       warn_threshold=0.95, error_threshold=0.0,
+                       name='audit_diff[fct_team_season_stats_audit.shots_sofascore]'),
+        # ----- MODELED xG diff (cross-source us vs ss) -----
+        CHECK.coverage('gold.fct_team_season_stats_audit',
+                       condition='ABS(xg_diff_us_vs_ss) <= 0.5 OR xg_diff_us_vs_ss IS NULL',
+                       warn_threshold=0.90, error_threshold=0.0,
+                       name='audit_diff[fct_team_season_stats_audit.xg_us_vs_ss]'),
+
+        # ============================================================
         # issue #46 audit: fct_player_match_audit — cross-source diff на
         # match-grain между FBref (primary spine), SofaScore (INNER secondary
         # spine), Understat (LEFT) и WhoScored (LEFT). 50 diff-колонок:
@@ -1685,6 +1791,12 @@ def validate_gold_row_counts() -> Dict[str, Any]:
         # на сезон × ~38 матчей × ~22 в составе ≈ 22000 audit-rows). Floor 1000
         # с запасом на тестовые/частичные backfill'ы.
         CHECK.row_count('gold.fct_player_match_audit', min_rows=1000),
+        # T6.4 (#94): cross-source team-season stats. APL spine ≈20 teams × 5+
+        # seasons = ≥100 expected, floor 80 с запасом на partition gaps.
+        # Audit INNER FBref ∩ Understat — Understat covers all APL seasons, so
+        # audit floor ≈ main fct (≈80).
+        CHECK.row_count('gold.fct_team_season_stats',       min_rows=80),
+        CHECK.row_count('gold.fct_team_season_stats_audit', min_rows=80),
         CHECK.row_count('gold.match_outcomes',   min_rows=3000),
 
         # ===== E2: master-data dim row-count floors =====
