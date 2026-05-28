@@ -476,3 +476,8 @@ teams:
         - "Ipswich"
         - "IpswichTown"
     competition_scope: ["ENG-Premier League"]
+
+  - canonical_name: "Sunderland"
+    aliases:
+      _generic: ["Sunderland"]
+    competition_scope: ["ENG-Premier League"]
