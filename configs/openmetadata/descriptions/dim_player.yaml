@@ -38,5 +38,5 @@ relationships:
     to: trino_iceberg.iceberg.gold.fct_player_match.player_id
     type: FOREIGN_KEY
   - from: player_id
-    to: trino_iceberg.iceberg.gold.feat_player_form.player_id
+    to: trino_iceberg.iceberg.gold.feat_player_form.player_id_canonical
     type: FOREIGN_KEY
