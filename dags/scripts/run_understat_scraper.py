@@ -133,14 +133,17 @@ def main():
 
             # Scrape per-match player stats (Silver layer requires this for xG joins)
             try:
-                pm_results = scraper.scrape_player_match_stats()
-                if pm_results:
-                    pm_table = pm_results.get('player_match_stats')
-                    if pm_table:
-                        results['tables'].append(pm_table)
-                        # Row count is recorded inside the wrapper; surface a marker.
-                        results['player_match_stats_rows'] = 1
-                        logger.info(f"Saved player_match_stats to {pm_table}")
+                df = scraper.read_player_match_stats()
+                if df is not None and not df.empty:
+                    table_path = scraper.save_to_iceberg(
+                        df=df,
+                        table_name='understat_player_match_stats',
+                        partition_cols=['league', 'season'],
+                        replace_partitions=['league', 'season'],
+                    )
+                    results['tables'].append(table_path)
+                    results['player_match_stats_rows'] = len(df)
+                    logger.info(f"Saved {len(df)} player match stats")
             except Exception as e:
                 error_msg = f"Player match stats scraping failed: {e}"
                 logger.error(error_msg)
