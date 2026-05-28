@@ -5,15 +5,15 @@
 -- Point-in-time safe: window excludes current match.
 --
 -- Sources: iceberg.gold.fct_player_match
--- PK: (match_id, player_id)
+-- PK: (match_id_canonical, player_id_canonical)
 -- Partitioning: (league, season)
 -- =============================================================================
 
 WITH base AS (
     SELECT
-        match_id,
-        player_id,
-        team_id,
+        match_id_canonical,
+        player_id_canonical,
+        team_id_canonical,
         league,
         season,
         minutes,
@@ -24,8 +24,8 @@ WITH base AS (
         yellow_cards,
         red_cards,
         ROW_NUMBER() OVER (
-            PARTITION BY player_id, season
-            ORDER BY match_id
+            PARTITION BY player_id_canonical, season
+            ORDER BY match_id_canonical
         ) AS appearance_rn
     FROM iceberg.gold.fct_player_match
 ),
@@ -43,15 +43,15 @@ rolled AS (
         SUM(red_cards)    OVER w                     AS l5_reds_sum_raw
     FROM base
     WINDOW w AS (
-        PARTITION BY player_id, season
-        ORDER BY match_id
+        PARTITION BY player_id_canonical, season
+        ORDER BY match_id_canonical
         ROWS BETWEEN 5 PRECEDING AND 1 PRECEDING
     )
 )
 SELECT
-    match_id,
-    player_id,
-    team_id,
+    match_id_canonical,
+    player_id_canonical,
+    team_id_canonical,
     CASE WHEN appearance_rn > 5 THEN l5_minutes_avg_raw  END AS l5_minutes_avg,
     CASE WHEN appearance_rn > 5 THEN l5_goals_avg_raw    END AS l5_goals_avg,
     CASE WHEN appearance_rn > 5 THEN l5_assists_avg_raw  END AS l5_assists_avg,
