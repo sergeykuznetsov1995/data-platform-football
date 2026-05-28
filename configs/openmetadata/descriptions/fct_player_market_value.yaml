@@ -1,0 +1,43 @@
+# =============================================================================
+# OpenMetadata description: iceberg.gold.fct_player_market_value
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.gold.fct_player_market_value
+  description: |
+    Timeline рыночной стоимости игроков (FotMob). Один row per
+    (player_id_canonical, value_date, league, season). Источник —
+    silver.fotmob_player_market_value_history (UNNEST из FotMob
+    market_values_json). Bridge FotMob player_id → canonical_id через
+    silver.xref_player WHERE source='fotmob' AND confidence <> 'orphan',
+    JOIN включает (league, season) предикат (CLAUDE.md footgun: иначе
+    1.5-4× fan-out). Cross-season дубликаты исторических точек ожидаемы
+    (FotMob отдаёт history в каждом ingest); потребитель фильтрует
+    WHERE season = (MAX) для «last view». TM расширение источника —
+    followup (silver.transfermarkt_market_value_history уже содержит
+    параллельный timeline + canonical_id). Latest точка дублируется в
+    dim_player_attributes.current_market_value_eur_fotmob для удобства
+    BI-карточки игрока (issue #11 Part B).
+  tags:
+    - Tier.Gold
+    - Domain.Football
+    - PII.Low
+columns:
+  - name: player_id_canonical
+    description: Канонический ID игрока (FK → dim_player_attributes / silver.xref_player).
+  - name: value_date
+    description: Дата фиксации market_value (исторический snapshot timeline).
+  - name: market_value_eur
+    description: Рыночная стоимость в EUR на value_date (BIGINT, value_range [0, 500M]).
+  - name: currency
+    description: Валюта котировки (обычно EUR).
+  - name: _bronze_ingested_at
+    description: Timestamp Bronze ingest'а из FotMob.
+  - name: league
+    description: Лига (partition key, current ingest league).
+  - name: season
+    description: Сезон bigint (e.g. 2025) — partition key, current ingest window.
+relationships:
+  - from: player_id_canonical
+    to: trino_iceberg.iceberg.gold.dim_player_attributes.player_id_canonical
+    type: FOREIGN_KEY
+    description: N:1 — таймлайн market_value для каждого канонического игрока.
