@@ -543,6 +543,11 @@ class FBrefBrowserMixin:
             for k, v in (real.get('restart_reasons') or {}).items():
                 restart_reasons[k] = restart_reasons.get(k, 0) + v
             self._stats['restart_reasons'] = restart_reasons
+            # Issue #116: surface CDP cache-miss counter for hit-rate analysis.
+            self._stats['resource_type_cache_misses'] = (
+                self._resource_type_cache_misses_base
+                + int(real.get('resource_type_cache_misses', 0) or 0)
+            )
         except Exception:
             pass
 
@@ -928,6 +933,9 @@ class FBrefBrowserMixin:
                 self._cf_challenge_attempts_base += int(real.get('cf_challenge_attempts', 0) or 0)
                 self._cf_challenges_passed_base += int(real.get('cf_challenges_passed', 0) or 0)
                 self._cf_challenges_failed_base += int(real.get('cf_challenges_failed', 0) or 0)
+                self._resource_type_cache_misses_base += int(
+                    real.get('resource_type_cache_misses', 0) or 0
+                )
                 for k, v in (real.get('restart_reasons') or {}).items():
                     self._restart_reasons_base[k] += v
                 if real.get('real_bytes_downloaded', 0) > 0:
@@ -962,6 +970,7 @@ class FBrefBrowserMixin:
             self._stats['cf_challenges_passed'] = self._cf_challenges_passed_base
             self._stats['cf_challenges_failed'] = self._cf_challenges_failed_base
             self._stats['restart_reasons'] = dict(self._restart_reasons_base)
+            self._stats['resource_type_cache_misses'] = self._resource_type_cache_misses_base
 
         # Reset HTTP session only when proxy changes (SlowProxyError, explicit close)
         if reset_http:

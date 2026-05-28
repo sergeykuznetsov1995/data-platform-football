@@ -252,12 +252,17 @@ class NodriverBypass:
         self._real_bytes_downloaded = 0
         self._real_requests_count = 0
         # Per-resource-type breakdown (Document / Script / XHR / Stylesheet /
-        # Image / Font / Other). Filled via Network.responseReceived which
-        # carries the resource_type — loadingFinished only has request_id +
-        # encoded bytes, so we cache the mapping. Issue #44.
+        # Image / Font / Other). Cache filled primarily via
+        # Network.requestWillBeSent (earliest event, always fires before
+        # loadingFinished) with Network.responseReceived kept as fallback for
+        # redirect chains. loadingFinished only has request_id + encoded
+        # bytes, so we look up the cached type. Issues #44, #116.
         self._real_bytes_by_resource_type: Counter = Counter()
         self._real_requests_by_resource_type: Counter = Counter()
         self._request_resource_types: dict = {}
+        # Diagnostic: count loadingFinished events that found no cached type
+        # (should stay close to 0 with requestWillBeSent in place). Issue #116.
+        self._resource_type_cache_misses = 0
         # CF bypass counters: attempt = entered get(), passed = first time
         # we see non-CF HTML (i.e. _setup_network_blocking() runs),
         # failed = exhausted max_retries with CF still blocking. Issue #44.
@@ -523,17 +528,41 @@ class NodriverBypass:
         # Enable Network domain
         await self._page.send(cdp_network.enable())
 
-        # Subscribe to responseReceived to cache (request_id -> resource_type).
-        # loadingFinished fires later with the actual encoded bytes but does
-        # not carry resource_type; we look it up from this cache. Issue #44.
+        # Normalise nodriver ResourceType enum → bare name ('Document',
+        # 'Script', 'Stylesheet', 'XHR', ...). enum-ish objects expose .name;
+        # bare strings may come through as 'ResourceType.Document' so we strip
+        # any dotted prefix.
+        def _rtype_name(rtype) -> str:
+            name = getattr(rtype, 'name', None)
+            if name:
+                return str(name)
+            s = str(rtype)
+            tail = s.rsplit('.', 1)[-1]
+            return tail or 'Other'
+
+        # Subscribe to requestWillBeSent — earliest CDP event, guaranteed to
+        # fire before loadingFinished. Caches (request_id -> resource_type)
+        # so the byte-counter handler can attribute size correctly.
+        # Issue #116 fix: responseReceived alone raced with loadingFinished
+        # and left the cache empty → everything fell into 'Other'.
+        def _on_request_will_be_sent(event):
+            try:
+                rid = getattr(event, 'request_id', None)
+                rtype = getattr(event, 'type_', None) or getattr(event, 'type', None)
+                if rid is not None and rtype is not None:
+                    self._request_resource_types[rid] = _rtype_name(rtype)
+            except Exception:
+                pass
+
+        # Subscribe to responseReceived as fallback: overrides the cached
+        # type if the response carries a different one (redirect chain,
+        # XHR-promoted preflight). Last writer wins.
         def _on_response_received(event):
             try:
                 rid = getattr(event, 'request_id', None)
                 rtype = getattr(event, 'type_', None) or getattr(event, 'type', None)
-                # nodriver wraps resource_type as an enum-ish object — str() it
-                rtype_str = str(rtype) if rtype is not None else 'Other'
-                if rid is not None:
-                    self._request_resource_types[rid] = rtype_str
+                if rid is not None and rtype is not None:
+                    self._request_resource_types[rid] = _rtype_name(rtype)
             except Exception:
                 pass
 
@@ -544,18 +573,22 @@ class NodriverBypass:
                 size = int(event.encoded_data_length or 0)
                 self._real_bytes_downloaded += size
                 self._real_requests_count += 1
-                # Resolve resource type from responseReceived cache; default
-                # to "Other" for entries that slipped (preflights etc).
                 rid = getattr(event, 'request_id', None)
-                rtype = self._request_resource_types.pop(rid, 'Other') if rid is not None else 'Other'
+                rtype = self._request_resource_types.pop(rid, None) if rid is not None else None
+                if rtype is None:
+                    self._resource_type_cache_misses += 1
+                    rtype = 'Other'
                 self._real_bytes_by_resource_type[rtype] += size
                 self._real_requests_by_resource_type[rtype] += 1
             except Exception:
                 pass
 
+        self._page.add_handler(cdp_network.RequestWillBeSent, _on_request_will_be_sent)
         self._page.add_handler(cdp_network.ResponseReceived, _on_response_received)
         self._page.add_handler(cdp_network.LoadingFinished, _on_loading_finished)
-        logger.debug("Network.responseReceived + loadingFinished tracking enabled")
+        logger.debug(
+            "Network tracking enabled: requestWillBeSent + responseReceived + loadingFinished"
+        )
 
     async def _setup_network_blocking(self):
         """Apply CDP Network.setBlockedURLs to block non-essential resources.
@@ -596,6 +629,7 @@ class NodriverBypass:
             'real_requests_count': self._real_requests_count,
             'real_bytes_by_resource_type': dict(self._real_bytes_by_resource_type),
             'real_requests_by_resource_type': dict(self._real_requests_by_resource_type),
+            'resource_type_cache_misses': self._resource_type_cache_misses,
             'cf_challenge_attempts': self._cf_challenge_attempts,
             'cf_challenges_passed': self._cf_challenges_passed,
             'cf_challenges_failed': self._cf_challenges_failed,
