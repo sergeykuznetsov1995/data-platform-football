@@ -86,6 +86,27 @@ def _get_traffic_diagnostics(scraper) -> dict:
     reqs_by_rtype = dict(stats.get('real_requests_by_resource_type', {}) or {})
     mb_by_rtype = {k: round(v / 1024 / 1024, 3) for k, v in bytes_by_rtype.items()}
 
+    # Issue #124 — curl_cffi HTTP fast-path counters (bypass CDP, so not in
+    # real_bytes_*). Aggregated with CDP into total_proxy_*_by_resource_type
+    # to give one canonical proxy-attribution view across both fetch paths.
+    http_bytes = stats.get('http_bytes_downloaded', 0)
+    http_requests = stats.get('http_requests_count', 0)
+    http_bytes_by_rtype = dict(stats.get('http_bytes_by_resource_type', {}) or {})
+    http_reqs_by_rtype = dict(stats.get('http_requests_by_resource_type', {}) or {})
+    http_mb_by_rtype = {
+        k: round(v / 1024 / 1024, 3) for k, v in http_bytes_by_rtype.items()
+    }
+
+    total_bytes_by_rtype = dict(bytes_by_rtype)
+    for k, v in http_bytes_by_rtype.items():
+        total_bytes_by_rtype[k] = total_bytes_by_rtype.get(k, 0) + v
+    total_reqs_by_rtype = dict(reqs_by_rtype)
+    for k, v in http_reqs_by_rtype.items():
+        total_reqs_by_rtype[k] = total_reqs_by_rtype.get(k, 0) + v
+    total_mb_by_rtype = {
+        k: round(v / 1024 / 1024, 3) for k, v in total_bytes_by_rtype.items()
+    }
+
     return {
         'bytes_downloaded': html_bytes,
         'pages_downloaded': stats.get('pages_downloaded', 0),
@@ -110,6 +131,16 @@ def _get_traffic_diagnostics(scraper) -> dict:
         'resource_type_cache_misses': int(
             stats.get('resource_type_cache_misses', 0) or 0
         ),
+        # Issue #124 — curl_cffi HTTP fast-path audit + CDP+HTTP aggregate.
+        'http_bytes_downloaded': http_bytes,
+        'http_mb_downloaded': round(http_bytes / 1024 / 1024, 3),
+        'http_requests_count': http_requests,
+        'http_bytes_by_resource_type': http_bytes_by_rtype,
+        'http_mb_by_resource_type': http_mb_by_rtype,
+        'http_requests_by_resource_type': http_reqs_by_rtype,
+        'total_proxy_bytes_by_resource_type': total_bytes_by_rtype,
+        'total_proxy_mb_by_resource_type': total_mb_by_rtype,
+        'total_proxy_requests_by_resource_type': total_reqs_by_rtype,
     }
 
 
@@ -157,6 +188,19 @@ def _write_traffic_summary(
         'html_mb_downloaded': traffic.get('mb_downloaded', 0.0),
         'pages_downloaded': traffic.get('pages_downloaded', 0),
         'overhead_ratio': traffic.get('overhead_ratio'),
+        # Issue #124 — curl_cffi HTTP fast-path audit + CDP+HTTP aggregate.
+        'http_mb_downloaded': traffic.get('http_mb_downloaded', 0.0),
+        'http_requests_count': traffic.get('http_requests_count', 0),
+        'http_mb_by_resource_type': traffic.get('http_mb_by_resource_type', {}),
+        'http_requests_by_resource_type': traffic.get(
+            'http_requests_by_resource_type', {}
+        ),
+        'total_proxy_mb_by_resource_type': traffic.get(
+            'total_proxy_mb_by_resource_type', {}
+        ),
+        'total_proxy_requests_by_resource_type': traffic.get(
+            'total_proxy_requests_by_resource_type', {}
+        ),
     }
     if extra:
         payload.update(extra)

@@ -43,6 +43,31 @@ _CHROME120_UA = (
 )
 
 
+def _content_type_to_resource_type(ct: str) -> str:
+    """Map HTTP Content-Type header to CDP-style resource_type label.
+
+    Mirrors NodriverBypass._rtype_name() labels so HTTP and CDP counters
+    can be merged into total_proxy_*_by_resource_type for unified audit
+    (issue #124).
+    """
+    mime = (ct or '').split(';', 1)[0].strip().lower()
+    if not mime:
+        return 'Other'
+    if mime == 'text/html':
+        return 'Document'
+    if mime == 'application/json':
+        return 'XHR'
+    if mime == 'text/css':
+        return 'Stylesheet'
+    if mime in ('application/javascript', 'text/javascript'):
+        return 'Script'
+    if mime.startswith('image/'):
+        return 'Image'
+    if mime.startswith('font/') or mime.startswith('application/font-'):
+        return 'Font'
+    return 'Other'
+
+
 class FBrefBrowserMixin:
     """
     Mixin providing browser lifecycle and page-fetching methods for FBrefScraper.
@@ -417,6 +442,29 @@ class FBrefBrowserMixin:
         try:
             response = self._http_session.get(url, timeout=30)
             self._http_request_count += 1
+
+            # Issue #124: account proxy bytes by resource_type for HTTP path.
+            # Counted before status check — proxy spent bytes regardless of
+            # response code. Uses decoded body length to match the legacy
+            # bytes_downloaded metric (acceptance: Document ≈ html_mb).
+            size = len(response.text or '')
+            rtype = _content_type_to_resource_type(
+                response.headers.get('content-type', '') or ''
+            )
+            self._stats['http_bytes_downloaded'] = (
+                self._stats.get('http_bytes_downloaded', 0) + size
+            )
+            self._stats['http_requests_count'] = (
+                self._stats.get('http_requests_count', 0) + 1
+            )
+            bytes_by_rt = self._stats.setdefault(
+                'http_bytes_by_resource_type', {}
+            )
+            reqs_by_rt = self._stats.setdefault(
+                'http_requests_by_resource_type', {}
+            )
+            bytes_by_rt[rtype] = bytes_by_rt.get(rtype, 0) + size
+            reqs_by_rt[rtype] = reqs_by_rt.get(rtype, 0) + 1
 
             if response.status_code != 200:
                 self._record_http_diag(
