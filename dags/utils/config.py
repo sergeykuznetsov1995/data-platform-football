@@ -73,6 +73,11 @@ MIN_ROW_THRESHOLDS: Dict[str, int] = {
     'team_stats': 18,       # 20 APL clubs, allow ~10% missing per rare stat_type
     'shots': 8000,          # ~10k shots/season, ~20% margin
     'elo_ratings': 100,     # ClubElo not in FBref-only roadmap; left unchanged
+    # WhoScored (issue #106): hidden-enabler thresholds. Without these keys,
+    # _validate_table() in dag_ingest_whoscored.py falls back to 0 and silently
+    # passes an empty schedule scrape (root cause of #102). Sized for APL 1 season.
+    'whoscored_schedule': 340,    # 380 fixtures/season - 5-10% margin
+    'whoscored_events': 500_000,  # ~540k events/season - 7% margin
 }
 
 # Tags for DAG organization
