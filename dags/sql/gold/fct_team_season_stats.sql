@@ -1,0 +1,268 @@
+-- =============================================================================
+-- Gold: fct_team_season_stats
+-- =============================================================================
+--
+-- Per-season cross-source team stats: FBref + Understat + WhoScored + SofaScore
+-- объединены через silver.xref_team. Mirror of `fct_player_season_stats` на
+-- team-уровне. Design contract: docs/decisions/T6_team_facts_schema.md §5.
+--
+--   * HARD_FACT counters (single column через COALESCE fb→us→ws→ss). FBref —
+--     primary spine. Cross-source diff'ы → `fct_team_season_stats_audit`.
+--   * MODELED xG / xA / NPxG — Understat primary (RX2: coverage 99.2% vs
+--     SS 84.6%; r ≥ 0.989). COALESCE fallback us → ss.
+--   * UNIQUE_<source> — single column без суффикса (метрика отсутствует у
+--     остальных источников).
+--   * FotMob (Phase 2, #97) — слот зарезервирован в COALESCE-цепочках,
+--     подключается без SQL-refactor.
+--
+-- Зерно: (team_id_canonical, league, season). Spine — FBref subset из
+-- xref_team. PK = natural composite (оба компонента NOT NULL по INNER FBref
+-- spine; xxhash64 + ROW_NUMBER tiebreaker не нужен — design doc §7).
+--
+-- Cross-source season type (verified vs production data 2026-05-28):
+--   * silver.xref_team.season для source='fbref'      = varchar year-start '2025'
+--   * silver.xref_team.season для source IN (understat,whoscored,sofascore)
+--                                                       = varchar slug '2526'
+--   * silver.fbref_team_season_profile.season         = bigint 2025
+--   * silver.understat_team_season.season             = varchar slug '2526'
+--   * silver.whoscored_team_season.season             = varchar slug '2526'
+--   * silver.sofascore_team_season.season             = varchar slug '2526'
+--
+--   FBref xref season — CAST varchar→bigint (2025 = 2025).
+--   Cross-source slug '2526' получаем из year-start через
+--     LPAD(year%100,2,'0') || LPAD((year+1)%100,2,'0').
+--   Note: design doc T6_team_facts_schema.md §4 ошибочно описал xref FBref
+--   season как slug — в реальности там year-start (как в bronze.fbref_schedule
+--   после CAST AS varchar). Followup для дока — отдельный PR.
+--
+-- xref source_id matching (verified vs xref_team.sql.j2):
+--   * fbref source_id     = bronze.fbref_schedule.home/away (squad NAME).
+--     fbref_team_season_profile хранит и `team` (squad name) и `team_id`
+--     (lookup ID) — JOIN через `fb.team` для совпадения с xref source_id.
+--   * understat            = team_id_canonical уже resolve'нут в Silver
+--     (`silver.understat_team_season` пришёл из team_match через canonical),
+--     LEFT JOIN напрямую по canonical_id (без xref CTE).
+--   * whoscored source_id  = bronze.whoscored_schedule.home/away_team (NAME).
+--     silver.whoscored_team_season.team_id наследуется от team_id_raw из
+--     events_spadl (NUMERIC после CAST(CAST(... AS BIGINT) AS varchar) — см.
+--     feedback_bronze_double_id_cast.md).
+--     KNOWN GAP: bronze.whoscored_schedule содержит и team_id (numeric) и
+--     team (name), но для APL заполнен только сезон '2021'. Для текущих
+--     сезонов (2425/2526) mapping numeric↔name отсутствует → WhoScored-блок
+--     будет NULL для большинства rows. Followup: либо добавить WS schedule
+--     backfill (preferred), либо resolve team_id_canonical в Silver-stage
+--     (T6.3 extension), либо matched-name probe through events. См. issue
+--     создаваемый в этом PR как followup.
+--   * sofascore source_id  = bronze.sofascore_schedule.home/away_team.
+--     silver.sofascore_team_season.team_id = CAST(schedule.home_team AS varchar).
+--
+-- xref JOIN MUST include (league, season) predicate (feedback_xref_join_season_predicate.md):
+--   silver.xref_team имеет per-(source, source_id, season) rows;
+--   без season-condition будет fan-out 1.5-4×.
+-- =============================================================================
+
+WITH
+xref_fbref AS (
+    SELECT DISTINCT
+        canonical_id,
+        source_id                                         AS fbref_team_name,
+        league,
+        CAST(season AS BIGINT)                            AS season_year,
+        -- Build slug '2526' from year-start '2025' for cross-source JOIN
+        LPAD(CAST(MOD(CAST(season AS BIGINT),     100) AS varchar), 2, '0')
+        || LPAD(CAST(MOD(CAST(season AS BIGINT)+1, 100) AS varchar), 2, '0')
+                                                          AS season_slug
+    FROM iceberg.silver.xref_team
+    WHERE source = 'fbref'
+      AND confidence <> 'orphan'
+),
+
+xref_ws AS (
+    SELECT DISTINCT
+        canonical_id,
+        source_id                                         AS ws_team_name,
+        league,
+        season                                            AS season_slug
+    FROM iceberg.silver.xref_team
+    WHERE source = 'whoscored'
+      AND confidence <> 'orphan'
+),
+
+xref_ss AS (
+    SELECT DISTINCT
+        canonical_id,
+        source_id                                         AS ss_team_name,
+        league,
+        season                                            AS season_slug
+    FROM iceberg.silver.xref_team
+    WHERE source = 'sofascore'
+      AND confidence <> 'orphan'
+),
+
+-- WhoScored numeric team_id ↔ team name mapping derived from bronze schedule.
+-- KNOWN GAP: schedule заполнен только для season '2021' (см. header) → для
+-- остальных сезонов JOIN не даст match и WS-колонки будут NULL. Followup-issue
+-- покрывает schedule backfill / Silver-side canonical resolve.
+ws_name_to_id AS (
+    SELECT DISTINCT
+        CAST(home_team_id AS varchar) AS ws_team_id,
+        home_team                     AS ws_team_name,
+        league,
+        season
+    FROM iceberg.bronze.whoscored_schedule
+    WHERE home_team_id IS NOT NULL
+    UNION
+    SELECT DISTINCT
+        CAST(away_team_id AS varchar) AS ws_team_id,
+        away_team                     AS ws_team_name,
+        league,
+        season
+    FROM iceberg.bronze.whoscored_schedule
+    WHERE away_team_id IS NOT NULL
+)
+
+SELECT
+    -- ========= Identity =========
+    xf.canonical_id                                      AS team_id_canonical,
+    xf.league                                            AS league,
+    xf.season_year                                       AS season,
+    COALESCE(fb.team, us.primary_team_name)              AS primary_team_name,
+
+    -- ========= HARD_FACT — counters (COALESCE fb → us → ws → ss) =========
+    CAST(COALESCE(fb.mp,             us.games_played, ws.matches_seen,  ss.appearances)    AS BIGINT) AS matches,
+    CAST(COALESCE(fb.minutes,                                            ss.minutes_played) AS BIGINT) AS minutes,
+    CAST(COALESCE(fb.goals,          us.goals,                          ss.goals)          AS BIGINT) AS goals,
+    CAST(COALESCE(fb.gk_goals_against, us.goals_against,                ss.goals_conceded) AS BIGINT) AS goals_against,
+    CAST(COALESCE(fb.assists,                                            ss.assists)        AS BIGINT) AS assists,
+    CAST(COALESCE(fb.yellow_cards,                                       ss.yellow_cards)   AS BIGINT) AS yellow_cards,
+    CAST(COALESCE(fb.red_cards,                                          ss.red_cards)      AS BIGINT) AS red_cards,
+    CAST(fb.second_yellow_cards                                                              AS BIGINT) AS second_yellow_cards,
+    -- Understat не агрегирует shots count в season-rollup (только goals/xG).
+    CAST(COALESCE(fb.total_shots,                     ws.shots_total,    ss.total_shots)   AS BIGINT) AS total_shots,
+    CAST(COALESCE(fb.shots_on_target,                 ws.shots_on_target_proxy, ss.shots_on_target) AS BIGINT) AS shots_on_target,
+    CAST(COALESCE(fb.fouls_committed,                 ws.fouls_committed, ss.fouls_committed) AS BIGINT) AS fouls_committed,
+    CAST(fb.fouls_drawn                                                                       AS BIGINT) AS fouls_drawn,
+    CAST(COALESCE(fb.offsides,                                            ss.offsides)       AS BIGINT) AS offsides,
+    CAST(COALESCE(fb.crosses,                                             ss.total_crosses)  AS BIGINT) AS crosses,
+    CAST(COALESCE(fb.interceptions,                   ws.interceptions,   ss.interceptions)  AS BIGINT) AS interceptions,
+    CAST(COALESCE(fb.tackles_won,                     ws.tackle_won,      ss.tackles_won)    AS BIGINT) AS tackles_won,
+    CAST(fb.penalties_won                                                                     AS BIGINT) AS penalties_won,
+    CAST(fb.penalties_conceded                                                                AS BIGINT) AS penalties_conceded,
+    CAST(fb.own_goals                                                                         AS BIGINT) AS own_goals,
+
+    -- ========= MODELED — xG/xA (Understat primary per RX2) =========
+    ROUND(COALESCE(us.xg,         ss.expected_goals),         2)         AS expected_goals,
+    ROUND(COALESCE(us.xg_against, ss.expected_goals_against), 2)         AS expected_goals_against,
+    ROUND(us.xpts, 2)                                                     AS xpts,
+    ROUND(us.npxg, 2)                                                     AS npxg,
+    ROUND(us.npxg_against, 2)                                             AS npxg_against,
+
+    -- ========= UNIQUE_FBREF — outfield team stats =========
+    fb.players_used,
+    ROUND(fb.avg_age, 1)                                  AS avg_age,
+    ROUND(fb.possession, 2)                               AS possession_pct,
+    ROUND(fb.goals_per_90, 2)                             AS goals_per_90,
+    ROUND(fb.goals_assists_per_90, 2)                     AS goals_assists_per_90,
+    ROUND(fb.non_penalty_goals_per_90, 2)                 AS non_penalty_goals_per_90,
+    ROUND(fb.shots_per_90, 2)                             AS shots_per_90,
+    ROUND(fb.shot_on_target_pct, 2)                       AS shot_on_target_pct,
+    ROUND(fb.goals_per_shot, 3)                           AS goals_per_shot,
+    ROUND(fb.goals_per_shot_on_target, 3)                 AS goals_per_shot_on_target,
+    fb.complete_matches,
+    fb.substitutions,
+    fb.unused_subs,
+    ROUND(fb.points_per_match, 2)                         AS points_per_match,
+    fb.on_field_goals,
+    fb.on_field_goals_against,
+    fb.plus_minus,
+    ROUND(fb.plus_minus_per_90, 2)                        AS plus_minus_per_90,
+
+    -- ========= UNIQUE_FBREF — goalkeeping aggregates =========
+    fb.gk_goals_against,
+    fb.gk_saves,
+    fb.gk_shots_on_target_against,
+    fb.clean_sheets,
+    fb.gk_minutes,
+    ROUND(fb.save_pct, 2)                                 AS save_pct,
+    fb.gk_pk_attempts_faced,
+    fb.gk_pk_allowed,
+    fb.gk_pk_saved,
+    ROUND(fb.goals_against_per_90, 2)                     AS goals_against_per_90,
+
+    -- ========= UNIQUE_UNDERSTAT — pressing / depth =========
+    ROUND(us.ppda, 2)                                     AS ppda,
+    ROUND(us.oppda, 2)                                    AS oppda,
+    us.deep_completions,
+    us.deep_completions_allowed,
+    us.wins,
+    us.draws,
+    us.losses,
+    us.points,
+
+    -- ========= UNIQUE_WHOSCORED — event-style aggregates =========
+    ws.pass_total,
+    ws.pass_ok,
+    ROUND(ws.pass_pct, 2)                                 AS pass_pct,
+    ws.key_passes_ws,
+    ws.takeon_att,
+    ws.takeon_won,
+    ROUND(ws.takeon_pct, 2)                               AS takeon_pct,
+    ws.clearances,
+    ws.ball_recoveries,
+    ws.touches_in_box,
+    ws.defensive_actions_third,
+    ROUND(ws.set_piece_share_pct, 2)                      AS set_piece_share_pct,
+
+    -- ========= UNIQUE_SOFASCORE — duels & breakdowns =========
+    ss.total_passes,
+    ss.accurate_passes,
+    ROUND(ss.accurate_passes_pct, 2)                      AS accurate_passes_pct,
+    ROUND(ss.possession_pct_avg, 2)                       AS possession_pct_avg,
+    ss.corner_kicks,
+    ss.ground_duels_won,
+    ss.ground_duels_total,
+    ROUND(ss.ground_duels_won_pct, 2)                     AS ground_duels_won_pct,
+    ss.aerial_duels_won,
+    ss.aerial_duels_total,
+    ROUND(ss.aerial_duels_won_pct, 2)                     AS aerial_duels_won_pct,
+    ROUND(ss.total_duels_won_pct, 2)                      AS total_duels_won_pct,
+    ss.accurate_long_balls,
+    ss.total_long_balls,
+    ROUND(ss.accurate_long_balls_pct, 2)                  AS accurate_long_balls_pct,
+    ss.accurate_crosses,
+    ss.total_crosses,
+
+    -- ========= Lineage =========
+    CURRENT_TIMESTAMP                                     AS _gold_created_at
+
+FROM xref_fbref xf
+INNER JOIN iceberg.silver.fbref_team_season_profile fb
+    ON  fb.team    = xf.fbref_team_name
+    AND fb.league  = xf.league
+    AND fb.season  = xf.season_year
+LEFT JOIN iceberg.silver.understat_team_season us
+    ON  us.team_id_canonical = xf.canonical_id
+    AND us.league            = xf.league
+    AND us.season            = xf.season_slug
+-- WhoScored: xref source_id = team NAME, Silver team_id = NUMERIC; bridge
+-- через bronze.whoscored_schedule (mapping name→numeric).
+LEFT JOIN xref_ws xw
+    ON  xw.canonical_id = xf.canonical_id
+    AND xw.league       = xf.league
+    AND xw.season_slug  = xf.season_slug
+LEFT JOIN ws_name_to_id wn
+    ON  wn.ws_team_name = xw.ws_team_name
+    AND wn.league       = xw.league
+    AND wn.season       = xw.season_slug
+LEFT JOIN iceberg.silver.whoscored_team_season ws
+    ON  ws.team_id = wn.ws_team_id
+    AND ws.league  = wn.league
+    AND ws.season  = wn.season
+LEFT JOIN xref_ss xs
+    ON  xs.canonical_id = xf.canonical_id
+    AND xs.league       = xf.league
+    AND xs.season_slug  = xf.season_slug
+LEFT JOIN iceberg.silver.sofascore_team_season ss
+    ON  ss.team_id = xs.ss_team_name
+    AND ss.league  = xs.league
+    AND ss.season  = xs.season_slug

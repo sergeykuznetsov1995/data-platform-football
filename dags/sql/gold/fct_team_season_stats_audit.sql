@@ -1,0 +1,149 @@
+-- =============================================================================
+-- Gold: fct_team_season_stats_audit
+-- =============================================================================
+--
+-- DQ-audit таблица для cross-source согласованности по HARD_FACT метрикам в
+-- `gold.fct_team_season_stats`. НЕ business-витрина: содержит ТОЛЬКО
+-- технические diff-колонки + PK.
+--
+-- Convention: diff = FBref - <source> для каждого HARD_FACT (FBref — primary
+-- spine на team-grain). Для MODELED xG diff'ы вычисляются между Understat и
+-- SofaScore (Understat = primary per RX2; FBref не отдаёт xG на team-level).
+--
+-- Зерно: (team_id_canonical, league, season). INNER JOIN FBref ∩ Understat
+-- (Understat = primary secondary с coverage 100% APL). WhoScored / SofaScore —
+-- LEFT JOIN → diff = NULL когда источник отсутствует.
+--
+-- Использование:
+--   1. DQ coverage WARNING — ABS(diff) <= threshold у ≥95% rows.
+--   2. Engineer-debug при «не сходятся goals/shots в дашборде».
+--   3. R1 калибровка thresholds → docs/research/R1_cross_source_thresholds.md.
+--
+-- Audit-таблица читает Silver заново (НЕ gold.fct_team_season_stats):
+--   one-hop правило (project_gold_cleanup_2026-05-12).
+-- =============================================================================
+
+WITH
+xref_fbref AS (
+    SELECT DISTINCT
+        canonical_id,
+        source_id                                         AS fbref_team_name,
+        league,
+        CAST(season AS BIGINT)                            AS season_year,
+        LPAD(CAST(MOD(CAST(season AS BIGINT),     100) AS varchar), 2, '0')
+        || LPAD(CAST(MOD(CAST(season AS BIGINT)+1, 100) AS varchar), 2, '0')
+                                                          AS season_slug
+    FROM iceberg.silver.xref_team
+    WHERE source = 'fbref'
+      AND confidence <> 'orphan'
+),
+
+xref_ws AS (
+    SELECT DISTINCT
+        canonical_id,
+        source_id                                         AS ws_team_name,
+        league,
+        season                                            AS season_slug
+    FROM iceberg.silver.xref_team
+    WHERE source = 'whoscored'
+      AND confidence <> 'orphan'
+),
+
+xref_ss AS (
+    SELECT DISTINCT
+        canonical_id,
+        source_id                                         AS ss_team_name,
+        league,
+        season                                            AS season_slug
+    FROM iceberg.silver.xref_team
+    WHERE source = 'sofascore'
+      AND confidence <> 'orphan'
+),
+
+-- WhoScored numeric↔name mapping (see main fct file header for KNOWN GAP).
+ws_name_to_id AS (
+    SELECT DISTINCT CAST(home_team_id AS varchar) AS ws_team_id,
+                    home_team                     AS ws_team_name,
+                    league, season
+    FROM iceberg.bronze.whoscored_schedule
+    WHERE home_team_id IS NOT NULL
+    UNION
+    SELECT DISTINCT CAST(away_team_id AS varchar) AS ws_team_id,
+                    away_team                     AS ws_team_name,
+                    league, season
+    FROM iceberg.bronze.whoscored_schedule
+    WHERE away_team_id IS NOT NULL
+)
+
+SELECT
+    -- ========= PK (грейн совпадает с fct_team_season_stats) =========
+    xf.canonical_id                                      AS team_id_canonical,
+    xf.league                                            AS league,
+    xf.season_year                                       AS season,
+
+    -- ========= Understat diff (INNER JOIN — всегда non-NULL) =========
+    (CAST(fb.mp                AS DOUBLE) - CAST(us.games_played AS DOUBLE)) AS matches_diff_understat,
+    (CAST(fb.goals             AS DOUBLE) - CAST(us.goals         AS DOUBLE)) AS goals_diff_understat,
+    (CAST(fb.gk_goals_against  AS DOUBLE) - CAST(us.goals_against AS DOUBLE)) AS goals_against_diff_understat,
+    -- Understat не агрегирует shots в season-grain → no shots_diff_understat.
+
+    -- ========= WhoScored diff (LEFT JOIN → NULL when absent) =========
+    (CAST(fb.mp              AS DOUBLE) - CAST(ws.matches_seen        AS DOUBLE)) AS matches_diff_whoscored,
+    (CAST(fb.total_shots     AS DOUBLE) - CAST(ws.shots_total         AS DOUBLE)) AS shots_diff_whoscored,
+    (CAST(fb.shots_on_target AS DOUBLE) - CAST(ws.shots_on_target_proxy AS DOUBLE)) AS shots_on_target_diff_whoscored,
+    (CAST(fb.interceptions   AS DOUBLE) - CAST(ws.interceptions       AS DOUBLE)) AS interceptions_diff_whoscored,
+    (CAST(fb.tackles_won     AS DOUBLE) - CAST(ws.tackle_won          AS DOUBLE)) AS tackles_won_diff_whoscored,
+    (CAST(fb.fouls_committed AS DOUBLE) - CAST(ws.fouls_committed     AS DOUBLE)) AS fouls_committed_diff_whoscored,
+
+    -- ========= SofaScore diff (LEFT JOIN → NULL when absent) =========
+    (CAST(fb.mp                AS DOUBLE) - CAST(ss.appearances       AS DOUBLE)) AS matches_diff_sofascore,
+    (CAST(fb.goals             AS DOUBLE) - CAST(ss.goals             AS DOUBLE)) AS goals_diff_sofascore,
+    (CAST(fb.gk_goals_against  AS DOUBLE) - CAST(ss.goals_conceded    AS DOUBLE)) AS goals_against_diff_sofascore,
+    (CAST(fb.assists           AS DOUBLE) - CAST(ss.assists           AS DOUBLE)) AS assists_diff_sofascore,
+    (CAST(fb.yellow_cards      AS DOUBLE) - CAST(ss.yellow_cards      AS DOUBLE)) AS yellow_cards_diff_sofascore,
+    (CAST(fb.red_cards         AS DOUBLE) - CAST(ss.red_cards         AS DOUBLE)) AS red_cards_diff_sofascore,
+    (CAST(fb.total_shots       AS DOUBLE) - CAST(ss.total_shots       AS DOUBLE)) AS shots_diff_sofascore,
+    (CAST(fb.shots_on_target   AS DOUBLE) - CAST(ss.shots_on_target   AS DOUBLE)) AS shots_on_target_diff_sofascore,
+    (CAST(fb.interceptions     AS DOUBLE) - CAST(ss.interceptions     AS DOUBLE)) AS interceptions_diff_sofascore,
+    (CAST(fb.tackles_won       AS DOUBLE) - CAST(ss.tackles_won       AS DOUBLE)) AS tackles_won_diff_sofascore,
+    (CAST(fb.fouls_committed   AS DOUBLE) - CAST(ss.fouls_committed   AS DOUBLE)) AS fouls_committed_diff_sofascore,
+    (CAST(fb.offsides          AS DOUBLE) - CAST(ss.offsides          AS DOUBLE)) AS offsides_diff_sofascore,
+    (CAST(fb.crosses           AS DOUBLE) - CAST(ss.total_crosses     AS DOUBLE)) AS crosses_diff_sofascore,
+
+    -- ========= MODELED xG diff (different models, expected to disagree) =========
+    -- FBref не отдаёт team-level xG → primary = Understat, secondary = SofaScore.
+    ROUND(CAST(us.xg         AS DOUBLE) - CAST(ss.expected_goals         AS DOUBLE), 4) AS xg_diff_us_vs_ss,
+    ROUND(CAST(us.xg_against AS DOUBLE) - CAST(ss.expected_goals_against AS DOUBLE), 4) AS xg_against_diff_us_vs_ss,
+
+    -- ========= Lineage =========
+    CURRENT_TIMESTAMP                                     AS _gold_created_at
+
+FROM xref_fbref xf
+INNER JOIN iceberg.silver.fbref_team_season_profile fb
+    ON  fb.team    = xf.fbref_team_name
+    AND fb.league  = xf.league
+    AND fb.season  = xf.season_year
+INNER JOIN iceberg.silver.understat_team_season us
+    ON  us.team_id_canonical = xf.canonical_id
+    AND us.league            = xf.league
+    AND us.season            = xf.season_slug
+LEFT JOIN xref_ws xw
+    ON  xw.canonical_id = xf.canonical_id
+    AND xw.league       = xf.league
+    AND xw.season_slug  = xf.season_slug
+LEFT JOIN ws_name_to_id wn
+    ON  wn.ws_team_name = xw.ws_team_name
+    AND wn.league       = xw.league
+    AND wn.season       = xw.season_slug
+LEFT JOIN iceberg.silver.whoscored_team_season ws
+    ON  ws.team_id = wn.ws_team_id
+    AND ws.league  = wn.league
+    AND ws.season  = wn.season
+LEFT JOIN xref_ss xs
+    ON  xs.canonical_id = xf.canonical_id
+    AND xs.league       = xf.league
+    AND xs.season_slug  = xf.season_slug
+LEFT JOIN iceberg.silver.sofascore_team_season ss
+    ON  ss.team_id = xs.ss_team_name
+    AND ss.league  = xs.league
+    AND ss.season  = xs.season_slug

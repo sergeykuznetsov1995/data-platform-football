@@ -1,0 +1,39 @@
+# =============================================================================
+# OpenMetadata description: iceberg.gold.fct_team_season_stats
+# =============================================================================
+# Stub created in T6.4 (#94). Full per-column documentation comes in T6.7 (#96).
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.gold.fct_team_season_stats
+  description: |
+    Wide per-season per-team stats объединяющие 4 источника
+    (FBref + Understat + WhoScored + SofaScore) через silver.xref_team.
+    FotMob (#97) зарезервирован Phase 2 слотом в COALESCE-цепочках.
+
+    Mirror волны T5 (`fct_player_season_stats`) на team-grain. Design contract:
+    `docs/decisions/T6_team_facts_schema.md` §5.
+
+    Правило выбора колонок:
+      * HARD_FACT (счётные event-метрики): single column через variadic
+        COALESCE(fb → us → ws → ss). FBref — primary spine. Cross-source
+        diff'ы хранятся в gold.fct_team_season_stats_audit.
+      * MODELED (xG/xA/NPxG): Understat primary per RX2 (coverage 99.2%,
+        r ≥ 0.989 между источниками). Single column через COALESCE(us → ss).
+      * UNIQUE_<source>: метрика отсутствует у других источников →
+        single column без суффикса.
+
+    Зерно: (team_id_canonical, league, season). PK = natural composite (оба
+    компонента NOT NULL по INNER FBref spine; xxhash64 + ROW_NUMBER tiebreaker
+    не нужен — см. design doc §7). Partitioning: (league, season).
+  tags:
+    - Tier.Gold
+    - Domain.Football
+columns:
+  # ─── Identity ───
+  - name: team_id_canonical
+    description: Канонический ID команды (PK part). FK → dim_team.team_id.
+  - name: league
+    description: Лига (partition key).
+  - name: season
+    description: Сезон в bigint формате (2025 == 2025/26). Partition key.
+  - name: primary_team_name
+    description: Display-имя команды (COALESCE FBref → Understat).

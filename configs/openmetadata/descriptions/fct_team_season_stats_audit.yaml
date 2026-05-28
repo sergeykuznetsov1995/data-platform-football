@@ -1,0 +1,38 @@
+# =============================================================================
+# OpenMetadata description: iceberg.gold.fct_team_season_stats_audit
+# =============================================================================
+# Stub created in T6.4 (#94). Full per-column documentation comes in T6.7 (#96).
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.gold.fct_team_season_stats_audit
+  description: |
+    DQ-audit таблица для cross-source согласованности HARD_FACT метрик в
+    gold.fct_team_season_stats. НЕ business-витрина: содержит ТОЛЬКО
+    технические diff-колонки + PK.
+
+    Convention: diff = FBref - <source> для каждого HARD_FACT (FBref —
+    primary spine). Для MODELED xG/xA diff'ы вычисляются между Understat
+    (primary per RX2) и SofaScore — FBref не отдаёт xG на team-level.
+
+    Зерно: (team_id_canonical, league, season). INNER FBref ∩ Understat
+    (Understat = primary secondary, 100% coverage APL). WhoScored/SofaScore —
+    LEFT JOIN → diff = NULL когда источник отсутствует.
+
+    Использование:
+      1. DQ coverage WARNING — ABS(diff) <= threshold у ≥95% rows.
+      2. Engineer-debug при «не сходятся goals/shots в дашборде».
+      3. Калибровка thresholds для R1_cross_source_thresholds.
+
+    Audit-таблица читает Silver заново (НЕ gold.fct_team_season_stats) —
+    one-hop правило (project_gold_cleanup_2026-05-12).
+  tags:
+    - Tier.Gold
+    - Domain.Football
+    - Audit.CrossSource
+columns:
+  # ─── PK ───
+  - name: team_id_canonical
+    description: Канонический ID команды (PK part). FK → fct_team_season_stats.team_id_canonical.
+  - name: league
+    description: Лига (partition key).
+  - name: season
+    description: Сезон в bigint формате (2025 == 2025/26). Partition key.
