@@ -67,6 +67,15 @@ def validate_data(**context) -> Dict[str, Any]:
         total_rows = validation['summary']['players_rows'] + validation['summary']['teams_rows']
         validation['status'] = 'partial_success' if total_rows > 0 else 'failed'
 
+    # Fail closed: пустой Bronze (CF-блок / "tab crashed") должен ВАЛИТЬ задачу,
+    # а не молча warn'ить — иначе DAG зелёный, пока Bronze протухает днями.
+    # См. docs/bronze_audit_2026-05-13.md §Phase 5 + issue #136.
+    if (validation['summary']['players_rows'] == 0
+            and validation['summary']['teams_rows'] == 0):
+        raise AirflowException(
+            "Zero rows scraped (players=0, teams=0) — SoFIFA Bronze is empty"
+        )
+
     # SoFIFA has lots of players, so we expect significant data
     if validation['summary']['players_rows'] < 1000:
         validation['warnings'].append("Low player count - possible scraping issue")
