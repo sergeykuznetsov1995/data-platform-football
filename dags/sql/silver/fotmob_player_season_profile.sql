@@ -93,7 +93,7 @@ SELECT
     -- ========= Identity (per-season attributes only) =========
     d.player_id,
     d.name                                                            AS player_name,
-    LOWER(json_extract_scalar(d.position_description, '$.primaryPosition.label')) AS primary_position,
+    LOWER(d.position_description) AS primary_position,
     d.primary_team_id,
     d.primary_team_name,
 
@@ -146,4 +146,4 @@ LEFT JOIN stats_pivoted s
     AND d.season    = s.season
 WHERE d.rn = 1
   AND NOT d.is_coach
-  AND LOWER(json_extract_scalar(d.position_description, '$.primaryPosition.label')) <> 'keeper'
+  AND LOWER(d.position_description) <> 'keeper'

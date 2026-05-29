@@ -99,4 +99,4 @@ LEFT JOIN stats_pivoted s
     AND d.season    = s.season
 WHERE d.rn = 1
   AND NOT d.is_coach
-  AND LOWER(json_extract_scalar(d.position_description, '$.primaryPosition.label')) = 'keeper'
+  AND LOWER(d.position_description) = 'keeper'
