@@ -115,8 +115,8 @@ columns:
     description: Голы на удар.
 
   # ─── UNIQUE_FOTMOB ───
-  - name: defensive_actions
-    description: Composite defensive actions (FotMob proprietary).
+  - name: defensive_actions_per_90
+    description: Composite defensive actions per 90 (FotMob proprietary).
   - name: big_chances_created
     description: Big chances created (FotMob).
   - name: big_chances_missed

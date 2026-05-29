@@ -108,23 +108,27 @@ SELECT
     CAST(COALESCE(fb.penalty_attempts,                                                ss.penalties_taken) AS BIGINT) AS penalty_attempts,
     CAST(COALESCE(fb.penalties_won,       fm.penalties_won,                           ss.penalty_won)    AS BIGINT) AS penalties_won,
     CAST(COALESCE(fb.penalties_conceded,  fm.penalties_conceded,                      ss.penalty_conceded) AS BIGINT) AS penalties_conceded,
-    CAST(COALESCE(fb.shots,               fm.shots,          ws.shots_total,         us.shots,           ss.total_shots) AS BIGINT) AS shots,
-    CAST(COALESCE(fb.shots_on_target,     fm.shots_on_target, ws.shots_on_target_proxy, ss.shots_on_target) AS BIGINT) AS shots_on_target,
-    CAST(COALESCE(fb.interceptions,       fm.interceptions,  ws.interceptions,        ss.interceptions)  AS BIGINT) AS interceptions,
+    -- NB (issue #154): FotMob silver больше не отдаёт абсолютные счётчики
+    -- (shots/tackles/clearances/... — только `*_per_90`), поэтому `fm.<count>`
+    -- удалён из COALESCE-цепочек ниже. FBref остаётся primary spine; ws/us/ss
+    -- покрывают эти HARD_FACT. НЕ возвращай `fm.<count>` — колонок нет в Silver.
+    CAST(COALESCE(fb.shots,                                  ws.shots_total,         us.shots,           ss.total_shots) AS BIGINT) AS shots,
+    CAST(COALESCE(fb.shots_on_target,                        ws.shots_on_target_proxy, ss.shots_on_target) AS BIGINT) AS shots_on_target,
+    CAST(COALESCE(fb.interceptions,                          ws.interceptions,        ss.interceptions)  AS BIGINT) AS interceptions,
     CAST(COALESCE(fb.tackles_won,         ws.tackle_won,                              ss.tackles_won)    AS BIGINT) AS tackles_won,
-    CAST(COALESCE(fm.tackles,             ws.tackle_att,                              ss.tackles)        AS BIGINT) AS tackles_attempted,
-    CAST(COALESCE(fb.fouls_committed,     fm.fouls_committed, ws.fouls_committed,    ss.fouls)          AS BIGINT) AS fouls_committed,
+    CAST(COALESCE(                        ws.tackle_att,                              ss.tackles)        AS BIGINT) AS tackles_attempted,
+    CAST(COALESCE(fb.fouls_committed,                        ws.fouls_committed,     ss.fouls)          AS BIGINT) AS fouls_committed,
     CAST(COALESCE(fb.fouls_drawn,                                                     ss.was_fouled)     AS BIGINT) AS fouls_drawn,
     CAST(COALESCE(fb.offsides,                                                        ss.offsides)       AS BIGINT) AS offsides,
-    CAST(COALESCE(fm.clearances,          ws.clearances,                              ss.clearances)     AS BIGINT) AS clearances,
-    CAST(COALESCE(fm.ball_recoveries,     ws.ball_recoveries,                         ss.ball_recoveries) AS BIGINT) AS ball_recoveries,
-    CAST(COALESCE(fm.blocks,                                                          ss.blocks)         AS BIGINT) AS blocks,
-    CAST(COALESCE(fm.successful_dribbles, ws.takeon_won,                              ss.dribbles)       AS BIGINT) AS successful_dribbles,
+    CAST(COALESCE(                        ws.clearances,                              ss.clearances)     AS BIGINT) AS clearances,
+    CAST(COALESCE(                        ws.ball_recoveries,                         ss.ball_recoveries) AS BIGINT) AS ball_recoveries,
+    CAST(ss.blocks                                                                                      AS BIGINT) AS blocks,
+    CAST(COALESCE(                        ws.takeon_won,                              ss.dribbles)       AS BIGINT) AS successful_dribbles,
     CAST(ws.takeon_att                                                                                  AS BIGINT) AS dribbles_attempted,
     CAST(ws.dribbles                                                                                    AS BIGINT) AS dribbles_completed_ws,  -- WS-specific SPADL "take_on" count (semantically different from takeon_won)
     CAST(COALESCE(ws.pass_total,                                                      ss.total_passes)   AS BIGINT) AS pass_total,
-    CAST(COALESCE(fm.accurate_passes,     ws.pass_ok,                                 ss.accurate_passes) AS BIGINT) AS accurate_passes,
-    CAST(COALESCE(fm.accurate_long_balls,                                             ss.accurate_long_balls) AS BIGINT) AS accurate_long_balls,
+    CAST(COALESCE(                        ws.pass_ok,                                 ss.accurate_passes) AS BIGINT) AS accurate_passes,
+    CAST(ss.accurate_long_balls                                                                         AS BIGINT) AS accurate_long_balls,
     CAST(ss.total_long_balls                                                                            AS BIGINT) AS total_long_balls,
     CAST(COALESCE(fb.crosses,                                                         ss.total_crosses)  AS BIGINT) AS crosses,
     CAST(ss.accurate_crosses                                                                            AS BIGINT) AS accurate_crosses,
@@ -178,11 +182,13 @@ SELECT
     -- defensive_actions — FotMob composite (нет в других). big_chances_*/
     -- chances_created — FotMob proprietary. poss_won_final_third — FotMob
     -- pressing-метрика (SS даёт att_third, но определения отличаются).
-    fm.defensive_actions,
+    -- defensive_actions / poss_won_final_third: FotMob silver хранит только
+    -- per-90 форму (issue #154) → выносим как `*_per_90` (count-формы нет).
+    fm.defensive_actions_per_90,
     ROUND(fm.big_chances_created, 2)                     AS big_chances_created,
     ROUND(fm.big_chances_missed, 2)                      AS big_chances_missed,
     ROUND(fm.chances_created, 2)                         AS chances_created,
-    fm.poss_won_final_third,
+    fm.poss_won_final_third_per_90,
 
     -- ========= UNIQUE_WHOSCORED =========
     -- bad_touches/touches_in_box/avg_x/avg_y — WS-specific event-aggregates,

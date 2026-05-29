@@ -150,10 +150,12 @@ class TestFctPlayerSeasonStatsSql:
     def test_unique_fotmob_columns_present(self):
         """UNIQUE_FOTMOB метрики, отсутствующие у других источников."""
         sql = _read_sql()
+        # issue #154: FotMob silver хранит defensive_actions / poss_won_final_third
+        # только в per-90 форме (absolute-полей больше нет) → проецируем `*_per_90`.
         unique_fotmob = [
-            'defensive_actions',
+            'defensive_actions_per_90',
             'big_chances_created', 'big_chances_missed', 'chances_created',
-            'poss_won_final_third',
+            'poss_won_final_third_per_90',
         ]
         for col in unique_fotmob:
             assert re.search(rf"fm\.{col}\b", sql, re.IGNORECASE), (

@@ -89,10 +89,11 @@ SELECT
     (CAST(fb.red_cards          AS DOUBLE) - CAST(fm.red_cards        AS DOUBLE)) AS red_cards_diff_fotmob,
     (CAST(fb.penalties_won      AS DOUBLE) - CAST(fm.penalties_won    AS DOUBLE)) AS penalties_won_diff_fotmob,
     (CAST(fb.penalties_conceded AS DOUBLE) - CAST(fm.penalties_conceded AS DOUBLE)) AS penalties_conceded_diff_fotmob,
-    (CAST(fb.shots              AS DOUBLE) - CAST(fm.shots            AS DOUBLE)) AS shots_diff_fotmob,
-    (CAST(fb.shots_on_target    AS DOUBLE) - CAST(fm.shots_on_target  AS DOUBLE)) AS shots_on_target_diff_fotmob,
-    (CAST(fb.interceptions      AS DOUBLE) - CAST(fm.interceptions    AS DOUBLE)) AS interceptions_diff_fotmob,
-    (CAST(fb.fouls_committed    AS DOUBLE) - CAST(fm.fouls_committed  AS DOUBLE)) AS fouls_committed_diff_fotmob,
+    -- NB (issue #154): FotMob silver больше не отдаёт абсолюты shots/
+    -- shots_on_target/interceptions/fouls/clearances/ball_recoveries/blocks/
+    -- accurate_passes/accurate_long_balls/successful_dribbles → соответствующие
+    -- diff-колонки удалены (нечего сравнивать). НЕ возвращай без восстановления
+    -- absolute-полей в silver.fotmob_player_season_profile.
 
     -- ========= WhoScored diff (LEFT JOIN → NULL if absent) =========
     (CAST(fb.mp              AS DOUBLE) - CAST(ws.matches_seen      AS DOUBLE)) AS matches_diff_whoscored,
@@ -101,12 +102,8 @@ SELECT
     (CAST(fb.interceptions   AS DOUBLE) - CAST(ws.interceptions     AS DOUBLE)) AS interceptions_diff_whoscored,
     (CAST(fb.tackles_won     AS DOUBLE) - CAST(ws.tackle_won        AS DOUBLE)) AS tackles_won_diff_whoscored,
     (CAST(fb.fouls_committed AS DOUBLE) - CAST(ws.fouls_committed   AS DOUBLE)) AS fouls_committed_diff_whoscored,
-    -- FBref не отдаёт clearances/ball_recoveries/blocks/pass_total/accurate_passes:
-    -- primary = FotMob, diff = FotMob - WS
-    (CAST(fm.clearances      AS DOUBLE) - CAST(ws.clearances        AS DOUBLE)) AS clearances_diff_whoscored,
-    (CAST(fm.ball_recoveries AS DOUBLE) - CAST(ws.ball_recoveries   AS DOUBLE)) AS ball_recoveries_diff_whoscored,
-    (CAST(fm.accurate_passes AS DOUBLE) - CAST(ws.pass_ok           AS DOUBLE)) AS accurate_passes_diff_whoscored,
-    (CAST(fm.successful_dribbles AS DOUBLE) - CAST(ws.takeon_won    AS DOUBLE)) AS successful_dribbles_diff_whoscored,
+    -- clearances/ball_recoveries/accurate_passes/successful_dribbles_diff_whoscored
+    -- удалены (issue #154): primary был FotMob, чьи absolute-поля больше нет в Silver.
 
     -- ========= Understat diff (LEFT JOIN → NULL if absent) =========
     (CAST(fb.mp           AS DOUBLE) - CAST(us.games_played   AS DOUBLE)) AS matches_diff_understat,
@@ -130,14 +127,9 @@ SELECT
     (CAST(fb.fouls_drawn        AS DOUBLE) - CAST(ss.was_fouled       AS DOUBLE)) AS fouls_drawn_diff_sofascore,
     (CAST(fb.offsides           AS DOUBLE) - CAST(ss.offsides         AS DOUBLE)) AS offsides_diff_sofascore,
     (CAST(fb.crosses            AS DOUBLE) - CAST(ss.total_crosses    AS DOUBLE)) AS crosses_diff_sofascore,
-    -- FBref не отдаёт clearances/ball_recoveries/blocks/key_passes/passes:
-    -- primary = FotMob или Understat, diff = primary - SS
-    (CAST(fm.clearances         AS DOUBLE) - CAST(ss.clearances       AS DOUBLE)) AS clearances_diff_sofascore,
-    (CAST(fm.ball_recoveries    AS DOUBLE) - CAST(ss.ball_recoveries  AS DOUBLE)) AS ball_recoveries_diff_sofascore,
-    (CAST(fm.blocks             AS DOUBLE) - CAST(ss.blocks           AS DOUBLE)) AS blocks_diff_sofascore,
-    (CAST(fm.accurate_passes    AS DOUBLE) - CAST(ss.accurate_passes  AS DOUBLE)) AS accurate_passes_diff_sofascore,
-    (CAST(fm.accurate_long_balls AS DOUBLE) - CAST(ss.accurate_long_balls AS DOUBLE)) AS accurate_long_balls_diff_sofascore,
-    (CAST(fm.successful_dribbles AS DOUBLE) - CAST(ss.dribbles        AS DOUBLE)) AS successful_dribbles_diff_sofascore,
+    -- clearances/ball_recoveries/blocks/accurate_passes/accurate_long_balls/
+    -- successful_dribbles_diff_sofascore удалены (issue #154): primary был FotMob,
+    -- чьи absolute-поля больше нет в Silver.
     (CAST(us.key_passes         AS DOUBLE) - CAST(ss.key_passes       AS DOUBLE)) AS key_passes_diff_sofascore,
 
     -- ========= MODELED xG diff (different models, expected to disagree) =========
