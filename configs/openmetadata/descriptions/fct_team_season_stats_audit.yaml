@@ -14,8 +14,10 @@ table:
     (primary per RX2) и SofaScore — FBref не отдаёт xG на team-level.
 
     Зерно: (team_id_canonical, league, season). INNER FBref ∩ Understat
-    (Understat = primary secondary, 100% coverage APL). WhoScored/SofaScore —
-    LEFT JOIN → diff = NULL когда источник отсутствует.
+    (Understat = primary secondary, 100% coverage APL). WhoScored/SofaScore/
+    FotMob (#97) — LEFT JOIN → diff = NULL когда источник отсутствует. FotMob
+    season-агрегаты недосчитаны (rollup только матчей со stats_json) → diff_fotmob
+    WARNING-only, surface'ит drift.
 
     Использование:
       1. DQ coverage WARNING — ABS(diff) <= threshold у ≥95% rows.

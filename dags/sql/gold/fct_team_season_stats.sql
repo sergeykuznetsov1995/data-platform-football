@@ -3,30 +3,31 @@
 -- =============================================================================
 --
 -- Per-season cross-source team stats: FBref + Understat + WhoScored + SofaScore
--- объединены через silver.xref_team. Mirror of `fct_player_season_stats` на
--- team-уровне. Design contract: docs/decisions/T6_team_facts_schema.md §5.
+-- + FotMob объединены через silver.xref_team. Mirror of `fct_player_season_stats`
+-- на team-уровне. Design contract: docs/decisions/T6_team_facts_schema.md §5.
 --
 --   * HARD_FACT counters (single column через COALESCE fb→us→ws→ss). FBref —
 --     primary spine. Cross-source diff'ы → `fct_team_season_stats_audit`.
---   * MODELED xG / xA / NPxG — Understat primary (RX2: coverage 99.2% vs
---     SS 84.6%; r ≥ 0.989). COALESCE fallback us → ss.
+--   * MODELED xG / NPxG — Understat primary (RX2: coverage 99.2% vs SS 84.6%;
+--     r ≥ 0.989). COALESCE fallback us → fm → ss.
+--   * MODELED xA (expected_assists) — FotMob only (#97); team-grain xA не отдают
+--     ни Understat, ни SofaScore на season-grain.
 --   * UNIQUE_<source> — single column без суффикса (метрика отсутствует у
---     остальных источников).
---   * FotMob (Phase 2, #97) — слот зарезервирован в COALESCE-цепочках,
---     подключается без SQL-refactor.
+--     остальных источников). FotMob (#97): xgot / big_chances / shots_*_box.
 --
 -- Зерно: (team_id_canonical, league, season). Spine — FBref subset из
 -- xref_team. PK = natural composite (оба компонента NOT NULL по INNER FBref
 -- spine; xxhash64 + ROW_NUMBER tiebreaker не нужен — design doc §7).
 --
 -- Cross-source season type (verified vs production data 2026-05-28):
---   * silver.xref_team.season для source='fbref'      = varchar year-start '2025'
+--   * silver.xref_team.season для source IN (fbref, fotmob) = varchar year-start '2025'
 --   * silver.xref_team.season для source IN (understat,whoscored,sofascore)
 --                                                       = varchar slug '2526'
 --   * silver.fbref_team_season_profile.season         = bigint 2025
 --   * silver.understat_team_season.season             = varchar slug '2526'
 --   * silver.whoscored_team_season.season             = varchar slug '2526'
 --   * silver.sofascore_team_season.season             = varchar slug '2526'
+--   * silver.fotmob_team_season.season                = varchar slug '2526'
 --
 --   FBref xref season — CAST varchar→bigint (2025 = 2025).
 --   Cross-source slug '2526' получаем из year-start через
@@ -99,6 +100,20 @@ xref_ss AS (
       AND confidence <> 'orphan'
 ),
 
+-- FotMob xref (#97). season is YEAR-START '2025' (bronze.fotmob_schedule is bigint),
+-- like FBref — JOIN on CAST(season_year AS varchar). silver.fotmob_team_season.season
+-- is slug '2526' → that fact JOINs on season_slug. team_id = team NAME (== source_id).
+xref_fm AS (
+    SELECT DISTINCT
+        canonical_id,
+        source_id                                         AS fm_team_name,
+        league,
+        season                                            AS season_year_str
+    FROM iceberg.silver.xref_team
+    WHERE source = 'fotmob'
+      AND confidence <> 'orphan'
+),
+
 -- WhoScored numeric team_id ↔ team name mapping derived from bronze schedule.
 -- KNOWN GAP: schedule заполнен только для season '2021' (см. header) → для
 -- остальных сезонов JOIN не даст match и WS-колонки будут NULL. Followup-issue
@@ -150,11 +165,14 @@ SELECT
     CAST(fb.penalties_conceded                                                                AS BIGINT) AS penalties_conceded,
     CAST(fb.own_goals                                                                         AS BIGINT) AS own_goals,
 
-    -- ========= MODELED — xG/xA (Understat primary per RX2) =========
-    ROUND(COALESCE(us.xg,         ss.expected_goals),         2)         AS expected_goals,
+    -- ========= MODELED — xG/xA (Understat primary per RX2; FotMob then SS fallback) =========
+    ROUND(COALESCE(us.xg,         fm.expected_goals, ss.expected_goals),  2) AS expected_goals,
+    -- FotMob has no team-grain xGA → COALESCE stays us → ss.
     ROUND(COALESCE(us.xg_against, ss.expected_goals_against), 2)         AS expected_goals_against,
+    -- expected_assists: FotMob is the ONLY source with team-grain xA (#97).
+    ROUND(fm.expected_assists, 2)                                        AS expected_assists,
     ROUND(us.xpts, 2)                                                     AS xpts,
-    ROUND(us.npxg, 2)                                                     AS npxg,
+    ROUND(COALESCE(us.npxg, fm.npxg), 2)                                  AS npxg,
     ROUND(us.npxg_against, 2)                                             AS npxg_against,
 
     -- ========= UNIQUE_FBREF — outfield team stats =========
@@ -209,7 +227,8 @@ SELECT
     ROUND(ws.takeon_pct, 2)                               AS takeon_pct,
     ws.clearances,
     ws.ball_recoveries,
-    ws.touches_in_box,
+    -- touches_in_box: WS is NULL for current seasons (#120) → fall back to FotMob.
+    COALESCE(ws.touches_in_box, fm.touches_in_box)        AS touches_in_box,
     ws.defensive_actions_third,
     ROUND(ws.set_piece_share_pct, 2)                      AS set_piece_share_pct,
 
@@ -231,6 +250,13 @@ SELECT
     ROUND(ss.accurate_long_balls_pct, 2)                  AS accurate_long_balls_pct,
     ss.accurate_crosses,
     ss.total_crosses,
+
+    -- ========= UNIQUE_FOTMOB — metrics no other source provides (#97) =========
+    ROUND(fm.xgot, 4)                                     AS xgot,
+    fm.big_chances,
+    fm.big_chances_missed,
+    fm.shots_inside_box,
+    fm.shots_outside_box,
 
     -- ========= Lineage =========
     CURRENT_TIMESTAMP                                     AS _gold_created_at
@@ -266,3 +292,12 @@ LEFT JOIN iceberg.silver.sofascore_team_season ss
     ON  ss.team_id = xs.ss_team_name
     AND ss.league  = xs.league
     AND ss.season  = xs.season_slug
+-- FotMob (#97): xref season year-start; silver.fotmob_team_season season slug.
+LEFT JOIN xref_fm xfm
+    ON  xfm.canonical_id   = xf.canonical_id
+    AND xfm.league         = xf.league
+    AND xfm.season_year_str = CAST(xf.season_year AS varchar)
+LEFT JOIN iceberg.silver.fotmob_team_season fm
+    ON  fm.team_id = xfm.fm_team_name
+    AND fm.league  = xf.league
+    AND fm.season  = xf.season_slug

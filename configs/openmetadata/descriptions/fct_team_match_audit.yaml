@@ -9,7 +9,7 @@ table:
 
     Grain: (match_id_canonical, team_id_canonical). Только строки с пересечением
     FBref ∩ Understat (INNER JOIN spine, design doc §8.3). SofaScore / WhoScored
-    — LEFT JOIN → diff = NULL при отсутствии записи.
+    / FotMob (#97) — LEFT JOIN → diff = NULL при отсутствии записи.
 
     WS-блок ожидаемо NULL для current seasons (2425/2526) — bridge
     bronze.whoscored_schedule (team_id NUMERIC ↔ NAME) заполнен только для
@@ -90,6 +90,32 @@ columns:
     description: |
       Diff фолов: ss.fouls - ws.fouls_committed. FBref не отдаёт team-fouls на
       match-grain → spine = SofaScore. NULL для current seasons (#120).
+
+  # ─── vs FotMob (#97, LEFT — NULL при отсутствии) ───
+  - name: goals_for_diff_fm
+    description: "Diff голов: fb.goals_for - fm.goals_for."
+  - name: goals_against_diff_fm
+    description: "Diff пропущенных: fb.goals_against - fm.goals_against."
+  - name: shots_diff_fm
+    description: "Diff ударов: fb.shots - fm.total_shots."
+  - name: shots_on_target_diff_fm
+    description: "Diff ударов в створ: fb.shots_on_target - fm.shots_on_target."
+  - name: possession_diff_fm
+    description: "Diff владения: fb.possession - fm.possession_pct."
+  - name: yellow_cards_diff_fm
+    description: "Diff жёлтых: fb.yellow_cards - fm.yellow_cards."
+  - name: red_cards_diff_fm
+    description: "Diff красных: fb.red_cards - fm.red_cards."
+  - name: xg_diff_us_fm
+    description: "Cross-model xG diff: us.xg - fm.expected_goals (разные xG-модели)."
+  - name: passes_diff_ss_fm
+    description: "Diff пасов: ss.total_passes - fm.total_passes (FBref не отдаёт team-passes)."
+  - name: corners_diff_ss_fm
+    description: "Diff угловых: ss.corner_kicks - fm.corner_kicks."
+  - name: fouls_diff_ss_fm
+    description: "Diff фолов: ss.fouls - fm.fouls."
+  - name: offsides_diff_ss_fm
+    description: "Diff офсайдов: ss.offsides - fm.offsides."
 
   # ─── Lineage ───
   - name: _gold_created_at

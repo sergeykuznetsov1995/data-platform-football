@@ -20,7 +20,7 @@
 
 Ключевые решения:
 - **Spine** — FBref: `silver.fbref_team_season_profile` (season) и `silver.fbref_match_enriched` (match). У FBref полное покрытие APL и каноническая роль в `silver.xref_team`.
-- **4 источника** в Phase 1: **FBref + Understat + WhoScored + SofaScore**. FotMob = Phase 2 slot (#97 blocked) — резервируется в column-mapping и COALESCE-цепочках, чтобы при подключении не делать SQL-refactor.
+- **5 источников**: **FBref + Understat + WhoScored + SofaScore** (Phase 1, #91–#96) + **FotMob** (Phase B, #97 — **DONE 2026-05-29**). FotMob подключён к `fct_team_match` + `fct_team_season_stats` + обе audit-таблицы; даёт **team-grain xA** (`expected_assists` — единственный источник) + xgot / big_chances / shots_*_box, слот в COALESCE для xG/npxg, и COALESCE-fill для `touches_in_box` (закрывает WS-пробел текущих сезонов). Подробности подключения — см. §14 ниже.
 - **Audit-таблицы** — отдельные `<table>_audit` (separate from business fct), INNER JOIN на FBref ∩ secondary source, WARNING-only DQ (см. `feedback_audit_in_separate_table.md`).
 - **PK** — natural composite (без xxhash64): `(team_id_canonical, league, season)` для season-таблицы, `(match_id_canonical, team_id_canonical)` для match-таблицы. Оба компонента non-NULL по конструкции INNER spine.
 - **xref JOIN predicate** — ВСЕГДА `(source, source_id, league, season)`; пропуск `(league, season)` даёт row fan-out 1.5-4× (см. `feedback_xref_join_season_predicate.md`).
@@ -639,3 +639,45 @@ Threshold `≤1` для целочисленных counters; `≤0.2` для xG-
   - `dags/sql/gold/fct_team_match.sql` — v1 (to be extended)
   - `dags/sql/gold/fct_player_season_stats.sql` — структурный образец
   - `dags/sql/gold/fct_player_season_stats_audit.sql` — audit-template
+
+---
+
+## 14. FotMob (#97 Phase B) — implementation notes (DONE 2026-05-29)
+
+Подключение FotMob 5-м источником вскрыло отклонения от исходного column-mapping
+(§5/§6 cells помеченные `(#97)`). Что фактически сделано и какие грабли:
+
+**Silver:**
+- `silver.fotmob_team_match` (Phase A) — **исправлен `team_id`**: исходно отдавал
+  NUMERIC FotMob team_id (как WhoScored), что не джойнилось с `xref_team.source_id`
+  (= team NAME). Теперь выдаёт **team NAME** (`bronze.fotmob_match_details.home_team/away_team`);
+  внутренний xA-join по numeric `teamId` сохранён через служебную `team_id_numeric`.
+  → прямой name-based JOIN в Gold, **без** WhoScored-style numeric↔name моста.
+- `silver.fotmob_team_season` (NEW) — rollup из `fotmob_team_match` через `GROUP BY
+  team_id, league, season`. **Incomplete-season caveat**: суммирует только матчи со
+  `stats_json` (~89% календаря) → SUM-счётчики недосчитаны vs FBref; `appearances`
+  показывает реальное число. Поэтому FotMob НЕ primary в COALESCE для goals/shots.
+
+**Season-формат footgun (verified на проде):** `bronze.fotmob_schedule.season` —
+bigint year-start → `silver.xref_team` и `silver.xref_match` для FotMob хранят season
+как **year-start `'2025'`** (как FBref), НЕ slug. Но `fotmob_team_match/season` факт —
+slug `'2526'`. → во всех 4 Gold-файлах FotMob xref-бриджи джойнятся на
+`CAST(season AS varchar)` (year-start), а сам факт — на `season_slug`.
+
+**Gold business-витрины (по решению «максимум метрик»):**
+- `fct_team_match` / `fct_team_season_stats`:
+  - `expected_assists` — fill из FotMob (был NULL; единственный team-grain xA источник).
+  - `expected_goals` / `npxg` — FotMob добавлен в COALESCE (us → fm → ss / us → fm).
+  - `expected_goals_against` — FotMob НЕ участвует (нет team-grain xGA на match-level).
+  - `touches_in_box` — `COALESCE(ws, fm)` (FotMob закрывает WS-пробел current seasons).
+  - **NEW UNIQUE_FOTMOB**: `xgot`, `big_chances`, `big_chances_missed`,
+    `shots_inside_box`, `shots_outside_box`, `blocked_shots`, `shots_off_target`,
+    `clearances` (match); `xgot`/`big_chances`/`big_chances_missed`/`shots_*_box` (season).
+  - Дублирующие метрики (possession, passes, fouls, cards, …) в витрину НЕ добавлены —
+    идут в audit как diff.
+
+**Audit:** `*_diff_fm` (match) и `*_diff_fotmob` (season) — LEFT JOIN, WARNING-only
+(`error_threshold=0.0`). Промоут в ERROR — после ≥3 зелёных прогонов (gate как #48).
+
+**Verified 2026-05-29:** fan-out отсутствует (760/сезон APL без изменений), PK без
+дублей, xA fill 676/760 match (89%) и 20/20 season; targeted DQ — 0 ERROR.

@@ -1,5 +1,5 @@
 -- =============================================================================
--- Gold: fct_team_match (v2 — 4-source: FBref + Understat + WhoScored + SofaScore)
+-- Gold: fct_team_match (v2 — 5-source: FBref + Understat + WhoScored + SofaScore + FotMob)
 -- =============================================================================
 -- Long-form fact: one row per (match_id, team_id).
 --
@@ -16,6 +16,7 @@
 --   iceberg.silver.understat_team_match    (#91 — xg/ppda/deep)
 --   iceberg.silver.whoscored_team_match    (#92 — SPADL event aggregates)
 --   iceberg.silver.sofascore_team_match    (#93 — passes/duels/corners)
+--   iceberg.silver.fotmob_team_match       (#97 — team-grain xA + xgot/big_chances)
 --   iceberg.silver.xref_team / xref_match  (canonical bridge per source)
 --   iceberg.bronze.whoscored_schedule      (numeric↔name bridge for WS team_id)
 --
@@ -33,6 +34,9 @@
 --     is NAME ('Liverpool'). Bridge via bronze.whoscored_schedule (numeric+name pair)
 --     is populated only for season='2021' — WS block is intentionally NULL for current
 --     seasons until issue #120 lands canonical resolution in Silver.
+--   * FotMob xref_team/xref_match.season is YEAR-START '2025' (bronze.fotmob_schedule
+--     season is bigint), but silver.fotmob_team_match.season is SLUG '2526'. JOIN the
+--     xref bridges on CAST(season AS varchar), the fact on season_slug.
 -- =============================================================================
 
 WITH
@@ -107,6 +111,36 @@ xref_match_ss AS (
         season        AS season_slug
     FROM iceberg.silver.xref_match
     WHERE source = 'sofascore'
+      AND confidence <> 'orphan'
+),
+
+-- ===== FotMob xref (issue #97 — 5th source) =====
+-- FotMob team_id in silver.fotmob_team_match is the team NAME (== xref source_id),
+-- so a direct JOIN works (no WhoScored-style numeric↔name bridge needed).
+-- FOOTGUN: bronze.fotmob_schedule.season is BIGINT year-start (2025) → xref_team /
+-- xref_match store season as YEAR-START '2025' (like FBref), NOT slug. But the
+-- silver.fotmob_team_match fact uses slug '2526'. So the xref bridges below JOIN on
+-- the year-start string (CAST(dim_match.season AS varchar)), while the fact JOINs on
+-- season_slug. See feedback_xref_team_source_id_format.md.
+xref_team_fm AS (
+    SELECT DISTINCT
+        canonical_id,
+        source_id   AS fm_team_name,
+        league,
+        season      AS season_year
+    FROM iceberg.silver.xref_team
+    WHERE source = 'fotmob'
+      AND confidence <> 'orphan'
+),
+
+xref_match_fm AS (
+    SELECT DISTINCT
+        canonical_id  AS match_id_canonical,
+        source_id     AS fm_match_id,
+        league,
+        season        AS season_year
+    FROM iceberg.silver.xref_match
+    WHERE source = 'fotmob'
       AND confidence <> 'orphan'
 ),
 
@@ -225,14 +259,14 @@ SELECT
     END AS result,
     u.is_completed,
 
-    -- ===== v2 MODELED — xG / xA (Understat primary per RX2; SS fallback) =====
-    ROUND(COALESCE(us.xg,          ss.expected_goals),         4) AS expected_goals,
+    -- ===== v2 MODELED — xG / xA (Understat primary per RX2; FotMob then SS fallback) =====
+    ROUND(COALESCE(us.xg,          fm.expected_goals, ss.expected_goals),  4) AS expected_goals,
+    -- FotMob does not expose team-grain xGA at match grain → COALESCE stays us → ss.
     ROUND(COALESCE(us.xg_against,  ss.expected_goals_against), 4) AS expected_goals_against,
-    -- expected_assists: neither silver.understat_team_match nor silver.sofascore_team_match
-    -- exposes team-grain xA. Column reserved per design doc §6.2 for Phase 2 FotMob (#97);
-    -- emits NULL until source data is available.
-    CAST(NULL AS DOUBLE)                                          AS expected_assists,
-    ROUND(us.npxg, 4)                                             AS npxg,
+    -- expected_assists: FotMob is the ONLY source with team-grain xA (#97). Understat /
+    -- SofaScore team-stats do not expose it. Filled from silver.fotmob_team_match.
+    ROUND(fm.expected_assists, 4)                                 AS expected_assists,
+    ROUND(COALESCE(us.npxg, fm.npxg), 4)                          AS npxg,
 
     -- ===== v2 UNIQUE_UNDERSTAT (pressing / depth) =====
     us.ppda,
@@ -247,7 +281,8 @@ SELECT
     ws.tackle_won,
     ws.takeon_att,
     ws.takeon_won,
-    ws.touches_in_box,
+    -- touches_in_box: WS is NULL for current seasons (#120) → fall back to FotMob.
+    COALESCE(ws.touches_in_box, fm.touches_in_box)               AS touches_in_box,
     ws.key_passes_ws,
 
     -- ===== v2 UNIQUE_SOFASCORE (passing / duels / breakdowns) =====
@@ -259,6 +294,16 @@ SELECT
     ss.offsides        AS offsides_ss,
     ss.ground_duels_won,
     ss.aerial_duels_won,
+
+    -- ===== v2 UNIQUE_FOTMOB (#97 — metrics no other source provides at match grain) =====
+    ROUND(fm.xgot, 4)                                            AS xgot,
+    fm.big_chances,
+    fm.big_chances_missed,
+    fm.shots_inside_box,
+    fm.shots_outside_box,
+    fm.blocked_shots,
+    fm.shots_off_target,
+    fm.clearances,
 
     -- ===== Lineage =====
     CURRENT_TIMESTAMP                                             AS _gold_created_at,
@@ -317,6 +362,24 @@ LEFT JOIN iceberg.silver.sofascore_team_match ss
     AND ss.team_id  = xts.ss_team_name
     AND ss.league   = u.league
     AND ss.season   = u.season_slug
+
+-- ===== FotMob bridge (LEFT, #97) =====
+-- silver.fotmob_team_match.team_id is the team NAME → JOIN xref_team directly.
+-- xref season is YEAR-START ('2025'); the fact season is SLUG ('2526') — JOIN each
+-- on its own format (dual-format footgun, see CTE comment above).
+LEFT JOIN xref_team_fm xtf
+    ON  xtf.canonical_id = u.team_id
+    AND xtf.league       = u.league
+    AND xtf.season_year  = CAST(u.season AS varchar)
+LEFT JOIN xref_match_fm xmf
+    ON  xmf.match_id_canonical = u.match_id
+    AND xmf.league             = u.league
+    AND xmf.season_year        = CAST(u.season AS varchar)
+LEFT JOIN iceberg.silver.fotmob_team_match fm
+    ON  fm.match_id = xmf.fm_match_id
+    AND fm.team_id  = xtf.fm_team_name
+    AND fm.league   = u.league
+    AND fm.season   = u.season_slug
 
 WHERE u.match_id IS NOT NULL
   AND u.team_id  IS NOT NULL

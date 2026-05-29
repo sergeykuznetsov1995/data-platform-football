@@ -8,10 +8,11 @@ table:
     представлены отдельно. Источник для rolling-фич (feat_team_form,
     feat_team_h2h, feat_team_event_style) и BI-отчётов по командным метрикам.
 
-    v2 (issue #95, T6 wave): 4-source консолидация — FBref (spine) + Understat
-    (xG/pressing) + WhoScored (event-aggregates) + SofaScore (passes/duels).
-    Все v1 FBref колонки сохранены под прежними именами (backwards-compat).
-    Кросс-источниковые diff'ы вынесены в gold.fct_team_match_audit (WARNING DQ).
+    v2 (issue #95, T6 wave): 5-source консолидация — FBref (spine) + Understat
+    (xG/pressing) + WhoScored (event-aggregates) + SofaScore (passes/duels) +
+    FotMob (#97 — team-grain xA + xgot/big_chances). Все v1 FBref колонки
+    сохранены под прежними именами (backwards-compat). Кросс-источниковые diff'ы
+    вынесены в gold.fct_team_match_audit (WARNING DQ).
 
     Грейн: (match_id, team_id) — физически каждый матч в таблице дважды
     (с домашней и гостевой стороны).
@@ -58,19 +59,21 @@ columns:
   # ===== v2 MODELED (xG primary = Understat per RX2; SS fallback) =====
   - name: expected_goals
     description: |
-      Ожидаемые голы команды (xG). Источник: Understat primary (RX2 —
-      coverage 99%, r≥0.99); SofaScore fallback. NULL для матчей без US/SS.
+      Ожидаемые голы команды (xG). Источник: COALESCE(Understat, FotMob,
+      SofaScore) — Understat primary (RX2 — coverage 99%, r≥0.99).
+      NULL для матчей без всех трёх.
   - name: expected_goals_against
     description: |
       xG, пропущенные командой. Источник: Understat (xg_against) primary,
-      SofaScore (expected_goals_against) fallback.
+      SofaScore (expected_goals_against) fallback. FotMob не отдаёт team-grain
+      xGA на match-уровне → не участвует в цепочке.
   - name: expected_assists
     description: |
-      Ожидаемые ассисты (xA). Reserved per design doc §6.2 — текущие Silver
-      US/SS team-match не отдают xA на team-grain; колонка NULL до FotMob
-      Phase 2 (#97).
+      Ожидаемые ассисты (xA) команды. Источник: FotMob (#97) — SUM per-player
+      xA. Единственный источник team-grain xA (US/SS его не отдают).
+      NULL для матчей без FotMob stats_json (~11% — отменённые/несыгранные).
   - name: npxg
-    description: Non-penalty xG (Understat-only, US.npxg).
+    description: Non-penalty xG. COALESCE(Understat, FotMob).
   # ===== v2 UNIQUE_UNDERSTAT (pressing / depth) =====
   - name: ppda
     description: Passes Per Defensive Action (Understat). Метрика прессинга —
@@ -98,8 +101,8 @@ columns:
     description: Успешные обводки (WhoScored). NULL для current seasons (#120).
   - name: touches_in_box
     description: |
-      Касания мяча в штрафной соперника (WhoScored). Маркер атакующей
-      угрозы. NULL для current seasons (#120).
+      Касания мяча в штрафной соперника. COALESCE(WhoScored, FotMob) —
+      WS NULL для current seasons (#120), поэтому FotMob закрывает пробел.
   - name: key_passes_ws
     description: |
       Ключевые пасы (WhoScored). Суффикс _ws — SofaScore тоже отдаёт
@@ -122,6 +125,23 @@ columns:
     description: Выигранные единоборства на земле (SofaScore).
   - name: aerial_duels_won
     description: Выигранные верховые единоборства (SofaScore).
+  # ===== v2 UNIQUE_FOTMOB (#97 — нет у других источников на team-match grain) =====
+  - name: xgot
+    description: xG on target — модельная ценность точно пробитого удара (FotMob).
+  - name: big_chances
+    description: Big chances — явные голевые моменты (FotMob).
+  - name: big_chances_missed
+    description: Big chances missed (FotMob).
+  - name: shots_inside_box
+    description: Удары из штрафной (FotMob).
+  - name: shots_outside_box
+    description: Удары вне штрафной (FotMob).
+  - name: blocked_shots
+    description: Заблокированные удары (FotMob).
+  - name: shots_off_target
+    description: Удары мимо створа (FotMob).
+  - name: clearances
+    description: Выносы (FotMob).
   # ===== Lineage =====
   - name: _gold_created_at
     description: Время материализации CTAS (UTC).

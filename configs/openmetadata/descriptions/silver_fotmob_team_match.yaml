@@ -26,9 +26,13 @@ columns:
   - name: match_id
     description: FotMob match_id (varchar; SCALAR из bronze.fotmob_match_details).
   - name: team_id
-    description: FotMob team_id (varchar). NUMERIC bronze ID — bridge на canonical через silver.xref_team source='fotmob'.
+    description: |
+      FotMob team NAME (varchar, bronze home_team/away_team), напр. 'Manchester
+      United'. Совпадает с silver.xref_team.source_id (source='fotmob') → прямой
+      JOIN в Gold без numeric↔name моста. Внутри SQL xA берётся per-player по
+      numeric teamId, но в выходе экспонируется NAME для канонизации.
   - name: opponent_id
-    description: ID соперника в этом матче (FotMob team_id).
+    description: NAME соперника в этом матче (FotMob, bronze home_team/away_team).
   - name: is_home
     description: TRUE если команда играла дома, FALSE если в гостях.
   - name: goals_for

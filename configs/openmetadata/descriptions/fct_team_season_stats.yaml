@@ -5,9 +5,10 @@
 table:
   fullyQualifiedName: trino_iceberg.iceberg.gold.fct_team_season_stats
   description: |
-    Wide per-season per-team stats объединяющие 4 источника
-    (FBref + Understat + WhoScored + SofaScore) через silver.xref_team.
-    FotMob (#97) зарезервирован Phase 2 слотом в COALESCE-цепочках.
+    Wide per-season per-team stats объединяющие 5 источников
+    (FBref + Understat + WhoScored + SofaScore + FotMob) через silver.xref_team.
+    FotMob (#97) даёт team-grain xA (expected_assists — единственный источник) +
+    xgot / big_chances / shots_*_box.
 
     Mirror волны T5 (`fct_player_season_stats`) на team-grain. Design contract:
     `docs/decisions/T6_team_facts_schema.md` §5.
