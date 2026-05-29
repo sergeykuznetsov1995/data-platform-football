@@ -79,17 +79,56 @@ class TestXrefTeamTemplateStructure:
                 f"source {src!r} missing as quoted literal in xref_team.sql.j2"
             )
 
-    def test_canonical_id_normalize_pattern(self):
-        """canonical_id resolved branch uses LOWER(REGEXP_REPLACE(canonical_name, ...))."""
+    def test_canonical_id_uses_explicit_slug(self):
+        """Resolved branch returns the explicit YAML slug, NOT a name-derived
+        one (issue #141 — identity must not come from the display name)."""
         sql = _read_template()
+        # matched branch: `WHEN canonical_id IS NOT NULL THEN canonical_id`
         pattern = re.compile(
-            r"LOWER\s*\(\s*REGEXP_REPLACE\s*\(\s*canonical_name",
+            r"WHEN\s+canonical_id\s+IS\s+NOT\s+NULL\s+THEN\s+canonical_id",
             re.IGNORECASE,
         )
         assert pattern.search(sql), (
-            "expected `LOWER(REGEXP_REPLACE(canonical_name, ...))` for the "
-            "alias-resolved canonical_id branch"
+            "expected `WHEN canonical_id IS NOT NULL THEN canonical_id` — the "
+            "resolved canonical_id must be the explicit YAML slug"
         )
+        # The old name-derived idiom must be gone for the matched branch.
+        assert not re.search(
+            r"REGEXP_REPLACE\s*\(\s*canonical_name", sql, re.IGNORECASE
+        ), "canonical_id must no longer be derived from canonical_name"
+
+    def test_orphan_id_still_derived_from_source_id(self):
+        """Orphan fallback slug is unchanged: LOWER(REGEXP_REPLACE(source_id, ...))."""
+        sql = _read_template()
+        assert re.search(
+            r"LOWER\s*\(\s*REGEXP_REPLACE\s*\(\s*source_id", sql, re.IGNORECASE
+        ), "orphan canonical_id must stay source_id-derived (stable for dim_team)"
+
+    def test_alias_join_uses_normalisation(self):
+        """Stage 3: alias JOIN matches on a normalised key, not the raw name."""
+        sql = _read_template()
+        # aliases CTE precomputes a `norm` column; JOIN matches on `a.norm`.
+        assert re.search(r"\bAS\s+norm\b", sql, re.IGNORECASE), (
+            "aliases CTE must expose a precomputed `norm` join key"
+        )
+        assert re.search(r"a\.norm\s*=", sql, re.IGNORECASE), (
+            "JOIN must match on the normalised key `a.norm = ...`"
+        )
+        # Normalisation building blocks: lower + diacritic strip + suffix strip.
+        assert "normalize(lower(" in sql.lower(), "expected normalize(lower(...))"
+        assert r"\p{Mn}" in sql, "expected diacritic (combining-mark) strip"
+        assert re.search(r"\(fc\|afc\|cf\)", sql, re.IGNORECASE), (
+            "expected trailing legal-form suffix strip (fc|afc|cf)"
+        )
+
+    def test_alias_cte_has_three_columns(self):
+        """aliases CTE binds the 3-tuple VALUES: (raw_name, canonical_name, canonical_id)."""
+        sql = _read_template()
+        assert re.search(
+            r"AS\s+t\s*\(\s*raw_name\s*,\s*canonical_name\s*,\s*canonical_id\s*\)",
+            sql,
+            re.IGNORECASE,
+        ), "aliases CTE must bind t(raw_name, canonical_name, canonical_id)"
 
     def test_orphan_id_prefix_per_source(self):
         """Each source has a 2-letter orphan prefix (fb_/us_/ws_/...)."""
@@ -160,7 +199,8 @@ class TestXrefTeamRendered:
 
         # Fresh read so a previous test cannot poison the lru_cache state.
         reset_cache()
-        values = get_team_alias_sql_values()
+        # xref_team consumes 3-column tuples (issue #141) — match the DAG call.
+        values = get_team_alias_sql_values(with_canonical_id=True)
         return render_sql_template(SQL_PATH, team_aliases_values_sql=values)
 
     def test_render_leaves_no_active_jinja_placeholders(self, rendered: str):

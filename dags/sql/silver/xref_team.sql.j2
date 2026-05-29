@@ -4,10 +4,15 @@
 -- Maps source-specific team-name → canonical team_id across 8 sources.
 --
 -- This template renders ONE `{{ team_aliases_values_sql }}` placeholder which
--- is filled by `dags.utils.medallion_config.get_team_alias_sql_values()`.
--- The placeholder must produce a comma-separated list of two-tuples in the
--- form `('raw_name', 'canonical_name'), ...`. See `medallion_config.py`
--- (T1 deliverable) for escape rules and the public-API contract.
+-- is filled by `medallion_config.get_team_alias_sql_values(with_canonical_id=True)`.
+-- The placeholder must produce a comma-separated list of three-tuples in the
+-- form `('raw_name', 'canonical_name', 'canonical_id'), ...`. See
+-- `medallion_config.py` for escape rules and the public-API contract.
+--
+-- Identity (issue #141): `canonical_id` is the explicit identity slug declared
+-- in `team_aliases.yaml` — it is NOT derived from the display name here. Two
+-- real clubs with similar names (Spartak Moscow vs Nalchik) get distinct slugs
+-- in YAML and therefore never silently merge.
 --
 -- DAG-integration note: T4 will wrap this SELECT in
 -- `CREATE TABLE iceberg.silver.xref_team AS ...` via
@@ -54,10 +59,24 @@
 -- =============================================================================
 
 WITH aliases AS (
-    SELECT raw_name, canonical_name
+    SELECT
+        raw_name,
+        canonical_name,
+        canonical_id,
+        -- Normalised join key (issue #141, stage 3): lower → strip diacritics →
+        -- drop a trailing legal-form suffix (FC/AFC/CF) → remove all remaining
+        -- non-alphanumerics. Lets "Liverpool FC" match the "Liverpool" alias
+        -- without a hand-written row, and absorbs ~80% of cosmetic variants.
+        regexp_replace(
+            regexp_replace(
+                regexp_replace(normalize(lower(raw_name), NFD), '\p{Mn}+', ''),
+                '\s+(fc|afc|cf)$', ''
+            ),
+            '[^a-z0-9]+', ''
+        ) AS norm
     FROM (VALUES
         {{ team_aliases_values_sql }}
-    ) AS t(raw_name, canonical_name)
+    ) AS t(raw_name, canonical_name, canonical_id)
 ),
 
 raw_teams AS (
@@ -131,18 +150,33 @@ resolved AS (
         rt.league,
         rt.season,
         a.canonical_name,
-        CASE WHEN a.canonical_name IS NOT NULL THEN 'name_alias' ELSE 'orphan' END
+        a.canonical_id,
+        CASE WHEN a.canonical_id IS NOT NULL THEN 'name_alias' ELSE 'orphan' END
             AS confidence
     FROM raw_teams rt
+    -- Match on the normalised key (NOT the raw string). Same normalisation as
+    -- the `aliases.norm` column above, applied to the Bronze raw team-name.
     LEFT JOIN aliases a
-      ON a.raw_name = rt.source_id
+      ON a.norm = regexp_replace(
+                      regexp_replace(
+                          regexp_replace(
+                              normalize(lower(rt.source_id), NFD), '\p{Mn}+', ''
+                          ),
+                          '\s+(fc|afc|cf)$', ''
+                      ),
+                      '[^a-z0-9]+', ''
+                  )
 )
 
 SELECT
     CASE
-        WHEN canonical_name IS NOT NULL
-          THEN LOWER(REGEXP_REPLACE(canonical_name, '[^a-zA-Z0-9]+', '_'))
+        WHEN canonical_id IS NOT NULL
+          THEN canonical_id   -- explicit identity slug from YAML (issue #141)
         ELSE
+            -- orphan fallback: source-prefixed slug of the raw name. Unchanged
+            -- from the original — orphan canonical_ids are excluded from every
+            -- cross-source Gold JOIN (confidence <> 'orphan'), so their format
+            -- must stay stable for dim_team.
             CASE source
                 WHEN 'fbref'        THEN 'fb_'
                 WHEN 'understat'    THEN 'us_'
@@ -164,7 +198,8 @@ SELECT
     CAST(NULL AS double)                      AS match_score
 FROM resolved
 GROUP BY
-    -- canonical_id is a deterministic function of (source, source_id, canonical_name)
-    -- so grouping by (source, source_id, league, season, canonical_name) is enough
-    -- to enforce the documented PK and dedupe identical rows from the UNION.
+    -- canonical_id is now the explicit YAML slug (1:1 with canonical_name) or the
+    -- orphan fallback (a function of source + source_id) — so grouping by
+    -- (canonical_id-expr, source, source_id, league, season, canonical_name) is
+    -- enough to enforce the documented PK and dedupe identical UNION rows.
     1, source, source_id, league, season, canonical_name

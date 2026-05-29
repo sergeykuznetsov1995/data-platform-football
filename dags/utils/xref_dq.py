@@ -618,6 +618,68 @@ def evaluate_orphan_rate_per_source(
     }
 
 
+def report_orphan_teams(
+    table: str = 'iceberg.silver.xref_team',
+    limit: int = 200,
+) -> Dict[str, Any]:
+    """List the distinct un-aliased (``confidence='orphan'``) teams in an xref
+    team table (issue #141, stage 4).
+
+    Unlike :func:`evaluate_orphan_rate_per_source` (which yields *rates*), this
+    yields the actual raw team-names that failed to glue, so a maintainer can
+    extend ``team_aliases.yaml`` for exactly what is broken — e.g. a SofaScore
+    "Liverpool FC" that never matched the "Liverpool" alias.
+
+    Returns::
+
+        {
+            'total_orphans': int,         # distinct (source, source_id, league, season)
+            'per_source': {'sofascore': 3, ...},
+            'rows': [{'source', 'league', 'season', 'source_id'}, ...],  # ≤ limit
+            'truncated': bool,
+        }
+
+    Informational only — never raises. Wire into the xref validation task and
+    push to XCom / logs.
+    """
+    qualified = _qualify(table)
+    sql = (
+        "SELECT source, league, season, source_id "
+        f"FROM {qualified} "
+        "WHERE confidence = 'orphan' "
+        "GROUP BY source, league, season, source_id "
+        "ORDER BY source, league, season, source_id"
+    )
+    conn = _get_conn()
+    try:
+        cur = conn.cursor()
+        try:
+            cur.execute(sql)
+            rows = cur.fetchall()
+        finally:
+            cur.close()
+    finally:
+        conn.close()
+
+    per_source: Dict[str, int] = {}
+    out_rows: List[Dict[str, Any]] = []
+    for src, league, season, source_id in rows:
+        per_source[src] = per_source.get(src, 0) + 1
+        if len(out_rows) < limit:
+            out_rows.append({
+                'source': src,
+                'league': league,
+                'season': season,
+                'source_id': source_id,
+            })
+    return {
+        'total_orphans': len(rows),
+        'per_source': per_source,
+        'rows': out_rows,
+        'truncated': len(rows) > limit,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Bronze-vs-xref freshness gap (Issue #15 regression guard)
 # ---------------------------------------------------------------------------
