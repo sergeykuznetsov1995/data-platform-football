@@ -245,6 +245,23 @@ class FotMobScraper(BaseScraper):
             return None
         return json.dumps(value, ensure_ascii=False, default=str)
 
+    @staticmethod
+    def _position_label(value: Any) -> Optional[str]:
+        """FotMob ``positionDescription`` is an object; keep the readable
+        primary-position label for the scalar ``position_description`` column
+        (e.g. ``{primaryPosition: {label: 'Right Back'}}`` -> 'Right Back')."""
+        if isinstance(value, dict):
+            return (value.get('primaryPosition') or {}).get('label')
+        return value
+
+    @staticmethod
+    def _date_str(value: Any) -> Optional[str]:
+        """FotMob date fields may be ``{utcTime, timezone}`` objects; keep the
+        ISO ``utcTime`` for plain date columns (e.g. ``contract_end``)."""
+        if isinstance(value, dict):
+            return value.get('utcTime')
+        return value
+
     # ------------------------------------------------------------------ #
     # Daily league-level entities (schedule / team_stats / player_stats)
     # ------------------------------------------------------------------ #
@@ -937,10 +954,10 @@ class FotMobScraper(BaseScraper):
                 'gender': d.get('gender'),
                 'primary_team_id': primary_team.get('teamId'),
                 'primary_team_name': primary_team.get('teamName'),
-                'position_description': d.get('positionDescription'),
+                'position_description': self._position_label(d.get('positionDescription')),
                 'main_league_id': main_league.get('leagueId'),
                 'main_league_name': main_league.get('leagueName'),
-                'contract_end': d.get('contractEnd'),
+                'contract_end': self._date_str(d.get('contractEnd')),
                 'player_information_json': self._jdump(d.get('playerInformation')),
                 'injury_information_json': self._jdump(d.get('injuryInformation')),
                 'trophies_json': self._jdump(d.get('trophies')),
