@@ -442,10 +442,18 @@ class FotMobScraper(BaseScraper):
         season: int = None
     ) -> Optional[pd.DataFrame]:
         """
-        Read player statistics for a season.
+        Read full per-player season stats across all leaderboard categories.
+
+        Walks ``stats.players[]`` and follows each category's ``fetchAllUrl``
+        (``data.fotmob.com/stats/.../<cat>.json``) to fetch the COMPLETE player
+        list (``TopLists[0].StatList[]``), not just the top-3 preview — yielding
+        one long-format row per (participant_id × stat_name). Downstream Silver
+        (``fotmob_player_season_profile`` / ``fotmob_keeper_profile``) and the
+        xref player resolver depend on ``participant_id`` + ``minutes_played``.
 
         Args:
-            stat_type: Type of statistics (goals, assists, rating, etc.)
+            stat_type: Kept for call-site compatibility; ignored — every
+                category is fetched.
             league: League name
             season: Season year
 
@@ -465,42 +473,50 @@ class FotMobScraper(BaseScraper):
         if not data:
             return None
 
+        categories = (data.get('stats') or {}).get('players') or []
+        if not categories:
+            logger.warning(f"No player leaderboard categories for {league} {season}")
+            return None
+
         try:
-            # Extract player stats from league data
-            players = []
+            rows = []
+            for cat in categories:
+                url = cat.get('fetchAllUrl')
+                if not url:
+                    continue
+                payload = self._fetch_api_json(url)
+                top_lists = (payload or {}).get('TopLists') or []
+                if not top_lists:
+                    continue
+                top = top_lists[0]
+                header = top.get('Title') or cat.get('header')
+                group = top.get('Category') or cat.get('category')
+                stat_name = top.get('StatName') or cat.get('name')
+                for item in top.get('StatList') or []:
+                    rows.append({
+                        # NB: FotMob misspells the player id key as 'ParticiantId'
+                        # (no second 'p') — matches bronze.fotmob_player_details.player_id.
+                        'participant_id': item.get('ParticiantId'),
+                        'participant_name': item.get('ParticipantName'),
+                        'team_id': item.get('TeamId'),
+                        'team_name': item.get('TeamName'),
+                        'country_code': item.get('ParticipantCountryCode'),
+                        'rank': item.get('Rank'),
+                        'stat_value': item.get('StatValue'),
+                        'sub_stat_value': item.get('SubStatValue'),
+                        'stat_value_count': item.get('StatValueCount'),
+                        'matches_played': item.get('MatchesPlayed'),
+                        'minutes_played': item.get('MinutesPlayed'),
+                        'stat_category_header': header,
+                        'stat_category_group': group,
+                        'stat_name': stat_name,
+                    })
 
-            stats_data = data.get('stats', {})
-            if stats_data:
-                # FotMob has different stat categories in 'players' list
-                stat_categories = stats_data.get('players', []) or stats_data.get('topLists', [])
-
-                for category in stat_categories:
-                    cat_name = category.get('header', '') or category.get('name', '')
-                    # FotMob uses 'topThree' for top players in each category
-                    player_list = category.get('topThree', []) or category.get('topPlayers', [])
-
-                    for player in player_list:
-                        stat_info = player.get('stat', {})
-                        player_info = {
-                            'player_id': player.get('id'),
-                            'player_name': player.get('name'),
-                            'team_id': player.get('teamId'),
-                            'team_name': player.get('teamName'),
-                            'country_code': player.get('ccode'),
-                            'stat_category': cat_name,
-                            'stat_name': stat_info.get('name'),
-                            'stat_value': player.get('value') or stat_info.get('value'),
-                            'rank': player.get('rank'),
-                        }
-                        players.append(player_info)
-
-            if not players:
+            if not rows:
                 logger.warning(f"No player stats found for {league} {season}")
                 return None
 
-            df = pd.DataFrame(players)
-
-            # Add metadata
+            df = pd.DataFrame(rows)
             df['league'] = league
             df['season'] = season
             df = self._add_metadata(df, 'player_stats')
