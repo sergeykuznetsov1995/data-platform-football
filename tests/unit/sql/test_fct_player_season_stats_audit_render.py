@@ -49,10 +49,12 @@ class TestFctPlayerSeasonStatsAuditSql:
             r"INNER\s+JOIN\s+iceberg\.silver\.fbref_player_season_profile",
             sql, re.IGNORECASE,
         ), "audit must INNER JOIN на FBref"
+        # FotMob INNER-джойнится через CTE fotmob_counts (per-90 → count recompute,
+        # issue #174); CTE читает iceberg.silver.fotmob_player_season_profile.
         assert re.search(
-            r"INNER\s+JOIN\s+iceberg\.silver\.fotmob_player_season_profile",
+            r"INNER\s+JOIN\s+fotmob_counts",
             sql, re.IGNORECASE,
-        ), "audit must INNER JOIN на FotMob"
+        ), "audit must INNER JOIN на fotmob_counts (FotMob subset)"
         assert re.search(
             r"LEFT\s+JOIN\s+iceberg\.silver\.whoscored_player_season_aggregate",
             sql, re.IGNORECASE,
