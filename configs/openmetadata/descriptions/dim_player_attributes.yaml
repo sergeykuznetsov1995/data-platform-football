@@ -14,6 +14,12 @@ table:
     current_market_value_eur (EUR, не USD-конверсия). НЕ заменяет
     gold.dim_player (per-season, FBref-only). См. docs/research/
     RX_cross_source_player_profile.md для полного rationale (D1-D4 решений).
+
+    SoFIFA-side (issue #42) читает silver.sofifa_player_profile (canonical_id
+    подтянут в Silver). ВНИМАНИЕ: колонки *_sofifa — это game-side рейтинги
+    EA Sports FC (мнение видеоигры, 0-99), а НЕ реальные метрики матчей.
+    FIFA/FC edition маппится на football-season по году конца сезона
+    (EA FC 26 → сезон 2025/26 → slug '2526').
   tags:
     - Tier.Gold
     - Domain.Football
@@ -85,6 +91,55 @@ columns:
     description: Дата последнего обновления market value на Transfermarkt.
   - name: contract_until_tm
     description: Дата окончания контракта из Transfermarkt (slowly-changing, snapshot).
+  # --- SoFIFA block (issue #42): EA Sports FC game-side ratings, 0-99 ---
+  - name: overall_sofifa
+    description: Общий FIFA/FC рейтинг (0-99), game-side оценка EA Sports — НЕ реальная метрика.
+  - name: potential_sofifa
+    description: Потенциальный FIFA/FC рейтинг (0-99).
+  - name: pace_sofifa
+    description: Main-6 card-агрегат «Pace» (0-99).
+  - name: shooting_sofifa
+    description: Main-6 card-агрегат «Shooting» (0-99).
+  - name: passing_sofifa
+    description: Main-6 card-агрегат «Passing» (0-99).
+  - name: dribbling_sofifa
+    description: Main-6 card-агрегат «Dribbling» (0-99).
+  - name: defending_sofifa
+    description: Main-6 card-агрегат «Defending» (0-99).
+  - name: physical_sofifa
+    description: Main-6 card-агрегат «Physical» (0-99).
+  - name: gk_diving_sofifa
+    description: GK-скилл «Diving» (0-99, релевантен только вратарям).
+  - name: gk_handling_sofifa
+    description: GK-скилл «Handling» (0-99).
+  - name: gk_kicking_sofifa
+    description: GK-скилл «Kicking» (0-99).
+  - name: gk_positioning_sofifa
+    description: GK-скилл «Positioning» (0-99).
+  - name: gk_reflexes_sofifa
+    description: GK-скилл «Reflexes» (0-99).
+  - name: value_eur_sofifa
+    description: Game-side рыночная стоимость в EUR (оценка EA Sports, не Transfermarkt).
+  - name: wage_eur_sofifa
+    description: Game-side недельная зарплата в EUR (оценка EA Sports).
+  - name: release_clause_eur_sofifa
+    description: Game-side сумма отступных в EUR (если задана).
+  - name: contract_valid_until_sofifa
+    description: Год окончания контракта по данным игры.
+  - name: joined_sofifa
+    description: Дата присоединения к клубу по данным игры.
+  - name: position_sofifa
+    description: Игровая позиция по данным SoFIFA (e.g. CB, RM, GK).
+  - name: dob_sofifa
+    description: Дата рождения из профиля SoFIFA.
+    tags:
+      - PII.Low
+  - name: height_cm_sofifa
+    description: Рост в см из профиля SoFIFA.
+  - name: weight_kg_sofifa
+    description: Вес в кг из профиля SoFIFA (единственный источник веса в платформе).
+  - name: nationality_sofifa
+    description: Национальность из профиля SoFIFA (флаг страны).
   - name: _gold_created_at
     description: Технический timestamp создания строки в Gold-слое.
 relationships:

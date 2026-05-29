@@ -33,7 +33,22 @@ class FlareSolverrCFChallengeFailed(FlareSolverrError):
     pass
 
 
+class FlareSolverrTabCrashed(FlareSolverrError):
+    """Raised when FlareSolverr's internal Chromium tab crashes.
+
+    Distinct from a CF challenge failure: the fix is to recreate the session
+    (fresh browser tab), not to re-solve a challenge. SoFIFA's SPA pages crash
+    the Chromium 142 tab unpredictably during long iteration — callers rotate
+    the session on this error (see ``FlareSolverrSoFIFAReader._fs_get_with_recovery``).
+    """
+    pass
+
+
 _CF_MARKERS = ("cloudflare", "challenge", "turnstile")
+
+#: Substrings in a FlareSolverr error message that indicate the Chromium tab
+#: crashed (vs. a CF challenge). Kept narrow to avoid mislabelling other errors.
+_TAB_CRASH_MARKERS = ("tab crashed", "target crashed", "page crashed", "renderer")
 
 
 class FlareSolverrClient:
@@ -118,6 +133,9 @@ class FlareSolverrClient:
         if data.get("status") == "error":
             message = str(data.get("message", "unknown error"))
             lowered = message.lower()
+            if any(marker in lowered for marker in _TAB_CRASH_MARKERS):
+                logger.warning(f"FlareSolverr tab crashed (cmd={cmd}): {message}")
+                raise FlareSolverrTabCrashed(message)
             if any(marker in lowered for marker in _CF_MARKERS):
                 logger.warning(f"FlareSolverr CF challenge failed (cmd={cmd}): {message}")
                 raise FlareSolverrCFChallengeFailed(message)

@@ -51,6 +51,7 @@ def main():
         'tables': [],
         'players_rows': 0,
         'teams_rows': 0,
+        'player_ratings_rows': 0,
         'errors': []
     }
 
@@ -66,10 +67,12 @@ def main():
                     df = scraper._process_player_data(df)
 
                     if not df.empty:
+                        part = ['fifa_edition'] if 'fifa_edition' in df.columns else None
                         table_path = scraper.save_to_iceberg(
                             df=df,
                             table_name='sofifa_players',
-                            partition_cols=['version'] if 'version' in df.columns else None,
+                            partition_cols=part,
+                            replace_partitions=part,
                         )
                         results['tables'].append(table_path)
                         results['players_rows'] = len(df)
@@ -83,16 +86,40 @@ def main():
             try:
                 df = scraper.read_teams()
                 if df is not None and not df.empty:
+                    part = ['fifa_edition'] if 'fifa_edition' in df.columns else None
                     table_path = scraper.save_to_iceberg(
                         df=df,
                         table_name='sofifa_teams',
-                        partition_cols=['version'] if 'version' in df.columns else None,
+                        partition_cols=part,
+                        replace_partitions=part,
                     )
                     results['tables'].append(table_path)
                     results['teams_rows'] = len(df)
                     logger.info(f"Saved {len(df)} team records")
             except Exception as e:
                 error_msg = f"Teams scraping failed: {e}"
+                logger.error(error_msg)
+                results['errors'].append(error_msg)
+
+            # Scrape per-player attribute ratings (issue #42).
+            # ~545 player pages per APL edition — slowest step by far.
+            try:
+                df = scraper.read_player_ratings()
+                if df is not None and not df.empty:
+                    df = scraper._process_rating_data(df)
+                    if not df.empty:
+                        part = ['fifa_edition'] if 'fifa_edition' in df.columns else None
+                        table_path = scraper.save_to_iceberg(
+                            df=df,
+                            table_name='sofifa_player_ratings',
+                            partition_cols=part,
+                            replace_partitions=part,
+                        )
+                        results['tables'].append(table_path)
+                        results['player_ratings_rows'] = len(df)
+                        logger.info(f"Saved {len(df)} player rating records")
+            except Exception as e:
+                error_msg = f"Player ratings scraping failed: {e}"
                 logger.error(error_msg)
                 results['errors'].append(error_msg)
 
@@ -107,7 +134,11 @@ def main():
     with open(args.output, 'w') as f:
         json.dump(results, f)
 
-    total_rows = results['players_rows'] + results['teams_rows']
+    total_rows = (
+        results['players_rows']
+        + results['teams_rows']
+        + results['player_ratings_rows']
+    )
     logger.info(f"Scraper complete: {total_rows} total rows")
     print(json.dumps(results))
     return 0

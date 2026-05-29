@@ -56,17 +56,24 @@ class SoFIFAScraper(SoccerdataScraper):
         self._reader = None
 
     def _get_reader(self):
-        """Get soccerdata SoFIFA reader."""
+        """Get the FlareSolverr-backed SoFIFA reader.
+
+        sofifa.com sits behind a Cloudflare Turnstile that vanilla soccerdata
+        (seleniumbase / UC) does not clear; FlareSolverr v3.4.6 (Chromium 142)
+        does. The subclass keeps soccerdata's parsing and only swaps the HTTP
+        transport. ``FLARESOLVERR_URL`` overrides the default endpoint.
+        """
         if self._reader is None:
-            try:
-                import soccerdata as sd
-                self._reader = sd.SoFIFA(
-                    versions=self.versions,
-                    **self._sd_kwargs
-                )
-            except ImportError:
-                logger.error("soccerdata library not installed")
-                raise
+            import os
+            from scrapers.sofifa.flaresolverr_reader import FlareSolverrSoFIFAReader
+            self._reader = FlareSolverrSoFIFAReader(
+                flaresolverr_url=os.environ.get(
+                    'FLARESOLVERR_URL', 'http://flaresolverr:8191'
+                ),
+                versions=self.versions,
+                leagues=self.leagues,
+                **self._sd_kwargs,
+            )
         return self._reader
 
     def read_players(self) -> Optional[pd.DataFrame]:
@@ -115,6 +122,30 @@ class SoFIFAScraper(SoccerdataScraper):
             logger.error(f"Error reading team data: {e}")
             return None
 
+    def read_player_ratings(self) -> Optional[pd.DataFrame]:
+        """Read per-player FIFA attribute ratings (issue #42).
+
+        Pulls one sofifa.com player page per (player, version) and parses
+        overall/potential + 34 detailed attributes + 5 GK skills (upstream
+        loop) plus the main-6 card aggregates, market value / wage / release
+        clause, contract dates and profile header (position / dob / height /
+        weight / nationality). ~545 player pages per APL edition — slow
+        (FlareSolverr solves a fresh Turnstile per session rotation).
+        """
+        reader = self._get_reader()
+        logger.info(
+            f"Fetching SoFIFA player ratings for versions: {self.versions}"
+        )
+        try:
+            df = self._execute_with_resilience(reader.read_player_ratings)
+            if df is not None and not df.empty:
+                df = df.reset_index()
+                df = self._add_metadata(df, 'player_ratings')
+            return df
+        except Exception as e:
+            logger.error(f"Error reading player ratings: {e}")
+            return None
+
     def _process_player_data(self, df: pd.DataFrame) -> pd.DataFrame:
         """
         Process and clean player data.
@@ -150,6 +181,37 @@ class SoFIFAScraper(SoccerdataScraper):
 
         return df
 
+    def _process_rating_data(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Cast SoFIFA rating columns to nullable Int64 (they arrive as str).
+
+        Every numeric-looking column except the identity / date / text columns
+        is coerced to ``Int64`` (memory ``feedback_sofifa_pipeline_full.md``);
+        a column that does not parse at all is left untouched.
+        """
+        if df is None or df.empty:
+            return df
+
+        df = df.copy()
+        string_cols = {
+            'player', 'fifa_edition', 'update', 'joined', 'dob', 'position',
+            'nationality', '_source', '_entity_type', '_batch_id',
+        }
+        for col in df.columns:
+            if col in string_cols or col == 'player_id':
+                continue
+            coerced = pd.to_numeric(df[col], errors='coerce')
+            if coerced.notna().any():
+                df[col] = coerced.astype('Int64')
+
+        # joined -> date (sofifa shows 'Sep 1, 2020')
+        if 'joined' in df.columns:
+            df['joined'] = pd.to_datetime(df['joined'], errors='coerce')
+
+        if 'overall_rating' in df.columns and 'potential' in df.columns:
+            df['potential_diff'] = df['potential'] - df['overall_rating']
+
+        return df
+
     def filter_by_league(self, df: pd.DataFrame) -> pd.DataFrame:
         """
         Filter players by league if leagues are specified.
@@ -179,10 +241,12 @@ class SoFIFAScraper(SoccerdataScraper):
             df = self.filter_by_league(df)
 
             if not df.empty:
+                part = ['fifa_edition'] if 'fifa_edition' in df.columns else None
                 table_path = self.save_to_iceberg(
                     df=df,
                     table_name='sofifa_players',
-                    partition_cols=['version'] if 'version' in df.columns else None,
+                    partition_cols=part,
+                    replace_partitions=part,
                 )
                 return {'players': table_path}
 
@@ -193,12 +257,32 @@ class SoFIFAScraper(SoccerdataScraper):
         df = self.read_teams()
 
         if df is not None and not df.empty:
+            part = ['fifa_edition'] if 'fifa_edition' in df.columns else None
             table_path = self.save_to_iceberg(
                 df=df,
                 table_name='sofifa_teams',
-                partition_cols=['version'] if 'version' in df.columns else None,
+                partition_cols=part,
+                replace_partitions=part,
             )
             return {'teams': table_path}
+
+        return {}
+
+    def scrape_player_ratings(self) -> Dict[str, str]:
+        """Scrape per-player FIFA attribute ratings to sofifa_player_ratings."""
+        df = self.read_player_ratings()
+
+        if df is not None and not df.empty:
+            df = self._process_rating_data(df)
+            if not df.empty:
+                part = ['fifa_edition'] if 'fifa_edition' in df.columns else None
+                table_path = self.save_to_iceberg(
+                    df=df,
+                    table_name='sofifa_player_ratings',
+                    partition_cols=part,
+                    replace_partitions=part,
+                )
+                return {'player_ratings': table_path}
 
         return {}
 
@@ -220,6 +304,10 @@ class SoFIFAScraper(SoccerdataScraper):
         # Scrape teams
         team_results = self.scrape_teams()
         results.update(team_results)
+
+        # Scrape per-player attribute ratings (issue #42)
+        ratings_results = self.scrape_player_ratings()
+        results.update(ratings_results)
 
         logger.info(f"SoFIFA scrape complete: {list(results.keys())}")
         return results

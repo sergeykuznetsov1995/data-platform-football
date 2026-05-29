@@ -905,7 +905,7 @@ services:
   # Used by WhoScored events scraper via HTTP at port 8191
   # ===========================================================================
   flaresolverr:
-    image: ghcr.io/flaresolverr/flaresolverr:v3.3.21
+    image: ghcr.io/flaresolverr/flaresolverr:v3.4.6
     container_name: flaresolverr
     restart: unless-stopped
     security_opt:
@@ -925,7 +925,10 @@ services:
       TZ: UTC
     shm_size: "1g"
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:8191/health || exit 1"]
+      # v3.4.6 image dropped wget (only curl is present); /health returns
+      # {"status": "ok"}. Using wget here marks the container unhealthy even
+      # though FlareSolverr serves fine.
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8191/health || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3

@@ -44,6 +44,77 @@ SESSION_RECREATE_EVERY = 4
 
 _PRE_BODY_RE = re.compile(r"<pre[^>]*>(.*?)</pre>", re.DOTALL | re.IGNORECASE)
 
+#: Main-6 FIFA card aggregates. sofifa renders these client-side from inline JS
+#: (``POINT_PAC=64,POINT_SHO=44,...``) — they are NOT present as DOM text, so we
+#: read them straight out of the page source.
+_MAIN6_JS = {
+    'pace': 'PAC', 'shooting': 'SHO', 'passing': 'PAS',
+    'dribbling': 'DRI', 'defending': 'DEF', 'physical': 'PHY',
+}
+
+
+def _eur_to_int(text: Optional[str]) -> Optional[int]:
+    """Parse a sofifa money string ('€104M', '€250K', '€0') to an int of euros."""
+    if not text:
+        return None
+    m = re.search(r"€\s*([\d.]+)\s*([MK]?)", text)
+    if not m:
+        return None
+    mult = {'M': 1_000_000, 'K': 1_000, '': 1}[m.group(2)]
+    return int(round(float(m.group(1)) * mult))
+
+
+def _extract_card_extras(raw_html: str, tree) -> dict:
+    """Pull the issue-#42 fields the upstream score loop does not capture.
+
+    Covers the main-6 card aggregates (JS), market value / wage / release clause,
+    contract dates, and the profile header (position / dob / height / weight /
+    nationality). All fields degrade to ``None`` when absent so a partial page
+    never aborts the run.
+    """
+    out: dict = {}
+    for col, ab in _MAIN6_JS.items():
+        m = re.search(rf"POINT_{ab}=(\d+)", raw_html)
+        out[col] = int(m.group(1)) if m else None
+
+    root = tree.getroot()
+    body = root.text_content()
+    mv = re.search(r"(€[\d.]+[MK]?)\s*Value", body)
+    mw = re.search(r"(€[\d.]+[MK]?)\s*Wage", body)
+    mrc = re.search(r"Release clause\s*(€[\d.]+[MK]?)", body)
+    out['value_eur'] = _eur_to_int(mv.group(1)) if mv else None
+    out['wage_eur'] = _eur_to_int(mw.group(1)) if mw else None
+    out['release_clause_eur'] = _eur_to_int(mrc.group(1)) if mrc else None
+
+    mc = re.search(r"Contract valid until\s*(\d{4})", body)
+    mj = re.search(r"Joined\s*([A-Z][a-z]{2} \d{1,2}, \d{4})", body)
+    out['contract_valid_until'] = int(mc.group(1)) if mc else None
+    out['joined'] = mj.group(1) if mj else None
+
+    prof = root.xpath("//div[contains(@class,'profile')]")
+    if prof:
+        ptxt = ' '.join(prof[0].text_content().split())
+        mp = re.search(r"\b([A-Z]{2,3}(?:,\s*[A-Z]{2,3})*)\b\s+\d+y\.o\.", ptxt)
+        md = re.search(r"\(([A-Z][a-z]{2} \d{1,2}, \d{4})\)", ptxt)
+        mh = re.search(r"(\d{2,3})cm", ptxt)
+        mwt = re.search(r"(\d{2,3})kg", ptxt)
+        out['position'] = mp.group(1) if mp else None
+        out['dob'] = md.group(1) if md else None
+        out['height_cm'] = int(mh.group(1)) if mh else None
+        out['weight_kg'] = int(mwt.group(1)) if mwt else None
+    else:
+        out.update(position=None, dob=None, height_cm=None, weight_kg=None)
+
+    # Nationality is the <img title="..."> inside the profile flag link
+    # (<a href="/players?na=NN"><img title="Brazil" .../></a>). The <a> itself
+    # carries no title, so target the inner image.
+    flags = root.xpath(
+        "//div[contains(@class,'profile')]"
+        "//a[contains(@href,'/players?na=')]/img/@title"
+    )
+    out['nationality'] = flags[0] if flags else None
+    return out
+
 
 def _force_english(url: str) -> str:
     """Append ``hl=en-US`` to sofifa.com URLs so the page comes back in English.
@@ -183,8 +254,11 @@ class FlareSolverrSoFIFAReader(sd.SoFIFA):
             )
             filepath = self.data_dir / filemask.format(pid, version_id)
             url = urlmask.format(pid, version_id)
-            reader = self.get(url, filepath)
-            tree = _html.parse(reader, parser=_html.HTMLParser(encoding="utf8"))
+            raw_bytes = self.get(url, filepath).read()
+            raw_text = raw_bytes.decode("utf-8", "replace")
+            tree = _html.parse(
+                io.BytesIO(raw_bytes), parser=_html.HTMLParser(encoding="utf8")
+            )
             node_player_name = tree.xpath("//div[contains(@class, 'profile')]/h1")
             if not node_player_name:
                 logger.warning("player %s: no profile h1 found, skipping", pid)
@@ -208,7 +282,13 @@ class FlareSolverrSoFIFAReader(sd.SoFIFA):
                     if nodes:
                         value = nodes[0].text.strip()
                         break
-                scores[s] = value
+                # The detailed "Dribbling" skill collides with the main-6 card
+                # aggregate (also 'dribbling'); keep both under distinct names.
+                key = 'dribbling_detail' if s == 'Dribbling' else s
+                scores[key] = value
+            # Issue #42: main-6 aggregates, market value / wage, contract dates,
+            # and profile header (position / dob / height / weight / nationality).
+            scores.update(_extract_card_extras(raw_text, tree))
             ratings.append(scores)
 
         return (
@@ -251,7 +331,6 @@ class FlareSolverrSoFIFAReader(sd.SoFIFA):
                     url,
                     self._session_id,
                     max_timeout_ms=self._max_timeout_ms,
-                    disable_media=True,
                 )
             except (FlareSolverrTabCrashed, FlareSolverrCFChallengeFailed) as e:
                 attempt += 1
