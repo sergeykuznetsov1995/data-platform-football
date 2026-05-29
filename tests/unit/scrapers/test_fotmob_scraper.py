@@ -187,31 +187,38 @@ class TestFotMobScraperUnit:
             assert df.iloc[0]['points'] == 48
 
     def test_read_player_stats_parses_data(self, mock_scraper):
-        """Test player stats parsing from API response."""
-        mock_data = {
-            'stats': {
-                'players': [
-                    {
-                        'header': 'Top scorer',
-                        'topThree': [
-                            {
-                                'id': 1001, 'name': 'Erling Haaland', 'teamId': 8456,
-                                'teamName': 'Manchester City', 'value': 20, 'rank': 1,
-                                'ccode': 'NOR', 'stat': {'name': 'goals', 'value': 20},
-                            },
-                        ]
-                    }
-                ]
-            }
-        }
+        """player_stats walks stats.players[].fetchAllUrl -> TopLists[0].StatList[].
 
-        with patch.object(mock_scraper, '_get_league_data', return_value=mock_data):
-            df = mock_scraper.read_player_season_stats('goals', 'ENG-Premier League', 2024)
+        NB: FotMob misspells the player id key as 'ParticiantId' (no 2nd 'p').
+        """
+        league_data = {'stats': {'players': [
+            {'fetchAllUrl': 'https://data.fotmob.com/stats/47/season/27110/goals.json',
+             'header': 'Top scorer', 'name': 'goals', 'category': 'Top Stat'},
+        ]}}
+        toplist = {'TopLists': [{
+            'Title': 'Top scorer', 'StatName': 'goals', 'Category': 'Top Stat',
+            'StatList': [
+                {'ParticiantId': 1001, 'ParticipantName': 'Erling Haaland',
+                 'TeamId': 8456, 'TeamName': 'Manchester City',
+                 'ParticipantCountryCode': 'NOR', 'Rank': 1, 'StatValue': 20,
+                 'SubStatValue': 3.0, 'StatValueCount': 18,
+                 'MatchesPlayed': 30, 'MinutesPlayed': 2600},
+            ],
+        }]}
+
+        with patch.object(mock_scraper, '_get_league_data', return_value=league_data):
+            with patch.object(mock_scraper, '_fetch_api_json', return_value=toplist):
+                df = mock_scraper.read_player_season_stats('goals', 'ENG-Premier League', 2024)
 
             assert df is not None
             assert len(df) == 1
-            assert df.iloc[0]['player_name'] == 'Erling Haaland'
-            assert df.iloc[0]['stat_value'] == 20
+            row = df.iloc[0]
+            assert row['participant_id'] == 1001
+            assert row['participant_name'] == 'Erling Haaland'
+            assert row['minutes_played'] == 2600
+            assert row['matches_played'] == 30
+            assert row['stat_name'] == 'goals'
+            assert row['stat_value'] == 20
 
     # ---------------------------------------------------------------- #
     # New entities (issue #99)
