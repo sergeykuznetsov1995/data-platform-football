@@ -38,7 +38,7 @@ pytestmark = pytest.mark.unit
 # ---------------------------------------------------------------------------
 
 _ICEBERG_TO_LOCAL = {
-    "iceberg.bronze.whoscored_events": "bronze_whoscored_events",
+    "iceberg.bronze.whoscored_schedule": "bronze_whoscored_schedule",
     "iceberg.gold.fct_event":          "gold_fct_event",
     "iceberg.gold.fct_shot":           "gold_fct_shot",
     "iceberg.gold.fct_team_match":     "gold_fct_team_match",
@@ -71,7 +71,7 @@ def duck_conn():
 @pytest.fixture(autouse=True)
 def _reset_schemas(duck_conn):
     for tbl in (
-        "bronze_whoscored_events",
+        "bronze_whoscored_schedule",
         "gold_fct_event", "gold_fct_shot",
         "gold_fct_team_match", "gold_dim_match",
     ):
@@ -79,11 +79,11 @@ def _reset_schemas(duck_conn):
 
     duck_conn.execute(
         """
-        CREATE TABLE bronze_whoscored_events (
-            game_id         DOUBLE,
-            start_datetime  TIMESTAMP,
-            league          VARCHAR,
-            season          VARCHAR
+        CREATE TABLE bronze_whoscored_schedule (
+            game_id     BIGINT,
+            start_time  VARCHAR,
+            league      VARCHAR,
+            season      VARCHAR
         )
         """
     )
@@ -126,7 +126,7 @@ def _reset_schemas(duck_conn):
             match_id      VARCHAR,
             date          DATE,
             league        VARCHAR,
-            season        VARCHAR,
+            season        BIGINT,
             home_team_id  VARCHAR,
             away_team_id  VARCHAR
         )
@@ -162,12 +162,19 @@ def _seed_team_matches(
     Each match produces:
       - 1 row in dim_match (the team is "home" with a fake away_team)
       - 1 row in fct_team_match
-      - bronze.whoscored_events: 1 marker row with start_datetime = match_date
+      - bronze.whoscored_schedule: 1 marker row with start_time = match_date
       - fct_event: pass + dribble + unknown (per counts)
       - fct_shot: shots split by situation/body_part
     """
     import datetime as dt
     base = dt.date.fromisoformat(base_date)
+    # Mirror the SQL season-normalisation CASE: compact '2425' → bigint 2024.
+    # dim_match.season is stored as the bigint year-of-start (see SQL bridge).
+    season_year = (
+        int(season)
+        if (len(season) == 4 and 2000 <= int(season) <= 2100)
+        else 2000 + int(season[:2])
+    )
     ws_ids: List[str] = []
     away = team_id + "_opp"
     for i in range(n_matches):
@@ -179,7 +186,7 @@ def _seed_team_matches(
 
         con.execute(
             f"INSERT INTO gold_dim_match VALUES "
-            f"('{match_id}', DATE '{d}', '{league}', '{season}', "
+            f"('{match_id}', DATE '{d}', '{league}', {season_year}, "
             f"'{team_id}', '{away}')"
         )
         con.execute(
@@ -187,8 +194,8 @@ def _seed_team_matches(
             f"('{match_id}', '{team_id}', DATE '{d}', '{season}', '{league}')"
         )
         con.execute(
-            f"INSERT INTO bronze_whoscored_events VALUES "
-            f"({float(gid)}, TIMESTAMP '{d} 12:00:00', '{league}', '{season}')"
+            f"INSERT INTO bronze_whoscored_schedule VALUES "
+            f"({gid}, '{d} 12:00:00', '{league}', '{season}')"
         )
 
         # Spread events
