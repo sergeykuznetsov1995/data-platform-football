@@ -105,6 +105,7 @@ class TestSofifaValidateData:
             "errors": [],
             "players_rows": 2500,
             "teams_rows": 200,
+            "player_ratings_rows": 545,
         })
 
         result = dag_module.validate_data()

@@ -370,6 +370,23 @@ with DAG(
         trigger_rule='all_done',
     )
 
+    # SoFIFA Silver (issue #42) — same dependency profile as TM/Capology:
+    # reads bronze.sofifa_* + fresh silver.xref_player (source='sofifa') from
+    # E1, so it is kept downstream of E1 and runs in parallel with TM/Capology.
+    # Bronze ingest is weekly (Sunday); CTAS is idempotent so daily re-
+    # materialisation keeps canonical_id coverage aligned.
+    trigger_silver_sofifa = TriggerDagRunOperator(
+        task_id='trigger_silver_sofifa',
+        trigger_dag_id='dag_transform_sofifa_silver',
+        wait_for_completion=True,
+        poke_interval=30,
+        allowed_states=['success', 'failed'],
+        failed_states=[],
+        reset_dag_run=True,
+        execution_date='{{ ds }}',
+        trigger_rule='all_done',
+    )
+
     # Check overall pipeline success
     check_success_task = PythonOperator(
         task_id='check_pipeline_success',
@@ -387,5 +404,13 @@ with DAG(
 
     # Dependencies
     triggers_group >> trigger_xref_task >> trigger_e3_transforms >> trigger_e4_transforms
-    trigger_e4_transforms >> [trigger_silver_transfermarkt, trigger_silver_capology]
-    [trigger_silver_transfermarkt, trigger_silver_capology] >> check_success_task >> generate_report_task
+    trigger_e4_transforms >> [
+        trigger_silver_transfermarkt,
+        trigger_silver_capology,
+        trigger_silver_sofifa,
+    ]
+    [
+        trigger_silver_transfermarkt,
+        trigger_silver_capology,
+        trigger_silver_sofifa,
+    ] >> check_success_task >> generate_report_task

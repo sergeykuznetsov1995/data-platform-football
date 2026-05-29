@@ -107,11 +107,13 @@ SURNAME_LEVENSHTEIN_MAX: int = 1
 #: too many false matches (Cole/Cone/Cool, Saka/Sako).
 SURNAME_MIN_LEN: int = 4
 
-#: Sources covered. ``sofifa`` has its own season-alignment problem
-#: (FIFA seasons != football seasons) and is a separate effort.
+#: Sources covered. ``sofifa`` bridges on the standard name+team cascade after
+#: mapping its FIFA/FC edition to a football-season slug (``'FC 26'`` -> ``'2526'``,
+#: see :func:`_fetch_sofifa_players`) — the edition/season mismatch is handled at
+#: read time, not by a dedicated tier.
 SOURCES: Tuple[str, ...] = (
     'fbref', 'understat', 'whoscored', 'fotmob', 'sofascore',
-    'transfermarkt', 'capology',
+    'transfermarkt', 'capology', 'sofifa',
 )
 
 #: Default batch size for ``INSERT INTO ... VALUES (...)``. 500 fits
@@ -647,6 +649,7 @@ def _orphan_prefix(source: str) -> str:
         'sofascore':     'ss',
         'transfermarkt': 'tm',
         'capology':      'cap',
+        'sofifa':        'sf',
     }[source]
 
 
@@ -1127,6 +1130,88 @@ def _fetch_capology_players(
     return out
 
 
+def _slug_to_sofifa_edition_num(slug: str) -> str:
+    """Map a football-season slug to a SoFIFA edition number.
+
+    SoFIFA / EA FC editions are named after the season's *end* year: EA FC 26
+    ships in Sep 2025 and covers the 2025/26 season. So slug ``'2526'`` ->
+    edition ``'26'``, ``'2425'`` -> ``'25'``. We compare on the numeric suffix
+    only so the ``'FIFA'`` -> ``'FC'`` rename (FC 24+) is transparent.
+    """
+    s = str(slug)
+    return s[2:4]
+
+
+def _fetch_sofifa_players(
+    conn, league: str, source_seasons: List[str]
+) -> List[Dict[str, Any]]:
+    """Read SoFIFA player anchor rows for the resolver cascade.
+
+    Bronze ``sofifa_players`` is a per-edition snapshot keyed by
+    ``(player_id, fifa_edition)`` carrying only identity columns (name / team /
+    league); the FIFA attribute ratings live in a separate Bronze table and are
+    consumed by the downstream Silver CTAS, not the resolver.
+
+    ``fifa_edition`` is stored as the marketing name (``'FC 26'``), so we map
+    each requested football-season slug to its edition number and filter on the
+    numeric suffix. The emitted ``season`` is the football-season slug (not the
+    edition) so ``xref_player.season`` lines up with every other source and the
+    Silver JOIN ``xp.season = b.season`` works after the same mapping.
+    """
+    # edition_num ('26') -> football slug ('2526') for the requested seasons.
+    edition_to_slug = {
+        _slug_to_sofifa_edition_num(s): str(s) for s in source_seasons
+    }
+    wanted_editions = [e for e in edition_to_slug if e]
+    if not wanted_editions:
+        return []
+
+    sql = f"""
+        SELECT
+            player_id,
+            player,
+            team,
+            league,
+            fifa_edition
+        FROM iceberg.bronze.sofifa_players
+        WHERE league = '{_sql_escape(league)}'
+          AND regexp_extract(fifa_edition, '(\\d+)', 1)
+              IN ({_seasons_in_clause(wanted_editions)})
+          AND player_id IS NOT NULL
+          AND player IS NOT NULL
+        GROUP BY player_id, player, team, league, fifa_edition
+    """
+    rows = _execute(conn, sql, fetch=True) or []
+    out: List[Dict[str, Any]] = []
+    seen: set = set()
+    for pid, name, team, lg, edition in rows:
+        # Extract the numeric suffix of the edition string ('FC 26' -> '26').
+        digits = ''.join(ch for ch in str(edition) if ch.isdigit())
+        edition_num = digits[-2:] if len(digits) >= 2 else digits
+        season = edition_to_slug.get(edition_num)
+        if season is None:
+            continue
+        key = (str(pid), team, season)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(
+            {
+                'source': 'sofifa',
+                'source_id': str(pid),
+                'player_name': name,
+                'raw_team_name': team,
+                'canonical_team': canonical_team_for_resolver(team, 'sofifa'),
+                'league': lg,
+                'season': season,
+                # No minutes/games proxy on SoFIFA Bronze; dedup tiebreaker
+                # degenerates to source_id ordering for canonical collisions.
+                'bronze_signal': -1.0,
+            }
+        )
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Trino write helpers
 # ---------------------------------------------------------------------------
@@ -1382,6 +1467,7 @@ def _resolve_all(
     fm_rows: Optional[List[Dict[str, Any]]] = None,
     tm_rows: Optional[List[Dict[str, Any]]] = None,
     cap_rows: Optional[List[Dict[str, Any]]] = None,
+    sf_rows: Optional[List[Dict[str, Any]]] = None,
     *,
     nn: Any = None,
     detected_at: Any = None,
@@ -1460,7 +1546,8 @@ def _resolve_all(
     fm_rows = fm_rows or []
     tm_rows = tm_rows or []
     cap_rows = cap_rows or []
-    for src_rows in (us_rows, ws_rows, fm_rows, ss_rows, tm_rows, cap_rows):
+    sf_rows = sf_rows or []
+    for src_rows in (us_rows, ws_rows, fm_rows, ss_rows, tm_rows, cap_rows, sf_rows):
         for row in src_rows:
             ambiguity_info: Dict[str, Any] = {}
             cid, conf, score = cascade_resolve(
@@ -1789,9 +1876,13 @@ def run_resolver(
         cap = _fetch_capology_players(conn, league, source_seasons)
         logger.info("  %d Capology players", len(cap))
 
+        logger.info("Reading SoFIFA players ...")
+        sf = _fetch_sofifa_players(conn, league, source_seasons)
+        logger.info("  %d SoFIFA players", len(sf))
+
         logger.info("Resolving identities ...")
         rows, review_rows, stats = _resolve_all(
-            fb, us, ws, ss, fm, tm, cap, nn=nn, detected_at=detected_at
+            fb, us, ws, ss, fm, tm, cap, sf, nn=nn, detected_at=detected_at
         )
         logger.info(
             "  produced %d xref rows, %d review rows",

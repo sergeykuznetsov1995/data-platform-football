@@ -113,6 +113,42 @@ transfermarkt_latest AS (
     GROUP BY canonical_id
 ),
 
+-- SoFIFA-side: silver.sofifa_player_profile уже содержит canonical_id (LEFT JOIN
+-- xref_player в Silver, source='sofifa' non-orphan). GROUP BY canonical_id +
+-- MAX_BY(..., season) сворачивает per-edition snapshot к одному row на
+-- канонического игрока (как SofaScore/TM — без xref hop в Gold). ВНИМАНИЕ:
+-- это game-side рейтинги EA Sports (мнение игры), НЕ реальные метрики матчей.
+sofifa_latest AS (
+    SELECT
+        canonical_id,
+        MAX_BY(overall,               season) AS overall,
+        MAX_BY(potential,             season) AS potential,
+        MAX_BY(pace,                  season) AS pace,
+        MAX_BY(shooting,              season) AS shooting,
+        MAX_BY(passing,               season) AS passing,
+        MAX_BY(dribbling,             season) AS dribbling,
+        MAX_BY(defending,             season) AS defending,
+        MAX_BY(physical,              season) AS physical,
+        MAX_BY(gk_diving,             season) AS gk_diving,
+        MAX_BY(gk_handling,           season) AS gk_handling,
+        MAX_BY(gk_kicking,            season) AS gk_kicking,
+        MAX_BY(gk_positioning,        season) AS gk_positioning,
+        MAX_BY(gk_reflexes,           season) AS gk_reflexes,
+        MAX_BY(value_eur,             season) AS value_eur,
+        MAX_BY(wage_eur,              season) AS wage_eur,
+        MAX_BY(release_clause_eur,    season) AS release_clause_eur,
+        MAX_BY(contract_valid_until,  season) AS contract_valid_until,
+        MAX_BY(joined,                season) AS joined,
+        MAX_BY(position,              season) AS position,
+        MAX_BY(dob,                   season) AS dob,
+        MAX_BY(height_cm,             season) AS height_cm,
+        MAX_BY(weight_kg,             season) AS weight_kg,
+        MAX_BY(nationality,           season) AS nationality
+    FROM iceberg.silver.sofifa_player_profile
+    WHERE canonical_id IS NOT NULL
+    GROUP BY canonical_id
+),
+
 -- FBref-spine: один row per canonical_id. FBref не имеет 'orphan' confidence
 -- (по построению resolver'а — FBref игроки всегда 'exact'), но фильтр оставлен
 -- для symmetry на случай будущей логики.
@@ -189,6 +225,31 @@ SELECT
     tm.mv_last_update                                  AS mv_last_update_tm,
     tm.contract_until                                  AS contract_until_tm,
 
+    -- SoFIFA block (EA Sports FC game-side ratings, NOT real match metrics).
+    sf.overall                                         AS overall_sofifa,
+    sf.potential                                       AS potential_sofifa,
+    sf.pace                                            AS pace_sofifa,
+    sf.shooting                                        AS shooting_sofifa,
+    sf.passing                                         AS passing_sofifa,
+    sf.dribbling                                       AS dribbling_sofifa,
+    sf.defending                                       AS defending_sofifa,
+    sf.physical                                        AS physical_sofifa,
+    sf.gk_diving                                       AS gk_diving_sofifa,
+    sf.gk_handling                                     AS gk_handling_sofifa,
+    sf.gk_kicking                                      AS gk_kicking_sofifa,
+    sf.gk_positioning                                  AS gk_positioning_sofifa,
+    sf.gk_reflexes                                     AS gk_reflexes_sofifa,
+    sf.value_eur                                       AS value_eur_sofifa,
+    sf.wage_eur                                        AS wage_eur_sofifa,
+    sf.release_clause_eur                              AS release_clause_eur_sofifa,
+    sf.contract_valid_until                            AS contract_valid_until_sofifa,
+    sf.joined                                          AS joined_sofifa,
+    sf.position                                        AS position_sofifa,
+    sf.dob                                             AS dob_sofifa,
+    sf.height_cm                                       AS height_cm_sofifa,
+    sf.weight_kg                                       AS weight_kg_sofifa,
+    sf.nationality                                     AS nationality_sofifa,
+
     CURRENT_TIMESTAMP                                  AS _gold_created_at
 
 FROM xref_fbref xf
@@ -202,3 +263,5 @@ LEFT JOIN sofascore_latest ss
     ON ss.canonical_id = xf.canonical_id
 LEFT JOIN transfermarkt_latest tm
     ON tm.canonical_id = xf.canonical_id
+LEFT JOIN sofifa_latest sf
+    ON sf.canonical_id = xf.canonical_id

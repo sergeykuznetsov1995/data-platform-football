@@ -57,6 +57,7 @@ def validate_data(**context) -> Dict[str, Any]:
         'summary': {
             'players_rows': scrape_result.get('players_rows', 0),
             'teams_rows': scrape_result.get('teams_rows', 0),
+            'player_ratings_rows': scrape_result.get('player_ratings_rows', 0),
             'tables': scrape_result.get('tables', []),
         }
     }
@@ -72,6 +73,13 @@ def validate_data(**context) -> Dict[str, Any]:
 
     if validation['summary']['teams_rows'] < 100:
         validation['warnings'].append("Low team count - possible scraping issue")
+
+    # Player ratings (issue #42): ~545 per APL edition. A near-empty table
+    # usually means FlareSolverr could not clear the Turnstile this run.
+    if validation['summary']['player_ratings_rows'] < 100:
+        validation['warnings'].append(
+            "Low player_ratings count - possible FlareSolverr/Turnstile issue"
+        )
 
     logger.info(f"Data validation complete: {validation['status']}")
     logger.info(f"Summary: {validation['summary']}")
@@ -150,6 +158,9 @@ python dags/scripts/run_sofifa_scraper.py \\
             'PATH': '/usr/local/bin:/usr/bin:/bin:/home/airflow/.local/bin',
             'HOME': '/home/airflow',
         },
+        # player_ratings fetches ~545 player pages through FlareSolverr with
+        # session rotation (~12s + occasional ~15s rotation each) → up to ~2h.
+        execution_timeout=timedelta(hours=4),
     )
 
     validate_data_task = PythonOperator(

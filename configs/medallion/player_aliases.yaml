@@ -12,7 +12,7 @@
 #
 # Schema:
 #   aliases:
-#     - source: understat | whoscored | sofascore | fotmob | matchhistory | transfermarkt | capology
+#     - source: understat | whoscored | sofascore | fotmob | matchhistory | transfermarkt | capology | sofifa
 #       source_id: "<the source's player_id, varchar>"
 #       fbref_player_id: "<FBref player_id, WITHOUT the 'fb_' prefix>"
 #       season: "<4-digit slug, e.g. '2425'>"  | "*"  (any season)
