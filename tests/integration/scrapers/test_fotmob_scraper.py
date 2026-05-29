@@ -1,24 +1,21 @@
 """
 Integration tests for FotMobScraper.
 
-Tests actual HTTP requests to FotMob API.
-Requires network connectivity and Chrome/Selenium.
+Tests actual HTTP requests to FotMob's public /api/data endpoints.
+Requires network connectivity only (no browser / Cloudflare bypass).
 """
 
 import pytest
 
 
 @pytest.mark.integration
-@pytest.mark.cloudflare
 @pytest.mark.slow
 class TestFotMobScraperIntegration:
     """Integration tests for FotMobScraper with real HTTP."""
 
     @pytest.fixture
-    def scraper(self, undetected_chrome_available, network_available, minimal_leagues, minimal_seasons):
+    def scraper(self, network_available, minimal_leagues, minimal_seasons):
         """Create real FotMob scraper instance."""
-        if not undetected_chrome_available:
-            pytest.skip("undetected-chromedriver not available")
         if not network_available:
             pytest.skip("No network connectivity")
 
@@ -27,8 +24,6 @@ class TestFotMobScraperIntegration:
         scraper = FotMobScraper(
             leagues=minimal_leagues,
             seasons=minimal_seasons,
-            headless=True,
-            use_xvfb=True,
         )
         yield scraper
         scraper.close()
@@ -68,12 +63,11 @@ class TestFotMobScraperIntegration:
         assert 'stat_value' in df.columns
 
     @pytest.mark.flaky
-    def test_cookies_obtained(self, scraper):
-        """Test that cookies are obtained from FotMob."""
-        # Force cookie obtaining by making a request
-        scraper._get_session()
+    def test_session_created(self, scraper):
+        """Test that a plain HTTP session is created (no cookies needed)."""
+        session = scraper._get_session()
 
-        assert scraper._cookies_obtained is True
+        assert session is not None
         assert scraper._session is not None
 
     @pytest.mark.flaky
@@ -104,10 +98,8 @@ class TestFotMobScraperMultiLeague:
     """Test scraping multiple leagues."""
 
     @pytest.fixture
-    def multi_league_scraper(self, undetected_chrome_available, network_available):
+    def multi_league_scraper(self, network_available):
         """Create scraper for multiple leagues."""
-        if not undetected_chrome_available:
-            pytest.skip("undetected-chromedriver not available")
         if not network_available:
             pytest.skip("No network connectivity")
 
@@ -116,8 +108,6 @@ class TestFotMobScraperMultiLeague:
         scraper = FotMobScraper(
             leagues=['ENG-Premier League', 'ESP-La Liga'],
             seasons=[2024],
-            headless=True,
-            use_xvfb=True,
         )
         yield scraper
         scraper.close()
