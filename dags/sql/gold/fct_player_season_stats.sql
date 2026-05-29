@@ -59,6 +59,29 @@ xref_fotmob AS (
     FROM iceberg.silver.xref_player
     WHERE source = 'fotmob'
       AND confidence <> 'orphan'
+),
+
+-- FotMob отдаёт shots/tackles/clearances/… как per-90 (не счётчики). Restore
+-- season-count ≈ per_90 × minutes / 90 (±1, per_90 округлён источником до 2 знаков).
+-- raw counts для этих метрик в FotMob API недоступны (issue #174). Pass-through
+-- колонки (goals/assists/cards/xG/big_chances/…) уже счётчики — через SELECT *.
+fotmob_counts AS (
+    SELECT
+        *,
+        ROUND(shots_per_90               * minutes_played / 90.0) AS shots,
+        ROUND(shots_on_target_per_90     * minutes_played / 90.0) AS shots_on_target,
+        ROUND(interceptions_per_90       * minutes_played / 90.0) AS interceptions,
+        ROUND(tackles_per_90             * minutes_played / 90.0) AS tackles,
+        ROUND(fouls_per_90               * minutes_played / 90.0) AS fouls_committed,
+        ROUND(clearances_per_90          * minutes_played / 90.0) AS clearances,
+        ROUND(recoveries_per_90          * minutes_played / 90.0) AS ball_recoveries,
+        ROUND(blocks_per_90              * minutes_played / 90.0) AS blocks,
+        ROUND(successful_dribbles_per_90 * minutes_played / 90.0) AS successful_dribbles,
+        ROUND(accurate_passes_per_90     * minutes_played / 90.0) AS accurate_passes,
+        ROUND(accurate_long_balls_per_90 * minutes_played / 90.0) AS accurate_long_balls,
+        ROUND(defensive_actions_per_90   * minutes_played / 90.0) AS defensive_actions,
+        ROUND(poss_won_final_third_per_90 * minutes_played / 90.0) AS poss_won_final_third
+    FROM iceberg.silver.fotmob_player_season_profile
 )
 
 SELECT
@@ -218,7 +241,7 @@ LEFT JOIN xref_fotmob xfm
     ON  xfm.canonical_id = xf.canonical_id
     AND xfm.league       = xf.league
     AND xfm.season_year  = xf.season_year
-LEFT JOIN iceberg.silver.fotmob_player_season_profile fm
+LEFT JOIN fotmob_counts fm
     ON  fm.player_id = xfm.fotmob_player_id
     AND fm.league    = xfm.league
     AND fm.season    = xfm.season_year
