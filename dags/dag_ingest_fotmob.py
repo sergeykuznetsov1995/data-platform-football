@@ -10,10 +10,16 @@ Pure HTTP — FotMob's public /api/data/leagues endpoint requires no auth.
 
 Schedules daily at 7 AM UTC (after FBref to avoid overlapping).
 
-Data collected:
-- Match schedules and results
-- Team season statistics
-- Player season statistics
+Data collected (9 Bronze tables):
+- Match schedules and results        (fotmob_schedule)
+- Team season standings              (fotmob_team_stats)
+- Player stat leaderboards (top)     (fotmob_player_stats)
+- Team profiles                      (fotmob_team_profile)
+- Team squads                        (fotmob_team_squad)
+- Team stat leaderboards             (fotmob_team_leaderboards)
+- Transfers                          (fotmob_transfers)
+- Per-match details                  (fotmob_match_details)
+- Per-player details                 (fotmob_player_details)
 
 All data is written to Iceberg Bronze layer tables.
 """
@@ -56,17 +62,30 @@ def validate_data(**context) -> Dict[str, Any]:
         logger.error(f"Invalid JSON in results: {e}")
         raise AirflowException(f"Invalid JSON in results: {e}")
 
+    # Per-entity soft-warn minimums (APL single-season baselines). Hard-fail is
+    # reserved for a fully empty ingest; individual low counts only warn.
+    MIN_ROWS = {
+        'schedule': 300,
+        'team_stats': 18,
+        'player_stats': 50,
+        'team_profile': 18,
+        'team_squad': 400,
+        'team_leaderboards': 400,
+        'transfers': 1,
+        'match_details': 200,
+        'player_details': 400,
+    }
+
+    # New runner emits a 'rows' dict; fall back to legacy flat '<key>_rows'.
+    rows = scrape_result.get('rows') or {
+        k: scrape_result.get(f'{k}_rows', 0) for k in MIN_ROWS
+    }
+
     summary = {
-        'schedule_rows': scrape_result.get('schedule_rows', 0),
-        'team_stats_rows': scrape_result.get('team_stats_rows', 0),
-        'player_stats_rows': scrape_result.get('player_stats_rows', 0),
+        'rows': rows,
         'tables': scrape_result.get('tables', []),
     }
-    total_rows = (
-        summary['schedule_rows']
-        + summary['team_stats_rows']
-        + summary['player_stats_rows']
-    )
+    total_rows = sum(rows.values())
 
     validation = {
         'status': 'success',
@@ -87,10 +106,12 @@ def validate_data(**context) -> Dict[str, Any]:
     if scrape_result.get('errors'):
         validation['status'] = 'partial_success'
 
-    if summary['schedule_rows'] < 100:
-        validation['warnings'].append("Low schedule row count - possible scraping issue")
-    if summary['team_stats_rows'] < 50:
-        validation['warnings'].append("Low team stats row count - possible scraping issue")
+    for key, minimum in MIN_ROWS.items():
+        if rows.get(key, 0) < minimum:
+            validation['warnings'].append(
+                f"Low {key} row count ({rows.get(key, 0)} < {minimum}) "
+                f"- possible scraping issue"
+            )
 
     logger.info(f"Data validation complete: {validation['status']}")
     logger.info(f"Summary: {summary}")
@@ -122,15 +143,23 @@ with DAG(
     Scrapes football statistics from FotMob's public ``/api/data/leagues``
     endpoint — no Cloudflare bypass, no Selenium, no cookies required.
 
-    ### Data Collected
+    ### Data Collected (9 Bronze tables)
 
     - **Schedule**: match dates, teams, scores
     - **Team Stats**: season standings (wins, draws, losses, points, goals)
     - **Player Stats**: top-player categories (goals, assists, rating, ...)
+    - **Team Profile**: venue, country, league position (per team)
+    - **Team Squad**: squad members + coach (per team)
+    - **Team Leaderboards**: team-side stat leaderboards (all categories)
+    - **Transfers**: league transfer list
+    - **Match Details**: lineups, events, stats, shotmap (per finished match)
+    - **Player Details**: career, market values, trophies (per squad player)
 
     ### Architecture
 
     BashOperator → ``run_fotmob_scraper.py`` → ``FotMobScraper`` (HTTP only).
+    All 9 entities use ``replace_partitions=['league','season']`` so daily
+    re-runs overwrite the season partition rather than accumulating duplicates.
 
     ### Failure Mode
 
