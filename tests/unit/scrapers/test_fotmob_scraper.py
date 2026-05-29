@@ -92,6 +92,19 @@ class TestFotMobScraperUnit:
 
         assert result is None
 
+    def test_next_data_buildid_rotation_retry(self, mock_scraper):
+        """A stale buildId (404) triggers one refresh + retry with the new id."""
+        with patch.object(mock_scraper, '_get_build_id',
+                          side_effect=['oldbuild', 'newbuild']) as gb, \
+             patch.object(mock_scraper, '_fetch_api_json',
+                          side_effect=[None, {'pageProps': {'data': {'id': 1}}}]) as fj:
+            res = mock_scraper._fetch_next_data_payload('/players/1')
+
+        assert res == {'pageProps': {'data': {'id': 1}}}
+        assert gb.call_count == 2                      # refreshed once
+        assert 'oldbuild' in fj.call_args_list[0][0][0]
+        assert 'newbuild' in fj.call_args_list[1][0][0]
+
     def test_read_schedule_parses_data(self, mock_scraper):
         """Test schedule parsing from API response."""
         mock_data = {
