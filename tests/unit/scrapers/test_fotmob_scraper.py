@@ -370,7 +370,9 @@ class TestFotMobScraperUnit:
             'id': 24011, 'name': 'David Raya', 'birthDate': '1995-09-15T00:00:00.000Z',
             'isCoach': False, 'isCaptain': False, 'gender': 'male',
             'primaryTeam': {'teamId': 9825, 'teamName': 'Arsenal'},
-            'positionDescription': 'Goalkeeper', 'contractEnd': '2028-06-30',
+            'positionDescription': {'primaryPosition': {'label': 'Goalkeeper'},
+                                    'positions': [{'occurences': 5}]},
+            'contractEnd': {'utcTime': '2028-06-30T00:00:00.000Z', 'timezone': 'UTC'},
             'mainLeague': {'leagueId': 47, 'leagueName': 'Premier League'},
             'playerInformation': [{'title': 'Height'}], 'careerHistory': [{'team': 'x'}],
             'statSeasons': [{'s': 1}], 'marketValues': {'mv': 1}, 'trophies': [{'t': 1}],
@@ -389,7 +391,9 @@ class TestFotMobScraperUnit:
         assert row['primary_team_id'] == 9825
         assert row['primary_team_name'] == 'Arsenal'
         assert row['main_league_id'] == 47
-        assert row['contract_end'] == '2028-06-30'
+        # object-valued API fields extracted to clean scalars
+        assert row['contract_end'] == '2028-06-30T00:00:00.000Z'
+        assert row['position_description'] == 'Goalkeeper'
         assert row['career_history_json'] == '[{"team": "x"}]'
         assert row['coach_stats_json'] is None
 
