@@ -29,6 +29,8 @@ Silver Tables Created:
     iceberg.silver.fotmob_player_season_profile
     iceberg.silver.fotmob_player_profile
     iceberg.silver.fotmob_keeper_profile
+    iceberg.silver.fotmob_player_market_value_history
+    iceberg.silver.fotmob_team_match
 """
 
 from datetime import datetime
@@ -66,6 +68,14 @@ SILVER_TRANSFORMS = [
         'dags/sql/silver/fotmob_player_market_value_history.sql',
         'fotmob_player_market_value_history',
     ),
+    # issue #97 Phase A: team-match stats из bronze.fotmob_match_details
+    # (stats_json + player_stats_json for xA). Питает gold.fct_team_match
+    # (5-source) и audit-таблицу — Phase B после gates DQ.
+    (
+        'team_match',
+        'dags/sql/silver/fotmob_team_match.sql',
+        'fotmob_team_match',
+    ),
 ]
 
 # FotMob Bronze coverage: только сезон 2025 (572 player в details, ~10K rows
@@ -79,6 +89,9 @@ SILVER_MIN_ROWS = {
     'fotmob_player_profile': 500,
     'fotmob_keeper_profile': 40,
     'fotmob_player_market_value_history': 1000,
+    # team_match: ~338 finished matches × 2 sides = 676 rows для APL 2025/26
+    # (7% бронзы без stats_json — cancelled / not finished). Floor 600 c headroom.
+    'fotmob_team_match': 600,
 }
 
 
@@ -287,6 +300,63 @@ def _validate_silver_quality(**context) -> Dict[str, Any]:
             max_val=500_000_000,
             severity='WARNING',
         ),
+
+        # --- team_match (issue #97 Phase A) ---
+        # ERROR: PK uniqueness + floor count.
+        # WARNING: freshness, plausibility ranges, coverage для критичных
+        # metrics (xG/xA, possession). expected_assists — raison d'être #97,
+        # держим coverage WARN высоко (вынуждаем reingest если падает).
+        CHECK.no_nulls(
+            'silver.fotmob_team_match',
+            cols=['match_id', 'team_id', 'league', 'season'],
+        ),
+        CHECK.no_duplicates(
+            'silver.fotmob_team_match',
+            pk=['match_id', 'team_id', 'league', 'season'],
+        ),
+        CHECK.row_count(
+            'silver.fotmob_team_match',
+            min_rows=600,
+        ),
+        CHECK.freshness(
+            'silver.fotmob_team_match',
+            ts_col='_bronze_ingested_at',
+            max_age_hours=FRESH_HOURS,
+            severity='WARNING',
+        ),
+        CHECK.value_range(
+            'silver.fotmob_team_match',
+            'possession_pct',
+            min_val=0,
+            max_val=100,
+            severity='WARNING',
+        ),
+        CHECK.value_range(
+            'silver.fotmob_team_match',
+            'expected_goals',
+            min_val=0,
+            max_val=10,
+            severity='WARNING',
+        ),
+        CHECK.value_range(
+            'silver.fotmob_team_match',
+            'expected_assists',
+            min_val=0,
+            max_val=10,
+            severity='WARNING',
+        ),
+        CHECK.coverage(
+            'silver.fotmob_team_match',
+            column='expected_goals',
+            warn_threshold=0.95,
+            error_threshold=0.80,
+        ),
+        CHECK.coverage(
+            'silver.fotmob_team_match',
+            column='expected_assists',
+            warn_threshold=0.95,
+            error_threshold=0.80,
+        ),
     ]
 
     report = run_checks(checks, raise_on_error=False)
@@ -338,6 +408,7 @@ with DAG(
     | `fotmob_player_season_profile` | Полевые игроки per-season (без GK, без тренеров) | fotmob_player_details + fotmob_player_stats (PIVOTED) |
     | `fotmob_player_profile` | Time-invariant snapshot: height_cm/dob/nationality/foot | fotmob_team_squad + fotmob_player_details (foot из JSON) |
     | `fotmob_keeper_profile` | Вратари per-season с GK-stats | fotmob_player_details + fotmob_player_stats (PIVOTED) |
+    | `fotmob_team_match` | Per (match, team_id) team-level stats + xG/xA | fotmob_match_details.stats_json + .player_stats_json (SUM xA) — issue #97 Phase A |
 
     ### Transformations
     - **Dedup** на (player_id, league, season) через ROW_NUMBER + ORDER BY _ingested_at DESC
