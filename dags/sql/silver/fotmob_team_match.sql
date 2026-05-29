@@ -27,6 +27,10 @@
 -- `docs/fotmob_bronze_dq_audit_2026-05-14.md` and #97 history.
 --
 -- Footguns:
+--   * Output `team_id` = team NAME (bronze home_team/away_team), to match
+--     silver.xref_team.source_id (source='fotmob') for a direct name-based JOIN
+--     in Gold. The numeric bronze team_id is kept internally as `team_id_numeric`
+--     ONLY to JOIN team_xa (player_stats_json is keyed by numeric teamId).
 --   * `home_team_id` / `away_team_id` are varchar in bronze; player_stats_json
 --     `teamId` is integer → CAST(... AS varchar) before JOIN.
 --   * Several stats are strings ("3.22"), not numbers — TRY_CAST(... AS DOUBLE).
@@ -59,6 +63,8 @@ stats_flat AS (
         md._ingested_at,
         md.home_team_id,
         md.away_team_id,
+        md.home_team,
+        md.away_team,
         md.home_score,
         md.away_score,
         json_extract_scalar(stat, '$.key')      AS stat_key,
@@ -82,6 +88,8 @@ stats_pivot AS (
         season,
         MAX(home_team_id)       AS home_team_id,
         MAX(away_team_id)       AS away_team_id,
+        MAX(home_team)          AS home_team_name,
+        MAX(away_team)          AS away_team_name,
         MAX(home_score)         AS home_score,
         MAX(away_score)         AS away_score,
         MAX(_ingested_at)       AS _bronze_ingested_at,
@@ -192,8 +200,11 @@ team_xa AS (
 home_side AS (
     SELECT
         sp.match_id,
-        sp.home_team_id           AS team_id,
-        sp.away_team_id           AS opponent_id,
+        -- team_id = team NAME (matches silver.xref_team source_id for fotmob);
+        -- team_id_numeric kept only to JOIN team_xa (keyed by player_stats teamId).
+        sp.home_team_name         AS team_id,
+        sp.away_team_name         AS opponent_id,
+        sp.home_team_id           AS team_id_numeric,
         TRUE                      AS is_home,
         sp.home_score             AS goals_for,
         sp.away_score             AS goals_against,
@@ -230,8 +241,9 @@ home_side AS (
 away_side AS (
     SELECT
         sp.match_id,
-        sp.away_team_id           AS team_id,
-        sp.home_team_id           AS opponent_id,
+        sp.away_team_name         AS team_id,
+        sp.home_team_name         AS opponent_id,
+        sp.away_team_id           AS team_id_numeric,
         FALSE                     AS is_home,
         sp.away_score             AS goals_for,
         sp.home_score             AS goals_against,
@@ -343,7 +355,7 @@ SELECT
 FROM unioned u
 LEFT JOIN team_xa xa
     ON  xa.match_id = u.match_id
-    AND xa.team_id  = u.team_id
+    AND xa.team_id  = u.team_id_numeric
     AND xa.league   = u.league
     AND xa.season   = u.season
 WHERE u.team_id IS NOT NULL

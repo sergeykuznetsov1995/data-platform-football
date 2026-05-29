@@ -30,10 +30,13 @@
 --   → ВСЕ xref JOIN обязаны иметь (league, season) predicate.
 --
 -- Season normalization (feedback_xref_team_source_id_format.md):
---   xref_team.season — varchar; для FBref = year-start '2025', остальных = slug '2526'.
---   xref_match.season — slug '2526' для всех source (унифицировано в xref_match.sql).
+--   xref_team.season — varchar; FBref + FotMob = year-start '2025', US/WS/SS = slug '2526'.
+--   xref_match.season — slug '2526' для US/WS/SS; FotMob = year-start '2025' (bronze
+--     fotmob_schedule.season is bigint; fm_resolved CTE не конвертирует в slug).
 --   silver.fbref_match_enriched.season — bigint 2025.
+--   silver.fotmob_team_match.season — slug '2526'.
 --   Cross-source slug derived via LPAD(MOD(season,100))||LPAD(MOD(season+1,100)).
+--   → FotMob xref bridges JOIN on year-start; the FotMob fact JOINs on season_slug.
 --
 -- PK: (match_id_canonical, team_id_canonical) — natural composite, без xxhash64
 -- (оба компонента non-NULL по конструкции INNER spine FBref ∩ Understat).
@@ -167,6 +170,30 @@ xref_match_ss AS (
       AND confidence <> 'orphan'
 ),
 
+-- FotMob xref (#97). season is YEAR-START '2025' (not slug) — JOIN below on
+-- CAST(season_year AS varchar); the fact season is slug '2526'.
+xref_team_fm AS (
+    SELECT DISTINCT
+        canonical_id,
+        source_id                                            AS fm_team_name,
+        league,
+        season                                               AS season_year
+    FROM iceberg.silver.xref_team
+    WHERE source = 'fotmob'
+      AND confidence <> 'orphan'
+),
+
+xref_match_fm AS (
+    SELECT DISTINCT
+        canonical_id                                         AS match_id_canonical,
+        source_id                                            AS fm_match_id,
+        league,
+        season                                               AS season_year
+    FROM iceberg.silver.xref_match
+    WHERE source = 'fotmob'
+      AND confidence <> 'orphan'
+),
+
 -- WS team_id NUMERIC ↔ NAME bridge (same fail-soft pattern as fct_team_match)
 ws_team_name_bridge AS (
     SELECT DISTINCT
@@ -214,6 +241,22 @@ SELECT
     (CAST(fb.shots_on_target   AS DOUBLE) - CAST(ws.shots_on_target_proxy  AS DOUBLE)) AS shots_on_target_diff_ws,
     -- FBref does not expose team-grain fouls; use SS as baseline for SS↔WS comparison.
     (CAST(ss.fouls             AS DOUBLE) - CAST(ws.fouls_committed         AS DOUBLE)) AS fouls_diff_ss_ws,
+
+    -- ========= vs FotMob (LEFT — NULL if absent; #97) =========
+    (CAST(fb.goals_for         AS DOUBLE) - CAST(fm.goals_for       AS DOUBLE)) AS goals_for_diff_fm,
+    (CAST(fb.goals_against     AS DOUBLE) - CAST(fm.goals_against   AS DOUBLE)) AS goals_against_diff_fm,
+    (CAST(fb.shots             AS DOUBLE) - CAST(fm.total_shots     AS DOUBLE)) AS shots_diff_fm,
+    (CAST(fb.shots_on_target   AS DOUBLE) - CAST(fm.shots_on_target AS DOUBLE)) AS shots_on_target_diff_fm,
+    (CAST(fb.possession        AS DOUBLE) - CAST(fm.possession_pct  AS DOUBLE)) AS possession_diff_fm,
+    (CAST(fb.yellow_cards      AS DOUBLE) - CAST(fm.yellow_cards    AS DOUBLE)) AS yellow_cards_diff_fm,
+    (CAST(fb.red_cards         AS DOUBLE) - CAST(fm.red_cards       AS DOUBLE)) AS red_cards_diff_fm,
+    -- xG cross-model diff (Understat vs FotMob); diff = US - FM.
+    ROUND(CAST(us.xg           AS DOUBLE) - CAST(fm.expected_goals  AS DOUBLE), 4) AS xg_diff_us_fm,
+    -- passes / corners / offsides: FBref has no team-grain → SS baseline vs FotMob.
+    (CAST(ss.total_passes      AS DOUBLE) - CAST(fm.total_passes    AS DOUBLE)) AS passes_diff_ss_fm,
+    (CAST(ss.corner_kicks      AS DOUBLE) - CAST(fm.corner_kicks    AS DOUBLE)) AS corners_diff_ss_fm,
+    (CAST(ss.fouls             AS DOUBLE) - CAST(fm.fouls           AS DOUBLE)) AS fouls_diff_ss_fm,
+    (CAST(ss.offsides          AS DOUBLE) - CAST(fm.offsides        AS DOUBLE)) AS offsides_diff_ss_fm,
 
     -- ========= Lineage =========
     CURRENT_TIMESTAMP                                     AS _gold_created_at,
@@ -278,5 +321,20 @@ LEFT JOIN iceberg.silver.whoscored_team_match ws
     AND ws.team_id  = wsb.ws_team_id_numeric
     AND ws.league   = fb.league
     AND ws.season   = fb.season_slug
+
+-- ===== FotMob LEFT (#97) — xref season year-start, fact season slug =====
+LEFT JOIN xref_team_fm xtfm
+    ON  xtfm.canonical_id = xtf.canonical_id
+    AND xtfm.league       = fb.league
+    AND xtfm.season_year  = CAST(fb.season_year AS varchar)
+LEFT JOIN xref_match_fm xmfm
+    ON  xmfm.match_id_canonical = fb.match_id
+    AND xmfm.league             = fb.league
+    AND xmfm.season_year        = CAST(fb.season_year AS varchar)
+LEFT JOIN iceberg.silver.fotmob_team_match fm
+    ON  fm.match_id = xmfm.fm_match_id
+    AND fm.team_id  = xtfm.fm_team_name
+    AND fm.league   = fb.league
+    AND fm.season   = fb.season_slug
 
 WHERE fb.match_id IS NOT NULL

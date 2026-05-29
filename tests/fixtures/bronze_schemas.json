@@ -1,5 +1,5 @@
 {
-  "snapshot_at": "2026-05-27T06:36:43+00:00",
+  "snapshot_at": "2026-05-29T08:57:54+00:00",
   "missing_tables": [
     "fbref_shot_events"
   ],
@@ -531,6 +531,34 @@
         "team_id": "varchar"
       }
     },
+    "bronze.fotmob_match_details": {
+      "columns": {
+        "_batch_id": "varchar",
+        "_entity_type": "varchar",
+        "_ingested_at": "timestamp(6)",
+        "_source": "varchar",
+        "away_score": "bigint",
+        "away_team": "varchar",
+        "away_team_id": "varchar",
+        "events_json": "varchar",
+        "h2h_json": "varchar",
+        "home_score": "bigint",
+        "home_team": "varchar",
+        "home_team_id": "varchar",
+        "league": "varchar",
+        "lineup_json": "varchar",
+        "match_date": "varchar",
+        "match_facts_json": "varchar",
+        "match_id": "varchar",
+        "momentum_json": "varchar",
+        "page_url": "varchar",
+        "player_stats_json": "varchar",
+        "season": "bigint",
+        "shotmap_json": "varchar",
+        "stats_json": "varchar",
+        "status": "varchar"
+      }
+    },
     "bronze.fotmob_player_details": {
       "columns": {
         "_batch_id": "varchar",
@@ -577,9 +605,12 @@
         "minutes_played": "bigint",
         "participant_id": "bigint",
         "participant_name": "varchar",
+        "player_id": "bigint",
+        "player_name": "varchar",
         "positions": "varchar",
         "rank": "bigint",
         "season": "bigint",
+        "stat_category": "varchar",
         "stat_category_group": "varchar",
         "stat_category_header": "varchar",
         "stat_name": "varchar",
@@ -918,6 +949,27 @@
         "won_tackle": "double"
       }
     },
+    "bronze.sofascore_match_stats": {
+      "columns": {
+        "_batch_id": "varchar",
+        "_entity_type": "varchar",
+        "_ingested_at": "timestamp(6)",
+        "_source": "varchar",
+        "away_text": "varchar",
+        "away_value": "double",
+        "compare_code": "bigint",
+        "home_text": "varchar",
+        "home_value": "double",
+        "league": "varchar",
+        "match_id": "varchar",
+        "period": "varchar",
+        "season": "varchar",
+        "stat_group": "varchar",
+        "stat_key": "varchar",
+        "stat_name": "varchar",
+        "value_type": "varchar"
+      }
+    },
     "bronze.sofascore_player_profile": {
       "columns": {
         "_batch_id": "varchar",
@@ -1254,6 +1306,72 @@
         "season": "varchar",
         "season_id": "bigint",
         "url": "varchar"
+      }
+    },
+    "bronze.understat_shots": {
+      "columns": {
+        "_batch_id": "varchar",
+        "_entity_type": "varchar",
+        "_ingested_at": "timestamp(6)",
+        "_source": "varchar",
+        "assist_player": "varchar",
+        "assist_player_id": "bigint",
+        "body_part": "varchar",
+        "date": "timestamp(6)",
+        "game": "varchar",
+        "game_id": "bigint",
+        "league": "varchar",
+        "league_id": "varchar",
+        "location_x": "double",
+        "location_y": "double",
+        "minute": "bigint",
+        "player": "varchar",
+        "player_id": "bigint",
+        "result": "varchar",
+        "season": "varchar",
+        "season_id": "bigint",
+        "shot_id": "bigint",
+        "situation": "varchar",
+        "team": "varchar",
+        "team_id": "bigint",
+        "xg": "double"
+      }
+    },
+    "bronze.understat_team_match_stats": {
+      "columns": {
+        "_batch_id": "varchar",
+        "_entity_type": "varchar",
+        "_ingested_at": "timestamp(6)",
+        "_source": "varchar",
+        "away_deep_completions": "bigint",
+        "away_expected_points": "double",
+        "away_goals": "bigint",
+        "away_np_xg": "double",
+        "away_np_xg_difference": "double",
+        "away_points": "bigint",
+        "away_ppda": "double",
+        "away_team": "varchar",
+        "away_team_code": "varchar",
+        "away_team_id": "bigint",
+        "away_xg": "double",
+        "date": "timestamp(6)",
+        "game": "varchar",
+        "game_id": "bigint",
+        "home_deep_completions": "bigint",
+        "home_expected_points": "double",
+        "home_goals": "bigint",
+        "home_np_xg": "double",
+        "home_np_xg_difference": "double",
+        "home_points": "bigint",
+        "home_ppda": "double",
+        "home_team": "varchar",
+        "home_team_code": "varchar",
+        "home_team_id": "bigint",
+        "home_xg": "double",
+        "league": "varchar",
+        "league_id": "varchar",
+        "season": "varchar",
+        "season_id": "bigint"
       }
     },
     "bronze.whoscored_events": {

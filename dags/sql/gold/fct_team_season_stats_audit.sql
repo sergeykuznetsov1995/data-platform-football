@@ -11,8 +11,9 @@
 -- SofaScore (Understat = primary per RX2; FBref не отдаёт xG на team-level).
 --
 -- Зерно: (team_id_canonical, league, season). INNER JOIN FBref ∩ Understat
--- (Understat = primary secondary с coverage 100% APL). WhoScored / SofaScore —
--- LEFT JOIN → diff = NULL когда источник отсутствует.
+-- (Understat = primary secondary с coverage 100% APL). WhoScored / SofaScore /
+-- FotMob (#97) — LEFT JOIN → diff = NULL когда источник отсутствует. FotMob xref
+-- season — year-start '2025'; fotmob_team_season.season — slug '2526'.
 --
 -- Использование:
 --   1. DQ coverage WARNING — ABS(diff) <= threshold у ≥95% rows.
@@ -57,6 +58,19 @@ xref_ss AS (
         season                                            AS season_slug
     FROM iceberg.silver.xref_team
     WHERE source = 'sofascore'
+      AND confidence <> 'orphan'
+),
+
+-- FotMob xref (#97). season is YEAR-START '2025' (like FBref) → JOIN on
+-- CAST(season_year AS varchar); silver.fotmob_team_season.season is slug.
+xref_fm AS (
+    SELECT DISTINCT
+        canonical_id,
+        source_id                                         AS fm_team_name,
+        league,
+        season                                            AS season_year_str
+    FROM iceberg.silver.xref_team
+    WHERE source = 'fotmob'
       AND confidence <> 'orphan'
 ),
 
@@ -115,6 +129,15 @@ SELECT
     ROUND(CAST(us.xg         AS DOUBLE) - CAST(ss.expected_goals         AS DOUBLE), 4) AS xg_diff_us_vs_ss,
     ROUND(CAST(us.xg_against AS DOUBLE) - CAST(ss.expected_goals_against AS DOUBLE), 4) AS xg_against_diff_us_vs_ss,
 
+    -- ========= FotMob diff (LEFT JOIN → NULL when absent; #97) =========
+    (CAST(fb.mp                AS DOUBLE) - CAST(fm.appearances    AS DOUBLE)) AS matches_diff_fotmob,
+    (CAST(fb.goals             AS DOUBLE) - CAST(fm.goals          AS DOUBLE)) AS goals_diff_fotmob,
+    (CAST(fb.gk_goals_against  AS DOUBLE) - CAST(fm.goals_conceded AS DOUBLE)) AS goals_against_diff_fotmob,
+    (CAST(fb.total_shots       AS DOUBLE) - CAST(fm.total_shots    AS DOUBLE)) AS shots_diff_fotmob,
+    (CAST(fb.shots_on_target   AS DOUBLE) - CAST(fm.shots_on_target AS DOUBLE)) AS shots_on_target_diff_fotmob,
+    -- xG cross-model: Understat (primary) vs FotMob.
+    ROUND(CAST(us.xg           AS DOUBLE) - CAST(fm.expected_goals AS DOUBLE), 4) AS xg_diff_us_vs_fm,
+
     -- ========= Lineage =========
     CURRENT_TIMESTAMP                                     AS _gold_created_at
 
@@ -147,3 +170,11 @@ LEFT JOIN iceberg.silver.sofascore_team_season ss
     ON  ss.team_id = xs.ss_team_name
     AND ss.league  = xs.league
     AND ss.season  = xs.season_slug
+LEFT JOIN xref_fm xfm
+    ON  xfm.canonical_id    = xf.canonical_id
+    AND xfm.league          = xf.league
+    AND xfm.season_year_str = CAST(xf.season_year AS varchar)
+LEFT JOIN iceberg.silver.fotmob_team_season fm
+    ON  fm.team_id = xfm.fm_team_name
+    AND fm.league  = xf.league
+    AND fm.season  = xf.season_slug
