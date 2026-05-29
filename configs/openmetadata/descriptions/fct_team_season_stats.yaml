@@ -1,7 +1,6 @@
 # =============================================================================
 # OpenMetadata description: iceberg.gold.fct_team_season_stats
 # =============================================================================
-# Stub created in T6.4 (#94). Full per-column documentation comes in T6.7 (#96).
 table:
   fullyQualifiedName: trino_iceberg.iceberg.gold.fct_team_season_stats
   description: |
@@ -38,3 +37,230 @@ columns:
     description: Сезон в bigint формате (2025 == 2025/26). Partition key.
   - name: primary_team_name
     description: Display-имя команды (COALESCE FBref → Understat).
+
+  # ─── HARD_FACT — counters (single column через COALESCE fb → us → ws → ss) ───
+  - name: matches
+    description: Сыгранные матчи (COALESCE FBref → Understat → WhoScored → SofaScore).
+  - name: minutes
+    description: Сыгранные минуты (COALESCE FBref → SofaScore). Understat/WS не агрегируют минуты на season-grain.
+  - name: goals
+    description: Голы команды (COALESCE FBref → Understat → SofaScore).
+  - name: goals_against
+    description: Пропущенные голы (COALESCE FBref gk_goals_against → Understat → SofaScore).
+  - name: assists
+    description: Ассисты (COALESCE FBref → SofaScore).
+  - name: yellow_cards
+    description: Жёлтые карточки (COALESCE FBref → SofaScore).
+  - name: red_cards
+    description: Красные карточки (COALESCE FBref → SofaScore).
+  - name: second_yellow_cards
+    description: Вторые жёлтые → красная (FBref-only).
+  - name: total_shots
+    description: Все удары (COALESCE FBref → WhoScored → SofaScore). Understat не агрегирует shots на season-grain.
+  - name: shots_on_target
+    description: Удары в створ (COALESCE FBref → WhoScored proxy → SofaScore).
+  - name: fouls_committed
+    description: Совершённые фолы (COALESCE FBref → WhoScored → SofaScore).
+  - name: fouls_drawn
+    description: Фолы на команде (FBref-only).
+  - name: offsides
+    description: Офсайды (COALESCE FBref → SofaScore).
+  - name: crosses
+    description: Навесы (COALESCE FBref → SofaScore total_crosses).
+  - name: interceptions
+    description: Перехваты (COALESCE FBref → WhoScored → SofaScore).
+  - name: tackles_won
+    description: Выигранные отборы (COALESCE FBref → WhoScored → SofaScore).
+  - name: penalties_won
+    description: Заработанные пенальти (FBref-only).
+  - name: penalties_conceded
+    description: Отданные пенальти (FBref-only).
+  - name: own_goals
+    description: Автоголы (FBref-only).
+
+  # ─── MODELED — xG/xA (Understat primary per RX2; FotMob → SofaScore fallback) ───
+  - name: expected_goals
+    description: |
+      xG команды через COALESCE(Understat → FotMob → SofaScore). Understat —
+      primary источник (RX2: coverage 99.2% vs SofaScore 84.6%, r ≥ 0.989).
+      Cross-source diff'ы → fct_team_season_stats_audit.
+  - name: expected_goals_against
+    description: |
+      xG, допущенные командой (xGA), через COALESCE(Understat → SofaScore).
+      FotMob не отдаёт team-grain xGA → не участвует в цепочке.
+  - name: expected_assists
+    description: |
+      Ожидаемые ассисты (xA), FotMob-only (#97). Единственный источник team-grain
+      xA на season-уровне (Understat/SofaScore его не отдают). NULL для команд без
+      FotMob stats_json (rollup только матчей со stats).
+  - name: xpts
+    description: Expected points — модельные ожидаемые очки (Understat-only).
+  - name: npxg
+    description: Non-penalty xG через COALESCE(Understat → FotMob).
+  - name: npxg_against
+    description: Non-penalty xG, допущенные командой (Understat-only).
+
+  # ─── UNIQUE_FBREF — outfield team stats ───
+  - name: players_used
+    description: Кол-во использованных игроков за сезон (FBref-only).
+  - name: avg_age
+    description: Средний возраст состава, лет (FBref-only).
+  - name: possession_pct
+    description: Владение мячом, % (FBref-only).
+  - name: goals_per_90
+    description: Голы на 90 минут (FBref-only).
+  - name: goals_assists_per_90
+    description: Голы + ассисты на 90 минут (FBref-only).
+  - name: non_penalty_goals_per_90
+    description: Голы без пенальти на 90 минут (FBref-only).
+  - name: shots_per_90
+    description: Удары на 90 минут (FBref-only).
+  - name: shot_on_target_pct
+    description: "% ударов в створ (FBref-only)."
+  - name: goals_per_shot
+    description: Голы на удар (FBref-only).
+  - name: goals_per_shot_on_target
+    description: Голы на удар в створ (FBref-only).
+  - name: complete_matches
+    description: Матчи, отыгранные полностью (FBref-only).
+  - name: substitutions
+    description: Сделанные замены (FBref-only).
+  - name: unused_subs
+    description: Неиспользованные замены (FBref-only).
+  - name: points_per_match
+    description: Очки за матч (FBref-only).
+  - name: on_field_goals
+    description: Голы команды, забитые при игроках на поле (FBref-only).
+  - name: on_field_goals_against
+    description: Голы, пропущенные при игроках на поле (FBref-only).
+  - name: plus_minus
+    description: Plus/minus команды по голам (FBref-only).
+  - name: plus_minus_per_90
+    description: Plus/minus на 90 минут (FBref-only).
+
+  # ─── UNIQUE_FBREF — goalkeeping aggregates ───
+  - name: gk_goals_against
+    description: Пропущенные голы (вратарская агрегация, FBref-only).
+  - name: gk_saves
+    description: Сейвы (FBref-only).
+  - name: gk_shots_on_target_against
+    description: Удары в створ по воротам команды (FBref-only).
+  - name: clean_sheets
+    description: Матчи «на ноль» (FBref-only).
+  - name: gk_minutes
+    description: Вратарские минуты (FBref-only).
+  - name: save_pct
+    description: "% сейвов (FBref-only)."
+  - name: gk_pk_attempts_faced
+    description: Пенальти по воротам команды (FBref-only).
+  - name: gk_pk_allowed
+    description: Пропущенные пенальти (FBref-only).
+  - name: gk_pk_saved
+    description: Отражённые пенальти (FBref-only).
+  - name: goals_against_per_90
+    description: Пропущенные голы на 90 минут (FBref-only).
+
+  # ─── UNIQUE_UNDERSTAT — pressing / depth / standings ───
+  - name: ppda
+    description: Passes Per Defensive Action — метрика прессинга (Understat-only); ниже = интенсивнее прессинг.
+  - name: oppda
+    description: Opponent PPDA — устойчивость к чужому прессингу (Understat-only).
+  - name: deep_completions
+    description: Передачи в зону <20м от ворот соперника (Understat-only).
+  - name: deep_completions_allowed
+    description: Допущенные deep completions соперника (Understat-only).
+  - name: wins
+    description: Победы (Understat-only).
+  - name: draws
+    description: Ничьи (Understat-only).
+  - name: losses
+    description: Поражения (Understat-only).
+  - name: points
+    description: Набранные очки = wins*3 + draws (Understat-only).
+
+  # ─── UNIQUE_WHOSCORED — event-style aggregates (SPADL) ───
+  # NB: текущие сезоны (2425/2526) ожидаемо NULL до issue #120 — bridge
+  # bronze.whoscored_schedule (team_id NUMERIC ↔ NAME) заполнен только для '2021'.
+  - name: pass_total
+    description: Всего пасов (WhoScored SPADL). NULL для current seasons (#120).
+  - name: pass_ok
+    description: Точные пасы (WhoScored). NULL для current seasons (#120).
+  - name: pass_pct
+    description: Точность пасов, % (WhoScored). NULL для current seasons (#120).
+  - name: key_passes_ws
+    description: Ключевые пасы (WhoScored). Суффикс _ws во избежание name-conflict. NULL для current seasons (#120).
+  - name: takeon_att
+    description: Попытки обводки 1v1 (WhoScored). NULL для current seasons (#120).
+  - name: takeon_won
+    description: Успешные обводки (WhoScored). NULL для current seasons (#120).
+  - name: takeon_pct
+    description: "% успешных обводок (WhoScored). NULL для current seasons (#120)."
+  - name: clearances
+    description: Выносы (WhoScored). NULL для current seasons (#120).
+  - name: ball_recoveries
+    description: Возвраты мяча (WhoScored). NULL для current seasons (#120).
+  - name: touches_in_box
+    description: |
+      Касания в чужой штрафной. COALESCE(WhoScored → FotMob) — WS NULL для
+      current seasons (#120), FotMob закрывает пробел.
+  - name: defensive_actions_third
+    description: Оборонительные действия в защитной трети (WhoScored). NULL для current seasons (#120).
+  - name: set_piece_share_pct
+    description: "Доля голевых атак со стандартов, % (WhoScored). NULL для current seasons (#120)."
+
+  # ─── UNIQUE_SOFASCORE — passes / duels / breakdowns ───
+  - name: total_passes
+    description: Всего пасов (SofaScore). Альтернативный счётчик к WhoScored.
+  - name: accurate_passes
+    description: Точные пасы (SofaScore).
+  - name: accurate_passes_pct
+    description: "Точность пасов, % (SofaScore)."
+  - name: possession_pct_avg
+    description: "Среднее владение мячом за матч, % (SofaScore)."
+  - name: corner_kicks
+    description: Угловые удары (SofaScore).
+  - name: ground_duels_won
+    description: Выигранные единоборства на земле (SofaScore).
+  - name: ground_duels_total
+    description: Всего единоборств на земле (SofaScore).
+  - name: ground_duels_won_pct
+    description: "% выигранных наземных единоборств (SofaScore)."
+  - name: aerial_duels_won
+    description: Выигранные верховые единоборства (SofaScore).
+  - name: aerial_duels_total
+    description: Всего верховых единоборств (SofaScore).
+  - name: aerial_duels_won_pct
+    description: "% выигранных верховых единоборств (SofaScore)."
+  - name: total_duels_won_pct
+    description: "% выигранных всех единоборств (SofaScore)."
+  - name: accurate_long_balls
+    description: Точные длинные передачи (SofaScore).
+  - name: total_long_balls
+    description: Всего длинных передач (SofaScore).
+  - name: accurate_long_balls_pct
+    description: "% точных длинных передач (SofaScore)."
+  - name: accurate_crosses
+    description: Точные навесы (SofaScore).
+  - name: total_crosses
+    description: Всего навесов (SofaScore).
+
+  # ─── UNIQUE_FOTMOB — metrics no other source provides (#97) ───
+  - name: xgot
+    description: Expected Goals on Target — модельная ценность пробитых в створ ударов (FotMob-only).
+  - name: big_chances
+    description: Явные голевые моменты (FotMob-only).
+  - name: big_chances_missed
+    description: Нереализованные явные моменты (FotMob-only).
+  - name: shots_inside_box
+    description: Удары из штрафной (FotMob-only).
+  - name: shots_outside_box
+    description: Удары из-за штрафной (FotMob-only).
+
+  # ─── Lineage ───
+  - name: _gold_created_at
+    description: Технический timestamp материализации строки CTAS (UTC).
+relationships:
+  - from: team_id_canonical
+    to: trino_iceberg.iceberg.gold.dim_team.team_id
+    type: FOREIGN_KEY
+    description: N:1 — атрибуты команды.

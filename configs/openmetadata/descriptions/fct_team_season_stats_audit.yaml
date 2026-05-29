@@ -1,7 +1,6 @@
 # =============================================================================
 # OpenMetadata description: iceberg.gold.fct_team_season_stats_audit
 # =============================================================================
-# Stub created in T6.4 (#94). Full per-column documentation comes in T6.7 (#96).
 table:
   fullyQualifiedName: trino_iceberg.iceberg.gold.fct_team_season_stats_audit
   description: |
@@ -29,7 +28,6 @@ table:
   tags:
     - Tier.Gold
     - Domain.Football
-    - Audit.CrossSource
 columns:
   # ─── PK ───
   - name: team_id_canonical
@@ -38,3 +36,86 @@ columns:
     description: Лига (partition key).
   - name: season
     description: Сезон в bigint формате (2025 == 2025/26). Partition key.
+
+  # ─── Understat diff (INNER JOIN — всегда non-NULL) ───
+  - name: matches_diff_understat
+    description: "Diff матчей: fb.mp - us.games_played. INNER JOIN — non-NULL."
+  - name: goals_diff_understat
+    description: "Diff голов: fb.goals - us.goals."
+  - name: goals_against_diff_understat
+    description: "Diff пропущенных: fb.gk_goals_against - us.goals_against."
+
+  # ─── WhoScored diff (LEFT JOIN → NULL когда отсутствует; #120) ───
+  - name: matches_diff_whoscored
+    description: "Diff матчей: fb.mp - ws.matches_seen. NULL для current seasons (#120)."
+  - name: shots_diff_whoscored
+    description: "Diff ударов: fb.total_shots - ws.shots_total. NULL для current seasons (#120)."
+  - name: shots_on_target_diff_whoscored
+    description: "Diff ударов в створ: fb.shots_on_target - ws.shots_on_target_proxy. NULL для current seasons (#120)."
+  - name: interceptions_diff_whoscored
+    description: "Diff перехватов: fb.interceptions - ws.interceptions. NULL для current seasons (#120)."
+  - name: tackles_won_diff_whoscored
+    description: "Diff отборов: fb.tackles_won - ws.tackle_won. NULL для current seasons (#120)."
+  - name: fouls_committed_diff_whoscored
+    description: "Diff фолов: fb.fouls_committed - ws.fouls_committed. NULL для current seasons (#120)."
+
+  # ─── SofaScore diff (LEFT JOIN → NULL когда отсутствует) ───
+  - name: matches_diff_sofascore
+    description: "Diff матчей: fb.mp - ss.appearances."
+  - name: goals_diff_sofascore
+    description: "Diff голов: fb.goals - ss.goals."
+  - name: goals_against_diff_sofascore
+    description: "Diff пропущенных: fb.gk_goals_against - ss.goals_conceded."
+  - name: assists_diff_sofascore
+    description: "Diff ассистов: fb.assists - ss.assists."
+  - name: yellow_cards_diff_sofascore
+    description: "Diff жёлтых: fb.yellow_cards - ss.yellow_cards."
+  - name: red_cards_diff_sofascore
+    description: "Diff красных: fb.red_cards - ss.red_cards."
+  - name: shots_diff_sofascore
+    description: "Diff ударов: fb.total_shots - ss.total_shots."
+  - name: shots_on_target_diff_sofascore
+    description: "Diff ударов в створ: fb.shots_on_target - ss.shots_on_target."
+  - name: interceptions_diff_sofascore
+    description: "Diff перехватов: fb.interceptions - ss.interceptions."
+  - name: tackles_won_diff_sofascore
+    description: "Diff отборов: fb.tackles_won - ss.tackles_won."
+  - name: fouls_committed_diff_sofascore
+    description: "Diff фолов: fb.fouls_committed - ss.fouls_committed."
+  - name: offsides_diff_sofascore
+    description: "Diff офсайдов: fb.offsides - ss.offsides."
+  - name: crosses_diff_sofascore
+    description: "Diff навесов: fb.crosses - ss.total_crosses."
+
+  # ─── MODELED xG diff (разные модели, расхождение ожидаемо) ───
+  - name: xg_diff_us_vs_ss
+    description: |
+      Кросс-модельный diff xG: us.xg - ss.expected_goals (ROUND 4). FBref не
+      отдаёт team-level xG → primary = Understat, secondary = SofaScore.
+      NULL если SofaScore-запись отсутствует.
+  - name: xg_against_diff_us_vs_ss
+    description: "Кросс-модельный diff xGA: us.xg_against - ss.expected_goals_against (ROUND 4). NULL если SS отсутствует."
+
+  # ─── FotMob diff (LEFT JOIN → NULL когда отсутствует; #97) ───
+  - name: matches_diff_fotmob
+    description: "Diff матчей: fb.mp - fm.appearances. NULL если FotMob отсутствует; season-rollup недосчитан → WARNING-only."
+  - name: goals_diff_fotmob
+    description: "Diff голов: fb.goals - fm.goals."
+  - name: goals_against_diff_fotmob
+    description: "Diff пропущенных: fb.gk_goals_against - fm.goals_conceded."
+  - name: shots_diff_fotmob
+    description: "Diff ударов: fb.total_shots - fm.total_shots."
+  - name: shots_on_target_diff_fotmob
+    description: "Diff ударов в створ: fb.shots_on_target - fm.shots_on_target."
+  - name: xg_diff_us_vs_fm
+    description: "Кросс-модельный diff xG: us.xg - fm.expected_goals (ROUND 4). Understat vs FotMob."
+
+  # ─── Lineage ───
+  - name: _gold_created_at
+    description: Технический timestamp создания строки в Gold-слое.
+
+relationships:
+  - from: team_id_canonical
+    to: trino_iceberg.iceberg.gold.fct_team_season_stats.team_id_canonical
+    type: FOREIGN_KEY
+    description: N:1 — business-витрина с тем же grain.
