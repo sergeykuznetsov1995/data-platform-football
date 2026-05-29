@@ -167,6 +167,9 @@ python dags/scripts/run_sofifa_scraper.py \\
             'PATH': '/usr/local/bin:/usr/bin:/bin:/home/airflow/.local/bin',
             'HOME': '/home/airflow',
         },
+        # Inherit container env (TRINO_PASSWORD/TRINO_PORT) so the Iceberg writer
+        # connects via HTTPS:8443 with auth instead of falling back to HTTP:8080.
+        append_env=True,
         # player_ratings fetches ~545 player pages through FlareSolverr with
         # session rotation (~12s + occasional ~15s rotation each) → up to ~2h.
         execution_timeout=timedelta(hours=4),
