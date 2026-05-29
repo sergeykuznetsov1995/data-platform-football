@@ -120,6 +120,10 @@ columns:
   # ─── Lineage ───
   - name: _gold_created_at
     description: Технический timestamp создания строки в Gold-слое.
+  - name: league
+    description: Лига (partition key).
+  - name: season
+    description: Сезон, slug-форма '2526' (fb.season_slug). Partition key.
 
 relationships:
   - from: match_id_canonical
