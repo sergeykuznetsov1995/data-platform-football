@@ -2,53 +2,42 @@
 FotMob Scraper
 ==============
 
-Scraper for FotMob football data using Selenium with Cloudflare bypass.
+Scraper for FotMob football data using FotMob's public ``/api/data`` JSON
+endpoints. No browser / Cloudflare bypass required — all endpoints are public
+HTTP (see issue #36; rotation ``/api`` → ``/api/data``).
+
 FotMob provides comprehensive football statistics including:
 - Match schedules and results
-- Team season statistics
-- Player season statistics
-- Match lineups and events
+- Team and player season statistics / leaderboards
+- Team profiles and squads
+- Transfers
+- Per-match details (lineups, events, shotmap, ...) via the Next.js
+  ``_next/data`` slug-form payload
+- Per-player details (career, market values, trophies, ...)
 
 Source: https://www.fotmob.com
-
-NOTE: FotMob uses session cookies for API access. This scraper uses
-undetected-chromedriver to obtain valid session cookies, then makes
-direct API calls.
 """
 
 import json
 import logging
+import re
 import time
-from io import StringIO
 from typing import Any, Dict, List, Optional
 
 import pandas as pd
 import requests
 
-from scrapers.base.base_scraper import SeleniumScraper
-from scrapers.base.browser import CloudflareBypass
+from scrapers.base.base_scraper import BaseScraper
 
 logger = logging.getLogger(__name__)
 
-class FotMobScraper(SeleniumScraper):
+
+class FotMobScraper(BaseScraper):
     """
-    Scraper for FotMob data using Selenium with Cloudflare bypass.
-
-    FotMob provides:
-    - Match schedules and scores
-    - Team season statistics
-    - Player season statistics
-    - Match lineups
-
-    The scraper uses Selenium to obtain session cookies from FotMob,
-    then uses those cookies to make direct API calls.
+    Scraper for FotMob data using public ``/api/data`` JSON endpoints.
 
     Usage:
-        scraper = FotMobScraper(
-            leagues=['ENG-Premier League'],
-            seasons=[2024],
-            headless=True
-        )
+        scraper = FotMobScraper(leagues=['ENG-Premier League'], seasons=[2025])
         result = scraper.scrape_all()
     """
 
@@ -56,7 +45,7 @@ class FotMobScraper(SeleniumScraper):
     DEFAULT_RATE_LIMIT = 30  # requests per minute
 
     BASE_URL = 'https://www.fotmob.com'
-    API_BASE = 'https://www.fotmob.com/api'
+    API_BASE = 'https://www.fotmob.com/api/data'
 
     # League configuration with FotMob league IDs
     LEAGUE_IDS = {
@@ -76,8 +65,6 @@ class FotMobScraper(SeleniumScraper):
         self,
         leagues: Optional[List[str]] = None,
         seasons: Optional[List[int]] = None,
-        headless: bool = True,
-        use_xvfb: bool = True,
         **kwargs
     ):
         """
@@ -85,98 +72,38 @@ class FotMobScraper(SeleniumScraper):
 
         Args:
             leagues: List of leagues to scrape
-            seasons: List of seasons to scrape (e.g., [2023, 2024])
-            headless: Run browser in headless mode
-            use_xvfb: Use Xvfb virtual display to bypass headless detection
-            **kwargs: Additional arguments for SeleniumScraper
+            seasons: List of seasons to scrape (e.g., [2024, 2025])
+            **kwargs: Additional arguments for BaseScraper
         """
-        super().__init__(
-            leagues=leagues,
-            seasons=seasons,
-            headless=headless,
-            **kwargs
-        )
-        self.use_xvfb = use_xvfb
+        super().__init__(leagues=leagues, seasons=seasons, **kwargs)
         self._session: Optional[requests.Session] = None
-        self._cookies_obtained = False
+        self._build_id: Optional[str] = None
+        self._team_data_cache: Dict[str, Optional[Dict[str, Any]]] = {}
 
-    def _get_browser(self) -> CloudflareBypass:
-        """Get browser with FotMob-specific configuration."""
-        if self._browser is None:
-            self._browser = CloudflareBypass(
-                headless=self.headless,
-                use_xvfb=self.use_xvfb,
-                proxy=self.proxy,
-                page_load_timeout=45,
-            )
-        return self._browser
+    # ------------------------------------------------------------------ #
+    # HTTP plumbing
+    # ------------------------------------------------------------------ #
 
     def _format_season(self, season: int) -> str:
-        """
-        Format season year to FotMob format.
-
-        FotMob uses format like '2023/2024' for season parameter.
-
-        Args:
-            season: Season start year (e.g., 2023 for 2023-2024 season)
-
-        Returns:
-            Formatted season string
-        """
+        """Format season year to FotMob format (e.g. 2023 -> '2023/2024')."""
         return f"{season}/{season + 1}"
 
     def _get_session(self) -> requests.Session:
-        """Get or create requests session with FotMob cookies."""
+        """Get or create a plain requests session (no cookies needed)."""
         if self._session is None:
             self._session = requests.Session()
             self._session.headers.update({
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'User-Agent': (
+                    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                    'AppleWebKit/537.36 (KHTML, like Gecko) '
+                    'Chrome/120.0.0.0 Safari/537.36'
+                ),
                 'Accept': 'application/json, text/plain, */*',
                 'Accept-Language': 'en-US,en;q=0.9',
                 'Referer': self.BASE_URL,
                 'Origin': self.BASE_URL,
             })
-
-        if not self._cookies_obtained:
-            self._obtain_cookies()
-
         return self._session
-
-    def _obtain_cookies(self) -> None:
-        """Obtain session cookies from FotMob using Selenium."""
-        logger.info("Obtaining FotMob session cookies via Selenium")
-
-        try:
-            browser = self._get_browser()
-
-            # Navigate to FotMob to get cookies
-            browser.get_page(
-                self.BASE_URL,
-                wait_timeout=20,
-                cloudflare_wait=8.0,
-            )
-
-            # Additional wait for page to fully load
-            time.sleep(3)
-
-            # Get cookies from browser
-            cookies = browser.get_cookies()
-
-            # Transfer cookies to requests session
-            for cookie in cookies:
-                self._session.cookies.set(
-                    cookie['name'],
-                    cookie['value'],
-                    domain=cookie.get('domain', '.fotmob.com'),
-                    path=cookie.get('path', '/'),
-                )
-
-            self._cookies_obtained = True
-            logger.info(f"Obtained {len(cookies)} cookies from FotMob")
-
-        except Exception as e:
-            logger.error(f"Error obtaining FotMob cookies: {e}")
-            raise
 
     def _fetch_api_json(
         self,
@@ -185,76 +112,125 @@ class FotMobScraper(SeleniumScraper):
         retry_count: int = 3
     ) -> Optional[Dict[str, Any]]:
         """
-        Fetch JSON data from FotMob API.
+        Fetch JSON from a FotMob endpoint.
 
         Args:
-            endpoint: API endpoint (e.g., 'leagues')
+            endpoint: API endpoint name (e.g. 'leagues') resolved against
+                ``API_BASE``, OR a fully-qualified ``http(s)://`` URL (used for
+                ``data.fotmob.com`` leaderboard ``fetchAllUrl`` and the
+                ``_next/data`` payloads).
             params: Query parameters
             retry_count: Number of retries
 
         Returns:
-            JSON response data or None
+            Parsed JSON or None.
         """
-        url = f"{self.API_BASE}/{endpoint}"
+        url = endpoint if endpoint.startswith('http') else f"{self.API_BASE}/{endpoint}"
         session = self._get_session()
 
         for attempt in range(retry_count):
             try:
-                # Rate limiting
                 self._rate_limiter.acquire()
-
                 response = session.get(url, params=params, timeout=30)
 
                 if response.status_code == 200:
                     self._stats['successes'] += 1
                     return response.json()
 
-                elif response.status_code == 403:
-                    # Cookies expired, refresh them
-                    logger.warning("FotMob API returned 403, refreshing cookies")
-                    self._cookies_obtained = False
-                    self._obtain_cookies()
-                    continue
-
-                else:
-                    logger.warning(f"FotMob API returned {response.status_code}")
+                logger.warning(f"FotMob API returned {response.status_code} for {url}")
 
             except requests.exceptions.RequestException as e:
-                logger.error(f"Request error: {e}")
+                logger.error(f"Request error for {url}: {e}")
                 if attempt < retry_count - 1:
                     time.sleep(2 ** attempt)
 
             except json.JSONDecodeError as e:
-                logger.error(f"JSON decode error: {e}")
+                logger.error(f"JSON decode error for {url}: {e}")
 
         self._stats['failures'] += 1
         return None
 
     def _get_league_data(self, league: str, season: int) -> Optional[Dict[str, Any]]:
-        """
-        Get league data from FotMob API.
-
-        Args:
-            league: League name
-            season: Season year
-
-        Returns:
-            League data dictionary or None
-        """
+        """Get league payload (`/api/data/leagues`)."""
         league_id = self.LEAGUE_IDS.get(league)
         if not league_id:
             logger.error(f"Unknown league: {league}")
             return None
 
-        season_str = self._format_season(season)
-
         return self._fetch_api_json(
             'leagues',
-            params={
-                'id': league_id,
-                'season': season_str,
-            }
+            params={'id': league_id, 'season': self._format_season(season)},
         )
+
+    def _get_build_id(self) -> Optional[str]:
+        """Fetch and cache the Next.js ``buildId`` from the homepage.
+
+        ``buildId`` rotates on every FotMob deploy, so it must never be
+        hard-coded — it is required to address ``_next/data`` payloads.
+        """
+        if self._build_id:
+            return self._build_id
+
+        session = self._get_session()
+        try:
+            self._rate_limiter.acquire()
+            resp = session.get(self.BASE_URL, timeout=30)
+            match = re.search(r'"buildId":"([^"]+)"', resp.text)
+            if match:
+                self._build_id = match.group(1)
+                logger.info(f"Resolved FotMob buildId={self._build_id}")
+            else:
+                logger.error("Could not find buildId in FotMob homepage")
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Error fetching FotMob homepage for buildId: {e}")
+
+        return self._build_id
+
+    def _fetch_next_data_payload(self, path: str) -> Optional[Dict[str, Any]]:
+        """Fetch a ``/_next/data/<buildId><path>.json`` payload.
+
+        Args:
+            path: Path beginning with ``/`` relative to the build root, e.g.
+                ``/players/24011`` or ``/matches/<slug>/<short_id>``.
+        """
+        build_id = self._get_build_id()
+        if not build_id:
+            return None
+        url = f"{self.BASE_URL}/_next/data/{build_id}{path}.json"
+        return self._fetch_api_json(url)
+
+    def _get_team_data(self, team_id: Any) -> Optional[Dict[str, Any]]:
+        """Get a team payload (`/api/data/teams?id=`), cached per run."""
+        key = str(team_id)
+        if key not in self._team_data_cache:
+            self._team_data_cache[key] = self._fetch_api_json('teams', params={'id': key})
+        return self._team_data_cache[key]
+
+    def _team_ids_for_league(self, league: str, season: int) -> List[int]:
+        """Extract team ids from the league standings table."""
+        data = self._get_league_data(league, season)
+        if not data:
+            return []
+        try:
+            table = data.get('table') or []
+            if not table:
+                return []
+            standings = table[0].get('data', {}).get('table', {}).get('all', [])
+            return [t['id'] for t in standings if t.get('id') is not None]
+        except (KeyError, IndexError, TypeError) as e:
+            logger.error(f"Error extracting team ids for {league} {season}: {e}")
+            return []
+
+    @staticmethod
+    def _jdump(value: Any) -> Optional[str]:
+        """Serialise a nested JSON value to a string column, None-safe."""
+        if value is None:
+            return None
+        return json.dumps(value, ensure_ascii=False, default=str)
+
+    # ------------------------------------------------------------------ #
+    # Daily league-level entities (schedule / team_stats / player_stats)
+    # ------------------------------------------------------------------ #
 
     def read_schedule(
         self,
@@ -502,14 +478,486 @@ class FotMobScraper(SeleniumScraper):
             logger.error(f"Error parsing player stats: {e}")
             return None
 
+    # ------------------------------------------------------------------ #
+    # Team-level entities (profile / squad) — /api/data/teams?id=
+    # ------------------------------------------------------------------ #
+
+    def read_team_profile(
+        self,
+        league: str = None,
+        season: int = None
+    ) -> Optional[pd.DataFrame]:
+        """Read one profile row per team in the league (`/api/data/teams`)."""
+        league = league or (self.leagues[0] if self.leagues else None)
+        season = season or (self.seasons[0] if self.seasons else None)
+        if not league or not season:
+            logger.error("League and season must be specified")
+            return None
+
+        logger.info(f"Fetching FotMob team profiles: {league} {season}")
+        team_ids = self._team_ids_for_league(league, season)
+        if not team_ids:
+            logger.warning(f"No team ids for {league} {season}")
+            return None
+
+        rows = []
+        for tid in team_ids:
+            data = self._get_team_data(tid)
+            if not data:
+                continue
+            details = data.get('details') or {}
+            overview = data.get('overview') or {}
+            history = data.get('history') or {}
+
+            venue = ((overview.get('venue') or {}).get('widget') or {}).get('name')
+            tables = history.get('tables') or {}
+            historic = tables.get('historic') if isinstance(tables, dict) else None
+
+            rows.append({
+                'team_id': details.get('id') or tid,
+                'team_name': details.get('name'),
+                'short_name': details.get('shortName'),
+                'country': details.get('country'),
+                'venue': venue,
+                'overview_season': overview.get('season'),
+                'overview_table_position': self._overview_table_position(overview, details.get('id') or tid),
+                'next_match': self._jdump(overview.get('nextMatch')),
+                'last_match': self._jdump(overview.get('lastMatch')),
+                'history_seasons_count': str(len(historic)) if isinstance(historic, list) else None,
+            })
+
+        if not rows:
+            logger.warning(f"No team profiles parsed for {league} {season}")
+            return None
+
+        df = pd.DataFrame(rows)
+        df['league'] = league
+        df['season'] = season
+        df = self._add_metadata(df, 'team_profile')
+        logger.info(f"Parsed {len(df)} team profiles")
+        return df
+
+    @staticmethod
+    def _overview_table_position(overview: Dict[str, Any], team_id: Any) -> Optional[str]:
+        """Best-effort league position lookup from the overview standings."""
+        try:
+            table = overview.get('table') or []
+            standings = table[0].get('data', {}).get('table', {}).get('all', [])
+            for row in standings:
+                if row.get('id') == team_id:
+                    pos = row.get('idx') or row.get('position')
+                    return str(pos) if pos is not None else None
+        except (KeyError, IndexError, TypeError):
+            pass
+        return None
+
+    def read_team_squad(
+        self,
+        league: str = None,
+        season: int = None
+    ) -> Optional[pd.DataFrame]:
+        """Read squad members (players + coach) for every team in the league."""
+        league = league or (self.leagues[0] if self.leagues else None)
+        season = season or (self.seasons[0] if self.seasons else None)
+        if not league or not season:
+            logger.error("League and season must be specified")
+            return None
+
+        logger.info(f"Fetching FotMob team squads: {league} {season}")
+        team_ids = self._team_ids_for_league(league, season)
+        if not team_ids:
+            logger.warning(f"No team ids for {league} {season}")
+            return None
+
+        rows = []
+        for tid in team_ids:
+            data = self._get_team_data(tid)
+            if not data:
+                continue
+            details = data.get('details') or {}
+            team_id = details.get('id') or tid
+            team_name = details.get('name')
+
+            sections = (data.get('squad') or {}).get('squad') or []
+            for section in sections:
+                section_role = section.get('title')
+                for m in section.get('members') or []:
+                    member_role = m.get('role') or {}
+                    injury = m.get('injury') or {}
+                    rows.append({
+                        'team_id': team_id,
+                        'team_name': team_name,
+                        'role': section_role,
+                        'player_id': m.get('id'),
+                        'player_name': m.get('name'),
+                        'shirt_number': m.get('shirtNumber'),
+                        'position_id': m.get('positionId'),
+                        'country': m.get('cname'),
+                        'country_code': m.get('ccode'),
+                        'age': m.get('age'),
+                        'height_cm': m.get('height'),
+                        'date_of_birth': m.get('dateOfBirth'),
+                        'rating': m.get('rating'),
+                        'goals': m.get('goals'),
+                        'assists': m.get('assists'),
+                        'penalties': m.get('penalties'),
+                        'red_cards': m.get('rcards'),
+                        'yellow_cards': m.get('ycards'),
+                        'injury_text': injury.get('expectedReturn') or injury.get('text'),
+                        'exclude_from_ranking': m.get('excludeFromRanking'),
+                        'position_label_key': member_role.get('key'),
+                        'position_label_fallback': member_role.get('fallback'),
+                    })
+
+        if not rows:
+            logger.warning(f"No squad members parsed for {league} {season}")
+            return None
+
+        df = pd.DataFrame(rows)
+        df['league'] = league
+        df['season'] = season
+        df = self._add_metadata(df, 'team_squad')
+        logger.info(f"Parsed {len(df)} squad members")
+        return df
+
+    # ------------------------------------------------------------------ #
+    # Team leaderboards — data.fotmob.com/stats/.../<cat>.json (TopLists)
+    # ------------------------------------------------------------------ #
+
+    def read_team_leaderboards(
+        self,
+        league: str = None,
+        season: int = None
+    ) -> Optional[pd.DataFrame]:
+        """Read team-side stat leaderboards across all categories."""
+        league = league or (self.leagues[0] if self.leagues else None)
+        season = season or (self.seasons[0] if self.seasons else None)
+        if not league or not season:
+            logger.error("League and season must be specified")
+            return None
+
+        logger.info(f"Fetching FotMob team leaderboards: {league} {season}")
+        data = self._get_league_data(league, season)
+        if not data:
+            return None
+
+        categories = (data.get('stats') or {}).get('teams') or []
+        if not categories:
+            logger.warning(f"No team leaderboard categories for {league} {season}")
+            return None
+
+        rows = []
+        for cat in categories:
+            url = cat.get('fetchAllUrl')
+            if not url:
+                continue
+            payload = self._fetch_api_json(url)
+            top_lists = (payload or {}).get('TopLists') or []
+            if not top_lists:
+                continue
+            top = top_lists[0]
+            header = top.get('Title') or cat.get('header')
+            group = top.get('Category') or cat.get('category')
+            stat_name = top.get('StatName') or cat.get('name')
+            for item in top.get('StatList') or []:
+                rows.append({
+                    'participant_name': item.get('ParticipantName'),
+                    'team_id': item.get('TeamId'),
+                    'team_name': item.get('TeamName'),
+                    'team_color': item.get('TeamColor'),
+                    'country_code': item.get('ParticipantCountryCode'),
+                    'rank': item.get('Rank'),
+                    'stat_value': item.get('StatValue'),
+                    'sub_stat_value': item.get('SubStatValue'),
+                    'stat_value_count': item.get('StatValueCount'),
+                    'matches_played': item.get('MatchesPlayed'),
+                    'minutes_played': item.get('MinutesPlayed'),
+                    'stat_category_header': header,
+                    'stat_category_group': group,
+                    'stat_name': stat_name,
+                })
+
+        if not rows:
+            logger.warning(f"No team leaderboard rows parsed for {league} {season}")
+            return None
+
+        df = pd.DataFrame(rows)
+        df['league'] = league
+        df['season'] = season
+        df = self._add_metadata(df, 'team_leaderboards')
+        logger.info(f"Parsed {len(df)} team leaderboard rows")
+        return df
+
+    # ------------------------------------------------------------------ #
+    # Transfers — /api/data/transfers?id=<league_id>
+    # ------------------------------------------------------------------ #
+
+    def read_transfers(
+        self,
+        league: str = None,
+        season: int = None
+    ) -> Optional[pd.DataFrame]:
+        """Read the league transfer list (`/api/data/transfers`)."""
+        league = league or (self.leagues[0] if self.leagues else None)
+        season = season or (self.seasons[0] if self.seasons else None)
+        if not league or not season:
+            logger.error("League and season must be specified")
+            return None
+
+        league_id = self.LEAGUE_IDS.get(league)
+        if not league_id:
+            logger.error(f"Unknown league: {league}")
+            return None
+
+        logger.info(f"Fetching FotMob transfers: {league} {season}")
+        payload = self._fetch_api_json('transfers', params={'id': league_id})
+        transfers = (payload or {}).get('transfers') or []
+        if not transfers:
+            logger.warning(f"No transfers for {league} {season}")
+            return None
+
+        rows = []
+        for tr in transfers:
+            position = tr.get('position') or {}
+            transfer_type = tr.get('transferType') or {}
+            fee = tr.get('fee')
+            if isinstance(fee, dict):
+                fee_text = fee.get('fallback') or fee.get('text')
+                fee_value = fee.get('value')
+            else:
+                fee_text = fee if isinstance(fee, str) else None
+                fee_value = tr.get('amountEuroEstimated')
+            market_value = tr.get('marketValue')
+            if isinstance(market_value, dict):
+                market_value = market_value.get('value')
+
+            rows.append({
+                'player_id': tr.get('playerId'),
+                'player_name': tr.get('name'),
+                'position_label': position.get('label'),
+                'position_key': position.get('key'),
+                'transfer_date': tr.get('transferDate'),
+                'from_club': tr.get('fromClub'),
+                'from_club_full_name': tr.get('fromClubFullName'),
+                'from_club_id': tr.get('fromClubId'),
+                'to_club': tr.get('toClub'),
+                'to_club_full_name': tr.get('toClubFullName'),
+                'to_club_id': tr.get('toClubId'),
+                'fee_text': fee_text,
+                'fee_value': fee_value,
+                'market_value': str(market_value) if market_value is not None else None,
+                'on_loan': tr.get('onLoan'),
+                'transfer_type_key': transfer_type.get('localizationKey'),
+                'transfer_type_text': transfer_type.get('text'),
+            })
+
+        df = pd.DataFrame(rows)
+        df['league'] = league
+        df['season'] = season
+        df = self._add_metadata(df, 'transfers')
+        logger.info(f"Parsed {len(df)} transfers")
+        return df
+
+    # ------------------------------------------------------------------ #
+    # Match details — 2-step slug-form _next/data
+    # ------------------------------------------------------------------ #
+
+    def _fetch_match_details(self, match_id: Any) -> Optional[Dict[str, Any]]:
+        """Resolve a match's ``_next/data`` payload via the 2-step slug path.
+
+        Step 1: ``/api/data/match?id=`` -> ``pageUrl`` slug.
+        Step 2: ``/_next/data/<buildId>/matches/<slug>/<short_id>.json``.
+        """
+        header = self._fetch_api_json('match', params={'id': str(match_id)})
+        if not header:
+            return None
+        page_url = header.get('pageUrl')
+        if not page_url:
+            return None
+        # "/matches/<slug>/<short_id>#<match_id>" -> "<slug>/<short_id>"
+        slug_path = page_url.split('#')[0].strip('/')
+        if slug_path.startswith('matches/'):
+            slug_path = slug_path[len('matches/'):]
+        content_payload = self._fetch_next_data_payload(f'/matches/{slug_path}')
+        if not content_payload:
+            return None
+        content = (content_payload.get('pageProps') or {}).get('content')
+        if content is None:
+            return None
+        return {'header': header, 'page_url': page_url, 'content': content}
+
+    def read_match_details(
+        self,
+        league: str = None,
+        season: int = None
+    ) -> Optional[pd.DataFrame]:
+        """Read per-match detail (one wide row per finished match)."""
+        league = league or (self.leagues[0] if self.leagues else None)
+        season = season or (self.seasons[0] if self.seasons else None)
+        if not league or not season:
+            logger.error("League and season must be specified")
+            return None
+
+        logger.info(f"Fetching FotMob match details: {league} {season}")
+        data = self._get_league_data(league, season)
+        if not data:
+            return None
+
+        match_data = data.get('fixtures', {}) or data.get('matches', {})
+        all_matches = match_data.get('allMatches', []) or \
+            match_data.get('data', {}).get('allMatches', [])
+        finished = [m for m in all_matches if (m.get('status') or {}).get('finished')]
+        if not finished:
+            logger.warning(f"No finished matches for {league} {season}")
+            return None
+
+        rows = []
+        for i, match in enumerate(finished):
+            mid = match.get('id')
+            details = self._fetch_match_details(mid)
+            if not details:
+                logger.warning(f"No match details for match_id={mid}")
+                continue
+            content = details['content']
+            status = match.get('status') or {}
+            score_str = status.get('scoreStr', '')
+            home_score = away_score = None
+            if score_str and ' - ' in score_str:
+                try:
+                    home_score, away_score = (int(x) for x in score_str.split(' - '))
+                except (ValueError, IndexError):
+                    pass
+            match_facts = content.get('matchFacts') or {}
+            reason = status.get('reason')
+            rows.append({
+                'match_id': mid,
+                'home_team': match.get('home', {}).get('name'),
+                'home_team_id': match.get('home', {}).get('id'),
+                'away_team': match.get('away', {}).get('name'),
+                'away_team_id': match.get('away', {}).get('id'),
+                'match_date': status.get('utcTime'),
+                'status': reason.get('long') if isinstance(reason, dict) else None,
+                'home_score': home_score,
+                'away_score': away_score,
+                'page_url': details['page_url'],
+                'lineup_json': self._jdump(content.get('lineup')),
+                'events_json': self._jdump(match_facts.get('events')),
+                'match_facts_json': self._jdump(match_facts),
+                'stats_json': self._jdump(content.get('stats')),
+                'player_stats_json': self._jdump(content.get('playerStats')),
+                'shotmap_json': self._jdump(content.get('shotmap')),
+                'h2h_json': self._jdump(content.get('h2h')),
+                'momentum_json': self._jdump(content.get('momentum')),
+            })
+            if (i + 1) % 50 == 0:
+                logger.info(f"  match details progress: {i + 1}/{len(finished)}")
+
+        if not rows:
+            logger.warning(f"No match details parsed for {league} {season}")
+            return None
+
+        df = pd.DataFrame(rows)
+        df['league'] = league
+        df['season'] = season
+        df = self._add_metadata(df, 'match_details')
+        logger.info(f"Parsed {len(df)} match details")
+        return df
+
+    # ------------------------------------------------------------------ #
+    # Player details — /_next/data/<buildId>/players/<id>.json
+    # ------------------------------------------------------------------ #
+
+    def _player_ids_for_league(self, league: str, season: int) -> List[int]:
+        """Collect unique player ids from every team squad in the league."""
+        player_ids: List[int] = []
+        seen = set()
+        for tid in self._team_ids_for_league(league, season):
+            data = self._get_team_data(tid)
+            if not data:
+                continue
+            sections = (data.get('squad') or {}).get('squad') or []
+            for section in sections:
+                for m in section.get('members') or []:
+                    pid = m.get('id')
+                    if pid is not None and pid not in seen:
+                        seen.add(pid)
+                        player_ids.append(pid)
+        return player_ids
+
+    def read_player_details(
+        self,
+        league: str = None,
+        season: int = None
+    ) -> Optional[pd.DataFrame]:
+        """Read per-player detail (one wide row per squad player)."""
+        league = league or (self.leagues[0] if self.leagues else None)
+        season = season or (self.seasons[0] if self.seasons else None)
+        if not league or not season:
+            logger.error("League and season must be specified")
+            return None
+
+        logger.info(f"Fetching FotMob player details: {league} {season}")
+        player_ids = self._player_ids_for_league(league, season)
+        if not player_ids:
+            logger.warning(f"No player ids for {league} {season}")
+            return None
+
+        rows = []
+        for i, pid in enumerate(player_ids):
+            payload = self._fetch_next_data_payload(f'/players/{pid}')
+            d = ((payload or {}).get('pageProps') or {}).get('data') if payload else None
+            if not d:
+                logger.warning(f"No player details for player_id={pid}")
+                continue
+            primary_team = d.get('primaryTeam') or {}
+            main_league = d.get('mainLeague') or {}
+            rows.append({
+                'player_id': d.get('id') or pid,
+                'name': d.get('name'),
+                'birth_date': d.get('birthDate'),
+                'is_coach': d.get('isCoach'),
+                'is_captain': d.get('isCaptain'),
+                'gender': d.get('gender'),
+                'primary_team_id': primary_team.get('teamId'),
+                'primary_team_name': primary_team.get('teamName'),
+                'position_description': d.get('positionDescription'),
+                'main_league_id': main_league.get('leagueId'),
+                'main_league_name': main_league.get('leagueName'),
+                'contract_end': d.get('contractEnd'),
+                'player_information_json': self._jdump(d.get('playerInformation')),
+                'injury_information_json': self._jdump(d.get('injuryInformation')),
+                'trophies_json': self._jdump(d.get('trophies')),
+                'career_history_json': self._jdump(d.get('careerHistory')),
+                'stat_seasons_json': self._jdump(d.get('statSeasons')),
+                'first_season_stats_json': self._jdump(d.get('firstSeasonStats')),
+                'recent_matches_json': self._jdump(d.get('recentMatches')),
+                'market_values_json': self._jdump(d.get('marketValues')),
+                'traits_json': self._jdump(d.get('traits')),
+                'meta_json': self._jdump(d.get('meta')),
+                'coach_stats_json': self._jdump(d.get('coachStats')),
+                'next_match_json': self._jdump(d.get('nextMatch')),
+            })
+            if (i + 1) % 100 == 0:
+                logger.info(f"  player details progress: {i + 1}/{len(player_ids)}")
+
+        if not rows:
+            logger.warning(f"No player details parsed for {league} {season}")
+            return None
+
+        df = pd.DataFrame(rows)
+        df['league'] = league
+        df['season'] = season
+        df = self._add_metadata(df, 'player_details')
+        logger.info(f"Parsed {len(df)} player details")
+        return df
+
+    # ------------------------------------------------------------------ #
+    # Orchestration
+    # ------------------------------------------------------------------ #
+
     def scrape_all(self) -> Dict[str, str]:
         """
         Scrape all FotMob data for configured leagues and seasons.
-
-        Collects:
-        - Match schedules
-        - Team statistics
-        - Player statistics
 
         Returns:
             Dictionary mapping data type to Iceberg table path
@@ -518,67 +966,38 @@ class FotMobScraper(SeleniumScraper):
             f"Starting FotMob scrape: leagues={self.leagues}, seasons={self.seasons}"
         )
 
-        results = {}
-        all_schedules = []
-        all_team_stats = []
-        all_player_stats = []
+        # (read callable, table_name) for every entity
+        entities = [
+            (lambda lg, se: self.read_schedule(lg, se), 'fotmob_schedule'),
+            (lambda lg, se: self.read_team_season_stats(lg, se), 'fotmob_team_stats'),
+            (lambda lg, se: self.read_player_season_stats('goals', lg, se), 'fotmob_player_stats'),
+            (lambda lg, se: self.read_team_profile(lg, se), 'fotmob_team_profile'),
+            (lambda lg, se: self.read_team_squad(lg, se), 'fotmob_team_squad'),
+            (lambda lg, se: self.read_team_leaderboards(lg, se), 'fotmob_team_leaderboards'),
+            (lambda lg, se: self.read_transfers(lg, se), 'fotmob_transfers'),
+            (lambda lg, se: self.read_match_details(lg, se), 'fotmob_match_details'),
+            (lambda lg, se: self.read_player_details(lg, se), 'fotmob_player_details'),
+        ]
 
-        for league in self.leagues:
-            for season in self.seasons:
-                try:
-                    # Scrape schedule
-                    schedule_df = self.read_schedule(league, season)
-                    if schedule_df is not None and not schedule_df.empty:
-                        all_schedules.append(schedule_df)
-
-                    # Rate limit pause between requests
-                    time.sleep(2)
-
-                    # Scrape team stats
-                    team_df = self.read_team_season_stats(league, season)
-                    if team_df is not None and not team_df.empty:
-                        all_team_stats.append(team_df)
-
-                    time.sleep(2)
-
-                    # Scrape player stats
-                    player_df = self.read_player_season_stats('goals', league, season)
-                    if player_df is not None and not player_df.empty:
-                        all_player_stats.append(player_df)
-
-                    time.sleep(2)
-
-                except Exception as e:
-                    logger.error(f"Error scraping {league} {season}: {e}")
-                    continue
-
-        # Save to Iceberg tables
-        if all_schedules:
-            combined_df = pd.concat(all_schedules, ignore_index=True)
-            table_path = self.save_to_iceberg(
-                df=combined_df,
-                table_name='fotmob_schedule',
-                partition_cols=['league', 'season'],
-            )
-            results['schedule'] = table_path
-
-        if all_team_stats:
-            combined_df = pd.concat(all_team_stats, ignore_index=True)
-            table_path = self.save_to_iceberg(
-                df=combined_df,
-                table_name='fotmob_team_stats',
-                partition_cols=['league', 'season'],
-            )
-            results['team_stats'] = table_path
-
-        if all_player_stats:
-            combined_df = pd.concat(all_player_stats, ignore_index=True)
-            table_path = self.save_to_iceberg(
-                df=combined_df,
-                table_name='fotmob_player_stats',
-                partition_cols=['league', 'season'],
-            )
-            results['player_stats'] = table_path
+        results: Dict[str, str] = {}
+        for read_fn, table_name in entities:
+            frames = []
+            for league in self.leagues:
+                for season in self.seasons:
+                    try:
+                        df = read_fn(league, season)
+                        if df is not None and not df.empty:
+                            frames.append(df)
+                    except Exception as e:
+                        logger.error(f"Error scraping {table_name} {league} {season}: {e}")
+            if frames:
+                combined = pd.concat(frames, ignore_index=True)
+                results[table_name] = self.save_to_iceberg(
+                    df=combined,
+                    table_name=table_name,
+                    partition_cols=['league', 'season'],
+                    replace_partitions=['league', 'season'],
+                )
 
         logger.info(f"FotMob scrape complete: {list(results.keys())}")
         return results
@@ -588,5 +1007,4 @@ class FotMobScraper(SeleniumScraper):
         if self._session:
             self._session.close()
             self._session = None
-
         super().close()
