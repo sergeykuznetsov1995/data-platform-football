@@ -184,6 +184,26 @@ SILVER_E3_TRANSFORMS = [
         'understat_player_match_aggregate',
     ),
     (
+        # T6.2 (#91): per-(match_id, team_id_canonical) Understat team
+        # match-facts (xG/NPxG/PPDA/deep/points/xPts). UNION ALL home+away из
+        # bronze.understat_team_match_stats + JOIN silver.xref_team
+        # (source='understat'). Feeds Understat block of gold.fct_team_match.
+        # MUST run after dag_transform_xref. MUST run BEFORE
+        # understat_team_season (which rolls up from this table).
+        'understat_team_match',
+        'dags/sql/silver/understat_team_match.sql',
+        'understat_team_match',
+    ),
+    (
+        # T6.2 (#91): per-(team_id_canonical, league, season) Understat team
+        # season-aggregate. SUM/COUNT/weighted-AVG rollup из
+        # silver.understat_team_match — wins/draws/losses/xpts become
+        # first-class. Feeds Understat block of gold.fct_team_season_stats (#94).
+        'understat_team_season',
+        'dags/sql/silver/understat_team_season.sql',
+        'understat_team_season',
+    ),
+    (
         # T6: SofaScore per-(canonical_id, league, season) aggregate.
         # Reads bronze.sofascore_player_season_stats + silver.xref_player
         # (source='sofascore') — MUST run after dag_transform_xref has
