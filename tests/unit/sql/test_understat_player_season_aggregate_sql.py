@@ -114,7 +114,7 @@ def test_grain_emits_canonical_id_and_partition_keys():
     columns for Iceberg partitioning convention."""
     body = _strip_comments(_read_sql())
     assert "canonical_id" in body
-    assert re.search(r"\bleague,\s*\n\s*b?\.?season\s*\n", body), (
+    assert re.search(r"\bleague,\s*\n\s*b?\.?season,?\s*\n", body), (
         "partition columns league/season must be emitted as last columns"
     )
 
