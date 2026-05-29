@@ -189,6 +189,11 @@ class FotMobScraper(BaseScraper):
     def _fetch_next_data_payload(self, path: str) -> Optional[Dict[str, Any]]:
         """Fetch a ``/_next/data/<buildId><path>.json`` payload.
 
+        ``buildId`` rotates on every FotMob deploy, which can happen mid-run
+        (a full ingest takes ~45 min). A stale ``buildId`` makes every
+        subsequent ``_next/data`` URL 404, so on a failed fetch we refresh the
+        cached ``buildId`` once and retry — keeping long runs resilient.
+
         Args:
             path: Path beginning with ``/`` relative to the build root, e.g.
                 ``/players/24011`` or ``/matches/<slug>/<short_id>``.
@@ -196,8 +201,20 @@ class FotMobScraper(BaseScraper):
         build_id = self._get_build_id()
         if not build_id:
             return None
-        url = f"{self.BASE_URL}/_next/data/{build_id}{path}.json"
-        return self._fetch_api_json(url)
+        payload = self._fetch_api_json(
+            f"{self.BASE_URL}/_next/data/{build_id}{path}.json"
+        )
+        if payload is not None:
+            return payload
+
+        # Possible buildId rotation — refresh once and retry.
+        self._build_id = None
+        build_id = self._get_build_id()
+        if not build_id:
+            return None
+        return self._fetch_api_json(
+            f"{self.BASE_URL}/_next/data/{build_id}{path}.json"
+        )
 
     def _get_team_data(self, team_id: Any) -> Optional[Dict[str, Any]]:
         """Get a team payload (`/api/data/teams?id=`), cached per run."""
