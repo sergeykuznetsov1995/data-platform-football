@@ -115,9 +115,8 @@ xref_fm AS (
 ),
 
 -- WhoScored numeric team_id ↔ team name mapping derived from bronze schedule.
--- KNOWN GAP: schedule заполнен только для season '2021' (см. header) → для
--- остальных сезонов JOIN не даст match и WS-колонки будут NULL. Followup-issue
--- покрывает schedule backfill / Silver-side canonical resolve.
+-- schedule забэкфилен на все сезоны (incl. 2526=380, #128) → JOIN даёт match и
+-- WS-колонки заполнены для текущего сезона (обоснование #161 penalties fallback).
 ws_name_to_id AS (
     SELECT DISTINCT
         CAST(home_team_id AS varchar) AS ws_team_id,
@@ -161,8 +160,9 @@ SELECT
     CAST(COALESCE(fb.crosses,                                             ss.total_crosses)  AS BIGINT) AS crosses,
     CAST(COALESCE(fb.interceptions,                   ws.interceptions,   ss.interceptions)  AS BIGINT) AS interceptions,
     CAST(COALESCE(fb.tackles_won,                     ws.tackle_won,      ss.tackles_won)    AS BIGINT) AS tackles_won,
-    CAST(fb.penalties_won                                                                     AS BIGINT) AS penalties_won,
-    CAST(fb.penalties_conceded                                                                AS BIGINT) AS penalties_conceded,
+    -- #161: FBref убрал PKwon/PKcon с сезона 2025/26 → WhoScored fallback.
+    CAST(COALESCE(fb.penalties_won,                   ws.penalties_won)      AS BIGINT) AS penalties_won,
+    CAST(COALESCE(fb.penalties_conceded,              ws.penalties_conceded) AS BIGINT) AS penalties_conceded,
     CAST(fb.own_goals                                                                         AS BIGINT) AS own_goals,
 
     -- ========= MODELED — xG/xA (Understat primary per RX2; FotMob then SS fallback) =========
