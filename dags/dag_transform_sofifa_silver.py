@@ -50,10 +50,37 @@ SILVER_MIN_ROWS = {
     'sofifa_player_profile': 100,
 }
 
+# issue #180: bronze.sofifa_player_ratings frozen (Cloudflare Turnstile). When
+# absent, build an empty-but-typed sofifa_player_profile so Silver and Gold
+# (dim_player_attributes LEFT JOIN) stay intact; auto-resumes when Bronze
+# returns. Mirrors the Gold fallback pattern (gold_tasks.run_gold_transform).
+SOFIFA_REQUIRE_BRONZE = 'sofifa_player_ratings'
+SOFIFA_FALLBACK_SQL = 'dags/sql/silver/sofifa_player_profile_empty.sql'
+
 
 def _run_transform(sql_file: str, table_name: str, **context) -> Dict[str, Any]:
-    """PythonOperator callable — run a single Silver CTAS transform."""
-    from utils.silver_tasks import run_silver_transform
+    """PythonOperator callable — run a single Silver CTAS transform.
+
+    issue #180: if bronze.sofifa_player_ratings is missing, build the empty
+    typed fallback instead of failing the DROP + CTAS. Returns fallback=True so
+    _validate_silver relaxes the row-count floor for this run.
+    """
+    from utils.silver_tasks import check_bronze_table_exists, run_silver_transform
+
+    if not check_bronze_table_exists(table_name=SOFIFA_REQUIRE_BRONZE, schema='bronze'):
+        logger.warning(
+            "bronze.%s not found — building empty fallback '%s' for silver.%s "
+            "(issue #180). Will auto-resume real build when Bronze returns.",
+            SOFIFA_REQUIRE_BRONZE, SOFIFA_FALLBACK_SQL, table_name,
+        )
+        result = run_silver_transform(
+            sql_file=SOFIFA_FALLBACK_SQL,
+            table_name=table_name,
+            schema='silver',
+        )
+        result['fallback'] = True
+        result['fallback_reason'] = f"missing bronze table: {SOFIFA_REQUIRE_BRONZE}"
+        return result
 
     return run_silver_transform(
         sql_file=sql_file,
@@ -63,11 +90,29 @@ def _run_transform(sql_file: str, table_name: str, **context) -> Dict[str, Any]:
 
 
 def _validate_silver(**context) -> Dict[str, Any]:
-    """PythonOperator callable — validate row counts in Silver tables."""
+    """PythonOperator callable — validate row counts in Silver tables.
+
+    issue #180: when player_profile fell back to the empty SQL (Bronze frozen),
+    relax the row-count floor so a legitimately-empty table is not flagged.
+    """
     from airflow.exceptions import AirflowException
     from utils.silver_tasks import validate_silver_tables
 
-    validation = validate_silver_tables(tables=SILVER_MIN_ROWS, min_rows=1)
+    ti = context['ti']
+    transform_result = ti.xcom_pull(task_ids='player_profile') or {}
+    fellback = bool(transform_result.get('fallback'))
+
+    tables = dict(SILVER_MIN_ROWS)
+    min_rows = 1
+    if fellback:
+        tables['sofifa_player_profile'] = 0   # 0 => use min_rows as floor
+        min_rows = 0                            # 0-row empty table is OK
+        logger.warning(
+            "sofifa_player_profile built via empty fallback — row-count floor "
+            "relaxed to 0 (issue #180)."
+        )
+
+    validation = validate_silver_tables(tables=tables, min_rows=min_rows)
     logger.info(f"Silver validation: {validation['status']} — {validation['details']}")
 
     if validation['warnings']:
