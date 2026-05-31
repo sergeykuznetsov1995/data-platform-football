@@ -106,9 +106,19 @@ STAGE_2_DIMS = [
      'dim_player_attributes',     None),
     ('fct_player_season_stats',   'dags/sql/gold/fct_player_season_stats.sql',
      'fct_player_season_stats',   ['league', 'season']),
+    # #175 — keeper-variant per-season facts. Restored lost wiring (SQL + DQ
+    # checks shipped in T5 but never registered in a STAGE list). Reads
+    # silver.fotmob_keeper_profile (per-90 cols pass through as-is), so the
+    # #174 FotMob count-drift does not apply here. Main facts precede both
+    # audits (audit ref_integrity → main).
+    ('fct_keeper_season_stats',   'dags/sql/gold/fct_keeper_season_stats.sql',
+     'fct_keeper_season_stats',   ['league', 'season']),
     ('fct_player_season_stats_audit',
      'dags/sql/gold/fct_player_season_stats_audit.sql',
      'fct_player_season_stats_audit', ['league', 'season']),
+    ('fct_keeper_season_stats_audit',
+     'dags/sql/gold/fct_keeper_season_stats_audit.sql',
+     'fct_keeper_season_stats_audit', ['league', 'season']),
     # T6.4 (#94) — cross-source team season facts + audit.
     # 4-source (FBref spine + Understat + WhoScored + SofaScore) merged via
     # silver.xref_team. Audit is WARNING-only and isolates HARD_FACT diffs
