@@ -124,14 +124,16 @@
 -- =============================================================================
 -- Pass routing (the dominant 62.89% bucket — drives overall coverage)
 -- =============================================================================
---   `qualifiers` is a JSON-string array; checked via regexp_like patterns:
---     `"type":"ThrowIn"`        -> throw_in
---     `"type":"GoalKick"`       -> goalkick
---     `"type":"CornerTaken"` + `"type":"Cross"`         -> corner_crossed
---     `"type":"CornerTaken"` (without Cross)            -> corner_short
---     `"type":"FreekickTaken"` + `"type":"Cross"`       -> freekick_crossed
---     `"type":"FreekickTaken"` (without Cross)          -> freekick_short
---     `"type":"Cross"` (none of the above)              -> cross
+--   `qualifiers` is a JSON-string array of NESTED objects
+--   ({"type": {"value": N, "displayName": "X"}}); checked via regexp_like on
+--   the `displayName` field (NOT the flat `type` — that holds a nested object):
+--     `"displayName":"ThrowIn"`        -> throw_in
+--     `"displayName":"GoalKick"`       -> goalkick
+--     `"displayName":"CornerTaken"` + `"displayName":"Cross"`   -> corner_crossed
+--     `"displayName":"CornerTaken"` (without Cross)             -> corner_short
+--     `"displayName":"FreekickTaken"` + `"displayName":"Cross"` -> freekick_crossed
+--     `"displayName":"FreekickTaken"` (without Cross)           -> freekick_short
+--     `"displayName":"Cross"` (none of the above)              -> cross
 --     no qualifier OR qualifiers=NULL                   -> pass (medium-conf
 --                                                         fallback; 7.05%
 --                                                         no-qualifier rows
@@ -144,9 +146,9 @@
 -- =============================================================================
 --
 -- Shot-subtype routing (SavedShot / MissedShots / ShotOnPost / ChanceMissed):
---     `"type":"Penalty"`        -> shot_penalty
---     `"type":"FreekickTaken"`  -> shot_freekick
---     default                   -> shot
+--     `"displayName":"Penalty"`        -> shot_penalty
+--     `"displayName":"DirectFreekick"` -> shot_freekick
+--     default                          -> shot
 --
 -- =============================================================================
 -- Edge cases / known fidelity losses (deferred to Gold or follow-ups)
@@ -261,21 +263,21 @@ SELECT
             CASE
                 WHEN qualifiers IS NULL OR qualifiers = '' OR qualifiers = '[]'
                     THEN 'pass'
-                WHEN regexp_like(qualifiers, '"type":\s*"ThrowIn"')
+                WHEN regexp_like(qualifiers, '"displayName"\s*:\s*"ThrowIn"')
                     THEN 'throw_in'
-                WHEN regexp_like(qualifiers, '"type":\s*"GoalKick"')
+                WHEN regexp_like(qualifiers, '"displayName"\s*:\s*"GoalKick"')
                     THEN 'goalkick'
-                WHEN regexp_like(qualifiers, '"type":\s*"CornerTaken"')
-                     AND regexp_like(qualifiers, '"type":\s*"Cross"')
+                WHEN regexp_like(qualifiers, '"displayName"\s*:\s*"CornerTaken"')
+                     AND regexp_like(qualifiers, '"displayName"\s*:\s*"Cross"')
                     THEN 'corner_crossed'
-                WHEN regexp_like(qualifiers, '"type":\s*"CornerTaken"')
+                WHEN regexp_like(qualifiers, '"displayName"\s*:\s*"CornerTaken"')
                     THEN 'corner_short'
-                WHEN regexp_like(qualifiers, '"type":\s*"FreekickTaken"')
-                     AND regexp_like(qualifiers, '"type":\s*"Cross"')
+                WHEN regexp_like(qualifiers, '"displayName"\s*:\s*"FreekickTaken"')
+                     AND regexp_like(qualifiers, '"displayName"\s*:\s*"Cross"')
                     THEN 'freekick_crossed'
-                WHEN regexp_like(qualifiers, '"type":\s*"FreekickTaken"')
+                WHEN regexp_like(qualifiers, '"displayName"\s*:\s*"FreekickTaken"')
                     THEN 'freekick_short'
-                WHEN regexp_like(qualifiers, '"type":\s*"Cross"')
+                WHEN regexp_like(qualifiers, '"displayName"\s*:\s*"Cross"')
                     THEN 'cross'
                 ELSE 'pass'
             END
@@ -308,9 +310,12 @@ SELECT
         -- ---------- Shot variants (qualifier-driven sub-routing) ----------
         WHEN type IN ('SavedShot', 'MissedShots', 'ShotOnPost', 'ChanceMissed') THEN
             CASE
-                WHEN regexp_like(COALESCE(qualifiers, ''), '"type":\s*"Penalty"')
+                WHEN regexp_like(COALESCE(qualifiers, ''), '"displayName"\s*:\s*"Penalty"')
                     THEN 'shot_penalty'
-                WHEN regexp_like(COALESCE(qualifiers, ''), '"type":\s*"FreekickTaken"')
+                -- Shot taken directly from a free kick carries the
+                -- `DirectFreekick` qualifier (NOT `FreekickTaken`, which only
+                -- tags the *pass* set-piece — it never appears on a shot event).
+                WHEN regexp_like(COALESCE(qualifiers, ''), '"displayName"\s*:\s*"DirectFreekick"')
                     THEN 'shot_freekick'
                 ELSE 'shot'
             END
