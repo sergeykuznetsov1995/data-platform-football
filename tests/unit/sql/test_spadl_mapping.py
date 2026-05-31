@@ -22,7 +22,7 @@ Coverage
 * Direct SPADL matches (Foul / TakeOn / Tackle / Interception / Clearance / ...).
 * Aerial paired-flag (``_action_source_note='aerial_paired:Aerial'``).
 * Shot subtype routing (SavedShot / MissedShots / ShotOnPost / ChanceMissed +
-  Penalty / FreekickTaken qualifiers).
+  Penalty / DirectFreekick qualifiers).
 * Goalkeeper actions (Save / KeeperSweeper / Smother / Punch / Claim / ...).
 * Meta / marker events → 'unknown' + confidence='unmappable'.
 * Confidence label cascade (high / medium / low / unmappable).
@@ -146,8 +146,15 @@ def _row(
 
 
 def _qualifiers_json(types: List[str]) -> str:
-    """Render WhoScored qualifiers as a JSON-string array (matches bronze)."""
-    return json.dumps([{"type": t, "value": ""} for t in types])
+    """Render WhoScored qualifiers as a JSON-string array (matches bronze).
+
+    Bronze stores each qualifier as a NESTED object — the sub-type label lives
+    in ``type.displayName``, NOT a flat ``type`` string:
+        {"type": {"value": N, "displayName": "ThrowIn"}}
+    The mapping SQL matches on ``"displayName": "X"`` accordingly. ``value`` is a
+    placeholder here (the regex keys off ``displayName``).
+    """
+    return json.dumps([{"type": {"value": 0, "displayName": t}} for t in types])
 
 
 @pytest.fixture(scope="session")
@@ -373,9 +380,13 @@ class TestShotSubtypes:
 
     @pytest.mark.parametrize("ws_type", ["SavedShot", "MissedShots", "ShotOnPost"])
     def test_shot_freekick(self, duck_conn, ws_type):
-        """FreekickTaken qualifier on shot → shot_freekick."""
+        """DirectFreekick qualifier on shot → shot_freekick.
+
+        Free-kick *shots* carry `DirectFreekick`; `FreekickTaken` only tags the
+        pass set-piece and never appears on a shot event.
+        """
         out = _seed_and_run(duck_conn, [
-            _row(type_=ws_type, qualifiers=_qualifiers_json(["FreekickTaken"])),
+            _row(type_=ws_type, qualifiers=_qualifiers_json(["DirectFreekick"])),
         ])
         assert out[0]["action_canonical"] == "shot_freekick"
 
@@ -697,7 +708,7 @@ class TestEnumCompleteness:
             _row(game_id=1000, minute=8, type_="SavedShot",
                  qualifiers=_qualifiers_json(["Penalty"])),
             _row(game_id=1000, minute=9, type_="SavedShot",
-                 qualifiers=_qualifiers_json(["FreekickTaken"])),
+                 qualifiers=_qualifiers_json(["DirectFreekick"])),
         ]
         out = _seed_and_run(duck_conn, rows)
         observed = {r["action_canonical"] for r in out}
