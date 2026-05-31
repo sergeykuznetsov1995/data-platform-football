@@ -114,6 +114,18 @@ xref_team_dedup AS (
     GROUP BY source, source_id, league
 ),
 
+-- 0b) De-dup xref_player across seasons --------------------------------------
+--    Same footgun as xref_team: xref_player PK = (source, source_id, season).
+--    Joining on source+source_id alone fans out ~2-4× per player-season
+--    (issue #168: 2.87× → 109k dup PK). canonical_id is resolver-stable per
+--    player across seasons (1/1092 understat ids drift — ARBITRARY tolerated,
+--    same as xref_team_dedup), so collapse to one row per (source, source_id).
+xref_player_dedup AS (
+    SELECT source, source_id, ARBITRARY(canonical_id) AS canonical_id
+    FROM iceberg.silver.xref_player
+    GROUP BY source, source_id
+),
+
 -- 1) Bridge: understat game_id → fbref match_id ------------------------------
 --    Resolve via (date, home_canonical_id, away_canonical_id).
 us_sched AS (
@@ -301,10 +313,10 @@ LEFT JOIN xref_team_dedup xt
 
 -- Orphan-tolerant player lookup (xref_player emits us_* canonical for orphans).
 -- xref_player rejection rate ≤6.94% per E1 verdict — orphan rows allowed.
-LEFT JOIN iceberg.silver.xref_player xp
+LEFT JOIN xref_player_dedup xp
        ON xp.source    = 'understat'
       AND xp.source_id = sn.understat_player_source_id
 
-LEFT JOIN iceberg.silver.xref_player xa
+LEFT JOIN xref_player_dedup xa
        ON xa.source    = 'understat'
       AND xa.source_id = sn.understat_assist_player_source_id
