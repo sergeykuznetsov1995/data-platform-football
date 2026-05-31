@@ -1,7 +1,7 @@
 -- =============================================================================
 -- Silver: xref_team   (Jinja-template — `.sql.j2`)
 -- =============================================================================
--- Maps source-specific team-name → canonical team_id across 8 sources.
+-- Maps source-specific team-name → canonical team_id across 10 sources.
 --
 -- This template renders ONE `{{ team_aliases_values_sql }}` placeholder which
 -- is filled by `medallion_config.get_team_alias_sql_values(with_canonical_id=True)`.
@@ -25,7 +25,8 @@
 -- =============================================================================
 --   canonical_id   varchar  -- 'wolverhampton_wanderers' | 'fb_<slug>' | 'mh_<slug>' | ...
 --   source         varchar  -- 'fbref' | 'understat' | 'whoscored' | 'sofascore' |
---                              'fotmob' | 'matchhistory' | 'clubelo' | 'espn'
+--                              'fotmob' | 'matchhistory' | 'clubelo' | 'espn' |
+--                              'transfermarkt' | 'capology'
 --   source_id      varchar  -- raw team-name as it appears in Bronze
 --   display_name   varchar  -- canonical_name when aliased, else source_id
 --   league         varchar  -- partitioning hint (e.g. 'ENG-Premier League')
@@ -35,9 +36,9 @@
 --
 -- Testable invariants (T5):
 --   * PK = (source, source_id, league, season) — guaranteed by final GROUP BY.
---   * All 8 sources are represented in the UNION ALL below; T5 should
+--   * All 10 sources are represented in the UNION ALL below; T5 should
 --     SELECT DISTINCT source FROM iceberg.silver.xref_team and assert
---     that the set equals the 8 prefixes documented above.
+--     that the set equals the 10 prefixes documented above.
 --   * canonical_id is NEVER NULL (CASE branch covers every source).
 --   * confidence ∈ {'name_alias', 'orphan'}.
 --
@@ -141,6 +142,16 @@ raw_teams AS (
     UNION
     SELECT 'espn' AS source, away_team AS source_id, league, CAST(season AS varchar) AS season
       FROM iceberg.bronze.espn_schedule WHERE away_team IS NOT NULL
+
+    UNION
+    -- ===== transfermarkt (team universe = player roster's current club; issue #192) =====
+    SELECT 'transfermarkt' AS source, current_club_name AS source_id, league, CAST(season AS varchar) AS season
+      FROM iceberg.bronze.transfermarkt_players WHERE current_club_name IS NOT NULL
+
+    UNION
+    -- ===== capology (team universe = salary roster's club; issue #192) =====
+    SELECT 'capology' AS source, club_name AS source_id, league, CAST(season AS varchar) AS season
+      FROM iceberg.bronze.capology_player_salaries WHERE club_name IS NOT NULL
 ),
 
 resolved AS (
@@ -186,6 +197,8 @@ SELECT
                 WHEN 'matchhistory' THEN 'mh_'
                 WHEN 'clubelo'      THEN 'ce_'
                 WHEN 'espn'         THEN 'es_'
+                WHEN 'transfermarkt' THEN 'tm_'
+                WHEN 'capology'     THEN 'cap_'
             END
             || LOWER(REGEXP_REPLACE(source_id, '[^a-zA-Z0-9]+', '_'))
     END                                       AS canonical_id,

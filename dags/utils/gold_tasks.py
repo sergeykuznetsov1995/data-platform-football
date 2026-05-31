@@ -1579,6 +1579,12 @@ def validate_gold_quality() -> Dict[str, Any]:
                           min_val=0, max_val=100, severity='ERROR'),
         CHECK.value_range('gold.fct_team_season_stats', 'set_piece_share_pct',
                           min_val=0, max_val=100, severity='ERROR'),
+        # issue #192: team-finance — неотрицательные суммы. NULL вне APL 2025/26
+        # покрытия (value_range игнорирует NULL). Верхняя граница — sanity-потолок.
+        CHECK.value_range('gold.fct_team_season_stats', 'squad_market_value_eur',
+                          min_val=0, max_val=5_000_000_000, severity='ERROR'),
+        CHECK.value_range('gold.fct_team_season_stats', 'total_wage_bill_gbp',
+                          min_val=0, max_val=2_000_000_000, severity='ERROR'),
 
         # ============================================================
         # T6.4 (#94) audit: fct_team_season_stats_audit — cross-source DQ

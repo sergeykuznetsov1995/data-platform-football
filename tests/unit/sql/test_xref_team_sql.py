@@ -68,11 +68,12 @@ class TestXrefTeamTemplateStructure:
         )
 
     def test_all_8_sources_unioned(self):
-        """All 8 documented sources appear as quoted source labels."""
+        """All 10 documented sources appear as quoted source labels."""
         sql = _read_template().lower()
         expected_sources = {
             "fbref", "understat", "whoscored", "sofascore",
             "fotmob", "matchhistory", "clubelo", "espn",
+            "transfermarkt", "capology",
         }
         for src in expected_sources:
             assert f"'{src}'" in sql, (
@@ -131,9 +132,10 @@ class TestXrefTeamTemplateStructure:
         ), "aliases CTE must bind t(raw_name, canonical_name, canonical_id)"
 
     def test_orphan_id_prefix_per_source(self):
-        """Each source has a 2-letter orphan prefix (fb_/us_/ws_/...)."""
+        """Each source has a short orphan prefix (fb_/us_/ws_/.../tm_/cap_)."""
         sql = _read_template()
-        for prefix in ["fb_", "us_", "ws_", "ss_", "fm_", "mh_", "ce_", "es_"]:
+        for prefix in ["fb_", "us_", "ws_", "ss_", "fm_", "mh_", "ce_", "es_",
+                       "tm_", "cap_"]:
             assert f"'{prefix}'" in sql, (
                 f"orphan prefix {prefix!r} missing — orphans must be uniquely "
                 "namespaced per-source so canonical_id collisions are impossible"
@@ -243,6 +245,8 @@ class TestXrefTeamRendered:
             "iceberg.bronze.fbref_schedule",
             "iceberg.bronze.matchhistory_games",
             "iceberg.bronze.clubelo_ratings",
+            "iceberg.bronze.transfermarkt_players",
+            "iceberg.bronze.capology_player_salaries",
         ]:
             assert tbl in rendered_lower, (
                 f"rendered xref_team.sql is missing Bronze table {tbl!r}"

@@ -133,6 +133,57 @@ ws_name_to_id AS (
         season
     FROM iceberg.bronze.whoscored_schedule
     WHERE away_team_id IS NOT NULL
+),
+
+-- ===== Team-finance sources (issue #192) =====
+-- TM/Capology team universe не имеет schedule → bridge через xref_team
+-- (source='transfermarkt'/'capology', добавлены в xref_team.sql.j2). Покрытие —
+-- только APL season slug '2526'; для прочих сезонов колонки останутся NULL.
+xref_tm AS (
+    SELECT DISTINCT
+        canonical_id,
+        source_id                                         AS tm_club_name,
+        league,
+        season                                            AS season_slug
+    FROM iceberg.silver.xref_team
+    WHERE source = 'transfermarkt'
+      AND confidence <> 'orphan'
+),
+
+xref_cap AS (
+    SELECT DISTINCT
+        canonical_id,
+        source_id                                         AS cap_club_name,
+        league,
+        season                                            AS season_slug
+    FROM iceberg.silver.xref_team
+    WHERE source = 'capology'
+      AND confidence <> 'orphan'
+),
+
+-- Squad market value: SUM рыночной стоимости состава (EUR, снимок «сейчас»).
+tm_finance AS (
+    SELECT
+        current_club_name                                 AS tm_club_name,
+        league,
+        season                                            AS season_slug,
+        SUM(current_market_value_eur)                     AS squad_market_value_eur
+    FROM iceberg.silver.transfermarkt_players
+    WHERE current_market_value_eur IS NOT NULL
+    GROUP BY current_club_name, league, season
+),
+
+-- Wage bill: SUM годового gross-фонда (GBP). Silver уже отфильтрован
+-- (active OR loan) + currency='GBP'; annual_gross_gbp = weekly_gross_gbp * 52.
+cap_finance AS (
+    SELECT
+        club_name                                         AS cap_club_name,
+        league,
+        season                                            AS season_slug,
+        CAST(SUM(annual_gross_gbp) AS BIGINT)             AS total_wage_bill_gbp
+    FROM iceberg.silver.capology_player_salaries
+    WHERE annual_gross_gbp IS NOT NULL
+    GROUP BY club_name, league, season
 )
 
 SELECT
@@ -258,6 +309,10 @@ SELECT
     fm.shots_inside_box,
     fm.shots_outside_box,
 
+    -- ========= TEAM FINANCE (issue #192) — APL 2025/26 only, else NULL =========
+    tmf.squad_market_value_eur,
+    capf.total_wage_bill_gbp,
+
     -- ========= Lineage =========
     CURRENT_TIMESTAMP                                     AS _gold_created_at
 
@@ -301,3 +356,22 @@ LEFT JOIN iceberg.silver.fotmob_team_season fm
     ON  fm.team_id = xfm.fm_team_name
     AND fm.league  = xf.league
     AND fm.season  = xf.season_slug
+-- Transfermarkt squad value (#192): bridge canonical→club name via xref_tm,
+-- aggregate via tm_finance. season_slug ('2526') matches xf.season_slug.
+LEFT JOIN xref_tm xtm
+    ON  xtm.canonical_id = xf.canonical_id
+    AND xtm.league       = xf.league
+    AND xtm.season_slug  = xf.season_slug
+LEFT JOIN tm_finance tmf
+    ON  tmf.tm_club_name = xtm.tm_club_name
+    AND tmf.league       = xtm.league
+    AND tmf.season_slug  = xtm.season_slug
+-- Capology wage bill (#192): same bridge pattern via xref_cap + cap_finance.
+LEFT JOIN xref_cap xcap
+    ON  xcap.canonical_id = xf.canonical_id
+    AND xcap.league       = xf.league
+    AND xcap.season_slug  = xf.season_slug
+LEFT JOIN cap_finance capf
+    ON  capf.cap_club_name = xcap.cap_club_name
+    AND capf.league        = xcap.league
+    AND capf.season_slug   = xcap.season_slug

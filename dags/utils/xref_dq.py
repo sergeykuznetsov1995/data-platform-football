@@ -123,11 +123,13 @@ def build_xref_team_checks() -> List[Check]:
             severity='ERROR',
         ),
 
-        # Source enum (8 sources documented in xref_team.sql.j2)
+        # Source enum (10 sources documented in xref_team.sql.j2;
+        # transfermarkt + capology added in issue #192 for team-finance facts)
         check_enum_compliance(
             table, 'source',
             allowed=['fbref', 'understat', 'whoscored', 'sofascore',
-                     'fotmob', 'matchhistory', 'clubelo', 'espn'],
+                     'fotmob', 'matchhistory', 'clubelo', 'espn',
+                     'transfermarkt', 'capology'],
             severity='ERROR',
         ),
     ]
