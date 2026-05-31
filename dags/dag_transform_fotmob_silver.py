@@ -173,6 +173,15 @@ def _validate_silver_quality(**context) -> Dict[str, Any]:
             'silver.fotmob_player_season_profile',
             min_rows=450,
         ),
+        # issue #177: ловим регресс «все статы NULL» (stale Silver / битый
+        # Bronze join). value_range пропускает NULL, поэтому нужен явный floor
+        # по non-null minutes_played — самой населённой стате: если она NULL
+        # везде, мёртв весь FotMob-блок в gold.fct_player_season_stats.
+        CHECK.row_count(
+            'silver.fotmob_player_season_profile',
+            min_rows=400,
+            where='minutes_played IS NOT NULL',
+        ),
         # WARNING severity — мониторинг, не блокируют
         CHECK.freshness(
             'silver.fotmob_player_season_profile',
