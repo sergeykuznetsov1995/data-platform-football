@@ -102,6 +102,15 @@ def _validate_team_aliases_schema(doc: Dict) -> None:
                 f"team_aliases.yaml: teams[{i}] ({t.get('canonical_name')}) "
                 f"missing/invalid 'aliases'"
             )
+        # canonical_id is the explicit identity slug (issue #141): identity must
+        # NOT be derived from the display name. Enforce a stable, URL-safe slug.
+        cid = t.get('canonical_id')
+        if not isinstance(cid, str) or not re.fullmatch(r'[a-z0-9_]+', cid):
+            raise MedallionConfigError(
+                f"team_aliases.yaml: teams[{i}] ({t.get('canonical_name')}) "
+                f"missing/invalid 'canonical_id' (must match ^[a-z0-9_]+$, "
+                f"got {cid!r})"
+            )
 
 
 def _validate_player_aliases_schema(doc: Dict) -> None:
@@ -256,8 +265,9 @@ def _team_in_scope(team: Dict, competition: Optional[str]) -> bool:
 def _iter_team_aliases(
     source: Optional[str],
     competition: Optional[str],
-) -> List[Tuple[str, str]]:
-    """Yield (raw_name, canonical_name) tuples filtered by source/competition.
+) -> List[Tuple[str, str, str]]:
+    """Yield (raw_name, canonical_name, canonical_id) tuples filtered by
+    source/competition.
 
     Filter semantics:
       * source=None   -> UNION of `_generic` + every source-specific bucket.
@@ -272,11 +282,12 @@ def _iter_team_aliases(
     """
     doc = load_team_aliases()
     seen: set = set()
-    out: List[Tuple[str, str]] = []
+    out: List[Tuple[str, str, str]] = []
     for team in doc['teams']:
         if not _team_in_scope(team, competition):
             continue
         canonical = team['canonical_name']
+        canonical_id = team['canonical_id']
         aliases = team.get('aliases') or {}
 
         # Buckets to merge: _generic + (specific bucket OR every bucket).
@@ -288,7 +299,7 @@ def _iter_team_aliases(
 
         for bucket in buckets:
             for raw in aliases.get(bucket, []) or []:
-                key = (raw, canonical)
+                key = (raw, canonical, canonical_id)
                 if key in seen:
                     continue
                 seen.add(key)
@@ -306,8 +317,12 @@ def get_team_alias_pairs(
 
     Empty list is a valid result (no team matches the filter); callers
     should treat empty as "skip alias-rewrite step" rather than as error.
+
+    Note: ``_iter_team_aliases`` now yields 3-tuples carrying ``canonical_id``;
+    this public helper keeps its historical ``(raw, canonical)`` contract.
     """
-    return _iter_team_aliases(source, competition)
+    return [(raw, canonical) for raw, canonical, _cid
+            in _iter_team_aliases(source, competition)]
 
 
 def get_canonical_team_name(
@@ -321,7 +336,7 @@ def get_canonical_team_name(
     Fuzzy matching belongs in T3 (player resolver) where it can score across
     multiple fields (name + team + jersey).
     """
-    for raw, canonical in _iter_team_aliases(source, competition=None):
+    for raw, canonical, _cid in _iter_team_aliases(source, competition=None):
         if raw == raw_name:
             return canonical
     return None
@@ -364,6 +379,7 @@ def _escape_sql_string(s: str) -> str:
 def get_team_alias_sql_values(
     source: Optional[str] = None,
     competition: Optional[str] = None,
+    with_canonical_id: bool = False,
 ) -> str:
     """Render alias pairs as a Trino VALUES body for inline CTAS embedding.
 
@@ -375,12 +391,19 @@ def get_team_alias_sql_values(
         ...
         ('Ipswich', 'Ipswich Town')
 
+    When ``with_canonical_id=True`` each tuple gains the explicit identity slug
+    (issue #141) so the consumer can resolve identity without re-deriving it
+    from the display name:
+
+        ('Wolves', 'Wolverhampton Wanderers', 'wolverhampton_wanderers'),
+        ...
+
     Intended use in T2 (xref_team.sql.j2):
 
         WITH aliases AS (
-            SELECT raw_name, canonical_name FROM (VALUES
+            SELECT raw_name, canonical_name, canonical_id FROM (VALUES
                 {{ team_alias_values }}
-            ) AS t(raw_name, canonical_name)
+            ) AS t(raw_name, canonical_name, canonical_id)
         )
 
     Apostrophes in raw names (e.g. ``Nott'm Forest``) are escaped to
@@ -388,17 +411,26 @@ def get_team_alias_sql_values(
     a CTAS over an empty VALUES is invalid Trino syntax, and an empty
     alias map almost certainly indicates a misconfigured filter.
     """
-    pairs = _iter_team_aliases(source, competition)
-    if not pairs:
+    triples = _iter_team_aliases(source, competition)
+    if not triples:
         raise MedallionConfigError(
             f"get_team_alias_sql_values produced 0 pairs "
             f"(source={source!r}, competition={competition!r}); "
             "an empty VALUES clause is invalid Trino — refusing to emit."
         )
-    lines = [
-        f"    ('{_escape_sql_string(raw)}', '{_escape_sql_string(canonical)}')"
-        for raw, canonical in pairs
-    ]
+    if with_canonical_id:
+        lines = [
+            f"    ('{_escape_sql_string(raw)}', "
+            f"'{_escape_sql_string(canonical)}', "
+            f"'{_escape_sql_string(cid)}')"
+            for raw, canonical, cid in triples
+        ]
+    else:
+        lines = [
+            f"    ('{_escape_sql_string(raw)}', "
+            f"'{_escape_sql_string(canonical)}')"
+            for raw, canonical, _cid in triples
+        ]
     return ',\n'.join(lines).lstrip()
 
 

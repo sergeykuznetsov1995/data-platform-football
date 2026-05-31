@@ -5,7 +5,8 @@
 # canonical_name следует Wikipedia "official name" convention.
 #
 # Структура одной записи:
-#   - canonical_name: <official Wikipedia name>
+#   - canonical_name: <official Wikipedia name>      # display only
+#     canonical_id:   <stable identity slug>         # IDENTITY — see below
 #     aliases:
 #       _generic:    [list of raw_names that may appear in any source — UNION pool]
 #       fbref:       [list, optional]    # full names with spaces (mostly canonical)
@@ -17,6 +18,17 @@
 #       espn:        [list, optional]
 #       whoscored:   [list, optional]
 #     competition_scope: [list of competition.id where this alias-set is valid]
+#
+# Why canonical_id (issue #141)?
+#   Identity must NOT be derived from the display name. At worldwide scope a
+#   name stops being a unique key (FC Barcelona vs Barcelona SC; Spartak Moscow
+#   vs Spartak Nalchik). `canonical_id` is an explicit, stable slug owned here;
+#   `xref_team.sql.j2` reads it verbatim instead of slugifying canonical_name.
+#   Convention: lower-snake-case, `^[a-z0-9_]+$` (loader enforces). For the
+#   current APL set the slug equals the old name-derived value (e.g.
+#   "Manchester United" -> manchester_united) so Gold canonical_id is unchanged.
+#   When onboarding an ambiguous club, disambiguate with a country/city suffix
+#   (e.g. barcelona_es, spartak_moscow) — never reuse a slug for two real clubs.
 #
 # Why _generic?
 #   The original `_team_aliases.sql` lists `(raw, canonical)` pairs without
@@ -50,6 +62,7 @@
 teams:
   # ====== Wolverhampton Wanderers ======
   - canonical_name: "Wolverhampton Wanderers"
+    canonical_id: "wolverhampton_wanderers"
     aliases:
       _generic:
         - "Wolves"
@@ -67,6 +80,7 @@ teams:
 
   # ====== Tottenham Hotspur ======
   - canonical_name: "Tottenham Hotspur"
+    canonical_id: "tottenham_hotspur"
     aliases:
       _generic:
         - "Spurs"
@@ -84,6 +98,7 @@ teams:
 
   # ====== Manchester United ======
   - canonical_name: "Manchester United"
+    canonical_id: "manchester_united"
     aliases:
       _generic:
         - "Man Utd"
@@ -104,6 +119,7 @@ teams:
 
   # ====== Manchester City ======
   - canonical_name: "Manchester City"
+    canonical_id: "manchester_city"
     aliases:
       _generic:
         - "Man City"
@@ -121,6 +137,7 @@ teams:
 
   # ====== Newcastle United ======
   - canonical_name: "Newcastle United"
+    canonical_id: "newcastle_united"
     aliases:
       _generic:
         - "Newcastle"
@@ -139,6 +156,7 @@ teams:
 
   # ====== Nottingham Forest ======
   - canonical_name: "Nottingham Forest"
+    canonical_id: "nottingham_forest"
     aliases:
       _generic:
         - "Nott'm Forest"
@@ -157,6 +175,7 @@ teams:
 
   # ====== Leicester City ======
   - canonical_name: "Leicester City"
+    canonical_id: "leicester_city"
     aliases:
       _generic:
         - "Leicester"
@@ -174,6 +193,7 @@ teams:
 
   # ====== Leeds United ======
   - canonical_name: "Leeds United"
+    canonical_id: "leeds_united"
     aliases:
       _generic:
         - "Leeds"
@@ -191,6 +211,7 @@ teams:
 
   # ====== West Ham United ======
   - canonical_name: "West Ham United"
+    canonical_id: "west_ham_united"
     aliases:
       _generic:
         - "West Ham"
@@ -208,6 +229,7 @@ teams:
 
   # ====== Brighton and Hove Albion ======
   - canonical_name: "Brighton and Hove Albion"
+    canonical_id: "brighton_and_hove_albion"
     aliases:
       _generic:
         - "Brighton"
@@ -225,6 +247,7 @@ teams:
 
   # ====== Norwich City ======
   - canonical_name: "Norwich City"
+    canonical_id: "norwich_city"
     aliases:
       _generic:
         - "Norwich"
@@ -242,6 +265,7 @@ teams:
 
   # ====== Sheffield United ======
   - canonical_name: "Sheffield United"
+    canonical_id: "sheffield_united"
     aliases:
       _generic:
         - "Sheff Utd"
@@ -260,6 +284,7 @@ teams:
 
   # ====== Brentford ======
   - canonical_name: "Brentford"
+    canonical_id: "brentford"
     aliases:
       _generic: ["Brentford"]
       fbref: ["Brentford"]
@@ -274,6 +299,7 @@ teams:
 
   # ====== AFC Bournemouth ======
   - canonical_name: "AFC Bournemouth"
+    canonical_id: "afc_bournemouth"
     aliases:
       _generic:
         - "Bournemouth"
@@ -290,6 +316,7 @@ teams:
 
   # ====== Cardiff City ======
   - canonical_name: "Cardiff City"
+    canonical_id: "cardiff_city"
     aliases:
       _generic:
         - "Cardiff"
@@ -306,6 +333,7 @@ teams:
 
   # ====== Hull City ======
   - canonical_name: "Hull City"
+    canonical_id: "hull_city"
     aliases:
       _generic:
         - "Hull"
@@ -322,6 +350,7 @@ teams:
 
   # ====== Stoke City ======
   - canonical_name: "Stoke City"
+    canonical_id: "stoke_city"
     aliases:
       _generic:
         - "Stoke"
@@ -338,6 +367,7 @@ teams:
 
   # ====== Swansea City ======
   - canonical_name: "Swansea City"
+    canonical_id: "swansea_city"
     aliases:
       _generic:
         - "Swansea"
@@ -354,6 +384,7 @@ teams:
 
   # ====== Watford ======
   - canonical_name: "Watford"
+    canonical_id: "watford"
     aliases:
       _generic:
         - "Watford"
@@ -370,6 +401,7 @@ teams:
 
   # ====== West Bromwich Albion ======
   - canonical_name: "West Bromwich Albion"
+    canonical_id: "west_bromwich_albion"
     aliases:
       _generic:
         - "West Brom"
@@ -389,6 +421,7 @@ teams:
 
   # ====== Aston Villa ======
   - canonical_name: "Aston Villa"
+    canonical_id: "aston_villa"
     aliases:
       _generic:
         - "Aston Villa"
@@ -405,6 +438,7 @@ teams:
 
   # ====== Crystal Palace ======
   - canonical_name: "Crystal Palace"
+    canonical_id: "crystal_palace"
     aliases:
       _generic:
         - "Crystal Palace"
@@ -425,37 +459,44 @@ teams:
   #        regex normalisation path).
 
   - canonical_name: "Arsenal"
+    canonical_id: "arsenal"
     aliases:
       _generic: ["Arsenal"]
     competition_scope: ["ENG-Premier League"]
 
   - canonical_name: "Burnley"
+    canonical_id: "burnley"
     aliases:
       _generic: ["Burnley"]
     competition_scope: ["ENG-Premier League"]
 
   - canonical_name: "Chelsea"
+    canonical_id: "chelsea"
     aliases:
       _generic: ["Chelsea"]
     competition_scope: ["ENG-Premier League"]
 
   - canonical_name: "Everton"
+    canonical_id: "everton"
     aliases:
       _generic: ["Everton"]
     competition_scope: ["ENG-Premier League"]
 
   - canonical_name: "Fulham"
+    canonical_id: "fulham"
     aliases:
       _generic: ["Fulham"]
     competition_scope: ["ENG-Premier League"]
 
   - canonical_name: "Liverpool"
+    canonical_id: "liverpool"
     aliases:
       _generic: ["Liverpool"]
       sofascore: ["Liverpool FC"]
     competition_scope: ["ENG-Premier League"]
 
   - canonical_name: "Luton Town"
+    canonical_id: "luton_town"
     aliases:
       _generic:
         - "Luton Town"
@@ -466,11 +507,13 @@ teams:
     competition_scope: ["ENG-Premier League"]
 
   - canonical_name: "Southampton"
+    canonical_id: "southampton"
     aliases:
       _generic: ["Southampton"]
     competition_scope: ["ENG-Premier League"]
 
   - canonical_name: "Ipswich Town"
+    canonical_id: "ipswich_town"
     aliases:
       _generic:
         - "Ipswich Town"
@@ -479,6 +522,7 @@ teams:
     competition_scope: ["ENG-Premier League"]
 
   - canonical_name: "Sunderland"
+    canonical_id: "sunderland"
     aliases:
       _generic: ["Sunderland"]
     competition_scope: ["ENG-Premier League"]

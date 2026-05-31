@@ -128,7 +128,7 @@ def _run_xref_team(**context) -> Dict[str, Any]:
 
     rendered_sql = render_sql_template(
         template_path,
-        team_aliases_values_sql=get_team_alias_sql_values(),
+        team_aliases_values_sql=get_team_alias_sql_values(with_canonical_id=True),
     )
     logger.info(
         "Rendered xref_team.sql.j2 — %d chars (template embeds %d alias pairs)",
@@ -229,6 +229,7 @@ def _validate_xref(**context) -> Dict[str, Any]:
     XCom outputs:
       * key=``parity_summary`` — dict {team, match, player → diff metrics}
       * key=``orphan_rates``    — dict {team, player → per-source verdicts}
+      * key=``orphan_teams``    — dict {total_orphans, per_source, rows} (issue #141)
     """
     from airflow.exceptions import AirflowException
 
@@ -242,6 +243,7 @@ def _validate_xref(**context) -> Dict[str, Any]:
         parity_check_xref_match_vs_gold,
         parity_check_xref_player_vs_gold,
         parity_check_xref_team_vs_gold,
+        report_orphan_teams,
     )
 
     # ------------------------------------------------------------------
@@ -298,6 +300,27 @@ def _validate_xref(**context) -> Dict[str, Any]:
         orphan_rates[entity] = res
 
     context['ti'].xcom_push(key='orphan_rates', value=orphan_rates)
+
+    # ------------------------------------------------------------------
+    # Phase 2.6 — orphan team report (issue #141, stage 4)
+    # Informational: lists the actual un-glued raw team-names so a maintainer
+    # can extend team_aliases.yaml for what is really broken. Never escalates.
+    # ------------------------------------------------------------------
+    try:
+        orphan_teams = report_orphan_teams(table='iceberg.silver.xref_team')
+        logger.info(
+            "Phase 2.6 — orphan teams: %d distinct (per_source=%s)",
+            orphan_teams['total_orphans'],
+            orphan_teams['per_source'],
+        )
+        for row in orphan_teams['rows']:
+            logger.info(
+                "  orphan team: source=%s league=%s season=%s name=%r",
+                row['source'], row['league'], row['season'], row['source_id'],
+            )
+        context['ti'].xcom_push(key='orphan_teams', value=orphan_teams)
+    except Exception:
+        logger.exception("orphan team report failed (non-fatal)")
 
     # ------------------------------------------------------------------
     # Phase 2.5 — Bronze-vs-xref freshness gap (Issue #15 regression guard)

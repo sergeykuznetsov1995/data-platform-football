@@ -46,6 +46,7 @@ for p in (str(PROJECT_ROOT), str(DAGS_DIR)):
 _MOCK_TEAM_ALIASES = """\
 teams:
   - canonical_name: "Wolverhampton Wanderers"
+    canonical_id: "wolverhampton_wanderers"
     aliases:
       _generic: ["Wolves", "Wolverhampton Wanderers"]
       sofascore: ["Wolverhampton"]
@@ -53,28 +54,33 @@ teams:
     competition_scope: ["ENG-Premier League"]
 
   - canonical_name: "Tottenham Hotspur"
+    canonical_id: "tottenham_hotspur"
     aliases:
       _generic: ["Spurs", "Tottenham"]
       fbref: ["Tottenham Hotspur"]
     competition_scope: ["ENG-Premier League"]
 
   - canonical_name: "Manchester United"
+    canonical_id: "manchester_united"
     aliases:
       _generic: ["Man Utd", "Manchester United"]
       clubelo: ["ManUnited"]
     competition_scope: ["ENG-Premier League"]
 
   - canonical_name: "Nottingham Forest"
+    canonical_id: "nottingham_forest"
     aliases:
       _generic: ["Nott'm Forest", "Nottingham Forest"]
     competition_scope: ["ENG-Premier League"]
 
   - canonical_name: "Newcastle United"
+    canonical_id: "newcastle_united"
     aliases:
       _generic: ["Newcastle", "Newcastle Utd"]
     competition_scope: ["ENG-Premier League"]
 
   - canonical_name: "Real Madrid"
+    canonical_id: "real_madrid"
     aliases:
       _generic: ["Real Madrid"]
     competition_scope: ["ESP-La Liga"]
@@ -206,6 +212,47 @@ def test_load_team_aliases_rejects_team_without_aliases(tmp_path, monkeypatch):
         medallion_config.load_team_aliases()
 
 
+def test_load_team_aliases_rejects_team_without_canonical_id(tmp_path, monkeypatch):
+    # canonical_name + aliases present, but canonical_id missing (issue #141).
+    (tmp_path / "team_aliases.yaml").write_text(
+        "teams:\n"
+        "  - canonical_name: 'X'\n"
+        "    aliases:\n"
+        "      _generic: ['X']\n"
+    )
+    (tmp_path / "competitions.yaml").write_text(_MOCK_COMPETITIONS)
+    monkeypatch.setenv("MEDALLION_CONFIG_DIR", str(tmp_path))
+
+    import importlib
+    from utils import medallion_config
+    importlib.reload(medallion_config)
+    medallion_config.reset_cache()
+
+    with pytest.raises(medallion_config.MedallionConfigError, match="canonical_id"):
+        medallion_config.load_team_aliases()
+
+
+def test_load_team_aliases_rejects_invalid_canonical_id_slug(tmp_path, monkeypatch):
+    # Uppercase / spaces / hyphens are not valid in a ^[a-z0-9_]+$ slug.
+    (tmp_path / "team_aliases.yaml").write_text(
+        "teams:\n"
+        "  - canonical_name: 'X'\n"
+        "    canonical_id: 'Bad-Slug'\n"
+        "    aliases:\n"
+        "      _generic: ['X']\n"
+    )
+    (tmp_path / "competitions.yaml").write_text(_MOCK_COMPETITIONS)
+    monkeypatch.setenv("MEDALLION_CONFIG_DIR", str(tmp_path))
+
+    import importlib
+    from utils import medallion_config
+    importlib.reload(medallion_config)
+    medallion_config.reset_cache()
+
+    with pytest.raises(medallion_config.MedallionConfigError, match="canonical_id"):
+        medallion_config.load_team_aliases()
+
+
 # ---------------------------------------------------------------------------
 # get_team_alias_pairs
 # ---------------------------------------------------------------------------
@@ -232,6 +279,7 @@ def test_alias_pairs_dedupes_when_same_pair_in_generic_and_source(tmp_path, monk
     (tmp_path / "team_aliases.yaml").write_text(
         "teams:\n"
         "  - canonical_name: 'X FC'\n"
+        "    canonical_id: 'x_fc'\n"
         "    aliases:\n"
         "      _generic: ['X', 'X FC']\n"
         "      sofascore: ['X FC']\n"
@@ -358,6 +406,28 @@ def test_sql_values_filtered_by_source(mock_config_dir):
     assert "'Wolverhampton')" not in sql
 
 
+def test_sql_values_with_canonical_id_emits_three_columns(mock_config_dir):
+    # issue #141: xref_team renders 3-tuples carrying the explicit identity slug.
+    sql = mock_config_dir.get_team_alias_sql_values(with_canonical_id=True)
+    # The Wolves row must carry raw, canonical_name AND canonical_id.
+    assert "('Wolves', 'Wolverhampton Wanderers', 'wolverhampton_wanderers')" in sql
+    # Every tuple has exactly 3 comma-separated literals.
+    for line in sql.splitlines():
+        line = line.strip().rstrip(",").strip("()")
+        assert line.count("',") + line.count("', ") >= 0  # sanity: parses
+        # Count top-level literal separators: 3 quoted fields → 2 separators.
+        assert line.count("', '") == 2, line
+
+
+def test_sql_values_default_stays_two_columns(mock_config_dir):
+    # Default (transfermarkt_transfers.sql.j2 contract) must be unchanged.
+    sql = mock_config_dir.get_team_alias_sql_values()
+    assert "('Wolves', 'Wolverhampton Wanderers')" in sql
+    for line in sql.splitlines():
+        line = line.strip().rstrip(",").strip("()")
+        assert line.count("', '") == 1, line
+
+
 def test_sql_values_raises_on_empty_result(mock_config_dir):
     # Filtering by an unknown source AND an unknown competition produces
     # zero rows — the loader refuses to emit invalid Trino syntax.
@@ -369,6 +439,7 @@ def test_sql_values_rejects_backslash_in_alias(tmp_path, monkeypatch):
     (tmp_path / "team_aliases.yaml").write_text(
         "teams:\n"
         "  - canonical_name: 'X'\n"
+        "    canonical_id: 'x'\n"
         "    aliases:\n"
         "      _generic: ['bad\\\\name']\n"
         "    competition_scope: ['ENG-Premier League']\n"
