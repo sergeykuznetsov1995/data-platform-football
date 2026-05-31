@@ -22,13 +22,6 @@ functions using the universal :mod:`utils.data_quality` primitives. The DAG
 
 Open TODOs (E1.5 cutover and beyond)
 ------------------------------------
-* **fct_event.match_id_canonical → silver.xref_match ref_integrity** —
-  held at WARNING severity (was ERROR). Phase B bridging is partial:
-  ~470 WhoScored games still ship as ``'whoscored_raw'`` v0 without a
-  matching xref_match row. Once Phase B completes a full 7-source cascade
-  (every WhoScored game gets a row in xref_match), bump severity back
-  to ERROR. See GitHub issue
-  `bug(e3): fct_event.match_id_canonical → xref_match bridging`.
 * **schema-version literal pin** for fct_event — currently the file checks
   ``action_source != 'whoscored_spadl_proprietary_v1'`` only. When the
   SPADL spec evolves to v2, bump both the SQL and this allow-list.
@@ -702,19 +695,19 @@ def _build_fct_event_checks() -> List[Check]:
                   'action_source', 'action_version'],
         ),
 
-        # Phase B residue: match_id_canonical SHOULD resolve to
-        # silver.xref_match.canonical_id via the 7-source xref_match cascade,
-        # but ~470 WhoScored games still ship as ``'whoscored_raw'`` v0
-        # (xref_match Phase B bridging not yet complete — see issue
-        # `bug(e3): fct_event.match_id_canonical → xref_match bridging`).
-        # Held at WARNING until full bridging lands; a regression (orphan
-        # count > baseline) is still visible in DQ output.
+        # Phase B bridging COMPLETE (#40): every WhoScored game in
+        # gold.fct_event resolves to a silver.xref_match.canonical_id row.
+        # The whoscored_schedule backfill-from-events (#128/#126/#106,
+        # 2026-05-28) closed the schedule⊇events gap that left ~470 games
+        # unbridged at WARNING; verified 0 orphan on live data 2026-05-31.
+        # Re-enabled at ERROR — the check is now the guard against a
+        # regression in the schedule⊇events invariant.
         CHECK.ref_integrity(
             child='gold.fct_event',
             parent='silver.xref_match',
             key='match_id_canonical',
             parent_key='canonical_id',
-            severity='WARNING',
+            severity='ERROR',
         ),
 
         # Volume — Bronze→Silver→Gold passthrough, expect ~Silver count.

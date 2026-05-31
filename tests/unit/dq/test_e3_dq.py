@@ -250,6 +250,20 @@ class TestErrorSeverityChecks:
         assert len(ref) == 1
         assert ref[0].severity == "ERROR"
 
+    def test_fct_event_ref_integrity_is_error(self):
+        """fct_event → xref_match bridging is COMPLETE (#40): every WhoScored
+        game resolves to a canonical_id row, so an orphan = a regression in
+        the schedule⊇events invariant. Re-enabled at ERROR (was WARNING)."""
+        checks = e3_dq.build_gold_e3_checks()
+        ref = [
+            c for c in checks
+            if c.kind == "ref_integrity"
+            and c.params.get("child") == "gold.fct_event"
+            and c.params.get("parent") == "silver.xref_match"
+        ]
+        assert len(ref) == 1
+        assert ref[0].severity == "ERROR"
+
     def test_fct_lineup_ref_integrity_is_warning_until_e15_cutover(self):
         """fct_lineup ref_integrity → silver.xref_match is WARNING (not ERROR)
         until E1.5 cutover bridges fct_event.match_id_canonical from
