@@ -42,6 +42,123 @@ logger = logging.getLogger(__name__)
 PARTITION_FILTER_SENTINEL = "-- WHERE_PARTITION_FILTER_HERE"
 
 
+# ---------------------------------------------------------------------------
+# Point-in-time leakage protection — rolling-feature column registries
+# ---------------------------------------------------------------------------
+# Each feat_* table masks rolling columns to NULL for the first N rows per
+# partition (see CASE WHEN match_rn > N in dags/sql/gold/feat_*.sql). DQ
+# verifies that mask is intact by counting non-NULL values where rn <= N.
+#
+# Keep these lists in sync with the SELECT lists of the corresponding SQL
+# files. New rolling column added in SQL? Add it here too — otherwise a
+# regression that drops the CASE-WHEN mask ships silently.
+#
+# Columns are grouped by SQL file. (table, partition_by, order_by, skip_n)
+# is shared across all columns in a group.
+
+# feat_team_form — partition (team_id, season) ORDER BY date, mask match_rn > 5
+FEAT_TEAM_FORM_ROLLING_COLS = [
+    # T1.x baseline averages
+    'l5_goals_for_avg',
+    'l5_goals_against_avg',
+    'l5_shots_avg',
+    'l5_sot_avg',
+    'l5_possession_avg',
+    'l5_form_points',
+    'l5_wins',
+    'l5_losses',
+    'l5_draws',
+    # T3.3 volatility + trend
+    'l5_goals_for_std',
+    'l5_goals_against_std',
+    'l5_points_std',
+    'l5_form_trend',
+    # E5: rolling avg # of confirmed unavailable players over L5. Same
+    # skip_first_n=5 mask — point-in-time leakage risk is identical to
+    # other rolling features here.
+    'unavailable_count_l5',
+]
+
+# feat_team_h2h — partition (team_id, opponent_id) ORDER BY date, mask h2h_rn > 1
+# NB: NO season in partition — head-to-head is a cross-season relationship.
+# skip_first_n=1 (not 5) because h2h has at most ~2 matches/season per pair.
+FEAT_TEAM_H2H_ROLLING_COLS = [
+    'h2h_goals_diff_avg',
+    'h2h_goals_for_avg',
+    'h2h_goals_against_avg',
+    'h2h_wins',
+    'h2h_losses',
+    'h2h_draws',
+]
+
+# feat_team_xg_form — partition (team_id, season) ORDER BY match_date, mask match_rn > 5
+# Both L5 and L10 columns share skip_first_n=5 — see SQL header for trade-off
+# rationale (APL 38-match seasons make >10 mask too restrictive).
+FEAT_TEAM_XG_FORM_ROLLING_COLS = [
+    # L5
+    'xg_for_l5_avg',
+    'xg_against_l5_avg',
+    'xg_diff_l5_avg',
+    'psxg_for_l5_avg',
+    'psxg_against_l5_avg',
+    'psxg_diff_l5_avg',
+    # L10
+    'xg_for_l10_avg',
+    'xg_against_l10_avg',
+    'xg_diff_l10_avg',
+    'psxg_for_l10_avg',
+    'psxg_against_l10_avg',
+    'psxg_diff_l10_avg',
+]
+
+# feat_player_form — partition (player_id, season) ORDER BY match_id, mask appearance_rn > 5
+FEAT_PLAYER_FORM_ROLLING_COLS = [
+    'l5_minutes_avg',
+    'l5_goals_avg',
+    'l5_assists_avg',
+    'l5_shots_avg',
+    'l5_sot_avg',
+    'l5_goals_sum',
+    'l5_assists_sum',
+    'l5_yellows_sum',
+    'l5_reds_sum',
+]
+
+# E6 / W2: feat_referee_bias — partition (referee_id, season) ORDER BY date,
+# mask ref_match_rn > 5. Each column is a rolling stat over the referee's last
+# 10 completed matches (within season). Same point-in-time semantics as the
+# other feat_* tables: first 5 matches of a referee's season carry NULL to
+# avoid leakage during early-season fitting.
+FEAT_REFEREE_BIAS_ROLLING_COLS = [
+    'ref_yellow_per_match_l10',
+    'ref_red_per_match_l10',
+    'ref_cards_per_match_l10',
+    'ref_goals_per_match_l10',
+    'ref_home_win_rate_l10',
+    'ref_pen_per_match_l10',
+]
+
+# E6 / W3: feat_team_event_style — partition (team_id, season) ORDER BY date,
+# mask match_rn > 5. All columns are share/rate metrics derived from
+# silver.whoscored_events_spadl rolling over the team's last 5 matches.
+# Bounded in [0, 1] (share = fraction of team's actions of given type, or
+# success_rate = share of successful actions). NB: skip_first_n=5 — share
+# numerators are unstable for the first ~5 matches when sample sizes are
+# small, so the SQL masks them to NULL and the DQ enforces the mask.
+FEAT_TEAM_EVENT_STYLE_ROLLING_COLS = [
+    'pass_share_l5_avg',
+    'dribble_share_l5_avg',
+    'tackle_share_l5_avg',
+    'interception_share_l5_avg',
+    'cross_share_l5_avg',
+    'shot_share_l5_avg',
+    'success_rate_l5_avg',
+    'set_piece_share_l5_avg',
+    'open_play_share_l5_avg',
+    'header_share_l5_avg',
+]
+
+
 def run_gold_transform(
     sql_file: str,
     table_name: str,
@@ -1928,6 +2045,85 @@ def validate_gold_quality() -> Dict[str, Any]:
         # may tighten the team-level check to ERROR severity.
         # ============================================================
         *build_e1_5_post_cutover_checks(),
+
+        # ============================================================
+        # Point-in-time leakage protection — feat_* rolling tables (#186)
+        # ------------------------------------------------------------
+        # Each rolling column MUST be NULL for the first skip_first_n rows
+        # per partition (SQL masks via CASE WHEN <rn> > N). These checks
+        # enforce the mask is intact — a dropped CASE-WHEN ships leakage
+        # silently otherwise. Column lists live in module-level constants
+        # (FEAT_*_ROLLING_COLS) kept in sync with the SQL by
+        # tests/unit/dq/test_feat_rolling_registry.py.
+        # ============================================================
+        *(
+            CHECK.point_in_time(
+                'gold.feat_team_form',
+                feature_col=col,
+                partition_by=['team_id', 'season'],
+                order_by='date',
+                skip_first_n=5,
+            )
+            for col in FEAT_TEAM_FORM_ROLLING_COLS
+        ),
+        # h2h: partition is (team_id, opponent_id) — h2h is cross-season; mask
+        # is h2h_rn > 1 (first encounter has no prior). skip_first_n=1.
+        *(
+            CHECK.point_in_time(
+                'gold.feat_team_h2h',
+                feature_col=col,
+                partition_by=['team_id', 'opponent_id'],
+                order_by='date',
+                skip_first_n=1,
+            )
+            for col in FEAT_TEAM_H2H_ROLLING_COLS
+        ),
+        # xG / PSxG rolling features (L5 + L10). SQL masks both window sizes at
+        # match_rn > 5 (an APL season has 38 matches; demanding 10 prior would
+        # null ~26% of rows), so skip_first_n=5 applies uniformly.
+        *(
+            CHECK.point_in_time(
+                'gold.feat_team_xg_form',
+                feature_col=col,
+                partition_by=['team_id', 'season'],
+                order_by='match_date',
+                skip_first_n=5,
+            )
+            for col in FEAT_TEAM_XG_FORM_ROLLING_COLS
+        ),
+        # feat_player_form keys are canonical (#46 multi-source rename):
+        # player_id_canonical / match_id_canonical, not the bare *_id the other
+        # feat_* tables use.
+        *(
+            CHECK.point_in_time(
+                'gold.feat_player_form',
+                feature_col=col,
+                partition_by=['player_id_canonical', 'season'],
+                order_by='match_id_canonical',
+                skip_first_n=5,
+            )
+            for col in FEAT_PLAYER_FORM_ROLLING_COLS
+        ),
+        *(
+            CHECK.point_in_time(
+                'gold.feat_referee_bias',
+                feature_col=col,
+                partition_by=['referee_id', 'season'],
+                order_by='date',
+                skip_first_n=5,
+            )
+            for col in FEAT_REFEREE_BIAS_ROLLING_COLS
+        ),
+        *(
+            CHECK.point_in_time(
+                'gold.feat_team_event_style',
+                feature_col=col,
+                partition_by=['team_id', 'season'],
+                order_by='date',
+                skip_first_n=5,
+            )
+            for col in FEAT_TEAM_EVENT_STYLE_ROLLING_COLS
+        ),
     ]
 
     report = run_checks(checks, raise_on_error=False)
