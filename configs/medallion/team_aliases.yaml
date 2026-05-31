@@ -452,6 +452,7 @@ teams:
   - canonical_name: "Liverpool"
     aliases:
       _generic: ["Liverpool"]
+      sofascore: ["Liverpool FC"]
     competition_scope: ["ENG-Premier League"]
 
   - canonical_name: "Luton Town"
@@ -480,4 +481,16 @@ teams:
   - canonical_name: "Sunderland"
     aliases:
       _generic: ["Sunderland"]
+    competition_scope: ["ENG-Premier League"]
+
+  - canonical_name: "Huddersfield Town"
+    aliases:
+      _generic:
+        - "Huddersfield Town"
+        - "Huddersfield"
+    competition_scope: ["ENG-Premier League"]
+
+  - canonical_name: "Middlesbrough"
+    aliases:
+      _generic: ["Middlesbrough"]
     competition_scope: ["ENG-Premier League"]
