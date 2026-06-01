@@ -172,8 +172,45 @@ class TestMasterPipeline:
             if 'trigger' in task.task_id.lower()
         ]
 
-        assert len(trigger_tasks) >= 5, \
+        assert len(trigger_tasks) >= 6, \
             f"Master pipeline should have multiple trigger tasks, found: {len(trigger_tasks)}"
+
+    def test_master_pipeline_triggers_fbref_gold(self, dag_bag):
+        """Master pipeline must trigger the FBref Gold DAG (issue #39)."""
+        dag_id = 'dag_master_pipeline'
+
+        if dag_id not in dag_bag.dags:
+            pytest.skip(f"DAG '{dag_id}' not found")
+
+        dag = dag_bag.dags[dag_id]
+        assert 'trigger_fbref_gold' in {t.task_id for t in dag.tasks}
+
+        trigger = dag.get_task('trigger_fbref_gold')
+        assert getattr(trigger, 'trigger_dag_id', None) == 'dag_transform_fbref_gold'
+
+    def test_fbref_gold_runs_after_silver_and_before_check(self, dag_bag):
+        """`trigger_fbref_gold` must run after TM/Cap/SoFIFA Silver and feed
+        into the pipeline success check (issue #39)."""
+        dag_id = 'dag_master_pipeline'
+
+        if dag_id not in dag_bag.dags:
+            pytest.skip(f"DAG '{dag_id}' not found")
+
+        dag = dag_bag.dags[dag_id]
+        task = dag.get_task('trigger_fbref_gold')
+
+        upstream_ids = {t.task_id for t in task.upstream_list}
+        assert {
+            'trigger_silver_transfermarkt',
+            'trigger_silver_capology',
+            'trigger_silver_sofifa',
+        } <= upstream_ids, (
+            "trigger_fbref_gold must run after the TM/Capology/SoFIFA Silver "
+            f"block (fct_team_season_stats finance inputs), got: {upstream_ids}"
+        )
+
+        downstream_ids = {t.task_id for t in task.downstream_list}
+        assert 'check_pipeline_success' in downstream_ids
 
     def test_master_has_check_and_report_tasks(self, dag_bag):
         """Test that master pipeline has check and report tasks."""
