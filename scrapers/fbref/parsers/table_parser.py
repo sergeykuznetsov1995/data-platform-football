@@ -407,6 +407,13 @@ def parse_table(
                     )
                 ]
 
+            # Remove repeated header rows in schedule tables (where Home == 'Home').
+            # FBref repeats the header row mid-table for in-progress seasons; without
+            # this filter the literal 'Home'/'Away' header values leak into Bronze
+            # as fake team rows (issue #189).
+            if 'Home' in df.columns:
+                df = df[df['Home'] != 'Home']
+
             # Reset index after filtering
             df = df.reset_index(drop=True)
 
@@ -484,6 +491,11 @@ def _parse_table_element(
                         'Total|Average', na=False, case=False
                     )
                 ]
+
+            # Remove repeated header rows in schedule tables (where Home == 'Home')
+            # — see parse_table (issue #189).
+            if 'Home' in df.columns:
+                df = df[df['Home'] != 'Home']
 
             # Reset index after filtering
             df = df.reset_index(drop=True)
