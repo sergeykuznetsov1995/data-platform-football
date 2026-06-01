@@ -256,3 +256,23 @@ class TestDimCompetitionRender:
                 f"league {league_name!r} should appear ≥2× per row "
                 f"(name + canonical); got {rendered_sql.count(f'{league_name!r}')}"
             )
+
+
+@pytest.mark.unit
+class TestSlugDiacritics:
+    """``_slug`` strips diacritics so accented league names slug to ASCII (#215)."""
+
+    def test_slug_strips_diacritics(self):
+        from utils.dim_loaders import _slug
+
+        # Accented vs accent-free spellings must collapse to ONE slug, not the
+        # bare-regex 's_per_lig' that would split the canonical_id.
+        assert _slug("Süper Lig") == "super_lig"
+        assert _slug("Süper Lig") == _slug("Super Lig")
+        assert _slug("Première Division") == "premiere_division"
+
+    def test_slug_ascii_unchanged(self):
+        from utils.dim_loaders import _slug
+
+        # Pre-#215 behaviour for plain-ASCII names is preserved.
+        assert _slug("ENG-Premier League") == "eng_premier_league"

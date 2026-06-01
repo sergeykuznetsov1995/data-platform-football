@@ -41,7 +41,11 @@ WITH u AS (
         player_name,
         reason,
         _bronze_ingested_at,
-        LOWER(REGEXP_REPLACE(team_name, '[^a-zA-Z0-9]+', '_')) AS team_slug
+        -- Strip diacritics before slugging (issue #215) so the slug universe
+        -- aligns with entity_xref / dim_match regardless of accent spelling.
+        LOWER(REGEXP_REPLACE(
+            REGEXP_REPLACE(NORMALIZE(team_name, NFD), '\p{Mn}+', ''),
+            '[^a-zA-Z0-9]+', '_')) AS team_slug
     FROM iceberg.silver.whoscored_player_unavailable
     WHERE match_id   IS NOT NULL
       AND match_date IS NOT NULL

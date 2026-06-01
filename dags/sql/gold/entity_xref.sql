@@ -23,7 +23,12 @@ SELECT
     'team'     AS entity_type,
     'fbref'    AS source,
     team_name  AS source_id,
-    LOWER(REGEXP_REPLACE(team_name, '[^a-zA-Z0-9]+', '_')) AS canonical_id,
+    -- Strip diacritics before slugging (issue #215) so a name with/without
+    -- accents maps to one canonical_id. NORMALIZE(NFD) + `\p{Mn}+` strip;
+    -- same idiom as xref_team.sql.j2.
+    LOWER(REGEXP_REPLACE(
+        REGEXP_REPLACE(NORMALIZE(team_name, NFD), '\p{Mn}+', ''),
+        '[^a-zA-Z0-9]+', '_')) AS canonical_id,
     team_name  AS display_name,
     league,
     season

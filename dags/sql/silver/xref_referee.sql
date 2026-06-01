@@ -18,7 +18,7 @@
 -- =============================================================================
 -- Schema (frozen for E1 dual-run)
 -- =============================================================================
---   canonical_id   varchar  -- LOWER(REGEXP_REPLACE(name, '[^a-zA-Z0-9]+','_'))
+--   canonical_id   varchar  -- LOWER(REGEXP_REPLACE(strip_diacritics(name),'[^a-zA-Z0-9]+','_'))
 --   source         varchar  -- 'fbref' | 'matchhistory'
 --   source_id      varchar  -- raw referee name as stored in Bronze
 --   display_name   varchar  -- == source_id (no canonical names yet)
@@ -43,7 +43,16 @@
 -- =============================================================================
 
 SELECT
-    LOWER(REGEXP_REPLACE(referee_name, '[^a-zA-Z0-9]+', '_'))  AS canonical_id,
+    -- Transliterate diacritics before slugging (issue #215, same root cause as
+    -- #201/xref_manager): FBref / matchhistory may emit the same referee both
+    -- with and without accents. A bare `[^a-zA-Z0-9]+ -> _` collapses each
+    -- accent to '_', yielding DIFFERENT canonical_ids for one referee and
+    -- risking the same SCD-2 split that broke dim_manager. NORMALIZE(NFD)
+    -- decomposes "é" -> "e" + combining mark, `\p{Mn}+` strips the mark.
+    -- Same idiom as xref_team.sql.j2 / xref_manager.sql.
+    LOWER(REGEXP_REPLACE(
+        REGEXP_REPLACE(NORMALIZE(referee_name, NFD), '\p{Mn}+', ''),
+        '[^a-zA-Z0-9]+', '_'))                                 AS canonical_id,
     source,
     referee_name                                               AS source_id,
     referee_name                                               AS display_name,
