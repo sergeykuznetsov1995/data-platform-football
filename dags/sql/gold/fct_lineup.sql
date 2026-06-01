@@ -130,6 +130,14 @@ xref_team_by_canonical AS (
     FROM iceberg.silver.xref_team
     WHERE canonical_id IS NOT NULL
 ),
+-- Collapse silver.xref_player (PK source, source_id, season) to one row per
+-- (source, source_id) so the FBref player JOIN below stays 1:1 — see the
+-- rationale on that JOIN. Mirrors the fix pattern in fct_shot.sql (#204).
+xref_player_dedup AS (
+    SELECT source, source_id, ARBITRARY(canonical_id) AS canonical_id
+    FROM iceberg.silver.xref_player
+    GROUP BY source, source_id
+),
 espn_match_bridge AS (
     SELECT
         -- Deterministic ESPN match_id (must mirror silver/espn_lineup.sql).
@@ -210,7 +218,17 @@ fbref_resolved AS (
        AND xt.source_id = fl.team
        AND xt.league    = fl.league
        AND xt.season    = CAST(fl.season AS varchar)
-    LEFT JOIN iceberg.silver.xref_player xp
+    -- xref_player_dedup (NOT raw silver.xref_player): xref_player PK is
+    -- (source, source_id, season), so a raw JOIN on (source, source_id) fans
+    -- out 1.5-4× over a player's seasons (#205; same footgun fixed in
+    -- fct_shot.sql #204). A season predicate would remove the fan-out but
+    -- ALSO drop ~36% of canonical assignments — FBref canonical_id is
+    -- 'fb_' || player_id (season-independent), so a player resolved only in
+    -- one in-scope season legitimately carries that canonical_id on lineup
+    -- rows for seasons outside resolver scope. The dedup CTE collapses to one
+    -- row per (source, source_id) via ARBITRARY (safe: 0 FBref source_id maps
+    -- to >1 canonical_id), eliminating the fan-out while preserving coverage.
+    LEFT JOIN xref_player_dedup xp
         ON xp.source    = 'fbref'
        AND xp.source_id = fl.player_id
 ),
