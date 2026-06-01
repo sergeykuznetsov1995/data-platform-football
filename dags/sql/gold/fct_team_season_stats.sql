@@ -46,14 +46,12 @@
 --   * whoscored source_id  = bronze.whoscored_schedule.home/away_team (NAME).
 --     silver.whoscored_team_season.team_id наследуется от team_id_raw из
 --     events_spadl (NUMERIC после CAST(CAST(... AS BIGINT) AS varchar) — см.
---     feedback_bronze_double_id_cast.md).
---     KNOWN GAP: bronze.whoscored_schedule содержит и team_id (numeric) и
---     team (name), но для APL заполнен только сезон '2021'. Для текущих
---     сезонов (2425/2526) mapping numeric↔name отсутствует → WhoScored-блок
---     будет NULL для большинства rows. Followup: либо добавить WS schedule
---     backfill (preferred), либо resolve team_id_canonical в Silver-stage
---     (T6.3 extension), либо matched-name probe through events. См. issue
---     создаваемый в этом PR как followup.
+--     feedback_bronze_double_id_cast.md). numeric↔name мост строит CTE
+--     `ws_name_to_id` ниже поверх bronze.whoscored_schedule.home/away_team_id,
+--     забэкфиленного на все сезоны из events (#126/#128) → bridge даёт match
+--     (closed #120). WhoScored events существуют только для сезонов 2425/2526,
+--     поэтому WS-колонки заполнены для season 2024/2025 (20/20); за старые
+--     сезоны NULL из-за отсутствия source-данных, не из-за bridge.
 --   * sofascore source_id  = bronze.sofascore_schedule.home/away_team.
 --     silver.sofascore_team_season.team_id = CAST(schedule.home_team AS varchar).
 --
