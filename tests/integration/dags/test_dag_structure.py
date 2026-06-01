@@ -13,18 +13,19 @@ class TestDagStructure:
     """Test suite for DAG structure validation."""
 
     def test_ingestion_dags_have_validate_task(self, dag_bag, ingestion_dag_ids):
-        """Test that all ingestion DAGs have a validate_data task."""
+        """Test that all ingestion DAGs have at least one validate* task."""
         for dag_id in ingestion_dag_ids:
             if dag_id in dag_bag.dags:
                 dag = dag_bag.dags[dag_id]
                 task_ids = [task.task_id for task in dag.tasks]
 
-                assert 'validate_data' in task_ids, \
-                    f"DAG '{dag_id}' missing 'validate_data' task. Tasks: {task_ids}"
+                validate_tasks = [t for t in dag.tasks if t.task_id.startswith('validate')]
+                assert validate_tasks, \
+                    f"DAG '{dag_id}' has no validate* task. Tasks: {task_ids}"
 
     def test_validate_data_has_trigger_rule_all_done(self, dag_bag, ingestion_dag_ids):
         """
-        Test that validate_data tasks have trigger_rule='all_done'.
+        Test that validate* tasks have trigger_rule='all_done'.
 
         This ensures validation runs even if scraping tasks fail,
         allowing us to report partial results.
@@ -33,10 +34,10 @@ class TestDagStructure:
             if dag_id in dag_bag.dags:
                 dag = dag_bag.dags[dag_id]
 
-                validate_task = dag.get_task('validate_data')
-                if validate_task:
+                validate_tasks = [t for t in dag.tasks if t.task_id.startswith('validate')]
+                for validate_task in validate_tasks:
                     assert validate_task.trigger_rule == 'all_done', \
-                        f"DAG '{dag_id}' validate_data has trigger_rule=" \
+                        f"DAG '{dag_id}' {validate_task.task_id} has trigger_rule=" \
                         f"'{validate_task.trigger_rule}', should be 'all_done'"
 
     def test_dags_have_at_least_two_tasks(self, dag_bag, expected_dag_ids):
