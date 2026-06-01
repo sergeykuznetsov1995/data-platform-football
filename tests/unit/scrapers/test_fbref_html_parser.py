@@ -1164,3 +1164,49 @@ class TestParseTableWithTeamIds:
         assert 'team_id' in df.columns
         assert len(df) == 2
         assert df['team_id'].notna().sum() == 2
+
+
+class TestParseScheduleRepeatedHeaders:
+    """Repeated 'Home'/'Away' header rows must not leak into Bronze (issue #189)."""
+
+    SCHEDULE_HTML = """
+    <html>
+    <table id="sched_2025-2026_9_1">
+        <thead>
+            <tr><th>Wk</th><th>Home</th><th>Score</th><th>Away</th></tr>
+        </thead>
+        <tbody>
+            <tr><td>1</td><td>Arsenal</td><td>2–1</td><td>Chelsea</td></tr>
+            <!-- FBref repeats the header row mid-table for in-progress seasons -->
+            <tr><td>Wk</td><td>Home</td><td>Score</td><td>Away</td></tr>
+            <tr><td>2</td><td>Liverpool</td><td>0–0</td><td>Everton</td></tr>
+        </tbody>
+    </table>
+    </html>
+    """
+
+    def test_parse_table_drops_home_header_rows(self):
+        from bs4 import BeautifulSoup
+        from scrapers.fbref.html_parser import parse_table
+
+        soup = BeautifulSoup(self.SCHEDULE_HTML, 'html.parser')
+        df = parse_table(soup, 'sched_2025-2026_9_1')
+
+        assert df is not None
+        # The repeated header row (Home='Home', Away='Away') must be removed.
+        assert 'Home' not in df['Home'].values
+        assert 'Away' not in df['Away'].values
+        assert len(df) == 2
+        assert set(df['Home']) == {'Arsenal', 'Liverpool'}
+
+    def test_parse_table_element_drops_home_header_rows(self):
+        from bs4 import BeautifulSoup
+        from scrapers.fbref.html_parser import _parse_table_element
+
+        soup = BeautifulSoup(self.SCHEDULE_HTML, 'html.parser')
+        table = soup.find('table')
+        df = _parse_table_element(table)
+
+        assert df is not None
+        assert 'Home' not in df['Home'].values
+        assert len(df) == 2
