@@ -2288,11 +2288,11 @@ def validate_gold_row_counts() -> Dict[str, Any]:
         CHECK.row_count('gold.fct_player_match_audit', min_rows=1000),
         # T6.4 (#94): cross-source team-season stats. APL spine ≈20 teams × 10
         # seasons (2016–2025) = 200 rows, floor 80 с запасом на partition gaps.
-        # Audit INNER FBref ∩ Understat — silver.understat_team_match покрывает
-        # только 2 сезона (2024/25 + 2025/26; upstream Understat не бэкфилен на
-        # историю), поэтому пересечение ≈40 rows, floor 30 (#199).
+        # Audit INNER FBref ∩ Understat — после backfill (#213) Understat team-match
+        # покрывает 6 сезонов (2020/21–2025/26), поэтому пересечение = 6 × 20 = 120
+        # rows, floor 100 с запасом на orphan-промоутов / partition gaps.
         CHECK.row_count('gold.fct_team_season_stats',       min_rows=80),
-        CHECK.row_count('gold.fct_team_season_stats_audit', min_rows=30),
+        CHECK.row_count('gold.fct_team_season_stats_audit', min_rows=100),
         CHECK.row_count('gold.match_outcomes',   min_rows=3000),
 
         # ===== E2: master-data dim row-count floors =====
