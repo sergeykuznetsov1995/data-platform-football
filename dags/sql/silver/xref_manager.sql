@@ -16,7 +16,7 @@
 -- =============================================================================
 -- Schema (frozen — identical to xref_team / xref_referee)
 -- =============================================================================
---   canonical_id   varchar  -- LOWER(REGEXP_REPLACE(name, '[^a-zA-Z0-9]+','_'))
+--   canonical_id   varchar  -- LOWER(REGEXP_REPLACE(strip_diacritics(name),'[^a-zA-Z0-9]+','_'))
 --   source         varchar  -- 'fbref'
 --   source_id      varchar  -- raw manager_name as stored in Bronze
 --   display_name   varchar  -- == source_id (no canonical names yet)
@@ -33,7 +33,17 @@
 -- =============================================================================
 
 SELECT
-    LOWER(REGEXP_REPLACE(manager_name, '[^a-zA-Z0-9]+', '_'))  AS canonical_id,
+    -- Transliterate diacritics before slugging (issue #201): FBref emits the
+    -- same manager name both with and without accents ("Régis Le Bris" vs
+    -- "Regis Le Bris"). A bare `[^a-zA-Z0-9]+ -> _` collapses each accent to
+    -- '_', so the two spellings yield DIFFERENT canonical_ids and dim_manager's
+    -- LAG-based stint detector then splits one continuous stint into several,
+    -- breaking the (manager, team, valid_from) PK. NORMALIZE(NFD) decomposes
+    -- "é" -> "e" + combining mark, `\p{Mn}+` strips the mark, leaving ASCII
+    -- "e". Same idiom as xref_team.sql.j2.
+    LOWER(REGEXP_REPLACE(
+        REGEXP_REPLACE(NORMALIZE(manager_name, NFD), '\p{Mn}+', ''),
+        '[^a-zA-Z0-9]+', '_'))                                  AS canonical_id,
     'fbref'                                                     AS source,
     manager_name                                                AS source_id,
     manager_name                                                AS display_name,
