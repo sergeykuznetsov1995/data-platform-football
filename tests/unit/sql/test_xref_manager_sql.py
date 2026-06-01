@@ -85,6 +85,21 @@ class TestXrefManagerStructure:
             "expected regex character class `[^a-zA-Z0-9]+` for normalize"
         )
 
+    def test_canonical_id_transliterates_diacritics(self):
+        """canonical_id strips diacritics via NORMALIZE(NFD) + `\\p{Mn}` (issue #201).
+
+        FBref emits the same manager both with and without accents
+        ("Régis Le Bris" / "Regis Le Bris"); a bare `[^a-zA-Z0-9]+ -> _`
+        produces two different canonical_ids and breaks dim_manager's SCD-2 PK.
+        """
+        sql = _read_sql()
+        assert re.search(r"NORMALIZE\s*\(\s*manager_name\s*,\s*NFD\s*\)", sql, re.IGNORECASE), (
+            "expected NORMALIZE(manager_name, NFD) to decompose accents before slugging"
+        )
+        assert r"\p{Mn}" in sql, (
+            "expected `\\p{Mn}` (Unicode combining marks) regex to strip diacritics"
+        )
+
     def test_confidence_name_normalize(self):
         """confidence must be the literal 'name_normalize' (no alias map)."""
         sql = _read_sql()
