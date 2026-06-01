@@ -59,7 +59,7 @@ relationships:
     to: trino_iceberg.iceberg.gold.fct_team_match.match_id
     type: FOREIGN_KEY
   - from: match_id
-    to: trino_iceberg.iceberg.gold.fct_player_match.match_id
+    to: trino_iceberg.iceberg.gold.fct_player_match.match_id_canonical
     type: FOREIGN_KEY
   - from: home_team_id
     to: trino_iceberg.iceberg.gold.dim_team.team_id
