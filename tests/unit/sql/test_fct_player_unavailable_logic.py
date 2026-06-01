@@ -52,8 +52,14 @@ def _transpile(path: Path) -> str:
     out = sqlglot.transpile(sql, read="trino", write="duckdb")
     if not out:
         raise RuntimeError(f"sqlglot returned no statements for {path}")
+    transpiled = out[0]
+    # Trino's NORMALIZE(x, NFD) (the diacritic-strip slug idiom, issue #215) has
+    # no DuckDB equivalent — DuckDB only ships nfc_normalize. Rewrite it to
+    # DuckDB's strip_accents(x), which removes the combining marks directly; the
+    # following `\p{Mn}+` REGEXP_REPLACE then matches nothing (harmless no-op).
+    transpiled = re.sub(r"NORMALIZE\((.*?),\s*NFD\)", r"strip_accents(\1)", transpiled)
     # Strip any trailing semicolons; we will wrap in SELECT
-    return out[0].rstrip().rstrip(";")
+    return transpiled.rstrip().rstrip(";")
 
 
 def _make_con() -> duckdb.DuckDBPyConnection:
@@ -424,6 +430,42 @@ class TestGoldFctPlayerUnavailable:
         assert rows[0]["match_id"] == "FBR_MATCH_ABC123"
         # team_id resolved via dim_team
         assert rows[0]["team_id"] == "arsenal"
+
+    def test_gold_team_slug_strips_diacritics(self):
+        """Accented team_name slugs to the same ASCII slug as dim_match (issue #215).
+
+        A silver team_name carrying diacritics ("Bayern München") must produce
+        ``bayern_munchen`` — matching the accent-free dim_match.home_team_id —
+        rather than the bare-slug ``bayern_m_nchen`` that would miss the bridge.
+        """
+        con = _make_con()
+        _create_silver_table(con)
+        _create_gold_dims(con)
+
+        self._seed_silver_one_row(
+            con, team_name="Bayern München", match_id="ws_g_de",
+            match_date=date(2025, 1, 15),
+        )
+
+        # dim_match stores the accent-free slug 'bayern_munchen'
+        con.execute(
+            """
+            INSERT INTO iceberg.gold.dim_match VALUES
+            ('FBR_BAYERN_1', DATE '2025-01-15','bayern_munchen','dortmund',
+             'Bayern München','Dortmund','ENG-PL', 2024)
+            """
+        )
+        con.execute(
+            "INSERT INTO iceberg.gold.dim_team VALUES ('bayern_munchen','ENG-PL', 2024)"
+        )
+
+        rows = self._run_gold(con)
+        assert len(rows) == 1, (
+            "accented team_name must slug to the accent-free dim_match slug and "
+            "bridge to exactly one match"
+        )
+        assert rows[0]["match_id"] == "FBR_BAYERN_1"
+        assert rows[0]["team_id"] == "bayern_munchen"
 
     def test_gold_orphan_match_dropped(self):
         """No dim_match bridge -> row is filtered out (WHERE fbref_match_id IS NOT NULL)."""

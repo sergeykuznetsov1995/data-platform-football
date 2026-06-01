@@ -83,6 +83,20 @@ class TestXrefRefereeStructure:
             or "[^a-zA-Z0-9]+" in sql.lower()
         ), "expected regex character class `[^a-zA-Z0-9]+` for normalize"
 
+    def test_canonical_id_transliterates_diacritics(self):
+        """canonical_id strips diacritics via NORMALIZE(NFD) + `\\p{Mn}` (issue #215).
+
+        A referee spelled with and without accents must map to ONE canonical_id;
+        otherwise dim_referee risks the same SCD-2 split that broke dim_manager.
+        """
+        sql = _read_sql()
+        assert re.search(r"NORMALIZE\s*\(\s*referee_name\s*,\s*NFD\s*\)", sql, re.IGNORECASE), (
+            "expected NORMALIZE(referee_name, NFD) to decompose accents before slugging"
+        )
+        assert r"\p{Mn}" in sql, (
+            "expected `\\p{Mn}` (Unicode combining marks) regex to strip diacritics"
+        )
+
     def test_confidence_name_normalize(self):
         """confidence must be the literal 'name_normalize' (no alias map)."""
         sql = _read_sql()
