@@ -84,6 +84,26 @@ manager_match_log_resolved AS (
         AND xt.season     = CAST(mml.season AS varchar)
 ),
 
+-- bronze.fbref_match_managers carries ×2-×5 duplicate scorebox rows per match
+-- (FBref parser; avg 1.007, max 5 observed). Collapse to ONE row per
+-- (team, match_date) so the islands-and-gaps windows below are deterministic
+-- and two stints can never share a valid_from (= MIN match_date). A team plays
+-- <=1 league match per calendar date, so this only removes duplicates, never
+-- real matches. Guards issue #200: Trino windows over tied match_date rows are
+-- non-deterministic across workers, so the cumulative SUM could split one stint
+-- into two segments with the same valid_from then collide on the PK.
+manager_match_log_dedup AS (
+    SELECT * FROM (
+        SELECT mmr.*,
+               ROW_NUMBER() OVER (
+                   PARTITION BY team_canonical_id, match_date
+                   ORDER BY manager_canonical_id, match_id
+               )                                          AS rn
+        FROM manager_match_log_resolved mmr
+    )
+    WHERE rn = 1
+),
+
 -- Detect stint boundaries: a NEW stint starts whenever the manager for a
 -- given team changes compared to the previous chronological match (or it's
 -- the first match for that team).
@@ -101,7 +121,7 @@ stints_marked AS (
             ) = manager_canonical_id THEN 0
             ELSE 1
         END                                               AS is_new_stint
-    FROM manager_match_log_resolved
+    FROM manager_match_log_dedup
 ),
 
 -- Cumulative SUM of the new-stint marker = a unique stint_id within each
