@@ -45,10 +45,17 @@ class TestCheckCounts:
     """Per-table check counts must match the contract documented in e3_dq.py."""
 
     def test_silver_e3_total_check_count(self):
-        """Silver builders: whoscored_events_spadl (9) + espn_lineup (4) = 13."""
+        """Silver builders compose 9 sub-builders = 44 checks total.
+
+        whoscored_events_spadl (9) + whoscored_team_match + whoscored_team_season
+        (T6.3) + understat_team_match + understat_team_season (T6.2) +
+        espn_lineup (4) + sofascore_player_profile + sofascore_team_match +
+        sofascore_team_season (T6.4). Bump this number whenever a builder is
+        added to ``build_silver_e3_checks``.
+        """
         checks = e3_dq.build_silver_e3_checks()
-        assert len(checks) == 13, (
-            f"Silver E3 expected 13 checks, got {len(checks)}: "
+        assert len(checks) == 44, (
+            f"Silver E3 expected 44 checks, got {len(checks)}: "
             f"{[c.name for c in checks]}"
         )
 
@@ -123,9 +130,13 @@ class TestCheckCounts:
         assert len(fct_lineup) == 8
 
     def test_build_all_e3_checks_total(self):
-        """13 silver + 26 gold = 39 total E3 standard DQ checks (Task 2.1)."""
+        """44 silver + 26 gold = 70 total E3 standard DQ checks.
+
+        Bump when either ``build_silver_e3_checks`` (44) or
+        ``build_gold_e3_checks`` (26) gains a builder.
+        """
         all_checks = e3_dq.build_all_e3_checks()
-        assert len(all_checks) == 39
+        assert len(all_checks) == 70
 
 
 # ===========================================================================
@@ -317,13 +328,43 @@ class TestWarningSeverityChecks:
         )
         assert x_range.severity == "WARNING"
 
+    # Understat team aggregates intentionally run freshness at ERROR: Understat
+    # is the xG-primary source (RX2, ~99% coverage), so a stale understat feed
+    # poisons every downstream xG feature/prediction — worth failing the DAG.
+    # Every other E3 table keeps freshness at WARNING (single missed run is OK).
+    _ERROR_FRESHNESS_TABLES = {
+        "iceberg.silver.understat_team_match",
+        "iceberg.silver.understat_team_season",
+    }
+
     def test_freshness_is_warning(self):
-        """All freshness checks are WARNING — single missed run shouldn't fail."""
+        """Freshness is WARNING for every E3 table except the Understat
+        team aggregates (those are ERROR — see _ERROR_FRESHNESS_TABLES)."""
         for c in e3_dq.build_all_e3_checks():
             if c.kind == "freshness":
+                if c.params.get("table") in self._ERROR_FRESHNESS_TABLES:
+                    continue
                 assert c.severity == "WARNING", (
                     f"freshness should be WARNING, got {c.severity} on {c.name}"
                 )
+
+    def test_understat_freshness_is_error(self):
+        """Guard the other direction: Understat (xG-primary) freshness MUST
+        stay ERROR so a stale feed fails the DAG instead of silently poisoning
+        downstream xG features."""
+        checks = e3_dq.build_all_e3_checks()
+        understat_fresh = [
+            c for c in checks
+            if c.kind == "freshness"
+            and c.params.get("table") in self._ERROR_FRESHNESS_TABLES
+        ]
+        assert len(understat_fresh) == 2, (
+            f"expected 2 Understat freshness checks, got {len(understat_fresh)}"
+        )
+        for c in understat_fresh:
+            assert c.severity == "ERROR", (
+                f"Understat freshness must be ERROR, got {c.severity} on {c.name}"
+            )
 
 
 # ===========================================================================
