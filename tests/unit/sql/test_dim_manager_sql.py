@@ -286,3 +286,136 @@ class TestDimManagerSCD2:
         assert len(pks) == len(set(pks)), (
             f"PK uniqueness violated: {pks}"
         )
+
+
+def _bootstrap_dirty(con) -> None:
+    """Bootstrap a fixture that reproduces issue #200: duplicate scorebox rows
+    plus a same-date manager tie that would split a stint into two segments
+    sharing the same valid_from (= MIN match_date) → PK collision.
+
+    Wolves timeline (one team, isolated):
+      * 2022-08-06  O'Neil ×3 identical scorebox dupes  (start of stint 1)
+      * 2022-09-01  O'Neil                              (stint 1 continues)
+      * 2022-11-01  Lopetegui ×2 identical dupes        (start of stint 2)
+      * 2022-11-01  O'Neil                              ← pathological tie:
+                    a SECOND distinct manager credited on the SAME date.
+
+    On the un-deduped SQL the tied 2022-11-01 rows (two distinct managers)
+    make the islands-and-gaps SUM produce two stints whose MIN(match_date)
+    both equal 2022-11-01 → duplicate (manager?, wolves, 2022-11-01)… and more
+    importantly O'Neil can appear in two segments. Collapsing to one row per
+    (team, match_date) removes the tie and guarantees a unique PK.
+    """
+    con.execute("CREATE SCHEMA IF NOT EXISTS bronze")
+    con.execute("CREATE SCHEMA IF NOT EXISTS silver")
+
+    con.execute("""
+        CREATE TABLE bronze.fbref_match_managers (
+            match_id VARCHAR, league VARCHAR, season BIGINT,
+            team VARCHAR, side VARCHAR, manager_name VARCHAR
+        )
+    """)
+    con.execute("""
+        CREATE TABLE silver.fbref_match_enriched (
+            match_id VARCHAR, date DATE, league VARCHAR,
+            season BIGINT, home VARCHAR, away VARCHAR
+        )
+    """)
+    con.execute("""
+        CREATE TABLE silver.xref_manager (
+            canonical_id VARCHAR, source VARCHAR, source_id VARCHAR,
+            display_name VARCHAR, league VARCHAR, season VARCHAR, confidence VARCHAR
+        )
+    """)
+    con.execute("""
+        CREATE TABLE silver.xref_team (
+            canonical_id VARCHAR, source VARCHAR, source_id VARCHAR,
+            display_name VARCHAR, league VARCHAR, season VARCHAR, confidence VARCHAR
+        )
+    """)
+
+    league = "ENG-Premier League"
+    # (match_id, season, manager_name, date) — side is always 'home'.
+    rows = [
+        # stint 1: O'Neil — first match has 3 identical scorebox dupes
+        ("wol1", 2022, "Gary O'Neil", "2022-08-06"),
+        ("wol1", 2022, "Gary O'Neil", "2022-08-06"),
+        ("wol1", 2022, "Gary O'Neil", "2022-08-06"),
+        ("wol2", 2022, "Gary O'Neil", "2022-09-01"),
+        # stint 2: Lopetegui — first match has 2 identical dupes
+        ("wol3", 2022, "Julen Lopetegui", "2022-11-01"),
+        ("wol3", 2022, "Julen Lopetegui", "2022-11-01"),
+        # pathological tie: a second distinct manager on the SAME date 2022-11-01
+        ("wol4", 2022, "Gary O'Neil", "2022-11-01"),
+    ]
+    for mid, season, mgr, d in rows:
+        con.execute(
+            "INSERT INTO bronze.fbref_match_managers VALUES (?, ?, ?, ?, ?, ?)",
+            (mid, league, season, "Wolverhampton Wanderers", "home", mgr),
+        )
+    # fbref_match_enriched: one row per distinct match_id.
+    for mid, d in {("wol1", "2022-08-06"), ("wol2", "2022-09-01"),
+                   ("wol3", "2022-11-01"), ("wol4", "2022-11-01")}:
+        con.execute(
+            "INSERT INTO silver.fbref_match_enriched VALUES (?, ?, ?, ?, ?, ?)",
+            (mid, date.fromisoformat(d), league, 2022,
+             "Wolverhampton Wanderers", "Opponent"),
+        )
+    for name in {"Gary O'Neil", "Julen Lopetegui"}:
+        canonical = name.lower().replace(" ", "_").replace("'", "")
+        con.execute(
+            "INSERT INTO silver.xref_manager VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (canonical, "fbref", name, name, league, "2022", "name_normalize"),
+        )
+    con.execute(
+        "INSERT INTO silver.xref_team VALUES (?, ?, ?, ?, ?, ?, ?)",
+        ("wolverhampton_wanderers", "fbref", "Wolverhampton Wanderers",
+         "Wolverhampton Wanderers", league, "2022", "name_alias"),
+    )
+
+
+@pytest.fixture(scope="module")
+def dirty_gold_rows():
+    sql_text = SQL_PATH.read_text(encoding="utf-8")
+    try:
+        translated = _translate(sql_text)
+    except Exception as e:
+        pytest.skip(f"sqlglot Trino→DuckDB translation failed: {e}")
+
+    con = duckdb.connect(":memory:")
+    try:
+        _bootstrap_dirty(con)
+    except Exception as e:
+        pytest.skip(f"DuckDB dirty fixture bootstrap failed: {e}")
+
+    try:
+        rows = con.execute(translated).fetchall()
+        col_names = [c[0] for c in con.description]
+    except Exception as e:
+        pytest.skip(f"DuckDB execution of translated dim_manager SQL failed: {e}")
+
+    return [dict(zip(col_names, r)) for r in rows]
+
+
+class TestDimManagerDedup:
+    """Issue #200: duplicate scorebox rows + same-date manager tie must not
+    break the SCD-2 PK. Reproduces the dup; passes only after the
+    (team, match_date) collapse is in place."""
+
+    def test_pk_unique_with_duplicate_and_tied_rows(self, dirty_gold_rows):
+        pks = [
+            (r["manager_id_canonical"], r["team_id_canonical"], r["valid_from"])
+            for r in dirty_gold_rows
+        ]
+        assert len(pks) == len(set(pks)), (
+            f"PK collision on dup/tied bronze rows (issue #200): {pks}"
+        )
+
+    def test_no_valid_from_collision_per_team(self, dirty_gold_rows):
+        """No two stints of the same team may share a valid_from."""
+        from collections import Counter
+        per_team = Counter(
+            (r["team_id_canonical"], r["valid_from"]) for r in dirty_gold_rows
+        )
+        dups = {k: n for k, n in per_team.items() if n > 1}
+        assert not dups, f"two stints share a valid_from (issue #200): {dups}"
