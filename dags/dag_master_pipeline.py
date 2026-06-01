@@ -222,6 +222,27 @@ with DAG(
     `trigger_rule='all_done'` policy as E1-E4 to keep the daily summary
     resilient.
 
+    ### FBref Gold layer (issue #39)
+
+    After the TM/Capology/SoFIFA Silver block, the master pipeline triggers
+    `dag_transform_fbref_gold`, which materialises the entire analytical Gold
+    layer (dimensions, season/base facts, rolling features, ML train/test
+    splits, and BI dashboard marts). It is placed LAST in the chain because it
+    consumes outputs from every earlier step:
+      * `silver.xref_*` (E1) for identity resolution;
+      * `silver.sofascore_player_profile` / `sofascore_player_season_aggregate`
+        (E3) -> `gold.dim_player_attributes` / `fct_player_season_stats`
+        (CTAS fails on a missing table if E3 has not run);
+      * `gold.fct_shot` / `fct_event` / `fct_goal` / `fct_card` (E3/E4);
+      * `silver.transfermarkt_players` / `capology_player_salaries`
+        (TM/Cap Silver) -> `gold.fct_team_season_stats`
+        (`squad_market_value_eur` / `total_wage_bill_gbp`), which is why it runs
+        AFTER the TM/Capology Silver block rather than in parallel with it.
+    The Gold DAG runs sequentially (`max_active_tasks=1`) for OOM safety on the
+    dev Trino (3.5 GB heap). Same `wait_for_completion=True` /
+    `failed_states=[]` / `trigger_rule='all_done'` policy as E1-E4 keeps the
+    daily summary resilient if a Gold CTAS degrades.
+
     ### Notes
 
     - Each DAG is triggered with `wait_for_completion=True`
@@ -387,6 +408,33 @@ with DAG(
         trigger_rule='all_done',
     )
 
+    # =========================================================================
+    # FBref Gold layer (issue #39)
+    # =========================================================================
+    # Runs AFTER E4 + TM/Capology/SoFIFA Silver so the Gold builders can read:
+    #   * silver.xref_* (E1)
+    #   * silver.sofascore_player_profile / _season_aggregate (E3) ->
+    #     gold.dim_player_attributes / fct_player_season_stats
+    #   * gold.fct_shot / fct_event / fct_goal / fct_card (E3/E4)
+    #   * silver.transfermarkt_players / capology_player_salaries (TM/Cap Silver)
+    #     -> gold.fct_team_season_stats (squad_market_value_eur /
+    #        total_wage_bill_gbp)
+    #
+    # The Gold DAG itself runs sequentially (max_active_tasks=1) for OOM safety;
+    # same wait/parity policy (failed_states=[], trigger_rule='all_done') as
+    # E1-E4 keeps the daily summary resilient if a Gold CTAS degrades.
+    trigger_fbref_gold = TriggerDagRunOperator(
+        task_id='trigger_fbref_gold',
+        trigger_dag_id='dag_transform_fbref_gold',
+        wait_for_completion=True,
+        poke_interval=30,
+        allowed_states=['success', 'failed'],
+        failed_states=[],
+        reset_dag_run=True,
+        execution_date='{{ ds }}',
+        trigger_rule='all_done',  # Run even if TM/Cap/SoFIFA Silver degraded
+    )
+
     # Check overall pipeline success
     check_success_task = PythonOperator(
         task_id='check_pipeline_success',
@@ -413,4 +461,5 @@ with DAG(
         trigger_silver_transfermarkt,
         trigger_silver_capology,
         trigger_silver_sofifa,
-    ] >> check_success_task >> generate_report_task
+    ] >> trigger_fbref_gold
+    trigger_fbref_gold >> check_success_task >> generate_report_task
