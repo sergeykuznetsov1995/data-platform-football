@@ -20,11 +20,13 @@
 --   iceberg.gold.fct_event           — ~695k rows, 24 SPADL action_canonical
 --                                      enum + outcome_success bool. team_id_canonical
 --                                      is FBref-canonical (resolved via xref_team
---                                      in fct_event.sql). match_id_canonical here
---                                      is the raw whoscored game_id (varchar BIGINT
---                                      — NO 'whoscored_raw_' prefix; the source
---                                      label is in match_id_source column).
---                                      v0_unbridged until E1.5 cutover.
+--                                      in fct_event.sql). match_id_canonical is
+--                                      now the FBref hex slug when the WhoScored
+--                                      game is bridged (E3 Phase B SHIPPED — see
+--                                      fct_event.sql ADR-1: LEFT JOIN silver.xref_match
+--                                      on source='whoscored'). Unbridged games carry
+--                                      an orphan id ('ws_<game_id>') or raw game_id
+--                                      and simply fall out on the spine JOIN.
 --   iceberg.gold.fct_shot            — ~47k rows, situation_canonical +
 --                                      body_part_canonical. match_id_canonical
 --                                      is FBref hex slug (Understat-bridged in
@@ -33,44 +35,25 @@
 --   iceberg.gold.fct_team_match      — spine: one row per (match_id, team_id)
 --                                      with date+season+league. match_id is
 --                                      FBref hex slug.
---   iceberg.bronze.whoscored_schedule— bridge: provides game_id → match_date
---                                      (parsed from start_time ISO-8601 string)
---                                      so we can JOIN whoscored game_id to dim_match
---                                      via (date, league, season) + team identity.
---   iceberg.gold.dim_match           — dim_match.match_id is FBref hex; carries
---                                      home_team_id / away_team_id / date as the
---                                      anchor for cross-source bridging.
 --
 -- =============================================================================
--- ADR — match_id bridging strategy (Option A: dim_match anchor)
+-- ADR — match_id bridging strategy (direct join, post E3 Phase B)
 -- =============================================================================
--- fct_event.match_id_canonical is the raw WhoScored game_id (v0_unbridged per
--- fct_event.sql ADR-1). It does NOT join directly to fct_team_match.match_id
--- (FBref hex slug). We bridge by aggregating events to (game_id, team_id_canonical),
--- then mapping game_id → fbref match_id via:
+-- fct_event.match_id_canonical is already the FBref hex slug (E3 Phase B bridged
+-- WhoScored game_id → FBref via silver.xref_match in fct_event.sql ADR-1). So it
+-- joins DIRECTLY to fct_team_match.match_id with no extra bridging — exactly the
+-- same pattern shot_agg/shot_shares use for fct_shot below.
 --
---   bronze.whoscored_events (game_id, date) → dim_match.match_id
---     ON  dim_match.date = bronze.date
---     AND (game_id-side resolves to team_id_canonical that equals
---          dim_match.home_team_id OR away_team_id for the given fixture)
+-- We aggregate events to (match_id_canonical, team_id_canonical) and feed the
+-- shares straight onto the spine. Unbridged WhoScored games (match_id_canonical
+-- = 'ws_<game_id>' orphan, or raw game_id fallback) do not match any FBref hex
+-- on the spine and drop out via the LEFT JOIN (NULL shares) — acceptable, and
+-- consistent with shot_agg's behaviour for unbridged shots.
 --
--- We keep this lightweight: a `ws_game_dates` CTE that pre-aggregates one row
--- per WhoScored game_id with the kickoff date (MIN to dedup multi-event per
--- game), then a `ws_match_bridge` CTE that JOINs bronze game_id → dim_match
--- via date + team_id_canonical match (we already have team_id_canonical on
--- fct_event side, so single-side identity check is sufficient — a date+team
--- fixture is unique).
---
--- Why not bridge via (date, home_canonical_id, away_canonical_id)?
--- That would require resolving both teams of each WhoScored fixture (two extra
--- xref_team JOINs through the bronze.team_id → name bridge), exactly mirroring
--- fct_event.sql's event_team_names CTE. fct_event already did that work and
--- baked team_id_canonical into the row. We just inherit it — cheaper and
--- consistent with the team identity already shipped in Gold.
---
--- Cutover plan: when E1.5 ships (xref_match adds whoscored→fbref bridge),
--- replace ws_match_bridge with `LEFT JOIN xref_match xm ON xm.source='whoscored'
--- AND xm.source_id = e.match_id_canonical`. Output schema unchanged.
+-- History: a prior version of this file double-bridged match_id_canonical back
+-- through bronze.whoscored_schedule + dim_match by (date, league, season). After
+-- Phase B made match_id_canonical = FBref hex, that bridge silently matched zero
+-- rows and left every event-share column NULL (issue #206).
 --
 -- =============================================================================
 -- ADR — team_id_canonical compatibility
@@ -133,46 +116,15 @@
 
 WITH
 
--- 0) WhoScored game_id → kickoff date (one row per game_id) ------------------
---    bronze.whoscored_schedule stores game_id as BIGINT and start_time as
---    varchar ISO-8601 ('2025-02-23T14:00:00'). Direct CAST AS date fails
---    on the 'T' separator → SUBSTR(start_time, 1, 10) gets the YYYY-MM-DD
---    prefix, which casts cleanly. Schedule has one row per game_id, so no
---    aggregation needed (event-level table fan-out avoided).
-ws_game_dates AS (
-    SELECT
-        CAST(game_id AS varchar)                              AS ws_game_id,
-        league,
-        -- Normalise compact season ('2425') → bigint year-of-start (2024)
-        -- to match dim_match.season=bigint. Mirrors fct_card.sql normalisation.
-        CASE
-            WHEN length(season) = 4
-             AND TRY_CAST(season AS bigint) BETWEEN 2000 AND 2100
-                THEN TRY_CAST(season AS bigint)
-            ELSE 2000 + TRY_CAST(substr(season, 1, 2) AS bigint)
-        END                                                   AS season,
-        CAST(SUBSTR(start_time, 1, 10) AS date)               AS match_date
-    FROM iceberg.bronze.whoscored_schedule
-    WHERE game_id    IS NOT NULL
-      AND start_time IS NOT NULL
-),
-
--- 1) Per (game_id, team_id_canonical) action aggregates ---------------------
+-- 1) Per (match_id, team_id_canonical) action aggregates --------------------
+--    match_id_canonical is already the FBref hex (E3 Phase B), so we group on
+--    it directly — no WhoScored game_id bridge needed (see ADR above).
 --    Filter action_canonical != 'unknown' both for the denominator and every
 --    numerator (R3.D5 semantics — see ADR above).
 event_agg AS (
     SELECT
-        e.match_id_canonical                                  AS ws_game_id,
+        e.match_id_canonical                                  AS match_id,
         e.team_id_canonical                                   AS team_id,
-        e.league                                              AS league,
-        -- fct_event.season is varchar (silver passthrough); normalise to
-        -- bigint year-of-start to match dim_match.season for the bridge JOIN.
-        CASE
-            WHEN length(e.season) = 4
-             AND TRY_CAST(e.season AS bigint) BETWEEN 2000 AND 2100
-                THEN TRY_CAST(e.season AS bigint)
-            ELSE 2000 + TRY_CAST(substr(e.season, 1, 2) AS bigint)
-        END                                                   AS season,
         COUNT(*)                                              AS total_events,
         SUM(CASE WHEN e.action_canonical = 'pass'         THEN 1 ELSE 0 END) AS n_pass,
         SUM(CASE WHEN e.action_canonical = 'dribble'      THEN 1 ELSE 0 END) AS n_dribble,
@@ -186,9 +138,7 @@ event_agg AS (
       AND e.team_id_canonical   IS NOT NULL
     GROUP BY
         e.match_id_canonical,
-        e.team_id_canonical,
-        e.league,
-        e.season
+        e.team_id_canonical
 ),
 
 -- 2) Per (fbref_match_id, team_id) shot-mix aggregates ----------------------
@@ -210,50 +160,24 @@ shot_agg AS (
         s.team_id_canonical
 ),
 
--- 3) WhoScored game_id → FBref match_id bridge (via dim_match) ---------------
---    Anchor on (date, league, season) + identity check that team_id appears
---    on at least one side of the dim_match fixture (home or away). For a
---    single date+league+season+team, a club plays at most one fixture, so
---    the JOIN is 1:1 (modulo orphans, which fall out via NULL).
-ws_match_bridge AS (
-    SELECT
-        ea.ws_game_id,
-        ea.team_id,
-        dm.match_id                                           AS fbref_match_id
-    FROM event_agg ea
-    LEFT JOIN ws_game_dates gd
-        ON  gd.ws_game_id = ea.ws_game_id
-        AND gd.league     = ea.league
-        AND gd.season     = ea.season
-    LEFT JOIN iceberg.gold.dim_match dm
-        ON  dm.date    = gd.match_date
-        AND dm.league  = ea.league
-        AND dm.season  = ea.season
-        AND (dm.home_team_id = ea.team_id OR dm.away_team_id = ea.team_id)
-),
-
--- 4) Per (fbref_match_id, team_id) action shares + success rate -------------
+-- 3) Per (match_id, team_id) action shares + success rate -------------------
+--    match_id is the FBref hex from event_agg; joins directly to the spine
+--    below (mirrors shot_shares from shot_agg).
 event_shares AS (
     SELECT
-        b.fbref_match_id                                      AS match_id,
-        ea.team_id                                            AS team_id,
-        ea.league                                             AS league,
-        ea.season                                             AS season,
-        1.0 * ea.n_pass         / NULLIF(ea.total_events, 0)  AS pass_share,
-        1.0 * ea.n_dribble      / NULLIF(ea.total_events, 0)  AS dribble_share,
-        1.0 * ea.n_tackle       / NULLIF(ea.total_events, 0)  AS tackle_share,
-        1.0 * ea.n_interception / NULLIF(ea.total_events, 0)  AS interception_share,
-        1.0 * ea.n_cross        / NULLIF(ea.total_events, 0)  AS cross_share,
-        1.0 * ea.n_shot         / NULLIF(ea.total_events, 0)  AS shot_share,
-        1.0 * ea.n_success      / NULLIF(ea.total_events, 0)  AS success_rate
-    FROM event_agg ea
-    INNER JOIN ws_match_bridge b
-        ON  b.ws_game_id = ea.ws_game_id
-        AND b.team_id    = ea.team_id
-    WHERE b.fbref_match_id IS NOT NULL
+        match_id,
+        team_id,
+        1.0 * n_pass         / NULLIF(total_events, 0)        AS pass_share,
+        1.0 * n_dribble      / NULLIF(total_events, 0)        AS dribble_share,
+        1.0 * n_tackle       / NULLIF(total_events, 0)        AS tackle_share,
+        1.0 * n_interception / NULLIF(total_events, 0)        AS interception_share,
+        1.0 * n_cross        / NULLIF(total_events, 0)        AS cross_share,
+        1.0 * n_shot         / NULLIF(total_events, 0)        AS shot_share,
+        1.0 * n_success      / NULLIF(total_events, 0)        AS success_rate
+    FROM event_agg
 ),
 
--- 5) Per (fbref_match_id, team_id) shot-mix shares --------------------------
+-- 4) Per (fbref_match_id, team_id) shot-mix shares --------------------------
 shot_shares AS (
     SELECT
         match_id,
@@ -264,7 +188,7 @@ shot_shares AS (
     FROM shot_agg
 ),
 
--- 6) Combine onto fct_team_match spine + assign per-team match_rn ------------
+-- 5) Combine onto fct_team_match spine + assign per-team match_rn ------------
 --    LEFT JOIN keeps every (match_id, team_id) row from the spine even if
 --    we have no events / shots for it (the per-share columns will be NULL,
 --    and the L5 window will see them as NULL — strict point-in-time semantics
@@ -300,7 +224,7 @@ spine AS (
         AND ss.team_id  = tm.team_id
 ),
 
--- 7) Rolling L5 averages (excludes current match) ---------------------------
+-- 6) Rolling L5 averages (excludes current match) ---------------------------
 rolled AS (
     SELECT
         *,
