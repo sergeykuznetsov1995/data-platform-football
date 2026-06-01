@@ -867,10 +867,18 @@ def test_post_cutover_canonical_format_checks_present():
     names = {c.name for c in fmt}
     assert 'canonical_format[dim_player.player_id]' in names
     assert 'canonical_format[fct_player_match.player_id]' in names
+    # issue #46: fct_player_match guards the renamed player_id_canonical column;
+    # dim_player still uses player_id. Expect the regex per check accordingly.
+    expected_predicate = {
+        'canonical_format[dim_player.player_id]':
+            "regexp_like(player_id, '^fb_.+')",
+        'canonical_format[fct_player_match.player_id]':
+            "regexp_like(player_id_canonical, '^fb_.+')",
+    }
     for c in fmt:
         assert c.kind == 'row_count'
         assert c.severity == 'WARNING'
-        assert "regexp_like(player_id, '^fb_.+')" in c.params['where']
+        assert expected_predicate[c.name] in c.params['where']
 
 
 def test_post_cutover_six_checks_total():

@@ -2130,6 +2130,92 @@ def validate_gold_quality() -> Dict[str, Any]:
             )
             for col in FEAT_TEAM_EVENT_STYLE_ROLLING_COLS
         ),
+
+        # ============================================================
+        # E7 / T7: BI dashboard marts — DQ guards complementing the
+        # row_count floors registered in validate_gold_row_counts().
+        # PK uniqueness ERROR + value-range / freshness WARNINGs +
+        # point-in-time leakage guard for mart_scouting_radar.xg_l5.
+        # ============================================================
+
+        # ----- E7: mart_scouting_radar — PK uniqueness — ERROR -----
+        # SQL declares (player_id, season, league, match_id) as PK in the
+        # header, but (player_id, match_id) is the unique tuple — season +
+        # league are passthrough partition keys (one row per appearance).
+        CHECK.no_duplicates('gold.mart_scouting_radar',
+                            pk=['player_id', 'match_id']),
+
+        # ----- E7: mart_scouting_radar — freshness — WARNING -----
+        # `match_date` is a DATE (not a load timestamp): used here as the
+        # most recent fixture played. Threshold = 2 days (48h) accommodates
+        # international breaks while still surfacing parser regressions.
+        CHECK.freshness('gold.mart_scouting_radar', ts_col='match_date',
+                        max_age_hours=48, severity='WARNING'),
+
+        # ----- E7: mart_scouting_radar — value-range — WARNING -----
+        # Single-match xG headroom: penalties are 0.79; legitimate top
+        # outliers (e.g. multiple big chances) rarely exceed 2.5; cap at 5
+        # leaves headroom for unusual matches without flagging real data.
+        CHECK.value_range('gold.mart_scouting_radar', 'xg',
+                          min_val=0, max_val=5, severity='WARNING'),
+        CHECK.value_range('gold.mart_scouting_radar', 'xa',
+                          min_val=0, max_val=5, severity='WARNING'),
+
+        # ----- E7: mart_scouting_radar — point-in-time — ERROR -----
+        # SQL masks xg_l5 / xa_l5 / shots_l5 / defensive_l5 at
+        # appearance_rn > 5 within (player_id, season). Ordered by
+        # (match_date, match_id). Leakage triggers DAG failure before
+        # Gold ships features to BI.
+        CHECK.point_in_time(
+            'gold.mart_scouting_radar',
+            feature_col='xg_l5',
+            partition_by=['player_id', 'season'],
+            order_by='match_date',
+            skip_first_n=5,
+        ),
+
+        # ----- E7: mart_referee_dashboard — PK uniqueness — ERROR -----
+        CHECK.no_duplicates('gold.mart_referee_dashboard',
+                            pk=['referee_id', 'season', 'league']),
+
+        # ----- E7: mart_referee_dashboard — value-range -----
+        # cards_per_match: typical EPL window is 2-5; cap at 15 leaves
+        # headroom for derby outliers. WARNING — a soft heuristic.
+        CHECK.value_range('gold.mart_referee_dashboard', 'cards_per_match',
+                          min_val=0, max_val=15, severity='WARNING'),
+        # home_win_pct is a fraction in [0, 1]. Boundary check is ERROR:
+        # values outside the unit interval indicate an aggregation bug.
+        CHECK.value_range('gold.mart_referee_dashboard', 'home_win_pct',
+                          min_val=0, max_val=1, severity='ERROR'),
+        # matches_officiated >= 1 — a referee-season row only exists if
+        # the ref appeared at least once. Zero or negative would mean an
+        # empty GROUP that survived the LEFT JOIN — definitely a bug.
+        CHECK.value_range('gold.mart_referee_dashboard', 'matches_officiated',
+                          min_val=1, severity='ERROR'),
+
+        # ----- E7: mart_event_heatmap — PK uniqueness — ERROR -----
+        CHECK.no_duplicates(
+            'gold.mart_event_heatmap',
+            pk=['team_id', 'season', 'league', 'zone_x', 'zone_y',
+                'action_canonical'],
+        ),
+
+        # ----- E7: mart_event_heatmap — bin safety — ERROR -----
+        # zone_x / zone_y are SQL-clamped to [0, 11] / [0, 7] via
+        # LEAST/GREATEST. Anything outside means the binning formula
+        # regressed (e.g. divisor change, missing GREATEST). Hard ERROR.
+        CHECK.value_range('gold.mart_event_heatmap', 'zone_x',
+                          min_val=0, max_val=11, severity='ERROR'),
+        CHECK.value_range('gold.mart_event_heatmap', 'zone_y',
+                          min_val=0, max_val=7,  severity='ERROR'),
+        # success_rate is AVG of a boolean cast to double — strictly in
+        # [0, 1]. Boundary breach = aggregation regression.
+        CHECK.value_range('gold.mart_event_heatmap', 'success_rate',
+                          min_val=0, max_val=1, severity='ERROR'),
+        # event_count >= 1 — the GROUP BY guarantees a row only when at
+        # least one event landed in the bin. Zero indicates a bug.
+        CHECK.value_range('gold.mart_event_heatmap', 'event_count',
+                          min_val=1, severity='ERROR'),
     ]
 
     report = run_checks(checks, raise_on_error=False)
