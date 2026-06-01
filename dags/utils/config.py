@@ -61,6 +61,7 @@ SCHEDULES: Dict[str, str] = {
     'dag_ingest_capology': '0 5 * * 1',      # 5:00 UTC Monday (weekly)
     'dag_master_pipeline': '0 14 * * *',     # 14:00 UTC daily
     'dag_transform_fbref_silver': None,     # Trigger only (after ingestion)
+    'dag_transform_fotmob_silver': None,    # Trigger only (after ingestion)
 }
 
 # Minimum row thresholds for validation (per single DagRun = 1 league x 1 season).
