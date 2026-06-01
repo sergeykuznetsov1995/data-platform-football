@@ -4,11 +4,11 @@ FotMob Silver Layer Transformation DAG
 
 Transforms Bronze FotMob data into Silver layer Iceberg tables.
 
-Runs after dag_ingest_fotmob completes (trigger-only, no schedule), но сейчас
-триггерится вручную или master pipeline'ом.
+Runs after dag_ingest_fotmob completes (trigger-only, no schedule):
+dag_ingest_fotmob триггерит его через TriggerDagRunOperator в конце ingest.
 
 Architecture:
-    Triggered manually (или TriggerDagRunOperator from ingest DAG)
+    Triggered by TriggerDagRunOperator from dag_ingest_fotmob
         |
         v
     TaskGroup: silver_transforms (2 tasks SEQUENTIAL, max_active_tasks=1)

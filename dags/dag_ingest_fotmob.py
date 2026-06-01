@@ -31,6 +31,7 @@ from airflow import DAG
 from airflow.exceptions import AirflowException
 from airflow.operators.bash import BashOperator
 from airflow.operators.python import PythonOperator
+from airflow.operators.trigger_dagrun import TriggerDagRunOperator
 
 from utils.config import LEAGUES, CURRENT_SEASON, SCHEDULES, DAG_TAGS
 from utils.default_args import DEFAULT_ARGS
@@ -193,4 +194,11 @@ python dags/scripts/run_fotmob_scraper.py \\
         trigger_rule='all_done',
     )
 
-    scrape_data_task >> validate_data_task
+    trigger_silver = TriggerDagRunOperator(
+        task_id='trigger_silver_transform',
+        trigger_dag_id='dag_transform_fotmob_silver',
+        wait_for_completion=False,
+        reset_dag_run=True,
+    )
+
+    scrape_data_task >> validate_data_task >> trigger_silver
