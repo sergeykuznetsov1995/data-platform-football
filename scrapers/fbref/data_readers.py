@@ -843,16 +843,22 @@ class FBrefDataReaderMixin:
         """
         saved_count = 0
 
+        # 4th element = replace_partitions key. Managers re-parse cleanly on
+        # every re-scrape of a match that lacks player_stats (the skip-source),
+        # so plain append accumulates duplicate (match_id, side) rows (#216).
+        # ['match_id'] gives delete-before-insert idempotency per match without
+        # wiping the rest of the league/season partition. Other tables keep
+        # plain append (None) — out of scope here.
         save_items = [
-            (all_shot_events, 'fbref_shot_events', 'shot_events'),
-            (all_match_events, 'fbref_match_events', 'match_events'),
-            (all_lineups, 'fbref_lineups', 'lineups'),
-            (all_match_team_stats, 'fbref_match_team_stats', 'match_team_stats'),
-            (all_match_player_stats, 'fbref_match_player_stats', 'match_player_stats'),
-            (all_match_managers, 'fbref_match_managers', 'match_managers'),
+            (all_shot_events, 'fbref_shot_events', 'shot_events', None),
+            (all_match_events, 'fbref_match_events', 'match_events', None),
+            (all_lineups, 'fbref_lineups', 'lineups', None),
+            (all_match_team_stats, 'fbref_match_team_stats', 'match_team_stats', None),
+            (all_match_player_stats, 'fbref_match_player_stats', 'match_player_stats', None),
+            (all_match_managers, 'fbref_match_managers', 'match_managers', ['match_id']),
         ]
 
-        for data_list, table_name, result_key in save_items:
+        for data_list, table_name, result_key, replace_keys in save_items:
             if not data_list:
                 continue
 
@@ -862,6 +868,7 @@ class FBrefDataReaderMixin:
                     df=combined_df,
                     table_name=table_name,
                     partition_cols=['league', 'season'],
+                    replace_partitions=replace_keys,
                 )
                 results[result_key] = table_path
                 saved_count += len(combined_df)

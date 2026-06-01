@@ -120,6 +120,9 @@ def _save_batch(scraper, frames: list, label: str) -> None:
     path = scraper.save_to_iceberg(
         df=df, table_name="fbref_match_managers",
         partition_cols=["league", "season"],
+        # delete-before-insert per match_id → idempotent on re-run (#216),
+        # without wiping the rest of the (league, season) partition.
+        replace_partitions=["match_id"],
     )
     logger.info("Batch save %s: %d rows -> %s", label, len(df), path)
     frames.clear()
