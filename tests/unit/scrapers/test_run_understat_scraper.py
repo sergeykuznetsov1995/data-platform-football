@@ -32,7 +32,8 @@ def _build_scraper(*, errors: bool):
 
     Successful path: every read_*() returns an EMPTY DataFrame so the
     runner just skips the corresponding save_to_iceberg() call but does
-    NOT append to errors. ``scrape_player_match_stats`` returns ``{}``.
+    NOT append to errors. ``read_player_match_stats`` returns an empty
+    DataFrame too (the runner checks ``df.empty`` on it).
     """
     scraper = MagicMock()
 
@@ -44,14 +45,14 @@ def _build_scraper(*, errors: bool):
         scraper.read_shot_events.side_effect = _boom
         scraper.read_player_season_stats.side_effect = _boom
         scraper.read_team_match_stats.side_effect = _boom
-        scraper.scrape_player_match_stats.side_effect = _boom
+        scraper.read_player_match_stats.side_effect = _boom
     else:
         empty = pd.DataFrame()
         scraper.read_schedule.return_value = empty
         scraper.read_shot_events.return_value = empty
         scraper.read_player_season_stats.return_value = empty
         scraper.read_team_match_stats.return_value = empty
-        scraper.scrape_player_match_stats.return_value = {}
+        scraper.read_player_match_stats.return_value = empty
 
     scraper.__enter__ = MagicMock(return_value=scraper)
     scraper.__exit__ = MagicMock(return_value=False)
@@ -152,7 +153,7 @@ class TestRunUnderstatExitCode:
         scraper.read_shot_events.side_effect = RuntimeError("HTTP 500")
         scraper.read_player_season_stats.return_value = empty
         scraper.read_team_match_stats.return_value = empty
-        scraper.scrape_player_match_stats.return_value = {}
+        scraper.read_player_match_stats.return_value = empty
         scraper.__enter__ = MagicMock(return_value=scraper)
         scraper.__exit__ = MagicMock(return_value=False)
         scraper_cls = MagicMock(return_value=scraper)

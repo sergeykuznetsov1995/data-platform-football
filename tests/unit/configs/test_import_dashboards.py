@@ -2,11 +2,17 @@
 Unit tests for ``configs/superset/dashboards/*.py`` declarations and
 ``configs/superset/import_dashboards.py`` (E7 / T4).
 
-The dashboard modules import ``Dashboard`` from ``import_dashboards``,
-which itself imports from ``superset.*`` — those packages live only inside
-the Superset container. So on the host we stub the ``superset`` package
-to make the import graph traversable, then assert each dashboard module
-exposes the ``DASHBOARD`` (singular) attribute the importer looks for.
+Two dashboard families coexist:
+  * declarative — module-level ``DASHBOARD`` dataclass picked up by
+    ``import_dashboards._discover_dashboards``;
+  * programmatic — a ``create_dashboard()`` function using real
+    ``superset.*`` models (e.g. ``player_overview.py``).
+
+Both import ``superset.*`` somewhere in their graph — those packages live
+only inside the Superset container. So on the host we stub the ``superset``
+package to make the import graph traversable, then assert each dashboard
+module exposes either a ``DASHBOARD``/``DASHBOARDS`` attribute or a
+``create_dashboard`` callable.
 """
 
 from __future__ import annotations
@@ -52,11 +58,14 @@ def _install_superset_stubs() -> None:
         sys.modules["superset.connectors.sqla.models"] = sqla_models
     # Cover any other lazy submodules referenced at module import time.
     for extra in (
-        "superset.models", "superset.models.dashboard", "superset.models.slice",
+        "superset.models", "superset.models.core",
+        "superset.models.dashboard", "superset.models.slice",
     ):
         if extra not in sys.modules:
             mod = types.ModuleType(extra)
             # Provide common classes used in the importer if it touches them.
+            if extra.endswith("core"):
+                mod.Database = type("Database", (), {})
             if extra.endswith("dashboard"):
                 mod.Dashboard = type("Dashboard", (), {})
             if extra.endswith("slice"):
@@ -107,9 +116,14 @@ def test_dashboards_import() -> None:
         except Exception as exc:
             failures.append(f"{path.name}: import failed → {exc}")
             continue
-        if not (hasattr(mod, "DASHBOARD") or hasattr(mod, "DASHBOARDS")):
+        has_export = (
+            hasattr(mod, "DASHBOARD")
+            or hasattr(mod, "DASHBOARDS")
+            or callable(getattr(mod, "create_dashboard", None))
+        )
+        if not has_export:
             failures.append(
-                f"{path.name}: missing DASHBOARD / DASHBOARDS attribute"
+                f"{path.name}: missing DASHBOARD / DASHBOARDS / create_dashboard"
             )
         else:
             found += 1
