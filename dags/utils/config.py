@@ -65,9 +65,10 @@ SCHEDULES: Dict[str, str] = {
 }
 
 # Minimum row thresholds for validation (per single DagRun = 1 league x 1 season).
-# Consumed by utils.validators.validate_scrape_results, where each task_id maps
-# to a single ingest call. Currently LEAGUES=['ENG-Premier League'] and
-# CURRENT_SEASON is one season, so values below are sized for 1 APL season.
+# Consumed by _validate_table() in dag_ingest_whoscored.py (keys
+# 'whoscored_schedule' + 'whoscored_events'; fail-closed on a missing key, #106).
+# Currently LEAGUES=['ENG-Premier League'] and CURRENT_SEASON is one season, so
+# values below are sized for 1 APL season.
 MIN_ROW_THRESHOLDS: Dict[str, int] = {
     'schedule': 350,        # 380 APL matches/season, allow ~5-10% missing/postponed
     'player_stats': 500,    # ~600-800 unique player-season rows expected, ~25% margin
