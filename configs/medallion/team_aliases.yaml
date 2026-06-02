@@ -528,6 +528,7 @@ teams:
     competition_scope: ["ENG-Premier League"]
 
   - canonical_name: "Huddersfield Town"
+    canonical_id: "huddersfield_town"
     aliases:
       _generic:
         - "Huddersfield Town"
@@ -535,6 +536,7 @@ teams:
     competition_scope: ["ENG-Premier League"]
 
   - canonical_name: "Middlesbrough"
+    canonical_id: "middlesbrough"
     aliases:
       _generic: ["Middlesbrough"]
     competition_scope: ["ENG-Premier League"]
