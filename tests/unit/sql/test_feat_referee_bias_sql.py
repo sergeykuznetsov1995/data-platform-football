@@ -78,6 +78,11 @@ _ICEBERG_TO_LOCAL = {
 def _translate(sql: str) -> str:
     for k, v in _ICEBERG_TO_LOCAL.items():
         sql = sql.replace(k, v)
+    # Trino's NORMALIZE(x, NFD) diacritic-fold (issue #228) has no DuckDB
+    # equivalent — rewrite to strip_accents(x); the following `\p{Mn}+`
+    # REGEXP_REPLACE then matches nothing (harmless no-op).
+    sql = re.sub(r"normalize\((.*?),\s*NFD\)", r"strip_accents(\1)",
+                 sql, flags=re.IGNORECASE)
     sql = _collapse_call(sql, "to_utf8")
     sql = _collapse_call(sql, "to_hex")
     sql = re.sub(r"\bxxhash64\b", "md5", sql, flags=re.IGNORECASE)
