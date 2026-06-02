@@ -843,18 +843,22 @@ class FBrefDataReaderMixin:
         """
         saved_count = 0
 
-        # 4th element = replace_partitions key. Managers re-parse cleanly on
-        # every re-scrape of a match that lacks player_stats (the skip-source),
-        # so plain append accumulates duplicate (match_id, side) rows (#216).
-        # ['match_id'] gives delete-before-insert idempotency per match without
-        # wiping the rest of the league/season partition. Other tables keep
-        # plain append (None) — out of scope here.
+        # 4th element = replace_partitions key. Matches that lack player_stats
+        # (the skip-source) are re-scraped every run; their other parsers
+        # (events/lineups/team_stats) succeed and plain append accumulated
+        # duplicate rows (#231 — lineups/events ~19% bloat, same root as #216).
+        # ['match_id'] deletes that match's old rows before inserting the fresh
+        # full set — idempotent per match without wiping the rest of the
+        # league/season partition (the delete filter only targets match_ids
+        # present in the batch, so a table that fails to parse is left alone).
+        # shot_events stays None: bronze.fbref_shot_events never exists
+        # (FBref Feb-2026 restriction).
         save_items = [
             (all_shot_events, 'fbref_shot_events', 'shot_events', None),
-            (all_match_events, 'fbref_match_events', 'match_events', None),
-            (all_lineups, 'fbref_lineups', 'lineups', None),
-            (all_match_team_stats, 'fbref_match_team_stats', 'match_team_stats', None),
-            (all_match_player_stats, 'fbref_match_player_stats', 'match_player_stats', None),
+            (all_match_events, 'fbref_match_events', 'match_events', ['match_id']),
+            (all_lineups, 'fbref_lineups', 'lineups', ['match_id']),
+            (all_match_team_stats, 'fbref_match_team_stats', 'match_team_stats', ['match_id']),
+            (all_match_player_stats, 'fbref_match_player_stats', 'match_player_stats', ['match_id']),
             (all_match_managers, 'fbref_match_managers', 'match_managers', ['match_id']),
         ]
 
