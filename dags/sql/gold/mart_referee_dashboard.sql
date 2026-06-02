@@ -19,7 +19,9 @@
 
 WITH match_with_ref AS (
     SELECT
-        'ref_' || lower(to_hex(xxhash64(to_utf8(lower(trim(m.referee))))))  AS referee_id,
+        'ref_' || lower(to_hex(xxhash64(to_utf8(
+            regexp_replace(normalize(lower(trim(m.referee)), NFD), '\p{Mn}+', '')
+        ))))                                                                AS referee_id,
         m.match_id,
         m.season,
         m.league,

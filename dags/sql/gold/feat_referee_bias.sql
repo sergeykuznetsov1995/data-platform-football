@@ -13,10 +13,11 @@
 --   iceberg.gold.fct_goal            (penalty + total goal counts per match)
 --
 -- referee_id derivation: inline-hash mirroring dim_referee.sql:40
---   'ref_' || lower(to_hex(xxhash64(to_utf8(lower(trim(referee))))))
--- We do NOT JOIN dim_referee on text — alias drift / cross-locale folding
--- (e.g. "Cakir" vs "Çakır") would silently fan-out. Inline hash guarantees
--- identical referee_id values to dim_referee + survives alias drift.
+--   'ref_' || lower(to_hex(xxhash64(to_utf8(
+--       regexp_replace(normalize(lower(trim(referee)), NFD), '\p{Mn}+', '')))))
+-- We do NOT JOIN dim_referee on text — alias drift would silently fan-out.
+-- The NFD diacritic-fold (issue #228) makes "Cakir" and "Çakır" hash identically
+-- AND keeps this inline hash byte-identical to dim_referee for join consistency.
 --
 -- DAG-integration note: gold_tasks.run_gold_transform() wraps this SELECT in
 -- `CREATE TABLE iceberg.gold.feat_referee_bias AS ... WITH
@@ -31,7 +32,9 @@
 WITH match_with_ref AS (
     -- Spine: matches with a non-empty referee. Inline-hash the referee name.
     SELECT
-        'ref_' || lower(to_hex(xxhash64(to_utf8(lower(trim(m.referee))))))  AS referee_id,
+        'ref_' || lower(to_hex(xxhash64(to_utf8(
+            regexp_replace(normalize(lower(trim(m.referee)), NFD), '\p{Mn}+', '')
+        ))))                                                                AS referee_id,
         m.match_id,
         m.date,
         m.season,

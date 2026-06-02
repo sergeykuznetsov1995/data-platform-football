@@ -17,6 +17,7 @@ cannot translate a Trino-specific construct.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
@@ -37,15 +38,27 @@ def _translate(sql_text: str) -> str:
     contract (``ref_<hex>``) still holds. The hash *value* differs from
     Trino but determinism + uniqueness checks still pass.
     """
-    statements = sqlglot.transpile(sql_text, read="trino", write="duckdb")
-    if not statements:
-        raise RuntimeError("sqlglot transpile produced no output")
-    out = statements[0]
+    # Drop comments (comments=False): the header references "NORMALIZE(NFD)" in
+    # prose, which would otherwise be swallowed by the NORMALIZE→strip_accents
+    # regex below and corrupt the SQL.
+    out = sqlglot.parse_one(sql_text, read="trino").sql(
+        dialect="duckdb", comments=False
+    )
     out = out.replace("iceberg.silver.", "silver.")
     out = out.replace("iceberg.bronze.", "bronze.")
+    # Trino's NORMALIZE(x, NFD) diacritic-fold (issue #228) has no DuckDB
+    # equivalent — rewrite to DuckDB's strip_accents(x). The following
+    # `\p{Mn}+` REGEXP_REPLACE then matches nothing (harmless no-op).
+    out = re.sub(r"NORMALIZE\((.*?),\s*NFD\)", r"strip_accents(\1)", out)
+    # DuckDB lacks XXHASH64; substitute its built-in HASH so the prefix
+    # contract (``ref_<hex>``) still holds. The hash *value* differs from
+    # Trino but determinism + uniqueness checks still pass. After the
+    # NORMALIZE→strip_accents rewrite above the hash input is the folded name.
     out = out.replace(
-        "LOWER(HEX(XXHASH64(ENCODE(LOWER(TRIM(referee_raw))))))",
-        "LOWER(PRINTF('%x', HASH(LOWER(TRIM(referee_raw)))))",
+        "LOWER(HEX(XXHASH64(ENCODE("
+        "REGEXP_REPLACE(strip_accents(LOWER(TRIM(referee_raw))), '\\p{Mn}+', '', 'g')))))",
+        "LOWER(PRINTF('%x', HASH("
+        "REGEXP_REPLACE(strip_accents(LOWER(TRIM(referee_raw))), '\\p{Mn}+', '', 'g'))))",
     )
     return out
 
@@ -72,6 +85,12 @@ def _bootstrap(con) -> None:
         ('Goodison Park',   'ENG-Premier League', 2024, DATE '2024-10-22', 'MIKE DEAN'),
         -- Distinct ref
         ('Camp Nou',        'ESP-La Liga',        2024, DATE '2024-09-22', 'Antonio Mateu Lahoz'),
+        -- Diacritic pair (issue #228): "Müller" and "Muller" must fold to ONE row
+        -- (same referee_id + referee_slug) via NFD + combining-mark strip.
+        -- (ü = u + combining diaeresis, which NFD decomposes; unlike the dotless
+        --  'ı', which has no NFD form and would NOT fold.)
+        ('Allianz Arena',   'GER-Bundesliga',     2024, DATE '2024-09-30', 'Müller'),
+        ('Allianz Arena',   'GER-Bundesliga',     2024, DATE '2024-10-05', 'Muller'),
         -- NULL / empty referees — must be filtered out
         ('Random Stadium',  'ENG-Premier League', 2024, DATE '2024-11-01', NULL),
         ('Random Stadium',  'ENG-Premier League', 2024, DATE '2024-11-02', '   ')
@@ -111,10 +130,12 @@ class TestDimRefereeLogic:
         assert "   " not in canonicals
 
     def test_one_row_per_lower_trim(self, gold_rows):
-        """Mixed-case 'Mike Dean'/'mike dean'/'MIKE DEAN' → 1 row."""
-        # 2 distinct refs after LOWER(TRIM): mike dean + antonio mateu lahoz
-        assert len(gold_rows) == 2, (
-            f"expected 2 rows after dedup, got {len(gold_rows)}: "
+        """Mixed-case 'Mike Dean'/'mike dean'/'MIKE DEAN' → 1 row; the
+        'Çakır'/'Cakir' diacritic pair also folds to 1 row (issue #228)."""
+        # 3 distinct refs after LOWER(TRIM)+diacritic-fold:
+        # mike dean + antonio mateu lahoz + cakir
+        assert len(gold_rows) == 3, (
+            f"expected 3 rows after dedup, got {len(gold_rows)}: "
             f"{[r['referee_canonical'] for r in gold_rows]}"
         )
         canonicals_lower = sorted(r["referee_canonical"].lower() for r in gold_rows)
@@ -167,3 +188,23 @@ class TestDimRefereeLogic:
             f"MIN should return 'MIKE DEAN' (lexicographic min), got "
             f"{mike['referee_canonical']!r}"
         )
+
+    def test_referee_slug_transliterates_diacritics(self, gold_rows):
+        """'Müller'/'Muller' fold to ONE row with an ASCII referee_slug (#228).
+
+        A bare ``[^a-zA-Z0-9]+ -> _`` slug would collapse 'ü' to '_',
+        yielding a different slug per spelling; NORMALIZE(NFD) + ``\\p{Mn}``
+        strip decomposes the accent so both map to 'muller'.
+        """
+        muller = [r for r in gold_rows if r["referee_slug"] == "muller"]
+        assert len(muller) == 1, (
+            f"'Müller'/'Muller' must fold to exactly one row, got "
+            f"{[r['referee_canonical'] for r in gold_rows]}"
+        )
+
+    def test_no_underscore_from_diacritics_in_slug(self, gold_rows):
+        """No referee_slug contains a leading/trailing/double underscore that
+        would betray an un-stripped accent (regression guard for #228)."""
+        for r in gold_rows:
+            slug = r["referee_slug"]
+            assert "__" not in slug, f"double underscore in slug: {slug!r}"

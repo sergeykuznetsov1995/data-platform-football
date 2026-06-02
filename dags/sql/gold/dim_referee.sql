@@ -16,12 +16,16 @@
 -- Hash-PK pattern mirrors entity_xref.sql:346-352 ('mh_<hash>' for MatchHistory).
 -- 'ref_' prefix avoids collision with team / venue namespace.
 --
+-- Diacritic folding (issue #228, same idiom as xref_team.sql.j2 / #215):
+--   Hash key, GROUP BY key and referee_slug all wrap the name in
+--   NORMALIZE(NFD) + REGEXP_REPLACE('\p{Mn}+','') so "Çakır" and "Cakir"
+--   fold to the SAME referee_id / slug. On pure-ASCII names this is a no-op,
+--   so every existing referee_id is unchanged.
+--
 -- KNOWN LIMITATION (R8 follow-up):
---   Hash key is ASCII-folded LOWER(TRIM(name)) — collisions across diacritics
---   are NOT handled. e.g. "Çakır" and "Cakir" hash to *different* venue_ids
---   even though they likely represent the same official. Cross-source name
---   reconciliation (FotMob / WhoScored / SofaScore) is deferred to R8 once a
---   second referee feed lands and a fuzzy-match resolver is justified.
+--   Cross-source name reconciliation (FotMob / WhoScored / SofaScore) — fuzzy
+--   matching of differently-spelled names for one official — is deferred to R8
+--   once a second referee feed lands and a fuzzy-match resolver is justified.
 -- =============================================================================
 
 with referees_raw as (
@@ -37,7 +41,9 @@ with referees_raw as (
 
 aggregated as (
     select
-        'ref_' || lower(to_hex(xxhash64(to_utf8(lower(trim(referee_raw))))))  as referee_id,
+        'ref_' || lower(to_hex(xxhash64(to_utf8(
+            regexp_replace(normalize(lower(trim(referee_raw)), NFD), '\p{Mn}+', '')
+        ))))                                                                  as referee_id,
         min(referee_raw)                                                       as referee_canonical,
         count(*)                                                               as n_matches,
         min(match_date)                                                        as first_seen_date,
@@ -45,7 +51,9 @@ aggregated as (
         array_agg(distinct league)                                             as leagues,
         array_agg(distinct cast(season as integer))                            as seasons
     from referees_raw
-    group by lower(trim(referee_raw))
+    -- Fold diacritics in the dedup key so it matches the hash input above —
+    -- otherwise "Çakır"/"Cakir" form two groups sharing one referee_id (PK dup).
+    group by regexp_replace(normalize(lower(trim(referee_raw)), NFD), '\p{Mn}+', '')
 )
 
 select
@@ -53,7 +61,9 @@ select
     referee_canonical,
     'fbref'                                                                    as referee_source,
     'v1'                                                                       as referee_version,
-    lower(regexp_replace(referee_canonical, '[^a-zA-Z0-9]+', '_'))             as referee_slug,
+    lower(regexp_replace(
+        regexp_replace(normalize(referee_canonical, NFD), '\p{Mn}+', ''),
+        '[^a-zA-Z0-9]+', '_'))                                                as referee_slug,
     n_matches,
     first_seen_date,
     last_seen_date,

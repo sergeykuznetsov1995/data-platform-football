@@ -54,6 +54,19 @@ def test_referee_id_inline_hash(sql_text: str) -> None:
     )
 
 
+def test_referee_id_folds_diacritics(sql_text: str) -> None:
+    """Hash input must NFD-fold diacritics (issue #228) so it stays byte-
+    identical to dim_referee / feat_referee_bias referee_id for "Çakır"/"Cakir".
+    """
+    assert re.search(r"normalize\(\s*lower\s*\(\s*trim\s*\(\s*m\.referee",
+                     sql_text, re.IGNORECASE), (
+        "Expected NORMALIZE(lower(trim(m.referee)), NFD) inside the hash input"
+    )
+    assert r"\p{Mn}" in sql_text, (
+        "Expected `\\p{Mn}` combining-mark strip in the referee_id hash input"
+    )
+
+
 def test_pk_grouping(sql_text: str) -> None:
     """Final GROUP BY must cover the PK + denorm referee_name."""
     pattern = re.compile(
