@@ -206,7 +206,7 @@ def _seed_team_matches(
             succ_so_far += 1 if ok == "TRUE" else 0
             con.execute(
                 f"INSERT INTO gold_fct_event VALUES "
-                f"('{ws_id}', '{team_id}', '{league}', '{season}', "
+                f"('{match_id}', '{team_id}', '{league}', '{season}', "
                 f"'pass', {ok})"
             )
         for k in range(other_per_match):
@@ -214,13 +214,13 @@ def _seed_team_matches(
             succ_so_far += 1 if ok == "TRUE" else 0
             con.execute(
                 f"INSERT INTO gold_fct_event VALUES "
-                f"('{ws_id}', '{team_id}', '{league}', '{season}', "
+                f"('{match_id}', '{team_id}', '{league}', '{season}', "
                 f"'dribble', {ok})"
             )
         for k in range(unknown_per_match):
             con.execute(
                 f"INSERT INTO gold_fct_event VALUES "
-                f"('{ws_id}', '{team_id}', '{league}', '{season}', "
+                f"('{match_id}', '{team_id}', '{league}', '{season}', "
                 f"'unknown', FALSE)"
             )
 
