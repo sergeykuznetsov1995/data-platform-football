@@ -108,7 +108,13 @@ class TestParseRowBlock:
             "'total_gross_gbp': accounting.formatMoney(\"45500000\", \"£ \", 0),"
             "'total_net_gbp': accounting.formatMoney(\"25030000\", \"£ \", 0),"
             "'adjusted_total_gross_gbp': accounting.formatMoney(\"45500000\", \"£ \", 0),"
-            "'adjusted_total_net_gbp': accounting.formatMoney(\"25030000\", \"£ \", 0)"
+            "'adjusted_total_net_gbp': accounting.formatMoney(\"25030000\", \"£ \", 0),"
+            # EUR/USD arrive inline in the same row (probe-confirmed); real
+            # Haaland 2024/25 figures.
+            "'weekly_gross_eur': accounting.formatMoney(\"31857680\"/52, \"€ \", 0),"
+            "'annual_gross_eur': accounting.formatMoney(\"31857680\", \"€ \", 0),"
+            "'weekly_gross_usd': accounting.formatMoney(\"35995050\"/52, \"$ \", 0),"
+            "'annual_gross_usd': accounting.formatMoney(\"35995050\", \"$ \", 0)"
             "}"
         )
 
@@ -132,6 +138,11 @@ class TestParseRowBlock:
         assert row['annual_gross_gbp'] == 27_300_000
         assert row['bonus_gross_gbp'] == 18_200_000
         assert row['total_gross_gbp'] == 45_500_000
+        # EUR/USD parsed from the same row (issue #195), same weekly = //52 rule.
+        assert row['annual_gross_eur'] == 31_857_680
+        assert row['weekly_gross_eur'] == 31_857_680 // 52
+        assert row['annual_gross_usd'] == 35_995_050
+        assert row['weekly_gross_usd'] == 35_995_050 // 52
 
     def test_country_as_image_html(self):
         block = (
@@ -161,6 +172,8 @@ class TestParseRowBlock:
         row = _parse_row_block(block)
         assert row['weekly_gross_gbp'] is None
         assert row['annual_gross_gbp'] is None
+        assert row['annual_gross_eur'] is None
+        assert row['annual_gross_usd'] is None
         assert row['age'] is None
 
 
@@ -193,7 +206,7 @@ class TestConstants:
         assert CAPOLOGY_LEAGUE_MAP['ENG-Premier League'] == 'premier-league'
 
     def test_supported_currencies(self):
-        assert 'GBP' in CAPOLOGY_SUPPORTED_CURRENCIES
+        assert CAPOLOGY_SUPPORTED_CURRENCIES == ('GBP', 'EUR', 'USD')
 
     def test_fallback_marker(self):
         assert R0_2B_FALLBACK_MARKER == 'CAPOLOGY_FALLBACK'

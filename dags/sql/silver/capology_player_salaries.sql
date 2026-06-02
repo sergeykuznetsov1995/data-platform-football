@@ -14,10 +14,12 @@
 --   player_slug, player_name, club_slug, club_name (varchar),
 --   position, status, currency (varchar),
 --   active, loan, verified (boolean),
---   age, weekly_gross_gbp, annual_gross_gbp (integer; salary через accounting.formatMoney),
---   weekly_net_gbp / bonus_* / total_* / adjusted_* / country_code — не переносим,
+--   age, weekly_gross_{gbp,eur,usd}, annual_gross_{gbp,eur,usd} (integer; salary
+--     через accounting.formatMoney — все 3 валюты приходят inline в одной строке),
+--   weekly_net_* / bonus_* / total_* / adjusted_* / country_code — не переносим,
 --   league, season (varchar short-form '2526'), _ingested_at (timestamp).
---   Bronze partitioning = (league, season, currency).
+--   Bronze partitioning = (league, season, currency); валюта остаётся 'GBP' —
+--     EUR/USD живут в отдельных колонках (wide), а не в партициях (issue #195).
 --
 -- Notes:
 --   * (league, season) JOIN predicate против xref_player MANDATORY
@@ -25,8 +27,9 @@
 --   * Filter (active = true OR loan = true) — симметрия с xref_player_resolver
 --     (см. _fetch_capology_players); Bronze несёт ~28% inactive строк
 --     (release/academy/youth) без FBref counterpart, отбрасываем до Silver.
---   * Filter currency = 'GBP' — MVP single-currency; EUR/USD расширение
---     отдельным issue после backfill.
+--   * Filter currency = 'GBP' — партиция всегда 'GBP' (одна строка/игрок);
+--     EUR/USD теперь переносятся как weekly/annual_gross_{eur,usd} колонки
+--     (issue #195), фильтр оставлен как guard против будущих партиций.
 --   * canonical_id остаётся NULLable: Capology orphan rate ≈ 9.5% live APL
 --     2025/26 (50/526, post issue #84 HTML-decode + Bynoe-Gittens alias). Это
 --     STRUCTURAL FLOOR: Capology = roster snapshot (контракты), FBref =
@@ -73,6 +76,10 @@ SELECT
 
     CAST(b.weekly_gross_gbp AS DECIMAL(12,2))           AS weekly_gross_gbp,
     CAST(b.weekly_gross_gbp * 52 AS DECIMAL(14,2))      AS annual_gross_gbp,
+    CAST(b.weekly_gross_eur AS DECIMAL(12,2))           AS weekly_gross_eur,
+    CAST(b.weekly_gross_eur * 52 AS DECIMAL(14,2))      AS annual_gross_eur,
+    CAST(b.weekly_gross_usd AS DECIMAL(12,2))           AS weekly_gross_usd,
+    CAST(b.weekly_gross_usd * 52 AS DECIMAL(14,2))      AS annual_gross_usd,
 
     CAST(b.age AS INTEGER)                              AS age,
     b.status,

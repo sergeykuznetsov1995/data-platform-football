@@ -1585,6 +1585,8 @@ def validate_gold_quality() -> Dict[str, Any]:
                           min_val=0, max_val=5_000_000_000, severity='ERROR'),
         CHECK.value_range('gold.fct_team_season_stats', 'total_wage_bill_gbp',
                           min_val=0, max_val=2_000_000_000, severity='ERROR'),
+        CHECK.value_range('gold.fct_team_season_stats', 'total_wage_bill_eur',
+                          min_val=0, max_val=2_000_000_000, severity='ERROR'),
 
         # ============================================================
         # T6.4 (#94) audit: fct_team_season_stats_audit — cross-source DQ
