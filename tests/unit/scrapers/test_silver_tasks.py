@@ -332,7 +332,7 @@ class TestValidateSilverQuality:
         return mock_conn, mock_cursor
 
     def test_default_check_list_includes_critical_checks(self):
-        """Default Silver check list must include ERROR severity for PK/uniqueness/ref_integrity."""
+        """Default Silver check list: ERROR for PK/uniqueness, WARNING for ref_integrity (#240) / freshness / ranges."""
         mod = _import_silver_tasks()
         checks = mod._build_silver_checks(schema='silver')
 
@@ -343,12 +343,19 @@ class TestValidateSilverQuality:
         assert 'freshness' in kinds
         assert 'value_range' in kinds
 
-        # All PK / uniqueness / ref_integrity checks must be ERROR
+        # PK NULLs / uniqueness must be ERROR — dirty data must not flow to Gold.
         for c in checks:
-            if c.kind in {'no_nulls', 'no_duplicates', 'ref_integrity'}:
+            if c.kind in {'no_nulls', 'no_duplicates'}:
                 assert c.severity == 'ERROR', (
                     f"{c.name} must be ERROR (got {c.severity}) — "
                     f"dirty data must not flow to Gold"
+                )
+            # ref_integrity is WARNING (#240): the fbref match_id orphans are
+            # duplicate alternate-hex scrapes already present in enriched, not
+            # lost matches. Restore to ERROR once upstream hex dedup lands.
+            if c.kind == 'ref_integrity':
+                assert c.severity == 'WARNING', (
+                    f"{c.name} expected WARNING (got {c.severity}) — see #240"
                 )
             if c.kind in {'freshness', 'value_range'}:
                 assert c.severity == 'WARNING', (
