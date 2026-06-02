@@ -218,9 +218,10 @@ class TestBatchSaveMatchDataFallback:
         assert 'match_events' in results
         assert 'match_events_fallback' not in results
 
-    def test_managers_saved_with_match_id_replace_partitions(self):
-        """#216: managers must use replace_partitions=['match_id'] for
-        per-match idempotency; other match tables stay plain append (None)."""
+    def test_match_tables_saved_with_match_id_replace_partitions(self):
+        """#231/#216: every match table must use replace_partitions=['match_id']
+        for per-match idempotency (matches lacking player_stats re-scrape every
+        run). shot_events stays None — bronze.fbref_shot_events never exists."""
         scraper = StubScraper()
         scraper.save_to_iceberg = MagicMock(
             side_effect=lambda df, table_name, **kw: f'iceberg.bronze.{table_name}'
@@ -235,8 +236,10 @@ class TestBatchSaveMatchDataFallback:
         scraper._batch_save_match_data(
             all_shot_events=[],
             all_match_events=[_row(event_type='goal')],
-            all_lineups=[],
+            all_lineups=[_row(player='p1')],
             results={},
+            all_match_team_stats=[_row(possession=55)],
+            all_match_player_stats=[_row(player='p1', goals=1)],
             all_match_managers=[_row(side='home', manager_name='Régis Le Bris')],
         )
 
@@ -244,8 +247,11 @@ class TestBatchSaveMatchDataFallback:
             c.kwargs.get('table_name'): c.kwargs.get('replace_partitions')
             for c in scraper.save_to_iceberg.call_args_list
         }
-        assert by_table['fbref_match_managers'] == ['match_id']
-        assert by_table['fbref_match_events'] is None
+        for table in (
+            'fbref_match_events', 'fbref_lineups', 'fbref_match_team_stats',
+            'fbref_match_player_stats', 'fbref_match_managers',
+        ):
+            assert by_table[table] == ['match_id'], table
 
 
 # ===========================================================================
