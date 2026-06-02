@@ -14,7 +14,7 @@ table:
     - PII.None
 columns:
   - name: team_id
-    description: Канонический ID команды (генерируется entity_xref как нормализованное имя).
+    description: Канонический ID команды (нормализованное имя из silver.xref_team).
   - name: team_name
     description: Полное имя команды как в источнике (например 'Manchester United').
   - name: league

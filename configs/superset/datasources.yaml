@@ -45,17 +45,8 @@ databases:
     tables:
 
       # -----------------------------------------------------------------------
-      # Cross-reference / dimensions
+      # Dimensions
       # -----------------------------------------------------------------------
-      - table_name: entity_xref
-        schema: gold
-        description: |
-          Кросс-референс внешних ID источников к каноническим ID платформы.
-          Используется как "клей" между источниками (FBref, Understat и т.д.).
-          Источник истины для team_id, player_id, match_id в Gold-слое.
-        default_endpoint: null
-        cache_timeout: 1800
-
       - table_name: dim_team
         schema: gold
         description: |

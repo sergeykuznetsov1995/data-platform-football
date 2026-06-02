@@ -38,13 +38,6 @@ Trigger model
 INDEPENDENT of FBref Silver: re-running this DAG does not require the
 existing fbref Silver to be fresh.
 
-Dual-run policy
----------------
-Gold ``entity_xref`` DAG-task remains in place (see
-``dag_transform_fbref_gold.py``). For ≥3 days both will run side-by-side
-and a parity validator (T6) will diff the canonical-id columns. Only after
-parity is green will Gold dims be re-pointed at ``silver.xref_*``.
-
 Notes for maintainers
 ---------------------
 * xref_team is a Jinja template (``.sql.j2``); team-alias VALUES are
@@ -194,7 +187,7 @@ def _run_xref_player(**context) -> Dict[str, Any]:
     the known-pair regression check (10/10 APL anchors) drops below 8/10
     — that aborts the DAG before partial data lands.
 
-    Summary dict is pushed to XCom for the downstream parity check (T6)
+    Summary dict is pushed to XCom for the downstream DQ check (T6)
     to consume.
     """
     from utils.xref_player_resolver import run_resolver
@@ -213,21 +206,17 @@ def _run_xref_player(**context) -> Dict[str, Any]:
 
 
 def _validate_xref(**context) -> Dict[str, Any]:
-    """Run extended DQ + dual-run parity for the 5 xref tables (T6).
+    """Run extended DQ for the 5 xref tables (T6).
 
     Phase 1 — standard DQ via :mod:`utils.xref_dq.build_all_xref_checks`
     Phase 2 — orphan-rate per source for xref_team / xref_player
               (synthetic CheckResults appended to the report)
-    Phase 3 — dual-run parity Silver vs legacy gold.entity_xref
-              (informational; does NOT raise; surfaced via XCom + Telegram)
 
     Severity model:
       * Phase 1 ERROR-checks raise ``AirflowException``.
       * Phase 2 orphan-rate ERROR (>25% in any source) raises.
-      * Phase 3 parity diffs NEVER raise (E1 dual-run policy ≥3 days).
 
     XCom outputs:
-      * key=``parity_summary`` — dict {team, match, player → diff metrics}
       * key=``orphan_rates``    — dict {team, player → per-source verdicts}
       * key=``orphan_teams``    — dict {total_orphans, per_source, rows} (issue #141)
     """
@@ -239,10 +228,6 @@ def _validate_xref(**context) -> Dict[str, Any]:
         build_all_xref_checks,
         evaluate_bronze_xref_freshness_gap,
         evaluate_orphan_rate_per_source,
-        maybe_alert_parity,
-        parity_check_xref_match_vs_gold,
-        parity_check_xref_player_vs_gold,
-        parity_check_xref_team_vs_gold,
         report_orphan_teams,
     )
 
@@ -357,7 +342,7 @@ def _validate_xref(**context) -> Dict[str, Any]:
     telegram_dq_summary(report, header="Silver xref DQ (E1)")
 
     # ------------------------------------------------------------------
-    # Phase 1 + 2 + 2.5 ERROR escalation (raise BEFORE parity)
+    # Phase 1 + 2 + 2.5 ERROR escalation
     # ------------------------------------------------------------------
     if report.errors:
         raise AirflowException(
@@ -368,35 +353,11 @@ def _validate_xref(**context) -> Dict[str, Any]:
             )
         )
 
-    # ------------------------------------------------------------------
-    # Phase 3 — dual-run parity (informational; does NOT raise)
-    # ------------------------------------------------------------------
-    try:
-        parity_summary = {
-            'team':   parity_check_xref_team_vs_gold(),
-            'match':  parity_check_xref_match_vs_gold(),
-            'player': parity_check_xref_player_vs_gold(),
-        }
-    except Exception as e:
-        logger.exception("dual-run parity check failed; not blocking the DAG")
-        parity_summary = {'error': str(e)}
-
-    context['ti'].xcom_push(key='parity_summary', value=parity_summary)
-
-    # Telegram alert ONLY when significant diff detected (≥100 rows)
-    try:
-        alerted = maybe_alert_parity(parity_summary, diff_threshold=100)
-        if alerted:
-            logger.warning("Dual-run parity alert sent to Telegram")
-    except Exception as e:
-        logger.warning("parity Telegram alert swallowed: %s", e)
-
     return {
         'passed': len(report.passed),
         'total': len(report.results),
         'errors': [r.name for r in report.errors],
         'warnings': [r.name for r in report.warnings],
-        'parity_summary': parity_summary,
         'orphan_rates': orphan_rates,
     }
 

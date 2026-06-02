@@ -6,7 +6,7 @@ table:
   description: |
     Snapshot турнирной таблицы из SofaScore (post-deduction points; учёт
     очковых санкций deferred до R7). PK = (league, season, team_id).
-    team_id резолвится через entity_xref в canonical FBref-id, либо
+    team_id резолвится через silver.xref_team в canonical FBref-id, либо
     помечается как orphan ('ss_<slug>') если нет соответствия — поле
     team_id_source служит lineage-маркером для downstream-логики.
   tags:
