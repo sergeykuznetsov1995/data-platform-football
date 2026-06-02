@@ -115,15 +115,26 @@ def run_silver_transform(
     add_timestamp: bool = True,
 ) -> Dict[str, Any]:
     """
-    Execute a Silver-layer transformation: DROP existing table + CTAS.
+    Execute a Silver-layer transformation via an atomic swap (#191).
+
+    Builds a fresh ``{table_name}_new`` staging table, then swaps it into
+    place with a metadata-only RENAME. A transient SELECT failure leaves the
+    EXISTING table untouched (the old DROP-then-CREATE flow left it deleted —
+    that is how #180 lost ``gold.dim_player_attributes``).
 
     Steps:
         1. Read the SELECT query from the SQL file
         2. CREATE SCHEMA IF NOT EXISTS iceberg.{schema}
-        3. DROP TABLE IF EXISTS iceberg.{schema}.{table_name}
-        4. CREATE TABLE iceberg.{schema}.{table_name}
+        3. DROP TABLE IF EXISTS iceberg.{schema}.{table_name}_new (stale staging)
+        4. CREATE TABLE iceberg.{schema}.{table_name}_new
            WITH (partitioning = ARRAY['league', 'season']) AS {sql}
-        5. Log the resulting row count
+        5. DROP TABLE IF EXISTS iceberg.{schema}.{table_name} (old) — only
+           reached after the staging CTAS succeeds
+        6. ALTER TABLE ..._new RENAME TO iceberg.{schema}.{table_name}
+        7. Log the resulting row count
+
+    On failure the staging table is best-effort dropped; the live table is
+    never touched before the staging CTAS succeeds.
 
     Args:
         sql_file: Path to SQL file containing the SELECT query.
@@ -152,10 +163,12 @@ def run_silver_transform(
     _validate_identifier(catalog, "catalog")
     _validate_identifier(schema, "schema")
     _validate_identifier(table_name, "table")
+    _validate_identifier(f"{table_name}_new", "staging table")
     for pc in partition_columns:
         _validate_identifier(pc, "partition column")
 
     full_table = f"{catalog}.{schema}.{table_name}"
+    staging_full = f"{catalog}.{schema}.{table_name}_new"
     result = {
         'table': full_table,
         'rows': 0,
@@ -183,11 +196,14 @@ def run_silver_transform(
         _execute(conn, f"CREATE SCHEMA IF NOT EXISTS {catalog}.{schema}")
         logger.info(f"Schema ensured: {catalog}.{schema}")
 
-        # --- 4. DROP TABLE IF EXISTS ---
-        logger.info(f"Dropping table if exists: {full_table}")
-        _execute(conn, f"DROP TABLE IF EXISTS {full_table}")
+        # --- 4. DROP stale staging table (from a prior failed run) ---
+        logger.info(f"Dropping stale staging table if exists: {staging_full}")
+        _execute(conn, f"DROP TABLE IF EXISTS {staging_full}")
 
-        # --- 5. CREATE TABLE AS SELECT ---
+        # --- 5. CREATE staging TABLE AS SELECT ---
+        # Atomic swap (#191): build a fresh {table}_new, then RENAME it into
+        # place. The live table is dropped ONLY after this CTAS succeeds, so a
+        # transient SELECT failure leaves the existing table intact.
         partition_clause = ''
         if partition_columns:
             cols = ", ".join(f"'{c}'" for c in partition_columns)
@@ -198,7 +214,7 @@ def run_silver_transform(
         # DUPLICATE_COLUMN_NAME. Such callers pass add_timestamp=False.
         if add_timestamp:
             ctas_sql = (
-                f"CREATE TABLE {full_table}\n"
+                f"CREATE TABLE {staging_full}\n"
                 f"{partition_clause}"
                 f"AS\n"
                 f"SELECT *, CURRENT_TIMESTAMP AS _silver_created_at\n"
@@ -208,16 +224,25 @@ def run_silver_transform(
             )
         else:
             ctas_sql = (
-                f"CREATE TABLE {full_table}\n"
+                f"CREATE TABLE {staging_full}\n"
                 f"{partition_clause}"
                 f"AS\n"
                 f"{select_sql}"
             )
 
-        logger.info(f"Executing CTAS for {full_table} ...")
+        logger.info(f"Executing CTAS for staging {staging_full} ...")
         _execute(conn, ctas_sql)
 
-        # --- 6. Count rows ---
+        # --- 6. Atomic swap: drop old, rename staging into place ---
+        # Partitioning lives on the staging table and survives RENAME (metadata
+        # only). RENAME also avoids the ICEBERG_COMMIT_ERROR class seen with
+        # ALTER DROP COLUMN on schema-evolved tables — each rebuild is a fresh
+        # table with clean manifests.
+        logger.info(f"Swapping staging into place: {staging_full} -> {full_table}")
+        _execute(conn, f"DROP TABLE IF EXISTS {full_table}")
+        _execute(conn, f"ALTER TABLE {staging_full} RENAME TO {full_table}")
+
+        # --- 7. Count rows ---
         count_result = _execute(
             conn,
             f"SELECT COUNT(*) FROM {full_table}",
@@ -230,6 +255,12 @@ def run_silver_transform(
         logger.info(f"Silver transform complete: {full_table} => {row_count} rows")
 
     except Exception as e:
+        # Best-effort staging cleanup; the live table is already safe because
+        # we only drop it AFTER the staging CTAS succeeds (#191).
+        try:
+            _execute(conn, f"DROP TABLE IF EXISTS {staging_full}")
+        except Exception:
+            pass
         result['status'] = 'failed'
         result['error'] = str(e)
         logger.error(f"Silver transform FAILED for {full_table}: {e}")
