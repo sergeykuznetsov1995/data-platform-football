@@ -60,14 +60,14 @@ N_SEASONS_WINDOW = 5
 def _slug(s: str) -> str:
     """Strip diacritics + lowercase + non-alnum -> '_' + collapse runs + strip edges.
 
-    Matches the convention used by entity_xref orphan IDs ('ss_<slug>') so
+    Matches the convention used by xref orphan IDs ('ss_<slug>') so
     canonical_id formatting stays consistent across Gold tables.
 
     NFD decomposes accented chars ("ü" -> "u" + combining mark); we drop the
     combining marks (Unicode category 'Mn') before the non-alnum collapse, so a
     competition name with/without accents maps to one slug (issue #215). This is
     the Python mirror of the NORMALIZE(NFD) + `\\p{Mn}+` idiom in the SQL
-    normalizers (xref_team.sql.j2, xref_referee.sql, entity_xref.sql).
+    normalizers (xref_team.sql.j2, xref_referee.sql).
     """
     s = ''.join(c for c in unicodedata.normalize('NFD', s)
                 if unicodedata.category(c) != 'Mn')
