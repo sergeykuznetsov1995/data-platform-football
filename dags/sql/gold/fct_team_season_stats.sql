@@ -171,14 +171,16 @@ tm_finance AS (
     GROUP BY current_club_name, league, season
 ),
 
--- Wage bill: SUM годового gross-фонда (GBP). Silver уже отфильтрован
--- (active OR loan) + currency='GBP'; annual_gross_gbp = weekly_gross_gbp * 52.
+-- Wage bill: SUM годового gross-фонда (GBP + EUR для кросс-валютной сопоставимости
+-- со squad_market_value_eur, issue #195). Silver уже отфильтрован (active OR loan)
+-- + currency='GBP'; annual_gross_{gbp,eur} = weekly_gross_{gbp,eur} * 52.
 cap_finance AS (
     SELECT
         club_name                                         AS cap_club_name,
         league,
         season                                            AS season_slug,
-        CAST(SUM(annual_gross_gbp) AS BIGINT)             AS total_wage_bill_gbp
+        CAST(SUM(annual_gross_gbp) AS BIGINT)             AS total_wage_bill_gbp,
+        CAST(SUM(annual_gross_eur) AS BIGINT)             AS total_wage_bill_eur
     FROM iceberg.silver.capology_player_salaries
     WHERE annual_gross_gbp IS NOT NULL
     GROUP BY club_name, league, season
@@ -310,6 +312,7 @@ SELECT
     -- ========= TEAM FINANCE (issue #192) — APL 2025/26 only, else NULL =========
     tmf.squad_market_value_eur,
     capf.total_wage_bill_gbp,
+    capf.total_wage_bill_eur,
 
     -- ========= Lineage =========
     CURRENT_TIMESTAMP                                     AS _gold_created_at

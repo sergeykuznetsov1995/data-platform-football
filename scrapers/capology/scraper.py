@@ -52,7 +52,20 @@ CAPOLOGY_LEAGUE_MAP: Dict[str, str] = {
     'ENG-Premier League': 'premier-league',
 }
 
-CAPOLOGY_SUPPORTED_CURRENCIES = ('GBP',)
+CAPOLOGY_SUPPORTED_CURRENCIES = ('GBP', 'EUR', 'USD')
+
+# All three currencies arrive inline in the same `var data = [...]` row as
+# `{base}_{gbp,eur,usd}` keys (probe-confirmed) — no extra HTTP. We extract the
+# full symmetric set so the Bronze schema stays inspectable and stays one row
+# per player (wide columns, currency partition stays 'GBP').
+CAPOLOGY_MONEY_BASES = (
+    'weekly_gross', 'annual_gross',
+    'weekly_net', 'annual_net',
+    'bonus_gross', 'bonus_net',
+    'total_gross', 'total_net',
+    'adjusted_total_gross', 'adjusted_total_net',
+)
+CAPOLOGY_MONEY_CURRENCIES = ('gbp', 'eur', 'usd')
 
 R0_2B_FALLBACK_MARKER = 'CAPOLOGY_FALLBACK'
 
@@ -237,33 +250,30 @@ def _parse_row_block(block: str) -> Optional[Dict]:
             continue
         out[key] = m.group(1).strip('"').lower() == 'true'
 
-    # Salary fields — currently MVP scope = GBP only, but we extract
-    # whatever GBP variants exist so the schema stays inspectable.
-    for field in (
-        'weekly_gross_gbp', 'annual_gross_gbp',
-        'weekly_net_gbp', 'annual_net_gbp',
-        'bonus_gross_gbp', 'bonus_net_gbp',
-        'total_gross_gbp', 'total_net_gbp',
-        'adjusted_total_gross_gbp', 'adjusted_total_net_gbp',
-    ):
-        m = re.search(
-            rf"'{field}'\s*:\s*accounting\.formatMoney\(\s*\"?(\-?[\d.]+)",
-            block,
-        )
-        if m:
-            raw = m.group(1)
-            try:
-                # Some fields are wrapped in a divide expression
-                # (e.g. ``"27300000"/52``) — the value we capture is
-                # already the dividend, so floor-divide by 52 for weekly.
-                if field.startswith('weekly_'):
-                    out[field] = int(float(raw)) // 52
-                else:
-                    out[field] = int(float(raw))
-            except (TypeError, ValueError):
+    # Salary fields — all three currencies (GBP/EUR/USD) arrive inline in the
+    # same row as `{base}_{gbp,eur,usd}` keys, so we extract the full symmetric
+    # set in one pass (no extra HTTP). Currency partition still tags 'GBP'.
+    for base in CAPOLOGY_MONEY_BASES:
+        for ccy in CAPOLOGY_MONEY_CURRENCIES:
+            field = f'{base}_{ccy}'
+            m = re.search(
+                rf"'{field}'\s*:\s*accounting\.formatMoney\(\s*\"?(\-?[\d.]+)",
+                block,
+            )
+            if m:
+                raw = m.group(1)
+                try:
+                    # Some fields are wrapped in a divide expression
+                    # (e.g. ``"27300000"/52``) — the value we capture is
+                    # already the dividend, so floor-divide by 52 for weekly.
+                    if base.startswith('weekly_'):
+                        out[field] = int(float(raw)) // 52
+                    else:
+                        out[field] = int(float(raw))
+                except (TypeError, ValueError):
+                    out[field] = None
+            else:
                 out[field] = None
-        else:
-            out[field] = None
 
     return out
 
@@ -465,15 +475,16 @@ class CapologyScraper(BaseScraper):
         limit: Optional[int] = None,
     ) -> pd.DataFrame:
         currency = (currency or self.currency).upper()
+        money_cols = [
+            f'{base}_{ccy}'
+            for base in CAPOLOGY_MONEY_BASES
+            for ccy in CAPOLOGY_MONEY_CURRENCIES
+        ]
         anchor_cols = [
             'player_slug', 'player_name', 'club_slug', 'club_name',
             'country_code', 'age', 'position', 'status',
             'active', 'loan', 'verified',
-            'weekly_gross_gbp', 'annual_gross_gbp',
-            'weekly_net_gbp', 'annual_net_gbp',
-            'bonus_gross_gbp', 'bonus_net_gbp',
-            'total_gross_gbp', 'total_net_gbp',
-            'adjusted_total_gross_gbp', 'adjusted_total_net_gbp',
+            *money_cols,
             'currency', 'league', 'season',
         ]
 
