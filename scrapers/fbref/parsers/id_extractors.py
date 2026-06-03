@@ -213,83 +213,77 @@ def extract_team_ids_from_table(
 
 
 def extract_match_urls_from_schedule(
-    soup: BeautifulSoup,
-    comment_tables: Optional[Dict[str, BeautifulSoup]] = None,
-    season_str: str = None,
-    comp_id: str = None,
+    table: BeautifulSoup,
 ) -> Dict[int, str]:
     """
-    Extract match URLs from schedule table HTML.
+    Extract match URLs from schedule table rows by parsing match-report links.
 
     FBref schedule tables have links like:
     <td><a href="/en/matches/abc123/...">Match Report</a></td>
 
-    pandas.read_html() extracts text, not href URLs. This function
-    extracts the href URLs to enable match_id extraction.
+    pandas.read_html() extracts text, not href URLs. This function extracts
+    the href URLs to enable match_id extraction.
+
+    The returned index corresponds to the row position in the DataFrame that
+    pandas.read_html() produces for this table — every <tr> in <tbody>/<tfoot>
+    is counted (spacer and repeated-header rows included, since pd.read_html
+    keeps them), NOT the raw whole-table <tr> index. Callers must map the
+    result onto the DataFrame BEFORE any row filtering / reset_index.
 
     Args:
-        soup: BeautifulSoup object
-        comment_tables: Tables extracted from comments
-        season_str: Season string (e.g., "2024-2025")
-        comp_id: Competition ID
+        table: BeautifulSoup table element
 
     Returns:
-        Dictionary mapping row index to match URL
+        Dictionary mapping DataFrame row index to match URL.
     """
     match_urls = {}
 
-    # Find schedule table
-    table_ids = [
-        'sched_all',
-        'sched_ks_all',
-    ]
-    if season_str and comp_id:
-        table_ids.insert(0, f'sched_{season_str}_{comp_id}_1')
-
-    table = None
-    for table_id in table_ids:
-        table = soup.find('table', id=table_id)
-        if table is None and comment_tables:
-            table = comment_tables.get(table_id)
-        if table is not None:
-            break
-
-    # Try finding any table with 'sched' in ID
     if table is None:
-        all_tables = soup.find_all(
-            'table',
-            id=lambda x: x and 'sched' in x.lower()
-        )
-        if all_tables:
-            table = all_tables[0]
-
-    if table is None:
-        logger.warning("No schedule table found for match URL extraction")
         return match_urls
-
-    # Extract URLs from table rows
-    tbody = table.find('tbody')
-    if tbody is None:
-        tbody = table
 
     # Match ID pattern: 8-character hex hash after /matches/
     match_id_pattern = re.compile(r'/matches/([a-f0-9]{8})/')
 
-    for idx, row in enumerate(tbody.find_all('tr')):
-        # Look for "Match Report" links (not date links like /matches/2024-08-16)
-        for link in row.find_all('a', href=True):
-            href = link['href']
-            link_text = link.get_text(strip=True)
+    # pd.read_html keeps EVERY <tr> inside <tbody>/<tfoot> (spacer and inline
+    # repeated-header rows included, as NaN/text rows), uses <thead> only for
+    # column names, and appends <tfoot> rows after the <tbody> rows. To keep
+    # data_row_idx aligned 1:1 with the resulting DataFrame index, count every
+    # such row — do NOT skip spacer/header rows; they simply carry no match
+    # link and map to nothing. (Misaligning these is the root cause of #241.)
+    sections = list(table.find_all('tbody'))
+    tfoot = table.find('tfoot')
+    if tfoot:
+        sections.append(tfoot)
 
-            # Priority 1: Link with "Match Report" text
-            if 'Match Report' in link_text and '/matches/' in href:
-                match_urls[idx] = href
-                break
+    if not sections:
+        sections = [table]
 
-            # Priority 2: Link with match ID hash (not date)
-            if match_id_pattern.search(href):
-                match_urls[idx] = href
-                break
+    data_row_idx = 0
 
-    logger.debug(f"Extracted {len(match_urls)} match URLs from schedule")
+    for section in sections:
+        for row in section.find_all('tr'):
+            # Look for "Match Report" links (not date links like
+            # /matches/2024-08-16). Spacer / repeated-header / future rows
+            # carry no such link and stay absent from the map.
+            for link in row.find_all('a', href=True):
+                href = link['href']
+                link_text = link.get_text(strip=True)
+
+                # Priority 1: Link with "Match Report" text
+                if 'Match Report' in link_text and '/matches/' in href:
+                    match_urls[data_row_idx] = href
+                    break
+
+                # Priority 2: Link with match ID hash (not date)
+                if match_id_pattern.search(href):
+                    match_urls[data_row_idx] = href
+                    break
+
+            data_row_idx += 1
+
+    if match_urls:
+        logger.debug(
+            f"Extracted {len(match_urls)} match URLs from {data_row_idx} rows"
+        )
+
     return match_urls

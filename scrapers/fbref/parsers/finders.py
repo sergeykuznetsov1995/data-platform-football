@@ -54,7 +54,7 @@ def find_schedule_table(
 
     df = None
     for table_id in table_ids:
-        df = parse_table(soup, table_id, comment_tables)
+        df = parse_table(soup, table_id, comment_tables, extract_match_urls=True)
         if df is not None and not df.empty:
             return df
 
@@ -65,7 +65,7 @@ def find_schedule_table(
     )
     for table in all_tables:
         table_id = table.get('id')
-        df = parse_table(soup, table_id, comment_tables)
+        df = parse_table(soup, table_id, comment_tables, extract_match_urls=True)
         if df is not None and not df.empty:
             logger.debug(f"Found schedule table: {table_id}")
             return df
@@ -73,7 +73,7 @@ def find_schedule_table(
     # Try parsing any table with 'sched' in ID from comments
     for key in comment_tables.keys():
         if 'sched' in key.lower():
-            df = parse_table(soup, key, comment_tables)
+            df = parse_table(soup, key, comment_tables, extract_match_urls=True)
             if df is not None and not df.empty:
                 return df
 

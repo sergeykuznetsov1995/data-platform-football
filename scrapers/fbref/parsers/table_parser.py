@@ -17,6 +17,7 @@ import pandas as pd
 from bs4 import BeautifulSoup, Comment
 
 from scrapers.fbref.parsers.id_extractors import (
+    extract_match_urls_from_schedule,
     extract_player_ids_from_table,
     extract_team_ids_from_table,
 )
@@ -317,6 +318,7 @@ def parse_table(
     comment_tables: Optional[Dict[str, BeautifulSoup]] = None,
     extract_player_ids: bool = False,
     extract_team_ids: bool = False,
+    extract_match_urls: bool = False,
 ) -> Optional[pd.DataFrame]:
     """
     Parse HTML table to DataFrame.
@@ -329,6 +331,8 @@ def parse_table(
                            and add as a column to the DataFrame
         extract_team_ids: If True, extract team_id from squad links
                          and add as a column to the DataFrame
+        extract_match_urls: If True, extract match-report URLs from schedule
+                           rows and add as a 'match_url' column
 
     Returns:
         DataFrame or None
@@ -353,6 +357,11 @@ def parse_table(
     team_ids_map = {}
     if extract_team_ids:
         team_ids_map = extract_team_ids_from_table(table)
+
+    # Extract match URLs before parsing with pandas (if requested)
+    match_urls_map = {}
+    if extract_match_urls:
+        match_urls_map = extract_match_urls_from_schedule(table)
 
     try:
         # Parse table with pandas (use lxml flavor for compatibility with bs4 4.13+)
@@ -390,6 +399,20 @@ def parse_table(
                 logger.debug(
                     f"Added team_id column: "
                     f"{df['team_id'].notna().sum()}/{len(df)} rows have IDs"
+                )
+
+            # Add match_url column BEFORE filtering (indices must match original
+            # HTML rows). pd.read_html loses href attributes, so the URLs are
+            # mapped back here while the index is still aligned with the raw
+            # rows — doing it after the 'Home'=='Home' filter / reset_index
+            # would misalign URLs onto the wrong fixtures (issue #241).
+            if extract_match_urls and match_urls_map:
+                df['match_url'] = df.index.map(
+                    lambda idx: match_urls_map.get(idx)
+                )
+                logger.debug(
+                    f"Added match_url column: "
+                    f"{df['match_url'].notna().sum()}/{len(df)} rows have URLs"
                 )
 
             # Remove header rows repeated inside tbody (where Player == 'Player')
