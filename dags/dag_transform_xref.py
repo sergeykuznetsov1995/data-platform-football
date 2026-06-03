@@ -79,11 +79,8 @@ PURE_SQL_XREF_TRANSFORMS = [
         'dags/sql/silver/xref_match.sql',
         'xref_match',
     ),
-    (
-        'xref_referee',
-        'dags/sql/silver/xref_referee.sql',
-        'xref_referee',
-    ),
+    # xref_referee moved to a dedicated Jinja-template callable (_run_xref_referee,
+    # issue #143) — it now embeds referee_aliases.yaml like xref_team.
     (
         'xref_manager',
         'dags/sql/silver/xref_manager.sql',
@@ -148,6 +145,63 @@ def _run_xref_team(**context) -> Dict[str, Any]:
         )
         logger.info(
             "xref_team CTAS complete: %d rows in %s",
+            result.get('rows', 0),
+            result.get('table'),
+        )
+        return result
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError as e:
+            logger.warning("Failed to cleanup temp file %s: %s", tmp_path, e)
+
+
+def _run_xref_referee(**context) -> Dict[str, Any]:
+    """Render the xref_referee Jinja template and run it as a Silver CTAS.
+
+    Mirror of :func:`_run_xref_team` (issue #143): embeds the curated
+    referee_aliases.yaml as inline VALUES so FBref "Michael Oliver" and
+    MatchHistory "M Oliver" resolve to one ``ref_<slug>`` canonical_id without
+    fuzzy matching. The tempfile is removed in ``finally`` regardless of CTAS
+    outcome to avoid leaking files in the scheduler's /tmp.
+    """
+    from pathlib import Path
+
+    from utils.medallion_config import (
+        get_referee_alias_sql_values,
+        render_sql_template,
+    )
+    from utils.silver_tasks import run_silver_transform
+
+    template_path = Path('/opt/airflow/dags/sql/silver/xref_referee.sql.j2')
+    if not template_path.exists():
+        raise FileNotFoundError(f"xref_referee template not found: {template_path}")
+
+    rendered_sql = render_sql_template(
+        template_path,
+        referee_aliases_values_sql=get_referee_alias_sql_values(
+            with_canonical_id=True, with_league=True
+        ),
+    )
+    logger.info("Rendered xref_referee.sql.j2 — %d chars", len(rendered_sql))
+
+    with tempfile.NamedTemporaryFile(
+        mode='w',
+        suffix='_xref_referee.sql',
+        delete=False,
+        encoding='utf-8',
+    ) as tmp:
+        tmp.write(rendered_sql)
+        tmp_path = tmp.name
+
+    try:
+        result = run_silver_transform(
+            sql_file=tmp_path,
+            table_name='xref_referee',
+            schema='silver',
+        )
+        logger.info(
+            "xref_referee CTAS complete: %d rows in %s",
             result.get('rows', 0),
             result.get('table'),
         )
@@ -243,15 +297,18 @@ def _validate_xref(**context) -> Dict[str, Any]:
     # Phase 2 — orphan-rate per source (team + player)
     # ------------------------------------------------------------------
     orphan_rates: Dict[str, Any] = {}
-    for entity, table in (
-        ('team', 'iceberg.silver.xref_team'),
-        ('player', 'iceberg.silver.xref_player'),
+    for entity, table, warn_t, err_t in (
+        ('team', 'iceberg.silver.xref_team', 10.0, 25.0),
+        ('player', 'iceberg.silver.xref_player', 10.0, 25.0),
+        # Referee feeds are noisier (initial-only MatchHistory forms) and have
+        # no DOB disambiguator → looser band (issue #143).
+        ('referee', 'iceberg.silver.xref_referee', 15.0, 35.0),
     ):
         try:
             res = evaluate_orphan_rate_per_source(
                 table=table,
-                warning_threshold=10.0,   # ≤10%      — OK
-                error_threshold=25.0,     # 10–25%    — WARNING; >25% — ERROR
+                warning_threshold=warn_t,
+                error_threshold=err_t,
             )
         except Exception as e:
             logger.exception("orphan_rate evaluation failed for %s", table)
@@ -396,8 +453,15 @@ with DAG(
             python_callable=_run_xref_team,
         )
 
-        # xref_match / xref_referee / xref_manager — plain SELECT files
-        prev = xref_team_task
+        # xref_referee — Jinja template (.sql.j2), embeds referee_aliases.yaml
+        xref_referee_task = PythonOperator(
+            task_id='xref_referee',
+            python_callable=_run_xref_referee,
+        )
+        xref_team_task >> xref_referee_task
+
+        # xref_match / xref_manager — plain SELECT files
+        prev = xref_referee_task
         for task_id, sql_file, table_name in PURE_SQL_XREF_TRANSFORMS:
             t = PythonOperator(
                 task_id=task_id,

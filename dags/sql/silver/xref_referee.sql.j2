@@ -1,0 +1,134 @@
+-- =============================================================================
+-- Silver: xref_referee   (Jinja-template — `.sql.j2`)
+-- =============================================================================
+-- Maps source-specific referee-name → canonical referee_id across 2 sources
+-- (FBref + MatchHistory). Issue #143: cross-source identity via a curated
+-- alias dictionary, mirroring `xref_team.sql.j2` (#141/#148).
+--
+-- This template renders ONE `{{ referee_aliases_values_sql }}` placeholder,
+-- filled by `medallion_config.get_referee_alias_sql_values(with_canonical_id=
+-- True, with_league=True)` → a comma-separated list of four-tuples
+-- `('raw_name', 'canonical_name', 'canonical_id', 'league'), ...`.
+--
+-- Identity (issue #141/#143): `canonical_id` is the explicit `ref_<slug>` from
+-- referee_aliases.yaml — NOT derived from the raw name. MatchHistory "M Oliver"
+-- and FBref "Michael Oliver" each carry an alias row pointing at
+-- `ref_michael_oliver`, so they merge with zero fuzzy matching. No initials
+-- algorithm needed: the curator lists the MatchHistory "Initial Surname" form.
+--
+-- DAG-integration note: `dag_transform_xref._run_xref_referee` renders this
+-- through `medallion_config.render_sql_template()` then wraps the result in
+-- `CREATE OR REPLACE TABLE iceberg.silver.xref_referee AS ...` via
+-- `silver_tasks.run_silver_transform()`. This file MUST stay a pure SELECT.
+--
+-- =============================================================================
+-- Schema (frozen for E1 dual-run)
+-- =============================================================================
+--   canonical_id   varchar  -- 'ref_<slug>' (aliased) | 'fb_ref_<slug>' |
+--                              'mh_ref_<slug>' (orphan fallback)
+--   source         varchar  -- 'fbref' | 'matchhistory'
+--   source_id      varchar  -- raw referee name as stored in Bronze
+--   display_name   varchar  -- canonical_name when aliased, else source_id
+--   league         varchar
+--   season         varchar  -- normalised (Bronze stores BIGINT)
+--   confidence     varchar  -- 'name_alias' (matched in YAML) | 'orphan'
+--   match_score    double   -- always NULL (no fuzzy — curated dictionary)
+--
+-- Testable invariants:
+--   * PK = (source, source_id, league, season) — guaranteed by final GROUP BY.
+--   * canonical_id is NEVER NULL.
+--   * source ∈ {'fbref', 'matchhistory'}.
+--   * confidence ∈ {'name_alias', 'orphan'}.
+--
+-- =============================================================================
+-- Bronze column-name reference (verified via DESCRIBE on 2026-06-03)
+-- =============================================================================
+--   fbref_schedule.referee      : varchar (full name, e.g. 'Michael Oliver')
+--   matchhistory_games.referee  : varchar ('Initial Surname', e.g. 'M Oliver')
+-- =============================================================================
+
+WITH aliases AS (
+    SELECT
+        raw_name,
+        canonical_name,
+        canonical_id,
+        -- League predicate (issue #148): each alias tagged with the competition
+        -- it applies to, so the JOIN can guard on `a.league = rt.league`. APL-
+        -- only today → no-op, but future-proofs worldwide namesake split.
+        league,
+        -- Normalised join key: lower → strip diacritics (NFD + \p{Mn}) → remove
+        -- all non-alphanumerics. "M Oliver" → 'moliver', "Michael Oliver" →
+        -- 'michaeloliver'. Each raw form normalises to its own key; both alias
+        -- rows point at the same canonical_id so the sources merge.
+        regexp_replace(
+            regexp_replace(normalize(lower(raw_name), NFD), '\p{Mn}+', ''),
+            '[^a-z0-9]+', ''
+        ) AS norm
+    FROM (VALUES
+        {{ referee_aliases_values_sql }}
+    ) AS t(raw_name, canonical_name, canonical_id, league)
+),
+
+raw_refs AS (
+    SELECT 'fbref' AS source, referee AS source_id, league,
+           CAST(season AS varchar) AS season
+      FROM iceberg.bronze.fbref_schedule
+     WHERE referee IS NOT NULL AND referee <> ''
+    UNION
+    SELECT 'matchhistory' AS source, referee AS source_id, league,
+           CAST(season AS varchar) AS season
+      FROM iceberg.bronze.matchhistory_games
+     WHERE referee IS NOT NULL AND referee <> ''
+),
+
+resolved AS (
+    SELECT
+        rt.source,
+        rt.source_id,
+        rt.league,
+        rt.season,
+        a.canonical_name,
+        a.canonical_id,
+        CASE WHEN a.canonical_id IS NOT NULL THEN 'name_alias' ELSE 'orphan' END
+            AS confidence
+    FROM raw_refs rt
+    -- Match on the normalised key (same normalisation as aliases.norm above).
+    LEFT JOIN aliases a
+      ON a.league = rt.league
+     AND a.norm = regexp_replace(
+                      regexp_replace(
+                          normalize(lower(rt.source_id), NFD), '\p{Mn}+', ''
+                      ),
+                      '[^a-z0-9]+', ''
+                  )
+)
+
+SELECT
+    CASE
+        WHEN canonical_id IS NOT NULL
+          THEN canonical_id   -- explicit 'ref_<slug>' from YAML (issue #141/#143)
+        ELSE
+            -- orphan fallback: source-prefixed slug of the raw name. Diacritics
+            -- folded for stable slug; excluded from cross-source JOINs by the
+            -- confidence='orphan' filter downstream.
+            CASE source
+                WHEN 'fbref'        THEN 'fb_ref_'
+                WHEN 'matchhistory' THEN 'mh_ref_'
+            END
+            || LOWER(REGEXP_REPLACE(
+                   REGEXP_REPLACE(NORMALIZE(source_id, NFD), '\p{Mn}+', ''),
+                   '[^a-zA-Z0-9]+', '_'))
+    END                                       AS canonical_id,
+    source,
+    source_id,
+    COALESCE(canonical_name, source_id)       AS display_name,
+    league,
+    season,
+    MIN(confidence)                           AS confidence,
+    CAST(NULL AS double)                      AS match_score
+FROM resolved
+GROUP BY
+    -- canonical_id is the YAML slug (1:1 with canonical_name) or the orphan
+    -- fallback (function of source + source_id) — grouping by these columns
+    -- enforces the documented PK and dedupes identical UNION rows.
+    1, source, source_id, league, season, canonical_name

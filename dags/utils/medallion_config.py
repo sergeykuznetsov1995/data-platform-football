@@ -62,6 +62,7 @@ CONFIG_DIR = Path(
 TEAM_ALIASES_FILE = 'team_aliases.yaml'
 COMPETITIONS_FILE = 'competitions.yaml'
 PLAYER_ALIASES_FILE = 'player_aliases.yaml'
+REFEREE_ALIASES_FILE = 'referee_aliases.yaml'
 
 # Sentinel for "no source filter" — distinct from None which means "include
 # generic + all sources merged" in get_team_alias_pairs. We pass the bucket
@@ -111,6 +112,53 @@ def _validate_team_aliases_schema(doc: Dict) -> None:
                 f"missing/invalid 'canonical_id' (must match ^[a-z0-9_]+$, "
                 f"got {cid!r})"
             )
+
+
+def _validate_referee_aliases_schema(doc: Dict) -> None:
+    """Structural validation of referee_aliases.yaml (issue #143).
+
+    Mirror of :func:`_validate_team_aliases_schema` but keyed on ``referees``.
+    Each entry needs ``canonical_name``, an ``aliases`` mapping, and an explicit
+    ``canonical_id`` slug (``^[a-z0-9_]+$``) — identity is NOT derived from the
+    raw name (FBref "Michael Oliver" vs MatchHistory "M Oliver" → one slug).
+    """
+    if not isinstance(doc, dict) or 'referees' not in doc:
+        raise MedallionConfigError(
+            "referee_aliases.yaml: missing top-level 'referees' key"
+        )
+    referees = doc['referees']
+    if not isinstance(referees, list):
+        raise MedallionConfigError(
+            "referee_aliases.yaml: 'referees' must be a list"
+        )
+    seen_ids: set = set()
+    for i, r in enumerate(referees):
+        if not isinstance(r, dict):
+            raise MedallionConfigError(
+                f"referee_aliases.yaml: referees[{i}] must be a mapping"
+            )
+        if 'canonical_name' not in r:
+            raise MedallionConfigError(
+                f"referee_aliases.yaml: referees[{i}] missing 'canonical_name'"
+            )
+        if 'aliases' not in r or not isinstance(r['aliases'], dict):
+            raise MedallionConfigError(
+                f"referee_aliases.yaml: referees[{i}] ({r.get('canonical_name')}) "
+                f"missing/invalid 'aliases'"
+            )
+        cid = r.get('canonical_id')
+        if not isinstance(cid, str) or not re.fullmatch(r'[a-z0-9_]+', cid):
+            raise MedallionConfigError(
+                f"referee_aliases.yaml: referees[{i}] ({r.get('canonical_name')}) "
+                f"missing/invalid 'canonical_id' (must match ^[a-z0-9_]+$, "
+                f"got {cid!r})"
+            )
+        if cid in seen_ids:
+            raise MedallionConfigError(
+                f"referee_aliases.yaml: duplicate canonical_id {cid!r} "
+                f"(referees[{i}]) — one slug must map to one referee"
+            )
+        seen_ids.add(cid)
 
 
 def _validate_player_aliases_schema(doc: Dict) -> None:
@@ -228,6 +276,21 @@ def load_competitions() -> Dict:
     path = str(CONFIG_DIR / COMPETITIONS_FILE)
     doc = _read_yaml(path)
     _validate_competitions_schema(doc)
+    return doc
+
+
+def load_referee_aliases() -> Dict:
+    """Return the parsed referee_aliases.yaml (with schema sanity-check).
+
+    Missing file is treated as ``{'referees': []}`` so an environment without
+    the curated file (e.g. a fresh checkout before #143) degrades to "no
+    referee aliases" rather than crashing DAG-parse.
+    """
+    path = str(CONFIG_DIR / REFEREE_ALIASES_FILE)
+    if not Path(path).exists():
+        return {'referees': []}
+    doc = _read_yaml(path)
+    _validate_referee_aliases_schema(doc)
     return doc
 
 
@@ -444,6 +507,109 @@ def get_team_alias_sql_values(
     if not rows:
         raise MedallionConfigError(
             f"get_team_alias_sql_values produced 0 pairs "
+            f"(source={source!r}, competition={competition!r}); "
+            "an empty VALUES clause is invalid Trino — refusing to emit."
+        )
+    if with_league:
+        lines = [
+            f"    ('{_escape_sql_string(raw)}', "
+            f"'{_escape_sql_string(canonical)}', "
+            f"'{_escape_sql_string(cid)}', "
+            f"'{_escape_sql_string(league)}')"
+            for raw, canonical, cid, league in rows
+        ]
+    elif with_canonical_id:
+        lines = [
+            f"    ('{_escape_sql_string(raw)}', "
+            f"'{_escape_sql_string(canonical)}', "
+            f"'{_escape_sql_string(cid)}')"
+            for raw, canonical, cid in rows
+        ]
+    else:
+        lines = [
+            f"    ('{_escape_sql_string(raw)}', "
+            f"'{_escape_sql_string(canonical)}')"
+            for raw, canonical, _cid in rows
+        ]
+    return ',\n'.join(lines).lstrip()
+
+
+# ---------------------------------------------------------------------------
+# Referee aliases — query helpers (issue #143)
+# ---------------------------------------------------------------------------
+
+def _referee_in_scope(referee: Dict, competition: Optional[str]) -> bool:
+    """True if this referee's competition_scope contains `competition`, OR if
+    no competition filter was requested. Missing scope defaults to APL (E1)."""
+    if competition is None:
+        return True
+    scope = referee.get('competition_scope') or ['ENG-Premier League']
+    return competition in scope
+
+
+def _iter_referee_aliases(
+    source: Optional[str],
+    competition: Optional[str],
+    include_league: bool = False,
+) -> List[Tuple[str, ...]]:
+    """Yield (raw_name, canonical_name, canonical_id[, league]) tuples.
+
+    Mirror of :func:`_iter_team_aliases` for ``referee_aliases.yaml``. Same
+    bucket-merge (``_generic`` + source bucket), same league fan-out under
+    ``include_league=True``, same order-preserving dedup.
+    """
+    doc = load_referee_aliases()
+    seen: set = set()
+    out: List[Tuple[str, ...]] = []
+    for referee in doc.get('referees', []):
+        if not _referee_in_scope(referee, competition):
+            continue
+        canonical = referee['canonical_name']
+        canonical_id = referee['canonical_id']
+        aliases = referee.get('aliases') or {}
+        leagues = (
+            (referee.get('competition_scope') or ['ENG-Premier League'])
+            if include_league else [None]
+        )
+
+        buckets: List[str] = [_GENERIC_BUCKET]
+        if source is None:
+            buckets.extend(k for k in aliases.keys() if k != _GENERIC_BUCKET)
+        else:
+            buckets.append(source)
+
+        for bucket in buckets:
+            for raw in aliases.get(bucket, []) or []:
+                for league in leagues:
+                    key = (
+                        (raw, canonical, canonical_id)
+                        if league is None
+                        else (raw, canonical, canonical_id, league)
+                    )
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    out.append(key)
+    return out
+
+
+def get_referee_alias_sql_values(
+    source: Optional[str] = None,
+    competition: Optional[str] = None,
+    with_canonical_id: bool = True,
+    with_league: bool = True,
+) -> str:
+    """Render referee alias tuples as a Trino VALUES body (issue #143).
+
+    Mirror of :func:`get_team_alias_sql_values`. Defaults emit the 4-tuple
+    ``(raw_name, canonical_name, canonical_id, league)`` consumed by
+    ``xref_referee.sql.j2``. Empty result raises (an empty VALUES is invalid
+    Trino and almost certainly signals a missing/misfiltered config).
+    """
+    rows = _iter_referee_aliases(source, competition, include_league=with_league)
+    if not rows:
+        raise MedallionConfigError(
+            f"get_referee_alias_sql_values produced 0 rows "
             f"(source={source!r}, competition={competition!r}); "
             "an empty VALUES clause is invalid Trino — refusing to emit."
         )

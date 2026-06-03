@@ -247,6 +247,41 @@ def test_xref_referee_source_enum():
     assert "'matchhistory'" in where
 
 
+def test_xref_referee_confidence_enum_is_name_alias_orphan():
+    """#143: curated-config confidence labels — name_alias / orphan (not name_normalize)."""
+    checks = xref_dq.build_xref_referee_checks()
+    conf = [c for c in checks if 'enum_compliance' in c.name and '.confidence' in c.name]
+    assert len(conf) == 1
+    where = conf[0].params['where']
+    assert "'name_alias'" in where and "'orphan'" in where
+    assert "'name_normalize'" not in where
+
+
+def test_xref_referee_has_canonical_id_format_guard():
+    """#143: canonical_id prefix guard present (ref_/fb_ref_/mh_ref_)."""
+    names = {c.name for c in xref_dq.build_xref_referee_checks()}
+    assert 'canonical_id_format[xref_referee]' in names
+
+
+def test_xref_referee_no_per_canonical_season_guard():
+    """#143: the xref_player-style per-canonical dup guard is intentionally
+    absent — name-keyed referees legitimately merge multiple raw spellings
+    into one canonical per (source, season)."""
+    names = {c.name for c in xref_dq.build_xref_referee_checks()}
+    assert 'no_duplicates_per_canonical_season[xref_referee]' not in names
+
+
+def test_xref_referee_known_pairs_guard():
+    """#143: known-referee regression guard checks anchors carry 2 sources."""
+    checks = xref_dq.build_xref_referee_checks()
+    kp = [c for c in checks if c.name == 'known_referee_pairs[xref_referee]']
+    assert len(kp) == 1
+    where = kp[0].params['where']
+    for anchor in xref_dq.KNOWN_REFEREE_CANONICALS:
+        assert anchor in where
+    assert 'COUNT(DISTINCT source) < 2' in where
+
+
 def test_xref_manager_phase_15_checks():
     """Phase 1.5 — xref_manager populated from FBref scorebox parser.
 

@@ -186,9 +186,28 @@ def build_xref_match_checks() -> List[Check]:
     return checks
 
 
+# Referee known-pair regression anchors (issue #143). Active APL referees that
+# MUST resolve to one canonical_id carrying BOTH fbref + matchhistory rows —
+# the curated-config analogue of xref_player's KNOWN_PAIRS guard. If
+# referee_aliases.yaml drops/breaks one of these, the DQ check below ERRORs.
+KNOWN_REFEREE_CANONICALS = (
+    'ref_michael_oliver',
+    'ref_anthony_taylor',
+    'ref_paul_tierney',
+    'ref_craig_pawson',
+)
+
+
 def build_xref_referee_checks() -> List[Check]:
-    """DQ for ``iceberg.silver.xref_referee``."""
+    """DQ for ``iceberg.silver.xref_referee`` (issue #143 — curated config).
+
+    Confidence allow-list mirrors the xref_team contract (``name_alias`` /
+    ``orphan``) now that referee identity comes from referee_aliases.yaml.
+    Adds the canonical_id-format guard, the per-canonical dup guard (issue #70
+    fan-out class), and a known-referee regression guard.
+    """
     table = 'iceberg.silver.xref_referee'
+    known_csv = ', '.join(f"'{c}'" for c in KNOWN_REFEREE_CANONICALS)
     return [
         CHECK.row_count(table, min_rows=200, max_rows=5000),
 
@@ -205,10 +224,51 @@ def build_xref_referee_checks() -> List[Check]:
             severity='ERROR',
         ),
 
+        # confidence — aligned with xref_team: 'name_alias' (matched in
+        # referee_aliases.yaml) | 'orphan' (no alias row). Old 'name_normalize'
+        # is gone with the pure-SQL slug path.
         check_enum_compliance(
             table, 'confidence',
-            allowed=['name_normalize'],
+            allowed=['name_alias', 'orphan'],
             severity='ERROR',
+        ),
+
+        # canonical_id format guard — 'ref_' (aliased) or 'fb_ref_'/'mh_ref_'
+        # (orphan fallback). Mirrors xref_player's prefix guard.
+        CHECK.row_count(
+            table=table,
+            min_rows=0,
+            max_rows=0,
+            where="NOT regexp_like(canonical_id, '^(ref|fb_ref|mh_ref)_.+$')",
+            severity='ERROR',
+            name='canonical_id_format[xref_referee]',
+        ),
+
+        # NB: unlike xref_player, we intentionally do NOT add a
+        # no_duplicates_per_canonical_season guard. Referees are name-keyed
+        # (no source ID), so multiple raw spellings legitimately collapse to one
+        # canonical within a (source, season) — e.g. MatchHistory 'J Gillett'
+        # and 'J Gillett ' (trailing space), or 'M Oliver' + the mis-keyed
+        # 'O Oliver'. That is the cross-source merge working, not a fan-out bug.
+        # The PK no_duplicates on (source, source_id, league, season) + the
+        # loader's unique-canonical_id check cover the real regressions.
+
+        # Known-referee regression guard (issue #143): each anchor canonical_id
+        # MUST carry rows from both sources. Offending = anchor present with
+        # < 2 distinct sources → ERROR (cross-source merge silently broke).
+        CHECK.row_count(
+            table=table,
+            min_rows=0,
+            max_rows=0,
+            where=(
+                f"canonical_id IN ({known_csv}) AND canonical_id IN ("
+                "SELECT canonical_id FROM iceberg.silver.xref_referee "
+                "WHERE confidence = 'name_alias' "
+                "GROUP BY canonical_id HAVING COUNT(DISTINCT source) < 2"
+                ")"
+            ),
+            severity='ERROR',
+            name='known_referee_pairs[xref_referee]',
         ),
     ]
 
