@@ -260,20 +260,19 @@ def _validate_silver_quality(**context) -> Dict[str, Any]:
             where='player_id IS NOT NULL',
         ),
 
-        # Referential integrity — WARNING (#240). The orphan match_ids are NOT
-        # lost matches: every orphan already exists in fbref_match_enriched under
-        # a different key (diagnosed 2026-06-02, APL 2025/26: 44 orphan, 0 truly
-        # missing by team-pair). Root cause is upstream — bronze.fbref_schedule
-        # emits the SAME fixture as two rows with DIFFERENT match-page hex ids:
-        # one fully-populated (lands in enriched) and one url-only "skeleton"
-        # (date NULL → filtered out, yet its match page is still scraped, so the
-        # child tables carry the alternate hex as an orphan). Relaxing the enriched
-        # date-filter would only re-materialise those skeletons as empty duplicate
-        # spine rows, so we keep ERROR's signal at WARNING instead of blocking the
-        # DAG. Proper fix = dedup the alternate/fragmented hex upstream (followup).
-        CHECK.ref_integrity('silver.fbref_player_match_stats', 'silver.fbref_match_enriched', 'match_id', severity='WARNING'),
-        CHECK.ref_integrity('silver.fbref_match_events', 'silver.fbref_match_enriched', 'match_id', severity='WARNING'),
-        CHECK.ref_integrity('silver.fbref_match_lineups', 'silver.fbref_match_enriched', 'match_id', severity='WARNING'),
+        # Referential integrity — ERROR (#258, restored from WARNING #240). The
+        # orphan match_ids were duplicate alternate-hex scrapes, not lost matches:
+        # bronze.fbref_schedule used to emit the SAME fixture as two rows with
+        # DIFFERENT match-page hex ids — one fully-populated (lands in enriched)
+        # and one url-only "skeleton" (date NULL → filtered out, yet its match
+        # page was still scraped, so child tables carried the alternate hex as an
+        # orphan). Root cause fixed upstream (#241/PR#257 align match_url) and
+        # Bronze fully re-ingested; clean-re-ingest gate confirmed orphan=0 live
+        # (2026-06-03, APL 2025/26). Restored to ERROR so dirty data again blocks
+        # the DAG.
+        CHECK.ref_integrity('silver.fbref_player_match_stats', 'silver.fbref_match_enriched', 'match_id', severity='ERROR'),
+        CHECK.ref_integrity('silver.fbref_match_events', 'silver.fbref_match_enriched', 'match_id', severity='ERROR'),
+        CHECK.ref_integrity('silver.fbref_match_lineups', 'silver.fbref_match_enriched', 'match_id', severity='ERROR'),
 
         # Freshness — WARNING (ingestion is weekly; >48h after Monday is normal mid-week)
         CHECK.freshness('silver.fbref_match_enriched', ts_col='_bronze_ingested_at',

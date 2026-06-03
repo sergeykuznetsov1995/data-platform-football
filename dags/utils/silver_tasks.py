@@ -644,15 +644,15 @@ def _build_silver_checks(schema: str = 'silver'):
             where='player_id IS NOT NULL',
         ),
 
-        # ---- WARNING: Referential integrity (#240) ----
+        # ---- ERROR: Referential integrity (#258, restored from WARNING #240) ----
         # Mirrors the canonical DAG _validate_silver_quality: the orphan
-        # match_ids are duplicate alternate-hex scrapes, not lost matches (every
-        # orphan already exists in enriched under a different key). Root cause =
-        # fragmented hex in bronze.fbref_schedule, tracked as an upstream
-        # followup; keep WARNING until that dedup lands, then restore ERROR.
-        CHECK.ref_integrity(f'{schema}.fbref_player_match_stats', f'{schema}.fbref_match_enriched', 'match_id', severity='WARNING'),
-        CHECK.ref_integrity(f'{schema}.fbref_match_events',       f'{schema}.fbref_match_enriched', 'match_id', severity='WARNING'),
-        CHECK.ref_integrity(f'{schema}.fbref_match_lineups',      f'{schema}.fbref_match_enriched', 'match_id', severity='WARNING'),
+        # match_ids were duplicate alternate-hex scrapes, not lost matches. Root
+        # cause (fragmented hex in bronze.fbref_schedule) fixed upstream
+        # (#241/PR#257) and Bronze fully re-ingested; clean-re-ingest gate
+        # confirmed orphan=0 live (2026-06-03). Restored to ERROR.
+        CHECK.ref_integrity(f'{schema}.fbref_player_match_stats', f'{schema}.fbref_match_enriched', 'match_id', severity='ERROR'),
+        CHECK.ref_integrity(f'{schema}.fbref_match_events',       f'{schema}.fbref_match_enriched', 'match_id', severity='ERROR'),
+        CHECK.ref_integrity(f'{schema}.fbref_match_lineups',      f'{schema}.fbref_match_enriched', 'match_id', severity='ERROR'),
 
         # ---- WARNING: Freshness (weekly ingest; >48h is normal mid-week) ----
         CHECK.freshness(f'{schema}.fbref_match_enriched',        ts_col='_bronze_ingested_at',
