@@ -43,6 +43,13 @@ EXPECTED_NULL: dict[str, set[str]] = {
     'fbref_team_misc': {'pkwon', 'pkcon'},
     'fbref_player_misc': {'pkwon', 'pkcon'},
     'fbref_match_player_stats': {'pkwon', 'pkcon'},
+    'fbref_schedule': {
+        # FBref schedule "Notes" column is upstream-sparse — only filled for rare
+        # match states ("Match Awarded", "Abandoned", ...). 100% NULL across all
+        # currently-ingested rows; not a parser drop (column maps straight from the
+        # raw HTML table). Verified 2026-06-03 (#276).
+        'notes',
+    },
     'matchhistory_games': {
         # 31 dropped bookmakers (Betfair, William Hill, 1xBet, VC, IW, SJ, SO, LB, GB, SB, BS)
         'bfh', 'bfd', 'bfa', 'whh', 'whd', 'wha', '1xbh', '1xbd', '1xba',
@@ -133,9 +140,83 @@ EXPECTED_TABLES: dict[str, dict[str, set[str]]] = {
         # has no read_standings (scraper.py:112 returns None), so the table is
         # never materialised. Listing it would be a permanent false-positive.
     },
-    # 'fbref': {...}, 'understat': {...}, 'whoscored': {...}, 'fotmob': {...},
-    # 'sofascore': {...}, 'matchhistory': {...}, 'clubelo': {...}, 'sofifa': {...},
-    # 'transfermarkt': {...}, 'capology': {...}  -> #276-#286
+    'fbref': {
+        # Minimal required set per table — identity keys + a few core metrics
+        # (FBref schemas are wide & volatile; extra live columns are NOT errors,
+        # and per-column non-NULL coverage is enforced separately by audit_table).
+        # Verified vs live bronze 2026-06-03. fbref_shot_events is intentionally
+        # absent (see EXPECTED_ABSENT) — FBref Feb-2026 shot-data restriction.
+        # --- match-level ---
+        'fbref_schedule': {
+            'league', 'season', 'date', 'home', 'away', 'score', *META_COLS,
+        },
+        'fbref_shot_events': {  # listed for completeness; gated by EXPECTED_ABSENT
+            'league', 'season', 'match_id', 'minute', 'player', 'squad', *META_COLS,
+        },
+        'fbref_match_events': {
+            'league', 'season', 'match_id', 'minute', 'event_type', 'player', 'team',
+            *META_COLS,
+        },
+        'fbref_lineups': {
+            'league', 'season', 'match_id', 'team', 'player', 'is_starter', 'position',
+            *META_COLS,
+        },
+        'fbref_match_team_stats': {
+            'league', 'season', 'match_id', 'home_team', 'away_team', 'home_shots',
+            'away_shots', *META_COLS,
+        },
+        'fbref_match_player_stats': {
+            'league', 'season', 'match_id', 'player', 'team', 'min', 'gls', *META_COLS,
+        },
+        'fbref_match_managers': {
+            'league', 'season', 'match_id', 'side', 'team', 'manager_name', *META_COLS,
+        },
+        # --- season player ---
+        'fbref_player_stats': {
+            'league', 'season', 'player', 'squad', 'mp', 'min', 'gls', *META_COLS,
+        },
+        'fbref_player_shooting': {
+            'league', 'season', 'player', 'squad', 'sh', 'sot', 'gls', *META_COLS,
+        },
+        'fbref_player_playingtime': {
+            'league', 'season', 'player', 'squad', 'mp', 'min', 'starts', *META_COLS,
+        },
+        'fbref_player_misc': {
+            'league', 'season', 'player', 'squad', 'crdy', 'crdr', 'fls', *META_COLS,
+        },
+        # --- season team ---
+        'fbref_team_stats': {
+            'league', 'season', 'squad', 'team_id', 'mp', 'gls', 'poss', *META_COLS,
+        },
+        'fbref_team_shooting': {
+            'league', 'season', 'squad', 'team_id', 'sh', 'sot', 'gls', *META_COLS,
+        },
+        'fbref_team_playingtime': {
+            'league', 'season', 'squad', 'team_id', 'mp', 'min', 'starts', *META_COLS,
+        },
+        'fbref_team_misc': {
+            'league', 'season', 'squad', 'team_id', 'crdy', 'crdr', 'fls', *META_COLS,
+        },
+        # --- keeper ---
+        'fbref_keeper_keeper': {
+            'league', 'season', 'player', 'squad', 'mp', 'ga', 'saves', *META_COLS,
+        },
+        # keeper_adv: 23 advanced cols are restricted (all-NULL, see EXPECTED_NULL);
+        # require only the identity + always-present columns.
+        'fbref_keeper_keeper_adv': {
+            'league', 'season', 'player', 'squad', '90s', *META_COLS,
+        },
+    },
+    # 'understat': {...}, 'whoscored': {...}, 'fotmob': {...}, 'sofascore': {...},
+    # 'matchhistory': {...}, 'clubelo': {...}, 'sofifa': {...},
+    # 'transfermarkt': {...}, 'capology': {...}  -> #277-#286
+}
+
+# Tables a source's contract names but that are intentionally NOT materialised
+# (upstream restriction). Absent / empty == PASS, surfaced as "expected absent (OK)"
+# instead of a missing-table failure.
+EXPECTED_ABSENT: dict[str, set[str]] = {
+    'fbref': {'fbref_shot_events'},  # FBref Feb-2026 shot-data restriction (#276)
 }
 
 # Source prefix → group label for the report
@@ -321,29 +402,39 @@ def diff_contract(
 ) -> dict[str, list]:
     """Diff EXPECTED_TABLES[source] against live bronze.
 
-    Returns three categories:
+    Returns four categories:
       - missing_tables: [(table, reason)]   — absent / empty / scan-failed
+      - expected_absent: [(table, reason)]  — in EXPECTED_ABSENT, absent/empty == PASS
       - missing_columns: [(table, col)]     — contract col not in live DESCRIBE
       - all_null_columns: [(table, col, detail)] — ALL_NULL findings (allowlist-aware,
         reused from audit_table; spans ALL {source}_* tables, not only contract cols)
     """
     contract = EXPECTED_TABLES.get(source, {})
+    absent_ok = EXPECTED_ABSENT.get(source, set())
     missing_tables: list[tuple[str, str]] = []
+    expected_absent: list[tuple[str, str]] = []
     missing_columns: list[tuple[str, str]] = []
     all_null_columns: list[tuple[str, str, str]] = []
 
     # (a) missing tables / (b) missing columns — driven by the contract
     for table in sorted(contract):
         expected_cols = contract[table]
+        in_absent_ok = table in absent_ok
         if table not in live_tables:
-            missing_tables.append((table, 'absent from bronze'))
+            if in_absent_ok:
+                expected_absent.append((table, 'absent — expected (upstream restriction)'))
+            else:
+                missing_tables.append((table, 'absent from bronze'))
             continue
         total = per_table.get(table, (0, []))[0]
         if total == -1:
             missing_tables.append((table, 'audit scan failed'))
             continue
         if total == 0:
-            missing_tables.append((table, 'present but empty (0 rows)'))
+            if in_absent_ok:
+                expected_absent.append((table, 'present but empty — expected'))
+            else:
+                missing_tables.append((table, 'present but empty (0 rows)'))
             continue
         live_cols = {c.lower() for c, _ in describe(cur, table)}
         for col in sorted(expected_cols):
@@ -359,6 +450,7 @@ def diff_contract(
 
     return {
         'missing_tables': missing_tables,
+        'expected_absent': expected_absent,
         'missing_columns': missing_columns,
         'all_null_columns': all_null_columns,
     }
@@ -469,6 +561,7 @@ def render_source_report(
 ) -> None:
     """Per-source contract report: missing tables / columns / all-NULL columns."""
     missing_tables = diff['missing_tables']
+    expected_absent = diff.get('expected_absent', [])
     missing_columns = diff['missing_columns']
     all_null_columns = diff['all_null_columns']
     contract = EXPECTED_TABLES.get(source, {})
@@ -486,6 +579,7 @@ def render_source_report(
         "",
         f"- Contract tables: **{len(contract)}**",
         f"- Missing tables: **{len(missing_tables)}**",
+        f"- Expected absent (OK): **{len(expected_absent)}**",
         f"- Missing columns: **{len(missing_columns)}**",
         f"- All-NULL columns: **{len(all_null_columns)}**",
         "",
@@ -505,6 +599,18 @@ def render_source_report(
         lines.append("| Table | Reason |")
         lines.append("|---|---|")
         for table, reason in missing_tables:
+            lines.append(f"| `{table}` | {reason} |")
+    else:
+        lines.append("(none)")
+    lines.append("")
+
+    # 1b. Expected absent (intentionally not materialised — NOT a failure)
+    lines.append("## Expected absent (OK)")
+    lines.append("")
+    if expected_absent:
+        lines.append("| Table | Reason |")
+        lines.append("|---|---|")
+        for table, reason in expected_absent:
             lines.append(f"| `{table}` | {reason} |")
     else:
         lines.append("(none)")
