@@ -899,15 +899,16 @@ def _build_fct_lineup_checks() -> List[Check]:
         # only (FROM fbref_match_enriched, date IS NOT NULL), поэтому alt-hex
         # lineup-строки становятся orphan'ами и флагаются. Scope
         # lineup_source='fbref' исключает ESPN pseudo-id (espn_<hash> ∉
-        # dim_match). Severity WARNING пока грязный Bronze не вычищен полным
-        # re-ingest; flip → ERROR вместе с #258 (тот же гейт «clean re-ingest»).
+        # dim_match). #258: грязный Bronze вычищен полным re-ingest (#241/PR#257),
+        # гейт «clean re-ingest» подтвердил orphan=0 live (2026-06-03) →
+        # severity ERROR.
         CHECK.ref_integrity(
             child='gold.fct_lineup',
             parent='gold.dim_match',
             key='match_id_canonical',
             parent_key='match_id',
             where="lineup_source = 'fbref'",
-            severity='WARNING',
+            severity='ERROR',
             name='ref_integrity[fct_lineup.fbref->dim_match]',
         ),
 

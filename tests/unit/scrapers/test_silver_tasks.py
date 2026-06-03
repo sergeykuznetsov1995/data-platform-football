@@ -394,12 +394,13 @@ class TestValidateSilverQuality:
                     f"{c.name} must be ERROR (got {c.severity}) — "
                     f"dirty data must not flow to Gold"
                 )
-            # ref_integrity is WARNING (#240): the fbref match_id orphans are
-            # duplicate alternate-hex scrapes already present in enriched, not
-            # lost matches. Restore to ERROR once upstream hex dedup lands.
+            # ref_integrity is ERROR (#258, restored from WARNING #240): the
+            # fbref match_id alt-hex orphans were dedup'd upstream (#241/PR#257)
+            # and the clean-re-ingest gate confirmed orphan=0, so dirty data must
+            # again block the DAG.
             if c.kind == 'ref_integrity':
-                assert c.severity == 'WARNING', (
-                    f"{c.name} expected WARNING (got {c.severity}) — see #240"
+                assert c.severity == 'ERROR', (
+                    f"{c.name} expected ERROR (got {c.severity}) — see #258"
                 )
             if c.kind in {'freshness', 'value_range'}:
                 assert c.severity == 'WARNING', (

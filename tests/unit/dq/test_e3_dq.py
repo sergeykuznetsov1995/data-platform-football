@@ -277,11 +277,11 @@ class TestErrorSeverityChecks:
         assert len(ref) == 1
         assert ref[0].severity == "ERROR"
 
-    def test_fct_lineup_ref_integrity_is_warning_until_e15_cutover(self):
-        """fct_lineup has 2 ref_integrity guards, both WARNING (not ERROR):
+    def test_fct_lineup_ref_integrity_severities(self):
+        """fct_lineup has 2 ref_integrity guards with distinct severities:
         - → silver.xref_match (ESPN-drift), WARNING until E1.5 cutover.
-        - → gold.dim_match scoped to FBref (issue #242 alt-hex guard), WARNING
-          until clean re-ingest (#258 gate)."""
+        - → gold.dim_match scoped to FBref (issue #242 alt-hex guard), ERROR
+          after the clean re-ingest gate (#258 — orphan=0 confirmed live)."""
         checks = e3_dq.build_gold_e3_checks()
         ref = [
             c for c in checks
@@ -289,12 +289,12 @@ class TestErrorSeverityChecks:
             and c.params.get("child") == "gold.fct_lineup"
         ]
         assert len(ref) == 2
-        assert all(c.severity == "WARNING" for c in ref)
-        parents = {c.params.get("parent") for c in ref}
-        assert parents == {"silver.xref_match", "gold.dim_match"}
+        by_parent = {c.params.get("parent"): c for c in ref}
+        assert set(by_parent) == {"silver.xref_match", "gold.dim_match"}
+        assert by_parent["silver.xref_match"].severity == "WARNING"
+        assert by_parent["gold.dim_match"].severity == "ERROR"
         # The dim_match guard must be scoped to FBref rows only.
-        dm = next(c for c in ref if c.params.get("parent") == "gold.dim_match")
-        assert dm.params.get("where") == "lineup_source = 'fbref'"
+        assert by_parent["gold.dim_match"].params.get("where") == "lineup_source = 'fbref'"
 
     def test_fct_lineup_fbref_coverage_dominant_is_error(self):
         checks = e3_dq.build_gold_e3_checks()
