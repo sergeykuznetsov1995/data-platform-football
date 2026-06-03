@@ -1186,6 +1186,22 @@ def validate_gold_quality() -> Dict[str, Any]:
         CHECK.canonical_completeness('gold.dim_competition', 'competition_canonical'),
         CHECK.canonical_completeness('gold.dim_season',      'season_canonical'),
 
+        # ----- E2: dim_venue alias coverage / dup report (issue #145) — WARNING -----
+        # Every venue whose raw name failed to match venue_aliases.yaml falls
+        # back to a normalised-name hash id and is marked venue_source='orphan'.
+        # Orphans are the dedup/merge candidates a curator must triage (new
+        # stadium, unseen spelling, sponsor rename). WARNING (not ERROR): the
+        # table still loads and orphans carry a stable id — but a non-zero count
+        # means the curated dictionary needs extending. city/country are NULL
+        # only for orphans, so this doubles as the city/country-completeness
+        # signal for in-scope venues.
+        CHECK.row_count(
+            'gold.dim_venue', min_rows=0, max_rows=0,
+            where="venue_source = 'orphan'",
+            severity='WARNING',
+            name='unmapped_venues[dim_venue]',
+        ),
+
         # ----- E2: value-range sanity (WARNING) -----
         # APL has 38 matches/season (max 46 across other supported leagues).
         # Points hard ceiling: 38 * 3 = 114 -> round to 120 for safety margin.

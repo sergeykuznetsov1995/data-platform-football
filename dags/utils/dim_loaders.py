@@ -178,6 +178,32 @@ def render_dim_season_sql(template_path: str, out_path: str) -> str:
     return out_path
 
 
+def render_dim_venue_sql(template_path: str, out_path: str) -> str:
+    """Render ``dim_venue.sql.j2`` to ``out_path`` (issue #145).
+
+    Unlike the two renderers above (which build VALUES rows from leagues.yaml /
+    a season window and use the ``{{ rows }}`` placeholder), dim_venue embeds
+    the curated venue-alias dictionary. It reuses ``medallion_config`` — the
+    same loader/VALUES/template machinery behind ``xref_referee.sql.j2`` — to
+    fill the single ``{{ venue_aliases_values_sql }}`` placeholder.
+
+    Returns ``out_path`` for the convenience of pipeline glue code.
+    """
+    # Lazy import: keeps the module top import-light (no PyYAML pull for DAGs
+    # that don't render config-driven dims).
+    from utils.medallion_config import (
+        get_venue_alias_sql_values,
+        render_sql_template,
+    )
+
+    rendered = render_sql_template(
+        Path(template_path),
+        venue_aliases_values_sql=get_venue_alias_sql_values(),
+    )
+    Path(out_path).write_text(rendered)
+    return out_path
+
+
 # ---------------------------------------------------------------------------
 # Airflow-callable shim
 # ---------------------------------------------------------------------------

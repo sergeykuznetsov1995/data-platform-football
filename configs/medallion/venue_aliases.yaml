@@ -1,0 +1,355 @@
+# =============================================================================
+# Cross-source venue (stadium) aliases — APL (E2, issue #145)
+# =============================================================================
+# Curated map of source-specific stadium-name spellings → one canonical venue
+# identity. Mirrors team_aliases.yaml (#141/#148) and referee_aliases.yaml
+# (#143). Consumed by `dim_venue.sql.j2` via
+# `medallion_config.get_venue_alias_sql_values()` → a VALUES body of six-tuples
+#   ('raw_name', 'canonical_id', 'canonical_name', 'city', 'country', 'league').
+#
+# WHY a curated dictionary (issue #145):
+#   `gold.dim_venue` previously keyed venue_id on xxhash64(LOWER(TRIM(name))) —
+#   a pure name hash. At worldwide scale this both (a) splits one stadium across
+#   spelling/sponsor-rename variants ("Brentford Community Stadium" vs "Gtech
+#   Community Stadium") and (b) merges genuine namesakes in different cities.
+#   The curated map gives every variant ONE stable `canonical_id` and carries
+#   `city`/`country` so namesakes stay distinct and geocoding has a base.
+#
+# Entry shape:
+#   - canonical_name: "Old Trafford"        # display name (current/official)
+#     canonical_id:   "venue_old_trafford"  # IDENTITY slug, ^[a-z0-9_]+$
+#     city:           "Manchester"
+#     country:        "England"
+#     aliases:
+#       _generic: ["Old Trafford"]          # every observed spelling, any source
+#     competition_scope: ["ENG-Premier League"]
+#
+# Matching: dim_venue normalises raw venue names (NFD + strip diacritics +
+# remove non-alphanumerics) and LEFT JOINs on that key. So apostrophe/period
+# variants ("St James' Park" / "St. James' Park") fold automatically and need
+# only one alias; word-additions ("Portman Road" vs "Portman Road Stadium") and
+# sponsor renames must be listed explicitly. All forms below were observed in
+# `silver.fbref_match_enriched` + `bronze.espn_matchsheet` for ENG-Premier
+# League (snapshot 2026-06-03, 9 seasons of history incl. relegated clubs).
+#
+# NOTE: Goodison Park and Hill Dickinson Stadium are BOTH Everton (Liverpool)
+# but are physically different grounds (2025 move) → two distinct venues, not a
+# merge. Same for White Hart Lane (demolished) vs Tottenham Hotspur Stadium.
+#
+# Scope: APL only today. Other leagues (#141 worldwide) are a tracked followup.
+# =============================================================================
+
+venues:
+  - canonical_name: "Anfield"
+    canonical_id: "venue_anfield"
+    city: "Liverpool"
+    country: "England"
+    aliases:
+      _generic: ["Anfield"]
+    competition_scope: ["ENG-Premier League"]
+
+  - canonical_name: "Bet365 Stadium"
+    canonical_id: "venue_bet365_stadium"
+    city: "Stoke-on-Trent"
+    country: "England"
+    aliases:
+      _generic: ["Bet365 Stadium"]
+    competition_scope: ["ENG-Premier League"]
+
+  - canonical_name: "Bramall Lane"
+    canonical_id: "venue_bramall_lane"
+    city: "Sheffield"
+    country: "England"
+    aliases:
+      _generic: ["Bramall Lane"]
+    competition_scope: ["ENG-Premier League"]
+
+  # Brentford — sponsor rename of one ground: Brentford Community Stadium (2020)
+  # → Gtech Community Stadium (2022). One venue.
+  - canonical_name: "Gtech Community Stadium"
+    canonical_id: "venue_brentford_community"
+    city: "London"
+    country: "England"
+    aliases:
+      _generic: ["Gtech Community Stadium", "Brentford Community Stadium"]
+    competition_scope: ["ENG-Premier League"]
+
+  - canonical_name: "Cardiff City Stadium"
+    canonical_id: "venue_cardiff_city"
+    city: "Cardiff"
+    country: "Wales"
+    aliases:
+      _generic: ["Cardiff City Stadium"]
+    competition_scope: ["ENG-Premier League"]
+
+  - canonical_name: "Carrow Road"
+    canonical_id: "venue_carrow_road"
+    city: "Norwich"
+    country: "England"
+    aliases:
+      _generic: ["Carrow Road"]
+    competition_scope: ["ENG-Premier League"]
+
+  - canonical_name: "Craven Cottage"
+    canonical_id: "venue_craven_cottage"
+    city: "London"
+    country: "England"
+    aliases:
+      _generic: ["Craven Cottage"]
+    competition_scope: ["ENG-Premier League"]
+
+  - canonical_name: "Elland Road"
+    canonical_id: "venue_elland_road"
+    city: "Leeds"
+    country: "England"
+    aliases:
+      _generic: ["Elland Road"]
+    competition_scope: ["ENG-Premier League"]
+
+  - canonical_name: "Emirates Stadium"
+    canonical_id: "venue_emirates_stadium"
+    city: "London"
+    country: "England"
+    aliases:
+      _generic: ["Emirates Stadium"]
+    competition_scope: ["ENG-Premier League"]
+
+  - canonical_name: "Etihad Stadium"
+    canonical_id: "venue_etihad_stadium"
+    city: "Manchester"
+    country: "England"
+    aliases:
+      _generic: ["Etihad Stadium"]
+    competition_scope: ["ENG-Premier League"]
+
+  - canonical_name: "Goodison Park"
+    canonical_id: "venue_goodison_park"
+    city: "Liverpool"
+    country: "England"
+    aliases:
+      _generic: ["Goodison Park"]
+    competition_scope: ["ENG-Premier League"]
+
+  # Everton's 2025 ground at Bramley-Moore Dock — distinct from Goodison Park.
+  - canonical_name: "Hill Dickinson Stadium"
+    canonical_id: "venue_hill_dickinson"
+    city: "Liverpool"
+    country: "England"
+    aliases:
+      _generic: ["Hill Dickinson Stadium"]
+    competition_scope: ["ENG-Premier League"]
+
+  - canonical_name: "Kenilworth Road"
+    canonical_id: "venue_kenilworth_road"
+    city: "Luton"
+    country: "England"
+    aliases:
+      _generic: ["Kenilworth Road Stadium", "Kenilworth Road"]
+    competition_scope: ["ENG-Premier League"]
+
+  - canonical_name: "King Power Stadium"
+    canonical_id: "venue_king_power"
+    city: "Leicester"
+    country: "England"
+    aliases:
+      _generic: ["King Power Stadium"]
+    competition_scope: ["ENG-Premier League"]
+
+  # Hull City — KC Stadium / KCOM Stadium / MKM Stadium. FBref carries the long
+  # "Kingston Communications Stadium" form.
+  - canonical_name: "MKM Stadium"
+    canonical_id: "venue_hull_city"
+    city: "Kingston upon Hull"
+    country: "England"
+    aliases:
+      _generic: ["Kingston Communications Stadium", "KCOM Stadium", "MKM Stadium"]
+    competition_scope: ["ENG-Premier League"]
+
+  - canonical_name: "Liberty Stadium"
+    canonical_id: "venue_swansea_com"
+    city: "Swansea"
+    country: "Wales"
+    aliases:
+      _generic: ["Liberty Stadium", "Swansea.com Stadium"]
+    competition_scope: ["ENG-Premier League"]
+
+  - canonical_name: "London Stadium"
+    canonical_id: "venue_london_stadium"
+    city: "London"
+    country: "England"
+    aliases:
+      _generic: ["London Stadium"]
+    competition_scope: ["ENG-Premier League"]
+
+  - canonical_name: "Molineux Stadium"
+    canonical_id: "venue_molineux"
+    city: "Wolverhampton"
+    country: "England"
+    aliases:
+      _generic: ["Molineux Stadium", "Molineux"]
+    competition_scope: ["ENG-Premier League"]
+
+  - canonical_name: "Old Trafford"
+    canonical_id: "venue_old_trafford"
+    city: "Manchester"
+    country: "England"
+    aliases:
+      _generic: ["Old Trafford"]
+    competition_scope: ["ENG-Premier League"]
+
+  # Ipswich Town — ESPN "Portman Road", FBref "Portman Road Stadium".
+  - canonical_name: "Portman Road"
+    canonical_id: "venue_portman_road"
+    city: "Ipswich"
+    country: "England"
+    aliases:
+      _generic: ["Portman Road", "Portman Road Stadium"]
+    competition_scope: ["ENG-Premier League"]
+
+  - canonical_name: "Riverside Stadium"
+    canonical_id: "venue_riverside"
+    city: "Middlesbrough"
+    country: "England"
+    aliases:
+      _generic: ["Riverside Stadium"]
+    competition_scope: ["ENG-Premier League"]
+
+  - canonical_name: "Selhurst Park"
+    canonical_id: "venue_selhurst_park"
+    city: "London"
+    country: "England"
+    aliases:
+      _generic: ["Selhurst Park"]
+    competition_scope: ["ENG-Premier League"]
+
+  # Newcastle United — "St James' Park" / "St. James' Park" fold via
+  # normalisation, but both listed for provenance.
+  - canonical_name: "St James' Park"
+    canonical_id: "venue_st_james_park"
+    city: "Newcastle upon Tyne"
+    country: "England"
+    aliases:
+      _generic: ["St James' Park", "St. James' Park"]
+    competition_scope: ["ENG-Premier League"]
+
+  - canonical_name: "St Mary's Stadium"
+    canonical_id: "venue_st_marys"
+    city: "Southampton"
+    country: "England"
+    aliases:
+      _generic: ["St Mary's Stadium", "St. Mary's Stadium"]
+    competition_scope: ["ENG-Premier League"]
+
+  - canonical_name: "Stadium of Light"
+    canonical_id: "venue_stadium_of_light"
+    city: "Sunderland"
+    country: "England"
+    aliases:
+      _generic: ["Stadium of Light"]
+    competition_scope: ["ENG-Premier League"]
+
+  - canonical_name: "Stamford Bridge"
+    canonical_id: "venue_stamford_bridge"
+    city: "London"
+    country: "England"
+    aliases:
+      _generic: ["Stamford Bridge"]
+    competition_scope: ["ENG-Premier League"]
+
+  # Brighton & Hove Albion — the Amex. ESPN "American Express Stadium", FBref
+  # "The American Express Community Stadium" (older official) + "The American
+  # Express Stadium". One venue.
+  - canonical_name: "American Express Stadium"
+    canonical_id: "venue_amex"
+    city: "Brighton"
+    country: "England"
+    aliases:
+      _generic:
+        - "American Express Stadium"
+        - "The American Express Stadium"
+        - "The American Express Community Stadium"
+    competition_scope: ["ENG-Premier League"]
+
+  - canonical_name: "The City Ground"
+    canonical_id: "venue_city_ground"
+    city: "Nottingham"
+    country: "England"
+    aliases:
+      _generic: ["The City Ground"]
+    competition_scope: ["ENG-Premier League"]
+
+  - canonical_name: "The Hawthorns"
+    canonical_id: "venue_the_hawthorns"
+    city: "West Bromwich"
+    country: "England"
+    aliases:
+      _generic: ["The Hawthorns"]
+    competition_scope: ["ENG-Premier League"]
+
+  - canonical_name: "John Smith's Stadium"
+    canonical_id: "venue_huddersfield"
+    city: "Huddersfield"
+    country: "England"
+    aliases:
+      _generic: ["The John Smith's Stadium", "John Smith's Stadium"]
+    competition_scope: ["ENG-Premier League"]
+
+  - canonical_name: "Tottenham Hotspur Stadium"
+    canonical_id: "venue_tottenham_hotspur"
+    city: "London"
+    country: "England"
+    aliases:
+      _generic: ["Tottenham Hotspur Stadium"]
+    competition_scope: ["ENG-Premier League"]
+
+  - canonical_name: "Turf Moor"
+    canonical_id: "venue_turf_moor"
+    city: "Burnley"
+    country: "England"
+    aliases:
+      _generic: ["Turf Moor"]
+    competition_scope: ["ENG-Premier League"]
+
+  - canonical_name: "Vicarage Road"
+    canonical_id: "venue_vicarage_road"
+    city: "Watford"
+    country: "England"
+    aliases:
+      _generic: ["Vicarage Road Stadium", "Vicarage Road"]
+    competition_scope: ["ENG-Premier League"]
+
+  - canonical_name: "Villa Park"
+    canonical_id: "venue_villa_park"
+    city: "Birmingham"
+    country: "England"
+    aliases:
+      _generic: ["Villa Park"]
+    competition_scope: ["ENG-Premier League"]
+
+  - canonical_name: "Vitality Stadium"
+    canonical_id: "venue_vitality"
+    city: "Bournemouth"
+    country: "England"
+    aliases:
+      _generic: ["Vitality Stadium", "Dean Court"]
+    competition_scope: ["ENG-Premier League"]
+
+  # National stadium — Tottenham's 2017-2019 temporary home during the new
+  # ground's construction. Distinct venue.
+  - canonical_name: "Wembley Stadium"
+    canonical_id: "venue_wembley"
+    city: "London"
+    country: "England"
+    aliases:
+      _generic: ["Wembley Stadium"]
+    competition_scope: ["ENG-Premier League"]
+
+  # Tottenham's old ground (demolished 2017) — distinct from Tottenham Hotspur
+  # Stadium built on the same site.
+  - canonical_name: "White Hart Lane"
+    canonical_id: "venue_white_hart_lane"
+    city: "London"
+    country: "England"
+    aliases:
+      _generic: ["White Hart Lane"]
+    competition_scope: ["ENG-Premier League"]
