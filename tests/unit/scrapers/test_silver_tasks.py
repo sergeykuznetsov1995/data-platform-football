@@ -73,10 +73,10 @@ class TestRunSilverTransform:
         sql_file = tmp_path / "test.sql"
         sql_file.write_text("SELECT * FROM iceberg.bronze.test_table")
 
-        # Atomic swap (#191): SCHEMA + DROP staging + CTAS staging + DROP old
-        # + RENAME consume calls + 1 COUNT fetch
+        # Atomic CREATE OR REPLACE (#265): SCHEMA + CREATE OR REPLACE consume
+        # calls + 1 COUNT fetch
         mock_conn, mock_cursor = self._make_conn(
-            fetchall_side_effect=[[], [], [], [], [], [[42]]]
+            fetchall_side_effect=[[], [], [[42]]]
         )
 
         result = self._run_transform(
@@ -89,8 +89,8 @@ class TestRunSilverTransform:
         assert result['rows'] == 42
         assert result['table'] == 'iceberg.silver.test_table'
         assert result['error'] is None
-        # SCHEMA + DROP staging + CTAS staging + DROP old + RENAME + COUNT
-        assert mock_cursor.execute.call_count == 6
+        # SCHEMA + CREATE OR REPLACE + COUNT
+        assert mock_cursor.execute.call_count == 3
         mock_conn.close.assert_called_once()
 
     def test_ctas_sql_contains_partition(self, tmp_path):
@@ -98,20 +98,16 @@ class TestRunSilverTransform:
         sql_file.write_text("SELECT 1 AS league, 2 AS season")
 
         mock_conn, mock_cursor = self._make_conn(
-            fetchall_side_effect=[[], [], [], [], [], [[1]]]
+            fetchall_side_effect=[[], [], [[1]]]
         )
 
         self._run_transform(mock_conn, sql_file, table_name='t', trino_host='localhost')
 
-        # 3rd execute call is CTAS (after CREATE SCHEMA and DROP staging)
-        ctas_sql = mock_cursor.execute.call_args_list[2][0][0]
-        assert "CREATE TABLE iceberg.silver.t_new" in ctas_sql
+        # 2nd execute call is CREATE OR REPLACE (after CREATE SCHEMA)
+        ctas_sql = mock_cursor.execute.call_args_list[1][0][0]
+        assert "CREATE OR REPLACE TABLE iceberg.silver.t" in ctas_sql
         assert "partitioning = ARRAY['league', 'season']" in ctas_sql
         assert "SELECT 1 AS league, 2 AS season" in ctas_sql
-
-        # 5th execute call is the atomic RENAME swap
-        rename_sql = mock_cursor.execute.call_args_list[4][0][0]
-        assert rename_sql == "ALTER TABLE iceberg.silver.t_new RENAME TO iceberg.silver.t"
 
     def test_empty_sql_raises(self, tmp_path):
         sql_file = tmp_path / "empty.sql"
@@ -127,7 +123,7 @@ class TestRunSilverTransform:
         sql_file.write_text("SELECT 1")
 
         mock_conn, mock_cursor = self._make_conn()
-        # First execute (CREATE SCHEMA) succeeds, second (DROP TABLE) fails
+        # First execute (CREATE SCHEMA) succeeds, second (CREATE OR REPLACE) fails
         mock_cursor.execute.side_effect = [None, Exception("Trino connection failed")]
 
         with pytest.raises(RuntimeError, match="Silver transform failed"):
@@ -140,13 +136,13 @@ class TestRunSilverTransform:
         sql_file.write_text("SELECT 1;")
 
         mock_conn, mock_cursor = self._make_conn(
-            fetchall_side_effect=[[], [], [], [], [], [[1]]]
+            fetchall_side_effect=[[], [], [[1]]]
         )
 
         self._run_transform(mock_conn, sql_file, table_name='t', trino_host='localhost')
 
-        # 3rd execute call is CTAS
-        ctas_sql = mock_cursor.execute.call_args_list[2][0][0]
+        # 2nd execute call is CREATE OR REPLACE
+        ctas_sql = mock_cursor.execute.call_args_list[1][0][0]
         assert not ctas_sql.rstrip().endswith(';')
 
     def test_sql_file_not_found(self):
@@ -164,7 +160,7 @@ class TestRunSilverTransform:
         sql_file.write_text("SELECT 1 AS x")
 
         mock_conn, mock_cursor = self._make_conn(
-            fetchall_side_effect=[[], [], [], [], [], [[1]]]
+            fetchall_side_effect=[[], [], [[1]]]
         )
 
         self._run_transform(
@@ -173,7 +169,7 @@ class TestRunSilverTransform:
             add_timestamp=True,
         )
 
-        ctas_sql = mock_cursor.execute.call_args_list[2][0][0]
+        ctas_sql = mock_cursor.execute.call_args_list[1][0][0]
         assert "CURRENT_TIMESTAMP AS _silver_created_at" in ctas_sql
         # Wrap-style: outer SELECT around the user SELECT
         assert "FROM (" in ctas_sql
@@ -186,7 +182,7 @@ class TestRunSilverTransform:
         sql_file.write_text("SELECT m.* FROM iceberg.gold.fct_match m")
 
         mock_conn, mock_cursor = self._make_conn(
-            fetchall_side_effect=[[], [], [], [], [], [[1]]]
+            fetchall_side_effect=[[], [], [[1]]]
         )
 
         self._run_transform(
@@ -195,7 +191,7 @@ class TestRunSilverTransform:
             add_timestamp=False,
         )
 
-        ctas_sql = mock_cursor.execute.call_args_list[2][0][0]
+        ctas_sql = mock_cursor.execute.call_args_list[1][0][0]
         assert "_silver_created_at" not in ctas_sql
         assert "CURRENT_TIMESTAMP" not in ctas_sql
         # The user SELECT is inlined directly (no FROM (...) wrapping)
@@ -207,52 +203,52 @@ class TestRunSilverTransform:
         sql_file.write_text("SELECT 1 AS x")
 
         mock_conn, mock_cursor = self._make_conn(
-            fetchall_side_effect=[[], [], [], [], [], [[1]]]
+            fetchall_side_effect=[[], [], [[1]]]
         )
 
         # No add_timestamp kwarg → default
         self._run_transform(mock_conn, sql_file, table_name='t', trino_host='localhost')
 
-        ctas_sql = mock_cursor.execute.call_args_list[2][0][0]
+        ctas_sql = mock_cursor.execute.call_args_list[1][0][0]
         assert "_silver_created_at" in ctas_sql
 
-    def test_atomic_swap_old_table_untouched_on_ctas_failure(self, tmp_path):
-        """#191: if the staging CTAS fails, the live table must NOT be dropped.
-        The staging table is best-effort cleaned up instead."""
+    def test_create_or_replace_failure_leaves_table_untouched(self, tmp_path):
+        """#265: if the CREATE OR REPLACE fails, the live table must NOT be
+        dropped — CREATE OR REPLACE is atomic, so there is no staging to clean
+        up and no DROP is ever issued."""
         sql_file = tmp_path / "test.sql"
         sql_file.write_text("SELECT 1")
 
         mock_conn, mock_cursor = self._make_conn()
-        # SCHEMA(ok) → DROP staging(ok) → CTAS staging(FAIL)
-        mock_cursor.execute.side_effect = [None, None, Exception("SELECT exploded")]
+        # SCHEMA(ok) → CREATE OR REPLACE(FAIL)
+        mock_cursor.execute.side_effect = [None, Exception("SELECT exploded")]
 
         with pytest.raises(RuntimeError, match="Silver transform failed"):
             self._run_transform(mock_conn, sql_file, table_name='t', trino_host='localhost')
 
         executed = [c[0][0] for c in mock_cursor.execute.call_args_list]
-        # Live table must never be dropped (exact match — _new drop is different)
-        assert "DROP TABLE IF EXISTS iceberg.silver.t" not in executed
-        # Staging was cleaned up (best-effort) in the except block
-        assert "DROP TABLE IF EXISTS iceberg.silver.t_new" in executed
+        # No DROP is ever issued — neither the live table nor any staging table.
+        assert not any(s.startswith("DROP TABLE") for s in executed)
         mock_conn.close.assert_called_once()
 
-    def test_atomic_swap_execute_sequence(self, tmp_path):
-        """#191: staging CTAS must precede DROP-old, which must precede RENAME."""
+    def test_create_or_replace_single_statement(self, tmp_path):
+        """#265: the rebuild emits a single CREATE OR REPLACE TABLE — no DROP,
+        no RENAME, no staging table."""
         sql_file = tmp_path / "test.sql"
         sql_file.write_text("SELECT 1 AS x")
 
         mock_conn, mock_cursor = self._make_conn(
-            fetchall_side_effect=[[], [], [], [], [], [[1]]]
+            fetchall_side_effect=[[], [], [[1]]]
         )
 
         self._run_transform(mock_conn, sql_file, table_name='t', trino_host='localhost')
 
         executed = [c[0][0] for c in mock_cursor.execute.call_args_list]
-        idx_ctas = next(i for i, s in enumerate(executed) if "CREATE TABLE iceberg.silver.t_new" in s)
-        idx_drop_old = executed.index("DROP TABLE IF EXISTS iceberg.silver.t")
-        idx_rename = next(i for i, s in enumerate(executed) if "RENAME TO iceberg.silver.t" in s)
-
-        assert idx_ctas < idx_drop_old < idx_rename
+        cor = [s for s in executed if "CREATE OR REPLACE TABLE iceberg.silver.t" in s]
+        assert len(cor) == 1
+        assert not any("RENAME TO" in s for s in executed)
+        assert not any(s.startswith("DROP TABLE") for s in executed)
+        assert not any("_new" in s for s in executed)
 
 
 class TestValidateSilverTables:

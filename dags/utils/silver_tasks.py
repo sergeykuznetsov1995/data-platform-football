@@ -94,11 +94,10 @@ def _execute(conn: trino_lib.dbapi.Connection, sql: str, fetch: bool = False):
         cursor.execute(sql)
         if fetch:
             return cursor.fetchall()
-        # Consume results for DDL/DML to ensure query completes
-        try:
-            cursor.fetchall()
-        except Exception:
-            pass
+        # Consume results for DDL/DML to ensure query completes. Do NOT swallow
+        # errors here (#265): a failing CTAS must surface its real error, not be
+        # masked into a downstream TABLE_NOT_FOUND.
+        cursor.fetchall()
         return None
     finally:
         cursor.close()
@@ -115,26 +114,30 @@ def run_silver_transform(
     add_timestamp: bool = True,
 ) -> Dict[str, Any]:
     """
-    Execute a Silver-layer transformation via an atomic swap (#191).
+    Execute a Silver-layer transformation via an atomic ``CREATE OR REPLACE`` (#265).
 
-    Builds a fresh ``{table_name}_new`` staging table, then swaps it into
-    place with a metadata-only RENAME. A transient SELECT failure leaves the
-    EXISTING table untouched (the old DROP-then-CREATE flow left it deleted —
-    that is how #180 lost ``gold.dim_player_attributes``).
+    Rebuilds the target table with a single ``CREATE OR REPLACE TABLE ... AS
+    SELECT`` (Trino 479 Iceberg). The new schema + data are committed in one
+    metastore transaction, so readers see either the old or the new table —
+    never a missing one, and a failing SELECT leaves the EXISTING table intact.
+
+    This replaces the #191 staging swap (``CREATE {table}_new`` → DROP live →
+    RENAME), which had two flaws: (a) the RENAME could hit a transient
+    ``TABLE_NOT_FOUND`` on ``{table}_new`` from metastore visibility lag (#265),
+    and (b) once the live table was dropped, a RENAME failure left no table at
+    all. ``CREATE OR REPLACE`` removes both by construction. (The old flow
+    itself replaced DROP-then-CREATE, which lost ``gold.dim_player_attributes``
+    in #180.)
 
     Steps:
         1. Read the SELECT query from the SQL file
         2. CREATE SCHEMA IF NOT EXISTS iceberg.{schema}
-        3. DROP TABLE IF EXISTS iceberg.{schema}.{table_name}_new (stale staging)
-        4. CREATE TABLE iceberg.{schema}.{table_name}_new
+        3. CREATE OR REPLACE TABLE iceberg.{schema}.{table_name}
            WITH (partitioning = ARRAY['league', 'season']) AS {sql}
-        5. DROP TABLE IF EXISTS iceberg.{schema}.{table_name} (old) — only
-           reached after the staging CTAS succeeds
-        6. ALTER TABLE ..._new RENAME TO iceberg.{schema}.{table_name}
-        7. Log the resulting row count
+        4. Log the resulting row count
 
-    On failure the staging table is best-effort dropped; the live table is
-    never touched before the staging CTAS succeeds.
+    On failure the live table is left untouched (CREATE OR REPLACE is atomic at
+    the Iceberg commit level) and the error is surfaced as a RuntimeError.
 
     Args:
         sql_file: Path to SQL file containing the SELECT query.
@@ -163,12 +166,10 @@ def run_silver_transform(
     _validate_identifier(catalog, "catalog")
     _validate_identifier(schema, "schema")
     _validate_identifier(table_name, "table")
-    _validate_identifier(f"{table_name}_new", "staging table")
     for pc in partition_columns:
         _validate_identifier(pc, "partition column")
 
     full_table = f"{catalog}.{schema}.{table_name}"
-    staging_full = f"{catalog}.{schema}.{table_name}_new"
     result = {
         'table': full_table,
         'rows': 0,
@@ -196,14 +197,13 @@ def run_silver_transform(
         _execute(conn, f"CREATE SCHEMA IF NOT EXISTS {catalog}.{schema}")
         logger.info(f"Schema ensured: {catalog}.{schema}")
 
-        # --- 4. DROP stale staging table (from a prior failed run) ---
-        logger.info(f"Dropping stale staging table if exists: {staging_full}")
-        _execute(conn, f"DROP TABLE IF EXISTS {staging_full}")
-
-        # --- 5. CREATE staging TABLE AS SELECT ---
-        # Atomic swap (#191): build a fresh {table}_new, then RENAME it into
-        # place. The live table is dropped ONLY after this CTAS succeeds, so a
-        # transient SELECT failure leaves the existing table intact.
+        # --- 4. Atomic rebuild via CREATE OR REPLACE TABLE (#265) ---
+        # A single statement commits the new schema + data in one metastore
+        # transaction. There is no staging table and no DROP-then-RENAME window,
+        # so the TABLE_NOT_FOUND visibility flake and the post-DROP data-loss
+        # window of the #191 swap are both gone. CREATE OR REPLACE writes a
+        # fresh schema wholesale (not a positional ALTER), so it also sidesteps
+        # the ICEBERG_COMMIT_ERROR class seen with ALTER DROP COLUMN.
         partition_clause = ''
         if partition_columns:
             cols = ", ".join(f"'{c}'" for c in partition_columns)
@@ -214,7 +214,7 @@ def run_silver_transform(
         # DUPLICATE_COLUMN_NAME. Such callers pass add_timestamp=False.
         if add_timestamp:
             ctas_sql = (
-                f"CREATE TABLE {staging_full}\n"
+                f"CREATE OR REPLACE TABLE {full_table}\n"
                 f"{partition_clause}"
                 f"AS\n"
                 f"SELECT *, CURRENT_TIMESTAMP AS _silver_created_at\n"
@@ -224,25 +224,16 @@ def run_silver_transform(
             )
         else:
             ctas_sql = (
-                f"CREATE TABLE {staging_full}\n"
+                f"CREATE OR REPLACE TABLE {full_table}\n"
                 f"{partition_clause}"
                 f"AS\n"
                 f"{select_sql}"
             )
 
-        logger.info(f"Executing CTAS for staging {staging_full} ...")
+        logger.info(f"Executing CREATE OR REPLACE TABLE {full_table} ...")
         _execute(conn, ctas_sql)
 
-        # --- 6. Atomic swap: drop old, rename staging into place ---
-        # Partitioning lives on the staging table and survives RENAME (metadata
-        # only). RENAME also avoids the ICEBERG_COMMIT_ERROR class seen with
-        # ALTER DROP COLUMN on schema-evolved tables — each rebuild is a fresh
-        # table with clean manifests.
-        logger.info(f"Swapping staging into place: {staging_full} -> {full_table}")
-        _execute(conn, f"DROP TABLE IF EXISTS {full_table}")
-        _execute(conn, f"ALTER TABLE {staging_full} RENAME TO {full_table}")
-
-        # --- 7. Count rows ---
+        # --- 5. Count rows ---
         count_result = _execute(
             conn,
             f"SELECT COUNT(*) FROM {full_table}",
@@ -255,12 +246,9 @@ def run_silver_transform(
         logger.info(f"Silver transform complete: {full_table} => {row_count} rows")
 
     except Exception as e:
-        # Best-effort staging cleanup; the live table is already safe because
-        # we only drop it AFTER the staging CTAS succeeds (#191).
-        try:
-            _execute(conn, f"DROP TABLE IF EXISTS {staging_full}")
-        except Exception:
-            pass
+        # CREATE OR REPLACE is atomic at the Iceberg commit level — a failing
+        # SELECT leaves the existing table intact, so there is nothing to clean
+        # up. Surface the real error (#265).
         result['status'] = 'failed'
         result['error'] = str(e)
         logger.error(f"Silver transform FAILED for {full_table}: {e}")
