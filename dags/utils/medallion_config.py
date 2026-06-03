@@ -265,7 +265,8 @@ def _team_in_scope(team: Dict, competition: Optional[str]) -> bool:
 def _iter_team_aliases(
     source: Optional[str],
     competition: Optional[str],
-) -> List[Tuple[str, str, str]]:
+    include_league: bool = False,
+) -> List[Tuple[str, ...]]:
     """Yield (raw_name, canonical_name, canonical_id) tuples filtered by
     source/competition.
 
@@ -276,19 +277,32 @@ def _iter_team_aliases(
       * competition=None -> all teams.
       * competition=X    -> teams whose competition_scope contains X.
 
+    When ``include_league=True`` each alias is emitted once per competition in
+    the team's ``competition_scope`` (defaulting to ``['ENG-Premier League']``)
+    as a 4-tuple ``(raw, canonical, canonical_id, league)``. This lets the
+    xref_team alias JOIN add an ``a.league = rt.league`` predicate (issue #148)
+    so a bare short name disambiguates by league at worldwide scope. When
+    ``include_league=False`` (default) the historical 3-tuple shape is kept.
+
     Deduplication: the same (raw, canonical) pair may appear in multiple
     buckets (e.g. _generic + matchhistory). We dedupe with an order-preserving
     seen-set so the output is stable for unit tests and SQL-diff review.
     """
     doc = load_team_aliases()
     seen: set = set()
-    out: List[Tuple[str, str, str]] = []
+    out: List[Tuple[str, ...]] = []
     for team in doc['teams']:
         if not _team_in_scope(team, competition):
             continue
         canonical = team['canonical_name']
         canonical_id = team['canonical_id']
         aliases = team.get('aliases') or {}
+        # In league mode, fan each alias out over the team's scope. The [None]
+        # sentinel keeps the non-league path at the historical 3-tuple shape.
+        leagues = (
+            (team.get('competition_scope') or ['ENG-Premier League'])
+            if include_league else [None]
+        )
 
         # Buckets to merge: _generic + (specific bucket OR every bucket).
         buckets: List[str] = [_GENERIC_BUCKET]
@@ -299,11 +313,16 @@ def _iter_team_aliases(
 
         for bucket in buckets:
             for raw in aliases.get(bucket, []) or []:
-                key = (raw, canonical, canonical_id)
-                if key in seen:
-                    continue
-                seen.add(key)
-                out.append(key)
+                for league in leagues:
+                    key = (
+                        (raw, canonical, canonical_id)
+                        if league is None
+                        else (raw, canonical, canonical_id, league)
+                    )
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    out.append(key)
     return out
 
 
@@ -380,6 +399,7 @@ def get_team_alias_sql_values(
     source: Optional[str] = None,
     competition: Optional[str] = None,
     with_canonical_id: bool = False,
+    with_league: bool = False,
 ) -> str:
     """Render alias pairs as a Trino VALUES body for inline CTAS embedding.
 
@@ -398,12 +418,21 @@ def get_team_alias_sql_values(
         ('Wolves', 'Wolverhampton Wanderers', 'wolverhampton_wanderers'),
         ...
 
+    When ``with_league=True`` each tuple additionally carries the league literal
+    (issue #148) — emitted once per competition in the team's
+    ``competition_scope`` — so the xref_team alias JOIN can guard on
+    ``a.league = rt.league`` and disambiguate bare short names by league:
+
+        ('Wolves', 'Wolverhampton Wanderers', 'wolverhampton_wanderers',
+         'ENG-Premier League'),
+        ...
+
     Intended use in T2 (xref_team.sql.j2):
 
         WITH aliases AS (
-            SELECT raw_name, canonical_name, canonical_id FROM (VALUES
+            SELECT raw_name, canonical_name, canonical_id, league FROM (VALUES
                 {{ team_alias_values }}
-            ) AS t(raw_name, canonical_name, canonical_id)
+            ) AS t(raw_name, canonical_name, canonical_id, league)
         )
 
     Apostrophes in raw names (e.g. ``Nott'm Forest``) are escaped to
@@ -411,25 +440,33 @@ def get_team_alias_sql_values(
     a CTAS over an empty VALUES is invalid Trino syntax, and an empty
     alias map almost certainly indicates a misconfigured filter.
     """
-    triples = _iter_team_aliases(source, competition)
-    if not triples:
+    rows = _iter_team_aliases(source, competition, include_league=with_league)
+    if not rows:
         raise MedallionConfigError(
             f"get_team_alias_sql_values produced 0 pairs "
             f"(source={source!r}, competition={competition!r}); "
             "an empty VALUES clause is invalid Trino — refusing to emit."
         )
-    if with_canonical_id:
+    if with_league:
+        lines = [
+            f"    ('{_escape_sql_string(raw)}', "
+            f"'{_escape_sql_string(canonical)}', "
+            f"'{_escape_sql_string(cid)}', "
+            f"'{_escape_sql_string(league)}')"
+            for raw, canonical, cid, league in rows
+        ]
+    elif with_canonical_id:
         lines = [
             f"    ('{_escape_sql_string(raw)}', "
             f"'{_escape_sql_string(canonical)}', "
             f"'{_escape_sql_string(cid)}')"
-            for raw, canonical, cid in triples
+            for raw, canonical, cid in rows
         ]
     else:
         lines = [
             f"    ('{_escape_sql_string(raw)}', "
             f"'{_escape_sql_string(canonical)}')"
-            for raw, canonical, _cid in triples
+            for raw, canonical, _cid in rows
         ]
     return ',\n'.join(lines).lstrip()
 

@@ -121,7 +121,9 @@ def _run_xref_team(**context) -> Dict[str, Any]:
 
     rendered_sql = render_sql_template(
         template_path,
-        team_aliases_values_sql=get_team_alias_sql_values(with_canonical_id=True),
+        team_aliases_values_sql=get_team_alias_sql_values(
+            with_canonical_id=True, with_league=True
+        ),
     )
     logger.info(
         "Rendered xref_team.sql.j2 — %d chars (template embeds %d alias pairs)",

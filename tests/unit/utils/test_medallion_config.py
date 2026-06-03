@@ -428,6 +428,50 @@ def test_sql_values_default_stays_two_columns(mock_config_dir):
         assert line.count("', '") == 1, line
 
 
+def test_sql_values_with_league_emits_four_columns(mock_config_dir):
+    # issue #148: xref_team renders 4-tuples carrying the league literal so the
+    # alias JOIN can guard on `a.league = rt.league`.
+    sql = mock_config_dir.get_team_alias_sql_values(with_league=True)
+    # The Wolves row must carry raw, canonical_name, canonical_id AND league.
+    assert (
+        "('Wolves', 'Wolverhampton Wanderers', 'wolverhampton_wanderers', "
+        "'ENG-Premier League')"
+    ) in sql
+    # Every tuple has exactly 4 comma-separated literals → 3 separators.
+    for line in sql.splitlines():
+        line = line.strip().rstrip(",").strip("()")
+        assert line.count("', '") == 3, line
+
+
+def test_sql_values_with_league_expands_per_competition(tmp_path, monkeypatch):
+    # A team scoped to TWO competitions emits each alias once per league
+    # (issue #148) — the league-tagged rows let the JOIN disambiguate a bare
+    # short name (e.g. "Spartak") by league at worldwide scope.
+    (tmp_path / "team_aliases.yaml").write_text(
+        "teams:\n"
+        "  - canonical_name: 'Spartak Moscow'\n"
+        "    canonical_id: 'spartak_moscow'\n"
+        "    aliases:\n"
+        "      _generic: ['Spartak']\n"
+        "    competition_scope: ['RUS-Premier League', 'UEFA-Champions League']\n"
+    )
+    (tmp_path / "competitions.yaml").write_text(_MOCK_COMPETITIONS)
+    monkeypatch.setenv("MEDALLION_CONFIG_DIR", str(tmp_path))
+
+    import importlib
+    from utils import medallion_config
+    importlib.reload(medallion_config)
+    medallion_config.reset_cache()
+
+    sql = medallion_config.get_team_alias_sql_values(with_league=True)
+    rows = [line.strip().rstrip(",") for line in sql.splitlines()]
+    # One alias × two leagues → exactly two rows, one per competition.
+    assert rows == [
+        "('Spartak', 'Spartak Moscow', 'spartak_moscow', 'RUS-Premier League')",
+        "('Spartak', 'Spartak Moscow', 'spartak_moscow', 'UEFA-Champions League')",
+    ]
+
+
 def test_sql_values_raises_on_empty_result(mock_config_dir):
     # Filtering by an unknown source AND an unknown competition produces
     # zero rows — the loader refuses to emit invalid Trino syntax.
