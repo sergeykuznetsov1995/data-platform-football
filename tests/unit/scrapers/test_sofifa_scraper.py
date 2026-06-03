@@ -27,19 +27,29 @@ class TestSoFIFAScraper:
 
     @pytest.fixture
     def mock_soccerdata_sofifa(self):
-        """Mock soccerdata SoFIFA reader."""
-        with patch.dict('sys.modules', {'soccerdata': MagicMock()}):
-            import soccerdata as sd
+        """Mock the FlareSolverr-backed SoFIFA reader so scrape_* never hits the network.
 
-            reader = MagicMock()
-            reader.read_players.return_value = pd.DataFrame({
-                'player': ['Haaland', 'Mbappe'],
-                'overall': [91, 91],
-                'potential': [94, 95],
-                'pace': [89, 97],
-            })
+        Patch the lazily-imported reader class directly instead of
+        ``sys.modules['soccerdata']`` (issue #262): once
+        ``scrapers.sofifa.flaresolverr_reader`` is imported with the real
+        soccerdata (e.g. by ``test_sofifa_flaresolverr_reader``), the
+        ``FlareSolverrSoFIFAReader(sd.SoFIFA)`` subclass is bound to the real
+        ``sd.SoFIFA`` and a later ``sys.modules`` swap no longer rebinds it — so
+        ``scrape_all`` would construct a real reader and fire a live
+        ``create_session`` call. Patching the reader class is import-order safe.
+        """
+        reader = MagicMock()
+        reader.read_players.return_value = pd.DataFrame({
+            'player': ['Haaland', 'Mbappe'],
+            'overall': [91, 91],
+            'potential': [94, 95],
+            'pace': [89, 97],
+        })
 
-            sd.SoFIFA.return_value = reader
+        with patch(
+            'scrapers.sofifa.flaresolverr_reader.FlareSolverrSoFIFAReader',
+            return_value=reader,
+        ):
             yield reader
 
     @pytest.fixture
