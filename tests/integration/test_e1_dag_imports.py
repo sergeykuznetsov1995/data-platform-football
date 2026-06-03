@@ -12,15 +12,13 @@ module is self-sufficient (mirrors ``test_e5_dag_imports.py``).
 from __future__ import annotations
 
 import os
-import sys
 from pathlib import Path
 
 import pytest
 
+# sys.path setup (project root + dags folder) is centralised in the root conftest.py.
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DAGS_FOLDER = PROJECT_ROOT / "dags"
-sys.path.insert(0, str(PROJECT_ROOT))
-sys.path.insert(0, str(DAGS_FOLDER))
 
 
 @pytest.fixture(scope="module")

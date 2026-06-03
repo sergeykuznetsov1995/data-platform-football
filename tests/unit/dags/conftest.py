@@ -19,26 +19,18 @@ from __future__ import annotations
 
 import sys
 import types
-from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
 
 
-# ---------------------------------------------------------------------------
-# 1. Make sure the project root + dags/ are on sys.path so test files can
-#    `import dags.dag_superset_alerts` and `from utils.alerts import ...`.
-# ---------------------------------------------------------------------------
-PROJECT_ROOT = Path(__file__).resolve().parents[3]
-DAGS_DIR = PROJECT_ROOT / "dags"
-
-for p in (str(PROJECT_ROOT), str(DAGS_DIR)):
-    if p not in sys.path:
-        sys.path.insert(0, p)
+# sys.path setup (project root + dags/ so test files can
+# `import dags.dag_superset_alerts` and `from utils.alerts import ...`) is
+# centralised in the root conftest.py.
 
 
 # ---------------------------------------------------------------------------
-# 2. Install minimal Airflow stubs BEFORE any test imports a DAG module.
+# Install minimal Airflow stubs BEFORE any test imports a DAG module.
 # ---------------------------------------------------------------------------
 def _install_airflow_stubs() -> None:
     """Idempotent — only inject stubs if real Airflow is missing.

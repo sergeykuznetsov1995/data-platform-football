@@ -10,19 +10,15 @@ Run with: pytest tests/integration/test_storage_pipeline.py -v -m integration
 """
 
 import os
-import sys
 import uuid
 from datetime import date, datetime
-from pathlib import Path
 
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-# Add project root to path
-project_root = Path(__file__).parent.parent.parent
-sys.path.insert(0, str(project_root))
+# sys.path setup (project root + dags folder) is centralised in the root conftest.py.
 
 
 # Mark all tests in this module as integration tests

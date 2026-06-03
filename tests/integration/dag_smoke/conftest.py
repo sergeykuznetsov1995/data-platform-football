@@ -3,17 +3,14 @@ Pytest fixtures for DAG integration tests.
 """
 
 import os
-import sys
 from pathlib import Path
 
 import pytest
 
 
-# Add project root and dags folder to path for imports
+# sys.path setup (project root + dags folder) is centralised in the root conftest.py.
 PROJECT_ROOT = Path(__file__).parent.parent.parent.parent
 DAGS_FOLDER = PROJECT_ROOT / 'dags'
-sys.path.insert(0, str(PROJECT_ROOT))
-sys.path.insert(0, str(DAGS_FOLDER))
 
 
 @pytest.fixture(scope='session')

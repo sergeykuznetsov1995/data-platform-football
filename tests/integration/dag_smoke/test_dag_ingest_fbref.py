@@ -9,17 +9,14 @@ These tests verify:
 """
 
 import os
-import sys
 from pathlib import Path
 
 import pytest
 
 
-# Ensure project paths are in sys.path
+# sys.path setup (project root + dags folder) is centralised in the root conftest.py.
 PROJECT_ROOT = Path(__file__).parent.parent.parent.parent
 DAGS_FOLDER = PROJECT_ROOT / 'dags'
-sys.path.insert(0, str(PROJECT_ROOT))
-sys.path.insert(0, str(DAGS_FOLDER))
 
 
 @pytest.fixture(scope='module')
