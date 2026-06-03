@@ -143,16 +143,9 @@ class FBrefDataReaderMixin:
             )
             return None
 
-        # Extract match URLs from the table HTML
-        # (pd.read_html extracts text, not href URLs)
-        from scrapers.fbref.html_parser import extract_match_urls_from_schedule
-        match_urls = extract_match_urls_from_schedule(
-            soup, comment_tables, season_str, comp_id
-        )
-        df['match_url'] = df.index.map(match_urls) if match_urls else None
-        if match_urls:
-            logger.debug(f"Extracted {len(match_urls)} match URLs from schedule")
-        else:
+        # match_url is populated inside find_schedule_table → parse_table
+        # (mapped before row filtering so URLs stay aligned with fixtures, #241).
+        if 'match_url' not in df.columns or not df['match_url'].notna().any():
             logger.warning(f"No match URLs extracted from schedule HTML for {league} {season}")
 
         # Add metadata

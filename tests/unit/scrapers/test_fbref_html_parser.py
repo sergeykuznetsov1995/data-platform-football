@@ -1210,3 +1210,93 @@ class TestParseScheduleRepeatedHeaders:
         assert df is not None
         assert 'Home' not in df['Home'].values
         assert len(df) == 2
+
+
+class TestExtractMatchUrlsFromSchedule:
+    """match_url must stay aligned with the right fixture even when the
+    schedule HTML interleaves spacer rows, repeated header rows, and future
+    (link-less) rows. Misalignment is the root cause of issue #241 — it made
+    FBref emit the same fixture under an alternate match-page hex.
+    """
+
+    # tbody order: 2 played matches, a spacer row, a repeated header row,
+    # another played match, and a future match (Head-to-Head link, NOT a
+    # match-report). pd.read_html keeps every tbody row (spacer/header as
+    # NaN/text), so the extractor must count them all to stay aligned.
+    SCHEDULE_HTML = """
+    <html>
+    <table id="sched_all">
+        <thead>
+            <tr><th>Wk</th><th>Home</th><th>Score</th><th>Away</th><th>Match Report</th></tr>
+        </thead>
+        <tbody>
+            <tr><td>1</td><td>Arsenal</td><td>2-1</td><td>Chelsea</td>
+                <td><a href="/en/matches/aaaaaaaa/Arsenal-Chelsea">Match Report</a></td></tr>
+            <tr><td>1</td><td>Spurs</td><td>0-0</td><td>Everton</td>
+                <td><a href="/en/matches/bbbbbbbb/Spurs-Everton">Match Report</a></td></tr>
+            <tr class="spacer"><td colspan="5"></td></tr>
+            <tr><td>Wk</td><td>Home</td><td>Score</td><td>Away</td><td>Match Report</td></tr>
+            <tr><td>2</td><td>Liverpool</td><td>3-1</td><td>Leeds</td>
+                <td><a href="/en/matches/cccccccc/Liverpool-Leeds">Match Report</a></td></tr>
+            <tr><td>3</td><td>City</td><td></td><td>United</td>
+                <td><a href="/en/matches/2026-05-01">Head-to-Head</a></td></tr>
+        </tbody>
+    </table>
+    </html>
+    """
+
+    def _table(self):
+        from bs4 import BeautifulSoup
+        return BeautifulSoup(self.SCHEDULE_HTML, 'html.parser').find('table')
+
+    def test_indices_align_with_pandas_rows(self):
+        """data_row_idx must count spacer/header rows (pd.read_html keeps them)."""
+        from scrapers.fbref.html_parser import extract_match_urls_from_schedule
+
+        match_urls = extract_match_urls_from_schedule(self._table())
+
+        # row 0 Arsenal, row 1 Spurs, row 2 spacer (none), row 3 header (none),
+        # row 4 Liverpool, row 5 future Head-to-Head (none).
+        assert match_urls == {
+            0: '/en/matches/aaaaaaaa/Arsenal-Chelsea',
+            1: '/en/matches/bbbbbbbb/Spurs-Everton',
+            4: '/en/matches/cccccccc/Liverpool-Leeds',
+        }
+
+    def test_none_table(self):
+        from scrapers.fbref.html_parser import extract_match_urls_from_schedule
+
+        assert extract_match_urls_from_schedule(None) == {}
+
+    def test_parse_table_maps_url_to_correct_fixture(self):
+        """Regression guard for #241: each surviving row keeps ITS OWN url."""
+        from bs4 import BeautifulSoup
+        from scrapers.fbref.html_parser import parse_table
+
+        soup = BeautifulSoup(self.SCHEDULE_HTML, 'html.parser')
+        df = parse_table(soup, 'sched_all', extract_match_urls=True)
+
+        assert df is not None
+        assert 'match_url' in df.columns
+        url_by_home = dict(zip(df['Home'], df['match_url']))
+        assert url_by_home['Arsenal'] == '/en/matches/aaaaaaaa/Arsenal-Chelsea'
+        assert url_by_home['Spurs'] == '/en/matches/bbbbbbbb/Spurs-Everton'
+        assert url_by_home['Liverpool'] == '/en/matches/cccccccc/Liverpool-Leeds'
+        # Future match (Head-to-Head, no match report) must NOT receive a hex url.
+        assert pd.isna(url_by_home['City'])
+        # Repeated header row dropped; no skeleton/duplicate hex leaked in.
+        assert 'Home' not in df['Home'].values
+
+    def test_find_schedule_table_populates_match_url(self):
+        """End-to-end: find_schedule_table wires extract_match_urls=True."""
+        from bs4 import BeautifulSoup
+        from scrapers.fbref.parsers.finders import find_schedule_table
+
+        soup = BeautifulSoup(self.SCHEDULE_HTML, 'html.parser')
+        df = find_schedule_table(soup, {}, '2025-2026', '9')
+
+        assert df is not None
+        assert 'match_url' in df.columns
+        url_by_home = dict(zip(df['Home'], df['match_url']))
+        assert url_by_home['Liverpool'] == '/en/matches/cccccccc/Liverpool-Leeds'
+        assert pd.isna(url_by_home['City'])
