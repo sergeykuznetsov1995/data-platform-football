@@ -177,9 +177,9 @@ exit $rc
     def _validate_bronze_quality(**ctx) -> None:
         """Trino-level CHECK gate over bronze.capology_player_salaries.
 
-        WARNING-severity in the MVP so CAPOLOGY_FALLBACK soft-exits don't
-        fail the gate; promote individual checks to ERROR after a few
-        green weekly runs.
+        row_count / no_duplicates are ERROR-severity (promoted after green
+        weekly runs, issue #48); no_nulls / freshness stay WARNING so a
+        CAPOLOGY_FALLBACK soft-exit doesn't hard-fail the gate.
         """
         from utils.data_quality import CHECK, run_checks
 
@@ -194,12 +194,12 @@ exit $rc
         checks = [
             CHECK.row_count(
                 'bronze.capology_player_salaries',
-                min_rows=400, where=where, severity='WARNING',
+                min_rows=400, where=where, severity='ERROR',
             ),
             CHECK.no_duplicates(
                 'bronze.capology_player_salaries',
                 pk=['league', 'season', 'currency', 'player_slug', 'club_slug'],
-                where=where, severity='WARNING',
+                where=where, severity='ERROR',
             ),
             CHECK.no_nulls(
                 'bronze.capology_player_salaries',
@@ -212,7 +212,7 @@ exit $rc
                 where=where, severity='WARNING',
             ),
         ]
-        report = run_checks(checks, raise_on_error=False)
+        report = run_checks(checks, raise_on_error=True)
         import logging
         logging.getLogger(__name__).info(
             "validate_bronze_quality: %s", report.summary(),

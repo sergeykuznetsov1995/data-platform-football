@@ -283,10 +283,11 @@ exit $rc
     def _validate_bronze_quality(**ctx) -> None:
         """Trino-level CHECK gate over the 3 Transfermarkt Bronze tables.
 
-        All checks are WARNING-severity in the MVP — a TM_FALLBACK soft
-        exit upstream would otherwise (legitimately) fail row_count /
-        freshness here. Promote individual checks to ERROR after a few
-        green weekly runs.
+        transfermarkt_players checks (row_count/no_duplicates/no_nulls/
+        freshness) are ERROR-severity (promoted after green weekly runs,
+        issue #48). market_value_history / transfers row_count stay
+        WARNING — a TM_FALLBACK soft exit upstream would otherwise
+        legitimately fail them.
         """
         from utils.data_quality import CHECK, run_checks
 
@@ -298,22 +299,22 @@ exit $rc
         checks = [
             CHECK.row_count(
                 'bronze.transfermarkt_players',
-                min_rows=400, where=where, severity='WARNING',
+                min_rows=400, where=where, severity='ERROR',
             ),
             CHECK.no_duplicates(
                 'bronze.transfermarkt_players',
                 pk=['league', 'season', 'player_id'],
-                where=where, severity='WARNING',
+                where=where, severity='ERROR',
             ),
             CHECK.no_nulls(
                 'bronze.transfermarkt_players',
                 cols=['player_id', 'name'],
-                where=where, severity='WARNING',
+                where=where, severity='ERROR',
             ),
             CHECK.freshness(
                 'bronze.transfermarkt_players',
                 ts_col='_ingested_at', max_age_hours=48,
-                where=where, severity='WARNING',
+                where=where, severity='ERROR',
             ),
             CHECK.row_count(
                 'bronze.transfermarkt_market_value_history',
@@ -324,7 +325,7 @@ exit $rc
                 min_rows=50, where=where, severity='WARNING',
             ),
         ]
-        report = run_checks(checks, raise_on_error=False)
+        report = run_checks(checks, raise_on_error=True)
         import logging
         logging.getLogger(__name__).info(
             "validate_bronze_quality: %s", report.summary(),
