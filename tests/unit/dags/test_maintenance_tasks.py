@@ -57,3 +57,38 @@ class TestHighChurnBronzeAllowlist:
         from utils.maintenance_tasks import HIGH_CHURN_BRONZE
 
         assert len(set(HIGH_CHURN_BRONZE)) == len(HIGH_CHURN_BRONZE)
+
+    def test_daily_fotmob_sofascore_espn_writers_listed(self):
+        """#266: these daily writers bloated to multi-GB metadata
+        (fotmob_match_details hit 7.2 GB / 154 MB data) because they were
+        never on the allow-list. They must stay listed."""
+        from utils.maintenance_tasks import HIGH_CHURN_BRONZE
+
+        for table in (
+            "fotmob_match_details",
+            "fotmob_player_details",
+            "fotmob_player_stats",
+            "sofascore_player_ratings",
+            "espn_lineup",
+            "espn_matchsheet",
+        ):
+            assert table in HIGH_CHURN_BRONZE, (
+                f"{table!r} must be in HIGH_CHURN_BRONZE (#266)."
+            )
+
+
+@pytest.mark.unit
+class TestSessionMinRetention:
+    """#266: the daily DAG asks for '3d', shorter than Trino's 7d default
+    floor. The per-session override must be strictly shorter than any
+    threshold the module uses, or every expire is rejected and the sweep
+    no-ops silently."""
+
+    def test_session_floor_below_daily_threshold(self):
+        from utils.maintenance_tasks import SESSION_MIN_RETENTION
+
+        # '1h' parsed crudely: must be sub-day so it clears the 3d daily ask.
+        assert SESSION_MIN_RETENTION.endswith(("h", "m", "s")), (
+            "SESSION_MIN_RETENTION must be sub-day (e.g. '1h') so the "
+            "daily '3d' threshold is honored."
+        )

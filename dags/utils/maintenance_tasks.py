@@ -13,6 +13,17 @@ Trino DOES NOT expose Iceberg table properties like
 extra_properties (Iceberg connector blocks `write.metadata.*` keys), so the
 only way to keep the warehouse healthy is periodic sweeps from this module.
 
+IMPORTANT (#266): `expire_snapshots` / `remove_orphan_files` reject any
+`retention_threshold` shorter than Trino's configured minimum
+(`iceberg.expire_snapshots_min_retention` / `..._remove_orphan_files...`,
+both default 7d) with `INVALID_PROCEDURE_ARGUMENT`. The daily high-churn DAG
+asks for '3d', so without lowering that minimum every expire silently fails
+and the sweep becomes a no-op. We lower it PER SESSION (`SET SESSION ...`) at
+connection time — scoped to this connection only, no Trino restart, no global
+config change. High-churn tables (e.g. `fotmob_match_details`) also commit
+hundreds of snapshots per run, so the per-session floor must be well under the
+requested threshold.
+
 Uses `_get_trino_connection()` from `silver_tasks` (lightweight `import trino`,
 avoids heavy `scrapers/__init__.py`).
 """
@@ -31,6 +42,12 @@ logger = logging.getLogger(__name__)
 DEFAULT_SCHEMAS: Tuple[str, ...] = ("bronze", "silver", "gold")
 DEFAULT_RETENTION = "7d"
 
+# Per-session floor for the expire/orphan retention guards. Set well below any
+# `retention_threshold` this module uses (down to '3d' for daily high-churn) so
+# the requested threshold is always honored. See #266 — without this the daily
+# sweep's '3d' is rejected by Trino's 7d default and every expire no-ops.
+SESSION_MIN_RETENTION = "1h"
+
 # High-churn tables — daily DAGs do delete-then-insert, so even a 7-day
 # retention leaves >14 stale snapshots between weekly sweeps. Run a separate
 # daily DAG with retention='3d' against this allowlist.
@@ -45,8 +62,48 @@ HIGH_CHURN_BRONZE: Tuple[str, ...] = (
     "fbref_lineups",
     "understat_shots",
     "understat_player_match_stats",
+    "understat_players",
+    "understat_schedule",
+    "understat_team_match_stats",
     "matchhistory_games",
+    # #266: daily fotmob/sofascore/espn writers were never on the list and
+    # bloated to multi-GB metadata (fotmob_match_details hit 7.2G / 154M data).
+    "fotmob_match_details",
+    "fotmob_player_details",
+    "fotmob_player_stats",
+    "sofascore_player_ratings",
+    "sofascore_event_player_stats",
+    "sofascore_match_stats",
+    "espn_lineup",
+    "espn_matchsheet",
 )
+
+
+def _set_session_min_retention(conn) -> None:
+    """Lower the expire/orphan retention floor for THIS session only (#266).
+
+    Trino rejects `retention_threshold` shorter than the configured minimum
+    (default 7d). Scoped `SET SESSION` lets the daily DAG's '3d' (and the
+    aggressive cleanup of churn tables) actually run, without a Trino restart
+    or a global config change.
+    """
+    cur = conn.cursor()
+    try:
+        for prop in (
+            "iceberg.expire_snapshots_min_retention",
+            "iceberg.remove_orphan_files_min_retention",
+        ):
+            cur.execute(f"SET SESSION {prop} = '{SESSION_MIN_RETENTION}'")
+            cur.fetchall()
+    finally:
+        cur.close()
+
+
+def _connect():
+    """Open a Trino connection with the session retention floor lowered."""
+    conn = _get_trino_connection()
+    _set_session_min_retention(conn)
+    return conn
 
 
 def _row_to_stats(cursor) -> dict:
@@ -121,7 +178,7 @@ def maintain_iceberg_tables(
         table_filter: if set, only tables whose short name is in this set
             are processed (used by the daily high-churn DAG).
     """
-    conn = _get_trino_connection()
+    conn = _connect()
     total_tables = 0
     total_deleted = 0
     total_scanned = 0
@@ -139,7 +196,7 @@ def maintain_iceberg_tables(
                 conn.close()
             except Exception:
                 pass
-            conn = _get_trino_connection()
+            conn = _connect()
             continue
 
         for tn in tables:
@@ -162,7 +219,7 @@ def maintain_iceberg_tables(
                     conn.close()
                 except Exception:
                     pass
-                conn = _get_trino_connection()
+                conn = _connect()
             except Exception as e:
                 logger.error("Maintenance failed on %s: %s", fq, e)
                 failures.append((fq, str(e)[:300]))
@@ -178,6 +235,16 @@ def maintain_iceberg_tables(
         conn.close()
     except Exception:
         pass
+
+    # #266: a systemic misconfiguration (e.g. min-retention floor above the
+    # requested threshold) makes EVERY per-table expire fail while the task
+    # still returns "success". Raise when nothing could be processed so the
+    # sweep can no longer no-op silently.
+    if total_tables > 0 and len(failures) >= total_tables:
+        raise RuntimeError(
+            f"Iceberg maintenance failed on all {total_tables} tables "
+            f"(first error: {failures[0][1]})"
+        )
 
     return {
         "tables_processed": total_tables,
