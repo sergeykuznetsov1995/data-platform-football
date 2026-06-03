@@ -53,18 +53,25 @@ class TestXrefRefereeTemplateStructure:
             "placeholder consumed by medallion_config.render_sql_template()"
         )
 
-    def test_two_sources_fbref_and_matchhistory(self):
+    def test_three_sources_fbref_matchhistory_fotmob(self):
         sql = _read_template().lower()
-        assert "'fbref'" in sql and "'matchhistory'" in sql
+        assert "'fbref'" in sql and "'matchhistory'" in sql and "'fotmob'" in sql
+
+    def test_fotmob_source_branch(self):
+        """FotMob (issue #270): 'fotmob' AS source reading match_facts_json."""
+        sql = _read_template().lower()
+        assert re.search(r"'fotmob'\s+as\s+source", sql)
+        assert "iceberg.bronze.fotmob_match_details" in sql
+        assert "$.infobox.referee.text" in sql
 
     def test_no_other_sources(self):
         sql = _read_template().lower()
         for forbidden in ["'understat'", "'whoscored'", "'sofascore'",
-                          "'fotmob'", "'clubelo'", "'espn'"]:
+                          "'clubelo'", "'espn'"]:
             pattern = re.compile(re.escape(forbidden) + r"\s+as\s+source", re.I)
             assert not pattern.search(sql), (
                 f"{forbidden} must not be a source in xref_referee — only "
-                "fbref + matchhistory carry referee data (FotMob → issue #270)"
+                "fbref + matchhistory + fotmob carry referee data (issue #270)"
             )
 
     def test_has_aliases_cte(self):
@@ -84,6 +91,7 @@ class TestXrefRefereeTemplateStructure:
     def test_orphan_prefixes(self):
         sql = _read_template().lower()
         assert "'fb_ref_'" in sql and "'mh_ref_'" in sql
+        assert "'fm_ref_'" in sql  # FotMob orphan fallback (issue #270)
 
     def test_diacritic_fold_idiom(self):
         r"""NFD + \p{Mn} strip — same fold as xref_team/xref_manager (issue #215)."""

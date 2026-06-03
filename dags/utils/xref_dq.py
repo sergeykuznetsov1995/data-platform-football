@@ -220,7 +220,7 @@ def build_xref_referee_checks() -> List[Check]:
 
         check_enum_compliance(
             table, 'source',
-            allowed=['fbref', 'matchhistory'],
+            allowed=['fbref', 'matchhistory', 'fotmob'],
             severity='ERROR',
         ),
 
@@ -233,13 +233,14 @@ def build_xref_referee_checks() -> List[Check]:
             severity='ERROR',
         ),
 
-        # canonical_id format guard — 'ref_' (aliased) or 'fb_ref_'/'mh_ref_'
-        # (orphan fallback). Mirrors xref_player's prefix guard.
+        # canonical_id format guard — 'ref_' (aliased) or
+        # 'fb_ref_'/'mh_ref_'/'fm_ref_' (orphan fallback). Mirrors xref_player's
+        # prefix guard. 'fm_ref_' = FotMob orphan (issue #270).
         CHECK.row_count(
             table=table,
             min_rows=0,
             max_rows=0,
-            where="NOT regexp_like(canonical_id, '^(ref|fb_ref|mh_ref)_.+$')",
+            where="NOT regexp_like(canonical_id, '^(ref|fb_ref|mh_ref|fm_ref)_.+$')",
             severity='ERROR',
             name='canonical_id_format[xref_referee]',
         ),

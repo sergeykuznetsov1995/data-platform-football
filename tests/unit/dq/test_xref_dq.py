@@ -245,6 +245,7 @@ def test_xref_referee_source_enum():
     where = src_checks[0].params['where']
     assert "'fbref'" in where
     assert "'matchhistory'" in where
+    assert "'fotmob'" in where  # 3rd source (issue #270)
 
 
 def test_xref_referee_confidence_enum_is_name_alias_orphan():
