@@ -15,7 +15,6 @@ against the actual DAG topology.
 from __future__ import annotations
 
 import os
-import sys
 from pathlib import Path
 
 import pytest
@@ -33,9 +32,8 @@ def _resolve_dags_folder() -> Path:
     return Path("/opt/airflow/dags")
 
 
+# sys.path setup (project root + dags folder) is centralised in the root conftest.py.
 DAGS_FOLDER = _resolve_dags_folder()
-sys.path.insert(0, str(PROJECT_ROOT))
-sys.path.insert(0, str(DAGS_FOLDER))
 
 
 _E4_DAG_PRESENT = (DAGS_FOLDER / "dag_transform_e4.py").exists()
