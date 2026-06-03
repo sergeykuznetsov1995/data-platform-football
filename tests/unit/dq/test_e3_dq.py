@@ -82,15 +82,17 @@ class TestCheckCounts:
         assert len(espn) == 4
 
     def test_gold_e3_total_check_count(self):
-        """Gold builders total: fct_event (11) + fct_shot (7) + fct_lineup (8) = 26.
+        """Gold builders total: fct_event (11) + fct_shot (7) + fct_lineup (9) = 27.
 
         fct_event grew by 1 check in Task 2.1 — Phase B re-enabled the
         ``ref_integrity[fct_event.match_id_canonical -> silver.xref_match]``
         gate that was disabled during the v0_unbridged interim.
+        fct_lineup grew by 1 in issue #242 — added the canon-spine
+        ``ref_integrity[fct_lineup.fbref->dim_match]`` alt-hex guard.
         """
         checks = e3_dq.build_gold_e3_checks()
-        assert len(checks) == 26, (
-            f"Gold E3 expected 26 checks, got {len(checks)}: "
+        assert len(checks) == 27, (
+            f"Gold E3 expected 27 checks, got {len(checks)}: "
             f"{[c.name for c in checks]}"
         )
 
@@ -127,16 +129,16 @@ class TestCheckCounts:
             if c.params.get("table") == "iceberg.gold.fct_lineup"
             or c.params.get("child") == "gold.fct_lineup"
         ]
-        assert len(fct_lineup) == 8
+        assert len(fct_lineup) == 9
 
     def test_build_all_e3_checks_total(self):
-        """44 silver + 26 gold = 70 total E3 standard DQ checks.
+        """44 silver + 27 gold = 71 total E3 standard DQ checks.
 
         Bump when either ``build_silver_e3_checks`` (44) or
-        ``build_gold_e3_checks`` (26) gains a builder.
+        ``build_gold_e3_checks`` (27) gains a builder.
         """
         all_checks = e3_dq.build_all_e3_checks()
-        assert len(all_checks) == 70
+        assert len(all_checks) == 71
 
 
 # ===========================================================================
@@ -276,17 +278,23 @@ class TestErrorSeverityChecks:
         assert ref[0].severity == "ERROR"
 
     def test_fct_lineup_ref_integrity_is_warning_until_e15_cutover(self):
-        """fct_lineup ref_integrity → silver.xref_match is WARNING (not ERROR)
-        until E1.5 cutover bridges fct_event.match_id_canonical from
-        'whoscored_raw' v0_unbridged to canonical IDs (E3 postmortem)."""
+        """fct_lineup has 2 ref_integrity guards, both WARNING (not ERROR):
+        - → silver.xref_match (ESPN-drift), WARNING until E1.5 cutover.
+        - → gold.dim_match scoped to FBref (issue #242 alt-hex guard), WARNING
+          until clean re-ingest (#258 gate)."""
         checks = e3_dq.build_gold_e3_checks()
         ref = [
             c for c in checks
             if c.kind == "ref_integrity"
             and c.params.get("child") == "gold.fct_lineup"
         ]
-        assert len(ref) == 1
-        assert ref[0].severity == "WARNING"
+        assert len(ref) == 2
+        assert all(c.severity == "WARNING" for c in ref)
+        parents = {c.params.get("parent") for c in ref}
+        assert parents == {"silver.xref_match", "gold.dim_match"}
+        # The dim_match guard must be scoped to FBref rows only.
+        dm = next(c for c in ref if c.params.get("parent") == "gold.dim_match")
+        assert dm.params.get("where") == "lineup_source = 'fbref'"
 
     def test_fct_lineup_fbref_coverage_dominant_is_error(self):
         checks = e3_dq.build_gold_e3_checks()

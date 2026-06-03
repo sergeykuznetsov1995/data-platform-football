@@ -893,6 +893,24 @@ def _build_fct_lineup_checks() -> List[Check]:
             severity='WARNING',
         ),
 
+        # issue #242: alt-hex FBref-дубли НЕ ловятся guard'ом выше — parent
+        # silver.xref_match сам несёт alt-hex (строится из fbref_schedule без
+        # date-фильтра, в отличие от fbref_match_enriched). dim_match — canon-
+        # only (FROM fbref_match_enriched, date IS NOT NULL), поэтому alt-hex
+        # lineup-строки становятся orphan'ами и флагаются. Scope
+        # lineup_source='fbref' исключает ESPN pseudo-id (espn_<hash> ∉
+        # dim_match). Severity WARNING пока грязный Bronze не вычищен полным
+        # re-ingest; flip → ERROR вместе с #258 (тот же гейт «clean re-ingest»).
+        CHECK.ref_integrity(
+            child='gold.fct_lineup',
+            parent='gold.dim_match',
+            key='match_id_canonical',
+            parent_key='match_id',
+            where="lineup_source = 'fbref'",
+            severity='WARNING',
+            name='ref_integrity[fct_lineup.fbref->dim_match]',
+        ),
+
         # Lineup-source distribution. FBref must dominate (canonical source).
         CHECK.row_count(
             table=table,
