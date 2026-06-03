@@ -1,9 +1,10 @@
 -- =============================================================================
 -- Silver: xref_referee   (Jinja-template — `.sql.j2`)
 -- =============================================================================
--- Maps source-specific referee-name → canonical referee_id across 2 sources
--- (FBref + MatchHistory). Issue #143: cross-source identity via a curated
--- alias dictionary, mirroring `xref_team.sql.j2` (#141/#148).
+-- Maps source-specific referee-name → canonical referee_id across 3 sources
+-- (FBref + MatchHistory + FotMob). Issue #143: cross-source identity via a
+-- curated alias dictionary, mirroring `xref_team.sql.j2` (#141/#148). FotMob
+-- added as the 3rd source in issue #270 (referee in match_facts_json).
 --
 -- This template renders ONE `{{ referee_aliases_values_sql }}` placeholder,
 -- filled by `medallion_config.get_referee_alias_sql_values(with_canonical_id=
@@ -25,8 +26,8 @@
 -- Schema (frozen for E1 dual-run)
 -- =============================================================================
 --   canonical_id   varchar  -- 'ref_<slug>' (aliased) | 'fb_ref_<slug>' |
---                              'mh_ref_<slug>' (orphan fallback)
---   source         varchar  -- 'fbref' | 'matchhistory'
+--                              'mh_ref_<slug>' | 'fm_ref_<slug>' (orphan fallback)
+--   source         varchar  -- 'fbref' | 'matchhistory' | 'fotmob'
 --   source_id      varchar  -- raw referee name as stored in Bronze
 --   display_name   varchar  -- canonical_name when aliased, else source_id
 --   league         varchar
@@ -37,7 +38,7 @@
 -- Testable invariants:
 --   * PK = (source, source_id, league, season) — guaranteed by final GROUP BY.
 --   * canonical_id is NEVER NULL.
---   * source ∈ {'fbref', 'matchhistory'}.
+--   * source ∈ {'fbref', 'matchhistory', 'fotmob'}.
 --   * confidence ∈ {'name_alias', 'orphan'}.
 --
 -- =============================================================================
@@ -45,6 +46,9 @@
 -- =============================================================================
 --   fbref_schedule.referee      : varchar (full name, e.g. 'Michael Oliver')
 --   matchhistory_games.referee  : varchar ('Initial Surname', e.g. 'M Oliver')
+--   fotmob_match_details.match_facts_json : varchar JSON; referee at
+--       $.infoBox.Referee.text — full name, e.g. 'Michael Oliver' (issue #270).
+--       Bronze keeps N ingest snapshots per match → dedup to latest below.
 -- =============================================================================
 
 WITH aliases AS (
@@ -79,6 +83,25 @@ raw_refs AS (
            CAST(season AS varchar) AS season
       FROM iceberg.bronze.matchhistory_games
      WHERE referee IS NOT NULL AND referee <> ''
+    UNION
+    -- FotMob (issue #270): referee in match_facts_json → $.infoBox.Referee.text.
+    -- Full-name form (== FBref) resolves via the bucket-agnostic alias JOIN with
+    -- zero YAML changes. Bronze keeps N ingest snapshots per match → dedup to the
+    -- latest per (match_id, league, season) before pulling the name.
+    SELECT 'fotmob' AS source, referee_name AS source_id, league,
+           CAST(season AS varchar) AS season
+      FROM (
+          SELECT json_extract_scalar(match_facts_json, '$.infoBox.Referee.text')
+                     AS referee_name,
+                 league, season,
+                 ROW_NUMBER() OVER (
+                     PARTITION BY match_id, league, season
+                     ORDER BY _ingested_at DESC
+                 ) AS rn
+            FROM iceberg.bronze.fotmob_match_details
+           WHERE match_facts_json IS NOT NULL
+      )
+     WHERE rn = 1 AND referee_name IS NOT NULL AND referee_name <> ''
 ),
 
 resolved AS (
@@ -114,6 +137,7 @@ SELECT
             CASE source
                 WHEN 'fbref'        THEN 'fb_ref_'
                 WHEN 'matchhistory' THEN 'mh_ref_'
+                WHEN 'fotmob'       THEN 'fm_ref_'
             END
             || LOWER(REGEXP_REPLACE(
                    REGEXP_REPLACE(NORMALIZE(source_id, NFD), '\p{Mn}+', ''),
