@@ -397,8 +397,9 @@ class IcebergWriter:
                     f"delete_filter '{delete_filter}' failed on {full_table}: {e}"
                 )
 
-        # Insert data
-        rows_inserted = trino.insert_dataframe(database, table, df)
+        # Insert data — atomic stage+merge so the target gets ONE snapshot
+        # regardless of how many byte-budget VALUES batches the rows need (#269).
+        rows_inserted = trino.insert_dataframe_atomic(database, table, df)
         logger.info(f"Inserted {rows_inserted} rows into {full_table}")
 
         return full_table

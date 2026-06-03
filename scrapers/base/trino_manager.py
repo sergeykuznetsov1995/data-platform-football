@@ -525,6 +525,65 @@ WITH (
         logger.info(f"Inserted {total_inserted} rows into {self.catalog}.{schema}.{table}")
         return total_inserted
 
+    def insert_dataframe_atomic(
+        self,
+        schema: str,
+        table: str,
+        df: pd.DataFrame,
+        batch_size: int = 1000,
+    ) -> int:
+        """
+        Insert a DataFrame so the target table receives exactly ONE snapshot.
+
+        ``insert_dataframe`` flushes a separate ``INSERT INTO ... VALUES`` for
+        every ~900 KB byte-budget batch, and each INSERT into an Iceberg table
+        creates a new snapshot + metadata.json + manifest. Wide rows (e.g.
+        ``fotmob_match_details`` with 8 large JSON blobs per row) therefore
+        produce hundreds of snapshots per run (#269).
+
+        This method stages the byte-budget batches into a transient table and
+        merges them with a single ``INSERT INTO target SELECT ... FROM stage``,
+        so the target gains exactly one snapshot regardless of batch count.
+        The throwaway stage is dropped, discarding its snapshot churn.
+
+        Args:
+            schema: Schema name
+            table: Target table name (must already exist)
+            df: Pandas DataFrame to insert
+            batch_size: Number of rows per staged INSERT statement
+
+        Returns:
+            Number of rows inserted into the target
+        """
+        if df.empty:
+            logger.warning(f"Empty DataFrame, skipping insert to {schema}.{table}")
+            return 0
+
+        stage = f"{table}__stg"  # matches _IDENTIFIER_RE
+        qualified_target = validate_catalog_qualified_name(self.catalog, schema, table)
+        qualified_stage = validate_catalog_qualified_name(self.catalog, schema, stage)
+
+        # Clean any leftover stage from a previously crashed run.
+        self.drop_table(schema, stage, if_exists=True)
+
+        # Empty copy of the target schema (column names/types incl. metadata).
+        self._execute(f"CREATE TABLE {qualified_stage} AS SELECT * FROM {qualified_target} WHERE false")
+
+        try:
+            # Many byte-budget INSERTs land on the throwaway stage.
+            inserted = self.insert_dataframe(schema, stage, df, batch_size)
+            # Single INSERT...SELECT → exactly one snapshot on the target.
+            cols = ', '.join(f'"{c}"' for c in df.columns)
+            self._execute(
+                f"INSERT INTO {qualified_target} ({cols}) "
+                f"SELECT {cols} FROM {qualified_stage}"
+            )
+        finally:
+            self.drop_table(schema, stage, if_exists=True)
+
+        logger.info(f"Inserted {inserted} rows into {qualified_target} (via stage, 1 snapshot)")
+        return inserted
+
     def drop_table(self, schema: str, table: str, if_exists: bool = True) -> None:
         """
         Drop table.

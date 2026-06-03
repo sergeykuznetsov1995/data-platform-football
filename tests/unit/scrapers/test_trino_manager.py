@@ -428,6 +428,66 @@ class TestTrinoTableManagerInsertDataFrame:
             assert mock_cursor.execute.call_count == 4
 
 
+class TestTrinoTableManagerInsertDataFrameAtomic:
+    """Tests for insert_dataframe_atomic (stage+merge → one target snapshot, #269)."""
+
+    def test_insert_dataframe_atomic_stages_and_merges(self):
+        """Staged batches collapse into a single INSERT...SELECT on the target."""
+        import pandas as pd
+        with patch.dict('sys.modules', {'trino': MagicMock(), 'trino.dbapi': MagicMock()}):
+            from scrapers.base.trino_manager import TrinoTableManager
+
+            manager = TrinoTableManager()
+
+            df = pd.DataFrame({'team': ['A', 'B', 'C'], 'goals': [1, 2, 3]})
+
+            with patch.object(manager, '_execute') as mock_execute, \
+                 patch.object(manager, 'insert_dataframe', return_value=3) as mock_insert, \
+                 patch.object(manager, 'drop_table') as mock_drop:
+                result = manager.insert_dataframe_atomic('bronze', 'test_table', df)
+
+            assert result == 3
+
+            # Batches are staged on the throwaway table, not the target.
+            mock_insert.assert_called_once()
+            assert mock_insert.call_args[0][1] == 'test_table__stg'
+
+            # Stage is dropped before (crash leftovers) and after (cleanup).
+            assert mock_drop.call_count == 2
+            for call in mock_drop.call_args_list:
+                assert call[0][1] == 'test_table__stg'
+
+            executed = [c[0][0] for c in mock_execute.call_args_list]
+            # Empty-schema copy of the target.
+            assert any(
+                'CREATE TABLE iceberg.bronze.test_table__stg AS SELECT * FROM '
+                'iceberg.bronze.test_table WHERE false' in sql for sql in executed
+            )
+            # Exactly ONE INSERT into the target — the merge from stage.
+            target_inserts = [
+                sql for sql in executed
+                if 'INSERT INTO iceberg.bronze.test_table ' in sql
+            ]
+            assert len(target_inserts) == 1
+            assert 'SELECT' in target_inserts[0]
+            assert 'FROM iceberg.bronze.test_table__stg' in target_inserts[0]
+
+    def test_insert_dataframe_atomic_empty(self):
+        """Empty DataFrame is a no-op (no staging)."""
+        import pandas as pd
+        with patch.dict('sys.modules', {'trino': MagicMock(), 'trino.dbapi': MagicMock()}):
+            from scrapers.base.trino_manager import TrinoTableManager
+
+            manager = TrinoTableManager()
+            with patch.object(manager, '_execute') as mock_execute, \
+                 patch.object(manager, 'drop_table') as mock_drop:
+                result = manager.insert_dataframe_atomic('bronze', 'test_table', pd.DataFrame())
+
+            assert result == 0
+            mock_execute.assert_not_called()
+            mock_drop.assert_not_called()
+
+
 class TestTrinoTableManagerDropTable:
     """Tests for drop_table operation."""
 
