@@ -282,52 +282,63 @@ def test_xref_referee_known_pairs_guard():
     assert 'COUNT(DISTINCT source) < 2' in where
 
 
-def test_xref_manager_phase_15_checks():
-    """Phase 1.5 — xref_manager populated from FBref scorebox parser.
+def test_xref_manager_two_source_checks():
+    """xref_manager — FBref spine + FotMob coachId mirror (issue #144).
 
-    The STUB-phase guard (row_count min=max=0) is replaced by the regular
-    cross-source xref check set: row count bounds, PK uniqueness, NOT NULL
-    on canonical, source enum {fbref}, confidence enum {name_normalize}.
+    Check set: row count bounds, PK uniqueness, NOT NULL on canonical,
+    source enum {fbref, fotmob}, confidence enum {name_normalize, orphan},
+    and a WARNING-severity FotMob name-collision guard.
     """
     checks = xref_dq.build_xref_manager_checks()
 
-    # Row count: positive lower bound (Phase 1.5 must produce rows).
+    # Row count: positive lower bound (must produce rows).
     # NB: enum_compliance uses kind='row_count' under the hood, so we
     # filter by name (the dedicated row_count check has no enum prefix).
     rc = [c for c in checks if c.kind == 'row_count' and 'enum_compliance' not in c.name]
     assert len(rc) == 1
-    assert rc[0].params.get('min_rows', 0) > 0, (
-        "Phase 1.5 xref_manager must require min_rows > 0 — STUB guard "
-        "(row_count min=max=0) was retired when bronze.fbref_match_managers "
-        "started landing rows"
-    )
+    assert rc[0].params.get('min_rows', 0) > 0
 
     # PK uniqueness on (source, source_id, league, season).
-    pk = [c for c in checks if c.kind == 'no_duplicates']
+    pk = [
+        c for c in checks
+        if c.kind == 'no_duplicates'
+        and c.params['pk'] == ['source', 'source_id', 'league', 'season']
+    ]
     assert len(pk) == 1
-    assert pk[0].params['pk'] == ['source', 'source_id', 'league', 'season']
+
+    # Collision guard: WARNING-only no_duplicates on (canonical_id, league,
+    # season) restricted to FotMob — catches two distinct coachIds collapsing
+    # to one slug.
+    collision = [
+        c for c in checks
+        if c.kind == 'no_duplicates'
+        and c.params['pk'] == ['canonical_id', 'league', 'season']
+    ]
+    assert len(collision) == 1
+    assert collision[0].severity == 'WARNING'
+    assert collision[0].params.get('where') == "source = 'fotmob'"
 
     # NOT NULL on canonical / source / source_id.
     nn = [c for c in checks if c.kind == 'no_nulls']
     assert len(nn) == 1
     assert set(nn[0].params['cols']) >= {'canonical_id', 'source', 'source_id'}
 
-    # Source enum: FBref-only at Phase 1.5.
+    # Source enum: FBref spine + FotMob mirror.
     src_enum = [
         c for c in checks
         if 'enum_compliance' in c.name and '.source' in c.name
     ]
     assert len(src_enum) == 1
     where_src = src_enum[0].params['where']
-    assert "'fbref'" in where_src
-    for forbidden in ['understat', 'whoscored', 'sofascore', 'fotmob',
+    assert "'fbref'" in where_src and "'fotmob'" in where_src
+    for forbidden in ['understat', 'whoscored', 'sofascore',
                       'matchhistory', 'clubelo', 'espn']:
         assert f"'{forbidden}'" not in where_src, (
-            f"Phase 1.5 xref_manager source enum must NOT include "
-            f"{forbidden!r} — FBref-only spine"
+            f"xref_manager source enum must NOT include {forbidden!r} — only "
+            "FBref + FotMob carry coach identity in Bronze"
         )
 
-    # Confidence enum: name_normalize only at Phase 1.5.
+    # Confidence enum: name_normalize (glued) + orphan (un-glued FotMob).
     conf_enum = [
         c for c in checks
         if 'enum_compliance' in c.name and 'confidence' in c.name
@@ -335,10 +346,10 @@ def test_xref_manager_phase_15_checks():
     assert len(conf_enum) == 1
     where_conf = conf_enum[0].params['where']
     assert "'name_normalize'" in where_conf
-    for forbidden in ['exact', 'name_team', 'orphan', 'ambiguous']:
+    assert "'orphan'" in where_conf
+    for forbidden in ['exact', 'name_team', 'ambiguous']:
         assert f"'{forbidden}'" not in where_conf, (
-            f"Phase 1.5 xref_manager confidence enum must NOT include "
-            f"{forbidden!r} — only name_normalize is currently produced"
+            f"xref_manager confidence enum must NOT include {forbidden!r}"
         )
 
 

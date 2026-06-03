@@ -274,12 +274,15 @@ def build_xref_referee_checks() -> List[Check]:
 
 
 def build_xref_manager_checks() -> List[Check]:
-    """DQ for ``iceberg.silver.xref_manager`` — Phase 1.5 single-source spine.
+    """DQ for ``iceberg.silver.xref_manager`` — FBref spine + FotMob mirror (#144).
 
-    Source = FBref scorebox parser (bronze.fbref_match_managers). Bounds
-    sized for APL across 8 seasons (2017-18 … 2024-25): ~30-50 distinct
-    managers × per-season presence ≈ 60-200 rows. Upper bound is generous
-    for future multi-league or multi-source expansion.
+    Sources: FBref scorebox parser (bronze.fbref_match_managers) +
+    FotMob coachId mirror (bronze.fotmob_player_details WHERE is_coach).
+    Bounds sized for APL across 8 seasons: ~30-50 distinct managers × per-season
+    presence × 2 sources ≈ 60-400 rows. Upper bound is generous for future
+    multi-league expansion. Per-source orphan-rate (FotMob coaches not glued to
+    an FBref counterpart) is evaluated separately by
+    :func:`evaluate_orphan_rate_per_source` and appended by the DAG callable.
     """
     table = 'iceberg.silver.xref_manager'
     return [
@@ -294,14 +297,28 @@ def build_xref_manager_checks() -> List[Check]:
 
         check_enum_compliance(
             table, 'source',
-            allowed=['fbref'],
+            allowed=['fbref', 'fotmob'],
             severity='ERROR',
         ),
 
         check_enum_compliance(
             table, 'confidence',
-            allowed=['name_normalize'],
+            allowed=['name_normalize', 'orphan'],
             severity='ERROR',
+        ),
+
+        # Collision guard (#144): two DIFFERENT FotMob coaches (distinct
+        # coachId/source_id) whose names normalise to the same canonical_id
+        # within one (league, season) would silently merge. FotMob rows are
+        # unique on (source_id, league, season) by construction, so any dup of
+        # (canonical_id, league, season) among them is a genuine name collision.
+        # WARNING-only: rare youth/duplicate-name coaches shouldn't fail the DAG.
+        CHECK.no_duplicates(
+            table,
+            pk=['canonical_id', 'league', 'season'],
+            where="source = 'fotmob'",
+            severity='WARNING',
+            name='manager_collision[fotmob.canonical_id]',
         ),
     ]
 
