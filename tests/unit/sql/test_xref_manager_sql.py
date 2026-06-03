@@ -1,5 +1,5 @@
 """
-Unit tests for ``dags/sql/silver/xref_manager.sql`` — Phase 1.5 (E2).
+Unit tests for ``dags/sql/silver/xref_manager.sql`` — two sources (issue #144).
 
 Strategy
 --------
@@ -7,11 +7,14 @@ Pure regex/keyword sanity over the raw SQL — same approach as
 ``test_xref_referee_sql.py`` and ``test_xref_team_sql.py``.
 
 Documented invariants we exercise:
-  * source ∈ {'fbref'} only (single-source spine at Phase 1.5).
-  * canonical_id = LOWER(REGEXP_REPLACE(manager_name, '[^a-zA-Z0-9]+', '_')).
-  * confidence == 'name_normalize' for every row.
-  * Reads bronze.fbref_match_managers (the new Bronze landing table).
-  * NULL/empty manager_name is filtered out.
+  * source ∈ {'fbref', 'fotmob'} (FBref spine + FotMob coachId mirror).
+  * canonical_id = LOWER(REGEXP_REPLACE(<name>, '[^a-zA-Z0-9]+', '_')).
+  * confidence ∈ {'name_normalize', 'orphan'} (orphan = FotMob coach with no
+    FBref counterpart in the same league).
+  * Reads bronze.fbref_match_managers (spine) and bronze.fotmob_player_details
+    filtered to is_coach (coachId mirror).
+  * FotMob source_id is the stable coachId (CAST(player_id AS varchar)).
+  * NULL/empty manager/coach name is filtered out.
 """
 
 from __future__ import annotations
@@ -36,17 +39,23 @@ pytestmark = pytest.mark.unit
 class TestXrefManagerStructure:
     """Regex/keyword sanity over ``xref_manager.sql``."""
 
-    def test_single_source_fbref(self):
-        """Phase 1.5 spine: FBref only."""
+    def test_emits_fbref_and_fotmob_sources(self):
+        """Two sources: FBref spine + FotMob coachId mirror (issue #144)."""
         sql = _read_sql().lower()
-        assert "'fbref'" in sql, "missing 'fbref' source literal"
+        for src in ("'fbref'", "'fotmob'"):
+            pattern = re.compile(
+                re.escape(src) + r"\s+as\s+source",
+                re.IGNORECASE,
+            )
+            assert pattern.search(sql), f"missing `{src} AS source` literal"
 
     def test_no_other_sources_emitted(self):
-        """xref_manager must NOT emit any source label other than 'fbref'."""
+        """Only 'fbref' and 'fotmob' may be emitted — others have no manager
+        metadata in Bronze."""
         sql = _read_sql().lower()
         for forbidden in [
             "'understat'", "'whoscored'", "'sofascore'",
-            "'fotmob'", "'matchhistory'", "'clubelo'", "'espn'",
+            "'matchhistory'", "'clubelo'", "'espn'",
         ]:
             pattern = re.compile(
                 re.escape(forbidden) + r"\s+as\s+source",
@@ -54,17 +63,40 @@ class TestXrefManagerStructure:
             )
             assert not pattern.search(sql), (
                 f"source label {forbidden} must not be emitted in xref_manager — "
-                "Phase 1.5 is FBref-only (FotMob coachId hardened, others have "
-                "no manager metadata in Bronze)"
+                "only FBref + FotMob carry coach identity in Bronze"
             )
 
     def test_reads_bronze_fbref_match_managers(self):
-        """SELECT reads from iceberg.bronze.fbref_match_managers."""
+        """SELECT reads from iceberg.bronze.fbref_match_managers (spine)."""
         sql_lower = _read_sql().lower()
         assert "iceberg.bronze.fbref_match_managers" in sql_lower, (
             "xref_manager must read from bronze.fbref_match_managers — the "
             "table populated by parsers/finders.py::parse_match_managers"
         )
+
+    def test_reads_bronze_fotmob_player_details(self):
+        """FotMob mirror reads from iceberg.bronze.fotmob_player_details."""
+        sql_lower = _read_sql().lower()
+        assert "iceberg.bronze.fotmob_player_details" in sql_lower, (
+            "xref_manager must read FotMob coaches from "
+            "bronze.fotmob_player_details (is_coach rows)"
+        )
+
+    def test_fotmob_filters_is_coach(self):
+        """FotMob block keeps only coaches (is_coach = true)."""
+        sql_lower = _read_sql().lower()
+        assert "is_coach = true" in sql_lower, (
+            "FotMob mirror must filter `is_coach = true` — the table also holds "
+            "players (filtered out elsewhere via NOT is_coach)"
+        )
+
+    def test_fotmob_source_id_is_stable_coach_id(self):
+        """FotMob source_id is the stable coachId = CAST(player_id AS varchar)."""
+        sql = _read_sql()
+        assert re.search(
+            r"CAST\s*\(\s*d?\.?player_id\s+AS\s+varchar\s*\)",
+            sql, re.IGNORECASE,
+        ), "expected CAST(player_id AS varchar) AS source_id for FotMob coachId"
 
     def test_canonical_id_normalize_pattern(self):
         """canonical_id = LOWER(REGEXP_REPLACE(<name>, '[^a-zA-Z0-9]+', '_'))."""
@@ -101,11 +133,18 @@ class TestXrefManagerStructure:
         )
 
     def test_confidence_name_normalize(self):
-        """confidence must be the literal 'name_normalize' (no alias map)."""
+        """confidence carries the literal 'name_normalize'."""
         sql = _read_sql()
         assert "'name_normalize'" in sql, (
-            "expected confidence='name_normalize' — manager xref has no alias "
-            "map yet at Phase 1.5"
+            "expected confidence='name_normalize' for glued rows"
+        )
+
+    def test_confidence_allows_orphan(self):
+        """FotMob coach with no FBref counterpart is flagged 'orphan' so the
+        Phase 2 orphan-rate report (evaluate_orphan_rate_per_source) can see it."""
+        sql = _read_sql()
+        assert "'orphan'" in sql, (
+            "expected confidence='orphan' branch for un-glued FotMob coaches"
         )
 
     def test_match_score_null(self):

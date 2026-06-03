@@ -265,15 +265,17 @@ def _validate_xref(**context) -> Dict[str, Any]:
     """Run extended DQ for the 5 xref tables (T6).
 
     Phase 1 — standard DQ via :mod:`utils.xref_dq.build_all_xref_checks`
-    Phase 2 — orphan-rate per source for xref_team / xref_player
-              (synthetic CheckResults appended to the report)
+    Phase 2 — orphan-rate per source for xref_team / xref_player / xref_referee
+              / xref_manager (synthetic CheckResults appended to the report)
 
     Severity model:
       * Phase 1 ERROR-checks raise ``AirflowException``.
-      * Phase 2 orphan-rate ERROR (>25% in any source) raises.
+      * Phase 2 orphan-rate ERROR raises (team/player >25%; referee >35%;
+        manager >60%).
 
     XCom outputs:
-      * key=``orphan_rates``    — dict {team, player → per-source verdicts}
+      * key=``orphan_rates``    — dict {team, player, referee, manager →
+                                  per-source verdicts}
       * key=``orphan_teams``    — dict {total_orphans, per_source, rows} (issue #141)
     """
     from airflow.exceptions import AirflowException
@@ -294,7 +296,10 @@ def _validate_xref(**context) -> Dict[str, Any]:
     logger.info("Phase 1 — xref DQ: %s", report.summary())
 
     # ------------------------------------------------------------------
-    # Phase 2 — orphan-rate per source (team + player)
+    # Phase 2 — orphan-rate per source (team + player + referee + manager)
+    # Per-entity (warn, err) bands: referee feeds (#143) and manager FotMob
+    # coaches (#144) are noisier than team/player, so they get looser bands —
+    # surfaced in the report, but won't fail the DAG below the error threshold.
     # ------------------------------------------------------------------
     orphan_rates: Dict[str, Any] = {}
     for entity, table, warn_t, err_t in (
@@ -303,6 +308,8 @@ def _validate_xref(**context) -> Dict[str, Any]:
         # Referee feeds are noisier (initial-only MatchHistory forms) and have
         # no DOB disambiguator → looser band (issue #143).
         ('referee', 'iceberg.silver.xref_referee', 15.0, 35.0),
+        # manager (#144): FotMob orphans expected at worldwide scale → soft band.
+        ('manager', 'iceberg.silver.xref_manager', 25.0, 60.0),
     ):
         try:
             res = evaluate_orphan_rate_per_source(
