@@ -197,14 +197,14 @@ class TestIcebergWriterWriteToIceberg:
             mock_trino = MagicMock()
             mock_trino.table_exists.return_value = False
             mock_trino.arrow_schema_to_trino.return_value = {'col1': 'BIGINT'}
-            mock_trino.insert_dataframe.return_value = 3
+            mock_trino.insert_dataframe_atomic.return_value = 3
             writer._trino_manager = mock_trino
 
             df = pd.DataFrame({'col1': [1, 2, 3]})
             result = writer._write_to_iceberg(df, 'bronze', 'test_table', None)
 
             mock_trino.create_iceberg_table.assert_called_once()
-            mock_trino.insert_dataframe.assert_called_once()
+            mock_trino.insert_dataframe_atomic.assert_called_once()
             assert result == 'iceberg.bronze.test_table'
 
     def test_write_to_iceberg_skips_table_creation_if_exists(self):
@@ -215,14 +215,14 @@ class TestIcebergWriterWriteToIceberg:
 
             mock_trino = MagicMock()
             mock_trino.table_exists.return_value = True
-            mock_trino.insert_dataframe.return_value = 3
+            mock_trino.insert_dataframe_atomic.return_value = 3
             writer._trino_manager = mock_trino
 
             df = pd.DataFrame({'col1': [1, 2, 3]})
             writer._write_to_iceberg(df, 'bronze', 'test_table', None)
 
             mock_trino.create_iceberg_table.assert_not_called()
-            mock_trino.insert_dataframe.assert_called_once()
+            mock_trino.insert_dataframe_atomic.assert_called_once()
 
     def test_write_to_iceberg_overwrite_mode(self):
         """Test _write_to_iceberg deletes data in overwrite mode."""
@@ -232,7 +232,7 @@ class TestIcebergWriterWriteToIceberg:
 
             mock_trino = MagicMock()
             mock_trino.table_exists.return_value = True
-            mock_trino.insert_dataframe.return_value = 2
+            mock_trino.insert_dataframe_atomic.return_value = 2
             writer._trino_manager = mock_trino
 
             df = pd.DataFrame({'col1': [1, 2]})
@@ -255,7 +255,7 @@ class TestIcebergWriterWriteToIceberg:
                 'col1': 'BIGINT',
                 'league': 'VARCHAR',
             }
-            mock_trino.insert_dataframe.return_value = 1
+            mock_trino.insert_dataframe_atomic.return_value = 1
             writer._trino_manager = mock_trino
 
             df = pd.DataFrame({'col1': [1], 'league': ['EPL']})
@@ -393,7 +393,7 @@ class TestIcebergWriterMetadataRecovery:
             mock_trino.table_exists.return_value = True
             mock_trino.get_table_columns.side_effect = metadata_error
             mock_trino.arrow_schema_to_trino.return_value = {'col1': 'BIGINT'}
-            mock_trino.insert_dataframe.return_value = 3
+            mock_trino.insert_dataframe_atomic.return_value = 3
             writer._trino_manager = mock_trino
 
             df = pd.DataFrame({'col1': [1, 2, 3]})
@@ -406,7 +406,7 @@ class TestIcebergWriterMetadataRecovery:
                 mock_clean.assert_called_once_with('bronze', 'test_table')
                 mock_trino.create_iceberg_table.assert_called_once()
                 # Insert should still proceed
-                mock_trino.insert_dataframe.assert_called_once()
+                mock_trino.insert_dataframe_atomic.assert_called_once()
                 assert result == 'iceberg.bronze.test_table'
 
     def test_reraises_non_metadata_errors(self):
