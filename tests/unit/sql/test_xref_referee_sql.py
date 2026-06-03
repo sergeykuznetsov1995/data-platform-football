@@ -1,156 +1,137 @@
 """
-Unit tests for ``dags/sql/silver/xref_referee.sql`` — structural / logical (T5/E1).
+Unit tests for ``dags/sql/silver/xref_referee.sql.j2`` — structural / logical (#143).
 
-Strategy
---------
-Pure regex/keyword sanity over the raw SQL — same approach as
-``test_xref_team_sql.py`` and ``test_xref_match_sql.py``.
+Strategy mirrors ``test_xref_team_sql.py``: the pure-SQL ``xref_referee.sql``
+became a Jinja template with a single ``{{ referee_aliases_values_sql }}``
+placeholder (issue #143 — curated cross-source identity, no fuzzy). We verify:
 
-Documented invariants we exercise:
-  * source ∈ {'fbref', 'matchhistory'}.
-  * canonical_id derived as LOWER(REGEXP_REPLACE(referee, '[^a-zA-Z0-9]+', '_')).
-  * confidence == 'name_normalize' for every row.
-  * Bronze-only reads (no Gold-era references).
+1. **Structural invariants** of the raw template (2 sources, aliases CTE,
+   league predicate, confidence CASE name_alias/orphan, orphan prefixes,
+   NFD diacritic fold, pure SELECT, Bronze-only reads).
+2. **Render-time correctness**: medallion_config hydrates the template into
+   stable Trino SQL (no leftover standalone placeholder, real VALUES embedded,
+   both Bronze tables referenced).
+
+No DuckDB / sqlglot — regex over the template is enough.
 """
 
 from __future__ import annotations
 
+import os
 import re
+import sys
 from pathlib import Path
 
 import pytest
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
-SQL_PATH = PROJECT_ROOT / "dags" / "sql" / "silver" / "xref_referee.sql"
+SQL_PATH = PROJECT_ROOT / "dags" / "sql" / "silver" / "xref_referee.sql.j2"
+
+_DAGS_DIR = PROJECT_ROOT / "dags"
+if str(_DAGS_DIR) not in sys.path:
+    sys.path.insert(0, str(_DAGS_DIR))
+
+os.environ.setdefault(
+    "MEDALLION_CONFIG_DIR", str(PROJECT_ROOT / "configs" / "medallion")
+)
 
 
-def _read_sql() -> str:
+def _read_template() -> str:
     return SQL_PATH.read_text(encoding="utf-8")
 
 
 pytestmark = pytest.mark.unit
 
 
-class TestXrefRefereeStructure:
-    """Regex/keyword sanity over ``xref_referee.sql``."""
+class TestXrefRefereeTemplateStructure:
+    """Regex/keyword sanity over the raw ``xref_referee.sql.j2``."""
+
+    def test_template_uses_aliases_placeholder(self):
+        assert "{{ referee_aliases_values_sql }}" in _read_template(), (
+            "xref_referee.sql.j2 must declare the {{ referee_aliases_values_sql }} "
+            "placeholder consumed by medallion_config.render_sql_template()"
+        )
 
     def test_two_sources_fbref_and_matchhistory(self):
-        """Documented sources: fbref + matchhistory only."""
-        sql = _read_sql().lower()
-        assert "'fbref'" in sql, "missing 'fbref' source literal"
-        assert "'matchhistory'" in sql, "missing 'matchhistory' source literal"
+        sql = _read_template().lower()
+        assert "'fbref'" in sql and "'matchhistory'" in sql
 
-    def test_no_other_sources_in_referee_xref(self):
-        """E1 referee xref intentionally limited to FBref + MatchHistory."""
-        sql = _read_sql().lower()
-        for forbidden in [
-            "'understat'", "'whoscored'", "'sofascore'",
-            "'fotmob'", "'clubelo'", "'espn'",
-        ]:
-            pattern = re.compile(
-                re.escape(forbidden) + r"\s+as\s+source",
-                re.IGNORECASE,
-            )
+    def test_no_other_sources(self):
+        sql = _read_template().lower()
+        for forbidden in ["'understat'", "'whoscored'", "'sofascore'",
+                          "'fotmob'", "'clubelo'", "'espn'"]:
+            pattern = re.compile(re.escape(forbidden) + r"\s+as\s+source", re.I)
             assert not pattern.search(sql), (
-                f"source label {forbidden} must not be emitted in xref_referee — "
-                "only fbref + matchhistory carry referee data at E1"
+                f"{forbidden} must not be a source in xref_referee — only "
+                "fbref + matchhistory carry referee data (FotMob → issue #270)"
             )
 
-    def test_referee_column_referenced(self):
-        """Both bronze tables expose a `referee` column (lower-case in MH)."""
-        sql_lower = _read_sql().lower()
-        assert "referee" in sql_lower, "expected referee column reference"
+    def test_has_aliases_cte(self):
+        assert re.search(r"\baliases\s+as\s*\(", _read_template(), re.I)
 
-    def test_canonical_id_normalize_pattern(self):
-        """canonical_id = LOWER(REGEXP_REPLACE(<name>, '[^a-zA-Z0-9]+', '_'))."""
-        sql = _read_sql()
-        pattern = re.compile(
-            r"LOWER\s*\(\s*REGEXP_REPLACE",
-            re.IGNORECASE,
-        )
-        assert pattern.search(sql), (
-            "expected canonical_id derivation via "
-            "LOWER(REGEXP_REPLACE(name, '[^a-zA-Z0-9]+', '_'))"
+    def test_league_predicate_in_join(self):
+        """Issue #148 league guard must be wired into the alias JOIN."""
+        assert re.search(r"a\.league\s*=\s*rt\.league", _read_template(), re.I)
+
+    def test_confidence_is_name_alias_or_orphan(self):
+        sql = _read_template().lower()
+        assert "'name_alias'" in sql and "'orphan'" in sql
+        assert "'name_normalize'" not in sql, (
+            "old pure-SQL confidence label must be gone after the #143 refactor"
         )
 
-    def test_canonical_id_regex_uses_alphanumeric_class(self):
-        """Normalize regex collapses non-alphanumerics to underscore."""
-        sql = _read_sql()
-        # Accept either escaped or raw character-class form.
-        assert (
-            "[^a-zA-Z0-9]+" in sql
-            or "[^a-zA-Z0-9]+" in sql.lower()
-        ), "expected regex character class `[^a-zA-Z0-9]+` for normalize"
+    def test_orphan_prefixes(self):
+        sql = _read_template().lower()
+        assert "'fb_ref_'" in sql and "'mh_ref_'" in sql
 
-    def test_canonical_id_transliterates_diacritics(self):
-        """canonical_id strips diacritics via NORMALIZE(NFD) + `\\p{Mn}` (issue #215).
-
-        A referee spelled with and without accents must map to ONE canonical_id;
-        otherwise dim_referee risks the same SCD-2 split that broke dim_manager.
-        """
-        sql = _read_sql()
-        assert re.search(r"NORMALIZE\s*\(\s*referee_name\s*,\s*NFD\s*\)", sql, re.IGNORECASE), (
-            "expected NORMALIZE(referee_name, NFD) to decompose accents before slugging"
-        )
-        assert r"\p{Mn}" in sql, (
-            "expected `\\p{Mn}` (Unicode combining marks) regex to strip diacritics"
-        )
-
-    def test_confidence_name_normalize(self):
-        """confidence must be the literal 'name_normalize' (no alias map)."""
-        sql = _read_sql()
-        assert "'name_normalize'" in sql, (
-            "expected confidence='name_normalize' — referee xref has no alias "
-            "map yet, so the only knowable provenance is the slug normalize"
-        )
+    def test_diacritic_fold_idiom(self):
+        r"""NFD + \p{Mn} strip — same fold as xref_team/xref_manager (issue #215)."""
+        sql = _read_template()
+        assert "NFD" in sql
+        assert r"\p{Mn}" in sql
 
     def test_match_score_null(self):
-        """match_score must be NULL — no fuzzy here."""
-        sql = _read_sql()
-        assert (
-            "CAST(NULL AS double)" in sql
-            or "CAST(NULL AS DOUBLE)" in sql
-        ), "match_score must be CAST(NULL AS double) for xref_referee"
-
-    def test_season_cast_to_varchar(self):
-        """Bronze stores season as BIGINT for both sources — cast to varchar."""
-        sql = _read_sql()
-        assert (
-            "CAST(season AS varchar)" in sql
-            or "CAST(season as varchar)" in sql
-        ), "expected CAST(season AS varchar) for unified Silver schema"
+        assert re.search(r"CAST\(NULL AS double\)", _read_template(), re.I)
 
     def test_pure_select_no_create_table(self):
-        """File stays a pure SELECT — silver_tasks wraps in CTAS.
-
-        Strip ``-- ...`` comments first; the header references
-        ``CREATE TABLE iceberg.silver.xref_referee`` in a documentation note.
-        """
-        non_comment = "\n".join(
-            line for line in _read_sql().splitlines()
+        """No DDL in the executable SQL (header comment may mention CTAS)."""
+        code = "\n".join(
+            line for line in _read_template().splitlines()
             if not line.lstrip().startswith("--")
-        )
-        assert "CREATE TABLE" not in non_comment.upper(), (
-            "xref_referee.sql must stay pure SELECT in executable SQL"
+        ).lower()
+        assert "create table" not in code and "create or replace" not in code
+
+    def test_reads_bronze_only(self):
+        sql = _read_template().lower()
+        assert "iceberg.bronze.fbref_schedule" in sql
+        assert "iceberg.bronze.matchhistory_games" in sql
+        assert "iceberg.gold." not in sql
+
+
+class TestXrefRefereeRender:
+    """Render the template via the real shipped referee_aliases.yaml."""
+
+    def _render(self) -> str:
+        from utils import medallion_config as mc
+        mc.reset_cache()
+        return mc.render_sql_template(
+            SQL_PATH,
+            referee_aliases_values_sql=mc.get_referee_alias_sql_values(
+                with_canonical_id=True, with_league=True
+            ),
         )
 
-    def test_filters_null_and_empty_referee(self):
-        """`WHERE referee IS NOT NULL AND referee <> ''` to skip blank rows."""
-        sql = _read_sql()
-        assert "IS NOT NULL" in sql.upper(), (
-            "expected NULL-filter on referee column"
-        )
-        assert "<> ''" in sql or "!= ''" in sql, (
-            "expected empty-string filter on referee column"
-        )
+    def test_no_leftover_standalone_placeholder(self):
+        rendered = self._render()
+        assert not re.search(r"^[ \t]*\{\{\s*\w+\s*\}\}[ \t]*$", rendered, re.M)
 
-    def test_bronze_tables_only(self):
-        """Reads from iceberg.bronze.* only — no Silver/Gold dependencies."""
-        sql_lower = _read_sql().lower()
-        assert "iceberg.bronze." in sql_lower, (
-            "expected at least one iceberg.bronze.* table reference"
-        )
-        assert "iceberg.silver.fbref_match_enriched" not in sql_lower, (
-            "xref_referee must read Bronze, not the Gold-era Silver mart"
-        )
+    def test_embeds_real_alias_values(self):
+        rendered = self._render()
+        assert "ref_michael_oliver" in rendered
+        assert "'M Oliver'" in rendered  # MatchHistory initial form merges to canonical
+
+    def test_references_both_bronze_tables(self):
+        rendered = self._render()
+        assert "iceberg.bronze.fbref_schedule" in rendered
+        assert "iceberg.bronze.matchhistory_games" in rendered
