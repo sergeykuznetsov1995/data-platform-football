@@ -5,8 +5,8 @@ Goal: verify the Silver + Gold DAGs *parse* and contain the new E5 task ids.
 Anything beyond presence (dependency wiring, task config) is out of scope —
 covered by ``test_dag_structure.py`` and ``test_dag_parsing.py``.
 
-We re-use the ``dag_bag`` fixture from ``tests/integration/dags/conftest.py``;
-it requires ``apache-airflow`` on PYTHONPATH and will skip otherwise.
+This module defines its own ``dag_bag`` fixture; it requires
+``apache-airflow`` on PYTHONPATH and will skip otherwise.
 """
 
 from __future__ import annotations
@@ -16,10 +16,6 @@ import sys
 from pathlib import Path
 
 import pytest
-
-# Make tests/integration/dags/conftest.py fixtures discoverable
-_DAGS_TESTS_DIR = Path(__file__).resolve().parent / "dags"
-sys.path.insert(0, str(_DAGS_TESTS_DIR.parent))
 
 # Re-use the project-level conftest fixtures
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
