@@ -5,23 +5,27 @@ table:
   fullyQualifiedName: trino_iceberg.iceberg.gold.dim_venue
   description: |
     Канонический справочник стадионов, объединённый из FBref и ESPN. Одна строка
-    на venue_id (`venue_<xxhash64>` от LOWER(TRIM(имя))), используется как
-    источник истины для атрибутации матчей к локациям. Поддерживает
-    schema-versioning по R0.4 (поля venue_canonical/_source/_version);
-    city и country — placeholder под R8 follow-up enrichment.
+    на venue_id — стабильный explicit-слаг `venue_<...>` из curated-справочника
+    configs/medallion/venue_aliases.yaml (issue #145), а НЕ хеш имени. Разные
+    написания одного стадиона ("Brentford Community Stadium" / "Gtech Community
+    Stadium") сливаются в один venue_id; тёзки в разных городах не склеиваются.
+    Стадионы без алиаса попадают как venue_source='orphan' (fallback на хеш
+    нормализованного имени) и сигналятся DQ-WARNING для куратора. Поддерживает
+    schema-versioning по R0.4 (venue_canonical/_source/_version, версия v2).
+    city/country заполнены для in-scope лиг (APL); для orphan — NULL.
   tags:
     - Tier.Gold
     - Domain.Football
     - PII.None
 columns:
   - name: venue_id
-    description: Канонический ID стадиона (`venue_<xxhash64>` от нормализованного имени).
+    description: Канонический ID стадиона — explicit-слаг `venue_<...>` из venue_aliases.yaml (curated), для orphan — `venue_<xxhash64>` от нормализованного имени.
   - name: venue_canonical
-    description: Каноническое имя стадиона после нормализации (LOWER+TRIM, schema R0.4).
+    description: Каноническое имя стадиона из venue_aliases.yaml (для orphan — наблюдаемое имя FBref>ESPN), schema R0.4.
   - name: venue_source
-    description: Источник, из которого взято каноническое имя ('fbref' | 'espn').
+    description: Происхождение идентичности ('curated' — матч по алиасу | 'orphan' — алиас не найден).
   - name: venue_version
-    description: Версия схемы канонизации стадиона (R0.4 schema-versioning).
+    description: Версия схемы канонизации стадиона (R0.4 schema-versioning; v2 после перехода на alias-идентичность #145).
   - name: venue_fbref
     description: Имя стадиона как оно встречается в FBref schedule.
   - name: venue_espn
@@ -29,9 +33,9 @@ columns:
   - name: venue_slug
     description: URL-friendly slug канонического имени (для UI и поиска).
   - name: city
-    description: Город (placeholder, будет заполнен в R8 enrichment follow-up).
+    description: Город стадиона из venue_aliases.yaml (заполнен для in-scope лиг; NULL для orphan).
   - name: country
-    description: Страна (placeholder, будет заполнен в R8 enrichment follow-up).
+    description: Страна стадиона из venue_aliases.yaml (заполнена для in-scope лиг; NULL для orphan).
   - name: n_matches
     description: Количество матчей, сыгранных на этом стадионе (по всем сезонам).
   - name: first_seen_date

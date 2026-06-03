@@ -63,6 +63,7 @@ TEAM_ALIASES_FILE = 'team_aliases.yaml'
 COMPETITIONS_FILE = 'competitions.yaml'
 PLAYER_ALIASES_FILE = 'player_aliases.yaml'
 REFEREE_ALIASES_FILE = 'referee_aliases.yaml'
+VENUE_ALIASES_FILE = 'venue_aliases.yaml'
 
 # Sentinel for "no source filter" — distinct from None which means "include
 # generic + all sources merged" in get_team_alias_pairs. We pass the bucket
@@ -159,6 +160,61 @@ def _validate_referee_aliases_schema(doc: Dict) -> None:
                 f"(referees[{i}]) — one slug must map to one referee"
             )
         seen_ids.add(cid)
+
+
+def _validate_venue_aliases_schema(doc: Dict) -> None:
+    """Structural validation of venue_aliases.yaml (issue #145).
+
+    Mirror of :func:`_validate_referee_aliases_schema` keyed on ``venues``.
+    In addition to the curated-alias contract (``canonical_name``, ``aliases``
+    mapping, unique ``canonical_id`` slug), venue entries MUST carry non-empty
+    ``city`` and ``country`` strings — filling those is half the point of the
+    refactor (namesake disambiguation + geocoding base).
+    """
+    if not isinstance(doc, dict) or 'venues' not in doc:
+        raise MedallionConfigError(
+            "venue_aliases.yaml: missing top-level 'venues' key"
+        )
+    venues = doc['venues']
+    if not isinstance(venues, list):
+        raise MedallionConfigError(
+            "venue_aliases.yaml: 'venues' must be a list"
+        )
+    seen_ids: set = set()
+    for i, v in enumerate(venues):
+        if not isinstance(v, dict):
+            raise MedallionConfigError(
+                f"venue_aliases.yaml: venues[{i}] must be a mapping"
+            )
+        if 'canonical_name' not in v:
+            raise MedallionConfigError(
+                f"venue_aliases.yaml: venues[{i}] missing 'canonical_name'"
+            )
+        if 'aliases' not in v or not isinstance(v['aliases'], dict):
+            raise MedallionConfigError(
+                f"venue_aliases.yaml: venues[{i}] ({v.get('canonical_name')}) "
+                f"missing/invalid 'aliases'"
+            )
+        cid = v.get('canonical_id')
+        if not isinstance(cid, str) or not re.fullmatch(r'[a-z0-9_]+', cid):
+            raise MedallionConfigError(
+                f"venue_aliases.yaml: venues[{i}] ({v.get('canonical_name')}) "
+                f"missing/invalid 'canonical_id' (must match ^[a-z0-9_]+$, "
+                f"got {cid!r})"
+            )
+        if cid in seen_ids:
+            raise MedallionConfigError(
+                f"venue_aliases.yaml: duplicate canonical_id {cid!r} "
+                f"(venues[{i}]) — one slug must map to one venue"
+            )
+        seen_ids.add(cid)
+        for geo in ('city', 'country'):
+            val = v.get(geo)
+            if not isinstance(val, str) or not val.strip():
+                raise MedallionConfigError(
+                    f"venue_aliases.yaml: venues[{i}] "
+                    f"({v.get('canonical_name')}) missing/empty {geo!r}"
+                )
 
 
 def _validate_player_aliases_schema(doc: Dict) -> None:
@@ -291,6 +347,21 @@ def load_referee_aliases() -> Dict:
         return {'referees': []}
     doc = _read_yaml(path)
     _validate_referee_aliases_schema(doc)
+    return doc
+
+
+def load_venue_aliases() -> Dict:
+    """Return the parsed venue_aliases.yaml (with schema sanity-check).
+
+    Missing file is treated as ``{'venues': []}`` so a fresh checkout before
+    #145 degrades to "no venue aliases" (every venue resolves to an orphan
+    hash id) rather than crashing DAG-parse.
+    """
+    path = str(CONFIG_DIR / VENUE_ALIASES_FILE)
+    if not Path(path).exists():
+        return {'venues': []}
+    doc = _read_yaml(path)
+    _validate_venue_aliases_schema(doc)
     return doc
 
 
@@ -634,6 +705,90 @@ def get_referee_alias_sql_values(
             f"'{_escape_sql_string(canonical)}')"
             for raw, canonical, _cid in rows
         ]
+    return ',\n'.join(lines).lstrip()
+
+
+# ---------------------------------------------------------------------------
+# Venue aliases — query helpers (issue #145)
+# ---------------------------------------------------------------------------
+
+def _venue_in_scope(venue: Dict, competition: Optional[str]) -> bool:
+    """True if this venue's competition_scope contains `competition`, OR if no
+    competition filter was requested. Missing scope defaults to APL (E2)."""
+    if competition is None:
+        return True
+    scope = venue.get('competition_scope') or ['ENG-Premier League']
+    return competition in scope
+
+
+def _iter_venue_aliases(
+    source: Optional[str],
+    competition: Optional[str],
+) -> List[Tuple[str, str, str, str, str, str]]:
+    """Yield (raw_name, canonical_id, canonical_name, city, country, league).
+
+    Mirror of :func:`_iter_referee_aliases`, but venues always carry city /
+    country / league (no toggles — they are core to #145). The league is the
+    venue's ``competition_scope`` fanned out one row per scope entry so the
+    downstream JOIN can guard on ``a.league = u.league``.
+    """
+    doc = load_venue_aliases()
+    seen: set = set()
+    out: List[Tuple[str, str, str, str, str, str]] = []
+    for venue in doc.get('venues', []):
+        if not _venue_in_scope(venue, competition):
+            continue
+        canonical = venue['canonical_name']
+        canonical_id = venue['canonical_id']
+        city = venue['city']
+        country = venue['country']
+        aliases = venue.get('aliases') or {}
+        leagues = venue.get('competition_scope') or ['ENG-Premier League']
+
+        buckets: List[str] = [_GENERIC_BUCKET]
+        if source is None:
+            buckets.extend(k for k in aliases.keys() if k != _GENERIC_BUCKET)
+        else:
+            buckets.append(source)
+
+        for bucket in buckets:
+            for raw in aliases.get(bucket, []) or []:
+                for league in leagues:
+                    key = (raw, canonical_id, canonical, city, country, league)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    out.append(key)
+    return out
+
+
+def get_venue_alias_sql_values(
+    source: Optional[str] = None,
+    competition: Optional[str] = None,
+) -> str:
+    """Render venue alias tuples as a Trino VALUES body (issue #145).
+
+    Emits six-tuples
+    ``(raw_name, canonical_id, canonical_name, city, country, league)``
+    consumed by ``dim_venue.sql.j2``. Empty result raises (an empty VALUES is
+    invalid Trino and almost certainly signals a missing/misfiltered config).
+    """
+    rows = _iter_venue_aliases(source, competition)
+    if not rows:
+        raise MedallionConfigError(
+            f"get_venue_alias_sql_values produced 0 rows "
+            f"(source={source!r}, competition={competition!r}); "
+            "an empty VALUES clause is invalid Trino — refusing to emit."
+        )
+    lines = [
+        f"    ('{_escape_sql_string(raw)}', "
+        f"'{_escape_sql_string(cid)}', "
+        f"'{_escape_sql_string(canonical)}', "
+        f"'{_escape_sql_string(city)}', "
+        f"'{_escape_sql_string(country)}', "
+        f"'{_escape_sql_string(league)}')"
+        for raw, cid, canonical, city, country, league in rows
+    ]
     return ',\n'.join(lines).lstrip()
 
 

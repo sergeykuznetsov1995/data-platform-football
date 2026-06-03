@@ -1,0 +1,169 @@
+-- =============================================================================
+-- Gold: dim_venue   (Jinja-template — `.sql.j2`)
+-- =============================================================================
+-- Global dimension of football venues (stadiums) consolidated from FBref and
+-- ESPN match feeds. One row per canonical venue.
+--
+-- Sources:
+--   iceberg.silver.fbref_match_enriched   (sch.venue per match)
+--   iceberg.bronze.espn_matchsheet        (latest snapshot per (game, team))
+--
+-- Identity (issue #145): `venue_id` is the explicit `venue_<slug>` from
+-- `configs/medallion/venue_aliases.yaml` — NOT a hash of the raw name. The
+-- template renders ONE `{{ venue_aliases_values_sql }}` placeholder, filled by
+-- `medallion_config.get_venue_alias_sql_values()` → a comma-separated list of
+-- six-tuples `('raw_name','canonical_id','canonical_name','city','country',
+-- 'league'), ...`. Every observed spelling of a stadium carries an alias row
+-- pointing at the same `canonical_id`, so "Brentford Community Stadium" and
+-- "Gtech Community Stadium" (sponsor rename) merge with zero fuzzy matching.
+--
+-- Unmatched raw names fall back to a normalised-name hash id and are marked
+-- `venue_source = 'orphan'` — a DQ WARNING surfaces them for the curator.
+--
+-- DAG-integration note: rendered by `dim_loaders.render_dim_venue_sql` →
+-- tempfile → `run_inline_ctas` → `CREATE OR REPLACE TABLE iceberg.gold.dim_venue`
+-- via `gold_tasks.run_gold_transform`. This file MUST stay a pure SELECT.
+--
+-- PK:           venue_id   (guaranteed unique by the final GROUP BY)
+-- Partitioning: NONE  (small global dim, queried by venue_id / venue_slug)
+--
+-- Source-of-truth selection (R0.4 schema versioning):
+--   venue_canonical = canonical_name from YAML, else MAX(name) fbref > espn
+--   venue_source    = 'curated' (matched alias) | 'orphan' (unmatched)
+--   venue_version   = 'v2'  (bumped from 'v1': hash-name identity -> alias slug)
+--
+-- Notes:
+--   * city / country come from venue_aliases.yaml for curated venues; NULL for
+--     orphans. Fills the former R8 placeholder for in-scope (APL) venues.
+--   * Normalisation key (NFD + strip diacritics + remove non-alphanumerics)
+--     folds apostrophe/period variants ("St James' Park" / "St. James' Park")
+--     automatically, so the curator only lists genuinely distinct spellings.
+--   * ESPN season comes as 4-char encoded label ('2526') -> normalized to
+--     BIGINT 2025 to align with silver/FBref season type.
+-- =============================================================================
+
+with aliases as (
+    select
+        raw_name,
+        canonical_id,
+        canonical_name,
+        city,
+        country,
+        -- League predicate (issue #148): guard the JOIN on a.league = u.league
+        -- so worldwide namesakes (one spelling, two cities) never cross-merge.
+        league,
+        -- Normalised join key: lower -> strip diacritics (NFD + \p{Mn}) ->
+        -- remove all non-alphanumerics. Same idiom as xref_referee.sql.j2.
+        regexp_replace(
+            regexp_replace(normalize(lower(raw_name), NFD), '\p{Mn}+', ''),
+            '[^a-z0-9]+', ''
+        ) as norm
+    from (values
+        {{ venue_aliases_values_sql }}
+    ) as t(raw_name, canonical_id, canonical_name, city, country, league)
+),
+
+fbref_venues as (
+    select
+        trim(venue)                                  as venue_raw,
+        league,
+        season,
+        date                                         as match_date,
+        'fbref'                                      as src
+    from iceberg.silver.fbref_match_enriched
+    where venue is not null
+      and trim(venue) <> ''
+),
+
+espn_dedup as (
+    select
+        trim(venue)                                  as venue_raw,
+        league,
+        try_cast(substr(season, 1, 2) as bigint) + 2000  as season,
+        try_cast(substr(game, 1, 10) as date)        as match_date,
+        'espn'                                       as src,
+        row_number() over (
+            partition by trim(venue), league, season, game
+            order by _ingested_at desc
+        )                                            as rn
+    from iceberg.bronze.espn_matchsheet
+    where venue is not null
+      and trim(venue) <> ''
+),
+
+espn_venues as (
+    select venue_raw, league, season, match_date, src
+    from espn_dedup
+    where rn = 1
+),
+
+unioned as (
+    select * from fbref_venues
+    union all
+    select * from espn_venues
+),
+
+resolved as (
+    select
+        u.venue_raw,
+        u.league,
+        u.season,
+        u.match_date,
+        u.src,
+        a.canonical_id,
+        a.canonical_name,
+        a.city,
+        a.country,
+        -- Curated alias -> explicit slug; orphan -> stable normalised-name hash.
+        case
+            when a.canonical_id is not null then a.canonical_id
+            else 'venue_' || lower(to_hex(xxhash64(to_utf8(
+                regexp_replace(
+                    regexp_replace(normalize(lower(trim(u.venue_raw)), NFD), '\p{Mn}+', ''),
+                    '[^a-z0-9]+', ''
+                )
+            ))))
+        end                                          as venue_id
+    from unioned u
+    left join aliases a
+      on a.league = u.league
+     and a.norm = regexp_replace(
+                      regexp_replace(normalize(lower(trim(u.venue_raw)), NFD), '\p{Mn}+', ''),
+                      '[^a-z0-9]+', ''
+                  )
+),
+
+aggregated as (
+    select
+        venue_id,
+        max(canonical_id)                            as canonical_id,
+        max(canonical_name)                          as canonical_name,
+        max(city)                                    as city,
+        max(country)                                 as country,
+        max(venue_raw) filter (where src = 'fbref')  as venue_fbref,
+        max(venue_raw) filter (where src = 'espn')   as venue_espn,
+        count(distinct match_date)                   as n_matches,
+        min(match_date)                              as first_seen_date,
+        max(match_date)                              as last_seen_date,
+        max(league)                                  as league,
+        max(season)                                  as season
+    from resolved
+    group by venue_id
+)
+
+select
+    venue_id,
+    coalesce(canonical_name, venue_fbref, venue_espn)                          as venue_canonical,
+    case when canonical_id is not null then 'curated' else 'orphan' end        as venue_source,
+    'v2'                                                                       as venue_version,
+    venue_fbref,
+    venue_espn,
+    lower(regexp_replace(coalesce(canonical_name, venue_fbref, venue_espn), '[^a-zA-Z0-9]+', '_'))  as venue_slug,
+    city,
+    country,
+    n_matches,
+    first_seen_date,
+    last_seen_date,
+    league,
+    season
+from aggregated

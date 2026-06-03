@@ -187,8 +187,24 @@ class TestE2GroupDependencies:
 
 @pytest.mark.unit
 class TestE2InlineRendererWiring:
-    """The two inline-rendered dims (dim_competition, dim_season) wire into
-    the DAG via PythonOperator(python_callable=run_inline_ctas)."""
+    """The three inline-rendered dims (dim_venue, dim_competition, dim_season)
+    wire into the DAG via PythonOperator(python_callable=run_inline_ctas)."""
+
+    def test_dim_venue_uses_run_inline_ctas(self):
+        """issue #145: dim_venue moved from a static .sql to a config-rendered
+        .sql.j2 (curated alias identity) → inline-CTAS like dim_competition."""
+        _reload_gold_dag()
+        venue = _by_task_id("s2b_master_dims.dim_venue")
+        assert venue.python_callable is not None
+        assert venue.python_callable.__name__ == "run_inline_ctas", (
+            f"expected run_inline_ctas, got {venue.python_callable.__name__}"
+        )
+        assert "renderer" in venue.op_kwargs
+        assert venue.op_kwargs.get("template_sql", "").endswith(
+            "dim_venue.sql.j2"
+        )
+        assert venue.op_kwargs.get("table_name") == "dim_venue"
+        assert venue.op_kwargs.get("partition_cols") is None
 
     def test_dim_competition_uses_run_inline_ctas(self):
         _reload_gold_dag()

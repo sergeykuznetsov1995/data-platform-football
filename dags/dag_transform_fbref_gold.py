@@ -130,7 +130,6 @@ STAGE_2_DIMS = [
 # (~5-30 rows) so partitioning would just create empty manifest noise.
 STAGE_2B_MASTER_DIMS_SQL = [
     # (task_id, sql_file, table_name, partition_cols)
-    ('dim_venue',     'dags/sql/gold/dim_venue.sql',     'dim_venue',     None),
     ('dim_referee',   'dags/sql/gold/dim_referee.sql',   'dim_referee',   None),
     ('dim_manager',   'dags/sql/gold/dim_manager.sql',   'dim_manager',   None),
     ('dim_standings', 'dags/sql/gold/dim_standings.sql', 'dim_standings', ['league', 'season']),
@@ -141,6 +140,9 @@ STAGE_2B_MASTER_DIMS_SQL = [
 # top-level DAG body stays import-light (no eager import of dim_loaders -> yaml).
 STAGE_2B_MASTER_DIMS_INLINE = [
     # (task_id, renderer_name, template_path, table_name, partition_cols)
+    # dim_venue (issue #145): curated alias-identity from venue_aliases.yaml.
+    ('dim_venue',       'render_dim_venue_sql',
+     'dags/sql/gold/dim_venue.sql.j2',       'dim_venue',       None),
     ('dim_competition', 'render_dim_competition_sql',
      'dags/sql/gold/dim_competition.sql.j2', 'dim_competition', None),
     ('dim_season',      'render_dim_season_sql',
@@ -360,9 +362,11 @@ with DAG(
         from utils.dim_loaders import (
             render_dim_competition_sql,
             render_dim_season_sql,
+            render_dim_venue_sql,
             run_inline_ctas,
         )
         _RENDERERS = {
+            'render_dim_venue_sql':       render_dim_venue_sql,
             'render_dim_competition_sql': render_dim_competition_sql,
             'render_dim_season_sql':      render_dim_season_sql,
         }
