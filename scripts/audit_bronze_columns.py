@@ -105,6 +105,39 @@ EXPECTED_CONSTANT: dict[str, set[str]] = {
 # by design — _source='fbref' for all rows), but still NULL-check them.
 META_COLS = {'_source', '_entity_type', '_ingested_at', '_batch_id'}
 
+# Per-source parser "contract": minimal REQUIRED tables + columns each source's
+# scraper is expected to emit into bronze. Authored by reading the scraper class
+# (scrapers.* cannot be imported here — scrapers/__init__.py pulls nodriver +
+# selenium, ~1.5GB). Semantics: listed columns are the minimal required set; extra
+# live columns are NOT errors. Used by the `--source` contract-diff mode.
+# #274 seeds espn only; other sources filled in #276-#286.
+EXPECTED_TABLES: dict[str, dict[str, set[str]]] = {
+    'espn': {
+        # Reliably-produced set (verified vs live bronze 2026-06-03). The
+        # _standardize_schedule renames (home_score->home_goals, venue, attendance)
+        # are conditional on raw soccerdata columns that ESPN never supplies, so
+        # those targets never materialise — contract lists what actually lands.
+        'espn_schedule': {
+            'league', 'season', 'game', 'match_date', 'home_team', 'away_team',
+            'game_id', 'league_id',
+            *META_COLS,
+        },
+        # scripts/backfill_espn_e3_5.py:119-122 (extra stat columns also land,
+        # but only these are required)
+        'espn_lineup': {
+            'league', 'season', 'game', 'team', 'player', 'position',
+            'formation_place', 'sub_in', 'sub_out',
+            *META_COLS,
+        },
+        # NOTE: espn_standings is NOT in the contract — soccerdata's ESPN reader
+        # has no read_standings (scraper.py:112 returns None), so the table is
+        # never materialised. Listing it would be a permanent false-positive.
+    },
+    # 'fbref': {...}, 'understat': {...}, 'whoscored': {...}, 'fotmob': {...},
+    # 'sofascore': {...}, 'matchhistory': {...}, 'clubelo': {...}, 'sofifa': {...},
+    # 'transfermarkt': {...}, 'capology': {...}  -> #276-#286
+}
+
 # Source prefix → group label for the report
 SOURCE_GROUPS = [
     ('fbref_', 'FBref'),
@@ -117,6 +150,23 @@ SOURCE_GROUPS = [
     ('clubelo_', 'ClubElo'),
     ('matchhistory_', 'MatchHistory'),
 ]
+
+
+# CLI slug -> live bronze table prefix. Slug == key in EXPECTED_TABLES.
+# (SOURCE_GROUPS is label-oriented for the full-scan report; --source needs a slug.)
+SOURCE_PREFIXES: dict[str, str] = {
+    'fbref': 'fbref_',
+    'understat': 'understat_',
+    'whoscored': 'whoscored_',
+    'espn': 'espn_',
+    'sofascore': 'sofascore_',
+    'fotmob': 'fotmob_',
+    'matchhistory': 'matchhistory_',
+    'clubelo': 'clubelo_',
+    'sofifa': 'sofifa_',
+    'transfermarkt': 'transfermarkt_',
+    'capology': 'capology_',
+}
 
 
 def source_of(table: str) -> str:
@@ -261,6 +311,59 @@ def audit_table(cur, table: str) -> tuple[int, list[dict]]:
     return total, findings
 
 
+# ---- Contract diff (--source mode) ----
+
+def diff_contract(
+    cur,
+    source: str,
+    live_tables: set[str],
+    per_table: dict[str, tuple[int, list[dict]]],
+) -> dict[str, list]:
+    """Diff EXPECTED_TABLES[source] against live bronze.
+
+    Returns three categories:
+      - missing_tables: [(table, reason)]   — absent / empty / scan-failed
+      - missing_columns: [(table, col)]     — contract col not in live DESCRIBE
+      - all_null_columns: [(table, col, detail)] — ALL_NULL findings (allowlist-aware,
+        reused from audit_table; spans ALL {source}_* tables, not only contract cols)
+    """
+    contract = EXPECTED_TABLES.get(source, {})
+    missing_tables: list[tuple[str, str]] = []
+    missing_columns: list[tuple[str, str]] = []
+    all_null_columns: list[tuple[str, str, str]] = []
+
+    # (a) missing tables / (b) missing columns — driven by the contract
+    for table in sorted(contract):
+        expected_cols = contract[table]
+        if table not in live_tables:
+            missing_tables.append((table, 'absent from bronze'))
+            continue
+        total = per_table.get(table, (0, []))[0]
+        if total == -1:
+            missing_tables.append((table, 'audit scan failed'))
+            continue
+        if total == 0:
+            missing_tables.append((table, 'present but empty (0 rows)'))
+            continue
+        live_cols = {c.lower() for c, _ in describe(cur, table)}
+        for col in sorted(expected_cols):
+            if col.lower() not in live_cols:
+                missing_columns.append((table, col))
+
+    # (c) all-NULL columns — reuse audit_table findings across all live {source}_*
+    for table in sorted(per_table):
+        _, findings = per_table[table]
+        for f in findings:
+            if f['sev'] == 'ERROR' and f['detail'].startswith('ALL_NULL'):
+                all_null_columns.append((table, f['col'], f['detail']))
+
+    return {
+        'missing_tables': missing_tables,
+        'missing_columns': missing_columns,
+        'all_null_columns': all_null_columns,
+    }
+
+
 # ---- Report ----
 
 SEV_ORDER = {'ERROR': 0, 'WARN': 1, 'INFO': 2}
@@ -358,17 +461,123 @@ def render_report(per_table: dict[str, tuple[int, list[dict]]], output: Path) ->
     output.write_text('\n'.join(lines), encoding='utf-8')
 
 
+def render_source_report(
+    source: str,
+    diff: dict[str, list],
+    per_table: dict[str, tuple[int, list[dict]]],
+    output: Path,
+) -> None:
+    """Per-source contract report: missing tables / columns / all-NULL columns."""
+    missing_tables = diff['missing_tables']
+    missing_columns = diff['missing_columns']
+    all_null_columns = diff['all_null_columns']
+    contract = EXPECTED_TABLES.get(source, {})
+
+    today = datetime.utcnow().strftime('%Y-%m-%d')
+    lines: list[str] = [
+        f"# Bronze contract audit — {source} — {today}",
+        "",
+        "Дифф live `iceberg.bronze.{source}_*` против контракта парсера "
+        "(`EXPECTED_TABLES`).",
+        "**missing table** (нет/пустая), **missing column** (ожидаемой колонки нет "
+        "в DESCRIBE), **all-NULL column** (100% NULL не в allowlist).",
+        "",
+        "## Summary",
+        "",
+        f"- Contract tables: **{len(contract)}**",
+        f"- Missing tables: **{len(missing_tables)}**",
+        f"- Missing columns: **{len(missing_columns)}**",
+        f"- All-NULL columns: **{len(all_null_columns)}**",
+        "",
+    ]
+
+    if not contract:
+        lines.append(
+            f"⚠️ Контракт для `{source}` пуст (`EXPECTED_TABLES['{source}']` "
+            "не заполнен) — наполняется в per-source issue #276-#286."
+        )
+        lines.append("")
+
+    # 1. Missing tables
+    lines.append("## Missing tables")
+    lines.append("")
+    if missing_tables:
+        lines.append("| Table | Reason |")
+        lines.append("|---|---|")
+        for table, reason in missing_tables:
+            lines.append(f"| `{table}` | {reason} |")
+    else:
+        lines.append("(none)")
+    lines.append("")
+
+    # 2. Missing columns
+    lines.append("## Missing columns")
+    lines.append("")
+    if missing_columns:
+        lines.append("| Table | Column |")
+        lines.append("|---|---|")
+        for table, col in missing_columns:
+            lines.append(f"| `{table}` | `{col}` |")
+    else:
+        lines.append("(none)")
+    lines.append("")
+
+    # 3. All-NULL columns
+    lines.append("## All-NULL columns")
+    lines.append("")
+    if all_null_columns:
+        lines.append("| Table | Column | Detail |")
+        lines.append("|---|---|---|")
+        for table, col, detail in all_null_columns:
+            lines.append(f"| `{table}` | `{col}` | {detail} |")
+    else:
+        lines.append("(none)")
+    lines.append("")
+
+    # Context: all live {source}_* tables scanned
+    lines.append("## Live tables scanned (context)")
+    lines.append("")
+    if per_table:
+        lines.append("| Table | Rows | ERROR | WARN |")
+        lines.append("|---|---:|---:|---:|")
+        for table in sorted(per_table):
+            total, fs = per_table[table]
+            e = sum(1 for f in fs if f['sev'] == 'ERROR')
+            w = sum(1 for f in fs if f['sev'] == 'WARN')
+            lines.append(f"| `{table}` | {total} | {e} | {w} |")
+    else:
+        lines.append("(none — нет живых таблиц с этим префиксом)")
+    lines.append("")
+
+    output.write_text('\n'.join(lines), encoding='utf-8')
+
+
 # ---- Main ----
 
 def main():
     p = argparse.ArgumentParser()
     p.add_argument('--output', default=f'/tmp/bronze_column_audit_{datetime.utcnow():%Y-%m-%d}.md')
+    p.add_argument('--source', default=None,
+                   help='slug (espn, fbref, ...) — scan only {source}_* tables and '
+                        'diff against the parser contract (EXPECTED_TABLES)')
     args = p.parse_args()
+
+    source: Optional[str] = None
+    if args.source:
+        source = args.source.lower()
+        if source not in SOURCE_PREFIXES:
+            sys.exit(f"unknown source '{source}'; known: {sorted(SOURCE_PREFIXES)}")
 
     conn = _get_trino_connection()
     cur = conn.cursor()
     cur.execute('SHOW TABLES FROM iceberg.bronze')
-    tables = sorted(r[0] for r in cur.fetchall())
+    all_tables = sorted(r[0] for r in cur.fetchall())
+
+    if source:
+        prefix = SOURCE_PREFIXES[source]
+        tables = [t for t in all_tables if t.startswith(prefix)]
+    else:
+        tables = all_tables
     print(f"Scanning {len(tables)} bronze tables...", file=sys.stderr)
 
     per_table: dict[str, tuple[int, list[dict]]] = {}
@@ -385,7 +594,11 @@ def main():
             }])
 
     output = Path(args.output)
-    render_report(per_table, output)
+    if source:
+        diff = diff_contract(cur, source, set(all_tables), per_table)
+        render_source_report(source, diff, per_table, output)
+    else:
+        render_report(per_table, output)
     print(f"\nReport written to: {output}", file=sys.stderr)
 
 
