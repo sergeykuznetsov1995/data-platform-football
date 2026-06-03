@@ -188,16 +188,23 @@ class CHECK:
         parent: str,
         key: str,
         parent_key: Optional[str] = None,
+        where: Optional[str] = None,
         severity: str = 'ERROR',
         name: Optional[str] = None,
     ) -> Check:
-        """Child.key must exist in parent.key (or parent.parent_key when names differ)."""
+        """Child.key must exist in parent.key (or parent.parent_key when names differ).
+
+        ``where`` restricts the check to a subset of child rows (e.g.
+        ``lineup_source = 'fbref'`` to exclude other-source pseudo-ids that
+        legitimately don't appear in the parent).
+        """
         pk = parent_key or key
         suffix = key if pk == key else f"{key}->{pk}"
         return Check(
             name=name or f"ref_integrity[{child}.{suffix}->{parent}]",
             kind='ref_integrity',
-            params={'child': child, 'parent': parent, 'key': key, 'parent_key': pk},
+            params={'child': child, 'parent': parent, 'key': key,
+                    'parent_key': pk, 'where': where},
             severity=severity,
         )
 
@@ -574,8 +581,19 @@ def _run_ref_integrity(conn, check: Check) -> Dict[str, Any]:
                 ),
             }
 
+    # Optional child-row filter (e.g. scope to a single source). Applied as a
+    # subquery so the predicate can't collide with parent column names in the
+    # JOIN. Same injection guard as _run_no_nulls / _run_value_range.
+    where = p.get('where')
+    if where:
+        if ';' in where or '--' in where:
+            raise ValueError(f"Unsafe WHERE: {where!r}")
+        child_src = f"(SELECT * FROM {child} WHERE {where})"
+    else:
+        child_src = child
+
     sql = (
-        f"SELECT COUNT(DISTINCT c.{key}) FROM {child} c "
+        f"SELECT COUNT(DISTINCT c.{key}) FROM {child_src} c "
         f"LEFT JOIN {parent} p ON c.{key} = p.{parent_key} "
         f"WHERE p.{parent_key} IS NULL AND c.{key} IS NOT NULL"
     )

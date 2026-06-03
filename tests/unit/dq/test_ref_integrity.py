@@ -113,6 +113,22 @@ class TestRefIntegrityFactory:
         )
         assert chk.severity == 'ERROR'
 
+    def test_where_defaults_none(self):
+        dq = _import_dq()
+        chk = dq.CHECK.ref_integrity(
+            child='gold.fct_match', parent='gold.dim_match', key='match_id',
+        )
+        assert chk.params['where'] is None
+
+    def test_where_stored_in_params(self):
+        dq = _import_dq()
+        chk = dq.CHECK.ref_integrity(
+            child='gold.fct_lineup', parent='gold.dim_match',
+            key='match_id_canonical', parent_key='match_id',
+            where="lineup_source = 'fbref'",
+        )
+        assert chk.params['where'] == "lineup_source = 'fbref'"
+
 
 # ---------------------------------------------------------------------------
 # Runner — happy path
@@ -250,3 +266,49 @@ class TestRefIntegritySql:
         assert 'LEFT JOIN' in executed.upper()
         assert 'iceberg.gold.dim_match' in executed
         assert 'iceberg.gold.fct_match' in executed
+
+    def test_where_wraps_child_in_subquery(self):
+        """issue #242: a scoped ref_integrity (e.g. fct_lineup limited to
+        FBref rows) must filter the child via a subquery so the predicate
+        can't collide with parent columns in the JOIN."""
+        dq = _import_dq()
+        conn = _make_scripted_conn(
+            columns_present={
+                'gold.fct_lineup': ['match_id_canonical', 'lineup_source'],
+                'gold.dim_match': ['match_id'],
+            },
+            orphan_count=0,
+        )
+        with patch.object(dq, '_get_conn', return_value=conn):
+            chk = dq.CHECK.ref_integrity(
+                child='gold.fct_lineup', parent='gold.dim_match',
+                key='match_id_canonical', parent_key='match_id',
+                where="lineup_source = 'fbref'",
+            )
+            dq.run_checks([chk], raise_on_error=False)
+
+        executed = conn.cursor.return_value._last_sql
+        assert "(SELECT * FROM iceberg.gold.fct_lineup WHERE lineup_source = 'fbref')" in executed
+        assert 'LEFT JOIN iceberg.gold.dim_match' in executed
+
+    def test_where_injection_guard(self):
+        """A WHERE carrying ';' or '--' must fail closed, not reach Trino."""
+        dq = _import_dq()
+        conn = _make_scripted_conn(
+            columns_present={
+                'gold.fct_lineup': ['match_id_canonical', 'lineup_source'],
+                'gold.dim_match': ['match_id'],
+            },
+            orphan_count=0,
+        )
+        with patch.object(dq, '_get_conn', return_value=conn):
+            chk = dq.CHECK.ref_integrity(
+                child='gold.fct_lineup', parent='gold.dim_match',
+                key='match_id_canonical', parent_key='match_id',
+                where="lineup_source = 'fbref'; DROP TABLE x",
+            )
+            report = dq.run_checks([chk], raise_on_error=False)
+
+        r = report.results[0]
+        assert r.passed is False
+        assert 'Unsafe WHERE' in (r.error or ''), r.error
