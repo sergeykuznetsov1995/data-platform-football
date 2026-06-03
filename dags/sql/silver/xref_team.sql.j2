@@ -64,6 +64,11 @@ WITH aliases AS (
         raw_name,
         canonical_name,
         canonical_id,
+        -- League predicate (issue #148, #141 stage 2): each alias is tagged with
+        -- the competition it applies to, so the JOIN below can guard on
+        -- `a.league = rt.league` and disambiguate a bare short name (e.g.
+        -- "Spartak") by league at worldwide scope. APL-only today → no-op.
+        league,
         -- Normalised join key (issue #141, stage 3): lower → strip diacritics →
         -- drop a trailing legal-form suffix (FC/AFC/CF) → remove all remaining
         -- non-alphanumerics. Lets "Liverpool FC" match the "Liverpool" alias
@@ -77,7 +82,7 @@ WITH aliases AS (
         ) AS norm
     FROM (VALUES
         {{ team_aliases_values_sql }}
-    ) AS t(raw_name, canonical_name, canonical_id)
+    ) AS t(raw_name, canonical_name, canonical_id, league)
 ),
 
 raw_teams AS (
@@ -167,8 +172,12 @@ resolved AS (
     FROM raw_teams rt
     -- Match on the normalised key (NOT the raw string). Same normalisation as
     -- the `aliases.norm` column above, applied to the Bronze raw team-name.
+    -- The `a.league = rt.league` guard (issue #148) disambiguates same-named
+    -- clubs in different leagues; all 10 Bronze sources emit the identical
+    -- league literal (e.g. 'ENG-Premier League'), so APL resolution is a no-op.
     LEFT JOIN aliases a
-      ON a.norm = regexp_replace(
+      ON a.league = rt.league
+     AND a.norm = regexp_replace(
                       regexp_replace(
                           regexp_replace(
                               normalize(lower(rt.source_id), NFD), '\p{Mn}+', ''

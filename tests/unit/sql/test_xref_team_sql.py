@@ -122,14 +122,22 @@ class TestXrefTeamTemplateStructure:
             "expected trailing legal-form suffix strip (fc|afc|cf)"
         )
 
-    def test_alias_cte_has_three_columns(self):
-        """aliases CTE binds the 3-tuple VALUES: (raw_name, canonical_name, canonical_id)."""
+    def test_alias_cte_has_four_columns(self):
+        """aliases CTE binds the 4-tuple VALUES (issue #148): adds `league`."""
         sql = _read_template()
         assert re.search(
-            r"AS\s+t\s*\(\s*raw_name\s*,\s*canonical_name\s*,\s*canonical_id\s*\)",
+            r"AS\s+t\s*\(\s*raw_name\s*,\s*canonical_name\s*,\s*"
+            r"canonical_id\s*,\s*league\s*\)",
             sql,
             re.IGNORECASE,
-        ), "aliases CTE must bind t(raw_name, canonical_name, canonical_id)"
+        ), "aliases CTE must bind t(raw_name, canonical_name, canonical_id, league)"
+
+    def test_alias_join_guards_on_league(self):
+        """JOIN disambiguates by league (issue #148): `a.league = rt.league`."""
+        sql = _read_template()
+        assert re.search(
+            r"a\.league\s*=\s*rt\.league", sql, re.IGNORECASE
+        ), "alias JOIN must guard on `a.league = rt.league`"
 
     def test_orphan_id_prefix_per_source(self):
         """Each source has a short orphan prefix (fb_/us_/ws_/.../tm_/cap_)."""
@@ -201,8 +209,8 @@ class TestXrefTeamRendered:
 
         # Fresh read so a previous test cannot poison the lru_cache state.
         reset_cache()
-        # xref_team consumes 3-column tuples (issue #141) — match the DAG call.
-        values = get_team_alias_sql_values(with_canonical_id=True)
+        # xref_team consumes 4-column tuples (issue #148) — match the DAG call.
+        values = get_team_alias_sql_values(with_canonical_id=True, with_league=True)
         return render_sql_template(SQL_PATH, team_aliases_values_sql=values)
 
     def test_render_leaves_no_active_jinja_placeholders(self, rendered: str):
