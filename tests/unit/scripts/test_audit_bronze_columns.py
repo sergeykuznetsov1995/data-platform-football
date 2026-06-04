@@ -261,3 +261,21 @@ def test_clubelo_contract_lists_all_three_tables(table):
 ])
 def test_matchhistory_contract_lists_all_tables(table):
     assert table in mod.EXPECTED_TABLES['matchhistory']
+
+
+# --- SoFIFA contract presence guard (#284) ---------------------------------
+# Regression guard: all 5 SoFIFA bronze tables must stay in the contract so the
+# --source sofifa audit keeps verifying full coverage. Ingest is CF-blocked
+# (#180) — verified vs baseline snapshot only (FC 26, ENG-Premier League,
+# 2026-06-04): player_ratings 546, players 546, team_ratings 20, teams 20,
+# versions 849 rows. 0 all-NULL outside allowlist; 15 sofifa_team_ratings cols
+# (build_up/chance_creation/defence/...) are 100% NULL and live in EXPECTED_NULL.
+@pytest.mark.parametrize('table', [
+    'sofifa_players',
+    'sofifa_teams',
+    'sofifa_player_ratings',
+    'sofifa_team_ratings',
+    'sofifa_versions',
+])
+def test_sofifa_contract_lists_all_five_tables(table):
+    assert table in mod.EXPECTED_TABLES['sofifa']

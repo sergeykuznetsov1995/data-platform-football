@@ -473,7 +473,40 @@ EXPECTED_TABLES: dict[str, dict[str, set[str]]] = {
             *META_COLS,
         },
     },
-    # 'sofifa': {...}, 'transfermarkt': {...}, 'capology': {...}  -> #284-#286
+    'sofifa': {
+        # SoFIFA scraper (scrapers/sofifa/scraper.py — soccerdata reader +
+        # FlareSolverr override). 5 tables, all partitioned ['fifa_edition'].
+        # Minimal required = identity keys + core ratings + META_COLS; extra live
+        # cols are NOT errors; the 15 100%-NULL sofifa_team_ratings cols live in
+        # EXPECTED_NULL and are excluded here. Ingest BLOCKED by CF Turnstile
+        # (#180) — no live re-run; verified vs the already-materialised baseline
+        # snapshot 2026-06-04 (#284): FC 26 / ENG-Premier League, all 5 tables
+        # non-empty (player_ratings 546, players 546, team_ratings 20, teams 20,
+        # versions 849 rows) — 0 missing tables/columns, 0 all-NULL outside the
+        # allowlist.
+        'sofifa_players': {
+            'fifa_edition', 'player', 'player_id', 'team', 'league', *META_COLS,
+        },
+        'sofifa_teams': {
+            'fifa_edition', 'team', 'team_id', 'league', *META_COLS,
+        },
+        'sofifa_player_ratings': {
+            'fifa_edition', 'player', 'player_id', 'position',
+            'overallrating', 'potential', 'pace', 'shooting', 'passing',
+            'dribbling', 'defending', 'physical', *META_COLS,
+        },
+        # build_up_*/chance_creation_*/defence_*/...prestige/whole_team_average_age
+        # (15 cols) are 100% NULL upstream (FC 26 removed them) — see EXPECTED_NULL,
+        # so they are excluded from the required set.
+        'sofifa_team_ratings': {
+            'fifa_edition', 'team', 'team_id', 'league',
+            'overall', 'attack', 'midfield', 'defence', *META_COLS,
+        },
+        'sofifa_versions': {  # FIFA-edition lookup (soccerdata read_versions)
+            'version_id', 'fifa_edition', 'update', *META_COLS,
+        },
+    },
+    # 'transfermarkt': {...}, 'capology': {...}  -> #285-#286
 }
 
 # Tables a source's contract names but that are intentionally NOT materialised
