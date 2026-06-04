@@ -127,31 +127,6 @@ class UnderstatScraper(SoccerdataScraper):
             logger.error(f"Error reading player stats: {e}")
             return None
 
-    def read_team_season_stats(self) -> Optional[pd.DataFrame]:
-        """
-        Read team match statistics (aggregated by team).
-
-        Note: Understat doesn't have read_team_season_stats, using read_team_match_stats instead.
-
-        Returns:
-            DataFrame with team xG stats
-        """
-        reader = self._get_reader()
-        logger.info("Fetching Understat team match stats")
-
-        try:
-            df = self._execute_with_resilience(reader.read_team_match_stats)
-
-            if df is not None and not df.empty:
-                df = df.reset_index()
-                df = self._add_metadata(df, 'team_stats')
-
-            return df
-
-        except Exception as e:
-            logger.error(f"Error reading team stats: {e}")
-            return None
-
     def read_player_match_stats(self) -> Optional[pd.DataFrame]:
         """
         Read player match-level statistics.
@@ -263,18 +238,6 @@ class UnderstatScraper(SoccerdataScraper):
             return {'player_stats': table_path}
         return {}
 
-    def scrape_team_stats(self) -> Dict[str, str]:
-        """Scrape team season stats."""
-        df = self.read_team_season_stats()
-        if df is not None and not df.empty:
-            table_path = self.save_to_iceberg(
-                df=df,
-                table_name='understat_teams',
-                partition_cols=['league', 'season'],
-            )
-            return {'team_stats': table_path}
-        return {}
-
     def scrape_shots(self) -> Dict[str, str]:
         """Scrape shot events."""
         df = self.read_shot_events()
@@ -307,10 +270,6 @@ class UnderstatScraper(SoccerdataScraper):
         # Scrape player stats
         player_results = self.scrape_player_stats()
         results.update(player_results)
-
-        # Scrape team stats
-        team_results = self.scrape_team_stats()
-        results.update(team_results)
 
         # Scrape shot events
         shots_results = self.scrape_shots()
