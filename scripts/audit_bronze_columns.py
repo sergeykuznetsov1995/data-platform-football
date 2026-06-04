@@ -207,9 +207,39 @@ EXPECTED_TABLES: dict[str, dict[str, set[str]]] = {
             'league', 'season', 'player', 'squad', '90s', *META_COLS,
         },
     },
-    # 'understat': {...}, 'whoscored': {...}, 'fotmob': {...}, 'sofascore': {...},
+    'understat': {
+        # soccerdata reader output (UnderstatScraper). 5 tables, all partitioned
+        # ['league', 'season']. Minimal required set = identity keys + core metrics
+        # + META_COLS; extra live columns are NOT errors. Column names verified vs
+        # live bronze snapshot (tests/fixtures/bronze_schemas.json, 2026-06-02).
+        # NOTE: bronze.understat_players carries ×10 row dups upstream (deduped in
+        # Silver via ROW_NUMBER) — not a coverage failure (per-column non-NULL is
+        # unaffected by row dups).
+        'understat_schedule': {
+            'league', 'season', 'game', 'game_id', 'date',
+            'home_team', 'away_team', 'home_goals', 'away_goals',
+            'home_xg', 'away_xg', *META_COLS,
+        },
+        'understat_shots': {
+            'league', 'season', 'game_id', 'shot_id', 'minute',
+            'player', 'player_id', 'team', 'team_id', 'xg', 'result', *META_COLS,
+        },
+        'understat_players': {
+            'league', 'season', 'player', 'player_id', 'team', 'position',
+            'matches', 'minutes', 'goals', 'assists', 'shots', 'xg', 'xa', *META_COLS,
+        },
+        'understat_team_match_stats': {
+            'league', 'season', 'game_id', 'date', 'home_team', 'away_team',
+            'home_goals', 'away_goals', 'home_xg', 'away_xg', *META_COLS,
+        },
+        'understat_player_match_stats': {
+            'league', 'season', 'game_id', 'player', 'player_id', 'team',
+            'minutes', 'goals', 'assists', 'shots', 'xg', 'xa', *META_COLS,
+        },
+    },
+    # 'whoscored': {...}, 'fotmob': {...}, 'sofascore': {...},
     # 'matchhistory': {...}, 'clubelo': {...}, 'sofifa': {...},
-    # 'transfermarkt': {...}, 'capology': {...}  -> #277-#286
+    # 'transfermarkt': {...}, 'capology': {...}  -> #278-#286
 }
 
 # Tables a source's contract names but that are intentionally NOT materialised
