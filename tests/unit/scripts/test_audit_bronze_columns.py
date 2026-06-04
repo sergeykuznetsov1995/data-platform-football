@@ -218,3 +218,15 @@ def test_sofascore_contract_lists_all_eight_tables(table):
 ])
 def test_fotmob_contract_lists_all_nine_tables(table):
     assert table in mod.EXPECTED_TABLES['fotmob']
+
+
+# --- MatchHistory contract presence guard (#282) ---------------------------
+# Regression guard: единственная MatchHistory bronze-таблица должна оставаться в
+# контракте, чтобы --source matchhistory продолжал проверять покрытие. matchhistory_results
+# материализуется и не пустая live (verified 2026-06-04, #282): 1439 строк, сезон 2025.
+# 0 all-NULL колонок. Известный дрейф: silver читает legacy matchhistory_games (followup).
+@pytest.mark.parametrize('table', [
+    'matchhistory_results',
+])
+def test_matchhistory_contract_lists_all_tables(table):
+    assert table in mod.EXPECTED_TABLES['matchhistory']
