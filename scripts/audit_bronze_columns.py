@@ -141,6 +141,15 @@ EXPECTED_TABLES: dict[str, dict[str, set[str]]] = {
             'formation_place', 'sub_in', 'sub_out',
             *META_COLS,
         },
+        # Producer: scripts/backfill_espn_e3_5.py matchsheet branch
+        # (soccerdata read_matchsheet — #298). One row per (game, team) with
+        # venue + ~35 team stat columns; only identity + venue are required
+        # (extra stat columns are NOT errors; `capacity` is 100%-NULL and lives
+        # in EXPECTED_NULL, so it is not listed here).
+        'espn_matchsheet': {
+            'league', 'season', 'game', 'team', 'is_home', 'venue', 'attendance',
+            *META_COLS,
+        },
         # NOTE: espn_standings is NOT in the contract — soccerdata's ESPN reader
         # has no read_standings (scraper.py:112 returns None), so the table is
         # never materialised. Listing it would be a permanent false-positive.
