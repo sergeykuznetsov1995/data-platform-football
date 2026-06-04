@@ -127,3 +127,17 @@ def test_missing_column_and_all_null_passthrough(patched_contract):
     assert ('testsrc_present', 'value') in diff['missing_columns']
     assert ('testsrc_present', 'value',
             'ALL_NULL — 0 of 10 non-NULL (bigint)') in diff['all_null_columns']
+
+
+# --- Understat contract presence guard (#277) ------------------------------
+# Regression guard: the 5 Understat bronze tables must stay in the contract so
+# the --source understat audit keeps verifying full coverage.
+@pytest.mark.parametrize('table', [
+    'understat_schedule',
+    'understat_shots',
+    'understat_players',
+    'understat_team_match_stats',
+    'understat_player_match_stats',
+])
+def test_understat_contract_lists_all_five_tables(table):
+    assert table in mod.EXPECTED_TABLES['understat']
