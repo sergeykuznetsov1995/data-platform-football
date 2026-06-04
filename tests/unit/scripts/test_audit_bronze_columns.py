@@ -141,3 +141,18 @@ def test_missing_column_and_all_null_passthrough(patched_contract):
 ])
 def test_understat_contract_lists_all_five_tables(table):
     assert table in mod.EXPECTED_TABLES['understat']
+
+
+# --- WhoScored contract presence guard (#278) ------------------------------
+# Regression guard: the 4 WhoScored bronze tables must stay in the contract so
+# the --source whoscored audit keeps verifying full coverage. whoscored_season_stages
+# is gated by EXPECTED_ABSENT (top-5 leagues have no cup stages) but stays in the
+# contract for completeness.
+@pytest.mark.parametrize('table', [
+    'whoscored_schedule',
+    'whoscored_events',
+    'whoscored_missing_players',
+    'whoscored_season_stages',
+])
+def test_whoscored_contract_lists_all_four_tables(table):
+    assert table in mod.EXPECTED_TABLES['whoscored']

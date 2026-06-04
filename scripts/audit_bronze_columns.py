@@ -74,6 +74,11 @@ EXPECTED_NULL: dict[str, set[str]] = {
         'home_extratime_score', 'away_extratime_score',
         'home_penalty_score', 'away_penalty_score',
         'stage',
+        # serialized nested betting-odds column — soccerdata's WhoScored
+        # read_schedule never populates `bets` for in-scope leagues (100% NULL
+        # across all 2280 rows, verified 2026-06-04 #278). Not a parser drop;
+        # the sibling `incidents` nested column does carry data.
+        'bets',
     },
     'whoscored_season_stages': {'stage'},
     'whoscored_events': {
@@ -237,9 +242,35 @@ EXPECTED_TABLES: dict[str, dict[str, set[str]]] = {
             'minutes', 'goals', 'assists', 'shots', 'xg', 'xa', *META_COLS,
         },
     },
-    # 'whoscored': {...}, 'fotmob': {...}, 'sofascore': {...},
+    'whoscored': {
+        # soccerdata WhoScored reader + FlareSolverr events fetcher. 4 tables,
+        # all partitioned ['league', 'season']. Minimal required = identity keys +
+        # core + META_COLS; extra live cols are NOT errors; EXPECTED_NULL cols
+        # (extratime/penalty/stage/bets on schedule; event-conditional on events)
+        # are excluded here. Verified vs live bronze 2026-06-04 (#278): all 4
+        # tables materialise (schedule 2280, events 709937, missing_players 21874,
+        # season_stages 6 rows) — 0 missing tables/columns.
+        'whoscored_schedule': {
+            'league', 'season', 'game', 'game_id', 'date',
+            'home_team', 'away_team', 'home_team_id', 'away_team_id',
+            'home_score', 'away_score', *META_COLS,
+        },
+        'whoscored_events': {
+            'league', 'season', 'game', 'game_id', 'minute', 'second', 'period',
+            'type', 'outcome_type', 'team', 'team_id', 'player', 'player_id',
+            'x', 'y', *META_COLS,
+        },
+        'whoscored_missing_players': {
+            'league', 'season', 'game', 'game_id', 'team',
+            'player', 'player_id', 'reason', 'status', *META_COLS,
+        },
+        'whoscored_season_stages': {  # cup/league stage metadata (6 rows live)
+            'league', 'season', 'stage_id', *META_COLS,
+        },
+    },
+    # 'fotmob': {...}, 'sofascore': {...},
     # 'matchhistory': {...}, 'clubelo': {...}, 'sofifa': {...},
-    # 'transfermarkt': {...}, 'capology': {...}  -> #278-#286
+    # 'transfermarkt': {...}, 'capology': {...}  -> #279-#286
 }
 
 # Tables a source's contract names but that are intentionally NOT materialised
