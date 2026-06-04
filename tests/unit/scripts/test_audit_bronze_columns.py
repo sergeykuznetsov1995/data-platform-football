@@ -176,3 +176,22 @@ def test_espn_contract_lists_all_tables(table):
 
 def test_espn_standings_excluded_from_contract():
     assert 'espn_standings' not in mod.EXPECTED_TABLES['espn']
+
+
+# --- SofaScore contract presence guard (#280) ------------------------------
+# Regression guard: the 8 SofaScore bronze tables must stay in the contract so
+# the --source sofascore audit keeps verifying full coverage. All 8 materialise
+# and are non-empty live (verified 2026-06-04, #280): the 2 soccerdata tables
+# (schedule, league_table) + 6 cherry-pick JSON-API tables.
+@pytest.mark.parametrize('table', [
+    'sofascore_schedule',
+    'sofascore_league_table',
+    'sofascore_player_ratings',
+    'sofascore_player_season_stats',
+    'sofascore_player_profile',
+    'sofascore_event_shotmap',
+    'sofascore_event_player_stats',
+    'sofascore_match_stats',
+])
+def test_sofascore_contract_lists_all_eight_tables(table):
+    assert table in mod.EXPECTED_TABLES['sofascore']

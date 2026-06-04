@@ -88,6 +88,30 @@ EXPECTED_NULL: dict[str, set[str]] = {
         'related_event_id', 'related_player_id',
         'end_x', 'end_y',
     },
+    'sofascore_event_player_stats': {
+        # Lineup-only fields: /event/{id}/player/{id}/statistics returns
+        # {player, team, statistics} with no `extra` block (isHome/captain/
+        # substitute live on the /lineups endpoint instead) and no per-player
+        # `position` inside statistics — so these 4 anchor cols are 100% NULL
+        # across all 15189 rows (verified 2026-06-04 #280). Enrichment from
+        # /lineups tracked in followup #301.
+        'is_home', 'captain', 'substitute', 'position_specific',
+        # auto-flatten artifacts: `ratingVersions` is a nested
+        # {original, alternative} object _coerce_scalar cannot reduce to a
+        # scalar; `statisticsType` is an always-empty key. Both 100% NULL.
+        'rating_versions', 'statistics_type',
+    },
+    'sofascore_event_shotmap': {
+        # Per-shot payload omits teamId/team.id and reversedPeriodCount/period
+        # for in-scope leagues — 100% NULL across all 9543 rows (verified
+        # 2026-06-04 #280). Shot side is still recoverable via `is_home`;
+        # period is simply not surfaced per shot by SofaScore's shotmap block.
+        'team_id', 'period',
+    },
+    'sofascore_player_season_stats': {
+        # auto-flatten always-empty `statisticsType` key (100% NULL, 533 rows).
+        'statistics_type',
+    },
 }
 
 # Columns that hold exactly 1 distinct value by design — should NOT trigger
@@ -277,9 +301,54 @@ EXPECTED_TABLES: dict[str, dict[str, set[str]]] = {
             'league', 'season', 'stage_id', *META_COLS,
         },
     },
-    # 'fotmob': {...}, 'sofascore': {...},
-    # 'matchhistory': {...}, 'clubelo': {...}, 'sofifa': {...},
-    # 'transfermarkt': {...}, 'capology': {...}  -> #279-#286
+    'sofascore': {
+        # soccerdata Sofascore reader (schedule + league_table) + cherry-pick
+        # JSON API endpoints (ratings/shotmap/event+season player stats/profile/
+        # match_stats). 8 tables, all partitioned ['league', 'season']. Minimal
+        # required = identity keys + core metrics + META_COLS; extra live cols
+        # (the wide Opta stat catalogues on *_player_*_stats) are NOT errors.
+        # Verified vs live bronze 2026-06-04 (#280): all 8 materialise + non-empty
+        # (schedule 380, league_table 20, ratings/event_player_stats 15189,
+        # event_shotmap 9543, match_stats 47188, player_season_stats/profile 533).
+        'sofascore_schedule': {
+            'league', 'season', 'game_id', 'date',
+            'home_team', 'away_team', 'home_score', 'away_score',
+            *META_COLS,
+        },
+        'sofascore_league_table': {
+            'league', 'season', 'team', 'mp', 'w', 'd', 'l',
+            'gf', 'ga', 'gd', 'pts', *META_COLS,
+        },
+        'sofascore_player_ratings': {
+            'league', 'season', 'match_id', 'player_id',
+            'team_side', 'rating', *META_COLS,
+        },
+        'sofascore_player_season_stats': {
+            'league', 'season', 'player_id', 'team_id', 'team_name',
+            'appearances', 'goals', 'assists', 'minutes_played', 'rating',
+            *META_COLS,
+        },
+        'sofascore_player_profile': {
+            'league', 'season', 'player_id', 'name', 'position',
+            *META_COLS,
+        },
+        'sofascore_event_shotmap': {
+            # `period` + `team_id` are 100% NULL upstream (see EXPECTED_NULL),
+            # so they are excluded from the required set.
+            'league', 'season', 'match_id', 'shot_id', 'player_id',
+            'minute', 'outcome', 'x', 'y', 'xg', *META_COLS,
+        },
+        'sofascore_event_player_stats': {
+            'league', 'season', 'match_id', 'player_id',
+            'minutes_played', 'rating', 'position', *META_COLS,
+        },
+        'sofascore_match_stats': {
+            'league', 'season', 'match_id', 'period',
+            'stat_key', 'stat_name', 'home_value', 'away_value', *META_COLS,
+        },
+    },
+    # 'fotmob': {...}, 'matchhistory': {...}, 'clubelo': {...}, 'sofifa': {...},
+    # 'transfermarkt': {...}, 'capology': {...}  -> #281-#286
 }
 
 # Tables a source's contract names but that are intentionally NOT materialised
