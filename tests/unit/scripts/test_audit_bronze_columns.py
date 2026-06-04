@@ -218,3 +218,20 @@ def test_sofascore_contract_lists_all_eight_tables(table):
 ])
 def test_fotmob_contract_lists_all_nine_tables(table):
     assert table in mod.EXPECTED_TABLES['fotmob']
+
+
+# --- ClubElo contract presence guard (#283) --------------------------------
+# Regression guard: all 3 ClubElo bronze tables must stay in the contract so the
+# --source clubelo audit keeps verifying full coverage. All 3 materialise + are
+# non-empty live (verified 2026-06-04, #283): ratings 2068, team_history 105600,
+# and ratings_historical (~52 weekly snapshots) now produced by the weekly
+# dag_ingest_clubelo_full. The two heavy tables use replace_partitions
+# (ratings_historical=['rating_date'], team_history=['team']) + weekly cadence,
+# neutralizing the daily-APPEND HDFS-overflow footgun (2026-05-04 incident).
+@pytest.mark.parametrize('table', [
+    'clubelo_ratings',
+    'clubelo_ratings_historical',
+    'clubelo_team_history',
+])
+def test_clubelo_contract_lists_all_three_tables(table):
+    assert table in mod.EXPECTED_TABLES['clubelo']
