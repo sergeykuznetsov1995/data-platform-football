@@ -435,6 +435,27 @@ EXPECTED_TABLES: dict[str, dict[str, set[str]]] = {
             'birth_date', 'primary_team_id', *META_COLS,
         },
     },
+    'clubelo': {
+        # ClubElo scraper (scrapers/clubelo/scraper.py). 3 tables. Verified vs
+        # live bronze 2026-06-04 (#283). Identity col is `team` (NOT `club`).
+        # `rank`/`league` are upstream-sparse but present (not all-NULL), so they
+        # are intentionally NOT in the required set — extra live cols are not
+        # errors. clubelo_ratings is the daily snapshot (partition rating_date);
+        # the two heavy tables are produced weekly by dag_ingest_clubelo_full
+        # with replace_partitions (ratings_historical=['rating_date'],
+        # team_history=['team']) — never daily APPEND (2026-05-04 HDFS overflow).
+        'clubelo_ratings': {
+            'team', 'country', 'level', 'elo', 'from', 'to', 'rating_date',
+            *META_COLS,
+        },
+        'clubelo_ratings_historical': {
+            'team', 'country', 'level', 'elo', 'from', 'to', 'rating_date',
+            *META_COLS,
+        },
+        'clubelo_team_history': {
+            'team', 'country', 'level', 'elo', 'from', 'to', *META_COLS,
+        },
+    },
     'matchhistory': {
         # football-data.co.uk CSV scraper, COLUMN_MAPPING (scrapers/matchhistory/scraper.py).
         # 1 table, partitioned ['league','season']. Минимальный контракт = identity +
@@ -452,8 +473,7 @@ EXPECTED_TABLES: dict[str, dict[str, set[str]]] = {
             *META_COLS,
         },
     },
-    # 'clubelo': {...}, 'sofifa': {...},
-    # 'transfermarkt': {...}, 'capology': {...}  -> #283-#286
+    # 'sofifa': {...}, 'transfermarkt': {...}, 'capology': {...}  -> #284-#286
 }
 
 # Tables a source's contract names but that are intentionally NOT materialised

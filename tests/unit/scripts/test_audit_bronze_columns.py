@@ -33,17 +33,31 @@ _SCRIPT_PATH = REPO_ROOT / 'scripts' / 'audit_bronze_columns.py'
 
 def _load_module():
     # Stub the container-only import so exec_module succeeds on the host.
+    # The stub must NOT leak into sys.modules past load — otherwise later tests
+    # that import the REAL utils.silver_tasks (e.g. test_silver_tasks,
+    # test_dag_transform_sofifa_silver_fallback) pick up this stub and fail with
+    # ImportError. Restore sys.modules in a finally so loading is side-effect-free.
     stub = types.ModuleType('utils.silver_tasks')
     stub._get_trino_connection = lambda *a, **k: None  # noqa: E731 — never called here
+    _sentinel = object()
+    _prev_utils = sys.modules.get('utils', _sentinel)
+    _prev_silver = sys.modules.get('utils.silver_tasks', _sentinel)
     sys.modules.setdefault('utils', types.ModuleType('utils'))
     sys.modules['utils.silver_tasks'] = stub
 
-    spec = importlib.util.spec_from_file_location('audit_bronze_columns', _SCRIPT_PATH)
-    assert spec is not None and spec.loader is not None, f'cannot load {_SCRIPT_PATH}'
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules['audit_bronze_columns'] = mod
-    spec.loader.exec_module(mod)
-    return mod
+    try:
+        spec = importlib.util.spec_from_file_location('audit_bronze_columns', _SCRIPT_PATH)
+        assert spec is not None and spec.loader is not None, f'cannot load {_SCRIPT_PATH}'
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules['audit_bronze_columns'] = mod
+        spec.loader.exec_module(mod)
+        return mod
+    finally:
+        for _name, _prev in (('utils.silver_tasks', _prev_silver), ('utils', _prev_utils)):
+            if _prev is _sentinel:
+                sys.modules.pop(_name, None)
+            else:
+                sys.modules[_name] = _prev
 
 
 mod = _load_module()
@@ -218,6 +232,23 @@ def test_sofascore_contract_lists_all_eight_tables(table):
 ])
 def test_fotmob_contract_lists_all_nine_tables(table):
     assert table in mod.EXPECTED_TABLES['fotmob']
+
+
+# --- ClubElo contract presence guard (#283) --------------------------------
+# Regression guard: all 3 ClubElo bronze tables must stay in the contract so the
+# --source clubelo audit keeps verifying full coverage. All 3 materialise + are
+# non-empty live (verified 2026-06-04, #283): ratings 2068, team_history 105600,
+# and ratings_historical (~52 weekly snapshots) now produced by the weekly
+# dag_ingest_clubelo_full. The two heavy tables use replace_partitions
+# (ratings_historical=['rating_date'], team_history=['team']) + weekly cadence,
+# neutralizing the daily-APPEND HDFS-overflow footgun (2026-05-04 incident).
+@pytest.mark.parametrize('table', [
+    'clubelo_ratings',
+    'clubelo_ratings_historical',
+    'clubelo_team_history',
+])
+def test_clubelo_contract_lists_all_three_tables(table):
+    assert table in mod.EXPECTED_TABLES['clubelo']
 
 
 # --- MatchHistory contract presence guard (#282) ---------------------------

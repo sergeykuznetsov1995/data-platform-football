@@ -150,8 +150,9 @@ class TestClubEloScraper:
             "balloons (the bug this fix targets)."
         )
 
-        # Sanity: returned dict points at the captured table path
-        assert result == {"team_history": "iceberg.bronze.clubelo_team_history"}
+        # Sanity: returned dict points at the captured table path (+ row count)
+        assert result["team_history"] == "iceberg.bronze.clubelo_team_history"
+        assert "rows" in result
 
     def test_scrape_team_histories_batches_all_teams_in_one_save(
         self, scraper, mock_soccerdata_clubelo
@@ -192,6 +193,53 @@ class TestClubEloScraper:
 
         assert mock_save.call_count == 0
         assert result == {}
+
+    # ------------------------------------------------------------------
+    # Regression: scrape_historical_ratings must call save_to_iceberg with
+    # replace_partitions=['rating_date'] AND a string rating_date.
+    #
+    # Background: rating_date arrives as a datetime. _build_partition_delete_filter
+    # only quotes str values; a datetime is emitted raw → invalid SQL → the DELETE
+    # fails and the writer SILENTLY falls back to plain APPEND (the 2026-05-04
+    # HDFS-overflow footgun). Normalizing rating_date to ISO 'YYYY-MM-DD' makes the
+    # replace-partition DELETE valid so re-runs stay idempotent.
+    # ------------------------------------------------------------------
+    def test_scrape_historical_ratings_uses_replace_partitions_with_str_date(
+        self, scraper, mock_soccerdata_clubelo
+    ):
+        """scrape_historical_ratings must pass replace_partitions=['rating_date']
+        and the saved frame's rating_date column must be ISO strings (not
+        datetimes), so the partition-delete filter is valid SQL."""
+        with patch.object(
+            scraper,
+            "save_to_iceberg",
+            return_value="iceberg.bronze.clubelo_ratings_historical",
+        ) as mock_save:
+            result = scraper.scrape_historical_ratings(days_back=14)
+
+        assert mock_save.call_count == 1
+        _, kwargs = mock_save.call_args
+        assert kwargs.get("table_name") == "clubelo_ratings_historical"
+        assert kwargs.get("partition_cols") == ["rating_date"]
+        assert kwargs.get("replace_partitions") == ["rating_date"], (
+            "scrape_historical_ratings must pass replace_partitions=['rating_date'] "
+            "— without it daily/repeat runs APPEND duplicate snapshots and Iceberg "
+            "metadata balloons (2026-05-04 HDFS overflow)."
+        )
+
+        saved_df = kwargs.get("df")
+        assert saved_df is not None and not saved_df.empty
+        rating_dates = saved_df["rating_date"].tolist()
+        assert all(isinstance(v, str) for v in rating_dates), (
+            "rating_date must be ISO strings — a datetime makes "
+            "_build_partition_delete_filter emit an unquoted predicate, the DELETE "
+            "fails, and the writer silently falls back to APPEND."
+        )
+        # ISO format YYYY-MM-DD
+        assert all(len(v) == 10 and v[4] == '-' and v[7] == '-' for v in rating_dates)
+
+        assert result["historical_ratings"] == "iceberg.bronze.clubelo_ratings_historical"
+        assert "rows" in result
 
 
 class TestTopEnglishClubs:

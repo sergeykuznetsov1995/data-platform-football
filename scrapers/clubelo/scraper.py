@@ -210,12 +210,21 @@ class ClubEloScraper(SoccerdataScraper):
 
         if all_data:
             combined_df = pd.concat(all_data, ignore_index=True)
+            # rating_date arrives as a datetime; normalize to ISO 'YYYY-MM-DD'
+            # so _build_partition_delete_filter emits a quoted, valid predicate
+            # (rating_date = '2026-06-04'). Without this the filter is raw/
+            # unquoted, the DELETE fails, and the writer SILENTLY falls back to
+            # plain APPEND — the 2026-05-04 HDFS-overflow footgun.
+            combined_df['rating_date'] = (
+                pd.to_datetime(combined_df['rating_date']).dt.strftime('%Y-%m-%d')
+            )
             table_path = self.save_to_iceberg(
                 df=combined_df,
                 table_name='clubelo_ratings_historical',
                 partition_cols=['rating_date'],
+                replace_partitions=['rating_date'],
             )
-            return {'historical_ratings': table_path}
+            return {'historical_ratings': table_path, 'rows': len(combined_df)}
 
         return {}
 
@@ -277,13 +286,18 @@ class ClubEloScraper(SoccerdataScraper):
                 replace_partitions=['team'],
             )
         except Exception as e:
+            # Do NOT swallow: replace_partitions does a DELETE then INSERT, and a
+            # failed INSERT after a committed DELETE can leave the table empty
+            # (observed 2026-06-04: 105600 rows -> 0 on a transient Trino SSL
+            # error). Re-raise so the caller records the failure loudly instead
+            # of reporting a silent empty result.
             logger.error(f"Failed to save combined team history: {e}")
-            return {}
+            raise
 
         logger.info(
             f"Team history saved: {len(combined)} rows across {fetched} teams"
         )
-        return {'team_history': table_path}
+        return {'team_history': table_path, 'rows': len(combined)}
 
     def scrape_all(
         self,
