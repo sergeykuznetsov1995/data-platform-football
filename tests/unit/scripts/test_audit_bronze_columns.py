@@ -195,3 +195,26 @@ def test_espn_standings_excluded_from_contract():
 ])
 def test_sofascore_contract_lists_all_eight_tables(table):
     assert table in mod.EXPECTED_TABLES['sofascore']
+
+
+# --- FotMob contract presence guard (#281) ---------------------------------
+# Regression guard: the 9 FotMob bronze tables must stay in the contract so the
+# --source fotmob audit keeps verifying full coverage. All 9 materialise and are
+# non-empty live (verified 2026-06-04, #281): schedule 760, team_stats 40,
+# player_stats 20227, team_profile 20, team_squad 607, team_leaderboards 574,
+# transfers 100, match_details 380, player_details 607 rows. 14 columns are
+# 100% NULL (10 dead-legacy drift -> followup #304, 4 upstream-missing) and live
+# in EXPECTED_NULL so the contract audit stays green.
+@pytest.mark.parametrize('table', [
+    'fotmob_schedule',
+    'fotmob_team_stats',
+    'fotmob_player_stats',
+    'fotmob_team_profile',
+    'fotmob_team_squad',
+    'fotmob_team_leaderboards',
+    'fotmob_transfers',
+    'fotmob_match_details',
+    'fotmob_player_details',
+])
+def test_fotmob_contract_lists_all_nine_tables(table):
+    assert table in mod.EXPECTED_TABLES['fotmob']

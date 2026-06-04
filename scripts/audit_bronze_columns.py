@@ -112,6 +112,46 @@ EXPECTED_NULL: dict[str, set[str]] = {
         # auto-flatten always-empty `statisticsType` key (100% NULL, 533 rows).
         'statistics_type',
     },
+    # --- FotMob (#281) -------------------------------------------------------
+    # 14 columns are 100% NULL live (verified 2026-06-04). Two classes:
+    #   (a) upstream-missing — scraper DOES emit the field but FotMob returns
+    #       None for every in-scope row.
+    #   (b) dead-legacy drift — the current scraper no longer emits the column;
+    #       it survives only as an Iceberg schema remnant from older runs. These
+    #       are tracked for removal in followup #304 (drop dead columns); kept
+    #       here so the --source fotmob contract audit stays green meanwhile.
+    'fotmob_team_stats': {
+        # (a) upstream-missing: read_team_season_stats writes team.get('form'),
+        # but FotMob's league table omits `form` for in-scope leagues.
+        'form',
+        # (b) dead-legacy: not in the current read_team_season_stats dict
+        # (scraper.py:404-417) — schema remnants from a prior, wider parser.
+        'table_type', 'short_name', 'xg', 'xg_conceded', 'qualification',
+    },
+    'fotmob_player_stats': {
+        # (b) dead-legacy: current read_player_season_stats writes
+        # participant_id/participant_name/stat_category_header (scraper.py:496-513)
+        # — these 5 older column names are never populated.
+        'player_id', 'player_name', 'stat_category', 'team_color', 'positions',
+    },
+    'fotmob_team_leaderboards': {
+        # (a) upstream-shape: read_team_leaderboards maps item.get('TeamName')
+        # (scraper.py:716), but team-leaderboard items carry the team name in
+        # `ParticipantName` (-> participant_name) instead, so team_name is NULL.
+        'team_name',
+    },
+    'fotmob_transfers': {
+        # (a) upstream-missing: read_transfers derives fee_text from
+        # fee.fallback/fee.text (scraper.py:775); FotMob supplies only the
+        # numeric `fee_value` for in-scope transfers, so fee_text is NULL.
+        'fee_text',
+    },
+    'fotmob_player_details': {
+        # (a) upstream-missing: read_player_details maps d.get('nextMatch')
+        # (scraper.py:988); the player __NEXT_DATA__ payload omits `nextMatch`
+        # for every squad player, so the column is 100% NULL.
+        'next_match_json',
+    },
 }
 
 # Columns that hold exactly 1 distinct value by design — should NOT trigger
@@ -347,8 +387,56 @@ EXPECTED_TABLES: dict[str, dict[str, set[str]]] = {
             'stat_key', 'stat_name', 'home_value', 'away_value', *META_COLS,
         },
     },
-    # 'fotmob': {...}, 'matchhistory': {...}, 'clubelo': {...}, 'sofifa': {...},
-    # 'transfermarkt': {...}, 'capology': {...}  -> #281-#286
+    'fotmob': {
+        # FotMob scraper (scrapers/fotmob/scraper.py, scrape_all). 9 tables, all
+        # partitioned ['league', 'season']. Minimal required = identity keys +
+        # core metrics + META_COLS; extra live cols are NOT errors; 14 100%-NULL
+        # cols (10 dead-legacy + 4 upstream-missing) live in EXPECTED_NULL and are
+        # excluded here. Verified vs live bronze 2026-06-04 (#281): all 9
+        # materialise + non-empty (schedule 760, team_stats 40, player_stats 20227,
+        # team_profile 20, team_squad 607, team_leaderboards 574, transfers 100,
+        # match_details 380, player_details 607 rows) — 0 missing tables/columns.
+        'fotmob_schedule': {
+            'league', 'season', 'match_id', 'date',
+            'home_team', 'away_team', 'home_team_id', 'away_team_id',
+            *META_COLS,
+        },
+        'fotmob_team_stats': {
+            'league', 'season', 'team_id', 'team_name',
+            'position', 'played', 'points', *META_COLS,
+        },
+        'fotmob_player_stats': {
+            'league', 'season', 'participant_id', 'participant_name', 'team_id',
+            'stat_name', 'stat_category_header', 'stat_value', 'minutes_played',
+            *META_COLS,
+        },
+        'fotmob_team_profile': {
+            'league', 'season', 'team_id', 'team_name',
+            'short_name', 'overview_season', *META_COLS,
+        },
+        'fotmob_team_squad': {
+            'league', 'season', 'team_id', 'player_id', 'player_name',
+            'role', 'shirt_number', *META_COLS,
+        },
+        'fotmob_team_leaderboards': {
+            'league', 'season', 'team_id', 'participant_name',
+            'stat_name', 'stat_category_group', 'stat_value', *META_COLS,
+        },
+        'fotmob_transfers': {
+            'league', 'season', 'player_id', 'player_name',
+            'transfer_date', 'to_club_id', 'from_club', *META_COLS,
+        },
+        'fotmob_match_details': {
+            'league', 'season', 'match_id', 'home_team', 'away_team',
+            'lineup_json', 'events_json', *META_COLS,
+        },
+        'fotmob_player_details': {
+            'league', 'season', 'player_id', 'name',
+            'birth_date', 'primary_team_id', *META_COLS,
+        },
+    },
+    # 'matchhistory': {...}, 'clubelo': {...}, 'sofifa': {...},
+    # 'transfermarkt': {...}, 'capology': {...}  -> #282-#286
 }
 
 # Tables a source's contract names but that are intentionally NOT materialised
