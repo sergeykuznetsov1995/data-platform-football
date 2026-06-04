@@ -156,3 +156,22 @@ def test_understat_contract_lists_all_five_tables(table):
 ])
 def test_whoscored_contract_lists_all_four_tables(table):
     assert table in mod.EXPECTED_TABLES['whoscored']
+
+
+# --- ESPN contract presence guard (#279) -----------------------------------
+# Regression guard: the 2 ESPN bronze tables must stay in the contract so the
+# --source espn audit keeps verifying full coverage. espn_standings is NOT in
+# the contract — soccerdata's ESPN reader has no read_standings (scraper.py:112
+# returns None), so the table never materialises (would be a permanent
+# false-positive). espn_matchsheet is legacy/ad-hoc (not scraper-emitted) →
+# tracked as a followup, intentionally out of contract.
+@pytest.mark.parametrize('table', [
+    'espn_schedule',
+    'espn_lineup',
+])
+def test_espn_contract_lists_both_tables(table):
+    assert table in mod.EXPECTED_TABLES['espn']
+
+
+def test_espn_standings_excluded_from_contract():
+    assert 'espn_standings' not in mod.EXPECTED_TABLES['espn']
