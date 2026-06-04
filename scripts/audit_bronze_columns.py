@@ -456,8 +456,24 @@ EXPECTED_TABLES: dict[str, dict[str, set[str]]] = {
             'team', 'country', 'level', 'elo', 'from', 'to', *META_COLS,
         },
     },
-    # 'matchhistory': {...}, 'sofifa': {...},
-    # 'transfermarkt': {...}, 'capology': {...}  -> #282, #284-#286
+    'matchhistory': {
+        # football-data.co.uk CSV scraper, COLUMN_MAPPING (scrapers/matchhistory/scraper.py).
+        # 1 table, partitioned ['league','season']. Минимальный контракт = identity +
+        # core match stats + META_COLS. Широкие odds-колонки (odds_home_b365, maxh, ...) —
+        # extra live cols, НЕ ошибки. 0 all-NULL колонок live (verified 2026-06-04, #282).
+        # ВНИМАНИЕ дрейф: silver всё ещё читает старую matchhistory_games (raw cols,
+        # заморожена 2026-05-07) — followup-issue, не в scope #282.
+        'matchhistory_results': {
+            'league', 'season', 'match_date', 'home_team', 'away_team',
+            'home_goals', 'away_goals', 'result',
+            'home_goals_ht', 'away_goals_ht', 'result_ht', 'referee',
+            'home_shots', 'away_shots', 'home_shots_on_target', 'away_shots_on_target',
+            'home_fouls', 'away_fouls', 'home_corners', 'away_corners',
+            'home_yellow', 'away_yellow', 'home_red', 'away_red',
+            *META_COLS,
+        },
+    },
+    # 'sofifa': {...}, 'transfermarkt': {...}, 'capology': {...}  -> #284-#286
 }
 
 # Tables a source's contract names but that are intentionally NOT materialised

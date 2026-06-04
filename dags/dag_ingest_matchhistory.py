@@ -175,12 +175,18 @@ python dags/scripts/run_matchhistory_scraper.py \\
     --headless \\
     --use-xvfb
 """,
+        # append_env=True: merge these vars INTO the container env instead of
+        # replacing it. Without it the subprocess loses TRINO_HOST/PORT/PASSWORD/
+        # SCHEME and falls back to trino:8080 (HTTP) → ConnectionRefused on the
+        # Iceberg write, while validate_data (trigger_rule=all_done) masks the
+        # failure as a green run. Footgun #183 (#311).
         env={
             'PYTHONPATH': '/opt/airflow:/opt/airflow/dags',
             'PATH': '/usr/local/bin:/usr/bin:/bin:/home/airflow/.local/bin',
             'HOME': '/home/airflow',
             'DISPLAY': ':99',
         },
+        append_env=True,
     )
 
     validate_data_task = PythonOperator(
