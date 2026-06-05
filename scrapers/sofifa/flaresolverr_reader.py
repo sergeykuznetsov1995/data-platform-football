@@ -238,7 +238,7 @@ class FlareSolverrSoFIFAReader(sd.SoFIFA):
             "Curve", "FK Accuracy", "Long passing", "Ball control",
             "Acceleration", "Sprint speed", "Agility", "Reactions",
             "Balance", "Shot power", "Jumping", "Stamina", "Strength",
-            "Long shots", "Aggression", "Interceptions", "Positioning",
+            "Long shots", "Aggression", "Interceptions", "Attack position",
             "Vision", "Penalties", "Composure", "Defensive awareness",
             "Standing tackle", "Sliding tackle",
             "GK Diving", "GK Handling", "GK Kicking",
@@ -284,7 +284,16 @@ class FlareSolverrSoFIFAReader(sd.SoFIFA):
                         break
                 # The detailed "Dribbling" skill collides with the main-6 card
                 # aggregate (also 'dribbling'); keep both under distinct names.
-                key = 'dribbling_detail' if s == 'Dribbling' else s
+                if s == 'Dribbling':
+                    key = 'dribbling_detail'
+                elif s == 'Attack position':
+                    # SoFIFA labels the attacking attribute "Attack position";
+                    # upstream searches "Positioning" and silently captures
+                    # "GK Positioning" instead (#316). Store under a key that
+                    # standardize_colnames maps back to 'positioning'.
+                    key = 'Positioning'
+                else:
+                    key = s
                 scores[key] = value
             # Issue #42: main-6 aggregates, market value / wage, contract dates,
             # and profile header (position / dob / height / weight / nationality).

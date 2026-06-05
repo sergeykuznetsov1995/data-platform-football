@@ -213,3 +213,40 @@ class TestFlareSolverrSoFIFAReader:
         assert mock_fs_client.create_session.call_count == 2
         # destroy was called once for the rotation
         assert mock_fs_client.destroy_session.call_count == 1
+
+
+class TestReadPlayerRatingsParsing:
+    """Regression for #316: the attacking attribute is labelled 'Attack position'
+    on sofifa.com, NOT 'Positioning'. Upstream searches the substring
+    'Positioning', which only matches 'GK Positioning', so the attacking
+    `positioning` column silently captured the goalkeeper value.
+    """
+
+    _PLAYER_HTML = (
+        '<html><body>'
+        '<div class="profile"><h1>Test Player</h1></div>'
+        '<p><span><em>80</em></span> Attack position</p>'
+        '<p><span><em>9</em></span> GK Positioning</p>'
+        '</body></html>'
+    )
+
+    def test_positioning_is_attack_position_not_gk(self, reader, tmp_path):
+        import io as _io
+
+        import pandas as pd
+
+        reader.data_dir = tmp_path
+        reader.versions = pd.DataFrame([{'update': 'Jun 2 2026'}], index=[260035])
+        reader.get = MagicMock(
+            side_effect=lambda *a, **k: _io.BytesIO(self._PLAYER_HTML.encode('utf-8'))
+        )
+
+        df = reader.read_player_ratings(player=[12345])
+
+        row = df.iloc[0]
+        # Attacking 'Attack position' (80) lands in `positioning` ...
+        assert int(row['positioning']) == 80
+        # ... and the goalkeeper value (9) stays in `gk_positioning`.
+        assert int(row['gk_positioning']) == 9
+        # The two must NOT collide (the bug made them identical at 9).
+        assert int(row['positioning']) != int(row['gk_positioning'])
