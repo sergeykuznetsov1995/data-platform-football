@@ -532,7 +532,72 @@ EXPECTED_TABLES: dict[str, dict[str, set[str]]] = {
             'to_club_id', 'fee_text', 'is_upcoming', *META_COLS,
         },
     },
-    # 'capology': {...}  -> #286
+    'capology': {
+        # 4 APL data products (#321), all from the same anti-bot-free tls path,
+        # partition (league, season[, currency]). All 3 currencies inline.
+        # Verified live 2026-06-05 across seasons 2324/2425/2526.
+        'capology_player_salaries': {
+            'league', 'season', 'currency', 'player_slug', 'player_name',
+            'club_slug', 'club_name', 'country_code', 'age', 'position',
+            'status', 'active', 'loan', 'verified',
+            'weekly_gross_gbp', 'weekly_gross_eur', 'weekly_gross_usd',
+            'annual_gross_gbp', 'annual_gross_eur', 'annual_gross_usd',
+            'weekly_net_gbp', 'weekly_net_eur', 'weekly_net_usd',
+            'annual_net_gbp', 'annual_net_eur', 'annual_net_usd',
+            'bonus_gross_gbp', 'bonus_gross_eur', 'bonus_gross_usd',
+            'bonus_net_gbp', 'bonus_net_eur', 'bonus_net_usd',
+            'total_gross_gbp', 'total_gross_eur', 'total_gross_usd',
+            'total_net_gbp', 'total_net_eur', 'total_net_usd',
+            'adjusted_total_gross_gbp', 'adjusted_total_gross_eur', 'adjusted_total_gross_usd',
+            'adjusted_total_net_gbp', 'adjusted_total_net_eur', 'adjusted_total_net_usd',
+            *META_COLS,
+        },
+        # Club-level wage totals. Positional split d/f/k/m is Pro-locked
+        # upstream → intentionally not ingested (so NOT in the contract).
+        'capology_team_payrolls': {
+            'league', 'season', 'club_slug', 'club_name', 'club_code',
+            'weekly_gross_gbp', 'weekly_gross_eur', 'weekly_gross_usd',
+            'weekly_net_gbp', 'weekly_net_eur', 'weekly_net_usd',
+            'annual_gross_gbp', 'annual_gross_eur', 'annual_gross_usd',
+            'annual_net_gbp', 'annual_net_eur', 'annual_net_usd',
+            'bonus_gross_gbp', 'bonus_gross_eur', 'bonus_gross_usd',
+            'bonus_net_gbp', 'bonus_net_eur', 'bonus_net_usd',
+            'total_gross_gbp', 'total_gross_eur', 'total_gross_usd',
+            'total_net_gbp', 'total_net_eur', 'total_net_usd',
+            'adjusted_total_gross_gbp', 'adjusted_total_gross_eur', 'adjusted_total_gross_usd',
+            'adjusted_total_net_gbp', 'adjusted_total_net_eur', 'adjusted_total_net_usd',
+            *META_COLS,
+        },
+        # Player-level contracts: signed/expiration ISO dates + years +
+        # salary + full contract_total value.
+        'capology_contract_extensions': {
+            'league', 'season', 'player_slug', 'player_name',
+            'club_slug', 'club_name', 'signed', 'expiration', 'years',
+            'weekly_gross_gbp', 'weekly_gross_eur', 'weekly_gross_usd',
+            'weekly_net_gbp', 'weekly_net_eur', 'weekly_net_usd',
+            'annual_gross_gbp', 'annual_gross_eur', 'annual_gross_usd',
+            'annual_net_gbp', 'annual_net_eur', 'annual_net_usd',
+            'bonus_gross_gbp', 'bonus_gross_eur', 'bonus_gross_usd',
+            'bonus_net_gbp', 'bonus_net_eur', 'bonus_net_usd',
+            'total_gross_gbp', 'total_gross_eur', 'total_gross_usd',
+            'total_net_gbp', 'total_net_eur', 'total_net_usd',
+            'adjusted_total_gross_gbp', 'adjusted_total_gross_eur', 'adjusted_total_gross_usd',
+            'adjusted_total_net_gbp', 'adjusted_total_net_eur', 'adjusted_total_net_usd',
+            'contract_total_gross_gbp', 'contract_total_gross_eur', 'contract_total_gross_usd',
+            'contract_total_net_gbp', 'contract_total_net_eur', 'contract_total_net_usd',
+            *META_COLS,
+        },
+        # Club-level transfer-window net spend (balances can be negative).
+        'capology_transfer_window': {
+            'league', 'season', 'club_slug', 'club_name', 'club_code',
+            'players', 'age', 'foreign',
+            'income_gbp', 'income_eur', 'income_usd',
+            'expense_gbp', 'expense_eur', 'expense_usd',
+            'balance_gbp', 'balance_eur', 'balance_usd',
+            'adjbalance_gbp', 'adjbalance_eur', 'adjbalance_usd',
+            *META_COLS,
+        },
+    },
 }
 
 # Tables a source's contract names but that are intentionally NOT materialised

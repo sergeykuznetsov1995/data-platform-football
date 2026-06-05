@@ -299,3 +299,22 @@ def test_sofifa_contract_lists_all_six_tables(table):
 ])
 def test_transfermarkt_contract_lists_all_three_tables(table):
     assert table in mod.EXPECTED_TABLES['transfermarkt']
+
+
+# --- Capology contract presence guard (#321) -------------------------------
+# Regression guard: all 4 Capology APL data products must stay in the contract
+# so the --source capology audit keeps verifying full coverage. MVP scope =
+# ENG-Premier League only (CAPOLOGY_LEAGUE_MAP). Verified live 2026-06-05
+# across seasons 2324/2425/2526: salaries 2038, contract_extensions 258,
+# team_payrolls 60, transfer_window 60 rows; 0 all-NULL columns (completed-
+# season backfill populates adjusted_total_*, resolving #319) -> no
+# EXPECTED_NULL entry. Positional payroll split d/f/k/m is Capology-Pro-locked
+# upstream and intentionally not ingested.
+@pytest.mark.parametrize('table', [
+    'capology_player_salaries',
+    'capology_team_payrolls',
+    'capology_contract_extensions',
+    'capology_transfer_window',
+])
+def test_capology_contract_lists_all_four_tables(table):
+    assert table in mod.EXPECTED_TABLES['capology']
