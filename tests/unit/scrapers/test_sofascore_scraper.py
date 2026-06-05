@@ -189,15 +189,15 @@ class TestEventPlayerStatsFlatten:
     """Tests for the per-(match, player) Opta stats flattener (#21)."""
 
     def _payload(self):
+        # Mirrors the real /event/{id}/player/{pid}/statistics response
+        # (verified live 2026-06-05, #301): NO `extra` block and NO
+        # `statistics.position` — so is_home/captain/substitute/
+        # position_specific cannot be sourced here and stay None. They are
+        # back-filled from /lineups by the overlay (tested below).
         return {
             'player': {'id': 11111, 'name': 'Player A'},
             'team': {'id': 1, 'name': 'Team X'},
             'position': 'F',
-            'extra': {
-                'isHome': True,
-                'captain': True,
-                'substitute': False,
-            },
             'statistics': {
                 'rating': '7.8',
                 'goalsPrevented': 0.42,
@@ -206,7 +206,6 @@ class TestEventPlayerStatsFlatten:
                 'expectedAssists': {'value': 0.21, 'previousValue': 0.10},
                 # Pure dict without 'value' → None
                 'noisyStruct': {'foo': 'bar'},
-                'position': 'CF',  # Should be skipped (re-export)
             },
         }
 
@@ -221,9 +220,13 @@ class TestEventPlayerStatsFlatten:
         assert row['player_id'] == '11111'
         assert row['team_id'] == 1
         assert row['team_name'] == 'Team X'
-        assert row['is_home'] is True
-        assert row['captain'] is True
-        assert row['substitute'] is False
+        # No `extra` block in the real statistics payload → these anchors
+        # are None from the flattener alone; the lineup overlay fills them.
+        assert row['is_home'] is None
+        assert row['captain'] is None
+        assert row['substitute'] is None
+        assert row['position_specific'] is None
+        # `position` (top-level) IS returned by the statistics endpoint.
         assert row['position'] == 'F'
 
         # snake_case auto-flatten
@@ -235,9 +238,6 @@ class TestEventPlayerStatsFlatten:
         assert row['expected_assists'] == 0.21
         # struct without `value` → None
         assert row['noisy_struct'] is None
-        # The 'position' key inside statistics is the re-export and must
-        # not clobber the anchor column.
-        assert row['position'] == 'F'
 
     def test_garbage_payload(self):
         from scrapers.sofascore.scraper import SofaScoreScraper
@@ -247,6 +247,184 @@ class TestEventPlayerStatsFlatten:
         assert row is not None
         assert row['match_id'] == '1'
         assert row['player_id'] == '1'
+
+
+class TestLineupOverlayLookup:
+    """Tests for _build_lineup_overlay_lookup — the /lineups projection
+    that back-fills is_home/captain/substitute/position_specific (#301)."""
+
+    def _lineups(self):
+        # Shape verified live 2026-06-05 (#301): `captain` present only on
+        # the captain entry; `substitute` a real bool everywhere;
+        # `position` the per-event line.
+        return {
+            'home': {'players': [
+                {'player': {'id': 11111}, 'position': 'G',
+                 'substitute': False, 'captain': True},
+                {'player': {'id': 22222}, 'position': 'D',
+                 'substitute': False},
+            ]},
+            'away': {'players': [
+                {'player': {'id': 33333}, 'position': 'M',
+                 'substitute': True},
+            ]},
+        }
+
+    def test_maps_all_four_fields(self):
+        from scrapers.sofascore.scraper import SofaScoreScraper
+        lookup = SofaScoreScraper._build_lineup_overlay_lookup(self._lineups())
+
+        # int id normalised to str key.
+        assert set(lookup) == {'11111', '22222', '33333'}
+
+        # home → is_home True; captain flag promoted to True.
+        assert lookup['11111'] == {
+            'is_home': True, 'captain': True,
+            'substitute': False, 'position_specific': 'G',
+        }
+        # home, no captain key → captain False (not None).
+        assert lookup['22222']['is_home'] is True
+        assert lookup['22222']['captain'] is False
+        assert lookup['22222']['substitute'] is False
+        assert lookup['22222']['position_specific'] == 'D'
+        # away → is_home False; bench → substitute True.
+        assert lookup['33333']['is_home'] is False
+        assert lookup['33333']['substitute'] is True
+        assert lookup['33333']['position_specific'] == 'M'
+
+    def test_missing_position_is_none(self):
+        from scrapers.sofascore.scraper import SofaScoreScraper
+        lookup = SofaScoreScraper._build_lineup_overlay_lookup(
+            {'home': {'players': [{'player': {'id': 7}, 'substitute': False}]}}
+        )
+        assert lookup['7']['position_specific'] is None
+
+    def test_player_without_id_skipped(self):
+        from scrapers.sofascore.scraper import SofaScoreScraper
+        lookup = SofaScoreScraper._build_lineup_overlay_lookup(
+            {'home': {'players': [{'player': {}, 'position': 'F'}]}}
+        )
+        assert lookup == {}
+
+    def test_garbage_payload(self):
+        from scrapers.sofascore.scraper import SofaScoreScraper
+        assert SofaScoreScraper._build_lineup_overlay_lookup(None) == {}
+        assert SofaScoreScraper._build_lineup_overlay_lookup({}) == {}
+        # Missing/empty sides and non-list players → no raise, empty.
+        assert SofaScoreScraper._build_lineup_overlay_lookup(
+            {'home': {}, 'away': {'players': None}}
+        ) == {}
+
+
+class TestApplyLineupOverlay:
+    """Tests for _apply_lineup_overlay — fill-if-None in-place merge."""
+
+    def test_fills_none_anchors(self):
+        from scrapers.sofascore.scraper import SofaScoreScraper
+        row = {'is_home': None, 'captain': None, 'substitute': None,
+               'position_specific': None, 'rating': 7.8}
+        SofaScoreScraper._apply_lineup_overlay(row, {
+            'is_home': True, 'captain': False,
+            'substitute': True, 'position_specific': 'M',
+        })
+        assert row['is_home'] is True
+        assert row['captain'] is False
+        assert row['substitute'] is True
+        assert row['position_specific'] == 'M'
+        assert row['rating'] == 7.8  # untouched
+
+    def test_does_not_overwrite_existing(self):
+        from scrapers.sofascore.scraper import SofaScoreScraper
+        row = {'is_home': False, 'captain': None,
+               'substitute': None, 'position_specific': None}
+        SofaScoreScraper._apply_lineup_overlay(row, {
+            'is_home': True, 'captain': True,
+            'substitute': True, 'position_specific': 'M',
+        })
+        # Primary (already-set) value wins; only None anchors get filled.
+        assert row['is_home'] is False
+        assert row['captain'] is True
+
+    def test_none_overlay_leaves_row_untouched(self):
+        from scrapers.sofascore.scraper import SofaScoreScraper
+        row = {'is_home': None, 'captain': None,
+               'substitute': None, 'position_specific': None}
+        SofaScoreScraper._apply_lineup_overlay(row, None)
+        assert all(row[c] is None for c in row)
+
+    def test_partial_overlay_fills_subset(self):
+        from scrapers.sofascore.scraper import SofaScoreScraper
+        row = {'is_home': None, 'captain': None,
+               'substitute': None, 'position_specific': None}
+        SofaScoreScraper._apply_lineup_overlay(
+            row, {'captain': True, 'substitute': None,
+                  'is_home': None, 'position_specific': None}
+        )
+        assert row['captain'] is True
+        assert row['substitute'] is None
+        assert row['is_home'] is None
+
+
+class TestEventPlayerStatsOverlayWiring:
+    """read_event_player_stats fetches /lineups once per match and overlays
+    the four anchor fields onto each stat row (#301)."""
+
+    def test_overlay_applied_and_lineup_fetched_once_per_match(self):
+        from scrapers.sofascore.scraper import SofaScoreScraper
+        with patch('scrapers.base.base_scraper.get_rate_limiter'), \
+             patch('scrapers.base.base_scraper.get_retry_policy'), \
+             patch('scrapers.base.base_scraper.get_circuit_breaker'), \
+             patch('scrapers.base.base_scraper.IcebergWriter'):
+            scraper = SofaScoreScraper()
+
+        # Two players in one match.
+        players_by_match = {'M1': ['11111', '33333']}
+
+        def fake_stats(event_id, player_id, max_attempts=3):
+            # Real statistics payload: no `extra`, no statistics.position.
+            return {
+                'player': {'id': int(player_id)},
+                'team': {'id': 1, 'name': 'Team X'},
+                'position': 'F',
+                'statistics': {'rating': '7.0'},
+            }
+
+        lineup_calls = []
+
+        def fake_lineup(event_id, max_attempts=3):
+            lineup_calls.append(event_id)
+            return {
+                'home': {'players': [
+                    {'player': {'id': 11111}, 'position': 'G',
+                     'substitute': False, 'captain': True},
+                ]},
+                'away': {'players': [
+                    {'player': {'id': 33333}, 'position': 'M',
+                     'substitute': True},
+                ]},
+            }
+
+        scraper._fetch_event_player_stats_payload = fake_stats
+        scraper._fetch_lineup_payload = fake_lineup
+
+        df = scraper.read_event_player_stats(
+            league='ENG-Premier League', season=2025,
+            player_ids_by_match=players_by_match,
+        )
+
+        # Exactly one lineup fetch for the single match.
+        assert lineup_calls == ['M1']
+
+        rows = {r['player_id']: r for r in df.to_dict('records')}
+        # Home captain.
+        assert rows['11111']['is_home'] is True
+        assert rows['11111']['captain'] is True
+        assert rows['11111']['substitute'] is False
+        assert rows['11111']['position_specific'] == 'G'
+        # Away substitute.
+        assert rows['33333']['is_home'] is False
+        assert rows['33333']['substitute'] is True
+        assert rows['33333']['position_specific'] == 'M'
 
 
 class TestMatchStatsFlatten:

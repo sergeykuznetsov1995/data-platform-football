@@ -89,12 +89,14 @@ EXPECTED_NULL: dict[str, set[str]] = {
         'end_x', 'end_y',
     },
     'sofascore_event_player_stats': {
-        # Lineup-only fields: /event/{id}/player/{id}/statistics returns
-        # {player, team, statistics} with no `extra` block (isHome/captain/
-        # substitute live on the /lineups endpoint instead) and no per-player
-        # `position` inside statistics — so these 4 anchor cols are 100% NULL
-        # across all 15189 rows (verified 2026-06-04 #280). Enrichment from
-        # /lineups tracked in followup #301.
+        # is_home/captain/substitute/position_specific: the statistics
+        # endpoint returns `extra: null` and no `statistics.position`
+        # (verified 2026-06-04 #280), so these are 100% NULL on the
+        # historical 15189 rows. The scraper now back-fills them from
+        # /lineups for all NEW matches (#301), but the append-only +
+        # skip-existing runner cannot rewrite past rows — they stay NULL
+        # until a one-off historical backfill (#337). Keep them
+        # allow-listed until that backfill flips null_rate < 1.0.
         'is_home', 'captain', 'substitute', 'position_specific',
         # auto-flatten artifacts: `ratingVersions` is a nested
         # {original, alternative} object _coerce_scalar cannot reduce to a

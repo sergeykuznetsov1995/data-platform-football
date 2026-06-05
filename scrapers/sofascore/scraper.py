@@ -490,6 +490,80 @@ class SofaScoreScraper(SoccerdataScraper):
 
         return rows
 
+    @staticmethod
+    def _build_lineup_overlay_lookup(
+        lineup_payload: dict,
+    ) -> Dict[str, Dict[str, object]]:
+        """Map ``player_id -> {is_home, captain, substitute,
+        position_specific}`` from a ``/event/{id}/lineups`` payload.
+
+        The ``.../player/{pid}/statistics`` endpoint returns ``extra:
+        null`` and no ``statistics.position`` (verified live 2026-06-05,
+        #301), so these four anchor columns are 100% NULL when sourced
+        from there alone. ``/lineups`` carries them per player:
+
+        - ``is_home`` — derived from the side (home -> True, away -> False).
+        - ``captain`` — ``entry['captain']`` is present (``True``) only on
+          the captain's entry; absent elsewhere -> ``bool(...)`` yields
+          ``False`` for every other named player.
+        - ``substitute`` — ``entry['substitute']`` is a real bool on every
+          entry (starters ``False``, bench ``True``).
+        - ``position_specific`` — the per-event line ``entry['position']``
+          (``'G'/'D'/'M'/'F'``).
+
+        Player ids mirror :meth:`_flatten_lineup_side`'s ``str(int(pid))``
+        normalisation so the lookup keys match the ``pids`` resolved from
+        ``bronze.sofascore_player_ratings``. Returns ``{}`` for an empty /
+        non-dict payload (no raise).
+        """
+        lookup: Dict[str, Dict[str, object]] = {}
+        if not isinstance(lineup_payload, dict):
+            return lookup
+
+        for side in ('home', 'away'):
+            side_payload = lineup_payload.get(side) or {}
+            if not isinstance(side_payload, dict):
+                continue
+            for entry in side_payload.get('players', []) or []:
+                if not isinstance(entry, dict):
+                    continue
+                player = entry.get('player') or {}
+                pid = player.get('id')
+                if pid is None:
+                    continue
+                player_id_str = (
+                    str(int(pid)) if isinstance(pid, (int, float)) else str(pid)
+                )
+                lookup[player_id_str] = {
+                    'is_home': side == 'home',
+                    'captain': bool(entry.get('captain')),
+                    'substitute': bool(entry.get('substitute')),
+                    'position_specific': entry.get('position') or None,
+                }
+
+        return lookup
+
+    @staticmethod
+    def _apply_lineup_overlay(
+        row: Dict,
+        overlay: Optional[Dict[str, object]],
+    ) -> None:
+        """Fill ``is_home/captain/substitute/position_specific`` on a
+        stats ``row`` in-place from a per-player lineup ``overlay``.
+
+        Fill-if-None: only writes where ``row`` is currently ``None`` and
+        ``overlay`` provides a non-None value. If SofaScore ever starts
+        returning a populated ``extra`` block on the statistics endpoint,
+        that primary source wins and the overlay stays a pure backfill.
+        ``overlay=None`` (player absent from lineups) leaves the row
+        untouched.
+        """
+        if not overlay:
+            return
+        for col in ('is_home', 'captain', 'substitute', 'position_specific'):
+            if row.get(col) is None and overlay.get(col) is not None:
+                row[col] = overlay[col]
+
     def read_player_ratings(
         self,
         league: str,
@@ -1001,7 +1075,18 @@ class SofaScoreScraper(SoccerdataScraper):
         max_consecutive = 200
 
         call_idx = 0
+        lineup_misses = 0
         for mid, pids in player_ids_by_match.items():
+            # The statistics endpoint returns `extra: null` and no
+            # `statistics.position`, so is_home/captain/substitute/
+            # position_specific must be back-filled from /lineups (#301).
+            # One extra fetch per match (~2.5% overhead vs the per-player
+            # stat calls). A miss leaves those anchors NULL — graceful,
+            # and does NOT count toward the stat-endpoint breaker below.
+            lineup_payload = self._fetch_lineup_payload(str(mid))
+            if lineup_payload is None:
+                lineup_misses += 1
+            overlay_lookup = self._build_lineup_overlay_lookup(lineup_payload or {})
             for pid in pids:
                 call_idx += 1
                 payload = self._fetch_event_player_stats_payload(str(mid), str(pid))
@@ -1019,6 +1104,7 @@ class SofaScoreScraper(SoccerdataScraper):
                 consecutive_failures = 0
                 row = self._flatten_event_player_stats(str(mid), str(pid), payload)
                 if row is not None:
+                    self._apply_lineup_overlay(row, overlay_lookup.get(str(pid)))
                     all_rows.append(row)
 
                 if call_idx % 100 == 0:
@@ -1049,6 +1135,12 @@ class SofaScoreScraper(SoccerdataScraper):
             "Materialised %d event_player_stats rows across %d unique matches",
             len(df), df['match_id'].nunique(),
         )
+        if lineup_misses:
+            logger.warning(
+                "Lineup overlay missing for %d/%d matches — those rows keep "
+                "NULL is_home/captain/substitute/position_specific (#301).",
+                lineup_misses, len(player_ids_by_match),
+            )
         return df
 
     # ------------------------------------------------------------------
