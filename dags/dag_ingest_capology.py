@@ -168,6 +168,39 @@ exit $rc
         append_env=True,
     )
 
+    # The other three APL data products (issue #321): same runner, one
+    # BashOperator each, partition (league, season). All soft-fall back on a
+    # CAPOLOGY_FALLBACK exit-code-2 like salaries do.
+    PRODUCT_ENTITIES = [
+        'team_payrolls', 'contract_extensions', 'transfer_window',
+    ]
+    product_tasks = []
+    for _entity in PRODUCT_ENTITIES:
+        _task = BashOperator(
+            task_id=f'scrape_{_entity}',
+            bash_command=f"""
+cd /opt/airflow && \\
+python dags/scripts/run_capology_scraper.py \\
+    --entity {_entity} \\
+    --league "{league}" \\
+    --season {season} \\
+    --output /tmp/capology_{_entity}_result.json
+rc=$?
+if [ $rc -eq 2 ]; then
+    echo "CAPOLOGY_FALLBACK exit-code 2 — propagating as soft success."
+    exit 0
+fi
+exit $rc
+""",
+            env={
+                'PYTHONPATH': '/opt/airflow:/opt/airflow/dags',
+                'PATH': '/usr/local/bin:/usr/bin:/bin:/home/airflow/.local/bin',
+                'HOME': '/home/airflow',
+            },
+            append_env=True,
+        )
+        product_tasks.append(_task)
+
     validate_task = PythonOperator(
         task_id='validate_data',
         python_callable=validate_data,
@@ -234,4 +267,5 @@ exit $rc
         reset_dag_run=True,
     )
 
-    scrape_salaries_task >> validate_task >> validate_bronze_quality_task >> trigger_silver_task
+    [scrape_salaries_task, *product_tasks] >> validate_task \
+        >> validate_bronze_quality_task >> trigger_silver_task
