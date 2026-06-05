@@ -299,3 +299,21 @@ def test_sofifa_contract_lists_all_six_tables(table):
 ])
 def test_transfermarkt_contract_lists_all_three_tables(table):
     assert table in mod.EXPECTED_TABLES['transfermarkt']
+
+
+# --- Capology contract presence guard (#286) -------------------------------
+# Regression guard: the 1 Capology bronze table must stay in the contract so
+# the --source capology audit keeps verifying full coverage. MVP scope =
+# ENG-Premier League only (CAPOLOGY_LEAGUE_MAP), currency='GBP'. All 3 salary
+# currencies (gbp/eur/usd) arrive inline in one scraper JS block, so the GBP
+# partition carries the full symmetric 30-salary set (10 money bases x 3 cur).
+# Verified live 2026-06-05 (#286): 730 rows on ('ENG-Premier League','2526').
+# 24/30 salary cols carry data; the 6 `adjusted_total_*` cols are 100% NULL
+# because the only materialised partition is the in-progress season ('2526'),
+# which Capology has no adjusted totals for yet (completed seasons like '2425'
+# do) -> EXPECTED_NULL, followup #319.
+@pytest.mark.parametrize('table', [
+    'capology_player_salaries',
+])
+def test_capology_contract_lists_all_tables(table):
+    assert table in mod.EXPECTED_TABLES['capology']

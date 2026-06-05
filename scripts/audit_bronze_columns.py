@@ -152,6 +152,19 @@ EXPECTED_NULL: dict[str, set[str]] = {
         # for every squad player, so the column is 100% NULL.
         'next_match_json',
     },
+    'capology_player_salaries': {
+        # in-progress-season gap (#286, verified live 2026-06-05): the only
+        # materialised partition is the CURRENT season ('2526'), and Capology
+        # does not yet compute `adjusted_total_*` for an in-progress season, so
+        # its source page omits those 6 keys entirely -> 100% NULL across all
+        # 730 rows. NOT a parser bug — completed seasons (e.g. '2425') DO carry
+        # `adjusted_total_*` with real values (probe-confirmed), and the scraper
+        # reads them via CAPOLOGY_MONEY_BASES. Drop this entry once a completed
+        # season is backfilled (then the cols are no longer all-NULL). Tracked
+        # in followup #319; the other 24 salary cols carry data.
+        'adjusted_total_gross_gbp', 'adjusted_total_gross_eur', 'adjusted_total_gross_usd',
+        'adjusted_total_net_gbp', 'adjusted_total_net_eur', 'adjusted_total_net_usd',
+    },
 }
 
 # Columns that hold exactly 1 distinct value by design — should NOT trigger
@@ -532,7 +545,35 @@ EXPECTED_TABLES: dict[str, dict[str, set[str]]] = {
             'to_club_id', 'fee_text', 'is_upcoming', *META_COLS,
         },
     },
-    # 'capology': {...}  -> #286
+    'capology': {
+        # 1 table, ENG-PL MVP only (CAPOLOGY_LEAGUE_MAP), currency='GBP'
+        # partition. All 3 currencies (gbp/eur/usd) arrive inline in one scraper
+        # JS block -> the GBP partition carries the full symmetric 30-salary set
+        # (10 money bases x 3 currencies). Full set listed (per #286 acceptance:
+        # each ~30 col incl. *_eur/*_usd must have >0 non-NULL); extra live
+        # columns are NOT errors. Verified live 2026-06-05 (#286): 730 rows on
+        # ('ENG-Premier League','2526','GBP'). 24/30 salary cols carry data; the
+        # 6 `adjusted_total_*` cols are 100% NULL because the only materialised
+        # partition is the in-progress season ('2526'), which Capology has no
+        # adjusted totals for yet (completed seasons like '2425' do) ->
+        # EXPECTED_NULL allowlist, followup #319.
+        'capology_player_salaries': {
+            'league', 'season', 'currency', 'player_slug', 'player_name',
+            'club_slug', 'club_name', 'country_code', 'age', 'position',
+            'status', 'active', 'loan', 'verified',
+            'weekly_gross_gbp', 'weekly_gross_eur', 'weekly_gross_usd',
+            'annual_gross_gbp', 'annual_gross_eur', 'annual_gross_usd',
+            'weekly_net_gbp', 'weekly_net_eur', 'weekly_net_usd',
+            'annual_net_gbp', 'annual_net_eur', 'annual_net_usd',
+            'bonus_gross_gbp', 'bonus_gross_eur', 'bonus_gross_usd',
+            'bonus_net_gbp', 'bonus_net_eur', 'bonus_net_usd',
+            'total_gross_gbp', 'total_gross_eur', 'total_gross_usd',
+            'total_net_gbp', 'total_net_eur', 'total_net_usd',
+            'adjusted_total_gross_gbp', 'adjusted_total_gross_eur', 'adjusted_total_gross_usd',
+            'adjusted_total_net_gbp', 'adjusted_total_net_eur', 'adjusted_total_net_usd',
+            *META_COLS,
+        },
+    },
 }
 
 # Tables a source's contract names but that are intentionally NOT materialised
