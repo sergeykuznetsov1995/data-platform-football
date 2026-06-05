@@ -309,7 +309,9 @@ def test_transfermarkt_contract_lists_all_three_tables(table):
 # partition carries the full symmetric 30-salary set (10 money bases x 3 cur).
 # Verified live 2026-06-05 (#286): 730 rows on ('ENG-Premier League','2526').
 # 24/30 salary cols carry data; the 6 `adjusted_total_*` cols are 100% NULL
-# (Capology omits those keys for APL league pages) -> EXPECTED_NULL, followup #319.
+# because the only materialised partition is the in-progress season ('2526'),
+# which Capology has no adjusted totals for yet (completed seasons like '2425'
+# do) -> EXPECTED_NULL, followup #319.
 @pytest.mark.parametrize('table', [
     'capology_player_salaries',
 ])
