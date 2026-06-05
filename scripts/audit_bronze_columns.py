@@ -152,6 +152,10 @@ EXPECTED_NULL: dict[str, set[str]] = {
         # for every squad player, so the column is 100% NULL.
         'next_match_json',
     },
+    # NB: no 'capology_player_salaries' entry — #320 allowlisted adjusted_total_*
+    # while only the in-progress season was materialised, but #321 backfilled
+    # completed seasons (which DO carry adjusted_total_*), so those cols are no
+    # longer all-NULL. Removing the stale entry (resolves #319).
 }
 
 # Columns that hold exactly 1 distinct value by design — should NOT trigger
@@ -535,7 +539,10 @@ EXPECTED_TABLES: dict[str, dict[str, set[str]]] = {
     'capology': {
         # 4 APL data products (#321), all from the same anti-bot-free tls path,
         # partition (league, season[, currency]). All 3 currencies inline.
-        # Verified live 2026-06-05 across seasons 2324/2425/2526.
+        # Verified live 2026-06-05 across seasons 2324/2425/2526. Backfill of
+        # completed seasons populates adjusted_total_* (resolves #319) so the
+        # salaries adjusted_total_* cols are no longer all-NULL — hence no
+        # EXPECTED_NULL entry for capology.
         'capology_player_salaries': {
             'league', 'season', 'currency', 'player_slug', 'player_name',
             'club_slug', 'club_name', 'country_code', 'age', 'position',
