@@ -184,6 +184,11 @@ def main() -> int:
                     help='Collect overlay and report; do NOT write to bronze.')
     ap.add_argument('--limit', type=int, default=None,
                     help='Cap number of matches (smoke test).')
+    ap.add_argument('--match-ids', type=str, default=None,
+                    help='Comma-separated match_ids to backfill instead of the '
+                         'full table. Use to retry matches whose /lineups fetch '
+                         'transiently failed during a full run (the MERGE only '
+                         'fills rows still NULL, so this is safe to re-run).')
     args = ap.parse_args()
 
     proxy_file = os.environ.get('PROXY_FILE', '/opt/airflow/proxys.txt')
@@ -192,9 +197,12 @@ def main() -> int:
         proxy_file = None
 
     mgr = TrinoTableManager()
-    match_ids = _resolve_match_ids(mgr)
-    if args.limit:
-        match_ids = match_ids[: args.limit]
+    if args.match_ids:
+        match_ids = [m.strip() for m in args.match_ids.split(',') if m.strip()]
+    else:
+        match_ids = _resolve_match_ids(mgr)
+        if args.limit:
+            match_ids = match_ids[: args.limit]
     logger.info("Backfilling overlay for %d matches", len(match_ids))
 
     df = _collect_overlay(match_ids, proxy_file)
