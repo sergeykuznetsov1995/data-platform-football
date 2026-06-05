@@ -93,6 +93,11 @@ CAPOLOGY_CONTRACT_BASES = (
 # Club-level transfer-window money bases — net balances, NOT weekly-divided.
 CAPOLOGY_TRANSFER_MONEY_BASES = ('income', 'expense', 'balance', 'adjbalance')
 
+# Capology contract-extensions has no genuine pre-2018-19 history (older season
+# URLs silently serve the current extensions). Backfill floor guards against
+# writing mislabelled current data under an old season partition.
+CONTRACT_HISTORY_FLOOR = 2018
+
 R0_2B_FALLBACK_MARKER = 'CAPOLOGY_FALLBACK'
 
 
@@ -824,6 +829,22 @@ class CapologyScraper(BaseScraper):
             for base in CAPOLOGY_CONTRACT_BASES
             for ccy in CAPOLOGY_MONEY_CURRENCIES
         ]
+        # Capology's contract-extensions history starts at 2018-19; for older
+        # season URLs the page ignores the param and serves the CURRENT
+        # extensions (verified 2026-06-05: 2014-2017 == 2025-26, 59/59 players).
+        # Refuse pre-floor seasons so a backfill can't write mislabelled dupes.
+        if int(season) < CONTRACT_HISTORY_FLOOR:
+            logger.warning(
+                "%s: contract_extensions has no real history before %d-%d "
+                "(Capology serves current data for %s) — skipping.",
+                R0_2B_FALLBACK_MARKER, CONTRACT_HISTORY_FLOOR,
+                CONTRACT_HISTORY_FLOOR + 1, season,
+            )
+            cols = [
+                'player_slug', 'player_name', 'club_slug', 'club_name',
+                'signed', 'expiration', 'years',
+            ] + money + ['league', 'season', '_ingested_at']
+            return pd.DataFrame(columns=cols)
         return self._read_product(
             league, season, _CONTRACTS_PATH, 'contract-extensions',
             'contract_extensions', _parse_contract_row,

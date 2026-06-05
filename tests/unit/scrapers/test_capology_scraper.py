@@ -314,3 +314,15 @@ class TestTransferRow:
         assert row['age'] == 23.5             # accounting.toFixed float
         assert row['foreign'] == 18
         assert row['balance_gbp'] == -42390000  # net balance can be negative
+
+
+class TestContractHistoryFloor:
+    """Pre-2018 contract-extensions URLs serve current data → must be refused
+    (no network) so a backfill can't write mislabelled dupes (#321)."""
+
+    def test_pre_floor_season_returns_empty_without_fetch(self):
+        scr = CapologyScraper(leagues=['ENG-Premier League'], seasons=[2017])
+        df = scr.read_contract_extensions('ENG-Premier League', 2017)
+        assert df.empty
+        # schema preserved so the runner still soft-falls back cleanly
+        assert 'contract_total_gross_gbp' in df.columns
