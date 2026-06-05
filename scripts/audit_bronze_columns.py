@@ -473,7 +473,46 @@ EXPECTED_TABLES: dict[str, dict[str, set[str]]] = {
             *META_COLS,
         },
     },
-    # 'sofifa': {...}, 'transfermarkt': {...}, 'capology': {...}  -> #284-#286
+    'sofifa': {
+        # SoFIFA scraper (scrapers/sofifa/scraper.py — soccerdata reader +
+        # FlareSolverr override). 6 tables (sofifa_leagues unpartitioned, the
+        # other 5 partitioned ['fifa_edition']). Minimal required = identity keys
+        # + core ratings + META_COLS; extra live cols are NOT errors; the 15
+        # 100%-NULL sofifa_team_ratings cols live in EXPECTED_NULL and are
+        # excluded here. FlareSolverr v3.4.6 (Chromium 142) clears the sofifa.com
+        # Turnstile — ingest works (the earlier #180 CF freeze is resolved). All
+        # 6 tables materialise + non-empty (verified live 2026-06-05, #284):
+        # FC 26 / ENG-Premier League — player_ratings 546, players 546,
+        # team_ratings 20, teams 20, versions 852, leagues 1 — 0 missing
+        # tables/columns, 0 all-NULL outside the allowlist.
+        'sofifa_players': {
+            'fifa_edition', 'player', 'player_id', 'team', 'league', *META_COLS,
+        },
+        'sofifa_teams': {
+            'fifa_edition', 'team', 'team_id', 'league', *META_COLS,
+        },
+        'sofifa_player_ratings': {
+            'fifa_edition', 'player', 'player_id', 'position',
+            'overallrating', 'potential', 'pace', 'shooting', 'passing',
+            'dribbling', 'defending', 'physical', *META_COLS,
+        },
+        # build_up_*/chance_creation_*/defence_*/...prestige/whole_team_average_age
+        # (15 cols) are 100% NULL upstream (FC 26 removed them) — see EXPECTED_NULL,
+        # so they are excluded from the required set.
+        'sofifa_team_ratings': {
+            'fifa_edition', 'team', 'team_id', 'league',
+            'overall', 'attack', 'midfield', 'defence', *META_COLS,
+        },
+        'sofifa_versions': {  # FIFA-edition lookup (soccerdata read_versions)
+            'version_id', 'fifa_edition', 'update', *META_COLS,
+        },
+        # league -> sofifa league_id lookup (soccerdata read_leagues).
+        # Unpartitioned reference table; replace-on-`league` keeps it idempotent.
+        'sofifa_leagues': {
+            'league', 'league_id', *META_COLS,
+        },
+    },
+    # 'transfermarkt': {...}, 'capology': {...}  -> #285-#286
 }
 
 # Tables a source's contract names but that are intentionally NOT materialised

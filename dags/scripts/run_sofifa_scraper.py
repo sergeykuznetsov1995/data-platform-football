@@ -51,6 +51,9 @@ def main():
         'tables': [],
         'players_rows': 0,
         'teams_rows': 0,
+        'team_ratings_rows': 0,
+        'versions_rows': 0,
+        'leagues_rows': 0,
         'player_ratings_rows': 0,
         'errors': []
     }
@@ -101,6 +104,65 @@ def main():
                 logger.error(error_msg)
                 results['errors'].append(error_msg)
 
+            # Scrape per-team ratings (overall/attack/midfield/defence + subs).
+            # Single league-level page — cheap.
+            try:
+                df = scraper.read_team_ratings()
+                if df is not None and not df.empty:
+                    part = ['fifa_edition'] if 'fifa_edition' in df.columns else None
+                    table_path = scraper.save_to_iceberg(
+                        df=df,
+                        table_name='sofifa_team_ratings',
+                        partition_cols=part,
+                        replace_partitions=part,
+                    )
+                    results['tables'].append(table_path)
+                    results['team_ratings_rows'] = len(df)
+                    logger.info(f"Saved {len(df)} team rating records")
+            except Exception as e:
+                error_msg = f"Team ratings scraping failed: {e}"
+                logger.error(error_msg)
+                results['errors'].append(error_msg)
+
+            # Scrape FIFA editions catalogue (version_id per edition). Cheap.
+            try:
+                df = scraper.read_versions()
+                if df is not None and not df.empty:
+                    part = ['fifa_edition'] if 'fifa_edition' in df.columns else None
+                    table_path = scraper.save_to_iceberg(
+                        df=df,
+                        table_name='sofifa_versions',
+                        partition_cols=part,
+                        replace_partitions=part,
+                    )
+                    results['tables'].append(table_path)
+                    results['versions_rows'] = len(df)
+                    logger.info(f"Saved {len(df)} version records")
+            except Exception as e:
+                error_msg = f"Versions scraping failed: {e}"
+                logger.error(error_msg)
+                results['errors'].append(error_msg)
+
+            # Scrape league -> sofifa league_id lookup. Cheap. No fifa_edition,
+            # so replace on the `league` key to stay idempotent across runs.
+            try:
+                df = scraper.read_leagues()
+                if df is not None and not df.empty:
+                    repl = ['league'] if 'league' in df.columns else None
+                    table_path = scraper.save_to_iceberg(
+                        df=df,
+                        table_name='sofifa_leagues',
+                        partition_cols=None,
+                        replace_partitions=repl,
+                    )
+                    results['tables'].append(table_path)
+                    results['leagues_rows'] = len(df)
+                    logger.info(f"Saved {len(df)} league records")
+            except Exception as e:
+                error_msg = f"Leagues scraping failed: {e}"
+                logger.error(error_msg)
+                results['errors'].append(error_msg)
+
             # Scrape per-player attribute ratings (issue #42).
             # ~545 player pages per APL edition — slowest step by far.
             try:
@@ -137,6 +199,9 @@ def main():
     total_rows = (
         results['players_rows']
         + results['teams_rows']
+        + results['team_ratings_rows']
+        + results['versions_rows']
+        + results['leagues_rows']
         + results['player_ratings_rows']
     )
     logger.info(f"Scraper complete: {total_rows} total rows")
