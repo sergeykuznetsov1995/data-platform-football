@@ -1,0 +1,51 @@
+# =============================================================================
+# OpenMetadata description: iceberg.bronze.fbref_match_events
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.bronze.fbref_match_events
+  description: |
+    Сырые событийные строки матча из scorebox FBref: голы, пенальти, автоголы,
+    жёлтые/вторые жёлтые/красные карточки, замены. Гранулярность: один row на
+    событие в пределах match_id. ВАЖНО: для автоголов (own_goal) поле team в
+    Bronze указывает команду, в чьи ворота забит мяч (атрибуция инвертирована) —
+    коррекция выполняется в Gold (fct_goal). Источник: FBref scrape
+    (dag_ingest_fbref).
+  tags:
+    - Tier.Bronze
+    - Domain.Football
+    - PII.Low
+columns:
+  - name: minute
+    description: Минута события (текст; формат "45+2" для добавленного времени).
+  - name: event_type
+    description: Тип события (goal / penalty / own_goal / yellow_card / second_yellow_card / red_card / substitution).
+  - name: player
+    description: Основной игрок события (автор гола, носитель карточки, вышедший на замену).
+    tags:
+      - PII.Low
+  - name: player_id
+    description: FBref ID основного игрока.
+  - name: team
+    description: Команда события (для own_goal — команда, пропустившая мяч; см. описание таблицы).
+  - name: team_side
+    description: Сторона команды в матче (Home / Away).
+  - name: secondary_player
+    description: Вторичный игрок (ассистент гола или ушедший с поля при замене).
+    tags:
+      - PII.Low
+  - name: secondary_player_id
+    description: FBref ID вторичного игрока.
+  - name: match_id
+    description: FBref ID матча (из match_url расписания).
+  - name: league
+    description: Лига (partition key).
+  - name: season
+    description: Сезон — год начала (bigint, напр. 2025 = сезон 2025/26).
+  - name: _source
+    description: Источник данных Bronze (всегда 'fbref').
+  - name: _entity_type
+    description: Внутренняя метка типа сущности ingest-конвейера FBref.
+  - name: _ingested_at
+    description: Timestamp ingest'а строки в Bronze.
+  - name: _batch_id
+    description: ID batch'а загрузки (трассировка и идемпотентность ingest).

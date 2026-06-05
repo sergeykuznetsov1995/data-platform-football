@@ -1,0 +1,73 @@
+# =============================================================================
+# OpenMetadata description: iceberg.bronze.fbref_team_stats
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.bronze.fbref_team_stats
+  description: |
+    Сезонная стандартная статистика команд из FBref (Squad Standard Stats).
+    Гранулярность: один row на (squad, league, season). Колонки с суффиксом `_1`
+    и `g+a-pk` — значения в пересчёте на 90 минут. Источник: FBref scrape
+    (dag_ingest_fbref).
+  tags:
+    - Tier.Bronze
+    - Domain.Football
+    - PII.None
+columns:
+  - name: squad
+    description: Название команды.
+  - name: "# pl"
+    description: Число игроков, использованных командой за сезон (Players used).
+  - name: age
+    description: Средний возраст состава.
+  - name: poss
+    description: Среднее владение мячом, % (Possession).
+  - name: mp
+    description: Сыграно матчей (Matches Played).
+  - name: starts
+    description: Сумма выходов в старте по игрокам.
+  - name: min
+    description: Сыграно минут (суммарно).
+  - name: 90s
+    description: Число 90-минуток (минуты / 90).
+  - name: gls
+    description: Голы.
+  - name: ast
+    description: Голевые передачи (ассисты).
+  - name: g+a
+    description: Голы + ассисты.
+  - name: g-pk
+    description: Голы без пенальти (Goals − Penalty Kicks).
+  - name: pk
+    description: Забитые пенальти.
+  - name: pkatt
+    description: Пробитые пенальти (попытки).
+  - name: crdy
+    description: Жёлтые карточки.
+  - name: crdr
+    description: Красные карточки.
+  - name: gls_1
+    description: Голы на 90 минут.
+  - name: ast_1
+    description: Ассисты на 90 минут.
+  - name: g+a_1
+    description: Голы + ассисты на 90 минут.
+  - name: g-pk_1
+    description: Голы без пенальти на 90 минут.
+  - name: g+a-pk
+    description: (Голы + ассисты − пенальти) на 90 минут.
+  - name: team_id
+    description: FBref ID команды.
+  - name: league
+    description: Лига (partition key).
+  - name: season
+    description: Сезон — год начала (bigint, напр. 2025 = сезон 2025/26).
+  - name: stat_type
+    description: Категория stat-таблицы FBref (для этой таблицы — standard).
+  - name: _source
+    description: Источник данных Bronze (всегда 'fbref').
+  - name: _entity_type
+    description: Внутренняя метка типа сущности ingest-конвейера FBref.
+  - name: _ingested_at
+    description: Timestamp ingest'а строки в Bronze.
+  - name: _batch_id
+    description: ID batch'а загрузки (трассировка и идемпотентность ingest).
