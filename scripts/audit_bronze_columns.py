@@ -152,6 +152,16 @@ EXPECTED_NULL: dict[str, set[str]] = {
         # for every squad player, so the column is 100% NULL.
         'next_match_json',
     },
+    'capology_player_salaries': {
+        # upstream-missing (#286, verified live 2026-06-05): the Capology APL
+        # league-table page does not emit `adjusted_total_*` keys, so these 6
+        # cols are 100% NULL across all 730 ENG-PL rows. NOT a parser bug — the
+        # scraper iterates them in CAPOLOGY_MONEY_BASES and the unit fixture
+        # proves it reads `adjusted_total_*_gbp` when present. Recoverability
+        # tracked in followup #319; the other 24 salary cols carry data.
+        'adjusted_total_gross_gbp', 'adjusted_total_gross_eur', 'adjusted_total_gross_usd',
+        'adjusted_total_net_gbp', 'adjusted_total_net_eur', 'adjusted_total_net_usd',
+    },
 }
 
 # Columns that hold exactly 1 distinct value by design — should NOT trigger
@@ -532,7 +542,33 @@ EXPECTED_TABLES: dict[str, dict[str, set[str]]] = {
             'to_club_id', 'fee_text', 'is_upcoming', *META_COLS,
         },
     },
-    # 'capology': {...}  -> #286
+    'capology': {
+        # 1 table, ENG-PL MVP only (CAPOLOGY_LEAGUE_MAP), currency='GBP'
+        # partition. All 3 currencies (gbp/eur/usd) arrive inline in one scraper
+        # JS block -> the GBP partition carries the full symmetric 30-salary set
+        # (10 money bases x 3 currencies). Full set listed (per #286 acceptance:
+        # each ~30 col incl. *_eur/*_usd must have >0 non-NULL); extra live
+        # columns are NOT errors. Verified live 2026-06-05 (#286): 730 rows on
+        # ('ENG-Premier League','2526','GBP'). 24/30 salary cols carry data; the
+        # 6 `adjusted_total_*` cols are 100% NULL (Capology omits those keys for
+        # APL league pages) -> EXPECTED_NULL allowlist, followup #319.
+        'capology_player_salaries': {
+            'league', 'season', 'currency', 'player_slug', 'player_name',
+            'club_slug', 'club_name', 'country_code', 'age', 'position',
+            'status', 'active', 'loan', 'verified',
+            'weekly_gross_gbp', 'weekly_gross_eur', 'weekly_gross_usd',
+            'annual_gross_gbp', 'annual_gross_eur', 'annual_gross_usd',
+            'weekly_net_gbp', 'weekly_net_eur', 'weekly_net_usd',
+            'annual_net_gbp', 'annual_net_eur', 'annual_net_usd',
+            'bonus_gross_gbp', 'bonus_gross_eur', 'bonus_gross_usd',
+            'bonus_net_gbp', 'bonus_net_eur', 'bonus_net_usd',
+            'total_gross_gbp', 'total_gross_eur', 'total_gross_usd',
+            'total_net_gbp', 'total_net_eur', 'total_net_usd',
+            'adjusted_total_gross_gbp', 'adjusted_total_gross_eur', 'adjusted_total_gross_usd',
+            'adjusted_total_net_gbp', 'adjusted_total_net_eur', 'adjusted_total_net_usd',
+            *META_COLS,
+        },
+    },
 }
 
 # Tables a source's contract names but that are intentionally NOT materialised
