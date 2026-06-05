@@ -84,6 +84,13 @@ SILVER_TRANSFORMS = [
         'dags/sql/silver/fotmob_team_season.sql',
         'fotmob_team_season',
     ),
+    # issue #290: судья матча + СТРАНА (FotMob-only) из match_facts_json.
+    # Future namesake-дизамбигуатор для xref_referee при мульти-лиговом scope.
+    (
+        'match_referee',
+        'dags/sql/silver/fotmob_match_referee.sql',
+        'fotmob_match_referee',
+    ),
 ]
 
 # FotMob Bronze coverage: только сезон 2025 (572 player в details, ~10K rows
@@ -102,6 +109,9 @@ SILVER_MIN_ROWS = {
     'fotmob_team_match': 600,
     # team_season: rollup → ~20 команд APL за сезон. Floor 18 c headroom.
     'fotmob_team_season': 18,
+    # match_referee: ~380 матчей APL 2025/26 со 100% покрытием судьи (issue #290).
+    # Floor 300 c headroom под матчи без referee.text.
+    'fotmob_match_referee': 300,
 }
 
 
@@ -404,6 +414,35 @@ def _validate_silver_quality(**context) -> Dict[str, Any]:
             warn_threshold=0.95,
             error_threshold=0.80,
         ),
+
+        # --- match_referee (issue #290) ---
+        # ERROR: PK uniqueness на (match_id, league, season) + floor count.
+        # WARNING: freshness + coverage(referee_country) — полнота страны судьи
+        # это raison d'être задачи (referee_name не-NULL гарантирован SQL-фильтром).
+        CHECK.no_nulls(
+            'silver.fotmob_match_referee',
+            cols=['match_id', 'league', 'season'],
+        ),
+        CHECK.no_duplicates(
+            'silver.fotmob_match_referee',
+            pk=['match_id', 'league', 'season'],
+        ),
+        CHECK.row_count(
+            'silver.fotmob_match_referee',
+            min_rows=300,
+        ),
+        CHECK.freshness(
+            'silver.fotmob_match_referee',
+            ts_col='_bronze_ingested_at',
+            max_age_hours=FRESH_HOURS,
+            severity='WARNING',
+        ),
+        CHECK.coverage(
+            'silver.fotmob_match_referee',
+            column='referee_country',
+            warn_threshold=0.90,
+            error_threshold=0.50,
+        ),
     ]
 
     report = run_checks(checks, raise_on_error=False)
@@ -456,6 +495,7 @@ with DAG(
     | `fotmob_player_profile` | Time-invariant snapshot: height_cm/dob/nationality/foot | fotmob_team_squad + fotmob_player_details (foot из JSON) |
     | `fotmob_keeper_profile` | Вратари per-season с GK-stats | fotmob_player_details + fotmob_player_stats (PIVOTED) |
     | `fotmob_team_match` | Per (match, team_id) team-level stats + xG/xA | fotmob_match_details.stats_json + .player_stats_json (SUM xA) — issue #97 Phase A |
+    | `fotmob_match_referee` | Per-match судья + страна (FotMob-only) | fotmob_match_details.match_facts_json ($.infoBox.Referee) — issue #290 |
 
     ### Transformations
     - **Dedup** на (player_id, league, season) через ROW_NUMBER + ORDER BY _ingested_at DESC
