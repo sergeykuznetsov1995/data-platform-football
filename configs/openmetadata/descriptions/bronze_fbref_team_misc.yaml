@@ -1,0 +1,61 @@
+# =============================================================================
+# OpenMetadata description: iceberg.bronze.fbref_team_misc
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.bronze.fbref_team_misc
+  description: |
+    Сезонная «прочая» статистика команд из FBref (Squad Miscellaneous Stats):
+    карточки, фолы, офсайды, навесы, перехваты, отборы, пенальти, автоголы.
+    Гранулярность: один row на (squad, league, season). Источник: FBref scrape
+    (dag_ingest_fbref).
+  tags:
+    - Tier.Bronze
+    - Domain.Football
+    - PII.None
+columns:
+  - name: squad
+    description: Название команды.
+  - name: "# pl"
+    description: Число игроков, использованных командой за сезон (Players used).
+  - name: 90s
+    description: Число 90-минуток (минуты / 90).
+  - name: crdy
+    description: Жёлтые карточки.
+  - name: crdr
+    description: Красные карточки.
+  - name: 2crdy
+    description: Вторые жёлтые карточки (удаление за две жёлтые).
+  - name: fls
+    description: Фолы совершённые.
+  - name: fld
+    description: Фолы заработанные.
+  - name: "off"
+    description: Положения вне игры (офсайды).
+  - name: crs
+    description: Навесы (crosses).
+  - name: int
+    description: Перехваты (interceptions).
+  - name: tklw
+    description: Отборы с возвратом владения (Tackles Won).
+  - name: pkwon
+    description: Заработанные пенальти.
+  - name: pkcon
+    description: Привезённые пенальти.
+  - name: og
+    description: Автоголы.
+  - name: team_id
+    description: FBref ID команды.
+  - name: league
+    description: Лига (partition key).
+  - name: season
+    description: Сезон — год начала (bigint, напр. 2025 = сезон 2025/26).
+  - name: stat_type
+    description: Категория stat-таблицы FBref (для этой таблицы — misc).
+  - name: _source
+    description: Источник данных Bronze (всегда 'fbref').
+  - name: _entity_type
+    description: Внутренняя метка типа сущности ingest-конвейера FBref.
+  - name: _ingested_at
+    description: Timestamp ingest'а строки в Bronze.
+  - name: _batch_id
+    description: ID batch'а загрузки (трассировка и идемпотентность ingest).

@@ -1,0 +1,37 @@
+# =============================================================================
+# OpenMetadata description: iceberg.bronze.fbref_match_managers
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.bronze.fbref_match_managers
+  description: |
+    Тренеры команд на матч из scorebox FBref. Гранулярность: два row на матч
+    (home и away сторона). Источник: FBref scrape (dag_ingest_fbref).
+  tags:
+    - Tier.Bronze
+    - Domain.Football
+    - PII.Low
+columns:
+  - name: match_id
+    description: FBref ID матча.
+  - name: side
+    description: Сторона команды (Home / Away).
+  - name: team
+    description: Название команды.
+  - name: manager_name
+    description: Имя тренера команды в матче.
+    tags:
+      - PII.Low
+  - name: manager_fbref_id
+    description: FBref ID тренера (из ссылки /managers/…; NULL если ссылки нет).
+  - name: league
+    description: Лига (partition key).
+  - name: season
+    description: Сезон — год начала (bigint, напр. 2025 = сезон 2025/26).
+  - name: _source
+    description: Источник данных Bronze (всегда 'fbref').
+  - name: _ingested_at
+    description: Timestamp ingest'а строки в Bronze.
+  - name: _entity_type
+    description: Внутренняя метка типа сущности ingest-конвейера FBref.
+  - name: _batch_id
+    description: ID batch'а загрузки (трассировка и идемпотентность ingest).
