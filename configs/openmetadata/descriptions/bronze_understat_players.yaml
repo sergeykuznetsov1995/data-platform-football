@@ -1,0 +1,73 @@
+# =============================================================================
+# OpenMetadata description: iceberg.bronze.understat_players
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.bronze.understat_players
+  description: |
+    Сезонные агрегаты игроков из Understat (soccerdata UnderstatScraper,
+    read_player_season_stats). Grain — один row на (player, team, season).
+    ВНИМАНИЕ: Bronze несёт ~×10 row-дублей upstream (особенность soccerdata) —
+    дедупликация выполняется в Silver через ROW_NUMBER; per-column non-NULL
+    дублями не затронут. Несёт xG-семейство (xG, xA, npxG, xGChain, xGBuildup).
+    Партиционирование ['league','season'].
+  tags:
+    - Tier.Bronze
+    - Domain.Football
+    - PII.Low
+columns:
+  - name: league
+    description: Лига (e.g. 'ENG-Premier League'); partition key.
+  - name: season
+    description: Сезон в формате Understat (e.g. '2526'); partition key.
+  - name: player
+    description: Имя игрока (PII.Low).
+    tags:
+      - PII.Low
+  - name: player_id
+    description: Understat player_id.
+  - name: team
+    description: Название команды игрока.
+  - name: team_id
+    description: Understat team_id команды.
+  - name: position
+    description: Позиция игрока (e.g. F / M / D / GK / S).
+  - name: matches
+    description: Сыграно матчей за сезон.
+  - name: minutes
+    description: Сыграно минут за сезон.
+  - name: goals
+    description: Голы за сезон.
+  - name: assists
+    description: Ассисты за сезон.
+  - name: shots
+    description: Удары за сезон.
+  - name: key_passes
+    description: Ключевые передачи (приведшие к удару) за сезон.
+  - name: yellow_cards
+    description: Жёлтые карточки за сезон.
+  - name: red_cards
+    description: Красные карточки за сезон.
+  - name: xg
+    description: Суммарные ожидаемые голы (xG) за сезон.
+  - name: xa
+    description: Суммарные ожидаемые ассисты (xA) за сезон.
+  - name: xg_chain
+    description: xGChain — суммарный xG владений, в которых игрок участвовал.
+  - name: xg_buildup
+    description: xGBuildup — xGChain без вкладов в удары/ключевые передачи (только построение атак).
+  - name: np_goals
+    description: Голы без учёта пенальти (non-penalty goals).
+  - name: np_xg
+    description: Ожидаемые голы без пенальти (non-penalty xG).
+  - name: league_id
+    description: Внутренний идентификатор лиги Understat.
+  - name: season_id
+    description: Внутренний идентификатор сезона Understat.
+  - name: _source
+    description: Источник данных ('understat'); метаколонка Bronze.
+  - name: _entity_type
+    description: Тип сущности в Bronze; метаколонка.
+  - name: _ingested_at
+    description: Timestamp ingest'а строки в Bronze; метаколонка.
+  - name: _batch_id
+    description: Идентификатор батча ingest'а; метаколонка.
