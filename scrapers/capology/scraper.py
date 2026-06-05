@@ -47,6 +47,9 @@ logger = logging.getLogger(__name__)
 
 _CAPOLOGY_BASE = "https://www.capology.com"
 _SALARIES_PATH = "/uk/{league_slug}/salaries/{season_long}/"
+_PAYROLLS_PATH = "/uk/{league_slug}/payrolls/{season_long}/"
+_CONTRACTS_PATH = "/uk/{league_slug}/contract-extensions/{season_long}/"
+_TRANSFERS_PATH = "/uk/{league_slug}/transfer-window/{season_long}/"
 
 CAPOLOGY_LEAGUE_MAP: Dict[str, str] = {
     'ENG-Premier League': 'premier-league',
@@ -66,6 +69,34 @@ CAPOLOGY_MONEY_BASES = (
     'adjusted_total_gross', 'adjusted_total_net',
 )
 CAPOLOGY_MONEY_CURRENCIES = ('gbp', 'eur', 'usd')
+
+# Club-level payroll table money bases (probe-confirmed 2026-06-05, APL).
+# The page also carries a positional split d/f/k/m (defenders / forwards /
+# keepers / midfielders), but those cells are Capology-Pro-locked
+# (`<span class='footer-pro'>Locked</span>`) on the public page — never real
+# data — so they are intentionally NOT extracted.
+CAPOLOGY_PAYROLL_BASES = (
+    'weekly_gross', 'weekly_net', 'annual_gross', 'annual_net',
+    'bonus_gross', 'bonus_net', 'total_gross', 'total_net',
+    'adjusted_total_gross', 'adjusted_total_net',
+)
+
+# Player-level contract-extensions table money bases (probe-confirmed).
+# Adds `contract_total_*` (full contract value) on top of the salary set.
+CAPOLOGY_CONTRACT_BASES = (
+    'weekly_gross', 'weekly_net', 'annual_gross', 'annual_net',
+    'bonus_gross', 'bonus_net', 'total_gross', 'total_net',
+    'adjusted_total_gross', 'adjusted_total_net',
+    'contract_total_gross', 'contract_total_net',
+)
+
+# Club-level transfer-window money bases — net balances, NOT weekly-divided.
+CAPOLOGY_TRANSFER_MONEY_BASES = ('income', 'expense', 'balance', 'adjbalance')
+
+# Capology contract-extensions has no genuine pre-2018-19 history (older season
+# URLs silently serve the current extensions). Backfill floor guards against
+# writing mislabelled current data under an old season partition.
+CONTRACT_HISTORY_FLOOR = 2018
 
 R0_2B_FALLBACK_MARKER = 'CAPOLOGY_FALLBACK'
 
@@ -278,16 +309,14 @@ def _parse_row_block(block: str) -> Optional[Dict]:
     return out
 
 
-def _parse_salary_table(html: str) -> List[Dict]:
-    """Extract per-(player, club) salary rows from the Capology HTML."""
-    data_block = _slice_data_array(html)
-    if not data_block:
-        return []
+def _iter_row_blocks(data_block: str):
+    """Yield each top-level ``{...}`` row literal from a sliced data array.
 
-    # Walk `data_block` finding sibling top-level `{...}` row literals.
-    # Bracket counter mirrors `_slice_data_array` but for `{` / `}`, while
-    # ignoring string literals so embedded `}` in HTML strings doesn't trip us.
-    rows: List[Dict] = []
+    Bracket counter mirrors `_slice_data_array` but for `{` / `}`, while
+    ignoring string literals so embedded `}` in HTML strings doesn't trip us.
+    Shared by every Capology table parser (salaries / payrolls / contracts /
+    transfer-window) — the row-block framing is identical across products.
+    """
     depth = 0
     in_str = False
     quote_char = ''
@@ -310,12 +339,179 @@ def _parse_salary_table(html: str) -> List[Dict]:
         elif c == '}':
             depth -= 1
             if depth == 0 and start is not None:
-                block = data_block[start:i + 1]
-                parsed = _parse_row_block(block)
-                if parsed:
-                    rows.append(parsed)
+                yield data_block[start:i + 1]
                 start = None
+
+
+# Field helpers tolerant to BOTH quote styles: the `salaries` /
+# `contract-extensions` pages quote keys with `'`, while `payrolls` /
+# `transfer-window` use `"`. The money call is also sometimes wrapped in an
+# extra paren — `formatMoney(("226293600"/52), ...)` — so allow an optional `(`.
+_Q = r"['\"]"  # opening/closing key quote (either kind)
+
+
+def _money_field(block: str, field: str, weekly: bool = False) -> Optional[int]:
+    """``'{field}': accounting.formatMoney("27300000"/52, ...)`` → int.
+
+    Captures the raw dividend; weekly fields are stored ÷52 (the JS divides
+    the annual figure by 52 for the weekly view).
+    """
+    m = re.search(
+        rf"{_Q}{re.escape(field)}{_Q}\s*:\s*accounting\.formatMoney\(\s*\(?\s*\"?(-?[\d.]+)",
+        block,
+    )
+    if not m:
+        return None
+    try:
+        val = int(float(m.group(1)))
+        return val // 52 if weekly else val
+    except (TypeError, ValueError):
+        return None
+
+
+def _str_field(block: str, field: str) -> Optional[str]:
+    """Plain string value for ``'{field}': "..."`` (either quote style)."""
+    m = re.search(
+        rf"{_Q}{re.escape(field)}{_Q}\s*:\s*(?:\"([^\"]*)\"|'([^']*)')", block,
+    )
+    if not m:
+        return None
+    val = m.group(1) if m.group(1) is not None else m.group(2)
+    return val if val != '' else None
+
+
+def _int_field(block: str, field: str) -> Optional[int]:
+    """Integer value, tolerating ``Math.round("24")`` and quoted/plain forms."""
+    m = re.search(
+        rf"{_Q}{re.escape(field)}{_Q}\s*:\s*(?:Math\.round\(\s*)?\"?(-?\d+)", block,
+    )
+    if not m:
+        return None
+    try:
+        return int(m.group(1))
+    except ValueError:
+        return None
+
+
+def _float_field(block: str, field: str) -> Optional[float]:
+    """Float value, tolerating ``accounting.toFixed("27.6000", ...)`` wrap."""
+    m = re.search(
+        rf"{_Q}{re.escape(field)}{_Q}\s*:\s*(?:accounting\.toFixed\(\s*)?\"?(-?[\d.]+)",
+        block,
+    )
+    if not m:
+        return None
+    try:
+        return float(m.group(1))
+    except ValueError:
+        return None
+
+
+def _moment_date_field(block: str, field: str) -> Optional[str]:
+    """``'expiration': moment("2029-06-30").format(...)`` → ``'2029-06-30'``.
+
+    Capology wraps contract dates in a moment.js call; the ISO date is the
+    first quoted arg. Returned as a plain ISO string for Bronze.
+    """
+    m = re.search(
+        rf"{_Q}{re.escape(field)}{_Q}\s*:\s*moment\(\s*\"([0-9\-]+)\"", block,
+    )
+    return m.group(1) if m else None
+
+
+def _parse_salary_table(html: str) -> List[Dict]:
+    """Extract per-(player, club) salary rows from the Capology HTML."""
+    return _parse_table(html, _parse_row_block)
+
+
+def _parse_table(html: str, row_fn) -> List[Dict]:
+    """Slice the inline `var data` array and project each row via ``row_fn``."""
+    data_block = _slice_data_array(html)
+    if not data_block:
+        return []
+    rows: List[Dict] = []
+    for block in _iter_row_blocks(data_block):
+        parsed = row_fn(block)
+        if parsed:
+            rows.append(parsed)
     return rows
+
+
+def _money_cols(block: str, bases) -> Dict[str, object]:
+    """Build the ``{base}_{ccy}`` money map for one row across all currencies."""
+    out: Dict[str, object] = {}
+    for base in bases:
+        weekly = base.startswith('weekly_')
+        for ccy in CAPOLOGY_MONEY_CURRENCIES:
+            field = f'{base}_{ccy}'
+            out[field] = _money_field(block, field, weekly=weekly)
+    return out
+
+
+def _club_anchor(block: str) -> tuple[Optional[str], Optional[str]]:
+    """``"club": "<a href='/club/{slug}/...'>Name</a>"`` → (slug, name)."""
+    club_html = _str_field(block, 'club')
+    if not club_html:
+        return None, None
+    slug_m = _CLUB_HREF_RE.search(club_html)
+    return (
+        slug_m.group(1) if slug_m else None,
+        _extract_anchor_text(club_html) or club_html,
+    )
+
+
+def _parse_payroll_row(block: str) -> Optional[Dict]:
+    """Project one club-level payroll row."""
+    slug, name = _club_anchor(block)
+    if slug is None and name is None:
+        return None
+    out: Dict[str, object] = {
+        'club_slug': slug,
+        'club_name': name,
+        'club_code': _str_field(block, 'club_code'),
+    }
+    out.update(_money_cols(block, CAPOLOGY_PAYROLL_BASES))
+    return out
+
+
+def _parse_contract_row(block: str) -> Optional[Dict]:
+    """Project one player-level contract-extension row."""
+    name_html = _str_field(block, 'name')
+    if not name_html:
+        return None
+    slug_m = _NAME_HREF_RE.search(name_html)
+    club_slug, club_name = _club_anchor(block)
+    out: Dict[str, object] = {
+        'player_slug': slug_m.group(1) if slug_m else None,
+        'player_name': _extract_anchor_text(name_html),
+        'club_slug': club_slug,
+        'club_name': club_name,
+        'signed': _moment_date_field(block, 'signed'),
+        'expiration': _moment_date_field(block, 'expiration'),
+        'years': _int_field(block, 'years'),
+    }
+    out.update(_money_cols(block, CAPOLOGY_CONTRACT_BASES))
+    return out
+
+
+def _parse_transfer_row(block: str) -> Optional[Dict]:
+    """Project one club-level transfer-window row (net spend balances)."""
+    slug, name = _club_anchor(block)
+    if slug is None and name is None:
+        return None
+    out: Dict[str, object] = {
+        'club_slug': slug,
+        'club_name': name,
+        'club_code': _str_field(block, 'club_code'),
+        'players': _int_field(block, 'players'),
+        'age': _float_field(block, 'age'),
+        'foreign': _int_field(block, 'foreign'),
+    }
+    for base in CAPOLOGY_TRANSFER_MONEY_BASES:
+        for ccy in CAPOLOGY_MONEY_CURRENCIES:
+            field = f'{base}_{ccy}'
+            out[field] = _money_field(block, field)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -541,6 +737,139 @@ class CapologyScraper(BaseScraper):
             len(df), league, season_short, currency,
         )
         return df
+
+    def _read_product(
+        self,
+        league: str,
+        season: int,
+        path_tmpl: str,
+        label: str,
+        entity_type: str,
+        row_fn,
+        base_cols: List[str],
+        money_cols: List[str],
+        limit: Optional[int] = None,
+    ) -> pd.DataFrame:
+        """Shared fetch→parse→frame path for the club/contract products.
+
+        Mirrors `read_player_salaries`: returns an empty (but correctly-typed)
+        frame on out-of-scope league / fetch failure / zero parsed rows so the
+        ingest runner can soft-fall back instead of raising.
+        """
+        cols = base_cols + money_cols + ['league', 'season', '_ingested_at']
+        if league not in CAPOLOGY_LEAGUE_MAP:
+            logger.warning(
+                "%s: league %s not in CAPOLOGY_LEAGUE_MAP — skipping %s.",
+                R0_2B_FALLBACK_MARKER, league, label,
+            )
+            return pd.DataFrame(columns=cols)
+
+        league_slug = CAPOLOGY_LEAGUE_MAP[league]
+        season_long = _season_long(season)
+        season_short = _season_short(season)
+        url = _CAPOLOGY_BASE + path_tmpl.format(
+            league_slug=league_slug, season_long=season_long,
+        )
+
+        html = self._fetch_html(
+            url, label=label, context={'league': league, 'season': season},
+        )
+        if html is None:
+            logger.error(
+                "%s: %s fetch failed for %s/%s.",
+                R0_2B_FALLBACK_MARKER, label, league, season,
+            )
+            return pd.DataFrame(columns=cols)
+
+        rows = _parse_table(html, row_fn)
+        if not rows:
+            logger.warning(
+                "%s: zero %s rows parsed (size=%d) for %s/%s.",
+                R0_2B_FALLBACK_MARKER, label, len(html), league, season,
+            )
+            return pd.DataFrame(columns=cols)
+
+        if limit:
+            rows = rows[: int(limit)]
+
+        df = pd.DataFrame(rows)
+        df['league'] = league
+        df['season'] = season_short
+        df['_source'] = self.SOURCE_NAME
+        df['_entity_type'] = entity_type
+        df['_ingested_at'] = datetime.utcnow()
+        df['_batch_id'] = self._batch_id
+
+        logger.info(
+            "Materialised %d Capology %s rows for %s/%s",
+            len(df), label, league, season_short,
+        )
+        return df
+
+    def read_team_payrolls(
+        self, league: str, season: int, limit: Optional[int] = None,
+    ) -> pd.DataFrame:
+        money = [
+            f'{base}_{ccy}'
+            for base in CAPOLOGY_PAYROLL_BASES
+            for ccy in CAPOLOGY_MONEY_CURRENCIES
+        ]
+        return self._read_product(
+            league, season, _PAYROLLS_PATH, 'payrolls', 'team_payrolls',
+            _parse_payroll_row,
+            base_cols=['club_slug', 'club_name', 'club_code'],
+            money_cols=money, limit=limit,
+        )
+
+    def read_contract_extensions(
+        self, league: str, season: int, limit: Optional[int] = None,
+    ) -> pd.DataFrame:
+        money = [
+            f'{base}_{ccy}'
+            for base in CAPOLOGY_CONTRACT_BASES
+            for ccy in CAPOLOGY_MONEY_CURRENCIES
+        ]
+        # Capology's contract-extensions history starts at 2018-19; for older
+        # season URLs the page ignores the param and serves the CURRENT
+        # extensions (verified 2026-06-05: 2014-2017 == 2025-26, 59/59 players).
+        # Refuse pre-floor seasons so a backfill can't write mislabelled dupes.
+        if int(season) < CONTRACT_HISTORY_FLOOR:
+            logger.warning(
+                "%s: contract_extensions has no real history before %d-%d "
+                "(Capology serves current data for %s) — skipping.",
+                R0_2B_FALLBACK_MARKER, CONTRACT_HISTORY_FLOOR,
+                CONTRACT_HISTORY_FLOOR + 1, season,
+            )
+            cols = [
+                'player_slug', 'player_name', 'club_slug', 'club_name',
+                'signed', 'expiration', 'years',
+            ] + money + ['league', 'season', '_ingested_at']
+            return pd.DataFrame(columns=cols)
+        return self._read_product(
+            league, season, _CONTRACTS_PATH, 'contract-extensions',
+            'contract_extensions', _parse_contract_row,
+            base_cols=[
+                'player_slug', 'player_name', 'club_slug', 'club_name',
+                'signed', 'expiration', 'years',
+            ],
+            money_cols=money, limit=limit,
+        )
+
+    def read_transfer_window(
+        self, league: str, season: int, limit: Optional[int] = None,
+    ) -> pd.DataFrame:
+        money = [
+            f'{base}_{ccy}'
+            for base in CAPOLOGY_TRANSFER_MONEY_BASES
+            for ccy in CAPOLOGY_MONEY_CURRENCIES
+        ]
+        return self._read_product(
+            league, season, _TRANSFERS_PATH, 'transfer-window',
+            'transfer_window', _parse_transfer_row,
+            base_cols=['club_slug', 'club_name', 'club_code',
+                       'players', 'age', 'foreign'],
+            money_cols=money, limit=limit,
+        )
 
     # ----------------------- BaseScraper contract ----------------------------
 

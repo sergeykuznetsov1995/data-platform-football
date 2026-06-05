@@ -152,19 +152,10 @@ EXPECTED_NULL: dict[str, set[str]] = {
         # for every squad player, so the column is 100% NULL.
         'next_match_json',
     },
-    'capology_player_salaries': {
-        # in-progress-season gap (#286, verified live 2026-06-05): the only
-        # materialised partition is the CURRENT season ('2526'), and Capology
-        # does not yet compute `adjusted_total_*` for an in-progress season, so
-        # its source page omits those 6 keys entirely -> 100% NULL across all
-        # 730 rows. NOT a parser bug — completed seasons (e.g. '2425') DO carry
-        # `adjusted_total_*` with real values (probe-confirmed), and the scraper
-        # reads them via CAPOLOGY_MONEY_BASES. Drop this entry once a completed
-        # season is backfilled (then the cols are no longer all-NULL). Tracked
-        # in followup #319; the other 24 salary cols carry data.
-        'adjusted_total_gross_gbp', 'adjusted_total_gross_eur', 'adjusted_total_gross_usd',
-        'adjusted_total_net_gbp', 'adjusted_total_net_eur', 'adjusted_total_net_usd',
-    },
+    # NB: no 'capology_player_salaries' entry — #320 allowlisted adjusted_total_*
+    # while only the in-progress season was materialised, but #321 backfilled
+    # completed seasons (which DO carry adjusted_total_*), so those cols are no
+    # longer all-NULL. Removing the stale entry (resolves #319).
 }
 
 # Columns that hold exactly 1 distinct value by design — should NOT trigger
@@ -546,17 +537,12 @@ EXPECTED_TABLES: dict[str, dict[str, set[str]]] = {
         },
     },
     'capology': {
-        # 1 table, ENG-PL MVP only (CAPOLOGY_LEAGUE_MAP), currency='GBP'
-        # partition. All 3 currencies (gbp/eur/usd) arrive inline in one scraper
-        # JS block -> the GBP partition carries the full symmetric 30-salary set
-        # (10 money bases x 3 currencies). Full set listed (per #286 acceptance:
-        # each ~30 col incl. *_eur/*_usd must have >0 non-NULL); extra live
-        # columns are NOT errors. Verified live 2026-06-05 (#286): 730 rows on
-        # ('ENG-Premier League','2526','GBP'). 24/30 salary cols carry data; the
-        # 6 `adjusted_total_*` cols are 100% NULL because the only materialised
-        # partition is the in-progress season ('2526'), which Capology has no
-        # adjusted totals for yet (completed seasons like '2425' do) ->
-        # EXPECTED_NULL allowlist, followup #319.
+        # 4 APL data products (#321), all from the same anti-bot-free tls path,
+        # partition (league, season[, currency]). All 3 currencies inline.
+        # Verified live 2026-06-05 across seasons 2324/2425/2526. Backfill of
+        # completed seasons populates adjusted_total_* (resolves #319) so the
+        # salaries adjusted_total_* cols are no longer all-NULL — hence no
+        # EXPECTED_NULL entry for capology.
         'capology_player_salaries': {
             'league', 'season', 'currency', 'player_slug', 'player_name',
             'club_slug', 'club_name', 'country_code', 'age', 'position',
@@ -571,6 +557,51 @@ EXPECTED_TABLES: dict[str, dict[str, set[str]]] = {
             'total_net_gbp', 'total_net_eur', 'total_net_usd',
             'adjusted_total_gross_gbp', 'adjusted_total_gross_eur', 'adjusted_total_gross_usd',
             'adjusted_total_net_gbp', 'adjusted_total_net_eur', 'adjusted_total_net_usd',
+            *META_COLS,
+        },
+        # Club-level wage totals. Positional split d/f/k/m is Pro-locked
+        # upstream → intentionally not ingested (so NOT in the contract).
+        'capology_team_payrolls': {
+            'league', 'season', 'club_slug', 'club_name', 'club_code',
+            'weekly_gross_gbp', 'weekly_gross_eur', 'weekly_gross_usd',
+            'weekly_net_gbp', 'weekly_net_eur', 'weekly_net_usd',
+            'annual_gross_gbp', 'annual_gross_eur', 'annual_gross_usd',
+            'annual_net_gbp', 'annual_net_eur', 'annual_net_usd',
+            'bonus_gross_gbp', 'bonus_gross_eur', 'bonus_gross_usd',
+            'bonus_net_gbp', 'bonus_net_eur', 'bonus_net_usd',
+            'total_gross_gbp', 'total_gross_eur', 'total_gross_usd',
+            'total_net_gbp', 'total_net_eur', 'total_net_usd',
+            'adjusted_total_gross_gbp', 'adjusted_total_gross_eur', 'adjusted_total_gross_usd',
+            'adjusted_total_net_gbp', 'adjusted_total_net_eur', 'adjusted_total_net_usd',
+            *META_COLS,
+        },
+        # Player-level contracts: signed/expiration ISO dates + years +
+        # salary + full contract_total value.
+        'capology_contract_extensions': {
+            'league', 'season', 'player_slug', 'player_name',
+            'club_slug', 'club_name', 'signed', 'expiration', 'years',
+            'weekly_gross_gbp', 'weekly_gross_eur', 'weekly_gross_usd',
+            'weekly_net_gbp', 'weekly_net_eur', 'weekly_net_usd',
+            'annual_gross_gbp', 'annual_gross_eur', 'annual_gross_usd',
+            'annual_net_gbp', 'annual_net_eur', 'annual_net_usd',
+            'bonus_gross_gbp', 'bonus_gross_eur', 'bonus_gross_usd',
+            'bonus_net_gbp', 'bonus_net_eur', 'bonus_net_usd',
+            'total_gross_gbp', 'total_gross_eur', 'total_gross_usd',
+            'total_net_gbp', 'total_net_eur', 'total_net_usd',
+            'adjusted_total_gross_gbp', 'adjusted_total_gross_eur', 'adjusted_total_gross_usd',
+            'adjusted_total_net_gbp', 'adjusted_total_net_eur', 'adjusted_total_net_usd',
+            'contract_total_gross_gbp', 'contract_total_gross_eur', 'contract_total_gross_usd',
+            'contract_total_net_gbp', 'contract_total_net_eur', 'contract_total_net_usd',
+            *META_COLS,
+        },
+        # Club-level transfer-window net spend (balances can be negative).
+        'capology_transfer_window': {
+            'league', 'season', 'club_slug', 'club_name', 'club_code',
+            'players', 'age', 'foreign',
+            'income_gbp', 'income_eur', 'income_usd',
+            'expense_gbp', 'expense_eur', 'expense_usd',
+            'balance_gbp', 'balance_eur', 'balance_usd',
+            'adjbalance_gbp', 'adjbalance_eur', 'adjbalance_usd',
             *META_COLS,
         },
     },

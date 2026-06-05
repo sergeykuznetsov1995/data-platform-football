@@ -12,8 +12,11 @@ from scrapers.capology.scraper import (
     CAPOLOGY_SUPPORTED_CURRENCIES,
     R0_2B_FALLBACK_MARKER,
     _extract_anchor_text,
+    _parse_contract_row,
+    _parse_payroll_row,
     _parse_row_block,
     _parse_salary_table,
+    _parse_transfer_row,
     _season_long,
     _season_short,
     _slice_data_array,
@@ -228,3 +231,98 @@ class TestCapologyInit:
             leagues=['ENG-Premier League'], seasons=[2024], currency='gbp',
         )
         assert scr.currency == 'GBP'
+
+
+# ---------------------------------------------------------------------------
+# New APL data products (#321): payrolls / contracts / transfer-window.
+# Blocks mirror the live row shapes — payrolls/transfer-window quote keys with
+# `"`, contract-extensions with `'`; money is sometimes paren-wrapped; the
+# positional payroll split d/f/k/m is Pro-locked (must NOT be extracted).
+# ---------------------------------------------------------------------------
+
+class TestPayrollRow:
+    BLOCK = (
+        '{'
+        '"club": "<a class=\'firstcol\' href=\'/club/manchester-city/salaries/2024-2025/\'>'
+        '<img/>Manchester City</a>",'
+        '"club_code": "MCI",'
+        '"weekly_gross_gbp": accounting.formatMoney(("226293600"/52), "£ ", 0),'
+        '"annual_gross_gbp": accounting.formatMoney("226293600", "£ ", 0),'
+        '"total_gross_gbp": accounting.formatMoney("244493600", "£ ", 0),'
+        '"adjusted_total_gross_gbp": accounting.formatMoney("244493600", "£ ", 0),'
+        '"d_gross_gbp": "<span class=\'footer-pro\'>Locked</span>",'
+        '}'
+    )
+
+    def test_club_anchor_and_money(self):
+        row = _parse_payroll_row(self.BLOCK)
+        assert row['club_slug'] == 'manchester-city'
+        assert row['club_name'] == 'Manchester City'
+        assert row['club_code'] == 'MCI'
+        assert row['total_gross_gbp'] == 244493600
+        assert row['weekly_gross_gbp'] == 226293600 // 52  # JS ÷52 weekly view
+
+    def test_pro_locked_position_split_not_extracted(self):
+        row = _parse_payroll_row(self.BLOCK)
+        assert 'd_gross_gbp' not in row  # Pro-locked → intentionally dropped
+
+
+class TestContractRow:
+    BLOCK = (
+        '{'
+        "'name': \"<a class='firstcol' href='/player/gabriel-magalhaes-1/'>"
+        "<img/>Gabriel Magalh&atilde;es</a>\","
+        "'club': \"<a href='/club/arsenal/salaries/2024-2025/'><img/>Arsenal</a>\","
+        "'signed': moment(\"2025-06-06\").format(\"MMM D, YYYY\"),"
+        "'expiration': moment(\"2029-06-30\").format(\"MMM D, YYYY\"),"
+        "'years': \"5\","
+        "'total_gross_gbp': accounting.formatMoney(\"10400000\", \"£ \", 0),"
+        "'contract_total_gross_gbp': accounting.formatMoney(\"52000000\", \"£ \", 0),"
+        '}'
+    )
+
+    def test_player_club_dates_and_money(self):
+        row = _parse_contract_row(self.BLOCK)
+        assert row['player_slug'] == 'gabriel-magalhaes-1'
+        assert row['player_name'] == 'Gabriel Magalhães'  # entity-unescaped
+        assert row['club_slug'] == 'arsenal'
+        assert row['signed'] == '2025-06-06'        # unwrapped from moment(...)
+        assert row['expiration'] == '2029-06-30'
+        assert row['years'] == 5
+        assert row['contract_total_gross_gbp'] == 52000000
+
+
+class TestTransferRow:
+    BLOCK = (
+        '{'
+        '"club": "<a class=\'firstcol\' href=\'/club/chelsea/transfer-window/2024-2025/\'>'
+        '<img/>Chelsea</a>",'
+        '"club_code": "CHE",'
+        '"players": "30",'
+        '"age": accounting.toFixed("23.5000000000", 1),'
+        '"foreign": "18",'
+        '"income_gbp": accounting.formatMoney("163620000", "£ ", 0),'
+        '"balance_gbp": accounting.formatMoney("-42390000", "£ ", 0),'
+        '}'
+    )
+
+    def test_club_counts_age_and_balance(self):
+        row = _parse_transfer_row(self.BLOCK)
+        assert row['club_slug'] == 'chelsea'
+        assert row['club_code'] == 'CHE'
+        assert row['players'] == 30
+        assert row['age'] == 23.5             # accounting.toFixed float
+        assert row['foreign'] == 18
+        assert row['balance_gbp'] == -42390000  # net balance can be negative
+
+
+class TestContractHistoryFloor:
+    """Pre-2018 contract-extensions URLs serve current data → must be refused
+    (no network) so a backfill can't write mislabelled dupes (#321)."""
+
+    def test_pre_floor_season_returns_empty_without_fetch(self):
+        scr = CapologyScraper(leagues=['ENG-Premier League'], seasons=[2017])
+        df = scr.read_contract_extensions('ENG-Premier League', 2017)
+        assert df.empty
+        # schema preserved so the runner still soft-falls back cleanly
+        assert 'contract_total_gross_gbp' in df.columns

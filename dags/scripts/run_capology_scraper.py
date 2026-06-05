@@ -39,7 +39,26 @@ logger = logging.getLogger(__name__)
 
 
 ENTITY_PLAYER_SALARIES = 'player_salaries'
-VALID_ENTITIES = {ENTITY_PLAYER_SALARIES}
+ENTITY_TEAM_PAYROLLS = 'team_payrolls'
+ENTITY_CONTRACT_EXTENSIONS = 'contract_extensions'
+ENTITY_TRANSFER_WINDOW = 'transfer_window'
+
+# Club/contract products share one fetch→parse→save shape (partition by
+# league+season, all 3 currencies inline). entity → (read method, bronze
+# table, the column counted into `units` for the result JSON).
+PRODUCTS = {
+    ENTITY_TEAM_PAYROLLS: (
+        'read_team_payrolls', 'capology_team_payrolls', 'club_slug',
+    ),
+    ENTITY_CONTRACT_EXTENSIONS: (
+        'read_contract_extensions', 'capology_contract_extensions', 'player_slug',
+    ),
+    ENTITY_TRANSFER_WINDOW: (
+        'read_transfer_window', 'capology_transfer_window', 'club_slug',
+    ),
+}
+
+VALID_ENTITIES = {ENTITY_PLAYER_SALARIES, *PRODUCTS}
 
 
 def _write_results(path: str, payload: dict) -> None:
@@ -142,6 +161,76 @@ def _run_player_salaries(
     return 0
 
 
+def _run_product(
+    entity: str,
+    league: str,
+    season: int,
+    limit: Optional[int],
+    output_path: str,
+) -> int:
+    """Generic runner for the club/contract products (payrolls / contracts /
+    transfer-window). Same exit-code contract as _run_player_salaries."""
+    from scrapers.capology import CapologyScraper
+    from scrapers.capology.scraper import R0_2B_FALLBACK_MARKER
+
+    method, table_name, unit_col = PRODUCTS[entity]
+    results = {
+        'entity': entity,
+        'tables': [],
+        'rows': 0,
+        'units': 0,
+        'fallback': False,
+        'fallback_reason': None,
+        'errors': [],
+    }
+
+    proxy_file = os.environ.get('CAPOLOGY_PROXY_FILE')
+    if proxy_file and not os.path.exists(proxy_file):
+        proxy_file = None
+
+    try:
+        with CapologyScraper(
+            leagues=[league], seasons=[season], proxy_file=proxy_file,
+        ) as scraper:
+            df = getattr(scraper, method)(
+                league=league, season=int(season), limit=limit,
+            )
+            if df is None or df.empty:
+                reason = _classify_fallback(scraper)
+                logger.error(
+                    "%s: %s unavailable — reason=%s",
+                    R0_2B_FALLBACK_MARKER, entity, reason,
+                )
+                results['fallback'] = True
+                results['fallback_reason'] = reason
+                results['errors'].append(f'{R0_2B_FALLBACK_MARKER}: {reason}')
+                _write_results(output_path, results)
+                return 2
+
+            table_path = scraper.save_to_iceberg(
+                df=df,
+                table_name=table_name,
+                partition_cols=['league', 'season'],
+                replace_partitions=['league', 'season'],
+            )
+            results['tables'].append(table_path)
+            results['rows'] = int(len(df))
+            if unit_col in df.columns:
+                results['units'] = int(df[unit_col].nunique())
+            logger.info(
+                "Saved %d %s rows (%d unique %s) → %s",
+                results['rows'], entity, results['units'], unit_col, table_path,
+            )
+    except Exception as e:
+        logger.error("%s scrape failed hard: %s", entity, e, exc_info=True)
+        results['errors'].append(str(e))
+        _write_results(output_path, results)
+        return 1
+
+    _write_results(output_path, results)
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description='Run Capology Bronze scraper')
     parser.add_argument(
@@ -188,6 +277,14 @@ def main() -> int:
             league=args.league,
             season=args.season,
             currency=args.currency,
+            limit=args.limit,
+            output_path=args.output,
+        )
+    if entity in PRODUCTS:
+        return _run_product(
+            entity=entity,
+            league=args.league,
+            season=args.season,
             limit=args.limit,
             output_path=args.output,
         )
