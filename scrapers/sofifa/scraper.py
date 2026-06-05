@@ -146,6 +146,90 @@ class SoFIFAScraper(SoccerdataScraper):
             logger.error(f"Error reading player ratings: {e}")
             return None
 
+    def read_team_ratings(self) -> Optional[pd.DataFrame]:
+        """Read per-team FIFA ratings (overall/attack/midfield/defence + the
+        build-up / chance-creation / defence sub-ratings).
+
+        One league-level page lists every team, so this is a single FlareSolverr
+        request — well below the per-session tab-crash ceiling.
+        """
+        reader = self._get_reader()
+        logger.info("Fetching SoFIFA team ratings")
+        try:
+            df = self._execute_with_resilience(reader.read_team_ratings)
+            if df is not None and not df.empty:
+                df = df.reset_index()
+                # The team-ratings page carries no team_id; enrich it from the
+                # teams lookup (same session) so the column is not all-NULL.
+                df = self._enrich_team_id(df, reader)
+                df = self._add_metadata(df, 'team_ratings')
+            return df
+        except Exception as e:
+            logger.error(f"Error reading team ratings: {e}")
+            return None
+
+    @staticmethod
+    def _enrich_team_id(df: pd.DataFrame, reader) -> pd.DataFrame:
+        """Left-join sofifa ``team_id`` onto a team-level frame via read_teams.
+
+        team_ratings/team pages share (league, team, fifa_edition) but only the
+        teams listing exposes team_id. Best-effort: on any failure the frame is
+        returned unchanged (team_id simply stays absent).
+        """
+        if 'team_id' in df.columns:
+            return df
+        try:
+            teams = reader.read_teams()
+            if teams is None or teams.empty:
+                return df
+            teams = teams.reset_index()
+            if 'team_id' not in teams.columns:
+                return df
+            keys = [c for c in ('league', 'team', 'fifa_edition')
+                    if c in df.columns and c in teams.columns]
+            if not keys:
+                return df
+            lookup = teams[keys + ['team_id']].drop_duplicates(keys)
+            return df.merge(lookup, on=keys, how='left')
+        except Exception as e:
+            logger.warning(f"team_id enrichment skipped: {e}")
+            return df
+
+    def read_versions(self) -> Optional[pd.DataFrame]:
+        """Read the SoFIFA catalogue of FIFA releases + rating updates.
+
+        Single request — the full editions list (version_id per fifa_edition /
+        update). Lets downstream resolve a version label to its sofifa id.
+        """
+        reader = self._get_reader()
+        logger.info("Fetching SoFIFA versions catalogue")
+        try:
+            df = self._execute_with_resilience(reader.read_versions)
+            if df is not None and not df.empty:
+                df = df.reset_index()
+                df = self._add_metadata(df, 'versions')
+            return df
+        except Exception as e:
+            logger.error(f"Error reading versions: {e}")
+            return None
+
+    def read_leagues(self) -> Optional[pd.DataFrame]:
+        """Read the league -> sofifa league_id lookup for the selected leagues.
+
+        Single request. Small reference table (one row per configured league).
+        """
+        reader = self._get_reader()
+        logger.info("Fetching SoFIFA leagues lookup")
+        try:
+            df = self._execute_with_resilience(reader.read_leagues)
+            if df is not None and not df.empty:
+                df = df.reset_index()
+                df = self._add_metadata(df, 'leagues')
+            return df
+        except Exception as e:
+            logger.error(f"Error reading leagues: {e}")
+            return None
+
     def _process_player_data(self, df: pd.DataFrame) -> pd.DataFrame:
         """
         Process and clean player data.
@@ -286,6 +370,52 @@ class SoFIFAScraper(SoccerdataScraper):
 
         return {}
 
+    def scrape_team_ratings(self) -> Dict[str, str]:
+        """Scrape per-team FIFA ratings to sofifa_team_ratings."""
+        df = self.read_team_ratings()
+        if df is not None and not df.empty:
+            part = ['fifa_edition'] if 'fifa_edition' in df.columns else None
+            table_path = self.save_to_iceberg(
+                df=df,
+                table_name='sofifa_team_ratings',
+                partition_cols=part,
+                replace_partitions=part,
+            )
+            return {'team_ratings': table_path}
+        return {}
+
+    def scrape_versions(self) -> Dict[str, str]:
+        """Scrape the FIFA editions catalogue to sofifa_versions."""
+        df = self.read_versions()
+        if df is not None and not df.empty:
+            part = ['fifa_edition'] if 'fifa_edition' in df.columns else None
+            table_path = self.save_to_iceberg(
+                df=df,
+                table_name='sofifa_versions',
+                partition_cols=part,
+                replace_partitions=part,
+            )
+            return {'versions': table_path}
+        return {}
+
+    def scrape_leagues(self) -> Dict[str, str]:
+        """Scrape the league -> sofifa league_id lookup to sofifa_leagues.
+
+        No ``fifa_edition`` column, so it is unpartitioned; replace on the
+        ``league`` key to keep weekly runs idempotent (no append-duplication).
+        """
+        df = self.read_leagues()
+        if df is not None and not df.empty:
+            repl = ['league'] if 'league' in df.columns else None
+            table_path = self.save_to_iceberg(
+                df=df,
+                table_name='sofifa_leagues',
+                partition_cols=None,
+                replace_partitions=repl,
+            )
+            return {'leagues': table_path}
+        return {}
+
     def scrape_all(self) -> Dict[str, str]:
         """
         Scrape all SoFIFA data.
@@ -304,6 +434,13 @@ class SoFIFAScraper(SoccerdataScraper):
         # Scrape teams
         team_results = self.scrape_teams()
         results.update(team_results)
+
+        # Scrape team ratings
+        results.update(self.scrape_team_ratings())
+
+        # Scrape versions catalogue + leagues lookup (cheap, single request each)
+        results.update(self.scrape_versions())
+        results.update(self.scrape_leagues())
 
         # Scrape per-player attribute ratings (issue #42)
         ratings_results = self.scrape_player_ratings()

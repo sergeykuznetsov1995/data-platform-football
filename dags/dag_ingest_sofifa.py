@@ -57,6 +57,9 @@ def validate_data(**context) -> Dict[str, Any]:
         'summary': {
             'players_rows': scrape_result.get('players_rows', 0),
             'teams_rows': scrape_result.get('teams_rows', 0),
+            'team_ratings_rows': scrape_result.get('team_ratings_rows', 0),
+            'versions_rows': scrape_result.get('versions_rows', 0),
+            'leagues_rows': scrape_result.get('leagues_rows', 0),
             'player_ratings_rows': scrape_result.get('player_ratings_rows', 0),
             'tables': scrape_result.get('tables', []),
         }
