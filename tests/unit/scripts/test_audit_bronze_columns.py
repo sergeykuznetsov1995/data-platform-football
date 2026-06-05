@@ -282,3 +282,20 @@ def test_matchhistory_contract_lists_all_tables(table):
 ])
 def test_sofifa_contract_lists_all_six_tables(table):
     assert table in mod.EXPECTED_TABLES['sofifa']
+
+
+# --- Transfermarkt contract presence guard (#285) --------------------------
+# Regression guard: all 3 Transfermarkt bronze tables must stay in the contract
+# so the --source transfermarkt audit keeps verifying full coverage. MVP scope =
+# ENG-Premier League only (TM_LEAGUE_MAP). All 3 materialise + non-empty live
+# (verified 2026-06-05, #285): players 555, market_value_history 2121,
+# transfers 750 rows on ('ENG-Premier League','2526'). 0 all-NULL columns ->
+# no EXPECTED_NULL entry. Sparse-by-design (NOT drift): transfers.fee_eur 176/750
+# (free transfers), transfers.market_value_eur 435/750.
+@pytest.mark.parametrize('table', [
+    'transfermarkt_players',
+    'transfermarkt_market_value_history',
+    'transfermarkt_transfers',
+])
+def test_transfermarkt_contract_lists_all_three_tables(table):
+    assert table in mod.EXPECTED_TABLES['transfermarkt']

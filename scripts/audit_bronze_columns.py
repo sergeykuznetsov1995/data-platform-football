@@ -512,7 +512,27 @@ EXPECTED_TABLES: dict[str, dict[str, set[str]]] = {
             'league', 'league_id', *META_COLS,
         },
     },
-    # 'transfermarkt': {...}, 'capology': {...}  -> #285-#286
+    'transfermarkt': {
+        # 3 tables, ENG-PL MVP only (TM_LEAGUE_MAP). Verified live 2026-06-05
+        # (#285): players 555, market_value_history 2121, transfers 750 rows on
+        # ('ENG-Premier League','2526'). 0 all-NULL columns -> no EXPECTED_NULL.
+        # Minimal required set (identity keys + core metrics); extra live columns
+        # are NOT errors. Sparse-by-design (NOT all-NULL): transfers.fee_eur
+        # 176/750 (free transfers), transfers.market_value_eur 435/750.
+        'transfermarkt_players': {
+            'league', 'season', 'player_id', 'name', 'position', 'nationality',
+            'market_value_eur', 'current_club_id', 'current_club_name', *META_COLS,
+        },
+        'transfermarkt_market_value_history': {
+            'league', 'season', 'player_id', 'mv_date', 'value_eur', 'club_name',
+            *META_COLS,
+        },
+        'transfermarkt_transfers': {
+            'league', 'season', 'player_id', 'transfer_date', 'from_club_id',
+            'to_club_id', 'fee_text', 'is_upcoming', *META_COLS,
+        },
+    },
+    # 'capology': {...}  -> #286
 }
 
 # Tables a source's contract names but that are intentionally NOT materialised
