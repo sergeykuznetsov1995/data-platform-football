@@ -50,13 +50,8 @@ EXPECTED_NULL: dict[str, set[str]] = {
         # raw HTML table). Verified 2026-06-03 (#276).
         'notes',
     },
-    'matchhistory_games': {
-        # 31 dropped bookmakers (Betfair, William Hill, 1xBet, VC, IW, SJ, SO, LB, GB, SB, BS)
-        'bfh', 'bfd', 'bfa', 'whh', 'whd', 'wha', '1xbh', '1xbd', '1xba',
-        'vch', 'vcd', 'vca', 'iwh', 'iwd', 'iwa', 'sjh', 'sjd', 'sja',
-        'soh', 'sod', 'soa', 'lbh', 'lbd', 'lba', 'gbh', 'gbd', 'gba',
-        'sbh', 'sbd', 'sba', 'bsh',  # bsd/bsa removed at some point — verify
-    },
+    # matchhistory_games removed (#307: legacy table dropped). matchhistory_results
+    # has 0 all-NULL columns (verified 2026-06-04, #282) → no allowlist needed.
     'espn_matchsheet': {'capacity'},
     'sofifa_team_ratings': {
         # sofifa.com removed these data-col cells from team page (FC 26, verified 2026-05-14).
@@ -453,8 +448,8 @@ EXPECTED_TABLES: dict[str, dict[str, set[str]]] = {
         # 1 table, partitioned ['league','season']. Минимальный контракт = identity +
         # core match stats + META_COLS. Широкие odds-колонки (odds_home_b365, maxh, ...) —
         # extra live cols, НЕ ошибки. 0 all-NULL колонок live (verified 2026-06-04, #282).
-        # ВНИМАНИЕ дрейф: silver всё ещё читает старую matchhistory_games (raw cols,
-        # заморожена 2026-05-07) — followup-issue, не в scope #282.
+        # #307 RESOLVED: silver мигрирован на matchhistory_results, legacy
+        # matchhistory_games дропнут — дрейфа больше нет.
         'matchhistory_results': {
             'league', 'season', 'match_date', 'home_team', 'away_team',
             'home_goals', 'away_goals', 'result',

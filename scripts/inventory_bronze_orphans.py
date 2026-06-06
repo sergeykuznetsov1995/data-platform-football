@@ -52,12 +52,10 @@ EXTRA_PRODUCED: set[str] = {
 # Producer-orphans (no active writer) that MUST NOT be dropped because live
 # Silver SQL still READS them. Dropping would break Silver with TABLE_NOT_FOUND.
 # Each entry is blocked behind the issue that migrates the reader off it.
-#   - matchhistory_games: frozen 2026-05-07, producer now writes
-#     matchhistory_results; xref_match / xref_team / xref_referee /
-#     matchhistory_match_odds Silver SQL still read the old name. Blocked by #307.
-BLOCKED_ORPHANS: dict[str, str] = {
-    'matchhistory_games': 'live Silver readers — blocked by #307',
-}
+#   - (empty) matchhistory_games was migrated off by #307 — all four Silver
+#     consumers (xref_match / xref_team / xref_referee / matchhistory_match_odds)
+#     now read matchhistory_results, so games is a plain droppable orphan.
+BLOCKED_ORPHANS: dict[str, str] = {}
 
 
 def build_keep_set() -> set[str]:

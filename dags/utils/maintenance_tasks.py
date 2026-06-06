@@ -65,7 +65,7 @@ HIGH_CHURN_BRONZE: Tuple[str, ...] = (
     "understat_players",
     "understat_schedule",
     "understat_team_match_stats",
-    "matchhistory_games",
+    "matchhistory_results",  # #307: was matchhistory_games (legacy table dropped)
     # #266: daily fotmob/sofascore/espn writers were never on the list and
     # bloated to multi-GB metadata (fotmob_match_details hit 7.2G / 154M data).
     "fotmob_match_details",

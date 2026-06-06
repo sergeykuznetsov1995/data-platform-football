@@ -254,8 +254,8 @@ def test_clubelo_contract_lists_all_three_tables(table):
 # --- MatchHistory contract presence guard (#282) ---------------------------
 # Regression guard: единственная MatchHistory bronze-таблица должна оставаться в
 # контракте, чтобы --source matchhistory продолжал проверять покрытие. matchhistory_results
-# материализуется и не пустая live (verified 2026-06-04, #282): 1439 строк, сезон 2025.
-# 0 all-NULL колонок. Известный дрейф: silver читает legacy matchhistory_games (followup).
+# материализуется и не пустая live (verified 2026-06-04, #282): сезоны 2021-2025, ~380/сезон.
+# 0 all-NULL колонок. #307 RESOLVED: silver мигрирован на matchhistory_results, games дропнут.
 @pytest.mark.parametrize('table', [
     'matchhistory_results',
 ])
