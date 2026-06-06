@@ -1,0 +1,117 @@
+# =============================================================================
+# OpenMetadata description: iceberg.bronze.whoscored_schedule
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.bronze.whoscored_schedule
+  description: |
+    Сырое расписание матчей из WhoScored (soccerdata WhoScored.read_schedule
+    через FlareSolverr). Grain — один row на матч (wide-формат: home_* / away_*
+    в одной строке). Несёт итоговый счёт, карточки, team_id обеих сторон,
+    флаги состояния матча и JSON-поля incidents/bets. Служит источником
+    (game_id, league, season, game) для последующего scrape событий.
+    Партиционирование ['league','season'].
+  tags:
+    - Tier.Bronze
+    - Domain.Football
+    - PII.None
+columns:
+  - name: league
+    description: Лига (e.g. 'ENG-Premier League'); partition key.
+  - name: season
+    description: Сезон в формате WhoScored 'YYZZ' (e.g. '2425'); partition key.
+  - name: game
+    description: Строковый идентификатор матча WhoScored (slug).
+  - name: stage_id
+    description: Идентификатор стадии турнира WhoScored.
+  - name: game_id
+    description: Числовой WhoScored match_id (bigint).
+  - name: status
+    description: Числовой код статуса матча WhoScored.
+  - name: start_time
+    description: Время начала матча (строка из WhoScored).
+  - name: home_team_id
+    description: WhoScored team_id домашней команды.
+  - name: home_team
+    description: Название домашней команды.
+  - name: home_yellow_cards
+    description: Жёлтые карточки домашней команды (итог матча).
+  - name: home_red_cards
+    description: Красные карточки домашней команды (итог матча).
+  - name: away_team_id
+    description: WhoScored team_id гостевой команды.
+  - name: away_team
+    description: Название гостевой команды.
+  - name: away_yellow_cards
+    description: Жёлтые карточки гостевой команды (итог матча).
+  - name: away_red_cards
+    description: Красные карточки гостевой команды (итог матча).
+  - name: has_incidents_summary
+    description: Есть ли сводка инцидентов матча.
+  - name: has_preview
+    description: Есть ли превью матча на WhoScored.
+  - name: score_changed_at
+    description: Метка времени последнего изменения счёта (строка).
+  - name: elapsed
+    description: Прошедшее игровое время / статус хода матча (строка).
+  - name: last_scorer
+    description: Идентификатор последнего забившего (double).
+  - name: is_top_match
+    description: Флаг «топ-матч» по версии WhoScored.
+  - name: home_team_country_code
+    description: ISO-код страны домашней команды (константа на уровне лиги).
+  - name: away_team_country_code
+    description: ISO-код страны гостевой команды (константа на уровне лиги).
+  - name: comment_count
+    description: Количество комментариев к матчу на WhoScored.
+  - name: is_lineup_confirmed
+    description: Подтверждён ли стартовый состав.
+  - name: is_stream_available
+    description: Доступна ли трансляция (константа на уровне лиги).
+  - name: match_is_opta
+    description: Есть ли по матчу Opta-данные событий (константа на уровне лиги).
+  - name: home_team_country_name
+    description: Название страны домашней команды (константа на уровне лиги).
+  - name: away_team_country_name
+    description: Название страны гостевой команды (константа на уровне лиги).
+  - name: date
+    description: Дата и время начала матча (timestamp).
+  - name: home_score
+    description: Голы домашней команды (итог матча).
+  - name: away_score
+    description: Голы гостевой команды (итог матча).
+  - name: incidents
+    description: Список инцидентов/событий матча, сериализованный в JSON-строку.
+  - name: bets
+    description: Букмекерские коэффициенты в JSON-строке (~99.6% NULL).
+  - name: aggregate_winner_field
+    description: Победитель по сумме двух матчей (обычно NULL; только для двухматчевых стадий).
+  - name: winner_field
+    description: Идентификатор победителя матча (double).
+  - name: period
+    description: Числовой код игрового периода WhoScored.
+  - name: extra_result_field
+    description: Доп. детали результата (обычно NULL; ET/пенальти).
+  - name: home_extratime_score
+    description: Счёт домашней команды в дополнительное время (обычно NULL).
+  - name: away_extratime_score
+    description: Счёт гостевой команды в дополнительное время (обычно NULL).
+  - name: home_penalty_score
+    description: Счёт домашней команды в серии пенальти (обычно NULL).
+  - name: away_penalty_score
+    description: Счёт гостевой команды в серии пенальти (обычно NULL).
+  - name: started_at_utc
+    description: Время старта матча в UTC (строка).
+  - name: first_half_ended_at_utc
+    description: Время окончания первого тайма в UTC (строка).
+  - name: second_half_started_at_utc
+    description: Время начала второго тайма в UTC (строка).
+  - name: stage
+    description: Название стадии турнира (обычно NULL для лиг).
+  - name: _source
+    description: Источник данных ('whoscored'); метаколонка Bronze.
+  - name: _entity_type
+    description: Тип сущности в Bronze; метаколонка.
+  - name: _ingested_at
+    description: Timestamp ingest'а строки в Bronze; метаколонка.
+  - name: _batch_id
+    description: Идентификатор батча ingest'а; метаколонка.
