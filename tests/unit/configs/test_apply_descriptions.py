@@ -85,6 +85,50 @@ def test_dry_run_renders_patches(monkeypatch) -> None:
     )
 
 
+def _import_apply():
+    if str(APPLY_DIR) not in sys.path:
+        sys.path.insert(0, str(APPLY_DIR))
+    sys.modules.pop("apply_descriptions", None)
+    try:
+        import apply_descriptions
+    except ImportError as exc:  # pragma: no cover
+        pytest.skip(f"apply_descriptions imports unavailable dep: {exc}")
+    return apply_descriptions
+
+
+def test_build_patch_emits_column_tags() -> None:
+    """build_patch must render a /columns/{idx}/tags op for YAML column tags (#351)."""
+    mod = _import_apply()
+    spec = {
+        "table": {"fullyQualifiedName": "x", "description": "d", "tags": ["Tier.Bronze"]},
+        "columns": [{"name": "player", "description": "Имя игрока.", "tags": ["PII.Low"]}],
+    }
+    current = {"description": "", "tags": [], "columns": [{"name": "player", "description": "", "tags": []}]}
+
+    ops = mod.build_patch(spec, current)
+    tag_ops = [o for o in ops if o["path"] == "/columns/0/tags"]
+    assert len(tag_ops) == 1, f"expected one column-tags op, got ops={ops}"
+    assert tag_ops[0]["value"] == [
+        {"tagFQN": "PII.Low", "labelType": "Manual", "state": "Confirmed", "source": "Classification"}
+    ]
+
+
+def test_build_patch_column_tags_idempotent() -> None:
+    """No column-tags op when the desired tag is already present (#351)."""
+    mod = _import_apply()
+    spec = {
+        "table": {"fullyQualifiedName": "x", "description": "d", "tags": ["Tier.Bronze"]},
+        "columns": [{"name": "player", "tags": ["PII.Low"]}],
+    }
+    current = {
+        "description": "d", "tags": [{"tagFQN": "Tier.Bronze"}],
+        "columns": [{"name": "player", "description": "", "tags": [{"tagFQN": "PII.Low"}]}],
+    }
+
+    ops = mod.build_patch(spec, current)
+    assert not [o for o in ops if o["path"] == "/columns/0/tags"], f"should be idempotent, got {ops}"
+
+
 def test_required_fields() -> None:
     """Each YAML must define table.fullyQualifiedName + description + tags(list)."""
     files = sorted(DESCRIPTIONS_DIR.glob("*.yaml"))

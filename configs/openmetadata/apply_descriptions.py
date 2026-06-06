@@ -58,17 +58,29 @@ def build_patch(spec: dict[str, Any], current: dict[str, Any]) -> list[dict[str,
         op = "replace" if current.get("tags") else "add"
         ops.append({"op": op, "path": "/tags", "value": tag_objs})
 
-    # Per-column descriptions: only patch columns the YAML knows about.
-    yaml_cols = {c["name"]: c.get("description", "") for c in (spec.get("columns") or [])}
+    # Per-column descriptions + tags: only patch columns the YAML knows about.
+    yaml_cols = {c["name"]: c for c in (spec.get("columns") or []) if c.get("name")}
     current_cols = current.get("columns") or []
     for idx, col in enumerate(current_cols):
-        name = col.get("name")
-        if name in yaml_cols and yaml_cols[name]:
+        spec_col = yaml_cols.get(col.get("name"))
+        if not spec_col:
+            continue
+
+        new = spec_col.get("description") or ""
+        if new:
             existing = col.get("description") or ""
-            new = yaml_cols[name]
             if existing.strip() != new.strip():
                 op = "replace" if existing else "add"
                 ops.append({"op": op, "path": f"/columns/{idx}/description", "value": new})
+
+        col_tags = spec_col.get("tags") or []
+        if col_tags:
+            existing_tags = col.get("tags") or []
+            existing_fqns = {t.get("tagFQN") for t in existing_tags}
+            if not set(col_tags).issubset(existing_fqns):
+                tag_objs = [{"tagFQN": t, "labelType": "Manual", "state": "Confirmed", "source": "Classification"} for t in col_tags]
+                op = "replace" if existing_tags else "add"
+                ops.append({"op": op, "path": f"/columns/{idx}/tags", "value": tag_objs})
     return ops
 
 
