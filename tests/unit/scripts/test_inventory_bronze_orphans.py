@@ -107,12 +107,12 @@ def test_find_orphans_empty_live_returns_empty():
     assert mod.find_orphans([], mod.build_keep_set()) == []
 
 
-def test_classify_orphans_blocks_matchhistory_games():
-    # matchhistory_games has no producer but live Silver readers (issue #307):
-    # it must be reported as blocked, never as droppable.
+def test_classify_orphans_matchhistory_games_now_droppable():
+    # #307 migrated all Silver readers off matchhistory_games → it is no longer
+    # in BLOCKED_ORPHANS and classifies as a plain droppable orphan.
     mod = _load_module()
     droppable, blocked = mod.classify_orphans(
         ['fbref_player_passing', 'matchhistory_games', 'fbref_team_defense']
     )
-    assert droppable == ['fbref_player_passing', 'fbref_team_defense']
-    assert blocked == ['matchhistory_games']
+    assert droppable == ['fbref_player_passing', 'matchhistory_games', 'fbref_team_defense']
+    assert blocked == []

@@ -2,7 +2,7 @@
 Unit tests for the matchhistory → fct_match_odds bridge pipeline (E4.5).
 
 Pipeline under test:
-  bronze.matchhistory_games → silver.matchhistory_match_odds (inline
+  bronze.matchhistory_results → silver.matchhistory_match_odds (inline
                               team_aliases CTE → INNER JOIN gold.dim_match)
                             → gold.fct_match_odds (passthrough + canonical-trio)
 
@@ -16,12 +16,15 @@ We exercise:
   * closing_flag detection on the PSCH/PSCD/PSCA closing 1x2 columns.
   * Numeric typing — DECIMAL(6,3) odds parse without overflow.
 
-The matchhistory_games bronze table has many wide odds columns ("b365>2.5"
-etc.) — DuckDB accepts ASCII operators inside double-quoted identifiers
-identically to Trino. The 30-row tall format is 6 1x2-open + 6 1x2-closing
-+ 4 ah-open + 4 ah-closing + 4 ou-open + 4 ou-closing — but the WHERE drops
-all-NULL bookmaker rows; we seed numeric odds only for B365 / PS / WH /
-VC / IW / BW (the 6 1x2 books) so the assertion is on the populated subset.
+#307: source switched from frozen bronze.matchhistory_games (raw football-data
+column names) to live bronze.matchhistory_results. COLUMN_MAPPING renames ~50
+cols (date→match_date, hometeam→home_team, B365H→odds_home_b365, …) and leaves
+the rest raw (iw*, *closing, ah*, OU "b365>2.5"). This simulated bronze table
+mirrors that mixed naming. DuckDB accepts ASCII operators inside double-quoted
+identifiers identically to Trino. The 30-row tall format is 6 1x2-open + 6
+1x2-closing + 4 ah-open + 4 ah-closing + 4 ou-open + 4 ou-closing — but the
+WHERE drops all-NULL bookmaker rows; we seed numeric odds only for B365 / PS /
+WH / VC / IW / BW (the 6 1x2 books) so the assertion is on the populated subset.
 """
 
 from __future__ import annotations
@@ -81,7 +84,7 @@ def _collapse_call(sql: str, fn_name: str) -> str:
 
 
 _ICEBERG_TO_LOCAL = {
-    "iceberg.bronze.matchhistory_games":      "bronze_matchhistory_games",
+    "iceberg.bronze.matchhistory_results":    "bronze_matchhistory_results",
     "iceberg.gold.dim_match":                 "gold_dim_match",
     "iceberg.silver.matchhistory_match_odds": "silver_matchhistory_match_odds",
 }
@@ -93,6 +96,8 @@ def _translate(sql: str) -> str:
     sql = _collapse_call(sql, "to_utf8")
     sql = _collapse_call(sql, "to_hex")
     sql = re.sub(r"\bxxhash64\b", "md5", sql, flags=re.IGNORECASE)
+    # Trino date_parse(x, fmt) → DuckDB strptime(x, fmt) (same %d/%m/%Y codes).
+    sql = re.sub(r"\bdate_parse\b", "strptime", sql, flags=re.IGNORECASE)
     sql = sql.replace("timestamp(6)", "timestamp")
     return sql
 
@@ -110,15 +115,17 @@ def duck_conn():
     con.close()
 
 
-# All MatchHistory bronze odds columns observed in the SELECT (~50 cols).
+# MatchHistory bronze odds columns observed in the SELECT, using the
+# matchhistory_results physical names (#307): the 1x2-open books B365/BW/PS/WH/VC
+# are renamed via COLUMN_MAPPING; IW + all closing/AH/OU stay raw.
 _MH_COLUMNS = [
-    "date", "hometeam", "awayteam", "league", "season", "_ingested_at",
-    "b365h", "b365d", "b365a",
-    "bwh",   "bwd",   "bwa",
+    "match_date", "home_team", "away_team", "league", "season", "_ingested_at",
+    "odds_home_b365", "odds_draw_b365", "odds_away_b365",
+    "odds_home_bw",   "odds_draw_bw",   "odds_away_bw",
     "iwh",   "iwd",   "iwa",
-    "psh",   "psd",   "psa",
-    "whh",   "whd",   "wha",
-    "vch",   "vcd",   "vca",
+    "odds_home_ps",   "odds_draw_ps",   "odds_away_ps",
+    "odds_home_wh",   "odds_draw_wh",   "odds_away_wh",
+    "odds_home_vc",   "odds_draw_vc",   "odds_away_vc",
     "b365ch", "b365cd", "b365ca",
     "bwch",   "bwcd",   "bwca",
     "iwch",   "iwcd",   "iwca",
@@ -149,9 +156,9 @@ _MH_COLUMNS = [
 def _create_mh_table(con) -> None:
     cols_ddl = []
     for c in _MH_COLUMNS:
-        if c == "date":
-            cols_ddl.append(f'"{c}" TIMESTAMP')
-        elif c in ("hometeam", "awayteam", "league"):
+        # match_date is raw 'DD/MM/YYYY' varchar in matchhistory_results (#307),
+        # parsed via date_parse in the silver SQL — keep it VARCHAR here.
+        if c in ("match_date", "home_team", "away_team", "league"):
             cols_ddl.append(f'"{c}" VARCHAR')
         elif c == "season":
             cols_ddl.append(f'"{c}" BIGINT')
@@ -159,13 +166,13 @@ def _create_mh_table(con) -> None:
             cols_ddl.append(f'"{c}" TIMESTAMP')
         else:
             cols_ddl.append(f'"{c}" DOUBLE')
-    con.execute(f"CREATE TABLE bronze_matchhistory_games ({', '.join(cols_ddl)})")
+    con.execute(f"CREATE TABLE bronze_matchhistory_results ({', '.join(cols_ddl)})")
 
 
 @pytest.fixture(autouse=True)
 def _reset_schemas(duck_conn):
     for tbl in (
-        "bronze_matchhistory_games",
+        "bronze_matchhistory_results",
         "gold_dim_match",
         "silver_matchhistory_match_odds",
     ):
@@ -207,33 +214,37 @@ def _mh_row(
     vch: float = 2.10,  vcd: float = 3.30,  vca: float = 3.45,
     psch: float = 2.20, pscd: float = 3.25, psca: float = 3.40,
 ) -> List[Any]:
-    """Build a row matching _MH_COLUMNS order. Most odds default to NULL."""
+    """Build a row matching _MH_COLUMNS order. Most odds default to NULL.
+
+    Seed kwargs keep the short football-data names (b365h, …) for readability;
+    they map to the renamed matchhistory_results physical columns below.
+    """
     values = [None] * len(_MH_COLUMNS)
     idx = {c: i for i, c in enumerate(_MH_COLUMNS)}
-    values[idx["date"]] = date
-    values[idx["hometeam"]] = home
-    values[idx["awayteam"]] = away
+    values[idx["match_date"]] = date
+    values[idx["home_team"]] = home
+    values[idx["away_team"]] = away
     values[idx["league"]] = league
     values[idx["season"]] = season
     values[idx["_ingested_at"]] = "2026-05-08 12:00:00"
-    values[idx["b365h"]] = b365h
-    values[idx["b365d"]] = b365d
-    values[idx["b365a"]] = b365a
-    values[idx["bwh"]] = bwh
-    values[idx["bwd"]] = bwd
-    values[idx["bwa"]] = bwa
+    values[idx["odds_home_b365"]] = b365h
+    values[idx["odds_draw_b365"]] = b365d
+    values[idx["odds_away_b365"]] = b365a
+    values[idx["odds_home_bw"]] = bwh
+    values[idx["odds_draw_bw"]] = bwd
+    values[idx["odds_away_bw"]] = bwa
     values[idx["iwh"]] = iwh
     values[idx["iwd"]] = iwd
     values[idx["iwa"]] = iwa
-    values[idx["psh"]] = psh
-    values[idx["psd"]] = psd
-    values[idx["psa"]] = psa
-    values[idx["whh"]] = whh
-    values[idx["whd"]] = whd
-    values[idx["wha"]] = wha
-    values[idx["vch"]] = vch
-    values[idx["vcd"]] = vcd
-    values[idx["vca"]] = vca
+    values[idx["odds_home_ps"]] = psh
+    values[idx["odds_draw_ps"]] = psd
+    values[idx["odds_away_ps"]] = psa
+    values[idx["odds_home_wh"]] = whh
+    values[idx["odds_draw_wh"]] = whd
+    values[idx["odds_away_wh"]] = wha
+    values[idx["odds_home_vc"]] = vch
+    values[idx["odds_draw_vc"]] = vcd
+    values[idx["odds_away_vc"]] = vca
     values[idx["psch"]] = psch
     values[idx["pscd"]] = pscd
     values[idx["psca"]] = psca
@@ -244,14 +255,15 @@ def _seed_corpus(duck_conn) -> None:
     """5 matches with naming variations + matching dim_match rows."""
     placeholders = ", ".join(["?"] * len(_MH_COLUMNS))
     cols_quoted = ", ".join(f'"{c}"' for c in _MH_COLUMNS)
-    insert_sql = f'INSERT INTO bronze_matchhistory_games ({cols_quoted}) VALUES ({placeholders})'
+    insert_sql = f'INSERT INTO bronze_matchhistory_results ({cols_quoted}) VALUES ({placeholders})'
 
+    # match_date seeded as raw football-data 'DD/MM/YYYY' (matches dim_match ISO dates after parse).
     rows = [
-        _mh_row(date="2024-08-15", home="Wolves",          away="Tottenham"),
-        _mh_row(date="2024-09-01", home="Wolverhampton",   away="Spurs"),
-        _mh_row(date="2024-10-05", home="Manchester Utd",  away="Nott'm Forest"),
-        _mh_row(date="2024-11-10", home="Manchester United", away="Nottingham Forest"),
-        _mh_row(date="2024-12-15", home="Newcastle Utd",   away="West Ham"),
+        _mh_row(date="15/08/2024", home="Wolves",          away="Tottenham"),
+        _mh_row(date="01/09/2024", home="Wolverhampton",   away="Spurs"),
+        _mh_row(date="05/10/2024", home="Manchester Utd",  away="Nott'm Forest"),
+        _mh_row(date="10/11/2024", home="Manchester United", away="Nottingham Forest"),
+        _mh_row(date="15/12/2024", home="Newcastle Utd",   away="West Ham"),
     ]
     for r in rows:
         duck_conn.execute(insert_sql, r)

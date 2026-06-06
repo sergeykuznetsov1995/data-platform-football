@@ -251,7 +251,7 @@ class TestXrefTeamRendered:
         # Sample the most fingerprint-distinctive bronze tables.
         for tbl in [
             "iceberg.bronze.fbref_schedule",
-            "iceberg.bronze.matchhistory_games",
+            "iceberg.bronze.matchhistory_results",
             "iceberg.bronze.clubelo_ratings",
             "iceberg.bronze.transfermarkt_players",
             "iceberg.bronze.capology_player_salaries",

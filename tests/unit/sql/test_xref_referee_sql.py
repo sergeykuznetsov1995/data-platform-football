@@ -113,7 +113,7 @@ class TestXrefRefereeTemplateStructure:
     def test_reads_bronze_only(self):
         sql = _read_template().lower()
         assert "iceberg.bronze.fbref_schedule" in sql
-        assert "iceberg.bronze.matchhistory_games" in sql
+        assert "iceberg.bronze.matchhistory_results" in sql
         assert "iceberg.gold." not in sql
 
 
@@ -142,4 +142,4 @@ class TestXrefRefereeRender:
     def test_references_both_bronze_tables(self):
         rendered = self._render()
         assert "iceberg.bronze.fbref_schedule" in rendered
-        assert "iceberg.bronze.matchhistory_games" in rendered
+        assert "iceberg.bronze.matchhistory_results" in rendered
