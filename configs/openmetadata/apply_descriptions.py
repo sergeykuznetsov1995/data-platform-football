@@ -139,7 +139,9 @@ def process_file(path: Path, host: str, headers: dict[str, str], dry_run: bool, 
         counter["applied"] += 1
         return
 
-    r = requests.get(f"{host}/api/v1/tables/name/{fqn}", headers=headers, timeout=15)
+    # Request column/table tags explicitly — without ?fields they are omitted,
+    # which would make the column-tag idempotency check re-emit ops every run.
+    r = requests.get(f"{host}/api/v1/tables/name/{fqn}", headers=headers, params={"fields": "columns,tags"}, timeout=15)
     if r.status_code == 401:
         raise SystemExit("ERROR: HTTP 401 — bad/missing OPENMETADATA_JWT_TOKEN. See README.md.")
     if r.status_code == 404:
