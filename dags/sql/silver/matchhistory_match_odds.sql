@@ -19,17 +19,24 @@
 -- Reference: roadmap E4.3 + `configs/medallion/team_aliases.yaml`.
 --
 -- =============================================================================
--- Bronze schema reference (verified via DESCRIBE on 2026-05-08)
+-- Bronze schema reference  (source: iceberg.bronze.matchhistory_results)
 -- =============================================================================
---   Все колонки lowercase. Football-data.co.uk оригинальные имена сохранены
---   (т.е. `b365h`, не `odds_home_b365` — COLUMN_MAPPING в scrapers/matchhistory
---   применяется в pandas-DataFrame, но ingestion в Iceberg идёт ДО переименования).
+--   ВНИМАНИЕ (#307): источник переключён с замороженной legacy
+--   `matchhistory_games` (сырые football-data имена) на живую
+--   `matchhistory_results`. У results СМЕШАННАЯ схема: COLUMN_MAPPING
+--   (scrapers/matchhistory/scraper.py) переименовывает ~50 колонок, остальные
+--   остаются сырыми. Все колонки lowercase.
+--     renamed : Date→match_date, HomeTeam→home_team, AwayTeam→away_team,
+--               B365H→odds_home_b365 (+ BW/PS/WH/VC по 1x2-open).
+--     raw     : iw* (IW нет в mapping), все *closing, все ah*, все OU "b365>2.5".
+--   `mh` CTE алиасит renamed-колонки обратно к legacy-именам (b365h, hometeam …),
+--   поэтому весь downstream ниже не меняется.
 --
---   Identity: date (timestamp(6)), hometeam, awayteam, referee, league,
+--   Identity: match_date (timestamp(6)), home_team, away_team, referee, league,
 --             season (bigint)
---   Score:    fthg, ftag, ftr, hthg, htag, htr  (bigint / varchar)
+--   Score:    home_goals, away_goals, result, …  (bigint / varchar)
 --
---   1x2 open    : b365h/d/a, bwh/d/a, iwh/d/a, psh/d/a, whh/d/a, vch/d/a
+--   1x2 open    : odds_home/draw/away_b365, …_bw, iwh/d/a (raw), …_ps, …_wh, …_vc
 --   1x2 closing : b365ch/cd/ca, bwch/cd/ca, psch/pscd/psca, whch/whcd/whca,
 --                 vcch/vccd/vcca, iwch/iwcd/iwca
 --   AH open     : ahh (handicap line), b365ahh/aha, pahh/paha, maxahh/maxaha,
@@ -192,20 +199,26 @@ WITH team_aliases AS (
 -- =============================================================================
 mh AS (
     SELECT
-        CAST(date AS DATE)              AS match_date,
-        hometeam,
-        awayteam,
+        -- NOTE: bronze.matchhistory_results has MIXED column naming —
+        -- COLUMN_MAPPING (scrapers/matchhistory/scraper.py) renames ~50 cols
+        -- (Date→match_date, HomeTeam→home_team, B365H→odds_home_b365, …) but
+        -- leaves the rest raw (iw*, *closing, ah*, OU "b365>2.5"). We alias the
+        -- renamed physical cols back to the legacy logical names below so the
+        -- ~400 lines of downstream UNION ALL stay untouched.
+        CAST(match_date AS DATE)       AS match_date,
+        home_team                      AS hometeam,
+        away_team                      AS awayteam,
         league,
         season,
         _ingested_at,
 
-        -- ---- 1x2 open ----
-        b365h, b365d, b365a,
-        bwh,   bwd,   bwa,
+        -- ---- 1x2 open (B365/BW/PS/WH/VC renamed via COLUMN_MAPPING; IW raw) ----
+        odds_home_b365 AS b365h, odds_draw_b365 AS b365d, odds_away_b365 AS b365a,
+        odds_home_bw   AS bwh,   odds_draw_bw   AS bwd,   odds_away_bw   AS bwa,
         iwh,   iwd,   iwa,
-        psh,   psd,   psa,
-        whh,   whd,   wha,
-        vch,   vcd,   vca,
+        odds_home_ps   AS psh,   odds_draw_ps   AS psd,   odds_away_ps   AS psa,
+        odds_home_wh   AS whh,   odds_draw_wh   AS whd,   odds_away_wh   AS wha,
+        odds_home_vc   AS vch,   odds_draw_vc   AS vcd,   odds_away_vc   AS vca,
 
         -- ---- 1x2 closing ----
         b365ch, b365cd, b365ca,
@@ -240,10 +253,10 @@ mh AS (
         "pc>2.5"    AS pc_o25,    "pc<2.5"    AS pc_u25,
         "maxc>2.5"  AS maxc_o25,  "maxc<2.5"  AS maxc_u25,
         "avgc>2.5"  AS avgc_o25,  "avgc<2.5"  AS avgc_u25
-    FROM iceberg.bronze.matchhistory_games
-    WHERE hometeam IS NOT NULL
-      AND awayteam IS NOT NULL
-      AND date     IS NOT NULL
+    FROM iceberg.bronze.matchhistory_results
+    WHERE home_team  IS NOT NULL
+      AND away_team  IS NOT NULL
+      AND match_date IS NOT NULL
 ),
 
 -- =============================================================================

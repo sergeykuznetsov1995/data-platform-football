@@ -51,7 +51,7 @@
 --                          (NB: whoscored_events has only `team`, not home/away)
 --   sofascore_schedule    : home_team, away_team, league, season (varchar)
 --   fotmob_schedule       : home_team, away_team, league, season (BIGINT)
---   matchhistory_games    : hometeam, awayteam, league, season (BIGINT)
+--   matchhistory_results  : home_team, away_team (renamed via COLUMN_MAPPING), league, season (BIGINT)
 --                          (NB: lowercase, single-token — NOT CamelCase)
 --   clubelo_ratings       : team, league (no season — see CAST(NULL AS varchar))
 --                          (clubelo_team_history has no league either; we
@@ -126,12 +126,12 @@ raw_teams AS (
       FROM iceberg.bronze.fotmob_schedule WHERE away_team IS NOT NULL
 
     UNION
-    -- ===== matchhistory (lowercase columns: hometeam, awayteam) =====
-    SELECT 'matchhistory' AS source, hometeam AS source_id, league, CAST(season AS varchar) AS season
-      FROM iceberg.bronze.matchhistory_games WHERE hometeam IS NOT NULL
+    -- ===== matchhistory (#307: cols renamed home_team/away_team via COLUMN_MAPPING) =====
+    SELECT 'matchhistory' AS source, home_team AS source_id, league, CAST(season AS varchar) AS season
+      FROM iceberg.bronze.matchhistory_results WHERE home_team IS NOT NULL
     UNION
-    SELECT 'matchhistory' AS source, awayteam AS source_id, league, CAST(season AS varchar) AS season
-      FROM iceberg.bronze.matchhistory_games WHERE awayteam IS NOT NULL
+    SELECT 'matchhistory' AS source, away_team AS source_id, league, CAST(season AS varchar) AS season
+      FROM iceberg.bronze.matchhistory_results WHERE away_team IS NOT NULL
 
     UNION
     -- ===== clubelo (column name is `team`; no season column → NULL) =====

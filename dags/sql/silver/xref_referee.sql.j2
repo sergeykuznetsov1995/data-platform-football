@@ -45,7 +45,7 @@
 -- Bronze column-name reference (verified via DESCRIBE on 2026-06-03)
 -- =============================================================================
 --   fbref_schedule.referee      : varchar (full name, e.g. 'Michael Oliver')
---   matchhistory_games.referee  : varchar ('Initial Surname', e.g. 'M Oliver')
+--   matchhistory_results.referee : varchar ('Initial Surname', e.g. 'M Oliver')
 --   fotmob_match_details.match_facts_json : varchar JSON; referee at
 --       $.infoBox.Referee.text — full name, e.g. 'Michael Oliver' (issue #270).
 --       Bronze keeps N ingest snapshots per match → dedup to latest below.
@@ -81,7 +81,7 @@ raw_refs AS (
     UNION
     SELECT 'matchhistory' AS source, referee AS source_id, league,
            CAST(season AS varchar) AS season
-      FROM iceberg.bronze.matchhistory_games
+      FROM iceberg.bronze.matchhistory_results  -- #307: was matchhistory_games (referee col unchanged)
      WHERE referee IS NOT NULL AND referee <> ''
     UNION
     -- FotMob (issue #270): referee in match_facts_json → $.infoBox.Referee.text.

@@ -47,7 +47,7 @@
 --   understat_schedule    : game_id (BIGINT), date (TIMESTAMP), home_team, away_team (varchar)
 --   sofascore_schedule    : game_id (BIGINT), date (TIMESTAMP), home_team, away_team (varchar)
 --   fotmob_schedule       : match_id (varchar! — NOT game_id), date (varchar), home_team, away_team (varchar), season (BIGINT)
---   matchhistory_games    : NO native match_id, date (TIMESTAMP), hometeam, awayteam (lowercase!), season (BIGINT)
+--   matchhistory_results  : NO native match_id, match_date (TIMESTAMP), home_team, away_team (renamed via COLUMN_MAPPING), season (BIGINT)
 --   espn_schedule         : game_id (BIGINT), NO date column — date prefixed in `game` column (e.g. '2026-01-06 Team-Team'); home_team, away_team (varchar), season (varchar)
 --
 -- Per CLAUDE.md DOUBLE-cast rule: bronze numeric ids stored as DOUBLE need
@@ -210,37 +210,40 @@ fm_resolved AS (
 mh_resolved AS (
     -- MatchHistory has NO native match_id. We synthesise a deterministic
     -- 'mh_<xxhash64>' source_id (mirrors fbref's 'fut_' fallback) keyed on
-    -- (date|hometeam|awayteam|league|season) — the (league, season) terms
-    -- prevent same-day-different-league collisions.
-    -- NB: hometeam/awayteam columns are lowercase single-token (matchhistory
-    -- specific — see xref_team.sql.j2:104-109).
+    -- (match_date|home_team|away_team|league|season) — the (league, season)
+    -- terms prevent same-day-different-league collisions.
+    -- NB: home_team/away_team VALUES are single-token (matchhistory specific —
+    -- e.g. 'Arsenal' not 'Arsenal FC'; see xref_team.sql.j2).
+    -- #307: source switched matchhistory_games → matchhistory_results.
+    -- COLUMN_MAPPING renamed date→match_date, hometeam→home_team,
+    -- awayteam→away_team; team-string VALUES are identical so xref_team JOIN holds.
     SELECT
         'mh_' || LOWER(TO_HEX(XXHASH64(TO_UTF8(
-            CAST(s.date AS varchar)
-            || '|' || COALESCE(LOWER(CAST(s.hometeam AS varchar)), '')
-            || '|' || COALESCE(LOWER(CAST(s.awayteam AS varchar)), '')
+            CAST(s.match_date AS varchar)
+            || '|' || COALESCE(LOWER(CAST(s.home_team AS varchar)), '')
+            || '|' || COALESCE(LOWER(CAST(s.away_team AS varchar)), '')
             || '|' || s.league
             || '|' || CAST(s.season AS varchar)
         ))))                                                           AS source_id,
-        TRY_CAST(s.date AS date)                                       AS match_date,
+        TRY_CAST(s.match_date AS date)                                 AS match_date,
         s.league,
         CAST(s.season AS varchar)                                      AS season,
         xt_h.canonical_id                                              AS home_canonical_id,
         xt_a.canonical_id                                              AS away_canonical_id,
-        CONCAT(CAST(s.hometeam AS varchar), ' vs ',
-               CAST(s.awayteam AS varchar))                            AS display_name
-    FROM iceberg.bronze.matchhistory_games s
+        CONCAT(CAST(s.home_team AS varchar), ' vs ',
+               CAST(s.away_team AS varchar))                           AS display_name
+    FROM iceberg.bronze.matchhistory_results s
     LEFT JOIN iceberg.silver.xref_team xt_h
            ON xt_h.source    = 'matchhistory'
-          AND xt_h.source_id = CAST(s.hometeam AS varchar)
+          AND xt_h.source_id = CAST(s.home_team AS varchar)
           AND xt_h.league    = s.league
           AND xt_h.season    = CAST(s.season AS varchar)
     LEFT JOIN iceberg.silver.xref_team xt_a
            ON xt_a.source    = 'matchhistory'
-          AND xt_a.source_id = CAST(s.awayteam AS varchar)
+          AND xt_a.source_id = CAST(s.away_team AS varchar)
           AND xt_a.league    = s.league
           AND xt_a.season    = CAST(s.season AS varchar)
-    WHERE s.date IS NOT NULL
+    WHERE s.match_date IS NOT NULL
 ),
 
 es_resolved AS (
