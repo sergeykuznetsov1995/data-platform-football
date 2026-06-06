@@ -175,10 +175,10 @@ def test_whoscored_contract_lists_all_four_tables(table):
 # --- ESPN contract presence guard (#279, #298) ------------------------------
 # Regression guard: the 3 ESPN bronze tables must stay in the contract so the
 # --source espn audit keeps verifying full coverage. espn_standings is NOT in
-# the contract — soccerdata's ESPN reader has no read_standings (scraper.py:112
-# returns None), so the table never materialises (would be a permanent
-# false-positive). espn_matchsheet was legacy/ad-hoc but its write-path is now
-# formalized via scripts/backfill_espn_e3_5.py (soccerdata read_matchsheet, #298).
+# the contract — soccerdata's ESPN reader has no read_standings, so the table
+# never materialises (would be a permanent false-positive); the dead scrape
+# path was removed in #354. espn_matchsheet was legacy/ad-hoc but its write-path
+# is now formalized via scripts/backfill_espn_e3_5.py (soccerdata read_matchsheet, #298).
 @pytest.mark.parametrize('table', [
     'espn_schedule',
     'espn_lineup',

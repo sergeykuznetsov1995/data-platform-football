@@ -204,8 +204,9 @@ EXPECTED_TABLES: dict[str, dict[str, set[str]]] = {
             *META_COLS,
         },
         # NOTE: espn_standings is NOT in the contract — soccerdata's ESPN reader
-        # has no read_standings (scraper.py:112 returns None), so the table is
-        # never materialised. Listing it would be a permanent false-positive.
+        # has no read_standings, so the table is never materialised. The dead
+        # scrape path was removed in #354. Listing it here would be a permanent
+        # false-positive.
     },
     'fbref': {
         # Minimal required set per table — identity keys + a few core metrics

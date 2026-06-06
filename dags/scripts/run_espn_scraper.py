@@ -48,7 +48,6 @@ def main():
     results = {
         'tables': [],
         'schedule_rows': 0,
-        'standings_rows': 0,
         'errors': []
     }
 
@@ -74,25 +73,6 @@ def main():
                 logger.error(error_msg)
                 results['errors'].append(error_msg)
 
-            # Scrape standings
-            try:
-                df = scraper.read_standings()
-                if df is not None and not df.empty:
-                    table_path = scraper.save_to_iceberg(
-                        df=df,
-                        table_name='espn_standings',
-                        partition_cols=['league', 'season'],
-                    )
-                    results['tables'].append(table_path)
-                    results['standings_rows'] = len(df)
-                    logger.info(f"Saved {len(df)} standings rows")
-                else:
-                    logger.info("No standings data available")
-            except Exception as e:
-                error_msg = f"Standings scraping failed (may not be available): {e}"
-                logger.warning(error_msg)
-                results['errors'].append(error_msg)
-
     except Exception as e:
         logger.error(f"Scraper failed: {e}", exc_info=True)
         results['errors'].append(str(e))
@@ -104,8 +84,7 @@ def main():
     with open(args.output, 'w') as f:
         json.dump(results, f)
 
-    total_rows = results['schedule_rows'] + results['standings_rows']
-    logger.info(f"Scraper complete: {total_rows} total rows")
+    logger.info(f"Scraper complete: {results['schedule_rows']} total rows")
     print(json.dumps(results))
     return 0
 
