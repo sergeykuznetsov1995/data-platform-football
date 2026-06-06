@@ -24,7 +24,6 @@ class ESPNScraper(SoccerdataScraper):
     ESPN provides:
     - Match schedules and results
     - Basic team information
-    - League standings
 
     Usage:
         scraper = ESPNScraper(
@@ -97,34 +96,6 @@ class ESPNScraper(SoccerdataScraper):
             logger.error(f"Error reading schedule: {e}")
             return None
 
-    def read_standings(self) -> Optional[pd.DataFrame]:
-        """
-        Read league standings.
-
-        Returns:
-            DataFrame with standings
-        """
-        reader = self._get_reader()
-        logger.info("Fetching ESPN standings")
-
-        try:
-            # ESPN reader may not have standings, try if available
-            if hasattr(reader, 'read_standings'):
-                df = self._execute_with_resilience(reader.read_standings)
-
-                if df is not None and not df.empty:
-                    df = df.reset_index()
-                    df = self._add_metadata(df, 'standings')
-
-                return df
-            else:
-                logger.debug("ESPN reader does not support standings")
-                return None
-
-        except Exception as e:
-            logger.error(f"Error reading standings: {e}")
-            return None
-
     def _standardize_schedule(self, df: pd.DataFrame) -> pd.DataFrame:
         """
         Standardize schedule column names.
@@ -172,20 +143,6 @@ class ESPNScraper(SoccerdataScraper):
 
         return {}
 
-    def scrape_standings(self) -> Dict[str, str]:
-        """Scrape league standings."""
-        df = self.read_standings()
-
-        if df is not None and not df.empty:
-            table_path = self.save_to_iceberg(
-                df=df,
-                table_name='espn_standings',
-                partition_cols=['league', 'season'],
-            )
-            return {'standings': table_path}
-
-        return {}
-
     def scrape_all(self) -> Dict[str, str]:
         """
         Scrape all ESPN data.
@@ -202,10 +159,6 @@ class ESPNScraper(SoccerdataScraper):
         # Scrape schedule
         schedule_results = self.scrape_schedule()
         results.update(schedule_results)
-
-        # Scrape standings
-        standings_results = self.scrape_standings()
-        results.update(standings_results)
 
         logger.info(f"ESPN scrape complete: {list(results.keys())}")
         return results

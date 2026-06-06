@@ -11,10 +11,10 @@ script via ``importlib.util``. No Trino, no network — only pure diff logic.
 
 What we cover
 -------------
-- ``build_keep_set`` includes the parser contract AND the producer-only
-  ``espn_standings`` (must never be flagged as an orphan).
+- ``build_keep_set`` includes the parser contract (``EXTRA_PRODUCED`` is empty
+  after #354 removed the dead ``espn_standings`` producer).
 - ``find_orphans`` flags a retired FBref stat_type table and a renamed table,
-  but NOT a contract table and NOT ``espn_standings``.
+  but NOT a contract table.
 - empty live list -> no orphans, no error.
 """
 
@@ -70,8 +70,8 @@ def test_keep_set_covers_contract_and_producer_only_tables():
     mod = _load_module()
     keep = mod.build_keep_set()
 
-    # Producer-only table outside the parser contract — must be kept.
-    assert 'espn_standings' in keep
+    # EXTRA_PRODUCED is empty after #354 removed the dead espn_standings producer.
+    assert mod.EXTRA_PRODUCED == set()
     # Representative contract tables across sources.
     assert 'fbref_player_stats' in keep
     assert 'capology_player_salaries' in keep
@@ -86,7 +86,6 @@ def test_find_orphans_flags_retired_and_renamed_only():
 
     live = [
         'fbref_player_stats',        # contract -> KEEP
-        'espn_standings',            # producer-only -> KEEP
         'fbref_player_passing',      # retired stat_type -> ORPHAN
         'fbref_team_defense',        # retired stat_type -> ORPHAN
         'fbref_team_match_stats',    # renamed (canon: fbref_match_team_stats) -> ORPHAN
@@ -99,7 +98,6 @@ def test_find_orphans_flags_retired_and_renamed_only():
         'fbref_team_match_stats',
     ]
     assert 'fbref_player_stats' not in orphans
-    assert 'espn_standings' not in orphans
 
 
 def test_find_orphans_empty_live_returns_empty():

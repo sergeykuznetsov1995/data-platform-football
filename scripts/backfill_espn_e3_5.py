@@ -17,7 +17,7 @@ its own partition; ESPN scraper class is per-season-instantiated which already m
 1:1 to a single partition write).
 
 Why not the existing DAG/runner: ``dags/scripts/run_espn_scraper.py`` only writes
-``espn_schedule`` and ``espn_standings``. ``espn_lineup`` and ``espn_matchsheet`` were
+``espn_schedule``. ``espn_lineup`` and ``espn_matchsheet`` were
 previously populated by ad-hoc ingestion (single batch_id per season). This script
 formalises both through the same SoccerdataScraper.save_to_iceberg() path while
 preserving the ``replace_partitions`` invariant required by full-state Bronze writes.

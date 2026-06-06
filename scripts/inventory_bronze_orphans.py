@@ -43,11 +43,9 @@ logger = logging.getLogger('inventory_bronze_orphans')
 
 # Producer-only tables that have an ACTIVE writer but are NOT in the parser
 # contract (EXPECTED_TABLES). Dropping these would delete live data.
-#   - espn_standings: written by scrapers/espn/scraper.py; the ESPN contract
-#     only covers espn_schedule / espn_lineup / espn_matchsheet.
-EXTRA_PRODUCED: set[str] = {
-    'espn_standings',
-}
+#   - (empty) espn_standings was removed in #354: soccerdata's ESPN reader has
+#     no read_standings, so the dead scrape path never materialised the table.
+EXTRA_PRODUCED: set[str] = set()
 
 # Producer-orphans (no active writer) that MUST NOT be dropped because live
 # Silver SQL still READS them. Dropping would break Silver with TABLE_NOT_FOUND.

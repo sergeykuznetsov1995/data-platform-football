@@ -10,7 +10,6 @@ Schedules daily at 12 PM UTC.
 
 Data collected:
 - Match schedules and results
-- League standings
 
 All data is written to Iceberg Bronze layer tables (via Parquet fallback).
 """
@@ -54,14 +53,13 @@ def validate_data(**context) -> Dict[str, Any]:
         'warnings': [],
         'summary': {
             'schedule_rows': scrape_result.get('schedule_rows', 0),
-            'standings_rows': scrape_result.get('standings_rows', 0),
             'tables': scrape_result.get('tables', []),
         }
     }
 
     if scrape_result.get('errors'):
         validation['warnings'] = scrape_result['errors']
-        # Only fail if schedule failed (standings may not be available)
+        # Only fail if the schedule scrape produced no rows.
         if validation['summary']['schedule_rows'] == 0:
             validation['status'] = 'failed'
         else:
@@ -113,7 +111,6 @@ with DAG(
     ### Data Collected
 
     - **Schedule**: Match dates, teams, scores, venues
-    - **Standings**: League table positions, points, goal difference
 
     ### Notes
 
