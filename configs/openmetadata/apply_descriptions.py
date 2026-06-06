@@ -9,6 +9,8 @@ Relationships are best-effort POSTed to /api/v1/lineage as addLineageEdge.
 ENV:
     OPENMETADATA_HOST       (default http://openmetadata-server:8585)
     OPENMETADATA_JWT_TOKEN  (required; admin bot JWT — see README.md)
+                            Falls back to OM_JWT_TOKEN, which the
+                            openmetadata-ingestion container already provides.
 
 Usage:
     python apply_descriptions.py [--dry-run]
@@ -165,7 +167,7 @@ def main() -> int:
     ap.add_argument("--host", default=DEFAULT_HOST, help=f"OpenMetadata host (default {DEFAULT_HOST})")
     args = ap.parse_args()
 
-    token = os.environ.get("OPENMETADATA_JWT_TOKEN", "")
+    token = os.environ.get("OPENMETADATA_JWT_TOKEN") or os.environ.get("OM_JWT_TOKEN", "")
     if not args.dry_run and not token:
         print("ERROR: OPENMETADATA_JWT_TOKEN not set. See configs/openmetadata/README.md.", file=sys.stderr)
         return 2
