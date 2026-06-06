@@ -461,6 +461,7 @@ class MatchHistoryScraper(SeleniumScraper):
                 df=combined_df,
                 table_name='matchhistory_results',
                 partition_cols=['league', 'season'],
+                replace_partitions=['league', 'season'],
             )
             results['match_results'] = table_path
 

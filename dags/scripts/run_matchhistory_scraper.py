@@ -105,6 +105,7 @@ def main():
                     df=combined_df,
                     table_name='matchhistory_results',
                     partition_cols=['league', 'season'],
+                    replace_partitions=['league', 'season'],
                 )
                 results['tables'].append(table_path)
                 logger.info(f"Saved {len(combined_df)} total rows")

@@ -214,6 +214,29 @@ class TestMatchHistoryScraperUnit:
 
                 assert 'match_results' in results
 
+    def test_scrape_all_uses_replace_partitions(self, mock_scraper):
+        """Regression #308: scrape_all MUST pass replace_partitions=['league',
+        'season'] so daily writes replace partitions instead of appending
+        (else matchhistory_results accumulates ~3.8x duplicates per season)."""
+        # Arrange
+        mock_games = pd.DataFrame({
+            'match_date': ['15/01/2024'],
+            'home_team': ['Arsenal'],
+            'away_team': ['Chelsea'],
+            'league': ['ENG-Premier League'],
+            'season': [2024],
+        })
+
+        # Act
+        with patch.object(mock_scraper, 'read_games', return_value=mock_games):
+            with patch.object(mock_scraper, 'save_to_iceberg',
+                              return_value='iceberg.bronze.test') as mock_save:
+                mock_scraper.scrape_all()
+
+        # Assert
+        mock_save.assert_called_once()
+        assert mock_save.call_args.kwargs['replace_partitions'] == ['league', 'season']
+
     def test_metadata_added(self, mock_scraper):
         """Test that metadata is added to DataFrames."""
         csv_content = """Date,HomeTeam,AwayTeam,FTHG,FTAG,FTR
