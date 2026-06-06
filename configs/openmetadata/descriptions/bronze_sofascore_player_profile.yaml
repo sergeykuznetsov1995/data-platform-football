@@ -1,0 +1,66 @@
+# =============================================================================
+# OpenMetadata description: iceberg.bronze.sofascore_player_profile
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.bronze.sofascore_player_profile
+  description: |
+    Сырые анкеты игроков из SofaScore (endpoint /player/{id} через
+    dag_ingest_sofascore, задача _run_player_profile). Grain — один row на
+    игрока (snapshot, full refresh каждый прогон). Несёт биографию: имя, рост,
+    рабочую ногу, дату рождения, гражданство, текущий клуб. Кандидат на
+    Silver dim_player_attributes. Партиционирование ['league','season'].
+  tags:
+    - Tier.Bronze
+    - Domain.Football
+    - PII.Low
+columns:
+  - name: player_id
+    description: SofaScore player_id (varchar).
+  - name: name
+    description: Полное имя игрока.
+    tags:
+      - PII.Low
+  - name: short_name
+    description: Короткое/игровое имя игрока.
+    tags:
+      - PII.Low
+  - name: slug
+    description: URL-slug игрока на SofaScore (содержит имя).
+    tags:
+      - PII.Low
+  - name: position
+    description: Основная позиция игрока (буквенный код).
+  - name: jersey_number
+    description: Игровой номер (varchar; может отсутствовать).
+  - name: shirt_number
+    description: Игровой номер (bigint).
+  - name: height_cm
+    description: Рост игрока, см (bigint).
+  - name: preferred_foot
+    description: Рабочая нога ('Left' / 'Right' / 'Both').
+  - name: date_of_birth
+    description: Дата рождения игрока (varchar).
+    tags:
+      - PII.Low
+  - name: nationality
+    description: Гражданство игрока.
+  - name: country_code
+    description: Код страны гражданства.
+  - name: current_team_id
+    description: SofaScore id текущего клуба (bigint).
+  - name: current_team_name
+    description: Название текущего клуба.
+  - name: retired
+    description: Завершил ли игрок карьеру (boolean; ~83% NULL — заполняется лишь для части игроков).
+  - name: league
+    description: Лига (e.g. 'ENG-Premier League'); partition key.
+  - name: season
+    description: Сезон в формате 'YYZZ' (e.g. '2526'); partition key.
+  - name: _ingested_at
+    description: Timestamp ingest'а строки в Bronze; метаколонка.
+  - name: _source
+    description: Источник данных ('sofascore'); метаколонка Bronze.
+  - name: _entity_type
+    description: Тип сущности в Bronze; метаколонка.
+  - name: _batch_id
+    description: Идентификатор батча ingest'а; метаколонка.

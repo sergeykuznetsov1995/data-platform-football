@@ -1,0 +1,46 @@
+# =============================================================================
+# OpenMetadata description: iceberg.bronze.sofascore_schedule
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.bronze.sofascore_schedule
+  description: |
+    Сырое расписание матчей из SofaScore (soccerdata Sofascore.read_schedule
+    через dag_ingest_sofascore). Grain — один row на матч. Несёт команды, счёт,
+    тур/неделю, дату начала и числовой SofaScore game_id. Базовая таблица:
+    из неё остальные SofaScore-скраперы (ratings, shotmap, match_stats) берут
+    список match_id завершённых матчей. Партиционирование ['league','season'].
+  tags:
+    - Tier.Bronze
+    - Domain.Football
+    - PII.None
+columns:
+  - name: league
+    description: Лига (e.g. 'ENG-Premier League'); partition key.
+  - name: season
+    description: Сезон в формате 'YYZZ' (e.g. '2526'); partition key.
+  - name: game
+    description: Строковый идентификатор матча SofaScore (slug с префиксом-датой).
+  - name: round
+    description: Номер тура (bigint).
+  - name: week
+    description: Игровая неделя (bigint).
+  - name: date
+    description: Дата и время начала матча (timestamp).
+  - name: home_team
+    description: Название домашней команды.
+  - name: away_team
+    description: Название гостевой команды.
+  - name: home_score
+    description: Голы домашней команды (double).
+  - name: away_score
+    description: Голы гостевой команды (double).
+  - name: game_id
+    description: Числовой SofaScore match/event id (bigint); ключ для остальных endpoint'ов.
+  - name: _source
+    description: Источник данных ('sofascore'); метаколонка Bronze.
+  - name: _entity_type
+    description: Тип сущности в Bronze; метаколонка.
+  - name: _ingested_at
+    description: Timestamp ingest'а строки в Bronze; метаколонка.
+  - name: _batch_id
+    description: Идентификатор батча ingest'а; метаколонка.

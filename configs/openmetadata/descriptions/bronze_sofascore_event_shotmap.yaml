@@ -1,0 +1,66 @@
+# =============================================================================
+# OpenMetadata description: iceberg.bronze.sofascore_event_shotmap
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.bronze.sofascore_event_shotmap
+  description: |
+    Сырая карта ударов матча из SofaScore (endpoint /event/{id}/shotmap через
+    dag_ingest_sofascore, задача _run_shotmap). Grain — один row на удар.
+    Несёт координаты удара и ворот, тип/ситуацию/часть тела, xG и xGOT.
+    Скрапер skip-existing (не перечитывает прошлые матчи, #69). Кандидат на
+    Gold fct_shot. Партиционирование ['league','season'].
+  tags:
+    - Tier.Bronze
+    - Domain.Football
+    - PII.Low
+columns:
+  - name: match_id
+    description: SofaScore event/match id (varchar).
+  - name: shot_id
+    description: Идентификатор удара (varchar; при отсутствии — составной fallback).
+  - name: player_id
+    description: SofaScore player_id бьющего игрока (varchar).
+  - name: team_id
+    description: SofaScore id команды бьющего (varchar).
+  - name: is_home
+    description: Бьёт ли домашняя команда (boolean).
+  - name: minute
+    description: Минута удара (bigint).
+  - name: added_time
+    description: Добавленное время на минуте удара (double).
+  - name: period
+    description: Тайм матча ('1ST' / '2ST' и т.п.).
+  - name: shot_type
+    description: Тип удара (e.g. 'goal','miss','save','block','post').
+  - name: situation
+    description: Игровая ситуация удара (e.g. 'regular','fast-break','set-piece').
+  - name: body_part
+    description: Часть тела (e.g. 'right-foot','left-foot','head').
+  - name: outcome
+    description: Исход удара.
+  - name: goal_type
+    description: Тип гола (если удар стал голом).
+  - name: x
+    description: Координата X точки удара на поле (double).
+  - name: y
+    description: Координата Y точки удара на поле (double).
+  - name: goal_x
+    description: Координата X точки в створе ворот (double).
+  - name: goal_y
+    description: Координата Y точки в створе ворот (double).
+  - name: xg
+    description: Ожидаемые голы удара, expected goals (double).
+  - name: xgot
+    description: Ожидаемые голы по удару в створ, expected goals on target (double).
+  - name: league
+    description: Лига (e.g. 'ENG-Premier League'); partition key.
+  - name: season
+    description: Сезон в формате 'YYZZ' (e.g. '2526'); partition key.
+  - name: _ingested_at
+    description: Timestamp ingest'а строки в Bronze; метаколонка.
+  - name: _source
+    description: Источник данных ('sofascore'); метаколонка Bronze.
+  - name: _entity_type
+    description: Тип сущности в Bronze; метаколонка.
+  - name: _batch_id
+    description: Идентификатор батча ingest'а; метаколонка.

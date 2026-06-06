@@ -1,0 +1,38 @@
+# =============================================================================
+# OpenMetadata description: iceberg.bronze.sofascore_player_ratings
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.bronze.sofascore_player_ratings
+  description: |
+    Сырые рейтинги игроков за матч из SofaScore (endpoint /event/{id}/lineups
+    через dag_ingest_sofascore, задача _run_player_ratings). Grain — один row
+    на (match_id, player_id): оценка SofaScore + позиция. Источник player_id
+    для downstream скраперов (event_player_stats, season_stats, profile) и для
+    Silver xref_player. Партиционирование ['league','season'].
+  tags:
+    - Tier.Bronze
+    - Domain.Football
+    - PII.Low
+columns:
+  - name: match_id
+    description: SofaScore event/match id (varchar).
+  - name: player_id
+    description: SofaScore player_id (varchar).
+  - name: team_side
+    description: Сторона игрока в матче ('home' / 'away').
+  - name: rating
+    description: Рейтинг игрока за матч по версии SofaScore (double).
+  - name: position
+    description: Позиция игрока в матче (буквенный код, e.g. 'G','D','M','F').
+  - name: league
+    description: Лига (e.g. 'ENG-Premier League'); partition key.
+  - name: season
+    description: Сезон в формате 'YYZZ' (e.g. '2526'); partition key.
+  - name: _ingested_at
+    description: Timestamp ingest'а строки в Bronze; метаколонка.
+  - name: _source
+    description: Источник данных ('sofascore'); метаколонка Bronze.
+  - name: _entity_type
+    description: Тип сущности в Bronze; метаколонка.
+  - name: _batch_id
+    description: Идентификатор батча ingest'а; метаколонка.
