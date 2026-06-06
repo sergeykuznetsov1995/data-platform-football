@@ -325,11 +325,26 @@ class MatchHistoryScraper(SeleniumScraper):
         Returns:
             DataFrame with standardized column names
         """
+        # football-data.co.uk CSV ships a UTF-8 BOM on the first header. requests
+        # decodes the body as latin-1, so the BOM bytes EF BB BF surface as the
+        # literal chars '\xef\xbb\xbf' (not a single '﻿'); strip both forms so
+        # 'Div' is not stored as the artifact column 'ï»¿div' (issue #309).
+        df = df.rename(columns=self._strip_bom)
+
         # Rename columns that exist
         rename_cols = {k: v for k, v in self.COLUMN_MAPPING.items() if k in df.columns}
         df = df.rename(columns=rename_cols)
 
         return df
+
+    @staticmethod
+    def _strip_bom(col):
+        """Strip a leading UTF-8 BOM (latin-1 mojibake or single-char form)."""
+        if isinstance(col, str):
+            for bom in ('﻿', '\xef\xbb\xbf'):
+                if col.startswith(bom):
+                    return col[len(bom):]
+        return col
 
     def read_games(
         self,

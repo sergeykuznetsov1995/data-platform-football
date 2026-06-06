@@ -139,6 +139,27 @@ class TestMatchHistoryScraperUnit:
         assert 'result' in standardized.columns
         assert 'odds_home_b365' in standardized.columns
 
+    def test_standardize_columns_strips_bom(self, mock_scraper):
+        """BOM-prefixed first header from football-data.co.uk CSV is stripped (#309).
+
+        requests decodes the body as latin-1, so the UTF-8 BOM (EF BB BF) surfaces
+        as the literal chars '\\xef\\xbb\\xbf'; the single '\\ufeff' form is also covered.
+        """
+        df = pd.DataFrame({
+            '\xef\xbb\xbfDiv': ['E0'],   # latin-1 mojibake form (requests path)
+            'HomeTeam': ['Arsenal'],
+        })
+
+        standardized = mock_scraper._standardize_columns(df)
+
+        assert 'Div' in standardized.columns
+        assert '\xef\xbb\xbfDiv' not in standardized.columns
+        assert 'home_team' in standardized.columns
+
+        # single-char BOM form (e.g. selenium page_source decoded as utf-8)
+        df2 = pd.DataFrame({'﻿Div': ['E0']})
+        assert 'Div' in mock_scraper._standardize_columns(df2).columns
+
     def test_read_games_parses_data(self, mock_scraper):
         """Test read_games parsing."""
         csv_content = """Date,HomeTeam,AwayTeam,FTHG,FTAG,FTR,HTHG,HTAG,HS,AS

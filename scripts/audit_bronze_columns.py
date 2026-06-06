@@ -162,6 +162,8 @@ EXPECTED_CONSTANT: dict[str, set[str]] = {
     # notes is sparse-by-design (HIGH_NULL) but the few populated rows happen to
     # share the same text ("Award Decided on Pens"), triggering CONSTANT too.
     'fbref_schedule': {'notes'},
+    # div = football-data division code (E0); CONSTANT т.к. в scope только EPL (#309).
+    'matchhistory_results': {'div'},
 }
 
 # Internal metadata cols — we skip them from CONSTANT-checks (they are constant
