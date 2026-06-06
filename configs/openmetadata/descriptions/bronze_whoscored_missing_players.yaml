@@ -1,0 +1,43 @@
+# =============================================================================
+# OpenMetadata description: iceberg.bronze.whoscored_missing_players
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.bronze.whoscored_missing_players
+  description: |
+    Сырые предматчевые сводки недоступных игроков из WhoScored (soccerdata
+    WhoScored.read_missing_players через FlareSolverr). Grain — один row на
+    (game, team, player): травмы, дисквалификации, вызовы в сборную. Источник
+    отметок reason/status. Партиционирование ['league','season'].
+  tags:
+    - Tier.Bronze
+    - Domain.Football
+    - PII.Low
+columns:
+  - name: league
+    description: Лига (e.g. 'ENG-Premier League'); partition key.
+  - name: season
+    description: Сезон в формате WhoScored 'YYZZ' (e.g. '2425'); partition key.
+  - name: game
+    description: Строковый идентификатор матча WhoScored (slug).
+  - name: team
+    description: Команда, к которой относится недоступный игрок.
+  - name: player
+    description: Имя игрока.
+    tags:
+      - PII.Low
+  - name: game_id
+    description: Числовой WhoScored match_id.
+  - name: player_id
+    description: WhoScored player_id (bigint).
+  - name: reason
+    description: Причина недоступности (e.g. Injury / Suspension / International duty).
+  - name: status
+    description: Статус подтверждения (e.g. Confirmed / Doubtful).
+  - name: _source
+    description: Источник данных ('whoscored'); метаколонка Bronze.
+  - name: _entity_type
+    description: Тип сущности в Bronze; метаколонка.
+  - name: _ingested_at
+    description: Timestamp ingest'а строки в Bronze; метаколонка.
+  - name: _batch_id
+    description: Идентификатор батча ingest'а; метаколонка.
