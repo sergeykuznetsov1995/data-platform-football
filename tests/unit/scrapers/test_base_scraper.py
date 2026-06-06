@@ -134,6 +134,31 @@ class TestBaseScraper:
         assert 'iceberg.bronze.test_table' in result
         assert len(concrete_scraper._stats['tables_written']) == 0
 
+    def test_build_partition_delete_filter_raises_on_missing_columns(self):
+        """replace_partitions on a frame missing the partition column must fail
+        loud, not silently fall back to a dup-accumulating append (#314 p.3)."""
+        from scrapers.base.base_scraper import BaseScraper
+
+        df = pd.DataFrame({'season': [2024], 'value': [1]})  # no 'league'
+        with pytest.raises(ValueError, match='missing columns'):
+            BaseScraper._build_partition_delete_filter(df, ['league', 'season'])
+
+    def test_build_partition_delete_filter_raises_on_all_null_keys(self):
+        """A non-empty frame whose partition keys are all NULL must fail loud."""
+        from scrapers.base.base_scraper import BaseScraper
+
+        df = pd.DataFrame({'league': [None, None], 'season': [None, None]})
+        with pytest.raises(ValueError, match='NULL'):
+            BaseScraper._build_partition_delete_filter(df, ['league', 'season'])
+
+    def test_build_partition_delete_filter_happy_path(self):
+        """Valid partition keys still produce the OR-joined WHERE clause."""
+        from scrapers.base.base_scraper import BaseScraper
+
+        df = pd.DataFrame({'league': ['EPL', 'EPL'], 'season': [2024, 2024]})
+        clause = BaseScraper._build_partition_delete_filter(df, ['league', 'season'])
+        assert clause == "(league = 'EPL' AND season = 2024)"
+
     def test_get_stats(self, concrete_scraper, mock_dependencies):
         """Test getting scraper statistics."""
         stats = concrete_scraper.get_stats()

@@ -429,7 +429,18 @@ class TestTrinoTableManagerInsertDataFrame:
 
 
 class TestTrinoTableManagerInsertDataFrameAtomic:
-    """Tests for insert_dataframe_atomic (stage+merge → one target snapshot, #269)."""
+    """Tests for insert_dataframe_atomic (stage+merge → one target snapshot, #269;
+    stage-first → atomic swap for replace_partitions, #314)."""
+
+    @staticmethod
+    def _exec_ok(staged_count):
+        """_execute side_effect: return a row count for the count(*) probe,
+        None for every other (DDL/DML) statement."""
+        def _exec(sql, fetch=False):
+            if fetch:
+                return [[staged_count]]
+            return None
+        return _exec
 
     def test_insert_dataframe_atomic_stages_and_merges(self):
         """Staged batches collapse into a single INSERT...SELECT on the target."""
@@ -441,7 +452,7 @@ class TestTrinoTableManagerInsertDataFrameAtomic:
 
             df = pd.DataFrame({'team': ['A', 'B', 'C'], 'goals': [1, 2, 3]})
 
-            with patch.object(manager, '_execute') as mock_execute, \
+            with patch.object(manager, '_execute', side_effect=self._exec_ok(3)) as mock_execute, \
                  patch.object(manager, 'insert_dataframe', return_value=3) as mock_insert, \
                  patch.object(manager, 'drop_table') as mock_drop:
                 result = manager.insert_dataframe_atomic('bronze', 'test_table', df)
@@ -471,6 +482,8 @@ class TestTrinoTableManagerInsertDataFrameAtomic:
             assert len(target_inserts) == 1
             assert 'SELECT' in target_inserts[0]
             assert 'FROM iceberg.bronze.test_table__stg' in target_inserts[0]
+            # Plain append → no DELETE issued.
+            assert not any('DELETE FROM' in sql for sql in executed)
 
     def test_insert_dataframe_atomic_empty(self):
         """Empty DataFrame is a no-op (no staging)."""
@@ -486,6 +499,118 @@ class TestTrinoTableManagerInsertDataFrameAtomic:
             assert result == 0
             mock_execute.assert_not_called()
             mock_drop.assert_not_called()
+
+    def test_replace_partitions_stages_before_delete(self):
+        """delete_filter path (#314): the partition DELETE runs only AFTER the
+        stage is populated, and the swap is DELETE then INSERT...SELECT on the
+        target. The stage is cleaned up on success."""
+        import pandas as pd
+        with patch.dict('sys.modules', {'trino': MagicMock(), 'trino.dbapi': MagicMock()}):
+            from scrapers.base.trino_manager import TrinoTableManager
+
+            manager = TrinoTableManager()
+            df = pd.DataFrame({'team': ['A', 'B'], 'goals': [1, 2]})
+
+            with patch.object(manager, '_execute', side_effect=self._exec_ok(2)) as mock_execute, \
+                 patch.object(manager, 'insert_dataframe', return_value=2) as mock_insert, \
+                 patch.object(manager, 'drop_table') as mock_drop:
+                result = manager.insert_dataframe_atomic(
+                    'bronze', 'test_table', df, delete_filter="team = 'A' OR team = 'B'",
+                )
+
+            assert result == 2
+            executed = [c[0][0] for c in mock_execute.call_args_list]
+
+            # Staging happens before any DELETE: insert_dataframe targets the stage.
+            assert mock_insert.call_args[0][1] == 'test_table__stg'
+
+            delete_idx = next(i for i, s in enumerate(executed) if 'DELETE FROM iceberg.bronze.test_table ' in s)
+            insert_idx = next(i for i, s in enumerate(executed) if 'INSERT INTO iceberg.bronze.test_table ' in s)
+            # DELETE is the partition replace, immediately before the merge INSERT.
+            assert "WHERE team = 'A' OR team = 'B'" in executed[delete_idx]
+            assert delete_idx < insert_idx
+            # Success → stage dropped (leading cleanup + trailing cleanup).
+            assert mock_drop.call_count == 2
+
+    def test_replace_partitions_retains_stage_when_swap_insert_fails(self):
+        """The #283/#314 wipe scenario: DELETE commits, the merge INSERT then
+        fails. The stage MUST be retained (not dropped) so the rows survive, and
+        the error MUST propagate (no silent empty table)."""
+        import pandas as pd
+        with patch.dict('sys.modules', {'trino': MagicMock(), 'trino.dbapi': MagicMock()}):
+            from scrapers.base.trino_manager import TrinoTableManager, TrinoError
+
+            manager = TrinoTableManager()
+            df = pd.DataFrame({'team': ['A', 'B'], 'goals': [1, 2]})
+
+            def _exec(sql, fetch=False):
+                if fetch:
+                    return [[2]]
+                if sql.lstrip().startswith('INSERT INTO'):
+                    raise TrinoError("transient SSL error during merge")
+                return None
+
+            with patch.object(manager, '_execute', side_effect=_exec) as mock_execute, \
+                 patch.object(manager, 'insert_dataframe', return_value=2), \
+                 patch.object(manager, 'drop_table') as mock_drop:
+                with pytest.raises(TrinoError):
+                    manager.insert_dataframe_atomic(
+                        'bronze', 'test_table', df, delete_filter="team = 'A'",
+                    )
+
+            executed = [c[0][0] for c in mock_execute.call_args_list]
+            # DELETE was issued (the dangerous window opened)...
+            assert any('DELETE FROM iceberg.bronze.test_table ' in s for s in executed)
+            # ...but the stage is NOT dropped — only the leading leftover-cleanup ran.
+            assert mock_drop.call_count == 1
+
+    def test_replace_partitions_drops_stage_when_staging_fails(self):
+        """If staging fails before the swap, the target is untouched: no DELETE is
+        issued and the half-built stage is cleaned up."""
+        import pandas as pd
+        with patch.dict('sys.modules', {'trino': MagicMock(), 'trino.dbapi': MagicMock()}):
+            from scrapers.base.trino_manager import TrinoTableManager, TrinoError
+
+            manager = TrinoTableManager()
+            df = pd.DataFrame({'team': ['A', 'B'], 'goals': [1, 2]})
+
+            with patch.object(manager, '_execute', side_effect=self._exec_ok(2)) as mock_execute, \
+                 patch.object(manager, 'insert_dataframe', side_effect=TrinoError("staging boom")), \
+                 patch.object(manager, 'drop_table') as mock_drop:
+                with pytest.raises(TrinoError):
+                    manager.insert_dataframe_atomic(
+                        'bronze', 'test_table', df, delete_filter="team = 'A'",
+                    )
+
+            executed = [c[0][0] for c in mock_execute.call_args_list]
+            # Target never touched.
+            assert not any('DELETE FROM iceberg.bronze.test_table ' in s for s in executed)
+            assert not any('INSERT INTO iceberg.bronze.test_table ' in s for s in executed)
+            # Stage cleaned up: leading leftover-cleanup + staging-failure cleanup.
+            assert mock_drop.call_count == 2
+
+    def test_replace_partitions_aborts_on_stage_count_mismatch(self):
+        """If the staged row count != len(df), abort BEFORE the swap — no DELETE,
+        stage dropped, error raised."""
+        import pandas as pd
+        with patch.dict('sys.modules', {'trino': MagicMock(), 'trino.dbapi': MagicMock()}):
+            from scrapers.base.trino_manager import TrinoTableManager, TrinoError
+
+            manager = TrinoTableManager()
+            df = pd.DataFrame({'team': ['A', 'B'], 'goals': [1, 2]})
+
+            # Stage reports only 1 row though df has 2.
+            with patch.object(manager, '_execute', side_effect=self._exec_ok(1)) as mock_execute, \
+                 patch.object(manager, 'insert_dataframe', return_value=2), \
+                 patch.object(manager, 'drop_table') as mock_drop:
+                with pytest.raises(TrinoError):
+                    manager.insert_dataframe_atomic(
+                        'bronze', 'test_table', df, delete_filter="team = 'A'",
+                    )
+
+            executed = [c[0][0] for c in mock_execute.call_args_list]
+            assert not any('DELETE FROM iceberg.bronze.test_table ' in s for s in executed)
+            assert mock_drop.call_count == 2
 
 
 class TestTrinoTableManagerDropTable:

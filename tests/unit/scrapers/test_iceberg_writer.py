@@ -267,6 +267,35 @@ class TestIcebergWriterWriteToIceberg:
             call_args = mock_trino.create_iceberg_table.call_args
             assert call_args.kwargs.get('partition_columns') == ['league']
 
+    def test_write_to_iceberg_routes_delete_filter_into_atomic(self):
+        """replace_partitions (#314): the writer hands delete_filter to
+        insert_dataframe_atomic instead of issuing its own DELETE — so the swap
+        is atomic (stage-first) and a failed INSERT can't leave the table empty."""
+        with patch.dict('sys.modules', {'trino': MagicMock(), 'trino.dbapi': MagicMock()}):
+            from scrapers.base.iceberg_writer import IcebergWriter
+            writer = IcebergWriter()
+
+            mock_trino = MagicMock()
+            mock_trino.table_exists.return_value = True
+            mock_trino.insert_dataframe_atomic.return_value = 2
+            writer._trino_manager = mock_trino
+
+            df = pd.DataFrame({'col1': [1, 2], 'league': ['EPL', 'EPL']})
+            writer._write_to_iceberg(
+                df, 'bronze', 'test', None, delete_filter="league = 'EPL'",
+            )
+
+            # delete_filter is forwarded to the atomic writer...
+            assert mock_trino.insert_dataframe_atomic.call_args.kwargs.get(
+                'delete_filter'
+            ) == "league = 'EPL'"
+            # ...and the writer no longer issues a standalone partition DELETE.
+            delete_calls = [
+                c for c in mock_trino._execute.call_args_list
+                if 'DELETE FROM' in str(c)
+            ]
+            assert delete_calls == []
+
 
 class TestIcebergWriterArrowConversion:
     """Tests for Arrow conversion."""

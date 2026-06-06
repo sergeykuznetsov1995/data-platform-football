@@ -310,25 +310,35 @@ class BaseScraper(ABC):
     def _build_partition_delete_filter(
         df: pd.DataFrame,
         partition_cols: List[str],
-    ) -> Optional[str]:
+    ) -> str:
         """Build a SQL WHERE clause matching every (partition_cols) tuple
-        present in ``df``. Returns None if any required column is missing
-        or no usable rows remain.
+        present in ``df``.
 
         String values are single-quote-escaped; numeric values stay raw.
         NaN/None partition values are dropped.
+
+        Raises ValueError when ``replace_partitions`` was requested but cannot be
+        honoured (missing columns, or no non-NULL partition values in a non-empty
+        frame). Previously these silently fell back to a plain append, which
+        accumulates duplicates run after run — a footgun, so now it fails loud
+        (#314 p.3). ``df`` is guaranteed non-empty here (``save_to_iceberg``
+        short-circuits empty frames before calling).
         """
         missing = [c for c in partition_cols if c not in df.columns]
         if missing:
-            logger.warning(
-                f"replace_partitions={partition_cols} requested but missing "
-                f"columns: {missing}. Falling back to plain append."
+            raise ValueError(
+                f"replace_partitions={partition_cols} requested but DataFrame is "
+                f"missing columns: {missing}. Refusing to fall back to a plain "
+                f"append (would accumulate duplicates)."
             )
-            return None
 
         unique = df[partition_cols].drop_duplicates().dropna()
         if unique.empty:
-            return None
+            raise ValueError(
+                f"replace_partitions={partition_cols} requested but every "
+                f"partition-key value is NULL in a non-empty frame. Refusing to "
+                f"fall back to a plain append (would accumulate duplicates)."
+            )
 
         clauses = []
         for _, row in unique.iterrows():
