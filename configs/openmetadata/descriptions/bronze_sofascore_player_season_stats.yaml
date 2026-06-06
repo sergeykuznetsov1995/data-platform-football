@@ -1,0 +1,265 @@
+# =============================================================================
+# OpenMetadata description: iceberg.bronze.sofascore_player_season_stats
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.bronze.sofascore_player_season_stats
+  description: |
+    Сырая сезонная статистика игроков из SofaScore (endpoint
+    /player/{id}/.../statistics через dag_ingest_sofascore, задача
+    _run_player_season_stats). Grain — один row на игрока за сезон (snapshot,
+    full refresh каждый прогон). ~110 Opta-метрик за сезон: голы/пасы/отборы/
+    дриблинг/единоборства/вратарские. Кормит Silver-агрегаты по игрокам.
+    Партиционирование ['league','season'].
+  tags:
+    - Tier.Bronze
+    - Domain.Football
+    - PII.Low
+columns:
+  - name: player_id
+    description: SofaScore player_id (varchar).
+  - name: unique_tournament_id
+    description: SofaScore id турнира (bigint).
+  - name: sofascore_season_id
+    description: Внутренний SofaScore id сезона (bigint).
+  - name: team_id
+    description: SofaScore id команды игрока (bigint).
+  - name: team_name
+    description: Название команды игрока.
+  - name: rating
+    description: Средний рейтинг игрока за сезон (double).
+  - name: total_rating
+    description: Сумма рейтингов за все матчи сезона (double).
+  - name: count_rating
+    description: Число матчей с рейтингом (bigint).
+  - name: goals
+    description: Голы за сезон.
+  - name: big_chances_created
+    description: Созданные явные моменты.
+  - name: big_chances_missed
+    description: Упущенные явные моменты.
+  - name: assists
+    description: Голевые передачи.
+  - name: expected_assists
+    description: Ожидаемые ассисты, xA (double).
+  - name: goals_assists_sum
+    description: Сумма голов и ассистов.
+  - name: accurate_passes
+    description: Точные передачи.
+  - name: inaccurate_passes
+    description: Неточные передачи.
+  - name: total_passes
+    description: Всего передач.
+  - name: accurate_passes_percentage
+    description: Точность передач, % (double).
+  - name: accurate_own_half_passes
+    description: Точные передачи на своей половине.
+  - name: accurate_opposition_half_passes
+    description: Точные передачи на чужой половине.
+  - name: accurate_final_third_passes
+    description: Точные передачи в финальной трети.
+  - name: key_passes
+    description: Ключевые передачи (под удар).
+  - name: successful_dribbles
+    description: Удачные обводки.
+  - name: successful_dribbles_percentage
+    description: Доля удачных обводок, % (double).
+  - name: tackles
+    description: Отборы.
+  - name: interceptions
+    description: Перехваты.
+  - name: yellow_cards
+    description: Жёлтые карточки.
+  - name: direct_red_cards
+    description: Прямые красные карточки.
+  - name: red_cards
+    description: Всего красных карточек.
+  - name: accurate_crosses
+    description: Точные навесы.
+  - name: accurate_crosses_percentage
+    description: Точность навесов, % (double).
+  - name: total_shots
+    description: Всего ударов.
+  - name: shots_on_target
+    description: Удары в створ.
+  - name: shots_off_target
+    description: Удары мимо.
+  - name: ground_duels_won
+    description: Выигранные единоборства на земле.
+  - name: ground_duels_won_percentage
+    description: Доля выигранных наземных единоборств, % (double).
+  - name: aerial_duels_won
+    description: Выигранные верховые единоборства.
+  - name: aerial_duels_won_percentage
+    description: Доля выигранных верховых единоборств, % (double).
+  - name: total_duels_won
+    description: Всего выигранных единоборств.
+  - name: total_duels_won_percentage
+    description: Доля выигранных единоборств, % (double).
+  - name: minutes_played
+    description: Сыграно минут.
+  - name: goal_conversion_percentage
+    description: Реализация моментов (голы/удары), % (double).
+  - name: penalties_taken
+    description: Пробито пенальти.
+  - name: penalty_goals
+    description: Голы с пенальти.
+  - name: penalty_won
+    description: Заработано пенальти.
+  - name: penalty_conceded
+    description: Сфолил на пенальти (отдал пенальти).
+  - name: shot_from_set_piece
+    description: Удары со стандартов.
+  - name: free_kick_goal
+    description: Голы со штрафных.
+  - name: goals_from_inside_the_box
+    description: Голы из штрафной.
+  - name: goals_from_outside_the_box
+    description: Голы из-за пределов штрафной.
+  - name: shots_from_inside_the_box
+    description: Удары из штрафной.
+  - name: shots_from_outside_the_box
+    description: Удары из-за пределов штрафной.
+  - name: headed_goals
+    description: Голы головой.
+  - name: left_foot_goals
+    description: Голы левой ногой.
+  - name: right_foot_goals
+    description: Голы правой ногой.
+  - name: accurate_long_balls
+    description: Точные длинные передачи.
+  - name: accurate_long_balls_percentage
+    description: Точность длинных передач, % (double).
+  - name: clearances
+    description: Выносы.
+  - name: error_lead_to_goal
+    description: Ошибки, приведшие к голу.
+  - name: error_lead_to_shot
+    description: Ошибки, приведшие к удару.
+  - name: dispossessed
+    description: Потери мяча при отборе соперником.
+  - name: possession_lost
+    description: Всего потерь владения.
+  - name: possession_won_att_third
+    description: Возвраты мяча в атакующей трети.
+  - name: total_chipped_passes
+    description: Всего навесных/подрезанных передач.
+  - name: accurate_chipped_passes
+    description: Точные навесные передачи.
+  - name: touches
+    description: Касания мяча.
+  - name: was_fouled
+    description: Сфолено на игроке.
+  - name: fouls
+    description: Совершено фолов.
+  - name: hit_woodwork
+    description: Попадания в каркас ворот.
+  - name: own_goals
+    description: Автоголы (разрежено — событийная метрика).
+  - name: dribbled_past
+    description: Сколько раз игрока обыграли в дриблинге.
+  - name: offsides
+    description: Положения вне игры.
+  - name: blocked_shots
+    description: Заблокированные удары соперника.
+  - name: pass_to_assist
+    description: Передачи под голевой пас (pre-assist).
+  - name: saves
+    description: Сейвы (вратарская; разрежено — только GK).
+  - name: clean_sheet
+    description: «Сухие» матчи (вратарская/защитная; разрежено).
+  - name: penalty_faced
+    description: Пенальти против вратаря (разрежено — только GK).
+  - name: penalty_save
+    description: Отражённые пенальти (разрежено — только GK).
+  - name: saved_shots_from_inside_the_box
+    description: Сейвы по ударам из штрафной (GK; разрежено).
+  - name: saved_shots_from_outside_the_box
+    description: Сейвы по ударам из-за штрафной (GK; разрежено).
+  - name: goals_conceded_inside_the_box
+    description: Пропущено из штрафной (GK; разрежено).
+  - name: goals_conceded_outside_the_box
+    description: Пропущено из-за штрафной (GK; разрежено).
+  - name: punches
+    description: Выносы мяча кулаками (GK; разрежено).
+  - name: runs_out
+    description: Выходы вратаря из ворот (GK; разрежено).
+  - name: successful_runs_out
+    description: Удачные выходы вратаря (GK; разрежено).
+  - name: high_claims
+    description: Выносы/забор верховых мячей (GK; разрежено).
+  - name: crosses_not_claimed
+    description: Невыбранные навесы (GK; разрежено).
+  - name: matches_started
+    description: Матчи в стартовом составе.
+  - name: penalty_conversion
+    description: Реализация пенальти.
+  - name: set_piece_conversion
+    description: Реализация стандартов.
+  - name: total_attempt_assist
+    description: Всего передач под удар.
+  - name: total_contest
+    description: Всего попыток обводки.
+  - name: total_cross
+    description: Всего навесов.
+  - name: duel_lost
+    description: Проигранные единоборства.
+  - name: aerial_lost
+    description: Проигранные верховые единоборства.
+  - name: attempt_penalty_miss
+    description: Пенальти мимо.
+  - name: attempt_penalty_post
+    description: Пенальти в каркас.
+  - name: attempt_penalty_target
+    description: Пенальти в створ.
+  - name: total_long_balls
+    description: Всего длинных передач.
+  - name: goals_conceded
+    description: Пропущено голов (GK/защита; разрежено).
+  - name: tackles_won
+    description: Удачные отборы.
+  - name: tackles_won_percentage
+    description: Доля удачных отборов, % (double).
+  - name: scoring_frequency
+    description: Частота голов (минут на гол; double).
+  - name: yellow_red_cards
+    description: Удаления второй жёлтой.
+  - name: saves_caught
+    description: Сейвы с фиксацией мяча (GK; разрежено).
+  - name: saves_parried
+    description: Сейвы с отбиванием мяча (GK; разрежено).
+  - name: total_own_half_passes
+    description: Всего передач на своей половине.
+  - name: total_opposition_half_passes
+    description: Всего передач на чужой половине.
+  - name: totw_appearances
+    description: Попадания в символическую сборную тура (Team of the Week).
+  - name: expected_goals
+    description: Ожидаемые голы за сезон, xG (double).
+  - name: goal_kicks
+    description: Удары от ворот (GK).
+  - name: ball_recovery
+    description: Возвраты мяча.
+  - name: outfielder_blocks
+    description: Блоки полевого игрока.
+  - name: id
+    description: Passthrough-идентификатор записи soccerdata (bigint).
+  - name: type
+    description: Passthrough-тип записи статистики soccerdata.
+  - name: appearances
+    description: Матчи с выходом на поле.
+  - name: statistics_type
+    description: Passthrough-поле soccerdata; 100% NULL в текущем продюсере.
+  - name: league
+    description: Лига (e.g. 'ENG-Premier League'); partition key.
+  - name: season
+    description: Сезон в формате 'YYZZ' (e.g. '2526'); partition key.
+  - name: _ingested_at
+    description: Timestamp ingest'а строки в Bronze; метаколонка.
+  - name: _source
+    description: Источник данных ('sofascore'); метаколонка Bronze.
+  - name: _entity_type
+    description: Тип сущности в Bronze; метаколонка.
+  - name: _batch_id
+    description: Идентификатор батча ingest'а; метаколонка.
+  - name: goals_prevented
+    description: Предотвращённые голы (GK-метрика над xGOT; ~93% NULL — только вратари).
