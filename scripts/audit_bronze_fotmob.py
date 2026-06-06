@@ -26,7 +26,7 @@ from utils.silver_tasks import _get_trino_connection  # noqa: E402
 # Hypothesised PKs — empirically verified by this script.
 PK_CANDIDATES: Dict[str, List[str]] = {
     'fotmob_schedule':         ['match_id', 'league', 'season'],
-    'fotmob_team_stats':       ['team_id', 'table_type', 'league', 'season'],
+    'fotmob_team_stats':       ['team_id', 'league', 'season'],
     'fotmob_player_stats':     ['participant_id', 'stat_name', 'league', 'season'],
     'fotmob_team_leaderboards': ['team_id', 'stat_name', 'league', 'season'],
     'fotmob_transfers':        ['player_id', 'transfer_date', 'to_club_id', 'league', 'season'],

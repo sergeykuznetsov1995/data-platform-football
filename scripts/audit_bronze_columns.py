@@ -110,26 +110,17 @@ EXPECTED_NULL: dict[str, set[str]] = {
         'statistics_type',
     },
     # --- FotMob (#281) -------------------------------------------------------
-    # 14 columns are 100% NULL live (verified 2026-06-04). Two classes:
-    #   (a) upstream-missing — scraper DOES emit the field but FotMob returns
-    #       None for every in-scope row.
-    #   (b) dead-legacy drift — the current scraper no longer emits the column;
-    #       it survives only as an Iceberg schema remnant from older runs. These
-    #       are tracked for removal in followup #304 (drop dead columns); kept
-    #       here so the --source fotmob contract audit stays green meanwhile.
+    # Originally 14 columns were 100% NULL live (verified 2026-06-04) in two
+    # classes: (a) upstream-missing — scraper emits the field but FotMob returns
+    # None for every in-scope row; (b) dead-legacy drift — the current scraper no
+    # longer emits the column, it survived only as an Iceberg schema remnant.
+    # The 10 dead-legacy columns were physically dropped via CTAS-rebuild (#304,
+    # scripts/drop_fotmob_dead_columns.py), so only the (a) upstream-missing
+    # entries remain allowlisted below.
     'fotmob_team_stats': {
         # (a) upstream-missing: read_team_season_stats writes team.get('form'),
         # but FotMob's league table omits `form` for in-scope leagues.
         'form',
-        # (b) dead-legacy: not in the current read_team_season_stats dict
-        # (scraper.py:404-417) — schema remnants from a prior, wider parser.
-        'table_type', 'short_name', 'xg', 'xg_conceded', 'qualification',
-    },
-    'fotmob_player_stats': {
-        # (b) dead-legacy: current read_player_season_stats writes
-        # participant_id/participant_name/stat_category_header (scraper.py:496-513)
-        # — these 5 older column names are never populated.
-        'player_id', 'player_name', 'stat_category', 'team_color', 'positions',
     },
     'fotmob_team_leaderboards': {
         # (a) upstream-shape: read_team_leaderboards maps item.get('TeamName')
