@@ -378,28 +378,18 @@ class IcebergWriter:
                 # Table might be empty or not support DELETE
                 logger.warning(f"Could not delete existing data: {e}")
 
-        # Partition-replace semantics: caller-supplied filter narrows the
-        # delete to the partitions being rewritten. Used by schedule writers
-        # so each run replaces (league, season) instead of appending dupes.
-        if delete_filter:
-            try:
-                trino._execute(
-                    f"DELETE FROM {full_table} WHERE {delete_filter}"
-                )
-                logger.info(
-                    f"Deleted rows matching '{delete_filter}' from {full_table}"
-                )
-            except TrinoError as e:
-                # First-time write or delete-by-filter unsupported on table —
-                # log and proceed with append (caller may end up with
-                # duplicates, but the alternative is failing the whole write).
-                logger.warning(
-                    f"delete_filter '{delete_filter}' failed on {full_table}: {e}"
-                )
-
         # Insert data — atomic stage+merge so the target gets ONE snapshot
         # regardless of how many byte-budget VALUES batches the rows need (#269).
-        rows_inserted = trino.insert_dataframe_atomic(database, table, df)
+        #
+        # Partition-replace semantics: the caller-supplied filter narrows the
+        # delete to the partitions being rewritten (so each run replaces
+        # (league, season) instead of appending dupes). The DELETE is handed to
+        # insert_dataframe_atomic so it runs AFTER the data is safely staged and
+        # back-to-back with the merge INSERT — a failed INSERT can no longer
+        # leave the table empty behind a committed DELETE (#314 / #283).
+        rows_inserted = trino.insert_dataframe_atomic(
+            database, table, df, delete_filter=delete_filter,
+        )
         logger.info(f"Inserted {rows_inserted} rows into {full_table}")
 
         return full_table

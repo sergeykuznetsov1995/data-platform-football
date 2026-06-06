@@ -531,6 +531,7 @@ WITH (
         table: str,
         df: pd.DataFrame,
         batch_size: int = 1000,
+        delete_filter: Optional[str] = None,
     ) -> int:
         """
         Insert a DataFrame so the target table receives exactly ONE snapshot.
@@ -546,11 +547,25 @@ WITH (
         so the target gains exactly one snapshot regardless of batch count.
         The throwaway stage is dropped, discarding its snapshot churn.
 
+        ``replace_partitions`` semantics (#314): when ``delete_filter`` is set the
+        partition DELETE is deferred until AFTER the stage is fully populated and
+        verified, then runs back-to-back with the merge INSERT. This is the
+        "stage-first → atomic swap" fix: all the slow, flaky network I/O happens
+        on the throwaway stage while the live table is untouched, so a transient
+        error (the kind that wiped ``clubelo_team_history`` 105600→0 in #283)
+        fails before any DELETE is issued. If the swap itself fails after the
+        DELETE commits, the stage is *retained* (not dropped) so the rows can be
+        recovered with ``INSERT INTO target SELECT * FROM stage``.
+
         Args:
             schema: Schema name
             table: Target table name (must already exist)
             df: Pandas DataFrame to insert
             batch_size: Number of rows per staged INSERT statement
+            delete_filter: Optional SQL WHERE clause. When set, rows matching it
+                are deleted from the target as part of the swap (partition
+                replace) instead of a plain append. A failure here raises — it is
+                never downgraded to a silent append.
 
         Returns:
             Number of rows inserted into the target
@@ -569,17 +584,50 @@ WITH (
         # Empty copy of the target schema (column names/types incl. metadata).
         self._execute(f"CREATE TABLE {qualified_stage} AS SELECT * FROM {qualified_target} WHERE false")
 
+        # --- Phase 1: stage every row (all the slow, flaky network I/O). The
+        # target is NOT touched yet, so any failure here leaves it intact (#314).
         try:
-            # Many byte-budget INSERTs land on the throwaway stage.
             inserted = self.insert_dataframe(schema, stage, df, batch_size)
+            staged = self._execute(
+                f"SELECT count(*) FROM {qualified_stage}", fetch=True
+            )[0][0]
+            if staged != len(df):
+                raise TrinoError(
+                    f"Stage row count mismatch for {qualified_stage}: staged "
+                    f"{staged}, expected {len(df)}. Aborting before touching target."
+                )
+        except Exception:
+            # Target untouched — safe to discard the half-built stage.
+            self.drop_table(schema, stage, if_exists=True)
+            raise
+
+        # --- Phase 2: swap (narrow window, two metadata-only operations). The
+        # stage already holds the data, so a partition DELETE followed by a single
+        # INSERT...SELECT is the whole replace.
+        cols = ', '.join(f'"{c}"' for c in df.columns)
+        try:
+            if delete_filter:
+                self._execute(f"DELETE FROM {qualified_target} WHERE {delete_filter}")
+                logger.info(
+                    f"Deleted rows matching '{delete_filter}' from {qualified_target}"
+                )
             # Single INSERT...SELECT → exactly one snapshot on the target.
-            cols = ', '.join(f'"{c}"' for c in df.columns)
             self._execute(
                 f"INSERT INTO {qualified_target} ({cols}) "
                 f"SELECT {cols} FROM {qualified_stage}"
             )
-        finally:
-            self.drop_table(schema, stage, if_exists=True)
+        except Exception:
+            # The DELETE may already be committed while the INSERT failed, so the
+            # stage is now the only copy of these rows. Do NOT drop it — keep it
+            # for recovery (`INSERT INTO target SELECT * FROM stage`) and fail loud.
+            logger.error(
+                f"Atomic swap failed for {qualified_target}; stage {qualified_stage} "
+                f"retained for recovery (holds {inserted} rows)"
+            )
+            raise
+
+        # Swap succeeded — discard the throwaway stage and its snapshot churn.
+        self.drop_table(schema, stage, if_exists=True)
 
         logger.info(f"Inserted {inserted} rows into {qualified_target} (via stage, 1 snapshot)")
         return inserted
