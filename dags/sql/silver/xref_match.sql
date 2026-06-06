@@ -218,14 +218,16 @@ mh_resolved AS (
     -- COLUMN_MAPPING renamed date→match_date, hometeam→home_team,
     -- awayteam→away_team; team-string VALUES are identical so xref_team JOIN holds.
     SELECT
+        -- match_date is raw 'DD/MM/YYYY' varchar in results → parse to ISO date
+        -- so the synthetic hash key and the output column are both well-formed.
         'mh_' || LOWER(TO_HEX(XXHASH64(TO_UTF8(
-            CAST(s.match_date AS varchar)
+            CAST(CAST(date_parse(s.match_date, '%d/%m/%Y') AS date) AS varchar)
             || '|' || COALESCE(LOWER(CAST(s.home_team AS varchar)), '')
             || '|' || COALESCE(LOWER(CAST(s.away_team AS varchar)), '')
             || '|' || s.league
             || '|' || CAST(s.season AS varchar)
         ))))                                                           AS source_id,
-        TRY_CAST(s.match_date AS date)                                 AS match_date,
+        CAST(date_parse(s.match_date, '%d/%m/%Y') AS date)             AS match_date,
         s.league,
         CAST(s.season AS varchar)                                      AS season,
         xt_h.canonical_id                                              AS home_canonical_id,

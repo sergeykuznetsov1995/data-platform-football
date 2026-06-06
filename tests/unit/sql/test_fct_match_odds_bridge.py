@@ -96,6 +96,8 @@ def _translate(sql: str) -> str:
     sql = _collapse_call(sql, "to_utf8")
     sql = _collapse_call(sql, "to_hex")
     sql = re.sub(r"\bxxhash64\b", "md5", sql, flags=re.IGNORECASE)
+    # Trino date_parse(x, fmt) → DuckDB strptime(x, fmt) (same %d/%m/%Y codes).
+    sql = re.sub(r"\bdate_parse\b", "strptime", sql, flags=re.IGNORECASE)
     sql = sql.replace("timestamp(6)", "timestamp")
     return sql
 
@@ -154,9 +156,9 @@ _MH_COLUMNS = [
 def _create_mh_table(con) -> None:
     cols_ddl = []
     for c in _MH_COLUMNS:
-        if c == "match_date":
-            cols_ddl.append(f'"{c}" TIMESTAMP')
-        elif c in ("home_team", "away_team", "league"):
+        # match_date is raw 'DD/MM/YYYY' varchar in matchhistory_results (#307),
+        # parsed via date_parse in the silver SQL — keep it VARCHAR here.
+        if c in ("match_date", "home_team", "away_team", "league"):
             cols_ddl.append(f'"{c}" VARCHAR')
         elif c == "season":
             cols_ddl.append(f'"{c}" BIGINT')
@@ -255,12 +257,13 @@ def _seed_corpus(duck_conn) -> None:
     cols_quoted = ", ".join(f'"{c}"' for c in _MH_COLUMNS)
     insert_sql = f'INSERT INTO bronze_matchhistory_results ({cols_quoted}) VALUES ({placeholders})'
 
+    # match_date seeded as raw football-data 'DD/MM/YYYY' (matches dim_match ISO dates after parse).
     rows = [
-        _mh_row(date="2024-08-15", home="Wolves",          away="Tottenham"),
-        _mh_row(date="2024-09-01", home="Wolverhampton",   away="Spurs"),
-        _mh_row(date="2024-10-05", home="Manchester Utd",  away="Nott'm Forest"),
-        _mh_row(date="2024-11-10", home="Manchester United", away="Nottingham Forest"),
-        _mh_row(date="2024-12-15", home="Newcastle Utd",   away="West Ham"),
+        _mh_row(date="15/08/2024", home="Wolves",          away="Tottenham"),
+        _mh_row(date="01/09/2024", home="Wolverhampton",   away="Spurs"),
+        _mh_row(date="05/10/2024", home="Manchester Utd",  away="Nott'm Forest"),
+        _mh_row(date="10/11/2024", home="Manchester United", away="Nottingham Forest"),
+        _mh_row(date="15/12/2024", home="Newcastle Utd",   away="West Ham"),
     ]
     for r in rows:
         duck_conn.execute(insert_sql, r)

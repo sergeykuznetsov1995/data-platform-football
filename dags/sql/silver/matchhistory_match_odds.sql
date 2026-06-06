@@ -205,7 +205,9 @@ mh AS (
         -- leaves the rest raw (iw*, *closing, ah*, OU "b365>2.5"). We alias the
         -- renamed physical cols back to the legacy logical names below so the
         -- ~400 lines of downstream UNION ALL stay untouched.
-        CAST(match_date AS DATE)       AS match_date,
+        -- match_date is raw football-data 'DD/MM/YYYY' varchar in results
+        -- (legacy games stored it pre-parsed as timestamp) → parse explicitly.
+        CAST(date_parse(match_date, '%d/%m/%Y') AS DATE) AS match_date,
         home_team                      AS hometeam,
         away_team                      AS awayteam,
         league,
