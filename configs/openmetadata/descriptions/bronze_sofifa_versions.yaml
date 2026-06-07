@@ -1,0 +1,29 @@
+# =============================================================================
+# OpenMetadata description: iceberg.bronze.sofifa_versions
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.bronze.sofifa_versions
+  description: |
+    Каталог изданий и обновлений SoFIFA (sofifa.com — зеркало рейтингов EA Sports FC /
+    FIFA, через scrapers/sofifa, dag_ingest_sofifa). Grain — один row на версию
+    (version_id): каждое издание игры может иметь несколько версий (исходная + апдейты
+    ростера). version_id нужен в URL per-player страниц рейтингов. Без партиционирования.
+  tags:
+    - Tier.Bronze
+    - Domain.Football
+    - PII.None
+columns:
+  - name: version_id
+    description: Внутренний идентификатор версии/снимка ростера SoFIFA (bigint).
+  - name: fifa_edition
+    description: Издание игры (e.g. 'FC 26','FIFA 23').
+  - name: update
+    description: Дата обновления ростера на sofifa.com (e.g. 'Jun 2, 2026').
+  - name: _source
+    description: Источник данных ('sofifa'); метаколонка Bronze.
+  - name: _entity_type
+    description: Тип сущности в Bronze; метаколонка.
+  - name: _ingested_at
+    description: Timestamp ingest'а строки в Bronze; метаколонка.
+  - name: _batch_id
+    description: Идентификатор батча ingest'а; метаколонка.

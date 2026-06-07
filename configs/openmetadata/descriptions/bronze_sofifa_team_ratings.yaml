@@ -1,0 +1,81 @@
+# =============================================================================
+# OpenMetadata description: iceberg.bronze.sofifa_team_ratings
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.bronze.sofifa_team_ratings
+  description: |
+    Командные рейтинги из видеоигры EA Sports FC / FIFA (sofifa.com, страница команды
+    через scrapers/sofifa + FlareSolverr, dag_ingest_sofifa). Grain — один row на
+    (команда, издание игры). Несёт сводные рейтинги (overall/attack/midfield/defence),
+    бюджет/стоимость клуба и подрейтинги тактики. Значения — строки (varchar). NB: 15
+    подрейтингов (build_up_*/chance_creation_*/defence_* + престиж/средний возраст)
+    100% NULL — sofifa.com убрал их в FC 26. Без партиционирования.
+  tags:
+    - Tier.Bronze
+    - Domain.Football
+    - PII.None
+columns:
+  - name: league
+    description: Лига (e.g. 'ENG-Premier League').
+  - name: team
+    description: Название команды.
+  - name: overall
+    description: Сводный рейтинг команды (varchar, 0-99).
+  - name: attack
+    description: Рейтинг атаки команды (varchar, 0-99).
+  - name: midfield
+    description: Рейтинг полузащиты команды (varchar, 0-99).
+  - name: defence
+    description: Рейтинг обороны команды (varchar, 0-99).
+  - name: transfer_budget
+    description: Трансферный бюджет клуба в игре (varchar).
+  - name: club_worth
+    description: Стоимость клуба в игре (varchar).
+  - name: build_up_speed
+    description: Подрейтинг тактики «скорость розыгрыша» (varchar); 100% NULL — убран в FC 26.
+  - name: build_up_dribbling
+    description: Подрейтинг «дриблинг в розыгрыше» (varchar); 100% NULL — убран в FC 26.
+  - name: build_up_passing
+    description: Подрейтинг «пас в розыгрыше» (varchar); 100% NULL — убран в FC 26.
+  - name: build_up_positioning
+    description: Подрейтинг «позиционирование в розыгрыше» (varchar); 100% NULL — убран в FC 26.
+  - name: chance_creation_crossing
+    description: Подрейтинг «навесы при создании моментов» (varchar); 100% NULL — убран в FC 26.
+  - name: chance_creation_passing
+    description: Подрейтинг «пас при создании моментов» (varchar); 100% NULL — убран в FC 26.
+  - name: chance_creation_shooting
+    description: Подрейтинг «удары при создании моментов» (varchar); 100% NULL — убран в FC 26.
+  - name: chance_creation_positioning
+    description: Подрейтинг «позиционирование при создании моментов» (varchar); 100% NULL — убран в FC 26.
+  - name: defence_aggression
+    description: Подрейтинг «агрессивность обороны» (varchar); 100% NULL — убран в FC 26.
+  - name: defence_pressure
+    description: Подрейтинг «прессинг» (varchar); 100% NULL — убран в FC 26.
+  - name: defence_team_width
+    description: Подрейтинг «ширина обороны» (varchar); 100% NULL — убран в FC 26.
+  - name: defence_defender_line
+    description: Подрейтинг «линия защитников» (varchar); 100% NULL — убран в FC 26.
+  - name: defence_domestic_prestige
+    description: Внутренний престиж клуба (varchar); 100% NULL — убран в FC 26.
+  - name: international_prestige
+    description: Международный престиж клуба (varchar); 100% NULL — убран в FC 26.
+  - name: players
+    description: Число игроков в составе клуба (varchar).
+  - name: starting_xi_average_age
+    description: Средний возраст стартового состава (varchar).
+  - name: whole_team_average_age
+    description: Средний возраст всего состава (varchar); 100% NULL — убран в FC 26.
+  - name: fifa_edition
+    description: Издание игры (e.g. 'FC 26').
+  - name: update
+    description: Дата обновления ростера на sofifa.com (e.g. 'Jun 2, 2026').
+  - name: _source
+    description: Источник данных ('sofifa'); метаколонка Bronze.
+  - name: _entity_type
+    description: Тип сущности в Bronze; метаколонка.
+  - name: _ingested_at
+    description: Timestamp ingest'а строки в Bronze; метаколонка.
+  - name: _batch_id
+    description: Идентификатор батча ingest'а; метаколонка.
+  - name: team_id
+    description: SoFIFA id команды (bigint); обогащается из sofifa_teams.
