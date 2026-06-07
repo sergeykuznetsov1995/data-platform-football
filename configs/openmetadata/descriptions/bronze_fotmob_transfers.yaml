@@ -1,0 +1,63 @@
+# =============================================================================
+# OpenMetadata description: iceberg.bronze.fotmob_transfers
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.bronze.fotmob_transfers
+  description: |
+    Сырые трансферы из FotMob (endpoint /api/data/transfers по лиге через
+    scrapers/fotmob, dag_ingest_fotmob). Grain — один row на трансферное событие:
+    игрок, клубы «из/в», сумма и рыночная стоимость, тип перехода (аренда/выкуп).
+    Партиционирование ['league','season'].
+  tags:
+    - Tier.Bronze
+    - Domain.Football
+    - PII.Low
+columns:
+  - name: player_id
+    description: FotMob player_id (bigint).
+  - name: player_name
+    description: Имя игрока.
+    tags:
+      - PII.Low
+  - name: position_label
+    description: Человекочитаемая метка позиции игрока.
+  - name: position_key
+    description: Машинный ключ позиции игрока.
+  - name: transfer_date
+    description: Дата трансфера (varchar).
+  - name: from_club
+    description: Короткое название клуба-отправителя.
+  - name: from_club_full_name
+    description: Полное название клуба-отправителя.
+  - name: from_club_id
+    description: FotMob id клуба-отправителя (bigint).
+  - name: to_club
+    description: Короткое название клуба-получателя.
+  - name: to_club_full_name
+    description: Полное название клуба-получателя.
+  - name: to_club_id
+    description: FotMob id клуба-получателя (bigint).
+  - name: fee_text
+    description: Текстовое описание суммы трансфера; 100% NULL (текущий продюсер не заполняет).
+  - name: fee_value
+    description: Числовая сумма трансфера (double; NULL ~63% — бесплатные/нераскрытые сделки).
+  - name: market_value
+    description: Рыночная стоимость игрока на момент трансфера (varchar).
+  - name: on_loan
+    description: Аренда (true) или постоянный переход (false) (boolean).
+  - name: league
+    description: Лига (e.g. 'ENG-Premier League'); partition key.
+  - name: season
+    description: Сезон — год начала (bigint, e.g. 2025); partition key.
+  - name: _source
+    description: Источник данных ('fotmob'); метаколонка Bronze.
+  - name: _entity_type
+    description: Тип сущности в Bronze; метаколонка.
+  - name: _ingested_at
+    description: Timestamp ingest'а строки в Bronze; метаколонка.
+  - name: _batch_id
+    description: Идентификатор батча ingest'а; метаколонка.
+  - name: transfer_type_key
+    description: Машинный ключ типа трансфера (e.g. 'transfer','loan').
+  - name: transfer_type_text
+    description: Человекочитаемый тип трансфера.

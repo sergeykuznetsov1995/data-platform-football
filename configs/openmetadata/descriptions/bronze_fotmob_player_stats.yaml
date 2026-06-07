@@ -1,0 +1,57 @@
+# =============================================================================
+# OpenMetadata description: iceberg.bronze.fotmob_player_stats
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.bronze.fotmob_player_stats
+  description: |
+    Сырые сезонные лидерборды игроков из FotMob (index /api/data/leagues +
+    полные списки data.fotmob.com/stats/.../<category>.json через scrapers/fotmob,
+    dag_ingest_fotmob). Long-form: grain — один row на (игрок, статистическая
+    категория) с местом в рейтинге и значением. Партиционирование ['league','season'].
+  tags:
+    - Tier.Bronze
+    - Domain.Football
+    - PII.Low
+columns:
+  - name: team_id
+    description: FotMob id команды игрока (bigint).
+  - name: team_name
+    description: Название команды игрока.
+  - name: country_code
+    description: Код страны игрока.
+  - name: stat_name
+    description: Имя метрики лидерборда (e.g. 'goals','assists').
+  - name: stat_value
+    description: Значение метрики (double).
+  - name: rank
+    description: Место игрока в рейтинге по метрике.
+  - name: league
+    description: Лига (e.g. 'ENG-Premier League'); partition key.
+  - name: season
+    description: Сезон — год начала (bigint, e.g. 2025); partition key.
+  - name: _source
+    description: Источник данных ('fotmob'); метаколонка Bronze.
+  - name: _entity_type
+    description: Тип сущности в Bronze; метаколонка.
+  - name: _ingested_at
+    description: Timestamp ingest'а строки в Bronze; метаколонка.
+  - name: _batch_id
+    description: Идентификатор батча ingest'а; метаколонка.
+  - name: participant_id
+    description: FotMob player_id игрока (bigint); соответствует fotmob_player_details.player_id.
+  - name: participant_name
+    description: Имя игрока.
+    tags:
+      - PII.Low
+  - name: sub_stat_value
+    description: Вторичное значение метрики (double; напр. за 90 минут).
+  - name: stat_value_count
+    description: База подсчёта метрики (bigint).
+  - name: matches_played
+    description: Сыграно матчей.
+  - name: minutes_played
+    description: Сыграно минут.
+  - name: stat_category_header
+    description: Заголовок категории статистики.
+  - name: stat_category_group
+    description: Группа категорий статистики.
