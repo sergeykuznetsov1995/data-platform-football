@@ -64,6 +64,7 @@ def main():
                         df=df,
                         table_name='espn_schedule',
                         partition_cols=['league', 'season'],
+                        replace_partitions=['league', 'season'],
                     )
                     results['tables'].append(table_path)
                     results['schedule_rows'] = len(df)

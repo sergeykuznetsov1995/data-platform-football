@@ -55,3 +55,28 @@ class TestESPNScraper:
 
         assert 'match_date' in result.columns
         assert 'home_goals' in result.columns
+
+    def test_scrape_schedule_uses_replace_partitions(self, scraper):
+        """Regression #347: scrape_schedule MUST pass replace_partitions=['league',
+        'season'] so daily writes replace each partition instead of appending
+        (else espn_schedule accumulates ~31x duplicates in the active season)."""
+        # Arrange
+        mock_schedule = pd.DataFrame({
+            'date': ['2024-08-17'],
+            'home_team': ['Arsenal'],
+            'away_team': ['Wolves'],
+            'home_score': [2],
+            'away_score': [0],
+            'league': ['ENG-Premier League'],
+            'season': [2425],
+        })
+
+        # Act
+        with patch.object(scraper, 'read_schedule', return_value=mock_schedule):
+            with patch.object(scraper, 'save_to_iceberg',
+                              return_value='iceberg.bronze.test') as mock_save:
+                scraper.scrape_schedule()
+
+        # Assert
+        mock_save.assert_called_once()
+        assert mock_save.call_args.kwargs['replace_partitions'] == ['league', 'season']

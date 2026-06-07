@@ -138,6 +138,7 @@ class ESPNScraper(SoccerdataScraper):
                 df=df,
                 table_name='espn_schedule',
                 partition_cols=['league', 'season'],
+                replace_partitions=['league', 'season'],
             )
             return {'schedule': table_path}
 
