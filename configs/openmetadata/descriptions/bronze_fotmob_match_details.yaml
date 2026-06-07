@@ -1,0 +1,72 @@
+# =============================================================================
+# OpenMetadata description: iceberg.bronze.fotmob_match_details
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.bronze.fotmob_match_details
+  description: |
+    Сырые детали завершённого матча из FotMob (endpoint /api/data/match →
+    /_next/data/<buildId>/matches/... через scrapers/fotmob, dag_ingest_fotmob).
+    Grain — один row на завершённый матч. Кроме счёта несёт 8 сырых JSON-блобов
+    (составы, события, статистика, удары и т.д.), которые распаковываются в Silver.
+    Данные игроков лежат внутри этих JSON. Партиционирование ['league','season'].
+  tags:
+    - Tier.Bronze
+    - Domain.Football
+    - PII.Low
+columns:
+  - name: match_id
+    description: FotMob идентификатор матча (varchar).
+  - name: home_team
+    description: Название домашней команды.
+  - name: home_team_id
+    description: FotMob id домашней команды (varchar).
+  - name: away_team
+    description: Название гостевой команды.
+  - name: away_team_id
+    description: FotMob id гостевой команды (varchar).
+  - name: match_date
+    description: Дата и время матча (varchar, как отдаёт FotMob).
+  - name: status
+    description: Статус матча (e.g. 'finished').
+  - name: home_score
+    description: Голы домашней команды (bigint).
+  - name: away_score
+    description: Голы гостевой команды (bigint).
+  - name: page_url
+    description: URL страницы матча на FotMob.
+  - name: lineup_json
+    description: Сырой JSON составов команд (распаковывается в Silver); содержит игроков.
+    tags:
+      - PII.Low
+  - name: events_json
+    description: Сырой JSON событий матча — голы/карточки/замены (распаковывается в Silver); содержит игроков.
+    tags:
+      - PII.Low
+  - name: match_facts_json
+    description: Сырой JSON ключевых фактов матча (распаковывается в Silver).
+  - name: stats_json
+    description: Сырой JSON командной статистики матча (распаковывается в Silver).
+  - name: player_stats_json
+    description: Сырой JSON статистики игроков за матч (распаковывается в Silver); содержит игроков.
+    tags:
+      - PII.Low
+  - name: shotmap_json
+    description: Сырой JSON карты ударов матча (распаковывается в Silver); содержит игроков.
+    tags:
+      - PII.Low
+  - name: h2h_json
+    description: Сырой JSON личных встреч команд, head-to-head (распаковывается в Silver).
+  - name: momentum_json
+    description: Сырой JSON давления/моментума по ходу матча (распаковывается в Silver).
+  - name: league
+    description: Лига (e.g. 'ENG-Premier League'); partition key.
+  - name: season
+    description: Сезон — год начала (bigint, e.g. 2025); partition key.
+  - name: _source
+    description: Источник данных ('fotmob'); метаколонка Bronze.
+  - name: _entity_type
+    description: Тип сущности в Bronze; метаколонка.
+  - name: _ingested_at
+    description: Timestamp ingest'а строки в Bronze; метаколонка.
+  - name: _batch_id
+    description: Идентификатор батча ingest'а; метаколонка.

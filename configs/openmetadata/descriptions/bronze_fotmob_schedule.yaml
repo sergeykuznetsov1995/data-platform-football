@@ -1,0 +1,50 @@
+# =============================================================================
+# OpenMetadata description: iceberg.bronze.fotmob_schedule
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.bronze.fotmob_schedule
+  description: |
+    Сырое расписание матчей из FotMob (endpoint /api/data/leagues через
+    scrapers/fotmob + dag_ingest_fotmob). Grain — один row на матч, включая
+    несыгранные. Несёт команды с FotMob team_id, счёт, тур и флаг завершённости.
+    Базовая таблица: match_id используется для подтягивания match_details.
+    Партиционирование ['league','season'].
+  tags:
+    - Tier.Bronze
+    - Domain.Football
+    - PII.None
+columns:
+  - name: match_id
+    description: FotMob идентификатор матча (varchar); ключ для match_details.
+  - name: date
+    description: Дата и время начала матча (varchar, как отдаёт FotMob).
+  - name: home_team
+    description: Название домашней команды.
+  - name: home_team_id
+    description: FotMob id домашней команды (varchar).
+  - name: away_team
+    description: Название гостевой команды.
+  - name: away_team_id
+    description: FotMob id гостевой команды (varchar).
+  - name: home_score
+    description: Голы домашней команды (double; NULL для несыгранных матчей).
+  - name: away_score
+    description: Голы гостевой команды (double; NULL для несыгранных матчей).
+  - name: is_finished
+    description: Завершён ли матч (boolean).
+  - name: round
+    description: Тур/стадия турнира (varchar).
+  - name: round_name
+    description: Номер тура (bigint).
+  - name: league
+    description: Лига (e.g. 'ENG-Premier League'); partition key.
+  - name: season
+    description: Сезон — год начала (bigint, e.g. 2025); partition key.
+  - name: _source
+    description: Источник данных ('fotmob'); метаколонка Bronze.
+  - name: _entity_type
+    description: Тип сущности в Bronze; метаколонка.
+  - name: _ingested_at
+    description: Timestamp ingest'а строки в Bronze; метаколонка.
+  - name: _batch_id
+    description: Идентификатор батча ingest'а; метаколонка.
