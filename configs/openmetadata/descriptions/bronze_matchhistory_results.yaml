@@ -1,0 +1,367 @@
+# =============================================================================
+# OpenMetadata description: iceberg.bronze.matchhistory_results
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.bronze.matchhistory_results
+  description: |
+    Сырые результаты матчей с football-data.co.uk (CSV
+    mmz4281/{сезон}/{код_лиги}.csv через scrapers/matchhistory, dag_ingest_matchhistory).
+    Grain — один row на матч. Несёт счёт (полный/первый тайм), командную статистику
+    (удары, фолы, угловые, карточки) и предматчевые/закрывающие котировки ~15
+    букмекеров по рынкам 1X2, тотал 2.5 и азиатский гандикап. Партиционирование
+    ['league','season'].
+  tags:
+    - Tier.Bronze
+    - Domain.Football
+    - PII.None
+columns:
+  - name: match_date
+    description: "Дата матча в сыром формате DD/MM/YYYY (varchar; парсится в Silver через date_parse('%d/%m/%Y'))."
+  - name: time
+    description: "Время начала матча (varchar, как в CSV football-data.co.uk)."
+  - name: home_team
+    description: "Название домашней команды."
+  - name: away_team
+    description: "Название гостевой команды."
+  - name: home_goals
+    description: "Голы домашней команды за полный матч, FTHG (bigint)."
+  - name: away_goals
+    description: "Голы гостевой команды за полный матч, FTAG (bigint)."
+  - name: result
+    description: "Итог матча, FTR: 'H' — победа хозяев, 'D' — ничья, 'A' — победа гостей (varchar)."
+  - name: home_goals_ht
+    description: "Голы домашней команды к перерыву, HTHG (bigint)."
+  - name: away_goals_ht
+    description: "Голы гостевой команды к перерыву, HTAG (bigint)."
+  - name: result_ht
+    description: "Итог первого тайма, HTR: 'H'/'D'/'A' (varchar)."
+  - name: referee
+    description: "Имя главного судьи матча."
+  - name: home_shots
+    description: "Удары домашней команды, HS (bigint)."
+  - name: away_shots
+    description: "Удары гостевой команды, AS (bigint)."
+  - name: home_shots_on_target
+    description: "Удары в створ домашней команды, HST (bigint)."
+  - name: away_shots_on_target
+    description: "Удары в створ гостевой команды, AST (bigint)."
+  - name: home_fouls
+    description: "Фолы домашней команды, HF (bigint)."
+  - name: away_fouls
+    description: "Фолы гостевой команды, AF (bigint)."
+  - name: home_corners
+    description: "Угловые домашней команды, HC (bigint)."
+  - name: away_corners
+    description: "Угловые гостевой команды, AC (bigint)."
+  - name: home_yellow
+    description: "Жёлтые карточки домашней команды, HY (bigint)."
+  - name: away_yellow
+    description: "Жёлтые карточки гостевой команды, AY (bigint)."
+  - name: home_red
+    description: "Красные карточки домашней команды, HR (bigint)."
+  - name: away_red
+    description: "Красные карточки гостевой команды, AR (bigint)."
+  - name: odds_home_b365
+    description: "Bet365: котировка на победу хозяев (opening), B365H (double)."
+  - name: odds_draw_b365
+    description: "Bet365: котировка на ничью (opening), B365D (double)."
+  - name: odds_away_b365
+    description: "Bet365: котировка на победу гостей (opening), B365A (double)."
+  - name: bfdh
+    description: "Betfred: котировка на победу хозяев (opening) (double)."
+  - name: bfdd
+    description: "Betfred: котировка на ничью (opening) (double)."
+  - name: bfda
+    description: "Betfred: котировка на победу гостей (opening) (double)."
+  - name: bmgmh
+    description: "BetMGM: котировка на победу хозяев (opening) (double)."
+  - name: bmgmd
+    description: "BetMGM: котировка на ничью (opening) (double)."
+  - name: bmgma
+    description: "BetMGM: котировка на победу гостей (opening) (double)."
+  - name: bvh
+    description: "BetVictor: котировка на победу хозяев (opening) (double)."
+  - name: bvd
+    description: "BetVictor: котировка на ничью (opening) (double)."
+  - name: bva
+    description: "BetVictor: котировка на победу гостей (opening) (double)."
+  - name: odds_home_bw
+    description: "bwin (Bet&Win): котировка на победу хозяев (opening), BWH (double)."
+  - name: odds_draw_bw
+    description: "bwin (Bet&Win): котировка на ничью (opening), BWD (double)."
+  - name: odds_away_bw
+    description: "bwin (Bet&Win): котировка на победу гостей (opening), BWA (double)."
+  - name: clh
+    description: "Coral: котировка на победу хозяев (opening) (double)."
+  - name: cld
+    description: "Coral: котировка на ничью (opening) (double)."
+  - name: cla
+    description: "Coral: котировка на победу гостей (opening) (double)."
+  - name: lbh
+    description: "Ladbrokes: котировка на победу хозяев (opening) (double)."
+  - name: lbd
+    description: "Ladbrokes: котировка на ничью (opening) (double)."
+  - name: lba
+    description: "Ladbrokes: котировка на победу гостей (opening) (double)."
+  - name: odds_home_ps
+    description: "Pinnacle: котировка на победу хозяев (opening), PSH (double)."
+  - name: odds_draw_ps
+    description: "Pinnacle: котировка на ничью (opening), PSD (double)."
+  - name: odds_away_ps
+    description: "Pinnacle: котировка на победу гостей (opening), PSA (double)."
+  - name: maxh
+    description: "Рыночный максимум котировки на победу хозяев (opening) (double)."
+  - name: maxd
+    description: "Рыночный максимум котировки на ничью (opening) (double)."
+  - name: maxa
+    description: "Рыночный максимум котировки на победу гостей (opening) (double)."
+  - name: avgh
+    description: "Рыночное среднее котировки на победу хозяев (opening) (double)."
+  - name: avgd
+    description: "Рыночное среднее котировки на ничью (opening) (double)."
+  - name: avga
+    description: "Рыночное среднее котировки на победу гостей (opening) (double)."
+  - name: bfeh
+    description: "Betfair Exchange: котировка на победу хозяев (opening) (double)."
+  - name: bfed
+    description: "Betfair Exchange: котировка на ничью (opening) (double)."
+  - name: bfea
+    description: "Betfair Exchange: котировка на победу гостей (opening) (double)."
+  - name: "b365>2.5"
+    description: "Bet365: котировка на тотал больше 2.5 голов (opening) (double)."
+  - name: "b365<2.5"
+    description: "Bet365: котировка на тотал меньше 2.5 голов (opening) (double)."
+  - name: "p>2.5"
+    description: "Pinnacle: котировка на тотал больше 2.5 голов (opening) (double)."
+  - name: "p<2.5"
+    description: "Pinnacle: котировка на тотал меньше 2.5 голов (opening) (double)."
+  - name: "max>2.5"
+    description: "Рыночный максимум котировки на тотал больше 2.5 голов (opening) (double)."
+  - name: "max<2.5"
+    description: "Рыночный максимум котировки на тотал меньше 2.5 голов (opening) (double)."
+  - name: "avg>2.5"
+    description: "Рыночное среднее котировки на тотал больше 2.5 голов (opening) (double)."
+  - name: "avg<2.5"
+    description: "Рыночное среднее котировки на тотал меньше 2.5 голов (opening) (double)."
+  - name: "bfe>2.5"
+    description: "Betfair Exchange: котировка на тотал больше 2.5 голов (opening) (double)."
+  - name: "bfe<2.5"
+    description: "Betfair Exchange: котировка на тотал меньше 2.5 голов (opening) (double)."
+  - name: ahh
+    description: "Рыночный размер азиатского гандикапа (линия для хозяев), AHh (opening, double)."
+  - name: b365ahh
+    description: "Bet365: котировка на победу хозяев с азиатским гандикапом (opening) (double)."
+  - name: b365aha
+    description: "Bet365: котировка на победу гостей с азиатским гандикапом (opening) (double)."
+  - name: pahh
+    description: "Pinnacle: котировка на победу хозяев с азиатским гандикапом (opening) (double)."
+  - name: paha
+    description: "Pinnacle: котировка на победу гостей с азиатским гандикапом (opening) (double)."
+  - name: maxahh
+    description: "Рыночный максимум котировки на победу хозяев с азиатским гандикапом (opening) (double)."
+  - name: maxaha
+    description: "Рыночный максимум котировки на победу гостей с азиатским гандикапом (opening) (double)."
+  - name: avgahh
+    description: "Рыночное среднее котировки на победу хозяев с азиатским гандикапом (opening) (double)."
+  - name: avgaha
+    description: "Рыночное среднее котировки на победу гостей с азиатским гандикапом (opening) (double)."
+  - name: bfeahh
+    description: "Betfair Exchange: котировка на победу хозяев с азиатским гандикапом (opening) (double)."
+  - name: bfeaha
+    description: "Betfair Exchange: котировка на победу гостей с азиатским гандикапом (opening) (double)."
+  - name: b365ch
+    description: "Bet365: котировка на победу хозяев (closing) (double)."
+  - name: b365cd
+    description: "Bet365: котировка на ничью (closing) (double)."
+  - name: b365ca
+    description: "Bet365: котировка на победу гостей (closing) (double)."
+  - name: bfdch
+    description: "Betfred: котировка на победу хозяев (closing) (double)."
+  - name: bfdcd
+    description: "Betfred: котировка на ничью (closing) (double)."
+  - name: bfdca
+    description: "Betfred: котировка на победу гостей (closing) (double)."
+  - name: bmgmch
+    description: "BetMGM: котировка на победу хозяев (closing) (double)."
+  - name: bmgmcd
+    description: "BetMGM: котировка на ничью (closing) (double)."
+  - name: bmgmca
+    description: "BetMGM: котировка на победу гостей (closing) (double)."
+  - name: bvch
+    description: "BetVictor: котировка на победу хозяев (closing) (double)."
+  - name: bvcd
+    description: "BetVictor: котировка на ничью (closing) (double)."
+  - name: bvca
+    description: "BetVictor: котировка на победу гостей (closing) (double)."
+  - name: bwch
+    description: "bwin (Bet&Win): котировка на победу хозяев (closing) (double)."
+  - name: bwcd
+    description: "bwin (Bet&Win): котировка на ничью (closing) (double)."
+  - name: bwca
+    description: "bwin (Bet&Win): котировка на победу гостей (closing) (double)."
+  - name: clch
+    description: "Coral: котировка на победу хозяев (closing) (double)."
+  - name: clcd
+    description: "Coral: котировка на ничью (closing) (double)."
+  - name: clca
+    description: "Coral: котировка на победу гостей (closing) (double)."
+  - name: lbch
+    description: "Ladbrokes: котировка на победу хозяев (closing) (double)."
+  - name: lbcd
+    description: "Ladbrokes: котировка на ничью (closing) (double)."
+  - name: lbca
+    description: "Ladbrokes: котировка на победу гостей (closing) (double)."
+  - name: psch
+    description: "Pinnacle: котировка на победу хозяев (closing) (double)."
+  - name: pscd
+    description: "Pinnacle: котировка на ничью (closing) (double)."
+  - name: psca
+    description: "Pinnacle: котировка на победу гостей (closing) (double)."
+  - name: maxch
+    description: "Рыночный максимум котировки на победу хозяев (closing) (double)."
+  - name: maxcd
+    description: "Рыночный максимум котировки на ничью (closing) (double)."
+  - name: maxca
+    description: "Рыночный максимум котировки на победу гостей (closing) (double)."
+  - name: avgch
+    description: "Рыночное среднее котировки на победу хозяев (closing) (double)."
+  - name: avgcd
+    description: "Рыночное среднее котировки на ничью (closing) (double)."
+  - name: avgca
+    description: "Рыночное среднее котировки на победу гостей (closing) (double)."
+  - name: bfech
+    description: "Betfair Exchange: котировка на победу хозяев (closing) (double)."
+  - name: bfecd
+    description: "Betfair Exchange: котировка на ничью (closing) (double)."
+  - name: bfeca
+    description: "Betfair Exchange: котировка на победу гостей (closing) (double)."
+  - name: "b365c>2.5"
+    description: "Bet365: котировка на тотал больше 2.5 голов (closing) (double)."
+  - name: "b365c<2.5"
+    description: "Bet365: котировка на тотал меньше 2.5 голов (closing) (double)."
+  - name: "pc>2.5"
+    description: "Pinnacle: котировка на тотал больше 2.5 голов (closing) (double)."
+  - name: "pc<2.5"
+    description: "Pinnacle: котировка на тотал меньше 2.5 голов (closing) (double)."
+  - name: "maxc>2.5"
+    description: "Рыночный максимум котировки на тотал больше 2.5 голов (closing) (double)."
+  - name: "maxc<2.5"
+    description: "Рыночный максимум котировки на тотал меньше 2.5 голов (closing) (double)."
+  - name: "avgc>2.5"
+    description: "Рыночное среднее котировки на тотал больше 2.5 голов (closing) (double)."
+  - name: "avgc<2.5"
+    description: "Рыночное среднее котировки на тотал меньше 2.5 голов (closing) (double)."
+  - name: "bfec>2.5"
+    description: "Betfair Exchange: котировка на тотал больше 2.5 голов (closing) (double)."
+  - name: "bfec<2.5"
+    description: "Betfair Exchange: котировка на тотал меньше 2.5 голов (closing) (double)."
+  - name: ahch
+    description: "Рыночный размер азиатского гандикапа (линия для хозяев), closing, AHCh (double)."
+  - name: b365cahh
+    description: "Bet365: котировка на победу хозяев с азиатским гандикапом (closing) (double)."
+  - name: b365caha
+    description: "Bet365: котировка на победу гостей с азиатским гандикапом (closing) (double)."
+  - name: pcahh
+    description: "Pinnacle: котировка на победу хозяев с азиатским гандикапом (closing) (double)."
+  - name: pcaha
+    description: "Pinnacle: котировка на победу гостей с азиатским гандикапом (closing) (double)."
+  - name: maxcahh
+    description: "Рыночный максимум котировки на победу хозяев с азиатским гандикапом (closing) (double)."
+  - name: maxcaha
+    description: "Рыночный максимум котировки на победу гостей с азиатским гандикапом (closing) (double)."
+  - name: avgcahh
+    description: "Рыночное среднее котировки на победу хозяев с азиатским гандикапом (closing) (double)."
+  - name: avgcaha
+    description: "Рыночное среднее котировки на победу гостей с азиатским гандикапом (closing) (double)."
+  - name: bfecahh
+    description: "Betfair Exchange: котировка на победу хозяев с азиатским гандикапом (closing) (double)."
+  - name: bfecaha
+    description: "Betfair Exchange: котировка на победу гостей с азиатским гандикапом (closing) (double)."
+  - name: league
+    description: "Лига (e.g. 'ENG-Premier League'); partition key."
+  - name: season
+    description: "Сезон — год начала (bigint, e.g. 2025); partition key."
+  - name: _source
+    description: "Источник данных ('matchhistory'); метаколонка Bronze."
+  - name: _entity_type
+    description: "Тип сущности в Bronze ('match_results'); метаколонка."
+  - name: _ingested_at
+    description: "Timestamp ingest'а строки в Bronze; метаколонка."
+  - name: _batch_id
+    description: "Идентификатор батча ingest'а; метаколонка."
+  - name: odds_home_avg
+    description: "Рассчитано скраппером: среднее по конторам — котировка на победу хозяев (double)."
+  - name: prob_home_implied
+    description: "Рассчитано скраппером: вменённая вероятность победы хозяев = 1/odds_home_avg (double)."
+  - name: odds_draw_avg
+    description: "Рассчитано скраппером: среднее по конторам — котировка на ничью (double)."
+  - name: prob_draw_implied
+    description: "Рассчитано скраппером: вменённая вероятность ничьи = 1/odds_draw_avg (double)."
+  - name: odds_away_avg
+    description: "Рассчитано скраппером: среднее по конторам — котировка на победу гостей (double)."
+  - name: prob_away_implied
+    description: "Рассчитано скраппером: вменённая вероятность победы гостей = 1/odds_away_avg (double)."
+  - name: overround
+    description: "Рассчитано скраппером: маржа букмекера = сумма вменённых вероятностей (double; обычно >1.0)."
+  - name: iwh
+    description: "Interwetten: котировка на победу хозяев (opening) (double)."
+  - name: iwd
+    description: "Interwetten: котировка на ничью (opening) (double)."
+  - name: iwa
+    description: "Interwetten: котировка на победу гостей (opening) (double)."
+  - name: odds_home_wh
+    description: "William Hill: котировка на победу хозяев (opening), WHH (double)."
+  - name: odds_draw_wh
+    description: "William Hill: котировка на ничью (opening), WHD (double)."
+  - name: odds_away_wh
+    description: "William Hill: котировка на победу гостей (opening), WHA (double)."
+  - name: odds_home_vc
+    description: "VC Bet (ныне BetVictor): котировка на победу хозяев (opening), VCH (double)."
+  - name: odds_draw_vc
+    description: "VC Bet (ныне BetVictor): котировка на ничью (opening), VCD (double)."
+  - name: odds_away_vc
+    description: "VC Bet (ныне BetVictor): котировка на победу гостей (opening), VCA (double)."
+  - name: iwch
+    description: "Interwetten: котировка на победу хозяев (closing) (double)."
+  - name: iwcd
+    description: "Interwetten: котировка на ничью (closing) (double)."
+  - name: iwca
+    description: "Interwetten: котировка на победу гостей (closing) (double)."
+  - name: whch
+    description: "William Hill: котировка на победу хозяев (closing) (double)."
+  - name: whcd
+    description: "William Hill: котировка на ничью (closing) (double)."
+  - name: whca
+    description: "William Hill: котировка на победу гостей (closing) (double)."
+  - name: vcch
+    description: "VC Bet: котировка на победу хозяев (closing) (double)."
+  - name: vccd
+    description: "VC Bet: котировка на ничью (closing) (double)."
+  - name: vcca
+    description: "VC Bet: котировка на победу гостей (closing) (double)."
+  - name: div
+    description: "Код дивизиона/лиги football-data.co.uk (varchar, e.g. 'E0'); сырая колонка CSV."
+  - name: bfh
+    description: "Betfair: котировка на победу хозяев (opening) (double)."
+  - name: bfd
+    description: "Betfair: котировка на ничью (opening) (double)."
+  - name: bfa
+    description: "Betfair: котировка на победу гостей (opening) (double)."
+  - name: "1xbh"
+    description: "1xBet: котировка на победу хозяев (opening) (double)."
+  - name: "1xbd"
+    description: "1xBet: котировка на ничью (opening) (double)."
+  - name: "1xba"
+    description: "1xBet: котировка на победу гостей (opening) (double)."
+  - name: bfch
+    description: "Betfair: котировка на победу хозяев (closing) (double)."
+  - name: bfcd
+    description: "Betfair: котировка на ничью (closing) (double)."
+  - name: bfca
+    description: "Betfair: котировка на победу гостей (closing) (double)."
+  - name: "1xbch"
+    description: "1xBet: котировка на победу хозяев (closing) (double)."
+  - name: "1xbcd"
+    description: "1xBet: котировка на ничью (closing) (double)."
+  - name: "1xbca"
+    description: "1xBet: котировка на победу гостей (closing) (double)."
