@@ -1,0 +1,115 @@
+# =============================================================================
+# OpenMetadata description: iceberg.bronze.capology_player_salaries
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.bronze.capology_player_salaries
+  description: |
+    Зарплаты футболистов с capology.com (весь сезон в одном ответе через
+    scrapers/capology, dag_ingest_capology, еженедельно). Grain — один row на (игрок,
+    клуб, сезон). Несёт анкету + зарплаты (gross/net, недельные/годовые, бонусы, итоги)
+    сразу в трёх валютах GBP/EUR/USD; единицы — целые единицы валюты (НЕ пенсы). Охват:
+    только ENG-Premier League (MVP), но много сезонов (2014/15…2025/26).
+    Партиционирование ['league','season','currency'].
+  tags:
+    - Tier.Bronze
+    - Domain.Football
+    - PII.Low
+columns:
+  - name: player_slug
+    description: Capology URL-слаг игрока (e.g. 'harry-kane').
+  - name: player_name
+    description: Имя игрока.
+    tags:
+      - PII.Low
+  - name: club_slug
+    description: Capology URL-слаг клуба.
+  - name: club_name
+    description: Название клуба.
+  - name: country_code
+    description: Гражданство игрока (код страны/флаг).
+  - name: verified
+    description: Флаг «проверенной» записи Capology (boolean).
+  - name: age
+    description: Возраст игрока, лет (bigint).
+  - name: position
+    description: Позиция (GK/DF/MF/FW).
+  - name: status
+    description: Контрактный статус игрока (e.g. 'Senior','Reserve').
+  - name: active
+    description: Действующий контракт (boolean).
+  - name: loan
+    description: Игрок в аренде (boolean).
+  - name: weekly_gross_gbp
+    description: Недельная зарплата до налога, GBP (bigint); = annual_gross / 52.
+  - name: annual_gross_gbp
+    description: Годовая зарплата до налога, GBP (bigint).
+  - name: weekly_net_gbp
+    description: Недельная зарплата после налога, GBP (bigint); = annual_net / 52.
+  - name: annual_net_gbp
+    description: Годовая зарплата после налога, GBP (bigint).
+  - name: bonus_gross_gbp
+    description: Годовой бонус до налога, GBP (double); ~90% NULL (бонусы редко раскрыты).
+  - name: bonus_net_gbp
+    description: Годовой бонус после налога, GBP (double); ~90% NULL.
+  - name: total_gross_gbp
+    description: Итог до налога (зарплата + бонус), GBP (bigint).
+  - name: total_net_gbp
+    description: Итог после налога (зарплата + бонус), GBP (bigint).
+  - name: adjusted_total_gross_gbp
+    description: Скорректированный итог до налога, GBP (bigint); ~19% NULL (завершённые сезоны).
+  - name: adjusted_total_net_gbp
+    description: Скорректированный итог после налога, GBP (bigint); ~19% NULL.
+  - name: currency
+    description: Валюта строки-партиции (пока только 'GBP'); partition key.
+  - name: league
+    description: Лига (e.g. 'ENG-Premier League'); partition key.
+  - name: season
+    description: Сезон в коротком виде (e.g. '2526'); partition key.
+  - name: _source
+    description: Источник данных ('capology'); метаколонка Bronze.
+  - name: _entity_type
+    description: Тип сущности в Bronze; метаколонка.
+  - name: _ingested_at
+    description: Timestamp ingest'а строки в Bronze; метаколонка.
+  - name: _batch_id
+    description: Идентификатор батча ingest'а; метаколонка.
+  - name: weekly_gross_eur
+    description: Недельная зарплата до налога, EUR (double).
+  - name: weekly_gross_usd
+    description: Недельная зарплата до налога, USD (double).
+  - name: annual_gross_eur
+    description: Годовая зарплата до налога, EUR (double).
+  - name: annual_gross_usd
+    description: Годовая зарплата до налога, USD (double).
+  - name: weekly_net_eur
+    description: Недельная зарплата после налога, EUR (double).
+  - name: weekly_net_usd
+    description: Недельная зарплата после налога, USD (double).
+  - name: annual_net_eur
+    description: Годовая зарплата после налога, EUR (double).
+  - name: annual_net_usd
+    description: Годовая зарплата после налога, USD (double).
+  - name: bonus_gross_eur
+    description: Годовой бонус до налога, EUR (double); ~90% NULL.
+  - name: bonus_gross_usd
+    description: Годовой бонус до налога, USD (double); ~90% NULL.
+  - name: bonus_net_eur
+    description: Годовой бонус после налога, EUR (double); ~90% NULL.
+  - name: bonus_net_usd
+    description: Годовой бонус после налога, USD (double); ~90% NULL.
+  - name: total_gross_eur
+    description: Итог до налога (зарплата + бонус), EUR (double).
+  - name: total_gross_usd
+    description: Итог до налога (зарплата + бонус), USD (double).
+  - name: total_net_eur
+    description: Итог после налога (зарплата + бонус), EUR (double).
+  - name: total_net_usd
+    description: Итог после налога (зарплата + бонус), USD (double).
+  - name: adjusted_total_gross_eur
+    description: Скорректированный итог до налога, EUR (double); ~19% NULL.
+  - name: adjusted_total_gross_usd
+    description: Скорректированный итог до налога, USD (double); ~19% NULL.
+  - name: adjusted_total_net_eur
+    description: Скорректированный итог после налога, EUR (double); ~19% NULL.
+  - name: adjusted_total_net_usd
+    description: Скорректированный итог после налога, USD (double); ~19% NULL.
