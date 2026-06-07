@@ -1,0 +1,38 @@
+# =============================================================================
+# OpenMetadata description: iceberg.bronze.sofifa_players
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.bronze.sofifa_players
+  description: |
+    Каталог игроков с sofifa.com — сайта-зеркала рейтингов из видеоигры EA Sports FC /
+    FIFA (через scrapers/sofifa + FlareSolverr, dag_ingest_sofifa, еженедельно). Grain —
+    один row на (игрок, издание игры). Несёт только идентификацию игрока; детальные
+    атрибуты (скорость/удар/пас…) живут в sofifa_player_ratings. Партиционирование
+    ['fifa_edition'].
+  tags:
+    - Tier.Bronze
+    - Domain.Football
+    - PII.Low
+columns:
+  - name: player_id
+    description: SoFIFA id игрока (bigint).
+  - name: player
+    description: Имя игрока.
+    tags:
+      - PII.Low
+  - name: team
+    description: Текущий клуб игрока.
+  - name: league
+    description: Лига (e.g. 'ENG-Premier League').
+  - name: fifa_edition
+    description: Издание игры (e.g. 'FC 26'); partition key.
+  - name: update
+    description: Метка обновления ростера на sofifa.com (e.g. 'Jun 2, 2026').
+  - name: _source
+    description: Источник данных ('sofifa'); метаколонка Bronze.
+  - name: _entity_type
+    description: Тип сущности в Bronze; метаколонка.
+  - name: _ingested_at
+    description: Timestamp ingest'а строки в Bronze; метаколонка.
+  - name: _batch_id
+    description: Идентификатор батча ingest'а; метаколонка.
