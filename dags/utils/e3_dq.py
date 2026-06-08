@@ -559,7 +559,7 @@ def _build_whoscored_events_spadl_checks() -> List[Check]:
 
 
 # ---------------------------------------------------------------------------
-# Silver — whoscored_team_match / whoscored_team_season (T6.3, #92)
+# Silver — whoscored_team_match (T6.3, #92). Season rollup migrated to Gold (#370).
 # ---------------------------------------------------------------------------
 
 def _build_whoscored_team_match_checks() -> List[Check]:
@@ -583,36 +583,6 @@ def _build_whoscored_team_match_checks() -> List[Check]:
             cols=['match_id', 'team_id', 'league', 'season'],
         ),
         CHECK.row_count(table, min_rows=600, severity='WARNING'),
-        CHECK.freshness(
-            table=table,
-            ts_col='_silver_created_at',
-            max_age_hours=48,
-            severity='WARNING',
-        ),
-    ]
-
-
-def _build_whoscored_team_season_checks() -> List[Check]:
-    """DQ for ``iceberg.silver.whoscored_team_season`` (T6.3 / #92).
-
-    Season-grain rollup из ``silver.whoscored_team_match`` GROUP BY
-    (team_id, league, season). Feeds the WhoScored block of Gold
-    ``fct_team_season_stats`` (#94).
-
-    Volume floor: 20 APL teams per season; multi-season backfill ≈ 140.
-    Min 20 (WARNING) is a single-season floor.
-    """
-    table = 'iceberg.silver.whoscored_team_season'
-    return [
-        CHECK.no_duplicates(
-            table,
-            pk=['team_id', 'league', 'season'],
-        ),
-        CHECK.no_nulls(
-            table,
-            cols=['team_id', 'league', 'season', 'matches_seen'],
-        ),
-        CHECK.row_count(table, min_rows=20, severity='WARNING'),
         CHECK.freshness(
             table=table,
             ts_col='_silver_created_at',
@@ -1031,39 +1001,6 @@ def _build_sofascore_team_match_checks() -> List[Check]:
     ]
 
 
-def _build_sofascore_team_season_checks() -> List[Check]:
-    """DQ for ``iceberg.silver.sofascore_team_season`` (T6.4 / issue #93).
-
-    SUM/AVG rollup from ``silver.sofascore_team_match`` — 20 teams per APL season.
-    """
-    table = 'iceberg.silver.sofascore_team_season'
-    return [
-        CHECK.no_duplicates(
-            table,
-            pk=['team_id', 'league', 'season'],
-            severity='ERROR',
-        ),
-        CHECK.no_nulls(
-            table,
-            cols=['team_id', 'league', 'season'],
-            severity='ERROR',
-        ),
-        # Issue #93 acceptance: 20 APL clubs per season (allow ≥18 for early backfills).
-        CHECK.row_count(
-            table,
-            min_rows=18,
-            where="league = 'ENG-Premier League' AND season = '2526'",
-            severity='ERROR',
-        ),
-        CHECK.freshness(
-            table,
-            ts_col='_bronze_ingested_at',
-            max_age_hours=72,
-            severity='WARNING',
-        ),
-    ]
-
-
 def _build_understat_team_match_checks() -> List[Check]:
     """DQ for ``iceberg.silver.understat_team_match`` (T6.2 / #91).
 
@@ -1104,60 +1041,23 @@ def _build_understat_team_match_checks() -> List[Check]:
     ]
 
 
-def _build_understat_team_season_checks() -> List[Check]:
-    """DQ for ``iceberg.silver.understat_team_season`` (T6.2 / #91).
-
-    Rollup of ``silver.understat_team_match``; 20 APL clubs / season=2425.
-    """
-    table = 'iceberg.silver.understat_team_season'
-    return [
-        CHECK.no_duplicates(
-            table,
-            pk=['team_id_canonical', 'league', 'season'],
-            severity='ERROR',
-        ),
-        CHECK.no_nulls(
-            table,
-            cols=['team_id_canonical', 'league', 'season'],
-            severity='ERROR',
-        ),
-        CHECK.no_nulls(
-            table,
-            cols=['xg', 'xg_against'],
-            severity='ERROR',
-        ),
-        CHECK.row_count(
-            table,
-            min_rows=20,
-            where="league = 'ENG-Premier League' AND season = '2425'",
-            severity='ERROR',
-        ),
-        CHECK.freshness(
-            table,
-            ts_col='_bronze_ingested_at',
-            max_age_hours=48,
-            severity='ERROR',
-        ),
-    ]
-
-
 def build_silver_e3_checks() -> List[Check]:
     """Return DQ checks for Silver E3 tables.
 
-    Composition: ``whoscored_events_spadl`` + WhoScored team aggregates (T6.3) +
-    Understat team aggregates (T6.2) +
-    ``espn_lineup`` + ``sofascore_player_profile`` + SofaScore team aggregates (T6.4).
+    Composition: ``whoscored_events_spadl`` + WhoScored team match-aggregate (T6.3) +
+    Understat team match-aggregate (T6.2) +
+    ``espn_lineup`` + ``sofascore_player_profile`` + SofaScore team match-aggregate (T6.4).
+
+    The *_team_season rollups (whoscored/understat/sofascore) moved to the Gold
+    layer in #370 — their PK-uniqueness DQ now lives in ``validate_gold_quality``.
     """
     return (
         _build_whoscored_events_spadl_checks()
         + _build_whoscored_team_match_checks()
-        + _build_whoscored_team_season_checks()
         + _build_understat_team_match_checks()
-        + _build_understat_team_season_checks()
         + _build_espn_lineup_checks()
         + _build_sofascore_player_profile_checks()
         + _build_sofascore_team_match_checks()
-        + _build_sofascore_team_season_checks()
     )
 
 

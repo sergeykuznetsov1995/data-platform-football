@@ -45,17 +45,17 @@ class TestCheckCounts:
     """Per-table check counts must match the contract documented in e3_dq.py."""
 
     def test_silver_e3_total_check_count(self):
-        """Silver builders compose 9 sub-builders = 44 checks total.
+        """Silver builders compose 6 sub-builders = 31 checks total.
 
-        whoscored_events_spadl (9) + whoscored_team_match + whoscored_team_season
-        (T6.3) + understat_team_match + understat_team_season (T6.2) +
-        espn_lineup (4) + sofascore_player_profile + sofascore_team_match +
-        sofascore_team_season (T6.4). Bump this number whenever a builder is
-        added to ``build_silver_e3_checks``.
+        whoscored_events_spadl (9) + whoscored_team_match (T6.3) +
+        understat_team_match (T6.2) + espn_lineup (4) + sofascore_player_profile +
+        sofascore_team_match (T6.4). The 3 *_team_season rollups migrated to Gold
+        in #370 (their PK-uniqueness DQ now lives in validate_gold_quality). Bump
+        this number whenever a builder is added to ``build_silver_e3_checks``.
         """
         checks = e3_dq.build_silver_e3_checks()
-        assert len(checks) == 44, (
-            f"Silver E3 expected 44 checks, got {len(checks)}: "
+        assert len(checks) == 31, (
+            f"Silver E3 expected 31 checks, got {len(checks)}: "
             f"{[c.name for c in checks]}"
         )
 
@@ -132,13 +132,13 @@ class TestCheckCounts:
         assert len(fct_lineup) == 9
 
     def test_build_all_e3_checks_total(self):
-        """44 silver + 27 gold = 71 total E3 standard DQ checks.
+        """31 silver + 27 gold = 58 total E3 standard DQ checks.
 
-        Bump when either ``build_silver_e3_checks`` (44) or
+        Bump when either ``build_silver_e3_checks`` (31) or
         ``build_gold_e3_checks`` (27) gains a builder.
         """
         all_checks = e3_dq.build_all_e3_checks()
-        assert len(all_checks) == 71
+        assert len(all_checks) == 58
 
 
 # ===========================================================================
@@ -336,13 +336,13 @@ class TestWarningSeverityChecks:
         )
         assert x_range.severity == "WARNING"
 
-    # Understat team aggregates intentionally run freshness at ERROR: Understat
-    # is the xG-primary source (RX2, ~99% coverage), so a stale understat feed
-    # poisons every downstream xG feature/prediction — worth failing the DAG.
-    # Every other E3 table keeps freshness at WARNING (single missed run is OK).
+    # Understat team match-aggregate intentionally runs freshness at ERROR:
+    # Understat is the xG-primary source (RX2, ~99% coverage), so a stale
+    # understat feed poisons every downstream xG feature/prediction — worth
+    # failing the DAG. Every other E3 table keeps freshness at WARNING (single
+    # missed run is OK). NB: understat_team_season migrated to Gold in #370.
     _ERROR_FRESHNESS_TABLES = {
         "iceberg.silver.understat_team_match",
-        "iceberg.silver.understat_team_season",
     }
 
     def test_freshness_is_warning(self):
@@ -366,8 +366,8 @@ class TestWarningSeverityChecks:
             if c.kind == "freshness"
             and c.params.get("table") in self._ERROR_FRESHNESS_TABLES
         ]
-        assert len(understat_fresh) == 2, (
-            f"expected 2 Understat freshness checks, got {len(understat_fresh)}"
+        assert len(understat_fresh) == 1, (
+            f"expected 1 Understat freshness check, got {len(understat_fresh)}"
         )
         for c in understat_fresh:
             assert c.severity == "ERROR", (

@@ -62,7 +62,7 @@ xref_ss AS (
 ),
 
 -- FotMob xref (#97). season is YEAR-START '2025' (like FBref) → JOIN on
--- CAST(season_year AS varchar); silver.fotmob_team_season.season is slug.
+-- CAST(season_year AS varchar); gold.fotmob_team_season.season is slug.
 xref_fm AS (
     SELECT DISTINCT
         canonical_id,
@@ -146,7 +146,7 @@ INNER JOIN iceberg.silver.fbref_team_season_profile fb
     ON  fb.team    = xf.fbref_team_name
     AND fb.league  = xf.league
     AND fb.season  = xf.season_year
-INNER JOIN iceberg.silver.understat_team_season us
+INNER JOIN iceberg.gold.understat_team_season us
     ON  us.team_id_canonical = xf.canonical_id
     AND us.league            = xf.league
     AND us.season            = xf.season_slug
@@ -158,7 +158,7 @@ LEFT JOIN ws_name_to_id wn
     ON  wn.ws_team_name = xw.ws_team_name
     AND wn.league       = xw.league
     AND wn.season       = xw.season_slug
-LEFT JOIN iceberg.silver.whoscored_team_season ws
+LEFT JOIN iceberg.gold.whoscored_team_season ws
     ON  ws.team_id = wn.ws_team_id
     AND ws.league  = wn.league
     AND ws.season  = wn.season
@@ -166,7 +166,7 @@ LEFT JOIN xref_ss xs
     ON  xs.canonical_id = xf.canonical_id
     AND xs.league       = xf.league
     AND xs.season_slug  = xf.season_slug
-LEFT JOIN iceberg.silver.sofascore_team_season ss
+LEFT JOIN iceberg.gold.sofascore_team_season ss
     ON  ss.team_id = xs.ss_team_name
     AND ss.league  = xs.league
     AND ss.season  = xs.season_slug
@@ -174,7 +174,7 @@ LEFT JOIN xref_fm xfm
     ON  xfm.canonical_id    = xf.canonical_id
     AND xfm.league          = xf.league
     AND xfm.season_year_str = CAST(xf.season_year AS varchar)
-LEFT JOIN iceberg.silver.fotmob_team_season fm
+LEFT JOIN iceberg.gold.fotmob_team_season fm
     ON  fm.team_id = xfm.fm_team_name
     AND fm.league  = xf.league
     AND fm.season  = xf.season_slug

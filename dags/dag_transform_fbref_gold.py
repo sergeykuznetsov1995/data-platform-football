@@ -83,6 +83,19 @@ from utils.default_args import SILVER_ARGS
 # Order matters: dim_* must be built before fct_* which reference them;
 # feat_* depend on fct_team_match; fct_match depends on feat_*.
 
+# Stage 1.5: per-source season aggregates (migrated from Silver, issue #370).
+# True match→season rollups that the Silver Charter assigns to Gold. They read
+# silver.*_team_match directly (legitimate Gold→Silver one-hop) and feed the
+# cross-source fct_team_season_stats / _audit in Stage 2 — so they MUST build
+# first. Pure GROUP BY rollups (uniqueness guaranteed by the group key), so no
+# extra DQ here; the cross-source facts downstream carry the validation.
+STAGE_1_5_SOURCE_SEASON_AGG = [
+    ('fotmob_team_season',    'dags/sql/gold/fotmob_team_season.sql',    'fotmob_team_season',    ['league', 'season']),
+    ('understat_team_season', 'dags/sql/gold/understat_team_season.sql', 'understat_team_season', ['league', 'season']),
+    ('whoscored_team_season', 'dags/sql/gold/whoscored_team_season.sql', 'whoscored_team_season', ['league', 'season']),
+    ('sofascore_team_season', 'dags/sql/gold/sofascore_team_season.sql', 'sofascore_team_season', ['league', 'season']),
+]
+
 STAGE_2_DIMS = [
     ('dim_team',   'dags/sql/gold/dim_team.sql',   'dim_team',   ['league', 'season']),
     ('dim_player', 'dags/sql/gold/dim_player.sql', 'dim_player', ['league', 'season']),
@@ -329,6 +342,17 @@ with DAG(
     doc_md=__doc__,
 ) as dag:
 
+    # Stage 1.5: per-source season aggregates migrated from Silver (#370).
+    # Must precede s2_dimensions because fct_team_season_stats (in g2) reads them.
+    with TaskGroup(group_id='s1_5_source_season_agg') as g1_5:
+        for task_id, sql_file, table_name, pcols in STAGE_1_5_SOURCE_SEASON_AGG:
+            PythonOperator(
+                task_id=task_id,
+                python_callable=_run_transform,
+                op_kwargs={'sql_file': sql_file, 'table_name': table_name,
+                           'partition_cols': pcols},
+            )
+
     # Stage 2: dimensions (read silver.xref_* directly since E1.5)
     with TaskGroup(group_id='s2_dimensions') as g2:
         for task_id, sql_file, table_name, pcols in STAGE_2_DIMS:
@@ -471,4 +495,4 @@ with DAG(
         python_callable=_quality,
     )
 
-    g2 >> g2b >> g3 >> g4 >> g5 >> g6 >> g7 >> validate_row_counts >> validate_quality
+    g1_5 >> g2 >> g2b >> g3 >> g4 >> g5 >> g6 >> g7 >> validate_row_counts >> validate_quality

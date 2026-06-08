@@ -1,5 +1,5 @@
 -- =============================================================================
--- Silver: fotmob_team_season
+-- Gold: fotmob_team_season (per-source season aggregate; migrated from Silver, #370)
 -- =============================================================================
 --
 -- One row per (team_id, league, season) — FotMob team-level season aggregate.

@@ -31,7 +31,6 @@ Silver Tables Created:
     iceberg.silver.fotmob_keeper_profile
     iceberg.silver.fotmob_player_market_value_history
     iceberg.silver.fotmob_team_match
-    iceberg.silver.fotmob_team_season
 """
 
 from datetime import datetime
@@ -77,13 +76,6 @@ SILVER_TRANSFORMS = [
         'dags/sql/silver/fotmob_team_match.sql',
         'fotmob_team_match',
     ),
-    # issue #97 Phase B: season rollup из silver.fotmob_team_match (SUM / COUNT).
-    # Питает gold.fct_team_season_stats (5-source) и его audit-таблицу.
-    (
-        'team_season',
-        'dags/sql/silver/fotmob_team_season.sql',
-        'fotmob_team_season',
-    ),
     # issue #290: судья матча + СТРАНА (FotMob-only) из match_facts_json.
     # Future namesake-дизамбигуатор для xref_referee при мульти-лиговом scope.
     (
@@ -107,8 +99,6 @@ SILVER_MIN_ROWS = {
     # team_match: ~338 finished matches × 2 sides = 676 rows для APL 2025/26
     # (7% бронзы без stats_json — cancelled / not finished). Floor 600 c headroom.
     'fotmob_team_match': 600,
-    # team_season: rollup → ~20 команд APL за сезон. Floor 18 c headroom.
-    'fotmob_team_season': 18,
     # match_referee: ~380 матчей APL 2025/26 со 100% покрытием судьи (issue #290).
     # Floor 300 c headroom под матчи без referee.text.
     'fotmob_match_referee': 300,
@@ -382,34 +372,6 @@ def _validate_silver_quality(**context) -> Dict[str, Any]:
         ),
         CHECK.coverage(
             'silver.fotmob_team_match',
-            column='expected_assists',
-            warn_threshold=0.95,
-            error_threshold=0.80,
-        ),
-
-        # --- team_season (issue #97 Phase B) ---
-        # ERROR: PK uniqueness + floor count.
-        # WARNING: freshness + coverage(expected_assists) — season xA — raison d'être.
-        CHECK.no_nulls(
-            'silver.fotmob_team_season',
-            cols=['team_id', 'league', 'season'],
-        ),
-        CHECK.no_duplicates(
-            'silver.fotmob_team_season',
-            pk=['team_id', 'league', 'season'],
-        ),
-        CHECK.row_count(
-            'silver.fotmob_team_season',
-            min_rows=18,
-        ),
-        CHECK.freshness(
-            'silver.fotmob_team_season',
-            ts_col='_bronze_ingested_at',
-            max_age_hours=FRESH_HOURS,
-            severity='WARNING',
-        ),
-        CHECK.coverage(
-            'silver.fotmob_team_season',
             column='expected_assists',
             warn_threshold=0.95,
             error_threshold=0.80,

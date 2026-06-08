@@ -70,13 +70,13 @@ GRAIN_TOKENS = (
 
 # Sanctioned registry — keep in sync with docs/decisions/silver-charter.md §7.
 SANCTIONED: dict[str, tuple[str, str]] = {
-    'fotmob_team_season': ('EXCEPTION', 'season-rollup feeding gold.fct_team_season_stats (#94/#97)'),
-    'understat_team_season': ('EXCEPTION', 'season-rollup feeding Gold'),
-    'whoscored_team_season': ('EXCEPTION', 'season-rollup feeding Gold'),
-    'sofascore_team_season': ('EXCEPTION', 'season-rollup feeding Gold'),
-    'fbref_team_season_profile': ('EXCEPTION', 'season-rollup feeding Gold'),
-    'whoscored_player_season_aggregate': ('EXCEPTION', 'player season-rollup feeding Gold'),
-    'fotmob_player_season_profile': ('EXCEPTION', 'PIVOT+rollup feeding Gold'),
+    # #370 team-wave DONE: the 4 team-season rollups moved to gold.*_team_season
+    # (built by dag_transform_fbref_gold) and their silver SQL was deleted, so
+    # they no longer exist to scan. fbref_team_season_profile stays in Silver but
+    # is now COMPLIANT (season-from-season conform, not a match→season rollup —
+    # R1 detector refined to require a match/event source).
+    'whoscored_player_season_aggregate': ('EXCEPTION', 'player season-rollup feeding Gold; migration #370 PR2'),
+    'fotmob_player_season_profile': ('EXCEPTION', 'PIVOT of season-grain Bronze; reclassify in #370 PR2'),
     # sofascore_team_match: resolved #367 — cross-entity minutes/assists rollup
     # moved out; now a clean single-source conform (PIVOT match_stats + schedule). COMPLIANT.
     # Cross-source E3/E4 facts (FBref+WhoScored union + canonical resolve) living in
@@ -108,6 +108,13 @@ _COMMENT_LINE = re.compile(r'--[^\n]*')
 _COMMENT_BLOCK = re.compile(r'/\*.*?\*/', re.DOTALL)
 _AGG = re.compile(r'\b(SUM|AVG|MIN|MAX|COUNT)\s*\(', re.IGNORECASE)
 _GROUP_BY = re.compile(r'\bGROUP\s+BY\b', re.IGNORECASE)
+# A reference to a finer-grain (match / event) source. R1 only fires when a
+# season-grain table actually rolls UP from one of these (charter §2: "grain
+# change upward, season from match"). A season-grain table built from
+# already-season-grain Bronze (dedup / PIVOT / intra-season player→team agg)
+# is conform, not a rollup — issue #370.
+_MATCH_GRAIN_SRC = re.compile(r'iceberg\.(?:bronze|silver)\.[a-z0-9_]*(?:_match|_events)',
+                              re.IGNORECASE)
 _DDL = re.compile(r'\b(CREATE\s+TABLE|CREATE\s+OR\s+REPLACE|INSERT\s+INTO)\b', re.IGNORECASE)
 _SILVER_REF = re.compile(r'iceberg\.silver\.([a-z0-9_]+)', re.IGNORECASE)
 _ANY_REF = re.compile(r'iceberg\.(?:bronze|silver)\.([a-z0-9_]+)', re.IGNORECASE)
@@ -149,10 +156,15 @@ def audit_file(path: Path) -> list[dict]:
     if _DDL.search(sql):
         findings.append({'rule': 'R6', 'sev': 'ERROR', 'detail': 'file contains DDL (CREATE/INSERT)'})
 
-    # R1 ROLLUP — GROUP BY + aggregate on a season-grain table = grain change upward.
-    if grain_of(stem) == 'season' and _GROUP_BY.search(sql) and _AGG.search(sql):
+    # R1 ROLLUP — GROUP BY + aggregate on a season-grain table that ALSO reads a
+    # finer-grain (match / event) source = grain change upward. A season-grain
+    # table built from already-season-grain Bronze (dedup / PIVOT / intra-season
+    # player→team aggregation) is conform, NOT a rollup — charter §2 (#370).
+    if (grain_of(stem) == 'season' and _GROUP_BY.search(sql) and _AGG.search(sql)
+            and _MATCH_GRAIN_SRC.search(sql)):
         findings.append({'rule': 'R1', 'sev': 'ERROR',
-                         'detail': 'season-grain rollup (GROUP BY + aggregate) — fact aggregation'})
+                         'detail': 'season-grain rollup (GROUP BY + aggregate over a '
+                                   'match/event source) — fact aggregation'})
 
     # R2 SILVER_ON_SILVER — reads another silver table (non-xref, non-self).
     silver_refs = sorted({m for m in _SILVER_REF.findall(sql)

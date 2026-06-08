@@ -89,9 +89,19 @@ class TestUnsanctionedErrorGate:
         assert mod.has_unsanctioned_error('some_new_table', findings) is True
 
     def test_error_on_sanctioned_table_does_not_trip_gate(self):
-        # fotmob_team_season is a registry EXCEPTION — sanctioned, must not block.
+        # whoscored_player_season_aggregate is a registry EXCEPTION — sanctioned,
+        # must not block (the 4 *_team_season rollups were migrated out in #370).
         findings = [{'rule': 'R1', 'sev': 'ERROR', 'detail': 'season-grain rollup'}]
-        assert mod.has_unsanctioned_error('fotmob_team_season', findings) is False
+        assert mod.has_unsanctioned_error('whoscored_player_season_aggregate', findings) is False
+
+    def test_migrated_team_season_no_longer_sanctioned(self):
+        # #370 team-wave: the 4 *_team_season rollups moved to Gold; their silver
+        # SQL was deleted, so they are no longer in the registry. fbref_team_season_profile
+        # stays in Silver but is now COMPLIANT (season-from-season conform, not a rollup).
+        for t in ('fotmob_team_season', 'understat_team_season',
+                  'whoscored_team_season', 'sofascore_team_season',
+                  'fbref_team_season_profile'):
+            assert t not in mod.SANCTIONED
 
     def test_no_findings_does_not_trip_gate(self):
         assert mod.has_unsanctioned_error('some_new_table', []) is False

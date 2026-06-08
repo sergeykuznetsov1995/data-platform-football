@@ -49,7 +49,7 @@ where analysis happens.
 
 | Anti-pattern | Why it's Gold | Live example |
 |---|---|---|
-| **Grain rollup** | `SUM/AVG/COUNT ... GROUP BY` that turns match-grain into season-grain is a fact aggregation | `fotmob_team_season`, `understat_team_season` |
+| **Grain rollup** | `SUM/AVG/COUNT ... GROUP BY` that turns match-grain into season-grain is a fact aggregation | `whoscored_player_season_aggregate` (the 4 `*_team_season` rollups migrated to Gold — #370) |
 | **Cross-entity / cross-source business JOIN** | assembling an analytical row from ≥2 different sources/entities (xref excepted) is fact assembly | (resolved: was `sofascore_team_match`; now COMPLIANT — #367) |
 | **PIVOT + join + rollup as a mart** | building a presentation table, not conforming one entity | (resolved: was `sofascore_team_match`; now COMPLIANT — #367) |
 | **ML features / cross-row derivations** | rolling form, rest-days, ELO-derived, ratios between matches | (none in Silver — keep it that way) |
@@ -157,18 +157,20 @@ here is rewritten in this pass** — this charter + checker land first.
 
 | Table | Verdict | Rules | Rationale / Action |
 |---|---|---|---|
-| `fotmob_team_season` | EXCEPTION | R1, R2 | season-rollup feeding `gold.fct_team_season_stats` (#94/#97). Documented; pending Gold migration. |
-| `understat_team_season` | EXCEPTION | R1, R2 | same |
-| `whoscored_team_season` | EXCEPTION | R1, R2 | same |
-| `sofascore_team_season` | EXCEPTION | R1, R2 | same |
-| `fbref_team_season_profile` | EXCEPTION | R1 | season-rollup; feeds Gold. |
-| `whoscored_player_season_aggregate` | EXCEPTION | R1 | player season-rollup; feeds Gold. |
-| `fotmob_player_season_profile` | EXCEPTION | R1 | PIVOT+rollup; feeds Gold. |
+| ~~`fotmob_team_season`~~ | MIGRATED | — | #370 team-wave: rollup moved to `gold.fotmob_team_season`, silver SQL deleted. |
+| ~~`understat_team_season`~~ | MIGRATED | — | #370 team-wave: moved to `gold.understat_team_season`. |
+| ~~`whoscored_team_season`~~ | MIGRATED | — | #370 team-wave: moved to `gold.whoscored_team_season`. |
+| ~~`sofascore_team_season`~~ | MIGRATED | — | #370 team-wave: moved to `gold.sofascore_team_season`. |
+| `fbref_team_season_profile` | COMPLIANT | — | #370: season-from-season conform (reads season-grain `bronze.fbref_team_*` + intra-season GK agg), NOT a match→season rollup. R1 detector refined to require a match/event source. |
+| `whoscored_player_season_aggregate` | EXCEPTION | R1 | player season-rollup (reads `silver.whoscored_events_spadl`); feeds Gold. Migration #370 PR2. |
+| `fotmob_player_season_profile` | EXCEPTION | — | PIVOT of season-grain Bronze; no longer trips R1 after the #370 detector refinement. Removed from registry in #370 PR2. |
 | `match_cards` | EXCEPTION | R2, R4, R5 | cross-source union (FBref+WhoScored) + canonical resolve — E3/E4 fact in Silver. Feeds thin `gold.fct_card`. Sanctioned (#368 decided); Gold migration tracked in #382. |
 | `match_substitutions` | EXCEPTION | R2, R4, R5 | same cross-source-fact pattern; feeds thin `gold.fct_substitution`. Sanctioned (#368 decided); Gold migration tracked in #382. |
 | `whoscored_team_match` | REVIEW | R2 | aggregates `silver.whoscored_events_spadl` to team×match (same-source) — manual review; likely conform. |
 
-> The 7 EXCEPTION season-rollups above are tracked for Gold migration in issue #370.
+> #370 team-wave (DONE): the 4 `*_team_season` rollups moved to `gold.*_team_season`
+> (built by `dag_transform_fbref_gold`, Stage 1.5) and `fbref_team_season_profile` was
+> reclassified COMPLIANT. The 2 player-side tables migrate in #370 PR2.
 > The 2 cross-source EXCEPTION facts (`match_cards`, `match_substitutions`) are tracked for
 > Gold migration in issue #382.
 > `sofifa_player_profile_empty` — RESOLVED (#369): not a standalone table, it is the empty
@@ -208,3 +210,4 @@ fix synchronised with their Gold consumers (separate issue). Full slug unificati
 | 2026-06-08 | Layer B S2: sanction year-start `season` (13 tables) as WARN; §4/§7 updated. | #373 |
 | 2026-06-08 | `sofascore_team_match` R2 resolved (#367): the cross-entity `minutes`/`assists` rollup from `silver.sofascore_player_match_aggregate` was dropped (it never matched on team_id — always NULL); columns kept as NULL placeholders to preserve the downstream schema. Table is now COMPLIANT single-source conform. | #367 |
 | 2026-06-08 | `match_cards` / `match_substitutions` moved REVIEW→EXCEPTION (cross-source E3/E4 facts feeding thin `gold.fct_card` / `fct_substitution`); Gold migration tracked separately. | #368 / #382 |
+| 2026-06-08 | #370 team-wave: 4 `*_team_season` rollups migrated Silver→Gold (`gold.*_team_season`, Stage 1.5 of `dag_transform_fbref_gold`); `fct_team_season_stats` + audit repointed; `fbref_team_season_profile` reclassified COMPLIANT; R1 detector tightened to require a match/event source. | #370 |

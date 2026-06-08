@@ -1,5 +1,5 @@
 -- =============================================================================
--- Silver: sofascore_team_season
+-- Gold: sofascore_team_season (per-source season aggregate; migrated from Silver, #370)
 -- =============================================================================
 --
 -- One row per (team_id, league, season) — season-level SofaScore team
