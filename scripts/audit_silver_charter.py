@@ -40,6 +40,20 @@ from pathlib import Path
 
 SILVER_SQL_DIR = Path(__file__).resolve().parent.parent / 'dags' / 'sql' / 'silver'
 
+# Fallback files (`*_empty.sql`) materialize an *existing* Silver table with a
+# typed 0-row spine when its Bronze source is absent (e.g. SoFIFA Cloudflare
+# freeze — issue #180). They are not standalone tables, so they are excluded
+# from the per-table audit (else they show up as phantom "dead stub" tables —
+# the false positive that prompted issue #369).
+FALLBACK_SUFFIX = '_empty'
+
+
+def silver_sql_files() -> list[Path]:
+    """Silver SELECT files to audit — fallback `*_empty.sql` excluded (#369)."""
+    files = sorted(SILVER_SQL_DIR.glob('*.sql')) + sorted(SILVER_SQL_DIR.glob('*.sql.j2'))
+    return [f for f in files
+            if not f.name.replace('.sql.j2', '').replace('.sql', '').endswith(FALLBACK_SUFFIX)]
+
 # Source prefixes (order matters — longest unambiguous first is not needed, all distinct).
 SOURCE_PREFIXES = (
     'fbref', 'fotmob', 'understat', 'whoscored', 'sofascore',
@@ -70,7 +84,9 @@ SANCTIONED: dict[str, tuple[str, str]] = {
     # tracked in #382 (#368 decided). Charter §7.
     'match_cards': ('EXCEPTION', 'cross-source fact feeding gold.fct_card; Gold migration #382'),
     'match_substitutions': ('EXCEPTION', 'cross-source fact feeding gold.fct_substitution; Gold migration #382'),
-    'sofifa_player_profile_empty': ('INVESTIGATE', 'possible dead stub'),
+    # sofifa_player_profile_empty: resolved #369 — it is the empty fallback for
+    # silver.sofifa_player_profile (issue #180), not a standalone table. Now
+    # excluded from the scan (see FALLBACK_SUFFIX), so no registry entry needed.
 }
 
 # Tables whose `season` is legitimately stored year-start (bigint `2024`),
@@ -272,7 +288,7 @@ def main() -> None:
                    help='gate mode: Layer A only, exit 1 on unsanctioned ERROR (#372)')
     args = p.parse_args()
 
-    files = sorted(SILVER_SQL_DIR.glob('*.sql')) + sorted(SILVER_SQL_DIR.glob('*.sql.j2'))
+    files = silver_sql_files()
     if args.table:
         files = [f for f in files if f.name.replace('.sql.j2', '').replace('.sql', '') == args.table]
         if not files:
