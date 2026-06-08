@@ -1,5 +1,5 @@
 -- =============================================================================
--- Silver: whoscored_team_season
+-- Gold: whoscored_team_season (per-source season aggregate; migrated from Silver, #370)
 -- =============================================================================
 --
 -- One row per (team_id, league, season) — season rollup of

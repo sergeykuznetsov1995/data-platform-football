@@ -149,20 +149,11 @@ SILVER_E3_TRANSFORMS = [
         # GROUP BY on silver.whoscored_events_spadl — pass/take-on/tackle/
         # interception/shot/foul/spatial counters via COUNT_IF. Feeds the
         # WhoScored block of gold.fct_team_match v2 (#95). MUST run after
-        # whoscored_events_spadl. MUST run BEFORE whoscored_team_season
-        # (which rolls up from this table).
+        # whoscored_events_spadl. The season rollup (gold.whoscored_team_season)
+        # reads this table from the Gold DAG (#370).
         'whoscored_team_match',
         'dags/sql/silver/whoscored_team_match.sql',
         'whoscored_team_match',
-    ),
-    (
-        # T6.3 (#92): per-(team_id, league, season) WhoScored team
-        # season-aggregate. SUM rollup из silver.whoscored_team_match —
-        # pct/share recomputed at season grain from SUM(ok)/SUM(total).
-        # Feeds WhoScored block of gold.fct_team_season_stats (#94).
-        'whoscored_team_season',
-        'dags/sql/silver/whoscored_team_season.sql',
-        'whoscored_team_season',
     ),
     (
         # Per-(canonical_id, league, season) aggregate of Understat player
@@ -188,20 +179,11 @@ SILVER_E3_TRANSFORMS = [
         # match-facts (xG/NPxG/PPDA/deep/points/xPts). UNION ALL home+away из
         # bronze.understat_team_match_stats + JOIN silver.xref_team
         # (source='understat'). Feeds Understat block of gold.fct_team_match.
-        # MUST run after dag_transform_xref. MUST run BEFORE
-        # understat_team_season (which rolls up from this table).
+        # MUST run after dag_transform_xref. The season rollup
+        # (gold.understat_team_season) reads this table from the Gold DAG (#370).
         'understat_team_match',
         'dags/sql/silver/understat_team_match.sql',
         'understat_team_match',
-    ),
-    (
-        # T6.2 (#91): per-(team_id_canonical, league, season) Understat team
-        # season-aggregate. SUM/COUNT/weighted-AVG rollup из
-        # silver.understat_team_match — wins/draws/losses/xpts become
-        # first-class. Feeds Understat block of gold.fct_team_season_stats (#94).
-        'understat_team_season',
-        'dags/sql/silver/understat_team_season.sql',
-        'understat_team_season',
     ),
     (
         # T6: SofaScore per-(canonical_id, league, season) aggregate.
@@ -238,18 +220,11 @@ SILVER_E3_TRANSFORMS = [
         # + JOIN bronze.sofascore_schedule (goals_for/against). No silver.* reads
         # (#367 removed the cross-entity minutes/assists rollup — Silver Charter R2).
         # Feeds SofaScore block of gold.fct_team_match v2 (#95).
-        # MUST run BEFORE sofascore_team_season (which rolls up from this table).
+        # The season rollup (gold.sofascore_team_season) reads this table from
+        # the Gold DAG (#370).
         'sofascore_team_match',
         'dags/sql/silver/sofascore_team_match.sql',
         'sofascore_team_match',
-    ),
-    (
-        # T6.4 (#93): per-(team_id, league, season) SofaScore team
-        # season-aggregate. SUM/AVG rollup из silver.sofascore_team_match.
-        # Feeds SofaScore block of gold.fct_team_season_stats (#94).
-        'sofascore_team_season',
-        'dags/sql/silver/sofascore_team_season.sql',
-        'sofascore_team_season',
     ),
 ]
 

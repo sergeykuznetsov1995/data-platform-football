@@ -24,10 +24,10 @@
 --   * silver.xref_team.season для source IN (understat,whoscored,sofascore)
 --                                                       = varchar slug '2526'
 --   * silver.fbref_team_season_profile.season         = bigint 2025
---   * silver.understat_team_season.season             = varchar slug '2526'
---   * silver.whoscored_team_season.season             = varchar slug '2526'
---   * silver.sofascore_team_season.season             = varchar slug '2526'
---   * silver.fotmob_team_season.season                = varchar slug '2526'
+--   * gold.understat_team_season.season               = varchar slug '2526'
+--   * gold.whoscored_team_season.season               = varchar slug '2526'
+--   * gold.sofascore_team_season.season               = varchar slug '2526'
+--   * gold.fotmob_team_season.season                  = varchar slug '2526'
 --
 --   FBref xref season — CAST varchar→bigint (2025 = 2025).
 --   Cross-source slug '2526' получаем из year-start через
@@ -41,10 +41,10 @@
 --     fbref_team_season_profile хранит и `team` (squad name) и `team_id`
 --     (lookup ID) — JOIN через `fb.team` для совпадения с xref source_id.
 --   * understat            = team_id_canonical уже resolve'нут в Silver
---     (`silver.understat_team_season` пришёл из team_match через canonical),
+--     (`gold.understat_team_season` пришёл из team_match через canonical),
 --     LEFT JOIN напрямую по canonical_id (без xref CTE).
 --   * whoscored source_id  = bronze.whoscored_schedule.home/away_team (NAME).
---     silver.whoscored_team_season.team_id наследуется от team_id_raw из
+--     gold.whoscored_team_season.team_id наследуется от team_id_raw из
 --     events_spadl (NUMERIC после CAST(CAST(... AS BIGINT) AS varchar) — см.
 --     feedback_bronze_double_id_cast.md). numeric↔name мост строит CTE
 --     `ws_name_to_id` ниже поверх bronze.whoscored_schedule.home/away_team_id,
@@ -53,7 +53,7 @@
 --     поэтому WS-колонки заполнены для season 2024/2025 (20/20); за старые
 --     сезоны NULL из-за отсутствия source-данных, не из-за bridge.
 --   * sofascore source_id  = bronze.sofascore_schedule.home/away_team.
---     silver.sofascore_team_season.team_id = CAST(schedule.home_team AS varchar).
+--     gold.sofascore_team_season.team_id = CAST(schedule.home_team AS varchar).
 --
 -- xref JOIN MUST include (league, season) predicate (feedback_xref_join_season_predicate.md):
 --   silver.xref_team имеет per-(source, source_id, season) rows;
@@ -99,7 +99,7 @@ xref_ss AS (
 ),
 
 -- FotMob xref (#97). season is YEAR-START '2025' (bronze.fotmob_schedule is bigint),
--- like FBref — JOIN on CAST(season_year AS varchar). silver.fotmob_team_season.season
+-- like FBref — JOIN on CAST(season_year AS varchar). gold.fotmob_team_season.season
 -- is slug '2526' → that fact JOINs on season_slug. team_id = team NAME (== source_id).
 xref_fm AS (
     SELECT DISTINCT
@@ -322,7 +322,7 @@ INNER JOIN iceberg.silver.fbref_team_season_profile fb
     ON  fb.team    = xf.fbref_team_name
     AND fb.league  = xf.league
     AND fb.season  = xf.season_year
-LEFT JOIN iceberg.silver.understat_team_season us
+LEFT JOIN iceberg.gold.understat_team_season us
     ON  us.team_id_canonical = xf.canonical_id
     AND us.league            = xf.league
     AND us.season            = xf.season_slug
@@ -336,7 +336,7 @@ LEFT JOIN ws_name_to_id wn
     ON  wn.ws_team_name = xw.ws_team_name
     AND wn.league       = xw.league
     AND wn.season       = xw.season_slug
-LEFT JOIN iceberg.silver.whoscored_team_season ws
+LEFT JOIN iceberg.gold.whoscored_team_season ws
     ON  ws.team_id = wn.ws_team_id
     AND ws.league  = wn.league
     AND ws.season  = wn.season
@@ -344,16 +344,16 @@ LEFT JOIN xref_ss xs
     ON  xs.canonical_id = xf.canonical_id
     AND xs.league       = xf.league
     AND xs.season_slug  = xf.season_slug
-LEFT JOIN iceberg.silver.sofascore_team_season ss
+LEFT JOIN iceberg.gold.sofascore_team_season ss
     ON  ss.team_id = xs.ss_team_name
     AND ss.league  = xs.league
     AND ss.season  = xs.season_slug
--- FotMob (#97): xref season year-start; silver.fotmob_team_season season slug.
+-- FotMob (#97): xref season year-start; gold.fotmob_team_season season slug.
 LEFT JOIN xref_fm xfm
     ON  xfm.canonical_id   = xf.canonical_id
     AND xfm.league         = xf.league
     AND xfm.season_year_str = CAST(xf.season_year AS varchar)
-LEFT JOIN iceberg.silver.fotmob_team_season fm
+LEFT JOIN iceberg.gold.fotmob_team_season fm
     ON  fm.team_id = xfm.fm_team_name
     AND fm.league  = xf.league
     AND fm.season  = xf.season_slug

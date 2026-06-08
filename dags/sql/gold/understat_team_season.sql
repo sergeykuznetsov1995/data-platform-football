@@ -1,5 +1,5 @@
 -- =============================================================================
--- Silver: understat_team_season
+-- Gold: understat_team_season (per-source season aggregate; migrated from Silver, #370)
 -- =============================================================================
 --
 -- One row per (team_id_canonical, league, season) — Understat team-level season

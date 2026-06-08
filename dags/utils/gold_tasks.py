@@ -1011,6 +1011,14 @@ def validate_gold_quality() -> Dict[str, Any]:
             'gold.fct_player_unavailable',
             pk=['match_id', 'team_id', 'player_id_canonical'],
         ),
+        # #370: per-source season aggregates migrated from Silver to Gold.
+        # Pure GROUP BY rollups (uniqueness is structural) — the check guards
+        # against a future regression dropping a GROUP BY key. Relocates the
+        # PK-uniqueness DQ removed from dag_transform_e3 / dag_transform_fotmob_silver.
+        CHECK.no_duplicates('gold.fotmob_team_season',    pk=['team_id', 'league', 'season']),
+        CHECK.no_duplicates('gold.understat_team_season', pk=['team_id_canonical', 'league', 'season']),
+        CHECK.no_duplicates('gold.whoscored_team_season', pk=['team_id', 'league', 'season']),
+        CHECK.no_duplicates('gold.sofascore_team_season', pk=['team_id', 'league', 'season']),
 
         # ========== No NULLs in PKs — ERROR ==========
         CHECK.no_nulls('gold.dim_match',       cols=['match_id', 'date']),
