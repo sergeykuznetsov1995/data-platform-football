@@ -167,11 +167,14 @@ here is rewritten in this pass** — this charter + checker land first.
 | `match_cards` | EXCEPTION | R2, R4, R5 | cross-source union (FBref+WhoScored) + canonical resolve — E3/E4 fact in Silver. Feeds thin `gold.fct_card`. Sanctioned (#368 decided); Gold migration tracked in #382. |
 | `match_substitutions` | EXCEPTION | R2, R4, R5 | same cross-source-fact pattern; feeds thin `gold.fct_substitution`. Sanctioned (#368 decided); Gold migration tracked in #382. |
 | `whoscored_team_match` | REVIEW | R2 | aggregates `silver.whoscored_events_spadl` to team×match (same-source) — manual review; likely conform. |
-| `sofifa_player_profile_empty` | INVESTIGATE | — | possible dead stub. Issue #369. |
 
 > The 7 EXCEPTION season-rollups above are tracked for Gold migration in issue #370.
 > The 2 cross-source EXCEPTION facts (`match_cards`, `match_substitutions`) are tracked for
 > Gold migration in issue #382.
+> `sofifa_player_profile_empty` — RESOLVED (#369): not a standalone table, it is the empty
+> fallback for `silver.sofifa_player_profile` (issue #180; spine `xref_player WHERE 1=0`,
+> active + tested). Fallback `*_empty.sql` files are now excluded from the checker scan, so
+> the phantom "dead stub" no longer surfaces.
 
 ### Sanctioned year-start `season` (S2 WARN, not ERROR)
 

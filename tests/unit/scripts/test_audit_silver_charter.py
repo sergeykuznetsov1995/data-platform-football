@@ -110,3 +110,21 @@ class TestUnsanctionedErrorGate:
         assert mod.has_unsanctioned_error('sofascore_team_match', err) is True
         # verdict: clean findings on a non-registry table → COMPLIANT.
         assert mod.verdict_of('sofascore_team_match', []) == ('COMPLIANT', '')
+
+
+class TestFallbackFilesExcluded:
+    """`*_empty.sql` fallbacks are not standalone tables — excluded from scan (#369)."""
+
+    def test_sofifa_empty_fallback_not_in_registry(self):
+        # Resolved #369: removed from SANCTIONED (was INVESTIGATE 'possible dead stub').
+        assert 'sofifa_player_profile_empty' not in mod.SANCTIONED
+
+    def test_silver_sql_files_excludes_empty_fallbacks(self):
+        stems = {f.name.replace('.sql.j2', '').replace('.sql', '')
+                 for f in mod.silver_sql_files()}
+        # The empty fallback must not surface as a phantom table...
+        assert 'sofifa_player_profile_empty' not in stems
+        # ...while the real table it materializes is still audited.
+        assert 'sofifa_player_profile' in stems
+        # No `*_empty` stem leaks through the filter.
+        assert not any(s.endswith(mod.FALLBACK_SUFFIX) for s in stems)
