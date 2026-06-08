@@ -66,6 +66,21 @@ SANCTIONED: dict[str, tuple[str, str]] = {
     'sofifa_player_profile_empty': ('INVESTIGATE', 'possible dead stub'),
 }
 
+# Tables whose `season` is legitimately stored year-start (bigint `2024`),
+# NOT the default varchar slug `'2425'`. Sanctioned because they join to
+# `xref_team` / `xref_match` in the source's native year-start format; the
+# slug↔year-start conversion happens at the Gold boundary, not in Silver.
+# Charter §4/§7. For these, S2 is a WARN (visible) instead of an ERROR.
+# Full unification onto slug is tracked under the cross-source identity epic.
+SEASON_YEAR_START_OK: set[str] = {
+    'fbref_keeper_profile', 'fbref_match_enriched', 'fbref_match_events',
+    'fbref_match_lineups', 'fbref_player_match_stats',
+    'fbref_player_season_profile', 'fbref_team_season_profile',
+    'fotmob_keeper_profile', 'fotmob_match_referee',
+    'fotmob_player_market_value_history', 'fotmob_player_profile',
+    'fotmob_player_season_profile', 'matchhistory_match_odds',
+}
+
 _COMMENT_LINE = re.compile(r'--[^\n]*')
 _COMMENT_BLOCK = re.compile(r'/\*.*?\*/', re.DOTALL)
 _AGG = re.compile(r'\b(SUM|AVG|MIN|MAX|COUNT)\s*\(', re.IGNORECASE)
@@ -174,8 +189,13 @@ def audit_schema(cur, table: str) -> list[dict]:
         if required not in cols:
             findings.append({'rule': 'S1', 'sev': 'ERROR', 'detail': f'missing column {required}'})
     if 'season' in cols and not cols['season'].startswith('varchar'):
-        findings.append({'rule': 'S2', 'sev': 'ERROR',
-                         'detail': f"season is {cols['season']}, expected varchar slug"})
+        if table in SEASON_YEAR_START_OK:
+            findings.append({'rule': 'S2', 'sev': 'WARN',
+                             'detail': f"season is {cols['season']} (sanctioned year-start, "
+                                       "slug↔year-start converted at Gold boundary — charter §4/§7)"})
+        else:
+            findings.append({'rule': 'S2', 'sev': 'ERROR',
+                             'detail': f"season is {cols['season']}, expected varchar slug"})
     for col in cols:
         if col.endswith('_id') and not (col.endswith('_id_raw') or col.endswith('_id_canonical')):
             findings.append({'rule': 'S3', 'sev': 'WARN',
