@@ -986,9 +986,12 @@ def _build_sofascore_player_profile_checks() -> List[Check]:
 def _build_sofascore_team_match_checks() -> List[Check]:
     """DQ for ``iceberg.silver.sofascore_team_match`` (T6.4 / issue #93).
 
-    Two rows per match (home + away) — PIVOT of ``bronze.sofascore_match_stats``
-    (period='ALL') + ``bronze.sofascore_schedule`` (outcome) + LEFT JOIN
-    ``silver.sofascore_player_match_aggregate`` (minutes/assists rollup).
+    Two rows per match (home + away) — single-source conform: PIVOT of
+    ``bronze.sofascore_match_stats`` (period='ALL') + ``bronze.sofascore_schedule``
+    (outcome). The cross-entity minutes/assists rollup from
+    ``silver.sofascore_player_match_aggregate`` was removed (#367, Silver Charter
+    R2); ``minutes``/``assists`` are kept as NULL placeholders (they were always
+    NULL — the rollup never matched on team_id).
     APL 2025/26 baseline: 380 matches × 2 sides = 760 rows.
 
     PK is ``(match_id, team_id)`` — native SofaScore IDs; Gold (#95) bridges

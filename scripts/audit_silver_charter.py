@@ -63,7 +63,8 @@ SANCTIONED: dict[str, tuple[str, str]] = {
     'fbref_team_season_profile': ('EXCEPTION', 'season-rollup feeding Gold'),
     'whoscored_player_season_aggregate': ('EXCEPTION', 'player season-rollup feeding Gold'),
     'fotmob_player_season_profile': ('EXCEPTION', 'PIVOT+rollup feeding Gold'),
-    'sofascore_team_match': ('VIOLATOR', 'PIVOT + cross-entity assembly -> gold.fct_team_match'),
+    # sofascore_team_match: resolved #367 — cross-entity minutes/assists rollup
+    # moved out; now a clean single-source conform (PIVOT match_stats + schedule). COMPLIANT.
     'sofifa_player_profile_empty': ('INVESTIGATE', 'possible dead stub'),
 }
 

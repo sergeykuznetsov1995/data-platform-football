@@ -11,14 +11,15 @@
 --                                            We PIVOT period='ALL' to wide form.
 --   bronze.sofascore_schedule             — for canonical (home_team, away_team,
 --                                            home_score, away_score).
---   silver.sofascore_player_match_aggregate — for SUM(minutes, assists) per
---                                            (match, team).
+--
+-- Pure single-source conform: PIVOT match_stats (period='ALL') joined to the
+-- schedule outcome. Reads only bronze.sofascore_* — no silver.* reads (R2).
 --
 -- Why two passes:
 --   * `bronze.sofascore_match_stats` is *team-level* but lacks the home/away
 --      team_id columns (rows carry only `home_value`/`away_value` pairs).
---   * Goals / minutes / assists are NOT in `match_stats` (they come from
---      `event_player_stats` → already in `silver.sofascore_player_match_aggregate`).
+--   * Goals come from the schedule; the remaining counters come from the
+--      `match_stats` PIVOT.
 --
 -- stat_key mapping (discovered 2026-05-27 via Trino DISTINCT):
 --   Match overview      | Total shots         | totalShotsOnGoal       (count)
@@ -47,6 +48,11 @@
 --   * Ground/aerial duels totals are parsed from `home_text`/`away_text`
 --     ("X/Y (Z%)") via regexp_extract — `home_value` alone gives only count won.
 --   * `accurate_passes_pct` is derived (no native stat_key) — `100.0 * accurate / total`.
+--   * `minutes`/`assists` are NULL placeholders: SofaScore match_stats has no
+--     team-grain minutes/assists. A prior cross-entity rollup from
+--     silver.sofascore_player_match_aggregate never matched on team_id (NAME vs
+--     numeric id) and was removed per Silver Charter R2 (#367); the columns are
+--     kept NULL so the downstream schema/contract is unchanged.
 --   * Bronze dedup: ROW_NUMBER on (match_id, period, stat_key); defensive
 --     against re-ingests (replace_partitions=True should keep this 1:1).
 -- =============================================================================
@@ -161,22 +167,6 @@ schedule_dim AS (
       AND game_id IS NOT NULL
 ),
 
--- Pull team-level player rollup for metrics absent from match_stats:
--- minutes_played (team total = ~990 = 11 × 90 + stoppage), assists, tackles.
-player_rollup AS (
-    SELECT
-        match_id,
-        CAST(team_id AS varchar) AS team_id,
-        league,
-        season,
-        SUM(minutes_played) AS minutes,
-        SUM(assists)        AS assists
-    FROM iceberg.silver.sofascore_player_match_aggregate
-    WHERE match_id IS NOT NULL
-      AND team_id  IS NOT NULL
-    GROUP BY match_id, CAST(team_id AS varchar), league, season
-),
-
 home_side AS (
     SELECT
         sp.match_id,
@@ -208,8 +198,6 @@ home_side AS (
         sp.home_total_long_balls   AS total_long_balls,
         sp.home_accurate_crosses   AS accurate_crosses,
         sp.home_total_crosses      AS total_crosses,
-        pr.minutes                 AS minutes,
-        pr.assists                 AS assists,
         sp._bronze_ingested_at,
         sp.league,
         sp.season
@@ -218,11 +206,6 @@ home_side AS (
       ON sd.match_id = sp.match_id
      AND sd.league   = sp.league
      AND sd.season   = sp.season
-    LEFT JOIN player_rollup pr
-      ON pr.match_id = sp.match_id
-     AND pr.team_id  = sd.home_team_id
-     AND pr.league   = sp.league
-     AND pr.season   = sp.season
 ),
 
 away_side AS (
@@ -256,8 +239,6 @@ away_side AS (
         sp.away_total_long_balls   AS total_long_balls,
         sp.away_accurate_crosses   AS accurate_crosses,
         sp.away_total_crosses      AS total_crosses,
-        pr.minutes                 AS minutes,
-        pr.assists                 AS assists,
         sp._bronze_ingested_at,
         sp.league,
         sp.season
@@ -266,11 +247,6 @@ away_side AS (
       ON sd.match_id = sp.match_id
      AND sd.league   = sp.league
      AND sd.season   = sp.season
-    LEFT JOIN player_rollup pr
-      ON pr.match_id = sp.match_id
-     AND pr.team_id  = sd.away_team_id
-     AND pr.league   = sp.league
-     AND pr.season   = sp.season
 ),
 
 unioned AS (
@@ -310,9 +286,12 @@ SELECT
     END                              AS accurate_passes_pct,
     possession_pct,
 
-    -- ===== HARD_FACT (from player_match_aggregate rollup) =====
-    minutes,
-    CAST(assists AS INTEGER) AS assists,
+    -- ===== HARD_FACT (minutes/assists — not in SofaScore match_stats; NULL) =====
+    -- Kept as NULL placeholders (#367): the team-grain minutes/assists rollup from
+    -- silver.sofascore_player_match_aggregate was a Silver Charter R2 violation and
+    -- never matched on team_id anyway. Types match the prior schema (double/integer).
+    CAST(NULL AS DOUBLE)  AS minutes,
+    CAST(NULL AS INTEGER) AS assists,
 
     -- ===== MODELED (xG / xA — xA not provided by SofaScore match_stats) =====
     expected_goals,

@@ -89,9 +89,9 @@ class TestUnsanctionedErrorGate:
         assert mod.has_unsanctioned_error('some_new_table', findings) is True
 
     def test_error_on_sanctioned_table_does_not_trip_gate(self):
-        # sofascore_team_match is a registry VIOLATOR — sanctioned, must not block.
+        # fotmob_team_season is a registry EXCEPTION — sanctioned, must not block.
         findings = [{'rule': 'R1', 'sev': 'ERROR', 'detail': 'season-grain rollup'}]
-        assert mod.has_unsanctioned_error('sofascore_team_match', findings) is False
+        assert mod.has_unsanctioned_error('fotmob_team_season', findings) is False
 
     def test_no_findings_does_not_trip_gate(self):
         assert mod.has_unsanctioned_error('some_new_table', []) is False
@@ -99,3 +99,14 @@ class TestUnsanctionedErrorGate:
     def test_warn_only_does_not_trip_gate(self):
         findings = [{'rule': 'R2', 'sev': 'WARN', 'detail': 'reads silver.x'}]
         assert mod.has_unsanctioned_error('some_new_table', findings) is False
+
+    def test_resolved_table_no_longer_sanctioned(self):
+        # sofascore_team_match resolved (#367): removed from registry, now COMPLIANT.
+        findings = [{'rule': 'R2', 'sev': 'WARN', 'detail': 'reads silver.x'}]
+        # WARN-only → COMPLIANT-ish, gate not tripped:
+        assert mod.has_unsanctioned_error('sofascore_team_match', findings) is False
+        # but a hypothetical ERROR on it WOULD now trip (no longer sanctioned):
+        err = [{'rule': 'R6', 'sev': 'ERROR', 'detail': 'ddl'}]
+        assert mod.has_unsanctioned_error('sofascore_team_match', err) is True
+        # verdict: clean findings on a non-registry table → COMPLIANT.
+        assert mod.verdict_of('sofascore_team_match', []) == ('COMPLIANT', '')
