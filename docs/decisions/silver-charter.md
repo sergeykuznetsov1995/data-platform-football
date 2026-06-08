@@ -164,12 +164,14 @@ here is rewritten in this pass** — this charter + checker land first.
 | `fbref_team_season_profile` | EXCEPTION | R1 | season-rollup; feeds Gold. |
 | `whoscored_player_season_aggregate` | EXCEPTION | R1 | player season-rollup; feeds Gold. |
 | `fotmob_player_season_profile` | EXCEPTION | R1 | PIVOT+rollup; feeds Gold. |
-| `match_cards` | REVIEW | R2, R4, R5 | cross-source union (FBref+WhoScored) + canonical resolve — an E3/E4 fact living in Silver. Issue #368 (evaluate Gold move). |
-| `match_substitutions` | REVIEW | R2, R4, R5 | same cross-source-fact pattern. Issue #368. |
+| `match_cards` | EXCEPTION | R2, R4, R5 | cross-source union (FBref+WhoScored) + canonical resolve — E3/E4 fact in Silver. Feeds thin `gold.fct_card`. Sanctioned (#368 decided); Gold migration tracked in #382. |
+| `match_substitutions` | EXCEPTION | R2, R4, R5 | same cross-source-fact pattern; feeds thin `gold.fct_substitution`. Sanctioned (#368 decided); Gold migration tracked in #382. |
 | `whoscored_team_match` | REVIEW | R2 | aggregates `silver.whoscored_events_spadl` to team×match (same-source) — manual review; likely conform. |
 | `sofifa_player_profile_empty` | INVESTIGATE | — | possible dead stub. Issue #369. |
 
 > The 7 EXCEPTION season-rollups above are tracked for Gold migration in issue #370.
+> The 2 cross-source EXCEPTION facts (`match_cards`, `match_substitutions`) are tracked for
+> Gold migration in issue #382.
 
 ### Sanctioned year-start `season` (S2 WARN, not ERROR)
 
@@ -202,3 +204,4 @@ fix synchronised with their Gold consumers (separate issue). Full slug unificati
 | 2026-06-07 | Charter created; checker + first audit. | feature/silver-charter-audit |
 | 2026-06-08 | Layer B S2: sanction year-start `season` (13 tables) as WARN; §4/§7 updated. | #373 |
 | 2026-06-08 | `sofascore_team_match` R2 resolved (#367): the cross-entity `minutes`/`assists` rollup from `silver.sofascore_player_match_aggregate` was dropped (it never matched on team_id — always NULL); columns kept as NULL placeholders to preserve the downstream schema. Table is now COMPLIANT single-source conform. | #367 |
+| 2026-06-08 | `match_cards` / `match_substitutions` moved REVIEW→EXCEPTION (cross-source E3/E4 facts feeding thin `gold.fct_card` / `fct_substitution`); Gold migration tracked separately. | #368 / #382 |
