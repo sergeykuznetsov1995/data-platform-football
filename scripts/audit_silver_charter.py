@@ -65,6 +65,11 @@ SANCTIONED: dict[str, tuple[str, str]] = {
     'fotmob_player_season_profile': ('EXCEPTION', 'PIVOT+rollup feeding Gold'),
     # sofascore_team_match: resolved #367 — cross-entity minutes/assists rollup
     # moved out; now a clean single-source conform (PIVOT match_stats + schedule). COMPLIANT.
+    # Cross-source E3/E4 facts (FBref+WhoScored union + canonical resolve) living in
+    # Silver. Feed thin gold.fct_card / fct_substitution passthroughs. Gold migration
+    # tracked in #382 (#368 decided). Charter §7.
+    'match_cards': ('EXCEPTION', 'cross-source fact feeding gold.fct_card; Gold migration #382'),
+    'match_substitutions': ('EXCEPTION', 'cross-source fact feeding gold.fct_substitution; Gold migration #382'),
     'sofifa_player_profile_empty': ('INVESTIGATE', 'possible dead stub'),
 }
 
