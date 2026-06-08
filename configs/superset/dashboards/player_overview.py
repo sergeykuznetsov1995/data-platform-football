@@ -38,8 +38,7 @@ DASHBOARD_SLUG = "player-overview-league"
 DATABASE_NAME = "trino_iceberg"
 LEAGUE = "ENG-Premier League"
 SEASON_FBREF = 2025          # fct_player_match / dim_player / dim_match
-SEASON_OTHER_INT = 2526      # fct_match_rating (bigint, sofascore convention)
-SEASON_OTHER_STR = "2526"    # fct_shot (varchar, understat/whoscored convention)
+SEASON_OTHER_STR = "2526"    # fct_shot + fct_match_rating (varchar slug convention)
 
 
 # ---------------------------------------------------------------------------
@@ -277,7 +276,7 @@ LEFT JOIN iceberg.gold.dim_player dp
   ON dp.player_id = fmr.player_id_canonical
  AND dp.season    = {SEASON_FBREF}
  AND dp.league    = fmr.league
-WHERE fmr.season = {SEASON_OTHER_INT}
+WHERE fmr.season = '{SEASON_OTHER_STR}'
   AND fmr.league = '{LEAGUE}'
   AND fmr.rating IS NOT NULL"""
 

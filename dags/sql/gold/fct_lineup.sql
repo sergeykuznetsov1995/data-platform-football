@@ -250,11 +250,10 @@ espn_resolved AS (
         el.jersey_number                               AS jersey_number,
         el._bronze_ingested_at                         AS _bronze_ingested_at,
         el.league                                      AS league,
-        -- season UNIFICATION (E3.5 R4): ESPN Silver stores compact slug-as-int
-        -- (``2425`` for 2024-25, post TRY_CAST in silver/espn_lineup.sql). Cast
-        -- back to 4-char varchar so this column matches FBref-branch output
-        -- (compact 'YYYY' form). lpad guards against degenerate ``525`` → '0525'
-        -- (defensive — production data is always 4-digit but the CAST is cheap).
+        -- season UNIFICATION (E3.5 R4): ESPN Silver stores a varchar slug
+        -- (``2425`` for 2024-25, see silver/espn_lineup.sql). CAST AS varchar is
+        -- now a no-op kept for clarity; lpad guards against degenerate ``525`` →
+        -- '0525' (defensive — production data is always 4-digit, lpad is cheap).
         lpad(CAST(el.season AS varchar), 4, '0')        AS season,
         'espn'                                         AS lineup_source,
         2                                              AS source_priority,

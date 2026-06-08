@@ -35,7 +35,7 @@
 --   rating_source         varchar         literal 'sofascore'
 --   rating_version        varchar         literal 'v1'
 --   league                varchar         partition key
---   season                bigint          partition key (silver already bigint)
+--   season                varchar         partition key (silver varchar slug '2526')
 --   _ingested_at          timestamp(6)    bronze provenance
 --
 -- Logical PK: rating_canonical
@@ -46,9 +46,9 @@
 -- =============================================================================
 -- Season type
 -- =============================================================================
--- silver.sofascore_player_ratings.season is already bigint year-of-start
--- (TRY_CAST'd from varchar in silver — see silver/sofascore_player_ratings.sql
--- final SELECT block). Direct passthrough.
+-- silver.sofascore_player_ratings.season is a varchar slug ('2526'), per charter
+-- S2 (see silver/sofascore_player_ratings.sql final SELECT block). Direct
+-- passthrough — the Gold column is varchar slug too.
 -- =============================================================================
 
 SELECT
