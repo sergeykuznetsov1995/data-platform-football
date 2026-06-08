@@ -234,12 +234,11 @@ SILVER_E3_TRANSFORMS = [
     ),
     (
         # T6.4 (#93): per-(match_id, team_id) SofaScore team match-aggregate.
-        # PIVOT bronze.sofascore_match_stats (long-form, period='ALL') +
-        # JOIN bronze.sofascore_schedule (goals_for/against) +
-        # LEFT JOIN silver.sofascore_player_match_aggregate (minutes/assists).
+        # Single-source conform: PIVOT bronze.sofascore_match_stats (period='ALL')
+        # + JOIN bronze.sofascore_schedule (goals_for/against). No silver.* reads
+        # (#367 removed the cross-entity minutes/assists rollup — Silver Charter R2).
         # Feeds SofaScore block of gold.fct_team_match v2 (#95).
-        # MUST run after sofascore_player_match_aggregate. MUST run BEFORE
-        # sofascore_team_season (which rolls up from this table).
+        # MUST run BEFORE sofascore_team_season (which rolls up from this table).
         'sofascore_team_match',
         'dags/sql/silver/sofascore_team_match.sql',
         'sofascore_team_match',
