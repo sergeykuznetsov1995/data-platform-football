@@ -79,3 +79,23 @@ class TestS2SeasonYearStartAllowlist:
                 ('league', 'varchar'), ('season', 'varchar')]
         findings = mod.audit_schema(_FakeCursor(cols), 'fbref_player_match_stats')
         assert _s2(findings) == []
+
+
+class TestUnsanctionedErrorGate:
+    """has_unsanctioned_error — the --check gate condition (#372)."""
+
+    def test_error_on_unsanctioned_table_trips_gate(self):
+        findings = [{'rule': 'R6', 'sev': 'ERROR', 'detail': 'file contains DDL'}]
+        assert mod.has_unsanctioned_error('some_new_table', findings) is True
+
+    def test_error_on_sanctioned_table_does_not_trip_gate(self):
+        # sofascore_team_match is a registry VIOLATOR — sanctioned, must not block.
+        findings = [{'rule': 'R1', 'sev': 'ERROR', 'detail': 'season-grain rollup'}]
+        assert mod.has_unsanctioned_error('sofascore_team_match', findings) is False
+
+    def test_no_findings_does_not_trip_gate(self):
+        assert mod.has_unsanctioned_error('some_new_table', []) is False
+
+    def test_warn_only_does_not_trip_gate(self):
+        findings = [{'rule': 'R2', 'sev': 'WARN', 'detail': 'reads silver.x'}]
+        assert mod.has_unsanctioned_error('some_new_table', findings) is False
