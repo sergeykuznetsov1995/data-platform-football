@@ -28,6 +28,7 @@ Usage:
     python scripts/audit_silver_charter.py --table sofascore_team_match
     python scripts/audit_silver_charter.py --output /tmp/silver_audit.md
     python scripts/audit_silver_charter.py --schema              # + Layer B (needs Trino)
+    python scripts/audit_silver_charter.py --check               # gate: exit 1 on unsanctioned ERROR
 """
 from __future__ import annotations
 
@@ -179,6 +180,16 @@ def verdict_of(stem: str, findings: list[dict]) -> tuple[str, str]:
     return ('REVIEW', 'WARN-only findings')
 
 
+def has_unsanctioned_error(stem: str, findings: list[dict]) -> bool:
+    """Gate condition (#372): an ERROR finding on a table not in SANCTIONED.
+
+    This is exactly the case ``verdict_of`` labels VIOLATOR with reason
+    'unsanctioned ERROR finding'. Sanctioned tables (EXCEPTION/VIOLATOR/
+    INVESTIGATE registry entries) never trip the gate.
+    """
+    return stem not in SANCTIONED and any(f['sev'] == 'ERROR' for f in findings)
+
+
 # ---- Layer B (schema, optional) --------------------------------------------
 
 def audit_schema(cur, table: str) -> list[dict]:
@@ -251,6 +262,8 @@ def main() -> None:
     p.add_argument('--output', default=f'/tmp/silver_charter_audit_{datetime.now(timezone.utc):%Y-%m-%d}.md')
     p.add_argument('--table', default=None, help='audit only this table stem')
     p.add_argument('--schema', action='store_true', help='also run Layer B (needs Trino)')
+    p.add_argument('--check', action='store_true',
+                   help='gate mode: Layer A only, exit 1 on unsanctioned ERROR (#372)')
     args = p.parse_args()
 
     files = sorted(SILVER_SQL_DIR.glob('*.sql')) + sorted(SILVER_SQL_DIR.glob('*.sql.j2'))
@@ -263,6 +276,24 @@ def main() -> None:
     for f in files:
         stem = f.name.replace('.sql.j2', '').replace('.sql', '')
         per_table[stem] = audit_file(f)
+
+    # --check: Layer A gate (no Trino, no report file). Exit 1 on unsanctioned ERROR.
+    if args.check:
+        offenders = {stem: fs for stem, fs in per_table.items()
+                     if has_unsanctioned_error(stem, fs)}
+        if offenders:
+            print('Silver Charter gate FAILED — unsanctioned ERROR finding(s):',
+                  file=sys.stderr)
+            for stem in sorted(offenders):
+                for f in offenders[stem]:
+                    if f['sev'] == 'ERROR':
+                        print(f'  {stem}: [{f["rule"]}] {f["detail"]}', file=sys.stderr)
+            print('\nFix the SQL, or sanction the table in the registry '
+                  '(charter §7) if intentional.', file=sys.stderr)
+            sys.exit(1)
+        print(f'Silver Charter gate OK — {len(per_table)} files, no unsanctioned ERROR.',
+              file=sys.stderr)
+        sys.exit(0)
 
     if args.schema:
         sys.path.insert(0, '/opt/airflow/dags')
