@@ -707,7 +707,8 @@ class TestSqlHelpers:
         # Spot-check every field appears in the right order with proper escaping.
         out = xpr._value_tuple(row)
         assert out.startswith("('fb_xyz', 'understat', 'u1', 'O''Reilly', ")
-        assert out.endswith(", 'Spurs', 'Tottenham Hotspur')")
+        # _silver_created_at lineage literal is the trailing 11th field (#374).
+        assert out.endswith(", 'Spurs', 'Tottenham Hotspur', CURRENT_TIMESTAMP)")
         assert 'CAST(92.5 AS DOUBLE)' in out
 
 
@@ -802,3 +803,52 @@ class TestDedupCanonicalPerSeason:
         out, removed = xpr._dedup_canonical_per_season([s1, s2])
         assert len(out) == 2
         assert removed == {}
+
+
+# ---------------------------------------------------------------------------
+# Silver lineage column (_silver_created_at) — charter §4 / S1 (issue #374)
+# ---------------------------------------------------------------------------
+class _RecordingCursor:
+    """Captures executed SQL; returns an empty result set on fetchall()."""
+
+    def __init__(self, sink):
+        self._sink = sink
+
+    def execute(self, sql):
+        self._sink.append(sql)
+
+    def fetchall(self):
+        return []
+
+    def close(self):
+        pass
+
+
+class _RecordingConn:
+    def __init__(self):
+        self.sql = []
+
+    def cursor(self):
+        return _RecordingCursor(self.sql)
+
+
+class TestSilverLineageColumn:
+    def test_value_tuple_appends_current_timestamp(self):
+        # _silver_created_at must be the 11th VALUES field as a SQL literal,
+        # so every materialised xref_player row carries lineage (charter §4).
+        row = _xrow('fb_p', 'understat', '5')
+        tup = xpr._value_tuple(row)
+        assert tup.rstrip().endswith("CURRENT_TIMESTAMP)")
+
+    def test_create_table_declares_lineage_column(self):
+        conn = _RecordingConn()
+        xpr._create_target_table(conn, 'iceberg.silver.xref_player')
+        ddl = next(s for s in conn.sql if 'CREATE TABLE' in s)
+        assert '_silver_created_at timestamp(6) with time zone' in ddl
+
+    def test_insert_rows_lists_lineage_column(self):
+        conn = _RecordingConn()
+        xpr._insert_rows(conn, 'iceberg.silver.xref_player',
+                         [_xrow('fb_p', 'understat', '5')], chunk_size=500)
+        insert = next(s for s in conn.sql if s.startswith('INSERT INTO'))
+        assert '_silver_created_at' in insert.split('VALUES')[0]

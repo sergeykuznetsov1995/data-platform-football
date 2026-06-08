@@ -1244,7 +1244,10 @@ def _value_tuple(row: Dict[str, Any]) -> str:
         f"{_sql_str(row['confidence'])}, "
         f"{_sql_double(row['match_score'])}, "
         f"{_sql_str(row['raw_team_name'])}, "
-        f"{_sql_str(row['canonical_team'])}"
+        f"{_sql_str(row['canonical_team'])}, "
+        # Silver lineage column (charter §4). xref_player is Python-materialised,
+        # so the CTAS runner does not inject this — the resolver adds it here.
+        'CURRENT_TIMESTAMP'
         ')'
     )
 
@@ -1272,7 +1275,8 @@ def _create_target_table(conn, target_table: str) -> None:
             confidence     varchar,
             match_score    double,
             raw_team_name  varchar,
-            canonical_team varchar
+            canonical_team varchar,
+            _silver_created_at timestamp(6) with time zone
         )
         WITH (
             format = 'PARQUET',
@@ -1334,7 +1338,8 @@ def _insert_rows(
     written = 0
     cols = (
         'canonical_id, source, source_id, display_name, league, season, '
-        'confidence, match_score, raw_team_name, canonical_team'
+        'confidence, match_score, raw_team_name, canonical_team, '
+        '_silver_created_at'
     )
     for i in range(0, len(rows), chunk_size):
         chunk = rows[i : i + chunk_size]
