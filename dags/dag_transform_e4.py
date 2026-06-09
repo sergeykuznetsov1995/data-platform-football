@@ -3,17 +3,17 @@ E4 Narrow-Facts Transformation DAG  (Medallion E4 / Wave 1+2)
 =============================================================
 
 Materialises the five Gold-layer **narrow fact tables** that complete the
-E4 wave of the medallion redesign, plus their four Silver-layer
+E4 wave of the medallion redesign, plus their two Silver-layer
 prerequisite tables:
 
-    iceberg.silver.match_cards                    -- yellow/red cards stream
-    iceberg.silver.match_substitutions            -- substitution events
     iceberg.silver.matchhistory_match_odds        -- pre-match + closing odds
     iceberg.silver.sofascore_player_ratings       -- per-match player ratings
 
     iceberg.gold.fct_goal                         -- goals (xxhash64 PK)
-    iceberg.gold.fct_card                         -- passthrough silver
-    iceberg.gold.fct_substitution                 -- passthrough silver
+    iceberg.gold.fct_card                         -- cross-source assembly
+                                                     (bronze+xref, folded #382)
+    iceberg.gold.fct_substitution                 -- cross-source assembly
+                                                     (bronze+xref, folded #382)
     iceberg.gold.fct_match_odds                   -- passthrough silver
     iceberg.gold.fct_match_rating                 -- passthrough silver
 
@@ -25,8 +25,6 @@ Topology
         |
         v
     TaskGroup: silver_e4
-        |-- match_cards                  (run_silver_transform)
-        |-- match_substitutions          (run_silver_transform)
         |-- matchhistory_match_odds      (run_silver_transform)
         |-- sofascore_player_ratings     (run_silver_transform; skipped
         |                                 if bronze missing)
@@ -124,16 +122,9 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # (task_id, sql_file (relative to /opt/airflow/), target table name)
 SILVER_E4_TRANSFORMS = [
-    (
-        'match_cards',
-        'dags/sql/silver/match_cards.sql',
-        'match_cards',
-    ),
-    (
-        'match_substitutions',
-        'dags/sql/silver/match_substitutions.sql',
-        'match_substitutions',
-    ),
+    # match_cards / match_substitutions were folded into gold.fct_card /
+    # gold.fct_substitution (cross-source assembly is a Gold concern per the
+    # Silver Charter) — #382. The Gold SQL now reads bronze + xref directly.
     (
         'matchhistory_match_odds',
         'dags/sql/silver/matchhistory_match_odds.sql',
@@ -267,11 +258,11 @@ def _run_gold_e4(sql_file: str, table_name: str, **context) -> Dict[str, Any]:
 def _validate_e4(**context) -> Dict[str, Any]:
     """Run E4-scoped DQ checks and post a Telegram summary.
 
-    DQ list comes from :func:`utils.e4_dq.build_all_e4_checks` (E4.7) — 81
-    standard checks across silver.match_cards / match_substitutions /
-    matchhistory_match_odds / sofascore_player_ratings and
-    gold.fct_goal / fct_card / fct_substitution / fct_match_odds /
-    fct_match_rating.
+    DQ list comes from :func:`utils.e4_dq.build_all_e4_checks` (E4.7) —
+    standard checks across silver.matchhistory_match_odds /
+    sofascore_player_ratings and gold.fct_goal / fct_card / fct_substitution /
+    fct_match_odds / fct_match_rating (cards/subs DQ now lives in the gold
+    builders — #382).
 
     Severity model — ERROR-severity failures raise ``AirflowException``
     after the Telegram summary is posted. WARNING-severity failures are
@@ -319,10 +310,11 @@ with DAG(
     dag_id='dag_transform_e4',
     default_args=SILVER_ARGS,
     description=(
-        'Materialise E4 narrow facts: silver.match_cards / match_substitutions '
-        '/ matchhistory_match_odds / sofascore_player_ratings -> '
-        'gold.fct_goal / fct_card / fct_substitution / fct_match_odds / '
-        'fct_match_rating. Triggered after dag_transform_e3 by master pipeline.'
+        'Materialise E4 narrow facts: silver.matchhistory_match_odds / '
+        'sofascore_player_ratings -> gold.fct_goal / fct_card / '
+        'fct_substitution / fct_match_odds / fct_match_rating (cards/subs '
+        'assembly folded into Gold, #382). Triggered after dag_transform_e3 '
+        'by master pipeline.'
     ),
     schedule=None,                 # Triggered by dag_master_pipeline (E4.10)
     start_date=datetime(2026, 5, 9),

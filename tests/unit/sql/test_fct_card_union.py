@@ -1,20 +1,21 @@
 """
 Unit tests for the FBref+WhoScored card UNION + dedup pipeline (E4.5).
 
-Pipeline under test:
+Pipeline under test (cross-source assembly folded into Gold — #382):
   bronze.fbref_match_events  ──┐
-                                 ├─► silver.match_cards ──► gold.fct_card
+                                 ├─► gold.fct_card
   bronze.whoscored_events    ──┘
 
-We execute BOTH ``dags/sql/silver/match_cards.sql`` and ``dags/sql/gold/
-fct_card.sql`` against an in-memory DuckDB after a small text-substitution
-pass (Trino-only ``regexp_like`` / ``xxhash64(to_utf8(…))`` / ``timestamp(6)``).
+We execute ``dags/sql/gold/fct_card.sql`` against an in-memory DuckDB after a
+small text-substitution pass (Trino-only ``regexp_like`` /
+``xxhash64(to_utf8(…))`` / ``timestamp(6)``). The gold SQL now inlines the
+former ``silver.match_cards`` CTE chain, so it reads bronze + xref directly.
 
 Synthetic dataset:
   * 3 FBref bronze cards: yellow, red, second_yellow.
   * 2 WhoScored bronze cards: type='Card' with qualifiers carrying displayName.
   * 1 cross-source duplicate (FBref + WS for the same player+minute) →
-    must collapse to 1 FBref-priority row in silver.
+    must collapse to 1 FBref-priority row.
   * 1 WS-only card (no FBref counterpart) → survives.
 """
 
@@ -29,7 +30,6 @@ import pytest
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
-SILVER_PATH = PROJECT_ROOT / "dags" / "sql" / "silver" / "match_cards.sql"
 GOLD_PATH = PROJECT_ROOT / "dags" / "sql" / "gold" / "fct_card.sql"
 
 _DAGS_DIR = PROJECT_ROOT / "dags"
@@ -83,7 +83,6 @@ _ICEBERG_TO_LOCAL = {
     "iceberg.silver.xref_match":             "silver_xref_match",
     "iceberg.silver.xref_team":              "silver_xref_team",
     "iceberg.silver.xref_player":            "silver_xref_player",
-    "iceberg.silver.match_cards":            "silver_match_cards",
 }
 
 
@@ -119,7 +118,6 @@ def _reset_schemas(duck_conn):
         "bronze_fbref_match_events", "bronze_whoscored_events",
         "bronze_whoscored_schedule", "silver_fbref_match_enriched",
         "silver_xref_match", "silver_xref_team", "silver_xref_player",
-        "silver_match_cards",
     ):
         duck_conn.execute(f"DROP TABLE IF EXISTS {tbl}")
 
@@ -315,12 +313,6 @@ def _seed_corpus(duck_conn) -> None:
     # xref_match: empty (COALESCE falls back to fe.match_id).
 
 
-def _materialize_silver(duck_conn) -> None:
-    sql = _translate(SILVER_PATH.read_text(encoding="utf-8"))
-    duck_conn.execute("DROP TABLE IF EXISTS silver_match_cards")
-    duck_conn.execute(f"CREATE TABLE silver_match_cards AS {sql}")
-
-
 def _run_gold(duck_conn) -> List[Dict[str, Any]]:
     sql = _translate(GOLD_PATH.read_text(encoding="utf-8"))
     cur = duck_conn.execute(sql)
@@ -339,13 +331,11 @@ class TestFctCardPipeline:
         """Total = 4 rows (3 FBref + 1 WS-only). The (M1, P1, 10, yellow)
         duplicate collapses on the resolved canonical to FBref-priority side."""
         _seed_corpus(duck_conn)
-        _materialize_silver(duck_conn)
         out = _run_gold(duck_conn)
         assert len(out) == 4, f"expected 4 rows after dedup, got {len(out)}: {out}"
 
     def test_card_type_distribution(self, duck_conn):
         _seed_corpus(duck_conn)
-        _materialize_silver(duck_conn)
         out = _run_gold(duck_conn)
         types = sorted(r["card_type"] for r in out)
         assert "yellow" in types
@@ -355,7 +345,6 @@ class TestFctCardPipeline:
     def test_card_source_distribution(self, duck_conn):
         """3 FBref-source rows + 1 WhoScored-source row (WS-only fallback)."""
         _seed_corpus(duck_conn)
-        _materialize_silver(duck_conn)
         out = _run_gold(duck_conn)
         from collections import Counter
         c = Counter(r["card_source"] for r in out)
@@ -364,7 +353,6 @@ class TestFctCardPipeline:
 
     def test_canonical_trio_populated(self, duck_conn):
         _seed_corpus(duck_conn)
-        _materialize_silver(duck_conn)
         out = _run_gold(duck_conn)
         for r in out:
             assert r["card_canonical"], r
@@ -373,7 +361,6 @@ class TestFctCardPipeline:
 
     def test_pk_uniqueness(self, duck_conn):
         _seed_corpus(duck_conn)
-        _materialize_silver(duck_conn)
         out = _run_gold(duck_conn)
         pks = [r["card_canonical"] for r in out]
         assert len(pks) == len(set(pks)), pks

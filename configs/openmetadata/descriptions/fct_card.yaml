@@ -4,8 +4,9 @@
 table:
   fullyQualifiedName: trino_iceberg.iceberg.gold.fct_card
   description: |
-    Narrow fact for cards (E4). Source: silver.match_cards (FBref + WhoScored
-    union). Grain: card_canonical (xxhash64 of match_id|minute|player|card_type).
+    Narrow fact for cards (E4). Source: bronze (FBref + WhoScored) + xref —
+    cross-source assembly folded directly into this Gold fact (#382). Grain:
+    card_canonical (xxhash64 of match_id|minute|player|card_type).
   tags:
     - Tier.Gold
     - Domain.Football

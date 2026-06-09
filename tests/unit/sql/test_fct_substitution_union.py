@@ -1,17 +1,16 @@
 """
 Unit tests for the FBref + WhoScored substitution UNION + dedup pipeline (E4.5).
 
-Pipeline under test:
+Pipeline under test (cross-source assembly folded into Gold — #382):
   bronze.fbref_match_events  (event_type='substitution', player + secondary_player)
   bronze.whoscored_events    (type IN ('SubstitutionOff', 'SubstitutionOn'),
                               paired via ws_pairs CTE on game_id+minute+team_id)
   ↓
-  silver.match_substitutions
-  ↓
   gold.fct_substitution
 
-We exercise both layers end-to-end on DuckDB after a small text-substitution
-pass.
+We exercise ``dags/sql/gold/fct_substitution.sql`` end-to-end on DuckDB after a
+small text-substitution pass. The gold SQL now inlines the former
+``silver.match_substitutions`` CTE chain, so it reads bronze + xref directly.
 
 Synthetic dataset:
   * 2 FBref subs in match M1 (player_in_canonical / player_out_canonical pairs)
@@ -30,7 +29,6 @@ import pytest
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
-SILVER_PATH = PROJECT_ROOT / "dags" / "sql" / "silver" / "match_substitutions.sql"
 GOLD_PATH = PROJECT_ROOT / "dags" / "sql" / "gold" / "fct_substitution.sql"
 
 _DAGS_DIR = PROJECT_ROOT / "dags"
@@ -83,7 +81,6 @@ _ICEBERG_TO_LOCAL = {
     "iceberg.silver.xref_match":             "silver_xref_match",
     "iceberg.silver.xref_team":              "silver_xref_team",
     "iceberg.silver.xref_player":            "silver_xref_player",
-    "iceberg.silver.match_substitutions":    "silver_match_substitutions",
 }
 
 
@@ -118,7 +115,6 @@ def _reset_schemas(duck_conn):
         "bronze_fbref_match_events", "bronze_whoscored_events",
         "bronze_whoscored_schedule", "silver_fbref_match_enriched",
         "silver_xref_match", "silver_xref_team", "silver_xref_player",
-        "silver_match_substitutions",
     ):
         duck_conn.execute(f"DROP TABLE IF EXISTS {tbl}")
 
@@ -293,12 +289,6 @@ def _seed(duck_conn) -> None:
     )
 
 
-def _materialize_silver(duck_conn) -> None:
-    sql = _translate(SILVER_PATH.read_text(encoding="utf-8"))
-    duck_conn.execute("DROP TABLE IF EXISTS silver_match_substitutions")
-    duck_conn.execute(f"CREATE TABLE silver_match_substitutions AS {sql}")
-
-
 def _run_gold(duck_conn) -> List[Dict[str, Any]]:
     sql = _translate(GOLD_PATH.read_text(encoding="utf-8"))
     cur = duck_conn.execute(sql)
@@ -316,7 +306,6 @@ class TestFctSubstitutionPipeline:
     def test_total_row_count(self, duck_conn):
         """2 FBref + 1 WhoScored paired = 3 rows."""
         _seed(duck_conn)
-        _materialize_silver(duck_conn)
         out = _run_gold(duck_conn)
         assert len(out) == 3, f"expected 3 rows, got {len(out)}: {out}"
 
@@ -327,7 +316,6 @@ class TestFctSubstitutionPipeline:
         on (game_id, minute, team_id).
         """
         _seed(duck_conn)
-        _materialize_silver(duck_conn)
         out = _run_gold(duck_conn)
 
         fbref_rows = [r for r in out if r["substitution_source"] == "fbref"]
@@ -350,14 +338,12 @@ class TestFctSubstitutionPipeline:
     def test_minute_parity_across_sources(self, duck_conn):
         """FBref minutes 60/75; WhoScored minute 80 — all preserved."""
         _seed(duck_conn)
-        _materialize_silver(duck_conn)
         out = _run_gold(duck_conn)
         minutes = sorted(r["minute"] for r in out)
         assert minutes == [60, 75, 80], minutes
 
     def test_canonical_trio_populated(self, duck_conn):
         _seed(duck_conn)
-        _materialize_silver(duck_conn)
         out = _run_gold(duck_conn)
         for r in out:
             assert r["substitution_canonical"], r
@@ -366,7 +352,6 @@ class TestFctSubstitutionPipeline:
 
     def test_source_distribution(self, duck_conn):
         _seed(duck_conn)
-        _materialize_silver(duck_conn)
         out = _run_gold(duck_conn)
         from collections import Counter
         c = Counter(r["substitution_source"] for r in out)
@@ -375,7 +360,6 @@ class TestFctSubstitutionPipeline:
 
     def test_pk_uniqueness(self, duck_conn):
         _seed(duck_conn)
-        _materialize_silver(duck_conn)
         out = _run_gold(duck_conn)
         pks = [r["substitution_canonical"] for r in out]
         assert len(pks) == len(set(pks)), pks
