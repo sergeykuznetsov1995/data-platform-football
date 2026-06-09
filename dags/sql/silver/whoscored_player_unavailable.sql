@@ -59,7 +59,10 @@ SELECT
 
     -- ========= Source attributes =========
     mp.league,
-    TRY_CAST(mp.season AS INTEGER)         AS season,
+    -- season как varchar-slug ('2526'), per charter S2 (#388). Bronze хранит
+    -- season как slug-строку; CAST держит тот же slug без смены значения.
+    -- Year-start↔slug мост к bigint-dims делает gold/fct_player_unavailable.sql.
+    CAST(mp.season AS varchar)             AS season,
     mp.team                                AS team_name,
     mp.player_id                           AS ws_player_id,
     mp.player                              AS player_name,

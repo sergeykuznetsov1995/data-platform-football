@@ -1102,10 +1102,18 @@ def validate_gold_quality() -> Dict[str, Any]:
                           where='is_completed = true', severity='WARNING'),
 
         # ========== E5: fct_player_unavailable observability — WARNING ==========
-        # Bronze whoscored_missing_players has been collected since 2021 (APL);
-        # upper bound 2030 leaves several seasons of headroom.
-        CHECK.value_range('gold.fct_player_unavailable', 'season',
-                          min_val=2021, max_val=2030, severity='WARNING'),
+        # season теперь varchar slug ('2021'..'2526'), per charter S2 (#388);
+        # value_range сравнивал бы varchar с числовым литералом → type-error в
+        # Trino. Range валидируем через TRY_CAST в row_count-предикате (тот же
+        # приём, что у coverage-проверок ниже). Bronze собирается с сезона
+        # 2020/21 ('2021'); верх '2930' даёт запас на несколько сезонов.
+        CHECK.row_count(
+            'gold.fct_player_unavailable',
+            min_rows=0, max_rows=0,
+            where="TRY_CAST(season AS integer) NOT BETWEEN 2021 AND 2930",
+            severity='WARNING',
+            name='value_range[gold.fct_player_unavailable.season slug]',
+        ),
 
         # Cross-source team_id coverage. WhoScored team_name -> team_slug is
         # best-effort (e.g. "Wolverhampton" vs "Wolves" leaves team_id NULL).

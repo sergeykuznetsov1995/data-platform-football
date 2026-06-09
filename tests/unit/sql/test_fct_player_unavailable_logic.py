@@ -58,6 +58,11 @@ def _transpile(path: Path) -> str:
     # DuckDB's strip_accents(x), which removes the combining marks directly; the
     # following `\p{Mn}+` REGEXP_REPLACE then matches nothing (harmless no-op).
     transpiled = re.sub(r"NORMALIZE\((.*?),\s*NFD\)", r"strip_accents(\1)", transpiled)
+    # Trino's printf-style FORMAT('%02d%02d', ...) (the season year-start↔slug
+    # bridge, #388) is left as DuckDB FORMAT() by sqlglot, but DuckDB's FORMAT
+    # uses Python `{}` placeholders and chokes on `%02d`. DuckDB's printf() is
+    # the printf-spec equivalent — rewrite the call so the bridge evaluates.
+    transpiled = re.sub(r"\bFORMAT\(", "printf(", transpiled)
     # Strip any trailing semicolons; we will wrap in SELECT
     return transpiled.rstrip().rstrip(";")
 
@@ -124,7 +129,7 @@ def _create_silver_table(con: duckdb.DuckDBPyConnection) -> None:
             match_id VARCHAR,
             match_date DATE,
             league VARCHAR,
-            season INTEGER,
+            season VARCHAR,
             team_name VARCHAR,
             ws_player_id VARCHAR,
             player_name VARCHAR,
@@ -339,8 +344,8 @@ class TestSilverWhoscoredPlayerUnavailable:
         assert len(rows) == 1
         assert rows[0]["match_date"] == date(2025, 3, 15)
         assert rows[0]["match_id"] == "g42"
-        # season string -> integer cast
-        assert rows[0]["season"] == 2024
+        # season passes through as varchar slug (#388), no longer integer-cast
+        assert rows[0]["season"] == "2024"
 
 
 # ---------------------------------------------------------------------------
@@ -361,7 +366,7 @@ class TestGoldFctPlayerUnavailable:
         con.execute(
             f"""
             INSERT INTO iceberg.silver.whoscored_player_unavailable VALUES
-            ('{match_id}', DATE '{match_date.isoformat()}', 'ENG-PL', 2024,
+            ('{match_id}', DATE '{match_date.isoformat()}', 'ENG-PL', '2425',
              '{team_name}', '{ws_player_id}', '{player_name}',
              'Injury', 'confirmed', TIMESTAMP '2025-01-10 00:00:00')
             """

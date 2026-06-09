@@ -31,6 +31,8 @@ SELECT
     CAST(NULL AS TIMESTAMP)            AS _silver_ingested_at,
 
     league,
-    season
+    -- season — varchar slug, как в основном fct_player_unavailable.sql (#388).
+    -- WHERE 1=0 => строк нет; важен только тип колонки для schema-parity.
+    format('%02d%02d', mod(season, 100), mod(season + 1, 100)) AS season
 FROM iceberg.gold.dim_match
 WHERE 1 = 0

@@ -59,7 +59,10 @@ u_resolved AS (
     LEFT JOIN iceberg.gold.dim_match dm
         ON  dm.date    = u.match_date
         AND dm.league  = u.league
-        AND dm.season  = u.season
+        -- season bridge (#388): dim_match.season — bigint year-start (2025 для
+        -- 2025/26); Silver season — varchar slug ('2526'). Конвертируем dim к
+        -- slug тем же format(), что и fct_lineup.sql, чтобы JOIN совпадал.
+        AND format('%02d%02d', mod(dm.season, 100), mod(dm.season + 1, 100)) = u.season
         AND (dm.home_team_id = u.team_slug OR dm.away_team_id = u.team_slug)
 ),
 
@@ -67,13 +70,15 @@ u_resolved AS (
 -- deterministic one. Conflicts surface via DQ.
 dp_lookup AS (
     SELECT
-        season,
+        -- season bridge (#388): dim_player.season — bigint year-start; приводим
+        -- к slug ('2526') здесь, чтобы JOIN ниже сравнивал slug со slug.
+        format('%02d%02d', mod(season, 100), mod(season + 1, 100)) AS season,
         player_name,
         MIN(player_id) AS player_id
     FROM iceberg.gold.dim_player
     WHERE player_name IS NOT NULL
       AND player_id   IS NOT NULL
-    GROUP BY season, player_name
+    GROUP BY format('%02d%02d', mod(season, 100), mod(season + 1, 100)), player_name
 )
 
 SELECT
@@ -93,13 +98,17 @@ SELECT
     ur._bronze_ingested_at                                  AS _silver_ingested_at,
 
     ur.league,
+    -- season — varchar slug ('2526') из Silver; year-start↔slug мост сделан в
+    -- dim-JOIN'ах выше (#388, charter S2). Не приводим тип здесь.
     ur.season
 
 FROM u_resolved ur
 LEFT JOIN iceberg.gold.dim_team dt
     ON  dt.team_id = ur.team_slug
     AND dt.league  = ur.league
-    AND dt.season  = ur.season
+    -- season bridge (#388): dim_team.season — bigint year-start; конвертируем к
+    -- slug, чтобы совпасть с varchar-slug сезоном из Silver.
+    AND format('%02d%02d', mod(dt.season, 100), mod(dt.season + 1, 100)) = ur.season
 LEFT JOIN dp_lookup dp
     ON  dp.player_name = ur.player_name
     AND dp.season      = ur.season
