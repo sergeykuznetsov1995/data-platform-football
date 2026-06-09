@@ -84,8 +84,46 @@ def build_patch(spec: dict[str, Any], current: dict[str, Any]) -> list[dict[str,
     return ops
 
 
-def apply_lineage(host: str, headers: dict[str, str], rels: list[dict[str, Any]], from_fqn: str, dry_run: bool, counter: dict[str, int]) -> None:
-    """Best-effort lineage edges. Non-fatal on errors."""
+def _table_fqn(fqn: str) -> str:
+    """OM table FQN = service.db.schema.table; trim a trailing column component."""
+    parts = fqn.split(".")
+    return ".".join(parts[:4]) if len(parts) > 4 else fqn
+
+
+def resolve_table_id(host: str, headers: dict[str, str], fqn: str, cache: dict[str, str | None]) -> str | None:
+    """FQN (table or column) -> table UUID, cached (incl. negative-cache on 404)."""
+    key = _table_fqn(fqn)
+    if key in cache:
+        return cache[key]
+    try:
+        r = requests.get(f"{host}/api/v1/tables/name/{key}", headers=headers, timeout=15)
+    except requests.RequestException:
+        cache[key] = None
+        return None
+    tid = r.json().get("id") if r.status_code == 200 else None
+    cache[key] = tid
+    return tid
+
+
+def apply_lineage(
+    host: str,
+    headers: dict[str, str],
+    rels: list[dict[str, Any]],
+    from_fqn: str,
+    dry_run: bool,
+    counter: dict[str, int],
+    *,
+    from_id: str | None = None,
+    fqn_cache: dict[str, str | None] | None = None,
+) -> None:
+    """Best-effort lineage edges. Non-fatal on errors.
+
+    The referenced (FK target) table is upstream; the current table is downstream
+    — so the edge is fromEntity=parent(to) -> toEntity=self(from). The Lineage API
+    needs entity UUIDs, so FQNs are resolved (and cached) via resolve_table_id.
+    """
+    if fqn_cache is None:
+        fqn_cache = {}
     for rel in rels:
         rel_type = (rel.get("type") or "").upper()
         if rel_type != "FOREIGN_KEY":
@@ -93,32 +131,38 @@ def apply_lineage(host: str, headers: dict[str, str], rels: list[dict[str, Any]]
         to_fqn = rel.get("to")
         if not to_fqn:
             continue
+        if dry_run:
+            print(f"[DRY] PUT /api/v1/lineage  {to_fqn} -> {from_fqn}")
+            counter["lineage_dry"] = counter.get("lineage_dry", 0) + 1
+            continue
+
+        to_id = resolve_table_id(host, headers, to_fqn, fqn_cache)
+        f_id = from_id or resolve_table_id(host, headers, from_fqn, fqn_cache)
+        if not to_id or not f_id:
+            print(f"  WARN lineage {to_fqn} -> {from_fqn}: unresolved FQN (not ingested yet)")
+            counter["lineage_warn"] = counter.get("lineage_warn", 0) + 1
+            continue
+
         edge = {
             "edge": {
-                "fromEntity": {"id": from_fqn, "type": "table"},
-                "toEntity": {"id": to_fqn, "type": "table"},
+                "fromEntity": {"id": to_id, "type": "table"},
+                "toEntity": {"id": f_id, "type": "table"},
                 "description": rel.get("description") or f"FK: {from_fqn} -> {to_fqn}",
             }
         }
-        if dry_run:
-            print(f"[DRY] PUT /api/v1/lineage  {from_fqn} -> {to_fqn}")
-            counter["lineage_dry"] = counter.get("lineage_dry", 0) + 1
-            continue
-        # TODO: Lineage API expects entity IDs, not FQNs — Phase 1.5 will resolve
-        # FQN -> id via GET /api/v1/tables/name/{fqn}. For now best-effort PUT.
         try:
             r = requests.put(f"{host}/api/v1/lineage", headers=headers, json=edge, timeout=15)
             if r.status_code in (200, 201):
                 counter["lineage_ok"] = counter.get("lineage_ok", 0) + 1
             else:
-                print(f"  WARN lineage {from_fqn} -> {to_fqn}: HTTP {r.status_code}")
+                print(f"  WARN lineage {to_fqn} -> {from_fqn}: HTTP {r.status_code}")
                 counter["lineage_warn"] = counter.get("lineage_warn", 0) + 1
         except requests.RequestException as exc:
-            print(f"  WARN lineage {from_fqn} -> {to_fqn}: {exc}")
+            print(f"  WARN lineage {to_fqn} -> {from_fqn}: {exc}")
             counter["lineage_warn"] = counter.get("lineage_warn", 0) + 1
 
 
-def process_file(path: Path, host: str, headers: dict[str, str], dry_run: bool, counter: dict[str, int]) -> None:
+def process_file(path: Path, host: str, headers: dict[str, str], dry_run: bool, counter: dict[str, int], fqn_cache: dict[str, str | None] | None = None) -> None:
     spec = load_yaml(path)
     table = spec.get("table") or {}
     fqn = table.get("fullyQualifiedName")
@@ -135,7 +179,7 @@ def process_file(path: Path, host: str, headers: dict[str, str], dry_run: bool, 
             print(f"  {json.dumps(op, ensure_ascii=False)}")
         rels = spec.get("relationships") or []
         if rels:
-            apply_lineage(host, headers, rels, fqn, dry_run=True, counter=counter)
+            apply_lineage(host, headers, rels, fqn, dry_run=True, counter=counter, fqn_cache=fqn_cache)
         counter["applied"] += 1
         return
 
@@ -172,7 +216,7 @@ def process_file(path: Path, host: str, headers: dict[str, str], dry_run: bool, 
 
     rels = spec.get("relationships") or []
     if rels:
-        apply_lineage(host, headers, rels, fqn, dry_run=False, counter=counter)
+        apply_lineage(host, headers, rels, fqn, dry_run=False, counter=counter, from_id=table_id, fqn_cache=fqn_cache)
 
 
 def main() -> int:
@@ -197,10 +241,15 @@ def main() -> int:
         return 0
 
     counter = {"applied": 0, "skipped": 0, "failed": 0}
+    fqn_cache: dict[str, str | None] = {}
     for path in files:
-        process_file(path, args.host, headers, args.dry_run, counter)
+        process_file(path, args.host, headers, args.dry_run, counter, fqn_cache)
 
     print(f"\nDone: applied={counter['applied']} skipped={counter['skipped']} failed={counter['failed']}")
+    print(
+        f"Lineage: ok={counter.get('lineage_ok', 0)} "
+        f"warn={counter.get('lineage_warn', 0)} dry={counter.get('lineage_dry', 0)}"
+    )
     return 1 if counter["failed"] else 0
 
 

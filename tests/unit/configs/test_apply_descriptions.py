@@ -129,6 +129,139 @@ def test_build_patch_column_tags_idempotent() -> None:
     assert not [o for o in ops if o["path"] == "/columns/0/tags"], f"should be idempotent, got {ops}"
 
 
+def test_table_fqn_strips_column() -> None:
+    """_table_fqn drops a trailing column component, keeps a bare table FQN (#406)."""
+    mod = _import_apply()
+    col_fqn = "trino_iceberg.iceberg.gold.dim_team.team_id"
+    tbl_fqn = "trino_iceberg.iceberg.gold.dim_team"
+    assert mod._table_fqn(col_fqn) == tbl_fqn
+    assert mod._table_fqn(tbl_fqn) == tbl_fqn
+
+
+def test_resolve_table_id_caches(monkeypatch) -> None:
+    """resolve_table_id hits the API once per table; column+table FQN share a key (#406)."""
+    mod = _import_apply()
+    calls: list[str] = []
+
+    class _Resp:
+        status_code = 200
+
+        @staticmethod
+        def json() -> dict:
+            return {"id": "uuid-dim-team"}
+
+    def fake_get(url, headers=None, timeout=None, params=None):  # noqa: ARG001
+        calls.append(url)
+        return _Resp()
+
+    monkeypatch.setattr(mod.requests, "get", fake_get)
+    cache: dict = {}
+    a = mod.resolve_table_id("http://om", {}, "trino_iceberg.iceberg.gold.dim_team.team_id", cache)
+    b = mod.resolve_table_id("http://om", {}, "trino_iceberg.iceberg.gold.dim_team", cache)
+    assert a == b == "uuid-dim-team"
+    assert len(calls) == 1, f"expected one GET (cached), got {calls}"
+
+
+def test_resolve_table_id_negative_cache(monkeypatch) -> None:
+    """404 → None, cached: a second lookup does not re-hit the API (#406)."""
+    mod = _import_apply()
+    calls: list[str] = []
+
+    class _Resp404:
+        status_code = 404
+
+        @staticmethod
+        def json() -> dict:
+            return {}
+
+    def fake_get(url, headers=None, timeout=None, params=None):  # noqa: ARG001
+        calls.append(url)
+        return _Resp404()
+
+    monkeypatch.setattr(mod.requests, "get", fake_get)
+    cache: dict = {}
+    fqn = "trino_iceberg.iceberg.gold.not_ingested"
+    assert mod.resolve_table_id("http://om", {}, fqn, cache) is None
+    assert mod.resolve_table_id("http://om", {}, fqn, cache) is None
+    assert len(calls) == 1, f"404 must be cached, got {calls}"
+
+
+def test_apply_lineage_puts_resolved_uuid_edge(monkeypatch) -> None:
+    """apply_lineage resolves FQN→UUID and PUTs parent→self edge (#406)."""
+    mod = _import_apply()
+    ids = {
+        "trino_iceberg.iceberg.silver.fbref_match_enriched": "uuid-parent",
+        "trino_iceberg.iceberg.silver.fbref_match_events": "uuid-self",
+    }
+    put_bodies: list[dict] = []
+
+    class _Get:
+        def __init__(self, tid):
+            self.status_code = 200
+            self._tid = tid
+
+        def json(self):
+            return {"id": self._tid}
+
+    def fake_get(url, headers=None, timeout=None, params=None):  # noqa: ARG001
+        fqn = url.rsplit("/name/", 1)[-1]
+        return _Get(ids.get(fqn))
+
+    class _Put:
+        status_code = 200
+        text = ""
+
+    def fake_put(url, headers=None, json=None, timeout=None):  # noqa: ARG001, A002
+        put_bodies.append(json)
+        return _Put()
+
+    monkeypatch.setattr(mod.requests, "get", fake_get)
+    monkeypatch.setattr(mod.requests, "put", fake_put)
+
+    rels = [{
+        "from": "match_id",
+        "to": "trino_iceberg.iceberg.silver.fbref_match_enriched.match_id",
+        "type": "FOREIGN_KEY",
+        "description": "N:1",
+    }]
+    counter: dict = {}
+    mod.apply_lineage(
+        "http://om", {}, rels,
+        "trino_iceberg.iceberg.silver.fbref_match_events",
+        dry_run=False, counter=counter,
+        from_id="uuid-self", fqn_cache={},
+    )
+
+    assert counter.get("lineage_ok") == 1, counter
+    assert len(put_bodies) == 1
+    edge = put_bodies[0]["edge"]
+    # Direction: referenced parent is upstream (fromEntity), self is downstream (toEntity).
+    assert edge["fromEntity"]["id"] == "uuid-parent"
+    assert edge["toEntity"]["id"] == "uuid-self"
+    # No raw FQN leaked into the id fields.
+    assert "iceberg" not in edge["fromEntity"]["id"]
+    assert "iceberg" not in edge["toEntity"]["id"]
+
+
+def test_apply_lineage_dry_run_no_http(monkeypatch) -> None:
+    """dry-run renders intent without calling the API (#406)."""
+    mod = _import_apply()
+
+    def boom(*a, **k):  # noqa: ARG001
+        raise AssertionError("dry-run must not hit HTTP")
+
+    monkeypatch.setattr(mod.requests, "get", boom)
+    monkeypatch.setattr(mod.requests, "put", boom)
+
+    rels = [{"to": "trino_iceberg.iceberg.gold.dim_team.team_id", "type": "FOREIGN_KEY"}]
+    counter: dict = {}
+    mod.apply_lineage(
+        "http://om", {}, rels, "trino_iceberg.iceberg.gold.fct_player_match",
+        dry_run=True, counter=counter, fqn_cache={},
+    )
+    assert counter.get("lineage_dry") == 1, counter
+
+
 def test_required_fields() -> None:
     """Each YAML must define table.fullyQualifiedName + description + tags(list)."""
     files = sorted(DESCRIPTIONS_DIR.glob("*.yaml"))
