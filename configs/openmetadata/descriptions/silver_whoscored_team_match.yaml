@@ -1,0 +1,69 @@
+# =============================================================================
+# OpenMetadata description: iceberg.silver.whoscored_team_match
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.silver.whoscored_team_match
+  description: |
+    Командная статистика за матч из WhoScored — один row на (match_id, team_id).
+    Источник: silver.whoscored_events_spadl (дедуп унаследован), GROUP BY команда+матч
+    с COUNT_IF по SPADL-действиям: пас-блок с success-rate, отборы, обводки, прокси
+    ударов, плюс производные пространственные метрики (touches_in_box,
+    defensive_actions_third) и детект стандартов через regex по qualifiers_raw
+    (SPADL схлопывает стандарты в 'pass', sub-type выживает только в qualifiers).
+    Сырой team_id (xref_team на Gold). Питает gold.fct_team_match v2.
+  tags:
+    - Tier.Silver
+    - Domain.Football
+    - PII.None
+columns:
+  - name: match_id
+    description: ID матча (сырой WhoScored game_id); часть PK; xref_match на Gold.
+  - name: team_id
+    description: Сырой WhoScored team_id (уже double→BIGINT→varchar в events_spadl); часть PK; xref_team на Gold.
+  - name: total_events
+    description: Всего событий команды в матче (COUNT(*)).
+  - name: pass_total
+    description: Передачи команды, всего (action_canonical='pass').
+  - name: pass_ok
+    description: Точные передачи (pass с outcome_success).
+  - name: pass_pct
+    description: Доля точных передач, % (pass_ok / pass_total).
+  - name: key_passes_ws
+    description: Ключевые передачи (pass с qualifier 'KeyPass' — привёл к удару).
+  - name: takeon_att
+    description: Попытки обводки / take-on (action_canonical='take_on').
+  - name: takeon_won
+    description: Удачные обводки (take_on с outcome_success).
+  - name: takeon_pct
+    description: Доля удачных обводок, % (takeon_won / takeon_att).
+  - name: tackle_att
+    description: Отборы, всего (action_canonical='tackle').
+  - name: tackle_won
+    description: Выигранные отборы (tackle с outcome_success).
+  - name: interceptions
+    description: Перехваты (action_canonical='interception').
+  - name: clearances
+    description: Выносы мяча (action_canonical='clearance').
+  - name: ball_recoveries
+    description: Возвраты владения мячом (action_canonical='ball_recovery').
+  - name: shots_total
+    description: Удары, всего (action_canonical='shot').
+  - name: shots_on_target_proxy
+    description: Прокси ударов в створ (shot с outcome_success ≈ сейвы+голы+штанги); фактические голы — в fct_shot.
+  - name: fouls_committed
+    description: Совершённые фолы (action_canonical='foul').
+  - name: touches_in_box
+    description: Касания в штрафной соперника (x≥83, y∈[21,79]) для on-ball действий.
+  - name: defensive_actions_third
+    description: Оборонительные действия в своей трети (tackle/interception/clearance/ball_recovery/foul при x<33.33).
+  - name: set_piece_events
+    description: События со стандартов (regex по qualifiers_raw — ThrowIn/CornerTaken/FreekickTaken/GoalKick, плюс shot_penalty/shot_freekick).
+  - name: set_piece_share_pct
+    description: Доля стандартов от всех событий, % (set_piece_events / total_events).
+  - name: league
+    description: Лига (partition key).
+  - name: season
+    description: Сезон slug '2526' (partition key, varchar).
+  - name: _silver_created_at
+    description: Технический timestamp создания строки в Silver-слое (добавляется CTAS-раннером).
+relationships: []

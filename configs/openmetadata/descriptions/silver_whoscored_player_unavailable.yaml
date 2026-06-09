@@ -1,0 +1,43 @@
+# =============================================================================
+# OpenMetadata description: iceberg.silver.whoscored_player_unavailable
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.silver.whoscored_player_unavailable
+  description: |
+    Недоступные игроки по матчам из WhoScored (травмы/дисквалификации) — один row
+    на (match_id, team_name, ws_player_id). Источник: bronze.whoscored_missing_players
+    LEFT JOIN bronze.whoscored_schedule (за match_date). Фильтры: только status='Out'
+    (слухи 'Doubtful' исключены), reason без 'international duty' (вызовы в сборную —
+    не сигнал формы). Сырой ws_player_id и team_name (xref резолвится на Gold,
+    мост через season-slug делает gold/fct_player_unavailable.sql). player_name —
+    PII (имя игрока), сохранено для user-facing отчётности.
+  tags:
+    - Tier.Silver
+    - Domain.Football
+    - PII.Low
+columns:
+  - name: match_id
+    description: ID матча (сырой WhoScored game_id); xref_match резолвится на Gold.
+  - name: match_date
+    description: Дата матча (TRY_CAST из bronze.whoscored_schedule.date); для контекстной фильтрации.
+  - name: league
+    description: Лига slug (например 'APL'), partition key.
+  - name: season
+    description: Сезон slug '2526' (varchar, per charter S2 #388); year-start↔slug мост к dim делает Gold.
+  - name: team_name
+    description: Название команды как на WhoScored (например 'Manchester City'); не канонический team_id.
+  - name: ws_player_id
+    description: Сырой WhoScored player_id недоступного игрока; xref_player резолвится на Gold.
+  - name: player_name
+    description: Имя недоступного игрока как на WhoScored (PII; для user-facing отчётности).
+    tags:
+      - PII.Low
+  - name: reason
+    description: Причина недоступности (например 'Injury', 'Suspension'); 'international duty' отфильтрован.
+  - name: status
+    description: Статус доступности; оставлен только 'Out' (подтверждённо вне игры), 'Doubtful' исключён.
+  - name: _bronze_ingested_at
+    description: Технический timestamp ingest'а Bronze (lineage).
+  - name: _silver_created_at
+    description: Технический timestamp создания строки в Silver-слое (добавляется CTAS-раннером).
+relationships: []

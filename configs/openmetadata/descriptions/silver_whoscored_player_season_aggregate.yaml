@@ -1,0 +1,84 @@
+# =============================================================================
+# OpenMetadata description: iceberg.silver.whoscored_player_season_aggregate
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.silver.whoscored_player_season_aggregate
+  description: |
+    Сезонная статистика игрока из WhoScored — один row на
+    (canonical_id, league, season). Источник: silver.whoscored_events_spadl
+    INNER JOIN silver.xref_player (source='whoscored') с обязательным предикатом
+    (league, season). Orphan-игроки (без xref) отфильтрованы — не bridge'атся к
+    FBref-spine на Gold. Агрегаты по SPADL-действиям: success-rate пасов/обводок/
+    отборов, проброс ударов, GK-метрики и пространственный профиль (avg_x/avg_y,
+    touches_in_box). canonical_id — FK → gold.dim_player.player_id. Форма зеркалит
+    sofascore/understat player_season_aggregate для LEFT JOIN на Gold.
+  tags:
+    - Tier.Silver
+    - Domain.Football
+    - PII.None
+columns:
+  - name: canonical_id
+    description: Канонический ID игрока из xref_player (FK → gold.dim_player.player_id).
+  - name: player_id_raw
+    description: Сырой WhoScored player_id (для трассировки; canonical_id — золотой ключ).
+  - name: matches_seen
+    description: Число матчей с участием игрока (COUNT(DISTINCT match_id)).
+  - name: total_events
+    description: Всего событий игрока за сезон (COUNT(*)).
+  - name: pass_total
+    description: Передачи, всего (action_canonical='pass').
+  - name: pass_ok
+    description: Точные передачи (pass с outcome_success).
+  - name: pass_pct
+    description: Доля точных передач, % (pass_ok / pass_total).
+  - name: takeon_att
+    description: Попытки обводки / take-on (action_canonical='take_on').
+  - name: takeon_won
+    description: Удачные обводки (take_on с outcome_success).
+  - name: takeon_pct
+    description: Доля удачных обводок, % (takeon_won / takeon_att).
+  - name: dribbles
+    description: Обводки-проводки мяча (action_canonical='dribble'; проприетарный SPADL-супплемент).
+  - name: bad_touches
+    description: Плохие касания / потери (action_canonical='bad_touch' — BallTouch/Dispossessed/Error).
+  - name: shots_total
+    description: Удары, всего (action_canonical='shot').
+  - name: shots_on_target_proxy
+    description: Прокси ударов в створ (shot с outcome_success ≈ дошёл до рамки — сейвы+голы+штанги); фактические голы — в fct_shot.
+  - name: tackle_att
+    description: Отборы, всего (action_canonical='tackle').
+  - name: tackle_won
+    description: Выигранные отборы (tackle с outcome_success).
+  - name: tackle_pct
+    description: Доля выигранных отборов, % (tackle_won / tackle_att).
+  - name: interceptions
+    description: Перехваты (action_canonical='interception').
+  - name: ball_recoveries
+    description: Возвраты владения мячом (action_canonical='ball_recovery').
+  - name: clearances
+    description: Выносы мяча (action_canonical='clearance').
+  - name: fouls_committed
+    description: Совершённые фолы (action_canonical='foul').
+  - name: keeper_saves
+    description: Сейвы вратаря (action_canonical='keeper_save'); NULL/0 для полевых игроков.
+  - name: keeper_pickups
+    description: Подборы мяча вратарём (action_canonical='keeper_pick_up'); NULL/0 для полевых.
+  - name: keeper_claims
+    description: Игра вратаря на выходе / фиксация навеса (action_canonical='keeper_claim'); NULL/0 для полевых.
+  - name: avg_x
+    description: Средняя X-позиция on-ball атакующих действий (pass/take_on/shot/dribble), SPADL 0–100.
+  - name: avg_y
+    description: Средняя Y-позиция on-ball атакующих действий (pass/take_on/shot/dribble), SPADL 0–100.
+  - name: touches_in_box
+    description: Касания в штрафной соперника (x≥83, y∈[21,79]) для on-ball действий.
+  - name: league
+    description: Лига (partition key).
+  - name: season
+    description: Сезон slug '2526' (partition key, varchar).
+  - name: _silver_created_at
+    description: Технический timestamp создания строки в Silver-слое (добавляется CTAS-раннером).
+relationships:
+  - from: canonical_id
+    to: trino_iceberg.iceberg.gold.dim_player.player_id
+    type: FOREIGN_KEY
+    description: N:1 — сезонная статистика к каноническому игроку.
