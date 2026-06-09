@@ -1,0 +1,46 @@
+# =============================================================================
+# OpenMetadata description: iceberg.silver.fbref_match_lineups
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.silver.fbref_match_lineups
+  description: |
+    Составы матча — по строке на игрока в заявке (старт + скамейка).
+    Несколько строк на матч. Источник: bronze.fbref_lineups (без JOIN'ов).
+    is_starter уже BOOLEAN в Bronze; jersey_number = TRY_CAST исходного
+    VARCHAR-поля number. Дедупликация: ROW_NUMBER PARTITION BY
+    (match_id, player_id) ORDER BY _ingested_at DESC.
+    match_id — сырой FBref-идентификатор (FK → silver.fbref_match_enriched).
+  tags:
+    - Tier.Silver
+    - Domain.Football
+    - PII.Low
+columns:
+  - name: match_id
+    description: ID матча (FK → silver.fbref_match_enriched.match_id).
+  - name: team
+    description: Команда игрока (название как на FBref).
+  - name: player
+    description: Имя игрока.
+    tags:
+      - PII.Low
+  - name: player_id
+    description: Сырой FBref player_id.
+  - name: is_starter
+    description: BOOLEAN — true для стартового состава, false для скамейки.
+  - name: position
+    description: Позиция игрока в матче (как указана FBref, например GK / CB / FW).
+  - name: jersey_number
+    description: Игровой номер на футболке (INTEGER, TRY_CAST из VARCHAR).
+  - name: _bronze_ingested_at
+    description: Технический timestamp ingest'а Bronze (lineage).
+  - name: league
+    description: Лига (partition key).
+  - name: season
+    description: Сезон short-form '2526' (partition key).
+  - name: _silver_created_at
+    description: Технический timestamp создания строки в Silver-слое (добавляется CTAS-раннером).
+relationships:
+  - from: match_id
+    to: trino_iceberg.iceberg.silver.fbref_match_enriched.match_id
+    type: FOREIGN_KEY
+    description: N:1 — составы матча.

@@ -1,0 +1,88 @@
+# =============================================================================
+# OpenMetadata description: iceberg.silver.fbref_player_match_stats
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.silver.fbref_player_match_stats
+  description: |
+    Индивидуальная статистика игрока за матч — один row на
+    (match_id, player, team). Источник: bronze.fbref_match_player_stats
+    (без JOIN'ов). Дедупликация: ROW_NUMBER PARTITION BY
+    (match_id, COALESCE(player_id, player), team) ORDER BY _ingested_at DESC.
+    player_id извлекается из HTML-ссылок (с апр-2026); для старых Bronze-строк
+    fallback на имя игрока. Числовые поля уже BIGINT/DOUBLE в Bronze —
+    минимальный TRY_CAST. match_id — сырой FBref-идентификатор
+    (FK → silver.fbref_match_enriched).
+  tags:
+    - Tier.Silver
+    - Domain.Football
+    - PII.Low
+columns:
+  - name: match_id
+    description: ID матча (FK → silver.fbref_match_enriched.match_id).
+  - name: player_id
+    description: Сырой FBref player_id (из HTML-ссылки; NULL для старых Bronze-строк).
+  - name: player
+    description: Имя игрока.
+    tags:
+      - PII.Low
+  - name: team
+    description: Команда игрока (название как на FBref).
+  - name: team_side
+    description: Сторона команды в матче — 'home' или 'away'.
+  - name: nation
+    description: Национальность игрока (код страны как на FBref).
+    tags:
+      - PII.Low
+  - name: pos
+    description: Позиция игрока в матче (например GK / DF / MF / FW).
+  - name: age
+    description: Возраст игрока на момент матча (как указан FBref).
+  - name: minutes
+    description: Сыгранные минуты (min).
+  - name: goals
+    description: Голы в матче (gls).
+  - name: assists
+    description: Ассисты (ast).
+  - name: penalty_goals
+    description: Голы с пенальти (pk).
+  - name: penalty_attempts
+    description: Пробитые пенальти, всего (pkatt).
+  - name: shots
+    description: Удары, всего (sh).
+  - name: shots_on_target
+    description: Удары в створ (sot = shots on target).
+  - name: yellow_cards
+    description: Жёлтые карточки (crdy).
+  - name: red_cards
+    description: Красные карточки (crdr).
+  - name: crosses
+    description: Навесы (crs).
+  - name: fouls_committed
+    description: Сфолил (fls = fouls committed).
+  - name: fouls_drawn
+    description: На игроке сфолили (fld = fouls drawn).
+  - name: offsides
+    description: Положения вне игры (off).
+  - name: tackles_won
+    description: Выигранные отборы (tklw = tackles won).
+  - name: interceptions
+    description: Перехваты (int).
+  - name: own_goals
+    description: Автоголы (og).
+  - name: penalties_won
+    description: Заработанные пенальти (pkwon), DOUBLE.
+  - name: penalties_conceded
+    description: Привезённые пенальти (pkcon), DOUBLE.
+  - name: _bronze_ingested_at
+    description: Технический timestamp ingest'а Bronze (lineage).
+  - name: league
+    description: Лига (partition key).
+  - name: season
+    description: Сезон short-form '2526' (partition key).
+  - name: _silver_created_at
+    description: Технический timestamp создания строки в Silver-слое (добавляется CTAS-раннером).
+relationships:
+  - from: match_id
+    to: trino_iceberg.iceberg.silver.fbref_match_enriched.match_id
+    type: FOREIGN_KEY
+    description: N:1 — статистика игроков матча.

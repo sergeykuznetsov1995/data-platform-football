@@ -1,0 +1,121 @@
+# =============================================================================
+# OpenMetadata description: iceberg.silver.fbref_match_enriched
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.silver.fbref_match_enriched
+  description: |
+    Один row на матч FBref — расписание (fbref_schedule) обогащённое
+    командными агрегатами (fbref_match_team_stats) и счётчиками событий /
+    составов (fbref_match_events, fbref_lineups). Match-хаб Silver-слоя:
+    остальные silver.fbref_* детальные таблицы (events / lineups / shots /
+    player_match_stats) ссылаются на этот match_id.
+    match_id: реальный hex-slug из match_url, либо синтетический
+    'fut_<xxhash64>' для будущих матчей без опубликованной страницы (по
+    приоритету gameweek+season+home+away, иначе date+home+away) — гарантирует
+    non-NULL и survive в Gold/predictions_input. home_score/away_score
+    парсятся REGEXP из строки score. Каждый источник дедуплицируется
+    независимо через ROW_NUMBER ... ORDER BY _ingested_at DESC.
+    Идентификаторы сырые FBref (canonical-резолюция — в Gold).
+  tags:
+    - Tier.Silver
+    - Domain.Football
+    - PII.None
+columns:
+  - name: match_id
+    description: |
+      ID матча. Реальный hex-slug FBref (из /matches/<id>/) либо
+      синтетический 'fut_<xxhash64>' для будущих матчей. PK Silver-слоя,
+      match-хаб для остальных silver.fbref_* таблиц.
+  - name: gameweek
+    description: Номер тура (gameweek), INTEGER.
+  - name: day
+    description: День недели матча (Mon/Tue/...).
+  - name: date
+    description: Дата матча (DATE).
+  - name: time
+    description: Время начала матча (как на FBref, строка).
+  - name: home
+    description: Команда хозяев (название как на FBref, до alias-нормализации).
+  - name: away
+    description: Команда гостей (название как на FBref, до alias-нормализации).
+  - name: score
+    description: Итоговый счёт строкой (например "2–1"), как опубликован FBref.
+  - name: home_score
+    description: Голы хозяев — INTEGER, извлечён REGEXP из score.
+  - name: away_score
+    description: Голы гостей — INTEGER, извлечён REGEXP из score.
+  - name: attendance
+    description: Посещаемость (количество зрителей), INTEGER.
+  - name: venue
+    description: Стадион проведения матча.
+  - name: referee
+    description: Главный арбитр матча (имя как на FBref).
+  - name: match_url
+    description: URL страницы матча на FBref (пустой для будущих матчей).
+  - name: home_possession
+    description: Владение мячом хозяев, % (fbref_match_team_stats).
+  - name: away_possession
+    description: Владение мячом гостей, % (fbref_match_team_stats).
+  - name: home_shots
+    description: Удары хозяев (fbref_match_team_stats).
+  - name: away_shots
+    description: Удары гостей (fbref_match_team_stats).
+  - name: home_sot
+    description: Удары в створ хозяев (sot = shots on target).
+  - name: away_sot
+    description: Удары в створ гостей (sot = shots on target).
+  - name: home_saves
+    description: Сэйвы вратаря хозяев.
+  - name: away_saves
+    description: Сэйвы вратаря гостей.
+  - name: home_yellow_cards
+    description: Жёлтые карточки хозяев (из командной статистики).
+  - name: away_yellow_cards
+    description: Жёлтые карточки гостей (из командной статистики).
+  - name: home_red_cards
+    description: Красные карточки хозяев (из командной статистики).
+  - name: away_red_cards
+    description: Красные карточки гостей (из командной статистики).
+  - name: home_goals_events
+    description: |
+      Голы хозяев, посчитанные из событий (event_type IN goal/penalty,
+      team_side='home'). Независимый счётчик vs home_score (sanity-check).
+  - name: away_goals_events
+    description: |
+      Голы гостей, посчитанные из событий (event_type IN goal/penalty,
+      team_side='away'). Независимый счётчик vs away_score.
+  - name: home_own_goals
+    description: Автоголы хозяев (event_type='own_goal', team_side='home').
+  - name: away_own_goals
+    description: Автоголы гостей (event_type='own_goal', team_side='away').
+  - name: home_yellows
+    description: Жёлтые хозяев, посчитанные из событий (event_type='yellow_card').
+  - name: away_yellows
+    description: Жёлтые гостей, посчитанные из событий (event_type='yellow_card').
+  - name: home_second_yellows
+    description: Вторые жёлтые хозяев из событий (event_type='second_yellow_card').
+  - name: away_second_yellows
+    description: Вторые жёлтые гостей из событий (event_type='second_yellow_card').
+  - name: home_reds
+    description: Прямые красные хозяев из событий (event_type='red_card').
+  - name: away_reds
+    description: Прямые красные гостей из событий (event_type='red_card').
+  - name: total_subs
+    description: Всего замен в матче (event_type='substitution').
+  - name: home_starters
+    description: Игроков в стартовом составе хозяев (is_starter=true, team=home).
+  - name: away_starters
+    description: Игроков в стартовом составе гостей (is_starter=true, team=away).
+  - name: home_bench
+    description: Игроков на скамейке хозяев (is_starter=false, team=home).
+  - name: away_bench
+    description: Игроков на скамейке гостей (is_starter=false, team=away).
+  - name: _bronze_ingested_at
+    description: Технический timestamp ingest'а Bronze (lineage).
+  - name: league
+    description: Лига (partition key).
+  - name: season
+    description: Сезон short-form '2526' (partition key).
+  - name: _silver_created_at
+    description: Технический timestamp создания строки в Silver-слое (добавляется CTAS-раннером).
+relationships: []

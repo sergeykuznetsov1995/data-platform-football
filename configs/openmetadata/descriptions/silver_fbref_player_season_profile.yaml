@@ -1,0 +1,141 @@
+# =============================================================================
+# OpenMetadata description: iceberg.silver.fbref_player_season_profile
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.silver.fbref_player_season_profile
+  description: |
+    Широкий профиль игрока за сезон — один row на (player_id, league, season).
+    Денормализованная склейка 4 Bronze-таблиц по (player_id, league, season):
+    fbref_player_stats (стандарт), fbref_player_shooting (удары),
+    fbref_player_playingtime (игровое время / +-), fbref_player_misc (фолы,
+    отборы, навесы). Каждый источник дедуплицируется через ROW_NUMBER ...
+    ORDER BY _ingested_at DESC до JOIN. Все числовые — TRY_CAST.
+    Идентификаторы сырые FBref (canonical-резолюция — в Gold).
+  tags:
+    - Tier.Silver
+    - Domain.Football
+    - PII.Low
+columns:
+  - name: player
+    description: Имя игрока.
+    tags:
+      - PII.Low
+  - name: player_id
+    description: Сырой FBref player_id.
+  - name: nation
+    description: Национальность игрока (код страны как на FBref).
+    tags:
+      - PII.Low
+  - name: pos
+    description: Позиция игрока (например GK / DF / MF / FW).
+  - name: squad
+    description: Клуб игрока в этом сезоне (название как на FBref).
+  - name: age
+    description: Возраст игрока (как указан FBref).
+  - name: born
+    description: Год рождения, INTEGER (TRY_CAST).
+    tags:
+      - PII.Low
+  - name: mp
+    description: Сыграно матчей (mp = matches played).
+  - name: starts
+    description: Матчей в стартовом составе.
+  - name: minutes
+    description: Сыграно минут, всего.
+  - name: minutes_90s
+    description: Сыграно полных 90-минуток (minutes / 90), DOUBLE.
+  - name: goals
+    description: Голы за сезон (gls).
+  - name: assists
+    description: Ассисты за сезон (ast).
+  - name: goals_assists
+    description: Голы + ассисты (g+a).
+  - name: goals_non_penalty
+    description: Голы без пенальти (g-pk = goals minus penalty kicks).
+  - name: penalty_goals
+    description: Голы с пенальти (pk).
+  - name: penalty_attempts
+    description: Пробитые пенальти, всего (pkatt).
+  - name: yellow_cards
+    description: Жёлтые карточки (crdy).
+  - name: red_cards
+    description: Красные карточки (crdr).
+  - name: shots
+    description: Удары, всего (sh).
+  - name: shots_on_target
+    description: Удары в створ (sot).
+  - name: shot_on_target_pct
+    description: Доля ударов в створ, % (sot%).
+  - name: shots_per90
+    description: Ударов за 90 минут (sh/90).
+  - name: shots_on_target_per90
+    description: Ударов в створ за 90 минут (sot/90).
+  - name: goals_per_shot
+    description: Голов на удар (g/sh).
+  - name: goals_per_shot_on_target
+    description: Голов на удар в створ (g/sot).
+  - name: minutes_per_match
+    description: Минут на матч (mn/mp).
+  - name: minutes_pct
+    description: Доля сыгранных командных минут, % (min%).
+  - name: minutes_per_start
+    description: Минут на матч в старте (mn/start).
+  - name: complete_matches
+    description: Матчей, сыгранных полностью (compl).
+  - name: subs
+    description: Выходов на замену (subs).
+  - name: minutes_per_sub
+    description: Минут на выход с замены (mn/sub).
+  - name: unused_sub
+    description: Матчей в запасе без выхода (unsub).
+  - name: points_per_match
+    description: Очков команды за матч с игроком на поле (ppm), DOUBLE.
+  - name: on_goals
+    description: Голы команды, забитые при игроке на поле (ong).
+  - name: on_goals_against
+    description: Голы команды, пропущенные при игроке на поле (onga).
+  - name: plus_minus
+    description: Разница забитые-пропущенные при игроке на поле (+/-).
+  - name: plus_minus_per90
+    description: +/- за 90 минут (+/-90), DOUBLE.
+  - name: on_off_impact
+    description: Влияние присутствия игрока (on-off, разница +/-90 на поле vs без), DOUBLE.
+  - name: second_yellow
+    description: Вторые жёлтые (2crdy).
+  - name: fouls_committed
+    description: Сфолил (fls).
+  - name: fouls_drawn
+    description: На игроке сфолили (fld).
+  - name: offsides
+    description: Положения вне игры (off).
+  - name: crosses
+    description: Навесы (crs).
+  - name: interceptions
+    description: Перехваты (int).
+  - name: tackles_won
+    description: Выигранные отборы (tklw).
+  - name: penalties_won
+    description: Заработанные пенальти (pkwon).
+  - name: penalties_conceded
+    description: Привезённые пенальти (pkcon).
+  - name: own_goals
+    description: Автоголы (og).
+  - name: goals_per90
+    description: Голов за 90 минут (gls/90).
+  - name: assists_per90
+    description: Ассистов за 90 минут (ast/90).
+  - name: goals_assists_per90
+    description: (Голы+ассисты) за 90 минут (g+a/90).
+  - name: non_penalty_goals_per90
+    description: Голов без пенальти за 90 минут (g-pk/90).
+  - name: goals_assists_minus_penalty_per90
+    description: (Голы+ассисты-пенальти) за 90 минут (g+a-pk/90).
+  - name: _bronze_ingested_at
+    description: Технический timestamp ingest'а Bronze (lineage).
+  - name: league
+    description: Лига (partition key).
+  - name: season
+    description: Сезон short-form '2526' (partition key).
+  - name: _silver_created_at
+    description: Технический timestamp создания строки в Silver-слое (добавляется CTAS-раннером).
+relationships: []
