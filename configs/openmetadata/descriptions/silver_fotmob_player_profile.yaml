@@ -28,7 +28,7 @@ columns:
     tags:
       - PII.Low
   - name: date_of_birth
-    description: Дата рождения игрока (DATE; источник fotmob_team_squad, ~100% покрытие).
+    description: Дата рождения игрока (varchar ISO YYYY-MM-DD из fotmob_team_squad, ~100% покрытие).
     tags:
       - PII.Low
   - name: height_cm
@@ -66,7 +66,7 @@ columns:
   - name: league
     description: Лига (partition key).
   - name: season
-    description: Сезон (partition key, varchar).
+    description: Сезон (partition key, bigint).
   - name: _silver_created_at
     description: Технический timestamp создания строки в Silver-слое (добавляется CTAS-раннером).
 relationships: []

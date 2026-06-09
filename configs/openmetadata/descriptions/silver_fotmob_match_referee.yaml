@@ -24,7 +24,7 @@ columns:
   - name: league
     description: Лига (partition key).
   - name: season
-    description: Сезон (partition key, varchar).
+    description: Сезон (partition key, bigint).
   - name: referee_name
     description: Имя судьи матча из $.infoBox.Referee.text (например 'Michael Oliver').
     tags:
