@@ -1,0 +1,155 @@
+# =============================================================================
+# OpenMetadata description: iceberg.silver.fbref_team_season_profile
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.silver.fbref_team_season_profile
+  description: |
+    Широкий профиль команды за сезон — один row на (team_id, league, season).
+    Аналог player_season_profile на уровне команды; основной feed для Gold
+    командных фактов и фич (сила атаки/обороны, тренд владения, вратарские
+    агрегаты). Склейка по (team_id, league, season): fbref_team_stats (база),
+    fbref_team_shooting, fbref_team_misc, fbref_team_playingtime, плюс
+    fbref_keeper_keeper, агрегированный к уровню команды по (squad, league,
+    season): счётчики суммируются, save% взвешивается по SOTA. Каждый источник
+    дедуплицируется через ROW_NUMBER ... ORDER BY _ingested_at DESC.
+    Командные Bronze-таблицы уже типизированы (bigint/double) — TRY_CAST нужен
+    только для вратарских агрегатов. Идентификаторы сырые FBref
+    (canonical-резолюция — в Gold).
+  tags:
+    - Tier.Silver
+    - Domain.Football
+    - PII.None
+columns:
+  - name: team
+    description: Название команды (squad как на FBref, до alias-нормализации).
+  - name: team_id
+    description: Сырой FBref team_id.
+  - name: league
+    description: Лига (partition key).
+  - name: season
+    description: Сезон short-form '2526' (partition key).
+  - name: players_used
+    description: Использовано игроков за сезон (# pl).
+  - name: avg_age
+    description: Средний возраст состава (age), DOUBLE.
+  - name: possession
+    description: Среднее владение мячом, % (poss).
+  - name: mp
+    description: Сыграно матчей (mp = matches played).
+  - name: starts
+    description: Стартовых выходов игроков суммарно (starts).
+  - name: minutes
+    description: Сыграно командой минут, всего (min).
+  - name: minutes_90s
+    description: Сыграно полных 90-минуток (minutes / 90), DOUBLE.
+  - name: goals
+    description: Голы команды за сезон (gls).
+  - name: assists
+    description: Ассисты команды (ast).
+  - name: goals_assists
+    description: Голы + ассисты (g+a).
+  - name: goals_non_penalty
+    description: Голы без пенальти (g-pk).
+  - name: penalty_goals
+    description: Голы с пенальти (pk).
+  - name: penalty_attempts
+    description: Пробитые пенальти, всего (pkatt).
+  - name: yellow_cards
+    description: Жёлтые карточки команды (crdy).
+  - name: red_cards
+    description: Красные карточки команды (crdr).
+  - name: goals_per_90
+    description: Голов за 90 минут (gls/90).
+  - name: assists_per_90
+    description: Ассистов за 90 минут (ast/90).
+  - name: goals_assists_per_90
+    description: (Голы+ассисты) за 90 минут (g+a/90).
+  - name: non_penalty_goals_per_90
+    description: Голов без пенальти за 90 минут (g-pk/90).
+  - name: goals_assists_minus_penalty_per_90
+    description: (Голы+ассисты-пенальти) за 90 минут (g+a-pk/90).
+  - name: total_shots
+    description: Удары команды, всего (sh).
+  - name: shots_on_target
+    description: Удары в створ (sot).
+  - name: shot_on_target_pct
+    description: Доля ударов в створ, % (sot%).
+  - name: shots_per_90
+    description: Ударов за 90 минут (sh/90).
+  - name: shots_on_target_per_90
+    description: Ударов в створ за 90 минут (sot/90).
+  - name: goals_per_shot
+    description: Голов на удар (g/sh).
+  - name: goals_per_shot_on_target
+    description: Голов на удар в створ (g/sot).
+  - name: second_yellow_cards
+    description: Вторые жёлтые (2crdy).
+  - name: fouls_committed
+    description: Фолы команды (fls).
+  - name: fouls_drawn
+    description: На команде сфолили (fld).
+  - name: offsides
+    description: Положения вне игры (off).
+  - name: crosses
+    description: Навесы (crs).
+  - name: interceptions
+    description: Перехваты (int).
+  - name: tackles_won
+    description: Выигранные отборы (tklw).
+  - name: penalties_won
+    description: Заработанные пенальти (pkwon).
+  - name: penalties_conceded
+    description: Привезённые пенальти (pkcon).
+  - name: own_goals
+    description: Автоголы (og).
+  - name: minutes_per_match
+    description: Минут на матч (mn/mp).
+  - name: minutes_pct
+    description: Доля сыгранных минут, % (min%).
+  - name: minutes_per_start
+    description: Минут на матч в старте (mn/start).
+  - name: complete_matches
+    description: Матчей, сыгранных составом полностью (compl).
+  - name: substitutions
+    description: Замен суммарно за сезон (subs).
+  - name: minutes_per_sub
+    description: Минут на выход с замены (mn/sub).
+  - name: unused_subs
+    description: Незадействованных запасных суммарно (unsub).
+  - name: points_per_match
+    description: Очков за матч (ppm), DOUBLE.
+  - name: on_field_goals
+    description: Голы команды на поле (ong).
+  - name: on_field_goals_against
+    description: Пропущенные голы на поле (onga).
+  - name: plus_minus
+    description: Разница забитые-пропущенные (+/-).
+  - name: plus_minus_per_90
+    description: +/- за 90 минут (+/-90), DOUBLE.
+  - name: gk_goals_against
+    description: Пропущено голов вратарями команды, сумма (SUM ga по всем GK).
+  - name: gk_saves
+    description: Сэйвы вратарей команды, сумма (SUM saves).
+  - name: gk_shots_on_target_against
+    description: Ударов в створ по воротам, сумма (SUM sota).
+  - name: clean_sheets
+    description: Сухие матчи вратарей команды, сумма (SUM cs).
+  - name: gk_minutes
+    description: Минуты вратарей команды, сумма (SUM min).
+  - name: save_pct
+    description: Процент сэйвов, взвешенный по SOTA (100 * SUM(saves) / SUM(sota)).
+  - name: gk_pk_attempts_faced
+    description: Пенальти по воротам команды, сумма (SUM pkatt вратарей).
+  - name: gk_pk_allowed
+    description: Пропущенные пенальти, сумма (SUM pka).
+  - name: gk_pk_saved
+    description: Отражённые пенальти, сумма (SUM pksv).
+  - name: goals_against_per_90
+    description: |
+      Пропущенных голов за 90 минут (gk_goals_against / minutes_90s,
+      NULL если minutes_90s <= 0) — сигнал силы обороны.
+  - name: _bronze_ingested_at
+    description: Технический timestamp ingest'а Bronze (lineage).
+  - name: _silver_created_at
+    description: Технический timestamp создания строки в Silver-слое (добавляется CTAS-раннером).
+relationships: []

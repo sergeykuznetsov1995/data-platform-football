@@ -1,0 +1,56 @@
+# =============================================================================
+# OpenMetadata description: iceberg.silver.fbref_match_events
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.silver.fbref_match_events
+  description: |
+    Детальные события матча — по строке на событие (гол, пенальти, автогол,
+    жёлтая / вторая жёлтая / красная карточка, замена). Несколько строк на
+    матч. Источник: bronze.fbref_match_events (без JOIN'ов). Все колонки —
+    VARCHAR (без TRY_CAST). Дедупликация: ROW_NUMBER PARTITION BY
+    (match_id, minute, player_id, event_type) ORDER BY _ingested_at DESC.
+    match_id — сырой FBref-идентификатор (FK → silver.fbref_match_enriched).
+  tags:
+    - Tier.Silver
+    - Domain.Football
+    - PII.Low
+columns:
+  - name: match_id
+    description: ID матча (FK → silver.fbref_match_enriched.match_id).
+  - name: minute
+    description: Минута события (строка, может содержать добавленное время "45+2").
+  - name: event_type
+    description: |
+      Тип события (lowercase): goal, penalty, own_goal, yellow_card,
+      second_yellow_card, red_card, substitution.
+  - name: player
+    description: Игрок — фигурант события (автор гола / получатель карточки / ушедший при замене).
+    tags:
+      - PII.Low
+  - name: player_id
+    description: Сырой FBref player_id фигуранта события.
+  - name: team
+    description: Команда игрока (название как на FBref).
+  - name: team_side
+    description: Сторона команды в матче — 'home' или 'away'.
+  - name: secondary_player
+    description: |
+      Второй игрок события: ассистент (для гола) или вышедший на замену
+      (для substitution). NULL если неприменимо.
+    tags:
+      - PII.Low
+  - name: secondary_player_id
+    description: Сырой FBref player_id второго игрока (ассистент / вышедший на замену).
+  - name: _bronze_ingested_at
+    description: Технический timestamp ingest'а Bronze (lineage).
+  - name: league
+    description: Лига (partition key).
+  - name: season
+    description: Сезон short-form '2526' (partition key).
+  - name: _silver_created_at
+    description: Технический timestamp создания строки в Silver-слое (добавляется CTAS-раннером).
+relationships:
+  - from: match_id
+    to: trino_iceberg.iceberg.silver.fbref_match_enriched.match_id
+    type: FOREIGN_KEY
+    description: N:1 — события матча.
