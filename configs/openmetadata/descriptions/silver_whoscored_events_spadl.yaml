@@ -1,0 +1,64 @@
+# =============================================================================
+# OpenMetadata description: iceberg.silver.whoscored_events_spadl
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.silver.whoscored_events_spadl
+  description: |
+    Событийный поток WhoScored, нормализованный в каноническую SPADL-форму —
+    один row на (match_id, event_id). Источник: bronze.whoscored_events.
+    Каждый сырой Opta-тип маппится в 24-значный SPADL-словарь действий
+    (22 SPADL + проприетарный 'ball_recovery' + 'unknown') с qualifier-driven
+    роутингом пасов (corner/freekick/cross/throw_in) и под-типизацией ударов
+    (penalty/freekick). Дедуп re-scrape'ов: ROW_NUMBER PARTITION BY полному
+    натуральному ключу ORDER BY _ingested_at DESC; затем синтетический стабильный
+    event_id. Сырые team_id/player_id (xref откладывается на Gold). Аудит-поля
+    (_action_confidence, _action_source_note, qualifiers_raw) сохранены для
+    Gold-сплитов (fct_shot, fct_team_match, set-piece детект).
+  tags:
+    - Tier.Silver
+    - Domain.Football
+    - PII.None
+columns:
+  - name: event_id
+    description: Синтетический стабильный ID события внутри матча (`game_id || '_' || LPAD(seq,5)`); часть PK.
+  - name: match_id
+    description: ID матча (сырой WhoScored game_id, CAST в varchar); xref_match резолвится на Gold.
+  - name: team_id_raw
+    description: Сырой WhoScored team_id (double→BIGINT→varchar, иначе '9.5408E4'); xref_team на Gold. NULL остаётся NULL.
+  - name: player_id_raw
+    description: Сырой WhoScored player_id (double→BIGINT→varchar); xref_player резолвится на Gold.
+  - name: period
+    description: Период матча (например '1', '2', 'PreMatch'); passthrough из bronze.
+  - name: expanded_minute
+    description: Минута матча с накоплением (включая добавленное время); TRY_CAST в integer.
+  - name: x
+    description: X-координата события на поле в шкале SPADL 0–100 (направление атаки); passthrough.
+  - name: y
+    description: Y-координата события на поле в шкале SPADL 0–100 (слева направо); passthrough.
+  - name: end_x
+    description: Конечная X-координата для пасовых действий (SPADL 0–100); NULL для не-пасов.
+  - name: end_y
+    description: Конечная Y-координата для пасовых действий (SPADL 0–100); NULL для не-пасов.
+  - name: action_canonical
+    description: Каноническое SPADL-действие из 24-значного enum (22 SPADL + 'ball_recovery' + 'unknown'); пасы и удары роутятся по qualifiers.
+  - name: action_source
+    description: Маркер происхождения маппинга; литерал 'whoscored_spadl_proprietary_v1'.
+  - name: action_version
+    description: Версия схемы канонизации действий; литерал 'v1'.
+  - name: _action_source_note
+    description: Исходный WhoScored type (аудит-след); для воздушных дуэлей — суффикс 'aerial_paired:Aerial'.
+  - name: _action_confidence
+    description: Уверенность маппинга в SPADL (high / medium / low / unmappable) по спецификации R3.D2; meta-события → unmappable.
+  - name: outcome_success
+    description: BOOLEAN — успех действия (outcome_type='Successful') — завершённый пас, выигранный отбор и т.п.
+  - name: qualifiers_raw
+    description: Сырой JSON-string массив qualifiers WhoScored (аудит); Gold сплитит на KeyPass/Cross/Corner и детект стандартов.
+  - name: _bronze_ingested_at
+    description: Технический timestamp ingest'а Bronze (lineage; используется в дедуп ORDER BY DESC).
+  - name: league
+    description: Лига (partition key).
+  - name: season
+    description: Сезон slug '2526' (partition key, varchar).
+  - name: _silver_created_at
+    description: Технический timestamp создания строки в Silver-слое (добавляется CTAS-раннером).
+relationships: []
