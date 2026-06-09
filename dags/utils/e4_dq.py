@@ -6,13 +6,6 @@ Universal builder helpers for Iteration **E4** Silver / Gold tables:
 
 Silver
 ------
-* ``iceberg.silver.match_cards``               — yellow/red cards stream
-  (FBref + WhoScored union, ~13.6K rows; orphan-mode tolerable for
-  player_id_canonical NULLs because Card events from WhoScored often
-  ship with no player attribution).
-* ``iceberg.silver.match_substitutions``       — sub on/off pairs
-  (~25.6K rows; PK protects against the FBref+WhoScored union
-  doubling rows when both sources have the same fixture).
 * ``iceberg.silver.matchhistory_match_odds``   — football-data.co.uk
   pre-match + closing odds (~47K rows; PK on bookmaker+market+
   closing_flag deduplicates the wide-schema upstream).
@@ -24,8 +17,10 @@ Gold
 ----
 * ``iceberg.gold.fct_goal``           — goals (xxhash64 PK) sourced from
   fct_shot (is_goal=true) and FBref own-goal annotations.
-* ``iceberg.gold.fct_card``           — passthrough from silver.match_cards.
-* ``iceberg.gold.fct_substitution``   — passthrough from silver.match_substitutions.
+* ``iceberg.gold.fct_card``           — cross-source cards assembly folded
+  in from bronze+xref (FBref+WhoScored union, FBref-priority dedup; #382).
+* ``iceberg.gold.fct_substitution``   — cross-source subs assembly folded
+  in from bronze+xref (Off↔On pairing, FBref-priority dedup; #382).
 * ``iceberg.gold.fct_match_odds``     — passthrough from silver.matchhistory_match_odds.
 * ``iceberg.gold.fct_match_rating``   — passthrough from silver.sofascore_player_ratings.
 
@@ -91,17 +86,13 @@ logger = logging.getLogger(__name__)
 # Source ENUM literals (frozen for E4 wave-1)
 # ---------------------------------------------------------------------------
 # Keep these in sync with the SQL CASE/literal expressions in
-#   dags/sql/silver/match_cards.sql
-#   dags/sql/silver/match_substitutions.sql
 #   dags/sql/silver/matchhistory_match_odds.sql
 #   dags/sql/silver/sofascore_player_ratings.sql
 #   dags/sql/gold/fct_goal.sql       (goal_source)
-#   dags/sql/gold/fct_card.sql       (card_source — passthrough)
-#   dags/sql/gold/fct_substitution.sql (substitution_source — passthrough)
+#   dags/sql/gold/fct_card.sql       (card_source — folded cross-source)
+#   dags/sql/gold/fct_substitution.sql (substitution_source — folded cross-source)
 #   dags/sql/gold/fct_match_odds.sql (odds_source — passthrough)
 #   dags/sql/gold/fct_match_rating.sql (rating_source — passthrough)
-SILVER_CARD_SOURCES: List[str] = ['fbref', 'whoscored']
-SILVER_SUB_SOURCES: List[str] = ['fbref', 'whoscored']
 SILVER_ODDS_SOURCES: List[str] = ['matchhistory']
 SILVER_RATING_SOURCES: List[str] = ['sofascore']
 
@@ -110,177 +101,6 @@ GOLD_CARD_SOURCES: List[str] = ['fbref', 'whoscored']
 GOLD_SUB_SOURCES: List[str] = ['fbref', 'whoscored']
 GOLD_ODDS_SOURCES: List[str] = ['matchhistory']
 GOLD_RATING_SOURCES: List[str] = ['sofascore']
-
-
-# ---------------------------------------------------------------------------
-# Silver — match_cards
-# ---------------------------------------------------------------------------
-
-def _build_silver_match_cards_checks() -> List[Check]:
-    """DQ for ``iceberg.silver.match_cards`` (E4.1).
-
-    Key invariants
-    --------------
-    * Volume floor 8K — 13.6K observed on APL 5-season FBref+WhoScored union;
-      8K covers a partial-backfill scenario.
-    * PK = (match_id_canonical, team_id_canonical, player_id_canonical,
-      minute, card_type) — but only when player_id_canonical IS NOT NULL,
-      since WhoScored Card events frequently lack player attribution
-      (orphan-mode tolerable per E4 spec).
-    * card_type ∈ {'yellow', 'red'} — ENUM presence checked via
-      row_count(min_rows=1) per value.
-    * Bridge un-bridged ratio: rows with match_id_canonical
-      LIKE 'whoscored_raw_%' are E1-bridge fallbacks; ~7.4% baseline,
-      WARNING-severity (tighten after E1.5 cutover).
-    """
-    table = 'iceberg.silver.match_cards'
-    return [
-        # Volume floor (ERROR).
-        CHECK.row_count(table, min_rows=8_000, severity='ERROR'),
-
-        # PK uniqueness — scoped to resolved player_id_canonical because
-        # NULL-player Card events legitimately collapse into one bucket.
-        CHECK.no_duplicates(
-            table,
-            pk=['match_id_canonical', 'team_id_canonical',
-                'player_id_canonical', 'minute', 'card_type'],
-            where='player_id_canonical IS NOT NULL',
-            severity='WARNING',
-        ),
-
-        # NULL guards on critical contract columns (ERROR).
-        CHECK.no_nulls(
-            table,
-            cols=['match_id_canonical', 'minute', 'card_type',
-                  'source', 'source_version', 'league', 'season'],
-            severity='ERROR',
-        ),
-
-        # Minute bounds — APL has 90' regulation + ET, allow up to 130
-        # for stoppage-time cards in extra time (ERROR — out-of-range
-        # signals upstream parser regression).
-        CHECK.value_range(
-            table=table, column='minute',
-            min_val=0, max_val=130,
-            severity='ERROR',
-        ),
-
-        # card_type ENUM presence — at least one yellow + one red.
-        # data_quality has no `enum_in` primitive, so we use the e3_dq
-        # pattern: row_count(min_rows=1) per allowed value.
-        CHECK.row_count(
-            table=table, min_rows=1,
-            where="card_type = 'yellow'",
-            severity='WARNING',
-            name='source_enum_card_type_yellow',
-        ),
-        CHECK.row_count(
-            table=table, min_rows=1,
-            where="card_type = 'red'",
-            severity='WARNING',
-            name='source_enum_card_type_red',
-        ),
-
-        # source ENUM presence (FBref + WhoScored).
-        CHECK.row_count(
-            table=table, min_rows=1,
-            where="source = 'fbref'",
-            severity='WARNING',
-            name='source_enum_fbref',
-        ),
-        CHECK.row_count(
-            table=table, min_rows=1,
-            where="source = 'whoscored'",
-            severity='WARNING',
-            name='source_enum_whoscored',
-        ),
-
-        # Freshness — Silver is rebuilt weekly via E4 DAG.
-        CHECK.freshness(
-            table=table, ts_col='_ingested_at',
-            max_age_hours=14 * 24,
-            severity='WARNING',
-        ),
-
-        # Bridge un-bridged ratio — E1 placeholder bridge id pattern
-        # 'whoscored_raw_<bronze_id>'. ~7.4% baseline; we surrogate
-        # the e3_dq orphan_rate idiom: bound the absolute count at
-        # 15% × 13.6K ≈ 2,040 (room for a partial-backfill spike).
-        CHECK.row_count(
-            table=table, min_rows=0, max_rows=2_040,
-            where="match_id_canonical LIKE 'whoscored_raw_%'",
-            severity='WARNING',
-            name='bridge_unbridged_rate',
-        ),
-    ]
-
-
-# ---------------------------------------------------------------------------
-# Silver — match_substitutions
-# ---------------------------------------------------------------------------
-
-def _build_silver_match_substitutions_checks() -> List[Check]:
-    """DQ for ``iceberg.silver.match_substitutions`` (E4.2).
-
-    PK = (match_id_canonical, team_id_canonical, player_in_canonical,
-    player_out_canonical, minute). Both player canonicals are required
-    for de-dup (orphan-tolerant on either side individually but the
-    pair must resolve at least one side to a canonical id).
-    """
-    table = 'iceberg.silver.match_substitutions'
-    return [
-        # Volume floor — APL multi-season ≈ 25.6K subs. Min 15K covers
-        # partial backfill.
-        CHECK.row_count(table, min_rows=15_000, severity='ERROR'),
-
-        # PK — scoped to rows where BOTH player canonicals resolved.
-        CHECK.no_duplicates(
-            table,
-            pk=['match_id_canonical', 'team_id_canonical',
-                'player_in_canonical', 'player_out_canonical', 'minute'],
-            where=(
-                'player_in_canonical IS NOT NULL '
-                'AND player_out_canonical IS NOT NULL'
-            ),
-            severity='WARNING',
-        ),
-
-        # NULL guards — critical contract columns (ERROR).
-        CHECK.no_nulls(
-            table,
-            cols=['match_id_canonical', 'minute',
-                  'source', 'source_version', 'league', 'season'],
-            severity='ERROR',
-        ),
-
-        # Minute bounds (ERROR — same logic as match_cards).
-        CHECK.value_range(
-            table=table, column='minute',
-            min_val=0, max_val=130,
-            severity='ERROR',
-        ),
-
-        # source ENUM presence (FBref + WhoScored).
-        CHECK.row_count(
-            table=table, min_rows=1,
-            where="source = 'fbref'",
-            severity='WARNING',
-            name='subs_source_enum_fbref',
-        ),
-        CHECK.row_count(
-            table=table, min_rows=1,
-            where="source = 'whoscored'",
-            severity='WARNING',
-            name='subs_source_enum_whoscored',
-        ),
-
-        # Freshness.
-        CHECK.freshness(
-            table=table, ts_col='_ingested_at',
-            max_age_hours=14 * 24,
-            severity='WARNING',
-        ),
-    ]
 
 
 # ---------------------------------------------------------------------------
@@ -523,8 +343,8 @@ def _build_gold_fct_goal_checks() -> List[Check]:
 def _build_gold_fct_card_checks() -> List[Check]:
     """DQ for ``iceberg.gold.fct_card`` (E4.5).
 
-    Passthrough from silver.match_cards. PK = card_canonical (xxhash64).
-    Source ENUM = {'fbref', 'whoscored'}.
+    Cross-source cards assembly folded in from bronze+xref (#382).
+    PK = card_canonical (xxhash64). Source ENUM = {'fbref', 'whoscored'}.
     """
     table = 'iceberg.gold.fct_card'
     return [
@@ -594,6 +414,17 @@ def _build_gold_fct_card_checks() -> List[Check]:
             severity='WARNING',
         ),
 
+        # Bridge un-bridged ratio — WhoScored→FBref bridge fallbacks carry the
+        # 'whoscored_raw_<bronze_id>' match id. ~7.4% baseline; bound the
+        # absolute count at 15% × 13.6K ≈ 2,040 (room for a partial-backfill
+        # spike). Folded from the former silver.match_cards DQ (#382).
+        CHECK.row_count(
+            table=table, min_rows=0, max_rows=2_040,
+            where="match_id_canonical LIKE 'whoscored_raw_%'",
+            severity='WARNING',
+            name='gold_card_bridge_unbridged_rate',
+        ),
+
         # Freshness.
         CHECK.freshness(
             table=table, ts_col='_ingested_at',
@@ -610,7 +441,7 @@ def _build_gold_fct_card_checks() -> List[Check]:
 def _build_gold_fct_substitution_checks() -> List[Check]:
     """DQ for ``iceberg.gold.fct_substitution`` (E4.5).
 
-    Passthrough from silver.match_substitutions. PK =
+    Cross-source subs assembly folded in from bronze+xref (#382). PK =
     substitution_canonical (xxhash64). Source ENUM =
     {'fbref', 'whoscored'}.
     """
@@ -874,13 +705,12 @@ def _build_gold_fct_match_rating_checks() -> List[Check]:
 def build_silver_e4_checks() -> List[Check]:
     """Return DQ checks for Silver E4 tables.
 
-    Composition: ``match_cards`` + ``match_substitutions`` +
-    ``matchhistory_match_odds`` + ``sofascore_player_ratings``.
+    Composition: ``matchhistory_match_odds`` + ``sofascore_player_ratings``.
+    (``match_cards`` / ``match_substitutions`` were folded into the Gold
+    facts — their DQ now lives in the gold builders; #382.)
     """
     return (
-        _build_silver_match_cards_checks()
-        + _build_silver_match_substitutions_checks()
-        + _build_silver_matchhistory_match_odds_checks()
+        _build_silver_matchhistory_match_odds_checks()
         + _build_silver_sofascore_player_ratings_checks()
     )
 
@@ -910,8 +740,6 @@ def build_all_e4_checks() -> List[Check]:
 
 
 __all__ = [
-    'SILVER_CARD_SOURCES',
-    'SILVER_SUB_SOURCES',
     'SILVER_ODDS_SOURCES',
     'SILVER_RATING_SOURCES',
     'GOLD_GOAL_SOURCES',

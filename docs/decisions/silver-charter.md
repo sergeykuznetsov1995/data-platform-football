@@ -164,15 +164,17 @@ here is rewritten in this pass** — this charter + checker land first.
 | `fbref_team_season_profile` | COMPLIANT | — | #370: season-from-season conform (reads season-grain `bronze.fbref_team_*` + intra-season GK agg), NOT a match→season rollup. R1 detector refined to require a match/event source. |
 | `whoscored_player_season_aggregate` | EXCEPTION | R1 | player season-rollup (reads `silver.whoscored_events_spadl`); feeds Gold. Migration #370 PR2. |
 | `fotmob_player_season_profile` | EXCEPTION | — | PIVOT of season-grain Bronze; no longer trips R1 after the #370 detector refinement. Removed from registry in #370 PR2. |
-| `match_cards` | EXCEPTION | R2, R4, R5 | cross-source union (FBref+WhoScored) + canonical resolve — E3/E4 fact in Silver. Feeds thin `gold.fct_card`. Sanctioned (#368 decided); Gold migration tracked in #382. |
-| `match_substitutions` | EXCEPTION | R2, R4, R5 | same cross-source-fact pattern; feeds thin `gold.fct_substitution`. Sanctioned (#368 decided); Gold migration tracked in #382. |
+| ~~`match_cards`~~ | MIGRATED | — | #382: cross-source assembly folded into `gold.fct_card` (reads bronze+xref directly); silver SQL deleted. |
+| ~~`match_substitutions`~~ | MIGRATED | — | #382: cross-source assembly folded into `gold.fct_substitution` (reads bronze+xref directly); silver SQL deleted. |
 | `whoscored_team_match` | REVIEW | R2 | aggregates `silver.whoscored_events_spadl` to team×match (same-source) — manual review; likely conform. |
 
 > #370 team-wave (DONE): the 4 `*_team_season` rollups moved to `gold.*_team_season`
 > (built by `dag_transform_fbref_gold`, Stage 1.5) and `fbref_team_season_profile` was
 > reclassified COMPLIANT. The 2 player-side tables migrate in #370 PR2.
-> The 2 cross-source EXCEPTION facts (`match_cards`, `match_substitutions`) are tracked for
-> Gold migration in issue #382.
+> #382 (DONE): the 2 cross-source EXCEPTION facts (`match_cards`, `match_substitutions`) were
+> folded into `gold.fct_card` / `gold.fct_substitution` — the assembly (FBref+WhoScored union,
+> bridge, FBref-priority dedup) now lives in the Gold SQL reading bronze+xref directly, and the
+> silver SQL was deleted.
 > `sofifa_player_profile_empty` — RESOLVED (#369): not a standalone table, it is the empty
 > fallback for `silver.sofifa_player_profile` (issue #180; spine `xref_player WHERE 1=0`,
 > active + tested). Fallback `*_empty.sql` files are now excluded from the checker scan, so

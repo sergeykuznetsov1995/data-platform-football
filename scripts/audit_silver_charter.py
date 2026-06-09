@@ -79,11 +79,9 @@ SANCTIONED: dict[str, tuple[str, str]] = {
     'fotmob_player_season_profile': ('EXCEPTION', 'PIVOT of season-grain Bronze; reclassify in #370 PR2'),
     # sofascore_team_match: resolved #367 — cross-entity minutes/assists rollup
     # moved out; now a clean single-source conform (PIVOT match_stats + schedule). COMPLIANT.
-    # Cross-source E3/E4 facts (FBref+WhoScored union + canonical resolve) living in
-    # Silver. Feed thin gold.fct_card / fct_substitution passthroughs. Gold migration
-    # tracked in #382 (#368 decided). Charter §7.
-    'match_cards': ('EXCEPTION', 'cross-source fact feeding gold.fct_card; Gold migration #382'),
-    'match_substitutions': ('EXCEPTION', 'cross-source fact feeding gold.fct_substitution; Gold migration #382'),
+    # #382 DONE: the 2 cross-source E3/E4 facts (match_cards, match_substitutions)
+    # were folded into gold.fct_card / gold.fct_substitution (assembly reads
+    # bronze+xref directly) and their silver SQL was deleted — no longer scanned.
     # sofifa_player_profile_empty: resolved #369 — it is the empty fallback for
     # silver.sofifa_player_profile (issue #180), not a standalone table. Now
     # excluded from the scan (see FALLBACK_SUFFIX), so no registry entry needed.

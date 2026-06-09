@@ -4,8 +4,10 @@
 table:
   fullyQualifiedName: trino_iceberg.iceberg.gold.fct_substitution
   description: |
-    Narrow fact for substitutions (E4). Source: silver.match_substitutions.
-    Grain: substitution_canonical (xxhash64 of match_id|minute|player_in|player_out).
+    Narrow fact for substitutions (E4). Source: bronze (FBref + WhoScored) +
+    xref — cross-source assembly (Off↔On pairing) folded directly into this
+    Gold fact (#382). Grain: substitution_canonical (xxhash64 of
+    match_id|minute|player_in|player_out).
   tags:
     - Tier.Gold
     - Domain.Football

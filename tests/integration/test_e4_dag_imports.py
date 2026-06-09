@@ -116,9 +116,7 @@ class TestE4DagImports:
         task_ids = {t.task_id for t in dag.tasks}
 
         expected_minima = {
-            # silver_e4: 4 source bridges
-            "silver_e4.match_cards",
-            "silver_e4.match_substitutions",
+            # silver_e4: 2 source bridges (cards/subs folded into Gold — #382)
             "silver_e4.matchhistory_match_odds",
             "silver_e4.sofascore_player_ratings",
             # gold_e4: 5 narrow facts
@@ -135,9 +133,9 @@ class TestE4DagImports:
             f"E4 DAG missing tasks: {sorted(missing)}. "
             f"Tasks: {sorted(task_ids)}"
         )
-        # Total must be ≥ 12 (4 silver + 5 gold + ≥3 markers/validate).
-        assert len(dag.tasks) >= 12, (
-            f"E4 DAG expected >=12 tasks, got {len(dag.tasks)}: "
+        # Total must be ≥ 10 (2 silver + 5 gold + ≥3 markers/validate).
+        assert len(dag.tasks) >= 10, (
+            f"E4 DAG expected >=10 tasks, got {len(dag.tasks)}: "
             f"{sorted(task_ids)}"
         )
 

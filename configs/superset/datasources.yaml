@@ -197,7 +197,8 @@ databases:
         schema: gold
         description: |
           Per-card факт: yellow/red/second_yellow, минута, игрок, команда.
-          Источник: silver.match_cards.
+          Источник: bronze (FBref+WhoScored) + xref, кросс-source сборка
+          инлайнится прямо в gold.fct_card (#382).
         default_endpoint: null
         cache_timeout: 3600
 
