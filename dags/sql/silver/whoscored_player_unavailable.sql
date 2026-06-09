@@ -9,9 +9,15 @@
 --   iceberg.bronze.whoscored_schedule         (s)  — joined for match_date
 --
 -- Architectural filters (D3 + D5):
---   * status = 'confirmed' (case-insensitive)        — no rumours
---   * reason <> 'International duty'                 — D3: national-team call-ups
---                                                       are not a "form" signal
+--   * status = 'Out' (case-insensitive)              — D5: confirmed absence.
+--       Bronze "missing players" uses two tiers: 'Out' (confirmed unavailable)
+--       and 'Doubtful' (uncertain / rumour-like). We keep only 'Out'. The old
+--       literal 'confirmed' never existed in Bronze → matched 0 rows → the table
+--       was structurally always empty (#393).
+--   * LOWER(reason) <> 'international duty'           — D3: national-team call-ups
+--       are not a "form" signal. Bronze reason is lowercase ('international
+--       duty'), so the comparison MUST be case-insensitive — the old
+--       case-sensitive '<> International duty' never excluded anything (#393).
 --   * player_id IS NOT NULL                          — rows without a stable id
 --                                                       cannot be deduped or joined
 -- =============================================================================
@@ -32,8 +38,8 @@ WITH mp_dedup AS (
             ORDER BY mp._ingested_at DESC
         ) AS rn
     FROM iceberg.bronze.whoscored_missing_players mp
-    WHERE LOWER(mp.status) = 'confirmed'
-      AND (mp.reason IS NULL OR mp.reason <> 'International duty')
+    WHERE LOWER(mp.status) = 'out'
+      AND (mp.reason IS NULL OR LOWER(mp.reason) <> 'international duty')
       AND mp.player_id IS NOT NULL
 ),
 
@@ -59,7 +65,10 @@ SELECT
 
     -- ========= Source attributes =========
     mp.league,
-    TRY_CAST(mp.season AS INTEGER)         AS season,
+    -- season как varchar-slug ('2526'), per charter S2 (#388). Bronze хранит
+    -- season как slug-строку; CAST держит тот же slug без смены значения.
+    -- Year-start↔slug мост к bigint-dims делает gold/fct_player_unavailable.sql.
+    CAST(mp.season AS varchar)             AS season,
     mp.team                                AS team_name,
     mp.player_id                           AS ws_player_id,
     mp.player                              AS player_name,

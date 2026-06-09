@@ -58,6 +58,11 @@ def _transpile(path: Path) -> str:
     # DuckDB's strip_accents(x), which removes the combining marks directly; the
     # following `\p{Mn}+` REGEXP_REPLACE then matches nothing (harmless no-op).
     transpiled = re.sub(r"NORMALIZE\((.*?),\s*NFD\)", r"strip_accents(\1)", transpiled)
+    # Trino's printf-style FORMAT('%02d%02d', ...) (the season year-start↔slug
+    # bridge, #388) is left as DuckDB FORMAT() by sqlglot, but DuckDB's FORMAT
+    # uses Python `{}` placeholders and chokes on `%02d`. DuckDB's printf() is
+    # the printf-spec equivalent — rewrite the call so the bridge evaluates.
+    transpiled = re.sub(r"\bFORMAT\(", "printf(", transpiled)
     # Strip any trailing semicolons; we will wrap in SELECT
     return transpiled.rstrip().rstrip(";")
 
@@ -124,7 +129,7 @@ def _create_silver_table(con: duckdb.DuckDBPyConnection) -> None:
             match_id VARCHAR,
             match_date DATE,
             league VARCHAR,
-            season INTEGER,
+            season VARCHAR,
             team_name VARCHAR,
             ws_player_id VARCHAR,
             player_name VARCHAR,
@@ -237,9 +242,9 @@ class TestSilverWhoscoredPlayerUnavailable:
             """
             INSERT INTO iceberg.bronze.whoscored_missing_players VALUES
             ('ENG-Premier League','2024','g1','Arsenal','p1','Saka',
-                'Injury','confirmed', TIMESTAMP '2025-01-01 10:00:00'),
+                'injured','Out', TIMESTAMP '2025-01-01 10:00:00'),
             ('ENG-Premier League','2024','g1','Arsenal','p1','Saka',
-                'Injury','confirmed', TIMESTAMP '2025-01-02 10:00:00')
+                'injured','Out', TIMESTAMP '2025-01-02 10:00:00')
             """
         )
         con.execute(
@@ -263,11 +268,11 @@ class TestSilverWhoscoredPlayerUnavailable:
         con.execute(
             """
             INSERT INTO iceberg.bronze.whoscored_missing_players VALUES
-            ('ENG-PL','2024','g1','Arsenal','p1','A','Injury','confirmed',
+            ('ENG-PL','2024','g1','Arsenal','p1','A','Injury','Out',
                 TIMESTAMP '2025-01-01 10:00:00'),
-            ('ENG-PL','2024','g1','Arsenal','p2','B','International duty','confirmed',
+            ('ENG-PL','2024','g1','Arsenal','p2','B','International duty','Out',
                 TIMESTAMP '2025-01-01 10:00:00'),
-            ('ENG-PL','2024','g1','Arsenal','p3','C','Suspension','confirmed',
+            ('ENG-PL','2024','g1','Arsenal','p3','C','Suspension','Out',
                 TIMESTAMP '2025-01-01 10:00:00')
             """
         )
@@ -284,21 +289,26 @@ class TestSilverWhoscoredPlayerUnavailable:
         assert reasons == ["Injury", "Suspension"]
         assert "International duty" not in reasons
 
-    def test_silver_filters_unconfirmed(self):
-        """Only ``LOWER(status)='confirmed'`` rows survive (D5)."""
+    def test_silver_filters_non_out(self):
+        """Only ``LOWER(status)='out'`` rows survive (D5, #393).
+
+        Bronze "missing players" uses 'Out' (confirmed absence) and 'Doubtful'
+        (uncertain). Keep only 'Out', case-insensitively; drop 'Doubtful' and
+        any other tier.
+        """
         con = _make_con()
         _create_bronze_tables(con)
 
         con.execute(
             """
             INSERT INTO iceberg.bronze.whoscored_missing_players VALUES
-            ('ENG-PL','2024','g1','Arsenal','p1','A','Injury','confirmed',
+            ('ENG-PL','2024','g1','Arsenal','p1','A','injured','Out',
                 TIMESTAMP '2025-01-01 10:00:00'),
-            ('ENG-PL','2024','g1','Arsenal','p2','B','Injury','Confirmed',
+            ('ENG-PL','2024','g1','Arsenal','p2','B','injured','out',
                 TIMESTAMP '2025-01-01 10:00:00'),
-            ('ENG-PL','2024','g1','Arsenal','p3','C','Injury','not confirmed',
+            ('ENG-PL','2024','g1','Arsenal','p3','C','injured','Doubtful',
                 TIMESTAMP '2025-01-01 10:00:00'),
-            ('ENG-PL','2024','g1','Arsenal','p4','D','Injury','rumor',
+            ('ENG-PL','2024','g1','Arsenal','p4','D','injured','rumor',
                 TIMESTAMP '2025-01-01 10:00:00')
             """
         )
@@ -311,9 +321,9 @@ class TestSilverWhoscoredPlayerUnavailable:
         )
 
         rows = self._run_silver(con)
-        # case-insensitive: 'confirmed' + 'Confirmed' both pass; 'not confirmed' rejected
+        # case-insensitive: 'Out' + 'out' both pass; 'Doubtful' / 'rumor' rejected
         names = sorted(r["player_name"] for r in rows)
-        assert names == ["A", "B"], f"expected only confirmed (case-insensitive); got {names}"
+        assert names == ["A", "B"], f"expected only status=out (case-insensitive); got {names}"
 
     def test_silver_match_date_enrichment(self):
         """Silver row carries ``match_date`` from bronze schedule join."""
@@ -323,7 +333,7 @@ class TestSilverWhoscoredPlayerUnavailable:
         con.execute(
             """
             INSERT INTO iceberg.bronze.whoscored_missing_players VALUES
-            ('ENG-PL','2024','g42','Chelsea','p9','Palmer','Injury','confirmed',
+            ('ENG-PL','2024','g42','Chelsea','p9','Palmer','injured','Out',
                 TIMESTAMP '2025-03-01 10:00:00')
             """
         )
@@ -339,8 +349,8 @@ class TestSilverWhoscoredPlayerUnavailable:
         assert len(rows) == 1
         assert rows[0]["match_date"] == date(2025, 3, 15)
         assert rows[0]["match_id"] == "g42"
-        # season string -> integer cast
-        assert rows[0]["season"] == 2024
+        # season passes through as varchar slug (#388), no longer integer-cast
+        assert rows[0]["season"] == "2024"
 
 
 # ---------------------------------------------------------------------------
@@ -361,7 +371,7 @@ class TestGoldFctPlayerUnavailable:
         con.execute(
             f"""
             INSERT INTO iceberg.silver.whoscored_player_unavailable VALUES
-            ('{match_id}', DATE '{match_date.isoformat()}', 'ENG-PL', 2024,
+            ('{match_id}', DATE '{match_date.isoformat()}', 'ENG-PL', '2425',
              '{team_name}', '{ws_player_id}', '{player_name}',
              'Injury', 'confirmed', TIMESTAMP '2025-01-10 00:00:00')
             """
