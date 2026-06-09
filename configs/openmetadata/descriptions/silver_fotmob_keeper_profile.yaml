@@ -1,0 +1,66 @@
+# =============================================================================
+# OpenMetadata description: iceberg.silver.fotmob_keeper_profile
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.silver.fotmob_keeper_profile
+  description: |
+    Широкий профиль вратаря за сезон из FotMob — один row на
+    (player_id, league, season). Симметрична silver.fbref_keeper_profile, но из
+    FotMob Bronze. Источники: bronze.fotmob_player_details (identity/команда) +
+    bronze.fotmob_player_stats (сезонные статы в LONG-формате, развёрнуты в
+    wide через MAX(CASE WHEN stat_name=...) PIVOT). Дедупликация details —
+    ROW_NUMBER PARTITION BY (player_id, league, season) ORDER BY _ingested_at DESC.
+    Фильтр: NOT is_coach AND LOWER(position_description)='keeper' (только вратари).
+    Время-инвариантные атрибуты (дата рождения, рост, нога, страна) живут в
+    silver.fotmob_player_profile, не здесь. Идентификаторы сырые FotMob —
+    canonical-резолюция в Gold.
+  tags:
+    - Tier.Silver
+    - Domain.Football
+    - PII.Low
+columns:
+  - name: player_id
+    description: Сырой FotMob player_id вратаря (FK → gold.dim_player через xref_player в Gold).
+  - name: player_name
+    description: Имя вратаря (FotMob name).
+    tags:
+      - PII.Low
+  - name: primary_team_id
+    description: Сырой FotMob team_id основной команды (FK → gold.dim_team через xref_team в Gold).
+  - name: primary_team_name
+    description: Название основной команды вратаря в этом сезоне.
+  - name: matches_played
+    description: Сыграно матчей за сезон.
+  - name: minutes_played
+    description: Сыграно минут, всего за сезон.
+  - name: fotmob_rating
+    description: Средний рейтинг FotMob за сезон.
+  - name: clean_sheets
+    description: Сухие матчи (clean sheets) — матчи без пропущенных голов.
+  - name: goals_conceded_per_90
+    description: Пропущено голов за 90 минут.
+  - name: save_percentage
+    description: Процент сэйвов, % (сэйвы / удары в створ).
+  - name: saves_per_90
+    description: Сэйвы за 90 минут.
+  - name: goals_prevented
+    description: Предотвращённые голы — сэйвы относительно ожидаемых (xG on target минус пропущенные).
+  - name: accurate_passes_per_90
+    description: Точные передачи за 90 минут.
+  - name: accurate_long_balls_per_90
+    description: Точные длинные передачи за 90 минут.
+  - name: yellow_cards
+    description: Жёлтые карточки за сезон.
+  - name: red_cards
+    description: Красные карточки за сезон.
+  - name: fouls_per_90
+    description: Фолы за 90 минут.
+  - name: _bronze_ingested_at
+    description: Технический timestamp ingest'а Bronze (lineage; GREATEST по details/stats).
+  - name: league
+    description: Лига (partition key).
+  - name: season
+    description: Сезон (partition key, varchar).
+  - name: _silver_created_at
+    description: Технический timestamp создания строки в Silver-слое (добавляется CTAS-раннером).
+relationships: []
