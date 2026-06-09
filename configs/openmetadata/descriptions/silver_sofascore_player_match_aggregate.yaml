@@ -1,0 +1,136 @@
+# =============================================================================
+# OpenMetadata description: iceberg.silver.sofascore_player_match_aggregate
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.silver.sofascore_player_match_aggregate
+  description: |
+    Индивидуальная статистика игрока за матч из SofaScore — один row на
+    (match_id, player_id, league, season). Источник:
+    bronze.sofascore_event_player_stats (без JOIN'ов). Bronze уже match-grain,
+    агрегация не нужна — только дедуп + переименование camelCase→snake_case под
+    кросс-источниковые имена (FBref/WhoScored/Understat). Дедупликация:
+    ROW_NUMBER PARTITION BY (match_id, player_id, league, season) ORDER BY
+    _ingested_at DESC. match_id / player_id / team_id — сырые SofaScore-id
+    (не канонические ключи dim_*).
+  tags:
+    - Tier.Silver
+    - Domain.Football
+    - PII.None
+columns:
+  - name: match_id
+    description: Сырой SofaScore game_id матча.
+  - name: player_id
+    description: Сырой SofaScore player_id игрока.
+  - name: team_id
+    description: Сырой SofaScore team_id команды игрока (CAST из числового в varchar).
+  - name: team_name
+    description: Название команды игрока (как на SofaScore).
+  - name: is_home
+    description: BOOLEAN — true если игрок выступал за хозяев, false за гостей.
+  - name: position
+    description: Позиционная группа игрока в матче (как на SofaScore).
+  - name: position_specific
+    description: Детальная позиция игрока (например CF / RB).
+  - name: minutes_played
+    description: Сыгранные минуты.
+  - name: goals
+    description: Забитые голы.
+  - name: assists
+    description: Голевые передачи (SofaScore goal_assist — первичный ассист).
+  - name: own_goals
+    description: Автоголы.
+  - name: shots
+    description: Удары, всего.
+  - name: shots_on_target
+    description: Удары в створ.
+  - name: shots_blocked
+    description: Заблокированные удары.
+  - name: shots_off_target
+    description: Удары мимо ворот.
+  - name: yellow_cards
+    description: NULL placeholder — карточки приходят отдельным потоком match_cards / event_incidents, вне scope этого Silver.
+  - name: red_cards
+    description: NULL placeholder — карточки приходят отдельным потоком match_cards / event_incidents, вне scope этого Silver.
+  - name: crosses
+    description: Навесы, всего.
+  - name: accurate_crosses
+    description: Точные навесы.
+  - name: fouls_committed
+    description: Совершённые фолы.
+  - name: fouls_drawn
+    description: Фолы, заработанные игроком (на нём сфолили).
+  - name: offsides
+    description: Положения вне игры.
+  - name: tackles
+    description: Отборы, всего.
+  - name: tackles_won
+    description: Выигранные отборы.
+  - name: interceptions
+    description: Перехваты.
+  - name: clearances
+    description: Выносы мяча.
+  - name: blocks
+    description: Блокировки мяча полевым игроком.
+  - name: ball_recoveries
+    description: Возвраты владения мячом.
+  - name: errors_lead_to_goal
+    description: Ошибки, приведшие к голу соперника.
+  - name: errors_lead_to_shot
+    description: Ошибки, приведшие к удару соперника.
+  - name: passes
+    description: Передачи, всего.
+  - name: passes_completed
+    description: Точные (завершённые) передачи.
+  - name: key_passes
+    description: Ключевые передачи (после которых партнёр наносил удар).
+  - name: accurate_long_balls
+    description: Точные длинные передачи.
+  - name: total_long_balls
+    description: Длинные передачи, всего.
+  - name: dribbles_attempted
+    description: Попытки обводки (take-ons).
+  - name: dribbles_won
+    description: Удачные обводки.
+  - name: total_duels_won
+    description: Выигранные единоборства, всего (наземные + воздушные).
+  - name: total_duels_lost
+    description: Проигранные единоборства, всего.
+  - name: aerial_duels_won
+    description: Выигранные воздушные единоборства.
+  - name: aerial_duels_lost
+    description: Проигранные воздушные единоборства.
+  - name: challenge_lost
+    description: Проигранные единоборства при обводке против игрока (dribbled past).
+  - name: touches
+    description: Касания мяча.
+  - name: dispossessed
+    description: Потери мяча в единоборстве (отобрали).
+  - name: possession_lost
+    description: Потери владения мячом (все типы).
+  - name: penalties_won
+    description: Заработанные пенальти.
+  - name: penalties_conceded
+    description: Привезённые пенальти (фол в своей штрафной).
+  - name: penalties_missed
+    description: Нереализованные пенальти.
+  - name: penalty_goals
+    description: NULL placeholder — не emit'ится в event_player_stats (голы с пенальти приходят через goal_assist + penalty-инцидент).
+  - name: penalty_saves
+    description: Отражённые пенальти (для вратарей).
+  - name: ground_duels_won
+    description: Выигранные наземные единоборства — выводится арифметикой (total_duels_won − aerial_duels_won), NULL если один из членов отсутствует.
+  - name: xg
+    description: Expected Goals (xG) — модельная вероятность гола по ударам игрока, DOUBLE.
+  - name: xa
+    description: Expected Assists (xA) — модельная вероятность ассиста, DOUBLE.
+  - name: rating
+    description: Матчевый рейтинг игрока от SofaScore (шкала 0–10), DOUBLE.
+  - name: _bronze_ingested_at
+    description: Технический timestamp ingest'а Bronze (lineage).
+  - name: league
+    description: Лига (partition key).
+  - name: season
+    description: Сезон slug '2526' (partition key, varchar).
+  - name: _silver_created_at
+    description: Технический timestamp создания строки в Silver-слое (добавляется CTAS-раннером).
+relationships: []

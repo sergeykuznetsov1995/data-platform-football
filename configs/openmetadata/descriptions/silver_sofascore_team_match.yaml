@@ -1,0 +1,104 @@
+# =============================================================================
+# OpenMetadata description: iceberg.silver.sofascore_team_match
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.silver.sofascore_team_match
+  description: |
+    Командная статистика за матч из SofaScore — один row на
+    (match_id, team_id, league, season), две строки на матч (хозяева + гости).
+    Источники (только bronze.sofascore_*, без silver-чтений):
+      * bronze.sofascore_match_stats — long-form (match, period, stat_group,
+        stat_name); PIVOT по period='ALL' в wide-форму через
+        MAX(IF(stat_key=...)). Тоталы дуэлей и длинных передач парсятся из
+        home_text/away_text формата "won/total (pct%)" через regexp_extract.
+      * bronze.sofascore_schedule — голы (home/away_score) и team_id сторон;
+        game_id BIGINT → CAST в varchar для JOIN с match_stats.match_id.
+    Проценты (accurate_passes_pct, *_duels_won_pct, *_long_balls_pct) выводятся
+    арифметикой с защитой от деления на ноль. minutes/assists — NULL
+    placeholder'ы (нет team-grain в SofaScore match_stats, #367). Дедуп:
+    ROW_NUMBER PARTITION BY (match_id, period, stat_key) ORDER BY _ingested_at
+    DESC. match_id / team_id / opponent_id — сырые SofaScore-id.
+  tags:
+    - Tier.Silver
+    - Domain.Football
+    - PII.None
+columns:
+  - name: match_id
+    description: Сырой SofaScore game_id матча.
+  - name: team_id
+    description: Сырой SofaScore team_id команды (из schedule home/away_team).
+  - name: opponent_id
+    description: Сырой SofaScore team_id соперника.
+  - name: is_home
+    description: BOOLEAN — true для стороны хозяев, false для гостей.
+  - name: goals_for
+    description: Забитые голы команды (из schedule home/away_score).
+  - name: goals_against
+    description: Пропущенные голы команды.
+  - name: total_shots
+    description: Удары, всего (stat totalShotsOnGoal).
+  - name: shots_on_target
+    description: Удары в створ (stat shotsOnGoal).
+  - name: yellow_cards
+    description: Жёлтые карточки команды.
+  - name: red_cards
+    description: Красные карточки команды.
+  - name: fouls
+    description: Совершённые фолы.
+  - name: offsides
+    description: Положения вне игры.
+  - name: corner_kicks
+    description: Угловые удары.
+  - name: interceptions
+    description: Перехваты (stat interceptionWon).
+  - name: tackles_won
+    description: Выигранные отборы (из stat wonTacklePercent.value).
+  - name: total_tackles
+    description: Отборы, всего (stat totalTackle).
+  - name: total_passes
+    description: Передачи, всего (stat passes).
+  - name: accurate_passes
+    description: Точные передачи (stat accuratePasses).
+  - name: accurate_passes_pct
+    description: Доля точных передач, % (derived = 100 * accurate / total).
+  - name: possession_pct
+    description: Владение мячом, % (stat ballPossession).
+  - name: minutes
+    description: NULL placeholder — у SofaScore match_stats нет team-grain минут (#367).
+  - name: assists
+    description: NULL placeholder — у SofaScore match_stats нет team-grain ассистов (#367).
+  - name: expected_goals
+    description: Expected Goals (xG) команды (stat expectedGoals), DOUBLE.
+  - name: expected_goals_against
+    description: Expected Goals соперника (xGA) — xG противоположной стороны, DOUBLE.
+  - name: ground_duels_won
+    description: Выигранные наземные единоборства (stat groundDuelsPercentage.value).
+  - name: ground_duels_total
+    description: Наземные единоборства, всего (parsed из текста "won/total (pct%)").
+  - name: ground_duels_won_pct
+    description: Доля выигранных наземных единоборств, % (derived).
+  - name: aerial_duels_won
+    description: Выигранные воздушные единоборства (stat aerialDuelsPercentage.value).
+  - name: aerial_duels_total
+    description: Воздушные единоборства, всего (parsed из текста).
+  - name: aerial_duels_won_pct
+    description: Доля выигранных воздушных единоборств, % (derived).
+  - name: accurate_long_balls
+    description: Точные длинные передачи (stat accurateLongBalls.value).
+  - name: total_long_balls
+    description: Длинные передачи, всего (parsed из текста).
+  - name: accurate_long_balls_pct
+    description: Доля точных длинных передач, % (derived).
+  - name: accurate_crosses
+    description: Точные навесы (stat accurateCross.value).
+  - name: total_crosses
+    description: Навесы, всего (parsed из текста).
+  - name: _bronze_ingested_at
+    description: Технический timestamp ingest'а Bronze (MAX по строкам матча, lineage).
+  - name: league
+    description: Лига (partition key).
+  - name: season
+    description: Сезон slug '2526' (partition key, varchar).
+  - name: _silver_created_at
+    description: Технический timestamp создания строки в Silver-слое (добавляется CTAS-раннером).
+relationships: []
