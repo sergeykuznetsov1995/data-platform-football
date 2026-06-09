@@ -1,8 +1,8 @@
 # =============================================================================
-# OpenMetadata description: iceberg.silver.fotmob_team_season
+# OpenMetadata description: iceberg.gold.fotmob_team_season
 # =============================================================================
 table:
-  fullyQualifiedName: trino_iceberg.iceberg.silver.fotmob_team_season
+  fullyQualifiedName: trino_iceberg.iceberg.gold.fotmob_team_season
   description: |
     Per-(team, season) team-level season aggregate из FotMob. Rollup из
     silver.fotmob_team_match через SUM / COUNT / AVG (один row на команду
@@ -15,7 +15,7 @@ table:
     сезона FBref; `appearances` показывает реальное число учтённых матчей.
     PK: (team_id, league, season). team_id = team NAME (== xref source_id).
   tags:
-    - Tier.Silver
+    - Tier.Gold
     - Domain.Football
     - PII.None
 columns:
