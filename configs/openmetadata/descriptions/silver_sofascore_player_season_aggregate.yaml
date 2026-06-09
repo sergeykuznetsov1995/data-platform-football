@@ -1,0 +1,156 @@
+# =============================================================================
+# OpenMetadata description: iceberg.silver.sofascore_player_season_aggregate
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.silver.sofascore_player_season_aggregate
+  description: |
+    Сезонная статистика игрока из SofaScore — один row на
+    (canonical_id, league, season). Самый полный набор метрик среди источников
+    (дуэли, обводки, разбивка пенальти и голов). Источник:
+    bronze.sofascore_player_season_stats (уже season-grain, без агрегации) INNER
+    JOIN silver.xref_player (source='sofascore', non-orphan) с обязательным
+    предикатом (league, season). Orphan-игроки отфильтрованы — они не bridge'атся
+    к FBref-spine на Gold. Дедуп: ROW_NUMBER PARTITION BY
+    (player_id, league, season) ORDER BY _ingested_at DESC. Форма зеркалит
+    understat/whoscored player_season_aggregate для LEFT JOIN на Gold.
+    canonical_id — FK → gold.dim_player.player_id.
+  tags:
+    - Tier.Silver
+    - Domain.Football
+    - PII.None
+columns:
+  - name: canonical_id
+    description: Канонический ID игрока из xref_player (FK → gold.dim_player.player_id).
+  - name: rating
+    description: Средний рейтинг игрока за сезон (SofaScore).
+  - name: tackles
+    description: Отборы, всего.
+  - name: tackles_won
+    description: Выигранные отборы.
+  - name: tackles_won_pct
+    description: Доля выигранных отборов, %.
+  - name: interceptions
+    description: Перехваты.
+  - name: dribbles
+    description: Удачные обводки (SofaScore successful_dribbles).
+  - name: dribbles_pct
+    description: Доля удачных обводок, %.
+  - name: ground_duels_won
+    description: Выигранные наземные единоборства.
+  - name: ground_duels_won_pct
+    description: Доля выигранных наземных единоборств, %.
+  - name: aerial_duels_won
+    description: Выигранные воздушные единоборства.
+  - name: aerial_duels_won_pct
+    description: Доля выигранных воздушных единоборств, %.
+  - name: total_duels_won
+    description: Выигранные единоборства, всего.
+  - name: total_duels_won_pct
+    description: Доля выигранных единоборств, %.
+  - name: total_passes
+    description: Передачи, всего.
+  - name: accurate_passes
+    description: Точные передачи.
+  - name: accurate_passes_pct
+    description: Доля точных передач, %.
+  - name: final_third_passes
+    description: Точные передачи в финальную треть.
+  - name: key_passes
+    description: Ключевые передачи (после которых партнёр наносил удар).
+  - name: secondary_assists
+    description: Вторичные ассисты (пас на ассистирующего; SofaScore pass_to_assist).
+  - name: total_crosses
+    description: Навесы, всего.
+  - name: accurate_crosses
+    description: Точные навесы.
+  - name: accurate_crosses_pct
+    description: Доля точных навесов, %.
+  - name: total_long_balls
+    description: Длинные передачи, всего.
+  - name: accurate_long_balls
+    description: Точные длинные передачи.
+  - name: accurate_long_balls_pct
+    description: Доля точных длинных передач, %.
+  - name: total_shots
+    description: Удары, всего.
+  - name: shots_on_target
+    description: Удары в створ.
+  - name: shots_off_target
+    description: Удары мимо ворот.
+  - name: shots_inside_box
+    description: Удары из штрафной площади.
+  - name: shots_outside_box
+    description: Удары из-за пределов штрафной.
+  - name: blocked_shots
+    description: Заблокированные удары.
+  - name: hit_woodwork
+    description: Попадания в каркас ворот (штанга/перекладина).
+  - name: offsides
+    description: Положения вне игры.
+  - name: expected_goals
+    description: Expected Goals (xG) за сезон, DOUBLE.
+  - name: penalties_taken
+    description: Пробитые пенальти, всего.
+  - name: penalty_goals
+    description: Голы с пенальти.
+  - name: penalty_won
+    description: Заработанные пенальти.
+  - name: penalty_conceded
+    description: Привезённые пенальти (фол в своей штрафной).
+  - name: was_fouled
+    description: Фолы, заработанные игроком (на нём сфолили).
+  - name: fouls
+    description: Совершённые фолы.
+  - name: dribbled_past
+    description: Случаи, когда игрока обвели в единоборстве.
+  - name: errors_lead_to_goal
+    description: Ошибки, приведшие к голу соперника.
+  - name: errors_lead_to_shot
+    description: Ошибки, приведшие к удару соперника.
+  - name: clearances
+    description: Выносы мяча.
+  - name: ball_recoveries
+    description: Возвраты владения мячом.
+  - name: blocks
+    description: Блокировки мяча полевым игроком.
+  - name: poss_won_att_third
+    description: Возвраты владения в атакующей трети поля.
+  - name: touches
+    description: Касания мяча.
+  - name: dispossessed
+    description: Потери мяча в единоборстве (отобрали).
+  - name: possession_lost
+    description: Потери владения мячом (все типы).
+  - name: totw_appearances
+    description: Попадания в символическую сборную тура (Team of the Week) — проприетарный сигнал SofaScore.
+  - name: matches_started
+    description: Матчи в стартовом составе.
+  - name: appearances
+    description: Появления в матчах, всего (старты + выходы на замену).
+  - name: goal_conversion_pct
+    description: Конверсия ударов в голы, % (goals / shots).
+  - name: goals_inside_box
+    description: Голы из штрафной площади.
+  - name: goals_outside_box
+    description: Голы из-за пределов штрафной.
+  - name: headed_goals
+    description: Голы головой.
+  - name: left_foot_goals
+    description: Голы левой ногой.
+  - name: right_foot_goals
+    description: Голы правой ногой.
+  - name: set_piece_shots
+    description: Удары со стандартных положений.
+  - name: free_kick_goals
+    description: Голы со штрафных ударов.
+  - name: league
+    description: Лига (partition key).
+  - name: season
+    description: Сезон slug '2526' (partition key, varchar).
+  - name: _silver_created_at
+    description: Технический timestamp создания строки в Silver-слое (добавляется CTAS-раннером).
+relationships:
+  - from: canonical_id
+    to: trino_iceberg.iceberg.gold.dim_player.player_id
+    type: FOREIGN_KEY
+    description: N:1 — сезонная статистика к каноническому игроку.

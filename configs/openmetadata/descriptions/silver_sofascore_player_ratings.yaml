@@ -1,0 +1,56 @@
+# =============================================================================
+# OpenMetadata description: iceberg.silver.sofascore_player_ratings
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.silver.sofascore_player_ratings
+  description: |
+    Матчевые рейтинги игроков от SofaScore — один row на
+    (match_id_canonical, player_id_canonical, team_side). Источник:
+    bronze.sofascore_player_ratings, канонизированный двумя bridge'ами:
+      * match_id_canonical — sofascore_schedule.game_id → (date, home/away
+        через team_aliases) → gold.dim_match.match_id (FBref hex); fallback
+        'sofascore_' || raw_id для матчей без FBref-расписания.
+      * player_id_canonical — silver.xref_player (source='sofascore', предикат
+        league+season); fallback 'ss_' || raw_id для нерезолвленных.
+    rating нормализован в decimal(3,1): 0.0 (нет рейтинга у незаигравшего
+    запасного) и значения вне [0.1, 10.0] обнуляются в NULL. Дедуп:
+    ROW_NUMBER PARTITION BY (match_id, player_id) ORDER BY _ingested_at DESC.
+    Bronze может быть пустым (E4.1 fallback не развёрнут) → Silver = 0 rows.
+    match_id_canonical / player_id_canonical — FK на dim_match / dim_player
+    (только для bridged-строк; fallback-префиксы 'sofascore_'/'ss_' не матчатся).
+  tags:
+    - Tier.Silver
+    - Domain.Football
+    - PII.None
+columns:
+  - name: match_id_canonical
+    description: Канонический ID матча — FBref hex если bridged через schedule, иначе 'sofascore_' || raw SofaScore game_id (FK → gold.dim_match.match_id).
+  - name: player_id_canonical
+    description: Канонический ID игрока из xref_player, иначе 'ss_' || raw SofaScore player_id для orphan (FK → gold.dim_player.player_id).
+  - name: team_side
+    description: Сторона игрока в матче — 'home' или 'away' (SofaScore-native атрибуция).
+  - name: rating
+    description: Рейтинг игрока за матч, decimal(3,1) в диапазоне 0.1–10.0 (0.0 и значения вне диапазона → NULL).
+  - name: position
+    description: Позиция игрока в матче (сырая SofaScore, без канонизации в MVP).
+  - name: source
+    description: Источник рейтинга — константа 'sofascore'.
+  - name: source_version
+    description: Версия схемы источника — константа 'v1'.
+  - name: league
+    description: Лига (partition key).
+  - name: season
+    description: Сезон slug '2526' (partition key, varchar).
+  - name: _ingested_at
+    description: Технический timestamp ingest'а Bronze (lineage, passthrough).
+  - name: _silver_created_at
+    description: Технический timestamp создания строки в Silver-слое (добавляется CTAS-раннером).
+relationships:
+  - from: match_id_canonical
+    to: trino_iceberg.iceberg.gold.dim_match.match_id
+    type: FOREIGN_KEY
+    description: N:1 — рейтинги игроков матча (только bridged match_id).
+  - from: player_id_canonical
+    to: trino_iceberg.iceberg.gold.dim_player.player_id
+    type: FOREIGN_KEY
+    description: N:1 — рейтинги к каноническому игроку (только non-orphan).
