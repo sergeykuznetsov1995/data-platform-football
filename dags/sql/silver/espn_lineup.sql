@@ -9,14 +9,16 @@
 --
 -- Target consumer:
 --   gold/fct_lineup (E3.5) — UNION ALL with silver.fbref_match_lineups.
---   Output schema MUST match silver.fbref_match_lineups column-for-column
---   (same names, same types) so the UNION needs no per-source casts.
+--   Output schema matches silver.fbref_match_lineups column-for-column, EXCEPT
+--   ``season``: here it is a varchar slug ('2526'), while fbref Silver carries
+--   bigint year-start. fct_lineup reconciles the two per-branch (each CTE casts
+--   season to a unified 4-char varchar), so the UNION stays type-aligned at Gold.
 --
 -- =============================================================================
 -- Bronze column reference (soccerdata.ESPN.read_lineup output, post _add_metadata)
 -- =============================================================================
 --   league            varchar   -- e.g. 'ENG-Premier League'
---   season            varchar   -- e.g. '2526' (soccerdata 2-digit form, BIGINT after _add_metadata cast)
+--   season            varchar   -- e.g. '2526' (soccerdata 2-digit slug form)
 --   game              varchar   -- ESPN match display ("YYYY-MM-DD Home-Away") — no native game_id in lineup df
 --   team              varchar   -- ESPN team displayName (post TEAMNAME_REPLACEMENTS)
 --   player            varchar   -- player displayName
@@ -54,10 +56,11 @@
 --   jersey_number         integer    -- ESPN matchsheet has NO jersey number → NULL
 --   _bronze_ingested_at   timestamp  -- direct
 --   league                varchar    -- partition key
---   season                bigint     -- partition key. ESPN Bronze stores season as
---                                       VARCHAR ('2526'); FBref Silver uses BIGINT.
---                                       TRY_CAST aligns the UNION partner without
---                                       failing on malformed seasons.
+--   season                varchar    -- partition key. ESPN Bronze stores season as
+--                                       VARCHAR slug ('2526'); kept as varchar slug
+--                                       here (charter S2). The slug↔year-start
+--                                       reconciliation with FBref happens at Gold
+--                                       (fct_lineup), not in Silver.
 --
 -- =============================================================================
 -- Deduplication
@@ -86,7 +89,7 @@
 WITH src AS (
     SELECT
         league,
-        TRY_CAST(season AS bigint)           AS season,
+        CAST(season AS varchar)              AS season,
         game,
         team,
         player,

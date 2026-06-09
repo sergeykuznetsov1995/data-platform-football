@@ -65,8 +65,9 @@
 --   source                varchar           -- 'sofascore'
 --   source_version        varchar           -- 'v1'
 --   league                varchar           -- partition key
---   season                bigint            -- partition key (cast to align с FBref-derived
---                                              dim_match.season=bigint)
+--   season                varchar           -- partition key, varchar slug ('2526')
+--                                              per charter S2 (slug↔year-start
+--                                              reconciliation deferred to Gold)
 --   _ingested_at          timestamp(6)      -- bronze lineage passthrough
 --
 -- Logical PK: (match_id_canonical, player_id_canonical, team_side)
@@ -289,8 +290,8 @@ SELECT
     CAST('sofascore' AS varchar)           AS source,
     CAST('v1'        AS varchar)           AS source_version,
     league,
-    -- season aligned to bigint, как в gold.dim_match. SofaScore Bronze хранит
-    -- season как varchar ('2526'); TRY_CAST (а не CAST) защищает от malformed.
-    TRY_CAST(season AS bigint)             AS season,
+    -- season как varchar-slug ('2526'), per charter S2. SofaScore Bronze хранит
+    -- season как varchar; CAST держит тот же slug без смены значения.
+    CAST(season AS varchar)               AS season,
     _ingested_at
 FROM ss_with_match
