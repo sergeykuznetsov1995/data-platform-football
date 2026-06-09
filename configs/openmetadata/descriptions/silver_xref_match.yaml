@@ -1,0 +1,44 @@
+# =============================================================================
+# OpenMetadata description: iceberg.silver.xref_match
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.silver.xref_match
+  description: |
+    Кросс-источниковый справочник матчей. Spine — FBref: его match_id
+    (8-символьный hex) стабилен и глобально уникален. 6 остальных источников
+    привязываются к этому spine по кортежу
+    (match_date, home_canonical_id, away_canonical_id, league, season), где
+    home/away_canonical_id берутся из silver.xref_team. Удачная привязка → строка
+    несёт FBref-hex в canonical_id с confidence='date_team_match'; если FBref-матч
+    не найден — orphan с префиксом источника ('ws_<id>', 'us_<id>',
+    'mh_<xxhash64>') и confidence='orphan'. Один row на (canonical_id, source):
+    один и тот же FBref canonical может встречаться под source='fbref' И
+    source='whoscored' (привязанная строка). canonical_id никогда не NULL.
+  tags:
+    - Tier.Silver
+    - Domain.Football
+    - PII.None
+columns:
+  - name: canonical_id
+    description: FBref match_id (8-симв. hex) при удачной привязке; orphan '<prefix>_<id>' если FBref-матч не найден.
+  - name: source
+    description: Источник матча — fbref / whoscored / understat / sofascore / fotmob / matchhistory / espn.
+  - name: source_id
+    description: Сырой match-id источника (varchar); FBref=match_id, WhoScored=game_id, MatchHistory='mh_<xxhash64>'.
+  - name: display_name
+    description: "Строка 'Home vs Away' для отладки (например 'Manchester City vs Arsenal')."
+  - name: league
+    description: Код лиги (например 'ENG-Premier League').
+  - name: season
+    description: Нормализованный сезон (varchar); форматы источников различаются (FBref '2024' vs WhoScored '2425').
+  - name: confidence
+    description: "Уровень привязки: 'exact' — FBref spine; 'date_team_match' — успешно привязан к FBref; 'orphan' — FBref-матч не найден."
+  - name: match_score
+    description: Всегда NULL — fuzzy-шага на этом уровне нет.
+  - name: _silver_created_at
+    description: Технический timestamp создания строки в Silver-слое (добавляется CTAS-раннером).
+relationships:
+  - from: trino_iceberg.iceberg.silver.xref_match
+    to: trino_iceberg.iceberg.silver.xref_team
+    type: FOREIGN_KEY
+    description: home/away команды резолвятся через xref_team по (source, source_id, league, season).

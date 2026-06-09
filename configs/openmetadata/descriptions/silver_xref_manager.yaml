@@ -1,0 +1,38 @@
+# =============================================================================
+# OpenMetadata description: iceberg.silver.xref_manager
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.silver.xref_manager
+  description: |
+    Кросс-источниковый справочник тренеров (главных). Два источника (issue #144):
+    FBref (bronze.fbref_match_managers — spine, есть только имя, без стабильного id)
+    и FotMob (bronze.fotmob_player_details WHERE is_coach — несёт стабильный
+    coachId в source_id). Один row на (source, source_id, league, season).
+    canonical_id выводится name-based одинаковым diacritic-stripping идиомом в обоих
+    источниках, поэтому одинаково записанный тренер ('Mikel Arteta') сходится в один
+    canonical_id. Fuzzy-резолвер тут НЕ нужен (тренеров ~20 на лигу-сезон, пишутся
+    одинаково). FotMob-строка без FBref-аналога в той же лиге → confidence='orphan'.
+  tags:
+    - Tier.Silver
+    - Domain.Football
+    - PII.Low
+columns:
+  - name: canonical_id
+    description: Name-based slug тренера (strip-диакритики → '[^a-z0-9]+'→'_'); одинаков для FBref и FotMob при идентичном написании.
+  - name: source
+    description: Источник тренера — fbref (spine) или fotmob.
+  - name: source_id
+    description: FBref — сырое имя тренера; FotMob — стабильный coachId (player_id).
+  - name: display_name
+    description: Сырое имя тренера из источника (персональные данные).
+  - name: league
+    description: Код лиги (например 'ENG-Premier League').
+  - name: season
+    description: Нормализованный сезон (varchar; в Bronze хранится BIGINT).
+  - name: confidence
+    description: "Уровень привязки: 'name_normalize' — есть FBref-аналог; 'orphan' — FotMob-тренер без привязки к FBref."
+  - name: match_score
+    description: Всегда NULL — fuzzy-скоринга для тренеров нет.
+  - name: _silver_created_at
+    description: Технический timestamp создания строки в Silver-слое (добавляется CTAS-раннером).
+relationships: []

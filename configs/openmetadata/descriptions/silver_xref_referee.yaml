@@ -1,0 +1,38 @@
+# =============================================================================
+# OpenMetadata description: iceberg.silver.xref_referee
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.silver.xref_referee
+  description: |
+    Кросс-источниковый справочник судей. Три источника: fbref, matchhistory,
+    fotmob. Один row на (source, source_id, league, season), где source_id =
+    сырое имя судьи из Bronze (например 'Michael Oliver' vs 'M Oliver').
+    canonical_id берётся из configs/medallion (referee_aliases.yaml) — явный slug
+    'ref_<slug>' (например 'ref_michael_oliver'), НЕ выводится из имени. Судья без
+    записи в YAML получает orphan-id с префиксом источника ('fb_ref_michael_oliver',
+    'mh_ref_m_oliver') и confidence='orphan'. Шаблон .sql.j2 рендерится с
+    referee_aliases-значениями через medallion_config.
+  tags:
+    - Tier.Silver
+    - Domain.Football
+    - PII.Low
+columns:
+  - name: canonical_id
+    description: Каноничный 'ref_<slug>' из referee_aliases.yaml; orphan '<src>_ref_<slug>' если судьи нет в YAML.
+  - name: source
+    description: Источник имени судьи — fbref / matchhistory / fotmob.
+  - name: source_id
+    description: Сырое имя судьи из Bronze (персональные данные; например 'Michael Oliver', 'M Oliver').
+  - name: display_name
+    description: Каноническое имя из YAML если судья сматчен, иначе source_id.
+  - name: league
+    description: Код лиги (например 'ENG-Premier League').
+  - name: season
+    description: Нормализованный сезон-slug (varchar).
+  - name: confidence
+    description: "Уровень привязки: 'name_alias' — сматчено с referee_aliases.yaml; 'orphan' — записи в YAML нет."
+  - name: match_score
+    description: Всегда NULL — fuzzy-скоринга для судей нет (только точный alias-матч).
+  - name: _silver_created_at
+    description: Технический timestamp создания строки в Silver-слое (добавляется CTAS-раннером).
+relationships: []
