@@ -1,0 +1,95 @@
+# =============================================================================
+# OpenMetadata description: iceberg.silver.sofifa_player_profile
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.silver.sofifa_player_profile
+  description: |
+    Per-edition snapshot игрока из SoFIFA (рейтинги видеоигры FIFA / EA FC) —
+    один row на (player_id, fifa_edition). ВАЖНО: это game-side оценки EA Sports,
+    НЕ реальные матчевые метрики. Несёт overall/potential, main-6 card-агрегаты
+    (pace/shooting/passing/dribbling/defending/physical), 5 GK-скиллов, game-side
+    финансы (value/wage/release clause/контракт) и профиль (position/dob/height/
+    weight/nationality). Источники: bronze.sofifa_player_ratings (атрибуты) +
+    bronze.sofifa_players (identity), оба key (player_id, fifa_edition), дедуп
+    ROW_NUMBER. fifa_edition → season slug: 'FC 26'→'2526' (edition названа по
+    году конца сезона). canonical_id LEFT JOIN через silver.xref_player
+    (source='sofifa', non-orphan) с обязательным предикатом (league, season);
+    NULLable — SoFIFA содержит игроков вне FBref-spine (loan-out/U21, orphan ≈15%).
+  tags:
+    - Tier.Silver
+    - Domain.Football
+    - PII.Low
+columns:
+  - name: player_id
+    description: Стабильный SoFIFA player_id (BIGINT); часть PK с fifa_edition.
+  - name: canonical_id
+    description: Канонический ID игрока из silver.xref_player (FK → gold.dim_player.player_id); NULL для SoFIFA-only игроков (~15% orphan).
+  - name: player_name
+    description: Имя игрока (COALESCE ratings/players; PII.Low — публично известное лицо).
+    tags:
+      - PII.Low
+  - name: overall
+    description: Общий рейтинг игрока (overall) в этой edition, 0–99.
+  - name: potential
+    description: Потенциальный максимум рейтинга (potential), 0–99.
+  - name: pace
+    description: Card-агрегат «скорость» (PAC), 0–99.
+  - name: shooting
+    description: Card-агрегат «удар» (SHO), 0–99.
+  - name: passing
+    description: Card-агрегат «пас» (PAS), 0–99.
+  - name: dribbling
+    description: Card-агрегат «дриблинг» (DRI), 0–99.
+  - name: defending
+    description: Card-агрегат «защита» (DEF), 0–99.
+  - name: physical
+    description: Card-агрегат «физика» (PHY), 0–99.
+  - name: gk_diving
+    description: Вратарский скилл «прыжок» (GK diving), 0–99; релевантно для GK.
+  - name: gk_handling
+    description: Вратарский скилл «фиксация мяча» (GK handling), 0–99.
+  - name: gk_kicking
+    description: Вратарский скилл «удар от ворот» (GK kicking), 0–99.
+  - name: gk_positioning
+    description: Вратарский скилл «выбор позиции» (GK positioning), 0–99.
+  - name: gk_reflexes
+    description: Вратарский скилл «реакция» (GK reflexes), 0–99.
+  - name: value_eur
+    description: Game-side рыночная стоимость в евро на момент edition (BIGINT; оценка EA, не реальный трансфер).
+  - name: wage_eur
+    description: Game-side недельная зарплата в евро (BIGINT; оценка EA).
+  - name: release_clause_eur
+    description: Game-side сумма отступных в евро (BIGINT; оценка EA).
+  - name: contract_valid_until
+    description: Год окончания контракта в игре (INTEGER).
+  - name: joined
+    description: Дата перехода игрока в клуб по данным игры (timestamp).
+  - name: position
+    description: Игровая позиция в SoFIFA (например ST / CM / GK).
+  - name: dob
+    description: Дата рождения (varchar). PII.Low.
+    tags:
+      - PII.Low
+  - name: height_cm
+    description: Рост в сантиметрах (INTEGER).
+  - name: weight_kg
+    description: Вес в килограммах (INTEGER).
+  - name: nationality
+    description: Национальность игрока (как в SoFIFA).
+  - name: team
+    description: Клуб игрока в этой edition (SoFIFA team name).
+  - name: fifa_edition
+    description: Издание игры (например 'FC 26' / 'FIFA 23'); часть PK с player_id.
+  - name: _bronze_ingested_at
+    description: Технический timestamp ingest'а Bronze (lineage).
+  - name: league
+    description: Лига (partition key).
+  - name: season
+    description: Сезон slug '2526' (partition key, varchar; выведен из fifa_edition).
+  - name: _silver_created_at
+    description: Технический timestamp создания строки в Silver-слое (добавляется CTAS-раннером).
+relationships:
+  - from: canonical_id
+    to: trino_iceberg.iceberg.gold.dim_player.player_id
+    type: FOREIGN_KEY
+    description: N:1 — per-edition профиль к каноническому игроку.
