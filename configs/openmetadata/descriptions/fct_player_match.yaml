@@ -55,9 +55,7 @@ columns:
   - name: league
     description: Лига (partition key).
   - name: season
-    description: |
-      Сезон в bigint формате (2025 == сезон 2025/26). Partition key.
-      Конвертируется из xref slug '2526': `2000 + CAST(SUBSTR(season,1,2) AS BIGINT)`.
+    description: Сезон — varchar slug ('2425' = сезон 2024/25). Partition key.
 
   # ─── HARD_FACT (COALESCE, primary = FBref) ───
   - name: minutes

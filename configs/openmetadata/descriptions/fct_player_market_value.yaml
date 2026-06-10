@@ -35,7 +35,7 @@ columns:
   - name: league
     description: Лига (partition key, current ingest league).
   - name: season
-    description: Сезон bigint (e.g. 2025) — partition key, current ingest window.
+    description: Сезон — varchar slug ('2526' = сезон 2025/26), partition key, current ingest window.
 relationships:
   - from: player_id_canonical
     to: trino_iceberg.iceberg.gold.dim_player_attributes.player_id_canonical

@@ -30,7 +30,7 @@ columns:
   - name: league
     description: Код лиги (например 'ENG-Premier League').
   - name: season
-    description: Нормализованный сезон (varchar); форматы источников различаются (FBref '2024' vs WhoScored '2425').
+    description: Нормализованный сезон — varchar slug ('2425' = сезон 2024/25); после #404 единый slug-формат у всех источников.
   - name: confidence
     description: "Уровень привязки: 'exact' — FBref spine; 'date_team_match' — успешно привязан к FBref; 'orphan' — FBref-матч не найден."
   - name: match_score

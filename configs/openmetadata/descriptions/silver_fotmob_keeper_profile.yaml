@@ -60,7 +60,7 @@ columns:
   - name: league
     description: Лига (partition key).
   - name: season
-    description: Сезон (partition key, bigint).
+    description: Сезон — varchar slug ('2526' = сезон 2025/26), partition key.
   - name: _silver_created_at
     description: Технический timestamp создания строки в Silver-слое (добавляется CTAS-раннером).
 relationships: []

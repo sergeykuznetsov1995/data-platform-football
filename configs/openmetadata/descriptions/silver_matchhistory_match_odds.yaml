@@ -44,7 +44,7 @@ columns:
   - name: league
     description: Лига (partition key).
   - name: season
-    description: Сезон год-начала (partition key, bigint — football-data конвенция).
+    description: Сезон — varchar slug ('2425' = сезон 2024/25), partition key.
   - name: _ingested_at
     description: Технический timestamp ingest'а Bronze (lineage passthrough).
   - name: _silver_created_at

@@ -148,7 +148,7 @@ columns:
   - name: league
     description: Лига.
   - name: season
-    description: Сезон (bigint year-start, e.g. 2025 для 2025/26).
+    description: Сезон — varchar slug ('2425' = сезон 2024/25).
 relationships:
   - from: match_id
     to: trino_iceberg.iceberg.gold.dim_match.match_id
