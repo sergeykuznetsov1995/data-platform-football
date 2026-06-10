@@ -221,9 +221,11 @@ class TestE1DagImports:
 
 
 # 6 SQL files migrated from gold.entity_xref → silver.xref_team in T2 (E1.5).
+# #425: dim_team / dim_match became Jinja templates (.sql.j2) — same pure
+# SELECT contract, rendered by dim_loaders before CTAS.
 CUTOVER_SQL_FILES = (
-    "dim_team.sql",
-    "dim_match.sql",
+    "dim_team.sql.j2",
+    "dim_match.sql.j2",
     "dim_player.sql",
     "dim_standings.sql",
     "fct_player_match.sql",
