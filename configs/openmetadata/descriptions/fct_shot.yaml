@@ -4,7 +4,7 @@
 table:
   fullyQualifiedName: trino_iceberg.iceberg.gold.fct_shot
   description: |
-    Shot-level fact. Source: silver.understat_shot_events bridged to FBref
+    Shot-level fact. Source: bronze.understat_shots bridged to FBref
     matches via cross-source xG join. Carries Understat xG and canonical
     body_part / situation / result enums. Grain: one row per shot_id.
   tags:
