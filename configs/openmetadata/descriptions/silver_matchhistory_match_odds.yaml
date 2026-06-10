@@ -1,0 +1,56 @@
+# =============================================================================
+# OpenMetadata description: iceberg.silver.matchhistory_match_odds
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.silver.matchhistory_match_odds
+  description: |
+    Букмекерские котировки матча из MatchHistory (football-data.co.uk) в
+    tall-формате — один row на (match_id_canonical, bookmaker_code, market,
+    closing_flag), ~12 строк на матч. Источник: bronze.matchhistory_results
+    (wide-form, ~50 odds-колонок) → UNION ALL по букмекер × рынок. Рынки:
+    '1x2' (исход), 'ah' (азиатский гандикап), 'ou_2_5' (тотал 2.5). Bridge к
+    gold.dim_match выполняется ИНЛАЙН через inline team_aliases CTE +
+    INNER JOIN dim_match по (date, league, season, home/away canonical) — НЕ
+    через silver.xref_match (Phase B deferred). Только сбриджившиеся матчи
+    выживают (coverage ≥95%). Строки со всеми тремя NULL-котировками и
+    нечислящимися odds (≤1.0) отфильтрованы. match_id_canonical == FBref-hex.
+  tags:
+    - Tier.Silver
+    - Domain.Football
+    - PII.None
+columns:
+  - name: match_id_canonical
+    description: Канонический ID матча (FBref-hex, == gold.dim_match.match_id); часть PK.
+  - name: bookmaker_code
+    description: Код букмекера/агрегата — B365 / PS / WH / VC / IW / BW / AVG / MAX; часть PK.
+  - name: market
+    description: "Рынок котировки: '1x2' (исход), 'ah' (азиатский гандикап), 'ou_2_5' (тотал 2.5); часть PK."
+  - name: odds_h
+    description: Котировка на победу хозяев (1x2.home) / линию гандикапа home (ah) / OVER (ou_2_5), decimal(6,3).
+  - name: odds_d
+    description: Котировка на ничью; NULL для рынков 'ah' и 'ou_2_5', decimal(6,3).
+  - name: odds_a
+    description: Котировка на победу гостей (1x2.away) / линию гандикапа away (ah) / UNDER (ou_2_5), decimal(6,3).
+  - name: ah_handicap
+    description: Линия азиатского гандикапа; NULL для рынков != 'ah', decimal(4,2).
+  - name: ou_line
+    description: Линия тотала (= 2.5); NULL для рынков != 'ou_2_5', decimal(4,2).
+  - name: closing_flag
+    description: BOOLEAN — true для closing-котировок (Cl-колонки football-data), false для open.
+  - name: source
+    description: Источник котировок — всегда 'matchhistory'.
+  - name: source_version
+    description: Версия схемы маппинга котировок — 'v1'.
+  - name: league
+    description: Лига (partition key).
+  - name: season
+    description: Сезон год-начала (partition key, bigint — football-data конвенция).
+  - name: _ingested_at
+    description: Технический timestamp ingest'а Bronze (lineage passthrough).
+  - name: _silver_created_at
+    description: Технический timestamp создания строки в Silver-слое (добавляется CTAS-раннером).
+relationships:
+  - from: match_id_canonical
+    to: trino_iceberg.iceberg.gold.dim_match.match_id
+    type: FOREIGN_KEY
+    description: N:1 — котировки к каноническому матчу.

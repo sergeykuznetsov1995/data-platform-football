@@ -1,0 +1,49 @@
+# =============================================================================
+# OpenMetadata description: iceberg.silver.espn_lineup
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.silver.espn_lineup
+  description: |
+    Составы матча из ESPN matchsheet API — по строке на игрока в заявке
+    (старт + скамейка), несколько строк на матч. Источник: bronze.espn_lineup
+    (без JOIN'ов). Схема выровнена колонка-в-колонку с silver.fbref_match_lineups
+    (кроме season: здесь varchar slug '2526'), чтобы gold.fct_lineup делал
+    UNION ALL обеих веток. match_id — синтетический 'espn_<xxhash64>' от
+    (league, season, game), т.к. ESPN не отдаёт native game_id; bridge к
+    FBref-hex выполняется в xref_match Phase B. player_id всегда NULL (у ESPN
+    нет native player_id; резолвится по (name, team) позже). Дедуп: ROW_NUMBER
+    PARTITION BY (match_id, team, player) ORDER BY _ingested_at DESC.
+  tags:
+    - Tier.Silver
+    - Domain.Football
+    - PII.Low
+columns:
+  - name: match_id
+    description: Синтетический ID матча 'espn_<xxhash64>' от (league, season, game); bridge к FBref-hex через silver.xref_match Phase B.
+  - name: team
+    description: Команда игрока (ESPN displayName, после TEAMNAME_REPLACEMENTS).
+  - name: player
+    description: Имя игрока (ESPN displayName; PII.Low — публично известное лицо).
+    tags:
+      - PII.Low
+  - name: player_id
+    description: NULL placeholder — у ESPN нет native player_id; xref_player резолвит по (name, team) в follow-up.
+  - name: is_starter
+    description: BOOLEAN — true для стартового состава (выводится из sub_in='start'); скамейка/неявка = false (без NULL).
+  - name: position
+    description: Позиция игрока в матче (сырое ESPN-название, без канонизации — как и в FBref Silver).
+  - name: jersey_number
+    description: NULL placeholder — ESPN matchsheet не содержит игровых номеров.
+  - name: _bronze_ingested_at
+    description: Технический timestamp ingest'а Bronze (lineage).
+  - name: league
+    description: Лига (partition key).
+  - name: season
+    description: Сезон slug '2526' (partition key, varchar; slug↔year-start с FBref сводится на Gold).
+  - name: _silver_created_at
+    description: Технический timestamp создания строки в Silver-слое (добавляется CTAS-раннером).
+relationships:
+  - from: match_id
+    to: trino_iceberg.iceberg.silver.xref_match.source_id
+    type: FOREIGN_KEY
+    description: N:1 — строки состава к матчу (ESPN-псевдоid в xref_match.source_id).
