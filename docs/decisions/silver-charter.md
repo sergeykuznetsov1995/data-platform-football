@@ -81,13 +81,10 @@ Every Silver table MUST have:
 - **Partition keys** (last in SELECT): `league` (varchar), `season` (varchar slug `'2425'`).
   Partitioning `ARRAY['league','season']` is applied by `run_silver_transform` — do **not**
   write it in SQL.
-  - **Sanctioned exception — year-start `season`.** FBref-derived tables and any table that
-    joins `xref_team`/`xref_match` in the source's native format keep `season` as year-start
-    (`2024` for 2024-25), because xref stores `season` per-source and the slug↔year-start
-    conversion happens at the **Gold boundary**, not in Silver. For these, checker rule **S2
-    is a WARN, not an ERROR** (allowlist `SEASON_YEAR_START_OK` in `audit_silver_charter.py`,
-    listed in §7). Full unification onto slug is tracked under the cross-source identity epic
-    (#147). Changing these values in Silver silently breaks Gold INNER JOINs — do **not**.
+  - **No exceptions (#404).** `season` is the slug everywhere. Year-start bronze sources
+    (FBref / FotMob / MatchHistory) are converted to slug **once in Silver** (`LPAD(MOD…)`),
+    so every Silver table — and every Gold JOIN — uses the slug directly (`season = season`).
+    Checker rule **S2 is a hard ERROR** for any non-varchar `season`.
 - **Lineage:** `_bronze_ingested_at` (alias of Bronze `_ingested_at`). `_silver_created_at`
   is added automatically by `run_silver_transform` — do **not** write it in SQL.
 - **Natural key** columns first, under an `-- Identity` header.
@@ -180,19 +177,14 @@ here is rewritten in this pass** — this charter + checker land first.
 > active + tested). Fallback `*_empty.sql` files are now excluded from the checker scan, so
 > the phantom "dead stub" no longer surfaces.
 
-### Sanctioned year-start `season` (S2 WARN, not ERROR)
+### ~~Sanctioned year-start `season`~~ — RETIRED (#404)
 
-These 13 tables store `season` as year-start by design (xref source-format compatibility, §4).
-Layer B rule S2 is downgraded to WARN via `SEASON_YEAR_START_OK` in the checker. Group A
-(`espn_lineup`, `sofascore_player_ratings`, `whoscored_player_unavailable`) is **not** here —
-their values are already slug, only the column type is bigint; they get a value-safe varchar
-fix synchronised with their Gold consumers (separate issue). Full slug unification → epic #147.
-
-| Tables | Source format | Why sanctioned |
-|---|---|---|
-| `fbref_*` (keeper_profile, match_enriched, match_events, match_lineups, player_match_stats, player_season_profile, team_season_profile) | year-start `2016`..`2025` | join `xref_team` in FBref year-start format |
-| `fotmob_*` (keeper_profile, match_referee, player_market_value_history, player_profile, player_season_profile) | year-start `2024`/`2025` | Gold converts slug→year-start at the boundary |
-| `matchhistory_match_odds` | year-start `2021`..`2025` | passthrough to `gold.fct_match_odds` (year-start by contract) |
+The 13 tables that used to store `season` as year-start are now slug ('2425') like every
+other table. The year-start→slug conversion moved from the Gold boundary **into Silver**
+(one `LPAD(MOD…)` per table), every Gold JOIN became a direct `season = season`, the
+`SEASON_YEAR_START_OK` allowlist was removed, and S2 is now a hard ERROR for any non-varchar
+`season`. xref_team/xref_match/xref_manager/xref_referee also emit slug for their FBref /
+FotMob / MatchHistory branches.
 
 > `sofascore_player_season_aggregate` was initially suspected a rollup but is **COMPLIANT**:
 > its source `bronze.sofascore_player_season_stats` is already season-grain (SofaScore serves

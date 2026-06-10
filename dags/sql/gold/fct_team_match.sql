@@ -117,11 +117,8 @@ xref_match_ss AS (
 -- ===== FotMob xref (issue #97 — 5th source) =====
 -- FotMob team_id in silver.fotmob_team_match is the team NAME (== xref source_id),
 -- so a direct JOIN works (no WhoScored-style numeric↔name bridge needed).
--- FOOTGUN: bronze.fotmob_schedule.season is BIGINT year-start (2025) → xref_team /
--- xref_match store season as YEAR-START '2025' (like FBref), NOT slug. But the
--- silver.fotmob_team_match fact uses slug '2526'. So the xref bridges below JOIN on
--- the year-start string (CAST(dim_match.season AS varchar)), while the fact JOINs on
--- season_slug. See feedback_xref_team_source_id_format.md.
+-- #404: xref_team / xref_match now store season as slug ('2425'), matching the
+-- silver.fotmob_team_match fact and dim_match — all bridge JOINs are slug = slug.
 xref_team_fm AS (
     SELECT DISTINCT
         canonical_id,
@@ -221,13 +218,12 @@ unioned AS (
     SELECT * FROM away
 ),
 
--- Compute season slug from dim_match.season (bigint year-start, e.g. 2025 → '2526')
--- for cross-source JOINs against xref_match / silver US/WS/SS team_match tables.
+-- #404: dim_match.season is slug now ('2425'), so season_slug is just a
+-- passthrough alias — kept so the cross-source bridge JOINs below read unchanged.
 unioned_with_slug AS (
     SELECT
         u.*,
-        LPAD(CAST(MOD(u.season,     100) AS varchar), 2, '0')
-            || LPAD(CAST(MOD(u.season + 1, 100) AS varchar), 2, '0') AS season_slug
+        u.season AS season_slug
     FROM unioned u
 )
 
@@ -365,8 +361,7 @@ LEFT JOIN iceberg.silver.sofascore_team_match ss
 
 -- ===== FotMob bridge (LEFT, #97) =====
 -- silver.fotmob_team_match.team_id is the team NAME → JOIN xref_team directly.
--- xref season is YEAR-START ('2025'); the fact season is SLUG ('2526') — JOIN each
--- on its own format (dual-format footgun, see CTE comment above).
+-- #404: xref season is slug now too, so the bridge JOINs are slug = slug.
 LEFT JOIN xref_team_fm xtf
     ON  xtf.canonical_id = u.team_id
     AND xtf.league       = u.league

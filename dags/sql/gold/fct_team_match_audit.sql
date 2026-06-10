@@ -83,8 +83,9 @@ fb_away AS (
 ),
 fb_team AS (
     SELECT *,
-        LPAD(CAST(MOD(season_year,     100) AS varchar), 2, '0')
-            || LPAD(CAST(MOD(season_year + 1, 100) AS varchar), 2, '0') AS season_slug
+        -- #404: silver.fbref_match_enriched.season is slug now → season_year is
+        -- already slug, so season_slug is the same value (no year-start build).
+        season_year AS season_slug
     FROM (
         SELECT * FROM fb_home
         UNION ALL

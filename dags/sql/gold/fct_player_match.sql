@@ -30,7 +30,7 @@
 --   * silver.xref_player.season              = varchar '2526'
 --   * silver.fbref_player_match_stats.season = bigint 2025
 --   * silver.{ss,us,ws}_player_match_aggregate.season = varchar slug
---   xref slug '2526' → bigint 2025: `2000 + CAST(SUBSTR(season, 1, 2) AS BIGINT)`.
+--   xref slug '2526' → bigint 2025: `season  /* #404: slug passthrough (was slug→year-start) */`.
 -- =============================================================================
 
 WITH
@@ -41,7 +41,7 @@ xref_fbref_player AS (
         source_id                                          AS fbref_player_id,
         league,
         season                                             AS season_slug,
-        2000 + CAST(SUBSTR(season, 1, 2) AS BIGINT)        AS season_year
+        season  /* #404: slug passthrough (was slug→year-start) */        AS season_year
     FROM iceberg.silver.xref_player
     WHERE source = 'fbref'
       AND confidence <> 'orphan'

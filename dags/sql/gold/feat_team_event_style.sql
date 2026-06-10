@@ -96,9 +96,8 @@
 --   match_id                  varchar    fct_team_match.match_id (FBref hex)
 --   team_id                   varchar    fct_team_match.team_id (canonical)
 --   date                      date       fct_team_match.date
---   season                    bigint     partition key (year-of-start, normalised
---                                        from compact 4-char form '2425' → 2024
---                                        to align with dim_match.season=bigint)
+--   season                    varchar    partition key (slug '2425', #404 — inherited
+--                                        from fct_team_match.season, now slug)
 --   league                    varchar    partition key
 --   pass_share_l5_avg         double
 --   dribble_share_l5_avg      double

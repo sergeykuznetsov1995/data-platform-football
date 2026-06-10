@@ -270,8 +270,8 @@ def _seed(duck_conn) -> None:
     duck_conn.execute(
         """
         INSERT INTO silver_xref_team VALUES
-          ('fbref',     'Liverpool',       'liverpool',       'ENG-Premier League', '2024'),
-          ('fbref',     'Arsenal',         'arsenal',         'ENG-Premier League', '2024'),
+          ('fbref',     'Liverpool',       'liverpool',       'ENG-Premier League', '2425'),
+          ('fbref',     'Arsenal',         'arsenal',         'ENG-Premier League', '2425'),
           ('whoscored', 'Manchester City', 'manchester_city', 'ENG-Premier League', '2425')
         """
     )
@@ -279,10 +279,10 @@ def _seed(duck_conn) -> None:
     duck_conn.execute(
         """
         INSERT INTO silver_xref_player VALUES
-          ('fbref',     'fb_in1',  'in1_canon',  'ENG-Premier League', '2024'),
-          ('fbref',     'fb_out1', 'out1_canon', 'ENG-Premier League', '2024'),
-          ('fbref',     'fb_in2',  'in2_canon',  'ENG-Premier League', '2024'),
-          ('fbref',     'fb_out2', 'out2_canon', 'ENG-Premier League', '2024'),
+          ('fbref',     'fb_in1',  'in1_canon',  'ENG-Premier League', '2425'),
+          ('fbref',     'fb_out1', 'out1_canon', 'ENG-Premier League', '2425'),
+          ('fbref',     'fb_in2',  'in2_canon',  'ENG-Premier League', '2425'),
+          ('fbref',     'fb_out2', 'out2_canon', 'ENG-Premier League', '2425'),
           ('whoscored', '6000',    'ws_in_canon',  'ENG-Premier League', '2425'),
           ('whoscored', '5000',    'ws_out_canon', 'ENG-Premier League', '2425')
         """

@@ -75,12 +75,12 @@ WITH aliases AS (
 
 raw_refs AS (
     SELECT 'fbref' AS source, referee AS source_id, league,
-           CAST(season AS varchar) AS season
+           LPAD(CAST(MOD(season, 100) AS varchar), 2, '0') || LPAD(CAST(MOD(season + 1, 100) AS varchar), 2, '0') AS season  -- year-start → slug '2425' (#404)
       FROM iceberg.bronze.fbref_schedule
      WHERE referee IS NOT NULL AND referee <> ''
     UNION
     SELECT 'matchhistory' AS source, referee AS source_id, league,
-           CAST(season AS varchar) AS season
+           LPAD(CAST(MOD(season, 100) AS varchar), 2, '0') || LPAD(CAST(MOD(season + 1, 100) AS varchar), 2, '0') AS season  -- year-start → slug '2425' (#404)
       FROM iceberg.bronze.matchhistory_results  -- #307: was matchhistory_games (referee col unchanged)
      WHERE referee IS NOT NULL AND referee <> ''
     UNION
@@ -89,7 +89,7 @@ raw_refs AS (
     -- zero YAML changes. Bronze keeps N ingest snapshots per match → dedup to the
     -- latest per (match_id, league, season) before pulling the name.
     SELECT 'fotmob' AS source, referee_name AS source_id, league,
-           CAST(season AS varchar) AS season
+           LPAD(CAST(MOD(season, 100) AS varchar), 2, '0') || LPAD(CAST(MOD(season + 1, 100) AS varchar), 2, '0') AS season  -- year-start → slug '2425' (#404)
       FROM (
           SELECT json_extract_scalar(match_facts_json, '$.infoBox.Referee.text')
                      AS referee_name,

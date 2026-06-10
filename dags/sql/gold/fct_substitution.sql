@@ -224,17 +224,17 @@ fb_subs AS (
         ON xt.source    = 'fbref'
        AND xt.source_id = fe.team
        AND xt.league    = fe.league
-       AND xt.season    = CAST(fe.season AS varchar)
+       AND xt.season    = format('%02d%02d', mod(fe.season, 100), mod(fe.season + 1, 100))  -- #404: year-start → slug
     LEFT JOIN iceberg.silver.xref_player xp_in
         ON xp_in.source    = 'fbref'
        AND xp_in.source_id = fe.player_id              -- coming ON
        AND xp_in.league    = fe.league
-       AND xp_in.season    = CAST(fe.season AS varchar)
+       AND xp_in.season    = format('%02d%02d', mod(fe.season, 100), mod(fe.season + 1, 100))  -- #404: year-start → slug
     LEFT JOIN iceberg.silver.xref_player xp_out
         ON xp_out.source    = 'fbref'
        AND xp_out.source_id = fe.secondary_player_id   -- going OFF
        AND xp_out.league    = fe.league
-       AND xp_out.season    = CAST(fe.season AS varchar)
+       AND xp_out.season    = format('%02d%02d', mod(fe.season, 100), mod(fe.season + 1, 100))  -- #404: year-start → slug
     WHERE fe.rn = 1
 ),
 
@@ -358,15 +358,8 @@ typed AS (
         s.minute,
         s.source            AS substitution_source,
         s.league,
-        COALESCE(
-            CASE
-                WHEN length(s.season) = 4
-                 AND TRY_CAST(s.season AS bigint) BETWEEN 2000 AND 2100
-                    THEN TRY_CAST(s.season AS bigint)
-                ELSE 2000 + TRY_CAST(substr(s.season, 1, 2) AS bigint)
-            END,
-            TRY_CAST(s.season AS bigint)
-        )                   AS season,
+        -- #404: both branches emit slug ('2425') now → pass through unchanged.
+        s.season            AS season,
         s._ingested_at
     FROM match_substitutions s
 )

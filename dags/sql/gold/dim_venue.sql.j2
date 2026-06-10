@@ -38,8 +38,8 @@
 --   * Normalisation key (NFD + strip diacritics + remove non-alphanumerics)
 --     folds apostrophe/period variants ("St James' Park" / "St. James' Park")
 --     automatically, so the curator only lists genuinely distinct spellings.
---   * ESPN season comes as 4-char encoded label ('2526') -> normalized to
---     BIGINT 2025 to align with silver/FBref season type.
+--   * ESPN season is a 4-char slug label ('2526'); kept as-is to align with
+--     silver/FBref season, now also slug varchar after #404.
 -- =============================================================================
 
 with aliases as (
@@ -79,7 +79,7 @@ espn_dedup as (
     select
         trim(venue)                                  as venue_raw,
         league,
-        try_cast(substr(season, 1, 2) as bigint) + 2000  as season,
+        season,  -- ESPN bronze is already slug '2526' → keep (FBref also slug, #404)
         try_cast(substr(game, 1, 10) as date)        as match_date,
         'espn'                                       as src,
         row_number() over (

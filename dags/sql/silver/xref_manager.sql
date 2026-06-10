@@ -100,7 +100,9 @@ SELECT
     manager_name                                                AS source_id,
     manager_name                                                AS display_name,
     league,
-    CAST(season AS varchar)                                     AS season,
+    -- season → slug ('2425'); bronze fbref_match_managers is year-start bigint (#404).
+    LPAD(CAST(MOD(season, 100) AS varchar), 2, '0')
+        || LPAD(CAST(MOD(season + 1, 100) AS varchar), 2, '0')  AS season,
     'name_normalize'                                            AS confidence,
     CAST(NULL AS double)                                        AS match_score
 FROM iceberg.bronze.fbref_match_managers
@@ -120,7 +122,9 @@ SELECT
     CAST(d.player_id AS varchar)                                AS source_id,
     d.name                                                      AS display_name,
     d.league,
-    CAST(d.season AS varchar)                                   AS season,
+    -- season → slug ('2425'); bronze fotmob_player_details is year-start bigint (#404).
+    LPAD(CAST(MOD(d.season, 100) AS varchar), 2, '0')
+        || LPAD(CAST(MOD(d.season + 1, 100) AS varchar), 2, '0')  AS season,
     -- 'name_normalize' when this coach glues to an FBref canonical in the same
     -- league; 'orphan' otherwise (surfaced by the Phase 2 orphan-rate report).
     CASE WHEN fc.canonical_id IS NOT NULL

@@ -486,4 +486,4 @@ class TestEmptyFallbackSchemaParity:
         assert types.get("match_id") == "varchar"
         assert types.get("date") == "date"
         assert types.get("league") == "varchar"
-        assert types.get("season") == "bigint"
+        assert types.get("season") == "varchar"  # #404: slug, matches dim_match

@@ -92,18 +92,16 @@ class TestDimMatchCutoverStructure:
         )
 
     def test_each_join_casts_season_to_varchar(self):
-        """silver.xref_team.season is varchar; m.season is bigint —
-        each JOIN must CAST(m.season AS varchar) to avoid an implicit
-        cast trap."""
+        """#404: both fbref_match_enriched.season and xref_team.season are slug
+        varchar — each JOIN is a direct `season = m.season` equality, no CAST."""
         sql = _read_sql()
-        season_casts = re.findall(
-            r"CAST\s*\(\s*m\.season\s+AS\s+varchar\s*\)",
-            sql, re.IGNORECASE,
+        direct = re.findall(r"\.season\s*=\s*m\.season", sql, re.IGNORECASE)
+        assert len(direct) >= 2, (
+            "dim_match.sql must JOIN on `*.season = m.season` in BOTH home and "
+            f"away joins; found {len(direct)}"
         )
-        assert len(season_casts) >= 2, (
-            "dim_match.sql must CAST(m.season AS varchar) in BOTH "
-            "home and away joins (silver.xref_team.season is varchar); "
-            f"found {len(season_casts)}"
+        assert "CAST(m.season AS varchar)" not in sql, (
+            "#404: season is slug now — CAST(m.season AS varchar) must be gone"
         )
 
     def test_home_and_away_canonical_id_selected(self):

@@ -22,7 +22,7 @@ xref_fbref AS (
         source_id                                         AS fbref_player_id,
         league,
         season                                            AS season_slug,  -- varchar '2526' (для WS JOIN)
-        2000 + CAST(SUBSTR(season, 1, 2) AS BIGINT)      AS season_year
+        season  /* #404: slug passthrough (was slug→year-start) */      AS season_year
     FROM iceberg.silver.xref_player
     WHERE source = 'fbref'
       AND confidence <> 'orphan'
@@ -33,7 +33,7 @@ xref_fotmob AS (
         canonical_id,
         source_id                                         AS fotmob_player_id,
         league,
-        2000 + CAST(SUBSTR(season, 1, 2) AS BIGINT)      AS season_year
+        season  /* #404: slug passthrough (was slug→year-start) */      AS season_year
     FROM iceberg.silver.xref_player
     WHERE source = 'fotmob'
       AND confidence <> 'orphan'

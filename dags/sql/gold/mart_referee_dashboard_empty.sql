@@ -7,7 +7,7 @@
 SELECT
     CAST(NULL AS varchar) AS referee_id,
     CAST(NULL AS varchar) AS referee_name,
-    CAST(NULL AS bigint)  AS season,
+    CAST(NULL AS varchar) AS season,  -- #404: slug, matches populated sibling
     CAST(NULL AS varchar) AS league,
     CAST(NULL AS bigint)  AS matches_officiated,
     CAST(NULL AS double)  AS cards_per_match,

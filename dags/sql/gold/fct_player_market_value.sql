@@ -24,7 +24,7 @@
 -- Season type mapping:
 --   * silver.fotmob_player_market_value_history.season = bigint 2025
 --   * silver.xref_player.season                       = varchar '2526'
---   xref slug '2526' → bigint 2025: `2000 + CAST(SUBSTR(season, 1, 2) AS BIGINT)`.
+--   xref slug '2526' → bigint 2025: `season  /* #404: slug passthrough (was slug→year-start) */`.
 --
 -- TM extension followup: silver.transfermarkt_market_value_history уже
 -- содержит canonical_id и параллельный timeline; UNION ALL добавление
@@ -37,7 +37,7 @@ WITH xref_fotmob AS (
         canonical_id,
         source_id                                         AS fotmob_player_id,
         league,
-        2000 + CAST(SUBSTR(season, 1, 2) AS BIGINT)      AS season_year
+        season  /* #404: slug passthrough (was slug→year-start) */      AS season_year
     FROM iceberg.silver.xref_player
     WHERE source = 'fotmob'
       AND confidence <> 'orphan'

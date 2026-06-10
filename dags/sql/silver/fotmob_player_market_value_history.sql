@@ -44,8 +44,10 @@ SELECT
     TRY_CAST(json_extract_scalar(v, '$.value')    AS BIGINT)          AS market_value_eur,
     json_extract_scalar(v, '$.currency')                              AS currency,
     d._ingested_at                                                    AS _bronze_ingested_at,
+    -- season → slug ('2425'); FotMob bronze stores year-start bigint (2024).
     d.league,
-    d.season
+    LPAD(CAST(MOD(d.season,     100) AS varchar), 2, '0')
+        || LPAD(CAST(MOD(d.season + 1, 100) AS varchar), 2, '0') AS season
 
 FROM details_dedup d
 CROSS JOIN UNNEST(

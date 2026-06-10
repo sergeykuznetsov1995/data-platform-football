@@ -41,7 +41,9 @@ WITH details_dedup AS (
 SELECT
     match_id,
     league,
-    season,
+    -- season → slug ('2425'); FotMob bronze stores year-start bigint (2024).
+    LPAD(CAST(MOD(season,     100) AS varchar), 2, '0')
+        || LPAD(CAST(MOD(season + 1, 100) AS varchar), 2, '0') AS season,
     json_extract_scalar(match_facts_json, '$.infoBox.Referee.text')       AS referee_name,
     json_extract_scalar(match_facts_json, '$.infoBox.Referee.country')     AS referee_country,
     json_extract_scalar(match_facts_json, '$.infoBox.Referee.countryCode') AS referee_country_code,

@@ -32,16 +32,15 @@
 --   * position is derived (ROW_NUMBER) — SofaScore exposes it implicitly via
 --     order in the league-table feed but does not store the rank column.
 --   * points_per_game uses NULLIF(mp, 0) to guard against zero-game teams.
---   * SofaScore 'season' is encoded as 4-char label ('2526') -> normalized to
---     BIGINT 2025 to align with silver/FBref season type. The raw '2526' slug
---     is retained as season_slug for the silver.xref_team JOIN (which keys on
---     varchar season).
+--   * SofaScore 'season' is a 4-char slug ('2526'); emitted as-is after #404
+--     (silver/FBref season is now slug too). season_slug stays as the explicit
+--     alias for the silver.xref_team JOIN (which keys on varchar slug season).
 -- =============================================================================
 
 with standings_raw as (
     select
         league,
-        try_cast(substr(season, 1, 2) as bigint) + 2000  as season,
+        season,  -- SofaScore bronze already slug '2526' (#404; was cast to bigint)
         season                                            as season_slug,
         team                                              as team_name_raw,
         cast(mp as integer)                               as mp,

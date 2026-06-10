@@ -66,11 +66,10 @@ xref_fbref AS (
         canonical_id,
         source_id                                         AS fbref_team_name,
         league,
-        CAST(season AS BIGINT)                            AS season_year,
-        -- Build slug '2526' from year-start '2025' for cross-source JOIN
-        LPAD(CAST(MOD(CAST(season AS BIGINT),     100) AS varchar), 2, '0')
-        || LPAD(CAST(MOD(CAST(season AS BIGINT)+1, 100) AS varchar), 2, '0')
-                                                          AS season_slug
+        -- #404: silver.xref_team.season is slug now → season_year & season_slug
+        -- are both the same slug ('2425'); the legacy year-start build is gone.
+        season                                            AS season_year,
+        season                                            AS season_slug
     FROM iceberg.silver.xref_team
     WHERE source = 'fbref'
       AND confidence <> 'orphan'

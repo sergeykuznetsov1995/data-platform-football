@@ -66,7 +66,7 @@
 --   source                 varchar          -- 'matchhistory'
 --   source_version         varchar          -- 'v1'
 --   league                 varchar          -- partition key
---   season                 bigint           -- partition key
+--   season                 varchar          -- partition key (slug '2425', #404)
 --   _ingested_at           timestamp(6)     -- bronze lineage passthrough
 --
 -- Logical PK: (match_id_canonical, bookmaker_code, market, closing_flag)
@@ -211,7 +211,11 @@ mh AS (
         home_team                      AS hometeam,
         away_team                      AS awayteam,
         league,
-        season,
+        -- season → slug ('2425'); matchhistory bronze stores year-start bigint.
+        -- Converted here so the gold.dim_match bridge JOIN (slug after #404) and
+        -- the final projection are both slug.
+        LPAD(CAST(MOD(season,     100) AS varchar), 2, '0')
+            || LPAD(CAST(MOD(season + 1, 100) AS varchar), 2, '0') AS season,
         _ingested_at,
 
         -- ---- 1x2 open (B365/BW/PS/WH/VC renamed via COLUMN_MAPPING; IW raw) ----

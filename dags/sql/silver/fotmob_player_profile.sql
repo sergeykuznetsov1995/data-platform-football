@@ -155,8 +155,10 @@ SELECT
     )                                                AS _bronze_ingested_at,
 
     -- ========= Partition Keys =========
+    -- season → slug ('2425'); FotMob bronze stores year-start bigint (2024).
     d.league,
-    d.season
+    LPAD(CAST(MOD(d.season,     100) AS varchar), 2, '0')
+        || LPAD(CAST(MOD(d.season + 1, 100) AS varchar), 2, '0') AS season
 
 FROM details_dedup d
 LEFT JOIN squad_dedup s

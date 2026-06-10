@@ -22,9 +22,7 @@
 --   date              date              (dim_match.date is date)
 --   league            varchar
 --   ref_*_per_match_l10 / ref_home_win_rate_l10  double
---   season            bigint            (dim_match.season is bigint year-of-start
---                                        in materialised Iceberg, e.g. 2024 for
---                                        the 2024-25 season)
+--   season            varchar           (dim_match.season is slug '2425' after #404)
 -- =============================================================================
 
 SELECT
@@ -38,5 +36,5 @@ SELECT
     CAST(NULL AS double)   AS ref_goals_per_match_l10,
     CAST(NULL AS double)   AS ref_home_win_rate_l10,
     CAST(NULL AS double)   AS ref_pen_per_match_l10,
-    CAST(NULL AS bigint)   AS season
+    CAST(NULL AS varchar)  AS season  -- #404: slug, matches populated sibling
 WHERE 1 = 0

@@ -105,17 +105,13 @@ class TestFctPlayerMatchSql:
         )
 
     def test_season_slug_to_year_idiom(self):
-        """xref slug '2526' → bigint 2025 идиомой
-        `2000 + CAST(SUBSTR(season, 1, 2) AS BIGINT)`. Нужно ИМЕННО
-        для FBref-bigint-spine: fbref_player_match_stats.season — bigint."""
+        """#404: season is slug end-to-end — the slug→year-start SUBSTR idiom is
+        gone; the xref CTE passes season through and JOINs are slug = slug."""
         sql = _read_sql()
-        assert re.search(
-            r"2000\s*\+\s*CAST\s*\(\s*SUBSTR\s*\(\s*season\s*,\s*1\s*,\s*2\s*\)",
+        assert not re.search(
+            r"2000\s*\+\s*CAST\s*\(\s*SUBSTR\s*\(\s*season",
             sql, re.IGNORECASE,
-        ), (
-            "fct_player_match.sql must convert xref season slug ('2526') "
-            "to bigint year (2025) using SUBSTR idiom for FBref-spine JOIN"
-        )
+        ), "fct_player_match.sql must NOT convert season slug→year-start (#404)"
 
     def test_grain_columns_present(self):
         """PK match-grain: (match_id_canonical, player_id_canonical).

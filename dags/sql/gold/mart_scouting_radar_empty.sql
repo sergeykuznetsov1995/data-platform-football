@@ -29,5 +29,5 @@ SELECT
     CAST(NULL AS double)  AS shots_l5,
     CAST(NULL AS double)  AS defensive_l5,
     CAST(NULL AS varchar) AS league,
-    CAST(NULL AS bigint)  AS season
+    CAST(NULL AS varchar) AS season  -- #404: slug, matches populated sibling
 WHERE 1 = 0
