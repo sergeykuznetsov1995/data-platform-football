@@ -21,19 +21,3 @@ columns:
     description: Лига сезона.
   - name: season
     description: Сезон; команда может присутствовать в нескольких сезонах.
-relationships:
-  - from: team_id
-    to: trino_iceberg.iceberg.gold.fct_match.home_team_id
-    type: FOREIGN_KEY
-  - from: team_id
-    to: trino_iceberg.iceberg.gold.fct_match.away_team_id
-    type: FOREIGN_KEY
-  - from: team_id
-    to: trino_iceberg.iceberg.gold.fct_team_match.team_id
-    type: FOREIGN_KEY
-  - from: team_id
-    to: trino_iceberg.iceberg.gold.feat_team_form.team_id
-    type: FOREIGN_KEY
-  - from: team_id
-    to: trino_iceberg.iceberg.gold.feat_team_h2h.team_id
-    type: FOREIGN_KEY
