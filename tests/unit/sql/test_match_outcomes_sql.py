@@ -82,15 +82,16 @@ class TestMatchOutcomesCutoverStructure:
         )
 
     def test_each_join_casts_season_to_varchar(self):
-        """Both joins must CAST(m.season AS varchar)."""
+        """#404: season is slug varchar on both sides — each JOIN is a direct
+        `season = m.season` equality, no CAST."""
         sql = _read_sql()
-        season_casts = re.findall(
-            r"CAST\s*\(\s*m\.season\s+AS\s+varchar\s*\)",
-            sql, re.IGNORECASE,
+        direct = re.findall(r"\.season\s*=\s*m\.season", sql, re.IGNORECASE)
+        assert len(direct) >= 2, (
+            "match_outcomes.sql must JOIN on `*.season = m.season` in BOTH "
+            f"home and away joins; found {len(direct)}"
         )
-        assert len(season_casts) >= 2, (
-            "match_outcomes.sql must CAST(m.season AS varchar) in BOTH "
-            f"home and away joins; found {len(season_casts)}"
+        assert "CAST(m.season AS varchar)" not in sql, (
+            "#404: season is slug now — CAST(m.season AS varchar) must be gone"
         )
 
     def test_home_and_away_canonical_id_selected(self):

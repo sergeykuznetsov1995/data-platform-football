@@ -156,12 +156,12 @@ class TestXrefManagerStructure:
         ), "match_score must be CAST(NULL AS double) for xref_manager"
 
     def test_season_cast_to_varchar(self):
-        """Bronze stores season as BIGINT — cast to varchar to match union."""
+        """#404: bronze season is year-start bigint → converted to a slug varchar
+        ('2425') via LPAD(MOD(...)), matching every other xref table."""
         sql = _read_sql()
-        assert (
-            "CAST(season AS varchar)" in sql
-            or "CAST(season as varchar)" in sql
-        ), "expected CAST(season AS varchar) for unified Silver schema"
+        assert "LPAD(CAST(MOD(season" in sql or "LPAD(CAST(MOD(d.season" in sql, (
+            "xref_manager.sql must build a slug season via LPAD(MOD(...)) (#404)"
+        )
 
     def test_pure_select_no_create_table(self):
         """File stays a pure SELECT — silver_tasks wraps in CTAS."""

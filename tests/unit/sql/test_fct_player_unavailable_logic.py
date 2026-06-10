@@ -152,7 +152,7 @@ def _create_gold_dims(con: duckdb.DuckDBPyConnection) -> None:
             home_team_name VARCHAR,
             away_team_name VARCHAR,
             league VARCHAR,
-            season INTEGER
+            season VARCHAR
         )
         """
     )
@@ -161,7 +161,7 @@ def _create_gold_dims(con: duckdb.DuckDBPyConnection) -> None:
         CREATE TABLE iceberg.gold.dim_team (
             team_id VARCHAR,
             league VARCHAR,
-            season INTEGER
+            season VARCHAR
         )
         """
     )
@@ -170,7 +170,7 @@ def _create_gold_dims(con: duckdb.DuckDBPyConnection) -> None:
         CREATE TABLE iceberg.gold.dim_player (
             player_id VARCHAR,
             player_name VARCHAR,
-            season INTEGER
+            season VARCHAR
         )
         """
     )
@@ -194,7 +194,7 @@ def _create_fct_team_match(con: duckdb.DuckDBPyConnection) -> None:
             points INTEGER,
             result VARCHAR,
             league VARCHAR,
-            season INTEGER
+            season VARCHAR
         )
         """
     )
@@ -215,7 +215,7 @@ def _create_fct_player_unavailable(con: duckdb.DuckDBPyConnection) -> None:
             reason VARCHAR,
             _silver_ingested_at TIMESTAMP,
             league VARCHAR,
-            season INTEGER
+            season VARCHAR
         )
         """
     )
@@ -396,16 +396,16 @@ class TestGoldFctPlayerUnavailable:
             """
             INSERT INTO iceberg.gold.dim_match VALUES
             ('FBRMATCHX', DATE '2025-01-15','arsenal','liverpool',
-             'Arsenal','Liverpool','ENG-PL', 2024)
+             'Arsenal','Liverpool','ENG-PL', '2425')
             """
         )
         con.execute(
-            "INSERT INTO iceberg.gold.dim_team VALUES ('arsenal','ENG-PL', 2024)"
+            "INSERT INTO iceberg.gold.dim_team VALUES ('arsenal','ENG-PL', '2425')"
         )
         # dim_player has DIFFERENT name -> no match
         con.execute(
             "INSERT INTO iceberg.gold.dim_player VALUES "
-            "('fbref_pid_001','Mohamed Salah', 2024)"
+            "('fbref_pid_001','Mohamed Salah', '2425')"
         )
 
         rows = self._run_gold(con)
@@ -428,11 +428,11 @@ class TestGoldFctPlayerUnavailable:
             """
             INSERT INTO iceberg.gold.dim_match VALUES
             ('FBR_MATCH_ABC123', DATE '2025-01-15','arsenal','liverpool',
-             'Arsenal','Liverpool','ENG-PL', 2024)
+             'Arsenal','Liverpool','ENG-PL', '2425')
             """
         )
         con.execute(
-            "INSERT INTO iceberg.gold.dim_team VALUES ('arsenal','ENG-PL', 2024)"
+            "INSERT INTO iceberg.gold.dim_team VALUES ('arsenal','ENG-PL', '2425')"
         )
 
         rows = self._run_gold(con)
@@ -462,11 +462,11 @@ class TestGoldFctPlayerUnavailable:
             """
             INSERT INTO iceberg.gold.dim_match VALUES
             ('FBR_BAYERN_1', DATE '2025-01-15','bayern_munchen','dortmund',
-             'Bayern München','Dortmund','ENG-PL', 2024)
+             'Bayern München','Dortmund','ENG-PL', '2425')
             """
         )
         con.execute(
-            "INSERT INTO iceberg.gold.dim_team VALUES ('bayern_munchen','ENG-PL', 2024)"
+            "INSERT INTO iceberg.gold.dim_team VALUES ('bayern_munchen','ENG-PL', '2425')"
         )
 
         rows = self._run_gold(con)
@@ -492,11 +492,11 @@ class TestGoldFctPlayerUnavailable:
             """
             INSERT INTO iceberg.gold.dim_match VALUES
             ('FBR_X', DATE '2025-02-01','arsenal','liverpool',
-             'Arsenal','Liverpool','ENG-PL', 2024)
+             'Arsenal','Liverpool','ENG-PL', '2425')
             """
         )
         con.execute(
-            "INSERT INTO iceberg.gold.dim_team VALUES ('arsenal','ENG-PL', 2024)"
+            "INSERT INTO iceberg.gold.dim_team VALUES ('arsenal','ENG-PL', '2425')"
         )
 
         rows = self._run_gold(con)
@@ -525,7 +525,7 @@ class TestFeatTeamFormUnavailableL5:
             d = f"2025-01-{i:02d}"
             rows.append(
                 f"('{mid}','arsenal','x{i}', DATE '{d}', {i}, TRUE, "
-                f"2, 1, 10, 5, 60.0, 3, 'W', 'ENG-PL', 2024)"
+                f"2, 1, 10, 5, 60.0, 3, 'W', 'ENG-PL', '2425')"
             )
         con.execute(
             "INSERT INTO iceberg.gold.fct_team_match VALUES " + ", ".join(rows)
@@ -548,7 +548,7 @@ class TestFeatTeamFormUnavailableL5:
                 unavail_rows.append(
                     f"('m{i:02d}', DATE '2025-01-{i:02d}', 'arsenal','Arsenal',"
                     f"'{pid}','wsid_{pid}','Player {pid}','Injury',"
-                    f" TIMESTAMP '2025-01-01 00:00:00','ENG-PL', 2024)"
+                    f" TIMESTAMP '2025-01-01 00:00:00','ENG-PL', '2425')"
                 )
         con.execute(
             "INSERT INTO iceberg.gold.fct_player_unavailable VALUES "

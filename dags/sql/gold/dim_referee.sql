@@ -49,7 +49,7 @@ aggregated as (
         min(match_date)                                                        as first_seen_date,
         max(match_date)                                                        as last_seen_date,
         array_agg(distinct league)                                             as leagues,
-        array_agg(distinct cast(season as integer))                            as seasons
+        array_agg(distinct season)                                             as seasons  -- slug '2425' after #404 (was cast-to-int year-start)
     from referees_raw
     -- Fold diacritics in the dedup key so it matches the hash input above —
     -- otherwise "Çakır"/"Cakir" form two groups sharing one referee_id (PK dup).

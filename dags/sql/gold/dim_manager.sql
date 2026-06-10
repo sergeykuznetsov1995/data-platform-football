@@ -49,7 +49,9 @@ WITH manager_match_log AS (
         m.team                                            AS raw_team,
         m.manager_name                                    AS raw_manager_name,
         m.league,
-        m.season,
+        -- season → slug ('2425'); bronze fbref_match_managers is year-start bigint (#404).
+        LPAD(CAST(MOD(m.season, 100) AS varchar), 2, '0')
+            || LPAD(CAST(MOD(m.season + 1, 100) AS varchar), 2, '0')  AS season,
         s.date                                            AS match_date,
         CASE m.side WHEN 'home' THEN s.home ELSE s.away END  AS schedule_team,
         xm.canonical_id                                   AS manager_canonical_id,
@@ -67,7 +69,8 @@ WITH manager_match_log AS (
         ON  xm.source     = 'fbref'
         AND xm.source_id  = m.manager_name
         AND xm.league     = m.league
-        AND xm.season     = CAST(m.season AS varchar)
+        AND xm.season     = LPAD(CAST(MOD(m.season, 100) AS varchar), 2, '0')
+                            || LPAD(CAST(MOD(m.season + 1, 100) AS varchar), 2, '0')
     WHERE m.manager_name IS NOT NULL
       AND m.manager_name <> ''
 ),
@@ -81,7 +84,7 @@ manager_match_log_resolved AS (
         ON  xt.source     = 'fbref'
         AND xt.source_id  = mml.schedule_team
         AND xt.league     = mml.league
-        AND xt.season     = CAST(mml.season AS varchar)
+        AND xt.season     = mml.season
 ),
 
 -- bronze.fbref_match_managers carries ×2-×5 duplicate scorebox rows per match
@@ -149,7 +152,7 @@ stint_boundaries AS (
         stint_id,
         MIN(match_date)                                   AS valid_from,
         MIN(league)                                       AS league,
-        CAST(MIN(season) AS varchar)                      AS season
+        MIN(season)                                       AS season
     FROM stints_grouped
     GROUP BY manager_canonical_id, team_canonical_id, stint_id
 ),

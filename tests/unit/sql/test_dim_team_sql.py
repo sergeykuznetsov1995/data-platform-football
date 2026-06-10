@@ -103,16 +103,11 @@ class TestDimTeamCutoverStructure:
             )
 
     def test_season_cast_to_bigint(self):
-        """silver.xref_team.season is varchar — dim_team must CAST back to
-        bigint to preserve the legacy dim_team.season=bigint contract."""
+        """#404: season is unified onto slug — dim_team emits xref_team.season
+        (varchar slug) directly, with NO CAST back to bigint."""
         sql = _read_sql()
-        assert (
-            "CAST(season AS bigint)" in sql
-            or "CAST(season as bigint)" in sql
-            or "CAST(season AS BIGINT)" in sql
-        ), (
-            "dim_team.sql must CAST(season AS bigint) — silver.xref_team "
-            "stores season as varchar"
+        assert "cast(season as bigint)" not in sql.lower(), (
+            "#404: dim_team.sql must emit slug season directly — no CAST to bigint"
         )
 
     def test_migration_breadcrumb_in_header(self):

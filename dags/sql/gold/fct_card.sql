@@ -185,12 +185,12 @@ fb_cards AS (
         ON xt.source    = 'fbref'
        AND xt.source_id = fe.team
        AND xt.league    = fe.league
-       AND xt.season    = CAST(fe.season AS varchar)
+       AND xt.season    = format('%02d%02d', mod(fe.season, 100), mod(fe.season + 1, 100))  -- #404: year-start → slug
     LEFT JOIN iceberg.silver.xref_player xp
         ON xp.source    = 'fbref'
        AND xp.source_id = fe.player_id
        AND xp.league    = fe.league
-       AND xp.season    = CAST(fe.season AS varchar)
+       AND xp.season    = format('%02d%02d', mod(fe.season, 100), mod(fe.season + 1, 100))  -- #404: year-start → slug
     WHERE fe.rn = 1
 ),
 
@@ -301,18 +301,8 @@ typed AS (
         s.card_type,
         s.source            AS card_source,
         s.league,
-        -- Compact 'YYYY' → bigint year-of-start. Cards only emit the compact
-        -- form, but the COALESCE branch keeps the path tolerant of a legacy
-        -- '2021'-style row that may sneak in during backfills.
-        COALESCE(
-            CASE
-                WHEN length(s.season) = 4
-                 AND TRY_CAST(s.season AS bigint) BETWEEN 2000 AND 2100
-                    THEN TRY_CAST(s.season AS bigint)
-                ELSE 2000 + TRY_CAST(substr(s.season, 1, 2) AS bigint)
-            END,
-            TRY_CAST(s.season AS bigint)
-        )                   AS season,
+        -- #404: both branches emit slug ('2425') now → pass through unchanged.
+        s.season            AS season,
         s._ingested_at
     FROM match_cards s
 )

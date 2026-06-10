@@ -325,8 +325,9 @@ class TestDimStandingsLogic:
         assert mci["points"] == 31
 
     def test_season_normalised_to_bigint(self, gold_rows):
-        """Bronze season '2425' → BIGINT 2024 (substr(1,2)+2000)."""
+        """#404: SofaScore bronze season slug '2425' is emitted as-is (varchar),
+        no longer normalised to bigint year-start."""
         for r in gold_rows:
-            assert r["season"] == 2024, (
-                f"season must be 2024 (from '2425'), got {r['season']!r}"
+            assert r["season"] == "2425", (
+                f"season must be slug '2425', got {r['season']!r}"
             )

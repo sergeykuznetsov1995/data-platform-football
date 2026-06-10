@@ -130,8 +130,11 @@ SELECT
     s._ingested_at                                  AS _bronze_ingested_at,
 
     -- ========= Partition Keys =========
+    -- season → slug ('2425'); FBref bronze stores year-start bigint (2024).
+    -- JOINs above stay on the native year-start (all intra-FBref), convert once here.
     s.league,
-    s.season
+    LPAD(CAST(MOD(s.season,     100) AS varchar), 2, '0')
+        || LPAD(CAST(MOD(s.season + 1, 100) AS varchar), 2, '0') AS season
 
 FROM s
 LEFT JOIN k

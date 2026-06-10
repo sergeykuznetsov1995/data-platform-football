@@ -58,13 +58,15 @@ def _s2(findings):
 
 class TestS2SeasonYearStartAllowlist:
     def test_year_start_table_with_bigint_season_is_warn(self):
+        # #404: the SEASON_YEAR_START_OK allowlist is retired — a bigint season
+        # is now a hard ERROR for EVERY Silver table (formerly-allowlisted ones too).
         cols = [('_silver_created_at', 'timestamp(6) with time zone'),
                 ('league', 'varchar'), ('season', 'bigint')]
         findings = mod.audit_schema(_FakeCursor(cols), 'fbref_player_match_stats')
         s2 = _s2(findings)
         assert len(s2) == 1
-        assert s2[0]['sev'] == 'WARN'
-        assert 'sanctioned year-start' in s2[0]['detail']
+        assert s2[0]['sev'] == 'ERROR'
+        assert 'expected varchar slug' in s2[0]['detail']
 
     def test_non_allowlisted_table_with_bigint_season_is_error(self):
         cols = [('_silver_created_at', 'timestamp(6) with time zone'),

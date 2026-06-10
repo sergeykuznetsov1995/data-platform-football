@@ -245,7 +245,7 @@ sched_bridge AS (
     LEFT JOIN iceberg.gold.dim_match dm
         ON  dm.date         = CAST(sched.date AS DATE)
         AND dm.league       = sched.league
-        AND dm.season       = TRY_CAST(sched.season AS bigint)
+        AND dm.season       = sched.season  -- #404: both slug ('2526'); was TRY_CAST→bigint (never matched vs year-start)
         AND dm.home_team_id = ha.canonical_id
         AND dm.away_team_id = aa.canonical_id
     WHERE sched.game_id IS NOT NULL

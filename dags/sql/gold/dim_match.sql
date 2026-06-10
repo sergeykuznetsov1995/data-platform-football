@@ -8,7 +8,8 @@
 -- Partitioning: (league, season)
 --
 -- Migrated from gold.entity_xref to silver.xref_team in E1.5 (2026-05-09 prep).
--- silver.xref_team.season is varchar — we CAST m.season (bigint) per JOIN.
+-- Both silver.fbref_match_enriched.season and silver.xref_team.season are slug
+-- varchar ('2425') after #404 — the JOIN is a direct season = season equality.
 -- The (league, season) predicate prevents the 1.5-4x JOIN fan-out documented
 -- in feedback_xref_join_season_predicate.md (silver.xref_team rows are
 -- per-(source, source_id, league, season)).
@@ -43,9 +44,9 @@ LEFT JOIN iceberg.silver.xref_team home_x
     ON home_x.source    = 'fbref'
    AND home_x.source_id = m.home
    AND home_x.league    = m.league
-   AND home_x.season    = CAST(m.season AS varchar)
+   AND home_x.season    = m.season
 LEFT JOIN iceberg.silver.xref_team away_x
     ON away_x.source    = 'fbref'
    AND away_x.source_id = m.away
    AND away_x.league    = m.league
-   AND away_x.season    = CAST(m.season AS varchar)
+   AND away_x.season    = m.season

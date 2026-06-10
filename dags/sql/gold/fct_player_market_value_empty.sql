@@ -13,5 +13,5 @@ SELECT
     CAST(NULL AS varchar)   AS currency,
     CAST(NULL AS timestamp(6) with time zone) AS _bronze_ingested_at,
     CAST(NULL AS varchar)   AS league,
-    CAST(NULL AS bigint)    AS season
+    CAST(NULL AS varchar)   AS season  -- #404: slug, matches populated sibling
 WHERE 1 = 0

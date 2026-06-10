@@ -145,7 +145,7 @@ def _bootstrap(con) -> None:
         canonical = name.lower().replace(" ", "_")
         con.execute(
             "INSERT INTO silver.xref_manager VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (canonical, "fbref", name, name, league, str(season), "name_normalize"),
+            (canonical, "fbref", name, name, league, f"{season % 100:02d}{(season + 1) % 100:02d}", "name_normalize"),
         )
 
     # Same shape for xref_team — slugged canonical_id per season.
@@ -159,7 +159,7 @@ def _bootstrap(con) -> None:
         canonical = team.lower()
         con.execute(
             "INSERT INTO silver.xref_team VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (canonical, "fbref", team, team, league, str(season), "name_alias"),
+            (canonical, "fbref", team, team, league, f"{season % 100:02d}{(season + 1) % 100:02d}", "name_alias"),
         )
 
 
@@ -235,7 +235,7 @@ class TestDimManagerSCD2:
         klopp = liv[0]
         assert klopp["manager_id_canonical"] == "jurgen_klopp"
         # season = season of the FIRST match in the stint
-        assert klopp["season"] == "2018"
+        assert klopp["season"] == "1819"  # #404: slug of first stint season (2018)
         assert klopp["valid_from"] == date(2018, 8, 12)
         assert klopp["valid_to"] is None
         assert klopp["is_current"] is True

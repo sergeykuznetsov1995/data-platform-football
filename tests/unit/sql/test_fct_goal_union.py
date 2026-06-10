@@ -112,6 +112,10 @@ def _translate_trino_to_duckdb(sql: str) -> str:
     sql = re.sub(r"\bxxhash64\b", "md5", sql, flags=re.IGNORECASE)
 
     sql = sql.replace("timestamp(6)", "timestamp")
+    # #404: the own_goal branch now emits/joins season via Trino
+    # format('%02d%02d', …); DuckDB's format() uses {} placeholders, so map it to
+    # printf() which honours the %02d specifiers (same idiom as test_fct_card_union).
+    sql = re.sub(r"\bformat\s*\(", "printf(", sql, flags=re.IGNORECASE)
     return sql
 
 
@@ -275,17 +279,17 @@ class TestUnionAndOwnGoalSplit:
         duck_conn.execute(
             """
             INSERT INTO silver_xref_team VALUES
-              ('fbref', 'Liverpool', 'liverpool', 'ENG-Premier League', '2024'),
+              ('fbref', 'Liverpool', 'liverpool', 'ENG-Premier League', '2425'),
               ('fbref', 'Wolverhampton Wanderers', 'wolves',
-               'ENG-Premier League', '2024')
+               'ENG-Premier League', '2425')
             """
         )
         # ---- xref_player for own_goal scorer canonical ----
         duck_conn.execute(
             """
             INSERT INTO silver_xref_player VALUES
-              ('fbref', 'fb_leno', 'leno_canonical', 'ENG-Premier League', '2024'),
-              ('fbref', 'fb_disasi', 'disasi_canonical', 'ENG-Premier League', '2024')
+              ('fbref', 'fb_leno', 'leno_canonical', 'ENG-Premier League', '2425'),
+              ('fbref', 'fb_disasi', 'disasi_canonical', 'ENG-Premier League', '2425')
             """
         )
 
@@ -420,13 +424,13 @@ class TestOwnGoalTeamAttribution:
         duck_conn.execute(
             """
             INSERT INTO silver_xref_team VALUES
-              ('fbref', 'Liverpool', 'liverpool', 'ENG-Premier League', '2024')
+              ('fbref', 'Liverpool', 'liverpool', 'ENG-Premier League', '2425')
             """
         )
         duck_conn.execute(
             """
             INSERT INTO silver_xref_player VALUES
-              ('fbref', 'fb_leno', 'leno_canonical', 'ENG-Premier League', '2024')
+              ('fbref', 'fb_leno', 'leno_canonical', 'ENG-Premier League', '2425')
             """
         )
         out = _run(duck_conn)

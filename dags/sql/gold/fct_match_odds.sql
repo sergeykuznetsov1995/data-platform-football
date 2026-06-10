@@ -34,8 +34,8 @@
 --   odds_source           varchar          'matchhistory'
 --   odds_version          varchar          literal 'v1'
 --   league                varchar          partition key
---   season                bigint           partition key (silver passthrough,
---                                          already bigint year-of-start)
+--   season                varchar          partition key (silver passthrough,
+--                                          slug '2425' after #404)
 --   _ingested_at          timestamp(6)     bronze provenance
 --
 -- Logical PK: odds_canonical
@@ -46,8 +46,8 @@
 -- =============================================================================
 -- Season type
 -- =============================================================================
--- silver.matchhistory_match_odds.season is already bigint year-of-start
--- (verified via DESCRIBE 2026-05-08). Direct passthrough — no cast needed.
+-- silver.matchhistory_match_odds.season is slug varchar ('2425') after #404.
+-- Direct passthrough — no cast needed.
 -- =============================================================================
 
 SELECT

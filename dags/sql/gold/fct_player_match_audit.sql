@@ -47,7 +47,7 @@ xref_fbref_player AS (
         source_id                                          AS fbref_player_id,
         league,
         season                                             AS season_slug,
-        2000 + CAST(SUBSTR(season, 1, 2) AS BIGINT)        AS season_year
+        season  /* #404: slug passthrough (was slug→year-start) */        AS season_year
     FROM iceberg.silver.xref_player
     WHERE source = 'fbref'
       AND confidence <> 'orphan'
@@ -60,7 +60,7 @@ xref_match_fbref AS (
         source_id                                          AS fbref_match_id,
         league,
         season                                             AS season_slug,
-        2000 + CAST(SUBSTR(season, 1, 2) AS BIGINT)        AS season_year
+        season  /* #404: slug passthrough (was slug→year-start) */        AS season_year
     FROM iceberg.silver.xref_match
     WHERE source = 'fbref'
 ),

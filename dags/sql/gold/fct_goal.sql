@@ -177,16 +177,8 @@ regular_goals AS (
         CAST(sh.shot_id AS varchar)     AS pk_tiebreaker,
         CAST('fct_shot' AS varchar)     AS goal_source,
         sh.league                       AS league,
-        -- Mixed-format → bigint year-of-start (see header §Season normalisation)
-        COALESCE(
-            CASE
-                WHEN length(sh.season) = 4
-                 AND TRY_CAST(sh.season AS bigint) BETWEEN 2000 AND 2100
-                    THEN TRY_CAST(sh.season AS bigint)
-                ELSE 2000 + TRY_CAST(substr(sh.season, 1, 2) AS bigint)
-            END,
-            TRY_CAST(sh.season AS bigint)
-        )                               AS season,
+        -- #404: gold.fct_shot.season is slug ('2425') → pass through unchanged.
+        sh.season                       AS season,
         CAST(NULL AS timestamp(6))      AS _ingested_at
     FROM iceberg.gold.fct_shot sh
     WHERE sh.result_canonical = 'goal'
@@ -234,7 +226,8 @@ fb_own_goals AS (
         FALSE                                           AS is_penalty,
         CAST('fbref_own_goal' AS varchar)               AS goal_source,
         fe.league                                       AS league,
-        fe.season                                       AS season,
+        -- #404: bronze fbref_match_events.season is year-start bigint → slug.
+        format('%02d%02d', mod(fe.season, 100), mod(fe.season + 1, 100)) AS season,
         fe._ingested_at                                 AS _ingested_at
     FROM fb_own_goals_dedup fe
     -- xref_match bridge (FBref source_id → canonical_id, season-agnostic
@@ -251,14 +244,14 @@ fb_own_goals AS (
         ON xt.source    = 'fbref'
        AND xt.source_id = fe.team_name_raw
        AND xt.league    = fe.league
-       AND xt.season    = CAST(fe.season AS varchar)
+       AND xt.season    = format('%02d%02d', mod(fe.season, 100), mod(fe.season + 1, 100))  -- #404: year-start → slug
     -- xref_player — resolve the actual scorer (opposing-team player on an
     -- own_goal). season+league predicate per xref_join contract.
     LEFT JOIN iceberg.silver.xref_player xp
         ON xp.source    = 'fbref'
        AND xp.source_id = fe.scorer_player_id
        AND xp.league    = fe.league
-       AND xp.season    = CAST(fe.season AS varchar)
+       AND xp.season    = format('%02d%02d', mod(fe.season, 100), mod(fe.season + 1, 100))  -- #404: year-start → slug
     WHERE fe.rn = 1
 ),
 

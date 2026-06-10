@@ -76,9 +76,10 @@ class TestFctKeeperSeasonStatsAuditSql:
             assert not re.search(rf"\bAS\s+{col}\b", sql, re.IGNORECASE)
 
     def test_season_slug_to_year_idiom(self):
+        # #404: season is slug end-to-end — the slug→year-start idiom is removed.
         sql = _read_sql()
-        assert re.search(
-            r"2000\s*\+\s*CAST\s*\(\s*SUBSTR\s*\(\s*season\s*,\s*1\s*,\s*2\s*\)",
+        assert not re.search(
+            r"2000\s*\+\s*CAST\s*\(\s*SUBSTR\s*\(\s*season",
             sql, re.IGNORECASE,
         )
 

@@ -39,8 +39,10 @@ SELECT
     _ingested_at                   AS _bronze_ingested_at,
 
     -- ========= Partition Keys =========
+    -- season → slug ('2425'); FBref bronze stores year-start bigint (2024).
     league,
-    season
+    LPAD(CAST(MOD(season,     100) AS varchar), 2, '0')
+        || LPAD(CAST(MOD(season + 1, 100) AS varchar), 2, '0') AS season
 
 FROM src
 WHERE rn = 1

@@ -148,7 +148,7 @@ espn_match_bridge AS (
         ))))                                                AS espn_match_id,
         fme.match_id                                        AS fbref_match_id,
         es.league                                           AS league,
-        TRY_CAST(es.season AS bigint)                       AS season
+        es.season                                           AS season  -- #404: ESPN bronze slug ('2526')
     FROM iceberg.bronze.espn_schedule es
     LEFT JOIN xref_team_by_canonical xt_home_es
         ON xt_home_es.source    = 'espn'
@@ -195,17 +195,8 @@ fbref_resolved AS (
         fl.jersey_number                               AS jersey_number,
         fl._bronze_ingested_at                         AS _bronze_ingested_at,
         fl.league                                      AS league,
-        -- season UNIFICATION (E3.5 R4): FBref Silver stores year-of-start as
-        -- bigint (``2024`` for the 2024-25 season). Convert to compact 4-char
-        -- 'YYYY' format ('2425') used by ESPN/WhoScored/xref_team — see
-        -- output schema header. ``format('%02d%02d', mod(s,100), mod(s+1,100))``
-        -- preserves leading zeros (2009 -> '0910', 2019 -> '1920'). NULL-safe:
-        -- TRY_CAST returns NULL on bad inputs, format() short-circuits to NULL.
-        format(
-            '%02d%02d',
-            mod(fl.season, 100),
-            mod(fl.season + 1, 100)
-        )                                              AS season,
+        -- #404: silver.fbref_match_lineups.season is slug ('2425') now → pass through.
+        fl.season                                      AS season,
         'fbref'                                        AS lineup_source,
         1                                              AS source_priority,
         fl.player_id                                   AS _raw_player_id_for_dedup

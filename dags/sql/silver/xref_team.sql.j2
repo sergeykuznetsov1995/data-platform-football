@@ -87,10 +87,10 @@ WITH aliases AS (
 
 raw_teams AS (
     -- ===== fbref (home/away from schedule) =====
-    SELECT 'fbref' AS source, home AS source_id, league, CAST(season AS varchar) AS season
+    SELECT 'fbref' AS source, home AS source_id, league, LPAD(CAST(MOD(season, 100) AS varchar), 2, '0') || LPAD(CAST(MOD(season + 1, 100) AS varchar), 2, '0') AS season  -- year-start bigint → slug '2425' (#404)
       FROM iceberg.bronze.fbref_schedule WHERE home IS NOT NULL
     UNION
-    SELECT 'fbref' AS source, away AS source_id, league, CAST(season AS varchar) AS season
+    SELECT 'fbref' AS source, away AS source_id, league, LPAD(CAST(MOD(season, 100) AS varchar), 2, '0') || LPAD(CAST(MOD(season + 1, 100) AS varchar), 2, '0') AS season  -- year-start bigint → slug '2425' (#404)
       FROM iceberg.bronze.fbref_schedule WHERE away IS NOT NULL
 
     UNION
@@ -119,18 +119,18 @@ raw_teams AS (
 
     UNION
     -- ===== fotmob =====
-    SELECT 'fotmob' AS source, home_team AS source_id, league, CAST(season AS varchar) AS season
+    SELECT 'fotmob' AS source, home_team AS source_id, league, LPAD(CAST(MOD(season, 100) AS varchar), 2, '0') || LPAD(CAST(MOD(season + 1, 100) AS varchar), 2, '0') AS season  -- year-start bigint → slug '2425' (#404)
       FROM iceberg.bronze.fotmob_schedule WHERE home_team IS NOT NULL
     UNION
-    SELECT 'fotmob' AS source, away_team AS source_id, league, CAST(season AS varchar) AS season
+    SELECT 'fotmob' AS source, away_team AS source_id, league, LPAD(CAST(MOD(season, 100) AS varchar), 2, '0') || LPAD(CAST(MOD(season + 1, 100) AS varchar), 2, '0') AS season  -- year-start bigint → slug '2425' (#404)
       FROM iceberg.bronze.fotmob_schedule WHERE away_team IS NOT NULL
 
     UNION
     -- ===== matchhistory (#307: cols renamed home_team/away_team via COLUMN_MAPPING) =====
-    SELECT 'matchhistory' AS source, home_team AS source_id, league, CAST(season AS varchar) AS season
+    SELECT 'matchhistory' AS source, home_team AS source_id, league, LPAD(CAST(MOD(season, 100) AS varchar), 2, '0') || LPAD(CAST(MOD(season + 1, 100) AS varchar), 2, '0') AS season  -- year-start bigint → slug '2425' (#404)
       FROM iceberg.bronze.matchhistory_results WHERE home_team IS NOT NULL
     UNION
-    SELECT 'matchhistory' AS source, away_team AS source_id, league, CAST(season AS varchar) AS season
+    SELECT 'matchhistory' AS source, away_team AS source_id, league, LPAD(CAST(MOD(season, 100) AS varchar), 2, '0') || LPAD(CAST(MOD(season + 1, 100) AS varchar), 2, '0') AS season  -- year-start bigint → slug '2425' (#404)
       FROM iceberg.bronze.matchhistory_results WHERE away_team IS NOT NULL
 
     UNION

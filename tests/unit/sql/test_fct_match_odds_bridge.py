@@ -185,7 +185,7 @@ def _reset_schemas(duck_conn):
             match_id      VARCHAR,
             date          DATE,
             league        VARCHAR,
-            season        BIGINT,
+            season        VARCHAR,
             home_team_id  VARCHAR,
             away_team_id  VARCHAR
         )
@@ -272,15 +272,15 @@ def _seed_corpus(duck_conn) -> None:
     duck_conn.execute(
         """
         INSERT INTO gold_dim_match VALUES
-          ('M_WV_TT', DATE '2024-08-15', 'ENG-Premier League', 2024,
+          ('M_WV_TT', DATE '2024-08-15', 'ENG-Premier League', '2425',
            'wolves', 'tottenham_hotspur'),
-          ('M_WV_TT2', DATE '2024-09-01', 'ENG-Premier League', 2024,
+          ('M_WV_TT2', DATE '2024-09-01', 'ENG-Premier League', '2425',
            'wolves', 'tottenham_hotspur'),
-          ('M_MU_NF', DATE '2024-10-05', 'ENG-Premier League', 2024,
+          ('M_MU_NF', DATE '2024-10-05', 'ENG-Premier League', '2425',
            'manchester_utd', 'nottingham_forest'),
-          ('M_MU_NF2', DATE '2024-11-10', 'ENG-Premier League', 2024,
+          ('M_MU_NF2', DATE '2024-11-10', 'ENG-Premier League', '2425',
            'manchester_utd', 'nottingham_forest'),
-          ('M_NU_WH', DATE '2024-12-15', 'ENG-Premier League', 2024,
+          ('M_NU_WH', DATE '2024-12-15', 'ENG-Premier League', '2425',
            'newcastle_united', 'west_ham_united')
         """
     )

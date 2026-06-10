@@ -174,8 +174,11 @@ SELECT
     sch._ingested_at                                AS _bronze_ingested_at,
 
     -- ========= Partition Keys =========
+    -- season → slug ('2425'); FBref bronze stores year-start bigint (2024).
+    -- The match_id hash above keeps the native year-start input → ids unchanged.
     sch.league,
-    sch.season
+    LPAD(CAST(MOD(sch.season,     100) AS varchar), 2, '0')
+        || LPAD(CAST(MOD(sch.season + 1, 100) AS varchar), 2, '0') AS season
 
 FROM sch
 LEFT JOIN ts

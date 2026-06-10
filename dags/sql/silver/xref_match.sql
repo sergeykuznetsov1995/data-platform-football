@@ -75,7 +75,9 @@ WITH derived AS (
         home,
         away,
         league,
-        CAST(season AS varchar)              AS season
+        -- season → slug ('2425'); the match_id hash above keeps year-start (ids stable).
+        LPAD(CAST(MOD(season, 100) AS varchar), 2, '0')
+            || LPAD(CAST(MOD(season + 1, 100) AS varchar), 2, '0')  AS season
     FROM iceberg.bronze.fbref_schedule
 ),
 
@@ -189,7 +191,9 @@ fm_resolved AS (
         s.match_id                                                     AS source_id,
         TRY_CAST(SUBSTR(s.date, 1, 10) AS date)                        AS match_date,
         s.league,
-        CAST(s.season AS varchar)                                      AS season,
+        -- season → slug ('2425'); bronze fotmob_schedule is year-start bigint.
+        LPAD(CAST(MOD(s.season, 100) AS varchar), 2, '0')
+            || LPAD(CAST(MOD(s.season + 1, 100) AS varchar), 2, '0')   AS season,
         xt_h.canonical_id                                              AS home_canonical_id,
         xt_a.canonical_id                                              AS away_canonical_id,
         CONCAT(s.home_team, ' vs ', s.away_team)                       AS display_name
@@ -198,12 +202,14 @@ fm_resolved AS (
            ON xt_h.source    = 'fotmob'
           AND xt_h.source_id = s.home_team
           AND xt_h.league    = s.league
-          AND xt_h.season    = CAST(s.season AS varchar)
+          AND xt_h.season    = LPAD(CAST(MOD(s.season, 100) AS varchar), 2, '0')
+                               || LPAD(CAST(MOD(s.season + 1, 100) AS varchar), 2, '0')
     LEFT JOIN iceberg.silver.xref_team xt_a
            ON xt_a.source    = 'fotmob'
           AND xt_a.source_id = s.away_team
           AND xt_a.league    = s.league
-          AND xt_a.season    = CAST(s.season AS varchar)
+          AND xt_a.season    = LPAD(CAST(MOD(s.season, 100) AS varchar), 2, '0')
+                               || LPAD(CAST(MOD(s.season + 1, 100) AS varchar), 2, '0')
     WHERE s.match_id IS NOT NULL
 ),
 
@@ -229,7 +235,10 @@ mh_resolved AS (
         ))))                                                           AS source_id,
         CAST(date_parse(s.match_date, '%d/%m/%Y') AS date)             AS match_date,
         s.league,
-        CAST(s.season AS varchar)                                      AS season,
+        -- season → slug ('2425'); bronze matchhistory is year-start bigint.
+        -- (The source_id hash above keeps year-start so ids stay stable.)
+        LPAD(CAST(MOD(s.season, 100) AS varchar), 2, '0')
+            || LPAD(CAST(MOD(s.season + 1, 100) AS varchar), 2, '0')   AS season,
         xt_h.canonical_id                                              AS home_canonical_id,
         xt_a.canonical_id                                              AS away_canonical_id,
         CONCAT(CAST(s.home_team AS varchar), ' vs ',
@@ -239,12 +248,14 @@ mh_resolved AS (
            ON xt_h.source    = 'matchhistory'
           AND xt_h.source_id = CAST(s.home_team AS varchar)
           AND xt_h.league    = s.league
-          AND xt_h.season    = CAST(s.season AS varchar)
+          AND xt_h.season    = LPAD(CAST(MOD(s.season, 100) AS varchar), 2, '0')
+                               || LPAD(CAST(MOD(s.season + 1, 100) AS varchar), 2, '0')
     LEFT JOIN iceberg.silver.xref_team xt_a
            ON xt_a.source    = 'matchhistory'
           AND xt_a.source_id = CAST(s.away_team AS varchar)
           AND xt_a.league    = s.league
-          AND xt_a.season    = CAST(s.season AS varchar)
+          AND xt_a.season    = LPAD(CAST(MOD(s.season, 100) AS varchar), 2, '0')
+                               || LPAD(CAST(MOD(s.season + 1, 100) AS varchar), 2, '0')
     WHERE s.match_date IS NOT NULL
 ),
 
@@ -311,8 +322,9 @@ LEFT JOIN fbref_base fb
       AND fb.home_canonical_id = src.home_canonical_id
       AND fb.away_canonical_id = src.away_canonical_id
       AND fb.league            = src.league
-      -- season intentionally omitted: source formats differ (fbref='2024'
-      -- vs whoscored='2425'); date+canonical teams already unique per match
+      -- season omitted from JOIN: all sources are slug now (#404), but
+      -- date+canonical teams already uniquely identify the match, so keeping
+      -- season out of the predicate is behaviour-stable (no fan-out).
 GROUP BY 1, 2, 3, 4, 5, 6, 7, 8
 
 UNION ALL
@@ -336,8 +348,9 @@ LEFT JOIN fbref_base fb
       AND fb.home_canonical_id = src.home_canonical_id
       AND fb.away_canonical_id = src.away_canonical_id
       AND fb.league            = src.league
-      -- season intentionally omitted: source formats differ (fbref='2024'
-      -- vs whoscored='2425'); date+canonical teams already unique per match
+      -- season omitted from JOIN: all sources are slug now (#404), but
+      -- date+canonical teams already uniquely identify the match, so keeping
+      -- season out of the predicate is behaviour-stable (no fan-out).
 GROUP BY 1, 2, 3, 4, 5, 6, 7, 8
 
 UNION ALL
@@ -361,8 +374,9 @@ LEFT JOIN fbref_base fb
       AND fb.home_canonical_id = src.home_canonical_id
       AND fb.away_canonical_id = src.away_canonical_id
       AND fb.league            = src.league
-      -- season intentionally omitted: source formats differ (fbref='2024'
-      -- vs whoscored='2425'); date+canonical teams already unique per match
+      -- season omitted from JOIN: all sources are slug now (#404), but
+      -- date+canonical teams already uniquely identify the match, so keeping
+      -- season out of the predicate is behaviour-stable (no fan-out).
 GROUP BY 1, 2, 3, 4, 5, 6, 7, 8
 
 UNION ALL
@@ -386,8 +400,9 @@ LEFT JOIN fbref_base fb
       AND fb.home_canonical_id = src.home_canonical_id
       AND fb.away_canonical_id = src.away_canonical_id
       AND fb.league            = src.league
-      -- season intentionally omitted: source formats differ (fbref='2024'
-      -- vs whoscored='2425'); date+canonical teams already unique per match
+      -- season omitted from JOIN: all sources are slug now (#404), but
+      -- date+canonical teams already uniquely identify the match, so keeping
+      -- season out of the predicate is behaviour-stable (no fan-out).
 GROUP BY 1, 2, 3, 4, 5, 6, 7, 8
 
 UNION ALL
@@ -411,8 +426,9 @@ LEFT JOIN fbref_base fb
       AND fb.home_canonical_id = src.home_canonical_id
       AND fb.away_canonical_id = src.away_canonical_id
       AND fb.league            = src.league
-      -- season intentionally omitted: source formats differ (fbref='2024'
-      -- vs whoscored='2425'); date+canonical teams already unique per match
+      -- season omitted from JOIN: all sources are slug now (#404), but
+      -- date+canonical teams already uniquely identify the match, so keeping
+      -- season out of the predicate is behaviour-stable (no fan-out).
 GROUP BY 1, 2, 3, 4, 5, 6, 7, 8
 
 UNION ALL
@@ -436,6 +452,7 @@ LEFT JOIN fbref_base fb
       AND fb.home_canonical_id = src.home_canonical_id
       AND fb.away_canonical_id = src.away_canonical_id
       AND fb.league            = src.league
-      -- season intentionally omitted: source formats differ (fbref='2024'
-      -- vs whoscored='2425'); date+canonical teams already unique per match
+      -- season omitted from JOIN: all sources are slug now (#404), but
+      -- date+canonical teams already uniquely identify the match, so keeping
+      -- season out of the predicate is behaviour-stable (no fan-out).
 GROUP BY 1, 2, 3, 4, 5, 6, 7, 8
