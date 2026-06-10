@@ -30,6 +30,34 @@ competitions:
     country: "England"
     tier: 1
     seasons:
+      # 1617-2021: исторические сезоны, даты = MIN/MAX(match_date) из
+      # фактически загруженного FBref-расписания (#425 — dim_season обязан
+      # покрывать все сезоны dim_match, FK season -> dim_season.season).
+      - id: 1617
+        format: "league_round_robin"
+        team_count: 20
+        start: "2016-08-13"
+        end: "2017-05-21"
+      - id: 1718
+        format: "league_round_robin"
+        team_count: 20
+        start: "2017-08-11"
+        end: "2018-05-13"
+      - id: 1819
+        format: "league_round_robin"
+        team_count: 20
+        start: "2018-08-10"
+        end: "2019-05-12"
+      - id: 1920
+        format: "league_round_robin"
+        team_count: 20
+        start: "2019-08-09"
+        end: "2020-07-26"
+      - id: 2021
+        format: "league_round_robin"
+        team_count: 20
+        start: "2020-09-12"
+        end: "2021-05-23"
       - id: 2122
         format: "league_round_robin"
         team_count: 20
