@@ -4,48 +4,31 @@
 table:
   fullyQualifiedName: trino_iceberg.iceberg.gold.dim_venue
   description: |
-    Канонический справочник стадионов, объединённый из FBref и ESPN. Одна строка
-    на venue_id — стабильный explicit-слаг `venue_<...>` из curated-справочника
-    configs/medallion/venue_aliases.yaml (issue #145), а НЕ хеш имени. Разные
-    написания одного стадиона ("Brentford Community Stadium" / "Gtech Community
-    Stadium") сливаются в один venue_id; тёзки в разных городах не склеиваются.
-    Стадионы без алиаса попадают как venue_source='orphan' (fallback на хеш
-    нормализованного имени) и сигналятся DQ-WARNING для куратора. Поддерживает
-    schema-versioning по R0.4 (venue_canonical/_source/_version, версия v2).
-    city/country заполнены для in-scope лиг (APL); для orphan — NULL.
+    Канонический справочник стадионов (звёздный дизайн, #425), объединённый
+    из FBref и ESPN. Одна строка на venue_id — стабильный explicit-слаг
+    `venue_<...>` из curated-справочника configs/medallion/venue_aliases.yaml
+    (issue #145), а НЕ хеш имени. Разные написания одного стадиона
+    ("Brentford Community Stadium" / "Gtech Community Stadium") сливаются в
+    один venue_id; тёзки в разных городах не склеиваются. Стадионы без алиаса
+    попадают как venue_source='orphan' (fallback на хеш нормализованного
+    имени) и сигналятся DQ-WARNING для куратора.
   tags:
     - Tier.Gold
     - Domain.Football
     - PII.None
 columns:
   - name: venue_id
-    description: Канонический ID стадиона — explicit-слаг `venue_<...>` из venue_aliases.yaml (curated), для orphan — `venue_<xxhash64>` от нормализованного имени.
-  - name: venue_canonical
-    description: Каноническое имя стадиона из venue_aliases.yaml (для orphan — наблюдаемое имя FBref>ESPN), schema R0.4.
-  - name: venue_source
-    description: Происхождение идентичности ('curated' — матч по алиасу | 'orphan' — алиас не найден).
-  - name: venue_version
-    description: Версия схемы канонизации стадиона (R0.4 schema-versioning; v2 после перехода на alias-идентичность #145).
-  - name: venue_fbref
-    description: Имя стадиона как оно встречается в FBref schedule.
-  - name: venue_espn
-    description: Имя стадиона как оно встречается в ESPN.
-  - name: venue_slug
-    description: URL-friendly slug канонического имени (для UI и поиска).
+    description: PK — explicit-слаг `venue_<...>` из venue_aliases.yaml (curated), для orphan — `venue_<xxhash64>` от нормализованного имени.
+  - name: venue_name
+    description: Каноническое имя стадиона из venue_aliases.yaml (для orphan — наблюдаемое имя FBref>ESPN).
   - name: city
-    description: Город стадиона из venue_aliases.yaml (заполнен для in-scope лиг; NULL для orphan).
+    description: Город стадиона из venue_aliases.yaml (NULL для orphan).
   - name: country
-    description: Страна стадиона из venue_aliases.yaml (заполнена для in-scope лиг; NULL для orphan).
-  - name: n_matches
-    description: Количество матчей, сыгранных на этом стадионе (по всем сезонам).
-  - name: first_seen_date
-    description: Дата первого матча, привязанного к этому стадиону.
-  - name: last_seen_date
-    description: Дата последнего матча, привязанного к этому стадиону.
-  - name: league
-    description: Лига, в рамках которой стадион встречается (для партиционирования).
-  - name: season
-    description: Сезон, в рамках которого стадион встречается.
+    description: Страна стадиона из venue_aliases.yaml (NULL для orphan).
+  - name: capacity
+    description: Вместимость стадиона. Пока NULL-заглушка — источника нет (ESPN capacity 100% NULL); обогащение — отдельная задача.
+  - name: venue_source
+    description: Происхождение идентичности ('curated' — матч по алиасу | 'orphan' — алиас не найден); используется DQ-чеком orphan-rate.
   - name: _silver_created_at
-    description: Технический timestamp создания строки в Silver-слое.
+    description: Технический timestamp создания строки CTAS-раннером.
 relationships: []

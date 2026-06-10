@@ -4,35 +4,27 @@
 table:
   fullyQualifiedName: trino_iceberg.iceberg.gold.dim_referee
   description: |
-    Справочник судей, извлекаемый из FBref schedule. Одна строка на referee_id
-    с ASCII-нормализацией имени (известное ограничение: `Çakır`≠`Cakir` —
-    фикс в R8 follow-up). В v1 referee_source всегда 'fbref'; поддержка
-    альтернативных источников добавится при расширении охвата.
+    Канонический справочник судей (звёздный дизайн, #425). Одна строка =
+    один судья. PK — canonical_id из silver.xref_referee (curated-алиасы,
+    3 источника: FBref + MatchHistory + FotMob): 'ref_<slug>' для
+    распознанных, '<src>_ref_<slug>' для orphan. country — только из FotMob
+    (единственный источник национальности судьи). first/last_seen — по датам
+    матчей FBref-расписания.
   tags:
     - Tier.Gold
     - Domain.Football
     - PII.None
 columns:
   - name: referee_id
-    description: Канонический ID судьи (`ref_<xxhash64>` от ASCII-нормализованного имени).
-  - name: referee_canonical
-    description: Каноническое имя судьи после ASCII-нормализации.
-  - name: referee_source
-    description: Источник имени судьи; в v1 всегда 'fbref'.
-  - name: referee_version
-    description: Версия схемы канонизации судьи (R0.4 schema-versioning).
-  - name: referee_slug
-    description: URL-friendly slug канонического имени судьи.
-  - name: n_matches
-    description: Количество матчей, отсуженных этим арбитром.
+    description: PK — canonical_id из silver.xref_referee ('ref_<slug>' | '<src>_ref_<slug>' для orphan).
+  - name: referee_name
+    description: Каноническое имя судьи (curated canonical_name; для orphan — FBref-написание).
+  - name: country
+    description: Страна судьи (FotMob — единственный источник; NULL вне его покрытия).
   - name: first_seen_date
-    description: Дата первого матча с этим судьёй.
+    description: Дата первого матча судьи в данных (FBref schedule).
   - name: last_seen_date
-    description: Дата последнего матча с этим судьёй.
-  - name: leagues
-    description: Массив лиг, в которых судья работал.
-  - name: seasons
-    description: Массив сезонов, в которых судья появлялся.
+    description: Дата последнего матча судьи в данных (FBref schedule).
   - name: _silver_created_at
-    description: Технический timestamp создания строки в Silver-слое.
+    description: Технический timestamp создания строки CTAS-раннером.
 relationships: []

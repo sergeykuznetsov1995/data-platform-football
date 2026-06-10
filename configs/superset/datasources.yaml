@@ -50,7 +50,8 @@ databases:
       - table_name: dim_team
         schema: gold
         description: |
-          Канонический справочник команд по сезонам (одна строка на team-league-season).
+          Канонический справочник клубов (#425: одна строка = один клуб,
+          PK team_id; team_name/country/short_name из team_aliases.yaml).
           Используется как FK target из fct_match, fct_team_match, feat_team_*.
         default_endpoint: null
         cache_timeout: 3600
@@ -58,16 +59,18 @@ databases:
       - table_name: dim_player
         schema: gold
         description: |
-          Канонический справочник игроков по сезонам. PK (player_id, season).
-          Используется как FK target из fct_player_match, feat_player_form.
+          Канонический справочник игроков (#425: одна строка = один игрок,
+          PK player_id; dob/nationality/height_cm/preferred_foot/primary_position
+          через multi-source COALESCE). FK target из fct_player_match и пр.
         default_endpoint: null
         cache_timeout: 3600
 
       - table_name: dim_match
         schema: gold
         description: |
-          Размерность матча: дата, тур, домашняя/гостевая команды, счёт, исход 1X2.
-          PK match_id. Источник для всех fct_* и feat_*-таблиц.
+          Паспорт матча (#425): match_date, kickoff_time, тур, FK на команды,
+          судью (referee_id), стадион (venue_id), тренеров, счёт, исход 1X2.
+          PK match_id. Центр звезды — источник для всех fct_* и feat_*-таблиц.
         default_endpoint: null
         cache_timeout: 3600
 

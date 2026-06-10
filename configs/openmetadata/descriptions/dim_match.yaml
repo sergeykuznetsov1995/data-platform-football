@@ -4,57 +4,75 @@
 table:
   fullyQualifiedName: trino_iceberg.iceberg.gold.dim_match
   description: |
-    Размерность матча: дата, тур, домашняя/гостевая команды, счёт, исход 1X2.
-    Один матч = одна строка (PK match_id). Источник истины для всех fct_*
-    и feat_*-таблиц, ссылающихся на match_id. Включает производные поля
-    result_1x2, total_goals, btts, is_completed.
+    Паспорт матча — центр звезды (#425). Один матч = одна строка (PK
+    match_id, FBref hex). Несёт FK на ВСЕ справочники: команды, судью,
+    стадион, тренеров, лигу, сезон — плюс контекст (дата, время, тур,
+    посещаемость, счёт, исход 1X2). Вся СТАТИСТИКА матча живёт в
+    fct_team_match, не здесь. Источник истины для всех fct_* и feat_*-таблиц,
+    ссылающихся на match_id.
   tags:
     - Tier.Gold
     - Domain.Football
     - PII.None
 columns:
   - name: match_id
-    description: Канонический ID матча (FBref match_id).
-  - name: date
-    description: Дата матча (UTC date).
-  - name: gameweek
-    description: Номер тура чемпионата.
-  - name: time
-    description: Время начала (локальное, как у источника).
-  - name: venue
-    description: Стадион проведения матча.
-  - name: referee
-    description: Имя судьи.
-  - name: attendance
-    description: Посещаемость (число зрителей).
+    description: PK — канонический ID матча (FBref hex, silver.xref_match spine).
   - name: home_team_id
     description: Канонический ID домашней команды (FK -> dim_team.team_id).
   - name: away_team_id
     description: Канонический ID гостевой команды (FK -> dim_team.team_id).
-  - name: home_team_name
-    description: Имя домашней команды (для отладки/UI).
-  - name: away_team_name
-    description: Имя гостевой команды (для отладки/UI).
+  - name: referee_id
+    description: Канонический ID судьи (FK -> dim_referee.referee_id, через silver.xref_referee).
+  - name: venue_id
+    description: Канонический ID стадиона (FK -> dim_venue.venue_id; inline alias-lookup, байт-идентичный dim_venue).
+  - name: home_manager_id
+    description: Канонический ID тренера хозяев (FK -> dim_manager.manager_id; bronze.fbref_match_managers + xref).
+  - name: away_manager_id
+    description: Канонический ID тренера гостей (FK -> dim_manager.manager_id).
+  - name: league
+    description: Лига (FK -> dim_competition.league).
+  - name: season
+    description: Сезон-slug '2425' (FK -> dim_season.season).
+  - name: match_date
+    description: Дата матча (UTC date).
+  - name: kickoff_time
+    description: Время начала (локальное, как у источника, 'HH:MM').
+  - name: gameweek
+    description: Номер тура чемпионата.
+  - name: attendance
+    description: Посещаемость (число зрителей).
   - name: home_score
     description: Голы домашней команды.
   - name: away_score
     description: Голы гостевой команды.
   - name: result_1x2
-    description: Исход 1X2 — 'H' (home wins) | 'A' (away wins) | 'D' (draw). NULL до окончания матча.
-  - name: total_goals
-    description: Сумма голов в матче (home_score + away_score).
-  - name: btts
-    description: Both Teams To Score — обе команды забили (boolean).
+    description: Исход 1X2 — 'H' | 'A' | 'D'. NULL до окончания матча.
   - name: is_completed
     description: Матч сыгран и счёт известен (boolean).
-  - name: league
-    description: Лига.
-  - name: season
-    description: Сезон.
+  - name: _silver_created_at
+    description: Технический timestamp создания строки CTAS-раннером.
 relationships:
   - from: home_team_id
     to: trino_iceberg.iceberg.gold.dim_team.team_id
     type: FOREIGN_KEY
   - from: away_team_id
     to: trino_iceberg.iceberg.gold.dim_team.team_id
+    type: FOREIGN_KEY
+  - from: referee_id
+    to: trino_iceberg.iceberg.gold.dim_referee.referee_id
+    type: FOREIGN_KEY
+  - from: venue_id
+    to: trino_iceberg.iceberg.gold.dim_venue.venue_id
+    type: FOREIGN_KEY
+  - from: home_manager_id
+    to: trino_iceberg.iceberg.gold.dim_manager.manager_id
+    type: FOREIGN_KEY
+  - from: away_manager_id
+    to: trino_iceberg.iceberg.gold.dim_manager.manager_id
+    type: FOREIGN_KEY
+  - from: league
+    to: trino_iceberg.iceberg.gold.dim_competition.league
+    type: FOREIGN_KEY
+  - from: season
+    to: trino_iceberg.iceberg.gold.dim_season.season
     type: FOREIGN_KEY

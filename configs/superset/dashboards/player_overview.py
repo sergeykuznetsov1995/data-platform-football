@@ -16,9 +16,10 @@
 #   13. Full player summary table
 #
 # Season is hard-coded in virtual datasets — column type differs by source:
-#   - FBref / dim_player  -> bigint 2025
+#   - FBref facts         -> bigint 2025
 #   - SofaScore rating    -> bigint 2526 (sofascore short-form)
 #   - Understat shots     -> varchar '2526' (understat short-form)
+# dim_player (#425) is per-player (no season) — JOINs by player_id only.
 # Single-season MVP; regenerate virtuals when a new season's data lands.
 #
 # All `superset.*` imports happen INSIDE `create_dashboard()` because the
@@ -191,8 +192,8 @@ def _build_virtual_datasets(ctx: _Ctx, database: Any) -> dict[str, Any]:
 SELECT
   fpm.player_id_canonical AS player_id,
   COALESCE(dp.player_name, fpm.player_id_canonical) AS player_name,
-  COALESCE(dp.position, fpm.position) AS position,
-  REGEXP_EXTRACT(COALESCE(dp.position, fpm.position), '^([A-Z]{{2}})') AS position_primary,
+  COALESCE(dp.primary_position, fpm.position) AS position,
+  REGEXP_EXTRACT(COALESCE(dp.primary_position, fpm.position), '^([A-Z]{{2}})') AS position_primary,
   fpm.team_name,
   fpm.match_id_canonical AS match_id,
   fpm.minutes, fpm.goals, fpm.assists,
@@ -203,8 +204,6 @@ SELECT
 FROM iceberg.gold.fct_player_match fpm
 LEFT JOIN iceberg.gold.dim_player dp
   ON dp.player_id = fpm.player_id_canonical
- AND dp.season    = fpm.season
- AND dp.league    = fpm.league
 WHERE fpm.season = {SEASON_FBREF}
   AND fpm.league = '{LEAGUE}'"""
 
@@ -212,15 +211,13 @@ WHERE fpm.season = {SEASON_FBREF}
 SELECT
   s.player_id_canonical AS player_id,
   COALESCE(dp.player_name, s.player_id_canonical) AS player_name,
-  dp.position,
-  REGEXP_EXTRACT(dp.position, '^([A-Z]{{2}})') AS position_primary,
+  dp.primary_position,
+  REGEXP_EXTRACT(dp.primary_position, '^([A-Z]{{2}})') AS position_primary,
   s.xg, s.is_goal, s.body_part_canonical, s.situation_canonical,
   s.league, s.season
 FROM iceberg.gold.fct_shot s
 LEFT JOIN iceberg.gold.dim_player dp
   ON dp.player_id = s.player_id_canonical
- AND dp.season    = {SEASON_FBREF}
- AND dp.league    = s.league
 WHERE s.season = '{SEASON_OTHER_STR}'
   AND s.league = '{LEAGUE}'
   AND s.player_id_canonical IS NOT NULL"""
@@ -243,8 +240,8 @@ xg_agg AS (
 SELECT
   COALESCE(f.player_id, x.player_id) AS player_id,
   COALESCE(dp.player_name, COALESCE(f.player_id, x.player_id)) AS player_name,
-  dp.position,
-  REGEXP_EXTRACT(dp.position, '^([A-Z]{{2}})') AS position_primary,
+  dp.primary_position,
+  REGEXP_EXTRACT(dp.primary_position, '^([A-Z]{{2}})') AS position_primary,
   f.team_name,
   COALESCE(f.goals, 0) AS goals,
   COALESCE(x.xg, 0.0)  AS xg,
@@ -254,8 +251,6 @@ FROM fbref_agg f
 FULL OUTER JOIN xg_agg x ON f.player_id = x.player_id
 LEFT JOIN iceberg.gold.dim_player dp
   ON dp.player_id = COALESCE(f.player_id, x.player_id)
- AND dp.season    = {SEASON_FBREF}
- AND dp.league    = '{LEAGUE}'
 WHERE COALESCE(f.minutes, 0) >= 270"""
 
     # NB: fct_match_rating identifies players by ss_* canonical id (SofaScore).
@@ -267,15 +262,13 @@ WHERE COALESCE(f.minutes, 0) >= 270"""
 SELECT
   fmr.player_id_canonical AS player_id,
   COALESCE(dp.player_name, fmr.player_id_canonical) AS player_name,
-  COALESCE(dp.position, 'unknown') AS position,
-  REGEXP_EXTRACT(COALESCE(dp.position, ''), '^([A-Z]{{2}})') AS position_primary,
+  COALESCE(dp.primary_position, 'unknown') AS position,
+  REGEXP_EXTRACT(COALESCE(dp.primary_position, ''), '^([A-Z]{{2}})') AS position_primary,
   fmr.rating,
   fmr.team_side
 FROM iceberg.gold.fct_match_rating fmr
 LEFT JOIN iceberg.gold.dim_player dp
   ON dp.player_id = fmr.player_id_canonical
- AND dp.season    = {SEASON_FBREF}
- AND dp.league    = fmr.league
 WHERE fmr.season = '{SEASON_OTHER_STR}'
   AND fmr.league = '{LEAGUE}'
   AND fmr.rating IS NOT NULL"""
@@ -314,8 +307,8 @@ rating_cte AS (
 SELECT
   f.player_id,
   COALESCE(dp.player_name, f.player_id) AS player_name,
-  dp.position,
-  REGEXP_EXTRACT(dp.position, '^([A-Z]{{2}})') AS position_primary,
+  dp.primary_position,
+  REGEXP_EXTRACT(dp.primary_position, '^([A-Z]{{2}})') AS position_primary,
   f.team_name, f.matches, f.minutes, f.goals, f.assists,
   COALESCE(x.total_xg, 0.0) AS xg,
   f.shots, f.sot,
@@ -326,9 +319,7 @@ FROM fbref f
 LEFT JOIN xg_cte     x ON x.player_id = f.player_id
 LEFT JOIN rating_cte r ON r.player_id = f.player_id
 LEFT JOIN iceberg.gold.dim_player dp
-  ON dp.player_id = f.player_id
- AND dp.season    = {SEASON_FBREF}
- AND dp.league    = '{LEAGUE}'"""
+  ON dp.player_id = f.player_id"""
 
     # Per-match timeline (Saka-кейс): x = дата матча, y = xG/xA/rating/key_passes
     # из multi-source fct_player_match (post issue #46).
@@ -338,11 +329,11 @@ LEFT JOIN iceberg.gold.dim_player dp
 SELECT
   fpm.player_id_canonical AS player_id,
   COALESCE(dp.player_name, fpm.player_id_canonical) AS player_name,
-  COALESCE(dp.position, fpm.position) AS position,
-  REGEXP_EXTRACT(COALESCE(dp.position, fpm.position), '^([A-Z]{{2}})') AS position_primary,
+  COALESCE(dp.primary_position, fpm.position) AS position,
+  REGEXP_EXTRACT(COALESCE(dp.primary_position, fpm.position), '^([A-Z]{{2}})') AS position_primary,
   fpm.team_name,
   fpm.match_id_canonical AS match_id,
-  dm.date AS match_date,
+  dm.match_date,
   fpm.minutes,
   fpm.goals,
   fpm.assists,
@@ -360,8 +351,6 @@ LEFT JOIN iceberg.gold.dim_match dm
   ON dm.match_id = fpm.match_id_canonical
 LEFT JOIN iceberg.gold.dim_player dp
   ON dp.player_id = fpm.player_id_canonical
- AND dp.season    = fpm.season
- AND dp.league    = fpm.league
 WHERE fpm.season = {SEASON_FBREF}
   AND fpm.league = '{LEAGUE}'"""
 
