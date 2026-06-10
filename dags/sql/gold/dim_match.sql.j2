@@ -36,18 +36,28 @@
 -- =============================================================================
 
 WITH venue_aliases AS (
+    -- GROUP BY (norm, league): two alias spellings may fold to the SAME
+    -- normalised key ("St James' Park" / "St. James Park" -> 'stjamespark').
+    -- dim_venue survives that via its final GROUP BY venue_id, but here a
+    -- non-unique join key would duplicate match rows (323 PK dups observed
+    -- on first #425 build). Same-norm rows always share one canonical_id
+    -- (same stadium by construction), so MAX is exact, not a tiebreak.
     SELECT
-        raw_name,
-        canonical_id,
-        -- Normalised join key — same idiom as dim_venue.sql.j2 / xref_referee.
         regexp_replace(
             regexp_replace(normalize(lower(raw_name), NFD), '\p{Mn}+', ''),
             '[^a-z0-9]+', ''
         ) AS norm,
-        league
+        league,
+        MAX(canonical_id) AS canonical_id
     FROM (VALUES
         {{ venue_aliases_values_sql }}
     ) AS t(raw_name, canonical_id, canonical_name, city, country, league)
+    GROUP BY
+        regexp_replace(
+            regexp_replace(normalize(lower(raw_name), NFD), '\p{Mn}+', ''),
+            '[^a-z0-9]+', ''
+        ),
+        league
 ),
 
 managers_dedup AS (
