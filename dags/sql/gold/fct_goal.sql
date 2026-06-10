@@ -107,8 +107,9 @@
 --   goal_source           varchar     'fct_shot' | 'fbref_own_goal'
 --   goal_version          varchar     literal 'v1'
 --   league                varchar     partition key
---   season                bigint      partition key (year-of-start, normalised
---                                     across both branches — see Season block)
+--   season                varchar     partition key (compact slug 'YYYY', e.g.
+--                                     '2425', normalised across both branches —
+--                                     see Season block)
 --   _ingested_at          timestamp(6)
 --
 -- Logical PK: goal_canonical
@@ -129,17 +130,14 @@
 -- =============================================================================
 -- Two input season representations need merging:
 --
---   * fct_shot.season   varchar mixed format observed in production:
---                       '2021', '2223', '2324', '2425', '2526'.
---                       The first season ('2021' for 2021-22) is the legacy
---                       single-year form; the rest are the compact 'YYNN'
---                       form (e.g. '2425' = 2024-25 → 2024).
---   * fbref_match_events.season   bigint year-of-start (2024 for 2024-25).
+--   * fct_shot.season   varchar slug 'YYNN' ('2223', '2324', '2425', '2526';
+--                       legacy single-year '2021' may also appear from earlier
+--                       ingest).
+--   * fbref_match_events.season   bronze year-of-start bigint (2024 for 2024-25).
 --
--- Target: bigint year-of-start to match gold.dim_match.season.
--- Strategy: detect single-year-form via numeric range (2000..2100) — if
--- already in range, use directly; otherwise parse first-2-digits + 2000.
--- Falls back to TRY_CAST for any unexpected format.
+-- Target: compact slug 'YYYY' varchar to match gold.dim_match.season (#404).
+-- Strategy: the own-goal branch converts the bronze bigint via format(); the
+-- fct_shot branch is already slug and passes through.
 --
 -- =============================================================================
 -- _ingested_at lineage
@@ -275,7 +273,7 @@ own_goals_projected AS (
         CAST('og' AS varchar)               AS pk_tiebreaker,
         og.goal_source,
         og.league,
-        og.season                           AS season,    -- already bigint
+        og.season                           AS season,    -- already slug ('2425')
         og._ingested_at
     FROM fb_own_goals og
 ),

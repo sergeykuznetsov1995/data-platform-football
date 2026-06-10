@@ -13,7 +13,7 @@
 -- Зерно: (team_id_canonical, league, season). INNER JOIN FBref ∩ Understat
 -- (Understat = primary secondary с coverage 100% APL). WhoScored / SofaScore /
 -- FotMob (#97) — LEFT JOIN → diff = NULL когда источник отсутствует. FotMob xref
--- season — year-start '2025'; fotmob_team_season.season — slug '2526'.
+-- season — slug '2526' (#404); fotmob_team_season.season — slug '2526'.
 --
 -- Использование:
 --   1. DQ coverage WARNING — ABS(diff) <= threshold у ≥95% rows.
@@ -61,8 +61,8 @@ xref_ss AS (
       AND confidence <> 'orphan'
 ),
 
--- FotMob xref (#97). season is YEAR-START '2025' (like FBref) → JOIN on
--- CAST(season_year AS varchar); gold.fotmob_team_season.season is slug.
+-- FotMob xref (#97). season is slug '2526' after #404 → JOIN on
+-- CAST(season_year AS varchar) (slug now); gold.fotmob_team_season.season is slug too.
 xref_fm AS (
     SELECT DISTINCT
         canonical_id,

@@ -59,9 +59,12 @@ class TestFctKeeperSeasonStatsSql:
             sql, re.IGNORECASE,
         ), "fct_keeper_season_stats must use INNER JOIN на fbref_keeper_profile"
 
-    def test_season_slug_to_year_idiom(self):
+    def test_season_slug_passthrough(self):
+        """#404: xref season is slug — passed straight through as season_year,
+        no slug→year SUBSTR conversion."""
         sql = _read_sql()
-        assert re.search(
+        assert re.search(r"season\b[^\n]*AS\s+season_year", sql, re.IGNORECASE)
+        assert not re.search(
             r"2000\s*\+\s*CAST\s*\(\s*SUBSTR\s*\(\s*season\s*,\s*1\s*,\s*2\s*\)",
             sql, re.IGNORECASE,
         )

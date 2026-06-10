@@ -29,8 +29,8 @@
 --   иначе fan-out 1.5-4×.
 --
 -- Season normalization (feedback_xref_season_type):
---   xref.season = varchar '2526'; fbref_player_match_stats.season = bigint 2025
---   `2000 + CAST(SUBSTR(season,1,2) AS BIGINT)` приводит slug → bigint.
+--   xref.season = varchar slug '2526'; fbref_player_match_stats.season = varchar slug '2526'
+--   #404 unified all silver/xref season onto the slug form → JOINs are slug = slug.
 --
 -- PK: (match_id_canonical, player_id_canonical) — natural composite, без
 -- xxhash64 (оба компонента non-NULL по конструкции INNER spine).

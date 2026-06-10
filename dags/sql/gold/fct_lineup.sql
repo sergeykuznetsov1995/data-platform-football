@@ -96,18 +96,12 @@
 --   lineup_source         varchar  -- 'fbref' | 'espn' (winner after dedup)
 --   lineup_version        varchar  -- literal 'v1' (schema versioning hook)
 --   league                varchar
---   season                varchar  -- UNIFIED 4-char 'YYYY' (e.g. '2425' for 2024-25 season)
---                                     E3.5 R4 fix (2026-05-08): historically Silver carried
---                                     ``season`` as bigint with mixed semantics — FBref wrote
---                                     year-of-start (``2024`` for 2024-25), ESPN wrote the
---                                     compact slug-as-int (``2425``). Unifying here on the
---                                     ESPN/WhoScored varchar 'YYYY' convention so this column
+--   season                varchar  -- UNIFIED 4-char slug 'YYYY' (e.g. '2425' for 2024-25 season)
+--                                     #404: every Silver/xref/gold season is now the varchar
+--                                     slug, so both branches read the slug from Silver and pass
+--                                     it through — no per-file format()/mod() conversion. Output
 --                                     is comparable to ``fct_event.season`` / ``fct_shot.season``
---                                     / ``xref_team.season`` (all varchar 'YYYY' already).
---                                     FBref branch: ``CAST`` via
---                                     ``format('%02d%02d', mod(season,100), mod(season+1,100))``
---                                     (handles leading-zero edge for 2009→'0910'). ESPN branch:
---                                     re-cast to varchar from the bigint Silver intermediary.
+--                                     / ``xref_team.season`` (all varchar slug).
 --
 --   _silver_created_at    -- NOT projected here; obvyazka adds it.
 -- =============================================================================
@@ -120,11 +114,10 @@ WITH
 -- joins to fbref_match_enriched via (date, home_canonical_id, away_canonical_id).
 -- xref_team.canonical_id makes the team-name comparison alias-tolerant.
 -- Pre-aggregate xref_team distinct (canonical_id, source_id) pairs WITHIN
--- a league to avoid season-format mismatch between ESPN ('2526' slug) and
--- FBref ('2018' year-of-start) — xref_team passes the source's native season
--- format through. canonical_id is league-scoped stable so dropping season
--- from the JOIN here is safe; cross-league ambiguity is impossible because
--- the JOIN to fbref_match_enriched re-applies the league predicate.
+-- a league. After #404 xref_team.season is slug for all sources, but
+-- canonical_id is league-scoped stable so dropping season from the JOIN here
+-- is safe anyway; cross-league ambiguity is impossible because the JOIN to
+-- fbref_match_enriched re-applies the league predicate.
 xref_team_by_canonical AS (
     SELECT DISTINCT source, source_id, canonical_id, league
     FROM iceberg.silver.xref_team

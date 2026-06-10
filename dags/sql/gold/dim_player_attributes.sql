@@ -25,8 +25,8 @@
 -- НЕ заменяет gold.dim_player (per-season, FBref-only). Additive deploy.
 --
 -- Сross-source season type discrepancy (CLAUDE.md):
---   - silver.fbref_player_season_profile.season = bigint  (2025)
---   - silver.fotmob_player_profile.season       = bigint  (2025)
+--   - silver.fbref_player_season_profile.season = varchar slug ('2526')  -- #404
+--   - silver.fotmob_player_profile.season       = varchar slug ('2526')  -- #404
 --   - silver.sofascore_player_profile.season    = varchar ('2526')
 --   - silver.xref_player.season                 = varchar ('2526')
 -- В этом SQL season НЕ используется в JOIN-ключе — snapshot-зерно делает

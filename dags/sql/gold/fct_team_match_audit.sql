@@ -30,13 +30,10 @@
 --   → ВСЕ xref JOIN обязаны иметь (league, season) predicate.
 --
 -- Season normalization (feedback_xref_team_source_id_format.md):
---   xref_team.season — varchar; FBref + FotMob = year-start '2025', US/WS/SS = slug '2526'.
---   xref_match.season — slug '2526' для US/WS/SS; FotMob = year-start '2025' (bronze
---     fotmob_schedule.season is bigint; fm_resolved CTE не конвертирует в slug).
---   silver.fbref_match_enriched.season — bigint 2025.
---   silver.fotmob_team_match.season — slug '2526'.
---   Cross-source slug derived via LPAD(MOD(season,100))||LPAD(MOD(season+1,100)).
---   → FotMob xref bridges JOIN on year-start; the FotMob fact JOINs on season_slug.
+--   #404 unified every silver/xref/gold season onto the slug form 'YYNN' ('2526'):
+--   xref_team / xref_match / silver.fbref_match_enriched / silver.fotmob_team_match
+--   all expose slug now (bronze fotmob_schedule.season is still bigint year-start).
+--   → all bridge + fact JOINs are direct slug = slug (no LPAD/MOD conversion).
 --
 -- PK: (match_id_canonical, team_id_canonical) — natural composite, без xxhash64
 -- (оба компонента non-NULL по конструкции INNER spine FBref ∩ Understat).
@@ -171,8 +168,8 @@ xref_match_ss AS (
       AND confidence <> 'orphan'
 ),
 
--- FotMob xref (#97). season is YEAR-START '2025' (not slug) — JOIN below on
--- CAST(season_year AS varchar); the fact season is slug '2526'.
+-- FotMob xref (#97). season is slug '2526' after #404 — JOIN below on
+-- CAST(season_year AS varchar) (slug now); the fact season is slug '2526' too.
 xref_team_fm AS (
     SELECT DISTINCT
         canonical_id,
@@ -323,7 +320,7 @@ LEFT JOIN iceberg.silver.whoscored_team_match ws
     AND ws.league   = fb.league
     AND ws.season   = fb.season_slug
 
--- ===== FotMob LEFT (#97) — xref season year-start, fact season slug =====
+-- ===== FotMob LEFT (#97) — xref season slug now (#404), fact season slug =====
 LEFT JOIN xref_team_fm xtfm
     ON  xtfm.canonical_id = xtf.canonical_id
     AND xtfm.league       = fb.league

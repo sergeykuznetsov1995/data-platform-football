@@ -10,8 +10,7 @@
 -- вратарь × лига × сезон. Spine — FBref subset из xref_player.
 --
 -- Cross-source season type: см. headerный комментарий fct_player_season_stats.sql.
--- xref slug '2526' → bigint 2025 идиомой
--- `2000 + CAST(SUBSTR(season, 1, 2) AS bigint)` (см. fct_card.sql:51).
+-- #404 unified all silver/xref season onto the slug form → JOINs are slug = slug.
 --
 -- ⚠️ save_pct / save_percentage: FBref `save_pct` хранится как % (e.g. 75.5),
 --    FotMob `save_percentage` — также формат %, но шкала может различаться.

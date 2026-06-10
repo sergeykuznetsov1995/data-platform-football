@@ -41,9 +41,9 @@
 --   card_source           varchar     'fbref' | 'whoscored' (silver.source pass-thru)
 --   card_version          varchar     literal 'v1'
 --   league                varchar     partition key
---   season                bigint      partition key (bigint year-of-start;
---                                     silver stores compact 'YYYY' varchar →
---                                     parsed via 2000 + first-2-digits)
+--   season                varchar     partition key (compact slug 'YYYY',
+--                                     e.g. '2425' for 2024-25; #404 unified all
+--                                     silver/gold season onto the slug form)
 --   _ingested_at          timestamp(6)  bronze provenance (silver pass-thru)
 --
 -- Logical PK: card_canonical
@@ -55,15 +55,13 @@
 --   collisions. ROW_NUMBER tiebreaker keeps the folded dedup behaviour 1:1.
 --
 -- =============================================================================
--- Season normalisation: compact 'YYYY' → bigint year-of-start
+-- Season normalisation: unified compact slug 'YYYY' (varchar)
 -- =============================================================================
--- The folded `fb_cards` CTE emits the unified compact 4-char form ('2425' for
--- the 2024-25 season; FBref bigint year-of-start → compact via format()).
--- gold.dim_match.season is bigint year-of-start (2024). This file aligns to
--- dim_match: `2000 + CAST(SUBSTR(season, 1, 2) AS bigint)` parses the first
--- two digits as the start-year offset century-2000. Defensive TRY_CAST so a
--- malformed season (legacy single-year '2021' from earlier ingest) still
--- yields a usable value via fallback.
+-- Both branches emit the unified compact 4-char slug ('2425' for the 2024-25
+-- season). The folded `fb_cards` CTE reads bronze FBref year-of-start bigint and
+-- converts to the slug via format(); the WhoScored branch is already slug.
+-- gold.dim_match.season is the same slug (varchar) after #404, so the output
+-- season passes through as varchar with no slug↔bigint conversion.
 -- =============================================================================
 
 WITH

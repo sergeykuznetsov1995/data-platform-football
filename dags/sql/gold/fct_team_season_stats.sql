@@ -19,22 +19,16 @@
 -- xref_team. PK = natural composite (оба компонента NOT NULL по INNER FBref
 -- spine; xxhash64 + ROW_NUMBER tiebreaker не нужен — design doc §7).
 --
--- Cross-source season type (verified vs production data 2026-05-28):
---   * silver.xref_team.season для source IN (fbref, fotmob) = varchar year-start '2025'
---   * silver.xref_team.season для source IN (understat,whoscored,sofascore)
---                                                       = varchar slug '2526'
---   * silver.fbref_team_season_profile.season         = bigint 2025
---   * gold.understat_team_season.season               = varchar slug '2526'
---   * gold.whoscored_team_season.season               = varchar slug '2526'
---   * gold.sofascore_team_season.season               = varchar slug '2526'
---   * gold.fotmob_team_season.season                  = varchar slug '2526'
+-- Cross-source season type (all varchar slug 'YYNN' after #404):
+--   * silver.xref_team.season                 = varchar slug '2526' (all sources)
+--   * silver.fbref_team_season_profile.season = varchar slug '2526'
+--   * gold.understat_team_season.season       = varchar slug '2526'
+--   * gold.whoscored_team_season.season       = varchar slug '2526'
+--   * gold.sofascore_team_season.season       = varchar slug '2526'
+--   * gold.fotmob_team_season.season          = varchar slug '2526'
 --
---   FBref xref season — CAST varchar→bigint (2025 = 2025).
---   Cross-source slug '2526' получаем из year-start через
---     LPAD(year%100,2,'0') || LPAD((year+1)%100,2,'0').
---   Note: design doc T6_team_facts_schema.md §4 ошибочно описал xref FBref
---   season как slug — в реальности там year-start (как в bronze.fbref_schedule
---   после CAST AS varchar). Followup для дока — отдельный PR.
+--   #404 unified every silver/xref/gold season onto the slug form, so all
+--   bridge JOINs are direct slug = slug (no varchar↔bigint / LPAD conversion).
 --
 -- xref source_id matching (verified vs xref_team.sql.j2):
 --   * fbref source_id     = bronze.fbref_schedule.home/away (squad NAME).
@@ -97,9 +91,9 @@ xref_ss AS (
       AND confidence <> 'orphan'
 ),
 
--- FotMob xref (#97). season is YEAR-START '2025' (bronze.fotmob_schedule is bigint),
--- like FBref — JOIN on CAST(season_year AS varchar). gold.fotmob_team_season.season
--- is slug '2526' → that fact JOINs on season_slug. team_id = team NAME (== source_id).
+-- FotMob xref (#97). season is slug '2526' after #404 (bronze.fotmob_schedule is
+-- still bigint year-start), like the other sources. gold.fotmob_team_season.season
+-- is slug '2526' too → bridge + fact JOIN slug = slug. team_id = team NAME (== source_id).
 xref_fm AS (
     SELECT DISTINCT
         canonical_id,
@@ -347,7 +341,7 @@ LEFT JOIN iceberg.gold.sofascore_team_season ss
     ON  ss.team_id = xs.ss_team_name
     AND ss.league  = xs.league
     AND ss.season  = xs.season_slug
--- FotMob (#97): xref season year-start; gold.fotmob_team_season season slug.
+-- FotMob (#97): xref season slug now (#404); gold.fotmob_team_season season slug → slug = slug.
 LEFT JOIN xref_fm xfm
     ON  xfm.canonical_id   = xf.canonical_id
     AND xfm.league         = xf.league

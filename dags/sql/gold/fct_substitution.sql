@@ -40,8 +40,8 @@
 --   substitution_source         varchar     'fbref' | 'whoscored'
 --   substitution_version        varchar     literal 'v1'
 --   league                      varchar     partition key
---   season                      bigint      partition key (silver compact
---                                           'YYYY' → bigint year-of-start)
+--   season                      varchar     partition key (compact slug 'YYYY',
+--                                           e.g. '2425'; #404 unified silver/gold)
 --   _ingested_at                timestamp(6)  bronze provenance
 --
 -- Logical PK: substitution_canonical
