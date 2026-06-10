@@ -10,8 +10,16 @@ Architecture
     Triggered by dag_transform_fbref_silver (or manual trigger)
         |
         v
-    dim_team, dim_player, dim_match (read silver.xref_* since E1.5;
-                                     parallel-safe, but sequential to save RAM)
+    dim_competition, dim_season, dim_venue   (config-driven, no dependencies)
+        |
+        v
+    dim_player, dim_team, dim_referee, dim_manager   (from silver.xref_*)
+        |
+        v
+    dim_match   (star centre — carries FKs to ALL dims above, issue #425)
+        |
+        v
+    dim_player_attributes, fct/dim season blocks
         |
         v
     fct_team_match, fct_player_match, match_outcomes
@@ -33,17 +41,18 @@ usage predictable on a dev-sized Trino (5 GB container / 3.5 GB heap).
 
 Gold Tables
 -----------
-- ``gold.dim_team``           — team dimension (reads silver.xref_team since E1.5)
-- ``gold.dim_player``         — player dimension (canonical_id format
-                                'fb_<player_id>' since E1.5)
-- ``gold.dim_match``          — match attributes + ML targets
-                                (reads silver.xref_team since E1.5)
-- ``gold.dim_venue``          — venue master-data (E2)
-- ``gold.dim_referee``        — referee master-data (E2)
+Star-schema dims (issue #425 — unpartitioned, design grains):
+- ``gold.dim_team``           — one row per club (attrs from team_aliases.yaml)
+- ``gold.dim_player``         — one row per player (multi-source COALESCE)
+- ``gold.dim_match``          — match passport: FKs to team/referee/venue/manager
+- ``gold.dim_venue``          — one row per stadium (venue_aliases.yaml identity)
+- ``gold.dim_referee``        — one row per referee (silver.xref_referee canonical)
+- ``gold.dim_manager``        — one row per manager (stints -> fct_manager_stint, #429)
+- ``gold.dim_competition``    — one row per league (configs/medallion/competitions.yaml)
+- ``gold.dim_season``         — one row per season slug (same YAML)
+Other:
 - ``gold.dim_standings``      — SofaScore league-table snapshot (E2)
                                 (reads silver.xref_team(source='sofascore') since E1.5)
-- ``gold.dim_competition``    — competition master-data from leagues.yaml (E2)
-- ``gold.dim_season``         — season master-data with valid_from/valid_to (E2)
 - ``gold.fct_team_match``     — long-form team metrics per match
 - ``gold.fct_team_season_stats`` — cross-source per-season team stats (T6.4 #94;
                                 FBref+Understat+WhoScored+SofaScore via xref_team)
@@ -96,13 +105,52 @@ STAGE_1_5_SOURCE_SEASON_AGG = [
     ('sofascore_team_season', 'dags/sql/gold/sofascore_team_season.sql', 'sofascore_team_season', ['league', 'season']),
 ]
 
-STAGE_2_DIMS = [
-    ('dim_team',   'dags/sql/gold/dim_team.sql',   'dim_team',   ['league', 'season']),
-    ('dim_player', 'dags/sql/gold/dim_player.sql', 'dim_player', ['league', 'season']),
-    ('dim_match',  'dags/sql/gold/dim_match.sql',  'dim_match',  ['league', 'season']),
-    # T5 wiring restore + T6 SofaScore. Player-season block ОТСЮДА depends
-    # on Silver per-source aggregates (FBref/FotMob/WS/US/SofaScore) which
-    # are produced by dag_transform_e3 ahead of this DAG via master pipeline.
+# Star-schema dims (issue #425) build in the design's dependency order:
+#   2a config dims (no dependencies) -> 2b xref dims -> 2c dim_match (centre).
+# ALL star dims are unpartitioned (design rule: dims carry no partitions;
+# dim_match is ~1.9k rows for APL×5 — partitioning is manifest noise).
+
+# Stage 2a: config-driven dims, rendered from configs/medallion/*.yaml via
+# utils.dim_loaders (Jinja .sql.j2 -> tempfile -> CTAS).
+STAGE_2A_CONFIG_DIMS_INLINE = [
+    # (task_id, renderer_name, template_path, table_name, partition_cols)
+    ('dim_competition', 'render_dim_competition_sql',
+     'dags/sql/gold/dim_competition.sql.j2', 'dim_competition', None),
+    ('dim_season',      'render_dim_season_sql',
+     'dags/sql/gold/dim_season.sql.j2',      'dim_season',      None),
+    # dim_venue (issue #145): curated alias-identity from venue_aliases.yaml.
+    ('dim_venue',       'render_dim_venue_sql',
+     'dags/sql/gold/dim_venue.sql.j2',       'dim_venue',       None),
+]
+
+# Stage 2b: dims built from silver.xref_* canonical identities.
+STAGE_2B_XREF_DIMS_SQL = [
+    # (task_id, sql_file, table_name, partition_cols)
+    ('dim_player',  'dags/sql/gold/dim_player.sql',  'dim_player',  None),
+    ('dim_referee', 'dags/sql/gold/dim_referee.sql', 'dim_referee', None),
+    ('dim_manager', 'dags/sql/gold/dim_manager.sql', 'dim_manager', None),
+]
+STAGE_2B_XREF_DIMS_INLINE = [
+    # dim_team: xref_team spine + country/short_name from team_aliases.yaml.
+    ('dim_team', 'render_dim_team_sql',
+     'dags/sql/gold/dim_team.sql.j2', 'dim_team', None),
+]
+
+# Stage 2c: the centre of the star — needs every dim above (FK targets) and
+# resolves referee/venue/manager ids itself via xref + venue alias VALUES.
+STAGE_2C_DIM_MATCH_INLINE = [
+    ('dim_match', 'render_dim_match_sql',
+     'dags/sql/gold/dim_match.sql.j2', 'dim_match', None),
+]
+
+# Stage 2d: snapshot/per-season blocks that historically shared the dim stage.
+# dim_standings IS partitioned by (league, season) because Bronze emits one
+# snapshot per league/season (its star redesign -> fct_standings is #428).
+STAGE_2D_SEASON_BLOCKS = [
+    ('dim_standings', 'dags/sql/gold/dim_standings.sql', 'dim_standings', ['league', 'season']),
+    # T5 wiring restore + T6 SofaScore. Player-season block depends on Silver
+    # per-source aggregates (FBref/FotMob/WS/US/SofaScore) which are produced
+    # by dag_transform_e3 ahead of this DAG via master pipeline.
     # dim_player_attributes — snapshot-grain (один row per canonical_id),
     # season не в SELECT. Без partition cols.
     ('dim_player_attributes',     'dags/sql/gold/dim_player_attributes.sql',
@@ -131,35 +179,6 @@ STAGE_2_DIMS = [
     ('fct_team_season_stats_audit',
      'dags/sql/gold/fct_team_season_stats_audit.sql',
      'fct_team_season_stats_audit', ['league', 'season']),
-]
-
-# E2: master-data dims that are NOT partitioned by (league, season).
-# Three are read straight from a static .sql file (Bronze-sourced); the other
-# two (dim_competition, dim_season) are rendered from config via
-# utils.dim_loaders before CTAS — see STAGE_2B_MASTER_DIMS_INLINE below.
-#
-# dim_standings IS partitioned by (league, season) because Bronze emits one
-# snapshot per league/season. The other four are tiny static reference tables
-# (~5-30 rows) so partitioning would just create empty manifest noise.
-STAGE_2B_MASTER_DIMS_SQL = [
-    # (task_id, sql_file, table_name, partition_cols)
-    ('dim_referee',   'dags/sql/gold/dim_referee.sql',   'dim_referee',   None),
-    ('dim_manager',   'dags/sql/gold/dim_manager.sql',   'dim_manager',   None),
-    ('dim_standings', 'dags/sql/gold/dim_standings.sql', 'dim_standings', ['league', 'season']),
-]
-
-# Inline-rendered master dims (Jinja .sql.j2 templates -> tempfile -> CTAS).
-# Renderer functions are looked up by name at TaskGroup-build time so the
-# top-level DAG body stays import-light (no eager import of dim_loaders -> yaml).
-STAGE_2B_MASTER_DIMS_INLINE = [
-    # (task_id, renderer_name, template_path, table_name, partition_cols)
-    # dim_venue (issue #145): curated alias-identity from venue_aliases.yaml.
-    ('dim_venue',       'render_dim_venue_sql',
-     'dags/sql/gold/dim_venue.sql.j2',       'dim_venue',       None),
-    ('dim_competition', 'render_dim_competition_sql',
-     'dags/sql/gold/dim_competition.sql.j2', 'dim_competition', None),
-    ('dim_season',      'render_dim_season_sql',
-     'dags/sql/gold/dim_season.sql.j2',      'dim_season',      None),
 ]
 
 STAGE_3_FACTS = [
@@ -353,48 +372,27 @@ with DAG(
                            'partition_cols': pcols},
             )
 
-    # Stage 2: dimensions (read silver.xref_* directly since E1.5)
-    with TaskGroup(group_id='s2_dimensions') as g2:
-        for task_id, sql_file, table_name, pcols in STAGE_2_DIMS:
-            PythonOperator(
-                task_id=task_id,
-                python_callable=_run_transform,
-                op_kwargs={'sql_file': sql_file, 'table_name': table_name,
-                           'partition_cols': pcols},
-            )
+    # Inline-rendered dims: import the renderer registry inside the DAG body
+    # (NOT at module top) so DAG parse stays cheap for unrelated DAGs in the
+    # same DagBag.
+    from utils.dim_loaders import (
+        render_dim_competition_sql,
+        render_dim_match_sql,
+        render_dim_season_sql,
+        render_dim_team_sql,
+        render_dim_venue_sql,
+        run_inline_ctas,
+    )
+    _RENDERERS = {
+        'render_dim_venue_sql':       render_dim_venue_sql,
+        'render_dim_competition_sql': render_dim_competition_sql,
+        'render_dim_season_sql':      render_dim_season_sql,
+        'render_dim_team_sql':        render_dim_team_sql,
+        'render_dim_match_sql':       render_dim_match_sql,
+    }
 
-    # Stage 2b: master-data dims (E2). Three Bronze-sourced + two
-    # config-rendered. NOT in s2_dimensions because:
-    #   * dim_team / dim_player / dim_match are FBref-driven and partitioned
-    #     by (league, season); the master dims have a different shape (mostly
-    #     un-partitioned, some come from YAML / Python config).
-    #   * Keeping a separate group makes the Airflow UI mirror the medallion
-    #     plan (E2 is "master-data dims") and keeps blast radius tight if
-    #     Phase B's SQL needs to be re-run independently.
-    with TaskGroup(group_id='s2b_master_dims') as g2b:
-        for task_id, sql_file, table_name, pcols in STAGE_2B_MASTER_DIMS_SQL:
-            PythonOperator(
-                task_id=task_id,
-                python_callable=_run_transform,
-                op_kwargs={'sql_file': sql_file, 'table_name': table_name,
-                           'partition_cols': pcols},
-            )
-
-        # Inline-rendered dims: lazy-import the renderer registry inside the
-        # TaskGroup body (NOT at module top) so DAG parse stays cheap and
-        # doesn't pull in PyYAML for unrelated DAGs in the same DagBag.
-        from utils.dim_loaders import (
-            render_dim_competition_sql,
-            render_dim_season_sql,
-            render_dim_venue_sql,
-            run_inline_ctas,
-        )
-        _RENDERERS = {
-            'render_dim_venue_sql':       render_dim_venue_sql,
-            'render_dim_competition_sql': render_dim_competition_sql,
-            'render_dim_season_sql':      render_dim_season_sql,
-        }
-        for task_id, renderer_name, tpl, table_name, pcols in STAGE_2B_MASTER_DIMS_INLINE:
+    def _add_inline_dims(stage):
+        for task_id, renderer_name, tpl, table_name, pcols in stage:
             PythonOperator(
                 task_id=task_id,
                 python_callable=run_inline_ctas,
@@ -404,6 +402,37 @@ with DAG(
                     'table_name':   table_name,
                     'partition_cols': pcols,
                 },
+            )
+
+    # Stage 2a: config-driven dims (design §7 step 1 — no dependencies).
+    with TaskGroup(group_id='s2a_config_dims') as g2a:
+        _add_inline_dims(STAGE_2A_CONFIG_DIMS_INLINE)
+
+    # Stage 2b: dims from silver.xref_* canonical identities (design step 2).
+    with TaskGroup(group_id='s2b_xref_dims') as g2b:
+        for task_id, sql_file, table_name, pcols in STAGE_2B_XREF_DIMS_SQL:
+            PythonOperator(
+                task_id=task_id,
+                python_callable=_run_transform,
+                op_kwargs={'sql_file': sql_file, 'table_name': table_name,
+                           'partition_cols': pcols},
+            )
+        _add_inline_dims(STAGE_2B_XREF_DIMS_INLINE)
+
+    # Stage 2c: dim_match — the star centre (design step 3). Group chaining
+    # (not intra-group deps) guarantees every FK-target dim exists first.
+    with TaskGroup(group_id='s2c_dim_match') as g2c:
+        _add_inline_dims(STAGE_2C_DIM_MATCH_INLINE)
+
+    # Stage 2d: snapshot/per-season blocks (dim_player_attributes,
+    # fct_*_season_stats, dim_standings) — unchanged by #425.
+    with TaskGroup(group_id='s2d_season_blocks') as g2d:
+        for task_id, sql_file, table_name, pcols in STAGE_2D_SEASON_BLOCKS:
+            PythonOperator(
+                task_id=task_id,
+                python_callable=_run_transform,
+                op_kwargs={'sql_file': sql_file, 'table_name': table_name,
+                           'partition_cols': pcols},
             )
 
     # Stage 3: base facts (long-form). Some tables degrade gracefully via
@@ -495,4 +524,5 @@ with DAG(
         python_callable=_quality,
     )
 
-    g1_5 >> g2 >> g2b >> g3 >> g4 >> g5 >> g6 >> g7 >> validate_row_counts >> validate_quality
+    (g1_5 >> g2a >> g2b >> g2c >> g2d >> g3 >> g4 >> g5 >> g6 >> g7
+     >> validate_row_counts >> validate_quality)

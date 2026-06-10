@@ -1,20 +1,20 @@
 """
-Topology tests for ``dags/dag_transform_fbref_gold.py`` — E2 master-data
-dims (2026-05).
+Topology tests for ``dags/dag_transform_fbref_gold.py`` — star-schema dims
+(issue #425, supersedes the E2 master-dims layout).
 
-Verifies the integration of the new ``s2b_master_dims`` TaskGroup:
-  * 6 new task IDs exist (``dim_venue``, ``dim_referee``, ``dim_manager``,
-    ``dim_standings``, ``dim_competition``, ``dim_season``).
-  * The group is downstream of ``s2_dimensions`` (specifically the
-    pre-existing ``dim_team``/``dim_player``/``dim_match`` tasks).
-  * The group is upstream of the s3 facts (``fct_team_match`` etc.).
+Verifies the staged dim build order from the design (§7):
+  * s2a_config_dims  — dim_competition / dim_season / dim_venue (inline j2)
+  * s2b_xref_dims    — dim_player / dim_referee / dim_manager (.sql)
+                       + dim_team (inline j2)
+  * s2c_dim_match    — dim_match (inline j2, the star centre)
+  * s2d_season_blocks — dim_standings / dim_player_attributes / fct_*_season
+  * group chaining: s2a >> s2b >> s2c >> s2d >> s3_facts
+  * ALL 8 star dims are unpartitioned (partition_cols=None).
   * ``dag.max_active_tasks == 1`` is preserved.
 
 Runs on the host without real Airflow — relies on the lightweight stubs
 installed by ``tests/unit/dags/conftest.py`` (``_PythonOperator``,
-``_TaskGroup``, ``_StubDAG``). Those stubs were extended in this commit
-to track operator instances + cross-group ``>>`` edges so this test can
-make topology assertions without DagBag.
+``_TaskGroup``, ``_StubDAG``).
 """
 
 from __future__ import annotations
@@ -68,12 +68,37 @@ def _by_task_id(task_id: str):
     return matches[0]
 
 
+CONFIG_DIM_IDS = {
+    "s2a_config_dims.dim_competition",
+    "s2a_config_dims.dim_season",
+    "s2a_config_dims.dim_venue",
+}
+XREF_DIM_IDS = {
+    "s2b_xref_dims.dim_player",
+    "s2b_xref_dims.dim_referee",
+    "s2b_xref_dims.dim_manager",
+    "s2b_xref_dims.dim_team",
+}
+DIM_MATCH_ID = "s2c_dim_match.dim_match"
+ALL_STAR_DIM_IDS = CONFIG_DIM_IDS | XREF_DIM_IDS | {DIM_MATCH_ID}
+
+# (task_id, expected renderer template suffix) — every star dim that renders
+# through run_inline_ctas.
+INLINE_DIMS = [
+    ("s2a_config_dims.dim_competition", "dim_competition.sql.j2"),
+    ("s2a_config_dims.dim_season",      "dim_season.sql.j2"),
+    ("s2a_config_dims.dim_venue",       "dim_venue.sql.j2"),
+    ("s2b_xref_dims.dim_team",          "dim_team.sql.j2"),
+    ("s2c_dim_match.dim_match",         "dim_match.sql.j2"),
+]
+
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
 
 @pytest.mark.unit
-class TestE2DagLoad:
+class TestDagLoad:
     """The DAG module imports cleanly under the stubbed Airflow."""
 
     def test_dag_loads_without_errors(self):
@@ -82,7 +107,7 @@ class TestE2DagLoad:
         assert mod.dag.dag_id == "dag_transform_fbref_gold"
 
     def test_max_active_tasks_is_one(self):
-        """E2 must NOT bump max_active_tasks — Trino RAM budget assumes 1."""
+        """#425 must NOT bump max_active_tasks — Trino RAM budget assumes 1."""
         mod = _reload_gold_dag()
         assert mod.dag._dag_kwargs.get("max_active_tasks") == 1, (
             "max_active_tasks must remain 1 for predictable RAM"
@@ -90,148 +115,104 @@ class TestE2DagLoad:
 
 
 @pytest.mark.unit
-class TestE2NewTaskIds:
-    """The 6 new master-data dim task IDs exist in the DAG."""
+class TestStarDimTaskIds:
+    """All 8 star dims exist under their design-stage groups."""
 
-    EXPECTED_E2_TASK_IDS = {
-        "s2b_master_dims.dim_venue",
-        "s2b_master_dims.dim_referee",
-        "s2b_master_dims.dim_manager",
-        "s2b_master_dims.dim_standings",
-        "s2b_master_dims.dim_competition",
-        "s2b_master_dims.dim_season",
-    }
-
-    def test_all_e2_task_ids_present(self):
+    def test_all_star_dim_task_ids_present(self):
         _reload_gold_dag()
         task_ids = _all_task_ids()
-        missing = self.EXPECTED_E2_TASK_IDS - task_ids
+        missing = ALL_STAR_DIM_IDS - task_ids
         assert not missing, (
-            f"missing E2 task IDs: {missing}. Found: "
-            f"{[t for t in task_ids if 's2b' in t]}"
+            f"missing star-dim task IDs: {missing}. Found: "
+            f"{[t for t in task_ids if 's2' in t]}"
         )
 
-    def test_e2_tasks_are_under_s2b_group(self):
-        """All 5 new tasks live under the s2b_master_dims group_id prefix."""
+    def test_season_blocks_under_s2d(self):
+        """dim_standings + dim_player_attributes stayed in the season-block
+        stage (their redesign is #428, not #425)."""
         _reload_gold_dag()
         task_ids = _all_task_ids()
-        s2b_tasks = {t for t in task_ids if t.startswith("s2b_master_dims.")}
-        assert s2b_tasks == self.EXPECTED_E2_TASK_IDS, (
-            f"unexpected s2b tasks. Expected {self.EXPECTED_E2_TASK_IDS}, "
-            f"got {s2b_tasks}"
-        )
+        assert "s2d_season_blocks.dim_standings" in task_ids
+        assert "s2d_season_blocks.dim_player_attributes" in task_ids
 
 
 @pytest.mark.unit
-class TestE2GroupDependencies:
-    """``s2b_master_dims`` is downstream of ``s2_dimensions`` and upstream of
-    ``s3_facts`` (verified per-task via ``upstream_task_ids``)."""
+class TestStageChaining:
+    """Design §7 build order via group chaining (s2a >> s2b >> s2c >> ...)."""
 
-    def test_dim_venue_downstream_of_dim_team(self):
-        """dim_venue runs AFTER dim_team (s2 → s2b)."""
+    def test_xref_dims_downstream_of_all_config_dims(self):
+        """Every s2b task is downstream of every s2a task (full fanout)."""
         _reload_gold_dag()
-        venue = _by_task_id("s2b_master_dims.dim_venue")
-        # The cross-group edge ``g2 >> g2b`` propagates as: every leaf in g2
-        # is upstream of every root in g2b. dim_team is one such leaf.
-        assert "s2_dimensions.dim_team" in venue.upstream_task_ids, (
-            f"dim_venue must be downstream of dim_team. "
-            f"upstream_task_ids={venue.upstream_task_ids}"
-        )
-
-    def test_all_e2_tasks_downstream_of_s2_dimensions(self):
-        """Every task in s2b is downstream of every task in s2 (full fanout)."""
-        _reload_gold_dag()
-        s2_task_ids = {
-            "s2_dimensions.dim_team",
-            "s2_dimensions.dim_player",
-            "s2_dimensions.dim_match",
-        }
-        e2_tasks = [
-            _by_task_id(tid) for tid in TestE2NewTaskIds.EXPECTED_E2_TASK_IDS
-        ]
-        for op in e2_tasks:
-            missing = s2_task_ids - op.upstream_task_ids
+        for tid in XREF_DIM_IDS:
+            op = _by_task_id(tid)
+            missing = CONFIG_DIM_IDS - op.upstream_task_ids
             assert not missing, (
-                f"{op.task_id} missing s2 upstreams: {missing}. "
+                f"{tid} missing s2a upstreams: {missing}. "
                 f"Have: {op.upstream_task_ids}"
             )
 
-    def test_dim_venue_upstream_of_fct_team_match(self):
-        """dim_venue runs BEFORE fct_team_match (s2b → s3)."""
+    def test_dim_match_downstream_of_all_xref_dims(self):
+        """dim_match (star centre) builds after every FK-target dim."""
         _reload_gold_dag()
-        venue = _by_task_id("s2b_master_dims.dim_venue")
-        # s3_facts is the next group; fct_team_match is one of its roots.
-        assert "s3_facts.fct_team_match" in venue.downstream_task_ids, (
-            f"dim_venue must be upstream of fct_team_match. "
-            f"downstream_task_ids={venue.downstream_task_ids}"
+        match = _by_task_id(DIM_MATCH_ID)
+        missing = XREF_DIM_IDS - match.upstream_task_ids
+        assert not missing, (
+            f"dim_match missing xref-dim upstreams: {missing}. "
+            f"Have: {match.upstream_task_ids}"
         )
 
-    def test_all_e2_tasks_upstream_of_s3_facts(self):
-        """Every E2 task fans out to every s3 task (full fanout)."""
+    def test_dim_match_upstream_of_season_blocks(self):
+        _reload_gold_dag()
+        match = _by_task_id(DIM_MATCH_ID)
+        assert "s2d_season_blocks.fct_team_season_stats" in match.downstream_task_ids
+
+    def test_season_blocks_upstream_of_s3_facts(self):
+        """s2d fans out to the s3 fact roots."""
         _reload_gold_dag()
         s3_task_ids = {
             "s3_facts.fct_team_match",
             "s3_facts.fct_player_match",
             "s3_facts.match_outcomes",
         }
-        e2_tasks = [
-            _by_task_id(tid) for tid in TestE2NewTaskIds.EXPECTED_E2_TASK_IDS
-        ]
-        for op in e2_tasks:
-            missing = s3_task_ids - op.downstream_task_ids
-            assert not missing, (
-                f"{op.task_id} missing s3 downstreams: {missing}. "
-                f"Have: {op.downstream_task_ids}"
-            )
+        op = _by_task_id("s2d_season_blocks.dim_standings")
+        missing = s3_task_ids - op.downstream_task_ids
+        assert not missing, (
+            f"dim_standings missing s3 downstreams: {missing}. "
+            f"Have: {op.downstream_task_ids}"
+        )
 
 
 @pytest.mark.unit
-class TestE2InlineRendererWiring:
-    """The three inline-rendered dims (dim_venue, dim_competition, dim_season)
-    wire into the DAG via PythonOperator(python_callable=run_inline_ctas)."""
+class TestDimWiring:
+    """Renderer wiring + the design rule 'dims are unpartitioned'."""
 
-    def test_dim_venue_uses_run_inline_ctas(self):
-        """issue #145: dim_venue moved from a static .sql to a config-rendered
-        .sql.j2 (curated alias identity) → inline-CTAS like dim_competition."""
+    def test_inline_dims_use_run_inline_ctas(self):
         _reload_gold_dag()
-        venue = _by_task_id("s2b_master_dims.dim_venue")
-        assert venue.python_callable is not None
-        assert venue.python_callable.__name__ == "run_inline_ctas", (
-            f"expected run_inline_ctas, got {venue.python_callable.__name__}"
-        )
-        assert "renderer" in venue.op_kwargs
-        assert venue.op_kwargs.get("template_sql", "").endswith(
-            "dim_venue.sql.j2"
-        )
-        assert venue.op_kwargs.get("table_name") == "dim_venue"
-        assert venue.op_kwargs.get("partition_cols") is None
+        for tid, tpl_suffix in INLINE_DIMS:
+            op = _by_task_id(tid)
+            assert op.python_callable is not None, tid
+            assert op.python_callable.__name__ == "run_inline_ctas", (
+                f"{tid}: expected run_inline_ctas, "
+                f"got {op.python_callable.__name__}"
+            )
+            assert "renderer" in op.op_kwargs, tid
+            assert op.op_kwargs.get("template_sql", "").endswith(tpl_suffix), tid
 
-    def test_dim_competition_uses_run_inline_ctas(self):
+    def test_all_star_dims_unpartitioned(self):
+        """Star design rule: dims carry NO partitions (incl. the previously
+        (league, season)-partitioned dim_team/dim_player/dim_match)."""
         _reload_gold_dag()
-        comp = _by_task_id("s2b_master_dims.dim_competition")
-        # python_callable points at run_inline_ctas (or its module-level alias)
-        assert comp.python_callable is not None
-        assert comp.python_callable.__name__ == "run_inline_ctas", (
-            f"expected run_inline_ctas, got {comp.python_callable.__name__}"
-        )
-        # op_kwargs must include the renderer + template path
-        assert "renderer" in comp.op_kwargs
-        assert "template_sql" in comp.op_kwargs
-        assert comp.op_kwargs.get("table_name") == "dim_competition"
-        # Master dim is NOT partitioned
-        assert comp.op_kwargs.get("partition_cols") is None
-
-    def test_dim_season_uses_run_inline_ctas(self):
-        _reload_gold_dag()
-        season = _by_task_id("s2b_master_dims.dim_season")
-        assert season.python_callable.__name__ == "run_inline_ctas"
-        assert season.op_kwargs.get("table_name") == "dim_season"
-        assert season.op_kwargs.get("partition_cols") is None
+        for tid in ALL_STAR_DIM_IDS:
+            op = _by_task_id(tid)
+            assert op.op_kwargs.get("partition_cols") is None, (
+                f"{tid}: star dims must be unpartitioned, "
+                f"got {op.op_kwargs.get('partition_cols')!r}"
+            )
 
     def test_dim_standings_partitioned_by_league_season(self):
         """dim_standings IS partitioned by (league, season) per the SQL contract."""
         _reload_gold_dag()
-        st = _by_task_id("s2b_master_dims.dim_standings")
+        st = _by_task_id("s2d_season_blocks.dim_standings")
         assert st.op_kwargs.get("partition_cols") == ["league", "season"], (
             f"dim_standings partition_cols should be ['league','season'], "
             f"got {st.op_kwargs.get('partition_cols')!r}"
