@@ -22,7 +22,6 @@ against Trino. The corresponding end-to-end check lives in
 
 from __future__ import annotations
 
-import importlib
 import re
 import sys
 import textwrap
@@ -89,12 +88,11 @@ def rendered_sql(monkeypatch, tmp_path) -> str:
     """Run ``render_dim_competition_sql`` against a fixture competitions.yaml."""
     pytest.importorskip("yaml")
     (tmp_path / "competitions.yaml").write_text(_COMPETITIONS_YAML_CONTENT)
-    monkeypatch.setenv("MEDALLION_CONFIG_DIR", str(tmp_path))
 
-    # CONFIG_DIR is a module-level Path resolved at import time — reload to
-    # pick up the env var (same pattern as test_medallion_config.py).
+    # Patch the module attribute (NOT env + reload): monkeypatch restores it
+    # on teardown, so later tests in the same session keep the real config.
     from utils import medallion_config
-    importlib.reload(medallion_config)
+    monkeypatch.setattr(medallion_config, "CONFIG_DIR", tmp_path)
     medallion_config.reset_cache()
 
     from utils import dim_loaders

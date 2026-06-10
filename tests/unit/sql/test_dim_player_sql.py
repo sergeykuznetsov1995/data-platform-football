@@ -1,14 +1,13 @@
 """
-Unit tests for ``dags/sql/gold/dim_player.sql`` after E1.5 cutover (2026-05-09).
+Unit tests for ``dags/sql/gold/dim_player.sql`` — star-schema grain (#425).
 
-T2 aligned dim_player with the silver.xref_player canonical convention:
-FBref-source players carry ``canonical_id = 'fb_' || raw player_id``.
-Rather than introducing a JOIN (which would be redundant — the canonical
-id is a deterministic function of source + raw id), the prefix is
-applied inline: ``'fb_' || player_id AS player_id``.
+dim_player is one row per PLAYER (no season in the grain): spine =
+silver.xref_player (source='fbref', canonical 'fb_<id>'), attributes
+COALESCE'd from FotMob / SofaScore / Transfermarkt / SoFIFA.
 
-This file pins down that contract so a future refactor can't silently
-drop the prefix.
+These are regex sanity checks over the SQL text — the executable contract
+is exercised by the integration smoke + validate_gold_quality (PK
+uniqueness on player_id).
 """
 
 from __future__ import annotations
@@ -37,26 +36,52 @@ def _strip_comments(sql: str) -> str:
 pytestmark = pytest.mark.unit
 
 
-class TestDimPlayerCutoverStructure:
-    """Regex sanity over ``dim_player.sql`` post-E1.5 cutover."""
+class TestDimPlayerStarStructure:
+    """Regex sanity over ``dim_player.sql`` post-#425 redesign."""
 
-    def test_fb_prefix_applied_inline(self):
-        """``'fb_' || player_id AS player_id`` (or CONCAT equivalent)."""
-        sql = _read_sql()
-        # Trino accepts both `||` and CONCAT(...) — we accept either.
-        pipes = re.search(
-            r"'fb_'\s*\|\|\s*player_id\s+AS\s+player_id",
-            sql, re.IGNORECASE,
+    def test_spine_is_xref_player_fbref(self):
+        """The row spine comes from silver.xref_player (FBref, non-orphan)."""
+        sql = _strip_comments(_read_sql())
+        assert "iceberg.silver.xref_player" in sql
+        assert re.search(r"source\s*=\s*'fbref'", sql)
+        assert re.search(r"confidence\s*<>\s*'orphan'", sql)
+
+    def test_pk_is_canonical_id_no_season(self):
+        """PK player_id = xref canonical; season is NOT a grain component."""
+        sql = _strip_comments(_read_sql())
+        assert re.search(r"canonical_id\s+AS\s+player_id", sql, re.IGNORECASE)
+        # season must not appear in the final SELECT output — it is only a
+        # MAX_BY ordering key inside the per-source CTEs.
+        final = sql[sql.rindex("FROM xref_fbref"):]
+        assert "season" not in final.lower(), (
+            "season must not leak into the final dim_player projection"
         )
-        concat = re.search(
-            r"CONCAT\s*\(\s*'fb_'\s*,\s*player_id\s*\)\s+AS\s+player_id",
-            sql, re.IGNORECASE,
+
+    def test_design_columns_present(self):
+        """All 6 design attribute columns are emitted."""
+        sql = _strip_comments(_read_sql())
+        for col in ("player_name", "dob", "nationality", "height_cm",
+                    "preferred_foot", "primary_position"):
+            assert re.search(rf"AS\s+{col}\b", sql, re.IGNORECASE), (
+                f"dim_player.sql must emit {col!r}"
+            )
+
+    def test_multi_source_enrichment(self):
+        """All four enrichment sources are joined."""
+        sql = _strip_comments(_read_sql())
+        for src in ("fotmob_player_profile", "sofascore_player_profile",
+                    "transfermarkt_players", "sofifa_player_profile"):
+            assert f"iceberg.silver.{src}" in sql, (
+                f"dim_player.sql must enrich from silver.{src}"
+            )
+
+    def test_height_priority_transfermarkt_first(self):
+        """TM is the primary height source (official club profile)."""
+        sql = _strip_comments(_read_sql())
+        m = re.search(
+            r"COALESCE\(\s*tm\.height_cm\s*,", sql, re.IGNORECASE
         )
-        assert pipes or concat, (
-            "dim_player.sql must apply the silver.xref_player FBref "
-            "canonical-id prefix inline: `'fb_' || player_id AS "
-            "player_id` (or CONCAT equivalent)"
-        )
+        assert m, "height_cm COALESCE must start with Transfermarkt (tm.)"
 
     def test_no_legacy_entity_xref_reference(self):
         """gold.entity_xref must not appear in executable SQL."""
@@ -65,60 +90,8 @@ class TestDimPlayerCutoverStructure:
             "dim_player.sql must NOT reference gold.entity_xref"
         )
 
-    def test_pk_contract_group_by_includes_player_id(self):
-        """PK = (player_id, season). GROUP BY must include player_id
-        so the prefixed id remains unique per season."""
-        sql = _read_sql()
-        m = re.search(r"GROUP\s+BY\s+([^\n;]+)", sql, re.IGNORECASE)
-        assert m, "dim_player.sql is missing a GROUP BY clause"
-        group_by = m.group(1).lower()
-        # The natural-key player_id is what's grouped — the 'fb_' prefix
-        # is applied in the SELECT projection only. We assert the bare
-        # player_id is in the GROUP BY because grouping by the prefixed
-        # alias would error in Trino (alias not visible to GROUP BY).
-        assert "player_id" in group_by, (
-            "dim_player.sql GROUP BY must include `player_id` to honour "
-            f"the (player_id, season) PK contract; got: {group_by!r}"
-        )
-        assert "season" in group_by, (
-            "dim_player.sql GROUP BY must include `season`; got: "
-            f"{group_by!r}"
-        )
-
-    def test_reads_from_silver_player_season_profile(self):
-        """Source is iceberg.silver.fbref_player_season_profile (FBref-only
-        dimension; cross-source enrichment is deferred)."""
-        sql = _strip_comments(_read_sql())
-        assert "iceberg.silver.fbref_player_season_profile" in sql, (
-            "dim_player.sql must read iceberg.silver.fbref_player_season_profile"
-        )
-
-    def test_migration_breadcrumb_in_header(self):
-        """The E1.5 cutover note must be discoverable in the header."""
-        sql = _read_sql()
-        # dim_player's breadcrumb mentions `silver.xref_player` rather than
-        # `silver.xref_team` (the canonical convention not the JOIN target).
-        assert "E1.5" in sql and "silver.xref_player" in sql, (
-            "dim_player.sql must keep an E1.5 breadcrumb pointing to "
-            "silver.xref_player canonical convention"
-        )
-
-    def test_filters_null_player_id_and_season(self):
-        """Existing WHERE clause must still filter out NULL player_id /
-        season (otherwise 'fb_' || NULL → NULL violates the PK)."""
-        sql = _read_sql()
-        assert re.search(
-            r"player_id\s+IS\s+NOT\s+NULL", sql, re.IGNORECASE
-        ), (
-            "dim_player.sql must keep `player_id IS NOT NULL` filter — "
-            "'fb_' || NULL => NULL would corrupt the PK"
-        )
-        assert re.search(
-            r"season\s+IS\s+NOT\s+NULL", sql, re.IGNORECASE
-        ), "dim_player.sql must keep `season IS NOT NULL` filter"
-
     def test_pure_select_no_create_table(self):
+        """File stays a pure SELECT — CTAS wrapping is the runner's job."""
         sql = _strip_comments(_read_sql())
-        assert "CREATE TABLE" not in sql.upper(), (
-            "dim_player.sql must remain a pure SELECT"
-        )
+        assert "CREATE TABLE" not in sql.upper()
+        assert "INSERT INTO" not in sql.upper()

@@ -20,7 +20,6 @@ Strategy:
 from __future__ import annotations
 
 import datetime as _dt
-import importlib
 import re
 import sys
 import textwrap
@@ -121,10 +120,11 @@ _COMPETITIONS_YAML_CONTENT = textwrap.dedent("""\
 def rendered_sql(monkeypatch, tmp_path) -> str:
     pytest.importorskip("yaml")
     (tmp_path / "competitions.yaml").write_text(_COMPETITIONS_YAML_CONTENT)
-    monkeypatch.setenv("MEDALLION_CONFIG_DIR", str(tmp_path))
 
+    # Patch the module attribute (NOT env + reload): monkeypatch restores it
+    # on teardown, so later tests in the same session keep the real config.
     from utils import medallion_config
-    importlib.reload(medallion_config)
+    monkeypatch.setattr(medallion_config, "CONFIG_DIR", tmp_path)
     medallion_config.reset_cache()
 
     from utils import dim_loaders
@@ -208,10 +208,9 @@ def test_leading_zero_slug_formatting(monkeypatch, tmp_path):
             in_scope: true
         """)
     (tmp_path / "competitions.yaml").write_text(yaml_content)
-    monkeypatch.setenv("MEDALLION_CONFIG_DIR", str(tmp_path))
 
     from utils import medallion_config
-    importlib.reload(medallion_config)
+    monkeypatch.setattr(medallion_config, "CONFIG_DIR", tmp_path)
     medallion_config.reset_cache()
 
     from utils import dim_loaders
