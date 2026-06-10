@@ -153,3 +153,7 @@ relationships:
     to: trino_iceberg.iceberg.gold.dim_team.team_id
     type: FOREIGN_KEY
     description: N:1 — атрибуты команды.
+  - from: player_id_canonical
+    to: trino_iceberg.iceberg.gold.dim_player.player_id
+    type: FOREIGN_KEY
+    description: N:1 — канонический per-season player dim (FBref spine).
