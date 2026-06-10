@@ -1,0 +1,42 @@
+# =============================================================================
+# OpenMetadata description: iceberg.silver.fotmob_match_referee
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.silver.fotmob_match_referee
+  description: |
+    Судья матча и его страна из FotMob — один row на (match_id, league, season).
+    Issue #290: FotMob — единственный источник, отдающий СТРАНУ судьи (FBref и
+    MatchHistory дают только имя). Источник:
+    bronze.fotmob_match_details.match_facts_json (varchar JSON), извлечение через
+    json_extract_scalar по путям $.infoBox.Referee.{text,country,countryCode}.
+    Дедупликация: ROW_NUMBER PARTITION BY (match_id, league, season) ORDER BY
+    _ingested_at DESC + фильтр непустого имени судьи. Country — будущий
+    дизамбигуатор тёзок-судей между странами при мульти-лиговом расширении
+    (схема xref_referee заморожена на время E1 dual-run, поэтому country вынесена
+    в эту match-grain таблицу). Питает матчинг silver.xref_referee → gold.dim_referee.
+  tags:
+    - Tier.Silver
+    - Domain.Football
+    - PII.Low
+columns:
+  - name: match_id
+    description: FotMob match_id (FK → gold.dim_match через xref_match в Gold).
+  - name: league
+    description: Лига (partition key).
+  - name: season
+    description: Сезон (partition key, bigint).
+  - name: referee_name
+    description: Имя судьи матча из $.infoBox.Referee.text (например 'Michael Oliver').
+    tags:
+      - PII.Low
+  - name: referee_country
+    description: Страна судьи (полное название) из $.infoBox.Referee.country (например 'England'); только FotMob отдаёт это поле.
+    tags:
+      - PII.Low
+  - name: referee_country_code
+    description: ISO-код страны судьи из $.infoBox.Referee.countryCode (например 'ENG', 'AUS').
+  - name: _bronze_ingested_at
+    description: Технический timestamp ingest'а Bronze (lineage).
+  - name: _silver_created_at
+    description: Технический timestamp создания строки в Silver-слое (добавляется CTAS-раннером).
+relationships: []

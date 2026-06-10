@@ -1,0 +1,72 @@
+# =============================================================================
+# OpenMetadata description: iceberg.silver.fotmob_player_profile
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.silver.fotmob_player_profile
+  description: |
+    Время-инвариантный снимок атрибутов игрока из FotMob — один row на
+    (player_id, league, season). Хранит то, что не меняется внутри сезона: рост,
+    дату рождения, национальность, ведущую ногу, номер на футболке, действующий
+    контракт и последнюю рыночную стоимость. Источники (все bronze):
+    fotmob_team_squad (s) — рост / дата рождения / страна / код страны / номер;
+    fotmob_player_details (d) — `foot` (Preferred foot из player_information_json,
+    единственный источник) и `contract_end`. Дедупликация обеих сторон через
+    ROW_NUMBER PARTITION BY (player_id, league, season) ORDER BY _ingested_at DESC,
+    JOIN-ключ CAST(team_squad.player_id AS varchar)=details.player_id. Фильтр
+    NOT is_coach. current_market_value_eur — последняя точка timeline из
+    market_values_json (полная история — в gold.fct_player_market_value, issue #11).
+    Идентификаторы сырые FotMob — canonical-резолюция в Gold.
+  tags:
+    - Tier.Silver
+    - Domain.Football
+    - PII.Low
+columns:
+  - name: player_id
+    description: Сырой FotMob player_id (FK → gold.dim_player через xref_player в Gold).
+  - name: player_name
+    description: Имя игрока (FotMob name).
+    tags:
+      - PII.Low
+  - name: date_of_birth
+    description: Дата рождения игрока (varchar ISO YYYY-MM-DD из fotmob_team_squad, ~100% покрытие).
+    tags:
+      - PII.Low
+  - name: height_cm
+    description: Рост игрока в сантиметрах (CAST→INTEGER; ~93% покрытие).
+    tags:
+      - PII.Low
+  - name: nationality
+    description: Национальность игрока (полное название страны, например 'England').
+    tags:
+      - PII.Low
+  - name: country_code
+    description: Код страны игрока (например 'ENG').
+    tags:
+      - PII.Low
+  - name: contract_end
+    description: Дата окончания контракта (DATE; ISO-substring из JSON $.utcTime с COALESCE на сырое значение, TRY_CAST; NULL для безконтрактных).
+    tags:
+      - PII.Low
+  - name: current_market_value_eur
+    description: Последняя рыночная стоимость игрока в EUR (MAX_BY по дате из market_values_json timeline, BIGINT).
+  - name: market_value_currency
+    description: Валюта рыночной стоимости (обычно EUR).
+  - name: primary_team_id
+    description: Сырой FotMob team_id текущего клуба (FK → gold.dim_team через xref_team в Gold).
+  - name: primary_team_name
+    description: Название текущего клуба игрока.
+  - name: foot
+    description: Ведущая нога ('Right' / 'Left' / 'Both'); извлечена из player_information_json по title='Preferred foot' (единственный источник, ~97% покрытие).
+    tags:
+      - PII.Low
+  - name: shirt_number
+    description: Игровой номер на футболке (CAST→INTEGER; источник fotmob_team_squad).
+  - name: _bronze_ingested_at
+    description: Технический timestamp ingest'а Bronze (lineage; GREATEST по details/squad).
+  - name: league
+    description: Лига (partition key).
+  - name: season
+    description: Сезон (partition key, bigint).
+  - name: _silver_created_at
+    description: Технический timestamp создания строки в Silver-слое (добавляется CTAS-раннером).
+relationships: []

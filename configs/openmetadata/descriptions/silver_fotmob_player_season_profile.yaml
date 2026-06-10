@@ -1,0 +1,110 @@
+# =============================================================================
+# OpenMetadata description: iceberg.silver.fotmob_player_season_profile
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.silver.fotmob_player_season_profile
+  description: |
+    Широкий профиль полевого игрока за сезон из FotMob — один row на
+    (player_id, league, season). Содержит per-season идентичность (клуб, позиция)
+    и ~34 статистические метрики (голы, ассисты, xG/xA, удары, отборы, дисциплина).
+    Источники: bronze.fotmob_player_details (identity) + bronze.fotmob_player_stats
+    (статы в LONG-формате, развёрнуты в wide через MAX(CASE WHEN stat_name=...) PIVOT).
+    Дедупликация details — ROW_NUMBER PARTITION BY (player_id, league, season)
+    ORDER BY _ingested_at DESC. Фильтры: NOT is_coach AND
+    LOWER(position_description)<>'keeper' (вратари — в silver.fotmob_keeper_profile).
+    primary_position нормализована LOWER() (FotMob отдаёт inconsistent case);
+    capitalize — на BI-слое. Время-инвариантные атрибуты (рост/нога/страна/дата
+    рождения) — в silver.fotmob_player_profile, не здесь. Идентификаторы сырые
+    FotMob — canonical-резолюция в Gold.
+  tags:
+    - Tier.Silver
+    - Domain.Football
+    - PII.Low
+columns:
+  - name: player_id
+    description: Сырой FotMob player_id (FK → gold.dim_player через xref_player в Gold).
+  - name: player_name
+    description: Имя игрока (FotMob name).
+    tags:
+      - PII.Low
+  - name: primary_position
+    description: Основная позиция игрока, нормализованная в lowercase (midfielder / defender / forward).
+  - name: primary_team_id
+    description: Сырой FotMob team_id клуба (FK → gold.dim_team через xref_team в Gold).
+  - name: primary_team_name
+    description: Название клуба игрока в этом сезоне.
+  - name: matches_played
+    description: Сыграно матчей за сезон.
+  - name: minutes_played
+    description: Сыграно минут, всего за сезон.
+  - name: goals
+    description: Голы за сезон.
+  - name: assists
+    description: Ассисты (голевые передачи) за сезон.
+  - name: goals_assists
+    description: Голы + ассисты за сезон.
+  - name: fotmob_rating
+    description: Средний рейтинг FotMob за сезон.
+  - name: goals_per_90
+    description: Голы за 90 минут.
+  - name: expected_goals
+    description: Ожидаемые голы (xG) за сезон по модели FotMob.
+  - name: expected_goals_per_90
+    description: Ожидаемые голы (xG) за 90 минут.
+  - name: expected_goals_on_target
+    description: Ожидаемые голы по ударам в створ (xGOT) за сезон.
+  - name: expected_assists
+    description: Ожидаемые ассисты (xA) за сезон.
+  - name: expected_assists_per_90
+    description: Ожидаемые ассисты (xA) за 90 минут.
+  - name: xg_xa_per_90
+    description: Сумма ожидаемых голов и ассистов (xG+xA) за 90 минут.
+  - name: shots_per_90
+    description: Удары по воротам за 90 минут.
+  - name: shots_on_target_per_90
+    description: Удары в створ за 90 минут.
+  - name: chances_created
+    description: Созданные моменты (передачи под удар) за сезон.
+  - name: big_chances_created
+    description: Созданные явные голевые моменты за сезон.
+  - name: big_chances_missed
+    description: Упущенные явные голевые моменты за сезон.
+  - name: accurate_passes_per_90
+    description: Точные передачи за 90 минут.
+  - name: accurate_long_balls_per_90
+    description: Точные длинные передачи за 90 минут.
+  - name: successful_dribbles_per_90
+    description: Удачные обводки (won contest) за 90 минут.
+  - name: penalties_won
+    description: Заработанные пенальти за сезон.
+  - name: defensive_actions_per_90
+    description: Оборонительные действия за 90 минут.
+  - name: tackles_per_90
+    description: Отборы за 90 минут.
+  - name: interceptions_per_90
+    description: Перехваты за 90 минут.
+  - name: clearances_per_90
+    description: Выносы (effective clearance) за 90 минут.
+  - name: recoveries_per_90
+    description: Подборы мяча (ball recovery) за 90 минут.
+  - name: blocks_per_90
+    description: Блокированные удары (outfielder block) за 90 минут.
+  - name: poss_won_final_third_per_90
+    description: Возвраты владения в финальной трети за 90 минут.
+  - name: penalties_conceded
+    description: Привезённые пенальти за сезон.
+  - name: yellow_cards
+    description: Жёлтые карточки за сезон.
+  - name: red_cards
+    description: Красные карточки за сезон.
+  - name: fouls_per_90
+    description: Фолы за 90 минут.
+  - name: _bronze_ingested_at
+    description: Технический timestamp ingest'а Bronze (lineage; GREATEST по details/stats).
+  - name: league
+    description: Лига (partition key).
+  - name: season
+    description: Сезон (partition key, bigint).
+  - name: _silver_created_at
+    description: Технический timestamp создания строки в Silver-слое (добавляется CTAS-раннером).
+relationships: []
