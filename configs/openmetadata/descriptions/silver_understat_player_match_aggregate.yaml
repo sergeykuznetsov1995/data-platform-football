@@ -1,0 +1,75 @@
+# =============================================================================
+# OpenMetadata description: iceberg.silver.understat_player_match_aggregate
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.silver.understat_player_match_aggregate
+  description: |
+    Индивидуальная статистика игрока за матч из Understat — один row на
+    (match_id, player_id, league, season). Источник:
+    bronze.understat_player_match_stats (passthrough, без агрегации — Bronze уже
+    match-grain), с переименованием под кросс-источниковые имена (FBref/SofaScore/
+    WhoScored): `game_id`→`match_id`, `time`→`minutes_played`, singular→plural
+    карточки. Дедупликация: ROW_NUMBER PARTITION BY
+    (game_id, player_id, league, season) ORDER BY _ingested_at DESC (защита от
+    исторических append-mode дублей). non_penalty_goals / non_penalty_xg
+    вычисляются через bronze.understat_shots (penalty-удары приходят с
+    situation IS NULL и xg≈0.7612, см. issue #103). Понятная грань Understat:
+    отдаёт только атакующие/созидательные метрики форвардов+полузащитников
+    (нет обороны/единоборств → нет rating). match_id / player_id / team_id —
+    сырые Understat-id (не канонические ключи dim_*; bridge через xref на Gold).
+  tags:
+    - Tier.Silver
+    - Domain.Football
+    - PII.Low
+columns:
+  - name: match_id
+    description: Сырой Understat game_id матча (CAST в varchar); часть PK; xref_match на Gold.
+  - name: player_id
+    description: Сырой Understat player_id игрока (CAST в varchar); часть PK; xref_player на Gold.
+  - name: player
+    description: Имя игрока (Understat name; PII.Low — публично известное лицо).
+    tags:
+      - PII.Low
+  - name: team_id
+    description: Сырой Understat team_id команды игрока (CAST в varchar); xref_team на Gold.
+  - name: team_side
+    description: NULL placeholder — Understat не отдаёт сторону (home/away) на player-grain; сторона выводится через team_match на Gold.
+  - name: position
+    description: Позиция игрока в матче (как на Understat — Sub / FW / M / D / GK и т.п.).
+  - name: minutes_played
+    description: Сыгранные минуты (Understat `time`).
+  - name: goals
+    description: Забитые голы.
+  - name: own_goals
+    description: Автоголы.
+  - name: shots
+    description: Удары, всего.
+  - name: yellow_cards
+    description: Жёлтые карточки.
+  - name: red_cards
+    description: Красные карточки.
+  - name: assists
+    description: Голевые передачи.
+  - name: key_passes
+    description: Ключевые передачи (после которых партнёр наносил удар).
+  - name: xg
+    description: Expected Goals (xG) — модельная вероятность гола по ударам игрока, DOUBLE.
+  - name: xa
+    description: Expected Assists (xA) — модельная вероятность ассиста по передачам игрока, DOUBLE.
+  - name: non_penalty_goals
+    description: Голы без учёта пенальти (goals − penalty_goals; penalty_goals выводятся из bronze.understat_shots, см. #103).
+  - name: non_penalty_xg
+    description: xG без учёта пенальти (GREATEST(0, xg − penalty_xg); penalty_xg из bronze.understat_shots, см. #103), DOUBLE.
+  - name: xg_chain
+    description: xGChain — суммарный xG всех владений, в которых игрок сделал хотя бы одно касание, DOUBLE.
+  - name: xg_buildup
+    description: xGBuildup — как xGChain, но без касаний, завершившихся ударом или ключевой передачей (вклад в начало атак), DOUBLE.
+  - name: _bronze_ingested_at
+    description: Технический timestamp ingest'а Bronze (lineage).
+  - name: league
+    description: Лига (partition key).
+  - name: season
+    description: Сезон slug '2526' (partition key, varchar).
+  - name: _silver_created_at
+    description: Технический timestamp создания строки в Silver-слое (добавляется CTAS-раннером).
+relationships: []
