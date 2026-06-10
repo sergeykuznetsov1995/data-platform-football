@@ -1,72 +1,83 @@
 -- =============================================================================
 -- Gold: dim_referee
 -- =============================================================================
--- Global dimension of match referees observed in FBref schedules. One row per
--- canonical referee.
+-- Canonical referee dimension, aligned to the star-schema design (issue #425).
+-- One row per referee.
 --
--- Source:       iceberg.silver.fbref_match_enriched (referee per match)
--- PK:           referee_id  ('ref_<xxhash64-hex>' from LOWER(TRIM(name)))
--- Partitioning: NONE  (small global dim, queried by referee_id / referee_slug)
+-- PK migrated from the legacy FBref-only name hash ('ref_<xxhash64-hex>') to
+-- the canonical_id of silver.xref_referee — the curated 3-source identity
+-- (FBref + MatchHistory + FotMob, issues #143/#270): 'ref_<slug>' for aliased
+-- referees, '<src>_ref_<slug>' for orphans. Downstream referee_id consumers
+-- (feat_referee_bias, mart_referee_dashboard) now read the id from
+-- dim_match.referee_id instead of re-deriving an inline hash.
 --
--- Source-of-truth selection (R0.4 schema versioning):
---   referee_canonical = MIN(referee_raw)   -- single source, MIN==stable
---   referee_source    = 'fbref'            -- only available source today
---   referee_version   = 'v1'
+-- Sources:
+--   iceberg.silver.xref_referee          (spine: canonical_id + display_name)
+--   iceberg.silver.fotmob_match_referee  (country — FotMob is the only source
+--                                         carrying referee nationality)
+--   iceberg.silver.fbref_match_enriched  (first/last_seen via match dates)
 --
--- Hash-PK pattern mirrors entity_xref.sql:346-352 ('mh_<hash>' for MatchHistory).
--- 'ref_' prefix avoids collision with team / venue namespace.
+-- Both enrichment JOINs go through xref_referee WITH the (league, season)
+-- predicate — xref rows are per-(source, source_id, league, season); without
+-- it a referee active across N seasons fans out N× (memory:
+-- feedback_xref_join_season_predicate).
 --
--- Diacritic folding (issue #228, same idiom as xref_team.sql.j2 / #215):
---   Hash key, GROUP BY key and referee_slug all wrap the name in
---   NORMALIZE(NFD) + REGEXP_REPLACE('\p{Mn}+','') so "Çakır" and "Cakir"
---   fold to the SAME referee_id / slug. On pure-ASCII names this is a no-op,
---   so every existing referee_id is unchanged.
---
--- KNOWN LIMITATION (R8 follow-up):
---   Cross-source name reconciliation (FotMob / WhoScored / SofaScore) — fuzzy
---   matching of differently-spelled names for one official — is deferred to R8
---   once a second referee feed lands and a fuzzy-match resolver is justified.
+-- Partitioning: NONE (small global dim — star design: dims unpartitioned;
+-- referees move between leagues, so even season partitioning is wrong here).
 -- =============================================================================
 
-with referees_raw as (
-    select
-        trim(referee)                                as referee_raw,
-        league,
-        season,
-        date                                         as match_date
-    from iceberg.silver.fbref_match_enriched
-    where referee is not null
-      and trim(referee) <> ''
+WITH ref_spine AS (
+    SELECT
+        canonical_id AS referee_id,
+        -- display_name == curated canonical_name on aliased rows; orphans
+        -- fall back to the FBref raw spelling, then any source's.
+        COALESCE(
+            MAX(display_name) FILTER (WHERE confidence = 'name_alias'),
+            MAX(display_name) FILTER (WHERE source = 'fbref'),
+            MAX(display_name)
+        ) AS referee_name
+    FROM iceberg.silver.xref_referee
+    GROUP BY canonical_id
 ),
 
-aggregated as (
-    select
-        'ref_' || lower(to_hex(xxhash64(to_utf8(
-            regexp_replace(normalize(lower(trim(referee_raw)), NFD), '\p{Mn}+', '')
-        ))))                                                                  as referee_id,
-        min(referee_raw)                                                       as referee_canonical,
-        count(*)                                                               as n_matches,
-        min(match_date)                                                        as first_seen_date,
-        max(match_date)                                                        as last_seen_date,
-        array_agg(distinct league)                                             as leagues,
-        array_agg(distinct season)                                             as seasons  -- slug '2425' after #404 (was cast-to-int year-start)
-    from referees_raw
-    -- Fold diacritics in the dedup key so it matches the hash input above —
-    -- otherwise "Çakır"/"Cakir" form two groups sharing one referee_id (PK dup).
-    group by regexp_replace(normalize(lower(trim(referee_raw)), NFD), '\p{Mn}+', '')
+fotmob_country AS (
+    SELECT
+        xr.canonical_id,
+        MAX(fm.referee_country) AS country
+    FROM iceberg.silver.fotmob_match_referee fm
+    INNER JOIN iceberg.silver.xref_referee xr
+        ON  xr.source    = 'fotmob'
+        AND xr.source_id = fm.referee_name
+        AND xr.league    = fm.league
+        AND xr.season    = fm.season
+    WHERE fm.referee_country IS NOT NULL
+    GROUP BY xr.canonical_id
+),
+
+fbref_seen AS (
+    SELECT
+        xr.canonical_id,
+        MIN(s.date) AS first_seen_date,
+        MAX(s.date) AS last_seen_date
+    FROM iceberg.silver.fbref_match_enriched s
+    INNER JOIN iceberg.silver.xref_referee xr
+        ON  xr.source    = 'fbref'
+        AND xr.source_id = TRIM(s.referee)
+        AND xr.league    = s.league
+        AND xr.season    = s.season
+    WHERE s.referee IS NOT NULL
+      AND TRIM(s.referee) <> ''
+    GROUP BY xr.canonical_id
 )
 
-select
-    referee_id,
-    referee_canonical,
-    'fbref'                                                                    as referee_source,
-    'v1'                                                                       as referee_version,
-    lower(regexp_replace(
-        regexp_replace(normalize(referee_canonical, NFD), '\p{Mn}+', ''),
-        '[^a-zA-Z0-9]+', '_'))                                                as referee_slug,
-    n_matches,
-    first_seen_date,
-    last_seen_date,
-    leagues,
-    seasons
-from aggregated
+SELECT
+    r.referee_id,
+    r.referee_name,
+    c.country,
+    f.first_seen_date,
+    f.last_seen_date
+FROM ref_spine r
+LEFT JOIN fotmob_country c
+    ON c.canonical_id = r.referee_id
+LEFT JOIN fbref_seen f
+    ON f.canonical_id = r.referee_id
