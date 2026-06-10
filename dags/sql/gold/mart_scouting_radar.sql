@@ -64,10 +64,10 @@ base AS (
         COALESCE(a.xa_match, 0.0)                     AS xa,
         pm.league,
         pm.season,
-        dm.date                                       AS match_date,
+        dm.match_date,
         ROW_NUMBER() OVER (
             PARTITION BY pm.player_id, pm.season
-            ORDER BY dm.date, pm.match_id
+            ORDER BY dm.match_date, pm.match_id
         )                                             AS appearance_rn
     FROM iceberg.gold.fct_player_match pm
     LEFT JOIN iceberg.gold.dim_match dm
@@ -121,6 +121,6 @@ SELECT
     r.league,
     r.season
 FROM rolled r
+-- #425: dim_player is one row per player now — season left the grain.
 LEFT JOIN iceberg.gold.dim_player dp
        ON dp.player_id = r.player_id
-      AND dp.season    = r.season

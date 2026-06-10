@@ -14,7 +14,7 @@
 
 SELECT
     match_id,
-    date                               AS match_date,
+    match_date,
 
     CAST(NULL AS VARCHAR)              AS team_id,
     CAST(NULL AS VARCHAR)              AS team_name_raw,

@@ -55,30 +55,33 @@ WITH shot_team_totals AS (
     GROUP BY match_id, team
 ),
 match_team_xg AS (
-    -- Map team_name -> team_id via dim_match (the only reliable place where
-    -- both name and id coexist). For each match: build (team_id, opponent_id,
-    -- team_name, opponent_name) so we can join shot_team_totals twice.
+    -- Map team_name -> team_id via dim_match ids + the Silver spine's FBref
+    -- team names (#425: dim_match no longer carries denormalised names —
+    -- sm.home/sm.away hold the SAME FBref short forms the old columns did,
+    -- so the name-keyed JOIN to shot_team_totals is unchanged).
     SELECT
         dm.match_id,
-        dm.date          AS match_date,
+        dm.match_date,
         dm.season,
         dm.league,
         dm.home_team_id  AS team_id,
         dm.away_team_id  AS opponent_id,
-        dm.home_team_name AS team_name,
-        dm.away_team_name AS opponent_name
+        sm.home          AS team_name,
+        sm.away          AS opponent_name
     FROM iceberg.gold.dim_match dm
+    JOIN iceberg.silver.fbref_match_enriched sm ON sm.match_id = dm.match_id
     UNION ALL
     SELECT
         dm.match_id,
-        dm.date,
+        dm.match_date,
         dm.season,
         dm.league,
         dm.away_team_id,
         dm.home_team_id,
-        dm.away_team_name,
-        dm.home_team_name
+        sm.away,
+        sm.home
     FROM iceberg.gold.dim_match dm
+    JOIN iceberg.silver.fbref_match_enriched sm ON sm.match_id = dm.match_id
 ),
 team_match_xg AS (
     -- One row per (match_id, team_id) with both xGF (own shots) and xGA

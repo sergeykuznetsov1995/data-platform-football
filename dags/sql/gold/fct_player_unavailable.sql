@@ -57,25 +57,26 @@ u_resolved AS (
         dm.match_id AS fbref_match_id
     FROM u
     LEFT JOIN iceberg.gold.dim_match dm
-        ON  dm.date    = u.match_date
+        ON  dm.match_date = u.match_date  -- #425: dim_match renamed date->match_date
         AND dm.league  = u.league
         -- #404: dim_match.season is slug now → direct season equality.
         AND dm.season = u.season
         AND (dm.home_team_id = u.team_slug OR dm.away_team_id = u.team_slug)
 ),
 
--- A name can map to multiple player_ids in a season (rare); MIN() picks a
--- deterministic one. Conflicts surface via DQ.
+-- A name can map to multiple player_ids (rare); MIN() picks a deterministic
+-- one. Conflicts surface via DQ. #425: dim_player is one row per player —
+-- the lookup is cross-season now (same-name collisions across seasons were
+-- already collapsed by MIN within a season; the blast radius is unchanged
+-- in practice and the resolution is replaced by xref in #426).
 dp_lookup AS (
     SELECT
-        -- #404: dim_player.season is slug now → pass through.
-        season,
         player_name,
         MIN(player_id) AS player_id
     FROM iceberg.gold.dim_player
     WHERE player_name IS NOT NULL
       AND player_id   IS NOT NULL
-    GROUP BY season, player_name
+    GROUP BY player_name
 )
 
 SELECT
@@ -99,13 +100,10 @@ SELECT
     ur.season
 
 FROM u_resolved ur
+-- #425: dim_team is one row per club — league/season left the grain.
 LEFT JOIN iceberg.gold.dim_team dt
     ON  dt.team_id = ur.team_slug
-    AND dt.league  = ur.league
-    -- #404: dim_team.season is slug now → direct season equality.
-    AND dt.season = ur.season
 LEFT JOIN dp_lookup dp
     ON  dp.player_name = ur.player_name
-    AND dp.season      = ur.season
 -- Drop rows where the cross-source bridge failed; keeps ref_integrity on match_id.
 WHERE ur.fbref_match_id IS NOT NULL

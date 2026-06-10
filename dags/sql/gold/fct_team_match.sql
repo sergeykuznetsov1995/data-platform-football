@@ -171,7 +171,7 @@ ws_team_name_bridge AS (
 home AS (
     SELECT
         dm.match_id,
-        dm.date,
+        dm.match_date      AS date,  -- #425: dim_match renamed date->match_date; output keeps `date`
         dm.season,
         dm.league,
         dm.gameweek,
@@ -193,7 +193,7 @@ home AS (
 away AS (
     SELECT
         dm.match_id,
-        dm.date,
+        dm.match_date      AS date,  -- #425: same rename as `home` CTE
         dm.season,
         dm.league,
         dm.gameweek,
