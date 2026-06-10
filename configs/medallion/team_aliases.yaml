@@ -7,6 +7,8 @@
 # Структура одной записи:
 #   - canonical_name: <official Wikipedia name>      # display only
 #     canonical_id:   <stable identity slug>         # IDENTITY — see below
+#     country:        <страна клуба>                 # → gold.dim_team (issue #425)
+#     short_name:     <короткое display-имя>         # → gold.dim_team (issue #425)
 #     aliases:
 #       _generic:    [list of raw_names that may appear in any source — UNION pool]
 #       fbref:       [list, optional]    # full names with spaces (mostly canonical)
@@ -63,6 +65,8 @@ teams:
   # ====== Wolverhampton Wanderers ======
   - canonical_name: "Wolverhampton Wanderers"
     canonical_id: "wolverhampton_wanderers"
+    country: "England"
+    short_name: "Wolves"
     aliases:
       _generic:
         - "Wolves"
@@ -81,6 +85,8 @@ teams:
   # ====== Tottenham Hotspur ======
   - canonical_name: "Tottenham Hotspur"
     canonical_id: "tottenham_hotspur"
+    country: "England"
+    short_name: "Spurs"
     aliases:
       _generic:
         - "Spurs"
@@ -99,6 +105,8 @@ teams:
   # ====== Manchester United ======
   - canonical_name: "Manchester United"
     canonical_id: "manchester_united"
+    country: "England"
+    short_name: "Man Utd"
     aliases:
       _generic:
         - "Man Utd"
@@ -120,6 +128,8 @@ teams:
   # ====== Manchester City ======
   - canonical_name: "Manchester City"
     canonical_id: "manchester_city"
+    country: "England"
+    short_name: "Man City"
     aliases:
       _generic:
         - "Man City"
@@ -138,6 +148,8 @@ teams:
   # ====== Newcastle United ======
   - canonical_name: "Newcastle United"
     canonical_id: "newcastle_united"
+    country: "England"
+    short_name: "Newcastle"
     aliases:
       _generic:
         - "Newcastle"
@@ -157,6 +169,8 @@ teams:
   # ====== Nottingham Forest ======
   - canonical_name: "Nottingham Forest"
     canonical_id: "nottingham_forest"
+    country: "England"
+    short_name: "Nott'm Forest"
     aliases:
       _generic:
         - "Nott'm Forest"
@@ -176,6 +190,8 @@ teams:
   # ====== Leicester City ======
   - canonical_name: "Leicester City"
     canonical_id: "leicester_city"
+    country: "England"
+    short_name: "Leicester"
     aliases:
       _generic:
         - "Leicester"
@@ -194,6 +210,8 @@ teams:
   # ====== Leeds United ======
   - canonical_name: "Leeds United"
     canonical_id: "leeds_united"
+    country: "England"
+    short_name: "Leeds"
     aliases:
       _generic:
         - "Leeds"
@@ -212,6 +230,8 @@ teams:
   # ====== West Ham United ======
   - canonical_name: "West Ham United"
     canonical_id: "west_ham_united"
+    country: "England"
+    short_name: "West Ham"
     aliases:
       _generic:
         - "West Ham"
@@ -230,6 +250,8 @@ teams:
   # ====== Brighton and Hove Albion ======
   - canonical_name: "Brighton and Hove Albion"
     canonical_id: "brighton_and_hove_albion"
+    country: "England"
+    short_name: "Brighton"
     aliases:
       _generic:
         - "Brighton"
@@ -248,6 +270,8 @@ teams:
   # ====== Norwich City ======
   - canonical_name: "Norwich City"
     canonical_id: "norwich_city"
+    country: "England"
+    short_name: "Norwich"
     aliases:
       _generic:
         - "Norwich"
@@ -266,6 +290,8 @@ teams:
   # ====== Sheffield United ======
   - canonical_name: "Sheffield United"
     canonical_id: "sheffield_united"
+    country: "England"
+    short_name: "Sheff Utd"
     aliases:
       _generic:
         - "Sheff Utd"
@@ -285,6 +311,8 @@ teams:
   # ====== Brentford ======
   - canonical_name: "Brentford"
     canonical_id: "brentford"
+    country: "England"
+    short_name: "Brentford"
     aliases:
       _generic: ["Brentford"]
       fbref: ["Brentford"]
@@ -300,6 +328,8 @@ teams:
   # ====== AFC Bournemouth ======
   - canonical_name: "AFC Bournemouth"
     canonical_id: "afc_bournemouth"
+    country: "England"
+    short_name: "Bournemouth"
     aliases:
       _generic:
         - "Bournemouth"
@@ -317,6 +347,8 @@ teams:
   # ====== Cardiff City ======
   - canonical_name: "Cardiff City"
     canonical_id: "cardiff_city"
+    country: "Wales"
+    short_name: "Cardiff"
     aliases:
       _generic:
         - "Cardiff"
@@ -334,6 +366,8 @@ teams:
   # ====== Hull City ======
   - canonical_name: "Hull City"
     canonical_id: "hull_city"
+    country: "England"
+    short_name: "Hull"
     aliases:
       _generic:
         - "Hull"
@@ -351,6 +385,8 @@ teams:
   # ====== Stoke City ======
   - canonical_name: "Stoke City"
     canonical_id: "stoke_city"
+    country: "England"
+    short_name: "Stoke"
     aliases:
       _generic:
         - "Stoke"
@@ -368,6 +404,8 @@ teams:
   # ====== Swansea City ======
   - canonical_name: "Swansea City"
     canonical_id: "swansea_city"
+    country: "Wales"
+    short_name: "Swansea"
     aliases:
       _generic:
         - "Swansea"
@@ -385,6 +423,8 @@ teams:
   # ====== Watford ======
   - canonical_name: "Watford"
     canonical_id: "watford"
+    country: "England"
+    short_name: "Watford"
     aliases:
       _generic:
         - "Watford"
@@ -402,6 +442,8 @@ teams:
   # ====== West Bromwich Albion ======
   - canonical_name: "West Bromwich Albion"
     canonical_id: "west_bromwich_albion"
+    country: "England"
+    short_name: "West Brom"
     aliases:
       _generic:
         - "West Brom"
@@ -422,6 +464,8 @@ teams:
   # ====== Aston Villa ======
   - canonical_name: "Aston Villa"
     canonical_id: "aston_villa"
+    country: "England"
+    short_name: "Aston Villa"
     aliases:
       _generic:
         - "Aston Villa"
@@ -439,6 +483,8 @@ teams:
   # ====== Crystal Palace ======
   - canonical_name: "Crystal Palace"
     canonical_id: "crystal_palace"
+    country: "England"
+    short_name: "Crystal Palace"
     aliases:
       _generic:
         - "Crystal Palace"
@@ -460,36 +506,48 @@ teams:
 
   - canonical_name: "Arsenal"
     canonical_id: "arsenal"
+    country: "England"
+    short_name: "Arsenal"
     aliases:
       _generic: ["Arsenal"]
     competition_scope: ["ENG-Premier League"]
 
   - canonical_name: "Burnley"
     canonical_id: "burnley"
+    country: "England"
+    short_name: "Burnley"
     aliases:
       _generic: ["Burnley"]
     competition_scope: ["ENG-Premier League"]
 
   - canonical_name: "Chelsea"
     canonical_id: "chelsea"
+    country: "England"
+    short_name: "Chelsea"
     aliases:
       _generic: ["Chelsea"]
     competition_scope: ["ENG-Premier League"]
 
   - canonical_name: "Everton"
     canonical_id: "everton"
+    country: "England"
+    short_name: "Everton"
     aliases:
       _generic: ["Everton"]
     competition_scope: ["ENG-Premier League"]
 
   - canonical_name: "Fulham"
     canonical_id: "fulham"
+    country: "England"
+    short_name: "Fulham"
     aliases:
       _generic: ["Fulham"]
     competition_scope: ["ENG-Premier League"]
 
   - canonical_name: "Liverpool"
     canonical_id: "liverpool"
+    country: "England"
+    short_name: "Liverpool"
     aliases:
       _generic: ["Liverpool"]
       sofascore: ["Liverpool FC"]
@@ -497,6 +555,8 @@ teams:
 
   - canonical_name: "Luton Town"
     canonical_id: "luton_town"
+    country: "England"
+    short_name: "Luton"
     aliases:
       _generic:
         - "Luton Town"
@@ -508,12 +568,16 @@ teams:
 
   - canonical_name: "Southampton"
     canonical_id: "southampton"
+    country: "England"
+    short_name: "Southampton"
     aliases:
       _generic: ["Southampton"]
     competition_scope: ["ENG-Premier League"]
 
   - canonical_name: "Ipswich Town"
     canonical_id: "ipswich_town"
+    country: "England"
+    short_name: "Ipswich"
     aliases:
       _generic:
         - "Ipswich Town"
@@ -523,12 +587,16 @@ teams:
 
   - canonical_name: "Sunderland"
     canonical_id: "sunderland"
+    country: "England"
+    short_name: "Sunderland"
     aliases:
       _generic: ["Sunderland"]
     competition_scope: ["ENG-Premier League"]
 
   - canonical_name: "Huddersfield Town"
     canonical_id: "huddersfield_town"
+    country: "England"
+    short_name: "Huddersfield"
     aliases:
       _generic:
         - "Huddersfield Town"
@@ -537,6 +605,8 @@ teams:
 
   - canonical_name: "Middlesbrough"
     canonical_id: "middlesbrough"
+    country: "England"
+    short_name: "Middlesbrough"
     aliases:
       _generic: ["Middlesbrough"]
     competition_scope: ["ENG-Premier League"]

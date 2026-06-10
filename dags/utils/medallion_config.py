@@ -113,6 +113,15 @@ def _validate_team_aliases_schema(doc: Dict) -> None:
                 f"missing/invalid 'canonical_id' (must match ^[a-z0-9_]+$, "
                 f"got {cid!r})"
             )
+        # country / short_name feed gold.dim_team (issue #425) — non-empty
+        # strings required, same contract as venue city/country.
+        for field in ('country', 'short_name'):
+            val = t.get(field)
+            if not isinstance(val, str) or not val.strip():
+                raise MedallionConfigError(
+                    f"team_aliases.yaml: teams[{i}] ({t.get('canonical_name')}) "
+                    f"missing/empty '{field}' (required for gold.dim_team)"
+                )
 
 
 def _validate_referee_aliases_schema(doc: Dict) -> None:
@@ -300,6 +309,13 @@ def _validate_competitions_schema(doc: Dict) -> None:
             raise MedallionConfigError(
                 f"competitions.yaml: competitions[{i}] ({c.get('id')}) "
                 f"missing 'in_scope' flag"
+            )
+        # country feeds gold.dim_competition (issue #425).
+        country = c.get('country')
+        if not isinstance(country, str) or not country.strip():
+            raise MedallionConfigError(
+                f"competitions.yaml: competitions[{i}] ({c.get('id')}) "
+                f"missing/empty 'country' (required for gold.dim_competition)"
             )
 
 
@@ -788,6 +804,30 @@ def get_venue_alias_sql_values(
         f"'{_escape_sql_string(country)}', "
         f"'{_escape_sql_string(league)}')"
         for raw, cid, canonical, city, country, league in rows
+    ]
+    return ',\n'.join(lines).lstrip()
+
+
+def get_team_meta_sql_values() -> str:
+    """Render team metadata tuples as a Trino VALUES body (issue #425).
+
+    Emits four-tuples ``(team_id, team_name, country, short_name)`` — one per
+    club in team_aliases.yaml — consumed by ``dim_team.sql.j2``. Mirrors
+    :func:`get_venue_alias_sql_values`; empty result raises because an empty
+    VALUES clause is invalid Trino.
+    """
+    teams = load_team_aliases()['teams']
+    if not teams:
+        raise MedallionConfigError(
+            "get_team_meta_sql_values produced 0 rows — "
+            "an empty VALUES clause is invalid Trino, refusing to emit."
+        )
+    lines = [
+        f"    ('{_escape_sql_string(t['canonical_id'])}', "
+        f"'{_escape_sql_string(t['canonical_name'])}', "
+        f"'{_escape_sql_string(t['country'])}', "
+        f"'{_escape_sql_string(t['short_name'])}')"
+        for t in teams
     ]
     return ',\n'.join(lines).lstrip()
 

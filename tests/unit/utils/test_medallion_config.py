@@ -47,6 +47,8 @@ _MOCK_TEAM_ALIASES = """\
 teams:
   - canonical_name: "Wolverhampton Wanderers"
     canonical_id: "wolverhampton_wanderers"
+    country: "England"
+    short_name: "Wolves"
     aliases:
       _generic: ["Wolves", "Wolverhampton Wanderers"]
       sofascore: ["Wolverhampton"]
@@ -55,6 +57,8 @@ teams:
 
   - canonical_name: "Tottenham Hotspur"
     canonical_id: "tottenham_hotspur"
+    country: "England"
+    short_name: "Spurs"
     aliases:
       _generic: ["Spurs", "Tottenham"]
       fbref: ["Tottenham Hotspur"]
@@ -62,6 +66,8 @@ teams:
 
   - canonical_name: "Manchester United"
     canonical_id: "manchester_united"
+    country: "England"
+    short_name: "Man Utd"
     aliases:
       _generic: ["Man Utd", "Manchester United"]
       clubelo: ["ManUnited"]
@@ -69,18 +75,24 @@ teams:
 
   - canonical_name: "Nottingham Forest"
     canonical_id: "nottingham_forest"
+    country: "England"
+    short_name: "Nott'm Forest"
     aliases:
       _generic: ["Nott'm Forest", "Nottingham Forest"]
     competition_scope: ["ENG-Premier League"]
 
   - canonical_name: "Newcastle United"
     canonical_id: "newcastle_united"
+    country: "England"
+    short_name: "Newcastle"
     aliases:
       _generic: ["Newcastle", "Newcastle Utd"]
     competition_scope: ["ENG-Premier League"]
 
   - canonical_name: "Real Madrid"
     canonical_id: "real_madrid"
+    country: "Spain"
+    short_name: "Real Madrid"
     aliases:
       _generic: ["Real Madrid"]
     competition_scope: ["ESP-La Liga"]
@@ -90,6 +102,7 @@ _MOCK_COMPETITIONS = """\
 competitions:
   - id: "ENG-Premier League"
     name: "English Premier League"
+    country: "England"
     tier: 1
     seasons:
       - id: 2425
@@ -109,6 +122,7 @@ competitions:
 
   - id: "ESP-La Liga"
     name: "Spanish La Liga"
+    country: "Spain"
     tier: 1
     seasons: []
     sources:
@@ -280,6 +294,8 @@ def test_alias_pairs_dedupes_when_same_pair_in_generic_and_source(tmp_path, monk
         "teams:\n"
         "  - canonical_name: 'X FC'\n"
         "    canonical_id: 'x_fc'\n"
+        "    country: 'England'\n"
+        "    short_name: 'X'\n"
         "    aliases:\n"
         "      _generic: ['X', 'X FC']\n"
         "      sofascore: ['X FC']\n"
@@ -451,6 +467,8 @@ def test_sql_values_with_league_expands_per_competition(tmp_path, monkeypatch):
         "teams:\n"
         "  - canonical_name: 'Spartak Moscow'\n"
         "    canonical_id: 'spartak_moscow'\n"
+        "    country: 'Russia'\n"
+        "    short_name: 'Spartak'\n"
         "    aliases:\n"
         "      _generic: ['Spartak']\n"
         "    competition_scope: ['RUS-Premier League', 'UEFA-Champions League']\n"
@@ -484,6 +502,8 @@ def test_sql_values_rejects_backslash_in_alias(tmp_path, monkeypatch):
         "teams:\n"
         "  - canonical_name: 'X'\n"
         "    canonical_id: 'x'\n"
+        "    country: 'England'\n"
+        "    short_name: 'X'\n"
         "    aliases:\n"
         "      _generic: ['bad\\\\name']\n"
         "    competition_scope: ['ENG-Premier League']\n"
