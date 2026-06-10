@@ -616,11 +616,12 @@ def test_real_config_in_scope_is_apl_only(real_config_dir):
     assert real_config_dir.get_in_scope_competitions() == ["ENG-Premier League"]
 
 
-def test_real_config_apl_has_5_seasons_for_backfill(real_config_dir):
-    # E3.5 backfill scope: current + 3 prior + 1 newer = 5 seasons total.
+def test_real_config_apl_seasons_cover_ingested_history(real_config_dir):
+    # #425: competitions.yaml covers the FULL ingested FBref history
+    # (1617..2526) so dim_season satisfies the dim_match season FK.
     seasons = real_config_dir.get_competition_seasons("ENG-Premier League")
-    assert len(seasons) == 5
-    assert 2425 in seasons and 2526 in seasons
+    assert len(seasons) == 10
+    assert 1617 in seasons and 2425 in seasons and 2526 in seasons
 
 
 @pytest.mark.parametrize(
