@@ -1,0 +1,72 @@
+# =============================================================================
+# OpenMetadata description: iceberg.silver.understat_team_match
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.silver.understat_team_match
+  description: |
+    Командная статистика за матч из Understat — один row на
+    (match_id, team_id_canonical). Источник: bronze.understat_team_match_stats
+    (wide-form: home_*/away_* в одной строке матча) → UNION ALL home+away в
+    long-form, затем JOIN silver.xref_team (source='understat', source_id =
+    display name команды, не numeric team_id) с обязательным предикатом
+    (league, season) — без него команда fan-out'ится 1.5-4×. Orphan-команды
+    (confidence='orphan') отфильтрованы. Метрики *_against / oppda /
+    deep_completions_allowed выводятся из противоположной стороны той же строки.
+    Дедуп Bronze: ROW_NUMBER PARTITION BY (game_id, league, season). Понятная
+    грань Understat: xG-primary источник + проприетарные PPDA и deep completions.
+    Issue #91 (T6.2), контракт docs/decisions/T6_team_facts_schema.md §6.2.
+    team_id_canonical — FK → gold.dim_team.team_id. Питает gold.fct_team_match.
+  tags:
+    - Tier.Silver
+    - Domain.Football
+    - PII.None
+columns:
+  - name: team_id_canonical
+    description: Канонический ID команды из xref_team (FK → gold.dim_team.team_id); часть PK.
+  - name: match_id
+    description: Сырой Understat game_id матча (CAST в varchar); часть PK; xref_match на Gold.
+  - name: team_id
+    description: Сырой Understat numeric team_id команды (CAST в varchar; трассировка).
+  - name: opponent_team_id
+    description: Сырой Understat team_id соперника (CAST в varchar).
+  - name: is_home
+    description: BOOLEAN — true если команда играла дома, false в гостях.
+  - name: team_name
+    description: Название команды (как на Understat; совпадает с xref_team.source_id).
+  - name: xg
+    description: Expected Goals (xG) команды за матч — Understat первичный источник xG, DOUBLE.
+  - name: xg_against
+    description: xG соперника (xG, допущенный командой) — с противоположной стороны строки, DOUBLE.
+  - name: npxg
+    description: Non-penalty xG команды (xG без пенальти), DOUBLE.
+  - name: npxg_against
+    description: Non-penalty xG соперника (допущенный без пенальти), DOUBLE.
+  - name: ppda
+    description: PPDA (passes allowed per defensive action) команды — метрика интенсивности прессинга (меньше = агрессивнее), DOUBLE.
+  - name: oppda
+    description: PPDA соперника против этой команды (как глубоко прессинговали её), DOUBLE.
+  - name: deep_completions
+    description: Deep completions — передачи/обводки, завершённые в ~20 м от ворот соперника (острота атак).
+  - name: deep_completions_allowed
+    description: Deep completions соперника против этой команды (острота допущенных атак).
+  - name: goals
+    description: Забитые голы команды в матче.
+  - name: goals_against
+    description: Пропущенные голы (голы соперника).
+  - name: points
+    description: Набранные очки в матче (3 победа / 1 ничья / 0 поражение).
+  - name: xpts
+    description: Expected Points (xPts) — модельные ожидаемые очки по xG обеих сторон, DOUBLE.
+  - name: _bronze_ingested_at
+    description: Технический timestamp ingest'а Bronze (lineage).
+  - name: league
+    description: Лига (partition key).
+  - name: season
+    description: Сезон slug '2526' (partition key, varchar).
+  - name: _silver_created_at
+    description: Технический timestamp создания строки в Silver-слое (добавляется CTAS-раннером).
+relationships:
+  - from: team_id_canonical
+    to: trino_iceberg.iceberg.gold.dim_team.team_id
+    type: FOREIGN_KEY
+    description: N:1 — командная матчевая статистика к канонической команде.
