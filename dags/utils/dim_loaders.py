@@ -2,18 +2,19 @@
 Dim loaders — config-driven Gold dim renderers
 ==============================================
 
-E2 (master-data dims) helper. Two of the five master-data dims do NOT come
-from a Bronze/Silver source — they are projections of YAML / Python config:
+E2 (master-data dims) helper. Two of the config-driven dims do NOT come
+from a Bronze/Silver source — they are projections of the medallion config
+(single source of truth, issue #425):
 
-  * ``dim_competition``   <- ``scrapers/sources/leagues.yaml:metadata``
-  * ``dim_season``        <- a fixed 5-season window anchored at
-                            ``utils.config.CURRENT_SEASON``
+  * ``dim_competition``   <- ``configs/medallion/competitions.yaml``
+  * ``dim_season``        <- union of ``seasons`` across in-scope
+                            competitions in the same YAML
 
 Both are stored as Jinja-style templates (``dags/sql/gold/dim_*.sql.j2``)
 with a single ``{{ rows }}`` placeholder for the VALUES tuples. The renderer
 substitutes the placeholder with one quoted SQL row per config entry, writes
 the rendered SQL to a tempfile, and hands it off to the existing
-``run_gold_transform`` CTAS engine — same DROP+CTAS+partitioning contract as
+``run_gold_transform`` CTAS engine — same CREATE-OR-REPLACE CTAS contract as
 every other Gold task.
 
 This module is intentionally thin: the renderers are pure functions, the
@@ -29,50 +30,11 @@ Why a separate module (not a method on gold_tasks.py)?
 
 from __future__ import annotations
 
-import os
 import re
 import tempfile
-import unicodedata
 from datetime import date
 from pathlib import Path
 from typing import Callable, List, Optional
-
-import yaml
-
-# ---------------------------------------------------------------------------
-# Config sources
-# ---------------------------------------------------------------------------
-# leagues.yaml lives in scrapers/sources/. In the Airflow container the
-# scrapers package is mounted at /opt/airflow/scrapers. On the host the
-# project root is wherever this repo is checked out — overridable via the
-# ``LEAGUES_YAML`` env var so unit tests can point it elsewhere.
-LEAGUES_YAML = Path(
-    os.environ.get('LEAGUES_YAML', '/opt/airflow/scrapers/sources/leagues.yaml')
-)
-
-# Number of historical seasons (incl. current) to materialize in dim_season.
-# Must match the row-count contract in gold_tasks.validate_gold_row_counts:
-#   CHECK.row_count('gold.dim_season', min_rows=5, max_rows=5)
-# Bump here AND there together; otherwise the DQ check will fail.
-N_SEASONS_WINDOW = 5
-
-
-def _slug(s: str) -> str:
-    """Strip diacritics + lowercase + non-alnum -> '_' + collapse runs + strip edges.
-
-    Matches the convention used by xref orphan IDs ('ss_<slug>') so
-    canonical_id formatting stays consistent across Gold tables.
-
-    NFD decomposes accented chars ("ü" -> "u" + combining mark); we drop the
-    combining marks (Unicode category 'Mn') before the non-alnum collapse, so a
-    competition name with/without accents maps to one slug (issue #215). This is
-    the Python mirror of the NORMALIZE(NFD) + `\\p{Mn}+` idiom in the SQL
-    normalizers (xref_team.sql.j2, xref_referee.sql).
-    """
-    s = ''.join(c for c in unicodedata.normalize('NFD', s)
-                if unicodedata.category(c) != 'Mn')
-    return re.sub(r'[^a-z0-9]+', '_', s.lower()).strip('_')
-
 
 _ROWS_PLACEHOLDER_RE = re.compile(r'^[ \t]*\{\{ rows \}\}[ \t]*$', re.MULTILINE)
 
@@ -94,42 +56,37 @@ def _substitute_rows(template: str, body: str) -> str:
     return _ROWS_PLACEHOLDER_RE.sub(lambda _: '    ' + body, template, count=1)
 
 
-def _seasons_window(current_season: int, n: int = N_SEASONS_WINDOW) -> List[int]:
-    """Return the last `n` season-start years ending at (and including)
-    ``current_season``. e.g. current=2025, n=5 -> [2021, 2022, 2023, 2024, 2025].
-
-    Centralised here so unit tests can monkey-patch the seed without touching
-    utils.config.
-    """
-    return list(range(current_season - n + 1, current_season + 1))
-
-
 # ---------------------------------------------------------------------------
 # Renderers
 # ---------------------------------------------------------------------------
 
 def render_dim_competition_sql(template_path: str, out_path: str) -> str:
-    """Render ``dim_competition.sql.j2`` to ``out_path``.
+    """Render ``dim_competition.sql.j2`` to ``out_path`` (issue #425).
 
-    Reads ``leagues.yaml:metadata``, emits one VALUES row per league with
-    the columns declared in the template's ``AS t(...)`` clause:
-        competition_id, competition_name, country, competition_level,
-        n_teams, matches_per_season, fbref_id, whoscored_id, sofascore_id,
-        espn_id, competition_canonical, competition_source, competition_version
+    Reads ``configs/medallion/competitions.yaml`` (the medallion source of
+    truth) and emits one VALUES row per competition — stubs included, the
+    dim is a dictionary — with the columns declared in the template's
+    ``AS t(...)`` clause:
+        league, competition_name, country, tier
+
+    PK ``league`` is the competition slug ('ENG-Premier League'), identical
+    to the ``league`` value carried by every Bronze/Silver/Gold row, so
+    fact-to-dim JOINs need no mapping table.
 
     The template's ``{{ rows }}`` literal is replaced with the joined tuples.
     Returns ``out_path`` for the convenience of pipeline glue code.
     """
-    meta = yaml.safe_load(LEAGUES_YAML.read_text())['metadata']
+    # Lazy import: keeps the module top import-light (no PyYAML pull for DAGs
+    # that don't render config-driven dims).
+    from utils.medallion_config import _escape_sql_string, load_competitions
 
     rows: List[str] = []
-    for name, m in meta.items():
-        cid = _slug(name)
+    for c in load_competitions()['competitions']:
         rows.append(
-            f"('{cid}', '{name}', '{m['country']}', {m['level']}, "
-            f"{m['teams']}, {m['matches_per_season']}, "
-            f"{m['fbref_id']}, {m['whoscored_id']}, {m['sofascore_id']}, "
-            f"'{m['espn_id']}', '{name}', 'config', 'v1')"
+            f"('{_escape_sql_string(c['id'])}', "
+            f"'{_escape_sql_string(c['name'])}', "
+            f"'{_escape_sql_string(c['country'])}', "
+            f"{int(c['tier'])})"
         )
 
     body = ',\n    '.join(rows)
@@ -140,35 +97,52 @@ def render_dim_competition_sql(template_path: str, out_path: str) -> str:
 
 
 def render_dim_season_sql(template_path: str, out_path: str) -> str:
-    """Render ``dim_season.sql.j2`` to ``out_path``.
+    """Render ``dim_season.sql.j2`` to ``out_path`` (issue #425).
 
-    Builds a 5-season window ending at ``CURRENT_SEASON`` (e.g. 2025 today
-    -> 2021..2025). For each year ``y`` emits a row keyed at ``f"{y}-{(y+1)%100:02d}"``
-    with August 1 / July 31 anchors and ``is_current`` marking the season
-    that contains today's date.
+    Unions ``seasons`` across all in-scope competitions in
+    ``configs/medallion/competitions.yaml``, dedupes by season slug
+    (earliest start / latest end win, so two leagues sharing slug '2425'
+    produce one covering row), and emits the columns declared in the
+    template's ``AS t(...)`` clause:
+        season, season_name, start_date, end_date, is_current
 
-    Columns must match the template's ``AS t(...)`` clause:
-        season_id, season_start_year, season_end_year, season_label,
-        valid_from, valid_to, is_current,
-        season_canonical, season_source, season_version
+    PK ``season`` is the 4-char slug ('2425') — the same value carried by
+    every Bronze/Silver/Gold row after #404.
+
+    ``is_current``: the LATEST season already started (max slug with
+    start_date <= today). A plain BETWEEN would flag zero seasons during
+    the summer gap between end_date and the next start_date.
     """
-    # Lazy import: utils.config pulls in datetime + a tiny bit of state but
-    # avoids a hard cycle at module-import time when running under pytest
-    # (where /opt/airflow may not be on sys.path).
-    from utils.config import CURRENT_SEASON
+    from utils.medallion_config import load_competitions
+
+    seasons: dict = {}  # slug -> {'start': date, 'end': date}
+    for c in load_competitions()['competitions']:
+        if not c.get('in_scope'):
+            continue
+        for s in c.get('seasons') or []:
+            # YAML season id is an int (2425) — format as 4-digit slug so a
+            # hypothetical '0203' season keeps its leading zero.
+            slug = f"{int(s['id']):04d}"
+            start = date.fromisoformat(str(s['start']))
+            end = date.fromisoformat(str(s['end']))
+            if slug in seasons:
+                seasons[slug]['start'] = min(seasons[slug]['start'], start)
+                seasons[slug]['end'] = max(seasons[slug]['end'], end)
+            else:
+                seasons[slug] = {'start': start, 'end': end}
 
     today = date.today()
-    rows: List[str] = []
+    started = [slug for slug, w in seasons.items() if w['start'] <= today]
+    current_slug = max(started) if started else None
 
-    for y in _seasons_window(CURRENT_SEASON):
-        sid = f"{y}-{str(y + 1)[-2:]}"
-        label = f"{y}/{str(y + 1)[-2:]}"
-        valid_from, valid_to = date(y, 8, 1), date(y + 1, 7, 31)
-        is_current = 'true' if valid_from <= today <= valid_to else 'false'
+    rows: List[str] = []
+    for slug in sorted(seasons):
+        w = seasons[slug]
+        name = f"20{slug[:2]}-{slug[2:]}"
+        is_current = 'true' if slug == current_slug else 'false'
         rows.append(
-            f"('{sid}', {y}, {y + 1}, '{label}', "
-            f"DATE '{valid_from}', DATE '{valid_to}', {is_current}, "
-            f"'{sid}', 'config', 'v1')"
+            f"('{slug}', '{name}', "
+            f"DATE '{w['start']}', DATE '{w['end']}', {is_current})"
         )
 
     body = ',\n    '.join(rows)
@@ -191,6 +165,48 @@ def render_dim_venue_sql(template_path: str, out_path: str) -> str:
     """
     # Lazy import: keeps the module top import-light (no PyYAML pull for DAGs
     # that don't render config-driven dims).
+    from utils.medallion_config import (
+        get_venue_alias_sql_values,
+        render_sql_template,
+    )
+
+    rendered = render_sql_template(
+        Path(template_path),
+        venue_aliases_values_sql=get_venue_alias_sql_values(),
+    )
+    Path(out_path).write_text(rendered)
+    return out_path
+
+
+def render_dim_team_sql(template_path: str, out_path: str) -> str:
+    """Render ``dim_team.sql.j2`` to ``out_path`` (issue #425).
+
+    Fills the single ``{{ team_meta_values_sql }}`` placeholder with
+    ``(team_id, team_name, country, short_name)`` tuples from
+    ``team_aliases.yaml`` — the club-attribute side of the dim; the row
+    spine still comes from ``silver.xref_team`` inside the template.
+    """
+    from utils.medallion_config import (
+        get_team_meta_sql_values,
+        render_sql_template,
+    )
+
+    rendered = render_sql_template(
+        Path(template_path),
+        team_meta_values_sql=get_team_meta_sql_values(),
+    )
+    Path(out_path).write_text(rendered)
+    return out_path
+
+
+def render_dim_match_sql(template_path: str, out_path: str) -> str:
+    """Render ``dim_match.sql.j2`` to ``out_path`` (issue #425).
+
+    Fills ``{{ venue_aliases_values_sql }}`` with the SAME tuples as
+    ``render_dim_venue_sql`` so the inline venue_id resolution in dim_match
+    is byte-identical to dim_venue's PK (a JOIN on gold.dim_venue is not an
+    option: the slim dim no longer carries raw alias spellings).
+    """
     from utils.medallion_config import (
         get_venue_alias_sql_values,
         render_sql_template,
