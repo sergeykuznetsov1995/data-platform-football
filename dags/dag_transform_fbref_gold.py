@@ -362,7 +362,7 @@ with DAG(
 ) as dag:
 
     # Stage 1.5: per-source season aggregates migrated from Silver (#370).
-    # Must precede s2_dimensions because fct_team_season_stats (in g2) reads them.
+    # Must precede s2d_season_blocks because fct_team_season_stats reads them.
     with TaskGroup(group_id='s1_5_source_season_agg') as g1_5:
         for task_id, sql_file, table_name, pcols in STAGE_1_5_SOURCE_SEASON_AGG:
             PythonOperator(
