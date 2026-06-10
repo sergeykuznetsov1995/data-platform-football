@@ -35,7 +35,7 @@ columns:
   - name: league
     description: Лига (partition key).
   - name: season
-    description: Сезон в bigint формате (2025 == 2025/26). Partition key.
+    description: Сезон — varchar slug ('2425' = сезон 2024/25). Partition key.
 
   # ─── Understat diff (INNER JOIN — всегда non-NULL) ───
   - name: matches_diff_understat

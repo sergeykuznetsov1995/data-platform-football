@@ -39,7 +39,7 @@ columns:
   - name: league
     description: Лига (partition key).
   - name: season
-    description: Сезон slug '2526' (partition key, varchar; slug↔year-start с FBref сводится на Gold).
+    description: Сезон — varchar slug '2526' (partition key); после #404 единый slug-формат у всех источников.
   - name: _silver_created_at
     description: Технический timestamp создания строки в Silver-слое (добавляется CTAS-раннером).
 relationships:

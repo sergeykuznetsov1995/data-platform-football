@@ -33,4 +33,4 @@ columns:
   - name: league
     description: Лига (partition key, текущая лига ingest'а).
   - name: season
-    description: Сезон bigint (e.g. 2025) — partition key, current ingest window.
+    description: Сезон — varchar slug ('2526' = сезон 2025/26), partition key, current ingest window.

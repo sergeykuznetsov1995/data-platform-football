@@ -34,7 +34,7 @@ columns:
   - name: league
     description: League slug.
   - name: season
-    description: Season (BIGINT; 2000+season_int).
+    description: Season — varchar slug ('2425' = сезон 2024/25). Partition key.
 relationships:
   - from: trino_iceberg.iceberg.gold.fct_goal
     to:   trino_iceberg.iceberg.gold.dim_match

@@ -24,7 +24,7 @@ columns:
   - name: league
     description: Лига (partition key).
   - name: season
-    description: Сезон (partition key, bigint).
+    description: Сезон — varchar slug ('2526' = сезон 2025/26), partition key.
   - name: referee_name
     description: Имя судьи матча из $.infoBox.Referee.text (например 'Michael Oliver').
     tags:

@@ -23,7 +23,7 @@ columns:
   - name: league
     description: Лига slug (например 'APL'), partition key.
   - name: season
-    description: Сезон slug '2526' (varchar, per charter S2 #388); year-start↔slug мост к dim делает Gold.
+    description: Сезон — varchar slug '2526' (per charter S2 #388); после #404 единый slug-формат у всех источников.
   - name: team_name
     description: Название команды как на WhoScored (например 'Manchester City'); не канонический team_id.
   - name: ws_player_id
