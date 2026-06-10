@@ -21,10 +21,10 @@
 --   silver.xref_player имеет per-(source, source_id, season) rows; без
 --   season-condition будет fan-out 1.5-4×.
 --
--- Season type mapping:
---   * silver.fotmob_player_market_value_history.season = bigint 2025
---   * silver.xref_player.season                       = varchar '2526'
---   xref slug '2526' → bigint 2025: `season  /* #404: slug passthrough (was slug→year-start) */`.
+-- Season type mapping (all varchar slug 'YYNN' after #404):
+--   * silver.fotmob_player_market_value_history.season = varchar slug '2526'
+--   * silver.xref_player.season                        = varchar slug '2526'
+--   #404 unified silver/xref season onto the slug form → JOIN is slug = slug.
 --
 -- TM extension followup: silver.transfermarkt_market_value_history уже
 -- содержит canonical_id и параллельный timeline; UNION ALL добавление

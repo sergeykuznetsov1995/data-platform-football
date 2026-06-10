@@ -23,14 +23,14 @@
 -- Зерно: (player_id_canonical, league, season). Spine — FBref subset из
 -- xref_player.
 --
--- Cross-source season type:
---   * silver.xref_player.season          = varchar '2526'
---   * silver.fbref_player_season_profile.season  = bigint 2025
---   * silver.fotmob_player_season_profile.season = bigint 2025
+-- Cross-source season type (all varchar slug 'YYNN' after #404):
+--   * silver.xref_player.season                       = varchar slug '2526'
+--   * silver.fbref_player_season_profile.season       = varchar slug '2526'
+--   * silver.fotmob_player_season_profile.season      = varchar slug '2526'
 --   * silver.whoscored_player_season_aggregate.season = varchar slug
 --   * silver.understat_player_season_aggregate.season = varchar slug
 --   * silver.sofascore_player_season_aggregate.season = varchar slug
---   xref slug '2526' → bigint 2025: `2000 + CAST(SUBSTR(season, 1, 2) AS bigint)`.
+--   #404 unified all silver/xref season onto the slug form → JOINs are slug = slug.
 --
 -- ⚠️ xref JOIN MUST include (league, season) predicate (CLAUDE.md):
 --   silver.xref_player имеет per-(source, source_id, season) rows;
@@ -44,7 +44,7 @@ xref_fbref AS (
         source_id                                         AS fbref_player_id,
         league,
         season                                            AS season_slug,  -- varchar '2526' (для WS/US/SS JOIN)
-        season  /* #404: slug passthrough (was slug→year-start) */      AS season_year   -- '2526' → 2025 (для FBref/FotMob)
+        season  /* #404: slug passthrough (was slug→year-start) */      AS season_year   -- slug '2526' (для FBref/FotMob JOIN)
     FROM iceberg.silver.xref_player
     WHERE source = 'fbref'
       AND confidence <> 'orphan'

@@ -28,20 +28,20 @@
 --
 -- Footguns (CLAUDE.md):
 --   * xref JOIN MUST include (league, season) predicate — feedback_xref_join_season_predicate.md
---   * xref_team.season per source: FBref = year-start '2025', US/WS/SS = slug '2526'.
---     dim_match.season = bigint 2025. season_slug computed via LPAD(MOD ...) below.
+--   * xref_team.season is slug '2526' for all sources after #404; dim_match.season
+--     is slug too — bridge JOINs are slug = slug (no LPAD/MOD conversion needed).
 --   * silver.whoscored_team_match.team_id is NUMERIC varchar ('16'), xref source_id
 --     is NAME ('Liverpool'). Bridge via bronze.whoscored_schedule (numeric+name pair)
 --     is populated only for season='2021' — WS block is intentionally NULL for current
 --     seasons until issue #120 lands canonical resolution in Silver.
---   * FotMob xref_team/xref_match.season is YEAR-START '2025' (bronze.fotmob_schedule
---     season is bigint), but silver.fotmob_team_match.season is SLUG '2526'. JOIN the
---     xref bridges on CAST(season AS varchar), the fact on season_slug.
+--   * FotMob xref_team/xref_match.season is slug '2526' after #404 (bronze.fotmob_schedule
+--     season is still bigint year-start), matching silver.fotmob_team_match.season —
+--     bridge JOINs are slug = slug.
 -- =============================================================================
 
 WITH
 -- ===== xref bridges per source =====
--- FBref team xref: season is varchar year-start ('2025') — used only for completeness
+-- FBref team xref: season is slug '2425' after #404 — used only for completeness
 -- (dim_match already exposes canonical team_id, so we don't strictly need this CTE
 -- for the spine; kept here documented for reference / symmetry with audit table).
 --

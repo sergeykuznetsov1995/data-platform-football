@@ -27,10 +27,10 @@
 --   Без него fan-out 1.5-4×.
 --
 -- Season normalization (feedback_xref_season_type):
---   * silver.xref_player.season              = varchar '2526'
---   * silver.fbref_player_match_stats.season = bigint 2025
+--   * silver.xref_player.season              = varchar slug '2526'
+--   * silver.fbref_player_match_stats.season = varchar slug '2526'
 --   * silver.{ss,us,ws}_player_match_aggregate.season = varchar slug
---   xref slug '2526' → bigint 2025: `season  /* #404: slug passthrough (was slug→year-start) */`.
+--   #404 unified all silver/xref season onto the slug form → bridge JOINs are slug = slug.
 -- =============================================================================
 
 WITH

@@ -76,17 +76,18 @@ class TestFctPlayerSeasonStatsSql:
             "xref_fotmob bridge JOIN must include season_year predicate"
         )
 
-    def test_season_slug_to_year_idiom(self):
-        """xref slug '2526' → bigint 2025 идиомой
-        `2000 + CAST(SUBSTR(season, 1, 2) AS bigint)`."""
+    def test_season_slug_passthrough(self):
+        """#404: xref season is slug — passed straight through as season_year,
+        no slug→year SUBSTR conversion."""
         sql = _read_sql()
-        assert re.search(
+        assert re.search(r"season\b[^\n]*AS\s+season_year", sql, re.IGNORECASE), (
+            "fct_player_season_stats.sql must alias xref season directly as "
+            "season_year (slug passthrough after #404)"
+        )
+        assert not re.search(
             r"2000\s*\+\s*CAST\s*\(\s*SUBSTR\s*\(\s*season\s*,\s*1\s*,\s*2\s*\)",
             sql, re.IGNORECASE,
-        ), (
-            "fct_player_season_stats.sql must convert xref season slug ('2526') "
-            "to bigint year (2025) using SUBSTR idiom"
-        )
+        ), "slug→year SUBSTR idiom was removed in #404 — season is slug now"
 
     def test_grain_columns_present(self):
         sql = _read_sql()

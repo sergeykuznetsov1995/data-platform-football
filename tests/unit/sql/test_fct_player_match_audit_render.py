@@ -104,13 +104,18 @@ class TestFctPlayerMatchAuditSql:
             "audit must reference season_slug / season_year в bridge JOINs"
         )
 
-    def test_season_slug_to_year_idiom(self):
-        """xref slug '2526' → bigint 2025 idiom для FBref-bigint-spine."""
+    def test_season_slug_passthrough(self):
+        """#404: xref season is slug — passed straight through as season_year,
+        no slug→year SUBSTR conversion."""
         sql = _read_sql()
-        assert re.search(
+        assert re.search(r"season\b[^\n]*AS\s+season_year", sql, re.IGNORECASE), (
+            "audit must alias xref season directly as season_year "
+            "(slug passthrough after #404)"
+        )
+        assert not re.search(
             r"2000\s*\+\s*CAST\s*\(\s*SUBSTR\s*\(\s*season\s*,\s*1\s*,\s*2\s*\)",
             sql, re.IGNORECASE,
-        ), "audit must convert xref season slug ('2526') → bigint year"
+        ), "slug→year SUBSTR idiom was removed in #404 — season is slug now"
 
     def test_audit_diff_columns_present(self):
         """Каждый из 4 источников отдаёт >= несколько diff-колонок.
