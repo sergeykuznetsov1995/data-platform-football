@@ -9,7 +9,7 @@ table:
     играла, видно из фактов; вылеты/выходы — события, не атрибуты). Spine —
     silver.xref_team (source='fbref'), атрибуты team_name/country/short_name —
     из configs/medallion/team_aliases.yaml. Используется как FK target из
-    dim_match (home/away), fct_team_match, feat_team_*.
+    dim_match (home/away), fct_team_match и других фактов.
   tags:
     - Tier.Gold
     - Domain.Football
