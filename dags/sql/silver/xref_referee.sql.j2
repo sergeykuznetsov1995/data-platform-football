@@ -40,6 +40,8 @@
 --   * canonical_id is NEVER NULL.
 --   * source ∈ {'fbref', 'matchhistory', 'fotmob'}.
 --   * confidence ∈ {'name_alias', 'orphan'}.
+--   * aliases CTE is unique on (norm, league) — GROUP BY guard against
+--     alias-JOIN fan-out (#465; precedent dim_match.venue_aliases / #425).
 --
 -- =============================================================================
 -- Bronze column-name reference (verified via DESCRIBE on 2026-06-03)
@@ -53,9 +55,6 @@
 
 WITH aliases AS (
     SELECT
-        raw_name,
-        canonical_name,
-        canonical_id,
         -- League predicate (issue #148): each alias tagged with the competition
         -- it applies to, so the JOIN can guard on `a.league = rt.league`. APL-
         -- only today → no-op, but future-proofs worldwide namesake split.
@@ -67,10 +66,26 @@ WITH aliases AS (
         regexp_replace(
             regexp_replace(normalize(lower(raw_name), NFD), '\p{Mn}+', ''),
             '[^a-z0-9]+', ''
-        ) AS norm
+        ) AS norm,
+        -- #465 guard (precedent: dim_match.venue_aliases / #425): one row per
+        -- (norm, league) — a non-unique join key would fan out raw_refs rows
+        -- and break PK (source, source_id, league, season). Same-norm rows
+        -- share one canonical by construction (collision = YAML curation
+        -- error), so MAX is exact, not a tiebreak.
+        MAX(canonical_name) AS canonical_name,
+        MAX(canonical_id)   AS canonical_id
     FROM (VALUES
         {{ referee_aliases_values_sql }}
     ) AS t(raw_name, canonical_name, canonical_id, league)
+    -- NB Trino: GROUP BY cannot reference the same-level SELECT alias `norm`
+    -- (COLUMN_NOT_FOUND; DuckDB-based tests mask this dialect gap — see
+    -- feedback_trino_window_alias_duckdb_gap), so the expression is repeated.
+    GROUP BY
+        regexp_replace(
+            regexp_replace(normalize(lower(raw_name), NFD), '\p{Mn}+', ''),
+            '[^a-z0-9]+', ''
+        ),
+        league
 ),
 
 raw_refs AS (

@@ -50,9 +50,14 @@ SEASON = "2526"
 
 # Two-column (raw_name, canonical_name) tuples — the template contract
 # (see test_medallion_config.test_sql_values_default_stays_two_columns).
+# 'Spartak' appears TWICE with different canonicals (worldwide namesake clubs —
+# the 2-tuple VALUES carries no league): without the #465 GROUP BY guard each
+# duplicate raw_name fans out both club JOINs.
 ALIAS_VALUES = (
     "('Arsenal', 'Arsenal'),\n"
-    "        ('Wolves', 'Wolverhampton Wanderers')"
+    "        ('Wolves', 'Wolverhampton Wanderers'),\n"
+    "        ('Spartak', 'Spartak Moscow'),\n"
+    "        ('Spartak', 'Spartak Nalchik')"
 )
 
 
@@ -125,6 +130,9 @@ def _bootstrap(con) -> None:
          "€10.00m", 10_000_000.0, t0),
         ("100007", date(2025, 7, 7), "Arsenal", "Wolves",
          "€11.00m", 11_000_000.0, t1),
+        # #465 collision case: 'Spartak' matches TWO alias rows.
+        ("100008", date(2025, 7, 8), "Spartak", "Arsenal",
+         "free transfer", None, t0),
     ]
     for pid, d, frm, to, fee_text, fee_eur, ts in rows:
         con.execute(
@@ -210,3 +218,33 @@ class TestSilverTransfersExistingContract:
         dup = [r for r in silver_rows if r["player_id"] == "100007"]
         assert len(dup) == 1
         assert dup[0]["fee_eur"] == 11_000_000
+
+
+class TestSilverTransfersAliasCollision:
+    """#465: a duplicate raw_name in the alias VALUES must NOT fan out the
+    club JOINs (precedent: venue norm-collision #425 — 323 dup PK rows)."""
+
+    def test_collision_raw_name_no_fanout(self, silver_rows):
+        rows = [r for r in silver_rows if r["player_id"] == "100008"]
+        assert len(rows) == 1, (
+            f"'Spartak' matches 2 alias rows — expected the GROUP BY guard to "
+            f"collapse them, got {len(rows)} rows"
+        )
+
+    def test_grain_unique(self, silver_rows):
+        grain = [
+            (r["player_id"], r["transfer_date"],
+             r["from_club_name"], r["to_club_name"])
+            for r in silver_rows
+        ]
+        assert len(grain) == len(set(grain)), (
+            f"duplicate grain rows: {sorted(grain)}"
+        )
+
+    def test_collision_resolves_to_one_curated(self, silver_rows):
+        """Membership only — the guard picks ONE deterministic canonical
+        (MAX); which one wins is not part of the contract."""
+        row = next(r for r in silver_rows if r["player_id"] == "100008")
+        assert row["from_club_id_canonical"] in {
+            "spartak_moscow", "spartak_nalchik",
+        }

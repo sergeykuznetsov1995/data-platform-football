@@ -4,10 +4,10 @@
 -- Maps source-specific team-name → canonical team_id across 10 sources.
 --
 -- This template renders ONE `{{ team_aliases_values_sql }}` placeholder which
--- is filled by `medallion_config.get_team_alias_sql_values(with_canonical_id=True)`.
--- The placeholder must produce a comma-separated list of three-tuples in the
--- form `('raw_name', 'canonical_name', 'canonical_id'), ...`. See
--- `medallion_config.py` for escape rules and the public-API contract.
+-- is filled by `medallion_config.get_team_alias_sql_values(with_canonical_id=True,
+-- with_league=True)`. The placeholder must produce a comma-separated list of
+-- four-tuples `('raw_name', 'canonical_name', 'canonical_id', 'league'), ...`.
+-- See `medallion_config.py` for escape rules and the public-API contract.
 --
 -- Identity (issue #141): `canonical_id` is the explicit identity slug declared
 -- in `team_aliases.yaml` — it is NOT derived from the display name here. Two
@@ -41,6 +41,8 @@
 --     that the set equals the 10 prefixes documented above.
 --   * canonical_id is NEVER NULL (CASE branch covers every source).
 --   * confidence ∈ {'name_alias', 'orphan'}.
+--   * aliases CTE is unique on (norm, league) — GROUP BY guard against
+--     alias-JOIN fan-out (#465; precedent dim_match.venue_aliases / #425).
 --
 -- =============================================================================
 -- Bronze column-name reference (verified via DESCRIBE on 2026-05-08)
@@ -61,9 +63,6 @@
 
 WITH aliases AS (
     SELECT
-        raw_name,
-        canonical_name,
-        canonical_id,
         -- League predicate (issue #148, #141 stage 2): each alias is tagged with
         -- the competition it applies to, so the JOIN below can guard on
         -- `a.league = rt.league` and disambiguate a bare short name (e.g.
@@ -79,10 +78,30 @@ WITH aliases AS (
                 '\s+(fc|afc|cf)$', ''
             ),
             '[^a-z0-9]+', ''
-        ) AS norm
+        ) AS norm,
+        -- #465 guard (precedent: dim_match.venue_aliases / #425): collapse to
+        -- ONE row per (norm, league) so the LEFT JOIN in `resolved` can never
+        -- fan out raw_teams rows (PK = source, source_id, league, season).
+        -- Same-norm rows share one canonical by construction (two DIFFERENT
+        -- canonicals on one norm = YAML curation error), so MAX is exact,
+        -- not a tiebreak.
+        MAX(canonical_name) AS canonical_name,
+        MAX(canonical_id)   AS canonical_id
     FROM (VALUES
         {{ team_aliases_values_sql }}
     ) AS t(raw_name, canonical_name, canonical_id, league)
+    -- NB Trino: GROUP BY cannot reference the same-level SELECT alias `norm`
+    -- (COLUMN_NOT_FOUND; DuckDB-based tests mask this dialect gap — see
+    -- feedback_trino_window_alias_duckdb_gap), so the expression is repeated.
+    GROUP BY
+        regexp_replace(
+            regexp_replace(
+                regexp_replace(normalize(lower(raw_name), NFD), '\p{Mn}+', ''),
+                '\s+(fc|afc|cf)$', ''
+            ),
+            '[^a-z0-9]+', ''
+        ),
+        league
 ),
 
 raw_teams AS (
