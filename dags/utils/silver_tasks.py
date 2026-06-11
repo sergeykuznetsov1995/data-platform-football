@@ -209,9 +209,9 @@ def run_silver_transform(
             cols = ", ".join(f"'{c}'" for c in partition_columns)
             partition_clause = f"WITH (partitioning = ARRAY[{cols}])\n"
 
-        # Gold-on-Gold transforms (e.g. fct_match_train SELECT m.* FROM gold.fct_match)
-        # already carry _silver_created_at via m.* — re-adding it would raise
-        # DUPLICATE_COLUMN_NAME. Such callers pass add_timestamp=False.
+        # Transforms re-selecting a table that already carries _silver_created_at
+        # (via m.*) would raise DUPLICATE_COLUMN_NAME on re-add. Such callers
+        # pass add_timestamp=False.
         if add_timestamp:
             ctas_sql = (
                 f"CREATE OR REPLACE TABLE {full_table}\n"

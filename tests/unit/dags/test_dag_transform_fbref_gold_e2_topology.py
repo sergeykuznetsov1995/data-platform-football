@@ -172,13 +172,26 @@ class TestStageChaining:
         s3_task_ids = {
             "s3_facts.fct_team_match",
             "s3_facts.fct_player_match",
-            "s3_facts.match_outcomes",
         }
         op = _by_task_id("s2d_season_blocks.fct_standings")
         missing = s3_task_ids - op.downstream_task_ids
         assert not missing, (
             f"fct_standings missing s3 downstreams: {missing}. "
             f"Have: {op.downstream_task_ids}"
+        )
+
+    def test_no_derived_tier_stages(self):
+        """#478: производный gold-этаж вырезан — в DAG нет task'ов стадий
+        s1_5 (per-source season agg), s4 (feat_*), s5 (fct_match),
+        s6 (ml splits), s7 (dashboard marts)."""
+        _reload_gold_dag()
+        dropped_prefixes = ("s1_5_", "s4_", "s5_", "s6_", "s7_")
+        leftovers = {
+            tid for tid in _all_task_ids()
+            if tid.startswith(dropped_prefixes)
+        }
+        assert not leftovers, (
+            f"derived-tier task ids must be gone after #478: {leftovers}"
         )
 
 

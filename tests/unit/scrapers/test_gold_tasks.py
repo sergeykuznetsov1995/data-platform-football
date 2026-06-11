@@ -2,7 +2,6 @@
 Unit tests for Gold Transformation Tasks (dags/utils/gold_tasks.py).
 
 Covers:
-  * FEAT_*_ROLLING_COLS registries — point-in-time leakage protection.
   * run_gold_transform fallback / require_silver graceful-degrade flow.
   * validate_gold_quality module imports cleanly without a live Trino.
 """
@@ -25,40 +24,8 @@ def _import_gold_tasks():
     return mod
 
 
-class TestRollingColumnRegistries:
-    """FEAT_*_ROLLING_COLS drive point-in-time DQ checks. Drift between SQL
-    and these lists silently disables leakage protection — keep them honest."""
-
-    def test_team_form_cols_non_empty_unique(self):
-        mod = _import_gold_tasks()
-        cols = mod.FEAT_TEAM_FORM_ROLLING_COLS
-        assert len(cols) > 0, "FEAT_TEAM_FORM_ROLLING_COLS is empty"
-        assert len(cols) == len(set(cols)), f"duplicates: {cols}"
-        # T3.3 std/trend additions must be present
-        for c in ('l5_goals_for_std', 'l5_goals_against_std',
-                  'l5_points_std', 'l5_form_trend'):
-            assert c in cols, f"{c} missing from FEAT_TEAM_FORM_ROLLING_COLS"
-
-    def test_h2h_cols_non_empty_unique(self):
-        mod = _import_gold_tasks()
-        cols = mod.FEAT_TEAM_H2H_ROLLING_COLS
-        assert len(cols) > 0
-        assert len(cols) == len(set(cols)), f"duplicates: {cols}"
-
-    def test_xg_form_cols_non_empty_unique_and_balanced(self):
-        mod = _import_gold_tasks()
-        cols = mod.FEAT_TEAM_XG_FORM_ROLLING_COLS
-        assert len(cols) > 0
-        assert len(cols) == len(set(cols)), f"duplicates: {cols}"
-        # Both L5 and L10 windows must be enforced
-        assert any(c.endswith('_l5_avg') for c in cols), "missing L5 cols"
-        assert any(c.endswith('_l10_avg') for c in cols), "missing L10 cols"
-
-    def test_player_form_cols_non_empty_unique(self):
-        mod = _import_gold_tasks()
-        cols = mod.FEAT_PLAYER_FORM_ROLLING_COLS
-        assert len(cols) > 0
-        assert len(cols) == len(set(cols)), f"duplicates: {cols}"
+class TestModuleImports:
+    """gold_tasks must import without a live Trino."""
 
     def test_validate_gold_quality_importable(self):
         """validate_gold_quality is callable + the symbol exists. Don't run
@@ -70,7 +37,7 @@ class TestRollingColumnRegistries:
 
 class TestRunGoldTransformFallback:
     """fallback_sql_file + require_silver: graceful degrade when an optional
-    Silver dependency (e.g. fbref_shot_events) is missing."""
+    Silver dependency (e.g. whoscored_player_unavailable) is missing."""
 
     def test_no_fallback_when_all_silver_present(self, tmp_path):
         mod = _import_gold_tasks()
@@ -84,9 +51,9 @@ class TestRunGoldTransformFallback:
                           return_value={'status': 'success', 'rows': 10}) as mock_run:
             result = mod.run_gold_transform(
                 sql_file=str(sql_file),
-                table_name='feat_team_xg_form',
+                table_name='fct_player_unavailable',
                 fallback_sql_file=str(fb_file),
-                require_silver=['fbref_shot_events'],
+                require_silver=['whoscored_player_unavailable'],
             )
 
         # All required tables present → main sql_file used, no fallback flag
@@ -95,7 +62,7 @@ class TestRunGoldTransformFallback:
         assert mock_run.call_args.kwargs['sql_file'] == str(sql_file)
         assert mock_run.call_args.kwargs['schema'] == 'gold'
         mock_exists.assert_called_once_with(
-            table_name='fbref_shot_events', schema='silver',
+            table_name='whoscored_player_unavailable', schema='silver',
         )
 
     def test_fallback_used_when_silver_missing(self, tmp_path):
@@ -111,14 +78,14 @@ class TestRunGoldTransformFallback:
                           return_value={'status': 'success', 'rows': 0}) as mock_run:
             result = mod.run_gold_transform(
                 sql_file=str(sql_file),
-                table_name='feat_team_xg_form',
+                table_name='fct_player_unavailable',
                 fallback_sql_file=str(fb_file),
-                require_silver=['fbref_shot_events'],
+                require_silver=['whoscored_player_unavailable'],
             )
 
         # Fallback fired → result carries fallback=True + reason
         assert result.get('fallback') is True
-        assert 'fbref_shot_events' in result.get('fallback_reason', '')
+        assert 'whoscored_player_unavailable' in result.get('fallback_reason', '')
         # run_silver_transform was called with the FALLBACK SQL, schema=gold
         mock_run.assert_called_once()
         assert mock_run.call_args.kwargs['sql_file'] == str(fb_file)
@@ -145,16 +112,17 @@ class TestRunGoldTransformFallback:
         assert mock_run.call_args.kwargs['schema'] == 'gold'
 
     def test_add_timestamp_propagated_to_silver_transform(self, tmp_path):
-        """add_timestamp must be forwarded — Gold-on-Gold uses False."""
+        """add_timestamp must be forwarded — callers re-selecting a table
+        that already carries _silver_created_at pass False."""
         mod = _import_gold_tasks()
         sql_file = tmp_path / "main.sql"
-        sql_file.write_text("SELECT m.* FROM iceberg.gold.fct_match m")
+        sql_file.write_text("SELECT m.* FROM iceberg.silver.some_table m")
 
         with patch.object(mod, 'run_silver_transform',
                           return_value={'status': 'success', 'rows': 1}) as mock_run:
             mod.run_gold_transform(
                 sql_file=str(sql_file),
-                table_name='fct_match_train',
+                table_name='some_table_copy',
                 add_timestamp=False,
             )
 

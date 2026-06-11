@@ -8,8 +8,7 @@
 -- the canonical_id of silver.xref_referee — the curated 3-source identity
 -- (FBref + MatchHistory + FotMob, issues #143/#270): 'ref_<slug>' for aliased
 -- referees, '<src>_ref_<slug>' for orphans. Downstream referee_id consumers
--- (feat_referee_bias, mart_referee_dashboard) now read the id from
--- dim_match.referee_id instead of re-deriving an inline hash.
+-- read the id from dim_match.referee_id instead of re-deriving an inline hash.
 --
 -- Sources:
 --   iceberg.silver.xref_referee          (spine: canonical_id + display_name)

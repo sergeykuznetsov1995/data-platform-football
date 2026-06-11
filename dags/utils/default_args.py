@@ -54,13 +54,3 @@ SILVER_ARGS: Dict[str, Any] = {
     'retry_delay': timedelta(minutes=2),
     'execution_timeout': timedelta(minutes=30),
 }
-
-# Online inference / serving arguments (T4.2: dag_serve_predictions)
-# Short timeout — predictions_input is one cheap CTAS over fct_match;
-# anything longer than 15 min indicates Trino contention worth alerting on.
-PREDICTIONS_ARGS: Dict[str, Any] = {
-    **DEFAULT_ARGS,
-    'retries': 2,
-    'retry_delay': timedelta(minutes=2),
-    'execution_timeout': timedelta(minutes=15),
-}

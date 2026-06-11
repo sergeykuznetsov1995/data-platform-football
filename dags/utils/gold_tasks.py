@@ -42,123 +42,6 @@ logger = logging.getLogger(__name__)
 PARTITION_FILTER_SENTINEL = "-- WHERE_PARTITION_FILTER_HERE"
 
 
-# ---------------------------------------------------------------------------
-# Point-in-time leakage protection — rolling-feature column registries
-# ---------------------------------------------------------------------------
-# Each feat_* table masks rolling columns to NULL for the first N rows per
-# partition (see CASE WHEN match_rn > N in dags/sql/gold/feat_*.sql). DQ
-# verifies that mask is intact by counting non-NULL values where rn <= N.
-#
-# Keep these lists in sync with the SELECT lists of the corresponding SQL
-# files. New rolling column added in SQL? Add it here too — otherwise a
-# regression that drops the CASE-WHEN mask ships silently.
-#
-# Columns are grouped by SQL file. (table, partition_by, order_by, skip_n)
-# is shared across all columns in a group.
-
-# feat_team_form — partition (team_id, season) ORDER BY date, mask match_rn > 5
-FEAT_TEAM_FORM_ROLLING_COLS = [
-    # T1.x baseline averages
-    'l5_goals_for_avg',
-    'l5_goals_against_avg',
-    'l5_shots_avg',
-    'l5_sot_avg',
-    'l5_possession_avg',
-    'l5_form_points',
-    'l5_wins',
-    'l5_losses',
-    'l5_draws',
-    # T3.3 volatility + trend
-    'l5_goals_for_std',
-    'l5_goals_against_std',
-    'l5_points_std',
-    'l5_form_trend',
-    # E5: rolling avg # of confirmed unavailable players over L5. Same
-    # skip_first_n=5 mask — point-in-time leakage risk is identical to
-    # other rolling features here.
-    'unavailable_count_l5',
-]
-
-# feat_team_h2h — partition (team_id, opponent_id) ORDER BY date, mask h2h_rn > 1
-# NB: NO season in partition — head-to-head is a cross-season relationship.
-# skip_first_n=1 (not 5) because h2h has at most ~2 matches/season per pair.
-FEAT_TEAM_H2H_ROLLING_COLS = [
-    'h2h_goals_diff_avg',
-    'h2h_goals_for_avg',
-    'h2h_goals_against_avg',
-    'h2h_wins',
-    'h2h_losses',
-    'h2h_draws',
-]
-
-# feat_team_xg_form — partition (team_id, season) ORDER BY match_date, mask match_rn > 5
-# Both L5 and L10 columns share skip_first_n=5 — see SQL header for trade-off
-# rationale (APL 38-match seasons make >10 mask too restrictive).
-FEAT_TEAM_XG_FORM_ROLLING_COLS = [
-    # L5
-    'xg_for_l5_avg',
-    'xg_against_l5_avg',
-    'xg_diff_l5_avg',
-    'psxg_for_l5_avg',
-    'psxg_against_l5_avg',
-    'psxg_diff_l5_avg',
-    # L10
-    'xg_for_l10_avg',
-    'xg_against_l10_avg',
-    'xg_diff_l10_avg',
-    'psxg_for_l10_avg',
-    'psxg_against_l10_avg',
-    'psxg_diff_l10_avg',
-]
-
-# feat_player_form — partition (player_id, season) ORDER BY match_id, mask appearance_rn > 5
-FEAT_PLAYER_FORM_ROLLING_COLS = [
-    'l5_minutes_avg',
-    'l5_goals_avg',
-    'l5_assists_avg',
-    'l5_shots_avg',
-    'l5_sot_avg',
-    'l5_goals_sum',
-    'l5_assists_sum',
-    'l5_yellows_sum',
-    'l5_reds_sum',
-]
-
-# E6 / W2: feat_referee_bias — partition (referee_id, season) ORDER BY date,
-# mask ref_match_rn > 5. Each column is a rolling stat over the referee's last
-# 10 completed matches (within season). Same point-in-time semantics as the
-# other feat_* tables: first 5 matches of a referee's season carry NULL to
-# avoid leakage during early-season fitting.
-FEAT_REFEREE_BIAS_ROLLING_COLS = [
-    'ref_yellow_per_match_l10',
-    'ref_red_per_match_l10',
-    'ref_cards_per_match_l10',
-    'ref_goals_per_match_l10',
-    'ref_home_win_rate_l10',
-    'ref_pen_per_match_l10',
-]
-
-# E6 / W3: feat_team_event_style — partition (team_id, season) ORDER BY date,
-# mask match_rn > 5. All columns are share/rate metrics derived from
-# silver.whoscored_events_spadl rolling over the team's last 5 matches.
-# Bounded in [0, 1] (share = fraction of team's actions of given type, or
-# success_rate = share of successful actions). NB: skip_first_n=5 — share
-# numerators are unstable for the first ~5 matches when sample sizes are
-# small, so the SQL masks them to NULL and the DQ enforces the mask.
-FEAT_TEAM_EVENT_STYLE_ROLLING_COLS = [
-    'pass_share_l5_avg',
-    'dribble_share_l5_avg',
-    'tackle_share_l5_avg',
-    'interception_share_l5_avg',
-    'cross_share_l5_avg',
-    'shot_share_l5_avg',
-    'success_rate_l5_avg',
-    'set_piece_share_l5_avg',
-    'open_play_share_l5_avg',
-    'header_share_l5_avg',
-]
-
-
 def run_gold_transform(
     sql_file: str,
     table_name: str,
@@ -914,11 +797,10 @@ def _append_fct_standings_coverage_check(report) -> None:
       * ``coverage < 50%`` -> ERROR-grade signal, but the check is wired as
         WARNING per the E2 spec (orphans are tracked, not blocking).
 
-    Implemented inline (mirroring ``_append_train_test_disjointness_check``)
-    because the universal CHECK registry has no two-tier ``coverage``
-    primitive yet — see CLAUDE.md Gold/DQ section. When ``coverage()``
-    lands in ``data_quality.py`` this helper should be folded into the
-    main check list.
+    Implemented inline because the universal CHECK registry has no two-tier
+    ``coverage`` primitive yet — see CLAUDE.md Gold/DQ section. When
+    ``coverage()`` lands in ``data_quality.py`` this helper should be folded
+    into the main check list.
     """
     from utils.data_quality import CheckResult, _get_conn
 
@@ -1005,7 +887,6 @@ def validate_gold_quality() -> Dict[str, Any]:
         CHECK.no_duplicates('gold.fct_team_match',   pk=['match_id', 'team_id']),
         # #426 star design §4.4: fct_player_match PK = (match_id, player_id).
         CHECK.no_duplicates('gold.fct_player_match', pk=['match_id', 'player_id']),
-        CHECK.no_duplicates('gold.match_outcomes',    pk=['match_id']),
         # E5 → #426 star design §4.6: PK = (match_id, player_id) — a player
         # cannot be unavailable twice for one match (verified dup-free on live
         # data pre-cutover). Empty fallback (0 rows) passes trivially.
@@ -1013,21 +894,10 @@ def validate_gold_quality() -> Dict[str, Any]:
             'gold.fct_player_unavailable',
             pk=['match_id', 'player_id'],
         ),
-        # #370: per-source season aggregates migrated from Silver to Gold.
-        # Pure GROUP BY rollups (uniqueness is structural) — the check guards
-        # against a future regression dropping a GROUP BY key. Relocates the
-        # PK-uniqueness DQ removed from dag_transform_e3 / dag_transform_fotmob_silver.
-        CHECK.no_duplicates('gold.fotmob_team_season',    pk=['team_id', 'league', 'season']),
-        CHECK.no_duplicates('gold.understat_team_season', pk=['team_id_canonical', 'league', 'season']),
-        CHECK.no_duplicates('gold.whoscored_team_season', pk=['team_id', 'league', 'season']),
-        CHECK.no_duplicates('gold.sofascore_team_season', pk=['team_id', 'league', 'season']),
 
         # ========== No NULLs in PKs — ERROR ==========
         CHECK.no_nulls('gold.dim_match',       cols=['match_id', 'match_date']),
         CHECK.no_nulls('gold.fct_team_match',  cols=['match_id', 'team_id', 'opponent_id']),
-        # match_outcomes is the source-of-truth for ML labels — PK + temporal
-        # keys MUST be present, otherwise downstream backtests silently misalign.
-        CHECK.no_nulls('gold.match_outcomes',  cols=['match_id', 'season', 'match_date']),
         # E5: required keys. NB: `team_id` is intentionally NOT here — cross-
         # source slug mismatches (Wolves/Wolverhampton) leave it NULL by design;
         # coverage is observed via the WARNING-severity row_count check below.
@@ -1047,7 +917,6 @@ def validate_gold_quality() -> Dict[str, Any]:
             'player_id',
             parent_key='player_id_canonical',
         ),
-        CHECK.ref_integrity('gold.match_outcomes',    'gold.dim_match', 'match_id'),
         # E5: every unavailability row must point at a real Gold match.
         # SQL already filters bridge failures, so 0 orphans by construction.
         CHECK.ref_integrity('gold.fct_player_unavailable', 'gold.dim_match', 'match_id'),
@@ -1091,14 +960,6 @@ def validate_gold_quality() -> Dict[str, Any]:
         # rating: SofaScore-источник, шкала [0, 10]; NULL для матчей без оценки.
         CHECK.value_range('gold.fct_player_match', 'rating',
                           min_val=0, max_val=10, severity='WARNING'),
-        # Targets sanity — only meaningful for completed matches; outliers
-        # outside [0, 20] indicate parser regression in Silver score extraction.
-        CHECK.value_range('gold.match_outcomes', 'total_goals', min_val=0, max_val=20,
-                          where='is_completed = true', severity='WARNING'),
-        CHECK.value_range('gold.match_outcomes', 'home_score', min_val=0, max_val=20,
-                          where='is_completed = true', severity='WARNING'),
-        CHECK.value_range('gold.match_outcomes', 'away_score', min_val=0, max_val=20,
-                          where='is_completed = true', severity='WARNING'),
 
         # ========== E5: fct_player_unavailable observability — WARNING ==========
         # season теперь varchar slug ('2021'..'2526'), per charter S2 (#388);
@@ -2203,175 +2064,10 @@ def validate_gold_quality() -> Dict[str, Any]:
         # with 'fb_'). All severity=WARNING in this prep PR — operate as
         # observability during the ≥3-day green-parity gate-watch window.
         # See dags/utils/xref_dq.py::build_e1_5_post_cutover_checks for
-        # the full list (6 checks). After cutover-merge a follow-up PR
+        # the full list (4 checks). After cutover-merge a follow-up PR
         # may tighten the team-level check to ERROR severity.
         # ============================================================
         *build_e1_5_post_cutover_checks(),
-
-        # ============================================================
-        # Point-in-time leakage protection — feat_* rolling tables (#186)
-        # ------------------------------------------------------------
-        # Each rolling column MUST be NULL for the first skip_first_n rows
-        # per partition (SQL masks via CASE WHEN <rn> > N). These checks
-        # enforce the mask is intact — a dropped CASE-WHEN ships leakage
-        # silently otherwise. Column lists live in module-level constants
-        # (FEAT_*_ROLLING_COLS) kept in sync with the SQL by
-        # tests/unit/dq/test_feat_rolling_registry.py.
-        # ============================================================
-        *(
-            CHECK.point_in_time(
-                'gold.feat_team_form',
-                feature_col=col,
-                partition_by=['team_id', 'season'],
-                order_by='date',
-                skip_first_n=5,
-            )
-            for col in FEAT_TEAM_FORM_ROLLING_COLS
-        ),
-        # h2h: partition is (team_id, opponent_id) — h2h is cross-season; mask
-        # is h2h_rn > 1 (first encounter has no prior). skip_first_n=1.
-        *(
-            CHECK.point_in_time(
-                'gold.feat_team_h2h',
-                feature_col=col,
-                partition_by=['team_id', 'opponent_id'],
-                order_by='date',
-                skip_first_n=1,
-            )
-            for col in FEAT_TEAM_H2H_ROLLING_COLS
-        ),
-        # xG / PSxG rolling features (L5 + L10). SQL masks both window sizes at
-        # match_rn > 5 (an APL season has 38 matches; demanding 10 prior would
-        # null ~26% of rows), so skip_first_n=5 applies uniformly.
-        *(
-            CHECK.point_in_time(
-                'gold.feat_team_xg_form',
-                feature_col=col,
-                partition_by=['team_id', 'season'],
-                order_by='match_date',
-                skip_first_n=5,
-            )
-            for col in FEAT_TEAM_XG_FORM_ROLLING_COLS
-        ),
-        # feat_player_form keys are canonical (#46 multi-source rename):
-        # player_id_canonical / match_id_canonical, not the bare *_id the other
-        # feat_* tables use.
-        *(
-            CHECK.point_in_time(
-                'gold.feat_player_form',
-                feature_col=col,
-                partition_by=['player_id_canonical', 'season'],
-                order_by='match_id_canonical',
-                skip_first_n=5,
-            )
-            for col in FEAT_PLAYER_FORM_ROLLING_COLS
-        ),
-        *(
-            CHECK.point_in_time(
-                'gold.feat_referee_bias',
-                feature_col=col,
-                partition_by=['referee_id', 'season'],
-                order_by='date',
-                skip_first_n=5,
-            )
-            for col in FEAT_REFEREE_BIAS_ROLLING_COLS
-        ),
-        *(
-            CHECK.point_in_time(
-                'gold.feat_team_event_style',
-                feature_col=col,
-                partition_by=['team_id', 'season'],
-                order_by='date',
-                skip_first_n=5,
-            )
-            for col in FEAT_TEAM_EVENT_STYLE_ROLLING_COLS
-        ),
-
-        # ============================================================
-        # E7 / T7: BI dashboard marts — DQ guards complementing the
-        # row_count floors registered in validate_gold_row_counts().
-        # PK uniqueness ERROR + value-range / freshness WARNINGs +
-        # point-in-time leakage guard for mart_scouting_radar.xg_l5.
-        # ============================================================
-
-        # ----- E7: mart_scouting_radar — PK uniqueness — ERROR -----
-        # SQL declares (player_id, season, league, match_id) as PK in the
-        # header, but (player_id, match_id) is the unique tuple — season +
-        # league are passthrough partition keys (one row per appearance).
-        CHECK.no_duplicates('gold.mart_scouting_radar',
-                            pk=['player_id', 'match_id']),
-
-        # ----- E7: mart_scouting_radar — freshness — WARNING -----
-        # `match_date` is a DATE (not a load timestamp): used here as the
-        # most recent fixture played. Threshold = 2 days (48h) accommodates
-        # international breaks while still surfacing parser regressions.
-        CHECK.freshness('gold.mart_scouting_radar', ts_col='match_date',
-                        max_age_hours=48, severity='WARNING'),
-
-        # ----- E7: mart_scouting_radar — value-range — WARNING -----
-        # Single-match xG headroom: penalties are 0.79; legitimate top
-        # outliers (e.g. multiple big chances) rarely exceed 2.5; cap at 5
-        # leaves headroom for unusual matches without flagging real data.
-        CHECK.value_range('gold.mart_scouting_radar', 'xg',
-                          min_val=0, max_val=5, severity='WARNING'),
-        CHECK.value_range('gold.mart_scouting_radar', 'xa',
-                          min_val=0, max_val=5, severity='WARNING'),
-
-        # ----- E7: mart_scouting_radar — point-in-time — ERROR -----
-        # SQL masks xg_l5 / xa_l5 / shots_l5 / defensive_l5 at
-        # appearance_rn > 5 within (player_id, season). Ordered by
-        # (match_date, match_id). Leakage triggers DAG failure before
-        # Gold ships features to BI.
-        CHECK.point_in_time(
-            'gold.mart_scouting_radar',
-            feature_col='xg_l5',
-            partition_by=['player_id', 'season'],
-            order_by='match_date',
-            skip_first_n=5,
-        ),
-
-        # ----- E7: mart_referee_dashboard — PK uniqueness — ERROR -----
-        CHECK.no_duplicates('gold.mart_referee_dashboard',
-                            pk=['referee_id', 'season', 'league']),
-
-        # ----- E7: mart_referee_dashboard — value-range -----
-        # cards_per_match: typical EPL window is 2-5; cap at 15 leaves
-        # headroom for derby outliers. WARNING — a soft heuristic.
-        CHECK.value_range('gold.mart_referee_dashboard', 'cards_per_match',
-                          min_val=0, max_val=15, severity='WARNING'),
-        # home_win_pct is a fraction in [0, 1]. Boundary check is ERROR:
-        # values outside the unit interval indicate an aggregation bug.
-        CHECK.value_range('gold.mart_referee_dashboard', 'home_win_pct',
-                          min_val=0, max_val=1, severity='ERROR'),
-        # matches_officiated >= 1 — a referee-season row only exists if
-        # the ref appeared at least once. Zero or negative would mean an
-        # empty GROUP that survived the LEFT JOIN — definitely a bug.
-        CHECK.value_range('gold.mart_referee_dashboard', 'matches_officiated',
-                          min_val=1, severity='ERROR'),
-
-        # ----- E7: mart_event_heatmap — PK uniqueness — ERROR -----
-        CHECK.no_duplicates(
-            'gold.mart_event_heatmap',
-            pk=['team_id', 'season', 'league', 'zone_x', 'zone_y',
-                'action_canonical'],
-        ),
-
-        # ----- E7: mart_event_heatmap — bin safety — ERROR -----
-        # zone_x / zone_y are SQL-clamped to [0, 11] / [0, 7] via
-        # LEAST/GREATEST. Anything outside means the binning formula
-        # regressed (e.g. divisor change, missing GREATEST). Hard ERROR.
-        CHECK.value_range('gold.mart_event_heatmap', 'zone_x',
-                          min_val=0, max_val=11, severity='ERROR'),
-        CHECK.value_range('gold.mart_event_heatmap', 'zone_y',
-                          min_val=0, max_val=7,  severity='ERROR'),
-        # success_rate is AVG of a boolean cast to double — strictly in
-        # [0, 1]. Boundary breach = aggregation regression.
-        CHECK.value_range('gold.mart_event_heatmap', 'success_rate',
-                          min_val=0, max_val=1, severity='ERROR'),
-        # event_count >= 1 — the GROUP BY guarantees a row only when at
-        # least one event landed in the bin. Zero indicates a bug.
-        CHECK.value_range('gold.mart_event_heatmap', 'event_count',
-                          min_val=1, severity='ERROR'),
     ]
 
     report = run_checks(checks, raise_on_error=False)
@@ -2457,7 +2153,6 @@ def validate_gold_row_counts() -> Dict[str, Any]:
         # rows, floor 100 с запасом на orphan-промоутов / partition gaps.
         CHECK.row_count('gold.fct_team_season_stats',       min_rows=80),
         CHECK.row_count('gold.fct_team_season_stats_audit', min_rows=100),
-        CHECK.row_count('gold.match_outcomes',   min_rows=3000),
 
         # ===== E2: master-data dim row-count floors =====
         # dim_venue: APL has ~20 active stadiums per season; 9+ seasons of

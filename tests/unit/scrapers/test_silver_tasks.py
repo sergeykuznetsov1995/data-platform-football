@@ -175,11 +175,11 @@ class TestRunSilverTransform:
         assert "FROM (" in ctas_sql
 
     def test_add_timestamp_false_omits_silver_created_at(self, tmp_path):
-        """Gold-on-Gold (e.g. fct_match_train SELECT m.*) must NOT inject the
-        timestamp — it would raise DUPLICATE_COLUMN_NAME because m.* already
-        carries it. Verifies the wrapper is bypassed entirely."""
+        """Re-selecting a table that already carries _silver_created_at
+        (SELECT m.*) must NOT inject the timestamp — it would raise
+        DUPLICATE_COLUMN_NAME. Verifies the wrapper is bypassed entirely."""
         sql_file = tmp_path / "test.sql"
-        sql_file.write_text("SELECT m.* FROM iceberg.gold.fct_match m")
+        sql_file.write_text("SELECT m.* FROM iceberg.gold.fct_team_match m")
 
         mock_conn, mock_cursor = self._make_conn(
             fetchall_side_effect=[[], [], [[1]]]

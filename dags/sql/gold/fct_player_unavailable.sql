@@ -8,8 +8,6 @@
 --   reason — enum injury | suspension | other (raw source label kept in detail).
 --   PK verified duplicate-free on (match_id, player_id) pre-cutover (#426 step 0).
 --
--- Used by: feat_team_form (l5 rolling unavailability).
---
 -- Sources:
 --   iceberg.silver.whoscored_player_unavailable  — primary
 --   iceberg.gold.dim_match                       — cross-source match bridge

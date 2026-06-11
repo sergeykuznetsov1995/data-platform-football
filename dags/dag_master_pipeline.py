@@ -192,9 +192,9 @@ with DAG(
     `espn_lineup` → Gold `fct_event` / `fct_shot` / `fct_lineup` →
     `validate_e3`. It depends on `silver.xref_match`, `silver.xref_team`,
     `silver.xref_player` (produced by E1) and runs sequentially
-    (`max_active_tasks=1`) for OOM safety. E3 facts are not yet consumed by
-    `predictions_input` v1, but materialising them here keeps the daily
-    cadence consistent and feeds future feature builders (E6 xG form, etc.).
+    (`max_active_tasks=1`) for OOM safety. E3 facts feed the Gold star
+    schema (fct_team_season_stats CTE inline и далее) — materialising them
+    here keeps the daily cadence consistent.
 
     ### E4: Narrow event facts (Silver + Gold)
 
@@ -225,9 +225,9 @@ with DAG(
     ### FBref Gold layer (issue #39)
 
     After the TM/Capology/SoFIFA Silver block, the master pipeline triggers
-    `dag_transform_fbref_gold`, which materialises the entire analytical Gold
-    layer (dimensions, season/base facts, rolling features, ML train/test
-    splits, and BI dashboard marts). It is placed LAST in the chain because it
+    `dag_transform_fbref_gold`, which materialises the analytical Gold star
+    schema (dimensions + season/base facts; the derived feat_*/mart_*/ML tier
+    was dropped in #478). It is placed LAST in the chain because it
     consumes outputs from every earlier step:
       * `silver.xref_*` (E1) for identity resolution;
       * `silver.sofascore_player_profile` / `sofascore_player_season_aggregate`

@@ -3,14 +3,13 @@
 -- =============================================================================
 -- Long-form fact: one row per (match_id, team_id) — exactly 2 rows per match.
 --
--- Used by: feat_team_form (rolling), feat_team_h2h, feat_team_event_style,
---          feat_team_xg_form.
+-- Used by: BI / ad-hoc analytics (производный feat_*-этаж удалён в #478).
 --
 -- Design contract: docs/design/gold-star-schema.md §4.1 (issue #426).
 -- Columns follow the star-schema groups (context / result / shots / xG /
 -- possession-passing / pressing-defence / duels / discipline). Extra context
--- columns date/gameweek/result/is_completed are kept beyond the design list —
--- the derived feat_* tier reads them directly (scope decision in #426).
+-- columns date/gameweek/result/is_completed are kept beyond the design list
+-- (scope decision in #426).
 -- A "beyond-design" metric block (saves / offsides / key_passes / takeons /
 -- FotMob shot mix) is also kept — user decision in #426 review: statistical
 -- value over the narrow star minimum.

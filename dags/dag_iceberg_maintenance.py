@@ -20,9 +20,9 @@ rollback на time-window E1-E7 этапов medallion-redesign'а (см.
 `whoscored_events`, где 30 daily ingest commits оставили бы 30+ stale
 snapshots между weekly run'ами.
 
-Schedule: Sundays 05:00 UTC — chosen to avoid `dag_serve_predictions` (runs
-every 2 hours: 00, 02, 04…), `dag_master_pipeline` (14:00 UTC), and Silver/Gold
-trigger chains. 9 hours of slack before the master pipeline starts.
+Schedule: Sundays 05:00 UTC — chosen to avoid `dag_master_pipeline` (14:00 UTC)
+and Silver/Gold trigger chains. 9 hours of slack before the master pipeline
+starts.
 """
 
 from __future__ import annotations

@@ -12,8 +12,7 @@ The full bronze/silver/gold sweep stays weekly (`dag_iceberg_maintenance.py`,
 retention 7d) — this DAG is a tighter loop only for the worst offenders
 identified during the 2026-04-30 disk-fill incident.
 
-Schedule: 02:00 UTC daily — clear of `dag_serve_predictions` 02:00 (runs
-quickly, finishes by 02:05 typically) and well before the 14:00 UTC master.
+Schedule: 02:00 UTC daily — well before the 14:00 UTC master pipeline.
 """
 
 from __future__ import annotations

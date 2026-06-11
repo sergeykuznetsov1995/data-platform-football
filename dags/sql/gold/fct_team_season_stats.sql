@@ -25,13 +25,17 @@
 -- #438); primary_team_name дропнут — контекст через dim_team. Audit-таблица
 -- сохраняет team_id_canonical (вне scope #428).
 --
+-- #478: производный gold-этаж удалён — per-source season rollups (бывшие
+-- gold.{understat,whoscored,sofascore,fotmob}_team_season, #370) инлайнены
+-- ниже как CTE и читают Silver напрямую. ⚠️ Усечённые копии тех же CTE живут
+-- в fct_team_season_stats_audit.sql — синхронизировать вручную.
+--
 -- Cross-source season type (all varchar slug 'YYNN' after #404):
 --   * silver.xref_team.season                 = varchar slug '2526' (all sources)
 --   * silver.fbref_team_season_profile.season = varchar slug '2526'
---   * gold.understat_team_season.season       = varchar slug '2526'
---   * gold.whoscored_team_season.season       = varchar slug '2526'
---   * gold.sofascore_team_season.season       = varchar slug '2526'
---   * gold.fotmob_team_season.season          = varchar slug '2526'
+--   * silver.{understat,whoscored,sofascore,fotmob}_team_match.season
+--                                             = varchar slug '2526'
+--     (season rollups над ними — инлайн-CTE ниже, #478)
 --
 --   #404 unified every silver/xref/gold season onto the slug form, so all
 --   bridge JOINs are direct slug = slug (no varchar↔bigint / LPAD conversion).
@@ -41,10 +45,10 @@
 --     fbref_team_season_profile хранит и `team` (squad name) и `team_id`
 --     (lookup ID) — JOIN через `fb.team` для совпадения с xref source_id.
 --   * understat            = team_id_canonical уже resolve'нут в Silver
---     (`gold.understat_team_season` пришёл из team_match через canonical),
---     LEFT JOIN напрямую по canonical_id (без xref CTE).
+--     (`us_team_season` CTE агрегирует silver.understat_team_match, который
+--     keyed by canonical), LEFT JOIN напрямую по canonical_id (без xref CTE).
 --   * whoscored source_id  = bronze.whoscored_schedule.home/away_team (NAME).
---     gold.whoscored_team_season.team_id наследуется от team_id_raw из
+--     ws_team_season.team_id наследуется от team_id_raw из
 --     events_spadl (NUMERIC после CAST(CAST(... AS BIGINT) AS varchar) — см.
 --     feedback_bronze_double_id_cast.md). numeric↔name мост строит CTE
 --     `ws_name_to_id` ниже поверх bronze.whoscored_schedule.home/away_team_id,
@@ -53,7 +57,7 @@
 --     поэтому WS-колонки заполнены для season 2024/2025 (20/20); за старые
 --     сезоны NULL из-за отсутствия source-данных, не из-за bridge.
 --   * sofascore source_id  = bronze.sofascore_schedule.home/away_team.
---     gold.sofascore_team_season.team_id = CAST(schedule.home_team AS varchar).
+--     ss_team_season.team_id = CAST(schedule.home_team AS varchar).
 --
 -- xref JOIN MUST include (league, season) predicate (feedback_xref_join_season_predicate.md):
 --   silver.xref_team имеет per-(source, source_id, season) rows;
@@ -98,7 +102,7 @@ xref_ss AS (
 ),
 
 -- FotMob xref (#97). season is slug '2526' after #404 (bronze.fotmob_schedule is
--- still bigint year-start), like the other sources. gold.fotmob_team_season.season
+-- still bigint year-start), like the other sources. fm_team_season.season
 -- is slug '2526' too → bridge + fact JOIN slug = slug. team_id = team NAME (== source_id).
 xref_fm AS (
     SELECT DISTINCT
@@ -183,6 +187,305 @@ cap_finance AS (
     FROM iceberg.silver.capology_player_salaries
     WHERE annual_gross_gbp IS NOT NULL
     GROUP BY club_name, league, season
+),
+
+-- =============================================================================
+-- Inlined per-source season aggregates (#478) — бывшие gold.*_team_season (#370).
+-- Производный gold-этаж удалён; rollups читают Silver напрямую.
+-- ⚠️ Усечённые копии этих CTE живут в fct_team_season_stats_audit.sql —
+-- синхронизировать вручную.
+-- =============================================================================
+
+-- ex gold.understat_team_season: rollup silver.understat_team_match (match-grain,
+-- уже keyed by team_id_canonical — без xref). PPDA/OPPDA — simple mean across
+-- matches: soccerdata не отдаёт числители/знаменатели на season-grain.
+us_team_season AS (
+    SELECT
+        team_id_canonical,
+
+        -- ========= HARD_FACT counters (SUM / COUNT) =========
+        CAST(COUNT(*) AS INTEGER)                       AS games_played,
+        CAST(SUM(CASE WHEN points = 3 THEN 1 ELSE 0 END) AS INTEGER) AS wins,
+        CAST(SUM(CASE WHEN points = 1 THEN 1 ELSE 0 END) AS INTEGER) AS draws,
+        CAST(SUM(CASE WHEN points = 0 THEN 1 ELSE 0 END) AS INTEGER) AS losses,
+        CAST(SUM(goals)         AS INTEGER)             AS goals,
+        CAST(SUM(goals_against) AS INTEGER)             AS goals_against,
+        CAST(SUM(points)        AS INTEGER)             AS points,
+
+        -- ========= MODELED xG (Understat primary per RX2) =========
+        SUM(xg)                                         AS xg,
+        SUM(xg_against)                                 AS xg_against,
+        SUM(npxg)                                       AS npxg,
+        SUM(npxg_against)                               AS npxg_against,
+        SUM(xpts)                                       AS xpts,
+
+        -- ========= Pressing / depth =========
+        AVG(ppda)                                       AS ppda,
+        AVG(oppda)                                      AS oppda,
+        CAST(SUM(deep_completions)         AS INTEGER)  AS deep_completions,
+        CAST(SUM(deep_completions_allowed) AS INTEGER)  AS deep_completions_allowed,
+
+        league,
+        season
+    FROM iceberg.silver.understat_team_match
+    GROUP BY team_id_canonical, league, season
+),
+
+-- ex gold.whoscored_team_season: rollup silver.whoscored_team_match. Pct/share
+-- recomputed at season grain from SUM(ok)/SUM(total), NOT averaged across
+-- matches (5 passes 100% + 500 passes 90% → true season pct ≈ 90.1%, не 95%).
+ws_season_rollup AS (
+    SELECT
+        team_id,
+
+        -- ========= Volume =========
+        COUNT(*)                                                                  AS matches_seen,
+        SUM(total_events)                                                          AS total_events,
+
+        -- ========= Pass-block (SUM + recompute pct) =========
+        SUM(pass_total)                                                            AS pass_total,
+        SUM(pass_ok)                                                               AS pass_ok,
+        ROUND(100.0 * SUM(pass_ok) / NULLIF(SUM(pass_total), 0), 2)                AS pass_pct,
+        SUM(key_passes_ws)                                                         AS key_passes_ws,
+
+        -- ========= Take-on (SUM + recompute) =========
+        SUM(takeon_att)                                                            AS takeon_att,
+        SUM(takeon_won)                                                            AS takeon_won,
+        ROUND(100.0 * SUM(takeon_won) / NULLIF(SUM(takeon_att), 0), 2)             AS takeon_pct,
+
+        -- ========= Defensive (SUM) =========
+        SUM(tackle_att)                                                            AS tackle_att,
+        SUM(tackle_won)                                                            AS tackle_won,
+        SUM(interceptions)                                                         AS interceptions,
+        SUM(clearances)                                                            AS clearances,
+        SUM(ball_recoveries)                                                       AS ball_recoveries,
+
+        -- ========= Shooting (SUM) =========
+        SUM(shots_total)                                                           AS shots_total,
+        SUM(shots_on_target_proxy)                                                 AS shots_on_target_proxy,
+
+        -- ========= Discipline (SUM) =========
+        SUM(fouls_committed)                                                       AS fouls_committed,
+
+        -- ========= Spatial (SUM) =========
+        SUM(touches_in_box)                                                        AS touches_in_box,
+        SUM(defensive_actions_third)                                               AS defensive_actions_third,
+
+        -- ========= Set-piece (recompute share at season grain) =========
+        ROUND(100.0 * SUM(set_piece_events) / NULLIF(SUM(total_events), 0), 2)     AS set_piece_share_pct,
+
+        league,
+        season
+    FROM iceberg.silver.whoscored_team_match
+    GROUP BY team_id, league, season
+),
+
+-- Penalties from raw Bronze (#161: FBref убрал PKwon/PKcon с сезона 2025/26 →
+-- WhoScored fallback). Считаются ПРЯМО из bronze.whoscored_events, НЕ из
+-- team_match/events_spadl: SPADL-канонизация разбрасывает пенальти
+-- (Goal→'unknown', Save→'keeper_save', Foul→'foul'), теряя ~80% сигнала.
+-- Маркер пенальти в bronze qualifiers — вложенный
+-- `{"type": {"value": 9, "displayName": "Penalty"}}`. won = penalty-удар бьющей
+-- команды; conceded = событие 'PenaltyFaced' командой вратаря (оба счётчика
+-- сходятся 1:1 на APL 25/26). team_id double-cast как в events_spadl
+-- (feedback_bronze_double_id_cast.md).
+ws_penalties AS (
+    SELECT
+        CAST(CAST(team_id AS BIGINT) AS varchar)                                  AS team_id,
+        league,
+        season,
+        COUNT_IF(type IN ('Goal', 'SavedShot', 'MissedShots', 'ShotOnPost')
+                 AND regexp_like(COALESCE(qualifiers, ''),
+                                 '"displayName"\s*:\s*"Penalty"'))                 AS penalties_won,
+        COUNT_IF(type = 'PenaltyFaced')                                           AS penalties_conceded
+    FROM iceberg.bronze.whoscored_events
+    WHERE team_id IS NOT NULL
+    GROUP BY CAST(CAST(team_id AS BIGINT) AS varchar), league, season
+),
+
+ws_team_season AS (
+    SELECT
+        r.*,
+        -- COALESCE → 0: команда с events, но без пенальти, должна давать 0 (не NULL).
+        COALESCE(p.penalties_won, 0)                                              AS penalties_won,
+        COALESCE(p.penalties_conceded, 0)                                         AS penalties_conceded
+    FROM ws_season_rollup r
+    LEFT JOIN ws_penalties p
+        ON  p.team_id = r.team_id
+        AND p.league  = r.league
+        AND p.season  = r.season
+),
+
+-- ex gold.sofascore_team_season: rollup silver.sofascore_team_match (уже мерджит
+-- match_stats PIVOT + schedule outcome + player_match_aggregate). Coverage gaps
+-- (NULL on purpose): expected_assists / was_fouled / penalty_won / penalty_conceded
+-- нет в bronze.sofascore_match_stats — финальный SELECT COALESCE'ит их из
+-- FBref / Understat / WhoScored.
+ss_match_rollup AS (
+    SELECT
+        team_id,
+        league,
+        season,
+
+        -- ===== Identity / appearances =====
+        COUNT(*)                  AS appearances,
+        SUM(minutes)              AS minutes_played,
+
+        -- ===== HARD_FACT — outcome =====
+        SUM(goals_for)            AS goals,
+        SUM(goals_against)        AS goals_conceded,
+        SUM(assists)              AS assists,
+
+        -- ===== HARD_FACT — discipline =====
+        SUM(yellow_cards)         AS yellow_cards,
+        SUM(red_cards)            AS red_cards,
+        SUM(fouls)                AS fouls_committed,
+        SUM(offsides)             AS offsides,
+
+        -- ===== HARD_FACT — shots =====
+        SUM(total_shots)          AS total_shots,
+        SUM(shots_on_target)      AS shots_on_target,
+
+        -- ===== HARD_FACT — defending =====
+        SUM(interceptions)        AS interceptions,
+        SUM(tackles_won)          AS tackles_won,
+        SUM(total_tackles)        AS total_tackles,
+
+        -- ===== HARD_FACT — passing =====
+        SUM(total_passes)         AS total_passes,
+        SUM(accurate_passes)      AS accurate_passes,
+
+        -- ===== Possession =====
+        AVG(possession_pct)       AS possession_pct_avg,
+
+        -- ===== MODELED =====
+        SUM(expected_goals)         AS expected_goals,
+        SUM(expected_goals_against) AS expected_goals_against,
+
+        -- ===== UNIQUE_SOFASCORE — corners =====
+        SUM(corner_kicks)         AS corner_kicks,
+
+        -- ===== UNIQUE_SOFASCORE — duels (totals for pct derivation) =====
+        SUM(ground_duels_won)     AS ground_duels_won,
+        SUM(ground_duels_total)   AS ground_duels_total,
+        SUM(aerial_duels_won)     AS aerial_duels_won,
+        SUM(aerial_duels_total)   AS aerial_duels_total,
+
+        -- ===== UNIQUE_SOFASCORE — long balls / crosses =====
+        SUM(accurate_long_balls)  AS accurate_long_balls,
+        SUM(total_long_balls)     AS total_long_balls,
+        SUM(accurate_crosses)     AS accurate_crosses,
+        SUM(total_crosses)        AS total_crosses
+
+    FROM iceberg.silver.sofascore_team_match
+    WHERE team_id IS NOT NULL
+    GROUP BY team_id, league, season
+),
+
+ss_team_season AS (
+    SELECT
+        team_id,
+        CAST(appearances    AS INTEGER) AS appearances,
+        minutes_played,
+        CAST(goals          AS INTEGER) AS goals,
+        CAST(goals_conceded AS INTEGER) AS goals_conceded,
+        CAST(assists        AS INTEGER) AS assists,
+        CAST(yellow_cards    AS INTEGER) AS yellow_cards,
+        CAST(red_cards       AS INTEGER) AS red_cards,
+        CAST(fouls_committed AS INTEGER) AS fouls_committed,
+        CAST(offsides        AS INTEGER) AS offsides,
+        CAST(total_shots     AS INTEGER) AS total_shots,
+        CAST(shots_on_target AS INTEGER) AS shots_on_target,
+        CAST(interceptions AS INTEGER) AS interceptions,
+        CAST(tackles_won   AS INTEGER) AS tackles_won,
+        CAST(total_passes    AS INTEGER) AS total_passes,
+        CAST(accurate_passes AS INTEGER) AS accurate_passes,
+        CASE
+            WHEN total_passes > 0
+                THEN ROUND(100.0 * accurate_passes / total_passes, 2)
+            ELSE NULL
+        END                              AS accurate_passes_pct,
+        ROUND(possession_pct_avg, 2) AS possession_pct_avg,
+        ROUND(expected_goals,         2) AS expected_goals,
+        ROUND(expected_goals_against, 2) AS expected_goals_against,
+        CAST(corner_kicks AS INTEGER) AS corner_kicks,
+        CAST(ground_duels_won   AS INTEGER) AS ground_duels_won,
+        CAST(ground_duels_total AS INTEGER) AS ground_duels_total,
+        CASE
+            WHEN ground_duels_total > 0
+                THEN ROUND(100.0 * ground_duels_won / ground_duels_total, 2)
+            ELSE NULL
+        END                                 AS ground_duels_won_pct,
+        CAST(aerial_duels_won   AS INTEGER) AS aerial_duels_won,
+        CAST(aerial_duels_total AS INTEGER) AS aerial_duels_total,
+        CASE
+            WHEN aerial_duels_total > 0
+                THEN ROUND(100.0 * aerial_duels_won / aerial_duels_total, 2)
+            ELSE NULL
+        END                                 AS aerial_duels_won_pct,
+        CASE
+            WHEN (ground_duels_total + aerial_duels_total) > 0
+                THEN ROUND(
+                    100.0 * (ground_duels_won + aerial_duels_won)
+                          / (ground_duels_total + aerial_duels_total), 2
+                )
+            ELSE NULL
+        END                                 AS total_duels_won_pct,
+        CAST(accurate_long_balls AS INTEGER) AS accurate_long_balls,
+        CAST(total_long_balls    AS INTEGER) AS total_long_balls,
+        CASE
+            WHEN total_long_balls > 0
+                THEN ROUND(100.0 * accurate_long_balls / total_long_balls, 2)
+            ELSE NULL
+        END                                  AS accurate_long_balls_pct,
+        CAST(accurate_crosses AS INTEGER) AS accurate_crosses,
+        CAST(total_crosses    AS INTEGER) AS total_crosses,
+        league,
+        season
+    FROM ss_match_rollup
+),
+
+-- ex gold.fotmob_team_season: rollup silver.fotmob_team_match (match-grain;
+-- team_id = FotMob team NAME, resolve до canonical — через xref_fm выше).
+-- INCOMPLETE-SEASON caveat: fotmob_team_match держит только матчи со stats_json
+-- (~89% фикстур) → SUM-счётчики занижены vs FBref; COALESCE primary остаётся
+-- FBref/US, FotMob кормит только expected_assists + UNIQUE_FOTMOB.
+fm_team_season AS (
+    SELECT
+        team_id,
+
+        -- ========= HARD_FACT counters (SUM / COUNT) =========
+        CAST(COUNT(*)                AS INTEGER) AS appearances,
+        CAST(SUM(goals_for)          AS INTEGER) AS goals,
+        CAST(SUM(goals_against)      AS INTEGER) AS goals_conceded,
+        CAST(SUM(total_shots)        AS INTEGER) AS total_shots,
+        CAST(SUM(shots_on_target)    AS INTEGER) AS shots_on_target,
+        CAST(SUM(yellow_cards)       AS INTEGER) AS yellow_cards,
+        CAST(SUM(red_cards)          AS INTEGER) AS red_cards,
+        CAST(SUM(fouls)              AS INTEGER) AS fouls_committed,
+        CAST(SUM(offsides)           AS INTEGER) AS offsides,
+        CAST(SUM(corner_kicks)       AS INTEGER) AS corner_kicks,
+        CAST(SUM(interceptions)      AS INTEGER) AS interceptions,
+        CAST(SUM(clearances)         AS INTEGER) AS clearances,
+
+        -- ========= MODELED — xG / xA family =========
+        ROUND(SUM(expected_goals),   4)          AS expected_goals,
+        ROUND(SUM(npxg),             4)          AS npxg,
+        ROUND(SUM(xgot),             4)          AS xgot,
+        -- The whole point of issue #97 at season grain: team xA, unavailable elsewhere.
+        ROUND(SUM(expected_assists), 4)          AS expected_assists,
+
+        -- ========= UNIQUE_FOTMOB =========
+        CAST(SUM(big_chances)        AS INTEGER) AS big_chances,
+        CAST(SUM(big_chances_missed) AS INTEGER) AS big_chances_missed,
+        CAST(SUM(touches_in_box)     AS INTEGER) AS touches_in_box,
+        CAST(SUM(shots_inside_box)   AS INTEGER) AS shots_inside_box,
+        CAST(SUM(shots_outside_box)  AS INTEGER) AS shots_outside_box,
+
+        league,
+        season
+    FROM iceberg.silver.fotmob_team_match
+    GROUP BY team_id, league, season
 )
 
 SELECT
@@ -320,7 +623,7 @@ INNER JOIN iceberg.silver.fbref_team_season_profile fb
     ON  fb.team    = xf.fbref_team_name
     AND fb.league  = xf.league
     AND fb.season  = xf.season_year
-LEFT JOIN iceberg.gold.understat_team_season us
+LEFT JOIN us_team_season us
     ON  us.team_id_canonical = xf.canonical_id
     AND us.league            = xf.league
     AND us.season            = xf.season_slug
@@ -334,7 +637,7 @@ LEFT JOIN ws_name_to_id wn
     ON  wn.ws_team_name = xw.ws_team_name
     AND wn.league       = xw.league
     AND wn.season       = xw.season_slug
-LEFT JOIN iceberg.gold.whoscored_team_season ws
+LEFT JOIN ws_team_season ws
     ON  ws.team_id = wn.ws_team_id
     AND ws.league  = wn.league
     AND ws.season  = wn.season
@@ -342,16 +645,16 @@ LEFT JOIN xref_ss xs
     ON  xs.canonical_id = xf.canonical_id
     AND xs.league       = xf.league
     AND xs.season_slug  = xf.season_slug
-LEFT JOIN iceberg.gold.sofascore_team_season ss
+LEFT JOIN ss_team_season ss
     ON  ss.team_id = xs.ss_team_name
     AND ss.league  = xs.league
     AND ss.season  = xs.season_slug
--- FotMob (#97): xref season slug now (#404); gold.fotmob_team_season season slug → slug = slug.
+-- FotMob (#97): xref season slug now (#404); fm_team_season season slug → slug = slug.
 LEFT JOIN xref_fm xfm
     ON  xfm.canonical_id   = xf.canonical_id
     AND xfm.league         = xf.league
     AND xfm.season_year_str = CAST(xf.season_year AS varchar)
-LEFT JOIN iceberg.gold.fotmob_team_season fm
+LEFT JOIN fm_team_season fm
     ON  fm.team_id = xfm.fm_team_name
     AND fm.league  = xf.league
     AND fm.season  = xf.season_slug

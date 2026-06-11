@@ -15,7 +15,6 @@ Files under test:
 
 * ``dags/sql/silver/whoscored_player_unavailable.sql``
 * ``dags/sql/gold/fct_player_unavailable.sql``
-* ``dags/sql/gold/feat_team_form.sql``      (E5 column ``unavailable_count_l5``)
 
 Caveats / known transpile mismatches
 ------------------------------------
@@ -39,7 +38,6 @@ import sqlglot
 REPO_ROOT = Path(__file__).resolve().parents[3]
 SILVER_SQL = REPO_ROOT / "dags" / "sql" / "silver" / "whoscored_player_unavailable.sql"
 GOLD_SQL = REPO_ROOT / "dags" / "sql" / "gold" / "fct_player_unavailable.sql"
-FEAT_SQL = REPO_ROOT / "dags" / "sql" / "gold" / "feat_team_form.sql"
 
 
 # ---------------------------------------------------------------------------
@@ -171,48 +169,6 @@ def _create_gold_dims(con: duckdb.DuckDBPyConnection) -> None:
         CREATE TABLE iceberg.gold.dim_player (
             player_id VARCHAR,
             player_name VARCHAR
-        )
-        """
-    )
-
-
-def _create_fct_team_match(con: duckdb.DuckDBPyConnection) -> None:
-    con.execute(
-        """
-        CREATE TABLE iceberg.gold.fct_team_match (
-            match_id VARCHAR,
-            team_id VARCHAR,
-            opponent_id VARCHAR,
-            date DATE,
-            gameweek INTEGER,
-            is_home BOOLEAN,
-            goals_for INTEGER,
-            goals_against INTEGER,
-            shots INTEGER,
-            shots_on_target INTEGER,
-            possession_pct DOUBLE,
-            points INTEGER,
-            result VARCHAR,
-            league VARCHAR,
-            season VARCHAR
-        )
-        """
-    )
-
-
-def _create_fct_player_unavailable(con: duckdb.DuckDBPyConnection) -> None:
-    """For feat_team_form tests we materialise the gold fct table directly."""
-    con.execute(
-        """
-        CREATE TABLE iceberg.gold.fct_player_unavailable (
-            match_id VARCHAR,
-            team_id VARCHAR,
-            player_id VARCHAR,
-            reason VARCHAR,
-            detail VARCHAR,
-            _silver_ingested_at TIMESTAMP,
-            league VARCHAR,
-            season VARCHAR
         )
         """
     )
@@ -502,90 +458,3 @@ class TestGoldFctPlayerUnavailable:
 
         rows = self._run_gold(con)
         assert rows == [], "orphan-match silver row must be filtered out of Gold"
-
-
-# ---------------------------------------------------------------------------
-# T6.1 — feat_team_form tests (E5 unavailable_count_l5 column)
-# ---------------------------------------------------------------------------
-
-@pytest.mark.unit
-class TestFeatTeamFormUnavailableL5:
-    """Pure-SQL tests for the E5-added ``unavailable_count_l5`` column in
-    ``dags/sql/gold/feat_team_form.sql``.
-    """
-
-    def _run_feat(self, con: duckdb.DuckDBPyConnection) -> List[Dict[str, Any]]:
-        select_sql = _transpile(FEAT_SQL)
-        return _exec_select(con, select_sql + " ORDER BY team_id, date, match_id")
-
-    def _seed_six_matches(self, con: duckdb.DuckDBPyConnection) -> None:
-        """Single team-season, 6 sequential matches, all wins (points=3)."""
-        rows = []
-        for i in range(1, 7):
-            mid = f"m{i:02d}"
-            d = f"2025-01-{i:02d}"
-            rows.append(
-                f"('{mid}','arsenal','x{i}', DATE '{d}', {i}, TRUE, "
-                f"2, 1, 10, 5, 60.0, 3, 'W', 'ENG-PL', '2425')"
-            )
-        con.execute(
-            "INSERT INTO iceberg.gold.fct_team_match VALUES " + ", ".join(rows)
-        )
-
-    def test_feat_team_form_unavailable_l5_masking(self):
-        """First 5 rows masked to NULL; row 6 = AVG(prior 5 unavailable counts)."""
-        con = _make_con()
-        _create_fct_team_match(con)
-        _create_fct_player_unavailable(con)
-
-        self._seed_six_matches(con)
-
-        # unavailable counts per match: m01=1, m02=2, ..., m06=6
-        # Window is ROWS 5 PRECEDING..1 PRECEDING -> for m06 averages m01..m05.
-        unavail_rows = []
-        for i in range(1, 7):
-            for k in range(i):  # i unavailable players for match i
-                pid = f"p{i:02d}_{k}"
-                unavail_rows.append(
-                    f"('m{i:02d}', 'arsenal', '{pid}', 'injury', 'injured',"
-                    f" TIMESTAMP '2025-01-01 00:00:00','ENG-PL', '2425')"
-                )
-        con.execute(
-            "INSERT INTO iceberg.gold.fct_player_unavailable VALUES "
-            + ", ".join(unavail_rows)
-        )
-
-        rows = self._run_feat(con)
-        assert len(rows) == 6
-
-        # Sort by match_id (matches our naming m01..m06)
-        rows = sorted(rows, key=lambda r: r["match_id"])
-
-        # Rows 1..5: masked (NULL)
-        for i in range(5):
-            assert rows[i]["unavailable_count_l5"] is None, (
-                f"row {i+1} (match_rn<=5) must be NULL, got {rows[i]['unavailable_count_l5']}"
-            )
-
-        # Row 6: AVG(1,2,3,4,5) = 3.0
-        assert rows[5]["unavailable_count_l5"] == pytest.approx(3.0)
-
-    def test_feat_team_form_no_unavailability_data(self):
-        """Matches without rows in fct_player_unavailable -> COALESCE to 0,
-        so window AVG = 0 for row 6 (and NULL for rows 1..5 due to mask)."""
-        con = _make_con()
-        _create_fct_team_match(con)
-        _create_fct_player_unavailable(con)
-
-        self._seed_six_matches(con)
-        # NB: empty fct_player_unavailable table — no rows inserted
-
-        rows = self._run_feat(con)
-        rows = sorted(rows, key=lambda r: r["match_id"])
-        assert len(rows) == 6
-
-        # Rows 1..5: masked
-        for i in range(5):
-            assert rows[i]["unavailable_count_l5"] is None
-        # Row 6: AVG of five 0s = 0
-        assert rows[5]["unavailable_count_l5"] == pytest.approx(0.0)
