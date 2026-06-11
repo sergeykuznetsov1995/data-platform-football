@@ -93,7 +93,7 @@ class TestDashboardModulesContract:
     """Each dashboard module MUST define ``create_dashboard``."""
 
     @pytest.mark.parametrize(
-        "module_name", ["team_form_overview", "match_outcomes"]
+        "module_name", ["player_overview"]
     )
     def test_dashboard_defines_create_dashboard(self, module_name):
         path = DASHBOARDS_DIR / f"{module_name}.py"
@@ -108,7 +108,7 @@ class TestDashboardModulesContract:
         path = DASHBOARDS_DIR / "import_dashboards.py"
         assert path.exists()
         source = path.read_text(encoding="utf-8")
-        for required in ("team_form_overview", "match_outcomes"):
+        for required in ("player_overview",):
             assert required in source, (
                 f"import_dashboards.py must reference '{required}'"
             )
@@ -241,14 +241,9 @@ class TestImportProbe:
         # Public surface check
         assert callable(getattr(mod, "main", None))
 
-    def test_team_form_overview_loads(self, superset_sdk_stubs):
-        path = DASHBOARDS_DIR / "team_form_overview.py"
-        mod = _import_by_path(path, "_smoke_team_form_overview")
-        assert callable(getattr(mod, "create_dashboard", None))
-
-    def test_match_outcomes_loads(self, superset_sdk_stubs):
-        path = DASHBOARDS_DIR / "match_outcomes.py"
-        mod = _import_by_path(path, "_smoke_match_outcomes")
+    def test_player_overview_loads(self, superset_sdk_stubs):
+        path = DASHBOARDS_DIR / "player_overview.py"
+        mod = _import_by_path(path, "_smoke_player_overview")
         assert callable(getattr(mod, "create_dashboard", None))
 
     def test_import_dashboards_loads(self, superset_sdk_stubs):
@@ -256,8 +251,7 @@ class TestImportProbe:
         mod = _import_by_path(path, "_smoke_import_dashboards")
         assert isinstance(getattr(mod, "DASHBOARDS", None), list)
         # Sanity: registry references match the per-file modules above
-        assert "team_form_overview" in mod.DASHBOARDS
-        assert "match_outcomes" in mod.DASHBOARDS
+        assert "player_overview" in mod.DASHBOARDS
 
     def test_apply_descriptions_loads(self, openmetadata_sdk_stubs):
         path = OPENMETADATA_DIR / "apply_descriptions.py"
@@ -273,10 +267,9 @@ class TestImportProbe:
 
 @pytest.mark.unit
 def test_at_least_five_scripts_discovered():
-    """Sanity bound: import_datasources, apply_descriptions, 2 dashboards,
-    import_dashboards — that's already 5. Anything fewer means a directory
-    is missing or restructured."""
-    # superset_config.py also exists, so >= 6 expected.
+    """Sanity bound (#478 — остался один дашборд): import_datasources,
+    superset_config, apply_descriptions, player_overview, import_dashboards —
+    уже 5. Anything fewer means a directory is missing or restructured."""
     assert len(SCRIPT_PATHS) >= 5, (
         f"Only discovered {len(SCRIPT_PATHS)} scripts — restructure?"
     )

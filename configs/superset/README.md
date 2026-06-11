@@ -14,9 +14,8 @@ configs/superset/
   import_dashboards.py     # idempotent upsert dashboards/*.py -> Superset DB
   dashboards/
     __init__.py
-    scouting_radar.py      # mart_scouting_radar
-    referee_dashboard.py   # mart_referee_dashboard
-    event_heatmap.py       # mart_event_heatmap
+    player_overview.py     # fct_player_match / fct_shot / fct_match_rating
+    import_dashboards.py   # реестр DASHBOARDS + оркестратор импорта
 ```
 
 ## Auth (env vars)
