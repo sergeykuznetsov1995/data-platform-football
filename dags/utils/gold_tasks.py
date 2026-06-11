@@ -1003,15 +1003,15 @@ def validate_gold_quality() -> Dict[str, Any]:
         CHECK.no_duplicates('gold.dim_team',         pk=['team_id']),
         CHECK.no_duplicates('gold.dim_player',       pk=['player_id']),
         CHECK.no_duplicates('gold.fct_team_match',   pk=['match_id', 'team_id']),
-        # issue #46: fct_player_match теперь multi-source, PK переименована
-        # match_id → match_id_canonical, player_id → player_id_canonical.
-        CHECK.no_duplicates('gold.fct_player_match', pk=['match_id_canonical', 'player_id_canonical']),
+        # #426 star design §4.4: fct_player_match PK = (match_id, player_id).
+        CHECK.no_duplicates('gold.fct_player_match', pk=['match_id', 'player_id']),
         CHECK.no_duplicates('gold.match_outcomes',    pk=['match_id']),
-        # E5: composite PK guards against double-listing the same player as
-        # absent for the same match. Empty fallback (0 rows) passes trivially.
+        # E5 → #426 star design §4.6: PK = (match_id, player_id) — a player
+        # cannot be unavailable twice for one match (verified dup-free on live
+        # data pre-cutover). Empty fallback (0 rows) passes trivially.
         CHECK.no_duplicates(
             'gold.fct_player_unavailable',
-            pk=['match_id', 'team_id', 'player_id_canonical'],
+            pk=['match_id', 'player_id'],
         ),
         # #370: per-source season aggregates migrated from Silver to Gold.
         # Pure GROUP BY rollups (uniqueness is structural) — the check guards
@@ -1031,24 +1031,20 @@ def validate_gold_quality() -> Dict[str, Any]:
         # E5: required keys. NB: `team_id` is intentionally NOT here — cross-
         # source slug mismatches (Wolves/Wolverhampton) leave it NULL by design;
         # coverage is observed via the WARNING-severity row_count check below.
+        # #426: match_date dropped from the fact (context lives in dim_match).
         CHECK.no_nulls('gold.fct_player_unavailable',
-                       cols=['match_id', 'match_date', 'player_id_canonical']),
+                       cols=['match_id', 'player_id']),
 
         # ========== Referential integrity — ERROR ==========
         CHECK.ref_integrity('gold.fct_team_match',   'gold.dim_match', 'match_id'),
-        # issue #46: ref_integrity на dim_match — child = match_id_canonical, parent = match_id.
-        CHECK.ref_integrity(
-            'gold.fct_player_match', 'gold.dim_match',
-            'match_id_canonical', parent_key='match_id',
-        ),
-        # issue #46: fct_player_match теперь multi-source с player_id_canonical
-        # — добавляем ref_integrity к dim_player_attributes (snapshot grain per
-        # canonical_id, T4). Без `parent_key=` так как обе таблицы используют
-        # одну и ту же колонку player_id_canonical.
+        CHECK.ref_integrity('gold.fct_player_match', 'gold.dim_match', 'match_id'),
+        # fct_player_match → dim_player_attributes (snapshot grain per
+        # canonical_id, T4). #426: child column renamed to player_id; the dim
+        # keeps its player_id_canonical naming (out of #426 scope).
         CHECK.ref_integrity(
             'gold.fct_player_match',
             'gold.dim_player_attributes',
-            'player_id_canonical',
+            'player_id',
             parent_key='player_id_canonical',
         ),
         CHECK.ref_integrity('gold.match_outcomes',    'gold.dim_match', 'match_id'),
@@ -1059,25 +1055,26 @@ def validate_gold_quality() -> Dict[str, Any]:
         # ========== Value ranges — WARNING ==========
         CHECK.value_range('gold.fct_team_match', 'goals_for',  min_val=0, max_val=20,
                           severity='WARNING'),
-        CHECK.value_range('gold.fct_team_match', 'possession', min_val=0, max_val=100,
+        CHECK.value_range('gold.fct_team_match', 'possession_pct', min_val=0, max_val=100,
                           severity='WARNING'),
-        # issue #95: v2 multi-source columns. xG/xGA/NPxG per team-match rarely
-        # exceed 6 (extreme top-tier blowouts ≈4); cap at 10 to catch parser
-        # regressions (xG=999) without false-positives. ppda upper bound 50
-        # (high-press teams ≈8, ultra-passive 30+). NULL for non-FBref games.
-        CHECK.value_range('gold.fct_team_match', 'expected_goals',
+        # issue #95: v2 multi-source columns (#426 names: xg/xga/xa). xG/xGA/NPxG
+        # per team-match rarely exceed 6 (extreme top-tier blowouts ≈4); cap at
+        # 10 to catch parser regressions (xG=999) without false-positives. ppda
+        # upper bound 50 (high-press teams ≈8, ultra-passive 30+). NULL for
+        # non-FBref games.
+        CHECK.value_range('gold.fct_team_match', 'xg',
                           min_val=0, max_val=10, severity='WARNING'),
-        CHECK.value_range('gold.fct_team_match', 'expected_goals_against',
+        CHECK.value_range('gold.fct_team_match', 'xga',
                           min_val=0, max_val=10, severity='WARNING'),
         CHECK.value_range('gold.fct_team_match', 'npxg',
                           min_val=0, max_val=10, severity='WARNING'),
         CHECK.value_range('gold.fct_team_match', 'ppda',
                           min_val=0, max_val=50, severity='WARNING'),
-        CHECK.value_range('gold.fct_team_match', 'accurate_passes_pct',
+        CHECK.value_range('gold.fct_team_match', 'pass_accuracy_pct',
                           min_val=0, max_val=100, severity='WARNING'),
-        # issue #97: FotMob 5th source. expected_assists (team-grain xA, FotMob-only)
+        # issue #97: FotMob 5th source. xa (team-grain xA, FotMob-only)
         # and xgot per team-match rarely exceed 4; cap 10 to catch parser regressions.
-        CHECK.value_range('gold.fct_team_match', 'expected_assists',
+        CHECK.value_range('gold.fct_team_match', 'xa',
                           min_val=0, max_val=10, severity='WARNING'),
         CHECK.value_range('gold.fct_team_match', 'xgot',
                           min_val=0, max_val=10, severity='WARNING'),
@@ -1087,9 +1084,9 @@ def validate_gold_quality() -> Dict[str, Any]:
         # для хет-триков; верхний bound 5.0 ловит явные парсер-выбросы (xG=999)
         # без false-positive'ов. Не value_range на goals/assists (могут быть
         # 4+ в редких матчах) и minutes (FBref гарантирует [0, 120]).
-        CHECK.value_range('gold.fct_player_match', 'expected_goals',
+        CHECK.value_range('gold.fct_player_match', 'xg',
                           min_val=0, max_val=5, severity='WARNING'),
-        CHECK.value_range('gold.fct_player_match', 'expected_assists',
+        CHECK.value_range('gold.fct_player_match', 'xa',
                           min_val=0, max_val=5, severity='WARNING'),
         # rating: SofaScore-источник, шкала [0, 10]; NULL для матчей без оценки.
         CHECK.value_range('gold.fct_player_match', 'rating',
@@ -1139,9 +1136,9 @@ def validate_gold_quality() -> Dict[str, Any]:
         CHECK.row_count(
             'gold.fct_player_unavailable',
             min_rows=0, max_rows=1500,
-            where="player_id_canonical LIKE 'ws_%'",
+            where="player_id LIKE 'ws_%'",
             severity='WARNING',
-            name='coverage[fct_player_unavailable.player_id_canonical resolved]',
+            name='coverage[fct_player_unavailable.player_id resolved]',
         ),
 
         # ============================================================
@@ -1710,11 +1707,12 @@ def validate_gold_quality() -> Dict[str, Any]:
                        cols=['match_id_canonical', 'player_id_canonical']),
         # audit ⊆ main fct (INNER FBref ∩ SofaScore) → каждая audit-строка
         # должна находить парную строку в gold.fct_player_match.
+        # #426: parent column renamed to player_id; audit keeps *_canonical.
         CHECK.ref_integrity(
             'gold.fct_player_match_audit',
             'gold.fct_player_match',
             'player_id_canonical',
-            parent_key='player_id_canonical',
+            parent_key='player_id',
         ),
 
         # ----- SofaScore diff (18 checks, INNER spine: всегда non-NULL) -----

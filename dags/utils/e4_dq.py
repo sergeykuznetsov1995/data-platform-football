@@ -538,11 +538,12 @@ def _build_gold_fct_match_odds_checks() -> List[Check]:
             table, pk=['odds_canonical'], severity='ERROR',
         ),
 
-        # NULL guards (ERROR).
+        # NULL guards (ERROR). #426: gold columns renamed (match_id,
+        # bookmaker, is_closing); silver keeps the old names.
         CHECK.no_nulls(
             table,
-            cols=['match_id_canonical', 'bookmaker_code', 'market',
-                  'closing_flag', 'odds_canonical', 'odds_source',
+            cols=['match_id', 'bookmaker', 'market',
+                  'is_closing', 'odds_canonical', 'odds_source',
                   'odds_version'],
             severity='ERROR',
         ),
@@ -556,21 +557,21 @@ def _build_gold_fct_match_odds_checks() -> List[Check]:
         # Decimal-odds bounds (ERROR). Filter NULL via WHERE because
         # some bookmakers don't quote certain markets.
         CHECK.value_range(
-            table=table, column='odds_h',
+            table=table, column='odds_home',
             min_val=1.01, max_val=1000.0,
-            where='odds_h IS NOT NULL',
+            where='odds_home IS NOT NULL',
             severity='ERROR',
         ),
         CHECK.value_range(
-            table=table, column='odds_d',
+            table=table, column='odds_draw',
             min_val=1.01, max_val=1000.0,
-            where='odds_d IS NOT NULL',
+            where='odds_draw IS NOT NULL',
             severity='ERROR',
         ),
         CHECK.value_range(
-            table=table, column='odds_a',
+            table=table, column='odds_away',
             min_val=1.01, max_val=1000.0,
-            where='odds_a IS NOT NULL',
+            where='odds_away IS NOT NULL',
             severity='ERROR',
         ),
 
@@ -586,13 +587,13 @@ def _build_gold_fct_match_odds_checks() -> List[Check]:
         # 30K floor × 50% = 15K; × 80% = 24K. Same idiom as Silver.
         CHECK.row_count(
             table=table, min_rows=15_000,
-            where='closing_flag = TRUE',
+            where='is_closing = TRUE',
             severity='ERROR',
             name='gold_dod_closing_odds_50pct',
         ),
         CHECK.row_count(
             table=table, min_rows=24_000,
-            where='closing_flag = TRUE',
+            where='is_closing = TRUE',
             severity='WARNING',
             name='gold_dod_closing_odds_80pct',
         ),
@@ -603,7 +604,7 @@ def _build_gold_fct_match_odds_checks() -> List[Check]:
         CHECK.ref_integrity(
             child='gold.fct_match_odds',
             parent='gold.dim_match',
-            key='match_id_canonical',
+            key='match_id',
             parent_key='match_id',
             severity='WARNING',
         ),
