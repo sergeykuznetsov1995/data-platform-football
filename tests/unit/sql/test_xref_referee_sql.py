@@ -41,6 +41,14 @@ def _read_template() -> str:
     return SQL_PATH.read_text(encoding="utf-8")
 
 
+def _aliases_cte(sql: str) -> str:
+    """Slice the ``aliases`` CTE source (from ``WITH aliases AS`` up to the
+    next CTE ``raw_refs AS``) for #465 guard assertions."""
+    start = sql.index("WITH aliases AS")
+    end = sql.index("raw_refs AS")
+    return sql[start:end]
+
+
 pytestmark = pytest.mark.unit
 
 
@@ -92,6 +100,36 @@ class TestXrefRefereeTemplateStructure:
         sql = _read_template().lower()
         assert "'fb_ref_'" in sql and "'mh_ref_'" in sql
         assert "'fm_ref_'" in sql  # FotMob orphan fallback (issue #270)
+
+    def test_aliases_cte_guards_join_key(self):
+        """#465: the aliases CTE must collapse to ONE row per (norm, league)
+        — GROUP BY + MAX(canonical_*) guard, precedent dim_match.venue_aliases
+        (#425). No-DuckDB safety net for test_xref_referee_logic.py (whose
+        fixture converts transpile errors into pytest.skip)."""
+        cte = _aliases_cte(_read_template())
+        assert re.search(r"GROUP\s+BY", cte, re.I), (
+            "aliases CTE must GROUP BY the (norm, league) join key (#465)"
+        )
+        assert re.search(r"MAX\s*\(\s*canonical_id\s*\)", cte, re.I), (
+            "aliases CTE must aggregate canonical_id with MAX (#465)"
+        )
+        assert re.search(r"MAX\s*\(\s*canonical_name\s*\)", cte, re.I), (
+            "aliases CTE must aggregate canonical_name with MAX (#465)"
+        )
+
+    def test_aliases_group_by_repeats_norm_expr_not_alias(self):
+        """Trino cannot reference a same-level SELECT alias in GROUP BY
+        (feedback_trino_window_alias_duckdb_gap) — the norm expression must be
+        repeated verbatim, so its fingerprint appears exactly twice."""
+        cte = _aliases_cte(_read_template())
+        assert len(re.findall(r"normalize\(lower\(raw_name", cte, re.I)) == 2, (
+            "norm expression must appear twice in the aliases CTE "
+            "(SELECT list + GROUP BY) — Trino rejects `GROUP BY norm`"
+        )
+        assert not re.search(r"GROUP\s+BY\s+norm\b", cte, re.I), (
+            "GROUP BY must repeat the expression, not the `norm` alias "
+            "(COLUMN_NOT_FOUND on live Trino; DuckDB masks this)"
+        )
 
     def test_diacritic_fold_idiom(self):
         r"""NFD + \p{Mn} strip — same fold as xref_team/xref_manager (issue #215)."""

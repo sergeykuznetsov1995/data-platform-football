@@ -195,6 +195,11 @@ class TestXrefRefereeExistingContract:
             if r["source_id"] == "Stale Snapshot Referee"
         ]
         assert stale == [], "older fotmob snapshot must be deduped away"
+        latest = [
+            r for r in xref_rows
+            if r["source"] == "fotmob" and r["source_id"] == "Michael Oliver"
+        ]
+        assert len(latest) == 1, "latest snapshot referee must survive dedup"
 
     def test_orphan_prefix_fallback(self, xref_rows):
         orphan = next(r for r in xref_rows if r["source_id"] == "Joe Orphan")
