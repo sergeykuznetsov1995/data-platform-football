@@ -11,6 +11,7 @@ import pytest
 
 from scrapers.transfermarkt import TransfermarktScraper
 from scrapers.transfermarkt.scraper import (
+    ConsecutiveFailureError,
     R0_2B_FALLBACK_MARKER,
     TM_LEAGUE_MAP,
     _coerce_int,
@@ -395,3 +396,96 @@ class TestTransfermarktInit:
         assert scr.leagues == ['ENG-Premier League']
         assert scr.seasons == [2025]
         assert scr._last_endpoint_error is None
+
+
+# ---------------------------------------------------------------------------
+# Consecutive-failure cap → raise, not partial frame (#457)
+#
+# A partial frame would be saved with replace_partitions=['league','season']
+# by the runner, wiping the full bronze partition. Hitting the cap must
+# therefore propagate instead of returning collected rows.
+# ---------------------------------------------------------------------------
+
+class TestConsecutiveFailureRaise:
+    @pytest.fixture
+    def scraper(self):
+        return TransfermarktScraper(
+            leagues=['ENG-Premier League'], seasons=[2025],
+        )
+
+    def test_read_players_raises_on_consecutive_profile_failures(
+        self, scraper, monkeypatch,
+    ):
+        import scrapers.transfermarkt.scraper as tm
+        monkeypatch.setattr(tm, '_MAX_CONSECUTIVE_FAILURES', 3)
+        monkeypatch.setattr(tm, '_parse_club_listing', lambda html: [
+            {'club_id': '11', 'club_slug': 'fc-arsenal', 'club_name': 'Arsenal'},
+        ])
+        monkeypatch.setattr(tm, '_parse_squad_page', lambda html, club_id: [
+            {'player_id': str(i), 'player_slug': f'player-{i}',
+             'name': f'P{i}', 'club_id': club_id, 'market_value_eur': None}
+            for i in range(5)
+        ])
+        monkeypatch.setattr(
+            scraper, '_fetch_html',
+            lambda url, label='html', context=None:
+                None if label == 'profile' else '<html/>',
+        )
+        with pytest.raises(
+            ConsecutiveFailureError, match='consecutive profile failures',
+        ):
+            scraper.read_players(league='ENG-Premier League', season=2025)
+
+    def test_read_mv_history_raises_on_consecutive_failures(
+        self, scraper, monkeypatch,
+    ):
+        import scrapers.transfermarkt.scraper as tm
+        monkeypatch.setattr(tm, '_MAX_CONSECUTIVE_FAILURES', 3)
+        monkeypatch.setattr(
+            scraper, '_fetch_json',
+            lambda url, label='json', context=None: None,
+        )
+        with pytest.raises(
+            ConsecutiveFailureError, match='consecutive mv_history failures',
+        ):
+            scraper.read_market_value_history(
+                league='ENG-Premier League', season=2025,
+                player_ids=['1', '2', '3', '4'],
+            )
+
+    def test_read_transfers_raises_on_consecutive_failures(
+        self, scraper, monkeypatch,
+    ):
+        import scrapers.transfermarkt.scraper as tm
+        monkeypatch.setattr(tm, '_MAX_CONSECUTIVE_FAILURES', 3)
+        monkeypatch.setattr(
+            scraper, '_fetch_json',
+            lambda url, label='json', context=None: None,
+        )
+        with pytest.raises(
+            ConsecutiveFailureError, match='consecutive transfers failures',
+        ):
+            scraper.read_transfers(
+                league='ENG-Premier League', season=2025,
+                player_ids=['1', '2', '3', '4'],
+            )
+
+    def test_counter_reset_prevents_raise(self, scraper, monkeypatch):
+        # 2 failures then a success, repeated — the counter never reaches
+        # the cap of 3, so no raise and the frame materialises.
+        import scrapers.transfermarkt.scraper as tm
+        monkeypatch.setattr(tm, '_MAX_CONSECUTIVE_FAILURES', 3)
+        responses = iter([None, None, {'list': []}] * 3)
+        monkeypatch.setattr(
+            scraper, '_fetch_json',
+            lambda url, label='json', context=None: next(responses),
+        )
+        monkeypatch.setattr(tm, '_parse_mv_history', lambda payload, player_id: [
+            {'player_id': player_id, 'value_eur': 100},
+        ])
+        df = scraper.read_market_value_history(
+            league='ENG-Premier League', season=2025,
+            player_ids=[str(i) for i in range(9)],
+        )
+        assert not df.empty
+        assert df['player_id'].nunique() == 3  # every 3rd fetch succeeded
