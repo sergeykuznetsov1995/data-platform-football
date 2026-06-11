@@ -1142,6 +1142,52 @@ def validate_gold_quality() -> Dict[str, Any]:
         ),
 
         # ============================================================
+        # issue #427: fct_match_timeline — unified per-event chronicle.
+        # ============================================================
+
+        # ----- PK + critical attrs — ERROR -----
+        CHECK.no_duplicates('gold.fct_match_timeline', pk=['match_id', 'event_seq']),
+        # player_id/team_id intentionally NOT here — xref orphans are
+        # legitimately NULL (orphan-tolerant design, same as sibling facts).
+        CHECK.no_nulls('gold.fct_match_timeline',
+                       cols=['match_id', 'event_seq', 'event_type', 'period',
+                             'minute', 'score_home_after', 'score_away_after']),
+        # event_type dictionary — the CHECK registry has no accepted_values
+        # primitive, so a zero-tolerance row_count guards the 8-value enum.
+        CHECK.row_count(
+            'gold.fct_match_timeline',
+            min_rows=0, max_rows=0,
+            where=("event_type NOT IN ('goal', 'own_goal', 'penalty_goal', "
+                   "'penalty_missed', 'yellow_card', 'second_yellow', "
+                   "'red_card', 'substitution')"),
+            severity='ERROR',
+            name='accepted_values[gold.fct_match_timeline.event_type]',
+        ),
+        # Unbridged WhoScored fallback matches legitimately carry synthetic
+        # 'whoscored_raw_<game_id>' ids that are absent from dim_match —
+        # exclude them, hard-fail on any other orphan.
+        CHECK.ref_integrity(
+            'gold.fct_match_timeline', 'gold.dim_match', 'match_id',
+            where="match_id NOT LIKE 'whoscored_raw_%'",
+        ),
+
+        # ----- Soft FKs + ranges — WARNING -----
+        CHECK.ref_integrity('gold.fct_match_timeline', 'gold.dim_player',
+                            'player_id', severity='WARNING'),
+        CHECK.ref_integrity('gold.fct_match_timeline', 'gold.dim_team',
+                            'team_id', severity='WARNING'),
+        CHECK.value_range('gold.fct_match_timeline', 'minute',
+                          min_val=0, max_val=120, severity='WARNING'),
+        # max 25: live corpus has legitimate 90+16..90+20 stoppage events
+        # (modern APL added time) — 15 fired permanent false-positives.
+        CHECK.value_range('gold.fct_match_timeline', 'minute_added',
+                          min_val=1, max_val=25, severity='WARNING'),
+        CHECK.value_range('gold.fct_match_timeline', 'score_home_after',
+                          min_val=0, max_val=20, severity='WARNING'),
+        CHECK.value_range('gold.fct_match_timeline', 'score_away_after',
+                          min_val=0, max_val=20, severity='WARNING'),
+
+        # ============================================================
         # E2: master-data dims (dim_venue / dim_referee / dim_standings /
         # dim_competition / dim_season). Mirrors the existing dim_match /
         # dim_team / dim_player block but adapted to the E2 PK shapes and
@@ -2305,6 +2351,11 @@ def validate_gold_row_counts() -> Dict[str, Any]:
         # NULL, но фильтр fb.match_id/fb.player_id IS NOT NULL сохраняет
         # FBref-spine). Baseline ≈14-15K на APL 5 сезонов.
         CHECK.row_count('gold.fct_player_match', min_rows=10000),
+        # issue #427: unified chronicle — first materialisation baseline
+        # 50081 rows (goals 10969 + cards 14021 + subs 25091 on APL 10
+        # seasons). Floor 40K leaves headroom for partition gaps while
+        # still catching a broken/partial build.
+        CHECK.row_count('gold.fct_match_timeline', min_rows=40000),
         # issue #46 audit: INNER FBref ∩ SofaScore — pewer rows than main.
         # SofaScore cherry-pick покрывает APL 2024/25 + 2025/26 (~526 игроков
         # на сезон × ~38 матчей × ~22 в составе ≈ 22000 audit-rows). Floor 1000
