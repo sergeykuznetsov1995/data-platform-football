@@ -5,8 +5,8 @@ table:
   fullyQualifiedName: trino_iceberg.iceberg.gold.fct_team_match
   description: |
     Long-form факт: одна строка на (match_id, team_id) — обе стороны матча
-    представлены отдельно. Источник для rolling-фич (feat_team_form,
-    feat_team_h2h, feat_team_event_style) и BI-отчётов по командным метрикам.
+    представлены отдельно. Источник для BI-отчётов по командным метрикам
+    (производный feat_*-этаж удалён в #478).
 
     v2 (issue #95, T6 wave): 5-source консолидация — FBref (spine) + Understat
     (xG/pressing) + WhoScored (event-aggregates) + SofaScore (passes/duels) +

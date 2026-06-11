@@ -12,7 +12,7 @@ table:
     match_id: реальный hex-slug из match_url, либо синтетический
     'fut_<xxhash64>' для будущих матчей без опубликованной страницы (по
     приоритету gameweek+season+home+away, иначе date+home+away) — гарантирует
-    non-NULL и survive в Gold/predictions_input. home_score/away_score
+    non-NULL и survive в Gold. home_score/away_score
     парсятся REGEXP из строки score. Каждый источник дедуплицируется
     независимо через ROW_NUMBER ... ORDER BY _ingested_at DESC.
     Идентификаторы сырые FBref (canonical-резолюция — в Gold).
