@@ -87,7 +87,9 @@ def main():
 
     logger.info(f"Scraper complete: {results['schedule_rows']} total rows")
     print(json.dumps(results))
-    return 0
+    # Issue #466: non-zero exit when any scrape step failed — otherwise the
+    # BashOperator stays green while bronze.espn_schedule silently goes stale.
+    return 1 if results.get('errors') else 0
 
 
 if __name__ == '__main__':

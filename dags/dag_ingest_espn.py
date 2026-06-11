@@ -22,6 +22,7 @@ from airflow.exceptions import AirflowException
 from airflow.operators.bash import BashOperator
 from airflow.operators.python import PythonOperator
 
+from utils.bronze_validation import validate_table
 from utils.config import LEAGUES, CURRENT_SEASON, SCHEDULES, DAG_TAGS
 from utils.default_args import DEFAULT_ARGS
 
@@ -79,6 +80,11 @@ def validate_data(**context) -> Dict[str, Any]:
         raise AirflowException(f"Validation failed: {validation.get('warnings', [])}")
 
     return validation
+
+
+def validate_schedule(**context) -> Dict[str, Any]:
+    """Fail-closed Trino COUNT(*) floor for espn_schedule (issue #466)."""
+    return validate_table('espn_schedule', 'espn_schedule')
 
 
 # Build arguments for bash command
@@ -143,4 +149,13 @@ python dags/scripts/run_espn_scraper.py \\
         trigger_rule='all_done',
     )
 
-    scrape_data_task >> validate_data_task
+    # Issue #466: hard Trino COUNT(*) floor — runs even if the scrape task
+    # failed (trigger_rule='all_done'), so an empty/wiped Bronze table can
+    # never pass silently.
+    validate_schedule_task = PythonOperator(
+        task_id='validate_schedule',
+        python_callable=validate_schedule,
+        trigger_rule='all_done',
+    )
+
+    scrape_data_task >> [validate_data_task, validate_schedule_task]

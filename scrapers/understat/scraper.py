@@ -101,8 +101,11 @@ class UnderstatScraper(SoccerdataScraper):
             return df
 
         except Exception as e:
+            # Issue #466: propagate instead of returning None — a swallowed
+            # error leaves the runner's results['errors'] empty -> exit 0 ->
+            # green DAG while Bronze silently goes stale.
             logger.error(f"Error reading schedule: {e}")
-            return None
+            raise
 
     def read_player_season_stats(self) -> Optional[pd.DataFrame]:
         """
@@ -125,7 +128,7 @@ class UnderstatScraper(SoccerdataScraper):
 
         except Exception as e:
             logger.error(f"Error reading player stats: {e}")
-            return None
+            raise
 
     def read_player_match_stats(self) -> Optional[pd.DataFrame]:
         """
@@ -148,7 +151,7 @@ class UnderstatScraper(SoccerdataScraper):
 
         except Exception as e:
             logger.error(f"Error reading player match stats: {e}")
-            return None
+            raise
 
     def read_shot_events(self) -> Optional[pd.DataFrame]:
         """
@@ -181,8 +184,11 @@ class UnderstatScraper(SoccerdataScraper):
                     all_shots.append(df)
 
             except Exception as e:
-                logger.warning(f"Error reading shots for {league}: {e}")
-                continue
+                # Issue #466: a failed league must fail the run, not be
+                # silently skipped — old partitions stay intact (runner saves
+                # with replace_partitions only on success).
+                logger.error(f"Error reading shots for {league}: {e}")
+                raise
 
         if not all_shots:
             return None
@@ -212,7 +218,7 @@ class UnderstatScraper(SoccerdataScraper):
 
         except Exception as e:
             logger.error(f"Error reading team match stats: {e}")
-            return None
+            raise
 
     def scrape_schedule(self) -> Dict[str, str]:
         """Scrape match schedule."""

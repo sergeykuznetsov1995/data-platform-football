@@ -134,6 +134,30 @@ class TestUnderstatScraper:
 
         assert isinstance(result, dict)
 
+    @pytest.mark.parametrize('method', [
+        'read_schedule',
+        'read_player_season_stats',
+        'read_player_match_stats',
+        'read_team_match_stats',
+    ])
+    def test_read_methods_raise_on_reader_error(self, scraper, method):
+        """Issue #466: read_* must propagate reader errors instead of
+        returning None — a swallowed exception leaves the runner's
+        results['errors'] empty -> exit 0 -> green DAG on total failure."""
+        with patch.object(scraper, '_get_reader', return_value=MagicMock()), \
+             patch.object(scraper, '_execute_with_resilience',
+                          side_effect=RuntimeError('boom')):
+            with pytest.raises(RuntimeError, match='boom'):
+                getattr(scraper, method)()
+
+    def test_read_shot_events_raises_on_league_error(self, scraper,
+                                                     mock_soccerdata_understat):
+        """Issue #466: per-league loop must not silently skip a failed league."""
+        with patch.object(scraper, '_execute_with_resilience',
+                          side_effect=RuntimeError('boom')):
+            with pytest.raises(RuntimeError, match='boom'):
+                scraper.read_shot_events()
+
 
 class TestUnderstatSupportedLeagues:
     """Tests for Understat supported leagues."""

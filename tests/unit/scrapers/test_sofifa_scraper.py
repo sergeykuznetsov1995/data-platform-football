@@ -81,6 +81,24 @@ class TestSoFIFAScraper:
         result = scraper.scrape_all()
         assert isinstance(result, dict)
 
+    @pytest.mark.parametrize('method', [
+        'read_players',
+        'read_teams',
+        'read_player_ratings',
+        'read_team_ratings',
+        'read_versions',
+        'read_leagues',
+    ])
+    def test_read_methods_raise_on_reader_error(self, scraper,
+                                                mock_soccerdata_sofifa, method):
+        """Issue #466: read_* must propagate reader errors instead of
+        returning None — a swallowed exception leaves the runner's
+        results['errors'] empty -> exit 0 -> green DAG on total failure."""
+        with patch.object(scraper, '_execute_with_resilience',
+                          side_effect=RuntimeError('boom')):
+            with pytest.raises(RuntimeError, match='boom'):
+                getattr(scraper, method)()
+
 
 class TestFIFAAttributes:
     """Tests for FIFA attribute definitions."""
