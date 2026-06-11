@@ -40,7 +40,7 @@ WITH team_unavail AS (
         team_id,
         CAST(COUNT(*) AS INTEGER) AS unavailable_count
     FROM iceberg.gold.fct_player_unavailable
-    WHERE player_id_canonical IS NOT NULL
+    WHERE player_id IS NOT NULL
       AND match_id  IS NOT NULL
       AND team_id   IS NOT NULL
     GROUP BY match_id, team_id
@@ -57,7 +57,9 @@ base AS (
         tm.goals_against,
         tm.shots,
         tm.shots_on_target,
-        tm.possession,
+        -- #426: fct_team_match column is possession_pct now; internal alias
+        -- `possession` keeps this feat table's own output schema unchanged.
+        tm.possession_pct AS possession,
         tm.points,
         tm.result,
         tm.league,

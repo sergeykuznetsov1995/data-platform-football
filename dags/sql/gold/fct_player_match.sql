@@ -15,11 +15,11 @@
 --         SofaScore fallback. Single column через COALESCE(us → ss).
 --       - rating: SofaScore (Opta) единственный источник на match-grain
 --         (FotMob match-level rating не собираем).
---   * UNIQUE_<source> метрики (ground_duels_won, aerials_won, dribbles_*) —
---     single column из соответствующего источника.
+--   * duels_won — total duels won (SofaScore only).
 --
--- Grain: (match_id_canonical, player_id_canonical).
--- PK: natural composite — оба компонента non-NULL по конструкции INNER spine.
+-- Design contract: docs/design/gold-star-schema.md §4.4 (issue #426).
+-- Grain: (match_id, player_id). PK: natural composite — оба компонента
+-- non-NULL по конструкции INNER spine.
 --
 -- xref JOIN footgun (feedback_xref_join_season_predicate.md):
 --   silver.xref_player и silver.xref_match хранят per-(source, source_id,
@@ -143,75 +143,80 @@ xref_ws_match AS (
 
 SELECT
     -- ========= PK (natural composite) =========
-    COALESCE(xmf.match_id_canonical, fb.match_id)        AS match_id_canonical,
-    xfp.canonical_id                                     AS player_id_canonical,
-    xtf.team_id_canonical                                AS team_id_canonical,
-
-    -- ========= Identity / context =========
-    fb.team                                              AS team_name_fbref,
-    fb.team_side,
-    fb.pos                                               AS position_fbref,
-    fme.date                                             AS match_date,
+    COALESCE(xmf.match_id_canonical, fb.match_id)        AS match_id,
+    xfp.canonical_id                                     AS player_id,
+    xtf.team_id_canonical                                AS team_id,
 
     -- ========= HARD_FACT (COALESCE fb → ss → ws → us, CAST AS BIGINT) =========
     -- COALESCE между гетерогенными source types (FBref integer, SS DOUBLE,
     -- WS BIGINT) промотит в DOUBLE — CAST AS BIGINT даёт чистый integer
     -- counter в BI. Cross-source diff'ы хранятся в fct_player_match_audit.
-    CAST(COALESCE(fb.minutes,           ss.minutes_played)                          AS BIGINT) AS minutes,
+    CAST(COALESCE(fb.minutes,           ss.minutes_played)                          AS BIGINT) AS minutes_played,
     CAST(COALESCE(fb.goals,             ss.goals,            ws.goals,    us.goals) AS BIGINT) AS goals,
     CAST(COALESCE(fb.assists,           ss.assists,                       us.assists) AS BIGINT) AS assists,
     CAST(COALESCE(fb.shots,             ss.shots,            ws.shots,    us.shots) AS BIGINT) AS shots,
     CAST(COALESCE(fb.shots_on_target,   ss.shots_on_target,  ws.shots_on_target)    AS BIGINT) AS shots_on_target,
-    CAST(COALESCE(fb.yellow_cards,      ss.yellow_cards,     ws.yellow_cards, us.yellow_cards) AS BIGINT) AS yellow_cards,
-    CAST(COALESCE(fb.red_cards,         ss.red_cards,        ws.red_cards,    us.red_cards)    AS BIGINT) AS red_cards,
-    CAST(COALESCE(fb.crosses,           ss.crosses,          ws.crosses)            AS BIGINT) AS crosses,
-    CAST(COALESCE(fb.fouls_committed,   ss.fouls_committed,  ws.fouls_committed)    AS BIGINT) AS fouls_committed,
-    CAST(COALESCE(fb.fouls_drawn,       ss.fouls_drawn,      ws.fouls_drawn)        AS BIGINT) AS fouls_drawn,
-    CAST(COALESCE(fb.offsides,          ss.offsides,         ws.offsides)           AS BIGINT) AS offsides,
-    CAST(COALESCE(fb.tackles_won,       ss.tackles_won,      ws.tackles_won)        AS BIGINT) AS tackles_won,
-    CAST(COALESCE(fb.interceptions,     ss.interceptions,    ws.interceptions)      AS BIGINT) AS interceptions,
-    CAST(COALESCE(fb.own_goals,         ss.own_goals,                        us.own_goals) AS BIGINT) AS own_goals,
-    CAST(COALESCE(fb.penalty_goals,     ss.penalty_goals)                           AS BIGINT) AS penalty_goals,
-    CAST(COALESCE(fb.penalty_attempts,  ss.penalties_missed + ss.penalty_goals)     AS BIGINT) AS penalty_attempts,
-    CAST(COALESCE(fb.penalties_won,     ss.penalties_won)                           AS BIGINT) AS penalties_won,
-    CAST(COALESCE(fb.penalties_conceded, ss.penalties_conceded)                     AS BIGINT) AS penalties_conceded,
+
+    -- ========= MODELED — xG / xA =========
+    -- Understat primary (RX2 — coverage 99% vs 82-85%; r≥0.989). COALESCE
+    -- us → ss закрывает ~1% Understat-gap (U21 / backup minutes). Cross-source
+    -- diff'ы (us vs ss) хранятся в fct_player_match_audit.
+    ROUND(COALESCE(us.xg, ss.xg), 4)                     AS xg,
+    ROUND(COALESCE(us.xa, ss.xa), 4)                     AS xa,
 
     -- FBref does NOT expose key_passes/tackles/passes/etc on match-grain.
     -- COALESCE SS → WS для этих метрик.
     CAST(COALESCE(ss.key_passes,        ws.key_passes)                              AS BIGINT) AS key_passes,
     CAST(COALESCE(ss.passes,            ws.passes)                                  AS BIGINT) AS passes,
-    CAST(COALESCE(ss.passes_completed,  ws.passes_completed)                        AS BIGINT) AS passes_completed,
+    -- pass_accuracy_pct: per-source ratio (числитель и знаменатель из ОДНОГО
+    -- источника — смешение SS/WS дало бы несогласованный процент).
+    ROUND(CASE
+        WHEN ss.passes > 0 THEN 100.0 * ss.passes_completed / ss.passes
+        WHEN ws.passes > 0 THEN 100.0 * ws.passes_completed / ws.passes
+    END, 1)                                                                          AS pass_accuracy_pct,
     CAST(COALESCE(ss.tackles,           ws.tackles)                                 AS BIGINT) AS tackles,
+    CAST(COALESCE(fb.interceptions,     ss.interceptions,    ws.interceptions)      AS BIGINT) AS interceptions,
+    -- duels_won — total duels won, SofaScore only (ground+aerial уже свёрнуты в источнике).
+    CAST(ss.total_duels_won                                                         AS BIGINT) AS duels_won,
+    CAST(COALESCE(ss.touches,           ws.touches)                                 AS BIGINT) AS touches,
+    CAST(COALESCE(ss.dispossessed,      ws.dispossessed)                            AS BIGINT) AS dispossessed,
+    CAST(COALESCE(fb.fouls_committed,   ss.fouls_committed,  ws.fouls_committed)    AS BIGINT) AS fouls_committed,
+    CAST(COALESCE(fb.fouls_drawn,       ss.fouls_drawn,      ws.fouls_drawn)        AS BIGINT) AS fouls_drawn,
+    CAST(COALESCE(fb.yellow_cards,      ss.yellow_cards,     ws.yellow_cards, us.yellow_cards) AS BIGINT) AS yellow_cards,
+    CAST(COALESCE(fb.red_cards,         ss.red_cards,        ws.red_cards,    us.red_cards)    AS BIGINT) AS red_cards,
+
+    -- ========= Beyond-design enrichment (#426 scope revision) =========
+    -- Метрики сверх минимального списка дизайна §4.4 — возвращены по решению
+    -- пользователя (statistical value > узкая звезда). Контекст
+    -- (team_name/position/match_date) НЕ возвращается — он в dims по JOIN.
+    -- FBref counters (заполнены на всех сезонах):
+    CAST(COALESCE(fb.crosses,           ss.crosses,          ws.crosses)            AS BIGINT) AS crosses,
+    CAST(COALESCE(fb.offsides,          ss.offsides,         ws.offsides)           AS BIGINT) AS offsides,
+    CAST(COALESCE(fb.tackles_won,       ss.tackles_won,      ws.tackles_won)        AS BIGINT) AS tackles_won,
+    CAST(COALESCE(fb.own_goals,         ss.own_goals,                        us.own_goals) AS BIGINT) AS own_goals,
+    CAST(COALESCE(fb.penalty_goals,     ss.penalty_goals)                           AS BIGINT) AS penalty_goals,
+    CAST(COALESCE(fb.penalty_attempts,  ss.penalties_missed + ss.penalty_goals)     AS BIGINT) AS penalty_attempts,
+    CAST(COALESCE(fb.penalties_won,     ss.penalties_won)                           AS BIGINT) AS penalties_won,
+    CAST(COALESCE(fb.penalties_conceded, ss.penalties_conceded)                     AS BIGINT) AS penalties_conceded,
+    -- SofaScore/WhoScored детали (покрытие 2425+):
+    CAST(COALESCE(ss.passes_completed,  ws.passes_completed)                        AS BIGINT) AS passes_completed,
     CAST(COALESCE(ss.clearances,        ws.clearances)                              AS BIGINT) AS clearances,
     CAST(COALESCE(ss.ball_recoveries,   ws.ball_recoveries)                         AS BIGINT) AS ball_recoveries,
     CAST(COALESCE(ss.dribbles_attempted, ws.dribbles_attempted)                     AS BIGINT) AS dribbles_attempted,
     CAST(COALESCE(ss.dribbles_won,      ws.dribbles_won)                            AS BIGINT) AS dribbles_won,
-    CAST(COALESCE(ss.touches,           ws.touches)                                 AS BIGINT) AS touches,
-    CAST(COALESCE(ss.dispossessed,      ws.dispossessed)                            AS BIGINT) AS dispossessed,
-    CAST(COALESCE(ss.aerial_duels_won,  ws.aerials_won)                             AS BIGINT) AS aerial_duels_won,
-
-    -- ========= UNIQUE_SOFASCORE =========
-    CAST(ss.ground_duels_won                                                        AS BIGINT) AS ground_duels_won,
+    CAST(COALESCE(ss.blocks,            ws.blocks)                                  AS BIGINT) AS blocks,
     CAST(ss.errors_lead_to_goal                                                     AS BIGINT) AS errors_lead_to_goal,
     CAST(ss.errors_lead_to_shot                                                     AS BIGINT) AS errors_lead_to_shot,
-    CAST(ss.blocks                                                                  AS BIGINT) AS blocks,
     CAST(ss.accurate_crosses                                                        AS BIGINT) AS accurate_crosses,
     CAST(ss.accurate_long_balls                                                     AS BIGINT) AS accurate_long_balls,
     CAST(ss.total_long_balls                                                        AS BIGINT) AS total_long_balls,
+    CAST(COALESCE(ss.aerial_duels_won,  ws.aerials_won)                             AS BIGINT) AS aerial_duels_won,
+    CAST(ss.ground_duels_won                                                        AS BIGINT) AS ground_duels_won,
+    -- Understat ML-сигналы (покрытие 2021+; clean-имена вместо *_understat):
+    ROUND(us.non_penalty_xg, 4)                          AS npxg,
+    ROUND(us.xg_chain, 4)                                AS xg_chain,
+    ROUND(us.xg_buildup, 4)                              AS xg_buildup,
 
-    -- ========= UNIQUE_WHOSCORED (event-derived dribble = SPADL take_on success) =========
-    CAST(ws.dribbles_won                                                            AS BIGINT) AS dribbles_ws,
-    CAST(ws.blocks                                                                  AS BIGINT) AS blocks_ws,
-
-    -- ========= MODELED — xG / xA / rating =========
-    -- xG/xA: Understat primary (RX2 — coverage 99% vs 82-85%; r≥0.989).
-    -- COALESCE us → ss закрывает ~1% Understat-gap (U21 / backup minutes).
-    -- Cross-source diff'ы (us vs ss) хранятся в fct_player_match_audit.
-    ROUND(COALESCE(us.xg, ss.xg), 4)                     AS expected_goals,
-    ROUND(COALESCE(us.xa, ss.xa), 4)                     AS expected_assists,
-    ROUND(us.non_penalty_xg, 4)                          AS non_penalty_xg_understat,
-    ROUND(us.xg_chain, 4)                                AS xg_chain_understat,
-    ROUND(us.xg_buildup, 4)                              AS xg_buildup_understat,
     -- Rating — SofaScore (Opta) единственный источник на match-grain.
     ROUND(ss.rating, 2)                                  AS rating,
 
@@ -239,12 +244,6 @@ LEFT JOIN xref_team_fbref xtf
     ON  xtf.fbref_team_id = fb.team
     AND xtf.league        = xfp.league
     AND xtf.season_slug   = xfp.season_slug
-
--- ===== Match-date enrichment =====
-LEFT JOIN iceberg.silver.fbref_match_enriched fme
-    ON  fme.match_id = fb.match_id
-    AND fme.league   = xfp.league
-    AND fme.season   = xfp.season_year
 
 -- ===== SofaScore bridge (LEFT) =====
 LEFT JOIN xref_ss_player xsp

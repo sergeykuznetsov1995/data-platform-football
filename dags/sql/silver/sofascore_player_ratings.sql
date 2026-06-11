@@ -243,7 +243,8 @@ sched_bridge AS (
     LEFT JOIN team_aliases ha ON ha.raw_name = sched.home_team
     LEFT JOIN team_aliases aa ON aa.raw_name = sched.away_team
     LEFT JOIN iceberg.gold.dim_match dm
-        ON  dm.date         = CAST(sched.date AS DATE)
+        -- #433: dim_match renamed date -> match_date (star dims, #425)
+        ON  dm.match_date   = CAST(sched.date AS DATE)
         AND dm.league       = sched.league
         AND dm.season       = sched.season  -- #404: both slug ('2526'); was TRY_CAST→bigint (never matched vs year-start)
         AND dm.home_team_id = ha.canonical_id

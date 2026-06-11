@@ -10,22 +10,27 @@
 -- =============================================================================
 
 WITH base AS (
+    -- #426: fct_player_match renamed PK/FK to plain ids and minutes to
+    -- minutes_played; internal aliases keep this feat table's own output
+    -- schema unchanged.
     SELECT
-        match_id_canonical,
-        player_id_canonical,
-        team_id_canonical,
+        match_id        AS match_id_canonical,
+        player_id       AS player_id_canonical,
+        team_id         AS team_id_canonical,
         league,
         season,
-        minutes,
+        minutes_played  AS minutes,
         goals,
         assists,
         shots,
         shots_on_target,
         yellow_cards,
         red_cards,
+        -- window references SOURCE columns (same-level SELECT aliases are
+        -- not visible to window expressions in Trino)
         ROW_NUMBER() OVER (
-            PARTITION BY player_id_canonical, season
-            ORDER BY match_id_canonical
+            PARTITION BY player_id, season
+            ORDER BY match_id
         ) AS appearance_rn
     FROM iceberg.gold.fct_player_match
 ),

@@ -325,7 +325,8 @@ mh_bridged AS (
         c.avgc_o25,  c.avgc_u25
     FROM mh_canonicalized c
     INNER JOIN iceberg.gold.dim_match dm
-        ON dm.date         = c.match_date
+        -- #433: dim_match renamed date -> match_date (star dims, #425)
+        ON dm.match_date   = c.match_date
        AND dm.league       = c.league
        AND dm.season       = c.season
        AND dm.home_team_id = c.home_canonical

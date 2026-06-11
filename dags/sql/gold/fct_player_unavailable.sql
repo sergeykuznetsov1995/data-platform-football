@@ -1,8 +1,12 @@
 -- =============================================================================
 -- Gold: fct_player_unavailable
 -- =============================================================================
--- One row per (match_id, team_id, player_id_canonical) — players unavailable
--- (confirmed absences) for a given match. Sourced from WhoScored.
+-- One row per (match_id, player_id) — players unavailable (confirmed absences)
+-- for a given match. Sourced from WhoScored.
+--
+-- Design contract: docs/design/gold-star-schema.md §4.6 (issue #426).
+--   reason — enum injury | suspension | other (raw source label kept in detail).
+--   PK verified duplicate-free on (match_id, player_id) pre-cutover (#426 step 0).
 --
 -- Used by: feat_team_form (l5 rolling unavailability).
 --
@@ -21,12 +25,12 @@
 --     "Wolverhampton" vs "Wolves") surface as NULL team_id and are tracked via
 --     the DQ coverage check; future _team_aliases work fixes them.
 --
---   * player_id_canonical: LEFT JOIN to dim_player by (player_name, season).
+--   * player_id: LEFT JOIN to dim_player by (player_name, season).
 --     On miss — synthetic `'ws_' || ws_player_id` so orphan players are NOT
---     lost (D4). ref_integrity on player_id_canonical is intentionally NOT
+--     lost (D4). ref_integrity on player_id is intentionally NOT
 --     enforced (E1 xref_player not yet built).
 --
--- PK (logical): (match_id, team_id, player_id_canonical)
+-- PK (logical): (match_id, player_id)
 -- =============================================================================
 
 WITH u AS (
@@ -81,18 +85,24 @@ dp_lookup AS (
 
 SELECT
     ur.fbref_match_id                                       AS match_id,
-    ur.match_date,
 
     dt.team_id                                              AS team_id,
-    ur.team_name                                            AS team_name_raw,
 
     -- Orphan-safe player resolution (D4) — never NULL.
     COALESCE(dp.player_id, 'ws_' || CAST(ur.ws_player_id AS VARCHAR))
-                                                            AS player_id_canonical,
-    ur.ws_player_id,
-    ur.player_name,
+                                                            AS player_id,
 
-    ur.reason,
+    -- reason — enum per star design §4.6. Raw WhoScored labels observed
+    -- (#426 step 0): injured, suspended, other, unfit, ineligible.
+    CASE
+        WHEN ur.reason IN ('injured', 'unfit') THEN 'injury'
+        WHEN ur.reason = 'suspended'           THEN 'suspension'
+        WHEN ur.reason IS NULL                 THEN NULL
+        ELSE 'other'
+    END                                                     AS reason,
+    -- detail — raw source label, provenance for the enum above.
+    ur.reason                                               AS detail,
+
     ur._bronze_ingested_at                                  AS _silver_ingested_at,
 
     ur.league,

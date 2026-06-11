@@ -19,7 +19,7 @@ SELECT
     CAST(NULL AS bigint)  AS assists,
     CAST(NULL AS bigint)  AS shots,
     CAST(NULL AS bigint)  AS shots_on_target,
-    CAST(NULL AS bigint)  AS tackles_won,
+    CAST(NULL AS bigint)  AS tackles,  -- #426: tackles_won -> tackles (fct_player_match rename)
     CAST(NULL AS bigint)  AS interceptions,
     CAST(NULL AS bigint)  AS defensive_actions,
     CAST(NULL AS double)  AS xg,

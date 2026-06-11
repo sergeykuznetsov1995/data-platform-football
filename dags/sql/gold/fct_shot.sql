@@ -12,7 +12,8 @@
 --   iceberg.silver.xref_team                — team alias resolution (8 sources)
 --   iceberg.silver.xref_player              — player resolution (orphan-tolerant)
 --
--- PK: (match_id_canonical, shot_id)
+-- Design contract: docs/design/gold-star-schema.md §4.3 (issue #426).
+-- PK: (match_id, shot_id)
 -- Partitioning: (league, season) — applied externally by Python CTAS.
 --
 -- =============================================================================
@@ -72,32 +73,37 @@
 -- onto `xref_match` filtered by source='understat'.
 --
 -- =============================================================================
--- Output schema (frozen)
+-- Output schema (frozen — star design §4.3)
 -- =============================================================================
 --   shot_id                  varchar
---   match_id_canonical       varchar    -- fbref match_id (8-char hex)
---   team_id_canonical        varchar    -- xref_team(source='understat')
---   player_id_canonical      varchar    -- xref_player(source='understat'); orphan us_* possible
---   assist_player_id_canon   varchar    -- xref_player(source='understat'); NULL when no assist
+--   match_id                 varchar    -- fbref match_id (8-char hex)
+--   team_id                  varchar    -- xref_team(source='understat')
+--   player_id                varchar    -- xref_player(source='understat'); orphan us_* possible
+--   assist_player_id         varchar    -- xref_player(source='understat'); NULL when no assist
 --   minute                   integer
 --   x, y                     double     -- 0..1 normalized
+--   body_part                varchar    -- foot | head | other | NULL
+--   situation                varchar    -- open_play | corner | free_kick | set_piece | penalty | NULL
 --   xg                       double     -- 0..1
---   body_part_canonical      varchar    -- foot | head | other | NULL
---   situation_canonical      varchar    -- open_play | from_corner | from_free_kick | set_piece | penalty
---   result_canonical         varchar    -- goal | saved | blocked | missed | post | own_goal
---   is_goal                  boolean    -- result_canonical IN ('goal','own_goal')
+--   psxg                     double     -- NULL placeholder: post-shot xG only exists in
+--                                       --   silver.fbref_shot_events (dead since 2026-02);
+--                                       --   historical enrichment tracked as followup of #426.
+--   result                   varchar    -- goal | saved | blocked | off_target | post | own_goal
+--                                       --   (own_goal — deviation from design §4.3, kept for
+--                                       --    shooter attribution; design doc amended)
+--   is_goal                  boolean    -- result IN ('goal','own_goal')
 --   shot_source              varchar    -- literal 'understat_v1'
 --   shot_version             varchar    -- literal 'v1'
 --   league                   varchar
 --   season                   varchar    -- normalised to varchar (bronze stores varchar)
 --
 -- Testable invariants (E3.8):
---   * PK = (match_id_canonical, shot_id) is unique.
+--   * PK = (match_id, shot_id) is unique.
 --   * shot_source = 'understat_v1' for every row.
 --   * xg ∈ [0, 1] (value_range check).
---   * is_goal = TRUE  iff  result_canonical IN ('goal', 'own_goal').
---   * match_id_canonical is non-null (INNER JOIN guarantees it).
---   * team_id_canonical / player_id_canonical may be NULL — orphan-tolerant.
+--   * is_goal = TRUE  iff  result IN ('goal', 'own_goal').
+--   * match_id is non-null (INNER JOIN guarantees it).
+--   * team_id / player_id may be NULL — orphan-tolerant.
 -- =============================================================================
 
 WITH
@@ -240,28 +246,31 @@ shots_norm AS (
             WHEN s.body_part IN ('Other Body Part', 'OtherBodyPart') THEN 'other'
             WHEN s.body_part IS NULL                              THEN NULL
             ELSE 'other'
-        END                            AS body_part_canonical,
+        END                            AS body_part,
 
         -- situation: {Open Play, From Corner, Set Piece, Direct Freekick, Penalty}
+        -- Domain per star design §4.3: open_play | corner | free_kick | set_piece | penalty
         CASE
             WHEN s.situation = 'Open Play'        THEN 'open_play'
-            WHEN s.situation = 'From Corner'      THEN 'from_corner'
-            WHEN s.situation = 'Direct Freekick'  THEN 'from_free_kick'
+            WHEN s.situation = 'From Corner'      THEN 'corner'
+            WHEN s.situation = 'Direct Freekick'  THEN 'free_kick'
             WHEN s.situation = 'Set Piece'        THEN 'set_piece'
             WHEN s.situation = 'Penalty'          THEN 'penalty'
             ELSE NULL
-        END                            AS situation_canonical,
+        END                            AS situation,
 
         -- result: {Goal, Saved Shot, Blocked Shot, Missed Shot, Shot On Post, Own Goal}
+        -- Domain per star design §4.3: goal | saved | blocked | off_target | post
+        -- (+ own_goal — kept beyond design, see header).
         CASE
             WHEN s.result = 'Goal'         THEN 'goal'
             WHEN s.result = 'Saved Shot'   THEN 'saved'
             WHEN s.result = 'Blocked Shot' THEN 'blocked'
-            WHEN s.result = 'Missed Shot'  THEN 'missed'
+            WHEN s.result = 'Missed Shot'  THEN 'off_target'
             WHEN s.result = 'Shot On Post' THEN 'post'
             WHEN s.result = 'Own Goal'     THEN 'own_goal'
             ELSE NULL
-        END                            AS result_canonical,
+        END                            AS result,
 
         s.league                       AS league,
         CAST(s.season AS varchar)      AS season
@@ -272,24 +281,29 @@ shots_norm AS (
 -- 4) Final projection — INNER JOIN on match bridge, LEFT JOIN on team/player
 SELECT
     sn.shot_id,
-    mb.match_id_canonical,
+    mb.match_id_canonical                          AS match_id,
 
-    xt.canonical_id                                AS team_id_canonical,
-    xp.canonical_id                                AS player_id_canonical,
-    xa.canonical_id                                AS assist_player_id_canonical,
+    xt.canonical_id                                AS team_id,
+    xp.canonical_id                                AS player_id,
+    xa.canonical_id                                AS assist_player_id,
 
     sn.minute,
     sn.x,
     sn.y,
-    sn.xg,
 
-    sn.body_part_canonical,
-    sn.situation_canonical,
-    sn.result_canonical,
+    sn.body_part,
+    sn.situation,
+
+    sn.xg,
+    -- psxg: only FBref shot events carry post-shot xG; that feed is dead since
+    -- 2026-02 → typed NULL placeholder, historical backfill is a #426 followup.
+    CAST(NULL AS double)                           AS psxg,
+
+    sn.result,
 
     -- own_goal counts as a goal for is_goal semantics (it ended in net).
     -- DQ note: own_goal credits scoring team via match outcome, NOT shooter.
-    (sn.result_canonical IN ('goal', 'own_goal'))  AS is_goal,
+    (sn.result IN ('goal', 'own_goal'))            AS is_goal,
 
     CAST('understat_v1' AS varchar)                AS shot_source,
     CAST('v1'           AS varchar)                AS shot_version,

@@ -69,5 +69,5 @@ def test_xg_l5_point_in_time_mask(sql_text: str) -> None:
 
 def test_filter_minutes_threshold(sql_text: str) -> None:
     """Drop dressing-room subs / unused substitutes via minutes >= 10."""
-    pattern = re.compile(r"WHERE\s+pm\.minutes\s*>=\s*10", re.IGNORECASE)
-    assert pattern.search(sql_text), "Expected `WHERE pm.minutes >= 10` filter"
+    pattern = re.compile(r"WHERE\s+pm\.minutes_played\s*>=\s*10", re.IGNORECASE)
+    assert pattern.search(sql_text), "Expected `WHERE pm.minutes_played >= 10` filter"

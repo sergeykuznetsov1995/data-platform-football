@@ -25,8 +25,8 @@ Open TODOs (E1.5 cutover and beyond)
 * **schema-version literal pin** for fct_event — currently the file checks
   ``action_source != 'whoscored_spadl_proprietary_v1'`` only. When the
   SPADL spec evolves to v2, bump both the SQL and this allow-list.
-* **fct_lineup PK with NULL player_id_canonical** — ESPN rows where
-  resolver returns NULL leave ``player_id_canonical IS NULL``. The
+* **fct_lineup PK with NULL player_id** — ESPN rows where
+  resolver returns NULL leave ``player_id IS NULL``. The
   ``no_duplicates`` runner uses ``COUNT(*) - COUNT(DISTINCT (...))``;
   NULL group by produces a single bucket per (match, team, NULL), so a
   duplicate ``(m, t, NULL)`` IS caught. Documented for posterity — full
@@ -389,7 +389,7 @@ def build_per_season_e3_checks(
         ),
         CHECK.no_duplicates(
             'iceberg.gold.fct_shot',
-            pk=['match_id_canonical', 'shot_id'],
+            pk=['match_id', 'shot_id'],
             where=season_filter,
             name=f"no_duplicates[gold.fct_shot season={season}]",
         ),
@@ -745,10 +745,10 @@ def _build_fct_event_checks() -> List[Check]:
 def _build_fct_shot_checks() -> List[Check]:
     """DQ for ``iceberg.gold.fct_shot`` (E3.4).
 
-    Unlike fct_event, this table CAN enforce ``match_id_canonical →
+    Unlike fct_event, this table CAN enforce ``match_id →
     silver.xref_match`` ref_integrity because E3.4 uses an INNER JOIN
     bridge through (date, home_canonical_id, away_canonical_id) to
-    derive match_id_canonical from the FBref hex (which IS resident in
+    derive match_id from the FBref hex (which IS resident in
     xref_match.source='fbref'). 1.8% of shots get filtered here — the
     surviving rows MUST all have a parent match.
     """
@@ -762,28 +762,28 @@ def _build_fct_shot_checks() -> List[Check]:
     return [
         CHECK.no_duplicates(
             table,
-            pk=['match_id_canonical', 'shot_id'],
+            pk=['match_id', 'shot_id'],
         ),
         CHECK.no_nulls(
             table,
-            cols=['match_id_canonical', 'shot_id', 'xg'],
+            cols=['match_id', 'shot_id', 'xg'],
         ),
 
         # Strict ref_integrity — E3.4 uses INNER JOIN bridge so any survivor
         # MUST be in xref_match. Leakage = upstream regression.
         # parent_key='canonical_id' because silver.xref_match has the column
-        # 'canonical_id' (not 'match_id_canonical'); see DESCRIBE 2026-05-08.
+        # 'canonical_id' (not 'match_id'); see DESCRIBE 2026-05-08.
         CHECK.ref_integrity(
             child='gold.fct_shot',
             parent='silver.xref_match',
-            key='match_id_canonical',
+            key='match_id',
             parent_key='canonical_id',
         ),
 
         # xG bounded probability. ERROR-severity: violations indicate a model
         # output regression (Understat upstream issue) and would poison
         # downstream features. xa is not materialized in fct_shot — assist
-        # tracking lives in the assist_player_id_canonical column only.
+        # tracking lives in the assist_player_id column only.
         CHECK.value_range(table, column='xg', min_val=0, max_val=1),
 
         # Volume — APL multi-season ≈ 47K shots smoke-tested. Min 20K
@@ -795,7 +795,7 @@ def _build_fct_shot_checks() -> List[Check]:
             table=table,
             min_rows=0,
             max_rows=shot_orphan_max,
-            where="player_id_canonical IS NULL",
+            where="player_id IS NULL",
             severity='WARNING',
             name='shot_orphan_player_rate',
         ),
@@ -825,29 +825,29 @@ def _build_fct_lineup_checks() -> List[Check]:
     """
     table = 'iceberg.gold.fct_lineup'
 
-    # ESPN player_id_canonical NULL rate — ESPN has no native player_id, so
+    # ESPN player_id NULL rate — ESPN has no native player_id, so
     # name-based resolution misses ~10% of edge cases. Cap absolute count
     # at 10% × 159K ≈ 15,900.
     lineup_orphan_max = int(0.10 * 159_000)
 
     return [
-        # PK guard. With player_id_canonical possibly NULL (ESPN edge case),
+        # PK guard. With player_id possibly NULL (ESPN edge case),
         # the runner uses COUNT - COUNT(DISTINCT) — Trino groups NULLs into
         # one bucket per (match, team, NULL), so duplicate (m, t, NULL) IS
         # caught. Full coverage of NULL semantics moves to E3.9 unit tests.
-        # PK uniqueness is meaningful only when player_id_canonical is
+        # PK uniqueness is meaningful only when player_id is
         # resolved — ESPN rows where the player resolver returned NULL
         # collapse into a single (m, t, NULL) bucket and Trino reports
         # them as duplicates. Scope the check to resolved rows; NULL-PK
         # contract is verified in E3.9 unit tests.
         CHECK.no_duplicates(
             table,
-            pk=['match_id_canonical', 'team_id_canonical', 'player_id_canonical'],
-            where='player_id_canonical IS NOT NULL',
+            pk=['match_id', 'team_id', 'player_id'],
+            where='player_id IS NOT NULL',
         ),
         CHECK.no_nulls(
             table,
-            cols=['match_id_canonical', 'team_id_canonical', 'lineup_source'],
+            cols=['match_id', 'team_id', 'lineup_source'],
         ),
 
         # ref_integrity fct_lineup → xref_match — WARNING (not ERROR).
@@ -858,7 +858,7 @@ def _build_fct_lineup_checks() -> List[Check]:
         CHECK.ref_integrity(
             child='gold.fct_lineup',
             parent='silver.xref_match',
-            key='match_id_canonical',
+            key='match_id',
             parent_key='canonical_id',
             severity='WARNING',
         ),
@@ -875,7 +875,7 @@ def _build_fct_lineup_checks() -> List[Check]:
         CHECK.ref_integrity(
             child='gold.fct_lineup',
             parent='gold.dim_match',
-            key='match_id_canonical',
+            key='match_id',
             parent_key='match_id',
             where="lineup_source = 'fbref'",
             severity='ERROR',
@@ -909,7 +909,7 @@ def _build_fct_lineup_checks() -> List[Check]:
             table=table,
             min_rows=0,
             max_rows=lineup_orphan_max,
-            where="player_id_canonical IS NULL",
+            where="player_id IS NULL",
             severity='WARNING',
             name='lineup_orphan_player_rate',
         ),
