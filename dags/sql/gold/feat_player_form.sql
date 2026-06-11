@@ -26,9 +26,11 @@ WITH base AS (
         shots_on_target,
         yellow_cards,
         red_cards,
+        -- window references SOURCE columns (same-level SELECT aliases are
+        -- not visible to window expressions in Trino)
         ROW_NUMBER() OVER (
-            PARTITION BY player_id_canonical, season
-            ORDER BY match_id_canonical
+            PARTITION BY player_id, season
+            ORDER BY match_id
         ) AS appearance_rn
     FROM iceberg.gold.fct_player_match
 ),
