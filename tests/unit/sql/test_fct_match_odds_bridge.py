@@ -183,7 +183,7 @@ def _reset_schemas(duck_conn):
         """
         CREATE TABLE gold_dim_match (
             match_id      VARCHAR,
-            date          DATE,
+            match_date    DATE,
             league        VARCHAR,
             season        VARCHAR,
             home_team_id  VARCHAR,

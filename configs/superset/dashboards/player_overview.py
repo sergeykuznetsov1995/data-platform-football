@@ -185,8 +185,8 @@ def _build_virtual_datasets(ctx: _Ctx, database: Any) -> dict[str, Any]:
     schema = "gold"
 
     # NB: post issue #426, fct_player_match.PK = (match_id, player_id); the
-    # star-aligned fact no longer carries denormalized team/position/penalty
-    # columns — team_name comes from dim_team, position from dim_player.
+    # star-aligned fact no longer carries denormalized team/position columns —
+    # team_name comes from dim_team, position from dim_player.
     # Для cross-source-only игроков (SofaScore/Understat-only) JOIN dim_player
     # вернёт NULL → COALESCE покажет сырой canonical id.
     v_player_match_named = f"""\
@@ -198,9 +198,9 @@ SELECT
   dt.team_name,
   fpm.match_id,
   fpm.minutes_played AS minutes, fpm.goals, fpm.assists,
-  fpm.shots, fpm.shots_on_target,
-  fpm.yellow_cards, fpm.red_cards, fpm.tackles, fpm.interceptions,
-  fpm.fouls_committed, fpm.fouls_drawn,
+  fpm.shots, fpm.shots_on_target, fpm.penalty_goals, fpm.penalty_attempts,
+  fpm.yellow_cards, fpm.red_cards, fpm.tackles_won, fpm.interceptions,
+  fpm.fouls_committed, fpm.fouls_drawn, fpm.offsides, fpm.own_goals,
   fpm.league, fpm.season
 FROM iceberg.gold.fct_player_match fpm
 LEFT JOIN iceberg.gold.dim_player dp
@@ -283,9 +283,10 @@ WITH fbref AS (
   SELECT player_id,
          COUNT(DISTINCT match_id) AS matches, SUM(minutes_played) AS minutes,
          SUM(goals) AS goals, SUM(assists) AS assists, SUM(shots) AS shots,
-         SUM(shots_on_target) AS sot, SUM(tackles) AS tackles,
+         SUM(shots_on_target) AS sot, SUM(tackles_won) AS tackles_won,
          SUM(interceptions) AS interceptions, SUM(yellow_cards) AS yellow_cards,
-         SUM(red_cards) AS red_cards,
+         SUM(red_cards) AS red_cards, SUM(penalty_goals) AS penalty_goals,
+         SUM(penalty_attempts) AS penalty_attempts,
          ARBITRARY(team_id) AS team_id
   FROM iceberg.gold.fct_player_match
   WHERE season = {SEASON_FBREF} AND league = '{LEAGUE}'
@@ -316,8 +317,8 @@ SELECT
   dt.team_name, f.matches, f.minutes, f.goals, f.assists,
   COALESCE(x.total_xg, 0.0) AS xg,
   f.shots, f.sot,
-  (f.tackles + f.interceptions) AS tackles_int,
-  f.yellow_cards, f.red_cards,
+  (f.tackles_won + f.interceptions) AS tackles_int,
+  f.yellow_cards, f.red_cards, f.penalty_goals, f.penalty_attempts,
   r.avg_rating
 FROM fbref f
 LEFT JOIN xg_cte     x ON x.player_id = f.player_id
@@ -518,7 +519,7 @@ def _build_slices(ctx: _Ctx, database: Any) -> list[Any]:
             "query_mode": "aggregate",
             "groupby": ["player_name", "position", "team_name"],
             "metrics": [
-                _metric("Отборы", "SUM", "tackles"),
+                _metric("Отборы", "SUM", "tackles_won"),
                 _metric("Перехваты", "SUM", "interceptions"),
                 _metric("Фолы", "SUM", "fouls_committed"),
                 _metric("Минуты", "SUM", "minutes"),
@@ -550,14 +551,12 @@ def _build_slices(ctx: _Ctx, database: Any) -> list[Any]:
         },
     ))
 
-    # #426: penalty_goals/penalty_attempts left fct_player_match (star design
-    # §4.4) — пенальти-чарт заменён на фолы, чтобы сохранить layout-сетку.
     slices.append(_make_slice(ctx,
-        "Топ-10 по фолам", "dist_bar", vds["v_player_match_named"],
+        "Топ-10 по пенальти", "dist_bar", vds["v_player_match_named"],
         {
             "metrics": [
-                _metric("Фолы (совершил)", "SUM", "fouls_committed"),
-                _metric("Фолы (на игроке)", "SUM", "fouls_drawn"),
+                _metric("Удары с пенальти", "SUM", "penalty_attempts"),
+                _metric("Голы с пенальти", "SUM", "penalty_goals"),
             ],
             "groupby": ["player_name"],
             "row_limit": 10, "order_desc": True,
@@ -661,6 +660,7 @@ def _build_slices(ctx: _Ctx, database: Any) -> list[Any]:
                 "player_name", "position", "team_name", "matches", "minutes",
                 "goals", "assists", "xg", "shots", "sot",
                 "tackles_int", "yellow_cards", "red_cards",
+                "penalty_goals", "penalty_attempts",
             ],
             "row_limit": 200,
             "order_by_cols": ['["minutes", false]'],

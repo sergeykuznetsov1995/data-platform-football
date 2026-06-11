@@ -11,6 +11,9 @@
 -- possession-passing / pressing-defence / duels / discipline). Extra context
 -- columns date/gameweek/result/is_completed are kept beyond the design list —
 -- the derived feat_* tier reads them directly (scope decision in #426).
+-- A "beyond-design" metric block (saves / offsides / key_passes / takeons /
+-- FotMob shot mix) is also kept — user decision in #426 review: statistical
+-- value over the narrow star minimum.
 --
 -- Sources:
 --   iceberg.gold.dim_match                 (spine — FBref canonical)
@@ -187,6 +190,7 @@ home AS (
         m.home_possession  AS possession,
         m.home_yellow_cards AS yellow_cards,
         m.home_red_cards   AS red_cards,
+        m.home_saves       AS saves,
         dm.is_completed
     FROM iceberg.gold.dim_match dm
     JOIN iceberg.silver.fbref_match_enriched m ON m.match_id = dm.match_id
@@ -208,6 +212,7 @@ away AS (
         m.away_possession  AS possession,
         m.away_yellow_cards AS yellow_cards,
         m.away_red_cards   AS red_cards,
+        m.away_saves       AS saves,
         dm.is_completed
     FROM iceberg.gold.dim_match dm
     JOIN iceberg.silver.fbref_match_enriched m ON m.match_id = dm.match_id
@@ -294,6 +299,19 @@ SELECT
     u.yellow_cards,
     u.red_cards,
     ss.corner_kicks                                               AS corners,
+
+    -- ===== Beyond-design enrichment (#426 scope revision) =====
+    -- Метрики сверх минимального списка дизайна §4.1 — возвращены по решению
+    -- пользователя. Clean-имена вместо суффиксованных (offsides_ss, key_passes_ws).
+    u.saves,
+    ss.offsides,
+    ws.key_passes_ws                                              AS key_passes,
+    ws.takeon_att,
+    ws.takeon_won,
+    fm.big_chances_missed,
+    fm.shots_outside_box,
+    fm.blocked_shots,
+    fm.shots_off_target,
 
     -- ===== Lineage =====
     CURRENT_TIMESTAMP                                             AS _gold_created_at,

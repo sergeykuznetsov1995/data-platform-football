@@ -185,6 +185,38 @@ SELECT
     CAST(COALESCE(fb.yellow_cards,      ss.yellow_cards,     ws.yellow_cards, us.yellow_cards) AS BIGINT) AS yellow_cards,
     CAST(COALESCE(fb.red_cards,         ss.red_cards,        ws.red_cards,    us.red_cards)    AS BIGINT) AS red_cards,
 
+    -- ========= Beyond-design enrichment (#426 scope revision) =========
+    -- Метрики сверх минимального списка дизайна §4.4 — возвращены по решению
+    -- пользователя (statistical value > узкая звезда). Контекст
+    -- (team_name/position/match_date) НЕ возвращается — он в dims по JOIN.
+    -- FBref counters (заполнены на всех сезонах):
+    CAST(COALESCE(fb.crosses,           ss.crosses,          ws.crosses)            AS BIGINT) AS crosses,
+    CAST(COALESCE(fb.offsides,          ss.offsides,         ws.offsides)           AS BIGINT) AS offsides,
+    CAST(COALESCE(fb.tackles_won,       ss.tackles_won,      ws.tackles_won)        AS BIGINT) AS tackles_won,
+    CAST(COALESCE(fb.own_goals,         ss.own_goals,                        us.own_goals) AS BIGINT) AS own_goals,
+    CAST(COALESCE(fb.penalty_goals,     ss.penalty_goals)                           AS BIGINT) AS penalty_goals,
+    CAST(COALESCE(fb.penalty_attempts,  ss.penalties_missed + ss.penalty_goals)     AS BIGINT) AS penalty_attempts,
+    CAST(COALESCE(fb.penalties_won,     ss.penalties_won)                           AS BIGINT) AS penalties_won,
+    CAST(COALESCE(fb.penalties_conceded, ss.penalties_conceded)                     AS BIGINT) AS penalties_conceded,
+    -- SofaScore/WhoScored детали (покрытие 2425+):
+    CAST(COALESCE(ss.passes_completed,  ws.passes_completed)                        AS BIGINT) AS passes_completed,
+    CAST(COALESCE(ss.clearances,        ws.clearances)                              AS BIGINT) AS clearances,
+    CAST(COALESCE(ss.ball_recoveries,   ws.ball_recoveries)                         AS BIGINT) AS ball_recoveries,
+    CAST(COALESCE(ss.dribbles_attempted, ws.dribbles_attempted)                     AS BIGINT) AS dribbles_attempted,
+    CAST(COALESCE(ss.dribbles_won,      ws.dribbles_won)                            AS BIGINT) AS dribbles_won,
+    CAST(COALESCE(ss.blocks,            ws.blocks)                                  AS BIGINT) AS blocks,
+    CAST(ss.errors_lead_to_goal                                                     AS BIGINT) AS errors_lead_to_goal,
+    CAST(ss.errors_lead_to_shot                                                     AS BIGINT) AS errors_lead_to_shot,
+    CAST(ss.accurate_crosses                                                        AS BIGINT) AS accurate_crosses,
+    CAST(ss.accurate_long_balls                                                     AS BIGINT) AS accurate_long_balls,
+    CAST(ss.total_long_balls                                                        AS BIGINT) AS total_long_balls,
+    CAST(COALESCE(ss.aerial_duels_won,  ws.aerials_won)                             AS BIGINT) AS aerial_duels_won,
+    CAST(ss.ground_duels_won                                                        AS BIGINT) AS ground_duels_won,
+    -- Understat ML-сигналы (покрытие 2021+; clean-имена вместо *_understat):
+    ROUND(us.non_penalty_xg, 4)                          AS npxg,
+    ROUND(us.xg_chain, 4)                                AS xg_chain,
+    ROUND(us.xg_buildup, 4)                              AS xg_buildup,
+
     -- Rating — SofaScore (Opta) единственный источник на match-grain.
     ROUND(ss.rating, 2)                                  AS rating,
 
