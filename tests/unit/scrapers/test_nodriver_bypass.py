@@ -1164,3 +1164,64 @@ class TestBrowserFlagsRemoved:
 
         # --disable-extensions should NOT be in the arguments
         assert '--disable-extensions' not in added_args
+
+
+class TestCleanupChromeProcesses:
+    """Tests for _cleanup_chrome_processes pkill invocation (issue #458)."""
+
+    def _run_cleanup(self, returncode, stderr=b''):
+        """Call _cleanup_chrome_processes with mocked subprocess.run."""
+        from scrapers.base.browser.nodriver_bypass import NodriverBypass
+
+        bypass = NodriverBypass()
+        mock_result = MagicMock(returncode=returncode, stderr=stderr)
+        with patch('subprocess.run', return_value=mock_result) as mock_run, \
+             patch('glob.glob', return_value=[]):
+            bypass._cleanup_chrome_processes()
+        return mock_run
+
+    @pytest.mark.unit
+    def test_pkill_called_with_option_separator(self):
+        """Pattern starts with -- so pkill needs the -- option separator.
+
+        Without it pkill parses the pattern as an unknown long option
+        (exit code 2) and kills nothing — a silent no-op.
+        """
+        mock_run = self._run_cleanup(returncode=0)
+
+        assert mock_run.call_args[0][0] == [
+            'pkill', '-f', '--', '--user-data-dir=/tmp/uc_'
+        ]
+
+    @pytest.mark.unit
+    def test_pkill_parse_error_logs_warning(self, caplog):
+        """returncode >= 2 means pkill itself failed — must be logged."""
+        import logging
+
+        with caplog.at_level(logging.WARNING, logger='scrapers.base.browser.nodriver_bypass'):
+            self._run_cleanup(returncode=2, stderr=b'pkill: unrecognized option')
+
+        assert any(
+            'returncode=2' in r.message for r in caplog.records
+            if r.levelno == logging.WARNING
+        )
+
+    @pytest.mark.unit
+    def test_pkill_success_logs_info(self, caplog):
+        """returncode 0 = processes killed — info log."""
+        import logging
+
+        with caplog.at_level(logging.INFO, logger='scrapers.base.browser.nodriver_bypass'):
+            self._run_cleanup(returncode=0)
+
+        assert any('Cleaned up orphaned Chrome' in r.message for r in caplog.records)
+
+    @pytest.mark.unit
+    def test_pkill_no_match_is_silent(self, caplog):
+        """returncode 1 = no matching processes — normal, no info/warning."""
+        import logging
+
+        with caplog.at_level(logging.INFO, logger='scrapers.base.browser.nodriver_bypass'):
+            self._run_cleanup(returncode=1)
+
+        assert not [r for r in caplog.records if r.levelno >= logging.INFO]

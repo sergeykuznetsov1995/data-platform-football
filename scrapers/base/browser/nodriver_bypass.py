@@ -365,13 +365,20 @@ class NodriverBypass:
         """Kill orphaned Chrome/Chromium processes to prevent FD exhaustion."""
         import subprocess
         try:
-            # Find zombie or orphaned chromium processes started by nodriver
+            # Find zombie or orphaned chromium processes started by nodriver.
+            # '--' separator is required: the pattern starts with '--' and
+            # pkill would otherwise parse it as an option (exit 2, no-op).
             result = subprocess.run(
-                ['pkill', '-f', '--user-data-dir=/tmp/uc_'],
+                ['pkill', '-f', '--', '--user-data-dir=/tmp/uc_'],
                 capture_output=True, timeout=5
             )
             if result.returncode == 0:
                 logger.info("Cleaned up orphaned Chrome processes")
+            elif result.returncode >= 2:  # 1 = no match (normal), >=2 = pkill error
+                logger.warning(
+                    f"pkill cleanup failed (returncode={result.returncode}): "
+                    f"{result.stderr}"
+                )
         except Exception as e:
             logger.debug(f"Chrome process cleanup: {e}")
 
