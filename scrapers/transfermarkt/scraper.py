@@ -70,6 +70,18 @@ TM_LEAGUE_MAP: Dict[str, Tuple[str, str]] = {
 
 R0_2B_FALLBACK_MARKER = 'TM_FALLBACK'
 
+# Per-player loops abort after this many fetch failures in a row (burned
+# proxies, CF lockout). Module-level so tests can monkeypatch it.
+_MAX_CONSECUTIVE_FAILURES = 50
+
+
+class ConsecutiveFailureError(RuntimeError):
+    """Raised when a per-player loop hits the consecutive-failure cap.
+
+    Propagating (instead of returning a partial frame) protects the
+    existing bronze partition from a replace_partitions wipe (#457).
+    """
+
 
 # ---------------------------------------------------------------------------
 # Pure helpers
@@ -747,7 +759,6 @@ class TransfermarktScraper(BaseScraper):
         # Step 3 — per-player profile page → enrich bio fields.
         rows: List[Dict] = []
         consecutive_failures = 0
-        max_consecutive = 50
         today = datetime.utcnow().date()
         for idx, sp in enumerate(squad_players, start=1):
             profile_url = (
@@ -763,12 +774,12 @@ class TransfermarktScraper(BaseScraper):
             )
             if payload is None:
                 consecutive_failures += 1
-                if consecutive_failures >= max_consecutive:
-                    logger.error(
-                        "%s: %d consecutive profile failures — aborting.",
-                        R0_2B_FALLBACK_MARKER, consecutive_failures,
+                if consecutive_failures >= _MAX_CONSECUTIVE_FAILURES:
+                    raise ConsecutiveFailureError(
+                        f"{consecutive_failures} consecutive profile failures "
+                        f"at {idx}/{len(squad_players)} — aborting to protect "
+                        f"existing partition"
                     )
-                    break
                 continue
             consecutive_failures = 0
             bio = _parse_player_profile(payload, sp['player_id']) or {}
@@ -865,12 +876,12 @@ class TransfermarktScraper(BaseScraper):
             )
             if payload is None:
                 consecutive_failures += 1
-                if consecutive_failures >= 50:
-                    logger.error(
-                        "%s: %d consecutive mv_history failures.",
-                        R0_2B_FALLBACK_MARKER, consecutive_failures,
+                if consecutive_failures >= _MAX_CONSECUTIVE_FAILURES:
+                    raise ConsecutiveFailureError(
+                        f"{consecutive_failures} consecutive mv_history "
+                        f"failures at {idx}/{len(player_ids)} — aborting to "
+                        f"protect existing partition"
                     )
-                    break
                 continue
             consecutive_failures = 0
             rows.extend(_parse_mv_history(payload, pid))
@@ -934,12 +945,12 @@ class TransfermarktScraper(BaseScraper):
             )
             if payload is None:
                 consecutive_failures += 1
-                if consecutive_failures >= 50:
-                    logger.error(
-                        "%s: %d consecutive transfers failures.",
-                        R0_2B_FALLBACK_MARKER, consecutive_failures,
+                if consecutive_failures >= _MAX_CONSECUTIVE_FAILURES:
+                    raise ConsecutiveFailureError(
+                        f"{consecutive_failures} consecutive transfers "
+                        f"failures at {idx}/{len(player_ids)} — aborting to "
+                        f"protect existing partition"
                     )
-                    break
                 continue
             consecutive_failures = 0
             rows.extend(_parse_transfers(payload, pid))
