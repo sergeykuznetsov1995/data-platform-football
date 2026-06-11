@@ -21,22 +21,21 @@ table:
       * UNIQUE_<source>: метрика отсутствует у других источников →
         single column без суффикса.
 
-    Зерно: (team_id_canonical, league, season). PK = natural composite (оба
-    компонента NOT NULL по INNER FBref spine; xxhash64 + ROW_NUMBER tiebreaker
-    не нужен — см. design doc §7). Partitioning: (league, season).
+    Зерно: (team_id, league, season) — star design §5.4 (#428,
+    ex-team_id_canonical). PK = natural composite (все компоненты NOT NULL
+    по INNER FBref spine; xxhash64 + ROW_NUMBER tiebreaker не нужен — см.
+    design doc §7). Partitioning: (league, season).
   tags:
     - Tier.Gold
     - Domain.Football
 columns:
-  # ─── Identity ───
-  - name: team_id_canonical
-    description: Канонический ID команды (PK part). FK → dim_team.team_id.
+  # ─── PK ───
+  - name: team_id
+    description: Канонический ID команды (PK part; #428 ex-team_id_canonical). FK → dim_team.team_id.
   - name: league
     description: Лига (partition key).
   - name: season
     description: Сезон — varchar slug ('2425' = сезон 2024/25). Partition key.
-  - name: primary_team_name
-    description: Display-имя команды (COALESCE FBref → Understat).
 
   # ─── HARD_FACT — counters (single column через COALESCE fb → us → ws → ss) ───
   - name: matches
@@ -260,7 +259,7 @@ columns:
   - name: _gold_created_at
     description: Технический timestamp материализации строки CTAS (UTC).
 relationships:
-  - from: team_id_canonical
+  - from: team_id
     to: trino_iceberg.iceberg.gold.dim_team.team_id
     type: FOREIGN_KEY
     description: N:1 — атрибуты команды.

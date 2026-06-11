@@ -90,10 +90,46 @@ class TestFctPlayerSeasonStatsSql:
         ), "slug→year SUBSTR idiom was removed in #404 — season is slug now"
 
     def test_grain_columns_present(self):
+        """#428 star design §5.2: PK = (player_id, league, season) — plain id."""
         sql = _read_sql()
-        for col in ['player_id_canonical', 'league', 'season']:
+        for col in ['player_id', 'league', 'season']:
             assert re.search(rf"\b{col}\b", sql), (
                 f"PK column `{col}` must be projected"
+            )
+
+    def test_team_id_fk_with_orphan_fallback(self):
+        """#428 §5.2: team_id FK (fb.squad → xref_team) + 'fb_<slug>' orphan
+        fallback — строки не теряются (§6.2)."""
+        sql = _strip_comments(_read_sql())
+        assert "iceberg.silver.xref_team" in sql, (
+            "team_id bridge must read silver.xref_team"
+        )
+        assert re.search(r"\bAS\s+team_id\b", sql, re.IGNORECASE), (
+            "team_id FK must be projected"
+        )
+        assert re.search(
+            r"'fb_'\s*\|\|\s*lower\s*\(\s*regexp_replace\s*\(", sql,
+            re.IGNORECASE,
+        ), "team_id must keep the 'fb_<slug>' orphan fallback"
+
+    def test_xref_team_join_includes_league_and_season(self):
+        """xref_team JOIN must carry (league, season) — fan-out footgun."""
+        sql = _strip_comments(_read_sql())
+        assert re.search(r"xt\.league\s*=\s*xf\.league", sql, re.IGNORECASE), (
+            "xref_team bridge JOIN must include league predicate"
+        )
+        assert re.search(r"xt\.season\s*=\s*xf\.season_year", sql, re.IGNORECASE), (
+            "xref_team bridge JOIN must include season predicate"
+        )
+
+    def test_context_columns_dropped(self):
+        """#428: контекст через dims — primary_team_name / position_* /
+        player_id_canonical удалены из business-fct."""
+        sql = _strip_comments(_read_sql())
+        for stale in ('primary_team_name', 'position_fbref',
+                      'position_fotmob', 'player_id_canonical'):
+            assert not re.search(rf"\bAS\s+{stale}\b", sql, re.IGNORECASE), (
+                f"`{stale}` must be dropped (#428 — context via dims)"
             )
 
     def test_hard_fact_coalesce_columns(self):

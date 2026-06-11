@@ -91,7 +91,7 @@ def _scalar(sql: str) -> int:
 _TABLE_CASES = [
     ("iceberg.gold.dim_venue",       1,    None),
     ("iceberg.gold.dim_referee",     1,    None),
-    ("iceberg.gold.dim_standings",   1,    None),
+    ("iceberg.gold.fct_standings",   1,    None),
     ("iceberg.gold.dim_manager",     1,    None),
     ("iceberg.gold.dim_player",      1,    None),
     ("iceberg.gold.dim_team",        1,    None),

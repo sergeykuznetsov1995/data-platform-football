@@ -70,9 +70,39 @@ class TestFctKeeperSeasonStatsSql:
         )
 
     def test_grain_columns_present(self):
+        """#428 star design §5.3: PK = (player_id, league, season) — plain id."""
         sql = _read_sql()
-        for col in ['player_id_canonical', 'league', 'season']:
+        for col in ['player_id', 'league', 'season']:
             assert re.search(rf"\b{col}\b", sql)
+
+    def test_team_id_fk_with_orphan_fallback(self):
+        """#428 §5.3: team_id FK (fb.squad → xref_team) + 'fb_<slug>' fallback."""
+        sql = _strip_comments(_read_sql())
+        assert "iceberg.silver.xref_team" in sql, (
+            "team_id bridge must read silver.xref_team"
+        )
+        assert re.search(r"\bAS\s+team_id\b", sql, re.IGNORECASE), (
+            "team_id FK must be projected"
+        )
+        assert re.search(
+            r"'fb_'\s*\|\|\s*lower\s*\(\s*regexp_replace\s*\(", sql,
+            re.IGNORECASE,
+        ), "team_id must keep the 'fb_<slug>' orphan fallback"
+
+    def test_xref_team_join_includes_league_and_season(self):
+        """xref_team JOIN must carry (league, season) — fan-out footgun."""
+        sql = _strip_comments(_read_sql())
+        assert re.search(r"xt\.league\s*=\s*xf\.league", sql, re.IGNORECASE)
+        assert re.search(r"xt\.season\s*=\s*xf\.season_year", sql, re.IGNORECASE)
+
+    def test_context_columns_dropped(self):
+        """#428: primary_team_name / player_id_canonical удалены —
+        контекст через dim_team / dim_player_attributes."""
+        sql = _strip_comments(_read_sql())
+        for stale in ('primary_team_name', 'player_id_canonical'):
+            assert not re.search(rf"\bAS\s+{stale}\b", sql, re.IGNORECASE), (
+                f"`{stale}` must be dropped (#428 — context via dims)"
+            )
 
     def test_hard_fact_coalesce_columns(self):
         sql = _read_sql()
@@ -104,10 +134,17 @@ class TestFctKeeperSeasonStatsSql:
 
     def test_save_pct_kept_separate(self):
         """FBref save_pct vs FotMob save_percentage хранятся в отдельных колонках
-        (без COALESCE) — шкалы могут различаться, COALESCE замаскирует расхождения."""
-        sql = _read_sql()
-        assert re.search(r"save_pct_fbref\b", sql), (
-            "FBref save_pct must be projected as `save_pct_fbref` (no COALESCE)"
+        (без COALESCE) — шкалы могут различаться, COALESCE замаскирует расхождения.
+        #428: дизайн-имя `save_pct` (FBref primary); суффикс `_fbref` удалён."""
+        sql = _strip_comments(_read_sql())
+        assert re.search(r"\bfb\.save_pct\b", sql, re.IGNORECASE), (
+            "FBref save_pct must be projected plain (design §5.3, no COALESCE)"
+        )
+        assert not re.search(r"\bAS\s+save_pct_fbref\b", sql, re.IGNORECASE), (
+            "#428: `save_pct_fbref` renamed to plain `save_pct`"
+        )
+        assert not re.search(r"COALESCE[^)]*save_pct", sql, re.IGNORECASE), (
+            "save_pct must NOT be COALESCEd across sources (scales differ)"
         )
         assert re.search(r"save_percentage_fotmob\b", sql), (
             "FotMob save_percentage must be projected as `save_percentage_fotmob`"
@@ -128,7 +165,7 @@ class TestFctKeeperSeasonStatsSql:
     def test_unique_fotmob_keeper_columns_present(self):
         sql = _read_sql()
         unique = [
-            'saves_per_90', 'goals_prevented',
+            'saves_per_90',
             'accurate_passes_per_90', 'accurate_long_balls_per_90',
             'fotmob_rating',
         ]
@@ -136,6 +173,14 @@ class TestFctKeeperSeasonStatsSql:
             assert re.search(rf"fm\.{col}\b", sql, re.IGNORECASE), (
                 f"UNIQUE_FOTMOB keeper column `{col}` must come from fm."
             )
+
+    def test_psxg_minus_ga_from_fotmob_goals_prevented(self):
+        """#428 §5.3: psxg_minus_ga = FotMob goals_prevented (≡ PSxG − GA);
+        FBref PSxG мёртв с Feb-2026 (keeper_adv expected-NULL)."""
+        sql = _strip_comments(_read_sql())
+        assert re.search(
+            r"fm\.goals_prevented\s+AS\s+psxg_minus_ga\b", sql, re.IGNORECASE,
+        ), "psxg_minus_ga must be projected from fm.goals_prevented"
 
     def test_unique_whoscored_keeper_columns_present(self):
         """WhoScored event-aggregate GK-метрики (3 колонки)."""

@@ -57,10 +57,10 @@ def _capture_checks(monkeypatch) -> list:
     # The function does the import at call time so patching the source
     # module is sufficient — the late binding picks up the stub.
     monkeypatch.setattr('utils.data_quality.run_checks', fake_run)
-    # Inline-helper (_append_dim_standings_coverage_check) issues its own Trino
+    # Inline-helper (_append_fct_standings_coverage_check) issues its own Trino
     # query — neutralise so the test stays offline.
     monkeypatch.setattr(gold_tasks,
-                        '_append_dim_standings_coverage_check',
+                        '_append_fct_standings_coverage_check',
                         lambda report: None)
     # telegram alerts make HTTP calls — stub.
     monkeypatch.setattr('utils.alerts.telegram_dq_summary',

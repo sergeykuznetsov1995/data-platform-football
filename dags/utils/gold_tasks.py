@@ -902,8 +902,8 @@ def _run_partition_dq(
     return [f"{r.name}: {r.details or r.error}" for r in report.errors]
 
 
-def _append_dim_standings_coverage_check(report) -> None:
-    """E2: append a two-tier coverage CheckResult for dim_standings.
+def _append_fct_standings_coverage_check(report) -> None:
+    """E2: append a two-tier coverage CheckResult for fct_standings (#428).
 
     Measures the fraction of standings rows whose team_id was resolved via
     the canonical resolver (``team_id_source = 'fbref_canonical'``) vs the
@@ -922,12 +922,12 @@ def _append_dim_standings_coverage_check(report) -> None:
     """
     from utils.data_quality import CheckResult, _get_conn
 
-    name = "coverage[dim_standings.team_id_source='fbref_canonical']"
+    name = "coverage[fct_standings.team_id_source='fbref_canonical']"
     sql = (
         "SELECT "
         "  COUNT(*) AS total, "
         "  COUNT_IF(team_id_source = 'fbref_canonical') AS resolved "
-        "FROM iceberg.gold.dim_standings"
+        "FROM iceberg.gold.fct_standings"
     )
 
     conn = _get_conn()
@@ -945,7 +945,7 @@ def _append_dim_standings_coverage_check(report) -> None:
         if total == 0:
             # No standings yet — surfaced separately by row_count check.
             passed = True
-            details = "dim_standings is empty — coverage skipped"
+            details = "fct_standings is empty — coverage skipped"
         elif ratio >= 0.95:
             passed = True
             details = (
@@ -980,7 +980,7 @@ def _append_dim_standings_coverage_check(report) -> None:
             passed=False,
             error=str(e),
         ))
-        logger.exception("dim_standings coverage check raised")
+        logger.exception("fct_standings coverage check raised")
     finally:
         conn.close()
 
@@ -1188,17 +1188,18 @@ def validate_gold_quality() -> Dict[str, Any]:
                           min_val=0, max_val=20, severity='WARNING'),
 
         # ============================================================
-        # E2: master-data dims (dim_venue / dim_referee / dim_standings /
-        # dim_competition / dim_season). Mirrors the existing dim_match /
-        # dim_team / dim_player block but adapted to the E2 PK shapes and
-        # the R0.4 (_canonical, _source, _version) schema-versioning trio.
+        # E2: master-data dims (dim_venue / dim_referee / dim_competition /
+        # dim_season) + fct_standings (ex-dim_standings, renamed #428).
+        # Mirrors the existing dim_match / dim_team / dim_player block but
+        # adapted to the E2 PK shapes and the R0.4 (_canonical, _source,
+        # _version) schema-versioning trio.
         # ============================================================
 
         # ----- E2: PK uniqueness — ERROR -----
         CHECK.no_duplicates('gold.dim_venue',       pk=['venue_id']),
         CHECK.no_duplicates('gold.dim_referee',     pk=['referee_id']),
         # Composite PK — one standings row per (league, season, team).
-        CHECK.no_duplicates('gold.dim_standings',   pk=['league', 'season', 'team_id']),
+        CHECK.no_duplicates('gold.fct_standings',   pk=['league', 'season', 'team_id']),
         # #425: PK renamed to the design keys — league slug / season slug.
         CHECK.no_duplicates('gold.dim_competition', pk=['league']),
         CHECK.no_duplicates('gold.dim_season',      pk=['season']),
@@ -1206,18 +1207,19 @@ def validate_gold_quality() -> Dict[str, Any]:
         # ----- E2: NOT NULL on PKs + critical attrs — ERROR -----
         CHECK.no_nulls('gold.dim_venue',       cols=['venue_id', 'venue_name']),
         CHECK.no_nulls('gold.dim_referee',     cols=['referee_id', 'referee_name']),
-        # dim_standings has no canonical column — its source-tracking is via
+        # fct_standings has no canonical column — its source-tracking is via
         # team_id_source (covered by the coverage check below). Here we just
         # guarantee the PK trio + the load-bearing numeric attrs are present.
-        CHECK.no_nulls('gold.dim_standings',
-                       cols=['league', 'season', 'team_id', 'points', 'mp']),
+        # #428: mp → played (design §5.5).
+        CHECK.no_nulls('gold.fct_standings',
+                       cols=['league', 'season', 'team_id', 'points', 'played']),
         CHECK.no_nulls('gold.dim_competition',
                        cols=['league', 'competition_name', 'country']),
         CHECK.no_nulls('gold.dim_season',
                        cols=['season', 'season_name',
                              'start_date', 'end_date']),
 
-        # ----- E2: ref_integrity dim_standings.team_id → dim_team — WARNING -----
+        # ----- E2: ref_integrity fct_standings.team_id → dim_team — WARNING -----
         # Soft FK: rows whose team_id_source='sofascore_orphan' are intentionally
         # NOT in dim_team (resolver couldn't match — they are tracked but not
         # joined). Only the canonical-resolved rows must point at a real
@@ -1229,11 +1231,11 @@ def validate_gold_quality() -> Dict[str, Any]:
         # map to a distinct `liverpool_fc` canonical_id whereas dim_team uses
         # `liverpool`. The orphan share is surfaced via the coverage WARNING.
         CHECK.row_count(
-            'gold.dim_standings', min_rows=0, max_rows=0,
+            'gold.fct_standings', min_rows=0, max_rows=0,
             where=("team_id_source = 'fbref_canonical' "
                    "AND team_id NOT IN (SELECT team_id FROM iceberg.gold.dim_team)"),
             severity='WARNING',
-            name='ref_integrity[dim_standings.team_id->dim_team]',
+            name='ref_integrity[fct_standings.team_id->dim_team]',
         ),
 
         # NB (#425): the R0.4 canonical/source/version trio left the slim
@@ -1259,11 +1261,11 @@ def validate_gold_quality() -> Dict[str, Any]:
         # ----- E2: value-range sanity (WARNING) -----
         # APL has 38 matches/season (max 46 across other supported leagues).
         # Points hard ceiling: 38 * 3 = 114 -> round to 120 for safety margin.
-        CHECK.value_range('gold.dim_standings', 'points',
+        CHECK.value_range('gold.fct_standings', 'points',
                           min_val=0, max_val=120, severity='WARNING'),
-        CHECK.value_range('gold.dim_standings', 'mp',
+        CHECK.value_range('gold.fct_standings', 'played',
                           min_val=0, max_val=46,  severity='WARNING'),
-        CHECK.value_range('gold.dim_standings', 'position',
+        CHECK.value_range('gold.fct_standings', 'position',
                           min_val=1, max_val=24,  severity='WARNING'),
 
         # ============================================================
@@ -1423,15 +1425,25 @@ def validate_gold_quality() -> Dict[str, Any]:
         # only (вратари в fct_keeper_season_stats). Business-витрина:
         # PK + ref_integrity ERROR; audit-diff чеки переехали в _audit.
         # ============================================================
+        # #428: PK renamed to plain player_id (design §5.2); the dim keeps
+        # its player_id_canonical naming (out of #428 scope) — mirror #426.
         CHECK.no_duplicates('gold.fct_player_season_stats',
-                            pk=['player_id_canonical', 'league', 'season']),
+                            pk=['player_id', 'league', 'season']),
         CHECK.no_nulls('gold.fct_player_season_stats',
-                       cols=['player_id_canonical', 'league', 'season']),
+                       cols=['player_id', 'league', 'season']),
         CHECK.ref_integrity(
             'gold.fct_player_season_stats',
             'gold.dim_player_attributes',
-            'player_id_canonical',
+            'player_id',
             parent_key='player_id_canonical',
+        ),
+        # #428: new team_id FK (squad with most minutes). WARNING-only —
+        # orphan-fallback ids ('fb_<slug>') are intentionally NOT in dim_team.
+        CHECK.ref_integrity(
+            'gold.fct_player_season_stats',
+            'gold.dim_team',
+            'team_id',
+            severity='WARNING',
         ),
         # Value-range plausibility — bounded domain метрики (ERROR на нарушение
         # домена). T6: HARD_FACT pct metrics single-column (COALESCE WS→SS),
@@ -1463,15 +1475,23 @@ def validate_gold_quality() -> Dict[str, Any]:
         # ============================================================
         # T5: fct_keeper_season_stats — keeper-variant. Зеркальный набор.
         # ============================================================
+        # #428: PK renamed to plain player_id (design §5.3) — mirror outfield.
         CHECK.no_duplicates('gold.fct_keeper_season_stats',
-                            pk=['player_id_canonical', 'league', 'season']),
+                            pk=['player_id', 'league', 'season']),
         CHECK.no_nulls('gold.fct_keeper_season_stats',
-                       cols=['player_id_canonical', 'league', 'season']),
+                       cols=['player_id', 'league', 'season']),
         CHECK.ref_integrity(
             'gold.fct_keeper_season_stats',
             'gold.dim_player_attributes',
-            'player_id_canonical',
+            'player_id',
             parent_key='player_id_canonical',
+        ),
+        # #428: new team_id FK — WARNING-only (orphan-fallback tolerated).
+        CHECK.ref_integrity(
+            'gold.fct_keeper_season_stats',
+            'gold.dim_team',
+            'team_id',
+            severity='WARNING',
         ),
 
         # ============================================================
@@ -1487,11 +1507,12 @@ def validate_gold_quality() -> Dict[str, Any]:
                             pk=['player_id_canonical', 'league', 'season']),
         CHECK.no_nulls('gold.fct_player_season_stats_audit',
                        cols=['player_id_canonical', 'league', 'season']),
+        # #428: audit keeps player_id_canonical; main fct renamed to player_id.
         CHECK.ref_integrity(
             'gold.fct_player_season_stats_audit',
             'gold.fct_player_season_stats',
             'player_id_canonical',
-            parent_key='player_id_canonical',
+            parent_key='player_id',
         ),
         # 8 audit-diff coverage WARNING-only (error_threshold=0). Audit —
         # observability, не gate; ERROR ломал бы DAG при нормальных
@@ -1572,7 +1593,7 @@ def validate_gold_quality() -> Dict[str, Any]:
             'gold.fct_keeper_season_stats_audit',
             'gold.fct_keeper_season_stats',
             'player_id_canonical',
-            parent_key='player_id_canonical',
+            parent_key='player_id',  # #428: main fct renamed; audit keeps _canonical
         ),
         CHECK.coverage('gold.fct_keeper_season_stats_audit',
                        condition='ABS(matches_diff_fotmob) <= 1 OR matches_diff_fotmob IS NULL',
@@ -1599,15 +1620,15 @@ def validate_gold_quality() -> Dict[str, Any]:
         # silver.xref_team. PK + ref_integrity (→ dim_team) ERROR; pct и
         # MODELED value-range ERROR на нарушение домена.
         # ============================================================
+        # #428: PK renamed to plain team_id (design §5.4).
         CHECK.no_duplicates('gold.fct_team_season_stats',
-                            pk=['team_id_canonical', 'league', 'season']),
+                            pk=['team_id', 'league', 'season']),
         CHECK.no_nulls('gold.fct_team_season_stats',
-                       cols=['team_id_canonical', 'league', 'season']),
+                       cols=['team_id', 'league', 'season']),
         CHECK.ref_integrity(
             'gold.fct_team_season_stats',
             'gold.dim_team',
-            'team_id_canonical',
-            parent_key='team_id',
+            'team_id',
         ),
         # MODELED xG/xA — bounded domain on season-level (≤ ~150 for top APL teams).
         CHECK.value_range('gold.fct_team_season_stats', 'expected_goals',
@@ -1667,7 +1688,7 @@ def validate_gold_quality() -> Dict[str, Any]:
             'gold.fct_team_season_stats_audit',
             'gold.fct_team_season_stats',
             'team_id_canonical',
-            parent_key='team_id_canonical',
+            parent_key='team_id',  # #428: main fct renamed; audit keeps _canonical
         ),
         # ----- Understat diff (INNER spine: всегда non-NULL) -----
         CHECK.coverage('gold.fct_team_season_stats_audit',
@@ -2287,11 +2308,11 @@ def validate_gold_quality() -> Dict[str, Any]:
 
     report = run_checks(checks, raise_on_error=False)
 
-    # E2: two-tier coverage check on dim_standings.team_id resolver hit-rate.
+    # E2: two-tier coverage check on fct_standings.team_id resolver hit-rate.
     # Inline because the universal CHECK registry has no two-tier coverage
     # primitive yet (see helper docstring). WARNING-only — orphans are
     # intentionally retained with team_id_source='sofascore_orphan'.
-    _append_dim_standings_coverage_check(report)
+    _append_fct_standings_coverage_check(report)
 
     logger.info(f"Gold DQ: {report.summary()}")
 
@@ -2379,10 +2400,10 @@ def validate_gold_row_counts() -> Dict[str, Any]:
         # dim_manager (#425): one row per manager. APL history counts
         # ~30-50+ distinct head coaches; floor 20 still catches an empty table.
         CHECK.row_count('gold.dim_manager',   min_rows=20),
-        # dim_standings: at least one snapshot of the current 18-team table
-        # (relaxed to 18 to cover early-season / partial loads — historical
-        # snapshots will multiply this by season).
-        CHECK.row_count('gold.dim_standings', min_rows=18),
+        # fct_standings (#428, ex-dim_standings): at least one snapshot of the
+        # current 18-team table (relaxed to 18 to cover early-season / partial
+        # loads — historical snapshots will multiply this by season).
+        CHECK.row_count('gold.fct_standings', min_rows=18),
         # dim_competition (#425): one row per competitions.yaml entry —
         # 8 today (1 in-scope + 7 stubs). Hard equality detects drift the
         # moment the YAML changes without a corresponding re-run.

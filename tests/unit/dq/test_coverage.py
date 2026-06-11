@@ -60,7 +60,7 @@ class TestCoverageFactory:
     def test_explicit_condition_overrides_column(self):
         dq = _import_dq()
         chk = dq.CHECK.coverage(
-            table='gold.dim_standings',
+            table='gold.fct_standings',
             condition="team_id_source = 'fbref_canonical'",
         )
         assert "fbref_canonical" in chk.params.get('condition', '')

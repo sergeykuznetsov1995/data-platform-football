@@ -7,7 +7,7 @@ table:
     Сырая турнирная таблица лиги из SofaScore (soccerdata
     Sofascore.read_league_table через dag_ingest_sofascore). Grain — один row
     на команду в (league, season): snapshot позиции на момент ingest'а.
-    Кормит Gold dim_standings. Партиционирование ['league','season'].
+    Кормит Gold fct_standings (#428, ex-dim_standings). Партиционирование ['league','season'].
   tags:
     - Tier.Bronze
     - Domain.Football
