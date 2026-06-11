@@ -102,10 +102,10 @@ def _reset_schemas(duck_conn):
     duck_conn.execute(
         """
         CREATE TABLE gold_fct_shot (
-            match_id_canonical    VARCHAR,
-            team_id_canonical     VARCHAR,
-            situation_canonical   VARCHAR,
-            body_part_canonical   VARCHAR
+            match_id    VARCHAR,
+            team_id     VARCHAR,
+            situation   VARCHAR,
+            body_part   VARCHAR
         )
         """
     )
@@ -224,7 +224,7 @@ def _seed_team_matches(
                 f"'unknown', FALSE)"
             )
 
-        # Shots: situation_canonical mix + body_part
+        # Shots: situation mix + body_part
         for s in range(set_piece_per_match):
             bp = "head" if s < header_per_match else "foot"
             con.execute(

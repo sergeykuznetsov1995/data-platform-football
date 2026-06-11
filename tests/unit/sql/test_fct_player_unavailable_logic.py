@@ -190,7 +190,7 @@ def _create_fct_team_match(con: duckdb.DuckDBPyConnection) -> None:
             goals_against INTEGER,
             shots INTEGER,
             shots_on_target INTEGER,
-            possession DOUBLE,
+            possession_pct DOUBLE,
             points INTEGER,
             result VARCHAR,
             league VARCHAR,
@@ -206,13 +206,10 @@ def _create_fct_player_unavailable(con: duckdb.DuckDBPyConnection) -> None:
         """
         CREATE TABLE iceberg.gold.fct_player_unavailable (
             match_id VARCHAR,
-            match_date DATE,
             team_id VARCHAR,
-            team_name_raw VARCHAR,
-            player_id_canonical VARCHAR,
-            ws_player_id VARCHAR,
-            player_name VARCHAR,
+            player_id VARCHAR,
             reason VARCHAR,
+            detail VARCHAR,
             _silver_ingested_at TIMESTAMP,
             league VARCHAR,
             season VARCHAR
@@ -378,7 +375,7 @@ class TestGoldFctPlayerUnavailable:
         )
 
     def test_gold_orphan_player_id_fallback(self):
-        """No dim_player match -> player_id_canonical = 'ws_<ws_player_id>'."""
+        """No dim_player match -> player_id = 'ws_<ws_player_id>'."""
         con = _make_con()
         _create_silver_table(con)
         _create_gold_dims(con)
@@ -411,7 +408,7 @@ class TestGoldFctPlayerUnavailable:
 
         rows = self._run_gold(con)
         assert len(rows) == 1
-        assert rows[0]["player_id_canonical"] == "ws_ws_999"
+        assert rows[0]["player_id"] == "ws_ws_999"
 
     def test_gold_match_id_bridge_via_dim_match(self):
         """Silver (match_date, team_slug) -> dim_match.match_id propagates to Gold."""
@@ -550,8 +547,7 @@ class TestFeatTeamFormUnavailableL5:
             for k in range(i):  # i unavailable players for match i
                 pid = f"p{i:02d}_{k}"
                 unavail_rows.append(
-                    f"('m{i:02d}', DATE '2025-01-{i:02d}', 'arsenal','Arsenal',"
-                    f"'{pid}','wsid_{pid}','Player {pid}','Injury',"
+                    f"('m{i:02d}', 'arsenal', '{pid}', 'injury', 'injured',"
                     f" TIMESTAMP '2025-01-01 00:00:00','ENG-PL', '2425')"
                 )
         con.execute(

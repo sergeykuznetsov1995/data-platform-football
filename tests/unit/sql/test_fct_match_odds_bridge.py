@@ -307,11 +307,11 @@ def _run_gold(con) -> List[Dict[str, Any]]:
 class TestFctMatchOddsBridge:
 
     def test_bridge_coverage_100_percent(self, duck_conn):
-        """All 5 matches resolve to a dim_match → 5 distinct match_id_canonical."""
+        """All 5 matches resolve to a dim_match → 5 distinct match_id."""
         _seed_corpus(duck_conn)
         _materialize_silver(duck_conn)
         out = _run_gold(duck_conn)
-        match_ids = {r["match_id_canonical"] for r in out}
+        match_ids = {r["match_id"] for r in out}
         assert match_ids == {"M_WV_TT", "M_WV_TT2", "M_MU_NF", "M_MU_NF2", "M_NU_WH"}, (
             f"bridge coverage incomplete: {sorted(match_ids)}"
         )
@@ -323,7 +323,7 @@ class TestFctMatchOddsBridge:
         out = _run_gold(duck_conn)
         # Both M_WV_TT (Wolves vs Tottenham) and M_WV_TT2 (Wolverhampton vs Spurs)
         # must show up — proves both alias-pairs resolve.
-        ids_present = {r["match_id_canonical"] for r in out}
+        ids_present = {r["match_id"] for r in out}
         assert "M_WV_TT" in ids_present
         assert "M_WV_TT2" in ids_present
 
@@ -332,7 +332,7 @@ class TestFctMatchOddsBridge:
         _seed_corpus(duck_conn)
         _materialize_silver(duck_conn)
         out = _run_gold(duck_conn)
-        ids_present = {r["match_id_canonical"] for r in out}
+        ids_present = {r["match_id"] for r in out}
         assert "M_MU_NF" in ids_present, (
             "Manchester Utd / Nott'm Forest alias-pair did not resolve"
         )
@@ -353,43 +353,43 @@ class TestFctMatchOddsBridge:
         assert len(out) >= 30, f"too few unfolded rows: {len(out)}"
 
     def test_closing_flag_detected_for_psc(self, duck_conn):
-        """PSCH/PSCD/PSCA seeded → closing_flag=TRUE for PS-1x2-closing rows."""
+        """PSCH/PSCD/PSCA seeded → is_closing=TRUE for PS-1x2-closing rows."""
         _seed_corpus(duck_conn)
         _materialize_silver(duck_conn)
         out = _run_gold(duck_conn)
         psc_rows = [
             r for r in out
-            if r["bookmaker_code"] == "PS"
+            if r["bookmaker"] == "PS"
             and r["market"] == "1x2"
-            and r["closing_flag"] is True
+            and r["is_closing"] is True
         ]
         assert psc_rows, "no PS closing 1x2 rows surfaced"
         for r in psc_rows:
-            assert r["odds_h"] is not None
-            assert r["odds_d"] is not None
-            assert r["odds_a"] is not None
+            assert r["odds_home"] is not None
+            assert r["odds_draw"] is not None
+            assert r["odds_away"] is not None
 
     def test_open_rows_have_closing_flag_false(self, duck_conn):
-        """Non-closing books (B365/BW/IW/WH/VC open) → closing_flag=FALSE."""
+        """Non-closing books (B365/BW/IW/WH/VC open) → is_closing=FALSE."""
         _seed_corpus(duck_conn)
         _materialize_silver(duck_conn)
         out = _run_gold(duck_conn)
         open_rows = [
             r for r in out
-            if r["bookmaker_code"] == "B365"
+            if r["bookmaker"] == "B365"
             and r["market"] == "1x2"
-            and r["closing_flag"] is False
+            and r["is_closing"] is False
         ]
         assert open_rows, "no B365 open 1x2 rows surfaced"
 
     def test_odds_decimal_typing_valid(self, duck_conn):
-        """odds_h/d/a typed DECIMAL(6,3) — no parse failure."""
+        """odds_home/draw/away typed DECIMAL(6,3) — no parse failure."""
         from decimal import Decimal
         _seed_corpus(duck_conn)
         _materialize_silver(duck_conn)
         out = _run_gold(duck_conn)
         for r in out:
-            for k in ("odds_h", "odds_d", "odds_a"):
+            for k in ("odds_home", "odds_draw", "odds_away"):
                 v = r.get(k)
                 if v is not None:
                     assert isinstance(v, Decimal), (

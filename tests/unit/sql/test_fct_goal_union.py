@@ -4,7 +4,7 @@ Unit tests for ``dags/sql/gold/fct_goal.sql`` — UNION + canonical-trio (E4.5).
 Strategy
 --------
 ``fct_goal`` unions:
-  * regular_goals   — ``iceberg.gold.fct_shot``        WHERE result_canonical='goal'
+  * regular_goals   — ``iceberg.gold.fct_shot``        WHERE result='goal'
   * own_goals       — ``iceberg.bronze.fbref_match_events`` WHERE event_type='own_goal'
                       (+ xref_match / xref_team / xref_player season+league JOINs)
 
@@ -152,13 +152,13 @@ def _create_schemas(duck_conn):
         """
         CREATE TABLE gold_fct_shot (
             shot_id                       VARCHAR,
-            match_id_canonical            VARCHAR,
-            team_id_canonical             VARCHAR,
-            player_id_canonical           VARCHAR,
-            assist_player_id_canonical    VARCHAR,
+            match_id                      VARCHAR,
+            team_id                       VARCHAR,
+            player_id                     VARCHAR,
+            assist_player_id              VARCHAR,
             minute                        INTEGER,
-            result_canonical              VARCHAR,
-            situation_canonical           VARCHAR,
+            result                        VARCHAR,
+            situation                     VARCHAR,
             league                        VARCHAR,
             season                        VARCHAR
         )
@@ -229,7 +229,7 @@ class TestUnionAndOwnGoalSplit:
     """3 regular goals + 2 own goals → 5 rows, correct is_own_goal split."""
 
     def test_full_corpus_union(self, duck_conn):
-        # ---- Regular goals (fct_shot WHERE result_canonical='goal') ----
+        # ---- Regular goals (fct_shot WHERE result='goal') ----
         # Per spec: 3 regular goals (1 normal, 1 penalty, 1 of a same-minute
         # brace via the multi-goal-same-minute pk_tiebreaker scenario). The
         # brace is exercised separately in TestPkUniqueness; here we want
@@ -240,7 +240,7 @@ class TestUnionAndOwnGoalSplit:
               -- 1) normal goal
               ('S1', 'M1', 'team_home', 'P1', 'P2', 22, 'goal', 'open_play',
                'ENG-Premier League', '2425'),
-              -- 2) penalty goal (situation_canonical='penalty')
+              -- 2) penalty goal (situation='penalty')
               ('S2', 'M1', 'team_away', 'P3', NULL, 67, 'goal', 'penalty',
                'ENG-Premier League', '2425'),
               -- 3) third goal — different match

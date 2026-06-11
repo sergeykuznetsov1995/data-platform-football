@@ -3,8 +3,8 @@
 Issue #46: per-match wide витрина cross-source (FBref+SofaScore+Understat+
 WhoScored). FBref-spine; HARD_FACT метрики через variadic COALESCE;
 MODELED xG/xA — single column через COALESCE(us → ss); audit-diff
-вынесены в `gold.fct_player_match_audit`. PK = `(match_id_canonical,
-player_id_canonical)` (natural composite — обе компоненты non-NULL по
+вынесены в `gold.fct_player_match_audit`. PK = `(match_id, player_id)`
+(#426 star design §4.4; natural composite — обе компоненты non-NULL по
 конструкции FBref-spine, поэтому НИКАКОГО `xxhash64` PK).
 
 Шаблон — `test_fct_player_season_stats_render.py`, адаптированный
@@ -114,12 +114,12 @@ class TestFctPlayerMatchSql:
         ), "fct_player_match.sql must NOT convert season slug→year-start (#404)"
 
     def test_grain_columns_present(self):
-        """PK match-grain: (match_id_canonical, player_id_canonical).
-        Plus team_id_canonical и league/season для partition."""
+        """PK match-grain: (match_id, player_id) — #426 star design §4.4.
+        Plus team_id и league/season для partition."""
         sql = _read_sql()
         for col in [
-            "match_id_canonical",
-            "player_id_canonical",
+            "match_id",
+            "player_id",
             "league",
             "season",
         ]:
@@ -128,14 +128,14 @@ class TestFctPlayerMatchSql:
             )
 
     def test_no_xxhash_pk(self):
-        """PK = natural composite `(match_id_canonical, player_id_canonical)` —
+        """PK = natural composite `(match_id, player_id)` —
         ОБЕ компоненты non-NULL по конструкции FBref-spine. Hash PK не
         нужен; xxhash64 запрещён (избыточная сложность, NULL-collision risk
         из feedback_hash_pk_with_null_canonical.md)."""
         sql = _strip_comments(_read_sql())
         assert not re.search(r"\bxxhash64\b", sql, re.IGNORECASE), (
             "fct_player_match must NOT use xxhash64 PK — natural composite "
-            "(match_id_canonical, player_id_canonical) is non-NULL by FBref-spine"
+            "(match_id, player_id) is non-NULL by FBref-spine"
         )
 
     def test_hard_fact_coalesce_columns(self):
@@ -145,7 +145,7 @@ class TestFctPlayerMatchSql:
         AS <alias>. Outer CAST(... AS BIGINT) wrapper допустим."""
         sql = _read_sql()
         hard_facts = [
-            ("minutes", "minutes"),
+            ("minutes", "minutes_played"),
             ("goals", "goals"),
             ("assists", "assists"),
             ("yellow_cards", "yellow_cards"),
@@ -166,8 +166,8 @@ class TestFctPlayerMatchSql:
         cascade только us→ss. Per-source suffix колонки в business-fct
         ЗАПРЕЩЕНЫ."""
         sql = _read_sql()
-        # Single-column expected_goals + expected_assists.
-        for col in ("expected_goals", "expected_assists"):
+        # Single-column xg + xa (#426 design names).
+        for col in ("xg", "xa"):
             assert re.search(rf"\bAS\s+{col}\b", sql, re.IGNORECASE), (
                 f"`{col}` must be projected as a single COALESCE column"
             )
