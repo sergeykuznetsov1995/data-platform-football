@@ -1284,6 +1284,74 @@ def validate_gold_quality() -> Dict[str, Any]:
         ),
 
         # ============================================================
+        # #429: fct_manager_stint — SCD-2 employment history (the stint
+        # table that moved out of dim_manager in #433). One row per
+        # (manager × team × stint), closed-open [valid_from, valid_to).
+        # ============================================================
+        # PK uniqueness — valid_from distinguishes returning managers
+        # (Mourinho-Chelsea-2004 vs Mourinho-Chelsea-2013).
+        CHECK.no_duplicates(
+            'gold.fct_manager_stint',
+            pk=['manager_id', 'team_id', 'valid_from'],
+        ),
+        CHECK.no_nulls(
+            'gold.fct_manager_stint',
+            cols=['manager_id', 'team_id', 'valid_from', 'matches_in_charge'],
+        ),
+        # For a single team at any date there is at most ONE active manager.
+        # Adjacent stints sharing an endpoint are OK (closed-open intervals).
+        CHECK.scd2_no_overlap(
+            'gold.fct_manager_stint',
+            pk_cols=['team_id'],
+        ),
+        # Interval sanity: a stint can never end before it starts (DoD).
+        CHECK.row_count(
+            'gold.fct_manager_stint', min_rows=0, max_rows=0,
+            where='valid_to < valid_from',
+            name='valid_to_before_valid_from[fct_manager_stint]',
+        ),
+        # Soft FK → star dims. Both ids come from the same xref tables the
+        # dims are built from, so ERROR severity holds by construction.
+        CHECK.ref_integrity('gold.fct_manager_stint', 'gold.dim_manager',
+                            'manager_id'),
+        CHECK.ref_integrity('gold.fct_manager_stint', 'gold.dim_team',
+                            'team_id'),
+
+        # ============================================================
+        # #429: fct_transfer — player transfers, pure projection of
+        # silver.transfermarkt_transfers. Orphan rows are KEPT with
+        # 'tm_'-prefixed ids (≈18% players, most clubs) — FK checks to
+        # dims are therefore WARNING-severity (dim_match referee/venue
+        # precedent), and the orphan share itself is monitored below.
+        # ============================================================
+        CHECK.no_duplicates(
+            'gold.fct_transfer',
+            pk=['player_id', 'transfer_date', 'from_team_id', 'to_team_id'],
+        ),
+        CHECK.no_nulls(
+            'gold.fct_transfer',
+            cols=['player_id', 'transfer_date', 'from_team_id', 'to_team_id',
+                  'is_loan', 'is_upcoming'],
+        ),
+        CHECK.ref_integrity('gold.fct_transfer', 'gold.dim_player',
+                            'player_id', severity='WARNING'),
+        CHECK.ref_integrity('gold.fct_transfer', 'gold.dim_team',
+                            'from_team_id', parent_key='team_id',
+                            severity='WARNING'),
+        CHECK.ref_integrity('gold.fct_transfer', 'gold.dim_team',
+                            'to_team_id', parent_key='team_id',
+                            severity='WARNING'),
+        # Orphan-player share: live baseline 136/750 ≈ 18% on APL '2526'
+        # (above the ≈10% design estimate — measured 2026-06-11). Ceiling
+        # 200 ≈ 27% leaves headroom; breach = xref_player coverage broke.
+        CHECK.row_count(
+            'gold.fct_transfer', min_rows=0, max_rows=200,
+            where="player_id LIKE 'tm\\_%' ESCAPE '\\'",
+            severity='WARNING',
+            name='orphan_players[fct_transfer]',
+        ),
+
+        # ============================================================
         # #425: dim_match — soft FK to every star dim. Team FKs are ERROR
         # (xref_team coverage is complete by construction); referee / venue /
         # manager FKs are WARNING for the first runs — LEFT JOIN coverage
@@ -2400,6 +2468,14 @@ def validate_gold_row_counts() -> Dict[str, Any]:
         # dim_manager (#425): one row per manager. APL history counts
         # ~30-50+ distinct head coaches; floor 20 still catches an empty table.
         CHECK.row_count('gold.dim_manager',   min_rows=20),
+        # fct_manager_stint (#429): one row per (manager × team × stint) —
+        # the SCD-2 history that moved out of dim_manager. APL 9+ seasons of
+        # managerial churn ≈ 50-200 stints; floor 20 catches an empty/broken
+        # build while tolerating partial bronze coverage.
+        CHECK.row_count('gold.fct_manager_stint', min_rows=20),
+        # fct_transfer (#429): pure projection of silver.transfermarkt_transfers
+        # — baseline 750 rows (APL '2526', measured 2026-06-11); floor 500.
+        CHECK.row_count('gold.fct_transfer',  min_rows=500),
         # fct_standings (#428, ex-dim_standings): at least one snapshot of the
         # current 18-team table (relaxed to 18 to cover early-season / partial
         # loads — historical snapshots will multiply this by season).

@@ -215,6 +215,18 @@ STAGE_3_FACTS = [
     # mechanism can't guard bronze sources anyway (fct_card precedent).
     ('fct_match_timeline', 'dags/sql/gold/fct_match_timeline.sql',
      'fct_match_timeline', ['league', 'season']),
+    # issue #429: SCD-2 manager employment history (stint = continuous run of
+    # matches, islands-and-gaps over bronze.fbref_match_managers). Resurrected
+    # from the pre-#433 dim_manager. Unpartitioned: ~50-200 rows, a stint may
+    # span seasons. No STAGE_3_FALLBACKS entry: bronze sources can't be
+    # guarded by require_silver (fct_match_timeline precedent).
+    ('fct_manager_stint', 'dags/sql/gold/fct_manager_stint.sql',
+     'fct_manager_stint', None),
+    # issue #429: player transfers — pure projection of
+    # silver.transfermarkt_transfers with 'tm_'-prefixed orphan ids (≈18%
+    # players, most clubs unresolved). Unpartitioned: ~750 rows APL '2526'.
+    ('fct_transfer', 'dags/sql/gold/fct_transfer.sql',
+     'fct_transfer', None),
 ]
 
 # Tables in STAGE_3 with optional Silver sources. Same mechanism as
@@ -229,6 +241,13 @@ STAGE_3_FALLBACKS = {
     'fct_player_market_value': {
         'fallback_sql_file': 'dags/sql/gold/fct_player_market_value_empty.sql',
         'require_silver':    ['fotmob_player_market_value_history'],
+    },
+    # issue #429: Transfermarkt Silver строится отдельным DAG'ом
+    # (dag_transform_transfermarkt_silver) и может отсутствовать в env без
+    # TM ingest. Fallback держит контракт пустой таблицы.
+    'fct_transfer': {
+        'fallback_sql_file': 'dags/sql/gold/fct_transfer_empty.sql',
+        'require_silver':    ['transfermarkt_transfers'],
     },
 }
 
