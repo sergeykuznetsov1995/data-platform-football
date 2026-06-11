@@ -859,6 +859,90 @@ class TestIsIcebergInvalidMetadata:
             assert _is_iceberg_invalid_metadata(error) is False
 
 
+class TestExecuteDdlErrorPropagation:
+    """Tests for _execute(fetch=False) error propagation (#456).
+
+    Trino surfaces runtime failures (ICEBERG_COMMIT_ERROR, OOM, dead worker)
+    while polling results — i.e. inside cursor.fetchall(). Swallowing them
+    turns a failed DELETE/INSERT into a silent success and lets
+    insert_dataframe_atomic drop the only copy of the data."""
+
+    def test_execute_raises_when_dml_poll_fails(self):
+        """A Trino error raised during the consuming fetchall() must propagate
+        as TrinoError, not be swallowed into a silent success."""
+        with patch.dict('sys.modules', {'trino': MagicMock(), 'trino.dbapi': MagicMock()}):
+            from scrapers.base.trino_manager import TrinoTableManager, TrinoError
+
+            manager = TrinoTableManager()
+            mock_cursor = MagicMock()
+            mock_cursor.fetchall.side_effect = Exception(
+                "ICEBERG_COMMIT_ERROR: Failed to commit during write"
+            )
+            mock_conn = MagicMock()
+            mock_conn.cursor.return_value = mock_cursor
+            manager._conn = mock_conn
+
+            with pytest.raises(TrinoError, match="ICEBERG_COMMIT_ERROR"):
+                manager._execute(
+                    "DELETE FROM iceberg.bronze.test_table WHERE league = 'X'"
+                )
+
+    def test_execute_preserves_cause_chain_on_poll_fail(self):
+        """The original error stays on __cause__, so the iceberg_writer
+        metadata-recovery path also sees poll-phase metadata errors."""
+        with patch.dict('sys.modules', {'trino': MagicMock(), 'trino.dbapi': MagicMock()}):
+            from scrapers.base.trino_manager import (
+                TrinoTableManager, TrinoError, _is_iceberg_invalid_metadata,
+            )
+
+            poll_error = Exception("Error accessing metadata file")
+            poll_error.error_name = 'ICEBERG_INVALID_METADATA'
+
+            manager = TrinoTableManager()
+            mock_cursor = MagicMock()
+            mock_cursor.fetchall.side_effect = poll_error
+            mock_conn = MagicMock()
+            mock_conn.cursor.return_value = mock_cursor
+            manager._conn = mock_conn
+
+            with pytest.raises(TrinoError) as exc_info:
+                manager._execute("DROP TABLE iceberg.bronze.test_table")
+
+            assert exc_info.value.__cause__ is poll_error
+            assert _is_iceberg_invalid_metadata(exc_info.value) is True
+
+    def test_execute_retries_on_connection_error_during_fetch(self):
+        """A connection error during the consuming fetchall() goes through the
+        existing reset-and-retry-once path instead of being swallowed."""
+        with patch.dict('sys.modules', {'trino': MagicMock(), 'trino.dbapi': MagicMock()}):
+            from scrapers.base.trino_manager import TrinoTableManager
+
+            manager = TrinoTableManager()
+
+            mock_cursor_bad = MagicMock()
+            mock_cursor_bad.fetchall.side_effect = Exception("Connection reset")
+            mock_conn1 = MagicMock()
+            mock_conn1.cursor.return_value = mock_cursor_bad
+
+            mock_cursor_good = MagicMock()
+            mock_cursor_good.fetchall.return_value = []
+            mock_conn2 = MagicMock()
+            mock_conn2.cursor.return_value = mock_cursor_good
+
+            manager._conn = mock_conn1
+
+            with patch.object(manager, '_connect_with_retry') as mock_retry:
+                def set_good_conn():
+                    manager._conn = mock_conn2
+                mock_retry.side_effect = set_good_conn
+
+                result = manager._execute("DELETE FROM iceberg.bronze.test_table")
+
+            assert result is None
+            mock_retry.assert_called_once()
+            mock_cursor_good.fetchall.assert_called_once()
+
+
 class TestTrinoTableManagerConnectionRetry:
     """Tests for connection retry logic."""
 
