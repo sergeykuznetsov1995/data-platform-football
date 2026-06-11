@@ -41,16 +41,17 @@ def test_renders_valid_sql(sql_text: str) -> None:
 
 
 def test_pk_uniqueness_logic(sql_text: str) -> None:
-    """Per-(player, season) appearance ranking via ROW_NUMBER over (date, match_id)."""
+    """Per-(player, season) appearance ranking via ROW_NUMBER over
+    (match_date, match_id) — #425: dim_match renamed date -> match_date."""
     pattern = re.compile(
         r"ROW_NUMBER\s*\(\s*\)\s*OVER\s*\(\s*"
         r"PARTITION\s+BY\s+pm\.player_id\s*,\s*pm\.season\s+"
-        r"ORDER\s+BY\s+dm\.date\s*,\s*pm\.match_id",
+        r"ORDER\s+BY\s+dm\.match_date\s*,\s*pm\.match_id",
         re.IGNORECASE | re.DOTALL,
     )
     assert pattern.search(sql_text), (
         "Expected ROW_NUMBER() OVER (PARTITION BY pm.player_id, pm.season "
-        "ORDER BY dm.date, pm.match_id) — appearance_rn drives PK + L5 mask"
+        "ORDER BY dm.match_date, pm.match_id) — appearance_rn drives PK + L5 mask"
     )
 
 

@@ -1,0 +1,30 @@
+# =============================================================================
+# OpenMetadata description: iceberg.gold.dim_manager
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.gold.dim_manager
+  description: |
+    Канонический справочник тренеров (звёздный дизайн, #425). Одна строка =
+    один тренер. PK — canonical_id из silver.xref_manager (FBref + FotMob).
+    История работы («кто когда тренировал какую команду») здесь НЕ хранится —
+    она уезжает в gold.fct_manager_stint (#429); прежняя SCD-2 версия этой
+    таблицы доступна в git-истории dim_manager.sql. nationality/dob — NULL-
+    заглушки до появления источника.
+  tags:
+    - Tier.Gold
+    - Domain.Football
+    - PII.Low
+columns:
+  - name: manager_id
+    description: PK — canonical_id из silver.xref_manager.
+  - name: manager_name
+    description: Имя тренера (приоритет FBref display_name). PII.Low — публично известное лицо.
+    tags:
+      - PII.Low
+  - name: nationality
+    description: Гражданство тренера. NULL-заглушка — источника нет; обогащение — отдельная задача.
+  - name: dob
+    description: Дата рождения тренера. NULL-заглушка — источника нет; обогащение — отдельная задача.
+  - name: _silver_created_at
+    description: Технический timestamp создания строки CTAS-раннером.
+relationships: []

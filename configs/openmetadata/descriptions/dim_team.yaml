@@ -4,20 +4,25 @@
 table:
   fullyQualifiedName: trino_iceberg.iceberg.gold.dim_team
   description: |
-    Канонический справочник команд. Одна строка на (team_id, league, season),
-    что позволяет отражать перемещения команды между лигами (промоушн/релегейшн).
-    Используется как FK target из fct_match (home/away), fct_team_match,
-    feat_team_form и feat_team_h2h.
+    Канонический справочник клубов (звёздный дизайн, #425). Одна строка =
+    один клуб (league/season в грейне НЕТ — в каких лигах/сезонах команда
+    играла, видно из фактов; вылеты/выходы — события, не атрибуты). Spine —
+    silver.xref_team (source='fbref'), атрибуты team_name/country/short_name —
+    из configs/medallion/team_aliases.yaml. Используется как FK target из
+    dim_match (home/away), fct_team_match, feat_team_*.
   tags:
     - Tier.Gold
     - Domain.Football
     - PII.None
 columns:
   - name: team_id
-    description: Канонический ID команды (нормализованное имя из silver.xref_team).
+    description: PK — канонический слаг клуба ('manchester_united') из silver.xref_team / team_aliases.yaml.
   - name: team_name
-    description: Полное имя команды как в источнике (например 'Manchester United').
-  - name: league
-    description: Лига сезона.
-  - name: season
-    description: Сезон; команда может присутствовать в нескольких сезонах.
+    description: Каноническое имя клуба (Wikipedia convention, из team_aliases.yaml; fallback — display_name xref).
+  - name: country
+    description: Страна клуба (из team_aliases.yaml; 'England' / 'Wales' для текущего APL-набора).
+  - name: short_name
+    description: Короткое display-имя ('Wolves', 'Spurs') из team_aliases.yaml.
+  - name: _silver_created_at
+    description: Технический timestamp создания строки CTAS-раннером.
+relationships: []

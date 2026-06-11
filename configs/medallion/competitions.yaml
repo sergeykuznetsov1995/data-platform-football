@@ -15,6 +15,7 @@
 # Field reference:
 #   id                — competition slug, совпадает с Bronze.league string
 #   name              — human-readable name
+#   country           — страна лиги ('Europe' для UEFA-турниров); → gold.dim_competition
 #   tier              — 1 = top flight (only tier=1 currently)
 #   seasons           — list of {id, format, team_count, start, end}
 #   sources.primary   — sources с >80% coverage (R0.1 verdict)
@@ -26,8 +27,37 @@
 competitions:
   - id: "ENG-Premier League"
     name: "English Premier League"
+    country: "England"
     tier: 1
     seasons:
+      # 1617-2021: исторические сезоны, даты = MIN/MAX(match_date) из
+      # фактически загруженного FBref-расписания (#425 — dim_season обязан
+      # покрывать все сезоны dim_match, FK season -> dim_season.season).
+      - id: 1617
+        format: "league_round_robin"
+        team_count: 20
+        start: "2016-08-13"
+        end: "2017-05-21"
+      - id: 1718
+        format: "league_round_robin"
+        team_count: 20
+        start: "2017-08-11"
+        end: "2018-05-13"
+      - id: 1819
+        format: "league_round_robin"
+        team_count: 20
+        start: "2018-08-10"
+        end: "2019-05-12"
+      - id: 1920
+        format: "league_round_robin"
+        team_count: 20
+        start: "2019-08-09"
+        end: "2020-07-26"
+      - id: 2021
+        format: "league_round_robin"
+        team_count: 20
+        start: "2020-09-12"
+        end: "2021-05-23"
       - id: 2122
         format: "league_round_robin"
         team_count: 20
@@ -66,6 +96,7 @@ competitions:
 
   - id: "EUR-Champions League"
     name: "UEFA Champions League"
+    country: "Europe"
     tier: 1
     seasons: []
     sources:
@@ -76,6 +107,7 @@ competitions:
 
   - id: "ESP-La Liga"
     name: "Spanish La Liga"
+    country: "Spain"
     tier: 1
     seasons: []
     sources:
@@ -86,6 +118,7 @@ competitions:
 
   - id: "ITA-Serie A"
     name: "Italian Serie A"
+    country: "Italy"
     tier: 1
     seasons: []
     sources:
@@ -96,6 +129,7 @@ competitions:
 
   - id: "GER-Bundesliga"
     name: "German Bundesliga"
+    country: "Germany"
     tier: 1
     seasons: []
     sources:
@@ -106,6 +140,7 @@ competitions:
 
   - id: "FRA-Ligue 1"
     name: "French Ligue 1"
+    country: "France"
     tier: 1
     seasons: []
     sources:
@@ -116,6 +151,7 @@ competitions:
 
   - id: "NED-Eredivisie"
     name: "Dutch Eredivisie"
+    country: "Netherlands"
     tier: 1
     seasons: []
     sources:
@@ -126,6 +162,7 @@ competitions:
 
   - id: "EUR-Europa League"
     name: "UEFA Europa League"
+    country: "Europe"
     tier: 1
     seasons: []
     sources:

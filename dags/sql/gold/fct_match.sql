@@ -27,20 +27,24 @@
 -- =============================================================================
 
 SELECT
+    -- #425: dim_match slimmed to the star "passport". Output schema of
+    -- fct_match is UNCHANGED (downstream predictions_input / train / test
+    -- read m.*): date keeps its name via alias, team names come from the
+    -- Silver spine, total_goals/btts are derived from the score in place.
     dm.match_id,
-    dm.date,
+    dm.match_date              AS date,
     dm.gameweek,
     dm.home_team_id,
     dm.away_team_id,
-    dm.home_team_name,
-    dm.away_team_name,
+    sm.home                    AS home_team_name,
+    sm.away                    AS away_team_name,
 
     -- ========= ML targets =========
     dm.home_score,
     dm.away_score,
     dm.result_1x2,
-    dm.total_goals,
-    dm.btts,
+    dm.home_score + dm.away_score                  AS total_goals,
+    (dm.home_score > 0 AND dm.away_score > 0)      AS btts,
     dm.is_completed,
 
     -- ========= Home team pre-match form (last 5) =========
@@ -152,6 +156,9 @@ SELECT
     dm.season
 
 FROM iceberg.gold.dim_match dm
+-- Team display names (FBref short form) — dim_match no longer carries them.
+LEFT JOIN iceberg.silver.fbref_match_enriched sm
+    ON sm.match_id = dm.match_id
 LEFT JOIN iceberg.gold.feat_team_form hf
     ON hf.match_id = dm.match_id AND hf.team_id = dm.home_team_id
 LEFT JOIN iceberg.gold.feat_team_form af

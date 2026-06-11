@@ -149,7 +149,7 @@ class TestDimVenueLogic:
         brentford (2 spellings merge), one orphan. NULL/'   ' filtered."""
         assert len(gold_rows) == 6, (
             f"expected 6 venues, got {len(gold_rows)}: "
-            f"{[(r['venue_id'], r['venue_canonical']) for r in gold_rows]}"
+            f"{[(r['venue_id'], r['venue_name']) for r in gold_rows]}"
         )
 
     def test_curated_venue_id_is_yaml_slug(self, gold_rows):
@@ -157,9 +157,11 @@ class TestDimVenueLogic:
         etihad = _by_id(gold_rows, "venue_etihad")
         assert len(etihad) == 1
         assert etihad[0]["venue_source"] == "curated"
-        assert etihad[0]["venue_canonical"] == "Etihad Stadium"
+        assert etihad[0]["venue_name"] == "Etihad Stadium"
         assert etihad[0]["city"] == "Manchester"
         assert etihad[0]["country"] == "England"
+        # capacity has no source yet (issue #425) — NULL placeholder.
+        assert etihad[0]["capacity"] is None
 
     def test_two_spellings_merge_into_one_venue(self, gold_rows):
         """Core #145: 'Gtech Community Stadium' (FBref) and 'Brentford Community
@@ -167,9 +169,7 @@ class TestDimVenueLogic:
         brentford = _by_id(gold_rows, "venue_brentford")
         assert len(brentford) == 1, "two spellings must merge into one row"
         row = brentford[0]
-        assert row["venue_canonical"] == "Gtech Community Stadium"
-        assert row["venue_fbref"] == "Gtech Community Stadium"
-        assert row["venue_espn"] == "Brentford Community Stadium"
+        assert row["venue_name"] == "Gtech Community Stadium"
         assert row["venue_source"] == "curated"
 
     def test_mixed_case_folds(self, gold_rows):
@@ -182,7 +182,7 @@ class TestDimVenueLogic:
         orphans = [r for r in gold_rows if r["venue_source"] == "orphan"]
         assert len(orphans) == 1
         row = orphans[0]
-        assert row["venue_canonical"] == "New Orphan Park"
+        assert row["venue_name"] == "New Orphan Park"
         assert row["venue_id"].startswith("venue_")
         assert row["venue_id"] not in {
             "venue_etihad", "venue_anfield", "venue_old_trafford",
@@ -199,13 +199,10 @@ class TestDimVenueLogic:
                 assert r["country"] is not None, f"curated venue NULL country: {r}"
 
     def test_canonical_completeness_contract(self, gold_rows):
-        """R0.4: every row has non-NULL canonical/source/version = 'v2'."""
+        """Every row has a non-NULL venue_name and a valid venue_source."""
         for r in gold_rows:
-            assert r["venue_canonical"] is not None, f"NULL canonical: {r}"
+            assert r["venue_name"] is not None, f"NULL venue_name: {r}"
             assert r["venue_source"] in {"curated", "orphan"}, f"bad source: {r}"
-            assert r["venue_version"] == "v2", (
-                f"venue_version must be 'v2', got: {r['venue_version']!r}"
-            )
 
     def test_venue_id_unique(self, gold_rows):
         """PK: venue_id unique across the dimension."""
@@ -213,7 +210,7 @@ class TestDimVenueLogic:
         assert len(ids) == len(set(ids)), f"duplicate venue_id: {ids}"
 
     def test_null_and_empty_venues_filtered(self, gold_rows):
-        canonicals = {r["venue_canonical"] for r in gold_rows}
-        assert None not in canonicals
-        assert "" not in canonicals
-        assert "   " not in canonicals
+        names = {r["venue_name"] for r in gold_rows}
+        assert None not in names
+        assert "" not in names
+        assert "   " not in names

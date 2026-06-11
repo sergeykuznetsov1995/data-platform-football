@@ -1,38 +1,26 @@
 -- =============================================================================
 -- Gold: dim_competition  (Jinja template, rendered by dim_loaders.py)
 -- =============================================================================
--- Static dimension of football competitions. One row per competition_id.
--- Sourced from `scrapers/sources/leagues.yaml:metadata` so config IS the SoT.
+-- Static dimension of football competitions. One row per league (incl. stubs
+-- for not-yet-ingested leagues — a dictionary lists what exists, not what we
+-- already scraped). Aligned to the star-schema design (issue #425).
 --
--- Source:       configs/sources/leagues.yaml -> rendered into VALUES rows by
---               dags/utils/dim_loaders.py::render_dim_competition_sql()
--- PK:           competition_id  (slug, e.g. 'eng_premier_league')
--- Partitioning: NONE  (5-row config-driven dim)
+-- Source:       configs/medallion/competitions.yaml -> rendered into VALUES
+--               rows by dags/utils/dim_loaders.py::render_dim_competition_sql()
+-- PK:           league  (slug, e.g. 'ENG-Premier League' — same value as the
+--               `league` column on every fact, so JOINs need no mapping)
+-- Partitioning: NONE  (8-row config-driven dim)
 --
--- Source-of-truth selection (R0.4 schema versioning):
---   competition_canonical = competition_name (config label)
---   competition_source    = 'config'         (no other source available)
---   competition_version   = 'v1'             (frozen until config schema changes)
---
--- The {{ rows }} placeholder is substituted by render_dim_competition_sql() in
--- Phase C; one tuple per league listed in leagues.yaml:metadata.
+-- The {{ rows }} placeholder is substituted by render_dim_competition_sql();
+-- one tuple per competition listed in competitions.yaml.
 -- Each tuple MUST follow the column order declared in the AS t(...) clause.
 -- =============================================================================
 
 select * from (values
 {{ rows }}
 ) as t(
-    competition_id,           -- PK, slug e.g. 'eng_premier_league'
-    competition_name,         -- e.g. 'ENG-Premier League' (matches dags/utils/config.py:LEAGUES)
-    country,                  -- e.g. 'England'
-    competition_level,        -- 1 = top flight
-    n_teams,                  -- e.g. 20
-    matches_per_season,       -- e.g. 380
-    fbref_id,                 -- FBref league id (integer)
-    whoscored_id,             -- WhoScored league id (integer)
-    sofascore_id,             -- SofaScore league id (integer)
-    espn_id,                  -- ESPN league code (e.g. 'eng.1')
-    competition_canonical,    -- == competition_name
-    competition_source,       -- 'config'
-    competition_version       -- 'v1'
+    league,                   -- PK, slug e.g. 'ENG-Premier League'
+    competition_name,         -- e.g. 'English Premier League'
+    country,                  -- e.g. 'England' ('Europe' for UEFA cups)
+    tier                      -- 1 = top flight
 )

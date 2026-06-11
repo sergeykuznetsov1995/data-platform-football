@@ -998,8 +998,10 @@ def validate_gold_quality() -> Dict[str, Any]:
     checks = [
         # ========== PK uniqueness — ERROR ==========
         CHECK.no_duplicates('gold.dim_match',        pk=['match_id']),
-        CHECK.no_duplicates('gold.dim_team',         pk=['team_id', 'season']),
-        CHECK.no_duplicates('gold.dim_player',       pk=['player_id', 'season']),
+        # #425 star grains: dim_team = one row per club, dim_player = one row
+        # per player — season is no longer part of either PK.
+        CHECK.no_duplicates('gold.dim_team',         pk=['team_id']),
+        CHECK.no_duplicates('gold.dim_player',       pk=['player_id']),
         CHECK.no_duplicates('gold.fct_team_match',   pk=['match_id', 'team_id']),
         # issue #46: fct_player_match теперь multi-source, PK переименована
         # match_id → match_id_canonical, player_id → player_id_canonical.
@@ -1021,7 +1023,7 @@ def validate_gold_quality() -> Dict[str, Any]:
         CHECK.no_duplicates('gold.sofascore_team_season', pk=['team_id', 'league', 'season']),
 
         # ========== No NULLs in PKs — ERROR ==========
-        CHECK.no_nulls('gold.dim_match',       cols=['match_id', 'date']),
+        CHECK.no_nulls('gold.dim_match',       cols=['match_id', 'match_date']),
         CHECK.no_nulls('gold.fct_team_match',  cols=['match_id', 'team_id', 'opponent_id']),
         # match_outcomes is the source-of-truth for ML labels — PK + temporal
         # keys MUST be present, otherwise downstream backtests silently misalign.
@@ -1154,22 +1156,23 @@ def validate_gold_quality() -> Dict[str, Any]:
         CHECK.no_duplicates('gold.dim_referee',     pk=['referee_id']),
         # Composite PK — one standings row per (league, season, team).
         CHECK.no_duplicates('gold.dim_standings',   pk=['league', 'season', 'team_id']),
-        CHECK.no_duplicates('gold.dim_competition', pk=['competition_id']),
-        CHECK.no_duplicates('gold.dim_season',      pk=['season_id']),
+        # #425: PK renamed to the design keys — league slug / season slug.
+        CHECK.no_duplicates('gold.dim_competition', pk=['league']),
+        CHECK.no_duplicates('gold.dim_season',      pk=['season']),
 
         # ----- E2: NOT NULL on PKs + critical attrs — ERROR -----
-        CHECK.no_nulls('gold.dim_venue',       cols=['venue_id', 'venue_canonical']),
-        CHECK.no_nulls('gold.dim_referee',     cols=['referee_id', 'referee_canonical']),
+        CHECK.no_nulls('gold.dim_venue',       cols=['venue_id', 'venue_name']),
+        CHECK.no_nulls('gold.dim_referee',     cols=['referee_id', 'referee_name']),
         # dim_standings has no canonical column — its source-tracking is via
         # team_id_source (covered by the coverage check below). Here we just
         # guarantee the PK trio + the load-bearing numeric attrs are present.
         CHECK.no_nulls('gold.dim_standings',
                        cols=['league', 'season', 'team_id', 'points', 'mp']),
         CHECK.no_nulls('gold.dim_competition',
-                       cols=['competition_id', 'competition_name']),
+                       cols=['league', 'competition_name', 'country']),
         CHECK.no_nulls('gold.dim_season',
-                       cols=['season_id', 'season_start_year',
-                             'valid_from', 'valid_to']),
+                       cols=['season', 'season_name',
+                             'start_date', 'end_date']),
 
         # ----- E2: ref_integrity dim_standings.team_id → dim_team — WARNING -----
         # Soft FK: rows whose team_id_source='sofascore_orphan' are intentionally
@@ -1190,17 +1193,9 @@ def validate_gold_quality() -> Dict[str, Any]:
             name='ref_integrity[dim_standings.team_id->dim_team]',
         ),
 
-        # ----- E2: schema-versioning completeness (R0.4) — ERROR -----
-        # Every row with a non-NULL <base>_canonical MUST also carry
-        # <base>_source and <base>_version. Catches schema regressions
-        # where a CTAS forgets to populate the trio.
-        # NB: dim_competition / dim_season are intentionally included even
-        # though their canonical = literal column — serves as a regression
-        # guard for future v2 schema bumps.
-        CHECK.canonical_completeness('gold.dim_venue',       'venue_canonical'),
-        CHECK.canonical_completeness('gold.dim_referee',     'referee_canonical'),
-        CHECK.canonical_completeness('gold.dim_competition', 'competition_canonical'),
-        CHECK.canonical_completeness('gold.dim_season',      'season_canonical'),
+        # NB (#425): the R0.4 canonical/source/version trio left the slim
+        # star dims — the canonical_completeness checks went with it. Only
+        # dim_venue keeps venue_source (feeds the orphan-rate check below).
 
         # ----- E2: dim_venue alias coverage / dup report (issue #145) — WARNING -----
         # Every venue whose raw name failed to match venue_aliases.yaml falls
@@ -1229,51 +1224,45 @@ def validate_gold_quality() -> Dict[str, Any]:
                           min_val=1, max_val=24,  severity='WARNING'),
 
         # ============================================================
-        # E2 Phase 1.5: dim_manager — SCD-2 head-coach dimension
-        # (one row per manager × team × stint). Source =
-        # silver.xref_manager × silver.xref_team × bronze.fbref_match_managers.
+        # dim_manager — plain per-manager dictionary since #425 (the SCD-2
+        # stint table moved out; it returns as fct_manager_stint in #429,
+        # together with its scd2_no_overlap check — the primitive stays in
+        # data_quality.py).
         # ============================================================
-
-        # ----- dim_manager: PK uniqueness — ERROR -----
-        # Composite PK: (manager_id_canonical, team_id_canonical, valid_from).
-        # The triple distinguishes returning managers (Mourinho-Chelsea-2004
-        # vs Mourinho-Chelsea-2013) which share the first two components.
-        CHECK.no_duplicates(
-            'gold.dim_manager',
-            pk=['manager_id_canonical', 'team_id_canonical', 'valid_from'],
-        ),
-
-        # ----- dim_manager: NOT NULL on PKs + display_name — ERROR -----
-        CHECK.no_nulls(
-            'gold.dim_manager',
-            cols=['manager_id_canonical', 'team_id_canonical',
-                  'valid_from', 'display_name'],
-        ),
-
-        # ----- dim_manager: SCD-2 timeline integrity — ERROR -----
-        # Closed-open intervals [valid_from, valid_to). For a single team
-        # at any given date there can be at most ONE active manager.
-        # Adjacent stints sharing an endpoint are OK.
-        CHECK.scd2_no_overlap(
-            'gold.dim_manager',
-            pk_cols=['team_id_canonical'],
-        ),
-
-        # ----- dim_manager: ref_integrity → silver.xref_manager — ERROR -----
+        CHECK.no_duplicates('gold.dim_manager', pk=['manager_id']),
+        CHECK.no_nulls('gold.dim_manager', cols=['manager_id', 'manager_name']),
         CHECK.ref_integrity(
             'gold.dim_manager',
             'silver.xref_manager',
-            'manager_id_canonical',
+            'manager_id',
             parent_key='canonical_id',
         ),
 
-        # ----- dim_manager: ref_integrity → silver.xref_team — ERROR -----
-        CHECK.ref_integrity(
-            'gold.dim_manager',
-            'silver.xref_team',
-            'team_id_canonical',
-            parent_key='canonical_id',
-        ),
+        # ============================================================
+        # #425: dim_match — soft FK to every star dim. Team FKs are ERROR
+        # (xref_team coverage is complete by construction); referee / venue /
+        # manager FKs are WARNING for the first runs — LEFT JOIN coverage
+        # gaps leave NULLs (ignored by ref_integrity) but a non-NULL id MUST
+        # exist in its dim. Tightening to ERROR is a tracked followup.
+        # ============================================================
+        CHECK.ref_integrity('gold.dim_match', 'gold.dim_team',
+                            'home_team_id', parent_key='team_id'),
+        CHECK.ref_integrity('gold.dim_match', 'gold.dim_team',
+                            'away_team_id', parent_key='team_id'),
+        CHECK.ref_integrity('gold.dim_match', 'gold.dim_referee',
+                            'referee_id', severity='WARNING'),
+        CHECK.ref_integrity('gold.dim_match', 'gold.dim_venue',
+                            'venue_id', severity='WARNING'),
+        CHECK.ref_integrity('gold.dim_match', 'gold.dim_manager',
+                            'home_manager_id', parent_key='manager_id',
+                            severity='WARNING'),
+        CHECK.ref_integrity('gold.dim_match', 'gold.dim_manager',
+                            'away_manager_id', parent_key='manager_id',
+                            severity='WARNING'),
+        CHECK.ref_integrity('gold.dim_match', 'gold.dim_competition',
+                            'league'),
+        CHECK.ref_integrity('gold.dim_match', 'gold.dim_season',
+                            'season'),
 
         # ============================================================
         # T4: dim_player_attributes — cross-source snapshot per canonical
@@ -2286,11 +2275,14 @@ def validate_gold_row_counts() -> Dict[str, Any]:
     # Rough expectations for APL-only history (9 complete seasons + current):
     # - 3420-3800 matches in dim_match
     # - 6840-7600 rows in fct_team_match (long form: 2 per match)
-    # - ~1900-2200 player-seasons in dim_player
+    # - ~1000+ canonical players in dim_player (one row per player, #425)
     checks = [
         CHECK.row_count('gold.dim_match',        min_rows=3000),
         CHECK.row_count('gold.fct_team_match',   min_rows=6000),
-        CHECK.row_count('gold.dim_team',         min_rows=50),
+        # #425: dim_team grain = one row per CLUB (~34 incl. relegated).
+        CHECK.row_count('gold.dim_team',         min_rows=25),
+        # #425: dim_player grain = one row per player (FBref-spine canonical
+        # union across seasons stays >1000).
         CHECK.row_count('gold.dim_player',       min_rows=1000),
         # T4: cross-source attribute snapshot — one row per FBref-spine player
         # canonical_id (all seasons union). Floor ~1000 = dim_player baseline.
@@ -2335,22 +2327,21 @@ def validate_gold_row_counts() -> Dict[str, Any]:
         CHECK.row_count('gold.dim_venue',     min_rows=20),
         # dim_referee: typically ~30+ active EPL match officials across history.
         CHECK.row_count('gold.dim_referee',   min_rows=30),
-        # dim_manager: SCD-2, one row per manager × team × stint. APL has
-        # ~30-50 distinct head coaches across 8 seasons (2017-18 → 2024-25)
-        # with frequent in-season changes; ~50 stint rows is a conservative
-        # floor that still catches a wholly empty table.
+        # dim_manager (#425): one row per manager. APL history counts
+        # ~30-50+ distinct head coaches; floor 20 still catches an empty table.
         CHECK.row_count('gold.dim_manager',   min_rows=20),
         # dim_standings: at least one snapshot of the current 18-team table
         # (relaxed to 18 to cover early-season / partial loads — historical
         # snapshots will multiply this by season).
         CHECK.row_count('gold.dim_standings', min_rows=18),
-        # dim_competition: derived from leagues.yaml — currently 5 supported
-        # leagues. Hard equality (min=max=5) detects drift the moment the
-        # leagues list changes without a corresponding CTAS update.
-        CHECK.row_count('gold.dim_competition', min_rows=5, max_rows=5),
-        # dim_season: derived from SEASONS list — currently 5 seasons in
-        # rotation. Same drift-detection contract as dim_competition.
-        CHECK.row_count('gold.dim_season',      min_rows=5, max_rows=5),
+        # dim_competition (#425): one row per competitions.yaml entry —
+        # 8 today (1 in-scope + 7 stubs). Hard equality detects drift the
+        # moment the YAML changes without a corresponding re-run.
+        CHECK.row_count('gold.dim_competition', min_rows=8, max_rows=8),
+        # dim_season (#425): union of seasons across in-scope competitions
+        # in competitions.yaml — 10 APL seasons (1617..2526, full ingested
+        # history). Same drift contract.
+        CHECK.row_count('gold.dim_season',      min_rows=10, max_rows=10),
     ]
     report = run_checks(checks, raise_on_error=False)
     logger.info(f"Gold row counts: {report.summary()}")

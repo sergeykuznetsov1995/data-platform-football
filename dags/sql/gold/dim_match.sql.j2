@@ -1,0 +1,155 @@
+-- =============================================================================
+-- Gold: dim_match   (Jinja template — `.sql.j2`, rendered by dim_loaders.py)
+-- =============================================================================
+-- Match "passport" — the centre of the star (issue #425). One row per match:
+-- who played, where, when, who refereed, who coached — plus final score.
+-- All match STATISTICS live in fct_team_match, not here.
+--
+-- PK:  match_id  (canonical from silver.xref_match = FBref hex — the spine)
+-- FK:  home_team_id / away_team_id  -> dim_team     (via silver.xref_team)
+--      referee_id                   -> dim_referee  (via silver.xref_referee)
+--      venue_id                     -> dim_venue    (inline alias lookup)
+--      home_manager_id / away_manager_id -> dim_manager (via xref_manager)
+--      league -> dim_competition; season -> dim_season
+--
+-- Sources:
+--   iceberg.silver.fbref_match_enriched  (spine: date, score, venue, referee,
+--                                         attendance — slug season after #404)
+--   iceberg.silver.xref_team / xref_referee / xref_manager
+--   iceberg.bronze.fbref_match_managers  (scorebox manager per match+side)
+--
+-- venue_id: the {{ venue_aliases_values_sql }} CTE + orphan-hash formula are
+-- BYTE-IDENTICAL copies of dim_venue.sql.j2 (rendered from the same
+-- medallion_config.get_venue_alias_sql_values()), so dim_match.venue_id always
+-- matches a dim_venue PK. A JOIN on gold.dim_venue is not possible — the slim
+-- dim no longer carries raw alias spellings.
+--
+-- Every xref JOIN carries the (league, season) predicate — xref rows are
+-- per-(source, source_id, league, season); omitting it fans out 1.5-4×
+-- (memory: feedback_xref_join_season_predicate).
+--
+-- bronze.fbref_match_managers.season is a year-start BIGINT (2024) — converted
+-- to the slug ('2425') inline (#404 idiom). The bronze table carries ×2-×5
+-- duplicate scorebox rows per match — ROW_NUMBER dedup per (match_id, side).
+--
+-- Partitioning: NONE (star design: dims unpartitioned; ~1.9k rows for APL×5).
+-- =============================================================================
+
+WITH venue_aliases AS (
+    -- GROUP BY (norm, league): two alias spellings may fold to the SAME
+    -- normalised key ("St James' Park" / "St. James Park" -> 'stjamespark').
+    -- dim_venue survives that via its final GROUP BY venue_id, but here a
+    -- non-unique join key would duplicate match rows (323 PK dups observed
+    -- on first #425 build). Same-norm rows always share one canonical_id
+    -- (same stadium by construction), so MAX is exact, not a tiebreak.
+    SELECT
+        regexp_replace(
+            regexp_replace(normalize(lower(raw_name), NFD), '\p{Mn}+', ''),
+            '[^a-z0-9]+', ''
+        ) AS norm,
+        league,
+        MAX(canonical_id) AS canonical_id
+    FROM (VALUES
+        {{ venue_aliases_values_sql }}
+    ) AS t(raw_name, canonical_id, canonical_name, city, country, league)
+    GROUP BY
+        regexp_replace(
+            regexp_replace(normalize(lower(raw_name), NFD), '\p{Mn}+', ''),
+            '[^a-z0-9]+', ''
+        ),
+        league
+),
+
+managers_dedup AS (
+    SELECT
+        match_id,
+        side,
+        manager_name,
+        league,
+        -- year-start bigint -> slug ('2425'), #404 idiom.
+        LPAD(CAST(MOD(season, 100) AS varchar), 2, '0')
+            || LPAD(CAST(MOD(season + 1, 100) AS varchar), 2, '0') AS season,
+        ROW_NUMBER() OVER (
+            PARTITION BY match_id, side
+            ORDER BY manager_name
+        ) AS rn
+    FROM iceberg.bronze.fbref_match_managers
+    WHERE manager_name IS NOT NULL
+      AND manager_name <> ''
+),
+
+managers_resolved AS (
+    SELECT
+        d.match_id,
+        d.side,
+        xm.canonical_id AS manager_id
+    FROM managers_dedup d
+    INNER JOIN iceberg.silver.xref_manager xm
+        ON  xm.source    = 'fbref'
+        AND xm.source_id = d.manager_name
+        AND xm.league    = d.league
+        AND xm.season    = d.season
+    WHERE d.rn = 1
+)
+
+SELECT
+    m.match_id,
+    home_x.canonical_id  AS home_team_id,
+    away_x.canonical_id  AS away_team_id,
+    ref_x.canonical_id   AS referee_id,
+    -- Curated alias -> explicit slug; orphan -> stable normalised-name hash.
+    -- NULL venue stays NULL (future fixtures often lack a venue).
+    CASE
+        WHEN m.venue IS NULL OR TRIM(m.venue) = '' THEN NULL
+        WHEN va.canonical_id IS NOT NULL THEN va.canonical_id
+        ELSE 'venue_' || lower(to_hex(xxhash64(to_utf8(
+            regexp_replace(
+                regexp_replace(normalize(lower(trim(m.venue)), NFD), '\p{Mn}+', ''),
+                '[^a-z0-9]+', ''
+            )
+        ))))
+    END                  AS venue_id,
+    hm.manager_id        AS home_manager_id,
+    am.manager_id        AS away_manager_id,
+    m.league,
+    m.season,
+    m.date               AS match_date,
+    m.time               AS kickoff_time,
+    m.gameweek,
+    m.attendance,
+    m.home_score,
+    m.away_score,
+    CASE
+        WHEN m.home_score > m.away_score THEN 'H'
+        WHEN m.home_score < m.away_score THEN 'A'
+        WHEN m.home_score = m.away_score THEN 'D'
+    END                  AS result_1x2,
+    (m.home_score IS NOT NULL AND m.away_score IS NOT NULL) AS is_completed
+FROM iceberg.silver.fbref_match_enriched m
+LEFT JOIN iceberg.silver.xref_team home_x
+    ON  home_x.source    = 'fbref'
+    AND home_x.source_id = m.home
+    AND home_x.league    = m.league
+    AND home_x.season    = m.season
+LEFT JOIN iceberg.silver.xref_team away_x
+    ON  away_x.source    = 'fbref'
+    AND away_x.source_id = m.away
+    AND away_x.league    = m.league
+    AND away_x.season    = m.season
+LEFT JOIN iceberg.silver.xref_referee ref_x
+    ON  ref_x.source    = 'fbref'
+    AND ref_x.source_id = TRIM(m.referee)
+    AND ref_x.league    = m.league
+    AND ref_x.season    = m.season
+LEFT JOIN venue_aliases va
+    ON  va.league = m.league
+    AND va.norm   = regexp_replace(
+                        regexp_replace(normalize(lower(trim(m.venue)), NFD), '\p{Mn}+', ''),
+                        '[^a-z0-9]+', ''
+                    )
+LEFT JOIN managers_resolved hm
+    ON  hm.match_id = m.match_id
+    AND hm.side     = 'home'
+LEFT JOIN managers_resolved am
+    ON  am.match_id = m.match_id
+    AND am.side     = 'away'

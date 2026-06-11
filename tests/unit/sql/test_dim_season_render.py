@@ -1,18 +1,20 @@
 """
-Unit tests for ``utils.dim_loaders.render_dim_season_sql`` (E2 — 2026-05).
+Unit tests for ``utils.dim_loaders.render_dim_season_sql`` (issue #425).
 
-Verifies the renderer that produces the dim_season VALUES tuples from a
-fixed window of 5 seasons ending at ``utils.config.CURRENT_SEASON``.
+Verifies the renderer that produces dim_season VALUES tuples from the union
+of ``seasons`` across in-scope competitions in
+``configs/medallion/competitions.yaml``.
 
 Strategy:
-  * monkeypatch ``dim_loaders.date.today`` (via the ``date`` symbol bound
-    in the module) to a deterministic 2024-09-15 — well inside the 2024-25
-    season window (Aug 1 2024 → Jul 31 2025).
-  * monkeypatch ``utils.config.CURRENT_SEASON`` to 2024 so the helper
-    ``_seasons_window`` deterministically yields [2020..2024] (5 entries).
-  * Invoke ``render_dim_season_sql`` with the real .sql.j2 template.
-  * Assert: 5 rows, 2024-25 has is_current=true, valid_from/valid_to
-    match Aug 1 / Jul 31, season_canonical/source/version literals match.
+  * Build a temp competitions.yaml with two in-scope leagues sharing season
+    slug '2425' (different windows — dedup must take min(start)/max(end)),
+    plus an out-of-scope stub whose seasons must be EXCLUDED.
+  * Point ``MEDALLION_CONFIG_DIR`` at it + reload ``utils.medallion_config``.
+  * Freeze ``date.today()`` inside dim_loaders to 2025-06-15 — the summer
+    gap AFTER the '2425' season ended and BEFORE '2526' starts. is_current
+    must still flag exactly one row ('2425' — the latest started season);
+    a naive BETWEEN would flag zero.
+  * Assert dedup, exclusion, leading-zero slug formatting and date literals.
 """
 
 from __future__ import annotations
@@ -20,6 +22,7 @@ from __future__ import annotations
 import datetime as _dt
 import re
 import sys
+import textwrap
 from pathlib import Path
 
 import pytest
@@ -28,8 +31,6 @@ import pytest
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 TEMPLATE_PATH = PROJECT_ROOT / "dags" / "sql" / "gold" / "dim_season.sql.j2"
 
-# ``utils.dim_loaders`` lives under ``dags/utils/`` — add to sys.path so
-# the test runs without depending on tests/unit/dags/conftest.py.
 _DAGS_DIR = PROJECT_ROOT / "dags"
 if str(_DAGS_DIR) not in sys.path:
     sys.path.insert(0, str(_DAGS_DIR))
@@ -40,164 +41,182 @@ if str(_DAGS_DIR) not in sys.path:
 # ---------------------------------------------------------------------------
 
 class _FixedDate(_dt.date):
-    """``date`` subclass whose ``.today()`` returns a fixed value.
+    """``date`` subclass whose ``.today()`` returns a fixed value (summer gap).
 
     Subclassing instead of monkeypatching avoids C-level "cannot set
-    attribute" issues on the built-in ``date`` type.
+    attribute" issues on the built-in ``date`` type. ``fromisoformat`` is
+    inherited, so the renderer's date parsing keeps working.
     """
 
     @classmethod
     def today(cls):
-        return _dt.date(2024, 9, 15)
+        return _dt.date(2025, 6, 15)
+
+
+_COMPETITIONS_YAML_CONTENT = textwrap.dedent("""\
+    competitions:
+      - id: "ENG-Premier League"
+        name: "English Premier League"
+        country: "England"
+        tier: 1
+        seasons:
+          - id: 2324
+            format: "league_round_robin"
+            team_count: 20
+            start: "2023-08-11"
+            end: "2024-05-19"
+          - id: 2425
+            format: "league_round_robin"
+            team_count: 20
+            start: "2024-08-16"
+            end: "2025-05-25"
+          - id: 2526
+            format: "league_round_robin"
+            team_count: 20
+            start: "2025-08-15"
+            end: "2026-05-24"
+        sources:
+          primary: ["fbref"]
+          fallback: []
+        in_scope: true
+
+      - id: "ESP-La Liga"
+        name: "Spanish La Liga"
+        country: "Spain"
+        tier: 1
+        seasons:
+          # Same slug as ENG '2425' but a WIDER window — dedup must merge
+          # into one row with min(start)=2024-08-10, max(end)=2025-06-01.
+          - id: 2425
+            format: "league_round_robin"
+            team_count: 20
+            start: "2024-08-10"
+            end: "2025-06-01"
+        sources:
+          primary: ["fbref"]
+          fallback: []
+        in_scope: true
+
+      - id: "GER-Bundesliga"
+        name: "German Bundesliga"
+        country: "Germany"
+        tier: 1
+        seasons:
+          # Out-of-scope league — its season must NOT appear in dim_season.
+          - id: 1920
+            format: "league_round_robin"
+            team_count: 18
+            start: "2019-08-16"
+            end: "2020-06-27"
+        sources:
+          primary: []
+          fallback: []
+        in_scope: false
+        notes: "stub"
+    """)
 
 
 @pytest.fixture
-def patched_renderer(monkeypatch):
-    """Patch CURRENT_SEASON + date.today() inside ``dim_loaders``.
-
-    Returns the imported (patched) module so tests can call its renderer
-    directly.
-    """
+def rendered_sql(monkeypatch, tmp_path) -> str:
     pytest.importorskip("yaml")
+    (tmp_path / "competitions.yaml").write_text(_COMPETITIONS_YAML_CONTENT)
+
+    # Patch the module attribute (NOT env + reload): monkeypatch restores it
+    # on teardown, so later tests in the same session keep the real config.
+    from utils import medallion_config
+    monkeypatch.setattr(medallion_config, "CONFIG_DIR", tmp_path)
+    medallion_config.reset_cache()
+
     from utils import dim_loaders
-
-    # _seasons_window reads CURRENT_SEASON via a deferred import —
-    # ``from utils.config import CURRENT_SEASON`` happens INSIDE
-    # ``render_dim_season_sql``. Patch the value at the source module so
-    # the next import sees 2024.
-    import utils.config as _cfg
-    monkeypatch.setattr(_cfg, "CURRENT_SEASON", 2024, raising=False)
-
-    # Patch ``date`` symbol in dim_loaders so date.today() returns 2024-09-15.
     monkeypatch.setattr(dim_loaders, "date", _FixedDate)
 
-    return dim_loaders
-
-
-@pytest.fixture
-def rendered_sql(patched_renderer, tmp_path) -> str:
     out_path = tmp_path / "dim_season_rendered.sql"
-    returned = patched_renderer.render_dim_season_sql(
-        str(TEMPLATE_PATH), str(out_path)
-    )
+    returned = dim_loaders.render_dim_season_sql(str(TEMPLATE_PATH), str(out_path))
     assert returned == str(out_path), "renderer must echo the out_path"
-    return out_path.read_text()
+    yield out_path.read_text()
+
+    medallion_config.reset_cache()
 
 
-# ---------------------------------------------------------------------------
-# Helpers — extract VALUES tuples from rendered SQL
-# ---------------------------------------------------------------------------
-
-def _extract_value_tuples(sql_text: str):
-    """Return the list of dicts, one per VALUES tuple, keyed by column name.
-
-    The template's column order (from ``AS t(...)``) is:
-        season_id, season_start_year, season_end_year, season_label,
-        valid_from, valid_to, is_current, season_canonical,
-        season_source, season_version
-    """
-    cols = [
-        "season_id",
-        "season_start_year",
-        "season_end_year",
-        "season_label",
-        "valid_from",
-        "valid_to",
-        "is_current",
-        "season_canonical",
-        "season_source",
-        "season_version",
-    ]
-
-    # Each tuple begins with `('YYYY-YY',` — match those.
-    tuple_re = re.compile(
-        r"\(\s*('\d{4}-\d{2}',[^)]+)\)",
-        re.DOTALL,
+def _tuples(rendered_sql: str) -> dict:
+    """Parse rendered VALUES rows into {slug: (name, start, end, is_current)}."""
+    rows = re.findall(
+        r"\('(\d{4})', '([\d-]+)', DATE '([\d-]+)', DATE '([\d-]+)', (true|false)\)",
+        rendered_sql,
     )
-    rows = tuple_re.findall(sql_text)
-    parsed = []
-    for body in rows:
-        # Top-level comma split is safe — none of the values contain commas
-        # inside quotes for this template.
-        fields = [f.strip() for f in body.split(",")]
-        assert len(fields) == len(cols), (
-            f"expected {len(cols)} fields per VALUES tuple, got {len(fields)}: {body!r}"
-        )
-        parsed.append(dict(zip(cols, fields)))
-    return parsed
+    return {slug: (name, start, end, cur) for slug, name, start, end, cur in rows}
 
-
-# ---------------------------------------------------------------------------
-# Tests
-# ---------------------------------------------------------------------------
 
 @pytest.mark.unit
 class TestDimSeasonRender:
-    def test_five_rows_rendered(self, rendered_sql):
-        """``_seasons_window(2024, n=5)`` → [2020..2024] = 5 rows."""
-        rows = _extract_value_tuples(rendered_sql)
-        assert len(rows) == 5, f"expected 5 rows, got {len(rows)}"
+    def test_template_placeholder_replaced(self, rendered_sql):
+        assert not re.search(r'^\s*\{\{ rows \}\}\s*$', rendered_sql,
+                             flags=re.MULTILINE)
 
-    def test_season_ids_match_window(self, rendered_sql):
-        """Expected season_ids: 2020-21, 2021-22, 2022-23, 2023-24, 2024-25."""
-        rows = _extract_value_tuples(rendered_sql)
-        season_ids = [r["season_id"].strip("'") for r in rows]
-        assert sorted(season_ids) == [
-            "2020-21",
-            "2021-22",
-            "2022-23",
-            "2023-24",
-            "2024-25",
-        ], f"unexpected season_ids: {season_ids}"
+    def test_one_row_per_distinct_slug_in_scope_only(self, rendered_sql):
+        """3 distinct slugs from in-scope leagues; the stub's '1920' excluded."""
+        t = _tuples(rendered_sql)
+        assert set(t) == {"2324", "2425", "2526"}
 
-    def test_only_current_season_is_flagged(self, rendered_sql):
-        """Only the 2024-25 row carries is_current=true; the other 4 are false.
+    def test_shared_slug_deduped_min_start_max_end(self, rendered_sql):
+        """ENG + ESP both carry '2425' → one row, widest covering window."""
+        _, start, end, _ = _tuples(rendered_sql)["2425"]
+        assert start == "2024-08-10", "dedup must take the EARLIEST start"
+        assert end == "2025-06-01", "dedup must take the LATEST end"
 
-        With today() pinned to 2024-09-15, the only window containing today
-        is 2024-08-01 .. 2025-07-31, i.e. the '2024-25' season.
-        """
-        rows = _extract_value_tuples(rendered_sql)
-        current = [r for r in rows if r["is_current"].lower() == "true"]
-        non_current = [r for r in rows if r["is_current"].lower() == "false"]
+    def test_season_name_derived_from_slug(self, rendered_sql):
+        t = _tuples(rendered_sql)
+        assert t["2324"][0] == "2023-24"
+        assert t["2425"][0] == "2024-25"
+        assert t["2526"][0] == "2025-26"
 
-        assert len(current) == 1, (
-            f"expected exactly 1 row with is_current=true, got {len(current)}: "
-            f"{[r['season_id'] for r in current]}"
-        )
-        assert current[0]["season_id"] == "'2024-25'", (
-            f"is_current=true must be the 2024-25 row, got "
-            f"{current[0]['season_id']!r}"
-        )
-        assert len(non_current) == 4
+    def test_is_current_exactly_one_row_summer_gap(self, rendered_sql):
+        """Frozen today=2025-06-15 sits BETWEEN seasons. The latest started
+        slug ('2425') must be current; '2526' has not started yet."""
+        t = _tuples(rendered_sql)
+        assert t["2425"][3] == "true"
+        assert t["2324"][3] == "false"
+        assert t["2526"][3] == "false"
+        flags = [v[3] for v in t.values()]
+        assert flags.count("true") == 1, "exactly one is_current row"
 
-    def test_valid_from_and_valid_to_anchors(self, rendered_sql):
-        """Current season anchors: valid_from='2024-08-01', valid_to='2025-07-31'."""
-        rows = _extract_value_tuples(rendered_sql)
-        current = next(r for r in rows if r["season_id"] == "'2024-25'")
-        # The renderer emits ``DATE 'YYYY-MM-DD'`` literals
-        assert current["valid_from"] == "DATE '2024-08-01'", (
-            f"valid_from must be DATE '2024-08-01', got {current['valid_from']!r}"
-        )
-        assert current["valid_to"] == "DATE '2025-07-31'", (
-            f"valid_to must be DATE '2025-07-31', got {current['valid_to']!r}"
-        )
+    def test_columns_declared(self, rendered_sql):
+        for col in ["season", "season_name", "start_date", "end_date",
+                    "is_current"]:
+            assert col in rendered_sql
 
-    def test_canonical_equals_season_id(self, rendered_sql):
-        """``season_canonical = season_id`` for every row."""
-        rows = _extract_value_tuples(rendered_sql)
-        for r in rows:
-            assert r["season_canonical"] == r["season_id"], (
-                f"season_canonical {r['season_canonical']!r} != "
-                f"season_id {r['season_id']!r}"
-            )
 
-    def test_constant_source_and_version_literals(self, rendered_sql):
-        """``season_source='config'`` + ``season_version='v1'`` per row."""
-        rows = _extract_value_tuples(rendered_sql)
-        for r in rows:
-            assert r["season_source"] == "'config'", (
-                f"season_source must be 'config', got {r['season_source']!r}"
-            )
-            assert r["season_version"] == "'v1'", (
-                f"season_version must be 'v1', got {r['season_version']!r}"
-            )
+@pytest.mark.unit
+def test_leading_zero_slug_formatting(monkeypatch, tmp_path):
+    """YAML season id is an int — id 203 must render as slug '0203', not '203'."""
+    pytest.importorskip("yaml")
+    yaml_content = textwrap.dedent("""\
+        competitions:
+          - id: "XXX-Test League"
+            name: "Test League"
+            country: "Testland"
+            tier: 1
+            seasons:
+              - id: 203
+                format: "league_round_robin"
+                team_count: 20
+                start: "2002-08-10"
+                end: "2003-05-20"
+            sources:
+              primary: []
+              fallback: []
+            in_scope: true
+        """)
+    (tmp_path / "competitions.yaml").write_text(yaml_content)
+
+    from utils import medallion_config
+    monkeypatch.setattr(medallion_config, "CONFIG_DIR", tmp_path)
+    medallion_config.reset_cache()
+
+    from utils import dim_loaders
+    out_path = tmp_path / "out.sql"
+    dim_loaders.render_dim_season_sql(str(TEMPLATE_PATH), str(out_path))
+    rendered = out_path.read_text()
+    medallion_config.reset_cache()
+
+    assert "('0203', '2002-03'" in rendered

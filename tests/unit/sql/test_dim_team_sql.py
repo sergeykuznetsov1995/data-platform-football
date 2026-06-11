@@ -1,30 +1,32 @@
 """
-Unit tests for ``dags/sql/gold/dim_team.sql`` after E1.5 cutover (2026-05-09).
+Unit tests for ``dags/sql/gold/dim_team.sql.j2`` — star-schema grain (#425).
 
-T2 migrated dim_team from ``gold.entity_xref`` to ``silver.xref_team`` —
-this file pins down the structural invariants of that refactor without
-spinning up a Trino/DuckDB engine. We use the same pattern as
-``test_xref_team_sql.py``: regex/keyword sanity over the raw SQL text.
+dim_team is one row per CLUB: spine = silver.xref_team (source='fbref',
+GROUP BY canonical_id collapses the per-(league, season) rows), attributes
+(team_name / country / short_name) from team_aliases.yaml via the
+``{{ team_meta_values_sql }}`` placeholder.
 
-E1.5 cutover invariants we exercise:
-  * Source is iceberg.silver.xref_team (NOT iceberg.gold.entity_xref).
-  * source = 'fbref' filter retained (FBref-only subset of dim_team).
-  * GROUP BY mirrors the documented PK contract (canonical_id /
-    display_name / league / season).
-  * Migration breadcrumb in header so future readers know why the
-    rewrite happened.
+Same pattern as ``test_xref_team_sql.py``: regex/keyword sanity over the
+raw template text (plus a render pass via dim_loaders against a fixture
+team_aliases.yaml).
 """
 
 from __future__ import annotations
 
 import re
+import sys
+import textwrap
 from pathlib import Path
 
 import pytest
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
-SQL_PATH = PROJECT_ROOT / "dags" / "sql" / "gold" / "dim_team.sql"
+SQL_PATH = PROJECT_ROOT / "dags" / "sql" / "gold" / "dim_team.sql.j2"
+
+_DAGS_DIR = PROJECT_ROOT / "dags"
+if str(_DAGS_DIR) not in sys.path:
+    sys.path.insert(0, str(_DAGS_DIR))
 
 
 def _read_sql() -> str:
@@ -42,87 +44,82 @@ def _strip_comments(sql: str) -> str:
 pytestmark = pytest.mark.unit
 
 
-class TestDimTeamCutoverStructure:
-    """Regex/keyword sanity over ``dim_team.sql`` post-E1.5 cutover."""
+class TestDimTeamStarStructure:
+    """Regex sanity over the dim_team template post-#425 redesign."""
 
     def test_reads_from_silver_xref_team(self):
-        """Source must be ``iceberg.silver.xref_team``."""
         sql = _strip_comments(_read_sql())
-        assert "iceberg.silver.xref_team" in sql, (
-            "dim_team.sql must read from iceberg.silver.xref_team after "
-            "the E1.5 cutover; got:\n" + sql
-        )
+        assert "iceberg.silver.xref_team" in sql
 
     def test_no_legacy_entity_xref_in_executable_sql(self):
-        """``iceberg.gold.entity_xref`` must NOT appear outside comments.
-
-        The header may legitimately reference the old table in a
-        "Migrated from gold.entity_xref ..." breadcrumb — we strip
-        comments before asserting.
-        """
         sql = _strip_comments(_read_sql())
-        assert "iceberg.gold.entity_xref" not in sql, (
-            "dim_team.sql must NOT reference iceberg.gold.entity_xref in "
-            "executable SQL after the E1.5 cutover"
-        )
-        assert "gold.entity_xref" not in sql, (
-            "dim_team.sql must NOT reference gold.entity_xref in "
-            "executable SQL after the E1.5 cutover"
-        )
+        assert "entity_xref" not in sql
 
     def test_fbref_source_filter(self):
-        """The FBref-only subset filter must remain — dim_team is
-        documented as ``FBref-only subset retained here``."""
-        sql = _read_sql()
-        assert re.search(r"source\s*=\s*'fbref'", sql, re.IGNORECASE), (
-            "dim_team.sql must keep the `source = 'fbref'` predicate"
-        )
+        sql = _strip_comments(_read_sql())
+        assert re.search(r"source\s*=\s*'fbref'", sql, re.IGNORECASE)
 
-    def test_select_canonical_columns(self):
-        """canonical_id / display_name carry through from xref_team."""
-        sql = _read_sql()
-        assert re.search(r"canonical_id\s+AS\s+team_id", sql, re.IGNORECASE), (
-            "dim_team.sql must SELECT `canonical_id AS team_id`"
-        )
-        assert re.search(
-            r"display_name\s+AS\s+team_name", sql, re.IGNORECASE
-        ), "dim_team.sql must SELECT `display_name AS team_name`"
-
-    def test_group_by_pk_columns(self):
-        """GROUP BY must include canonical_id / display_name / league / season
-        so the PK = (team_id, league, season) contract is enforced."""
-        sql = _read_sql()
-        # Regex tolerates any whitespace and trailing CAST(... AS bigint)
-        # variant on season.
+    def test_grain_is_club_group_by_canonical_only(self):
+        """GROUP BY collapses per-(league, season) xref rows to one per club —
+        league/season must NOT be part of the grouping key anymore."""
+        sql = _strip_comments(_read_sql())
         m = re.search(r"GROUP\s+BY\s+([^\n;]+)", sql, re.IGNORECASE)
-        assert m, "dim_team.sql is missing a GROUP BY clause"
+        assert m, "dim_team template is missing a GROUP BY clause"
         group_by = m.group(1).lower()
-        for col in ["canonical_id", "display_name", "league", "season"]:
-            assert col in group_by, (
-                f"GROUP BY must include {col!r}; got: {group_by!r}"
+        assert "canonical_id" in group_by
+        assert "season" not in group_by
+        assert "league" not in group_by
+
+    def test_design_columns_present(self):
+        sql = _strip_comments(_read_sql())
+        for col in ("team_id", "team_name", "country", "short_name"):
+            assert re.search(rf"\b{col}\b", sql, re.IGNORECASE), (
+                f"dim_team template must emit {col!r}"
             )
 
-    def test_season_cast_to_bigint(self):
-        """#404: season is unified onto slug — dim_team emits xref_team.season
-        (varchar slug) directly, with NO CAST back to bigint."""
-        sql = _read_sql()
-        assert "cast(season as bigint)" not in sql.lower(), (
-            "#404: dim_team.sql must emit slug season directly — no CAST to bigint"
-        )
-
-    def test_migration_breadcrumb_in_header(self):
-        """Header must carry the cutover breadcrumb so future readers
-        know this file moved off gold.entity_xref in E1.5."""
-        sql = _read_sql()
-        assert "Migrated from gold.entity_xref to silver.xref_team in E1.5" in sql, (
-            "dim_team.sql must keep the E1.5 migration breadcrumb in the "
-            "header so the cutover is discoverable"
-        )
+    def test_meta_placeholder_present(self):
+        """Attributes come from team_aliases.yaml via the VALUES placeholder."""
+        assert "{{ team_meta_values_sql }}" in _read_sql()
 
     def test_pure_select_no_create_table(self):
-        """File must remain a pure SELECT (gold_tasks wraps in CTAS)."""
         sql = _strip_comments(_read_sql())
-        assert "CREATE TABLE" not in sql.upper(), (
-            "dim_team.sql must remain a pure SELECT — gold_tasks "
-            "wraps it in CREATE TABLE AS at run time"
+        assert "CREATE TABLE" not in sql.upper()
+        assert "INSERT INTO" not in sql.upper()
+
+
+class TestDimTeamRender:
+    """render_dim_team_sql fills the placeholder from team_aliases.yaml."""
+
+    _TEAM_ALIASES_YAML = textwrap.dedent("""\
+        teams:
+          - canonical_name: "X United"
+            canonical_id: "x_united"
+            country: "England"
+            short_name: "X Utd"
+            aliases:
+              _generic: ["X United"]
+            competition_scope: ["ENG-Premier League"]
+        """)
+
+    def test_renders_team_meta_tuples(self, monkeypatch, tmp_path):
+        pytest.importorskip("yaml")
+        (tmp_path / "team_aliases.yaml").write_text(self._TEAM_ALIASES_YAML)
+
+        # Patch the module attribute (NOT env + reload): monkeypatch restores
+        # it on teardown, so later tests keep the real config.
+        from utils import medallion_config
+        monkeypatch.setattr(medallion_config, "CONFIG_DIR", tmp_path)
+        medallion_config.reset_cache()
+
+        from utils import dim_loaders
+        out_path = tmp_path / "dim_team_rendered.sql"
+        dim_loaders.render_dim_team_sql(str(SQL_PATH), str(out_path))
+        rendered = out_path.read_text()
+        medallion_config.reset_cache()
+
+        assert "('x_united', 'X United', 'England', 'X Utd')" in rendered
+        # The standalone placeholder must be gone from the VALUES block.
+        assert not re.search(
+            r"^\s*\{\{\s*team_meta_values_sql\s*\}\}\s*$",
+            rendered, flags=re.MULTILINE,
         )

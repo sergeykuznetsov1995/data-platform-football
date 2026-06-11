@@ -4,32 +4,37 @@
 table:
   fullyQualifiedName: trino_iceberg.iceberg.gold.dim_player
   description: |
-    Канонический справочник игроков по сезонам. PK (player_id, season).
-    Учитывает что игрок может менять команду внутри сезона (берём last_team
-    через MAX). Возраст и позиция — снимок на момент последнего обновления
-    в Silver. Используется как FK target из fct_player_match и feat_player_form.
+    Канонический справочник игроков (звёздный дизайн, #425). Одна строка =
+    один игрок (сезона в грейне НЕТ): справочник хранит только то, что у
+    игрока «навсегда» — возраст считается из dob на дату матча, текущая
+    команда видна из фактов. Spine — silver.xref_player (FBref canonical
+    'fb_<id>'), атрибуты — multi-source COALESCE (FotMob / SofaScore /
+    Transfermarkt / SoFIFA; height_cm — Transfermarkt первичен). Покрытие
+    dob/height/foot для исторических игроков низкое (источники покрывают
+    текущий APL); nationality для них — 3-буквенный FBref-код.
   tags:
     - Tier.Gold
     - Domain.Football
     - PII.Low
 columns:
   - name: player_id
-    description: Стабильный FBref player_id (хеш, присвоенный источником).
+    description: PK — канонический ID игрока ('fb_<fbref_id>' из silver.xref_player).
   - name: player_name
     description: Полное имя игрока (PII.Low — публично известное лицо).
     tags:
       - PII.Low
-  - name: nation
-    description: Национальность (трёхбуквенный код, например ENG, FRA).
-  - name: position
-    description: Позиция игрока (GK / DF / MF / FW; может комбинироваться, "DF,MF").
-  - name: born_year
-    description: Год рождения. PII.Low — широкодоступная информация.
+  - name: dob
+    description: Дата рождения (FotMob > SofaScore > Transfermarkt > SoFIFA). PII.Low — широкодоступная информация.
     tags:
       - PII.Low
-  - name: last_team
-    description: Последняя команда игрока в сезоне.
-  - name: league
-    description: Лига сезона.
-  - name: season
-    description: Сезон.
+  - name: nationality
+    description: Гражданство — полное название (FotMob/SofaScore/TM/SoFIFA) или 3-буквенный FBref-код для игроков вне их покрытия.
+  - name: height_cm
+    description: Рост в сантиметрах (Transfermarkt первичен > FotMob > SofaScore > SoFIFA).
+  - name: preferred_foot
+    description: Рабочая нога в нижнем регистре (Transfermarkt > FotMob > SofaScore).
+  - name: primary_position
+    description: Основная позиция — первый токен (SoFIFA > FBref, 'MF,FW' -> 'MF').
+  - name: _silver_created_at
+    description: Технический timestamp создания строки CTAS-раннером.
+relationships: []

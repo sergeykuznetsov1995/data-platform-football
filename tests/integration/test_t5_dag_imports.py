@@ -3,9 +3,10 @@ Smoke integration test for T5 (cross-source per-season stats) wiring inside
 ``dag_transform_fbref_gold``.
 
 Verifies:
-* the Gold DAG still loads after T5 added two new tasks to STAGE_2_DIMS,
+* the Gold DAG still loads after T5 added two new tasks to the season-stats
+  stage (STAGE_2D_SEASON_BLOCKS since #425; previously STAGE_2_DIMS),
 * the two task_ids `fct_player_season_stats` and `fct_keeper_season_stats`
-  are present, namespaced under s2_dimensions.
+  are present, namespaced under s2d_season_blocks.
 """
 
 from __future__ import annotations
@@ -56,7 +57,7 @@ class TestT5GoldDagSeasonStats:
                 + "; ".join(f"{k}: {v}" for k, v in relevant.items())
             )
 
-    def test_t5_tasks_present_in_s2_dimensions(self, dag_bag):
+    def test_t5_tasks_present_in_season_blocks(self, dag_bag):
         dag = dag_bag.dags.get(self.DAG_ID)
         assert dag is not None, (
             f"DAG '{self.DAG_ID}' not found. "
@@ -65,13 +66,13 @@ class TestT5GoldDagSeasonStats:
         task_ids = {t.task_id for t in dag.tasks}
         for t5 in self.EXPECTED_T5_TASKS:
             present = (
-                f"s2_dimensions.{t5}" in task_ids
+                f"s2d_season_blocks.{t5}" in task_ids
                 or any(tid.endswith(f".{t5}") or tid == t5 for tid in task_ids)
             )
             assert present, (
                 f"T5 task '{t5}' missing from {self.DAG_ID}. "
-                f"s2_dimensions children: "
-                f"{sorted(t for t in task_ids if t.startswith('s2_dimensions.'))}"
+                f"s2d_season_blocks children: "
+                f"{sorted(t for t in task_ids if t.startswith('s2d_season_blocks.'))}"
             )
 
     def test_t5_tasks_run_after_dim_player_attributes(self, dag_bag):
@@ -80,12 +81,12 @@ class TestT5GoldDagSeasonStats:
         в той же группе."""
         dag = dag_bag.dags.get(self.DAG_ID)
         assert dag is not None
-        # STAGE_2_DIMS — sequential через for loop в TaskGroup, и dependencies
-        # внутри группы: dim_team >> dim_player >> dim_player_attributes >>
-        # fct_player_season_stats >> fct_keeper_season_stats >> dim_match.
-        # Проверяем порядок через task ordering в STAGE_2_DIMS.
-        from dag_transform_fbref_gold import STAGE_2_DIMS
-        names = [t[0] for t in STAGE_2_DIMS]
+        # STAGE_2D_SEASON_BLOCKS — sequential через for loop в TaskGroup:
+        # dim_player_attributes >> fct_player_season_stats >>
+        # fct_keeper_season_stats >> audits. Проверяем порядок через task
+        # ordering в списке регистрации (#425 renamed from STAGE_2_DIMS).
+        from dag_transform_fbref_gold import STAGE_2D_SEASON_BLOCKS
+        names = [t[0] for t in STAGE_2D_SEASON_BLOCKS]
         assert names.index('dim_player_attributes') < names.index(
             'fct_player_season_stats'
         ), "fct_player_season_stats must come AFTER dim_player_attributes"

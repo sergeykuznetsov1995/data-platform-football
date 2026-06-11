@@ -39,31 +39,23 @@ def test_renders_valid_sql(sql_text: str) -> None:
     )
 
 
-def test_referee_id_inline_hash(sql_text: str) -> None:
-    """Mirror feat_referee_bias: 'ref_' || lower(to_hex(xxhash64(to_utf8(lower(trim(...)))))) ."""
-    # Match the salient prefix; the exact column name (m.referee) and inner
-    # transforms are covered by the longer pattern below.
-    prefix = re.search(
-        r"'ref_'\s*\|\|\s*lower\s*\(\s*to_hex\s*\(\s*xxhash64",
-        sql_text,
-        re.IGNORECASE,
+def test_referee_id_from_dim_match(sql_text: str) -> None:
+    """#425: referee_id is read verbatim from dim_match.referee_id (the
+    canonical silver.xref_referee id) — the legacy inline hash must be gone."""
+    assert re.search(r"m\.referee_id", sql_text, re.IGNORECASE), (
+        "Expected the spine to select m.referee_id from gold.dim_match"
     )
-    assert prefix, (
-        "Expected referee_id derivation: 'ref_' || lower(to_hex(xxhash64(...))) "
-        "— must mirror feat_referee_bias to share dim_referee key"
+    assert "xxhash64" not in sql_text.lower(), (
+        "Inline referee-name hashing must NOT be used anymore (#425) — "
+        "the canonical id comes from dim_match.referee_id"
     )
 
 
-def test_referee_id_folds_diacritics(sql_text: str) -> None:
-    """Hash input must NFD-fold diacritics (issue #228) so it stays byte-
-    identical to dim_referee / feat_referee_bias referee_id for "Çakır"/"Cakir".
-    """
-    assert re.search(r"normalize\(\s*lower\s*\(\s*trim\s*\(\s*m\.referee",
-                     sql_text, re.IGNORECASE), (
-        "Expected NORMALIZE(lower(trim(m.referee)), NFD) inside the hash input"
-    )
-    assert r"\p{Mn}" in sql_text, (
-        "Expected `\\p{Mn}` combining-mark strip in the referee_id hash input"
+def test_null_referee_rows_filtered(sql_text: str) -> None:
+    """Matches without a resolved referee are excluded from the mart spine."""
+    assert re.search(r"m\.referee_id\s+IS\s+NOT\s+NULL", sql_text,
+                     re.IGNORECASE), (
+        "Expected `WHERE m.referee_id IS NOT NULL` in the spine CTE"
     )
 
 
@@ -72,14 +64,14 @@ def test_pk_grouping(sql_text: str) -> None:
     pattern = re.compile(
         r"GROUP\s+BY\s+"
         r"\s*pm\.referee_id\s*,\s*"
-        r"dr\.referee_canonical\s*,\s*"
+        r"dr\.referee_name\s*,\s*"
         r"pm\.season\s*,\s*"
         r"pm\.league",
         re.IGNORECASE | re.DOTALL,
     )
     assert pattern.search(sql_text), (
-        "Expected `GROUP BY pm.referee_id, dr.referee_canonical, pm.season, pm.league` "
-        "to enforce PK uniqueness (referee_canonical aliased AS referee_name in SELECT)"
+        "Expected `GROUP BY pm.referee_id, dr.referee_name, pm.season, pm.league` "
+        "to enforce PK uniqueness (#425: dim_referee exposes referee_name)"
     )
 
 

@@ -11,17 +11,16 @@
 --   iceberg.gold.fct_goal    -- goal + penalty counts per match
 --   iceberg.gold.dim_referee -- referee_name lookup
 --
--- referee_id derivation: same inline-hash as feat_referee_bias.sql to
--- guarantee identical referee_id values to dim_referee + survive alias drift.
+-- referee_id (#425): read directly from dim_match.referee_id — the canonical
+-- silver.xref_referee id resolved once at the star centre; identical to the
+-- dim_referee PK by construction (no inline hash anymore).
 --
 -- PK: (referee_id, season, league)
 -- =============================================================================
 
 WITH match_with_ref AS (
     SELECT
-        'ref_' || lower(to_hex(xxhash64(to_utf8(
-            regexp_replace(normalize(lower(trim(m.referee)), NFD), '\p{Mn}+', '')
-        ))))                                                                AS referee_id,
+        m.referee_id,
         m.match_id,
         m.season,
         m.league,
@@ -29,8 +28,7 @@ WITH match_with_ref AS (
         m.home_score,
         m.away_score
     FROM iceberg.gold.dim_match m
-    WHERE m.referee IS NOT NULL
-      AND TRIM(m.referee) <> ''
+    WHERE m.referee_id IS NOT NULL
 ),
 
 card_agg AS (
@@ -71,7 +69,7 @@ per_match AS (
 
 SELECT
     pm.referee_id,
-    dr.referee_canonical AS referee_name,
+    dr.referee_name,
     pm.season,
     pm.league,
     COUNT(*)                                                       AS matches_officiated,
@@ -86,6 +84,6 @@ LEFT JOIN iceberg.gold.dim_referee dr
        ON dr.referee_id = pm.referee_id
 GROUP BY
     pm.referee_id,
-    dr.referee_canonical,
+    dr.referee_name,
     pm.season,
     pm.league

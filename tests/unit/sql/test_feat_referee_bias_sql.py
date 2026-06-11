@@ -114,8 +114,8 @@ def _reset_schemas(duck_conn):
         """
         CREATE TABLE gold_dim_match (
             match_id     VARCHAR,
-            referee      VARCHAR,
-            date         DATE,
+            referee_id   VARCHAR,
+            match_date   DATE,
             season       VARCHAR,
             league       VARCHAR,
             result_1x2   VARCHAR,
@@ -160,10 +160,15 @@ def _seed_referee_matches(
 ) -> List[str]:
     """Insert N matches officiated by ``referee_name`` with deterministic stats.
 
+    #425: dim_match carries the CANONICAL referee_id (resolved via
+    silver.xref_referee at the star centre) — the fixture derives a stable
+    'ref_<slug>' id from the name, mirroring the xref alias convention.
+
     Returns the list of inserted match_ids (sorted by date).
     """
     import datetime as dt
     base = dt.date.fromisoformat(base_date)
+    referee_id = "ref_" + re.sub(r"[^a-z0-9]+", "_", referee_name.lower())
     match_ids: List[str] = []
     for i in range(n):
         mid = f"m_{referee_name.replace(' ', '')}_{base_match + i:04d}"
@@ -172,7 +177,7 @@ def _seed_referee_matches(
         result = "H" if home_win_each else "D"
         con.execute(
             f"INSERT INTO gold_dim_match VALUES "
-            f"('{mid}', '{referee_name}', DATE '{d}', "
+            f"('{mid}', '{referee_id}', DATE '{d}', "
             f"'{season}', '{league}', '{result}', 1, 1)"
         )
         for _ in range(yellow_per_match):
@@ -298,42 +303,32 @@ class TestFeatRefereeBiasPK:
         )
 
     def test_no_referee_id_null(self, duck_conn):
-        """match_with_ref filters NULL/blank referees → no NULL referee_id."""
+        """match_with_ref filters NULL referee_id rows (#425)."""
         _seed_referee_matches(duck_conn, "Solid Ref", 7, base_match=8000)
+        # A match without a resolved referee must be excluded, not NULL-keyed.
+        duck_conn.execute(
+            "INSERT INTO gold_dim_match VALUES "
+            "('m_no_ref_0001', NULL, DATE '2024-08-02', "
+            "'2425', 'ENG-Premier League', 'D', 1, 1)"
+        )
         rows = _run_feat_sql(duck_conn)
         assert all(r["referee_id"] is not None for r in rows)
+        assert all(r["match_id"] != "m_no_ref_0001" for r in rows)
 
 
 # ---------------------------------------------------------------------------
-# Tests — referee_id format
+# Tests — referee_id passthrough (#425: canonical id from dim_match)
 # ---------------------------------------------------------------------------
 
-class TestRefereeIdFormat:
-    """``referee_id = 'ref_' || lower(to_hex(xxhash64(...)))``.
+class TestRefereeIdPassthrough:
+    """#425: referee_id is read verbatim from dim_match.referee_id (the
+    canonical silver.xref_referee id) — no inline hashing anymore."""
 
-    DuckDB substitutes md5 for xxhash64 — md5 is 32 hex chars vs Trino's
-    16 chars. We assert format ``ref_[a-f0-9]+`` (length tolerance) so
-    the test is portable across the two engines.
-    """
-
-    def test_referee_id_starts_with_ref_prefix(self, duck_conn):
+    def test_referee_id_passes_through_verbatim(self, duck_conn):
         _seed_referee_matches(duck_conn, "Format Ref", 6, base_match=9000)
         rows = _run_feat_sql(duck_conn)
         assert rows
-        for r in rows:
-            assert r["referee_id"].startswith("ref_"), (
-                f"referee_id missing 'ref_' prefix: {r['referee_id']!r}"
-            )
-
-    def test_referee_id_hex_body(self, duck_conn):
-        _seed_referee_matches(duck_conn, "HexRef", 6, base_match=10000)
-        rows = _run_feat_sql(duck_conn)
-        assert rows
-        hex_re = re.compile(r"^ref_[a-f0-9]+$")
-        for r in rows:
-            assert hex_re.match(r["referee_id"]), (
-                f"referee_id not hex: {r['referee_id']!r}"
-            )
+        assert {r["referee_id"] for r in rows} == {"ref_format_ref"}
 
     def test_referee_id_stable_across_matches(self, duck_conn):
         """Same referee → identical id across all of their matches."""

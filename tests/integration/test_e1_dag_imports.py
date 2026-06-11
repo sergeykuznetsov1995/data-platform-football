@@ -221,9 +221,11 @@ class TestE1DagImports:
 
 
 # 6 SQL files migrated from gold.entity_xref → silver.xref_team in T2 (E1.5).
+# #425: dim_team / dim_match became Jinja templates (.sql.j2) — same pure
+# SELECT contract, rendered by dim_loaders before CTAS.
 CUTOVER_SQL_FILES = (
-    "dim_team.sql",
-    "dim_match.sql",
+    "dim_team.sql.j2",
+    "dim_match.sql.j2",
     "dim_player.sql",
     "dim_standings.sql",
     "fct_player_match.sql",
@@ -340,36 +342,37 @@ class TestE2DimManagerWiring:
             "(populated by parsers/finders.py::parse_match_managers)"
         )
 
-    def test_dim_manager_sql_exists_and_uses_scd2(self):
-        """gold/dim_manager.sql exists and uses LAG/LEAD window functions for SCD-2."""
+    def test_dim_manager_sql_is_plain_dictionary(self):
+        """gold/dim_manager.sql is a plain per-manager dictionary (issue #425).
+
+        The SCD-2 stint logic (LAG/LEAD islands-and-gaps) moved out of the
+        dim — it returns as gold.fct_manager_stint in issue #429.
+        """
         assert self.GOLD_SQL.exists(), (
             "Gold dim_manager.sql missing — Phase 1.5 plumbing incomplete"
         )
         text = self.GOLD_SQL.read_text(encoding="utf-8")
-        assert "LAG(manager_canonical_id)" in text, (
-            "dim_manager.sql must use LAG over team timeline to detect "
-            "stint boundaries"
-        )
-        assert "LEAD(valid_from)" in text, (
-            "dim_manager.sql must use LEAD to compute closed-open valid_to"
-        )
         assert "iceberg.silver.xref_manager" in text, (
-            "dim_manager.sql must JOIN against silver.xref_manager for "
+            "dim_manager.sql must read silver.xref_manager for "
             "canonical manager identity"
         )
-        assert "iceberg.silver.xref_team" in text, (
-            "dim_manager.sql must JOIN against silver.xref_team for "
-            "canonical team identity"
+        assert "AS manager_id" in text, (
+            "dim_manager.sql must expose the canonical id as manager_id "
+            "(star-schema design, issue #425)"
+        )
+        assert "LAG(" not in text and "LEAD(" not in text, (
+            "SCD-2 stint logic must NOT live in dim_manager anymore — "
+            "it belongs to fct_manager_stint (#429)"
         )
 
     def test_dim_manager_registered_in_gold_dag(self):
-        """The Gold DAG must declare dim_manager in STAGE_2B_MASTER_DIMS_SQL."""
+        """The Gold DAG must declare dim_manager in STAGE_2B_XREF_DIMS_SQL."""
         text = self.GOLD_DAG.read_text(encoding="utf-8")
         # Non-comment line that registers dim_manager. Match on the SQL
         # path so a stray docstring mention does not trick the assertion.
         assert "dags/sql/gold/dim_manager.sql" in text, (
             "dag_transform_fbref_gold.py must register dim_manager.sql "
-            "in STAGE_2B_MASTER_DIMS_SQL"
+            "in STAGE_2B_XREF_DIMS_SQL"
         )
 
     def test_xref_dq_no_zero_row_guard_for_manager(self):

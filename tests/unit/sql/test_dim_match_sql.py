@@ -1,15 +1,18 @@
 """
-Unit tests for ``dags/sql/gold/dim_match.sql`` after E1.5 cutover (2026-05-09).
+Unit tests for ``dags/sql/gold/dim_match.sql.j2`` — star centre (#425).
 
-T2 migrated dim_match's home/away team resolution from
-``gold.entity_xref`` to ``silver.xref_team``. The (league, season)
-predicate was added to prevent the 1.5-4x JOIN fan-out documented in
-``feedback_xref_join_season_predicate.md`` (silver.xref_team is keyed
-per-(source, source_id, league, season)).
+dim_match carries FKs to every star dim: home/away_team_id (xref_team),
+referee_id (xref_referee), venue_id (inline alias VALUES — byte-identical
+to dim_venue), home/away_manager_id (bronze.fbref_match_managers +
+xref_manager). Context columns renamed to the design: date -> match_date,
+time -> kickoff_time. Denormalised extras (team names, total_goals, btts)
+moved out — stats belong to facts.
 
-This file pins down those invariants without a Trino engine. Pattern
-mirrors ``test_xref_team_sql.py`` / ``test_dim_team_sql.py``: regex
-sanity over the raw SQL.
+Every xref JOIN must keep the (league, season) predicate — without it the
+JOIN fans out 1.5-4× (memory: feedback_xref_join_season_predicate).
+
+Pattern mirrors ``test_xref_team_sql.py``: regex sanity over the raw
+template text (no Trino engine).
 """
 
 from __future__ import annotations
@@ -21,7 +24,7 @@ import pytest
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
-SQL_PATH = PROJECT_ROOT / "dags" / "sql" / "gold" / "dim_match.sql"
+SQL_PATH = PROJECT_ROOT / "dags" / "sql" / "gold" / "dim_match.sql.j2"
 
 
 def _read_sql() -> str:
@@ -38,101 +41,92 @@ def _strip_comments(sql: str) -> str:
 pytestmark = pytest.mark.unit
 
 
-class TestDimMatchCutoverStructure:
-    """Regex sanity over ``dim_match.sql`` post-E1.5 cutover."""
-
+class TestDimMatchStarStructure:
     def test_two_left_joins_on_silver_xref_team(self):
-        """Both home and away resolution use silver.xref_team."""
         sql = _strip_comments(_read_sql())
-        # We expect at least two occurrences (home + away).
         joins = re.findall(
-            r"LEFT\s+JOIN\s+iceberg\.silver\.xref_team",
-            sql, re.IGNORECASE,
+            r"LEFT\s+JOIN\s+iceberg\.silver\.xref_team", sql, re.IGNORECASE
         )
-        assert len(joins) >= 2, (
-            "dim_match.sql must LEFT JOIN iceberg.silver.xref_team at "
-            f"least twice (home + away); found {len(joins)}"
+        assert len(joins) == 2, (
+            f"expected exactly 2 LEFT JOINs on silver.xref_team "
+            f"(home + away), found {len(joins)}"
+        )
+
+    def test_referee_fk_via_xref_referee(self):
+        sql = _strip_comments(_read_sql())
+        assert re.search(
+            r"LEFT\s+JOIN\s+iceberg\.silver\.xref_referee", sql, re.IGNORECASE
+        ), "dim_match must resolve referee_id via silver.xref_referee"
+        assert re.search(r"AS\s+referee_id", sql, re.IGNORECASE)
+
+    def test_manager_fks_via_bronze_and_xref_manager(self):
+        sql = _strip_comments(_read_sql())
+        assert "iceberg.bronze.fbref_match_managers" in sql
+        assert "iceberg.silver.xref_manager" in sql
+        assert re.search(r"AS\s+home_manager_id", sql, re.IGNORECASE)
+        assert re.search(r"AS\s+away_manager_id", sql, re.IGNORECASE)
+        # bronze season is a year-start BIGINT — the slug conversion idiom
+        # must be present (silent type mismatch would zero the JOIN).
+        assert re.search(r"LPAD\(CAST\(MOD\(", sql, re.IGNORECASE), (
+            "bronze season bigint -> slug conversion (LPAD/MOD idiom) missing"
+        )
+
+    def test_venue_alias_placeholder_present(self):
+        """venue_id resolves via the SAME alias VALUES as dim_venue."""
+        assert "{{ venue_aliases_values_sql }}" in _read_sql()
+
+    def test_every_xref_join_has_league_and_season_predicate(self):
+        """All 4 xref JOIN blocks carry league AND season equality —
+        the anti-fan-out contract."""
+        sql = _strip_comments(_read_sql())
+        # Split on JOIN keywords and inspect each xref block.
+        blocks = re.split(r"(?:LEFT\s+)?(?:INNER\s+)?JOIN\s+", sql,
+                          flags=re.IGNORECASE)
+        xref_blocks = [b for b in blocks if b.startswith("iceberg.silver.xref")]
+        assert len(xref_blocks) == 4, (
+            f"expected 4 xref JOIN blocks (2×team, referee, manager), "
+            f"got {len(xref_blocks)}"
+        )
+        for block in xref_blocks:
+            assert re.search(r"\.league\s*=", block), (
+                f"xref JOIN missing league predicate: {block[:120]!r}"
+            )
+            assert re.search(r"\.season\s*=", block), (
+                f"xref JOIN missing season predicate: {block[:120]!r}"
+            )
+            assert re.search(r"source\s*=\s*'fbref'", block), (
+                f"xref JOIN missing source='fbref' filter: {block[:120]!r}"
+            )
+
+    def test_design_renames_applied(self):
+        sql = _strip_comments(_read_sql())
+        assert re.search(r"AS\s+match_date", sql, re.IGNORECASE)
+        assert re.search(r"AS\s+kickoff_time", sql, re.IGNORECASE)
+
+    def test_denormalised_extras_removed(self):
+        """Team names / total_goals / btts left the passport — stats live in
+        facts, names in dim_team (#425)."""
+        sql = _strip_comments(_read_sql())
+        for gone in ("home_team_name", "away_team_name", "total_goals",
+                     "btts"):
+            assert not re.search(rf"\b{gone}\b", sql, re.IGNORECASE), (
+                f"{gone!r} must not be emitted by dim_match anymore"
+            )
+
+    def test_home_and_away_canonical_id_selected(self):
+        sql = _strip_comments(_read_sql())
+        assert re.search(
+            r"home_x\.canonical_id\s+AS\s+home_team_id", sql, re.IGNORECASE
+        )
+        assert re.search(
+            r"away_x\.canonical_id\s+AS\s+away_team_id", sql, re.IGNORECASE
         )
 
     def test_no_legacy_entity_xref_in_executable_sql(self):
-        """gold.entity_xref must NOT appear outside header comments."""
         sql = _strip_comments(_read_sql())
-        assert "gold.entity_xref" not in sql, (
-            "dim_match.sql must NOT reference gold.entity_xref in "
-            "executable SQL after E1.5 cutover"
-        )
-
-    def test_each_join_has_fbref_source_filter(self):
-        """Every silver.xref_team JOIN must filter source = 'fbref' so
-        we don't accidentally match Understat/WhoScored canonicals."""
-        sql = _read_sql()
-        # Count occurrences of `source ... = ... 'fbref'` near the joins.
-        # Tolerant regex — alias-prefixed (home_x.source / away_x.source)
-        # is the documented form, but we also accept bare `source`.
-        fbref_filters = re.findall(
-            r"\.source\s*=\s*'fbref'", sql, re.IGNORECASE,
-        )
-        assert len(fbref_filters) >= 2, (
-            "dim_match.sql must filter `source = 'fbref'` on BOTH "
-            f"silver.xref_team joins; found {len(fbref_filters)}"
-        )
-
-    def test_each_join_includes_league_predicate(self):
-        """Both joins must include `<alias>.league = m.league` to
-        prevent the 1.5-4x fan-out (xref_team is per-season)."""
-        sql = _read_sql()
-        league_predicates = re.findall(
-            r"\.league\s*=\s*m\.league", sql, re.IGNORECASE,
-        )
-        assert len(league_predicates) >= 2, (
-            "dim_match.sql must have a `<alias>.league = m.league` "
-            "predicate in BOTH home and away joins to prevent the "
-            "documented 1.5-4x JOIN fan-out; found "
-            f"{len(league_predicates)}"
-        )
-
-    def test_each_join_casts_season_to_varchar(self):
-        """#404: both fbref_match_enriched.season and xref_team.season are slug
-        varchar — each JOIN is a direct `season = m.season` equality, no CAST."""
-        sql = _read_sql()
-        direct = re.findall(r"\.season\s*=\s*m\.season", sql, re.IGNORECASE)
-        assert len(direct) >= 2, (
-            "dim_match.sql must JOIN on `*.season = m.season` in BOTH home and "
-            f"away joins; found {len(direct)}"
-        )
-        assert "CAST(m.season AS varchar)" not in sql, (
-            "#404: season is slug now — CAST(m.season AS varchar) must be gone"
-        )
-
-    def test_home_and_away_canonical_id_selected(self):
-        """SELECT must surface canonical_id from both home and away alias."""
-        sql = _read_sql()
-        # Tolerant of `home_x.canonical_id AS home_team_id` style.
-        assert re.search(
-            r"home_x\.canonical_id\s+AS\s+home_team_id",
-            sql, re.IGNORECASE,
-        ), (
-            "dim_match.sql must SELECT `home_x.canonical_id AS "
-            "home_team_id`"
-        )
-        assert re.search(
-            r"away_x\.canonical_id\s+AS\s+away_team_id",
-            sql, re.IGNORECASE,
-        ), (
-            "dim_match.sql must SELECT `away_x.canonical_id AS "
-            "away_team_id`"
-        )
-
-    def test_migration_breadcrumb_in_header(self):
-        """E1.5 cutover breadcrumb must be present."""
-        sql = _read_sql()
-        assert "Migrated from gold.entity_xref to silver.xref_team in E1.5" in sql, (
-            "dim_match.sql must keep the E1.5 migration breadcrumb"
-        )
+        assert "entity_xref" not in sql
 
     def test_pure_select_no_create_table(self):
-        """gold_tasks wraps in CTAS — file must stay pure SELECT."""
         sql = _strip_comments(_read_sql())
-        assert "CREATE TABLE" not in sql.upper(), (
-            "dim_match.sql must remain a pure SELECT"
-        )
+        assert "CREATE TABLE" not in sql.upper()
+        assert "INSERT INTO" not in sql.upper()

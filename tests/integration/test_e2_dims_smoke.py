@@ -1,10 +1,10 @@
 """
-Smoke tests for E2 master-data dims against a live Trino (E2 — 2026-05).
+Smoke tests for the star-schema dims against a live Trino (#425).
 
 Verifies that, after the Gold DAG has run end-to-end at least once, the
-five new ``iceberg.gold.dim_*`` tables exist, are non-empty, and obey the
-R0.4 canonical-completeness contract (every row with a non-NULL
-``<base>_canonical`` carries ``<base>_source`` AND ``<base>_version``).
+``iceberg.gold.dim_*`` tables exist, respect their row-count contracts
+(config-driven dims match competitions.yaml exactly) and keep their PKs
+unique — the core star-schema invariant.
 
 These tests **require a running Trino**. They auto-skip when
 ``TRINO_HOST`` is not set so unit-test CI lanes don't fail on absence.
@@ -92,8 +92,14 @@ _TABLE_CASES = [
     ("iceberg.gold.dim_venue",       1,    None),
     ("iceberg.gold.dim_referee",     1,    None),
     ("iceberg.gold.dim_standings",   1,    None),
-    ("iceberg.gold.dim_competition", 5,    5),
-    ("iceberg.gold.dim_season",      5,    5),
+    ("iceberg.gold.dim_manager",     1,    None),
+    ("iceberg.gold.dim_player",      1,    None),
+    ("iceberg.gold.dim_team",        1,    None),
+    ("iceberg.gold.dim_match",       1,    None),
+    # #425: config-driven dims mirror competitions.yaml exactly —
+    # 8 competitions (1 in-scope + 7 stubs), 10 APL seasons (1617..2526).
+    ("iceberg.gold.dim_competition", 8,    8),
+    ("iceberg.gold.dim_season",      10,   10),
 ]
 
 
@@ -103,11 +109,11 @@ _TABLE_CASES = [
     ids=[c[0].split(".")[-1] for c in _TABLE_CASES],
 )
 def test_dim_table_row_counts(table, min_rows, exact_rows):
-    """Each E2 dim table must exist and respect its row-count contract.
+    """Each dim table must exist and respect its row-count contract.
 
-    * dim_competition → exactly 5 (one row per league in leagues.yaml)
-    * dim_season      → exactly 5 (5-season window)
-    * dim_venue/referee/standings → at least 1 row (depend on Bronze content)
+    * dim_competition → exactly 8 (one row per competitions.yaml entry)
+    * dim_season      → exactly 10 (union of in-scope seasons in the YAML)
+    * остальные dims  → at least 1 row (depend on Bronze content)
     """
     count = _scalar(f"SELECT COUNT(*) FROM {table}")
     assert count >= min_rows, (
@@ -120,35 +126,27 @@ def test_dim_table_row_counts(table, min_rows, exact_rows):
 
 
 # ---------------------------------------------------------------------------
-# Canonical-completeness probe — one per dim that carries _canonical/_source/_version
+# PK-uniqueness probe — the core star-schema invariant (#425)
 # ---------------------------------------------------------------------------
 
-# (table, base) where the columns are <base>_canonical / <base>_source / <base>_version.
-# dim_standings has no _canonical triple — its source-of-truth lives in the
-# team_id_source column (see SQL header comment) — so it is intentionally excluded.
-_CANONICAL_CASES = [
-    ("iceberg.gold.dim_venue",       "venue"),
-    ("iceberg.gold.dim_referee",     "referee"),
-    ("iceberg.gold.dim_competition", "competition"),
+_PK_CASES = [
+    ("iceberg.gold.dim_competition", "league"),
     ("iceberg.gold.dim_season",      "season"),
+    ("iceberg.gold.dim_venue",       "venue_id"),
+    ("iceberg.gold.dim_player",      "player_id"),
+    ("iceberg.gold.dim_team",        "team_id"),
+    ("iceberg.gold.dim_referee",     "referee_id"),
+    ("iceberg.gold.dim_manager",     "manager_id"),
+    ("iceberg.gold.dim_match",       "match_id"),
 ]
 
 
 @pytest.mark.parametrize(
-    "table,base",
-    _CANONICAL_CASES,
-    ids=[f"{c[0].split('.')[-1]}/{c[1]}" for c in _CANONICAL_CASES],
+    "table,pk",
+    _PK_CASES,
+    ids=[c[0].split(".")[-1] for c in _PK_CASES],
 )
-def test_canonical_completeness_zero_offenders(table, base):
-    """R0.4: rows with non-NULL ``<base>_canonical`` MUST also carry non-NULL
-    ``<base>_source`` AND ``<base>_version``."""
-    sql = (
-        f"SELECT COUNT(*) FROM {table} "
-        f"WHERE {base}_canonical IS NOT NULL "
-        f"AND ({base}_source IS NULL OR {base}_version IS NULL)"
-    )
-    offenders = _scalar(sql)
-    assert offenders == 0, (
-        f"{table} has {offenders} row(s) violating canonical completeness "
-        f"({base}_canonical present but {base}_source or {base}_version is NULL)"
-    )
+def test_dim_pk_unique(table, pk):
+    """#425 DoD: every star dim PK is unique (0 duplicate keys)."""
+    dups = _scalar(f"SELECT COUNT(*) - COUNT(DISTINCT {pk}) FROM {table}")
+    assert dups == 0, f"{table} has {dups} duplicate {pk} value(s)"

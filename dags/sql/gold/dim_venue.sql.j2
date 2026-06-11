@@ -25,12 +25,14 @@
 -- via `gold_tasks.run_gold_transform`. This file MUST stay a pure SELECT.
 --
 -- PK:           venue_id   (guaranteed unique by the final GROUP BY)
--- Partitioning: NONE  (small global dim, queried by venue_id / venue_slug)
+-- Partitioning: NONE  (small global dim, queried by venue_id)
 --
--- Source-of-truth selection (R0.4 schema versioning):
---   venue_canonical = canonical_name from YAML, else MAX(name) fbref > espn
---   venue_source    = 'curated' (matched alias) | 'orphan' (unmatched)
---   venue_version   = 'v2'  (bumped from 'v1': hash-name identity -> alias slug)
+-- Output columns (star-schema design, issue #425):
+--   venue_name   = canonical_name from YAML, else MAX(name) fbref > espn
+--   city/country = from venue_aliases.yaml (NULL for orphans)
+--   capacity     = NULL placeholder (no source yet; enrichment followup)
+--   venue_source = 'curated' (matched alias) | 'orphan' (unmatched) — kept
+--                  for the orphan-rate DQ check in validate_gold_quality
 --
 -- Notes:
 --   * city / country come from venue_aliases.yaml for curated venues; NULL for
@@ -153,17 +155,14 @@ aggregated as (
 
 select
     venue_id,
-    coalesce(canonical_name, venue_fbref, venue_espn)                          as venue_canonical,
-    case when canonical_id is not null then 'curated' else 'orphan' end        as venue_source,
-    'v2'                                                                       as venue_version,
-    venue_fbref,
-    venue_espn,
-    lower(regexp_replace(coalesce(canonical_name, venue_fbref, venue_espn), '[^a-zA-Z0-9]+', '_'))  as venue_slug,
+    coalesce(canonical_name, venue_fbref, venue_espn)                          as venue_name,
     city,
     country,
-    n_matches,
-    first_seen_date,
-    last_seen_date,
-    league,
-    season
+    -- No capacity source yet (ESPN's column is 100% NULL — see
+    -- feedback_bronze_expected_null_columns). Placeholder keeps the schema
+    -- aligned to the star design (issue #425); enrichment is a followup.
+    cast(null as integer)                                                      as capacity,
+    -- Kept beyond the design's column list: the orphan-rate DQ check in
+    -- gold_tasks.validate_gold_quality filters on venue_source = 'orphan'.
+    case when canonical_id is not null then 'curated' else 'orphan' end        as venue_source
 from aggregated

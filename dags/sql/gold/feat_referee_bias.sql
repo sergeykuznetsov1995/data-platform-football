@@ -8,16 +8,13 @@
 -- noise from cold-start referees in early matchdays.
 --
 -- Sources:
---   iceberg.gold.dim_match           (referee, date, season, league, result)
+--   iceberg.gold.dim_match           (referee_id, match_date, season, league, result)
 --   iceberg.gold.fct_card            (yellow/red counts per match)
 --   iceberg.gold.fct_goal            (penalty + total goal counts per match)
 --
--- referee_id derivation: inline-hash mirroring dim_referee.sql:40
---   'ref_' || lower(to_hex(xxhash64(to_utf8(
---       regexp_replace(normalize(lower(trim(referee)), NFD), '\p{Mn}+', '')))))
--- We do NOT JOIN dim_referee on text — alias drift would silently fan-out.
--- The NFD diacritic-fold (issue #228) makes "Cakir" and "Çakır" hash identically
--- AND keeps this inline hash byte-identical to dim_referee for join consistency.
+-- referee_id (#425): read directly from dim_match.referee_id — the canonical
+-- silver.xref_referee id resolved once at the star centre. The legacy inline
+-- name-hash is gone; ids are consistent with dim_referee by construction.
 --
 -- DAG-integration note: gold_tasks.run_gold_transform() wraps this SELECT in
 -- `CREATE TABLE iceberg.gold.feat_referee_bias AS ... WITH
@@ -30,21 +27,18 @@
 -- =============================================================================
 
 WITH match_with_ref AS (
-    -- Spine: matches with a non-empty referee. Inline-hash the referee name.
+    -- Spine: matches with a resolved canonical referee (#425).
     SELECT
-        'ref_' || lower(to_hex(xxhash64(to_utf8(
-            regexp_replace(normalize(lower(trim(m.referee)), NFD), '\p{Mn}+', '')
-        ))))                                                                AS referee_id,
+        m.referee_id,
         m.match_id,
-        m.date,
+        m.match_date AS date,
         m.season,
         m.league,
         m.result_1x2,
         m.home_score,
         m.away_score
     FROM iceberg.gold.dim_match m
-    WHERE m.referee IS NOT NULL
-      AND TRIM(m.referee) <> ''
+    WHERE m.referee_id IS NOT NULL
 ),
 
 card_agg AS (
