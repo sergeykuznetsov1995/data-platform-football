@@ -30,6 +30,10 @@
 --   * Bronze ingest mode = replace_partitions → ROW_NUMBER dedup defensive.
 --   * (league, season) JOIN predicate на xref_player MANDATORY
 --     (feedback_xref_join_season_predicate.md).
+--   * is_loan (#429): LOWER(fee_text) LIKE '%loan%'. ⚠️ Добавление колонки
+--     требует одноразового DROP TABLE iceberg.silver.transfermarkt_transfers
+--     перед прогоном (CREATE OR REPLACE сверяет схему позиционно —
+--     feedback_silver_create_or_replace_positional_schema).
 -- =============================================================================
 
 WITH aliases AS (
@@ -80,6 +84,11 @@ SELECT
     CAST(b.fee_eur AS BIGINT)                          AS fee_eur,
     CAST(b.market_value_eur AS BIGINT)                 AS market_value_eur,
     b.is_upcoming,
+    -- #429: loan flag for gold.fct_transfer. Live fee_text variants:
+    -- 'loan transfer', 'End of loan', 'Loan fee:<br />…€2.00m' → TRUE;
+    -- '€30.00m' / 'free transfer' / '-' / '?' → FALSE. fee_text is never
+    -- NULL in bronze (verified 2026-06-11), so is_loan is never NULL.
+    LOWER(b.fee_text) LIKE '%loan%'                    AS is_loan,
 
     b._ingested_at                                     AS _bronze_ingested_at,
 
