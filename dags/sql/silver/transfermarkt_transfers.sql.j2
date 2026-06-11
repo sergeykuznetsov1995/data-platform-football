@@ -34,13 +34,22 @@
 --     требует одноразового DROP TABLE iceberg.silver.transfermarkt_transfers
 --     перед прогоном (CREATE OR REPLACE сверяет схему позиционно —
 --     feedback_silver_create_or_replace_positional_schema).
+--   * aliases дедупится GROUP BY raw_name + MAX (#465): дубль raw_name в
+--     2-tuple VALUES (одноимённые клубы разных лиг) иначе фанит оба
+--     club-JOIN'а (прецедент — venue-коллизия #425).
 -- =============================================================================
 
 WITH aliases AS (
-    SELECT raw_name, canonical_name
+    -- #465 guard: one row per raw_name. The 2-tuple VALUES is rendered with
+    -- NO source/league filter, and _iter_team_aliases dedups on the FULL
+    -- (raw, canonical, canonical_id) tuple — so one raw_name can reach this
+    -- CTE twice (worldwide namesake clubs). A non-unique raw_name would fan
+    -- out BOTH club JOINs below (a_from / a_to).
+    SELECT raw_name, MAX(canonical_name) AS canonical_name
     FROM (VALUES
         {{ team_aliases_values_sql }}
     ) AS t(raw_name, canonical_name)
+    GROUP BY raw_name
 ),
 
 bronze_dedup AS (
