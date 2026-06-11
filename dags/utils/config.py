@@ -65,10 +65,12 @@ SCHEDULES: Dict[str, str] = {
 }
 
 # Minimum row thresholds for validation (per single DagRun = 1 league x 1 season).
-# Consumed by _validate_table() in dag_ingest_whoscored.py (keys
-# 'whoscored_schedule' + 'whoscored_events'; fail-closed on a missing key, #106).
-# Currently LEAGUES=['ENG-Premier League'] and CURRENT_SEASON is one season, so
-# values below are sized for 1 APL season.
+# Consumed by validate_table() in dags/utils/bronze_validation.py (fail-closed
+# on a missing key, #106/#110) via the validate tasks in the whoscored / espn /
+# understat / sofifa ingest DAGs. Currently LEAGUES=['ENG-Premier League'] and
+# CURRENT_SEASON is one season, so values below are sized for 1 APL season
+# (floor against a wiped/empty table — whole-table COUNT(*), so they must not
+# false-fail if the configured scope ever shrinks to one season).
 MIN_ROW_THRESHOLDS: Dict[str, int] = {
     'schedule': 350,        # 380 APL matches/season, allow ~5-10% missing/postponed
     'player_stats': 500,    # ~600-800 unique player-season rows expected, ~25% margin
@@ -76,10 +78,25 @@ MIN_ROW_THRESHOLDS: Dict[str, int] = {
     'shots': 8000,          # ~10k shots/season, ~20% margin
     'elo_ratings': 100,     # ClubElo not in FBref-only roadmap; left unchanged
     # WhoScored (issue #106): hidden-enabler thresholds. Without these keys,
-    # _validate_table() in dag_ingest_whoscored.py falls back to 0 and silently
-    # passes an empty schedule scrape (root cause of #102). Sized for APL 1 season.
+    # validate_table() falls back to 0 and silently passes an empty schedule
+    # scrape (root cause of #102). Sized for APL 1 season.
     'whoscored_schedule': 340,    # 380 fixtures/season - 5-10% margin
     'whoscored_events': 500_000,  # ~540k events/season - 7% margin
+    # ESPN / Understat / SoFIFA (issue #466): same silent-fail class as #102 —
+    # read_* swallowed errors and runners exited 0. Floors calibrated against
+    # live Bronze counts on 2026-06-11.
+    'espn_schedule': 340,                  # 380 fixtures/season - 10% margin
+    'understat_schedule': 340,             # 380 fixtures/season - 10% margin
+    'understat_players': 450,              # ~547 player-season rows/season - 18%
+    'understat_shots': 8000,               # ~9.8k shots/season - 20% margin
+    'understat_team_match_stats': 340,     # 380 team-match rows/season - 10%
+    'understat_player_match_stats': 10_000,  # ~11.1k rows/season - 10% margin
+    'sofifa_players': 450,                 # 546 players / APL edition - 18%
+    'sofifa_teams': 18,                    # 20 APL clubs - 10%
+    'sofifa_team_ratings': 18,             # 20 APL clubs - 10%
+    'sofifa_versions': 800,                # 852-row catalogue, grows only
+    'sofifa_leagues': 1,                   # 1-row lookup (APL-only scope)
+    'sofifa_player_ratings': 450,          # 546 per-player pages / edition - 18%
 }
 
 # Tags for DAG organization

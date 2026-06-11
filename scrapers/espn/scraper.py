@@ -93,8 +93,11 @@ class ESPNScraper(SoccerdataScraper):
             return df
 
         except Exception as e:
+            # Issue #466: propagate instead of returning None — a swallowed
+            # error leaves the runner's results['errors'] empty -> exit 0 ->
+            # green DAG while Bronze silently goes stale.
             logger.error(f"Error reading schedule: {e}")
-            return None
+            raise
 
     def _standardize_schedule(self, df: pd.DataFrame) -> pd.DataFrame:
         """

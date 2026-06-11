@@ -206,7 +206,10 @@ def main():
     )
     logger.info(f"Scraper complete: {total_rows} total rows")
     print(json.dumps(results))
-    return 0
+    # Issue #466: non-zero exit when any scrape step failed — otherwise the
+    # BashOperator stays green while team_ratings/versions/leagues/
+    # player_ratings silently go stale for weeks.
+    return 1 if results.get('errors') else 0
 
 
 if __name__ == '__main__':

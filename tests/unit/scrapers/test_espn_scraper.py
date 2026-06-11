@@ -56,6 +56,16 @@ class TestESPNScraper:
         assert 'match_date' in result.columns
         assert 'home_goals' in result.columns
 
+    def test_read_schedule_raises_on_reader_error(self, scraper):
+        """Issue #466: read_schedule must propagate reader errors instead of
+        returning None — a swallowed exception leaves the runner's
+        results['errors'] empty -> exit 0 -> green DAG on total failure."""
+        with patch.object(scraper, '_get_reader', return_value=MagicMock()), \
+             patch.object(scraper, '_execute_with_resilience',
+                          side_effect=RuntimeError('CF block')):
+            with pytest.raises(RuntimeError, match='CF block'):
+                scraper.read_schedule()
+
     def test_scrape_schedule_uses_replace_partitions(self, scraper):
         """Regression #347: scrape_schedule MUST pass replace_partitions=['league',
         'season'] so daily writes replace each partition instead of appending

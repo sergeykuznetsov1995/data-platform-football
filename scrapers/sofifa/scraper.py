@@ -96,8 +96,11 @@ class SoFIFAScraper(SoccerdataScraper):
             return df
 
         except Exception as e:
+            # Issue #466: propagate instead of returning None — a swallowed
+            # error leaves the runner's results['errors'] empty -> exit 0 ->
+            # green DAG while Bronze silently goes stale.
             logger.error(f"Error reading player data: {e}")
-            return None
+            raise
 
     def read_teams(self) -> Optional[pd.DataFrame]:
         """
@@ -120,7 +123,7 @@ class SoFIFAScraper(SoccerdataScraper):
 
         except Exception as e:
             logger.error(f"Error reading team data: {e}")
-            return None
+            raise
 
     def read_player_ratings(self) -> Optional[pd.DataFrame]:
         """Read per-player FIFA attribute ratings (issue #42).
@@ -144,7 +147,7 @@ class SoFIFAScraper(SoccerdataScraper):
             return df
         except Exception as e:
             logger.error(f"Error reading player ratings: {e}")
-            return None
+            raise
 
     def read_team_ratings(self) -> Optional[pd.DataFrame]:
         """Read per-team FIFA ratings (overall/attack/midfield/defence + the
@@ -166,7 +169,7 @@ class SoFIFAScraper(SoccerdataScraper):
             return df
         except Exception as e:
             logger.error(f"Error reading team ratings: {e}")
-            return None
+            raise
 
     @staticmethod
     def _enrich_team_id(df: pd.DataFrame, reader) -> pd.DataFrame:
@@ -211,7 +214,7 @@ class SoFIFAScraper(SoccerdataScraper):
             return df
         except Exception as e:
             logger.error(f"Error reading versions: {e}")
-            return None
+            raise
 
     def read_leagues(self) -> Optional[pd.DataFrame]:
         """Read the league -> sofifa league_id lookup for the selected leagues.
@@ -228,7 +231,7 @@ class SoFIFAScraper(SoccerdataScraper):
             return df
         except Exception as e:
             logger.error(f"Error reading leagues: {e}")
-            return None
+            raise
 
     def _process_player_data(self, df: pd.DataFrame) -> pd.DataFrame:
         """
