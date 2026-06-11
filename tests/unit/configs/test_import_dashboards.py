@@ -128,4 +128,6 @@ def test_dashboards_import() -> None:
         else:
             found += 1
     assert not failures, "\n".join(failures)
-    assert found >= 3, f"expected >=3 dashboard modules, parsed {found}"
+    # #478: производный gold-этаж удалён — остались player_overview +
+    # оркестратор import_dashboards (оба экспортируют требуемые атрибуты).
+    assert found >= 2, f"expected >=2 dashboard modules, parsed {found}"

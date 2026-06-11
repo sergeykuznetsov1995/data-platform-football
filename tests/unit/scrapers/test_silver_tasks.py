@@ -195,7 +195,7 @@ class TestRunSilverTransform:
         assert "_silver_created_at" not in ctas_sql
         assert "CURRENT_TIMESTAMP" not in ctas_sql
         # The user SELECT is inlined directly (no FROM (...) wrapping)
-        assert "SELECT m.* FROM iceberg.gold.fct_match m" in ctas_sql
+        assert "SELECT m.* FROM iceberg.gold.fct_team_match m" in ctas_sql
 
     def test_add_timestamp_default_is_true(self, tmp_path):
         """Backward-compat: omitting add_timestamp behaves like add_timestamp=True."""
