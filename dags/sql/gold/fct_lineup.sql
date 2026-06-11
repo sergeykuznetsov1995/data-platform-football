@@ -12,7 +12,8 @@
 --   iceberg.silver.fbref_match_enriched  — bridge spine for ESPN → FBref match_id
 --   iceberg.bronze.espn_schedule         — provides `date` for bridge JOIN
 --
--- PK:           (match_id_canonical, player_id_canonical)
+-- Design contract: docs/design/gold-star-schema.md §4.5 (issue #426).
+-- PK:           (match_id, player_id)
 -- Partitioning: (league, season)  — applied externally by Python CTAS.
 --
 -- =============================================================================
@@ -82,17 +83,18 @@
 --   and DQ can track the (match × team) starter-count as a sanity probe.
 --
 -- =============================================================================
--- Output schema (frozen for E3.5)
+-- Output schema (frozen — star design §4.5)
 -- =============================================================================
---   match_id_canonical    varchar  -- via xref_match (FBref) / bridge (ESPN)
---   team_id_canonical     varchar  -- via xref_team — NULL-tolerant
---   player_id_canonical   varchar  -- via xref_player (FBref); NULL for ESPN
---   player_name           varchar  -- passthrough
+--   match_id              varchar  -- via xref_match (FBref) / bridge (ESPN)
+--   team_id               varchar  -- via xref_team — NULL-tolerant
+--   player_id             varchar  -- via xref_player (FBref); NULL for ESPN
 --   is_starter            boolean
---   position_canonical    varchar  -- raw passthrough — no canonicalisation in MVP
+--   position              varchar  -- raw passthrough — no canonicalisation in MVP
 --                                     (FBref Silver also keeps raw position;
 --                                      dim_position deferred until used)
 --   jersey_number         integer  -- NULL for ESPN (matchsheet has no jersey)
+--   is_captain            boolean  -- NULL placeholder: neither FBref nor ESPN lineups
+--                                     carry captaincy; SofaScore enrichment is a #426 followup
 --   lineup_source         varchar  -- 'fbref' | 'espn' (winner after dedup)
 --   lineup_version        varchar  -- literal 'v1' (schema versioning hook)
 --   league                varchar
@@ -300,13 +302,15 @@ dedup AS (
 )
 
 SELECT
-    match_id_canonical,
-    team_id_canonical,
-    player_id_canonical,
-    player_name,
+    match_id_canonical              AS match_id,
+    team_id_canonical               AS team_id,
+    player_id_canonical             AS player_id,
     is_starter,
-    position_canonical,
+    position_canonical              AS position,
     jersey_number,
+    -- is_captain: neither FBref nor ESPN lineup feeds carry captaincy.
+    -- Typed NULL per star design §4.5; SofaScore enrichment is a #426 followup.
+    CAST(NULL AS boolean)           AS is_captain,
     lineup_source,
     'v1'                            AS lineup_version,
     league,

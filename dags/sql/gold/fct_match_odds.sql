@@ -18,18 +18,18 @@
 -- This file MUST stay a pure SELECT (no CREATE TABLE, no DDL).
 --
 -- =============================================================================
--- Output schema (frozen for E4 wave-1)
+-- Output schema (frozen — star design §4.7, issue #426)
 -- =============================================================================
---   match_id_canonical    varchar          == gold.dim_match.match_id
---   bookmaker_code        varchar          'B365' | 'PS' | 'WH' | 'VC' | 'IW'
+--   match_id              varchar          == gold.dim_match.match_id
+--   bookmaker             varchar          'B365' | 'PS' | 'WH' | 'VC' | 'IW'
 --                                          | 'BW' | 'AVG' | 'MAX'
 --   market                varchar          '1x2' | 'ah' | 'ou_2_5'
---   odds_h                decimal(6,3)     1x2.home OR ah.home OR ou.over
---   odds_d                decimal(6,3)     1x2.draw; NULL for ah / ou_2_5
---   odds_a                decimal(6,3)     1x2.away OR ah.away OR ou.under
---   ah_handicap           decimal(4,2)     handicap line; NULL outside 'ah'
+--   odds_home             decimal(6,3)     1x2.home OR ah.home OR ou.over
+--   odds_draw             decimal(6,3)     1x2.draw; NULL for ah / ou_2_5
+--   odds_away             decimal(6,3)     1x2.away OR ah.away OR ou.under
+--   ah_line               decimal(4,2)     handicap line; NULL outside 'ah'
 --   ou_line               decimal(4,2)     O/U line (=2.5); NULL outside 'ou_2_5'
---   closing_flag          boolean          TRUE = closing-line odds
+--   is_closing            boolean          TRUE = closing-line odds
 --   odds_canonical        varchar          xxhash64 synthetic PK
 --   odds_source           varchar          'matchhistory'
 --   odds_version          varchar          literal 'v1'
@@ -38,10 +38,10 @@
 --                                          slug '2425' after #404)
 --   _ingested_at          timestamp(6)     bronze provenance
 --
--- Logical PK: odds_canonical
---   xxhash64 over (match || bookmaker || market || closing_flag). One row
---   per (match, bookmaker, market, closing_flag) is the silver invariant —
---   PK uniqueness in gold falls out for free.
+-- PK: (match_id, bookmaker, market, is_closing); odds_canonical is the same
+--   quadruple hashed (xxhash64) — hash input unchanged across #426 renames.
+--   One row per quadruple is the silver invariant — PK uniqueness in gold
+--   falls out for free.
 --
 -- =============================================================================
 -- Season type
@@ -51,15 +51,15 @@
 -- =============================================================================
 
 SELECT
-    s.match_id_canonical,
-    s.bookmaker_code,
+    s.match_id_canonical                     AS match_id,
+    s.bookmaker_code                         AS bookmaker,
     s.market,
-    s.odds_h,
-    s.odds_d,
-    s.odds_a,
-    s.ah_handicap,
+    s.odds_h                                 AS odds_home,
+    s.odds_d                                 AS odds_draw,
+    s.odds_a                                 AS odds_away,
+    s.ah_handicap                            AS ah_line,
     s.ou_line,
-    s.closing_flag,
+    s.closing_flag                           AS is_closing,
 
     -- ============================================================
     -- canonical-trio: synthetic PK + provenance

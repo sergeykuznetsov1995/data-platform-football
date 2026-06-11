@@ -7,23 +7,21 @@
 -- Goal: keep the Gold contract intact so feat_team_form's LEFT JOIN keeps
 -- resolving (finds 0 rows, COALESCEs to 0 unavailable players per match).
 --
--- Schema MUST mirror fct_player_unavailable.sql exactly. Spine is dim_match
--- with WHERE 1=0 — Trino preserves column types from the SELECT list; the
--- CAST(NULL AS …) calls anchor types for columns not sourced from dim_match.
+-- Schema MUST mirror fct_player_unavailable.sql exactly (star design §4.6,
+-- issue #426). Spine is dim_match with WHERE 1=0 — Trino preserves column
+-- types from the SELECT list; the CAST(NULL AS …) calls anchor types for
+-- columns not sourced from dim_match.
 -- =============================================================================
 
 SELECT
     match_id,
-    match_date,
 
     CAST(NULL AS VARCHAR)              AS team_id,
-    CAST(NULL AS VARCHAR)              AS team_name_raw,
 
-    CAST(NULL AS VARCHAR)              AS player_id_canonical,
-    CAST(NULL AS BIGINT)               AS ws_player_id,
-    CAST(NULL AS VARCHAR)              AS player_name,
+    CAST(NULL AS VARCHAR)              AS player_id,
 
     CAST(NULL AS VARCHAR)              AS reason,
+    CAST(NULL AS VARCHAR)              AS detail,
 
     -- Type does not need to match the non-fallback timestamp(3 with tz)
     -- variant: table is rebuilt every run (DROP + CTAS) and downstream

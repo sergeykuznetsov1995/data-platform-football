@@ -1,14 +1,16 @@
 -- =============================================================================
--- Gold: fct_team_match (v2 — 5-source: FBref + Understat + WhoScored + SofaScore + FotMob)
+-- Gold: fct_team_match (5-source: FBref + Understat + WhoScored + SofaScore + FotMob)
 -- =============================================================================
--- Long-form fact: one row per (match_id, team_id).
+-- Long-form fact: one row per (match_id, team_id) — exactly 2 rows per match.
 --
--- Used by: feat_team_form (rolling), feat_team_h2h, feat_team_event_style.
--- v1 column set (19 columns) is preserved exactly per design doc §6.1 —
--- downstream features INNER-JOIN those columns and ANY rename/drop/type-change
--- would break them.
+-- Used by: feat_team_form (rolling), feat_team_h2h, feat_team_event_style,
+--          feat_team_xg_form.
 --
--- Design contract: docs/decisions/T6_team_facts_schema.md §6 (issue #95).
+-- Design contract: docs/design/gold-star-schema.md §4.1 (issue #426).
+-- Columns follow the star-schema groups (context / result / shots / xG /
+-- possession-passing / pressing-defence / duels / discipline). Extra context
+-- columns date/gameweek/result/is_completed are kept beyond the design list —
+-- the derived feat_* tier reads them directly (scope decision in #426).
 --
 -- Sources:
 --   iceberg.gold.dim_match                 (spine — FBref canonical)
@@ -185,7 +187,6 @@ home AS (
         m.home_possession  AS possession,
         m.home_yellow_cards AS yellow_cards,
         m.home_red_cards   AS red_cards,
-        m.home_saves       AS saves,
         dm.is_completed
     FROM iceberg.gold.dim_match dm
     JOIN iceberg.silver.fbref_match_enriched m ON m.match_id = dm.match_id
@@ -207,7 +208,6 @@ away AS (
         m.away_possession  AS possession,
         m.away_yellow_cards AS yellow_cards,
         m.away_red_cards   AS red_cards,
-        m.away_saves       AS saves,
         dm.is_completed
     FROM iceberg.gold.dim_match dm
     JOIN iceberg.silver.fbref_match_enriched m ON m.match_id = dm.match_id
@@ -228,21 +228,20 @@ unioned_with_slug AS (
 )
 
 SELECT
-    -- ===== v1 columns — preserved exactly (backwards-compat invariant) =====
+    -- ===== PK / FK =====
     u.match_id,
     u.team_id,
     u.opponent_id,
+
+    -- ===== Context (design + derived-tier extras) =====
+    u.is_home,
     u.date,
     u.gameweek,
-    u.is_home,
+    u.is_completed,
+
+    -- ===== Result =====
     u.goals_for,
     u.goals_against,
-    u.shots,
-    u.shots_on_target,
-    u.possession,
-    u.yellow_cards,
-    u.red_cards,
-    u.saves,
     CASE
         WHEN u.goals_for > u.goals_against THEN 3
         WHEN u.goals_for = u.goals_against THEN 1
@@ -253,53 +252,48 @@ SELECT
         WHEN u.goals_for = u.goals_against THEN 'D'
         ELSE 'L'
     END AS result,
-    u.is_completed,
 
-    -- ===== v2 MODELED — xG / xA (Understat primary per RX2; FotMob then SS fallback) =====
-    ROUND(COALESCE(us.xg,          fm.expected_goals, ss.expected_goals),  4) AS expected_goals,
-    -- FotMob does not expose team-grain xGA at match grain → COALESCE stays us → ss.
-    ROUND(COALESCE(us.xg_against,  ss.expected_goals_against), 4) AS expected_goals_against,
-    -- expected_assists: FotMob is the ONLY source with team-grain xA (#97). Understat /
-    -- SofaScore team-stats do not expose it. Filled from silver.fotmob_team_match.
-    ROUND(fm.expected_assists, 4)                                 AS expected_assists,
+    -- ===== Shots =====
+    u.shots,
+    u.shots_on_target,
+    fm.shots_inside_box                                           AS shots_in_box,
+    fm.big_chances,
+
+    -- ===== Expected metrics (Understat primary per RX2; FotMob then SS fallback) =====
+    ROUND(COALESCE(us.xg,          fm.expected_goals, ss.expected_goals),  4) AS xg,
     ROUND(COALESCE(us.npxg, fm.npxg), 4)                          AS npxg,
+    -- FotMob does not expose team-grain xGA at match grain → COALESCE stays us → ss.
+    ROUND(COALESCE(us.xg_against,  ss.expected_goals_against), 4) AS xga,
+    ROUND(fm.xgot, 4)                                             AS xgot,
+    -- xa: FotMob is the ONLY source with team-grain xA (#97).
+    ROUND(fm.expected_assists, 4)                                 AS xa,
 
-    -- ===== v2 UNIQUE_UNDERSTAT (pressing / depth) =====
-    us.ppda,
+    -- ===== Possession / passing =====
+    u.possession                                                  AS possession_pct,
+    -- SofaScore official match stats primary; WhoScored SPADL aggregate fallback
+    -- (WS block is NULL for current seasons until #120).
+    COALESCE(ss.total_passes,        ws.pass_total)               AS passes,
+    COALESCE(ss.accurate_passes_pct, ws.pass_pct)                 AS pass_accuracy_pct,
+    -- touches_in_box: WS is NULL for current seasons (#120) → fall back to FotMob.
+    COALESCE(ws.touches_in_box, fm.touches_in_box)                AS touches_in_box,
     us.deep_completions,
 
-    -- ===== v2 UNIQUE_WHOSCORED (SPADL event aggregates) =====
-    -- NULL for current seasons until issue #120 lands WS canonical resolve.
-    ws.pass_total,
-    ws.pass_ok,
-    ws.pass_pct,
-    ws.tackle_att,
-    ws.tackle_won,
-    ws.takeon_att,
-    ws.takeon_won,
-    -- touches_in_box: WS is NULL for current seasons (#120) → fall back to FotMob.
-    COALESCE(ws.touches_in_box, fm.touches_in_box)               AS touches_in_box,
-    ws.key_passes_ws,
-
-    -- ===== v2 UNIQUE_SOFASCORE (passing / duels / breakdowns) =====
-    ss.total_passes,
-    ss.accurate_passes,
-    ss.accurate_passes_pct,
-    ss.corner_kicks,
-    ss.fouls           AS fouls_ss,
-    ss.offsides        AS offsides_ss,
-    ss.ground_duels_won,
-    ss.aerial_duels_won,
-
-    -- ===== v2 UNIQUE_FOTMOB (#97 — metrics no other source provides at match grain) =====
-    ROUND(fm.xgot, 4)                                            AS xgot,
-    fm.big_chances,
-    fm.big_chances_missed,
-    fm.shots_inside_box,
-    fm.shots_outside_box,
-    fm.blocked_shots,
-    fm.shots_off_target,
+    -- ===== Pressing / defence =====
+    us.ppda,
+    COALESCE(ss.total_tackles,  ws.tackle_att)                    AS tackles,
+    COALESCE(ss.interceptions,  ws.interceptions)                 AS interceptions,
     fm.clearances,
+    ws.ball_recoveries,
+
+    -- ===== Duels (SofaScore only) =====
+    ss.ground_duels_won_pct,
+    ss.aerial_duels_won_pct,
+
+    -- ===== Discipline / set pieces =====
+    ss.fouls,
+    u.yellow_cards,
+    u.red_cards,
+    ss.corner_kicks                                               AS corners,
 
     -- ===== Lineage =====
     CURRENT_TIMESTAMP                                             AS _gold_created_at,
