@@ -26,8 +26,8 @@ DAGS_DIR = PROJECT_ROOT / 'dags'
 
 class TestSilverMatchEnrichedSQL:
     """fbref_match_enriched.sql must keep generating pseudo-match_ids for
-    future fixtures. Without this, future matches drop out of Silver and
-    predictions_input becomes empty."""
+    future fixtures. Without this, future matches silently drop out of
+    Silver/Gold."""
 
     @pytest.fixture
     def sql_text(self) -> str:
@@ -77,7 +77,6 @@ def _has_airflow() -> bool:
 SMOKE_DAG_FILES = [
     'dag_transform_fbref_silver.py',
     'dag_transform_fbref_gold.py',
-    'dag_serve_predictions.py',
 ]
 
 

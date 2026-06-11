@@ -29,8 +29,8 @@ WITH sch_raw AS (
     SELECT *,
            -- Real FBref match_id is a hex slug from /matches/<id>/.
            -- For FUTURE fixtures FBref hasn't published a match page yet, so match_url is empty.
-           -- We synthesise a deterministic pseudo-id so future matches survive Silver/Gold and
-           -- can be served by predictions_input. Prefix 'fut_' guarantees zero collision with
+           -- We synthesise a deterministic pseudo-id so future matches survive
+           -- Silver/Gold. Prefix 'fut_' guarantees zero collision with
            -- real hex slugs and makes them trivially identifiable in downstream layers.
            --
            -- Hash inputs (in priority order):

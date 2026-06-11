@@ -60,7 +60,6 @@ TABLES: dict[str, dict] = {
     'gold.dim_team':                     {'sums': []},
     'gold.dim_player':                   {'sums': []},
     'gold.dim_manager':                  {'sums': []},
-    'gold.match_outcomes':               {'sums': ['total_goals']},
     'gold.fct_match_odds':               {'sums': []},
     # ---- Gold facts ----
     'gold.fct_player_match':             {'sums': ['goals', 'assists', 'minutes']},
@@ -76,11 +75,6 @@ TABLES: dict[str, dict] = {
     'gold.fct_player_market_value':      {'sums': ['market_value_eur']},
     # ---- Gold dims without a season column (cardinality-only sanity) ----
     'gold.dim_referee':                  {'sums': [], 'no_season': True},
-    # ---- gold-on-gold (inherit slug; row counts must be stable) ----
-    'gold.fct_match':                    {'sums': []},
-    'gold.fct_match_train':              {'sums': []},
-    'gold.fct_match_test':               {'sums': []},
-    'gold.predictions_input':            {'sums': []},
 }
 
 

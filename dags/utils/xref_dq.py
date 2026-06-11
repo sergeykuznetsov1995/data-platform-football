@@ -489,7 +489,7 @@ def build_e1_5_post_cutover_checks() -> List[Check]:
     ≥3-day green-parity gate-watch window without breaking the DAG. After
     cutover-merge a follow-up PR may tighten the team-level check to ERROR.
 
-    Six checks (all severity=WARNING in this prep PR):
+    Four checks (all severity=WARNING in this prep PR):
 
     1. ``ref_integrity[dim_team.team_id->silver.xref_team(fbref).canonical_id]``
        — Gold dim_team.team_id must trace back to silver.xref_team for the
@@ -501,18 +501,14 @@ def build_e1_5_post_cutover_checks() -> List[Check]:
        ref_integrity check that catches team_id slug drift introduced when
        SQL files cut over from gold.entity_xref → silver.xref_team.
 
-    3-4. ``ref_integrity[match_outcomes.{home,away}_team_id->dim_team]`` —
-        same intent, narrower scope. match_outcomes is the ML-label
-        source-of-truth so a regression here invalidates target labels.
-
-    5-6. Canonical-format guards on ``dim_player.player_id`` and
+    3-4. Canonical-format guards on ``dim_player.player_id`` and
         ``fct_player_match.player_id`` — both MUST start with ``fb_``
         post-cutover (FBref is the player spine). Implemented via
         ``regexp_like`` over a row_count(max=0) predicate.
 
     Severity rationale
     ------------------
-    All six checks ship at WARNING during the gate-watch window (2026-05-09
+    All four checks ship at WARNING during the gate-watch window (2026-05-09
     → 2026-05-12+). A non-zero offender count surfaces in Telegram via
     ``telegram_dq_summary`` without raising. After cutover the team-level
     check (#1) is the first candidate for ERROR-severity tightening — see
@@ -552,33 +548,7 @@ def build_e1_5_post_cutover_checks() -> List[Check]:
             name='ref_integrity[fct_player_match.team_id->dim_team]',
         ),
 
-        # 3) match_outcomes.home_team_id ⊆ dim_team.team_id
-        CHECK.row_count(
-            table='iceberg.gold.match_outcomes',
-            min_rows=0,
-            max_rows=0,
-            where=(
-                "home_team_id IS NOT NULL "
-                "AND home_team_id NOT IN (SELECT team_id FROM iceberg.gold.dim_team)"
-            ),
-            severity='WARNING',
-            name='ref_integrity[match_outcomes.home_team_id->dim_team]',
-        ),
-
-        # 4) match_outcomes.away_team_id ⊆ dim_team.team_id
-        CHECK.row_count(
-            table='iceberg.gold.match_outcomes',
-            min_rows=0,
-            max_rows=0,
-            where=(
-                "away_team_id IS NOT NULL "
-                "AND away_team_id NOT IN (SELECT team_id FROM iceberg.gold.dim_team)"
-            ),
-            severity='WARNING',
-            name='ref_integrity[match_outcomes.away_team_id->dim_team]',
-        ),
-
-        # 5) dim_player.player_id matches '^fb_' regex
+        # 3) dim_player.player_id matches '^fb_' regex
         CHECK.row_count(
             table='iceberg.gold.dim_player',
             min_rows=0,
@@ -588,7 +558,7 @@ def build_e1_5_post_cutover_checks() -> List[Check]:
             name='canonical_format[dim_player.player_id]',
         ),
 
-        # 6) fct_player_match.player_id_canonical matches '^fb_' regex
+        # 4) fct_player_match.player_id_canonical matches '^fb_' regex
         # issue #46: переименование player_id → player_id_canonical.
         CHECK.row_count(
             table='iceberg.gold.fct_player_match',

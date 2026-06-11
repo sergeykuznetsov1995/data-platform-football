@@ -149,8 +149,8 @@ SILVER_E3_TRANSFORMS = [
         # GROUP BY on silver.whoscored_events_spadl — pass/take-on/tackle/
         # interception/shot/foul/spatial counters via COUNT_IF. Feeds the
         # WhoScored block of gold.fct_team_match v2 (#95). MUST run after
-        # whoscored_events_spadl. The season rollup (gold.whoscored_team_season)
-        # reads this table from the Gold DAG (#370).
+        # whoscored_events_spadl. Season rollup инлайнен CTE в
+        # gold.fct_team_season_stats (#478).
         'whoscored_team_match',
         'dags/sql/silver/whoscored_team_match.sql',
         'whoscored_team_match',
@@ -179,8 +179,8 @@ SILVER_E3_TRANSFORMS = [
         # match-facts (xG/NPxG/PPDA/deep/points/xPts). UNION ALL home+away из
         # bronze.understat_team_match_stats + JOIN silver.xref_team
         # (source='understat'). Feeds Understat block of gold.fct_team_match.
-        # MUST run after dag_transform_xref. The season rollup
-        # (gold.understat_team_season) reads this table from the Gold DAG (#370).
+        # MUST run after dag_transform_xref. Season rollup инлайнен CTE в
+        # gold.fct_team_season_stats (#478).
         'understat_team_match',
         'dags/sql/silver/understat_team_match.sql',
         'understat_team_match',
@@ -220,8 +220,7 @@ SILVER_E3_TRANSFORMS = [
         # + JOIN bronze.sofascore_schedule (goals_for/against). No silver.* reads
         # (#367 removed the cross-entity minutes/assists rollup — Silver Charter R2).
         # Feeds SofaScore block of gold.fct_team_match v2 (#95).
-        # The season rollup (gold.sofascore_team_season) reads this table from
-        # the Gold DAG (#370).
+        # Season rollup инлайнен CTE в gold.fct_team_season_stats (#478).
         'sofascore_team_match',
         'dags/sql/silver/sofascore_team_match.sql',
         'sofascore_team_match',

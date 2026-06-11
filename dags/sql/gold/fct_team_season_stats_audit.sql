@@ -13,7 +13,7 @@
 -- Зерно: (team_id_canonical, league, season). INNER JOIN FBref ∩ Understat
 -- (Understat = primary secondary с coverage 100% APL). WhoScored / SofaScore /
 -- FotMob (#97) — LEFT JOIN → diff = NULL когда источник отсутствует. FotMob xref
--- season — slug '2526' (#404); fotmob_team_season.season — slug '2526'.
+-- season — slug '2526' (#404); fm_team_season.season — slug '2526'.
 --
 -- Использование:
 --   1. DQ coverage WARNING — ABS(diff) <= threshold у ≥95% rows.
@@ -22,6 +22,12 @@
 --
 -- Audit-таблица читает Silver заново (НЕ gold.fct_team_season_stats):
 --   one-hop правило (project_gold_cleanup_2026-05-12).
+--
+-- #478: производный gold-этаж удалён — per-source season rollups (бывшие
+-- gold.*_team_season, #370) инлайнены ниже как УСЕЧЁННЫЕ CTE (только колонки,
+-- нужные diff'ам; выражения дословно из main-файла). Без ws_penalties — аудит
+-- пенальти не сравнивает и bronze.whoscored_events не сканирует.
+-- ⚠️ Синхронизировать вручную с fct_team_season_stats.sql.
 -- =============================================================================
 
 WITH
@@ -62,7 +68,7 @@ xref_ss AS (
 ),
 
 -- FotMob xref (#97). season is slug '2526' after #404 → JOIN on
--- CAST(season_year AS varchar) (slug now); gold.fotmob_team_season.season is slug too.
+-- CAST(season_year AS varchar) (slug now); fm_team_season.season is slug too.
 xref_fm AS (
     SELECT DISTINCT
         canonical_id,
@@ -87,6 +93,77 @@ ws_name_to_id AS (
                     league, season
     FROM iceberg.bronze.whoscored_schedule
     WHERE away_team_id IS NOT NULL
+),
+
+-- ===== Inlined per-source season aggregates (#478, усечены до diff-колонок) =====
+
+us_team_season AS (
+    SELECT
+        team_id_canonical,
+        CAST(COUNT(*) AS INTEGER)           AS games_played,
+        CAST(SUM(goals)         AS INTEGER) AS goals,
+        CAST(SUM(goals_against) AS INTEGER) AS goals_against,
+        SUM(xg)                             AS xg,
+        SUM(xg_against)                     AS xg_against,
+        league,
+        season
+    FROM iceberg.silver.understat_team_match
+    GROUP BY team_id_canonical, league, season
+),
+
+ws_season_rollup AS (
+    SELECT
+        team_id,
+        COUNT(*)                   AS matches_seen,
+        SUM(shots_total)           AS shots_total,
+        SUM(shots_on_target_proxy) AS shots_on_target_proxy,
+        SUM(interceptions)         AS interceptions,
+        SUM(tackle_won)            AS tackle_won,
+        SUM(fouls_committed)       AS fouls_committed,
+        league,
+        season
+    FROM iceberg.silver.whoscored_team_match
+    GROUP BY team_id, league, season
+),
+
+ss_team_season AS (
+    SELECT
+        team_id,
+        league,
+        season,
+        CAST(COUNT(*)              AS INTEGER) AS appearances,
+        CAST(SUM(goals_for)        AS INTEGER) AS goals,
+        CAST(SUM(goals_against)    AS INTEGER) AS goals_conceded,
+        CAST(SUM(assists)          AS INTEGER) AS assists,
+        CAST(SUM(yellow_cards)     AS INTEGER) AS yellow_cards,
+        CAST(SUM(red_cards)        AS INTEGER) AS red_cards,
+        CAST(SUM(total_shots)      AS INTEGER) AS total_shots,
+        CAST(SUM(shots_on_target)  AS INTEGER) AS shots_on_target,
+        CAST(SUM(interceptions)    AS INTEGER) AS interceptions,
+        CAST(SUM(tackles_won)      AS INTEGER) AS tackles_won,
+        CAST(SUM(fouls)            AS INTEGER) AS fouls_committed,
+        CAST(SUM(offsides)         AS INTEGER) AS offsides,
+        CAST(SUM(total_crosses)    AS INTEGER) AS total_crosses,
+        ROUND(SUM(expected_goals),         2)  AS expected_goals,
+        ROUND(SUM(expected_goals_against), 2)  AS expected_goals_against
+    FROM iceberg.silver.sofascore_team_match
+    WHERE team_id IS NOT NULL
+    GROUP BY team_id, league, season
+),
+
+fm_team_season AS (
+    SELECT
+        team_id,
+        CAST(COUNT(*)              AS INTEGER) AS appearances,
+        CAST(SUM(goals_for)        AS INTEGER) AS goals,
+        CAST(SUM(goals_against)    AS INTEGER) AS goals_conceded,
+        CAST(SUM(total_shots)      AS INTEGER) AS total_shots,
+        CAST(SUM(shots_on_target)  AS INTEGER) AS shots_on_target,
+        ROUND(SUM(expected_goals), 4)          AS expected_goals,
+        league,
+        season
+    FROM iceberg.silver.fotmob_team_match
+    GROUP BY team_id, league, season
 )
 
 SELECT
@@ -146,7 +223,7 @@ INNER JOIN iceberg.silver.fbref_team_season_profile fb
     ON  fb.team    = xf.fbref_team_name
     AND fb.league  = xf.league
     AND fb.season  = xf.season_year
-INNER JOIN iceberg.gold.understat_team_season us
+INNER JOIN us_team_season us
     ON  us.team_id_canonical = xf.canonical_id
     AND us.league            = xf.league
     AND us.season            = xf.season_slug
@@ -158,7 +235,7 @@ LEFT JOIN ws_name_to_id wn
     ON  wn.ws_team_name = xw.ws_team_name
     AND wn.league       = xw.league
     AND wn.season       = xw.season_slug
-LEFT JOIN iceberg.gold.whoscored_team_season ws
+LEFT JOIN ws_season_rollup ws
     ON  ws.team_id = wn.ws_team_id
     AND ws.league  = wn.league
     AND ws.season  = wn.season
@@ -166,7 +243,7 @@ LEFT JOIN xref_ss xs
     ON  xs.canonical_id = xf.canonical_id
     AND xs.league       = xf.league
     AND xs.season_slug  = xf.season_slug
-LEFT JOIN iceberg.gold.sofascore_team_season ss
+LEFT JOIN ss_team_season ss
     ON  ss.team_id = xs.ss_team_name
     AND ss.league  = xs.league
     AND ss.season  = xs.season_slug
@@ -174,7 +251,7 @@ LEFT JOIN xref_fm xfm
     ON  xfm.canonical_id    = xf.canonical_id
     AND xfm.league          = xf.league
     AND xfm.season_year_str = CAST(xf.season_year AS varchar)
-LEFT JOIN iceberg.gold.fotmob_team_season fm
+LEFT JOIN fm_team_season fm
     ON  fm.team_id = xfm.fm_team_name
     AND fm.league  = xf.league
     AND fm.season  = xf.season_slug

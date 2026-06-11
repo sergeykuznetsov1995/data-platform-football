@@ -215,28 +215,28 @@ class TestE1DagImports:
 
 
 # ---------------------------------------------------------------------------
-# E1.5 cutover tests — Gold DAG must still import + the 6 cutover SQL files
+# E1.5 cutover tests — Gold DAG must still import + the 5 cutover SQL files
 # must parse cleanly (no Trino round-trip).
 # ---------------------------------------------------------------------------
 
 
-# 6 SQL files migrated from gold.entity_xref → silver.xref_team in T2 (E1.5).
+# 5 SQL files migrated from gold.entity_xref → silver.xref_team in T2 (E1.5).
 # #425: dim_team / dim_match became Jinja templates (.sql.j2) — same pure
 # SELECT contract, rendered by dim_loaders before CTAS.
+# (match_outcomes.sql удалён вместе с производным gold-этажом, #478.)
 CUTOVER_SQL_FILES = (
     "dim_team.sql.j2",
     "dim_match.sql.j2",
     "dim_player.sql",
     "fct_standings.sql",
     "fct_player_match.sql",
-    "match_outcomes.sql",
 )
 
 
 @pytest.mark.integration
 class TestE15CutoverGoldDagImports:
     """Verify dag_transform_fbref_gold still parses post-cutover and the
-    6 migrated SQL files are syntactically loadable.
+    5 migrated SQL files are syntactically loadable.
 
     We do NOT spin up Trino — just DagBag parse + raw file parse.
     """
@@ -265,7 +265,7 @@ class TestE15CutoverGoldDagImports:
         )
 
     def test_cutover_sql_files_exist_and_readable(self):
-        """Every one of the 6 cutover SQL files must exist + be UTF-8
+        """Every one of the 5 cutover SQL files must exist + be UTF-8
         decodable. Catches accidental deletion / binary corruption."""
         for fname in CUTOVER_SQL_FILES:
             path = self.GOLD_SQL_DIR / fname

@@ -347,8 +347,8 @@ class CHECK:
         listing missing columns and data-type mismatches per table.
 
         Use case: enforce train/inference schema parity for ML pipelines —
-        e.g. assert that ``gold.fct_match_train``, ``gold.fct_match_test``
-        and ``gold.predictions_input_v2`` carry the same feature columns
+        e.g. assert that a train table, a test table and a serving-input
+        table carry the same feature columns
         (modulo target/lineage cols passed via ``ignore_cols``).
 
         ``tables`` items must have the form ``'<schema>.<table>'`` (catalog

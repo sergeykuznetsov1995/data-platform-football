@@ -72,14 +72,14 @@ def test_three_identical_tables_pass(monkeypatch):
         ("xg",       "double"),
     ]
     _patch_fetch_schema(monkeypatch, {
-        "gold.fct_match_train":      schemas,
-        "gold.fct_match_test":       schemas,
-        "gold.predictions_input_v2": schemas,
+        "gold.train_table":   schemas,
+        "gold.test_table":    schemas,
+        "gold.serving_table": schemas,
     })
     chk = dq.CHECK.schema_parity(tables=[
-        "gold.fct_match_train",
-        "gold.fct_match_test",
-        "gold.predictions_input_v2",
+        "gold.train_table",
+        "gold.test_table",
+        "gold.serving_table",
     ])
     out = dq._run_schema_parity(_StubConn(), chk)
     assert out["passed"] is True, out["details"]

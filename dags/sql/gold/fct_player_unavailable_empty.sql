@@ -4,8 +4,8 @@
 -- Materialized when silver.whoscored_player_unavailable is absent (Bronze not
 -- ingested yet, or WhoScored DAG paused — see project_whoscored_cloudflare.md).
 --
--- Goal: keep the Gold contract intact so feat_team_form's LEFT JOIN keeps
--- resolving (finds 0 rows, COALESCEs to 0 unavailable players per match).
+-- Goal: keep the Gold contract intact so downstream LEFT JOINs keep
+-- resolving (find 0 rows, COALESCE to 0 unavailable players per match).
 --
 -- Schema MUST mirror fct_player_unavailable.sql exactly (star design §4.6,
 -- issue #426). Spine is dim_match with WHERE 1=0 — Trino preserves column
