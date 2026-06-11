@@ -4,14 +4,14 @@
 -- Goal-grained narrow fact (one row per goal). UNION ALL of two sources:
 --
 --   1) Regular goals — projected from `iceberg.gold.fct_shot` WHERE
---      result_canonical='goal' (i.e. shots that ended in net via a regular
+--      result='goal' (i.e. shots that ended in net via a regular
 --      Understat shot row). Carries scorer + assist + situation/penalty flag.
 --
 --   2) Own goals — extracted from `iceberg.bronze.fbref_match_events` WHERE
 --      event_type='own_goal'. FBref own-goal coverage is the most complete
 --      across all 10 APL seasons (463 events vs Understat's 203 own_goal
 --      shots — Understat misses early seasons). To avoid double-counting
---      we INTENTIONALLY exclude `fct_shot` rows with result_canonical='own_goal'
+--      we INTENTIONALLY exclude `fct_shot` rows with result='own_goal'
 --      from the regular branch.
 --
 -- Sources:
@@ -76,7 +76,7 @@
 --                                     (own_goal: opposing-team player)
 --   assist_id_canonical   varchar     assister; NULL for own_goals (FBref does
 --                                     not assist own goals). For regular goals
---                                     this is fct_shot.assist_player_id_canonical
+--                                     this is fct_shot.assist_player_id
 --                                     pass-through; LIVE-DATA OBSERVATION
 --                                     (2026-05-08): all 5,147 regular goal
 --                                     rows in fct_shot currently have NULL
@@ -156,18 +156,20 @@ WITH
 -- =============================================================================
 -- 1) Regular goals — projection from fct_shot (excludes own_goal rows)
 -- =============================================================================
--- Drop result_canonical='own_goal' to avoid double-counting against the
--- fbref own-goal branch below. fct_shot's situation_canonical='penalty' is
+-- Drop result='own_goal' to avoid double-counting against the
+-- fbref own-goal branch below. fct_shot's situation='penalty' is
 -- the explicit Understat penalty marker.
+-- #426: fct_shot columns renamed (*_canonical → plain); fct_goal keeps its
+-- own *_canonical output names until fct_match_timeline replaces it.
 regular_goals AS (
     SELECT
-        sh.match_id_canonical,
-        sh.team_id_canonical,
-        sh.player_id_canonical          AS scorer_id_canonical,
-        sh.assist_player_id_canonical   AS assist_id_canonical,
+        sh.match_id                     AS match_id_canonical,
+        sh.team_id                      AS team_id_canonical,
+        sh.player_id                    AS scorer_id_canonical,
+        sh.assist_player_id             AS assist_id_canonical,
         sh.minute,
         FALSE                           AS is_own_goal,
-        (sh.situation_canonical = 'penalty') AS is_penalty,
+        (sh.situation = 'penalty')      AS is_penalty,
         -- shot_id makes the canonical hash unique even for the rare same-
         -- minute brace (one scorer, two shots in the same minute — verified
         -- on match 967efd56 / Tottenham brace 2021-22). Cast defensively to
@@ -179,7 +181,7 @@ regular_goals AS (
         sh.season                       AS season,
         CAST(NULL AS timestamp(6))      AS _ingested_at
     FROM iceberg.gold.fct_shot sh
-    WHERE sh.result_canonical = 'goal'
+    WHERE sh.result = 'goal'
 ),
 
 -- =============================================================================

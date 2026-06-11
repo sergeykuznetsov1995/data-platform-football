@@ -27,11 +27,11 @@
 --                                      on source='whoscored'). Unbridged games carry
 --                                      an orphan id ('ws_<game_id>') or raw game_id
 --                                      and simply fall out on the spine JOIN.
---   iceberg.gold.fct_shot            — ~47k rows, situation_canonical +
---                                      body_part_canonical. match_id_canonical
---                                      is FBref hex slug (Understat-bridged in
---                                      fct_shot.sql via date+canonical teams).
---                                      team_id_canonical is FBref-canonical.
+--   iceberg.gold.fct_shot            — ~47k rows, situation + body_part
+--                                      (#426 renames). match_id is FBref hex
+--                                      slug (Understat-bridged in fct_shot.sql
+--                                      via date+canonical teams). team_id is
+--                                      FBref-canonical.
 --   iceberg.gold.fct_team_match      — spine: one row per (match_id, team_id)
 --                                      with date+season+league. match_id is
 --                                      FBref hex slug.
@@ -146,17 +146,17 @@ event_agg AS (
 --    works without further bridging.
 shot_agg AS (
     SELECT
-        s.match_id_canonical                                  AS match_id,
-        s.team_id_canonical                                   AS team_id,
+        s.match_id,
+        s.team_id,
         COUNT(*)                                              AS total_shots,
-        SUM(CASE WHEN s.situation_canonical = 'set_piece' THEN 1 ELSE 0 END) AS n_set_piece,
-        SUM(CASE WHEN s.situation_canonical = 'open_play' THEN 1 ELSE 0 END) AS n_open_play,
-        SUM(CASE WHEN s.body_part_canonical = 'head'      THEN 1 ELSE 0 END) AS n_header
+        SUM(CASE WHEN s.situation = 'set_piece' THEN 1 ELSE 0 END) AS n_set_piece,
+        SUM(CASE WHEN s.situation = 'open_play' THEN 1 ELSE 0 END) AS n_open_play,
+        SUM(CASE WHEN s.body_part = 'head'      THEN 1 ELSE 0 END) AS n_header
     FROM iceberg.gold.fct_shot s
-    WHERE s.team_id_canonical IS NOT NULL
+    WHERE s.team_id IS NOT NULL
     GROUP BY
-        s.match_id_canonical,
-        s.team_id_canonical
+        s.match_id,
+        s.team_id
 ),
 
 -- 3) Per (match_id, team_id) action shares + success rate -------------------

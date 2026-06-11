@@ -184,65 +184,68 @@ def _metric(label: str, agg: str, col: str | None, sql: str | None = None) -> di
 def _build_virtual_datasets(ctx: _Ctx, database: Any) -> dict[str, Any]:
     schema = "gold"
 
-    # NB: post issue #46, fct_player_match.PK = (match_id_canonical, player_id_canonical).
-    # JOIN-key для dim_player.player_id (вида 'fb_*') = player_id_canonical (то же
-    # семейство id'шников для FBref-узнанных игроков). Для cross-source-only игроков
-    # (SofaScore/Understat-only) JOIN вернёт NULL → COALESCE покажет сырой canonical id.
+    # NB: post issue #426, fct_player_match.PK = (match_id, player_id); the
+    # star-aligned fact no longer carries denormalized team/position/penalty
+    # columns — team_name comes from dim_team, position from dim_player.
+    # Для cross-source-only игроков (SofaScore/Understat-only) JOIN dim_player
+    # вернёт NULL → COALESCE покажет сырой canonical id.
     v_player_match_named = f"""\
 SELECT
-  fpm.player_id_canonical AS player_id,
-  COALESCE(dp.player_name, fpm.player_id_canonical) AS player_name,
-  COALESCE(dp.primary_position, fpm.position) AS position,
-  REGEXP_EXTRACT(COALESCE(dp.primary_position, fpm.position), '^([A-Z]{{2}})') AS position_primary,
-  fpm.team_name,
-  fpm.match_id_canonical AS match_id,
-  fpm.minutes, fpm.goals, fpm.assists,
-  fpm.shots, fpm.shots_on_target, fpm.penalty_goals, fpm.penalty_attempts,
-  fpm.yellow_cards, fpm.red_cards, fpm.tackles_won, fpm.interceptions,
-  fpm.fouls_committed, fpm.fouls_drawn, fpm.offsides, fpm.own_goals,
+  fpm.player_id,
+  COALESCE(dp.player_name, fpm.player_id) AS player_name,
+  dp.primary_position AS position,
+  REGEXP_EXTRACT(dp.primary_position, '^([A-Z]{{2}})') AS position_primary,
+  dt.team_name,
+  fpm.match_id,
+  fpm.minutes_played AS minutes, fpm.goals, fpm.assists,
+  fpm.shots, fpm.shots_on_target,
+  fpm.yellow_cards, fpm.red_cards, fpm.tackles, fpm.interceptions,
+  fpm.fouls_committed, fpm.fouls_drawn,
   fpm.league, fpm.season
 FROM iceberg.gold.fct_player_match fpm
 LEFT JOIN iceberg.gold.dim_player dp
-  ON dp.player_id = fpm.player_id_canonical
+  ON dp.player_id = fpm.player_id
+LEFT JOIN iceberg.gold.dim_team dt
+  ON dt.team_id = fpm.team_id
 WHERE fpm.season = {SEASON_FBREF}
   AND fpm.league = '{LEAGUE}'"""
 
     v_player_xg = f"""\
 SELECT
-  s.player_id_canonical AS player_id,
-  COALESCE(dp.player_name, s.player_id_canonical) AS player_name,
+  s.player_id,
+  COALESCE(dp.player_name, s.player_id) AS player_name,
   dp.primary_position,
   REGEXP_EXTRACT(dp.primary_position, '^([A-Z]{{2}})') AS position_primary,
-  s.xg, s.is_goal, s.body_part_canonical, s.situation_canonical,
+  s.xg, s.is_goal, s.body_part, s.situation,
   s.league, s.season
 FROM iceberg.gold.fct_shot s
 LEFT JOIN iceberg.gold.dim_player dp
-  ON dp.player_id = s.player_id_canonical
+  ON dp.player_id = s.player_id
 WHERE s.season = '{SEASON_OTHER_STR}'
   AND s.league = '{LEAGUE}'
-  AND s.player_id_canonical IS NOT NULL"""
+  AND s.player_id IS NOT NULL"""
 
     v_player_goals_vs_xg = f"""\
 WITH fbref_agg AS (
-  SELECT player_id_canonical AS player_id, SUM(goals) AS goals, SUM(minutes) AS minutes,
-         SUM(shots) AS shots, ARBITRARY(team_name) AS team_name
+  SELECT player_id, SUM(goals) AS goals, SUM(minutes_played) AS minutes,
+         SUM(shots) AS shots, ARBITRARY(team_id) AS team_id
   FROM iceberg.gold.fct_player_match
   WHERE season = {SEASON_FBREF} AND league = '{LEAGUE}'
-  GROUP BY player_id_canonical
+  GROUP BY player_id
 ),
 xg_agg AS (
-  SELECT player_id_canonical AS player_id, SUM(xg) AS xg
+  SELECT player_id, SUM(xg) AS xg
   FROM iceberg.gold.fct_shot
   WHERE season = '{SEASON_OTHER_STR}' AND league = '{LEAGUE}'
-    AND player_id_canonical IS NOT NULL
-  GROUP BY player_id_canonical
+    AND player_id IS NOT NULL
+  GROUP BY player_id
 )
 SELECT
   COALESCE(f.player_id, x.player_id) AS player_id,
   COALESCE(dp.player_name, COALESCE(f.player_id, x.player_id)) AS player_name,
   dp.primary_position,
   REGEXP_EXTRACT(dp.primary_position, '^([A-Z]{{2}})') AS position_primary,
-  f.team_name,
+  dt.team_name,
   COALESCE(f.goals, 0) AS goals,
   COALESCE(x.xg, 0.0)  AS xg,
   COALESCE(f.minutes, 0) AS minutes,
@@ -251,6 +254,8 @@ FROM fbref_agg f
 FULL OUTER JOIN xg_agg x ON f.player_id = x.player_id
 LEFT JOIN iceberg.gold.dim_player dp
   ON dp.player_id = COALESCE(f.player_id, x.player_id)
+LEFT JOIN iceberg.gold.dim_team dt
+  ON dt.team_id = f.team_id
 WHERE COALESCE(f.minutes, 0) >= 270"""
 
     # NB: fct_match_rating identifies players by ss_* canonical id (SofaScore).
@@ -275,23 +280,22 @@ WHERE fmr.season = '{SEASON_OTHER_STR}'
 
     v_player_summary = f"""\
 WITH fbref AS (
-  SELECT player_id_canonical AS player_id,
-         COUNT(DISTINCT match_id_canonical) AS matches, SUM(minutes) AS minutes,
+  SELECT player_id,
+         COUNT(DISTINCT match_id) AS matches, SUM(minutes_played) AS minutes,
          SUM(goals) AS goals, SUM(assists) AS assists, SUM(shots) AS shots,
-         SUM(shots_on_target) AS sot, SUM(tackles_won) AS tackles_won,
+         SUM(shots_on_target) AS sot, SUM(tackles) AS tackles,
          SUM(interceptions) AS interceptions, SUM(yellow_cards) AS yellow_cards,
-         SUM(red_cards) AS red_cards, SUM(penalty_goals) AS penalty_goals,
-         SUM(penalty_attempts) AS penalty_attempts,
-         ARBITRARY(team_name) AS team_name
+         SUM(red_cards) AS red_cards,
+         ARBITRARY(team_id) AS team_id
   FROM iceberg.gold.fct_player_match
   WHERE season = {SEASON_FBREF} AND league = '{LEAGUE}'
-  GROUP BY player_id_canonical
+  GROUP BY player_id
 ),
 xg_cte AS (
-  SELECT player_id_canonical AS player_id, SUM(xg) AS total_xg
+  SELECT player_id, SUM(xg) AS total_xg
   FROM iceberg.gold.fct_shot
   WHERE season = '{SEASON_OTHER_STR}' AND league = '{LEAGUE}'
-  GROUP BY player_id_canonical
+  GROUP BY player_id
 ),
 rating_cte AS (
   -- avg_rating omitted: fct_match_rating.player_id_canonical is ss_* (SofaScore)
@@ -309,17 +313,19 @@ SELECT
   COALESCE(dp.player_name, f.player_id) AS player_name,
   dp.primary_position,
   REGEXP_EXTRACT(dp.primary_position, '^([A-Z]{{2}})') AS position_primary,
-  f.team_name, f.matches, f.minutes, f.goals, f.assists,
+  dt.team_name, f.matches, f.minutes, f.goals, f.assists,
   COALESCE(x.total_xg, 0.0) AS xg,
   f.shots, f.sot,
-  (f.tackles_won + f.interceptions) AS tackles_int,
-  f.yellow_cards, f.red_cards, f.penalty_goals, f.penalty_attempts,
+  (f.tackles + f.interceptions) AS tackles_int,
+  f.yellow_cards, f.red_cards,
   r.avg_rating
 FROM fbref f
 LEFT JOIN xg_cte     x ON x.player_id = f.player_id
 LEFT JOIN rating_cte r ON r.player_id = f.player_id
 LEFT JOIN iceberg.gold.dim_player dp
-  ON dp.player_id = f.player_id"""
+  ON dp.player_id = f.player_id
+LEFT JOIN iceberg.gold.dim_team dt
+  ON dt.team_id = f.team_id"""
 
     # Per-match timeline (Saka-кейс): x = дата матча, y = xG/xA/rating/key_passes
     # из multi-source fct_player_match (post issue #46).
@@ -327,30 +333,30 @@ LEFT JOIN iceberg.gold.dim_player dp
     # FBref-canonical (для cross-source-only игроков покажем сырой canonical id).
     v_player_match_timeline = f"""\
 SELECT
-  fpm.player_id_canonical AS player_id,
-  COALESCE(dp.player_name, fpm.player_id_canonical) AS player_name,
-  COALESCE(dp.primary_position, fpm.position) AS position,
-  REGEXP_EXTRACT(COALESCE(dp.primary_position, fpm.position), '^([A-Z]{{2}})') AS position_primary,
-  fpm.team_name,
-  fpm.match_id_canonical AS match_id,
+  fpm.player_id,
+  COALESCE(dp.player_name, fpm.player_id) AS player_name,
+  dp.primary_position AS position,
+  REGEXP_EXTRACT(dp.primary_position, '^([A-Z]{{2}})') AS position_primary,
+  dt.team_name,
+  fpm.match_id,
   dm.match_date,
-  fpm.minutes,
+  fpm.minutes_played AS minutes,
   fpm.goals,
   fpm.assists,
-  fpm.expected_goals,
-  fpm.expected_assists,
+  fpm.xg AS expected_goals,
+  fpm.xa AS expected_assists,
   fpm.rating,
   fpm.key_passes,
-  fpm.dribbles,
-  fpm.ground_duels_won,
-  fpm.aerial_duels_won,
+  fpm.duels_won,
   fpm.league,
   fpm.season
 FROM iceberg.gold.fct_player_match fpm
 LEFT JOIN iceberg.gold.dim_match dm
-  ON dm.match_id = fpm.match_id_canonical
+  ON dm.match_id = fpm.match_id
 LEFT JOIN iceberg.gold.dim_player dp
-  ON dp.player_id = fpm.player_id_canonical
+  ON dp.player_id = fpm.player_id
+LEFT JOIN iceberg.gold.dim_team dt
+  ON dt.team_id = fpm.team_id
 WHERE fpm.season = {SEASON_FBREF}
   AND fpm.league = '{LEAGUE}'"""
 
@@ -512,7 +518,7 @@ def _build_slices(ctx: _Ctx, database: Any) -> list[Any]:
             "query_mode": "aggregate",
             "groupby": ["player_name", "position", "team_name"],
             "metrics": [
-                _metric("Отборы", "SUM", "tackles_won"),
+                _metric("Отборы", "SUM", "tackles"),
                 _metric("Перехваты", "SUM", "interceptions"),
                 _metric("Фолы", "SUM", "fouls_committed"),
                 _metric("Минуты", "SUM", "minutes"),
@@ -544,12 +550,14 @@ def _build_slices(ctx: _Ctx, database: Any) -> list[Any]:
         },
     ))
 
+    # #426: penalty_goals/penalty_attempts left fct_player_match (star design
+    # §4.4) — пенальти-чарт заменён на фолы, чтобы сохранить layout-сетку.
     slices.append(_make_slice(ctx,
-        "Топ-10 по пенальти", "dist_bar", vds["v_player_match_named"],
+        "Топ-10 по фолам", "dist_bar", vds["v_player_match_named"],
         {
             "metrics": [
-                _metric("Удары с пенальти", "SUM", "penalty_attempts"),
-                _metric("Голы с пенальти", "SUM", "penalty_goals"),
+                _metric("Фолы (совершил)", "SUM", "fouls_committed"),
+                _metric("Фолы (на игроке)", "SUM", "fouls_drawn"),
             ],
             "groupby": ["player_name"],
             "row_limit": 10, "order_desc": True,
@@ -653,7 +661,6 @@ def _build_slices(ctx: _Ctx, database: Any) -> list[Any]:
                 "player_name", "position", "team_name", "matches", "minutes",
                 "goals", "assists", "xg", "shots", "sot",
                 "tackles_int", "yellow_cards", "red_cards",
-                "penalty_goals", "penalty_attempts",
             ],
             "row_limit": 200,
             "order_by_cols": ['["minutes", false]'],

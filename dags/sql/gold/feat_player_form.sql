@@ -10,13 +10,16 @@
 -- =============================================================================
 
 WITH base AS (
+    -- #426: fct_player_match renamed PK/FK to plain ids and minutes to
+    -- minutes_played; internal aliases keep this feat table's own output
+    -- schema unchanged.
     SELECT
-        match_id_canonical,
-        player_id_canonical,
-        team_id_canonical,
+        match_id        AS match_id_canonical,
+        player_id       AS player_id_canonical,
+        team_id         AS team_id_canonical,
         league,
         season,
-        minutes,
+        minutes_played  AS minutes,
         goals,
         assists,
         shots,
