@@ -1,11 +1,12 @@
 # =============================================================================
-# OpenMetadata description: iceberg.gold.dim_standings
+# OpenMetadata description: iceberg.gold.fct_standings
 # =============================================================================
 table:
-  fullyQualifiedName: trino_iceberg.iceberg.gold.dim_standings
+  fullyQualifiedName: trino_iceberg.iceberg.gold.fct_standings
   description: |
     Snapshot турнирной таблицы из SofaScore (post-deduction points; учёт
-    очковых санкций deferred до R7). PK = (league, season, team_id).
+    очковых санкций deferred до R7). Переименована из dim_standings в #428 —
+    командный снапшот это факт (star design §5.5). PK = (league, season, team_id).
     team_id резолвится через silver.xref_team в canonical FBref-id, либо
     помечается как orphan ('ss_<slug>') если нет соответствия — поле
     team_id_source служит lineage-маркером для downstream-логики.
@@ -24,8 +25,8 @@ columns:
     description: Lineage-маркер источника team_id ('fbref_canonical' | 'sofascore_orphan').
   - name: team_name_raw
     description: Имя команды как оно пришло из SofaScore (до канонизации).
-  - name: mp
-    description: Сыгранные матчи (matches played).
+  - name: played
+    description: Сыгранные матчи (#428 ex-mp, дизайн-имя §5.5).
   - name: wins
     description: Количество побед.
   - name: draws
@@ -43,7 +44,7 @@ columns:
   - name: position
     description: Текущая позиция в таблице на момент snapshot.
   - name: points_per_game
-    description: Среднее количество очков за матч (points / mp).
+    description: Среднее количество очков за матч (points / played).
   - name: snapshot_at
     description: Timestamp снятия snapshot из SofaScore.
   - name: as_of_date

@@ -20,8 +20,18 @@
 --   * UNIQUE_<source> (метрика отсутствует у других) → single column,
 --     без суффикса.
 --
--- Зерно: (player_id_canonical, league, season). Spine — FBref subset из
--- xref_player.
+-- Design contract: docs/design/gold-star-schema.md §5.2 (issue #428).
+-- Grain: (player_id, league, season). PK: natural composite — все компоненты
+-- non-NULL по конструкции INNER FBref-spine. FK: player_id → dim_player,
+-- team_id → dim_team (клуб игрока в сезоне; orphan-fallback 'fb_<slug>' если
+-- squad не резолвится через xref_team — строки не теряются, §6.2).
+-- Partitioning: (league, season) — passed by run_gold_transform().
+--
+-- #428 renames vs v1: player_id_canonical → player_id (plain FK id, паттерн
+-- #438); primary_team_name / position_fbref / position_fotmob дропнуты —
+-- контекст через dim_team / dim_player_attributes. Audit-таблица сохраняет
+-- player_id_canonical (вне scope #428).
+-- Spine — FBref subset из xref_player.
 --
 -- Cross-source season type (all varchar slug 'YYNN' after #404):
 --   * silver.xref_player.season                       = varchar slug '2526'
@@ -61,6 +71,20 @@ xref_fotmob AS (
       AND confidence <> 'orphan'
 ),
 
+-- Team FK bridge (#428 §5.2): fb.squad (FBref squad NAME) → canonical team_id.
+-- xref_team source='fbref' source_id = squad name (см. xref_team.sql.j2).
+-- ⚠️ JOIN обязан включать (league, season) — feedback_xref_join_season_predicate.
+xref_team_fbref AS (
+    SELECT DISTINCT
+        canonical_id,
+        source_id                                         AS fbref_team_name,
+        league,
+        season
+    FROM iceberg.silver.xref_team
+    WHERE source = 'fbref'
+      AND confidence <> 'orphan'
+),
+
 -- FotMob отдаёт shots/tackles/clearances/… как per-90 (не счётчики). Restore
 -- season-count ≈ per_90 × minutes / 90 (±1, per_90 округлён источником до 2 знаков).
 -- raw counts для этих метрик в FotMob API недоступны (issue #174). Pass-through
@@ -85,13 +109,16 @@ fotmob_counts AS (
 )
 
 SELECT
-    -- ========= Identity (per-season) =========
-    xf.canonical_id                                      AS player_id_canonical,
+    -- ========= PK / FK (per-season) =========
+    xf.canonical_id                                      AS player_id,
     xf.league                                            AS league,
     xf.season_year                                       AS season,
-    COALESCE(fb.squad, fm.primary_team_name)             AS primary_team_name,
-    fb.pos                                               AS position_fbref,
-    fm.primary_position                                  AS position_fotmob,
+    -- team_id: клуб игрока в сезоне (FBref squad → xref_team). Live-проверка
+    -- #428: 0 unresolved squad rows; fallback — страховка по §6.2.
+    COALESCE(
+        xt.canonical_id,
+        'fb_' || lower(regexp_replace(fb.squad, '[^a-zA-Z0-9]+', '_'))
+    )                                                    AS team_id,
 
     -- ========= HARD_FACT (single column, COALESCE fb→fm→ws→us→ss) =========
     -- Integer counters get CAST(... AS BIGINT) — COALESCE между гетерогенными
@@ -243,6 +270,10 @@ INNER JOIN iceberg.silver.fbref_player_season_profile fb
     ON  fb.player_id = xf.fbref_player_id
     AND fb.league    = xf.league
     AND fb.season    = xf.season_year
+LEFT JOIN xref_team_fbref xt
+    ON  xt.fbref_team_name = fb.squad
+    AND xt.league          = xf.league
+    AND xt.season          = xf.season_year
 LEFT JOIN xref_fotmob xfm
     ON  xfm.canonical_id = xf.canonical_id
     AND xfm.league       = xf.league

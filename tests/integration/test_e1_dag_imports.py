@@ -227,7 +227,7 @@ CUTOVER_SQL_FILES = (
     "dim_team.sql.j2",
     "dim_match.sql.j2",
     "dim_player.sql",
-    "dim_standings.sql",
+    "fct_standings.sql",
     "fct_player_match.sql",
     "match_outcomes.sql",
 )

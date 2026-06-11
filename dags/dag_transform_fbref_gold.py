@@ -51,8 +51,9 @@ Star-schema dims (issue #425 — unpartitioned, design grains):
 - ``gold.dim_competition``    — one row per league (configs/medallion/competitions.yaml)
 - ``gold.dim_season``         — one row per season slug (same YAML)
 Other:
-- ``gold.dim_standings``      — SofaScore league-table snapshot (E2)
-                                (reads silver.xref_team(source='sofascore') since E1.5)
+- ``gold.fct_standings``      — SofaScore league-table snapshot (E2; renamed
+                                from dim_standings in #428 — командный снапшот
+                                это факт). Reads silver.xref_team(source='sofascore').
 - ``gold.fct_team_match``     — long-form team metrics per match
 - ``gold.fct_team_season_stats`` — cross-source per-season team stats (T6.4 #94;
                                 FBref+Understat+WhoScored+SofaScore via xref_team)
@@ -144,10 +145,10 @@ STAGE_2C_DIM_MATCH_INLINE = [
 ]
 
 # Stage 2d: snapshot/per-season blocks that historically shared the dim stage.
-# dim_standings IS partitioned by (league, season) because Bronze emits one
-# snapshot per league/season (its star redesign -> fct_standings is #428).
+# fct_standings (#428, ex-dim_standings) IS partitioned by (league, season)
+# because Bronze emits one snapshot per league/season.
 STAGE_2D_SEASON_BLOCKS = [
-    ('dim_standings', 'dags/sql/gold/dim_standings.sql', 'dim_standings', ['league', 'season']),
+    ('fct_standings', 'dags/sql/gold/fct_standings.sql', 'fct_standings', ['league', 'season']),
     # T5 wiring restore + T6 SofaScore. Player-season block depends on Silver
     # per-source aggregates (FBref/FotMob/WS/US/SofaScore) which are produced
     # by dag_transform_e3 ahead of this DAG via master pipeline.
@@ -433,7 +434,7 @@ with DAG(
         _add_inline_dims(STAGE_2C_DIM_MATCH_INLINE)
 
     # Stage 2d: snapshot/per-season blocks (dim_player_attributes,
-    # fct_*_season_stats, dim_standings) — unchanged by #425.
+    # fct_*_season_stats, fct_standings ex-dim_standings #428).
     with TaskGroup(group_id='s2d_season_blocks') as g2d:
         for task_id, sql_file, table_name, pcols in STAGE_2D_SEASON_BLOCKS:
             PythonOperator(

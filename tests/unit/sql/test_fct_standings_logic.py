@@ -1,5 +1,5 @@
 """
-Unit tests for Gold ``dim_standings`` SQL logic (E2 — 2026-05).
+Unit tests for Gold ``fct_standings`` (ex-dim_standings, #428) SQL logic (E2 — 2026-05).
 
 Reads ``bronze.sofascore_league_table`` (APPEND-mode snapshots) directly,
 deduplicates to the latest ``_ingested_at`` per (league, season, team),
@@ -12,9 +12,9 @@ Resolution path:
     orphan  -> team_id = 'ss_<slug>',            team_id_source='sofascore_orphan'
 
 Two test layers:
-  * ``TestDimStandingsLogic`` (legacy) — Trino → DuckDB transpile via
+  * ``TestFctStandingsLogic`` (legacy) — Trino → DuckDB transpile via
     sqlglot; fixture rows in-memory; assert on the result set.
-  * ``TestDimStandingsCutoverStructure`` (E1.5 prep) — regex sanity over
+  * ``TestFctStandingsCutoverStructure`` (E1.5 prep) — regex sanity over
     the raw SQL pinning down the silver.xref_team migration so the
     structure can't drift even if DuckDB transpile breaks.
 """
@@ -28,7 +28,7 @@ import pytest
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
-SQL_PATH = PROJECT_ROOT / "dags" / "sql" / "gold" / "dim_standings.sql"
+SQL_PATH = PROJECT_ROOT / "dags" / "sql" / "gold" / "fct_standings.sql"
 
 
 def _read_sql() -> str:
@@ -48,21 +48,21 @@ def _strip_comments(sql: str) -> str:
 
 
 @pytest.mark.unit
-class TestDimStandingsCutoverStructure:
-    """Regex sanity over ``dim_standings.sql`` post-E1.5 cutover."""
+class TestFctStandingsCutoverStructure:
+    """Regex sanity over ``fct_standings.sql`` post-E1.5 cutover."""
 
     def test_join_uses_silver_xref_team(self):
         """JOIN must hit silver.xref_team, not gold.entity_xref."""
         sql = _strip_comments(_read_sql())
         assert "iceberg.silver.xref_team" in sql, (
-            "dim_standings.sql must JOIN iceberg.silver.xref_team after "
+            "fct_standings.sql must JOIN iceberg.silver.xref_team after "
             "the E1.5 cutover"
         )
 
     def test_no_legacy_entity_xref_in_executable_sql(self):
         sql = _strip_comments(_read_sql())
         assert "gold.entity_xref" not in sql, (
-            "dim_standings.sql must NOT reference gold.entity_xref in "
+            "fct_standings.sql must NOT reference gold.entity_xref in "
             "executable SQL after E1.5 cutover"
         )
 
@@ -74,7 +74,7 @@ class TestDimStandingsCutoverStructure:
         ) or re.search(
             r"source\s*=\s*'sofascore'", sql, re.IGNORECASE,
         ), (
-            "dim_standings.sql must filter `source = 'sofascore'` on the "
+            "fct_standings.sql must filter `source = 'sofascore'` on the "
             "silver.xref_team join"
         )
 
@@ -88,7 +88,7 @@ class TestDimStandingsCutoverStructure:
         ) or re.search(
             r"\bleague\s*=\s*s\.league", sql, re.IGNORECASE,
         ), (
-            "dim_standings.sql must include a `league = s.league` "
+            "fct_standings.sql must include a `league = s.league` "
             "predicate in the silver.xref_team join"
         )
 
@@ -106,7 +106,7 @@ class TestDimStandingsCutoverStructure:
             sql, re.IGNORECASE,
         )
         assert has_slug or has_cast, (
-            "dim_standings.sql must include a season predicate on the "
+            "fct_standings.sql must include a season predicate on the "
             "silver.xref_team JOIN — either `season = s.season_slug` or "
             "`season = CAST(s.season AS varchar)`"
         )
@@ -123,7 +123,7 @@ class TestDimStandingsCutoverStructure:
             re.IGNORECASE,
         )
         assert pattern.search(sql), (
-            "dim_standings.sql must keep the `'ss_' || "
+            "fct_standings.sql must keep the `'ss_' || "
             "lower(regexp_replace(...))` orphan fallback"
         )
 
@@ -133,16 +133,16 @@ class TestDimStandingsCutoverStructure:
         string values."""
         sql = _read_sql()
         assert "'fbref_canonical'" in sql, (
-            "dim_standings.sql must keep the 'fbref_canonical' label"
+            "fct_standings.sql must keep the 'fbref_canonical' label"
         )
         assert "'sofascore_orphan'" in sql, (
-            "dim_standings.sql must keep the 'sofascore_orphan' label"
+            "fct_standings.sql must keep the 'sofascore_orphan' label"
         )
 
     def test_migration_breadcrumb_in_header(self):
         sql = _read_sql()
         assert "Migrated from gold.entity_xref to silver.xref_team in E1.5" in sql, (
-            "dim_standings.sql must keep the E1.5 migration breadcrumb"
+            "fct_standings.sql must keep the E1.5 migration breadcrumb"
         )
 
 
@@ -250,18 +250,18 @@ def gold_rows():
         rows = con.execute(translated).fetchall()
         col_names = [c[0] for c in con.description]
     except Exception as e:
-        pytest.skip(f"DuckDB execution of translated dim_standings SQL failed: {e}")
+        pytest.skip(f"DuckDB execution of translated fct_standings SQL failed: {e}")
 
     return [dict(zip(col_names, r)) for r in rows]
 
 
 @pytest.mark.unit
-class TestDimStandingsLogic:
+class TestFctStandingsLogic:
     def test_dedup_to_latest_snapshot(self, gold_rows):
         """6 input rows (3 teams × 2 snapshots) → 3 output rows."""
         assert len(gold_rows) == 3, (
             f"expected 3 rows after snapshot dedup, got {len(gold_rows)}: "
-            f"{[(r['team_name_raw'], r['mp']) for r in gold_rows]}"
+            f"{[(r['team_name_raw'], r['played']) for r in gold_rows]}"
         )
 
     def test_position_ordering(self, gold_rows):
@@ -303,19 +303,19 @@ class TestDimStandingsLogic:
         )
 
     def test_points_per_game_exact(self, gold_rows):
-        """``points_per_game = CAST(points AS DOUBLE) / NULLIF(mp, 0)`` —
+        """``points_per_game = CAST(points AS DOUBLE) / NULLIF(played, 0)`` —
         latest MCI: 31 / 12 == 2.5833…
         """
         mci = next(r for r in gold_rows if r["team_name_raw"] == "Manchester City")
         assert mci["points"] == 31
-        assert mci["mp"] == 12
+        assert mci["played"] == 12
         assert mci["points_per_game"] == pytest.approx(31 / 12)
 
     def test_match_columns_carry_through(self, gold_rows):
-        """mp / wins / draws / losses / goals_for / goals_against / goal_diff /
+        """played / wins / draws / losses / goals_for / goals_against / goal_diff /
         points are all surfaced from the latest snapshot."""
         mci = next(r for r in gold_rows if r["team_name_raw"] == "Manchester City")
-        assert mci["mp"] == 12
+        assert mci["played"] == 12
         assert mci["wins"] == 10
         assert mci["draws"] == 1
         assert mci["losses"] == 1

@@ -15,9 +15,15 @@
 --   * UNIQUE_<source> — single column без суффикса (метрика отсутствует у
 --     остальных источников). FotMob (#97): xgot / big_chances / shots_*_box.
 --
--- Зерно: (team_id_canonical, league, season). Spine — FBref subset из
--- xref_team. PK = natural composite (оба компонента NOT NULL по INNER FBref
--- spine; xxhash64 + ROW_NUMBER tiebreaker не нужен — design doc §7).
+-- Design contract: docs/design/gold-star-schema.md §5.4 (issue #428).
+-- Grain: (team_id, league, season). Spine — FBref subset из xref_team.
+-- PK = natural composite (все компоненты NOT NULL по INNER FBref spine;
+-- xxhash64 + ROW_NUMBER tiebreaker не нужен — design doc §7).
+-- Partitioning: (league, season) — passed by run_gold_transform().
+--
+-- #428 renames vs v1: team_id_canonical → team_id (plain FK id, паттерн
+-- #438); primary_team_name дропнут — контекст через dim_team. Audit-таблица
+-- сохраняет team_id_canonical (вне scope #428).
 --
 -- Cross-source season type (all varchar slug 'YYNN' after #404):
 --   * silver.xref_team.season                 = varchar slug '2526' (all sources)
@@ -180,11 +186,10 @@ cap_finance AS (
 )
 
 SELECT
-    -- ========= Identity =========
-    xf.canonical_id                                      AS team_id_canonical,
+    -- ========= PK =========
+    xf.canonical_id                                      AS team_id,
     xf.league                                            AS league,
     xf.season_year                                       AS season,
-    COALESCE(fb.team, us.primary_team_name)              AS primary_team_name,
 
     -- ========= HARD_FACT — counters (COALESCE fb → us → ws → ss) =========
     CAST(COALESCE(fb.mp,             us.games_played, ws.matches_seen,  ss.appearances)    AS BIGINT) AS matches,

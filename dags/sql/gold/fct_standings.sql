@@ -1,8 +1,14 @@
 -- =============================================================================
--- Gold: dim_standings
+-- Gold: fct_standings
 -- =============================================================================
 -- Per-(league, season, team) league table snapshot from SofaScore. One row per
 -- team per league/season. Carries position, points, goals, GD, points-per-game.
+--
+-- Design contract: docs/design/gold-star-schema.md §5.5 (issue #428).
+-- #428: переименовано из dim_standings — снапшот по командам это факт, не
+-- справочник (grain-конфликт с dim_*). Колонка mp → played (дизайн-имя §5.5).
+-- Ограничение (честно): снапшот «на сейчас», не по турам — point-in-time
+-- реконструкция из fct_team_match это этаж 2, не здесь.
 --
 -- Source:       iceberg.bronze.sofascore_league_table + iceberg.silver.xref_team
 -- PK:           (league, season, team_id)
@@ -31,7 +37,7 @@
 --   * SofaScore Pts already reflects post-deduction; R7 trust-check deferred.
 --   * position is derived (ROW_NUMBER) — SofaScore exposes it implicitly via
 --     order in the league-table feed but does not store the rank column.
---   * points_per_game uses NULLIF(mp, 0) to guard against zero-game teams.
+--   * points_per_game uses NULLIF(played, 0) to guard against zero-game teams.
 --   * SofaScore 'season' is a 4-char slug ('2526'); emitted as-is after #404
 --     (silver/FBref season is now slug too). season_slug stays as the explicit
 --     alias for the silver.xref_team JOIN (which keys on varchar slug season).
@@ -43,7 +49,7 @@ with standings_raw as (
         season,  -- SofaScore bronze already slug '2526' (#404; was cast to bigint)
         season                                            as season_slug,
         team                                              as team_name_raw,
-        cast(mp as integer)                               as mp,
+        cast(mp as integer)                               as played,  -- #428: mp → played (§5.5)
         cast(w  as integer)                               as wins,
         cast(d  as integer)                               as draws,
         cast(l  as integer)                               as losses,
@@ -67,7 +73,7 @@ standings_latest as (
         season,
         season_slug,
         team_name_raw,
-        mp,
+        played,
         wins,
         draws,
         losses,
@@ -105,7 +111,7 @@ select
         else 'sofascore_orphan'
     end                                                   as team_id_source,
     team_name_raw,
-    mp,
+    played,
     wins,
     draws,
     losses,
@@ -119,7 +125,7 @@ select
             order by points desc, goal_diff desc, goals_for desc
         ) as integer
     )                                                     as position,
-    cast(points as double) / nullif(mp, 0)                as points_per_game,
+    cast(points as double) / nullif(played, 0)            as points_per_game,
     snapshot_at,
     as_of_date
 from resolved

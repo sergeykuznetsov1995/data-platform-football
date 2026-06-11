@@ -23,26 +23,24 @@ table:
       * UNIQUE_<source>: метрика отсутствует у других источников →
         single column без суффикса.
 
-    Зерно: (player_id_canonical, league, season). Outfield-only (вратари
-    в fct_keeper_season_stats). Partitioning: (league, season).
+    Зерно: (player_id, league, season) — star design §5.2 (#428). FK:
+    player_id → dim_player, team_id → dim_team (orphan-fallback 'fb_<slug>').
+    Outfield-only (вратари в fct_keeper_season_stats).
+    Partitioning: (league, season).
   tags:
     - Tier.Gold
     - Domain.Football
     - PII.Low
 columns:
-  # ─── Identity ───
-  - name: player_id_canonical
-    description: Канонический ID игрока (PK part). FK → dim_player_attributes.
+  # ─── PK / FK ───
+  - name: player_id
+    description: Канонический ID игрока (PK part; #428 ex-player_id_canonical). FK → dim_player / dim_player_attributes.
   - name: league
     description: Лига (partition key).
   - name: season
     description: Сезон — varchar slug ('2425' = сезон 2024/25). Partition key.
-  - name: primary_team_name
-    description: Команда per-season (COALESCE FBref → FotMob).
-  - name: position_fbref
-    description: Позиция из FBref (DF/MF/FW/GK).
-  - name: position_fotmob
-    description: Позиция из FotMob (другая шкала классификации).
+  - name: team_id
+    description: Клуб игрока в сезоне (#428) — canonical id через xref_team, orphan-fallback 'fb_<slug>'. FK → dim_team.
 
   # ─── HARD_FACT (key metrics — single column COALESCE) ───
   - name: matches
@@ -171,7 +169,11 @@ columns:
   - name: _gold_created_at
     description: Технический timestamp создания строки в Gold-слое.
 relationships:
-  - from: player_id_canonical
+  - from: player_id
     to: trino_iceberg.iceberg.gold.dim_player_attributes.player_id_canonical
     type: FOREIGN_KEY
     description: N:1 — атрибуты игрока (snapshot per canonical_id).
+  - from: team_id
+    to: trino_iceberg.iceberg.gold.dim_team.team_id
+    type: FOREIGN_KEY
+    description: N:1 — клуб игрока в сезоне (#428; orphan 'fb_<slug>' вне dim_team).

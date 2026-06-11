@@ -31,7 +31,7 @@ table:
 columns:
   # ─── PK ───
   - name: team_id_canonical
-    description: Канонический ID команды (PK part). FK → fct_team_season_stats.team_id_canonical.
+    description: Канонический ID команды (PK part). FK → fct_team_season_stats.team_id (#428 parent переименован, audit сохраняет _canonical).
   - name: league
     description: Лига (partition key).
   - name: season
@@ -116,6 +116,6 @@ columns:
 
 relationships:
   - from: team_id_canonical
-    to: trino_iceberg.iceberg.gold.fct_team_season_stats.team_id_canonical
+    to: trino_iceberg.iceberg.gold.fct_team_season_stats.team_id
     type: FOREIGN_KEY
     description: N:1 — business-витрина с тем же grain.

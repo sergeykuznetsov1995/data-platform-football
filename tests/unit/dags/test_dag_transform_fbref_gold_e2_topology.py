@@ -7,7 +7,7 @@ Verifies the staged dim build order from the design (§7):
   * s2b_xref_dims    — dim_player / dim_referee / dim_manager (.sql)
                        + dim_team (inline j2)
   * s2c_dim_match    — dim_match (inline j2, the star centre)
-  * s2d_season_blocks — dim_standings / dim_player_attributes / fct_*_season
+  * s2d_season_blocks — fct_standings / dim_player_attributes / fct_*_season
   * group chaining: s2a >> s2b >> s2c >> s2d >> s3_facts
   * ALL 8 star dims are unpartitioned (partition_cols=None).
   * ``dag.max_active_tasks == 1`` is preserved.
@@ -128,11 +128,11 @@ class TestStarDimTaskIds:
         )
 
     def test_season_blocks_under_s2d(self):
-        """dim_standings + dim_player_attributes stayed in the season-block
-        stage (their redesign is #428, not #425)."""
+        """fct_standings (ex-dim_standings, renamed #428) + dim_player_attributes
+        stayed in the season-block stage."""
         _reload_gold_dag()
         task_ids = _all_task_ids()
-        assert "s2d_season_blocks.dim_standings" in task_ids
+        assert "s2d_season_blocks.fct_standings" in task_ids
         assert "s2d_season_blocks.dim_player_attributes" in task_ids
 
 
@@ -174,10 +174,10 @@ class TestStageChaining:
             "s3_facts.fct_player_match",
             "s3_facts.match_outcomes",
         }
-        op = _by_task_id("s2d_season_blocks.dim_standings")
+        op = _by_task_id("s2d_season_blocks.fct_standings")
         missing = s3_task_ids - op.downstream_task_ids
         assert not missing, (
-            f"dim_standings missing s3 downstreams: {missing}. "
+            f"fct_standings missing s3 downstreams: {missing}. "
             f"Have: {op.downstream_task_ids}"
         )
 
@@ -209,11 +209,11 @@ class TestDimWiring:
                 f"got {op.op_kwargs.get('partition_cols')!r}"
             )
 
-    def test_dim_standings_partitioned_by_league_season(self):
-        """dim_standings IS partitioned by (league, season) per the SQL contract."""
+    def test_fct_standings_partitioned_by_league_season(self):
+        """fct_standings IS partitioned by (league, season) per the SQL contract."""
         _reload_gold_dag()
-        st = _by_task_id("s2d_season_blocks.dim_standings")
+        st = _by_task_id("s2d_season_blocks.fct_standings")
         assert st.op_kwargs.get("partition_cols") == ["league", "season"], (
-            f"dim_standings partition_cols should be ['league','season'], "
+            f"fct_standings partition_cols should be ['league','season'], "
             f"got {st.op_kwargs.get('partition_cols')!r}"
         )
