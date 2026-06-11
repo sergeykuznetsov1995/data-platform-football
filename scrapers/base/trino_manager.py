@@ -179,6 +179,10 @@ class TrinoTableManager:
         Trino Python client cancels queries on cursor.close() if results
         are not fully consumed.
 
+        Runtime failures (ICEBERG_COMMIT_ERROR, OOM, dead worker) surface
+        while polling results — i.e. inside fetchall() — so they propagate
+        as TrinoError even for DDL/DML, never a silent success (#456).
+
         On connection errors, resets connection and retries once.
         """
         for attempt in range(2):
@@ -191,10 +195,7 @@ class TrinoTableManager:
                     return cursor.fetchall()
 
                 # Consume results even for DDL/DML to ensure query completes
-                try:
-                    cursor.fetchall()
-                except Exception:
-                    pass
+                cursor.fetchall()
                 return None
 
             except Exception as e:
