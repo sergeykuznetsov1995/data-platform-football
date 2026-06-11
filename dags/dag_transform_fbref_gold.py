@@ -206,6 +206,14 @@ STAGE_3_FACTS = [
     # Labels-only target table — kept separate from `fct_match` so backtesting
     # can join targets to features without leakage.
     ('match_outcomes',   'dags/sql/gold/match_outcomes.sql',   'match_outcomes',   ['league', 'season']),
+    # issue #427: unified per-event match chronicle (goals/cards/subs in ONE
+    # timeline, PK (match_id, event_seq)). silver.fbref_match_events primary
+    # + bronze.whoscored_events per-match fallback. Runs in s3 — after g2c,
+    # so dim_match (FK target) already exists. No STAGE_3_FALLBACKS entry:
+    # silver.fbref_match_events is a core table, and the require_silver
+    # mechanism can't guard bronze sources anyway (fct_card precedent).
+    ('fct_match_timeline', 'dags/sql/gold/fct_match_timeline.sql',
+     'fct_match_timeline', ['league', 'season']),
 ]
 
 # Tables in STAGE_3 with optional Silver sources. Same mechanism as
