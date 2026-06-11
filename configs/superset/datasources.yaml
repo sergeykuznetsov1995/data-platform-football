@@ -52,7 +52,7 @@ databases:
         description: |
           Канонический справочник клубов (#425: одна строка = один клуб,
           PK team_id; team_name/country/short_name из team_aliases.yaml).
-          Используется как FK target из fct_match, fct_team_match, feat_team_*.
+          Используется как FK target из fct_team_match и других фактов.
         default_endpoint: null
         cache_timeout: 3600
 
@@ -70,27 +70,18 @@ databases:
         description: |
           Паспорт матча (#425): match_date, kickoff_time, тур, FK на команды,
           судью (referee_id), стадион (venue_id), тренеров, счёт, исход 1X2.
-          PK match_id. Центр звезды — источник для всех fct_* и feat_*-таблиц.
+          PK match_id. Центр звезды — FK target для всех fct_*-таблиц.
         default_endpoint: null
         cache_timeout: 3600
 
       # -----------------------------------------------------------------------
       # Facts
       # -----------------------------------------------------------------------
-      - table_name: fct_match
-        schema: gold
-        description: |
-          Wide-form факт-таблица для ML: один матч = одна строка с
-          home/away pre-match form, H2H и xG-фичами. ML-таргеты result_1x2,
-          total_goals, btts. Готова к обучению моделей 1X2, BTTS, totals.
-        default_endpoint: null
-        cache_timeout: 1800
-
       - table_name: fct_team_match
         schema: gold
         description: |
           Long-form факт: одна строка на (match_id, team_id) — обе команды матча.
-          Источник rolling-фич (feat_team_form, feat_team_h2h).
+          Per-match командные метрики 5 источников (FBref spine).
         default_endpoint: null
         cache_timeout: 1800
 
@@ -103,62 +94,9 @@ databases:
           SofaScore: rating (0-10), ground_duels_won, aerial_duels_won.
           Understat: expected_goals, expected_assists, key_passes.
           WhoScored: dribbles.
-          Источник для feat_player_form и per-match timeline-аналитики.
+          Источник для per-match timeline-аналитики.
         default_endpoint: null
         cache_timeout: 1800
-
-      # -----------------------------------------------------------------------
-      # Features
-      # -----------------------------------------------------------------------
-      - table_name: feat_team_form
-        schema: gold
-        description: |
-          Rolling-фичи команды по последним 5 матчам (point-in-time safe).
-          Включает avg/std/trend по голам, ударам, поссессии, очкам.
-          Первые 5 матчей сезона — NULL для предотвращения лика.
-        default_endpoint: null
-        cache_timeout: 1800
-
-      - table_name: feat_team_h2h
-        schema: gold
-        description: |
-          Head-to-head фичи: rolling-агрегация последних 5 встреч пары команд.
-          PK (match_id, team_id, opponent_id). Excludes current match.
-        default_endpoint: null
-        cache_timeout: 1800
-
-      - table_name: feat_player_form
-        schema: gold
-        description: |
-          Rolling-фичи игрока за последние 5 матчей.
-          Голы, ассисты, удары, минуты — avg по L5; sum для голов/карточек.
-          Первые 5 появлений сезона — NULL.
-        default_endpoint: null
-        cache_timeout: 1800
-
-      - table_name: feat_team_xg_form
-        schema: gold
-        description: |
-          xG/xA rolling-форма команды (Understat L5).
-          xg_for_l5, xg_against_l5, xg_diff_l5. Источник для фичей ML.
-        default_endpoint: null
-        cache_timeout: 1800
-
-      - table_name: feat_referee_bias
-        schema: gold
-        description: |
-          Per-(referee, season, league) bias-метрики: cards_per_match,
-          home_win_pct, penalty_rate. Используется в mart_referee_dashboard.
-        default_endpoint: null
-        cache_timeout: 3600
-
-      - table_name: feat_team_event_style
-        schema: gold
-        description: |
-          Per-(team, season, league) распределение SPADL action_canonical
-          и success_rate. Источник для тактических разрезов.
-        default_endpoint: null
-        cache_timeout: 3600
 
       # -----------------------------------------------------------------------
       # E3/E4 facts (event-level + narrow facts)
@@ -167,7 +105,7 @@ databases:
         schema: gold
         description: |
           Event-grain факт (~695k строк): SPADL-канонизированные события
-          WhoScored с x/y координатами (0-100). Источник mart_event_heatmap.
+          WhoScored с x/y координатами (0-100).
           PK (event_id_canonical). Партиции (league, season).
         default_endpoint: null
         cache_timeout: 3600
@@ -226,36 +164,5 @@ databases:
         description: |
           Travail/injuries/suspensions: per-(match, player, reason).
           Источник: silver.whoscored_missing_players. E5.
-        default_endpoint: null
-        cache_timeout: 3600
-
-      # -----------------------------------------------------------------------
-      # E7 marts (BI-ready denormalized views)
-      # -----------------------------------------------------------------------
-      - table_name: mart_scouting_radar
-        schema: gold
-        description: |
-          Per-(player, match) scouting view с denormalized player_name/position.
-          xG, xA, key_passes, defensive_actions + L5 rolling метрики
-          (point-in-time safe, NULL для первых 5 матчей).
-          Источник для дашборда Scouting Radar.
-        default_endpoint: null
-        cache_timeout: 1800
-
-      - table_name: mart_referee_dashboard
-        schema: gold
-        description: |
-          Per-(referee, season, league) сводка: cards_per_match,
-          yellows/reds/penalties/goals per match, home_win_pct.
-          Источник для дашборда Referee Dashboard.
-        default_endpoint: null
-        cache_timeout: 3600
-
-      - table_name: mart_event_heatmap
-        schema: gold
-        description: |
-          Per-(team, season, league, zone_x, zone_y, action_canonical)
-          распределение событий и success_rate. Грид 12×8 поверх 0-100 пола.
-          Источник для дашборда Event Heatmap.
         default_endpoint: null
         cache_timeout: 3600

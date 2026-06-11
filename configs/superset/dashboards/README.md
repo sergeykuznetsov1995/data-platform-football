@@ -21,15 +21,17 @@
 
 | Slug | Title | Чартов | Источники |
 |------|-------|--------|-----------|
-| `team-form-overview` | Team form overview | 4 | `feat_team_form`, `feat_team_h2h`, `dim_team` |
-| `match-outcomes` | Match outcomes | 4 | `fct_match`, `fct_team_match` |
+| `player-overview` | Player overview | — | `fct_player_match`, `fct_shot`, `fct_match_rating`, `dim_*` |
+
+(Дашборды производного gold-этажа — team-form-overview, match-outcomes,
+scouting-radar, referee-dashboard, event-heatmap — удалены в epic #478.)
 
 ## Как добавить новый дашборд
 
 1. Создай файл `<short_name>.py` в этой директории. Он должен:
    - определять функцию `create_dashboard()` без аргументов;
    - проверять идемпотентно `slug` и выходить, если дашборд уже есть;
-   - использовать утилиты `_find_table` / `_make_slice` (см. `team_form_overview.py`).
+   - использовать утилиты `_find_table` / `_make_slice` (см. `player_overview.py`).
 2. Добавь имя модуля (без `.py`) в список `DASHBOARDS` в `import_dashboards.py`.
 3. Применить:
    ```bash

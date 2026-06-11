@@ -30,8 +30,6 @@ log = logging.getLogger("import_dashboards")
 # Реестр дашбордов. Имя соответствует module name (без .py).
 # -----------------------------------------------------------------------------
 DASHBOARDS: list[str] = [
-    "team_form_overview",
-    "match_outcomes",
     "player_overview",
 ]
 
