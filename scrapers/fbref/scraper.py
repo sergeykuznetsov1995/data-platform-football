@@ -496,6 +496,7 @@ class FBrefScraper(
                 df=combined_df,
                 table_name='fbref_team_stats',
                 partition_cols=['league', 'season'],
+                replace_partitions=['league', 'season'],
             )
             results['team_stats'] = table_path
 
@@ -505,6 +506,7 @@ class FBrefScraper(
                 df=combined_df,
                 table_name='fbref_team_stats_extended',
                 partition_cols=['league', 'season'],
+                replace_partitions=['league', 'season'],
             )
             results['team_stats_extended'] = table_path
 
@@ -514,6 +516,7 @@ class FBrefScraper(
                 df=combined_df,
                 table_name='fbref_player_stats',
                 partition_cols=['league', 'season'],
+                replace_partitions=['league', 'season'],
             )
             results['player_stats'] = table_path
 
@@ -523,6 +526,7 @@ class FBrefScraper(
                 df=combined_df,
                 table_name='fbref_player_stats_extended',
                 partition_cols=['league', 'season'],
+                replace_partitions=['league', 'season'],
             )
             results['player_stats_extended'] = table_path
 
@@ -532,6 +536,7 @@ class FBrefScraper(
                 df=combined_df,
                 table_name='fbref_keeper_stats',
                 partition_cols=['league', 'season'],
+                replace_partitions=['league', 'season'],
             )
             results['keeper_stats'] = table_path
 
@@ -541,6 +546,7 @@ class FBrefScraper(
                 df=combined_df,
                 table_name='fbref_player_match_stats',
                 partition_cols=['league', 'season'],
+                replace_partitions=['match_id'],
             )
             results['player_match_stats'] = table_path
 
@@ -550,6 +556,7 @@ class FBrefScraper(
                 df=combined_df,
                 table_name='fbref_shot_events',
                 partition_cols=['league', 'season'],
+                replace_partitions=['match_id'],
             )
             results['shot_events'] = table_path
 
@@ -559,6 +566,7 @@ class FBrefScraper(
                 df=combined_df,
                 table_name='fbref_match_events',
                 partition_cols=['league', 'season'],
+                replace_partitions=['match_id'],
             )
             results['match_events'] = table_path
 
@@ -568,6 +576,7 @@ class FBrefScraper(
                 df=combined_df,
                 table_name='fbref_lineups',
                 partition_cols=['league', 'season'],
+                replace_partitions=['match_id'],
             )
             results['lineups'] = table_path
 
@@ -577,6 +586,7 @@ class FBrefScraper(
                 df=combined_df,
                 table_name='fbref_team_match_stats',
                 partition_cols=['league', 'season'],
+                replace_partitions=['match_id'],
             )
             results['team_match_stats'] = table_path
 

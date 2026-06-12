@@ -1000,3 +1000,87 @@ class TestSkippedLeaguesFailureTracking:
 
         assert scraper._stats.get('failures', 0) > 0
         assert len(result) == 0
+
+
+class TestScrapeAllReplacePartitions:
+    """#468: every scrape_all save must pass replace_partitions —
+    season-grain tables by (league, season), match-grain by match_id —
+    otherwise --mode full re-runs plain-append duplicates."""
+
+    SEASON_TABLES = (
+        'fbref_schedule', 'fbref_team_stats', 'fbref_team_stats_extended',
+        'fbref_player_stats', 'fbref_player_stats_extended',
+        'fbref_keeper_stats',
+    )
+    MATCH_TABLES = (
+        'fbref_player_match_stats', 'fbref_shot_events', 'fbref_match_events',
+        'fbref_lineups', 'fbref_team_match_stats',
+    )
+
+    @pytest.fixture
+    def mock_scraper_dependencies(self):
+        """Mock all dependencies for the Selenium scraper."""
+        with patch('scrapers.base.base_scraper.get_rate_limiter') as mock_rl, \
+             patch('scrapers.base.base_scraper.get_retry_policy') as mock_rp, \
+             patch('scrapers.base.base_scraper.get_circuit_breaker') as mock_cb, \
+             patch('scrapers.base.base_scraper.IcebergWriter') as mock_iw, \
+             patch('scrapers.base.browser.cloudflare_bypass.CloudflareBypass'):
+
+            mock_rl.return_value = MagicMock()
+            mock_rl.return_value.acquire.return_value = True
+            mock_rp.return_value = MagicMock()
+            mock_cb.return_value = MagicMock()
+            mock_cb.return_value.state = 'closed'
+            mock_iw.return_value = MagicMock()
+
+            yield
+
+    def test_scrape_all_saves_every_table_with_replace_partitions(
+        self, mock_scraper_dependencies
+    ):
+        from scrapers.fbref.scraper import FBrefScraper
+
+        scraper = FBrefScraper(leagues=['ENG-Premier League'], seasons=[2024])
+
+        season_df = pd.DataFrame({
+            'league': ['ENG-Premier League'], 'season': [2024], 'value': [1],
+        })
+        match_df = pd.DataFrame({
+            'match_id': ['m1'], 'league': ['ENG-Premier League'],
+            'season': [2024], 'value': [1],
+        })
+
+        scraper.read_schedule = MagicMock(return_value=season_df.copy())
+        scraper.read_team_season_stats = MagicMock(return_value=season_df.copy())
+        scraper.read_player_season_stats = MagicMock(return_value=season_df.copy())
+        scraper.read_keeper_stats = MagicMock(return_value=season_df.copy())
+        scraper._merge_team_stats = MagicMock(return_value=season_df.copy())
+        scraper._merge_player_stats = MagicMock(return_value=season_df.copy())
+        scraper._merge_keeper_stats = MagicMock(return_value=season_df.copy())
+        scraper._extract_match_ids = MagicMock(return_value=['m1'])
+        scraper.read_player_match_stats = MagicMock(return_value=match_df.copy())
+        scraper.read_shot_events = MagicMock(return_value=match_df.copy())
+        scraper.read_match_events = MagicMock(return_value=match_df.copy())
+        scraper.read_lineup = MagicMock(return_value=match_df.copy())
+        scraper.read_team_match_stats = MagicMock(return_value=match_df.copy())
+        scraper._cleanup_after_league = MagicMock()
+        scraper.save_to_iceberg = MagicMock(
+            side_effect=lambda df, table_name, **kw: f'iceberg.bronze.{table_name}'
+        )
+
+        with patch('scrapers.fbref.scraper.time'):
+            scraper.scrape_all(
+                include_match_stats=True,
+                include_team_match_stats=True,
+                max_matches_per_league=1,
+            )
+
+        by_table = {
+            c.kwargs.get('table_name'): c.kwargs.get('replace_partitions')
+            for c in scraper.save_to_iceberg.call_args_list
+        }
+        assert set(by_table) == set(self.SEASON_TABLES) | set(self.MATCH_TABLES)
+        for table in self.SEASON_TABLES:
+            assert by_table[table] == ['league', 'season'], table
+        for table in self.MATCH_TABLES:
+            assert by_table[table] == ['match_id'], table
