@@ -86,7 +86,8 @@
 --                                     and will populate automatically once
 --                                     fct_shot is rebuilt with resolved
 --                                     assists — no fct_goal change needed).
---   minute                integer
+--   minute                integer     BASE minute for the own-goal branch
+--                                     (#454: FBref '90+4' → 90)
 --   is_own_goal           boolean     TRUE iff the goal is an own_goal
 --   is_penalty            boolean     TRUE iff regular goal with situation
 --                                     ='penalty' (always FALSE for own_goal).
@@ -193,7 +194,10 @@ regular_goals AS (
 fb_own_goals_dedup AS (
     SELECT
         match_id,
-        TRY_CAST(minute AS integer)          AS minute,
+        -- #454: '90+4' stoppage-time strings → base minute 90 (split_part
+        -- mirrors fct_match_timeline.sql). Plain TRY_CAST returned NULL and
+        -- the final WHERE silently dropped every stoppage-time own goal.
+        TRY_CAST(split_part(minute, '+', 1) AS integer) AS minute,
         player                               AS scorer_name,
         player_id                            AS scorer_player_id,
         team                                 AS team_name_raw,

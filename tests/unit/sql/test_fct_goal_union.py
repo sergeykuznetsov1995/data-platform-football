@@ -439,3 +439,36 @@ class TestOwnGoalTeamAttribution:
         assert out[0]["scorer_id_canonical"] == "leno_canonical"
         assert out[0]["is_own_goal"] is True
         assert out[0]["assist_id_canonical"] is None
+
+
+class TestStoppageTimeMinute:
+    """#454: bronze FBref minute is varchar with stoppage time ('90+4').
+
+    The own-goal branch must parse the BASE minute (90), not TRY_CAST the
+    whole string to NULL and silently drop the row in the final WHERE.
+    """
+
+    def test_own_goal_in_stoppage_time_survives_with_base_minute(self, duck_conn):
+        duck_conn.execute(
+            """
+            INSERT INTO bronze_fbref_match_events VALUES
+              ('M3', '90+4', 'own_goal', 'Bernd Leno', 'fb_leno',
+                'Liverpool', 'ENG-Premier League', 2024,
+                TIMESTAMP '2026-05-08 12:00:00'),
+              ('M3', '45+2', 'own_goal', 'Axel Disasi', 'fb_disasi',
+                'Wolverhampton Wanderers', 'ENG-Premier League', 2024,
+                TIMESTAMP '2026-05-08 12:00:00')
+            """
+        )
+        duck_conn.execute(
+            """
+            INSERT INTO silver_xref_team VALUES
+              ('fbref', 'Liverpool', 'liverpool', 'ENG-Premier League', '2425'),
+              ('fbref', 'Wolverhampton Wanderers', 'wolves',
+               'ENG-Premier League', '2425')
+            """
+        )
+        out = _run(duck_conn)
+        assert len(out) == 2, f"stoppage-time own goals dropped: {out}"
+        minutes = sorted(r["minute"] for r in out)
+        assert minutes == [45, 90], minutes

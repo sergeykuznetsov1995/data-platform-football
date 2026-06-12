@@ -35,7 +35,9 @@
 --   team_id_canonical           varchar     via xref_team — orphan-tolerant
 --   player_in_canonical         varchar     player coming ON  (xref_player)
 --   player_out_canonical        varchar     player going OFF  (xref_player)
---   minute                      integer     event minute
+--   minute                      integer     BASE event minute (#454: FBref
+--                                           '90+3' → 90; WS cumulative 93 →
+--                                           90 period-aware)
 --   substitution_canonical      varchar     xxhash64 synthetic PK
 --   substitution_source         varchar     'fbref' | 'whoscored'
 --   substitution_version        varchar     literal 'v1'
@@ -89,6 +91,10 @@ ws_off AS (
         CAST(CAST(team_id AS BIGINT) AS varchar)         AS team_id_raw,
         CAST(CAST(player_id AS BIGINT) AS varchar)       AS player_out_raw,
         TRY_CAST(minute AS integer)                      AS minute,
+        period,                                          -- #454: for the
+        -- cumulative→base minute conversion in ws_subs (AFTER pairing —
+        -- converting here would collapse two same-team stoppage swaps into
+        -- one pairing partition and fan the INNER JOIN out 2×2).
         league,
         season,
         _ingested_at,
@@ -125,6 +131,7 @@ ws_pairs AS (
         n.player_in_raw                                   AS player_in_raw,
         o.player_out_raw                                  AS player_out_raw,
         o.minute,
+        o.period,
         o.league,
         o.season,
         GREATEST(o._ingested_at, n._ingested_at)          AS _ingested_at
@@ -206,7 +213,10 @@ fb_subs AS (
         xt.canonical_id                                   AS team_id_canonical,
         xp_in.canonical_id                                AS player_in_canonical,
         xp_out.canonical_id                               AS player_out_canonical,
-        TRY_CAST(fe.minute AS integer)                    AS minute,
+        -- #454: '90+3' stoppage-time strings → base minute 90 (split_part
+        -- mirrors fct_match_timeline.sql). Plain TRY_CAST returned NULL and
+        -- the final WHERE silently dropped every stoppage-time sub.
+        TRY_CAST(split_part(fe.minute, '+', 1) AS integer) AS minute,
         CAST('fbref' AS varchar)                          AS source,
         1                                                 AS source_priority,
         fe.league                                         AS league,
@@ -248,7 +258,14 @@ ws_subs AS (
         xt.canonical_id                                   AS team_id_canonical,
         xp_in.canonical_id                                AS player_in_canonical,
         xp_out.canonical_id                               AS player_out_canonical,
-        wp.minute                                         AS minute,
+        -- #454: WS minute is the CUMULATIVE half minute (90+3 → 93). Convert
+        -- to base minute (period-aware, mirrors fct_match_timeline.sql) so
+        -- the dedup key aligns with the FBref branch's base minute.
+        CASE
+            WHEN wp.period = 'FirstHalf'  AND wp.minute > 45 THEN 45
+            WHEN wp.period = 'SecondHalf' AND wp.minute > 90 THEN 90
+            ELSE wp.minute
+        END                                               AS minute,
         CAST('whoscored' AS varchar)                      AS source,
         2                                                 AS source_priority,
         wp.league                                         AS league,

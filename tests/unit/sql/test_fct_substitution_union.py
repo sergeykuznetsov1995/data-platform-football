@@ -363,3 +363,147 @@ class TestFctSubstitutionPipeline:
         out = _run_gold(duck_conn)
         pks = [r["substitution_canonical"] for r in out]
         assert len(pks) == len(set(pks)), pks
+
+
+class TestStoppageTimeMinutes:
+    """#454: FBref minute is varchar with stoppage time ('90+3') and WhoScored
+    minute is the CUMULATIVE half minute (90+3 → 93). Both branches must emit
+    the BASE minute so cross-source dedup keys align — while WS Off/On pairing
+    keeps using the raw cumulative minute (converting before pairing would
+    fan-out two same-team stoppage subs into 2×2 join matches).
+    """
+
+    def test_fbref_stoppage_sub_base_minute(self, duck_conn):
+        """On top of the standard corpus, a '90+3' FBref sub must survive
+        as minute 90 (today it is TRY_CAST → NULL → dropped)."""
+        _seed(duck_conn)
+        duck_conn.execute(
+            """
+            INSERT INTO bronze_fbref_match_events VALUES
+              ('M1', '90+3', 'substitution', 'NewPlayer3', 'fb_in3',
+               'OldPlayer3', 'fb_out3', 'Liverpool', 'ENG-Premier League', 2024,
+               TIMESTAMP '2026-05-08 12:00:00')
+            """
+        )
+        out = _run_gold(duck_conn)
+        assert len(out) == 4, f"stoppage-time sub dropped: {out}"
+        minutes = sorted(r["minute"] for r in out)
+        assert minutes == [60, 75, 80, 90], minutes
+
+    def test_ws_stoppage_pair_dedups_with_fbref(self, duck_conn):
+        """Same stoppage swap from FBref ('90+3') and WS (cumulative 93,
+        SecondHalf) must collapse to ONE FBref-priority row at minute 90."""
+        # FBref sub in M1.
+        duck_conn.execute(
+            """
+            INSERT INTO bronze_fbref_match_events VALUES
+              ('M1', '90+3', 'substitution', 'NewPlayer1', 'fb_in1',
+               'OldPlayer1', 'fb_out1', 'Liverpool', 'ENG-Premier League', 2024,
+               TIMESTAMP '2026-05-08 12:00:00')
+            """
+        )
+        # WS swap pair for the same match/team/players at cumulative 93.
+        duck_conn.execute(
+            """
+            INSERT INTO bronze_whoscored_events VALUES
+              (1.0, 'SecondHalf', 93, 5, 93, 'SubstitutionOff', 'Successful',
+               100.0, 5000.0, NULL, 6000.0, 'Liverpool',
+               'ENG-Premier League', '2425', TIMESTAMP '2026-05-08 12:00:00'),
+              (1.0, 'SecondHalf', 93, 6, 93, 'SubstitutionOn',  'Successful',
+               100.0, 6000.0, NULL, 5000.0, 'Liverpool',
+               'ENG-Premier League', '2425', TIMESTAMP '2026-05-08 12:00:00')
+            """
+        )
+        # Bridge spine: WS game 1 ↔ FBref M1 (same league, same date).
+        duck_conn.execute(
+            """
+            INSERT INTO bronze_whoscored_schedule VALUES
+              (1, TIMESTAMP '2024-08-15 19:00:00', 'Liverpool', 'Arsenal',
+               'ENG-Premier League', '2425', TIMESTAMP '2026-05-08 12:00:00')
+            """
+        )
+        duck_conn.execute(
+            """
+            INSERT INTO silver_fbref_match_enriched VALUES
+              ('M1', 'ENG-Premier League', 'Liverpool', 'Arsenal',
+               DATE '2024-08-15')
+            """
+        )
+        duck_conn.execute(
+            """
+            INSERT INTO silver_xref_team VALUES
+              ('fbref',     'Liverpool', 'liverpool', 'ENG-Premier League', '2425'),
+              ('fbref',     'Arsenal',   'arsenal',   'ENG-Premier League', '2425'),
+              ('whoscored', 'Liverpool', 'liverpool', 'ENG-Premier League', '2425'),
+              ('whoscored', 'Arsenal',   'arsenal',   'ENG-Premier League', '2425')
+            """
+        )
+        # Both sources resolve to the same (in, out) canonicals → dedup fires.
+        duck_conn.execute(
+            """
+            INSERT INTO silver_xref_player VALUES
+              ('fbref',     'fb_in1',  'in1_canon',  'ENG-Premier League', '2425'),
+              ('fbref',     'fb_out1', 'out1_canon', 'ENG-Premier League', '2425'),
+              ('whoscored', '6000',    'in1_canon',  'ENG-Premier League', '2425'),
+              ('whoscored', '5000',    'out1_canon', 'ENG-Premier League', '2425')
+            """
+        )
+        out = _run_gold(duck_conn)
+        assert len(out) == 1, f"expected 1 deduped row, got {len(out)}: {out}"
+        assert out[0]["substitution_source"] == "fbref", out
+        assert out[0]["minute"] == 90, out
+
+    def test_ws_two_stoppage_pairs_no_fanout(self, duck_conn):
+        """Two same-team WS swaps at cumulative 91 and 94 must stay TWO rows
+        (pairing on raw cumulative minute), both emitted at base minute 90."""
+        duck_conn.execute(
+            """
+            INSERT INTO bronze_whoscored_events VALUES
+              (2.0, 'SecondHalf', 91, 5, 91, 'SubstitutionOff', 'Successful',
+               100.0, 5000.0, NULL, 6000.0, 'Manchester City',
+               'ENG-Premier League', '2425', TIMESTAMP '2026-05-08 12:00:00'),
+              (2.0, 'SecondHalf', 91, 6, 91, 'SubstitutionOn',  'Successful',
+               100.0, 6000.0, NULL, 5000.0, 'Manchester City',
+               'ENG-Premier League', '2425', TIMESTAMP '2026-05-08 12:00:00'),
+              (2.0, 'SecondHalf', 94, 7, 94, 'SubstitutionOff', 'Successful',
+               100.0, 5001.0, NULL, 6001.0, 'Manchester City',
+               'ENG-Premier League', '2425', TIMESTAMP '2026-05-08 12:00:00'),
+              (2.0, 'SecondHalf', 94, 8, 94, 'SubstitutionOn',  'Successful',
+               100.0, 6001.0, NULL, 5001.0, 'Manchester City',
+               'ENG-Premier League', '2425', TIMESTAMP '2026-05-08 12:00:00')
+            """
+        )
+        duck_conn.execute(
+            """
+            INSERT INTO bronze_whoscored_schedule VALUES
+              (2, TIMESTAMP '2024-09-01 19:00:00', 'Manchester City', 'Newcastle',
+               'ENG-Premier League', '2425', TIMESTAMP '2026-05-08 12:00:00')
+            """
+        )
+        duck_conn.execute(
+            """
+            INSERT INTO silver_xref_team VALUES
+              ('whoscored', 'Manchester City', 'manchester_city',
+               'ENG-Premier League', '2425')
+            """
+        )
+        # Distinct canonicals per swap keep the dedup buckets apart.
+        duck_conn.execute(
+            """
+            INSERT INTO silver_xref_player VALUES
+              ('whoscored', '6000', 'ws_in1_canon',  'ENG-Premier League', '2425'),
+              ('whoscored', '5000', 'ws_out1_canon', 'ENG-Premier League', '2425'),
+              ('whoscored', '6001', 'ws_in2_canon',  'ENG-Premier League', '2425'),
+              ('whoscored', '5001', 'ws_out2_canon', 'ENG-Premier League', '2425')
+            """
+        )
+        out = _run_gold(duck_conn)
+        assert len(out) == 2, f"pairing fan-out or collapse: {out}"
+        assert sorted(r["minute"] for r in out) == [90, 90], out
+        in_outs = sorted(
+            (r["player_in_canonical"], r["player_out_canonical"]) for r in out
+        )
+        assert in_outs == [
+            ("ws_in1_canon", "ws_out1_canon"),
+            ("ws_in2_canon", "ws_out2_canon"),
+        ], in_outs
