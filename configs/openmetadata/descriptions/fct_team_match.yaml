@@ -51,9 +51,13 @@ columns:
   - name: saves
     description: Сейвы вратаря команды (FBref).
   - name: points
-    description: Очки за матч (3 / 1 / 0). Computed.
+    description: >-
+      Очки за матч (3 / 1 / 0). Computed. NULL для несыгранных матчей
+      (is_completed = FALSE).
   - name: result
-    description: Результат с т.з. команды — 'W' / 'D' / 'L'. Computed.
+    description: >-
+      Результат с т.з. команды — 'W' / 'D' / 'L'. Computed. NULL для
+      несыгранных матчей (is_completed = FALSE).
   - name: is_completed
     description: Матч сыгран.
   # ===== v2 MODELED (xG primary = Understat per RX2; SS fallback) =====

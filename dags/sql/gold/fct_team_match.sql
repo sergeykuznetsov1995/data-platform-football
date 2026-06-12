@@ -246,15 +246,17 @@ SELECT
     -- ===== Result =====
     u.goals_for,
     u.goals_against,
+    -- #452: explicit `<` branch instead of ELSE — NULL goals (unplayed
+    -- matches, is_completed = FALSE) fall through to NULL, not 0/'L'.
     CASE
         WHEN u.goals_for > u.goals_against THEN 3
         WHEN u.goals_for = u.goals_against THEN 1
-        ELSE 0
+        WHEN u.goals_for < u.goals_against THEN 0
     END AS points,
     CASE
         WHEN u.goals_for > u.goals_against THEN 'W'
         WHEN u.goals_for = u.goals_against THEN 'D'
-        ELSE 'L'
+        WHEN u.goals_for < u.goals_against THEN 'L'
     END AS result,
 
     -- ===== Shots =====
