@@ -456,6 +456,8 @@ class TestBatchSaveRetryDedup:
             self._frame('m1', 'first'),
             self._frame('m1', 'retry'),
             self._frame('m2', 'first'),
+            # Empty frame must be skipped, not crash the dedup loop
+            pd.DataFrame(columns=['match_id', 'league', 'season', 'pass_marker']),
         ]
 
         scraper._batch_save_match_data(

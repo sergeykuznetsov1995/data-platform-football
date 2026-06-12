@@ -866,7 +866,12 @@ class FBrefDataReaderMixin:
             # tagged with one match_id — keep only the newest per match.
             latest_by_match = {}
             for frame in data_list:
+                if frame.empty:
+                    continue
                 latest_by_match[frame['match_id'].iloc[0]] = frame
+            if not latest_by_match:
+                data_list.clear()
+                continue
             combined_df = pd.concat(latest_by_match.values(), ignore_index=True)
             try:
                 table_path = self.save_to_iceberg(
