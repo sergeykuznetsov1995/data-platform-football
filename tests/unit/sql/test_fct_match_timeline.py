@@ -533,6 +533,61 @@ class TestSeasonScopedBridgeAndIdentityGate:
         assert {r["match_id"] for r in out} == {"M3"}, out
         assert len(out) == 2, f"bridge fan-out duplicated the WS match: {out}"
 
+    def test_same_season_variant_does_not_duplicate_ws_only_match(self, duck_conn):
+        """#445: xref_team now legally carries TWO same-season FBref spellings
+        per canonical (schedule short name + match-page full name). For a
+        WS-only match the identity gate has no FBref twin to key on — the
+        bridge itself must collapse the variant fan-out to one row per game."""
+        duck_conn.execute(
+            f"""
+            INSERT INTO silver_xref_team VALUES
+              ('fbref',     'Wolves',                  'wolves',    '{_LG}', '2425'),
+              ('fbref',     'Wolverhampton Wanderers', 'wolves',    '{_LG}', '2425'),
+              ('fbref',     'Liverpool',               'liverpool', '{_LG}', '2425'),
+              ('whoscored', 'Wolves',                  'wolves',    '{_LG}', '2425'),
+              ('whoscored', 'Liverpool',               'liverpool', '{_LG}', '2425')
+            """
+        )
+        duck_conn.execute(
+            f"""
+            INSERT INTO bronze_whoscored_schedule VALUES
+              (6, TIMESTAMP '2024-08-25 19:00:00', 'Wolves', 'Liverpool',
+               '{_LG}', '2425', {_TS})
+            """
+        )
+        duck_conn.execute(
+            f"""
+            INSERT INTO silver_fbref_match_enriched VALUES
+              ('M6', '{_LG}', 'Wolves', 'Liverpool', DATE '2024-08-25')
+            """
+        )
+        yellow_q = _ws_qualifiers("Yellow")
+        duck_conn.execute(
+            f"""
+            INSERT INTO bronze_whoscored_events VALUES
+              (6.0, 'FirstHalf', 10, 0, 10, 'Goal', 'Successful',
+               100.0, 6001.0, 6002.0, '[]', NULL, 'Wolves',
+               '{_LG}', '2425', {_TS}),
+              (6.0, 'SecondHalf', 60, 0, 60, 'Card', 'Successful',
+               101.0, 6003.0, NULL, ?, NULL, 'Liverpool',
+               '{_LG}', '2425', {_TS})
+            """,
+            [yellow_q],
+        )
+        duck_conn.execute(
+            f"""
+            INSERT INTO silver_xref_player VALUES
+              ('whoscored', '6001', 'c6001', '{_LG}', '2425'),
+              ('whoscored', '6002', 'c6002', '{_LG}', '2425'),
+              ('whoscored', '6003', 'c6003', '{_LG}', '2425')
+            """
+        )
+        out = _run_gold(duck_conn)
+        assert {r["match_id"] for r in out} == {"M6"}, out
+        assert len(out) == 2, (
+            f"same-season variant fan-out duplicated the WS-only match: {out}"
+        )
+
     def test_unbridged_ws_twin_gated_by_identity(self, duck_conn):
         """TWO same-season FBref spellings fan the bridge out irreparably —
         the raw-id WS twin must be dropped by the identity gate because the

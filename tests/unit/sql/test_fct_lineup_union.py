@@ -664,6 +664,29 @@ class TestEspnBridgeDedup:
         )
         assert out[0]["match_id"] == _FB_HEX, out
 
+    def test_same_season_variant_does_not_duplicate_lineup(self, bridge_conn):
+        """#445: xref_team now legally carries a SAME-season second FBref
+        spelling per canonical (match-page full name next to the schedule
+        short name) — season-scoping alone can't save the bridge; it must
+        aggregate the variant fan-out instead of emitting a NULL twin."""
+        _seed_espn_corpus(bridge_conn)
+        bridge_conn.execute(
+            """
+            INSERT INTO silver_xref_team VALUES
+              ('fbref', 'Liverpool FC', 'liverpool', ?, ?)
+            """,
+            [_LEAGUE, _SEASON],
+        )
+        bridge_conn.execute(
+            _SCHEDULE_ROW,
+            [_LEAGUE, _SEASON, _GAME, "Liverpool", "2026-02-01 06:00:00"],
+        )
+        out = _run_lineup_gold(bridge_conn)
+        assert len(out) == 1, (
+            f"same-season variant fan-out duplicated the lineup row: {out}"
+        )
+        assert out[0]["match_id"] == _FB_HEX, out
+
     def test_clean_bridge_resolves_hex(self, bridge_conn):
         """Happy path stays intact: one schedule row, full xref → one lineup
         row under the FBref hex id."""
