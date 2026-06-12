@@ -2,9 +2,11 @@
 Smoke integration tests for E4 (Narrow Facts) DAG wiring.
 
 Mirror of ``test_e3_dag_imports.py``. Verifies ``dag_transform_e4`` parses,
-exposes the documented TaskGroups (``silver_e4`` for 4 source-bridge silver
-materializations + ``gold_e4`` for 5 narrow-fact passthrough materialisations
+exposes the documented TaskGroups (``silver_e4`` for 2 source-bridge silver
+materializations + ``gold_e4`` for 2 narrow-fact passthrough materialisations
 + ``validate_e4``), and is wired into ``dag_master_pipeline`` after E3.
+(fct_goal/fct_card/fct_substitution dropped in #448 — superseded by
+gold.fct_match_timeline.)
 
 NOTE (2026-05-08): The E4.6 DAG is NOT yet shipped on this branch. The whole
 test class is marked ``skip`` until ``dags/dag_transform_e4.py`` lands. Once
@@ -119,10 +121,7 @@ class TestE4DagImports:
             # silver_e4: 2 source bridges (cards/subs folded into Gold — #382)
             "silver_e4.matchhistory_match_odds",
             "silver_e4.sofascore_player_ratings",
-            # gold_e4: 5 narrow facts
-            "gold_e4.fct_goal",
-            "gold_e4.fct_card",
-            "gold_e4.fct_substitution",
+            # gold_e4: 2 narrow facts (goal/card/substitution dropped — #448)
             "gold_e4.fct_match_odds",
             "gold_e4.fct_match_rating",
         }
@@ -133,9 +132,9 @@ class TestE4DagImports:
             f"E4 DAG missing tasks: {sorted(missing)}. "
             f"Tasks: {sorted(task_ids)}"
         )
-        # Total must be ≥ 10 (2 silver + 5 gold + ≥3 markers/validate).
-        assert len(dag.tasks) >= 10, (
-            f"E4 DAG expected >=10 tasks, got {len(dag.tasks)}: "
+        # Total must be ≥ 7 (2 silver + 2 gold + ≥3 markers/validate).
+        assert len(dag.tasks) >= 7, (
+            f"E4 DAG expected >=7 tasks, got {len(dag.tasks)}: "
             f"{sorted(task_ids)}"
         )
 

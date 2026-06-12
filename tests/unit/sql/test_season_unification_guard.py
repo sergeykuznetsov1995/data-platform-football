@@ -3,8 +3,9 @@
 After #404 every Silver/xref table emits the slug ('2425'), so Gold never needs
 to convert a slug back to a bigint year-start. The bronze→slug direction
 (``format('%02d%02d', …)`` / ``LPAD(CAST(MOD(season,…)))``) is still legitimate in
-the handful of Gold facts that read bronze year-start events directly (fct_card /
-fct_goal / fct_substitution fbref branches, dim_manager) — so we only forbid the
+the handful of Gold facts that read bronze year-start events directly
+(fct_match_timeline whoscored branch, dim_manager; the fct_card/fct_goal/
+fct_substitution fbref branches were dropped in #448) — so we only forbid the
 slug→year idiom, which has no remaining valid use.
 """
 from __future__ import annotations

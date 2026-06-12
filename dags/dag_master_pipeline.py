@@ -199,11 +199,11 @@ with DAG(
     ### E4: Narrow event facts (Silver + Gold)
 
     After `dag_transform_e3` finishes, `dag_transform_e4` materialises the
-    E4 narrow facts: Silver `match_cards` / `match_substitutions` /
-    `matchhistory_match_odds` / `sofascore_player_ratings` → Gold
-    `fct_goal` / `fct_card` / `fct_substitution` / `fct_match_odds` /
-    `fct_match_rating` → `validate_e4`. It depends on `silver.xref_*`
-    (E1) and `gold.fct_shot` (E3) and runs sequentially
+    E4 narrow facts: Silver `matchhistory_match_odds` /
+    `sofascore_player_ratings` → Gold `fct_match_odds` /
+    `fct_match_rating` → `validate_e4` (fct_goal/fct_card/fct_substitution
+    dropped in #448 — superseded by `gold.fct_match_timeline`). It depends
+    on `silver.xref_*` (E1) and runs sequentially
     (`max_active_tasks=1`) for OOM safety. The Sofascore Silver task is
     bronze-guarded — it skips if `bronze.sofascore_player_ratings` is
     absent (R0.2B partial-backfill scenarios) so the rest of the chain
@@ -233,7 +233,7 @@ with DAG(
       * `silver.sofascore_player_profile` / `sofascore_player_season_aggregate`
         (E3) -> `gold.dim_player_attributes` / `fct_player_season_stats`
         (CTAS fails on a missing table if E3 has not run);
-      * `gold.fct_shot` / `fct_event` / `fct_goal` / `fct_card` (E3/E4);
+      * `gold.fct_shot` / `fct_event` (E3);
       * `silver.transfermarkt_players` / `capology_player_salaries`
         (TM/Cap Silver) -> `gold.fct_team_season_stats`
         (`squad_market_value_eur` / `total_wage_bill_gbp`), which is why it runs
@@ -332,11 +332,9 @@ with DAG(
     # =========================================================================
     # E4 medallion-redesign: Narrow event facts (Silver + Gold)
     # =========================================================================
-    # Runs AFTER `dag_transform_e3` (E3) so the E4 builders can:
-    #   * read fresh `silver.xref_match` / `silver.xref_team` /
-    #     `silver.xref_player` rows (produced by xref step);
-    #   * source `gold.fct_goal` from the `gold.fct_shot` baseline
-    #     materialised by E3.
+    # Runs AFTER `dag_transform_e3` (E3) so the E4 builders can read fresh
+    # `silver.xref_match` / `silver.xref_team` / `silver.xref_player` rows
+    # (produced by xref step).
     #
     # The E4 DAG itself runs sequentially (`max_active_tasks=1`) for OOM
     # safety; here we simply trigger it with the same wait/parity policy as
@@ -415,7 +413,7 @@ with DAG(
     #   * silver.xref_* (E1)
     #   * silver.sofascore_player_profile / _season_aggregate (E3) ->
     #     gold.dim_player_attributes / fct_player_season_stats
-    #   * gold.fct_shot / fct_event / fct_goal / fct_card (E3/E4)
+    #   * gold.fct_shot / fct_event (E3)
     #   * silver.transfermarkt_players / capology_player_salaries (TM/Cap Silver)
     #     -> gold.fct_team_season_stats (squad_market_value_eur /
     #        total_wage_bill_gbp)

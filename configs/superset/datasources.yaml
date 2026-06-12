@@ -126,23 +126,6 @@ databases:
         default_endpoint: null
         cache_timeout: 3600
 
-      - table_name: fct_goal
-        schema: gold
-        description: |
-          Per-goal факт: scorer, assist, minute, is_penalty, is_own_goal.
-          Источник: fct_shot is_goal=true ∪ FBref own-goal annotations.
-        default_endpoint: null
-        cache_timeout: 3600
-
-      - table_name: fct_card
-        schema: gold
-        description: |
-          Per-card факт: yellow/red/second_yellow, минута, игрок, команда.
-          Источник: bronze (FBref+WhoScored) + xref, кросс-source сборка
-          инлайнится прямо в gold.fct_card (#382).
-        default_endpoint: null
-        cache_timeout: 3600
-
       - table_name: fct_match_odds
         schema: gold
         description: |

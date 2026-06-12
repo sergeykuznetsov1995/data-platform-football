@@ -1,0 +1,41 @@
+-- =============================================================================
+-- Drop superseded E4 event facts (June 2026) — issue #448
+-- =============================================================================
+--
+-- Context:
+--   gold.fct_match_timeline (#427, PR #446) покрывает голы/карточки/замены
+--   единым таймлайном. Три старых узких факта остались без потребителей:
+--   ни один gold SQL/DAG/dashboard их не читает (аудит в #448), их билды
+--   убраны из GOLD_E4_TRANSFORMS и e4_dq этим же PR.
+--
+--   Row counts на момент верификации (2026-06-12):
+--     iceberg.gold.fct_goal            — 6712  rows
+--     iceberg.gold.fct_card            — 15617 rows
+--     iceberg.gold.fct_substitution    — 28609 rows
+--
+--   Данные НЕ теряются:
+--     * голы/карточки/замены — gold.fct_match_timeline (покрытие строго шире:
+--       fct_goal не имел regular-голов за сезоны 1617–1920);
+--     * Understat-измерения (shot_id, xg, situation/is_penalty) — gold.fct_shot;
+--     * отрицательные дельты cards/subs в 2425/2526 — это WS-дубли (#503),
+--       которые timeline корректно отбрасывает per-match all-or-nothing гейтом.
+--
+-- Execution (manual; not auto-applied; СТРОГО после merge PR — иначе
+-- следующий запуск dag_transform_e4 пересоздаст таблицы CTAS-ом):
+--   docker compose exec trino bash -c '\
+--     trino --server https://localhost:8443 --user airflow --password \
+--           --insecure -f /opt/sql/drop_e4_event_facts.sql' \
+--     <<< "$TRINO_PASSWORD"
+--
+--   Or run line by line via `make shell-trino`.
+--   При исполнении через python trino-клиент: после КАЖДОГО DROP обязателен
+--   cursor.fetchall() перед close — иначе клиент шлёт DELETE → USER_CANCELED.
+--   После — `make om-ingest-trino`, чтобы каталог не показывал призраков.
+--
+-- WARNING: DROP TABLE у Iceberg-managed таблиц сносит и метастор-запись, и данные
+-- в HDFS. Undo нет без пересборки (git history хранит SQL трёх таблиц).
+-- =============================================================================
+
+DROP TABLE IF EXISTS iceberg.gold.fct_goal;
+DROP TABLE IF EXISTS iceberg.gold.fct_card;
+DROP TABLE IF EXISTS iceberg.gold.fct_substitution;
