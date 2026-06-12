@@ -867,6 +867,227 @@ def _append_fct_standings_coverage_check(report) -> None:
         conn.close()
 
 
+# ---------------------------------------------------------------------------
+# #432: final star-schema DQ gate (design docs/design/gold-star-schema.md §6
+# rule 8 + §7 step 6). Covers the 22 live star tables (8 dims + 14 facts);
+# fct_player_salary / fct_player_fifa_rating / fct_team_elo arrive with
+# #430/#431 — their PK/FK/orphan checks must be added here in those PRs.
+# fct_event / fct_match_rating are outside the 17-fact star design (own DQ
+# in e3_dq/e4_dq). All thresholds carry their live baseline + measure date.
+# ---------------------------------------------------------------------------
+
+# Star facts (design §2) that exist today. Every one carries (league, season).
+_STAR_FACT_TABLES = [
+    'gold.fct_team_match',
+    'gold.fct_match_timeline',
+    'gold.fct_shot',
+    'gold.fct_player_match',
+    'gold.fct_lineup',
+    'gold.fct_player_unavailable',
+    'gold.fct_match_odds',
+    'gold.fct_player_season_stats',
+    'gold.fct_keeper_season_stats',
+    'gold.fct_team_season_stats',
+    'gold.fct_standings',
+    'gold.fct_manager_stint',
+    'gold.fct_transfer',
+    'gold.fct_player_market_value',
+]
+
+
+def _star_gate_pk_checks() -> List:
+    """Design-grain PK uniqueness for the 3 facts missing from the central
+    registry (their local DQ lives in e3_dq/e4_dq and runs in earlier DAGs;
+    the final gate re-asserts the DESIGN grain independently)."""
+    from utils.data_quality import CHECK
+
+    return [
+        # Design §4.3 — one row per shot.
+        CHECK.no_duplicates(
+            'gold.fct_shot', pk=['match_id', 'shot_id'],
+            name='star_pk[fct_shot(match_id,shot_id)]',
+        ),
+        # Design §4.7 — e4_dq checks only the odds_canonical surrogate
+        # (trivially unique); the business grain is asserted nowhere else.
+        CHECK.no_duplicates(
+            'gold.fct_match_odds',
+            pk=['match_id', 'bookmaker', 'market', 'is_closing'],
+            name='star_pk[fct_match_odds(match_id,bookmaker,market,is_closing)]',
+        ),
+        # Design §4.5 PK (match_id, player_id), scoped to resolved rows:
+        # ESPN rows with an unresolved player carry NULL player_id and would
+        # collapse into false dup buckets (runner uses COUNT-COUNT DISTINCT).
+        # Baseline 2026-06-12: 0 dups on the design PK among resolved rows.
+        CHECK.no_duplicates(
+            'gold.fct_lineup', pk=['match_id', 'player_id'],
+            where='player_id IS NOT NULL',
+            name='star_pk[fct_lineup(match_id,player_id) resolved]',
+        ),
+    ]
+
+
+def _star_gate_league_season_fk_checks() -> List:
+    """league -> dim_competition, season -> dim_season for every star fact.
+
+    ERROR severity: both dims render straight from configs/medallion YAMLs
+    and facts carry the same partition slugs — an orphan means a config hole,
+    not a data wart. Baseline 2026-06-12: 0 orphans across all 14 facts.
+    """
+    from utils.data_quality import CHECK
+
+    return [
+        *[CHECK.ref_integrity(t, 'gold.dim_competition', 'league')
+          for t in _STAR_FACT_TABLES],
+        *[CHECK.ref_integrity(t, 'gold.dim_season', 'season')
+          for t in _STAR_FACT_TABLES],
+    ]
+
+
+def _star_gate_dim_fk_checks() -> List:
+    """Missing fct -> dim soft-FK pairs (design §3-5 FK lists).
+
+    ERROR only where the id comes from the same xref the dim is built from
+    (orphans impossible by construction). Everything else is WARNING with
+    two-tier orphan-ROW-rate thresholds (#432 rate mode) — orphan-prefixed
+    ids (tm_/ws_/fb_<slug>) are kept by design (rule 2) and only their share
+    is policed. NULL-key shares are measured by the coverage checks at the
+    end (ref_integrity ignores NULL keys by contract).
+    All baselines measured live 2026-06-12.
+    """
+    from utils.data_quality import CHECK
+
+    return [
+        # ----- ERROR: FBref-spine team ids, same xref as dim_team -----
+        CHECK.ref_integrity('gold.fct_team_match', 'gold.dim_team', 'team_id'),
+        CHECK.ref_integrity('gold.fct_team_match', 'gold.dim_team',
+                            'opponent_id', parent_key='team_id'),
+
+        # ----- fct_shot (baseline: team 0%, player 0.52%, match 0%) -----
+        CHECK.ref_integrity('gold.fct_shot', 'gold.dim_team', 'team_id',
+                            warn_rate=0.01, error_rate=0.05, severity='WARNING'),
+        CHECK.ref_integrity('gold.fct_shot', 'gold.dim_player', 'player_id',
+                            warn_rate=0.02, error_rate=0.05, severity='WARNING'),
+        # assist_player_id is all-NULL today (FBref shot feed dead since
+        # Feb 2026; Understat carries no assist id) — vacuous pass until a
+        # source returns. Same thresholds as player_id when it does.
+        CHECK.ref_integrity('gold.fct_shot', 'gold.dim_player',
+                            'assist_player_id', parent_key='player_id',
+                            warn_rate=0.02, error_rate=0.05, severity='WARNING'),
+        # e3_dq only asserts fct_shot -> silver.xref_match; the star FK is
+        # to dim_match (alt-hex divergence risk, see fct_lineup #242).
+        CHECK.ref_integrity('gold.fct_shot', 'gold.dim_match', 'match_id',
+                            warn_rate=0.005, error_rate=0.02, severity='WARNING'),
+
+        # ----- fct_lineup (baseline: all 0% among non-NULL keys) -----
+        CHECK.ref_integrity('gold.fct_lineup', 'gold.dim_team', 'team_id',
+                            warn_rate=0.02, error_rate=0.10, severity='WARNING'),
+        CHECK.ref_integrity('gold.fct_lineup', 'gold.dim_player', 'player_id',
+                            warn_rate=0.02, error_rate=0.10, severity='WARNING'),
+        # Whole-table complement to the fbref-scoped ERROR check in e3_dq
+        # (espn pseudo-ids + ~0.9% unbridged tolerated via rate).
+        CHECK.ref_integrity('gold.fct_lineup', 'gold.dim_match', 'match_id',
+                            warn_rate=0.02, error_rate=0.05, severity='WARNING',
+                            name='star_fk[fct_lineup.match_id->dim_match all-sources]'),
+
+        # ----- fct_match_odds (baseline 0%; matchhistory fixture-bridge) -----
+        CHECK.ref_integrity('gold.fct_match_odds', 'gold.dim_match', 'match_id',
+                            warn_rate=0.05, error_rate=0.20, severity='WARNING'),
+
+        # ----- player facts -> dim_player (design FK; the existing checks
+        # ----- against dim_player_attributes stay untouched) -----
+        CHECK.ref_integrity('gold.fct_player_match', 'gold.dim_player',
+                            'player_id',
+                            warn_rate=0.01, error_rate=0.05, severity='WARNING'),
+        # ws_-prefixed orphans ≈12.6% (1174/9346) — by design (rule 2).
+        CHECK.ref_integrity('gold.fct_player_unavailable', 'gold.dim_player',
+                            'player_id',
+                            warn_rate=0.15, error_rate=0.30, severity='WARNING'),
+        CHECK.ref_integrity('gold.fct_player_unavailable', 'gold.dim_team',
+                            'team_id',
+                            warn_rate=0.02, error_rate=0.10, severity='WARNING'),
+        # player_id/team_id FKs already exist for fct_match_timeline —
+        # related_player_id (assist / sub-ON player, #427) was missing.
+        CHECK.ref_integrity('gold.fct_match_timeline', 'gold.dim_player',
+                            'related_player_id', parent_key='player_id',
+                            warn_rate=0.05, error_rate=0.15, severity='WARNING'),
+        CHECK.ref_integrity('gold.fct_player_season_stats', 'gold.dim_player',
+                            'player_id',
+                            warn_rate=0.05, error_rate=0.15, severity='WARNING'),
+        CHECK.ref_integrity('gold.fct_keeper_season_stats', 'gold.dim_player',
+                            'player_id',
+                            warn_rate=0.05, error_rate=0.15, severity='WARNING'),
+        CHECK.ref_integrity('gold.fct_player_market_value', 'gold.dim_player',
+                            'player_id_canonical', parent_key='player_id',
+                            warn_rate=0.05, error_rate=0.15, severity='WARNING'),
+
+        # ----- NULL-key shares (ref_integrity ignores NULLs by contract) -----
+        # Baseline 99.7% non-NULL (172/58580 NULL).
+        CHECK.coverage('gold.fct_shot', column='player_id',
+                       warn_threshold=0.95, error_threshold=0.85),
+        # Baseline 64.9% non-NULL — ESPN rows resolve no player_id for ~35%
+        # of the table (77K/220K); thresholds sit under the live share.
+        CHECK.coverage('gold.fct_lineup', column='player_id',
+                       warn_threshold=0.60, error_threshold=0.50),
+    ]
+
+
+def _star_gate_grain_checks() -> List:
+    """Grain sanity (issue #432): violations counted via HAVING subqueries.
+
+    ``value`` = number of rows living in violating groups (0 = healthy).
+    """
+    from utils.data_quality import CHECK
+
+    return [
+        # Long format: exactly 2 rows (home + away) per match — by
+        # construction, so ERROR. Baseline 2026-06-12: 0 violations.
+        CHECK.row_count(
+            'gold.fct_team_match', min_rows=0, max_rows=0,
+            where=("match_id IN (SELECT match_id FROM iceberg.gold.fct_team_match "
+                   "GROUP BY match_id HAVING COUNT(*) <> 2)"),
+            severity='ERROR',
+            name='star_grain[fct_team_match=2rows/match]',
+        ),
+        # ~20 teams per (league, season): 18 (Bundesliga/Ligue 1) to 24
+        # (Championship). PK uniqueness is asserted separately, so COUNT(*)
+        # equals the team count. WARNING — approximate invariant.
+        # Baseline 2026-06-12: standings 1 group / season-stats 10 groups,
+        # all exactly 20.
+        CHECK.row_count(
+            'gold.fct_standings', min_rows=0, max_rows=0,
+            where=("(league, season) IN (SELECT league, season "
+                   "FROM iceberg.gold.fct_standings "
+                   "GROUP BY league, season HAVING COUNT(*) NOT BETWEEN 18 AND 24)"),
+            severity='WARNING',
+            name='star_grain[fct_standings~20teams/league-season]',
+        ),
+        CHECK.row_count(
+            'gold.fct_team_season_stats', min_rows=0, max_rows=0,
+            where=("(league, season) IN (SELECT league, season "
+                   "FROM iceberg.gold.fct_team_season_stats "
+                   "GROUP BY league, season HAVING COUNT(*) NOT BETWEEN 18 AND 24)"),
+            severity='WARNING',
+            name='star_grain[fct_team_season_stats~20teams/league-season]',
+        ),
+    ]
+
+
+def build_star_gate_checks() -> List:
+    """#432: final star-schema gate — design-PK / league+season FK /
+    missing dim-FK with orphan-rate thresholds / grain sanity.
+
+    Appended to the ``validate_gold_quality`` registry (the last task of
+    ``dag_transform_fbref_gold``, which the master pipeline triggers after
+    e3/e4 — so every star table is already materialised when this runs).
+    """
+    return (
+        _star_gate_pk_checks()
+        + _star_gate_league_season_fk_checks()
+        + _star_gate_dim_fk_checks()
+        + _star_gate_grain_checks()
+    )
+
+
 def validate_gold_quality() -> Dict[str, Any]:
     """Run Gold-layer DQ checks — PK uniqueness, ref integrity, point-in-time.
 
@@ -977,30 +1198,17 @@ def validate_gold_quality() -> Dict[str, Any]:
 
         # Cross-source team_id coverage. WhoScored team_name -> team_slug is
         # best-effort (e.g. "Wolverhampton" vs "Wolves" leaves team_id NULL).
-        # 200 ≈ ~10% of a typical season — surfaces the issue without paging
-        # during a known-broken alias state. The CHECK registry has no
-        # two-tier coverage primitive yet, so we use a hard row count.
-        # Tighten once _team_aliases work absorbs the residual mismatches.
-        CHECK.row_count(
+        # #432: absolute row ceiling replaced with two-tier coverage —
+        # baseline 100% non-NULL (9346/9346, measured 2026-06-12).
+        CHECK.coverage(
             'gold.fct_player_unavailable',
-            min_rows=0, max_rows=200,
-            where='team_id IS NULL',
-            severity='WARNING',
+            condition='team_id IS NOT NULL',
+            warn_threshold=0.95, error_threshold=0.85,
             name='coverage[fct_player_unavailable.team_id non-NULL]',
         ),
-
-        # Cross-source player_id resolution coverage. Players that didn't
-        # match dim_player get a synthetic 'ws_<id>' fallback (D4); counting
-        # those tells us how much of the WhoScored player namespace is still
-        # un-bridged. Generous threshold until E1 xref_player ships a proper
-        # crosswalk.
-        CHECK.row_count(
-            'gold.fct_player_unavailable',
-            min_rows=0, max_rows=1500,
-            where="player_id LIKE 'ws_%'",
-            severity='WARNING',
-            name='coverage[fct_player_unavailable.player_id resolved]',
-        ),
+        # player_id resolution share ('ws_<id>' fallbacks) is policed by the
+        # rate-mode FK to dim_player in build_star_gate_checks (#432) — the
+        # old 1500-row ceiling proxy was retired with it.
 
         # ============================================================
         # issue #427: fct_match_timeline — unified per-event chronicle.
@@ -1033,10 +1241,14 @@ def validate_gold_quality() -> Dict[str, Any]:
         ),
 
         # ----- Soft FKs + ranges — WARNING -----
+        # #432: rate thresholds added (baseline 0% orphans, 2026-06-12) —
+        # tolerate a small unbridged share instead of firing on the first id.
         CHECK.ref_integrity('gold.fct_match_timeline', 'gold.dim_player',
-                            'player_id', severity='WARNING'),
+                            'player_id', warn_rate=0.05, error_rate=0.15,
+                            severity='WARNING'),
         CHECK.ref_integrity('gold.fct_match_timeline', 'gold.dim_team',
-                            'team_id', severity='WARNING'),
+                            'team_id', warn_rate=0.05, error_rate=0.15,
+                            severity='WARNING'),
         CHECK.value_range('gold.fct_match_timeline', 'minute',
                           min_val=0, max_val=120, severity='WARNING'),
         # max 25: live corpus has legitimate 90+16..90+20 stoppage events
@@ -1194,23 +1406,21 @@ def validate_gold_quality() -> Dict[str, Any]:
             cols=['player_id', 'transfer_date', 'from_team_id', 'to_team_id',
                   'is_loan', 'is_upcoming'],
         ),
+        # #432: rate thresholds replace the absolute orphan_players row_count
+        # proxy. player_id: live baseline 136/750 ≈ 18.1% tm_-orphans
+        # (measured 2026-06-12); warn 27% mirrors the old 200-row ceiling.
         CHECK.ref_integrity('gold.fct_transfer', 'gold.dim_player',
-                            'player_id', severity='WARNING'),
+                            'player_id', warn_rate=0.27, error_rate=0.40,
+                            severity='WARNING'),
+        # from/to team: foreign clubs are legitimately outside dim_team —
+        # baseline 82%/69% orphans. warn 0.90 only alerts on a total break
+        # (no error_rate: never escalate).
         CHECK.ref_integrity('gold.fct_transfer', 'gold.dim_team',
                             'from_team_id', parent_key='team_id',
-                            severity='WARNING'),
+                            warn_rate=0.90, severity='WARNING'),
         CHECK.ref_integrity('gold.fct_transfer', 'gold.dim_team',
                             'to_team_id', parent_key='team_id',
-                            severity='WARNING'),
-        # Orphan-player share: live baseline 136/750 ≈ 18% on APL '2526'
-        # (above the ≈10% design estimate — measured 2026-06-11). Ceiling
-        # 200 ≈ 27% leaves headroom; breach = xref_player coverage broke.
-        CHECK.row_count(
-            'gold.fct_transfer', min_rows=0, max_rows=200,
-            where="player_id LIKE 'tm\\_%' ESCAPE '\\'",
-            severity='WARNING',
-            name='orphan_players[fct_transfer]',
-        ),
+                            warn_rate=0.90, severity='WARNING'),
 
         # ============================================================
         # #425: dim_match — soft FK to every star dim. Team FKs are ERROR
@@ -2068,6 +2278,14 @@ def validate_gold_quality() -> Dict[str, Any]:
         # may tighten the team-level check to ERROR severity.
         # ============================================================
         *build_e1_5_post_cutover_checks(),
+
+        # ============================================================
+        # #432: final star-schema gate — design-PK / league+season FK /
+        # missing dim-FK with orphan-rate thresholds / grain sanity.
+        # See the builder + sub-builders above for the full list and
+        # per-threshold baselines.
+        # ============================================================
+        *build_star_gate_checks(),
     ]
 
     report = run_checks(checks, raise_on_error=False)
