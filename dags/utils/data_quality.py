@@ -189,6 +189,8 @@ class CHECK:
         key: str,
         parent_key: Optional[str] = None,
         where: Optional[str] = None,
+        warn_rate: Optional[float] = None,
+        error_rate: Optional[float] = None,
         severity: str = 'ERROR',
         name: Optional[str] = None,
     ) -> Check:
@@ -197,14 +199,37 @@ class CHECK:
         ``where`` restricts the check to a subset of child rows (e.g.
         ``lineup_source = 'fbref'`` to exclude other-source pseudo-ids that
         legitimately don't appear in the parent).
+
+        Rate mode (issue #432): when ``warn_rate`` is set, the runner measures
+        the orphan ROW share (orphan rows / rows with non-NULL key) instead of
+        failing on the first orphan. Two-tier severity, mirroring ``coverage``:
+
+            rate <= warn_rate                  -> passed=True
+            warn_rate < rate <= error_rate     -> failed, WARNING
+            rate > error_rate                  -> failed, ERROR (runtime override)
+
+        ``error_rate=None`` never escalates past the static ``severity``.
+        NULL child keys are excluded from both numerator and denominator —
+        "no claim, no violation" (NULL-orphan shares are measured by
+        ``CHECK.coverage`` instead).
         """
+        for label, rate in (('warn_rate', warn_rate), ('error_rate', error_rate)):
+            if rate is not None and not (0.0 <= rate <= 1.0):
+                raise ValueError(f"{label} must be in [0, 1], got {rate}")
+        if error_rate is not None and warn_rate is None:
+            raise ValueError("error_rate requires warn_rate")
+        if warn_rate is not None and error_rate is not None and warn_rate > error_rate:
+            raise ValueError(
+                f"warn_rate must be <= error_rate, got warn={warn_rate}, error={error_rate}"
+            )
         pk = parent_key or key
         suffix = key if pk == key else f"{key}->{pk}"
         return Check(
             name=name or f"ref_integrity[{child}.{suffix}->{parent}]",
             kind='ref_integrity',
             params={'child': child, 'parent': parent, 'key': key,
-                    'parent_key': pk, 'where': where},
+                    'parent_key': pk, 'where': where,
+                    'warn_rate': warn_rate, 'error_rate': error_rate},
             severity=severity,
         )
 
@@ -592,18 +617,59 @@ def _run_ref_integrity(conn, check: Check) -> Dict[str, Any]:
     else:
         child_src = child
 
+    warn_rate = p.get('warn_rate')
+    if warn_rate is None:
+        sql = (
+            f"SELECT COUNT(DISTINCT c.{key}) FROM {child_src} c "
+            f"LEFT JOIN {parent} p ON c.{key} = p.{parent_key} "
+            f"WHERE p.{parent_key} IS NULL AND c.{key} IS NOT NULL"
+        )
+        row = _fetchone(conn, sql)
+        orphan = row[0] if row else 0
+        return {
+            'passed': orphan == 0,
+            'details': f"{orphan} orphan key(s) in {child}.{key} not in {parent}.{parent_key}",
+            'value': orphan,
+        }
+
+    # Rate mode (#432): orphan ROW share with two-tier severity. The parent
+    # is de-duplicated so a non-unique parent_key can't inflate the row
+    # counts via JOIN fan-out (the legacy branch counts DISTINCT child keys,
+    # where fan-out is harmless).
+    error_rate = p.get('error_rate')
     sql = (
-        f"SELECT COUNT(DISTINCT c.{key}) FROM {child_src} c "
-        f"LEFT JOIN {parent} p ON c.{key} = p.{parent_key} "
-        f"WHERE p.{parent_key} IS NULL AND c.{key} IS NOT NULL"
+        f"SELECT COUNT(*), "
+        f"COUNT_IF(p.{parent_key} IS NULL), "
+        f"COUNT(DISTINCT CASE WHEN p.{parent_key} IS NULL THEN c.{key} END) "
+        f"FROM {child_src} c "
+        f"LEFT JOIN (SELECT DISTINCT {parent_key} FROM {parent}) p "
+        f"ON c.{key} = p.{parent_key} "
+        f"WHERE c.{key} IS NOT NULL"
     )
     row = _fetchone(conn, sql)
-    orphan = row[0] if row else 0
-    return {
-        'passed': orphan == 0,
-        'details': f"{orphan} orphan key(s) in {child}.{key} not in {parent}.{parent_key}",
-        'value': orphan,
-    }
+    total, orphan_rows, orphan_keys = (
+        (int(row[0] or 0), int(row[1] or 0), int(row[2] or 0)) if row else (0, 0, 0)
+    )
+    if total == 0:
+        return {
+            'passed': True,
+            'value': 0.0,
+            'details': f"0 rows with non-NULL {child}.{key} — vacuous pass",
+        }
+    rate = orphan_rows / total
+    details = (
+        f"orphan rate {rate:.1%} ({orphan_rows}/{total} rows, "
+        f"{orphan_keys} distinct keys) in {child}.{key} not in "
+        f"{parent}.{parent_key}, warn<={warn_rate:.0%}"
+        + (f", error<={error_rate:.0%}" if error_rate is not None else "")
+    )
+    if rate <= warn_rate:
+        return {'passed': True, 'value': rate, 'details': details}
+    if error_rate is not None and rate > error_rate:
+        return {'passed': False, 'severity': 'ERROR', 'value': rate,
+                'details': details}
+    return {'passed': False, 'severity': 'WARNING', 'value': rate,
+            'details': details}
 
 
 def _run_value_range(conn, check: Check) -> Dict[str, Any]:
