@@ -12,6 +12,7 @@ import pytest
 from scrapers.transfermarkt import TransfermarktScraper
 from scrapers.transfermarkt.scraper import (
     ConsecutiveFailureError,
+    PartialScrapeError,
     R0_2B_FALLBACK_MARKER,
     TM_LEAGUE_MAP,
     _coerce_int,
@@ -473,8 +474,12 @@ class TestConsecutiveFailureRaise:
     def test_counter_reset_prevents_raise(self, scraper, monkeypatch):
         # 2 failures then a success, repeated — the counter never reaches
         # the cap of 3, so no raise and the frame materialises.
+        # _MIN_SUCCESS_RATIO is disabled: this scenario (ratio 1/3) now
+        # trips PartialScrapeError (#484), tested separately — here we
+        # isolate the counter-reset behaviour of the consecutive cap.
         import scrapers.transfermarkt.scraper as tm
         monkeypatch.setattr(tm, '_MAX_CONSECUTIVE_FAILURES', 3)
+        monkeypatch.setattr(tm, '_MIN_SUCCESS_RATIO', 0)
         responses = iter([None, None, {'list': []}] * 3)
         monkeypatch.setattr(
             scraper, '_fetch_json',
@@ -489,3 +494,221 @@ class TestConsecutiveFailureRaise:
         )
         assert not df.empty
         assert df['player_id'].nunique() == 3  # every 3rd fetch succeeded
+
+
+# ---------------------------------------------------------------------------
+# In-run success-ratio → raise on partial scrape (#484)
+#
+# Intermittent failures (e.g. every 2nd player fails) reset the consecutive
+# counter and never trip the #457 cap, yet still return a half-empty frame
+# that the runner would save with replace_partitions. A run whose
+# success/attempted ratio falls below _MIN_SUCCESS_RATIO must raise instead.
+# ---------------------------------------------------------------------------
+
+class TestPartialScrapeRatio:
+    @pytest.fixture
+    def scraper(self):
+        return TransfermarktScraper(
+            leagues=['ENG-Premier League'], seasons=[2025],
+        )
+
+    def _patch_players_pipeline(self, monkeypatch, scraper, profile_responses):
+        import scrapers.transfermarkt.scraper as tm
+        monkeypatch.setattr(tm, '_parse_club_listing', lambda html: [
+            {'club_id': '11', 'club_slug': 'fc-arsenal', 'club_name': 'Arsenal'},
+        ])
+        monkeypatch.setattr(tm, '_parse_squad_page', lambda html, club_id: [
+            {'player_id': str(i), 'player_slug': f'player-{i}',
+             'name': f'P{i}', 'club_id': club_id, 'market_value_eur': None}
+            for i in range(len(profile_responses))
+        ])
+        responses = iter(profile_responses)
+        monkeypatch.setattr(
+            scraper, '_fetch_html',
+            lambda url, label='html', context=None:
+                next(responses) if label == 'profile' else '<html/>',
+        )
+
+    def test_read_players_raises_on_low_success_ratio(
+        self, scraper, monkeypatch,
+    ):
+        # alternating failures: ratio 0.5 < 0.9, never 2 consecutive
+        self._patch_players_pipeline(
+            monkeypatch, scraper, [None, '<html/>'] * 5,
+        )
+        with pytest.raises(PartialScrapeError, match='player profiles'):
+            scraper.read_players(league='ENG-Premier League', season=2025)
+
+    def test_read_players_passes_on_high_success_ratio(
+        self, scraper, monkeypatch,
+    ):
+        # 1 failure of 10 → ratio 0.9, exactly at threshold → no raise
+        self._patch_players_pipeline(
+            monkeypatch, scraper, [None] + ['<html/>'] * 9,
+        )
+        df = scraper.read_players(league='ENG-Premier League', season=2025)
+        assert df['player_id'].nunique() == 9
+
+    def test_read_mv_history_raises_on_low_success_ratio(
+        self, scraper, monkeypatch,
+    ):
+        import scrapers.transfermarkt.scraper as tm
+        responses = iter([None, {'list': []}] * 5)
+        monkeypatch.setattr(
+            scraper, '_fetch_json',
+            lambda url, label='json', context=None: next(responses),
+        )
+        monkeypatch.setattr(tm, '_parse_mv_history', lambda payload, player_id: [
+            {'player_id': player_id, 'value_eur': 100},
+        ])
+        with pytest.raises(PartialScrapeError, match='mv_history'):
+            scraper.read_market_value_history(
+                league='ENG-Premier League', season=2025,
+                player_ids=[str(i) for i in range(10)],
+            )
+
+    def test_read_transfers_raises_on_low_success_ratio(
+        self, scraper, monkeypatch,
+    ):
+        import scrapers.transfermarkt.scraper as tm
+        responses = iter([None, {'transfers': []}] * 5)
+        monkeypatch.setattr(
+            scraper, '_fetch_json',
+            lambda url, label='json', context=None: next(responses),
+        )
+        monkeypatch.setattr(tm, '_parse_transfers', lambda payload, player_id: [
+            {'player_id': player_id, 'fee_eur': 100},
+        ])
+        with pytest.raises(PartialScrapeError, match='transfers'):
+            scraper.read_transfers(
+                league='ENG-Premier League', season=2025,
+                player_ids=[str(i) for i in range(10)],
+            )
+
+    def test_total_failure_still_returns_empty_frame(
+        self, scraper, monkeypatch,
+    ):
+        # 0 successes → empty frame → graceful TM_FALLBACK path (exit 2 in
+        # the runner), NOT PartialScrapeError: nothing gets saved anyway.
+        monkeypatch.setattr(
+            scraper, '_fetch_json',
+            lambda url, label='json', context=None: None,
+        )
+        df = scraper.read_market_value_history(
+            league='ENG-Premier League', season=2025,
+            player_ids=['1', '2', '3'],
+        )
+        assert df.empty
+
+
+# ---------------------------------------------------------------------------
+# count_bronze_partition_players — guard input for the runner (#484/#486)
+# ---------------------------------------------------------------------------
+
+class _StubCursor:
+    def __init__(self, rows):
+        self._rows = rows
+        self.executed = []
+
+    def execute(self, sql, params=None):
+        self.executed.append((sql, params))
+
+    def fetchone(self):
+        return self._rows[0] if self._rows else None
+
+    def fetchall(self):
+        return self._rows
+
+
+def _stub_trino_modules(cursor):
+    """sys.modules stubs for the lazy ``import trino`` inside the scraper."""
+    from unittest.mock import MagicMock
+
+    conn = MagicMock()
+    conn.cursor.return_value = cursor
+    stub_trino = MagicMock()
+    stub_trino.dbapi.connect.return_value = conn
+    return {'trino': stub_trino, 'trino.auth': stub_trino.auth}
+
+
+class TestCountBronzePartitionPlayers:
+    @pytest.fixture
+    def scraper(self):
+        return TransfermarktScraper(
+            leagues=['ENG-Premier League'], seasons=[2025],
+        )
+
+    def test_counts_distinct_players_with_short_season(self, scraper):
+        from unittest.mock import patch
+        import sys
+
+        cursor = _StubCursor([(600,)])
+        with patch.dict(sys.modules, _stub_trino_modules(cursor)):
+            count = scraper.count_bronze_partition_players(
+                'transfermarkt_players', 'ENG-Premier League', 2025,
+            )
+        assert count == 600
+        sql, params = cursor.executed[0]
+        assert 'count(DISTINCT player_id)' in sql
+        assert 'iceberg.bronze.transfermarkt_players' in sql
+        assert params == ('ENG-Premier League', '2526')
+
+    def test_returns_none_on_query_error(self, scraper):
+        from unittest.mock import MagicMock, patch
+        import sys
+
+        stub_trino = MagicMock()
+        stub_trino.dbapi.connect.side_effect = RuntimeError('trino down')
+        modules = {'trino': stub_trino, 'trino.auth': stub_trino.auth}
+        with patch.dict(sys.modules, modules):
+            count = scraper.count_bronze_partition_players(
+                'transfermarkt_players', 'ENG-Premier League', 2025,
+            )
+        assert count is None
+
+    def test_rejects_short_form_season(self, scraper):
+        # _season_short('2526') double-shortens to '2627' → count 0 →
+        # an always-passing guard. Fail loudly instead.
+        with pytest.raises(ValueError, match='start year'):
+            scraper.count_bronze_partition_players(
+                'transfermarkt_players', 'ENG-Premier League', 2526,
+            )
+
+
+# ---------------------------------------------------------------------------
+# Deterministic LIMIT subset in the bronze roster resolver
+# ---------------------------------------------------------------------------
+
+class TestResolverDeterministicLimit:
+    @pytest.fixture
+    def scraper(self):
+        return TransfermarktScraper(
+            leagues=['ENG-Premier League'], seasons=[2025],
+        )
+
+    def test_limit_query_orders_by_player_id(self, scraper):
+        from unittest.mock import patch
+        import sys
+
+        cursor = _StubCursor([('1',), ('2',)])
+        with patch.dict(sys.modules, _stub_trino_modules(cursor)):
+            ids = scraper._resolve_player_ids_from_bronze(
+                'ENG-Premier League', '2526', limit=100,
+            )
+        assert ids == ['1', '2']
+        sql, _ = cursor.executed[0]
+        assert 'ORDER BY player_id' in sql
+        assert 'LIMIT 100' in sql
+
+    def test_no_limit_no_order_by(self, scraper):
+        from unittest.mock import patch
+        import sys
+
+        cursor = _StubCursor([('1',)])
+        with patch.dict(sys.modules, _stub_trino_modules(cursor)):
+            scraper._resolve_player_ids_from_bronze(
+                'ENG-Premier League', '2526',
+            )
+        sql, _ = cursor.executed[0]
+        assert 'ORDER BY' not in sql
+        assert 'LIMIT' not in sql
