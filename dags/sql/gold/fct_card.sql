@@ -35,7 +35,8 @@
 --                                     'whoscored_raw_<game_id>' fallback)
 --   team_id_canonical     varchar     via xref_team — orphan-tolerant (NULL ok)
 --   player_id_canonical   varchar     via xref_player — orphan-tolerant (NULL ok)
---   minute                integer     event minute
+--   minute                integer     BASE event minute (#454: FBref '90+4' →
+--                                     90; WS cumulative 94 → 90 period-aware)
 --   card_type             varchar     'yellow' | 'red' | 'second_yellow'
 --   card_canonical        varchar     xxhash64-derived synthetic PK (varchar)
 --   card_source           varchar     'fbref' | 'whoscored' (silver.source pass-thru)
@@ -159,7 +160,10 @@ fb_cards AS (
         COALESCE(xm.canonical_id, fe.match_id)               AS match_id_canonical,
         xt.canonical_id                                      AS team_id_canonical,
         xp.canonical_id                                      AS player_id_canonical,
-        TRY_CAST(fe.minute AS integer)                       AS minute,
+        -- #454: '90+4' stoppage-time strings → base minute 90 (split_part
+        -- mirrors fct_match_timeline.sql). Plain TRY_CAST returned NULL and
+        -- the final WHERE silently dropped every stoppage-time card.
+        TRY_CAST(split_part(fe.minute, '+', 1) AS integer)   AS minute,
         CASE fe.event_type
             WHEN 'yellow_card'         THEN 'yellow'
             WHEN 'red_card'            THEN 'red'
@@ -201,7 +205,16 @@ ws_cards AS (
         )                                                    AS match_id_canonical,
         xt.canonical_id                                      AS team_id_canonical,
         xp.canonical_id                                      AS player_id_canonical,
-        TRY_CAST(we.minute AS integer)                       AS minute,
+        -- #454: WS minute is the CUMULATIVE half minute (90+4 → 94). Convert
+        -- to base minute (period-aware, mirrors fct_match_timeline.sql) so
+        -- the dedup key aligns with the FBref branch's base minute.
+        CASE
+            WHEN we.period = 'FirstHalf'
+                 AND TRY_CAST(we.minute AS integer) > 45 THEN 45
+            WHEN we.period = 'SecondHalf'
+                 AND TRY_CAST(we.minute AS integer) > 90 THEN 90
+            ELSE TRY_CAST(we.minute AS integer)
+        END                                                  AS minute,
         CASE
             WHEN regexp_like(we.qualifiers, '"displayName"\s*:\s*"SecondYellow"')
                 THEN 'second_yellow'

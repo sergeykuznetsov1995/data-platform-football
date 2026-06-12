@@ -364,3 +364,121 @@ class TestFctCardPipeline:
         out = _run_gold(duck_conn)
         pks = [r["card_canonical"] for r in out]
         assert len(pks) == len(set(pks)), pks
+
+
+def _seed_stoppage_bridge(duck_conn) -> None:
+    """Bridge spine + xref shared by the stoppage-time tests (#454).
+
+    WS game_id=1 ↔ FBref M1 (Liverpool vs Arsenal, 2024-08-15); FBref fb_p1
+    and WS player 1000 resolve to the same canonical so cross-source dedup
+    can fire.
+    """
+    duck_conn.execute(
+        """
+        INSERT INTO bronze_whoscored_schedule VALUES
+          (1, TIMESTAMP '2024-08-15 19:00:00', 'Liverpool', 'Arsenal',
+           'ENG-Premier League', '2425', TIMESTAMP '2026-05-08 12:00:00')
+        """
+    )
+    duck_conn.execute(
+        """
+        INSERT INTO silver_fbref_match_enriched VALUES
+          ('M1', 'ENG-Premier League', 'Liverpool', 'Arsenal',
+           DATE '2024-08-15')
+        """
+    )
+    duck_conn.execute(
+        """
+        INSERT INTO silver_xref_team VALUES
+          ('fbref',     'Liverpool', 'liverpool',
+           'ENG-Premier League', '2425'),
+          ('fbref',     'Arsenal',   'arsenal',
+           'ENG-Premier League', '2425'),
+          ('whoscored', 'Liverpool', 'liverpool',
+           'ENG-Premier League', '2425'),
+          ('whoscored', 'Arsenal',   'arsenal',
+           'ENG-Premier League', '2425')
+        """
+    )
+    duck_conn.execute(
+        """
+        INSERT INTO silver_xref_player VALUES
+          ('fbref',     'fb_p1', 'p1_canon', 'ENG-Premier League', '2425'),
+          ('whoscored', '1000',  'p1_canon', 'ENG-Premier League', '2425')
+        """
+    )
+
+
+class TestStoppageTimeMinutes:
+    """#454: FBref minute is varchar with stoppage time ('90+4') and WhoScored
+    minute is the CUMULATIVE half minute (90+4 → 94). Both branches must emit
+    the BASE minute so cross-source dedup keys align.
+    """
+
+    def test_fbref_stoppage_card_base_minute(self, duck_conn):
+        """'90+4' and '45+2' must survive as base minutes 90 / 45."""
+        _seed_stoppage_bridge(duck_conn)
+        duck_conn.execute(
+            """
+            INSERT INTO bronze_fbref_match_events VALUES
+              ('M1', '90+4', 'yellow_card', 'Player1', 'fb_p1', NULL, NULL,
+               'Liverpool', 'ENG-Premier League', 2024,
+               TIMESTAMP '2026-05-08 12:00:00'),
+              ('M1', '45+2', 'red_card',    'Player9', 'fb_p9', NULL, NULL,
+               'Liverpool', 'ENG-Premier League', 2024,
+               TIMESTAMP '2026-05-08 12:00:00')
+            """
+        )
+        out = _run_gold(duck_conn)
+        assert len(out) == 2, f"stoppage-time cards dropped: {out}"
+        minutes = sorted(r["minute"] for r in out)
+        assert minutes == [45, 90], minutes
+        assert all(r["card_source"] == "fbref" for r in out), out
+
+    def test_cross_source_stoppage_dup_collapses(self, duck_conn):
+        """Same stoppage card from FBref ('90+4') and WS (cumulative 94,
+        SecondHalf) must collapse to ONE FBref-priority row at minute 90."""
+        _seed_stoppage_bridge(duck_conn)
+        duck_conn.execute(
+            """
+            INSERT INTO bronze_fbref_match_events VALUES
+              ('M1', '90+4', 'yellow_card', 'Player1', 'fb_p1', NULL, NULL,
+               'Liverpool', 'ENG-Premier League', 2024,
+               TIMESTAMP '2026-05-08 12:00:00')
+            """
+        )
+        yellow_q = _ws_card_qualifiers("Yellow")
+        duck_conn.execute(
+            """
+            INSERT INTO bronze_whoscored_events VALUES
+              (1.0, 'SecondHalf', 94, 0, 94, 'Card', 'Successful',
+               100.0, 1000.0, ?, NULL, 'Liverpool',
+               'ENG-Premier League', '2425', TIMESTAMP '2026-05-08 12:00:00')
+            """,
+            [yellow_q],
+        )
+        out = _run_gold(duck_conn)
+        assert len(out) == 1, f"expected 1 deduped row, got {len(out)}: {out}"
+        assert out[0]["card_source"] == "fbref", out
+        assert out[0]["minute"] == 90, out
+
+    def test_ws_only_stoppage_card_base_minute(self, duck_conn):
+        """WS-only cards: cumulative 94/SecondHalf → 90; 46/FirstHalf → 45."""
+        _seed_stoppage_bridge(duck_conn)
+        yellow_q = _ws_card_qualifiers("Yellow")
+        duck_conn.execute(
+            """
+            INSERT INTO bronze_whoscored_events VALUES
+              (1.0, 'SecondHalf', 94, 0, 94, 'Card', 'Successful',
+               100.0, 999.0, ?, NULL, 'Liverpool',
+               'ENG-Premier League', '2425', TIMESTAMP '2026-05-08 12:00:00'),
+              (1.0, 'FirstHalf', 46, 0, 46, 'Card', 'Successful',
+               100.0, 998.0, ?, NULL, 'Liverpool',
+               'ENG-Premier League', '2425', TIMESTAMP '2026-05-08 12:00:00')
+            """,
+            [yellow_q, yellow_q],
+        )
+        out = _run_gold(duck_conn)
+        assert len(out) == 2, out
+        minutes = sorted(r["minute"] for r in out)
+        assert minutes == [45, 90], minutes
