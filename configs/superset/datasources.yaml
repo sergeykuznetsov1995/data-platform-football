@@ -126,6 +126,17 @@ databases:
         default_endpoint: null
         cache_timeout: 3600
 
+      - table_name: fct_match_timeline
+        schema: gold
+        description: |
+          Единая поминутная хроника матча (#427): голы, карточки, замены в одной
+          таблице. Заменяет дропнутые fct_goal/fct_card/fct_substitution (#448).
+          Зерно: (match_id, event_seq). Источники: silver.fbref_match_events
+          (primary) ∪ bronze.whoscored_events (per-match fallback).
+          event_type — словарь из 8 значений; score_home/away_after — счёт после события.
+        default_endpoint: null
+        cache_timeout: 3600
+
       - table_name: fct_match_odds
         schema: gold
         description: |

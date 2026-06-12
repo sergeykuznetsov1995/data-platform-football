@@ -1,0 +1,63 @@
+# =============================================================================
+# OpenMetadata description: iceberg.gold.fct_match_timeline
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.gold.fct_match_timeline
+  description: |
+    Единая поминутная хроника матча (#427). Голы, карточки и замены в ОДНОЙ
+    таблице — "что и на какой минуте" отвечается одним SELECT ... ORDER BY
+    event_seq, без UNION fct_goal/fct_card/fct_substitution (те три узких факта
+    дропнуты в #448, это их замена). Зерно: (match_id, event_seq).
+    Партиционирование: (league, season). Источники: silver.fbref_match_events
+    (PRIMARY) ∪ bronze.whoscored_events (per-match fallback с двуногим
+    identity-gate #459 против задвоения голов).
+  tags:
+    - Tier.Gold
+    - Domain.Football
+    - PII.Low
+columns:
+  - name: match_id
+    description: PK-часть. FBref hex когда привязан через xref_match; иначе 'whoscored_raw_<game_id>'. FK -> dim_match.match_id.
+  - name: event_seq
+    description: PK-часть. Плотный 1..N номер события внутри матча. Детерминирован; intra-minute порядок арбитрарен (priority-tiebreaker).
+  - name: period
+    description: Половина матча — '1H' | '2H' | 'ET'.
+  - name: minute
+    description: Базовая минута (90 для "90+4").
+  - name: minute_added
+    description: Компенсированное время, NULL когда нет.
+  - name: event_type
+    description: Словарь из 8 значений — goal, own_goal, penalty_goal, penalty_missed, yellow_card, second_yellow, red_card, substitution. penalty_missed на практике только WhoScored.
+  - name: team_id
+    description: Для голевых событий — команда, КОТОРОЙ засчитан гол (own_goal — бенефициар, не автор); иначе команда актора. FK -> dim_team.team_id. Orphan-tolerant.
+  - name: player_id
+    description: Главный актор — забивший / получивший карточку / уходящий при замене. FK -> dim_player.player_id.
+  - name: related_player_id
+    description: Ассистент на голах; выходящий на поле при замене. NULL для карточек, автоголов, нереализованных пенальти. FK -> dim_player.player_id.
+  - name: score_home_after
+    description: Счёт хозяев ПОСЛЕ события (running sum голевых событий по засчитанной стороне).
+  - name: score_away_after
+    description: Счёт гостей ПОСЛЕ события.
+  - name: event_source
+    description: Источник строки — 'fbref' | 'whoscored'.
+  - name: league
+    description: Слаг лиги (ключ партиционирования).
+  - name: season
+    description: Слаг сезона, компактный '2425' (ключ партиционирования).
+  - name: _ingested_at
+    description: Bronze-provenance timestamp исходного события.
+  - name: _silver_created_at
+    description: Время материализации строки CTAS-обёрткой run_gold_transform (добавляется раннером, не в .sql).
+relationships:
+  - from: trino_iceberg.iceberg.gold.fct_match_timeline
+    to:   trino_iceberg.iceberg.gold.dim_match
+    type: FOREIGN_KEY
+    description: match_id -> dim_match.match_id
+  - from: trino_iceberg.iceberg.gold.fct_match_timeline
+    to:   trino_iceberg.iceberg.gold.dim_team
+    type: FOREIGN_KEY
+    description: team_id -> dim_team.team_id
+  - from: trino_iceberg.iceberg.gold.fct_match_timeline
+    to:   trino_iceberg.iceberg.gold.dim_player
+    type: FOREIGN_KEY
+    description: player_id -> dim_player.player_id
