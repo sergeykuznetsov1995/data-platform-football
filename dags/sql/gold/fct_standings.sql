@@ -19,6 +19,10 @@
 --   LEFT JOIN iceberg.silver.xref_team on (source='sofascore')
 --   * matched   -> team_id = xref_team.canonical_id, team_id_source='fbref_canonical'
 --   * orphan    -> team_id = 'ss_<slug>',            team_id_source='sofascore_orphan'
+--   The JOIN excludes confidence='orphan' xref rows (#460): they carry a
+--   non-NULL source-prefixed canonical_id ('ss_<slug>'), so without the
+--   filter they'd be mislabeled 'fbref_canonical'. xref_team.sql.j2 contract:
+--   orphans are excluded from every cross-source Gold JOIN.
 --   Orphan prefix mirrors the 'ss_' source-prefix convention enforced by
 --   silver.xref_team for unresolved sofascore teams (see xref_team.sql.j2).
 --
@@ -97,6 +101,7 @@ resolved as (
       and x.source_id   = s.team_name_raw
       and x.league      = s.league
       and x.season      = s.season_slug
+      and x.confidence <> 'orphan'
 )
 
 select

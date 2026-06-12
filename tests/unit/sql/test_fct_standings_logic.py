@@ -111,6 +111,20 @@ class TestFctStandingsCutoverStructure:
             "`season = CAST(s.season AS varchar)`"
         )
 
+    def test_join_excludes_orphan_confidence(self):
+        """#460: the silver.xref_team JOIN must exclude orphan rows.
+        Orphan xref rows carry a non-NULL source-prefixed canonical_id
+        ('ss_<slug>'), so without `confidence <> 'orphan'` they would be
+        mislabeled team_id_source='fbref_canonical' (xref_team.sql.j2
+        contract: orphans are excluded from every cross-source Gold JOIN)."""
+        sql = _strip_comments(_read_sql())
+        assert re.search(
+            r"confidence\s*<>\s*'orphan'", sql, re.IGNORECASE,
+        ), (
+            "fct_standings.sql must filter `confidence <> 'orphan'` on the "
+            "silver.xref_team join (#460)"
+        )
+
     def test_orphan_fallback_ss_prefix_regex(self):
         """Orphan fallback regex: `'ss_' || lower(regexp_replace(...))` must
         survive the cutover — silver.xref_team's orphan namespace is
@@ -188,7 +202,7 @@ def _bootstrap(con) -> None:
             _ingested_at TIMESTAMP
         )
     """)
-    # 6 rows: 3 teams × 2 snapshots (latest must win after dedup).
+    # 8 rows: 4 teams × 2 snapshots (latest must win after dedup).
     con.execute("""
         INSERT INTO bronze.sofascore_league_table VALUES
         -- Older snapshot (must be discarded)
@@ -198,12 +212,16 @@ def _bootstrap(con) -> None:
          TIMESTAMP '2026-04-26 06:00:00'),
         ('ENG-Premier League', '2425', 'Arsenal',         10, 6, 3, 1, 22, 14,  8, 21,
          TIMESTAMP '2026-04-26 06:00:00'),
+        ('ENG-Premier League', '2425', 'Burnley',         10, 2, 2, 6,  8, 20, -12, 8,
+         TIMESTAMP '2026-04-26 06:00:00'),
         -- Latest snapshot (must win)
         ('ENG-Premier League', '2425', 'Manchester City', 12, 10, 1, 1, 35, 11, 24, 31,
          TIMESTAMP '2026-04-27 06:00:00'),
         ('ENG-Premier League', '2425', 'Liverpool',       12, 8, 2, 2, 28, 14, 14, 26,
          TIMESTAMP '2026-04-27 06:00:00'),
         ('ENG-Premier League', '2425', 'Arsenal',         12, 7, 3, 2, 24, 16,  8, 24,
+         TIMESTAMP '2026-04-27 06:00:00'),
+        ('ENG-Premier League', '2425', 'Burnley',         12, 2, 3, 7, 10, 24, -14, 9,
          TIMESTAMP '2026-04-27 06:00:00')
     """)
 
@@ -211,7 +229,14 @@ def _bootstrap(con) -> None:
     # Note: season is VARCHAR (the season_slug — '2425') unlike the legacy
     # gold.entity_xref where it was BIGINT. This is intentional: silver
     # xref tables use the raw season-slug per the documented contract.
-    # 2 of the 3 teams resolved -> canonical_id; Arsenal is an orphan.
+    # 2 of the 4 teams resolved -> canonical_id. Two orphan shapes (#460):
+    #   * Arsenal — xref ROW EXISTS with confidence='orphan' and a non-NULL
+    #     source-prefixed canonical_id ('ss_arsenal'). This mirrors live
+    #     xref_team: the orphan fallback in xref_team.sql.j2 always emits a
+    #     canonical_id, so a JOIN without `confidence <> 'orphan'` would
+    #     mislabel the row as resolved.
+    #   * Burnley — no xref row at all (fresh team before xref refresh);
+    #     covers the COALESCE 'ss_<slug>' fallback path.
     con.execute("""
         CREATE TABLE silver.xref_team (
             source VARCHAR,
@@ -228,7 +253,9 @@ def _bootstrap(con) -> None:
         ('sofascore', 'Manchester City', 'manchester_city', 'Manchester City',
          'ENG-Premier League', '2425', 'name_alias'),
         ('sofascore', 'Liverpool',       'liverpool',       'Liverpool',
-         'ENG-Premier League', '2425', 'name_alias')
+         'ENG-Premier League', '2425', 'name_alias'),
+        ('sofascore', 'Arsenal',         'ss_arsenal',      'Arsenal',
+         'ENG-Premier League', '2425', 'orphan')
     """)
 
 
@@ -258,22 +285,23 @@ def gold_rows():
 @pytest.mark.unit
 class TestFctStandingsLogic:
     def test_dedup_to_latest_snapshot(self, gold_rows):
-        """6 input rows (3 teams × 2 snapshots) → 3 output rows."""
-        assert len(gold_rows) == 3, (
-            f"expected 3 rows after snapshot dedup, got {len(gold_rows)}: "
+        """8 input rows (4 teams × 2 snapshots) → 4 output rows."""
+        assert len(gold_rows) == 4, (
+            f"expected 4 rows after snapshot dedup, got {len(gold_rows)}: "
             f"{[(r['team_name_raw'], r['played']) for r in gold_rows]}"
         )
 
     def test_position_ordering(self, gold_rows):
         """``position`` = ROW_NUMBER OVER (PARTITION BY league, season ORDER BY
         points DESC, goal_diff DESC, goals_for DESC).
-        Input (latest): MCI=31pts, LIV=26pts, ARS=24pts.
+        Input (latest): MCI=31pts, LIV=26pts, ARS=24pts, BUR=9pts.
         """
         by_position = sorted(gold_rows, key=lambda r: r["position"])
-        assert [r["position"] for r in by_position] == [1, 2, 3]
+        assert [r["position"] for r in by_position] == [1, 2, 3, 4]
         assert by_position[0]["team_name_raw"] == "Manchester City"
         assert by_position[1]["team_name_raw"] == "Liverpool"
         assert by_position[2]["team_name_raw"] == "Arsenal"
+        assert by_position[3]["team_name_raw"] == "Burnley"
 
     def test_resolved_team_uses_canonical_id(self, gold_rows):
         """When silver.xref_team has a row, team_id = canonical_id and
@@ -288,18 +316,25 @@ class TestFctStandingsLogic:
         assert ids["Liverpool"] == "liverpool"
 
     def test_orphan_team_uses_ss_prefix(self, gold_rows):
-        """When silver.xref_team has no match, team_id = 'ss_<slug>' and
-        team_id_source = 'sofascore_orphan'."""
-        orphans = [r for r in gold_rows
-                   if r["team_id_source"] == "sofascore_orphan"]
-        assert len(orphans) == 1, (
-            f"expected 1 orphan team (Arsenal), got {len(orphans)}: "
-            f"{[r['team_name_raw'] for r in orphans]}"
+        """Both orphan shapes must land on team_id = 'ss_<slug>' and
+        team_id_source = 'sofascore_orphan' (#460):
+          * Arsenal — xref row exists with confidence='orphan' (must be
+            excluded by the JOIN filter, NOT counted as resolved);
+          * Burnley — no xref row at all (COALESCE fallback path).
+        """
+        orphans = {r["team_name_raw"]: r for r in gold_rows
+                   if r["team_id_source"] == "sofascore_orphan"}
+        assert set(orphans) == {"Arsenal", "Burnley"}, (
+            f"expected orphans {{'Arsenal', 'Burnley'}}, got "
+            f"{sorted(orphans)}"
         )
-        ars = orphans[0]
-        assert ars["team_name_raw"] == "Arsenal"
-        assert ars["team_id"] == "ss_arsenal", (
-            f"orphan team_id must be 'ss_arsenal', got {ars['team_id']!r}"
+        assert orphans["Arsenal"]["team_id"] == "ss_arsenal", (
+            f"orphan team_id must be 'ss_arsenal', got "
+            f"{orphans['Arsenal']['team_id']!r}"
+        )
+        assert orphans["Burnley"]["team_id"] == "ss_burnley", (
+            f"orphan team_id must be 'ss_burnley', got "
+            f"{orphans['Burnley']['team_id']!r}"
         )
 
     def test_points_per_game_exact(self, gold_rows):
