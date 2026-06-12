@@ -1,6 +1,6 @@
 """
-DQ check builders for E4 — Narrow Facts (Goals / Cards / Subs / Odds / Ratings)
-==============================================================================
+DQ check builders for E4 — Narrow Facts (Odds / Ratings)
+========================================================
 
 Universal builder helpers for Iteration **E4** Silver / Gold tables:
 
@@ -15,14 +15,12 @@ Silver
 
 Gold
 ----
-* ``iceberg.gold.fct_goal``           — goals (xxhash64 PK) sourced from
-  fct_shot (is_goal=true) and FBref own-goal annotations.
-* ``iceberg.gold.fct_card``           — cross-source cards assembly folded
-  in from bronze+xref (FBref+WhoScored union, FBref-priority dedup; #382).
-* ``iceberg.gold.fct_substitution``   — cross-source subs assembly folded
-  in from bronze+xref (Off↔On pairing, FBref-priority dedup; #382).
 * ``iceberg.gold.fct_match_odds``     — passthrough from silver.matchhistory_match_odds.
 * ``iceberg.gold.fct_match_rating``   — passthrough from silver.sofascore_player_ratings.
+
+(``fct_goal`` / ``fct_card`` / ``fct_substitution`` builders were removed in
+#448 — the tables are superseded by ``gold.fct_match_timeline``, whose DQ
+lives in ``utils.gold_tasks``.)
 
 Pattern mirrors :mod:`utils.e3_dq` — pure :class:`Check` builder
 functions using the universal :mod:`utils.data_quality` primitives. The
@@ -50,8 +48,8 @@ WARNING (Telegram, no raise) for:
 
 Open TODOs (E4 Phase 1.5 cutover and beyond)
 --------------------------------------------
-* ref_integrity to ``iceberg.gold.dim_match`` for fct_goal/fct_card/
-  fct_substitution/fct_match_odds/fct_match_rating is **WARNING** until
+* ref_integrity to ``iceberg.gold.dim_match`` for
+  fct_match_odds/fct_match_rating is **WARNING** until
   Phase B bridging via xref_match adds non-FBref source coverage. See
   ``MEDALLION_REDESIGN_ROADMAP.md`` E4.6.
 * ref_integrity to ``iceberg.gold.dim_player`` for fct_match_rating is
@@ -88,17 +86,11 @@ logger = logging.getLogger(__name__)
 # Keep these in sync with the SQL CASE/literal expressions in
 #   dags/sql/silver/matchhistory_match_odds.sql
 #   dags/sql/silver/sofascore_player_ratings.sql
-#   dags/sql/gold/fct_goal.sql       (goal_source)
-#   dags/sql/gold/fct_card.sql       (card_source — folded cross-source)
-#   dags/sql/gold/fct_substitution.sql (substitution_source — folded cross-source)
 #   dags/sql/gold/fct_match_odds.sql (odds_source — passthrough)
 #   dags/sql/gold/fct_match_rating.sql (rating_source — passthrough)
 SILVER_ODDS_SOURCES: List[str] = ['matchhistory']
 SILVER_RATING_SOURCES: List[str] = ['sofascore']
 
-GOLD_GOAL_SOURCES: List[str] = ['fct_shot', 'fbref_own_goal']
-GOLD_CARD_SOURCES: List[str] = ['fbref', 'whoscored']
-GOLD_SUB_SOURCES: List[str] = ['fbref', 'whoscored']
 GOLD_ODDS_SOURCES: List[str] = ['matchhistory']
 GOLD_RATING_SOURCES: List[str] = ['sofascore']
 
@@ -245,259 +237,6 @@ def _build_silver_sofascore_player_ratings_checks() -> List[Check]:
             where="team_side = 'away'",
             severity='WARNING',
             name='ratings_team_side_away',
-        ),
-
-        # Freshness.
-        CHECK.freshness(
-            table=table, ts_col='_ingested_at',
-            max_age_hours=14 * 24,
-            severity='WARNING',
-        ),
-    ]
-
-
-# ---------------------------------------------------------------------------
-# Gold — fct_goal
-# ---------------------------------------------------------------------------
-
-def _build_gold_fct_goal_checks() -> List[Check]:
-    """DQ for ``iceberg.gold.fct_goal`` (E4.5).
-
-    PK = goal_canonical (xxhash64 of match+minute+scorer+is_own_goal+
-    pk_tiebreaker). Source ENUM = {'fct_shot', 'fbref_own_goal'} —
-    the dominant tier MUST be fct_shot (regular play goals); own
-    goals are a small fraction (<5% baseline).
-    """
-    table = 'iceberg.gold.fct_goal'
-    return [
-        # Volume floor — ~5.5K observed; min 4K with ERROR.
-        CHECK.row_count(table, min_rows=4_000, severity='ERROR'),
-
-        # PK uniqueness on the xxhash64 canonical (ERROR).
-        CHECK.no_duplicates(
-            table, pk=['goal_canonical'], severity='ERROR',
-        ),
-
-        # NULL guards — canonical-trio + critical contract (ERROR).
-        CHECK.no_nulls(
-            table,
-            cols=['match_id_canonical', 'team_id_canonical', 'minute',
-                  'goal_canonical', 'goal_source', 'goal_version'],
-            severity='ERROR',
-        ),
-
-        # R0.4 schema-versioning completeness for goal_canonical.
-        CHECK.canonical_completeness(
-            table, canonical_col='goal_canonical',
-            severity='ERROR',
-        ),
-
-        # Minute bounds — same as silver.
-        CHECK.value_range(
-            table=table, column='minute',
-            min_val=0, max_val=130,
-            severity='ERROR',
-        ),
-
-        # goal_source ENUM presence.
-        # fct_shot is the DOMINANT source — must have data (ERROR).
-        CHECK.row_count(
-            table=table, min_rows=1,
-            where="goal_source = 'fct_shot'",
-            severity='ERROR',
-            name='goal_source_enum_fct_shot',
-        ),
-        # fbref_own_goal is a minority source — WARNING if absent
-        # (could legitimately be empty in a small partial-backfill).
-        CHECK.row_count(
-            table=table, min_rows=1,
-            where="goal_source = 'fbref_own_goal'",
-            severity='WARNING',
-            name='goal_source_enum_fbref_own_goal',
-        ),
-
-        # ref_integrity to dim_match — WARNING (Phase B bridging).
-        # parent_key='match_id' because dim_match.match_id is the canonical
-        # column (no '_canonical' suffix); see E4 postmortem 2026-05-09.
-        CHECK.ref_integrity(
-            child='gold.fct_goal',
-            parent='gold.dim_match',
-            key='match_id_canonical',
-            parent_key='match_id',
-            severity='WARNING',
-        ),
-
-        # Freshness.
-        CHECK.freshness(
-            table=table, ts_col='_ingested_at',
-            max_age_hours=14 * 24,
-            severity='WARNING',
-        ),
-    ]
-
-
-# ---------------------------------------------------------------------------
-# Gold — fct_card
-# ---------------------------------------------------------------------------
-
-def _build_gold_fct_card_checks() -> List[Check]:
-    """DQ for ``iceberg.gold.fct_card`` (E4.5).
-
-    Cross-source cards assembly folded in from bronze+xref (#382).
-    PK = card_canonical (xxhash64). Source ENUM = {'fbref', 'whoscored'}.
-    """
-    table = 'iceberg.gold.fct_card'
-    return [
-        # Volume floor — silver baseline 13.6K; gold ~equal (passthrough).
-        CHECK.row_count(table, min_rows=8_000, severity='ERROR'),
-
-        # PK uniqueness (ERROR).
-        CHECK.no_duplicates(
-            table, pk=['card_canonical'], severity='ERROR',
-        ),
-
-        # NULL guards (ERROR).
-        CHECK.no_nulls(
-            table,
-            cols=['match_id_canonical', 'minute', 'card_type',
-                  'card_canonical', 'card_source', 'card_version'],
-            severity='ERROR',
-        ),
-
-        # R0.4 canonical completeness.
-        CHECK.canonical_completeness(
-            table, canonical_col='card_canonical',
-            severity='ERROR',
-        ),
-
-        # Minute bounds.
-        CHECK.value_range(
-            table=table, column='minute',
-            min_val=0, max_val=130,
-            severity='ERROR',
-        ),
-
-        # card_type ENUM presence.
-        CHECK.row_count(
-            table=table, min_rows=1,
-            where="card_type = 'yellow'",
-            severity='WARNING',
-            name='gold_card_type_yellow',
-        ),
-        CHECK.row_count(
-            table=table, min_rows=1,
-            where="card_type = 'red'",
-            severity='WARNING',
-            name='gold_card_type_red',
-        ),
-
-        # card_source ENUM presence.
-        CHECK.row_count(
-            table=table, min_rows=1,
-            where="card_source = 'fbref'",
-            severity='WARNING',
-            name='gold_card_source_fbref',
-        ),
-        CHECK.row_count(
-            table=table, min_rows=1,
-            where="card_source = 'whoscored'",
-            severity='WARNING',
-            name='gold_card_source_whoscored',
-        ),
-
-        # ref_integrity to dim_match — WARNING (Phase B).
-        CHECK.ref_integrity(
-            child='gold.fct_card',
-            parent='gold.dim_match',
-            key='match_id_canonical',
-            parent_key='match_id',
-            severity='WARNING',
-        ),
-
-        # Bridge un-bridged ratio — WhoScored→FBref bridge fallbacks carry the
-        # 'whoscored_raw_<bronze_id>' match id. ~7.4% baseline; bound the
-        # absolute count at 15% × 13.6K ≈ 2,040 (room for a partial-backfill
-        # spike). Folded from the former silver.match_cards DQ (#382).
-        CHECK.row_count(
-            table=table, min_rows=0, max_rows=2_040,
-            where="match_id_canonical LIKE 'whoscored_raw_%'",
-            severity='WARNING',
-            name='gold_card_bridge_unbridged_rate',
-        ),
-
-        # Freshness.
-        CHECK.freshness(
-            table=table, ts_col='_ingested_at',
-            max_age_hours=14 * 24,
-            severity='WARNING',
-        ),
-    ]
-
-
-# ---------------------------------------------------------------------------
-# Gold — fct_substitution
-# ---------------------------------------------------------------------------
-
-def _build_gold_fct_substitution_checks() -> List[Check]:
-    """DQ for ``iceberg.gold.fct_substitution`` (E4.5).
-
-    Cross-source subs assembly folded in from bronze+xref (#382). PK =
-    substitution_canonical (xxhash64). Source ENUM =
-    {'fbref', 'whoscored'}.
-    """
-    table = 'iceberg.gold.fct_substitution'
-    return [
-        # Volume floor — silver baseline 25.6K.
-        CHECK.row_count(table, min_rows=15_000, severity='ERROR'),
-
-        # PK uniqueness (ERROR).
-        CHECK.no_duplicates(
-            table, pk=['substitution_canonical'], severity='ERROR',
-        ),
-
-        # NULL guards (ERROR).
-        CHECK.no_nulls(
-            table,
-            cols=['match_id_canonical', 'minute',
-                  'substitution_canonical', 'substitution_source',
-                  'substitution_version'],
-            severity='ERROR',
-        ),
-
-        # R0.4 canonical completeness.
-        CHECK.canonical_completeness(
-            table, canonical_col='substitution_canonical',
-            severity='ERROR',
-        ),
-
-        # Minute bounds.
-        CHECK.value_range(
-            table=table, column='minute',
-            min_val=0, max_val=130,
-            severity='ERROR',
-        ),
-
-        # substitution_source ENUM presence.
-        CHECK.row_count(
-            table=table, min_rows=1,
-            where="substitution_source = 'fbref'",
-            severity='WARNING',
-            name='gold_sub_source_fbref',
-        ),
-        CHECK.row_count(
-            table=table, min_rows=1,
-            where="substitution_source = 'whoscored'",
-            severity='WARNING',
-            name='gold_sub_source_whoscored',
-        ),
-
-        # ref_integrity to dim_match — WARNING (Phase B).
-        CHECK.ref_integrity(
-            child='gold.fct_substitution',
-            parent='gold.dim_match',
-            key='match_id_canonical',
-            parent_key='match_id',
-            severity='WARNING',
         ),
 
         # Freshness.
@@ -719,14 +458,12 @@ def build_silver_e4_checks() -> List[Check]:
 def build_gold_e4_checks() -> List[Check]:
     """Return DQ checks for Gold E4 tables.
 
-    Composition: ``fct_goal`` + ``fct_card`` + ``fct_substitution`` +
-    ``fct_match_odds`` + ``fct_match_rating``.
+    Composition: ``fct_match_odds`` + ``fct_match_rating``.
+    (``fct_goal`` / ``fct_card`` / ``fct_substitution`` checks removed in
+    #448 together with the tables.)
     """
     return (
-        _build_gold_fct_goal_checks()
-        + _build_gold_fct_card_checks()
-        + _build_gold_fct_substitution_checks()
-        + _build_gold_fct_match_odds_checks()
+        _build_gold_fct_match_odds_checks()
         + _build_gold_fct_match_rating_checks()
     )
 
@@ -743,9 +480,6 @@ def build_all_e4_checks() -> List[Check]:
 __all__ = [
     'SILVER_ODDS_SOURCES',
     'SILVER_RATING_SOURCES',
-    'GOLD_GOAL_SOURCES',
-    'GOLD_CARD_SOURCES',
-    'GOLD_SUB_SOURCES',
     'GOLD_ODDS_SOURCES',
     'GOLD_RATING_SOURCES',
     'build_silver_e4_checks',

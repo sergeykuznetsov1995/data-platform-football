@@ -67,9 +67,8 @@ TABLES: dict[str, dict] = {
     'gold.fct_keeper_season_stats':      {'sums': []},
     'gold.fct_team_season_stats':        {'sums': []},
     'gold.fct_team_match':               {'sums': ['goals_for', 'goals_against']},
-    'gold.fct_card':                     {'sums': []},
-    'gold.fct_goal':                     {'sums': []},
-    'gold.fct_substitution':             {'sums': []},
+    # fct_card / fct_goal / fct_substitution dropped in #448
+    # (superseded by gold.fct_match_timeline)
     'gold.fct_lineup':                   {'sums': []},
     'gold.fct_player_unavailable':       {'sums': []},
     'gold.fct_player_market_value':      {'sums': ['market_value_eur']},

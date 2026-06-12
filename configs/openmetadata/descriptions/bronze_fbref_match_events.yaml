@@ -8,7 +8,7 @@ table:
     жёлтые/вторые жёлтые/красные карточки, замены. Гранулярность: один row на
     событие в пределах match_id. ВАЖНО: для автоголов (own_goal) поле team в
     Bronze указывает команду, в чьи ворота забит мяч (атрибуция инвертирована) —
-    коррекция выполняется в Gold (fct_goal). Источник: FBref scrape
+    коррекция выполняется в Gold (fct_match_timeline). Источник: FBref scrape
     (dag_ingest_fbref).
   tags:
     - Tier.Bronze

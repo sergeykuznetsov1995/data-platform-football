@@ -5,7 +5,7 @@
 -- cards and substitutions in ONE timeline — "what happened and on which
 -- minute" answered by a single `SELECT ... ORDER BY event_seq`, no UNION of
 -- fct_goal / fct_card / fct_substitution needed. Those three narrow facts
--- stay untouched (their fate is a separate followup).
+-- were dropped in #448 (this table is their replacement).
 --
 -- Sources:
 --   iceberg.silver.fbref_match_events     — PRIMARY (already deduped, season
@@ -41,7 +41,8 @@
 --     SubstitutionOn twin rows are dropped entirely — no pair-matching dance.
 --   * own_goal: team_id = team CREDITED with the goal; player_id = actual
 --     striker from the opposite team. FBref rows already sit on the credited
---     side (team/team_side = beneficiary — see fct_goal.sql ADR), so
+--     side (team/team_side = beneficiary — see the former fct_goal.sql ADR,
+--     removed in #448, kept in git history), so
 --     team_side feeds the running score directly. Opta attributes the event
 --     to the STRIKER's team → the WhoScored branch flips the credited side
 --     (and takes team_id from the bridge's opposite-team canonical).
@@ -128,7 +129,8 @@ fb_raw AS (
             ELSE NULL                                        -- cards, own_goal
         END                                                  AS related_raw,
         fe.team                                              AS team_name_raw,
-        -- own_goal rows already sit on the credited side (fct_goal.sql ADR);
+        -- own_goal rows already sit on the credited side (former fct_goal.sql
+        -- ADR, removed in #448);
         -- silver values are lowercase 'home'/'away' — lower() guards drift
         lower(fe.team_side)                                  AS credited_side,
         fe.league                                            AS league,
@@ -223,14 +225,16 @@ ws_schedule_dedup AS (
 -- historical FBref name variant ('Newcastle Utd' / 'Newcastle United'); the
 -- variant that misses fme.home/away produced a second bridge row with
 -- fbref_match_id = NULL and duplicated WhoScored events under
--- 'whoscored_raw_<game_id>' (same pattern as fct_card.sql).
+-- 'whoscored_raw_<game_id>' (same pattern as the former fct_card.sql,
+-- removed in #448).
 xref_team_canonical AS (
     SELECT DISTINCT source, source_id, canonical_id, league, season
     FROM iceberg.silver.xref_team
     WHERE canonical_id IS NOT NULL
 ),
 
--- WhoScored → FBref match bridge, extended vs fct_card.sql with home/away
+-- WhoScored → FBref match bridge, extended vs the former fct_card.sql
+-- (removed in #448) with home/away
 -- names + canonicals: needed for event-side resolution (running score) and
 -- the own_goal credited-team flip.
 ws_match_bridge AS (
@@ -275,7 +279,7 @@ ws_match_bridge AS (
 
 -- Classify deduped WhoScored events onto the 8-value dictionary. The
 -- quote-anchored displayName regex does NOT match 'PenaltyFaced' /
--- 'KeeperPenaltySaved' etc. — same trick fct_card.sql relies on.
+-- 'KeeperPenaltySaved' etc. — same trick the former fct_card.sql relied on.
 ws_classified AS (
     SELECT
         CAST(CAST(we.game_id AS BIGINT) AS varchar)          AS ws_game_id,

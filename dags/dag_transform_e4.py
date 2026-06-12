@@ -2,20 +2,19 @@
 E4 Narrow-Facts Transformation DAG  (Medallion E4 / Wave 1+2)
 =============================================================
 
-Materialises the five Gold-layer **narrow fact tables** that complete the
+Materialises the two Gold-layer **narrow fact tables** that remain from the
 E4 wave of the medallion redesign, plus their two Silver-layer
 prerequisite tables:
 
     iceberg.silver.matchhistory_match_odds        -- pre-match + closing odds
     iceberg.silver.sofascore_player_ratings       -- per-match player ratings
 
-    iceberg.gold.fct_goal                         -- goals (xxhash64 PK)
-    iceberg.gold.fct_card                         -- cross-source assembly
-                                                     (bronze+xref, folded #382)
-    iceberg.gold.fct_substitution                 -- cross-source assembly
-                                                     (bronze+xref, folded #382)
     iceberg.gold.fct_match_odds                   -- passthrough silver
     iceberg.gold.fct_match_rating                 -- passthrough silver
+
+(``fct_goal`` / ``fct_card`` / ``fct_substitution`` were dropped in #448 --
+superseded by ``gold.fct_match_timeline``, built in
+``dag_transform_fbref_gold`` -- #427.)
 
 Topology
 --------
@@ -31,9 +30,6 @@ Topology
         |
         v
     TaskGroup: gold_e4
-        |-- fct_goal           (run_gold_transform, partitions=['league','season'])
-        |-- fct_card           (run_gold_transform, partitions=['league','season'])
-        |-- fct_substitution   (run_gold_transform, partitions=['league','season'])
         |-- fct_match_odds     (run_gold_transform, partitions=['league','season'])
         |-- fct_match_rating   (run_gold_transform, partitions=['league','season'])
         |
@@ -60,17 +56,14 @@ Upstream dependencies
 ---------------------
 * Silver: ``silver.xref_match``, ``silver.xref_team``, ``silver.xref_player``
   (built by ``dag_transform_xref``).
-* Gold: ``gold.fct_shot`` (built by ``dag_transform_e3``) -- consumed by
-  ``fct_goal``.
-* Bronze: ``bronze.match_cards`` (FBref), ``bronze.whoscored_events``
-  (cards + substitutions), ``bronze.matchhistory_match_odds``,
+* Bronze: ``bronze.matchhistory_match_odds``,
   ``bronze.sofascore_player_ratings`` (E4.1 smoke; defensively guarded
   via ``check_bronze_table_exists`` so an empty/absent Bronze yields a
   task SKIP rather than a hard failure).
 
 Known limitations (carried over from the SQL-level ADRs)
 --------------------------------------------------------
-* ``fct_card`` / ``fct_substitution`` / ``fct_match_odds`` /
+* ``fct_match_odds`` /
   ``fct_match_rating`` ref_integrity to ``gold.dim_match`` is WARNING-only
   pending Phase B bridging via ``xref_match`` for non-FBref sources
   (matchhistory bookmaker fixture IDs, sofascore game IDs, whoscored
@@ -81,8 +74,8 @@ Known limitations (carried over from the SQL-level ADRs)
 DQ wiring (validate_e4)
 -----------------------
 DQ builders live in ``utils.e4_dq`` (E4.7). The validator imports
-``build_all_e4_checks`` -- 81 checks total (42 ERROR / 39 WARNING) across
-the four Silver tables and five Gold facts. ERROR-severity failures raise
+``build_all_e4_checks`` across
+the two Silver tables and two Gold facts. ERROR-severity failures raise
 ``AirflowException`` after the Telegram summary is posted. WARNING-severity
 failures are logged + reported but do NOT fail the DAG.
 
@@ -122,9 +115,8 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # (task_id, sql_file (relative to /opt/airflow/), target table name)
 SILVER_E4_TRANSFORMS = [
-    # match_cards / match_substitutions were folded into gold.fct_card /
-    # gold.fct_substitution (cross-source assembly is a Gold concern per the
-    # Silver Charter) — #382. The Gold SQL now reads bronze + xref directly.
+    # match_cards / match_substitutions were folded into the Gold facts (#382),
+    # which were in turn superseded by gold.fct_match_timeline (#448).
     (
         'matchhistory_match_odds',
         'dags/sql/silver/matchhistory_match_odds.sql',
@@ -138,21 +130,8 @@ SILVER_E4_TRANSFORMS = [
 ]
 
 GOLD_E4_TRANSFORMS = [
-    (
-        'fct_goal',
-        'dags/sql/gold/fct_goal.sql',
-        'fct_goal',
-    ),
-    (
-        'fct_card',
-        'dags/sql/gold/fct_card.sql',
-        'fct_card',
-    ),
-    (
-        'fct_substitution',
-        'dags/sql/gold/fct_substitution.sql',
-        'fct_substitution',
-    ),
+    # fct_goal / fct_card / fct_substitution dropped in #448 — superseded by
+    # gold.fct_match_timeline (#427, built in dag_transform_fbref_gold).
     (
         'fct_match_odds',
         'dags/sql/gold/fct_match_odds.sql',
@@ -165,7 +144,7 @@ GOLD_E4_TRANSFORMS = [
     ),
 ]
 
-# Partition columns common to all five Gold facts (per the SQL files'
+# Partition columns common to both Gold facts (per the SQL files'
 # SELECT lists -- league/season are emitted as last columns to feed the
 # Iceberg ``partitioning`` clause set up by ``run_silver_transform``).
 GOLD_E4_PARTITION_COLUMNS = ['league', 'season']
@@ -233,7 +212,7 @@ def _run_silver_e4(sql_file: str, table_name: str, **context) -> Dict[str, Any]:
 def _run_gold_e4(sql_file: str, table_name: str, **context) -> Dict[str, Any]:
     """Run an E4 Gold CTAS via :func:`utils.gold_tasks.run_gold_transform`.
 
-    Always partitions by ``(league, season)`` -- all five E4 facts are
+    Always partitions by ``(league, season)`` -- both E4 facts are
     APL-only at MVP but partitioning future-proofs them for E8 multi-
     competition expansion. The partition columns MUST be the last columns
     in the SELECT (which they are -- see SQL files).
@@ -260,9 +239,8 @@ def _validate_e4(**context) -> Dict[str, Any]:
 
     DQ list comes from :func:`utils.e4_dq.build_all_e4_checks` (E4.7) —
     standard checks across silver.matchhistory_match_odds /
-    sofascore_player_ratings and gold.fct_goal / fct_card / fct_substitution /
-    fct_match_odds / fct_match_rating (cards/subs DQ now lives in the gold
-    builders — #382).
+    sofascore_player_ratings and gold.fct_match_odds / fct_match_rating
+    (fct_goal/fct_card/fct_substitution dropped in #448).
 
     Severity model — ERROR-severity failures raise ``AirflowException``
     after the Telegram summary is posted. WARNING-severity failures are
@@ -311,10 +289,9 @@ with DAG(
     default_args=SILVER_ARGS,
     description=(
         'Materialise E4 narrow facts: silver.matchhistory_match_odds / '
-        'sofascore_player_ratings -> gold.fct_goal / fct_card / '
-        'fct_substitution / fct_match_odds / fct_match_rating (cards/subs '
-        'assembly folded into Gold, #382). Triggered after dag_transform_e3 '
-        'by master pipeline.'
+        'sofascore_player_ratings -> gold.fct_match_odds / fct_match_rating '
+        '(fct_goal/fct_card/fct_substitution dropped in #448). '
+        'Triggered after dag_transform_e3 by master pipeline.'
     ),
     schedule=None,                 # Triggered by dag_master_pipeline (E4.10)
     start_date=datetime(2026, 5, 9),
