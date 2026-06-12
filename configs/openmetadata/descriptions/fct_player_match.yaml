@@ -21,7 +21,9 @@ table:
         → single column без суффикса.
       * RATING: SofaScore (Opta-derived) — единственный источник.
 
-    Зерно: (match_id_canonical, player_id_canonical). Partitioning: (league, season).
+    Зерно: (match_id, player_id). Partitioning: (league, season). #426 переименовал
+    *_canonical id-колонки в plain ids и убрал денормализованный контекст
+    (team_name / team_side / position) — он доступен через JOIN к dims.
 
     Footgun: xref JOIN обязаны иметь (league, season) predicate — без него
     silver.xref_player/xref_match даёт fan-out 1.5-4× (per-season rows).
@@ -32,48 +34,80 @@ table:
     - PII.Low
 columns:
   # ─── PK / Identity ───
-  - name: match_id_canonical
+  - name: match_id
     description: |
       Канонический ID матча (PK part). Берётся из silver.xref_match.canonical_id
       (source='fbref'), fallback — raw fbref_player_match_stats.match_id.
       FK → gold.dim_match.match_id.
-  - name: player_id_canonical
+  - name: player_id
     description: |
       Канонический ID игрока (PK part). Берётся из silver.xref_player.canonical_id
       (source='fbref', confidence <> 'orphan').
-      FK → gold.dim_player_attributes.player_id_canonical.
-  - name: team_id_canonical
+      FK → gold.dim_player.player_id / gold.dim_player_attributes.
+  - name: team_id
     description: |
       Канонический ID команды игрока в матче. Из silver.xref_team (source='fbref').
       FK → gold.dim_team.team_id.
-  - name: team_name
-    description: Имя команды как в источнике FBref (для отладки / отображения).
-  - name: team_side
-    description: Сторона команды в матче — 'home' или 'away'.
-  - name: position
-    description: "Позиция игрока в этом матче (FBref: DF/MF/FW/GK)."
-  - name: league
-    description: Лига (partition key).
-  - name: season
-    description: Сезон — varchar slug ('2425' = сезон 2024/25). Partition key.
 
   # ─── HARD_FACT (COALESCE, primary = FBref) ───
-  - name: minutes
-    description: Сыгранные минуты. COALESCE(FBref → SofaScore → Understat).
+  - name: minutes_played
+    description: Сыгранные минуты. COALESCE(FBref → SofaScore).
   - name: goals
-    description: Голы в матче. COALESCE(FBref → SofaScore → Understat → WhoScored).
+    description: Голы в матче. COALESCE(FBref → SofaScore → WhoScored → Understat).
   - name: assists
     description: Ассисты в матче. COALESCE(FBref → SofaScore → Understat).
-  - name: own_goals
-    description: Автоголы (FBref-only; diff в audit).
   - name: shots
-    description: Все удары. COALESCE(FBref → SofaScore → Understat → WhoScored).
+    description: Все удары. COALESCE(FBref → SofaScore → WhoScored → Understat).
   - name: shots_on_target
     description: Удары в створ. COALESCE(FBref → SofaScore → WhoScored).
+
+  # ─── MODELED (xG / xA — после RX2, COALESCE) ───
+  - name: xg
+    description: |
+      xG за матч. COALESCE(Understat → SofaScore). Understat — primary источник
+      (coverage 99% APL 2025/26, r≥0.99 с SofaScore). Разные xG-модели:
+      Understat own-model, SofaScore Opta-derived. Cross-model diff в audit.
+      Решение RX2: docs/research/RX2_xg_source_selection.md.
+  - name: xa
+    description: xA за матч. COALESCE(Understat → SofaScore). Understat primary.
+
+  # ─── UNIQUE_SOFASCORE / WHOSCORED (match-grain метрики, которых нет у FBref) ───
+  - name: key_passes
+    description: Передачи под удар. COALESCE(SofaScore → WhoScored).
+  - name: passes
+    description: Всего передач. COALESCE(SofaScore → WhoScored).
+  - name: pass_accuracy_pct
+    description: >-
+      Точность пасов, % — per-source ratio (числитель и знаменатель из ОДНОГО
+      источника: SofaScore, иначе WhoScored — смешение дало бы несогласованный %).
+  - name: tackles
+    description: Все попытки отбора. COALESCE(SofaScore → WhoScored).
+  - name: interceptions
+    description: Перехваты. COALESCE(FBref → SofaScore → WhoScored).
+  - name: duels_won
+    description: Всего выигранных единоборств (SofaScore-only; ground+aerial свёрнуты в источнике).
+  - name: touches
+    description: Касания мяча. COALESCE(SofaScore → WhoScored).
+  - name: dispossessed
+    description: Потери мяча через отбор. COALESCE(SofaScore → WhoScored).
+
+  # ─── HARD_FACT (продолжение) ───
+  - name: fouls_committed
+    description: Совершённые фолы. COALESCE(FBref → SofaScore → WhoScored).
+  - name: fouls_drawn
+    description: Заработанные фолы. COALESCE(FBref → SofaScore).
   - name: yellow_cards
-    description: Жёлтые карточки. COALESCE(FBref → SofaScore → Understat → WhoScored).
+    description: Жёлтые карточки. COALESCE(FBref → SofaScore → WhoScored → Understat).
   - name: red_cards
-    description: Красные карточки. COALESCE(FBref → SofaScore → Understat → WhoScored).
+    description: Красные карточки. COALESCE(FBref → SofaScore → WhoScored → Understat).
+  - name: crosses
+    description: Навесы. COALESCE(FBref → SofaScore → WhoScored).
+  - name: offsides
+    description: Офсайды. COALESCE(FBref → SofaScore → WhoScored).
+  - name: tackles_won
+    description: Выигранные отборы. COALESCE(FBref → SofaScore → WhoScored).
+  - name: own_goals
+    description: Автоголы. COALESCE(FBref → SofaScore → Understat).
   - name: penalty_goals
     description: Забитые пенальти (FBref primary, fallback SofaScore).
   - name: penalty_attempts
@@ -82,76 +116,72 @@ columns:
     description: Заработанных пенальти. COALESCE(FBref → SofaScore).
   - name: penalties_conceded
     description: Допущенных пенальти. COALESCE(FBref → SofaScore).
-  - name: tackles_won
-    description: Выигранные отборы. COALESCE(FBref → SofaScore → WhoScored).
-  - name: interceptions
-    description: Перехваты. COALESCE(FBref → SofaScore → WhoScored).
-  - name: fouls_committed
-    description: Совершённые фолы. COALESCE(FBref → SofaScore → WhoScored).
-  - name: fouls_drawn
-    description: Заработанные фолы. COALESCE(FBref → SofaScore).
-  - name: offsides
-    description: Офсайды. COALESCE(FBref → SofaScore).
-  - name: crosses
-    description: Навесы. COALESCE(FBref → SofaScore → WhoScored).
-
-  # ─── UNIQUE_SOFASCORE (match-grain метрики, которых нет у FBref) ───
-  - name: key_passes
-    description: Передачи под удар (SofaScore primary на match-grain; diff с Understat в audit).
-  - name: passes
-    description: Всего передач (SofaScore-only на match-grain).
   - name: passes_completed
-    description: Точные передачи (SofaScore-only на match-grain).
-  - name: tackles
-    description: Все попытки отбора (SofaScore-only на match-grain).
+    description: Точные передачи. COALESCE(SofaScore → WhoScored).
   - name: clearances
-    description: Выносы мяча (SofaScore-only на match-grain).
+    description: Выносы мяча. COALESCE(SofaScore → WhoScored).
   - name: ball_recoveries
-    description: Подборы мяча (SofaScore-only на match-grain).
+    description: Подборы мяча. COALESCE(SofaScore → WhoScored).
   - name: dribbles_attempted
-    description: Попытки дриблинга (SofaScore на match-grain; diff с WhoScored в audit).
+    description: Попытки дриблинга. COALESCE(SofaScore → WhoScored).
   - name: dribbles_won
-    description: Успешные дриблинги (SofaScore на match-grain; diff с WhoScored в audit).
+    description: Успешные дриблинги. COALESCE(SofaScore → WhoScored).
+
+  # ─── Beyond-design enrichment (#426 scope revision) ───
+  - name: blocks
+    description: Блокшоты. COALESCE(SofaScore → WhoScored).
+  - name: errors_lead_to_goal
+    description: Ошибки, приведшие к голу (SofaScore-only).
+  - name: errors_lead_to_shot
+    description: Ошибки, приведшие к удару (SofaScore-only).
+  - name: accurate_crosses
+    description: Точные навесы (SofaScore-only).
+  - name: accurate_long_balls
+    description: Точные длинные передачи (SofaScore-only).
+  - name: total_long_balls
+    description: Всего длинных передач (SofaScore-only).
   - name: aerial_duels_won
-    description: Выигранные верховые дуэли (SofaScore на match-grain; diff с WhoScored в audit).
-  - name: touches
-    description: Касания мяча (SofaScore на match-grain; diff с WhoScored в audit).
-  - name: dispossessed
-    description: Потери мяча через отбор (SofaScore на match-grain; diff с WhoScored в audit).
+    description: Выигранные верховые дуэли. COALESCE(SofaScore → WhoScored).
+  - name: ground_duels_won
+    description: Выигранные единоборства на земле (SofaScore-only).
+  - name: npxg
+    description: Non-penalty xG (Understat; покрытие 2021+).
+  - name: xg_chain
+    description: xG chain — суммарный xG владений, в которых игрок участвовал и которые завершились ударом (Understat).
+  - name: xg_buildup
+    description: xG buildup — как xg_chain, но без финального удара и ассиста (Understat).
   - name: rating
     description: |
       SofaScore match-rating (0-10, Opta-style). Единственный источник для
       per-match рейтинга (FotMob не даёт match-grain rating). NULL если
       SofaScore не имеет записи для этого матча × игрока.
 
-  # ─── MODELED (xG / xA — после RX2, COALESCE) ───
-  - name: expected_goals
-    description: |
-      xG за матч. COALESCE(Understat → SofaScore). Understat — primary источник
-      (coverage 99% APL 2025/26, r≥0.99 с SofaScore). Разные xG-модели:
-      Understat own-model, SofaScore Opta-derived. Cross-model diff в audit.
-      Решение RX2: docs/research/RX2_xg_source_selection.md.
-  - name: expected_assists
-    description: xA за матч. COALESCE(Understat → SofaScore). Understat primary.
-
   # ─── Lineage ───
   - name: _gold_created_at
     description: Технический timestamp создания строки в Gold-слое.
+  - name: league
+    description: Лига (partition key).
+  - name: season
+    description: Сезон — varchar slug ('2425' = сезон 2024/25). Partition key.
+  - name: _silver_created_at
+    description: >-
+      Технический timestamp: инжектируется runner'ом (run_silver_transform)
+      поверх SQL. Дублирует _gold_created_at — унификация в followup.
 
 relationships:
-  - from: match_id_canonical
+  - from: match_id
     to: trino_iceberg.iceberg.gold.dim_match.match_id
     type: FOREIGN_KEY
     description: N:1 — атрибуты матча.
-  - from: player_id_canonical
+  - from: player_id
     to: trino_iceberg.iceberg.gold.dim_player_attributes.player_id_canonical
     type: FOREIGN_KEY
     description: N:1 — атрибуты игрока (snapshot per canonical_id).
-  - from: team_id_canonical
+  - from: team_id
     to: trino_iceberg.iceberg.gold.dim_team.team_id
     type: FOREIGN_KEY
     description: N:1 — атрибуты команды.
-  - from: player_id_canonical
+  - from: player_id
     to: trino_iceberg.iceberg.gold.dim_player.player_id
     type: FOREIGN_KEY
     description: N:1 — канонический per-season player dim (FBref spine).

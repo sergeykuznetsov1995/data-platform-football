@@ -6,34 +6,44 @@ table:
   description: |
     Lineup fact (E3). Source: silver.espn_lineup deduplicated by
     (match_id, player_name) with source_priority precedence. Grain: one row
-    per (match_id, team, player) appearance.
+    per (match_id, team, player) appearance. #426 renamed *_canonical id
+    columns to plain ids, dropped player_name, and added is_captain placeholder
+    + lineup_version.
   tags:
     - Tier.Gold
     - Domain.Football
     - PII.None
 columns:
-  - name: match_id_canonical
+  - name: match_id
     description: FK -> dim_match.match_id (currently ESPN match_id; bridge via xref_match in E1.5).
-  - name: team_id_canonical
+  - name: team_id
     description: FK -> dim_team.team_id.
-  - name: player_id_canonical
+  - name: player_id
     description: FK -> dim_player.player_id (NULL until cross-source player xref ships).
-  - name: player_name
-    description: Raw player display name from ESPN.
   - name: is_starter
     description: TRUE for starting XI, FALSE for substitutes / unused subs.
-  - name: position_canonical
+  - name: position
     description: ESPN position string (passthrough; not yet enum-normalised).
   - name: jersey_number
     description: Shirt number worn in this match.
+  - name: is_captain
+    description: >-
+      Captaincy flag — typed NULL placeholder. Neither FBref nor ESPN lineup
+      feeds carry captaincy; SofaScore enrichment is a #426 followup.
   - name: lineup_source
     description: Source system (currently 'espn'; whoscored adds in E5).
+  - name: lineup_version
+    description: Schema version of this fact (literal 'v1').
   - name: league
     description: League slug.
   - name: season
     description: Season slug.
+  - name: _silver_created_at
+    description: >-
+      Технический timestamp: инжектируется runner'ом (run_silver_transform)
+      поверх SQL.
 relationships:
   - from: trino_iceberg.iceberg.gold.fct_lineup
     to:   trino_iceberg.iceberg.gold.dim_team
     type: FOREIGN_KEY
-    description: team_id_canonical -> dim_team.team_id
+    description: team_id -> dim_team.team_id

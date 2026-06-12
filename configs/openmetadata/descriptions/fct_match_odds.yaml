@@ -5,32 +5,51 @@ table:
   fullyQualifiedName: trino_iceberg.iceberg.gold.fct_match_odds
   description: |
     Pre-match betting odds (E4). Source: silver.matchhistory_match_odds
-    (football-data.co.uk). One row per (match, bookmaker, market, closing_flag).
+    (football-data.co.uk). #426 reshaped the grain: one row per
+    (match, bookmaker, market, is_closing), where market ∈ {'1x2','ah','ou_2_5'}
+    and the three odds columns (odds_home/draw/away) carry the outcomes of that
+    market group. Replaces the old tall (market, odd_value) layout.
   tags:
     - Tier.Gold
     - Domain.Football
     - PII.None
 columns:
-  - name: odds_canonical
-    description: Logical PK (xxhash64 over match|bookmaker|market|closing_flag).
-  - name: match_id_canonical
+  - name: match_id
     description: FK -> dim_match.match_id.
   - name: bookmaker
-    description: Bookmaker code (e.g. 'B365', 'PSC').
+    description: Bookmaker code ('B365' | 'PS' | 'WH' | 'VC' | 'IW' | 'BW' | 'AVG' | 'MAX').
   - name: market
-    description: Market type (e.g. 'home_win', 'draw', 'away_win', 'over_25').
-  - name: odd_value
-    description: Decimal odds value.
-  - name: closing_flag
+    description: Market group ('1x2' | 'ah' | 'ou_2_5').
+  - name: odds_home
+    description: Decimal odds — 1x2.home OR ah.home OR ou.over (depending on market).
+  - name: odds_draw
+    description: Decimal odds — 1x2.draw; NULL for 'ah' / 'ou_2_5'.
+  - name: odds_away
+    description: Decimal odds — 1x2.away OR ah.away OR ou.under (depending on market).
+  - name: ah_line
+    description: Asian-handicap line; NULL outside market='ah'.
+  - name: ou_line
+    description: Over/Under line (=2.5); NULL outside market='ou_2_5'.
+  - name: is_closing
     description: TRUE for closing-line odds, FALSE for opening.
+  - name: odds_canonical
+    description: Logical PK — xxhash64 over (match_id | bookmaker | market | is_closing).
   - name: odds_source
-    description: Source label ('matchhistory').
+    description: Source label (literal 'matchhistory').
+  - name: odds_version
+    description: Schema version of this fact (literal 'v1').
   - name: league
-    description: League slug.
+    description: League slug (partition key).
   - name: season
     description: Season — varchar slug ('2425' = сезон 2024/25). Partition key.
+  - name: _ingested_at
+    description: Bronze provenance timestamp.
+  - name: _silver_created_at
+    description: >-
+      Технический timestamp: инжектируется runner'ом (run_silver_transform)
+      поверх SQL.
 relationships:
   - from: trino_iceberg.iceberg.gold.fct_match_odds
     to:   trino_iceberg.iceberg.gold.dim_match
     type: FOREIGN_KEY
-    description: match_id_canonical -> dim_match.match_id
+    description: match_id -> dim_match.match_id
