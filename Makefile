@@ -277,8 +277,9 @@ superset-import:
 	@docker compose exec superset python /app/pythonpath/import_datasources.py
 
 # E7: Import declarative dashboards from configs/superset/dashboards/*.py
+# (#496: оркестратор живёт в dashboards/ — top-level копия не монтировалась)
 superset-dashboards:
-	@docker compose exec superset python /app/pythonpath/import_dashboards.py
+	@docker compose exec superset python /app/pythonpath/dashboards/import_dashboards.py
 
 # Run OpenMetadata Trino schema ingestion workflow
 om-ingest-trino:
