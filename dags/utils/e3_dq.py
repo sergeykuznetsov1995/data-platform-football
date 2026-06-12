@@ -919,6 +919,20 @@ def _build_fct_lineup_checks() -> List[Check]:
             name='lineup_orphan_player_rate',
         ),
 
+        # is_captain coverage (#439) — SofaScore /lineups enrich the FBref
+        # canonical (match, player) via xref_match + xref_player. WARNING-only:
+        # coverage is partial by design (SofaScore /lineups ⊂ FBref lineups).
+        # Live 2026-06-12: 14,507 enriched rows (760 captains) of 142,868 FBref
+        # rows. Floor well below that catches a total bridge regression while
+        # tolerating partial backfills.
+        CHECK.row_count(
+            table=table,
+            min_rows=5_000,
+            where="is_captain IS NOT NULL",
+            severity='WARNING',
+            name='is_captain_coverage_present',
+        ),
+
         CHECK.freshness(
             table=table,
             ts_col='_silver_created_at',
