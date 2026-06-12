@@ -50,6 +50,15 @@ SELECT
     CAST(team_id AS varchar)               AS team_id,
     team_name,
     is_home,
+    -- is_captain (#439): bronze.captain is varchar 'True'/'False' (from the
+    -- /lineups overlay, #301 — confirmed live 760 'True' / 14.4K 'False').
+    -- Conform to boolean via CASE, NOT TRY_CAST(boolean) which would silently
+    -- NULL the capitalised literals. NULL = lineup overlay missed for this row.
+    CASE
+        WHEN captain = 'True'  THEN true
+        WHEN captain = 'False' THEN false
+        ELSE NULL
+    END                                    AS is_captain,
     position,
     position_specific,
 

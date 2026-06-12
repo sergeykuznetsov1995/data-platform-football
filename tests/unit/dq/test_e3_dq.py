@@ -82,17 +82,18 @@ class TestCheckCounts:
         assert len(espn) == 4
 
     def test_gold_e3_total_check_count(self):
-        """Gold builders total: fct_event (11) + fct_shot (7) + fct_lineup (9) = 27.
+        """Gold builders total: fct_event (11) + fct_shot (7) + fct_lineup (10) = 28.
 
         fct_event grew by 1 check in Task 2.1 — Phase B re-enabled the
         ``ref_integrity[fct_event.match_id_canonical -> silver.xref_match]``
         gate that was disabled during the v0_unbridged interim.
         fct_lineup grew by 1 in issue #242 — added the canon-spine
-        ``ref_integrity[fct_lineup.fbref->dim_match]`` alt-hex guard.
+        ``ref_integrity[fct_lineup.fbref->dim_match]`` alt-hex guard — and by 1
+        more in #439 (``is_captain_coverage_present``).
         """
         checks = e3_dq.build_gold_e3_checks()
-        assert len(checks) == 27, (
-            f"Gold E3 expected 27 checks, got {len(checks)}: "
+        assert len(checks) == 28, (
+            f"Gold E3 expected 28 checks, got {len(checks)}: "
             f"{[c.name for c in checks]}"
         )
 
@@ -129,16 +130,16 @@ class TestCheckCounts:
             if c.params.get("table") == "iceberg.gold.fct_lineup"
             or c.params.get("child") == "gold.fct_lineup"
         ]
-        assert len(fct_lineup) == 9
+        assert len(fct_lineup) == 10
 
     def test_build_all_e3_checks_total(self):
-        """31 silver + 27 gold = 58 total E3 standard DQ checks.
+        """31 silver + 28 gold = 59 total E3 standard DQ checks.
 
         Bump when either ``build_silver_e3_checks`` (31) or
-        ``build_gold_e3_checks`` (27) gains a builder.
+        ``build_gold_e3_checks`` (28) gains a builder.
         """
         all_checks = e3_dq.build_all_e3_checks()
-        assert len(all_checks) == 58
+        assert len(all_checks) == 59
 
 
 # ===========================================================================
@@ -503,6 +504,24 @@ class TestOrphanAndCoverageGuards:
         checks = e3_dq.build_gold_e3_checks()
         ln = [c for c in checks if c.name == "lineup_orphan_player_rate"]
         assert len(ln) == 1
+
+    def test_is_captain_coverage_present(self):
+        """#439: a WARNING coverage guard for SofaScore-sourced is_captain."""
+        checks = e3_dq.build_gold_e3_checks()
+        cap = [c for c in checks if c.name == "is_captain_coverage_present"]
+        assert len(cap) == 1
+        assert cap[0].severity == "WARNING"
+        assert cap[0].params["where"] == "is_captain IS NOT NULL"
+
+    def test_lineup_orphan_player_rate_scoped_to_fbref(self):
+        """#519: orphan rate must measure FBref rows only — ESPN player_id is
+        NULL by design (no ESPN resolver), so an unscoped guard is permanent
+        noise. Cap re-derived from FBref row count (10% × 145K)."""
+        checks = e3_dq.build_gold_e3_checks()
+        ln = next(c for c in checks if c.name == "lineup_orphan_player_rate")
+        assert ln.severity == "WARNING"
+        assert "lineup_source = 'fbref'" in ln.params["where"]
+        assert ln.params["max_rows"] == int(0.10 * 145_000)
 
     def test_spadl_unknown_rate_capped(self):
         """spadl_coverage_unknown_rate must cap at 40K rows (R3 baseline 17.5K

@@ -466,6 +466,8 @@ _ICEBERG_TO_LOCAL = {
     "iceberg.silver.xref_match":             "silver_xref_match",
     "iceberg.silver.xref_team":              "silver_xref_team",
     "iceberg.silver.xref_player":            "silver_xref_player",
+    "iceberg.silver.sofascore_player_match_aggregate":
+        "silver_sofascore_player_match_aggregate",
 }
 
 
@@ -557,11 +559,17 @@ def bridge_conn(duck_conn):
     )
     duck_conn.execute(
         "CREATE TABLE silver_xref_match "
-        "(source VARCHAR, source_id VARCHAR, canonical_id VARCHAR)"
+        "(source VARCHAR, source_id VARCHAR, canonical_id VARCHAR, "
+        "league VARCHAR, season VARCHAR, confidence VARCHAR)"
+    )
+    duck_conn.execute(
+        "CREATE TABLE silver_sofascore_player_match_aggregate "
+        "(match_id VARCHAR, player_id VARCHAR, league VARCHAR, season VARCHAR, "
+        "is_captain BOOLEAN)"
     )
     duck_conn.execute(
         "CREATE TABLE silver_xref_team (source VARCHAR, source_id VARCHAR, "
-        "canonical_id VARCHAR, league VARCHAR, season VARCHAR)"
+        "canonical_id VARCHAR, league VARCHAR, season VARCHAR, confidence VARCHAR)"
     )
     duck_conn.execute(
         "CREATE TABLE silver_xref_player (source VARCHAR, source_id VARCHAR, "
@@ -579,10 +587,10 @@ def _seed_espn_corpus(con, *, fbref_xref_season: str = _SEASON) -> None:
     con.execute(
         """
         INSERT INTO silver_xref_team VALUES
-          ('espn',  'Liverpool', 'liverpool', ?, ?),
-          ('espn',  'Arsenal',   'arsenal',   ?, ?),
-          ('fbref', 'Liverpool', 'liverpool', ?, ?),
-          ('fbref', 'Arsenal',   'arsenal',   ?, ?)
+          ('espn',  'Liverpool', 'liverpool', ?, ?, 'name_alias'),
+          ('espn',  'Arsenal',   'arsenal',   ?, ?, 'name_alias'),
+          ('fbref', 'Liverpool', 'liverpool', ?, ?, 'name_alias'),
+          ('fbref', 'Arsenal',   'arsenal',   ?, ?, 'name_alias')
         """,
         [_LEAGUE, _SEASON, _LEAGUE, _SEASON,
          _LEAGUE, fbref_xref_season, _LEAGUE, fbref_xref_season],
@@ -650,7 +658,7 @@ class TestEspnBridgeDedup:
         bridge_conn.execute(
             """
             INSERT INTO silver_xref_team VALUES
-              ('fbref', 'Liverpool FC', 'liverpool', ?, '2425')
+              ('fbref', 'Liverpool FC', 'liverpool', ?, '2425', 'name_alias')
             """,
             [_LEAGUE],
         )
@@ -673,7 +681,7 @@ class TestEspnBridgeDedup:
         bridge_conn.execute(
             """
             INSERT INTO silver_xref_team VALUES
-              ('fbref', 'Liverpool FC', 'liverpool', ?, ?)
+              ('fbref', 'Liverpool FC', 'liverpool', ?, ?, 'name_alias')
             """,
             [_LEAGUE, _SEASON],
         )
@@ -713,6 +721,115 @@ class TestEspnBridgeDedup:
         out = _run_lineup_gold(bridge_conn)
         assert len(out) == 1, out
         assert out[0]["match_id"] == _espn_match_id(), out
+
+
+class TestOrphanTeamExcluded:
+    """#506: xref_team rows with confidence='orphan' carry a non-NULL source-
+    prefixed canonical ('fb_<slug>'); the team JOINs must NOT leak them as a
+    resolved team_id. xref_team.sql.j2 contract: orphans excluded from every
+    cross-source Gold JOIN.
+    """
+
+    def _seed_fbref_lineup(self, con, *, confidence: str) -> None:
+        con.execute(
+            """
+            INSERT INTO silver_fbref_match_lineups VALUES
+              (?, 'Orphanton FC', 'Orphan P', '9001', TRUE, 'F', 9, ?, ?,
+               TIMESTAMP '2026-02-01 06:00:00')
+            """,
+            [_FB_HEX, _LEAGUE, _SEASON],
+        )
+        con.execute(
+            "INSERT INTO silver_xref_team VALUES "
+            "('fbref', 'Orphanton FC', 'fb_orphanton_fc', ?, ?, ?)",
+            [_LEAGUE, _SEASON, confidence],
+        )
+
+    def test_orphan_fbref_team_yields_null_team_id(self, bridge_conn):
+        """Orphan xref_team → team_id IS NULL (not the 'fb_<slug>' pseudo-id)."""
+        self._seed_fbref_lineup(bridge_conn, confidence="orphan")
+        out = _run_lineup_gold(bridge_conn)
+        assert len(out) == 1, out
+        assert out[0]["lineup_source"] == "fbref", out
+        assert out[0]["team_id"] is None, (
+            f"orphan xref_team leaked as a resolved team_id: {out}"
+        )
+
+    def test_name_alias_fbref_team_resolves(self, bridge_conn):
+        """Contrast: the SAME row with confidence='name_alias' DOES resolve —
+        proves the NULL above comes from the #506 filter, not a missing row."""
+        self._seed_fbref_lineup(bridge_conn, confidence="name_alias")
+        out = _run_lineup_gold(bridge_conn)
+        assert len(out) == 1, out
+        assert out[0]["team_id"] == "fb_orphanton_fc", out
+
+
+class TestCaptainEnrichment:
+    """#439: is_captain is sourced from SofaScore /lineups via xref_match +
+    xref_player. A FBref lineup row whose canonical (match, player) matches a
+    SofaScore entry inherits its captaincy; absent coverage stays NULL.
+    """
+
+    @staticmethod
+    def _seed_fbref_side(con) -> None:
+        con.execute(
+            """
+            INSERT INTO silver_fbref_match_lineups VALUES
+              (?, 'Liverpool', 'Mo Salah', 'p99', TRUE, 'F', 11, ?, ?,
+               TIMESTAMP '2026-02-01 06:00:00')
+            """,
+            [_FB_HEX, _LEAGUE, _SEASON],
+        )
+        con.execute(
+            "INSERT INTO silver_xref_team VALUES "
+            "('fbref', 'Liverpool', 'liverpool', ?, ?, 'name_alias')",
+            [_LEAGUE, _SEASON],
+        )
+        con.execute(
+            "INSERT INTO silver_xref_player VALUES ('fbref', 'p99', 'fb_p99', ?, ?)",
+            [_LEAGUE, _SEASON],
+        )
+
+    def _seed_sofascore_side(self, con, *, is_captain) -> None:
+        # SofaScore game 'ss1' bridges to the SAME hex canonical; player 'ssp'
+        # resolves to the SAME canonical 'fb_p99' as the FBref lineup row.
+        con.execute(
+            "INSERT INTO silver_xref_match VALUES "
+            "('sofascore', 'ss1', ?, ?, ?, 'date_team_match')",
+            [_FB_HEX, _LEAGUE, _SEASON],
+        )
+        con.execute(
+            "INSERT INTO silver_xref_player VALUES ('sofascore', 'ssp', 'fb_p99', ?, ?)",
+            [_LEAGUE, _SEASON],
+        )
+        con.execute(
+            "INSERT INTO silver_sofascore_player_match_aggregate VALUES "
+            "('ss1', 'ssp', ?, ?, ?)",
+            [_LEAGUE, _SEASON, is_captain],
+        )
+
+    def test_captain_true_enriches_fbref_row(self, bridge_conn):
+        self._seed_fbref_side(bridge_conn)
+        self._seed_sofascore_side(bridge_conn, is_captain=True)
+        out = _run_lineup_gold(bridge_conn)
+        assert len(out) == 1, out
+        assert out[0]["player_id"] == "fb_p99", out
+        assert out[0]["is_captain"] is True, out
+
+    def test_non_captain_resolves_to_false(self, bridge_conn):
+        """A resolved SofaScore non-captain → is_captain False (known), not NULL."""
+        self._seed_fbref_side(bridge_conn)
+        self._seed_sofascore_side(bridge_conn, is_captain=False)
+        out = _run_lineup_gold(bridge_conn)
+        assert len(out) == 1, out
+        assert out[0]["is_captain"] is False, out
+
+    def test_no_sofascore_coverage_leaves_null(self, bridge_conn):
+        """FBref player absent from SofaScore /lineups → is_captain NULL."""
+        self._seed_fbref_side(bridge_conn)
+        out = _run_lineup_gold(bridge_conn)
+        assert len(out) == 1, out
+        assert out[0]["is_captain"] is None, out
 
 
 class TestSqlInvariants:

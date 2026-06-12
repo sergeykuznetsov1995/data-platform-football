@@ -247,11 +247,15 @@ LEFT JOIN event_team_names etn
    AND etn.season      = e.season
 
 -- ---- team xref (whoscored team-name -> canonical) ----
+-- #506: exclude confidence='orphan' rows — they carry a non-NULL source-
+-- prefixed canonical ('ws_<slug>') that would leak through as a resolved id.
+-- xref_team.sql.j2 contract: orphans are excluded from every cross-source JOIN.
 LEFT JOIN iceberg.silver.xref_team xt
     ON xt.source    = 'whoscored'
    AND xt.source_id = etn.team_name_raw
    AND xt.league    = e.league
    AND xt.season    = e.season
+   AND xt.confidence <> 'orphan'
 
 -- ---- player xref (whoscored numeric id -> canonical or ws_ orphan) ----
 -- xref_player has one row per (source, source_id, season) — the resolver

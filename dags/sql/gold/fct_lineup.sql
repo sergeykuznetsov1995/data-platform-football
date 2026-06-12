@@ -93,8 +93,9 @@
 --                                     (FBref Silver also keeps raw position;
 --                                      dim_position deferred until used)
 --   jersey_number         integer  -- NULL for ESPN (matchsheet has no jersey)
---   is_captain            boolean  -- NULL placeholder: neither FBref nor ESPN lineups
---                                     carry captaincy; SofaScore enrichment is a #426 followup
+--   is_captain            boolean  -- SofaScore-sourced (#439): FBref/ESPN lineups
+--                                     carry no captaincy. NULL = no SofaScore /lineups
+--                                     coverage (all ESPN rows; FBref players not in SS)
 --   lineup_source         varchar  -- 'fbref' | 'espn' (winner after dedup)
 --   lineup_version        varchar  -- literal 'v1' (schema versioning hook)
 --   league                varchar
@@ -130,7 +131,12 @@ WITH
 xref_team_by_canonical AS (
     SELECT DISTINCT source, source_id, canonical_id, league, season
     FROM iceberg.silver.xref_team
+    -- #506: canonical_id IS NOT NULL does NOT exclude orphans — orphan rows
+    -- carry a non-NULL source-prefixed canonical ('es_<slug>'/'fb_<slug>').
+    -- Add the contract filter so the ESPN→FBref bridge never matches on a
+    -- pseudo-canonical. xref_team.sql.j2: orphans excluded from cross-source JOIN.
     WHERE canonical_id IS NOT NULL
+      AND confidence <> 'orphan'
 ),
 -- Collapse silver.xref_player (PK source, source_id, season) to one row per
 -- (source, source_id) so the FBref player JOIN below stays 1:1 — see the
@@ -238,6 +244,7 @@ fbref_resolved AS (
        AND xt.source_id = fl.team
        AND xt.league    = fl.league
        AND xt.season    = CAST(fl.season AS varchar)
+       AND xt.confidence <> 'orphan'   -- #506: don't leak 'fb_<slug>' pseudo-canonical
     -- xref_player_dedup (NOT raw silver.xref_player): xref_player PK is
     -- (source, source_id, season), so a raw JOIN on (source, source_id) fans
     -- out 1.5-4× over a player's seasons (#205; same footgun fixed in
@@ -289,6 +296,7 @@ espn_resolved AS (
        AND xt.source_id = el.team
        AND xt.league    = el.league
        AND xt.season    = CAST(el.season AS varchar)
+       AND xt.confidence <> 'orphan'   -- #506: don't leak 'es_<slug>' pseudo-canonical
 ),
 
 -- ============================================================================
@@ -333,22 +341,62 @@ dedup AS (
                 _bronze_ingested_at DESC
         ) AS rn
     FROM all_lineups
+),
+
+-- ============================================================================
+-- 5) SofaScore captain bridge (#439)
+-- ============================================================================
+-- Neither FBref nor ESPN lineup feeds carry captaincy; SofaScore /lineups do
+-- (silver.sofascore_player_match_aggregate.is_captain, conformed to boolean).
+-- Resolve the SofaScore (match, player) to the SAME canonical ids fct_lineup
+-- already keys on, then LEFT JOIN below. Coverage is FBref-only in practice:
+-- ESPN rows have player_id_canonical = NULL (no ESPN resolver), so the
+-- player-id equality never matches and they stay is_captain = NULL.
+--   * (league, season) predicate on BOTH xref JOINs — mandatory, else 1.5-4×
+--     fan-out (xref rows are per-(source, source_id, season)).
+--   * confidence <> 'orphan' on xref_match — a SofaScore-orphan match resolves
+--     to 'ss_<id>' which never equals a FBref hex anyway; filter is the
+--     xref contract (#506) and trims the bridge early.
+--   * GROUP BY (match, player) + MAX(is_captain) — one captaincy verdict per
+--     resolved pair (true wins over false; both win over an absent overlay).
+sofascore_captain AS (
+    SELECT
+        xm.canonical_id                  AS match_id_canonical,
+        xp.canonical_id                  AS player_id_canonical,
+        MAX(spa.is_captain)              AS is_captain
+    FROM iceberg.silver.sofascore_player_match_aggregate spa
+    JOIN iceberg.silver.xref_match xm
+        ON xm.source     = 'sofascore'
+       AND xm.source_id  = spa.match_id
+       AND xm.league     = spa.league
+       AND xm.season     = spa.season
+       AND xm.confidence <> 'orphan'
+    JOIN iceberg.silver.xref_player xp
+        ON xp.source     = 'sofascore'
+       AND xp.source_id  = spa.player_id
+       AND xp.league     = spa.league
+       AND xp.season     = spa.season
+    WHERE spa.is_captain IS NOT NULL
+    GROUP BY 1, 2
 )
 
 SELECT
-    match_id_canonical              AS match_id,
-    team_id_canonical               AS team_id,
-    player_id_canonical             AS player_id,
-    is_starter,
-    position_canonical              AS position,
-    jersey_number,
-    -- is_captain: neither FBref nor ESPN lineup feeds carry captaincy.
-    -- Typed NULL per star design §4.5; SofaScore enrichment is a #426 followup.
-    CAST(NULL AS boolean)           AS is_captain,
-    lineup_source,
+    d.match_id_canonical            AS match_id,
+    d.team_id_canonical             AS team_id,
+    d.player_id_canonical           AS player_id,
+    d.is_starter,
+    d.position_canonical            AS position,
+    d.jersey_number,
+    -- is_captain (#439): SofaScore-sourced; NULL where no SofaScore coverage
+    -- (all ESPN rows, plus FBref players absent from SofaScore /lineups).
+    sc.is_captain                   AS is_captain,
+    d.lineup_source,
     'v1'                            AS lineup_version,
-    league,
-    season
-FROM dedup
-WHERE rn = 1
-  AND match_id_canonical IS NOT NULL
+    d.league,
+    d.season
+FROM dedup d
+LEFT JOIN sofascore_captain sc
+       ON sc.match_id_canonical  = d.match_id_canonical
+      AND sc.player_id_canonical = d.player_id_canonical
+WHERE d.rn = 1
+  AND d.match_id_canonical IS NOT NULL
