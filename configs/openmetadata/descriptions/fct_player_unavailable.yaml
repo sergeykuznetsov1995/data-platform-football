@@ -7,7 +7,9 @@ table:
     Pre-match unavailable / injured / suspended players (E5). Source:
     silver.whoscored_missing_players bridged to FBref match via dim_match
     + dim_player. Orphan-safe: unmapped players keep 'ws_<id>' canonical
-    (deferred to E1.5 cross-source player xref).
+    (deferred to E1.5 cross-source player xref). #426 renamed player_id_canonical
+    to player_id, dropped match_date / player_name, and added a normalised
+    reason enum + raw detail.
   tags:
     - Tier.Gold
     - Domain.Football
@@ -15,20 +17,28 @@ table:
 columns:
   - name: match_id
     description: FK -> dim_match.match_id (FBref-canonical).
-  - name: match_date
-    description: Match date.
   - name: team_id
     description: FK -> dim_team.team_id (player's team for this match).
-  - name: player_id_canonical
-    description: FK -> dim_player.player_id; orphan fallback 'ws_<source_id>'.
-  - name: player_name
-    description: Player display name (raw WhoScored).
+  - name: player_id
+    description: FK -> dim_player.player_id; orphan-safe fallback 'ws_<source_id>' (never NULL).
   - name: reason
-    description: Unavailability reason (injury / suspension / illness / etc.).
+    description: >-
+      Нормализованная причина: 'injury' (injured / unfit) / 'suspension'
+      (suspended) / 'other' (прочее наблюдаемое) / NULL.
+  - name: detail
+    description: >-
+      Сырой ярлык причины из WhoScored (provenance для reason):
+      injured / suspended / unfit / ineligible / other.
+  - name: _silver_ingested_at
+    description: Bronze provenance timestamp (carried from _bronze_ingested_at).
   - name: league
     description: League slug.
   - name: season
     description: Season slug.
+  - name: _silver_created_at
+    description: >-
+      Технический timestamp: инжектируется runner'ом (run_silver_transform)
+      поверх SQL.
 relationships:
   - from: trino_iceberg.iceberg.gold.fct_player_unavailable
     to:   trino_iceberg.iceberg.gold.dim_match
@@ -37,4 +47,4 @@ relationships:
   - from: trino_iceberg.iceberg.gold.fct_player_unavailable
     to:   trino_iceberg.iceberg.gold.dim_player
     type: FOREIGN_KEY
-    description: player_id_canonical -> dim_player.player_id
+    description: player_id -> dim_player.player_id

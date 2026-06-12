@@ -5,8 +5,10 @@ table:
   fullyQualifiedName: trino_iceberg.iceberg.gold.fct_shot
   description: |
     Shot-level fact. Source: bronze.understat_shots bridged to FBref
-    matches via cross-source xG join. Carries Understat xG and canonical
-    body_part / situation / result enums. Grain: one row per shot_id.
+    matches via cross-source xG join. Carries Understat xG and normalised
+    body_part / situation / result enums. #426 renamed *_canonical id columns
+    to plain ids and added psxg + shot_source/shot_version provenance.
+    Grain: one row per shot_id.
   tags:
     - Tier.Gold
     - Domain.Football
@@ -14,13 +16,13 @@ table:
 columns:
   - name: shot_id
     description: Understat shot identifier (PK).
-  - name: match_id_canonical
+  - name: match_id
     description: FK -> dim_match.match_id (FBref-canonical, post xref join).
-  - name: team_id_canonical
+  - name: team_id
     description: FK -> dim_team.team_id (shooting team).
-  - name: player_id_canonical
+  - name: player_id
     description: FK -> dim_player.player_id (shooter; 'u_<id>' if cross-match failed).
-  - name: assist_player_id_canonical
+  - name: assist_player_id
     description: FK -> dim_player.player_id (assist provider; NULL if no assist).
   - name: minute
     description: Match minute.
@@ -28,22 +30,39 @@ columns:
     description: Shot X coordinate (Understat 0-100 scale).
   - name: y
     description: Shot Y coordinate (Understat 0-100 scale).
+  - name: body_part
+    description: Normalised body part (foot / head / other / NULL).
+  - name: situation
+    description: Normalised situation (open_play / corner / free_kick / set_piece / penalty / NULL).
   - name: xg
     description: Expected goals value (Understat model).
-  - name: body_part_canonical
-    description: Canonical body part (head / left_foot / right_foot / other_body).
-  - name: situation_canonical
-    description: Canonical situation (open_play / set_piece / penalty / corner_kick / free_kick / direct_free_kick).
-  - name: result_canonical
-    description: Canonical result (goal / saved / missed / blocked / post / own_goal).
+  - name: psxg
+    description: >-
+      Post-shot xG — typed NULL placeholder. Only FBref shot events carry
+      post-shot xG and that feed is dead since 2026-02; historical backfill
+      is a #426 followup.
+  - name: result
+    description: Normalised result (goal / saved / blocked / off_target / post / own_goal).
   - name: is_goal
-    description: TRUE when result_canonical IN ('goal', 'own_goal').
+    description: TRUE when result IN ('goal', 'own_goal').
+  - name: shot_source
+    description: Source provenance label (literal 'understat_v1').
+  - name: shot_version
+    description: Schema version of this fact (literal 'v1').
+  - name: league
+    description: League slug.
+  - name: season
+    description: Season — varchar slug ('2425' = сезон 2024/25).
+  - name: _silver_created_at
+    description: >-
+      Технический timestamp: инжектируется runner'ом (run_silver_transform)
+      поверх SQL.
 relationships:
   - from: trino_iceberg.iceberg.gold.fct_shot
     to:   trino_iceberg.iceberg.gold.dim_match
     type: FOREIGN_KEY
-    description: match_id_canonical -> dim_match.match_id
+    description: match_id -> dim_match.match_id
   - from: trino_iceberg.iceberg.gold.fct_shot
     to:   trino_iceberg.iceberg.gold.dim_player
     type: FOREIGN_KEY
-    description: player_id_canonical -> dim_player.player_id
+    description: player_id -> dim_player.player_id
