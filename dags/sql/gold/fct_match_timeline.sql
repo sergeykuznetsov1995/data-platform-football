@@ -17,6 +17,12 @@
 --                                           minute mismatches between sources
 --                                           would double goals and break the
 --                                           running score / dense event_seq.
+--                                           Gate is two-legged (#459): by
+--                                           match_id AND by physical identity
+--                                           (league, season, date, canonical
+--                                           teams) so an unbridged WS twin of
+--                                           an FBref-covered match can't
+--                                           double-enter under the raw id.
 --   iceberg.bronze.whoscored_schedule     — bridge spine (game_id → date/home/away)
 --   iceberg.silver.fbref_match_enriched   — bridge target (FBref hex match_id)
 --   iceberg.silver.xref_match/team/player — canonical resolvers
@@ -210,12 +216,16 @@ ws_schedule_dedup AS (
     FROM iceberg.bronze.whoscored_schedule
 ),
 
--- Pre-aggregate distinct (canonical_id, source_id) pairs WITHIN a league to
--- avoid season-format mismatch — xref_team passes native season per source
--- (ws='2425', fb='2024'), so dropping season here is intentional (same
--- pattern as fct_card.sql).
+-- #459: xref_team is season-grained (PK = source, source_id, league, season;
+-- season is the compact slug '2425' for ALL sources since #404 — the old
+-- "ws='2425' vs fb='2024' format mismatch" justification for dropping season
+-- no longer holds). Without the season key one canonical_id expands to every
+-- historical FBref name variant ('Newcastle Utd' / 'Newcastle United'); the
+-- variant that misses fme.home/away produced a second bridge row with
+-- fbref_match_id = NULL and duplicated WhoScored events under
+-- 'whoscored_raw_<game_id>' (same pattern as fct_card.sql).
 xref_team_canonical AS (
-    SELECT DISTINCT source, source_id, canonical_id, league
+    SELECT DISTINCT source, source_id, canonical_id, league, season
     FROM iceberg.silver.xref_team
     WHERE canonical_id IS NOT NULL
 ),
@@ -228,6 +238,7 @@ ws_match_bridge AS (
         CAST(s.game_id AS varchar)               AS ws_game_id,
         s.league                                 AS league,
         s.season                                 AS ws_season,
+        CAST(s.date AS date)                     AS match_date,     -- #459: identity-gate key
         s.home_team                              AS home_team_name,
         s.away_team                              AS away_team_name,
         xt_home_ws.canonical_id                  AS home_team_id,
@@ -238,18 +249,22 @@ ws_match_bridge AS (
         ON xt_home_ws.source    = 'whoscored'
        AND xt_home_ws.source_id = s.home_team
        AND xt_home_ws.league    = s.league
+       AND xt_home_ws.season    = s.season          -- #459
     LEFT JOIN xref_team_canonical xt_away_ws
         ON xt_away_ws.source    = 'whoscored'
        AND xt_away_ws.source_id = s.away_team
        AND xt_away_ws.league    = s.league
+       AND xt_away_ws.season    = s.season          -- #459
     LEFT JOIN xref_team_canonical xt_home_fb
         ON xt_home_fb.source       = 'fbref'
        AND xt_home_fb.canonical_id = xt_home_ws.canonical_id
        AND xt_home_fb.league       = s.league
+       AND xt_home_fb.season       = s.season       -- #459
     LEFT JOIN xref_team_canonical xt_away_fb
         ON xt_away_fb.source       = 'fbref'
        AND xt_away_fb.canonical_id = xt_away_ws.canonical_id
        AND xt_away_fb.league       = s.league
+       AND xt_away_fb.season       = s.season       -- #459
     LEFT JOIN iceberg.silver.fbref_match_enriched fme
         ON fme.league = s.league
        AND fme.home   = xt_home_fb.source_id
@@ -360,7 +375,12 @@ ws_resolved AS (
         CAST('whoscored' AS varchar)                         AS event_source,
         wc.league                                            AS league,
         wc.season                                            AS season,
-        wc._ingested_at                                      AS _ingested_at
+        wc._ingested_at                                      AS _ingested_at,
+        -- #459: bridge identity for the ws_only identity gate — filtered out
+        -- of the final output by `unified`'s explicit projection.
+        mb.match_date                                        AS bridge_match_date,
+        mb.home_team_id                                      AS bridge_home_team_id,
+        mb.away_team_id                                      AS bridge_away_team_id
     FROM ws_classified wc
     LEFT JOIN ws_match_bridge mb
         ON mb.ws_game_id = wc.ws_game_id
@@ -392,12 +412,53 @@ fb_match_ids AS (
     SELECT DISTINCT match_id FROM fb_resolved
 ),
 
+-- #459: physical-identity keys of every FBref-covered match. When the
+-- WhoScored→FBref bridge fails, the WS match enters under
+-- 'whoscored_raw_<game_id>' and the match_id gate alone cannot see that the
+-- same physical match already has FBref events — double counting in
+-- league/season aggregates. Identity = (league, season, date, canonical
+-- home/away). INNER JOINs: an FBref match without an fme row or without
+-- season-scoped canonicals contributes no key (safe direction — the WS twin
+-- is kept rather than wrongly dropped).
+fb_match_keys AS (
+    SELECT
+        f.league                                 AS league,
+        f.season                                 AS season,
+        fme.date                                 AS match_date,
+        xt_home.canonical_id                     AS home_team_id,
+        xt_away.canonical_id                     AS away_team_id
+    FROM (SELECT DISTINCT match_id, league, season FROM fb_resolved) f
+    JOIN iceberg.silver.fbref_match_enriched fme
+        ON fme.match_id = f.match_id
+    JOIN xref_team_canonical xt_home
+        ON xt_home.source    = 'fbref'
+       AND xt_home.source_id = fme.home
+       AND xt_home.league    = f.league
+       AND xt_home.season    = f.season
+    JOIN xref_team_canonical xt_away
+        ON xt_away.source    = 'fbref'
+       AND xt_away.source_id = fme.away
+       AND xt_away.league    = f.league
+       AND xt_away.season    = f.season
+),
+
+-- Two-leg gate: a WS row survives only with NEITHER a match_id twin NOR a
+-- physical-identity twin in the FBref branch. Rows whose bridge identity is
+-- unresolvable (orphan xref, no schedule row) can never satisfy the equality
+-- join → they are kept under the raw id, never wrongly dropped.
 ws_only AS (
     SELECT w.*
     FROM ws_resolved w
     LEFT JOIN fb_match_ids f
         ON f.match_id = w.match_id
-    WHERE f.match_id IS NULL
+    LEFT JOIN fb_match_keys k
+        ON  k.league       = w.league
+        AND k.season       = w.season
+        AND k.match_date   = w.bridge_match_date
+        AND k.home_team_id = w.bridge_home_team_id
+        AND k.away_team_id = w.bridge_away_team_id
+    WHERE f.match_id   IS NULL      -- no match_id twin
+      AND k.match_date IS NULL      -- no physical-identity twin (#459)
 ),
 
 unified AS (

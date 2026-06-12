@@ -109,12 +109,16 @@ ws_schedule_dedup AS (
 ),
 
 -- 4) WhoScored → FBref match_id bridge
--- Pre-aggregate distinct (canonical_id, source_id) pairs WITHIN a league to
--- avoid season-format mismatch — xref_team passes native season per source
--- (ws='2425', fb='2024'), so dropping season here is intentional. Cross-league
--- ambiguity is impossible because fbref_match_enriched re-applies league.
+-- #459: xref_team is season-grained (PK = source, source_id, league, season;
+-- season is the compact slug '2425' for ALL sources since #404 — the old
+-- "ws='2425' vs fb='2024' format mismatch" justification for dropping season
+-- no longer holds). Without the season key one canonical_id expands to every
+-- historical FBref name variant ('Newcastle Utd' / 'Newcastle United'); the
+-- variant that misses fme.home/away produced a second bridge row with
+-- fbref_match_id = NULL and duplicated WhoScored events under
+-- 'whoscored_raw_<game_id>'.
 xref_team_canonical AS (
-    SELECT DISTINCT source, source_id, canonical_id, league
+    SELECT DISTINCT source, source_id, canonical_id, league, season
     FROM iceberg.silver.xref_team
     WHERE canonical_id IS NOT NULL
 ),
@@ -131,18 +135,22 @@ ws_match_bridge AS (
         ON xt_home_ws.source    = 'whoscored'
        AND xt_home_ws.source_id = s.home_team
        AND xt_home_ws.league    = s.league
+       AND xt_home_ws.season    = s.season          -- #459
     LEFT JOIN xref_team_canonical xt_away_ws
         ON xt_away_ws.source    = 'whoscored'
        AND xt_away_ws.source_id = s.away_team
        AND xt_away_ws.league    = s.league
+       AND xt_away_ws.season    = s.season          -- #459
     LEFT JOIN xref_team_canonical xt_home_fb
         ON xt_home_fb.source       = 'fbref'
        AND xt_home_fb.canonical_id = xt_home_ws.canonical_id
        AND xt_home_fb.league       = s.league
+       AND xt_home_fb.season       = s.season       -- #459
     LEFT JOIN xref_team_canonical xt_away_fb
         ON xt_away_fb.source       = 'fbref'
        AND xt_away_fb.canonical_id = xt_away_ws.canonical_id
        AND xt_away_fb.league       = s.league
+       AND xt_away_fb.season       = s.season       -- #459
     LEFT JOIN iceberg.silver.fbref_match_enriched fme
         ON fme.league = s.league
        AND fme.home   = xt_home_fb.source_id
