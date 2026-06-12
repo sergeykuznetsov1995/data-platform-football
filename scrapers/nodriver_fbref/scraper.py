@@ -32,6 +32,7 @@ import asyncio
 import gc
 import logging
 import time
+from collections import Counter
 from typing import Any, Dict, List, Optional
 
 import pandas as pd
@@ -165,6 +166,21 @@ class NodriverFBrefScraper(BaseScraper):
             'proxy_rotations': 0,
         })
 
+        # Issue #131: real-traffic accumulator base — preserves proxy bytes /
+        # CF counters across browser restarts (each new NodriverBypass resets
+        # its own counters to 0). Flushed in _close_browser() before the
+        # browser is torn down; read back in _update_real_traffic_stats().
+        # Mirrors FBrefBrowserMixin (scrapers/fbref/browser_manager.py).
+        self._real_traffic_base_bytes: int = 0
+        self._real_traffic_base_requests: int = 0
+        self._real_traffic_base_bytes_by_rtype: Counter = Counter()
+        self._real_traffic_base_requests_by_rtype: Counter = Counter()
+        self._cf_challenge_attempts_base: int = 0
+        self._cf_challenges_passed_base: int = 0
+        self._cf_challenges_failed_base: int = 0
+        self._restart_reasons_base: Counter = Counter()
+        self._resource_type_cache_misses_base: int = 0
+
         logger.info(
             f"NodriverFBrefScraper initialized: "
             f"leagues={self.leagues}, seasons={self.seasons}, "
@@ -238,9 +254,101 @@ class NodriverFBrefScraper(BaseScraper):
             self._browser = self._create_browser()
         return self._browser
 
+    def _flush_browser_traffic(self) -> None:
+        """Accumulate live browser traffic counters into the persistent base.
+
+        Issue #131: each NodriverBypass instance tracks proxy bytes / CF
+        challenges only for its own lifetime and resets on restart. Call this
+        BEFORE tearing the browser down (in _close_browser) so the numbers
+        survive restarts and reach the runner diagnostics. Mirrors the flush
+        block in scrapers/fbref/browser_manager.py::_close_browser.
+        """
+        if self._browser is None or not hasattr(self._browser, 'get_real_traffic_stats'):
+            return
+        try:
+            real = self._browser.get_real_traffic_stats()
+            self._real_traffic_base_bytes += real.get('real_bytes_downloaded', 0)
+            self._real_traffic_base_requests += real.get('real_requests_count', 0)
+            for k, v in (real.get('real_bytes_by_resource_type') or {}).items():
+                self._real_traffic_base_bytes_by_rtype[k] += v
+            for k, v in (real.get('real_requests_by_resource_type') or {}).items():
+                self._real_traffic_base_requests_by_rtype[k] += v
+            self._cf_challenge_attempts_base += int(real.get('cf_challenge_attempts', 0) or 0)
+            self._cf_challenges_passed_base += int(real.get('cf_challenges_passed', 0) or 0)
+            self._cf_challenges_failed_base += int(real.get('cf_challenges_failed', 0) or 0)
+            self._resource_type_cache_misses_base += int(
+                real.get('resource_type_cache_misses', 0) or 0
+            )
+            for k, v in (real.get('restart_reasons') or {}).items():
+                self._restart_reasons_base[k] += v
+            if real.get('real_bytes_downloaded', 0) > 0:
+                logger.info(
+                    f"Session proxy traffic: "
+                    f"{real['real_bytes_downloaded'] / 1024 / 1024:.1f} MB "
+                    f"over {real.get('real_requests_count', 0)} requests "
+                    f"(total accumulated: "
+                    f"{self._real_traffic_base_bytes / 1024 / 1024:.1f} MB)"
+                )
+        except Exception as e:
+            logger.debug(f"Could not flush traffic stats: {e}")
+
+    def _update_real_traffic_stats(self) -> None:
+        """Merge accumulated base + live browser counters into self._stats.
+
+        Issue #131: the runner's _get_traffic_diagnostics() calls this hook
+        (via hasattr) to pull a fresh snapshot before writing the traffic JSON.
+        When called mid-session the browser is still alive (base may be 0), so
+        we add the current session's counters on top of the accumulated base.
+        Direct mirror of FBrefBrowserMixin._sync_real_traffic_stats().
+        """
+        session: Dict[str, Any] = {}
+        if self._browser is not None and hasattr(self._browser, 'get_real_traffic_stats'):
+            try:
+                session = self._browser.get_real_traffic_stats()
+            except Exception:
+                session = {}
+
+        self._stats['real_bytes_downloaded'] = (
+            self._real_traffic_base_bytes + session.get('real_bytes_downloaded', 0)
+        )
+        self._stats['real_requests_count'] = (
+            self._real_traffic_base_requests + session.get('real_requests_count', 0)
+        )
+        bytes_by_rtype = dict(self._real_traffic_base_bytes_by_rtype)
+        reqs_by_rtype = dict(self._real_traffic_base_requests_by_rtype)
+        for k, v in (session.get('real_bytes_by_resource_type') or {}).items():
+            bytes_by_rtype[k] = bytes_by_rtype.get(k, 0) + v
+        for k, v in (session.get('real_requests_by_resource_type') or {}).items():
+            reqs_by_rtype[k] = reqs_by_rtype.get(k, 0) + v
+        self._stats['real_bytes_by_resource_type'] = bytes_by_rtype
+        self._stats['real_requests_by_resource_type'] = reqs_by_rtype
+        self._stats['cf_challenge_attempts'] = (
+            self._cf_challenge_attempts_base
+            + int(session.get('cf_challenge_attempts', 0) or 0)
+        )
+        self._stats['cf_challenges_passed'] = (
+            self._cf_challenges_passed_base
+            + int(session.get('cf_challenges_passed', 0) or 0)
+        )
+        self._stats['cf_challenges_failed'] = (
+            self._cf_challenges_failed_base
+            + int(session.get('cf_challenges_failed', 0) or 0)
+        )
+        restart_reasons = dict(self._restart_reasons_base)
+        for k, v in (session.get('restart_reasons') or {}).items():
+            restart_reasons[k] = restart_reasons.get(k, 0) + v
+        self._stats['restart_reasons'] = restart_reasons
+        self._stats['resource_type_cache_misses'] = (
+            self._resource_type_cache_misses_base
+            + int(session.get('resource_type_cache_misses', 0) or 0)
+        )
+
     def _close_browser(self) -> None:
         """Close browser and cleanup with aggressive memory release."""
         if self._browser is not None:
+            # Issue #131: snapshot proxy-traffic counters into the persistent
+            # base before the browser (and its counters) go away.
+            self._flush_browser_traffic()
             try:
                 self._browser.close_sync()
                 logger.info("Closed nodriver browser")

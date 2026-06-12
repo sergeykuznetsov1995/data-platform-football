@@ -239,3 +239,91 @@ class TestResourceTypeDetection:
         stats = bypass.get_real_traffic_stats()
         assert stats['resource_type_cache_misses'] == 1
         assert stats['real_bytes_by_resource_type'] == {'Document': 100, 'Other': 50}
+
+
+# Mock IcebergWriter at module level to prevent Trino connection attempts
+# during BaseScraper.__init__() (same pattern as test_nodriver_fbref_scraper).
+ICEBERG_WRITER_PATCH = 'scrapers.base.base_scraper.IcebergWriter'
+
+
+def _nonzero_traffic_stats() -> dict:
+    """Realistic non-zero NodriverBypass.get_real_traffic_stats() payload."""
+    return {
+        'real_bytes_downloaded': 1_500_000,
+        'real_requests_count': 12,
+        'real_bytes_by_resource_type': {'Document': 1_200_000, 'Script': 300_000},
+        'real_requests_by_resource_type': {'Document': 1, 'Script': 11},
+        'resource_type_cache_misses': 2,
+        'cf_challenge_attempts': 3,
+        'cf_challenges_passed': 2,
+        'cf_challenges_failed': 1,
+        'restart_reasons': {'page_limit': 1},
+    }
+
+
+class TestNodriverFBrefTrafficWiring:
+    """Issue #131: NodriverFBrefScraper must flush NodriverBypass traffic
+    counters into _stats so the runner diagnostics report non-zero MB on the
+    production DAG path (previously always 0)."""
+
+    @pytest.mark.unit
+    @patch(ICEBERG_WRITER_PATCH)
+    def test_update_real_traffic_stats_reads_live_browser(self, mock_iceberg):
+        from scrapers.nodriver_fbref import NodriverFBrefScraper
+
+        scraper = NodriverFBrefScraper()
+        scraper._browser = MagicMock()
+        scraper._browser.get_real_traffic_stats.return_value = _nonzero_traffic_stats()
+
+        scraper._update_real_traffic_stats()
+
+        assert scraper._stats['real_bytes_downloaded'] == 1_500_000
+        assert scraper._stats['real_requests_count'] == 12
+        assert scraper._stats['real_bytes_by_resource_type'] == {
+            'Document': 1_200_000, 'Script': 300_000,
+        }
+        assert scraper._stats['cf_challenge_attempts'] == 3
+        assert scraper._stats['cf_challenges_passed'] == 2
+        assert scraper._stats['cf_challenges_failed'] == 1
+        assert scraper._stats['restart_reasons'] == {'page_limit': 1}
+        assert scraper._stats['resource_type_cache_misses'] == 2
+
+    @pytest.mark.unit
+    @patch(ICEBERG_WRITER_PATCH)
+    def test_end_to_end_diagnostics_nonzero(self, mock_iceberg):
+        # Full wiring: browser counters → _update_real_traffic_stats() (called
+        # by the runner via hasattr) → _stats → _get_traffic_diagnostics().
+        from dags.scripts.run_fbref_scraper import _get_traffic_diagnostics
+        from scrapers.nodriver_fbref import NodriverFBrefScraper
+
+        scraper = NodriverFBrefScraper()
+        scraper._browser = MagicMock()
+        scraper._browser.get_real_traffic_stats.return_value = _nonzero_traffic_stats()
+
+        result = _get_traffic_diagnostics(scraper)
+
+        assert result['real_proxy_mb'] > 0
+        assert result['real_proxy_bytes'] == 1_500_000
+        assert result['real_proxy_requests'] == 12
+        assert result['cf_challenge_attempts'] == 3
+        assert result['real_proxy_mb_by_resource_type']  # non-empty breakdown
+
+    @pytest.mark.unit
+    @patch(ICEBERG_WRITER_PATCH)
+    def test_close_browser_flushes_to_base(self, mock_iceberg):
+        from scrapers.nodriver_fbref import NodriverFBrefScraper
+
+        scraper = NodriverFBrefScraper()
+        scraper._browser = MagicMock()
+        scraper._browser.get_real_traffic_stats.return_value = _nonzero_traffic_stats()
+
+        # Closing the browser must flush counters into the persistent base so
+        # they survive the teardown (mid-scrape restart scenario).
+        scraper._close_browser()
+        assert scraper._browser is None
+
+        # With no live browser, a fresh snapshot still reports the base totals.
+        scraper._update_real_traffic_stats()
+        assert scraper._stats['real_bytes_downloaded'] == 1_500_000
+        assert scraper._stats['cf_challenge_attempts'] == 3
+        assert scraper._stats['restart_reasons'] == {'page_limit': 1}
