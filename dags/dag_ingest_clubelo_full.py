@@ -24,13 +24,9 @@ from airflow import DAG
 from airflow.operators.bash import BashOperator
 from airflow.operators.python import PythonOperator
 
+from utils.clubelo_tasks import validate_data
 from utils.config import LEAGUES, SCHEDULES, DAG_TAGS
 from utils.default_args import LIGHT_ARGS
-
-# Reuse the validation callable from the daily DAG (reads the same result JSON;
-# it already surfaces history_rows). Importing the module does not double-register
-# the daily DAG — Airflow registers DAG objects per dag-file namespace.
-from dag_ingest_clubelo import validate_data
 
 leagues_str = ','.join(LEAGUES)
 
