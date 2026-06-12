@@ -859,7 +859,20 @@ class FBrefDataReaderMixin:
             if not data_list:
                 continue
 
-            combined_df = pd.concat(data_list, ignore_index=True)
+            # Retry passes (#468) and duplicate schedule rows can append a
+            # second frame for the same match before the buffer flushes
+            # (the ['match_id'] DELETE only cleans prior table rows, not
+            # in-frame duplicates). Each frame is a full parse uniformly
+            # tagged with one match_id — keep only the newest per match.
+            latest_by_match = {}
+            for frame in data_list:
+                if frame.empty:
+                    continue
+                latest_by_match[frame['match_id'].iloc[0]] = frame
+            if not latest_by_match:
+                data_list.clear()
+                continue
+            combined_df = pd.concat(latest_by_match.values(), ignore_index=True)
             try:
                 table_path = self.save_to_iceberg(
                     df=combined_df,

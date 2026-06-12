@@ -368,3 +368,103 @@ class TestTrinoTableManagerFastFail:
 
         # Flag should be reset
         assert TrinoTableManager._trino_unreachable is False
+
+
+# ===========================================================================
+# Test: _batch_save_match_data — retry double-append dedup (#468)
+# ===========================================================================
+
+class TestBatchSaveRetryDedup:
+    """#468: a partial match retried within the same flush window must not
+    save two copies of its frames — replace_partitions=['match_id'] DELETE
+    only cleans prior table rows, not in-frame duplicates."""
+
+    @staticmethod
+    def _frame(match_id, marker):
+        return pd.DataFrame({
+            'match_id': [match_id], 'league': ['ENG-Premier League'],
+            'season': [2025], 'pass_marker': [marker],
+        })
+
+    def test_partial_match_retry_saves_exactly_one_copy(self):
+        scraper = StubScraper()
+        scraper._fetch_page = MagicMock(return_value='<html></html>')
+        scraper.save_to_iceberg = MagicMock(
+            side_effect=lambda df, table_name, **kw: f'iceberg.bronze.{table_name}'
+        )
+
+        all_shot_events, all_match_events, all_lineups = [], [], []
+        all_team_stats, all_player_stats, all_managers = [], [], []
+        process_args = (
+            'm1', 'ENG-Premier League', 2025,
+            all_shot_events, all_match_events, all_lineups,
+            all_team_stats, all_player_stats, all_managers,
+        )
+
+        # First pass: lineups/events parse OK but match_player_stats is
+        # missing → the match is 'partial' and gets retried. Retry: full set.
+        with patch('scrapers.fbref.data_readers.extract_tables_from_comments',
+                   return_value={}), \
+             patch('scrapers.fbref.data_readers.parse_shots_table',
+                   return_value=None), \
+             patch('scrapers.fbref.data_readers.parse_events_from_scorebox',
+                   side_effect=[self._frame('m1', 'first'),
+                                self._frame('m1', 'retry')]), \
+             patch('scrapers.fbref.data_readers.parse_lineup_table',
+                   side_effect=[self._frame('m1', 'first'),
+                                self._frame('m1', 'retry')]), \
+             patch('scrapers.fbref.data_readers.parse_team_match_stats_table',
+                   return_value=None), \
+             patch('scrapers.fbref.data_readers.parse_player_match_stats_tables',
+                   side_effect=[None, self._frame('m1', 'retry')]), \
+             patch('scrapers.fbref.data_readers.parse_match_managers',
+                   return_value=None):
+            first_pass = scraper._process_single_match(*process_args)
+            retry_pass = scraper._process_single_match(*process_args)
+
+        # Bug precondition reproduced: partial first pass, both copies buffered
+        assert 'match_player_stats' not in first_pass
+        assert 'match_player_stats' in retry_pass
+        assert len(all_lineups) == 2
+
+        scraper._batch_save_match_data(
+            all_shot_events, all_match_events, all_lineups,
+            results={},
+            all_match_team_stats=all_team_stats,
+            all_match_player_stats=all_player_stats,
+            all_match_managers=all_managers,
+        )
+
+        saved = {
+            c.kwargs['table_name']: c.kwargs['df']
+            for c in scraper.save_to_iceberg.call_args_list
+        }
+        for table in ('fbref_lineups', 'fbref_match_events'):
+            df = saved[table]
+            assert len(df) == 1, f'{table}: duplicate rows saved for m1'
+            assert df['pass_marker'].tolist() == ['retry'], (
+                f'{table}: retry frame must win'
+            )
+        assert len(saved['fbref_match_player_stats']) == 1
+
+    def test_batch_save_dedups_buffered_frames_per_match(self):
+        scraper = StubScraper()
+        scraper.save_to_iceberg = MagicMock(
+            side_effect=lambda df, table_name, **kw: f'iceberg.bronze.{table_name}'
+        )
+        lineups = [
+            self._frame('m1', 'first'),
+            self._frame('m1', 'retry'),
+            self._frame('m2', 'first'),
+            # Empty frame must be skipped, not crash the dedup loop
+            pd.DataFrame(columns=['match_id', 'league', 'season', 'pass_marker']),
+        ]
+
+        scraper._batch_save_match_data(
+            all_shot_events=[], all_match_events=[], all_lineups=lineups,
+            results={},
+        )
+
+        df = scraper.save_to_iceberg.call_args.kwargs['df']
+        assert sorted(df['match_id']) == ['m1', 'm2']
+        assert df.set_index('match_id').loc['m1', 'pass_marker'] == 'retry'

@@ -179,3 +179,58 @@ class TestSingleStatExitCode:
         assert len(result['errors']) > 0, (
             "Error should be recorded for empty single_stat"
         )
+
+
+class TestNodriverImportFailure:
+    """#468: ImportError of NodriverFBrefScraper must fail the run loudly.
+
+    The old 'fall through to selenium' fallback was dead code: the else
+    branch belonged to an already-evaluated if, so control jumped straight
+    to result writing and non-critical modes finished green with zero
+    tables (silent failure)."""
+
+    @pytest.fixture
+    def temp_output_file(self):
+        """Create a temporary output file."""
+        fd, path = tempfile.mkstemp(suffix='.json')
+        os.close(fd)
+        yield path
+        if os.path.exists(path):
+            os.unlink(path)
+
+    @pytest.mark.unit
+    def test_nodriver_import_error_exits_1_with_error_recorded(
+        self, temp_output_file
+    ):
+        # Non-critical mode: pre-#468 this finished with exit code 0.
+        sys.argv = ['run_fbref_scraper.py'] + [
+            '--scraper-type', 'nodriver',
+            '--mode', 'single_stat',
+            '--stat-type', 'stats',
+            '--data-category', 'player',
+            '--leagues', 'ENG-Premier League',
+            '--season', '2024',
+            '--output', temp_output_file,
+        ]
+
+        # None entry makes `from scrapers.nodriver_fbref import ...`
+        # raise ImportError inside main().
+        with patch.dict(sys.modules, {'scrapers.nodriver_fbref': None}):
+            import importlib
+            import dags.scripts.run_fbref_scraper as scraper_module
+            importlib.reload(scraper_module)
+            with pytest.raises(SystemExit) as exc_info:
+                scraper_module.main()
+
+        assert exc_info.value.code == 1
+
+        with open(temp_output_file, 'r') as f:
+            result = json.load(f)
+
+        assert result['tables'] == []
+        assert any('NodriverFBrefScraper' in err for err in result['errors']), (
+            "Import failure must be recorded in results['errors']"
+        )
+        assert result['scraper_type'] == 'nodriver', (
+            "scraper_type must not be silently mutated to 'selenium'"
+        )

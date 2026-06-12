@@ -606,10 +606,16 @@ def main():
                     )
 
         except ImportError as e:
-            logger.error(f"Failed to import NodriverFBrefScraper: {e}")
-            logger.info("Falling back to selenium scraper...")
-            args.scraper_type = 'selenium'
-            # Fall through to selenium scraper below
+            # #468: no silent fallback to selenium — it never worked (the
+            # else-branch below belongs to an already-evaluated if), and a
+            # live one would ignore nodriver args and write different table
+            # names. A broken image must fail the DAG loudly.
+            error_msg = f"Failed to import NodriverFBrefScraper: {e}"
+            logger.error(error_msg)
+            results['errors'].append(error_msg)
+            with open(args.output, 'w') as f:
+                json.dump(results, f)
+            sys.exit(1)
 
         except Exception as e:
             logger.error(f"Nodriver scraper failed: {e}", exc_info=True)
