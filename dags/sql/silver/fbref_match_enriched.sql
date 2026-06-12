@@ -53,7 +53,7 @@ sch AS (
     SELECT *,
            ROW_NUMBER() OVER (
                PARTITION BY match_id
-               ORDER BY _ingested_at DESC
+               ORDER BY _ingested_at DESC, _batch_id DESC
            ) AS rn
     FROM sch_raw
 ),
@@ -62,17 +62,18 @@ ts AS (
     SELECT *,
            ROW_NUMBER() OVER (
                PARTITION BY match_id
-               ORDER BY _ingested_at DESC
+               ORDER BY _ingested_at DESC, _batch_id DESC
            ) AS rn
     FROM iceberg.bronze.fbref_match_team_stats
 ),
 
--- Deduplicate events before aggregation (natural key: match_id + minute + player_id + event_type)
+-- Deduplicate events before aggregation (#463) — key MUST stay in sync with
+-- fbref_match_events.sql: NULL-safe player + deterministic tiebreaker.
 events_dedup AS (
     SELECT *,
            ROW_NUMBER() OVER (
-               PARTITION BY match_id, minute, player_id, event_type
-               ORDER BY _ingested_at DESC
+               PARTITION BY match_id, minute, COALESCE(player_id, player), event_type
+               ORDER BY _ingested_at DESC, _batch_id DESC
            ) AS rn
     FROM iceberg.bronze.fbref_match_events
 ),
@@ -96,12 +97,13 @@ events_agg AS (
     GROUP BY match_id
 ),
 
--- Deduplicate lineups before aggregation (natural key: match_id + player_id)
+-- Deduplicate lineups before aggregation (#463) — key MUST stay in sync with
+-- fbref_match_lineups.sql: NULL-safe player + team + deterministic tiebreaker.
 lineups_dedup AS (
     SELECT *,
            ROW_NUMBER() OVER (
-               PARTITION BY match_id, player_id
-               ORDER BY _ingested_at DESC
+               PARTITION BY match_id, COALESCE(player_id, player), team
+               ORDER BY _ingested_at DESC, _batch_id DESC
            ) AS rn
     FROM iceberg.bronze.fbref_lineups
 ),

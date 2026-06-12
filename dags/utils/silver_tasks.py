@@ -608,8 +608,9 @@ def _build_silver_checks(schema: str = 'silver'):
     return [
         # ---- ERROR: PK NULLs (joins / dedup logic break otherwise) ----
         CHECK.no_nulls(f'{schema}.fbref_match_enriched',        cols=['match_id', 'date']),
-        CHECK.no_nulls(f'{schema}.fbref_player_season_profile', cols=['player_id', 'league', 'season']),
-        CHECK.no_nulls(f'{schema}.fbref_keeper_profile',        cols=['player_id', 'league', 'season']),
+        # #463: squad — компонент PK профилей (per-(player, squad) grain).
+        CHECK.no_nulls(f'{schema}.fbref_player_season_profile', cols=['player_id', 'squad', 'league', 'season']),
+        CHECK.no_nulls(f'{schema}.fbref_keeper_profile',        cols=['player_id', 'squad', 'league', 'season']),
         CHECK.no_nulls(f'{schema}.fbref_player_match_stats',    cols=['match_id']),
         CHECK.no_nulls(f'{schema}.fbref_match_events',          cols=['match_id']),
         CHECK.no_nulls(f'{schema}.fbref_match_lineups',         cols=['match_id', 'player_id']),
@@ -617,9 +618,17 @@ def _build_silver_checks(schema: str = 'silver'):
 
         # ---- ERROR: PK uniqueness (duplicates explode downstream facts) ----
         CHECK.no_duplicates(f'{schema}.fbref_match_enriched',        pk=['match_id']),
-        CHECK.no_duplicates(f'{schema}.fbref_player_season_profile', pk=['player_id', 'league', 'season']),
-        CHECK.no_duplicates(f'{schema}.fbref_keeper_profile',        pk=['player_id', 'league', 'season']),
-        CHECK.no_duplicates(f'{schema}.fbref_match_lineups',         pk=['match_id', 'player_id']),
+        # #463: профили per-(player, squad, league, season) — зимний трансфер
+        # внутри лиги даёт 2 строки на игрока-сезон (по одной на клуб).
+        CHECK.no_duplicates(f'{schema}.fbref_player_season_profile', pk=['player_id', 'squad', 'league', 'season']),
+        CHECK.no_duplicates(f'{schema}.fbref_keeper_profile',        pk=['player_id', 'squad', 'league', 'season']),
+        # #463: team в ключе — зеркало дедупа (parse-артефакт «игрок в обеих
+        # командах» теперь не схлопывается молча, а ловится этим чеком).
+        CHECK.no_duplicates(
+            f'{schema}.fbref_match_lineups',
+            pk=['match_id', 'player_id', 'team'],
+            where='player_id IS NOT NULL',
+        ),
         CHECK.no_duplicates(f'{schema}.fbref_team_season_profile',   pk=['team', 'league', 'season']),
         CHECK.no_duplicates(
             f'{schema}.fbref_player_match_stats',

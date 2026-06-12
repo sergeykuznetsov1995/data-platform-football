@@ -7,9 +7,12 @@
 -- Source:
 --   iceberg.bronze.fbref_lineups
 --
--- Deduplication:
---   ROW_NUMBER() OVER (PARTITION BY match_id, player_id
---                       ORDER BY _ingested_at DESC)  =>  rn = 1
+-- Deduplication (#463):
+--   ROW_NUMBER() OVER (PARTITION BY match_id, COALESCE(player_id, player), team
+--                       ORDER BY _ingested_at DESC, _batch_id DESC)  =>  rn = 1
+--   COALESCE guards legacy rows without player_id (otherwise every NULL row
+--   of a match collapses into one partition); team guards same-named players
+--   on opposite sides (mirrors fbref_player_match_stats.sql).
 --
 -- Notes:
 --   * is_starter is already BOOLEAN in Bronze.
@@ -20,8 +23,8 @@
 WITH src AS (
     SELECT *,
            ROW_NUMBER() OVER (
-               PARTITION BY match_id, player_id
-               ORDER BY _ingested_at DESC
+               PARTITION BY match_id, COALESCE(player_id, player), team
+               ORDER BY _ingested_at DESC, _batch_id DESC
            ) AS rn
     FROM iceberg.bronze.fbref_lineups
 )

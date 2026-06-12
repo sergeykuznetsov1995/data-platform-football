@@ -45,10 +45,15 @@ class TestFctPlayerSeasonStatsAuditSql:
         """FBref + FotMob — INNER JOIN (классический FotMob audit subset).
         WhoScored + Understat — LEFT JOIN: добавочные diffs, не сужают spine."""
         sql = _read_sql()
+        # #463: FBref spine идёт через fb_dedup CTE (max-minutes club);
+        # raw silver profile читается внутри CTE.
         assert re.search(
-            r"INNER\s+JOIN\s+iceberg\.silver\.fbref_player_season_profile",
+            r"INNER\s+JOIN\s+fb_dedup\s+fb\b",
             sql, re.IGNORECASE,
-        ), "audit must INNER JOIN на FBref"
+        ), "audit must INNER JOIN fb_dedup (FBref spine)"
+        assert "iceberg.silver.fbref_player_season_profile" in sql, (
+            "fb_dedup CTE must read silver.fbref_player_season_profile"
+        )
         # FotMob INNER-джойнится через CTE fotmob_counts (per-90 → count recompute,
         # issue #174); CTE читает iceberg.silver.fotmob_player_season_profile.
         assert re.search(

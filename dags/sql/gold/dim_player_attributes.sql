@@ -36,6 +36,22 @@
 -- =============================================================================
 
 WITH
+-- #463: silver-профиль per-(player, squad) — multi-squad сезон делает
+-- MAX_BY(squad, season) AS current_team недетерминированным. Pre-dedup до
+-- одной строки на (player, season): max-minutes клуб, tie → squad —
+-- консистентно с team_id в fct_player_season_stats.
+fbref_profile_dedup AS (
+    SELECT * FROM (
+        SELECT *,
+               ROW_NUMBER() OVER (
+                   PARTITION BY player_id, season
+                   ORDER BY minutes DESC NULLS LAST, squad
+               ) AS rn
+        FROM iceberg.silver.fbref_player_season_profile
+        WHERE player_id IS NOT NULL
+    ) WHERE rn = 1
+),
+
 fbref_latest AS (
     SELECT
         player_id,
@@ -43,8 +59,7 @@ fbref_latest AS (
         MAX_BY(born,   season)  AS born_year,
         MAX_BY(nation, season)  AS nationality,
         MAX_BY(squad,  season)  AS current_team
-    FROM iceberg.silver.fbref_player_season_profile
-    WHERE player_id IS NOT NULL
+    FROM fbref_profile_dedup
     GROUP BY player_id
 ),
 

@@ -95,3 +95,22 @@ class TestDimPlayerStarStructure:
         sql = _strip_comments(_read_sql())
         assert "CREATE TABLE" not in sql.upper()
         assert "INSERT INTO" not in sql.upper()
+
+    def test_fbref_profile_dedup_cte(self):
+        """#463: silver profile grain = (player_id, squad, league, season) —
+        MAX_BY(x, season) над multi-squad сезоном недетерминирован (pos может
+        отличаться между клубами). fbref_latest must read a pre-deduped CTE
+        (max-minutes club, tiebreaker squad)."""
+        sql = _strip_comments(_read_sql())
+        assert re.search(r"\bfbref_profile_dedup\s+AS\s*\(", sql, re.IGNORECASE), (
+            "missing fbref_profile_dedup CTE — MAX_BY over multi-squad season "
+            "is nondeterministic (#463)"
+        )
+        assert re.search(
+            r"PARTITION\s+BY\s+player_id\s*,\s*season\s+"
+            r"ORDER\s+BY\s+minutes\s+DESC\s+NULLS\s+LAST\s*,\s*squad",
+            sql, re.IGNORECASE,
+        ), "fbref_profile_dedup must pick max-minutes club per (player, season)"
+        assert re.search(r"FROM\s+fbref_profile_dedup", sql, re.IGNORECASE), (
+            "fbref_latest must read fbref_profile_dedup, not the raw silver table"
+        )

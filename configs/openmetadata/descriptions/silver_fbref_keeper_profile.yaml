@@ -4,13 +4,15 @@
 table:
   fullyQualifiedName: trino_iceberg.iceberg.silver.fbref_keeper_profile
   description: |
-    Широкий профиль вратаря за сезон — один row на (player_id, league, season).
+    Широкий профиль вратаря за сезон — один row на (player_id, squad, league,
+    season): зимний трансфер внутри лиги даёт по строке на каждый клуб (#463).
     Базовая таблица fbref_player_stats отфильтрована до вратарей
     (pos LIKE '%GK%') и склеена с fbref_keeper_keeper (вратарские метрики),
-    fbref_player_shooting и fbref_player_misc по (player_id, league, season).
-    Каждый источник дедуплицируется через ROW_NUMBER ... ORDER BY
-    _ingested_at DESC до JOIN. Все числовые — TRY_CAST.
-    Идентификаторы сырые FBref (canonical-резолюция — в Gold).
+    fbref_player_shooting и fbref_player_misc по (player_id, squad, league,
+    season). Каждый источник дедуплицируется через ROW_NUMBER ... ORDER BY
+    _ingested_at DESC, _batch_id DESC до JOIN. Все числовые — TRY_CAST.
+    Идентификаторы сырые FBref (canonical-резолюция — в Gold; Gold-факты
+    схлопывают мульти-squad сезоны до клуба с максимумом минут).
   tags:
     - Tier.Silver
     - Domain.Football

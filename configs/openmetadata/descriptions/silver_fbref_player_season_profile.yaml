@@ -4,13 +4,15 @@
 table:
   fullyQualifiedName: trino_iceberg.iceberg.silver.fbref_player_season_profile
   description: |
-    Широкий профиль игрока за сезон — один row на (player_id, league, season).
-    Денормализованная склейка 4 Bronze-таблиц по (player_id, league, season):
-    fbref_player_stats (стандарт), fbref_player_shooting (удары),
+    Широкий профиль игрока за сезон — один row на (player_id, squad, league,
+    season): зимний трансфер внутри лиги даёт по строке на каждый клуб (#463).
+    Денормализованная склейка 4 Bronze-таблиц по (player_id, squad, league,
+    season): fbref_player_stats (стандарт), fbref_player_shooting (удары),
     fbref_player_playingtime (игровое время / +-), fbref_player_misc (фолы,
     отборы, навесы). Каждый источник дедуплицируется через ROW_NUMBER ...
-    ORDER BY _ingested_at DESC до JOIN. Все числовые — TRY_CAST.
-    Идентификаторы сырые FBref (canonical-резолюция — в Gold).
+    ORDER BY _ingested_at DESC, _batch_id DESC до JOIN. Все числовые —
+    TRY_CAST. Идентификаторы сырые FBref (canonical-резолюция — в Gold;
+    Gold-факты схлопывают мульти-squad сезоны до клуба с максимумом минут).
   tags:
     - Tier.Silver
     - Domain.Football

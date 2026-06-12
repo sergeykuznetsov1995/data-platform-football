@@ -52,12 +52,33 @@ class TestFctKeeperSeasonStatsSql:
 
     def test_inner_join_keeper_profile(self):
         """fbref_keeper_profile уже фильтрует pos LIKE '%GK%'; INNER JOIN
-        автоматически даёт только вратарей без отдельного WHERE."""
+        автоматически даёт только вратарей без отдельного WHERE.
+        #463: JOIN идёт через fb_dedup CTE (raw silver читается внутри него)."""
         sql = _read_sql()
         assert re.search(
-            r"INNER\s+JOIN\s+iceberg\.silver\.fbref_keeper_profile",
+            r"INNER\s+JOIN\s+fb_dedup\s+fb\b",
             sql, re.IGNORECASE,
-        ), "fct_keeper_season_stats must use INNER JOIN на fbref_keeper_profile"
+        ), "fct_keeper_season_stats must INNER JOIN fb_dedup (keeper spine)"
+        assert "iceberg.silver.fbref_keeper_profile" in sql, (
+            "fb_dedup CTE must read silver.fbref_keeper_profile"
+        )
+
+    def test_fb_dedup_collapses_multi_squad_seasons(self):
+        """#463: silver keeper grain = (player_id, squad, league, season) —
+        gold keeps one row per keeper-season via fb_dedup (max-minutes club,
+        §5.3), deterministic tiebreaker squad."""
+        sql = _strip_comments(_read_sql())
+        assert re.search(r"\bfb_dedup\s+AS\s*\(", sql, re.IGNORECASE), (
+            "missing fb_dedup CTE — multi-squad silver rows would fan out gold PK"
+        )
+        assert re.search(
+            r"ORDER\s+BY\s+minutes\s+DESC\s+NULLS\s+LAST\s*,\s*squad",
+            sql, re.IGNORECASE,
+        ), "fb_dedup must pick max-minutes club deterministically (§5.3)"
+        assert not re.search(
+            r"JOIN\s+iceberg\.silver\.fbref_keeper_profile\s+fb\b",
+            sql, re.IGNORECASE,
+        ), "raw silver keeper profile must be read only inside fb_dedup"
 
     def test_season_slug_passthrough(self):
         """#404: xref season is slug — passed straight through as season_year,
