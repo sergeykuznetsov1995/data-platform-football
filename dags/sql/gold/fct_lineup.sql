@@ -115,13 +115,16 @@ WITH
 -- Reconstructs the same xxhash64 seed used by silver/espn_lineup.sql and
 -- joins to fbref_match_enriched via (date, home_canonical_id, away_canonical_id).
 -- xref_team.canonical_id makes the team-name comparison alias-tolerant.
--- Pre-aggregate xref_team distinct (canonical_id, source_id) pairs WITHIN
--- a league. After #404 xref_team.season is slug for all sources, but
--- canonical_id is league-scoped stable so dropping season from the JOIN here
--- is safe anyway; cross-league ambiguity is impossible because the JOIN to
--- fbref_match_enriched re-applies the league predicate.
+-- #461 (same mechanism as #459 in fct_card/fct_substitution/fct_match_timeline):
+-- xref_team is season-grained (PK = source, source_id, league, season; season
+-- is the compact slug '2526' for ALL sources since #404). Without the season
+-- key one canonical_id expands to every historical FBref name variant; the
+-- variant that misses fme.home/away produces a second bridge row with
+-- fbref_match_id = NULL and duplicates the lineup under the 'espn_<hash>'
+-- pseudo-id (the final dedup partitions by match_id_canonical and cannot
+-- collapse the twins).
 xref_team_by_canonical AS (
-    SELECT DISTINCT source, source_id, canonical_id, league
+    SELECT DISTINCT source, source_id, canonical_id, league, season
     FROM iceberg.silver.xref_team
     WHERE canonical_id IS NOT NULL
 ),
@@ -132,6 +135,22 @@ xref_player_dedup AS (
     SELECT source, source_id, ARBITRARY(canonical_id) AS canonical_id
     FROM iceberg.silver.xref_player
     GROUP BY source, source_id
+),
+-- #461: bronze.espn_schedule re-ingests of the same game must collapse to the
+-- freshest row BEFORE the bridge — a stale duplicate whose team spelling /
+-- date no longer resolves produces a second bridge row with
+-- fbref_match_id = NULL, surfacing the lineup twice (hex + pseudo-id).
+-- Partition by (league, season, game) — exactly the xxhash64 seed of
+-- espn_match_id below — so the bridge emits ≤1 row per espn_match_id.
+espn_schedule_dedup AS (
+    SELECT
+        league, season, game, match_date, home_team, away_team,
+        ROW_NUMBER() OVER (
+            PARTITION BY league, season, game
+            ORDER BY _ingested_at DESC
+        ) AS rn
+    FROM iceberg.bronze.espn_schedule
+    WHERE game IS NOT NULL
 ),
 espn_match_bridge AS (
     SELECT
@@ -144,23 +163,27 @@ espn_match_bridge AS (
         fme.match_id                                        AS fbref_match_id,
         es.league                                           AS league,
         es.season                                           AS season  -- #404: ESPN bronze slug ('2526')
-    FROM iceberg.bronze.espn_schedule es
+    FROM espn_schedule_dedup es
     LEFT JOIN xref_team_by_canonical xt_home_es
         ON xt_home_es.source    = 'espn'
        AND xt_home_es.source_id = es.home_team
        AND xt_home_es.league    = es.league
+       AND xt_home_es.season    = es.season         -- #461
     LEFT JOIN xref_team_by_canonical xt_away_es
         ON xt_away_es.source    = 'espn'
        AND xt_away_es.source_id = es.away_team
        AND xt_away_es.league    = es.league
+       AND xt_away_es.season    = es.season         -- #461
     LEFT JOIN xref_team_by_canonical xt_home_fb
         ON xt_home_fb.source       = 'fbref'
        AND xt_home_fb.canonical_id = xt_home_es.canonical_id
        AND xt_home_fb.league       = es.league
+       AND xt_home_fb.season       = es.season      -- #461
     LEFT JOIN xref_team_by_canonical xt_away_fb
         ON xt_away_fb.source       = 'fbref'
        AND xt_away_fb.canonical_id = xt_away_es.canonical_id
        AND xt_away_fb.league       = es.league
+       AND xt_away_fb.season       = es.season      -- #461
     LEFT JOIN iceberg.silver.fbref_match_enriched fme
         ON fme.league = es.league
        AND fme.home   = xt_home_fb.source_id
@@ -169,7 +192,7 @@ espn_match_bridge AS (
        -- Compare on the date part. Rescheduling within a day is rare for
        -- APL fixtures and surfaces as bridge-miss in DQ.
        AND fme.date   = CAST(es.match_date AS date)
-    WHERE es.game IS NOT NULL
+    WHERE es.rn = 1
 ),
 
 -- ============================================================================
