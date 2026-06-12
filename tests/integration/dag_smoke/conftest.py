@@ -52,6 +52,7 @@ def expected_dag_ids():
         'dag_ingest_sofascore',
         'dag_ingest_espn',
         'dag_ingest_clubelo',
+        'dag_ingest_clubelo_full',
         'dag_ingest_sofifa',
         'dag_master_pipeline',
     ]
@@ -69,5 +70,6 @@ def ingestion_dag_ids():
         'dag_ingest_sofascore',
         'dag_ingest_espn',
         'dag_ingest_clubelo',
+        'dag_ingest_clubelo_full',
         'dag_ingest_sofifa',
     ]
