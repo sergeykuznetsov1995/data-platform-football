@@ -561,7 +561,7 @@ def bridge_conn(duck_conn):
     )
     duck_conn.execute(
         "CREATE TABLE silver_xref_team (source VARCHAR, source_id VARCHAR, "
-        "canonical_id VARCHAR, league VARCHAR, season VARCHAR)"
+        "canonical_id VARCHAR, league VARCHAR, season VARCHAR, confidence VARCHAR)"
     )
     duck_conn.execute(
         "CREATE TABLE silver_xref_player (source VARCHAR, source_id VARCHAR, "
@@ -579,10 +579,10 @@ def _seed_espn_corpus(con, *, fbref_xref_season: str = _SEASON) -> None:
     con.execute(
         """
         INSERT INTO silver_xref_team VALUES
-          ('espn',  'Liverpool', 'liverpool', ?, ?),
-          ('espn',  'Arsenal',   'arsenal',   ?, ?),
-          ('fbref', 'Liverpool', 'liverpool', ?, ?),
-          ('fbref', 'Arsenal',   'arsenal',   ?, ?)
+          ('espn',  'Liverpool', 'liverpool', ?, ?, 'name_alias'),
+          ('espn',  'Arsenal',   'arsenal',   ?, ?, 'name_alias'),
+          ('fbref', 'Liverpool', 'liverpool', ?, ?, 'name_alias'),
+          ('fbref', 'Arsenal',   'arsenal',   ?, ?, 'name_alias')
         """,
         [_LEAGUE, _SEASON, _LEAGUE, _SEASON,
          _LEAGUE, fbref_xref_season, _LEAGUE, fbref_xref_season],
@@ -650,7 +650,7 @@ class TestEspnBridgeDedup:
         bridge_conn.execute(
             """
             INSERT INTO silver_xref_team VALUES
-              ('fbref', 'Liverpool FC', 'liverpool', ?, '2425')
+              ('fbref', 'Liverpool FC', 'liverpool', ?, '2425', 'name_alias')
             """,
             [_LEAGUE],
         )
@@ -673,7 +673,7 @@ class TestEspnBridgeDedup:
         bridge_conn.execute(
             """
             INSERT INTO silver_xref_team VALUES
-              ('fbref', 'Liverpool FC', 'liverpool', ?, ?)
+              ('fbref', 'Liverpool FC', 'liverpool', ?, ?, 'name_alias')
             """,
             [_LEAGUE, _SEASON],
         )
@@ -713,6 +713,47 @@ class TestEspnBridgeDedup:
         out = _run_lineup_gold(bridge_conn)
         assert len(out) == 1, out
         assert out[0]["match_id"] == _espn_match_id(), out
+
+
+class TestOrphanTeamExcluded:
+    """#506: xref_team rows with confidence='orphan' carry a non-NULL source-
+    prefixed canonical ('fb_<slug>'); the team JOINs must NOT leak them as a
+    resolved team_id. xref_team.sql.j2 contract: orphans excluded from every
+    cross-source Gold JOIN.
+    """
+
+    def _seed_fbref_lineup(self, con, *, confidence: str) -> None:
+        con.execute(
+            """
+            INSERT INTO silver_fbref_match_lineups VALUES
+              (?, 'Orphanton FC', 'Orphan P', '9001', TRUE, 'F', 9, ?, ?,
+               TIMESTAMP '2026-02-01 06:00:00')
+            """,
+            [_FB_HEX, _LEAGUE, _SEASON],
+        )
+        con.execute(
+            "INSERT INTO silver_xref_team VALUES "
+            "('fbref', 'Orphanton FC', 'fb_orphanton_fc', ?, ?, ?)",
+            [_LEAGUE, _SEASON, confidence],
+        )
+
+    def test_orphan_fbref_team_yields_null_team_id(self, bridge_conn):
+        """Orphan xref_team → team_id IS NULL (not the 'fb_<slug>' pseudo-id)."""
+        self._seed_fbref_lineup(bridge_conn, confidence="orphan")
+        out = _run_lineup_gold(bridge_conn)
+        assert len(out) == 1, out
+        assert out[0]["lineup_source"] == "fbref", out
+        assert out[0]["team_id"] is None, (
+            f"orphan xref_team leaked as a resolved team_id: {out}"
+        )
+
+    def test_name_alias_fbref_team_resolves(self, bridge_conn):
+        """Contrast: the SAME row with confidence='name_alias' DOES resolve —
+        proves the NULL above comes from the #506 filter, not a missing row."""
+        self._seed_fbref_lineup(bridge_conn, confidence="name_alias")
+        out = _run_lineup_gold(bridge_conn)
+        assert len(out) == 1, out
+        assert out[0]["team_id"] == "fb_orphanton_fc", out
 
 
 class TestSqlInvariants:

@@ -130,7 +130,12 @@ WITH
 xref_team_by_canonical AS (
     SELECT DISTINCT source, source_id, canonical_id, league, season
     FROM iceberg.silver.xref_team
+    -- #506: canonical_id IS NOT NULL does NOT exclude orphans — orphan rows
+    -- carry a non-NULL source-prefixed canonical ('es_<slug>'/'fb_<slug>').
+    -- Add the contract filter so the ESPN→FBref bridge never matches on a
+    -- pseudo-canonical. xref_team.sql.j2: orphans excluded from cross-source JOIN.
     WHERE canonical_id IS NOT NULL
+      AND confidence <> 'orphan'
 ),
 -- Collapse silver.xref_player (PK source, source_id, season) to one row per
 -- (source, source_id) so the FBref player JOIN below stays 1:1 — see the
@@ -238,6 +243,7 @@ fbref_resolved AS (
        AND xt.source_id = fl.team
        AND xt.league    = fl.league
        AND xt.season    = CAST(fl.season AS varchar)
+       AND xt.confidence <> 'orphan'   -- #506: don't leak 'fb_<slug>' pseudo-canonical
     -- xref_player_dedup (NOT raw silver.xref_player): xref_player PK is
     -- (source, source_id, season), so a raw JOIN on (source, source_id) fans
     -- out 1.5-4× over a player's seasons (#205; same footgun fixed in
@@ -289,6 +295,7 @@ espn_resolved AS (
        AND xt.source_id = el.team
        AND xt.league    = el.league
        AND xt.season    = CAST(el.season AS varchar)
+       AND xt.confidence <> 'orphan'   -- #506: don't leak 'es_<slug>' pseudo-canonical
 ),
 
 -- ============================================================================

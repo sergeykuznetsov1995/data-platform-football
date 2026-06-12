@@ -117,6 +117,11 @@ WITH
 xref_team_dedup AS (
     SELECT source, source_id, league, ARBITRARY(canonical_id) AS canonical_id
     FROM iceberg.silver.xref_team
+    -- #506: drop confidence='orphan' rows before the GROUP BY — they carry a
+    -- non-NULL source-prefixed canonical ('us_<slug>') and would leak through
+    -- as a resolved team_id. xref_team.sql.j2 contract: orphans excluded from
+    -- every cross-source Gold JOIN.
+    WHERE confidence <> 'orphan'
     GROUP BY source, source_id, league
 ),
 
