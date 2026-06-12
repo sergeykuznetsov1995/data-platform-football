@@ -85,6 +85,22 @@ xref_team_fbref AS (
     FROM iceberg.silver.xref_team
     WHERE source = 'fbref'
       AND confidence <> 'orphan'
+),
+
+-- #463: silver.fbref_keeper_profile grain = (player_id, squad, league, season)
+-- — зимний трансфер даёт 2 строки на вратаря-сезон. Gold PK остаётся
+-- (player_id, league, season): выживает ЦЕЛИКОМ строка клуба с максимумом
+-- минут (§5.3), tie → squad ASC. SUM-агрегация по клубам — followup
+-- (save_pct / clean_sheet_pct несуммируемы).
+fb_dedup AS (
+    SELECT * FROM (
+        SELECT *,
+               ROW_NUMBER() OVER (
+                   PARTITION BY player_id, league, season
+                   ORDER BY minutes DESC NULLS LAST, squad
+               ) AS rn
+        FROM iceberg.silver.fbref_keeper_profile
+    ) WHERE rn = 1
 )
 
 SELECT
@@ -144,7 +160,9 @@ SELECT
 -- уже отфильтрован WHERE pos LIKE '%GK%'). INNER JOIN автоматически даёт нужный
 -- набор без отдельного WHERE pos-условия.
 FROM xref_fbref xf
-INNER JOIN iceberg.silver.fbref_keeper_profile fb
+-- #463: fb_dedup (max-minutes club) вместо raw silver — keeper-профиль теперь
+-- per-(player, squad); без дедупа PK развалится на мульти-squad вратарях.
+INNER JOIN fb_dedup fb
     ON  fb.player_id = xf.fbref_player_id
     AND fb.league    = xf.league
     AND fb.season    = xf.season_year

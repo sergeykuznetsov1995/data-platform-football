@@ -85,6 +85,24 @@ xref_team_fbref AS (
       AND confidence <> 'orphan'
 ),
 
+-- #463: silver.fbref_player_season_profile grain = (player_id, squad, league,
+-- season) — зимний трансфер внутри лиги даёт 2 строки на игрока-сезон.
+-- Gold PK остаётся (player_id, league, season): выживает ЦЕЛИКОМ строка клуба
+-- с максимумом минут (§5.2 — team_id = «клуб, за который сыграл больше всего
+-- минут»), tie → squad ASC. Семантика max-minutes-club выбрана осознанно:
+-- ratio-колонки (points_per_match, on_off_impact, minutes_pct…) несуммируемы;
+-- SUM-агрегация счётчиков по клубам — followup.
+fb_dedup AS (
+    SELECT * FROM (
+        SELECT *,
+               ROW_NUMBER() OVER (
+                   PARTITION BY player_id, league, season
+                   ORDER BY minutes DESC NULLS LAST, squad
+               ) AS rn
+        FROM iceberg.silver.fbref_player_season_profile
+    ) WHERE rn = 1
+),
+
 -- FotMob отдаёт shots/tackles/clearances/… как per-90 (не счётчики). Restore
 -- season-count ≈ per_90 × minutes / 90 (±1, per_90 округлён источником до 2 знаков).
 -- raw counts для этих метрик в FotMob API недоступны (issue #174). Pass-through
@@ -266,7 +284,9 @@ SELECT
     CURRENT_TIMESTAMP                                    AS _gold_created_at
 
 FROM xref_fbref xf
-INNER JOIN iceberg.silver.fbref_player_season_profile fb
+-- #463: fb_dedup (max-minutes club) вместо raw silver — профиль теперь
+-- per-(player, squad); без дедупа PK развалится на мульти-squad игроках.
+INNER JOIN fb_dedup fb
     ON  fb.player_id = xf.fbref_player_id
     AND fb.league    = xf.league
     AND fb.season    = xf.season_year

@@ -7,8 +7,9 @@ table:
     Детальные события матча — по строке на событие (гол, пенальти, автогол,
     жёлтая / вторая жёлтая / красная карточка, замена). Несколько строк на
     матч. Источник: bronze.fbref_match_events (без JOIN'ов). Все колонки —
-    VARCHAR (без TRY_CAST). Дедупликация: ROW_NUMBER PARTITION BY
-    (match_id, minute, player_id, event_type) ORDER BY _ingested_at DESC.
+    VARCHAR (без TRY_CAST). Дедупликация (#463): ROW_NUMBER PARTITION BY
+    (match_id, minute, COALESCE(player_id, player), event_type)
+    ORDER BY _ingested_at DESC, _batch_id DESC.
     match_id — сырой FBref-идентификатор (FK → silver.fbref_match_enriched).
   tags:
     - Tier.Silver

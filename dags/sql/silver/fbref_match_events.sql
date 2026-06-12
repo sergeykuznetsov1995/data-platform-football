@@ -7,9 +7,14 @@
 -- Source:
 --   iceberg.bronze.fbref_match_events
 --
--- Deduplication:
---   ROW_NUMBER() OVER (PARTITION BY match_id, minute, player_id, event_type
---                       ORDER BY _ingested_at DESC)  =>  rn = 1
+-- Deduplication (#463):
+--   ROW_NUMBER() OVER (PARTITION BY match_id, minute,
+--                                   COALESCE(player_id, player), event_type
+--                       ORDER BY _ingested_at DESC, _batch_id DESC)  =>  rn = 1
+--   COALESCE guards rows without player_id (two carded NULL-id players in the
+--   same minute must NOT collapse). Key-based dedup is kept deliberately:
+--   live bronze (2026-06-12) contains 4 bit-identical duplicate yellow_card
+--   rows (parse artifacts) that this key correctly collapses.
 --
 -- Notes:
 --   * event_type values: goal, penalty, own_goal, yellow_card,
@@ -21,8 +26,8 @@
 WITH src AS (
     SELECT *,
            ROW_NUMBER() OVER (
-               PARTITION BY match_id, minute, player_id, event_type
-               ORDER BY _ingested_at DESC
+               PARTITION BY match_id, minute, COALESCE(player_id, player), event_type
+               ORDER BY _ingested_at DESC, _batch_id DESC
            ) AS rn
     FROM iceberg.bronze.fbref_match_events
 )

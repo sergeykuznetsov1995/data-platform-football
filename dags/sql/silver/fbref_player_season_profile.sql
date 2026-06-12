@@ -2,7 +2,9 @@
 -- Silver: fbref_player_season_profile
 -- =============================================================================
 --
--- One wide row per player / league / season.
+-- One wide row per player / squad / league / season (#463).
+-- FBref emits one row per (player, squad): a winter transfer inside the
+-- league keeps BOTH club rows — Gold collapses them (max-minutes club).
 --
 -- Sources (all from iceberg.bronze):
 --   fbref_player_stats      (s)  -- standard stats (base table)
@@ -10,9 +12,11 @@
 --   fbref_player_playingtime(pl) -- playing-time stats
 --   fbref_player_misc       (mi) -- miscellaneous stats
 --
--- Deduplication:
---   ROW_NUMBER() OVER (PARTITION BY player_id, league, season
---                       ORDER BY _ingested_at DESC)  =>  rn = 1
+-- Deduplication (#463):
+--   ROW_NUMBER() OVER (PARTITION BY player_id, squad, league, season
+--                       ORDER BY _ingested_at DESC, _batch_id DESC)  =>  rn = 1
+--   _batch_id breaks _ingested_at ties deterministically between rebuilds.
+--   JOINs carry squad — otherwise multi-squad players fan out 2×2.
 --
 -- Notes:
 --   * Column identifiers with special characters are double-quoted.
@@ -24,8 +28,8 @@
 WITH s AS (
     SELECT *,
            ROW_NUMBER() OVER (
-               PARTITION BY player_id, league, season
-               ORDER BY _ingested_at DESC
+               PARTITION BY player_id, squad, league, season
+               ORDER BY _ingested_at DESC, _batch_id DESC
            ) AS rn
     FROM iceberg.bronze.fbref_player_stats
 ),
@@ -33,8 +37,8 @@ WITH s AS (
 sh AS (
     SELECT *,
            ROW_NUMBER() OVER (
-               PARTITION BY player_id, league, season
-               ORDER BY _ingested_at DESC
+               PARTITION BY player_id, squad, league, season
+               ORDER BY _ingested_at DESC, _batch_id DESC
            ) AS rn
     FROM iceberg.bronze.fbref_player_shooting
 ),
@@ -42,8 +46,8 @@ sh AS (
 pl AS (
     SELECT *,
            ROW_NUMBER() OVER (
-               PARTITION BY player_id, league, season
-               ORDER BY _ingested_at DESC
+               PARTITION BY player_id, squad, league, season
+               ORDER BY _ingested_at DESC, _batch_id DESC
            ) AS rn
     FROM iceberg.bronze.fbref_player_playingtime
 ),
@@ -51,8 +55,8 @@ pl AS (
 mi AS (
     SELECT *,
            ROW_NUMBER() OVER (
-               PARTITION BY player_id, league, season
-               ORDER BY _ingested_at DESC
+               PARTITION BY player_id, squad, league, season
+               ORDER BY _ingested_at DESC, _batch_id DESC
            ) AS rn
     FROM iceberg.bronze.fbref_player_misc
 )
@@ -137,16 +141,19 @@ SELECT
 FROM s
 LEFT JOIN sh
     ON  s.player_id = sh.player_id
+    AND s.squad     = sh.squad
     AND s.league    = sh.league
     AND s.season    = sh.season
     AND sh.rn       = 1
 LEFT JOIN pl
     ON  s.player_id = pl.player_id
+    AND s.squad     = pl.squad
     AND s.league    = pl.league
     AND s.season    = pl.season
     AND pl.rn       = 1
 LEFT JOIN mi
     ON  s.player_id = mi.player_id
+    AND s.squad     = mi.squad
     AND s.league    = mi.league
     AND s.season    = mi.season
     AND mi.rn       = 1

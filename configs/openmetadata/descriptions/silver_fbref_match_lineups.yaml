@@ -7,8 +7,9 @@ table:
     Составы матча — по строке на игрока в заявке (старт + скамейка).
     Несколько строк на матч. Источник: bronze.fbref_lineups (без JOIN'ов).
     is_starter уже BOOLEAN в Bronze; jersey_number = TRY_CAST исходного
-    VARCHAR-поля number. Дедупликация: ROW_NUMBER PARTITION BY
-    (match_id, player_id) ORDER BY _ingested_at DESC.
+    VARCHAR-поля number. Дедупликация (#463): ROW_NUMBER PARTITION BY
+    (match_id, COALESCE(player_id, player), team) ORDER BY _ingested_at DESC,
+    _batch_id DESC.
     match_id — сырой FBref-идентификатор (FK → silver.fbref_match_enriched).
   tags:
     - Tier.Silver

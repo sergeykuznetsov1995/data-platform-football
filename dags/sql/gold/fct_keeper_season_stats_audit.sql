@@ -37,6 +37,19 @@ xref_fotmob AS (
     FROM iceberg.silver.xref_player
     WHERE source = 'fotmob'
       AND confidence <> 'orphan'
+),
+
+-- #463: silver keeper-профиль per-(player, squad) — дедуп до max-minutes
+-- клуба, зеркально fct_keeper_season_stats.
+fb_dedup AS (
+    SELECT * FROM (
+        SELECT *,
+               ROW_NUMBER() OVER (
+                   PARTITION BY player_id, league, season
+                   ORDER BY minutes DESC NULLS LAST, squad
+               ) AS rn
+        FROM iceberg.silver.fbref_keeper_profile
+    ) WHERE rn = 1
 )
 
 SELECT
@@ -57,7 +70,8 @@ SELECT
     CURRENT_TIMESTAMP                                    AS _gold_created_at
 
 FROM xref_fbref xf
-INNER JOIN iceberg.silver.fbref_keeper_profile fb
+-- #463: fb_dedup (max-minutes club) вместо raw silver.
+INNER JOIN fb_dedup fb
     ON  fb.player_id = xf.fbref_player_id
     AND fb.league    = xf.league
     AND fb.season    = xf.season_year

@@ -43,9 +43,13 @@ class TestFctKeeperSeasonStatsAuditSql:
 
     def test_inner_join_keeper_sources_left_join_ws(self):
         sql = _read_sql()
+        # #463: FBref keeper spine через fb_dedup CTE (max-minutes club).
         assert re.search(
-            r"INNER\s+JOIN\s+iceberg\.silver\.fbref_keeper_profile",
+            r"INNER\s+JOIN\s+fb_dedup\s+fb\b",
             sql, re.IGNORECASE,
+        )
+        assert "iceberg.silver.fbref_keeper_profile" in sql, (
+            "fb_dedup CTE must read silver.fbref_keeper_profile"
         )
         assert re.search(
             r"INNER\s+JOIN\s+iceberg\.silver\.fotmob_keeper_profile",

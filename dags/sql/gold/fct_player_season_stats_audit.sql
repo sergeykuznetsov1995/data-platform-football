@@ -71,6 +71,19 @@ fotmob_counts AS (
         ROUND(defensive_actions_per_90   * minutes_played / 90.0) AS defensive_actions,
         ROUND(poss_won_final_third_per_90 * minutes_played / 90.0) AS poss_won_final_third
     FROM iceberg.silver.fotmob_player_season_profile
+),
+
+-- #463: silver-профиль per-(player, squad) — дедуп до max-minutes клуба,
+-- зеркально fct_player_season_stats (иначе PK audit-таблицы развалится).
+fb_dedup AS (
+    SELECT * FROM (
+        SELECT *,
+               ROW_NUMBER() OVER (
+                   PARTITION BY player_id, league, season
+                   ORDER BY minutes DESC NULLS LAST, squad
+               ) AS rn
+        FROM iceberg.silver.fbref_player_season_profile
+    ) WHERE rn = 1
 )
 
 SELECT
@@ -145,7 +158,8 @@ SELECT
     CURRENT_TIMESTAMP                                    AS _gold_created_at
 
 FROM xref_fbref xf
-INNER JOIN iceberg.silver.fbref_player_season_profile fb
+-- #463: fb_dedup (max-minutes club) вместо raw silver.
+INNER JOIN fb_dedup fb
     ON  fb.player_id = xf.fbref_player_id
     AND fb.league    = xf.league
     AND fb.season    = xf.season_year

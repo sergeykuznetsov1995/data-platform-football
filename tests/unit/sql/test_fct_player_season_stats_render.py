@@ -97,6 +97,27 @@ class TestFctPlayerSeasonStatsSql:
                 f"PK column `{col}` must be projected"
             )
 
+    def test_fb_dedup_collapses_multi_squad_seasons(self):
+        """#463: silver profile grain = (player_id, squad, league, season) —
+        winter transfers keep one row per club. Gold PK stays
+        (player_id, league, season) via fb_dedup CTE: survivor = max-minutes
+        club (§5.2), deterministic tiebreaker squad."""
+        sql = _strip_comments(_read_sql())
+        assert re.search(r"\bfb_dedup\s+AS\s*\(", sql, re.IGNORECASE), (
+            "missing fb_dedup CTE — multi-squad silver rows would fan out gold PK"
+        )
+        assert re.search(
+            r"ORDER\s+BY\s+minutes\s+DESC\s+NULLS\s+LAST\s*,\s*squad",
+            sql, re.IGNORECASE,
+        ), "fb_dedup must pick max-minutes club deterministically (§5.2)"
+        assert re.search(r"INNER\s+JOIN\s+fb_dedup\s+fb\b", sql, re.IGNORECASE), (
+            "spine must join fb_dedup, not the raw silver profile"
+        )
+        assert not re.search(
+            r"JOIN\s+iceberg\.silver\.fbref_player_season_profile\s+fb\b",
+            sql, re.IGNORECASE,
+        ), "raw silver profile must be read only inside fb_dedup"
+
     def test_team_id_fk_with_orphan_fallback(self):
         """#428 §5.2: team_id FK (fb.squad → xref_team) + 'fb_<slug>' orphan
         fallback — строки не теряются (§6.2)."""
