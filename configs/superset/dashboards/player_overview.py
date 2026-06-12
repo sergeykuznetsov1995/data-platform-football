@@ -15,10 +15,9 @@
 #         — связаны с фильтром «Игрок» (multi-source fct_player_match, issue #46)
 #   13. Full player summary table
 #
-# Season is hard-coded in virtual datasets — column type differs by source:
-#   - FBref facts         -> bigint 2025
-#   - SofaScore rating    -> bigint 2526 (sofascore short-form)
-#   - Understat shots     -> varchar '2526' (understat short-form)
+# Season is hard-coded in virtual datasets. Post issue #404 every gold table
+# stores `season` as a varchar slug ('2526'), so a single quoted constant
+# (SEASON) feeds every WHERE — no more per-source type juggling.
 # dim_player (#425) is per-player (no season) — JOINs by player_id only.
 # Single-season MVP; regenerate virtuals when a new season's data lands.
 #
@@ -38,8 +37,7 @@ DASHBOARD_TITLE = "Сводный обзор лиги — игроки"
 DASHBOARD_SLUG = "player-overview-league"
 DATABASE_NAME = "trino_iceberg"
 LEAGUE = "ENG-Premier League"
-SEASON_FBREF = 2025          # fct_player_match / dim_player / dim_match
-SEASON_OTHER_STR = "2526"    # fct_shot + fct_match_rating (varchar slug convention)
+SEASON = "2526"              # все gold-таблицы хранят season как varchar-slug (#404)
 
 
 # ---------------------------------------------------------------------------
@@ -207,7 +205,7 @@ LEFT JOIN iceberg.gold.dim_player dp
   ON dp.player_id = fpm.player_id
 LEFT JOIN iceberg.gold.dim_team dt
   ON dt.team_id = fpm.team_id
-WHERE fpm.season = {SEASON_FBREF}
+WHERE fpm.season = '{SEASON}'
   AND fpm.league = '{LEAGUE}'"""
 
     v_player_xg = f"""\
@@ -221,7 +219,7 @@ SELECT
 FROM iceberg.gold.fct_shot s
 LEFT JOIN iceberg.gold.dim_player dp
   ON dp.player_id = s.player_id
-WHERE s.season = '{SEASON_OTHER_STR}'
+WHERE s.season = '{SEASON}'
   AND s.league = '{LEAGUE}'
   AND s.player_id IS NOT NULL"""
 
@@ -230,13 +228,13 @@ WITH fbref_agg AS (
   SELECT player_id, SUM(goals) AS goals, SUM(minutes_played) AS minutes,
          SUM(shots) AS shots, ARBITRARY(team_id) AS team_id
   FROM iceberg.gold.fct_player_match
-  WHERE season = {SEASON_FBREF} AND league = '{LEAGUE}'
+  WHERE season = '{SEASON}' AND league = '{LEAGUE}'
   GROUP BY player_id
 ),
 xg_agg AS (
   SELECT player_id, SUM(xg) AS xg
   FROM iceberg.gold.fct_shot
-  WHERE season = '{SEASON_OTHER_STR}' AND league = '{LEAGUE}'
+  WHERE season = '{SEASON}' AND league = '{LEAGUE}'
     AND player_id IS NOT NULL
   GROUP BY player_id
 )
@@ -274,7 +272,7 @@ SELECT
 FROM iceberg.gold.fct_match_rating fmr
 LEFT JOIN iceberg.gold.dim_player dp
   ON dp.player_id = fmr.player_id_canonical
-WHERE fmr.season = '{SEASON_OTHER_STR}'
+WHERE fmr.season = '{SEASON}'
   AND fmr.league = '{LEAGUE}'
   AND fmr.rating IS NOT NULL"""
 
@@ -289,13 +287,13 @@ WITH fbref AS (
          SUM(penalty_attempts) AS penalty_attempts,
          ARBITRARY(team_id) AS team_id
   FROM iceberg.gold.fct_player_match
-  WHERE season = {SEASON_FBREF} AND league = '{LEAGUE}'
+  WHERE season = '{SEASON}' AND league = '{LEAGUE}'
   GROUP BY player_id
 ),
 xg_cte AS (
   SELECT player_id, SUM(xg) AS total_xg
   FROM iceberg.gold.fct_shot
-  WHERE season = '{SEASON_OTHER_STR}' AND league = '{LEAGUE}'
+  WHERE season = '{SEASON}' AND league = '{LEAGUE}'
   GROUP BY player_id
 ),
 rating_cte AS (
@@ -312,7 +310,7 @@ rating_cte AS (
 SELECT
   f.player_id,
   COALESCE(dp.player_name, f.player_id) AS player_name,
-  dp.primary_position,
+  dp.primary_position AS position,
   REGEXP_EXTRACT(dp.primary_position, '^([A-Z]{{2}})') AS position_primary,
   dt.team_name, f.matches, f.minutes, f.goals, f.assists,
   COALESCE(x.total_xg, 0.0) AS xg,
@@ -358,7 +356,7 @@ LEFT JOIN iceberg.gold.dim_player dp
   ON dp.player_id = fpm.player_id
 LEFT JOIN iceberg.gold.dim_team dt
   ON dt.team_id = fpm.team_id
-WHERE fpm.season = {SEASON_FBREF}
+WHERE fpm.season = '{SEASON}'
   AND fpm.league = '{LEAGUE}'"""
 
     return {
