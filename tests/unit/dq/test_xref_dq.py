@@ -24,6 +24,7 @@ inspection is sufficient to lock the contract.
 
 from __future__ import annotations
 
+import re
 import sys
 from pathlib import Path
 
@@ -712,3 +713,50 @@ def test_bronze_xref_freshness_handles_empty_xref_snapshots(monkeypatch):
     assert res['xref_max_committed_at'] is None
     us = next(p for p in res['per_partition'] if p['source'] == 'understat')
     assert us['lag_hours'] is None
+
+
+# ===========================================================================
+# E1.5 post-cutover checks (issue #451)
+# ===========================================================================
+
+def _fct_player_match_output_columns() -> set:
+    """Derive the output schema of gold.fct_player_match from its SQL file.
+
+    Parses the final SELECT (between the top-level ``SELECT`` and ``FROM``
+    markers, both at column 0) and collects the ``AS <alias>`` projections —
+    derive-from-source so the test follows schema renames instead of
+    hardcoding a snapshot.
+    """
+    sql = (REPO_ROOT / "dags" / "sql" / "gold" / "fct_player_match.sql").read_text()
+    final_select = re.split(r"^SELECT\s*$", sql, flags=re.MULTILINE)[-1]
+    final_select = re.split(r"^FROM\s", final_select, flags=re.MULTILINE)[0]
+    return set(re.findall(r"\bAS\s+(\w+)\s*,?\s*$", final_select, flags=re.MULTILINE))
+
+
+def test_post_cutover_checks_structure():
+    """build_e1_5_post_cutover_checks: 4 WARNING-only row_count guards."""
+    checks = xref_dq.build_e1_5_post_cutover_checks()
+    assert len(checks) == 4
+    assert all(c.severity == 'WARNING' for c in checks)
+    assert all(c.kind == 'row_count' for c in checks)
+
+
+def test_post_cutover_fct_player_match_predicates_match_sql_schema():
+    """#451 regression: WHERE predicates must reference live fct_player_match
+    columns. #438 renamed *_canonical → plain ids; the stale predicates made
+    both checks die with COLUMN_NOT_FOUND instead of validating.
+    """
+    schema = _fct_player_match_output_columns()
+    # Parser sanity — the live schema must expose the plain ids.
+    assert {'team_id', 'player_id'} <= schema
+
+    checks = [c for c in xref_dq.build_e1_5_post_cutover_checks()
+              if c.params.get('table') == 'iceberg.gold.fct_player_match']
+    assert len(checks) == 2
+    for check in checks:
+        where = check.params['where']
+        for col in re.findall(r'\b(?:team_id|player_id)\w*', where):
+            assert col in schema, (
+                f"{check.name}: predicate references '{col}' which is not an "
+                f"output column of fct_player_match.sql"
+            )
