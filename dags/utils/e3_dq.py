@@ -825,10 +825,14 @@ def _build_fct_lineup_checks() -> List[Check]:
     """
     table = 'iceberg.gold.fct_lineup'
 
-    # ESPN player_id NULL rate — ESPN has no native player_id, so
-    # name-based resolution misses ~10% of edge cases. Cap absolute count
-    # at 10% × 159K ≈ 15,900.
-    lineup_orphan_max = int(0.10 * 159_000)
+    # Orphan rate measured on FBref rows ONLY (#519). ESPN player_id is NULL
+    # by design — there is no ESPN player resolver (see fct_lineup.sql ADR
+    # "player_id resolution"), so every ESPN row is an expected NULL. Counting
+    # ESPN turned this guard into pure noise (~74.6K expected NULLs vs a 15.9K
+    # cap → permanently red, masking real resolver regressions). FBref ≈ 145K
+    # rows; the resolver legitimately misses out-of-scope seasons (~2.7K live).
+    # Cap at 10% × 145K ≈ 14,500.
+    lineup_fbref_orphan_max = int(0.10 * 145_000)
 
     return [
         # PK guard. With player_id possibly NULL (ESPN edge case),
@@ -904,12 +908,13 @@ def _build_fct_lineup_checks() -> List[Check]:
         # is a single-season floor; we enforce as ERROR.
         CHECK.row_count(table, min_rows=380 * 22, severity='ERROR'),
 
-        # ESPN player orphan guard — see threshold derivation above.
+        # FBref player orphan guard — see threshold derivation above. Scoped to
+        # lineup_source='fbref'; ESPN rows are expected-NULL (#519) and excluded.
         CHECK.row_count(
             table=table,
             min_rows=0,
-            max_rows=lineup_orphan_max,
-            where="player_id IS NULL",
+            max_rows=lineup_fbref_orphan_max,
+            where="player_id IS NULL AND lineup_source = 'fbref'",
             severity='WARNING',
             name='lineup_orphan_player_rate',
         ),

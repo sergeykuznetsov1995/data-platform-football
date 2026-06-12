@@ -504,6 +504,16 @@ class TestOrphanAndCoverageGuards:
         ln = [c for c in checks if c.name == "lineup_orphan_player_rate"]
         assert len(ln) == 1
 
+    def test_lineup_orphan_player_rate_scoped_to_fbref(self):
+        """#519: orphan rate must measure FBref rows only — ESPN player_id is
+        NULL by design (no ESPN resolver), so an unscoped guard is permanent
+        noise. Cap re-derived from FBref row count (10% × 145K)."""
+        checks = e3_dq.build_gold_e3_checks()
+        ln = next(c for c in checks if c.name == "lineup_orphan_player_rate")
+        assert ln.severity == "WARNING"
+        assert "lineup_source = 'fbref'" in ln.params["where"]
+        assert ln.params["max_rows"] == int(0.10 * 145_000)
+
     def test_spadl_unknown_rate_capped(self):
         """spadl_coverage_unknown_rate must cap at 40K rows (R3 baseline 17.5K
         with headroom for 5-season backfill)."""
