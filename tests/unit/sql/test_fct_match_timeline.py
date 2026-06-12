@@ -471,3 +471,145 @@ class TestFctMatchTimeline:
         assert first == second
         pks = [(r["match_id"], r["event_seq"]) for r in first]
         assert len(pks) == len(set(pks))
+
+
+class TestSeasonScopedBridgeAndIdentityGate:
+    """#459: (1) ws_match_bridge must be season-scoped so a historical FBref
+    name variant doesn't fan the bridge out and duplicate a WS match under
+    'whoscored_raw_<game_id>'; (2) the ws_only gate must also key on the
+    physical match identity (league, season, date, canonical teams) so an
+    UNBRIDGED WS twin of an FBref-covered match cannot double-enter.
+    """
+
+    def test_variant_fanout_does_not_duplicate_bridged_ws_match(self, duck_conn):
+        """WS-only match whose home club has a historical FBref spelling:
+        every event must come out ONCE under the FBref hex id."""
+        duck_conn.execute(
+            f"""
+            INSERT INTO silver_xref_team VALUES
+              ('fbref',     'Newcastle Utd',    'newcastle', '{_LG}', '2324'),
+              ('fbref',     'Newcastle United', 'newcastle', '{_LG}', '2425'),
+              ('fbref',     'Liverpool',        'liverpool', '{_LG}', '2425'),
+              ('whoscored', 'Newcastle',        'newcastle', '{_LG}', '2425'),
+              ('whoscored', 'Liverpool',        'liverpool', '{_LG}', '2425')
+            """
+        )
+        duck_conn.execute(
+            f"""
+            INSERT INTO bronze_whoscored_schedule VALUES
+              (3, TIMESTAMP '2024-08-20 19:00:00', 'Newcastle', 'Liverpool',
+               '{_LG}', '2425', {_TS})
+            """
+        )
+        duck_conn.execute(
+            f"""
+            INSERT INTO silver_fbref_match_enriched VALUES
+              ('M3', '{_LG}', 'Newcastle United', 'Liverpool',
+               DATE '2024-08-20')
+            """
+        )
+        yellow_q = _ws_qualifiers("Yellow")
+        duck_conn.execute(
+            f"""
+            INSERT INTO bronze_whoscored_events VALUES
+              (3.0, 'FirstHalf', 10, 0, 10, 'Goal', 'Successful',
+               100.0, 3001.0, 3002.0, '[]', NULL, 'Newcastle',
+               '{_LG}', '2425', {_TS}),
+              (3.0, 'SecondHalf', 60, 0, 60, 'Card', 'Successful',
+               101.0, 3003.0, NULL, ?, NULL, 'Liverpool',
+               '{_LG}', '2425', {_TS})
+            """,
+            [yellow_q],
+        )
+        duck_conn.execute(
+            f"""
+            INSERT INTO silver_xref_player VALUES
+              ('whoscored', '3001', 'c3001', '{_LG}', '2425'),
+              ('whoscored', '3002', 'c3002', '{_LG}', '2425'),
+              ('whoscored', '3003', 'c3003', '{_LG}', '2425')
+            """
+        )
+        out = _run_gold(duck_conn)
+        assert {r["match_id"] for r in out} == {"M3"}, out
+        assert len(out) == 2, f"bridge fan-out duplicated the WS match: {out}"
+
+    def test_unbridged_ws_twin_gated_by_identity(self, duck_conn):
+        """TWO same-season FBref spellings fan the bridge out irreparably —
+        the raw-id WS twin must be dropped by the identity gate because the
+        physical match (league, season, date, teams) already has FBref
+        events."""
+        duck_conn.execute(
+            f"""
+            INSERT INTO silver_xref_team VALUES
+              ('fbref',     'Newcastle Utd',    'newcastle', '{_LG}', '2425'),
+              ('fbref',     'Newcastle United', 'newcastle', '{_LG}', '2425'),
+              ('fbref',     'Liverpool',        'liverpool', '{_LG}', '2425'),
+              ('whoscored', 'Newcastle',        'newcastle', '{_LG}', '2425'),
+              ('whoscored', 'Liverpool',        'liverpool', '{_LG}', '2425')
+            """
+        )
+        duck_conn.execute(
+            f"""
+            INSERT INTO bronze_whoscored_schedule VALUES
+              (4, TIMESTAMP '2024-09-10 19:00:00', 'Newcastle', 'Liverpool',
+               '{_LG}', '2425', {_TS})
+            """
+        )
+        duck_conn.execute(
+            f"""
+            INSERT INTO silver_fbref_match_enriched VALUES
+              ('M4', '{_LG}', 'Newcastle United', 'Liverpool',
+               DATE '2024-09-10')
+            """
+        )
+        # FBref covers M4 — one goal.
+        duck_conn.execute(
+            f"""
+            INSERT INTO silver_fbref_match_events VALUES
+              ('M4', '12', 'goal', 'P1', 'fb_p1', 'Newcastle United', 'home',
+               NULL, NULL, {_TS}, '{_LG}', '2425')
+            """
+        )
+        # WS twin of the same physical match.
+        duck_conn.execute(
+            f"""
+            INSERT INTO bronze_whoscored_events VALUES
+              (4.0, 'FirstHalf', 30, 0, 30, 'Goal', 'Successful',
+               100.0, 4001.0, NULL, '[]', NULL, 'Newcastle',
+               '{_LG}', '2425', {_TS})
+            """
+        )
+        duck_conn.execute(
+            f"""
+            INSERT INTO silver_xref_player VALUES
+              ('fbref',     'fb_p1', 'p1',    '{_LG}', '2425'),
+              ('whoscored', '4001',  'c4001', '{_LG}', '2425')
+            """
+        )
+        out = _run_gold(duck_conn)
+        assert {r["match_id"] for r in out} == {"M4"}, out
+        assert all(r["event_source"] == "fbref" for r in out), out
+        assert len(out) == 1, f"raw-id WS twin slipped past the gate: {out}"
+
+    def test_unbridgeable_ws_match_survives_gate(self, duck_conn):
+        """A WS match whose identity is UNRESOLVABLE (no xref rows, no fme
+        twin) must survive the gate exactly once under the raw id — the
+        identity anti-join must not drop NULL-keyed rows."""
+        duck_conn.execute(
+            f"""
+            INSERT INTO bronze_whoscored_schedule VALUES
+              (5, TIMESTAMP '2024-09-15 19:00:00', 'Wigan', 'Bolton',
+               '{_LG}', '2425', {_TS})
+            """
+        )
+        duck_conn.execute(
+            f"""
+            INSERT INTO bronze_whoscored_events VALUES
+              (5.0, 'FirstHalf', 20, 0, 20, 'Goal', 'Successful',
+               100.0, 5001.0, NULL, '[]', NULL, 'Wigan',
+               '{_LG}', '2425', {_TS})
+            """
+        )
+        out = _run_gold(duck_conn)
+        assert len(out) == 1, out
+        assert out[0]["match_id"] == "whoscored_raw_5", out

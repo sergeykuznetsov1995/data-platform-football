@@ -482,3 +482,148 @@ class TestStoppageTimeMinutes:
         assert len(out) == 2, out
         minutes = sorted(r["minute"] for r in out)
         assert minutes == [45, 90], minutes
+
+
+def _seed_variant_bridge(duck_conn) -> None:
+    """Bridge spine where the FBref club name has a HISTORICAL variant (#459).
+
+    canonical 'newcastle' carries two FBref spellings across seasons:
+    'Newcastle Utd' ('2324') and 'Newcastle United' ('2425'). The season-less
+    xref_team_canonical CTE expanded BOTH variants into ws_match_bridge; the
+    '2324' spelling missed fme.home and produced a second bridge row with
+    fbref_match_id = NULL → WS events duplicated under 'whoscored_raw_1'.
+    """
+    duck_conn.execute(
+        """
+        INSERT INTO silver_xref_team VALUES
+          ('fbref',     'Newcastle Utd',    'newcastle',
+           'ENG-Premier League', '2324'),
+          ('fbref',     'Newcastle United', 'newcastle',
+           'ENG-Premier League', '2425'),
+          ('fbref',     'Liverpool',        'liverpool',
+           'ENG-Premier League', '2425'),
+          ('whoscored', 'Newcastle',        'newcastle',
+           'ENG-Premier League', '2425'),
+          ('whoscored', 'Liverpool',        'liverpool',
+           'ENG-Premier League', '2425')
+        """
+    )
+    duck_conn.execute(
+        """
+        INSERT INTO bronze_whoscored_schedule VALUES
+          (1, TIMESTAMP '2024-08-15 19:00:00', 'Newcastle', 'Liverpool',
+           'ENG-Premier League', '2425', TIMESTAMP '2026-05-08 12:00:00')
+        """
+    )
+    duck_conn.execute(
+        """
+        INSERT INTO silver_fbref_match_enriched VALUES
+          ('M1', 'ENG-Premier League', 'Newcastle United', 'Liverpool',
+           DATE '2024-08-15')
+        """
+    )
+
+
+class TestSeasonScopedBridge:
+    """#459: ws_match_bridge must be season-scoped — a historical FBref name
+    variant must NOT yield a second bridge row and duplicate WS events under
+    'whoscored_raw_<game_id>'.
+    """
+
+    def test_historical_variant_does_not_duplicate_ws_card(self, duck_conn):
+        """FBref + WS copies of the same card must collapse to ONE FBref row —
+        no surviving raw-id twin from the bridge fan-out."""
+        _seed_variant_bridge(duck_conn)
+        duck_conn.execute(
+            """
+            INSERT INTO bronze_fbref_match_events VALUES
+              ('M1', '10', 'yellow_card', 'Player1', 'fb_p1', NULL, NULL,
+               'Newcastle United', 'ENG-Premier League', 2024,
+               TIMESTAMP '2026-05-08 12:00:00')
+            """
+        )
+        yellow_q = _ws_card_qualifiers("Yellow")
+        duck_conn.execute(
+            """
+            INSERT INTO bronze_whoscored_events VALUES
+              (1.0, 'FirstHalf', 10, 0, 10, 'Card', 'Successful',
+               100.0, 1000.0, ?, NULL, 'Newcastle',
+               'ENG-Premier League', '2425', TIMESTAMP '2026-05-08 12:00:00')
+            """,
+            [yellow_q],
+        )
+        duck_conn.execute(
+            """
+            INSERT INTO silver_xref_player VALUES
+              ('fbref',     'fb_p1', 'p1_canon', 'ENG-Premier League', '2425'),
+              ('whoscored', '1000',  'p1_canon', 'ENG-Premier League', '2425')
+            """
+        )
+        out = _run_gold(duck_conn)
+        assert len(out) == 1, f"bridge fan-out duplicated the WS card: {out}"
+        assert out[0]["card_source"] == "fbref", out
+        assert not any(
+            r["match_id_canonical"].startswith("whoscored_raw_") for r in out
+        ), out
+
+    def test_variant_fanout_bridge_still_resolves_hex(self, duck_conn):
+        """A WS-only card must come out ONCE and bridged to the FBref hex id
+        (via the season-correct variant) — not duplicated, not raw."""
+        _seed_variant_bridge(duck_conn)
+        yellow_q = _ws_card_qualifiers("Yellow")
+        duck_conn.execute(
+            """
+            INSERT INTO bronze_whoscored_events VALUES
+              (1.0, 'FirstHalf', 30, 0, 30, 'Card', 'Successful',
+               100.0, 999.0, ?, NULL, 'Newcastle',
+               'ENG-Premier League', '2425', TIMESTAMP '2026-05-08 12:00:00')
+            """,
+            [yellow_q],
+        )
+        out = _run_gold(duck_conn)
+        assert len(out) == 1, f"expected 1 bridged row, got {len(out)}: {out}"
+        assert out[0]["match_id_canonical"] == "M1", out
+
+    def test_missing_xref_season_yields_single_unbridged_row(self, duck_conn):
+        """When xref_team has NO fbref rows for the schedule's season the
+        bridge degrades to exactly ONE unbridged row (raw id, no dup)."""
+        duck_conn.execute(
+            """
+            INSERT INTO silver_xref_team VALUES
+              ('fbref',     'Newcastle Utd', 'newcastle',
+               'ENG-Premier League', '2324'),
+              ('fbref',     'Liverpool',     'liverpool',
+               'ENG-Premier League', '2324'),
+              ('whoscored', 'Newcastle',     'newcastle',
+               'ENG-Premier League', '2425'),
+              ('whoscored', 'Liverpool',     'liverpool',
+               'ENG-Premier League', '2425')
+            """
+        )
+        duck_conn.execute(
+            """
+            INSERT INTO bronze_whoscored_schedule VALUES
+              (1, TIMESTAMP '2024-08-15 19:00:00', 'Newcastle', 'Liverpool',
+               'ENG-Premier League', '2425', TIMESTAMP '2026-05-08 12:00:00')
+            """
+        )
+        duck_conn.execute(
+            """
+            INSERT INTO silver_fbref_match_enriched VALUES
+              ('M1', 'ENG-Premier League', 'Newcastle United', 'Liverpool',
+               DATE '2024-08-15')
+            """
+        )
+        yellow_q = _ws_card_qualifiers("Yellow")
+        duck_conn.execute(
+            """
+            INSERT INTO bronze_whoscored_events VALUES
+              (1.0, 'FirstHalf', 30, 0, 30, 'Card', 'Successful',
+               100.0, 999.0, ?, NULL, 'Newcastle',
+               'ENG-Premier League', '2425', TIMESTAMP '2026-05-08 12:00:00')
+            """,
+            [yellow_q],
+        )
+        out = _run_gold(duck_conn)
+        assert len(out) == 1, out
+        assert out[0]["match_id_canonical"] == "whoscored_raw_1", out

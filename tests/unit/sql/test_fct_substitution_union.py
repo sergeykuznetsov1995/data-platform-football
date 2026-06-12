@@ -507,3 +507,83 @@ class TestStoppageTimeMinutes:
             ("ws_in1_canon", "ws_out1_canon"),
             ("ws_in2_canon", "ws_out2_canon"),
         ], in_outs
+
+
+class TestSeasonScopedBridge:
+    """#459: ws_match_bridge must be season-scoped — a historical FBref name
+    variant must NOT yield a second bridge row and duplicate the WS swap
+    under 'whoscored_raw_<game_id>'.
+    """
+
+    def test_historical_variant_does_not_duplicate_ws_sub(self, duck_conn):
+        """FBref + WS copies of the same swap must collapse to ONE FBref row —
+        no surviving raw-id twin from the bridge fan-out."""
+        # canonical 'newcastle' has two FBref spellings across seasons; the
+        # season-less bridge expanded both, and the '2324' spelling missed
+        # fme.home → second bridge row with fbref_match_id = NULL.
+        duck_conn.execute(
+            """
+            INSERT INTO silver_xref_team VALUES
+              ('fbref',     'Newcastle Utd',    'newcastle',
+               'ENG-Premier League', '2324'),
+              ('fbref',     'Newcastle United', 'newcastle',
+               'ENG-Premier League', '2425'),
+              ('fbref',     'Liverpool',        'liverpool',
+               'ENG-Premier League', '2425'),
+              ('whoscored', 'Newcastle',        'newcastle',
+               'ENG-Premier League', '2425'),
+              ('whoscored', 'Liverpool',        'liverpool',
+               'ENG-Premier League', '2425')
+            """
+        )
+        duck_conn.execute(
+            """
+            INSERT INTO bronze_whoscored_schedule VALUES
+              (3, TIMESTAMP '2024-09-01 19:00:00', 'Newcastle', 'Liverpool',
+               'ENG-Premier League', '2425', TIMESTAMP '2026-05-08 12:00:00')
+            """
+        )
+        duck_conn.execute(
+            """
+            INSERT INTO silver_fbref_match_enriched VALUES
+              ('M9', 'ENG-Premier League', 'Newcastle United', 'Liverpool',
+               DATE '2024-09-01')
+            """
+        )
+        # FBref swap in M9 (player = IN, secondary_player = OFF).
+        duck_conn.execute(
+            """
+            INSERT INTO bronze_fbref_match_events VALUES
+              ('M9', '70', 'substitution', 'NewPlayer1', 'fb_in1',
+               'OldPlayer1', 'fb_out1', 'Newcastle United',
+               'ENG-Premier League', 2024, TIMESTAMP '2026-05-08 12:00:00')
+            """
+        )
+        # Same swap from WhoScored (game 3, team_id=100, minute 70).
+        duck_conn.execute(
+            """
+            INSERT INTO bronze_whoscored_events VALUES
+              (3.0, 'SecondHalf', 70, 5, 70, 'SubstitutionOff', 'Successful',
+               100.0, 5000.0, NULL, 6000.0, 'Newcastle',
+               'ENG-Premier League', '2425', TIMESTAMP '2026-05-08 12:00:00'),
+              (3.0, 'SecondHalf', 70, 6, 70, 'SubstitutionOn',  'Successful',
+               100.0, 6000.0, NULL, 5000.0, 'Newcastle',
+               'ENG-Premier League', '2425', TIMESTAMP '2026-05-08 12:00:00')
+            """
+        )
+        # Both sources resolve to the same (in, out) canonicals → dedup fires.
+        duck_conn.execute(
+            """
+            INSERT INTO silver_xref_player VALUES
+              ('fbref',     'fb_in1',  'in1_canon',  'ENG-Premier League', '2425'),
+              ('fbref',     'fb_out1', 'out1_canon', 'ENG-Premier League', '2425'),
+              ('whoscored', '6000',    'in1_canon',  'ENG-Premier League', '2425'),
+              ('whoscored', '5000',    'out1_canon', 'ENG-Premier League', '2425')
+            """
+        )
+        out = _run_gold(duck_conn)
+        assert len(out) == 1, f"bridge fan-out duplicated the WS swap: {out}"
+        assert out[0]["substitution_source"] == "fbref", out
+        assert not any(
+            r["match_id_canonical"].startswith("whoscored_raw_") for r in out
+        ), out
