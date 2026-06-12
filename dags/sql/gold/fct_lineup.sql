@@ -123,6 +123,10 @@ WITH
 -- fbref_match_id = NULL and duplicates the lineup under the 'espn_<hash>'
 -- pseudo-id (the final dedup partitions by match_id_canonical and cannot
 -- collapse the twins).
+-- #445: season-scoping alone no longer suffices — xref_team now legally
+-- carries TWO same-season fbref spellings per canonical (schedule short name
+-- + match-page full name), so espn_match_bridge below aggregates to one row
+-- per ESPN game instead of relying on (canonical, league, season) uniqueness.
 xref_team_by_canonical AS (
     SELECT DISTINCT source, source_id, canonical_id, league, season
     FROM iceberg.silver.xref_team
@@ -160,7 +164,10 @@ espn_match_bridge AS (
             || '|' || COALESCE(CAST(es.season AS varchar), '')
             || '|' || COALESCE(es.game, '')
         ))))                                                AS espn_match_id,
-        fme.match_id                                        AS fbref_match_id,
+        -- #445: the xt_*_fb reverse lookups fan out across same-season fbref
+        -- name variants; only the schedule spelling can match fme.home/away,
+        -- so MAX over the NULL twins is exact (not a tiebreak).
+        MAX(fme.match_id)                                   AS fbref_match_id,
         es.league                                           AS league,
         es.season                                           AS season  -- #404: ESPN bronze slug ('2526')
     FROM espn_schedule_dedup es
@@ -193,6 +200,10 @@ espn_match_bridge AS (
        -- APL fixtures and surfaces as bridge-miss in DQ.
        AND fme.date   = CAST(es.match_date AS date)
     WHERE es.rn = 1
+    -- #445: ordinals, NOT select aliases — Trino raises COLUMN_NOT_FOUND on
+    -- same-level aliases in GROUP BY (DuckDB-based tests mask this).
+    -- Ordinal 1 = the espn_match_id hash expression.
+    GROUP BY 1, 3, 4
 ),
 
 -- ============================================================================

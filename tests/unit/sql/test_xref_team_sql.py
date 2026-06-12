@@ -186,6 +186,33 @@ class TestXrefTeamTemplateStructure:
             "(COLUMN_NOT_FOUND on live Trino; DuckDB masks this)"
         )
 
+    def test_fbref_match_page_branches_present(self):
+        """#445: raw_teams must also enumerate the FBref match-page name
+        universe — match pages carry FULL club names ('Wolverhampton
+        Wanderers') where the schedule carries SHORT ones ('Wolves'), and
+        name-keyed Gold JOINs must resolve either spelling."""
+        sql = _read_template()
+        for tbl in [
+            "iceberg.bronze.fbref_match_player_stats",
+            "iceberg.bronze.fbref_match_events",
+        ]:
+            assert re.search(
+                rf"FROM\s+{re.escape(tbl)}\s+WHERE\s+team\s+IS\s+NOT\s+NULL",
+                sql,
+                re.IGNORECASE,
+            ), (
+                f"raw_teams must read {tbl!r} with `WHERE team IS NOT NULL` "
+                "(#445 — full-name universe from match pages)"
+            )
+        # Every BIGINT-season branch must keep the year-start→slug expression
+        # (#404): 4 fbref (2 schedule + 2 match-page) + 2 fotmob +
+        # 2 matchhistory = 8 — a branch without it would silently emit
+        # unjoinable season values.
+        assert len(re.findall(r"LPAD\(CAST\(MOD\(season, 100\)", sql)) >= 8, (
+            "expected the season-slug expression on all 4 fbref branches "
+            "(schedule + match-page) plus fotmob/matchhistory (#445/#404)"
+        )
+
     def test_season_cast_to_varchar(self):
         """FBref/MatchHistory/FotMob seasons are BIGINT in Bronze; need CAST."""
         sql = _read_template()
@@ -288,6 +315,8 @@ class TestXrefTeamRendered:
         # Sample the most fingerprint-distinctive bronze tables.
         for tbl in [
             "iceberg.bronze.fbref_schedule",
+            "iceberg.bronze.fbref_match_player_stats",
+            "iceberg.bronze.fbref_match_events",
             "iceberg.bronze.matchhistory_results",
             "iceberg.bronze.clubelo_ratings",
             "iceberg.bronze.transfermarkt_players",

@@ -48,6 +48,8 @@
 -- Bronze column-name reference (verified via DESCRIBE on 2026-05-08)
 -- =============================================================================
 --   fbref_schedule        : home, away, league, season (BIGINT — needs CAST)
+--   fbref_match_player_stats : team, league, season (BIGINT) — match-page FULL names (#445)
+--   fbref_match_events    : team, league, season (BIGINT) — match-page FULL names (#445)
 --   understat_schedule    : home_team, away_team, league, season (varchar)
 --   whoscored_schedule    : home_team, away_team, league, season (varchar)
 --                          (NB: whoscored_events has only `team`, not home/away)
@@ -111,6 +113,21 @@ raw_teams AS (
     UNION
     SELECT 'fbref' AS source, away AS source_id, league, LPAD(CAST(MOD(season, 100) AS varchar), 2, '0') || LPAD(CAST(MOD(season + 1, 100) AS varchar), 2, '0') AS season  -- year-start bigint → slug '2425' (#404)
       FROM iceberg.bronze.fbref_schedule WHERE away IS NOT NULL
+
+    UNION
+    -- ===== fbref (match-page full names — #445) =====
+    -- Match pages carry FULL club names ('Wolverhampton Wanderers',
+    -- 'Brighton & Hove Albion') where the schedule carries SHORT ones
+    -- ('Wolves', 'Brighton'). Both variants must exist as xref rows so
+    -- name-keyed Gold JOINs resolve either spelling.
+    -- NB: this makes TWO fbref rows per (canonical_id, league, season) legal —
+    -- canonical→fbref-name bridges must aggregate (see the GROUP BY guards in
+    -- fct_match_timeline.ws_match_bridge / fct_lineup.espn_match_bridge).
+    SELECT 'fbref' AS source, team AS source_id, league, LPAD(CAST(MOD(season, 100) AS varchar), 2, '0') || LPAD(CAST(MOD(season + 1, 100) AS varchar), 2, '0') AS season  -- year-start bigint → slug '2425' (#404)
+      FROM iceberg.bronze.fbref_match_player_stats WHERE team IS NOT NULL
+    UNION
+    SELECT 'fbref' AS source, team AS source_id, league, LPAD(CAST(MOD(season, 100) AS varchar), 2, '0') || LPAD(CAST(MOD(season + 1, 100) AS varchar), 2, '0') AS season  -- year-start bigint → slug '2425' (#404)
+      FROM iceberg.bronze.fbref_match_events WHERE team IS NOT NULL
 
     UNION
     -- ===== understat =====

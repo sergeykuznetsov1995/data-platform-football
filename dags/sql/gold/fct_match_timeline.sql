@@ -227,6 +227,10 @@ ws_schedule_dedup AS (
 -- fbref_match_id = NULL and duplicated WhoScored events under
 -- 'whoscored_raw_<game_id>' (same pattern as the former fct_card.sql,
 -- removed in #448).
+-- #445: season-scoping alone no longer suffices — xref_team now legally
+-- carries TWO same-season fbref spellings per canonical (schedule short name
+-- + match-page full name), so the bridge below aggregates to one row per
+-- WS game instead of relying on (canonical, league, season) uniqueness.
 xref_team_canonical AS (
     SELECT DISTINCT source, source_id, canonical_id, league, season
     FROM iceberg.silver.xref_team
@@ -237,6 +241,10 @@ xref_team_canonical AS (
 -- (removed in #448) with home/away
 -- names + canonicals: needed for event-side resolution (running score) and
 -- the own_goal credited-team flip.
+-- #445 guard: the xt_*_fb reverse lookups fan out across same-season fbref
+-- name variants; only the schedule spelling can match fme.home/away, so
+-- MAX over the NULL twins is exact (not a tiebreak) and GROUP BY collapses
+-- the bridge to ≤1 row per WS game.
 ws_match_bridge AS (
     SELECT
         CAST(s.game_id AS varchar)               AS ws_game_id,
@@ -247,7 +255,7 @@ ws_match_bridge AS (
         s.away_team                              AS away_team_name,
         xt_home_ws.canonical_id                  AS home_team_id,
         xt_away_ws.canonical_id                  AS away_team_id,
-        fme.match_id                             AS fbref_match_id
+        MAX(fme.match_id)                        AS fbref_match_id  -- #445
     FROM ws_schedule_dedup s
     LEFT JOIN xref_team_canonical xt_home_ws
         ON xt_home_ws.source    = 'whoscored'
@@ -275,6 +283,9 @@ ws_match_bridge AS (
        AND fme.away   = xt_away_fb.source_id
        AND fme.date   = CAST(s.date AS date)
     WHERE s.rn = 1
+    -- #445: ordinals, NOT select aliases — Trino raises COLUMN_NOT_FOUND on
+    -- same-level aliases in GROUP BY (DuckDB-based tests mask this).
+    GROUP BY 1, 2, 3, 4, 5, 6, 7, 8
 ),
 
 -- Classify deduped WhoScored events onto the 8-value dictionary. The
