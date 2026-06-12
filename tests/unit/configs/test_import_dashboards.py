@@ -1,17 +1,16 @@
 """
-Unit tests for ``configs/superset/dashboards/*.py`` declarations and
-``configs/superset/import_dashboards.py`` (E7 / T4).
+Unit tests for ``configs/superset/dashboards/*.py`` declarations and the
+``configs/superset/dashboards/import_dashboards.py`` orchestrator (E7 / T4).
 
-Two dashboard families coexist:
-  * declarative — module-level ``DASHBOARD`` dataclass picked up by
-    ``import_dashboards._discover_dashboards``;
-  * programmatic — a ``create_dashboard()`` function using real
-    ``superset.*`` models (e.g. ``player_overview.py``).
+#496: legacy top-level ``configs/superset/import_dashboards.py`` (glob-вариант
+с dataclass ``Dashboard``) удалён — он не монтировался в контейнер и нигде не
+вызывался. Единственный оркестратор — ``dashboards/import_dashboards.py``
+с явным реестром ``DASHBOARDS``.
 
-Both import ``superset.*`` somewhere in their graph — those packages live
-only inside the Superset container. So on the host we stub the ``superset``
-package to make the import graph traversable, then assert each dashboard
-module exposes either a ``DASHBOARD``/``DASHBOARDS`` attribute or a
+Dashboard modules import ``superset.*`` somewhere in their graph — those
+packages live only inside the Superset container. So on the host we stub the
+``superset`` package to make the import graph traversable, then assert each
+dashboard module exposes a ``DASHBOARD``/``DASHBOARDS`` attribute or a
 ``create_dashboard`` callable.
 """
 
@@ -87,13 +86,14 @@ def _superset_stubs():
 
 
 def test_import_dashboards_main_imports() -> None:
-    """`import_dashboards` module is importable with superset stubs in place."""
+    """Оркестратор ``dashboards/import_dashboards.py`` importable + контракт."""
+    if str(DASHBOARDS_DIR) not in sys.path:
+        sys.path.insert(0, str(DASHBOARDS_DIR))
     sys.modules.pop("import_dashboards", None)
-    try:
-        import import_dashboards  # noqa: F401
-    except Exception as exc:  # pragma: no cover — defensive
-        pytest.skip(f"import_dashboards has uncoverable host-side import: {exc}")
-    assert hasattr(import_dashboards, "Dashboard"), "Dashboard dataclass missing"
+    import import_dashboards  # noqa: F401
+    assert isinstance(getattr(import_dashboards, "DASHBOARDS", None), list), \
+        "DASHBOARDS registry missing"
+    assert callable(getattr(import_dashboards, "main", None)), "main() missing"
 
 
 def test_dashboards_import() -> None:

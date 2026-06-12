@@ -11,7 +11,6 @@ configs/superset/
   superset_config.py       # Flask config (override secrets/CORS/...)
   datasources.yaml         # source-of-truth для database + datasets
   import_datasources.py    # idempotent upsert datasources.yaml -> Superset DB
-  import_dashboards.py     # idempotent upsert dashboards/*.py -> Superset DB
   dashboards/
     __init__.py
     player_overview.py     # fct_player_match / fct_shot / fct_match_rating
