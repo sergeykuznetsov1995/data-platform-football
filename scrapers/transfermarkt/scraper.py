@@ -74,12 +74,27 @@ R0_2B_FALLBACK_MARKER = 'TM_FALLBACK'
 # proxies, CF lockout). Module-level so tests can monkeypatch it.
 _MAX_CONSECUTIVE_FAILURES = 50
 
+# Per-player loops abort when the in-run success/attempted ratio falls
+# below this threshold. Module-level so tests can monkeypatch it.
+_MIN_SUCCESS_RATIO = 0.9
+
 
 class ConsecutiveFailureError(RuntimeError):
     """Raised when a per-player loop hits the consecutive-failure cap.
 
     Propagating (instead of returning a partial frame) protects the
     existing bronze partition from a replace_partitions wipe (#457).
+    """
+
+
+class PartialScrapeError(RuntimeError):
+    """Raised when the in-run success ratio falls below ``_MIN_SUCCESS_RATIO``.
+
+    Intermittent failures (e.g. every 2nd player fails) reset the
+    consecutive counter and never trip the #457 cap, yet still produce a
+    half-empty frame that the runner would save with replace_partitions.
+    Total failure (0 successes) is NOT raised here — the empty frame takes
+    the graceful TM_FALLBACK path and nothing gets saved (#484).
     """
 
 
@@ -605,6 +620,33 @@ class TransfermarktScraper(BaseScraper):
 
     # ---------------------- bronze resolver ----------------------------------
 
+    def _bronze_connection(self):
+        """Trino DB-API connection for bronze lookups (env-driven auth)."""
+        import os
+
+        import trino
+        import trino.auth as trino_auth
+
+        user = os.environ.get('TRINO_USER', 'airflow')
+        password = os.environ.get('TRINO_PASSWORD')
+
+        if password:
+            return trino.dbapi.connect(
+                host=os.environ.get('TRINO_HOST', 'trino'),
+                port=int(os.environ.get('TRINO_PORT', 8443)),
+                user=user,
+                catalog='iceberg',
+                http_scheme='https',
+                auth=trino_auth.BasicAuthentication(user, password),
+                verify=False,
+            )
+        return trino.dbapi.connect(
+            host=os.environ.get('TRINO_HOST', 'trino'),
+            port=int(os.environ.get('TRINO_PORT', 8080)),
+            user=user,
+            catalog='iceberg',
+        )
+
     def _resolve_player_ids_from_bronze(
         self,
         league: str,
@@ -616,38 +658,14 @@ class TransfermarktScraper(BaseScraper):
         Mirrors ``scrapers/sofascore/scraper.py:_resolve_player_ids_from_bronze``
         — the dependent entities (``transfers``, ``mv_history``) need a fresh
         roster from the ``players`` entity before they can fan out per-player.
+
+        With ``limit`` the subset is ordered by player_id: a deterministic
+        sample keeps the partition's distinct-player count stable across
+        runs (replace-guard input, #484/#486) and makes mv_history and
+        transfers sample the SAME players.
         """
         try:
-            import os
-
-            import trino
-            import trino.auth as trino_auth
-        except ImportError as e:  # pragma: no cover
-            logger.error("trino client unavailable: %s", e)
-            return []
-
-        user = os.environ.get('TRINO_USER', 'airflow')
-        password = os.environ.get('TRINO_PASSWORD')
-
-        try:
-            if password:
-                conn = trino.dbapi.connect(
-                    host=os.environ.get('TRINO_HOST', 'trino'),
-                    port=int(os.environ.get('TRINO_PORT', 8443)),
-                    user=user,
-                    catalog='iceberg',
-                    http_scheme='https',
-                    auth=trino_auth.BasicAuthentication(user, password),
-                    verify=False,
-                )
-            else:
-                conn = trino.dbapi.connect(
-                    host=os.environ.get('TRINO_HOST', 'trino'),
-                    port=int(os.environ.get('TRINO_PORT', 8080)),
-                    user=user,
-                    catalog='iceberg',
-                )
-
+            conn = self._bronze_connection()
             cur = conn.cursor()
             sql = (
                 "SELECT DISTINCT player_id "
@@ -655,7 +673,7 @@ class TransfermarktScraper(BaseScraper):
                 "WHERE league = ? AND season = ?"
             )
             if limit:
-                sql = sql + f" LIMIT {int(limit)}"
+                sql = sql + f" ORDER BY player_id LIMIT {int(limit)}"
             cur.execute(sql, (league, season_short))
             rows = cur.fetchall()
             return [str(r[0]) for r in rows if r and r[0]]
@@ -664,6 +682,46 @@ class TransfermarktScraper(BaseScraper):
                 "Could not resolve transfermarkt player_ids from bronze: %s", e,
             )
             return []
+
+    def count_bronze_partition_players(
+        self,
+        table_name: str,
+        league: str,
+        season: int,
+    ) -> Optional[int]:
+        """COUNT(DISTINCT player_id) in the ``(league, season)`` bronze partition.
+
+        Guard input for the runner's replace-partitions completeness check
+        (#484/#486). ``season`` is the 4-digit start year (2025 → partition
+        '2526'), same convention as the ``read_*`` entry points — short
+        forms are rejected because ``_season_short('2526')`` would
+        double-shorten to '2627' and silently count 0 (an always-passing
+        guard). Returns ``None`` when the count is unavailable (table
+        missing on a first run, Trino unreachable) — callers treat that as
+        "guard skipped".
+        """
+        if not (2000 <= int(season) <= 2099):
+            raise ValueError(
+                f"season must be a 4-digit start year (e.g. 2025), got {season!r}"
+            )
+        season_short = _season_short(int(season))
+        try:
+            conn = self._bronze_connection()
+            cur = conn.cursor()
+            cur.execute(
+                f"SELECT count(DISTINCT player_id) "
+                f"FROM iceberg.bronze.{table_name} "
+                f"WHERE league = ? AND season = ?",
+                (league, season_short),
+            )
+            row = cur.fetchone()
+            return int(row[0]) if row else None
+        except Exception as e:
+            logger.warning(
+                "Could not count bronze players in %s for (%s, %s): %s",
+                table_name, league, season_short, e,
+            )
+            return None
 
     # ---------------------- read_* entry points ------------------------------
 
@@ -759,6 +817,7 @@ class TransfermarktScraper(BaseScraper):
         # Step 3 — per-player profile page → enrich bio fields.
         rows: List[Dict] = []
         consecutive_failures = 0
+        successes = 0
         today = datetime.utcnow().date()
         for idx, sp in enumerate(squad_players, start=1):
             profile_url = (
@@ -782,6 +841,7 @@ class TransfermarktScraper(BaseScraper):
                     )
                 continue
             consecutive_failures = 0
+            successes += 1
             bio = _parse_player_profile(payload, sp['player_id']) or {}
 
             # Merge squad-level MV / club_id with profile-level enrichment.
@@ -820,6 +880,13 @@ class TransfermarktScraper(BaseScraper):
                 R0_2B_FALLBACK_MARKER,
             )
             return pd.DataFrame(columns=anchor_cols + ['_ingested_at'])
+
+        if successes < _MIN_SUCCESS_RATIO * len(squad_players):
+            raise PartialScrapeError(
+                f"only {successes}/{len(squad_players)} player profiles "
+                f"fetched (< {_MIN_SUCCESS_RATIO:.0%}) — aborting to protect "
+                f"existing partition"
+            )
 
         df = pd.DataFrame(rows)
         df['league'] = league
@@ -869,6 +936,7 @@ class TransfermarktScraper(BaseScraper):
 
         rows: List[Dict] = []
         consecutive_failures = 0
+        successes = 0
         for idx, pid in enumerate(player_ids, start=1):
             url = f"{_TM_BASE}" + _PLAYER_MV_HISTORY_PATH.format(player_id=pid)
             payload = self._fetch_json(
@@ -884,12 +952,20 @@ class TransfermarktScraper(BaseScraper):
                     )
                 continue
             consecutive_failures = 0
+            successes += 1
             rows.extend(_parse_mv_history(payload, pid))
             if idx % 50 == 0:
                 logger.info("mv_history progress: %d/%d", idx, len(player_ids))
 
         if not rows:
             return pd.DataFrame(columns=anchor_cols + ['_ingested_at'])
+
+        if successes < _MIN_SUCCESS_RATIO * len(player_ids):
+            raise PartialScrapeError(
+                f"only {successes}/{len(player_ids)} mv_history payloads "
+                f"fetched (< {_MIN_SUCCESS_RATIO:.0%}) — aborting to protect "
+                f"existing partition"
+            )
 
         df = pd.DataFrame(rows)
         df['league'] = league
@@ -938,6 +1014,7 @@ class TransfermarktScraper(BaseScraper):
 
         rows: List[Dict] = []
         consecutive_failures = 0
+        successes = 0
         for idx, pid in enumerate(player_ids, start=1):
             url = f"{_TM_BASE}" + _PLAYER_TRANSFERS_PATH.format(player_id=pid)
             payload = self._fetch_json(
@@ -953,12 +1030,20 @@ class TransfermarktScraper(BaseScraper):
                     )
                 continue
             consecutive_failures = 0
+            successes += 1
             rows.extend(_parse_transfers(payload, pid))
             if idx % 50 == 0:
                 logger.info("transfers progress: %d/%d", idx, len(player_ids))
 
         if not rows:
             return pd.DataFrame(columns=anchor_cols + ['league', 'season', '_ingested_at'])
+
+        if successes < _MIN_SUCCESS_RATIO * len(player_ids):
+            raise PartialScrapeError(
+                f"only {successes}/{len(player_ids)} transfers payloads "
+                f"fetched (< {_MIN_SUCCESS_RATIO:.0%}) — aborting to protect "
+                f"existing partition"
+            )
 
         df = pd.DataFrame(rows)
         df['league'] = league

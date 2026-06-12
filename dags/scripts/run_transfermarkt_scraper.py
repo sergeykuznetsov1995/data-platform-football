@@ -19,13 +19,17 @@ Supported entities:
                               endpoint.
 
 Exit codes:
-    0 — scrape completed successfully (>= 1 row written)
+    0 — scrape completed successfully (>= 1 row written, or ``--dry-run``)
     1 — hard failure (exception raised, runner crashed)
     2 — graceful ``TM_FALLBACK``: upstream endpoint unavailable (HTTP 403,
         proxy quota empty, repeated timeouts), or the bronze players table
         is missing/empty when a dependent entity ran. DataFrame is empty,
         nothing written to bronze. The DAG wraps exit 2 → exit 0 so
         validate_data can still summarise the run.
+    3 — ``TM_REPLACE_GUARD``: completeness guard refused the
+        replace-partitions save because the scraped frame holds fewer
+        distinct players than 90% of the existing bronze partition
+        (#484/#486). Nothing written. Bypass with ``--force-replace``.
 """
 
 from __future__ import annotations
@@ -53,6 +57,13 @@ ENTITY_MV_HISTORY = 'market_value_history'
 ENTITY_TRANSFERS = 'transfers'
 
 VALID_ENTITIES = {ENTITY_PLAYERS, ENTITY_MV_HISTORY, ENTITY_TRANSFERS}
+
+# Replace-partitions completeness guard (#484/#486): refuse the save when
+# the scraped frame holds fewer distinct players than this share of the
+# existing bronze partition. Distinct players (not raw rows) because
+# per-player timeline lengths vary wildly for mv_history/transfers.
+_MIN_REPLACE_RATIO = 0.9
+REPLACE_GUARD_MARKER = 'TM_REPLACE_GUARD'
 
 
 def _write_results(path: str, payload: dict) -> None:
@@ -85,11 +96,48 @@ def _classify_fallback(scraper) -> str:
     return f'http_{status}'
 
 
+def _replace_guard_blocks(
+    scraper,
+    table_name: str,
+    league: str,
+    season: int,
+    new_players: int,
+    results: dict,
+) -> Optional[str]:
+    """Completeness check before a replace-partitions save (#484/#486).
+
+    Returns a block-reason string when the scraped frame would shrink the
+    existing bronze partition below ``_MIN_REPLACE_RATIO`` (catches both a
+    silent partial scrape and a ``--limit N`` smoke run). ``None`` count
+    (table missing on first run, Trino unreachable) skips the guard — the
+    save itself also needs Trino, so an unreachable cluster cannot wipe
+    anything.
+    """
+    existing = scraper.count_bronze_partition_players(table_name, league, season)
+    if existing is None:
+        logger.warning(
+            "%s: existing player count unavailable for %s — proceeding "
+            "without guard.",
+            REPLACE_GUARD_MARKER, table_name,
+        )
+        results['guard_skipped'] = 'count_unavailable'
+        return None
+    if existing and new_players < _MIN_REPLACE_RATIO * existing:
+        return (
+            f"{REPLACE_GUARD_MARKER}: new_players={new_players} < "
+            f"{_MIN_REPLACE_RATIO:.0%} of existing_players={existing} for "
+            f"{table_name} — refusing replace_partitions save"
+        )
+    return None
+
+
 def _run_players(
     leagues: List[str],
     season: int,
     limit: Optional[int],
     output_path: str,
+    dry_run: bool = False,
+    force_replace: bool = False,
 ) -> int:
     """Anchor entity: league listing → squad pages → per-player profiles.
 
@@ -135,6 +183,29 @@ def _run_players(
                 _write_results(output_path, results)
                 return 2
 
+            results['rows'] = int(len(df))
+            results['players_with_rows'] = int(df['player_id'].nunique())
+
+            if dry_run:
+                results['dry_run'] = True
+                logger.info(
+                    "Dry-run: scraped %d player rows (%d unique) — skipping save.",
+                    results['rows'], results['players_with_rows'],
+                )
+                _write_results(output_path, results)
+                return 0
+
+            if not force_replace:
+                block = _replace_guard_blocks(
+                    scraper, 'transfermarkt_players', league, season,
+                    results['players_with_rows'], results,
+                )
+                if block:
+                    logger.error(block)
+                    results['errors'].append(block)
+                    _write_results(output_path, results)
+                    return 3
+
             table_path = scraper.save_to_iceberg(
                 df=df,
                 table_name='transfermarkt_players',
@@ -142,8 +213,6 @@ def _run_players(
                 replace_partitions=['league', 'season'],
             )
             results['tables'].append(table_path)
-            results['rows'] = int(len(df))
-            results['players_with_rows'] = int(df['player_id'].nunique())
             logger.info(
                 "Saved %d player rows (%d unique) → %s",
                 results['rows'], results['players_with_rows'], table_path,
@@ -163,6 +232,8 @@ def _run_mv_history(
     season: int,
     limit: Optional[int],
     output_path: str,
+    dry_run: bool = False,
+    force_replace: bool = False,
 ) -> int:
     """Per-player MV timeline via the ceapi JSON endpoint.
 
@@ -208,6 +279,30 @@ def _run_mv_history(
                 _write_results(output_path, results)
                 return 2
 
+            results['rows'] = int(len(df))
+            results['players_with_rows'] = int(df['player_id'].nunique())
+
+            if dry_run:
+                results['dry_run'] = True
+                logger.info(
+                    "Dry-run: scraped %d MV history rows for %d players — "
+                    "skipping save.",
+                    results['rows'], results['players_with_rows'],
+                )
+                _write_results(output_path, results)
+                return 0
+
+            if not force_replace:
+                block = _replace_guard_blocks(
+                    scraper, 'transfermarkt_market_value_history', league,
+                    season, results['players_with_rows'], results,
+                )
+                if block:
+                    logger.error(block)
+                    results['errors'].append(block)
+                    _write_results(output_path, results)
+                    return 3
+
             table_path = scraper.save_to_iceberg(
                 df=df,
                 table_name='transfermarkt_market_value_history',
@@ -215,8 +310,6 @@ def _run_mv_history(
                 replace_partitions=['league', 'season'],
             )
             results['tables'].append(table_path)
-            results['rows'] = int(len(df))
-            results['players_with_rows'] = int(df['player_id'].nunique())
             logger.info(
                 "Saved %d MV history rows for %d players → %s",
                 results['rows'], results['players_with_rows'], table_path,
@@ -236,6 +329,8 @@ def _run_transfers(
     season: int,
     limit: Optional[int],
     output_path: str,
+    dry_run: bool = False,
+    force_replace: bool = False,
 ) -> int:
     """Per-player transfers via the ceapi JSON endpoint. Same dependency
     contract as ``_run_mv_history``.
@@ -279,6 +374,30 @@ def _run_transfers(
                 _write_results(output_path, results)
                 return 2
 
+            results['rows'] = int(len(df))
+            results['players_with_rows'] = int(df['player_id'].nunique())
+
+            if dry_run:
+                results['dry_run'] = True
+                logger.info(
+                    "Dry-run: scraped %d transfer rows for %d players — "
+                    "skipping save.",
+                    results['rows'], results['players_with_rows'],
+                )
+                _write_results(output_path, results)
+                return 0
+
+            if not force_replace:
+                block = _replace_guard_blocks(
+                    scraper, 'transfermarkt_transfers', league, season,
+                    results['players_with_rows'], results,
+                )
+                if block:
+                    logger.error(block)
+                    results['errors'].append(block)
+                    _write_results(output_path, results)
+                    return 3
+
             table_path = scraper.save_to_iceberg(
                 df=df,
                 table_name='transfermarkt_transfers',
@@ -286,8 +405,6 @@ def _run_transfers(
                 replace_partitions=['league', 'season'],
             )
             results['tables'].append(table_path)
-            results['rows'] = int(len(df))
-            results['players_with_rows'] = int(df['player_id'].nunique())
             logger.info(
                 "Saved %d transfer rows for %d players → %s",
                 results['rows'], results['players_with_rows'], table_path,
@@ -334,6 +451,17 @@ def main() -> int:
         default='/tmp/transfermarkt_result.json',
         help='Output JSON file path (also printed to stdout)',
     )
+    parser.add_argument(
+        '--dry-run',
+        action='store_true',
+        help='Scrape and report rows without saving to Iceberg (smoke runs)',
+    )
+    parser.add_argument(
+        '--force-replace',
+        action='store_true',
+        help='Bypass the completeness guard and replace the partition '
+             'unconditionally (operator recovery, never used by the DAG)',
+    )
     args = parser.parse_args()
 
     entity = args.entity.lower()
@@ -350,11 +478,20 @@ def main() -> int:
     )
 
     if entity == ENTITY_PLAYERS:
-        return _run_players(leagues, args.season, args.limit, args.output)
+        return _run_players(
+            leagues, args.season, args.limit, args.output,
+            args.dry_run, args.force_replace,
+        )
     if entity == ENTITY_MV_HISTORY:
-        return _run_mv_history(leagues, args.season, args.limit, args.output)
+        return _run_mv_history(
+            leagues, args.season, args.limit, args.output,
+            args.dry_run, args.force_replace,
+        )
     if entity == ENTITY_TRANSFERS:
-        return _run_transfers(leagues, args.season, args.limit, args.output)
+        return _run_transfers(
+            leagues, args.season, args.limit, args.output,
+            args.dry_run, args.force_replace,
+        )
     return 1
 
 
