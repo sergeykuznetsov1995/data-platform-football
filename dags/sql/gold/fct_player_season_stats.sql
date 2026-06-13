@@ -180,8 +180,13 @@ SELECT
     CAST(COALESCE(us.key_passes,                                                      ss.key_passes)     AS BIGINT) AS key_passes,
     CAST(fb.own_goals                                                                                   AS BIGINT) AS own_goals,
     CAST(fb.second_yellow                                                                               AS BIGINT) AS second_yellow,
-    CAST(COALESCE(us.non_penalty_goals,
-                  CAST(fb.goals AS BIGINT) - CAST(fb.penalty_goals AS BIGINT))                          AS BIGINT) AS non_penalty_goals,
+    -- #437: derive from the SAME merged goals/penalty_goals expressions as the
+    -- columns above so `goals - penalty_goals == non_penalty_goals` holds within
+    -- every row. Previously us.non_penalty_goals was Understat-first while
+    -- goals/penalty_goals were FBref-first → cross-source arithmetic mismatch.
+    -- Trino can't reference a SELECT alias at the same level, so repeat verbatim.
+    CAST(COALESCE(fb.goals,         fm.goals,          us.goals)         AS BIGINT)
+      - CAST(COALESCE(fb.penalty_goals,                ss.penalty_goals) AS BIGINT)                      AS non_penalty_goals,
 
     -- ========= Percentages (single column, COALESCE) =========
     -- Платформы вычисляют по-разному, но разница ≤2% — приемлемо для single

@@ -42,6 +42,27 @@ class TestFctPlayerSeasonStatsSql:
         assert "iceberg.silver.whoscored_player_season_aggregate" in sql
         assert "iceberg.silver.understat_player_season_aggregate" in sql
 
+    def test_non_penalty_goals_consistent_with_goals_and_penalty_goals(self):
+        """#437: non_penalty_goals must equal the reported goals minus the
+        reported penalty_goals — derived from the SAME merged COALESCE
+        expressions as the `goals`/`penalty_goals` columns, NOT from the
+        Understat-first ``us.non_penalty_goals`` (which desynced the within-row
+        arithmetic: goals - penalty_goals != non_penalty_goals cross-source)."""
+        sql = _strip_comments(_read_sql())
+        assert "us.non_penalty_goals" not in sql, (
+            "non_penalty_goals must NOT be sourced from us.non_penalty_goals "
+            "(Understat-first) — it desyncs goals - penalty_goals (#437)"
+        )
+        assert re.search(
+            r"CAST\(COALESCE\(fb\.goals[^)]*\)\s*AS\s+BIGINT\)\s*-\s*"
+            r"CAST\(COALESCE\(fb\.penalty_goals[^)]*\)\s*AS\s+BIGINT\)\s*"
+            r"AS\s+non_penalty_goals",
+            sql, re.IGNORECASE | re.DOTALL,
+        ), (
+            "non_penalty_goals must be derived as CAST(COALESCE(fb.goals, ...) AS "
+            "BIGINT) - CAST(COALESCE(fb.penalty_goals, ...) AS BIGINT) (#437)"
+        )
+
     def test_fbref_spine_filter(self):
         """Spine = (canonical_id, league, season) FBref-only из xref_player."""
         sql = _read_sql()
