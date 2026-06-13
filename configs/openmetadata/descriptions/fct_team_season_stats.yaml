@@ -255,6 +255,26 @@ columns:
   - name: shots_outside_box
     description: Удары из-за штрафной (FotMob-only).
 
+  # ─── Team-finance — APL 2025/26 only, else NULL (#192, #195) ───
+  - name: squad_market_value_eur
+    description: |
+      Суммарная рыночная стоимость состава в EUR (Transfermarkt-only;
+      SUM рыночных стоимостей игроков команды за сезон). Покрытие — только
+      APL 2025/26 (season '2526'); для прочих лиг/сезонов NULL (bridge через
+      xref_team source='transfermarkt'). Issue #192.
+  - name: total_wage_bill_gbp
+    description: |
+      Годовой gross-фонд оплаты труда состава в GBP (Capology-only;
+      CAST(SUM(annual_gross_gbp) AS BIGINT)). Покрытие — только APL 2025/26
+      (season '2526'); иначе NULL (bridge через xref_team source='capology').
+      Issue #192.
+  - name: total_wage_bill_eur
+    description: |
+      Годовой gross-фонд оплаты труда состава в EUR (Capology-only;
+      CAST(SUM(annual_gross_eur) AS BIGINT)). EUR-сиблинг total_wage_bill_gbp
+      для кросс-валютной сопоставимости со squad_market_value_eur. Покрытие —
+      только APL 2025/26 (season '2526'); иначе NULL. Issue #195 / PR #244.
+
   # ─── Lineage ───
   - name: _gold_created_at
     description: Технический timestamp материализации строки CTAS (UTC).
