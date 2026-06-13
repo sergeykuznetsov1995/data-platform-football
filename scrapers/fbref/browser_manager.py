@@ -193,6 +193,7 @@ class FBrefBrowserMixin:
                 pre_content_js=FBREF_UNCOMMENT_TABLES_JS,
                 content_timeout=30.0,
                 slow_proxy_threshold=15.0,   # 25→15: normal load 5-8s, 15s is suspicious
+                cf_cookies_file=getattr(self, 'cf_cookies_file', None),  # issue #118
             )
             logger.debug(
                 f"Initialized nodriver browser (headless={self.headless}, "

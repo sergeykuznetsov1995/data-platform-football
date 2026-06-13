@@ -117,6 +117,7 @@ class FBrefScraper(
         proxy_file: Optional[str] = None,
         use_nodriver: bool = False,
         nodriver_cloudflare_wait: float = 30.0,
+        cf_cookies_file: Optional[str] = None,
         **kwargs
     ):
         """
@@ -143,6 +144,9 @@ class FBrefScraper(
         )
         self.use_nodriver = use_nodriver
         self.nodriver_cloudflare_wait = nodriver_cloudflare_wait
+        # Issue #118: inter-process CF cookie cache file (set by run_fbref_scraper
+        # from --cf-cookies-file); read by FBrefBrowserMixin._get_nodriver_browser.
+        self.cf_cookies_file = cf_cookies_file
         self._page_cache: Dict[str, str] = {}
         self._pages_fetched: int = 0  # Counter for browser restart
         self._nodriver_browser = None  # Separate instance for nodriver

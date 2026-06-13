@@ -285,6 +285,14 @@ def main():
         default=None,
         help='Path to file with proxies (format: host:port:user:pass)'
     )
+    parser.add_argument(
+        '--cf-cookies-file',
+        type=str,
+        default=None,
+        help='Path to JSON file with pre-warmed CF cookies (issue #118). When '
+             'fresh (<25 min), cookies are injected before the first page load '
+             'to skip the Cloudflare challenge.'
+    )
 
     # === Selenium-specific arguments ===
     parser.add_argument(
@@ -491,6 +499,7 @@ def main():
                 max_retries=args.max_retries,
                 cf_verify_max_retries=args.cf_verify_retries,
                 content_timeout=args.content_timeout,
+                cf_cookies_file=args.cf_cookies_file,
             ) as scraper:
 
                 # =============================================================
@@ -649,6 +658,7 @@ def main():
                 proxy_file=args.proxy_file,
                 use_nodriver=args.use_nodriver,
                 nodriver_cloudflare_wait=args.nodriver_cloudflare_wait,
+                cf_cookies_file=args.cf_cookies_file,
             ) as scraper:
 
                 # =============================================================

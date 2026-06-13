@@ -117,6 +117,7 @@ class NodriverFBrefScraper(BaseScraper):
         max_retries: int = MAX_RETRIES,
         cf_verify_max_retries: int = CF_VERIFY_MAX_RETRIES,
         content_timeout: float = CONTENT_TIMEOUT,
+        cf_cookies_file: Optional[str] = None,
     ):
         """
         Initialize NodriverFBrefScraper.
@@ -150,6 +151,9 @@ class NodriverFBrefScraper(BaseScraper):
         self.max_retries = max_retries
         self.cf_verify_max_retries = cf_verify_max_retries
         self.content_timeout = content_timeout
+        # Issue #118: inter-process CF cookie cache file (set by run_fbref_scraper
+        # from --cf-cookies-file); forwarded to each NodriverBypass instance.
+        self.cf_cookies_file = cf_cookies_file
 
         # Initialize proxy manager (nodriver-specific: weighted strategy)
         if proxy_file:
@@ -236,6 +240,7 @@ class NodriverFBrefScraper(BaseScraper):
             # in Python by extract_tables_from_comments() regardless.
             pre_content_js=FBREF_UNCOMMENT_TABLES_JS,
             slow_proxy_threshold=slow_proxy_threshold,
+            cf_cookies_file=self.cf_cookies_file,
         )
 
         logger.debug(

@@ -182,6 +182,7 @@ class NodriverBypass:
         wait_for_content_timeout: float = 120.0,
         wait_for_content_poll: float = 5.0,
         slow_proxy_threshold: float = 15.0,
+        cf_cookies_file: Optional[str] = None,
     ):
         """
         Initialize NodriverBypass.
@@ -239,6 +240,12 @@ class NodriverBypass:
         # Slow proxy detection: page.get() > threshold -> SlowProxyError
         # Set to 0 to disable slow proxy detection
         self.slow_proxy_threshold = slow_proxy_threshold
+
+        # Issue #118: optional inter-process CF cookie cache file (written by
+        # the FBref prewarm task). When set and fresh, cookies are injected in
+        # start() to skip the Cloudflare challenge on the first navigation.
+        self.cf_cookies_file = cf_cookies_file
+        self._cf_cookies_injected = False
 
         self._browser = None
         self._page = None
@@ -511,6 +518,20 @@ class NodriverBypass:
         except Exception as e:
             logger.warning(f"Could not enable network tracking: {e}")
 
+        # Issue #118: inject pre-warmed CF cookies from the inter-process file
+        # cache BEFORE the first navigation, so the initial get() skips the
+        # Cloudflare challenge (no CSS/fonts/JS warm-up download). Best-effort:
+        # cookies are (IP, UA)-bound, so a proxy mismatch just means CF
+        # re-challenges harmlessly.
+        if self.cf_cookies_file and not self._cf_cookies_injected:
+            file_cookies = self._load_cf_cookies_file(self.cf_cookies_file)
+            if file_cookies:
+                try:
+                    if await self.inject_cookies(file_cookies):
+                        self._cf_cookies_injected = True
+                except Exception as e:
+                    logger.debug(f"CF cookie file injection skipped: {e}")
+
         logger.debug("Nodriver browser started successfully")
 
     # ------------------------------------------------------------------ #
@@ -707,6 +728,51 @@ class NodriverBypass:
                 "httpOnly": True,
             })
         return result
+
+    @staticmethod
+    def _load_cf_cookies_file(path: Optional[str], max_age_min: float = 25.0) -> list:
+        """Load pre-warmed CF cookies from the inter-process JSON cache (issue #118).
+
+        The file is written by the FBref prewarm task and shared with scraper
+        subprocesses (BashOperator) that cannot read Airflow XCom. Returns the
+        list of cookie dicts when the file exists and its ``extracted_at`` is
+        younger than ``max_age_min`` minutes; otherwise returns []. Never raises
+        — any problem degrades gracefully to a fresh Cloudflare challenge.
+
+        Default max age 25 min mirrors CF_COOKIE_CACHE_TTL_MINUTES in the DAG
+        (slightly under the ~30 min cf_clearance lifetime).
+        """
+        if not path:
+            return []
+        import os
+        if not os.path.exists(path):
+            return []
+        import json
+        from datetime import datetime
+        try:
+            with open(path) as f:
+                data = json.load(f)
+        except (OSError, ValueError) as e:
+            logger.debug(f"CF cookie file unreadable ({path}): {e}")
+            return []
+        if not isinstance(data, dict):
+            return []
+        extracted_at = data.get("extracted_at")
+        if extracted_at:
+            try:
+                age_min = (
+                    datetime.now() - datetime.fromisoformat(extracted_at)
+                ).total_seconds() / 60.0
+            except (TypeError, ValueError):
+                return []
+            if age_min > max_age_min:
+                logger.info(
+                    f"CF cookie file stale ({age_min:.1f} min > {max_age_min}); "
+                    f"ignoring {path}"
+                )
+                return []
+        cookies = data.get("cookies")
+        return cookies if isinstance(cookies, list) else []
 
     async def inject_cookies(self, cookies: list) -> int:
         """Inject cookies into the running browser via CDP Network.setCookie.

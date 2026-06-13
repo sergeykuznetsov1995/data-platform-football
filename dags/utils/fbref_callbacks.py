@@ -11,6 +11,48 @@ Callback and callable functions for FBref DAG PythonOperator tasks.
 from typing import Any, Dict
 
 
+def _write_cf_cookies_file(
+    path: str,
+    cookies: Dict[str, str],
+    proxy_idx: int = -1,
+) -> bool:
+    """Write pre-warmed CF cookies to the inter-process JSON cache (issue #118).
+
+    Converts the ``{name: value}`` dict returned by CFCookieManager into the
+    list-of-dict shape that NodriverBypass.inject_cookies expects, stamps
+    ``extracted_at`` (ISO 8601) and ``proxy_idx``, and writes atomically via
+    os.replace. Returns True on success, False on any OS error.
+    """
+    import json
+    import os
+    from datetime import datetime
+
+    cookie_list = [
+        {
+            "name": name,
+            "value": value,
+            "domain": ".fbref.com",
+            "path": "/",
+            "secure": True,
+            "httpOnly": True,
+        }
+        for name, value in cookies.items()
+    ]
+    payload = {
+        "cookies": cookie_list,
+        "extracted_at": datetime.now().isoformat(),
+        "proxy_idx": proxy_idx,
+    }
+    tmp_path = f"{path}.tmp"
+    try:
+        with open(tmp_path, "w") as f:
+            json.dump(payload, f)
+        os.replace(tmp_path, path)
+        return True
+    except OSError:
+        return False
+
+
 def prewarm_cf_cookies(
     proxy_file: str,
     cache_ttl_minutes: int,
@@ -19,6 +61,7 @@ def prewarm_cf_cookies(
     cf_verify_interval: float,
     use_xvfb: bool,
     max_attempts: int,
+    cf_cookies_file: str = '/tmp/fbref_cf_cookies.json',
     **context,
 ) -> Dict[str, Any]:
     """
@@ -85,6 +128,25 @@ def prewarm_cf_cookies(
         if cookies and 'cf_clearance' in cookies:
             # Success - push cookies to XCom for scraper tasks
             context['ti'].xcom_push(key='cf_cookies', value=cookies)
+
+            # Issue #118: also persist to a file so scraper SUBPROCESSES
+            # (BashOperator) can read the cookies — XCom is unreachable across
+            # the process boundary. proxy_idx is best-effort (diagnostic only).
+            proxy_idx = -1
+            try:
+                used = proxy_manager.get_current_proxy()
+                if used is not None and used in proxy_manager._proxies:
+                    proxy_idx = proxy_manager._proxies.index(used)
+            except Exception:
+                proxy_idx = -1
+            if _write_cf_cookies_file(cf_cookies_file, cookies, proxy_idx):
+                logger.info(
+                    f"Wrote {len(cookies)} CF cookies to {cf_cookies_file} "
+                    f"(proxy_idx={proxy_idx})"
+                )
+            else:
+                logger.warning(f"Could not write CF cookies file: {cf_cookies_file}")
+
             result['success'] = True
             result['cookie_count'] = len(cookies)
             result['cookies'] = list(cookies.keys())

@@ -48,6 +48,7 @@ def _build_nodriver_command(
     stat_type: str | None = None,
     data_category: str | None = None,
     match_data_type: str | None = None,
+    cf_cookies_file: str | None = None,
 ) -> str:
     """Build bash command for nodriver scraper type."""
     nodriver_args = []
@@ -57,6 +58,8 @@ def _build_nodriver_command(
         nodriver_args.append('--use-xvfb')
     if proxy_file:
         nodriver_args.append(f'--proxy-file {proxy_file}')
+    if cf_cookies_file:
+        nodriver_args.append(f'--cf-cookies-file {cf_cookies_file}')
     nodriver_args.append(f'--cloudflare-wait {cloudflare_wait}')
     nodriver_args.append(f'--content-timeout {content_timeout}')
     nodriver_args.append(f'--max-retries {max_retries}')
@@ -101,6 +104,7 @@ def _build_selenium_command(
     data_category: str | None = None,
     match_data_type: str | None = None,
     max_matches: int = 0,
+    cf_cookies_file: str | None = None,
 ) -> str:
     """Build bash command for selenium scraper type."""
     selenium_args_list = []
@@ -113,6 +117,8 @@ def _build_selenium_command(
         selenium_args_list.append(f'--nodriver-cloudflare-wait {nodriver_cloudflare_wait}')
     if proxy_file:
         selenium_args_list.append(f'--proxy-file {proxy_file}')
+    if cf_cookies_file:
+        selenium_args_list.append(f'--cf-cookies-file {cf_cookies_file}')
     selenium_args = ' '.join(selenium_args_list)
 
     mode_args = ''
@@ -160,6 +166,7 @@ def create_single_stat_task(
     nodriver_max_retries: int = 2,
     nodriver_cf_verify_retries: int = 6,
     proxy_file: str | None = None,
+    cf_cookies_file: str | None = None,
     # Compatibility kwargs accepted but no longer used (Apr 2026):
     # the soccerdata branch was removed because curl_cffi cannot bypass
     # Cloudflare Turnstile. Kept here so existing call sites do not break.
@@ -198,6 +205,7 @@ def create_single_stat_task(
     if scraper_type == 'nodriver':
         bash_command = _build_nodriver_command(
             mode='single_stat',
+            cf_cookies_file=cf_cookies_file,
             leagues_str=leagues_str,
             season=season,
             output_file=output_file,
@@ -214,6 +222,7 @@ def create_single_stat_task(
     else:
         bash_command = _build_selenium_command(
             mode='single_stat',
+            cf_cookies_file=cf_cookies_file,
             leagues_str=leagues_str,
             season=season,
             output_file=output_file,
@@ -248,6 +257,7 @@ def create_match_data_task(
     nodriver_max_retries: int = 2,
     nodriver_cf_verify_retries: int = 6,
     proxy_file: str | None = None,
+    cf_cookies_file: str | None = None,
     # Compatibility kwargs accepted but no longer used (Apr 2026):
     # the soccerdata branch was removed because curl_cffi cannot bypass
     # Cloudflare Turnstile.
@@ -295,6 +305,7 @@ def create_match_data_task(
     if effective_scraper == 'nodriver':
         bash_command = _build_nodriver_command(
             mode='match_data',
+            cf_cookies_file=cf_cookies_file,
             leagues_str=leagues_str,
             season=season,
             output_file=output_file,
@@ -310,6 +321,7 @@ def create_match_data_task(
     else:
         bash_command = _build_selenium_command(
             mode='match_data',
+            cf_cookies_file=cf_cookies_file,
             leagues_str=leagues_str,
             season=season,
             output_file=output_file,
@@ -339,6 +351,7 @@ def create_combined_match_data_task(
     use_nodriver: bool = True,
     nodriver_cloudflare_wait: float = 30.0,
     proxy_file: str | None = None,
+    cf_cookies_file: str | None = None,
 ) -> BashOperator:
     """
     Create a BashOperator task for collecting ALL match-level data in one pass.
@@ -372,6 +385,7 @@ def create_combined_match_data_task(
 
     bash_command = _build_selenium_command(
         mode='combined_match_data',
+        cf_cookies_file=cf_cookies_file,
         leagues_str=leagues_str,
         season=season,
         output_file=output_file,

@@ -120,11 +120,20 @@ CF_COOKIE_CACHE_TTL_MINUTES = 25  # Slightly less than 30min CF cookie lifetime
 # =============================================================================
 # Pre-solve Cloudflare Turnstile before starting scraper tasks
 # Reduces 403 errors by having valid cookies ready
-CF_COOKIE_PREWARM = False  # Disabled to prevent OOM during ingestion
+# Issue #118: prewarm solves CF once and writes cookies to CF_COOKIES_FILE; the
+# scraper subprocesses inject them to skip their own CF challenge (saves the
+# ~1-2 MB warm-up download per cold start). NOTE: prewarm launches Chrome
+# in-process (PythonOperator) — watch scheduler RAM on the first live run.
+CF_COOKIE_PREWARM = True
 CF_COOKIE_PREWARM_ATTEMPTS = 5
 
 # Proxy configuration
 PROXY_FILE = '/opt/airflow/proxys.txt'  # Path to proxy file in container
+
+# Issue #118: inter-process CF cookie cache. prewarm_cf_cookies writes it;
+# each scraper subprocess reads it via --cf-cookies-file and injects the
+# cookies before the first page load to skip the CF challenge.
+CF_COOKIES_FILE = '/tmp/fbref_cf_cookies.json'
 
 # =============================================================================
 # COMMON TASK KWARGS (passed to all task factory functions)
@@ -142,6 +151,7 @@ COMMON_TASK_KWARGS = dict(
     nodriver_max_retries=NODRIVER_MAX_RETRIES,
     nodriver_cf_verify_retries=NODRIVER_CF_VERIFY_RETRIES,
     proxy_file=PROXY_FILE,
+    cf_cookies_file=CF_COOKIES_FILE,
 )
 
 # Subset of kwargs for combined match data task (doesn't use all options)
@@ -153,6 +163,7 @@ COMBINED_MATCH_KWARGS = dict(
     use_nodriver=USE_NODRIVER,
     nodriver_cloudflare_wait=NODRIVER_CLOUDFLARE_WAIT,
     proxy_file=PROXY_FILE,
+    cf_cookies_file=CF_COOKIES_FILE,
 )
 
 
@@ -372,6 +383,7 @@ with DAG(
         python_callable=prewarm_cf_cookies,
         op_kwargs=dict(
             proxy_file=PROXY_FILE,
+            cf_cookies_file=CF_COOKIES_FILE,
             cache_ttl_minutes=CF_COOKIE_CACHE_TTL_MINUTES,
             use_cf_verify=USE_CF_VERIFY_PLUGIN,
             cf_verify_max_retries=CF_VERIFY_MAX_RETRIES,

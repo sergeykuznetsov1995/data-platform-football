@@ -234,3 +234,100 @@ class TestNodriverImportFailure:
         assert result['scraper_type'] == 'nodriver', (
             "scraper_type must not be silently mutated to 'selenium'"
         )
+
+
+class TestCfCookiesFileThreading:
+    """Issue #118: --cf-cookies-file must reach BOTH scraper branches."""
+
+    @pytest.fixture
+    def mock_scraper(self):
+        scraper = MagicMock()
+        scraper._stats = {'successes': 1, 'failures': 0}
+        scraper.get_stats.return_value = scraper._stats
+        scraper.scrape_schedule.return_value = {
+            'schedule': 'iceberg.bronze.fbref_schedule'
+        }
+        scraper.__enter__ = MagicMock(return_value=scraper)
+        scraper.__exit__ = MagicMock(return_value=False)
+        return scraper
+
+    @pytest.fixture
+    def temp_output_file(self):
+        fd, path = tempfile.mkstemp(suffix='.json')
+        os.close(fd)
+        yield path
+        if os.path.exists(path):
+            os.unlink(path)
+
+    def _run(self, args, target, mock_scraper_class):
+        """Run main() with the target scraper class patched; tolerate SystemExit.
+
+        We only assert on how the class was *constructed*, which happens before
+        any mode dispatch, so the exit path is irrelevant.
+        """
+        sys.argv = ['run_fbref_scraper.py'] + args
+        with patch(target, mock_scraper_class):
+            import importlib
+            import dags.scripts.run_fbref_scraper as scraper_module
+            importlib.reload(scraper_module)
+            try:
+                scraper_module.main()
+            except SystemExit:
+                pass
+
+    @pytest.mark.unit
+    def test_nodriver_branch_receives_cf_cookies_file(
+        self, mock_scraper, temp_output_file
+    ):
+        mock_class = MagicMock(return_value=mock_scraper)
+        self._run(
+            [
+                '--scraper-type', 'nodriver',
+                '--mode', 'match_data',
+                '--match-data-type', 'schedule',
+                '--leagues', 'ENG-Premier League',
+                '--season', '2024',
+                '--output', temp_output_file,
+                '--cf-cookies-file', '/tmp/test_cf.json',
+            ],
+            'scrapers.nodriver_fbref.NodriverFBrefScraper',
+            mock_class,
+        )
+        assert mock_class.call_args.kwargs.get('cf_cookies_file') == '/tmp/test_cf.json'
+
+    @pytest.mark.unit
+    def test_selenium_branch_receives_cf_cookies_file(
+        self, mock_scraper, temp_output_file
+    ):
+        mock_class = MagicMock(return_value=mock_scraper)
+        self._run(
+            [
+                '--scraper-type', 'selenium',
+                '--mode', 'match_data',
+                '--match-data-type', 'schedule',
+                '--leagues', 'ENG-Premier League',
+                '--season', '2024',
+                '--output', temp_output_file,
+                '--cf-cookies-file', '/tmp/test_cf.json',
+            ],
+            'scrapers.fbref.FBrefScraper',
+            mock_class,
+        )
+        assert mock_class.call_args.kwargs.get('cf_cookies_file') == '/tmp/test_cf.json'
+
+    @pytest.mark.unit
+    def test_default_cf_cookies_file_is_none(self, mock_scraper, temp_output_file):
+        mock_class = MagicMock(return_value=mock_scraper)
+        self._run(
+            [
+                '--scraper-type', 'nodriver',
+                '--mode', 'match_data',
+                '--match-data-type', 'schedule',
+                '--leagues', 'ENG-Premier League',
+                '--season', '2024',
+                '--output', temp_output_file,
+            ],
+            'scrapers.nodriver_fbref.NodriverFBrefScraper',
+            mock_class,
+        )
+        assert mock_class.call_args.kwargs.get('cf_cookies_file') is None
