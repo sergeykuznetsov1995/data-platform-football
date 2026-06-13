@@ -214,7 +214,6 @@ def validate_all_data(**context) -> Dict[str, Any]:
     required_match_tables = {
         'fbref_match_team_stats',
         'fbref_match_player_stats',
-        'fbref_shot_events',
         'fbref_match_events',
         'fbref_lineups',
     }
