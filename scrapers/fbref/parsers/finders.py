@@ -673,6 +673,12 @@ def _detect_event_type(div) -> str:
 
         if 'own_goal' in cls_str or 'own-goal' in cls_str:
             return 'own_goal'
+        # Missed penalty MUST be checked before the generic 'penalty' branch:
+        # FBref marks it with the `penalty_miss` sprite, whose class also
+        # contains the substring 'penalty' and would otherwise collapse into a
+        # scored penalty and inflate the downstream running score. See #447.
+        if 'penalty_miss' in cls_str or 'penalty-miss' in cls_str:
+            return 'penalty_missed'
         if 'penalty' in cls_str:
             return 'penalty'
         if 'goal' in cls_str:
@@ -685,7 +691,13 @@ def _detect_event_type(div) -> str:
             return 'goal'
         if 'second_yellow' in cls_str or 'second-yellow' in cls_str:
             return 'second_yellow_card'
-        if 'yellow_card' in cls_str or 'yellow-card' in cls_str or 'yellow_red' in cls_str:
+        # Second yellow = sending off. FBref marks it with the `yellow_red_card`
+        # sprite; map to second_yellow_card (NOT yellow_card) so the category is
+        # populated from FBref. See #447. (_parse_team_stats_main already counts
+        # `yellow_red` as a red at team level.)
+        if 'yellow_red' in cls_str or 'yellow-red' in cls_str:
+            return 'second_yellow_card'
+        if 'yellow_card' in cls_str or 'yellow-card' in cls_str:
             return 'yellow_card'
         if 'red_card' in cls_str or 'red-card' in cls_str:
             return 'red_card'

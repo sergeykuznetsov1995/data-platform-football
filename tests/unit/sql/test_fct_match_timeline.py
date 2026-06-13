@@ -369,7 +369,7 @@ class TestFctMatchTimeline:
         assert "second_yellow_card" not in types
         assert "penalty_goal" in types
         assert "second_yellow" in types
-        assert "penalty_missed" in types  # WS-only category
+        assert "penalty_missed" in types  # WhoScored here; also FBref since #447
 
     def test_minute_added_and_period_parsing(self, duck_conn):
         _seed_corpus(duck_conn)
@@ -452,6 +452,31 @@ class TestFctMatchTimeline:
         assert (og["score_home_after"], og["score_away_after"]) == (2, 1)
         scores = [(r["score_home_after"], r["score_away_after"]) for r in m2]
         assert scores == [(1, 0), (1, 0), (1, 1), (1, 1), (1, 1), (2, 1)], scores
+
+    def test_fbref_penalty_missed_does_not_increment_score(self, duck_conn):
+        """#447: a missed penalty from FBref maps to 'penalty_missed' and must
+        NOT increment the running score. Before the scraper fix FBref emitted
+        'penalty' for both scored and missed penalties → gold counted misses as
+        penalty_goal and inflated score_home/away_after."""
+        _seed_corpus(duck_conn)
+        # FBref-only match M7: a goal (→ 1:0) then a missed penalty (→ stays 1:0).
+        duck_conn.execute(
+            f"""
+            INSERT INTO silver_fbref_match_events VALUES
+              ('M7', '20', 'goal',           'PA', 'fb_pa', 'Liverpool', 'home',
+               NULL, NULL, {_TS}, '{_LG}', '2425'),
+              ('M7', '40', 'penalty_missed', 'PB', 'fb_pb', 'Liverpool', 'home',
+               NULL, NULL, {_TS}, '{_LG}', '2425')
+            """
+        )
+        out = _run_gold(duck_conn)
+        m7 = _match_rows(out, "M7")
+        assert [r["event_type"] for r in m7] == ["goal", "penalty_missed"], m7
+        assert all(r["event_source"] == "fbref" for r in m7), m7
+        goal_row, miss_row = m7[0], m7[1]
+        assert (goal_row["score_home_after"], goal_row["score_away_after"]) == (1, 0)
+        # the miss carries the score forward unchanged — NOT 2:0
+        assert (miss_row["score_home_after"], miss_row["score_away_after"]) == (1, 0)
 
     def test_goal_assist_related(self, duck_conn):
         _seed_corpus(duck_conn)

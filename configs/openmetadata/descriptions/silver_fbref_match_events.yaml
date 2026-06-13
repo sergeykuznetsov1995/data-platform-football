@@ -22,8 +22,8 @@ columns:
     description: Минута события (строка, может содержать добавленное время "45+2").
   - name: event_type
     description: |
-      Тип события (lowercase): goal, penalty, own_goal, yellow_card,
-      second_yellow_card, red_card, substitution.
+      Тип события (lowercase): goal, penalty, penalty_missed, own_goal,
+      yellow_card, second_yellow_card, red_card, substitution.
   - name: player
     description: Игрок — фигурант события (автор гола / получатель карточки / ушедший при замене).
     tags:

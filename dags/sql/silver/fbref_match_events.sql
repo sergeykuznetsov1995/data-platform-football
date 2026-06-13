@@ -17,8 +17,8 @@
 --   rows (parse artifacts) that this key correctly collapses.
 --
 -- Notes:
---   * event_type values: goal, penalty, own_goal, yellow_card,
---     second_yellow_card, red_card, substitution.
+--   * event_type values: goal, penalty, penalty_missed, own_goal,
+--     yellow_card, second_yellow_card, red_card, substitution.
 --   * All columns remain VARCHAR — no TRY_CAST needed.
 --   * Partitioning by (league, season) is applied externally by Python CTAS.
 -- =============================================================================
