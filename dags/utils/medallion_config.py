@@ -64,6 +64,7 @@ COMPETITIONS_FILE = 'competitions.yaml'
 PLAYER_ALIASES_FILE = 'player_aliases.yaml'
 REFEREE_ALIASES_FILE = 'referee_aliases.yaml'
 VENUE_ALIASES_FILE = 'venue_aliases.yaml'
+SOURCE_PRIORITY_FILE = 'source_priority.yaml'
 
 # Sentinel for "no source filter" — distinct from None which means "include
 # generic + all sources merged" in get_team_alias_pairs. We pass the bucket
@@ -395,6 +396,62 @@ def load_player_aliases() -> Dict:
     # Normalise null aliases to empty list.
     if doc.get('aliases') is None:
         doc = {**doc, 'aliases': []}
+    return doc
+
+
+def _validate_source_priority_schema(doc: Dict) -> None:
+    """Minimal structural validation for source_priority.yaml (issue #437).
+
+    Each top-level key is a Gold table name; each maps output_alias -> spec,
+    where spec has a non-empty ``sources`` list and every source carries an
+    ``expr``. ``wrap`` (if present) must contain the ``{coalesce}`` marker.
+    """
+    if not isinstance(doc, dict):
+        raise MedallionConfigError(
+            "source_priority.yaml: top level must be a mapping of table -> metrics"
+        )
+    for table, metrics in doc.items():
+        if not isinstance(metrics, dict):
+            raise MedallionConfigError(
+                f"source_priority.yaml: {table!r} must map metric -> spec"
+            )
+        for alias, spec in metrics.items():
+            if not isinstance(spec, dict):
+                raise MedallionConfigError(
+                    f"source_priority.yaml: {table}.{alias} must be a mapping"
+                )
+            sources = spec.get('sources')
+            if not isinstance(sources, list) or not sources:
+                raise MedallionConfigError(
+                    f"source_priority.yaml: {table}.{alias} needs a non-empty "
+                    f"'sources' list"
+                )
+            for j, s in enumerate(sources):
+                if not isinstance(s, dict) or not s.get('expr'):
+                    raise MedallionConfigError(
+                        f"source_priority.yaml: {table}.{alias}.sources[{j}] "
+                        f"missing 'expr'"
+                    )
+            wrap = spec.get('wrap')
+            if wrap is not None and '{coalesce}' not in wrap:
+                raise MedallionConfigError(
+                    f"source_priority.yaml: {table}.{alias} 'wrap' must contain "
+                    f"the {{coalesce}} marker (got {wrap!r})"
+                )
+
+
+def load_source_priority() -> Dict:
+    """Return the parsed source_priority.yaml (issue #437, with schema check).
+
+    Missing file is treated as ``{}`` so an environment without the curated file
+    degrades to "no templated facts" rather than crashing DAG-parse. The
+    .sql.j2 render path raises loudly later if a table it needs is absent.
+    """
+    path = str(CONFIG_DIR / SOURCE_PRIORITY_FILE)
+    if not Path(path).exists():
+        return {}
+    doc = _read_yaml(path)
+    _validate_source_priority_schema(doc)
     return doc
 
 
@@ -983,3 +1040,50 @@ def render_sql_template(sql_path: Path, **context: str) -> str:
             f"{sorted(set(missing))}"
         )
     return rendered
+
+
+# ---------------------------------------------------------------------------
+# Source-priority COALESCE emitter (issue #437)
+# ---------------------------------------------------------------------------
+
+def get_source_priority_exprs(table_name: str) -> Dict[str, str]:
+    """Build the COALESCE SELECT-lines for a fact from source_priority.yaml.
+
+    For each metric of ``table_name`` returns a ``{{ m_<alias> }}`` placeholder
+    value: the full ``<wrap>COALESCE(expr1, expr2, ...) AS <alias>,`` SELECT
+    line (trailing comma included — these are never the last SELECT item, see
+    the .sql.j2 templates). Priority == order of ``sources`` in the YAML.
+
+    The returned dict is passed straight to :func:`render_sql_template` as
+    keyword context, so the keys mirror the template placeholders.
+
+    Raises:
+        MedallionConfigError: if the table has no entry in source_priority.yaml.
+    """
+    metrics = load_source_priority().get(table_name)
+    if not metrics:
+        raise MedallionConfigError(
+            f"source_priority.yaml has no entry for table {table_name!r}"
+        )
+    out: Dict[str, str] = {}
+    for alias, spec in metrics.items():
+        exprs = [s['expr'] for s in spec['sources']]
+        coalesce = f"COALESCE({', '.join(exprs)})"
+        wrap = spec.get('wrap')
+        body = wrap.replace('{coalesce}', coalesce) if wrap else coalesce
+        out[f"m_{alias}"] = f"{body} AS {alias},"
+    return out
+
+
+def render_fact_sql(template_path, table_name: str) -> str:
+    """Render a ``fct_*.sql.j2`` by filling its source-priority placeholders.
+
+    Thin convenience wrapper: pulls the COALESCE lines for ``table_name`` from
+    source_priority.yaml and substitutes them into the template. Returns the
+    rendered SQL string (no file I/O on the output side — the caller decides
+    whether to write a tempfile).
+    """
+    return render_sql_template(
+        Path(template_path),
+        **get_source_priority_exprs(table_name),
+    )

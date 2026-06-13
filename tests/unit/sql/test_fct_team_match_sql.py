@@ -21,18 +21,32 @@ Two test layers (pattern: ``test_fct_standings_logic.py``):
 
 from __future__ import annotations
 
+import os
 import re
+import sys
 from pathlib import Path
 
 import pytest
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
-SQL_PATH = PROJECT_ROOT / "dags" / "sql" / "gold" / "fct_team_match.sql"
+# #437: fct_team_match became a .sql.j2 template — its cross-source COALESCE
+# columns render from configs/medallion/source_priority.yaml. Render here so the
+# structural + DuckDB-transpile tests run against the actually-executed SQL.
+SQL_PATH = PROJECT_ROOT / "dags" / "sql" / "gold" / "fct_team_match.sql.j2"
+
+_DAGS_DIR = PROJECT_ROOT / "dags"
+if str(_DAGS_DIR) not in sys.path:
+    sys.path.insert(0, str(_DAGS_DIR))
+os.environ.setdefault(
+    "MEDALLION_CONFIG_DIR", str(PROJECT_ROOT / "configs" / "medallion")
+)
 
 
 def _read_sql() -> str:
-    return SQL_PATH.read_text(encoding="utf-8")
+    from utils.medallion_config import render_fact_sql
+
+    return render_fact_sql(SQL_PATH, "fct_team_match")
 
 
 def _strip_comments(sql: str) -> str:
@@ -234,7 +248,7 @@ def _bootstrap(con) -> None:
 
 @pytest.fixture(scope="module")
 def fct_rows():
-    sql_text = SQL_PATH.read_text(encoding="utf-8")
+    sql_text = _read_sql()
     try:
         translated = _translate(sql_text)
     except Exception as e:

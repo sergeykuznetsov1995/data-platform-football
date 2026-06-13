@@ -24,6 +24,7 @@ inspection is sufficient to lock the contract.
 
 from __future__ import annotations
 
+import os
 import re
 import sys
 from pathlib import Path
@@ -35,6 +36,11 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 DAGS_DIR = REPO_ROOT / "dags"
 if str(DAGS_DIR) not in sys.path:
     sys.path.insert(0, str(DAGS_DIR))
+# #437: _fct_player_match_output_columns renders the fct_player_match .sql.j2
+# from the shipped config below.
+os.environ.setdefault(
+    "MEDALLION_CONFIG_DIR", str(REPO_ROOT / "configs" / "medallion")
+)
 
 # Import after sys.path wire-up.
 from utils import data_quality as dq  # noqa: E402
@@ -727,7 +733,14 @@ def _fct_player_match_output_columns() -> set:
     derive-from-source so the test follows schema renames instead of
     hardcoding a snapshot.
     """
-    sql = (REPO_ROOT / "dags" / "sql" / "gold" / "fct_player_match.sql").read_text()
+    from utils.medallion_config import render_fact_sql
+
+    # #437: render the .sql.j2 so the COALESCE metric columns (now templated
+    # from source_priority.yaml) reappear as `AS <alias>` projections.
+    sql = render_fact_sql(
+        REPO_ROOT / "dags" / "sql" / "gold" / "fct_player_match.sql.j2",
+        "fct_player_match",
+    )
     final_select = re.split(r"^SELECT\s*$", sql, flags=re.MULTILINE)[-1]
     final_select = re.split(r"^FROM\s", final_select, flags=re.MULTILINE)[0]
     return set(re.findall(r"\bAS\s+(\w+)\s*,?\s*$", final_select, flags=re.MULTILINE))
