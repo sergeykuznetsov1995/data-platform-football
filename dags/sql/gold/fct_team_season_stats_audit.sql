@@ -28,6 +28,10 @@
 -- нужные diff'ам; выражения дословно из main-файла). Без ws_penalties — аудит
 -- пенальти не сравнивает и bronze.whoscored_events не сканирует.
 -- ⚠️ Синхронизировать вручную с fct_team_season_stats.sql.
+--
+-- #556: остаётся inline .sql (НЕ мигрирован на source_priority.yaml) — per-source
+-- diff-layout несовместим с single-COALESCE эмиттером. Sync усечённых CTE выше
+-- закреплён тестом TestAuditCteSync. Решение: docs/decisions/season-audit-inline.md
 -- =============================================================================
 
 WITH

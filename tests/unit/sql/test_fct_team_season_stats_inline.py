@@ -152,3 +152,50 @@ class TestMainSchemaFreeze:
             "Если это осознанно — обнови EXPECTED_MAIN_COLUMNS и проверь "
             "консьюмеров (CREATE OR REPLACE сверяет схему позиционно)."
         )
+
+
+# CTE, которые audit копирует ДОСЛОВНО из одноступенчатых CTE главного файла,
+# усечёнными до diff-колонок (#478). ss_team_season исключён: в main он
+# двухступенчатый (ss_match_rollup → ss_team_season), в audit одноступенчатый —
+# построчного соответствия нет (docs/decisions/season-audit-inline.md).
+_SYNCED_CTES = ["us_team_season", "ws_season_rollup", "fm_team_season"]
+
+
+def _cte_proj_map(sql_body: str, cte_name: str) -> dict:
+    """{alias: <выражение без алиаса, нормализованное sqlglot>} для проекций CTE.
+
+    sqlglot канонизирует форматирование, поэтому сравнение устойчиво к
+    выравниванию/пробелам; comments=False отбрасывает `-- ...` внутри CTE.
+    """
+    tree = sqlglot.parse_one(sql_body, read="trino")
+    for cte in tree.find_all(sqlglot.exp.CTE):
+        if cte.alias_or_name == cte_name:
+            out = {}
+            for e in cte.this.expressions:
+                expr = e.this if isinstance(e, sqlglot.exp.Alias) else e
+                out[e.alias_or_name] = expr.sql(dialect="trino", comments=False)
+            return out
+    raise AssertionError(f"CTE {cte_name} не найден")
+
+
+@pytest.mark.unit
+class TestAuditCteSync:
+    """#478/#556: усечённые per-source CTE audit — подмножество main, выражения
+    общих колонок совпадают. Закрепляет ручное ⚠️-предупреждение проверяемым
+    инвариантом (docs/decisions/season-audit-inline.md)."""
+
+    @pytest.mark.parametrize("cte_name", _SYNCED_CTES)
+    def test_audit_cte_subset_of_main(self, cte_name):
+        main_map = _cte_proj_map(_main_body(), cte_name)
+        audit_map = _cte_proj_map(_audit_body(), cte_name)
+        assert audit_map, f"{cte_name}: пустой/отсутствующий CTE в audit"
+        for alias, audit_expr in audit_map.items():
+            assert alias in main_map, (
+                f"{cte_name}.{alias} есть в audit, нет в main — дрейф CTE (#478). "
+                f"Синхронизировать с fct_team_season_stats.sql.j2."
+            )
+            assert audit_expr == main_map[alias], (
+                f"{cte_name}.{alias} разошёлся: audit={audit_expr!r} "
+                f"main={main_map[alias]!r}. Синхронизировать усечённый CTE с "
+                f"fct_team_season_stats.sql.j2 (#478)."
+            )

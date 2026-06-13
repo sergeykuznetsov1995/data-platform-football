@@ -13,6 +13,10 @@
 -- yellow/red skipped — у вратарей почти всегда 0/0, audit-сигнала нет.
 --
 -- Зерно: (player_id_canonical, league, season). INNER JOIN на оба источника.
+--
+-- #556: остаётся inline .sql (НЕ мигрирован на source_priority.yaml) — per-source
+-- diff-layout несовместим с single-COALESCE эмиттером. Решение:
+-- docs/decisions/season-audit-inline.md
 -- =============================================================================
 
 WITH
