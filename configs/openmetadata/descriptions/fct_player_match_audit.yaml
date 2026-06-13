@@ -33,12 +33,12 @@ columns:
   - name: match_id_canonical
     description: |
       Канонический ID матча (PK part). COALESCE(xref_match.canonical_id, fb.match_id).
-      FK → gold.fct_player_match.match_id_canonical.
+      FK → gold.fct_player_match.match_id.
   - name: player_id_canonical
     description: |
       Канонический ID игрока (PK part). Из silver.xref_player (source='fbref',
       confidence <> 'orphan').
-      FK → gold.fct_player_match.player_id_canonical.
+      FK → gold.fct_player_match.player_id.
 
   # ─── SofaScore diff (INNER JOIN — non-NULL для всех строк) ───
   - name: minutes_diff_ss
@@ -165,13 +165,21 @@ columns:
   # ─── Lineage ───
   - name: _gold_created_at
     description: Технический timestamp создания строки в Gold-слое.
+  - name: league
+    description: Лига (partition key).
+  - name: season
+    description: Сезон, slug-форма '2526' (fb.season_slug). Partition key.
+  - name: _silver_created_at
+    description: >-
+      Технический timestamp: инжектируется runner'ом (run_silver_transform)
+      поверх SQL. Дублирует _gold_created_at — унификация в followup.
 
 relationships:
   - from: match_id_canonical
-    to: trino_iceberg.iceberg.gold.fct_player_match.match_id_canonical
+    to: trino_iceberg.iceberg.gold.fct_player_match.match_id
     type: FOREIGN_KEY
     description: N:1 — business-витрина с тем же grain.
   - from: player_id_canonical
-    to: trino_iceberg.iceberg.gold.fct_player_match.player_id_canonical
+    to: trino_iceberg.iceberg.gold.fct_player_match.player_id
     type: FOREIGN_KEY
     description: N:1 — business-витрина с тем же grain.
