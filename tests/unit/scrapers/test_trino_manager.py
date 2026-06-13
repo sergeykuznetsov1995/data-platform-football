@@ -1046,3 +1046,48 @@ class TestTrinoTableManagerConnectionRetry:
 
                 assert result == [(1,)]
                 mock_retry.assert_called_once()
+
+
+class TestFormatSqlValueHardening:
+    """_format_sql_value: BOOLEAN string parsing + DATE/TIMESTAMP quote escaping (#470 bug 4)."""
+
+    @staticmethod
+    def _manager():
+        with patch.dict('sys.modules', {'trino': MagicMock(), 'trino.dbapi': MagicMock()}):
+            from scrapers.base.trino_manager import TrinoTableManager
+            return TrinoTableManager()
+
+    def test_boolean_string_false_renders_false(self):
+        """String 'False' (a known SofaScore format) must NOT become TRUE via
+        Python truthiness — that was silent data corruption."""
+        m = self._manager()
+        assert m._format_sql_value("False", "BOOLEAN") == "FALSE"
+        assert m._format_sql_value("false", "BOOLEAN") == "FALSE"
+        assert m._format_sql_value("0", "BOOLEAN") == "FALSE"
+
+    def test_boolean_string_true_renders_true(self):
+        m = self._manager()
+        assert m._format_sql_value("True", "BOOLEAN") == "TRUE"
+        assert m._format_sql_value("true", "BOOLEAN") == "TRUE"
+        assert m._format_sql_value("1", "BOOLEAN") == "TRUE"
+
+    def test_boolean_native_bool_unchanged(self):
+        m = self._manager()
+        assert m._format_sql_value(True, "BOOLEAN") == "TRUE"
+        assert m._format_sql_value(False, "BOOLEAN") == "FALSE"
+
+    def test_boolean_unrecognized_string_is_null(self):
+        """Unrecognized values must not be silently coerced to a boolean."""
+        m = self._manager()
+        assert m._format_sql_value("maybe", "BOOLEAN") == "NULL"
+
+    def test_date_string_with_quote_is_escaped(self):
+        """A stray single quote in a DATE value must be doubled, not break SQL."""
+        m = self._manager()
+        val = "2024-01-01' OR '1'='1"
+        assert m._format_sql_value(val, "DATE") == "DATE '" + val.replace("'", "''") + "'"
+
+    def test_timestamp_string_with_quote_is_escaped(self):
+        m = self._manager()
+        val = "2024-01-01 00:00:00' x"
+        assert m._format_sql_value(val, "TIMESTAMP") == "TIMESTAMP '" + val.replace("'", "''") + "'"

@@ -404,6 +404,16 @@ WITH (
                     return "NULL"
 
             if tt == 'BOOLEAN':
+                # A string like "False" is truthy in Python, so plain
+                # `if val` would silently render it as TRUE (#470). Parse the
+                # common string forms explicitly; refuse to guess otherwise.
+                if isinstance(val, str):
+                    s = val.strip().lower()
+                    if s in ('true', 't', '1'):
+                        return "TRUE"
+                    if s in ('false', 'f', '0', ''):
+                        return "FALSE"
+                    return "NULL"
                 return "TRUE" if val else "FALSE"
 
             if tt == 'DATE':
@@ -411,13 +421,15 @@ WITH (
                     if isinstance(val, datetime):
                         return f"DATE '{val.strftime('%Y-%m-%d')}'"
                     return f"DATE '{val}'"
-                return f"DATE '{val}'"
+                safe = str(val).replace("'", "''")
+                return f"DATE '{safe}'"
 
             if 'TIMESTAMP' in tt:
                 if isinstance(val, (datetime, pd.Timestamp)):
                     ts_str = val.strftime('%Y-%m-%d %H:%M:%S.%f')
                     return f"TIMESTAMP '{ts_str}'"
-                return f"TIMESTAMP '{val}'"
+                safe = str(val).replace("'", "''")
+                return f"TIMESTAMP '{safe}'"
 
         # Fallback: infer type from Python value (used when table types unknown)
         if isinstance(val, str):
