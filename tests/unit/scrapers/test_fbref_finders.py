@@ -509,6 +509,29 @@ class TestDetectEventType:
         div = BeautifulSoup(html, 'html.parser').find('div', class_='event')
         assert _detect_event_type(div) == 'penalty'
 
+    def test_penalty_goal(self):
+        # Scored penalty — FBref `penalty_goal` sprite. Must stay 'penalty'
+        # (gold maps it to penalty_goal). Regression guard for #447: the new
+        # penalty_miss branch must NOT swallow a scored penalty.
+        html = '<div class="event"><div class="penalty_goal">Content</div></div>'
+        div = BeautifulSoup(html, 'html.parser').find('div', class_='event')
+        assert _detect_event_type(div) == 'penalty'
+
+    def test_penalty_miss(self):
+        # Missed penalty — FBref `penalty_miss` sprite. Must NOT collapse into a
+        # scored penalty (which inflates the downstream running score). See #447.
+        html = '<div class="event"><div class="penalty_miss">Content</div></div>'
+        div = BeautifulSoup(html, 'html.parser').find('div', class_='event')
+        assert _detect_event_type(div) == 'penalty_missed'
+
+    def test_second_yellow_card(self):
+        # Second yellow → sending off. FBref marks it with the `yellow_red_card`
+        # sprite; must map to second_yellow_card, NOT yellow_card (dead branch
+        # before #447 left the category empty across all seasons).
+        html = '<div class="event"><div class="yellow_red_card">Content</div></div>'
+        div = BeautifulSoup(html, 'html.parser').find('div', class_='event')
+        assert _detect_event_type(div) == 'second_yellow_card'
+
     def test_unknown(self):
         html = '<div class="event"><div>Just text</div></div>'
         div = BeautifulSoup(html, 'html.parser').find('div', class_='event')

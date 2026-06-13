@@ -18,7 +18,7 @@ columns:
   - name: minute
     description: Минута события (текст; формат "45+2" для добавленного времени).
   - name: event_type
-    description: Тип события (goal / penalty / own_goal / yellow_card / second_yellow_card / red_card / substitution).
+    description: Тип события (goal / penalty / penalty_missed / own_goal / yellow_card / second_yellow_card / red_card / substitution).
   - name: player
     description: Основной игрок события (автор гола, носитель карточки, вышедший на замену).
     tags:

@@ -27,7 +27,7 @@ columns:
   - name: minute_added
     description: Компенсированное время, NULL когда нет.
   - name: event_type
-    description: Словарь из 8 значений — goal, own_goal, penalty_goal, penalty_missed, yellow_card, second_yellow, red_card, substitution. penalty_missed на практике только WhoScored.
+    description: Словарь из 8 значений — goal, own_goal, penalty_goal, penalty_missed, yellow_card, second_yellow, red_card, substitution. penalty_missed и second_yellow наполняются из обоих источников (с #447 скрапер FBref разносит спрайты penalty_miss / yellow_red_card).
   - name: team_id
     description: Для голевых событий — команда, КОТОРОЙ засчитан гол (own_goal — бенефициар, не автор); иначе команда актора. FK -> dim_team.team_id. Orphan-tolerant.
   - name: player_id

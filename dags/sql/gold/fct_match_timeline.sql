@@ -30,9 +30,11 @@
 -- ADRs folded into this file:
 --   * event_type dictionary (8 values): goal, own_goal, penalty_goal,
 --     penalty_missed, yellow_card, second_yellow, red_card, substitution.
---     FBref 'penalty' → 'penalty_goal' (scraper maps any penalty CSS class;
---     a rare missed penalty leaking in is accepted per DoD "± penalty
---     nuances"). 'penalty_missed' is therefore WhoScored-only in practice.
+--     FBref bronze 'penalty' → 'penalty_goal' (scored penalty). Since #447 the
+--     scraper splits the FBref penalty_miss / yellow_red_card sprites into
+--     their own bronze values, so 'penalty_missed' and 'second_yellow' are now
+--     populated from BOTH sources (previously penalty_missed was WhoScored-only
+--     and FBref missed penalties leaked in as penalty_goal, inflating score).
 --   * substitution: player_id = player going OFF (main actor, Opta/StatsBomb
 --     convention per issue spec), related_player_id = player coming ON.
 --     FBref source is INVERTED (player_id=ON, secondary_player_id=OFF) — the
@@ -109,6 +111,7 @@ fb_raw AS (
         CASE fe.event_type
             WHEN 'goal'                THEN 'goal'
             WHEN 'penalty'             THEN 'penalty_goal'
+            WHEN 'penalty_missed'      THEN 'penalty_missed'
             WHEN 'own_goal'            THEN 'own_goal'
             WHEN 'yellow_card'         THEN 'yellow_card'
             WHEN 'second_yellow_card'  THEN 'second_yellow'
@@ -137,8 +140,9 @@ fb_raw AS (
         fe.season                                            AS season,
         fe._bronze_ingested_at                               AS _ingested_at
     FROM iceberg.silver.fbref_match_events fe
-    WHERE fe.event_type IN ('goal', 'penalty', 'own_goal', 'yellow_card',
-                            'second_yellow_card', 'red_card', 'substitution')
+    WHERE fe.event_type IN ('goal', 'penalty', 'penalty_missed', 'own_goal',
+                            'yellow_card', 'second_yellow_card', 'red_card',
+                            'substitution')
 ),
 
 fb_resolved AS (
