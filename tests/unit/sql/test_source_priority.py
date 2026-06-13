@@ -40,7 +40,8 @@ GOLD_SQL = PROJECT_ROOT / "dags" / "sql" / "gold"
 # Golden fixtures live under tests/unit/fixtures/ (parents[1] == tests/unit).
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "source_priority"
 
-# (table_name, .sql.j2 template, pre-#437 golden snapshot)
+# (table_name, .sql.j2 template, pre-migration golden snapshot)
+# Match facts migrated in #437; season facts in #542 (same mechanism).
 CASES = [
     ("fct_team_match",
      GOLD_SQL / "fct_team_match.sql.j2",
@@ -48,6 +49,15 @@ CASES = [
     ("fct_player_match",
      GOLD_SQL / "fct_player_match.sql.j2",
      FIXTURES / "fct_player_match.pre437.sql"),
+    ("fct_player_season_stats",
+     GOLD_SQL / "fct_player_season_stats.sql.j2",
+     FIXTURES / "fct_player_season_stats.pre542.sql"),
+    ("fct_team_season_stats",
+     GOLD_SQL / "fct_team_season_stats.sql.j2",
+     FIXTURES / "fct_team_season_stats.pre542.sql"),
+    ("fct_keeper_season_stats",
+     GOLD_SQL / "fct_keeper_season_stats.sql.j2",
+     FIXTURES / "fct_keeper_season_stats.pre542.sql"),
 ]
 _IDS = [c[0] for c in CASES]
 
@@ -63,9 +73,13 @@ def _strip_comments(sql: str) -> str:
 
 def _normalize(sql: str) -> str:
     """Executable-SQL equivalence key: drop ``--`` comments, collapse all
-    whitespace (incl. newlines) to single spaces. Two SQL strings with the same
-    key produce identical Trino output."""
-    return re.sub(r"\s+", " ", _strip_comments(sql)).strip()
+    whitespace (incl. newlines) to single spaces, then drop the alignment pad
+    right after an opening paren. Two SQL strings with the same key produce
+    identical Trino output. The paren rule matters because the emitter writes
+    ``COALESCE(fb.x`` with no pad while the hand-aligned pre-migration SQL wrote
+    ``COALESCE(            ws.x`` (padding where the FBref arg was absent)."""
+    s = re.sub(r"\s+", " ", _strip_comments(sql)).strip()
+    return re.sub(r"\(\s+", "(", s)
 
 
 @pytest.mark.parametrize("table,template,golden", CASES, ids=_IDS)
@@ -86,22 +100,54 @@ def test_render_leaves_no_placeholder(table, template, golden):
     from utils.medallion_config import render_fact_sql
 
     rendered = render_fact_sql(template, table)
-    assert "{{" not in rendered and "}}" not in rendered, (
+    # ``{{`` is the Jinja opener and never occurs in our SQL/JSON literals; a
+    # bare ``}}`` legitimately appears in a JSON example inside a -- comment
+    # (fct_team_season_stats ws_penalties), so only the opener flags a leak.
+    assert "{{" not in rendered, (
         f"{table}: unresolved placeholder left in rendered SQL"
     )
 
 
+# Per-source table aliases bound by the .sql.j2 JOINs. A COALESCE is a
+# cross-source *metric merge* (its priority MUST live in source_priority.yaml)
+# iff ≥2 of its args reference DISTINCT aliases from this set. This excludes the
+# legitimate-inline cases automatically: PK/bridge fallbacks (one source alias +
+# an id/literal, e.g. COALESCE(xt.canonical_id, 'fb_'||...)) and null-defaults
+# inside CTEs (COALESCE(p.penalties_won, 0), COALESCE(qualifiers, '')).
+_SOURCE_ALIASES = {"fb", "us", "ws", "fm", "ss"}
+
+# The one cross-source COALESCE that stays inline by design: #437 derives
+# non_penalty_goals = goals - penalty_goals from the SAME merged exprs as the
+# goals/penalty_goals columns (Trino can't reference a same-level SELECT alias,
+# so the two COALESCE are repeated verbatim). Normalized (single-space) form.
+_ALLOWED_INLINE_COALESCE = {
+    "COALESCE(fb.goals, fm.goals, us.goals)",
+    "COALESCE(fb.penalty_goals, ss.penalty_goals)",
+}
+
+
+def _is_cross_source_merge(coalesce_expr: str) -> bool:
+    inner = coalesce_expr[coalesce_expr.index("(") + 1: coalesce_expr.rindex(")")]
+    srcs = {
+        a.strip().split(".")[0].lower()
+        for a in inner.split(",") if "." in a
+    }
+    return len(srcs & _SOURCE_ALIASES) >= 2
+
+
 @pytest.mark.parametrize("table,template,golden", CASES, ids=_IDS)
 def test_no_inline_multi_source_coalesce_in_template(table, template, golden):
-    """A 2+-arg COALESCE is a cross-source merge and MUST be a placeholder, not
-    inline — otherwise its priority lives outside source_priority.yaml. The PK
-    bridge fallback COALESCE(xmf.match_id_canonical, fb.match_id) is the one
-    documented exception (resolves match_id, not a metric)."""
+    """A cross-source COALESCE merge MUST be a placeholder, not inline —
+    otherwise its priority lives outside source_priority.yaml. Legitimate inline
+    COALESCE (PK bridges, CTE null-defaults, the #437 non_penalty_goals
+    derivation) are not cross-source merges and stay put."""
     raw = _strip_comments(template.read_text(encoding="utf-8"))
     offenders = [
         m.group(0)
         for m in re.finditer(r"COALESCE\s*\([^)]*,[^)]*\)", raw, re.IGNORECASE)
-        if "match_id_canonical" not in m.group(0)
+        if "match_id_canonical" not in m.group(0)          # PK bridge (match facts)
+        and re.sub(r"\s+", " ", m.group(0)) not in _ALLOWED_INLINE_COALESCE
+        and _is_cross_source_merge(m.group(0))
     ]
     assert not offenders, (
         f"{table}: inline multi-source COALESCE left in template (move it to "
