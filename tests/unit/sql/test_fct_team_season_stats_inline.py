@@ -3,7 +3,7 @@ Guard-тесты инлайна per-source season rollups в fct_team_season_sta
 
 Epic #478 удалил производный gold-этаж, включая 4 промежуточные таблицы
 gold.{understat,whoscored,sofascore,fotmob}_team_season. Их агрегации
-инлайнены как CTE прямо в fct_team_season_stats.sql (полные) и
+инлайнены как CTE прямо в fct_team_season_stats.sql.j2 (полные) и
 fct_team_season_stats_audit.sql (усечённые до diff-колонок, без ws_penalties).
 
 Тесты фиксируют это решение:
@@ -17,19 +17,45 @@ fct_team_season_stats_audit.sql (усечённые до diff-колонок, б
 * schema-freeze: список выходных колонок main-файла заморожен — CREATE OR
   REPLACE сверяет схему позиционно, молчаливый дрейф типов/состава колонок
   ломает консьюмеров (feedback_silver_create_or_replace_positional_schema).
+
+#542: main теперь .sql.j2 — его cross-source COALESCE рендерятся из
+configs/medallion/source_priority.yaml. Рендерим перед проверками
+(``_main_body``); audit остаётся обычным .sql (``_audit_body``).
 """
 
 from __future__ import annotations
 
+import os
 import re
+import sys
 from pathlib import Path
 
 import pytest
 import sqlglot
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
-MAIN_SQL = REPO_ROOT / "dags" / "sql" / "gold" / "fct_team_season_stats.sql"
+
+_DAGS_DIR = REPO_ROOT / "dags"
+if str(_DAGS_DIR) not in sys.path:
+    sys.path.insert(0, str(_DAGS_DIR))
+os.environ.setdefault(
+    "MEDALLION_CONFIG_DIR", str(REPO_ROOT / "configs" / "medallion")
+)
+
+MAIN_SQL = REPO_ROOT / "dags" / "sql" / "gold" / "fct_team_season_stats.sql.j2"
 AUDIT_SQL = REPO_ROOT / "dags" / "sql" / "gold" / "fct_team_season_stats_audit.sql"
+
+
+def _main_body() -> str:
+    """Rendered main SQL (#542: .sql.j2 → source_priority.yaml COALESCE)."""
+    from utils.medallion_config import render_fact_sql
+    return render_fact_sql(MAIN_SQL, "fct_team_season_stats")
+
+
+def _audit_body() -> str:
+    """Audit stays a plain .sql (out of #542 scope)."""
+    return AUDIT_SQL.read_text(encoding="utf-8")
+
 
 # Замороженный контракт выходных колонок main-файла (102 шт., порядок важен —
 # CREATE OR REPLACE сверяет схему позиционно). Менять только осознанно,
@@ -79,18 +105,17 @@ class TestInlineSourceRefs:
         pattern = re.compile(
             r"gold\s*\.\s*(understat|whoscored|sofascore|fotmob)_team_season"
         )
-        for path in (MAIN_SQL, AUDIT_SQL):
-            body = _strip_comments(path.read_text(encoding="utf-8"))
-            assert not pattern.search(body), (
-                f"{path.name} ссылается на удалённую gold.*_team_season (#478)"
+        for name, body in (("main", _main_body()), ("audit", _audit_body())):
+            assert not pattern.search(_strip_comments(body)), (
+                f"{name} ссылается на удалённую gold.*_team_season (#478)"
             )
 
     def test_silver_team_match_sources_present(self):
-        for path in (MAIN_SQL, AUDIT_SQL):
-            body = _strip_comments(path.read_text(encoding="utf-8"))
+        for name, body in (("main", _main_body()), ("audit", _audit_body())):
+            stripped = _strip_comments(body)
             for src in ("understat", "whoscored", "sofascore", "fotmob"):
-                assert f"iceberg.silver.{src}_team_match" in body, (
-                    f"{path.name}: ожидается инлайн-CTE над "
+                assert f"iceberg.silver.{src}_team_match" in stripped, (
+                    f"{name}: ожидается инлайн-CTE над "
                     f"silver.{src}_team_match"
                 )
 
@@ -98,8 +123,8 @@ class TestInlineSourceRefs:
         """ws_penalties (#161) сканирует bronze.whoscored_events ТОЛЬКО в
         main — аудит penalties не сравнивает, второй скан event-grain
         таблицы за DAG-ран не нужен."""
-        main_body = _strip_comments(MAIN_SQL.read_text(encoding="utf-8"))
-        audit_body = _strip_comments(AUDIT_SQL.read_text(encoding="utf-8"))
+        main_body = _strip_comments(_main_body())
+        audit_body = _strip_comments(_audit_body())
         assert "iceberg.bronze.whoscored_events" in main_body
         assert "iceberg.bronze.whoscored_events" not in audit_body
 
@@ -108,10 +133,10 @@ class TestInlineSourceRefs:
 class TestSqlParses:
     """Синтакс-смоук: sqlglot парсит оба файла как Trino."""
 
-    @pytest.mark.parametrize("path", [MAIN_SQL, AUDIT_SQL],
+    @pytest.mark.parametrize("getter", [_main_body, _audit_body],
                              ids=["main", "audit"])
-    def test_parses_as_trino(self, path):
-        stmts = sqlglot.parse(path.read_text(encoding="utf-8"), read="trino")
+    def test_parses_as_trino(self, getter):
+        stmts = sqlglot.parse(getter(), read="trino")
         assert len(stmts) == 1
 
 
@@ -120,8 +145,7 @@ class TestMainSchemaFreeze:
     """Выходные колонки main-файла — позиционный контракт CREATE OR REPLACE."""
 
     def test_output_columns_frozen(self):
-        tree = sqlglot.parse_one(MAIN_SQL.read_text(encoding="utf-8"),
-                                 read="trino")
+        tree = sqlglot.parse_one(_main_body(), read="trino")
         actual = [e.alias_or_name for e in tree.selects]
         assert actual == EXPECTED_MAIN_COLUMNS, (
             "Состав/порядок выходных колонок fct_team_season_stats изменился. "

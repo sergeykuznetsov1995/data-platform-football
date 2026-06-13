@@ -128,14 +128,14 @@ STAGE_2D_SEASON_BLOCKS = [
     # season не в SELECT. Без partition cols.
     ('dim_player_attributes',     'dags/sql/gold/dim_player_attributes.sql',
      'dim_player_attributes',     None),
-    ('fct_player_season_stats',   'dags/sql/gold/fct_player_season_stats.sql',
+    ('fct_player_season_stats',   'dags/sql/gold/fct_player_season_stats.sql.j2',
      'fct_player_season_stats',   ['league', 'season']),
     # #175 — keeper-variant per-season facts. Restored lost wiring (SQL + DQ
     # checks shipped in T5 but never registered in a STAGE list). Reads
     # silver.fotmob_keeper_profile (per-90 cols pass through as-is), so the
     # #174 FotMob count-drift does not apply here. Main facts precede both
     # audits (audit ref_integrity → main).
-    ('fct_keeper_season_stats',   'dags/sql/gold/fct_keeper_season_stats.sql',
+    ('fct_keeper_season_stats',   'dags/sql/gold/fct_keeper_season_stats.sql.j2',
      'fct_keeper_season_stats',   ['league', 'season']),
     ('fct_player_season_stats_audit',
      'dags/sql/gold/fct_player_season_stats_audit.sql',
@@ -149,7 +149,7 @@ STAGE_2D_SEASON_BLOCKS = [
     # from the business mart. Mirrors fct_player_season_stats pattern above.
     # #478: per-source season rollups (бывшие gold.*_team_season, ex Stage 1.5)
     # инлайнены в оба SQL как CTE — читают silver.*_team_match напрямую.
-    ('fct_team_season_stats',     'dags/sql/gold/fct_team_season_stats.sql',
+    ('fct_team_season_stats',     'dags/sql/gold/fct_team_season_stats.sql.j2',
      'fct_team_season_stats',     ['league', 'season']),
     ('fct_team_season_stats_audit',
      'dags/sql/gold/fct_team_season_stats_audit.sql',

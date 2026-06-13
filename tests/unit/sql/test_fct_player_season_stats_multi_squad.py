@@ -19,13 +19,25 @@ and every COALESCE falls back to FBref.
 
 from __future__ import annotations
 
+import os
+import sys
 from pathlib import Path
 
 import pytest
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
-SQL_PATH = PROJECT_ROOT / "dags" / "sql" / "gold" / "fct_player_season_stats.sql"
+
+# #542: gold SQL is now a source-priority template (.sql.j2) — render it from
+# configs/medallion/source_priority.yaml before translating for DuckDB.
+_DAGS_DIR = PROJECT_ROOT / "dags"
+if str(_DAGS_DIR) not in sys.path:
+    sys.path.insert(0, str(_DAGS_DIR))
+os.environ.setdefault(
+    "MEDALLION_CONFIG_DIR", str(PROJECT_ROOT / "configs" / "medallion")
+)
+
+SQL_PATH = PROJECT_ROOT / "dags" / "sql" / "gold" / "fct_player_season_stats.sql.j2"
 
 pytestmark = pytest.mark.unit
 
@@ -171,7 +183,9 @@ def _insert_profile(con, squad: str, minutes: float, goals: float):
 
 
 def _run(con):
-    sql = _translate(SQL_PATH.read_text(encoding="utf-8"))
+    from utils.medallion_config import render_fact_sql
+    rendered = render_fact_sql(SQL_PATH, "fct_player_season_stats")
+    sql = _translate(rendered)
     return con.execute(sql).fetch_df()
 
 
