@@ -2,7 +2,7 @@
 # Data Platform - Makefile
 # =============================================================================
 
-.PHONY: help build up up-lite up-full up-build down restart logs ps clean health test-spark test-trino init-hdfs init-storage shell-spark shell-airflow shell-trino test-fbref-curl test-fbref-nodriver test-fbref-full test-proxy-stats up-bi up-catalog down-bi down-catalog superset-init superset-import superset-dashboards om-ingest-trino om-lineage-trino om-apply-descriptions logs-superset logs-om shell-superset shell-om
+.PHONY: help build up up-lite up-full up-build down restart logs ps clean health test-spark test-trino init-hdfs init-storage shell-spark shell-airflow shell-trino test-fbref-curl test-fbref-nodriver test-fbref-full test-proxy-stats up-bi up-catalog down-bi down-catalog superset-init superset-import superset-dashboards om-ingest-trino om-lineage-trino om-apply-descriptions om-cleanup-lineage logs-superset logs-om shell-superset shell-om
 
 # Default target
 help:
@@ -297,6 +297,11 @@ om-apply-descriptions:
 # Reads JWT from OPENMETADATA_JWT_TOKEN, falling back to OM_JWT_TOKEN (already in compose env).
 om-bootstrap:
 	@docker compose exec openmetadata-ingestion python /opt/configs/bootstrap_classifications.py
+
+# Hard-delete OM entities of tables dropped in epic #478 → cascades to remove their stale lineage edges (#529).
+# Default = dry-run preview; real delete needs --apply (see configs/openmetadata/README.md). Reads OM_JWT_TOKEN.
+om-cleanup-lineage:
+	@docker compose exec openmetadata-ingestion python /opt/configs/cleanup_lineage.py
 
 # Tail Superset web logs
 logs-superset:
