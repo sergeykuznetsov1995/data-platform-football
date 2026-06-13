@@ -100,8 +100,12 @@ class ClubEloScraper(SoccerdataScraper):
             if df is not None and not df.empty:
                 df = df.reset_index()
 
-                # Add date column
-                df['rating_date'] = date_val
+                # Add date column — date-only ISO string (NOT datetime.now() with
+                # a time component). A time-bearing partition key makes every
+                # same-day rerun a new partition, and _build_partition_delete_filter
+                # can't emit a valid predicate, so replace silently degrades to
+                # APPEND. This mirrors the historical path (#470, precedent #283/#314).
+                df['rating_date'] = pd.Timestamp(date_val).strftime('%Y-%m-%d')
 
                 # Filter by leagues if specified
                 if self.leagues:
@@ -177,6 +181,11 @@ class ClubEloScraper(SoccerdataScraper):
                 df=df,
                 table_name='clubelo_ratings',
                 partition_cols=['rating_date'],
+                # Replace the day's partition wholesale so a same-day rerun /
+                # Airflow retry overwrites instead of appending a duplicate
+                # full snapshot (#470). rating_date is date-only ISO (see
+                # read_by_date) so the partition-delete filter is valid SQL.
+                replace_partitions=['rating_date'],
             )
             return {'current_ratings': table_path}
 

@@ -241,6 +241,49 @@ class TestClubEloScraper:
         assert result["historical_ratings"] == "iceberg.bronze.clubelo_ratings_historical"
         assert "rows" in result
 
+    # ------------------------------------------------------------------
+    # Regression (#470 bug 5): the DAILY snapshot path must match historical —
+    # rating_date as an ISO date-only string + replace_partitions=['rating_date'].
+    #
+    # Background: scrape_current_ratings set rating_date = datetime.now() WITH
+    # TIME and saved without replace_partitions, so an Airflow retry / same-day
+    # rerun appended a second full snapshot (the historical path was already
+    # fixed; the two branches had diverged). Precedent: #283/#314.
+    # ------------------------------------------------------------------
+    def test_scrape_current_ratings_uses_replace_partitions_with_str_date(
+        self, scraper, mock_soccerdata_clubelo
+    ):
+        """scrape_current_ratings must pass replace_partitions=['rating_date']
+        and a date-only ISO string, so a same-day rerun replaces (not appends)."""
+        with patch.object(
+            scraper,
+            "save_to_iceberg",
+            return_value="iceberg.bronze.clubelo_ratings",
+        ) as mock_save:
+            result = scraper.scrape_current_ratings()
+
+        assert mock_save.call_count == 1
+        _, kwargs = mock_save.call_args
+        assert kwargs.get("table_name") == "clubelo_ratings"
+        assert kwargs.get("partition_cols") == ["rating_date"]
+        assert kwargs.get("replace_partitions") == ["rating_date"], (
+            "scrape_current_ratings must pass replace_partitions=['rating_date'] "
+            "— without it a same-day rerun/Airflow-retry APPENDS a duplicate "
+            "full snapshot (#470)."
+        )
+
+        saved_df = kwargs.get("df")
+        assert saved_df is not None and not saved_df.empty
+        rating_dates = saved_df["rating_date"].tolist()
+        assert all(isinstance(v, str) for v in rating_dates), (
+            "rating_date must be a date-only ISO string (no time component), or "
+            "_build_partition_delete_filter emits an invalid predicate and the "
+            "writer silently falls back to APPEND."
+        )
+        assert all(len(v) == 10 and v[4] == '-' and v[7] == '-' for v in rating_dates)
+
+        assert result["current_ratings"] == "iceberg.bronze.clubelo_ratings"
+
 
 class TestTopEnglishClubs:
     """Tests for predefined club lists."""

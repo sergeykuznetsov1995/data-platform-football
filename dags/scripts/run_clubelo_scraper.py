@@ -76,6 +76,14 @@ def main():
                     df=df,
                     table_name='clubelo_ratings',
                     partition_cols=['rating_date'],
+                    # Replace the day's partition so a same-day rerun / Airflow
+                    # retry overwrites instead of appending a duplicate snapshot.
+                    # read_by_date now yields a date-only ISO rating_date and the
+                    # table column is varchar, so the delete predicate is valid
+                    # (#554, split from #470 bug 5). This runner inlines the save
+                    # instead of calling scrape_current_ratings(), so the fix must
+                    # live here too — not only on the scraper method.
+                    replace_partitions=['rating_date'],
                 )
                 results['tables'].append(table_path)
                 results['rows'] = len(df)
