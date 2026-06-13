@@ -107,7 +107,10 @@ class CircuitBreaker:
         self._breaker = pybreaker.CircuitBreaker(
             fail_max=fail_max,
             reset_timeout=reset_timeout,
-            exclude=[pybreaker.CircuitBreakerError],
+            success_threshold=success_threshold,
+            # CircuitBreakerError must never count as a failure; merge in any
+            # caller-supplied exclusions instead of dropping them (#470 bug 3).
+            exclude=[pybreaker.CircuitBreakerError, *self.config.exclude_exceptions],
             listeners=[CircuitBreakerListener(self.config.name)],
             name=self.config.name,
         )
@@ -189,7 +192,8 @@ class CircuitBreaker:
         self._breaker = pybreaker.CircuitBreaker(
             fail_max=self.config.fail_max,
             reset_timeout=self.config.reset_timeout,
-            exclude=[pybreaker.CircuitBreakerError],
+            success_threshold=self.config.success_threshold,
+            exclude=[pybreaker.CircuitBreakerError, *self.config.exclude_exceptions],
             listeners=[CircuitBreakerListener(self.config.name)],
             name=self.config.name,
         )
