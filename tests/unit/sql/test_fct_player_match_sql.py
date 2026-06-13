@@ -14,18 +14,32 @@ MODELED xG/xA — single column через COALESCE(us → ss); audit-diff
 
 from __future__ import annotations
 
+import os
 import re
+import sys
 from pathlib import Path
 
 import pytest
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
-SQL_PATH = PROJECT_ROOT / "dags" / "sql" / "gold" / "fct_player_match.sql"
+# #437: fct_player_match became a .sql.j2 template — its cross-source COALESCE
+# columns render from configs/medallion/source_priority.yaml. We render here so
+# the assertions below run against the actually-executed SQL (priority included).
+SQL_PATH = PROJECT_ROOT / "dags" / "sql" / "gold" / "fct_player_match.sql.j2"
+
+_DAGS_DIR = PROJECT_ROOT / "dags"
+if str(_DAGS_DIR) not in sys.path:
+    sys.path.insert(0, str(_DAGS_DIR))
+os.environ.setdefault(
+    "MEDALLION_CONFIG_DIR", str(PROJECT_ROOT / "configs" / "medallion")
+)
 
 
 def _read_sql() -> str:
-    return SQL_PATH.read_text(encoding="utf-8")
+    from utils.medallion_config import render_fact_sql
+
+    return render_fact_sql(SQL_PATH, "fct_player_match")
 
 
 def _strip_comments(sql: str) -> str:

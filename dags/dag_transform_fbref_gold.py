@@ -157,13 +157,13 @@ STAGE_2D_SEASON_BLOCKS = [
 ]
 
 STAGE_3_FACTS = [
-    ('fct_team_match',   'dags/sql/gold/fct_team_match.sql',   'fct_team_match',   ['league', 'season']),
+    ('fct_team_match',   'dags/sql/gold/fct_team_match.sql.j2',   'fct_team_match',   ['league', 'season']),
     # issue #95: cross-source DQ-audit для fct_team_match. INNER FBref ∩ Understat,
     # LEFT WhoScored / SofaScore с diff-колонками. WARNING-only DQ.
     # Pattern: fct_player_match_audit (issue #46).
     ('fct_team_match_audit', 'dags/sql/gold/fct_team_match_audit.sql',
      'fct_team_match_audit', ['league', 'season']),
-    ('fct_player_match', 'dags/sql/gold/fct_player_match.sql', 'fct_player_match', ['league', 'season']),
+    ('fct_player_match', 'dags/sql/gold/fct_player_match.sql.j2', 'fct_player_match', ['league', 'season']),
     # issue #46: cross-source DQ-audit для fct_player_match. INNER JOIN всех
     # 4 источников (FBref/SofaScore/Understat/WhoScored) с diff-колонками
     # `<metric>_diff_<source>` для anomaly detection. WARNING-only DQ.

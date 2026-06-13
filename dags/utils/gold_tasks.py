@@ -42,6 +42,28 @@ logger = logging.getLogger(__name__)
 PARTITION_FILTER_SENTINEL = "-- WHERE_PARTITION_FILTER_HERE"
 
 
+def _render_source_priority(template_file: str, table_name: str) -> str:
+    """Render a source-priority fact template (``.sql.j2``) to a tempfile (#437).
+
+    Resolves the template path, fills its ``{{ m_<metric> }}`` COALESCE
+    placeholders from configs/medallion/source_priority.yaml via
+    ``medallion_config.render_fact_sql``, writes the rendered SQL to a tempfile
+    and returns its path. The CTAS runner then treats it like any plain .sql.
+    Mirrors ``dim_loaders.run_inline_ctas`` (render -> tempfile -> CTAS).
+    """
+    import tempfile
+
+    from utils.medallion_config import render_fact_sql
+
+    template_path = _resolve_sql_path(template_file)
+    rendered = render_fact_sql(template_path, table_name)
+    with tempfile.NamedTemporaryFile(
+        mode='w', suffix=f'_{table_name}.sql', delete=False, encoding='utf-8',
+    ) as fh:
+        fh.write(rendered)
+        return fh.name
+
+
 def run_gold_transform(
     sql_file: str,
     table_name: str,
@@ -84,6 +106,12 @@ def run_gold_transform(
     """
     if partition_columns is None:
         partition_columns = []
+
+    # #437: fct_*.sql.j2 templates render their cross-source COALESCE columns
+    # from configs/medallion/source_priority.yaml. Resolve + render to a tempfile
+    # before the CTAS engine (run_silver_transform), which expects a .sql path.
+    if str(sql_file).endswith('.sql.j2'):
+        sql_file = _render_source_priority(sql_file, table_name)
 
     if fallback_sql_file and require_silver:
         missing = [
