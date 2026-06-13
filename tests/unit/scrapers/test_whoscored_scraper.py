@@ -475,6 +475,97 @@ class TestWhoScoredScrapeEventsViaFlaresolverr:
         # final destroy still ran
         assert client.destroy_session.called
 
+    def test_skip_existing_fetch_failure_raises_no_save(
+        self, mock_base_dependencies, mock_enhanced_whoscored
+    ):
+        """Bug #467(1): a transient _fetch_existing_event_game_ids failure must
+        propagate, not be swallowed — otherwise the whole season re-appends."""
+        from scrapers.whoscored import WhoScoredScraper
+
+        meta = [
+            _make_meta_row(1, 'ENG-Premier League', '2425', 'g1'),
+            _make_meta_row(2, 'ENG-Premier League', '2425', 'g2'),
+        ]
+        scraper = WhoScoredScraper(leagues=['ENG-Premier League'], seasons=[2024])
+
+        cms, save_mock, client, fetch_mock = _patch_events_pipeline(
+            scraper, meta, fetch_side_effect={'events': [{}]}
+        )
+        # Replace the default no-op _fetch_existing patch (cms[1]) with a
+        # raising one to simulate a transient Trino / network error.
+        raising = patch.object(
+            scraper,
+            '_fetch_existing_event_game_ids',
+            side_effect=RuntimeError('trino unavailable'),
+        )
+        with cms[0], cms[2], cms[3], cms[4], cms[5], cms[6], raising:
+            with pytest.raises(RuntimeError, match='trino unavailable'):
+                scraper.scrape_events(
+                    match_ids=[1, 2], chunk_size=1, skip_existing=True
+                )
+
+        # No matches fetched, nothing appended — we fail closed, Airflow retries.
+        assert not save_mock.called
+        assert fetch_mock.call_count == 0
+
+    def test_tail_chunk_flushed_when_last_match_fails(
+        self, mock_base_dependencies, mock_enhanced_whoscored, monkeypatch
+    ):
+        """Bug #467(2): the accumulated chunk must still be saved when the final
+        match exhausts its retries (the old `i == total` flush was bypassed by
+        `continue`)."""
+        from scrapers.base.flaresolverr_client import FlareSolverrCFChallengeFailed
+        from scrapers.whoscored import WhoScoredScraper
+
+        monkeypatch.setattr(WhoScoredScraper, 'EVENTS_MAX_PROXY_RETRIES', 1)
+        meta = [
+            _make_meta_row(1, 'ENG-Premier League', '2425', 'g1'),
+            _make_meta_row(2, 'ENG-Premier League', '2425', 'g2'),
+        ]
+        scraper = WhoScoredScraper(leagues=['ENG-Premier League'], seasons=[2024])
+
+        cms, save_mock, client, fetch_mock = _patch_events_pipeline(
+            scraper, meta,
+            fetch_side_effect=[
+                {'events': [{}]},
+                FlareSolverrCFChallengeFailed('CF'),
+            ],
+        )
+        # chunk_size > total → the ONLY save path is the post-loop flush.
+        with cms[0], cms[1], cms[2], cms[3], cms[4], cms[5], cms[6]:
+            result = scraper.scrape_events(match_ids=[1, 2], chunk_size=10)
+
+        assert save_mock.call_count == 1
+        saved_df = save_mock.call_args.kwargs['df']
+        assert len(saved_df) == 1
+        assert set(saved_df['game_id']) == {1}  # failed match 2 absent
+        # `path` set via nonlocal → return is the table, not {}.
+        assert result == {'events': 'iceberg.bronze.whoscored_events'}
+        assert fetch_mock.call_count == 2
+
+    def test_full_run_saves_via_post_loop_flush(
+        self, mock_base_dependencies, mock_enhanced_whoscored
+    ):
+        """Regression guard: with chunk_size > total and every match succeeding,
+        the single save comes from the post-loop flush and `path` is set."""
+        from scrapers.whoscored import WhoScoredScraper
+
+        meta = [
+            _make_meta_row(i, 'ENG-Premier League', '2425', f'g{i}')
+            for i in range(1, 6)
+        ]
+        scraper = WhoScoredScraper(leagues=['ENG-Premier League'], seasons=[2024])
+
+        cms, save_mock, client, _ = _patch_events_pipeline(
+            scraper, meta, fetch_side_effect={'events': [{}]}
+        )
+        with cms[0], cms[1], cms[2], cms[3], cms[4], cms[5], cms[6]:
+            result = scraper.scrape_events(match_ids=[1, 2, 3, 4, 5], chunk_size=10)
+
+        assert save_mock.call_count == 1
+        assert len(save_mock.call_args.kwargs['df']) == 5
+        assert result == {'events': 'iceberg.bronze.whoscored_events'}
+
 
 @pytest.mark.unit
 class TestFetchMatchEventsViaFlaresolverr:
