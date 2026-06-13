@@ -32,6 +32,81 @@ from scrapers.base.base_scraper import BaseScraper
 logger = logging.getLogger(__name__)
 
 
+# Content-derived JSON columns of fotmob_match_details. A failed re-fetch leaves
+# these empty for a match; under replace_partitions that empties out a row that
+# previously held good data (issue #544 — a re-scrape wiped stats_json for 10
+# matches that Bronze still had identity rows for). Keep-last-good below backfills
+# them from the existing Bronze partition so good payloads are never overwritten
+# by an empty re-scrape.
+_PRESERVE_JSON_COLS = (
+    'stats_json',
+    'player_stats_json',
+    'lineup_json',
+    'events_json',
+    'match_facts_json',
+    'shotmap_json',
+    'h2h_json',
+    'momentum_json',
+)
+
+
+def _is_empty_json_value(value: Any) -> bool:
+    """True for FotMob JSON-column values that carry no payload.
+
+    Covers Python ``None``, pandas NaN, and the empty-ish JSON strings the
+    scraper / Trino can produce (``''``, ``'null'``, ``'{}'``, ``'[]'``).
+    """
+    if value is None:
+        return True
+    if isinstance(value, float) and pd.isna(value):
+        return True
+    if isinstance(value, str):
+        return value.strip() in ('', 'null', '{}', '[]')
+    return False
+
+
+def _backfill_empty_json(
+    new_df: pd.DataFrame,
+    existing_df: Optional[pd.DataFrame],
+    key: str = 'match_id',
+    cols: tuple = _PRESERVE_JSON_COLS,
+) -> pd.DataFrame:
+    """Keep-last-good merge for FotMob match-detail JSON columns (issue #544).
+
+    For every row in ``new_df`` whose ``col`` value is empty (see
+    :func:`_is_empty_json_value`), fill it from the row with the same ``key`` in
+    ``existing_df`` — but only when the existing value is itself non-empty. This
+    prevents a failed re-fetch (empty payload) from overwriting a previously-good
+    Bronze row under ``replace_partitions``.
+
+    Pure function: ``new_df`` is not mutated. ``key`` is matched as a string on
+    both sides (Bronze stores ``match_id`` as varchar; the scraper may build it
+    as int). A missing/empty ``existing_df`` returns ``new_df`` unchanged.
+    """
+    if existing_df is None or len(existing_df) == 0 or key not in new_df.columns:
+        return new_df
+    if key not in existing_df.columns:
+        return new_df
+
+    out = new_df.copy()
+    ex = existing_df.drop_duplicates(subset=[key]).copy()
+    ex[key] = ex[key].astype(str)
+    ex = ex.set_index(key)
+    keys_str = out[key].astype(str)
+
+    for col in cols:
+        if col not in out.columns or col not in ex.columns:
+            continue
+        empty_mask = out[col].map(_is_empty_json_value)
+        if not empty_mask.any():
+            continue
+        mapped = keys_str[empty_mask].map(ex[col])
+        mapped = mapped[mapped.map(lambda v: not _is_empty_json_value(v))]
+        if len(mapped):
+            out.loc[mapped.index, col] = mapped.values
+    return out
+
+
 class FotMobScraper(BaseScraper):
     """
     Scraper for FotMob data using public ``/api/data`` JSON endpoints.
@@ -909,6 +984,38 @@ class FotMobScraper(BaseScraper):
         df = pd.DataFrame(rows)
         df['league'] = league
         df['season'] = season
+
+        # #544 keep-last-good: under replace_partitions a match whose content
+        # re-fetched empty (stats_json = None) would overwrite a previously-good
+        # Bronze row. Backfill the content JSON columns from the existing Bronze
+        # partition so good payloads survive a failed re-scrape. Defensive: any
+        # read failure (first run, table absent, Trino down) falls back to the
+        # freshly-scraped frame unchanged — never worse than today's behaviour.
+        try:
+            existing = self._iceberg_writer.read_table(
+                'bronze',
+                'fotmob_match_details',
+                columns=['match_id', *_PRESERVE_JSON_COLS],
+                filter_expr=f"league = '{league}' AND season = {int(season)}",
+            )
+            before = df
+            df = _backfill_empty_json(df, existing)
+            preserved = sum(
+                1 for c in _PRESERVE_JSON_COLS if c in df.columns
+                for a, b in zip(before[c], df[c]) if a != b
+            )
+            if preserved:
+                logger.warning(
+                    "keep-last-good: preserved %d existing JSON value(s) for "
+                    "%s %s where the re-scrape returned empty (#544)",
+                    preserved, league, season,
+                )
+        except Exception as e:  # noqa: BLE001 — defensive, must never block save
+            logger.warning(
+                "keep-last-good skipped for %s %s (%s) — using fresh scrape",
+                league, season, e,
+            )
+
         df = self._add_metadata(df, 'match_details')
         logger.info(f"Parsed {len(df)} match details")
         return df
