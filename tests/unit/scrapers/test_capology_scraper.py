@@ -12,6 +12,7 @@ from scrapers.capology.scraper import (
     CAPOLOGY_SUPPORTED_CURRENCIES,
     R0_2B_FALLBACK_MARKER,
     _extract_anchor_text,
+    _iter_row_blocks,
     _parse_contract_row,
     _parse_payroll_row,
     _parse_row_block,
@@ -87,7 +88,23 @@ class TestSliceDataArray:
         assert s.count('}') == 2
 
 
-class TestParseRowBlock:
+class TestIterRowBlocks:
+    def test_splits_two_plain_blocks(self):
+        data_block = "[{'k': 1},{'k': 2}]"
+        blocks = list(_iter_row_blocks(data_block))
+        assert blocks == ["{'k': 1}", "{'k': 2}"]
+
+    def test_escaped_quote_inside_value_does_not_desync(self):
+        # A single-quoted value contains an escaped apostrophe followed by a
+        # brace that is PART of the string. The backslash must skip the next
+        # char (like _slice_data_array's `i += 2`) so the escaped quote doesn't
+        # close the literal and the in-string `}` isn't treated as a structural
+        # block close (#470 bug 6: `if c == '\\': continue` skipped nothing).
+        data_block = r"[{'k':'a\'}b'},{'k':'c'}]"
+        blocks = list(_iter_row_blocks(data_block))
+        assert len(blocks) == 2
+        assert blocks[0] == r"{'k':'a\'}b'}"
+        assert blocks[1] == "{'k':'c'}"
     def _haaland_block(self) -> str:
         return (
             "{"
