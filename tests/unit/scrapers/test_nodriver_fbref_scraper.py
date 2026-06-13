@@ -431,6 +431,35 @@ class TestNodriverFBrefScraperScrapeStatType:
 
         assert result == {}
 
+    @pytest.mark.unit
+    @pytest.mark.parametrize('data_category, read_method, table', [
+        ('player', 'read_player_season_stats', 'fbref_player_stats'),
+        ('team', 'read_team_season_stats', 'fbref_team_stats'),
+        ('keeper', 'read_keeper_stats', 'fbref_keeper_keeper'),
+    ])
+    def test_scrape_single_stat_type_uses_replace_partitions(
+        self, scraper, data_category, read_method, table
+    ):
+        """#536: the nodriver single_stat path is the production default
+        (create_single_stat_task scraper_type='nodriver'). Without
+        replace_partitions=['league','season'] it plain-appends a full copy
+        of each (league, season) every weekly DAG run (45-50x bloat)."""
+        mock_df = pd.DataFrame({
+            'x': [1],
+            'league': ['ENG-Premier League'],
+            'season': [2024],
+        })
+        with patch.object(scraper, read_method, return_value=mock_df):
+            with patch.object(
+                scraper, 'save_to_iceberg',
+                return_value=f'iceberg.bronze.{table}',
+            ) as mock_save:
+                scraper.scrape_single_stat_type('stats', data_category)
+
+        assert mock_save.call_args.kwargs.get(
+            'replace_partitions'
+        ) == ['league', 'season']
+
 
 class TestNodriverFBrefScraperScrapeAll:
     """Tests for scrape_all method."""
