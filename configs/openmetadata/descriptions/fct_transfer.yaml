@@ -1,0 +1,80 @@
+# =============================================================================
+# OpenMetadata description: iceberg.gold.fct_transfer
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.gold.fct_transfer
+  description: |
+    Event-grain трансферов игроков (issue #429). Одна строка = один трансфер.
+    Чистая проекция silver.transfermarkt_transfers БЕЗ JOIN — gold row count
+    в точности равен silver row count (по DoD строки никогда не выбрасываются).
+
+    Orphan-ID стратегия: canonical id отсутствует у ≈18% игроков (U21 / loan-out
+    / новички вне FBref-spine) и у большинства клубов (TM-имена резолвятся только
+    через team_aliases, non-APL клубы без алиаса). NULL в PK-компонентах схлопнул
+    бы два разных движения, поэтому каждый PK-компонент имеет fallback на
+    детерминированный 'tm_'-префикс:
+      player_id    = COALESCE(canonical_id, 'tm_' || player_id)
+      from_team_id = COALESCE(from_club_id_canonical, 'tm_' || slug(from_club_name))
+      to_team_id   = COALESCE(to_club_id_canonical,   'tm_' || slug(to_club_name))
+    Резолвнутые клубы совпадают с dim_team.team_id точно; orphan'ы узнаются по
+    'tm_'-префиксу. Soft-FK к dim_player / dim_team — WARNING-severity.
+
+    PK = (player_id, transfer_date, from_team_id, to_team_id). Партиционирования
+    нет (маленькая таблица, ~750 строк для APL '2526').
+  tags:
+    - Tier.Gold
+    - Domain.Football
+    - PII.None
+columns:
+  # ─── PK ───
+  - name: player_id
+    description: |
+      ID игрока (PK part) — COALESCE(canonical_id, 'tm_' || raw TM id).
+      Soft FK → dim_player.player_id ('tm_'-orphan'ы вне dim).
+  - name: transfer_date
+    description: Дата трансфера (PK part).
+  - name: from_team_id
+    description: |
+      ID клуба-отдающего (PK part) — COALESCE(canonical slug, 'tm_' || slug(name)).
+      Soft FK → dim_team.team_id.
+  - name: to_team_id
+    description: |
+      ID клуба-принимающего (PK part) — COALESCE(canonical slug, 'tm_' || slug(name)).
+      Soft FK → dim_team.team_id.
+  # ─── Атрибуты трансфера ───
+  - name: from_club_name
+    description: Raw имя клуба-отдающего (как на Transfermarkt).
+  - name: to_club_name
+    description: Raw имя клуба-принимающего (как на Transfermarkt).
+  - name: fee_eur
+    description: Сумма трансфера в евро (BIGINT; NULL для free transfer / аренды).
+  - name: market_value_at_transfer_eur
+    description: Рыночная стоимость игрока на TM на момент трансфера (BIGINT, EUR).
+  - name: is_loan
+    description: |
+      True для всех loan-движений — уход в аренду И возврат
+      ('loan transfer' / 'Loan fee: €X' / 'End of loan').
+  - name: is_upcoming
+    description: True если трансфер ещё не завершён (announced / agreed, будущая дата).
+  # ─── Lineage ───
+  - name: _bronze_ingested_at
+    description: Timestamp ingest'а Bronze (source lineage, прокинут из silver).
+  - name: league
+    description: Лига (scope текущего ingest'а).
+  - name: season
+    description: Сезон short-form '2526' (scope текущего ingest-окна).
+  - name: _silver_created_at
+    description: Технический timestamp материализации строки CTAS-раннером.
+relationships:
+  - from: player_id
+    to: trino_iceberg.iceberg.gold.dim_player.player_id
+    type: FOREIGN_KEY
+    description: N:1 — атрибуты игрока (soft; 'tm_'-orphan'ы вне dim_player).
+  - from: from_team_id
+    to: trino_iceberg.iceberg.gold.dim_team.team_id
+    type: FOREIGN_KEY
+    description: N:1 — клуб-отдающий (soft; 'tm_'-orphan'ы вне dim_team).
+  - from: to_team_id
+    to: trino_iceberg.iceberg.gold.dim_team.team_id
+    type: FOREIGN_KEY
+    description: N:1 — клуб-принимающий (soft; 'tm_'-orphan'ы вне dim_team).
