@@ -156,3 +156,82 @@ def test_apply_without_token_fails_fast(monkeypatch) -> None:
     with redirect_stdout(buf):
         rc = mod.main()
     assert rc == 2, f"expected exit 2 without token, got {rc}"
+
+
+def test_hard_delete_warns_on_http_error(monkeypatch) -> None:
+    """A non-2xx DELETE is counted as a warning, not a success."""
+    mod = _import_cleanup()
+
+    class _Get:
+        status_code = 200
+
+        @staticmethod
+        def json() -> dict:
+            return {"id": "uuid-x"}
+
+    class _Del:
+        status_code = 500
+        text = "boom"
+
+    monkeypatch.setattr(mod.requests, "get", lambda *a, **k: _Get())
+    monkeypatch.setattr(mod.requests, "delete", lambda *a, **k: _Del())
+
+    counter = {"deleted": 0, "absent": 0, "warn": 0, "dry": 0}
+    mod.hard_delete("http://om", {}, "trino_iceberg.iceberg.gold.fct_match", dry_run=False, counter=counter)
+    assert counter == {"deleted": 0, "absent": 0, "warn": 1, "dry": 0}
+
+
+def test_hard_delete_warns_on_request_exception(monkeypatch) -> None:
+    """A network error during DELETE is a warning, not a crash."""
+    mod = _import_cleanup()
+
+    class _Get:
+        status_code = 200
+
+        @staticmethod
+        def json() -> dict:
+            return {"id": "uuid-x"}
+
+    def boom_delete(*a, **k):  # noqa: ARG001
+        raise mod.requests.RequestException("network down")
+
+    monkeypatch.setattr(mod.requests, "get", lambda *a, **k: _Get())
+    monkeypatch.setattr(mod.requests, "delete", boom_delete)
+
+    counter = {"deleted": 0, "absent": 0, "warn": 0, "dry": 0}
+    mod.hard_delete("http://om", {}, "trino_iceberg.iceberg.gold.fct_match", dry_run=False, counter=counter)
+    assert counter["warn"] == 1 and counter["deleted"] == 0
+
+
+def test_resolve_table_id_raises_on_401(monkeypatch) -> None:
+    """A 401 is fatal — surfaces a clear error instead of silently skipping."""
+    mod = _import_cleanup()
+
+    class _Get401:
+        status_code = 401
+
+        @staticmethod
+        def json() -> dict:
+            return {}
+
+    monkeypatch.setattr(mod.requests, "get", lambda *a, **k: _Get401())
+    with pytest.raises(SystemExit):
+        mod.resolve_table_id("http://om", {}, "trino_iceberg.iceberg.gold.fct_match")
+
+
+def test_resolve_request_exception_is_absent(monkeypatch) -> None:
+    """A network error during resolve → None → table treated as ABSENT, no DELETE."""
+    mod = _import_cleanup()
+
+    def boom_get(*a, **k):  # noqa: ARG001
+        raise mod.requests.RequestException("dns fail")
+
+    def boom_delete(*a, **k):  # noqa: ARG001
+        raise AssertionError("must not DELETE when resolve failed")
+
+    monkeypatch.setattr(mod.requests, "get", boom_get)
+    monkeypatch.setattr(mod.requests, "delete", boom_delete)
+
+    counter = {"deleted": 0, "absent": 0, "warn": 0, "dry": 0}
+    mod.hard_delete("http://om", {}, "trino_iceberg.iceberg.gold.fct_match", dry_run=False, counter=counter)
+    assert counter["absent"] == 1 and counter["deleted"] == 0

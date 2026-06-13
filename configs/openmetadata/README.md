@@ -111,17 +111,12 @@ docker compose exec openmetadata-ingestion python /opt/configs/cleanup_lineage.p
 ```
 
 The script targets a curated list of the 19 derived-gold tables dropped in epic
-#478 (idempotent — a table already gone is reported `ABSENT` and skipped). For a
-general sweep of any future drop, first re-run `om-ingest-trino` (to soft-delete
-tables gone from Trino), then add `--all-soft-deleted`:
-
-```bash
-docker compose exec openmetadata-ingestion python /opt/configs/cleanup_lineage.py --all-soft-deleted --apply
-```
+#478 (idempotent — a table already gone is reported `ABSENT` and skipped). When a
+future drop needs the same treatment, add its FQN to `DROPPED_TABLES` in the script.
 
 This step is **deliberately manual, not wired into the nightly `om-lineage-trino`** —
-auto-hard-deleting any transiently-missing table would permanently destroy its
-descriptions, tags, and lineage. Always review the dry-run list first.
+hard-deleting a table that is only transiently missing from Trino would permanently
+destroy its descriptions, tags, and lineage. Always review the dry-run list first.
 
 > `entity_xref` is **not** cleaned here: it is still a live table (its drop is the
 > separate followup #146), so it is never soft-deleted and its edges are not stale.

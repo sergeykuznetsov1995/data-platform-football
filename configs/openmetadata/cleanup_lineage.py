@@ -28,7 +28,6 @@ ENV:
 Usage:
     python cleanup_lineage.py                       # dry-run the curated #478 list
     python cleanup_lineage.py --apply               # hard-delete the curated #478 list
-    python cleanup_lineage.py --all-soft-deleted    # also include any soft-deleted table
 """
 
 from __future__ import annotations
@@ -94,22 +93,6 @@ def resolve_table_id(host: str, headers: dict[str, str], fqn: str) -> str | None
     return r.json().get("id") if r.status_code == 200 else None
 
 
-def discover_soft_deleted(host: str, headers: dict[str, str]) -> list[str]:
-    """FQNs of soft-deleted tables under the trino_iceberg service (read-only)."""
-    try:
-        r = requests.get(
-            f"{host}/api/v1/tables",
-            headers=headers,
-            params={"service": SERVICE, "include": "deleted", "limit": 1000},
-            timeout=30,
-        )
-        r.raise_for_status()
-    except requests.RequestException as exc:
-        print(f"  WARN discover soft-deleted: {exc}")
-        return []
-    return [t["fullyQualifiedName"] for t in (r.json().get("data") or []) if t.get("fullyQualifiedName")]
-
-
 def hard_delete(host: str, headers: dict[str, str], fqn: str, dry_run: bool, counter: dict[str, int]) -> None:
     """Hard-delete one table by FQN (recursive → cascades to its lineage edges)."""
     if dry_run:
@@ -151,11 +134,6 @@ def main() -> int:
         "--dry-run", action="store_true",
         help="explicit no-op (dry-run is the default; --apply overrides it)",
     )
-    ap.add_argument(
-        "--all-soft-deleted",
-        action="store_true",
-        help="also hard-delete every soft-deleted table under trino_iceberg (future drops)",
-    )
     ap.add_argument("--host", default=DEFAULT_HOST, help=f"OpenMetadata host (default {DEFAULT_HOST})")
     args = ap.parse_args()
 
@@ -168,12 +146,6 @@ def main() -> int:
     headers = {"Authorization": f"Bearer {token}"} if token else {}
 
     fqns = list(CURATED_FQNS)
-    if args.all_soft_deleted and token:
-        for fqn in discover_soft_deleted(args.host, headers):
-            if fqn not in fqns:
-                fqns.append(fqn)
-    elif args.all_soft_deleted:
-        print("NOTE: --all-soft-deleted needs a JWT to list deleted tables; running curated list only.\n")
 
     mode = "DRY-RUN (no deletes; pass --apply to execute)" if dry_run else "APPLY (hard-delete)"
     print(f"cleanup_lineage: {mode} — {len(fqns)} target table(s) on {args.host}\n")
