@@ -897,8 +897,14 @@ class NodriverFBrefScraper(BaseScraper):
         if all_data:
             combined_df = pd.concat(all_data, ignore_index=True)
             table_name = f"fbref_{data_category}_{stat_type}"
+            # #536: this nodriver path is the production single_stat default
+            # (create_single_stat_task scraper_type='nodriver'). Without
+            # replace_partitions the weekly DAG appends a full copy of each
+            # (league, season) every run (45-50x bloat). Mirrors scrape_all
+            # (#468) and the selenium FBrefDataReaderMixin path.
             table_path = self.save_to_iceberg(
-                combined_df, table_name, partition_cols=['league', 'season']
+                combined_df, table_name, partition_cols=['league', 'season'],
+                replace_partitions=['league', 'season'],
             )
             entity_key = f"{data_category}_{stat_type}"
             result[entity_key] = table_path

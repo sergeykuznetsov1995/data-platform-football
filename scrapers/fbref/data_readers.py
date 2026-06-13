@@ -665,10 +665,17 @@ class FBrefDataReaderMixin:
             combined_df = pd.concat(all_data, ignore_index=True)
             table_name = f'fbref_{data_category}_{stat_type}'
 
+            # #536: full-state per (league, season) — without replace_partitions
+            # the weekly single_stat DAG tasks plain-append a full copy every
+            # run (45-50x bloat in fbref_player_{misc,shooting,playingtime},
+            # team_* and keeper_*). Mirrors scrape_all (#468) and the combined
+            # match path; the DELETE only targets the (league, season) keys in
+            # this frame, leaving other partitions untouched.
             table_path = self.save_to_iceberg(
                 df=combined_df,
                 table_name=table_name,
                 partition_cols=['league', 'season'],
+                replace_partitions=['league', 'season'],
             )
 
             key = f'{data_category}_{stat_type}'
