@@ -316,19 +316,19 @@ class WhoScoredScraper(SoccerdataScraper):
         else:
             ids = list(meta_by_id.keys())
 
-        # 2. Resume — skip already-saved.
+        # 2. Resume — skip already-saved. A transient failure here MUST raise,
+        # not be swallowed: with `done` left empty the whole season would be
+        # re-appended (events save is APPEND-only). TABLE_NOT_FOUND is already
+        # handled inside _fetch_existing_event_game_ids (returns set()).
         if skip_existing and ids:
-            try:
-                done = self._fetch_existing_event_game_ids()
-                if done:
-                    before = len(ids)
-                    ids = [mid for mid in ids if mid not in done]
-                    logger.info(
-                        f"WhoScored: skip_existing — {before - len(ids)} of "
-                        f"{before} already in bronze, {len(ids)} remaining"
-                    )
-            except Exception as e:
-                logger.warning(f"WhoScored: skip_existing check failed: {e}")
+            done = self._fetch_existing_event_game_ids()
+            if done:
+                before = len(ids)
+                ids = [mid for mid in ids if mid not in done]
+                logger.info(
+                    f"WhoScored: skip_existing — {before - len(ids)} of "
+                    f"{before} already in bronze, {len(ids)} remaining"
+                )
 
         if max_matches is not None:
             ids = ids[: int(max_matches)]
@@ -391,6 +391,32 @@ class WhoScoredScraper(SoccerdataScraper):
                 pass
             session_id = f"whoscored-{uuid.uuid4().hex[:8]}"
             client.create_session(session_id, proxy_url=_pick_proxy_url())
+
+        def _flush_chunk(progress: Optional[int] = None) -> None:
+            """Persist accumulated event frames as one Iceberg append, reset.
+
+            Called when the chunk fills mid-loop AND once after the loop — the
+            post-loop call guards the tail chunk against the final match(es)
+            failing (issue #467), where the old ``i == total`` trigger was
+            bypassed by ``continue``.
+            """
+            nonlocal chunk, path
+            if not chunk:
+                return
+            combined = pd.concat(chunk, ignore_index=True)
+            combined = self._add_metadata(combined, 'events')
+            path = self.save_to_iceberg(
+                df=combined,
+                table_name='whoscored_events',
+                partition_cols=['league', 'season'],
+            )
+            where = (
+                f"{progress}/{total}" if progress is not None else f"final/{total}"
+            )
+            logger.info(
+                f"WhoScored: saved chunk @ {where} ({len(combined)} rows)"
+            )
+            chunk = []
 
         try:
             for i, mid in enumerate(ids, 1):
@@ -470,20 +496,11 @@ class WhoScoredScraper(SoccerdataScraper):
                         f"({i}/{total})"
                     )
 
-                if len(chunk) >= chunk_size or i == total:
-                    if chunk:
-                        combined = pd.concat(chunk, ignore_index=True)
-                        combined = self._add_metadata(combined, 'events')
-                        path = self.save_to_iceberg(
-                            df=combined,
-                            table_name='whoscored_events',
-                            partition_cols=['league', 'season'],
-                        )
-                        logger.info(
-                            f"WhoScored: saved chunk @ {i}/{total} "
-                            f"({len(combined)} rows)"
-                        )
-                        chunk = []
+                if len(chunk) >= chunk_size:
+                    _flush_chunk(i)
+            # Final flush — guards the tail chunk when the last match(es) gave
+            # up via `continue` and never tripped the in-loop flush (issue #467).
+            _flush_chunk()
         finally:
             try:
                 client.destroy_session(session_id)
