@@ -41,6 +41,11 @@ columns:
     description: Market value игрока на момент трансфера (BIGINT).
   - name: is_upcoming
     description: True если трансфер ещё не завершён (announced/agreed).
+  - name: is_loan
+    description: |
+      True для всех loan-движений (уход в аренду и возврат): из fee_text
+      LIKE '%loan%' ('loan transfer' / 'End of loan' / 'Loan fee: €X').
+      Никогда не NULL.
   - name: _bronze_ingested_at
     description: Timestamp ingest'а Bronze.
   - name: league

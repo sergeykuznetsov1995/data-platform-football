@@ -1,0 +1,72 @@
+# =============================================================================
+# OpenMetadata description: iceberg.gold.fct_manager_stint
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.gold.fct_manager_stint
+  description: |
+    SCD-2 история работы тренеров (issue #429). Одна строка =
+    (тренер × команда × стинт), где «стинт» — непрерывный набор матчей, в
+    которых одна команда играла под одним тренером. Граница стинта детектится
+    через LAG(manager) OVER (team ORDER BY match_date): любая строка, где
+    тренер отличается от предыдущей, начинает новый стинт.
+
+    PK = (manager_id, team_id, valid_from). Интервалы closed-open
+    [valid_from, valid_to): valid_to IS NULL означает текущий (открытый) стинт.
+    Point-in-time JOIN: match_date >= valid_from AND
+    (valid_to IS NULL OR match_date < valid_to) — джойнить по интервалу, а не
+    по равенству season. Multi-season стинт (напр. Артета @ Arsenal с 2019-12)
+    = одна строка; league/season взяты от ПЕРВОГО матча стинта.
+
+    Источники: bronze.fbref_match_managers (FBref scorebox) +
+    silver.fbref_match_enriched (типизированный match_date, dedup-расписание) +
+    silver.xref_manager / silver.xref_team (canonical id per source-season).
+    Партиционирования нет (маленькая таблица, стинт может пересекать сезоны).
+  tags:
+    - Tier.Gold
+    - Domain.Football
+    - PII.None
+columns:
+  # ─── PK ───
+  - name: manager_id
+    description: Канонический ID тренера (PK part) из silver.xref_manager (source='fbref'). FK → dim_manager.manager_id.
+  - name: team_id
+    description: Канонический ID команды (PK part) из silver.xref_team. FK → dim_team.team_id.
+  - name: valid_from
+    description: |
+      Начало стинта (PK part) — MIN(match_date) матчей стинта. Левая граница
+      closed-open интервала [valid_from, valid_to).
+  # ─── Validity / metrics ───
+  - name: valid_to
+    description: |
+      Конец стинта (exclusive) — LEAD(valid_from) следующего стинта команды.
+      NULL = текущий открытый стинт. Для команд, выпавших из глобально-
+      последнего сезона данных, закрывается last_match_date + 1 день (чтобы
+      closed-open семантика и point-in-time JOIN'ы остались корректными).
+  - name: is_current
+    description: |
+      TRUE только если (a) это последний стинт команды И (b) у команды есть
+      матчи в глобально-последнем сезоне данных. Условие (b) не даёт пометить
+      текущим тренера вылетевшей команды.
+  - name: matches_in_charge
+    description: |
+      Число дедуплицированных лиговых матчей внутри стинта (одна строка на
+      (team, match_date) — FBref scorebox несёт ×2-×5 дублей).
+  - name: league
+    description: Лига (от первого матча стинта; стинт может пересекать сезоны).
+  - name: season
+    description: |
+      Сезон-slug ('2425' = сезон 2024/25) ПЕРВОГО матча стинта. Для запросов
+      «тренер X в сезоне Y» джойнить по интервалу [valid_from, valid_to),
+      а не по равенству с этим столбцом.
+  # ─── Lineage ───
+  - name: _silver_created_at
+    description: Технический timestamp материализации строки CTAS-раннером.
+relationships:
+  - from: manager_id
+    to: trino_iceberg.iceberg.gold.dim_manager.manager_id
+    type: FOREIGN_KEY
+    description: N:1 — атрибуты тренера.
+  - from: team_id
+    to: trino_iceberg.iceberg.gold.dim_team.team_id
+    type: FOREIGN_KEY
+    description: N:1 — атрибуты команды.
