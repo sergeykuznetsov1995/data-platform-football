@@ -156,3 +156,84 @@ class TestRetryableExceptions:
         assert ConnectionError in RETRYABLE_EXCEPTIONS
         assert TimeoutError in RETRYABLE_EXCEPTIONS
         assert OSError in RETRYABLE_EXCEPTIONS
+
+
+class TestHttpErrorRetry:
+    """HTTPError is retried only for transient/server statuses, never 4xx (#470).
+
+    requests.exceptions.HTTPError subclasses OSError, so a blanket type-based
+    retry would otherwise hammer 403/404 — burning attempts and accelerating
+    proxy bans on anti-bot sources.
+    """
+
+    @staticmethod
+    def _http_error(status):
+        import requests
+        resp = MagicMock()
+        resp.status_code = status
+        return requests.exceptions.HTTPError(response=resp)
+
+    def test_http_403_not_retried(self):
+        import requests
+        policy = RetryPolicy(max_attempts=3, min_wait=0.01, max_wait=0.01)
+        calls = [0]
+
+        def f():
+            calls[0] += 1
+            raise self._http_error(403)
+
+        with pytest.raises(requests.exceptions.HTTPError):
+            policy.execute(f)
+        assert calls[0] == 1  # no retry on 403
+
+    def test_http_404_not_retried(self):
+        import requests
+        policy = RetryPolicy(max_attempts=3, min_wait=0.01, max_wait=0.01)
+        calls = [0]
+
+        def f():
+            calls[0] += 1
+            raise self._http_error(404)
+
+        with pytest.raises(requests.exceptions.HTTPError):
+            policy.execute(f)
+        assert calls[0] == 1
+
+    def test_http_503_retried(self):
+        policy = RetryPolicy(max_attempts=3, min_wait=0.01, max_wait=0.01)
+        calls = [0]
+
+        def f():
+            calls[0] += 1
+            if calls[0] < 3:
+                raise self._http_error(503)
+            return "ok"
+
+        assert policy.execute(f) == "ok"
+        assert calls[0] == 3
+
+    def test_http_429_retried(self):
+        policy = RetryPolicy(max_attempts=2, min_wait=0.01, max_wait=0.01)
+        calls = [0]
+
+        def f():
+            calls[0] += 1
+            raise self._http_error(429)
+
+        with pytest.raises(Exception):
+            policy.execute(f)
+        assert calls[0] == 2  # retried up to max_attempts
+
+    def test_connection_error_still_retried(self):
+        """Regression guard: non-HTTP retryables keep retrying."""
+        policy = RetryPolicy(max_attempts=3, min_wait=0.01, max_wait=0.01)
+        calls = [0]
+
+        def f():
+            calls[0] += 1
+            if calls[0] < 3:
+                raise ConnectionError("transient")
+            return "ok"
+
+        assert policy.execute(f) == "ok"
+        assert calls[0] == 3

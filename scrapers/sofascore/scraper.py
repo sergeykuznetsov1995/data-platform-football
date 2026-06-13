@@ -203,16 +203,6 @@ class SofaScoreScraper(SoccerdataScraper):
         """
         return self.read_league_table()
 
-    def read_player_season_stats(self) -> Optional[pd.DataFrame]:
-        """
-        Read player season statistics.
-
-        Note: Sofascore doesn't have this method in soccerdata.
-        Returns None.
-        """
-        logger.info("Sofascore player stats not available in soccerdata")
-        return None
-
     def read_team_match_stats(self) -> Optional[pd.DataFrame]:
         """
         Read team match-level statistics.
@@ -1792,18 +1782,6 @@ class SofaScoreScraper(SoccerdataScraper):
     def scrape_team_stats(self) -> Dict[str, str]:
         """Scrape team stats (alias for league table)."""
         return self.scrape_league_table()
-
-    def scrape_player_stats(self) -> Dict[str, str]:
-        """Scrape player stats."""
-        df = self.read_player_season_stats()
-        if df is not None and not df.empty:
-            table_path = self.save_to_iceberg(
-                df=df,
-                table_name='sofascore_player_stats',
-                partition_cols=['league', 'season'],
-            )
-            return {'player_stats': table_path}
-        return {}
 
     def scrape_player_ratings(
         self,

@@ -14,7 +14,7 @@ from tenacity import (
     RetryError,
     Retrying,
     retry,
-    retry_if_exception_type,
+    retry_if_exception,
     stop_after_attempt,
     stop_after_delay,
     wait_exponential,
@@ -32,15 +32,31 @@ RETRYABLE_EXCEPTIONS: Tuple[Type[Exception], ...] = (
     OSError,
 )
 
+# HTTPError is handled separately (status-aware) because it subclasses OSError —
+# a plain type match would retry every status, including 403/404 (#470).
+_HTTPError: Optional[Type[Exception]] = None
+
 try:
     import requests
     RETRYABLE_EXCEPTIONS = RETRYABLE_EXCEPTIONS + (
         requests.exceptions.ConnectionError,
         requests.exceptions.Timeout,
-        requests.exceptions.HTTPError,
     )
+    _HTTPError = requests.exceptions.HTTPError
 except ImportError:
     pass
+
+# Transient/server statuses worth retrying. Anti-bot 4xx (403/404/410/451) are
+# excluded: retrying them burns attempts and accelerates proxy bans (#470).
+RETRYABLE_HTTP_STATUS = frozenset({408, 425, 429, 500, 502, 503, 504})
+
+
+def _is_retryable_http_error(exc: BaseException) -> bool:
+    """True only for an HTTPError whose status is in RETRYABLE_HTTP_STATUS."""
+    if _HTTPError is None or not isinstance(exc, _HTTPError):
+        return False
+    status = getattr(getattr(exc, "response", None), "status_code", None)
+    return status in RETRYABLE_HTTP_STATUS
 
 
 class RetryPolicy:
@@ -114,8 +130,20 @@ class RetryPolicy:
         )
 
     def _get_retry_condition(self):
-        """Get the retry condition based on configuration."""
-        return retry_if_exception_type(self.retryable_exceptions)
+        """Get the retry condition based on configuration.
+
+        A single predicate so HTTPError is checked by status BEFORE the
+        type-based fallback — otherwise OSError (its base class) would retry
+        every status, including non-retryable 4xx like 403/404 (#470).
+        """
+        retryable = self.retryable_exceptions
+
+        def _should_retry(exc: BaseException) -> bool:
+            if _HTTPError is not None and isinstance(exc, _HTTPError):
+                return _is_retryable_http_error(exc)
+            return isinstance(exc, retryable)
+
+        return retry_if_exception(_should_retry)
 
     @property
     def decorator(self) -> Callable:

@@ -545,9 +545,17 @@ class ProxyManager:
                 return
 
             # Check if should ban based on consecutive failures
+            total_attempts = proxy.success_count + proxy.failure_count
             if self._consecutive_failures[proxy_key] >= self.config.ban_threshold:
                 proxy.mark_banned()
-            elif proxy.success_rate < self.config.min_success_rate:
+            elif (
+                total_attempts >= self.config.ban_threshold
+                and proxy.success_rate < self.config.min_success_rate
+            ):
+                # Only apply the success-rate gate once the proxy has enough
+                # attempts for the rate to be meaningful — otherwise a single
+                # transient failure (0/1=0 < min_success_rate) permabans a fresh
+                # proxy and can wipe the whole pool in one rotation pass (#470).
                 proxy.mark_banned()
 
     def unban_all(self) -> None:

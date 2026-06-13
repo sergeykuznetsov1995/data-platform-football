@@ -321,9 +321,18 @@ def _iter_row_blocks(data_block: str):
     in_str = False
     quote_char = ''
     start = None
+    skip_next = False
     for i, c in enumerate(data_block):
+        if skip_next:
+            skip_next = False
+            continue
         if in_str:
             if c == '\\':
+                # Skip the escaped char (mirrors `i += 2` in _slice_data_array).
+                # A bare `continue` left the next char to be processed, so `\'`
+                # prematurely closed the literal and desynced the brace counter,
+                # silently merging/dropping rows on apostrophes in values (#470).
+                skip_next = True
                 continue
             if c == quote_char:
                 in_str = False

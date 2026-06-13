@@ -664,3 +664,29 @@ class TestPlayerProfileFlatten:
         row = SofaScoreScraper._flatten_player_profile(payload)
         assert row['nationality'] == 'Brazil'
         assert row['country_code'] == 'BR'
+
+
+class TestNoShadowedPlayerStats:
+    """#470 bug 7: a no-arg read_player_season_stats(self) stub shadowed the
+    real (league, season) method, and an unreachable scrape_player_stats()
+    called it with no args (latent TypeError) and without replace_partitions.
+    Both were removed — guard against their return."""
+
+    def test_no_scrape_player_stats_method(self):
+        from scrapers.sofascore.scraper import SofaScoreScraper
+        assert not hasattr(SofaScoreScraper, 'scrape_player_stats')
+
+    def test_single_read_player_season_stats_with_args(self):
+        import inspect
+        from scrapers.sofascore import scraper as sofascore_module
+        from scrapers.sofascore.scraper import SofaScoreScraper
+
+        src = inspect.getsource(sofascore_module)
+        assert src.count('def read_player_season_stats(') == 1, (
+            "exactly one read_player_season_stats definition — the no-arg stub "
+            "must stay removed so it can't shadow the real method"
+        )
+        params = inspect.signature(
+            SofaScoreScraper.read_player_season_stats
+        ).parameters
+        assert 'league' in params and 'season' in params

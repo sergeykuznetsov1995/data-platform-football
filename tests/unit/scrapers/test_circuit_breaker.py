@@ -121,6 +121,41 @@ class TestCircuitBreaker:
         # Verify force_open method exists and can be called
         cb.force_open()  # Should not raise
 
+    def test_exclude_exceptions_honored(self):
+        """exclude_exceptions must reach pybreaker so they don't trip the
+        circuit (regression for #470 bug 3 — param was decorative)."""
+        cb = CircuitBreaker(fail_max=2, exclude_exceptions=(ValueError,))
+
+        def excluded_failure():
+            raise ValueError("should not count as a failure")
+
+        # More than fail_max ValueErrors — yet the circuit must stay closed and
+        # keep re-raising ValueError, never CircuitBreakerError.
+        for _ in range(4):
+            with pytest.raises(ValueError):
+                cb.call(excluded_failure)
+
+        assert cb.is_closed is True
+        assert cb.failure_count == 0
+
+    def test_success_threshold_forwarded(self):
+        """success_threshold must reach pybreaker (was dropped — #470 bug 3)."""
+        cb = CircuitBreaker(fail_max=5, success_threshold=3)
+        assert cb._breaker.success_threshold == 3
+
+    def test_exclude_exceptions_survive_reset(self):
+        """reset() recreates the breaker — exclusions must persist."""
+        cb = CircuitBreaker(fail_max=2, exclude_exceptions=(ValueError,))
+        cb.reset()
+
+        def excluded_failure():
+            raise ValueError("excluded")
+
+        for _ in range(4):
+            with pytest.raises(ValueError):
+                cb.call(excluded_failure)
+        assert cb.is_closed is True
+
 
 class TestGetCircuitBreaker:
     """Tests for get_circuit_breaker function."""
