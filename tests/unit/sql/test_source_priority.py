@@ -196,3 +196,37 @@ def test_unknown_table_raises():
 
     with pytest.raises(MedallionConfigError):
         get_source_priority_exprs("fct_does_not_exist")
+
+
+# -- #556: season-fact audit siblings stay inline .sql (decision lock) ----------
+# The _audit tables emit a per-source DIFF matrix (fb.x - src.x AS x_diff_<source>)
+# which the single-COALESCE emitter cannot express, so they are deliberately NOT
+# migrated to source_priority.yaml. See docs/decisions/season-audit-inline.md.
+AUDIT_FILES = [
+    GOLD_SQL / "fct_player_season_stats_audit.sql",
+    GOLD_SQL / "fct_team_season_stats_audit.sql",
+    GOLD_SQL / "fct_keeper_season_stats_audit.sql",
+]
+
+
+@pytest.mark.parametrize("audit", AUDIT_FILES, ids=lambda p: p.stem)
+def test_season_audit_stays_inline(audit):
+    """#556 decision lock: audit siblings are NOT migrated to source_priority.yaml.
+    They render a per-source diff layout the single-COALESCE emitter cannot express.
+    A future migration would trip this test — see docs/decisions/season-audit-inline.md."""
+    assert audit.exists(), f"{audit.name} is missing"
+    # Must stay a plain .sql — no rendered .sql.j2 sibling.
+    assert not Path(str(audit) + ".j2").exists(), (
+        f"{audit.name}: a .sql.j2 sibling appeared — audit was migrated to "
+        f"source_priority.yaml against the #556 decision "
+        f"(docs/decisions/season-audit-inline.md)."
+    )
+    body = audit.read_text(encoding="utf-8")
+    # Not rendered → no Jinja placeholders.
+    assert "{{" not in body, (
+        f"{audit.name}: Jinja placeholder in a plain .sql audit"
+    )
+    # Proof it is a diff layout, not a COALESCE merge: per-source diff columns.
+    assert re.search(r"_diff_\w+", body), (
+        f"{audit.name}: expected per-source diff columns (…_diff_<source>)"
+    )

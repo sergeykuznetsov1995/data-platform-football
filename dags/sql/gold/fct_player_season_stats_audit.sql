@@ -24,6 +24,10 @@
 --
 -- ⚠️ Audit-таблица читает Silver заново (НЕ gold.fct_player_season_stats):
 --   one-hop правило (memory: project_gold_cleanup_2026-05-12).
+--
+-- #556: остаётся inline .sql (НЕ мигрирован на source_priority.yaml) — per-source
+-- diff-layout несовместим с single-COALESCE эмиттером. Решение:
+-- docs/decisions/season-audit-inline.md
 -- =============================================================================
 
 WITH
