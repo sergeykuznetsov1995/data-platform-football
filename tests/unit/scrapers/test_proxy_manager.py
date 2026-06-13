@@ -189,6 +189,41 @@ class TestProxyManager:
 
         assert proxy.is_banned is True
 
+    def test_record_result_single_failure_does_not_ban_fresh_proxy(self):
+        """A fresh proxy must survive ONE transient failure.
+
+        Regression for #470 bug 1: success_rate = 0/1 = 0 < min_success_rate(0.5)
+        used to permaban on the very first failure, making ban_threshold dead
+        code and letting a single transient site outage wipe the whole pool in
+        one rotation pass.
+        """
+        manager = ProxyManager()  # defaults: ban_threshold=5, min_success_rate=0.5
+        manager.add_proxy('proxy1.example.com', 8080)
+
+        proxy = manager.get_proxy()
+        manager.record_result(proxy, success=False)  # single transient failure
+
+        assert proxy.is_banned is False
+        assert proxy.failure_count == 1
+
+    def test_record_result_success_rate_ban_after_min_attempts(self):
+        """Once a proxy reaches ban_threshold attempts, a sub-threshold success
+        rate still bans it — the guard only suppresses *premature* bans."""
+        manager = ProxyManager()
+        manager.config.ban_threshold = 5
+        manager.config.min_success_rate = 0.5
+        manager.add_proxy('proxy1.example.com', 8080)
+
+        proxy = manager.get_proxy()
+        # 2 successes, then 3 failures: 5 attempts, rate 2/5=0.4 < 0.5, but only
+        # 3 consecutive failures (< ban_threshold) so the consecutive path is idle.
+        manager.record_result(proxy, success=True)
+        manager.record_result(proxy, success=True)
+        for _ in range(3):
+            manager.record_result(proxy, success=False)
+
+        assert proxy.is_banned is True
+
     def test_available_count(self):
         manager = ProxyManager()
         manager.add_proxy('proxy1.example.com', 8080)
