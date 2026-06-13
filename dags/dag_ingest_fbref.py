@@ -32,7 +32,7 @@ Each stat_type is saved to a separate Iceberg table:
 - fbref_player_{stat_type} (4 tables)
 - fbref_team_{stat_type} (4 tables)
 - fbref_keeper_{stat_type} (2 tables)
-- fbref_schedule, fbref_shot_events, fbref_match_events, fbref_lineups,
+- fbref_schedule, fbref_match_events, fbref_lineups,
   fbref_match_team_stats, fbref_match_player_stats, fbref_match_managers
 
 NOTE: As of 2025-2026, FBref uses Cloudflare Turnstile CAPTCHA.
@@ -305,8 +305,8 @@ with DAG(
     **Keeper Stats (2 tables):**
     - fbref_keeper_keeper, fbref_keeper_keeper_adv
 
-    **Match Data (7 tables):**
-    - fbref_schedule, fbref_shot_events, fbref_match_events, fbref_lineups
+    **Match Data (6 tables):**
+    - fbref_schedule, fbref_match_events, fbref_lineups
     - fbref_match_team_stats, fbref_match_player_stats, fbref_match_managers
 
     ### Testing nodriver scraper with residential proxies
