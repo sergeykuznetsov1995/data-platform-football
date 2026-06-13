@@ -255,6 +255,47 @@ class TestBatchSaveMatchDataFallback:
 
 
 # ===========================================================================
+# Test: scrape_single_stat_type — season-grain replace_partitions (#536)
+# ===========================================================================
+
+class TestSingleStatReplacePartitions:
+    """#536: scrape_single_stat_type must save with replace_partitions=
+    ['league', 'season']. Without it the weekly single_stat DAG tasks
+    plain-append a full copy of each (league, season) every run — observed
+    45-50x bloat in fbref_player_{misc,shooting,playingtime}, fbref_team_*
+    and fbref_keeper_* (same root cause as #468, different code path)."""
+
+    @pytest.mark.parametrize('data_category, read_method', [
+        ('player', 'read_player_season_stats'),
+        ('team', 'read_team_season_stats'),
+        ('keeper', 'read_keeper_stats'),
+    ])
+    @patch('scrapers.fbref.data_readers.time.sleep', return_value=None)
+    def test_single_stat_saved_with_league_season_replace_partitions(
+        self, _sleep, data_category, read_method
+    ):
+        scraper = StubScraper()
+        scraper.save_to_iceberg = MagicMock(
+            side_effect=lambda df, table_name, **kw: f'iceberg.bronze.{table_name}'
+        )
+        df = pd.DataFrame({
+            'squad': ['Arsenal'],
+            'league': ['ENG-Premier League'],
+            'season': [2025],
+        })
+        setattr(scraper, read_method, MagicMock(return_value=df))
+
+        scraper.scrape_single_stat_type(
+            stat_type='stats', data_category=data_category
+        )
+
+        assert scraper.save_to_iceberg.call_count == 1
+        assert scraper.save_to_iceberg.call_args.kwargs.get(
+            'replace_partitions'
+        ) == ['league', 'season']
+
+
+# ===========================================================================
 # Test: scrape_combined_match_data — pre-flight Trino probe
 # ===========================================================================
 
