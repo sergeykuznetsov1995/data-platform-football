@@ -51,13 +51,32 @@ WITH bronze_dedup AS (
     WHERE rn = 1
 ),
 
+-- Dedup bronze.understat_shots by shot_id BEFORE the penalty SUM/COUNT —
+-- otherwise a re-ingest / replace→append regression double-counts a penalty
+-- shot and poisons non_penalty_xg / non_penalty_goals (#464). Mirrors
+-- gold/fct_shot.sql shots_dedup; _batch_id breaks _ingested_at ties.
+shots_dedup AS (
+    SELECT *
+    FROM (
+        SELECT
+            s.*,
+            ROW_NUMBER() OVER (
+                PARTITION BY shot_id
+                ORDER BY _ingested_at DESC, _batch_id DESC
+            ) AS rn
+        FROM iceberg.bronze.understat_shots s
+        WHERE shot_id IS NOT NULL
+    )
+    WHERE rn = 1
+),
+
 shot_penalty_aggr AS (
     SELECT
         game_id,
         player_id,
         SUM(xg)        AS penalty_xg,
         COUNT(*) FILTER (WHERE result = 'Goal') AS penalty_goals
-    FROM iceberg.bronze.understat_shots
+    FROM shots_dedup
     WHERE game_id   IS NOT NULL
       AND player_id IS NOT NULL
       AND situation IS NULL           -- soccerdata maps 'Penalty' → NULL

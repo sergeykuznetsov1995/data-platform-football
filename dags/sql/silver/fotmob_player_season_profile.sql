@@ -42,6 +42,24 @@ WITH details_dedup AS (
     FROM iceberg.bronze.fotmob_player_details
 ),
 
+stats_dedup AS (
+    -- Dedup long-format stats by (participant_id, league, season, stat_name)
+    -- BEFORE the MAX-pivot — otherwise MAX(stat_value) over multiple snapshots
+    -- returns the historical high for non-monotonic metrics (rating, per-90),
+    -- not the latest value. _batch_id breaks _ingested_at ties (#464).
+    SELECT *
+    FROM (
+        SELECT
+            s.*,
+            ROW_NUMBER() OVER (
+                PARTITION BY participant_id, league, season, stat_name
+                ORDER BY _ingested_at DESC, _batch_id DESC
+            ) AS rn
+        FROM iceberg.bronze.fotmob_player_stats s
+    )
+    WHERE rn = 1
+),
+
 stats_pivoted AS (
     SELECT
         CAST(participant_id AS VARCHAR) AS player_id,
@@ -85,7 +103,7 @@ stats_pivoted AS (
         MAX(CASE WHEN stat_name = 'yellow_card' THEN stat_value END) AS yellow_cards,
         MAX(CASE WHEN stat_name = 'red_card' THEN stat_value END) AS red_cards,
         MAX(CASE WHEN stat_name = 'fouls' THEN stat_value END) AS fouls_per_90
-    FROM iceberg.bronze.fotmob_player_stats
+    FROM stats_dedup
     GROUP BY participant_id, league, season
 )
 
