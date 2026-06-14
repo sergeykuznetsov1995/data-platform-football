@@ -198,15 +198,24 @@ class TestDrissionPageBypass:
         assert len(DrissionPageBypass.WINDOW_SIZES) >= 3
         assert (1920, 1080) not in DrissionPageBypass.WINDOW_SIZES  # Standard should be avoided
 
-    def test_user_agents_variation(self):
-        """Test that user agents are varied for anti-fingerprinting."""
+    def test_create_options_omits_cf_violating_args(self):
+        """CF invariants (#469): no --disable-gpu / --renderer-process-limit /
+        --disable-software-rasterizer, and no User-Agent override."""
         from scrapers.base.browser.drissionpage_bypass import DrissionPageBypass
 
-        # Check user agents are defined and varied
-        assert len(DrissionPageBypass.USER_AGENTS) >= 2
-        # All should be Chrome-based
-        for ua in DrissionPageBypass.USER_AGENTS:
-            assert 'Chrome' in ua
+        bypass = DrissionPageBypass()
+        captured = []
+        mock_co = MagicMock()
+        mock_co.set_argument.side_effect = lambda arg: captured.append(arg)
+
+        with patch('scrapers.base.browser.drissionpage_bypass._import_drissionpage',
+                   return_value=(Mock(), Mock(return_value=mock_co))):
+            bypass._create_options()
+
+        assert '--disable-gpu' not in captured
+        assert '--renderer-process-limit=1' not in captured
+        assert '--disable-software-rasterizer' not in captured
+        assert not any(a.startswith('--user-agent') for a in captured)
 
     def test_drissionpage_session_factory(self):
         """Test drissionpage_session factory function."""

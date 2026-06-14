@@ -64,15 +64,6 @@ class DrissionPageBypass:
         headless: Run browser in headless mode (requires Xvfb in Docker)
     """
 
-    # User agents for rotation (Chrome 131-133, актуальные для Q1 2026)
-    USER_AGENTS = [
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36',
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36',
-        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-        'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36',
-    ]
-
     # Window sizes for rotation (non-standard to avoid fingerprinting)
     WINDOW_SIZES = [
         (1366, 768),   # Common laptop
@@ -183,28 +174,27 @@ class DrissionPageBypass:
         co.set_argument('--no-first-run')
         co.set_argument('--no-default-browser-check')
 
-        # Random User-Agent
-        user_agent = random.choice(self.USER_AGENTS)
-        co.set_argument(f'--user-agent={user_agent}')
+        # Do NOT override User-Agent — let the real Chromium 120 use its native UA.
+        # Faking Chrome 131-133 UA on a Chromium 120 binary creates a version /
+        # JA3/JA4 mismatch that Cloudflare catches. (#469)
 
         # Language settings (human-like)
         co.set_argument('--lang=en-US,en,ru-RU,ru')
 
-        # Note: WebGL is NOT disabled — Cloudflare uses WebGL fingerprinting
-        # to verify "real" browser. With --disable-gpu, WebGL uses software fallback.
-
         # Memory optimization for Docker (CRITICAL for OOM prevention)
         # Note: --single-process removed — Cloudflare detects it as bot marker
         co.set_argument('--disable-dev-shm-usage')
-        co.set_argument('--disable-gpu')
         co.set_argument('--no-sandbox')
-        co.set_argument('--disable-software-rasterizer')
         co.set_argument('--disable-background-networking')
         co.set_argument('--disable-sync')
         co.set_argument('--disable-translate')
         co.set_argument('--js-flags=--max-old-space-size=512')
-        co.set_argument('--renderer-process-limit=1')
         co.set_argument('--disable-background-timer-throttling')
+
+        # Note: --disable-gpu, --renderer-process-limit=1 and --disable-software-rasterizer
+        # intentionally NOT set — they create a unique browser fingerprint that Cloudflare
+        # detects as a bot marker. WebGL fingerprinting needs GPU/SwiftShader enabled to
+        # produce a "real" WebGL context (null context = bot tell). (#469)
 
         # Proxy configuration
         if self.proxy:
