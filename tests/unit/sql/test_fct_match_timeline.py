@@ -23,8 +23,8 @@ Synthetic dataset:
     events for the same bridged game_id=1 that the gate must drop.
   * M2 — WhoScored-only match (Chelsea vs Fulham, game_id=2 bridged via
     schedule+enriched): goal+assist, penalty goal, penalty miss, own goal
-    (Opta side flip), yellow card in first-half stoppage (cumulative
-    minute 48 → 45+3), SubstitutionOff/On pair (one timeline row).
+    (Opta side flip), yellow card in first-half stoppage (0-based cumulative
+    minute 48 → +1 → 45+4, #521), SubstitutionOff/On pair (one timeline row).
 """
 
 from __future__ import annotations
@@ -242,7 +242,8 @@ def _seed_corpus(duck_conn) -> None:
 
     # ---- M2: WhoScored-only match (Chelsea home vs Fulham away) ----
     # Opta own_goal convention: event sits on the STRIKER's team (Fulham) —
-    # the credit must flip to Chelsea. Cumulative minute: FirstHalf 48 → 45+3.
+    # the credit must flip to Chelsea. 0-based cumulative minute: FirstHalf 48
+    # → +1 → 45+4 (#521).
     duck_conn.execute(
         f"""
         INSERT INTO bronze_whoscored_events VALUES
@@ -382,13 +383,54 @@ class TestFctMatchTimeline:
         stoppage_2h = next(r for r in m1 if r["event_seq"] == 8)
         assert (stoppage_2h["minute"], stoppage_2h["minute_added"],
                 stoppage_2h["period"]) == (90, 4, "2H")
-        # WS cumulative minute: FirstHalf 48 → 45+3
+        # WS 0-based cumulative minute: FirstHalf 48 → +1 = 49 → 45+4 (#521)
         ws_yellow = next(r for r in _match_rows(out, "M2")
                          if r["event_type"] == "yellow_card")
         assert (ws_yellow["minute"], ws_yellow["minute_added"],
-                ws_yellow["period"]) == (45, 3, "1H")
+                ws_yellow["period"]) == (45, 4, "1H")
         plain = next(r for r in m1 if r["event_seq"] == 1)
         assert (plain["minute"], plain["minute_added"]) == (10, None)
+
+    def test_whoscored_minute_plus_one_normalisation(self, duck_conn):
+        """#521: WhoScored (Opta) minute is 0-based cumulative within the half;
+        FBref is 1-based display. The WS branch must add +1 BEFORE the
+        period-aware base/stoppage clamp so both sources share one scale.
+        Covers the edge cases the issue calls out: 0th minute (kickoff),
+        the 45'/90' joints, and stoppage just past each joint.
+
+        A bridgeless game_id=3 (no schedule/xref rows) survives the ws_only
+        gate under 'whoscored_raw_3' — minute math is independent of bridging.
+        """
+        _seed_corpus(duck_conn)
+        duck_conn.execute(
+            f"""
+            INSERT INTO bronze_whoscored_events VALUES
+              (3.0, 'FirstHalf',   0, 0,  0, 'Goal', 'Successful',
+               300.0, 3001.0, NULL, '[]', NULL, 'Brighton', '{_LG}', '2425', {_TS}),
+              (3.0, 'FirstHalf',  44, 0, 44, 'Goal', 'Successful',
+               300.0, 3002.0, NULL, '[]', NULL, 'Brighton', '{_LG}', '2425', {_TS}),
+              (3.0, 'FirstHalf',  45, 0, 45, 'Goal', 'Successful',
+               300.0, 3003.0, NULL, '[]', NULL, 'Brighton', '{_LG}', '2425', {_TS}),
+              (3.0, 'SecondHalf', 89, 0, 89, 'Goal', 'Successful',
+               300.0, 3004.0, NULL, '[]', NULL, 'Brighton', '{_LG}', '2425', {_TS}),
+              (3.0, 'SecondHalf', 90, 0, 90, 'Goal', 'Successful',
+               300.0, 3005.0, NULL, '[]', NULL, 'Brighton', '{_LG}', '2425', {_TS})
+            """
+        )
+        out = _run_gold(duck_conn)
+        m3 = _match_rows(out, "whoscored_raw_3")
+        assert len(m3) == 5, m3
+        assert all(r["event_source"] == "whoscored" for r in m3), m3
+        assert [r["event_seq"] for r in m3] == [1, 2, 3, 4, 5]
+        # raw 0/44/45/89/90 → +1 → 1/45/46/90/91 → base+stoppage
+        seq = [(r["period"], r["minute"], r["minute_added"]) for r in m3]
+        assert seq == [
+            ("1H", 1, None),    # raw 0  → 1   kickoff / 0th minute
+            ("1H", 45, None),   # raw 44 → 45  last regulation 1H minute
+            ("1H", 45, 1),      # raw 45 → 46  first-half stoppage 45+1
+            ("2H", 90, None),   # raw 89 → 90  90' regulation
+            ("2H", 90, 1),      # raw 90 → 91  second-half stoppage 90+1
+        ], seq
 
     def test_running_score_and_own_goal_credit(self, duck_conn):
         _seed_corpus(duck_conn)
