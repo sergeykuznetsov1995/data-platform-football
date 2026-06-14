@@ -93,11 +93,13 @@ class DriverFactory:
         )
         options.add_argument('--no-sandbox')
         options.add_argument('--disable-dev-shm-usage')
-        options.add_argument('--disable-gpu')
         options.add_argument('--disable-setuid-sandbox')
 
+        # Note: --disable-gpu / --disable-software-rasterizer intentionally NOT set —
+        # they null the WebGL context, which Cloudflare reads as a bot marker. WebGL
+        # needs GPU/SwiftShader enabled to produce a "real" context. (#567)
+
         # Memory and stability optimizations
-        options.add_argument('--disable-software-rasterizer')
         options.add_argument('--disable-background-networking')
         options.add_argument('--disable-default-apps')
         options.add_argument('--disable-sync')
@@ -193,7 +195,8 @@ class DriverFactory:
         )
         options.add_argument('--no-sandbox')
         options.add_argument('--disable-dev-shm-usage')
-        options.add_argument('--disable-gpu')
+        # Note: --disable-gpu intentionally NOT set — it nulls the WebGL context
+        # that Cloudflare uses to verify a "real" browser (bot marker). (#567)
         options.add_argument('--disable-blink-features=AutomationControlled')
 
         # Handle proxy settings - bypass system proxy if no explicit proxy configured
