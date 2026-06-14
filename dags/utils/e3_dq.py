@@ -490,10 +490,11 @@ def _build_whoscored_events_spadl_checks() -> List[Check]:
 
         # SPADL coverage drift guard. R3 verdict: ~2.88% unknown baseline on
         # 2425+2526 corpus. After full multi-season backfill the rate ran at
-        # 4.27% (29,708 / 695,144) — the bigger corpus exposes more meta-event
-        # types Card/Substitution/Goal etc. that map to 'unknown' by design.
-        # Cap at 40K (~5.75%) so a fresh taxonomy drift (new WhoScored type)
-        # still trips before silently corrupting downstream stats.
+        # ~4.1% (~28.4K / 695,144) — meta-event types Card/Substitution etc.
+        # map to 'unknown' by design (Goal moved to the shot family in #462,
+        # dropping ~1,288 rows out of 'unknown'). Cap at 40K (~5.75%) so a fresh
+        # taxonomy drift (new WhoScored type) still trips before silently
+        # corrupting downstream stats.
         CHECK.row_count(
             table=table,
             min_rows=0,
