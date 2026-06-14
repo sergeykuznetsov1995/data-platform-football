@@ -52,12 +52,13 @@
 --     Goal.related_player_id (verified = assist on live corpus). NULL where
 --     not applicable (cards, own goals, penalty miss) — by design.
 --   * time: minute = base minute, minute_added = stoppage ("90+4" → 90/4).
---     FBref minute is a varchar with optional '+'; WhoScored minute is
---     CUMULATIVE within half (probed live: FirstHalf 0–59, SecondHalf 45–105)
---     → FirstHalf >45 ⇒ 45+(m−45), SecondHalf >90 ⇒ 90+(m−90).
---     period: '1H' | '2H' | 'ET' (FBref base >90 ⇒ ET; league corpus has no
---     ET in practice). WhoScored non-half periods (PreMatch/PostGame/shootout)
---     are dropped.
+--     FBref minute is a 1-based display varchar with optional '+'. WhoScored
+--     (Opta) minute is 0-based CUMULATIVE within half (probed live: FirstHalf
+--     0–59, SecondHalf 45–105) → normalised +1 to FBref's 1-based convention
+--     (#521), THEN clamped: FirstHalf >45 ⇒ 45+(m−45), SecondHalf >90 ⇒
+--     90+(m−90). period: '1H' | '2H' | 'ET' (FBref base >90 ⇒ ET; league
+--     corpus has no ET in practice). WhoScored non-half periods
+--     (PreMatch/PostGame/shootout) are dropped.
 --   * event_seq: ROW_NUMBER per match ordered by (period, minute, added,
 --     second, event-priority, player) — dense, 1-based, deterministic. True
 --     intra-minute order is unknowable from FBref granularity, so the
@@ -299,7 +300,8 @@ ws_classified AS (
     SELECT
         CAST(CAST(we.game_id AS BIGINT) AS varchar)          AS ws_game_id,
         we.period                                            AS period_raw,
-        CAST(we.minute AS integer)                           AS minute_cum,
+        -- #521: Opta minute is 0-based cumulative; +1 → FBref 1-based scale
+        CAST(we.minute AS integer) + 1                       AS minute_cum,
         CAST(we.second AS integer)                           AS second_in_minute,
         CASE
             WHEN we.type = 'Goal'
@@ -354,7 +356,7 @@ ws_resolved AS (
             WHEN 'SecondHalf' THEN 2
             ELSE 3
         END                                                  AS period_num,
-        -- cumulative half minute → base + stoppage
+        -- minute_cum already +1-normalised (1-based, #521) → base + stoppage
         CASE
             WHEN wc.period_raw = 'FirstHalf'  AND wc.minute_cum > 45 THEN 45
             WHEN wc.period_raw = 'SecondHalf' AND wc.minute_cum > 90 THEN 90
