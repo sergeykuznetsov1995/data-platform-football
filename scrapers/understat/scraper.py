@@ -228,6 +228,7 @@ class UnderstatScraper(SoccerdataScraper):
                 df=df,
                 table_name='understat_schedule',
                 partition_cols=['league', 'season'],
+                replace_partitions=['league', 'season'],
             )
             return {'schedule': table_path}
         return {}
@@ -240,6 +241,7 @@ class UnderstatScraper(SoccerdataScraper):
                 df=df,
                 table_name='understat_players',
                 partition_cols=['league', 'season'],
+                replace_partitions=['league', 'season'],
             )
             return {'player_stats': table_path}
         return {}
@@ -252,6 +254,7 @@ class UnderstatScraper(SoccerdataScraper):
                 df=df,
                 table_name='understat_shots',
                 partition_cols=['league', 'season'],
+                replace_partitions=['league', 'season'],
             )
             return {'shots': table_path}
         return {}

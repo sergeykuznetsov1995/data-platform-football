@@ -259,10 +259,23 @@ mh AS (
         "pc>2.5"    AS pc_o25,    "pc<2.5"    AS pc_u25,
         "maxc>2.5"  AS maxc_o25,  "maxc<2.5"  AS maxc_u25,
         "avgc>2.5"  AS avgc_o25,  "avgc<2.5"  AS avgc_u25
-    FROM iceberg.bronze.matchhistory_results
-    WHERE home_team  IS NOT NULL
-      AND away_team  IS NOT NULL
-      AND match_date IS NOT NULL
+    -- Dedup raw bronze by match natural key BEFORE the tall UNFOLD —
+    -- football-data has no game_id, so a re-ingest / replace→append regression
+    -- would double EVERY odds row. Keep the freshest snapshot per match;
+    -- _batch_id breaks _ingested_at ties (#464). _dedup_rn is not re-selected
+    -- by `mh` (explicit column list) so the output schema is unchanged.
+    FROM (
+        SELECT *,
+               ROW_NUMBER() OVER (
+                   PARTITION BY league, match_date, home_team, away_team, season
+                   ORDER BY _ingested_at DESC, _batch_id DESC
+               ) AS _dedup_rn
+        FROM iceberg.bronze.matchhistory_results
+        WHERE home_team  IS NOT NULL
+          AND away_team  IS NOT NULL
+          AND match_date IS NOT NULL
+    )
+    WHERE _dedup_rn = 1
 ),
 
 -- =============================================================================

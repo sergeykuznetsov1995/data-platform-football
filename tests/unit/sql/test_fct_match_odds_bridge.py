@@ -120,6 +120,7 @@ def duck_conn():
 # are renamed via COLUMN_MAPPING; IW + all closing/AH/OU stay raw.
 _MH_COLUMNS = [
     "match_date", "home_team", "away_team", "league", "season", "_ingested_at",
+    "_batch_id",
     "odds_home_b365", "odds_draw_b365", "odds_away_b365",
     "odds_home_bw",   "odds_draw_bw",   "odds_away_bw",
     "iwh",   "iwd",   "iwa",
@@ -164,6 +165,8 @@ def _create_mh_table(con) -> None:
             cols_ddl.append(f'"{c}" BIGINT')
         elif c == "_ingested_at":
             cols_ddl.append(f'"{c}" TIMESTAMP')
+        elif c == "_batch_id":
+            cols_ddl.append(f'"{c}" VARCHAR')
         else:
             cols_ddl.append(f'"{c}" DOUBLE')
     con.execute(f"CREATE TABLE bronze_matchhistory_results ({', '.join(cols_ddl)})")
@@ -227,6 +230,7 @@ def _mh_row(
     values[idx["league"]] = league
     values[idx["season"]] = season
     values[idx["_ingested_at"]] = "2026-05-08 12:00:00"
+    values[idx["_batch_id"]] = "batch-1"
     values[idx["odds_home_b365"]] = b365h
     values[idx["odds_draw_b365"]] = b365d
     values[idx["odds_away_b365"]] = b365a

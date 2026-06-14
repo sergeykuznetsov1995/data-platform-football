@@ -49,6 +49,24 @@ bronze_dedup AS (
 )
 
 SELECT
+    canonical_id,
+    rating, tackles, tackles_won, tackles_won_pct, interceptions, dribbles,
+    dribbles_pct, ground_duels_won, ground_duels_won_pct, aerial_duels_won,
+    aerial_duels_won_pct, total_duels_won, total_duels_won_pct, total_passes,
+    accurate_passes, accurate_passes_pct, final_third_passes, key_passes,
+    secondary_assists, total_crosses, accurate_crosses, accurate_crosses_pct,
+    total_long_balls, accurate_long_balls, accurate_long_balls_pct, total_shots,
+    shots_on_target, shots_off_target, shots_inside_box, shots_outside_box,
+    blocked_shots, hit_woodwork, offsides, expected_goals, penalties_taken,
+    penalty_goals, penalty_won, penalty_conceded, was_fouled, fouls,
+    dribbled_past, errors_lead_to_goal, errors_lead_to_shot, clearances,
+    ball_recoveries, blocks, poss_won_att_third, touches, dispossessed,
+    possession_lost, totw_appearances, matches_started, appearances,
+    goal_conversion_pct, goals_inside_box, goals_outside_box, headed_goals,
+    left_foot_goals, right_foot_goals, set_piece_shots, free_kick_goals,
+    league, season
+FROM (
+SELECT
     xp.canonical_id,
 
     -- ========= UNIQUE_SOFASCORE (consumed by Gold fct_player_season_stats) =========
@@ -139,10 +157,20 @@ SELECT
 
     -- ========= Partition keys =========
     b.league,
-    b.season
+    b.season,
+
+    -- Dedup AFTER the xref JOIN — one canonical_id can map to >1 sofascore
+    -- source_id within a (league, season), fanning the JOIN out. Keep the most
+    -- "active" record (most appearances); mirrors understat canonical_rn (#464).
+    ROW_NUMBER() OVER (
+        PARTITION BY xp.canonical_id, b.league, b.season
+        ORDER BY b.appearances DESC NULLS LAST, b.player_id
+    ) AS canonical_rn
 
 FROM bronze_dedup b
 JOIN xp
   ON b.player_id = xp.source_id
  AND b.league    = xp.league
  AND b.season    = xp.season
+)
+WHERE canonical_rn = 1

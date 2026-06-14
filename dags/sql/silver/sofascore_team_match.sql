@@ -153,18 +153,30 @@ stats_pivot AS (
 ),
 
 schedule_dim AS (
-    SELECT DISTINCT
-        CAST(game_id AS varchar)  AS match_id,
+    -- Dedup by game_id (latest snapshot) instead of SELECT DISTINCT: two
+    -- snapshots of one game_id with different scores (live 0:0 vs final 2:1)
+    -- both survive DISTINCT → ×2 fan-out in home_side/away_side. Take the
+    -- freshest by _ingested_at (= final score); _batch_id breaks ties (#464).
+    SELECT
+        CAST(game_id AS varchar)   AS match_id,
         CAST(home_team AS varchar) AS home_team_id,
         CAST(away_team AS varchar) AS away_team_id,
         CAST(home_score AS INTEGER) AS home_score,
         CAST(away_score AS INTEGER) AS away_score,
         league,
         season
-    FROM iceberg.bronze.sofascore_schedule
-    WHERE home_score IS NOT NULL
-      AND away_score IS NOT NULL
-      AND game_id IS NOT NULL
+    FROM (
+        SELECT *,
+               ROW_NUMBER() OVER (
+                   PARTITION BY game_id
+                   ORDER BY _ingested_at DESC, _batch_id DESC
+               ) AS rn
+        FROM iceberg.bronze.sofascore_schedule
+        WHERE home_score IS NOT NULL
+          AND away_score IS NOT NULL
+          AND game_id IS NOT NULL
+    )
+    WHERE rn = 1
 ),
 
 home_side AS (
