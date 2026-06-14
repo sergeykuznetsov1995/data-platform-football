@@ -366,19 +366,19 @@ class TestAerialPaired:
 class TestShotSubtypes:
     """Shot variants resolve to shot / shot_freekick / shot_penalty by qualifier."""
 
-    @pytest.mark.parametrize("ws_type", ["SavedShot", "MissedShots", "ShotOnPost"])
+    @pytest.mark.parametrize("ws_type", ["SavedShot", "MissedShots", "ShotOnPost", "Goal"])
     def test_shot_default(self, duck_conn, ws_type):
         out = _seed_and_run(duck_conn, [_row(type_=ws_type, qualifiers=None)])
         assert out[0]["action_canonical"] == "shot"
 
-    @pytest.mark.parametrize("ws_type", ["SavedShot", "MissedShots", "ShotOnPost"])
+    @pytest.mark.parametrize("ws_type", ["SavedShot", "MissedShots", "ShotOnPost", "Goal"])
     def test_shot_penalty(self, duck_conn, ws_type):
         out = _seed_and_run(duck_conn, [
             _row(type_=ws_type, qualifiers=_qualifiers_json(["Penalty"])),
         ])
         assert out[0]["action_canonical"] == "shot_penalty"
 
-    @pytest.mark.parametrize("ws_type", ["SavedShot", "MissedShots", "ShotOnPost"])
+    @pytest.mark.parametrize("ws_type", ["SavedShot", "MissedShots", "ShotOnPost", "Goal"])
     def test_shot_freekick(self, duck_conn, ws_type):
         """DirectFreekick qualifier on shot → shot_freekick.
 
@@ -461,7 +461,10 @@ class TestBallTouchAndDribbleVariants:
 
 
 class TestMetaEventsBecomeUnknown:
-    """All 11 meta/marker types collapse to 'unknown' with confidence='unmappable'."""
+    """All 10 meta/marker types collapse to 'unknown' with confidence='unmappable'.
+
+    Goal is NOT here — it routes to the shot family (see TestShotSubtypes / #462).
+    """
 
     META_TYPES = [
         "Card",
@@ -471,7 +474,6 @@ class TestMetaEventsBecomeUnknown:
         "End",
         "FormationSet",
         "FormationChange",
-        "Goal",
         "CornerAwarded",
         "OffsideProvoked",
         "OffsideGiven",
@@ -603,6 +605,7 @@ class TestConfidenceCascade:
         ("SavedShot", "medium"),
         ("MissedShots", "medium"),
         ("ShotOnPost", "medium"),
+        ("Goal", "medium"),
         ("KeeperSweeper", "medium"),
         ("GoodSkill", "medium"),
         ("CrossNotClaimed", "medium"),
@@ -616,7 +619,6 @@ class TestConfidenceCascade:
         ("Card", "unmappable"),
         ("Start", "unmappable"),
         ("End", "unmappable"),
-        ("Goal", "unmappable"),
         ("FormationChange", "unmappable"),
     ])
     def test_confidence_for_type(self, duck_conn, ws_type, conf):

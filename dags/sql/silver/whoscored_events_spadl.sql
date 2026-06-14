@@ -103,8 +103,8 @@
 --   24 OffsideGiven      unknown (marker)                        unmappable
 --   25 OffsidePass       pass                                    low
 --   26 FormationChange   unknown (meta)                          unmappable
---   27 Goal              unknown (marker — shot already in       unmappable
---                        SavedShot/MissedShots/ShotOnPost)
+--   27 Goal              shot / shot_freekick / shot_penalty     medium
+--                        (Opta type-16 = standalone scored shot, #462)
 --   28 FormationSet      unknown (meta)                          unmappable
 --   29 Claim             keeper_claim                            high
 --   30 Error             bad_touch (degraded)                    low
@@ -163,9 +163,12 @@
 --     consumer filters (this also avoids a 17K-row Bronze-Silver gap).
 --   * Foul+Unsuccessful (foul-suffered marker): kept as foul with
 --     outcome_success=false. Gold can split if needed.
---   * Goal events (1,266 rows): mapped to 'unknown' — the actual shot lives
---     in SavedShot/MissedShots/ShotOnPost. Goal is an outcome marker on
---     the previous shot event.
+--   * Goal events (~1,288 rows): mapped to the shot family (shot /
+--     shot_penalty / shot_freekick by qualifier). Opta type-16 Goal IS the
+--     standalone scored-shot record — verified 0/1288 goals have a paired
+--     SavedShot/MissedShots in the same second (#462). Counting Goal as a
+--     shot matches whoscored_player_match_aggregate (which counts it from
+--     bronze) and lifts WhoScored shots to a realistic ~25.2/match.
 --   * CornerAwarded / OffsideProvoked / OffsideGiven: marker events with
 --     no SPADL action; mapped to 'unknown' to preserve event-count parity.
 --   * BronZE re-scrape duplicates: deduplicated via ROW_NUMBER() over the
@@ -308,7 +311,11 @@ SELECT
         WHEN type = 'BallRecovery' THEN 'ball_recovery'
 
         -- ---------- Shot variants (qualifier-driven sub-routing) ----------
-        WHEN type IN ('SavedShot', 'MissedShots', 'ShotOnPost', 'ChanceMissed') THEN
+        --   `Goal` (Opta type 16) is the standalone scored-shot record, NOT a
+        --   redundant marker: 0/1288 goals have a paired SavedShot/MissedShots
+        --   in the same second (#462). It joins the shot family so the most
+        --   valuable ~11% of shots are not lost from action_canonical='shot'.
+        WHEN type IN ('SavedShot', 'MissedShots', 'ShotOnPost', 'ChanceMissed', 'Goal') THEN
             CASE
                 WHEN regexp_like(COALESCE(qualifiers, ''), '"displayName"\s*:\s*"Penalty"')
                     THEN 'shot_penalty'
@@ -332,7 +339,7 @@ SELECT
 
         -- ---------- Meta / marker events -> 'unknown' ----------
         --   Card, SubstitutionOn, SubstitutionOff, Start, End,
-        --   FormationSet, FormationChange, Goal, CornerAwarded,
+        --   FormationSet, FormationChange, CornerAwarded,
         --   OffsideProvoked, OffsideGiven (any other unforeseen type)
         ELSE 'unknown'
     END                                                      AS action_canonical,
@@ -359,7 +366,7 @@ SELECT
         -- medium (qualifier-dependent OR direct-but-paired/degraded)
         WHEN type IN (
             'Pass', 'Aerial', 'BallTouch', 'Dispossessed',
-            'SavedShot', 'MissedShots', 'ShotOnPost',
+            'SavedShot', 'MissedShots', 'ShotOnPost', 'Goal',
             'KeeperSweeper', 'GoodSkill', 'CrossNotClaimed'
         ) THEN 'medium'
 

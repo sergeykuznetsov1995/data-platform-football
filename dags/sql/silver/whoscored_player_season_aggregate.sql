@@ -15,11 +15,11 @@
 --   silver.xref_player              (canonical_id ↔ raw player_id bridge)
 --
 -- Notes:
---   * `outcome_success` for action_canonical='shot' marks "shot reached the
---     opposition goal frame" (i.e. on-target ≈ saves + goals + post hits) but
---     SPADL does not separate Goal/Saved/Blocked at this layer. The
---     `shot_on_target` count below is therefore a proxy — match-level
---     fct_shot is the source of truth for goals.
+--   * shots_total / shots_on_target_proxy count all shot variants ('shot' +
+--     'shot_penalty' + 'shot_freekick'), incl. goals (Goal→shot family, #462).
+--     shots_on_target_proxy stays a coarse proxy: WhoScored marks MissedShots
+--     outcome_type='Successful', so it over-counts off-target attempts —
+--     match-level fct_shot is the source of truth for goals / true on-target.
 --   * Spatial avg_x/avg_y is computed only on on-ball offensive actions
 --     (pass / take_on / shot / dribble) so defensive recoveries don't
 --     pull a winger's average back to his own half.
@@ -89,8 +89,12 @@ SELECT
     COUNT_IF(action_canonical = 'bad_touch')                                 AS bad_touches,
 
     -- ========= Shooting (proxy — see header) =========
-    COUNT_IF(action_canonical = 'shot')                                      AS shots_total,
-    COUNT_IF(action_canonical = 'shot' AND outcome_success)                  AS shots_on_target_proxy,
+    -- All shot variants ('shot' + 'shot_penalty' + 'shot_freekick'), incl.
+    -- goals now routed into the shot family (#462).
+    COUNT_IF(action_canonical IN ('shot', 'shot_penalty', 'shot_freekick'))
+        AS shots_total,
+    COUNT_IF(action_canonical IN ('shot', 'shot_penalty', 'shot_freekick')
+             AND outcome_success)                                            AS shots_on_target_proxy,
 
     -- ========= Defensive =========
     COUNT_IF(action_canonical = 'tackle')                                    AS tackle_att,

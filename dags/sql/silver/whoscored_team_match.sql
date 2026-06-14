@@ -25,9 +25,12 @@
 --   * Cards (yellow/red) NOT aggregated here — SPADL collapses Card events
 --     into 'unknown' (not one of the 24 canonical actions). Gold COALESCEs
 --     from FBref + SofaScore.
---   * shots_on_target_proxy: outcome_success on a shot ≈ "reached the goal
---     frame" (saves + goals). SPADL does not separate Goal/Saved/Blocked
---     at this layer. fct_shot is the source of truth for actual goals.
+--   * shots_total / shots_on_target_proxy count all shot variants ('shot' +
+--     'shot_penalty' + 'shot_freekick'), incl. goals (Goal→shot family, #462),
+--     matching whoscored_player_match_aggregate.shots. shots_on_target_proxy
+--     stays a coarse proxy: WhoScored marks MissedShots outcome_type=
+--     'Successful', so it over-counts off-target attempts. fct_shot is the
+--     source of truth for actual goals / true on-target.
 --   * Derived metrics:
 --     - defensive_actions_third = defensive third (x < 33.33 on SPADL pitch
 --       [0..100], attacking direction) ∩ {tackle, interception, clearance,
@@ -73,8 +76,13 @@ SELECT
     COUNT_IF(action_canonical = 'ball_recovery')                              AS ball_recoveries,
 
     -- ========= Shooting (proxy — see header) =========
-    COUNT_IF(action_canonical = 'shot')                                       AS shots_total,
-    COUNT_IF(action_canonical = 'shot' AND outcome_success)                   AS shots_on_target_proxy,
+    -- Count ALL shot variants (open-play 'shot' + 'shot_penalty' +
+    -- 'shot_freekick'), incl. goals now routed into the shot family (#462).
+    -- Mirrors whoscored_player_match_aggregate.shots (counted from bronze).
+    COUNT_IF(action_canonical IN ('shot', 'shot_penalty', 'shot_freekick'))
+        AS shots_total,
+    COUNT_IF(action_canonical IN ('shot', 'shot_penalty', 'shot_freekick')
+             AND outcome_success)                                             AS shots_on_target_proxy,
 
     -- ========= Discipline =========
     COUNT_IF(action_canonical = 'foul')                                       AS fouls_committed,
