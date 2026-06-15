@@ -90,3 +90,27 @@ class TestESPNScraper:
         # Assert
         mock_save.assert_called_once()
         assert mock_save.call_args.kwargs['replace_partitions'] == ['league', 'season']
+
+    def test_scrape_schedule_arms_completeness_guard(self, scraper):
+        """#583: scrape_schedule MUST arm the replace guard (min_replace_ratio
+        0.9) so a partial scrape can't wipe a good espn_schedule partition."""
+        # Arrange
+        mock_schedule = pd.DataFrame({
+            'date': ['2024-08-17'],
+            'home_team': ['Arsenal'],
+            'away_team': ['Wolves'],
+            'home_score': [2],
+            'away_score': [0],
+            'league': ['ENG-Premier League'],
+            'season': [2425],
+        })
+
+        # Act
+        with patch.object(scraper, 'read_schedule', return_value=mock_schedule):
+            with patch.object(scraper, 'save_to_iceberg',
+                              return_value='iceberg.bronze.test') as mock_save:
+                scraper.scrape_schedule()
+
+        # Assert
+        mock_save.assert_called_once()
+        assert mock_save.call_args.kwargs['min_replace_ratio'] == 0.9

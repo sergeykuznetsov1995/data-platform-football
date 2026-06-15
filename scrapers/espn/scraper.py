@@ -142,6 +142,9 @@ class ESPNScraper(SoccerdataScraper):
                 table_name='espn_schedule',
                 partition_cols=['league', 'season'],
                 replace_partitions=['league', 'season'],
+                # Completeness guard (#583): refuse a replace that shrinks the
+                # partition below 90% of its existing rows (one row per match).
+                min_replace_ratio=0.9,
             )
             return {'schedule': table_path}
 
