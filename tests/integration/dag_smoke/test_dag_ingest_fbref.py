@@ -272,7 +272,7 @@ class TestFBrefTaskCount:
 
     def test_total_task_count(self, fbref_dag):
         """Total = 2×(player+team+keeper) + 6 match_data + start/validate/
-        trigger_silver (+опциональный prewarm)."""
+        trigger_silver."""
         player_types, team_types, keeper_types = _stat_types()
         total_tasks = len(fbref_dag.task_dict)
 
