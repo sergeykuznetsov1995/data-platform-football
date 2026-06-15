@@ -19,6 +19,14 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Replace-partitions completeness guard (#513 → #583): refuse a save that would
+# shrink bronze.espn_schedule below this share of the existing (league, season)
+# partition, so a partial/failed scrape can't wipe a good partition. COUNT(*)
+# (one row per match — no replace_guard_key needed). ReplaceGuardError → exit 3;
+# bypass with --force-replace for a deliberate first backfill / known shrink.
+_MIN_REPLACE_RATIO = 0.9
+REPLACE_GUARD_MARKER = 'ESPN_REPLACE_GUARD'
+
 
 def main():
     parser = argparse.ArgumentParser(description='Run ESPN scraper')
@@ -40,6 +48,13 @@ def main():
         default='/tmp/espn_result.json',
         help='Output file for results'
     )
+    parser.add_argument(
+        '--force-replace',
+        action='store_true',
+        help='Bypass the completeness guard — write even if the scraped frame '
+             'shrinks the existing partition. Use for a deliberate first '
+             'backfill or a known legitimate shrink.'
+    )
     args = parser.parse_args()
 
     leagues = [l.strip() for l in args.leagues.split(',')]
@@ -52,6 +67,7 @@ def main():
     }
 
     try:
+        from scrapers.base.base_scraper import ReplaceGuardError
         from scrapers.espn import ESPNScraper
 
         with ESPNScraper(leagues=leagues, seasons=[args.season]) as scraper:
@@ -65,10 +81,23 @@ def main():
                         table_name='espn_schedule',
                         partition_cols=['league', 'season'],
                         replace_partitions=['league', 'season'],
+                        min_replace_ratio=(
+                            None if args.force_replace else _MIN_REPLACE_RATIO
+                        ),
                     )
                     results['tables'].append(table_path)
                     results['schedule_rows'] = len(df)
                     logger.info(f"Saved {len(df)} schedule rows")
+            except ReplaceGuardError as e:
+                # Guard refused the save (partial scrape would shrink the
+                # partition) — nothing written. Distinct exit 3 so an operator
+                # can tell a refused guard from a hard scrape failure (#583).
+                msg = f"{REPLACE_GUARD_MARKER}: {e}"
+                logger.error(msg)
+                results['errors'].append(msg)
+                with open(args.output, 'w') as f:
+                    json.dump(results, f)
+                return 3
             except Exception as e:
                 error_msg = f"Schedule scraping failed: {e}"
                 logger.error(error_msg)
