@@ -6,8 +6,8 @@ table:
   description: |
     Событийный поток WhoScored, нормализованный в каноническую SPADL-форму —
     один row на (match_id, event_id). Источник: bronze.whoscored_events.
-    Каждый сырой Opta-тип маппится в 24-значный SPADL-словарь действий
-    (22 SPADL + проприетарный 'ball_recovery' + 'unknown') с qualifier-driven
+    Каждый сырой Opta-тип маппится в 25-значный SPADL-словарь действий
+    (22 SPADL + проприетарные 'ball_recovery'/'own_goal' + 'unknown') с qualifier-driven
     роутингом пасов (corner/freekick/cross/throw_in) и под-типизацией ударов
     (penalty/freekick). Дедуп re-scrape'ов: ROW_NUMBER PARTITION BY полному
     натуральному ключу ORDER BY _ingested_at DESC; затем синтетический стабильный
@@ -40,7 +40,7 @@ columns:
   - name: end_y
     description: Конечная Y-координата для пасовых действий (SPADL 0–100); NULL для не-пасов.
   - name: action_canonical
-    description: Каноническое SPADL-действие из 24-значного enum (22 SPADL + 'ball_recovery' + 'unknown'); пасы и удары роутятся по qualifiers.
+    description: Каноническое SPADL-действие из 25-значного enum (22 SPADL + 'ball_recovery' + 'own_goal' + 'unknown'); пасы и удары роутятся по qualifiers; own-goal (Goal+OwnGoal qualifier) выделен из shot-семейства, чтобы не засчитываться ударом автору (#572).
   - name: action_source
     description: Маркер происхождения маппинга; литерал 'whoscored_spadl_proprietary_v1'.
   - name: action_version

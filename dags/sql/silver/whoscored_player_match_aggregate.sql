@@ -21,12 +21,12 @@
 --   * `game_id → match_id` rename for cross-source alignment.
 --   * Card detection: qualifiers JSON-string carries
 --     `"displayName":"Yellow"|"Red"|"SecondYellow"` (see match_cards.sql).
---   * Goal detection: WhoScored does NOT have a single `type='Goal'`; goals
---     are derived from `type='Goal'` rows OR via qualifier flags on shot
---     events. Use `type='Goal'` as the canonical marker (the Opta meta-event
---     emitted on every successful score, including own goals). For shot
---     attempts that became goals there's a `Goal` row with the scoring
---     player; for own-goals there's a `type='OwnGoal'` row.
+--   * Goal detection: a scored goal is a `type='Goal'` row carrying the
+--     scoring player. Own-goals are NOT a separate `type='OwnGoal'` row — they
+--     arrive as `type='Goal'` with qualifier `"displayName":"OwnGoal"` (#572),
+--     and are EXCLUDED from goals/shots/shots_on_target via `is_own_goal` so the
+--     deflecting defender is not credited. The own-goal still counts as a touch
+--     (it was a real touch). Team-credit lives in Gold `fct_match_timeline`.
 --   * Aerial duels: WhoScored emits paired `type='Aerial'` rows
 --     (winner + loser); `outcome_type='Successful'` flags the winner.
 --   * Discipline (offsides): `type='OffsideGiven'` rows attribute to player.
@@ -77,6 +77,10 @@ normalised AS (
         type,
         outcome_type,
         qualifiers,
+        -- Own-goals arrive as type='Goal' + qualifier OwnGoal (NOT a distinct
+        -- type='OwnGoal' row); flag them so goals/shots exclude the scorer (#572).
+        regexp_like(COALESCE(qualifiers, ''),
+                    '"displayName"\s*:\s*"OwnGoal"')          AS is_own_goal,
         league,
         season
     FROM events_dedup
@@ -91,16 +95,18 @@ SELECT
     COUNT(*)                                                              AS total_events,
 
     -- ========= Goals / shots =========
-    -- `type='Goal'` row emitted once per scored goal (incl. own-goals are
-    -- emitted as `type='OwnGoal'` separately, so we don't double-count).
-    COUNT_IF(type = 'Goal')                                               AS goals,
-    -- Shots: SavedShot + MissedShots + ShotOnPost + ChanceMissed (all
-    -- the "attempt on goal" Opta types).
+    -- `type='Goal'` row emitted once per scored goal. Own-goals (type='Goal'
+    -- + qualifier OwnGoal) are EXCLUDED via `is_own_goal` so the deflecting
+    -- defender is not credited a goal/shot (#572).
+    COUNT_IF(type = 'Goal' AND NOT is_own_goal)                           AS goals,
+    -- Shots: SavedShot + MissedShots + ShotOnPost + ChanceMissed (all the
+    -- "attempt on goal" Opta types) + scored goals, own-goals excluded.
     COUNT_IF(type IN ('SavedShot', 'MissedShots', 'ShotOnPost',
                       'ChanceMissed'))
-        + COUNT_IF(type = 'Goal')                                         AS shots,
-    -- Shots on target = saved + goals. (Posts and misses excluded.)
-    COUNT_IF(type = 'SavedShot') + COUNT_IF(type = 'Goal')                AS shots_on_target,
+        + COUNT_IF(type = 'Goal' AND NOT is_own_goal)                     AS shots,
+    -- Shots on target = saved + scored goals (own-goals, posts, misses excluded).
+    COUNT_IF(type = 'SavedShot')
+        + COUNT_IF(type = 'Goal' AND NOT is_own_goal)                     AS shots_on_target,
 
     -- ========= Passes =========
     COUNT_IF(type IN ('Pass', 'OffsidePass'))                             AS passes,

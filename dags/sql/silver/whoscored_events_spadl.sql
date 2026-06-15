@@ -27,7 +27,7 @@
 --   period                varchar     period passthrough
 --   expanded_minute       integer     TRY_CAST from bigint
 --   x, y, end_x, end_y    double      pitch coordinates (passthrough)
---   action_canonical      varchar     ENUM (24 values, see below)
+--   action_canonical      varchar     ENUM (25 values, see below)
 --   action_source         varchar     literal 'whoscored_spadl_proprietary_v1'
 --   action_version        varchar     literal 'v1'
 --   _action_source_note   varchar     original WhoScored type (audit trail)
@@ -43,7 +43,7 @@
 -- Primary key:  (match_id, event_id)
 --
 -- =============================================================================
--- action_canonical enum — 24 values (22 SPADL + 1 proprietary + 'unknown')
+-- action_canonical enum — 25 values (22 SPADL + 2 proprietary + 'unknown')
 -- =============================================================================
 --   SPADL canonical (22):
 --     pass, cross, throw_in, freekick_crossed, freekick_short,
@@ -51,17 +51,20 @@
 --     shot, shot_penalty, shot_freekick, keeper_save, keeper_claim,
 --     keeper_punch, keeper_pick_up, clearance, bad_touch, dribble,
 --     goalkick
---   Proprietary supplement (1):
+--   Proprietary supplement (2):
 --     ball_recovery       (R3.D2 #2; SPADL collapses recovery into
 --                          interception — 5.33% objem too high to lose;
 --                          confidence='low' so downstream ML can filter)
+--     own_goal            (#572; Goal + OwnGoal qualifier. Kept distinct from
+--                          the shot family so the deflecting defender is not
+--                          credited a shot; confidence='medium' via type='Goal')
 --   Sentinel (1):
 --     unknown             (meta-events: Card / Substitution / Goal / Start
 --                          / End / FormationSet / FormationChange /
 --                          OffsideProvoked / OffsideGiven / CornerAwarded;
 --                          confidence='unmappable')
 --
--- DQ invariant (E3.8): every row's action_canonical MUST be in the 24-value
+-- DQ invariant (E3.8): every row's action_canonical MUST be in the 25-value
 -- enum above. Any other value -> hard fail.
 --
 -- =============================================================================
@@ -104,7 +107,8 @@
 --   25 OffsidePass       pass                                    low
 --   26 FormationChange   unknown (meta)                          unmappable
 --   27 Goal              shot / shot_freekick / shot_penalty     medium
---                        (Opta type-16 = standalone scored shot, #462)
+--                        (Opta type-16 = standalone scored shot, #462);
+--                        Goal + OwnGoal qualifier -> own_goal (#572)
 --   28 FormationSet      unknown (meta)                          unmappable
 --   29 Claim             keeper_claim                            high
 --   30 Error             bad_touch (degraded)                    low
@@ -169,6 +173,9 @@
 --     SavedShot/MissedShots in the same second (#462). Counting Goal as a
 --     shot matches whoscored_player_match_aggregate (which counts it from
 --     bronze) and lifts WhoScored shots to a realistic ~25.2/match.
+--     EXCEPTION (#572): a Goal carrying the `OwnGoal` qualifier (~49 rows)
+--     routes to action_canonical='own_goal' instead — own-goals must not be
+--     credited as a shot to the deflecting defender.
 --   * CornerAwarded / OffsideProvoked / OffsideGiven: marker events with
 --     no SPADL action; mapped to 'unknown' to preserve event-count parity.
 --   * BronZE re-scrape duplicates: deduplicated via ROW_NUMBER() over the
@@ -259,7 +266,7 @@ SELECT
     end_x,
     end_y,
 
-    -- ========= SPADL canonical action (24-value enum) =========
+    -- ========= SPADL canonical action (25-value enum) =========
     CASE
         -- ---------- Pass routing (qualifier-driven) ----------
         WHEN type = 'Pass' THEN
@@ -309,6 +316,17 @@ SELECT
 
         -- ---------- BallRecovery — proprietary supplement (NOT SPADL) ----------
         WHEN type = 'BallRecovery' THEN 'ball_recovery'
+
+        -- ---------- Own-goal (Goal + OwnGoal qualifier) ----------
+        --   Own-goals arrive as type='Goal' carrying the `OwnGoal` qualifier
+        --   (NOT a distinct type='OwnGoal' row). Route to a dedicated action so
+        --   the deflecting defender is NOT counted a shot by shot-family
+        --   consumers (#572). MUST precede the shot block below — a plain Goal
+        --   (no OwnGoal qualifier) falls through to the shot routing. Team-credit
+        --   for the goal lives in Gold fct_match_timeline, not here.
+        WHEN type = 'Goal'
+             AND regexp_like(COALESCE(qualifiers, ''), '"displayName"\s*:\s*"OwnGoal"')
+            THEN 'own_goal'
 
         -- ---------- Shot variants (qualifier-driven sub-routing) ----------
         --   `Goal` (Opta type 16) is the standalone scored-shot record, NOT a

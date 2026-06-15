@@ -49,7 +49,7 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# SPADL action vocabulary (R3 D2: 24 enum values frozen at E3 wave-1)
+# SPADL action vocabulary (R3 D2: 25 enum values; own_goal added in #572)
 # ---------------------------------------------------------------------------
 # Source of truth: dags/sql/silver/whoscored_events_spadl.sql (header).
 # Keep this list in sync with the SQL CASE expression. Adding a new tier
@@ -64,6 +64,7 @@ SPADL_ACTION_ENUM: List[str] = [
     'shot', 'shot_penalty', 'shot_freekick',
     'keeper_save', 'keeper_claim', 'keeper_punch', 'keeper_pick_up',
     'clearance', 'bad_touch', 'dribble', 'goalkick', 'ball_recovery',
+    'own_goal',
     'unknown',
 ]
 
@@ -463,7 +464,7 @@ def _build_whoscored_events_spadl_checks() -> List[Check]:
 
     Key invariants:
       * (match_id, event_id) PK — synthetic event_id verified unique in E3.1.
-      * action_canonical ∈ 24-value SPADL enum (frozen for E3 wave-1).
+      * action_canonical ∈ 25-value SPADL enum (own_goal added #572).
       * action_source / action_version literals pinned to v1 (R0.4 contract).
       * SPADL ``unknown`` rate ≤ ~2.88% (R3 verdict 89.97% mapped — slack on
         17,550 unmappable baseline).
@@ -504,7 +505,7 @@ def _build_whoscored_events_spadl_checks() -> List[Check]:
             name='spadl_coverage_unknown_rate',
         ),
 
-        # Enum compliance — every action_canonical must be one of the 24
+        # Enum compliance — every action_canonical must be one of the 25
         # values. Implemented as row_count with NOT IN predicate. Zero
         # tolerance because adding a value requires SQL + this list update.
         CHECK.row_count(
