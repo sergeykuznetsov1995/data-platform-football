@@ -35,14 +35,16 @@ def _by_name(checks, name):
 @pytest.mark.unit
 class TestStarGateComposition:
     def test_total_check_count(self):
-        """Contract: 3 star_pk + 28 league/season FK (14 facts × 2) +
-        17 dim-FK + 2 NULL-coverage + 3 grain = 53.
+        """Contract: 4 star_pk + 28 league/season FK (14 facts × 2) +
+        18 dim-FK + 2 NULL-coverage + 3 grain = 55.
 
-        Bump this number when a sub-builder gains a check — e.g. when
-        #430/#431 add fct_player_salary / fct_player_fifa_rating /
-        fct_team_elo to the gate.
+        #431 added fct_team_elo pointwise (PK + team_id->dim_team FK) — it is
+        NOT in _STAR_FACT_TABLES (no league/season cols), so it gains no
+        league/season FK from the comprehension. Bump this number when a
+        sub-builder gains a check — e.g. when #430 adds fct_player_salary /
+        fct_player_fifa_rating to the gate.
         """
-        assert len(_build()) == 53
+        assert len(_build()) == 55
 
     def test_names_unique(self):
         checks = _build()
@@ -91,6 +93,13 @@ class TestStarGatePk:
         chk = _by_name(_build(), 'star_pk[fct_lineup(match_id,player_id) resolved]')
         assert chk.params['pk'] == ['match_id', 'player_id']
         assert chk.params['where'] == 'player_id IS NOT NULL'
+
+    def test_fct_team_elo_design_pk(self):
+        """issue #431: one row per team per date (team_id, elo_date)."""
+        chk = _by_name(_build(), 'star_pk[fct_team_elo(team_id,elo_date)]')
+        assert chk.kind == 'no_duplicates'
+        assert chk.params['pk'] == ['team_id', 'elo_date']
+        assert chk.severity == 'ERROR'
 
 
 @pytest.mark.unit
@@ -148,6 +157,22 @@ class TestStarGateDimFk:
         ]
         assert {c.params['key'] for c in checks} == {'team_id', 'opponent_id'}
         assert all(c.severity == 'ERROR' for c in checks)
+
+    def test_fct_team_elo_team_fk(self):
+        """issue #431: fct_team_elo.team_id -> dim_team, WARNING rate-mode
+        (ClubElo names absent from team_aliases.yaml fall back to 'ce_' orphans
+        kept by design)."""
+        checks = [
+            c for c in _build()
+            if c.kind == 'ref_integrity'
+            and c.params['child'] == 'gold.fct_team_elo'
+            and c.params['parent'] == 'gold.dim_team'
+        ]
+        assert len(checks) == 1
+        chk = checks[0]
+        assert chk.params['key'] == 'team_id'
+        assert chk.severity == 'WARNING'
+        assert chk.params['warn_rate'] <= chk.params['error_rate']
 
     def test_player_facts_point_at_dim_player(self):
         """The design FK is player -> dim_player (NOT dim_player_attributes,

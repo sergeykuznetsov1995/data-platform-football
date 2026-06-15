@@ -951,6 +951,13 @@ def _star_gate_pk_checks() -> List:
             where='player_id IS NOT NULL',
             name='star_pk[fct_lineup(match_id,player_id) resolved]',
         ),
+        # issue #431 — fct_team_elo design grain: one row per team per date.
+        # Not in _STAR_FACT_TABLES (no league/season cols → excluded from the
+        # league/season FK comprehension), so its PK is asserted pointwise here.
+        CHECK.no_duplicates(
+            'gold.fct_team_elo', pk=['team_id', 'elo_date'],
+            name='star_pk[fct_team_elo(team_id,elo_date)]',
+        ),
     ]
 
 
@@ -989,6 +996,17 @@ def _star_gate_dim_fk_checks() -> List:
         CHECK.ref_integrity('gold.fct_team_match', 'gold.dim_team', 'team_id'),
         CHECK.ref_integrity('gold.fct_team_match', 'gold.dim_team',
                             'opponent_id', parent_key='team_id'),
+
+        # ----- fct_team_elo team_id -> dim_team (issue #431) -----
+        # APL ClubElo names resolve to dim_team canonicals via xref_team, but a
+        # name absent from team_aliases.yaml falls back to a 'ce_<slug>' orphan
+        # (kept by design, rule 2). WARNING rate-mode polices the orphan share.
+        # Baseline 2026-06-15: 6.1% (168/2760) — 138 are 'Forest' (Nottingham
+        # Forest unmapped in team_aliases.yaml) + 30 relegated teams present
+        # only in clubelo_ratings_historical; both tracked in #589. Falls to
+        # ~1.1% once #589 lands (still passes the 2% warn floor then).
+        CHECK.ref_integrity('gold.fct_team_elo', 'gold.dim_team', 'team_id',
+                            warn_rate=0.02, error_rate=0.10, severity='WARNING'),
 
         # ----- fct_shot (baseline: team 0%, player 0.52%, match 0%) -----
         CHECK.ref_integrity('gold.fct_shot', 'gold.dim_team', 'team_id',

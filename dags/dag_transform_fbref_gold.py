@@ -201,6 +201,15 @@ STAGE_3_FACTS = [
     # players, most clubs unresolved). Unpartitioned: ~750 rows APL '2526'.
     ('fct_transfer', 'dags/sql/gold/fct_transfer.sql',
      'fct_transfer', None),
+    # issue #431: external team-strength ELO from ClubElo. One row per team
+    # per date (PK team_id, elo_date). Reads bronze.clubelo_ratings ∪
+    # clubelo_ratings_historical + silver.xref_team — no silver ClubElo layer
+    # (mirrors fct_standings reading bronze directly). Unpartitioned
+    # (design §6 r5 — small off-field fact, no season key). No STAGE_3_FALLBACKS
+    # entry: bronze sources can't be guarded by require_silver (fct_standings
+    # precedent).
+    ('fct_team_elo', 'dags/sql/gold/fct_team_elo.sql',
+     'fct_team_elo', None),
 ]
 
 # Tables in STAGE_3 with optional Silver sources — runner routes CTAS to
