@@ -1,25 +1,34 @@
 """
-Unit tests for ``dags/sql/gold/dim_player.sql`` — star-schema grain (#425).
+Unit tests for ``dags/sql/gold/dim_player.sql.j2`` — star-schema grain (#425).
 
 dim_player is one row per PLAYER (no season in the grain): spine =
 silver.xref_player (source='fbref', canonical 'fb_<id>'), attributes
-COALESCE'd from FotMob / SofaScore / Transfermarkt / SoFIFA.
+COALESCE'd from FotMob / SofaScore / Transfermarkt / SoFIFA. Since #435 it is
+a Jinja template (.sql.j2) rendered by dim_loaders: the nationality COALESCE
+maps the FBref FIFA code to a full name via the {{ country_map_values_sql }}
+placeholder (configs/medallion/country_codes.yaml).
 
-These are regex sanity checks over the SQL text — the executable contract
-is exercised by the integration smoke + validate_gold_quality (PK
-uniqueness on player_id).
+These are regex sanity checks over the template text + a render pass through
+dim_loaders against a fixture country_codes.yaml; the executable nationality
+logic is exercised by test_dim_player_nationality.py (DuckDB).
 """
 
 from __future__ import annotations
 
 import re
+import sys
+import textwrap
 from pathlib import Path
 
 import pytest
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
-SQL_PATH = PROJECT_ROOT / "dags" / "sql" / "gold" / "dim_player.sql"
+SQL_PATH = PROJECT_ROOT / "dags" / "sql" / "gold" / "dim_player.sql.j2"
+
+_DAGS_DIR = PROJECT_ROOT / "dags"
+if str(_DAGS_DIR) not in sys.path:
+    sys.path.insert(0, str(_DAGS_DIR))
 
 
 def _read_sql() -> str:
@@ -113,4 +122,63 @@ class TestDimPlayerStarStructure:
         ), "fbref_profile_dedup must pick max-minutes club per (player, season)"
         assert re.search(r"FROM\s+fbref_profile_dedup", sql, re.IGNORECASE), (
             "fbref_latest must read fbref_profile_dedup, not the raw silver table"
+        )
+
+    def test_nationality_code_map(self):
+        """#435: the FBref FIFA-code fallback is mapped to a full name via the
+        country_map CTE/JOIN, placed BEFORE the raw-code fallback in COALESCE so
+        the column is single-format (full names)."""
+        raw = _read_sql()
+        # The VALUES placeholder is filled by dim_loaders.render_dim_player_sql.
+        assert "{{ country_map_values_sql }}" in raw, (
+            "country_map VALUES placeholder missing from the template"
+        )
+        sql = _strip_comments(raw)
+        assert re.search(r"\bcountry_map\s+AS\s*\(", sql, re.IGNORECASE), (
+            "missing country_map CTE (#435 code->name map)"
+        )
+        # cm.country_name sits between the source columns and the raw-code
+        # REGEXP_EXTRACT fallback in the nationality COALESCE.
+        m = re.search(
+            r"sf\.nationality\s*,\s*cm\.country_name\s*,\s*"
+            r"REGEXP_EXTRACT\(fb\.nation",
+            sql, re.IGNORECASE,
+        )
+        assert m, (
+            "nationality COALESCE must read cm.country_name before the raw "
+            "REGEXP_EXTRACT(fb.nation, ...) fallback"
+        )
+
+
+class TestDimPlayerRender:
+    """render_dim_player_sql fills the placeholder from country_codes.yaml."""
+
+    _COUNTRY_CODES_YAML = textwrap.dedent("""\
+        countries:
+          - {code: ENG, name: England}
+          - {code: SCO, name: Scotland}
+        """)
+
+    def test_renders_country_map_tuples(self, monkeypatch, tmp_path):
+        pytest.importorskip("yaml")
+        (tmp_path / "country_codes.yaml").write_text(self._COUNTRY_CODES_YAML)
+
+        # Patch the module attribute (NOT env + reload): monkeypatch restores
+        # it on teardown, so later tests keep the real config.
+        from utils import medallion_config
+        monkeypatch.setattr(medallion_config, "CONFIG_DIR", tmp_path)
+        medallion_config.reset_cache()
+
+        from utils import dim_loaders
+        out_path = tmp_path / "dim_player_rendered.sql"
+        dim_loaders.render_dim_player_sql(str(SQL_PATH), str(out_path))
+        rendered = out_path.read_text()
+        medallion_config.reset_cache()
+
+        assert "('ENG', 'England')" in rendered
+        assert "('SCO', 'Scotland')" in rendered
+        # The standalone placeholder must be gone from the VALUES block.
+        assert not re.search(
+            r"^\s*\{\{\s*country_map_values_sql\s*\}\}\s*$",
+            rendered, flags=re.MULTILINE,
         )

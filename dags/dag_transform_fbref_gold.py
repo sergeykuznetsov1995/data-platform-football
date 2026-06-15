@@ -99,7 +99,6 @@ STAGE_2A_CONFIG_DIMS_INLINE = [
 # Stage 2b: dims built from silver.xref_* canonical identities.
 STAGE_2B_XREF_DIMS_SQL = [
     # (task_id, sql_file, table_name, partition_cols)
-    ('dim_player',  'dags/sql/gold/dim_player.sql',  'dim_player',  None),
     ('dim_referee', 'dags/sql/gold/dim_referee.sql', 'dim_referee', None),
     ('dim_manager', 'dags/sql/gold/dim_manager.sql', 'dim_manager', None),
 ]
@@ -107,6 +106,10 @@ STAGE_2B_XREF_DIMS_INLINE = [
     # dim_team: xref_team spine + country/short_name from team_aliases.yaml.
     ('dim_team', 'render_dim_team_sql',
      'dags/sql/gold/dim_team.sql.j2', 'dim_team', None),
+    # dim_player (#435): xref_player spine + FBref FIFA-code->name map from
+    # country_codes.yaml via {{ country_map_values_sql }}.
+    ('dim_player', 'render_dim_player_sql',
+     'dags/sql/gold/dim_player.sql.j2', 'dim_player', None),
 ]
 
 # Stage 2c: the centre of the star — needs every dim above (FK targets) and
@@ -278,6 +281,7 @@ with DAG(
     from utils.dim_loaders import (
         render_dim_competition_sql,
         render_dim_match_sql,
+        render_dim_player_sql,
         render_dim_season_sql,
         render_dim_team_sql,
         render_dim_venue_sql,
@@ -288,6 +292,7 @@ with DAG(
         'render_dim_competition_sql': render_dim_competition_sql,
         'render_dim_season_sql':      render_dim_season_sql,
         'render_dim_team_sql':        render_dim_team_sql,
+        'render_dim_player_sql':      render_dim_player_sql,
         'render_dim_match_sql':       render_dim_match_sql,
     }
 

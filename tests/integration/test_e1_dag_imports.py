@@ -227,7 +227,7 @@ class TestE1DagImports:
 CUTOVER_SQL_FILES = (
     "dim_team.sql.j2",
     "dim_match.sql.j2",
-    "dim_player.sql",
+    "dim_player.sql.j2",
     "fct_standings.sql",
     "fct_player_match.sql.j2",
 )
@@ -291,7 +291,7 @@ class TestE15CutoverGoldDagImports:
         ``iceberg.silver.xref_team``. dim_player applies the canonical
         prefix inline (no JOIN), so it's the documented exception.
         """
-        no_join_files = {"dim_player.sql"}
+        no_join_files = {"dim_player.sql.j2"}
         for fname in CUTOVER_SQL_FILES:
             text = (self.GOLD_SQL_DIR / fname).read_text(encoding="utf-8")
             if fname in no_join_files:
