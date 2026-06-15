@@ -602,7 +602,7 @@ class TestPartialScrapeRatio:
 
 
 # ---------------------------------------------------------------------------
-# count_bronze_partition_players — guard input for the runner (#484/#486)
+# Shared Trino DB-API stubs for bronze-lookup tests
 # ---------------------------------------------------------------------------
 
 class _StubCursor:
@@ -629,50 +629,6 @@ def _stub_trino_modules(cursor):
     stub_trino = MagicMock()
     stub_trino.dbapi.connect.return_value = conn
     return {'trino': stub_trino, 'trino.auth': stub_trino.auth}
-
-
-class TestCountBronzePartitionPlayers:
-    @pytest.fixture
-    def scraper(self):
-        return TransfermarktScraper(
-            leagues=['ENG-Premier League'], seasons=[2025],
-        )
-
-    def test_counts_distinct_players_with_short_season(self, scraper):
-        from unittest.mock import patch
-        import sys
-
-        cursor = _StubCursor([(600,)])
-        with patch.dict(sys.modules, _stub_trino_modules(cursor)):
-            count = scraper.count_bronze_partition_players(
-                'transfermarkt_players', 'ENG-Premier League', 2025,
-            )
-        assert count == 600
-        sql, params = cursor.executed[0]
-        assert 'count(DISTINCT player_id)' in sql
-        assert 'iceberg.bronze.transfermarkt_players' in sql
-        assert params == ('ENG-Premier League', '2526')
-
-    def test_returns_none_on_query_error(self, scraper):
-        from unittest.mock import MagicMock, patch
-        import sys
-
-        stub_trino = MagicMock()
-        stub_trino.dbapi.connect.side_effect = RuntimeError('trino down')
-        modules = {'trino': stub_trino, 'trino.auth': stub_trino.auth}
-        with patch.dict(sys.modules, modules):
-            count = scraper.count_bronze_partition_players(
-                'transfermarkt_players', 'ENG-Premier League', 2025,
-            )
-        assert count is None
-
-    def test_rejects_short_form_season(self, scraper):
-        # _season_short('2526') double-shortens to '2627' → count 0 →
-        # an always-passing guard. Fail loudly instead.
-        with pytest.raises(ValueError, match='start year'):
-            scraper.count_bronze_partition_players(
-                'transfermarkt_players', 'ENG-Premier League', 2526,
-            )
 
 
 # ---------------------------------------------------------------------------

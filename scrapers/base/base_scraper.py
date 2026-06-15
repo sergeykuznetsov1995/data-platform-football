@@ -27,6 +27,18 @@ from scrapers.utils.proxy_manager import ProxyManager
 logger = logging.getLogger(__name__)
 
 
+class ReplaceGuardError(Exception):
+    """A ``replace_partitions`` save was refused by the completeness guard.
+
+    Raised by :meth:`BaseScraper.save_to_iceberg` when ``min_replace_ratio`` is
+    set and the new frame holds fewer rows (or distinct ``replace_guard_key``
+    values) than that share of the existing partition — i.e. the save would
+    shrink the partition (silent partial scrape, ``--limit`` smoke run). A
+    dedicated type lets callers tell a refused guard apart from a hard write
+    failure (#513).
+    """
+
+
 class ScraperConfig:
     """Configuration for scrapers loaded from YAML."""
 
@@ -260,6 +272,8 @@ class BaseScraper(ABC):
         partition_cols: Optional[List[str]] = None,
         database: str = 'bronze',
         replace_partitions: Optional[List[str]] = None,
+        min_replace_ratio: Optional[float] = None,
+        replace_guard_key: Optional[str] = None,
     ) -> str:
         """
         Save DataFrame to Iceberg table in Bronze layer.
@@ -274,6 +288,22 @@ class BaseScraper(ABC):
                 tuples present in ``df`` BEFORE inserting. Gives
                 partition-replace semantics instead of plain append.
                 Used by schedule writers to prevent INSERT-only duplication.
+            min_replace_ratio: Opt-in completeness guard for
+                ``replace_partitions`` saves (#513). When set (e.g. ``0.9``),
+                the existing partition rows that ``delete_filter`` would delete
+                are counted via Trino; if the new frame holds fewer than this
+                share the save is refused with :class:`ReplaceGuardError`
+                (nothing deleted or written). Guards a partial scrape from
+                wiping a good partition (precedent: ClubElo wipe #283/#314).
+                Requires ``replace_partitions`` (raises ``ValueError`` without
+                it — "guarding" a plain append is meaningless). The count is
+                aggregate over all partition tuples in ``df``; exact for a
+                single-partition frame.
+            replace_guard_key: Column to ``COUNT(DISTINCT ...)`` for the guard
+                instead of raw rows. Use when per-key row counts vary (e.g.
+                Transfermarkt mv_history/transfers carry variable per-player
+                timeline lengths → count distinct ``player_id``). ``None`` →
+                ``COUNT(*)``.
 
         Returns:
             Full table identifier
@@ -291,6 +321,12 @@ class BaseScraper(ABC):
             self._build_partition_delete_filter(df, replace_partitions)
             if replace_partitions else None
         )
+
+        if min_replace_ratio is not None:
+            self._enforce_replace_guard(
+                df, database, table_name, delete_filter,
+                min_replace_ratio, replace_guard_key,
+            )
 
         table_path = self._iceberg_writer.write_dataframe(
             df=df,
@@ -352,6 +388,97 @@ class BaseScraper(ABC):
                     parts.append(f"{col} = {val}")
             clauses.append('(' + ' AND '.join(parts) + ')')
         return ' OR '.join(clauses)
+
+    def _enforce_replace_guard(
+        self,
+        df: pd.DataFrame,
+        database: str,
+        table_name: str,
+        delete_filter: Optional[str],
+        min_replace_ratio: float,
+        replace_guard_key: Optional[str],
+    ) -> None:
+        """Refuse a replace-partitions save that would shrink the partition.
+
+        Opt-in completeness guard (#513): compares the new frame against the
+        existing partition (the rows ``delete_filter`` would delete) and raises
+        :class:`ReplaceGuardError` when the new frame holds fewer than
+        ``min_replace_ratio`` of the existing count. Skips (warning) when the
+        existing count is unavailable — a first run, or an unreachable Trino;
+        the save itself needs Trino, so a dead cluster cannot wipe anything.
+        ``df`` is guaranteed non-empty (``save_to_iceberg`` short-circuits empty
+        frames before calling).
+        """
+        if not 0.0 < min_replace_ratio <= 1.0:
+            raise ValueError(
+                f"min_replace_ratio must be in (0, 1], got {min_replace_ratio!r}"
+            )
+        if delete_filter is None:
+            raise ValueError(
+                "min_replace_ratio requires replace_partitions; refusing to "
+                "'guard' a plain append (it would still accumulate duplicates)."
+            )
+        if replace_guard_key is not None and replace_guard_key not in df.columns:
+            raise ValueError(
+                f"replace_guard_key={replace_guard_key!r} not in DataFrame columns"
+            )
+
+        existing = self._count_existing_partition(
+            database, table_name, delete_filter, replace_guard_key,
+        )
+        if not existing:  # None (unavailable) or 0 (empty partition / first run)
+            logger.warning(
+                "Replace guard skipped for %s.%s (existing count unavailable or "
+                "zero) — proceeding with save.", database, table_name,
+            )
+            return
+
+        new = (
+            int(df[replace_guard_key].nunique())
+            if replace_guard_key else len(df)
+        )
+        if new < min_replace_ratio * existing:
+            unit = f"distinct {replace_guard_key}" if replace_guard_key else "rows"
+            raise ReplaceGuardError(
+                f"new={new} {unit} < {min_replace_ratio:.0%} of "
+                f"existing={existing} for {database}.{table_name} — refusing "
+                f"replace_partitions save (would shrink the partition)"
+            )
+
+    def _count_existing_partition(
+        self,
+        database: str,
+        table_name: str,
+        delete_filter: str,
+        key: Optional[str],
+    ) -> Optional[int]:
+        """COUNT the existing rows ``delete_filter`` would delete, or ``None``.
+
+        Returns ``None`` (guard skips) when the table does not yet exist or
+        Trino is unreachable. Reuses the exact ``delete_filter`` so it measures
+        the rows ``save_to_iceberg`` is about to DELETE. Counts ``DISTINCT key``
+        when ``key`` is given, else raw rows (``COUNT(DISTINCT *)`` is invalid
+        Trino SQL, so the branch is required).
+        """
+        try:
+            if not self._iceberg_writer.table_exists(database, table_name):
+                return None
+            agg = f"count(DISTINCT {key})" if key else "count(*)"
+            catalog = self._iceberg_writer.catalog
+            sql = (
+                f"SELECT {agg} FROM {catalog}.{database}.{table_name} "
+                f"WHERE {delete_filter}"
+            )
+            rows = self._iceberg_writer._get_trino_manager().execute_query(sql)
+            if rows and rows[0] and rows[0][0] is not None:
+                return int(rows[0][0])
+            return None
+        except Exception as e:
+            logger.warning(
+                "Could not count existing partition for %s.%s: %s",
+                database, table_name, e,
+            )
+            return None
 
     @abstractmethod
     def scrape_all(self) -> Dict[str, str]:

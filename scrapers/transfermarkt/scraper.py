@@ -683,46 +683,6 @@ class TransfermarktScraper(BaseScraper):
             )
             return []
 
-    def count_bronze_partition_players(
-        self,
-        table_name: str,
-        league: str,
-        season: int,
-    ) -> Optional[int]:
-        """COUNT(DISTINCT player_id) in the ``(league, season)`` bronze partition.
-
-        Guard input for the runner's replace-partitions completeness check
-        (#484/#486). ``season`` is the 4-digit start year (2025 → partition
-        '2526'), same convention as the ``read_*`` entry points — short
-        forms are rejected because ``_season_short('2526')`` would
-        double-shorten to '2627' and silently count 0 (an always-passing
-        guard). Returns ``None`` when the count is unavailable (table
-        missing on a first run, Trino unreachable) — callers treat that as
-        "guard skipped".
-        """
-        if not (2000 <= int(season) <= 2099):
-            raise ValueError(
-                f"season must be a 4-digit start year (e.g. 2025), got {season!r}"
-            )
-        season_short = _season_short(int(season))
-        try:
-            conn = self._bronze_connection()
-            cur = conn.cursor()
-            cur.execute(
-                f"SELECT count(DISTINCT player_id) "
-                f"FROM iceberg.bronze.{table_name} "
-                f"WHERE league = ? AND season = ?",
-                (league, season_short),
-            )
-            row = cur.fetchone()
-            return int(row[0]) if row else None
-        except Exception as e:
-            logger.warning(
-                "Could not count bronze players in %s for (%s, %s): %s",
-                table_name, league, season_short, e,
-            )
-            return None
-
     # ---------------------- read_* entry points ------------------------------
 
     def read_players(
@@ -1073,11 +1033,15 @@ class TransfermarktScraper(BaseScraper):
                 df = self.read_players(league=league, season=season)
                 if df.empty:
                     continue
+                # Completeness guard (#513): refuse a replace that would shrink
+                # the partition below 90% of the existing distinct players.
                 table_path = self.save_to_iceberg(
                     df,
                     'transfermarkt_players',
                     partition_cols=['league', 'season'],
                     replace_partitions=['league', 'season'],
+                    min_replace_ratio=0.9,
+                    replace_guard_key='player_id',
                 )
                 results[f'players_{league}_{season}'] = table_path
         return results
