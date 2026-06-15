@@ -199,6 +199,27 @@ def render_dim_team_sql(template_path: str, out_path: str) -> str:
     return out_path
 
 
+def render_dim_player_sql(template_path: str, out_path: str) -> str:
+    """Render ``dim_player.sql.j2`` to ``out_path`` (issue #435).
+
+    Fills the single ``{{ country_map_values_sql }}`` placeholder with
+    ``(fifa_code, country_name)`` tuples from ``country_codes.yaml`` — the
+    FBref FIFA-code -> full-name map used in the nationality COALESCE; the row
+    spine still comes from ``silver.xref_player`` inside the template.
+    """
+    from utils.medallion_config import (
+        get_country_map_sql_values,
+        render_sql_template,
+    )
+
+    rendered = render_sql_template(
+        Path(template_path),
+        country_map_values_sql=get_country_map_sql_values(),
+    )
+    Path(out_path).write_text(rendered)
+    return out_path
+
+
 def render_dim_match_sql(template_path: str, out_path: str) -> str:
     """Render ``dim_match.sql.j2`` to ``out_path`` (issue #425).
 

@@ -1,5 +1,5 @@
 -- =============================================================================
--- Gold: dim_player
+-- Gold: dim_player   (Jinja template — `.sql.j2`, rendered by dim_loaders.py)
 -- =============================================================================
 -- Canonical player dimension, aligned to the star-schema design (issue #425).
 -- One row per player — NO season in the grain: the dim keeps only what a
@@ -15,6 +15,7 @@
 -- Priorities per attribute (memory: T4 dim_player_attributes):
 --   dob:         FotMob > SofaScore > Transfermarkt > SoFIFA
 --   nationality: FotMob > SofaScore > Transfermarkt > SoFIFA > FBref code
+--                (FBref FIFA code mapped to full name via country_codes.yaml)
 --   height_cm:   Transfermarkt (official club profile) > FotMob > SofaScore > SoFIFA
 --   foot:        Transfermarkt > FotMob > SofaScore
 --   position:    SoFIFA > FBref (first token of 'pos', e.g. 'MF,FW' -> 'MF')
@@ -23,10 +24,10 @@
 -- Partitioning: NONE  (global dim — star design: dims are unpartitioned)
 --
 -- Coverage caveat: FotMob/SofaScore/TM/SoFIFA profiles cover current-APL
--- players only — dob/height/foot stay NULL for most historical players, and
--- nationality falls back to the FBref 3-letter code ('ENG') instead of the
--- full name. Mixed format is a deliberate completeness trade-off; the
--- code->name mapping is a tracked followup.
+-- players only — dob/height/foot stay NULL for most historical players. For
+-- nationality the FBref-code fallback is mapped to a full name via
+-- country_codes.yaml (#435) so the column is single-format (full names);
+-- a code absent from the map degrades gracefully to the raw 3-letter code.
 --
 -- Season is NOT a JOIN key anywhere here (snapshot grain — MAX_BY(.., season)
 -- takes each source's freshest value), so the xref (league, season) fan-out
@@ -34,6 +35,16 @@
 -- =============================================================================
 
 WITH
+-- #435: FBref FIFA-code -> full country name map
+-- (configs/medallion/country_codes.yaml, rendered via the
+-- {{ country_map_values_sql }} placeholder). Keyed by unique fifa_code, so the
+-- LEFT JOIN below cannot fan out the player spine.
+country_map AS (
+    SELECT * FROM (VALUES
+        {{ country_map_values_sql }}
+    ) AS t(fifa_code, country_name)
+),
+
 -- #463: silver-профиль per-(player, squad) — multi-squad сезон делает
 -- MAX_BY(x, season) недетерминированным (pos может отличаться между клубами).
 -- Pre-dedup до одной строки на (player, season): max-minutes клуб, tie → squad.
@@ -151,8 +162,12 @@ SELECT
              ss.date_of_birth,
              tm.dob,
              TRY_CAST(sf.dob AS DATE))                             AS dob,
+    -- #435: FBref fallback is the FIFA 3-letter code — map it to a full name
+    -- (country_map) so the column is single-format; an unmapped code keeps the
+    -- raw code (graceful, never NULL).
     COALESCE(fm.nationality, ss.nationality, tm.nationality,
              sf.nationality,
+             cm.country_name,
              REGEXP_EXTRACT(fb.nation, '[A-Z]{3}'))                AS nationality,
     COALESCE(tm.height_cm, fm.height_cm,
              ss.height_cm, sf.height_cm)                           AS height_cm,
@@ -163,6 +178,10 @@ SELECT
 FROM xref_fbref xf
 LEFT JOIN fbref_latest fb
     ON fb.player_id = xf.fbref_player_id
+-- #435: map the FBref FIFA code to a full country name (≤1 match per row —
+-- country_map is unique on fifa_code, so no fan-out of the player spine).
+LEFT JOIN country_map cm
+    ON cm.fifa_code = REGEXP_EXTRACT(fb.nation, '[A-Z]{3}')
 LEFT JOIN xref_fotmob_latest xfm
     ON xfm.canonical_id = xf.canonical_id
 LEFT JOIN fotmob_latest fm

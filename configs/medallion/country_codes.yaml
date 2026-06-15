@@ -1,0 +1,186 @@
+# =============================================================================
+# Country code map — FBref/FIFA 3-letter code -> full country name (issue #435)
+# =============================================================================
+# FBref `nation` column carries FIFA/IOC 3-letter codes (e.g. 'eng ENG'), NOT
+# ISO-3166 alpha-3. The UK home nations (ENG/SCO/WAL/NIR) and many football
+# codes diverge from ISO (GER≠DEU, NED≠NLD, POR≠PRT, SUI≠CHE, CRO≠HRV, ...).
+#
+# Used by gold.dim_player.sql.j2 via the {{ country_map_values_sql }}
+# placeholder (medallion_config.get_country_map_sql_values): the FBref-code
+# fallback in the nationality COALESCE is mapped to a full name so the column
+# is single-format (full names) across all sources. Unmapped codes degrade to
+# the raw 3-letter code (graceful — never NULL).
+#
+# `name` MUST match the spelling emitted by FotMob/SofaScore/Transfermarkt so
+# a player resolved via the map reads identically to one resolved via a source
+# (single canonical spelling). Reconcile against:
+#   SELECT DISTINCT nationality FROM iceberg.silver.fotmob_player_profile
+# Coverage MUST cover 100% of:
+#   SELECT DISTINCT REGEXP_EXTRACT(nation,'[A-Z]{3}') FROM iceberg.silver.fbref_player_season_profile
+#
+# Field reference:
+#   code — FIFA/IOC 3-letter code, upper-case (^[A-Z]{3}$), unique
+#   name — full country name (full-name spelling per the enrichment sources)
+# =============================================================================
+
+countries:
+  # --- UK & Ireland (FBref home-nation codes, absent from ISO-3166) ---
+  - {code: ENG, name: England}
+  - {code: SCO, name: Scotland}
+  - {code: WAL, name: Wales}
+  - {code: NIR, name: Northern Ireland}
+  - {code: IRL, name: Republic of Ireland}
+
+  # --- UEFA (Europe) ---
+  - {code: FRA, name: France}
+  - {code: GER, name: Germany}
+  - {code: ESP, name: Spain}
+  - {code: ITA, name: Italy}
+  - {code: POR, name: Portugal}
+  - {code: NED, name: Netherlands}
+  - {code: BEL, name: Belgium}
+  - {code: SUI, name: Switzerland}
+  - {code: AUT, name: Austria}
+  - {code: DEN, name: Denmark}
+  - {code: SWE, name: Sweden}
+  - {code: NOR, name: Norway}
+  - {code: FIN, name: Finland}
+  - {code: ISL, name: Iceland}
+  - {code: POL, name: Poland}
+  - {code: CZE, name: Czech Republic}
+  - {code: SVK, name: Slovakia}
+  - {code: SVN, name: Slovenia}
+  - {code: CRO, name: Croatia}
+  - {code: SRB, name: Serbia}
+  - {code: BIH, name: Bosnia and Herzegovina}
+  - {code: MNE, name: Montenegro}
+  - {code: MKD, name: North Macedonia}
+  - {code: ALB, name: Albania}
+  - {code: KVX, name: Kosovo}
+  - {code: GRE, name: Greece}
+  - {code: ROU, name: Romania}
+  - {code: BUL, name: Bulgaria}
+  - {code: HUN, name: Hungary}
+  - {code: TUR, name: Turkey}
+  - {code: UKR, name: Ukraine}
+  - {code: RUS, name: Russia}
+  - {code: BLR, name: Belarus}
+  - {code: LTU, name: Lithuania}
+  - {code: LVA, name: Latvia}
+  - {code: EST, name: Estonia}
+  - {code: MDA, name: Moldova}
+  - {code: GEO, name: Georgia}
+  - {code: ARM, name: Armenia}
+  - {code: AZE, name: Azerbaijan}
+  - {code: KAZ, name: Kazakhstan}
+  - {code: ISR, name: Israel}
+  - {code: CYP, name: Cyprus}
+  - {code: LUX, name: Luxembourg}
+  - {code: MLT, name: Malta}
+  - {code: FRO, name: Faroe Islands}
+  - {code: GIB, name: Gibraltar}
+  - {code: AND, name: Andorra}
+  - {code: LIE, name: Liechtenstein}
+  - {code: SMR, name: San Marino}
+
+  # --- CONMEBOL / CONCACAF (Americas) ---
+  - {code: BRA, name: Brazil}
+  - {code: ARG, name: Argentina}
+  - {code: URU, name: Uruguay}
+  - {code: COL, name: Colombia}
+  - {code: CHI, name: Chile}
+  - {code: PER, name: Peru}
+  - {code: PAR, name: Paraguay}
+  - {code: ECU, name: Ecuador}
+  - {code: VEN, name: Venezuela}
+  - {code: BOL, name: Bolivia}
+  - {code: USA, name: United States}
+  - {code: CAN, name: Canada}
+  - {code: MEX, name: Mexico}
+  - {code: CRC, name: Costa Rica}
+  - {code: HON, name: Honduras}
+  - {code: GUA, name: Guatemala}
+  - {code: PAN, name: Panama}
+  - {code: JAM, name: Jamaica}
+  - {code: TRI, name: Trinidad and Tobago}
+  - {code: HAI, name: Haiti}
+  - {code: CUB, name: Cuba}
+  - {code: DOM, name: Dominican Republic}
+  - {code: CUW, name: Curacao}
+  - {code: GLP, name: Guadeloupe}
+  - {code: GUY, name: Guyana}
+  - {code: SUR, name: Suriname}
+  - {code: GRN, name: Grenada}
+  - {code: ATG, name: Antigua and Barbuda}
+  - {code: SKN, name: St Kitts and Nevis}
+  - {code: LCA, name: St Lucia}
+  - {code: VIN, name: St Vincent and the Grenadines}
+  - {code: BRB, name: Barbados}
+  - {code: BAH, name: Bahamas}
+  - {code: BER, name: Bermuda}
+  - {code: MSR, name: Montserrat}
+
+  # --- CAF (Africa) ---
+  - {code: NGA, name: Nigeria}
+  - {code: GHA, name: Ghana}
+  - {code: CIV, name: Ivory Coast}
+  - {code: SEN, name: Senegal}
+  - {code: CMR, name: Cameroon}
+  - {code: MLI, name: Mali}
+  - {code: EGY, name: Egypt}
+  - {code: MAR, name: Morocco}
+  - {code: ALG, name: Algeria}
+  - {code: TUN, name: Tunisia}
+  - {code: COD, name: DR Congo}
+  - {code: CGO, name: Congo}
+  - {code: GAB, name: Gabon}
+  - {code: GUI, name: Guinea}
+  - {code: GNB, name: Guinea-Bissau}
+  - {code: BFA, name: Burkina Faso}
+  - {code: TOG, name: Togo}
+  - {code: BEN, name: Benin}
+  - {code: ZAM, name: Zambia}
+  - {code: ZIM, name: Zimbabwe}
+  - {code: KEN, name: Kenya}
+  - {code: UGA, name: Uganda}
+  - {code: ANG, name: Angola}
+  - {code: CPV, name: Cape Verde}
+  - {code: GAM, name: Gambia}
+  - {code: SLE, name: Sierra Leone}
+  - {code: LBR, name: Liberia}
+  - {code: MAD, name: Madagascar}
+  - {code: MTN, name: Mauritania}
+  - {code: COM, name: Comoros}
+  - {code: RSA, name: South Africa}
+  - {code: NAM, name: Namibia}
+  - {code: MOZ, name: Mozambique}
+  - {code: BDI, name: Burundi}
+  - {code: RWA, name: Rwanda}
+  - {code: TAN, name: Tanzania}
+  - {code: CTA, name: Central African Republic}
+  - {code: EQG, name: Equatorial Guinea}
+
+  # --- AFC / OFC (Asia & Oceania) ---
+  - {code: JPN, name: Japan}
+  - {code: KOR, name: South Korea}
+  - {code: PRK, name: North Korea}
+  - {code: CHN, name: China}
+  - {code: AUS, name: Australia}
+  - {code: NZL, name: New Zealand}
+  - {code: IRN, name: Iran}
+  - {code: IRQ, name: Iraq}
+  - {code: KSA, name: Saudi Arabia}
+  - {code: UAE, name: United Arab Emirates}
+  - {code: QAT, name: Qatar}
+  - {code: JOR, name: Jordan}
+  - {code: LBN, name: Lebanon}
+  - {code: SYR, name: Syria}
+  - {code: UZB, name: Uzbekistan}
+  - {code: IND, name: India}
+  - {code: BAN, name: Bangladesh}
+  - {code: PHI, name: Philippines}
+  - {code: THA, name: Thailand}
+  - {code: VIE, name: Vietnam}
+  - {code: IDN, name: Indonesia}
+  - {code: MAS, name: Malaysia}
+  - {code: HKG, name: Hong Kong}

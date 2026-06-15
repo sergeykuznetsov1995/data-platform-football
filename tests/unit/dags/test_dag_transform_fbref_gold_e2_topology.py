@@ -4,8 +4,8 @@ Topology tests for ``dags/dag_transform_fbref_gold.py`` — star-schema dims
 
 Verifies the staged dim build order from the design (§7):
   * s2a_config_dims  — dim_competition / dim_season / dim_venue (inline j2)
-  * s2b_xref_dims    — dim_player / dim_referee / dim_manager (.sql)
-                       + dim_team (inline j2)
+  * s2b_xref_dims    — dim_referee / dim_manager (.sql)
+                       + dim_team / dim_player (inline j2)
   * s2c_dim_match    — dim_match (inline j2, the star centre)
   * s2d_season_blocks — fct_standings / dim_player_attributes / fct_*_season
   * group chaining: s2a >> s2b >> s2c >> s2d >> s3_facts
@@ -89,6 +89,7 @@ INLINE_DIMS = [
     ("s2a_config_dims.dim_season",      "dim_season.sql.j2"),
     ("s2a_config_dims.dim_venue",       "dim_venue.sql.j2"),
     ("s2b_xref_dims.dim_team",          "dim_team.sql.j2"),
+    ("s2b_xref_dims.dim_player",        "dim_player.sql.j2"),
     ("s2c_dim_match.dim_match",         "dim_match.sql.j2"),
 ]
 

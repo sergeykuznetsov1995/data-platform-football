@@ -65,6 +65,7 @@ PLAYER_ALIASES_FILE = 'player_aliases.yaml'
 REFEREE_ALIASES_FILE = 'referee_aliases.yaml'
 VENUE_ALIASES_FILE = 'venue_aliases.yaml'
 SOURCE_PRIORITY_FILE = 'source_priority.yaml'
+COUNTRY_CODES_FILE = 'country_codes.yaml'
 
 # Sentinel for "no source filter" — distinct from None which means "include
 # generic + all sources merged" in get_team_alias_pairs. We pass the bucket
@@ -320,6 +321,48 @@ def _validate_competitions_schema(doc: Dict) -> None:
             )
 
 
+def _validate_country_codes_schema(doc: Dict) -> None:
+    """Structural validation of country_codes.yaml (issue #435).
+
+    Each entry maps a FBref/FIFA 3-letter ``code`` (``^[A-Z]{3}$``) to a
+    non-empty full-country ``name``. Codes must be unique — a duplicate would
+    silently fan out the country_map JOIN in gold.dim_player.
+    """
+    if not isinstance(doc, dict) or 'countries' not in doc:
+        raise MedallionConfigError(
+            "country_codes.yaml: missing top-level 'countries' key"
+        )
+    countries = doc['countries']
+    if not isinstance(countries, list):
+        raise MedallionConfigError(
+            "country_codes.yaml: 'countries' must be a list"
+        )
+    seen_codes: set = set()
+    for i, c in enumerate(countries):
+        if not isinstance(c, dict):
+            raise MedallionConfigError(
+                f"country_codes.yaml: countries[{i}] must be a mapping"
+            )
+        code = c.get('code')
+        if not isinstance(code, str) or not re.fullmatch(r'[A-Z]{3}', code):
+            raise MedallionConfigError(
+                f"country_codes.yaml: countries[{i}] has missing/invalid "
+                f"'code' (must match ^[A-Z]{{3}}$, got {code!r})"
+            )
+        if code in seen_codes:
+            raise MedallionConfigError(
+                f"country_codes.yaml: duplicate code {code!r} "
+                f"(countries[{i}]) — one code must map to one country"
+            )
+        seen_codes.add(code)
+        name = c.get('name')
+        if not isinstance(name, str) or not name.strip():
+            raise MedallionConfigError(
+                f"country_codes.yaml: countries[{i}] ({code}) "
+                f"missing/empty 'name'"
+            )
+
+
 # ---------------------------------------------------------------------------
 # YAML readers — cached on the resolved file path so tests overriding
 # CONFIG_DIR get fresh reads after reset_cache().
@@ -349,6 +392,21 @@ def load_competitions() -> Dict:
     path = str(CONFIG_DIR / COMPETITIONS_FILE)
     doc = _read_yaml(path)
     _validate_competitions_schema(doc)
+    return doc
+
+
+def load_country_codes() -> Dict:
+    """Return the parsed country_codes.yaml (issue #435, with schema check).
+
+    Missing file is treated as ``{'countries': []}`` so a fresh checkout before
+    #435 degrades to "no code mapping" (nationality keeps the raw FBref code)
+    rather than crashing DAG-parse.
+    """
+    path = str(CONFIG_DIR / COUNTRY_CODES_FILE)
+    if not Path(path).exists():
+        return {'countries': []}
+    doc = _read_yaml(path)
+    _validate_country_codes_schema(doc)
     return doc
 
 
@@ -885,6 +943,28 @@ def get_team_meta_sql_values() -> str:
         f"'{_escape_sql_string(t['country'])}', "
         f"'{_escape_sql_string(t['short_name'])}')"
         for t in teams
+    ]
+    return ',\n'.join(lines).lstrip()
+
+
+def get_country_map_sql_values() -> str:
+    """Render country-code tuples as a Trino VALUES body (issue #435).
+
+    Emits two-tuples ``(fifa_code, country_name)`` — one per entry in
+    country_codes.yaml — consumed by ``dim_player.sql.j2``. Mirrors
+    :func:`get_team_meta_sql_values`; empty result raises because an empty
+    VALUES clause is invalid Trino.
+    """
+    countries = load_country_codes()['countries']
+    if not countries:
+        raise MedallionConfigError(
+            "get_country_map_sql_values produced 0 rows — "
+            "an empty VALUES clause is invalid Trino, refusing to emit."
+        )
+    lines = [
+        f"    ('{_escape_sql_string(c['code'])}', "
+        f"'{_escape_sql_string(c['name'])}')"
+        for c in countries
     ]
     return ',\n'.join(lines).lstrip()
 
