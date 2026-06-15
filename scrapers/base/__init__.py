@@ -12,7 +12,7 @@ Modules:
 - browser/: Browser automation package (CloudflareBypass)
 """
 
-from scrapers.base.base_scraper import BaseScraper, SeleniumScraper
+from scrapers.base.base_scraper import BaseScraper, ReplaceGuardError, SeleniumScraper
 from scrapers.base.iceberg_writer import IcebergWriter
 from scrapers.base.hdfs_client import HDFSClient, HDFSError
 from scrapers.base.trino_manager import TrinoTableManager, TrinoError
@@ -20,6 +20,7 @@ from scrapers.base.browser import CloudflareBypass, browser_session, BrowserConf
 
 __all__ = [
     'BaseScraper',
+    'ReplaceGuardError',
     'SeleniumScraper',
     'IcebergWriter',
     'HDFSClient',

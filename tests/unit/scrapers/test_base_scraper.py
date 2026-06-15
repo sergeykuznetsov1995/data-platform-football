@@ -159,6 +159,203 @@ class TestBaseScraper:
         clause = BaseScraper._build_partition_delete_filter(df, ['league', 'season'])
         assert clause == "(league = 'EPL' AND season = 2024)"
 
+    # ---- replace_partitions completeness guard (min_replace_ratio, #513) ----
+
+    def _guard_df(self, n_players=100):
+        """One (league, season) partition with ``n`` distinct player_id."""
+        return pd.DataFrame({
+            'league': ['EPL'] * n_players,
+            'season': ['2526'] * n_players,
+            'player_id': [str(i) for i in range(n_players)],
+        })
+
+    def _setup_iw(self, scraper, *, exists=True, existing_count=100):
+        """Wire the mocked IcebergWriter for the guard's count query."""
+        iw = scraper._iceberg_writer
+        iw.catalog = 'iceberg'
+        iw.table_exists.return_value = exists
+        iw._get_trino_manager.return_value.execute_query.return_value = (
+            [[existing_count]] if existing_count is not None else []
+        )
+        return iw
+
+    def test_guard_blocks_when_new_below_ratio(self, concrete_scraper):
+        """50 distinct players < 90% of 600 existing → refuse, nothing written."""
+        from scrapers.base.base_scraper import ReplaceGuardError
+        iw = self._setup_iw(concrete_scraper, existing_count=600)
+        df = self._guard_df(50)
+
+        with pytest.raises(ReplaceGuardError, match='refusing'):
+            concrete_scraper.save_to_iceberg(
+                df, 'transfermarkt_players',
+                partition_cols=['league', 'season'],
+                replace_partitions=['league', 'season'],
+                min_replace_ratio=0.9, replace_guard_key='player_id',
+            )
+        iw.write_dataframe.assert_not_called()
+
+    def test_guard_passes_at_exact_boundary(self, concrete_scraper):
+        """90 vs 100 == exactly 90% → not below threshold → save proceeds."""
+        iw = self._setup_iw(concrete_scraper, existing_count=100)
+        df = self._guard_df(90)
+
+        concrete_scraper.save_to_iceberg(
+            df, 'transfermarkt_players',
+            partition_cols=['league', 'season'],
+            replace_partitions=['league', 'season'],
+            min_replace_ratio=0.9, replace_guard_key='player_id',
+        )
+        iw.write_dataframe.assert_called_once()
+
+    def test_guard_passes_when_above_ratio(self, concrete_scraper):
+        iw = self._setup_iw(concrete_scraper, existing_count=100)
+        df = self._guard_df(100)
+
+        concrete_scraper.save_to_iceberg(
+            df, 'transfermarkt_players',
+            partition_cols=['league', 'season'],
+            replace_partitions=['league', 'season'],
+            min_replace_ratio=0.9, replace_guard_key='player_id',
+        )
+        iw.write_dataframe.assert_called_once()
+
+    def test_guard_skipped_when_table_missing(self, concrete_scraper):
+        """First run (table absent) → no count query, save proceeds."""
+        iw = self._setup_iw(concrete_scraper, exists=False)
+        df = self._guard_df(1)
+
+        concrete_scraper.save_to_iceberg(
+            df, 'transfermarkt_players',
+            partition_cols=['league', 'season'],
+            replace_partitions=['league', 'season'],
+            min_replace_ratio=0.9, replace_guard_key='player_id',
+        )
+        iw.write_dataframe.assert_called_once()
+        iw._get_trino_manager.return_value.execute_query.assert_not_called()
+
+    def test_guard_skipped_when_existing_zero(self, concrete_scraper):
+        iw = self._setup_iw(concrete_scraper, existing_count=0)
+        df = self._guard_df(1)
+
+        concrete_scraper.save_to_iceberg(
+            df, 'transfermarkt_players',
+            partition_cols=['league', 'season'],
+            replace_partitions=['league', 'season'],
+            min_replace_ratio=0.9, replace_guard_key='player_id',
+        )
+        iw.write_dataframe.assert_called_once()
+
+    def test_guard_skipped_when_trino_unreachable(self, concrete_scraper):
+        """table_exists raising (dead cluster) → skip; the save needs Trino too,
+        so an unreachable cluster cannot wipe anything."""
+        iw = self._setup_iw(concrete_scraper)
+        iw.table_exists.side_effect = Exception('connection refused')
+        df = self._guard_df(1)
+
+        concrete_scraper.save_to_iceberg(
+            df, 'transfermarkt_players',
+            partition_cols=['league', 'season'],
+            replace_partitions=['league', 'season'],
+            min_replace_ratio=0.9, replace_guard_key='player_id',
+        )
+        iw.write_dataframe.assert_called_once()
+
+    def test_guard_skipped_on_query_error(self, concrete_scraper):
+        iw = self._setup_iw(concrete_scraper)
+        iw._get_trino_manager.return_value.execute_query.side_effect = (
+            Exception('boom')
+        )
+        df = self._guard_df(1)
+
+        concrete_scraper.save_to_iceberg(
+            df, 'transfermarkt_players',
+            partition_cols=['league', 'season'],
+            replace_partitions=['league', 'season'],
+            min_replace_ratio=0.9, replace_guard_key='player_id',
+        )
+        iw.write_dataframe.assert_called_once()
+
+    def test_guard_query_uses_distinct_key_and_delete_filter(self, concrete_scraper):
+        iw = self._setup_iw(concrete_scraper, existing_count=100)
+        df = self._guard_df(100)
+
+        concrete_scraper.save_to_iceberg(
+            df, 'transfermarkt_players',
+            partition_cols=['league', 'season'],
+            replace_partitions=['league', 'season'],
+            min_replace_ratio=0.9, replace_guard_key='player_id',
+        )
+        sql = iw._get_trino_manager.return_value.execute_query.call_args[0][0]
+        assert 'count(DISTINCT player_id)' in sql
+        assert 'iceberg.bronze.transfermarkt_players' in sql
+        assert "league = 'EPL'" in sql
+        assert "season = '2526'" in sql
+
+    def test_guard_counts_raw_rows_without_key(self, concrete_scraper):
+        """No replace_guard_key → COUNT(*) of raw rows (not DISTINCT)."""
+        from scrapers.base.base_scraper import ReplaceGuardError
+        iw = self._setup_iw(concrete_scraper, existing_count=100)
+        df = self._guard_df(50)  # 50 rows < 90 → block via raw-row count
+
+        with pytest.raises(ReplaceGuardError):
+            concrete_scraper.save_to_iceberg(
+                df, 'matchhistory_results',
+                partition_cols=['league', 'season'],
+                replace_partitions=['league', 'season'],
+                min_replace_ratio=0.9,
+            )
+        sql = iw._get_trino_manager.return_value.execute_query.call_args[0][0]
+        assert 'count(*)' in sql
+        assert 'DISTINCT' not in sql
+        iw.write_dataframe.assert_not_called()
+
+    def test_guard_no_op_without_min_replace_ratio(self, concrete_scraper):
+        """Regression contract for the ~50 existing replace_partitions call
+        sites: omitting min_replace_ratio runs no count query and writes."""
+        iw = self._setup_iw(concrete_scraper, existing_count=1)
+        df = self._guard_df(100)
+
+        concrete_scraper.save_to_iceberg(
+            df, 'transfermarkt_players',
+            partition_cols=['league', 'season'],
+            replace_partitions=['league', 'season'],
+        )
+        iw.table_exists.assert_not_called()
+        iw.write_dataframe.assert_called_once()
+
+    def test_guard_raises_without_replace_partitions(self, concrete_scraper):
+        self._setup_iw(concrete_scraper)
+        df = self._guard_df(100)
+        with pytest.raises(ValueError, match='requires replace_partitions'):
+            concrete_scraper.save_to_iceberg(
+                df, 'transfermarkt_players',
+                partition_cols=['league', 'season'],
+                min_replace_ratio=0.9, replace_guard_key='player_id',
+            )
+
+    @pytest.mark.parametrize('bad', [0.0, 1.5, -0.1])
+    def test_guard_raises_on_ratio_out_of_range(self, concrete_scraper, bad):
+        self._setup_iw(concrete_scraper)
+        df = self._guard_df(100)
+        with pytest.raises(ValueError, match='min_replace_ratio'):
+            concrete_scraper.save_to_iceberg(
+                df, 'transfermarkt_players',
+                partition_cols=['league', 'season'],
+                replace_partitions=['league', 'season'],
+                min_replace_ratio=bad, replace_guard_key='player_id',
+            )
+
+    def test_guard_raises_when_key_missing(self, concrete_scraper):
+        self._setup_iw(concrete_scraper)
+        df = self._guard_df(100)
+        with pytest.raises(ValueError, match='not in DataFrame columns'):
+            concrete_scraper.save_to_iceberg(
+                df, 'transfermarkt_players',
+                partition_cols=['league', 'season'],
+                replace_partitions=['league', 'season'],
+                min_replace_ratio=0.9, replace_guard_key='nonexistent',
+            )
+
     def test_get_stats(self, concrete_scraper, mock_dependencies):
         """Test getting scraper statistics."""
         stats = concrete_scraper.get_stats()

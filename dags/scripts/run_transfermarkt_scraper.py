@@ -76,10 +76,12 @@ ENTITY_TRANSFERS = 'transfers'
 
 VALID_ENTITIES = {ENTITY_PLAYERS, ENTITY_MV_HISTORY, ENTITY_TRANSFERS}
 
-# Replace-partitions completeness guard (#484/#486): refuse the save when
-# the scraped frame holds fewer distinct players than this share of the
-# existing bronze partition. Distinct players (not raw rows) because
-# per-player timeline lengths vary wildly for mv_history/transfers.
+# Replace-partitions completeness guard (#484/#486, generalised into
+# BaseScraper.save_to_iceberg in #513): passed as min_replace_ratio +
+# replace_guard_key='player_id'. Refuse the save when the scraped frame holds
+# fewer distinct players than this share of the existing bronze partition.
+# Distinct players (not raw rows) because per-player timeline lengths vary
+# wildly for mv_history/transfers. ReplaceGuardError → exit 3.
 _MIN_REPLACE_RATIO = 0.9
 REPLACE_GUARD_MARKER = 'TM_REPLACE_GUARD'
 
@@ -114,41 +116,6 @@ def _classify_fallback(scraper) -> str:
     return f'http_{status}'
 
 
-def _replace_guard_blocks(
-    scraper,
-    table_name: str,
-    league: str,
-    season: int,
-    new_players: int,
-    results: dict,
-) -> Optional[str]:
-    """Completeness check before a replace-partitions save (#484/#486).
-
-    Returns a block-reason string when the scraped frame would shrink the
-    existing bronze partition below ``_MIN_REPLACE_RATIO`` (catches both a
-    silent partial scrape and a ``--limit N`` smoke run). ``None`` count
-    (table missing on first run, Trino unreachable) skips the guard — the
-    save itself also needs Trino, so an unreachable cluster cannot wipe
-    anything.
-    """
-    existing = scraper.count_bronze_partition_players(table_name, league, season)
-    if existing is None:
-        logger.warning(
-            "%s: existing player count unavailable for %s — proceeding "
-            "without guard.",
-            REPLACE_GUARD_MARKER, table_name,
-        )
-        results['guard_skipped'] = 'count_unavailable'
-        return None
-    if existing and new_players < _MIN_REPLACE_RATIO * existing:
-        return (
-            f"{REPLACE_GUARD_MARKER}: new_players={new_players} < "
-            f"{_MIN_REPLACE_RATIO:.0%} of existing_players={existing} for "
-            f"{table_name} — refusing replace_partitions save"
-        )
-    return None
-
-
 def _run_players(
     leagues: List[str],
     season: int,
@@ -162,6 +129,7 @@ def _run_players(
     Writes ``bronze.transfermarkt_players`` with replace-partitions on
     ``(league, season)``.
     """
+    from scrapers.base.base_scraper import ReplaceGuardError
     from scrapers.transfermarkt import TransfermarktScraper
     from scrapers.transfermarkt.scraper import R0_2B_FALLBACK_MARKER
 
@@ -213,28 +181,25 @@ def _run_players(
                 _write_results(output_path, results)
                 return 0
 
-            if not force_replace:
-                block = _replace_guard_blocks(
-                    scraper, 'transfermarkt_players', league, season,
-                    results['players_with_rows'], results,
-                )
-                if block:
-                    logger.error(block)
-                    results['errors'].append(block)
-                    _write_results(output_path, results)
-                    return 3
-
             table_path = scraper.save_to_iceberg(
                 df=df,
                 table_name='transfermarkt_players',
                 partition_cols=['league', 'season'],
                 replace_partitions=['league', 'season'],
+                min_replace_ratio=(None if force_replace else _MIN_REPLACE_RATIO),
+                replace_guard_key='player_id',
             )
             results['tables'].append(table_path)
             logger.info(
                 "Saved %d player rows (%d unique) → %s",
                 results['rows'], results['players_with_rows'], table_path,
             )
+    except ReplaceGuardError as e:
+        msg = f"{REPLACE_GUARD_MARKER}: {e}"
+        logger.error(msg)
+        results['errors'].append(msg)
+        _write_results(output_path, results)
+        return 3
     except Exception as e:
         logger.error("players scrape failed hard: %s", e, exc_info=True)
         results['errors'].append(str(e))
@@ -258,6 +223,7 @@ def _run_mv_history(
     Depends on a fresh ``bronze.transfermarkt_players``; if that table is
     empty, the resolver returns ``[]`` and we emit TM_FALLBACK exit 2.
     """
+    from scrapers.base.base_scraper import ReplaceGuardError
     from scrapers.transfermarkt import TransfermarktScraper
     from scrapers.transfermarkt.scraper import R0_2B_FALLBACK_MARKER
 
@@ -310,28 +276,25 @@ def _run_mv_history(
                 _write_results(output_path, results)
                 return 0
 
-            if not force_replace:
-                block = _replace_guard_blocks(
-                    scraper, 'transfermarkt_market_value_history', league,
-                    season, results['players_with_rows'], results,
-                )
-                if block:
-                    logger.error(block)
-                    results['errors'].append(block)
-                    _write_results(output_path, results)
-                    return 3
-
             table_path = scraper.save_to_iceberg(
                 df=df,
                 table_name='transfermarkt_market_value_history',
                 partition_cols=['league', 'season'],
                 replace_partitions=['league', 'season'],
+                min_replace_ratio=(None if force_replace else _MIN_REPLACE_RATIO),
+                replace_guard_key='player_id',
             )
             results['tables'].append(table_path)
             logger.info(
                 "Saved %d MV history rows for %d players → %s",
                 results['rows'], results['players_with_rows'], table_path,
             )
+    except ReplaceGuardError as e:
+        msg = f"{REPLACE_GUARD_MARKER}: {e}"
+        logger.error(msg)
+        results['errors'].append(msg)
+        _write_results(output_path, results)
+        return 3
     except Exception as e:
         logger.error("mv_history scrape failed hard: %s", e, exc_info=True)
         results['errors'].append(str(e))
@@ -353,6 +316,7 @@ def _run_transfers(
     """Per-player transfers via the ceapi JSON endpoint. Same dependency
     contract as ``_run_mv_history``.
     """
+    from scrapers.base.base_scraper import ReplaceGuardError
     from scrapers.transfermarkt import TransfermarktScraper
     from scrapers.transfermarkt.scraper import R0_2B_FALLBACK_MARKER
 
@@ -405,28 +369,25 @@ def _run_transfers(
                 _write_results(output_path, results)
                 return 0
 
-            if not force_replace:
-                block = _replace_guard_blocks(
-                    scraper, 'transfermarkt_transfers', league, season,
-                    results['players_with_rows'], results,
-                )
-                if block:
-                    logger.error(block)
-                    results['errors'].append(block)
-                    _write_results(output_path, results)
-                    return 3
-
             table_path = scraper.save_to_iceberg(
                 df=df,
                 table_name='transfermarkt_transfers',
                 partition_cols=['league', 'season'],
                 replace_partitions=['league', 'season'],
+                min_replace_ratio=(None if force_replace else _MIN_REPLACE_RATIO),
+                replace_guard_key='player_id',
             )
             results['tables'].append(table_path)
             logger.info(
                 "Saved %d transfer rows for %d players → %s",
                 results['rows'], results['players_with_rows'], table_path,
             )
+    except ReplaceGuardError as e:
+        msg = f"{REPLACE_GUARD_MARKER}: {e}"
+        logger.error(msg)
+        results['errors'].append(msg)
+        _write_results(output_path, results)
+        return 3
     except Exception as e:
         logger.error("transfers scrape failed hard: %s", e, exc_info=True)
         results['errors'].append(str(e))
