@@ -56,7 +56,6 @@ from utils.fbref_tasks import (
     create_trino_health_check_task,
 )
 from utils.fbref_callbacks import (
-    prewarm_cf_cookies,
     validate_all_data,
     check_traffic_guard,
 )
@@ -109,19 +108,6 @@ NODRIVER_CF_VERIFY_RETRIES = 6  # Maximum cf-verify plugin retries
 USE_CF_VERIFY_PLUGIN = True  # Enable automatic Turnstile checkbox clicking
 CF_VERIFY_MAX_RETRIES = 3    # Max retries (less aggressive to avoid triggering new challenges)
 CF_VERIFY_INTERVAL = 1.5     # Interval between cf-verify retries (seconds, reduced from 3.0)
-
-# Cookie injection settings (fallback for HTTP scraper after cf-verify)
-# Extracts cf_clearance cookies via nodriver and injects into HTTP session
-USE_CF_COOKIE_INJECTION = True
-CF_COOKIE_CACHE_TTL_MINUTES = 25  # Slightly less than 30min CF cookie lifetime
-
-# =============================================================================
-# CF COOKIE PREWARM SETTINGS
-# =============================================================================
-# Pre-solve Cloudflare Turnstile before starting scraper tasks
-# Reduces 403 errors by having valid cookies ready
-CF_COOKIE_PREWARM = False  # Disabled to prevent OOM during ingestion
-CF_COOKIE_PREWARM_ATTEMPTS = 5
 
 # Proxy configuration
 PROXY_FILE = '/opt/airflow/proxys.txt'  # Path to proxy file in container
@@ -363,27 +349,6 @@ with DAG(
     start = EmptyOperator(task_id='start')
 
     # =========================================================================
-    # Prewarm CF Cookies Task
-    # =========================================================================
-    # Pre-solve Cloudflare Turnstile to get cf_clearance cookies
-    # before starting any scraper tasks
-    prewarm_task = PythonOperator(
-        task_id='prewarm_cf_cookies',
-        python_callable=prewarm_cf_cookies,
-        op_kwargs=dict(
-            proxy_file=PROXY_FILE,
-            cache_ttl_minutes=CF_COOKIE_CACHE_TTL_MINUTES,
-            use_cf_verify=USE_CF_VERIFY_PLUGIN,
-            cf_verify_max_retries=CF_VERIFY_MAX_RETRIES,
-            cf_verify_interval=CF_VERIFY_INTERVAL,
-            use_xvfb=USE_XVFB,
-            max_attempts=CF_COOKIE_PREWARM_ATTEMPTS,
-        ),
-        retries=2,
-        retry_delay=timedelta(seconds=120),
-    ) if CF_COOKIE_PREWARM else None
-
-    # =========================================================================
     # TaskGroup: Player Stats (9 SEQUENTIAL tasks to prevent OOM)
     # =========================================================================
     with TaskGroup(group_id='player_stats') as player_stats_group:
@@ -472,10 +437,7 @@ with DAG(
     )
 
     # =========================================================================
-    # Dependencies: Start -> Prewarm -> TaskGroups SEQUENTIAL -> Validate -> Trigger Silver
-    # Changed from parallel to sequential execution to prevent OOM
+    # Dependencies: Start -> TaskGroups SEQUENTIAL -> Validate -> Trigger Silver
+    # Sequential execution to prevent OOM
     # =========================================================================
-    if CF_COOKIE_PREWARM and prewarm_task:
-        start >> prewarm_task >> player_stats_group >> team_stats_group >> keeper_stats_group >> match_data_group >> validate_task >> trigger_silver
-    else:
-        start >> player_stats_group >> team_stats_group >> keeper_stats_group >> match_data_group >> validate_task >> trigger_silver
+    start >> player_stats_group >> team_stats_group >> keeper_stats_group >> match_data_group >> validate_task >> trigger_silver

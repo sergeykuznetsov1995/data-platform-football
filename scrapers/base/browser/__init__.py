@@ -10,7 +10,6 @@ Modules:
 - nodriver_bypass: NodriverBypass class (nodriver - successor to uc)
 - driver_factory: WebDriver creation and configuration
 - proxy_extension: Chrome proxy authentication extension
-- cf_cookie_manager: Cloudflare cookie extraction and injection
 - utils: Browser utility functions
 
 Usage:
@@ -49,7 +48,6 @@ from scrapers.base.browser.utils import find_chrome_binary
 # Lazy import for nodriver (may not be installed)
 NodriverBypass = None
 nodriver_session = None
-CFCookieManager = None
 
 
 def _import_nodriver():
@@ -65,17 +63,6 @@ def _import_nodriver():
     return NodriverBypass, nodriver_session
 
 
-def _import_cf_cookie_manager():
-    """Lazy import CFCookieManager."""
-    global CFCookieManager
-    if CFCookieManager is None:
-        from scrapers.base.browser.cf_cookie_manager import (
-            CFCookieManager as _CFCookieManager,
-        )
-        CFCookieManager = _CFCookieManager
-    return CFCookieManager
-
-
 def get_nodriver_bypass():
     """Get NodriverBypass class (lazy import)."""
     cls, _ = _import_nodriver()
@@ -86,11 +73,6 @@ def get_nodriver_session():
     """Get nodriver_session factory (lazy import)."""
     _, factory = _import_nodriver()
     return factory
-
-
-def get_cf_cookie_manager():
-    """Get CFCookieManager class (lazy import)."""
-    return _import_cf_cookie_manager()
 
 
 __all__ = [
@@ -104,8 +86,6 @@ __all__ = [
     # Nodriver (lazy import)
     'get_nodriver_bypass',
     'get_nodriver_session',
-    # CF Cookie Manager (lazy import)
-    'get_cf_cookie_manager',
 ]
 
 
