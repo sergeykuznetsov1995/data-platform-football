@@ -120,6 +120,18 @@ class TestProxy:
         proxy.mark_banned()
         assert proxy.is_banned is True
 
+    def test_mark_banned_records_timestamp(self):
+        """mark_banned() stamps banned_at; a later success clears it (#552)."""
+        proxy = Proxy(host='test', port=8080)
+        assert proxy.banned_at is None
+
+        proxy.mark_banned()
+        assert proxy.banned_at is not None
+
+        proxy.record_success()
+        assert proxy.is_banned is False
+        assert proxy.banned_at is None
+
 
 class TestProxyManager:
     """Tests for ProxyManager."""
@@ -325,6 +337,99 @@ class TestProxyManager:
         manager.record_result(proxy, success=False, error_type='cloudflare')
         assert proxy.is_banned is True
         assert proxy.error_counts.get('cloudflare', 0) == 2
+
+    def test_banned_proxy_auto_unbanned_after_cooldown(self):
+        """A banned proxy returns to the pool once its cooldown elapses (#552).
+
+        banned_at is set into the past to simulate elapsed time — no real
+        sleep / freezegun, mirroring how the cooldown tests set last_used.
+        """
+        manager = ProxyManager(unban_cooldown_seconds=600.0)
+        manager.add_proxy('proxy1.example.com', 8080)
+        proxy = manager._proxies[0]
+
+        proxy.mark_banned()
+        proxy.banned_at = time.time() - 601.0  # cooldown elapsed
+
+        returned = manager.get_proxy()
+        assert returned is proxy
+        assert proxy.is_banned is False
+        assert proxy.banned_at is None
+
+    def test_banned_proxy_stays_banned_within_cooldown(self):
+        """A banned proxy is NOT returned before its cooldown elapses (#552)."""
+        manager = ProxyManager(unban_cooldown_seconds=600.0)
+        manager.add_proxy('proxy1.example.com', 8080)
+        proxy = manager._proxies[0]
+
+        proxy.mark_banned()  # banned_at = now, well within cooldown
+
+        assert manager.get_proxy() is None
+        assert proxy.is_banned is True
+
+    def test_auto_unban_resets_consecutive_failures(self):
+        """Auto-unban clears the consecutive-failure counter so the proxy gets
+        a fresh ban_threshold budget, mirroring unban_all (#552)."""
+        manager = ProxyManager(unban_cooldown_seconds=600.0)
+        manager.config.ban_threshold = 3
+        manager.add_proxy('proxy1.example.com', 8080)
+
+        proxy = manager.get_proxy()
+        for _ in range(3):
+            manager.record_result(proxy, success=False)
+        assert proxy.is_banned is True
+
+        proxy.banned_at = time.time() - 601.0
+        manager.get_proxy()
+
+        assert proxy.is_banned is False
+        assert manager._consecutive_failures['proxy1.example.com:8080'] == 0
+
+    def test_auto_unban_disabled_when_cooldown_zero(self):
+        """unban_cooldown_seconds=0 keeps the old permanent-ban behaviour (#552)."""
+        manager = ProxyManager(unban_cooldown_seconds=0.0)
+        manager.add_proxy('proxy1.example.com', 8080)
+        proxy = manager._proxies[0]
+
+        proxy.mark_banned()
+        proxy.banned_at = time.time() - 10_000.0  # long past, but auto-unban off
+
+        assert manager.get_proxy() is None
+        assert proxy.is_banned is True
+
+    def test_unban_all_clears_banned_at(self):
+        """unban_all() also clears banned_at, not just the is_banned flag (#552)."""
+        manager = ProxyManager()
+        manager.add_proxy('proxy1.example.com', 8080)
+        proxy = manager._proxies[0]
+        proxy.mark_banned()
+        assert proxy.banned_at is not None
+
+        manager.unban_all()
+        assert proxy.is_banned is False
+        assert proxy.banned_at is None
+
+    def test_cloudflare_ban_re_bans_after_auto_unban_probe(self):
+        """DoD regression: a dead cloudflare proxy re-bans on its first probe
+        after auto-unban — cumulative error_counts is preserved (#552)."""
+        manager = ProxyManager(unban_cooldown_seconds=600.0)
+        manager.config.cloudflare_ban_threshold = 2
+        manager.config.min_success_rate = 0.0  # isolate the cloudflare path
+        manager.add_proxy('proxy1.example.com', 8080)
+
+        proxy = manager.get_proxy()
+        for _ in range(2):
+            manager.record_result(proxy, success=False, error_type='cloudflare')
+        assert proxy.is_banned is True
+
+        # Cooldown elapses -> proxy returns for one probe.
+        proxy.banned_at = time.time() - 601.0
+        assert manager.get_proxy() is proxy
+        assert proxy.is_banned is False
+
+        # One more cloudflare failure re-bans immediately (count 2->3 >= 2).
+        manager.record_result(proxy, success=False, error_type='cloudflare')
+        assert proxy.is_banned is True
 
     def test_get_best_proxies(self):
         """Test getting best performing proxies."""

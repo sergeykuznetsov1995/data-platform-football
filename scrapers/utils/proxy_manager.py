@@ -59,6 +59,7 @@ class Proxy:
     failure_count: int = 0
     last_used: float = 0.0
     is_banned: bool = False
+    banned_at: Optional[float] = None  # time.time() when banned; None if not banned
 
     # Detailed error statistics
     error_counts: Dict[str, int] = field(default_factory=dict)
@@ -118,6 +119,7 @@ class Proxy:
         self.success_count += 1
         self.last_used = time.time()
         self.is_banned = False
+        self.banned_at = None
 
     def record_failure(self, error_type: str = 'unknown') -> None:
         """
@@ -152,6 +154,7 @@ class Proxy:
     def mark_banned(self) -> None:
         """Mark proxy as banned."""
         self.is_banned = True
+        self.banned_at = time.time()
         logger.warning(f"Proxy {self.masked_url} marked as banned")
 
     def get_error_summary(self) -> str:
@@ -168,6 +171,7 @@ class ProxyManagerConfig:
     min_success_rate: float = 0.5
     ban_threshold: int = 5  # Consecutive failures to ban
     cooldown_seconds: float = 60.0  # Min time between proxy uses
+    unban_cooldown_seconds: float = 600.0  # Auto-return a banned proxy to the pool after N seconds (0 = never)
     use_tor: bool = False
     tor_control_port: int = 9051
     tor_socks_port: int = 9050
@@ -198,6 +202,7 @@ class ProxyManager:
         min_success_rate: float = 0.5,
         use_tor: bool = False,
         cooldown_seconds: float = 60.0,
+        unban_cooldown_seconds: float = 600.0,
     ):
         """
         Initialize proxy manager.
@@ -207,12 +212,15 @@ class ProxyManager:
             min_success_rate: Minimum success rate before banning proxy
             use_tor: Whether to use Tor network
             cooldown_seconds: Minimum time between uses of the same proxy
+            unban_cooldown_seconds: Auto-return a banned proxy to the pool after
+                this many seconds without a manual unban_all() (0 = never)
         """
         self.config = ProxyManagerConfig(
             rotation_strategy=rotation_strategy,
             min_success_rate=min_success_rate,
             use_tor=use_tor,
             cooldown_seconds=cooldown_seconds,
+            unban_cooldown_seconds=unban_cooldown_seconds,
         )
 
         self._proxies: List[Proxy] = []
@@ -437,6 +445,34 @@ class ProxyManager:
         )
         return {'alive': alive, 'dead': dead, 'total': total}
 
+    def _reactivate_expired_bans(self) -> None:
+        """Auto-unban proxies whose ban cooldown has elapsed (#552).
+
+        Lazy per-proxy recovery: a banned proxy returns to the pool once
+        ``unban_cooldown_seconds`` have passed since it was banned, without a
+        manual ``unban_all()``. Mirrors ``unban_all`` semantics (clears the
+        consecutive-failure counter) but keeps cumulative ``error_counts`` so a
+        genuinely dead proxy re-bans on its first probe while a victim of a
+        transient site outage gets a fresh ``ban_threshold`` budget.
+        """
+        cooldown = self.config.unban_cooldown_seconds
+        if cooldown <= 0:
+            return
+        now = time.time()
+        for proxy in self._proxies:
+            if (
+                proxy.is_banned
+                and proxy.banned_at is not None
+                and now - proxy.banned_at >= cooldown
+            ):
+                proxy.is_banned = False
+                proxy.banned_at = None
+                self._consecutive_failures[f"{proxy.host}:{proxy.port}"] = 0
+                logger.info(
+                    f"Proxy {proxy.masked_url} auto-unbanned after "
+                    f"{cooldown:.0f}s cooldown"
+                )
+
     def get_proxy(self, respect_cooldown: bool = True) -> Optional[Proxy]:
         """
         Get next available proxy based on rotation strategy.
@@ -447,6 +483,7 @@ class ProxyManager:
         Returns:
             Proxy instance or None if no proxies available
         """
+        self._reactivate_expired_bans()
         available = [p for p in self._proxies if not p.is_banned]
 
         if not available:
@@ -561,6 +598,7 @@ class ProxyManager:
         """Unban all proxies."""
         for proxy in self._proxies:
             proxy.is_banned = False
+            proxy.banned_at = None
         self._consecutive_failures.clear()
         logger.info("All proxies unbanned")
 
