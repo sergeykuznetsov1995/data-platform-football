@@ -4,7 +4,7 @@ Unit tests for ``dags/utils/xref_player_resolver.py`` (E1 T3).
 Strategy
 --------
 * No Trino: :func:`run_resolver` is *not* exercised here — we validate every
-  pure helper (``normalize_name``, ``fuzzy_match_score``, ``canonical_team_for_resolver``,
+  pure helper (``normalize_name``, ``canonical_team_for_resolver``,
   ``cascade_resolve``) and the in-memory ``_FBrefSpine`` against fixture data.
 * No mock framework: pure functions are easier to assert against directly,
   and the spine is small enough (5 fixtures) to construct in-line.
@@ -63,33 +63,9 @@ class TestNormalizeName:
 
     def test_preserves_token_order(self):
         # Order is preserved here — token-order-invariance is the job
-        # of fuzzy_match_score, not normalize_name.
+        # of the cascade's fuzzy matching, not normalize_name.
         assert xpr.normalize_name("Son Heung-min") == "son heung-min"
         assert xpr.normalize_name("Heung-Min Son") == "heung-min son"
-
-
-# ---------------------------------------------------------------------------
-# fuzzy_match_score
-# ---------------------------------------------------------------------------
-class TestFuzzyMatchScore:
-    def test_token_order_invariance(self):
-        # token_sort_ratio sorts tokens before comparing → 100 even with
-        # different surface order.
-        score = xpr.fuzzy_match_score("Son Heung-min", "Heung-Min Son")
-        assert score >= 90.0, f"expected ≥90, got {score}"
-
-    def test_diacritic_invariance(self):
-        score = xpr.fuzzy_match_score("Joško Gvardiol", "Josko Gvardiol")
-        assert score == 100.0
-
-    def test_low_score_for_unrelated_names(self):
-        score = xpr.fuzzy_match_score("Bukayo Saka", "Erling Haaland")
-        assert score < xpr.NAME_THRESHOLD
-
-    def test_empty_inputs_return_zero(self):
-        assert xpr.fuzzy_match_score("", "Bukayo Saka") == 0.0
-        assert xpr.fuzzy_match_score("Bukayo Saka", None) == 0.0
-        assert xpr.fuzzy_match_score(None, None) == 0.0
 
 
 # ---------------------------------------------------------------------------

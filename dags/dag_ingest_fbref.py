@@ -64,7 +64,6 @@ from scrapers.fbref.constants import (
     PLAYER_STAT_TYPES,
     TEAM_STAT_TYPES,
     KEEPER_STAT_TYPES,
-    MATCH_DATA_TYPES,
 )
 
 # =============================================================================

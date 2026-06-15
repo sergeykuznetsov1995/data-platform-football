@@ -38,11 +38,6 @@ INGESTION_DAGS = [
     'dag_ingest_clubelo',
 ]
 
-# Weekly DAGs (run separately)
-WEEKLY_DAGS = [
-    'dag_ingest_sofifa',
-]
-
 # Extended default args for master pipeline
 MASTER_ARGS = {
     **DEFAULT_ARGS,
