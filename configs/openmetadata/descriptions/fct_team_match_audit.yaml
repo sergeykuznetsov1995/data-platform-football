@@ -84,7 +84,8 @@ columns:
   - name: shots_on_target_diff_ws
     description: |
       Diff ударов в створ: fb.shots_on_target - ws.shots_on_target_proxy.
-      WS proxy = SPADL shot с outcome_success (приближение, не точное shots-on-target).
+      WS proxy = SPADL shot где _action_source_note IN ('SavedShot','Goal') —
+      сейвы + забитые голы (#573); прокси vs точного fct_shot.
       NULL для current seasons (#120).
   - name: fouls_diff_ss_ws
     description: |

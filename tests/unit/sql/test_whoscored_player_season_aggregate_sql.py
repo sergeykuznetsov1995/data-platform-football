@@ -1,16 +1,22 @@
 """
 Unit tests for ``dags/sql/silver/whoscored_player_season_aggregate.sql`` (B1).
 
-Pure regex / keyword sanity — no Trino engine. Verifies the SPADL action
-enum coverage, mandatory ``(league, season)`` JOIN predicate against
-``silver.xref_player`` (CLAUDE.md fan-out rule), and the GROUP BY
-contract that defines the table's PK.
+Regex / keyword sanity (no Trino engine) verifies the SPADL action enum
+coverage, mandatory ``(league, season)`` JOIN predicate against
+``silver.xref_player`` (CLAUDE.md fan-out rule), and the GROUP BY contract
+that defines the table's PK.
+
+Plus a DuckDB data-test (#573): ``shots_on_target_proxy`` must be saved shots +
+scored goals (``_action_source_note IN ('SavedShot','Goal')``), NOT every
+``outcome_success`` shot — and that signal must survive the events→joined CTE
+plumbing through the xref_player join.
 """
 
 from __future__ import annotations
 
 import re
 from pathlib import Path
+from typing import Any, Dict, List, Optional
 
 import pytest
 
@@ -129,3 +135,149 @@ def test_partition_columns_are_last():
     assert re.search(r"\bleague,\s*\n\s*season\s*\n", body), (
         "partition columns league/season must be emitted as last columns"
     )
+
+
+# ---------------------------------------------------------------------------
+# DuckDB data-test (#573) — shots_on_target_proxy = saves + scored goals
+# ---------------------------------------------------------------------------
+#
+# Seeds the two Silver sources (events_spadl + xref_player), runs the SELECT on
+# DuckDB and asserts on-target counts SavedShot + Goal only — verifying the
+# ``_action_source_note`` signal survives the events->joined CTE plumbing.
+
+
+def _translate_trino_to_duckdb(sql: str) -> str:
+    sql = sql.replace(
+        "iceberg.silver.whoscored_events_spadl", "silver_whoscored_events_spadl"
+    )
+    sql = sql.replace("iceberg.silver.xref_player", "silver_xref_player")
+    sql = re.sub(r"\bregexp_like\s*\(", "regexp_matches(", sql, flags=re.IGNORECASE)
+    return sql
+
+
+_SPADL_COLUMNS: List[str] = [
+    "match_id", "player_id_raw", "action_canonical", "_action_source_note",
+    "outcome_success", "x", "y", "league", "season",
+]
+
+
+def _spadl_row(
+    *,
+    match_id: str = "100",
+    player_id_raw: str = "555",
+    action_canonical: str = "pass",
+    action_source_note: str = "Pass",
+    outcome_success: bool = True,
+    x: float = 90.0,
+    y: float = 50.0,
+    league: str = "ENG-Premier League",
+    season: str = "2526",
+) -> Dict[str, Any]:
+    return {
+        "match_id": match_id,
+        "player_id_raw": player_id_raw,
+        "action_canonical": action_canonical,
+        "_action_source_note": action_source_note,
+        "outcome_success": outcome_success,
+        "x": x,
+        "y": y,
+        "league": league,
+        "season": season,
+    }
+
+
+@pytest.fixture(scope="session")
+def duck_conn():
+    duckdb = pytest.importorskip("duckdb")
+    con = duckdb.connect()
+    yield con
+    con.close()
+
+
+def _seed_and_run(con, spadl_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    con.execute("DROP TABLE IF EXISTS silver_whoscored_events_spadl")
+    con.execute("DROP TABLE IF EXISTS silver_xref_player")
+    con.execute(
+        """
+        CREATE TABLE silver_whoscored_events_spadl (
+            match_id            VARCHAR,
+            player_id_raw       VARCHAR,
+            action_canonical    VARCHAR,
+            _action_source_note VARCHAR,
+            outcome_success     BOOLEAN,
+            x                   DOUBLE,
+            y                   DOUBLE,
+            league              VARCHAR,
+            season              VARCHAR
+        )
+        """
+    )
+    con.execute(
+        """
+        CREATE TABLE silver_xref_player (
+            canonical_id VARCHAR,
+            source_id    VARCHAR,
+            source       VARCHAR,
+            league       VARCHAR,
+            season       VARCHAR
+        )
+        """
+    )
+    # One whoscored player (555) -> canonical fb_999, resolvable for 2526 APL.
+    con.execute(
+        "INSERT INTO silver_xref_player VALUES "
+        "('fb_999', '555', 'whoscored', 'ENG-Premier League', '2526')"
+    )
+    placeholders = ", ".join(["?"] * len(_SPADL_COLUMNS))
+    insert_sql = (
+        f"INSERT INTO silver_whoscored_events_spadl "
+        f"({', '.join(_SPADL_COLUMNS)}) VALUES ({placeholders})"
+    )
+    for row in spadl_rows:
+        con.execute(insert_sql, [row[c] for c in _SPADL_COLUMNS])
+
+    sql = _translate_trino_to_duckdb(_read_sql())
+    cur = con.execute(sql)
+    cols = [d[0] for d in cur.description]
+    return [dict(zip(cols, r)) for r in cur.fetchall()]
+
+
+class TestShotsOnTargetSavesPlusGoals:
+    """on-target = SavedShot + Goal, not every Successful shot (#573) — through
+    the xref_player join."""
+
+    def _shot_corpus(self) -> List[Dict[str, Any]]:
+        return [
+            _spadl_row(action_canonical="shot", action_source_note="SavedShot",
+                       outcome_success=True),                                   # on target
+            _spadl_row(action_canonical="shot", action_source_note="Goal",
+                       outcome_success=True),                                   # on target (scored)
+            _spadl_row(action_canonical="shot", action_source_note="MissedShots",
+                       outcome_success=True),                                   # off target, but Successful
+            _spadl_row(action_canonical="shot", action_source_note="ShotOnPost",
+                       outcome_success=True),                                   # off target, but Successful
+            _spadl_row(action_canonical="shot_penalty", action_source_note="Goal",
+                       outcome_success=True),                                   # on target (scored pen)
+            _spadl_row(action_canonical="own_goal", action_source_note="Goal",
+                       outcome_success=True),                                   # excluded by shot-family
+        ]
+
+    def test_shots_total_counts_all_shot_family_excl_own_goal(self, duck_conn):
+        out = _seed_and_run(duck_conn, self._shot_corpus())
+        assert len(out) == 1
+        assert out[0]["shots_total"] == 5
+
+    def test_shots_on_target_is_saves_plus_goals(self, duck_conn):
+        out = _seed_and_run(duck_conn, self._shot_corpus())
+        # SavedShot + open-play Goal + penalty Goal = 3.
+        assert out[0]["shots_on_target_proxy"] == 3
+
+    def test_missed_shot_successful_is_not_on_target(self, duck_conn):
+        out = _seed_and_run(duck_conn, [
+            _spadl_row(action_canonical="shot", action_source_note="SavedShot",
+                       outcome_success=True),
+            _spadl_row(action_canonical="shot", action_source_note="MissedShots",
+                       outcome_success=True),
+        ])
+        assert out[0]["shots_total"] == 2
+        assert out[0]["shots_on_target_proxy"] == 1

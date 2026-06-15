@@ -49,7 +49,7 @@ columns:
   - name: shots_total
     description: Удары, всего — все shot-варианты (action_canonical IN 'shot'/'shot_penalty'/'shot_freekick'), включая голы (#462).
   - name: shots_on_target_proxy
-    description: Прокси ударов в створ (shot-варианты с outcome_success); грубый — WhoScored помечает MissedShots как Successful, поэтому завышает; фактические голы / в створ — в fct_shot.
+    description: Удары в створ = сейвы + забитые голы (SavedShot+Goal через _action_source_note, #573). НЕ outcome_success — WhoScored помечает MissedShots/ShotOnPost как Successful (раньше завышало). Остаётся прокси vs fct_shot (Understat) — source of truth для точного в створ.
   - name: fouls_committed
     description: Совершённые фолы (action_canonical='foul').
   - name: touches_in_box
