@@ -43,8 +43,8 @@ per-item/per-season HTTP.
 | `sofifa_leagues` | CHEAP | OK (reference) | (b) future | [#601] |
 | `sofifa_versions` | CHEAP | OK (reference) | (b) future | [#601] |
 | `sofascore_event_shotmap` | EXPENSIVE (~380/season) | OK | (b) future | [#602] |
-| `fbref_keeper_keeper_adv` | FREE (same HTTP as `keeper`) | ⚠ 23 cols 100% NULL (FBref Feb-2026) | (b) keep | — (§3) |
-| `whoscored_season_stages` | FREE (from `scrape_schedule`) | ⚠ `stage` all-NULL | (b) keep | — (§3) |
+| `fbref_keeper_keeper_adv` | EXPENSIVE (separate `/keepersadv/` page + CF bypass ~9.67s) | ⚠ 23 advanced cols 100% NULL (FBref Feb-2026); core dups `keeper` | **(c) stop** | [#606] |
+| `whoscored_season_stages` | FREE (same session as `scrape_schedule`, soccerdata cache) | ⚠ `stage` all-NULL | (b) keep | — (§3) |
 | `clubelo_team_history` | MODERATE (per-team histories) | no `rank`/`league` | **(c) stop** | [#604] |
 
 ### Resolved since the 2026-06-11 inventory
@@ -80,24 +80,24 @@ salaries**, not `capology_team_payrolls`. The 3 team-finance tables are read now
 
 ---
 
-## 3. Free by-products kept without an issue
+## 3. Free by-product kept without an issue
 
-Two tables are **free by-products** of a request that is made for another, needed table, so
-"stop scraping" would remove a parse+save but **not** the HTTP call — near-zero saving.
-Both also carry a structural all-NULL caveat that is upstream, not ours to fix. They are
-kept and documented here; no tracking issue is filed (avoids p3 issue-spam):
+One table is a **free by-product** of a request made for another, needed table, so "stop
+scraping" would remove a parse+save but **not** the HTTP call — near-zero saving. Kept and
+documented here; no tracking issue (avoids p3 issue-spam):
 
-- **`fbref_keeper_keeper_adv`** — extracted from the *same* page as `fbref_keeper_keeper`
-  (`create_single_stat_task('keeper','keeper_adv')`). Its 23 advanced-GK columns have been
-  100% NULL since the FBref Feb-2026 restriction (recorded in `audit_bronze_columns.py`
-  `EXPECTED_NULL`). Revisit if FBref restores PSxG/advanced GK data; until then it is a free
-  empty shell.
-- **`whoscored_season_stages`** — parsed from the `scrape_schedule()` response in the same
-  browser session (0 extra HTTP). The `stage` column is all-NULL for the in-scope single-stage
-  leagues. Free; kept for the day a multi-stage competition enters scope.
+- **`whoscored_season_stages`** — `scrape_season_stages()` calls `read_season_stages()` in the
+  **same** scraper process as `scrape_schedule()` (`run_whoscored_scraper.py:157,173`); the
+  soccerdata reader caches the tournament page, so no extra HTTP in practice. The `stage`
+  column is all-NULL for the in-scope single-stage leagues. Free; kept for the day a
+  multi-stage competition enters scope.
 
-If HDFS/snapshot pressure ever makes even these worth dropping, that is a trivial
-parse-removal — but it is **not** worth a scrape-cost argument.
+> **Correction (2026-06-15):** `fbref_keeper_keeper_adv` was initially placed here as a "free
+> by-product of `keeper`". That was **wrong** — `KEEPER_STAT_TYPES = ['keeper','keeper_adv']`
+> (`scrapers/fbref/constants.py:42-45`) makes each a **separate** `create_single_stat_task`
+> → separate `BashOperator` → separate nodriver+CF scrape of a distinct URL (`/keepersadv/`).
+> It is an EXPENSIVE FBref request whose 23 advanced columns are all-NULL and whose core
+> columns duplicate the (consumed) `fbref_keeper_keeper`. Re-classified **(c) stop** → [#606].
 
 ---
 
@@ -117,6 +117,7 @@ parse-removal — but it is **not** worth a scrape-cost argument.
 | Date | Change | Ref |
 |---|---|---|
 | 2026-06-15 | Register created; 2026-06-11 inventory re-verified (15 live, not 16 — `clubelo_ratings_historical` now CONSUMED); per-table verdicts + tracking issues [#600]–[#604] filed. | #476 |
+| 2026-06-15 | Correction after line-level re-check: `fbref_keeper_keeper_adv` is a **separate** FBref scrape (not a `keeper` by-product), re-classified (b) keep → **(c) stop**, issue [#606] filed; NULL counts (keeper_adv 23, sofifa_team_ratings 15) confirmed against `audit_bronze_columns.py` comments. | #476 |
 
 [#476]: https://github.com/sergeykuznetsov1995/data-platform-football/issues/476
 [#600]: https://github.com/sergeykuznetsov1995/data-platform-football/issues/600
@@ -124,3 +125,4 @@ parse-removal — but it is **not** worth a scrape-cost argument.
 [#602]: https://github.com/sergeykuznetsov1995/data-platform-football/issues/602
 [#603]: https://github.com/sergeykuznetsov1995/data-platform-football/issues/603
 [#604]: https://github.com/sergeykuznetsov1995/data-platform-football/issues/604
+[#606]: https://github.com/sergeykuznetsov1995/data-platform-football/issues/606
