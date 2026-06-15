@@ -51,7 +51,6 @@ Public API contract (frozen for T4 DAG integration)
 ---------------------------------------------------
 * :func:`run_resolver` — full pipeline; returns a summary dict.
 * :func:`normalize_name` — pure helper; testable without Trino.
-* :func:`fuzzy_match_score` — pure helper; rapidfuzz wrapper.
 * :func:`canonical_team_for_resolver` — wrapper over
   :func:`utils.medallion_config.get_canonical_team_name` with a sensible
   fallback (raw-name passthrough) so unmapped clubs still get *some* team
@@ -170,7 +169,7 @@ def normalize_name(s: Optional[str]) -> str:
 
     Returns:
         Normalized form. Order of tokens is NOT canonicalized here —
-        :func:`fuzzy_match_score` uses ``token_sort_ratio`` which handles
+        the cascade's fuzzy matching uses ``token_sort_ratio`` which handles
         token-order invariance (so ``"Heung-Min Son"`` and ``"Son Heung-min"``
         score 100 after normalisation).
     """
@@ -181,21 +180,6 @@ def normalize_name(s: Optional[str]) -> str:
     from unidecode import unidecode  # type: ignore
 
     return " ".join(unidecode(s).lower().split())
-
-
-def fuzzy_match_score(name_a: Optional[str], name_b: Optional[str]) -> float:
-    """``token_sort_ratio`` of two names, after :func:`normalize_name`.
-
-    Returns 0.0 if either input is empty / None — callers can rely on
-    "anything ≥ NAME_THRESHOLD is a real match".
-    """
-    a = normalize_name(name_a)
-    b = normalize_name(name_b)
-    if not a or not b:
-        return 0.0
-    from rapidfuzz import fuzz  # type: ignore
-
-    return float(fuzz.token_sort_ratio(a, b))
 
 
 def canonical_team_for_resolver(

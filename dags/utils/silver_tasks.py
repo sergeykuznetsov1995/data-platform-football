@@ -266,7 +266,7 @@ def run_silver_transform(
 #
 # DESIGN
 # ------
-# Mirrors ``gold_tasks.run_gold_partition_inserts`` but for Silver tables.
+# Mirrors ``gold_tasks.run_gold_partition_insert_wrapped`` but for Silver tables.
 # Used by ``dag_e3_backfill`` to materialise a single (season, league) slice
 # of ``silver.whoscored_events_spadl`` and ``silver.espn_lineup`` without
 # touching other partitions (production E3 DAG keeps using the DROP+CTAS
@@ -302,8 +302,8 @@ _MAX_PARTITION_VALUE_LEN_SILVER = 128
 def _safe_silver_value(value: str, key: str) -> str:
     """Escape a partition VALUE for inline use in a Trino predicate.
 
-    Mirrors :func:`utils.gold_tasks._safe_partition_value` — kept inline here
-    to avoid a circular ``silver_tasks → gold_tasks`` import.
+    Kept inline (rather than shared with gold_tasks) to avoid a circular
+    ``silver_tasks → gold_tasks`` import.
     """
     if not isinstance(value, str):
         raise ValueError(
@@ -577,141 +577,6 @@ def check_bronze_table_exists(
         return False
     finally:
         conn.close()
-
-
-# ---------------------------------------------------------------------------
-# Data Quality Checks
-# ---------------------------------------------------------------------------
-#
-# The Silver DAG (`dag_transform_fbref_silver._validate_silver_quality`) is the
-# canonical entry point and uses the typed `CHECK` API from `data_quality.py`
-# with ERROR severity for PK / ref_integrity violations so dirty data never
-# reaches Gold.
-#
-# `QUALITY_CHECKS` and `validate_silver_quality()` below remain for ad-hoc
-# operational use (e.g. shell, REPL, manual reruns) and now mirror the DAG:
-# critical checks raise, freshness / ranges are WARNING.
-
-# Freshness threshold: ingestion runs weekly (Monday). 48h covers the
-# post-ingest grace window; mid-week staleness is normal and stays WARNING.
-_FRESH_HOURS = 48
-
-
-def _build_silver_checks(schema: str = 'silver'):
-    """Construct the canonical Silver DQ check list.
-
-    Imported lazily so `silver_tasks` keeps working in callers that don't
-    have `data_quality` on the path (e.g. unit tests that mock the module).
-    """
-    from utils.data_quality import CHECK
-
-    return [
-        # ---- ERROR: PK NULLs (joins / dedup logic break otherwise) ----
-        CHECK.no_nulls(f'{schema}.fbref_match_enriched',        cols=['match_id', 'date']),
-        # #463: squad — компонент PK профилей (per-(player, squad) grain).
-        CHECK.no_nulls(f'{schema}.fbref_player_season_profile', cols=['player_id', 'squad', 'league', 'season']),
-        CHECK.no_nulls(f'{schema}.fbref_keeper_profile',        cols=['player_id', 'squad', 'league', 'season']),
-        CHECK.no_nulls(f'{schema}.fbref_player_match_stats',    cols=['match_id']),
-        CHECK.no_nulls(f'{schema}.fbref_match_events',          cols=['match_id']),
-        CHECK.no_nulls(f'{schema}.fbref_match_lineups',         cols=['match_id', 'player_id']),
-        CHECK.no_nulls(f'{schema}.fbref_team_season_profile',   cols=['team', 'league', 'season']),
-
-        # ---- ERROR: PK uniqueness (duplicates explode downstream facts) ----
-        CHECK.no_duplicates(f'{schema}.fbref_match_enriched',        pk=['match_id']),
-        # #463: профили per-(player, squad, league, season) — зимний трансфер
-        # внутри лиги даёт 2 строки на игрока-сезон (по одной на клуб).
-        CHECK.no_duplicates(f'{schema}.fbref_player_season_profile', pk=['player_id', 'squad', 'league', 'season']),
-        CHECK.no_duplicates(f'{schema}.fbref_keeper_profile',        pk=['player_id', 'squad', 'league', 'season']),
-        # #463: team в ключе — зеркало дедупа (parse-артефакт «игрок в обеих
-        # командах» теперь не схлопывается молча, а ловится этим чеком).
-        CHECK.no_duplicates(
-            f'{schema}.fbref_match_lineups',
-            pk=['match_id', 'player_id', 'team'],
-            where='player_id IS NOT NULL',
-        ),
-        CHECK.no_duplicates(f'{schema}.fbref_team_season_profile',   pk=['team', 'league', 'season']),
-        CHECK.no_duplicates(
-            f'{schema}.fbref_player_match_stats',
-            pk=['match_id', 'player_id', 'team'],
-            where='player_id IS NOT NULL',
-        ),
-        CHECK.no_duplicates(
-            f'{schema}.fbref_match_events',
-            pk=['match_id', 'minute', 'player_id', 'event_type'],
-            where='player_id IS NOT NULL',
-        ),
-
-        # ---- ERROR: Referential integrity (#258, restored from WARNING #240) ----
-        # Mirrors the canonical DAG _validate_silver_quality: the orphan
-        # match_ids were duplicate alternate-hex scrapes, not lost matches. Root
-        # cause (fragmented hex in bronze.fbref_schedule) fixed upstream
-        # (#241/PR#257) and Bronze fully re-ingested; clean-re-ingest gate
-        # confirmed orphan=0 live (2026-06-03). Restored to ERROR.
-        CHECK.ref_integrity(f'{schema}.fbref_player_match_stats', f'{schema}.fbref_match_enriched', 'match_id', severity='ERROR'),
-        CHECK.ref_integrity(f'{schema}.fbref_match_events',       f'{schema}.fbref_match_enriched', 'match_id', severity='ERROR'),
-        CHECK.ref_integrity(f'{schema}.fbref_match_lineups',      f'{schema}.fbref_match_enriched', 'match_id', severity='ERROR'),
-
-        # ---- WARNING: Freshness (weekly ingest; >48h is normal mid-week) ----
-        CHECK.freshness(f'{schema}.fbref_match_enriched',        ts_col='_bronze_ingested_at',
-                        max_age_hours=_FRESH_HOURS, severity='WARNING'),
-        CHECK.freshness(f'{schema}.fbref_player_season_profile', ts_col='_bronze_ingested_at',
-                        max_age_hours=_FRESH_HOURS, severity='WARNING'),
-        CHECK.freshness(f'{schema}.fbref_keeper_profile',        ts_col='_bronze_ingested_at',
-                        max_age_hours=_FRESH_HOURS, severity='WARNING'),
-        CHECK.freshness(f'{schema}.fbref_player_match_stats',    ts_col='_bronze_ingested_at',
-                        max_age_hours=_FRESH_HOURS, severity='WARNING'),
-        CHECK.freshness(f'{schema}.fbref_match_events',          ts_col='_bronze_ingested_at',
-                        max_age_hours=_FRESH_HOURS, severity='WARNING'),
-        CHECK.freshness(f'{schema}.fbref_match_lineups',         ts_col='_bronze_ingested_at',
-                        max_age_hours=_FRESH_HOURS, severity='WARNING'),
-        CHECK.freshness(f'{schema}.fbref_team_season_profile',   ts_col='_bronze_ingested_at',
-                        max_age_hours=_FRESH_HOURS, severity='WARNING'),
-
-        # ---- WARNING: Value ranges (legitimate outliers possible) ----
-        CHECK.value_range(f'{schema}.fbref_player_season_profile', 'goals',
-                          min_val=0, severity='WARNING'),
-        CHECK.value_range(f'{schema}.fbref_player_season_profile', 'minutes',
-                          min_val=0, max_val=5000, severity='WARNING'),
-        CHECK.value_range(f'{schema}.fbref_keeper_profile', 'save_pct',
-                          min_val=0, max_val=100, severity='WARNING'),
-        CHECK.value_range(f'{schema}.fbref_team_season_profile', 'possession',
-                          min_val=0, max_val=100, severity='WARNING'),
-        CHECK.value_range(f'{schema}.fbref_team_season_profile', 'goals',
-                          min_val=0, severity='WARNING'),
-    ]
-
-
-def validate_silver_quality(
-    checks: Optional[List[Any]] = None,
-    schema: str = 'silver',
-    raise_on_error: bool = True,
-) -> Dict[str, Any]:
-    """Run Silver DQ checks via the universal `data_quality` framework.
-
-    PK NULLs / uniqueness / referential integrity are ERROR severity and
-    raise ``AirflowException`` (or ``RuntimeError`` outside Airflow) on
-    failure. Freshness and value-range violations are WARNING and only logged.
-
-    Args:
-        checks: Override the default check list (must be `Check` instances).
-        schema: Iceberg schema name (default 'silver').
-        raise_on_error: Re-raise on ERROR-severity failures (default True).
-
-    Returns:
-        Dict with `passed`, `total`, `errors`, `warnings`.
-    """
-    from utils.data_quality import run_checks
-
-    if checks is None:
-        checks = _build_silver_checks(schema=schema)
-
-    report = run_checks(checks, raise_on_error=raise_on_error)
-    return {
-        'passed': len(report.passed),
-        'total': len(report.results),
-        'errors': [r.name for r in report.errors],
-        'warnings': [r.name for r in report.warnings],
-    }
 
 
 def _resolve_sql_path(sql_file: str) -> Path:

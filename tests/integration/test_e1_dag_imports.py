@@ -389,13 +389,22 @@ class TestE2DimManagerWiring:
             "should require min_rows > 0"
         )
 
-    def test_gold_tasks_validates_dim_manager_scd2(self):
-        """validate_gold_quality must include scd2_no_overlap for dim_manager."""
+    def test_gold_tasks_validates_fct_manager_stint_scd2(self):
+        """validate_gold_quality must wire scd2_no_overlap to gold.fct_manager_stint.
+
+        The SCD-2 timeline-overlap guard lives on the fct_manager_stint fact
+        (employment history, #429), NOT on dim_manager — dim_manager is a plain
+        per-manager dictionary since #425. Assert the *linkage* (the
+        scd2_no_overlap check targets fct_manager_stint), not merely that both
+        strings appear somewhere in the file.
+        """
         text = self.GOLD_TASKS.read_text(encoding="utf-8")
-        assert "gold.dim_manager" in text, (
-            "validate_gold_quality must reference gold.dim_manager"
+        assert "CHECK.scd2_no_overlap(" in text, (
+            "validate_gold_quality must call CHECK.scd2_no_overlap"
         )
-        assert "scd2_no_overlap" in text, (
-            "validate_gold_quality must call CHECK.scd2_no_overlap for the "
-            "dim_manager timeline integrity guard"
+        idx = text.index("CHECK.scd2_no_overlap(")
+        window = text[idx:idx + 200]
+        assert "'gold.fct_manager_stint'" in window, (
+            "scd2_no_overlap must guard gold.fct_manager_stint (the SCD-2 "
+            "employment-history fact), not another table"
         )

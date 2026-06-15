@@ -1016,26 +1016,6 @@ def get_player_alias(
     return exact if exact is not None else wildcard
 
 
-def get_player_alias_pairs() -> List[Dict[str, str]]:
-    """Return the full list of player alias entries (for tests/diagnostics).
-
-    Each item is a dict with keys ``source, source_id, fbref_player_id,
-    season, reason``. Output is a fresh list — callers may mutate freely.
-    """
-    doc = load_player_aliases()
-    aliases = doc.get('aliases') or []
-    return [
-        {
-            'source': str(e['source']),
-            'source_id': str(e['source_id']),
-            'fbref_player_id': str(e['fbref_player_id']),
-            'season': str(e['season']),
-            'reason': str(e.get('reason', '')),
-        }
-        for e in aliases
-    ]
-
-
 # ---------------------------------------------------------------------------
 # Competitions — query helpers
 # ---------------------------------------------------------------------------

@@ -102,17 +102,6 @@ def telegram_on_failure(context: Dict[str, Any]) -> None:
         logger.warning(f"telegram_on_failure swallowed: {e}")
 
 
-def telegram_on_success(context: Dict[str, Any]) -> None:
-    """Optional on_success_callback for critical DAGs (e.g. master pipeline)."""
-    try:
-        ti = context.get('task_instance') or context.get('ti')
-        dag_id = getattr(ti, 'dag_id', '?')
-        env = _get_var('ALERT_ENV', 'dev')
-        _send_telegram(f"<b>[{env}] {dag_id}</b> ✅ success")
-    except Exception as e:
-        logger.warning(f"telegram_on_success swallowed: {e}")
-
-
 def send_telegram_message(message: str, level: str = "info") -> bool:
     """Send an arbitrary message to Telegram (no Airflow context required).
 
