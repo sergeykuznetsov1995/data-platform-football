@@ -199,21 +199,6 @@ class FBrefBrowserMixin:
                 f"xvfb={xvfb_running}, "
                 f"cloudflare_wait={self.nodriver_cloudflare_wait}s)"
             )
-
-            # Reuse previously exported CF cookies to skip CF challenge after
-            # a restart on the same proxy. Safe because proxy/UA are unchanged
-            # (cf_clearance is bound to IP + UA).
-            cached = getattr(self, '_cached_cf_cookies', None)
-            if cached:
-                try:
-                    n = self._nodriver_browser.inject_cookies_sync(cached)
-                    if n:
-                        logger.info(
-                            f"Reused {n} cached CF cookies across restart "
-                            f"(saves ~1-2 MB of proxy traffic per restart)"
-                        )
-                except Exception as e:
-                    logger.debug(f"CF cookie reuse failed (will re-solve): {e}")
         return self._nodriver_browser
 
     def _get_browser(self) -> CloudflareBypass:
@@ -948,22 +933,6 @@ class FBrefBrowserMixin:
 
         # Close nodriver browser (Xvfb is managed separately)
         if self._nodriver_browser is not None:
-            # Cache CF cookies for next restart (same-proxy reuse avoids
-            # re-solving CF Turnstile, saving 1-2 MB of proxy traffic).
-            # Only meaningful when proxy/UA stay the same (reset_http=False).
-            if not reset_http:
-                try:
-                    cookies = self._nodriver_browser.export_cf_cookies_sync()
-                    if cookies:
-                        self._cached_cf_cookies = cookies
-                        logger.info(
-                            f"Cached {len(cookies)} CF cookies for next restart"
-                        )
-                except Exception as e:
-                    logger.debug(f"Could not cache CF cookies: {e}")
-            else:
-                self._cached_cf_cookies = None
-
             # Flush session traffic stats to persistent base BEFORE closing
             # (nodriver browser counters reset on restart).
             try:
