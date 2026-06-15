@@ -12,13 +12,8 @@ Advantages over undetected-chromedriver:
 - Actively maintained
 
 Usage:
-    # Async usage
     async with NodriverBypass(headless=True) as browser:
         html = await browser.get("https://fbref.com")
-
-    # Sync wrapper for compatibility
-    bypass = NodriverBypass(headless=True)
-    html = bypass.get_sync("https://fbref.com")
 
 Requirements:
     - Python 3.9+
@@ -1401,7 +1396,7 @@ class NodriverBypass:
         """Get existing event loop or create a new one.
 
         Caches the loop on self._loop. Without caching, each sync entry point
-        (get_page, get_sync, _extract_cookies_from_nodriver, ...) created a
+        (get_page, _extract_cookies_from_nodriver, ...) created a
         fresh loop via new_event_loop(); the nodriver Connection._listener
         task created on the FIRST loop got orphaned on subsequent calls, so
         Connection.send awaited a future no one resolved → 5–30s timeouts
@@ -1461,34 +1456,6 @@ class NodriverBypass:
         gc.collect()
         gc.collect()
         logger.info("Browser restarted (will reconnect on next request)")
-
-    def get_sync(self, url: str, wait_for_cloudflare: bool = True) -> str:
-        """
-        Synchronous wrapper for get() - for compatibility with existing code.
-
-        Opens browser, navigates to URL, gets HTML, and closes browser.
-
-        Args:
-            url: URL to navigate to
-            wait_for_cloudflare: Whether to wait for Cloudflare challenge
-
-        Returns:
-            Page HTML content
-        """
-        loop = self._get_or_create_loop()
-        return loop.run_until_complete(
-            self._get_with_lifecycle(url, wait_for_cloudflare)
-        )
-
-    async def _get_with_lifecycle(
-        self, url: str, wait_for_cloudflare: bool = True
-    ) -> str:
-        """Get page with automatic browser lifecycle management."""
-        await self.start()
-        try:
-            return await self.get(url, wait_for_cloudflare)
-        finally:
-            await self.close()
 
     def get_page(
         self,

@@ -94,14 +94,6 @@ class IcebergWriter:
             logger.warning(f"Could not check namespace existence: {e}")
             return False
 
-    def create_namespace(self, database: str) -> None:
-        """Create namespace if it doesn't exist."""
-        try:
-            trino = self._get_trino_manager()
-            trino.create_schema(database)
-        except Exception as e:
-            logger.warning(f"Could not create namespace: {e}")
-
     def table_exists(self, database: str, table: str) -> bool:
         """Check if Iceberg table exists.
 

@@ -312,74 +312,6 @@ class CloudflareBypass:
         """Execute JavaScript and return result."""
         return self.driver.execute_script(script)
 
-    def get_json_from_script(
-        self,
-        variable_name: str
-    ) -> Optional[Dict[str, Any]]:
-        """
-        Extract JSON data from JavaScript variable.
-
-        Args:
-            variable_name: JavaScript variable name (e.g., '__INITIAL_STATE__')
-
-        Returns:
-            Parsed JSON data or None
-        """
-        try:
-            import json
-            script = f"return JSON.stringify(window.{variable_name})"
-            result = self.execute_script(script)
-
-            if result:
-                return json.loads(result)
-        except Exception as e:
-            logger.error(f"Error extracting {variable_name}: {e}")
-
-        return None
-
-    def click_element(
-        self,
-        selector: str,
-        by: str = 'css',
-        wait: bool = True
-    ) -> None:
-        """Click on element."""
-        by_map = {
-            'css': By.CSS_SELECTOR,
-            'xpath': By.XPATH,
-            'id': By.ID,
-        }
-
-        locator = by_map.get(by, By.CSS_SELECTOR)
-
-        if wait:
-            element = WebDriverWait(self.driver, 10).until(
-                EC.element_to_be_clickable((locator, selector))
-            )
-        else:
-            element = self.driver.find_element(locator, selector)
-
-        element.click()
-
-    def scroll_to_bottom(self, pause_time: float = 1.0) -> None:
-        """Scroll to bottom of page (for infinite scroll)."""
-        last_height = self.driver.execute_script(
-            "return document.body.scrollHeight"
-        )
-
-        while True:
-            self.driver.execute_script(
-                "window.scrollTo(0, document.body.scrollHeight);"
-            )
-            time.sleep(pause_time)
-
-            new_height = self.driver.execute_script(
-                "return document.body.scrollHeight"
-            )
-            if new_height == last_height:
-                break
-            last_height = new_height
-
     def get_cookies(self) -> List[Dict[str, Any]]:
         """Get all cookies."""
         return self.driver.get_cookies()
@@ -387,10 +319,6 @@ class CloudflareBypass:
     def add_cookie(self, cookie: Dict[str, Any]) -> None:
         """Add cookie to browser."""
         self.driver.add_cookie(cookie)
-
-    def take_screenshot(self, filename: str) -> None:
-        """Save screenshot to file."""
-        self.driver.save_screenshot(filename)
 
     @property
     def current_url(self) -> str:

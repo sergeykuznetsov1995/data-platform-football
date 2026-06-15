@@ -661,33 +661,6 @@ WITH (
         self._execute(sql)
         logger.info(f"Dropped table: {self.catalog}.{schema}.{table}")
 
-    def sync_partitions(self, schema: str, table: str) -> None:
-        """
-        Sync partitions from storage (calls Hive MSCK REPAIR).
-
-        Note: Trino doesn't have direct MSCK REPAIR, but we can use
-        CALL system.sync_partition_metadata for Hive tables.
-
-        Args:
-            schema: Schema name
-            table: Table name
-        """
-        validate_identifier(schema, "schema")
-        validate_identifier(table, "table")
-        # For Hive connector, we use sync_partition_metadata procedure
-        sql = f"""CALL {self.catalog}.system.sync_partition_metadata(
-    schema_name => '{schema}',
-    table_name => '{table}',
-    mode => 'ADD'
-)"""
-
-        try:
-            self._execute(sql)
-            logger.info(f"Synced partitions for {self.catalog}.{schema}.{table}")
-        except TrinoError as e:
-            # Procedure might not exist or table not partitioned
-            logger.warning(f"Could not sync partitions: {e}")
-
     def add_column(self, schema: str, table: str, column: str, column_type: str) -> None:
         """
         Add a column to an existing Iceberg table.
