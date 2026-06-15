@@ -206,3 +206,35 @@ class TestFallbackPath:
         scraper.save_to_iceberg.assert_not_called()
         results = _load_results(temp_output)
         assert results['fallback'] is True
+
+
+# ---------------------------------------------------------------------------
+# argparse hard-fail (#512)
+# ---------------------------------------------------------------------------
+
+class TestArgparseHardFail:
+    """A CLI parse error must exit 1 (hard failure), NOT argparse's default 2.
+
+    Exit 2 is the ``TM_FALLBACK`` soft-success code the DAG bash wrapper maps
+    to ``exit 0`` — so a flag typo at exit 2 would silently no-op the task.
+    """
+
+    def test_unknown_flag_returns_1_not_2(self, temp_output):
+        scraper = _build_scraper(df=_players_df(3), existing_players=3)
+        rc = _run_main(
+            ['--entity', 'players', '--bogus-flag', 'x', '--output', temp_output],
+            scraper,
+        )
+        assert rc == 1
+        scraper.read_players.assert_not_called()
+        scraper.save_to_iceberg.assert_not_called()
+
+    def test_bad_typed_season_returns_1(self, temp_output):
+        # --season is type=int; a non-int must hard-fail, not soft-fallback.
+        scraper = _build_scraper(df=_players_df(3), existing_players=3)
+        rc = _run_main(
+            ['--entity', 'players', '--season', 'notanumber', '--output', temp_output],
+            scraper,
+        )
+        assert rc == 1
+        scraper.read_players.assert_not_called()

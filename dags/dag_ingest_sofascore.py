@@ -342,6 +342,7 @@ with DAG(
         task_id='scrape_sofascore_data',
         bash_command=f"""
 cd /opt/airflow && \\
+rm -f {SCHEDULE_RESULT_PATH} && \\
 python dags/scripts/run_sofascore_scraper.py \\
     --leagues "{leagues_str}" \\
     --season {CURRENT_SEASON} \\
@@ -362,6 +363,7 @@ python dags/scripts/run_sofascore_scraper.py \\
         task_id='scrape_player_ratings',
         bash_command=f"""
 cd /opt/airflow && \\
+rm -f {PLAYER_RATINGS_RESULT_PATH} && \\
 python dags/scripts/run_sofascore_scraper.py \\
     --entity player_ratings \\
     --league "{LEAGUES[0]}" \\
@@ -389,6 +391,7 @@ exit $rc
         task_id='scrape_shotmap',
         bash_command=f"""
 cd /opt/airflow && \\
+rm -f {SHOTMAP_RESULT_PATH} && \\
 python dags/scripts/run_sofascore_scraper.py \\
     --entity shotmap \\
     --league "{LEAGUES[0]}" \\
@@ -417,6 +420,7 @@ exit $rc
         task_id='scrape_match_stats',
         bash_command=f"""
 cd /opt/airflow && \\
+rm -f {MATCH_STATS_RESULT_PATH} && \\
 python dags/scripts/run_sofascore_scraper.py \\
     --entity match_stats \\
     --league "{LEAGUES[0]}" \\
@@ -445,6 +449,7 @@ exit $rc
         task_id='scrape_player_season_stats',
         bash_command=f"""
 cd /opt/airflow && \\
+rm -f {PLAYER_SEASON_STATS_RESULT_PATH} && \\
 python dags/scripts/run_sofascore_scraper.py \\
     --entity player_season_stats \\
     --league "{LEAGUES[0]}" \\
@@ -472,6 +477,7 @@ exit $rc
         task_id='scrape_player_profile',
         bash_command=f"""
 cd /opt/airflow && \\
+rm -f {PLAYER_PROFILE_RESULT_PATH} && \\
 python dags/scripts/run_sofascore_scraper.py \\
     --entity player_profile \\
     --league "{LEAGUES[0]}" \\
@@ -501,6 +507,7 @@ exit $rc
         task_id='scrape_event_player_stats',
         bash_command=f"""
 cd /opt/airflow && \\
+rm -f {EVENT_PLAYER_STATS_RESULT_PATH} && \\
 python dags/scripts/run_sofascore_scraper.py \\
     --entity event_player_stats \\
     --league "{LEAGUES[0]}" \\

@@ -20,7 +20,9 @@ Supported entities:
 
 Exit codes:
     0 — scrape completed successfully (>= 1 row written, or ``--dry-run``)
-    1 — hard failure (exception raised, runner crashed)
+    1 — hard failure (exception raised, runner crashed; or a CLI parse error
+        — unknown/typo'd flag, invalid value — #512, kept off exit 2 so the
+        DAG wrapper does not mistake it for a TM_FALLBACK soft-success)
     2 — graceful ``TM_FALLBACK``: upstream endpoint unavailable (HTTP 403,
         proxy quota empty, repeated timeouts), or the bronze players table
         is missing/empty when a dependent entity ran. DataFrame is empty,
@@ -50,6 +52,22 @@ logging.basicConfig(
     datefmt='%Y-%m-%d %H:%M:%S',
 )
 logger = logging.getLogger(__name__)
+
+
+class _ArgparseError(Exception):
+    """Raised by _StrictArgumentParser.error so main() returns exit 1."""
+
+
+class _StrictArgumentParser(argparse.ArgumentParser):
+    """argparse exits 2 on a CLI parse error (bad/unknown flag, wrong type).
+    The DAG bash wrapper maps exit 2 to TM_FALLBACK soft-success, so a flag
+    typo would silently no-op the task (#512). Funnel every parse error
+    through a catchable exception → main() returns hard-failure exit 1.
+    """
+
+    def error(self, message):
+        self.print_usage(sys.stderr)
+        raise _ArgparseError(message)
 
 
 ENTITY_PLAYERS = 'players'
@@ -420,7 +438,7 @@ def _run_transfers(
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description='Run Transfermarkt Bronze scraper')
+    parser = _StrictArgumentParser(description='Run Transfermarkt Bronze scraper')
     parser.add_argument(
         '--entity',
         type=str,
@@ -462,7 +480,11 @@ def main() -> int:
         help='Bypass the completeness guard and replace the partition '
              'unconditionally (operator recovery, never used by the DAG)',
     )
-    args = parser.parse_args()
+    try:
+        args = parser.parse_args()
+    except _ArgparseError as exc:
+        logger.error("Invalid CLI arguments: %s — failing hard (not TM_FALLBACK)", exc)
+        return 1
 
     entity = args.entity.lower()
     if entity not in VALID_ENTITIES:

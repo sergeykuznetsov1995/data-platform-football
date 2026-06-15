@@ -33,7 +33,9 @@ Supported entities:
 
 Exit codes:
     0 — scrape completed successfully (>= 1 row written)
-    1 — hard failure (exception raised, runner crashed)
+    1 — hard failure (exception raised, runner crashed; or a CLI parse error
+        — unknown/typo'd flag, invalid value — #512, kept off exit 2 so the
+        DAG wrapper does not mistake it for a fallback soft-success)
     2 — graceful R0.2B_FALLBACK: lineups endpoint unavailable
         (HTTP 403 / proxy quota empty / repeated timeouts).
         DataFrame is empty, nothing written to bronze. The Gold-layer
@@ -57,6 +59,22 @@ logging.basicConfig(
     datefmt='%Y-%m-%d %H:%M:%S',
 )
 logger = logging.getLogger(__name__)
+
+
+class _ArgparseError(Exception):
+    """Raised by _StrictArgumentParser.error so main() returns exit 1."""
+
+
+class _StrictArgumentParser(argparse.ArgumentParser):
+    """argparse exits 2 on a CLI parse error (bad/unknown flag, wrong type).
+    The DAG bash wrapper maps exit 2 to a SofaScore fallback soft-success, so
+    a flag typo would silently no-op the task (#512). Funnel every parse error
+    through a catchable exception → main() returns hard-failure exit 1.
+    """
+
+    def error(self, message):
+        self.print_usage(sys.stderr)
+        raise _ArgparseError(message)
 
 
 # Entities runnable from this script. Kept as constants so we can wire
@@ -862,7 +880,7 @@ def _run_legacy(
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Run SofaScore scraper')
+    parser = _StrictArgumentParser(description='Run SofaScore scraper')
     parser.add_argument(
         '--entity',
         type=str,
@@ -904,7 +922,11 @@ def main():
         default='/tmp/sofascore_result.json',
         help='Output file for results',
     )
-    args = parser.parse_args()
+    try:
+        args = parser.parse_args()
+    except _ArgparseError as exc:
+        logger.error("Invalid CLI arguments: %s — failing hard (not a fallback)", exc)
+        return 1
 
     if args.league:
         leagues = [args.league]
