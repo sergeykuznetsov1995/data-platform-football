@@ -18,7 +18,7 @@
 7. **Top-3 followup'а** (детальные числа в Section 6):
    1. ~~`resource_type=Other` на 100%~~ — **RESOLVED** PR #125 (issue #116), см. §6.1.
    2. ~~Полный baseline run отсутствует~~ — **CLOSED** этим документом (issue #117), §2bis/§2ter ниже.
-   3. **CF cookie inter-process reuse** — `prewarm_cf_cookies` task disabled (`CF_COOKIE_PREWARM=False`), file-based кэш `/tmp/fbref_cf_cookies.json` отсутствует. Каждая из 12 задач в DAG'е сейчас делает свой CF challenge при cold-start (~12 × 1-2 MB = 15-25 MB только на warm-up). Issue #118 open.
+   3. ~~**CF cookie inter-process reuse** — `prewarm_cf_cookies` task + file-based кэш `/tmp/fbref_cf_cookies.json`.~~ — **СНЯТО / SUPERSEDED.** Issue #118 закрыт **not-planned** (live-disproven 2026-06-14): pre-warmed `cf_clearance` НЕ пропускает CF Turnstile у FBref — CF привязывает clearance к полному fingerprint браузер-сессии, prewarm-браузер ≠ scraper-браузер. Вся инфра удалена в **#581 (PR #587)**; гипотеза экономии 15-25 MB для FBref неверна.
    4. **NEW: telemetry gap на `scrapers.nodriver_fbref` path** — counters не подключены к production single-stat/schedule wrapper. Issue [#131](https://github.com/sergeykuznetsov1995/data-platform-football/issues/131), см. §6.4.
 
 ## 1. What was missing before this audit
@@ -196,7 +196,10 @@ docker compose exec -T airflow-webserver airflow dags trigger dag_ingest_fbref
 
 ## 4. Decisions
 
-### 4.1 `CF_COOKIE_PREWARM` — **возвращаем `True`** после fix §6.1
+### 4.1 ~~`CF_COOKIE_PREWARM` — **возвращаем `True`** после fix §6.1~~ → **СНЯТО / SUPERSEDED**
+
+> ⚠️ **Решение отменено (2026-06-15).** Issue #118 закрыт **not-planned**: live-проверка (2026-06-14) показала, что pre-warmed `cf_clearance` НЕ пропускает CF Turnstile у FBref — CF привязывает clearance к полному fingerprint браузер-сессии (TLS/JS/window), prewarm-браузер ≠ scraper-браузер → challenge переотдаётся независимо. Ожидаемая экономия 15-25 MB не подтвердилась. Вся file-based prewarm-инфра удалена в **#581 (PR #587)**. Абзац ниже — историческая гипотеза, **неактуален**.
+
 Сейчас disabled. Без него каждая из 11 traffic-heavy задач делает cold-start CF challenge. С prewarm + file-based persistence в `/tmp/fbref_cf_cookies.json` cookies переиспользуются между процессами (`concurrency=1`, последовательные таски). Ожидаемая экономия: **~15-25 MB на DAG run** (10 stat-tasks × 1-2 MB + 1 schedule + 1 match_all_data за вычетом одного теплового warm-up).
 
 ### 4.2 Расширение `traffic_guard` на остальные таски — **сделано**
@@ -215,7 +218,7 @@ DAG теперь содержит:
 - [⚠] **Разбивка реального трафика по этапам и типам ресурсов** — per-task ✓, per-resource-type **частично** (bug §6.1 → followup).
 - [x] **Топ-3 источника overhead'а с количественной оценкой** — §6 (предварительные, нуждаются в full baseline).
 - [x] **Список конкретных fix'ов (PR-ready тикеты)** — §6, открыты через `gh issue create` в Phase 4.
-- [x] **Решение по `CF_COOKIE_PREWARM`** — §4.1.
+- [x] **Решение по `CF_COOKIE_PREWARM`** — §4.1 (⚠️ позже отменено: #118 not-planned, инфра удалена в #581).
 - [x] **Решение по расширению `traffic_guard` на остальные таски** — §4.2 (сделано в коде).
 
 ## 5. How to consume the new instrumentation
@@ -271,8 +274,10 @@ airflow variables set fbref_proxy_mb_threshold_match_all_data 300
 - Hypothesis 2 / 6 (restart-induced CF re-challenges) — **не активированы** (0 restart'ов в обоих runs).
 **Headline new finding:** instrumentation gap (§6.4) — без него full-fresh production-pattern измерение невозможно.
 
-### 6.3 `CF_COOKIE_PREWARM=True` + file-based inter-process cookie cache
-**Severity:** P2 · **Issue #118** (open)
+### 6.3 ~~`CF_COOKIE_PREWARM=True` + file-based inter-process cookie cache~~ — **СНЯТО / SUPERSEDED**
+**Severity:** P2 · **Issue #118** — **CLOSED not-planned** (2026-06-14, live-disproven); инфра удалена в **#581 (PR #587)**
+
+> ⚠️ **Не реализуемо для FBref:** pre-warmed `cf_clearance` не пропускает CF (clearance привязан к полному fingerprint браузер-сессии; prewarm-браузер ≠ scraper-браузер). План ниже — историческая гипотеза.
 **Where:** `dags/dag_ingest_fbref.py:123` (`CF_COOKIE_PREWARM = False`), `scrapers/base/browser/cf_cookie_manager.py` (в памяти TTL-кэш — не survives subprocess).
 **Plan:** `prewarm_cf_cookies` пишет `/tmp/fbref_cf_cookies.json` (JSON: cookies + extracted_at + proxy_id). Каждая stat-task / match-task передаёт path через CLI `--cf-cookies-file`. `FBrefBrowserMixin._get_nodriver_browser` подгружает cookies в новый NodriverBypass через `inject_cookies_sync()` ПЕРЕД первой `get()` → нет CF challenge на cold-start.
 **Constraint:** cookies bound to `(IP, UA)` → reuse работает только если proxy ID consistent. Можно солтить файл `/tmp/fbref_cf_cookies_<proxy_idx>.json`.
@@ -296,6 +301,6 @@ airflow variables set fbref_proxy_mb_threshold_match_all_data 300
 
 - **#116** — `fix(fbref): NodriverBypass resource_type detection — all CDP requests fall into 'Other' bucket` (P1) — **CLOSED** via PR #125 (2026-05-28)
 - **#117** — `research(fbref): full APL baseline run after resource_type fix — quantify CF amplification` (P1, blocked by #116) — **CLOSED** by this update (2026-05-28)
-- **#118** — `feat(fbref): CF_COOKIE_PREWARM=True + file-based inter-process cookie cache` (P2) — open
+- **#118** — `feat(fbref): CF_COOKIE_PREWARM=True + file-based inter-process cookie cache` (P2) — **CLOSED not-planned** (2026-06-14, live-disproven); инфра удалена в #581 (PR #587)
 - **#124** — `feat(audit): instrument curl_cffi HTTP fast-path for resource_type breakdown` (P3) — **CLOSED** (probe §2bis verifies `http_mb_by_resource_type={"Document": 1.719}`)
 - **#131** — `fix(fbref): telemetry counters not wired to scrapers.nodriver_fbref production path` (P1) — open, surfaced by §6.4 / #117 production DAG run

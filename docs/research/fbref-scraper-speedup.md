@@ -184,8 +184,8 @@ state (см. Next steps).
   (см. [feedback_scraperfc_sofascore_blocked](../../memory/feedback_scraperfc_sofascore_blocked.md)).
   Решение: оценить только cherry-pick парсеров в follow-up issue.
 - **D. Tuning констант** (`MAX_SLOW_PROXY_RETRIES`, `MAX_CONSECUTIVE_FAILURES`,
-  `time.sleep(0.5)`, CF_COOKIE_PREWARM) — отдельные мелкие PR'ы, follow-up
-  issue.
+  `time.sleep(0.5)`) — отдельные мелкие PR'ы, follow-up
+  issue. (~~CF_COOKIE_PREWARM~~ убран: инфра удалена в #581, #118 not-planned.)
 
 ## Bench A vs baseline (10 матчей APL 2025/26, 2026-05-23)
 
@@ -329,8 +329,8 @@ JSON-парсинге. Patch необходим (закрывает изнача
   (см. [feedback_scraperfc_sofascore_blocked](../../memory/feedback_scraperfc_sofascore_blocked.md)).
   Решение: оценить только cherry-pick парсеров в follow-up issue.
 - **D. Tuning констант** (`MAX_SLOW_PROXY_RETRIES`, `MAX_CONSECUTIVE_FAILURES`,
-  `time.sleep(0.5)`, CF_COOKIE_PREWARM) — отдельные мелкие PR'ы, follow-up
-  issue.
+  `time.sleep(0.5)`) — отдельные мелкие PR'ы, follow-up
+  issue. (~~CF_COOKIE_PREWARM~~ убран: инфра удалена в #581, #118 not-planned.)
 
 ## Next steps
 
