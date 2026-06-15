@@ -4,7 +4,7 @@
 --
 -- One row per (match_id, team_id, league, season) — WhoScored event counters
 -- rolled up to the team grain from `silver.whoscored_events_spadl`
--- (SPADL-canonical, 24-value action enum + outcome_success boolean).
+-- (SPADL-canonical, 25-value action enum + outcome_success boolean).
 --
 -- Feeds Gold `fct_team_match` v2 (#95) — see
 -- docs/decisions/T6_team_facts_schema.md §6.2 (UNIQUE_WHOSCORED block).
@@ -23,11 +23,12 @@
 --   * `match_id` is raw game_id varchar; xref_match resolution happens in
 --     Gold (#95) via silver.xref_match. See ADR in dag_transform_e3.py.
 --   * Cards (yellow/red) NOT aggregated here — SPADL collapses Card events
---     into 'unknown' (not one of the 24 canonical actions). Gold COALESCEs
+--     into 'unknown' (not one of the 25 canonical actions). Gold COALESCEs
 --     from FBref + SofaScore.
 --   * shots_total / shots_on_target_proxy count all shot variants ('shot' +
---     'shot_penalty' + 'shot_freekick'), incl. goals (Goal→shot family, #462),
---     matching whoscored_player_match_aggregate.shots. shots_on_target_proxy
+--     'shot_penalty' + 'shot_freekick'), incl. scored goals (Goal→shot family,
+--     #462) but EXCLUDING own-goals (Goal+OwnGoal qualifier → 'own_goal' in
+--     SPADL, #572), matching whoscored_player_match_aggregate.shots. shots_on_target_proxy
 --     stays a coarse proxy: WhoScored marks MissedShots outcome_type=
 --     'Successful', so it over-counts off-target attempts. fct_shot is the
 --     source of truth for actual goals / true on-target.
