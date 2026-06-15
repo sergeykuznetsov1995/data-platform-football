@@ -73,6 +73,23 @@
         "to": "timestamp(6)"
       }
     },
+    "bronze.clubelo_ratings_historical": {
+      "columns": {
+        "_batch_id": "varchar",
+        "_entity_type": "varchar",
+        "_ingested_at": "timestamp(6)",
+        "_source": "varchar",
+        "country": "varchar",
+        "elo": "double",
+        "from": "timestamp(6)",
+        "league": "varchar",
+        "level": "bigint",
+        "rank": "double",
+        "rating_date": "varchar",
+        "team": "varchar",
+        "to": "timestamp(6)"
+      }
+    },
     "bronze.espn_lineup": {
       "columns": {
         "_batch_id": "varchar",

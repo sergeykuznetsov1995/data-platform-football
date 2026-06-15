@@ -309,6 +309,18 @@ class TestXrefTeamRendered:
             "expected canonical 'Wolverhampton Wanderers' in VALUES"
         )
 
+    def test_render_includes_clubelo_forest_alias(self, rendered: str):
+        """#589: ClubElo short name 'Forest' must map to Nottingham Forest.
+
+        ClubElo emits the bare short name 'Forest' for Nottingham Forest;
+        before #589 only 'NottinghamForest' was aliased, so 'Forest' fell to an
+        orphan 'ce_forest' row. The alias pair must now be embedded in the
+        rendered VALUES so the normalised JOIN resolves it to nottingham_forest.
+        """
+        assert "'Forest', 'Nottingham Forest', 'nottingham_forest'" in rendered, (
+            "expected ClubElo alias 'Forest' -> nottingham_forest in VALUES"
+        )
+
     def test_render_references_expected_bronze_tables(self, rendered: str):
         """Rendered SQL reads the documented Bronze sources by table name."""
         rendered_lower = rendered.lower()
@@ -319,6 +331,7 @@ class TestXrefTeamRendered:
             "iceberg.bronze.fbref_match_events",
             "iceberg.bronze.matchhistory_results",
             "iceberg.bronze.clubelo_ratings",
+            "iceberg.bronze.clubelo_ratings_historical",  # #589: relegated APL teams
             "iceberg.bronze.transfermarkt_players",
             "iceberg.bronze.capology_player_salaries",
         ]:

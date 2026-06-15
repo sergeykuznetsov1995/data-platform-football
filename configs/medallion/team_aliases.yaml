@@ -181,7 +181,7 @@ teams:
       understat: ["Nottingham Forest"]
       sofascore: ["Nottingham Forest"]
       matchhistory: ["Nott'm Forest"]
-      clubelo: ["NottinghamForest"]
+      clubelo: ["NottinghamForest", "Forest"]   # #589: ClubElo also emits the bare short name
       fotmob: ["Nott'm Forest"]
       espn: ["Nottingham Forest"]
       whoscored: ["Nottingham Forest"]
