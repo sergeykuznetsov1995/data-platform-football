@@ -39,13 +39,13 @@ per-item/per-season HTTP.
 | `fotmob_team_leaderboards` | FREE (shared `/api/data/leagues`) | OK | (b) future | [#600] |
 | `fotmob_transfers` | CHEAP (1 HTTP) | OK | (b) future | [#600] |
 | `sofifa_teams` | EXPENSIVE (N HTTP) | OK | (b) future | [#601] |
-| `sofifa_team_ratings` | CHEAP | ⚠ 15 cols 100% NULL (upstream) | (b) future | [#601] |
+| `sofifa_team_ratings` | CHEAP | ⚠ 15 cols 100% NULL (upstream; live-confirmed 2026-06-16) | (b) future | [#601] |
 | `sofifa_leagues` | CHEAP | OK (reference) | (b) future | [#601] |
 | `sofifa_versions` | CHEAP | OK (reference) | (b) future | [#601] |
 | `sofascore_event_shotmap` | EXPENSIVE (~380/season) | OK | (b) future | [#602] |
-| `fbref_keeper_keeper_adv` | EXPENSIVE (separate `/keepersadv/` page + CF bypass ~9.67s) | ⚠ 23 advanced cols 100% NULL (FBref Feb-2026); core dups `keeper` | **(c) stop** | [#606] |
-| `whoscored_season_stages` | FREE (same session as `scrape_schedule`, soccerdata cache) | ⚠ `stage` all-NULL | (b) keep | — (§3) |
-| `clubelo_team_history` | MODERATE (per-team histories) | no `rank`/`league` | **(c) stop** | [#604] |
+| `fbref_keeper_keeper_adv` | EXPENSIVE (separate `/keepersadv/` page + CF bypass ~9.67s) | ⚠ 26 cols 100% NULL live (incl. 23 advanced GK, FBref Feb-2026); core dups `keeper` | **(c) stop** | [#606] |
+| `whoscored_season_stages` | FREE (same session as `scrape_schedule`, soccerdata cache) | ⚠ `stage` all-NULL; 6 rows | (b) keep | — (§3) |
+| `clubelo_team_history` | MODERATE (per-team histories) | no `rank`/`league`; **219,861 rows** (largest unread) | **(c) stop** | [#604] |
 
 ### Resolved since the 2026-06-11 inventory
 
@@ -118,6 +118,7 @@ documented here; no tracking issue (avoids p3 issue-spam):
 |---|---|---|
 | 2026-06-15 | Register created; 2026-06-11 inventory re-verified (15 live, not 16 — `clubelo_ratings_historical` now CONSUMED); per-table verdicts + tracking issues [#600]–[#604] filed. | #476 |
 | 2026-06-15 | Correction after line-level re-check: `fbref_keeper_keeper_adv` is a **separate** FBref scrape (not a `keeper` by-product), re-classified (b) keep → **(c) stop**, issue [#606] filed; NULL counts (keeper_adv 23, sofifa_team_ratings 15) confirmed against `audit_bronze_columns.py` comments. | #476 |
+| 2026-06-16 | Live `audit_bronze_columns.py` run: confirmed `sofifa_team_ratings`=15 and `fbref_keeper_keeper_adv`=26 cols 100% NULL, all 15 tables non-empty with 0 ERROR, `clubelo_team_history`=219,861 rows (largest unread). Cost/NULL notes refined. | #476 |
 
 [#476]: https://github.com/sergeykuznetsov1995/data-platform-football/issues/476
 [#600]: https://github.com/sergeykuznetsov1995/data-platform-football/issues/600
