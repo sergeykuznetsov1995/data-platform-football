@@ -204,6 +204,7 @@ with DAG(
         task_id='scrape_players',
         bash_command=f"""
 cd /opt/airflow && \\
+rm -f {PLAYERS_RESULT_PATH} && \\
 python dags/scripts/run_transfermarkt_scraper.py \\
     --entity players \\
     --league "{league}" \\
@@ -228,6 +229,7 @@ exit $rc
         task_id='scrape_market_value_history',
         bash_command=f"""
 cd /opt/airflow && \\
+rm -f {MV_HISTORY_RESULT_PATH} && \\
 python dags/scripts/run_transfermarkt_scraper.py \\
     --entity market_value_history \\
     --league "{league}" \\
@@ -253,6 +255,7 @@ exit $rc
         task_id='scrape_transfers',
         bash_command=f"""
 cd /opt/airflow && \\
+rm -f {TRANSFERS_RESULT_PATH} && \\
 python dags/scripts/run_transfermarkt_scraper.py \\
     --entity transfers \\
     --league "{league}" \\

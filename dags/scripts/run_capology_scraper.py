@@ -12,7 +12,9 @@ MVP currency scope: GBP only (issue #43). EUR/USD lift is a separate issue.
 
 Exit codes:
     0 — scrape completed successfully (>= 1 row written)
-    1 — hard failure (exception raised)
+    1 — hard failure (exception raised; or a CLI parse error — unknown/typo'd
+        flag, invalid value — #512, kept off exit 2 so the DAG wrapper does
+        not mistake it for a CAPOLOGY_FALLBACK soft-success)
     2 — graceful CAPOLOGY_FALLBACK: HTML fetch failed (CF block / 5xx) or
         the inline ``var data`` array couldn't be sliced. DataFrame empty,
         nothing written; DAG wraps exit 2 → exit 0 for validate_data.
@@ -36,6 +38,22 @@ logging.basicConfig(
     datefmt='%Y-%m-%d %H:%M:%S',
 )
 logger = logging.getLogger(__name__)
+
+
+class _ArgparseError(Exception):
+    """Raised by _StrictArgumentParser.error so main() returns exit 1."""
+
+
+class _StrictArgumentParser(argparse.ArgumentParser):
+    """argparse exits 2 on a CLI parse error (bad/unknown flag, wrong type).
+    The DAG bash wrapper maps exit 2 to CAPOLOGY_FALLBACK soft-success, so a
+    flag typo would silently no-op the task (#512). Funnel every parse error
+    through a catchable exception → main() returns hard-failure exit 1.
+    """
+
+    def error(self, message):
+        self.print_usage(sys.stderr)
+        raise _ArgparseError(message)
 
 
 ENTITY_PLAYER_SALARIES = 'player_salaries'
@@ -232,7 +250,7 @@ def _run_product(
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description='Run Capology Bronze scraper')
+    parser = _StrictArgumentParser(description='Run Capology Bronze scraper')
     parser.add_argument(
         '--entity', type=str, default=ENTITY_PLAYER_SALARIES,
         help=f"Entity to scrape. One of: {sorted(VALID_ENTITIES)}",
@@ -258,7 +276,11 @@ def main() -> int:
         default='/tmp/capology_result.json',
         help='Output JSON file path',
     )
-    args = parser.parse_args()
+    try:
+        args = parser.parse_args()
+    except _ArgparseError as exc:
+        logger.error("Invalid CLI arguments: %s — failing hard (not CAPOLOGY_FALLBACK)", exc)
+        return 1
 
     entity = args.entity.lower()
     if entity not in VALID_ENTITIES:

@@ -147,6 +147,7 @@ with DAG(
         task_id='scrape_player_salaries',
         bash_command=f"""
 cd /opt/airflow && \\
+rm -f {SALARIES_RESULT_PATH} && \\
 python dags/scripts/run_capology_scraper.py \\
     --entity player_salaries \\
     --league "{league}" \\
@@ -180,6 +181,7 @@ exit $rc
             task_id=f'scrape_{_entity}',
             bash_command=f"""
 cd /opt/airflow && \\
+rm -f /tmp/capology_{_entity}_result.json && \\
 python dags/scripts/run_capology_scraper.py \\
     --entity {_entity} \\
     --league "{league}" \\
