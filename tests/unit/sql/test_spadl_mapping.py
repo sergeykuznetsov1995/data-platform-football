@@ -398,6 +398,40 @@ class TestShotSubtypes:
 
 
 # ---------------------------------------------------------------------------
+# Own-goal routing (#572)
+# ---------------------------------------------------------------------------
+
+
+class TestOwnGoal:
+    """Goal + OwnGoal qualifier routes to 'own_goal' (NOT the shot family), so
+    the scorer is not credited with a shot. Plain Goals stay 'shot' (#462)."""
+
+    def test_own_goal_routes_to_own_goal(self, duck_conn):
+        out = _seed_and_run(duck_conn, [
+            _row(type_="Goal", qualifiers=_qualifiers_json(["OwnGoal"])),
+        ])
+        assert out[0]["action_canonical"] == "own_goal"
+
+    def test_plain_goal_still_routes_to_shot(self, duck_conn):
+        """Guard against over-matching: a Goal without the OwnGoal qualifier
+        must still land in the shot family (#462 behaviour preserved)."""
+        out = _seed_and_run(duck_conn, [
+            _row(type_="Goal", qualifiers=None),
+        ])
+        assert out[0]["action_canonical"] == "shot"
+
+    def test_own_goal_in_enum(self, duck_conn):
+        """'own_goal' must be a registered SPADL_ACTION_ENUM value or the
+        DQ enum-violation guard would hard-fail on it."""
+        from utils.e3_dq import SPADL_ACTION_ENUM
+        assert "own_goal" in SPADL_ACTION_ENUM
+        out = _seed_and_run(duck_conn, [
+            _row(type_="Goal", qualifiers=_qualifiers_json(["OwnGoal"])),
+        ])
+        assert out[0]["action_canonical"] in set(SPADL_ACTION_ENUM)
+
+
+# ---------------------------------------------------------------------------
 # Goalkeeper actions
 # ---------------------------------------------------------------------------
 
@@ -652,9 +686,9 @@ class TestOutcomeSuccess:
 class TestEnumCompleteness:
     """SPADL_ACTION_ENUM in utils.e3_dq must cover every value the SQL emits."""
 
-    def test_action_canonical_enum_size_is_24(self):
+    def test_action_canonical_enum_size_is_25(self):
         from utils.e3_dq import SPADL_ACTION_ENUM
-        assert len(SPADL_ACTION_ENUM) == 24
+        assert len(SPADL_ACTION_ENUM) == 25
 
     def test_all_observed_routes_in_enum(self, duck_conn):
         """Run every documented WhoScored type once and assert the produced

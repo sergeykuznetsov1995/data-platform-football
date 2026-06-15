@@ -16,7 +16,9 @@
 --
 -- Notes:
 --   * shots_total / shots_on_target_proxy count all shot variants ('shot' +
---     'shot_penalty' + 'shot_freekick'), incl. goals (Goal→shot family, #462).
+--     'shot_penalty' + 'shot_freekick'), incl. scored goals (Goal→shot family,
+--     #462) but EXCLUDING own-goals (Goal+OwnGoal qualifier routes to
+--     action_canonical='own_goal' in SPADL, #572 — not a shot to the scorer).
 --     shots_on_target_proxy stays a coarse proxy: WhoScored marks MissedShots
 --     outcome_type='Successful', so it over-counts off-target attempts —
 --     match-level fct_shot is the source of truth for goals / true on-target.

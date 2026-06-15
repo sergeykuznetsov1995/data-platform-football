@@ -9,7 +9,7 @@ themselves are exercised by the universal ``data_quality`` test suite.
 Coverage
 --------
 * Per-table check counts (silver / gold) match the contract.
-* SPADL_ACTION_ENUM has exactly 24 values and matches the documented set.
+* SPADL_ACTION_ENUM has exactly 25 values and matches the documented set.
 * Critical ERROR-severity checks are present (PK, schema-version drift,
   enum violation, ref_integrity).
 * All check names are unique (the runner relies on uniqueness for the
@@ -148,10 +148,10 @@ class TestCheckCounts:
 
 
 class TestSpadlActionEnum:
-    """The 24-value enum is the contract between Silver SQL and DQ."""
+    """The 25-value enum is the contract between Silver SQL and DQ."""
 
-    def test_enum_size_is_24(self):
-        assert len(e3_dq.SPADL_ACTION_ENUM) == 24
+    def test_enum_size_is_25(self):
+        assert len(e3_dq.SPADL_ACTION_ENUM) == 25
 
     def test_enum_includes_all_canonicals(self):
         expected = {
@@ -162,7 +162,7 @@ class TestSpadlActionEnum:
             "shot", "shot_penalty", "shot_freekick",
             "keeper_save", "keeper_claim", "keeper_punch", "keeper_pick_up",
             "clearance", "bad_touch", "dribble", "goalkick",
-            "ball_recovery", "unknown",
+            "ball_recovery", "own_goal", "unknown",
         }
         assert set(e3_dq.SPADL_ACTION_ENUM) == expected
 
@@ -180,8 +180,9 @@ class TestSpadlActionEnum:
         assert len(e3_dq.SPADL_ACTION_ENUM) == len(set(e3_dq.SPADL_ACTION_ENUM))
 
     def test_proprietary_supplement_present(self):
-        """ball_recovery is the single non-SPADL proprietary value."""
+        """ball_recovery and own_goal are the non-SPADL proprietary values."""
         assert "ball_recovery" in e3_dq.SPADL_ACTION_ENUM
+        assert "own_goal" in e3_dq.SPADL_ACTION_ENUM
 
     def test_unknown_sentinel_present(self):
         """'unknown' sentinel is required for meta-events."""
