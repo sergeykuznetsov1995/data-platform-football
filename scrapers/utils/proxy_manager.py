@@ -14,7 +14,6 @@ Features:
 """
 
 import logging
-import os
 import random
 import socket
 import time
@@ -716,33 +715,6 @@ class ProxyManager:
             proxy_key = f"{proxy.host}:{proxy.port}"
             status[proxy_key] = round(remaining, 1)
         return status
-
-    def rotate_tor_identity(self) -> bool:
-        """
-        Rotate Tor identity (get new exit node).
-
-        Returns:
-            True if successful
-        """
-        if not self.config.use_tor:
-            return False
-
-        try:
-            from stem import Signal
-            from stem.control import Controller
-
-            tor_password = os.environ.get('TOR_CONTROL_PASSWORD', '')
-            with Controller.from_port(port=self.config.tor_control_port) as controller:
-                controller.authenticate(password=tor_password)
-                controller.signal(Signal.NEWNYM)
-                logger.info("Tor identity rotated")
-                return True
-        except ImportError:
-            logger.warning("stem library not installed, cannot rotate Tor identity")
-            return False
-        except Exception as e:
-            logger.error(f"Failed to rotate Tor identity: {e}")
-            return False
 
 
 def classify_error(error_str: str) -> str:
