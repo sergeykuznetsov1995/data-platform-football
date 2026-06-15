@@ -15,12 +15,13 @@
 --   silver.xref_player              (canonical_id ↔ raw player_id bridge)
 --
 -- Notes:
---   * shots_total / shots_on_target_proxy count all shot variants ('shot' +
---     'shot_penalty' + 'shot_freekick'), incl. scored goals (Goal→shot family,
---     #462) but EXCLUDING own-goals (Goal+OwnGoal qualifier routes to
+--   * shots_total counts all shot variants ('shot' + 'shot_penalty' +
+--     'shot_freekick'), incl. scored goals (Goal→shot family, #462) but
+--     EXCLUDING own-goals (Goal+OwnGoal qualifier routes to
 --     action_canonical='own_goal' in SPADL, #572 — not a shot to the scorer).
---     shots_on_target_proxy stays a coarse proxy: WhoScored marks MissedShots
---     outcome_type='Successful', so it over-counts off-target attempts —
+--   * shots_on_target_proxy = saved shots + scored goals (SavedShot + Goal via
+--     _action_source_note, #573) — NOT outcome_success, which WhoScored also
+--     marks 'Successful' for MissedShots / ShotOnPost (that over-counted).
 --     match-level fct_shot is the source of truth for goals / true on-target.
 --   * Spatial avg_x/avg_y is computed only on on-ball offensive actions
 --     (pass / take_on / shot / dribble) so defensive recoveries don't
@@ -38,6 +39,7 @@ WITH events AS (
         player_id_raw,
         action_canonical,
         outcome_success,
+        _action_source_note,
         x,
         y,
         league,
@@ -61,6 +63,7 @@ joined AS (
         e.match_id,
         e.action_canonical,
         e.outcome_success,
+        e._action_source_note,
         e.x,
         e.y
     FROM events e
@@ -95,8 +98,11 @@ SELECT
     -- goals now routed into the shot family (#462).
     COUNT_IF(action_canonical IN ('shot', 'shot_penalty', 'shot_freekick'))
         AS shots_total,
+    -- On target = saved shots + scored goals (#573), NOT outcome_success:
+    -- WhoScored marks MissedShots / ShotOnPost 'Successful' too (over-count).
+    -- _action_source_note carries the original WhoScored type per shot row.
     COUNT_IF(action_canonical IN ('shot', 'shot_penalty', 'shot_freekick')
-             AND outcome_success)                                            AS shots_on_target_proxy,
+             AND _action_source_note IN ('SavedShot', 'Goal'))              AS shots_on_target_proxy,
 
     -- ========= Defensive =========
     COUNT_IF(action_canonical = 'tackle')                                    AS tackle_att,

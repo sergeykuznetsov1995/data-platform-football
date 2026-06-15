@@ -25,13 +25,14 @@
 --   * Cards (yellow/red) NOT aggregated here — SPADL collapses Card events
 --     into 'unknown' (not one of the 25 canonical actions). Gold COALESCEs
 --     from FBref + SofaScore.
---   * shots_total / shots_on_target_proxy count all shot variants ('shot' +
---     'shot_penalty' + 'shot_freekick'), incl. scored goals (Goal→shot family,
---     #462) but EXCLUDING own-goals (Goal+OwnGoal qualifier → 'own_goal' in
---     SPADL, #572), matching whoscored_player_match_aggregate.shots. shots_on_target_proxy
---     stays a coarse proxy: WhoScored marks MissedShots outcome_type=
---     'Successful', so it over-counts off-target attempts. fct_shot is the
---     source of truth for actual goals / true on-target.
+--   * shots_total counts all shot variants ('shot' + 'shot_penalty' +
+--     'shot_freekick'), incl. scored goals (Goal→shot family, #462) but
+--     EXCLUDING own-goals (Goal+OwnGoal qualifier → 'own_goal' in SPADL, #572),
+--     matching whoscored_player_match_aggregate.shots.
+--   * shots_on_target_proxy = saved shots + scored goals (SavedShot + Goal via
+--     _action_source_note, #573) — NOT outcome_success, which WhoScored also
+--     marks 'Successful' for MissedShots / ShotOnPost (that over-counted). Still
+--     a proxy vs fct_shot (Understat), the source of truth for true on-target.
 --   * Derived metrics:
 --     - defensive_actions_third = defensive third (x < 33.33 on SPADL pitch
 --       [0..100], attacking direction) ∩ {tackle, interception, clearance,
@@ -82,8 +83,12 @@ SELECT
     -- Mirrors whoscored_player_match_aggregate.shots (counted from bronze).
     COUNT_IF(action_canonical IN ('shot', 'shot_penalty', 'shot_freekick'))
         AS shots_total,
+    -- On target = saved shots + scored goals (#573). Cannot use outcome_success:
+    -- WhoScored marks MissedShots / ShotOnPost outcome_type='Successful' too, so
+    -- that predicate over-counts. _action_source_note preserves the original
+    -- WhoScored type per shot row (SavedShot / Goal / MissedShots / ...).
     COUNT_IF(action_canonical IN ('shot', 'shot_penalty', 'shot_freekick')
-             AND outcome_success)                                             AS shots_on_target_proxy,
+             AND _action_source_note IN ('SavedShot', 'Goal'))               AS shots_on_target_proxy,
 
     -- ========= Discipline =========
     COUNT_IF(action_canonical = 'foul')                                       AS fouls_committed,
