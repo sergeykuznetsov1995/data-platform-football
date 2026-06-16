@@ -3,9 +3,9 @@ Unit tests for Gold ``dim_manager`` SQL logic — star-schema grain (#425).
 
 dim_manager is a plain per-manager dictionary now: spine =
 silver.xref_manager GROUP BY canonical_id, manager_name prefers the FBref
-display_name, nationality/dob are NULL placeholders. The SCD-2 stint logic
-that used to live here moves to fct_manager_stint (issue #429) — its tests
-go with it (`git log -p tests/unit/sql/test_dim_manager_sql.py`).
+display_name, nationality/dob are enriched from FotMob by coachId (issue #434).
+The SCD-2 stint logic that used to live here moves to fct_manager_stint
+(issue #429) — its tests go with it (`git log -p tests/unit/sql/test_dim_manager_sql.py`).
 
 Strategy: Trino → DuckDB transpile via sqlglot, fixture rows in an
 in-memory schema, execute, assert. Skips cleanly if sqlglot cannot
@@ -50,6 +50,8 @@ def _bootstrap(con) -> None:
     )
     # One manager seen by BOTH sources across two seasons (4 xref rows ->
     # 1 dim row); one FotMob-only manager (name falls back to FotMob).
+    # FotMob source_id = stable coachId (issue #144) — the bridge key to
+    # fotmob_manager_profile.player_id (#434).
     con.execute(
         """
         INSERT INTO silver.xref_manager VALUES
@@ -57,10 +59,28 @@ def _bootstrap(con) -> None:
          'ENG-Premier League', '2425', 'name_normalize', NULL),
         ('mikel_arteta', 'fbref',  'Mikel Arteta', 'Mikel Arteta',
          'ENG-Premier League', '2526', 'name_normalize', NULL),
-        ('mikel_arteta', 'fotmob', 'M. Arteta',    'M. Arteta',
+        ('mikel_arteta', 'fotmob', '1001',         'M. Arteta',
          'ENG-Premier League', '2526', 'name_normalize', NULL),
-        ('fm_mgr_unai',  'fotmob', 'U. Emery',     'U. Emery',
+        ('fm_mgr_unai',  'fotmob', '1002',         'U. Emery',
          'ENG-Premier League', '2526', 'orphan', NULL)
+        """
+    )
+    # issue #434: FotMob coach profile enriches nationality/dob by coachId.
+    # Arteta (coachId 1001) has a profile; Emery (1002) does NOT -> stays NULL.
+    con.execute(
+        """
+        CREATE TABLE silver.fotmob_manager_profile (
+            player_id VARCHAR, name VARCHAR, date_of_birth VARCHAR,
+            nationality VARCHAR, _bronze_ingested_at TIMESTAMP,
+            league VARCHAR, season VARCHAR
+        )
+        """
+    )
+    con.execute(
+        """
+        INSERT INTO silver.fotmob_manager_profile VALUES
+        ('1001', 'Mikel Arteta', '1982-03-26', 'Spain',
+         NULL, 'ENG-Premier League', '2526')
         """
     )
 
@@ -104,8 +124,16 @@ class TestDimManagerDictionary:
         assert len(emery) == 1
         assert emery[0]["manager_name"] == "U. Emery"
 
-    def test_nationality_dob_null_placeholders(self, gold_rows):
-        """No source carries them yet — schema-aligned NULLs (#425)."""
-        for r in gold_rows:
-            assert r["nationality"] is None, r
-            assert r["dob"] is None, r
+    def test_nationality_dob_enriched_from_fotmob(self, gold_rows):
+        """issue #434: matched coachId pulls nationality/dob from FotMob."""
+        import datetime
+
+        arteta = [r for r in gold_rows if r["manager_id"] == "mikel_arteta"][0]
+        assert arteta["nationality"] == "Spain", arteta
+        assert arteta["dob"] == datetime.date(1982, 3, 26), arteta
+
+    def test_unmatched_manager_attrs_null(self, gold_rows):
+        """No FotMob profile for this coachId -> nationality/dob stay NULL."""
+        emery = [r for r in gold_rows if r["manager_id"] == "fm_mgr_unai"][0]
+        assert emery["nationality"] is None, emery
+        assert emery["dob"] is None, emery

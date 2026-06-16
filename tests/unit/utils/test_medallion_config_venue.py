@@ -30,6 +30,7 @@ venues:
     canonical_id: "venue_old_trafford"
     city: "Manchester"
     country: "England"
+    capacity: 74310
     aliases:
       _generic: ["Old Trafford"]
     competition_scope: ["ENG-Premier League"]
@@ -129,6 +130,22 @@ def test_rejects_missing_city(tmp_path, monkeypatch):
         mc.load_venue_aliases()
 
 
+def test_rejects_non_int_capacity(tmp_path, monkeypatch):
+    """capacity is optional, but when present must be a positive int (#434)."""
+    bad = (
+        'venues:\n'
+        '  - canonical_name: "A"\n    canonical_id: "venue_a"\n'
+        '    city: "C"\n    country: "K"\n    capacity: "big"\n'
+        '    aliases: {_generic: ["A"]}\n'
+    )
+    (tmp_path / "venue_aliases.yaml").write_text(bad, encoding="utf-8")
+    from utils import medallion_config as mc
+    monkeypatch.setattr(mc, "CONFIG_DIR", tmp_path)
+    mc.reset_cache()
+    with pytest.raises(mc.MedallionConfigError, match="capacity"):
+        mc.load_venue_aliases()
+
+
 # ---------------------------------------------------------------------------
 # get_venue_alias_sql_values — VALUES shape
 # ---------------------------------------------------------------------------
@@ -146,6 +163,30 @@ def test_sql_values_merges_both_spellings_to_one_id(mock_venue_dir):
     sql = mock_venue_dir.get_venue_alias_sql_values()
     assert "'Gtech Community Stadium', 'venue_brentford'" in sql
     assert "'Brentford Community Stadium', 'venue_brentford'" in sql
+
+
+def test_sql_values_capacity_appended_unquoted(mock_venue_dir):
+    """include_capacity=True appends a 7th column; capacity is a bare int (#434)."""
+    sql = mock_venue_dir.get_venue_alias_sql_values(include_capacity=True)
+    ot_line = [ln for ln in sql.splitlines() if "venue_old_trafford" in ln][0]
+    assert "74310" in ot_line, ot_line
+    assert "'74310'" not in ot_line, "capacity must be UNQUOTED (numeric, not varchar)"
+
+
+def test_sql_values_capacity_null_when_absent(mock_venue_dir):
+    """A venue without a curated capacity renders bare NULL (not 'NULL')."""
+    sql = mock_venue_dir.get_venue_alias_sql_values(include_capacity=True)
+    brent_line = [ln for ln in sql.splitlines() if "venue_brentford" in ln][0]
+    assert ", NULL)" in brent_line, brent_line  # bare NULL, may have trailing comma
+    assert "'NULL'" not in brent_line
+
+
+def test_default_render_excludes_capacity(mock_venue_dir):
+    """Default (dim_match) stays 6 columns — no capacity, no arity drift."""
+    sql = mock_venue_dir.get_venue_alias_sql_values()
+    assert "74310" not in sql
+    first = sql.splitlines()[0]
+    assert first.count("'") == 12  # still six single-quoted fields
 
 
 def test_sql_values_raises_on_empty(tmp_path, monkeypatch):
@@ -185,3 +226,12 @@ def test_shipped_venue_yaml_loads_and_renders():
     # sponsor-rename merge survives into the rendered VALUES
     assert "'Gtech Community Stadium', 'venue_brentford_community'" in sql
     assert "'Brentford Community Stadium', 'venue_brentford_community'" in sql
+    # capacity (issue #434): shipped values are positive ints (or omitted) and
+    # render UNQUOTED in the include_capacity VALUES body.
+    for v in venues:
+        cap = v.get("capacity")
+        assert cap is None or (isinstance(cap, int) and not isinstance(cap, bool) and cap > 0), \
+            v["canonical_id"]
+    sql_cap = mc.get_venue_alias_sql_values(include_capacity=True)
+    ot_line = [ln for ln in sql_cap.splitlines() if "venue_old_trafford" in ln][0]
+    assert "74310" in ot_line and "'74310'" not in ot_line, ot_line
