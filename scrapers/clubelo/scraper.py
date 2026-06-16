@@ -124,49 +124,6 @@ class ClubEloScraper(SoccerdataScraper):
             logger.error(f"Error reading ClubElo by date: {e}")
             return None
 
-    def read_team_history(
-        self,
-        team: str,
-        start_date: Optional[date] = None,
-        end_date: Optional[date] = None
-    ) -> Optional[pd.DataFrame]:
-        """
-        Read historical ELO ratings for a specific team.
-
-        Args:
-            team: Team name as used in ClubElo
-            start_date: Start date for history
-            end_date: End date for history
-
-        Returns:
-            DataFrame with ELO history
-        """
-        reader = self._get_reader()
-
-        logger.info(f"Fetching ClubElo history for {team}")
-
-        try:
-            df = self._execute_with_resilience(reader.read_team_history, team)
-
-            if df is not None and not df.empty:
-                df = df.reset_index()
-
-                # Filter by date range if specified
-                if 'from' in df.columns:
-                    if start_date:
-                        df = df[df['from'] >= pd.Timestamp(start_date)]
-                    if end_date:
-                        df = df[df['from'] <= pd.Timestamp(end_date)]
-
-                df['team'] = team
-                df = self._add_metadata(df, 'elo_history')
-
-            return df
-
-        except Exception as e:
-            logger.error(f"Error reading team history for {team}: {e}")
-            return None
-
     def scrape_current_ratings(self) -> Dict[str, str]:
         """
         Scrape current ELO ratings for all clubs.
@@ -237,88 +194,9 @@ class ClubEloScraper(SoccerdataScraper):
 
         return {}
 
-    def scrape_team_histories(
-        self,
-        teams: Optional[List[str]] = None
-    ) -> Dict[str, str]:
-        """
-        Scrape ELO history for specific teams.
-
-        Reads each team sequentially, then writes ALL teams in a single
-        save_to_iceberg call with replace_partitions=['team']. This
-        produces ONE Iceberg snapshot per run (not one per team) and one
-        DELETE+INSERT covering all teams atomically — fast (~30 s vs
-        ~10 min per-team) and avoids metadata bloat (was 23 GB before
-        the fix).
-
-        Args:
-            teams: List of team names to scrape
-
-        Returns:
-            Dictionary with table path (only set if at least one team
-            yielded data).
-        """
-        if not teams:
-            logger.warning("No teams specified for history scraping")
-            return {}
-
-        frames = []
-        fetched = 0
-        empty = 0
-        failed = 0
-        for team in teams:
-            try:
-                df = self.read_team_history(team)
-            except Exception as e:
-                logger.error(f"Failed to fetch history for {team}: {e}")
-                failed += 1
-                continue
-            if df is None or df.empty:
-                empty += 1
-                continue
-            frames.append(df)
-            fetched += 1
-
-        logger.info(
-            f"Team history fetched: {fetched} ok, {empty} empty, {failed} failed"
-        )
-
-        if not frames:
-            return {}
-
-        combined = pd.concat(frames, ignore_index=True)
-        try:
-            table_path = self.save_to_iceberg(
-                df=combined,
-                table_name='clubelo_team_history',
-                partition_cols=['team'],
-                replace_partitions=['team'],
-            )
-        except Exception as e:
-            # Do NOT swallow: replace_partitions does a DELETE then INSERT, and a
-            # failed INSERT after a committed DELETE can leave the table empty
-            # (observed 2026-06-04: 105600 rows -> 0 on a transient Trino SSL
-            # error). Re-raise so the caller records the failure loudly instead
-            # of reporting a silent empty result.
-            logger.error(f"Failed to save combined team history: {e}")
-            raise
-
-        logger.info(
-            f"Team history saved: {len(combined)} rows across {fetched} teams"
-        )
-        return {'team_history': table_path, 'rows': len(combined)}
-
-    def scrape_all(
-        self,
-        teams: Optional[List[str]] = None,
-    ) -> Dict[str, str]:
+    def scrape_all(self) -> Dict[str, str]:
         """
         Scrape all ClubElo data.
-
-        Args:
-            teams: Team names to fetch full ELO history for. If None,
-                derives the list from the current rating snapshot
-                (filtered by configured leagues).
 
         Returns:
             Dictionary mapping data type to Iceberg table path
@@ -327,31 +205,8 @@ class ClubEloScraper(SoccerdataScraper):
 
         results = {}
 
-        # Scrape current ratings (also yields the team list when teams=None)
         current_results = self.scrape_current_ratings()
         results.update(current_results)
-
-        # Derive team list from the snapshot if not explicitly provided
-        if teams is None:
-            try:
-                snapshot = self.read_by_date()
-                if snapshot is not None and not snapshot.empty and 'team' in snapshot.columns:
-                    teams = (
-                        snapshot['team'].dropna().astype(str).unique().tolist()
-                    )
-            except Exception as e:
-                logger.warning(f"Could not derive team list from snapshot: {e}")
-                teams = None
-
-        # Scrape per-team ELO histories
-        if teams:
-            try:
-                history_results = self.scrape_team_histories(teams=teams)
-                results.update(history_results)
-            except Exception as e:
-                logger.error(f"team_histories failed: {e}")
-        else:
-            logger.warning("Skipping scrape_team_histories — no teams resolved")
 
         logger.info(f"ClubElo scrape complete: {list(results.keys())}")
         return results

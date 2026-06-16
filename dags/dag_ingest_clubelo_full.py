@@ -3,19 +3,17 @@ ClubElo Full Ingestion DAG (weekly)
 ===================================
 
 Weekly companion to ``dag_ingest_clubelo`` (daily). Runs the same runner with
-``--mode full`` to materialize the two HEAVY ClubElo bronze tables that the
-daily DAG deliberately skips:
+``--mode full`` to materialize the HEAVY ClubElo bronze table that the daily
+DAG deliberately skips:
 
 - ``clubelo_ratings_historical`` — weekly-sampled snapshots over the last 365
   days, written with ``replace_partitions=['rating_date']``.
-- ``clubelo_team_history``       — per-team full ELO history, batched single
-  save with ``replace_partitions=['team']``.
 
-Why weekly + replace_partitions: these tables are full-state/historical. Daily
-APPEND-mode ingest is exactly what caused the 2026-05-04 HDFS overflow
-(clubelo_team_history hit 23 GB of Iceberg metadata). Replace semantics keep one
-snapshot per partition; weekly cadence keeps the ~150 HTTP calls off the daily
-path. The light daily DAG (current ratings only) stays unchanged.
+Why weekly + replace_partitions: this table is full-state/historical. Daily
+APPEND-mode ingest is exactly what caused the 2026-05-04 HDFS overflow (Iceberg
+metadata ballooned to 20+ GB). Replace semantics keep one snapshot per
+partition; weekly cadence keeps the ~150 HTTP calls off the daily path. The
+light daily DAG (current ratings only) stays unchanged.
 """
 
 from datetime import datetime, timedelta
@@ -33,7 +31,7 @@ leagues_str = ','.join(LEAGUES)
 with DAG(
     dag_id='dag_ingest_clubelo_full',
     default_args=LIGHT_ARGS,
-    description='Weekly ingest of ClubElo historical + team-history bronze tables',
+    description='Weekly ingest of the ClubElo historical-ratings bronze table',
     schedule=SCHEDULES.get('dag_ingest_clubelo_full', '0 4 * * 0'),
     start_date=datetime(2024, 1, 1),
     catchup=False,
@@ -45,10 +43,10 @@ with DAG(
     doc_md="""
     ## ClubElo Full Ingestion (weekly)
 
-    Materializes the two heavy ClubElo bronze tables (historical ratings +
-    per-team ELO history) via the shared runner in `--mode full`. Both use
-    `replace_partitions` so re-runs stay idempotent and do not accumulate
-    Iceberg metadata (root cause of the 2026-05-04 HDFS overflow).
+    Materializes the heavy ClubElo historical-ratings bronze table via the
+    shared runner in `--mode full`. It uses `replace_partitions` so re-runs
+    stay idempotent and do not accumulate Iceberg metadata (root cause of the
+    2026-05-04 HDFS overflow).
 
     The daily `dag_ingest_clubelo` continues to ingest current ratings only.
     """,
