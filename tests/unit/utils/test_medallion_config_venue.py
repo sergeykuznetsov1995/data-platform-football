@@ -234,4 +234,4 @@ def test_shipped_venue_yaml_loads_and_renders():
             v["canonical_id"]
     sql_cap = mc.get_venue_alias_sql_values(include_capacity=True)
     ot_line = [ln for ln in sql_cap.splitlines() if "venue_old_trafford" in ln][0]
-    assert "74310" in ot_line and "'74310'" not in ot_line, ot_line
+    assert "74244" in ot_line and "'74244'" not in ot_line, ot_line

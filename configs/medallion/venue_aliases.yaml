@@ -21,7 +21,7 @@
 #     canonical_id:   "venue_old_trafford"  # IDENTITY slug, ^[a-z0-9_]+$
 #     city:           "Manchester"
 #     country:        "England"
-#     capacity:       74310                  # issue #434: curated capacity (int), optional → NULL
+#     capacity:       74244                  # issue #434: curated capacity (int), optional → NULL
 #     aliases:
 #       _generic: ["Old Trafford"]          # every observed spelling, any source
 #     competition_scope: ["ENG-Premier League"]
@@ -98,7 +98,7 @@ venues:
     canonical_id: "venue_carrow_road"
     city: "Norwich"
     country: "England"
-    capacity: 27359
+    capacity: 27150
     aliases:
       _generic: ["Carrow Road"]
     competition_scope: ["ENG-Premier League"]
@@ -107,7 +107,7 @@ venues:
     canonical_id: "venue_craven_cottage"
     city: "London"
     country: "England"
-    capacity: 28350
+    capacity: 28800
     aliases:
       _generic: ["Craven Cottage"]
     competition_scope: ["ENG-Premier League"]
@@ -116,7 +116,7 @@ venues:
     canonical_id: "venue_elland_road"
     city: "Leeds"
     country: "England"
-    capacity: 37792
+    capacity: 37645
     aliases:
       _generic: ["Elland Road"]
     competition_scope: ["ENG-Premier League"]
@@ -134,7 +134,7 @@ venues:
     canonical_id: "venue_etihad_stadium"
     city: "Manchester"
     country: "England"
-    capacity: 53400
+    capacity: 61470
     aliases:
       _generic: ["Etihad Stadium"]
     competition_scope: ["ENG-Premier League"]
@@ -153,7 +153,7 @@ venues:
     canonical_id: "venue_hill_dickinson"
     city: "Liverpool"
     country: "England"
-    capacity: 52888
+    capacity: 52769
     aliases:
       _generic: ["Hill Dickinson Stadium"]
     competition_scope: ["ENG-Premier League"]
@@ -162,7 +162,7 @@ venues:
     canonical_id: "venue_kenilworth_road"
     city: "Luton"
     country: "England"
-    capacity: 11500
+    capacity: 12056
     aliases:
       _generic: ["Kenilworth Road Stadium", "Kenilworth Road"]
     competition_scope: ["ENG-Premier League"]
@@ -218,7 +218,7 @@ venues:
     canonical_id: "venue_old_trafford"
     city: "Manchester"
     country: "England"
-    capacity: 74310
+    capacity: 74244
     aliases:
       _generic: ["Old Trafford"]
     competition_scope: ["ENG-Premier League"]
@@ -228,7 +228,7 @@ venues:
     canonical_id: "venue_portman_road"
     city: "Ipswich"
     country: "England"
-    capacity: 30311
+    capacity: 30056
     aliases:
       _generic: ["Portman Road", "Portman Road Stadium"]
     competition_scope: ["ENG-Premier League"]
@@ -257,7 +257,7 @@ venues:
     canonical_id: "venue_st_james_park"
     city: "Newcastle upon Tyne"
     country: "England"
-    capacity: 52305
+    capacity: 52264
     aliases:
       _generic: ["St James' Park", "St. James' Park"]
     competition_scope: ["ENG-Premier League"]
@@ -284,7 +284,7 @@ venues:
     canonical_id: "venue_stamford_bridge"
     city: "London"
     country: "England"
-    capacity: 40343
+    capacity: 40044
     aliases:
       _generic: ["Stamford Bridge"]
     competition_scope: ["ENG-Premier League"]
@@ -296,7 +296,7 @@ venues:
     canonical_id: "venue_amex"
     city: "Brighton"
     country: "England"
-    capacity: 31800
+    capacity: 31876
     aliases:
       _generic:
         - "American Express Stadium"
@@ -308,7 +308,7 @@ venues:
     canonical_id: "venue_city_ground"
     city: "Nottingham"
     country: "England"
-    capacity: 30404
+    capacity: 31042
     aliases:
       _generic: ["The City Ground"]
     competition_scope: ["ENG-Premier League"]
@@ -317,7 +317,7 @@ venues:
     canonical_id: "venue_the_hawthorns"
     city: "West Bromwich"
     country: "England"
-    capacity: 26850
+    capacity: 27087
     aliases:
       _generic: ["The Hawthorns"]
     competition_scope: ["ENG-Premier League"]
@@ -353,7 +353,7 @@ venues:
     canonical_id: "venue_vicarage_road"
     city: "Watford"
     country: "England"
-    capacity: 22200
+    capacity: 22220
     aliases:
       _generic: ["Vicarage Road Stadium", "Vicarage Road"]
     competition_scope: ["ENG-Premier League"]
@@ -362,7 +362,7 @@ venues:
     canonical_id: "venue_villa_park"
     city: "Birmingham"
     country: "England"
-    capacity: 42657
+    capacity: 43205
     aliases:
       _generic: ["Villa Park"]
     competition_scope: ["ENG-Premier League"]
