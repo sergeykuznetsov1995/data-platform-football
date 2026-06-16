@@ -420,11 +420,13 @@ def _append_fct_standings_coverage_check(report) -> None:
 
 # ---------------------------------------------------------------------------
 # #432: final star-schema DQ gate (design docs/design/gold-star-schema.md §6
-# rule 8 + §7 step 6). Covers the 22 live star tables (8 dims + 14 facts);
-# fct_player_salary / fct_player_fifa_rating / fct_team_elo arrive with
-# #430/#431 — their PK/FK/orphan checks must be added here in those PRs.
-# fct_event / fct_match_rating are outside the 17-fact star design (own DQ
-# in e3_dq/e4_dq). All thresholds carry their live baseline + measure date.
+# rule 8 + §7 step 6). Covers the live star tables (8 dims + 14 facts).
+# fct_team_elo / fct_player_market_value / fct_player_fifa_rating are pointwise
+# off-field facts (no league/season cols) → their PK/FK are asserted pointwise
+# below, NOT via _STAR_FACT_TABLES. #430 added fct_player_salary to the list and
+# moved market_value out of it (market_value dropped league/season). fct_event /
+# fct_match_rating are outside the 17-fact star design (own DQ in e3_dq/e4_dq).
+# All thresholds carry their live baseline + measure date.
 # ---------------------------------------------------------------------------
 
 # Star facts (design §2) that exist today. Every one carries (league, season).
@@ -442,7 +444,7 @@ _STAR_FACT_TABLES = [
     'gold.fct_standings',
     'gold.fct_manager_stint',
     'gold.fct_transfer',
-    'gold.fct_player_market_value',
+    'gold.fct_player_salary',
 ]
 
 
@@ -480,6 +482,22 @@ def _star_gate_pk_checks() -> List:
         CHECK.no_duplicates(
             'gold.fct_team_elo', pk=['team_id', 'elo_date'],
             name='star_pk[fct_team_elo(team_id,elo_date)]',
+        ),
+        # issue #430 — three player-money facts. salary carries (league,
+        # season) and lives in _STAR_FACT_TABLES; market_value / fifa_rating are
+        # pointwise (no league/season), so their design PK is asserted only here.
+        CHECK.no_duplicates(
+            'gold.fct_player_salary', pk=['player_id', 'league', 'season'],
+            name='star_pk[fct_player_salary(player_id,league,season)]',
+        ),
+        CHECK.no_duplicates(
+            'gold.fct_player_market_value',
+            pk=['player_id_canonical', 'valuation_date', 'source'],
+            name='star_pk[fct_player_market_value(player_id_canonical,valuation_date,source)]',
+        ),
+        CHECK.no_duplicates(
+            'gold.fct_player_fifa_rating', pk=['player_id', 'fifa_edition'],
+            name='star_pk[fct_player_fifa_rating(player_id,fifa_edition)]',
         ),
     ]
 
@@ -588,6 +606,16 @@ def _star_gate_dim_fk_checks() -> List:
         CHECK.ref_integrity('gold.fct_player_market_value', 'gold.dim_player',
                             'player_id_canonical', parent_key='player_id',
                             warn_rate=0.05, error_rate=0.15, severity='WARNING'),
+        # issue #430 — salary keeps 'cap_' orphans (≈9.5%), fifa_rating keeps
+        # 'sf_' orphans (≈15%); both kept by design (rule 2), policed by
+        # rate-mode. Thresholds sit above the live orphan share (re-baseline if
+        # coverage grows beyond APL).
+        CHECK.ref_integrity('gold.fct_player_salary', 'gold.dim_player',
+                            'player_id',
+                            warn_rate=0.12, error_rate=0.25, severity='WARNING'),
+        CHECK.ref_integrity('gold.fct_player_fifa_rating', 'gold.dim_player',
+                            'player_id',
+                            warn_rate=0.18, error_rate=0.35, severity='WARNING'),
 
         # ----- NULL-key shares (ref_integrity ignores NULLs by contract) -----
         # Baseline 99.7% non-NULL (172/58580 NULL).
@@ -1098,17 +1126,15 @@ def validate_gold_quality() -> Dict[str, Any]:
                        warn_threshold=0.30, error_threshold=0.0),
 
         # ============================================================
-        # issue #11: fct_player_market_value — FotMob MV timeline per
-        # (player_id_canonical, value_date, league, season). Cross-season
-        # дубликаты исторических точек ожидаемы (FotMob отдаёт history в
-        # каждом ingest-snapshot) — PK включает (league, season).
+        # issue #430: fct_player_market_value — two-source MV timeline, one row
+        # per (player_id_canonical, valuation_date, source). Pointwise off-field
+        # fact (no league/season). The design PK is asserted in
+        # build_star_gate_checks (pointwise, like fct_team_elo); here we keep
+        # only the NOT-NULL / FK / range checks.
         # ============================================================
-        CHECK.no_duplicates('gold.fct_player_market_value',
-                            pk=['player_id_canonical', 'value_date',
-                                'league', 'season']),
         CHECK.no_nulls('gold.fct_player_market_value',
-                       cols=['player_id_canonical', 'value_date',
-                             'market_value_eur', 'league', 'season']),
+                       cols=['player_id_canonical', 'valuation_date',
+                             'market_value_eur', 'source']),
         CHECK.ref_integrity(
             'gold.fct_player_market_value',
             'gold.dim_player_attributes',
