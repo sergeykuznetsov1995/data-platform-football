@@ -229,6 +229,22 @@
         "team": "varchar"
       }
     },
+    "bronze.fbref_match_officials": {
+      "columns": {
+        "_batch_id": "varchar",
+        "_entity_type": "varchar",
+        "_ingested_at": "timestamp(6)",
+        "_source": "varchar",
+        "ar1": "varchar",
+        "ar2": "varchar",
+        "fourth_official": "varchar",
+        "league": "varchar",
+        "match_id": "varchar",
+        "referee": "varchar",
+        "season": "bigint",
+        "var": "varchar"
+      }
+    },
     "bronze.fbref_match_player_stats": {
       "columns": {
         "#": "double",
