@@ -52,7 +52,6 @@ SESSION_MIN_RETENTION = "1h"
 # retention leaves >14 stale snapshots between weekly sweeps. Run a separate
 # daily DAG with retention='3d' against this allowlist.
 HIGH_CHURN_BRONZE: Tuple[str, ...] = (
-    "clubelo_team_history",
     "whoscored_events",
     "whoscored_missing_players",
     "whoscored_schedule",

@@ -426,14 +426,14 @@ EXPECTED_TABLES: dict[str, dict[str, set[str]]] = {
         },
     },
     'clubelo': {
-        # ClubElo scraper (scrapers/clubelo/scraper.py). 3 tables. Verified vs
+        # ClubElo scraper (scrapers/clubelo/scraper.py). 2 tables. Verified vs
         # live bronze 2026-06-04 (#283). Identity col is `team` (NOT `club`).
         # `rank`/`league` are upstream-sparse but present (not all-NULL), so they
         # are intentionally NOT in the required set — extra live cols are not
         # errors. clubelo_ratings is the daily snapshot (partition rating_date);
-        # the two heavy tables are produced weekly by dag_ingest_clubelo_full
-        # with replace_partitions (ratings_historical=['rating_date'],
-        # team_history=['team']) — never daily APPEND (2026-05-04 HDFS overflow).
+        # the heavy ratings_historical table is produced weekly by
+        # dag_ingest_clubelo_full with replace_partitions=['rating_date'] —
+        # never daily APPEND (2026-05-04 HDFS overflow).
         'clubelo_ratings': {
             'team', 'country', 'level', 'elo', 'from', 'to', 'rating_date',
             *META_COLS,
@@ -441,9 +441,6 @@ EXPECTED_TABLES: dict[str, dict[str, set[str]]] = {
         'clubelo_ratings_historical': {
             'team', 'country', 'level', 'elo', 'from', 'to', 'rating_date',
             *META_COLS,
-        },
-        'clubelo_team_history': {
-            'team', 'country', 'level', 'elo', 'from', 'to', *META_COLS,
         },
     },
     'matchhistory': {
