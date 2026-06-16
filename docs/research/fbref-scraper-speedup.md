@@ -467,8 +467,8 @@ time/MB/success помечены **N/A**: soccerdata `1.9.0` физически 
 
 ### Track B — soccerdata: вердикт «не мигрируем»
 
-Полностью покрыто issue **#67** (закрыт `not-planned`, 2026-05-26) и
-[feedback_soccerdata_19_fbref_hold](../../memory/feedback_soccerdata_19_fbref_hold.md):
+Полностью покрыто issue **#67** (закрыт `not-planned`, 2026-05-26) и memory
+`feedback_soccerdata_19_fbref_hold`:
 
 - `1.9.0` мигрировал FBref на `BaseSeleniumReader` → CF-bypass падает в контейнере:
   passive UC оставляет «Just a moment…»; `uc_gui_click_captcha` требует `python3-tk`
@@ -489,7 +489,7 @@ time/MB/success помечены **N/A**: soccerdata `1.9.0` физически 
 (подтверждено `LICENSE` = GNU GPL v3, 29 June 2007). Прямая зависимость исключена:
 копилефт инфицирует наш код (та же логика, что для SofaScore #32 / Transfermarkt /
 Capology — только cherry-pick шаблонов парсинга поверх нашего HTTP-стека, без `import`,
-см. [feedback_scraperfc_sofascore_blocked](../../memory/feedback_scraperfc_sofascore_blocked.md)).
+см. issue #32 + memory `feedback_scraperfc_sofascore_blocked`).
 
 Публичные методы класса `FBref` и наш статус покрытия:
 
