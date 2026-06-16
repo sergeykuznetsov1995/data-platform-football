@@ -23,7 +23,7 @@ Per-table verdict vocabulary (from #476):
 
 ---
 
-## 1. Register (15 live write-only tables, audit 2026-06-15)
+## 1. Register (14 live write-only tables, audit 2026-06-15)
 
 Cost class = cost of *stopping* the scrape. **FREE** = by-product of a request made anyway
 (removing it saves only HDFS/snapshots, not HTTP); **CHEAP** = 1 HTTP; **EXPENSIVE** =
@@ -42,7 +42,6 @@ per-item/per-season HTTP.
 | `sofifa_team_ratings` | CHEAP | ⚠ 15 cols 100% NULL (upstream; live-confirmed 2026-06-16) | (b) future | [#601] |
 | `sofifa_leagues` | CHEAP | OK (reference) | (b) future | [#601] |
 | `sofifa_versions` | CHEAP | OK (reference) | (b) future | [#601] |
-| `sofascore_event_shotmap` | EXPENSIVE (~380/season) | OK | (b) future | [#602] |
 | `fbref_keeper_keeper_adv` | EXPENSIVE (separate `/keepersadv/` page + CF bypass ~9.67s) | ⚠ 26 cols 100% NULL live (incl. 23 advanced GK, FBref Feb-2026); core dups `keeper` | **(c) stop** | [#606] |
 | `whoscored_season_stages` | FREE (same session as `scrape_schedule`, soccerdata cache) | ⚠ `stage` all-NULL; 6 rows | (b) keep | — (§3) |
 | `clubelo_team_history` | MODERATE (per-team histories) | no `rank`/`league`; **219,861 rows** (largest unread) | **(c) stop** | [#604] |
@@ -52,10 +51,12 @@ per-item/per-season HTTP.
 | Table | Was | Now | Evidence |
 |---|---|---|---|
 | `clubelo_ratings_historical` | write-only | **CONSUMED** | `dags/sql/gold/fct_team_elo.sql:52` (UNION with `clubelo_ratings`) + `dags/sql/silver/xref_team.sql.j2:186`; landed via #431 / #593. |
+| `sofascore_event_shotmap` | write-only (EXPENSIVE ~380/season) | **CONSUMED** | `dags/sql/silver/sofascore_shots.sql` (shot×match projection) → `dags/sql/gold/fct_shot_audit.sql` (cross-source xG/SoT validation vs Understat `fct_shot`); landed via #602. |
 
-> The #476 body lists 16 tables but the title says "15". The discrepancy is exactly
-> `clubelo_ratings_historical`: now consumed, it drops out, leaving **15** live write-only
-> tables. The register above is the corrected set.
+> The #476 body lists 16 tables but the title says "15". The discrepancy is
+> `clubelo_ratings_historical` (now consumed), which left 15. Consuming
+> `sofascore_event_shotmap` (#602) leaves **14** live write-only tables.
+> The register above is the corrected set.
 
 ---
 
