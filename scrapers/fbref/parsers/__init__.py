@@ -39,6 +39,7 @@ from scrapers.fbref.parsers.finders import (
     parse_team_match_stats_table,
     parse_player_match_stats_tables,
     parse_match_managers,
+    parse_match_officials,
 )
 
 __all__ = [
@@ -68,4 +69,5 @@ __all__ = [
     'parse_team_match_stats_table',
     'parse_player_match_stats_tables',
     'parse_match_managers',
+    'parse_match_officials',
 ]

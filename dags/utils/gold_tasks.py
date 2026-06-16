@@ -830,6 +830,39 @@ def validate_gold_quality() -> Dict[str, Any]:
                           min_val=0, max_val=20, severity='WARNING'),
 
         # ============================================================
+        # issue #613: fct_match_officials — per-match officiating crew.
+        # ============================================================
+        # ----- PK + critical attrs — ERROR -----
+        CHECK.no_duplicates('gold.fct_match_officials', pk=['match_id', 'role']),
+        # referee_id intentionally NOT here — pure assistants / VAR-only
+        # officials are single-source (FBref) and legitimately carry a NULL
+        # canonical id (#613 design).
+        CHECK.no_nulls('gold.fct_match_officials',
+                       cols=['match_id', 'role', 'official_name']),
+        # role dictionary — zero-tolerance row_count guards the 5-value enum
+        # (same idiom as fct_match_timeline.event_type; no accepted_values
+        # primitive in the CHECK registry).
+        CHECK.row_count(
+            'gold.fct_match_officials',
+            min_rows=0, max_rows=0,
+            where=("role NOT IN ('referee', 'ar1', 'ar2', "
+                   "'fourth_official', 'var')"),
+            severity='ERROR',
+            name='accepted_values[gold.fct_match_officials.role]',
+        ),
+        # match_id must point at a real Gold match — ERROR.
+        CHECK.ref_integrity('gold.fct_match_officials', 'gold.dim_match', 'match_id'),
+        # ----- Soft FK — WARNING -----
+        # referee_id → dim_referee is best-effort. ref_integrity ignores NULL
+        # child keys, so the denominator is only the populated ids (main referee
+        # + assistants who also referee elsewhere) — those are xref canonicals
+        # and thus always in dim_referee, so the rate is ~0. Rate-mode WARNING
+        # catches a regression without firing on the by-design NULLs.
+        CHECK.ref_integrity('gold.fct_match_officials', 'gold.dim_referee',
+                            'referee_id', warn_rate=0.05, error_rate=0.15,
+                            severity='WARNING'),
+
+        # ============================================================
         # E2: master-data dims (dim_venue / dim_referee / dim_competition /
         # dim_season) + fct_standings (ex-dim_standings, renamed #428).
         # Mirrors the existing dim_match / dim_team / dim_player block but

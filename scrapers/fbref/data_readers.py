@@ -41,6 +41,7 @@ from scrapers.fbref.html_parser import (
     parse_team_match_stats_table,
     parse_player_match_stats_tables,
     parse_match_managers,
+    parse_match_officials,
     diagnose_html_structure,
 )
 
@@ -712,6 +713,7 @@ class FBrefDataReaderMixin:
         all_match_team_stats: List[pd.DataFrame] = None,
         all_match_player_stats: List[pd.DataFrame] = None,
         all_match_managers: List[pd.DataFrame] = None,
+        all_match_officials: List[pd.DataFrame] = None,
     ) -> Set[str]:
         """
         Process a single match page: extract shots, events, lineups,
@@ -796,6 +798,17 @@ class FBrefDataReaderMixin:
                 all_match_managers.append(managers_df)
                 got_types.add('match_managers')
 
+        # Match officials (scorebox_meta — one wide row: referee/ar1/ar2/4th/var)
+        if all_match_officials is not None:
+            officials_df = parse_match_officials(soup)
+            if officials_df is not None and not officials_df.empty:
+                officials_df['match_id'] = match_id
+                officials_df['league'] = league
+                officials_df['season'] = season
+                officials_df = self._add_metadata(officials_df, 'match_officials')
+                all_match_officials.append(officials_df)
+                got_types.add('match_officials')
+
         # Free memory: decompose soup tree and remove from cache
         soup.decompose()
         del comment_tables
@@ -831,6 +844,7 @@ class FBrefDataReaderMixin:
         all_match_team_stats: List[pd.DataFrame] = None,
         all_match_player_stats: List[pd.DataFrame] = None,
         all_match_managers: List[pd.DataFrame] = None,
+        all_match_officials: List[pd.DataFrame] = None,
     ) -> None:
         """
         Save accumulated match data to Iceberg and clear the lists.
@@ -860,6 +874,7 @@ class FBrefDataReaderMixin:
             (all_match_team_stats, 'fbref_match_team_stats', 'match_team_stats', ['match_id']),
             (all_match_player_stats, 'fbref_match_player_stats', 'match_player_stats', ['match_id']),
             (all_match_managers, 'fbref_match_managers', 'match_managers', ['match_id']),
+            (all_match_officials, 'fbref_match_officials', 'match_officials', ['match_id']),
         ]
 
         for data_list, table_name, result_key, replace_keys in save_items:
@@ -1187,6 +1202,7 @@ class FBrefDataReaderMixin:
         all_match_team_stats = []
         all_match_player_stats = []
         all_match_managers = []
+        all_match_officials = []
 
         total_matches_processed = 0
         total_pages_fetched = 0
@@ -1199,6 +1215,7 @@ class FBrefDataReaderMixin:
             all_match_team_stats=all_match_team_stats,
             all_match_player_stats=all_match_player_stats,
             all_match_managers=all_match_managers,
+            all_match_officials=all_match_officials,
         )
 
         for league in self.leagues:
@@ -1302,6 +1319,7 @@ class FBrefDataReaderMixin:
                                 all_shot_events, all_match_events, all_lineups,
                                 all_match_team_stats, all_match_player_stats,
                                 all_match_managers,
+                                all_match_officials,
                             )
 
                             if got_types:
@@ -1380,6 +1398,7 @@ class FBrefDataReaderMixin:
                                     all_shot_events, all_match_events, all_lineups,
                                     all_match_team_stats, all_match_player_stats,
                                     all_match_managers,
+                                    all_match_officials,
                                 )
                                 if got_types and 'match_player_stats' in got_types:
                                     recovered += 1

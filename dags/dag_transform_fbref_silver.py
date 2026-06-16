@@ -100,6 +100,13 @@ SILVER_TRANSFORMS = [
         'dags/sql/silver/whoscored_player_unavailable.sql',
         'whoscored_player_unavailable',
     ),
+    # issue #613: FBref match officials (referee + ar1/ar2/4th/var), unpivoted
+    # from wide bronze.fbref_match_officials. Optional Bronze (graceful skip).
+    (
+        'match_officials',
+        'dags/sql/silver/fbref_match_officials.sql',
+        'fbref_match_officials',
+    ),
 ]
 
 # Expected minimum row counts per Silver table (for validation)
@@ -117,6 +124,9 @@ SILVER_MIN_ROWS = {
     # not strict — the table is in OPTIONAL_BRONZE_TABLES so it's excluded
     # from `validate_silver` row-count enforcement (see _validate_silver).
     'whoscored_player_unavailable': 100,
+    # issue #613: ~5 officials/match × matches; conservative floor. Optional
+    # Bronze → excluded from strict row-count enforcement (see _validate_silver).
+    'fbref_match_officials': 50,
 }
 
 # Bronze tables that may not exist yet — skip transform with warning if absent.
@@ -128,6 +138,9 @@ OPTIONAL_BRONZE_TABLES = {
     # project_whoscored_cloudflare.md) — Silver must skip gracefully when the
     # Bronze source is absent rather than failing the whole DAG.
     'whoscored_player_unavailable': 'whoscored_missing_players',
+    # issue #613: combined_match_data may not have populated officials yet on
+    # some deployments — skip the Silver transform gracefully if absent.
+    'fbref_match_officials': 'fbref_match_officials',
 }
 
 
@@ -342,6 +355,33 @@ def _validate_silver_quality(**context) -> Dict[str, Any]:
         logger.warning(
             "silver.whoscored_player_unavailable not found — skipping E5 DQ "
             "checks (Bronze whoscored_missing_players likely paused)."
+        )
+
+    # issue #613: FBref officials is optional Bronze (combined_match_data may
+    # not have populated it yet) — probe before appending checks.
+    if check_bronze_table_exists(
+        table_name='fbref_match_officials', schema='silver',
+    ):
+        checks.extend([
+            CHECK.no_nulls(
+                'silver.fbref_match_officials',
+                cols=['match_id', 'role', 'official_name', 'league', 'season'],
+            ),
+            CHECK.no_duplicates(
+                'silver.fbref_match_officials',
+                pk=['match_id', 'role'],
+            ),
+            CHECK.freshness(
+                'silver.fbref_match_officials',
+                ts_col='_bronze_ingested_at',
+                max_age_hours=FRESH_HOURS,
+                severity='WARNING',
+            ),
+        ])
+    else:
+        logger.warning(
+            "silver.fbref_match_officials not found — skipping #613 officials "
+            "DQ checks (Bronze fbref_match_officials likely absent)."
         )
 
     # Run with raise_on_error=False so we can push a summary before failing.

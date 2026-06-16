@@ -210,6 +210,12 @@ STAGE_3_FACTS = [
     # precedent).
     ('fct_team_elo', 'dags/sql/gold/fct_team_elo.sql',
      'fct_team_elo', None),
+    # issue #613: per-match officiating crew (referee/ar1/ar2/4th/var). referee_id
+    # resolved best-effort via silver.xref_referee. Optional Silver source →
+    # STAGE_3_FALLBACKS empty contract below. Runs in s3 (after g2c) so
+    # dim_match / dim_referee (FK targets) already exist.
+    ('fct_match_officials', 'dags/sql/gold/fct_match_officials.sql',
+     'fct_match_officials', ['league', 'season']),
 ]
 
 # Tables in STAGE_3 with optional Silver sources — runner routes CTAS to
@@ -231,6 +237,13 @@ STAGE_3_FALLBACKS = {
     'fct_transfer': {
         'fallback_sql_file': 'dags/sql/gold/fct_transfer_empty.sql',
         'require_silver':    ['transfermarkt_transfers'],
+    },
+    # issue #613: officials Silver may be absent (combined_match_data hasn't
+    # populated bronze.fbref_match_officials yet). Empty contract keeps the
+    # Gold star intact.
+    'fct_match_officials': {
+        'fallback_sql_file': 'dags/sql/gold/fct_match_officials_empty.sql',
+        'require_silver':    ['fbref_match_officials'],
     },
 }
 

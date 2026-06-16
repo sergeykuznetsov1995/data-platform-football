@@ -1088,3 +1088,81 @@ def parse_match_managers(soup: BeautifulSoup) -> Optional[pd.DataFrame]:
         return None
 
     return pd.DataFrame(rows)
+
+
+# Match scorebox_meta "Officials" line (issue #613). FBref renders each official
+# as ``<span style="display:inline-block">Name (Role)</span>`` with roles already
+# numbered — (Referee) (AR1) (AR2) (4th) (VAR) — confirmed on a live APL match
+# page (Liverpool–Bournemouth, 2026-06-16). The regex tolerates an optional
+# space before '(' and is case-insensitive; unknown roles (e.g. AVAR/PR on some
+# cup ties) simply fall through and are ignored.
+_OFFICIAL_RE = re.compile(
+    r'^(.*?)\s*\((Referee|AR1|AR2|4th|VAR)\)\s*$', re.IGNORECASE
+)
+
+# FBref role label -> Bronze column (wide, one row per match).
+_OFFICIAL_ROLE_TO_COL = {
+    'referee': 'referee',
+    'ar1': 'ar1',
+    'ar2': 'ar2',
+    '4th': 'fourth_official',
+    'var': 'var',
+}
+
+_OFFICIAL_COLUMNS = ['referee', 'ar1', 'ar2', 'fourth_official', 'var']
+
+
+def parse_match_officials(soup: BeautifulSoup) -> Optional[pd.DataFrame]:
+    """Parse the officiating crew from the FBref match-page scorebox_meta.
+
+    The scorebox_meta block renders officials as::
+
+        <strong><small>Officials</small></strong> :
+        <small>
+          <span style="display:inline-block">Anthony Taylor (Referee)</span> ·
+          <span style="display:inline-block">Gary Beswick (AR1)</span> · ...
+        </small>
+
+    Roles are pre-numbered by FBref — (Referee) (AR1) (AR2) (4th) (VAR) — so the
+    parser maps each to a fixed column without guessing AR order. Returns a
+    single wide row; a role missing from the page (e.g. no VAR on some fixtures)
+    stays NULL. ``None`` only when the Officials block is absent entirely
+    (caller treats that as a parse failure, not as "no officials"), mirroring
+    :func:`parse_match_managers`.
+
+    Args:
+        soup: BeautifulSoup of the match page.
+
+    Returns:
+        One-row DataFrame with columns ``referee``, ``ar1``, ``ar2``,
+        ``fourth_official``, ``var`` (each a name or NULL). ``None`` if no
+        Officials block is present.
+    """
+    # Locate the "Officials" label (a <small> inside <strong>), then its div.
+    label = next(
+        (sm for sm in soup.find_all('small')
+         if sm.get_text(strip=True).lower() == 'officials'),
+        None,
+    )
+    if label is None:
+        return None
+    block = label.find_parent('div')
+    if block is None:
+        return None
+
+    cols = {c: None for c in _OFFICIAL_COLUMNS}
+    for span in block.find_all('span'):
+        text = _norm_name(span.get_text(' ', strip=True))
+        if not text:
+            continue
+        m = _OFFICIAL_RE.match(text)
+        if not m:
+            continue
+        name = _norm_name(m.group(1))
+        col = _OFFICIAL_ROLE_TO_COL.get(m.group(2).lower())
+        if col and name:
+            cols[col] = name
+
+    if all(v is None for v in cols.values()):
+        return None
+    return pd.DataFrame([cols])
