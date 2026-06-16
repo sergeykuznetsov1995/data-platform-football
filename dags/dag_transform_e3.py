@@ -225,6 +225,17 @@ SILVER_E3_TRANSFORMS = [
         'dags/sql/silver/sofascore_team_match.sql',
         'sofascore_team_match',
     ),
+    (
+        # issue #602: shot-grained SofaScore shotmap projection, canonicalised
+        # to fct_shot's match/team/player IDs. Reads bronze.sofascore_event_shotmap
+        # + sofascore_schedule + silver.xref_{match,team,player} (source='sofascore')
+        # — MUST run after dag_transform_xref. Consumer = gold.fct_shot_audit
+        # (cross-source xG/SoT validation vs Understat). NOT merged into fct_shot
+        # (no shared shot key across sources).
+        'sofascore_shots',
+        'dags/sql/silver/sofascore_shots.sql',
+        'sofascore_shots',
+    ),
 ]
 
 GOLD_E3_TRANSFORMS = [
@@ -237,6 +248,14 @@ GOLD_E3_TRANSFORMS = [
         'fct_shot',
         'dags/sql/gold/fct_shot.sql',
         'fct_shot',
+    ),
+    (
+        # issue #602: cross-source shot audit (Understat fct_shot vs SofaScore
+        # silver.sofascore_shots). MUST run after fct_shot (reads it as the
+        # Understat spine). WARNING-only DQ table, grain (match_id, team_id).
+        'fct_shot_audit',
+        'dags/sql/gold/fct_shot_audit.sql',
+        'fct_shot_audit',
     ),
     (
         'fct_lineup',

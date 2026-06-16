@@ -993,6 +993,35 @@
         "won_tackle": "double"
       }
     },
+    "bronze.sofascore_event_shotmap": {
+      "columns": {
+        "_batch_id": "varchar",
+        "_entity_type": "varchar",
+        "_ingested_at": "timestamp(6)",
+        "_source": "varchar",
+        "added_time": "double",
+        "body_part": "varchar",
+        "goal_type": "varchar",
+        "goal_x": "double",
+        "goal_y": "double",
+        "is_home": "boolean",
+        "league": "varchar",
+        "match_id": "varchar",
+        "minute": "bigint",
+        "outcome": "varchar",
+        "period": "varchar",
+        "player_id": "varchar",
+        "season": "varchar",
+        "shot_id": "varchar",
+        "shot_type": "varchar",
+        "situation": "varchar",
+        "team_id": "varchar",
+        "x": "double",
+        "xg": "double",
+        "xgot": "double",
+        "y": "double"
+      }
+    },
     "bronze.sofascore_match_stats": {
       "columns": {
         "_batch_id": "varchar",
