@@ -33,4 +33,5 @@ from scrapers.fbref.parsers import (  # noqa: F811 — explicit re-exports for I
     parse_team_match_stats_table,
     parse_player_match_stats_tables,
     parse_match_managers,
+    parse_match_officials,
 )
