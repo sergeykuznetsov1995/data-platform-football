@@ -651,3 +651,11 @@ def test_real_config_sql_values_pair_count_matches_legacy_sql(real_config_dir):
     # added MORE source-specific entries, but never fewer generics).
     pairs = real_config_dir.get_team_alias_pairs()
     assert len(pairs) >= 75
+
+
+def test_real_config_savinho_alias_resolves(real_config_dir):
+    # Issue #500: TM "Savinho" (743591) ↔ FBref "Sávio" (fe6e7156) nickname
+    # bridge. season='*' wildcard must resolve for the live TM season (2526).
+    assert real_config_dir.get_player_alias(
+        "transfermarkt", "743591", "2526"
+    ) == "fe6e7156"
