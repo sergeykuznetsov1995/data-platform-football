@@ -54,6 +54,9 @@ with aliases as (
         -- League predicate (issue #148): guard the JOIN on a.league = u.league
         -- so worldwide namesakes (one spelling, two cities) never cross-merge.
         league,
+        -- capacity (issue #434): curated stadium capacity (int) or NULL. Emitted
+        -- as a 7th, UNQUOTED column by get_venue_alias_sql_values(include_capacity=True).
+        capacity,
         -- Normalised join key: lower -> strip diacritics (NFD + \p{Mn}) ->
         -- remove all non-alphanumerics. Same idiom as xref_referee.sql.j2.
         regexp_replace(
@@ -62,7 +65,7 @@ with aliases as (
         ) as norm
     from (values
         {{ venue_aliases_values_sql }}
-    ) as t(raw_name, canonical_id, canonical_name, city, country, league)
+    ) as t(raw_name, canonical_id, canonical_name, city, country, league, capacity)
 ),
 
 fbref_venues as (
@@ -116,6 +119,7 @@ resolved as (
         a.canonical_name,
         a.city,
         a.country,
+        a.capacity,
         -- Curated alias -> explicit slug; orphan -> stable normalised-name hash.
         case
             when a.canonical_id is not null then a.canonical_id
@@ -142,6 +146,7 @@ aggregated as (
         max(canonical_name)                          as canonical_name,
         max(city)                                    as city,
         max(country)                                 as country,
+        max(capacity)                                as capacity,
         max(venue_raw) filter (where src = 'fbref')  as venue_fbref,
         max(venue_raw) filter (where src = 'espn')   as venue_espn,
         count(distinct match_date)                   as n_matches,
@@ -158,10 +163,10 @@ select
     coalesce(canonical_name, venue_fbref, venue_espn)                          as venue_name,
     city,
     country,
-    -- No capacity source yet (ESPN's column is 100% NULL — see
-    -- feedback_bronze_expected_null_columns). Placeholder keeps the schema
-    -- aligned to the star design (issue #425); enrichment is a followup.
-    cast(null as integer)                                                      as capacity,
+    -- capacity (issue #434): curated in venue_aliases.yaml (NULL for orphans /
+    -- venues without a curated value). ESPN's bronze column is 100% NULL — see
+    -- feedback_bronze_expected_null_columns.
+    cast(capacity as integer)                                                  as capacity,
     -- Kept beyond the design's column list: the orphan-rate DQ check in
     -- gold_tasks.validate_gold_quality filters on venue_source = 'orphan'.
     case when canonical_id is not null then 'curated' else 'orphan' end        as venue_source

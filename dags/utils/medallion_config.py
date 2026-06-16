@@ -226,6 +226,15 @@ def _validate_venue_aliases_schema(doc: Dict) -> None:
                     f"venue_aliases.yaml: venues[{i}] "
                     f"({v.get('canonical_name')}) missing/empty {geo!r}"
                 )
+        # capacity (issue #434) is optional — absent => NULL in dim_venue. When
+        # present it must be a positive int (bool is an int subclass — reject it).
+        cap = v.get('capacity')
+        if cap is not None and (not isinstance(cap, int) or isinstance(cap, bool) or cap <= 0):
+            raise MedallionConfigError(
+                f"venue_aliases.yaml: venues[{i}] "
+                f"({v.get('canonical_name')}) invalid 'capacity' "
+                f"(must be a positive int or omitted, got {cap!r})"
+            )
 
 
 def _validate_player_aliases_schema(doc: Dict) -> None:
@@ -855,17 +864,21 @@ def _venue_in_scope(venue: Dict, competition: Optional[str]) -> bool:
 def _iter_venue_aliases(
     source: Optional[str],
     competition: Optional[str],
-) -> List[Tuple[str, str, str, str, str, str]]:
-    """Yield (raw_name, canonical_id, canonical_name, city, country, league).
+) -> List[Tuple[str, str, str, str, str, str, Optional[int]]]:
+    """Yield (raw_name, canonical_id, canonical_name, city, country, league, capacity).
 
     Mirror of :func:`_iter_referee_aliases`, but venues always carry city /
     country / league (no toggles — they are core to #145). The league is the
     venue's ``competition_scope`` fanned out one row per scope entry so the
     downstream JOIN can guard on ``a.league = u.league``.
+
+    ``capacity`` (issue #434) is an optional curated stadium capacity (int) or
+    ``None`` when unknown. It is constant per venue, so it rides on the tuple
+    without affecting the dedup key.
     """
     doc = load_venue_aliases()
     seen: set = set()
-    out: List[Tuple[str, str, str, str, str, str]] = []
+    out: List[Tuple[str, str, str, str, str, str, Optional[int]]] = []
     for venue in doc.get('venues', []):
         if not _venue_in_scope(venue, competition):
             continue
@@ -873,6 +886,7 @@ def _iter_venue_aliases(
         canonical_id = venue['canonical_id']
         city = venue['city']
         country = venue['country']
+        capacity = venue.get('capacity')
         aliases = venue.get('aliases') or {}
         leagues = venue.get('competition_scope') or ['ENG-Premier League']
 
@@ -889,20 +903,27 @@ def _iter_venue_aliases(
                     if key in seen:
                         continue
                     seen.add(key)
-                    out.append(key)
+                    out.append((*key, capacity))
     return out
 
 
 def get_venue_alias_sql_values(
     source: Optional[str] = None,
     competition: Optional[str] = None,
+    include_capacity: bool = False,
 ) -> str:
     """Render venue alias tuples as a Trino VALUES body (issue #145).
 
-    Emits six-tuples
-    ``(raw_name, canonical_id, canonical_name, city, country, league)``
-    consumed by ``dim_venue.sql.j2``. Empty result raises (an empty VALUES is
-    invalid Trino and almost certainly signals a missing/misfiltered config).
+    Default: six-tuples
+    ``(raw_name, canonical_id, canonical_name, city, country, league)`` —
+    consumed by ``dim_match.sql.j2`` (venue_id resolution only).
+
+    ``include_capacity=True`` (issue #434) appends a 7th column ``capacity``
+    (integer literal or ``NULL``) for ``dim_venue.sql.j2``. capacity is emitted
+    UNQUOTED — quoting it would make Trino read the column as varchar.
+
+    Empty result raises (an empty VALUES is invalid Trino and almost certainly
+    signals a missing/misfiltered config).
     """
     rows = _iter_venue_aliases(source, competition)
     if not rows:
@@ -911,15 +932,27 @@ def get_venue_alias_sql_values(
             f"(source={source!r}, competition={competition!r}); "
             "an empty VALUES clause is invalid Trino — refusing to emit."
         )
-    lines = [
-        f"    ('{_escape_sql_string(raw)}', "
-        f"'{_escape_sql_string(cid)}', "
-        f"'{_escape_sql_string(canonical)}', "
-        f"'{_escape_sql_string(city)}', "
-        f"'{_escape_sql_string(country)}', "
-        f"'{_escape_sql_string(league)}')"
-        for raw, cid, canonical, city, country, league in rows
-    ]
+    if include_capacity:
+        lines = [
+            f"    ('{_escape_sql_string(raw)}', "
+            f"'{_escape_sql_string(cid)}', "
+            f"'{_escape_sql_string(canonical)}', "
+            f"'{_escape_sql_string(city)}', "
+            f"'{_escape_sql_string(country)}', "
+            f"'{_escape_sql_string(league)}', "
+            f"{'NULL' if cap is None else int(cap)})"
+            for raw, cid, canonical, city, country, league, cap in rows
+        ]
+    else:
+        lines = [
+            f"    ('{_escape_sql_string(raw)}', "
+            f"'{_escape_sql_string(cid)}', "
+            f"'{_escape_sql_string(canonical)}', "
+            f"'{_escape_sql_string(city)}', "
+            f"'{_escape_sql_string(country)}', "
+            f"'{_escape_sql_string(league)}')"
+            for raw, cid, canonical, city, country, league, _cap in rows
+        ]
     return ',\n'.join(lines).lstrip()
 
 

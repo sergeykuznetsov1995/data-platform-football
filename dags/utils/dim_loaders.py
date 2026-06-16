@@ -172,7 +172,9 @@ def render_dim_venue_sql(template_path: str, out_path: str) -> str:
 
     rendered = render_sql_template(
         Path(template_path),
-        venue_aliases_values_sql=get_venue_alias_sql_values(),
+        # include_capacity=True (issue #434): dim_venue projects capacity;
+        # dim_match reuses the same dict WITHOUT capacity (6-col tuple).
+        venue_aliases_values_sql=get_venue_alias_sql_values(include_capacity=True),
     )
     Path(out_path).write_text(rendered)
     return out_path

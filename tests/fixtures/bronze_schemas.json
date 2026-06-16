@@ -1324,6 +1324,24 @@
         "update": "varchar"
       }
     },
+    "bronze.transfermarkt_coaches": {
+      "columns": {
+        "_batch_id": "varchar",
+        "_entity_type": "varchar",
+        "_ingested_at": "timestamp(6)",
+        "_source": "varchar",
+        "coach_id": "varchar",
+        "coach_slug": "varchar",
+        "current_club_id": "varchar",
+        "current_club_name": "varchar",
+        "dob": "date",
+        "league": "varchar",
+        "name": "varchar",
+        "nationality": "varchar",
+        "role": "varchar",
+        "season": "varchar"
+      }
+    },
     "bronze.transfermarkt_market_value_history": {
       "columns": {
         "_batch_id": "varchar",

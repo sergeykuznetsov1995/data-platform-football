@@ -66,6 +66,12 @@ SILVER_TRANSFORMS = [
         'dags/sql/silver/transfermarkt_transfers.sql.j2',
         'transfermarkt_transfers',
     ),
+    # issue #434: head coaches (dob/nationality) for gold.dim_manager enrichment.
+    (
+        'coaches',
+        'dags/sql/silver/transfermarkt_coaches.sql',
+        'transfermarkt_coaches',
+    ),
 ]
 
 # Expected minimum row counts per Silver table (for validation)
@@ -81,6 +87,9 @@ SILVER_MIN_ROWS = {
     'transfermarkt_players': 400,
     'transfermarkt_market_value_history': 1000,
     'transfermarkt_transfers': 600,
+    # transfermarkt_coaches: ~20 head coaches per APL season (1 per club).
+    # Floor 15 protects against a broken CTAS / scrape collapse.
+    'transfermarkt_coaches': 15,
 }
 
 

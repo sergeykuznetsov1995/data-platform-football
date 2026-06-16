@@ -18,10 +18,12 @@ from scrapers.transfermarkt.scraper import (
     _coerce_int,
     _extract_club_id_from_href,
     _parse_club_listing,
+    _parse_coach_profile,
     _parse_height_cm,
     _parse_mv_history,
     _parse_player_profile,
     _parse_squad_page,
+    _parse_staff_managers,
     _parse_tm_date,
     _parse_tm_money_eur,
     _parse_transfers,
@@ -668,3 +670,102 @@ class TestResolverDeterministicLimit:
         sql, _ = cursor.executed[0]
         assert 'ORDER BY' not in sql
         assert 'LIMIT' not in sql
+
+
+# ---------------------------------------------------------------------------
+# Coach parsers (issue #434)
+# ---------------------------------------------------------------------------
+
+def _staff_row(slug: str, cid: str, name: str, role: str) -> str:
+    """One staff person: name in an inline-table, role on the second line."""
+    return (
+        '<tr><td>'
+        '<table class="inline-table"><tr>'
+        '<td><img></td>'
+        f'<td class="hauptlink"><a href="/{slug}/profil/trainer/{cid}">{name}</a></td>'
+        '</tr><tr><td></td><td>'
+        f'{role}</td></tr></table>'
+        '</td><td class="zentriert">50</td></tr>'
+    )
+
+
+def _staff_html(coaching_rows: str) -> str:
+    """A staff page: a 'Coaching Staff' section then an empty 'Management' one."""
+    return (
+        '<html><body>'
+        '<div class="content-box-headline">Coaching Staff</div>'
+        f'<table class="items"><tbody>{coaching_rows}</tbody></table>'
+        '<div class="content-box-headline">Management</div>'
+        '<table class="items"><tbody></tbody></table>'
+        '</body></html>'
+    )
+
+
+class TestParseStaffManagers:
+    def test_keeps_only_manager_role(self):
+        rows = (
+            _staff_row('pep-guardiola', '5672', 'Pep Guardiola', 'Manager')
+            + _staff_row('kolo-toure', '56390', 'Kolo Touré', 'Assistant Manager')
+            + _staff_row('richard-wright', '93678', 'Richard Wright', 'Goalkeeping Coach')
+        )
+        mgrs = _parse_staff_managers(_staff_html(rows), club_id='281')
+        assert len(mgrs) == 1, mgrs
+        m = mgrs[0]
+        assert m['coach_id'] == '5672'
+        assert m['coach_slug'] == 'pep-guardiola'
+        assert m['name'] == 'Pep Guardiola'
+        assert m['role'] == 'Manager'
+        assert m['club_id'] == '281'
+
+    def test_no_coaching_staff_section_returns_empty(self):
+        html = (
+            '<html><body><div class="content-box-headline">Management</div>'
+            '<table class="items"></table></body></html>'
+        )
+        assert _parse_staff_managers(html, club_id='1') == []
+
+    def test_dedups_by_coach_id(self):
+        rows = (
+            _staff_row('pep-guardiola', '5672', 'Pep Guardiola', 'Manager')
+            + _staff_row('pep-guardiola', '5672', 'Pep Guardiola', 'Manager')
+        )
+        assert len(_parse_staff_managers(_staff_html(rows), club_id='281')) == 1
+
+    def test_garbage_input(self):
+        assert _parse_staff_managers('', club_id='1') == []
+        assert _parse_staff_managers('<not-html>', club_id='1') == []
+
+
+def _coach_profile_html(name: str, dob: str, nat: str) -> str:
+    return (
+        '<html><body>'
+        f'<h1 class="data-header__headline-wrapper">{name}</h1>'
+        f'<span itemprop="birthDate">{dob}</span>'
+        f'<span itemprop="nationality">{nat}</span>'
+        '</body></html>'
+    )
+
+
+class TestParseCoachProfile:
+    def test_extracts_dob_nationality(self):
+        import datetime
+
+        html = _coach_profile_html('Pep Guardiola', 'Jan 18, 1971 (55)', 'Spain')
+        bio = _parse_coach_profile(html, coach_id='5672')
+        assert bio['coach_id'] == '5672'
+        assert bio['name'] == 'Pep Guardiola'
+        assert bio['dob'] == datetime.date(1971, 1, 18)
+        assert bio['nationality'] == 'Spain'
+
+    def test_missing_h1_returns_none(self):
+        assert _parse_coach_profile('<html><body>x</body></html>', coach_id='1') is None
+
+    def test_missing_bio_fields_degrade_to_none(self):
+        html = (
+            '<html><body><h1 class="data-header__headline-wrapper">Joe Coach</h1>'
+            '</body></html>'
+        )
+        bio = _parse_coach_profile(html, coach_id='9')
+        assert bio['name'] == 'Joe Coach'
+        assert bio['dob'] is None
+        assert bio['nationality'] is None

@@ -61,6 +61,13 @@ SILVER_TRANSFORMS = [
         'dags/sql/silver/fotmob_keeper_profile.sql',
         'fotmob_keeper_profile',
     ),
+    # issue #434: тренеры (WHERE is_coach) — nationality/dob для gold.dim_manager.
+    # Зеркало player_profile; coachId (player_id) совпадает с xref_manager.source_id.
+    (
+        'manager_profile',
+        'dags/sql/silver/fotmob_manager_profile.sql',
+        'fotmob_manager_profile',
+    ),
     # issue #11: timeline market_value из bronze.fotmob_player_details
     # .market_values_json (UNNEST). Питает gold.fct_player_market_value.
     (
@@ -95,6 +102,8 @@ SILVER_MIN_ROWS = {
     'fotmob_player_season_profile': 450,
     'fotmob_player_profile': 500,
     'fotmob_keeper_profile': 40,
+    # manager_profile: ~18 coaches APL 2025/26 (1 head coach per club). Floor 15.
+    'fotmob_manager_profile': 15,
     'fotmob_player_market_value_history': 1000,
     # team_match: ~338 finished matches × 2 sides = 676 rows для APL 2025/26
     # (7% бронзы без stats_json — cancelled / not finished). Floor 600 c headroom.

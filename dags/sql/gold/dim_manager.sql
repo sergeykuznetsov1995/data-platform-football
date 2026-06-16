@@ -11,26 +11,95 @@
 -- (issue #429). The stint logic lives in this file's git history —
 -- `git log -p dags/sql/gold/dim_manager.sql` — for #429 to resurrect.
 --
--- Source: iceberg.silver.xref_manager (canonical ids merged across
+-- Spine: iceberg.silver.xref_manager (canonical ids merged across
 -- FBref + FotMob). GROUP BY canonical_id collapses the per-(source,
 -- source_id, league, season) xref rows, so no (league, season) predicate is
--- needed — the fan-out footgun does not apply here.
+-- needed — the fan-out footgun does not apply to the spine.
 --
--- nationality / dob: no source carries them today (xref has names only) —
--- NULL placeholders keep the schema aligned to the design; enrichment is a
--- tracked followup.
+-- nationality / dob (issue #434): enriched from two sources, priority
+-- FotMob > Transfermarkt (COALESCE).
+--   * FotMob — xref_manager carries the coachId in source_id (source='fotmob');
+--     we bridge canonical_id ↔ coachId (xref_fotmob, 1 row/canonical) and pull
+--     country/dob from silver.fotmob_manager_profile. Covers current-season APL
+--     coaches only.
+--   * Transfermarkt — silver.transfermarkt_coaches computes the same
+--     name-normalize canonical_id, so it JOINs directly on manager_id and adds
+--     historical managers (the bulk of the 81).
+-- Each attribute lives in an already-aggregated CTE (1 row/key) before the LEFT
+-- JOIN, so the "1 row/manager" grain is preserved. A canonical_id neither source
+-- covers stays NULL (same caveat as dim_player).
 --
 -- PK:           manager_id  (canonical from silver.xref_manager)
 -- Partitioning: NONE  (small global dim — star design: dims unpartitioned)
 -- =============================================================================
 
+WITH managers AS (
+    -- Spine: one row per canonical manager.
+    SELECT
+        canonical_id AS manager_id,
+        COALESCE(
+            MAX(display_name) FILTER (WHERE source = 'fbref'),
+            MAX(display_name)
+        )            AS manager_name
+    FROM iceberg.silver.xref_manager
+    GROUP BY canonical_id
+),
+
+-- canonical_id ↔ FotMob coachId (source_id). ROW_NUMBER keeps it 1:1 (latest
+-- season wins) so the LEFT JOIN below cannot fan out the spine.
+xref_fotmob AS (
+    SELECT canonical_id, fotmob_coach_id
+    FROM (
+        SELECT
+            canonical_id,
+            source_id AS fotmob_coach_id,
+            ROW_NUMBER() OVER (
+                PARTITION BY canonical_id
+                ORDER BY season DESC
+            ) AS rn
+        FROM iceberg.silver.xref_manager
+        WHERE source = 'fotmob'
+    )
+    WHERE rn = 1
+),
+
+-- FotMob coach attributes, freshest value per coachId (MAX_BY ignores
+-- league/season — snapshot grain, same idiom as dim_player's fotmob_latest).
+fotmob_manager AS (
+    SELECT
+        player_id,
+        MAX_BY(nationality,   season) AS nationality,
+        MAX_BY(date_of_birth, season) AS date_of_birth
+    FROM iceberg.silver.fotmob_manager_profile
+    WHERE player_id IS NOT NULL
+    GROUP BY player_id
+),
+
+-- Transfermarkt head-coach attributes (issue #434): keyed DIRECTLY on
+-- canonical_id (TM silver computes the same name-normalize id), so no xref hop.
+-- One row per canonical_id via MAX_BY (freshest season). dob is already DATE.
+tm_manager AS (
+    SELECT
+        canonical_id,
+        MAX_BY(nationality, season) AS nationality,
+        MAX_BY(dob,         season) AS dob
+    FROM iceberg.silver.transfermarkt_coaches
+    WHERE canonical_id IS NOT NULL
+    GROUP BY canonical_id
+)
+
 SELECT
-    canonical_id AS manager_id,
-    COALESCE(
-        MAX(display_name) FILTER (WHERE source = 'fbref'),
-        MAX(display_name)
-    )            AS manager_name,
-    CAST(NULL AS varchar) AS nationality,
-    CAST(NULL AS date)    AS dob
-FROM iceberg.silver.xref_manager
-GROUP BY canonical_id
+    m.manager_id,
+    m.manager_name,
+    -- Priority FotMob > Transfermarkt (FotMob exact for current-season coaches;
+    -- TM adds historical managers). FotMob dob is an ISO-string passthrough —
+    -- TRY_CAST keeps the column DATE-typed; TM dob is already DATE.
+    COALESCE(fm.nationality, tm.nationality)               AS nationality,
+    COALESCE(TRY_CAST(fm.date_of_birth AS DATE), tm.dob)   AS dob
+FROM managers m
+LEFT JOIN xref_fotmob xf
+    ON xf.canonical_id = m.manager_id
+LEFT JOIN fotmob_manager fm
+    ON fm.player_id = xf.fotmob_coach_id
+LEFT JOIN tm_manager tm
+    ON tm.canonical_id = m.manager_id
