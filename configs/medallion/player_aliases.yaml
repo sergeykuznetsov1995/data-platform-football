@@ -32,3 +32,12 @@ aliases:
     fbref_player_id: "10745192"
     season: "*"
     reason: "Bynoe-Gittens (Capology) ↔ Gittens (FBref) surname extension"
+
+  # Issue #500 — Transfermarkt "Savinho" (743591) vs FBref "Sávio" (fe6e7156).
+  # Brazilian nickname: TM stores "Savinho", FBref the birth-name short form
+  # "Sávio". Distinct tokens → surname-anchor / token_set / nicknames all miss.
+  - source: transfermarkt
+    source_id: "743591"
+    fbref_player_id: "fe6e7156"
+    season: "*"
+    reason: "Savinho (Transfermarkt) ↔ Sávio (FBref) Brazilian nickname"
