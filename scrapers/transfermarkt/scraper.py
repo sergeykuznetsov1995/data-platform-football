@@ -61,6 +61,10 @@ _PLAYER_PROFILE_PATH = "/{player_slug}/profil/spieler/{player_id}"
 # JSON, no auth, no proxy required cookie-wise (but TM CF still requires proxy).
 _PLAYER_MV_HISTORY_PATH = "/ceapi/marketValueDevelopment/graph/{player_id}"
 _PLAYER_TRANSFERS_PATH = "/ceapi/transferHistory/list/{player_id}"
+# Coaches (issue #434). Staff page lists the whole backroom; we keep only the
+# "Coaching Staff" section row whose role is exactly "Manager" (head coach).
+_CLUB_STAFF_PATH = "/{club_slug}/mitarbeiter/verein/{club_id}/saison_id/{year}"
+_COACH_PROFILE_PATH = "/{coach_slug}/profil/trainer/{coach_id}"
 
 # Canonical league-slug + competition-id mapping. MVP: APL only. Extend with
 # {'ESP-La Liga': ('laliga', 'ES1'), ...} when the issue's scope widens.
@@ -208,6 +212,7 @@ def _parse_tm_date(raw) -> Optional[date]:
 
 _CLUB_HREF_RE = re.compile(r'^/(?P<slug>[^/]+)/startseite/verein/(?P<id>\d+)')
 _PLAYER_HREF_RE = re.compile(r'^/(?P<slug>[^/]+)/profil/spieler/(?P<id>\d+)')
+_COACH_HREF_RE = re.compile(r'^/(?P<slug>[^/]+)/profil/trainer/(?P<id>\d+)')
 
 
 def _parse_club_listing(html: str) -> List[Dict]:
@@ -379,6 +384,90 @@ def _parse_player_profile(html: str, player_id: str) -> Optional[Dict]:
         'contract_until': contract_until,
         'market_value_eur': mv_eur,
         'market_value_last_update': mv_last_update,
+    }
+
+
+def _parse_staff_managers(html: str, club_id: str) -> List[Dict]:
+    """Extract the head coach(es) from a club staff (`mitarbeiter`) page.
+
+    The staff page groups people under section headers
+    (``div.content-box-headline``): "Coaching Staff", "Management", "Medical
+    department", … Each person sits in a ``table.inline-table`` whose first
+    cell links to ``/{slug}/profil/trainer/{id}`` and whose second line is the
+    role. We keep ONLY the "Coaching Staff" section rows whose role is exactly
+    ``"Manager"`` (the head coach) — assistants / GK coaches / analysts are
+    dropped. Verified by scripts/probe_transfermarkt_coaches.py (2026-06-16).
+    """
+    from bs4 import BeautifulSoup
+
+    soup = BeautifulSoup(html, 'html.parser')
+    hdr = soup.find(
+        lambda t: bool(t.get('class'))
+        and any('content-box-headline' in c for c in (t.get('class') or []))
+        and 'Coaching Staff' in t.get_text()
+    )
+    if hdr is None:
+        return []
+    table = hdr.find_next('table')
+    if table is None:
+        return []
+
+    managers: List[Dict] = []
+    seen: set = set()
+    for a in table.find_all('a', href=True):
+        m = _COACH_HREF_RE.match(a['href'])
+        if not m:
+            continue
+        coach_id = m.group('id')
+        if coach_id in seen:
+            continue
+        name = a.get_text(strip=True)
+        inline = a.find_parent('table', {'class': 'inline-table'})
+        full = (
+            re.sub(r'\s+', ' ', inline.get_text(' ', strip=True))
+            if inline else name
+        )
+        role = full.replace(name, '').strip()
+        if role != 'Manager':
+            continue
+        seen.add(coach_id)
+        managers.append({
+            'coach_id': coach_id,
+            'coach_slug': m.group('slug'),
+            'name': name,
+            'role': role,
+            'club_id': str(club_id),
+        })
+    return managers
+
+
+def _parse_coach_profile(html: str, coach_id: str) -> Optional[Dict]:
+    """Extract dob + nationality from a coach (`trainer`) profile page.
+
+    Same ``data-header`` itemprop selectors as the player profile (verified by
+    probe 2026-06-16): h1 headline, span[itemprop=birthDate|nationality].
+    """
+    from bs4 import BeautifulSoup
+
+    soup = BeautifulSoup(html, 'html.parser')
+    name_el = soup.find('h1', {'class': 'data-header__headline-wrapper'})
+    if not name_el:
+        return None
+    full_name = re.sub(
+        r'^#\d+\s*', '', re.sub(r'\s+', ' ', name_el.get_text(' ', strip=True))
+    )
+
+    dob_el = soup.find('span', {'itemprop': 'birthDate'})
+    dob = _parse_tm_date(dob_el.get_text(' ', strip=True)) if dob_el else None
+
+    nat_el = soup.find('span', {'itemprop': 'nationality'})
+    nationality = nat_el.get_text(' ', strip=True) if nat_el else None
+
+    return {
+        'coach_id': str(coach_id),
+        'name': full_name,
+        'dob': dob,
+        'nationality': nationality,
     }
 
 
@@ -858,6 +947,152 @@ class TransfermarktScraper(BaseScraper):
 
         logger.info(
             "Materialised %d transfermarkt players (league=%s season=%s)",
+            len(df), league, season,
+        )
+        return df
+
+    def read_coaches(
+        self,
+        league: str,
+        season: int,
+        limit: Optional[int] = None,
+    ) -> pd.DataFrame:
+        """Listing → club staff pages → head-coach profile pages (issue #434).
+
+        Returns one row per (league, season, coach_id) for the head coach
+        (role == "Manager") of every club in the league-season. Feeds
+        bronze.transfermarkt_coaches → silver → gold.dim_manager nationality/dob
+        enrichment. ``limit`` caps clubs visited (smoke runs).
+        """
+        anchor_cols = [
+            'coach_id', 'coach_slug', 'name', 'role', 'dob', 'nationality',
+            'current_club_id', 'current_club_name', 'league', 'season',
+        ]
+
+        if league not in TM_LEAGUE_MAP:
+            logger.warning(
+                "%s: league %s not in TM_LEAGUE_MAP — skipping coaches.",
+                R0_2B_FALLBACK_MARKER, league,
+            )
+            return pd.DataFrame(columns=anchor_cols + ['_ingested_at'])
+
+        league_slug, comp_id = TM_LEAGUE_MAP[league]
+        season_short = _season_short(season)
+
+        # Step 1 — league listing → clubs.
+        listing_url = (
+            f"{_TM_BASE}"
+            + _LEAGUE_LISTING_PATH.format(
+                league_slug=league_slug, comp_id=comp_id, year=int(season),
+            )
+        )
+        listing_html = self._fetch_html(
+            listing_url, label='listing',
+            context={'league': league, 'season': season},
+        )
+        if listing_html is None:
+            logger.error(
+                "%s: league listing fetch failed for coaches %s/%s.",
+                R0_2B_FALLBACK_MARKER, league, season,
+            )
+            return pd.DataFrame(columns=anchor_cols + ['_ingested_at'])
+
+        clubs = _parse_club_listing(listing_html)
+        if limit:
+            clubs = clubs[: int(limit)]
+        logger.info("TM coaches: %d clubs for %s/%s", len(clubs), league, season)
+
+        # Step 2 — per-club staff page → head coach (role == "Manager").
+        managers: List[Dict] = []
+        for club in clubs:
+            staff_url = (
+                f"{_TM_BASE}"
+                + _CLUB_STAFF_PATH.format(
+                    club_slug=club['club_slug'],
+                    club_id=club['club_id'],
+                    year=int(season),
+                )
+            )
+            html = self._fetch_html(
+                staff_url, label='staff',
+                context={'club_id': club['club_id']},
+            )
+            if html is None:
+                continue
+            for mgr in _parse_staff_managers(html, club_id=club['club_id']):
+                mgr['current_club_name'] = club['club_name']
+                managers.append(mgr)
+
+        if not managers:
+            logger.warning(
+                "%s: zero head coaches harvested across %d clubs.",
+                R0_2B_FALLBACK_MARKER, len(clubs),
+            )
+            return pd.DataFrame(columns=anchor_cols + ['_ingested_at'])
+
+        logger.info("TM staff pages → %d head coaches to enrich", len(managers))
+
+        # Step 3 — per-coach profile page → dob + nationality.
+        rows: List[Dict] = []
+        consecutive_failures = 0
+        successes = 0
+        for idx, mgr in enumerate(managers, start=1):
+            profile_url = (
+                f"{_TM_BASE}"
+                + _COACH_PROFILE_PATH.format(
+                    coach_slug=mgr['coach_slug'], coach_id=mgr['coach_id'],
+                )
+            )
+            payload = self._fetch_html(
+                profile_url, label='coach_profile',
+                context={'coach_id': mgr['coach_id']},
+            )
+            if payload is None:
+                consecutive_failures += 1
+                if consecutive_failures >= _MAX_CONSECUTIVE_FAILURES:
+                    raise ConsecutiveFailureError(
+                        f"{consecutive_failures} consecutive coach-profile "
+                        f"failures at {idx}/{len(managers)} — aborting to "
+                        f"protect existing partition"
+                    )
+                continue
+            consecutive_failures = 0
+            successes += 1
+            bio = _parse_coach_profile(payload, mgr['coach_id']) or {}
+            rows.append({
+                'coach_id': mgr['coach_id'],
+                'coach_slug': mgr['coach_slug'],
+                'name': bio.get('name') or mgr['name'],
+                'role': mgr['role'],
+                'dob': bio.get('dob'),
+                'nationality': bio.get('nationality'),
+                'current_club_id': mgr['club_id'],
+                'current_club_name': mgr.get('current_club_name'),
+            })
+
+        if not rows:
+            logger.warning(
+                "%s: zero coach_profile rows materialised.",
+                R0_2B_FALLBACK_MARKER,
+            )
+            return pd.DataFrame(columns=anchor_cols + ['_ingested_at'])
+
+        if successes < _MIN_SUCCESS_RATIO * len(managers):
+            raise PartialScrapeError(
+                f"only {successes}/{len(managers)} coach profiles fetched "
+                f"(< {_MIN_SUCCESS_RATIO:.0%}) — aborting to protect partition"
+            )
+
+        df = pd.DataFrame(rows)
+        df['league'] = league
+        df['season'] = season_short
+        df['_source'] = self.SOURCE_NAME
+        df['_entity_type'] = 'coaches'
+        df['_ingested_at'] = datetime.utcnow()
+        df['_batch_id'] = self._batch_id
+
+        logger.info(
+            "Materialised %d transfermarkt coaches (league=%s season=%s)",
             len(df), league, season,
         )
         return df

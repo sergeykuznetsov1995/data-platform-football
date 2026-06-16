@@ -16,14 +16,18 @@
 -- source_id, league, season) xref rows, so no (league, season) predicate is
 -- needed — the fan-out footgun does not apply to the spine.
 --
--- nationality / dob (issue #434): enriched from FotMob. xref_manager carries the
--- FotMob coachId in source_id (source='fotmob'); we bridge canonical_id ↔ coachId
--- (xref_fotmob, deduped to 1 row/canonical) and pull country/dob from
--- silver.fotmob_manager_profile (freshest season via MAX_BY). FotMob covers
--- current-season APL coaches only (~18/81) — historical managers stay NULL, same
--- coverage caveat as dim_player. A Transfermarkt-coach source is a tracked
--- followup to raise coverage. Each attribute lives in an already-aggregated CTE
--- (1 row/key) before the LEFT JOIN, so the "1 row/manager" grain is preserved.
+-- nationality / dob (issue #434): enriched from two sources, priority
+-- FotMob > Transfermarkt (COALESCE).
+--   * FotMob — xref_manager carries the coachId in source_id (source='fotmob');
+--     we bridge canonical_id ↔ coachId (xref_fotmob, 1 row/canonical) and pull
+--     country/dob from silver.fotmob_manager_profile. Covers current-season APL
+--     coaches only.
+--   * Transfermarkt — silver.transfermarkt_coaches computes the same
+--     name-normalize canonical_id, so it JOINs directly on manager_id and adds
+--     historical managers (the bulk of the 81).
+-- Each attribute lives in an already-aggregated CTE (1 row/key) before the LEFT
+-- JOIN, so the "1 row/manager" grain is preserved. A canonical_id neither source
+-- covers stays NULL (same caveat as dim_player).
 --
 -- PK:           manager_id  (canonical from silver.xref_manager)
 -- Partitioning: NONE  (small global dim — star design: dims unpartitioned)
@@ -69,17 +73,33 @@ fotmob_manager AS (
     FROM iceberg.silver.fotmob_manager_profile
     WHERE player_id IS NOT NULL
     GROUP BY player_id
+),
+
+-- Transfermarkt head-coach attributes (issue #434): keyed DIRECTLY on
+-- canonical_id (TM silver computes the same name-normalize id), so no xref hop.
+-- One row per canonical_id via MAX_BY (freshest season). dob is already DATE.
+tm_manager AS (
+    SELECT
+        canonical_id,
+        MAX_BY(nationality, season) AS nationality,
+        MAX_BY(dob,         season) AS dob
+    FROM iceberg.silver.transfermarkt_coaches
+    WHERE canonical_id IS NOT NULL
+    GROUP BY canonical_id
 )
 
 SELECT
     m.manager_id,
     m.manager_name,
-    fm.nationality                         AS nationality,
-    -- FotMob dob is an ISO-string passthrough — TRY_CAST keeps the column
-    -- DATE-typed (a non-ISO value degrades to NULL).
-    TRY_CAST(fm.date_of_birth AS DATE)     AS dob
+    -- Priority FotMob > Transfermarkt (FotMob exact for current-season coaches;
+    -- TM adds historical managers). FotMob dob is an ISO-string passthrough —
+    -- TRY_CAST keeps the column DATE-typed; TM dob is already DATE.
+    COALESCE(fm.nationality, tm.nationality)               AS nationality,
+    COALESCE(TRY_CAST(fm.date_of_birth AS DATE), tm.dob)   AS dob
 FROM managers m
 LEFT JOIN xref_fotmob xf
     ON xf.canonical_id = m.manager_id
 LEFT JOIN fotmob_manager fm
     ON fm.player_id = xf.fotmob_coach_id
+LEFT JOIN tm_manager tm
+    ON tm.canonical_id = m.manager_id
