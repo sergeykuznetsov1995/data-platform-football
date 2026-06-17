@@ -696,6 +696,50 @@
         "season": "bigint"
       }
     },
+    "bronze.fotmob_team_leaderboards": {
+      "columns": {
+        "_batch_id": "varchar",
+        "_entity_type": "varchar",
+        "_ingested_at": "timestamp(6)",
+        "_source": "varchar",
+        "country_code": "varchar",
+        "league": "varchar",
+        "matches_played": "bigint",
+        "minutes_played": "bigint",
+        "participant_name": "varchar",
+        "rank": "bigint",
+        "season": "bigint",
+        "stat_category_group": "varchar",
+        "stat_category_header": "varchar",
+        "stat_name": "varchar",
+        "stat_value": "double",
+        "stat_value_count": "bigint",
+        "sub_stat_value": "double",
+        "team_color": "varchar",
+        "team_id": "bigint",
+        "team_name": "varchar"
+      }
+    },
+    "bronze.fotmob_team_profile": {
+      "columns": {
+        "_batch_id": "varchar",
+        "_entity_type": "varchar",
+        "_ingested_at": "timestamp(6)",
+        "_source": "varchar",
+        "country": "varchar",
+        "history_seasons_count": "varchar",
+        "last_match": "varchar",
+        "league": "varchar",
+        "next_match": "varchar",
+        "overview_season": "varchar",
+        "overview_table_position": "varchar",
+        "season": "bigint",
+        "short_name": "varchar",
+        "team_id": "bigint",
+        "team_name": "varchar",
+        "venue": "varchar"
+      }
+    },
     "bronze.fotmob_team_squad": {
       "columns": {
         "_batch_id": "varchar",
@@ -726,6 +770,55 @@
         "team_id": "bigint",
         "team_name": "varchar",
         "yellow_cards": "double"
+      }
+    },
+    "bronze.fotmob_team_stats": {
+      "columns": {
+        "_batch_id": "varchar",
+        "_entity_type": "varchar",
+        "_ingested_at": "timestamp(6)",
+        "_source": "varchar",
+        "draws": "bigint",
+        "form": "varchar",
+        "goal_diff": "bigint",
+        "goals_against": "bigint",
+        "goals_for": "bigint",
+        "league": "varchar",
+        "losses": "bigint",
+        "played": "bigint",
+        "points": "bigint",
+        "position": "bigint",
+        "season": "bigint",
+        "team_id": "bigint",
+        "team_name": "varchar",
+        "wins": "bigint"
+      }
+    },
+    "bronze.fotmob_transfers": {
+      "columns": {
+        "_batch_id": "varchar",
+        "_entity_type": "varchar",
+        "_ingested_at": "timestamp(6)",
+        "_source": "varchar",
+        "fee_text": "varchar",
+        "fee_value": "double",
+        "from_club": "varchar",
+        "from_club_full_name": "varchar",
+        "from_club_id": "bigint",
+        "league": "varchar",
+        "market_value": "varchar",
+        "on_loan": "boolean",
+        "player_id": "bigint",
+        "player_name": "varchar",
+        "position_key": "varchar",
+        "position_label": "varchar",
+        "season": "bigint",
+        "to_club": "varchar",
+        "to_club_full_name": "varchar",
+        "to_club_id": "bigint",
+        "transfer_date": "varchar",
+        "transfer_type_key": "varchar",
+        "transfer_type_text": "varchar"
       }
     },
     "bronze.matchhistory_results": {

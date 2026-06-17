@@ -23,7 +23,7 @@ Per-table verdict vocabulary (from #476):
 
 ---
 
-## 1. Register (10 live write-only tables, audit 2026-06-15; 4 SoFIFA CONSUMED via #601, 2026-06-17)
+## 1. Register (6 live write-only tables, audit 2026-06-15; 4 SoFIFA CONSUMED via #601 + 4 FotMob CONSUMED via #600, 2026-06-17)
 
 Cost class = cost of *stopping* the scrape. **FREE** = by-product of a request made anyway
 (removing it saves only HDFS/snapshots, not HTTP); **CHEAP** = 1 HTTP; **EXPENSIVE** =
@@ -34,10 +34,6 @@ per-item/per-season HTTP.
 | `capology_team_payrolls` | EXPENSIVE (1 page/season) | OK | (b) future | [#603] |
 | `capology_contract_extensions` | EXPENSIVE | OK | (b) future | [#603] |
 | `capology_transfer_window` | EXPENSIVE | OK | (b) future | [#603] |
-| `fotmob_team_stats` | FREE (shared `/api/data/leagues`) | OK | (b) future | [#600] |
-| `fotmob_team_profile` | FREE (shared `/api/data/leagues`) | OK | (b) future | [#600] |
-| `fotmob_team_leaderboards` | FREE (shared `/api/data/leagues`) | OK | (b) future | [#600] |
-| `fotmob_transfers` | CHEAP (1 HTTP) | OK | (b) future | [#600] |
 | `fbref_keeper_keeper_adv` | EXPENSIVE (separate `/keepersadv/` page + CF bypass ~9.67s) | ⚠ 26 cols 100% NULL live (incl. 23 advanced GK, FBref Feb-2026); core dups `keeper` | **(c) stop** | [#606] |
 | `whoscored_season_stages` | FREE (same session as `scrape_schedule`, soccerdata cache) | ⚠ `stage` all-NULL; 6 rows | (b) keep | — (§3) |
 | `clubelo_team_history` | MODERATE (per-team histories) | no `rank`/`league`; **219,861 rows** (largest unread) | **(c) stop** | [#604] |
@@ -52,12 +48,16 @@ per-item/per-season HTTP.
 | `sofifa_team_ratings` | write-only (CHEAP; 15 cols 100% NULL) | **CONSUMED** | `dags/sql/silver/sofifa_team_profile.sql` (8 live ratings). The 15 dead FC-26 cols removed from the parser (`scrapers/sofifa/flaresolverr_reader.read_team_ratings`) + Bronze (`scripts/drop_sofifa_team_ratings_dead_columns.py`); landed via #601. |
 | `sofifa_leagues` | write-only (CHEAP reference) | **CONSUMED** | `dags/sql/silver/sofifa_league_lookup.sql`; landed via #601. |
 | `sofifa_versions` | write-only (CHEAP reference) | **CONSUMED** | `dags/sql/silver/sofifa_edition_lookup.sql`; landed via #601. |
+| `fotmob_team_profile` | write-only (FREE by-product) | **CONSUMED** | `dags/sql/silver/fotmob_team_profile.sql` (team×season conform); landed via #600. |
+| `fotmob_team_stats` | write-only (FREE by-product) | **CONSUMED** | `dags/sql/silver/fotmob_team_standings.sql` (team×season standings conform); landed via #600. |
+| `fotmob_team_leaderboards` | write-only (FREE by-product) | **CONSUMED** | `dags/sql/silver/fotmob_team_leaderboards.sql` (long-form team×stat conform); landed via #600. |
+| `fotmob_transfers` | write-only (CHEAP; 1 HTTP) | **CONSUMED** | `dags/sql/silver/fotmob_transfers.sql` (event-grain conform); landed via #600. |
 
 > The #476 body lists 16 tables but the title says "15". The discrepancy is
 > `clubelo_ratings_historical` (now consumed), which left 15. Consuming
 > `sofascore_event_shotmap` (#602) left 14; promoting the 4 SoFIFA tables
-> (#601) leaves **10** live write-only tables. The register above is the
-> corrected set.
+> (#601) left 10; consuming the 4 FotMob team/transfers tables (#600) leaves
+> **6** live write-only tables. The register above is the corrected set.
 
 ---
 
@@ -122,6 +122,7 @@ documented here; no tracking issue (avoids p3 issue-spam):
 | 2026-06-15 | Correction after line-level re-check: `fbref_keeper_keeper_adv` is a **separate** FBref scrape (not a `keeper` by-product), re-classified (b) keep → **(c) stop**, issue [#606] filed; NULL counts (keeper_adv 23, sofifa_team_ratings 15) confirmed against `audit_bronze_columns.py` comments. | #476 |
 | 2026-06-16 | Live `audit_bronze_columns.py` run: confirmed `sofifa_team_ratings`=15 and `fbref_keeper_keeper_adv`=26 cols 100% NULL, all 15 tables non-empty with 0 ERROR, `clubelo_team_history`=219,861 rows (largest unread). Cost/NULL notes refined. | #476 |
 | 2026-06-17 | 4 SoFIFA tables promoted to Silver → **CONSUMED**: `sofifa_team_profile.sql` (+ `sofifa` source branch in `xref_team.sql.j2`), `sofifa_league_lookup.sql`, `sofifa_edition_lookup.sql`. `sofifa_team_ratings` 15 dead FC-26 cols removed (parser override + `drop_sofifa_team_ratings_dead_columns.py`, dropped from `EXPECTED_NULL`). 14 → 10 live write-only. | #601 |
+| 2026-06-17 | 4 FotMob team/transfers tables promoted to Silver → **CONSUMED** (conform-only, canonical_id resolution deferred to Gold): `fotmob_team_profile.sql`, `fotmob_team_standings.sql` (from `fotmob_team_stats`), `fotmob_team_leaderboards.sql`, `fotmob_transfers.sql`; registered in `dag_transform_fotmob_silver.py` + bronze schemas added to fixture. 10 → 6 live write-only. | #600 |
 
 [#476]: https://github.com/sergeykuznetsov1995/data-platform-football/issues/476
 [#600]: https://github.com/sergeykuznetsov1995/data-platform-football/issues/600
