@@ -76,6 +76,20 @@ class SoFIFAScraper(SoccerdataScraper):
             )
         return self._reader
 
+    def get_traffic_stats(self) -> dict:
+        """FlareSolverr proxy-traffic audit for this run (issue #616).
+
+        All SoFIFA reads share one FlareSolverr session held by the reader;
+        ``read_player_ratings`` (~545 pages/edition) dominates. ``fs_response_*``
+        is a lower bound on residential-proxy MB, not the proxy MB itself
+        (Camoufox fetches sub-resources through the proxy and returns only the
+        rendered HTML) — see ``docs/research/flaresolverr-proxy-traffic-audit.md``.
+        """
+        reader = self._reader
+        if reader is not None and getattr(reader, "_fs_client", None) is not None:
+            return reader._fs_client.get_traffic_stats()
+        return {}
+
     def read_players(self) -> Optional[pd.DataFrame]:
         """
         Read player ratings and attributes.

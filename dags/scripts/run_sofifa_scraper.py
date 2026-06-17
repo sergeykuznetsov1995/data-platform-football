@@ -55,7 +55,9 @@ def main():
         'versions_rows': 0,
         'leagues_rows': 0,
         'player_ratings_rows': 0,
-        'errors': []
+        'errors': [],
+        # Issue #616 — FlareSolverr proxy-traffic audit for this run.
+        'traffic': {},
     }
 
     try:
@@ -184,6 +186,13 @@ def main():
                 error_msg = f"Player ratings scraping failed: {e}"
                 logger.error(error_msg)
                 results['errors'].append(error_msg)
+
+            # Issue #616: surface the FlareSolverr proxy-traffic audit for this
+            # run (per-match proxy MB baseline; player_ratings dominates).
+            try:
+                results['traffic'] = scraper.get_traffic_stats()
+            except Exception as e:
+                logger.warning(f"get_traffic_stats failed: {e}")
 
     except Exception as e:
         logger.error(f"Scraper failed: {e}", exc_info=True)

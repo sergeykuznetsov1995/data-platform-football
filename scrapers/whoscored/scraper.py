@@ -103,6 +103,9 @@ class WhoScoredScraper(SoccerdataScraper):
         self._reader = None
         # Tracks the currently-active proxy so record_result() can credit it.
         self._current_proxy_obj = None
+        # FlareSolverr traffic-audit snapshot from the last scrape_events run
+        # (issue #616), surfaced via get_traffic_stats().
+        self._last_events_traffic: Optional[dict] = None
 
     # ---------- Reader ----------
 
@@ -507,12 +510,33 @@ class WhoScoredScraper(SoccerdataScraper):
             except FlareSolverrError as e:
                 logger.warning(f"WhoScored: final FS session destroy failed: {e}")
 
+        # Surface the FlareSolverr proxy-traffic audit for this events run
+        # (issue #616). The client accumulated across all session recycles.
+        self._last_events_traffic = client.get_traffic_stats()
+
         if path is None:
             logger.warning("WhoScored: events scrape produced no rows")
             return {}
         return {'events': path}
 
     # ---------- Helpers ----------
+
+    def get_traffic_stats(self) -> dict:
+        """FlareSolverr proxy-traffic audit for this run (issue #616).
+
+        The two FlareSolverr sessions have different cost profiles, so they are
+        reported separately: ``events`` (per-match Opta — the heavy path) and
+        ``schedule`` (the soccerdata reader behind schedule / missing_players /
+        season_stages). ``fs_response_*`` is a lower bound on residential-proxy
+        MB, not the proxy MB itself — see
+        ``docs/research/flaresolverr-proxy-traffic-audit.md``.
+        """
+        events = self._last_events_traffic or {}
+        schedule: dict = {}
+        reader = self._reader
+        if reader is not None and getattr(reader, "_fs_client", None) is not None:
+            schedule = reader._fs_client.get_traffic_stats()
+        return {"events": events, "schedule": schedule}
 
     def _build_proxy_url(self) -> Optional[str]:
         """Convert ``self.proxy`` (``host:port:user:pass``) to an HTTP proxy URL."""
