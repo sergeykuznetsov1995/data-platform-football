@@ -752,3 +752,57 @@ class TestEnumCompleteness:
         assert not leaked, (
             f"qualifier branch leaked outside enum: {sorted(leaked)}"
         )
+
+
+# ---------------------------------------------------------------------------
+# event_seq chronology across periods (#477)
+# ---------------------------------------------------------------------------
+
+
+class TestEventSeqChronology:
+    """event_seq must follow true match chronology, NOT lexical period order.
+
+    Regression for #477: the seq CTE used ``ORDER BY period`` where period is a
+    VARCHAR. Lexically 'FirstPeriodOfExtraTime' < 'PenaltyShootout' < 'SecondHalf'
+    < 'SecondPeriodOfExtraTime', so cup matches with extra time / shootouts got a
+    non-monotonic event_seq (extra-time/shootout events sorted BEFORE the second
+    half). The fix replaces the raw period column with an explicit chronological
+    CASE ordinal.
+    """
+
+    @staticmethod
+    def _seq(event_id: str) -> int:
+        return int(event_id.split("_")[1])
+
+    def test_extra_time_and_shootout_ordered_after_second_half(self, duck_conn):
+        # Seeded in deliberately NON-chronological insert order; the SQL must
+        # still assign event_seq following real match time.
+        rows = [
+            _row(game_id=700, period="PenaltyShootout",         minute=120, second=0, type_="Pass"),
+            _row(game_id=700, period="FirstHalf",               minute=10,  second=0, type_="Pass"),
+            _row(game_id=700, period="SecondPeriodOfExtraTime", minute=115, second=0, type_="Pass"),
+            _row(game_id=700, period="SecondHalf",              minute=80,  second=0, type_="Pass"),
+            _row(game_id=700, period="FirstPeriodOfExtraTime",  minute=100, second=0, type_="Pass"),
+        ]
+        out = _seed_and_run(duck_conn, rows)
+        seq = {r["period"]: self._seq(r["event_id"]) for r in out}
+        chronological = [
+            "FirstHalf", "SecondHalf", "FirstPeriodOfExtraTime",
+            "SecondPeriodOfExtraTime", "PenaltyShootout",
+        ]
+        ordered = [seq[p] for p in chronological]
+        assert ordered == sorted(ordered), (
+            f"event_seq not monotonic with match chronology: {seq}"
+        )
+
+    def test_within_period_minute_order_preserved(self, duck_conn):
+        """Within a single period, event_seq still follows ascending minute."""
+        rows = [
+            _row(game_id=701, period="FirstHalf", minute=30, second=0, expanded_minute=30, type_="Pass"),
+            _row(game_id=701, period="FirstHalf", minute=5,  second=0, expanded_minute=5,  type_="Pass"),
+            _row(game_id=701, period="FirstHalf", minute=15, second=0, expanded_minute=15, type_="Pass"),
+        ]
+        out = _seed_and_run(duck_conn, rows)
+        ordered = sorted(out, key=lambda r: self._seq(r["event_id"]))
+        minutes = [r["expanded_minute"] for r in ordered]
+        assert minutes == [5, 15, 30], f"within-period order broken: {minutes}"
