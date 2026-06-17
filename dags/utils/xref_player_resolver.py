@@ -182,6 +182,17 @@ def normalize_name(s: Optional[str]) -> str:
     return " ".join(unidecode(s).lower().split())
 
 
+# FotMob youth squads ("Arsenal U21", "Chelsea Under-21") — the FBref APL spine
+# never carries U18-U23 teams, so these rows can only ever orphan. Matched on
+# the raw team name and excluded at ingest (issue #563).
+_YOUTH_TEAM_RE = re.compile(r"(?i)\b(?:under[-\s]?|u[-\s]?)(?:18|19|20|21|23)\b")
+
+
+def _is_youth_team(team_name: Optional[str]) -> bool:
+    """True for FotMob youth squads (e.g. 'Arsenal U21') — never in FBref spine."""
+    return bool(team_name and _YOUTH_TEAM_RE.search(team_name))
+
+
 def canonical_team_for_resolver(
     raw_team: Optional[str],
     source: str,
@@ -915,6 +926,13 @@ def _fetch_fotmob_players(
     out: List[Dict[str, Any]] = []
     seen: set = set()
     for pid, name, team, lg, season, signal in rows:
+        # Align FotMob population with FBref coverage (issue #563). FBref lists
+        # only players with senior APL appearances and never carries U21 squads,
+        # so youth teams and zero-minute deep-squad/reserve players are
+        # structural non-overlaps, not resolver misses — they inflate the orphan
+        # rate ~10pp. Mirrors the Capology active+loan filter (_fetch_capology).
+        if _is_youth_team(team) or float(signal or 0.0) <= 0.0:
+            continue
         # Dedup by (pid, team, season) — same reasoning as
         # _fetch_understat_players above. Bronze fotmob_player_details
         # is partitioned by season (bigint), so each season is a distinct

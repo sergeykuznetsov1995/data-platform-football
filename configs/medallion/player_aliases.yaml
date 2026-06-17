@@ -41,3 +41,12 @@ aliases:
     fbref_player_id: "fe6e7156"
     season: "*"
     reason: "Savinho (Transfermarkt) ↔ Sávio (FBref) Brazilian nickname"
+
+  # Issue #563 — FotMob "Savinho" (1174337) vs FBref "Sávio" (fe6e7156), Man City.
+  # Same Brazilian nickname miss as #500, but FotMob carries a distinct source_id
+  # so the Transfermarkt alias above doesn't cover it. token_set 83 < 95.
+  - source: fotmob
+    source_id: "1174337"
+    fbref_player_id: "fe6e7156"
+    season: "*"
+    reason: "Savinho (FotMob) ↔ Sávio (FBref) Brazilian nickname"
