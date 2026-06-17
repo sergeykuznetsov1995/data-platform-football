@@ -2,9 +2,15 @@
 Tests for FBrefScraper.
 """
 
+import os
+
 import pytest
 import pandas as pd
 from unittest.mock import MagicMock, patch
+
+# Repo root (this file lives in tests/unit/scrapers/) — used for subprocess cwd
+# instead of a hard-coded /root/data_platform that doesn't exist in CI/docker.
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 
 
 class TestFBrefScraperConstants:
@@ -530,7 +536,7 @@ class TestFBrefRunnerScriptArguments:
              'print(args.mode)'],
             capture_output=True,
             text=True,
-            cwd='/root/data_platform',
+            cwd=_REPO_ROOT,
         )
 
         assert 'single_stat' in result.stdout or result.returncode == 0
@@ -841,7 +847,7 @@ sys.exit(0)
         result = subprocess.run(
             [sys.executable, '-c', test_script],
             capture_output=True, text=True,
-            cwd='/root/data_platform',
+            cwd=_REPO_ROOT,
         )
         assert result.returncode == 1
 
