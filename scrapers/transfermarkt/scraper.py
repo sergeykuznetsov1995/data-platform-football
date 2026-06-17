@@ -65,6 +65,17 @@ _PLAYER_TRANSFERS_PATH = "/ceapi/transferHistory/list/{player_id}"
 # "Coaching Staff" section row whose role is exactly "Manager" (head coach).
 _CLUB_STAFF_PATH = "/{club_slug}/mitarbeiter/verein/{club_id}/saison_id/{year}"
 _COACH_PROFILE_PATH = "/{coach_slug}/profil/trainer/{coach_id}"
+# Club trainer-history (issue #619). The staff page above is a single
+# end-of-season snapshot → it misses mid-season replacements and caretakers
+# (who ARE in the FBref spine because FBref attributes them to specific
+# matches). This page lists EVERY manager the club has had, with appointed /
+# end-of-tenure dates and a role; we keep the rows whose tenure overlaps the
+# requested season. No saison_id — the page is full history, filtered in
+# _parse_coach_history. NB: exact selectors must be confirmed via
+# scripts/probe_transfermarkt_coaches.py before the first prod run.
+_CLUB_COACH_HISTORY_PATH = (
+    "/{club_slug}/mitarbeiterhistorie/verein/{club_id}/plus/1"
+)
 
 # Canonical league-slug + competition-id mapping. MVP: APL only. Extend with
 # {'ESP-La Liga': ('laliga', 'ES1'), ...} when the issue's scope widens.
@@ -112,6 +123,31 @@ def _season_short(season: int) -> str:
     if len(s) == 4 and s.isdigit():
         return f"{s[2:4]}{(int(s[2:4]) + 1) % 100:02d}"
     return s
+
+
+def _season_window(season: int) -> Tuple[date, date]:
+    """Year-start ``season`` → the (start, end) dates of the football season.
+
+    APL seasons run roughly Jul 1 → Jun 30 the following year. Used by
+    _parse_coach_history to keep only the managers whose tenure overlaps the
+    requested season (issue #619). Generous bounds (Jul→Jun) tolerate pre-season
+    appointments and post-season departures without dropping a real stint.
+    """
+    y = int(season)
+    return date(y, 7, 1), date(y + 1, 6, 30)
+
+
+def _stint_overlaps_season(
+    stint: Dict, win_start: date, win_end: date
+) -> bool:
+    """True if a manager-stint's [appointed, left] interval overlaps the season
+    window (issue #619). A missing ``left`` means the incumbent (open-ended);
+    a missing ``appointed`` means unbounded-left. Both missing → kept (rare
+    malformed row; a spurious bio fetch is cheaper than a missed caretaker)."""
+    appointed = stint.get('appointed_date')
+    left = stint.get('left_date')
+    return (appointed is None or appointed <= win_end) and \
+           (left is None or left >= win_start)
 
 
 _INT_RE = re.compile(r'-?\d+')
@@ -469,6 +505,89 @@ def _parse_coach_profile(html: str, coach_id: str) -> Optional[Dict]:
         'dob': dob,
         'nationality': nationality,
     }
+
+
+def _parse_coach_history(html: str, club_id: str) -> List[Dict]:
+    """Extract every manager-stint from a club trainer-history page (issue #619).
+
+    The ``mitarbeiterhistorie`` page renders a ``table.items`` whose rows each
+    carry a manager link to ``/{slug}/profil/trainer/{id}``, the appointed and
+    end-of-tenure dates, and a role/function ("Manager", "Caretaker Manager",
+    "Interim Manager"). Returns one dict per stint:
+    ``{coach_id, coach_slug, name, role, appointed_date, left_date, club_id}``.
+    The caller filters by season window and dedups coach_id.
+
+    Rows without a trainer link (section/header rows) are skipped. Caretakers
+    are KEPT — they are exactly the coverage gap this page closes vs the
+    end-of-season staff snapshot.
+
+    NB: TM's history table layout differs from the staff page; confirm the
+    selectors with scripts/probe_transfermarkt_coaches.py before the first prod
+    run (same probe-first discipline as _parse_staff_managers, #434).
+    """
+    from bs4 import BeautifulSoup
+
+    soup = BeautifulSoup(html, 'html.parser')
+    table = soup.find('table', {'class': 'items'})
+    if table is None:
+        return []
+
+    out: List[Dict] = []
+    seen_stints: set = set()
+    for tr in table.find_all('tr'):
+        link = next(
+            (a for a in tr.find_all('a', href=True)
+             if _COACH_HREF_RE.match(a['href'])),
+            None,
+        )
+        if link is None:
+            continue
+        m = _COACH_HREF_RE.match(link['href'])
+        coach_id = m.group('id')
+        name = link.get_text(strip=True)
+        if not name:
+            continue
+
+        # Date cells, in row order. TM lists "Appointed" then "End of tenure"
+        # (the incumbent's end is blank / '-'). First parseable = appointed,
+        # second = left.
+        dates: List[date] = []
+        for td in tr.find_all('td'):
+            d = _parse_tm_date(td.get_text(' ', strip=True))
+            if d is not None:
+                dates.append(d)
+        appointed = dates[0] if dates else None
+        left = dates[1] if len(dates) > 1 else None
+
+        # De-dupe identical stint rows (a manager can appear once per spell).
+        stint_key = (coach_id, appointed, left)
+        if stint_key in seen_stints:
+            continue
+        seen_stints.add(stint_key)
+
+        # Role/function: first plain-text (non-link) cell that contains a letter
+        # and is not a date. Link cells (manager name, club) are skipped, as are
+        # placeholders ('-', '?') and date cells. Defaults to 'Manager' when the
+        # column is absent (older layouts).
+        role = 'Manager'
+        for td in tr.find_all('td'):
+            if td.find('a', href=True):
+                continue
+            txt = td.get_text(' ', strip=True)
+            if txt and any(c.isalpha() for c in txt) and _parse_tm_date(txt) is None:
+                role = txt
+                break
+
+        out.append({
+            'coach_id': coach_id,
+            'coach_slug': m.group('slug'),
+            'name': name,
+            'role': role,
+            'appointed_date': appointed,
+            'left_date': left,
+            'club_id': str(club_id),
+        })
+    return out
 
 
 def _parse_mv_history(payload: dict, player_id: str) -> List[Dict]:
@@ -1002,35 +1121,53 @@ class TransfermarktScraper(BaseScraper):
             clubs = clubs[: int(limit)]
         logger.info("TM coaches: %d clubs for %s/%s", len(clubs), league, season)
 
-        # Step 2 — per-club staff page → head coach (role == "Manager").
+        # Step 2 — per-club trainer-history page → every manager whose tenure
+        # overlaps the season (issue #619). The old staff snapshot kept only the
+        # end-of-season head coach, missing mid-season replacements and
+        # caretakers; the history page lists them all with appointed/left dates.
+        # Dedup coach_id per club so Step 3 fetches each bio once.
+        win_start, win_end = _season_window(season)
         managers: List[Dict] = []
         for club in clubs:
-            staff_url = (
+            history_url = (
                 f"{_TM_BASE}"
-                + _CLUB_STAFF_PATH.format(
+                + _CLUB_COACH_HISTORY_PATH.format(
                     club_slug=club['club_slug'],
                     club_id=club['club_id'],
-                    year=int(season),
                 )
             )
             html = self._fetch_html(
-                staff_url, label='staff',
+                history_url, label='coach_history',
                 context={'club_id': club['club_id']},
             )
             if html is None:
                 continue
-            for mgr in _parse_staff_managers(html, club_id=club['club_id']):
-                mgr['current_club_name'] = club['club_name']
-                managers.append(mgr)
+            seen_coach: set = set()
+            for stint in _parse_coach_history(html, club_id=club['club_id']):
+                if not _stint_overlaps_season(stint, win_start, win_end):
+                    continue
+                if stint['coach_id'] in seen_coach:
+                    continue
+                seen_coach.add(stint['coach_id'])
+                managers.append({
+                    'coach_id': stint['coach_id'],
+                    'coach_slug': stint['coach_slug'],
+                    'name': stint['name'],
+                    'role': stint['role'],
+                    'club_id': stint['club_id'],
+                    'current_club_name': club['club_name'],
+                })
 
         if not managers:
             logger.warning(
-                "%s: zero head coaches harvested across %d clubs.",
+                "%s: zero coaches harvested across %d clubs.",
                 R0_2B_FALLBACK_MARKER, len(clubs),
             )
             return pd.DataFrame(columns=anchor_cols + ['_ingested_at'])
 
-        logger.info("TM staff pages → %d head coaches to enrich", len(managers))
+        logger.info(
+            "TM trainer-history → %d in-season coaches to enrich", len(managers)
+        )
 
         # Step 3 — per-coach profile page → dob + nationality.
         rows: List[Dict] = []

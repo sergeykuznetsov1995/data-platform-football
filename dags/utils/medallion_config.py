@@ -63,6 +63,7 @@ TEAM_ALIASES_FILE = 'team_aliases.yaml'
 COMPETITIONS_FILE = 'competitions.yaml'
 PLAYER_ALIASES_FILE = 'player_aliases.yaml'
 REFEREE_ALIASES_FILE = 'referee_aliases.yaml'
+MANAGER_ALIASES_FILE = 'manager_aliases.yaml'
 VENUE_ALIASES_FILE = 'venue_aliases.yaml'
 SOURCE_PRIORITY_FILE = 'source_priority.yaml'
 COUNTRY_CODES_FILE = 'country_codes.yaml'
@@ -169,6 +170,55 @@ def _validate_referee_aliases_schema(doc: Dict) -> None:
             raise MedallionConfigError(
                 f"referee_aliases.yaml: duplicate canonical_id {cid!r} "
                 f"(referees[{i}]) — one slug must map to one referee"
+            )
+        seen_ids.add(cid)
+
+
+def _validate_manager_aliases_schema(doc: Dict) -> None:
+    """Structural validation of manager_aliases.yaml (issue #619).
+
+    Mirror of :func:`_validate_referee_aliases_schema` but keyed on ``managers``.
+    Each entry needs ``canonical_name``, an ``aliases`` mapping, and an explicit
+    ``canonical_id`` slug. Unlike referees (``ref_<slug>``), the manager slug is
+    the BARE FBref-spine name-normalize id (e.g. ``regis_le_bris``) so it joins
+    straight onto the gold.dim_manager spine — NO ``mgr_`` prefix. The regex
+    ``^[a-z0-9_]+$`` is identical; only the prefix convention differs.
+    """
+    if not isinstance(doc, dict) or 'managers' not in doc:
+        raise MedallionConfigError(
+            "manager_aliases.yaml: missing top-level 'managers' key"
+        )
+    managers = doc['managers']
+    if not isinstance(managers, list):
+        raise MedallionConfigError(
+            "manager_aliases.yaml: 'managers' must be a list"
+        )
+    seen_ids: set = set()
+    for i, m in enumerate(managers):
+        if not isinstance(m, dict):
+            raise MedallionConfigError(
+                f"manager_aliases.yaml: managers[{i}] must be a mapping"
+            )
+        if 'canonical_name' not in m:
+            raise MedallionConfigError(
+                f"manager_aliases.yaml: managers[{i}] missing 'canonical_name'"
+            )
+        if 'aliases' not in m or not isinstance(m['aliases'], dict):
+            raise MedallionConfigError(
+                f"manager_aliases.yaml: managers[{i}] ({m.get('canonical_name')}) "
+                f"missing/invalid 'aliases'"
+            )
+        cid = m.get('canonical_id')
+        if not isinstance(cid, str) or not re.fullmatch(r'[a-z0-9_]+', cid):
+            raise MedallionConfigError(
+                f"manager_aliases.yaml: managers[{i}] ({m.get('canonical_name')}) "
+                f"missing/invalid 'canonical_id' (must match ^[a-z0-9_]+$, "
+                f"got {cid!r})"
+            )
+        if cid in seen_ids:
+            raise MedallionConfigError(
+                f"manager_aliases.yaml: duplicate canonical_id {cid!r} "
+                f"(managers[{i}]) — one slug must map to one manager"
             )
         seen_ids.add(cid)
 
@@ -470,6 +520,22 @@ def load_referee_aliases() -> Dict:
         return {'referees': []}
     doc = _read_yaml(path)
     _validate_referee_aliases_schema(doc)
+    return doc
+
+
+def load_manager_aliases() -> Dict:
+    """Return the parsed manager_aliases.yaml (with schema sanity-check).
+
+    Missing file is treated as ``{'managers': []}`` so an environment without
+    the curated file (e.g. a fresh checkout before #619) degrades to "no
+    manager aliases" — TM coaches fall back to plain name-normalize — rather
+    than crashing DAG-parse.
+    """
+    path = str(CONFIG_DIR / MANAGER_ALIASES_FILE)
+    if not Path(path).exists():
+        return {'managers': []}
+    doc = _read_yaml(path)
+    _validate_manager_aliases_schema(doc)
     return doc
 
 
@@ -883,6 +949,115 @@ def get_referee_alias_sql_values(
             f"    ('{_escape_sql_string(raw)}', "
             f"'{_escape_sql_string(canonical)}')"
             for raw, canonical, _cid in rows
+        ]
+    return ',\n'.join(lines).lstrip()
+
+
+# ---------------------------------------------------------------------------
+# Manager aliases — query helpers (issue #619)
+# ---------------------------------------------------------------------------
+
+# Sentinel emitted when there are NO curated manager aliases, so the rendered
+# VALUES clause stays valid Trino and the LEFT JOIN in
+# transfermarkt_coaches.sql.j2 matches nothing — a graceful no-op (TM-coaches
+# enrichment behaves exactly as pre-#619). This is a deliberate divergence from
+# the referee/team emitters (which mandate aliases): a missing manager_aliases
+# .yaml must NOT break the pre-existing coaches transform.
+_NO_MANAGER_ALIAS_SENTINEL = '__no_manager_alias__'
+
+
+def _manager_in_scope(manager: Dict, competition: Optional[str]) -> bool:
+    """True if this manager's competition_scope contains `competition`, OR if
+    no competition filter was requested. Missing scope defaults to APL."""
+    if competition is None:
+        return True
+    scope = manager.get('competition_scope') or ['ENG-Premier League']
+    return competition in scope
+
+
+def _iter_manager_aliases(
+    source: Optional[str],
+    competition: Optional[str],
+    include_league: bool = True,
+) -> List[Tuple[str, ...]]:
+    """Yield (raw_name, canonical_id[, league]) tuples from manager_aliases.yaml.
+
+    Mirror of :func:`_iter_referee_aliases`, with two differences: the tuple
+    drops ``canonical_name`` (TM silver keeps the source name as display) and
+    ``canonical_id`` is the BARE FBref-spine id (e.g. ``regis_le_bris``) so it
+    joins straight onto the gold.dim_manager spine. Same bucket-merge
+    (``_generic`` + source bucket), league fan-out, and order-preserving dedup.
+    """
+    doc = load_manager_aliases()
+    seen: set = set()
+    out: List[Tuple[str, ...]] = []
+    for manager in doc.get('managers', []):
+        if not _manager_in_scope(manager, competition):
+            continue
+        canonical_id = manager['canonical_id']
+        aliases = manager.get('aliases') or {}
+        leagues = (
+            (manager.get('competition_scope') or ['ENG-Premier League'])
+            if include_league else [None]
+        )
+
+        buckets: List[str] = [_GENERIC_BUCKET]
+        if source is None:
+            buckets.extend(k for k in aliases.keys() if k != _GENERIC_BUCKET)
+        else:
+            buckets.append(source)
+
+        for bucket in buckets:
+            for raw in aliases.get(bucket, []) or []:
+                for league in leagues:
+                    key = (
+                        (raw, canonical_id)
+                        if league is None
+                        else (raw, canonical_id, league)
+                    )
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    out.append(key)
+    return out
+
+
+def get_manager_alias_sql_values(
+    source: Optional[str] = 'transfermarkt',
+    competition: Optional[str] = None,
+    with_league: bool = True,
+) -> str:
+    """Render manager alias tuples as a Trino VALUES body (issue #619).
+
+    Default emits the 3-tuple ``(raw_name, canonical_id, league)`` consumed by
+    ``transfermarkt_coaches.sql.j2`` (``source='transfermarkt'`` — the only
+    consumer). Unlike :func:`get_referee_alias_sql_values`, an empty result is
+    NOT an error: it emits a single guaranteed-non-matching sentinel row so the
+    coaches transform keeps working (no-op) when no aliases are curated yet.
+    """
+    rows = _iter_manager_aliases(source, competition, include_league=with_league)
+    if not rows:
+        if with_league:
+            return (
+                f"    ('{_NO_MANAGER_ALIAS_SENTINEL}', "
+                f"'{_NO_MANAGER_ALIAS_SENTINEL}', '__none__')"
+            )
+        return (
+            f"    ('{_NO_MANAGER_ALIAS_SENTINEL}', "
+            f"'{_NO_MANAGER_ALIAS_SENTINEL}')"
+        )
+    if with_league:
+        lines = [
+            f"    ('{_escape_sql_string(raw)}', "
+            f"'{_escape_sql_string(cid)}', "
+            f"'{_escape_sql_string(league)}')"
+            for raw, cid, league in rows
+        ]
+    else:
+        lines = [
+            f"    ('{_escape_sql_string(raw)}', "
+            f"'{_escape_sql_string(cid)}')"
+            for raw, cid in rows
         ]
     return ',\n'.join(lines).lstrip()
 

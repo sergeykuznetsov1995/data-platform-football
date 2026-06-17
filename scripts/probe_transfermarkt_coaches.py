@@ -17,6 +17,9 @@ Steps:
   2. Staff page  /{club_slug}/mitarbeiter/verein/{club_id} — find trainer links
      + try to read role / dob / nationality straight off the staff table
   3. Coach profile /{slug}/profil/trainer/{id} — confirm dob/nationality itemprops
+  4. Trainer-history /{club_slug}/mitarbeiterhistorie/verein/{club_id} (issue
+     #619) — confirm the URL + run the REAL scraper parser _parse_coach_history
+     against live HTML (caretakers / mid-season stints with appointed/left dates)
 """
 from __future__ import annotations
 
@@ -39,6 +42,12 @@ from probe_transfermarkt import (  # noqa: E402
     _first_proxy,
     _get,
     _parse_listing,
+)
+
+# Issue #619: validate the REAL scraper parser against live trainer-history HTML.
+from scrapers.transfermarkt.scraper import (  # noqa: E402
+    _CLUB_COACH_HISTORY_PATH,
+    _parse_coach_history,
 )
 
 _TRAINER_HREF_RE = re.compile(r'^/([^/]+)/profil/trainer/(\d+)')
@@ -150,9 +159,43 @@ def main() -> int:
         verdict = _parse_coach_profile(html)
         print(f"- coach profile selectors: `{json.dumps(verdict, ensure_ascii=False)}`")
 
-    print("\n---\n**NOTE**: if dob/nationality appear in the Step 2 row_text, read_coaches "
-          "can take them off the staff page directly (1 request/club); otherwise it must "
-          "fetch each coach profile (Step 3 selectors).")
+    # --- Step 4: trainer-history (issue #619) ---
+    print("\n## Step 4 — Trainer-history (mitarbeiterhistorie)\n")
+    history_url = TM_BASE + _CLUB_COACH_HISTORY_PATH.format(
+        club_slug=club0['club_slug'], club_id=club0['club_id'],
+    )
+    print(f"- url: `{history_url}`")
+    status, html, dur = _get(history_url, proxy_url=proxy)
+    _dump('c4_trainer_history.html', html if status > 0 else '')
+    print(f"- HTTP **{status}** | {dur:.2f}s | {len(html) if status > 0 else 0} bytes")
+    if status == 200:
+        # Run the SHIPPING parser so the probe tests real code, not a fork.
+        stints = _parse_coach_history(html, club_id=club0['club_id'])
+        print(f"- _parse_coach_history → **{len(stints)}** stint(s)")
+        for s in stints[:8]:
+            print(
+                f"  - `{s['coach_id']}` {s['name']} | role={s['role']!r} "
+                f"| appointed={s['appointed_date']} left={s['left_date']}"
+            )
+        dated = sum(1 for s in stints if s['appointed_date'])
+        if not stints:
+            print("\n**VERDICT Step 4**: history page parsed 0 stints — URL or "
+                  "table.items selector drifted; inspect c4_trainer_history.html "
+                  "and fix _parse_coach_history before the prod run.")
+        elif dated == 0:
+            print("\n**VERDICT Step 4**: stints found but NO appointed dates parsed "
+                  "— the season-window filter would keep everything; fix the date "
+                  "cell extraction.")
+        else:
+            print(f"\n**VERDICT Step 4**: OK — {dated}/{len(stints)} stints carry an "
+                  "appointed date; caretakers/mid-season coaches are captured.")
+    else:
+        print("\n**VERDICT Step 4**: history page unreachable — confirm the "
+              "mitarbeiterhistorie URL pattern.")
+
+    print("\n---\n**NOTE**: Step 2/3 (snapshot) is the #434 path; issue #619 uses "
+          "Step 4 (trainer-history) so mid-season/caretaker coaches reach "
+          "dim_manager. read_coaches now harvests from the Step-4 page.")
     return 0
 
 
