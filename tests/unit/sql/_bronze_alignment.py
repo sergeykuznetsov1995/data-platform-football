@@ -82,11 +82,12 @@ def load_silver_sql(sql_path: Path) -> str:
     if sql_path.suffix == ".j2":
         mc = _load_medallion_config()
         # Pass every known alias-VALUES context; render_sql_template ignores
-        # unused keys, so one call covers team / referee templates alike.
+        # unused keys, so one call covers team / referee / manager templates alike.
         return mc.render_sql_template(
             str(sql_path),
             team_aliases_values_sql=mc.get_team_alias_sql_values(),
             referee_aliases_values_sql=mc.get_referee_alias_sql_values(),
+            manager_aliases_values_sql=mc.get_manager_alias_sql_values(),
         )
     return sql_path.read_text()
 
