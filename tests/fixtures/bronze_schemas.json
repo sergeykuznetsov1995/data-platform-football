@@ -1351,7 +1351,8 @@
         "starting_xi_average_age": "varchar",
         "team": "varchar",
         "team_id": "bigint",
-        "transfer_budget": "varchar"
+        "transfer_budget": "varchar",
+        "update": "varchar"
       }
     },
     "bronze.sofifa_teams": {
@@ -1363,7 +1364,8 @@
         "fifa_edition": "varchar",
         "league": "varchar",
         "team": "varchar",
-        "team_id": "bigint"
+        "team_id": "bigint",
+        "update": "varchar"
       }
     },
     "bronze.sofifa_versions": {
