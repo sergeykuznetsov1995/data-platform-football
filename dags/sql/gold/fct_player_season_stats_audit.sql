@@ -97,15 +97,21 @@ SELECT
     xf.season_year                                       AS season,
 
     -- ========= FotMob diff (INNER JOIN — всегда non-NULL) =========
-    -- HARD_FACT pairs с FBref-spine
-    (CAST(fb.mp                 AS DOUBLE) - CAST(fm.matches_played   AS DOUBLE)) AS matches_diff_fotmob,
-    (CAST(fb.minutes            AS DOUBLE) - CAST(fm.minutes_played   AS DOUBLE)) AS minutes_diff_fotmob,
-    (CAST(fb.goals              AS DOUBLE) - CAST(fm.goals            AS DOUBLE)) AS goals_diff_fotmob,
-    (CAST(fb.assists            AS DOUBLE) - CAST(fm.assists          AS DOUBLE)) AS assists_diff_fotmob,
-    (CAST(fb.yellow_cards       AS DOUBLE) - CAST(fm.yellow_cards     AS DOUBLE)) AS yellow_cards_diff_fotmob,
-    (CAST(fb.red_cards          AS DOUBLE) - CAST(fm.red_cards        AS DOUBLE)) AS red_cards_diff_fotmob,
-    (CAST(fb.penalties_won      AS DOUBLE) - CAST(fm.penalties_won    AS DOUBLE)) AS penalties_won_diff_fotmob,
-    (CAST(fb.penalties_conceded AS DOUBLE) - CAST(fm.penalties_conceded AS DOUBLE)) AS penalties_conceded_diff_fotmob,
+    -- HARD_FACT pairs с FBref-spine. NB (issue #564): FotMob отдаёт счётные
+    -- события (goals/assists/cards) разреженно — у игрока без события строки в
+    -- bronze нет, silver-пивот возвращает NULL. COALESCE(fm.*, 0) трактует
+    -- «не было события = 0» (а не NULL), иначе diff=NULL съедает ~38% пар и
+    -- искажает coverage/within-threshold. matches/minutes НЕ coalesce'им
+    -- (NULL ≠ 0, и они покрыты ~100%).
+    (CAST(fb.mp                 AS DOUBLE) - CAST(fm.matches_played            AS DOUBLE)) AS matches_diff_fotmob,
+    (CAST(fb.minutes            AS DOUBLE) - CAST(fm.minutes_played            AS DOUBLE)) AS minutes_diff_fotmob,
+    (CAST(fb.goals              AS DOUBLE) - CAST(COALESCE(fm.goals, 0)        AS DOUBLE)) AS goals_diff_fotmob,
+    (CAST(fb.assists            AS DOUBLE) - CAST(COALESCE(fm.assists, 0)      AS DOUBLE)) AS assists_diff_fotmob,
+    (CAST(fb.yellow_cards       AS DOUBLE) - CAST(COALESCE(fm.yellow_cards, 0) AS DOUBLE)) AS yellow_cards_diff_fotmob,
+    (CAST(fb.red_cards          AS DOUBLE) - CAST(COALESCE(fm.red_cards, 0)    AS DOUBLE)) AS red_cards_diff_fotmob,
+    -- penalties_won_diff_fotmob / penalties_conceded_diff_fotmob удалены (issue #564):
+    -- FotMob не отдаёт сезонные penalty_won/penalty_conceded (колонки полностью NULL,
+    -- 0/430 сравнимых пар) → нечего сравнивать. SofaScore penalties остаются (ниже).
     -- NB (issue #154): FotMob silver больше не отдаёт абсолюты shots/
     -- shots_on_target/interceptions/fouls/clearances/ball_recoveries/blocks/
     -- accurate_passes/accurate_long_balls/successful_dribbles → соответствующие
