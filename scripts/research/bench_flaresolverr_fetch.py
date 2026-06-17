@@ -27,6 +27,8 @@ Run (inside the airflow container, on the VM):
   docker exec -e BENCH_LABEL=baseline airflow-webserver bash -c \\
     'cd /opt/airflow && python scripts/research/bench_flaresolverr_fetch.py --source whoscored'
   docker exec -e BENCH_LABEL=baseline airflow-webserver bash -c \\
+    'cd /opt/airflow && python scripts/research/bench_flaresolverr_fetch.py --source whoscored-schedule'
+  docker exec -e BENCH_LABEL=baseline airflow-webserver bash -c \\
     'cd /opt/airflow && python scripts/research/bench_flaresolverr_fetch.py --source sofifa'
 
 Override the fixed set (else WhoScored pulls game_ids from
@@ -166,6 +168,36 @@ def _bench_whoscored(n: int, proxy_file: str, fs_url: str, league: str, season: 
     return client.get_traffic_stats(), per_match, len(ids), succeeded
 
 
+def _bench_whoscored_schedule(proxy_file: str, fs_url: str, league: str, season: int):
+    """Fetch the WhoScored schedule once (no Iceberg write).
+
+    Schedule is a once-per-(league, season) operation, not per-match, so this
+    runs a single ``read_schedule()`` through the same FlareSolverr reader the
+    production schedule path uses (``SESSION_RECREATE_EVERY=8``). Mirrors
+    ``_bench_sofifa``: build the reader directly with the picked proxy and read
+    its ``_fs_client`` traffic stats — ``_save()`` / Iceberg is deliberately
+    skipped so the bench measures fetch traffic only.
+    """
+    from scrapers.whoscored.flaresolverr_reader import FlareSolverrWhoScoredReader
+
+    proxy_url, _ = _pick_proxy_url(proxy_file)
+    reader = FlareSolverrWhoScoredReader(
+        flaresolverr_url=fs_url, proxy=proxy_url,
+        leagues=[league], seasons=[season],
+    )
+    try:
+        t0 = time.monotonic()
+        df = reader.read_schedule()
+        elapsed = round(time.monotonic() - t0, 2)
+        rows = 0 if df is None else len(df)
+        stats = reader._fs_client.get_traffic_stats()
+        per_match = [{"i": 1, "rows": rows, "seconds": elapsed, "success": rows > 0}]
+        log.info(f"  schedule rows={rows} in {elapsed:.2f}s")
+        return stats, per_match, 1, (1 if rows > 0 else 0)
+    finally:
+        reader.close()
+
+
 def _bench_sofifa(n: int, proxy_file: str, fs_url: str, league: str, versions: str):
     """Fetch N SoFIFA player-rating pages sequentially (no Iceberg write)."""
     from scrapers.sofifa.flaresolverr_reader import FlareSolverrSoFIFAReader
@@ -204,7 +236,11 @@ def _bench_sofifa(n: int, proxy_file: str, fs_url: str, league: str, versions: s
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="Bench FlareSolverr proxy traffic")
-    ap.add_argument("--source", choices=["whoscored", "sofifa"], required=True)
+    ap.add_argument(
+        "--source",
+        choices=["whoscored", "whoscored-schedule", "sofifa"],
+        required=True,
+    )
     ap.add_argument("--n", type=int, default=10, help="Number of pages to fetch")
     ap.add_argument("--league", default="ENG-Premier League")
     ap.add_argument("--season", type=int, default=2025, help="[whoscored] season start year")
@@ -217,7 +253,7 @@ def main() -> None:
     args = ap.parse_args()
 
     label = os.environ.get("BENCH_LABEL", "unlabeled")
-    report_path = f"/tmp/bench_{args.source}_{label}.json"
+    report_path = f"/tmp/bench_{args.source.replace('-', '_')}_{label}.json"
 
     log.info("=" * 64)
     log.info(
@@ -234,6 +270,10 @@ def main() -> None:
     if args.source == "whoscored":
         stats, per_match, attempted, succeeded = _bench_whoscored(
             args.n, args.proxy_file, args.flaresolverr_url, args.league, args.season
+        )
+    elif args.source == "whoscored-schedule":
+        stats, per_match, attempted, succeeded = _bench_whoscored_schedule(
+            args.proxy_file, args.flaresolverr_url, args.league, args.season
         )
     else:
         stats, per_match, attempted, succeeded = _bench_sofifa(
