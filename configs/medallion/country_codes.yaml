@@ -11,6 +11,14 @@
 # is single-format (full names) across all sources. Unmapped codes degrade to
 # the raw 3-letter code (graceful — never NULL).
 #
+# #585: each entry MAY carry an optional `aliases` list — alternate full-name
+# spellings emitted by the enrichment sources (e.g. USA -> United States,
+# Czechia -> Czech Republic). Rendered via the {{ nationality_alias_values_sql }}
+# placeholder (medallion_config.get_country_alias_sql_values) and applied in
+# dim_player.sql.j2 to canonicalize the winning source spelling BEFORE the
+# code-map fallback. Every alias maps to the canonical `name`; an alias must be
+# globally unique and must not collide with any `name`.
+#
 # `name` MUST match the spelling emitted by FotMob/SofaScore/Transfermarkt so
 # a player resolved via the map reads identically to one resolved via a source
 # (single canonical spelling). Reconcile against:
@@ -21,6 +29,7 @@
 # Field reference:
 #   code — FIFA/IOC 3-letter code, upper-case (^[A-Z]{3}$), unique
 #   name — full country name (full-name spelling per the enrichment sources)
+#   aliases — optional list of alternate source spellings -> canonical `name`
 # =============================================================================
 
 countries:
@@ -29,7 +38,7 @@ countries:
   - {code: SCO, name: Scotland}
   - {code: WAL, name: Wales}
   - {code: NIR, name: Northern Ireland}
-  - {code: IRL, name: Republic of Ireland}
+  - {code: IRL, name: Republic of Ireland, aliases: [Ireland]}
 
   # --- UEFA (Europe) ---
   - {code: FRA, name: France}
@@ -47,7 +56,7 @@ countries:
   - {code: FIN, name: Finland}
   - {code: ISL, name: Iceland}
   - {code: POL, name: Poland}
-  - {code: CZE, name: Czech Republic}
+  - {code: CZE, name: Czech Republic, aliases: [Czechia]}
   - {code: SVK, name: Slovakia}
   - {code: SVN, name: Slovenia}
   - {code: CRO, name: Croatia}
@@ -61,7 +70,7 @@ countries:
   - {code: ROU, name: Romania}
   - {code: BUL, name: Bulgaria}
   - {code: HUN, name: Hungary}
-  - {code: TUR, name: Turkey}
+  - {code: TUR, name: Turkey, aliases: [Türkiye, Turkiye]}
   - {code: UKR, name: Ukraine}
   - {code: RUS, name: Russia}
   - {code: BLR, name: Belarus}
@@ -94,7 +103,7 @@ countries:
   - {code: ECU, name: Ecuador}
   - {code: VEN, name: Venezuela}
   - {code: BOL, name: Bolivia}
-  - {code: USA, name: United States}
+  - {code: USA, name: United States, aliases: [USA]}
   - {code: CAN, name: Canada}
   - {code: MEX, name: Mexico}
   - {code: CRC, name: Costa Rica}
@@ -123,7 +132,7 @@ countries:
   # --- CAF (Africa) ---
   - {code: NGA, name: Nigeria}
   - {code: GHA, name: Ghana}
-  - {code: CIV, name: Ivory Coast}
+  - {code: CIV, name: Ivory Coast, aliases: ["Côte d'Ivoire", "Cote d'Ivoire"]}
   - {code: SEN, name: Senegal}
   - {code: CMR, name: Cameroon}
   - {code: MLI, name: Mali}
@@ -131,7 +140,7 @@ countries:
   - {code: MAR, name: Morocco}
   - {code: ALG, name: Algeria}
   - {code: TUN, name: Tunisia}
-  - {code: COD, name: DR Congo}
+  - {code: COD, name: DR Congo, aliases: [Congo DR]}
   - {code: CGO, name: Congo}
   - {code: GAB, name: Gabon}
   - {code: GUI, name: Guinea}
@@ -145,7 +154,7 @@ countries:
   - {code: UGA, name: Uganda}
   - {code: ANG, name: Angola}
   - {code: CPV, name: Cape Verde}
-  - {code: GAM, name: Gambia}
+  - {code: GAM, name: Gambia, aliases: [The Gambia]}
   - {code: SLE, name: Sierra Leone}
   - {code: LBR, name: Liberia}
   - {code: MAD, name: Madagascar}
@@ -162,7 +171,7 @@ countries:
 
   # --- AFC / OFC (Asia & Oceania) ---
   - {code: JPN, name: Japan}
-  - {code: KOR, name: South Korea}
+  - {code: KOR, name: South Korea, aliases: [Korea Republic, "Korea, South"]}
   - {code: PRK, name: North Korea}
   - {code: CHN, name: China}
   - {code: AUS, name: Australia}
