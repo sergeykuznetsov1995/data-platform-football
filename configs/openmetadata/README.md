@@ -119,5 +119,5 @@ hard-deleting a table that is only transiently missing from Trino would permanen
 destroy its descriptions, tags, and lineage. Always review the dry-run list first.
 
 > `entity_xref` is **not** cleaned here: it was never part of epic #478. Its own
-> drop is the separate followup #146 (already absent from live gold per the Trino
+> drop is the separate followup #211 (already absent from live gold per the Trino
 > inventory in #475), so it is out of scope for this #478 cleanup.

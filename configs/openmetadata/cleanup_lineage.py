@@ -51,7 +51,7 @@ SERVICE = "trino_iceberg"
 # om-lineage-trino) linger after the drop because markDeletedTables only
 # soft-deletes. Source: the 19 deleted dags/sql/gold/*.sql in PR #490.
 # entity_xref is intentionally EXCLUDED — it was never part of epic #478. Its own
-# drop is the separate followup #146 (entity_xref is already absent from live gold
+# drop is the separate followup #211 (entity_xref is already absent from live gold
 # per the Trino inventory in #475), so it is not one of these #478 soft-deletes.
 DROPPED_TABLES = [
     "fct_match",
