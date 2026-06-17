@@ -1506,16 +1506,16 @@ def validate_gold_quality() -> Dict[str, Any]:
         # passed через `OR <col> IS NULL`.
         # ============================================================
         CHECK.no_duplicates('gold.fct_player_match_audit',
-                            pk=['match_id_canonical', 'player_id_canonical']),
+                            pk=['match_id', 'player_id']),
         CHECK.no_nulls('gold.fct_player_match_audit',
-                       cols=['match_id_canonical', 'player_id_canonical']),
+                       cols=['match_id', 'player_id']),
         # audit ⊆ main fct (INNER FBref ∩ SofaScore) → каждая audit-строка
         # должна находить парную строку в gold.fct_player_match.
-        # #426: parent column renamed to player_id; audit keeps *_canonical.
+        # #442: audit PK renamed off *_canonical to match parent (player_id).
         CHECK.ref_integrity(
             'gold.fct_player_match_audit',
             'gold.fct_player_match',
-            'player_id_canonical',
+            'player_id',
             parent_key='player_id',
         ),
 
@@ -1744,15 +1744,15 @@ def validate_gold_quality() -> Dict[str, Any]:
         # Thresholds: ±1 для integer counters, ±5 для possession, ±0.5 для xG.
         # ============================================================
         CHECK.no_duplicates('gold.fct_team_match_audit',
-                            pk=['match_id_canonical', 'team_id_canonical']),
+                            pk=['match_id', 'team_id']),
         CHECK.no_nulls('gold.fct_team_match_audit',
-                       cols=['match_id_canonical', 'team_id_canonical']),
+                       cols=['match_id', 'team_id']),
         # audit ⊆ main fct (INNER FBref ∩ US) → каждая audit-строка должна
-        # находить парную (match_id, team_id) в gold.fct_team_match. main fct
-        # PK uses match_id/team_id (v1 names), audit uses *_canonical, но
-        # значения идентичны (для source='fbref' canonical == raw).
+        # находить парную (match_id, team_id) в gold.fct_team_match. #442: audit
+        # PK renamed off *_canonical to match parent names; значения идентичны
+        # (для source='fbref' canonical == raw).
         CHECK.ref_integrity('gold.fct_team_match_audit', 'gold.fct_team_match',
-                            'match_id_canonical', parent_key='match_id'),
+                            'match_id', parent_key='match_id'),
 
         # ----- Understat diff (INNER spine — всегда non-NULL) -----
         CHECK.coverage('gold.fct_team_match_audit',

@@ -7,7 +7,7 @@ table:
     Cross-source DQ-audit таблица для gold.fct_team_match. НЕ business-витрина:
     содержит ТОЛЬКО технические diff-колонки + PK.
 
-    Grain: (match_id_canonical, team_id_canonical). Только строки с пересечением
+    Grain: (match_id, team_id). Только строки с пересечением
     FBref ∩ Understat (INNER JOIN spine, design doc §8.3). SofaScore / WhoScored
     / FotMob (#97) — LEFT JOIN → diff = NULL при отсутствии записи.
 
@@ -34,12 +34,12 @@ table:
     - PII.None
 columns:
   # ─── PK ───
-  - name: match_id_canonical
+  - name: match_id
     description: |
       Канонический ID матча (PK part). Равен fb.match_id (FBref hex), который
       для source='fbref' является canonical_id в silver.xref_match.
       FK → gold.fct_team_match.match_id.
-  - name: team_id_canonical
+  - name: team_id
     description: |
       Канонический ID команды (PK part). Из silver.xref_team (source='fbref',
       confidence <> 'orphan').
@@ -131,11 +131,11 @@ columns:
       поверх SQL. Дублирует _gold_created_at — унификация в followup.
 
 relationships:
-  - from: match_id_canonical
+  - from: match_id
     to: trino_iceberg.iceberg.gold.fct_team_match.match_id
     type: FOREIGN_KEY
-    description: N:1 — business-витрина с тем же grain (v1 column name).
-  - from: team_id_canonical
+    description: N:1 — business-витрина с тем же grain.
+  - from: team_id
     to: trino_iceberg.iceberg.gold.fct_team_match.team_id
     type: FOREIGN_KEY
-    description: N:1 — business-витрина с тем же grain (v1 column name).
+    description: N:1 — business-витрина с тем же grain.
