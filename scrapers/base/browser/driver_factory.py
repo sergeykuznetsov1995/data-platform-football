@@ -99,6 +99,14 @@ class DriverFactory:
         # they null the WebGL context, which Cloudflare reads as a bot marker. WebGL
         # needs GPU/SwiftShader enabled to produce a "real" context. (#567)
 
+        # Software WebGL via ANGLE (#574): with the mesa GL stack in the image + Xvfb,
+        # these make Chromium 120 expose a real WebGL context (Mesa/llvmpipe) instead of
+        # null. --use-angle=swiftshader is the only ANGLE backend that initializes;
+        # --use-angle=gl fails EGL/X init → null. (Headless has no X display, so WebGL
+        # appears only when use_xvfb=True.)
+        options.add_argument('--use-gl=angle')
+        options.add_argument('--use-angle=swiftshader')
+
         # Memory and stability optimizations
         options.add_argument('--disable-background-networking')
         options.add_argument('--disable-default-apps')
@@ -197,6 +205,9 @@ class DriverFactory:
         options.add_argument('--disable-dev-shm-usage')
         # Note: --disable-gpu intentionally NOT set — it nulls the WebGL context
         # that Cloudflare uses to verify a "real" browser (bot marker). (#567)
+        # Software WebGL via ANGLE — see _create_undetected_driver; needs Xvfb. (#574)
+        options.add_argument('--use-gl=angle')
+        options.add_argument('--use-angle=swiftshader')
         options.add_argument('--disable-blink-features=AutomationControlled')
 
         # Handle proxy settings - bypass system proxy if no explicit proxy configured

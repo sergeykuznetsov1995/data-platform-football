@@ -560,6 +560,16 @@ class NodriverBypass:
         # intentionally removed — they create a unique browser fingerprint that
         # Cloudflare detects as a bot marker. WebGL fingerprinting requires GPU enabled.
 
+        # Software WebGL via ANGLE. The image ships a mesa GL stack (libgl1-mesa-dri/
+        # glx/egl); under Xvfb these flags make Chromium 120 expose a real WebGL context
+        # (renderer "ANGLE (Mesa/X.org, llvmpipe ...)") instead of a null context, which
+        # Cloudflare reads as a bot marker. --use-angle=swiftshader is the only ANGLE
+        # backend that initializes in this Debian Chromium 120 build — with mesa present
+        # it resolves to Mesa/llvmpipe (not actual SwiftShader); --use-angle=gl fails
+        # EGL/X init and yields a null context. (#574)
+        config.add_argument('--use-gl=angle')
+        config.add_argument('--use-angle=swiftshader')
+
         # Add custom browser arguments
         for arg in self.browser_args:
             config.add_argument(arg)
