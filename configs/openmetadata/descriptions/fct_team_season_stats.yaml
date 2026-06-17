@@ -275,6 +275,70 @@ columns:
       для кросс-валютной сопоставимости со squad_market_value_eur. Покрытие —
       только APL 2025/26 (season '2526'); иначе NULL. Issue #195 / PR #244.
 
+  # ─── Прямые Capology team-finance — APL, до 12 сезонов, else NULL (#643) ───
+  # Источник: silver.capology_{team_payrolls,transfer_window} (прямой team-level
+  # снимок, canonical_id уже разрешён в Silver). Дополняют salary-sum wage bill,
+  # не заменяют его. Покрытие шире, чем total_wage_bill (12 сезонов APL vs 2526).
+  - name: declared_payroll_gross_gbp
+    description: |
+      Заявленный клубный фонд оплаты труда, gross, GBP (Capology team_payrolls,
+      total_gross_gbp — прямой team-снимок, не SUM зарплат игроков). Кросс-чек
+      против salary-sum total_wage_bill_gbp. Issue #643.
+  - name: declared_payroll_gross_eur
+    description: |
+      Заявленный клубный фонд, gross, EUR (Capology team_payrolls, total_gross_eur).
+      EUR-сиблинг declared_payroll_gross_gbp. Issue #643.
+  - name: declared_payroll_net_gbp
+    description: |
+      Заявленный клубный фонд, net (после налогов), GBP (Capology team_payrolls,
+      total_net_gbp). Issue #643.
+  - name: declared_payroll_net_eur
+    description: |
+      Заявленный клубный фонд, net, EUR (Capology team_payrolls, total_net_eur).
+      Issue #643.
+  - name: declared_payroll_adjusted_gross_gbp
+    description: |
+      Рыночно-скорректированный заявленный фонд, gross, GBP (Capology
+      team_payrolls, adjusted_total_gross_gbp). Issue #643.
+  - name: declared_payroll_adjusted_gross_eur
+    description: |
+      Рыночно-скорректированный заявленный фонд, gross, EUR (Capology
+      team_payrolls, adjusted_total_gross_eur). Issue #643.
+  - name: transfer_income_gbp
+    description: |
+      Доход от продаж игроков за трансферное окно, GBP (Capology transfer_window,
+      income_gbp). Issue #643.
+  - name: transfer_income_eur
+    description: |
+      Доход от продаж за трансферное окно, EUR (Capology transfer_window,
+      income_eur). Issue #643.
+  - name: transfer_expense_gbp
+    description: |
+      Расход на покупки игроков за трансферное окно, GBP (Capology transfer_window,
+      expense_gbp). Issue #643.
+  - name: transfer_expense_eur
+    description: |
+      Расход на покупки за трансферное окно, EUR (Capology transfer_window,
+      expense_eur). Issue #643.
+  - name: transfer_balance_gbp
+    description: |
+      Нетто-баланс трансферного окна, GBP (Capology transfer_window, balance_gbp;
+      income − expense). Отрицательное значение = нетто-расход. Issue #643.
+  - name: transfer_balance_eur
+    description: |
+      Нетто-баланс трансферного окна, EUR (Capology transfer_window, balance_eur).
+      Отрицательное значение = нетто-расход. Issue #643.
+  - name: squad_size
+    description: |
+      Размер заявки (число игроков) на момент снимка трансферного окна
+      (Capology transfer_window, players). Issue #643.
+  - name: avg_squad_age
+    description: |
+      Средний возраст состава (Capology transfer_window, age). Issue #643.
+  - name: foreign_count
+    description: |
+      Число легионеров в составе (Capology transfer_window, foreign). Issue #643.
+
   # ─── Lineage ───
   - name: _gold_created_at
     description: Технический timestamp материализации строки CTAS (UTC).
