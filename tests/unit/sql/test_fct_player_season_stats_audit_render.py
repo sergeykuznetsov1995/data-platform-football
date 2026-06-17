@@ -2,7 +2,7 @@
 
 T5 audit: DQ-таблица для cross-source согласованности FBref vs FotMob.
 INNER JOIN на оба источника → rows только где обе стороны не-NULL.
-Не business-витрина: ТОЛЬКО PK + 8 diff-колонок + lineage.
+Не business-витрина: ТОЛЬКО PK + 6 FotMob diff-колонок + lineage.
 """
 
 from __future__ import annotations
@@ -76,18 +76,17 @@ class TestFctPlayerSeasonStatsAuditSql:
             assert re.search(rf"\b{col}\b", sql)
 
     def test_audit_diff_columns(self):
-        """15 audit-diff: 8 FotMob + 1 WhoScored + 6 Understat."""
+        """13 audit-diff: 6 FotMob + 1 WhoScored + 6 Understat."""
         sql = _read_sql()
         audit_cols = [
-            # FotMob (8)
+            # FotMob (6; #564: penalties_won/conceded удалены — FotMob не
+            # отдаёт сезонные пенальти, колонки были полностью NULL)
             'matches_diff_fotmob',
             'minutes_diff_fotmob',
             'goals_diff_fotmob',
             'assists_diff_fotmob',
             'yellow_cards_diff_fotmob',
             'red_cards_diff_fotmob',
-            'penalties_won_diff_fotmob',
-            'penalties_conceded_diff_fotmob',
             # WhoScored (1; только matches есть в event-aggregate)
             'matches_diff_whoscored',
             # Understat (6)
@@ -105,16 +104,40 @@ class TestFctPlayerSeasonStatsAuditSql:
 
     def test_no_business_metric_columns(self):
         """Audit-таблица содержит ТОЛЬКО diff + PK + lineage. Никаких
-        business-метрик (goals/assists сами по себе, COALESCE и т.п.)."""
+        standalone business-метрик. COALESCE допустим ТОЛЬКО внутри FotMob
+        diff-выражений (#564: NULL=«не было события»→0), не как отдельная метрика."""
         sql = _strip_comments(_read_sql())
-        assert "COALESCE" not in sql.upper(), (
-            "audit must NOT carry business COALESCE-metrics — only diff"
-        )
+        for line in sql.splitlines():
+            if "COALESCE" in line.upper():
+                assert "diff_fotmob" in line.lower(), (
+                    "COALESCE разрешён только внутри FotMob diff-выражений, "
+                    f"не как business-метрика: {line.strip()}"
+                )
         # UNIQUE_FBREF / UNIQUE_FOTMOB не должны быть выпроецированы.
         for col in ['expected_goals', 'fotmob_rating', 'complete_matches',
                     'big_chances_created']:
             assert not re.search(rf"\bAS\s+{col}\b", sql, re.IGNORECASE), (
                 f"audit-таблица не должна содержать business-метрику `{col}`"
+            )
+
+    def test_fotmob_count_diffs_coalesce_to_zero(self):
+        """#564: разреженные FotMob счётчики COALESCE→0 (иначе diff=NULL
+        съедает ~38% пар). penalties_won/conceded удалены — FotMob не отдаёт
+        сезонные пенальти (колонки были полностью NULL)."""
+        sql = _strip_comments(_read_sql())
+        for metric in ['goals', 'assists', 'yellow_cards', 'red_cards']:
+            assert re.search(
+                rf"COALESCE\(fm\.{metric},\s*0\)", sql, re.IGNORECASE,
+            ), f"FotMob `{metric}` diff должен COALESCE→0 (#564)"
+        # matches/minutes НЕ coalesce'им (NULL ≠ 0).
+        for raw in ['matches_played', 'minutes_played']:
+            assert not re.search(
+                rf"COALESCE\(fm\.{raw}", sql, re.IGNORECASE,
+            ), f"FotMob `{raw}` НЕ должен coalesce'иться (NULL ≠ 0)"
+        for dropped in ['penalties_won_diff_fotmob',
+                        'penalties_conceded_diff_fotmob']:
+            assert not re.search(rf"\bAS\s+{dropped}\b", sql, re.IGNORECASE), (
+                f"`{dropped}` должен быть удалён (#564)"
             )
 
     def test_outfield_filter_excludes_keepers(self):

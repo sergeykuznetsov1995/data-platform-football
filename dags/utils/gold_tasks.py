@@ -1257,11 +1257,13 @@ def validate_gold_quality() -> Dict[str, Any]:
             'player_id_canonical',
             parent_key='player_id',
         ),
-        # 8 audit-diff coverage WARNING-only (error_threshold=0). Audit —
+        # 6 audit-diff coverage WARNING-only (error_threshold=0). Audit —
         # observability, не gate; ERROR ломал бы DAG при нормальных
-        # cross-source расхождениях (например FotMob не отдаёт нулевой
-        # penalty_won → diff=NULL для большинства rows). NULL diff
-        # засчитывается как "not measured" (passed) — не ошибка.
+        # cross-source расхождениях (mid-season transfer, разные методики
+        # подсчёта). NULL diff засчитывается как "not measured" (passed).
+        # #564: goals/assists/cards FotMob теперь COALESCE→0 в SQL (NULL=«не
+        # было события»); penalties_won/conceded diff-колонки удалены (FotMob
+        # не отдаёт сезонные пенальти — были полностью NULL).
         CHECK.coverage('gold.fct_player_season_stats_audit',
                        condition='ABS(matches_diff_fotmob) <= 1 OR matches_diff_fotmob IS NULL',
                        warn_threshold=0.95, error_threshold=0.0,
@@ -1286,14 +1288,6 @@ def validate_gold_quality() -> Dict[str, Any]:
                        condition='ABS(red_cards_diff_fotmob) <= 1 OR red_cards_diff_fotmob IS NULL',
                        warn_threshold=0.95, error_threshold=0.0,
                        name='audit_diff[fct_player_season_stats_audit.red_cards]'),
-        CHECK.coverage('gold.fct_player_season_stats_audit',
-                       condition='ABS(penalties_won_diff_fotmob) <= 1 OR penalties_won_diff_fotmob IS NULL',
-                       warn_threshold=0.95, error_threshold=0.0,
-                       name='audit_diff[fct_player_season_stats_audit.penalties_won]'),
-        CHECK.coverage('gold.fct_player_season_stats_audit',
-                       condition='ABS(penalties_conceded_diff_fotmob) <= 1 OR penalties_conceded_diff_fotmob IS NULL',
-                       warn_threshold=0.95, error_threshold=0.0,
-                       name='audit_diff[fct_player_season_stats_audit.penalties_conceded]'),
         # ----- WhoScored audit (1: только matches есть в event-aggregate) -----
         CHECK.coverage('gold.fct_player_season_stats_audit',
                        condition='ABS(matches_diff_whoscored) <= 1 OR matches_diff_whoscored IS NULL',
