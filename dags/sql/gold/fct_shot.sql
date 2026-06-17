@@ -36,8 +36,10 @@
 --
 -- Notes on Understat raw values (sample 143k rows on 2026-05-08):
 --   * `xa` is NOT present in bronze.understat_shots; Understat exposes the
---     assister via `assist_player_id`/`assist_player`. We therefore expose the
---     assister-pointer columns instead of `xa`. xA aggregation lives in
+--     assister by NAME only (`assist_player`). There is no per-shot numeric
+--     assist id — `bronze.assist_player_id` is a soccerdata roster-row id (#444)
+--     and is IGNORED here. The assister is resolved name → bronze.understat_players
+--     → xref_player (see us_player_dim CTE). xA aggregation lives in
 --     fct_player_match (cross-source via in-match name-match).
 --   * `body_part` ∈ {Right Foot, Left Foot} only in current sample (no Head /
 --     Other Body Part observed yet). Mapping branches included for forward
@@ -79,7 +81,7 @@
 --   match_id                 varchar    -- fbref match_id (8-char hex)
 --   team_id                  varchar    -- xref_team(source='understat')
 --   player_id                varchar    -- xref_player(source='understat'); orphan us_* possible
---   assist_player_id         varchar    -- xref_player(source='understat'); NULL when no assist
+--   assist_player_id         varchar    -- name-resolved canonical (#444); NULL when no assist
 --   minute                   integer
 --   x, y                     double     -- 0..1 normalized
 --   body_part                varchar    -- foot | head | other | NULL
@@ -135,6 +137,26 @@ xref_player_dedup AS (
     SELECT source, source_id, ARBITRARY(canonical_id) AS canonical_id
     FROM iceberg.silver.xref_player
     GROUP BY source, source_id
+),
+
+-- 0c) Understat name→player_id dictionary (#444) -----------------------------
+--    Understat has NO per-shot numeric assist id. soccerdata 1.8.8 fills
+--    bronze.understat_shots.assist_player_id with the roster-ROW id instead of
+--    the player id, so it never matches xref_player and assist resolution was
+--    100% NULL. The assister NAME (`assist_player`) IS correct, so we recover
+--    the true understat player_id from bronze.understat_players (the same source
+--    that feeds xref_player) keyed on (LOWER(name), league, season). The player
+--    id is stable across mid-season transfers, so ARBITRARY is safe when a name
+--    appears under two teams; identical names within one league-season (rare)
+--    are the only residual collision risk, tracked in DQ.
+us_player_dim AS (
+    SELECT LOWER(player)                          AS player_norm,
+           league,
+           CAST(season AS varchar)                AS season,
+           ARBITRARY(CAST(player_id AS varchar))  AS understat_player_id
+    FROM iceberg.bronze.understat_players
+    WHERE player IS NOT NULL AND player_id IS NOT NULL
+    GROUP BY LOWER(player), league, CAST(season AS varchar)
 ),
 
 -- 1) Bridge: understat game_id → fbref match_id ------------------------------
@@ -238,7 +260,11 @@ shots_norm AS (
         -- xref_player.source_id for source='understat' is player_id as varchar
         -- (e.g. '5613'). Bronze stores BIGINT → cast to varchar for join.
         CAST(s.player_id AS varchar)   AS understat_player_source_id,
-        CAST(s.assist_player_id AS varchar) AS understat_assist_player_source_id,
+        -- #444: resolve the assister by NAME (bronze.assist_player_id is a
+        -- soccerdata roster-row id, not a player id). Lower-cased for the join
+        -- against the understat name→id dictionary; same source, so case is the
+        -- only normalisation needed.
+        LOWER(s.assist_player)         AS assist_player_norm,
         CAST(s.minute    AS integer)   AS minute,
         s.location_x                   AS x,
         s.location_y                   AS y,
@@ -336,6 +362,14 @@ LEFT JOIN xref_player_dedup xp
        ON xp.source    = 'understat'
       AND xp.source_id = sn.understat_player_source_id
 
+-- Assister resolution (#444): recover the true understat player_id from the
+-- name dictionary (Understat has no per-shot assist id), then xref to canonical.
+-- NULL assist_player_norm (no assist) → no match → NULL assist_player_id.
+LEFT JOIN us_player_dim upd
+       ON upd.player_norm = sn.assist_player_norm
+      AND upd.league      = sn.league
+      AND upd.season      = sn.season
+
 LEFT JOIN xref_player_dedup xa
        ON xa.source    = 'understat'
-      AND xa.source_id = sn.understat_assist_player_source_id
+      AND xa.source_id = upd.understat_player_id

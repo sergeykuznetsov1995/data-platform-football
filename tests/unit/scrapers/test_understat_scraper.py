@@ -158,6 +158,56 @@ class TestUnderstatScraper:
             with pytest.raises(RuntimeError, match='boom'):
                 scraper.read_shot_events()
 
+    # -- #444: assist_player_id re-derived from name -------------------------
+    # soccerdata 1.8.8 fills shot ``assist_player_id`` from the roster-ROW id
+    # (``player["id"]``), not the true player id. ``read_shot_events`` must
+    # re-derive it from the assister NAME via this scrape's own shooter
+    # (player→player_id) pairs, so Bronze no longer carries bogus roster ids.
+
+    @staticmethod
+    def _buggy_shots_df():
+        return pd.DataFrame({
+            'league': ['ENG-Premier League'] * 3,
+            'season': [2024] * 3,
+            'player': ['Mohamed Salah', 'Cody Gakpo', 'Virgil van Dijk'],
+            'player_id': pd.array([11, 12, 13], dtype='Int64'),
+            # row0: assisted by a shooter (Gakpo, id 12) -> remaps to 12
+            # row1: no assist -> NA
+            # row2: assisted by a NON-shooter (absent here) -> NA (honest)
+            'assist_player': ['Cody Gakpo', None, 'Trent Alexander-Arnold'],
+            'assist_player_id': pd.array([500001, None, 500002], dtype='Int64'),
+            'xg': [0.3, 0.1, 0.05],
+            'result': ['Goal', 'Saved Shot', 'Missed Shot'],
+        })
+
+    def test_assist_id_remapped_from_name(self, scraper, mock_soccerdata_understat):
+        mock_soccerdata_understat.read_shot_events.return_value = self._buggy_shots_df()
+        df = scraper.read_shot_events()
+        row = df[df['player'] == 'Mohamed Salah'].iloc[0]
+        assert row['assist_player_id'] == 12          # Cody Gakpo's true id
+        assert row['assist_player'] == 'Cody Gakpo'   # name preserved
+
+    def test_assist_no_assist_stays_na(self, scraper, mock_soccerdata_understat):
+        mock_soccerdata_understat.read_shot_events.return_value = self._buggy_shots_df()
+        df = scraper.read_shot_events()
+        row = df[df['player'] == 'Cody Gakpo'].iloc[0]
+        assert pd.isna(row['assist_player_id'])
+
+    def test_assist_non_shooter_is_na_not_bogus(self, scraper, mock_soccerdata_understat):
+        """Assister who took no shot in this scrape can't be derived → NA, NOT
+        the bogus roster id that soccerdata produced."""
+        mock_soccerdata_understat.read_shot_events.return_value = self._buggy_shots_df()
+        df = scraper.read_shot_events()
+        row = df[df['player'] == 'Virgil van Dijk'].iloc[0]
+        assert pd.isna(row['assist_player_id'])
+
+    def test_assist_no_roster_ids_survive(self, scraper, mock_soccerdata_understat):
+        """None of the bogus roster ids (500001/500002) may remain anywhere."""
+        mock_soccerdata_understat.read_shot_events.return_value = self._buggy_shots_df()
+        df = scraper.read_shot_events()
+        ids = set(df['assist_player_id'].dropna().tolist())
+        assert ids == {12}
+
 
 class TestUnderstatSupportedLeagues:
     """Tests for Understat supported leagues."""
