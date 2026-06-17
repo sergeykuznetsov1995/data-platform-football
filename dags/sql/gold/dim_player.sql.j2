@@ -45,6 +45,16 @@ country_map AS (
     ) AS t(fifa_code, country_name)
 ),
 
+-- #585: source full-name spelling -> canonical name map
+-- (configs/medallion/country_codes.yaml `aliases`, rendered via the
+-- {{ nationality_alias_values_sql }} placeholder). Keyed by unique variant, so
+-- the LEFT JOIN below cannot fan out the player spine.
+nationality_alias AS (
+    SELECT * FROM (VALUES
+        {{ nationality_alias_values_sql }}
+    ) AS t(variant, canonical_name)
+),
+
 -- #463: silver-профиль per-(player, squad) — multi-squad сезон делает
 -- MAX_BY(x, season) недетерминированным (pos может отличаться между клубами).
 -- Pre-dedup до одной строки на (player, season): max-minutes клуб, tie → squad.
@@ -162,10 +172,14 @@ SELECT
              ss.date_of_birth,
              tm.dob,
              TRY_CAST(sf.dob AS DATE))                             AS dob,
+    -- #585: canonicalize the winning source spelling (na.canonical_name maps
+    -- USA -> United States, Czechia -> Czech Republic, ...); NULL when the
+    -- picked value is already canonical or unknown, so COALESCE falls through.
     -- #435: FBref fallback is the FIFA 3-letter code — map it to a full name
     -- (country_map) so the column is single-format; an unmapped code keeps the
     -- raw code (graceful, never NULL).
-    COALESCE(fm.nationality, ss.nationality, tm.nationality,
+    COALESCE(na.canonical_name,
+             fm.nationality, ss.nationality, tm.nationality,
              sf.nationality,
              cm.country_name,
              REGEXP_EXTRACT(fb.nation, '[A-Z]{3}'))                AS nationality,
@@ -192,3 +206,8 @@ LEFT JOIN transfermarkt_latest tm
     ON tm.canonical_id = xf.canonical_id
 LEFT JOIN sofifa_latest sf
     ON sf.canonical_id = xf.canonical_id
+-- #585: canonicalize the winning source spelling before the code-map fallback
+-- (≤1 match per row — nationality_alias is unique on variant, so no fan-out).
+LEFT JOIN nationality_alias na
+    ON na.variant = COALESCE(fm.nationality, ss.nationality,
+                             tm.nationality, sf.nationality)

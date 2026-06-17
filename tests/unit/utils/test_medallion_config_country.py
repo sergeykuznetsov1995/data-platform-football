@@ -114,6 +114,71 @@ def test_rejects_missing_name(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# #585 — optional `aliases` schema validation
+# ---------------------------------------------------------------------------
+
+def test_accepts_optional_aliases(tmp_path, monkeypatch):
+    body = "countries:\n  - {code: USA, name: United States, aliases: [USA]}\n"
+    (tmp_path / "country_codes.yaml").write_text(body, encoding="utf-8")
+    from utils import medallion_config as mc
+    monkeypatch.setattr(mc, "CONFIG_DIR", tmp_path)
+    mc.reset_cache()
+    doc = mc.load_country_codes()
+    assert doc["countries"][0]["aliases"] == ["USA"]
+
+
+def test_rejects_duplicate_alias(tmp_path, monkeypatch):
+    """Same spelling under two countries would fan out the alias JOIN."""
+    body = (
+        "countries:\n"
+        "  - {code: USA, name: United States, aliases: [America]}\n"
+        "  - {code: CAN, name: Canada, aliases: [America]}\n"
+    )
+    (tmp_path / "country_codes.yaml").write_text(body, encoding="utf-8")
+    from utils import medallion_config as mc
+    monkeypatch.setattr(mc, "CONFIG_DIR", tmp_path)
+    mc.reset_cache()
+    with pytest.raises(mc.MedallionConfigError, match="duplicate alias"):
+        mc.load_country_codes()
+
+
+def test_rejects_alias_colliding_with_name(tmp_path, monkeypatch):
+    """An alias equal to a canonical name would remap a legit value."""
+    body = (
+        "countries:\n"
+        "  - {code: IRL, name: Republic of Ireland}\n"
+        "  - {code: NIR, name: Northern Ireland, "
+        "aliases: [Republic of Ireland]}\n"
+    )
+    (tmp_path / "country_codes.yaml").write_text(body, encoding="utf-8")
+    from utils import medallion_config as mc
+    monkeypatch.setattr(mc, "CONFIG_DIR", tmp_path)
+    mc.reset_cache()
+    with pytest.raises(mc.MedallionConfigError, match="collides"):
+        mc.load_country_codes()
+
+
+def test_rejects_non_list_aliases(tmp_path, monkeypatch):
+    body = "countries:\n  - {code: USA, name: United States, aliases: USA}\n"
+    (tmp_path / "country_codes.yaml").write_text(body, encoding="utf-8")
+    from utils import medallion_config as mc
+    monkeypatch.setattr(mc, "CONFIG_DIR", tmp_path)
+    mc.reset_cache()
+    with pytest.raises(mc.MedallionConfigError, match="aliases"):
+        mc.load_country_codes()
+
+
+def test_rejects_empty_alias(tmp_path, monkeypatch):
+    body = 'countries:\n  - {code: USA, name: United States, aliases: ["  "]}\n'
+    (tmp_path / "country_codes.yaml").write_text(body, encoding="utf-8")
+    from utils import medallion_config as mc
+    monkeypatch.setattr(mc, "CONFIG_DIR", tmp_path)
+    mc.reset_cache()
+    with pytest.raises(mc.MedallionConfigError, match="alias"):
+        mc.load_country_codes()
+
+
+# ---------------------------------------------------------------------------
 # get_country_map_sql_values — VALUES shape
 # ---------------------------------------------------------------------------
 
@@ -145,6 +210,45 @@ def test_sql_values_raises_on_empty(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# get_country_alias_sql_values (#585) — VALUES shape
+# ---------------------------------------------------------------------------
+
+def test_alias_sql_values_emits_variant_canonical(tmp_path, monkeypatch):
+    body = (
+        "countries:\n"
+        "  - {code: USA, name: United States, aliases: [USA]}\n"
+        "  - {code: CZE, name: Czech Republic, aliases: [Czechia]}\n"
+    )
+    (tmp_path / "country_codes.yaml").write_text(body, encoding="utf-8")
+    from utils import medallion_config as mc
+    monkeypatch.setattr(mc, "CONFIG_DIR", tmp_path)
+    mc.reset_cache()
+    sql = mc.get_country_alias_sql_values()
+    assert "('USA', 'United States')" in sql
+    assert "('Czechia', 'Czech Republic')" in sql
+
+
+def test_alias_sql_values_sentinel_when_no_aliases(mock_country_dir):
+    """Aliases are optional — with none configured the emitter returns a single
+    no-op sentinel row so the VALUES clause stays valid Trino."""
+    sql = mock_country_dir.get_country_alias_sql_values()
+    assert sql == "('', '')"
+
+
+def test_alias_sql_values_escapes_apostrophe(tmp_path, monkeypatch):
+    body = (
+        "countries:\n"
+        "  - {code: CIV, name: Ivory Coast, aliases: [\"Cote d'Ivoire\"]}\n"
+    )
+    (tmp_path / "country_codes.yaml").write_text(body, encoding="utf-8")
+    from utils import medallion_config as mc
+    monkeypatch.setattr(mc, "CONFIG_DIR", tmp_path)
+    mc.reset_cache()
+    sql = mc.get_country_alias_sql_values()
+    assert "('Cote d''Ivoire', 'Ivory Coast')" in sql
+
+
+# ---------------------------------------------------------------------------
 # Real shipped YAML — production regression guard
 # ---------------------------------------------------------------------------
 
@@ -169,4 +273,8 @@ def test_shipped_country_yaml_loads_and_renders():
     assert by_code.get("USA") == "United States"
     sql = mc.get_country_map_sql_values()
     assert "'ENG', 'England'" in sql
+    # #585: known source spelling variants canonicalize to the registry name.
+    alias_sql = mc.get_country_alias_sql_values()
+    assert "('USA', 'United States')" in alias_sql
+    assert "('Czechia', 'Czech Republic')" in alias_sql
     mc.reset_cache()

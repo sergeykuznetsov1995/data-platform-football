@@ -331,11 +331,18 @@ def _validate_competitions_schema(doc: Dict) -> None:
 
 
 def _validate_country_codes_schema(doc: Dict) -> None:
-    """Structural validation of country_codes.yaml (issue #435).
+    """Structural validation of country_codes.yaml (issues #435, #585).
 
     Each entry maps a FBref/FIFA 3-letter ``code`` (``^[A-Z]{3}$``) to a
     non-empty full-country ``name``. Codes must be unique — a duplicate would
     silently fan out the country_map JOIN in gold.dim_player.
+
+    #585: an entry MAY carry an optional ``aliases`` list of alternate source
+    spellings that canonicalize to ``name``. Each alias must be a non-empty
+    string, globally unique (one spelling -> one canonical), and must not
+    collide with any canonical ``name`` (else a legitimately-canonical value
+    would be remapped). The nationality_alias JOIN in gold.dim_player keys on
+    the alias, so a duplicate alias would fan out the player spine.
     """
     if not isinstance(doc, dict) or 'countries' not in doc:
         raise MedallionConfigError(
@@ -347,6 +354,10 @@ def _validate_country_codes_schema(doc: Dict) -> None:
             "country_codes.yaml: 'countries' must be a list"
         )
     seen_codes: set = set()
+    all_names: set = set()
+    # (index, code, alias) — validated after the loop, once every canonical
+    # name is known (the alias-vs-name collision guard needs the full set).
+    alias_entries: List[tuple] = []
     for i, c in enumerate(countries):
         if not isinstance(c, dict):
             raise MedallionConfigError(
@@ -370,6 +381,34 @@ def _validate_country_codes_schema(doc: Dict) -> None:
                 f"country_codes.yaml: countries[{i}] ({code}) "
                 f"missing/empty 'name'"
             )
+        all_names.add(name)
+        aliases = c.get('aliases')
+        if aliases is not None:
+            if not isinstance(aliases, list):
+                raise MedallionConfigError(
+                    f"country_codes.yaml: countries[{i}] ({code}) "
+                    f"'aliases' must be a list"
+                )
+            for a in aliases:
+                if not isinstance(a, str) or not a.strip():
+                    raise MedallionConfigError(
+                        f"country_codes.yaml: countries[{i}] ({code}) "
+                        f"has a missing/empty alias (got {a!r})"
+                    )
+                alias_entries.append((i, code, a))
+    seen_aliases: set = set()
+    for i, code, a in alias_entries:
+        if a in all_names:
+            raise MedallionConfigError(
+                f"country_codes.yaml: alias {a!r} (countries[{i}], {code}) "
+                f"collides with a canonical 'name' — drop it or fix the name"
+            )
+        if a in seen_aliases:
+            raise MedallionConfigError(
+                f"country_codes.yaml: duplicate alias {a!r} (countries[{i}], "
+                f"{code}) — one spelling must map to one canonical name"
+            )
+        seen_aliases.add(a)
 
 
 # ---------------------------------------------------------------------------
@@ -999,6 +1038,28 @@ def get_country_map_sql_values() -> str:
         f"'{_escape_sql_string(c['name'])}')"
         for c in countries
     ]
+    return ',\n'.join(lines).lstrip()
+
+
+def get_country_alias_sql_values() -> str:
+    """Render source-spelling alias tuples as a Trino VALUES body (issue #585).
+
+    Emits two-tuples ``(variant, canonical_name)`` — one per ``aliases`` entry
+    in country_codes.yaml — consumed by ``dim_player.sql.j2`` to canonicalize
+    the winning source nationality spelling (e.g. ``('USA', 'United States')``).
+    Aliases are optional, so when none are configured a single no-op sentinel
+    ``('', '')`` is emitted: an empty VALUES clause is invalid Trino, and the
+    empty string never matches a real nationality.
+    """
+    countries = load_country_codes()['countries']
+    lines = [
+        f"    ('{_escape_sql_string(a)}', "
+        f"'{_escape_sql_string(c['name'])}')"
+        for c in countries
+        for a in (c.get('aliases') or [])
+    ]
+    if not lines:
+        lines = ["    ('', '')"]
     return ',\n'.join(lines).lstrip()
 
 

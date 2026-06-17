@@ -1,20 +1,26 @@
 """
-Executable unit test for Gold ``dim_player`` nationality logic (issue #435).
+Executable unit test for Gold ``dim_player`` nationality logic (issues #435,
+#585).
 
 ``dim_player.sql.j2`` maps the FBref FIFA 3-letter code fallback to a full
 country name via the ``country_map`` CTE (filled from country_codes.yaml at
-render time through ``{{ country_map_values_sql }}``). This proves the actual
-emitted nationality VALUE:
+render time through ``{{ country_map_values_sql }}``) and canonicalizes
+inconsistent source spellings via the ``nationality_alias`` CTE (#585, filled
+through ``{{ nationality_alias_values_sql }}``). This proves the actual emitted
+nationality VALUE:
 
   * historical player (FBref-only, ``nation='eng ENG'``)  -> 'England'
   * unmapped code (``nation='xyz XYZ'``, absent from map)  -> 'XYZ' (raw)
   * current player (FotMob nationality present)            -> source wins
+  * source variant spelling (FotMob 'USA', #585)           -> 'United States'
+  * canonical source spelling (FotMob 'United States')     -> unchanged
 
-Strategy mirrors ``test_dim_venue_logic``: substitute the placeholder with a
-small hermetic country map, transpile Trino → DuckDB via sqlglot, materialise
-fixture silver tables and execute. Skips cleanly if sqlglot cannot translate a
-Trino-specific construct (MAX_BY / REGEXP_EXTRACT) on the installed engine —
-the authoritative syntax check is EXPLAIN (TYPE VALIDATE) on live Trino.
+Strategy mirrors ``test_dim_venue_logic``: substitute the placeholders with
+small hermetic country/alias maps, transpile Trino → DuckDB via sqlglot,
+materialise fixture silver tables and execute. Skips cleanly if sqlglot cannot
+translate a Trino-specific construct (MAX_BY / REGEXP_EXTRACT) on the installed
+engine — the authoritative syntax check is EXPLAIN (TYPE VALIDATE) on live
+Trino.
 
 NB: fixtures carry the LIVE raw FBref format ``'eng ENG'`` (flag + code), not a
 pre-extracted ``'ENG'`` — the column is passed through Silver verbatim and the
@@ -43,14 +49,29 @@ _TEST_COUNTRY_MAP = """\
     ('SCO', 'Scotland'),
     ('ARG', 'Argentina')"""
 
+# Hermetic source-spelling -> canonical alias map (#585), independent of the
+# shipped YAML. 'USA' is a variant; its canonical 'United States' is
+# deliberately absent as a key so a canonical source value passes through.
+_TEST_NATIONALITY_ALIAS = """\
+    ('USA', 'United States'),
+    ('Czechia', 'Czech Republic')"""
+
 _PLACEHOLDER_RE = re.compile(
     r"^[ \t]*\{\{\s*country_map_values_sql\s*\}\}[ \t]*$", re.MULTILINE
 )
 
+_ALIAS_PLACEHOLDER_RE = re.compile(
+    r"^[ \t]*\{\{\s*nationality_alias_values_sql\s*\}\}[ \t]*$", re.MULTILINE
+)
+
 
 def _render(sql_text: str) -> str:
-    """Fill the standalone ``{{ country_map_values_sql }}`` placeholder."""
-    return _PLACEHOLDER_RE.sub(lambda _: _TEST_COUNTRY_MAP, sql_text, count=1)
+    """Fill the two standalone VALUES placeholders with hermetic test maps."""
+    out = _PLACEHOLDER_RE.sub(lambda _: _TEST_COUNTRY_MAP, sql_text, count=1)
+    out = _ALIAS_PLACEHOLDER_RE.sub(
+        lambda _: _TEST_NATIONALITY_ALIAS, out, count=1
+    )
+    return out
 
 
 def _translate(sql_text: str) -> str:
@@ -79,7 +100,12 @@ def _bootstrap(con) -> None:
         ('fb_bbb', 'fbref',  'bbb',    'high', '2324'),
         ('fb_ccc', 'fbref',  'ccc',    'high', '2425'),
         -- player C also has a FotMob xref row (current-APL enrichment)
-        ('fb_ccc', 'fotmob', 'fm_ccc', 'high', '2425')
+        ('fb_ccc', 'fotmob', 'fm_ccc', 'high', '2425'),
+        -- #585: D = source variant spelling, E = canonical source spelling
+        ('fb_ddd', 'fbref',  'ddd',    'high', '2425'),
+        ('fb_ddd', 'fotmob', 'fm_ddd', 'high', '2425'),
+        ('fb_eee', 'fbref',  'eee',    'high', '2425'),
+        ('fb_eee', 'fotmob', 'fm_eee', 'high', '2425')
     """)
 
     con.execute("""
@@ -95,7 +121,10 @@ def _bootstrap(con) -> None:
         -- B: historical, XYZ absent from map → raw code 'XYZ'
         ('bbb', 2324, 'Test Unmapped', 'xyz XYZ', 'MF', 800,  'Club B'),
         -- C: current, FBref says SCO; FotMob (below) overrides with England
-        ('ccc', 2425, 'Kieran Tierney','sco SCO', 'DF', 1000, 'Arsenal')
+        ('ccc', 2425, 'Kieran Tierney','sco SCO', 'DF', 1000, 'Arsenal'),
+        -- D/E (#585): FotMob nationality wins; alias canonicalizes it
+        ('ddd', 2425, 'Variant Src',   'usa USA', 'FW', 700,  'Club D'),
+        ('eee', 2425, 'Canon Src',     'usa USA', 'FW', 700,  'Club E')
     """)
 
     # --- Enrichment sources (mostly empty; FotMob carries player C) ---
@@ -110,7 +139,11 @@ def _bootstrap(con) -> None:
         INSERT INTO silver.fotmob_player_profile VALUES
         -- Deliberately 'England' (≠ map's 'Scotland' for SCO) to prove the
         -- source wins over the code map in the COALESCE order.
-        ('fm_ccc', 2425, 'Kieran Tierney', '1997-06-05', 'England', 180, 'left')
+        ('fm_ccc', 2425, 'Kieran Tierney', '1997-06-05', 'England', 180, 'left'),
+        -- D (#585): variant 'USA' → canonicalized to 'United States'
+        ('fm_ddd', 2425, 'Variant Src', '2000-01-01', 'USA', 175, 'right'),
+        -- E (#585): already-canonical 'United States' → passes through unchanged
+        ('fm_eee', 2425, 'Canon Src', '2000-01-01', 'United States', 175, 'right')
     """)
 
     con.execute("""
@@ -166,10 +199,11 @@ def _nat(rows, player_id):
 @pytest.mark.unit
 class TestDimPlayerNationality:
     def test_row_count(self, gold_rows):
-        """One row per FBref-spine player — the country_map JOIN must NOT
-        fan out the spine (it is unique on fifa_code)."""
-        assert len(gold_rows) == 3, (
-            f"expected 3 players, got {len(gold_rows)}: "
+        """One row per FBref-spine player — neither the country_map nor the
+        nationality_alias JOIN may fan out the spine (both are unique on their
+        join key: fifa_code / variant respectively)."""
+        assert len(gold_rows) == 5, (
+            f"expected 5 players, got {len(gold_rows)}: "
             f"{[(r['player_id'], r['nationality']) for r in gold_rows]}"
         )
 
@@ -190,6 +224,17 @@ class TestDimPlayerNationality:
         """FotMob full name takes precedence over the FBref-code map
         (cm.country_name sits AFTER the sources in the COALESCE)."""
         assert _nat(gold_rows, "fb_ccc") == "England"
+
+    def test_source_variant_canonicalized(self, gold_rows):
+        """#585: a known source spelling variant ('USA') is canonicalized to
+        the registry name ('United States') via nationality_alias."""
+        assert _nat(gold_rows, "fb_ddd") == "United States"
+
+    def test_canonical_source_passes_through(self, gold_rows):
+        """#585: a value that is already canonical ('United States', absent
+        from the alias map as a variant) is left unchanged — na.canonical_name
+        is NULL so the COALESCE falls through to the source value."""
+        assert _nat(gold_rows, "fb_eee") == "United States"
 
     def test_no_bare_three_letter_codes_for_mapped(self, gold_rows):
         """The mapped players read as full names, not codes."""
