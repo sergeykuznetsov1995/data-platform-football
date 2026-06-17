@@ -250,3 +250,85 @@ class TestReadPlayerRatingsParsing:
         assert int(row['gk_positioning']) == 9
         # The two must NOT collide (the bug made them identical at 9).
         assert int(row['positioning']) != int(row['gk_positioning'])
+
+
+class TestReadTeamRatingsParsing:
+    """#601: read_team_ratings must scrape only the 8 columns sofifa.com still
+    renders on the FC 26 team page and never emit the 15 dead-tactics columns
+    EA removed (they would otherwise land as all-NULL in Bronze).
+    """
+
+    _TEAM_HTML = (
+        '<html><body><table><tbody>'
+        '<tr>'
+        '<td>1</td>'
+        '<td><a href="/team/9/test-team/">Test Team</a></td>'
+        '<td data-col="oa">85</td>'
+        '<td data-col="at">84</td>'
+        '<td data-col="md">83</td>'
+        '<td data-col="df">82</td>'
+        '<td data-col="tb">€45M</td>'
+        '<td data-col="cw">€500M</td>'
+        '<td data-col="ps">27</td>'
+        '<td data-col="sa">26</td>'
+        '</tr>'
+        '</tbody></table></body></html>'
+    )
+
+    _DEAD_COLS = [
+        'build_up_speed', 'build_up_dribbling', 'build_up_passing',
+        'build_up_positioning', 'chance_creation_crossing',
+        'chance_creation_passing', 'chance_creation_shooting',
+        'chance_creation_positioning', 'defence_aggression', 'defence_pressure',
+        'defence_team_width', 'defence_defender_line', 'defence_domestic_prestige',
+        'international_prestige', 'whole_team_average_age',
+    ]
+
+    def _prime(self, reader, tmp_path):
+        import io as _io
+
+        import pandas as pd
+
+        reader.data_dir = tmp_path
+        reader.versions = pd.DataFrame(
+            [{'fifa_edition': 'FC 26', 'update': 'Jun 2 2026'}], index=[260035]
+        )
+        reader.read_leagues = MagicMock(
+            return_value=pd.DataFrame(
+                [{'league_id': 13}], index=['ENG-Premier League']
+            )
+        )
+        reader.get = MagicMock(
+            side_effect=lambda *a, **k: _io.BytesIO(self._TEAM_HTML.encode('utf-8'))
+        )
+
+    def test_scrapes_eight_live_columns(self, reader, tmp_path):
+        self._prime(reader, tmp_path)
+        df = reader.read_team_ratings().reset_index()
+        row = df.iloc[0]
+        assert row['team'] == 'Test Team'
+        assert row['overall'] == '85'
+        assert row['attack'] == '84'
+        assert row['midfield'] == '83'
+        assert row['defence'] == '82'
+        assert row['transfer_budget'] == '€45M'
+        assert row['club_worth'] == '€500M'
+        assert row['players'] == '27'
+        assert row['starting_xi_average_age'] == '26'
+
+    def test_dead_columns_absent(self, reader, tmp_path):
+        self._prime(reader, tmp_path)
+        df = reader.read_team_ratings()
+        for col in self._DEAD_COLS:
+            assert col not in df.columns, (
+                f"dead FC-26 column {col!r} must not be scraped (#601)"
+            )
+
+    def test_url_requests_only_live_cols(self, reader, tmp_path):
+        self._prime(reader, tmp_path)
+        reader.read_team_ratings()
+        url = reader.get.call_args.args[0]
+        # honest URL: requests the 8 live cols, never the removed ones.
+        assert 'showCol[]=oa' in url and 'showCol[]=sa' in url
+        assert 'showCol[]=bs' not in url  # build_up_speed
+        assert 'showCol[]=ip' not in url  # international_prestige

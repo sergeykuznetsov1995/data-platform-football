@@ -268,9 +268,9 @@ def test_matchhistory_contract_lists_all_tables(table):
 # (Chromium 142) clears the sofifa.com Turnstile — ingest works (the earlier
 # #180 CF freeze is resolved). All 6 materialise + non-empty (verified live
 # 2026-06-05): FC 26, ENG-Premier League — player_ratings 546, players 546,
-# team_ratings 20, teams 20, versions 852, leagues 1. 0 all-NULL outside
-# allowlist; 15 sofifa_team_ratings cols (build_up/chance_creation/defence/...)
-# are 100% NULL and live in EXPECTED_NULL.
+# team_ratings 20, teams 20, versions 852, leagues 1. The 15 dead FC-26
+# sofifa_team_ratings cols (build_up/chance_creation/defence/...) were removed
+# from the parser + Bronze (#601), so there is no longer an EXPECTED_NULL entry.
 @pytest.mark.parametrize('table', [
     'sofifa_players',
     'sofifa_teams',

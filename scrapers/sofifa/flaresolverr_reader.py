@@ -307,6 +307,88 @@ class FlareSolverrSoFIFAReader(sd.SoFIFA):
             .sort_index()
         )
 
+    def read_team_ratings(self) -> "pd.DataFrame":
+        """Override soccerdata.SoFIFA.read_team_ratings to drop dead FC-26 cols.
+
+        Upstream requests 23 rating columns via ``&showCol[]=`` and parses each
+        from a ``<td data-col='...'>`` cell. EA removed the team-tactics block
+        (build-up / chance-creation / defence sliders), international &
+        domestic prestige, and the ``whole_team_average_age`` label from the
+        FC 26 team page, so sofifa.com no longer renders those 15 cells —
+        soccerdata silently emits them as all-NULL (issue #601; confirmed
+        live 2026-06-16 via audit_bronze_columns.py). We keep only the 8 columns
+        that still exist on the page and request exactly those, so the URL is
+        honest and Bronze stops carrying 15 dead columns.
+
+        Source mirror: ``soccerdata/sofifa.py:287-373`` (same loop, trimmed dict).
+        """
+        import pandas as pd
+        from itertools import product
+        from lxml import html as _html
+        from soccerdata._common import safe_xpath_text
+        from soccerdata._config import TEAMNAME_REPLACEMENTS
+
+        SO_FIFA_API = "https://sofifa.com"
+
+        # Only the rating cells sofifa.com still renders on the FC 26 team page.
+        ratings = {
+            "oa": "overall",
+            "at": "attack",
+            "md": "midfield",
+            "df": "defence",
+            "tb": "transfer_budget",
+            "cw": "club_worth",
+            "ps": "players",
+            "sa": "starting_xi_average_age",
+        }
+
+        urlmask = SO_FIFA_API + "/teams?lg={}&r={}&set=true"
+        for rating_id in ratings:
+            urlmask += f"&showCol[]={rating_id}"
+        filemask = "teams_{}_{}.html"
+
+        leagues = self.read_leagues()
+
+        teams: list[dict] = []
+        iterator = list(product(leagues.iterrows(), self.versions.iterrows()))
+        for i, ((lkey, league), (version_id, version)) in enumerate(iterator):
+            logger.info(
+                "[%s/%s] Retrieving team ratings for %s in %s edition",
+                i + 1, len(iterator), lkey, version["update"],
+            )
+            league_id = league["league_id"]
+            filepath = self.data_dir / filemask.format(league_id, version_id)
+            url = urlmask.format(league_id, version_id)
+            reader = self.get(url, filepath)
+
+            # Explicit utf-8 (mirrors read_player_ratings): the team page carries
+            # € money cells (transfer_budget / club_worth); without the hint lxml
+            # falls back to latin-1 and mojibakes the euro sign.
+            tree = _html.parse(reader, parser=_html.HTMLParser(encoding="utf8"))
+            for node in tree.xpath("//table/tbody/tr"):
+                teams.append(
+                    {
+                        "league": lkey,
+                        "team": node.xpath(".//td[2]//a")[0].text,
+                        **{
+                            desc: safe_xpath_text(
+                                node,
+                                f".//td[@data-col='{key}']//text()",
+                                warn=f"Could not parse {desc} ({key}) stat.",
+                            )
+                            for key, desc in ratings.items()
+                        },
+                        **version.to_dict(),
+                    }
+                )
+
+        return (
+            pd.DataFrame(teams)
+            .replace({"team": TEAMNAME_REPLACEMENTS})
+            .set_index(["league", "team"])
+            .sort_index()
+        )
+
     def _maybe_recreate_session(self) -> None:
         if self._request_count <= 0:
             return
