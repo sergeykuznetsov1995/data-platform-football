@@ -3,8 +3,8 @@ Unit tests for ``configs/openmetadata/cleanup_lineage.py`` (issue #529).
 
 These run on the host without OpenMetadata (no real HTTP). They verify:
 * the module imports and exposes ``main`` + the curated FQN list,
-* the curated list targets only ``gold`` tables and excludes the live
-  ``entity_xref`` (its drop is the separate followup #146),
+* the curated list targets only ``gold`` tables and excludes
+  ``entity_xref`` (not part of epic #478; its own drop is the followup #146),
 * dry-run (default) prints DELETE intent and makes NO HTTP calls,
 * ``--apply`` hard-deletes with ``hardDelete=true&recursive=true`` (the flags
   that cascade lineage-edge removal),
@@ -52,7 +52,7 @@ def test_curated_list_shape() -> None:
     mod = _import_cleanup()
     assert len(mod.CURATED_FQNS) == 19, mod.CURATED_FQNS
     assert all(f.startswith("trino_iceberg.iceberg.gold.") for f in mod.CURATED_FQNS), mod.CURATED_FQNS
-    assert not any("entity_xref" in f for f in mod.CURATED_FQNS), "entity_xref is live (#146), must not be targeted"
+    assert not any("entity_xref" in f for f in mod.CURATED_FQNS), "entity_xref is not part of #478 (its drop is #146), must not be targeted"
     # spot-check a few known #478 drops
     for tbl in ("fct_match", "feat_team_form", "fotmob_team_season"):
         assert f"trino_iceberg.iceberg.gold.{tbl}" in mod.CURATED_FQNS

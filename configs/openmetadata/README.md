@@ -118,5 +118,6 @@ This step is **deliberately manual, not wired into the nightly `om-lineage-trino
 hard-deleting a table that is only transiently missing from Trino would permanently
 destroy its descriptions, tags, and lineage. Always review the dry-run list first.
 
-> `entity_xref` is **not** cleaned here: it is still a live table (its drop is the
-> separate followup #146), so it is never soft-deleted and its edges are not stale.
+> `entity_xref` is **not** cleaned here: it was never part of epic #478. Its own
+> drop is the separate followup #146 (already absent from live gold per the Trino
+> inventory in #475), so it is out of scope for this #478 cleanup.
