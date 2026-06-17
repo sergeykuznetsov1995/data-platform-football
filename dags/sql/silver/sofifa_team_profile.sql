@@ -19,8 +19,9 @@
 -- Bronze team_ratings приходит НЕтипизированным (scrape_team_ratings не зовёт
 -- _process_rating_data) — значения это строки, поэтому TRY_CAST везде:
 --   * overall/attack/midfield/defence — целые 0-99.
---   * transfer_budget/club_worth — деньги ('€45M' / '€250K' / '€0'); парсим в
---     евро (BIGINT). CASE робастен и к чистому числу, и к €M/K записи.
+--   * transfer_budget/club_worth — деньги ('€63.3M' / '€2.5B' / '€250K'); парсим
+--     в евро (BIGINT). club_worth доходит до миллиардов → ветка B обязательна;
+--     число дробное → DOUBLE перед умножением.
 --   * players — размер состава (squad_size). starting_xi_average_age — DOUBLE.
 --
 -- FIFA-edition → football-season mapping: edition назван по году конца сезона
@@ -39,10 +40,10 @@
 -- =============================================================================
 
 WITH teams_dedup AS (
-    SELECT team_id, fifa_edition, league, team
+    SELECT team_id, fifa_edition, league, team, _ingested_at
     FROM (
         SELECT
-            t.team_id, t.fifa_edition, t.league, t.team,
+            t.team_id, t.fifa_edition, t.league, t.team, t._ingested_at,
             ROW_NUMBER() OVER (
                 PARTITION BY t.team_id, t.fifa_edition
                 ORDER BY t._ingested_at DESC
@@ -86,24 +87,35 @@ joined AS (
         TRY_CAST(r.midfield AS INTEGER)             AS midfield,
         TRY_CAST(r.defence AS INTEGER)              AS defence,
 
-        -- Game-side money ('€45M' / '€250K' / '€0') → euros (BIGINT).
+        -- Game-side money: '€63.3M' / '€2.5B' / '€915.3M' / '€250K' → euros
+        -- (BIGINT). club_worth reaches billions (live: €5.7B) — the B branch is
+        -- MANDATORY or top clubs collapse to NULL. Numbers are decimal, so parse
+        -- as DOUBLE before the multiply/cast (verified on bronze 2026-06-17).
         CASE
+            WHEN r.transfer_budget LIKE '%B'
+                THEN CAST(TRY_CAST(regexp_extract(r.transfer_budget, '([\d.]+)', 1)
+                          AS DOUBLE) * 1000000000 AS BIGINT)
             WHEN r.transfer_budget LIKE '%M'
                 THEN CAST(TRY_CAST(regexp_extract(r.transfer_budget, '([\d.]+)', 1)
                           AS DOUBLE) * 1000000 AS BIGINT)
             WHEN r.transfer_budget LIKE '%K'
                 THEN CAST(TRY_CAST(regexp_extract(r.transfer_budget, '([\d.]+)', 1)
                           AS DOUBLE) * 1000 AS BIGINT)
-            ELSE TRY_CAST(regexp_extract(r.transfer_budget, '([\d.]+)', 1) AS BIGINT)
+            ELSE CAST(TRY_CAST(regexp_extract(r.transfer_budget, '([\d.]+)', 1)
+                      AS DOUBLE) AS BIGINT)
         END                                         AS transfer_budget_eur,
         CASE
+            WHEN r.club_worth LIKE '%B'
+                THEN CAST(TRY_CAST(regexp_extract(r.club_worth, '([\d.]+)', 1)
+                          AS DOUBLE) * 1000000000 AS BIGINT)
             WHEN r.club_worth LIKE '%M'
                 THEN CAST(TRY_CAST(regexp_extract(r.club_worth, '([\d.]+)', 1)
                           AS DOUBLE) * 1000000 AS BIGINT)
             WHEN r.club_worth LIKE '%K'
                 THEN CAST(TRY_CAST(regexp_extract(r.club_worth, '([\d.]+)', 1)
                           AS DOUBLE) * 1000 AS BIGINT)
-            ELSE TRY_CAST(regexp_extract(r.club_worth, '([\d.]+)', 1) AS BIGINT)
+            ELSE CAST(TRY_CAST(regexp_extract(r.club_worth, '([\d.]+)', 1)
+                      AS DOUBLE) AS BIGINT)
         END                                         AS club_worth_eur,
 
         -- Squad shape
