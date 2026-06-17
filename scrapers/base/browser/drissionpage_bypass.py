@@ -196,6 +196,13 @@ class DrissionPageBypass:
         # detects as a bot marker. WebGL fingerprinting needs GPU/SwiftShader enabled to
         # produce a "real" WebGL context (null context = bot tell). (#469)
 
+        # Software WebGL via ANGLE (#574): with the mesa GL stack in the image, these
+        # flags make Chromium 120 expose a real WebGL context under Xvfb (renderer
+        # Mesa/llvmpipe) instead of null. --use-angle=swiftshader is the only ANGLE
+        # backend that initializes here; --use-angle=gl fails EGL/X init → null context.
+        co.set_argument('--use-gl=angle')
+        co.set_argument('--use-angle=swiftshader')
+
         # Proxy configuration
         if self.proxy:
             proxy_info = self._parse_proxy(self.proxy)

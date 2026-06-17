@@ -48,6 +48,10 @@ class TestDriverFactoryCFInvariants:
         # Assert
         assert "--disable-gpu" not in captured
         assert "--disable-software-rasterizer" not in captured
+        # Software WebGL must be enabled via ANGLE so Chromium 120 yields a real
+        # (non-null) context under Xvfb instead of a CF bot marker (#574).
+        assert "--use-gl=angle" in captured
+        assert "--use-angle=swiftshader" in captured
         # Sanity: options were actually built (guards against a no-op test).
         assert "--no-sandbox" in captured
 
@@ -68,5 +72,7 @@ class TestDriverFactoryCFInvariants:
 
         # Assert
         assert "--disable-gpu" not in options.arguments
+        assert "--use-gl=angle" in options.arguments
+        assert "--use-angle=swiftshader" in options.arguments
         # Sanity: options were actually built (guards against a no-op test).
         assert "--no-sandbox" in options.arguments
