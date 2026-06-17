@@ -189,6 +189,45 @@ cap_finance AS (
     GROUP BY club_name, league, season
 ),
 
+-- Declared club payroll (#643): прямой team-level фонд (gross/net/adjusted) из
+-- silver.capology_team_payrolls — богаче salary-sum cap_finance. canonical_id уже
+-- разрешён в Silver (xref_team) → мост xref_cap не нужен.
+cap_payroll AS (
+    SELECT
+        canonical_id,
+        league,
+        season                                            AS season_slug,
+        total_gross_gbp                                   AS declared_payroll_gross_gbp,
+        total_gross_eur                                   AS declared_payroll_gross_eur,
+        total_net_gbp                                     AS declared_payroll_net_gbp,
+        total_net_eur                                     AS declared_payroll_net_eur,
+        adjusted_total_gross_gbp                          AS declared_payroll_adjusted_gross_gbp,
+        adjusted_total_gross_eur                          AS declared_payroll_adjusted_gross_eur
+    FROM iceberg.silver.capology_team_payrolls
+    WHERE canonical_id IS NOT NULL
+),
+
+-- Трансферный баланс окна (#643): нетто-спенд (income/expense/balance) + squad-
+-- метрики (size/age/foreign) из silver.capology_transfer_window — новые сигналы,
+-- не выводимые из зарплат. canonical_id уже разрешён в Silver.
+cap_transfer AS (
+    SELECT
+        canonical_id,
+        league,
+        season                                            AS season_slug,
+        income_gbp                                        AS transfer_income_gbp,
+        income_eur                                        AS transfer_income_eur,
+        expense_gbp                                       AS transfer_expense_gbp,
+        expense_eur                                       AS transfer_expense_eur,
+        balance_gbp                                       AS transfer_balance_gbp,
+        balance_eur                                       AS transfer_balance_eur,
+        players                                           AS squad_size,
+        age                                               AS avg_squad_age,
+        "foreign"                                         AS foreign_count
+    FROM iceberg.silver.capology_transfer_window
+    WHERE canonical_id IS NOT NULL
+),
+
 -- =============================================================================
 -- Inlined per-source season aggregates (#478) — бывшие gold.*_team_season (#370).
 -- Производный gold-этаж удалён; rollups читают Silver напрямую.
@@ -615,6 +654,23 @@ SELECT
     capf.total_wage_bill_gbp,
     capf.total_wage_bill_eur,
 
+    -- ===== DIRECT CAPOLOGY TEAM-FINANCE (issue #643) =====
+    cpay.declared_payroll_gross_gbp,
+    cpay.declared_payroll_gross_eur,
+    cpay.declared_payroll_net_gbp,
+    cpay.declared_payroll_net_eur,
+    cpay.declared_payroll_adjusted_gross_gbp,
+    cpay.declared_payroll_adjusted_gross_eur,
+    ctr.transfer_income_gbp,
+    ctr.transfer_income_eur,
+    ctr.transfer_expense_gbp,
+    ctr.transfer_expense_eur,
+    ctr.transfer_balance_gbp,
+    ctr.transfer_balance_eur,
+    ctr.squad_size,
+    ctr.avg_squad_age,
+    ctr.foreign_count,
+
     -- ========= Lineage =========
     CURRENT_TIMESTAMP                                     AS _gold_created_at
 
@@ -677,3 +733,13 @@ LEFT JOIN cap_finance capf
     ON  capf.cap_club_name = xcap.cap_club_name
     AND capf.league        = xcap.league
     AND capf.season_slug   = xcap.season_slug
+-- Direct Capology team-finance (#643): Silver несёт canonical_id → JOIN напрямую
+-- (без xref_cap-моста). (league, season) predicate обязателен (fan-out guard).
+LEFT JOIN cap_payroll cpay
+    ON  cpay.canonical_id = xf.canonical_id
+    AND cpay.league       = xf.league
+    AND cpay.season_slug  = xf.season_slug
+LEFT JOIN cap_transfer ctr
+    ON  ctr.canonical_id = xf.canonical_id
+    AND ctr.league       = xf.league
+    AND ctr.season_slug  = xf.season_slug

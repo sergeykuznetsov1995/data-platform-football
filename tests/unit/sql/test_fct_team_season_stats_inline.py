@@ -57,7 +57,7 @@ def _audit_body() -> str:
     return AUDIT_SQL.read_text(encoding="utf-8")
 
 
-# Замороженный контракт выходных колонок main-файла (102 шт., порядок важен —
+# Замороженный контракт выходных колонок main-файла (117 шт., порядок важен —
 # CREATE OR REPLACE сверяет схему позиционно). Менять только осознанно,
 # синхронно с консьюмерами и OM-описанием.
 EXPECTED_MAIN_COLUMNS = [
@@ -88,7 +88,16 @@ EXPECTED_MAIN_COLUMNS = [
     'accurate_long_balls_pct', 'accurate_crosses', 'total_crosses', 'xgot',
     'big_chances', 'big_chances_missed', 'shots_inside_box',
     'shots_outside_box', 'squad_market_value_eur', 'total_wage_bill_gbp',
-    'total_wage_bill_eur', '_gold_created_at',
+    'total_wage_bill_eur',
+    # Direct Capology team-finance (#643)
+    'declared_payroll_gross_gbp', 'declared_payroll_gross_eur',
+    'declared_payroll_net_gbp', 'declared_payroll_net_eur',
+    'declared_payroll_adjusted_gross_gbp', 'declared_payroll_adjusted_gross_eur',
+    'transfer_income_gbp', 'transfer_income_eur',
+    'transfer_expense_gbp', 'transfer_expense_eur',
+    'transfer_balance_gbp', 'transfer_balance_eur',
+    'squad_size', 'avg_squad_age', 'foreign_count',
+    '_gold_created_at',
 ]
 
 
