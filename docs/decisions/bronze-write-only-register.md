@@ -23,7 +23,7 @@ Per-table verdict vocabulary (from #476):
 
 ---
 
-## 1. Register (6 live write-only tables, audit 2026-06-15; 4 SoFIFA CONSUMED via #601 + 4 FotMob CONSUMED via #600, 2026-06-17)
+## 1. Register (3 live write-only tables, audit 2026-06-15; 4 SoFIFA via #601 + 4 FotMob via #600 + 3 Capology via #603 CONSUMED, 2026-06-17)
 
 Cost class = cost of *stopping* the scrape. **FREE** = by-product of a request made anyway
 (removing it saves only HDFS/snapshots, not HTTP); **CHEAP** = 1 HTTP; **EXPENSIVE** =
@@ -31,9 +31,6 @@ per-item/per-season HTTP.
 
 | Table | Cost | Data-quality note | Verdict | Tracking issue |
 |---|---|---|---|---|
-| `capology_team_payrolls` | EXPENSIVE (1 page/season) | OK | (b) future | [#603] |
-| `capology_contract_extensions` | EXPENSIVE | OK | (b) future | [#603] |
-| `capology_transfer_window` | EXPENSIVE | OK | (b) future | [#603] |
 | `fbref_keeper_keeper_adv` | EXPENSIVE (separate `/keepersadv/` page + CF bypass ~9.67s) | ⚠ 26 cols 100% NULL live (incl. 23 advanced GK, FBref Feb-2026); core dups `keeper` | **(c) stop** | [#606] |
 | `whoscored_season_stages` | FREE (same session as `scrape_schedule`, soccerdata cache) | ⚠ `stage` all-NULL; 6 rows | (b) keep | — (§3) |
 | `clubelo_team_history` | MODERATE (per-team histories) | no `rank`/`league`; **219,861 rows** (largest unread) | **(c) stop** | [#604] |
@@ -52,12 +49,16 @@ per-item/per-season HTTP.
 | `fotmob_team_stats` | write-only (FREE by-product) | **CONSUMED** | `dags/sql/silver/fotmob_team_standings.sql` (team×season standings conform); landed via #600. |
 | `fotmob_team_leaderboards` | write-only (FREE by-product) | **CONSUMED** | `dags/sql/silver/fotmob_team_leaderboards.sql` (long-form team×stat conform); landed via #600. |
 | `fotmob_transfers` | write-only (CHEAP; 1 HTTP) | **CONSUMED** | `dags/sql/silver/fotmob_transfers.sql` (event-grain conform); landed via #600. |
+| `capology_team_payrolls` | write-only (EXPENSIVE 1 page/season) | **CONSUMED** | `dags/sql/silver/capology_team_payrolls.sql` (declared club payroll, club×season + `canonical_id` via existing `xref_team` capology branch); landed via #603. |
+| `capology_transfer_window` | write-only (EXPENSIVE) | **CONSUMED** | `dags/sql/silver/capology_transfer_window.sql` (net transfer balance, club×season); landed via #603. |
+| `capology_contract_extensions` | write-only (EXPENSIVE) | **CONSUMED** | `dags/sql/silver/capology_contract_extensions.sql` (player contract snapshot, player×season + `canonical_id` via `xref_player`); landed via #603. |
 
 > The #476 body lists 16 tables but the title says "15". The discrepancy is
 > `clubelo_ratings_historical` (now consumed), which left 15. Consuming
 > `sofascore_event_shotmap` (#602) left 14; promoting the 4 SoFIFA tables
-> (#601) left 10; consuming the 4 FotMob team/transfers tables (#600) leaves
-> **6** live write-only tables. The register above is the corrected set.
+> (#601) left 10; consuming the 4 FotMob team/transfers tables (#600) left 6;
+> promoting the 3 Capology team-finance tables (#603) leaves **3** live
+> write-only tables. The register above is the corrected set.
 
 ---
 
@@ -75,10 +76,13 @@ SQL comments do **not** count — the #476 body itself flagged `clubelo_team_his
 comments (`fct_team_elo.sql:18`, `xref_team.sql.j2:61`) and the Iceberg-maintenance list
 (`dags/utils/maintenance_tasks.py:55`), never in a `SELECT`.
 
-Capology cross-check (why the 3 team tables stay write-only even though Capology *is* read):
-`gold.fct_team_season_stats.sql.j2:187` reads `silver.capology_player_salaries` (the
-promoted **player** table), and the team wage bill (#192) is an **aggregate of player
-salaries**, not `capology_team_payrolls`. The 3 team-finance tables are read nowhere.
+Capology cross-check (the 3 team-finance tables, CONSUMED via #603): they are now read by
+their own Silver projections (`dags/sql/silver/capology_{team_payrolls,transfer_window,
+contract_extensions}.sql`). NOTE: the Gold team **wage bill** (`fct_team_season_stats.sql.j2`
+`cap_finance` CTE, #192) STILL aggregates `silver.capology_player_salaries` (player salaries),
+NOT `capology_team_payrolls` — #603 deliberately left Gold untouched (Silver-only). Whether the
+direct team payroll should supplement/replace the salary-sum wage bill is a tracked followup
+(see §4 / the #603 PR body).
 
 ---
 
@@ -123,6 +127,7 @@ documented here; no tracking issue (avoids p3 issue-spam):
 | 2026-06-16 | Live `audit_bronze_columns.py` run: confirmed `sofifa_team_ratings`=15 and `fbref_keeper_keeper_adv`=26 cols 100% NULL, all 15 tables non-empty with 0 ERROR, `clubelo_team_history`=219,861 rows (largest unread). Cost/NULL notes refined. | #476 |
 | 2026-06-17 | 4 SoFIFA tables promoted to Silver → **CONSUMED**: `sofifa_team_profile.sql` (+ `sofifa` source branch in `xref_team.sql.j2`), `sofifa_league_lookup.sql`, `sofifa_edition_lookup.sql`. `sofifa_team_ratings` 15 dead FC-26 cols removed (parser override + `drop_sofifa_team_ratings_dead_columns.py`, dropped from `EXPECTED_NULL`). 14 → 10 live write-only. | #601 |
 | 2026-06-17 | 4 FotMob team/transfers tables promoted to Silver → **CONSUMED** (conform-only, canonical_id resolution deferred to Gold): `fotmob_team_profile.sql`, `fotmob_team_standings.sql` (from `fotmob_team_stats`), `fotmob_team_leaderboards.sql`, `fotmob_transfers.sql`; registered in `dag_transform_fotmob_silver.py` + bronze schemas added to fixture. 10 → 6 live write-only. | #600 |
+| 2026-06-17 | 3 Capology team-finance tables promoted to Silver → **CONSUMED**: `capology_team_payrolls.sql` (declared club payroll), `capology_transfer_window.sql` (net transfer balance), `capology_contract_extensions.sql` (player contract snapshot); registered in `dag_transform_capology_silver.py` + 3 render-tests. `canonical_id` resolved in Silver via existing `xref_team`/`xref_player` capology branches (team 239/240, contract 680/810 live). Gold wage bill untouched (Silver-only); replace/supplement = followup. 6 → 3 live write-only. | #603 |
 
 [#476]: https://github.com/sergeykuznetsov1995/data-platform-football/issues/476
 [#600]: https://github.com/sergeykuznetsov1995/data-platform-football/issues/600
