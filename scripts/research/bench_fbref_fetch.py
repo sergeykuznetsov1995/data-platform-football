@@ -68,6 +68,14 @@ def main() -> None:
         use_nodriver=True,
         nodriver_cloudflare_wait=90,
     ) as scraper:
+        # Issue #616: BENCH_FORCE_NODRIVER=1 disables the curl_cffi HTTP
+        # fast-path so EVERY match goes through the nodriver browser. This
+        # reproduces the cold / HTTP-fallback regime (the one behind the
+        # 2.12 MB/match headline) where CDP network-blocking actually applies
+        # to matches 2..N — letting us measure the BLOCKED_URL_PATTERNS effect.
+        if os.environ.get("BENCH_FORCE_NODRIVER") == "1":
+            scraper._fetch_page_http = lambda *a, **k: None
+            log.info("BENCH_FORCE_NODRIVER=1 — HTTP fast-path disabled (cold regime)")
         for i, path in enumerate(MATCH_PATHS, 1):
             url = "https://fbref.com" + path
             t0 = time.monotonic()
@@ -121,6 +129,11 @@ def main() -> None:
         ),
         "real_requests": final_stats.get("real_requests_count", 0),
         "scraper_failures": final_stats.get("failures", 0),
+        # Issue #616 — per-URL audit: top consumers + first/third-party split.
+        "top_traffic_urls": final_stats.get("top_traffic_urls", []),
+        "first_party_mb": final_stats.get("first_party_mb", 0.0),
+        "third_party_mb": final_stats.get("third_party_mb", 0.0),
+        "real_bytes_by_url": dict(final_stats.get("real_bytes_by_url", {}) or {}),
         "http_fetch_diag": final_stats.get("http_fetch_diag", []),
         "per_match": per_match,
     }

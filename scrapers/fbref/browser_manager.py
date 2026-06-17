@@ -560,6 +560,17 @@ class FBrefBrowserMixin:
                 reqs_by_rtype[k] = reqs_by_rtype.get(k, 0) + v
             self._stats['real_bytes_by_resource_type'] = bytes_by_rtype
             self._stats['real_requests_by_resource_type'] = reqs_by_rtype
+            # Issue #616: per-URL breakdown + top-consumer / first-third summary.
+            bytes_by_url = dict(self._real_traffic_base_bytes_by_url)
+            reqs_by_url = dict(self._real_traffic_base_requests_by_url)
+            for k, v in (real.get('real_bytes_by_url') or {}).items():
+                bytes_by_url[k] = bytes_by_url.get(k, 0) + v
+            for k, v in (real.get('real_requests_by_url') or {}).items():
+                reqs_by_url[k] = reqs_by_url.get(k, 0) + v
+            self._stats['real_bytes_by_url'] = bytes_by_url
+            self._stats['real_requests_by_url'] = reqs_by_url
+            from scrapers.base.browser.nodriver_bypass import _summarise_url_traffic
+            self._stats.update(_summarise_url_traffic(bytes_by_url, reqs_by_url))
             self._stats['cf_challenge_attempts'] = (
                 self._cf_challenge_attempts_base
                 + int(real.get('cf_challenge_attempts', 0) or 0)
@@ -947,6 +958,11 @@ class FBrefBrowserMixin:
                     self._real_traffic_base_bytes_by_rtype[k] += v
                 for k, v in (real.get('real_requests_by_resource_type') or {}).items():
                     self._real_traffic_base_requests_by_rtype[k] += v
+                # Issue #616: flush per-URL counters so they survive teardown.
+                for k, v in (real.get('real_bytes_by_url') or {}).items():
+                    self._real_traffic_base_bytes_by_url[k] += v
+                for k, v in (real.get('real_requests_by_url') or {}).items():
+                    self._real_traffic_base_requests_by_url[k] += v
                 self._cf_challenge_attempts_base += int(real.get('cf_challenge_attempts', 0) or 0)
                 self._cf_challenges_passed_base += int(real.get('cf_challenges_passed', 0) or 0)
                 self._cf_challenges_failed_base += int(real.get('cf_challenges_failed', 0) or 0)
@@ -983,6 +999,16 @@ class FBrefBrowserMixin:
             self._stats['real_requests_by_resource_type'] = dict(
                 self._real_traffic_base_requests_by_rtype
             )
+            # Issue #616: surface accumulated per-URL breakdown + summary.
+            self._stats['real_bytes_by_url'] = dict(self._real_traffic_base_bytes_by_url)
+            self._stats['real_requests_by_url'] = dict(
+                self._real_traffic_base_requests_by_url
+            )
+            from scrapers.base.browser.nodriver_bypass import _summarise_url_traffic
+            self._stats.update(_summarise_url_traffic(
+                self._real_traffic_base_bytes_by_url,
+                self._real_traffic_base_requests_by_url,
+            ))
             self._stats['cf_challenge_attempts'] = self._cf_challenge_attempts_base
             self._stats['cf_challenges_passed'] = self._cf_challenges_passed_base
             self._stats['cf_challenges_failed'] = self._cf_challenges_failed_base

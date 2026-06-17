@@ -30,6 +30,7 @@ import os
 import random
 from collections import Counter
 from typing import Optional
+from urllib.parse import urlsplit
 
 from scrapers.base.browser.nodriver_stealth import (
     STEALTH_JS,
@@ -134,6 +135,71 @@ def _import_cf_verify():
                 logger.debug("nodriver-cf-verify not available, Turnstile auto-click disabled")
                 pass
     return CFVerify
+
+
+# First-party hosts for the per-URL traffic audit (issue #616). fbref.com is
+# the site itself; ssref.net / sports-reference.com serve FBref's own static
+# assets and data endpoints. Everything else counts as third-party.
+_FIRST_PARTY_HOSTS = ('fbref.com', 'ssref.net', 'sports-reference.com')
+
+
+def _is_first_party(host: str) -> bool:
+    """True if `host` belongs to FBref / Sports-Reference (first-party)."""
+    h = (host or '').lower()
+    return any(fp in h for fp in _FIRST_PARTY_HOSTS)
+
+
+def _normalise_url_key(url: str) -> str:
+    """Collapse a URL to ``host/path`` (query + fragment dropped).
+
+    Groups every call to one endpoint under a single key so the per-URL
+    traffic counter stays bounded regardless of cache-busting query params
+    (issue #616). Returns '' for falsy input.
+    """
+    if not url:
+        return ''
+    try:
+        parts = urlsplit(url)
+        if parts.netloc:
+            return f"{parts.netloc}{parts.path}"
+        return url.split('?', 1)[0].split('#', 1)[0]
+    except Exception:
+        return url.split('?', 1)[0]
+
+
+def _summarise_url_traffic(bytes_by_url, requests_by_url, top_n: int = 25) -> dict:
+    """Build the per-URL audit summary (issue #616).
+
+    Returns the top-N consumers by bytes plus first/third-party byte totals.
+    Shared by NodriverBypass.get_real_traffic_stats() and the FBref scraper
+    flush paths so live and restart-accumulated counters summarise identically.
+    """
+    bytes_by_url = bytes_by_url or {}
+    requests_by_url = requests_by_url or {}
+    first_bytes = 0
+    third_bytes = 0
+    for key, size in bytes_by_url.items():
+        host = key.split('/', 1)[0] if key else ''
+        if _is_first_party(host):
+            first_bytes += size
+        else:
+            third_bytes += size
+    top = sorted(bytes_by_url.items(), key=lambda kv: kv[1], reverse=True)[:top_n]
+    return {
+        'top_traffic_urls': [
+            {
+                'url': key,
+                'bytes': size,
+                'mb': round(size / 1024 / 1024, 4),
+                'requests': int(requests_by_url.get(key, 0)),
+            }
+            for key, size in top
+        ],
+        'first_party_bytes': first_bytes,
+        'third_party_bytes': third_bytes,
+        'first_party_mb': round(first_bytes / 1024 / 1024, 3),
+        'third_party_mb': round(third_bytes / 1024 / 1024, 3),
+    }
 
 
 class NodriverBypass:
@@ -255,6 +321,15 @@ class NodriverBypass:
         self._real_bytes_by_resource_type: Counter = Counter()
         self._real_requests_by_resource_type: Counter = Counter()
         self._request_resource_types: dict = {}
+        # Per-URL byte/request breakdown (issue #616). Keyed by normalised
+        # host+path (query stripped) so repeated calls to one endpoint collapse
+        # into one row. Feeds the top-consumer audit that decides which
+        # XHR/SCRIPT are blockable. `_request_urls` caches request_id -> key
+        # between requestWillBeSent and loadingFinished (mirrors the
+        # resource-type cache above).
+        self._real_bytes_by_url: Counter = Counter()
+        self._real_requests_by_url: Counter = Counter()
+        self._request_urls: dict = {}
         # Diagnostic: count loadingFinished events that found no cached type
         # (should stay close to 0 with requestWillBeSent in place). Issue #116.
         self._resource_type_cache_misses = 0
@@ -309,6 +384,9 @@ class NodriverBypass:
         "*hs-scripts.com*", "*hs-analytics.net*",
         "*/ads/*",
     ]
+
+    # How many top URL consumers get_real_traffic_stats() reports (issue #616).
+    _TOP_URLS_N = 25
 
     # ------------------------------------------------------------------ #
     #  Xvfb management                                                    #
@@ -553,6 +631,15 @@ class NodriverBypass:
                 rtype = getattr(event, 'type_', None) or getattr(event, 'type', None)
                 if rid is not None and rtype is not None:
                     self._request_resource_types[rid] = _rtype_name(rtype)
+                # Cache the URL for the per-URL audit (issue #616). The real CDP
+                # event nests it under request.url; fall back to a bare .url so
+                # duck-typed test events work too.
+                if rid is not None:
+                    req = getattr(event, 'request', None)
+                    url = (getattr(req, 'url', None) if req is not None
+                           else getattr(event, 'url', None))
+                    if url:
+                        self._request_urls[rid] = _normalise_url_key(url)
             except Exception:
                 pass
 
@@ -582,6 +669,13 @@ class NodriverBypass:
                     rtype = 'Other'
                 self._real_bytes_by_resource_type[rtype] += size
                 self._real_requests_by_resource_type[rtype] += 1
+                # Per-URL attribution (issue #616). Skip silently when the URL
+                # wasn't captured — totals already counted above, and we don't
+                # want a bogus key polluting the top-consumer list.
+                url_key = self._request_urls.pop(rid, None) if rid is not None else None
+                if url_key:
+                    self._real_bytes_by_url[url_key] += size
+                    self._real_requests_by_url[url_key] += 1
             except Exception:
                 pass
 
@@ -626,7 +720,7 @@ class NodriverBypass:
         and restart-reason counters so the audit can attribute MB/run to
         specific code paths.
         """
-        return {
+        stats = {
             'real_bytes_downloaded': self._real_bytes_downloaded,
             'real_requests_count': self._real_requests_count,
             'real_bytes_by_resource_type': dict(self._real_bytes_by_resource_type),
@@ -636,7 +730,14 @@ class NodriverBypass:
             'cf_challenges_passed': self._cf_challenges_passed,
             'cf_challenges_failed': self._cf_challenges_failed,
             'restart_reasons': dict(self._restart_reasons),
+            # Issue #616 — per-URL breakdown + top-consumer / first-third split.
+            'real_bytes_by_url': dict(self._real_bytes_by_url),
+            'real_requests_by_url': dict(self._real_requests_by_url),
         }
+        stats.update(_summarise_url_traffic(
+            self._real_bytes_by_url, self._real_requests_by_url, self._TOP_URLS_N
+        ))
+        return stats
 
     # ------------------------------------------------------------------ #
     #  Proxy helpers                                                      #
