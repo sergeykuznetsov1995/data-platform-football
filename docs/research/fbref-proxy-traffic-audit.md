@@ -304,3 +304,84 @@ airflow variables set fbref_proxy_mb_threshold_match_all_data 300
 - **#118** — `feat(fbref): CF_COOKIE_PREWARM=True + file-based inter-process cookie cache` (P2) — **CLOSED not-planned** (2026-06-14, live-disproven); инфра удалена в #581 (PR #587)
 - **#124** — `feat(audit): instrument curl_cffi HTTP fast-path for resource_type breakdown` (P3) — **CLOSED** (probe §2bis verifies `http_mb_by_resource_type={"Document": 1.719}`)
 - **#131** — `fix(fbref): telemetry counters not wired to scrapers.nodriver_fbref production path` (P1) — open, surfaced by §6.4 / #117 production DAG run
+
+## 9. Issue #616 — per-URL audit + blocking verdict (2026-06-17)
+
+> **Question:** can we cut per-match proxy MB by extending `BLOCKED_URL_PATTERNS`
+> (block "useless" XHR/SCRIPT/3rd-party)? **Verdict: no — blocklist extension is
+> 0% in both regimes.** The traffic is already low in clean runs; the headline
+> 2+ MB/match comes from browser cold-start amplification, not blockable resources.
+
+### 9.1 What was added (instrumentation — shipped)
+
+Per-URL traffic breakdown in `NodriverBypass`, keyed by normalised `host+path`
+(query stripped, so repeated endpoint calls collapse and the counter stays
+bounded):
+- `get_real_traffic_stats()` now also returns `real_bytes_by_url`,
+  `real_requests_by_url`, `top_traffic_urls` (top-25 by bytes, with mb+requests),
+  and `first_party_mb` / `third_party_mb` (fbref.com / ssref.net = first-party).
+- Flushed across browser restarts via the same base-accumulator path as the
+  resource-type counters (`scrapers/fbref/browser_manager.py`,
+  `scrapers/nodriver_fbref/scraper.py`), surfaced in
+  `/tmp/fbref_traffic_<label>.json` (`run_fbref_scraper.py`) and the bench report.
+- `scripts/research/bench_fbref_fetch.py`: new env `BENCH_FORCE_NODRIVER=1`
+  disables the curl_cffi HTTP fast-path to reproduce the cold / fallback regime.
+
+### 9.2 Method
+
+`bench_fbref_fetch.py`, 10 fixed APL 2025/26 match pages, production-mode scraper.
+Four runs — with vs without the candidate blocking patterns, in each regime:
+
+| run | regime (HTTP fast-path) | new patterns | real_proxy_mb (CDP) | `/short/inc/` search-lists |
+|---|---|---|---:|---|
+| `issue616_baseline`      | warm (9/10 via curl_cffi) | no  | **2.75** | x1 |
+| `issue616_after`         | warm                      | yes | **2.75** | x1 |
+| `issue616_cold_baseline` | cold (0/10, forced)       | no  | **3.44** | x1 |
+| `issue616_cold_after`    | cold                      | yes | **3.44** | x1 |
+
+Raw artifacts: `docs/research/data/bench_fbref_issue616_{baseline,after,cold_baseline,cold_after}.json`.
+All four: `success_rate=1.0`, per-match HTML intact (~353 KB), no data loss.
+
+### 9.3 Why blocking does nothing
+
+Top CDP consumer on a cold load was `fbref.com/short/inc/*_search_list.csv`
+(~1.65 MB — autocomplete lists, **not** match data; parser reads HTML comments
+via `extract_tables_from_comments`, no scraper code references `/short/inc/`).
+Yet adding `*/short/inc/*` changed nothing because:
+
+1. **Browser cache, not blocking.** Search-lists are fetched **once** (`requests=1`)
+   on match 1 and served from cache afterwards — identical with/without the
+   pattern. On that first load they're fetched *before* blocking activates.
+2. **Sub-target leak.** 3rd-party trackers/ads (GTM `x21`, osano `x10`,
+   pub.network `x10`) load in ad/consent **iframes (separate CDP targets)** that
+   the main page's `Network.setBlockedURLs` does not cover. GTM was **already**
+   in `BLOCKED_URL_PATTERNS` and still leaks identically.
+3. **Late activation.** `_setup_network_blocking()` runs only *after* CF bypass,
+   so the cold-start page load leaks its resources regardless of patterns.
+
+### 9.4 Headline correction
+
+Clean per-match proxy traffic is already low: **~0.28 MB (warm) / ~0.34 MB (cold)**.
+The `2.12 MB/match` figure (`bench_fbref_baseline.json`, 601 requests / 21 MB) was
+a **pathological run** — repeated browser cold-starts (CF re-challenges /
+slow-proxy / restarts), each re-minting and re-downloading ~2 MB. The cost is
+cold-start *amplification*, not per-page blockable resources.
+
+### 9.5 HTTP fast-path fingerprint — already correct
+
+(Re: external suggestion to match the cf_clearance fingerprint.) Verified:
+container Chromium is **120**, the browser uses its **native UA** (UA is
+deliberately not faked — see `nodriver_bypass.py` comment on JA3/JA4 mismatch),
+and `curl_cffi` reuses the cookie with `impersonate='chrome120'` + matching UA,
+same proxy, TTL 25 min / 150 req. The recipe is already implemented; in clean
+runs the fast path works **9/10** and traffic is minimal. No fingerprint fix
+needed.
+
+### 9.6 Real lever → follow-up
+
+Reduce **browser cold-starts** (CF re-challenge / slow-proxy / restart
+amplification); each ≈ 2 MB. The HTTP fast-path already avoids them when it
+works — the spikes are bad-proxy/CF days where it falls back. Diagnose with the
+existing `http_fetch_diag` (#65) on the production VM when
+`http_fetch_fallback > 0`. Blocklist tuning and fingerprint matching are **not**
+the levers (this section).

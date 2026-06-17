@@ -1,0 +1,343 @@
+{
+  "label": "issue616_baseline",
+  "matches_attempted": 10,
+  "matches_succeeded": 10,
+  "total_seconds": 23.77,
+  "mean_seconds": 2.18,
+  "p50_seconds": 0.56,
+  "p95_seconds": 17.51,
+  "success_rate": 1.0,
+  "http_fetch_ok_total": 9,
+  "http_fetch_fallback_total": 0,
+  "real_bytes_mb": 2.75,
+  "real_requests": 65,
+  "scraper_failures": 0,
+  "top_traffic_urls": [
+    {
+      "url": "fbref.com/short/inc/players_search_list.csv",
+      "bytes": 1295253,
+      "mb": 1.2352,
+      "requests": 1
+    },
+    {
+      "url": "www.googletagmanager.com/gtag/js",
+      "bytes": 330406,
+      "mb": 0.3151,
+      "requests": 2
+    },
+    {
+      "url": "fbref.com/short/inc/clubs_search_list.csv",
+      "bytes": 258969,
+      "mb": 0.247,
+      "requests": 1
+    },
+    {
+      "url": "fbref.com/short/inc/sh_squads_search_list.csv",
+      "bytes": 172853,
+      "mb": 0.1648,
+      "requests": 1
+    },
+    {
+      "url": "cmp.osano.com/16CGnCU8UtNhM14sg/12669873-8cf8-41e2-be1f-1cb803cbffe0/osano.js",
+      "bytes": 168626,
+      "mb": 0.1608,
+      "requests": 1
+    },
+    {
+      "url": "www.googletagmanager.com/gtm.js",
+      "bytes": 123077,
+      "mb": 0.1174,
+      "requests": 1
+    },
+    {
+      "url": "cdn.ssref.net/req/202605271/js/fb/sr-min.js",
+      "bytes": 70436,
+      "mb": 0.0672,
+      "requests": 1
+    },
+    {
+      "url": "fbref.com/cdn-cgi/challenge-platform/h/b/orchestrate/chl_page/v1",
+      "bytes": 68823,
+      "mb": 0.0656,
+      "requests": 1
+    },
+    {
+      "url": "fbref.com/en/matches/a071faa8/Liverpool-Bournemouth-August-15-2025-Premier-League",
+      "bytes": 57520,
+      "mb": 0.0549,
+      "requests": 2
+    },
+    {
+      "url": "cdn.ssref.net/req/1701182769646-20231028/flags/rs.svg",
+      "bytes": 51738,
+      "mb": 0.0493,
+      "requests": 1
+    },
+    {
+      "url": "cdn.ssref.net/req/202605271/css/fb/sr-min.css",
+      "bytes": 35646,
+      "mb": 0.034,
+      "requests": 1
+    },
+    {
+      "url": "cdn.ssref.net/req/202301032/images/stathead/stathead-newspaper-texture.jpg",
+      "bytes": 30293,
+      "mb": 0.0289,
+      "requests": 1
+    },
+    {
+      "url": "a.pub.network/fbref-com/pubfig.min.js",
+      "bytes": 29448,
+      "mb": 0.0281,
+      "requests": 1
+    },
+    {
+      "url": "js.hubspot.com/web-interactives-embed.js",
+      "bytes": 28945,
+      "mb": 0.0276,
+      "requests": 1
+    },
+    {
+      "url": "fbref.com/cdn-cgi/challenge-platform/h/b/flow/ov1/2979298634:1781686845:fXo9wV33YdbMi6UR46mhfssKG1fpFL_koC0DHqrSmho/a0d10bd1dcdfd3c2/36N._8e6xujZikqPGSe2QU6ZS1s10wHUvGoni2DWAxM-1781688737-1.2.1.1-V.xdl2KhtRwjjYdn1f.sBeoAz.8ZR6wnowHHyQgROmYN69caI2xig9LIDF79HYOo",
+      "bytes": 21811,
+      "mb": 0.0208,
+      "requests": 2
+    },
+    {
+      "url": "challenges.cloudflare.com/turnstile/v0/b/7c8a194018aa/api.js",
+      "bytes": 21654,
+      "mb": 0.0207,
+      "requests": 1
+    },
+    {
+      "url": "fbref.com/favicon.ico",
+      "bytes": 13794,
+      "mb": 0.0132,
+      "requests": 3
+    },
+    {
+      "url": "static.cloudflareinsights.com/beacon.min.js/v833ccba57c9e4d2798f2e76cebdd09a11778172276447",
+      "bytes": 11671,
+      "mb": 0.0111,
+      "requests": 1
+    },
+    {
+      "url": "d.pub.network/v2/sites/fbref-com/configs",
+      "bytes": 11625,
+      "mb": 0.0111,
+      "requests": 1
+    },
+    {
+      "url": "fbref.com/short/inc/comps_search_list.csv",
+      "bytes": 7458,
+      "mb": 0.0071,
+      "requests": 1
+    },
+    {
+      "url": "cdn.ssref.net/req/202605271/icons/sr_icons-min.svg",
+      "bytes": 7114,
+      "mb": 0.0068,
+      "requests": 1
+    },
+    {
+      "url": "cdn.ssref.net/req/202606080/tlogo/fb/822bd0ba.png",
+      "bytes": 6868,
+      "mb": 0.0065,
+      "requests": 1
+    },
+    {
+      "url": "fbref.com/short/inc/main_nav_menu.json",
+      "bytes": 6763,
+      "mb": 0.0064,
+      "requests": 1
+    },
+    {
+      "url": "cdn.ssref.net/req/1701182769667-20231028/flags/gb-wal.svg",
+      "bytes": 4527,
+      "mb": 0.0043,
+      "requests": 1
+    },
+    {
+      "url": "cdn.ssref.net/req/1701182769577-20231028/flags/eg.svg",
+      "bytes": 4192,
+      "mb": 0.004,
+      "requests": 1
+    }
+  ],
+  "first_party_mb": 2.047,
+  "third_party_mb": 0.701,
+  "real_bytes_by_url": {
+    "fbref.com/en/matches/a071faa8/Liverpool-Bournemouth-August-15-2025-Premier-League": 57520,
+    "fbref.com/cdn-cgi/challenge-platform/h/b/orchestrate/chl_page/v1": 68823,
+    "blob:https://fbref.com/3b8dae34-d390-418f-97d5-7f855d8cc18a": 0,
+    "fbref.com/favicon.ico": 13794,
+    "fbref.com/cdn-cgi/challenge-platform/h/b/flow/ov1/2979298634:1781686845:fXo9wV33YdbMi6UR46mhfssKG1fpFL_koC0DHqrSmho/a0d10bd1dcdfd3c2/36N._8e6xujZikqPGSe2QU6ZS1s10wHUvGoni2DWAxM-1781688737-1.2.1.1-V.xdl2KhtRwjjYdn1f.sBeoAz.8ZR6wnowHHyQgROmYN69caI2xig9LIDF79HYOo": 21811,
+    "blob:https://fbref.com/c0734cfa-1844-4900-8a00-08454a188867": 0,
+    "challenges.cloudflare.com/turnstile/v0/b/7c8a194018aa/api.js": 21654,
+    "fbref.com/short/inc/main_nav_menu.json": 6763,
+    "a.pub.network/fbref-com/cls.css": 1012,
+    "cdn.ssref.net/req/202605271/css/fb/sr-min.css": 35646,
+    "cdn.ssref.net/req/202606080/tlogo/fb/822bd0ba.png": 6868,
+    "cdn.ssref.net/req/202605271/logos/fb-logo.svg": 1532,
+    "cdn.ssref.net/req/202605271/icons/sr_icons-min.svg": 7114,
+    "cdn.ssref.net/req/1/images/fb/pitch.svg": 839,
+    "cdn.ssref.net/req/202606080/tlogo/fb/4ba7cbea.png": 3775,
+    "cmp.osano.com/16CGnCU8UtNhM14sg/12669873-8cf8-41e2-be1f-1cb803cbffe0/osano.js": 168626,
+    "cdn.ssref.net/req/202004233/logos/stathead-fb-white.svg": 1827,
+    "cdn.ssref.net/req/201604190/images/chosen-sprite.png": 879,
+    "cdn.ssref.net/req/202004233/logos/fb-logo-white.svg": 1368,
+    "blob:https://fbref.com/4d68427c-7ba5-471f-ac34-0b8f8f46956f": 0,
+    "cdn.ssref.net/req/202605271/images/klecko/dsg.png": 3126,
+    "cdn.ssref.net/req/1/images/fb/yellow-card.png": 529,
+    "cdn.ssref.net/req/202301032/images/stathead/stathead-newspaper-texture.jpg": 30293,
+    "cdn.ssref.net/req/1/images/fb/sub.png": 785,
+    "a.pub.network/fbref-com/pubfig.min.js": 29448,
+    "cdn.ssref.net/req/1/images/fb/ball.png": 1700,
+    "cdn.ssref.net/req/1701182769581-20231028/flags/fr.svg": 525,
+    "cdn.ssref.net/req/1701182769661-20231028/flags/gb-eng.svg": 459,
+    "cdn.ssref.net/req/1701182769638-20231028/flags/nl.svg": 643,
+    "cdn.ssref.net/req/202605271/js/fb/sr-min.js": 70436,
+    "cdn.ssref.net/req/1701182769574-20231028/flags/de.svg": 443,
+    "cdn.ssref.net/req/1701182769552-20231028/flags/ar.svg": 1462,
+    "cdn.ssref.net/req/1701182769593-20231028/flags/hu.svg": 469,
+    "cdn.ssref.net/req/1701182769667-20231028/flags/gb-sco.svg": 546,
+    "cdn.ssref.net/req/1701182769602-20231028/flags/it.svg": 518,
+    "cdn.ssref.net/req/1701182769577-20231028/flags/eg.svg": 4192,
+    "cdn.ssref.net/req/1701182769606-20231028/flags/jp.svg": 612,
+    "cdn.ssref.net/req/1701182769558-20231028/flags/br.svg": 3269,
+    "cdn.ssref.net/req/1701182769667-20231028/flags/gb-wal.svg": 4527,
+    "cdn.ssref.net/req/1701182769585-20231028/flags/gh.svg": 476,
+    "cdn.ssref.net/req/1701182769569-20231028/flags/ci.svg": 481,
+    "cdn.ssref.net/req/1701182769656-20231028/flags/us.svg": 613,
+    "cdn.ssref.net/req/1701182769646-20231028/flags/rs.svg": 51738,
+    "static.cloudflareinsights.com/beacon.min.js/v833ccba57c9e4d2798f2e76cebdd09a11778172276447": 11671,
+    "config.config-factory.com/fbref-com.json": 3704,
+    "js.hs-scripts.com/20503178.js": 1397,
+    "d.pub.network/v2/sites/fbref-com/configs": 11625,
+    "js.hubspot.com/web-interactives-embed.js": 28945,
+    "www.googletagmanager.com/gtm.js": 123077,
+    "a.pub.network/core/imgs/1.png": 1202,
+    "www.googletagmanager.com/gtag/js": 330406,
+    "cta-service-cms2.hubspot.com/web-interactives/public/v1/embed/combinedConfigs": 1154,
+    "fbref.com/short/inc/clubs_search_list.csv": 258969,
+    "fbref.com/short/inc/comps_search_list.csv": 7458,
+    "perf-na1.hsforms.com/embed/v3/counters.gif": 1023,
+    "cdn.ssref.net/req/202605271/favicons/fb/favicon-32.png": 2350,
+    "fbref.com/short/inc/direct_search_list.csv": 3668,
+    "fbref.com/short/inc/sh_squads_search_list.csv": 172853,
+    "fbref.com/short/inc/players_search_list.csv": 1295253
+  },
+  "http_fetch_diag": [],
+  "per_match": [
+    {
+      "i": 1,
+      "path": "/en/matches/a071faa8/Liverpool-Bournemouth-August-15-2025-Premier-League",
+      "seconds": 17.51,
+      "bytes": 353617,
+      "success": true,
+      "http_fetch_ok_cumul": 0,
+      "http_fetch_fallback_cumul": 0,
+      "successes_cumul": 1,
+      "failures_cumul": 0
+    },
+    {
+      "i": 2,
+      "path": "/en/matches/bbdf4739/Aston-Villa-Newcastle-United-August-16-2025-Premier-League",
+      "seconds": 0.98,
+      "bytes": 189479,
+      "success": true,
+      "http_fetch_ok_cumul": 1,
+      "http_fetch_fallback_cumul": 0,
+      "successes_cumul": 2,
+      "failures_cumul": 0
+    },
+    {
+      "i": 3,
+      "path": "/en/matches/e1058522/Sunderland-West-Ham-United-August-16-2025-Premier-League",
+      "seconds": 0.57,
+      "bytes": 197754,
+      "success": true,
+      "http_fetch_ok_cumul": 2,
+      "http_fetch_fallback_cumul": 0,
+      "successes_cumul": 3,
+      "failures_cumul": 0
+    },
+    {
+      "i": 4,
+      "path": "/en/matches/57c49bae/Brighton-and-Hove-Albion-Fulham-August-16-2025-Premier-League",
+      "seconds": 0.23,
+      "bytes": 207528,
+      "success": true,
+      "http_fetch_ok_cumul": 3,
+      "http_fetch_fallback_cumul": 0,
+      "successes_cumul": 4,
+      "failures_cumul": 0
+    },
+    {
+      "i": 5,
+      "path": "/en/matches/d41bb8b3/Tottenham-Hotspur-Burnley-August-16-2025-Premier-League",
+      "seconds": 0.58,
+      "bytes": 204333,
+      "success": true,
+      "http_fetch_ok_cumul": 4,
+      "http_fetch_fallback_cumul": 0,
+      "successes_cumul": 5,
+      "failures_cumul": 0
+    },
+    {
+      "i": 6,
+      "path": "/en/matches/8613020d/Wolverhampton-Wanderers-Manchester-City-August-16-2025-Premier-League",
+      "seconds": 0.56,
+      "bytes": 207633,
+      "success": true,
+      "http_fetch_ok_cumul": 5,
+      "http_fetch_fallback_cumul": 0,
+      "successes_cumul": 6,
+      "failures_cumul": 0
+    },
+    {
+      "i": 7,
+      "path": "/en/matches/2185fc64/Chelsea-Crystal-Palace-August-17-2025-Premier-League",
+      "seconds": 0.24,
+      "bytes": 195416,
+      "success": true,
+      "http_fetch_ok_cumul": 6,
+      "http_fetch_fallback_cumul": 0,
+      "successes_cumul": 7,
+      "failures_cumul": 0
+    },
+    {
+      "i": 8,
+      "path": "/en/matches/855f8b5e/Nottingham-Forest-Brentford-August-17-2025-Premier-League",
+      "seconds": 0.29,
+      "bytes": 200335,
+      "success": true,
+      "http_fetch_ok_cumul": 7,
+      "http_fetch_fallback_cumul": 0,
+      "successes_cumul": 8,
+      "failures_cumul": 0
+    },
+    {
+      "i": 9,
+      "path": "/en/matches/643d26fd/Manchester-United-Arsenal-August-17-2025-Premier-League",
+      "seconds": 0.3,
+      "bytes": 203496,
+      "success": true,
+      "http_fetch_ok_cumul": 8,
+      "http_fetch_fallback_cumul": 0,
+      "successes_cumul": 9,
+      "failures_cumul": 0
+    },
+    {
+      "i": 10,
+      "path": "/en/matches/0701e218/Leeds-United-Everton-August-18-2025-Premier-League",
+      "seconds": 0.58,
+      "bytes": 196415,
+      "success": true,
+      "http_fetch_ok_cumul": 9,
+      "http_fetch_fallback_cumul": 0,
+      "successes_cumul": 10,
+      "failures_cumul": 0
+    }
+  ]
+}

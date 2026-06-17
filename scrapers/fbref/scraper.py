@@ -165,6 +165,10 @@ class FBrefScraper(
         # Issue #116: cumulative count of loadingFinished events that found
         # no cached resource_type (diagnostic for CDP cache hit-rate).
         self._resource_type_cache_misses_base: int = 0
+        # Issue #616: per-URL byte/request breakdown, also flushed across
+        # browser restarts so the top-consumer audit covers the whole run.
+        self._real_traffic_base_bytes_by_url: _Counter = _Counter()
+        self._real_traffic_base_requests_by_url: _Counter = _Counter()
 
         # Consecutive fetch failure tracking for automatic proxy rotation
         # 3→15: higher MAX_SLOW_PROXY_RETRIES already handles dead proxies per URL;

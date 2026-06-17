@@ -241,6 +241,106 @@ class TestResourceTypeDetection:
         assert stats['real_bytes_by_resource_type'] == {'Document': 100, 'Other': 50}
 
 
+class TestPerUrlTracking:
+    """Issue #616: per-URL byte breakdown drives the blockable-XHR audit.
+
+    The counter must group by host+path (drop query), survive into
+    get_real_traffic_stats() as a sorted top-N list, and split first-party
+    (fbref.com / ssref.net CDN) from third-party bytes.
+    """
+
+    @pytest.mark.unit
+    def test_init_zero_url_counters(self):
+        from scrapers.base.browser.nodriver_bypass import NodriverBypass
+
+        bypass = NodriverBypass()
+        assert dict(bypass._real_bytes_by_url) == {}
+        assert dict(bypass._real_requests_by_url) == {}
+        assert bypass._request_urls == {}
+
+    @pytest.mark.unit
+    def test_loading_finished_accumulates_by_url(self):
+        bypass, h = _setup_handlers()
+
+        h['RequestWillBeSent'](_evt(
+            request_id='U1', type_=_FakeType('XHR'),
+            request=_evt(url='https://fbref.com/en/xg/abc?foo=1'),
+        ))
+        h['LoadingFinished'](_evt(request_id='U1', encoded_data_length=4096))
+
+        assert dict(bypass._real_bytes_by_url) == {'fbref.com/en/xg/abc': 4096}
+        assert dict(bypass._real_requests_by_url) == {'fbref.com/en/xg/abc': 1}
+
+    @pytest.mark.unit
+    def test_url_key_strips_query_and_collapses(self):
+        # Cache-busting query params must collapse to one endpoint key so the
+        # counter stays bounded and the audit groups repeated calls.
+        bypass, h = _setup_handlers()
+
+        for i, rid in enumerate(('A', 'B'), 1):
+            h['RequestWillBeSent'](_evt(
+                request_id=rid, type_=_FakeType('Script'),
+                request=_evt(url=f'https://cdn.example.com/app.js?v={i}'),
+            ))
+            h['LoadingFinished'](_evt(request_id=rid, encoded_data_length=1000))
+
+        assert dict(bypass._real_bytes_by_url) == {'cdn.example.com/app.js': 2000}
+        assert dict(bypass._real_requests_by_url) == {'cdn.example.com/app.js': 2}
+
+    @pytest.mark.unit
+    def test_loading_finished_without_url_skips_per_url(self):
+        # No cached URL → per-URL counter stays clean, but resource-type and
+        # grand totals still count the bytes.
+        bypass, h = _setup_handlers()
+
+        h['LoadingFinished'](_evt(request_id='Z', encoded_data_length=500))
+
+        assert dict(bypass._real_bytes_by_url) == {}
+        assert bypass._real_bytes_downloaded == 500
+
+    @pytest.mark.unit
+    def test_top_traffic_urls_sorted_and_first_third_party_split(self):
+        bypass, h = _setup_handlers()
+
+        feed = [
+            ('R1', 'https://fbref.com/en/matches/abc', 5000),      # first-party
+            ('R2', 'https://cdn.ssref.net/req/big.js', 8000),      # first-party CDN
+            ('R3', 'https://www.google-analytics.com/g/x', 3000),  # third-party
+        ]
+        for rid, url, size in feed:
+            h['RequestWillBeSent'](_evt(
+                request_id=rid, type_=_FakeType('XHR'), request=_evt(url=url)))
+            h['LoadingFinished'](_evt(request_id=rid, encoded_data_length=size))
+
+        stats = bypass.get_real_traffic_stats()
+        urls = stats['top_traffic_urls']
+
+        assert [u['url'] for u in urls] == [
+            'cdn.ssref.net/req/big.js',
+            'fbref.com/en/matches/abc',
+            'www.google-analytics.com/g/x',
+        ]
+        assert urls[0]['bytes'] == 8000
+        assert urls[0]['requests'] == 1
+        # ssref.net (FBref CDN) + fbref.com are first-party; GA is third-party.
+        assert stats['first_party_bytes'] == 13000
+        assert stats['third_party_bytes'] == 3000
+
+    @pytest.mark.unit
+    def test_top_traffic_urls_capped(self):
+        from scrapers.base.browser.nodriver_bypass import NodriverBypass
+
+        bypass = NodriverBypass()
+        for i in range(40):
+            bypass._real_bytes_by_url[f'host{i}.com/p'] = i + 1
+            bypass._real_requests_by_url[f'host{i}.com/p'] = 1
+
+        stats = bypass.get_real_traffic_stats()
+
+        assert len(stats['top_traffic_urls']) == NodriverBypass._TOP_URLS_N
+        assert stats['top_traffic_urls'][0]['url'] == 'host39.com/p'  # highest first
+
+
 # Mock IcebergWriter at module level to prevent Trino connection attempts
 # during BaseScraper.__init__() (same pattern as test_nodriver_fbref_scraper).
 ICEBERG_WRITER_PATCH = 'scrapers.base.base_scraper.IcebergWriter'
@@ -258,6 +358,15 @@ def _nonzero_traffic_stats() -> dict:
         'cf_challenges_passed': 2,
         'cf_challenges_failed': 1,
         'restart_reasons': {'page_limit': 1},
+        # Issue #616 — per-URL breakdown (host+path keys).
+        'real_bytes_by_url': {
+            'fbref.com/en/matches/abc': 1_200_000,
+            'cdn.example.com/app.js': 300_000,
+        },
+        'real_requests_by_url': {
+            'fbref.com/en/matches/abc': 1,
+            'cdn.example.com/app.js': 11,
+        },
     }
 
 
@@ -307,6 +416,11 @@ class TestNodriverFBrefTrafficWiring:
         assert result['real_proxy_requests'] == 12
         assert result['cf_challenge_attempts'] == 3
         assert result['real_proxy_mb_by_resource_type']  # non-empty breakdown
+        # Issue #616 — per-URL audit surfaced in diagnostics.
+        assert result['top_traffic_urls']
+        assert result['top_traffic_urls'][0]['url'] == 'fbref.com/en/matches/abc'
+        assert result['first_party_mb'] > 0
+        assert result['third_party_mb'] > 0
 
     @pytest.mark.unit
     @patch(ICEBERG_WRITER_PATCH)
@@ -327,3 +441,39 @@ class TestNodriverFBrefTrafficWiring:
         assert scraper._stats['real_bytes_downloaded'] == 1_500_000
         assert scraper._stats['cf_challenge_attempts'] == 3
         assert scraper._stats['restart_reasons'] == {'page_limit': 1}
+
+    @pytest.mark.unit
+    @patch(ICEBERG_WRITER_PATCH)
+    def test_url_breakdown_flushed_and_summarised(self, mock_iceberg):
+        # Issue #616: merged per-URL counter reaches _stats with a derived
+        # top-N list and first/third-party split.
+        from scrapers.nodriver_fbref import NodriverFBrefScraper
+
+        scraper = NodriverFBrefScraper()
+        scraper._browser = MagicMock()
+        scraper._browser.get_real_traffic_stats.return_value = _nonzero_traffic_stats()
+
+        scraper._update_real_traffic_stats()
+
+        assert scraper._stats['real_bytes_by_url']['fbref.com/en/matches/abc'] == 1_200_000
+        assert scraper._stats['first_party_bytes'] == 1_200_000  # fbref.com
+        assert scraper._stats['third_party_bytes'] == 300_000     # cdn.example.com
+        top = scraper._stats['top_traffic_urls']
+        assert top[0]['url'] == 'fbref.com/en/matches/abc'
+
+    @pytest.mark.unit
+    @patch(ICEBERG_WRITER_PATCH)
+    def test_url_breakdown_survives_restart(self, mock_iceberg):
+        # Per-URL counter must flush into the persistent base so it survives a
+        # mid-scrape browser teardown (mirrors resource-type survival).
+        from scrapers.nodriver_fbref import NodriverFBrefScraper
+
+        scraper = NodriverFBrefScraper()
+        scraper._browser = MagicMock()
+        scraper._browser.get_real_traffic_stats.return_value = _nonzero_traffic_stats()
+
+        scraper._close_browser()
+        assert scraper._browser is None
+
+        scraper._update_real_traffic_stats()
+        assert scraper._stats['real_bytes_by_url']['cdn.example.com/app.js'] == 300_000
