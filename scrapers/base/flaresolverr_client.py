@@ -9,7 +9,9 @@ that holds CF state inside the FlareSolverr container.
 
 import logging
 import uuid
+from collections import Counter
 from typing import Optional, Tuple
+from urllib.parse import urlsplit
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -51,8 +53,31 @@ _CF_MARKERS = ("cloudflare", "challenge", "turnstile")
 _TAB_CRASH_MARKERS = ("tab crashed", "target crashed", "page crashed", "renderer")
 
 
+def _normalise_url_key(url: str) -> str:
+    """Collapse a URL to ``host/path`` (query + fragment dropped).
+
+    Groups repeated calls to one endpoint under a single key so the per-URL
+    traffic counter (issue #616) stays bounded regardless of cache-busting
+    query params (``?d=`` on WhoScored data, ``?r=&set=true`` on SoFIFA).
+    Mirrors ``nodriver_bypass._normalise_url_key`` but kept local so this light
+    client never imports the CDP / nodriver stack. Returns '' for falsy input.
+    """
+    if not url:
+        return ""
+    try:
+        parts = urlsplit(url)
+        if parts.netloc:
+            return f"{parts.netloc}{parts.path}"
+        return url.split("?", 1)[0].split("#", 1)[0]
+    except Exception:
+        return url.split("?", 1)[0]
+
+
 class FlareSolverrClient:
     """HTTP wrapper around FlareSolverr `/v1` and `/health` endpoints."""
+
+    #: Number of top per-URL consumers surfaced by get_traffic_stats().
+    _TOP_URLS_N = 25
 
     def __init__(
         self,
@@ -65,6 +90,19 @@ class FlareSolverrClient:
         self.default_max_timeout_ms = default_max_timeout_ms
         self._session: Optional[requests.Session] = None
         self._auto_session_id: Optional[str] = None
+        # Traffic-audit counters (issue #616). ``fs_response_bytes`` is the
+        # payload FlareSolverr returns to us (rendered HTML + JSON envelope) —
+        # a LOWER BOUND on residential-proxy traffic, NOT the proxy MB itself:
+        # Camoufox downloads images/CSS/JS/XHR through the proxy and returns
+        # only the rendered HTML. ``sessions_created`` ≈ CF cold-starts, the
+        # real traffic driver (each new session re-solves the CF challenge).
+        self._fs_response_bytes = 0
+        self._requests = 0
+        self._bytes_by_url: Counter = Counter()
+        self._requests_by_url: Counter = Counter()
+        self._sessions_created = 0
+        self._cf_challenge_failures = 0
+        self._last_post_bytes = 0
 
     @property
     def session(self) -> requests.Session:
@@ -118,6 +156,7 @@ class FlareSolverrClient:
             )
             lower = body.lower()
             if "challenge" in lower or "cloudflare" in lower or "turnstile" in lower:
+                self._cf_challenge_failures += 1
                 raise FlareSolverrCFChallengeFailed(
                     f"FlareSolverr HTTP {response.status_code}: {body}"
                 )
@@ -137,11 +176,16 @@ class FlareSolverrClient:
                 logger.warning(f"FlareSolverr tab crashed (cmd={cmd}): {message}")
                 raise FlareSolverrTabCrashed(message)
             if any(marker in lowered for marker in _CF_MARKERS):
+                self._cf_challenge_failures += 1
                 logger.warning(f"FlareSolverr CF challenge failed (cmd={cmd}): {message}")
                 raise FlareSolverrCFChallengeFailed(message)
             logger.warning(f"FlareSolverr error (cmd={cmd}): {message}")
             raise FlareSolverrError(message)
 
+        # Count only successful responses: bytes FlareSolverr returned to us.
+        # ``_last_post_bytes`` bridges to get() for per-URL attribution.
+        self._last_post_bytes = len(response.content or b"")
+        self._fs_response_bytes += self._last_post_bytes
         return data
 
     def health(self) -> bool:
@@ -161,6 +205,10 @@ class FlareSolverrClient:
         if proxy_url:
             payload["proxy"] = {"url": proxy_url}
         self._post(payload)
+        # A fresh session re-solves the Cloudflare challenge → a cold-start.
+        # Counting these is the cheapest signal for the dominant traffic driver
+        # (issue #616): SoFIFA rotates every 4 requests, WhoScored every 8–10.
+        self._sessions_created += 1
         logger.info(
             f"FlareSolverr session created: {session_id}"
             f"{' (proxy=' + proxy_url + ')' if proxy_url else ''}"
@@ -199,12 +247,50 @@ class FlareSolverrClient:
 
         timeout = (max_timeout_ms / 1000.0 + 30.0) if max_timeout_ms else self.default_timeout
         data = self._post(payload, timeout=timeout)
+        # Per-URL traffic attribution (issue #616). Only successful fetches
+        # reach here (_post raises on CF / error), so a failed page is never
+        # booked as a request.
+        self._requests += 1
+        url_key = _normalise_url_key(url)
+        if url_key:
+            self._bytes_by_url[url_key] += self._last_post_bytes
+            self._requests_by_url[url_key] += 1
         solution = data.get("solution") or {}
         return {
             "html": solution.get("response", ""),
             "cookies": solution.get("cookies", []),
             "userAgent": solution.get("userAgent", ""),
             "status": solution.get("status", 0),
+        }
+
+    def get_traffic_stats(self) -> dict:
+        """Per-scrape proxy-traffic audit summary (issue #616).
+
+        ``fs_response_*`` is the FlareSolverr payload returned to us — a LOWER
+        BOUND on residential-proxy bytes, not the proxy MB itself (sub-resources
+        are fetched by Camoufox and never returned). The true per-match proxy
+        MB is measured at the container/proxy level on the VM; see
+        ``docs/research/flaresolverr-proxy-traffic-audit.md``. ``sessions_created``
+        ≈ CF cold-starts, the dominant traffic driver.
+        """
+        top = sorted(
+            self._bytes_by_url.items(), key=lambda kv: kv[1], reverse=True
+        )[: self._TOP_URLS_N]
+        return {
+            "fs_response_bytes": self._fs_response_bytes,
+            "fs_response_mb": round(self._fs_response_bytes / 1024 / 1024, 4),
+            "requests": self._requests,
+            "sessions_created": self._sessions_created,
+            "cf_challenge_failures": self._cf_challenge_failures,
+            "top_traffic_urls": [
+                {
+                    "url": key,
+                    "bytes": size,
+                    "mb": round(size / 1024 / 1024, 4),
+                    "requests": int(self._requests_by_url.get(key, 0)),
+                }
+                for key, size in top
+            ],
         }
 
     def __enter__(self) -> Tuple["FlareSolverrClient", str]:

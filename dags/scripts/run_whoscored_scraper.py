@@ -27,6 +27,7 @@ JSON output (stable contract):
       "errors":           [str, ...],
       "tables":           [str, ...],
       "tables_by_entity": {entity: table_path, ...},
+      "traffic":          {events: {...}, schedule: {...}},  # issue #616 audit
     }
 """
 
@@ -136,6 +137,8 @@ def main() -> int:
         'errors': [],
         'tables': [],
         'tables_by_entity': {},
+        # Issue #616 — FlareSolverr proxy-traffic audit ({events, schedule}).
+        'traffic': {},
     }
 
     try:
@@ -188,6 +191,13 @@ def main() -> int:
                 except Exception as e:
                     logger.error(f"scrape_events failed: {e}", exc_info=True)
                     results['errors'].append(f"events: {e}")
+
+            # Issue #616: surface the FlareSolverr proxy-traffic audit for this
+            # run (per-match proxy MB baseline; events + schedule sessions).
+            try:
+                results['traffic'] = scraper.get_traffic_stats()
+            except Exception as e:
+                logger.warning(f"get_traffic_stats failed: {e}")
 
     except Exception as e:
         logger.error(f"Scraper failed: {e}", exc_info=True)
