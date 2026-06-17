@@ -37,7 +37,7 @@ Silver Tables Created:
     iceberg.silver.fbref_shot_events            — per-shot xG data (if Bronze exists)
 """
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Dict
 
 from airflow import DAG
@@ -420,6 +420,10 @@ with DAG(
     tags=['transform', 'fbref', 'silver', 'football', 'trino'],
     max_active_runs=1,
     max_active_tasks=1,  # Sequential execution to prevent OOM (each CTAS + import ~1.2GB)
+    # issue #530: cap run wall-clock so a stuck/abandoned run auto-fails instead
+    # of lingering forever (orphaned up_for_retry TIs accrued under runs that
+    # never reached a terminal state). ~10 sequential CTAS @ 30m timeout each.
+    dagrun_timeout=timedelta(hours=2),
     doc_md="""
     ## FBref Silver Transformation
 
