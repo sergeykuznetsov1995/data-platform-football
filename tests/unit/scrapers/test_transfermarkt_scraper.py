@@ -18,6 +18,7 @@ from scrapers.transfermarkt.scraper import (
     _coerce_int,
     _extract_club_id_from_href,
     _parse_club_listing,
+    _parse_coach_history,
     _parse_coach_profile,
     _parse_height_cm,
     _parse_mv_history,
@@ -28,6 +29,8 @@ from scrapers.transfermarkt.scraper import (
     _parse_tm_money_eur,
     _parse_transfers,
     _season_short,
+    _season_window,
+    _stint_overlaps_season,
 )
 
 
@@ -769,3 +772,143 @@ class TestParseCoachProfile:
         assert bio['name'] == 'Joe Coach'
         assert bio['dob'] is None
         assert bio['nationality'] is None
+
+
+# ---------------------------------------------------------------------------
+# Trainer-history parser + season window (issue #619)
+# ---------------------------------------------------------------------------
+
+def _history_row(slug, cid, name, appointed, left, role='Manager'):
+    return (
+        '<tr>'
+        f'<td class="hauptlink"><a href="/{slug}/profil/trainer/{cid}">{name}</a></td>'
+        f'<td class="zentriert">{appointed}</td>'
+        f'<td class="zentriert">{left}</td>'
+        f'<td class="zentriert">{role}</td>'
+        '</tr>'
+    )
+
+
+def _history_html(rows: str) -> str:
+    return (
+        '<html><body>'
+        '<table class="items"><tbody>'
+        '<tr><th>Manager</th><th>Appointed</th><th>End</th><th>Function</th></tr>'
+        f'{rows}'
+        '</tbody></table>'
+        '</body></html>'
+    )
+
+
+class TestParseCoachHistory:
+    def test_extracts_every_manager_with_dates(self):
+        import datetime
+
+        rows = (
+            # incumbent (open-ended) + mid-season replacement + caretaker
+            _history_row('regis-le-bris', '39286', 'Le Bris, Régis',
+                         'Jul 1, 2025', '-', 'Manager')
+            + _history_row('mike-dodds', '88888', 'Mike Dodds',
+                           'Jan 10, 2025', 'Jun 30, 2025', 'Caretaker Manager')
+        )
+        out = _parse_coach_history(_history_html(rows), club_id='289')
+        assert len(out) == 2, out
+        by_id = {r['coach_id']: r for r in out}
+
+        bris = by_id['39286']
+        assert bris['coach_slug'] == 'regis-le-bris'
+        assert bris['name'] == 'Le Bris, Régis'
+        assert bris['role'] == 'Manager'
+        assert bris['appointed_date'] == datetime.date(2025, 7, 1)
+        assert bris['left_date'] is None  # '-' → incumbent, open-ended
+        assert bris['club_id'] == '289'
+
+        dodds = by_id['88888']
+        assert dodds['role'] == 'Caretaker Manager'  # caretaker KEPT (the gap)
+        assert dodds['appointed_date'] == datetime.date(2025, 1, 10)
+        assert dodds['left_date'] == datetime.date(2025, 6, 30)
+
+    def test_skips_rows_without_trainer_link(self):
+        # A player link (spieler, not trainer) and a plain row must be ignored.
+        noise = (
+            '<tr><td class="hauptlink">'
+            '<a href="/some-player/profil/spieler/12345">Some Player</a></td>'
+            '<td>Jan 1, 2025</td></tr>'
+            '<tr><td>section header</td></tr>'
+        )
+        out = _parse_coach_history(_history_html(noise), club_id='1')
+        assert out == []
+
+    def test_dedups_identical_stint(self):
+        rows = (
+            _history_row('pep', '5672', 'Pep Guardiola', 'Jul 1, 2016', '-')
+            + _history_row('pep', '5672', 'Pep Guardiola', 'Jul 1, 2016', '-')
+        )
+        out = _parse_coach_history(_history_html(rows), club_id='281')
+        assert len(out) == 1, out
+
+    def test_role_defaults_to_manager_when_column_absent(self):
+        # No function column → role defaults to 'Manager'.
+        row = (
+            '<tr>'
+            '<td class="hauptlink"><a href="/x/profil/trainer/7">X Coach</a></td>'
+            '<td class="zentriert">Aug 1, 2024</td>'
+            '<td class="zentriert">-</td>'
+            '</tr>'
+        )
+        out = _parse_coach_history(_history_html(row), club_id='9')
+        assert out[0]['role'] == 'Manager'
+
+    def test_garbage_input(self):
+        assert _parse_coach_history('', club_id='1') == []
+        assert _parse_coach_history('<not-html>', club_id='1') == []
+
+
+class TestSeasonWindow:
+    def test_apl_season_bounds(self):
+        import datetime
+
+        start, end = _season_window(2025)
+        assert start == datetime.date(2025, 7, 1)
+        assert end == datetime.date(2026, 6, 30)
+
+
+class TestStintOverlapsSeason:
+    def _win(self):
+        return _season_window(2025)  # (2025-07-01, 2026-06-30)
+
+    def test_incumbent_appointed_before_window_kept(self):
+        import datetime
+        s, e = self._win()
+        stint = {'appointed_date': datetime.date(2024, 7, 1), 'left_date': None}
+        assert _stint_overlaps_season(stint, s, e) is True
+
+    def test_mid_season_caretaker_kept(self):
+        import datetime
+        s, e = self._win()
+        stint = {
+            'appointed_date': datetime.date(2025, 11, 1),
+            'left_date': datetime.date(2025, 11, 20),
+        }
+        assert _stint_overlaps_season(stint, s, e) is True
+
+    def test_old_stint_dropped(self):
+        import datetime
+        s, e = self._win()
+        stint = {
+            'appointed_date': datetime.date(2017, 1, 1),
+            'left_date': datetime.date(2019, 5, 1),
+        }
+        assert _stint_overlaps_season(stint, s, e) is False
+
+    def test_future_stint_dropped(self):
+        import datetime
+        s, e = self._win()
+        stint = {'appointed_date': datetime.date(2027, 1, 1), 'left_date': None}
+        assert _stint_overlaps_season(stint, s, e) is False
+
+    def test_undated_stint_kept(self):
+        s, e = self._win()
+        assert _stint_overlaps_season(
+            {'appointed_date': None, 'left_date': None}, s, e
+        ) is True
