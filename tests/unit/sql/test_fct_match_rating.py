@@ -77,10 +77,9 @@ def _collapse_call(sql: str, fn_name: str) -> str:
 
 _ICEBERG_TO_LOCAL = {
     "iceberg.bronze.sofascore_player_ratings": "bronze_sofascore_player_ratings",
-    "iceberg.bronze.sofascore_schedule":       "bronze_sofascore_schedule",
     "iceberg.silver.xref_player":              "silver_xref_player",
+    "iceberg.silver.xref_match":               "silver_xref_match",
     "iceberg.silver.sofascore_player_ratings": "silver_sofascore_player_ratings",
-    "iceberg.gold.dim_match":                  "gold_dim_match",
 }
 
 
@@ -110,9 +109,9 @@ def duck_conn():
 @pytest.fixture(autouse=True)
 def _reset_schemas(duck_conn):
     for tbl in (
-        "bronze_sofascore_player_ratings", "bronze_sofascore_schedule",
-        "silver_xref_player", "silver_sofascore_player_ratings",
-        "gold_dim_match",
+        "bronze_sofascore_player_ratings",
+        "silver_xref_player", "silver_xref_match",
+        "silver_sofascore_player_ratings",
     ):
         duck_conn.execute(f"DROP TABLE IF EXISTS {tbl}")
 
@@ -132,19 +131,6 @@ def _reset_schemas(duck_conn):
     )
     duck_conn.execute(
         """
-        CREATE TABLE bronze_sofascore_schedule (
-            game_id       BIGINT,
-            date          TIMESTAMP,
-            home_team     VARCHAR,
-            away_team     VARCHAR,
-            league        VARCHAR,
-            season        VARCHAR,
-            _ingested_at  TIMESTAMP
-        )
-        """
-    )
-    duck_conn.execute(
-        """
         CREATE TABLE silver_xref_player (
             source        VARCHAR,
             source_id     VARCHAR,
@@ -154,15 +140,19 @@ def _reset_schemas(duck_conn):
         )
         """
     )
+    # silver.xref_match — frozen E1.5 schema (see silver/xref_match.sql L22-32).
+    # Bridges SofaScore game_id (source_id) → canonical FBref match_id (#477).
     duck_conn.execute(
         """
-        CREATE TABLE gold_dim_match (
-            match_id      VARCHAR,
-            match_date    DATE,
+        CREATE TABLE silver_xref_match (
+            canonical_id  VARCHAR,
+            source        VARCHAR,
+            source_id     VARCHAR,
+            display_name  VARCHAR,
             league        VARCHAR,
-            season        BIGINT,
-            home_team_id  VARCHAR,
-            away_team_id  VARCHAR
+            season        VARCHAR,
+            confidence    VARCHAR,
+            match_score   DOUBLE
         )
         """
     )
@@ -210,19 +200,16 @@ def _seed(duck_conn) -> None:
         """
     )
 
-    # Schedule + dim_match for the bridge — supply M_SS_1 as bridged.
+    # silver.xref_match — bridge SofaScore game_id 'M_SS_1' → FBref hex (#477).
+    # The silver SQL joins xref_match.source_id = ratings.match_id directly
+    # (no schedule read), so source_id is the SofaScore match id verbatim.
     duck_conn.execute(
         """
-        INSERT INTO bronze_sofascore_schedule VALUES
-          (1234, TIMESTAMP '2024-08-15 19:00:00', 'Liverpool', 'Arsenal',
-           'ENG-Premier League', '2425', TIMESTAMP '2026-05-08 12:00:00')
-        """
-    )
-    duck_conn.execute(
-        """
-        INSERT INTO gold_dim_match VALUES
-          ('M_FBREF_HEX', DATE '2024-08-15', 'ENG-Premier League', 2024,
-           'liverpool', 'arsenal')
+        INSERT INTO silver_xref_match
+          (canonical_id, source, source_id, display_name, league, season, confidence, match_score)
+        VALUES
+          ('M_FBREF_HEX', 'sofascore', 'M_SS_1', 'Liverpool vs Arsenal',
+           'ENG-Premier League', '2425', 'date_team_match', NULL)
         """
     )
 
@@ -303,6 +290,36 @@ class TestFctMatchRatingPipeline:
         out = _run_gold(duck_conn)
         canonicals = {r["player_id_canonical"] for r in out}
         assert {"fb_p1", "fb_p2", "fb_p3"} <= canonicals, canonicals
+
+    def test_match_id_bridged_via_xref_match(self, duck_conn):
+        """ratings.match_id 'M_SS_1' resolves to the FBref hex through
+        silver.xref_match (#477 — no longer through gold.dim_match)."""
+        _seed(duck_conn)
+        _materialize_silver(duck_conn)
+        out = _run_gold(duck_conn)
+        match_ids = {r["match_id_canonical"] for r in out}
+        assert match_ids == {"M_FBREF_HEX"}, match_ids
+
+    def test_orphan_match_falls_back_to_sofascore_prefix(self, duck_conn):
+        """A rating whose game_id is absent from xref_match falls back to
+        'sofascore_<id>' (mirrors silver/sofascore_shots.sql; #477)."""
+        _seed(duck_conn)
+        duck_conn.execute(
+            """
+            INSERT INTO bronze_sofascore_player_ratings VALUES
+              ('M_SS_ORPHAN', 'P9', 'home', 7.0, 'MF', 'ENG-Premier League', '2425',
+               TIMESTAMP '2026-05-08 12:00:00')
+            """
+        )
+        _materialize_silver(duck_conn)
+        out = _run_gold(duck_conn)
+        orphan_ids = {
+            r["match_id_canonical"] for r in out
+            if r["match_id_canonical"] == "sofascore_M_SS_ORPHAN"
+        }
+        assert orphan_ids == {"sofascore_M_SS_ORPHAN"}, (
+            [r["match_id_canonical"] for r in out]
+        )
 
     def test_canonical_trio_populated(self, duck_conn):
         _seed(duck_conn)

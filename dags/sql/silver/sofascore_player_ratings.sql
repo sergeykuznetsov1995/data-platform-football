@@ -9,22 +9,23 @@
 --      (производится E4.1 web-scraping-expert; до тех пор Bronze 0 rows
 --      → пустая Silver-таблица; см. Empty-bronze handling ниже).
 --
---   2) match_id_canonical bridging — двухступенчатый:
---      a) sofascore_schedule.game_id → (date, home_team, away_team) →
---         через team_aliases → gold.dim_match.match_id (FBref hex).
---         sofascore_schedule.game_id это BIGINT, ratings.match_id это varchar
---         → CAST(game_id AS varchar) для JOIN.
---      b) Если bridge не сработал (новые SofaScore матчи без FBref schedule
---         или alias не покрывает имя) → fallback prefix
---         'sofascore_' || sofascore_match_id (v0_unbridged pattern,
---         совместимо с whoscored 'whoscored_raw' approach в fct_event).
+--   2) match_id_canonical bridging — через silver.xref_match (НЕ через
+--      gold.dim_match — #477). ratings.match_id это SofaScore game_id (varchar);
+--      xref_match.source_id для source='sofascore' это CAST(game_id AS varchar),
+--      поэтому LEFT JOIN по (source_id, league, season) сразу даёт canonical_id
+--      (FBref hex когда сбриджован, 'ss_<id>' когда orphan). Канонизация имён
+--      команд живёт ВЫШЕ — в xref_match (через xref_team), здесь больше НЕТ
+--      инлайнового team_aliases CTE (устранён дубль #477) и нет чтения
+--      sofascore_schedule. Зависимость silver→silver: xref_match строится в E1
+--      (раньше E4), инверсия слоёв silver→gold устранена.
+--      Fallback (game вне xref_match): 'sofascore_' || match_id —
+--      mirrors silver/sofascore_shots.sql:173.
 --
 --   3) player_id_canonical через silver.xref_player WHERE source='sofascore'
 --      AND season+league predicate (memory note feedback_xref_join_season_predicate).
 --      Fallback orphan: 'ss_' || sofascore_player_id для unresolved.
 --
---   4) НЕ модифицирует silver.xref_match (Phase B-deferred).
---   5) team_side passthrough — SofaScore JSON уже даёт home/away атрибуцию
+--   4) team_side passthrough — SofaScore JSON уже даёт home/away атрибуцию
 --      на уровне rating-row; не нужно пере-вычислять через sofascore_schedule.
 --
 -- Reference: roadmap E4.4 + R0.2B web-scraping spec.
@@ -80,91 +81,12 @@
 --   partitioning by (league, season). This file MUST stay a pure SELECT.
 -- =============================================================================
 
-WITH team_aliases AS (
-    -- Same lookup pool as silver.matchhistory_match_odds — kept inline вместо
-    -- читать xref_team чтобы не создавать кросс-Silver зависимость (xref_team
-    -- всё равно строится в одной DAG-итерации). При расширении alias-списка
-    -- ОБА файла надо обновлять параллельно.
-    --
-    -- KEY INSIGHT: canonical_id RHS = ACTUAL `gold.dim_match.home_team_id`
-    -- value as observed in production, NOT slug-of-YAML-canonical_name. См.
-    -- полный комментарий в matchhistory_match_odds.sql. SofaScore raw names
-    -- может отличаться от football-data.co.uk (e.g. SofaScore часто пишет
-    -- 'Wolverhampton', 'Brighton & Hove Albion' — оба варианта покрыты).
-    SELECT raw_name, canonical_id
-    FROM (VALUES
-        ('AFC Bournemouth', 'bournemouth'),
-        ('Arsenal', 'arsenal'),
-        ('Aston Villa', 'aston_villa'),
-        ('Bournemouth', 'bournemouth'),
-        ('Brentford', 'brentford'),
-        ('Brighton', 'brighton'),
-        ('Brighton & Hove Albion', 'brighton'),
-        ('Brighton and Hove Albion', 'brighton'),
-        ('Burnley', 'burnley'),
-        ('Cardiff', 'cardiff_city'),
-        ('Cardiff City', 'cardiff_city'),
-        ('Chelsea', 'chelsea'),
-        ('Crystal Palace', 'crystal_palace'),
-        ('Everton', 'everton'),
-        ('Fulham', 'fulham'),
-        ('Huddersfield', 'huddersfield_town'),
-        ('Hull', 'hull_city'),
-        ('Hull City', 'hull_city'),
-        ('Ipswich', 'ipswich_town'),
-        ('Ipswich Town', 'ipswich_town'),
-        ('Leeds', 'leeds_united'),
-        ('Leeds United', 'leeds_united'),
-        ('Leicester', 'leicester_city'),
-        ('Leicester City', 'leicester_city'),
-        ('Liverpool', 'liverpool'),
-        ('Luton', 'luton_town'),
-        ('Luton Town', 'luton_town'),
-        ('Man City', 'manchester_city'),
-        ('Man United', 'manchester_utd'),
-        ('Man Utd', 'manchester_utd'),
-        ('Manchester City', 'manchester_city'),
-        ('Manchester United', 'manchester_utd'),
-        ('Manchester Utd', 'manchester_utd'),
-        ('Middlesbrough', 'middlesbrough'),
-        ('Newcastle', 'newcastle_united'),
-        ('Newcastle United', 'newcastle_united'),
-        ('Newcastle Utd', 'newcastle_united'),
-        ('Norwich', 'norwich_city'),
-        ('Norwich City', 'norwich_city'),
-        ('Nott''m Forest', 'nottingham_forest'),
-        ('Nottingham', 'nottingham_forest'),
-        ('Nottingham Forest', 'nottingham_forest'),
-        ('Sheff Utd', 'sheffield_united'),
-        ('Sheffield United', 'sheffield_united'),
-        ('Sheffield Utd', 'sheffield_united'),
-        ('Southampton', 'southampton'),
-        ('Spurs', 'tottenham_hotspur'),
-        ('Stoke', 'stoke_city'),
-        ('Stoke City', 'stoke_city'),
-        ('Sunderland', 'sunderland'),
-        ('Swansea', 'swansea_city'),
-        ('Swansea City', 'swansea_city'),
-        ('Tottenham', 'tottenham_hotspur'),
-        ('Tottenham Hotspur', 'tottenham_hotspur'),
-        ('Watford', 'watford'),
-        ('West Brom', 'west_brom'),
-        ('West Bromwich', 'west_brom'),
-        ('West Bromwich Albion', 'west_brom'),
-        ('West Ham', 'west_ham_united'),
-        ('West Ham United', 'west_ham_united'),
-        ('Wolverhampton', 'wolves'),
-        ('Wolverhampton Wanderers', 'wolves'),
-        ('Wolves', 'wolves')
-    ) AS t(raw_name, canonical_id)
-),
-
 -- =============================================================================
 -- ss: raw bronze, basic dedup. Bronze cardinality = (match_id, player_id).
 -- Re-scrapes возможны → ROW_NUMBER OVER (PARTITION BY match_id, player_id)
 -- ORDER BY _ingested_at DESC keeps latest.
 -- =============================================================================
-ss AS (
+WITH ss AS (
     SELECT
         match_id,
         player_id,
@@ -226,38 +148,23 @@ ss_with_player AS (
 ),
 
 -- =============================================================================
--- sched_bridge: SofaScore game_id → FBref match_id через team_aliases.
--- LEFT JOIN, dedup ON (game_id) — на случай re-scrape schedule.
+-- xref_match_ss: SofaScore game_id → canonical FBref match_id via the Silver
+-- xref table (#477). Mirrors silver/sofascore_shots.sql:165-169. source_id is
+-- CAST(game_id AS varchar); canonical_id is the FBref hex when bridged, else
+-- 'ss_<game_id>' when orphan.
 -- =============================================================================
-sched_bridge AS (
-    SELECT
-        sched.game_id,
-        sched.league,
-        sched.season,
-        dm.match_id           AS fbref_match_id,
-        ROW_NUMBER() OVER (
-            PARTITION BY sched.game_id, sched.league, sched.season
-            ORDER BY sched._ingested_at DESC
-        ) AS rn
-    FROM iceberg.bronze.sofascore_schedule sched
-    LEFT JOIN team_aliases ha ON ha.raw_name = sched.home_team
-    LEFT JOIN team_aliases aa ON aa.raw_name = sched.away_team
-    LEFT JOIN iceberg.gold.dim_match dm
-        -- #433: dim_match renamed date -> match_date (star dims, #425)
-        ON  dm.match_date   = CAST(sched.date AS DATE)
-        AND dm.league       = sched.league
-        AND dm.season       = sched.season  -- #404: both slug ('2526'); was TRY_CAST→bigint (never matched vs year-start)
-        AND dm.home_team_id = ha.canonical_id
-        AND dm.away_team_id = aa.canonical_id
-    WHERE sched.game_id IS NOT NULL
+xref_match_ss AS (
+    SELECT source_id, league, season, canonical_id
+    FROM iceberg.silver.xref_match
+    WHERE source = 'sofascore'
 ),
 
 -- =============================================================================
--- ss_with_match: bridge match_id_canonical. Fallback v0_unbridged для misses.
--- ratings.match_id (varchar) joinится с CAST(schedule.game_id AS varchar).
--- Per-(game_id, league, season): достаточно сравнения season + match_id =
--- game_id, потому что SofaScore game_id глобально-уникален и league+season
--- передаются для предохранителя.
+-- ss_with_match: bridge match_id_canonical via xref_match. ratings.match_id
+-- (varchar) joins xref_match.source_id (= CAST(game_id AS varchar)). xref_match
+-- PK = (source, source_id, season) → season+league predicate prevents fan-out.
+-- Fallback (game absent from xref_match): 'sofascore_' || match_id — same
+-- pattern as silver/sofascore_shots.sql:173.
 -- =============================================================================
 ss_with_match AS (
     SELECT
@@ -271,15 +178,14 @@ ss_with_match AS (
         sp.season,
         sp._ingested_at,
         COALESCE(
-            sb.fbref_match_id,
+            xm.canonical_id,
             'sofascore_' || sp.match_id
         )                       AS match_id_canonical
     FROM ss_with_player sp
-    LEFT JOIN sched_bridge sb
-        ON  sb.rn = 1
-        AND CAST(sb.game_id AS varchar) = sp.match_id
-        AND sb.league = sp.league
-        AND sb.season = sp.season
+    LEFT JOIN xref_match_ss xm
+        ON  xm.source_id = sp.match_id
+        AND xm.league    = sp.league
+        AND xm.season    = sp.season
 )
 
 SELECT

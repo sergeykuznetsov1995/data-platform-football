@@ -1,17 +1,23 @@
 """
 Unit tests for the matchhistory → fct_match_odds bridge pipeline (E4.5).
 
-Pipeline under test:
-  bronze.matchhistory_results → silver.matchhistory_match_odds (inline
-                              team_aliases CTE → INNER JOIN gold.dim_match)
+Pipeline under test (#477 — bridge now via silver.xref_match, not gold.dim_match):
+  bronze.matchhistory_results → silver.matchhistory_match_odds (synthesise the
+                              'mh_<hash>' source_id → INNER JOIN silver.xref_match
+                              WHERE confidence='date_team_match')
                             → gold.fct_match_odds (passthrough + canonical-trio)
 
+Team-name canonicalisation moved UPSTREAM into xref_match (via xref_team) — this
+file no longer carries an inline team_aliases CTE. The bridge is now a hash join
+on the synthetic source_id, so the test seeds silver.xref_match rows whose
+source_id is computed with the SAME 'mh_<md5>' formula (xxhash64→md5 under the
+DuckDB translation) keyed on the raw bronze natural key.
+
 We exercise:
-  * The 63-pair team_aliases lookup (raw_name → canonical_id) on common
-    naming variations (Wolves/Wolverhampton, Spurs/Tottenham, Manchester
-    Utd/Manchester United, Nott'm Forest/Nottingham Forest, Newcastle Utd/
-    Newcastle).
-  * INNER JOIN coverage = 100% (every seeded match bridges to dim_match).
+  * Bridge coverage = 100% via xref_match (every seeded match resolves through
+    the synthetic source_id hash on naming variations Wolves/Wolverhampton,
+    Spurs/Tottenham, Manchester Utd/United, Nott'm/Nottingham Forest, …).
+  * INNER-JOIN + confidence='date_team_match' semantics: orphan matches dropped.
   * Tall-format unfold: 30 (bookmaker × market × closing_flag) rows per match.
   * closing_flag detection on the PSCH/PSCD/PSCA closing 1x2 columns.
   * Numeric typing — DECIMAL(6,3) odds parse without overflow.
@@ -85,7 +91,7 @@ def _collapse_call(sql: str, fn_name: str) -> str:
 
 _ICEBERG_TO_LOCAL = {
     "iceberg.bronze.matchhistory_results":    "bronze_matchhistory_results",
-    "iceberg.gold.dim_match":                 "gold_dim_match",
+    "iceberg.silver.xref_match":              "silver_xref_match",
     "iceberg.silver.matchhistory_match_odds": "silver_matchhistory_match_odds",
 }
 
@@ -176,21 +182,24 @@ def _create_mh_table(con) -> None:
 def _reset_schemas(duck_conn):
     for tbl in (
         "bronze_matchhistory_results",
-        "gold_dim_match",
+        "silver_xref_match",
         "silver_matchhistory_match_odds",
     ):
         duck_conn.execute(f"DROP TABLE IF EXISTS {tbl}")
 
     _create_mh_table(duck_conn)
+    # silver.xref_match — frozen E1.5 schema (see silver/xref_match.sql L22-32).
     duck_conn.execute(
         """
-        CREATE TABLE gold_dim_match (
-            match_id      VARCHAR,
-            match_date    DATE,
+        CREATE TABLE silver_xref_match (
+            canonical_id  VARCHAR,
+            source        VARCHAR,
+            source_id     VARCHAR,
+            display_name  VARCHAR,
             league        VARCHAR,
             season        VARCHAR,
-            home_team_id  VARCHAR,
-            away_team_id  VARCHAR
+            confidence    VARCHAR,
+            match_score   DOUBLE
         )
         """
     )
@@ -272,20 +281,36 @@ def _seed_corpus(duck_conn) -> None:
     for r in rows:
         duck_conn.execute(insert_sql, r)
 
-    # gold.dim_match — slugs as observed in production
+    # silver.xref_match — canonical bridge rows for matchhistory. source_id is
+    # computed with the SAME 'mh_<md5>' formula the silver SQL uses (the DuckDB
+    # translation rewrites xxhash64→md5), keyed on the raw bronze natural key
+    # (parsed ISO date | lower(home) | lower(away) | league | raw year-start
+    # season). All seeded matches bridge → confidence='date_team_match'.
     duck_conn.execute(
         """
-        INSERT INTO gold_dim_match VALUES
-          ('M_WV_TT', DATE '2024-08-15', 'ENG-Premier League', '2425',
-           'wolves', 'tottenham_hotspur'),
-          ('M_WV_TT2', DATE '2024-09-01', 'ENG-Premier League', '2425',
-           'wolves', 'tottenham_hotspur'),
-          ('M_MU_NF', DATE '2024-10-05', 'ENG-Premier League', '2425',
-           'manchester_utd', 'nottingham_forest'),
-          ('M_MU_NF2', DATE '2024-11-10', 'ENG-Premier League', '2425',
-           'manchester_utd', 'nottingham_forest'),
-          ('M_NU_WH', DATE '2024-12-15', 'ENG-Premier League', '2425',
-           'newcastle_united', 'west_ham_united')
+        INSERT INTO silver_xref_match
+          (canonical_id, source, source_id, display_name, league, season, confidence, match_score)
+        SELECT
+            canonical_id,
+            'matchhistory',
+            'mh_' || lower(md5(
+                CAST(strptime(raw_date, '%d/%m/%Y') AS DATE)::varchar
+                || '|' || lower(home) || '|' || lower(away)
+                || '|' || league || '|' || CAST(season_year AS varchar)
+            )),
+            home || ' vs ' || away,
+            league,
+            lpad(CAST((season_year % 100) AS varchar), 2, '0')
+              || lpad(CAST(((season_year + 1) % 100) AS varchar), 2, '0'),
+            'date_team_match',
+            NULL
+        FROM (VALUES
+            ('15/08/2024', 'Wolves',            'Tottenham',         'ENG-Premier League', 2024, 'M_WV_TT'),
+            ('01/09/2024', 'Wolverhampton',     'Spurs',             'ENG-Premier League', 2024, 'M_WV_TT2'),
+            ('05/10/2024', 'Manchester Utd',    'Nott''m Forest',    'ENG-Premier League', 2024, 'M_MU_NF'),
+            ('10/11/2024', 'Manchester United', 'Nottingham Forest', 'ENG-Premier League', 2024, 'M_MU_NF2'),
+            ('15/12/2024', 'Newcastle Utd',     'West Ham',          'ENG-Premier League', 2024, 'M_NU_WH')
+        ) AS t(raw_date, home, away, league, season_year, canonical_id)
         """
     )
 
@@ -320,29 +345,64 @@ class TestFctMatchOddsBridge:
             f"bridge coverage incomplete: {sorted(match_ids)}"
         )
 
-    def test_alias_canonicalisation_wolves_and_spurs(self, duck_conn):
-        """Wolves/Wolverhampton → wolves; Spurs/Tottenham → tottenham_hotspur."""
+    def test_bridge_resolves_wolves_and_spurs_name_variants(self, duck_conn):
+        """Both name-variant fixtures bridge via xref_match (#477): the synthetic
+        source_id hash is over the RAW bronze name, and xref_match is seeded from
+        the same raw names, so 'Wolves vs Tottenham' and 'Wolverhampton vs Spurs'
+        each resolve to their canonical match_id."""
         _seed_corpus(duck_conn)
         _materialize_silver(duck_conn)
         out = _run_gold(duck_conn)
-        # Both M_WV_TT (Wolves vs Tottenham) and M_WV_TT2 (Wolverhampton vs Spurs)
-        # must show up — proves both alias-pairs resolve.
         ids_present = {r["match_id"] for r in out}
         assert "M_WV_TT" in ids_present
         assert "M_WV_TT2" in ids_present
 
-    def test_alias_canonicalisation_man_utd_variants(self, duck_conn):
-        """Manchester Utd / Manchester United / Man Utd all → manchester_utd."""
+    def test_bridge_resolves_man_utd_name_variants(self, duck_conn):
+        """'Manchester Utd' and 'Manchester United' fixtures both bridge via
+        xref_match (the hash join is name-agnostic — canonicalisation is xref's
+        job, here we only verify each distinct match resolves)."""
         _seed_corpus(duck_conn)
         _materialize_silver(duck_conn)
         out = _run_gold(duck_conn)
         ids_present = {r["match_id"] for r in out}
         assert "M_MU_NF" in ids_present, (
-            "Manchester Utd / Nott'm Forest alias-pair did not resolve"
+            "Manchester Utd / Nott'm Forest fixture did not bridge"
         )
         assert "M_MU_NF2" in ids_present, (
-            "Manchester United / Nottingham Forest alias-pair did not resolve"
+            "Manchester United / Nottingham Forest fixture did not bridge"
         )
+
+    def test_orphan_match_dropped_by_confidence_filter(self, duck_conn):
+        """A match whose only xref_match row is confidence='orphan' is dropped —
+        the INNER JOIN + confidence='date_team_match' filter preserves the old
+        INNER-JOIN-to-dim_match semantics (#477)."""
+        _seed_corpus(duck_conn)
+        # 6th bronze match (Brentford vs Fulham) with an ORPHAN xref_match row.
+        cols_quoted = ", ".join(f'"{c}"' for c in _MH_COLUMNS)
+        placeholders = ", ".join(["?"] * len(_MH_COLUMNS))
+        duck_conn.execute(
+            f'INSERT INTO bronze_matchhistory_results ({cols_quoted}) VALUES ({placeholders})',
+            _mh_row(date="20/01/2025", home="Brentford", away="Fulham"),
+        )
+        duck_conn.execute(
+            """
+            INSERT INTO silver_xref_match
+              (canonical_id, source, source_id, display_name, league, season, confidence, match_score)
+            SELECT
+                'mh_orphanhash', 'matchhistory',
+                'mh_' || lower(md5(
+                    CAST(strptime('20/01/2025', '%d/%m/%Y') AS DATE)::varchar
+                    || '|' || lower('Brentford') || '|' || lower('Fulham')
+                    || '|' || 'ENG-Premier League' || '|' || CAST(2024 AS varchar)
+                )),
+                'Brentford vs Fulham', 'ENG-Premier League', '2425', 'orphan', NULL
+            """
+        )
+        _materialize_silver(duck_conn)
+        out = _run_gold(duck_conn)
+        ids = {r["match_id"] for r in out}
+        assert "mh_orphanhash" not in ids, "orphan match leaked past confidence filter"
+        assert ids == {"M_WV_TT", "M_WV_TT2", "M_MU_NF", "M_MU_NF2", "M_NU_WH"}
 
     def test_tall_format_unfold(self, duck_conn):
         """Each match unfolds to ~6 1x2-open + 6 1x2-closing rows for the

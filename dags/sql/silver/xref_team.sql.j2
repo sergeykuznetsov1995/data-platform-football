@@ -171,6 +171,12 @@ raw_teams AS (
 
     UNION
     -- ===== clubelo (column name is `team`; no season column → NULL) =====
+    -- ⚠️ TRAP (#477): clubelo rows carry season = NULL BY DESIGN — ClubElo is a
+    -- point-in-time daily ELO snapshot with no season concept. Consumers MUST
+    -- NOT add a `season = '<slug>'` predicate to clubelo rows: NULL = '2526'
+    -- is NULL (never TRUE), so such a JOIN silently returns ZERO clubelo rows.
+    -- Join clubelo on (source, source_id, league) ONLY — see fct_team_elo.sql
+    -- which deliberately omits the season predicate for exactly this reason.
     SELECT 'clubelo' AS source, team AS source_id, league, CAST(NULL AS varchar) AS season
       FROM iceberg.bronze.clubelo_ratings
      WHERE team IS NOT NULL
