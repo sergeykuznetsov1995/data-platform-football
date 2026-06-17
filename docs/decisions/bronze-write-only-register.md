@@ -23,7 +23,7 @@ Per-table verdict vocabulary (from #476):
 
 ---
 
-## 1. Register (14 live write-only tables, audit 2026-06-15)
+## 1. Register (10 live write-only tables, audit 2026-06-15; 4 SoFIFA CONSUMED via #601, 2026-06-17)
 
 Cost class = cost of *stopping* the scrape. **FREE** = by-product of a request made anyway
 (removing it saves only HDFS/snapshots, not HTTP); **CHEAP** = 1 HTTP; **EXPENSIVE** =
@@ -38,10 +38,6 @@ per-item/per-season HTTP.
 | `fotmob_team_profile` | FREE (shared `/api/data/leagues`) | OK | (b) future | [#600] |
 | `fotmob_team_leaderboards` | FREE (shared `/api/data/leagues`) | OK | (b) future | [#600] |
 | `fotmob_transfers` | CHEAP (1 HTTP) | OK | (b) future | [#600] |
-| `sofifa_teams` | EXPENSIVE (N HTTP) | OK | (b) future | [#601] |
-| `sofifa_team_ratings` | CHEAP | ⚠ 15 cols 100% NULL (upstream; live-confirmed 2026-06-16) | (b) future | [#601] |
-| `sofifa_leagues` | CHEAP | OK (reference) | (b) future | [#601] |
-| `sofifa_versions` | CHEAP | OK (reference) | (b) future | [#601] |
 | `fbref_keeper_keeper_adv` | EXPENSIVE (separate `/keepersadv/` page + CF bypass ~9.67s) | ⚠ 26 cols 100% NULL live (incl. 23 advanced GK, FBref Feb-2026); core dups `keeper` | **(c) stop** | [#606] |
 | `whoscored_season_stages` | FREE (same session as `scrape_schedule`, soccerdata cache) | ⚠ `stage` all-NULL; 6 rows | (b) keep | — (§3) |
 | `clubelo_team_history` | MODERATE (per-team histories) | no `rank`/`league`; **219,861 rows** (largest unread) | **(c) stop** | [#604] |
@@ -52,11 +48,16 @@ per-item/per-season HTTP.
 |---|---|---|---|
 | `clubelo_ratings_historical` | write-only | **CONSUMED** | `dags/sql/gold/fct_team_elo.sql:52` (UNION with `clubelo_ratings`) + `dags/sql/silver/xref_team.sql.j2:186`; landed via #431 / #593. |
 | `sofascore_event_shotmap` | write-only (EXPENSIVE ~380/season) | **CONSUMED** | `dags/sql/silver/sofascore_shots.sql` (shot×match projection) → `dags/sql/gold/fct_shot_audit.sql` (cross-source xG/SoT validation vs Understat `fct_shot`); landed via #602. |
+| `sofifa_teams` | write-only (EXPENSIVE N HTTP) | **CONSUMED** | `dags/sql/silver/sofifa_team_profile.sql` (team projection) + `sofifa` source branch in `dags/sql/silver/xref_team.sql.j2`; landed via #601. |
+| `sofifa_team_ratings` | write-only (CHEAP; 15 cols 100% NULL) | **CONSUMED** | `dags/sql/silver/sofifa_team_profile.sql` (8 live ratings). The 15 dead FC-26 cols removed from the parser (`scrapers/sofifa/flaresolverr_reader.read_team_ratings`) + Bronze (`scripts/drop_sofifa_team_ratings_dead_columns.py`); landed via #601. |
+| `sofifa_leagues` | write-only (CHEAP reference) | **CONSUMED** | `dags/sql/silver/sofifa_league_lookup.sql`; landed via #601. |
+| `sofifa_versions` | write-only (CHEAP reference) | **CONSUMED** | `dags/sql/silver/sofifa_edition_lookup.sql`; landed via #601. |
 
 > The #476 body lists 16 tables but the title says "15". The discrepancy is
 > `clubelo_ratings_historical` (now consumed), which left 15. Consuming
-> `sofascore_event_shotmap` (#602) leaves **14** live write-only tables.
-> The register above is the corrected set.
+> `sofascore_event_shotmap` (#602) left 14; promoting the 4 SoFIFA tables
+> (#601) leaves **10** live write-only tables. The register above is the
+> corrected set.
 
 ---
 
@@ -120,6 +121,7 @@ documented here; no tracking issue (avoids p3 issue-spam):
 | 2026-06-15 | Register created; 2026-06-11 inventory re-verified (15 live, not 16 — `clubelo_ratings_historical` now CONSUMED); per-table verdicts + tracking issues [#600]–[#604] filed. | #476 |
 | 2026-06-15 | Correction after line-level re-check: `fbref_keeper_keeper_adv` is a **separate** FBref scrape (not a `keeper` by-product), re-classified (b) keep → **(c) stop**, issue [#606] filed; NULL counts (keeper_adv 23, sofifa_team_ratings 15) confirmed against `audit_bronze_columns.py` comments. | #476 |
 | 2026-06-16 | Live `audit_bronze_columns.py` run: confirmed `sofifa_team_ratings`=15 and `fbref_keeper_keeper_adv`=26 cols 100% NULL, all 15 tables non-empty with 0 ERROR, `clubelo_team_history`=219,861 rows (largest unread). Cost/NULL notes refined. | #476 |
+| 2026-06-17 | 4 SoFIFA tables promoted to Silver → **CONSUMED**: `sofifa_team_profile.sql` (+ `sofifa` source branch in `xref_team.sql.j2`), `sofifa_league_lookup.sql`, `sofifa_edition_lookup.sql`. `sofifa_team_ratings` 15 dead FC-26 cols removed (parser override + `drop_sofifa_team_ratings_dead_columns.py`, dropped from `EXPECTED_NULL`). 14 → 10 live write-only. | #601 |
 
 [#476]: https://github.com/sergeykuznetsov1995/data-platform-football/issues/476
 [#600]: https://github.com/sergeykuznetsov1995/data-platform-football/issues/600

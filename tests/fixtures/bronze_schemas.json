@@ -905,7 +905,7 @@
         "whca": "double",
         "whcd": "double",
         "whch": "double",
-        "\u00ef\u00bb\u00bfdiv": "varchar"
+        "ï»¿div": "varchar"
       }
     },
     "bronze.sofascore_event_player_stats": {
@@ -1246,6 +1246,16 @@
         "week": "bigint"
       }
     },
+    "bronze.sofifa_leagues": {
+      "columns": {
+        "_batch_id": "varchar",
+        "_entity_type": "varchar",
+        "_ingested_at": "timestamp(6)",
+        "_source": "varchar",
+        "league": "varchar",
+        "league_id": "bigint"
+      }
+    },
     "bronze.sofifa_player_ratings": {
       "columns": {
         "_batch_id": "varchar",
@@ -1322,6 +1332,51 @@
         "player_id": "bigint",
         "team": "varchar",
         "update": "varchar"
+      }
+    },
+    "bronze.sofifa_team_ratings": {
+      "columns": {
+        "_batch_id": "varchar",
+        "_entity_type": "varchar",
+        "_ingested_at": "timestamp(6)",
+        "_source": "varchar",
+        "attack": "varchar",
+        "club_worth": "varchar",
+        "defence": "varchar",
+        "fifa_edition": "varchar",
+        "league": "varchar",
+        "midfield": "varchar",
+        "overall": "varchar",
+        "players": "varchar",
+        "starting_xi_average_age": "varchar",
+        "team": "varchar",
+        "team_id": "bigint",
+        "transfer_budget": "varchar",
+        "update": "varchar"
+      }
+    },
+    "bronze.sofifa_teams": {
+      "columns": {
+        "_batch_id": "varchar",
+        "_entity_type": "varchar",
+        "_ingested_at": "timestamp(6)",
+        "_source": "varchar",
+        "fifa_edition": "varchar",
+        "league": "varchar",
+        "team": "varchar",
+        "team_id": "bigint",
+        "update": "varchar"
+      }
+    },
+    "bronze.sofifa_versions": {
+      "columns": {
+        "_batch_id": "varchar",
+        "_entity_type": "varchar",
+        "_ingested_at": "timestamp(6)",
+        "_source": "varchar",
+        "fifa_edition": "varchar",
+        "update": "varchar",
+        "version_id": "bigint"
       }
     },
     "bronze.transfermarkt_coaches": {

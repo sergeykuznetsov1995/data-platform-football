@@ -53,17 +53,10 @@ EXPECTED_NULL: dict[str, set[str]] = {
     # matchhistory_games removed (#307: legacy table dropped). matchhistory_results
     # has 0 all-NULL columns (verified 2026-06-04, #282) → no allowlist needed.
     'espn_matchsheet': {'capacity'},
-    'sofifa_team_ratings': {
-        # sofifa.com removed these data-col cells from team page (FC 26, verified 2026-05-14).
-        # soccerdata still requests them via showCol[]=... but sofifa silently ignores.
-        'build_up_speed', 'build_up_dribbling', 'build_up_passing', 'build_up_positioning',
-        'chance_creation_crossing', 'chance_creation_passing',
-        'chance_creation_shooting', 'chance_creation_positioning',
-        'defence_aggression', 'defence_pressure', 'defence_team_width',
-        'defence_defender_line', 'defence_domestic_prestige',
-        'international_prestige',
-        'whole_team_average_age',  # renamed to starting_xi_average_age upstream
-    },
+    # sofifa_team_ratings: the 15 dead FC-26 columns are no longer scraped
+    # (flaresolverr_reader.read_team_ratings trimmed to 8 live cols) and were
+    # physically dropped from Bronze via drop_sofifa_team_ratings_dead_columns.py
+    # (#601). No all-NULL columns remain, so no allowlist entry is needed.
     'whoscored_schedule': {
         'aggregate_winner_field', 'extra_result_field',
         'home_extratime_score', 'away_extratime_score',
@@ -465,8 +458,8 @@ EXPECTED_TABLES: dict[str, dict[str, set[str]]] = {
         # FlareSolverr override). 6 tables (sofifa_leagues unpartitioned, the
         # other 5 partitioned ['fifa_edition']). Minimal required = identity keys
         # + core ratings + META_COLS; extra live cols are NOT errors; the 15
-        # 100%-NULL sofifa_team_ratings cols live in EXPECTED_NULL and are
-        # excluded here. FlareSolverr v3.4.6 (Chromium 142) clears the sofifa.com
+        # dead FC-26 sofifa_team_ratings cols were dropped from the parser and
+        # Bronze (#601). FlareSolverr v3.4.6 (Chromium 142) clears the sofifa.com
         # Turnstile — ingest works (the earlier #180 CF freeze is resolved). All
         # 6 tables materialise + non-empty (verified live 2026-06-05, #284):
         # FC 26 / ENG-Premier League — player_ratings 546, players 546,
@@ -484,8 +477,8 @@ EXPECTED_TABLES: dict[str, dict[str, set[str]]] = {
             'dribbling', 'defending', 'physical', *META_COLS,
         },
         # build_up_*/chance_creation_*/defence_*/...prestige/whole_team_average_age
-        # (15 cols) are 100% NULL upstream (FC 26 removed them) — see EXPECTED_NULL,
-        # so they are excluded from the required set.
+        # (15 cols) were removed by FC 26 upstream; the parser no longer scrapes
+        # them and they were dropped from Bronze (#601).
         'sofifa_team_ratings': {
             'fifa_edition', 'team', 'team_id', 'league',
             'overall', 'attack', 'midfield', 'defence', *META_COLS,

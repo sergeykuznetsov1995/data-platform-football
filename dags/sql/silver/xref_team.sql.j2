@@ -26,7 +26,7 @@
 --   canonical_id   varchar  -- 'wolverhampton_wanderers' | 'fb_<slug>' | 'mh_<slug>' | ...
 --   source         varchar  -- 'fbref' | 'understat' | 'whoscored' | 'sofascore' |
 --                              'fotmob' | 'matchhistory' | 'clubelo' | 'espn' |
---                              'transfermarkt' | 'capology'
+--                              'transfermarkt' | 'capology' | 'sofifa'
 --   source_id      varchar  -- raw team-name as it appears in Bronze
 --   display_name   varchar  -- canonical_name when aliased, else source_id
 --   league         varchar  -- partitioning hint (e.g. 'ENG-Premier League')
@@ -36,9 +36,9 @@
 --
 -- Testable invariants (T5):
 --   * PK = (source, source_id, league, season) — guaranteed by final GROUP BY.
---   * All 10 sources are represented in the UNION ALL below; T5 should
+--   * All 11 sources are represented in the UNION ALL below; T5 should
 --     SELECT DISTINCT source FROM iceberg.silver.xref_team and assert
---     that the set equals the 10 prefixes documented above.
+--     that the set equals the 11 prefixes documented above.
 --   * canonical_id is NEVER NULL (CASE branch covers every source).
 --   * confidence ∈ {'name_alias', 'orphan'}.
 --   * aliases CTE is unique on (norm, league) — GROUP BY guard against
@@ -210,6 +210,16 @@ raw_teams AS (
     -- ===== capology (team universe = salary roster's club; issue #192) =====
     SELECT 'capology' AS source, club_name AS source_id, league, CAST(season AS varchar) AS season
       FROM iceberg.bronze.capology_player_salaries WHERE club_name IS NOT NULL
+
+    UNION
+    -- ===== sofifa (team universe = FIFA-edition team listing; issue #601) =====
+    -- No `season` column — derive the slug from fifa_edition ('FC 26' -> '2526'),
+    -- the SAME expression sofifa_team_profile.sql uses so the canonical_id JOIN
+    -- aligns on season.
+    SELECT 'sofifa' AS source, team AS source_id, league,
+           LPAD(CAST(CAST(regexp_extract(fifa_edition, '(\d+)', 1) AS INTEGER) - 1 AS varchar), 2, '0')
+           || LPAD(regexp_extract(fifa_edition, '(\d+)', 1), 2, '0') AS season
+      FROM iceberg.bronze.sofifa_teams WHERE team IS NOT NULL
 ),
 
 resolved AS (
@@ -261,6 +271,7 @@ SELECT
                 WHEN 'espn'         THEN 'es_'
                 WHEN 'transfermarkt' THEN 'tm_'
                 WHEN 'capology'     THEN 'cap_'
+                WHEN 'sofifa'       THEN 'sf_'
             END
             || LOWER(REGEXP_REPLACE(source_id, '[^a-zA-Z0-9]+', '_'))
     END                                       AS canonical_id,
