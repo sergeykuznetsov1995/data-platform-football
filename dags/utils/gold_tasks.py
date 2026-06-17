@@ -1025,20 +1025,22 @@ def validate_gold_quality() -> Dict[str, Any]:
                             warn_rate=0.90, severity='WARNING'),
 
         # ============================================================
-        # #425: dim_match — soft FK to every star dim. Team FKs are ERROR
-        # (xref_team coverage is complete by construction); referee / venue /
-        # manager FKs are WARNING for the first runs — LEFT JOIN coverage
-        # gaps leave NULLs (ignored by ref_integrity) but a non-NULL id MUST
-        # exist in its dim. Tightening to ERROR is a tracked followup.
+        # #425: dim_match — soft FK to every star dim. Team / referee / venue
+        # FKs are ERROR — the id comes from the same xref / alias table the dim
+        # is built from, so a non-NULL id is orphan-free by construction (LEFT
+        # JOIN coverage gaps surface as NULLs, which ref_integrity ignores).
+        # #436 tightened referee / venue from WARNING after stable green runs.
+        # manager FKs stay WARNING until the FBref scorebox parser
+        # (bronze.fbref_match_managers, ~80% coverage) improves — then ERROR.
         # ============================================================
         CHECK.ref_integrity('gold.dim_match', 'gold.dim_team',
                             'home_team_id', parent_key='team_id'),
         CHECK.ref_integrity('gold.dim_match', 'gold.dim_team',
                             'away_team_id', parent_key='team_id'),
         CHECK.ref_integrity('gold.dim_match', 'gold.dim_referee',
-                            'referee_id', severity='WARNING'),
+                            'referee_id'),
         CHECK.ref_integrity('gold.dim_match', 'gold.dim_venue',
-                            'venue_id', severity='WARNING'),
+                            'venue_id'),
         CHECK.ref_integrity('gold.dim_match', 'gold.dim_manager',
                             'home_manager_id', parent_key='manager_id',
                             severity='WARNING'),
