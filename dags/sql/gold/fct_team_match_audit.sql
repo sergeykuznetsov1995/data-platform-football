@@ -14,7 +14,7 @@
 --   total / duels / fouls), diff = SS - <source> (SofaScore secondary).
 --   xG / xA — кросс-моделированные diff'ы между US ↔ SS.
 --
--- Grain: (match_id_canonical, team_id_canonical). Один row per канонический
+-- Grain: (match_id, team_id). Один row per канонический
 -- матч × команда — **только когда обе стороны spine имеют запись** (INNER JOIN
 -- FBref ∩ Understat). WhoScored / SofaScore — LEFT JOIN → diff = NULL когда
 -- источник отсутствует. WS-блок ожидаемо NULL для current seasons (см.
@@ -35,7 +35,7 @@
 --   all expose slug now (bronze fotmob_schedule.season is still bigint year-start).
 --   → all bridge + fact JOINs are direct slug = slug (no LPAD/MOD conversion).
 --
--- PK: (match_id_canonical, team_id_canonical) — natural composite, без xxhash64
+-- PK: (match_id, team_id) — natural composite, без xxhash64
 -- (оба компонента non-NULL по конструкции INNER spine FBref ∩ Understat).
 --
 -- Audit-таблица читает Silver заново (НЕ gold.fct_team_match) per one-hop
@@ -214,9 +214,9 @@ ws_team_name_bridge AS (
 )
 
 SELECT
-    -- ========= PK (canonical, naming distinct from main fct) =========
-    fb.match_id                                          AS match_id_canonical,
-    xtf.canonical_id                                     AS team_id_canonical,
+    -- ========= PK (natural composite, same names as fct_team_match; #442) =========
+    fb.match_id                                          AS match_id,
+    xtf.canonical_id                                     AS team_id,
 
     -- ========= vs Understat (INNER spine — always non-NULL) =========
     (CAST(fb.goals_for         AS DOUBLE) - CAST(us.goals          AS DOUBLE)) AS goals_for_diff_us,

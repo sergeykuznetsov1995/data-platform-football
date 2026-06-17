@@ -13,7 +13,7 @@
 --   touches), diff = SS - <source> (SofaScore = secondary spine, INNER JOIN).
 --   xG / xA — кросс-моделированные diff'ы между US ↔ SS ↔ FB-derived.
 --
--- Grain: (match_id_canonical, player_id_canonical). Один row per канонический
+-- Grain: (match_id, player_id). Один row per канонический
 -- матч × игрок, **только когда обе стороны spine имеют запись** (INNER JOIN
 -- FBref ∩ SofaScore). Understat / WhoScored — LEFT JOIN → diff = NULL когда
 -- источник отсутствует.
@@ -32,7 +32,7 @@
 --   xref.season = varchar slug '2526'; fbref_player_match_stats.season = varchar slug '2526'
 --   #404 unified all silver/xref season onto the slug form → JOINs are slug = slug.
 --
--- PK: (match_id_canonical, player_id_canonical) — natural composite, без
+-- PK: (match_id, player_id) — natural composite, без
 -- xxhash64 (оба компонента non-NULL по конструкции INNER spine).
 --
 -- Audit-таблица читает Silver заново (НЕ gold.fct_player_match) per one-hop
@@ -136,8 +136,8 @@ xref_ws_match AS (
 
 SELECT
     -- ========= PK (грейн совпадает с fct_player_match) =========
-    COALESCE(xmf.match_id_canonical, fb.match_id)         AS match_id_canonical,
-    xfp.canonical_id                                       AS player_id_canonical,
+    COALESCE(xmf.match_id_canonical, fb.match_id)         AS match_id,
+    xfp.canonical_id                                       AS player_id,
 
     -- ========= SofaScore diff (INNER JOIN — всегда non-NULL) =========
     -- HARD_FACT pairs с FBref spine
