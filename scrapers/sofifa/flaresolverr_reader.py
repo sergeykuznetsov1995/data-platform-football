@@ -29,6 +29,7 @@ from scrapers.base.flaresolverr_client import (
     FlareSolverrCFChallengeFailed,
     FlareSolverrClient,
     FlareSolverrTabCrashed,
+    describe_proxy_mode,
 )
 
 logger = logging.getLogger(__name__)
@@ -178,7 +179,11 @@ class FlareSolverrSoFIFAReader(sd.SoFIFA):
         self._session_recreate_every = session_recreate_every
         self._session_closed = False
         self._fs_client.create_session(self._session_id, proxy_url=self._proxy_url)
-        logger.info("FlareSolverr session %s created", self._session_id)
+        logger.info(
+            "FlareSolverr session %s created (proxy mode: %s)",
+            self._session_id,
+            describe_proxy_mode(self._proxy_url),
+        )
 
         kw = dict(
             versions=versions,

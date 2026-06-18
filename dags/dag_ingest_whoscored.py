@@ -108,6 +108,12 @@ with DAG(
     """,
 ) as dag:
 
+    # Proxy-less by design (#616, decision 2026-06-18): empty --proxy-file +
+    # unset PROXY_FILTER_URL means no residential proxy — FlareSolverr solves
+    # Cloudflare itself (probe: 30/30 pages, 0 CF failures). To re-enable a
+    # proxy as a fallback, set PROXY_FILTER_URL=http://proxy_filter:8899
+    # (ad-tech filter, #652) or pass a non-empty --proxy-file. See
+    # docs/research/flaresolverr-proxy-traffic-audit.md.
     scrape_task = BashOperator(
         task_id='scrape_whoscored',
         bash_command=(

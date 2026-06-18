@@ -97,6 +97,21 @@ def _normalise_url_key(url: str) -> str:
         return url.split("?", 1)[0]
 
 
+def describe_proxy_mode(proxy_url: Optional[str]) -> str:
+    """Human-readable FlareSolverr proxy mode for logs (issue #616).
+
+    Makes the proxy decision visible at session start so an accidental
+    re-enable (via ``PROXY_FILTER_URL`` or a non-empty proxy-file) shows up
+    in logs instead of being silent. Never echoes residential credentials —
+    a residential URL carries ``user:pass`` so we only name the mode.
+    """
+    if not proxy_url:
+        return "PROXY-LESS (FlareSolverr solves CF directly)"
+    if "proxy_filter" in proxy_url:
+        return "via ad-tech filter (#652)"
+    return "via residential proxy"
+
+
 class FlareSolverrClient:
     """HTTP wrapper around FlareSolverr `/v1` and `/health` endpoints."""
 

@@ -40,6 +40,7 @@ from scrapers.base.flaresolverr_client import (
     FlareSolverrClient,
     FlareSolverrError,
     FlareSolverrTimeout,
+    describe_proxy_mode,
 )
 
 logger = logging.getLogger(__name__)
@@ -125,13 +126,20 @@ class WhoScoredScraper(SoccerdataScraper):
             fs_url = self.flaresolverr_url or os.environ.get(
                 "FLARESOLVERR_URL", "http://flaresolverr:8191"
             )
+            # Proxy-less by default (#616): with PROXY_FILTER_URL unset and no
+            # proxy-file, this resolves to None and FlareSolverr solves CF itself.
             # When PROXY_FILTER_URL is set, route the schedule reader's FlareSolverr
             # session through the ad-tech filtering proxy too (#652) — same as the
             # events path in _pick_proxy_url. The filter holds the residential creds
             # and rotates the upstream, so we hand it a static credential-free URL.
+            schedule_proxy = os.environ.get("PROXY_FILTER_URL") or self._build_proxy_url()
+            logger.info(
+                "WhoScored: schedule reader proxy mode: %s",
+                describe_proxy_mode(schedule_proxy),
+            )
             self._reader = FlareSolverrWhoScoredReader(
                 flaresolverr_url=fs_url,
-                proxy=os.environ.get("PROXY_FILTER_URL") or self._build_proxy_url(),
+                proxy=schedule_proxy,
                 leagues=self.leagues,
                 seasons=self.seasons,
             )
@@ -387,9 +395,11 @@ class WhoScoredScraper(SoccerdataScraper):
         )
         client = FlareSolverrClient(url=fs_url)
         session_id = f"whoscored-{uuid.uuid4().hex[:8]}"
-        client.create_session(session_id, proxy_url=_pick_proxy_url())
+        events_proxy = _pick_proxy_url()
+        client.create_session(session_id, proxy_url=events_proxy)
         logger.info(
-            f"WhoScored: FlareSolverr session started — {session_id} via {fs_url}"
+            f"WhoScored: FlareSolverr session started — {session_id} via {fs_url} "
+            f"(proxy mode: {describe_proxy_mode(events_proxy)})"
         )
 
         def _recycle_session() -> None:

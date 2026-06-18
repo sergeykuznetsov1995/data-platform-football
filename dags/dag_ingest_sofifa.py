@@ -170,6 +170,13 @@ with DAG(
     """,
 ) as dag:
 
+    # Proxy-less by design (#616, decision 2026-06-18): no proxy flag + unset
+    # PROXY_FILTER_URL means the FlareSolverr reader runs without a residential
+    # proxy and solves Cloudflare itself. SoFIFA probe was 30/30 pages with
+    # 5/30 CF "warnings" (vs 0 with proxy) — acceptable, but if a full ~545-page
+    # run starts hitting CF failures, re-enable a proxy fallback by setting
+    # PROXY_FILTER_URL=http://proxy_filter:8899 (ad-tech filter, #652). See
+    # docs/research/flaresolverr-proxy-traffic-audit.md.
     scrape_data_task = BashOperator(
         task_id='scrape_sofifa_data',
         bash_command=f"""
