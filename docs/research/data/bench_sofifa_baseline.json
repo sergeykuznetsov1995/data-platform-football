@@ -1,0 +1,185 @@
+{
+  "label": "baseline",
+  "source": "sofifa",
+  "matches_attempted": 10,
+  "matches_succeeded": 10,
+  "success_rate": 1.0,
+  "total_seconds": 360.8,
+  "mean_seconds": 87.49,
+  "fs_response_mb": 56.2185,
+  "fs_response_bytes": 58949331,
+  "requests": 33,
+  "sessions_created": 9,
+  "cf_challenge_failures": 0,
+  "top_traffic_urls": [
+    {
+      "url": "sofifa.com",
+      "bytes": 2192452,
+      "mb": 2.0909,
+      "requests": 1
+    },
+    {
+      "url": "sofifa.com/team/11/",
+      "bytes": 2033144,
+      "mb": 1.939,
+      "requests": 1
+    },
+    {
+      "url": "sofifa.com/team/18/",
+      "bytes": 1971740,
+      "mb": 1.8804,
+      "requests": 1
+    },
+    {
+      "url": "sofifa.com/team/1/",
+      "bytes": 1940533,
+      "mb": 1.8506,
+      "requests": 1
+    },
+    {
+      "url": "sofifa.com/team/5/",
+      "bytes": 1933493,
+      "mb": 1.8439,
+      "requests": 1
+    },
+    {
+      "url": "sofifa.com/team/14/",
+      "bytes": 1926190,
+      "mb": 1.837,
+      "requests": 1
+    },
+    {
+      "url": "sofifa.com/team/106/",
+      "bytes": 1922619,
+      "mb": 1.8336,
+      "requests": 1
+    },
+    {
+      "url": "sofifa.com/team/9/",
+      "bytes": 1917159,
+      "mb": 1.8283,
+      "requests": 1
+    },
+    {
+      "url": "sofifa.com/team/1925/",
+      "bytes": 1914030,
+      "mb": 1.8254,
+      "requests": 1
+    },
+    {
+      "url": "sofifa.com/team/2/",
+      "bytes": 1911248,
+      "mb": 1.8227,
+      "requests": 1
+    },
+    {
+      "url": "sofifa.com/team/13/",
+      "bytes": 1895353,
+      "mb": 1.8075,
+      "requests": 1
+    },
+    {
+      "url": "sofifa.com/team/1808/",
+      "bytes": 1893884,
+      "mb": 1.8061,
+      "requests": 1
+    },
+    {
+      "url": "sofifa.com/team/10/",
+      "bytes": 1885818,
+      "mb": 1.7985,
+      "requests": 1
+    },
+    {
+      "url": "sofifa.com/team/1943/",
+      "bytes": 1877604,
+      "mb": 1.7906,
+      "requests": 1
+    },
+    {
+      "url": "sofifa.com/team/7/",
+      "bytes": 1873361,
+      "mb": 1.7866,
+      "requests": 1
+    },
+    {
+      "url": "sofifa.com/team/1799/",
+      "bytes": 1871835,
+      "mb": 1.7851,
+      "requests": 1
+    },
+    {
+      "url": "sofifa.com/team/19/",
+      "bytes": 1868031,
+      "mb": 1.7815,
+      "requests": 1
+    },
+    {
+      "url": "sofifa.com/team/1796/",
+      "bytes": 1862358,
+      "mb": 1.7761,
+      "requests": 1
+    },
+    {
+      "url": "sofifa.com/team/144/",
+      "bytes": 1854853,
+      "mb": 1.7689,
+      "requests": 1
+    },
+    {
+      "url": "sofifa.com/team/110/",
+      "bytes": 1854462,
+      "mb": 1.7686,
+      "requests": 1
+    },
+    {
+      "url": "sofifa.com/team/8/",
+      "bytes": 1845597,
+      "mb": 1.7601,
+      "requests": 1
+    },
+    {
+      "url": "sofifa.com/player/257711/",
+      "bytes": 1745867,
+      "mb": 1.665,
+      "requests": 1
+    },
+    {
+      "url": "sofifa.com/player/234378/",
+      "bytes": 1743066,
+      "mb": 1.6623,
+      "requests": 1
+    },
+    {
+      "url": "sofifa.com/player/235794/",
+      "bytes": 1739697,
+      "mb": 1.6591,
+      "requests": 1
+    },
+    {
+      "url": "sofifa.com/player/207421/",
+      "bytes": 1733568,
+      "mb": 1.6533,
+      "requests": 1
+    }
+  ],
+  "per_match": [
+    {
+      "player_ids": [
+        220901,
+        251805,
+        243715,
+        232580,
+        257711,
+        248148,
+        234378,
+        246669,
+        207421,
+        235794
+      ],
+      "count": 10,
+      "seconds": 87.49,
+      "success": true
+    }
+  ]
+}
