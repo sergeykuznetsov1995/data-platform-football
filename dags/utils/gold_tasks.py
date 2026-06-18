@@ -1134,31 +1134,27 @@ def validate_gold_quality() -> Dict[str, Any]:
                        column='current_market_value_eur_tm',
                        warn_threshold=0.30, error_threshold=0.15),
 
-        # ------------------------------------------------------------
-        # issue #42: SoFIFA block (EA Sports FC game-side ratings).
-        # FIFA ratings are bounded 0-99 → value_range ERROR. Coverage is
-        # WARNING-only: dim holds the full FBref-spine (~28K canonical ×
-        # all seasons) but SoFIFA Bronze covers only the current APL
-        # edition, so spine-wide coverage is structurally low (~2%); the
-        # ≥80% APL-cohort DoD is checked by a season-scoped verify query.
-        # ------------------------------------------------------------
+        # issue #609: SoFIFA EA-rating range checks — relocated here from
+        # dim_player_attributes (ratings now live in gold.fct_player_fifa_rating
+        # per-(player, fifa_edition)). FIFA card stats bounded 0-99 → ERROR;
+        # value/wage game-side estimates loosely bounded → WARNING. The
+        # identity/contract *_sofifa cols remain in the dim and were never
+        # range-checked (kept as-is, surgical).
         *[
-            CHECK.value_range('gold.dim_player_attributes', col,
+            CHECK.value_range('gold.fct_player_fifa_rating', col,
                               min_val=0, max_val=99, severity='ERROR')
             for col in (
-                'overall_sofifa', 'potential_sofifa',
-                'pace_sofifa', 'shooting_sofifa', 'passing_sofifa',
-                'dribbling_sofifa', 'defending_sofifa', 'physical_sofifa',
-                'gk_diving_sofifa', 'gk_handling_sofifa', 'gk_kicking_sofifa',
-                'gk_positioning_sofifa', 'gk_reflexes_sofifa',
+                'overall', 'potential',
+                'pace', 'shooting', 'passing',
+                'dribbling', 'defending', 'physical',
+                'gk_diving', 'gk_handling', 'gk_kicking',
+                'gk_positioning', 'gk_reflexes',
             )
         ],
-        CHECK.value_range('gold.dim_player_attributes', 'value_eur_sofifa',
+        CHECK.value_range('gold.fct_player_fifa_rating', 'value_eur',
                           min_val=0, max_val=500_000_000, severity='WARNING'),
-        CHECK.value_range('gold.dim_player_attributes', 'wage_eur_sofifa',
+        CHECK.value_range('gold.fct_player_fifa_rating', 'wage_eur',
                           min_val=0, max_val=5_000_000, severity='WARNING'),
-        CHECK.coverage('gold.dim_player_attributes', column='overall_sofifa',
-                       warn_threshold=0.30, error_threshold=0.0),
 
         # ============================================================
         # issue #430: fct_player_market_value — two-source MV timeline, one row
