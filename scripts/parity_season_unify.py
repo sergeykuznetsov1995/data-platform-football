@@ -71,7 +71,9 @@ TABLES: dict[str, dict] = {
     # (superseded by gold.fct_match_timeline)
     'gold.fct_lineup':                   {'sums': []},
     'gold.fct_player_unavailable':       {'sums': []},
-    'gold.fct_player_market_value':      {'sums': ['market_value_eur']},
+    # #430: market_value dropped league/season (now pointwise per
+    # player×date×source) — no season column to diff.
+    'gold.fct_player_market_value':      {'sums': ['market_value_eur'], 'no_season': True},
     # ---- Gold dims without a season column (cardinality-only sanity) ----
     'gold.dim_referee':                  {'sums': [], 'no_season': True},
 }

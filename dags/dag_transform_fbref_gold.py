@@ -176,11 +176,11 @@ STAGE_3_FACTS = [
     # E5: confirmed absences — самостоятельный narrow fact (WhoScored Silver).
     ('fct_player_unavailable', 'dags/sql/gold/fct_player_unavailable.sql',
      'fct_player_unavailable', ['league', 'season']),
-    # issue #11: FotMob market_value timeline (per-player, per-date).
-    # Источник — silver.fotmob_player_market_value_history (Bronze UNNEST).
-    # Bridge FotMob→canonical через silver.xref_player(source='fotmob').
+    # issue #430: market_value timeline from TWO sources (fotmob +
+    # transfermarkt, source in PK). Pointwise off-field fact — a career-long
+    # timeline with no season key → unpartitioned (None), like fct_team_elo.
     ('fct_player_market_value', 'dags/sql/gold/fct_player_market_value.sql',
-     'fct_player_market_value', ['league', 'season']),
+     'fct_player_market_value', None),
     # issue #427: unified per-event match chronicle (goals/cards/subs in ONE
     # timeline, PK (match_id, event_seq)). silver.fbref_match_events primary
     # + bronze.whoscored_events per-match fallback. Runs in s3 — after g2c,
@@ -210,6 +210,16 @@ STAGE_3_FACTS = [
     # precedent).
     ('fct_team_elo', 'dags/sql/gold/fct_team_elo.sql',
      'fct_team_elo', None),
+    # issue #430: player wages from Capology (APL only). canonical_id is
+    # resolved in Silver → pure projection with 'cap_'-prefixed orphan ids.
+    # Partitioned by (league, season) — a contract is season-bound.
+    ('fct_player_salary', 'dags/sql/gold/fct_player_salary.sql',
+     'fct_player_salary', ['league', 'season']),
+    # issue #430: EA Sports FC game ratings from SoFIFA. canonical_id resolved
+    # in Silver → 'sf_'-prefixed orphan ids. Pointwise off-field fact keyed by
+    # fifa_edition (1:1 with season) → unpartitioned (None), like fct_team_elo.
+    ('fct_player_fifa_rating', 'dags/sql/gold/fct_player_fifa_rating.sql',
+     'fct_player_fifa_rating', None),
     # issue #613: per-match officiating crew (referee/ar1/ar2/4th/var). referee_id
     # resolved best-effort via silver.xref_referee. Optional Silver source →
     # STAGE_3_FALLBACKS empty contract below. Runs in s3 (after g2c) so
@@ -225,11 +235,13 @@ STAGE_3_FALLBACKS = {
         'fallback_sql_file': 'dags/sql/gold/fct_player_unavailable_empty.sql',
         'require_silver':    ['whoscored_player_unavailable'],
     },
-    # issue #11: market_value Silver source может отсутствовать в MVP env
-    # без FotMob ingest. Fallback держит контракт пустой таблицы.
+    # issue #430: market_value needs BOTH Silver sources; either may be absent
+    # in an MVP env without FotMob / Transfermarkt ingest. Fallback holds the
+    # empty contract.
     'fct_player_market_value': {
         'fallback_sql_file': 'dags/sql/gold/fct_player_market_value_empty.sql',
-        'require_silver':    ['fotmob_player_market_value_history'],
+        'require_silver':    ['fotmob_player_market_value_history',
+                              'transfermarkt_market_value_history'],
     },
     # issue #429: Transfermarkt Silver строится отдельным DAG'ом
     # (dag_transform_transfermarkt_silver) и может отсутствовать в env без
@@ -237,6 +249,15 @@ STAGE_3_FALLBACKS = {
     'fct_transfer': {
         'fallback_sql_file': 'dags/sql/gold/fct_transfer_empty.sql',
         'require_silver':    ['transfermarkt_transfers'],
+    },
+    # issue #430: Capology / SoFIFA Silver may be absent in env without ingest.
+    'fct_player_salary': {
+        'fallback_sql_file': 'dags/sql/gold/fct_player_salary_empty.sql',
+        'require_silver':    ['capology_player_salaries'],
+    },
+    'fct_player_fifa_rating': {
+        'fallback_sql_file': 'dags/sql/gold/fct_player_fifa_rating_empty.sql',
+        'require_silver':    ['sofifa_player_profile'],
     },
     # issue #613: officials Silver may be absent (combined_match_data hasn't
     # populated bronze.fbref_match_officials yet). Empty contract keeps the

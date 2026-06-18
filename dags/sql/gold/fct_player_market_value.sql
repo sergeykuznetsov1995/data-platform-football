@@ -1,60 +1,103 @@
 -- =============================================================================
--- Gold: fct_player_market_value
+-- Gold: fct_player_market_value  (issue #430 — two sources + source in PK)
 -- =============================================================================
+-- One valuation point per (player_id_canonical, valuation_date, source).
+-- Two sources, both kept side by side — we do NOT pick a "correct" one here
+-- (that is a feature decision, floor 2):
 --
--- Timeline рыночной стоимости игроков из FotMob. Один row per
--- (player_id_canonical, value_date, league, season).
+--   fotmob        — silver.fotmob_player_market_value_history (canonical_id is
+--                   NOT resolved in Silver → bridge via silver.xref_player here,
+--                   INNER JOIN non-orphan = canonical-only, same as before).
+--   transfermarkt — silver.transfermarkt_market_value_history (canonical_id IS
+--                   resolved in Silver → read it directly, no xref hop).
 --
--- Source: silver.fotmob_player_market_value_history (UNNEST из
---         bronze.fotmob_player_details.market_values_json).
--- Bridge: FotMob player_id → canonical_id через silver.xref_player
---         WHERE source='fotmob' AND confidence <> 'orphan'.
+-- Pointwise off-field fact (design §6 rule 5): market value is a career-long
+-- timeline, NOT season-bound — so NO league/season columns and NO partitioning
+-- (like fct_team_elo). `source` in the PK keeps a FotMob and a Transfermarkt
+-- point on the same (player, date) from colliding.
 --
--- Зерно и partitioning (issue #11):
---   * Grain per-row: (player_id_canonical, value_date, league, season).
---   * Partitioned by (league, season) — для совместимости с остальными fct.
---   * Cross-season дубликаты точек FotMob timeline (FotMob отдаёт всю history
---     в каждом ingest snapshot) — потребитель фильтрует WHERE season = (MAX)
---     для «last view». Полная одиночная картина = WHERE season = current.
+-- Cross-season collapse: both sources re-emit the full history in every ingest
+-- snapshot, so the same (player, date) point lands in several season partitions
+-- of Silver. ROW_NUMBER over the design PK keeps one row (freshest ingest) —
+-- without it the dropped (league, season) grain would leave cross-season dups.
+--
+-- Canonical-only: the FotMob half has always been canonical-only (INNER JOIN
+-- xref non-orphan); the Transfermarkt half matches that contract
+-- (WHERE canonical_id IS NOT NULL) so player_id_canonical is always a real
+-- 'fb_' canonical and the dim_player FK stays low-orphan.
 --
 -- ⚠️ xref JOIN MUST include (league, season) predicate (CLAUDE.md footgun):
---   silver.xref_player имеет per-(source, source_id, season) rows; без
---   season-condition будет fan-out 1.5-4×.
+--   silver.xref_player has per-(source, source_id, season) rows; without the
+--   season condition the FotMob join fans out 1.5-4×. Season is a varchar slug
+--   '2526' on both sides after #404 (slug = slug).
 --
--- Season type mapping (all varchar slug 'YYNN' after #404):
---   * silver.fotmob_player_market_value_history.season = varchar slug '2526'
---   * silver.xref_player.season                        = varchar slug '2526'
---   #404 unified silver/xref season onto the slug form → JOIN is slug = slug.
---
--- TM extension followup: silver.transfermarkt_market_value_history уже
--- содержит canonical_id и параллельный timeline; UNION ALL добавление
--- источника = новая `source` колонка + расширение PK на `source`. Не входит
--- в issue #11 scope.
+-- PK:           (player_id_canonical, valuation_date, source)
+-- FK:           player_id_canonical -> dim_player (soft, WARNING rate-mode)
+-- Partitioning: none (small off-field table, no season key)
 -- =============================================================================
 
 WITH xref_fotmob AS (
     SELECT DISTINCT
         canonical_id,
-        source_id                                         AS fotmob_player_id,
+        source_id    AS fotmob_player_id,
         league,
-        season  /* #404: slug passthrough (was slug→year-start) */      AS season_year
+        season       AS season_year
     FROM iceberg.silver.xref_player
     WHERE source = 'fotmob'
       AND confidence <> 'orphan'
+),
+
+fotmob AS (
+    SELECT
+        xfm.canonical_id                                  AS player_id_canonical,
+        mv.value_date                                     AS valuation_date,
+        mv.market_value_eur                               AS market_value_eur,
+        mv.currency                                       AS currency,
+        CAST('fotmob' AS varchar)                         AS source,
+        CAST(mv._bronze_ingested_at AS timestamp(6))      AS _bronze_ingested_at
+    FROM iceberg.silver.fotmob_player_market_value_history mv
+    INNER JOIN xref_fotmob xfm
+        ON  xfm.fotmob_player_id = mv.player_id
+        AND xfm.league           = mv.league
+        AND xfm.season_year      = mv.season
+    WHERE mv.value_date IS NOT NULL
+),
+
+transfermarkt AS (
+    SELECT
+        tm.canonical_id                                   AS player_id_canonical,
+        tm.mv_date                                        AS valuation_date,
+        tm.value_eur                                      AS market_value_eur,
+        CAST('EUR' AS varchar)                            AS currency,
+        CAST('transfermarkt' AS varchar)                  AS source,
+        CAST(tm._bronze_ingested_at AS timestamp(6))      AS _bronze_ingested_at
+    FROM iceberg.silver.transfermarkt_market_value_history tm
+    WHERE tm.mv_date      IS NOT NULL
+      AND tm.canonical_id IS NOT NULL
+),
+
+unioned AS (
+    SELECT * FROM fotmob
+    UNION ALL
+    SELECT * FROM transfermarkt
+),
+
+deduped AS (
+    SELECT
+        u.*,
+        ROW_NUMBER() OVER (
+            PARTITION BY u.player_id_canonical, u.valuation_date, u.source
+            ORDER BY u._bronze_ingested_at DESC
+        ) AS rn
+    FROM unioned u
 )
 
 SELECT
-    xfm.canonical_id                                      AS player_id_canonical,
-    mv.value_date                                         AS value_date,
-    mv.market_value_eur                                   AS market_value_eur,
-    mv.currency                                           AS currency,
-    mv._bronze_ingested_at                                AS _bronze_ingested_at,
-    mv.league                                             AS league,
-    mv.season                                             AS season
-
-FROM iceberg.silver.fotmob_player_market_value_history mv
-INNER JOIN xref_fotmob xfm
-    ON  xfm.fotmob_player_id = mv.player_id
-    AND xfm.league           = mv.league
-    AND xfm.season_year      = mv.season
-WHERE mv.value_date IS NOT NULL
+    player_id_canonical,
+    valuation_date,
+    market_value_eur,
+    currency,
+    source,
+    _bronze_ingested_at
+FROM deduped
+WHERE rn = 1

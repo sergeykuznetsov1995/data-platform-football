@@ -35,16 +35,17 @@ def _by_name(checks, name):
 @pytest.mark.unit
 class TestStarGateComposition:
     def test_total_check_count(self):
-        """Contract: 4 star_pk + 28 league/season FK (14 facts × 2) +
-        18 dim-FK + 2 NULL-coverage + 3 grain = 55.
+        """Contract: 7 star_pk + 28 league/season FK (14 facts × 2) +
+        20 dim-FK + 2 NULL-coverage + 3 grain = 60.
 
-        #431 added fct_team_elo pointwise (PK + team_id->dim_team FK) — it is
-        NOT in _STAR_FACT_TABLES (no league/season cols), so it gains no
-        league/season FK from the comprehension. Bump this number when a
-        sub-builder gains a check — e.g. when #430 adds fct_player_salary /
-        fct_player_fifa_rating to the gate.
+        #431 added fct_team_elo pointwise (PK + team_id->dim_team FK). #430
+        added the three player-money facts: fct_player_salary joined
+        _STAR_FACT_TABLES (replacing fct_player_market_value, which dropped
+        league/season), salary / market_value / fifa_rating each gained a
+        pointwise star_pk (+3), and salary / fifa_rating each gained a
+        dim_player FK (+2). Pointwise facts gain no league/season FK.
         """
-        assert len(_build()) == 55
+        assert len(_build()) == 60
 
     def test_names_unique(self):
         checks = _build()
@@ -100,6 +101,21 @@ class TestStarGatePk:
         assert chk.kind == 'no_duplicates'
         assert chk.params['pk'] == ['team_id', 'elo_date']
         assert chk.severity == 'ERROR'
+
+    def test_player_money_design_pks(self):
+        """issue #430: design-grain PK for the three player-money facts."""
+        cases = {
+            'star_pk[fct_player_salary(player_id,league,season)]':
+                ['player_id', 'league', 'season'],
+            'star_pk[fct_player_market_value(player_id_canonical,valuation_date,source)]':
+                ['player_id_canonical', 'valuation_date', 'source'],
+            'star_pk[fct_player_fifa_rating(player_id,fifa_edition)]':
+                ['player_id', 'fifa_edition'],
+        }
+        for name, pk in cases.items():
+            chk = _by_name(_build(), name)
+            assert chk.kind == 'no_duplicates'
+            assert chk.params['pk'] == pk
 
 
 @pytest.mark.unit
@@ -174,6 +190,22 @@ class TestStarGateDimFk:
         assert chk.severity == 'WARNING'
         assert chk.params['warn_rate'] <= chk.params['error_rate']
 
+    def test_player_money_dim_player_fks(self):
+        """issue #430: salary / fifa_rating keep orphan ids ('cap_' / 'sf_'),
+        so the dim_player FK is WARNING rate-mode, not zero-tolerance ERROR."""
+        for child in ('gold.fct_player_salary', 'gold.fct_player_fifa_rating'):
+            checks = [
+                c for c in _build()
+                if c.kind == 'ref_integrity'
+                and c.params['child'] == child
+                and c.params['parent'] == 'gold.dim_player'
+            ]
+            assert len(checks) == 1, child
+            chk = checks[0]
+            assert chk.params['key'] == 'player_id'
+            assert chk.severity == 'WARNING'
+            assert chk.params['warn_rate'] <= chk.params['error_rate']
+
     def test_player_facts_point_at_dim_player(self):
         """The design FK is player -> dim_player (NOT dim_player_attributes,
         which keeps its separate pre-existing checks in the main registry)."""
@@ -182,6 +214,7 @@ class TestStarGateDimFk:
             'gold.fct_player_unavailable', 'gold.fct_match_timeline',
             'gold.fct_player_season_stats', 'gold.fct_keeper_season_stats',
             'gold.fct_player_market_value',
+            'gold.fct_player_salary', 'gold.fct_player_fifa_rating',
         }
         children = {
             c.params['child'] for c in _build()
