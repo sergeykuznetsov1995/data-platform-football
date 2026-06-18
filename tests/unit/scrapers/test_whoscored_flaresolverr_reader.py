@@ -269,6 +269,36 @@ class TestFlareSolverrWhoScoredReader:
         with pytest.raises(ConnectionError):
             reader._download_and_save('https://whoscored.com/')
 
+    @pytest.mark.parametrize(
+        'html',
+        [
+            '<html><body>chrome-error://dino/</body></html>',
+            '<html id="neterror"><body>x</body></html>',
+            '<html><body>ERR_NO_SUPPORTED_PROXIES</body></html>',
+        ],
+    )
+    def test_download_and_save_rejects_chromium_error_page(self, mock_fs_client, reader, html):
+        """A Chromium net-error page (HTTP 200) must raise, not be returned (#655)."""
+        from scrapers.base.flaresolverr_client import FlareSolverrErrorPage
+
+        mock_fs_client.get.return_value = {'html': html, 'status': 200}
+        with pytest.raises(FlareSolverrErrorPage):
+            reader._download_and_save('https://whoscored.com/')
+
+    def test_download_and_save_does_not_cache_error_page(self, mock_fs_client, reader, tmp_path):
+        """Regression #655: error page must NOT poison the disk cache (var=None path)."""
+        from scrapers.base.flaresolverr_client import FlareSolverrErrorPage
+
+        reader.no_store = False
+        fp = tmp_path / 'page.html'
+        mock_fs_client.get.return_value = {
+            'html': '<html><body>chrome-error://dino/ ERR_NO_SUPPORTED_PROXIES</body></html>',
+            'status': 200,
+        }
+        with pytest.raises(FlareSolverrErrorPage):
+            reader._download_and_save('https://whoscored.com/', filepath=fp)
+        assert not fp.exists()
+
     def test_validate_page_is_defensive(self, reader):
         with pytest.raises(RuntimeError):
             reader._validate_page('https://whoscored.com/')
