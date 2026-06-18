@@ -45,6 +45,15 @@ blocked_count: dict[str, int] = defaultdict(int)
 
 BLOCKLIST: set[str] = set()
 
+# Idle-refresh rotation state (#652). The residential exit is refreshed only when
+# no tunnel is currently open (``_active == 0``), so one exit IP serves a whole
+# FlareSolverr/CF session (the page and its Turnstile challenge share an IP =
+# CF-safe) and each new session — which closes all tunnels first — draws a fresh
+# exit. Picking per-CONNECT instead would split a page and its CF challenge across
+# different IPs and re-trigger the challenge.
+_current_up: tuple[str, int, str, str] | None = None
+_active = 0
+
 
 def _load_blocklist(path: str | None) -> set[str]:
     out: set[str] = set()
@@ -63,17 +72,44 @@ def _is_blocked(host: str) -> bool:
     return any(h == b or h.endswith("." + b) for b in BLOCKLIST)
 
 
-def _residential(proxy_file: str):
-    """(host, port, user, pass) of one residential proxy, reusing ProxyManager parsing."""
+def _residential_manager(proxy_file: str):
+    """A ProxyManager loaded from the custom-format pool file (host:port:user:pass).
+
+    The upstream is refreshed per FlareSolverr session (idle-refresh, see
+    ``_acquire_upstream``) so each session lands on a different residential exit —
+    keeping IP diversity that a pin-one-proxy startup would have thrown away, while
+    holding one exit per CF session so the page and its Turnstile challenge stay on
+    a single IP (#652)."""
     from scrapers.utils.proxy_manager import ProxyManager
 
     mgr = ProxyManager(rotation_strategy="random")
     n = mgr.load_from_file_custom_format(proxy_file)
     if n <= 0:
         raise SystemExit(f"no proxies in {proxy_file}")
-    p = mgr.get_proxy()
-    u = urlsplit(p.url)  # http://user:pass@host:port
+    return mgr
+
+
+def _pick_upstream(mgr):
+    """(host, port, user, pass) of one residential proxy from the pool."""
+    u = urlsplit(mgr.get_proxy().url)  # http://user:pass@host:port
     return u.hostname, u.port, u.username, u.password
+
+
+def _acquire_upstream(mgr):
+    """Return the residential upstream for a new tunnel, refreshing it only when idle.
+
+    A fresh random exit is drawn only when no tunnel is currently open
+    (``_active == 0``): so all tunnels within one FlareSolverr session reuse the
+    same exit IP (the page + its Turnstile challenge — CF-safe), and the next
+    session (which destroys the tab, closing every tunnel through us) draws a new
+    one. Callers MUST ``_active += 1`` right after and ``-= 1`` when the tunnel
+    closes. Safe without a lock: asyncio is cooperative and this runs with no
+    ``await`` between the check and the caller's increment."""
+    global _current_up
+    if _active == 0 or _current_up is None:
+        _current_up = _pick_upstream(mgr)
+        log.info("residential upstream → %s:%s (user=%s)", *_current_up[:3])
+    return _current_up
 
 
 async def _pump(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, host: str, counter: dict[str, int]) -> None:
@@ -101,9 +137,8 @@ async def _read_headers(reader: asyncio.StreamReader) -> None:
             return
 
 
-async def handle(client_r: asyncio.StreamReader, client_w: asyncio.StreamWriter, up) -> None:
-    up_host, up_port, up_user, up_pass = up
-    auth = base64.b64encode(f"{up_user}:{up_pass}".encode()).decode()
+async def handle(client_r: asyncio.StreamReader, client_w: asyncio.StreamWriter, mgr) -> None:
+    global _active
     try:
         first = await client_r.readline()
         if not first:
@@ -124,39 +159,48 @@ async def handle(client_r: asyncio.StreamReader, client_w: asyncio.StreamWriter,
             client_w.close()
             return
 
-        if method == "CONNECT":
-            conn_count[host] += 1
-            await _read_headers(client_r)
-            srv_r, srv_w = await asyncio.open_connection(up_host, up_port)
-            srv_w.write(
-                f"CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n"
-                f"Proxy-Authorization: Basic {auth}\r\n\r\n".encode()
-            )
-            await srv_w.drain()
-            status = await srv_r.readline()
-            await _read_headers(srv_r)
-            if b"200" not in status:
-                client_w.write(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+        # Acquire the residential exit (idle-refresh) and mark a tunnel open so the
+        # exit stays pinned for the rest of this CF session. _active must wrap the
+        # whole tunnel so the next session only refreshes once every tunnel closed.
+        up_host, up_port, up_user, up_pass = _acquire_upstream(mgr)
+        auth = base64.b64encode(f"{up_user}:{up_pass}".encode()).decode()
+        _active += 1
+        try:
+            if method == "CONNECT":
+                conn_count[host] += 1
+                await _read_headers(client_r)
+                srv_r, srv_w = await asyncio.open_connection(up_host, up_port)
+                srv_w.write(
+                    f"CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n"
+                    f"Proxy-Authorization: Basic {auth}\r\n\r\n".encode()
+                )
+                await srv_w.drain()
+                status = await srv_r.readline()
+                await _read_headers(srv_r)
+                if b"200" not in status:
+                    client_w.write(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+                    await client_w.drain()
+                    client_w.close()
+                    srv_w.close()
+                    return
+                client_w.write(b"HTTP/1.1 200 Connection established\r\n\r\n")
                 await client_w.drain()
-                client_w.close()
-                srv_w.close()
-                return
-            client_w.write(b"HTTP/1.1 200 Connection established\r\n\r\n")
-            await client_w.drain()
-            await asyncio.gather(
-                _pump(client_r, srv_w, host, up_bytes),
-                _pump(srv_r, client_w, host, down_bytes),
-            )
-        else:
-            conn_count[host] += 1
-            srv_r, srv_w = await asyncio.open_connection(up_host, up_port)
-            srv_w.write(first)
-            srv_w.write(f"Proxy-Authorization: Basic {auth}\r\n".encode())
-            await srv_w.drain()
-            await asyncio.gather(
-                _pump(client_r, srv_w, host, up_bytes),
-                _pump(srv_r, client_w, host, down_bytes),
-            )
+                await asyncio.gather(
+                    _pump(client_r, srv_w, host, up_bytes),
+                    _pump(srv_r, client_w, host, down_bytes),
+                )
+            else:
+                conn_count[host] += 1
+                srv_r, srv_w = await asyncio.open_connection(up_host, up_port)
+                srv_w.write(first)
+                srv_w.write(f"Proxy-Authorization: Basic {auth}\r\n".encode())
+                await srv_w.drain()
+                await asyncio.gather(
+                    _pump(client_r, srv_w, host, up_bytes),
+                    _pump(srv_r, client_w, host, down_bytes),
+                )
+        finally:
+            _active -= 1
     except Exception:  # noqa: BLE001
         try:
             client_w.close()
@@ -222,11 +266,11 @@ async def main() -> None:
     BLOCKLIST = _load_blocklist(args.blocklist)
     log.info("blocklist: %d domains from %s", len(BLOCKLIST), args.blocklist or "(none — observe mode)")
 
-    up = _residential(args.proxy_file)
-    log.info("residential upstream = %s:%s (user=%s)", up[0], up[1], up[2])
+    mgr = _residential_manager(args.proxy_file)
+    log.info("residential pool = %d proxies (idle-refresh per FS session)", mgr.total_count)
     host, port = args.listen.rsplit(":", 1)
 
-    server = await asyncio.start_server(lambda r, w: handle(r, w, up), host, int(port))
+    server = await asyncio.start_server(lambda r, w: handle(r, w, mgr), host, int(port))
     log.info("listening on %s (no auth — point FlareSolverr proxy here)", args.listen)
 
     asyncio.ensure_future(_periodic_dump(args.out))
