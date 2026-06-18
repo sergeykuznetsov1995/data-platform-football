@@ -33,6 +33,9 @@ x-airflow-common: &airflow-common
     SPARK_MASTER_URL: ${SPARK_MASTER_URL}
     TRINO_PASSWORD: ${TRINO_PASSWORD}
     TRINO_PORT: ${TRINO_PORT}
+    # Route FlareSolverr scrapers (WhoScored/SoFIFA) through the ad-tech filter (#652).
+    # Off by default — set to http://proxy_filter:8899 to cut residential traffic.
+    PROXY_FILTER_URL: ${PROXY_FILTER_URL:-}
     TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
     TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
     ALERT_ENV: ${ALERT_ENV:-dev}
@@ -939,6 +942,52 @@ services:
           memory: 512M
         reservations:
           memory: 256M
+    networks:
+      - backend
+
+  # ===========================================================================
+  # proxy_filter - ad-tech filtering proxy between FlareSolverr and the
+  # residential pool (#652). Cuts billable residential traffic by refusing
+  # ad-tech CONNECT hosts (no MITM — preserves Chrome's TLS fingerprint).
+  # Holds the residential creds and rotates the upstream per FlareSolverr session
+  # (idle-refresh: a fresh exit is drawn only when no tunnel is open, so a page and
+  # its CF challenge share one IP). Scrapers route here when the global
+  # PROXY_FILTER_URL=http://proxy_filter:8899 toggle is set.
+  # ===========================================================================
+  proxy_filter:
+    build:
+      context: ./docker/images/airflow
+      dockerfile: Dockerfile
+    container_name: proxy_filter
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    environment:
+      PYTHONPATH: /opt/airflow
+    command:
+      - python
+      - /opt/airflow/scripts/proxy_filter/filter_proxy.py
+      - --listen
+      - 0.0.0.0:8899
+      - --blocklist
+      - /opt/airflow/configs/proxy_filter/blocklist.txt
+      - --out
+      - /tmp/filter_bytes.json
+    volumes:
+      - ./scripts:/opt/airflow/scripts
+      - ./scrapers:/opt/airflow/scrapers
+      - ./proxys.txt:/opt/airflow/proxys.txt:ro
+      - ./configs/proxy_filter:/opt/airflow/configs/proxy_filter:ro
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+        reservations:
+          memory: 64M
+    depends_on:
+      - flaresolverr
     networks:
       - backend
 

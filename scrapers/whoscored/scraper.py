@@ -125,9 +125,13 @@ class WhoScoredScraper(SoccerdataScraper):
             fs_url = self.flaresolverr_url or os.environ.get(
                 "FLARESOLVERR_URL", "http://flaresolverr:8191"
             )
+            # When PROXY_FILTER_URL is set, route the schedule reader's FlareSolverr
+            # session through the ad-tech filtering proxy too (#652) — same as the
+            # events path in _pick_proxy_url. The filter holds the residential creds
+            # and rotates the upstream, so we hand it a static credential-free URL.
             self._reader = FlareSolverrWhoScoredReader(
                 flaresolverr_url=fs_url,
-                proxy=self._build_proxy_url(),
+                proxy=os.environ.get("PROXY_FILTER_URL") or self._build_proxy_url(),
                 leagues=self.leagues,
                 seasons=self.seasons,
             )
@@ -360,7 +364,15 @@ class WhoScoredScraper(SoccerdataScraper):
 
         def _pick_proxy_url() -> Optional[str]:
             """Pull a proxy from ProxyManager (preferred) or fall back to
-            the legacy single ``self.proxy`` env."""
+            the legacy single ``self.proxy`` env.
+
+            When ``PROXY_FILTER_URL`` is set, route every FlareSolverr session
+            through the ad-tech filtering proxy instead (#652). The filter holds
+            the residential creds and rotates the upstream itself, so we hand
+            FlareSolverr a static, credential-free URL."""
+            filter_url = os.environ.get("PROXY_FILTER_URL")
+            if filter_url:
+                return filter_url
             if self._proxy_manager and self._proxy_manager.total_count > 0:
                 proxy_obj = self._proxy_manager.get_proxy()
                 if proxy_obj:

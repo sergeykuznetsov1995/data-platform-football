@@ -184,6 +184,37 @@ images/ads/trackers) — НЕ тюнинг `SESSION_RECREATE_EVERY` (cold-start 
   путь скрапа/парсинга не менялся; сторож — DQ-проверки
   (`tests/unit/dq/test_e3_dq.py`, `tests/integration/test_e2_dims_smoke.py`).
 
+## 5b. Prod-проводка фильтра (#652)
+
+Реализация снижения трафика (ветка `feature/issue-652-flaresolverr-proxy-filter`):
+
+- **compose-сервис `proxy_filter`** (`compose.yaml`) — long-running asyncio-прокси
+  (`scripts/proxy_filter/filter_proxy.py`) на `backend`-сети, слушает `0.0.0.0:8899`,
+  грузит `configs/proxy_filter/blocklist.txt`. Режет ad-tech CONNECT-хосты (403, без
+  дозвона upstream → байты не биллятся); MITM нет, TLS-fingerprint Chrome цел.
+- **Ротация upstream — внутри фильтра, idle-refresh.** `filter_proxy` держит
+  `ProxyManager` и выбирает свежий residential-exit (`_acquire_upstream`) **только
+  когда нет открытых туннелей** (`_active == 0`), а не пинит один при старте и не
+  меняет на каждое соединение. Так все туннели одной FlareSolverr-сессии идут с
+  одного exit-IP (страница и её Turnstile-challenge на одном IP = CF-safe), а
+  следующая сессия (она рвёт вкладку → закрывает все туннели через нас) берёт новый
+  exit. Это и есть ротация на уровне FS-сессии — попутно ловит реактивную ротацию
+  скрапера (на CF-fail он пересоздаёт сессию).
+- **Тоггл `PROXY_FILTER_URL`** (opt-in, по умолчанию выкл). Задан → WhoScored
+  (events `_pick_proxy_url` **и** schedule-reader) и SoFIFA
+  (`FlareSolverrSoFIFAReader._proxy_url`) отдают FlareSolverr статичный
+  `http://proxy_filter:8899` (без креды; фильтр держит creds). Не задан → прежнее
+  поведение (прямой residential).
+
+Перемер: §3 runbook с `PROXY_FILTER_URL=http://proxy_filter:8899`; биллинговый трафик
+читать из `/tmp/filter_bytes.json` фильтра (`total_mb / n`). Observe-замер (PR #656)
+дал ~77% (WhoScored) и ~50% (SoFIFA) на like-for-like наборе страниц при целых данных.
+
+| источник | proxy МБ / шт (baseline §4) | proxy МБ / шт (filter) | Δ% |
+|---|---|---|---|
+| WhoScored events | ~10.9 | TBD | TBD |
+| SoFIFA player_ratings | ~38.3 | TBD | TBD |
+
 ## 6. Cross-refs
 
 - #616 (этот аудит), #647 (фикс прокси-авторизации FS — precondition замера),

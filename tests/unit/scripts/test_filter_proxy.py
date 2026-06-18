@@ -127,6 +127,76 @@ def test_dump_writes_expected_report_shape(mod, tmp_path):
     assert report["blocked_hosts"] == [{"host": "doubleclick.net", "attempts": 5}]
 
 
+# --- _pick_upstream / _acquire_upstream (idle-refresh rotation) ---------------
+
+class _FakeProxy:
+    def __init__(self, url):
+        self.url = url
+
+
+class _FakeManager:
+    """Stand-in for ProxyManager: hands out a different proxy on each get_proxy()."""
+
+    def __init__(self, urls):
+        self._urls = list(urls)
+        self.calls = 0
+
+    def get_proxy(self):
+        url = self._urls[self.calls % len(self._urls)]
+        self.calls += 1
+        return _FakeProxy(url)
+
+
+def test_pick_upstream_parses_creds_from_url(mod):
+    # Arrange
+    mgr = _FakeManager(["http://user:pass@pool.proxys.io:10000"])
+    # Act
+    host, port, user, pw = mod._pick_upstream(mgr)
+    # Assert
+    assert (host, port, user, pw) == ("pool.proxys.io", 10000, "user", "pass")
+
+
+def test_acquire_upstream_draws_fresh_exit_when_idle(mod):
+    # Arrange — pool of two exits, no tunnel open
+    mgr = _FakeManager(
+        ["http://u:p@pool.proxys.io:10000", "http://u:p@pool.proxys.io:10001"]
+    )
+    mod._current_up, mod._active = None, 0
+    # Act / Assert — idle → draw the first exit
+    assert mod._acquire_upstream(mgr)[1] == 10000
+    assert mgr.calls == 1
+
+
+def test_acquire_upstream_reuses_exit_while_a_tunnel_is_open(mod):
+    # Arrange — the page's tunnel is open on the first exit (_active == 1)
+    mgr = _FakeManager(
+        ["http://u:p@pool.proxys.io:10000", "http://u:p@pool.proxys.io:10001"]
+    )
+    mod._current_up, mod._active = None, 0
+    first = mod._acquire_upstream(mgr)  # mgr.calls -> 1
+    mod._active = 1                     # that tunnel stays open
+    # Act — a sibling CONNECT in the SAME CF session asks for an upstream
+    second = mod._acquire_upstream(mgr)
+    # Assert — same exit IP (page + Turnstile on one IP = CF-safe), no new draw
+    assert second == first
+    assert mgr.calls == 1
+
+
+def test_acquire_upstream_refreshes_for_next_session_once_idle(mod):
+    # Arrange — session 1 ran and every tunnel closed (back to idle)
+    mgr = _FakeManager(
+        ["http://u:p@pool.proxys.io:10000", "http://u:p@pool.proxys.io:10001"]
+    )
+    mod._current_up, mod._active = None, 0
+    mod._acquire_upstream(mgr)  # session 1 -> 10000, mgr.calls -> 1
+    mod._active = 0             # all tunnels closed
+    # Act — the next FlareSolverr session opens its first tunnel
+    nxt = mod._acquire_upstream(mgr)
+    # Assert — a fresh exit is drawn for the new session (#652 idle-refresh)
+    assert nxt[1] == 10001
+    assert mgr.calls == 2
+
+
 # --- shipped blocklist safety -------------------------------------------------
 
 def test_shipped_blocklist_blocks_adtech_but_not_cf_or_sites(mod):

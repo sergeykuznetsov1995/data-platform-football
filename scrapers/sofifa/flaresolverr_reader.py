@@ -17,6 +17,7 @@ from __future__ import annotations
 import html as html_module
 import io
 import logging
+import os
 import re
 import uuid
 from pathlib import Path
@@ -168,11 +169,15 @@ class FlareSolverrSoFIFAReader(sd.SoFIFA):
         self._fs_client = FlareSolverrClient(url=flaresolverr_url)
         self._session_id = self._new_session_id()
         self._max_timeout_ms = max_timeout_ms
-        self._proxy_url = proxy
+        # When PROXY_FILTER_URL is set, route the FlareSolverr session through the
+        # ad-tech filtering proxy (#652) — it holds the residential creds and rotates
+        # the upstream itself, so we pass a static credential-free URL. Used for both
+        # the initial session and every _maybe_recreate_session.
+        self._proxy_url = os.environ.get("PROXY_FILTER_URL") or proxy
         self._request_count = 0
         self._session_recreate_every = session_recreate_every
         self._session_closed = False
-        self._fs_client.create_session(self._session_id, proxy_url=proxy)
+        self._fs_client.create_session(self._session_id, proxy_url=self._proxy_url)
         logger.info("FlareSolverr session %s created", self._session_id)
 
         kw = dict(
