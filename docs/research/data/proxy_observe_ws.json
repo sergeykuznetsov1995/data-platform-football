@@ -1,0 +1,691 @@
+{
+  "total_mb": 5.508,
+  "hosts": [
+    {
+      "host": "www.googletagmanager.com",
+      "conns": 2,
+      "down_mb": 0.459,
+      "up_mb": 0.005,
+      "total_mb": 0.464
+    },
+    {
+      "host": "podname.com",
+      "conns": 4,
+      "down_mb": 0.432,
+      "up_mb": 0.012,
+      "total_mb": 0.444
+    },
+    {
+      "host": "r2---sn-4g5ednse.gvt1.com",
+      "conns": 1,
+      "down_mb": 0.437,
+      "up_mb": 0.002,
+      "total_mb": 0.439
+    },
+    {
+      "host": "cdn.whoscored.com",
+      "conns": 6,
+      "down_mb": 0.352,
+      "up_mb": 0.011,
+      "total_mb": 0.363
+    },
+    {
+      "host": "d2zywfiolv4f83.cloudfront.net",
+      "conns": 5,
+      "down_mb": 0.342,
+      "up_mb": 0.011,
+      "total_mb": 0.353
+    },
+    {
+      "host": "cdn-adm.pbstck.com",
+      "conns": 5,
+      "down_mb": 0.309,
+      "up_mb": 0.009,
+      "total_mb": 0.319
+    },
+    {
+      "host": "securepubads.g.doubleclick.net",
+      "conns": 4,
+      "down_mb": 0.262,
+      "up_mb": 0.01,
+      "total_mb": 0.272
+    },
+    {
+      "host": "connect.facebook.net",
+      "conns": 1,
+      "down_mb": 0.243,
+      "up_mb": 0.003,
+      "total_mb": 0.246
+    },
+    {
+      "host": "cx-resources.oddschecker.com",
+      "conns": 3,
+      "down_mb": 0.214,
+      "up_mb": 0.007,
+      "total_mb": 0.221
+    },
+    {
+      "host": "www.whoscored.com",
+      "conns": 2,
+      "down_mb": 0.183,
+      "up_mb": 0.007,
+      "total_mb": 0.189
+    },
+    {
+      "host": "cdn.pbstck.com",
+      "conns": 4,
+      "down_mb": 0.141,
+      "up_mb": 0.004,
+      "total_mb": 0.145
+    },
+    {
+      "host": "www.google.com",
+      "conns": 9,
+      "down_mb": 0.099,
+      "up_mb": 0.011,
+      "total_mb": 0.11
+    },
+    {
+      "host": "b2b-static.oddschecker.com",
+      "conns": 1,
+      "down_mb": 0.1,
+      "up_mb": 0.003,
+      "total_mb": 0.103
+    },
+    {
+      "host": "template-meta.oddschecker.com",
+      "conns": 1,
+      "down_mb": 0.095,
+      "up_mb": 0.002,
+      "total_mb": 0.097
+    },
+    {
+      "host": "www.gstatic.com",
+      "conns": 3,
+      "down_mb": 0.077,
+      "up_mb": 0.005,
+      "total_mb": 0.081
+    },
+    {
+      "host": "tagan.adlightning.com",
+      "conns": 2,
+      "down_mb": 0.066,
+      "up_mb": 0.004,
+      "total_mb": 0.07
+    },
+    {
+      "host": "cdn1.anonymised.io",
+      "conns": 2,
+      "down_mb": 0.056,
+      "up_mb": 0.002,
+      "total_mb": 0.059
+    },
+    {
+      "host": "prebid-server.pbstck.com",
+      "conns": 6,
+      "down_mb": 0.026,
+      "up_mb": 0.032,
+      "total_mb": 0.059
+    },
+    {
+      "host": "fonts.gstatic.com",
+      "conns": 1,
+      "down_mb": 0.051,
+      "up_mb": 0.002,
+      "total_mb": 0.053
+    },
+    {
+      "host": "prebid.cootlogix.com",
+      "conns": 4,
+      "down_mb": 0.026,
+      "up_mb": 0.027,
+      "total_mb": 0.053
+    },
+    {
+      "host": "btloader.com",
+      "conns": 3,
+      "down_mb": 0.046,
+      "up_mb": 0.006,
+      "total_mb": 0.052
+    },
+    {
+      "host": "cdn.webpu.sh",
+      "conns": 1,
+      "down_mb": 0.046,
+      "up_mb": 0.002,
+      "total_mb": 0.049
+    },
+    {
+      "host": "direct.adsrvr.org",
+      "conns": 4,
+      "down_mb": 0.018,
+      "up_mb": 0.021,
+      "total_mb": 0.039
+    },
+    {
+      "host": "elb.the-ozone-project.com",
+      "conns": 4,
+      "down_mb": 0.011,
+      "up_mb": 0.025,
+      "total_mb": 0.036
+    },
+    {
+      "host": "metrics.rapidedge.io",
+      "conns": 1,
+      "down_mb": 0.032,
+      "up_mb": 0.002,
+      "total_mb": 0.034
+    },
+    {
+      "host": "fast.nexx360.io",
+      "conns": 4,
+      "down_mb": 0.012,
+      "up_mb": 0.023,
+      "total_mb": 0.034
+    },
+    {
+      "host": "intake.pbstck.com",
+      "conns": 5,
+      "down_mb": 0.014,
+      "up_mb": 0.019,
+      "total_mb": 0.033
+    },
+    {
+      "host": "ads.pubmatic.com",
+      "conns": 4,
+      "down_mb": 0.024,
+      "up_mb": 0.009,
+      "total_mb": 0.033
+    },
+    {
+      "host": "prebid.a-mo.net",
+      "conns": 4,
+      "down_mb": 0.006,
+      "up_mb": 0.026,
+      "total_mb": 0.032
+    },
+    {
+      "host": "tlx.3lift.com",
+      "conns": 3,
+      "down_mb": 0.014,
+      "up_mb": 0.018,
+      "total_mb": 0.032
+    },
+    {
+      "host": "ib.adnxs.com",
+      "conns": 6,
+      "down_mb": 0.011,
+      "up_mb": 0.02,
+      "total_mb": 0.031
+    },
+    {
+      "host": "snackmedia-ron-tagan.adlightning.com",
+      "conns": 2,
+      "down_mb": 0.025,
+      "up_mb": 0.006,
+      "total_mb": 0.03
+    },
+    {
+      "host": "ex.ingage.tech",
+      "conns": 5,
+      "down_mb": 0.011,
+      "up_mb": 0.019,
+      "total_mb": 0.029
+    },
+    {
+      "host": "ad-delivery.net",
+      "conns": 6,
+      "down_mb": 0.016,
+      "up_mb": 0.012,
+      "total_mb": 0.028
+    },
+    {
+      "host": "acdn.adnxs.com",
+      "conns": 2,
+      "down_mb": 0.024,
+      "up_mb": 0.004,
+      "total_mb": 0.028
+    },
+    {
+      "host": "hbopenbid.pubmatic.com",
+      "conns": 3,
+      "down_mb": 0.014,
+      "up_mb": 0.014,
+      "total_mb": 0.028
+    },
+    {
+      "host": "pbs.nextmillmedia.com",
+      "conns": 3,
+      "down_mb": 0.013,
+      "up_mb": 0.014,
+      "total_mb": 0.027
+    },
+    {
+      "host": "rtb.openx.net",
+      "conns": 3,
+      "down_mb": 0.008,
+      "up_mb": 0.019,
+      "total_mb": 0.027
+    },
+    {
+      "host": "ogads-pa.clients6.google.com",
+      "conns": 2,
+      "down_mb": 0.022,
+      "up_mb": 0.005,
+      "total_mb": 0.027
+    },
+    {
+      "host": "ad.doubleclick.net",
+      "conns": 4,
+      "down_mb": 0.015,
+      "up_mb": 0.011,
+      "total_mb": 0.026
+    },
+    {
+      "host": "mp.4dex.io",
+      "conns": 4,
+      "down_mb": 0.011,
+      "up_mb": 0.015,
+      "total_mb": 0.026
+    },
+    {
+      "host": "eb2.3lift.com",
+      "conns": 5,
+      "down_mb": 0.015,
+      "up_mb": 0.011,
+      "total_mb": 0.026
+    },
+    {
+      "host": "s.seedtag.com",
+      "conns": 3,
+      "down_mb": 0.01,
+      "up_mb": 0.015,
+      "total_mb": 0.026
+    },
+    {
+      "host": "script.4dex.io",
+      "conns": 1,
+      "down_mb": 0.023,
+      "up_mb": 0.002,
+      "total_mb": 0.025
+    },
+    {
+      "host": "fastlane.rubiconproject.com",
+      "conns": 4,
+      "down_mb": 0.009,
+      "up_mb": 0.014,
+      "total_mb": 0.024
+    },
+    {
+      "host": "pbs.optidigital.com",
+      "conns": 3,
+      "down_mb": 0.014,
+      "up_mb": 0.009,
+      "total_mb": 0.023
+    },
+    {
+      "host": "scripts.opti-digital.com",
+      "conns": 2,
+      "down_mb": 0.018,
+      "up_mb": 0.004,
+      "total_mb": 0.023
+    },
+    {
+      "host": "boot.pbstck.com",
+      "conns": 3,
+      "down_mb": 0.016,
+      "up_mb": 0.007,
+      "total_mb": 0.023
+    },
+    {
+      "host": "visitor.omnitagjs.com",
+      "conns": 2,
+      "down_mb": 0.016,
+      "up_mb": 0.004,
+      "total_mb": 0.02
+    },
+    {
+      "host": "fonts.googleapis.com",
+      "conns": 3,
+      "down_mb": 0.015,
+      "up_mb": 0.005,
+      "total_mb": 0.02
+    },
+    {
+      "host": "fundingchoicesmessages.google.com",
+      "conns": 1,
+      "down_mb": 0.016,
+      "up_mb": 0.002,
+      "total_mb": 0.018
+    },
+    {
+      "host": "pixel.rubiconproject.com",
+      "conns": 3,
+      "down_mb": 0.01,
+      "up_mb": 0.008,
+      "total_mb": 0.018
+    },
+    {
+      "host": "api.xtremepush.com",
+      "conns": 3,
+      "down_mb": 0.007,
+      "up_mb": 0.009,
+      "total_mb": 0.016
+    },
+    {
+      "host": "id5-sync.com",
+      "conns": 3,
+      "down_mb": 0.008,
+      "up_mb": 0.008,
+      "total_mb": 0.016
+    },
+    {
+      "host": "region1.google-analytics.com",
+      "conns": 2,
+      "down_mb": 0.009,
+      "up_mb": 0.006,
+      "total_mb": 0.015
+    },
+    {
+      "host": "static.anonm.io",
+      "conns": 2,
+      "down_mb": 0.011,
+      "up_mb": 0.004,
+      "total_mb": 0.015
+    },
+    {
+      "host": "static.anonymised.io",
+      "conns": 1,
+      "down_mb": 0.013,
+      "up_mb": 0.002,
+      "total_mb": 0.015
+    },
+    {
+      "host": "region1.analytics.google.com",
+      "conns": 2,
+      "down_mb": 0.009,
+      "up_mb": 0.006,
+      "total_mb": 0.015
+    },
+    {
+      "host": "gum.criteo.com",
+      "conns": 2,
+      "down_mb": 0.01,
+      "up_mb": 0.005,
+      "total_mb": 0.015
+    },
+    {
+      "host": "ssp-sync.criteo.com",
+      "conns": 2,
+      "down_mb": 0.009,
+      "up_mb": 0.005,
+      "total_mb": 0.014
+    },
+    {
+      "host": "onetag-sys.com",
+      "conns": 3,
+      "down_mb": 0.006,
+      "up_mb": 0.007,
+      "total_mb": 0.014
+    },
+    {
+      "host": "ad.360yield.com",
+      "conns": 2,
+      "down_mb": 0.009,
+      "up_mb": 0.004,
+      "total_mb": 0.013
+    },
+    {
+      "host": "api.btloader.com",
+      "conns": 2,
+      "down_mb": 0.006,
+      "up_mb": 0.007,
+      "total_mb": 0.013
+    },
+    {
+      "host": "cdn.btloader.com",
+      "conns": 2,
+      "down_mb": 0.008,
+      "up_mb": 0.004,
+      "total_mb": 0.012
+    },
+    {
+      "host": "redirector.gvt1.com",
+      "conns": 3,
+      "down_mb": 0.008,
+      "up_mb": 0.004,
+      "total_mb": 0.012
+    },
+    {
+      "host": "cdn.jsdelivr.net",
+      "conns": 1,
+      "down_mb": 0.009,
+      "up_mb": 0.002,
+      "total_mb": 0.011
+    },
+    {
+      "host": "content-autofill.googleapis.com",
+      "conns": 1,
+      "down_mb": 0.007,
+      "up_mb": 0.003,
+      "total_mb": 0.01
+    },
+    {
+      "host": "accounts.google.com",
+      "conns": 2,
+      "down_mb": 0.006,
+      "up_mb": 0.004,
+      "total_mb": 0.01
+    },
+    {
+      "host": "a.teads.tv",
+      "conns": 1,
+      "down_mb": 0.005,
+      "up_mb": 0.004,
+      "total_mb": 0.01
+    },
+    {
+      "host": "scripts.snack-media.com",
+      "conns": 1,
+      "down_mb": 0.007,
+      "up_mb": 0.002,
+      "total_mb": 0.01
+    },
+    {
+      "host": "optimizationguide-pa.googleapis.com",
+      "conns": 1,
+      "down_mb": 0.006,
+      "up_mb": 0.003,
+      "total_mb": 0.009
+    },
+    {
+      "host": "a.ad.gt",
+      "conns": 1,
+      "down_mb": 0.007,
+      "up_mb": 0.002,
+      "total_mb": 0.009
+    },
+    {
+      "host": "api.anonymised.io",
+      "conns": 1,
+      "down_mb": 0.006,
+      "up_mb": 0.003,
+      "total_mb": 0.009
+    },
+    {
+      "host": "creativecdn.com",
+      "conns": 1,
+      "down_mb": 0.006,
+      "up_mb": 0.002,
+      "total_mb": 0.009
+    },
+    {
+      "host": "sync.cootlogix.com",
+      "conns": 1,
+      "down_mb": 0.006,
+      "up_mb": 0.002,
+      "total_mb": 0.009
+    },
+    {
+      "host": "aax.amazon-adsystem.com",
+      "conns": 1,
+      "down_mb": 0.007,
+      "up_mb": 0.002,
+      "total_mb": 0.009
+    },
+    {
+      "host": "g2.gumgum.com",
+      "conns": 1,
+      "down_mb": 0.006,
+      "up_mb": 0.003,
+      "total_mb": 0.009
+    },
+    {
+      "host": "images.getadmiral.com",
+      "conns": 1,
+      "down_mb": 0.006,
+      "up_mb": 0.002,
+      "total_mb": 0.008
+    },
+    {
+      "host": "extreme-ip-lookup.com",
+      "conns": 1,
+      "down_mb": 0.006,
+      "up_mb": 0.002,
+      "total_mb": 0.008
+    },
+    {
+      "host": "stats.g.doubleclick.net",
+      "conns": 1,
+      "down_mb": 0.006,
+      "up_mb": 0.003,
+      "total_mb": 0.008
+    },
+    {
+      "host": "c1.adform.net",
+      "conns": 1,
+      "down_mb": 0.006,
+      "up_mb": 0.002,
+      "total_mb": 0.008
+    },
+    {
+      "host": "play.google.com",
+      "conns": 1,
+      "down_mb": 0.006,
+      "up_mb": 0.002,
+      "total_mb": 0.008
+    },
+    {
+      "host": "www.google.de",
+      "conns": 1,
+      "down_mb": 0.005,
+      "up_mb": 0.003,
+      "total_mb": 0.008
+    },
+    {
+      "host": "www.facebook.com",
+      "conns": 1,
+      "down_mb": 0.005,
+      "up_mb": 0.003,
+      "total_mb": 0.008
+    },
+    {
+      "host": "ssbsync-global.smartadserver.com",
+      "conns": 1,
+      "down_mb": 0.005,
+      "up_mb": 0.003,
+      "total_mb": 0.008
+    },
+    {
+      "host": "ab.dns-finder.com",
+      "conns": 1,
+      "down_mb": 0.005,
+      "up_mb": 0.002,
+      "total_mb": 0.007
+    },
+    {
+      "host": "snackmedia-d.openx.net",
+      "conns": 1,
+      "down_mb": 0.005,
+      "up_mb": 0.002,
+      "total_mb": 0.007
+    },
+    {
+      "host": "match.adsrvr.org",
+      "conns": 1,
+      "down_mb": 0.004,
+      "up_mb": 0.002,
+      "total_mb": 0.007
+    },
+    {
+      "host": "csync.smilewanted.com",
+      "conns": 1,
+      "down_mb": 0.004,
+      "up_mb": 0.002,
+      "total_mb": 0.007
+    },
+    {
+      "host": "image8.pubmatic.com",
+      "conns": 1,
+      "down_mb": 0.004,
+      "up_mb": 0.002,
+      "total_mb": 0.007
+    },
+    {
+      "host": "id.hadron.ad.gt",
+      "conns": 1,
+      "down_mb": 0.004,
+      "up_mb": 0.002,
+      "total_mb": 0.006
+    },
+    {
+      "host": "cdn.api.btloader.com",
+      "conns": 1,
+      "down_mb": 0.004,
+      "up_mb": 0.002,
+      "total_mb": 0.006
+    },
+    {
+      "host": "ov-1d104299d2a447049cdc73700c9309f7.ecs.us-west-2.on.aws",
+      "conns": 1,
+      "down_mb": 0.004,
+      "up_mb": 0.003,
+      "total_mb": 0.006
+    },
+    {
+      "host": "hb-analytics.nextmillmedia.com",
+      "conns": 1,
+      "down_mb": 0.004,
+      "up_mb": 0.002,
+      "total_mb": 0.006
+    },
+    {
+      "host": "cookies.nextmillmedia.com",
+      "conns": 1,
+      "down_mb": 0.004,
+      "up_mb": 0.002,
+      "total_mb": 0.006
+    },
+    {
+      "host": "sync.richaudience.com",
+      "conns": 2,
+      "down_mb": 0.003,
+      "up_mb": 0.003,
+      "total_mb": 0.006
+    },
+    {
+      "host": "lb.eu-1-id5-sync.com",
+      "conns": 1,
+      "down_mb": 0.004,
+      "up_mb": 0.002,
+      "total_mb": 0.006
+    },
+    {
+      "host": "clients2.google.com",
+      "conns": 1,
+      "down_mb": 0.001,
+      "up_mb": 0.0,
+      "total_mb": 0.001
+    }
+  ]
+}
