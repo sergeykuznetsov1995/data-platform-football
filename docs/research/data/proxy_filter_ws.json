@@ -1,0 +1,130 @@
+{
+  "total_mb": 1.275,
+  "allowed_hosts": [
+    {
+      "host": "r4---sn-bvvbaxivnuxqqu5b-5hne.gvt1.com",
+      "conns": 1,
+      "down_mb": 0.437,
+      "up_mb": 0.002,
+      "total_mb": 0.439
+    },
+    {
+      "host": "cdn.whoscored.com",
+      "conns": 6,
+      "down_mb": 0.352,
+      "up_mb": 0.009,
+      "total_mb": 0.361
+    },
+    {
+      "host": "www.whoscored.com",
+      "conns": 2,
+      "down_mb": 0.139,
+      "up_mb": 0.005,
+      "total_mb": 0.143
+    },
+    {
+      "host": "www.google.com",
+      "conns": 6,
+      "down_mb": 0.121,
+      "up_mb": 0.005,
+      "total_mb": 0.125
+    },
+    {
+      "host": "www.gstatic.com",
+      "conns": 3,
+      "down_mb": 0.077,
+      "up_mb": 0.003,
+      "total_mb": 0.08
+    },
+    {
+      "host": "fonts.gstatic.com",
+      "conns": 2,
+      "down_mb": 0.051,
+      "up_mb": 0.002,
+      "total_mb": 0.053
+    },
+    {
+      "host": "redirector.gvt1.com",
+      "conns": 2,
+      "down_mb": 0.014,
+      "up_mb": 0.004,
+      "total_mb": 0.018
+    },
+    {
+      "host": "fonts.googleapis.com",
+      "conns": 2,
+      "down_mb": 0.01,
+      "up_mb": 0.004,
+      "total_mb": 0.014
+    },
+    {
+      "host": "ogads-pa.clients6.google.com",
+      "conns": 1,
+      "down_mb": 0.011,
+      "up_mb": 0.002,
+      "total_mb": 0.013
+    },
+    {
+      "host": "play.google.com",
+      "conns": 1,
+      "down_mb": 0.006,
+      "up_mb": 0.003,
+      "total_mb": 0.01
+    },
+    {
+      "host": "accounts.google.com",
+      "conns": 2,
+      "down_mb": 0.006,
+      "up_mb": 0.002,
+      "total_mb": 0.009
+    },
+    {
+      "host": "content-autofill.googleapis.com",
+      "conns": 1,
+      "down_mb": 0.006,
+      "up_mb": 0.002,
+      "total_mb": 0.008
+    },
+    {
+      "host": "clients2.google.com",
+      "conns": 1,
+      "down_mb": 0.001,
+      "up_mb": 0.0,
+      "total_mb": 0.001
+    }
+  ],
+  "blocked_hosts": [
+    {
+      "host": "d2zywfiolv4f83.cloudfront.net",
+      "attempts": 7
+    },
+    {
+      "host": "cx-resources.oddschecker.com",
+      "attempts": 4
+    },
+    {
+      "host": "b2b-static.oddschecker.com",
+      "attempts": 1
+    },
+    {
+      "host": "www.googletagmanager.com",
+      "attempts": 1
+    },
+    {
+      "host": "boot.pbstck.com",
+      "attempts": 1
+    },
+    {
+      "host": "btloader.com",
+      "attempts": 1
+    },
+    {
+      "host": "securepubads.g.doubleclick.net",
+      "attempts": 1
+    },
+    {
+      "host": "podname.com",
+      "attempts": 1
+    }
+  ]
+}
