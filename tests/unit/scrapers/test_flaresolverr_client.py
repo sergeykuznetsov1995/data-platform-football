@@ -172,7 +172,10 @@ class TestFlareSolverrSessions:
         payload = sess.post.call_args.kwargs['json']
         assert payload == {'cmd': 'sessions.create', 'session': 'my-id'}
 
-    def test_create_session_with_proxy(self):
+    def test_create_session_with_proxy_splits_credentials(self):
+        # Chromium rejects creds embedded in the proxy URL
+        # (ERR_NO_SUPPORTED_PROXIES, #647) — auth must go in separate
+        # username/password fields, with a credential-free url.
         client = FlareSolverrClient()
         with patch.object(client, 'session', new=MagicMock()) as sess:
             sess.post.return_value = _ok_response({'status': 'ok'})
@@ -181,7 +184,19 @@ class TestFlareSolverrSessions:
         payload = sess.post.call_args.kwargs['json']
         assert payload['cmd'] == 'sessions.create'
         assert payload['session'] == 'id'
-        assert payload['proxy'] == {'url': 'http://u:p@h:1'}
+        assert payload['proxy'] == {
+            'url': 'http://h:1', 'username': 'u', 'password': 'p',
+        }
+
+    def test_create_session_proxy_without_credentials_unchanged(self):
+        # A credential-free proxy URL is passed through verbatim.
+        client = FlareSolverrClient()
+        with patch.object(client, 'session', new=MagicMock()) as sess:
+            sess.post.return_value = _ok_response({'status': 'ok'})
+            client.create_session('id', proxy_url='http://h:1')
+
+        payload = sess.post.call_args.kwargs['json']
+        assert payload['proxy'] == {'url': 'http://h:1'}
 
     def test_destroy_session_idempotent(self):
         client = FlareSolverrClient()

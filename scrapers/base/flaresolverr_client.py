@@ -11,7 +11,7 @@ import logging
 import uuid
 from collections import Counter
 from typing import Optional, Tuple
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -51,6 +51,30 @@ _CF_MARKERS = ("cloudflare", "challenge", "turnstile")
 #: Substrings in a FlareSolverr error message that indicate the Chromium tab
 #: crashed (vs. a CF challenge). Kept narrow to avoid mislabelling other errors.
 _TAB_CRASH_MARKERS = ("tab crashed", "target crashed", "page crashed", "renderer")
+
+
+def _proxy_payload(proxy_url: str) -> dict:
+    """Build the FlareSolverr ``proxy`` object from a proxy URL.
+
+    Chromium's ``--proxy-server`` rejects credentials embedded in the URL
+    (``http://user:pass@host:port`` → ``ERR_NO_SUPPORTED_PROXIES``: every
+    proxied fetch silently returns a browser error page with HTTP 200, so
+    no exception is raised and reactive rotation never fires — see #647).
+    FlareSolverr takes auth as separate ``username`` / ``password`` fields,
+    so split them out of the netloc and pass a credential-free URL.
+    """
+    parts = urlsplit(proxy_url)
+    if not (parts.username or parts.password):
+        return {"url": proxy_url}
+    netloc = parts.hostname or ""
+    if parts.port:
+        netloc = f"{netloc}:{parts.port}"
+    clean_url = urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
+    return {
+        "url": clean_url,
+        "username": parts.username or "",
+        "password": parts.password or "",
+    }
 
 
 def _normalise_url_key(url: str) -> str:
@@ -203,7 +227,7 @@ class FlareSolverrClient:
         """Create a named FlareSolverr browser session, optionally bound to a proxy."""
         payload: dict = {"cmd": "sessions.create", "session": session_id}
         if proxy_url:
-            payload["proxy"] = {"url": proxy_url}
+            payload["proxy"] = _proxy_payload(proxy_url)
         self._post(payload)
         # A fresh session re-solves the Cloudflare challenge → a cold-start.
         # Counting these is the cheapest signal for the dominant traffic driver
