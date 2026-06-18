@@ -12,6 +12,7 @@ from scrapers.base.flaresolverr_client import (
     FlareSolverrClient,
     FlareSolverrError,
     FlareSolverrTimeout,
+    is_chromium_error_page,
 )
 
 
@@ -302,3 +303,37 @@ class TestFlareSolverrContextManager:
                 assert client._auto_session_id is not None
             # Cleared after __exit__.
             assert client._auto_session_id is None
+
+
+# -----------------------------------------------------------------------------
+# is_chromium_error_page tests (#655)
+# -----------------------------------------------------------------------------
+@pytest.mark.unit
+class TestIsChromiumErrorPage:
+    """FlareSolverr returns Chromium net-error pages as HTTP 200 HTML; these
+    must be detected so callers refuse to cache them (#655)."""
+
+    @pytest.mark.parametrize(
+        'html',
+        [
+            '<html><body>chrome-error://dino/</body></html>',
+            '<html id="neterror"><body>...</body></html>',
+            '<html><body>ERR_NO_SUPPORTED_PROXIES</body></html>',
+            # Realistic shape: title is the host, body is the chrome error page.
+            '<html><head><title>sofifa.com</title></head>'
+            '<body class="neterror"><div id="main-frame-error"></div></body></html>',
+        ],
+    )
+    def test_detects_error_pages(self, html):
+        assert is_chromium_error_page(html) is True
+
+    @pytest.mark.parametrize(
+        'html',
+        [
+            '',
+            '<html><body><p>real content</p></body></html>',
+            '<select id="select-version"><option>FC 26</option></select>',
+        ],
+    )
+    def test_passes_real_html(self, html):
+        assert is_chromium_error_page(html) is False

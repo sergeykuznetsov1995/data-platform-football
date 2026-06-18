@@ -46,11 +46,39 @@ class FlareSolverrTabCrashed(FlareSolverrError):
     pass
 
 
+class FlareSolverrErrorPage(FlareSolverrError):
+    """Raised when FlareSolverr returns a Chromium net-error page, not site HTML.
+
+    The browser renders its own error page (HTTP 200) for transport failures
+    such as ``ERR_NO_SUPPORTED_PROXIES``. Callers must raise rather than cache
+    it, or soccerdata's ``read_*(max_age=…)`` would reuse the poisoned cache
+    for days (#655).
+    """
+    pass
+
+
 _CF_MARKERS = ("cloudflare", "challenge", "turnstile")
 
 #: Substrings in a FlareSolverr error message that indicate the Chromium tab
 #: crashed (vs. a CF challenge). Kept narrow to avoid mislabelling other errors.
 _TAB_CRASH_MARKERS = ("tab crashed", "target crashed", "page crashed", "renderer")
+
+#: Markers in returned HTML that flag a Chromium net-error page rather than site
+#: content. FlareSolverr serves these as HTTP 200 (e.g. ERR_NO_SUPPORTED_PROXIES
+#: when proxy creds are embedded in the URL, #647). ``chrome-error://`` is the
+#: error page's base URL and ``neterror`` its template id/class — both confirmed
+#: present in the live poisoned page (#655) and absent from real sofifa/whoscored
+#: HTML, so they reliably catch any ERR_* code with zero false positives.
+_CHROMIUM_ERROR_MARKERS = (
+    "chrome-error://",
+    "neterror",
+    "ERR_NO_SUPPORTED_PROXIES",
+)
+
+
+def is_chromium_error_page(html: str) -> bool:
+    """True if ``html`` is a Chromium network-error page, not real site content."""
+    return any(marker in html for marker in _CHROMIUM_ERROR_MARKERS)
 
 
 def _proxy_payload(proxy_url: str) -> dict:
