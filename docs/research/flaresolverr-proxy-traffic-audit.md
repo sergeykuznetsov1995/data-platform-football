@@ -212,8 +212,19 @@ images/ads/trackers) — НЕ тюнинг `SESSION_RECREATE_EVERY` (cold-start 
 
 | источник | proxy МБ / шт (baseline §4) | proxy МБ / шт (filter) | Δ% |
 |---|---|---|---|
-| WhoScored events | ~10.9 | TBD | TBD |
-| SoFIFA player_ratings | ~38.3 | TBD | TBD |
+| WhoScored events | ~10.9 | **~0.54** (n=3) | **~−95%** |
+| SoFIFA player_ratings | ~38.3 | TBD (не замерян live) | — |
+
+> **Live-замер WhoScored (2026-06-18, n=3 матча через прод-фильтр).** Биллинг по
+> точному счёту фильтра (`filter_bytes.json` = байты CONNECT-туннеля к residential):
+> **1.63 МБ на 3 матча = 0.54 МБ/матч**, 3/3 успешно, **0 CF-фейлов**, idle-refresh =
+> 1 exit на сессию, заблокировано 53 ad-tech-попытки (8 хостов). Like-for-like
+> observe-прогон (тот же фильтр БЕЗ блок-листа, те же 3 game_id) **завис**: без
+> блокировки ad-tech держит соединения открытыми и загрузка не доходит до idle —
+> накопил **11.7 МБ уже на 1 матче** (сходится с baseline ~10.9). Вывод: фильтр режет
+> ~95% И убирает зависание. Оговорки: выборка мала (n=3); baseline §4 мерян методом
+> `/proc/net/dev` (шумит loopback'ом Chromium) — точное число — счёт самого фильтра.
+> SoFIFA вживую не мерян (обвязка покрыта юнит-тестами; тот же фильтр-путь).
 
 ## 6. Cross-refs
 
