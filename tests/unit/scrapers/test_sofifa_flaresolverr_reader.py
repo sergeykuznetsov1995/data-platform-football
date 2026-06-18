@@ -332,3 +332,64 @@ class TestReadTeamRatingsParsing:
         assert 'showCol[]=oa' in url and 'showCol[]=sa' in url
         assert 'showCol[]=bs' not in url  # build_up_speed
         assert 'showCol[]=ip' not in url  # international_prestige
+
+
+# Post-EA-FC homepage: the edition/roster pickers moved to id-based <select>s
+# (#650). select-version = one option per edition (value → latest update id);
+# select-roster = updates of the *current* edition (value → id, text → date).
+_VERSIONS_HTML = """
+<html><body>
+<select id="select-version" name="version">
+  <option value="/?hl=en-US&amp;r=260035&amp;set=true">FC 26</option>
+  <option value="/?hl=en-US&amp;r=250044&amp;set=true">FC 25</option>
+  <option value="/?hl=en-US&amp;r=230054&amp;set=true">FIFA 23</option>
+</select>
+<select id="select-roster" name="roster">
+  <option value="/?hl=en-US&amp;r=260035&amp;set=true">May 28, 2026</option>
+  <option value="/?hl=en-US&amp;r=260034&amp;set=true">May 28, 2026</option>
+  <option value="/?hl=en-US&amp;r=260033&amp;set=true">May 12, 2026</option>
+</select>
+</body></html>
+"""
+
+
+class TestReadVersions:
+    """Regression for #650 — KeyError('version_id') on the new SoFIFA DOM."""
+
+    def test_parse_versions_new_dom(self):
+        from scrapers.sofifa.flaresolverr_reader import FlareSolverrSoFIFAReader
+
+        df = FlareSolverrSoFIFAReader._parse_versions(_VERSIONS_HTML)
+
+        assert df.index.name == 'version_id'
+        assert set(df.columns) == {'fifa_edition', 'update'}
+        assert df.loc[260035, 'fifa_edition'] == 'FC 26'
+        # current-edition id overlaps the roster picker → real release date
+        assert df.loc[260035, 'update'] == 'May 28, 2026'
+        # past-edition latest id is absent from the roster → edition fallback
+        assert df.loc[250044, 'fifa_edition'] == 'FC 25'
+        assert df.loc[250044, 'update'] == 'FC 25'
+
+    def test_latest_resolves_to_max_id(self):
+        from scrapers.sofifa.flaresolverr_reader import FlareSolverrSoFIFAReader
+
+        # soccerdata's versions='latest' takes read_versions().tail(1)
+        df = FlareSolverrSoFIFAReader._parse_versions(_VERSIONS_HTML)
+        assert df.tail(1).index.tolist() == [260035]
+
+    def test_empty_dropdown_raises_not_keyerror(self):
+        from scrapers.sofifa.flaresolverr_reader import FlareSolverrSoFIFAReader
+
+        # DOM drift (the #650 bug) must surface a clear error, not a bare
+        # KeyError swallowed deep in pandas.
+        with pytest.raises(ValueError, match='select#select-version'):
+            FlareSolverrSoFIFAReader._parse_versions('<html><body></body></html>')
+
+    def test_read_versions_routes_through_get(self, reader, tmp_path):
+        reader.data_dir = tmp_path
+        reader.get = MagicMock(return_value=io.BytesIO(_VERSIONS_HTML.encode()))
+
+        df = reader.read_versions()
+
+        assert 260035 in df.index
+        assert reader.get.call_args.args[0] == 'https://sofifa.com'
