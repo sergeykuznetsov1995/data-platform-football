@@ -91,37 +91,9 @@ columns:
     description: Дата последнего обновления market value на Transfermarkt.
   - name: contract_until_tm
     description: Дата окончания контракта из Transfermarkt (slowly-changing, snapshot).
-  # --- SoFIFA block (issue #42): EA Sports FC game-side ratings, 0-99 ---
-  - name: overall_sofifa
-    description: Общий FIFA/FC рейтинг (0-99), game-side оценка EA Sports — НЕ реальная метрика.
-  - name: potential_sofifa
-    description: Потенциальный FIFA/FC рейтинг (0-99).
-  - name: pace_sofifa
-    description: Main-6 card-агрегат «Pace» (0-99).
-  - name: shooting_sofifa
-    description: Main-6 card-агрегат «Shooting» (0-99).
-  - name: passing_sofifa
-    description: Main-6 card-агрегат «Passing» (0-99).
-  - name: dribbling_sofifa
-    description: Main-6 card-агрегат «Dribbling» (0-99).
-  - name: defending_sofifa
-    description: Main-6 card-агрегат «Defending» (0-99).
-  - name: physical_sofifa
-    description: Main-6 card-агрегат «Physical» (0-99).
-  - name: gk_diving_sofifa
-    description: GK-скилл «Diving» (0-99, релевантен только вратарям).
-  - name: gk_handling_sofifa
-    description: GK-скилл «Handling» (0-99).
-  - name: gk_kicking_sofifa
-    description: GK-скилл «Kicking» (0-99).
-  - name: gk_positioning_sofifa
-    description: GK-скилл «Positioning» (0-99).
-  - name: gk_reflexes_sofifa
-    description: GK-скилл «Reflexes» (0-99).
-  - name: value_eur_sofifa
-    description: Game-side рыночная стоимость в EUR (оценка EA Sports, не Transfermarkt).
-  - name: wage_eur_sofifa
-    description: Game-side недельная зарплата в EUR (оценка EA Sports).
+  # --- SoFIFA block (issue #609): identity + контрактные атрибуты. Game-side
+  # EA-рейтинги (overall/pace/value_eur/wage_eur/…) переехали в gold-факт
+  # fct_player_fifa_rating per-(player, fifa_edition). ---
   - name: release_clause_eur_sofifa
     description: Game-side сумма отступных в EUR (если задана).
   - name: contract_valid_until_sofifa
