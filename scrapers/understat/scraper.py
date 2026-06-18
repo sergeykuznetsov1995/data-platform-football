@@ -194,6 +194,20 @@ class UnderstatScraper(SoccerdataScraper):
             return None
 
         df = pd.concat(all_shots, ignore_index=True)
+
+        # #444: soccerdata 1.8.8 builds shot `assist_player_id` from the
+        # roster-ROW id (`player["id"]`, range 414509…793112) instead of the
+        # true player id (understat.py:580) — so the column never matches
+        # xref_player and assist resolution downstream was 100% NULL. Same family
+        # as the per-league workaround above. The assister NAME (`assist_player`)
+        # IS correct, so re-derive the id from this scrape's own shooter
+        # (player→player_id) pairs. Assisters who took no shot here stay NA — an
+        # honest NULL beats a bogus roster id (Gold fills the rest by name).
+        remap_cols = {'player', 'player_id', 'assist_player', 'assist_player_id'}
+        if remap_cols.issubset(df.columns):
+            name_to_id = dict(zip(df['player'], df['player_id']))
+            df['assist_player_id'] = df['assist_player'].map(name_to_id).astype('Int64')
+
         df = self._add_metadata(df, 'shots')
         return df
 

@@ -31,6 +31,10 @@ Silver Tables Created:
     iceberg.silver.fotmob_keeper_profile
     iceberg.silver.fotmob_player_market_value_history
     iceberg.silver.fotmob_team_match
+    iceberg.silver.fotmob_team_profile        (#600)
+    iceberg.silver.fotmob_team_standings      (#600)
+    iceberg.silver.fotmob_team_leaderboards   (#600)
+    iceberg.silver.fotmob_transfers           (#600)
 """
 
 from datetime import datetime
@@ -61,6 +65,13 @@ SILVER_TRANSFORMS = [
         'dags/sql/silver/fotmob_keeper_profile.sql',
         'fotmob_keeper_profile',
     ),
+    # issue #434: тренеры (WHERE is_coach) — nationality/dob для gold.dim_manager.
+    # Зеркало player_profile; coachId (player_id) совпадает с xref_manager.source_id.
+    (
+        'manager_profile',
+        'dags/sql/silver/fotmob_manager_profile.sql',
+        'fotmob_manager_profile',
+    ),
     # issue #11: timeline market_value из bronze.fotmob_player_details
     # .market_values_json (UNNEST). Питает gold.fct_player_market_value.
     (
@@ -83,6 +94,29 @@ SILVER_TRANSFORMS = [
         'dags/sql/silver/fotmob_match_referee.sql',
         'fotmob_match_referee',
     ),
+    # issue #600: промоут 4 write-only bronze-таблиц (audit #476) в Silver.
+    # Conform-only (типизация + dedup + season-slug), резолв canonical_id отложен
+    # в Gold. Team-таблицы держат numeric team_id + team_name.
+    (
+        'team_profile',
+        'dags/sql/silver/fotmob_team_profile.sql',
+        'fotmob_team_profile',
+    ),
+    (
+        'team_standings',
+        'dags/sql/silver/fotmob_team_standings.sql',
+        'fotmob_team_standings',
+    ),
+    (
+        'team_leaderboards',
+        'dags/sql/silver/fotmob_team_leaderboards.sql',
+        'fotmob_team_leaderboards',
+    ),
+    (
+        'transfers',
+        'dags/sql/silver/fotmob_transfers.sql',
+        'fotmob_transfers',
+    ),
 ]
 
 # FotMob Bronze coverage: только сезон 2025 (572 player в details, ~10K rows
@@ -95,6 +129,8 @@ SILVER_MIN_ROWS = {
     'fotmob_player_season_profile': 450,
     'fotmob_player_profile': 500,
     'fotmob_keeper_profile': 40,
+    # manager_profile: ~18 coaches APL 2025/26 (1 head coach per club). Floor 15.
+    'fotmob_manager_profile': 15,
     'fotmob_player_market_value_history': 1000,
     # team_match: ~338 finished matches × 2 sides = 676 rows для APL 2025/26
     # (7% бронзы без stats_json — cancelled / not finished). Floor 600 c headroom.
@@ -102,6 +138,14 @@ SILVER_MIN_ROWS = {
     # match_referee: ~380 матчей APL 2025/26 со 100% покрытием судьи (issue #290).
     # Floor 300 c headroom под матчи без referee.text.
     'fotmob_match_referee': 300,
+    # issue #600 — APL 2025/26, 20 команд:
+    #   team_profile / team_standings ~20 row (1 на команду) → floor 15.
+    #   team_leaderboards ~574 row (long-form, ~28 stat × 20 team) → floor 300.
+    #   transfers ~100 событий за сезон → floor 50.
+    'fotmob_team_profile': 15,
+    'fotmob_team_standings': 15,
+    'fotmob_team_leaderboards': 300,
+    'fotmob_transfers': 50,
 }
 
 
@@ -405,6 +449,105 @@ def _validate_silver_quality(**context) -> Dict[str, Any]:
             warn_threshold=0.90,
             error_threshold=0.50,
         ),
+
+        # --- team_profile (issue #600) ---
+        # PK = (team_id, league, season). ERROR: no-NULL на PK + uniqueness + floor.
+        CHECK.no_nulls(
+            'silver.fotmob_team_profile',
+            cols=['team_id', 'league', 'season'],
+        ),
+        CHECK.no_duplicates(
+            'silver.fotmob_team_profile',
+            pk=['team_id', 'league', 'season'],
+        ),
+        CHECK.row_count('silver.fotmob_team_profile', min_rows=15),
+        CHECK.freshness(
+            'silver.fotmob_team_profile',
+            ts_col='_bronze_ingested_at',
+            max_age_hours=FRESH_HOURS,
+            severity='WARNING',
+        ),
+        CHECK.value_range(
+            'silver.fotmob_team_profile', 'table_position',
+            min_val=1, max_val=30, severity='WARNING',
+        ),
+
+        # --- team_standings (issue #600) ---
+        # PK = (team_id, league, season). Season-grain snapshot турнирной таблицы.
+        CHECK.no_nulls(
+            'silver.fotmob_team_standings',
+            cols=['team_id', 'league', 'season'],
+        ),
+        CHECK.no_duplicates(
+            'silver.fotmob_team_standings',
+            pk=['team_id', 'league', 'season'],
+        ),
+        CHECK.row_count('silver.fotmob_team_standings', min_rows=15),
+        CHECK.freshness(
+            'silver.fotmob_team_standings',
+            ts_col='_bronze_ingested_at',
+            max_age_hours=FRESH_HOURS,
+            severity='WARNING',
+        ),
+        CHECK.value_range(
+            'silver.fotmob_team_standings', 'position',
+            min_val=1, max_val=30, severity='WARNING',
+        ),
+        CHECK.value_range(
+            'silver.fotmob_team_standings', 'points',
+            min_val=0, max_val=130, severity='WARNING',
+        ),
+        CHECK.value_range(
+            'silver.fotmob_team_standings', 'played',
+            min_val=0, max_val=60, severity='WARNING',
+        ),
+
+        # --- team_leaderboards (issue #600) ---
+        # Long-form PK = (team_id, stat_category_group, stat_name, league, season).
+        CHECK.no_nulls(
+            'silver.fotmob_team_leaderboards',
+            cols=['team_id', 'stat_name', 'league', 'season'],
+        ),
+        CHECK.no_duplicates(
+            'silver.fotmob_team_leaderboards',
+            pk=['team_id', 'stat_category_group', 'stat_name', 'league', 'season'],
+        ),
+        CHECK.row_count('silver.fotmob_team_leaderboards', min_rows=300),
+        CHECK.freshness(
+            'silver.fotmob_team_leaderboards',
+            ts_col='_bronze_ingested_at',
+            max_age_hours=FRESH_HOURS,
+            severity='WARNING',
+        ),
+        CHECK.value_range(
+            'silver.fotmob_team_leaderboards', 'rank',
+            min_val=1, severity='WARNING',
+        ),
+
+        # --- transfers (issue #600) ---
+        # Event-grain PK = (player_id, from_club_id, to_club_id, transfer_date,
+        # league, season). no_nulls только на гарантированно non-NULL колонках
+        # (club ids могут быть NULL для free agents).
+        CHECK.no_nulls(
+            'silver.fotmob_transfers',
+            cols=['player_id', 'league', 'season'],
+        ),
+        CHECK.no_duplicates(
+            'silver.fotmob_transfers',
+            pk=['player_id', 'from_club_id', 'to_club_id', 'transfer_date',
+                'league', 'season'],
+        ),
+        CHECK.row_count('silver.fotmob_transfers', min_rows=50),
+        CHECK.freshness(
+            'silver.fotmob_transfers',
+            ts_col='_bronze_ingested_at',
+            max_age_hours=FRESH_HOURS,
+            severity='WARNING',
+        ),
+        CHECK.value_range(
+            'silver.fotmob_transfers', 'fee_eur',
+            min_val=0, severity='WARNING',
+        ),
     ]
 
     report = run_checks(checks, raise_on_error=False)
@@ -458,6 +601,10 @@ with DAG(
     | `fotmob_keeper_profile` | Вратари per-season с GK-stats | fotmob_player_details + fotmob_player_stats (PIVOTED) |
     | `fotmob_team_match` | Per (match, team_id) team-level stats + xG/xA | fotmob_match_details.stats_json + .player_stats_json (SUM xA) — issue #97 Phase A |
     | `fotmob_match_referee` | Per-match судья + страна (FotMob-only) | fotmob_match_details.match_facts_json ($.infoBox.Referee) — issue #290 |
+    | `fotmob_team_profile` | Профиль команды per-season (страна, стадион, позиция) | fotmob_team_profile — issue #600 |
+    | `fotmob_team_standings` | Турнирная таблица per-season (place/W/D/L/GF/GA/pts) | fotmob_team_stats — issue #600 |
+    | `fotmob_team_leaderboards` | Long-form командные лидерборды (rank + value per stat) | fotmob_team_leaderboards — issue #600 |
+    | `fotmob_transfers` | Трансферные события (player, clubs, fee, loan) | fotmob_transfers — issue #600 |
 
     ### Transformations
     - **Dedup** на (player_id, league, season) через ROW_NUMBER + ORDER BY _ingested_at DESC

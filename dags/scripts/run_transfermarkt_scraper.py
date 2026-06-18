@@ -73,8 +73,9 @@ class _StrictArgumentParser(argparse.ArgumentParser):
 ENTITY_PLAYERS = 'players'
 ENTITY_MV_HISTORY = 'market_value_history'
 ENTITY_TRANSFERS = 'transfers'
+ENTITY_COACHES = 'coaches'
 
-VALID_ENTITIES = {ENTITY_PLAYERS, ENTITY_MV_HISTORY, ENTITY_TRANSFERS}
+VALID_ENTITIES = {ENTITY_PLAYERS, ENTITY_MV_HISTORY, ENTITY_TRANSFERS, ENTITY_COACHES}
 
 # Replace-partitions completeness guard (#484/#486, generalised into
 # BaseScraper.save_to_iceberg in #513): passed as min_replace_ratio +
@@ -398,6 +399,100 @@ def _run_transfers(
     return 0
 
 
+def _run_coaches(
+    leagues: List[str],
+    season: int,
+    limit: Optional[int],
+    output_path: str,
+    dry_run: bool = False,
+    force_replace: bool = False,
+) -> int:
+    """Head-coach entity (issue #434): listing → staff pages → coach profiles.
+
+    Writes ``bronze.transfermarkt_coaches`` with replace-partitions on
+    ``(league, season)``. Feeds gold.dim_manager nationality/dob enrichment.
+    """
+    from scrapers.base.base_scraper import ReplaceGuardError
+    from scrapers.transfermarkt import TransfermarktScraper
+    from scrapers.transfermarkt.scraper import R0_2B_FALLBACK_MARKER
+
+    league = leagues[0]
+    results = {
+        'entity': ENTITY_COACHES,
+        'tables': [],
+        'rows': 0,
+        'coaches_with_rows': 0,
+        'fallback': False,
+        'fallback_reason': None,
+        'errors': [],
+    }
+
+    proxy_file = os.environ.get('PROXY_FILE', '/opt/airflow/proxys.txt')
+    if not os.path.exists(proxy_file):
+        proxy_file = None
+
+    try:
+        with TransfermarktScraper(
+            leagues=[league],
+            seasons=[season],
+            proxy_file=proxy_file,
+        ) as scraper:
+            df = scraper.read_coaches(
+                league=league, season=int(season), limit=limit,
+            )
+            if df is None or df.empty:
+                reason = _classify_fallback(scraper)
+                logger.error(
+                    "%s: coaches unavailable — reason=%s",
+                    R0_2B_FALLBACK_MARKER, reason,
+                )
+                results['fallback'] = True
+                results['fallback_reason'] = reason
+                results['errors'].append(f'{R0_2B_FALLBACK_MARKER}: {reason}')
+                _write_results(output_path, results)
+                return 2
+
+            results['rows'] = int(len(df))
+            results['coaches_with_rows'] = int(df['coach_id'].nunique())
+
+            if dry_run:
+                results['dry_run'] = True
+                logger.info(
+                    "Dry-run: scraped %d coach rows (%d unique) — skipping save.",
+                    results['rows'], results['coaches_with_rows'],
+                )
+                _write_results(output_path, results)
+                return 0
+
+            table_path = scraper.save_to_iceberg(
+                df=df,
+                table_name='transfermarkt_coaches',
+                partition_cols=['league', 'season'],
+                replace_partitions=['league', 'season'],
+                min_replace_ratio=(None if force_replace else _MIN_REPLACE_RATIO),
+                replace_guard_key='coach_id',
+            )
+            results['tables'].append(table_path)
+            logger.info(
+                "Saved %d coach rows (%d unique) → %s",
+                results['rows'], results['coaches_with_rows'], table_path,
+            )
+    except ReplaceGuardError as e:
+        msg = f"{REPLACE_GUARD_MARKER}: {e}"
+        logger.error(msg)
+        results['errors'].append(msg)
+        _write_results(output_path, results)
+        return 3
+    except Exception as e:
+        logger.error("coaches scrape failed hard: %s", e, exc_info=True)
+        results['errors'].append(str(e))
+        _write_results(output_path, results)
+        return 1
+
+    _write_results(output_path, results)
+    return 0
+
+
 def main() -> int:
     parser = _StrictArgumentParser(description='Run Transfermarkt Bronze scraper')
     parser.add_argument(
@@ -472,6 +567,11 @@ def main() -> int:
         )
     if entity == ENTITY_TRANSFERS:
         return _run_transfers(
+            leagues, args.season, args.limit, args.output,
+            args.dry_run, args.force_replace,
+        )
+    if entity == ENTITY_COACHES:
+        return _run_coaches(
             leagues, args.season, args.limit, args.output,
             args.dry_run, args.force_replace,
         )

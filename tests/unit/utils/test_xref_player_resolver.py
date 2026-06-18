@@ -69,6 +69,44 @@ class TestNormalizeName:
 
 
 # ---------------------------------------------------------------------------
+# _is_youth_team — FotMob U21/U23 youth-squad detection (issue #563)
+# ---------------------------------------------------------------------------
+class TestIsYouthTeam:
+    @pytest.mark.parametrize(
+        "team",
+        [
+            "Arsenal U21",
+            "Manchester City U23",
+            "Chelsea U19",
+            "West Ham United U21",
+            "Sunderland U21",
+            "Tottenham Under-21",
+            "Crystal Palace U-21",
+        ],
+    )
+    def test_youth_squads_match(self, team):
+        assert xpr._is_youth_team(team) is True
+
+    @pytest.mark.parametrize(
+        "team",
+        [
+            "Arsenal",
+            "Brighton & Hove Albion",
+            "AFC Bournemouth",
+            "Wolverhampton Wanderers",
+            "Manchester City",
+            "Luton Town",  # contains 'u' but no youth marker — must NOT match
+        ],
+    )
+    def test_senior_teams_do_not_match(self, team):
+        assert xpr._is_youth_team(team) is False
+
+    def test_none_and_empty_are_not_youth(self):
+        assert xpr._is_youth_team(None) is False
+        assert xpr._is_youth_team("") is False
+
+
+# ---------------------------------------------------------------------------
 # canonical_team_for_resolver — uses real medallion_config YAML
 # (cheap: configs/medallion/team_aliases.yaml lives in the repo and the
 # loader hits the disk once via lru_cache; no monkey-patching needed).

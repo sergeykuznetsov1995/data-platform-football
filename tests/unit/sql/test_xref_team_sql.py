@@ -76,12 +76,12 @@ class TestXrefTeamTemplateStructure:
         )
 
     def test_all_8_sources_unioned(self):
-        """All 10 documented sources appear as quoted source labels."""
+        """All 11 documented sources appear as quoted source labels."""
         sql = _read_template().lower()
         expected_sources = {
             "fbref", "understat", "whoscored", "sofascore",
             "fotmob", "matchhistory", "clubelo", "espn",
-            "transfermarkt", "capology",
+            "transfermarkt", "capology", "sofifa",
         }
         for src in expected_sources:
             assert f"'{src}'" in sql, (
@@ -151,7 +151,7 @@ class TestXrefTeamTemplateStructure:
         """Each source has a short orphan prefix (fb_/us_/ws_/.../tm_/cap_)."""
         sql = _read_template()
         for prefix in ["fb_", "us_", "ws_", "ss_", "fm_", "mh_", "ce_", "es_",
-                       "tm_", "cap_"]:
+                       "tm_", "cap_", "sf_"]:
             assert f"'{prefix}'" in sql, (
                 f"orphan prefix {prefix!r} missing — orphans must be uniquely "
                 "namespaced per-source so canonical_id collisions are impossible"

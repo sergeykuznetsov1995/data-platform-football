@@ -216,6 +216,9 @@ class TestDrissionPageBypass:
         assert '--renderer-process-limit=1' not in captured
         assert '--disable-software-rasterizer' not in captured
         assert not any(a.startswith('--user-agent') for a in captured)
+        # Software WebGL enabled via ANGLE — real context under Xvfb, not null (#574).
+        assert '--use-gl=angle' in captured
+        assert '--use-angle=swiftshader' in captured
 
     def test_drissionpage_session_factory(self):
         """Test drissionpage_session factory function."""

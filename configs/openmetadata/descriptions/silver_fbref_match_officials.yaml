@@ -1,0 +1,31 @@
+# =============================================================================
+# OpenMetadata description: iceberg.silver.fbref_match_officials
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.silver.fbref_match_officials
+  description: |
+    Судейская бригада на матч (issue #613), unpivot из wide Bronze в long.
+    Гранулярность: один row на (match_id, role). role ∈ {referee, ar1, ar2,
+    fourth_official, var}. Отсутствующая роль = отсутствующий row (не NULL-имя).
+    Spine для gold.fct_match_officials.
+  tags:
+    - Tier.Silver
+    - Domain.Football
+    - PII.Low
+columns:
+  - name: match_id
+    description: FBref ID матча.
+  - name: league
+    description: Лига (partition key).
+  - name: season
+    description: Сезон — slug ('2526'), partition key.
+  - name: role
+    description: Роль судьи (referee / ar1 / ar2 / fourth_official / var).
+  - name: official_name
+    description: Имя судьи в этой роли.
+    tags:
+      - PII.Low
+  - name: _bronze_ingested_at
+    description: Timestamp ingest'а исходной Bronze-строки (lineage).
+  - name: _silver_created_at
+    description: Timestamp материализации Silver-строки (добавляется runner'ом).

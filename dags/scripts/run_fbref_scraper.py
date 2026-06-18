@@ -121,6 +121,13 @@ def _get_traffic_diagnostics(scraper) -> dict:
         'real_proxy_bytes_by_resource_type': bytes_by_rtype,
         'real_proxy_mb_by_resource_type': mb_by_rtype,
         'real_proxy_requests_by_resource_type': reqs_by_rtype,
+        # Issue #616 — per-URL audit: top consumers + first/third-party split.
+        'top_traffic_urls': list(stats.get('top_traffic_urls', []) or []),
+        'real_bytes_by_url': dict(stats.get('real_bytes_by_url', {}) or {}),
+        'first_party_bytes': int(stats.get('first_party_bytes', 0) or 0),
+        'third_party_bytes': int(stats.get('third_party_bytes', 0) or 0),
+        'first_party_mb': stats.get('first_party_mb', 0.0),
+        'third_party_mb': stats.get('third_party_mb', 0.0),
         'cf_challenge_attempts': int(stats.get('cf_challenge_attempts', 0) or 0),
         'cf_challenges_passed': int(stats.get('cf_challenges_passed', 0) or 0),
         'cf_challenges_failed': int(stats.get('cf_challenges_failed', 0) or 0),
@@ -180,6 +187,10 @@ def _write_traffic_summary(
         'real_proxy_requests_by_resource_type': traffic.get(
             'real_proxy_requests_by_resource_type', {}
         ),
+        # Issue #616 — per-URL audit for the blockable-XHR/SCRIPT analysis.
+        'top_traffic_urls': traffic.get('top_traffic_urls', []),
+        'first_party_mb': traffic.get('first_party_mb', 0.0),
+        'third_party_mb': traffic.get('third_party_mb', 0.0),
         'cf_challenge_attempts': traffic.get('cf_challenge_attempts', 0),
         'cf_challenges_passed': traffic.get('cf_challenges_passed', 0),
         'cf_challenges_failed': traffic.get('cf_challenges_failed', 0),

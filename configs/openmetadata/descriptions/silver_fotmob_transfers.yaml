@@ -1,0 +1,53 @@
+# =============================================================================
+# OpenMetadata description: iceberg.silver.fotmob_transfers
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.silver.fotmob_transfers
+  description: |
+    Conform-only трансферные события из FotMob (issue #600), event-grain. Один
+    row per (player_id, from_club_id, to_club_id, transfer_date, league, season).
+    Источник: bronze.fotmob_transfers (endpoint /api/data/transfers по лиге).
+    `fee_text` (100% NULL) не переносится. player/club identity не резолвится —
+    храним numeric ids + имена клубов, резолв в Gold (charter §5). Дедуп:
+    ROW_NUMBER per PK ORDER BY _ingested_at DESC.
+  tags:
+    - Tier.Silver
+    - Domain.Football
+    - PII.Low
+columns:
+  - name: player_id
+    description: FotMob player_id (bigint). Raw passthrough — резолв canonical в Gold.
+  - name: player_name
+    description: Имя игрока.
+    tags:
+      - PII.Low
+  - name: transfer_date
+    description: Дата трансфера (DATE; TRY_CAST из bronze varchar ISO).
+  - name: from_club_id
+    description: FotMob id клуба-отправителя (bigint; NULL для free agents).
+  - name: from_club_full_name
+    description: Полное название клуба-отправителя.
+  - name: to_club_id
+    description: FotMob id клуба-получателя (bigint).
+  - name: to_club_full_name
+    description: Полное название клуба-получателя.
+  - name: position_label
+    description: Человекочитаемая метка позиции игрока.
+  - name: position_key
+    description: Машинный ключ позиции игрока.
+  - name: fee_eur
+    description: Сумма трансфера в евро (CAST bronze fee_value double → BIGINT; NULL ~63% для free/нераскрытых).
+  - name: market_value
+    description: Рыночная стоимость игрока (сырой varchar — формат вариативен, парсинг отложен в Gold).
+  - name: on_loan
+    description: Аренда (true) или постоянный переход (false) — нативный loan-флаг FotMob.
+  - name: transfer_type_key
+    description: Машинный ключ типа трансфера ('transfer'/'loan').
+  - name: transfer_type_text
+    description: Человекочитаемый тип трансфера.
+  - name: _bronze_ingested_at
+    description: Timestamp Bronze ingest'а (для freshness).
+  - name: league
+    description: Лига (partition key).
+  - name: season
+    description: Сезон — slug ('2526'), из bronze season bigint через LPAD(MOD(season,100))||LPAD(MOD(season+1,100)).

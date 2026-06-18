@@ -1,22 +1,25 @@
 -- =============================================================================
 -- Silver: matchhistory_match_odds
 -- =============================================================================
--- DESIGN: bridge MatchHistory (football-data.co.uk) → gold.dim_match через
---   (date, home_canonical, away_canonical), а НЕ через silver.xref_match.
---   1) MatchHistory.hometeam/awayteam canonicalize via inline team_aliases CTE
---      (источник истины — `configs/medallion/team_aliases.yaml`; список
---      сгенерирован через `medallion_config.get_team_alias_pairs(
---      source='matchhistory', competition='ENG-Premier League')` и
---      синхронизирован вручную — при добавлении нового APL-club YAML
---      обновлять оба места).
---   2) INNER JOIN gold.dim_match по (CAST(date AS DATE), league, season,
---      home_team_id=home_canonical, away_team_id=away_canonical).
---   3) НЕ модифицирует silver.xref_match (Phase B расширение deferred —
---      bridging здесь живёт инлайн как в R3 spec для E4 итерации).
+-- DESIGN: bridge MatchHistory (football-data.co.uk) → canonical FBref match_id
+--   через silver-слой `silver.xref_match` (НЕ через gold.dim_match — #477).
+--   football-data has NO native match_id, so we synthesise the SAME
+--   'mh_<xxhash64>' source_id that xref_match assigns to MatchHistory rows
+--   (keyed on date|home|away|league|season) and join the Silver xref table.
+--   1) Канонизация имён команд живёт ВЫШЕ по потоку — в xref_match (через
+--      xref_team, единый источник `configs/medallion/team_aliases.yaml`).
+--      Здесь больше НЕТ инлайнового team_aliases CTE (устранён дубль #477).
+--   2) INNER JOIN silver.xref_match WHERE confidence='date_team_match' —
+--      сохраняет прежнюю семантику: только сбриджованные матчи выживают,
+--      orphans отбрасываются. PK xref_match = (source, source_id, season),
+--      поэтому season-предикат обязателен (от fan-out).
+--   3) Зависимость silver→silver (xref_match строится в E1, раньше E4):
+--      инверсия слоёв silver→gold устранена, тихая потеря матчей при
+--      устаревшем dim_match невозможна.
 --   4) Tall format: UNION ALL по bookmaker × market даёт ~12 row/match
 --      (6 bookies × 1x2 open + 4 closing + 4 AH + 4 OU вариаций), что
 --      раскладывается без PIVOT, удобно для downstream Brier-backtests.
--- Reference: roadmap E4.3 + `configs/medallion/team_aliases.yaml`.
+-- Reference: issue #477 + silver/xref_match.sql (mh_resolved).
 --
 -- =============================================================================
 -- Bronze schema reference  (source: iceberg.bronze.matchhistory_results)
@@ -91,113 +94,10 @@
 --   partitioning by (league, season). This file MUST stay a pure SELECT.
 -- =============================================================================
 
-WITH team_aliases AS (
-    -- ====== APL-only team alias pool ======
-    -- Source of truth: configs/medallion/team_aliases.yaml + verified against
-    -- live `gold.dim_match` (smoke 2026-05-08).
-    --
-    -- KEY INSIGHT: canonical_id RHS = ACTUAL `gold.dim_match.home_team_id`
-    -- value as observed in production, NOT slug-of-YAML-canonical_name. Это
-    -- потому что `gold.dim_match.home_team_id` строится через
-    -- `entity_xref` SQL (`LOWER(REGEXP_REPLACE(fbref.home, ...))`) и FBref
-    -- сам неконсистентен между сезонами (e.g. `Newcastle Utd` 2017-18 vs
-    -- `Newcastle United` 2018+; `Wolverhampton Wanderers` early seasons vs
-    -- `Wolves` later). Прямое сравнение со sliced `home_team_id`
-    -- distinct-values из dim_match даёт правильный target slug.
-    --
-    -- Examples of YAML drift (memory note `feedback_xref_team_canonical_drift`):
-    --   YAML canonical_name      → slug-of-yaml             dim_match.home_team_id
-    --   `AFC Bournemouth`        → `afc_bournemouth`        `bournemouth`
-    --   `Brighton and Hove Albion` → `brighton_and_hove_...`  `brighton`
-    --   `Wolverhampton Wanderers` → `wolverhampton_wanderers` `wolves`
-    --   `Manchester United`      → `manchester_united`      `manchester_utd`
-    --   `West Ham United`        → `west_ham_united`        `west_ham_united` (matches!)
-    --
-    -- Phase B work для xref_team будет приводить FBref slugs к Wikipedia
-    -- canonical_name; до тех пор bridge должен использовать наблюдаемые
-    -- dim_match slug-и напрямую.
-    --
-    -- Generation: distinct-slug query against live dim_match seasons 2021+
-    --   SELECT DISTINCT home_team_id FROM iceberg.gold.dim_match WHERE season >= 2021
-    -- The 2021+ filter matches Bronze.matchhistory_games season range (5
-    -- seasons: 2021-2025). Older clubs (Stoke/Cardiff/Hull/etc.) included
-    -- for forward-compat когда Bronze расширится до 2016+.
-    --
-    -- При расширении: ОБА файла (matchhistory_match_odds,
-    -- sofascore_player_ratings) обновлять параллельно. Sunderland +
-    -- Huddersfield + Middlesbrough добавлены для исторических CSVs.
-    SELECT raw_name, canonical_id
-    FROM (VALUES
-        ('AFC Bournemouth', 'bournemouth'),
-        ('Arsenal', 'arsenal'),
-        ('Aston Villa', 'aston_villa'),
-        ('Bournemouth', 'bournemouth'),
-        ('Brentford', 'brentford'),
-        ('Brighton', 'brighton'),
-        ('Brighton & Hove Albion', 'brighton'),
-        ('Brighton and Hove Albion', 'brighton'),
-        ('Burnley', 'burnley'),
-        ('Cardiff', 'cardiff_city'),
-        ('Cardiff City', 'cardiff_city'),
-        ('Chelsea', 'chelsea'),
-        ('Crystal Palace', 'crystal_palace'),
-        ('Everton', 'everton'),
-        ('Fulham', 'fulham'),
-        ('Huddersfield', 'huddersfield_town'),
-        ('Hull', 'hull_city'),
-        ('Hull City', 'hull_city'),
-        ('Ipswich', 'ipswich_town'),
-        ('Ipswich Town', 'ipswich_town'),
-        ('Leeds', 'leeds_united'),
-        ('Leeds United', 'leeds_united'),
-        ('Leicester', 'leicester_city'),
-        ('Leicester City', 'leicester_city'),
-        ('Liverpool', 'liverpool'),
-        ('Luton', 'luton_town'),
-        ('Luton Town', 'luton_town'),
-        ('Man City', 'manchester_city'),
-        ('Man United', 'manchester_utd'),
-        ('Man Utd', 'manchester_utd'),
-        ('Manchester City', 'manchester_city'),
-        ('Manchester United', 'manchester_utd'),
-        ('Manchester Utd', 'manchester_utd'),
-        ('Middlesbrough', 'middlesbrough'),
-        ('Newcastle', 'newcastle_united'),
-        ('Newcastle United', 'newcastle_united'),
-        ('Newcastle Utd', 'newcastle_united'),
-        ('Norwich', 'norwich_city'),
-        ('Norwich City', 'norwich_city'),
-        ('Nott''m Forest', 'nottingham_forest'),
-        ('Nottingham', 'nottingham_forest'),
-        ('Nottingham Forest', 'nottingham_forest'),
-        ('Sheff Utd', 'sheffield_united'),
-        ('Sheffield United', 'sheffield_united'),
-        ('Sheffield Utd', 'sheffield_united'),
-        ('Southampton', 'southampton'),
-        ('Spurs', 'tottenham_hotspur'),
-        ('Stoke', 'stoke_city'),
-        ('Stoke City', 'stoke_city'),
-        ('Sunderland', 'sunderland'),
-        ('Swansea', 'swansea_city'),
-        ('Swansea City', 'swansea_city'),
-        ('Tottenham', 'tottenham_hotspur'),
-        ('Tottenham Hotspur', 'tottenham_hotspur'),
-        ('Watford', 'watford'),
-        ('West Brom', 'west_brom'),
-        ('West Bromwich', 'west_brom'),
-        ('West Bromwich Albion', 'west_brom'),
-        ('West Ham', 'west_ham_united'),
-        ('West Ham United', 'west_ham_united'),
-        ('Wolverhampton', 'wolves'),
-        ('Wolverhampton Wanderers', 'wolves'),
-        ('Wolves', 'wolves')
-    ) AS t(raw_name, canonical_id)
-),
-
 -- =============================================================================
 -- mh: raw bronze, basic typed projection (one row per MatchHistory match)
 -- =============================================================================
-mh AS (
+WITH mh AS (
     SELECT
         -- NOTE: bronze.matchhistory_results has MIXED column naming —
         -- COLUMN_MAPPING (scrapers/matchhistory/scraper.py) renames ~50 cols
@@ -211,8 +111,12 @@ mh AS (
         home_team                      AS hometeam,
         away_team                      AS awayteam,
         league,
+        -- Raw year-start bigint (e.g. 2024) — fed verbatim into the
+        -- 'mh_<xxhash64>' source_id below so it matches xref_match.mh_resolved
+        -- (which hashes the raw bronze season, not the slug).
+        season                         AS season_year,
         -- season → slug ('2425'); matchhistory bronze stores year-start bigint.
-        -- Converted here so the gold.dim_match bridge JOIN (slug after #404) and
+        -- Converted here so the xref_match bridge JOIN (slug after #404) and
         -- the final projection are both slug.
         LPAD(CAST(MOD(season,     100) AS varchar), 2, '0')
             || LPAD(CAST(MOD(season + 1, 100) AS varchar), 2, '0') AS season,
@@ -279,25 +183,35 @@ mh AS (
 ),
 
 -- =============================================================================
--- mh_canonicalized: lookup home/away canonical_id via team_aliases
+-- mh_keyed: synthesise the same 'mh_<xxhash64>' source_id that
+-- silver.xref_match assigns to MatchHistory rows, so we can bridge to the
+-- canonical FBref match_id through the Silver xref table (no Gold dependency).
+-- !!! KEEP IN SYNC with xref_match.sql `mh_resolved` source_id formula. !!!
+-- Inputs are identical to xref_match: parsed ISO date | lower(home) |
+-- lower(away) | league | raw year-start season.
 -- =============================================================================
-mh_canonicalized AS (
+mh_keyed AS (
     SELECT
         mh.*,
-        ha.canonical_id AS home_canonical,
-        aa.canonical_id AS away_canonical
+        'mh_' || LOWER(TO_HEX(XXHASH64(TO_UTF8(
+            CAST(mh.match_date AS varchar)
+            || '|' || COALESCE(LOWER(CAST(mh.hometeam AS varchar)), '')
+            || '|' || COALESCE(LOWER(CAST(mh.awayteam AS varchar)), '')
+            || '|' || mh.league
+            || '|' || CAST(mh.season_year AS varchar)
+        )))) AS mh_source_id
     FROM mh
-    LEFT JOIN team_aliases ha ON ha.raw_name = mh.hometeam
-    LEFT JOIN team_aliases aa ON aa.raw_name = mh.awayteam
 ),
 
 -- =============================================================================
--- mh_bridged: INNER JOIN to gold.dim_match — only matches that bridge survive.
--- season+league predicate enforced (memory note: feedback_xref_join_season_predicate).
+-- mh_bridged: bridge to canonical FBref match_id via silver.xref_match.
+-- INNER JOIN + confidence='date_team_match' preserves the original behaviour
+-- (only matches that bridge to FBref survive; orphans dropped). xref_match PK
+-- is (source, source_id, season) → season predicate prevents fan-out.
 -- =============================================================================
 mh_bridged AS (
     SELECT
-        dm.match_id        AS match_id_canonical,
+        xm.canonical_id    AS match_id_canonical,
         c.match_date,
         c.league,
         c.season,
@@ -336,14 +250,13 @@ mh_bridged AS (
         c.pc_o25,    c.pc_u25,
         c.maxc_o25,  c.maxc_u25,
         c.avgc_o25,  c.avgc_u25
-    FROM mh_canonicalized c
-    INNER JOIN iceberg.gold.dim_match dm
-        -- #433: dim_match renamed date -> match_date (star dims, #425)
-        ON dm.match_date   = c.match_date
-       AND dm.league       = c.league
-       AND dm.season       = c.season
-       AND dm.home_team_id = c.home_canonical
-       AND dm.away_team_id = c.away_canonical
+    FROM mh_keyed c
+    INNER JOIN iceberg.silver.xref_match xm
+        ON  xm.source     = 'matchhistory'
+        AND xm.source_id  = c.mh_source_id
+        AND xm.league     = c.league
+        AND xm.season     = c.season
+        AND xm.confidence = 'date_team_match'
 ),
 
 -- =============================================================================

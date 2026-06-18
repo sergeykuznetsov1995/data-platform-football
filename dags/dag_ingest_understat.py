@@ -119,6 +119,10 @@ with DAG(
     catchup=False,
     tags=DAG_TAGS.get('understat', ['scraping', 'understat', 'bronze']),
     max_active_runs=1,
+    # issue #530: cap run wall-clock so a stuck/abandoned run auto-fails instead
+    # of lingering forever. Scrape execution_timeout is 2h (DEFAULT_ARGS) — 3h
+    # leaves headroom for the scrape + downstream validation tasks.
+    dagrun_timeout=timedelta(hours=3),
     params={
         'leagues': LEAGUES,
         'season': CURRENT_SEASON,

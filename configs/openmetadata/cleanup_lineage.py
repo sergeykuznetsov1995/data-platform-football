@@ -50,8 +50,9 @@ SERVICE = "trino_iceberg"
 # edges (manual FK edges from apply_descriptions.py, or CTAS edges from
 # om-lineage-trino) linger after the drop because markDeletedTables only
 # soft-deletes. Source: the 19 deleted dags/sql/gold/*.sql in PR #490.
-# entity_xref is intentionally EXCLUDED — it is still a live table (its drop is
-# the separate followup #146), so it is never soft-deleted and not stale here.
+# entity_xref is intentionally EXCLUDED — it was never part of epic #478. Its own
+# drop is the separate followup #211 (entity_xref is already absent from live gold
+# per the Trino inventory in #475), so it is not one of these #478 soft-deletes.
 DROPPED_TABLES = [
     "fct_match",
     "fct_match_train",

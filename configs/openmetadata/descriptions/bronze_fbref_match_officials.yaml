@@ -1,0 +1,49 @@
+# =============================================================================
+# OpenMetadata description: iceberg.bronze.fbref_match_officials
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.bronze.fbref_match_officials
+  description: |
+    Судейская бригада на матч из блока scorebox_meta «Officials» FBref
+    (issue #613). Гранулярность: один wide-row на матч. Источник: FBref scrape
+    (dag_ingest_fbref, режим combined_match_data). Главный судья (referee)
+    дублирует fbref_schedule.referee; новое здесь — ar1/ar2/fourth_official/var.
+  tags:
+    - Tier.Bronze
+    - Domain.Football
+    - PII.Low
+columns:
+  - name: match_id
+    description: FBref ID матча.
+  - name: referee
+    description: Главный судья.
+    tags:
+      - PII.Low
+  - name: ar1
+    description: Первый ассистент (AR1).
+    tags:
+      - PII.Low
+  - name: ar2
+    description: Второй ассистент (AR2).
+    tags:
+      - PII.Low
+  - name: fourth_official
+    description: Четвёртый судья (4th). NULL если не указан.
+    tags:
+      - PII.Low
+  - name: var
+    description: Видеоассистент (VAR). NULL если на матче не было VAR.
+    tags:
+      - PII.Low
+  - name: league
+    description: Лига (partition key).
+  - name: season
+    description: Сезон — год начала (bigint, напр. 2025 = сезон 2025/26).
+  - name: _source
+    description: Источник данных Bronze (всегда 'fbref').
+  - name: _ingested_at
+    description: Timestamp ingest'а строки в Bronze.
+  - name: _entity_type
+    description: Внутренняя метка типа сущности ingest-конвейера FBref.
+  - name: _batch_id
+    description: ID batch'а загрузки (трассировка и идемпотентность ingest).

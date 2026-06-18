@@ -205,6 +205,81 @@ class FlareSolverrSoFIFAReader(sd.SoFIFA):
         # Selenium not needed — FlareSolverr owns the browser.
         return None
 
+    def read_versions(self, max_age=1) -> "pd.DataFrame":
+        """Override ``soccerdata.SoFIFA.read_versions`` for the post-EA-FC DOM.
+
+        Upstream (``soccerdata/sofifa.py``) parses two nested dropdowns at
+        ``//header/section/p/select[1|2]/option``. The EA SPORTS FC rebrand
+        moved the pickers to ``<select id="select-version">`` (one option per
+        FIFA/FC edition, ``value`` carries ``r=<latest update id>``) and
+        ``<select id="select-roster">`` (one option per update of the *current*
+        edition, ``value`` carries ``r=<update id>``, text = release date). The
+        old xpath now matches 0 options → empty ``versions`` →
+        ``set_index('version_id')`` raises ``KeyError`` in the constructor,
+        killing all SoFIFA scraping (#650, silent-fail sibling of #647).
+
+        One homepage request (matches the wrapper contract): one row per
+        edition with its latest update id, enriched with the release date from
+        the roster picker where the current edition's ids overlap.
+        """
+        SO_FIFA_API = "https://sofifa.com"
+        filepath = self.data_dir / "index.html"
+        reader = self.get(SO_FIFA_API, filepath, max_age)
+        page = reader.read()
+        if isinstance(page, bytes):
+            page = page.decode("utf-8", "replace")
+        return self._parse_versions(page)
+
+    @staticmethod
+    def _parse_versions(page: str) -> "pd.DataFrame":
+        """Parse the SoFIFA homepage edition/roster pickers into a versions frame.
+
+        Pure (no I/O) so it is unit-testable against a saved page. Returns a
+        DataFrame indexed by ``version_id`` with ``fifa_edition`` + ``update``
+        columns — same contract as upstream, so ``versions='latest'`` (which
+        takes ``.tail(1)`` = max id) and downstream readers keep working.
+        """
+        import pandas as pd
+        from lxml import html as _html
+
+        tree = _html.fromstring(page)
+
+        def _rid(value: Optional[str]) -> Optional[int]:
+            m = re.search(r"[rR]=(\d+)", value or "")
+            return int(m.group(1)) if m else None
+
+        # roster picker → {update id: release date} for the current edition only
+        update_date: dict[int, str] = {}
+        for opt in tree.xpath('//select[@id="select-roster"]/option'):
+            rid = _rid(opt.get("value"))
+            if rid is not None:
+                update_date[rid] = opt.text_content().strip()
+
+        # version picker → one row per edition (value = its latest update id)
+        rows: List[dict] = []
+        for opt in tree.xpath('//select[@id="select-version"]/option'):
+            rid = _rid(opt.get("value"))
+            if rid is None:
+                continue
+            edition = opt.text_content().strip()
+            rows.append({
+                "version_id": rid,
+                "fifa_edition": edition,
+                "update": update_date.get(rid, edition),
+            })
+
+        if not rows:
+            raise ValueError(
+                "SoFIFA read_versions: 0 editions parsed from "
+                "select#select-version — DOM drifted again (#650)"
+            )
+        return (
+            pd.DataFrame(rows)
+            .drop_duplicates("version_id")
+            .set_index("version_id")
+            .sort_index()
+        )
+
     def read_player_ratings(self, team=None, player=None) -> "pd.DataFrame":
         """Override soccerdata.SoFIFA.read_player_ratings to inject ``player_id``.
 
@@ -304,6 +379,88 @@ class FlareSolverrSoFIFAReader(sd.SoFIFA):
             pd.DataFrame(ratings)
             .pipe(standardize_colnames)
             .set_index(["player"])
+            .sort_index()
+        )
+
+    def read_team_ratings(self) -> "pd.DataFrame":
+        """Override soccerdata.SoFIFA.read_team_ratings to drop dead FC-26 cols.
+
+        Upstream requests 23 rating columns via ``&showCol[]=`` and parses each
+        from a ``<td data-col='...'>`` cell. EA removed the team-tactics block
+        (build-up / chance-creation / defence sliders), international &
+        domestic prestige, and the ``whole_team_average_age`` label from the
+        FC 26 team page, so sofifa.com no longer renders those 15 cells —
+        soccerdata silently emits them as all-NULL (issue #601; confirmed
+        live 2026-06-16 via audit_bronze_columns.py). We keep only the 8 columns
+        that still exist on the page and request exactly those, so the URL is
+        honest and Bronze stops carrying 15 dead columns.
+
+        Source mirror: ``soccerdata/sofifa.py:287-373`` (same loop, trimmed dict).
+        """
+        import pandas as pd
+        from itertools import product
+        from lxml import html as _html
+        from soccerdata._common import safe_xpath_text
+        from soccerdata._config import TEAMNAME_REPLACEMENTS
+
+        SO_FIFA_API = "https://sofifa.com"
+
+        # Only the rating cells sofifa.com still renders on the FC 26 team page.
+        ratings = {
+            "oa": "overall",
+            "at": "attack",
+            "md": "midfield",
+            "df": "defence",
+            "tb": "transfer_budget",
+            "cw": "club_worth",
+            "ps": "players",
+            "sa": "starting_xi_average_age",
+        }
+
+        urlmask = SO_FIFA_API + "/teams?lg={}&r={}&set=true"
+        for rating_id in ratings:
+            urlmask += f"&showCol[]={rating_id}"
+        filemask = "teams_{}_{}.html"
+
+        leagues = self.read_leagues()
+
+        teams: list[dict] = []
+        iterator = list(product(leagues.iterrows(), self.versions.iterrows()))
+        for i, ((lkey, league), (version_id, version)) in enumerate(iterator):
+            logger.info(
+                "[%s/%s] Retrieving team ratings for %s in %s edition",
+                i + 1, len(iterator), lkey, version["update"],
+            )
+            league_id = league["league_id"]
+            filepath = self.data_dir / filemask.format(league_id, version_id)
+            url = urlmask.format(league_id, version_id)
+            reader = self.get(url, filepath)
+
+            # Explicit utf-8 (mirrors read_player_ratings): the team page carries
+            # € money cells (transfer_budget / club_worth); without the hint lxml
+            # falls back to latin-1 and mojibakes the euro sign.
+            tree = _html.parse(reader, parser=_html.HTMLParser(encoding="utf8"))
+            for node in tree.xpath("//table/tbody/tr"):
+                teams.append(
+                    {
+                        "league": lkey,
+                        "team": node.xpath(".//td[2]//a")[0].text,
+                        **{
+                            desc: safe_xpath_text(
+                                node,
+                                f".//td[@data-col='{key}']//text()",
+                                warn=f"Could not parse {desc} ({key}) stat.",
+                            )
+                            for key, desc in ratings.items()
+                        },
+                        **version.to_dict(),
+                    }
+                )
+
+        return (
+            pd.DataFrame(teams)
+            .replace({"team": TEAMNAME_REPLACEMENTS})
+            .set_index(["league", "team"])
             .sort_index()
         )
 

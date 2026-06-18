@@ -122,8 +122,8 @@ class TestE3DagImports:
                 f"Top-level task {tid!r} missing. Tasks: {sorted(task_ids)}"
             )
 
-        # TaskGroup-prefixed silver_e3
-        for suffix in ("whoscored_events_spadl", "espn_lineup"):
+        # TaskGroup-prefixed silver_e3 (sofascore_shots added in #602)
+        for suffix in ("whoscored_events_spadl", "espn_lineup", "sofascore_shots"):
             present = any(
                 tid == f"silver_e3.{suffix}" or tid.endswith(f".{suffix}")
                 for tid in task_ids
@@ -132,8 +132,8 @@ class TestE3DagImports:
                 f"silver_e3 task {suffix!r} missing. Tasks: {sorted(task_ids)}"
             )
 
-        # TaskGroup-prefixed gold_e3
-        for suffix in ("fct_event", "fct_shot", "fct_lineup"):
+        # TaskGroup-prefixed gold_e3 (fct_shot_audit added in #602)
+        for suffix in ("fct_event", "fct_shot", "fct_shot_audit", "fct_lineup"):
             present = any(
                 tid == f"gold_e3.{suffix}" or tid.endswith(f".{suffix}")
                 for tid in task_ids
@@ -155,8 +155,10 @@ class TestE3DagImports:
         for tid in (
             "silver_e3.whoscored_events_spadl",
             "silver_e3.espn_lineup",
+            "silver_e3.sofascore_shots",
             "gold_e3.fct_event",
             "gold_e3.fct_shot",
+            "gold_e3.fct_shot_audit",
             "gold_e3.fct_lineup",
         ):
             assert tid in task_ids, (
@@ -238,11 +240,19 @@ class TestE3DagImports:
             "execution. Got upstream={!r}".format(sorted(upstream_ids))
         )
 
+        # #602: fct_shot_audit is wired between fct_shot and fct_lineup.
+        fct_shot_audit = dag.get_task("gold_e3.fct_shot_audit")
+        upstream_ids = {t.task_id for t in fct_shot_audit.upstream_list}
+        assert "gold_e3.fct_shot" in upstream_ids, (
+            "gold_e3.fct_shot_audit must depend on gold_e3.fct_shot (it reads it "
+            f"as the Understat spine). Got upstream={sorted(upstream_ids)}"
+        )
+
         fct_lineup = dag.get_task("gold_e3.fct_lineup")
         upstream_ids = {t.task_id for t in fct_lineup.upstream_list}
-        assert "gold_e3.fct_shot" in upstream_ids, (
-            "gold_e3.fct_lineup must depend on gold_e3.fct_shot. "
-            f"Got upstream={sorted(upstream_ids)}"
+        assert "gold_e3.fct_shot_audit" in upstream_ids, (
+            "gold_e3.fct_lineup must depend on gold_e3.fct_shot_audit "
+            f"(sequential chain after #602 insert). Got upstream={sorted(upstream_ids)}"
         )
 
     def test_e3_dag_tags_include_medallion_e3(self, dag_bag):

@@ -40,6 +40,7 @@ from utils.default_args import DEFAULT_ARGS
 PLAYERS_RESULT_PATH = '/tmp/transfermarkt_players_result.json'
 MV_HISTORY_RESULT_PATH = '/tmp/transfermarkt_mv_history_result.json'
 TRANSFERS_RESULT_PATH = '/tmp/transfermarkt_transfers_result.json'
+COACHES_RESULT_PATH = '/tmp/transfermarkt_coaches_result.json'
 
 # Smoke caps for the first weeks of the DAG — APL has ~600 player rows per
 # season, so PLAYERS_DAILY_LIMIT = None means full crawl. Dependent entities
@@ -277,6 +278,33 @@ exit $rc
         append_env=True,
     )
 
+    # issue #434: head coaches → bronze.transfermarkt_coaches. Independent of
+    # scrape_players (discovers via club staff pages, not the players table).
+    scrape_coaches_task = BashOperator(
+        task_id='scrape_coaches',
+        bash_command=f"""
+cd /opt/airflow && \\
+rm -f {COACHES_RESULT_PATH} && \\
+python dags/scripts/run_transfermarkt_scraper.py \\
+    --entity coaches \\
+    --league "{league}" \\
+    --season {season} \\
+    --output {COACHES_RESULT_PATH}
+rc=$?
+if [ $rc -eq 2 ]; then
+    echo "TM_FALLBACK exit-code 2 (coaches) — propagating as soft success."
+    exit 0
+fi
+exit $rc
+""",
+        env={
+            'PYTHONPATH': '/opt/airflow:/opt/airflow/dags',
+            'PATH': '/usr/local/bin:/usr/bin:/bin:/home/airflow/.local/bin',
+            'HOME': '/home/airflow',
+        },
+        append_env=True,
+    )
+
     validate_task = PythonOperator(
         task_id='validate_data',
         python_callable=validate_data,
@@ -327,6 +355,12 @@ exit $rc
                 'bronze.transfermarkt_transfers',
                 min_rows=50, where=where, severity='WARNING',
             ),
+            # coaches (issue #434): ~20 head coaches/season. WARNING — a
+            # TM_FALLBACK soft exit upstream would otherwise fail it.
+            CHECK.row_count(
+                'bronze.transfermarkt_coaches',
+                min_rows=15, where=where, severity='WARNING',
+            ),
         ]
         report = run_checks(checks, raise_on_error=True)
         import logging
@@ -356,4 +390,5 @@ exit $rc
         scrape_players_task,
         scrape_mv_history_task,
         scrape_transfers_task,
+        scrape_coaches_task,
     ] >> validate_task >> validate_bronze_quality_task >> trigger_silver_task

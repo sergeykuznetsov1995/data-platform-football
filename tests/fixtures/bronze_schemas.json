@@ -4,6 +4,59 @@
     "fbref_shot_events"
   ],
   "tables": {
+    "bronze.capology_contract_extensions": {
+      "columns": {
+        "_batch_id": "varchar",
+        "_entity_type": "varchar",
+        "_ingested_at": "timestamp(6)",
+        "_source": "varchar",
+        "adjusted_total_gross_eur": "bigint",
+        "adjusted_total_gross_gbp": "bigint",
+        "adjusted_total_gross_usd": "bigint",
+        "adjusted_total_net_eur": "bigint",
+        "adjusted_total_net_gbp": "bigint",
+        "adjusted_total_net_usd": "bigint",
+        "annual_gross_eur": "bigint",
+        "annual_gross_gbp": "bigint",
+        "annual_gross_usd": "bigint",
+        "annual_net_eur": "bigint",
+        "annual_net_gbp": "bigint",
+        "annual_net_usd": "bigint",
+        "bonus_gross_eur": "bigint",
+        "bonus_gross_gbp": "bigint",
+        "bonus_gross_usd": "bigint",
+        "bonus_net_eur": "bigint",
+        "bonus_net_gbp": "bigint",
+        "bonus_net_usd": "bigint",
+        "club_name": "varchar",
+        "club_slug": "varchar",
+        "contract_total_gross_eur": "bigint",
+        "contract_total_gross_gbp": "bigint",
+        "contract_total_gross_usd": "bigint",
+        "contract_total_net_eur": "bigint",
+        "contract_total_net_gbp": "bigint",
+        "contract_total_net_usd": "bigint",
+        "expiration": "varchar",
+        "league": "varchar",
+        "player_name": "varchar",
+        "player_slug": "varchar",
+        "season": "varchar",
+        "signed": "varchar",
+        "total_gross_eur": "bigint",
+        "total_gross_gbp": "bigint",
+        "total_gross_usd": "bigint",
+        "total_net_eur": "bigint",
+        "total_net_gbp": "bigint",
+        "total_net_usd": "bigint",
+        "weekly_gross_eur": "bigint",
+        "weekly_gross_gbp": "bigint",
+        "weekly_gross_usd": "bigint",
+        "weekly_net_eur": "bigint",
+        "weekly_net_gbp": "bigint",
+        "weekly_net_usd": "bigint",
+        "years": "bigint"
+      }
+    },
     "bronze.capology_player_salaries": {
       "columns": {
         "_batch_id": "varchar",
@@ -54,6 +107,77 @@
         "weekly_net_eur": "double",
         "weekly_net_gbp": "bigint",
         "weekly_net_usd": "double"
+      }
+    },
+    "bronze.capology_team_payrolls": {
+      "columns": {
+        "_batch_id": "varchar",
+        "_entity_type": "varchar",
+        "_ingested_at": "timestamp(6)",
+        "_source": "varchar",
+        "adjusted_total_gross_eur": "bigint",
+        "adjusted_total_gross_gbp": "bigint",
+        "adjusted_total_gross_usd": "bigint",
+        "adjusted_total_net_eur": "bigint",
+        "adjusted_total_net_gbp": "bigint",
+        "adjusted_total_net_usd": "bigint",
+        "annual_gross_eur": "bigint",
+        "annual_gross_gbp": "bigint",
+        "annual_gross_usd": "bigint",
+        "annual_net_eur": "bigint",
+        "annual_net_gbp": "bigint",
+        "annual_net_usd": "bigint",
+        "bonus_gross_eur": "bigint",
+        "bonus_gross_gbp": "bigint",
+        "bonus_gross_usd": "bigint",
+        "bonus_net_eur": "bigint",
+        "bonus_net_gbp": "bigint",
+        "bonus_net_usd": "bigint",
+        "club_code": "varchar",
+        "club_name": "varchar",
+        "club_slug": "varchar",
+        "league": "varchar",
+        "season": "varchar",
+        "total_gross_eur": "bigint",
+        "total_gross_gbp": "bigint",
+        "total_gross_usd": "bigint",
+        "total_net_eur": "bigint",
+        "total_net_gbp": "bigint",
+        "total_net_usd": "bigint",
+        "weekly_gross_eur": "bigint",
+        "weekly_gross_gbp": "bigint",
+        "weekly_gross_usd": "bigint",
+        "weekly_net_eur": "bigint",
+        "weekly_net_gbp": "bigint",
+        "weekly_net_usd": "bigint"
+      }
+    },
+    "bronze.capology_transfer_window": {
+      "columns": {
+        "_batch_id": "varchar",
+        "_entity_type": "varchar",
+        "_ingested_at": "timestamp(6)",
+        "_source": "varchar",
+        "adjbalance_eur": "bigint",
+        "adjbalance_gbp": "bigint",
+        "adjbalance_usd": "bigint",
+        "age": "double",
+        "balance_eur": "bigint",
+        "balance_gbp": "bigint",
+        "balance_usd": "bigint",
+        "club_code": "varchar",
+        "club_name": "varchar",
+        "club_slug": "varchar",
+        "expense_eur": "bigint",
+        "expense_gbp": "bigint",
+        "expense_usd": "bigint",
+        "foreign": "bigint",
+        "income_eur": "bigint",
+        "income_gbp": "bigint",
+        "income_usd": "bigint",
+        "league": "varchar",
+        "players": "bigint",
+        "season": "varchar"
       }
     },
     "bronze.clubelo_ratings": {
@@ -227,6 +351,22 @@
         "season": "bigint",
         "side": "varchar",
         "team": "varchar"
+      }
+    },
+    "bronze.fbref_match_officials": {
+      "columns": {
+        "_batch_id": "varchar",
+        "_entity_type": "varchar",
+        "_ingested_at": "timestamp(6)",
+        "_source": "varchar",
+        "ar1": "varchar",
+        "ar2": "varchar",
+        "fourth_official": "varchar",
+        "league": "varchar",
+        "match_id": "varchar",
+        "referee": "varchar",
+        "season": "bigint",
+        "var": "varchar"
       }
     },
     "bronze.fbref_match_player_stats": {
@@ -680,6 +820,50 @@
         "season": "bigint"
       }
     },
+    "bronze.fotmob_team_leaderboards": {
+      "columns": {
+        "_batch_id": "varchar",
+        "_entity_type": "varchar",
+        "_ingested_at": "timestamp(6)",
+        "_source": "varchar",
+        "country_code": "varchar",
+        "league": "varchar",
+        "matches_played": "bigint",
+        "minutes_played": "bigint",
+        "participant_name": "varchar",
+        "rank": "bigint",
+        "season": "bigint",
+        "stat_category_group": "varchar",
+        "stat_category_header": "varchar",
+        "stat_name": "varchar",
+        "stat_value": "double",
+        "stat_value_count": "bigint",
+        "sub_stat_value": "double",
+        "team_color": "varchar",
+        "team_id": "bigint",
+        "team_name": "varchar"
+      }
+    },
+    "bronze.fotmob_team_profile": {
+      "columns": {
+        "_batch_id": "varchar",
+        "_entity_type": "varchar",
+        "_ingested_at": "timestamp(6)",
+        "_source": "varchar",
+        "country": "varchar",
+        "history_seasons_count": "varchar",
+        "last_match": "varchar",
+        "league": "varchar",
+        "next_match": "varchar",
+        "overview_season": "varchar",
+        "overview_table_position": "varchar",
+        "season": "bigint",
+        "short_name": "varchar",
+        "team_id": "bigint",
+        "team_name": "varchar",
+        "venue": "varchar"
+      }
+    },
     "bronze.fotmob_team_squad": {
       "columns": {
         "_batch_id": "varchar",
@@ -710,6 +894,55 @@
         "team_id": "bigint",
         "team_name": "varchar",
         "yellow_cards": "double"
+      }
+    },
+    "bronze.fotmob_team_stats": {
+      "columns": {
+        "_batch_id": "varchar",
+        "_entity_type": "varchar",
+        "_ingested_at": "timestamp(6)",
+        "_source": "varchar",
+        "draws": "bigint",
+        "form": "varchar",
+        "goal_diff": "bigint",
+        "goals_against": "bigint",
+        "goals_for": "bigint",
+        "league": "varchar",
+        "losses": "bigint",
+        "played": "bigint",
+        "points": "bigint",
+        "position": "bigint",
+        "season": "bigint",
+        "team_id": "bigint",
+        "team_name": "varchar",
+        "wins": "bigint"
+      }
+    },
+    "bronze.fotmob_transfers": {
+      "columns": {
+        "_batch_id": "varchar",
+        "_entity_type": "varchar",
+        "_ingested_at": "timestamp(6)",
+        "_source": "varchar",
+        "fee_text": "varchar",
+        "fee_value": "double",
+        "from_club": "varchar",
+        "from_club_full_name": "varchar",
+        "from_club_id": "bigint",
+        "league": "varchar",
+        "market_value": "varchar",
+        "on_loan": "boolean",
+        "player_id": "bigint",
+        "player_name": "varchar",
+        "position_key": "varchar",
+        "position_label": "varchar",
+        "season": "bigint",
+        "to_club": "varchar",
+        "to_club_full_name": "varchar",
+        "to_club_id": "bigint",
+        "transfer_date": "varchar",
+        "transfer_type_key": "varchar",
+        "transfer_type_text": "varchar"
       }
     },
     "bronze.matchhistory_results": {
@@ -889,7 +1122,7 @@
         "whca": "double",
         "whcd": "double",
         "whch": "double",
-        "\u00ef\u00bb\u00bfdiv": "varchar"
+        "ï»¿div": "varchar"
       }
     },
     "bronze.sofascore_event_player_stats": {
@@ -991,6 +1224,35 @@
         "was_fouled": "double",
         "won_contest": "double",
         "won_tackle": "double"
+      }
+    },
+    "bronze.sofascore_event_shotmap": {
+      "columns": {
+        "_batch_id": "varchar",
+        "_entity_type": "varchar",
+        "_ingested_at": "timestamp(6)",
+        "_source": "varchar",
+        "added_time": "double",
+        "body_part": "varchar",
+        "goal_type": "varchar",
+        "goal_x": "double",
+        "goal_y": "double",
+        "is_home": "boolean",
+        "league": "varchar",
+        "match_id": "varchar",
+        "minute": "bigint",
+        "outcome": "varchar",
+        "period": "varchar",
+        "player_id": "varchar",
+        "season": "varchar",
+        "shot_id": "varchar",
+        "shot_type": "varchar",
+        "situation": "varchar",
+        "team_id": "varchar",
+        "x": "double",
+        "xg": "double",
+        "xgot": "double",
+        "y": "double"
       }
     },
     "bronze.sofascore_match_stats": {
@@ -1201,6 +1463,16 @@
         "week": "bigint"
       }
     },
+    "bronze.sofifa_leagues": {
+      "columns": {
+        "_batch_id": "varchar",
+        "_entity_type": "varchar",
+        "_ingested_at": "timestamp(6)",
+        "_source": "varchar",
+        "league": "varchar",
+        "league_id": "bigint"
+      }
+    },
     "bronze.sofifa_player_ratings": {
       "columns": {
         "_batch_id": "varchar",
@@ -1277,6 +1549,69 @@
         "player_id": "bigint",
         "team": "varchar",
         "update": "varchar"
+      }
+    },
+    "bronze.sofifa_team_ratings": {
+      "columns": {
+        "_batch_id": "varchar",
+        "_entity_type": "varchar",
+        "_ingested_at": "timestamp(6)",
+        "_source": "varchar",
+        "attack": "varchar",
+        "club_worth": "varchar",
+        "defence": "varchar",
+        "fifa_edition": "varchar",
+        "league": "varchar",
+        "midfield": "varchar",
+        "overall": "varchar",
+        "players": "varchar",
+        "starting_xi_average_age": "varchar",
+        "team": "varchar",
+        "team_id": "bigint",
+        "transfer_budget": "varchar",
+        "update": "varchar"
+      }
+    },
+    "bronze.sofifa_teams": {
+      "columns": {
+        "_batch_id": "varchar",
+        "_entity_type": "varchar",
+        "_ingested_at": "timestamp(6)",
+        "_source": "varchar",
+        "fifa_edition": "varchar",
+        "league": "varchar",
+        "team": "varchar",
+        "team_id": "bigint",
+        "update": "varchar"
+      }
+    },
+    "bronze.sofifa_versions": {
+      "columns": {
+        "_batch_id": "varchar",
+        "_entity_type": "varchar",
+        "_ingested_at": "timestamp(6)",
+        "_source": "varchar",
+        "fifa_edition": "varchar",
+        "update": "varchar",
+        "version_id": "bigint"
+      }
+    },
+    "bronze.transfermarkt_coaches": {
+      "columns": {
+        "_batch_id": "varchar",
+        "_entity_type": "varchar",
+        "_ingested_at": "timestamp(6)",
+        "_source": "varchar",
+        "coach_id": "varchar",
+        "coach_slug": "varchar",
+        "current_club_id": "varchar",
+        "current_club_name": "varchar",
+        "dob": "date",
+        "league": "varchar",
+        "name": "varchar",
+        "nationality": "varchar",
+        "role": "varchar",
+        "season": "varchar"
       }
     },
     "bronze.transfermarkt_market_value_history": {

@@ -3,8 +3,9 @@
 -- =============================================================================
 --
 -- Snapshot зарплат игроков из Capology: weekly_gross_gbp, status, флаги
--- active/loan/verified. Один row per (player_slug, league, season) — snapshot
--- grain совпадает с Bronze после фильтра currency='GBP' + (active OR loan).
+-- active/loan/verified. Один row per (player_slug, league, season) для ТЕКУЩЕГО
+-- сезона — snapshot grain совпадает с Bronze после фильтра currency='GBP' +
+-- (active OR loan) + season = MAX(season) (issue #632).
 -- `canonical_id` подтягивается через silver.xref_player (source='capology',
 -- non-orphan) и материализуется как сторонний ключ для Gold-витрин уровня
 -- fct_player_season_stats (привязка salary→canonical player).
@@ -30,6 +31,14 @@
 --   * Filter currency = 'GBP' — партиция всегда 'GBP' (одна строка/игрок);
 --     EUR/USD теперь переносятся как weekly/annual_gross_{eur,usd} колонки
 --     (issue #195), фильтр оставлен как guard против будущих партиций.
+--   * Scope = ТОЛЬКО текущий сезон (issue #632): bronze_dedup фильтрует
+--     season = (SELECT MAX(season) ... WHERE currency='GBP'). Bronze копит
+--     исторические партиции (backfill), но Silver-снепшот — current-season
+--     only: xref-резолвер и DQ-пороги (canonical_coverage 0.80,
+--     no_nulls weekly_gross_gbp) калиброваны под активный APL-сезон. Без
+--     фильтра CTAS промоутил все ~13 сезонов → 7121 строк, coverage 67%,
+--     600 undisclosed-NULL. MAX(season) трекает сезон без Python-параметра
+--     (slug 'YYNN' сортируется лексикографически: '2526' > '2425').
 --   * canonical_id остаётся NULLable: Capology orphan rate ≈ 9.5% live APL
 --     2025/26 (50/526, post issue #84 HTML-decode + Bynoe-Gittens alias). Это
 --     STRUCTURAL FLOOR: Capology = roster snapshot (контракты), FBref =
@@ -55,6 +64,15 @@ WITH bronze_dedup AS (
         WHERE player_slug IS NOT NULL
           AND currency = 'GBP'
           AND (active = true OR loan = true)
+          -- issue #632: scope to current season only. Bronze копит исторические
+          -- партиции (backfill); без этого фильтра CTAS промоутил все ~13 APL
+          -- сезонов (7121 строк) → coverage 67%, 600 undisclosed-NULL. MAX(season)
+          -- = активный сезон (недельный ingest пишет только CURRENT_SEASON).
+          AND b.season = (
+              SELECT MAX(season)
+              FROM iceberg.bronze.capology_player_salaries
+              WHERE currency = 'GBP'
+          )
     )
     WHERE rn = 1
 ),

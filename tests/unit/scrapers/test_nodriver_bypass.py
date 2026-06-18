@@ -1165,6 +1165,40 @@ class TestBrowserFlagsRemoved:
         # --disable-extensions should NOT be in the arguments
         assert '--disable-extensions' not in added_args
 
+    @pytest.mark.asyncio
+    @pytest.mark.unit
+    async def test_software_webgl_flags_present(self):
+        """--use-gl=angle + --use-angle=swiftshader MUST be set.
+
+        With the mesa software-GL stack in the image, these make Chromium 120
+        expose a real WebGL context under Xvfb (renderer Mesa/llvmpipe) instead
+        of a null context, which Cloudflare reads as a bot marker. (#574)
+        """
+        from scrapers.base.browser.nodriver_bypass import NodriverBypass
+
+        bypass = NodriverBypass(headless=True)
+
+        added_args = []
+        mock_config = MagicMock()
+        mock_config.add_argument = lambda arg: added_args.append(arg)
+        mock_config.add_extension = MagicMock()
+
+        mock_browser = MagicMock()
+        mock_page = MagicMock()
+        mock_page.send = AsyncMock()
+        mock_browser.get = AsyncMock(return_value=mock_page)
+
+        mock_uc = MagicMock()
+        mock_uc.Config.return_value = mock_config
+        mock_uc.start = AsyncMock(return_value=mock_browser)
+
+        with patch('scrapers.base.browser.nodriver_bypass._import_nodriver', return_value=mock_uc), \
+             patch('shutil.which', return_value='/usr/bin/google-chrome'):
+            await bypass.start()
+
+        assert '--use-gl=angle' in added_args
+        assert '--use-angle=swiftshader' in added_args
+
 
 class TestCleanupChromeProcesses:
     """Tests for _cleanup_chrome_processes pkill invocation (issue #458)."""

@@ -31,14 +31,15 @@ PROJECT_ROOT = Path(__file__).resolve().parents[3]
 SQL_PATH = PROJECT_ROOT / "dags" / "sql" / "gold" / "dim_venue.sql.j2"
 
 # Hermetic alias VALUES (raw_name, canonical_id, canonical_name, city, country,
-# league). Two Brentford spellings share one canonical_id → merge test.
+# league, capacity). Two Brentford spellings share one canonical_id → merge test.
+# capacity (issue #434) is the 7th, UNQUOTED column (NULL allowed).
 _TEST_ALIASES = """\
-    ('Etihad Stadium', 'venue_etihad', 'Etihad Stadium', 'Manchester', 'England', 'ENG-Premier League'),
-    ('Anfield', 'venue_anfield', 'Anfield', 'Liverpool', 'England', 'ENG-Premier League'),
-    ('Old Trafford', 'venue_old_trafford', 'Old Trafford', 'Manchester', 'England', 'ENG-Premier League'),
-    ('Goodison Park', 'venue_goodison', 'Goodison Park', 'Liverpool', 'England', 'ENG-Premier League'),
-    ('Gtech Community Stadium', 'venue_brentford', 'Gtech Community Stadium', 'London', 'England', 'ENG-Premier League'),
-    ('Brentford Community Stadium', 'venue_brentford', 'Gtech Community Stadium', 'London', 'England', 'ENG-Premier League')"""
+    ('Etihad Stadium', 'venue_etihad', 'Etihad Stadium', 'Manchester', 'England', 'ENG-Premier League', 53400),
+    ('Anfield', 'venue_anfield', 'Anfield', 'Liverpool', 'England', 'ENG-Premier League', 61276),
+    ('Old Trafford', 'venue_old_trafford', 'Old Trafford', 'Manchester', 'England', 'ENG-Premier League', 74310),
+    ('Goodison Park', 'venue_goodison', 'Goodison Park', 'Liverpool', 'England', 'ENG-Premier League', NULL),
+    ('Gtech Community Stadium', 'venue_brentford', 'Gtech Community Stadium', 'London', 'England', 'ENG-Premier League', 17250),
+    ('Brentford Community Stadium', 'venue_brentford', 'Gtech Community Stadium', 'London', 'England', 'ENG-Premier League', 17250)"""
 
 _PLACEHOLDER_RE = re.compile(
     r"^[ \t]*\{\{\s*venue_aliases_values_sql\s*\}\}[ \t]*$", re.MULTILINE
@@ -160,8 +161,8 @@ class TestDimVenueLogic:
         assert etihad[0]["venue_name"] == "Etihad Stadium"
         assert etihad[0]["city"] == "Manchester"
         assert etihad[0]["country"] == "England"
-        # capacity has no source yet (issue #425) — NULL placeholder.
-        assert etihad[0]["capacity"] is None
+        # capacity (issue #434) flows from the curated alias VALUES.
+        assert etihad[0]["capacity"] == 53400
 
     def test_two_spellings_merge_into_one_venue(self, gold_rows):
         """Core #145: 'Gtech Community Stadium' (FBref) and 'Brentford Community
@@ -171,6 +172,18 @@ class TestDimVenueLogic:
         row = brentford[0]
         assert row["venue_name"] == "Gtech Community Stadium"
         assert row["venue_source"] == "curated"
+        # capacity survives the merge (both spellings carry 17250).
+        assert row["capacity"] == 17250
+
+    def test_orphan_and_uncurated_capacity_null(self, gold_rows):
+        """Orphan venues (no alias) and curated venues without a capacity
+        value both surface NULL capacity (issue #434)."""
+        orphan = [r for r in gold_rows if r["venue_source"] == "orphan"]
+        assert orphan, "fixture must produce an orphan venue"
+        assert all(r["capacity"] is None for r in orphan), orphan
+        goodison = _by_id(gold_rows, "venue_goodison")  # curated, capacity NULL
+        assert len(goodison) == 1
+        assert goodison[0]["capacity"] is None
 
     def test_mixed_case_folds(self, gold_rows):
         """'Old Trafford' / 'OLD TRAFFORD' fold to one curated venue."""

@@ -19,6 +19,7 @@
 #       fotmob:      [list, optional]
 #       espn:        [list, optional]
 #       whoscored:   [list, optional]
+#       sofifa:      [list, optional]    # FIFA/EA FC team names — full, ≈ canonical (#601)
 #     competition_scope: [list of competition.id where this alias-set is valid]
 #
 # Why canonical_id (issue #141)?

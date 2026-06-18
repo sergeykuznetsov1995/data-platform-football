@@ -6,7 +6,9 @@ silver.xref_player (source='fbref', canonical 'fb_<id>'), attributes
 COALESCE'd from FotMob / SofaScore / Transfermarkt / SoFIFA. Since #435 it is
 a Jinja template (.sql.j2) rendered by dim_loaders: the nationality COALESCE
 maps the FBref FIFA code to a full name via the {{ country_map_values_sql }}
-placeholder (configs/medallion/country_codes.yaml).
+placeholder and canonicalizes source spellings via the
+{{ nationality_alias_values_sql }} placeholder (#585) — both from
+configs/medallion/country_codes.yaml.
 
 These are regex sanity checks over the template text + a render pass through
 dim_loaders against a fixture country_codes.yaml; the executable nationality
@@ -149,6 +151,31 @@ class TestDimPlayerStarStructure:
             "REGEXP_EXTRACT(fb.nation, ...) fallback"
         )
 
+    def test_nationality_alias_canonicalization(self):
+        """#585: the winning source spelling is canonicalized via the
+        nationality_alias CTE/JOIN — na.canonical_name leads the nationality
+        COALESCE (before the source columns), and the alias map is filled from
+        the {{ nationality_alias_values_sql }} placeholder."""
+        raw = _read_sql()
+        assert "{{ nationality_alias_values_sql }}" in raw, (
+            "nationality_alias VALUES placeholder missing from the template"
+        )
+        sql = _strip_comments(raw)
+        assert re.search(
+            r"\bnationality_alias\s+AS\s*\(", sql, re.IGNORECASE
+        ), "missing nationality_alias CTE (#585 variant->canonical map)"
+        # na.canonical_name is the FIRST term of the nationality COALESCE.
+        assert re.search(
+            r"COALESCE\(\s*na\.canonical_name\s*,\s*fm\.nationality",
+            sql, re.IGNORECASE,
+        ), "nationality COALESCE must lead with na.canonical_name (#585)"
+        # The alias JOIN keys on the COALESCE of the four source spellings.
+        assert re.search(
+            r"LEFT\s+JOIN\s+nationality_alias\s+na\s+ON\s+na\.variant\s*=\s*"
+            r"COALESCE\(\s*fm\.nationality",
+            sql, re.IGNORECASE,
+        ), "nationality_alias JOIN must key on COALESCE(source nationalities)"
+
 
 class TestDimPlayerRender:
     """render_dim_player_sql fills the placeholder from country_codes.yaml."""
@@ -180,5 +207,31 @@ class TestDimPlayerRender:
         # The standalone placeholder must be gone from the VALUES block.
         assert not re.search(
             r"^\s*\{\{\s*country_map_values_sql\s*\}\}\s*$",
+            rendered, flags=re.MULTILINE,
+        )
+
+    def test_renders_nationality_alias_tuples(self, monkeypatch, tmp_path):
+        """#585: render_dim_player_sql fills the nationality_alias placeholder
+        with (variant, canonical) tuples from the `aliases` field."""
+        pytest.importorskip("yaml")
+        (tmp_path / "country_codes.yaml").write_text(textwrap.dedent("""\
+            countries:
+              - {code: USA, name: United States, aliases: [USA]}
+            """))
+
+        from utils import medallion_config
+        monkeypatch.setattr(medallion_config, "CONFIG_DIR", tmp_path)
+        medallion_config.reset_cache()
+
+        from utils import dim_loaders
+        out_path = tmp_path / "dim_player_rendered.sql"
+        dim_loaders.render_dim_player_sql(str(SQL_PATH), str(out_path))
+        rendered = out_path.read_text()
+        medallion_config.reset_cache()
+
+        assert "('USA', 'United States')" in rendered
+        # The standalone alias placeholder must be gone from the VALUES block.
+        assert not re.search(
+            r"^\s*\{\{\s*nationality_alias_values_sql\s*\}\}\s*$",
             rendered, flags=re.MULTILINE,
         )

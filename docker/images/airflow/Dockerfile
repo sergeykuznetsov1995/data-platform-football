@@ -13,9 +13,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Chrome/Chromium for Selenium (headless browser automation)
 # Xvfb for virtual display (bypasses Cloudflare headless detection)
+# Mesa software-GL (libgl1-mesa-dri/glx/egl): gives Chromium 120 a real (non-null)
+# WebGL context under Xvfb — Cloudflare reads a null WebGL context as a bot marker (#574)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     chromium \
     chromium-driver \
+    libgl1-mesa-dri \
+    libgl1-mesa-glx \
+    libegl1-mesa \
     fonts-liberation \
     libasound2 \
     libatk-bridge2.0-0 \
@@ -31,6 +36,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 ENV CHROME_BIN=/usr/bin/chromium
 ENV CHROMEDRIVER_PATH=/usr/bin/chromedriver
+# Force software GL (llvmpipe) — no GPU in the container; avoids failed HW-GL probes (#574)
+ENV LIBGL_ALWAYS_SOFTWARE=1
 
 # Set Java environment
 ENV JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64

@@ -239,7 +239,24 @@ seq AS (
         *,
         ROW_NUMBER() OVER (
             PARTITION BY game_id
-            ORDER BY period, minute, second, expanded_minute, type, x, y
+            -- #477: period is VARCHAR; a raw `ORDER BY period` sorts it
+            -- lexically, which is only accidentally correct for FirstHalf/
+            -- SecondHalf. Cup matches with extra time / shootouts (e.g.
+            -- 'PenaltyShootout' < 'SecondHalf' lexically) would get a
+            -- non-monotonic event_seq. Map period → explicit chronological
+            -- ordinal so the sequence always follows real match time.
+            ORDER BY
+                CASE period
+                    WHEN 'PreMatch'                THEN 0
+                    WHEN 'FirstHalf'               THEN 1
+                    WHEN 'SecondHalf'              THEN 2
+                    WHEN 'FirstPeriodOfExtraTime'  THEN 3
+                    WHEN 'SecondPeriodOfExtraTime' THEN 4
+                    WHEN 'PenaltyShootout'         THEN 5
+                    WHEN 'PostGame'                THEN 6
+                    ELSE 99
+                END,
+                minute, second, expanded_minute, type, x, y
         ) AS event_seq
     FROM dedup
 )

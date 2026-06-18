@@ -45,17 +45,18 @@ class TestCheckCounts:
     """Per-table check counts must match the contract documented in e3_dq.py."""
 
     def test_silver_e3_total_check_count(self):
-        """Silver builders compose 6 sub-builders = 31 checks total.
+        """Silver builders compose 7 sub-builders = 34 checks total.
 
         whoscored_events_spadl (9) + whoscored_team_match (T6.3) +
         understat_team_match (T6.2) + espn_lineup (4) + sofascore_player_profile +
-        sofascore_team_match (T6.4). The 3 *_team_season rollups migrated to Gold
-        in #370 (their PK-uniqueness DQ now lives in validate_gold_quality). Bump
-        this number whenever a builder is added to ``build_silver_e3_checks``.
+        sofascore_team_match (T6.4) + sofascore_shots (3, #602). The 3
+        *_team_season rollups migrated to Gold in #370 (their PK-uniqueness DQ
+        now lives in validate_gold_quality). Bump this number whenever a builder
+        is added to ``build_silver_e3_checks``.
         """
         checks = e3_dq.build_silver_e3_checks()
-        assert len(checks) == 31, (
-            f"Silver E3 expected 31 checks, got {len(checks)}: "
+        assert len(checks) == 34, (
+            f"Silver E3 expected 34 checks, got {len(checks)}: "
             f"{[c.name for c in checks]}"
         )
 
@@ -82,7 +83,8 @@ class TestCheckCounts:
         assert len(espn) == 4
 
     def test_gold_e3_total_check_count(self):
-        """Gold builders total: fct_event (11) + fct_shot (7) + fct_lineup (10) = 28.
+        """Gold builders total: fct_event (11) + fct_shot (7) + fct_shot_audit (4,
+        #602) + fct_lineup (10) = 32.
 
         fct_event grew by 1 check in Task 2.1 — Phase B re-enabled the
         ``ref_integrity[fct_event.match_id_canonical -> silver.xref_match]``
@@ -90,10 +92,11 @@ class TestCheckCounts:
         fct_lineup grew by 1 in issue #242 — added the canon-spine
         ``ref_integrity[fct_lineup.fbref->dim_match]`` alt-hex guard — and by 1
         more in #439 (``is_captain_coverage_present``).
+        fct_shot_audit (#602): no_duplicates + no_nulls + coverage + xg_divergence.
         """
         checks = e3_dq.build_gold_e3_checks()
-        assert len(checks) == 28, (
-            f"Gold E3 expected 28 checks, got {len(checks)}: "
+        assert len(checks) == 32, (
+            f"Gold E3 expected 32 checks, got {len(checks)}: "
             f"{[c.name for c in checks]}"
         )
 
@@ -133,13 +136,13 @@ class TestCheckCounts:
         assert len(fct_lineup) == 10
 
     def test_build_all_e3_checks_total(self):
-        """31 silver + 28 gold = 59 total E3 standard DQ checks.
+        """34 silver + 32 gold = 66 total E3 standard DQ checks.
 
-        Bump when either ``build_silver_e3_checks`` (31) or
-        ``build_gold_e3_checks`` (28) gains a builder.
+        Bump when either ``build_silver_e3_checks`` (34) or
+        ``build_gold_e3_checks`` (32) gains a builder.
         """
         all_checks = e3_dq.build_all_e3_checks()
-        assert len(all_checks) == 59
+        assert len(all_checks) == 66
 
 
 # ===========================================================================
@@ -531,6 +534,62 @@ class TestOrphanAndCoverageGuards:
         unk = next(c for c in checks if c.name == "spadl_coverage_unknown_rate")
         assert unk.severity == "ERROR"
         assert unk.params["max_rows"] == 40_000
+
+
+# ===========================================================================
+# #602 — sofascore_shots (silver) + fct_shot_audit (gold)
+# ===========================================================================
+
+
+class TestSofaScoreShotsAndAudit:
+    """issue #602: SofaScore shotmap projection + cross-source shot audit."""
+
+    def test_sofascore_shots_check_count(self):
+        """silver.sofascore_shots: no_duplicates + no_nulls + row_count = 3."""
+        checks = [
+            c for c in e3_dq.build_silver_e3_checks()
+            if c.params.get("table") == "iceberg.silver.sofascore_shots"
+        ]
+        assert len(checks) == 3, [c.name for c in checks]
+
+    def test_sofascore_shots_pk_is_error(self):
+        checks = e3_dq.build_silver_e3_checks()
+        pk = next(
+            c for c in checks
+            if c.kind == "no_duplicates"
+            and c.params.get("table") == "iceberg.silver.sofascore_shots"
+        )
+        assert pk.severity == "ERROR"
+        assert pk.params["pk"] == ["match_id", "shot_id"]
+
+    def test_fct_shot_audit_check_count(self):
+        """gold.fct_shot_audit: no_duplicates + no_nulls + coverage + divergence = 4."""
+        checks = [
+            c for c in e3_dq.build_gold_e3_checks()
+            if c.params.get("table") == "iceberg.gold.fct_shot_audit"
+        ]
+        assert len(checks) == 4, [c.name for c in checks]
+
+    def test_fct_shot_audit_pk_is_error(self):
+        checks = e3_dq.build_gold_e3_checks()
+        pk = next(
+            c for c in checks
+            if c.kind == "no_duplicates"
+            and c.params.get("table") == "iceberg.gold.fct_shot_audit"
+        )
+        assert pk.severity == "ERROR"
+        assert pk.params["pk"] == ["match_id", "team_id"]
+
+    def test_fct_shot_audit_coverage_and_divergence_are_warning(self):
+        """Audit is a DQ table, not a gate — coverage + xg divergence are WARNING."""
+        checks = e3_dq.build_gold_e3_checks()
+        by_name = {c.name: c for c in checks}
+        for name in (
+            "fct_shot_audit_sofascore_coverage",
+            "fct_shot_audit_xg_divergence",
+        ):
+            assert name in by_name, f"missing audit check {name!r}"
+            assert by_name[name].severity == "WARNING"
 
 
 # ===========================================================================

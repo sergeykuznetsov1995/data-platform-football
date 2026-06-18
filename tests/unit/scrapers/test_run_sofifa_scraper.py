@@ -44,6 +44,8 @@ def _build_scraper(*, errors: bool):
     runner skips ``save_to_iceberg()`` but does NOT append to errors.
     """
     scraper = MagicMock()
+    # #616: runner calls scraper.get_traffic_stats(); stub so json.dump stays serializable.
+    scraper.get_traffic_stats.return_value = {}
 
     for method in _READ_METHODS:
         if errors:
@@ -130,6 +132,7 @@ class TestRunSofifaExitCode:
         """One step fails (player_ratings), the rest are empty — exit MUST
         be 1 (any non-empty ``errors`` ⇒ failure)."""
         scraper = MagicMock()
+        scraper.get_traffic_stats.return_value = {}
         empty = pd.DataFrame()
         for method in _READ_METHODS:
             getattr(scraper, method).return_value = empty

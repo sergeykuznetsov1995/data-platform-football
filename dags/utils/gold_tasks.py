@@ -858,6 +858,39 @@ def validate_gold_quality() -> Dict[str, Any]:
                           min_val=0, max_val=20, severity='WARNING'),
 
         # ============================================================
+        # issue #613: fct_match_officials — per-match officiating crew.
+        # ============================================================
+        # ----- PK + critical attrs — ERROR -----
+        CHECK.no_duplicates('gold.fct_match_officials', pk=['match_id', 'role']),
+        # referee_id intentionally NOT here — pure assistants / VAR-only
+        # officials are single-source (FBref) and legitimately carry a NULL
+        # canonical id (#613 design).
+        CHECK.no_nulls('gold.fct_match_officials',
+                       cols=['match_id', 'role', 'official_name']),
+        # role dictionary — zero-tolerance row_count guards the 5-value enum
+        # (same idiom as fct_match_timeline.event_type; no accepted_values
+        # primitive in the CHECK registry).
+        CHECK.row_count(
+            'gold.fct_match_officials',
+            min_rows=0, max_rows=0,
+            where=("role NOT IN ('referee', 'ar1', 'ar2', "
+                   "'fourth_official', 'var')"),
+            severity='ERROR',
+            name='accepted_values[gold.fct_match_officials.role]',
+        ),
+        # match_id must point at a real Gold match — ERROR.
+        CHECK.ref_integrity('gold.fct_match_officials', 'gold.dim_match', 'match_id'),
+        # ----- Soft FK — WARNING -----
+        # referee_id → dim_referee is best-effort. ref_integrity ignores NULL
+        # child keys, so the denominator is only the populated ids (main referee
+        # + assistants who also referee elsewhere) — those are xref canonicals
+        # and thus always in dim_referee, so the rate is ~0. Rate-mode WARNING
+        # catches a regression without firing on the by-design NULLs.
+        CHECK.ref_integrity('gold.fct_match_officials', 'gold.dim_referee',
+                            'referee_id', warn_rate=0.05, error_rate=0.15,
+                            severity='WARNING'),
+
+        # ============================================================
         # E2: master-data dims (dim_venue / dim_referee / dim_competition /
         # dim_season) + fct_standings (ex-dim_standings, renamed #428).
         # Mirrors the existing dim_match / dim_team / dim_player block but
@@ -1020,20 +1053,22 @@ def validate_gold_quality() -> Dict[str, Any]:
                             warn_rate=0.90, severity='WARNING'),
 
         # ============================================================
-        # #425: dim_match — soft FK to every star dim. Team FKs are ERROR
-        # (xref_team coverage is complete by construction); referee / venue /
-        # manager FKs are WARNING for the first runs — LEFT JOIN coverage
-        # gaps leave NULLs (ignored by ref_integrity) but a non-NULL id MUST
-        # exist in its dim. Tightening to ERROR is a tracked followup.
+        # #425: dim_match — soft FK to every star dim. Team / referee / venue
+        # FKs are ERROR — the id comes from the same xref / alias table the dim
+        # is built from, so a non-NULL id is orphan-free by construction (LEFT
+        # JOIN coverage gaps surface as NULLs, which ref_integrity ignores).
+        # #436 tightened referee / venue from WARNING after stable green runs.
+        # manager FKs stay WARNING until the FBref scorebox parser
+        # (bronze.fbref_match_managers, ~80% coverage) improves — then ERROR.
         # ============================================================
         CHECK.ref_integrity('gold.dim_match', 'gold.dim_team',
                             'home_team_id', parent_key='team_id'),
         CHECK.ref_integrity('gold.dim_match', 'gold.dim_team',
                             'away_team_id', parent_key='team_id'),
         CHECK.ref_integrity('gold.dim_match', 'gold.dim_referee',
-                            'referee_id', severity='WARNING'),
+                            'referee_id'),
         CHECK.ref_integrity('gold.dim_match', 'gold.dim_venue',
-                            'venue_id', severity='WARNING'),
+                            'venue_id'),
         CHECK.ref_integrity('gold.dim_match', 'gold.dim_manager',
                             'home_manager_id', parent_key='manager_id',
                             severity='WARNING'),
@@ -1248,11 +1283,13 @@ def validate_gold_quality() -> Dict[str, Any]:
             'player_id_canonical',
             parent_key='player_id',
         ),
-        # 8 audit-diff coverage WARNING-only (error_threshold=0). Audit —
+        # 6 audit-diff coverage WARNING-only (error_threshold=0). Audit —
         # observability, не gate; ERROR ломал бы DAG при нормальных
-        # cross-source расхождениях (например FotMob не отдаёт нулевой
-        # penalty_won → diff=NULL для большинства rows). NULL diff
-        # засчитывается как "not measured" (passed) — не ошибка.
+        # cross-source расхождениях (mid-season transfer, разные методики
+        # подсчёта). NULL diff засчитывается как "not measured" (passed).
+        # #564: goals/assists/cards FotMob теперь COALESCE→0 в SQL (NULL=«не
+        # было события»); penalties_won/conceded diff-колонки удалены (FotMob
+        # не отдаёт сезонные пенальти — были полностью NULL).
         CHECK.coverage('gold.fct_player_season_stats_audit',
                        condition='ABS(matches_diff_fotmob) <= 1 OR matches_diff_fotmob IS NULL',
                        warn_threshold=0.95, error_threshold=0.0,
@@ -1277,14 +1314,6 @@ def validate_gold_quality() -> Dict[str, Any]:
                        condition='ABS(red_cards_diff_fotmob) <= 1 OR red_cards_diff_fotmob IS NULL',
                        warn_threshold=0.95, error_threshold=0.0,
                        name='audit_diff[fct_player_season_stats_audit.red_cards]'),
-        CHECK.coverage('gold.fct_player_season_stats_audit',
-                       condition='ABS(penalties_won_diff_fotmob) <= 1 OR penalties_won_diff_fotmob IS NULL',
-                       warn_threshold=0.95, error_threshold=0.0,
-                       name='audit_diff[fct_player_season_stats_audit.penalties_won]'),
-        CHECK.coverage('gold.fct_player_season_stats_audit',
-                       condition='ABS(penalties_conceded_diff_fotmob) <= 1 OR penalties_conceded_diff_fotmob IS NULL',
-                       warn_threshold=0.95, error_threshold=0.0,
-                       name='audit_diff[fct_player_season_stats_audit.penalties_conceded]'),
         # ----- WhoScored audit (1: только matches есть в event-aggregate) -----
         CHECK.coverage('gold.fct_player_season_stats_audit',
                        condition='ABS(matches_diff_whoscored) <= 1 OR matches_diff_whoscored IS NULL',
@@ -1503,16 +1532,16 @@ def validate_gold_quality() -> Dict[str, Any]:
         # passed через `OR <col> IS NULL`.
         # ============================================================
         CHECK.no_duplicates('gold.fct_player_match_audit',
-                            pk=['match_id_canonical', 'player_id_canonical']),
+                            pk=['match_id', 'player_id']),
         CHECK.no_nulls('gold.fct_player_match_audit',
-                       cols=['match_id_canonical', 'player_id_canonical']),
+                       cols=['match_id', 'player_id']),
         # audit ⊆ main fct (INNER FBref ∩ SofaScore) → каждая audit-строка
         # должна находить парную строку в gold.fct_player_match.
-        # #426: parent column renamed to player_id; audit keeps *_canonical.
+        # #442: audit PK renamed off *_canonical to match parent (player_id).
         CHECK.ref_integrity(
             'gold.fct_player_match_audit',
             'gold.fct_player_match',
-            'player_id_canonical',
+            'player_id',
             parent_key='player_id',
         ),
 
@@ -1741,15 +1770,15 @@ def validate_gold_quality() -> Dict[str, Any]:
         # Thresholds: ±1 для integer counters, ±5 для possession, ±0.5 для xG.
         # ============================================================
         CHECK.no_duplicates('gold.fct_team_match_audit',
-                            pk=['match_id_canonical', 'team_id_canonical']),
+                            pk=['match_id', 'team_id']),
         CHECK.no_nulls('gold.fct_team_match_audit',
-                       cols=['match_id_canonical', 'team_id_canonical']),
+                       cols=['match_id', 'team_id']),
         # audit ⊆ main fct (INNER FBref ∩ US) → каждая audit-строка должна
-        # находить парную (match_id, team_id) в gold.fct_team_match. main fct
-        # PK uses match_id/team_id (v1 names), audit uses *_canonical, но
-        # значения идентичны (для source='fbref' canonical == raw).
+        # находить парную (match_id, team_id) в gold.fct_team_match. #442: audit
+        # PK renamed off *_canonical to match parent names; значения идентичны
+        # (для source='fbref' canonical == raw).
         CHECK.ref_integrity('gold.fct_team_match_audit', 'gold.fct_team_match',
-                            'match_id_canonical', parent_key='match_id'),
+                            'match_id', parent_key='match_id'),
 
         # ----- Understat diff (INNER spine — всегда non-NULL) -----
         CHECK.coverage('gold.fct_team_match_audit',

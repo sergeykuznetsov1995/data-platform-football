@@ -37,6 +37,8 @@ def _build_scraper_class(*, errors: bool):
     dicts (success, no tables).
     """
     scraper = MagicMock()
+    # #616: runner calls scraper.get_traffic_stats(); stub so json.dump stays serializable.
+    scraper.get_traffic_stats.return_value = {}
 
     if errors:
         def _boom(*a, **k):
@@ -153,6 +155,7 @@ class TestRunWhoscoredExitCode:
         """Mixed success/failure also yields exit 1 — partial-error must not
         be reported as success."""
         scraper = MagicMock()
+        scraper.get_traffic_stats.return_value = {}
         scraper.scrape_schedule.return_value = {
             "schedule": "iceberg.bronze.whoscored_schedule"
         }

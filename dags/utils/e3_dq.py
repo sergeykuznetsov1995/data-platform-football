@@ -1062,6 +1062,59 @@ def _build_understat_team_match_checks() -> List[Check]:
     ]
 
 
+def _build_sofascore_shots_checks() -> List[Check]:
+    """DQ for ``iceberg.silver.sofascore_shots`` (issue #602).
+
+    Primary guard is the xref-JOIN fan-out footgun: the projection is one row
+    per shot, so a missing (league, season) predicate would multiply rows. PK
+    uniqueness + a row-count floor catch that. APL 2526 ≈ 9.5K shots smoke-
+    tested; 5K WARNING floor allows partial scrape.
+    """
+    table = 'iceberg.silver.sofascore_shots'
+    return [
+        CHECK.no_duplicates(table, pk=['match_id', 'shot_id']),
+        CHECK.no_nulls(table, cols=['match_id', 'shot_id']),
+        CHECK.row_count(table, min_rows=5_000, severity='WARNING'),
+    ]
+
+
+def _build_fct_shot_audit_checks() -> List[Check]:
+    """DQ for ``iceberg.gold.fct_shot_audit`` (issue #602).
+
+    Cross-source shot consistency (Understat fct_shot vs SofaScore). Structural
+    integrity is ERROR; coverage is WARNING (audit is a DQ table, not a gate).
+    The |xg_diff| divergence threshold is added after live calibration.
+    """
+    table = 'iceberg.gold.fct_shot_audit'
+    return [
+        # Structural — ERROR.
+        CHECK.no_duplicates(table, pk=['match_id', 'team_id']),
+        CHECK.no_nulls(table, cols=['match_id', 'team_id']),
+
+        # SofaScore overlap must materialise — a broken xref/schedule bridge
+        # would zero this out. 2526 ≈ 760 team-matches; floor 600 WARNING.
+        CHECK.row_count(
+            table=table,
+            min_rows=600,
+            where="has_sofascore = true",
+            severity='WARNING',
+            name='fct_shot_audit_sofascore_coverage',
+        ),
+
+        # xG model agreement — a gross |xg_diff| > 2.0 over a single team-match
+        # signals a normalisation/mapping regression, not normal model variance
+        # (live calibration 2026-06-16: max |xg_diff| 1.65, zero rows > 2.0).
+        CHECK.row_count(
+            table=table,
+            min_rows=0,
+            max_rows=20,
+            where="has_sofascore = true AND ABS(xg_diff) > 2.0",
+            severity='WARNING',
+            name='fct_shot_audit_xg_divergence',
+        ),
+    ]
+
+
 def build_silver_e3_checks() -> List[Check]:
     """Return DQ checks for Silver E3 tables.
 
@@ -1079,6 +1132,7 @@ def build_silver_e3_checks() -> List[Check]:
         + _build_espn_lineup_checks()
         + _build_sofascore_player_profile_checks()
         + _build_sofascore_team_match_checks()
+        + _build_sofascore_shots_checks()
     )
 
 
@@ -1090,6 +1144,7 @@ def build_gold_e3_checks() -> List[Check]:
     return (
         _build_fct_event_checks()
         + _build_fct_shot_checks()
+        + _build_fct_shot_audit_checks()
         + _build_fct_lineup_checks()
     )
 

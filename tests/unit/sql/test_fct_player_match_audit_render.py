@@ -80,12 +80,12 @@ class TestFctPlayerMatchAuditSql:
         ), "audit must LEFT JOIN на WhoScored (не INNER — сохраняем spine)"
 
     def test_grain_pk_columns(self):
-        """PK совпадает с main fct: (match_id_canonical, player_id_canonical).
+        """PK совпадает с main fct: (match_id, player_id) — plain ids после #442.
         Natural composite — non-NULL по конструкции INNER spine."""
         sql = _read_sql()
-        for col in ["match_id_canonical", "player_id_canonical"]:
-            assert re.search(rf"\b{col}\b", sql), (
-                f"PK column `{col}` must be projected"
+        for col in ["match_id", "player_id"]:
+            assert re.search(rf"\bAS\s+{col}\b", sql), (
+                f"PK column `{col}` must be projected as final alias"
             )
 
     def test_xref_join_includes_league_and_season_predicate(self):
@@ -195,9 +195,9 @@ class TestFctPlayerMatchAuditSql:
             "json", "array", "map", "row",
         }
         allowed_non_diff = {
-            "match_id_canonical",
-            "player_id_canonical",
-            "team_id_canonical",
+            "match_id",            # #442: финальный PK — plain id
+            "player_id",           # #442: финальный PK — plain id
+            "match_id_canonical",  # CTE xref-мосты всё ещё дают AS match_id_canonical
             "fbref_player_id",
             "fbref_match_id",
             "ss_player_id",

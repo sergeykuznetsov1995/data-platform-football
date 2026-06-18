@@ -66,6 +66,13 @@ SILVER_TRANSFORMS = [
         'dags/sql/silver/transfermarkt_transfers.sql.j2',
         'transfermarkt_transfers',
     ),
+    # issue #434/#619: head coaches (dob/nationality) for gold.dim_manager
+    # enrichment. `.sql.j2` — embeds manager_aliases VALUES (issue #619).
+    (
+        'coaches',
+        'dags/sql/silver/transfermarkt_coaches.sql.j2',
+        'transfermarkt_coaches',
+    ),
 ]
 
 # Expected minimum row counts per Silver table (for validation)
@@ -81,6 +88,9 @@ SILVER_MIN_ROWS = {
     'transfermarkt_players': 400,
     'transfermarkt_market_value_history': 1000,
     'transfermarkt_transfers': 600,
+    # transfermarkt_coaches: ~20 head coaches per APL season (1 per club).
+    # Floor 15 protects against a broken CTAS / scrape collapse.
+    'transfermarkt_coaches': 15,
 }
 
 
@@ -109,6 +119,7 @@ def _run_transform(sql_file: str, table_name: str, **context) -> Dict[str, Any]:
         )
 
     from utils.medallion_config import (
+        get_manager_alias_sql_values,
         get_team_alias_sql_values,
         render_sql_template,
     )
@@ -117,10 +128,20 @@ def _run_transform(sql_file: str, table_name: str, **context) -> Dict[str, Any]:
     if not template_path.exists():
         raise FileNotFoundError(f"Silver template not found: {template_path}")
 
-    rendered_sql = render_sql_template(
-        template_path,
-        team_aliases_values_sql=get_team_alias_sql_values(),
-    )
+    # Each template references exactly one alias placeholder. transfermarkt_
+    # coaches → manager aliases (issue #619); the others → team aliases. Pass
+    # only the kwarg the template needs (render_sql_template ignores extras but
+    # would fail on a referenced-yet-missing key).
+    if 'transfermarkt_coaches' in sql_file:
+        render_kwargs = {
+            'manager_aliases_values_sql': get_manager_alias_sql_values(
+                source='transfermarkt',
+            ),
+        }
+    else:
+        render_kwargs = {'team_aliases_values_sql': get_team_alias_sql_values()}
+
+    rendered_sql = render_sql_template(template_path, **render_kwargs)
     logger.info(
         "Rendered %s — %d chars (%d alias pairs embedded)",
         template_path.name,

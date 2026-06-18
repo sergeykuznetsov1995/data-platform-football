@@ -14,7 +14,10 @@ Architecture:
         |
         v
     TaskGroup: silver_transforms
-        └── player_salaries — typed salary snapshot with canonical_id (issue #63)
+        ├── player_salaries — typed salary snapshot with canonical_id (issue #63)
+        ├── team_payrolls — declared club payroll snapshot (issue #603)
+        ├── transfer_window — net transfer balance snapshot (issue #603)
+        └── contract_extensions — player contract snapshot (issue #603)
         |
         v
     validate_silver  — row count checks
@@ -23,7 +26,10 @@ Architecture:
     validate_silver_quality  — DQ checks (PK, ref integrity WARNING, ranges, orphan coverage)
 
 Silver Tables Created:
-    iceberg.silver.capology_player_salaries  — typed salary snapshot + canonical_id (issue #63)
+    iceberg.silver.capology_player_salaries       — typed salary snapshot + canonical_id (issue #63)
+    iceberg.silver.capology_team_payrolls         — declared club payroll + canonical_id (issue #603)
+    iceberg.silver.capology_transfer_window       — net transfer balance + canonical_id (issue #603)
+    iceberg.silver.capology_contract_extensions   — player contract snapshot + canonical_id (issue #603)
 """
 
 import logging
@@ -48,14 +54,36 @@ SILVER_TRANSFORMS = [
         'dags/sql/silver/capology_player_salaries.sql',
         'capology_player_salaries',
     ),
+    # Team-finance + contracts (issue #603) — снимаем write-only статус
+    # 3 bronze-таблиц (audit #476), прецедент #601 (SoFIFA promote).
+    (
+        'team_payrolls',
+        'dags/sql/silver/capology_team_payrolls.sql',
+        'capology_team_payrolls',
+    ),
+    (
+        'transfer_window',
+        'dags/sql/silver/capology_transfer_window.sql',
+        'capology_transfer_window',
+    ),
+    (
+        'contract_extensions',
+        'dags/sql/silver/capology_contract_extensions.sql',
+        'capology_contract_extensions',
+    ),
 ]
 
 # Expected minimum row counts per Silver table (for validation).
 # capology_player_salaries: Bronze APL 2025/26 = 730 rows; после filter
 # (currency='GBP' AND (active OR loan)) live ≈ 525 rows. Floor = 400
 # защищает от broken CTAS / scrape regression.
+# team_payrolls / transfer_window: live 240 rows (12 сезонов × ~20 клубов APL).
+# contract_extensions: live 819 bronze → ~810 после dedup (8 сезонов, floor 1819).
 SILVER_MIN_ROWS = {
     'capology_player_salaries': 400,
+    'capology_team_payrolls': 200,
+    'capology_transfer_window': 200,
+    'capology_contract_extensions': 600,
 }
 
 
@@ -187,6 +215,71 @@ def _validate_silver_quality(**context) -> Dict[str, Any]:
             'silver.capology_player_salaries', 'age',
             min_val=14, max_val=50, severity='WARNING',
         ),
+
+        # ---------------------------------------------------------------
+        # silver.capology_team_payrolls (issue #603)
+        # ---------------------------------------------------------------
+        CHECK.no_nulls(
+            'silver.capology_team_payrolls',
+            cols=['club_slug', 'league', 'season'],
+        ),
+        CHECK.no_duplicates(
+            'silver.capology_team_payrolls',
+            pk=['club_slug', 'league', 'season'],
+        ),
+        CHECK.row_count(
+            'silver.capology_team_payrolls',
+            min_rows=200, severity='WARNING',
+        ),
+        CHECK.freshness(
+            'silver.capology_team_payrolls',
+            ts_col='_bronze_ingested_at',
+            max_age_hours=FRESH_HOURS, severity='WARNING',
+        ),
+
+        # ---------------------------------------------------------------
+        # silver.capology_transfer_window (issue #603)
+        # ---------------------------------------------------------------
+        CHECK.no_nulls(
+            'silver.capology_transfer_window',
+            cols=['club_slug', 'league', 'season'],
+        ),
+        CHECK.no_duplicates(
+            'silver.capology_transfer_window',
+            pk=['club_slug', 'league', 'season'],
+        ),
+        CHECK.row_count(
+            'silver.capology_transfer_window',
+            min_rows=200, severity='WARNING',
+        ),
+        CHECK.freshness(
+            'silver.capology_transfer_window',
+            ts_col='_bronze_ingested_at',
+            max_age_hours=FRESH_HOURS, severity='WARNING',
+        ),
+
+        # ---------------------------------------------------------------
+        # silver.capology_contract_extensions (issue #603)
+        # canonical_id EXCLUDED из no_nulls — ~16% orphans by design
+        # (контракт без FBref counterpart). PK после dedup уникален.
+        # ---------------------------------------------------------------
+        CHECK.no_nulls(
+            'silver.capology_contract_extensions',
+            cols=['player_slug', 'league', 'season'],
+        ),
+        CHECK.no_duplicates(
+            'silver.capology_contract_extensions',
+            pk=['player_slug', 'league', 'season'],
+        ),
+        CHECK.row_count(
+            'silver.capology_contract_extensions',
+            min_rows=600, severity='WARNING',
+        ),
+        CHECK.freshness(
+            'silver.capology_contract_extensions',
+            ts_col='_bronze_ingested_at',
+            max_age_hours=FRESH_HOURS, severity='WARNING',
+        ),
     ]
 
     # Run with raise_on_error=False so the Telegram summary always lands.
@@ -241,6 +334,9 @@ with DAG(
     | Table | Description | Bronze sources |
     |-------|-------------|----------------|
     | `capology_player_salaries` | Typed salary snapshot + canonical_id (issue #63) | `capology_player_salaries` |
+    | `capology_team_payrolls` | Declared club payroll (gross/net/bonus/total/adjusted) + canonical_id (issue #603) | `capology_team_payrolls` |
+    | `capology_transfer_window` | Net transfer balance (income/expense/balance, age, foreign) + canonical_id (issue #603) | `capology_transfer_window` |
+    | `capology_contract_extensions` | Player contract snapshot (signed/expiration/years + full contract value) + canonical_id (issue #603) | `capology_contract_extensions` |
 
     ### Filters applied in CTE
 
