@@ -131,14 +131,26 @@ transfermarkt_latest AS (
 -- SoFIFA-side: silver.sofifa_player_profile уже содержит canonical_id (LEFT JOIN
 -- xref_player в Silver, source='sofifa' non-orphan). GROUP BY canonical_id +
 -- MAX_BY(..., season) сворачивает per-edition snapshot к одному row на
--- канонического игрока (как SofaScore/TM — без xref hop в Gold). Game-side
--- EA-рейтинги (overall/pace/value_eur/wage_eur/…) переехали в
--- gold.fct_player_fifa_rating per-(player, fifa_edition) (#430/#609); здесь
--- остаются только identity- и контрактные атрибуты (weight_kg — единственный
--- источник веса на платформе).
+-- канонического игрока (как SofaScore/TM — без xref hop в Gold). ВНИМАНИЕ:
+-- это game-side рейтинги EA Sports (мнение игры), НЕ реальные метрики матчей.
 sofifa_latest AS (
     SELECT
         canonical_id,
+        MAX_BY(overall,               season) AS overall,
+        MAX_BY(potential,             season) AS potential,
+        MAX_BY(pace,                  season) AS pace,
+        MAX_BY(shooting,              season) AS shooting,
+        MAX_BY(passing,               season) AS passing,
+        MAX_BY(dribbling,             season) AS dribbling,
+        MAX_BY(defending,             season) AS defending,
+        MAX_BY(physical,              season) AS physical,
+        MAX_BY(gk_diving,             season) AS gk_diving,
+        MAX_BY(gk_handling,           season) AS gk_handling,
+        MAX_BY(gk_kicking,            season) AS gk_kicking,
+        MAX_BY(gk_positioning,        season) AS gk_positioning,
+        MAX_BY(gk_reflexes,           season) AS gk_reflexes,
+        MAX_BY(value_eur,             season) AS value_eur,
+        MAX_BY(wage_eur,              season) AS wage_eur,
         MAX_BY(release_clause_eur,    season) AS release_clause_eur,
         MAX_BY(contract_valid_until,  season) AS contract_valid_until,
         MAX_BY(joined,                season) AS joined,
@@ -228,9 +240,22 @@ SELECT
     tm.mv_last_update                                  AS mv_last_update_tm,
     tm.contract_until                                  AS contract_until_tm,
 
-    -- SoFIFA block — identity + контрактные атрибуты. Game-side EA-рейтинги
-    -- (overall/pace/value_eur/wage_eur/…) теперь в gold.fct_player_fifa_rating
-    -- per-(player, fifa_edition) (#609).
+    -- SoFIFA block (EA Sports FC game-side ratings, NOT real match metrics).
+    sf.overall                                         AS overall_sofifa,
+    sf.potential                                       AS potential_sofifa,
+    sf.pace                                            AS pace_sofifa,
+    sf.shooting                                        AS shooting_sofifa,
+    sf.passing                                         AS passing_sofifa,
+    sf.dribbling                                       AS dribbling_sofifa,
+    sf.defending                                       AS defending_sofifa,
+    sf.physical                                        AS physical_sofifa,
+    sf.gk_diving                                       AS gk_diving_sofifa,
+    sf.gk_handling                                     AS gk_handling_sofifa,
+    sf.gk_kicking                                      AS gk_kicking_sofifa,
+    sf.gk_positioning                                  AS gk_positioning_sofifa,
+    sf.gk_reflexes                                     AS gk_reflexes_sofifa,
+    sf.value_eur                                       AS value_eur_sofifa,
+    sf.wage_eur                                        AS wage_eur_sofifa,
     sf.release_clause_eur                              AS release_clause_eur_sofifa,
     sf.contract_valid_until                            AS contract_valid_until_sofifa,
     sf.joined                                          AS joined_sofifa,
