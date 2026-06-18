@@ -205,6 +205,81 @@ class FlareSolverrSoFIFAReader(sd.SoFIFA):
         # Selenium not needed — FlareSolverr owns the browser.
         return None
 
+    def read_versions(self, max_age=1) -> "pd.DataFrame":
+        """Override ``soccerdata.SoFIFA.read_versions`` for the post-EA-FC DOM.
+
+        Upstream (``soccerdata/sofifa.py``) parses two nested dropdowns at
+        ``//header/section/p/select[1|2]/option``. The EA SPORTS FC rebrand
+        moved the pickers to ``<select id="select-version">`` (one option per
+        FIFA/FC edition, ``value`` carries ``r=<latest update id>``) and
+        ``<select id="select-roster">`` (one option per update of the *current*
+        edition, ``value`` carries ``r=<update id>``, text = release date). The
+        old xpath now matches 0 options → empty ``versions`` →
+        ``set_index('version_id')`` raises ``KeyError`` in the constructor,
+        killing all SoFIFA scraping (#650, silent-fail sibling of #647).
+
+        One homepage request (matches the wrapper contract): one row per
+        edition with its latest update id, enriched with the release date from
+        the roster picker where the current edition's ids overlap.
+        """
+        SO_FIFA_API = "https://sofifa.com"
+        filepath = self.data_dir / "index.html"
+        reader = self.get(SO_FIFA_API, filepath, max_age)
+        page = reader.read()
+        if isinstance(page, bytes):
+            page = page.decode("utf-8", "replace")
+        return self._parse_versions(page)
+
+    @staticmethod
+    def _parse_versions(page: str) -> "pd.DataFrame":
+        """Parse the SoFIFA homepage edition/roster pickers into a versions frame.
+
+        Pure (no I/O) so it is unit-testable against a saved page. Returns a
+        DataFrame indexed by ``version_id`` with ``fifa_edition`` + ``update``
+        columns — same contract as upstream, so ``versions='latest'`` (which
+        takes ``.tail(1)`` = max id) and downstream readers keep working.
+        """
+        import pandas as pd
+        from lxml import html as _html
+
+        tree = _html.fromstring(page)
+
+        def _rid(value: Optional[str]) -> Optional[int]:
+            m = re.search(r"[rR]=(\d+)", value or "")
+            return int(m.group(1)) if m else None
+
+        # roster picker → {update id: release date} for the current edition only
+        update_date: dict[int, str] = {}
+        for opt in tree.xpath('//select[@id="select-roster"]/option'):
+            rid = _rid(opt.get("value"))
+            if rid is not None:
+                update_date[rid] = opt.text_content().strip()
+
+        # version picker → one row per edition (value = its latest update id)
+        rows: List[dict] = []
+        for opt in tree.xpath('//select[@id="select-version"]/option'):
+            rid = _rid(opt.get("value"))
+            if rid is None:
+                continue
+            edition = opt.text_content().strip()
+            rows.append({
+                "version_id": rid,
+                "fifa_edition": edition,
+                "update": update_date.get(rid, edition),
+            })
+
+        if not rows:
+            raise ValueError(
+                "SoFIFA read_versions: 0 editions parsed from "
+                "select#select-version — DOM drifted again (#650)"
+            )
+        return (
+            pd.DataFrame(rows)
+            .drop_duplicates("version_id")
+            .set_index("version_id")
+            .sort_index()
+        )
+
     def read_player_ratings(self, team=None, player=None) -> "pd.DataFrame":
         """Override soccerdata.SoFIFA.read_player_ratings to inject ``player_id``.
 
