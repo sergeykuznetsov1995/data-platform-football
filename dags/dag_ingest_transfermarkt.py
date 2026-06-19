@@ -192,7 +192,12 @@ with DAG(
     - ``iceberg.bronze.transfermarkt_market_value_history`` (partition: league/season)
     - ``iceberg.bronze.transfermarkt_transfers`` (partition: league/season)
 
-    All three are written with ``replace_partitions=['league','season']``.
+    ``players`` is a full crawl written with whole-partition replace
+    (``replace_partitions=['league','season']``). ``market_value_history`` and
+    ``transfers`` are rate-capped to ~100 players/run, so each run scrapes the
+    NEXT rotating roster window (``--as-of-date {{ ds }}`` → window index) and
+    **upserts by player** (``replace_partitions=['league','season','player_id']``)
+    so prior windows accumulate — full roster covered over ~6 weekly runs (#620).
     """,
 ) as dag:
 
@@ -236,6 +241,7 @@ python dags/scripts/run_transfermarkt_scraper.py \\
     --league "{league}" \\
     --season {season} \\
     --limit {MV_HISTORY_DAILY_LIMIT} \\
+    --as-of-date {{{{ ds }}}} \\
     --output {MV_HISTORY_RESULT_PATH}
 rc=$?
 if [ $rc -eq 2 ]; then
@@ -262,6 +268,7 @@ python dags/scripts/run_transfermarkt_scraper.py \\
     --league "{league}" \\
     --season {season} \\
     --limit {TRANSFERS_DAILY_LIMIT} \\
+    --as-of-date {{{{ ds }}}} \\
     --output {TRANSFERS_RESULT_PATH}
 rc=$?
 if [ $rc -eq 2 ]; then

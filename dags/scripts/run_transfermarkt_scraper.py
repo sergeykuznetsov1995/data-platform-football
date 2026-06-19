@@ -42,6 +42,7 @@ import logging
 import os
 import sys
 import warnings
+from datetime import date
 from typing import List, Optional
 
 warnings.filterwarnings('ignore', category=DeprecationWarning)
@@ -85,6 +86,24 @@ VALID_ENTITIES = {ENTITY_PLAYERS, ENTITY_MV_HISTORY, ENTITY_TRANSFERS, ENTITY_CO
 # wildly for mv_history/transfers. ReplaceGuardError → exit 3.
 _MIN_REPLACE_RATIO = 0.9
 REPLACE_GUARD_MARKER = 'TM_REPLACE_GUARD'
+
+# Rotating roster window (#620): transfers / mv_history are rate-capped to ~100
+# players per run, so each run scrapes the NEXT window of the numerically sorted
+# roster. The window index must advance by exactly +1 per DAG run; the DAG is
+# weekly (0 4 * * 1), so we derive it from the logical date as ordinal // 7
+# (consecutive weekly runs differ by exactly 1). Using the logical date keeps
+# reruns reproducible — idempotent with the per-player upsert.
+_WINDOW_STRIDE_DAYS = 7
+
+
+def _window_offset(as_of_date: Optional[str]) -> int:
+    """Roster-window index for this run.
+
+    ``as_of_date`` is the Airflow logical date 'YYYY-MM-DD' (``{{ ds }}``);
+    ``None`` falls back to today (standalone CLI use).
+    """
+    d = date.fromisoformat(as_of_date) if as_of_date else date.today()
+    return d.toordinal() // _WINDOW_STRIDE_DAYS
 
 
 def _write_results(path: str, payload: dict) -> None:
@@ -218,11 +237,14 @@ def _run_mv_history(
     output_path: str,
     dry_run: bool = False,
     force_replace: bool = False,
+    window_offset: int = 0,
 ) -> int:
     """Per-player MV timeline via the ceapi JSON endpoint.
 
     Depends on a fresh ``bronze.transfermarkt_players``; if that table is
     empty, the resolver returns ``[]`` and we emit TM_FALLBACK exit 2.
+    ``window_offset`` rotates which ``limit``-sized roster slice is scraped
+    (#620).
     """
     from scrapers.base.base_scraper import ReplaceGuardError
     from scrapers.transfermarkt import TransfermarktScraper
@@ -251,6 +273,7 @@ def _run_mv_history(
         ) as scraper:
             df = scraper.read_market_value_history(
                 league=league, season=int(season), limit=limit,
+                window_offset=window_offset,
             )
             if df is None or df.empty:
                 reason = _classify_fallback(scraper)
@@ -281,7 +304,13 @@ def _run_mv_history(
                 df=df,
                 table_name='transfermarkt_market_value_history',
                 partition_cols=['league', 'season'],
-                replace_partitions=['league', 'season'],
+                # Upsert by player (#620): delete+reinsert ONLY the scraped
+                # window's players so prior windows accumulate. The guard stays
+                # armed but, scoped per-window, is now structurally satisfied
+                # (new >= existing) — it cannot shrink other windows, so
+                # rotation never trips it. Partial-scrape protection lives
+                # upstream in read_* (ConsecutiveFailureError/PartialScrapeError).
+                replace_partitions=['league', 'season', 'player_id'],
                 min_replace_ratio=(None if force_replace else _MIN_REPLACE_RATIO),
                 replace_guard_key='player_id',
             )
@@ -313,9 +342,10 @@ def _run_transfers(
     output_path: str,
     dry_run: bool = False,
     force_replace: bool = False,
+    window_offset: int = 0,
 ) -> int:
     """Per-player transfers via the ceapi JSON endpoint. Same dependency
-    contract as ``_run_mv_history``.
+    contract as ``_run_mv_history`` (rotating window via ``window_offset``, #620).
     """
     from scrapers.base.base_scraper import ReplaceGuardError
     from scrapers.transfermarkt import TransfermarktScraper
@@ -344,6 +374,7 @@ def _run_transfers(
         ) as scraper:
             df = scraper.read_transfers(
                 league=league, season=int(season), limit=limit,
+                window_offset=window_offset,
             )
             if df is None or df.empty:
                 reason = _classify_fallback(scraper)
@@ -374,7 +405,10 @@ def _run_transfers(
                 df=df,
                 table_name='transfermarkt_transfers',
                 partition_cols=['league', 'season'],
-                replace_partitions=['league', 'season'],
+                # Upsert by player (#620): see _run_mv_history for the rationale —
+                # delete+reinsert only the scraped window so prior windows
+                # accumulate; the per-window guard cannot trip on rotation.
+                replace_partitions=['league', 'season', 'player_id'],
                 min_replace_ratio=(None if force_replace else _MIN_REPLACE_RATIO),
                 replace_guard_key='player_id',
             )
@@ -536,6 +570,13 @@ def main() -> int:
         help='Bypass the completeness guard and replace the partition '
              'unconditionally (operator recovery, never used by the DAG)',
     )
+    parser.add_argument(
+        '--as-of-date',
+        type=str,
+        default=None,
+        help="Logical run date 'YYYY-MM-DD' (Airflow {{ ds }}) used to rotate "
+             'the transfers/mv_history roster window (#620). None → today.',
+    )
     try:
         args = parser.parse_args()
     except _ArgparseError as exc:
@@ -550,9 +591,11 @@ def main() -> int:
         return 1
 
     leagues = [args.league]
+    window_offset = _window_offset(args.as_of_date)
     logger.info(
-        "Starting Transfermarkt scraper: entity=%s league=%s season=%s limit=%s",
-        entity, leagues, args.season, args.limit,
+        "Starting Transfermarkt scraper: entity=%s league=%s season=%s limit=%s "
+        "window_offset=%s",
+        entity, leagues, args.season, args.limit, window_offset,
     )
 
     if entity == ENTITY_PLAYERS:
@@ -563,12 +606,12 @@ def main() -> int:
     if entity == ENTITY_MV_HISTORY:
         return _run_mv_history(
             leagues, args.season, args.limit, args.output,
-            args.dry_run, args.force_replace,
+            args.dry_run, args.force_replace, window_offset,
         )
     if entity == ENTITY_TRANSFERS:
         return _run_transfers(
             leagues, args.season, args.limit, args.output,
-            args.dry_run, args.force_replace,
+            args.dry_run, args.force_replace, window_offset,
         )
     if entity == ENTITY_COACHES:
         return _run_coaches(

@@ -104,6 +104,14 @@ def _load_results(path: str) -> dict:
         return json.load(f)
 
 
+def _import_runner():
+    """Fresh import of the runner module (module-level has no heavy imports,
+    so no scraper stubs needed — used to exercise pure helpers like
+    ``_window_offset``)."""
+    sys.modules.pop("dags.scripts.run_transfermarkt_scraper", None)
+    return importlib.import_module("dags.scripts.run_transfermarkt_scraper")
+
+
 # ---------------------------------------------------------------------------
 # Completeness guard handling (#484 / #486, generalised #513)
 # ---------------------------------------------------------------------------
@@ -155,6 +163,62 @@ class TestReplaceGuard:
         scraper.save_to_iceberg.assert_called_once()
         results = _load_results(temp_output)
         assert any('TM_REPLACE_GUARD' in e for e in results['errors'])
+
+
+# ---------------------------------------------------------------------------
+# Rotating window + per-player upsert (issue #620)
+# ---------------------------------------------------------------------------
+
+class TestRosterRotationUpsert:
+    @pytest.mark.parametrize('entity', ['market_value_history', 'transfers'])
+    def test_dependent_entities_upsert_by_player_id(self, temp_output, entity):
+        # transfers / mv_history must delete+reinsert ONLY the scraped window's
+        # players so previous windows accumulate (#620). That means player_id
+        # joins the replace_partitions key.
+        scraper = _build_scraper(df=_players_df(3))
+        rc = _run_main(
+            ['--entity', entity, '--limit', '100', '--output', temp_output],
+            scraper,
+        )
+        assert rc == 0
+        kwargs = scraper.save_to_iceberg.call_args.kwargs
+        assert kwargs['replace_partitions'] == ['league', 'season', 'player_id']
+        assert kwargs['replace_guard_key'] == 'player_id'
+
+    def test_players_partition_unchanged(self, temp_output):
+        # Anchor entity stays a whole-partition replace (full crawl).
+        scraper = _build_scraper(df=_players_df(3))
+        rc = _run_main(
+            ['--entity', 'players', '--output', temp_output], scraper,
+        )
+        assert rc == 0
+        kwargs = scraper.save_to_iceberg.call_args.kwargs
+        assert kwargs['replace_partitions'] == ['league', 'season']
+
+    def test_window_offset_helper_increments_per_run(self):
+        mod = _import_runner()
+        # Two dates 7 days apart (one weekly DAG run) → offset differs by 1.
+        assert mod._window_offset('2026-06-29') - mod._window_offset('2026-06-22') == 1
+        # No date → today-based int (callable standalone).
+        assert isinstance(mod._window_offset(None), int)
+
+    @pytest.mark.parametrize(
+        'entity,reader',
+        [
+            ('market_value_history', 'read_market_value_history'),
+            ('transfers', 'read_transfers'),
+        ],
+    )
+    def test_as_of_date_forwards_window_offset(self, temp_output, entity, reader):
+        scraper = _build_scraper(df=_players_df(3))
+        rc = _run_main(
+            ['--entity', entity, '--limit', '100',
+             '--as-of-date', '2026-06-22', '--output', temp_output],
+            scraper,
+        )
+        assert rc == 0
+        expected = _import_runner()._window_offset('2026-06-22')
+        assert getattr(scraper, reader).call_args.kwargs['window_offset'] == expected
 
 
 # ---------------------------------------------------------------------------

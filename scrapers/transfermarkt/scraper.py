@@ -860,6 +860,7 @@ class TransfermarktScraper(BaseScraper):
         league: str,
         season_short: str,
         limit: Optional[int] = None,
+        window_offset: int = 0,
     ) -> List[str]:
         """DISTINCT player_id from ``bronze.transfermarkt_players``.
 
@@ -867,10 +868,15 @@ class TransfermarktScraper(BaseScraper):
         — the dependent entities (``transfers``, ``mv_history``) need a fresh
         roster from the ``players`` entity before they can fan out per-player.
 
-        With ``limit`` the subset is ordered by player_id: a deterministic
-        sample keeps the partition's distinct-player count stable across
-        runs (replace-guard input, #484/#486) and makes mv_history and
-        transfers sample the SAME players.
+        ``player_id`` is a varchar Transfermarkt id, so a SQL ``ORDER BY
+        player_id`` sorts lexicographically and the same ~100 ids on '1'/'2'
+        win every run — ids on 3-9 are never scraped (#620). We instead sort
+        the full roster numerically in Python (a ``SELECT DISTINCT`` cannot
+        ``ORDER BY`` a cast expression that is not in the select list) and,
+        when ``limit`` is set, return a *rotating window*: run ``window_offset``
+        scrapes the next contiguous block of ``limit`` players, wrapping
+        around, so the whole roster is covered over ``ceil(n/limit)`` runs and
+        mv_history + transfers sample the SAME window.
         """
         try:
             conn = self._bronze_connection()
@@ -880,16 +886,22 @@ class TransfermarktScraper(BaseScraper):
                 "FROM iceberg.bronze.transfermarkt_players "
                 "WHERE league = ? AND season = ?"
             )
-            if limit:
-                sql = sql + f" ORDER BY player_id LIMIT {int(limit)}"
             cur.execute(sql, (league, season_short))
             rows = cur.fetchall()
-            return [str(r[0]) for r in rows if r and r[0]]
+            roster = [str(r[0]) for r in rows if r and r[0]]
         except Exception as e:
             logger.warning(
                 "Could not resolve transfermarkt player_ids from bronze: %s", e,
             )
             return []
+
+        # Numeric order (non-numeric ids — none expected — sort last, stably).
+        roster.sort(key=lambda p: (0, int(p)) if p.isdigit() else (1, p))
+        if not limit or len(roster) <= limit:
+            return roster
+        n = len(roster)
+        start = (int(window_offset) * int(limit)) % n
+        return (roster + roster)[start:start + int(limit)]
 
     # ---------------------- read_* entry points ------------------------------
 
@@ -1240,12 +1252,15 @@ class TransfermarktScraper(BaseScraper):
         season: int,
         player_ids: Optional[List[str]] = None,
         limit: Optional[int] = None,
+        window_offset: int = 0,
     ) -> pd.DataFrame:
         """Per-player MV timeline via ``/ceapi/marketValueDevelopment/graph``.
 
-        ``player_ids`` defaults to DISTINCT from ``bronze.transfermarkt_players``
-        for the requested (league, season). Empty roster → empty DF (runner
-        emits ``TM_FALLBACK`` exit code 2).
+        ``player_ids`` defaults to the rotating roster window from
+        ``bronze.transfermarkt_players`` for the requested (league, season) —
+        see :meth:`_resolve_player_ids_from_bronze` (``window_offset`` advances
+        the window per run, #620). Empty roster → empty DF (runner emits
+        ``TM_FALLBACK`` exit code 2).
         """
         anchor_cols = [
             'player_id', 'mv_date', 'value_eur', 'club_name', 'age', 'mv_raw',
@@ -1255,7 +1270,7 @@ class TransfermarktScraper(BaseScraper):
 
         if player_ids is None:
             player_ids = self._resolve_player_ids_from_bronze(
-                league, season_short, limit=limit,
+                league, season_short, limit=limit, window_offset=window_offset,
             )
         if not player_ids:
             logger.warning(
@@ -1318,10 +1333,12 @@ class TransfermarktScraper(BaseScraper):
         season: int,
         player_ids: Optional[List[str]] = None,
         limit: Optional[int] = None,
+        window_offset: int = 0,
     ) -> pd.DataFrame:
         """Per-player transfer events via ``/ceapi/transferHistory/list``.
 
-        Same roster-resolution semantics as ``read_market_value_history``.
+        Same roster-resolution semantics as ``read_market_value_history``
+        (rotating window via ``window_offset``, #620).
         """
         anchor_cols = [
             'player_id', 'transfer_date', 'season',
@@ -1333,7 +1350,7 @@ class TransfermarktScraper(BaseScraper):
 
         if player_ids is None:
             player_ids = self._resolve_player_ids_from_bronze(
-                league, season_short, limit=limit,
+                league, season_short, limit=limit, window_offset=window_offset,
             )
         if not player_ids:
             logger.warning(
