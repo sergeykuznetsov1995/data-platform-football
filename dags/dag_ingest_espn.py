@@ -24,7 +24,7 @@ from airflow.operators.python import PythonOperator
 
 from utils.bronze_validation import validate_table
 from utils.config import LEAGUES, CURRENT_SEASON, SCHEDULES, DAG_TAGS
-from utils.default_args import DEFAULT_ARGS
+from utils.default_args import SCRAPER_ARGS
 
 
 def validate_data(**context) -> Dict[str, Any]:
@@ -93,7 +93,7 @@ leagues_str = ','.join(LEAGUES)
 # DAG definition
 with DAG(
     dag_id='dag_ingest_espn',
-    default_args=DEFAULT_ARGS,
+    default_args=SCRAPER_ARGS,
     description='Ingest football data from ESPN',
     schedule=SCHEDULES.get('dag_ingest_espn', '0 12 * * *'),
     start_date=datetime(2024, 1, 1),

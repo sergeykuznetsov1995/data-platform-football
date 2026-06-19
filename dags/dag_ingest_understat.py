@@ -27,7 +27,7 @@ from airflow.operators.python import PythonOperator
 
 from utils.bronze_validation import validate_table
 from utils.config import LEAGUES, CURRENT_SEASON, SCHEDULES, DAG_TAGS
-from utils.default_args import DEFAULT_ARGS
+from utils.default_args import SCRAPER_ARGS
 
 # Issue #466: every Bronze table this DAG writes gets a fail-closed Trino
 # COUNT(*) floor (threshold key == table name in MIN_ROW_THRESHOLDS).
@@ -112,7 +112,7 @@ leagues_str = ','.join(LEAGUES)
 # DAG definition
 with DAG(
     dag_id='dag_ingest_understat',
-    default_args=DEFAULT_ARGS,
+    default_args=SCRAPER_ARGS,
     description='Ingest xG statistics from Understat',
     schedule=SCHEDULES.get('dag_ingest_understat', '0 9 * * *'),
     start_date=datetime(2024, 1, 1),
