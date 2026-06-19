@@ -192,7 +192,7 @@ class FBrefBrowserMixin:
                 use_cf_verify=True,
                 pre_content_js=FBREF_UNCOMMENT_TABLES_JS,
                 content_timeout=30.0,
-                slow_proxy_threshold=15.0,   # 25→15: normal load 5-8s, 15s is suspicious
+                slow_proxy_threshold=self.SLOW_PROXY_THRESHOLD,  # env-tunable (issue #624); default 15s (normal load 5-8s)
             )
             logger.debug(
                 f"Initialized nodriver browser (headless={self.headless}, "
@@ -331,6 +331,9 @@ class FBrefBrowserMixin:
             self._http_session = self._create_http_session(cookies, proxy_url=proxy_url)
             self._http_cookies_time = time.time()
             self._http_request_count = 0
+            # Issue #624: remember the proxy this session is bound to so a later
+            # fallback diag can flag proxy-mismatch (drift vs current nodriver proxy).
+            self._http_proxy_minted = self._sanitize_proxy_url(proxy_url)
             cf_clearance_preview = cookies.get('cf_clearance', '')[:16]
             logger.info(
                 f"HTTP session initialized with {len(cookies)} cookies "
@@ -341,6 +344,7 @@ class FBrefBrowserMixin:
         except Exception as e:
             logger.warning(f"Failed to create HTTP session: {e}")
             self._http_session = None
+            self._http_proxy_minted = None
 
     def _http_cookies_expired(self) -> bool:
         """Check if HTTP session cookies have expired (TTL or request count)."""
@@ -398,8 +402,10 @@ class FBrefBrowserMixin:
             "request_n": self._http_request_count,
             # Issue #624: proxy the nodriver browser is currently on. cf_clearance
             # is IP-bound; if this drifts from the proxy the curl session was
-            # minted on, the fallback is a proxy-mismatch (not TLS / expiry).
+            # minted on (`proxy_minted`), the fallback is a proxy-mismatch (not
+            # TLS / expiry). Compare proxy != proxy_minted to detect the drift.
             "proxy": self._sanitize_proxy_url(self._get_current_nodriver_proxy_url()),
+            "proxy_minted": getattr(self, "_http_proxy_minted", None),
         }
         if html_preview:
             record["html_preview"] = html_preview[:500]
@@ -897,8 +903,9 @@ class FBrefBrowserMixin:
 
         if success:
             self._current_proxy_obj = proxy_obj
-            # Reset HTTP session since proxy changed
+            # Reset HTTP session since proxy changed (cf_clearance is IP-bound)
             self._http_session = None
+            self._http_proxy_minted = None
             logger.info(
                 f"Proxy changed via CDP to {proxy_obj.host}:{proxy_obj.port} "
                 f"(no browser restart)"
@@ -1022,6 +1029,7 @@ class FBrefBrowserMixin:
         # Reset HTTP session only when proxy changes (SlowProxyError, explicit close)
         if reset_http:
             self._http_session = None
+            self._http_proxy_minted = None
 
     def _close_all(self) -> None:
         """Close browser AND shared Xvfb (final cleanup)."""

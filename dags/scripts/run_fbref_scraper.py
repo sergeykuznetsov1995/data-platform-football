@@ -117,6 +117,14 @@ def _get_traffic_diagnostics(scraper) -> dict:
     diag_by_cf_mitigated = Counter(
         d.get('cf_mitigated') for d in http_diag if d.get('cf_mitigated')
     )
+    # Issue #624: a fallback where the minted proxy drifted from the current
+    # nodriver proxy is a proxy-mismatch (cf_clearance is IP-bound). Counted
+    # only when both fields are present and differ — the dominant cause read.
+    diag_proxy_mismatch = sum(
+        1 for d in http_diag
+        if d.get('proxy_minted') and d.get('proxy')
+        and d['proxy_minted'] != d['proxy']
+    )
 
     return {
         'bytes_downloaded': html_bytes,
@@ -168,6 +176,7 @@ def _get_traffic_diagnostics(scraper) -> dict:
         'http_fetch_diag_summary': {
             'by_reason': dict(diag_by_reason),
             'by_cf_mitigated': dict(diag_by_cf_mitigated),
+            'proxy_mismatch': diag_proxy_mismatch,
         },
     }
 

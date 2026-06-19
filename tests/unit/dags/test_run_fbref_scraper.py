@@ -292,3 +292,25 @@ class TestHttpFastPathDiagnostics:
         assert payload['http_fetch_ok'] == 7
         assert payload['http_fetch_fallback'] == 3
         assert payload['http_fetch_diag_summary']['by_reason']['non_200'] == 2
+
+    @pytest.mark.unit
+    def test_diag_summary_counts_proxy_mismatch(self):
+        # #624: a fallback where the curl session's minted proxy drifted from
+        # the current nodriver proxy is a proxy-mismatch — counted only when
+        # both fields are present and differ.
+        import dags.scripts.run_fbref_scraper as m
+
+        scraper = SimpleNamespace(_stats={
+            'http_fetch_ok': 5,
+            'http_fetch_fallback': 4,
+            'http_fetch_diag': [
+                {'reason': 'non_200', 'proxy_minted': 'host:1', 'proxy': 'host:1'},
+                {'reason': 'non_200', 'proxy_minted': 'host:1', 'proxy': 'host:2'},
+                {'reason': 'empty_body', 'proxy_minted': None, 'proxy': 'host:2'},
+                {'reason': 'exception', 'proxy': 'host:3'},
+            ],
+        })
+
+        diag = m._get_traffic_diagnostics(scraper)
+
+        assert diag['http_fetch_diag_summary']['proxy_mismatch'] == 1

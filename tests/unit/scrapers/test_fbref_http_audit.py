@@ -47,9 +47,11 @@ def _make_scraper_stub():
     scraper._http_session = MagicMock()
     scraper._http_request_count = 0
     scraper._http_cookies_time = None
-    # Issue #624: `_record_http_diag` now reads the current nodriver proxy.
-    # Mirror the real __init__ default so failure-path recording can't raise.
+    # Issue #624: `_record_http_diag` now reads the current nodriver proxy
+    # and the proxy the curl session was minted on. Mirror the real __init__
+    # defaults so failure-path recording can't raise.
     scraper._nodriver_browser = None
+    scraper._http_proxy_minted = None
     scraper._stats = {
         'http_bytes_downloaded': 0,
         'http_requests_count': 0,
@@ -170,3 +172,74 @@ class TestHttpDiagProxyField:
         assert len(diag) == 1
         # Credentials must be stripped — host:port only.
         assert diag[0]['proxy'] == 'pool.example.io:10587'
+
+    @pytest.mark.unit
+    def test_diag_records_proxy_minted_matching_current(self):
+        # No drift: the session was minted on the same proxy the browser is on
+        # now — proxy == proxy_minted, so this is NOT a proxy-mismatch fallback.
+        scraper = _make_scraper_stub()
+        scraper._http_proxy_minted = 'pool.example.io:10587'
+        browser = MagicMock()
+        browser.proxy = 'http://user:secret@pool.example.io:10587'
+        scraper._nodriver_browser = browser
+        scraper._http_session.get.return_value = _make_response(
+            403, '<html>blocked</html>'
+        )
+
+        scraper._fetch_page_http('https://fbref.com/test')
+
+        diag = scraper._stats['http_fetch_diag']
+        assert diag[0]['proxy_minted'] == 'pool.example.io:10587'
+        assert diag[0]['proxy'] == diag[0]['proxy_minted']
+
+    @pytest.mark.unit
+    def test_diag_records_proxy_mismatch(self):
+        # Drift: cf_clearance was minted on one proxy but the browser has since
+        # rotated to another — proxy != proxy_minted flags an IP-bound mismatch
+        # (not a TLS / cookie-expiry failure).
+        scraper = _make_scraper_stub()
+        scraper._http_proxy_minted = 'minted.example.io:1'
+        browser = MagicMock()
+        browser.proxy = 'http://user:secret@rotated.example.io:2'
+        scraper._nodriver_browser = browser
+        scraper._http_session.get.return_value = _make_response(
+            403, '<html>blocked</html>'
+        )
+
+        scraper._fetch_page_http('https://fbref.com/test')
+
+        diag = scraper._stats['http_fetch_diag']
+        assert diag[0]['proxy'] == 'rotated.example.io:2'
+        assert diag[0]['proxy_minted'] == 'minted.example.io:1'
+        assert diag[0]['proxy'] != diag[0]['proxy_minted']
+
+
+class TestEnvTunables:
+    """Issue #624: cold-start / fallback thresholds are env-tunable so ops can
+    dampen browser restart amplification on a bad-proxy day without a code
+    change. `_env_num` reads the override, or falls back to the default."""
+
+    @pytest.mark.unit
+    def test_env_num_default_when_absent(self, monkeypatch):
+        from scrapers.fbref.scraper import _env_num
+
+        monkeypatch.delenv('FBREF_TEST_TUNABLE', raising=False)
+        assert _env_num('FBREF_TEST_TUNABLE', 15.0, float) == 15.0
+
+    @pytest.mark.unit
+    def test_env_num_reads_override(self, monkeypatch):
+        from scrapers.fbref.scraper import _env_num
+
+        monkeypatch.setenv('FBREF_TEST_TUNABLE', '30')
+        assert _env_num('FBREF_TEST_TUNABLE', 15.0, float) == 30.0
+        monkeypatch.setenv('FBREF_TEST_RETRIES', '8')
+        assert _env_num('FBREF_TEST_RETRIES', 5, int) == 8
+
+    @pytest.mark.unit
+    def test_env_num_falls_back_on_invalid_or_empty(self, monkeypatch):
+        from scrapers.fbref.scraper import _env_num
+
+        monkeypatch.setenv('FBREF_TEST_TUNABLE', 'not-a-number')
+        assert _env_num('FBREF_TEST_TUNABLE', 15.0, float) == 15.0
+        monkeypatch.setenv('FBREF_TEST_TUNABLE', '')
+        assert _env_num('FBREF_TEST_TUNABLE', 15.0, float) == 15.0

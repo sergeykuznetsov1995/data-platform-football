@@ -24,6 +24,7 @@ Architecture:
 
 import gc
 import logging
+import os
 import time
 from typing import Any, Dict, List, Optional
 
@@ -54,6 +55,23 @@ from scrapers.fbref.html_parser import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _env_num(name: str, default, cast):
+    """Read a numeric tunable from env, falling back to `default`.
+
+    Issue #624: cold-start / fallback thresholds are env-tunable so ops can
+    dampen browser restart amplification on a bad-proxy day without a code
+    change. Absent, empty, or unparseable values use `default`.
+    """
+    raw = os.environ.get(name)
+    if not raw:
+        return default
+    try:
+        return cast(raw)
+    except (TypeError, ValueError):
+        logger.warning("Invalid %s=%r — using default %r", name, raw, default)
+        return default
 
 
 class FBrefScraper(
@@ -175,15 +193,27 @@ class FBrefScraper(
         # this counter is a last-resort systemic guard, don't let it restart the
         # browser on a transient series of dead proxies.
         self._consecutive_fetch_failures: int = 0
-        self.MAX_CONSECUTIVE_FAILURES = 15
+        # Issue #624: cold-start / fallback thresholds are env-tunable so a
+        # bad-proxy day can be dampened without a code change. Defaults below
+        # reproduce the prior hardcoded behaviour exactly.
+        self.MAX_CONSECUTIVE_FAILURES = _env_num("FBREF_MAX_CONSECUTIVE_FAILURES", 15, int)
+        self.MAX_SLOW_PROXY_RETRIES = _env_num(
+            "FBREF_MAX_SLOW_PROXY_RETRIES", self.MAX_SLOW_PROXY_RETRIES, int
+        )
+        self.SLOW_PROXY_THRESHOLD = _env_num("FBREF_SLOW_PROXY_THRESHOLD", 15.0, float)
         self._current_proxy_obj = None  # Track current proxy for result recording
 
         # HTTP session state (for match pages after initial CF bypass)
         self._http_session = None
         self._http_cookies_time: Optional[float] = None
         self._http_request_count: int = 0
-        self.HTTP_COOKIE_TTL_MINUTES = 25  # CF cookies live ~30 min, refresh at 25
-        self.HTTP_MAX_REQUESTS = 150  # Re-extract cookies every N requests
+        # Issue #624: proxy the curl_cffi session was minted on (sanitized). The
+        # fallback diag compares it against the current nodriver proxy — a drift
+        # means cf_clearance is IP-bound to a now-rotated proxy (mismatch), not a
+        # TLS / cookie-expiry failure.
+        self._http_proxy_minted: Optional[str] = None
+        self.HTTP_COOKIE_TTL_MINUTES = _env_num("FBREF_HTTP_COOKIE_TTL_MINUTES", 25, float)
+        self.HTTP_MAX_REQUESTS = _env_num("FBREF_HTTP_MAX_REQUESTS", 150, int)
 
     # ------------------------------------------------------------------
     # URL helper delegates (backwards compatibility)
