@@ -17,7 +17,7 @@
 -- is NULL for ≈15% of SoFIFA players (loan-out / U21 outside the FBref spine).
 -- Each keeps a deterministic 'sf_'-prefixed id instead of a NULL PK component:
 --
---   player_id = COALESCE(canonical_id, 'sf_' || player_id)
+--   player_id = COALESCE(canonical_id, 'sf_' || CAST(player_id AS varchar))
 --
 -- 'sf_' mirrors xref_player_resolver._orphan_prefix; the dim_player FK is
 -- therefore WARNING rate-mode.
@@ -33,7 +33,7 @@
 
 WITH resolved AS (
     SELECT
-        COALESCE(p.canonical_id, 'sf_' || p.player_id)   AS player_id,
+        COALESCE(p.canonical_id, 'sf_' || CAST(p.player_id AS varchar))   AS player_id,
         p.player_name,
         p.fifa_edition,
         p.overall,
@@ -53,7 +53,7 @@ WITH resolved AS (
         p.wage_eur,
         p._bronze_ingested_at,
         ROW_NUMBER() OVER (
-            PARTITION BY COALESCE(p.canonical_id, 'sf_' || p.player_id),
+            PARTITION BY COALESCE(p.canonical_id, 'sf_' || CAST(p.player_id AS varchar)),
                          p.fifa_edition
             ORDER BY p.overall DESC NULLS LAST, p._bronze_ingested_at DESC
         )                                                AS rn
