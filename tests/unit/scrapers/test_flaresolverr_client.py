@@ -12,8 +12,31 @@ from scrapers.base.flaresolverr_client import (
     FlareSolverrClient,
     FlareSolverrError,
     FlareSolverrTimeout,
+    describe_proxy_mode,
     is_chromium_error_page,
 )
+
+
+# -----------------------------------------------------------------------------
+# describe_proxy_mode (issue #616 — proxy mode visibility)
+# -----------------------------------------------------------------------------
+
+
+class TestDescribeProxyMode:
+    def test_none_is_proxy_less(self):
+        assert describe_proxy_mode(None).startswith('PROXY-LESS')
+
+    def test_empty_string_is_proxy_less(self):
+        assert describe_proxy_mode('').startswith('PROXY-LESS')
+
+    def test_filter_url_named_as_filter(self):
+        assert 'filter' in describe_proxy_mode('http://proxy_filter:8899')
+
+    def test_residential_url_named_without_leaking_creds(self):
+        url = 'http://user:secret@residential.example.com:8080'
+        desc = describe_proxy_mode(url)
+        assert desc == 'via residential proxy'
+        assert 'secret' not in desc
 
 
 # -----------------------------------------------------------------------------
