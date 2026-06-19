@@ -212,7 +212,6 @@ class TestFctPlayerMatchAuditSql:
             "source_id",
             "league",
             "season",
-            "_gold_created_at",
             "_gold_loaded_at",
         }
         for alias in aliases:

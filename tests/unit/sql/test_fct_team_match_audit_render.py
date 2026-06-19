@@ -136,7 +136,6 @@ class TestFctTeamMatchAuditSql:
         allowed_non_diff = {
             "match_id",
             "team_id",
-            "_gold_created_at",
             "league",
             "season",
         }
