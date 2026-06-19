@@ -94,7 +94,7 @@ MIN_ROW_THRESHOLDS: Dict[str, int] = {
     'sofifa_players': 450,                 # 546 players / APL edition - 18%
     'sofifa_teams': 18,                    # 20 APL clubs - 10%
     'sofifa_team_ratings': 18,             # 20 APL clubs - 10%
-    'sofifa_versions': 800,                # 852-row catalogue, grows only
+    'sofifa_versions': 15,                 # ~20 editions (FIFA 07→FC 26) on post-EA-FC homepage (#654/#670); +1/yr
     'sofifa_leagues': 1,                   # 1-row lookup (APL-only scope)
     'sofifa_player_ratings': 450,          # 546 per-player pages / edition - 18%
 }
