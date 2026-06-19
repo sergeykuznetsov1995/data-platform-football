@@ -4,40 +4,42 @@
 table:
   fullyQualifiedName: trino_iceberg.iceberg.gold.fct_player_market_value
   description: |
-    Timeline рыночной стоимости игроков (FotMob). Один row per
-    (player_id_canonical, value_date, league, season). Источник —
-    silver.fotmob_player_market_value_history (UNNEST из FotMob
-    market_values_json). Bridge FotMob player_id → canonical_id через
-    silver.xref_player WHERE source='fotmob' AND confidence <> 'orphan',
-    JOIN включает (league, season) предикат (CLAUDE.md footgun: иначе
-    1.5-4× fan-out). Cross-season дубликаты исторических точек ожидаемы
-    (FotMob отдаёт history в каждом ingest); потребитель фильтрует
-    WHERE season = (MAX) для «last view». TM расширение источника —
-    followup (silver.transfermarkt_market_value_history уже содержит
-    параллельный timeline + canonical_id). Latest точка дублируется в
-    dim_player_attributes.current_market_value_eur_fotmob для удобства
-    BI-карточки игрока (issue #11 Part B).
+    Timeline рыночной стоимости игроков из ДВУХ источников (issue #430). Один
+    row per (player_id_canonical, valuation_date, source) — FotMob и
+    Transfermarkt-точки хранятся бок о бок, «правильный» источник здесь НЕ
+    выбирается (feature-решение downstream). Pointwise off-field факт: market
+    value — это career-long таймлайн, НЕ season-bound, поэтому БЕЗ league/season
+    и без партиционирования (как fct_team_elo). `source` в PK не даёт точкам
+    FotMob и Transfermarkt на одну (player, date) коллидировать.
+    Источники: silver.fotmob_player_market_value_history (canonical_id НЕ
+    разрешён в Silver → bridge через silver.xref_player WHERE source='fotmob'
+    AND confidence<>'orphan', INNER JOIN = canonical-only; JOIN включает
+    (league, season) предикат — CLAUDE.md footgun, иначе 1.5-4× fan-out) и
+    silver.transfermarkt_market_value_history (canonical_id уже разрешён в
+    Silver, читается напрямую, WHERE canonical_id IS NOT NULL). Обе половины
+    canonical-only → player_id_canonical всегда реальный 'fb_' canonical,
+    soft FK к dim_player остаётся low-orphan. ROW_NUMBER по design-PK
+    схлопывает cross-season дубликаты (источники re-emit'ят полную history
+    в каждом ingest-снэпшоте).
   tags:
     - Tier.Gold
     - Domain.Football
     - PII.Low
 columns:
   - name: player_id_canonical
-    description: Канонический ID игрока (FK → dim_player_attributes / silver.xref_player).
-  - name: value_date
-    description: Дата фиксации market_value (исторический snapshot timeline).
+    description: Канонический 'fb_' ID игрока (soft FK → dim_player, low-orphan). Часть PK (player_id_canonical, valuation_date, source).
+  - name: valuation_date
+    description: Дата фиксации market_value (FotMob value_date / Transfermarkt mv_date). Часть PK.
   - name: market_value_eur
-    description: Рыночная стоимость в EUR на value_date (BIGINT, value_range [0, 500M]).
+    description: Рыночная стоимость в EUR на valuation_date (BIGINT).
   - name: currency
-    description: Валюта котировки (обычно EUR).
+    description: Валюта котировки ('EUR' для обоих источников).
+  - name: source
+    description: Источник точки — 'fotmob' или 'transfermarkt'. Часть PK (разводит точки на одну (player, date)).
   - name: _bronze_ingested_at
-    description: Timestamp Bronze ingest'а из FotMob.
-  - name: league
-    description: Лига (partition key, current ingest league).
-  - name: season
-    description: Сезон — varchar slug ('2526' = сезон 2025/26), partition key, current ingest window.
+    description: Timestamp Bronze ingest'а исходной точки.
 relationships:
-  - from: player_id_canonical
-    to: trino_iceberg.iceberg.gold.dim_player_attributes.player_id_canonical
+  - from: trino_iceberg.iceberg.gold.fct_player_market_value
+    to:   trino_iceberg.iceberg.gold.dim_player
     type: FOREIGN_KEY
-    description: N:1 — таймлайн market_value для каждого канонического игрока.
+    description: player_id_canonical -> dim_player.player_id (soft, low-orphan).
