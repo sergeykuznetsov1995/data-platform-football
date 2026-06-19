@@ -13,6 +13,7 @@ import json
 import os
 import sys
 import tempfile
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -234,3 +235,60 @@ class TestNodriverImportFailure:
         assert result['scraper_type'] == 'nodriver', (
             "scraper_type must not be silently mutated to 'selenium'"
         )
+
+
+class TestHttpFastPathDiagnostics:
+    """#624: the runner must surface HTTP fast-path counters + fallback
+    diagnostics so a prod combined_match_data run can identify the dominant
+    cold-start cause (acceptance #1)."""
+
+    def _stub_scraper(self):
+        # SimpleNamespace has no `_update_real_traffic_stats`, so the flush in
+        # _get_traffic_diagnostics is skipped and `_stats` is read verbatim.
+        return SimpleNamespace(
+            _stats={
+                'http_fetch_ok': 7,
+                'http_fetch_fallback': 3,
+                'http_fetch_diag': [
+                    {'reason': 'non_200', 'cf_mitigated': 'challenge',
+                     'proxy': 'host:1'},
+                    {'reason': 'non_200', 'cf_mitigated': 'challenge',
+                     'proxy': 'host:1'},
+                    {'reason': 'incomplete_no_tables', 'cf_mitigated': None,
+                     'proxy': 'host:2'},
+                ],
+            }
+        )
+
+    @pytest.mark.unit
+    def test_get_traffic_diagnostics_surfaces_http_fast_path(self):
+        import dags.scripts.run_fbref_scraper as m
+
+        diag = m._get_traffic_diagnostics(self._stub_scraper())
+
+        assert diag['http_fetch_ok'] == 7
+        assert diag['http_fetch_fallback'] == 3
+        assert len(diag['http_fetch_diag']) == 3
+        assert diag['http_fetch_diag_summary']['by_reason'] == {
+            'non_200': 2, 'incomplete_no_tables': 1,
+        }
+        assert diag['http_fetch_diag_summary']['by_cf_mitigated'] == {
+            'challenge': 2,
+        }
+
+    @pytest.mark.unit
+    def test_write_traffic_summary_includes_http_fast_path(self, tmp_path):
+        import dags.scripts.run_fbref_scraper as m
+
+        out = tmp_path / 'traffic.json'
+        m._write_traffic_summary(
+            self._stub_scraper(),
+            label='match_all_data',
+            mode='combined_match_data',
+            explicit_path=str(out),
+        )
+
+        payload = json.loads(out.read_text())
+        assert payload['http_fetch_ok'] == 7
+        assert payload['http_fetch_fallback'] == 3
+        assert payload['http_fetch_diag_summary']['by_reason']['non_200'] == 2

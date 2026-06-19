@@ -30,6 +30,7 @@ import json
 import logging
 import os
 import sys
+from collections import Counter
 from datetime import datetime
 from typing import Optional
 
@@ -107,6 +108,16 @@ def _get_traffic_diagnostics(scraper) -> dict:
         k: round(v / 1024 / 1024, 3) for k, v in total_bytes_by_rtype.items()
     }
 
+    # Issue #624 — HTTP fast-path fallback diagnostics. Each fallback to the
+    # nodriver browser risks a fresh CF cold-start (~2 MB proxy). The dominant
+    # fallback cause gates the fix: the summary aggregates ALL records by
+    # reason / cf-mitigated, the raw list (capped) keeps recent samples.
+    http_diag = list(stats.get('http_fetch_diag', []) or [])
+    diag_by_reason = Counter(d.get('reason') for d in http_diag)
+    diag_by_cf_mitigated = Counter(
+        d.get('cf_mitigated') for d in http_diag if d.get('cf_mitigated')
+    )
+
     return {
         'bytes_downloaded': html_bytes,
         'pages_downloaded': stats.get('pages_downloaded', 0),
@@ -148,6 +159,16 @@ def _get_traffic_diagnostics(scraper) -> dict:
         'total_proxy_bytes_by_resource_type': total_bytes_by_rtype,
         'total_proxy_mb_by_resource_type': total_mb_by_rtype,
         'total_proxy_requests_by_resource_type': total_reqs_by_rtype,
+        # Issue #624 — HTTP fast-path reliability. A fallback (http_fetch_fallback)
+        # is a nodriver fetch that can trigger a CF cold-start; keeping the
+        # fast-path success rate high is the lever for per-match proxy traffic.
+        'http_fetch_ok': int(stats.get('http_fetch_ok', 0) or 0),
+        'http_fetch_fallback': int(stats.get('http_fetch_fallback', 0) or 0),
+        'http_fetch_diag': http_diag[-50:],
+        'http_fetch_diag_summary': {
+            'by_reason': dict(diag_by_reason),
+            'by_cf_mitigated': dict(diag_by_cf_mitigated),
+        },
     }
 
 
@@ -212,6 +233,13 @@ def _write_traffic_summary(
         'total_proxy_requests_by_resource_type': traffic.get(
             'total_proxy_requests_by_resource_type', {}
         ),
+        # Issue #624 — HTTP fast-path reliability + fallback diagnostics so the
+        # per-task traffic JSON (read by traffic_guard) carries the cold-start
+        # signal, not just totals.
+        'http_fetch_ok': traffic.get('http_fetch_ok', 0),
+        'http_fetch_fallback': traffic.get('http_fetch_fallback', 0),
+        'http_fetch_diag': traffic.get('http_fetch_diag', []),
+        'http_fetch_diag_summary': traffic.get('http_fetch_diag_summary', {}),
     }
     if extra:
         payload.update(extra)

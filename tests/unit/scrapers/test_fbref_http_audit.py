@@ -47,6 +47,9 @@ def _make_scraper_stub():
     scraper._http_session = MagicMock()
     scraper._http_request_count = 0
     scraper._http_cookies_time = None
+    # Issue #624: `_record_http_diag` now reads the current nodriver proxy.
+    # Mirror the real __init__ default so failure-path recording can't raise.
+    scraper._nodriver_browser = None
     scraper._stats = {
         'http_bytes_downloaded': 0,
         'http_requests_count': 0,
@@ -131,3 +134,39 @@ class TestFetchPageHttpAudit:
             len(body1) + len(body2)
         )
         assert scraper._stats['http_requests_by_resource_type']['Document'] == 2
+
+
+class TestHttpDiagProxyField:
+    """Issue #624: `_record_http_diag` records the current nodriver proxy
+    (sanitized) so proxy-mismatch fallbacks can be told apart from TLS/expiry."""
+
+    @pytest.mark.unit
+    def test_diag_records_none_proxy_without_browser(self):
+        scraper = _make_scraper_stub()  # _nodriver_browser = None
+        scraper._http_session.get.return_value = _make_response(
+            403, '<html>blocked</html>'
+        )
+
+        scraper._fetch_page_http('https://fbref.com/test')
+
+        diag = scraper._stats['http_fetch_diag']
+        assert len(diag) == 1
+        assert diag[0]['reason'] == 'non_200'
+        assert diag[0]['proxy'] is None
+
+    @pytest.mark.unit
+    def test_diag_records_sanitized_proxy(self):
+        scraper = _make_scraper_stub()
+        browser = MagicMock()
+        browser.proxy = 'http://user:secret@pool.example.io:10587'
+        scraper._nodriver_browser = browser
+        scraper._http_session.get.return_value = _make_response(
+            403, '<html>blocked</html>'
+        )
+
+        scraper._fetch_page_http('https://fbref.com/test')
+
+        diag = scraper._stats['http_fetch_diag']
+        assert len(diag) == 1
+        # Credentials must be stripped — host:port only.
+        assert diag[0]['proxy'] == 'pool.example.io:10587'

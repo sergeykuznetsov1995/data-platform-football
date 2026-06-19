@@ -396,6 +396,10 @@ class FBrefBrowserMixin:
             "content_length": hdrs.get("Content-Length") or hdrs.get("content-length"),
             "cookies_age_min": cookies_age_min,
             "request_n": self._http_request_count,
+            # Issue #624: proxy the nodriver browser is currently on. cf_clearance
+            # is IP-bound; if this drifts from the proxy the curl session was
+            # minted on, the fallback is a proxy-mismatch (not TLS / expiry).
+            "proxy": self._sanitize_proxy_url(self._get_current_nodriver_proxy_url()),
         }
         if html_preview:
             record["html_preview"] = html_preview[:500]
