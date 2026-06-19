@@ -119,16 +119,14 @@ columns:
     description: "Diff офсайдов: ss.offsides - fm.offsides."
 
   # ─── Lineage ───
-  - name: _gold_created_at
-    description: Технический timestamp создания строки в Gold-слое.
   - name: league
     description: Лига (partition key).
   - name: season
     description: Сезон, slug-форма '2526' (fb.season_slug). Partition key.
   - name: _silver_created_at
     description: >-
-      Технический timestamp: инжектируется runner'ом (run_silver_transform)
-      поверх SQL. Дублирует _gold_created_at — унификация в followup.
+      Технический timestamp создания строки в Gold-слое: инжектируется
+      runner'ом (run_silver_transform) поверх SQL.
 
 relationships:
   - from: match_id

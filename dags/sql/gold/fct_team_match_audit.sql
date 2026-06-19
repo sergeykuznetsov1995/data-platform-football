@@ -256,9 +256,6 @@ SELECT
     (CAST(ss.fouls             AS DOUBLE) - CAST(fm.fouls           AS DOUBLE)) AS fouls_diff_ss_fm,
     (CAST(ss.offsides          AS DOUBLE) - CAST(fm.offsides        AS DOUBLE)) AS offsides_diff_ss_fm,
 
-    -- ========= Lineage =========
-    CURRENT_TIMESTAMP                                     AS _gold_created_at,
-
     -- ========= Partition keys (LAST in SELECT) =========
     fb.league                                             AS league,
     fb.season_slug                                        AS season

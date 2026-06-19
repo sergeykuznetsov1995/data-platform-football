@@ -204,9 +204,6 @@ SELECT
     ROUND(CAST(us.xg AS DOUBLE) - CAST(ss.xg AS DOUBLE), 4) AS xg_diff_us_ss,
     ROUND(CAST(us.xa AS DOUBLE) - CAST(ss.xa AS DOUBLE), 4) AS xa_diff_us_ss,
 
-    -- ========= Lineage =========
-    CURRENT_TIMESTAMP                                      AS _gold_created_at,
-
     -- ========= Partition keys (must be last for Iceberg partitioning) =========
     xfp.league                                             AS league,
     xfp.season_slug                                        AS season
