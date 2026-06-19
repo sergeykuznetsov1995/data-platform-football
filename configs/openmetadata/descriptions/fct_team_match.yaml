@@ -142,16 +142,14 @@ columns:
   - name: shots_off_target
     description: Удары мимо створа (FotMob).
   # ===== Lineage =====
-  - name: _gold_created_at
-    description: Время материализации CTAS (UTC).
   - name: league
     description: Лига.
   - name: season
     description: Сезон — varchar slug ('2425' = сезон 2024/25).
   - name: _silver_created_at
     description: >-
-      Технический timestamp: инжектируется runner'ом (run_silver_transform)
-      поверх SQL. Дублирует _gold_created_at — унификация в followup.
+      Технический timestamp материализации CTAS (UTC): инжектируется runner'ом
+      (run_silver_transform) поверх SQL.
 relationships:
   - from: match_id
     to: trino_iceberg.iceberg.gold.dim_match.match_id

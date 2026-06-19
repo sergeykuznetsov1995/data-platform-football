@@ -220,9 +220,6 @@ SELECT
     -- Rating — SofaScore (Opta) единственный источник на match-grain.
     ROUND(ss.rating, 2)                                  AS rating,
 
-    -- ========= Lineage =========
-    CURRENT_TIMESTAMP                                    AS _gold_created_at,
-
     -- ========= Partition keys (LAST in SELECT) =========
     xfp.league                                           AS league,
     xfp.season_slug                                      AS season

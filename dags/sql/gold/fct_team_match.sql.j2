@@ -315,9 +315,6 @@ SELECT
     fm.blocked_shots,
     fm.shots_off_target,
 
-    -- ===== Lineage =====
-    CURRENT_TIMESTAMP                                             AS _gold_created_at,
-
     -- ===== Partition keys (LAST in SELECT) =====
     u.league,
     u.season
