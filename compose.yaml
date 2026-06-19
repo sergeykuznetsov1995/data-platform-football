@@ -30,6 +30,10 @@ x-airflow-common: &airflow-common
     AIRFLOW__CELERY__BROKER_URL: ${AIRFLOW__CELERY__BROKER_URL}
     AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW__WEBSERVER__SECRET_KEY}
     AIRFLOW__WEBSERVER__EXPOSE_CONFIG: ${AIRFLOW__WEBSERVER__EXPOSE_CONFIG}
+    # Блокирующие CF-вызовы SoFIFA (max_timeout_ms=90s) под memory-pressure FlareSolverr могут
+    # задержать heartbeat LocalTaskJob; дефолт 300s триггерил ложный zombie-SIGTERM в долгих
+    # proxy-less прогонах (~545 player-страниц). 1200s покрывает 90s-вызов + ротации/ретраи (#671).
+    AIRFLOW__SCHEDULER__SCHEDULER_ZOMBIE_TASK_THRESHOLD: "1200"
     SPARK_MASTER_URL: ${SPARK_MASTER_URL}
     TRINO_PASSWORD: ${TRINO_PASSWORD}
     TRINO_PORT: ${TRINO_PORT}
@@ -939,7 +943,10 @@ services:
     deploy:
       resources:
         limits:
-          memory: 512M
+          # Было 512M — полный proxy-less прогон SoFIFA (~545 страниц) упирал Chromium в
+          # ~476M (93%) → memory-pressure → хвостовые CF timeout + ложный zombie-reset (#671).
+          # 1G ≈ 2× пика, headroom без свопа (своп Chromium = медленнее = больше CF timeout).
+          memory: 1G
         reservations:
           memory: 256M
     networks:
