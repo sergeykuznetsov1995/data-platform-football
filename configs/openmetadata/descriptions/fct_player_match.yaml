@@ -157,16 +157,14 @@ columns:
       SofaScore не имеет записи для этого матча × игрока.
 
   # ─── Lineage ───
-  - name: _gold_created_at
-    description: Технический timestamp создания строки в Gold-слое.
   - name: league
     description: Лига (partition key).
   - name: season
     description: Сезон — varchar slug ('2425' = сезон 2024/25). Partition key.
   - name: _silver_created_at
     description: >-
-      Технический timestamp: инжектируется runner'ом (run_silver_transform)
-      поверх SQL. Дублирует _gold_created_at — унификация в followup.
+      Технический timestamp создания строки в Gold-слое: инжектируется runner'ом
+      (run_silver_transform) поверх SQL.
 
 relationships:
   - from: match_id
