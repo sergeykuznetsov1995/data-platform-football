@@ -490,6 +490,10 @@ services:
           --lastname User \
           --role Admin \
           --email admin@example.com || true
+        # Serialize heavy ingest scrapers to 1 concurrent task platform-wide:
+        # two browser/FlareSolverr scrapers at once exhaust VM swap → scheduler
+        # stalls → live tasks get orphan-reset (#671). Idempotent (create/update).
+        airflow pools set 'ingest_scraper_pool' 1 'Serialize heavy ingest scrapers to avoid VM swap (#671)'
         echo "Airflow initialization complete"
     environment:
       <<: *airflow-common-env

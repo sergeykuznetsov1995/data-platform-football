@@ -243,3 +243,193 @@ class TestEnvTunables:
         assert _env_num('FBREF_TEST_TUNABLE', 15.0, float) == 15.0
         monkeypatch.setenv('FBREF_TEST_TUNABLE', '')
         assert _env_num('FBREF_TEST_TUNABLE', 15.0, float) == 15.0
+
+
+# Body must contain '<table' and no CF keywords to pass the `_fetch_page`
+# validation gates and be returned as a successful (non-match) page.
+_VALID_HTML = '<html><body><table id="x">' + 'x' * 200 + '</table></body></html>'
+
+
+def _make_fetch_stub():
+    """Stub for driving `_fetch_page` orchestration (issue #624 decouple).
+
+    `_fetch_page` is the main fetch loop; here every heavy collaborator
+    (`_fetch_page_http`/`_fetch_page_nodriver`, restart, re-mint, proxy
+    manager) is mocked and only the branching state the loop reads is set.
+    Mirrors the real __init__ defaults for the #624 knobs.
+    """
+    from scrapers.fbref.scraper import FBrefScraper
+
+    scraper = FBrefScraper.__new__(FBrefScraper)
+    scraper.use_nodriver = True
+    scraper._page_cache = {}
+    scraper._rate_limiter = MagicMock()
+    scraper._proxy_manager = None
+    scraper._current_proxy_obj = None
+    scraper._consecutive_fetch_failures = 0
+    scraper.MAX_SLOW_PROXY_RETRIES = 1
+    scraper.MAX_CONSECUTIVE_FAILURES = 15
+    # HTTP fast-path state (#624)
+    scraper._http_session = MagicMock(name='http_session')
+    scraper._http_cookies_expired = MagicMock(return_value=False)
+    scraper._http_proxy_minted = 'minted.example.io:1'
+    scraper._http_consecutive_fallbacks = 0
+    scraper.HTTP_MAX_FALLBACKS_BEFORE_REMINT = 2
+    scraper.RESET_HTTP_ON_RESTART = 0
+    scraper._stats = {
+        'failures': 0,
+        'successes': 0,
+        'bytes_downloaded': 0,
+        'http_fetch_ok': 0,
+        'http_fetch_fallback': 0,
+    }
+    # Mock collaborators so only the orchestration under test executes.
+    scraper._fetch_page_http = MagicMock(return_value=None)
+    scraper._fetch_page_nodriver = MagicMock(return_value=_VALID_HTML)
+    scraper._fetch_page_selenium = MagicMock(return_value=_VALID_HTML)
+    scraper._track_download = MagicMock()
+    scraper._manage_cache_size = MagicMock()
+    scraper._maybe_restart_browser = MagicMock()
+    scraper._try_init_http_session = MagicMock()
+    scraper._try_change_proxy_nodriver = MagicMock(return_value=False)
+    scraper._close_browser = MagicMock()
+    return scraper
+
+
+class TestColdStartDecouple:
+    """Issue #624: a slow/dead *nodriver* proxy must NOT drop the *curl* fast-path
+    session — it is bound to its own proxy and survives browser restarts. The
+    restart sites pass `reset_http=False` by default; FBREF_RESET_HTTP_ON_RESTART
+    restores the old reset-on-restart behaviour."""
+
+    @pytest.mark.unit
+    def test_slow_proxy_restart_keeps_http_session(self):
+        from scrapers.base.browser.nodriver_bypass import SlowProxyError
+
+        scraper = _make_fetch_stub()
+        scraper._fetch_page_nodriver = MagicMock(side_effect=SlowProxyError('slow'))
+
+        result = scraper._fetch_page('https://fbref.com/x', page_type='other')
+
+        assert result is None
+        scraper._close_browser.assert_called_once_with(
+            reset_http=False, reason='slow_proxy'
+        )
+
+    @pytest.mark.unit
+    def test_consecutive_failures_restart_keeps_http_session(self):
+        scraper = _make_fetch_stub()
+        scraper.MAX_CONSECUTIVE_FAILURES = 1
+        scraper._fetch_page_nodriver = MagicMock(side_effect=RuntimeError('boom'))
+
+        result = scraper._fetch_page('https://fbref.com/x', page_type='other')
+
+        assert result is None
+        scraper._close_browser.assert_called_once_with(
+            reset_http=False, reason='consecutive_failures'
+        )
+
+    @pytest.mark.unit
+    def test_env_hatch_restores_reset_on_slow_proxy(self):
+        from scrapers.base.browser.nodriver_bypass import SlowProxyError
+
+        scraper = _make_fetch_stub()
+        scraper.RESET_HTTP_ON_RESTART = 1  # opt back into old reset-on-restart
+        scraper._fetch_page_nodriver = MagicMock(side_effect=SlowProxyError('slow'))
+
+        scraper._fetch_page('https://fbref.com/x', page_type='other')
+
+        scraper._close_browser.assert_called_once_with(
+            reset_http=True, reason='slow_proxy'
+        )
+
+    @pytest.mark.unit
+    def test_warm_path_never_drops_session_or_restarts(self):
+        scraper = _make_fetch_stub()
+        sentinel = scraper._http_session
+        scraper._fetch_page_http = MagicMock(return_value=_VALID_HTML)  # fast-path hit
+
+        for i in range(5):
+            scraper._page_cache.clear()
+            assert (
+                scraper._fetch_page(f'https://fbref.com/{i}', page_type='other')
+                == _VALID_HTML
+            )
+
+        assert scraper._stats['http_fetch_ok'] == 5
+        assert scraper._stats['http_fetch_fallback'] == 0
+        assert scraper._http_consecutive_fallbacks == 0
+        assert scraper._http_session is sentinel
+        scraper._close_browser.assert_not_called()
+        scraper._try_init_http_session.assert_not_called()
+
+
+class TestFallbackRemintCounter:
+    """Issue #624: the curl path never reports proxy failures to the proxy-manager,
+    so a dead pinned proxy is bounded by a fallback counter — after N consecutive
+    fallbacks the session is dropped to re-mint on the next nodriver fetch. The
+    counter resets on any fast-path success."""
+
+    @pytest.mark.unit
+    def test_counter_increments_below_threshold(self):
+        scraper = _make_fetch_stub()
+        sentinel = scraper._http_session
+        # fast-path miss (stub default), nodriver succeeds → counter +1, no drop
+
+        result = scraper._fetch_page('https://fbref.com/x', page_type='other')
+
+        assert result == _VALID_HTML
+        assert scraper._stats['http_fetch_fallback'] == 1
+        assert scraper._http_consecutive_fallbacks == 1
+        assert scraper._http_session is sentinel  # below threshold → not dropped
+        scraper._try_init_http_session.assert_not_called()
+
+    @pytest.mark.unit
+    def test_counter_resets_on_fast_path_success(self):
+        scraper = _make_fetch_stub()
+        scraper._http_consecutive_fallbacks = 3  # pre-existing streak
+        scraper._fetch_page_http = MagicMock(return_value=_VALID_HTML)  # hit
+
+        result = scraper._fetch_page('https://fbref.com/x', page_type='other')
+
+        assert result == _VALID_HTML
+        assert scraper._stats['http_fetch_ok'] == 1
+        assert scraper._http_consecutive_fallbacks == 0
+
+    @pytest.mark.unit
+    def test_remint_fires_at_threshold(self):
+        scraper = _make_fetch_stub()
+        scraper.HTTP_MAX_FALLBACKS_BEFORE_REMINT = 2
+        scraper._http_consecutive_fallbacks = 1  # one miss away from threshold
+
+        result = scraper._fetch_page('https://fbref.com/x', page_type='other')
+
+        assert result == _VALID_HTML
+        # at threshold the curl session is dropped + counter reset; the nodriver
+        # success then re-mints via the lazy-init hook.
+        assert scraper._http_consecutive_fallbacks == 0
+        assert scraper._http_proxy_minted is None
+        scraper._try_init_http_session.assert_called_once()
+
+
+class TestRemintTunableDefaults:
+    """Issue #624: the new re-mint / rollback knobs default to the documented
+    values (re-mint after 2 fallbacks; rollback hatch off)."""
+
+    @pytest.mark.unit
+    def test_defaults_when_env_absent(self, monkeypatch):
+        from scrapers.fbref.scraper import _env_num
+
+        monkeypatch.delenv('FBREF_HTTP_MAX_FALLBACKS_BEFORE_REMINT', raising=False)
+        monkeypatch.delenv('FBREF_RESET_HTTP_ON_RESTART', raising=False)
+        assert _env_num('FBREF_HTTP_MAX_FALLBACKS_BEFORE_REMINT', 2, int) == 2
+        assert _env_num('FBREF_RESET_HTTP_ON_RESTART', 0, int) == 0
+
+    @pytest.mark.unit
+    def test_overrides_applied(self, monkeypatch):
+        from scrapers.fbref.scraper import _env_num
+
+        monkeypatch.setenv('FBREF_HTTP_MAX_FALLBACKS_BEFORE_REMINT', '4')
+        monkeypatch.setenv('FBREF_RESET_HTTP_ON_RESTART', '1')
+        assert _env_num('FBREF_HTTP_MAX_FALLBACKS_BEFORE_REMINT', 2, int) == 4
+        assert _env_num('FBREF_RESET_HTTP_ON_RESTART', 0, int) == 1

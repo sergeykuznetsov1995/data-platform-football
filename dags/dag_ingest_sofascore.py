@@ -26,7 +26,7 @@ from airflow.operators.bash import BashOperator
 from airflow.operators.python import PythonOperator
 
 from utils.config import LEAGUES, CURRENT_SEASON, SCHEDULES, DAG_TAGS
-from utils.default_args import DEFAULT_ARGS
+from utils.default_args import SCRAPER_ARGS
 
 
 SCHEDULE_RESULT_PATH = '/tmp/sofascore_result.json'
@@ -288,7 +288,7 @@ leagues_str = ','.join(LEAGUES)
 # DAG definition
 with DAG(
     dag_id='dag_ingest_sofascore',
-    default_args=DEFAULT_ARGS,
+    default_args=SCRAPER_ARGS,
     description='Ingest football statistics from SofaScore',
     schedule=SCHEDULES.get('dag_ingest_sofascore', '0 11 * * *'),
     start_date=datetime(2024, 1, 1),

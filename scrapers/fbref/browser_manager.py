@@ -644,9 +644,27 @@ class FBrefBrowserMixin:
                     if html is not None:
                         self._stats.setdefault('http_fetch_ok', 0)
                         self._stats['http_fetch_ok'] += 1
+                        self._http_consecutive_fallbacks = 0
                     else:
                         self._stats.setdefault('http_fetch_fallback', 0)
                         self._stats['http_fetch_fallback'] += 1
+                        # Issue #624: the curl session keeps its OWN proxy across
+                        # nodriver restarts, so the proxy-manager never bans it on
+                        # failure. A run of fallbacks means that pinned proxy is
+                        # dead — drop the session so the next nodriver fetch
+                        # re-mints cf_clearance on the current (healthy) proxy.
+                        # Bounds the dead-proxy streak; reset the counter so we
+                        # don't re-trip before the re-mint lands.
+                        self._http_consecutive_fallbacks += 1
+                        if self._http_consecutive_fallbacks >= self.HTTP_MAX_FALLBACKS_BEFORE_REMINT:
+                            self._http_session = None
+                            self._http_proxy_minted = None
+                            self._http_consecutive_fallbacks = 0
+                            logger.info(
+                                "[http-fast-path] %d consecutive fallbacks — dropping "
+                                "curl session to re-mint on next nodriver fetch",
+                                self.HTTP_MAX_FALLBACKS_BEFORE_REMINT,
+                            )
 
                 # Fallback / first-time path: nodriver (or selenium)
                 if html is None:
@@ -778,7 +796,15 @@ class FBrefBrowserMixin:
                         f"{e} — proxy changed via CDP, retrying immediately"
                     )
                 else:
-                    self._close_browser(reason='slow_proxy')
+                    # Issue #624: keep the curl fast-path session — it is bound to
+                    # its OWN proxy and serves matches independently of which proxy
+                    # the nodriver browser rotates to. Dropping it here re-minted
+                    # cf_clearance from a full CF cold-start every restart (the
+                    # bad-day ~2 MB/match amplifier). FBREF_RESET_HTTP_ON_RESTART=1
+                    # restores the old reset-on-restart behaviour.
+                    self._close_browser(
+                        reset_http=bool(self.RESET_HTTP_ON_RESTART), reason='slow_proxy'
+                    )
                     if slow_retry < self.MAX_SLOW_PROXY_RETRIES - 1:
                         wait = 2 * (slow_retry + 1)
                         logger.warning(
@@ -800,7 +826,12 @@ class FBrefBrowserMixin:
                         f"{self._consecutive_fetch_failures} consecutive fetch failures "
                         f"— restarting browser for proxy rotation"
                     )
-                    self._close_browser(reason='consecutive_failures')
+                    # Issue #624: keep the curl fast-path session (see slow_proxy
+                    # branch) — it survives nodriver restarts on its own proxy.
+                    self._close_browser(
+                        reset_http=bool(self.RESET_HTTP_ON_RESTART),
+                        reason='consecutive_failures',
+                    )
                     self._consecutive_fetch_failures = 0
                 logger.error(f"Error fetching page {url}: {e}", exc_info=True)
                 return None
@@ -934,9 +965,12 @@ class FBrefBrowserMixin:
         """Close browser and clean up resources.
 
         Args:
-            reset_http: If True, also reset the HTTP session. Set to False
-                when restarting browser for memory reasons (same proxy,
-                cookies still valid).
+            reset_http: If True, also reset the HTTP session. Default-False at
+                the slow_proxy / consecutive_failures / page_limit restart sites
+                (issue #624): the curl fast-path session is bound to its OWN
+                proxy and survives nodriver restarts independently — a fallback
+                run re-mints it, not the restart. True only on explicit/Selenium
+                close or when FBREF_RESET_HTTP_ON_RESTART=1.
             reason: Why the browser is being closed — passed through to
                 NodriverBypass.close_sync() for the restart_reasons counter
                 (issue #44). Accepted: 'slow_proxy', 'consecutive_failures',
@@ -1026,7 +1060,10 @@ class FBrefBrowserMixin:
             self._stats['restart_reasons'] = dict(self._restart_reasons_base)
             self._stats['resource_type_cache_misses'] = self._resource_type_cache_misses_base
 
-        # Reset HTTP session only when proxy changes (SlowProxyError, explicit close)
+        # Reset HTTP session only when the caller asks (explicit/Selenium close,
+        # or FBREF_RESET_HTTP_ON_RESTART=1). Issue #624: proxy-rotation restarts
+        # (slow_proxy / consecutive_failures) now pass reset_http=False — the curl
+        # session is pinned to its own proxy and re-minted by the fallback counter.
         if reset_http:
             self._http_session = None
             self._http_proxy_minted = None

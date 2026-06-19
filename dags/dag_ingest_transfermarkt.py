@@ -34,7 +34,7 @@ from airflow.operators.python import PythonOperator
 from airflow.operators.trigger_dagrun import TriggerDagRunOperator
 
 from utils.config import CURRENT_SEASON, DAG_TAGS, LEAGUES, SCHEDULES
-from utils.default_args import DEFAULT_ARGS
+from utils.default_args import SCRAPER_ARGS
 
 
 PLAYERS_RESULT_PATH = '/tmp/transfermarkt_players_result.json'
@@ -162,7 +162,7 @@ def validate_data(**context) -> Dict[str, Any]:
 
 with DAG(
     dag_id='dag_ingest_transfermarkt',
-    default_args=DEFAULT_ARGS,
+    default_args=SCRAPER_ARGS,
     description='Ingest Transfermarkt player + transfer Bronze (issue #43)',
     schedule=SCHEDULES.get('dag_ingest_transfermarkt', '0 4 * * 1'),
     start_date=datetime(2024, 1, 1),

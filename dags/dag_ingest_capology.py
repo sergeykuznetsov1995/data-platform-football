@@ -22,7 +22,7 @@ from airflow.operators.python import PythonOperator
 from airflow.operators.trigger_dagrun import TriggerDagRunOperator
 
 from utils.config import CURRENT_SEASON, DAG_TAGS, LEAGUES, SCHEDULES
-from utils.default_args import DEFAULT_ARGS
+from utils.default_args import SCRAPER_ARGS
 
 
 SALARIES_RESULT_PATH = '/tmp/capology_player_salaries_result.json'
@@ -103,7 +103,7 @@ def validate_data(**context) -> Dict[str, Any]:
 
 with DAG(
     dag_id='dag_ingest_capology',
-    default_args=DEFAULT_ARGS,
+    default_args=SCRAPER_ARGS,
     description='Ingest Capology player salaries Bronze (issue #43)',
     schedule=SCHEDULES.get('dag_ingest_capology', '0 5 * * 1'),
     start_date=datetime(2024, 1, 1),
