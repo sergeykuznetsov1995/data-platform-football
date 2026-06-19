@@ -214,6 +214,18 @@ class FBrefScraper(
         self._http_proxy_minted: Optional[str] = None
         self.HTTP_COOKIE_TTL_MINUTES = _env_num("FBREF_HTTP_COOKIE_TTL_MINUTES", 25, float)
         self.HTTP_MAX_REQUESTS = _env_num("FBREF_HTTP_MAX_REQUESTS", 150, int)
+        # Issue #624: the curl fast-path session is bound to its OWN proxy and is
+        # independent of the nodriver browser, so a slow/dead nodriver proxy must
+        # NOT drop it (that re-minted cf_clearance from a full CF cold-start every
+        # restart — the bad-day ~2 MB/match amplifier). Keep it across restarts;
+        # detect a genuinely dead curl proxy by a run of fallbacks and re-mint on
+        # the next nodriver fetch. FBREF_RESET_HTTP_ON_RESTART=1 restores the old
+        # reset-on-restart behaviour exactly.
+        self._http_consecutive_fallbacks: int = 0
+        self.HTTP_MAX_FALLBACKS_BEFORE_REMINT = _env_num(
+            "FBREF_HTTP_MAX_FALLBACKS_BEFORE_REMINT", 2, int
+        )
+        self.RESET_HTTP_ON_RESTART = _env_num("FBREF_RESET_HTTP_ON_RESTART", 0, int)
 
     # ------------------------------------------------------------------
     # URL helper delegates (backwards compatibility)
