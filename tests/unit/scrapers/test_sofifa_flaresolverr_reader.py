@@ -108,6 +108,37 @@ class TestFlareSolverrSoFIFAReader:
         with pytest.raises(ConnectionError):
             reader._download_and_save('https://sofifa.com/')
 
+    @pytest.mark.parametrize(
+        'html',
+        [
+            '<html><body>chrome-error://dino/</body></html>',
+            '<html id="neterror"><body>x</body></html>',
+            '<html><body>ERR_NO_SUPPORTED_PROXIES</body></html>',
+        ],
+    )
+    def test_download_and_save_rejects_chromium_error_page(self, mock_fs_client, reader, html):
+        """A Chromium net-error page (HTTP 200) must raise, not be returned (#655)."""
+        from scrapers.base.flaresolverr_client import FlareSolverrErrorPage
+
+        mock_fs_client.get.return_value = {'html': html, 'status': 200}
+        with pytest.raises(FlareSolverrErrorPage):
+            reader._download_and_save('https://sofifa.com/')
+
+    def test_download_and_save_does_not_cache_error_page(self, mock_fs_client, reader, tmp_path):
+        """Regression #655: the error page must NOT be written to disk, or
+        read_versions(max_age=1) would reuse the poisoned cache for up to a day."""
+        from scrapers.base.flaresolverr_client import FlareSolverrErrorPage
+
+        reader.no_store = False
+        fp = tmp_path / 'index.html'
+        mock_fs_client.get.return_value = {
+            'html': '<html><body>chrome-error://dino/ ERR_NO_SUPPORTED_PROXIES</body></html>',
+            'status': 200,
+        }
+        with pytest.raises(FlareSolverrErrorPage):
+            reader._download_and_save('https://sofifa.com/', filepath=fp)
+        assert not fp.exists()
+
     def test_var_param_raises(self, reader):
         with pytest.raises(NotImplementedError):
             reader._download_and_save('https://sofifa.com/', var='something')

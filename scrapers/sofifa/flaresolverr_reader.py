@@ -28,8 +28,10 @@ import soccerdata as sd
 from scrapers.base.flaresolverr_client import (
     FlareSolverrCFChallengeFailed,
     FlareSolverrClient,
+    FlareSolverrErrorPage,
     FlareSolverrTabCrashed,
     describe_proxy_mode,
+    is_chromium_error_page,
 )
 
 logger = logging.getLogger(__name__)
@@ -557,6 +559,10 @@ class FlareSolverrSoFIFAReader(sd.SoFIFA):
         if "_cf_chl_opt" in html or "Just a moment" in html:
             raise FlareSolverrCFChallengeFailed(
                 f"Cloudflare challenge HTML returned for {url} (status={status})"
+            )
+        if is_chromium_error_page(html):
+            raise FlareSolverrErrorPage(
+                f"Chromium error page returned for {url} (status={status}); refusing to cache"
             )
         if not html:
             raise ConnectionError(f"FlareSolverr returned empty body for {url}")
