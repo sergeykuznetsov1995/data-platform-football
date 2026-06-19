@@ -1,0 +1,64 @@
+# =============================================================================
+# OpenMetadata description: iceberg.gold.fct_player_fifa_rating
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.gold.fct_player_fifa_rating
+  description: |
+    EA Sports FC (FIFA) game-side рейтинги игроков (issue #430). Один row per
+    (player_id, fifa_edition). Проекция silver.sofifa_player_profile —
+    canonical_id уже разрешён в Silver (LEFT JOIN xref_player, source='sofifa'),
+    xref-хопа здесь нет. ВАЖНО: это game-side оценки EA Sports, НЕ реальные
+    матчевые метрики — дешёвый раз-в-год прокси качества игрока. fifa_edition —
+    натуральный season-ключ (1:1 с футбольным сезоном: 'FC 26' → '2526'),
+    поэтому это pointwise off-field факт без league/season и без партиций
+    (как fct_team_elo). Orphan-ID: для ≈15% игроков canonical_id NULL
+    (loan-out / U21 вне FBref-spine) → детерминированный 'sf_'-префикс. Эти
+    game-side рейтинги переехали сюда из dim_player_attributes (PR #657 / #609).
+  tags:
+    - Tier.Gold
+    - Domain.Football
+    - PII.Low
+columns:
+  - name: player_id
+    description: ID игрока — canonical_id или 'sf_'-orphan (soft FK → dim_player, WARNING rate-mode). Часть PK (player_id, fifa_edition).
+  - name: player_name
+    description: Имя игрока (SoFIFA).
+  - name: fifa_edition
+    description: Издание EA FC/FIFA = натуральный season-ключ ('FC 26' → '2526'). Часть PK.
+  - name: overall
+    description: Общий FIFA/FC рейтинг (0-99), game-side оценка EA Sports — НЕ реальная метрика.
+  - name: potential
+    description: Потенциальный FIFA/FC рейтинг (0-99).
+  - name: pace
+    description: Main-6 card-агрегат «Pace» (0-99).
+  - name: shooting
+    description: Main-6 card-агрегат «Shooting» (0-99).
+  - name: passing
+    description: Main-6 card-агрегат «Passing» (0-99).
+  - name: dribbling
+    description: Main-6 card-агрегат «Dribbling» (0-99).
+  - name: defending
+    description: Main-6 card-агрегат «Defending» (0-99).
+  - name: physical
+    description: Main-6 card-агрегат «Physical» (0-99).
+  - name: gk_diving
+    description: GK-скилл «Diving» (0-99, релевантен только вратарям).
+  - name: gk_handling
+    description: GK-скилл «Handling» (0-99).
+  - name: gk_kicking
+    description: GK-скилл «Kicking» (0-99).
+  - name: gk_positioning
+    description: GK-скилл «Positioning» (0-99).
+  - name: gk_reflexes
+    description: GK-скилл «Reflexes» (0-99).
+  - name: value_eur
+    description: Game-side рыночная стоимость в EUR (оценка EA Sports, не Transfermarkt).
+  - name: wage_eur
+    description: Game-side недельная зарплата в EUR (оценка EA Sports).
+  - name: _bronze_ingested_at
+    description: Timestamp Bronze ingest'а из SoFIFA.
+relationships:
+  - from: trino_iceberg.iceberg.gold.fct_player_fifa_rating
+    to:   trino_iceberg.iceberg.gold.dim_player
+    type: FOREIGN_KEY
+    description: player_id -> dim_player.player_id (soft, ≈15% 'sf_'-orphan).
