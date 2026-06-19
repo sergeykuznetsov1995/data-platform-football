@@ -44,6 +44,7 @@ SELECT
     CAST(NULL AS INTEGER)       AS height_cm,
     CAST(NULL AS INTEGER)       AS weight_kg,
     CAST(NULL AS VARCHAR)       AS nationality,
+    CAST(NULL AS VARCHAR)       AS preferred_foot,
 
     CAST(NULL AS VARCHAR)       AS team,
     CAST(NULL AS VARCHAR)       AS fifa_edition,

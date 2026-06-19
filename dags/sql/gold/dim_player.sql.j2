@@ -128,7 +128,8 @@ sofifa_latest AS (
         MAX_BY(dob,         season) AS dob,
         MAX_BY(nationality, season) AS nationality,
         MAX_BY(height_cm,   season) AS height_cm,
-        MAX_BY(position,    season) AS position
+        MAX_BY(position,    season) AS position,
+        MAX_BY(preferred_foot, season) AS preferred_foot
     FROM iceberg.silver.sofifa_player_profile
     WHERE canonical_id IS NOT NULL
     GROUP BY canonical_id
@@ -188,7 +189,8 @@ SELECT
              REGEXP_EXTRACT(fb.nation, '[A-Z]{3}'))                AS nationality,
     COALESCE(tm.height_cm, fm.height_cm,
              ss.height_cm, sf.height_cm)                           AS height_cm,
-    LOWER(COALESCE(tm.foot, fm.foot, ss.preferred_foot))           AS preferred_foot,
+    LOWER(COALESCE(tm.foot, fm.foot,
+                   ss.preferred_foot, sf.preferred_foot))          AS preferred_foot,
     -- First position token: SoFIFA 'ST, RW' -> 'ST'; FBref 'MF,FW' -> 'MF'.
     COALESCE(REGEXP_EXTRACT(sf.position, '^[A-Za-z]+'),
              REGEXP_EXTRACT(fb.pos,      '^[A-Za-z]+'))            AS primary_position

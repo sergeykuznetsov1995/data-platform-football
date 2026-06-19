@@ -1519,6 +1519,7 @@
         "position": "varchar",
         "positioning": "bigint",
         "potential": "bigint",
+        "preferred_foot": "varchar",
         "reactions": "bigint",
         "release_clause_eur": "bigint",
         "shooting": "bigint",

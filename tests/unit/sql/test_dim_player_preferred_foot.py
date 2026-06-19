@@ -1,31 +1,27 @@
 """
-Executable unit test for Gold ``dim_player`` dob logic (issue #584).
+Executable unit test for Gold ``dim_player`` preferred_foot logic (issue #663).
 
-``dim_player.sql.j2`` resolves ``dob`` via
-``COALESCE(TRY_CAST(fm.date_of_birth), ss.date_of_birth, tm.dob,
-          TRY(CAST(date_parse(sf.dob, '%b %e, %Y') AS DATE)))``.
+``dim_player.sql.j2`` resolves ``preferred_foot`` via
+``LOWER(COALESCE(tm.foot, fm.foot, ss.preferred_foot, sf.preferred_foot))``.
 
-SoFIFA carries dob as a ``"Mon D, YYYY"`` string (e.g. ``'Nov 9, 1982'``).
-Before #584 the SoFIFA branch was a plain ``TRY_CAST(sf.dob AS DATE)`` which can
-NOT parse that format → always NULL, so SoFIFA never enriched dob. The pilot
-(FIFA 18) surfaced this: height filled but dob did not. This proves the emitted
-dob VALUE:
+Before #663 SoFIFA was absent from the chain (its parser never extracted foot,
+so silver had no column). #663 wires it through Bronze → Silver → Gold and adds
+``sf.preferred_foot`` as the LAST fallback. This proves the emitted VALUE:
 
-  * historical player, dob ONLY in SoFIFA ('Nov 9, 1982')  -> 1982-11-09
-  * player with a higher-priority source (Transfermarkt)   -> source wins
-    (SoFIFA sits LAST in the COALESCE)
-  * player with no dob in any source                        -> NULL
+  * player with foot ONLY in SoFIFA ('Right')        -> 'right'
+  * player with a higher-priority source (Transfermarkt 'Left') AND a SoFIFA
+    foot ('Right')                                    -> 'left' (SoFIFA is LAST)
+  * player with no foot in any source                 -> NULL
 
-Strategy mirrors ``test_dim_player_nationality``: substitute the two VALUES
-placeholders with small hermetic maps, transpile Trino → DuckDB via sqlglot,
-materialise fixture silver tables and execute. Skips cleanly if sqlglot cannot
-translate a Trino construct on the installed engine — the authoritative syntax
-check is EXPLAIN (TYPE VALIDATE) on live Trino.
+Strategy mirrors ``test_dim_player_dob`` / ``test_dim_player_nationality``:
+substitute the two VALUES placeholders with small hermetic maps, transpile
+Trino → DuckDB via sqlglot, materialise fixture silver tables and execute. Skips
+cleanly if sqlglot cannot translate a Trino construct on the installed engine —
+the authoritative syntax check is EXPLAIN (TYPE VALIDATE) on live Trino.
 """
 
 from __future__ import annotations
 
-import datetime as _dt
 import re
 from pathlib import Path
 
@@ -79,9 +75,9 @@ def _bootstrap(con) -> None:
     """)
     con.execute("""
         INSERT INTO silver.xref_player VALUES
-        ('fb_h', 'fbref', 'h', 'high', '1718'),   -- historical, dob only in SoFIFA
-        ('fb_p', 'fbref', 'p', 'high', '2425'),   -- has Transfermarkt dob (wins)
-        ('fb_n', 'fbref', 'n', 'high', '2425')    -- no dob anywhere
+        ('fb_s', 'fbref', 's', 'high', '2425'),   -- foot only in SoFIFA
+        ('fb_t', 'fbref', 't', 'high', '2425'),   -- Transfermarkt foot (wins)
+        ('fb_z', 'fbref', 'z', 'high', '2425')    -- no foot anywhere
     """)
 
     con.execute("""
@@ -92,12 +88,12 @@ def _bootstrap(con) -> None:
     """)
     con.execute("""
         INSERT INTO silver.fbref_player_season_profile VALUES
-        ('h', 1718, 'Historical Hugh', 'eng ENG', 'DF', 900, 'Club H'),
-        ('p', 2425, 'Priority Pete',   'eng ENG', 'MF', 900, 'Club P'),
-        ('n', 2425, 'Nobody Ned',      'eng ENG', 'FW', 900, 'Club N')
+        ('s', 2425, 'Sofifa Sam',   'eng ENG', 'DF', 900, 'Club S'),
+        ('t', 2425, 'Transfer Tom', 'eng ENG', 'MF', 900, 'Club T'),
+        ('z', 2425, 'Zero Zoe',     'eng ENG', 'FW', 900, 'Club Z')
     """)
 
-    # Enrichment sources — fotmob / sofascore empty (no dob from them here).
+    # Enrichment sources — fotmob / sofascore empty (no foot from them here).
     con.execute("""
         CREATE TABLE silver.fotmob_player_profile (
             player_id VARCHAR, season BIGINT, player_name VARCHAR,
@@ -112,7 +108,7 @@ def _bootstrap(con) -> None:
             preferred_foot VARCHAR
         )
     """)
-    # Transfermarkt carries a real DATE dob for player P (must win over SoFIFA).
+    # Transfermarkt carries a foot for player T (must win over SoFIFA).
     con.execute("""
         CREATE TABLE silver.transfermarkt_players (
             canonical_id VARCHAR, season BIGINT, name VARCHAR, dob DATE,
@@ -121,10 +117,10 @@ def _bootstrap(con) -> None:
     """)
     con.execute("""
         INSERT INTO silver.transfermarkt_players VALUES
-        ('fb_p', 2425, 'Priority Pete', DATE '2000-01-01', 'England', 180, 'right')
+        ('fb_t', 2425, 'Transfer Tom', NULL, 'England', 180, 'Left')
     """)
-    # SoFIFA dob in the live "Mon D, YYYY" string format. P also has a SoFIFA dob
-    # to prove the COALESCE order (Transfermarkt must still win).
+    # SoFIFA carries a foot for S (only source) and T (proves COALESCE order:
+    # Transfermarkt must still win because SoFIFA is LAST).
     con.execute("""
         CREATE TABLE silver.sofifa_player_profile (
             canonical_id VARCHAR, season BIGINT, dob VARCHAR,
@@ -134,8 +130,8 @@ def _bootstrap(con) -> None:
     """)
     con.execute("""
         INSERT INTO silver.sofifa_player_profile VALUES
-        ('fb_h', 1718, 'Nov 9, 1982', 'England', 185, 'CB', NULL),
-        ('fb_p', 2425, 'Mar 3, 1995', 'England', 180, 'CM', NULL)
+        ('fb_s', 2425, NULL, 'England', 180, 'CB', 'Right'),
+        ('fb_t', 2425, NULL, 'England', 180, 'CM', 'Right')
     """)
 
 
@@ -163,19 +159,19 @@ def gold_rows():
 
 
 @pytest.mark.unit
-class TestDimPlayerDob:
+class TestDimPlayerPreferredFoot:
     def test_all_three_players_present(self, gold_rows):
-        assert set(gold_rows) == {"fb_h", "fb_p", "fb_n"}
+        assert set(gold_rows) == {"fb_s", "fb_t", "fb_z"}
 
-    def test_sofifa_dob_fallback_parsed(self, gold_rows):
-        """#584: dob present ONLY in SoFIFA ('Nov 9, 1982') is date_parsed to a
-        real DATE — the regression a plain CAST AS DATE silently dropped."""
-        assert gold_rows["fb_h"]["dob"] == _dt.date(1982, 11, 9)
+    def test_sofifa_foot_fallback(self, gold_rows):
+        """#663: foot present ONLY in SoFIFA ('Right') enriches the column,
+        lower-cased like every other source."""
+        assert gold_rows["fb_s"]["preferred_foot"] == "right"
 
     def test_higher_priority_source_wins_over_sofifa(self, gold_rows):
-        """Transfermarkt dob outranks SoFIFA (SoFIFA is LAST in the COALESCE)."""
-        assert gold_rows["fb_p"]["dob"] == _dt.date(2000, 1, 1)
+        """Transfermarkt foot outranks SoFIFA (SoFIFA is LAST in the COALESCE)."""
+        assert gold_rows["fb_t"]["preferred_foot"] == "left"
 
-    def test_no_dob_anywhere_is_null(self, gold_rows):
-        """No source carries dob → NULL (graceful, never a parse error)."""
-        assert gold_rows["fb_n"]["dob"] is None
+    def test_no_foot_anywhere_is_null(self, gold_rows):
+        """No source carries foot → NULL (graceful, never an error)."""
+        assert gold_rows["fb_z"]["preferred_foot"] is None

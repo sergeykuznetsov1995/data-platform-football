@@ -283,6 +283,60 @@ class TestReadPlayerRatingsParsing:
         assert int(row['positioning']) != int(row['gk_positioning'])
 
 
+class TestReadPlayerRatingsPreferredFoot:
+    """#663: extract preferred foot (Left/Right) from the SoFIFA player page.
+
+    The value sits in the "grid attribute" Profile block as the tail text of a
+    ``<label>Preferred foot</label>`` element. "Weak foot" / "Skill moves" put a
+    rating number BEFORE their label, so the label-anchored XPath must capture
+    the foot value and never those neighbouring numbers.
+    """
+
+    # Mirrors the real markup confirmed live (player 158023, #663).
+    _PLAYER_HTML = (
+        '<html><body>'
+        '<div class="profile"><h1>Test Player</h1></div>'
+        '<div class="grid attribute"><div class="col"><h5>Profile</h5>'
+        '<p><label>Preferred foot</label> Right</p>'
+        '<p>4 <svg class="star"><path d="M12"></path></svg> <label>Skill moves</label></p>'
+        '<p>3 <svg class="star"><path d="M12"></path></svg> <label>Weak foot</label></p>'
+        '</div></div>'
+        '</body></html>'
+    )
+
+    # A player page with the profile header but no Profile attribute block.
+    _NO_FOOT_HTML = (
+        '<html><body>'
+        '<div class="profile"><h1>No Foot Player</h1></div>'
+        '</body></html>'
+    )
+
+    def _read_one(self, reader, tmp_path, html):
+        import io as _io
+
+        import pandas as pd
+
+        reader.data_dir = tmp_path
+        reader.versions = pd.DataFrame([{'update': 'Jun 2 2026'}], index=[260035])
+        reader.get = MagicMock(
+            side_effect=lambda *a, **k: _io.BytesIO(html.encode('utf-8'))
+        )
+        return reader.read_player_ratings(player=[12345])
+
+    def test_preferred_foot_extracted(self, reader, tmp_path):
+        df = self._read_one(reader, tmp_path, self._PLAYER_HTML)
+        # The label's tail text ('Right') is captured verbatim ...
+        assert df.iloc[0]['preferred_foot'] == 'Right'
+        # ... and the neighbouring "Weak foot" rating (3) must NOT leak in.
+        assert df.iloc[0]['preferred_foot'] != '3'
+
+    def test_missing_foot_block_is_none(self, reader, tmp_path):
+        import pandas as pd
+
+        df = self._read_one(reader, tmp_path, self._NO_FOOT_HTML)
+        assert pd.isna(df.iloc[0]['preferred_foot'])
+
+
 class TestReadTeamRatingsParsing:
     """#601: read_team_ratings must scrape only the 8 columns sofifa.com still
     renders on the FC 26 team page and never emit the 15 dead-tactics columns
