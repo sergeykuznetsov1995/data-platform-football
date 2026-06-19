@@ -108,6 +108,7 @@ joined AS (
         CAST(r.height_cm AS INTEGER)                AS height_cm,
         CAST(r.weight_kg AS INTEGER)                AS weight_kg,
         r.nationality                               AS nationality,
+        r.preferred_foot                            AS preferred_foot,
 
         r._ingested_at                              AS _bronze_ingested_at
     FROM ratings_dedup r
@@ -153,6 +154,7 @@ SELECT
     j.height_cm,
     j.weight_kg,
     j.nationality,
+    j.preferred_foot,
 
     j.team,
     j.fifa_edition,

@@ -162,7 +162,8 @@ def _bootstrap(con) -> None:
     con.execute("""
         CREATE TABLE silver.sofifa_player_profile (
             canonical_id VARCHAR, season BIGINT, dob VARCHAR,
-            nationality VARCHAR, height_cm INTEGER, position VARCHAR
+            nationality VARCHAR, height_cm INTEGER, position VARCHAR,
+            preferred_foot VARCHAR
         )
     """)
 

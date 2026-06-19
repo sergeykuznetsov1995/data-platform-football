@@ -72,9 +72,9 @@ def _extract_card_extras(raw_html: str, tree) -> dict:
     """Pull the issue-#42 fields the upstream score loop does not capture.
 
     Covers the main-6 card aggregates (JS), market value / wage / release clause,
-    contract dates, and the profile header (position / dob / height / weight /
-    nationality). All fields degrade to ``None`` when absent so a partial page
-    never aborts the run.
+    contract dates, the profile header (position / dob / height / weight /
+    nationality), and preferred foot (#663). All fields degrade to ``None``
+    when absent so a partial page never aborts the run.
     """
     out: dict = {}
     for col, ab in _MAIN6_JS.items():
@@ -117,6 +117,16 @@ def _extract_card_extras(raw_html: str, tree) -> dict:
         "//a[contains(@href,'/players?na=')]/img/@title"
     )
     out['nationality'] = flags[0] if flags else None
+
+    # Preferred foot — '<p><label>Preferred foot</label> Right</p>' in the
+    # "grid attribute" Profile block (a separate element from the profile
+    # header above). The value is the label's tail text; "Weak foot" /
+    # "Skill moves" put a rating number BEFORE the label, so this
+    # label-anchored XPath never picks them up (#663). None when absent.
+    foot = root.xpath(
+        "//label[normalize-space()='Preferred foot']/following-sibling::text()[1]"
+    )
+    out['preferred_foot'] = foot[0].strip() if foot and foot[0].strip() else None
     return out
 
 
