@@ -165,13 +165,16 @@ SELECT
     xf.canonical_id                                                AS player_id,
     COALESCE(fb.player_name, fm.player_name,
              ss.player_name, tm.player_name)                       AS player_name,
-    -- FotMob/SoFIFA dob are source-typed passthroughs — TRY_CAST keeps the
-    -- COALESCE chain DATE-typed (non-ISO strings degrade to NULL, and the
-    -- next source wins).
+    -- FotMob dob is a source-typed passthrough — TRY_CAST keeps the COALESCE
+    -- chain DATE-typed (non-ISO strings degrade to NULL, and the next source
+    -- wins).
+    -- SoFIFA dob is "Mon D, YYYY" (e.g. 'Nov 9, 1982') — a plain CAST AS DATE
+    -- never parses it (always NULL), so SoFIFA never enriched dob; date_parse
+    -- the SoFIFA format so historical players get a dob fallback (#584).
     COALESCE(TRY_CAST(fm.date_of_birth AS DATE),
              ss.date_of_birth,
              tm.dob,
-             TRY_CAST(sf.dob AS DATE))                             AS dob,
+             TRY(CAST(date_parse(sf.dob, '%b %e, %Y') AS DATE)))   AS dob,
     -- #585: canonicalize the winning source spelling (na.canonical_name maps
     -- USA -> United States, Czechia -> Czech Republic, ...); NULL when the
     -- picked value is already canonical or unknown, so COALESCE falls through.
