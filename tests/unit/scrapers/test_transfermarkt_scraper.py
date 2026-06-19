@@ -647,32 +647,69 @@ class TestResolverDeterministicLimit:
             leagues=['ENG-Premier League'], seasons=[2025],
         )
 
-    def test_limit_query_orders_by_player_id(self, scraper):
+    def test_limit_window_orders_numeric_in_python(self, scraper):
+        # player_id is varchar; lexicographic order would pick the same ~100
+        # ids on '1'/'2' forever (#620). Sort numerically in Python and slice
+        # the window — the SQL itself carries no ORDER BY / LIMIT.
         from unittest.mock import patch
         import sys
 
-        cursor = _StubCursor([('1',), ('2',)])
+        cursor = _StubCursor([('10',), ('2',), ('100',), ('3',)])
         with patch.dict(sys.modules, _stub_trino_modules(cursor)):
             ids = scraper._resolve_player_ids_from_bronze(
-                'ENG-Premier League', '2526', limit=100,
+                'ENG-Premier League', '2526', limit=2,
             )
-        assert ids == ['1', '2']
-        sql, _ = cursor.executed[0]
-        assert 'ORDER BY player_id' in sql
-        assert 'LIMIT 100' in sql
-
-    def test_no_limit_no_order_by(self, scraper):
-        from unittest.mock import patch
-        import sys
-
-        cursor = _StubCursor([('1',)])
-        with patch.dict(sys.modules, _stub_trino_modules(cursor)):
-            scraper._resolve_player_ids_from_bronze(
-                'ENG-Premier League', '2526',
-            )
+        assert ids == ['2', '3']  # numeric order [2,3,10,100], window [0:2]
         sql, _ = cursor.executed[0]
         assert 'ORDER BY' not in sql
         assert 'LIMIT' not in sql
+
+    def test_no_limit_returns_full_numeric_sorted(self, scraper):
+        from unittest.mock import patch
+        import sys
+
+        cursor = _StubCursor([('10',), ('2',), ('1',)])
+        with patch.dict(sys.modules, _stub_trino_modules(cursor)):
+            ids = scraper._resolve_player_ids_from_bronze(
+                'ENG-Premier League', '2526',
+            )
+        assert ids == ['1', '2', '10']
+        sql, _ = cursor.executed[0]
+        assert 'ORDER BY' not in sql
+        assert 'LIMIT' not in sql
+
+    def test_window_offset_rotates(self, scraper):
+        # 250-player roster, limit=100 → 3 windows tile the roster, the last
+        # wrapping around. Stub rows are reversed to prove Python sorts them.
+        from unittest.mock import patch
+        import sys
+
+        rows = [(str(i),) for i in range(250, 0, -1)]
+        sorted_ids = [str(i) for i in range(1, 251)]
+
+        def _resolve(offset):
+            cursor = _StubCursor(list(rows))
+            with patch.dict(sys.modules, _stub_trino_modules(cursor)):
+                return scraper._resolve_player_ids_from_bronze(
+                    'ENG-Premier League', '2526', limit=100, window_offset=offset,
+                )
+
+        assert _resolve(0) == sorted_ids[0:100]
+        assert _resolve(1) == sorted_ids[100:200]
+        # offset 2 → start=(2*100)%250=200 → tail [200:250] + wrap head [0:50]
+        assert _resolve(2) == sorted_ids[200:250] + sorted_ids[0:50]
+
+    def test_window_smaller_than_limit_returns_all(self, scraper):
+        from unittest.mock import patch
+        import sys
+
+        rows = [(str(i),) for i in range(50, 0, -1)]
+        cursor = _StubCursor(rows)
+        with patch.dict(sys.modules, _stub_trino_modules(cursor)):
+            ids = scraper._resolve_player_ids_from_bronze(
+                'ENG-Premier League', '2526', limit=100, window_offset=3,
+            )
+        assert ids == [str(i) for i in range(1, 51)]
 
 
 # ---------------------------------------------------------------------------
