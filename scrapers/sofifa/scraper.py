@@ -8,7 +8,7 @@ Source: https://sofifa.com
 """
 
 import logging
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Union
 
 import pandas as pd
 
@@ -40,7 +40,7 @@ class SoFIFAScraper(SoccerdataScraper):
         self,
         leagues: Optional[List[str]] = None,
         seasons: Optional[List[int]] = None,
-        versions: str = 'latest',
+        versions: Union[str, int, List[int]] = 'latest',
         **kwargs
     ):
         """

@@ -151,3 +151,69 @@ class TestRunSofifaExitCode:
             payload = json.load(f)
         assert len(payload["errors"]) == 1
         assert "Player ratings" in payload["errors"][0]
+
+
+class TestRunSofifaVersionsParsing:
+    """Cover ``--versions`` parsing (#665).
+
+    ``soccerdata.SoFIFA`` accepts ``'latest'|'all'|int|list[int]`` and raises
+    ``ValueError`` on a raw digit string, so the runner must turn explicit
+    comma-separated version IDs into ``list[int]`` before constructing the
+    scraper — while leaving ``'latest'``/``'all'`` as pass-through strings.
+    """
+
+    @pytest.fixture
+    def temp_output(self):
+        fd, path = tempfile.mkstemp(suffix=".json", prefix="sofifa_")
+        os.close(fd)
+        yield path
+        if os.path.exists(path):
+            os.unlink(path)
+
+    @pytest.mark.unit
+    def test_versions_comma_separated_parsed_to_int_list(self, temp_output):
+        """``--versions "180084,190075"`` → SoFIFAScraper(versions=[180084, 190075])."""
+        scraper_cls = _build_scraper(errors=False)
+
+        _run_main(
+            ["--versions", "180084,190075", "--output", temp_output],
+            scraper_cls,
+        )
+
+        assert scraper_cls.call_args.kwargs["versions"] == [180084, 190075]
+
+    @pytest.mark.unit
+    def test_versions_single_id_parsed_to_int_list(self, temp_output):
+        """A lone version ID still becomes a list[int] (soccerdata ``.loc[[id]]``)."""
+        scraper_cls = _build_scraper(errors=False)
+
+        _run_main(
+            ["--versions", "180084", "--output", temp_output],
+            scraper_cls,
+        )
+
+        assert scraper_cls.call_args.kwargs["versions"] == [180084]
+
+    @pytest.mark.unit
+    def test_versions_latest_passthrough(self, temp_output):
+        """``--versions "latest"`` (the weekly path) stays a string, untouched."""
+        scraper_cls = _build_scraper(errors=False)
+
+        _run_main(
+            ["--versions", "latest", "--output", temp_output],
+            scraper_cls,
+        )
+
+        assert scraper_cls.call_args.kwargs["versions"] == "latest"
+
+    @pytest.mark.unit
+    def test_versions_all_passthrough(self, temp_output):
+        """``--versions "all"`` stays a string, untouched."""
+        scraper_cls = _build_scraper(errors=False)
+
+        _run_main(
+            ["--versions", "all", "--output", temp_output],
+            scraper_cls,
+        )
+
+        assert scraper_cls.call_args.kwargs["versions"] == "all"

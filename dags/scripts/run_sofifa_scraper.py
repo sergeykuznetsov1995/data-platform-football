@@ -43,8 +43,13 @@ def main():
     args = parser.parse_args()
 
     leagues = [l.strip() for l in args.leagues.split(',')]
-    # versions can be "latest", "all", or comma-separated IDs
-    versions = args.versions
+    # versions: "latest"/"all" pass through; explicit comma-separated version
+    # IDs must become list[int] — soccerdata.SoFIFA accepts 'latest'|'all'|int|
+    # list[int] and raises ValueError on a raw digit string. (#665)
+    if args.versions in ('latest', 'all'):
+        versions = args.versions
+    else:
+        versions = [int(v.strip()) for v in args.versions.split(',')]
     logger.info(f"Starting SoFIFA scraper: leagues={leagues}, versions={versions}")
 
     results = {
