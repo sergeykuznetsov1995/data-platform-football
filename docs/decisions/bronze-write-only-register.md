@@ -60,6 +60,26 @@ per-item/per-season HTTP.
 > promoting the 3 Capology team-finance tables (#603) leaves **3** live
 > write-only tables. The register above is the corrected set.
 
+### Non-prod-producer orphans — stopped + dropped via #614 (not part of the write-only set)
+
+Distinct from the §1 register (which is *prod-producer* ∧ 0-reader): these three FBref
+tables had a producer **only** in the non-prod selenium path `FBrefScraper.scrape_all()`
+(runner `--scraper-type selenium --mode full`), which the production DAG never invokes — it
+runs `single_stat` + `combined_match_data`. They were never in the parser contract
+(`scripts/audit_bronze_columns.py::EXPECTED_TABLES`) and had no Silver/Gold reader, so
+`inventory_bronze_orphans.py` flagged them **droppable**. Frozen at small stale row counts.
+
+| Table | live rows | Verdict | Superseded by |
+|---|---|---|---|
+| `fbref_player_stats_extended` | 551 | **(c) stop + drop** | per-stat-type `fbref_player_{stats,shooting,playingtime,misc}` + Silver `fbref_player_season_profile.sql` join |
+| `fbref_team_stats_extended` | 20 | **(c) stop + drop** | per-stat-type `fbref_team_*` + `fbref_team_season_profile.sql` |
+| `fbref_keeper_stats` | 40 | **(c) stop + drop** | `fbref_keeper_keeper` (+ `fbref_keeper_keeper_adv`, itself stopping via #606) |
+
+Executed in #614 (mirrors #604): removed the producer sections from selenium `scrape_all()`
+(plus the now-orphan `_merge_{team,player,keeper}_stats` / `_find_join_column` in
+`data_mergers.py`, the runner full-mode flags, and their tests), then dropped the tables via
+`inventory_bronze_orphans.py --drop`. No `EXPECTED_TABLES` change — they were never in it.
+
 ---
 
 ## 2. Methodology (how each table was re-verified)
@@ -128,6 +148,7 @@ documented here; no tracking issue (avoids p3 issue-spam):
 | 2026-06-17 | 4 SoFIFA tables promoted to Silver → **CONSUMED**: `sofifa_team_profile.sql` (+ `sofifa` source branch in `xref_team.sql.j2`), `sofifa_league_lookup.sql`, `sofifa_edition_lookup.sql`. `sofifa_team_ratings` 15 dead FC-26 cols removed (parser override + `drop_sofifa_team_ratings_dead_columns.py`, dropped from `EXPECTED_NULL`). 14 → 10 live write-only. | #601 |
 | 2026-06-17 | 4 FotMob team/transfers tables promoted to Silver → **CONSUMED** (conform-only, canonical_id resolution deferred to Gold): `fotmob_team_profile.sql`, `fotmob_team_standings.sql` (from `fotmob_team_stats`), `fotmob_team_leaderboards.sql`, `fotmob_transfers.sql`; registered in `dag_transform_fotmob_silver.py` + bronze schemas added to fixture. 10 → 6 live write-only. | #600 |
 | 2026-06-17 | 3 Capology team-finance tables promoted to Silver → **CONSUMED**: `capology_team_payrolls.sql` (declared club payroll), `capology_transfer_window.sql` (net transfer balance), `capology_contract_extensions.sql` (player contract snapshot); registered in `dag_transform_capology_silver.py` + 3 render-tests. `canonical_id` resolved in Silver via existing `xref_team`/`xref_player` capology branches (team 239/240, contract 680/810 live). Gold wage bill untouched (Silver-only); replace/supplement = followup. 6 → 3 live write-only. | #603 |
+| 2026-06-20 | 3 FBref non-prod-producer orphans stopped + dropped (`fbref_player_stats_extended` 551, `fbref_team_stats_extended` 20, `fbref_keeper_stats` 40): producer existed only in selenium `scrape_all` (`--mode full`, never run by prod), not in the parser contract, 0 Silver/Gold readers, superseded by per-stat-type tables + Silver joins. Removed producer + orphan merge helpers/tests; dropped tables. Mirrors #604. Not part of the §1 write-only set. | #614 |
 
 [#476]: https://github.com/sergeykuznetsov1995/data-platform-football/issues/476
 [#600]: https://github.com/sergeykuznetsov1995/data-platform-football/issues/600
@@ -136,3 +157,4 @@ documented here; no tracking issue (avoids p3 issue-spam):
 [#603]: https://github.com/sergeykuznetsov1995/data-platform-football/issues/603
 [#604]: https://github.com/sergeykuznetsov1995/data-platform-football/issues/604
 [#606]: https://github.com/sergeykuznetsov1995/data-platform-football/issues/606
+[#614]: https://github.com/sergeykuznetsov1995/data-platform-football/issues/614

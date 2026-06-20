@@ -13,16 +13,14 @@ Memory Optimization Notes:
 - Page cache is cleared after each league to prevent OOM
 - gc.collect() is called after processing each league
 - Browser is restarted after MAX_PAGES_BEFORE_BROWSER_RESTART pages
-- Intermediate DataFrames are explicitly deleted after merge operations
 
 Architecture:
 - FBrefBrowserMixin  — browser lifecycle, page fetching, cache (browser_manager.py)
 - FBrefDataReaderMixin — all read_* methods and batch scrape helpers (data_readers.py)
-- FBrefDataMergerMixin — stat merging and match-ID extraction (data_mergers.py)
+- FBrefDataMergerMixin — match-ID extraction from schedules (data_mergers.py)
 - FBrefScraper (this file) — __init__, close, scrape_all, URL/HTML helpers
 """
 
-import gc
 import logging
 import os
 import time
@@ -301,14 +299,11 @@ class FBrefScraper(
 
     def scrape_all(
         self,
-        include_extended_stats: bool = True,
         include_match_stats: bool = False,
-        include_keeper_stats: bool = True,
         include_shot_events: bool = True,
         include_match_events: bool = True,
         include_lineups: bool = True,
         include_team_match_stats: bool = False,
-        include_team_stats_extended: bool = True,
         max_matches_per_league: int = 50,
     ) -> Dict[str, str]:
         """
@@ -318,9 +313,6 @@ class FBrefScraper(
         - Match schedules
         - Team statistics (standard)
         - Player statistics (standard)
-        - Extended player statistics (merged from all stat_types)
-        - Extended team statistics (merged from all stat_types)
-        - Keeper statistics (basic + advanced)
         - Per-match player statistics (optional)
         - Shot events with xG and coordinates (new)
         - Match events: goals, cards, substitutions (new)
@@ -328,14 +320,11 @@ class FBrefScraper(
         - Team match statistics (new, optional - slow)
 
         Args:
-            include_extended_stats: Collect extended player stats (all stat_types merged)
             include_match_stats: Collect per-match player stats (significantly slower)
-            include_keeper_stats: Collect goalkeeper statistics
             include_shot_events: Collect shot events with xG data
             include_match_events: Collect match events (goals, cards, subs)
             include_lineups: Collect team lineups
             include_team_match_stats: Collect team-level match statistics (slow)
-            include_team_stats_extended: Collect extended team stats (all stat_types merged)
             max_matches_per_league: Maximum matches to scrape per league/season
 
         Returns:
@@ -343,20 +332,16 @@ class FBrefScraper(
         """
         logger.info(
             f"Starting FBref scrape: leagues={self.leagues}, "
-            f"seasons={self.seasons}, extended={include_extended_stats}, "
-            f"match_stats={include_match_stats}, keeper={include_keeper_stats}, "
+            f"seasons={self.seasons}, "
+            f"match_stats={include_match_stats}, "
             f"shot_events={include_shot_events}, match_events={include_match_events}, "
-            f"lineups={include_lineups}, team_match_stats={include_team_match_stats}, "
-            f"team_stats_extended={include_team_stats_extended}"
+            f"lineups={include_lineups}, team_match_stats={include_team_match_stats}"
         )
 
         results = {}
         all_schedules = []
         all_team_stats = []
-        all_team_stats_extended = []
         all_player_stats = []
-        all_player_stats_extended = []
-        all_keeper_stats = []
         all_match_stats = []
         all_shot_events = []
         all_match_events = []
@@ -380,27 +365,6 @@ class FBrefScraper(
 
                     time.sleep(1)  # Reduced from 3s - rate limiter handles main delays
 
-                    # Scrape extended team stats (all stat_types)
-                    if include_team_stats_extended:
-                        team_data = {}
-                        for stat_type in TEAM_STAT_TYPES:
-                            df = self.read_team_season_stats(
-                                stat_type, league, season
-                            )
-                            if df is not None and not df.empty:
-                                team_data[stat_type] = df
-                            time.sleep(1)  # Reduced from 3s - rate limiter handles main delays
-
-                        if team_data:
-                            merged = self._merge_team_stats(
-                                team_data, league, season
-                            )
-                            if merged is not None and not merged.empty:
-                                all_team_stats_extended.append(merged)
-                            # Clean up intermediate data
-                            del team_data
-                            gc.collect()
-
                     # Scrape player stats (basic)
                     player_df = self.read_player_season_stats(
                         'stats', league, season
@@ -409,46 +373,6 @@ class FBrefScraper(
                         all_player_stats.append(player_df)
 
                     time.sleep(1)  # Reduced from 3s - rate limiter handles main delays
-
-                    # Scrape extended player stats (all stat_types)
-                    if include_extended_stats:
-                        player_data = {}
-                        for stat_type in PLAYER_STAT_TYPES:
-                            df = self.read_player_season_stats(
-                                stat_type, league, season
-                            )
-                            if df is not None and not df.empty:
-                                player_data[stat_type] = df
-                            time.sleep(1)  # Reduced from 3s - rate limiter handles main delays
-
-                        if player_data:
-                            merged = self._merge_player_stats(
-                                player_data, league, season
-                            )
-                            if merged is not None and not merged.empty:
-                                all_player_stats_extended.append(merged)
-                            # Clean up intermediate data
-                            del player_data
-                            gc.collect()
-
-                    # Scrape keeper stats
-                    if include_keeper_stats:
-                        keeper_data = {}
-                        for stat_type in KEEPER_STAT_TYPES:
-                            df = self.read_keeper_stats(stat_type, league, season)
-                            if df is not None and not df.empty:
-                                keeper_data[stat_type] = df
-                            time.sleep(1)  # Reduced from 3s - rate limiter handles main delays
-
-                        if keeper_data:
-                            merged = self._merge_keeper_stats(
-                                keeper_data, league, season
-                            )
-                            if merged is not None and not merged.empty:
-                                all_keeper_stats.append(merged)
-                            # Clean up intermediate data
-                            del keeper_data
-                            gc.collect()
 
                     # Get match IDs for match-level data collection
                     collect_match_data = any([
@@ -546,16 +470,6 @@ class FBrefScraper(
             )
             results['team_stats'] = table_path
 
-        if all_team_stats_extended:
-            combined_df = pd.concat(all_team_stats_extended, ignore_index=True)
-            table_path = self.save_to_iceberg(
-                df=combined_df,
-                table_name='fbref_team_stats_extended',
-                partition_cols=['league', 'season'],
-                replace_partitions=['league', 'season'],
-            )
-            results['team_stats_extended'] = table_path
-
         if all_player_stats:
             combined_df = pd.concat(all_player_stats, ignore_index=True)
             table_path = self.save_to_iceberg(
@@ -565,26 +479,6 @@ class FBrefScraper(
                 replace_partitions=['league', 'season'],
             )
             results['player_stats'] = table_path
-
-        if all_player_stats_extended:
-            combined_df = pd.concat(all_player_stats_extended, ignore_index=True)
-            table_path = self.save_to_iceberg(
-                df=combined_df,
-                table_name='fbref_player_stats_extended',
-                partition_cols=['league', 'season'],
-                replace_partitions=['league', 'season'],
-            )
-            results['player_stats_extended'] = table_path
-
-        if all_keeper_stats:
-            combined_df = pd.concat(all_keeper_stats, ignore_index=True)
-            table_path = self.save_to_iceberg(
-                df=combined_df,
-                table_name='fbref_keeper_stats',
-                partition_cols=['league', 'season'],
-                replace_partitions=['league', 'season'],
-            )
-            results['keeper_stats'] = table_path
 
         if all_match_stats:
             combined_df = pd.concat(all_match_stats, ignore_index=True)
