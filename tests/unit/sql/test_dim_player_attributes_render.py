@@ -90,8 +90,8 @@ class TestDimPlayerAttributesSql:
             "nationality_fotmob",
             "height_cm_fotmob",
             "foot_fotmob",
-            "player_id_canonical",
-            "player_name_canonical",
+            "player_id",
+            "player_name",
         ]
         for col in required_cols:
             assert re.search(rf"\b{col}\b", sql), (
@@ -100,13 +100,13 @@ class TestDimPlayerAttributesSql:
 
     def test_player_name_uses_coalesce_only_for_label(self):
         """Единственное место где допустим COALESCE между источниками — это
-        display label (player_name_canonical). Атрибуты — нет."""
+        display label (player_name). Атрибуты — нет."""
         sql = _read_sql()
         assert re.search(
             r"COALESCE\s*\([^)]*player_name", sql, re.IGNORECASE,
         ), (
             "dim_player_attributes.sql must use COALESCE(fb.player_name, "
-            "fm.player_name) AS player_name_canonical"
+            "fm.player_name) AS player_name"
         )
 
     def test_no_join_on_season_predicate(self):

@@ -12,7 +12,7 @@
 --   * WhoScored diff (1): saves_diff_whoscored — LEFT JOIN.
 -- yellow/red skipped — у вратарей почти всегда 0/0, audit-сигнала нет.
 --
--- Зерно: (player_id_canonical, league, season). INNER JOIN на оба источника.
+-- Зерно: (player_id, league, season). INNER JOIN на оба источника.
 --
 -- #556: остаётся inline .sql (НЕ мигрирован на source_priority.yaml) — per-source
 -- diff-layout несовместим с single-COALESCE эмиттером. Решение:
@@ -68,7 +68,7 @@ fb_dedup AS (
 
 SELECT
     -- ========= PK =========
-    xf.canonical_id                                      AS player_id_canonical,
+    xf.canonical_id                                      AS player_id,
     xf.league                                            AS league,
     xf.season_year                                       AS season,
 

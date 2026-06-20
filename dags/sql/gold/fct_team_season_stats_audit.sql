@@ -10,7 +10,7 @@
 -- spine на team-grain). Для MODELED xG diff'ы вычисляются между Understat и
 -- SofaScore (Understat = primary per RX2; FBref не отдаёт xG на team-level).
 --
--- Зерно: (team_id_canonical, league, season). INNER JOIN FBref ∩ Understat
+-- Зерно: (team_id, league, season). INNER JOIN FBref ∩ Understat
 -- (Understat = primary secondary с coverage 100% APL). WhoScored / SofaScore /
 -- FotMob (#97) — LEFT JOIN → diff = NULL когда источник отсутствует. FotMob xref
 -- season — slug '2526' (#404); fm_team_season.season — slug '2526'.
@@ -172,7 +172,7 @@ fm_team_season AS (
 
 SELECT
     -- ========= PK (грейн совпадает с fct_team_season_stats) =========
-    xf.canonical_id                                      AS team_id_canonical,
+    xf.canonical_id                                      AS team_id,
     xf.league                                            AS league,
     xf.season_year                                       AS season,
 

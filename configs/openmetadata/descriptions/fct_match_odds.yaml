@@ -32,7 +32,7 @@ columns:
     description: Over/Under line (=2.5); NULL outside market='ou_2_5'.
   - name: is_closing
     description: TRUE for closing-line odds, FALSE for opening.
-  - name: odds_canonical
+  - name: odds_id
     description: Logical PK — xxhash64 over (match_id | bookmaker | market | is_closing).
   - name: odds_source
     description: Source label (literal 'matchhistory').

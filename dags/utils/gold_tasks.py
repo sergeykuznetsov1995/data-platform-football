@@ -492,8 +492,8 @@ def _star_gate_pk_checks() -> List:
         ),
         CHECK.no_duplicates(
             'gold.fct_player_market_value',
-            pk=['player_id_canonical', 'valuation_date', 'source'],
-            name='star_pk[fct_player_market_value(player_id_canonical,valuation_date,source)]',
+            pk=['player_id', 'valuation_date', 'source'],
+            name='star_pk[fct_player_market_value(player_id,valuation_date,source)]',
         ),
         CHECK.no_duplicates(
             'gold.fct_player_fifa_rating', pk=['player_id', 'fifa_edition'],
@@ -604,7 +604,7 @@ def _star_gate_dim_fk_checks() -> List:
                             'player_id',
                             warn_rate=0.05, error_rate=0.15, severity='WARNING'),
         CHECK.ref_integrity('gold.fct_player_market_value', 'gold.dim_player',
-                            'player_id_canonical', parent_key='player_id',
+                            'player_id', parent_key='player_id',
                             warn_rate=0.05, error_rate=0.15, severity='WARNING'),
         # issue #430 — salary keeps 'cap_' orphans (≈9.5%), fifa_rating keeps
         # 'sf_' orphans (≈15%); both kept by design (rule 2), policed by
@@ -731,13 +731,13 @@ def validate_gold_quality() -> Dict[str, Any]:
         CHECK.ref_integrity('gold.fct_team_match',   'gold.dim_match', 'match_id'),
         CHECK.ref_integrity('gold.fct_player_match', 'gold.dim_match', 'match_id'),
         # fct_player_match → dim_player_attributes (snapshot grain per
-        # canonical_id, T4). #426: child column renamed to player_id; the dim
-        # keeps its player_id_canonical naming (out of #426 scope).
+        # canonical_id, T4). #426 renamed the child column to player_id; #696
+        # aligned the dim too (player_id_canonical → player_id).
         CHECK.ref_integrity(
             'gold.fct_player_match',
             'gold.dim_player_attributes',
             'player_id',
-            parent_key='player_id_canonical',
+            parent_key='player_id',
         ),
         # E5: every unavailability row must point at a real Gold match.
         # SQL already filters bridge failures, so 0 orphans by construction.
@@ -1093,13 +1093,13 @@ def validate_gold_quality() -> Dict[str, Any]:
         # подключения R3 источников (Sofascore/Transfermarkt).
         # ============================================================
         CHECK.no_duplicates('gold.dim_player_attributes',
-                            pk=['player_id_canonical']),
+                            pk=['player_id']),
         CHECK.no_nulls('gold.dim_player_attributes',
-                       cols=['player_id_canonical']),
+                       cols=['player_id']),
         CHECK.ref_integrity(
             'gold.dim_player_attributes',
             'silver.xref_player',
-            'player_id_canonical',
+            'player_id',
             parent_key='canonical_id',
         ),
         CHECK.value_range('gold.dim_player_attributes', 'height_cm_fotmob',
@@ -1162,19 +1162,19 @@ def validate_gold_quality() -> Dict[str, Any]:
 
         # ============================================================
         # issue #430: fct_player_market_value — two-source MV timeline, one row
-        # per (player_id_canonical, valuation_date, source). Pointwise off-field
+        # per (player_id, valuation_date, source). Pointwise off-field
         # fact (no league/season). The design PK is asserted in
         # build_star_gate_checks (pointwise, like fct_team_elo); here we keep
         # only the NOT-NULL / FK / range checks.
         # ============================================================
         CHECK.no_nulls('gold.fct_player_market_value',
-                       cols=['player_id_canonical', 'valuation_date',
+                       cols=['player_id', 'valuation_date',
                              'market_value_eur', 'source']),
         CHECK.ref_integrity(
             'gold.fct_player_market_value',
             'gold.dim_player_attributes',
-            'player_id_canonical',
-            parent_key='player_id_canonical',
+            'player_id',
+            parent_key='player_id',
         ),
         CHECK.value_range('gold.fct_player_market_value', 'market_value_eur',
                           min_val=0, max_val=500_000_000, severity='ERROR'),
@@ -1194,8 +1194,8 @@ def validate_gold_quality() -> Dict[str, Any]:
         # only (вратари в fct_keeper_season_stats). Business-витрина:
         # PK + ref_integrity ERROR; audit-diff чеки переехали в _audit.
         # ============================================================
-        # #428: PK renamed to plain player_id (design §5.2); the dim keeps
-        # its player_id_canonical naming (out of #428 scope) — mirror #426.
+        # #428: PK renamed to plain player_id (design §5.2). #696: the dim
+        # (dim_player_attributes) now matches — both plain player_id.
         CHECK.no_duplicates('gold.fct_player_season_stats',
                             pk=['player_id', 'league', 'season']),
         CHECK.no_nulls('gold.fct_player_season_stats',
@@ -1204,7 +1204,7 @@ def validate_gold_quality() -> Dict[str, Any]:
             'gold.fct_player_season_stats',
             'gold.dim_player_attributes',
             'player_id',
-            parent_key='player_id_canonical',
+            parent_key='player_id',
         ),
         # #428: new team_id FK (squad with most minutes). WARNING-only —
         # orphan-fallback ids ('fb_<slug>') are intentionally NOT in dim_team.
@@ -1253,7 +1253,7 @@ def validate_gold_quality() -> Dict[str, Any]:
             'gold.fct_keeper_season_stats',
             'gold.dim_player_attributes',
             'player_id',
-            parent_key='player_id_canonical',
+            parent_key='player_id',
         ),
         # #428: new team_id FK — WARNING-only (orphan-fallback tolerated).
         CHECK.ref_integrity(
@@ -1273,14 +1273,14 @@ def validate_gold_quality() -> Dict[str, Any]:
         #          1 для счётных событий, 90 для minutes.
         # ============================================================
         CHECK.no_duplicates('gold.fct_player_season_stats_audit',
-                            pk=['player_id_canonical', 'league', 'season']),
+                            pk=['player_id', 'league', 'season']),
         CHECK.no_nulls('gold.fct_player_season_stats_audit',
-                       cols=['player_id_canonical', 'league', 'season']),
-        # #428: audit keeps player_id_canonical; main fct renamed to player_id.
+                       cols=['player_id', 'league', 'season']),
+        # #696: audit aligned to plain player_id (matches main fct, #428).
         CHECK.ref_integrity(
             'gold.fct_player_season_stats_audit',
             'gold.fct_player_season_stats',
-            'player_id_canonical',
+            'player_id',
             parent_key='player_id',
         ),
         # 6 audit-diff coverage WARNING-only (error_threshold=0). Audit —
@@ -1349,14 +1349,14 @@ def validate_gold_quality() -> Dict[str, Any]:
         # T5 audit: fct_keeper_season_stats_audit — keeper variant.
         # ============================================================
         CHECK.no_duplicates('gold.fct_keeper_season_stats_audit',
-                            pk=['player_id_canonical', 'league', 'season']),
+                            pk=['player_id', 'league', 'season']),
         CHECK.no_nulls('gold.fct_keeper_season_stats_audit',
-                       cols=['player_id_canonical', 'league', 'season']),
+                       cols=['player_id', 'league', 'season']),
         CHECK.ref_integrity(
             'gold.fct_keeper_season_stats_audit',
             'gold.fct_keeper_season_stats',
-            'player_id_canonical',
-            parent_key='player_id',  # #428: main fct renamed; audit keeps _canonical
+            'player_id',
+            parent_key='player_id',  # #696: audit + main fct both plain player_id
         ),
         CHECK.coverage('gold.fct_keeper_season_stats_audit',
                        condition='ABS(matches_diff_fotmob) <= 1 OR matches_diff_fotmob IS NULL',
@@ -1444,14 +1444,14 @@ def validate_gold_quality() -> Dict[str, Any]:
         # NULL diff = "источник отсутствует" → засчитывается как passed.
         # ============================================================
         CHECK.no_duplicates('gold.fct_team_season_stats_audit',
-                            pk=['team_id_canonical', 'league', 'season']),
+                            pk=['team_id', 'league', 'season']),
         CHECK.no_nulls('gold.fct_team_season_stats_audit',
-                       cols=['team_id_canonical', 'league', 'season']),
+                       cols=['team_id', 'league', 'season']),
         CHECK.ref_integrity(
             'gold.fct_team_season_stats_audit',
             'gold.fct_team_season_stats',
-            'team_id_canonical',
-            parent_key='team_id',  # #428: main fct renamed; audit keeps _canonical
+            'team_id',
+            parent_key='team_id',  # #696: audit + main fct both plain team_id
         ),
         # ----- Understat diff (INNER spine: всегда non-NULL) -----
         CHECK.coverage('gold.fct_team_season_stats_audit',

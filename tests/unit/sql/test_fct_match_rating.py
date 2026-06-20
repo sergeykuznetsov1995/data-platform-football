@@ -279,7 +279,7 @@ class TestFctMatchRatingPipeline:
         _seed(duck_conn)
         _materialize_silver(duck_conn)
         out = _run_gold(duck_conn)
-        canonicals = {r["player_id_canonical"] for r in out}
+        canonicals = {r["player_id"] for r in out}
         assert "ss_P4" in canonicals, canonicals
         assert "ss_P5" in canonicals, canonicals
 
@@ -288,7 +288,7 @@ class TestFctMatchRatingPipeline:
         _seed(duck_conn)
         _materialize_silver(duck_conn)
         out = _run_gold(duck_conn)
-        canonicals = {r["player_id_canonical"] for r in out}
+        canonicals = {r["player_id"] for r in out}
         assert {"fb_p1", "fb_p2", "fb_p3"} <= canonicals, canonicals
 
     def test_match_id_bridged_via_xref_match(self, duck_conn):
@@ -297,7 +297,7 @@ class TestFctMatchRatingPipeline:
         _seed(duck_conn)
         _materialize_silver(duck_conn)
         out = _run_gold(duck_conn)
-        match_ids = {r["match_id_canonical"] for r in out}
+        match_ids = {r["match_id"] for r in out}
         assert match_ids == {"M_FBREF_HEX"}, match_ids
 
     def test_orphan_match_falls_back_to_sofascore_prefix(self, duck_conn):
@@ -314,11 +314,11 @@ class TestFctMatchRatingPipeline:
         _materialize_silver(duck_conn)
         out = _run_gold(duck_conn)
         orphan_ids = {
-            r["match_id_canonical"] for r in out
-            if r["match_id_canonical"] == "sofascore_M_SS_ORPHAN"
+            r["match_id"] for r in out
+            if r["match_id"] == "sofascore_M_SS_ORPHAN"
         }
         assert orphan_ids == {"sofascore_M_SS_ORPHAN"}, (
-            [r["match_id_canonical"] for r in out]
+            [r["match_id"] for r in out]
         )
 
     def test_canonical_trio_populated(self, duck_conn):
@@ -326,7 +326,7 @@ class TestFctMatchRatingPipeline:
         _materialize_silver(duck_conn)
         out = _run_gold(duck_conn)
         for r in out:
-            assert r["rating_canonical"], r
+            assert r["rating_id"], r
             assert r["rating_source"] == "sofascore", r
             assert r["rating_version"] == "v1", r
 
@@ -341,5 +341,5 @@ class TestFctMatchRatingPipeline:
         _seed(duck_conn)
         _materialize_silver(duck_conn)
         out = _run_gold(duck_conn)
-        pks = [r["rating_canonical"] for r in out]
+        pks = [r["rating_id"] for r in out]
         assert len(pks) == len(set(pks)), pks

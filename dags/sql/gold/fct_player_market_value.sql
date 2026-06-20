@@ -1,7 +1,7 @@
 -- =============================================================================
 -- Gold: fct_player_market_value  (issue #430 — two sources + source in PK)
 -- =============================================================================
--- One valuation point per (player_id_canonical, valuation_date, source).
+-- One valuation point per (player_id, valuation_date, source).
 -- Two sources, both kept side by side — we do NOT pick a "correct" one here
 -- (that is a feature decision, floor 2):
 --
@@ -23,7 +23,7 @@
 --
 -- Canonical-only: the FotMob half has always been canonical-only (INNER JOIN
 -- xref non-orphan); the Transfermarkt half matches that contract
--- (WHERE canonical_id IS NOT NULL) so player_id_canonical is always a real
+-- (WHERE canonical_id IS NOT NULL) so player_id is always a real
 -- 'fb_' canonical and the dim_player FK stays low-orphan.
 --
 -- ⚠️ xref JOIN MUST include (league, season) predicate (CLAUDE.md footgun):
@@ -31,8 +31,8 @@
 --   season condition the FotMob join fans out 1.5-4×. Season is a varchar slug
 --   '2526' on both sides after #404 (slug = slug).
 --
--- PK:           (player_id_canonical, valuation_date, source)
--- FK:           player_id_canonical -> dim_player (soft, WARNING rate-mode)
+-- PK:           (player_id, valuation_date, source)
+-- FK:           player_id -> dim_player (soft, WARNING rate-mode)
 -- Partitioning: none (small off-field table, no season key)
 -- =============================================================================
 
@@ -49,7 +49,7 @@ WITH xref_fotmob AS (
 
 fotmob AS (
     SELECT
-        xfm.canonical_id                                  AS player_id_canonical,
+        xfm.canonical_id                                  AS player_id,
         mv.value_date                                     AS valuation_date,
         mv.market_value_eur                               AS market_value_eur,
         mv.currency                                       AS currency,
@@ -65,7 +65,7 @@ fotmob AS (
 
 transfermarkt AS (
     SELECT
-        tm.canonical_id                                   AS player_id_canonical,
+        tm.canonical_id                                   AS player_id,
         tm.mv_date                                        AS valuation_date,
         tm.value_eur                                      AS market_value_eur,
         CAST('EUR' AS varchar)                            AS currency,
@@ -86,14 +86,14 @@ deduped AS (
     SELECT
         u.*,
         ROW_NUMBER() OVER (
-            PARTITION BY u.player_id_canonical, u.valuation_date, u.source
+            PARTITION BY u.player_id, u.valuation_date, u.source
             ORDER BY u._bronze_ingested_at DESC
         ) AS rn
     FROM unioned u
 )
 
 SELECT
-    player_id_canonical,
+    player_id,
     valuation_date,
     market_value_eur,
     currency,

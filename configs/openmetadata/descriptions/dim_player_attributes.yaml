@@ -25,9 +25,9 @@ table:
     - Domain.Football
     - PII.Low
 columns:
-  - name: player_id_canonical
+  - name: player_id
     description: Канонический ID игрока (`fb_<xxhash64>` для FBref-spine). PK.
-  - name: player_name_canonical
+  - name: player_name
     description: COALESCE(FBref → FotMob → SofaScore) — name fallback chain.
     tags:
       - PII.Low

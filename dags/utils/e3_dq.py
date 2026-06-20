@@ -384,7 +384,7 @@ def build_per_season_e3_checks(
         ),
         CHECK.no_duplicates(
             'iceberg.gold.fct_event',
-            pk=['match_id_canonical', 'event_id'],
+            pk=['match_id', 'event_id'],
             where=season_filter,
             name=f"no_duplicates[gold.fct_event season={season}]",
         ),
@@ -638,19 +638,19 @@ def _build_espn_lineup_checks() -> List[Check]:
 def _build_fct_event_checks() -> List[Check]:
     """DQ for ``iceberg.gold.fct_event`` (E3.3 / Task 2.1).
 
-    ref_integrity for match_id_canonical
-    ------------------------------------
+    ref_integrity for match_id
+    --------------------------
     Phase B (Task 2.1) shipped a 7-source ``silver.xref_match`` cascade,
     so every WhoScored game has a row in xref_match (bridged-fbref or
     orphan-prefixed ``ws_<id>``). The ref_integrity check on
-    ``fct_event.match_id_canonical → silver.xref_match.canonical_id`` is
+    ``fct_event.match_id → silver.xref_match.canonical_id`` is
     now ENABLED at ERROR severity.
 
     Orphan-rate proxies
     -------------------
     Two complementary non-strict guards:
-      * ``orphan_team_rate``   — team_id_canonical IS NULL    (alias-YAML drift)
-      * ``orphan_player_rate_non_meta`` — player_id_canonical IS NULL on
+      * ``orphan_team_rate``   — team_id IS NULL    (alias-YAML drift)
+      * ``orphan_player_rate_non_meta`` — player_id IS NULL on
         non-meta events (Card/Goal/Sub may legitimately have NULL player
         in bronze, so we exclude unmappable rows from the orphan count).
     """
@@ -659,11 +659,11 @@ def _build_fct_event_checks() -> List[Check]:
         # PK + NULL guards (ERROR)
         CHECK.no_duplicates(
             table,
-            pk=['match_id_canonical', 'event_id'],
+            pk=['match_id', 'event_id'],
         ),
         CHECK.no_nulls(
             table,
-            cols=['match_id_canonical', 'event_id', 'action_canonical',
+            cols=['match_id', 'event_id', 'action',
                   'action_source', 'action_version'],
         ),
 
@@ -677,7 +677,7 @@ def _build_fct_event_checks() -> List[Check]:
         CHECK.ref_integrity(
             child='gold.fct_event',
             parent='silver.xref_match',
-            key='match_id_canonical',
+            key='match_id',
             parent_key='canonical_id',
             severity='ERROR',
         ),
@@ -693,7 +693,7 @@ def _build_fct_event_checks() -> List[Check]:
             table=table,
             min_rows=0,
             max_rows=10_000,
-            where="team_id_canonical IS NULL",
+            where="team_id IS NULL",
             severity='WARNING',
             name='orphan_team_rate',
         ),
@@ -707,7 +707,7 @@ def _build_fct_event_checks() -> List[Check]:
             table=table,
             min_rows=0,
             max_rows=50_000,
-            where="player_id_canonical IS NULL AND _action_confidence != 'unmappable'",
+            where="player_id IS NULL AND _action_confidence != 'unmappable'",
             severity='WARNING',
             name='orphan_player_rate_non_meta',
         ),

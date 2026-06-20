@@ -184,9 +184,9 @@ xref_fotmob_latest AS (
 )
 
 SELECT
-    xf.canonical_id                                    AS player_id_canonical,
+    xf.canonical_id                                    AS player_id,
     COALESCE(fb.player_name, fm.player_name, ss.player_name, tm.player_name)
-                                                       AS player_name_canonical,
+                                                       AS player_name,
 
     -- Current club — единый источник FBref (spine 100% coverage,
     -- симметрично с remaining `*_fbref` колонками).

@@ -30,7 +30,7 @@
 --   ah_line               decimal(4,2)     handicap line; NULL outside 'ah'
 --   ou_line               decimal(4,2)     O/U line (=2.5); NULL outside 'ou_2_5'
 --   is_closing            boolean          TRUE = closing-line odds
---   odds_canonical        varchar          xxhash64 synthetic PK
+--   odds_id               varchar          xxhash64 synthetic PK
 --   odds_source           varchar          'matchhistory'
 --   odds_version          varchar          literal 'v1'
 --   league                varchar          partition key
@@ -38,7 +38,7 @@
 --                                          slug '2425' after #404)
 --   _ingested_at          timestamp(6)     bronze provenance
 --
--- PK: (match_id, bookmaker, market, is_closing); odds_canonical is the same
+-- PK: (match_id, bookmaker, market, is_closing); odds_id is the same
 --   quadruple hashed (xxhash64) — hash input unchanged across #426 renames.
 --   One row per quadruple is the silver invariant — PK uniqueness in gold
 --   falls out for free.
@@ -71,7 +71,7 @@ SELECT
         || '|' || s.bookmaker_code
         || '|' || s.market
         || '|' || CAST(s.closing_flag AS varchar)
-    ))))                                     AS odds_canonical,
+    ))))                                     AS odds_id,
     CAST('matchhistory' AS varchar)          AS odds_source,
     CAST('v1'           AS varchar)          AS odds_version,
 

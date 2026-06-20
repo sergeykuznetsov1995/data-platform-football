@@ -87,7 +87,7 @@ class TestCheckCounts:
         #602) + fct_lineup (13) = 35.
 
         fct_event grew by 1 check in Task 2.1 — Phase B re-enabled the
-        ``ref_integrity[fct_event.match_id_canonical -> silver.xref_match]``
+        ``ref_integrity[fct_event.match_id -> silver.xref_match]``
         gate that was disabled during the v0_unbridged interim.
         fct_lineup grew by 1 in issue #242 — added the canon-spine
         ``ref_integrity[fct_lineup.fbref->dim_match]`` alt-hex guard — by 1

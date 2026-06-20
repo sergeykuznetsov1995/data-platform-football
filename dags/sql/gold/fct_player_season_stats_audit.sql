@@ -12,7 +12,7 @@
 -- key_passes, accurate_crosses, tackles_attempted) — primary = FotMob; diff =
 -- FotMob - <source>.
 --
--- Зерно: (player_id_canonical, league, season). Один row per канонический
+-- Зерно: (player_id, league, season). Один row per канонический
 -- игрок × лига × сезон, **только когда обе стороны имеют запись** (INNER JOIN
 -- FBref ∩ FotMob — symmetric to main fct INNER FBref). WhoScored/Understat/
 -- SofaScore — LEFT JOIN → diff = NULL когда источник отсутствует.
@@ -116,7 +116,7 @@ fb_dedup AS (
 
 SELECT
     -- ========= PK (грейн совпадает с fct_player_season_stats) =========
-    xf.canonical_id                                      AS player_id_canonical,
+    xf.canonical_id                                      AS player_id,
     xf.league                                            AS league,
     xf.season_year                                       AS season,
 

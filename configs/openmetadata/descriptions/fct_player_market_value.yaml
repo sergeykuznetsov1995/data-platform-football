@@ -5,7 +5,7 @@ table:
   fullyQualifiedName: trino_iceberg.iceberg.gold.fct_player_market_value
   description: |
     Timeline рыночной стоимости игроков из ДВУХ источников (issue #430). Один
-    row per (player_id_canonical, valuation_date, source) — FotMob и
+    row per (player_id, valuation_date, source) — FotMob и
     Transfermarkt-точки хранятся бок о бок, «правильный» источник здесь НЕ
     выбирается (feature-решение downstream). Pointwise off-field факт: market
     value — это career-long таймлайн, НЕ season-bound, поэтому БЕЗ league/season
@@ -17,7 +17,7 @@ table:
     (league, season) предикат — CLAUDE.md footgun, иначе 1.5-4× fan-out) и
     silver.transfermarkt_market_value_history (canonical_id уже разрешён в
     Silver, читается напрямую, WHERE canonical_id IS NOT NULL). Обе половины
-    canonical-only → player_id_canonical всегда реальный 'fb_' canonical,
+    canonical-only → player_id всегда реальный 'fb_' canonical,
     soft FK к dim_player остаётся low-orphan. ROW_NUMBER по design-PK
     схлопывает cross-season дубликаты (источники re-emit'ят полную history
     в каждом ingest-снэпшоте).
@@ -26,8 +26,8 @@ table:
     - Domain.Football
     - PII.Low
 columns:
-  - name: player_id_canonical
-    description: Канонический 'fb_' ID игрока (soft FK → dim_player, low-orphan). Часть PK (player_id_canonical, valuation_date, source).
+  - name: player_id
+    description: Канонический 'fb_' ID игрока (soft FK → dim_player, low-orphan). Часть PK (player_id, valuation_date, source).
   - name: valuation_date
     description: Дата фиксации market_value (FotMob value_date / Transfermarkt mv_date). Часть PK.
   - name: market_value_eur
@@ -42,4 +42,4 @@ relationships:
   - from: trino_iceberg.iceberg.gold.fct_player_market_value
     to:   trino_iceberg.iceberg.gold.dim_player
     type: FOREIGN_KEY
-    description: player_id_canonical -> dim_player.player_id (soft, low-orphan).
+    description: player_id -> dim_player.player_id (soft, low-orphan).
