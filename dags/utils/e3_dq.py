@@ -753,6 +753,20 @@ def _build_fct_shot_checks() -> List[Check]:
     derive match_id from the FBref hex (which IS resident in
     xref_match.source='fbref'). 1.8% of shots get filtered here — the
     surviving rows MUST all have a parent match.
+
+    Multi-source (#699)
+    -------------------
+    fct_shot is now Understat-primary + SofaScore-fallback, merged at the
+    MATCH level (each match keeps shots from exactly one source). All the
+    checks below still hold unchanged:
+      * SofaScore rows are filtered to fbref-spine match_ids only, so
+        ref_integrity → xref_match still passes.
+      * PK (match_id, shot_id) stays unique — one source per match, and
+        distinct matches have distinct match_ids.
+    No hard "source distribution" floor is added: SofaScore today covers a
+    strict subset of Understat (APL 2526), so the sofascore_v1 row count is
+    ~0 and any min-floor would false-alarm. The "exactly one source per
+    match" invariant is covered by unit tests (test_fct_shot_multisource).
     """
     table = 'iceberg.gold.fct_shot'
 

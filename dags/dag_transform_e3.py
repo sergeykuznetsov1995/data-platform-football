@@ -238,9 +238,9 @@ SILVER_E3_TRANSFORMS = [
         # issue #602: shot-grained SofaScore shotmap projection, canonicalised
         # to fct_shot's match/team/player IDs. Reads bronze.sofascore_event_shotmap
         # + sofascore_schedule + silver.xref_{match,team,player} (source='sofascore')
-        # — MUST run after dag_transform_xref. Consumer = gold.fct_shot_audit
-        # (cross-source xG/SoT validation vs Understat). NOT merged into fct_shot
-        # (no shared shot key across sources).
+        # — MUST run after dag_transform_xref. Consumers: gold.fct_shot_audit
+        # (cross-source xG/SoT validation vs Understat) AND gold.fct_shot (#699,
+        # match-level fallback source — runs in gold_e3, after this silver group).
         'sofascore_shots',
         'dags/sql/silver/sofascore_shots.sql',
         'sofascore_shots',

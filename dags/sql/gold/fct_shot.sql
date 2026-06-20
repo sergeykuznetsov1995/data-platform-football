@@ -1,13 +1,22 @@
 -- =============================================================================
 -- Gold: fct_shot
 -- =============================================================================
--- Shot-grained xG/xA fact table built on top of Understat shot events.
--- One row per shot, resolved to canonical match/team/player IDs via E1 xref.
+-- Shot-grained xG/xA fact table. Multi-source (#699): Understat is the primary
+-- feed, SofaScore is a match-level fallback. One row per shot, resolved to
+-- canonical match/team/player IDs via E1 xref.
+--
+-- Source selection is per-match, NOT per-shot: the two feeds share no shot key
+-- (Understat shot_id != SofaScore shot_id for the same physical shot), so a
+-- match keeps ALL shots from exactly ONE source — the lowest source_priority
+-- present (Understat=1, SofaScore=2). SofaScore only fills matches Understat is
+-- missing or failed to bridge to the FBref spine. See the match_winner CTE.
 --
 -- Source:
---   iceberg.bronze.understat_shots          — shot-level events with xG
+--   iceberg.bronze.understat_shots          — shot-level events with xG (primary)
 --   iceberg.bronze.understat_schedule       — game_id → (date, home, away) lookup
 --   iceberg.silver.fbref_match_enriched     — fbref match_id + date/home/away
+--   iceberg.silver.sofascore_shots          — canonicalised SofaScore shotmap (#602),
+--                                             fallback source, already on fct_shot IDs
 --   iceberg.silver.xref_match               — fbref-spine canonical match_id
 --   iceberg.silver.xref_team                — team alias resolution (8 sources)
 --   iceberg.silver.xref_player              — player resolution (orphan-tolerant)
@@ -87,24 +96,25 @@
 --   body_part                varchar    -- foot | head | other | NULL
 --   situation                varchar    -- open_play | corner | free_kick | set_piece | penalty | NULL
 --   xg                       double     -- 0..1
---   psxg                     double     -- NULL placeholder: post-shot xG only exists in
---                                       --   silver.fbref_shot_events (dead since 2026-02);
---                                       --   historical enrichment tracked as followup of #426.
+--   psxg                     double     -- post-shot xG. NULL for understat_v1 rows
+--                                       --   (Understat has none); sofascore_v1 rows
+--                                       --   carry SofaScore xGOT (#699).
 --   result                   varchar    -- goal | saved | blocked | off_target | post | own_goal
 --                                       --   (own_goal — deviation from design §4.3, kept for
 --                                       --    shooter attribution; design doc amended)
 --   is_goal                  boolean    -- result IN ('goal','own_goal')
---   shot_source              varchar    -- literal 'understat_v1'
+--   shot_source              varchar    -- 'understat_v1' (primary) | 'sofascore_v1' (fallback)
 --   shot_version             varchar    -- literal 'v1'
 --   league                   varchar
 --   season                   varchar    -- normalised to varchar (bronze stores varchar)
 --
 -- Testable invariants (E3.8):
 --   * PK = (match_id, shot_id) is unique.
---   * shot_source = 'understat_v1' for every row.
+--   * shot_source ∈ {'understat_v1', 'sofascore_v1'} for every row.
+--   * each match_id has exactly ONE shot_source (match-level fallback).
 --   * xg ∈ [0, 1] (value_range check).
 --   * is_goal = TRUE  iff  result IN ('goal', 'own_goal').
---   * match_id is non-null (INNER JOIN guarantees it).
+--   * match_id is non-null (INNER JOIN / fbref-spine filter guarantees it).
 --   * team_id / player_id may be NULL — orphan-tolerant.
 -- =============================================================================
 
@@ -307,69 +317,180 @@ shots_norm AS (
         CAST(s.season AS varchar)      AS season
     FROM shots_dedup s
     WHERE s.rn = 1
+),
+
+-- 4) Understat branch (primary, source_priority=1) ---------------------------
+--    INNER JOIN on match bridge, LEFT JOIN on team/player. Logic unchanged
+--    from the single-source v1 — only wrapped in a CTE + tagged source_priority.
+understat_final AS (
+    SELECT
+        sn.shot_id,
+        mb.match_id_canonical                          AS match_id,
+
+        xt.canonical_id                                AS team_id,
+        xp.canonical_id                                AS player_id,
+        xa.canonical_id                                AS assist_player_id,
+
+        sn.minute,
+        sn.x,
+        sn.y,
+
+        sn.body_part,
+        sn.situation,
+
+        sn.xg,
+        -- psxg: Understat carries no post-shot xG (the FBref feed that did is
+        -- dead since 2026-02) → typed NULL. SofaScore branch fills it from xgot.
+        CAST(NULL AS double)                           AS psxg,
+
+        sn.result,
+
+        -- own_goal counts as a goal for is_goal semantics (it ended in net).
+        -- DQ note: own_goal credits scoring team via match outcome, NOT shooter.
+        (sn.result IN ('goal', 'own_goal'))            AS is_goal,
+
+        CAST('understat_v1' AS varchar)                AS shot_source,
+        CAST('v1'           AS varchar)                AS shot_version,
+
+        sn.league,
+        sn.season,
+
+        1                                              AS source_priority
+
+    FROM shots_norm sn
+
+    -- Strict bridge — drops shots whose game_id can't be mapped to fbref match_id.
+    INNER JOIN match_bridge mb
+           ON mb.understat_game_id = sn.understat_game_id
+
+    -- Orphan-tolerant team lookup. xref_team.source_id for source='understat'
+    -- carries the team NAME (e.g. 'Tottenham'), so we join on `team` not `team_id`.
+    -- Use season-deduped view (xref_team_dedup) to avoid N-row fan-out.
+    LEFT JOIN xref_team_dedup xt
+           ON xt.source    = 'understat'
+          AND xt.source_id = sn.understat_team_source_id
+          AND xt.league    = sn.league
+
+    -- Orphan-tolerant player lookup (xref_player emits us_* canonical for orphans).
+    -- xref_player rejection rate ≤6.94% per E1 verdict — orphan rows allowed.
+    LEFT JOIN xref_player_dedup xp
+           ON xp.source    = 'understat'
+          AND xp.source_id = sn.understat_player_source_id
+
+    -- Assister resolution (#444): recover the true understat player_id from the
+    -- name dictionary (Understat has no per-shot assist id), then xref to canonical.
+    -- NULL assist_player_norm (no assist) → no match → NULL assist_player_id.
+    LEFT JOIN us_player_dim upd
+           ON upd.player_norm = sn.assist_player_norm
+          AND upd.league      = sn.league
+          AND upd.season      = sn.season
+
+    LEFT JOIN xref_player_dedup xa
+           ON xa.source    = 'understat'
+          AND xa.source_id = upd.understat_player_id
+),
+
+-- 5) SofaScore branch (fallback, source_priority=2) --------------------------
+--    silver.sofascore_shots (#602) is ALREADY canonicalised to the same
+--    match/team/player IDs and the same enum domains (result/body_part/
+--    situation) and coordinate scale (0..1) as the Understat branch, so we read
+--    it directly — no xref re-join here (the (league,season) footgun is already
+--    handled inside the silver projection). We DROP:
+--      * non-fbref matches — silver emits orphan ids ('sofascore_<raw>' when the
+--        game is absent from xref_match, 'ss_<id>' when xref_match has it but it
+--        didn't bridge to the FBref spine). Neither is on the fbref spine; the
+--        first also fails ref_integrity. fct_shot is fbref-spine-keyed (Understat
+--        branch INNER-JOINs the bridge), so SofaScore must match the same shape.
+--        No fbref match_id (8-hex) starts with 's', so the two prefix filters are
+--        collision-free.
+--      * NULL-xg shots — fct_shot.xg is NOT NULL / [0,1] at ERROR severity.
+--    psxg := xgot (#699): SofaScore xGOT is post-shot xG — the metric FBref's
+--    dead feed used to provide. assist_player_id has no SofaScore shotmap source.
+sofascore_final AS (
+    SELECT
+        ss.shot_id,
+        ss.match_id,
+
+        ss.team_id,
+        ss.player_id,
+        CAST(NULL AS varchar)                          AS assist_player_id,
+
+        ss.minute,
+        ss.x,
+        ss.y,
+
+        ss.body_part,
+        ss.situation,
+
+        ss.xg,
+        ss.xgot                                        AS psxg,
+
+        ss.result,
+        ss.is_goal,
+
+        ss.shot_source,                                -- literal 'sofascore_v1'
+        CAST('v1' AS varchar)                          AS shot_version,
+
+        ss.league,
+        ss.season,
+
+        2                                              AS source_priority
+
+    FROM iceberg.silver.sofascore_shots ss
+    WHERE ss.match_id NOT LIKE 'sofascore_%'
+      AND ss.match_id NOT LIKE 'ss_%'
+      AND ss.xg IS NOT NULL
+),
+
+-- 6) Union both sources ------------------------------------------------------
+all_shots AS (
+    SELECT shot_id, match_id, team_id, player_id, assist_player_id, minute,
+           x, y, body_part, situation, xg, psxg, result, is_goal,
+           shot_source, shot_version, league, season, source_priority
+    FROM understat_final
+    UNION ALL
+    SELECT shot_id, match_id, team_id, player_id, assist_player_id, minute,
+           x, y, body_part, situation, xg, psxg, result, is_goal,
+           shot_source, shot_version, league, season, source_priority
+    FROM sofascore_final
+),
+
+-- 7) Per-match source winner (match-level fallback) --------------------------
+--    The two sources share NO shot key (Understat shot_id != SofaScore shot_id
+--    for the same physical shot), so individual shots cannot be COALESCE'd or
+--    deduped across sources (#602). Instead we pick ONE source per canonical
+--    match: the lowest source_priority present. A match covered by Understat
+--    keeps ALL its Understat shots; SofaScore only fills matches Understat is
+--    missing (or failed to bridge). No double-count, no cross-source coordinate
+--    mixing (orientation is not guaranteed equal between the two feeds).
+match_winner AS (
+    SELECT match_id, MIN(source_priority) AS win_priority
+    FROM all_shots
+    GROUP BY match_id
 )
 
--- 4) Final projection — INNER JOIN on match bridge, LEFT JOIN on team/player
+-- 8) Final projection — keep only the winning source's shots per match --------
 SELECT
-    sn.shot_id,
-    mb.match_id_canonical                          AS match_id,
+    a.shot_id,
+    a.match_id,
+    a.team_id,
+    a.player_id,
+    a.assist_player_id,
+    a.minute,
+    a.x,
+    a.y,
+    a.body_part,
+    a.situation,
+    a.xg,
+    a.psxg,
+    a.result,
+    a.is_goal,
+    a.shot_source,
+    a.shot_version,
+    a.league,
+    a.season
 
-    xt.canonical_id                                AS team_id,
-    xp.canonical_id                                AS player_id,
-    xa.canonical_id                                AS assist_player_id,
-
-    sn.minute,
-    sn.x,
-    sn.y,
-
-    sn.body_part,
-    sn.situation,
-
-    sn.xg,
-    -- psxg: only FBref shot events carry post-shot xG; that feed is dead since
-    -- 2026-02 → typed NULL placeholder, historical backfill is a #426 followup.
-    CAST(NULL AS double)                           AS psxg,
-
-    sn.result,
-
-    -- own_goal counts as a goal for is_goal semantics (it ended in net).
-    -- DQ note: own_goal credits scoring team via match outcome, NOT shooter.
-    (sn.result IN ('goal', 'own_goal'))            AS is_goal,
-
-    CAST('understat_v1' AS varchar)                AS shot_source,
-    CAST('v1'           AS varchar)                AS shot_version,
-
-    sn.league,
-    sn.season
-
-FROM shots_norm sn
-
--- Strict bridge — drops shots whose game_id can't be mapped to fbref match_id.
-INNER JOIN match_bridge mb
-       ON mb.understat_game_id = sn.understat_game_id
-
--- Orphan-tolerant team lookup. xref_team.source_id for source='understat'
--- carries the team NAME (e.g. 'Tottenham'), so we join on `team` not `team_id`.
--- Use season-deduped view (xref_team_dedup) to avoid N-row fan-out.
-LEFT JOIN xref_team_dedup xt
-       ON xt.source    = 'understat'
-      AND xt.source_id = sn.understat_team_source_id
-      AND xt.league    = sn.league
-
--- Orphan-tolerant player lookup (xref_player emits us_* canonical for orphans).
--- xref_player rejection rate ≤6.94% per E1 verdict — orphan rows allowed.
-LEFT JOIN xref_player_dedup xp
-       ON xp.source    = 'understat'
-      AND xp.source_id = sn.understat_player_source_id
-
--- Assister resolution (#444): recover the true understat player_id from the
--- name dictionary (Understat has no per-shot assist id), then xref to canonical.
--- NULL assist_player_norm (no assist) → no match → NULL assist_player_id.
-LEFT JOIN us_player_dim upd
-       ON upd.player_norm = sn.assist_player_norm
-      AND upd.league      = sn.league
-      AND upd.season      = sn.season
-
-LEFT JOIN xref_player_dedup xa
-       ON xa.source    = 'understat'
-      AND xa.source_id = upd.understat_player_id
+FROM all_shots a
+JOIN match_winner w
+       ON w.match_id     = a.match_id
+      AND w.win_priority = a.source_priority

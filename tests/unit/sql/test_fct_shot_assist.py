@@ -117,6 +117,27 @@ _TABLES: Dict[str, str] = {
         source_id    VARCHAR,
         canonical_id VARCHAR
     """,
+    # SofaScore fallback source (#699). Seeded empty here — these tests exercise
+    # the Understat assist path, and an empty SofaScore branch lets Understat win
+    # every match. Multi-source merge behaviour is in test_fct_shot_multisource.
+    "silver_sofascore_shots": """
+        shot_id     VARCHAR,
+        match_id    VARCHAR,
+        team_id     VARCHAR,
+        player_id   VARCHAR,
+        minute      INTEGER,
+        x           DOUBLE,
+        y           DOUBLE,
+        body_part   VARCHAR,
+        situation   VARCHAR,
+        xg          DOUBLE,
+        xgot        DOUBLE,
+        result      VARCHAR,
+        is_goal     BOOLEAN,
+        shot_source VARCHAR,
+        league      VARCHAR,
+        season      VARCHAR
+    """,
 }
 
 
