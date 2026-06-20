@@ -86,6 +86,12 @@ class WhoScoredScraper(SoccerdataScraper):
     # turns each subsequent request into a 60 s challenge timeout.
     EVENTS_SESSION_RECREATE_EVERY = 10
 
+    # Player-profile pages are light static HTML (no per-match heaviness), but
+    # WhoScored still flags a reused CF cookie after ~10 requests, so mirror the
+    # events recycle/retry budget.
+    PLAYER_PROFILE_SESSION_RECREATE_EVERY = 10
+    PLAYER_PROFILE_MAX_RETRIES = 3
+
     def __init__(
         self,
         leagues: Optional[List[str]] = None,
@@ -232,6 +238,160 @@ class WhoScoredScraper(SoccerdataScraper):
         df = self._safe_call('read_season_stages')
         path = self._save(df, 'whoscored_season_stages', 'season_stages')
         return {'season_stages': path} if path else {}
+
+    # ---------- Player profile: FlareSolverr-based ----------
+
+    def _resolve_player_ids_from_bronze(
+        self, limit: Optional[int] = None
+    ) -> List[str]:
+        """DISTINCT player_id from bronze.whoscored_events (configured league/season).
+
+        ``player_id`` is ``DOUBLE`` in Bronze — the double-cast footgun: a plain
+        ``CAST AS varchar`` yields ``'3.55401E5'``. Cast through ``BIGINT`` first
+        (CLAUDE.md → top footguns). WhoScored has no ratings table, so events is
+        the player roster of record.
+        """
+        from scrapers.base.trino_manager import TrinoTableManager
+
+        leagues = list(self.leagues or [])
+        # bronze.whoscored_events.season is the soccerdata SHORT form ('2526');
+        # SEASONS_STR tokens are already short form, so compare str(token)
+        # directly — NOT via _season_to_soccerdata_str (that expects a year-start
+        # int, 2025→'2526', and would map a short token 2526 to '2627' = no match).
+        season_strs = [str(s) for s in (self.seasons or [])]
+        if not leagues or not season_strs:
+            return []
+
+        leagues_in = ", ".join(f"'{l}'" for l in leagues)
+        seasons_in = ", ".join(f"'{s}'" for s in season_strs)
+        sql = (
+            "SELECT DISTINCT CAST(CAST(player_id AS BIGINT) AS varchar) "
+            "FROM iceberg.bronze.whoscored_events "
+            f"WHERE league IN ({leagues_in}) AND season IN ({seasons_in}) "
+            "AND player_id IS NOT NULL"
+        )
+        if limit:
+            sql += f" LIMIT {int(limit)}"
+
+        mgr = TrinoTableManager()
+        try:
+            rows = mgr._execute(sql, fetch=True)
+        except Exception as e:
+            msg = str(e)
+            if 'TABLE_NOT_FOUND' in msg or 'does not exist' in msg:
+                logger.warning("bronze.whoscored_events does not exist yet")
+                return []
+            raise
+        return [str(r[0]) for r in (rows or []) if r and r[0]]
+
+    def scrape_player_profile(
+        self,
+        player_ids: Optional[List[str]] = None,
+        limit: Optional[int] = None,
+    ) -> Dict[str, str]:
+        """Per-player biographical snapshot from ``/Players/{id}/Show``.
+
+        Snapshot grain: 1 row per ``player_id`` in the ``(league, season)``
+        partition (``replace_partitions`` → full refresh each run). player_ids
+        default to the configured league/season roster pulled from
+        ``bronze.whoscored_events``. Cross-source validation against the FotMob /
+        SofaScore profiles lives in Silver (issue #12), not here.
+        """
+        from scrapers.whoscored.player_profile_fetcher import (
+            fetch_player_profile_html,
+            parse_player_profile,
+        )
+
+        league = (self.leagues or [None])[0]
+        # Tag the partition with the bronze short-form season (see resolver note).
+        season_str = str(self.seasons[0]) if self.seasons else None
+
+        if player_ids is None:
+            player_ids = self._resolve_player_ids_from_bronze(limit=limit)
+        if not player_ids:
+            logger.warning(
+                "WhoScored: no player_ids resolved for player_profile "
+                "(league=%s season=%s)", league, season_str,
+            )
+            return {}
+        if limit:
+            player_ids = list(player_ids)[: int(limit)]
+
+        # Release the schedule selenium/FS reader before opening our own session.
+        self._close_reader()
+
+        fs_url = self.flaresolverr_url or os.environ.get(
+            "FLARESOLVERR_URL", "http://flaresolverr:8191"
+        )
+        # Proxy-less by default (#616); honour PROXY_FILTER_URL / proxy-file.
+        proxy_url = os.environ.get("PROXY_FILTER_URL") or (
+            self._build_proxy_url() if self.proxy else None
+        )
+        client = FlareSolverrClient(url=fs_url)
+        session_id = f"whoscored-pp-{uuid.uuid4().hex[:8]}"
+        client.create_session(session_id, proxy_url=proxy_url)
+        logger.info(
+            "WhoScored: player_profile FS session %s via %s for %d players "
+            "(proxy mode: %s)",
+            session_id, fs_url, len(player_ids), describe_proxy_mode(proxy_url),
+        )
+
+        def _recycle() -> str:
+            client.destroy_session(session_id)
+            sid = f"whoscored-pp-{uuid.uuid4().hex[:8]}"
+            client.create_session(sid, proxy_url=proxy_url)
+            return sid
+
+        rows: List[Dict] = []
+        try:
+            for i, pid in enumerate(player_ids, 1):
+                if i > 1 and (i - 1) % self.PLAYER_PROFILE_SESSION_RECREATE_EVERY == 0:
+                    logger.info(
+                        "WhoScored: recycling player_profile FS session at %d/%d",
+                        i, len(player_ids),
+                    )
+                    session_id = _recycle()
+
+                html = None
+                for attempt in range(self.PLAYER_PROFILE_MAX_RETRIES):
+                    try:
+                        html = fetch_player_profile_html(client, pid, session_id)
+                        break
+                    except (FlareSolverrTimeout, FlareSolverrCFChallengeFailed) as e:
+                        logger.warning(
+                            "WhoScored: player_profile pid=%s attempt %d/%d: %s",
+                            pid, attempt + 1, self.PLAYER_PROFILE_MAX_RETRIES, e,
+                        )
+                        session_id = _recycle()
+
+                if not html:
+                    continue
+                row = parse_player_profile(html, pid, league, season_str)
+                if row is not None:
+                    rows.append(row)
+        finally:
+            client.destroy_session(session_id)
+
+        if not rows:
+            logger.warning(
+                "WhoScored: zero player_profile rows materialised across %d players",
+                len(player_ids),
+            )
+            return {}
+
+        df = pd.DataFrame(rows)
+        df = self._add_metadata(df, 'player_profile')
+        path = self.save_to_iceberg(
+            df=df,
+            table_name='whoscored_player_profile',
+            partition_cols=['league', 'season'],
+            replace_partitions=['league', 'season'],
+        )
+        logger.info(
+            "WhoScored: saved %d player_profile rows for %d players to %s",
+            len(df), df['player_id'].nunique(), path,
+        )
+        return {'player_profile': path} if path else {}
 
     # ---------- Events: FlareSolverr-based ----------
 

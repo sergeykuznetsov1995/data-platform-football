@@ -122,6 +122,22 @@ def main() -> int:
         default=os.environ.get('FLARESOLVERR_URL', 'http://flaresolverr:8191'),
         help='Base URL of FlareSolverr instance.',
     )
+    parser.add_argument(
+        '--player-profile',
+        action='store_true',
+        default=False,
+        help=(
+            'Run ONLY scrape_player_profile — biographical /Players/{id} '
+            'snapshot. Reads player_ids from bronze.whoscored_events, so safe '
+            'only after events have been ingested. Skips schedule/events.'
+        ),
+    )
+    parser.add_argument(
+        '--limit',
+        type=int,
+        default=None,
+        help='Cap player_profile to N players (smoke / verification runs).',
+    )
     args = parser.parse_args()
 
     leagues = [l.strip() for l in args.leagues.split(',') if l.strip()]
@@ -152,7 +168,15 @@ def main() -> int:
             proxy_file=args.proxy_file,
             flaresolverr_url=args.flaresolverr_url,
         ) as scraper:
-            if args.events_only:
+            if args.player_profile:
+                logger.info("--player-profile set: running scrape_player_profile only")
+                try:
+                    out = scraper.scrape_player_profile(limit=args.limit) or {}
+                    _merge(results, out)
+                except Exception as e:
+                    logger.error(f"scrape_player_profile failed: {e}", exc_info=True)
+                    results['errors'].append(f"player_profile: {e}")
+            elif args.events_only:
                 logger.info("--events-only set: skipping schedule/missing/stages")
             else:
                 # 1. Schedule (cheap, required)
@@ -180,7 +204,9 @@ def main() -> int:
                     results['errors'].append(f"season_stages: {e}")
 
             # 4. Events (heavy — only latest season; can be skipped)
-            if args.skip_events:
+            if args.player_profile:
+                pass  # player-profile-only run: events deliberately skipped
+            elif args.skip_events:
                 logger.info("--skip-events set: not calling scrape_events()")
             else:
                 try:

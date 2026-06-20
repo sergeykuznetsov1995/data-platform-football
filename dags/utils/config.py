@@ -82,6 +82,7 @@ MIN_ROW_THRESHOLDS: Dict[str, int] = {
     # scrape (root cause of #102). Sized for APL 1 season.
     'whoscored_schedule': 340,    # 380 fixtures/season - 5-10% margin
     'whoscored_events': 500_000,  # ~540k events/season - 7% margin
+    'whoscored_player_profile': 300,  # ~531 distinct players/season (#37) - margin for fetch/parse loss
     # ESPN / Understat / SoFIFA (issue #466): same silent-fail class as #102 —
     # read_* swallowed errors and runners exited 0. Floors calibrated against
     # live Bronze counts on 2026-06-11.

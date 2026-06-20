@@ -719,3 +719,143 @@ class TestWhoScoredSeasonHelper:
     def test_season_to_soccerdata_str(self, season, expected):
         from scrapers.whoscored.scraper import _season_to_soccerdata_str
         assert _season_to_soccerdata_str(season) == expected
+
+
+# -----------------------------------------------------------------------------
+# Player profile: /Players/{id} biographical snapshot (issue #37).
+# -----------------------------------------------------------------------------
+# Minimal real info-label block captured by scripts/probe_whoscored_players.py.
+_PLAYER_PROFILE_HTML = (
+    '<div class="col12-lg-6"><span class="info-label">Name: </span>Rayan Aït-Nouri</div>'
+    '<div class="col12-lg-6"><span class="info-label">Current Team: </span>'
+    '<a href="/teams/167/show/england-manchester-city" class="team-link">Manchester City</a></div>'
+    '<div class="col12-lg-6"><span class="info-label">Shirt Number: </span>\n  21\n</div>'
+    '<div class="col12-lg-6"><span class="info-label">Age: </span>25 years old (<i>06-06-2001</i>)</div>'
+    '<div class="col12-lg-6"><span class="info-label">Height: </span>180cm</div>'
+    '<div class="col12-lg-6"><span class="info-label">Nationality: </span>'
+    '<span class="iconize iconize-icon-left">Algeria <span class="ui-icon country flg-dz"></span></span></div>'
+    '<div class="col12-lg-6"><span class="info-label">Positions: </span><span>'
+    '<span style="display: inline-block;">Defender (Left),</span>'
+    '<span style="display: inline-block;">Midfielder (Left)</span></span></div>'
+)
+
+
+@pytest.mark.unit
+class TestPlayerProfileParse:
+    """``parse_player_profile`` projects the DOM info-label block to a flat row."""
+
+    def test_happy_path(self):
+        from scrapers.whoscored.player_profile_fetcher import parse_player_profile
+
+        row = parse_player_profile(
+            _PLAYER_PROFILE_HTML, '355401', 'ENG-Premier League', '2526',
+        )
+        assert row['player_id'] == '355401'
+        assert row['name'] == 'Rayan Aït-Nouri'
+        assert row['current_team_id'] == '167'
+        assert row['current_team_name'] == 'Manchester City'
+        assert row['shirt_number'] == 21
+        assert row['age'] == 25
+        assert row['date_of_birth'] == '2001-06-06'  # DD-MM-YYYY -> ISO
+        assert row['height_cm'] == 180
+        assert row['nationality'] == 'Algeria'
+        assert row['country_code'] == 'dz'
+        assert 'Defender (Left)' in row['positions']
+        assert row['league'] == 'ENG-Premier League'
+        assert row['season'] == '2526'
+
+    def test_garbage_returns_none(self):
+        from scrapers.whoscored.player_profile_fetcher import parse_player_profile
+
+        assert parse_player_profile(None, '1', 'L', '2526') is None
+        assert parse_player_profile('', '1', 'L', '2526') is None
+        assert parse_player_profile(
+            '<html><body>no info-label here</body></html>', '1', 'L', '2526'
+        ) is None
+
+    def test_missing_fields_degrade_to_null(self):
+        """A page with only some labels yields a row, absent fields are None."""
+        from scrapers.whoscored.player_profile_fetcher import parse_player_profile
+
+        html = (
+            '<div><span class="info-label">Name: </span>John Doe</div>'
+            '<div><span class="info-label">Height: </span>172cm</div>'
+        )
+        row = parse_player_profile(html, '99', 'ENG-Premier League', '2526')
+        assert row['name'] == 'John Doe'
+        assert row['height_cm'] == 172
+        assert row['date_of_birth'] is None
+        assert row['current_team_id'] is None
+        assert row['nationality'] is None
+        assert row['positions'] is None
+
+
+@pytest.mark.unit
+class TestScrapePlayerProfile:
+    """End-to-end ``scrape_player_profile`` with FlareSolverr mocked offline."""
+
+    def test_writes_player_profile_table(self, mock_base_dependencies):
+        from scrapers.whoscored import WhoScoredScraper
+        from scrapers.whoscored import scraper as scraper_mod
+
+        scraper = WhoScoredScraper(leagues=['ENG-Premier League'], seasons=[2526])
+
+        client_instance = MagicMock()
+        client_instance.get.return_value = {
+            'status': 200, 'html': _PLAYER_PROFILE_HTML, 'cookies': [], 'userAgent': '',
+        }
+        client_cls = MagicMock(return_value=client_instance)
+        save_mock = MagicMock(return_value='iceberg.bronze.whoscored_player_profile')
+
+        with patch.object(scraper_mod, 'FlareSolverrClient', client_cls), \
+             patch.object(scraper, 'save_to_iceberg', save_mock):
+            result = scraper.scrape_player_profile(player_ids=['355401', '355402'])
+
+        client_instance.create_session.assert_called()
+        client_instance.destroy_session.assert_called()
+        assert client_instance.get.call_count == 2  # one GET per player
+
+        kwargs = save_mock.call_args.kwargs
+        assert kwargs['table_name'] == 'whoscored_player_profile'
+        assert kwargs['partition_cols'] == ['league', 'season']
+        assert kwargs['replace_partitions'] == ['league', 'season']
+        df = kwargs['df']
+        assert len(df) == 2
+        assert set(df['player_id']) == {'355401', '355402'}
+        assert df['height_cm'].tolist() == [180, 180]
+        assert df['season'].unique().tolist() == ['2526']
+        assert df['_source'].iloc[0] == 'whoscored'
+        assert df['_entity_type'].iloc[0] == 'player_profile'
+        assert result == {'player_profile': 'iceberg.bronze.whoscored_player_profile'}
+
+    def test_no_player_ids_returns_empty(self, mock_base_dependencies):
+        from scrapers.whoscored import WhoScoredScraper
+
+        scraper = WhoScoredScraper(leagues=['ENG-Premier League'], seasons=[2526])
+        with patch.object(scraper, '_resolve_player_ids_from_bronze', return_value=[]):
+            result = scraper.scrape_player_profile()
+        assert result == {}
+
+
+@pytest.mark.unit
+class TestResolvePlayerIdsFromBronze:
+    """player_id resolver uses the DOUBLE→BIGINT→varchar double-cast (footgun)."""
+
+    def test_double_cast_sql_and_ids(self, mock_base_dependencies):
+        from scrapers.whoscored import WhoScoredScraper
+
+        scraper = WhoScoredScraper(leagues=['ENG-Premier League'], seasons=[2526])
+        mgr_instance = MagicMock()
+        mgr_instance._execute.return_value = [('355401',), ('355402',)]
+
+        with patch(
+            'scrapers.base.trino_manager.TrinoTableManager',
+            return_value=mgr_instance,
+        ):
+            ids = scraper._resolve_player_ids_from_bronze(limit=5)
+
+        assert ids == ['355401', '355402']
+        sql = mgr_instance._execute.call_args.args[0]
+        assert 'CAST(CAST(player_id AS BIGINT) AS varchar)' in sql
+        assert "season IN ('2526')" in sql
+        assert 'LIMIT 5' in sql
