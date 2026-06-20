@@ -58,9 +58,6 @@ class FBrefDataReaderMixin:
         - self._add_metadata(df, entity_type)
         - self._cleanup_after_league()
         - self._extract_match_ids(schedule_df, max_matches)
-        - self._merge_team_stats(data, league, season)
-        - self._merge_player_stats(data, league, season)
-        - self._merge_keeper_stats(data, league, season)
         - self.save_to_iceberg(df, table_name, partition_cols)
         - self.use_nodriver, self._nodriver_browser
     """

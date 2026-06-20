@@ -385,31 +385,9 @@ def main():
 
     # === Full mode specific arguments ===
     parser.add_argument(
-        '--extended-stats',
-        action='store_true',
-        default=True,
-        help='[full mode] Collect extended player stats (all stat_types merged)'
-    )
-    parser.add_argument(
-        '--no-extended-stats',
-        action='store_true',
-        help='[full mode] Disable extended player stats collection'
-    )
-    parser.add_argument(
         '--match-stats',
         action='store_true',
         help='[full mode] Collect per-match player stats (slow, selenium only)'
-    )
-    parser.add_argument(
-        '--keeper-stats',
-        action='store_true',
-        default=True,
-        help='[full mode] Collect goalkeeper statistics'
-    )
-    parser.add_argument(
-        '--no-keeper-stats',
-        action='store_true',
-        help='[full mode] Disable goalkeeper stats collection'
     )
     parser.add_argument(
         '--shot-events',
@@ -448,17 +426,6 @@ def main():
         '--team-match-stats',
         action='store_true',
         help='[full mode] Collect team-level match statistics (slow, selenium only)'
-    )
-    parser.add_argument(
-        '--team-stats-extended',
-        action='store_true',
-        default=True,
-        help='[full mode] Collect extended team stats (all stat_types merged)'
-    )
-    parser.add_argument(
-        '--no-team-stats-extended',
-        action='store_true',
-        help='[full mode] Disable extended team stats collection'
     )
     parser.add_argument(
         '--max-matches',
@@ -924,29 +891,23 @@ def main():
                 # MODE: full
                 # =============================================================
                 else:  # mode == 'full'
-                    include_extended = args.extended_stats and not args.no_extended_stats
-                    include_keeper = args.keeper_stats and not args.no_keeper_stats
                     include_shot_events = args.shot_events and not args.no_shot_events
                     include_match_events = args.match_events and not args.no_match_events
                     include_lineups = args.lineups and not args.no_lineups
-                    include_team_stats_extended = args.team_stats_extended and not args.no_team_stats_extended
 
                     logger.info(
-                        f"Full mode (selenium): extended={include_extended}, keeper={include_keeper}, "
+                        f"Full mode (selenium): "
                         f"shot_events={include_shot_events}, match_events={include_match_events}, "
-                        f"lineups={include_lineups}, team_extended={include_team_stats_extended}"
+                        f"lineups={include_lineups}"
                     )
                     logger.info(f"Max matches per league: {max_matches if max_matches else 'unlimited'}")
 
                     scrape_results = scraper.scrape_all(
-                        include_extended_stats=include_extended,
                         include_match_stats=args.match_stats,
-                        include_keeper_stats=include_keeper,
                         include_shot_events=include_shot_events,
                         include_match_events=include_match_events,
                         include_lineups=include_lineups,
                         include_team_match_stats=args.team_match_stats,
-                        include_team_stats_extended=include_team_stats_extended,
                         max_matches_per_league=max_matches,
                     )
 
@@ -955,10 +916,7 @@ def main():
                     # Add row count placeholders for backwards compatibility
                     results['schedule_rows'] = 1 if 'schedule' in scrape_results else 0
                     results['team_stats_rows'] = 1 if 'team_stats' in scrape_results else 0
-                    results['team_stats_extended_rows'] = 1 if 'team_stats_extended' in scrape_results else 0
                     results['player_stats_rows'] = 1 if 'player_stats' in scrape_results else 0
-                    results['player_stats_extended_rows'] = 1 if 'player_stats_extended' in scrape_results else 0
-                    results['keeper_stats_rows'] = 1 if 'keeper_stats' in scrape_results else 0
                     results['match_stats_rows'] = 1 if 'player_match_stats' in scrape_results else 0
                     results['shot_events_rows'] = 1 if 'shot_events' in scrape_results else 0
                     results['match_events_rows'] = 1 if 'match_events' in scrape_results else 0

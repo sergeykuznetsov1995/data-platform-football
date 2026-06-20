@@ -192,7 +192,6 @@ class TestFBrefScraperMethods:
         assert hasattr(scraper, 'read_match_events')
         assert hasattr(scraper, 'read_lineup')
         assert hasattr(scraper, 'read_team_match_stats')
-        assert hasattr(scraper, '_merge_team_stats')
         assert hasattr(scraper, '_extract_match_ids')
 
         # Check methods are callable
@@ -214,7 +213,6 @@ class TestFBrefScraperMethods:
         assert 'include_match_events' in params
         assert 'include_lineups' in params
         assert 'include_team_match_stats' in params
-        assert 'include_team_stats_extended' in params
         assert 'max_matches_per_league' in params
 
     def test_extract_match_ids_from_dataframe(self, mock_scraper_dependencies):
@@ -1014,9 +1012,7 @@ class TestScrapeAllReplacePartitions:
     otherwise --mode full re-runs plain-append duplicates."""
 
     SEASON_TABLES = (
-        'fbref_schedule', 'fbref_team_stats', 'fbref_team_stats_extended',
-        'fbref_player_stats', 'fbref_player_stats_extended',
-        'fbref_keeper_stats',
+        'fbref_schedule', 'fbref_team_stats', 'fbref_player_stats',
     )
     MATCH_TABLES = (
         'fbref_player_match_stats', 'fbref_shot_events', 'fbref_match_events',
@@ -1059,10 +1055,6 @@ class TestScrapeAllReplacePartitions:
         scraper.read_schedule = MagicMock(return_value=season_df.copy())
         scraper.read_team_season_stats = MagicMock(return_value=season_df.copy())
         scraper.read_player_season_stats = MagicMock(return_value=season_df.copy())
-        scraper.read_keeper_stats = MagicMock(return_value=season_df.copy())
-        scraper._merge_team_stats = MagicMock(return_value=season_df.copy())
-        scraper._merge_player_stats = MagicMock(return_value=season_df.copy())
-        scraper._merge_keeper_stats = MagicMock(return_value=season_df.copy())
         scraper._extract_match_ids = MagicMock(return_value=['m1'])
         scraper.read_player_match_stats = MagicMock(return_value=match_df.copy())
         scraper.read_shot_events = MagicMock(return_value=match_df.copy())
