@@ -12,7 +12,7 @@ Supports two scraper backends:
 Architecture:
 - TaskGroup player_stats: 4 SEQUENTIAL tasks (stats, shooting, playingtime, misc)
 - TaskGroup team_stats: 4 SEQUENTIAL tasks (same as player_stats)
-- TaskGroup keeper_stats: 2 SEQUENTIAL tasks (keeper, keeper_adv)
+- TaskGroup keeper_stats: 1 SEQUENTIAL task (keeper)
 - TaskGroup match_data: schedule -> match_all_data (OPTIMIZED)
 - validate_all_data: final validation
 
@@ -265,9 +265,8 @@ with DAG(
     │   └── player_stats, player_shooting, player_playingtime, player_misc
     ├── TaskGroup: team_stats (4 SEQUENTIAL tasks)
     │   └── (same stat_types as player)
-    ├── TaskGroup: keeper_stats (2 SEQUENTIAL tasks)
-    │   ├── keeper_keeper
-    │   └── keeper_keeper_adv
+    ├── TaskGroup: keeper_stats (1 task)
+    │   └── keeper_keeper
     ├── TaskGroup: match_data (OPTIMIZED)
     │   ├── match_schedule
     │   └── match_all_data (combined: 5 data types in single pass)
@@ -277,7 +276,7 @@ with DAG(
     Note (Apr 2026): passing, passing_types, gca, defense, possession were
     removed — FBref restricted these stats and the tables were 100% empty.
 
-    ### Tables Created (16 tables)
+    ### Tables Created (15 tables)
 
     **Player Stats (4 tables):**
     - fbref_player_stats, fbref_player_shooting
@@ -287,8 +286,8 @@ with DAG(
     - fbref_team_stats, fbref_team_shooting
     - fbref_team_playingtime, fbref_team_misc
 
-    **Keeper Stats (2 tables):**
-    - fbref_keeper_keeper, fbref_keeper_keeper_adv
+    **Keeper Stats (1 table):**
+    - fbref_keeper_keeper
 
     **Match Data (6 tables):**
     - fbref_schedule, fbref_match_events, fbref_lineups

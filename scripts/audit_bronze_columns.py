@@ -29,17 +29,7 @@ from utils.silver_tasks import _get_trino_connection
 # ---- Allowlist (verbatim from feedback_bronze_expected_null_columns.md) ----
 
 EXPECTED_NULL: dict[str, set[str]] = {
-    'fbref_keeper_keeper_adv': {
-        # 23 "advanced keeper" cols restricted by FBref Feb 2026
-        'goals_fk', 'goals_ck', 'goals_og', 'psxg', 'psxg/sot', 'psxg+/-', '/90',
-        'cmp', 'att', 'cmp%', 'att (gk)', 'thr', 'launch%', 'avglen',
-        'opp', 'stp', 'stp%', '#opa', '#opa/90', 'avgdist',
-        'pkatt', 'pka', 'pksv',
-        # Merged-header duplicate columns (FBref renders the same metric twice
-        # under different table headers, parser keeps both — `_1` suffix is the
-        # second occurrence and is always empty because FBref only fills the first).
-        'att_1', 'avglen_1', 'launch%_1',
-    },
+    # fbref_keeper_keeper_adv removed in #606 — scrape stopped, table dropped.
     'fbref_team_misc': {'pkwon', 'pkcon'},
     'fbref_player_misc': {'pkwon', 'pkcon'},
     'fbref_match_player_stats': {'pkwon', 'pkcon'},
@@ -151,7 +141,6 @@ EXPECTED_CONSTANT: dict[str, set[str]] = {
     'fbref_team_playingtime': {'stat_type', 'min%', 'mn/mp'},
     'fbref_team_misc': {'stat_type'},
     'fbref_keeper_keeper': {'stat_type', 'pos', 'matches'},
-    'fbref_keeper_keeper_adv': {'stat_type', 'pos', 'matches'},
     # notes is sparse-by-design (HIGH_NULL) but the few populated rows happen to
     # share the same text ("Award Decided on Pens"), triggering CONSTANT too.
     'fbref_schedule': {'notes'},
@@ -262,11 +251,7 @@ EXPECTED_TABLES: dict[str, dict[str, set[str]]] = {
         'fbref_keeper_keeper': {
             'league', 'season', 'player', 'squad', 'mp', 'ga', 'saves', *META_COLS,
         },
-        # keeper_adv: 23 advanced cols are restricted (all-NULL, see EXPECTED_NULL);
-        # require only the identity + always-present columns.
-        'fbref_keeper_keeper_adv': {
-            'league', 'season', 'player', 'squad', '90s', *META_COLS,
-        },
+        # keeper_adv removed in #606 — scrape stopped, table dropped.
     },
     'understat': {
         # soccerdata reader output (UnderstatScraper). 5 tables, all partitioned

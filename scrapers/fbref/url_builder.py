@@ -83,7 +83,6 @@ def get_stats_url(
     # Map stat_type to FBref URL path (FBref uses different naming)
     url_stat_type_mapping = {
         'keeper': 'keepers',           # FBref uses plural 'keepers'
-        'keeper_adv': 'keepersadv',    # FBref uses 'keepersadv'
         'playingtime': 'playingtime',  # FBref uses 'playingtime' (no underscore) for player URL
     }
     url_stat_type = url_stat_type_mapping.get(stat_type, stat_type)

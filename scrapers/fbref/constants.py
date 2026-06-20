@@ -39,9 +39,13 @@ PLAYER_STAT_TYPES = [
 ]
 
 # Goalkeeper-specific stat types
+#
+# Removed (Jun 2026, #606) 'keeper_adv' — a SEPARATE expensive CF-bypass scrape
+# (/keepersadv/) whose 23 advanced GK cols (PSxG etc.) are all-NULL since the
+# FBref Feb-2026 restriction and whose core cols duplicate the (consumed)
+# fbref_keeper_keeper. Re-add if FBref restores advanced GK stats.
 KEEPER_STAT_TYPES = [
     'keeper',          # Goalkeeper basic stats
-    'keeper_adv',      # Goalkeeper advanced stats
 ]
 
 # Player match-level stat types (per-game statistics)

@@ -272,7 +272,7 @@ class FBrefDataReaderMixin:
         Read goalkeeper statistics for a season.
 
         Args:
-            stat_type: Type of keeper statistics (keeper, keeper_adv)
+            stat_type: Type of keeper statistics (keeper)
             league: League name
             season: Season year
 
@@ -610,7 +610,7 @@ class FBrefDataReaderMixin:
             stat_type: One of PLAYER_STAT_TYPES, TEAM_STAT_TYPES, or KEEPER_STAT_TYPES
                        (e.g., 'stats', 'shooting', 'passing', 'passing_types', 'gca',
                         'defense', 'possession', 'playingtime', 'misc',
-                        'keeper', 'keeper_adv')
+                        'keeper')
             data_category: One of 'player', 'team', or 'keeper'
             force_replace: Bypass the completeness guard (#513/#583). When False
                 (default) a partial scrape that would shrink the (league, season)

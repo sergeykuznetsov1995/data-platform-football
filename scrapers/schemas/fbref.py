@@ -932,7 +932,8 @@ FBREF_KEEPER_ADVANCED_SCHEMA = create_schema_with_metadata([
 # LEGACY MERGED SCHEMAS (kept for backward compatibility)
 # =============================================================================
 
-# Extended Keeper stats (merged basic + advanced)
+# Keeper stats (basic). Advanced 'keeper_adv' fields removed in #606 — that
+# stat_type is no longer scraped (all-NULL since the FBref Feb-2026 restriction).
 FBREF_KEEPER_STATS_SCHEMA = create_schema_with_metadata([
     # === Identification ===
     pa.field('league', pa.string(), nullable=False),
@@ -968,39 +969,4 @@ FBREF_KEEPER_STATS_SCHEMA = create_schema_with_metadata([
     pa.field('penalties_saved', pa.int32(), nullable=True),
     pa.field('penalties_missed', pa.int32(), nullable=True),
     pa.field('penalty_save_pct', pa.float64(), nullable=True),
-
-    # === Advanced (from keeper_adv) ===
-    pa.field('free_kick_goals_against', pa.int32(), nullable=True),
-    pa.field('corner_kick_goals_against', pa.int32(), nullable=True),
-    pa.field('own_goals_against', pa.int32(), nullable=True),
-    pa.field('psxg', pa.float64(), nullable=True),
-    pa.field('psxg_per_shot_on_target', pa.float64(), nullable=True),
-    pa.field('psxg_minus_goals_allowed', pa.float64(), nullable=True),
-    pa.field('psxg_minus_goals_allowed_per_90', pa.float64(), nullable=True),
-
-    # === Launched Passes ===
-    pa.field('launched_completed', pa.int32(), nullable=True),
-    pa.field('launched_attempted', pa.int32(), nullable=True),
-    pa.field('launched_completion_pct', pa.float64(), nullable=True),
-
-    # === Passes ===
-    pa.field('passes_attempted', pa.int32(), nullable=True),
-    pa.field('throws_attempted', pa.int32(), nullable=True),
-    pa.field('pass_launch_pct', pa.float64(), nullable=True),
-    pa.field('avg_pass_length', pa.float64(), nullable=True),
-
-    # === Goal Kicks ===
-    pa.field('goal_kicks_attempted', pa.int32(), nullable=True),
-    pa.field('goal_kicks_launch_pct', pa.float64(), nullable=True),
-    pa.field('avg_goal_kick_length', pa.float64(), nullable=True),
-
-    # === Crosses ===
-    pa.field('crosses_faced', pa.int32(), nullable=True),
-    pa.field('crosses_stopped', pa.int32(), nullable=True),
-    pa.field('crosses_stopped_pct', pa.float64(), nullable=True),
-
-    # === Sweeper ===
-    pa.field('def_actions_outside_pen', pa.int32(), nullable=True),
-    pa.field('def_actions_outside_pen_per_90', pa.float64(), nullable=True),
-    pa.field('avg_def_action_distance', pa.float64(), nullable=True),
 ])
