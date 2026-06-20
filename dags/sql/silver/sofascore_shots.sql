@@ -6,10 +6,14 @@
 -- cross-validated (gold.fct_shot_audit). One row per shot.
 --
 -- Issue #602 — consume the previously write-only bronze.sofascore_event_shotmap
--- (audit #476). NOT merged into fct_shot: shots have no shared key across
--- sources (Understat shot_id != SofaScore shot_id for the same physical shot),
--- so source_priority.yaml COALESCE does not apply. This is a standalone
--- canonical projection; the consumer is gold.fct_shot_audit.
+-- (audit #476). Consumers:
+--   * gold.fct_shot_audit — cross-validates Understat vs SofaScore (xg, counts).
+--   * gold.fct_shot (#699) — SofaScore is a MATCH-LEVEL fallback source here.
+-- Shots have no shared key across sources (Understat shot_id != SofaScore
+-- shot_id for the same physical shot), so per-shot COALESCE does NOT apply; the
+-- fct_shot merge instead picks ONE source per match (Understat primary). This
+-- projection is canonicalised to fct_shot's IDs/enums precisely so it can drop
+-- straight into that fallback branch.
 --
 -- Source:
 --   iceberg.bronze.sofascore_event_shotmap  — shot-level events (xg, xgot, ...)
