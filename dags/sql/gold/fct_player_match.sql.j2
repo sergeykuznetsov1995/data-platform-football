@@ -3,16 +3,17 @@
 -- =============================================================================
 --
 -- Per-match cross-source player performance: FBref + SofaScore + Understat +
--- WhoScored объединены через silver.xref_player + silver.xref_match. Spine —
--- FBref (silver.fbref_player_match_stats), остальные источники LEFT JOIN.
+-- WhoScored + FotMob объединены через silver.xref_player + silver.xref_match.
+-- Spine — FBref (silver.fbref_player_match_stats), остальные источники LEFT JOIN.
 --
 -- Source-selection rule (mirrors fct_player_season_stats / RX2):
---   * HARD_FACT (counters, identical definition) → COALESCE(fb → ss → ws → us)
+--   * HARD_FACT (counters, identical definition) → COALESCE(fb → ss → ws → us → fm)
 --     CAST AS BIGINT. FBref — primary; cross-source diff-колонки идут в
 --     `fct_player_match_audit`.
 --   * MODELED:
 --       - xG / xA: Understat primary (RX2 — coverage 99% vs 82-85%), then
---         SofaScore fallback. Single column через COALESCE(us → ss).
+--         FotMob (independent xG model), then SofaScore fallback. Single column
+--         через COALESCE(us → fm → ss).
 --       - rating: SofaScore (Opta) единственный источник на match-grain
 --         (FotMob match-level rating не собираем).
 --   * duels_won — total duels won (SofaScore only).
@@ -138,6 +139,29 @@ xref_ws_match AS (
         season                                             AS season_slug
     FROM iceberg.silver.xref_match
     WHERE source = 'whoscored'
+      AND confidence <> 'orphan'
+),
+
+-- ===== FotMob bridges (#691) =====
+xref_fm_player AS (
+    SELECT DISTINCT
+        canonical_id,
+        source_id                                          AS fm_player_id,
+        league,
+        season                                             AS season_slug
+    FROM iceberg.silver.xref_player
+    WHERE source = 'fotmob'
+      AND confidence <> 'orphan'
+),
+
+xref_fm_match AS (
+    SELECT DISTINCT
+        canonical_id                                       AS match_id_canonical,
+        source_id                                          AS fm_match_id,
+        league,
+        season                                             AS season_slug
+    FROM iceberg.silver.xref_match
+    WHERE source = 'fotmob'
       AND confidence <> 'orphan'
 )
 
@@ -287,6 +311,21 @@ LEFT JOIN iceberg.silver.whoscored_player_match_aggregate ws
     AND ws.player_id = xwp.ws_player_id
     AND ws.league    = xfp.league
     AND ws.season    = xfp.season_slug
+
+-- ===== FotMob bridge (LEFT, #691) =====
+LEFT JOIN xref_fm_player xfmp
+    ON  xfmp.canonical_id = xfp.canonical_id
+    AND xfmp.league       = xfp.league
+    AND xfmp.season_slug  = xfp.season_slug
+LEFT JOIN xref_fm_match xfmm
+    ON  xfmm.match_id_canonical = COALESCE(xmf.match_id_canonical, fb.match_id)
+    AND xfmm.league             = xfp.league
+    AND xfmm.season_slug        = xfp.season_slug
+LEFT JOIN iceberg.silver.fotmob_player_match_aggregate fm
+    ON  fm.match_id  = xfmm.fm_match_id
+    AND fm.player_id = xfmp.fm_player_id
+    AND fm.league    = xfp.league
+    AND fm.season    = xfp.season_slug
 
 WHERE fb.match_id  IS NOT NULL
   AND fb.player_id IS NOT NULL

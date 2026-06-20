@@ -54,10 +54,11 @@ pytestmark = pytest.mark.unit
 
 class TestFctPlayerMatchSql:
 
-    def test_reads_xref_and_all_four_silver_sources(self):
+    def test_reads_xref_and_all_five_silver_sources(self):
         """Multi-source spine. После issue #46 cutover читаем FBref+
         SofaScore+Understat+WhoScored Silver-агрегаты + silver.xref_player
-        + silver.xref_match (bridging match_id → canonical)."""
+        + silver.xref_match (bridging match_id → canonical). Issue #691 добавил
+        FotMob 5-м источником (fotmob_player_match_aggregate)."""
         sql = _strip_comments(_read_sql())
         assert "iceberg.silver.xref_player" in sql
         assert "iceberg.silver.xref_match" in sql
@@ -65,6 +66,7 @@ class TestFctPlayerMatchSql:
         assert "iceberg.silver.sofascore_player_match_aggregate" in sql
         assert "iceberg.silver.understat_player_match_aggregate" in sql
         assert "iceberg.silver.whoscored_player_match_aggregate" in sql
+        assert "iceberg.silver.fotmob_player_match_aggregate" in sql
 
     def test_fbref_spine_filter(self):
         """Spine = (canonical_id, league, season) FBref-only из xref_player.
@@ -97,8 +99,9 @@ class TestFctPlayerMatchSql:
         # Каждый source-bridge JOIN на canonical_id из spine ДОЛЖЕН
         # включать league + season-predicate. Проверяем регексом по
         # ON-блоку каждого CTE bridge.
-        for bridge in ("xref_ss", "xref_us", "xref_ws", "xref_sofascore",
-                       "xref_understat", "xref_whoscored"):
+        for bridge in ("xref_ss", "xref_us", "xref_ws", "xref_fm",
+                       "xref_sofascore", "xref_understat", "xref_whoscored",
+                       "xref_fotmob"):
             # Если CTE с таким именем есть — проверим что в ON-блоке
             # JOIN'а наружу присутствуют league + season(_slug|_year).
             pattern = re.compile(
@@ -175,10 +178,9 @@ class TestFctPlayerMatchSql:
 
     def test_modeled_xg_xa_single_column(self):
         """RX2 verdict (memory: project_xg_rx2_2026-05-22) распространяется
-        и на match-grain: xG/xA — single column через COALESCE(us → ss).
-        FotMob на match-grain отсутствует (см. план Out-of-scope), поэтому
-        cascade только us→ss. Per-source suffix колонки в business-fct
-        ЗАПРЕЩЕНЫ."""
+        и на match-grain: xG/xA — single column через COALESCE(us → fm → ss).
+        Issue #691 добавил FotMob (independent xG model) между Understat и
+        SofaScore. Per-source suffix колонки в business-fct ЗАПРЕЩЕНЫ."""
         sql = _read_sql()
         # Single-column xg + xa (#426 design names).
         for col in ("xg", "xa"):

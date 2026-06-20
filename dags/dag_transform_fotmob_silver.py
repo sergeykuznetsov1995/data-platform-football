@@ -87,6 +87,14 @@ SILVER_TRANSFORMS = [
         'dags/sql/silver/fotmob_team_match.sql',
         'fotmob_team_match',
     ),
+    # issue #691: per-(match, player) stats из bronze.fotmob_match_details
+    # .player_stats_json. Полный паритет колонок с sofascore_player_match_aggregate.
+    # Питает gold.fct_player_match как 5-й источник (FotMob xG/xA + counters).
+    (
+        'player_match_aggregate',
+        'dags/sql/silver/fotmob_player_match_aggregate.sql',
+        'fotmob_player_match_aggregate',
+    ),
     # issue #290: судья матча + СТРАНА (FotMob-only) из match_facts_json.
     # Future namesake-дизамбигуатор для xref_referee при мульти-лиговом scope.
     (
@@ -135,6 +143,9 @@ SILVER_MIN_ROWS = {
     # team_match: ~338 finished matches × 2 sides = 676 rows для APL 2025/26
     # (7% бронзы без stats_json — cancelled / not finished). Floor 600 c headroom.
     'fotmob_team_match': 600,
+    # player_match_aggregate: ~334 finished matches × ~28 сыгравших игроков ≈
+    # 11.1K rows (live-verified 2026-06-20). Floor 6000 с запасом под 7% bronze-gap.
+    'fotmob_player_match_aggregate': 6000,
     # match_referee: ~380 матчей APL 2025/26 со 100% покрытием судьи (issue #290).
     # Floor 300 c headroom под матчи без referee.text.
     'fotmob_match_referee': 300,
@@ -421,6 +432,56 @@ def _validate_silver_quality(**context) -> Dict[str, Any]:
             error_threshold=0.80,
         ),
 
+        # --- player_match_aggregate (issue #691) ---
+        # ERROR: PK uniqueness (match_id, player_id, league, season) + floor.
+        # xg/counters 0-filled (sparse FotMob key = 0), so coverage is trivially
+        # 100% — instead a `xg > 0` row floor catches the «all xG failed to
+        # parse → everything 0» regression (mirror player_season_profile guard).
+        CHECK.no_nulls(
+            'silver.fotmob_player_match_aggregate',
+            cols=['match_id', 'player_id', 'league', 'season'],
+        ),
+        CHECK.no_duplicates(
+            'silver.fotmob_player_match_aggregate',
+            pk=['match_id', 'player_id', 'league', 'season'],
+        ),
+        CHECK.row_count(
+            'silver.fotmob_player_match_aggregate',
+            min_rows=6000,
+        ),
+        CHECK.row_count(
+            'silver.fotmob_player_match_aggregate',
+            min_rows=3000,
+            where='xg > 0',
+        ),
+        CHECK.freshness(
+            'silver.fotmob_player_match_aggregate',
+            ts_col='_bronze_ingested_at',
+            max_age_hours=FRESH_HOURS,
+            severity='WARNING',
+        ),
+        CHECK.value_range(
+            'silver.fotmob_player_match_aggregate',
+            'minutes_played',
+            min_val=0,
+            max_val=130,
+            severity='WARNING',
+        ),
+        CHECK.value_range(
+            'silver.fotmob_player_match_aggregate',
+            'xg',
+            min_val=0,
+            max_val=5,
+            severity='WARNING',
+        ),
+        CHECK.value_range(
+            'silver.fotmob_player_match_aggregate',
+            'rating',
+            min_val=0,
+            max_val=10,
+            severity='WARNING',
+        ),
+
         # --- match_referee (issue #290) ---
         # ERROR: PK uniqueness на (match_id, league, season) + floor count.
         # WARNING: freshness + coverage(referee_country) — полнота страны судьи
@@ -600,6 +661,7 @@ with DAG(
     | `fotmob_player_profile` | Time-invariant snapshot: height_cm/dob/nationality/foot | fotmob_team_squad + fotmob_player_details (foot из JSON) |
     | `fotmob_keeper_profile` | Вратари per-season с GK-stats | fotmob_player_details + fotmob_player_stats (PIVOTED) |
     | `fotmob_team_match` | Per (match, team_id) team-level stats + xG/xA | fotmob_match_details.stats_json + .player_stats_json (SUM xA) — issue #97 Phase A |
+    | `fotmob_player_match_aggregate` | Per (match, player_id) stats (parity с SofaScore) | fotmob_match_details.player_stats_json — issue #691 |
     | `fotmob_match_referee` | Per-match судья + страна (FotMob-only) | fotmob_match_details.match_facts_json ($.infoBox.Referee) — issue #290 |
     | `fotmob_team_profile` | Профиль команды per-season (страна, стадион, позиция) | fotmob_team_profile — issue #600 |
     | `fotmob_team_standings` | Турнирная таблица per-season (place/W/D/L/GF/GA/pts) | fotmob_team_stats — issue #600 |

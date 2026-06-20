@@ -75,9 +75,13 @@ fct_team_match:
       - {src: whoscored,  expr: "ws.interceptions"}
 
 # -----------------------------------------------------------------------------
-# fct_player_match  (FBref spine + SofaScore + Understat + WhoScored).
-# HARD_FACT counters = FBref-first (fb -> ss -> ws -> us), CAST AS BIGINT.
-# MODELED xG/xA = Understat-first (RX2), then SofaScore. ROUND(., 4).
+# fct_player_match  (FBref spine + SofaScore + Understat + WhoScored + FotMob).
+# HARD_FACT counters = FBref-first (fb -> ss -> ws -> us -> fm), CAST AS BIGINT.
+#   FotMob (#691) appended LAST as a fallback — FBref spine covers ~all rows,
+#   fm closes gaps where ss/ws/us are NULL. fm added only to metrics FotMob
+#   actually exposes on match-grain (no cards / total crosses / tackles_won).
+# MODELED xG/xA = Understat-first (RX2), then FotMob (independent xG model),
+#   then SofaScore. ROUND(., 4).
 # -----------------------------------------------------------------------------
 fct_player_match:
   minutes_played:
@@ -85,6 +89,7 @@ fct_player_match:
     sources:
       - {src: fbref,     expr: "fb.minutes"}
       - {src: sofascore, expr: "ss.minutes_played"}
+      - {src: fotmob,    expr: "fm.minutes_played"}
   goals:
     wrap: "CAST({coalesce} AS BIGINT)"
     sources:
@@ -92,12 +97,14 @@ fct_player_match:
       - {src: sofascore, expr: "ss.goals"}
       - {src: whoscored, expr: "ws.goals"}
       - {src: understat, expr: "us.goals"}
+      - {src: fotmob,    expr: "fm.goals"}
   assists:
     wrap: "CAST({coalesce} AS BIGINT)"
     sources:
       - {src: fbref,     expr: "fb.assists"}
       - {src: sofascore, expr: "ss.assists"}
       - {src: understat, expr: "us.assists"}
+      - {src: fotmob,    expr: "fm.assists"}
   shots:
     wrap: "CAST({coalesce} AS BIGINT)"
     sources:
@@ -105,65 +112,77 @@ fct_player_match:
       - {src: sofascore, expr: "ss.shots"}
       - {src: whoscored, expr: "ws.shots"}
       - {src: understat, expr: "us.shots"}
+      - {src: fotmob,    expr: "fm.shots"}
   shots_on_target:
     wrap: "CAST({coalesce} AS BIGINT)"
     sources:
       - {src: fbref,     expr: "fb.shots_on_target"}
       - {src: sofascore, expr: "ss.shots_on_target"}
       - {src: whoscored, expr: "ws.shots_on_target"}
+      - {src: fotmob,    expr: "fm.shots_on_target"}
   xg:
     wrap: "ROUND({coalesce}, 4)"
     sources:
       - {src: understat, expr: "us.xg"}
+      - {src: fotmob,    expr: "fm.xg"}
       - {src: sofascore, expr: "ss.xg"}
   xa:
     wrap: "ROUND({coalesce}, 4)"
     sources:
       - {src: understat, expr: "us.xa"}
+      - {src: fotmob,    expr: "fm.xa"}
       - {src: sofascore, expr: "ss.xa"}
   key_passes:
     wrap: "CAST({coalesce} AS BIGINT)"
     sources:
       - {src: sofascore, expr: "ss.key_passes"}
       - {src: whoscored, expr: "ws.key_passes"}
+      - {src: fotmob,    expr: "fm.key_passes"}
   passes:
     wrap: "CAST({coalesce} AS BIGINT)"
     sources:
       - {src: sofascore, expr: "ss.passes"}
       - {src: whoscored, expr: "ws.passes"}
+      - {src: fotmob,    expr: "fm.passes"}
   tackles:
     wrap: "CAST({coalesce} AS BIGINT)"
     sources:
       - {src: sofascore, expr: "ss.tackles"}
       - {src: whoscored, expr: "ws.tackles"}
+      - {src: fotmob,    expr: "fm.tackles"}
   interceptions:
     wrap: "CAST({coalesce} AS BIGINT)"
     sources:
       - {src: fbref,     expr: "fb.interceptions"}
       - {src: sofascore, expr: "ss.interceptions"}
       - {src: whoscored, expr: "ws.interceptions"}
+      - {src: fotmob,    expr: "fm.interceptions"}
   touches:
     wrap: "CAST({coalesce} AS BIGINT)"
     sources:
       - {src: sofascore, expr: "ss.touches"}
       - {src: whoscored, expr: "ws.touches"}
+      - {src: fotmob,    expr: "fm.touches"}
   dispossessed:
     wrap: "CAST({coalesce} AS BIGINT)"
     sources:
       - {src: sofascore, expr: "ss.dispossessed"}
       - {src: whoscored, expr: "ws.dispossessed"}
+      - {src: fotmob,    expr: "fm.dispossessed"}
   fouls_committed:
     wrap: "CAST({coalesce} AS BIGINT)"
     sources:
       - {src: fbref,     expr: "fb.fouls_committed"}
       - {src: sofascore, expr: "ss.fouls_committed"}
       - {src: whoscored, expr: "ws.fouls_committed"}
+      - {src: fotmob,    expr: "fm.fouls_committed"}
   fouls_drawn:
     wrap: "CAST({coalesce} AS BIGINT)"
     sources:
       - {src: fbref,     expr: "fb.fouls_drawn"}
       - {src: sofascore, expr: "ss.fouls_drawn"}
       - {src: whoscored, expr: "ws.fouls_drawn"}
+      - {src: fotmob,    expr: "fm.fouls_drawn"}
   yellow_cards:
     wrap: "CAST({coalesce} AS BIGINT)"
     sources:
@@ -190,6 +209,7 @@ fct_player_match:
       - {src: fbref,     expr: "fb.offsides"}
       - {src: sofascore, expr: "ss.offsides"}
       - {src: whoscored, expr: "ws.offsides"}
+      - {src: fotmob,    expr: "fm.offsides"}
   tackles_won:
     wrap: "CAST({coalesce} AS BIGINT)"
     sources:
@@ -202,6 +222,7 @@ fct_player_match:
       - {src: fbref,     expr: "fb.own_goals"}
       - {src: sofascore, expr: "ss.own_goals"}
       - {src: understat, expr: "us.own_goals"}
+      - {src: fotmob,    expr: "fm.own_goals"}
   penalty_goals:
     wrap: "CAST({coalesce} AS BIGINT)"
     sources:
@@ -217,46 +238,55 @@ fct_player_match:
     sources:
       - {src: fbref,     expr: "fb.penalties_won"}
       - {src: sofascore, expr: "ss.penalties_won"}
+      - {src: fotmob,    expr: "fm.penalties_won"}
   penalties_conceded:
     wrap: "CAST({coalesce} AS BIGINT)"
     sources:
       - {src: fbref,     expr: "fb.penalties_conceded"}
       - {src: sofascore, expr: "ss.penalties_conceded"}
+      - {src: fotmob,    expr: "fm.penalties_conceded"}
   passes_completed:
     wrap: "CAST({coalesce} AS BIGINT)"
     sources:
       - {src: sofascore, expr: "ss.passes_completed"}
       - {src: whoscored, expr: "ws.passes_completed"}
+      - {src: fotmob,    expr: "fm.passes_completed"}
   clearances:
     wrap: "CAST({coalesce} AS BIGINT)"
     sources:
       - {src: sofascore, expr: "ss.clearances"}
       - {src: whoscored, expr: "ws.clearances"}
+      - {src: fotmob,    expr: "fm.clearances"}
   ball_recoveries:
     wrap: "CAST({coalesce} AS BIGINT)"
     sources:
       - {src: sofascore, expr: "ss.ball_recoveries"}
       - {src: whoscored, expr: "ws.ball_recoveries"}
+      - {src: fotmob,    expr: "fm.ball_recoveries"}
   dribbles_attempted:
     wrap: "CAST({coalesce} AS BIGINT)"
     sources:
       - {src: sofascore, expr: "ss.dribbles_attempted"}
       - {src: whoscored, expr: "ws.dribbles_attempted"}
+      - {src: fotmob,    expr: "fm.dribbles_attempted"}
   dribbles_won:
     wrap: "CAST({coalesce} AS BIGINT)"
     sources:
       - {src: sofascore, expr: "ss.dribbles_won"}
       - {src: whoscored, expr: "ws.dribbles_won"}
+      - {src: fotmob,    expr: "fm.dribbles_won"}
   blocks:
     wrap: "CAST({coalesce} AS BIGINT)"
     sources:
       - {src: sofascore, expr: "ss.blocks"}
       - {src: whoscored, expr: "ws.blocks"}
+      - {src: fotmob,    expr: "fm.blocks"}
   aerial_duels_won:
     wrap: "CAST({coalesce} AS BIGINT)"
     sources:
       - {src: sofascore, expr: "ss.aerial_duels_won"}
       - {src: whoscored, expr: "ws.aerials_won"}
+      - {src: fotmob,    expr: "fm.aerial_duels_won"}
 
 # -----------------------------------------------------------------------------
 # fct_player_season_stats  (#542; FBref spine + FotMob + WhoScored + Understat +

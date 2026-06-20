@@ -167,8 +167,10 @@ def test_emitter_preserves_priority_order_and_wrap():
     assert tm["m_passes"] == "COALESCE(ss.total_passes, ws.pass_total) AS passes,"
 
     pm = get_source_priority_exprs("fct_player_match")
+    # #691: FotMob appended LAST in the HARD_FACT cascade.
     assert pm["m_goals"] == (
-        "CAST(COALESCE(fb.goals, ss.goals, ws.goals, us.goals) AS BIGINT) AS goals,"
+        "CAST(COALESCE(fb.goals, ss.goals, ws.goals, us.goals, fm.goals) "
+        "AS BIGINT) AS goals,"
     )
     # A computed per-source fallback expression must survive verbatim.
     assert pm["m_penalty_attempts"] == (
