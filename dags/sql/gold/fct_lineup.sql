@@ -1,10 +1,14 @@
 -- =============================================================================
 -- Gold: fct_lineup
 -- =============================================================================
--- Per-player lineup entries unified across FBref and ESPN.
+-- Per-player lineup entries unified across FBref, ESPN and SofaScore (#693).
 --
 -- Sources:
 --   iceberg.silver.fbref_match_lineups   — primary (complete coverage)
+--   iceberg.silver.sofascore_player_match_aggregate — full lineup source (#693):
+--                                          real player_id (resolves via
+--                                          xref_player, unlike ESPN), native
+--                                          is_starter/is_captain/position
 --   iceberg.silver.espn_lineup           — secondary (E3.2 deliverable)
 --   iceberg.silver.xref_match            — match_id resolution (FBref-only in MVP)
 --   iceberg.silver.xref_team             — team alias canonicalisation
@@ -65,14 +69,19 @@
 --   rows, so downstream consumers can WHERE-filter or join cautiously.
 --
 -- =============================================================================
--- ADR — Dedup priority FBref > ESPN
+-- ADR — Dedup priority FBref > SofaScore > ESPN (#693)
 -- =============================================================================
---   When the same (match, player) is covered by both sources we keep the
---   FBref row (more complete schema: real player_id, jersey_number).
+--   When the same (match, player) is covered by multiple sources we keep the
+--   most complete one. Priority by schema richness:
+--     1 FBref     — real player_id + jersey_number + position + is_starter
+--     2 SofaScore — real player_id + position + is_starter + native is_captain
+--                   (no jersey); cross-source dedup against FBref actually fires
+--                   because the player resolves to a shared canonical_id
+--     5 ESPN      — player_id always NULL (no resolver) → never wins dedup;
+--                   parked at the tail (3/4 reserved for FotMob/WhoScored).
 --   Implementation: ROW_NUMBER() OVER (PARTITION BY ... ORDER BY
---   source_priority ASC, _bronze_ingested_at DESC), source_priority=1 for
---   FBref, 2 for ESPN. Tie-breaker on _bronze_ingested_at retains the
---   freshest row within a single source.
+--   source_priority ASC, _bronze_ingested_at DESC). Tie-breaker on
+--   _bronze_ingested_at retains the freshest row within a single source.
 --
 --   Edge case: cross-source dedup only fires when the ESPN→FBref match_id
 --   bridge succeeds AND the ESPN player resolves to a canonical_id. Today
@@ -93,9 +102,10 @@
 --                                     (FBref Silver also keeps raw position;
 --                                      dim_position deferred until used)
 --   jersey_number         integer  -- NULL for ESPN (matchsheet has no jersey)
---   is_captain            boolean  -- SofaScore-sourced (#439): FBref/ESPN lineups
---                                     carry no captaincy. NULL = no SofaScore /lineups
---                                     coverage (all ESPN rows; FBref players not in SS)
+--   is_captain            boolean  -- native on SofaScore rows (#693); FBref rows
+--                                     enriched via the SofaScore captain bridge (#439).
+--                                     NULL = no coverage (all ESPN rows; FBref players
+--                                     absent from SofaScore /lineups)
 --   lineup_source         varchar  -- 'fbref' | 'espn' (winner after dedup)
 --   lineup_version        varchar  -- literal 'v1' (schema versioning hook)
 --   league                varchar
@@ -228,6 +238,9 @@ fbref_resolved AS (
         fl.is_starter                                  AS is_starter,
         fl.position                                    AS position_canonical,
         fl.jersey_number                               AS jersey_number,
+        -- FBref lineups carry no captaincy → NULL; enriched downstream via the
+        -- SofaScore captain bridge (#439). Column present so the UNION aligns.
+        CAST(NULL AS boolean)                          AS is_captain,
         fl._bronze_ingested_at                         AS _bronze_ingested_at,
         fl.league                                      AS league,
         -- #404: silver.fbref_match_lineups.season is slug ('2425') now → pass through.
@@ -275,6 +288,8 @@ espn_resolved AS (
         el.is_starter                                  AS is_starter,
         el.position                                    AS position_canonical,
         el.jersey_number                               AS jersey_number,
+        -- ESPN matchsheet carries no captaincy → NULL (UNION alignment).
+        CAST(NULL AS boolean)                          AS is_captain,
         el._bronze_ingested_at                         AS _bronze_ingested_at,
         el.league                                      AS league,
         -- season UNIFICATION (E3.5 R4): ESPN Silver stores a varchar slug
@@ -283,7 +298,10 @@ espn_resolved AS (
         -- '0525' (defensive — production data is always 4-digit, lpad is cheap).
         lpad(CAST(el.season AS varchar), 4, '0')        AS season,
         'espn'                                         AS lineup_source,
-        2                                              AS source_priority,
+        -- #693: ESPN moves to the tail of the priority order. Its player_id is
+        -- always NULL (no ESPN player resolver), so it never wins cross-source
+        -- dedup anyway; FBref(1) > SofaScore(2) > [FotMob(3) > WhoScored(4)] > ESPN(5).
+        5                                              AS source_priority,
         -- Compose a stable per-row dedup proxy from (player, team) so that
         -- two distinct ESPN players with NULL canonical don't collapse into
         -- one ROW_NUMBER bucket. NOT projected to output.
@@ -300,12 +318,65 @@ espn_resolved AS (
 ),
 
 -- ============================================================================
+-- 3b) SofaScore source rows (#693) — full lineup source, not just the captain
+--     overlay. Unlike ESPN, SofaScore players resolve to a REAL canonical via
+--     xref_player (source='sofascore'), so cross-source dedup actually fires
+--     (FBref wins via source_priority). Mirrors the ESPN bridge for match_id:
+--     resolve via xref_match (confidence<>'orphan'), else fall back to an
+--     'ss_<id>' pseudo-id so SofaScore-only matches still add coverage.
+--   * (league, season) predicate on BOTH xref JOINs — mandatory, else 1.5-4×
+--     fan-out (xref rows are per-(source, source_id, season)).
+--   * xref_player_dedup (NOT a season-predicated raw join) keeps this 1:1 and
+--     preserves coverage for out-of-scope seasons — same rationale as FBref.
+--   * is_starter / is_captain / position are native here (conformed in
+--     silver.sofascore_player_match_aggregate from the /lineups overlay).
+--   * No jersey_number in SofaScore /lineups → NULL.
+--   * No player_name column in the SofaScore aggregate → NULL; only ever used
+--     as the dedup fallback key, and spa.player_id (the PK) is always present.
+-- ============================================================================
+sofascore_resolved AS (
+    SELECT
+        COALESCE(xm.canonical_id, 'ss_' || spa.match_id) AS match_id_canonical,
+        xt.canonical_id                                AS team_id_canonical,
+        xp.canonical_id                                AS player_id_canonical,
+        CAST(NULL AS varchar)                          AS player_name,
+        spa.is_starter                                 AS is_starter,
+        spa.position                                   AS position_canonical,
+        CAST(NULL AS integer)                          AS jersey_number,
+        spa.is_captain                                 AS is_captain,
+        spa._bronze_ingested_at                        AS _bronze_ingested_at,
+        spa.league                                     AS league,
+        spa.season                                     AS season,         -- #404 slug '2526'
+        'sofascore'                                    AS lineup_source,
+        2                                              AS source_priority,
+        spa.player_id                                  AS _raw_player_id_for_dedup
+    FROM iceberg.silver.sofascore_player_match_aggregate spa
+    LEFT JOIN iceberg.silver.xref_match xm
+        ON  xm.source     = 'sofascore'
+       AND xm.source_id   = spa.match_id
+       AND xm.league      = spa.league
+       AND xm.season      = spa.season
+       AND xm.confidence <> 'orphan'
+    LEFT JOIN iceberg.silver.xref_team xt
+        ON  xt.source     = 'sofascore'
+       AND xt.source_id   = spa.team_name        -- xref_team source_id = team NAME
+       AND xt.league      = spa.league
+       AND xt.season      = spa.season
+       AND xt.confidence <> 'orphan'
+    LEFT JOIN xref_player_dedup xp
+        ON  xp.source     = 'sofascore'
+       AND xp.source_id   = spa.player_id
+),
+
+-- ============================================================================
 -- 4) UNION + dedup
 -- ============================================================================
 all_lineups AS (
     SELECT * FROM fbref_resolved
     UNION ALL
     SELECT * FROM espn_resolved
+    UNION ALL
+    SELECT * FROM sofascore_resolved
 ),
 
 dedup AS (
@@ -387,9 +458,11 @@ SELECT
     d.is_starter,
     d.position_canonical            AS position,
     d.jersey_number,
-    -- is_captain (#439): SofaScore-sourced; NULL where no SofaScore coverage
+    -- is_captain: native captain of the winning source first (SofaScore rows
+    -- carry it from /lineups; #693), then the SofaScore captain bridge as a
+    -- fallback for FBref rows (#439). NULL where neither covers the player
     -- (all ESPN rows, plus FBref players absent from SofaScore /lineups).
-    sc.is_captain                   AS is_captain,
+    COALESCE(d.is_captain, sc.is_captain)  AS is_captain,
     d.lineup_source,
     'v1'                            AS lineup_version,
     d.league,
