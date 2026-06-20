@@ -1673,6 +1673,17 @@ def _dedup_canonical_per_season(
     their canonical_id is source-private (``orphan:<...>``) so they cannot
     fan-out a real canonical in Gold.
 
+    ESPN rows are also exempt (#720). ESPN has no native player_id, so
+    ``source_id`` is the ``'<name>|<team>'`` composite and a within-season
+    transfer resolves both club-stints to the SAME canonical_id. Its only
+    downstream consumer — ``gold/fct_lineup.sql`` — JOINs on
+    ``(display_name, raw_team_name, league, season)``, which disambiguates by
+    club, so the two transfer rows are legitimate stints, NOT the fan-out this
+    function targets. Collapsing them would drop one club's row and NULL that
+    club's player_id in fct_lineup. ESPN Bronze rows are already unique per
+    ``(player, team, league, season)`` (``_fetch_espn_players`` GROUP BY), so
+    passing them through introduces no true duplicates.
+
     Returns ``(deduped_rows, removed_per_source)``.
     """
     from collections import defaultdict
@@ -1680,7 +1691,7 @@ def _dedup_canonical_per_season(
     out: List[Dict[str, Any]] = []
     groups: Dict[Tuple[str, str, str, str], List[Dict[str, Any]]] = defaultdict(list)
     for row in rows:
-        if row.get('confidence') == 'orphan':
+        if row.get('confidence') == 'orphan' or row.get('source') == 'espn':
             out.append(row)
             continue
         key = (
