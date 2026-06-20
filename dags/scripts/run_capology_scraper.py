@@ -78,6 +78,14 @@ PRODUCTS = {
 
 VALID_ENTITIES = {ENTITY_PLAYER_SALARIES, *PRODUCTS}
 
+# Replace-partitions completeness guard (#513 → #583): refuse a save that would
+# shrink a bronze.capology_* partition below this share of its existing rows, so
+# a partial/failed scrape can't wipe a good partition. COUNT(*) (no
+# replace_guard_key) — each partition tuple is scraped full-state.
+# ReplaceGuardError → exit 3; bypass with --force-replace.
+_MIN_REPLACE_RATIO = 0.9
+REPLACE_GUARD_MARKER = 'CAPOLOGY_REPLACE_GUARD'
+
 
 def _write_results(path: str, payload: dict) -> None:
     try:
@@ -111,7 +119,9 @@ def _run_player_salaries(
     currency: str,
     limit: Optional[int],
     output_path: str,
+    force_replace: bool = False,
 ) -> int:
+    from scrapers.base.base_scraper import ReplaceGuardError
     from scrapers.capology import CapologyScraper
     from scrapers.capology.scraper import R0_2B_FALLBACK_MARKER
 
@@ -159,6 +169,9 @@ def _run_player_salaries(
                 table_name='capology_player_salaries',
                 partition_cols=['league', 'season', 'currency'],
                 replace_partitions=['league', 'season', 'currency'],
+                min_replace_ratio=(
+                    None if force_replace else _MIN_REPLACE_RATIO
+                ),
             )
             results['tables'].append(table_path)
             results['rows'] = int(len(df))
@@ -167,6 +180,15 @@ def _run_player_salaries(
                 "Saved %d salary rows (%d unique players) → %s",
                 results['rows'], results['players_with_rows'], table_path,
             )
+    except ReplaceGuardError as e:
+        # Guard refused the save (partial scrape would shrink the partition) —
+        # nothing written. Distinct exit 3 so an operator can tell a refused
+        # guard from a hard failure (1) or a fallback (2) (#583).
+        msg = f"{REPLACE_GUARD_MARKER}: {e}"
+        logger.error(msg)
+        results['errors'].append(msg)
+        _write_results(output_path, results)
+        return 3
     except Exception as e:
         logger.error(
             "player_salaries scrape failed hard: %s", e, exc_info=True,
@@ -185,9 +207,11 @@ def _run_product(
     season: int,
     limit: Optional[int],
     output_path: str,
+    force_replace: bool = False,
 ) -> int:
     """Generic runner for the club/contract products (payrolls / contracts /
     transfer-window). Same exit-code contract as _run_player_salaries."""
+    from scrapers.base.base_scraper import ReplaceGuardError
     from scrapers.capology import CapologyScraper
     from scrapers.capology.scraper import R0_2B_FALLBACK_MARKER
 
@@ -230,6 +254,9 @@ def _run_product(
                 table_name=table_name,
                 partition_cols=['league', 'season'],
                 replace_partitions=['league', 'season'],
+                min_replace_ratio=(
+                    None if force_replace else _MIN_REPLACE_RATIO
+                ),
             )
             results['tables'].append(table_path)
             results['rows'] = int(len(df))
@@ -239,6 +266,14 @@ def _run_product(
                 "Saved %d %s rows (%d unique %s) → %s",
                 results['rows'], entity, results['units'], unit_col, table_path,
             )
+    except ReplaceGuardError as e:
+        # Guard refused the save (partial scrape would shrink the partition) —
+        # nothing written. Distinct exit 3 (#583).
+        msg = f"{REPLACE_GUARD_MARKER}: {e}"
+        logger.error(msg)
+        results['errors'].append(msg)
+        _write_results(output_path, results)
+        return 3
     except Exception as e:
         logger.error("%s scrape failed hard: %s", entity, e, exc_info=True)
         results['errors'].append(str(e))
@@ -276,6 +311,12 @@ def main() -> int:
         default='/tmp/capology_result.json',
         help='Output JSON file path',
     )
+    parser.add_argument(
+        '--force-replace', action='store_true',
+        help='Bypass the completeness guard — write even if the scraped frame '
+             'shrinks the existing partition. Use for a deliberate first '
+             'backfill or a known legitimate shrink.',
+    )
     try:
         args = parser.parse_args()
     except _ArgparseError as exc:
@@ -301,6 +342,7 @@ def main() -> int:
             currency=args.currency,
             limit=args.limit,
             output_path=args.output,
+            force_replace=args.force_replace,
         )
     if entity in PRODUCTS:
         return _run_product(
@@ -309,6 +351,7 @@ def main() -> int:
             season=args.season,
             limit=args.limit,
             output_path=args.output,
+            force_replace=args.force_replace,
         )
     return 1
 
