@@ -816,14 +816,19 @@ def _build_fct_shot_checks() -> List[Check]:
 # ---------------------------------------------------------------------------
 
 def _build_fct_lineup_checks() -> List[Check]:
-    """DQ for ``iceberg.gold.fct_lineup`` (E3.5).
+    """DQ for ``iceberg.gold.fct_lineup`` (E3.5; SofaScore source added #693).
 
     Lineup_source distribution
     --------------------------
-    Smoke-test verdict: 159,445 rows total, FBref bulk + ESPN secondary
-    (90.8% bridge success). Two row_count guards lock that distribution:
-      * fbref ≥ 100K (ERROR — FBref is the canonical source, must dominate)
-      * espn  ≥ 5K   (WARNING — ESPN coverage is partial by design)
+    Smoke-test verdict (pre-#693): 159,445 rows, FBref bulk + ESPN secondary
+    (90.8% bridge success). row_count guards lock the distribution:
+      * fbref     ≥ 100K (ERROR — FBref is the canonical source, must dominate)
+      * espn      ≥ 5K   (WARNING — ESPN coverage is partial by design)
+      * sofascore ≥ 500  (WARNING, #693 — net contribution = matches/players
+        FBref does NOT already cover; most SofaScore rows dedup UNDER FBref, so
+        the surviving count is small. Live 2026-06-20: 682 rows survived as
+        lineup_source='sofascore' (of 15,189 SS lineup rows — the other ~14.5K
+        deduped under FBref and supplied is_captain). Floor catches a dead branch.)
     """
     table = 'iceberg.gold.fct_lineup'
 
@@ -903,6 +908,17 @@ def _build_fct_lineup_checks() -> List[Check]:
             where="lineup_source = 'espn'",
             severity='WARNING',
             name='espn_coverage_present',
+        ),
+        # SofaScore as a full source (#693). Only rows that WIN dedup carry
+        # lineup_source='sofascore' (FBref-gap matches/players); the rest dedup
+        # under FBref. Live 2026-06-20: 682 survived → floor 500 catches a dead
+        # branch with headroom. WARNING-only (net coverage naturally fluctuates).
+        CHECK.row_count(
+            table=table,
+            min_rows=500,
+            where="lineup_source = 'sofascore'",
+            severity='WARNING',
+            name='sofascore_coverage_present',
         ),
 
         # Total volume — 380 APL matches/season × 22 lineup rows / (match × team)
