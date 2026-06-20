@@ -150,13 +150,19 @@ class ClubEloScraper(SoccerdataScraper):
 
     def scrape_historical_ratings(
         self,
-        days_back: int = 365
+        days_back: int = 365,
+        force_replace: bool = False,
     ) -> Dict[str, str]:
         """
         Scrape historical ELO ratings for past N days.
 
         Args:
             days_back: Number of days to scrape
+            force_replace: Bypass the completeness guard (#513/#583). When
+                False (default) a partial historical scrape that would shrink
+                the clubelo_ratings_historical partition below 90% of its
+                existing rows is refused (ReplaceGuardError). Set True for a
+                deliberate first backfill / known legitimate shrink.
 
         Returns:
             Dictionary with table path
@@ -189,6 +195,10 @@ class ClubEloScraper(SoccerdataScraper):
                 table_name='clubelo_ratings_historical',
                 partition_cols=['rating_date'],
                 replace_partitions=['rating_date'],
+                # Completeness guard (#513/#583): refuse a partial historical
+                # scrape that would shrink the partition below 90% of its
+                # existing rows (full-state per rating_date → raw COUNT(*)).
+                min_replace_ratio=(None if force_replace else 0.9),
             )
             return {'historical_ratings': table_path, 'rows': len(combined_df)}
 
