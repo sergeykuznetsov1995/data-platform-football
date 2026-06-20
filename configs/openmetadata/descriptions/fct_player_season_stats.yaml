@@ -23,6 +23,15 @@ table:
       * UNIQUE_<source>: метрика отсутствует у других источников →
         single column без суффикса.
 
+    Мульти-squad агрегация (#515, Вариант B): если игрок зимой сменил клуб
+    ВНУТРИ лиги, FBref хранит отдельную строку на каждый клуб. Счётные
+    FBref-метрики (matches/minutes/goals/… и FBref-only счётчики) СУММИРУЮТСЯ
+    по клубам сезона — тоталы сходятся с FotMob/Understat/SofaScore/WhoScored
+    (дают сумму за лигу-сезон). team_id и несуммируемые ratio (points_per_match)
+    берутся от клуба с максимумом минут; ratio с известной формулой
+    (goals_per_shot) пересчитываются из суммированных счётчиков. Одноклубные
+    игроки не затронуты (поведение идентично прежнему Варианту A).
+
     Зерно: (player_id, league, season) — star design §5.2 (#428). FK:
     player_id → dim_player, team_id → dim_team (orphan-fallback 'fb_<slug>').
     Outfield-only (вратари в fct_keeper_season_stats).
@@ -40,29 +49,29 @@ columns:
   - name: season
     description: Сезон — varchar slug ('2425' = сезон 2024/25). Partition key.
   - name: team_id
-    description: Клуб игрока в сезоне (#428) — canonical id через xref_team, orphan-fallback 'fb_<slug>'. FK → dim_team.
+    description: Клуб игрока в сезоне (#428) — canonical id через xref_team, orphan-fallback 'fb_<slug>'. FK → dim_team. При трансфере внутри лиги = клуб с максимумом минут (#515).
 
   # ─── HARD_FACT (key metrics — single column COALESCE) ───
   - name: matches
-    description: Matches played (COALESCE FBref → FotMob → WhoScored → Understat).
+    description: Matches played (COALESCE FBref → FotMob → WhoScored → Understat). FBref-часть суммируется по клубам при трансфере (#515).
   - name: minutes
-    description: Minutes played (COALESCE FBref → FotMob → Understat).
+    description: Minutes played (COALESCE FBref → FotMob → Understat). FBref-часть суммируется по клубам при трансфере (#515).
   - name: goals
-    description: Голы (COALESCE FBref → FotMob → Understat).
+    description: Голы (COALESCE FBref → FotMob → Understat). FBref-часть суммируется по клубам при трансфере (#515).
   - name: assists
-    description: Ассисты (COALESCE FBref → FotMob → Understat).
+    description: Ассисты (COALESCE FBref → FotMob → Understat). FBref-часть суммируется по клубам при трансфере (#515).
   - name: yellow_cards
-    description: Жёлтые карточки.
+    description: Жёлтые карточки. FBref-часть суммируется по клубам при трансфере (#515).
   - name: red_cards
-    description: Красные карточки.
+    description: Красные карточки. FBref-часть суммируется по клубам при трансфере (#515).
   - name: shots
-    description: Все удары (COALESCE FBref → FotMob → WS → Understat → SofaScore).
+    description: Все удары (COALESCE FBref → FotMob → WS → Understat → SofaScore). FBref-часть суммируется по клубам при трансфере (#515).
   - name: shots_on_target
-    description: Удары в створ.
+    description: Удары в створ. FBref-часть суммируется по клубам при трансфере (#515).
   - name: interceptions
-    description: Перехваты (COALESCE FBref → FotMob → WhoScored → SofaScore).
+    description: Перехваты (COALESCE FBref → FotMob → WhoScored → SofaScore). FBref-часть суммируется по клубам при трансфере (#515).
   - name: tackles_won
-    description: Выигранные отборы.
+    description: Выигранные отборы. FBref-часть суммируется по клубам при трансфере (#515).
   - name: tackles_attempted
     description: Все попытки отбора.
   - name: successful_dribbles
@@ -100,17 +109,17 @@ columns:
 
   # ─── UNIQUE_FBREF (FBref-only метрики) ───
   - name: complete_matches
-    description: Полные матчи (FBref-only).
+    description: Полные матчи (FBref-only; сумма по клубам сезона при трансфере, #515).
   - name: starts
-    description: Стартовые составы (FBref-only).
+    description: Стартовые составы (FBref-only; сумма по клубам сезона при трансфере, #515).
   - name: subs
-    description: Выходы на замену.
+    description: Выходы на замену (FBref-only; сумма по клубам сезона при трансфере, #515).
   - name: plus_minus
-    description: Plus/minus.
+    description: Plus/minus (FBref-only; сумма по клубам сезона при трансфере, #515).
   - name: points_per_match
-    description: Points per match (FBref).
+    description: Points per match (FBref). При трансфере = значение клуба с максимумом минут (несуммируемо, #515).
   - name: goals_per_shot
-    description: Голы на удар.
+    description: Голы на удар (FBref). При трансфере пересчитывается из суммированных голов/ударов (#515).
 
   # ─── UNIQUE_FOTMOB ───
   - name: defensive_actions_per_90
