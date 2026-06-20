@@ -55,30 +55,27 @@ def _translate_trino_to_duckdb(sql: str) -> str:
 # ---------------------------------------------------------------------------
 
 _TABLES: Dict[str, str] = {
-    "bronze_understat_shots": """
-        shot_id          BIGINT,
-        game_id          BIGINT,
-        team             VARCHAR,
-        player           VARCHAR,
-        player_id        BIGINT,
-        assist_player    VARCHAR,
-        assist_player_id BIGINT,
-        minute           BIGINT,
-        location_x       DOUBLE,
-        location_y       DOUBLE,
-        xg               DOUBLE,
-        body_part        VARCHAR,
-        situation        VARCHAR,
-        result           VARCHAR,
-        league           VARCHAR,
-        season           VARCHAR,
-        _ingested_at     TIMESTAMP
-    """,
-    "bronze_understat_players": """
-        player     VARCHAR,
-        player_id  BIGINT,
-        league     VARCHAR,
-        season     VARCHAR
+    # #704: the Understat shot conform now lives in silver.understat_shots — the
+    # fct_shot Understat branch reads it (already canonicalised), no longer
+    # bronze.understat_shots / bronze.understat_players.
+    "silver_understat_shots": """
+        shot_id             VARCHAR,
+        understat_game_id   BIGINT,
+        team_id             VARCHAR,
+        player_id           VARCHAR,
+        assist_player_id    VARCHAR,
+        minute              INTEGER,
+        x                   DOUBLE,
+        y                   DOUBLE,
+        body_part           VARCHAR,
+        situation           VARCHAR,
+        xg                  DOUBLE,
+        result              VARCHAR,
+        is_goal             BOOLEAN,
+        shot_source         VARCHAR,
+        _bronze_ingested_at TIMESTAMP,
+        league              VARCHAR,
+        season              VARCHAR
     """,
     "bronze_understat_schedule": """
         game_id      BIGINT,
@@ -101,11 +98,6 @@ _TABLES: Dict[str, str] = {
         league       VARCHAR,
         canonical_id VARCHAR,
         confidence   VARCHAR
-    """,
-    "silver_xref_player": """
-        source       VARCHAR,
-        source_id    VARCHAR,
-        canonical_id VARCHAR
     """,
     # SofaScore fallback source — already canonicalised to fct_shot IDs (#602).
     # Only the columns the SofaScore branch of fct_shot.sql reads.
@@ -179,24 +171,20 @@ def _base_fixtures() -> Dict[str, List[Dict[str, Any]]]:
             {"source": "fbref", "source_id": "Bournemouth", "league": _LEAGUE,
              "canonical_id": "t_bou", "confidence": "exact"},
         ],
-        "bronze_understat_players": [
-            {"player": "Mohamed Salah", "player_id": 11, "league": _LEAGUE, "season": _SEASON},
-        ],
-        "silver_xref_player": [
-            {"source": "understat", "source_id": "11", "canonical_id": "fb_salah"},
-        ],
     }
 
 
 def _us_shot(**over: Any) -> Dict[str, Any]:
-    """An Understat shot in the bridgeable Liverpool–Bournemouth match."""
+    """An Understat shot in the bridgeable Liverpool–Bournemouth match, as a
+    silver.understat_shots row (already conformed/canonicalised, #704)."""
     row = {
-        "shot_id": 1, "game_id": 900, "team": "Liverpool",
-        "player": "Mohamed Salah", "player_id": 11,
-        "assist_player": None, "assist_player_id": None,
-        "minute": 10, "location_x": 0.9, "location_y": 0.5, "xg": 0.3,
-        "body_part": "Right Foot", "situation": "Open Play", "result": "Goal",
-        "league": _LEAGUE, "season": _SEASON, "_ingested_at": _ING,
+        "shot_id": "1", "understat_game_id": 900,
+        "team_id": "t_liv", "player_id": "fb_salah", "assist_player_id": None,
+        "minute": 10, "x": 0.9, "y": 0.5,
+        "body_part": "foot", "situation": "open_play",
+        "xg": 0.3, "result": "goal", "is_goal": True,
+        "shot_source": "understat_v1", "_bronze_ingested_at": _ING,
+        "league": _LEAGUE, "season": _SEASON,
     }
     row.update(over)
     return row
@@ -218,7 +206,7 @@ def _ss_shot(**over: Any) -> Dict[str, Any]:
 def _run(con, understat_shots: List[Dict[str, Any]],
          sofascore_shots: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     fx = _base_fixtures()
-    fx["bronze_understat_shots"] = understat_shots
+    fx["silver_understat_shots"] = understat_shots
     fx["silver_sofascore_shots"] = sofascore_shots
     for table in _TABLES:
         _seed(con, table, fx.get(table, []))
@@ -326,6 +314,16 @@ class TestFctShotMultiSourceStructure:
 
     def test_reads_sofascore_silver(self):
         assert "iceberg.silver.sofascore_shots" in _strip_comments(_read_sql())
+
+    def test_reads_understat_silver_not_bronze(self):
+        """#704 one-hop: the Understat branch reads silver.understat_shots; the
+        direct bronze.understat_shots / bronze.understat_players reads are gone.
+        bronze.understat_schedule (the *_schedule match bridge) is kept."""
+        sql = _strip_comments(_read_sql())
+        assert "iceberg.silver.understat_shots" in sql
+        assert "iceberg.bronze.understat_shots" not in sql
+        assert "iceberg.bronze.understat_players" not in sql
+        assert "iceberg.bronze.understat_schedule" in sql
 
     def test_has_match_winner_cte(self):
         sql = _strip_comments(_read_sql()).lower()
