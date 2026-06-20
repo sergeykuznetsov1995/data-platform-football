@@ -1255,6 +1255,25 @@
         "y": "double"
       }
     },
+    "bronze.sofascore_league_table": {
+      "columns": {
+        "_batch_id": "varchar",
+        "_entity_type": "varchar",
+        "_ingested_at": "timestamp(6)",
+        "_source": "varchar",
+        "d": "bigint",
+        "ga": "bigint",
+        "gd": "bigint",
+        "gf": "bigint",
+        "l": "bigint",
+        "league": "varchar",
+        "mp": "bigint",
+        "pts": "bigint",
+        "season": "varchar",
+        "team": "varchar",
+        "w": "bigint"
+      }
+    },
     "bronze.sofascore_match_stats": {
       "columns": {
         "_batch_id": "varchar",

@@ -1036,6 +1036,45 @@ def _build_sofascore_player_profile_checks() -> List[Check]:
     ]
 
 
+def _build_sofascore_league_table_checks() -> List[Check]:
+    """DQ for ``iceberg.silver.sofascore_league_table`` (issue #702).
+
+    Conform-only season-grain standings snapshot из bronze.sofascore_league_table
+    (dedup ROW_NUMBER, cast, season-slug as-is). PK = (league, season, team_name) —
+    canonical resolve отложен в Gold (gold.fct_standings джойнит silver.xref_team).
+    Floor 18 = минимальный размер одной (league, season) таблицы (18 команд).
+    """
+    table = 'iceberg.silver.sofascore_league_table'
+    return [
+        CHECK.no_duplicates(
+            table,
+            pk=['league', 'season', 'team_name'],
+            severity='ERROR',
+        ),
+        CHECK.no_nulls(
+            table,
+            cols=['league', 'season', 'team_name', 'points', 'played'],
+            severity='ERROR',
+        ),
+        CHECK.row_count(table, min_rows=18, severity='WARNING'),
+        # Sanity bounds: 38 matches × 3 pts = 114 (→120 slack); ≤46 matchdays.
+        CHECK.value_range(
+            table, 'points',
+            min_val=0, max_val=120, severity='WARNING',
+        ),
+        CHECK.value_range(
+            table, 'played',
+            min_val=0, max_val=46, severity='WARNING',
+        ),
+        CHECK.freshness(
+            table,
+            ts_col='_bronze_ingested_at',
+            max_age_hours=72,
+            severity='WARNING',
+        ),
+    ]
+
+
 def _build_sofascore_team_match_checks() -> List[Check]:
     """DQ for ``iceberg.silver.sofascore_team_match`` (T6.4 / issue #93).
 
@@ -1193,6 +1232,7 @@ def build_silver_e3_checks() -> List[Check]:
         + _build_understat_team_match_checks()
         + _build_espn_lineup_checks()
         + _build_sofascore_player_profile_checks()
+        + _build_sofascore_league_table_checks()
         + _build_sofascore_team_match_checks()
         + _build_sofascore_shots_checks()
     )

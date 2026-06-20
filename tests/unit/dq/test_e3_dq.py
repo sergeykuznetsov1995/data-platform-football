@@ -45,18 +45,19 @@ class TestCheckCounts:
     """Per-table check counts must match the contract documented in e3_dq.py."""
 
     def test_silver_e3_total_check_count(self):
-        """Silver builders compose 7 sub-builders = 34 checks total.
+        """Silver builders compose 8 sub-builders = 40 checks total.
 
         whoscored_events_spadl (9) + whoscored_team_match (T6.3) +
         understat_team_match (T6.2) + espn_lineup (4) + sofascore_player_profile +
-        sofascore_team_match (T6.4) + sofascore_shots (3, #602). The 3
-        *_team_season rollups migrated to Gold in #370 (their PK-uniqueness DQ
-        now lives in validate_gold_quality). Bump this number whenever a builder
-        is added to ``build_silver_e3_checks``.
+        sofascore_league_table (6, #702) + sofascore_team_match (T6.4) +
+        sofascore_shots (3, #602). The 3 *_team_season rollups migrated to Gold
+        in #370 (their PK-uniqueness DQ now lives in validate_gold_quality).
+        Bump this number whenever a builder is added to
+        ``build_silver_e3_checks``.
         """
         checks = e3_dq.build_silver_e3_checks()
-        assert len(checks) == 34, (
-            f"Silver E3 expected 34 checks, got {len(checks)}: "
+        assert len(checks) == 40, (
+            f"Silver E3 expected 40 checks, got {len(checks)}: "
             f"{[c.name for c in checks]}"
         )
 
@@ -137,13 +138,13 @@ class TestCheckCounts:
         assert len(fct_lineup) == 13  # +sofascore +fotmob +whoscored coverage (#693)
 
     def test_build_all_e3_checks_total(self):
-        """34 silver + 35 gold = 69 total E3 standard DQ checks.
+        """40 silver + 35 gold = 75 total E3 standard DQ checks.
 
-        Bump when either ``build_silver_e3_checks`` (34) or
+        Bump when either ``build_silver_e3_checks`` (40) or
         ``build_gold_e3_checks`` (35) gains a builder.
         """
         all_checks = e3_dq.build_all_e3_checks()
-        assert len(all_checks) == 69
+        assert len(all_checks) == 75
 
 
 # ===========================================================================

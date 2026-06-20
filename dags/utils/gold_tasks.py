@@ -341,7 +341,8 @@ def _append_fct_standings_coverage_check(report) -> None:
 
     Measures the fraction of standings rows whose team_id was resolved via
     the canonical resolver (``team_id_source = 'fbref_canonical'``) vs the
-    fallback (``'sofascore_orphan'``). Uses two-tier severity:
+    per-source fallback (``'sofascore_orphan'`` / ``'fotmob_orphan'``, #702).
+    Uses two-tier severity:
 
       * ``coverage >= 95%`` -> OK
       * ``50% <= coverage < 95%`` -> WARNING (drop in resolver match-rate)
@@ -915,11 +916,13 @@ def validate_gold_quality() -> Dict[str, Any]:
         CHECK.no_nulls('gold.dim_venue',       cols=['venue_id', 'venue_name']),
         CHECK.no_nulls('gold.dim_referee',     cols=['referee_id', 'referee_name']),
         # fct_standings has no canonical column — its source-tracking is via
-        # team_id_source (covered by the coverage check below). Here we just
-        # guarantee the PK trio + the load-bearing numeric attrs are present.
+        # team_id_source (covered by the coverage check below) и standings_source
+        # (#702 provenance: 'sofascore'/'fotmob'). Here we just guarantee the PK
+        # trio + the load-bearing numeric attrs + provenance are present.
         # #428: mp → played (design §5.5).
         CHECK.no_nulls('gold.fct_standings',
-                       cols=['league', 'season', 'team_id', 'points', 'played']),
+                       cols=['league', 'season', 'team_id', 'points', 'played',
+                             'standings_source']),
         CHECK.no_nulls('gold.dim_competition',
                        cols=['league', 'competition_name', 'country']),
         CHECK.no_nulls('gold.dim_season',
@@ -974,6 +977,14 @@ def validate_gold_quality() -> Dict[str, Any]:
                           min_val=0, max_val=46,  severity='WARNING'),
         CHECK.value_range('gold.fct_standings', 'position',
                           min_val=1, max_val=24,  severity='WARNING'),
+        # #702: standings_source provenance — only the two wired sources are
+        # valid. Any other value means a producer bug in fct_standings.sql.
+        CHECK.row_count(
+            'gold.fct_standings', min_rows=0, max_rows=0,
+            where="standings_source NOT IN ('sofascore', 'fotmob')",
+            severity='ERROR',
+            name='enum[fct_standings.standings_source]',
+        ),
 
         # ============================================================
         # dim_manager — plain per-manager dictionary since #425 (the SCD-2
