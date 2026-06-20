@@ -78,6 +78,18 @@ relationships:
 Only PK + key FK + 3-5 main metrics need explicit column descriptions; OM
 keeps native column types from the ingested schema regardless.
 
+### Season facts: document squad-sum semantics (#515)
+
+The FBref season facts — [`descriptions/fct_player_season_stats.yaml`](descriptions/fct_player_season_stats.yaml)
+and [`descriptions/fct_keeper_season_stats.yaml`](descriptions/fct_keeper_season_stats.yaml) —
+aggregate a winter intra-league transfer across both clubs (#515, Variant B):
+FBref counter columns are **summed across squads** for the season, `team_id`
+comes from the max-minutes club, and ratios with a known formula
+(`goals_per_shot`; keeper `save_pct` / `clean_sheet_pct` / `goals_against_per90`
+/ `pk_save_pct`) are recomputed from the summed counters. When documenting a
+column on these tables, note this on summed/recomputed columns so catalog users
+read the totals correctly. FotMob / WhoScored columns are unaffected.
+
 ## Adding a new table
 
 1. Drop a new `<table>.yaml` in `descriptions/`.
