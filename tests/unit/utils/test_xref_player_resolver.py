@@ -869,6 +869,20 @@ class TestDedupCanonicalPerSeason:
         assert len(out) == 2
         assert removed == {}
 
+    def test_espn_transfer_rows_both_survive(self):
+        # #720: ESPN source_id is '<name>|<team>'. A within-season transfer
+        # resolves both club-stints to the SAME canonical_id. Collapsing them
+        # would drop one club's row, and fct_lineup's ESPN JOIN (keyed on
+        # raw_team_name) would NULL that club's player_id. ESPN is exempt.
+        a = {**_xrow('fb_palmer', 'espn', 'Cole Palmer|Manchester City'),
+             'raw_team_name': 'Manchester City'}
+        b = {**_xrow('fb_palmer', 'espn', 'Cole Palmer|Chelsea'),
+             'raw_team_name': 'Chelsea'}
+        out, removed = xpr._dedup_canonical_per_season([a, b])
+        assert len(out) == 2
+        assert {r['raw_team_name'] for r in out} == {'Manchester City', 'Chelsea'}
+        assert removed == {}
+
 
 # ---------------------------------------------------------------------------
 # Silver lineage column (_silver_created_at) — charter §4 / S1 (issue #374)
