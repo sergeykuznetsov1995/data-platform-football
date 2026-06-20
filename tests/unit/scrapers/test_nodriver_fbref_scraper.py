@@ -460,6 +460,32 @@ class TestNodriverFBrefScraperScrapeStatType:
             'replace_partitions'
         ) == ['league', 'season']
 
+    @pytest.mark.unit
+    def test_scrape_single_stat_type_arms_completeness_guard(self, scraper):
+        """#583: the nodriver single_stat save arms the completeness guard
+        (min_replace_ratio=0.9, raw COUNT(*) — no replace_guard_key);
+        force_replace=True disarms it."""
+        mock_df = pd.DataFrame({
+            'x': [1],
+            'league': ['ENG-Premier League'],
+            'season': [2024],
+        })
+        with patch.object(scraper, 'read_player_season_stats', return_value=mock_df):
+            with patch.object(
+                scraper, 'save_to_iceberg',
+                return_value='iceberg.bronze.fbref_player_stats',
+            ) as mock_save:
+                scraper.scrape_single_stat_type('stats', 'player')
+                armed = mock_save.call_args.kwargs
+                scraper.scrape_single_stat_type(
+                    'stats', 'player', force_replace=True
+                )
+                forced = mock_save.call_args.kwargs
+
+        assert armed.get('min_replace_ratio') == 0.9
+        assert 'replace_guard_key' not in armed
+        assert forced.get('min_replace_ratio') is None
+
 
 class TestNodriverFBrefScraperScrapeAll:
     """Tests for scrape_all method."""

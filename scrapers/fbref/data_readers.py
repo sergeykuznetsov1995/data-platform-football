@@ -58,9 +58,6 @@ class FBrefDataReaderMixin:
         - self._add_metadata(df, entity_type)
         - self._cleanup_after_league()
         - self._extract_match_ids(schedule_df, max_matches)
-        - self._merge_team_stats(data, league, season)
-        - self._merge_player_stats(data, league, season)
-        - self._merge_keeper_stats(data, league, season)
         - self.save_to_iceberg(df, table_name, partition_cols)
         - self.use_nodriver, self._nodriver_browser
     """
@@ -601,6 +598,7 @@ class FBrefDataReaderMixin:
         self,
         stat_type: str,
         data_category: str,
+        force_replace: bool = False,
     ) -> Dict[str, str]:
         """
         Memory-efficient: scrape single stat_type for all leagues/seasons.
@@ -614,6 +612,10 @@ class FBrefDataReaderMixin:
                         'defense', 'possession', 'playingtime', 'misc',
                         'keeper', 'keeper_adv')
             data_category: One of 'player', 'team', or 'keeper'
+            force_replace: Bypass the completeness guard (#513/#583). When False
+                (default) a partial scrape that would shrink the (league, season)
+                partition below 90% of its existing rows is refused
+                (ReplaceGuardError). Set True for a deliberate first backfill.
 
         Returns:
             Dictionary mapping '{data_category}_{stat_type}' to Iceberg table path
@@ -677,6 +679,10 @@ class FBrefDataReaderMixin:
                 table_name=table_name,
                 partition_cols=['league', 'season'],
                 replace_partitions=['league', 'season'],
+                # Completeness guard (#513/#583): refuse a partial scrape that
+                # would shrink the (league, season) partition below 90% of its
+                # existing rows (full-state season stats → raw COUNT(*)).
+                min_replace_ratio=(None if force_replace else 0.9),
             )
 
             key = f'{data_category}_{stat_type}'

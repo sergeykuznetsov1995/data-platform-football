@@ -36,6 +36,16 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
+# Replace-partitions completeness guard (#513 → #583): refuse a single_stat save
+# that would shrink a fbref_{category}_{stat} (league, season) partition below
+# this share of its existing rows, so a partial/failed scrape can't wipe a good
+# season (precedent #536 45-50x bloat the other way). COUNT(*) (full-state per
+# (league, season) — no replace_guard_key needed). The guard lives inside
+# scrape_single_stat_type; this runner threads force_replace down and maps the
+# resulting ReplaceGuardError to exit 3. --force-replace bypasses it.
+_MIN_REPLACE_RATIO = 0.9
+REPLACE_GUARD_MARKER = 'FBREF_REPLACE_GUARD'
+
 # Noisy third-party loggers to suppress to WARNING level
 _NOISY_LOGGERS = [
     'nodriver', 'uc', 'urllib3', 'websockets', 'asyncio',
@@ -385,31 +395,9 @@ def main():
 
     # === Full mode specific arguments ===
     parser.add_argument(
-        '--extended-stats',
-        action='store_true',
-        default=True,
-        help='[full mode] Collect extended player stats (all stat_types merged)'
-    )
-    parser.add_argument(
-        '--no-extended-stats',
-        action='store_true',
-        help='[full mode] Disable extended player stats collection'
-    )
-    parser.add_argument(
         '--match-stats',
         action='store_true',
         help='[full mode] Collect per-match player stats (slow, selenium only)'
-    )
-    parser.add_argument(
-        '--keeper-stats',
-        action='store_true',
-        default=True,
-        help='[full mode] Collect goalkeeper statistics'
-    )
-    parser.add_argument(
-        '--no-keeper-stats',
-        action='store_true',
-        help='[full mode] Disable goalkeeper stats collection'
     )
     parser.add_argument(
         '--shot-events',
@@ -450,17 +438,6 @@ def main():
         help='[full mode] Collect team-level match statistics (slow, selenium only)'
     )
     parser.add_argument(
-        '--team-stats-extended',
-        action='store_true',
-        default=True,
-        help='[full mode] Collect extended team stats (all stat_types merged)'
-    )
-    parser.add_argument(
-        '--no-team-stats-extended',
-        action='store_true',
-        help='[full mode] Disable extended team stats collection'
-    )
-    parser.add_argument(
         '--max-matches',
         type=int,
         default=50,
@@ -488,6 +465,13 @@ def main():
              'summary (real_proxy_mb, per-resource-type, CF challenges, '
              'restart reasons) is written. Useful when one bash command '
              'should not clobber the file from a previous step.'
+    )
+    parser.add_argument(
+        '--force-replace',
+        action='store_true',
+        help='Bypass the single_stat completeness guard — write even if the '
+             'scraped frame shrinks the existing (league, season) partition. '
+             'Use for a deliberate first backfill or a known legitimate shrink.'
     )
     args = parser.parse_args()
 
@@ -527,6 +511,7 @@ def main():
         results['diagnostics']['content_timeout'] = args.content_timeout
 
         try:
+            from scrapers.base.base_scraper import ReplaceGuardError
             from scrapers.nodriver_fbref import NodriverFBrefScraper
 
             with NodriverFBrefScraper(
@@ -556,6 +541,7 @@ def main():
                     scrape_result = scraper.scrape_single_stat_type(
                         stat_type=args.stat_type,
                         data_category=args.data_category,
+                        force_replace=args.force_replace,
                     )
 
                     results['tables'] = list(scrape_result.values())
@@ -665,6 +651,17 @@ def main():
                 json.dump(results, f)
             sys.exit(1)
 
+        except ReplaceGuardError as e:
+            # Guard refused: a partial single_stat scrape would shrink the
+            # (league, season) partition — nothing written. Distinct exit 3 so
+            # an operator can tell a refused guard from a hard failure (#583).
+            msg = f"{REPLACE_GUARD_MARKER}: {e}"
+            logger.error(msg)
+            results['errors'].append(msg)
+            with open(args.output, 'w') as f:
+                json.dump(results, f)
+            sys.exit(3)
+
         except Exception as e:
             logger.error(f"Nodriver scraper failed: {e}", exc_info=True)
             results['errors'].append(str(e))
@@ -687,6 +684,7 @@ def main():
             logger.info("Nodriver mode enabled - using advanced Cloudflare bypass")
 
         try:
+            from scrapers.base.base_scraper import ReplaceGuardError
             from scrapers.fbref import FBrefScraper
 
             with FBrefScraper(
@@ -714,6 +712,7 @@ def main():
                     scrape_results = scraper.scrape_single_stat_type(
                         stat_type=args.stat_type,
                         data_category=args.data_category,
+                        force_replace=args.force_replace,
                     )
 
                     results['tables'] = list(scrape_results.values())
@@ -924,29 +923,23 @@ def main():
                 # MODE: full
                 # =============================================================
                 else:  # mode == 'full'
-                    include_extended = args.extended_stats and not args.no_extended_stats
-                    include_keeper = args.keeper_stats and not args.no_keeper_stats
                     include_shot_events = args.shot_events and not args.no_shot_events
                     include_match_events = args.match_events and not args.no_match_events
                     include_lineups = args.lineups and not args.no_lineups
-                    include_team_stats_extended = args.team_stats_extended and not args.no_team_stats_extended
 
                     logger.info(
-                        f"Full mode (selenium): extended={include_extended}, keeper={include_keeper}, "
+                        f"Full mode (selenium): "
                         f"shot_events={include_shot_events}, match_events={include_match_events}, "
-                        f"lineups={include_lineups}, team_extended={include_team_stats_extended}"
+                        f"lineups={include_lineups}"
                     )
                     logger.info(f"Max matches per league: {max_matches if max_matches else 'unlimited'}")
 
                     scrape_results = scraper.scrape_all(
-                        include_extended_stats=include_extended,
                         include_match_stats=args.match_stats,
-                        include_keeper_stats=include_keeper,
                         include_shot_events=include_shot_events,
                         include_match_events=include_match_events,
                         include_lineups=include_lineups,
                         include_team_match_stats=args.team_match_stats,
-                        include_team_stats_extended=include_team_stats_extended,
                         max_matches_per_league=max_matches,
                     )
 
@@ -955,10 +948,7 @@ def main():
                     # Add row count placeholders for backwards compatibility
                     results['schedule_rows'] = 1 if 'schedule' in scrape_results else 0
                     results['team_stats_rows'] = 1 if 'team_stats' in scrape_results else 0
-                    results['team_stats_extended_rows'] = 1 if 'team_stats_extended' in scrape_results else 0
                     results['player_stats_rows'] = 1 if 'player_stats' in scrape_results else 0
-                    results['player_stats_extended_rows'] = 1 if 'player_stats_extended' in scrape_results else 0
-                    results['keeper_stats_rows'] = 1 if 'keeper_stats' in scrape_results else 0
                     results['match_stats_rows'] = 1 if 'player_match_stats' in scrape_results else 0
                     results['shot_events_rows'] = 1 if 'shot_events' in scrape_results else 0
                     results['match_events_rows'] = 1 if 'match_events' in scrape_results else 0
@@ -966,6 +956,17 @@ def main():
                     results['team_match_stats_rows'] = 1 if 'team_match_stats' in scrape_results else 0
 
                     logger.info(f"Full scrape completed. Tables saved: {list(scrape_results.keys())}")
+
+        except ReplaceGuardError as e:
+            # Guard refused: a partial single_stat scrape would shrink the
+            # (league, season) partition — nothing written. Distinct exit 3 so
+            # an operator can tell a refused guard from a hard failure (#583).
+            msg = f"{REPLACE_GUARD_MARKER}: {e}"
+            logger.error(msg)
+            results['errors'].append(msg)
+            with open(args.output, 'w') as f:
+                json.dump(results, f)
+            sys.exit(3)
 
         except Exception as e:
             logger.error(f"Selenium scraper failed: {e}", exc_info=True)

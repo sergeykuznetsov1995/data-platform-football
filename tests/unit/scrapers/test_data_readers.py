@@ -294,6 +294,33 @@ class TestSingleStatReplacePartitions:
             'replace_partitions'
         ) == ['league', 'season']
 
+    @patch('scrapers.fbref.data_readers.time.sleep', return_value=None)
+    def test_single_stat_arms_completeness_guard(self, _sleep):
+        """#583: the season-grain save arms the completeness guard
+        (min_replace_ratio=0.9, raw COUNT(*) — no replace_guard_key);
+        force_replace=True disarms it."""
+        scraper = StubScraper()
+        scraper.save_to_iceberg = MagicMock(
+            side_effect=lambda df, table_name, **kw: f'iceberg.bronze.{table_name}'
+        )
+        df = pd.DataFrame({
+            'squad': ['Arsenal'],
+            'league': ['ENG-Premier League'],
+            'season': [2025],
+        })
+        scraper.read_team_season_stats = MagicMock(return_value=df)
+
+        scraper.scrape_single_stat_type(stat_type='stats', data_category='team')
+        armed = scraper.save_to_iceberg.call_args.kwargs
+        scraper.scrape_single_stat_type(
+            stat_type='stats', data_category='team', force_replace=True
+        )
+        forced = scraper.save_to_iceberg.call_args.kwargs
+
+        assert armed.get('min_replace_ratio') == 0.9
+        assert 'replace_guard_key' not in armed
+        assert forced.get('min_replace_ratio') is None
+
 
 # ===========================================================================
 # Test: scrape_combined_match_data — pre-flight Trino probe
