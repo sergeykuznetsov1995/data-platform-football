@@ -910,11 +910,12 @@ def _build_fct_lineup_checks() -> List[Check]:
         ),
         # ESPN coverage — WARNING only. Post-#692 resolved ESPN rows dedup into
         # their FBref twin, so surviving lineup_source='espn' rows are the tail
-        # (ESPN-exclusive / bridge-miss / unresolved). Floor kept at 5K pending
-        # a live re-baseline; lower it if the post-#692 survivor count is below.
+        # (ESPN-exclusive / bridge-miss / unresolved). Re-baselined live
+        # 2026-06-20 after #722: ~74.7K → 4,685 survivors (3,515 with a resolved
+        # player_id). Floor lowered 5K → 3K to match the post-dedup reality.
         CHECK.row_count(
             table=table,
-            min_rows=5_000,
+            min_rows=3_000,
             where="lineup_source = 'espn'",
             severity='WARNING',
             name='espn_coverage_present',
