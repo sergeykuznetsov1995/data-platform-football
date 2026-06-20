@@ -49,20 +49,21 @@
 -- =============================================================================
 -- ADR — player_id resolution (ESPN ↔ canonical)
 -- =============================================================================
---   xref_player covers FBref / Understat / WhoScored (R2 prototype scope).
---   ESPN is NOT in that resolver — silver.espn_lineup.player_id is NULL,
---   and there is no (name, team) → canonical_id mapping for ESPN players
---   in production today. Behaviour:
+--   xref_player covers FBref + 8 other sources incl. ESPN (#692). Behaviour:
 --
---     * FBref rows -> LEFT JOIN xref_player (source='fbref') -> 'fb_<id>'.
---     * ESPN rows  -> player_id_canonical = NULL.
+--     * FBref rows -> LEFT JOIN xref_player_dedup (source='fbref') -> 'fb_<id>'.
+--     * ESPN rows  -> LEFT JOIN xref_player (source='espn') keyed on
+--                     (display_name, raw_team_name, league, season). ESPN has
+--                     NO native player_id, so the resolver matches by name+team
+--                     against the FBref spine: 'fb_<id>' when matched,
+--                     'es_<player>|<team>' orphan otherwise, NULL when the ESPN
+--                     season is outside the resolver's configured scope.
 --
---   To prevent the dedup PARTITION from collapsing distinct ESPN players
---   sharing a NULL canonical_id, we synthesise a *partition key only*
+--   The dedup PARTITION still synthesises a *partition key only*
 --   (`_dedup_player_key = COALESCE(player_id_canonical, 'es_' || hash(...))`)
---   that is used solely inside ROW_NUMBER and dropped from the projection.
---   The output column `player_id_canonical` stays NULL for unresolved ESPN
---   rows, so downstream consumers can WHERE-filter or join cautiously.
+--   so distinct ESPN players that did NOT resolve (NULL canonical) don't
+--   collapse into one ROW_NUMBER bucket. Resolved ESPN rows now carry a real
+--   canonical and therefore dedup against their FBref twin (see next ADR).
 --
 -- =============================================================================
 -- ADR — Dedup priority FBref > ESPN
@@ -75,19 +76,20 @@
 --   freshest row within a single source.
 --
 --   Edge case: cross-source dedup only fires when the ESPN→FBref match_id
---   bridge succeeds AND the ESPN player resolves to a canonical_id. Today
---   the second condition is never true (no ESPN player resolver), so
---   FBref + ESPN rows for the same match coexist as separate
---   player_id_canonical groups. That is the correct behaviour until an
---   ESPN player resolver lands in E1.5+ — fct_lineup acts as a UNION ALL
---   and DQ can track the (match × team) starter-count as a sanity probe.
+--   bridge succeeds AND the ESPN player resolves to a canonical_id (#692
+--   enabled the latter). When both hold the FBref row wins and the ESPN twin
+--   is dropped — so wiring the ESPN resolver REDUCES the row count for
+--   FBref-covered matches (APL is fully FBref-covered). ESPN rows survive
+--   only where FBref is missing, the bridge misses, or the player did not
+--   resolve. fct_lineup is no longer a blind UNION ALL for overlapping rows.
 --
 -- =============================================================================
 -- Output schema (frozen — star design §4.5)
 -- =============================================================================
 --   match_id              varchar  -- via xref_match (FBref) / bridge (ESPN)
 --   team_id               varchar  -- via xref_team — NULL-tolerant
---   player_id             varchar  -- via xref_player (FBref); NULL for ESPN
+--   player_id             varchar  -- via xref_player (FBref + ESPN #692);
+--                                     NULL when ESPN player unresolved/out-of-scope
 --   is_starter            boolean
 --   position              varchar  -- raw passthrough — no canonicalisation in MVP
 --                                     (FBref Silver also keeps raw position;
@@ -268,9 +270,12 @@ espn_resolved AS (
     SELECT
         COALESCE(emb.fbref_match_id, el.match_id)      AS match_id_canonical,
         xt.canonical_id                                AS team_id_canonical,
-        -- ESPN player resolver does not exist yet (R2 spike covers FB/US/WS).
-        -- Surface NULL; downstream DQ tracks "ESPN orphan rate".
-        CAST(NULL AS varchar)                          AS player_id_canonical,
+        -- #692: ESPN has no native player_id; xref_player (source='espn')
+        -- resolves by (name, team). canonical_id is 'fb_<id>' when matched,
+        -- 'es_<player>|<team>' when orphan, NULL when ESPN season is outside
+        -- the resolver's scope. Cross-source dedup (FBref priority 1 < ESPN 2)
+        -- then collapses resolved ESPN rows into their FBref twin.
+        xp.canonical_id                                AS player_id_canonical,
         el.player                                      AS player_name,
         el.is_starter                                  AS is_starter,
         el.position                                    AS position_canonical,
@@ -297,6 +302,20 @@ espn_resolved AS (
        AND xt.league    = el.league
        AND xt.season    = CAST(el.season AS varchar)
        AND xt.confidence <> 'orphan'   -- #506: don't leak 'es_<slug>' pseudo-canonical
+    -- #692: resolve ESPN player_id via xref_player. ESPN has no native
+    -- player_id, so the resolver synthesises source_id='<player>|<team>' and
+    -- the JOIN keys on (display_name, raw_team_name). The (league, season)
+    -- predicate keeps this 1:1 (xref_player PK is (source, source_id, league,
+    -- season)) and avoids the cross-season fan-out footgun (#205). A raw
+    -- xref_player JOIN (NOT the xref_player_dedup CTE used for FBref) is
+    -- correct: ESPN canonical is season-specific (resolved one season may
+    -- orphan another), unlike FBref's season-independent 'fb_<player_id>'.
+    LEFT JOIN iceberg.silver.xref_player xp
+        ON xp.source        = 'espn'
+       AND xp.display_name  = el.player
+       AND xp.raw_team_name = el.team
+       AND xp.league        = el.league
+       AND xp.season        = el.season
 ),
 
 -- ============================================================================
