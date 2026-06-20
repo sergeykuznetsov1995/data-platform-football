@@ -57,8 +57,18 @@ def validate_events(**context) -> Dict[str, Any]:
     return validate_table('whoscored_events', 'whoscored_events')
 
 
+def validate_player_profile(**context) -> Dict[str, Any]:
+    """Hard threshold check for whoscored_player_profile (~531 players/season, #37)."""
+    return validate_table('whoscored_player_profile', 'whoscored_player_profile')
+
+
 # Build arguments for bash command
 leagues_str = ','.join(LEAGUES)
+
+# player_profile reads player_ids from bronze.whoscored_events (latest season).
+# Use the latest single short-form season token so the resolver matches Bronze
+# exactly and tags the partition correctly (see scraper resolver note).
+whoscored_pp_season = SEASONS_STR.split(',')[-1]
 
 # DAG definition
 with DAG(
@@ -145,4 +155,35 @@ with DAG(
         trigger_rule='all_done',
     )
 
+    # player_profile — biographical /Players/{id} snapshot (issue #37). Runs
+    # AFTER the main scrape because it resolves player_ids from the freshly
+    # written bronze.whoscored_events (latest season only). Separate FlareSolverr
+    # session; proxy-less by default like the main scrape.
+    scrape_player_profile_task = BashOperator(
+        task_id='scrape_player_profile',
+        bash_command=(
+            'cd /opt/airflow && '
+            f'python dags/scripts/run_whoscored_scraper.py '
+            f'--player-profile '
+            f'--leagues "{leagues_str}" '
+            f'--seasons "{whoscored_pp_season}" '
+            f'--proxy-file "" '
+            f'--flaresolverr-url http://flaresolverr:8191 '
+            f'--output /tmp/whoscored_player_profile_result.json'
+        ),
+        env={
+            'PYTHONPATH': '/opt/airflow:/opt/airflow/dags',
+            'PATH': '/usr/local/bin:/usr/bin:/bin:/home/airflow/.local/bin',
+            'HOME': '/home/airflow',
+        },
+        append_env=True,
+    )
+
+    validate_player_profile_task = PythonOperator(
+        task_id='validate_player_profile',
+        python_callable=validate_player_profile,
+        trigger_rule='all_done',
+    )
+
     scrape_task >> [validate_schedule_task, validate_events_task]
+    scrape_task >> scrape_player_profile_task >> validate_player_profile_task
