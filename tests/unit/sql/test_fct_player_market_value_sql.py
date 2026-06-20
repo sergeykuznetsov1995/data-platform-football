@@ -2,7 +2,7 @@
 Unit tests for Gold ``fct_player_market_value`` SQL logic (issue #430).
 
 Two-source market-value timeline, one row per
-(player_id_canonical, valuation_date, source). Logic under test:
+(player_id, valuation_date, source). Logic under test:
 
   * FotMob bridged to canonical via silver.xref_player (INNER JOIN non-orphan =
     canonical-only); Transfermarkt reads canonical_id straight from Silver,
@@ -155,28 +155,28 @@ class TestFctPlayerMarketValue:
     def test_fotmob_point_collapsed_cross_season(self, gold_rows):
         fm = [r for r in gold_rows if r["source"] == "fotmob"]
         assert len(fm) == 1, "the two season partitions must collapse to one row"
-        assert fm[0]["player_id_canonical"] == "fb_x"
+        assert fm[0]["player_id"] == "fb_x"
         assert fm[0]["valuation_date"] == date(2024, 1, 1)
         assert fm[0]["market_value_eur"] == 100_000_000
 
     def test_transfermarkt_point_present(self, gold_rows):
         tm = next(r for r in gold_rows if r["source"] == "transfermarkt")
-        assert tm["player_id_canonical"] == "fb_x"
+        assert tm["player_id"] == "fb_x"
         assert tm["market_value_eur"] == 95_000_000
         assert tm["currency"] == "EUR"
 
     def test_orphans_dropped_canonical_only(self, gold_rows):
         # FotMob '900' (orphan bridge) and TM '701' (NULL canonical) are gone.
-        assert all(r["player_id_canonical"].startswith("fb_") for r in gold_rows)
+        assert all(r["player_id"].startswith("fb_") for r in gold_rows)
 
     def test_pk_unique_with_source(self, gold_rows):
-        pks = [(r["player_id_canonical"], r["valuation_date"], r["source"])
+        pks = [(r["player_id"], r["valuation_date"], r["source"])
                for r in gold_rows]
         assert len(pks) == len(set(pks)), f"PK collision: {pks}"
 
     def test_columns_contract(self, gold_rows):
         expected = {
-            "player_id_canonical", "valuation_date", "market_value_eur",
+            "player_id", "valuation_date", "market_value_eur",
             "currency", "source", "_bronze_ingested_at",
         }
         assert set(gold_rows[0].keys()) == expected

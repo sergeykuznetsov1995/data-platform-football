@@ -5,7 +5,7 @@
 -- with cross-source identity resolution via E1 xref tables.
 --
 -- One row per WhoScored event — full row-count parity with Silver (NO filtering
--- on action_canonical='unknown'; per R3.D5 those rows are kept for audit).
+-- on action='unknown'; per R3.D5 those rows are kept for audit).
 --
 -- Sources:
 --   iceberg.silver.whoscored_events_spadl   (input — frozen E3.1 deliverable)
@@ -22,21 +22,21 @@
 -- =============================================================================
 -- Output schema (frozen for E3 wave-1 — see plan R3.E3.3)
 -- =============================================================================
---   match_id_canonical    varchar     resolved match canonical (see ADR #1)
+--   match_id    varchar     resolved match canonical (see ADR #1)
 --   match_id_source       varchar     'fbref' when bridged via silver.xref_match,
 --                                     else 'whoscored_raw' (orphan)
 --   match_id_version      varchar     'v1' when bridged, else 'v0_unbridged' (orphan)
 --   event_id              varchar     passthrough from silver (synthetic stable PK)
---   team_id_canonical     varchar     via xref_team — orphan-tolerant LEFT JOIN
+--   team_id     varchar     via xref_team — orphan-tolerant LEFT JOIN
 --   team_id_source        varchar     'whoscored'
 --   team_id_version       varchar     'v1'
---   player_id_canonical   varchar     via xref_player — NULL when player_id missing
+--   player_id   varchar     via xref_player — NULL when player_id missing
 --   player_id_source      varchar     'whoscored'
 --   player_id_version     varchar     'v1'
 --   period                varchar     passthrough
 --   minute                integer     renamed from silver.expanded_minute
 --   x, y, end_x, end_y    double      pitch coordinates (passthrough)
---   action_canonical      varchar     SPADL 24-value enum (passthrough)
+--   action                varchar     SPADL 24-value enum (passthrough)
 --   action_source         varchar     'whoscored_spadl_proprietary_v1'
 --   action_version        varchar     'v1'
 --   _action_confidence    varchar     'high'/'medium'/'low'/'unmappable'
@@ -45,8 +45,8 @@
 --   league                varchar     partition key
 --   season                varchar     partition key (silver stores varchar)
 --
--- Primary key:  (match_id_canonical, event_id)
---   Note: match_id_canonical == raw match_id at v0_unbridged stage, so PK is
+-- Primary key:  (match_id, event_id)
+--   Note: match_id == raw match_id at v0_unbridged stage, so PK is
 --   effectively (match_id, event_id) which silver guarantees unique
 --   (166,453 rows / 166,453 distinct keys verified on 2425 corpus).
 --
@@ -62,14 +62,14 @@
 -- orphan canonical of the form 'ws_<game_id>' with confidence='orphan'.
 --
 -- This CTAS LEFT JOINs xref_match and resolves the triplet:
---   * match_id_canonical = COALESCE(xm.canonical_id, e.match_id)
+--   * match_id = COALESCE(xm.canonical_id, e.match_id)
 --   * match_id_source    = 'fbref' when bridged AND non-orphan, else 'whoscored_raw'
 --   * match_id_version   = 'v1'    when bridged AND non-orphan, else 'v0_unbridged'
 --
 -- The orphan branch preserves R3.D5 row-count parity (ADR-4) — silver-level
 -- whoscored events with no FBref bridge still flow through Gold.
 --
--- ref_integrity for match_id_canonical → silver.xref_match.canonical_id is
+-- ref_integrity for match_id → silver.xref_match.canonical_id is
 -- now ENABLED in `dags/utils/e3_dq.py::_build_fct_event_checks` because
 -- every WhoScored game_id has a row in xref_match (bridged or orphan).
 --
@@ -100,7 +100,7 @@
 -- on (source='whoscored', source_id=player_id_raw) always returns
 -- *some* canonical_id when player_id_raw is present in xref_player.
 --
--- player_id_canonical IS NULL only when:
+-- player_id IS NULL only when:
 --   (a) silver event has player_id_raw IS NULL (substitutions / meta /
 --       team-only events — kept by R3.D5 row-count parity); or
 --   (b) xref_player has not been re-materialised after a new bronze
@@ -108,14 +108,14 @@
 --       orphan rate; target ≤7%).
 --
 -- Both cases are tolerated; downstream ML can filter on
--- player_id_canonical IS NOT NULL when needed.
+-- player_id IS NOT NULL when needed.
 --
 -- ADR-4: NO row dropping (R3.D5)
 -- ------------------------------
 -- WHERE filters are forbidden in this CTAS. Silver writes one row per
 -- bronze event (including action_canonical='unknown' meta/marker rows).
 -- Dropping any row here breaks the bronze→silver→gold row-count parity
--- audit. Consumers filter unknown via WHERE action_canonical != 'unknown'
+-- audit. Consumers filter unknown via WHERE action != 'unknown'
 -- in their own queries.
 --
 -- ADR-5: dedup of bronze bridge
@@ -163,10 +163,10 @@ SELECT
     -- found a FBref counterpart for this whoscored game we emit FBref
     -- hex + ('fbref','v1'). When no counterpart was found, xm.canonical_id
     -- is the orphan-prefixed 'ws_<id>' (confidence='orphan'); we surface
-    -- it as match_id_canonical for ref_integrity but keep the legacy
+    -- it as match_id for ref_integrity but keep the legacy
     -- ('whoscored_raw','v0_unbridged') labels so downstream consumers
     -- can detect unbridged rows.
-    COALESCE(xm.canonical_id, e.match_id)        AS match_id_canonical,
+    COALESCE(xm.canonical_id, e.match_id)        AS match_id,
     CASE
         WHEN xm.canonical_id IS NOT NULL AND xm.confidence != 'orphan'
             THEN CAST('fbref'         AS varchar)
@@ -191,19 +191,19 @@ SELECT
     --     not happen on validated bronze); OR
     --   * xref_team has no row for (whoscored, team_name) — alias
     --     YAML drift; DQ in E3.8 catches this.
-    xt.canonical_id                              AS team_id_canonical,
+    xt.canonical_id                              AS team_id,
     CAST('whoscored' AS varchar)                 AS team_id_source,
     CAST('v1'        AS varchar)                 AS team_id_version,
 
     -- ============================================================
     -- player identity — orphan-tolerant LEFT JOIN on xref_player
     -- ============================================================
-    -- ADR-3: player_id_canonical is non-null when player_id_raw
+    -- ADR-3: player_id is non-null when player_id_raw
     -- exists in xref_player (orphan rows have ws_<sid> canonical,
     -- so non-resolved players still get a stable key downstream).
     -- Genuinely NULL only for player_id_raw IS NULL events (subs /
     -- markers / meta — R3.D5 row-count parity).
-    xp.canonical_id                              AS player_id_canonical,
+    xp.canonical_id                              AS player_id,
     CAST('whoscored' AS varchar)                 AS player_id_source,
     CAST('v1'        AS varchar)                 AS player_id_version,
 
@@ -220,7 +220,7 @@ SELECT
     -- ============================================================
     -- SPADL action vocabulary (passthrough — see silver header for enum)
     -- ============================================================
-    e.action_canonical                           AS action_canonical,
+    e.action_canonical                           AS action,
     e.action_source                              AS action_source,
     e.action_version                             AS action_version,
     e._action_confidence                         AS _action_confidence,
@@ -270,7 +270,7 @@ LEFT JOIN iceberg.silver.xref_player xp
 -- ---- match xref (whoscored game_id -> FBref hex via Phase B cascade) ----
 -- Phase B (Task 2.1) materialises a 7-source xref_match. For every WhoScored
 -- game silver.xref_match has a row (bridged FBref or orphan-prefixed
--- 'ws_<id>'), so the JOIN here resolves match_id_canonical to a non-NULL
+-- 'ws_<id>'), so the JOIN here resolves match_id to a non-NULL
 -- value matched by ref_integrity.
 LEFT JOIN iceberg.silver.xref_match xm
     ON xm.source    = 'whoscored'

@@ -25,20 +25,20 @@
 -- =============================================================================
 -- Output schema (frozen for E4 wave-1)
 -- =============================================================================
---   match_id_canonical    varchar         FBref hex when bridged; else
+--   match_id              varchar         FBref hex when bridged; else
 --                                         'sofascore_<raw>' v0_unbridged
---   player_id_canonical   varchar         xref_player canonical; else 'ss_<raw>'
+--   player_id             varchar         xref_player canonical; else 'ss_<raw>'
 --   team_side             varchar         'home' | 'away'
 --   rating                decimal(3,1)    valid range 0.1–10.0 (silver drops 0.0)
 --   position              varchar         passthrough (no canonicalisation MVP)
---   rating_canonical      varchar         xxhash64 synthetic PK
+--   rating_id             varchar         xxhash64 synthetic PK
 --   rating_source         varchar         literal 'sofascore'
 --   rating_version        varchar         literal 'v1'
 --   league                varchar         partition key
 --   season                varchar         partition key (silver varchar slug '2526')
 --   _ingested_at          timestamp(6)    bronze provenance
 --
--- Logical PK: rating_canonical
+-- Logical PK: rating_id
 --   xxhash64 over (match || player || team_side). team_side is part of the
 --   key because a player can theoretically appear on both sides of an
 --   inter-club friendly (extremely rare in APL — guard kept for hygiene).
@@ -52,8 +52,8 @@
 -- =============================================================================
 
 SELECT
-    s.match_id_canonical,
-    s.player_id_canonical,
+    s.match_id_canonical                     AS match_id,
+    s.player_id_canonical                    AS player_id,
     s.team_side,
     s.rating,
     s.position,
@@ -65,7 +65,7 @@ SELECT
         s.match_id_canonical
         || '|' || s.player_id_canonical
         || '|' || s.team_side
-    ))))                                     AS rating_canonical,
+    ))))                                     AS rating_id,
     CAST('sofascore' AS varchar)             AS rating_source,
     CAST('v1'        AS varchar)             AS rating_version,
 

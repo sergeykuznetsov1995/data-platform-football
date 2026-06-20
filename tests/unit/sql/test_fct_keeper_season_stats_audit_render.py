@@ -62,7 +62,7 @@ class TestFctKeeperSeasonStatsAuditSql:
 
     def test_grain_pk_columns(self):
         sql = _read_sql()
-        for col in ['player_id_canonical', 'league', 'season']:
+        for col in ['player_id', 'league', 'season']:
             assert re.search(rf"\b{col}\b", sql)
 
     def test_audit_diff_columns(self):

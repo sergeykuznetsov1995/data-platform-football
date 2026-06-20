@@ -263,15 +263,15 @@ WHERE COALESCE(f.minutes, 0) >= 270"""
     # count (>= 5 matches) using a self-join CTE.
     v_player_rating = f"""\
 SELECT
-  fmr.player_id_canonical AS player_id,
-  COALESCE(dp.player_name, fmr.player_id_canonical) AS player_name,
+  fmr.player_id AS player_id,
+  COALESCE(dp.player_name, fmr.player_id) AS player_name,
   COALESCE(dp.primary_position, 'unknown') AS position,
   REGEXP_EXTRACT(COALESCE(dp.primary_position, ''), '^([A-Z]{{2}})') AS position_primary,
   fmr.rating,
   fmr.team_side
 FROM iceberg.gold.fct_match_rating fmr
 LEFT JOIN iceberg.gold.dim_player dp
-  ON dp.player_id = fmr.player_id_canonical
+  ON dp.player_id = fmr.player_id
 WHERE fmr.season = '{SEASON}'
   AND fmr.league = '{LEAGUE}'
   AND fmr.rating IS NOT NULL"""
@@ -297,7 +297,7 @@ xg_cte AS (
   GROUP BY player_id
 ),
 rating_cte AS (
-  -- avg_rating omitted: fct_match_rating.player_id_canonical is ss_* (SofaScore)
+  -- avg_rating omitted: fct_match_rating.player_id is ss_* (SofaScore)
   -- and silver.xref_player has NO sofascore rows yet (only fbref/understat/
   -- whoscored). No deterministic way to bridge ss_* to fb_*, so we'd produce
   -- 100% NULLs. The standalone "Топ-10 по среднему рейтингу SofaScore" slice

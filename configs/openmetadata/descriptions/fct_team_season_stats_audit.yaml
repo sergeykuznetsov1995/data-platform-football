@@ -12,7 +12,7 @@ table:
     primary spine). Для MODELED xG/xA diff'ы вычисляются между Understat
     (primary per RX2) и SofaScore — FBref не отдаёт xG на team-level.
 
-    Зерно: (team_id_canonical, league, season). INNER FBref ∩ Understat
+    Зерно: (team_id, league, season). INNER FBref ∩ Understat
     (Understat = primary secondary, 100% coverage APL). WhoScored/SofaScore/
     FotMob (#97) — LEFT JOIN → diff = NULL когда источник отсутствует. FotMob
     season-агрегаты недосчитаны (rollup только матчей со stats_json) → diff_fotmob
@@ -30,8 +30,8 @@ table:
     - Domain.Football
 columns:
   # ─── PK ───
-  - name: team_id_canonical
-    description: Канонический ID команды (PK part). FK → fct_team_season_stats.team_id (#428 parent переименован, audit сохраняет _canonical).
+  - name: team_id
+    description: Канонический ID команды (PK part). FK → fct_team_season_stats.team_id (#696 — и audit, и main fct на plain team_id).
   - name: league
     description: Лига (partition key).
   - name: season
@@ -115,7 +115,7 @@ columns:
     description: Технический timestamp создания строки в Gold-слое.
 
 relationships:
-  - from: team_id_canonical
+  - from: team_id
     to: trino_iceberg.iceberg.gold.fct_team_season_stats.team_id
     type: FOREIGN_KEY
     description: N:1 — business-витрина с тем же grain.

@@ -107,8 +107,8 @@ class TestStarGatePk:
         cases = {
             'star_pk[fct_player_salary(player_id,league,season)]':
                 ['player_id', 'league', 'season'],
-            'star_pk[fct_player_market_value(player_id_canonical,valuation_date,source)]':
-                ['player_id_canonical', 'valuation_date', 'source'],
+            'star_pk[fct_player_market_value(player_id,valuation_date,source)]':
+                ['player_id', 'valuation_date', 'source'],
             'star_pk[fct_player_fifa_rating(player_id,fifa_edition)]':
                 ['player_id', 'fifa_edition'],
         }

@@ -467,17 +467,17 @@ class TestFctMatchOddsBridge:
         _materialize_silver(duck_conn)
         out = _run_gold(duck_conn)
         for r in out:
-            assert r["odds_canonical"], r
+            assert r["odds_id"], r
             assert r["odds_source"] == "matchhistory", r
             assert r["odds_version"] == "v1", r
 
     def test_pk_uniqueness_per_match_book_market_closing(self, duck_conn):
-        """PK = (match, bookmaker, market, closing_flag) — odds_canonical unique."""
+        """PK = (match, bookmaker, market, closing_flag) — odds_id unique."""
         _seed_corpus(duck_conn)
         _materialize_silver(duck_conn)
         out = _run_gold(duck_conn)
-        pks = [r["odds_canonical"] for r in out]
+        pks = [r["odds_id"] for r in out]
         assert len(pks) == len(set(pks)), (
-            f"odds_canonical PK collision detected. Rows={len(pks)}, "
+            f"odds_id PK collision detected. Rows={len(pks)}, "
             f"distinct={len(set(pks))}"
         )

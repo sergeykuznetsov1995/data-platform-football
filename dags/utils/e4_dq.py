@@ -256,7 +256,7 @@ def _build_gold_fct_match_odds_checks() -> List[Check]:
     """DQ for ``iceberg.gold.fct_match_odds`` (E4.5).
 
     Passthrough from silver.matchhistory_match_odds.
-    PK = odds_canonical (xxhash64). Source ENUM = {'matchhistory'}.
+    PK = odds_id (xxhash64). Source ENUM = {'matchhistory'}.
 
     Odds bounds
     -----------
@@ -274,7 +274,7 @@ def _build_gold_fct_match_odds_checks() -> List[Check]:
 
         # PK uniqueness (ERROR).
         CHECK.no_duplicates(
-            table, pk=['odds_canonical'], severity='ERROR',
+            table, pk=['odds_id'], severity='ERROR',
         ),
 
         # NULL guards (ERROR). #426: gold columns renamed (match_id,
@@ -282,14 +282,14 @@ def _build_gold_fct_match_odds_checks() -> List[Check]:
         CHECK.no_nulls(
             table,
             cols=['match_id', 'bookmaker', 'market',
-                  'is_closing', 'odds_canonical', 'odds_source',
+                  'is_closing', 'odds_id', 'odds_source',
                   'odds_version'],
             severity='ERROR',
         ),
 
         # R0.4 canonical completeness.
         CHECK.canonical_completeness(
-            table, canonical_col='odds_canonical',
+            table, canonical_col='odds_id',
             severity='ERROR',
         ),
 
@@ -365,7 +365,7 @@ def _build_gold_fct_match_rating_checks() -> List[Check]:
     """DQ for ``iceberg.gold.fct_match_rating`` (E4.5).
 
     Passthrough from silver.sofascore_player_ratings. PK =
-    rating_canonical (xxhash64). Source ENUM = {'sofascore'}.
+    rating_id (xxhash64). Source ENUM = {'sofascore'}.
 
     Smoke-test status (May 2026): ~200 rows on 5 APL 2526 fixtures.
     Thresholds match the silver layer (50-row floor) — will be
@@ -378,20 +378,20 @@ def _build_gold_fct_match_rating_checks() -> List[Check]:
 
         # PK uniqueness (ERROR).
         CHECK.no_duplicates(
-            table, pk=['rating_canonical'], severity='ERROR',
+            table, pk=['rating_id'], severity='ERROR',
         ),
 
         # NULL guards (ERROR).
         CHECK.no_nulls(
             table,
-            cols=['match_id_canonical', 'team_side',
-                  'rating_canonical', 'rating_source', 'rating_version'],
+            cols=['match_id', 'team_side',
+                  'rating_id', 'rating_source', 'rating_version'],
             severity='ERROR',
         ),
 
         # R0.4 canonical completeness.
         CHECK.canonical_completeness(
-            table, canonical_col='rating_canonical',
+            table, canonical_col='rating_id',
             severity='ERROR',
         ),
 
@@ -415,7 +415,7 @@ def _build_gold_fct_match_rating_checks() -> List[Check]:
         CHECK.ref_integrity(
             child='gold.fct_match_rating',
             parent='gold.dim_player',
-            key='player_id_canonical',
+            key='player_id',
             parent_key='player_id',
             severity='WARNING',
         ),
@@ -424,7 +424,7 @@ def _build_gold_fct_match_rating_checks() -> List[Check]:
         CHECK.ref_integrity(
             child='gold.fct_match_rating',
             parent='gold.dim_match',
-            key='match_id_canonical',
+            key='match_id',
             parent_key='match_id',
             severity='WARNING',
         ),
