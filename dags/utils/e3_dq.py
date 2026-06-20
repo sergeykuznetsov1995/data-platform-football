@@ -829,6 +829,8 @@ def _build_fct_lineup_checks() -> List[Check]:
         the surviving count is small. Live 2026-06-20: 682 rows survived as
         lineup_source='sofascore' (of 15,189 SS lineup rows — the other ~14.5K
         deduped under FBref and supplied is_captain). Floor catches a dead branch.)
+      * fotmob ≥ 1000 (WARNING, #693 — same idea; live 2026-06-20: 2,378 rows
+        survived, 1,372 with a resolved player_id.)
     """
     table = 'iceberg.gold.fct_lineup'
 
@@ -919,6 +921,16 @@ def _build_fct_lineup_checks() -> List[Check]:
             where="lineup_source = 'sofascore'",
             severity='WARNING',
             name='sofascore_coverage_present',
+        ),
+        # FotMob as a full source (#693). Net contribution = FBref-gap rows that
+        # survive dedup. Live 2026-06-20: 2,378 survived (1,372 with a resolved
+        # player_id). Floor 1000 catches a dead branch. WARNING-only.
+        CHECK.row_count(
+            table=table,
+            min_rows=1_000,
+            where="lineup_source = 'fotmob'",
+            severity='WARNING',
+            name='fotmob_coverage_present',
         ),
 
         # Total volume — 380 APL matches/season × 22 lineup rows / (match × team)

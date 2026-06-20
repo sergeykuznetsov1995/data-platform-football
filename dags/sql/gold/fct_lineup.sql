@@ -1,7 +1,7 @@
 -- =============================================================================
 -- Gold: fct_lineup
 -- =============================================================================
--- Per-player lineup entries unified across FBref, ESPN and SofaScore (#693).
+-- Per-player lineup entries unified across FBref, ESPN, SofaScore, FotMob (#693).
 --
 -- Sources:
 --   iceberg.silver.fbref_match_lineups   — primary (complete coverage)
@@ -9,6 +9,9 @@
 --                                          real player_id (resolves via
 --                                          xref_player, unlike ESPN), native
 --                                          is_starter/is_captain/position
+--   iceberg.silver.fotmob_lineup         — full lineup source (#693): starters+
+--                                          subs from lineup_json; real player_id,
+--                                          is_starter + jersey; is_captain NULL
 --   iceberg.silver.espn_lineup           — secondary (E3.2 deliverable)
 --   iceberg.silver.xref_match            — match_id resolution (FBref-only in MVP)
 --   iceberg.silver.xref_team             — team alias canonicalisation
@@ -369,6 +372,52 @@ sofascore_resolved AS (
 ),
 
 -- ============================================================================
+-- 3c) FotMob source rows (#693) — full lineup parsed from lineup_json into
+--     silver.fotmob_lineup (starters + subs, both teams). Same resolution shape
+--     as SofaScore: real player_id via xref_player → cross-source dedup fires.
+--   * match_id via xref_match (source='fotmob', keyed on the bronze match_id),
+--     else 'fm_<id>' pseudo-id so FotMob-only matches still add coverage.
+--   * (league, season) predicate on BOTH xref JOINs — mandatory.
+--   * jersey_number IS available (FotMob shirtNumber); is_captain is NOT in
+--     lineup_json → NULL (enriched via the SofaScore captain bridge below).
+--   * position is the FotMob positionId CODE (varchar) for starters, NULL for
+--     subs (they hold no formation slot) — raw passthrough, dim_position deferred.
+-- ============================================================================
+fotmob_resolved AS (
+    SELECT
+        COALESCE(xm.canonical_id, 'fm_' || fl.match_id) AS match_id_canonical,
+        xt.canonical_id                                AS team_id_canonical,
+        xp.canonical_id                                AS player_id_canonical,
+        fl.player_name                                 AS player_name,
+        fl.is_starter                                  AS is_starter,
+        fl.position                                    AS position_canonical,
+        fl.jersey_number                               AS jersey_number,
+        fl.is_captain                                  AS is_captain,   -- always NULL in silver
+        fl._bronze_ingested_at                         AS _bronze_ingested_at,
+        fl.league                                      AS league,
+        fl.season                                      AS season,        -- #404 slug '2526'
+        'fotmob'                                       AS lineup_source,
+        3                                              AS source_priority,
+        fl.player_id                                   AS _raw_player_id_for_dedup
+    FROM iceberg.silver.fotmob_lineup fl
+    LEFT JOIN iceberg.silver.xref_match xm
+        ON  xm.source     = 'fotmob'
+       AND xm.source_id   = fl.match_id
+       AND xm.league      = fl.league
+       AND xm.season      = fl.season
+       AND xm.confidence <> 'orphan'
+    LEFT JOIN iceberg.silver.xref_team xt
+        ON  xt.source     = 'fotmob'
+       AND xt.source_id   = fl.team_name        -- xref_team source_id = team NAME
+       AND xt.league      = fl.league
+       AND xt.season      = fl.season
+       AND xt.confidence <> 'orphan'
+    LEFT JOIN xref_player_dedup xp
+        ON  xp.source     = 'fotmob'
+       AND xp.source_id   = fl.player_id
+),
+
+-- ============================================================================
 -- 4) UNION + dedup
 -- ============================================================================
 all_lineups AS (
@@ -377,6 +426,8 @@ all_lineups AS (
     SELECT * FROM espn_resolved
     UNION ALL
     SELECT * FROM sofascore_resolved
+    UNION ALL
+    SELECT * FROM fotmob_resolved
 ),
 
 dedup AS (

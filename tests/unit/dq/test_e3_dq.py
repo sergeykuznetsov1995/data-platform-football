@@ -84,20 +84,20 @@ class TestCheckCounts:
 
     def test_gold_e3_total_check_count(self):
         """Gold builders total: fct_event (11) + fct_shot (7) + fct_shot_audit (4,
-        #602) + fct_lineup (11) = 33.
+        #602) + fct_lineup (12) = 34.
 
         fct_event grew by 1 check in Task 2.1 — Phase B re-enabled the
         ``ref_integrity[fct_event.match_id_canonical -> silver.xref_match]``
         gate that was disabled during the v0_unbridged interim.
         fct_lineup grew by 1 in issue #242 — added the canon-spine
         ``ref_integrity[fct_lineup.fbref->dim_match]`` alt-hex guard — by 1
-        more in #439 (``is_captain_coverage_present``) — and by 1 more in #693
-        (``sofascore_coverage_present``).
+        more in #439 (``is_captain_coverage_present``) — and by 2 more in #693
+        (``sofascore_coverage_present`` + ``fotmob_coverage_present``).
         fct_shot_audit (#602): no_duplicates + no_nulls + coverage + xg_divergence.
         """
         checks = e3_dq.build_gold_e3_checks()
-        assert len(checks) == 33, (
-            f"Gold E3 expected 33 checks, got {len(checks)}: "
+        assert len(checks) == 34, (
+            f"Gold E3 expected 34 checks, got {len(checks)}: "
             f"{[c.name for c in checks]}"
         )
 
@@ -134,16 +134,16 @@ class TestCheckCounts:
             if c.params.get("table") == "iceberg.gold.fct_lineup"
             or c.params.get("child") == "gold.fct_lineup"
         ]
-        assert len(fct_lineup) == 11  # +1 sofascore_coverage_present (#693)
+        assert len(fct_lineup) == 12  # +sofascore +fotmob coverage (#693)
 
     def test_build_all_e3_checks_total(self):
-        """34 silver + 33 gold = 67 total E3 standard DQ checks.
+        """34 silver + 34 gold = 68 total E3 standard DQ checks.
 
         Bump when either ``build_silver_e3_checks`` (34) or
-        ``build_gold_e3_checks`` (33) gains a builder.
+        ``build_gold_e3_checks`` (34) gains a builder.
         """
         all_checks = e3_dq.build_all_e3_checks()
-        assert len(all_checks) == 67
+        assert len(all_checks) == 68
 
 
 # ===========================================================================
