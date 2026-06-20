@@ -67,9 +67,15 @@ WEEKLY_ARGS: Dict[str, Any] = {
 }
 
 # Silver layer transform arguments (SQL-only, no browser/scraper)
+# retries/retry_delay hardened (#728): heavy CTAS (e.g. whoscored_events_spadl)
+# can momentarily crash+restart Trino under memory pressure; a single 2-min
+# retry sometimes landed inside the restart window and the whole DAG failed.
+# Two retries at 5-min spacing absorb a Trino restart (~30-60s to healthy) so a
+# transient blip recovers instead of failing the run. Spill-to-disk
+# (configs/trino/config.properties) is the primary fix; this is the safety net.
 SILVER_ARGS: Dict[str, Any] = {
     **DEFAULT_ARGS,
-    'retries': 1,
-    'retry_delay': timedelta(minutes=2),
+    'retries': 2,
+    'retry_delay': timedelta(minutes=5),
     'execution_timeout': timedelta(minutes=30),
 }
