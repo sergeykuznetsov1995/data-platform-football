@@ -831,6 +831,8 @@ def _build_fct_lineup_checks() -> List[Check]:
         deduped under FBref and supplied is_captain). Floor catches a dead branch.)
       * fotmob ≥ 1000 (WARNING, #693 — same idea; live 2026-06-20: 2,378 rows
         survived, 1,372 with a resolved player_id.)
+      * whoscored ≥ 10 (WARNING, #693 — inferred lineup; ~99.8% dedup under
+        FBref, so only ~32 net rows survive live 2026-06-20. Low dead-branch floor.)
     """
     table = 'iceberg.gold.fct_lineup'
 
@@ -931,6 +933,17 @@ def _build_fct_lineup_checks() -> List[Check]:
             where="lineup_source = 'fotmob'",
             severity='WARNING',
             name='fotmob_coverage_present',
+        ),
+        # WhoScored as a full source (#693). Lineup is INFERRED from events
+        # (appeared & not subbed-on); its players resolve to FBref canonicals so
+        # ~99.8% dedup UNDER FBref — net survivors are tiny. Live 2026-06-20: 32
+        # rows. Low floor catches only a fully-dead branch. WARNING-only.
+        CHECK.row_count(
+            table=table,
+            min_rows=10,
+            where="lineup_source = 'whoscored'",
+            severity='WARNING',
+            name='whoscored_coverage_present',
         ),
 
         # Total volume — 380 APL matches/season × 22 lineup rows / (match × team)

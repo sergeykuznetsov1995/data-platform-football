@@ -1,7 +1,8 @@
 -- =============================================================================
 -- Gold: fct_lineup
 -- =============================================================================
--- Per-player lineup entries unified across FBref, ESPN, SofaScore, FotMob (#693).
+-- Per-player lineup entries unified across FBref, ESPN, SofaScore, FotMob,
+-- WhoScored (#693).
 --
 -- Sources:
 --   iceberg.silver.fbref_match_lineups   — primary (complete coverage)
@@ -12,6 +13,9 @@
 --   iceberg.silver.fotmob_lineup         — full lineup source (#693): starters+
 --                                          subs from lineup_json; real player_id,
 --                                          is_starter + jersey; is_captain NULL
+--   iceberg.silver.whoscored_lineup      — inferred lineup source (#693): real
+--                                          player_id + is_starter (appeared & not
+--                                          subbed-on); position/captain/jersey NULL
 --   iceberg.silver.espn_lineup           — secondary (E3.2 deliverable)
 --   iceberg.silver.xref_match            — match_id resolution (FBref-only in MVP)
 --   iceberg.silver.xref_team             — team alias canonicalisation
@@ -418,6 +422,51 @@ fotmob_resolved AS (
 ),
 
 -- ============================================================================
+-- 3d) WhoScored source rows (#693) — lineup INFERRED from the event stream
+--     (silver.whoscored_lineup): a player who appeared and was not subbed on
+--     started. Thinnest source: real player_id + is_starter only; position /
+--     is_captain / jersey_number are NOT derivable from WhoScored events → NULL.
+--   * match via xref_match (source='whoscored', source_id = WhoScored game_id),
+--     else 'ws_<id>' pseudo-id fallback.
+--   * team via xref_team (source_id = team NAME; silver already resolved the
+--     numeric team_id → name through whoscored_schedule).
+--   * (league, season) predicate on BOTH xref JOINs.
+-- ============================================================================
+whoscored_resolved AS (
+    SELECT
+        COALESCE(xm.canonical_id, 'ws_' || wl.match_id) AS match_id_canonical,
+        xt.canonical_id                                AS team_id_canonical,
+        xp.canonical_id                                AS player_id_canonical,
+        CAST(NULL AS varchar)                          AS player_name,
+        wl.is_starter                                  AS is_starter,
+        wl.position                                    AS position_canonical,  -- NULL
+        wl.jersey_number                               AS jersey_number,       -- NULL
+        wl.is_captain                                  AS is_captain,          -- NULL
+        wl._bronze_ingested_at                         AS _bronze_ingested_at,
+        wl.league                                      AS league,
+        wl.season                                      AS season,              -- slug '2526'
+        'whoscored'                                    AS lineup_source,
+        4                                              AS source_priority,
+        wl.player_id                                   AS _raw_player_id_for_dedup
+    FROM iceberg.silver.whoscored_lineup wl
+    LEFT JOIN iceberg.silver.xref_match xm
+        ON  xm.source     = 'whoscored'
+       AND xm.source_id   = wl.match_id
+       AND xm.league      = wl.league
+       AND xm.season      = wl.season
+       AND xm.confidence <> 'orphan'
+    LEFT JOIN iceberg.silver.xref_team xt
+        ON  xt.source     = 'whoscored'
+       AND xt.source_id   = wl.team_name        -- xref_team source_id = team NAME
+       AND xt.league      = wl.league
+       AND xt.season      = wl.season
+       AND xt.confidence <> 'orphan'
+    LEFT JOIN xref_player_dedup xp
+        ON  xp.source     = 'whoscored'
+       AND xp.source_id   = wl.player_id
+),
+
+-- ============================================================================
 -- 4) UNION + dedup
 -- ============================================================================
 all_lineups AS (
@@ -428,6 +477,8 @@ all_lineups AS (
     SELECT * FROM sofascore_resolved
     UNION ALL
     SELECT * FROM fotmob_resolved
+    UNION ALL
+    SELECT * FROM whoscored_resolved
 ),
 
 dedup AS (
