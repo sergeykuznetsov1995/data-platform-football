@@ -156,8 +156,12 @@ SELECT
     CASE WHEN team_id_numeric = home_team_id THEN home_team
          WHEN team_id_numeric = away_team_id THEN away_team END AS team_name,
     (team_id_numeric = home_team_id)         AS is_home,
-    -- FotMob player_stats_json has no captain/position block → NULL (parity).
+    -- FotMob player_stats_json has no captain/starter/position block → NULL
+    -- (parity with sofascore_player_match_aggregate). #693 added is_starter to
+    -- the SofaScore aggregate; real FotMob lineup data lives in a separate
+    -- silver.fotmob_lineup table (Phase 2), not this stats aggregate.
     CAST(NULL AS boolean)                    AS is_captain,
+    CAST(NULL AS boolean)                    AS is_starter,
     CAST(NULL AS varchar)                    AS position,
     CAST(NULL AS varchar)                    AS position_specific,
 

@@ -57,6 +57,12 @@ WITH all_lineups AS (
     SELECT * FROM fbref_resolved
     UNION ALL
     SELECT * FROM espn_resolved
+    UNION ALL
+    SELECT * FROM sofascore_resolved
+    UNION ALL
+    SELECT * FROM fotmob_resolved
+    UNION ALL
+    SELECT * FROM whoscored_resolved
 ),
 dedup AS (
     SELECT
@@ -86,6 +92,7 @@ SELECT
     is_starter,
     position_canonical,
     jersey_number,
+    is_captain,
     lineup_source,
     'v1'                          AS lineup_version,
     league,
@@ -103,6 +110,7 @@ _RESOLVED_COLUMNS = [
     "is_starter",
     "position_canonical",
     "jersey_number",
+    "is_captain",
     "_bronze_ingested_at",
     "league",
     "season",
@@ -143,6 +151,7 @@ def _fbref(
         "is_starter": is_starter,
         "position_canonical": position,
         "jersey_number": jersey_number,
+        "is_captain": None,  # FBref lineups carry no captaincy (bridge-enriched)
         "_bronze_ingested_at": ingested,
         "league": league,
         "season": season,
@@ -163,7 +172,11 @@ def _espn(
     league: str = "ENG-Premier League",
     season: str = "2526",
 ) -> Dict[str, Any]:
-    """Build an ESPN-resolved row (source_priority=2; player_id_canonical=NULL).
+    """Build an ESPN-resolved row (source_priority=5; player_id_canonical=NULL).
+
+    #693: ESPN moved from priority 2 to 5 (tail) when SofaScore/FotMob/WhoScored
+    were added as fuller sources. ESPN never wins dedup (NULL player_id), so the
+    exact tail value is immaterial — only that FBref(1) and SofaScore(2) precede it.
 
     Note (E3.5 R4 — 2026-05-08): ``season`` defaults to varchar '2526'
     matching the unified post-fix schema (was bigint pre-2026-05-08).
@@ -176,19 +189,137 @@ def _espn(
         "is_starter": is_starter,
         "position_canonical": position,
         "jersey_number": None,
+        "is_captain": None,  # ESPN matchsheet carries no captaincy
         "_bronze_ingested_at": ingested,
         "league": league,
         "season": season,
         "lineup_source": "espn",
-        "source_priority": 2,
+        "source_priority": 5,  # #693: ESPN parked at tail
         "_raw_player_id_for_dedup": player_name,
     }
 
 
+def _sofascore(
+    *,
+    match_id_canonical: str,
+    team_id_canonical: Optional[str] = "team_a",
+    player_id_canonical: Optional[str] = None,
+    is_starter: bool = True,
+    position: str = "F",
+    is_captain: Optional[bool] = None,
+    ingested: str = "2026-05-08 12:00:00",
+    league: str = "ENG-Premier League",
+    season: str = "2526",
+    raw_player_id: str = "ss_native_1",
+) -> Dict[str, Any]:
+    """Build a SofaScore-resolved row (source_priority=2; #693).
+
+    SofaScore resolves a REAL player_id_canonical via xref_player (unlike ESPN),
+    so cross-source dedup against FBref fires. is_captain is native here (from
+    the /lineups overlay). No jersey_number / player_name in the SS aggregate.
+    ``raw_player_id`` mirrors the native SofaScore player_id used as the dedup
+    fallback key when player_id_canonical is NULL.
+    """
+    return {
+        "match_id_canonical": match_id_canonical,
+        "team_id_canonical": team_id_canonical,
+        "player_id_canonical": player_id_canonical,
+        "player_name": None,  # SS aggregate has no player_name column
+        "is_starter": is_starter,
+        "position_canonical": position,
+        "jersey_number": None,
+        "is_captain": is_captain,
+        "_bronze_ingested_at": ingested,
+        "league": league,
+        "season": season,
+        "lineup_source": "sofascore",
+        "source_priority": 2,
+        "_raw_player_id_for_dedup": raw_player_id,
+    }
+
+
+def _fotmob(
+    *,
+    match_id_canonical: str,
+    team_id_canonical: Optional[str] = "team_a",
+    player_id_canonical: Optional[str] = None,
+    is_starter: bool = True,
+    position: str = "11",
+    jersey_number: Optional[int] = 7,
+    ingested: str = "2026-05-08 12:00:00",
+    league: str = "ENG-Premier League",
+    season: str = "2526",
+    raw_player_id: str = "fm_native_1",
+) -> Dict[str, Any]:
+    """Build a FotMob-resolved row (source_priority=3; #693).
+
+    FotMob resolves a real player_id and carries jersey_number (shirtNumber) +
+    is_starter; is_captain is NULL (lineup_json has no captaincy). position is
+    the FotMob positionId CODE as varchar.
+    """
+    return {
+        "match_id_canonical": match_id_canonical,
+        "team_id_canonical": team_id_canonical,
+        "player_id_canonical": player_id_canonical,
+        "player_name": None,
+        "is_starter": is_starter,
+        "position_canonical": position,
+        "jersey_number": jersey_number,
+        "is_captain": None,
+        "_bronze_ingested_at": ingested,
+        "league": league,
+        "season": season,
+        "lineup_source": "fotmob",
+        "source_priority": 3,
+        "_raw_player_id_for_dedup": raw_player_id,
+    }
+
+
+def _whoscored(
+    *,
+    match_id_canonical: str,
+    team_id_canonical: Optional[str] = "team_a",
+    player_id_canonical: Optional[str] = None,
+    is_starter: bool = True,
+    ingested: str = "2026-05-08 12:00:00",
+    league: str = "ENG-Premier League",
+    season: str = "2526",
+    raw_player_id: str = "ws_native_1",
+) -> Dict[str, Any]:
+    """Build a WhoScored-resolved row (source_priority=4; #693).
+
+    Thinnest source: real player_id + is_starter (inferred) only — position,
+    is_captain, jersey_number are all NULL (WhoScored events have no lineup block).
+    """
+    return {
+        "match_id_canonical": match_id_canonical,
+        "team_id_canonical": team_id_canonical,
+        "player_id_canonical": player_id_canonical,
+        "player_name": None,
+        "is_starter": is_starter,
+        "position_canonical": None,
+        "jersey_number": None,
+        "is_captain": None,
+        "_bronze_ingested_at": ingested,
+        "league": league,
+        "season": season,
+        "lineup_source": "whoscored",
+        "source_priority": 4,
+        "_raw_player_id_for_dedup": raw_player_id,
+    }
+
+
 def _seed_resolved(con, fbref_rows: List[Dict[str, Any]],
-                   espn_rows: List[Dict[str, Any]]) -> None:
-    """Recreate the two resolved CTEs as physical tables."""
-    for tbl in ("fbref_resolved", "espn_resolved"):
+                   espn_rows: List[Dict[str, Any]],
+                   sofascore_rows: Optional[List[Dict[str, Any]]] = None,
+                   fotmob_rows: Optional[List[Dict[str, Any]]] = None,
+                   whoscored_rows: Optional[List[Dict[str, Any]]] = None) -> None:
+    """Recreate the resolved CTEs as physical tables (all 5 sources)."""
+    sofascore_rows = sofascore_rows or []
+    fotmob_rows = fotmob_rows or []
+    whoscored_rows = whoscored_rows or []
+    for tbl in ("fbref_resolved", "espn_resolved", "sofascore_resolved",
+                "fotmob_resolved", "whoscored_resolved"):
         con.execute(f"DROP TABLE IF EXISTS {tbl}")
         con.execute(
             f"""
@@ -200,6 +331,7 @@ def _seed_resolved(con, fbref_rows: List[Dict[str, Any]],
                 is_starter                  BOOLEAN,
                 position_canonical          VARCHAR,
                 jersey_number               INTEGER,
+                is_captain                  BOOLEAN,
                 _bronze_ingested_at         TIMESTAMP,
                 league                      VARCHAR,
                 season                      VARCHAR,
@@ -224,6 +356,21 @@ def _seed_resolved(con, fbref_rows: List[Dict[str, Any]],
     for r in espn_rows:
         con.execute(
             insert_template.format(tbl="espn_resolved"),
+            [r[c] for c in _RESOLVED_COLUMNS],
+        )
+    for r in sofascore_rows:
+        con.execute(
+            insert_template.format(tbl="sofascore_resolved"),
+            [r[c] for c in _RESOLVED_COLUMNS],
+        )
+    for r in fotmob_rows:
+        con.execute(
+            insert_template.format(tbl="fotmob_resolved"),
+            [r[c] for c in _RESOLVED_COLUMNS],
+        )
+    for r in whoscored_rows:
+        con.execute(
+            insert_template.format(tbl="whoscored_resolved"),
             [r[c] for c in _RESOLVED_COLUMNS],
         )
 
@@ -322,6 +469,92 @@ class TestDedupPriority:
         assert all(r["lineup_source"] == "espn" for r in out)
         assert all(r["player_id_canonical"] is None for r in out)
 
+    def test_fbref_wins_over_sofascore_same_canonical(self, duck_conn):
+        """#693: same (match, player_id_canonical) in FBref + SofaScore →
+        FBref wins on source_priority (1 < 2), even though SofaScore is fresher.
+        Unlike ESPN, SofaScore HAS a real canonical so the dedup actually fires.
+        """
+        fbref = [_fbref(
+            match_id_canonical="MX", player_id_canonical="fb_Z",
+            player_name="Z", ingested="2026-05-01 12:00:00",
+        )]
+        sofa = [_sofascore(
+            match_id_canonical="MX", player_id_canonical="fb_Z",
+            is_captain=True, ingested="2026-05-08 12:00:00",  # newer, still loses
+        )]
+        _seed_resolved(duck_conn, fbref, [], sofa)
+        out = _run_dedup(duck_conn)
+        assert len(out) == 1, out
+        assert out[0]["lineup_source"] == "fbref", out
+        assert out[0]["player_id_canonical"] == "fb_Z", out
+
+    def test_sofascore_beats_espn(self, duck_conn):
+        """#693: SofaScore (priority 2) outranks ESPN (priority 5) when both
+        resolve to the same canonical (forward-looking — ESPN canonical is NULL
+        today, so we force it here to lock the ordering)."""
+        sofa = [_sofascore(
+            match_id_canonical="ME", player_id_canonical="fb_Q",
+            ingested="2026-05-01 12:00:00",
+        )]
+        espn = [_espn(match_id_canonical="ME", player_name="Q",
+                      ingested="2026-05-08 12:00:00")]
+        espn[0]["player_id_canonical"] = "fb_Q"
+        _seed_resolved(duck_conn, [], espn, sofa)
+        out = _run_dedup(duck_conn)
+        assert len(out) == 1, out
+        assert out[0]["lineup_source"] == "sofascore", out
+
+    def test_priority_order_fbref_sofascore_fotmob(self, duck_conn):
+        """#693: all four sources on the same canonical (match, player) →
+        FBref(1) > SofaScore(2) > FotMob(3) > ESPN(5). FBref must win."""
+        cid = "fb_W"
+        fbref = [_fbref(match_id_canonical="MP", player_id_canonical=cid,
+                        player_name="W")]
+        sofa = [_sofascore(match_id_canonical="MP", player_id_canonical=cid)]
+        fot = [_fotmob(match_id_canonical="MP", player_id_canonical=cid)]
+        espn = [_espn(match_id_canonical="MP", player_name="W")]
+        espn[0]["player_id_canonical"] = cid
+        _seed_resolved(duck_conn, fbref, espn, sofa, fot)
+        out = _run_dedup(duck_conn)
+        assert len(out) == 1, out
+        assert out[0]["lineup_source"] == "fbref", out
+
+    def test_fotmob_beats_espn(self, duck_conn):
+        """FotMob(3) outranks ESPN(5) on a shared canonical."""
+        cid = "fb_V"
+        fot = [_fotmob(match_id_canonical="MV2", player_id_canonical=cid,
+                       ingested="2026-05-01 12:00:00")]
+        espn = [_espn(match_id_canonical="MV2", player_name="V",
+                      ingested="2026-05-08 12:00:00")]
+        espn[0]["player_id_canonical"] = cid
+        _seed_resolved(duck_conn, [], espn, [], fot)
+        out = _run_dedup(duck_conn)
+        assert len(out) == 1, out
+        assert out[0]["lineup_source"] == "fotmob", out
+
+    def test_fotmob_beats_whoscored(self, duck_conn):
+        """FotMob(3) outranks WhoScored(4) on a shared canonical (#693)."""
+        cid = "fb_U"
+        fot = [_fotmob(match_id_canonical="MU", player_id_canonical=cid)]
+        ws = [_whoscored(match_id_canonical="MU", player_id_canonical=cid)]
+        _seed_resolved(duck_conn, [], [], None, fot, ws)
+        out = _run_dedup(duck_conn)
+        assert len(out) == 1, out
+        assert out[0]["lineup_source"] == "fotmob", out
+
+    def test_whoscored_beats_espn(self, duck_conn):
+        """WhoScored(4) outranks ESPN(5) on a shared canonical."""
+        cid = "fb_T"
+        ws = [_whoscored(match_id_canonical="MT", player_id_canonical=cid,
+                         ingested="2026-05-01 12:00:00")]
+        espn = [_espn(match_id_canonical="MT", player_name="T",
+                      ingested="2026-05-08 12:00:00")]
+        espn[0]["player_id_canonical"] = cid
+        _seed_resolved(duck_conn, [], espn, None, None, ws)
+        out = _run_dedup(duck_conn)
+        assert len(out) == 1, out
+        assert out[0]["lineup_source"] == "whoscored", out
+
 
 class TestSourceCoverage:
     """FBref-only / ESPN-only matches retain all their rows."""
@@ -375,6 +608,48 @@ class TestSourceCoverage:
         names = sorted(r["player_name"] for r in out)
         assert names == ["Unresolved 1", "Unresolved 2"]
 
+    def test_sofascore_only_match_keeps_ss_rows(self, duck_conn):
+        """#693: a match SofaScore covers but FBref/ESPN don't → SS rows survive
+        with a resolved player_id_canonical (the value-add over ESPN's NULL)."""
+        sofa = [
+            _sofascore(match_id_canonical="M_SS", player_id_canonical="fb_a",
+                       raw_player_id="111"),
+            _sofascore(match_id_canonical="M_SS", player_id_canonical="fb_b",
+                       raw_player_id="222"),
+        ]
+        _seed_resolved(duck_conn, [], [], sofa)
+        out = _run_dedup(duck_conn)
+        assert len(out) == 2, out
+        assert all(r["lineup_source"] == "sofascore" for r in out)
+        assert sorted(r["player_id_canonical"] for r in out) == ["fb_a", "fb_b"]
+
+    def test_sofascore_orphan_players_kept_distinct(self, duck_conn):
+        """Two SofaScore players with NULL canonical in the same match must NOT
+        collapse — dedup key falls back to (source || team || native_id)."""
+        # Distinct positions make the two rows distinguishable in the projection;
+        # the dedup key still falls back to (source || team || native_id).
+        sofa = [
+            _sofascore(match_id_canonical="M_SS2", player_id_canonical=None,
+                       raw_player_id="111", position="GK"),
+            _sofascore(match_id_canonical="M_SS2", player_id_canonical=None,
+                       raw_player_id="222", position="ST"),
+        ]
+        _seed_resolved(duck_conn, [], [], sofa)
+        out = _run_dedup(duck_conn)
+        assert len(out) == 2, out  # NOT collapsed by shared NULL canonical
+        assert all(r["lineup_source"] == "sofascore" for r in out)
+        assert sorted(r["position_canonical"] for r in out) == ["GK", "ST"]
+
+    def test_sofascore_native_captain_survives(self, duck_conn):
+        """#693: on an SS-only match the native is_captain is projected (the
+        final SQL COALESCEs native first, then the #439 bridge)."""
+        sofa = [_sofascore(match_id_canonical="M_SS3",
+                           player_id_canonical="fb_cap", is_captain=True)]
+        _seed_resolved(duck_conn, [], [], sofa)
+        out = _run_dedup(duck_conn)
+        assert len(out) == 1, out
+        assert out[0]["is_captain"] is True, out
+
 
 class TestProjection:
     """Output schema invariants."""
@@ -387,14 +662,19 @@ class TestProjection:
         out = _run_dedup(duck_conn)
         assert all(r["lineup_version"] == "v1" for r in out)
 
-    def test_lineup_source_enum_only_fbref_or_espn(self, duck_conn):
+    def test_lineup_source_enum_all_five(self, duck_conn):
         fbref = [_fbref(match_id_canonical="MS", player_id_canonical="fb_p",
                         player_name="A")]
         espn = [_espn(match_id_canonical="MS2", player_name="B")]
-        _seed_resolved(duck_conn, fbref, espn)
+        sofa = [_sofascore(match_id_canonical="MS3", player_id_canonical="fb_c")]
+        fot = [_fotmob(match_id_canonical="MS4", player_id_canonical="fb_d")]
+        ws = [_whoscored(match_id_canonical="MS5", player_id_canonical="fb_e")]
+        _seed_resolved(duck_conn, fbref, espn, sofa, fot, ws)
         out = _run_dedup(duck_conn)
         srcs = {r["lineup_source"] for r in out}
-        assert srcs <= {"fbref", "espn"}, f"unexpected source labels: {srcs}"
+        assert srcs <= {"fbref", "espn", "sofascore", "fotmob", "whoscored"}, (
+            f"unexpected source labels: {srcs}"
+        )
 
     def test_null_match_id_canonical_filtered_out(self, duck_conn):
         """WHERE match_id_canonical IS NOT NULL drops orphan rows."""
@@ -468,6 +748,8 @@ _ICEBERG_TO_LOCAL = {
     "iceberg.silver.xref_player":            "silver_xref_player",
     "iceberg.silver.sofascore_player_match_aggregate":
         "silver_sofascore_player_match_aggregate",
+    "iceberg.silver.fotmob_lineup":          "silver_fotmob_lineup",
+    "iceberg.silver.whoscored_lineup":       "silver_whoscored_lineup",
 }
 
 
@@ -563,9 +845,28 @@ def bridge_conn(duck_conn):
         "league VARCHAR, season VARCHAR, confidence VARCHAR)"
     )
     duck_conn.execute(
+        # #693: sofascore_resolved reads team_name/is_starter/position/
+        # is_captain/_bronze_ingested_at on top of the #439 captain columns.
         "CREATE TABLE silver_sofascore_player_match_aggregate "
-        "(match_id VARCHAR, player_id VARCHAR, league VARCHAR, season VARCHAR, "
-        "is_captain BOOLEAN)"
+        "(match_id VARCHAR, player_id VARCHAR, team_name VARCHAR, "
+        "is_starter BOOLEAN, position VARCHAR, is_captain BOOLEAN, "
+        "_bronze_ingested_at TIMESTAMP, league VARCHAR, season VARCHAR)"
+    )
+    duck_conn.execute(
+        # #693: FotMob lineup source (fotmob_resolved reads these columns).
+        "CREATE TABLE silver_fotmob_lineup "
+        "(match_id VARCHAR, player_id VARCHAR, player_name VARCHAR, "
+        "team_name VARCHAR, is_home BOOLEAN, is_starter BOOLEAN, "
+        "is_captain BOOLEAN, position VARCHAR, jersey_number INTEGER, "
+        "_bronze_ingested_at TIMESTAMP, league VARCHAR, season VARCHAR)"
+    )
+    duck_conn.execute(
+        # #693: WhoScored inferred lineup (whoscored_resolved reads these).
+        "CREATE TABLE silver_whoscored_lineup "
+        "(match_id VARCHAR, player_id VARCHAR, team_name VARCHAR, "
+        "is_starter BOOLEAN, is_captain BOOLEAN, position VARCHAR, "
+        "jersey_number INTEGER, _bronze_ingested_at TIMESTAMP, "
+        "league VARCHAR, season VARCHAR)"
     )
     duck_conn.execute(
         "CREATE TABLE silver_xref_team (source VARCHAR, source_id VARCHAR, "
@@ -803,8 +1104,9 @@ class TestCaptainEnrichment:
             [_LEAGUE, _SEASON],
         )
         con.execute(
-            "INSERT INTO silver_sofascore_player_match_aggregate VALUES "
-            "('ss1', 'ssp', ?, ?, ?)",
+            "INSERT INTO silver_sofascore_player_match_aggregate "
+            "(match_id, player_id, league, season, is_captain) "
+            "VALUES ('ss1', 'ssp', ?, ?, ?)",
             [_LEAGUE, _SEASON, is_captain],
         )
 
@@ -832,28 +1134,233 @@ class TestCaptainEnrichment:
         assert out[0]["is_captain"] is None, out
 
 
+class TestSofaScoreSource:
+    """#693: SofaScore is a FULL lineup source now, not just the #439 captain
+    overlay. A SofaScore-covered match contributes rows carrying a resolved
+    player_id (the value-add over ESPN's NULL) plus native is_starter /
+    is_captain / position. Exercised through the real fct_lineup.sql.
+    """
+
+    def _seed(self, con, *, is_starter, is_captain) -> None:
+        con.execute(
+            "INSERT INTO silver_xref_match VALUES "
+            "('sofascore', 'ss9', 'ss_canon_match', ?, ?, 'date_team_match')",
+            [_LEAGUE, _SEASON],
+        )
+        con.execute(
+            "INSERT INTO silver_xref_team VALUES "
+            "('sofascore', 'Liverpool', 'liverpool', ?, ?, 'name_alias')",
+            [_LEAGUE, _SEASON],
+        )
+        con.execute(
+            "INSERT INTO silver_xref_player VALUES "
+            "('sofascore', 'ssp9', 'fb_ss9', ?, ?)",
+            [_LEAGUE, _SEASON],
+        )
+        con.execute(
+            "INSERT INTO silver_sofascore_player_match_aggregate "
+            "(match_id, player_id, team_name, is_starter, position, is_captain, "
+            "league, season) "
+            "VALUES ('ss9', 'ssp9', 'Liverpool', ?, 'F', ?, ?, ?)",
+            [is_starter, is_captain, _LEAGUE, _SEASON],
+        )
+
+    def test_sofascore_only_row_resolves_with_real_ids(self, bridge_conn):
+        self._seed(bridge_conn, is_starter=True, is_captain=True)
+        out = _run_lineup_gold(bridge_conn)
+        assert len(out) == 1, out
+        r = out[0]
+        assert r["lineup_source"] == "sofascore", r
+        assert r["match_id"] == "ss_canon_match", r
+        assert r["player_id"] == "fb_ss9", r          # resolved, NOT NULL (vs ESPN)
+        assert r["team_id"] == "liverpool", r
+        assert r["is_starter"] is True, r
+        assert r["is_captain"] is True, r             # native captain
+        assert r["jersey_number"] is None, r          # SofaScore has no jersey
+
+    def test_sofascore_substitute_is_not_starter(self, bridge_conn):
+        self._seed(bridge_conn, is_starter=False, is_captain=False)
+        out = _run_lineup_gold(bridge_conn)
+        assert len(out) == 1, out
+        assert out[0]["is_starter"] is False, out
+        assert out[0]["is_captain"] is False, out
+
+    def test_fbref_wins_over_sofascore_full_sql(self, bridge_conn):
+        """When FBref and SofaScore both cover the same canonical (match, player)
+        the FBref row wins dedup; SofaScore still supplies is_captain via the
+        bridge (COALESCE native, bridge)."""
+        # FBref side: player p99 -> fb_p99 at the FBref hex match.
+        bridge_conn.execute(
+            """
+            INSERT INTO silver_fbref_match_lineups VALUES
+              (?, 'Liverpool', 'Mo Salah', 'p99', TRUE, 'F', 11, ?, ?,
+               TIMESTAMP '2026-02-01 06:00:00')
+            """,
+            [_FB_HEX, _LEAGUE, _SEASON],
+        )
+        bridge_conn.execute(
+            "INSERT INTO silver_xref_team VALUES "
+            "('fbref', 'Liverpool', 'liverpool', ?, ?, 'name_alias')",
+            [_LEAGUE, _SEASON],
+        )
+        bridge_conn.execute(
+            "INSERT INTO silver_xref_player VALUES ('fbref', 'p99', 'fb_p99', ?, ?)",
+            [_LEAGUE, _SEASON],
+        )
+        # SofaScore side: match ss1 -> SAME hex; player ssp -> SAME fb_p99.
+        bridge_conn.execute(
+            "INSERT INTO silver_xref_match VALUES "
+            "('sofascore', 'ss1', ?, ?, ?, 'date_team_match')",
+            [_FB_HEX, _LEAGUE, _SEASON],
+        )
+        bridge_conn.execute(
+            "INSERT INTO silver_xref_player VALUES ('sofascore', 'ssp', 'fb_p99', ?, ?)",
+            [_LEAGUE, _SEASON],
+        )
+        bridge_conn.execute(
+            "INSERT INTO silver_sofascore_player_match_aggregate "
+            "(match_id, player_id, team_name, is_starter, position, is_captain, "
+            "league, season) "
+            "VALUES ('ss1', 'ssp', 'Liverpool', TRUE, 'F', TRUE, ?, ?)",
+            [_LEAGUE, _SEASON],
+        )
+        out = _run_lineup_gold(bridge_conn)
+        assert len(out) == 1, out                       # deduped, not 2 rows
+        assert out[0]["lineup_source"] == "fbref", out  # FBref priority wins
+        assert out[0]["player_id"] == "fb_p99", out
+        assert out[0]["jersey_number"] == 11, out       # FBref schema richer
+        assert out[0]["is_captain"] is True, out        # from SofaScore (native→bridge)
+
+
+class TestFotmobSource:
+    """#693: FotMob as a full lineup source. A FotMob-covered match contributes
+    rows with a resolved player_id, is_starter, and jersey_number (shirtNumber);
+    is_captain is NULL (lineup_json has no captaincy). Real fct_lineup.sql."""
+
+    def _seed(self, con, *, is_starter, jersey) -> None:
+        con.execute(
+            "INSERT INTO silver_xref_match VALUES "
+            "('fotmob', 'fm9', 'fm_canon_match', ?, ?, 'date_team_match')",
+            [_LEAGUE, _SEASON],
+        )
+        con.execute(
+            "INSERT INTO silver_xref_team VALUES "
+            "('fotmob', 'Liverpool', 'liverpool', ?, ?, 'name_alias')",
+            [_LEAGUE, _SEASON],
+        )
+        con.execute(
+            "INSERT INTO silver_xref_player VALUES "
+            "('fotmob', 'fmp9', 'fb_fm9', ?, ?)",
+            [_LEAGUE, _SEASON],
+        )
+        con.execute(
+            "INSERT INTO silver_fotmob_lineup "
+            "(match_id, player_id, player_name, team_name, is_home, is_starter, "
+            "is_captain, position, jersey_number, league, season) "
+            "VALUES ('fm9', 'fmp9', 'Mo Salah', 'Liverpool', true, ?, NULL, "
+            "'11', ?, ?, ?)",
+            [is_starter, jersey, _LEAGUE, _SEASON],
+        )
+
+    def test_fotmob_only_row_resolves_with_jersey(self, bridge_conn):
+        self._seed(bridge_conn, is_starter=True, jersey=11)
+        out = _run_lineup_gold(bridge_conn)
+        assert len(out) == 1, out
+        r = out[0]
+        assert r["lineup_source"] == "fotmob", r
+        assert r["match_id"] == "fm_canon_match", r
+        assert r["player_id"] == "fb_fm9", r            # resolved
+        assert r["team_id"] == "liverpool", r
+        assert r["is_starter"] is True, r
+        assert r["jersey_number"] == 11, r              # FotMob shirtNumber
+        assert r["is_captain"] is None, r               # no captaincy in lineup_json
+
+    def test_fotmob_sub_is_not_starter(self, bridge_conn):
+        self._seed(bridge_conn, is_starter=False, jersey=30)
+        out = _run_lineup_gold(bridge_conn)
+        assert len(out) == 1, out
+        assert out[0]["is_starter"] is False, out
+
+
+class TestWhoscoredSource:
+    """#693: WhoScored as a (thin) full lineup source — real player_id +
+    inferred is_starter; position/captain/jersey NULL. Real fct_lineup.sql."""
+
+    def _seed(self, con, *, is_starter) -> None:
+        con.execute(
+            "INSERT INTO silver_xref_match VALUES "
+            "('whoscored', 'ws9', 'ws_canon_match', ?, ?, 'date_team_match')",
+            [_LEAGUE, _SEASON],
+        )
+        con.execute(
+            "INSERT INTO silver_xref_team VALUES "
+            "('whoscored', 'Liverpool', 'liverpool', ?, ?, 'name_alias')",
+            [_LEAGUE, _SEASON],
+        )
+        con.execute(
+            "INSERT INTO silver_xref_player VALUES "
+            "('whoscored', 'wsp9', 'fb_ws9', ?, ?)",
+            [_LEAGUE, _SEASON],
+        )
+        con.execute(
+            "INSERT INTO silver_whoscored_lineup "
+            "(match_id, player_id, team_name, is_starter, is_captain, position, "
+            "jersey_number, league, season) "
+            "VALUES ('ws9', 'wsp9', 'Liverpool', ?, NULL, NULL, NULL, ?, ?)",
+            [is_starter, _LEAGUE, _SEASON],
+        )
+
+    def test_whoscored_only_row_resolves(self, bridge_conn):
+        self._seed(bridge_conn, is_starter=True)
+        out = _run_lineup_gold(bridge_conn)
+        assert len(out) == 1, out
+        r = out[0]
+        assert r["lineup_source"] == "whoscored", r
+        assert r["match_id"] == "ws_canon_match", r
+        assert r["player_id"] == "fb_ws9", r           # resolved (better than ESPN NULL)
+        assert r["team_id"] == "liverpool", r
+        assert r["is_starter"] is True, r
+        assert r["position"] is None, r                 # not derivable from events
+        assert r["is_captain"] is None, r
+        assert r["jersey_number"] is None, r
+
+    def test_whoscored_subbed_on_is_not_starter(self, bridge_conn):
+        self._seed(bridge_conn, is_starter=False)
+        out = _run_lineup_gold(bridge_conn)
+        assert len(out) == 1, out
+        assert out[0]["is_starter"] is False, out
+
+
 class TestSqlInvariants:
     """Lock the SQL-text invariants that this behavioural harness CANNOT see."""
 
     def _sql(self) -> str:
         return SQL_PATH.read_text(encoding="utf-8")
 
-    def test_fbref_priority_one_espn_priority_two_in_sql(self):
-        """The two source_priority literals are the load-bearing constants."""
+    def test_source_priority_literals_in_sql(self):
+        """The source_priority literals are the load-bearing dedup constants:
+        FBref=1, SofaScore=2, ESPN=5 (#693). Strip block comments to avoid
+        commentary false-positives."""
         sql = self._sql()
-        # source_priority=1 for FBref CTE (fbref_resolved), 2 for ESPN.
-        # Strip block comments to avoid commentary false-positives.
         non_comment = "\n".join(
             line for line in sql.splitlines()
             if not line.lstrip().startswith("--")
         )
-        # FBref CTE must contain ``1 ... AS source_priority``.
         assert re.search(
             r"\b1\b\s+AS\s+source_priority", non_comment, re.IGNORECASE
         ), "fbref_resolved CTE must emit `1 AS source_priority`"
         assert re.search(
             r"\b2\b\s+AS\s+source_priority", non_comment, re.IGNORECASE
-        ), "espn_resolved CTE must emit `2 AS source_priority`"
+        ), "sofascore_resolved CTE must emit `2 AS source_priority`"
+        assert re.search(
+            r"\b3\b\s+AS\s+source_priority", non_comment, re.IGNORECASE
+        ), "fotmob_resolved CTE must emit `3 AS source_priority`"
+        assert re.search(
+            r"\b4\b\s+AS\s+source_priority", non_comment, re.IGNORECASE
+        ), "whoscored_resolved CTE must emit `4 AS source_priority`"
+        assert re.search(
+            r"\b5\b\s+AS\s+source_priority", non_comment, re.IGNORECASE
+        ), "espn_resolved CTE must emit `5 AS source_priority` (#693 tail)"
 
     def test_order_by_priority_then_freshness_in_sql(self):
         """Dedup ordering: source_priority ASC, _bronze_ingested_at DESC."""
@@ -879,14 +1386,10 @@ class TestSqlInvariants:
             "expected literal 'v1' for lineup_version (R0.4 schema versioning)"
         )
 
-    def test_lineup_source_literals_only_fbref_and_espn(self):
-        """Only 'fbref' and 'espn' should appear as lineup_source literal values."""
+    def test_lineup_source_literals_all_five(self):
+        """fbref / espn / sofascore / fotmob / whoscored lineup_source CTEs (#693)."""
         sql = self._sql()
-        # ``'fbref' AS lineup_source`` and ``'espn' AS lineup_source``
-        # are the two CTE projections.
-        assert re.search(
-            r"'fbref'\s+AS\s+lineup_source", sql, re.IGNORECASE
-        ), "missing `'fbref' AS lineup_source`"
-        assert re.search(
-            r"'espn'\s+AS\s+lineup_source", sql, re.IGNORECASE
-        ), "missing `'espn' AS lineup_source`"
+        for src in ("fbref", "espn", "sofascore", "fotmob", "whoscored"):
+            assert re.search(
+                rf"'{src}'\s+AS\s+lineup_source", sql, re.IGNORECASE
+            ), f"missing `'{src}' AS lineup_source`"

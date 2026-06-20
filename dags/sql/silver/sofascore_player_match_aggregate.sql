@@ -59,6 +59,20 @@ SELECT
         WHEN captain = 'False' THEN false
         ELSE NULL
     END                                    AS is_captain,
+    -- is_starter (#693): bronze.substitute is varchar 'True'/'False' from the
+    -- same /lineups overlay (#301; scraper.py overlay → real bool stored as
+    -- text). A starter == NOT a substitute. Conform via CASE, NOT
+    -- TRY_CAST(boolean) which would silently NULL the capitalised literals.
+    -- NULL = lineup overlay missed for this row.
+    -- Coverage note: bronze.sofascore_event_player_stats only carries players
+    -- with a statistics block (starters + subs who came on) — unused bench
+    -- players are absent, so SofaScore lineup ⊂ FBref matchsheet. fct_lineup
+    -- keeps FBref primary; SofaScore adds rows where FBref is missing (#693).
+    CASE
+        WHEN substitute = 'False' THEN true
+        WHEN substitute = 'True'  THEN false
+        ELSE NULL
+    END                                    AS is_starter,
     position,
     position_specific,
 
