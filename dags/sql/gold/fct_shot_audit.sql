@@ -99,9 +99,6 @@ SELECT
     -- ========= coverage flag =========
     (ss.match_id IS NOT NULL)                            AS has_sofascore,
 
-    -- ========= Lineage =========
-    CURRENT_TIMESTAMP                                    AS _gold_created_at,
-
     -- ========= Partition keys (LAST) =========
     us.league,
     us.season
