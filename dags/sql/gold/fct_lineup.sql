@@ -169,6 +169,23 @@ xref_player_dedup AS (
     FROM iceberg.silver.xref_player
     GROUP BY source, source_id
 ),
+-- #729: Collapse silver.xref_team (PK source, source_id, league, season) to one
+-- row per (source, source_id, league) so the FBref team JOIN below stays
+-- season-agnostic — mirrors xref_team_dedup in fct_shot.sql. WHY: xref_team
+-- carries a team's SHORT name ('Tottenham') only for the season(s) the bronze
+-- schedule emitted it (currently 2526); older seasons hold only the FULL name
+-- ('Tottenham Hotspur'). fbref_match_lineups.team uses the short spelling for
+-- 1617/2425, so a season-keyed JOIN missed 2967 rows → NULL team_id, breaking
+-- the no_nulls(team_id) ERROR gate. canonical_id is season-stable (alias mapping
+-- doesn't change across years; 0 fbref source_id maps to >1 canonical), so
+-- ARBITRARY is safe and the season key is unnecessary. confidence='orphan'
+-- excluded here so the JOIN never leaks a 'fb_<slug>' pseudo-canonical (#506).
+xref_team_dedup AS (
+    SELECT source, source_id, league, ARBITRARY(canonical_id) AS canonical_id
+    FROM iceberg.silver.xref_team
+    WHERE confidence <> 'orphan'
+    GROUP BY source, source_id, league
+),
 -- #461: bronze.espn_schedule re-ingests of the same game must collapse to the
 -- freshest row BEFORE the bridge — a stale duplicate whose team spelling /
 -- date no longer resolves produces a second bridge row with
@@ -265,12 +282,15 @@ fbref_resolved AS (
     LEFT JOIN iceberg.silver.xref_match xm
         ON xm.source    = 'fbref'
        AND xm.source_id = fl.match_id
-    LEFT JOIN iceberg.silver.xref_team xt
+    -- #729: season-agnostic dedup. fbref_match_lineups.team carries short names
+    -- (Tottenham / West Ham / Nottingham / Newcastle) that xref_team only holds
+    -- for season 2526, so the old season-keyed JOIN dropped 2967 older-season
+    -- rows to NULL team_id. xref_team_dedup is one row per (source, source_id,
+    -- league) with confidence='orphan' already filtered.
+    LEFT JOIN xref_team_dedup xt
         ON xt.source    = 'fbref'
        AND xt.source_id = fl.team
        AND xt.league    = fl.league
-       AND xt.season    = CAST(fl.season AS varchar)
-       AND xt.confidence <> 'orphan'   -- #506: don't leak 'fb_<slug>' pseudo-canonical
     -- xref_player_dedup (NOT raw silver.xref_player): xref_player PK is
     -- (source, source_id, season), so a raw JOIN on (source, source_id) fans
     -- out 1.5-4× over a player's seasons (#205; same footgun fixed in

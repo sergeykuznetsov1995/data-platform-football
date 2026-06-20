@@ -1066,6 +1066,73 @@ class TestOrphanTeamExcluded:
         assert out[0]["team_id"] == "fb_orphanton_fc", out
 
 
+class TestFbrefTeamCrossSeason:
+    """#729: fbref_match_lineups.team carries SHORT names ('Tottenham') that
+    xref_team only holds for the current season (2526); older seasons hold only
+    the FULL name ('Tottenham Hotspur'). The FBref team JOIN must resolve
+    season-agnostically (xref_team_dedup) — a season-keyed JOIN dropped 2967
+    older-season rows to NULL team_id and broke the no_nulls(team_id) ERROR gate.
+    """
+
+    def _seed_lineup(self, con, *, team: str, season: str) -> None:
+        con.execute(
+            """
+            INSERT INTO silver_fbref_match_lineups VALUES
+              (?, ?, 'Some Player', 'p_729', TRUE, 'F', 7, ?, ?,
+               TIMESTAMP '2026-02-01 06:00:00')
+            """,
+            [_FB_HEX, team, _LEAGUE, season],
+        )
+
+    def test_short_name_in_other_season_still_resolves(self, bridge_conn):
+        """Lineup 'Tottenham' in 1617; xref_team has the short spelling only in
+        2526 and the full spelling in 1617. Season-agnostic dedup resolves it."""
+        self._seed_lineup(bridge_conn, team="Tottenham", season="1617")
+        bridge_conn.execute(
+            """
+            INSERT INTO silver_xref_team VALUES
+              ('fbref', 'Tottenham',         'tottenham_hotspur', ?, '2526', 'name_alias'),
+              ('fbref', 'Tottenham Hotspur', 'tottenham_hotspur', ?, '1617', 'name_alias')
+            """,
+            [_LEAGUE, _LEAGUE],
+        )
+        out = _run_lineup_gold(bridge_conn)
+        assert len(out) == 1, out
+        assert out[0]["lineup_source"] == "fbref", out
+        assert out[0]["team_id"] == "tottenham_hotspur", (
+            f"#729 regression — short name in a non-matching season dropped to "
+            f"NULL team_id: {out}"
+        )
+
+    def test_resolves_when_only_other_season_spelling_exists(self, bridge_conn):
+        """Pure #729: xref_team has ONLY ('Tottenham', 2526); lineup is 1617.
+        A season-keyed JOIN would miss entirely; the dedup resolves it."""
+        self._seed_lineup(bridge_conn, team="Tottenham", season="1617")
+        bridge_conn.execute(
+            "INSERT INTO silver_xref_team VALUES "
+            "('fbref', 'Tottenham', 'tottenham_hotspur', ?, '2526', 'name_alias')",
+            [_LEAGUE],
+        )
+        out = _run_lineup_gold(bridge_conn)
+        assert len(out) == 1, out
+        assert out[0]["team_id"] == "tottenham_hotspur", out
+
+    def test_orphan_short_name_still_excluded(self, bridge_conn):
+        """The season-agnostic dedup must STILL honour the #506 orphan filter:
+        an orphan-confidence xref_team row never leaks as a resolved team_id."""
+        self._seed_lineup(bridge_conn, team="Tottenham", season="1617")
+        bridge_conn.execute(
+            "INSERT INTO silver_xref_team VALUES "
+            "('fbref', 'Tottenham', 'fb_tottenham', ?, '2526', 'orphan')",
+            [_LEAGUE],
+        )
+        out = _run_lineup_gold(bridge_conn)
+        assert len(out) == 1, out
+        assert out[0]["team_id"] is None, (
+            f"orphan xref_team leaked through the season-agnostic dedup: {out}"
+        )
+
+
 class TestCaptainEnrichment:
     """#439: is_captain is sourced from SofaScore /lineups via xref_match +
     xref_player. A FBref lineup row whose canonical (match, player) matches a
