@@ -89,17 +89,63 @@ xref_team_fbref AS (
 
 -- #463: silver.fbref_keeper_profile grain = (player_id, squad, league, season)
 -- — зимний трансфер даёт 2 строки на вратаря-сезон. Gold PK остаётся
--- (player_id, league, season): выживает ЦЕЛИКОМ строка клуба с максимумом
--- минут (§5.3), tie → squad ASC. SUM-агрегация по клубам — followup
--- (save_pct / clean_sheet_pct несуммируемы).
+-- (player_id, league, season).
+-- #515 (Вариант B): счётчики СУММИРУЮТСЯ по клубам сезона (SUM ... OVER w);
+-- team_id — от клуба с максимумом минут (rn=1, §5.3; tie → squad ASC). Ratio с
+-- известной формулой (save_pct / clean_sheet_pct / goals_against_per90 /
+-- pk_save_pct) пересчитываются из суммированных счётчиков, но ТОЛЬКО для
+-- мульти-squad строк (COUNT(*) OVER w > 1) — одноклубные вратари сохраняют
+-- родной FBref-ratio (0-diff к Варианту A).
 fb_dedup AS (
     SELECT * FROM (
-        SELECT *,
-               ROW_NUMBER() OVER (
-                   PARTITION BY player_id, league, season
-                   ORDER BY minutes DESC NULLS LAST, squad
-               ) AS rn
+        SELECT
+            player_id,
+            league,
+            season,
+            squad,
+            SUM(mp)                      OVER w AS mp,
+            SUM(minutes)                 OVER w AS minutes,
+            SUM(clean_sheets)            OVER w AS clean_sheets,
+            SUM(yellow_cards)            OVER w AS yellow_cards,
+            SUM(red_cards)               OVER w AS red_cards,
+            SUM(goals_against)           OVER w AS goals_against,
+            SUM(shots_on_target_against) OVER w AS shots_on_target_against,
+            SUM(saves)                   OVER w AS saves,
+            SUM(wins)                    OVER w AS wins,
+            SUM(draws)                   OVER w AS draws,
+            SUM(losses)                  OVER w AS losses,
+            SUM(pk_faced)                OVER w AS pk_faced,
+            SUM(pk_allowed)              OVER w AS pk_allowed,
+            SUM(pk_saved)                OVER w AS pk_saved,
+            SUM(pk_missed)               OVER w AS pk_missed,
+            -- ratio с известной формулой → пересчёт из сумм (#515 B2), но только
+            -- для мульти-squad; одноклубные сохраняют родной FBref-ratio.
+            CASE WHEN COUNT(*) OVER w > 1
+                 THEN ROUND(CAST(SUM(goals_against) OVER w AS DOUBLE)
+                            * 90.0 / NULLIF(SUM(minutes) OVER w, 0), 2)
+                 ELSE goals_against_per90
+            END                          AS goals_against_per90,
+            CASE WHEN COUNT(*) OVER w > 1
+                 THEN ROUND(CAST(SUM(saves) OVER w AS DOUBLE)
+                            / NULLIF(SUM(shots_on_target_against) OVER w, 0) * 100, 1)
+                 ELSE save_pct
+            END                          AS save_pct,
+            CASE WHEN COUNT(*) OVER w > 1
+                 THEN ROUND(CAST(SUM(clean_sheets) OVER w AS DOUBLE)
+                            / NULLIF(SUM(mp) OVER w, 0) * 100, 1)
+                 ELSE clean_sheet_pct
+            END                          AS clean_sheet_pct,
+            CASE WHEN COUNT(*) OVER w > 1
+                 THEN ROUND(CAST(SUM(pk_saved) OVER w AS DOUBLE)
+                            / NULLIF(SUM(pk_faced) OVER w, 0) * 100, 1)
+                 ELSE pk_save_pct
+            END                          AS pk_save_pct,
+            ROW_NUMBER() OVER (
+                PARTITION BY player_id, league, season
+                ORDER BY minutes DESC NULLS LAST, squad
+            ) AS rn
         FROM iceberg.silver.fbref_keeper_profile
+        WINDOW w AS (PARTITION BY player_id, league, season)
     ) WHERE rn = 1
 )
 

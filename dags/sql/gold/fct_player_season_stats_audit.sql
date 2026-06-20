@@ -77,16 +77,40 @@ fotmob_counts AS (
     FROM iceberg.silver.fotmob_player_season_profile
 ),
 
--- #463: silver-профиль per-(player, squad) — дедуп до max-minutes клуба,
--- зеркально fct_player_season_stats (иначе PK audit-таблицы развалится).
+-- #463/#515: silver-профиль per-(player, squad) — счётчики СУММИРУЮТСЯ по клубам
+-- сезона (SUM ... OVER w), зеркально fct_player_season_stats (Вариант B). Иначе
+-- FBref-spine брал бы один клуб, а main fct — сумму → diff'ы поехали бы. team_id
+-- здесь не нужен; pos берётся от max-minutes клуба (rn=1) для outfield-фильтра.
 fb_dedup AS (
     SELECT * FROM (
-        SELECT *,
-               ROW_NUMBER() OVER (
-                   PARTITION BY player_id, league, season
-                   ORDER BY minutes DESC NULLS LAST, squad
-               ) AS rn
+        SELECT
+            player_id,
+            league,
+            season,
+            pos,
+            SUM(mp)                 OVER w AS mp,
+            SUM(minutes)            OVER w AS minutes,
+            SUM(goals)              OVER w AS goals,
+            SUM(assists)            OVER w AS assists,
+            SUM(yellow_cards)       OVER w AS yellow_cards,
+            SUM(red_cards)          OVER w AS red_cards,
+            SUM(shots)              OVER w AS shots,
+            SUM(shots_on_target)    OVER w AS shots_on_target,
+            SUM(interceptions)      OVER w AS interceptions,
+            SUM(tackles_won)        OVER w AS tackles_won,
+            SUM(fouls_committed)    OVER w AS fouls_committed,
+            SUM(fouls_drawn)        OVER w AS fouls_drawn,
+            SUM(offsides)           OVER w AS offsides,
+            SUM(crosses)            OVER w AS crosses,
+            SUM(penalties_won)      OVER w AS penalties_won,
+            SUM(penalties_conceded) OVER w AS penalties_conceded,
+            SUM(penalty_goals)      OVER w AS penalty_goals,
+            ROW_NUMBER() OVER (
+                PARTITION BY player_id, league, season
+                ORDER BY minutes DESC NULLS LAST, squad
+            ) AS rn
         FROM iceberg.silver.fbref_player_season_profile
+        WINDOW w AS (PARTITION BY player_id, league, season)
     ) WHERE rn = 1
 )
 
