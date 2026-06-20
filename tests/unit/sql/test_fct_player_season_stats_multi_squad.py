@@ -1,16 +1,20 @@
 """
-DuckDB-execution test for gold Variant A (issue #463):
+DuckDB-execution test for gold Variant B (issue #515, на базе #463):
 ``dags/sql/gold/fct_player_season_stats.sql`` over a multi-squad silver fixture.
 
 After #463 silver.fbref_player_season_profile keeps one row per
 (player_id, squad, league, season) — a winter transfer inside the league
-yields TWO rows per player-season. The gold fct must collapse them back to
-ONE row via the fb_dedup CTE: survivor = max-minutes club (design contract
-docs/design/gold-star-schema.md §5.2), deterministic tiebreaker = squad ASC.
+yields TWO rows per player-season. The gold fct collapses them back to ONE row
+via the fb_dedup CTE. #515 Variant B: counters are SUMmed across squads, while
+team_id (and the non-summable ratios) come from the max-minutes club
+(design contract docs/design/gold-star-schema.md §5.2; deterministic tiebreaker
+= squad ASC). Single-squad players are byte-identical to the old Variant A
+(window SUM over a 1-row partition == the row's own value).
 
 Fixture mirrors the live canary (feedback_fixture_must_mirror_live_enums):
 Danny Ings 2022/23 — Aston Villa 824 min / 6 goals, West Ham United
-775 min / 2 goals → gold row must carry team_id='aston_villa', goals=6.
+775 min / 2 goals → gold row must carry team_id='aston_villa' (max-minutes),
+minutes=1599 and goals=8 (summed across both clubs).
 
 Only the FBref spine + xref tables carry rows; the four enrichment sources
 (FotMob/WhoScored/Understat/SofaScore) are empty — LEFT JOINs yield NULLs
@@ -191,7 +195,7 @@ def _run(con):
 
 class TestMultiSquadCollapse:
 
-    def test_one_gold_row_team_id_from_max_minutes_club(self, duck_conn):
+    def test_one_gold_row_counters_summed_team_id_from_max_minutes_club(self, duck_conn):
         # Arrange: winter transfer — two silver rows for one player-season
         _insert_profile(duck_conn, "Aston Villa", 824, 6)
         _insert_profile(duck_conn, "West Ham United", 775, 2)
@@ -199,8 +203,9 @@ class TestMultiSquadCollapse:
         # Act
         df = _run(duck_conn)
 
-        # Assert: gold PK (player_id, league, season) — exactly one row,
-        # whole row taken from the max-minutes club (Variant A)
+        # Assert: gold PK (player_id, league, season) — exactly one row.
+        # #515 Variant B: counters SUMmed across squads; team_id from the
+        # max-minutes club.
         assert len(df) == 1, (
             f"multi-squad silver rows must collapse to 1 gold row, got {len(df)}"
         )
@@ -209,8 +214,29 @@ class TestMultiSquadCollapse:
         assert row["team_id"] == "aston_villa", (
             "team_id must resolve to the max-minutes club (§5.2)"
         )
-        assert row["minutes"] == 824
-        assert row["goals"] == 6
+        assert row["minutes"] == 824 + 775, (
+            "minutes must be SUMmed across squads (#515 Variant B)"
+        )
+        assert row["goals"] == 6 + 2, (
+            "goals must be SUMmed across squads (#515 Variant B)"
+        )
+
+    def test_single_squad_unchanged_vs_variant_a(self, duck_conn):
+        # #515 surgical guard: одноклубный игрок-сезон НЕ должен измениться —
+        # window SUM по партиции из 1 строки == собственное значение строки.
+        # Меняются ТОЛЬКО мульти-squad строки.
+        # Arrange
+        _insert_profile(duck_conn, "Aston Villa", 3000, 20)
+
+        # Act
+        df = _run(duck_conn)
+
+        # Assert
+        assert len(df) == 1
+        row = df.iloc[0]
+        assert row["team_id"] == "aston_villa"
+        assert row["minutes"] == 3000, "single-squad minutes must stay unchanged"
+        assert row["goals"] == 20, "single-squad goals must stay unchanged"
 
     def test_minutes_tie_resolved_by_squad_alphabetical(self, duck_conn):
         # Arrange: equal minutes — tiebreaker = squad ASC (deterministic)
@@ -220,8 +246,12 @@ class TestMultiSquadCollapse:
         # Act
         df = _run(duck_conn)
 
-        # Assert
+        # Assert: team_id from the alphabetical-first club on a tie; counters
+        # still SUMmed across both squads (#515 Variant B).
         assert len(df) == 1
-        assert df.iloc[0]["team_id"] == "aston_villa", (
+        row = df.iloc[0]
+        assert row["team_id"] == "aston_villa", (
             "minutes tie must resolve deterministically (squad ASC)"
         )
+        assert row["minutes"] == 800 + 800
+        assert row["goals"] == 2 + 6

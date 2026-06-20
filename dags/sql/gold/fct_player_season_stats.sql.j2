@@ -87,19 +87,64 @@ xref_team_fbref AS (
 
 -- #463: silver.fbref_player_season_profile grain = (player_id, squad, league,
 -- season) — зимний трансфер внутри лиги даёт 2 строки на игрока-сезон.
--- Gold PK остаётся (player_id, league, season): выживает ЦЕЛИКОМ строка клуба
--- с максимумом минут (§5.2 — team_id = «клуб, за который сыграл больше всего
--- минут»), tie → squad ASC. Семантика max-minutes-club выбрана осознанно:
--- ratio-колонки (points_per_match, on_off_impact, minutes_pct…) несуммируемы;
--- SUM-агрегация счётчиков по клубам — followup.
+-- Gold PK остаётся (player_id, league, season).
+-- #515 (Вариант B): счётчики СУММИРУЮТСЯ по клубам сезона (SUM ... OVER w) —
+-- тоталы сходятся с Understat/SofaScore/WhoScored (дают сумму за лигу-сезон).
+-- team_id и несуммируемые ratio (points_per_match, on_off_impact — нет компонент
+-- для пересчёта) берутся от клуба с максимумом минут (rn=1, §5.2; tie → squad
+-- ASC). Ratio с известной формулой (goals_per_shot) пересчитывается из
+-- суммированных счётчиков, но ТОЛЬКО для мульти-squad строк (COUNT(*) OVER w > 1)
+-- — одноклубные игроки сохраняют родной FBref-ratio (0-diff к Варианту A; лишь
+-- ~111 трансферных игроко-сезонов меняются).
 fb_dedup AS (
     SELECT * FROM (
-        SELECT *,
-               ROW_NUMBER() OVER (
-                   PARTITION BY player_id, league, season
-                   ORDER BY minutes DESC NULLS LAST, squad
-               ) AS rn
+        SELECT
+            player_id,
+            league,
+            season,
+            squad,
+            pos,
+            SUM(mp)                 OVER w AS mp,
+            SUM(minutes)            OVER w AS minutes,
+            SUM(goals)              OVER w AS goals,
+            SUM(assists)            OVER w AS assists,
+            SUM(yellow_cards)       OVER w AS yellow_cards,
+            SUM(red_cards)          OVER w AS red_cards,
+            SUM(penalty_goals)      OVER w AS penalty_goals,
+            SUM(penalty_attempts)   OVER w AS penalty_attempts,
+            SUM(penalties_won)      OVER w AS penalties_won,
+            SUM(penalties_conceded) OVER w AS penalties_conceded,
+            SUM(shots)              OVER w AS shots,
+            SUM(shots_on_target)    OVER w AS shots_on_target,
+            SUM(interceptions)      OVER w AS interceptions,
+            SUM(tackles_won)        OVER w AS tackles_won,
+            SUM(fouls_committed)    OVER w AS fouls_committed,
+            SUM(fouls_drawn)        OVER w AS fouls_drawn,
+            SUM(offsides)           OVER w AS offsides,
+            SUM(crosses)            OVER w AS crosses,
+            SUM(own_goals)          OVER w AS own_goals,
+            SUM(second_yellow)      OVER w AS second_yellow,
+            SUM(complete_matches)   OVER w AS complete_matches,
+            SUM(starts)             OVER w AS starts,
+            SUM(subs)               OVER w AS subs,
+            SUM(unused_sub)         OVER w AS unused_sub,
+            SUM(plus_minus)         OVER w AS plus_minus,
+            -- ratio с известной формулой → пересчёт из сумм (#515 B2), но только
+            -- для мульти-squad; одноклубные сохраняют родной FBref goals_per_shot.
+            CASE WHEN COUNT(*) OVER w > 1
+                 THEN CAST(SUM(goals) OVER w AS DOUBLE)
+                      / NULLIF(SUM(shots) OVER w, 0)
+                 ELSE goals_per_shot
+            END                     AS goals_per_shot,
+            -- несуммируемы (нет компонент в профиле) → от max-minutes клуба (rn=1).
+            points_per_match,
+            on_off_impact,
+            ROW_NUMBER() OVER (
+                PARTITION BY player_id, league, season
+                ORDER BY minutes DESC NULLS LAST, squad
+            ) AS rn
         FROM iceberg.silver.fbref_player_season_profile
+        WINDOW w AS (PARTITION BY player_id, league, season)
     ) WHERE rn = 1
 ),
 

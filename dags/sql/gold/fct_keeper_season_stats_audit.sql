@@ -43,16 +43,26 @@ xref_fotmob AS (
       AND confidence <> 'orphan'
 ),
 
--- #463: silver keeper-профиль per-(player, squad) — дедуп до max-minutes
--- клуба, зеркально fct_keeper_season_stats.
+-- #463/#515: silver keeper-профиль per-(player, squad) — счётчики СУММИРУЮТСЯ
+-- по клубам сезона (SUM ... OVER w), зеркально fct_keeper_season_stats
+-- (Вариант B). Иначе FBref-spine брал бы один клуб, а main fct — сумму → diff'ы
+-- поехали бы.
 fb_dedup AS (
     SELECT * FROM (
-        SELECT *,
-               ROW_NUMBER() OVER (
-                   PARTITION BY player_id, league, season
-                   ORDER BY minutes DESC NULLS LAST, squad
-               ) AS rn
+        SELECT
+            player_id,
+            league,
+            season,
+            SUM(mp)           OVER w AS mp,
+            SUM(minutes)      OVER w AS minutes,
+            SUM(clean_sheets) OVER w AS clean_sheets,
+            SUM(saves)        OVER w AS saves,
+            ROW_NUMBER() OVER (
+                PARTITION BY player_id, league, season
+                ORDER BY minutes DESC NULLS LAST, squad
+            ) AS rn
         FROM iceberg.silver.fbref_keeper_profile
+        WINDOW w AS (PARTITION BY player_id, league, season)
     ) WHERE rn = 1
 )
 
