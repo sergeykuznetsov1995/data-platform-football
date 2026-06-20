@@ -19,6 +19,17 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Replace-partitions completeness guard (#513 → #583): refuse a save that would
+# shrink a sofifa_* partition below this share of its existing rows, so a
+# partial/failed scrape (Turnstile/FlareSolverr death mid heavy player_ratings)
+# can't wipe a good FIFA edition. COUNT(*) (full-state per fifa_edition — no
+# replace_guard_key needed). Armed only when replace_partitions is set
+# (dynamic `part` is None when the column is absent → guard stays off, else
+# min_replace_ratio without replace_partitions raises ValueError).
+# ReplaceGuardError → exit 3; bypass with --force-replace for a first backfill.
+_MIN_REPLACE_RATIO = 0.9
+REPLACE_GUARD_MARKER = 'SOFIFA_REPLACE_GUARD'
+
 
 def main():
     parser = argparse.ArgumentParser(description='Run SoFIFA scraper')
@@ -39,6 +50,13 @@ def main():
         type=str,
         default='/tmp/sofifa_result.json',
         help='Output file for results'
+    )
+    parser.add_argument(
+        '--force-replace',
+        action='store_true',
+        help='Bypass the completeness guard — write even if the scraped frame '
+             'shrinks the existing partition. Use for a deliberate first '
+             'backfill or a known legitimate shrink.'
     )
     args = parser.parse_args()
 
@@ -64,8 +82,12 @@ def main():
         # Issue #616 — FlareSolverr proxy-traffic audit for this run.
         'traffic': {},
     }
+    # #583: a refused completeness guard (partial scrape would shrink a
+    # partition) maps to exit 3 — distinct from the exit-1 hard-failure path.
+    guard_refused = False
 
     try:
+        from scrapers.base.base_scraper import ReplaceGuardError
         from scrapers.sofifa import SoFIFAScraper
 
         with SoFIFAScraper(leagues=leagues, versions=versions) as scraper:
@@ -83,10 +105,19 @@ def main():
                             table_name='sofifa_players',
                             partition_cols=part,
                             replace_partitions=part,
+                            min_replace_ratio=(
+                                None if (args.force_replace or part is None)
+                                else _MIN_REPLACE_RATIO
+                            ),
                         )
                         results['tables'].append(table_path)
                         results['players_rows'] = len(df)
                         logger.info(f"Saved {len(df)} player records")
+            except ReplaceGuardError as e:
+                msg = f"{REPLACE_GUARD_MARKER}: {e}"
+                logger.error(msg)
+                results['errors'].append(msg)
+                guard_refused = True
             except Exception as e:
                 error_msg = f"Players scraping failed: {e}"
                 logger.error(error_msg)
@@ -102,10 +133,19 @@ def main():
                         table_name='sofifa_teams',
                         partition_cols=part,
                         replace_partitions=part,
+                        min_replace_ratio=(
+                            None if (args.force_replace or part is None)
+                            else _MIN_REPLACE_RATIO
+                        ),
                     )
                     results['tables'].append(table_path)
                     results['teams_rows'] = len(df)
                     logger.info(f"Saved {len(df)} team records")
+            except ReplaceGuardError as e:
+                msg = f"{REPLACE_GUARD_MARKER}: {e}"
+                logger.error(msg)
+                results['errors'].append(msg)
+                guard_refused = True
             except Exception as e:
                 error_msg = f"Teams scraping failed: {e}"
                 logger.error(error_msg)
@@ -122,10 +162,19 @@ def main():
                         table_name='sofifa_team_ratings',
                         partition_cols=part,
                         replace_partitions=part,
+                        min_replace_ratio=(
+                            None if (args.force_replace or part is None)
+                            else _MIN_REPLACE_RATIO
+                        ),
                     )
                     results['tables'].append(table_path)
                     results['team_ratings_rows'] = len(df)
                     logger.info(f"Saved {len(df)} team rating records")
+            except ReplaceGuardError as e:
+                msg = f"{REPLACE_GUARD_MARKER}: {e}"
+                logger.error(msg)
+                results['errors'].append(msg)
+                guard_refused = True
             except Exception as e:
                 error_msg = f"Team ratings scraping failed: {e}"
                 logger.error(error_msg)
@@ -141,10 +190,19 @@ def main():
                         table_name='sofifa_versions',
                         partition_cols=part,
                         replace_partitions=part,
+                        min_replace_ratio=(
+                            None if (args.force_replace or part is None)
+                            else _MIN_REPLACE_RATIO
+                        ),
                     )
                     results['tables'].append(table_path)
                     results['versions_rows'] = len(df)
                     logger.info(f"Saved {len(df)} version records")
+            except ReplaceGuardError as e:
+                msg = f"{REPLACE_GUARD_MARKER}: {e}"
+                logger.error(msg)
+                results['errors'].append(msg)
+                guard_refused = True
             except Exception as e:
                 error_msg = f"Versions scraping failed: {e}"
                 logger.error(error_msg)
@@ -161,10 +219,19 @@ def main():
                         table_name='sofifa_leagues',
                         partition_cols=None,
                         replace_partitions=repl,
+                        min_replace_ratio=(
+                            None if (args.force_replace or repl is None)
+                            else _MIN_REPLACE_RATIO
+                        ),
                     )
                     results['tables'].append(table_path)
                     results['leagues_rows'] = len(df)
                     logger.info(f"Saved {len(df)} league records")
+            except ReplaceGuardError as e:
+                msg = f"{REPLACE_GUARD_MARKER}: {e}"
+                logger.error(msg)
+                results['errors'].append(msg)
+                guard_refused = True
             except Exception as e:
                 error_msg = f"Leagues scraping failed: {e}"
                 logger.error(error_msg)
@@ -183,10 +250,19 @@ def main():
                             table_name='sofifa_player_ratings',
                             partition_cols=part,
                             replace_partitions=part,
+                            min_replace_ratio=(
+                                None if (args.force_replace or part is None)
+                                else _MIN_REPLACE_RATIO
+                            ),
                         )
                         results['tables'].append(table_path)
                         results['player_ratings_rows'] = len(df)
                         logger.info(f"Saved {len(df)} player rating records")
+            except ReplaceGuardError as e:
+                msg = f"{REPLACE_GUARD_MARKER}: {e}"
+                logger.error(msg)
+                results['errors'].append(msg)
+                guard_refused = True
             except Exception as e:
                 error_msg = f"Player ratings scraping failed: {e}"
                 logger.error(error_msg)
@@ -222,8 +298,9 @@ def main():
     print(json.dumps(results))
     # Issue #466: non-zero exit when any scrape step failed — otherwise the
     # BashOperator stays green while team_ratings/versions/leagues/
-    # player_ratings silently go stale for weeks.
-    return 1 if results.get('errors') else 0
+    # player_ratings silently go stale for weeks. #583: a refused completeness
+    # guard takes priority as exit 3 (distinct from a hard failure's exit 1).
+    return 3 if guard_refused else (1 if results.get('errors') else 0)
 
 
 if __name__ == '__main__':
