@@ -314,3 +314,111 @@ class TestHttpFastPathDiagnostics:
         diag = m._get_traffic_diagnostics(scraper)
 
         assert diag['http_fetch_diag_summary']['proxy_mismatch'] == 1
+
+
+class TestSingleStatReplaceGuard:
+    """#583: completeness-guard wiring for single_stat mode (nodriver path).
+
+    The guard arithmetic lives in scrape_single_stat_type (covered by
+    test_data_readers.py / test_nodriver_fbref_scraper.py); here we cover the
+    runner's handling — thread force_replace down to the scraper and map a
+    raised ReplaceGuardError to exit 3 + the FBREF_REPLACE_GUARD marker.
+    """
+
+    @pytest.fixture
+    def temp_output_file(self):
+        fd, path = tempfile.mkstemp(suffix='.json')
+        os.close(fd)
+        yield path
+        if os.path.exists(path):
+            os.unlink(path)
+
+    @staticmethod
+    def _single_stat_args(output, *, force=False):
+        args = [
+            '--scraper-type', 'nodriver',
+            '--mode', 'single_stat',
+            '--stat-type', 'stats',
+            '--data-category', 'player',
+            '--leagues', 'ENG-Premier League',
+            '--season', '2024',
+            '--output', output,
+        ]
+        if force:
+            args.append('--force-replace')
+        return args
+
+    @staticmethod
+    def _run(scraper, args):
+        sys.argv = ['run_fbref_scraper.py'] + args
+        with patch(
+            'scrapers.nodriver_fbref.NodriverFBrefScraper',
+            MagicMock(return_value=scraper),
+        ):
+            import importlib
+            import dags.scripts.run_fbref_scraper as m
+            importlib.reload(m)
+            return m.main()
+
+    @staticmethod
+    def _stub_scraper():
+        scraper = MagicMock()
+        scraper._stats = {'successes': 1, 'failures': 0}
+        scraper.get_stats.return_value = scraper._stats
+        scraper.__enter__ = MagicMock(return_value=scraper)
+        scraper.__exit__ = MagicMock(return_value=False)
+        return scraper
+
+    @pytest.mark.unit
+    def test_guard_refusal_exits_3(self, temp_output_file):
+        """scrape_single_stat_type raises ReplaceGuardError → exit 3 +
+        FBREF_REPLACE_GUARD marker (distinct from the exit-1 path)."""
+        from scrapers.base.base_scraper import ReplaceGuardError
+
+        scraper = self._stub_scraper()
+        scraper.scrape_single_stat_type.side_effect = ReplaceGuardError(
+            'new=2 rows < 90% of existing=380 for bronze.fbref_player_stats '
+            '— refusing replace_partitions save (would shrink the partition)'
+        )
+
+        sys.argv = ['run_fbref_scraper.py'] + self._single_stat_args(temp_output_file)
+        with patch(
+            'scrapers.nodriver_fbref.NodriverFBrefScraper',
+            MagicMock(return_value=scraper),
+        ):
+            import importlib
+            import dags.scripts.run_fbref_scraper as m
+            importlib.reload(m)
+            with pytest.raises(SystemExit) as exc:
+                m.main()
+
+        assert exc.value.code == 3
+        with open(temp_output_file) as f:
+            result = json.load(f)
+        assert any('FBREF_REPLACE_GUARD' in e for e in result['errors'])
+
+    @pytest.mark.unit
+    def test_normal_path_threads_force_replace_false(self, temp_output_file):
+        """Non-force run threads force_replace=False into scrape_single_stat_type."""
+        scraper = self._stub_scraper()
+        scraper.scrape_single_stat_type.return_value = {
+            'player_stats': 'iceberg.bronze.fbref_player_stats'
+        }
+
+        rc = self._run(scraper, self._single_stat_args(temp_output_file))
+
+        assert rc == 0
+        assert scraper.scrape_single_stat_type.call_args.kwargs['force_replace'] is False
+
+    @pytest.mark.unit
+    def test_force_replace_threads_true(self, temp_output_file):
+        """--force-replace threads force_replace=True into scrape_single_stat_type."""
+        scraper = self._stub_scraper()
+        scraper.scrape_single_stat_type.return_value = {
+            'player_stats': 'iceberg.bronze.fbref_player_stats'
+        }
+
+        rc = self._run(scraper, self._single_stat_args(temp_output_file, force=True))
+
+        assert rc == 0
+        assert scraper.scrape_single_stat_type.call_args.kwargs['force_replace'] is True

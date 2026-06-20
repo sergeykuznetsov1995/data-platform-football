@@ -857,6 +857,7 @@ class NodriverFBrefScraper(BaseScraper):
         self,
         stat_type: str,
         data_category: str,
+        force_replace: bool = False,
     ) -> Dict[str, str]:
         """
         Scrape single stat_type for all configured leagues/seasons.
@@ -867,6 +868,10 @@ class NodriverFBrefScraper(BaseScraper):
         Args:
             stat_type: One of PLAYER_STAT_TYPES, TEAM_STAT_TYPES, KEEPER_STAT_TYPES
             data_category: One of 'player', 'team', 'keeper'
+            force_replace: Bypass the completeness guard (#513/#583). When False
+                (default) a partial scrape that would shrink the (league, season)
+                partition below 90% of its existing rows is refused
+                (ReplaceGuardError). Set True for a deliberate first backfill.
 
         Returns:
             Dictionary mapping entity name to Iceberg table path,
@@ -924,6 +929,10 @@ class NodriverFBrefScraper(BaseScraper):
             table_path = self.save_to_iceberg(
                 combined_df, table_name, partition_cols=['league', 'season'],
                 replace_partitions=['league', 'season'],
+                # Completeness guard (#513/#583): refuse a partial scrape that
+                # would shrink the (league, season) partition below 90% of its
+                # existing rows (full-state season stats → raw COUNT(*)).
+                min_replace_ratio=(None if force_replace else 0.9),
             )
             entity_key = f"{data_category}_{stat_type}"
             result[entity_key] = table_path
