@@ -161,7 +161,9 @@ def _reset_schemas(duck_conn):
         CREATE TABLE silver_xref_match (
             source        VARCHAR,
             source_id     VARCHAR,
-            canonical_id  VARCHAR
+            canonical_id  VARCHAR,
+            league        VARCHAR,
+            season        VARCHAR
         )
         """
     )
