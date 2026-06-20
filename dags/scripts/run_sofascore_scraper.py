@@ -99,6 +99,16 @@ VALID_ENTITIES = {
     ENTITY_PLAYER_PROFILE,
 }
 
+# Replace-partitions completeness guard (#513 → #583): refuse a save that would
+# shrink a bronze.sofascore_* (league, season) partition below this share of its
+# existing rows, so a partial/failed scrape can't wipe a good partition.
+# COUNT(*) (no replace_guard_key) — each (league, season) is scraped full-state.
+# ReplaceGuardError → exit 3; bypass with --force-replace. NOTE: the append-only
+# event endpoint (shotmap / event_player_stats / match_stats) is NOT guarded —
+# it has no replace_partitions (rows preserved across runs, #69).
+_MIN_REPLACE_RATIO = 0.9
+REPLACE_GUARD_MARKER = 'SOFASCORE_REPLACE_GUARD'
+
 
 def _trino_connect():
     """Open a Trino dbapi connection from env. Returns None on import error."""
@@ -230,8 +240,10 @@ def _run_player_ratings(
     season: int,
     limit: Optional[int],
     output_path: str,
+    force_replace: bool = False,
 ) -> int:
     """R0.2b player-ratings entrypoint. Returns process exit code."""
+    from scrapers.base.base_scraper import ReplaceGuardError
     from scrapers.sofascore import SofaScoreScraper
     from scrapers.sofascore.scraper import R0_2B_FALLBACK_MARKER
 
@@ -340,6 +352,9 @@ def _run_player_ratings(
                 table_name='sofascore_player_ratings',
                 partition_cols=['league', 'season'],
                 replace_partitions=['league', 'season'],
+                min_replace_ratio=(
+                    None if force_replace else _MIN_REPLACE_RATIO
+                ),
             )
             results['tables'].append(table_path)
             results['rows'] = int(len(df))
@@ -349,6 +364,12 @@ def _run_player_ratings(
                 results['rows'], results['matches_with_ratings'], table_path,
             )
 
+    except ReplaceGuardError as e:
+        msg = f"{REPLACE_GUARD_MARKER}: {e}"
+        logger.error(msg)
+        results['errors'].append(msg)
+        _write_results(output_path, results)
+        return 3
     except Exception as e:
         logger.error("player_ratings scrape failed hard: %s", e, exc_info=True)
         results['errors'].append(str(e))
@@ -607,6 +628,7 @@ def _run_player_season_stats(
     season: int,
     limit: Optional[int],
     output_path: str,
+    force_replace: bool = False,
 ) -> int:
     """#24 — season-aggregate Opta stats per (player, season).
 
@@ -616,6 +638,7 @@ def _run_player_season_stats(
     lookup against ``/unique-tournament/{ut_id}/seasons`` cached on the
     scraper instance.
     """
+    from scrapers.base.base_scraper import ReplaceGuardError
     from scrapers.sofascore import SofaScoreScraper
     from scrapers.sofascore.scraper import R0_2B_FALLBACK_MARKER
 
@@ -683,6 +706,9 @@ def _run_player_season_stats(
                 table_name='sofascore_player_season_stats',
                 partition_cols=['league', 'season'],
                 replace_partitions=['league', 'season'],
+                min_replace_ratio=(
+                    None if force_replace else _MIN_REPLACE_RATIO
+                ),
             )
             results['tables'].append(table_path)
             results['rows'] = int(len(df))
@@ -692,6 +718,12 @@ def _run_player_season_stats(
                 results['rows'], results['players_with_rows'], table_path,
             )
 
+    except ReplaceGuardError as e:
+        msg = f"{REPLACE_GUARD_MARKER}: {e}"
+        logger.error(msg)
+        results['errors'].append(msg)
+        _write_results(output_path, results)
+        return 3
     except Exception as e:
         logger.error(
             "player_season_stats scrape failed hard: %s", e, exc_info=True,
@@ -709,6 +741,7 @@ def _run_player_profile(
     season: int,
     limit: Optional[int],
     output_path: str,
+    force_replace: bool = False,
 ) -> int:
     """#23 — biographical snapshot per player (height, foot, dob,
     nationality, current team). One HTTP call per player.
@@ -716,6 +749,7 @@ def _run_player_profile(
     Player ids are pulled from ``bronze.sofascore_player_ratings``;
     snapshot grain (1 row per player) partitioned by (league, season).
     """
+    from scrapers.base.base_scraper import ReplaceGuardError
     from scrapers.sofascore import SofaScoreScraper
     from scrapers.sofascore.scraper import R0_2B_FALLBACK_MARKER
 
@@ -783,6 +817,9 @@ def _run_player_profile(
                 table_name='sofascore_player_profile',
                 partition_cols=['league', 'season'],
                 replace_partitions=['league', 'season'],
+                min_replace_ratio=(
+                    None if force_replace else _MIN_REPLACE_RATIO
+                ),
             )
             results['tables'].append(table_path)
             results['rows'] = int(len(df))
@@ -792,6 +829,12 @@ def _run_player_profile(
                 results['rows'], results['players_with_rows'], table_path,
             )
 
+    except ReplaceGuardError as e:
+        msg = f"{REPLACE_GUARD_MARKER}: {e}"
+        logger.error(msg)
+        results['errors'].append(msg)
+        _write_results(output_path, results)
+        return 3
     except Exception as e:
         logger.error(
             "player_profile scrape failed hard: %s", e, exc_info=True,
@@ -822,6 +865,7 @@ def _run_legacy(
     leagues: List[str],
     season: int,
     output_path: str,
+    force_replace: bool = False,
 ) -> int:
     """Original behaviour: scrape schedule + league_table."""
     results = {
@@ -831,8 +875,10 @@ def _run_legacy(
         'league_table_rows': 0,
         'errors': [],
     }
+    guard_refused = False
 
     try:
+        from scrapers.base.base_scraper import ReplaceGuardError
         from scrapers.sofascore import SofaScoreScraper
 
         with SofaScoreScraper(leagues=leagues, seasons=[season]) as scraper:
@@ -844,10 +890,18 @@ def _run_legacy(
                         table_name='sofascore_schedule',
                         partition_cols=['league', 'season'],
                         replace_partitions=['league', 'season'],
+                        min_replace_ratio=(
+                            None if force_replace else _MIN_REPLACE_RATIO
+                        ),
                     )
                     results['tables'].append(table_path)
                     results['schedule_rows'] = len(df)
                     logger.info(f"Saved {len(df)} schedule rows")
+            except ReplaceGuardError as e:
+                msg = f"{REPLACE_GUARD_MARKER}: schedule: {e}"
+                logger.error(msg)
+                results['errors'].append(msg)
+                guard_refused = True
             except Exception as e:
                 error_msg = f"Schedule scraping failed: {e}"
                 logger.error(error_msg)
@@ -861,10 +915,18 @@ def _run_legacy(
                         table_name='sofascore_league_table',
                         partition_cols=['league', 'season'],
                         replace_partitions=['league', 'season'],
+                        min_replace_ratio=(
+                            None if force_replace else _MIN_REPLACE_RATIO
+                        ),
                     )
                     results['tables'].append(table_path)
                     results['league_table_rows'] = len(df)
                     logger.info(f"Saved {len(df)} league table rows")
+            except ReplaceGuardError as e:
+                msg = f"{REPLACE_GUARD_MARKER}: league_table: {e}"
+                logger.error(msg)
+                results['errors'].append(msg)
+                guard_refused = True
             except Exception as e:
                 error_msg = f"League table scraping failed: {e}"
                 logger.error(error_msg)
@@ -876,7 +938,9 @@ def _run_legacy(
         return 1
 
     _write_results(output_path, results)
-    return 0
+    # Exit 3 when the guard refused any save (distinct from the exit-0 path) so
+    # an operator can spot a refused guard in the BashOperator (#583).
+    return 3 if guard_refused else 0
 
 
 def main():
@@ -922,6 +986,13 @@ def main():
         default='/tmp/sofascore_result.json',
         help='Output file for results',
     )
+    parser.add_argument(
+        '--force-replace',
+        action='store_true',
+        help='Bypass the completeness guard — write even if the scraped frame '
+             'shrinks the existing partition. Use for a deliberate first '
+             'backfill or a known legitimate shrink.',
+    )
     try:
         args = parser.parse_args()
     except _ArgparseError as exc:
@@ -952,6 +1023,7 @@ def main():
             season=args.season,
             limit=args.limit,
             output_path=args.output,
+            force_replace=args.force_replace,
         )
 
     if entity == ENTITY_SHOTMAP:
@@ -984,6 +1056,7 @@ def main():
             season=args.season,
             limit=args.limit,
             output_path=args.output,
+            force_replace=args.force_replace,
         )
 
     if entity == ENTITY_PLAYER_PROFILE:
@@ -992,6 +1065,7 @@ def main():
             season=args.season,
             limit=args.limit,
             output_path=args.output,
+            force_replace=args.force_replace,
         )
 
     # Default: legacy schedule+league_table flow.
@@ -999,6 +1073,7 @@ def main():
         leagues=leagues,
         season=args.season,
         output_path=args.output,
+        force_replace=args.force_replace,
     )
 
 
