@@ -816,18 +816,26 @@ def _build_fct_shot_checks() -> List[Check]:
 # ---------------------------------------------------------------------------
 
 def _build_fct_lineup_checks() -> List[Check]:
-    """DQ for ``iceberg.gold.fct_lineup`` (E3.5).
+    """DQ for ``iceberg.gold.fct_lineup`` (E3.5; SofaScore source added #693).
 
     Lineup_source distribution
     --------------------------
-    Pre-#692 smoke verdict: 159,445 rows total, FBref bulk + ESPN secondary
-    (90.8% bridge success). #692 wired the ESPN player resolver, so resolved
-    ESPN rows now dedup into their FBref twin — the surviving lineup_source=
-    'espn' count drops (only ESPN-exclusive / bridge-miss / unresolved remain).
-    Guards:
-      * fbref ≥ 100K (ERROR — FBref is the canonical source, must dominate)
-      * espn  ≥ 5K   (WARNING — re-baseline post-#692 live; ESPN now collapses
-                      into FBref by design, so this floor may need lowering)
+    Smoke-test verdict (pre-#693): 159,445 rows, FBref bulk + ESPN secondary
+    (90.8% bridge success). row_count guards lock the distribution:
+      * fbref     ≥ 100K (ERROR — FBref is the canonical source, must dominate)
+      * espn      ≥ 5K   (WARNING — #692 wired the ESPN player resolver, so
+        resolved ESPN rows now dedup UNDER their FBref twin; the surviving
+        lineup_source='espn' count = ESPN-exclusive / bridge-miss / unresolved
+        only. Re-baseline post-#692 live; this floor may need lowering.)
+      * sofascore ≥ 500  (WARNING, #693 — net contribution = matches/players
+        FBref does NOT already cover; most SofaScore rows dedup UNDER FBref, so
+        the surviving count is small. Live 2026-06-20: 682 rows survived as
+        lineup_source='sofascore' (of 15,189 SS lineup rows — the other ~14.5K
+        deduped under FBref and supplied is_captain). Floor catches a dead branch.)
+      * fotmob ≥ 1000 (WARNING, #693 — same idea; live 2026-06-20: 2,378 rows
+        survived, 1,372 with a resolved player_id.)
+      * whoscored ≥ 10 (WARNING, #693 — inferred lineup; ~99.8% dedup under
+        FBref, so only ~32 net rows survive live 2026-06-20. Low dead-branch floor.)
     """
     table = 'iceberg.gold.fct_lineup'
 
@@ -910,6 +918,38 @@ def _build_fct_lineup_checks() -> List[Check]:
             where="lineup_source = 'espn'",
             severity='WARNING',
             name='espn_coverage_present',
+        ),
+        # SofaScore as a full source (#693). Only rows that WIN dedup carry
+        # lineup_source='sofascore' (FBref-gap matches/players); the rest dedup
+        # under FBref. Live 2026-06-20: 682 survived → floor 500 catches a dead
+        # branch with headroom. WARNING-only (net coverage naturally fluctuates).
+        CHECK.row_count(
+            table=table,
+            min_rows=500,
+            where="lineup_source = 'sofascore'",
+            severity='WARNING',
+            name='sofascore_coverage_present',
+        ),
+        # FotMob as a full source (#693). Net contribution = FBref-gap rows that
+        # survive dedup. Live 2026-06-20: 2,378 survived (1,372 with a resolved
+        # player_id). Floor 1000 catches a dead branch. WARNING-only.
+        CHECK.row_count(
+            table=table,
+            min_rows=1_000,
+            where="lineup_source = 'fotmob'",
+            severity='WARNING',
+            name='fotmob_coverage_present',
+        ),
+        # WhoScored as a full source (#693). Lineup is INFERRED from events
+        # (appeared & not subbed-on); its players resolve to FBref canonicals so
+        # ~99.8% dedup UNDER FBref — net survivors are tiny. Live 2026-06-20: 32
+        # rows. Low floor catches only a fully-dead branch. WARNING-only.
+        CHECK.row_count(
+            table=table,
+            min_rows=10,
+            where="lineup_source = 'whoscored'",
+            severity='WARNING',
+            name='whoscored_coverage_present',
         ),
 
         # Total volume — 380 APL matches/season × 22 lineup rows / (match × team)

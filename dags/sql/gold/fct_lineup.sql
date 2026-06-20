@@ -1,10 +1,21 @@
 -- =============================================================================
 -- Gold: fct_lineup
 -- =============================================================================
--- Per-player lineup entries unified across FBref and ESPN.
+-- Per-player lineup entries unified across FBref, ESPN, SofaScore, FotMob,
+-- WhoScored (#693).
 --
 -- Sources:
 --   iceberg.silver.fbref_match_lineups   — primary (complete coverage)
+--   iceberg.silver.sofascore_player_match_aggregate — full lineup source (#693):
+--                                          real player_id (resolves via
+--                                          xref_player, unlike ESPN), native
+--                                          is_starter/is_captain/position
+--   iceberg.silver.fotmob_lineup         — full lineup source (#693): starters+
+--                                          subs from lineup_json; real player_id,
+--                                          is_starter + jersey; is_captain NULL
+--   iceberg.silver.whoscored_lineup      — inferred lineup source (#693): real
+--                                          player_id + is_starter (appeared & not
+--                                          subbed-on); position/captain/jersey NULL
 --   iceberg.silver.espn_lineup           — secondary (E3.2 deliverable)
 --   iceberg.silver.xref_match            — match_id resolution (FBref-only in MVP)
 --   iceberg.silver.xref_team             — team alias canonicalisation
@@ -66,14 +77,23 @@
 --   canonical and therefore dedup against their FBref twin (see next ADR).
 --
 -- =============================================================================
--- ADR — Dedup priority FBref > ESPN
+-- ADR — Dedup priority FBref > SofaScore > ESPN (#693)
 -- =============================================================================
---   When the same (match, player) is covered by both sources we keep the
---   FBref row (more complete schema: real player_id, jersey_number).
+--   When the same (match, player) is covered by multiple sources we keep the
+--   most complete one. Priority by schema richness:
+--     1 FBref     — real player_id + jersey_number + position + is_starter
+--     2 SofaScore — real player_id + position + is_starter + native is_captain
+--                   (no jersey); cross-source dedup against FBref fires via the
+--                   shared canonical_id
+--     3 FotMob    — real player_id + is_starter + jersey (#693)
+--     4 WhoScored — real player_id + is_starter only (#693)
+--     5 ESPN      — player_id NOW resolves via xref_player by name+team (#692);
+--                   no jersey/captain + lowest schema richness, so ESPN sits at
+--                   the tail and never wins cross-source dedup (but resolved
+--                   ESPN rows DO dedup away against their FBref twin).
 --   Implementation: ROW_NUMBER() OVER (PARTITION BY ... ORDER BY
---   source_priority ASC, _bronze_ingested_at DESC), source_priority=1 for
---   FBref, 2 for ESPN. Tie-breaker on _bronze_ingested_at retains the
---   freshest row within a single source.
+--   source_priority ASC, _bronze_ingested_at DESC). Tie-breaker on
+--   _bronze_ingested_at retains the freshest row within a single source.
 --
 --   Edge case: cross-source dedup only fires when the ESPN→FBref match_id
 --   bridge succeeds AND the ESPN player resolves to a canonical_id (#692
@@ -95,9 +115,10 @@
 --                                     (FBref Silver also keeps raw position;
 --                                      dim_position deferred until used)
 --   jersey_number         integer  -- NULL for ESPN (matchsheet has no jersey)
---   is_captain            boolean  -- SofaScore-sourced (#439): FBref/ESPN lineups
---                                     carry no captaincy. NULL = no SofaScore /lineups
---                                     coverage (all ESPN rows; FBref players not in SS)
+--   is_captain            boolean  -- native on SofaScore rows (#693); FBref rows
+--                                     enriched via the SofaScore captain bridge (#439).
+--                                     NULL = no coverage (all ESPN rows; FBref players
+--                                     absent from SofaScore /lineups)
 --   lineup_source         varchar  -- 'fbref' | 'espn' (winner after dedup)
 --   lineup_version        varchar  -- literal 'v1' (schema versioning hook)
 --   league                varchar
@@ -230,6 +251,9 @@ fbref_resolved AS (
         fl.is_starter                                  AS is_starter,
         fl.position                                    AS position_canonical,
         fl.jersey_number                               AS jersey_number,
+        -- FBref lineups carry no captaincy → NULL; enriched downstream via the
+        -- SofaScore captain bridge (#439). Column present so the UNION aligns.
+        CAST(NULL AS boolean)                          AS is_captain,
         fl._bronze_ingested_at                         AS _bronze_ingested_at,
         fl.league                                      AS league,
         -- #404: silver.fbref_match_lineups.season is slug ('2425') now → pass through.
@@ -280,6 +304,8 @@ espn_resolved AS (
         el.is_starter                                  AS is_starter,
         el.position                                    AS position_canonical,
         el.jersey_number                               AS jersey_number,
+        -- ESPN matchsheet carries no captaincy → NULL (UNION alignment).
+        CAST(NULL AS boolean)                          AS is_captain,
         el._bronze_ingested_at                         AS _bronze_ingested_at,
         el.league                                      AS league,
         -- season UNIFICATION (E3.5 R4): ESPN Silver stores a varchar slug
@@ -288,7 +314,10 @@ espn_resolved AS (
         -- '0525' (defensive — production data is always 4-digit, lpad is cheap).
         lpad(CAST(el.season AS varchar), 4, '0')        AS season,
         'espn'                                         AS lineup_source,
-        2                                              AS source_priority,
+        -- #693: ESPN moves to the tail of the priority order. Its player_id is
+        -- always NULL (no ESPN player resolver), so it never wins cross-source
+        -- dedup anyway; FBref(1) > SofaScore(2) > [FotMob(3) > WhoScored(4)] > ESPN(5).
+        5                                              AS source_priority,
         -- Compose a stable per-row dedup proxy from (player, team) so that
         -- two distinct ESPN players with NULL canonical don't collapse into
         -- one ROW_NUMBER bucket. NOT projected to output.
@@ -319,12 +348,160 @@ espn_resolved AS (
 ),
 
 -- ============================================================================
+-- 3b) SofaScore source rows (#693) — full lineup source, not just the captain
+--     overlay. Unlike ESPN, SofaScore players resolve to a REAL canonical via
+--     xref_player (source='sofascore'), so cross-source dedup actually fires
+--     (FBref wins via source_priority). Mirrors the ESPN bridge for match_id:
+--     resolve via xref_match (confidence<>'orphan'), else fall back to an
+--     'ss_<id>' pseudo-id so SofaScore-only matches still add coverage.
+--   * (league, season) predicate on BOTH xref JOINs — mandatory, else 1.5-4×
+--     fan-out (xref rows are per-(source, source_id, season)).
+--   * xref_player_dedup (NOT a season-predicated raw join) keeps this 1:1 and
+--     preserves coverage for out-of-scope seasons — same rationale as FBref.
+--   * is_starter / is_captain / position are native here (conformed in
+--     silver.sofascore_player_match_aggregate from the /lineups overlay).
+--   * No jersey_number in SofaScore /lineups → NULL.
+--   * No player_name column in the SofaScore aggregate → NULL; only ever used
+--     as the dedup fallback key, and spa.player_id (the PK) is always present.
+-- ============================================================================
+sofascore_resolved AS (
+    SELECT
+        COALESCE(xm.canonical_id, 'ss_' || spa.match_id) AS match_id_canonical,
+        xt.canonical_id                                AS team_id_canonical,
+        xp.canonical_id                                AS player_id_canonical,
+        CAST(NULL AS varchar)                          AS player_name,
+        spa.is_starter                                 AS is_starter,
+        spa.position                                   AS position_canonical,
+        CAST(NULL AS integer)                          AS jersey_number,
+        spa.is_captain                                 AS is_captain,
+        spa._bronze_ingested_at                        AS _bronze_ingested_at,
+        spa.league                                     AS league,
+        spa.season                                     AS season,         -- #404 slug '2526'
+        'sofascore'                                    AS lineup_source,
+        2                                              AS source_priority,
+        spa.player_id                                  AS _raw_player_id_for_dedup
+    FROM iceberg.silver.sofascore_player_match_aggregate spa
+    LEFT JOIN iceberg.silver.xref_match xm
+        ON  xm.source     = 'sofascore'
+       AND xm.source_id   = spa.match_id
+       AND xm.league      = spa.league
+       AND xm.season      = spa.season
+       AND xm.confidence <> 'orphan'
+    LEFT JOIN iceberg.silver.xref_team xt
+        ON  xt.source     = 'sofascore'
+       AND xt.source_id   = spa.team_name        -- xref_team source_id = team NAME
+       AND xt.league      = spa.league
+       AND xt.season      = spa.season
+       AND xt.confidence <> 'orphan'
+    LEFT JOIN xref_player_dedup xp
+        ON  xp.source     = 'sofascore'
+       AND xp.source_id   = spa.player_id
+),
+
+-- ============================================================================
+-- 3c) FotMob source rows (#693) — full lineup parsed from lineup_json into
+--     silver.fotmob_lineup (starters + subs, both teams). Same resolution shape
+--     as SofaScore: real player_id via xref_player → cross-source dedup fires.
+--   * match_id via xref_match (source='fotmob', keyed on the bronze match_id),
+--     else 'fm_<id>' pseudo-id so FotMob-only matches still add coverage.
+--   * (league, season) predicate on BOTH xref JOINs — mandatory.
+--   * jersey_number IS available (FotMob shirtNumber); is_captain is NOT in
+--     lineup_json → NULL (enriched via the SofaScore captain bridge below).
+--   * position is the FotMob positionId CODE (varchar) for starters, NULL for
+--     subs (they hold no formation slot) — raw passthrough, dim_position deferred.
+-- ============================================================================
+fotmob_resolved AS (
+    SELECT
+        COALESCE(xm.canonical_id, 'fm_' || fl.match_id) AS match_id_canonical,
+        xt.canonical_id                                AS team_id_canonical,
+        xp.canonical_id                                AS player_id_canonical,
+        fl.player_name                                 AS player_name,
+        fl.is_starter                                  AS is_starter,
+        fl.position                                    AS position_canonical,
+        fl.jersey_number                               AS jersey_number,
+        fl.is_captain                                  AS is_captain,   -- always NULL in silver
+        fl._bronze_ingested_at                         AS _bronze_ingested_at,
+        fl.league                                      AS league,
+        fl.season                                      AS season,        -- #404 slug '2526'
+        'fotmob'                                       AS lineup_source,
+        3                                              AS source_priority,
+        fl.player_id                                   AS _raw_player_id_for_dedup
+    FROM iceberg.silver.fotmob_lineup fl
+    LEFT JOIN iceberg.silver.xref_match xm
+        ON  xm.source     = 'fotmob'
+       AND xm.source_id   = fl.match_id
+       AND xm.league      = fl.league
+       AND xm.season      = fl.season
+       AND xm.confidence <> 'orphan'
+    LEFT JOIN iceberg.silver.xref_team xt
+        ON  xt.source     = 'fotmob'
+       AND xt.source_id   = fl.team_name        -- xref_team source_id = team NAME
+       AND xt.league      = fl.league
+       AND xt.season      = fl.season
+       AND xt.confidence <> 'orphan'
+    LEFT JOIN xref_player_dedup xp
+        ON  xp.source     = 'fotmob'
+       AND xp.source_id   = fl.player_id
+),
+
+-- ============================================================================
+-- 3d) WhoScored source rows (#693) — lineup INFERRED from the event stream
+--     (silver.whoscored_lineup): a player who appeared and was not subbed on
+--     started. Thinnest source: real player_id + is_starter only; position /
+--     is_captain / jersey_number are NOT derivable from WhoScored events → NULL.
+--   * match via xref_match (source='whoscored', source_id = WhoScored game_id),
+--     else 'ws_<id>' pseudo-id fallback.
+--   * team via xref_team (source_id = team NAME; silver already resolved the
+--     numeric team_id → name through whoscored_schedule).
+--   * (league, season) predicate on BOTH xref JOINs.
+-- ============================================================================
+whoscored_resolved AS (
+    SELECT
+        COALESCE(xm.canonical_id, 'ws_' || wl.match_id) AS match_id_canonical,
+        xt.canonical_id                                AS team_id_canonical,
+        xp.canonical_id                                AS player_id_canonical,
+        CAST(NULL AS varchar)                          AS player_name,
+        wl.is_starter                                  AS is_starter,
+        wl.position                                    AS position_canonical,  -- NULL
+        wl.jersey_number                               AS jersey_number,       -- NULL
+        wl.is_captain                                  AS is_captain,          -- NULL
+        wl._bronze_ingested_at                         AS _bronze_ingested_at,
+        wl.league                                      AS league,
+        wl.season                                      AS season,              -- slug '2526'
+        'whoscored'                                    AS lineup_source,
+        4                                              AS source_priority,
+        wl.player_id                                   AS _raw_player_id_for_dedup
+    FROM iceberg.silver.whoscored_lineup wl
+    LEFT JOIN iceberg.silver.xref_match xm
+        ON  xm.source     = 'whoscored'
+       AND xm.source_id   = wl.match_id
+       AND xm.league      = wl.league
+       AND xm.season      = wl.season
+       AND xm.confidence <> 'orphan'
+    LEFT JOIN iceberg.silver.xref_team xt
+        ON  xt.source     = 'whoscored'
+       AND xt.source_id   = wl.team_name        -- xref_team source_id = team NAME
+       AND xt.league      = wl.league
+       AND xt.season      = wl.season
+       AND xt.confidence <> 'orphan'
+    LEFT JOIN xref_player_dedup xp
+        ON  xp.source     = 'whoscored'
+       AND xp.source_id   = wl.player_id
+),
+
+-- ============================================================================
 -- 4) UNION + dedup
 -- ============================================================================
 all_lineups AS (
     SELECT * FROM fbref_resolved
     UNION ALL
     SELECT * FROM espn_resolved
+    UNION ALL
+    SELECT * FROM sofascore_resolved
+    UNION ALL
+    SELECT * FROM fotmob_resolved
+    UNION ALL
+    SELECT * FROM whoscored_resolved
 ),
 
 dedup AS (
@@ -406,9 +583,11 @@ SELECT
     d.is_starter,
     d.position_canonical            AS position,
     d.jersey_number,
-    -- is_captain (#439): SofaScore-sourced; NULL where no SofaScore coverage
+    -- is_captain: native captain of the winning source first (SofaScore rows
+    -- carry it from /lineups; #693), then the SofaScore captain bridge as a
+    -- fallback for FBref rows (#439). NULL where neither covers the player
     -- (all ESPN rows, plus FBref players absent from SofaScore /lineups).
-    sc.is_captain                   AS is_captain,
+    COALESCE(d.is_captain, sc.is_captain)  AS is_captain,
     d.lineup_source,
     'v1'                            AS lineup_version,
     d.league,

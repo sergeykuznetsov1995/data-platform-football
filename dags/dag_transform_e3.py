@@ -120,6 +120,15 @@ SILVER_E3_TRANSFORMS = [
         'whoscored_events_spadl',
     ),
     (
+        # issue #693: per-(match, player) lineup INFERRED from bronze.whoscored_events
+        # (appeared & not subbed-on ⇒ starter) + whoscored_schedule team-name bridge.
+        # Feeds the WhoScored branch of gold.fct_lineup (player_id + is_starter only;
+        # position/captain/jersey NULL — WhoScored events have no lineup block).
+        'whoscored_lineup',
+        'dags/sql/silver/whoscored_lineup.sql',
+        'whoscored_lineup',
+    ),
+    (
         'espn_lineup',
         'dags/sql/silver/espn_lineup.sql',
         'espn_lineup',

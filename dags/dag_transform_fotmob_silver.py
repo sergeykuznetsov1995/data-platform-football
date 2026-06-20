@@ -95,6 +95,14 @@ SILVER_TRANSFORMS = [
         'dags/sql/silver/fotmob_player_match_aggregate.sql',
         'fotmob_player_match_aggregate',
     ),
+    # issue #693: per-(match, player) lineup из bronze.fotmob_match_details
+    # .lineup_json (starters/subs × home/away). Питает FotMob-ветку
+    # gold.fct_lineup (is_starter + jersey + position-code; is_captain=NULL).
+    (
+        'lineup',
+        'dags/sql/silver/fotmob_lineup.sql',
+        'fotmob_lineup',
+    ),
     # issue #290: судья матча + СТРАНА (FotMob-only) из match_facts_json.
     # Future namesake-дизамбигуатор для xref_referee при мульти-лиговом scope.
     (
@@ -146,6 +154,9 @@ SILVER_MIN_ROWS = {
     # player_match_aggregate: ~334 finished matches × ~28 сыгравших игроков ≈
     # 11.1K rows (live-verified 2026-06-20). Floor 6000 с запасом под 7% bronze-gap.
     'fotmob_player_match_aggregate': 6000,
+    # lineup: ~294 matches × ~40 named players (11 start + ~9 subs, ×2 sides) ≈
+    # 11.8K rows (live-verified 2026-06-20). Floor 6000 с запасом под bronze-gap.
+    'fotmob_lineup': 6000,
     # match_referee: ~380 матчей APL 2025/26 со 100% покрытием судьи (issue #290).
     # Floor 300 c headroom под матчи без referee.text.
     'fotmob_match_referee': 300,
@@ -456,6 +467,29 @@ def _validate_silver_quality(**context) -> Dict[str, Any]:
         ),
         CHECK.freshness(
             'silver.fotmob_player_match_aggregate',
+            ts_col='_bronze_ingested_at',
+            max_age_hours=FRESH_HOURS,
+            severity='WARNING',
+        ),
+        # --- lineup (issue #693): per-(match, player) starters+subs ---
+        CHECK.no_nulls(
+            'silver.fotmob_lineup',
+            cols=['match_id', 'player_id', 'league', 'season'],
+        ),
+        CHECK.no_duplicates(
+            'silver.fotmob_lineup',
+            pk=['match_id', 'player_id'],
+        ),
+        CHECK.row_count('silver.fotmob_lineup', min_rows=6000),
+        # is_starter must populate (catches a parse regression where every row
+        # falls into one bucket). ~22 starters/match → a healthy floor.
+        CHECK.row_count(
+            'silver.fotmob_lineup',
+            min_rows=3000,
+            where='is_starter = true',
+        ),
+        CHECK.freshness(
+            'silver.fotmob_lineup',
             ts_col='_bronze_ingested_at',
             max_age_hours=FRESH_HOURS,
             severity='WARNING',
