@@ -458,3 +458,18 @@ class TestGoldFctPlayerUnavailable:
 
         rows = self._run_gold(con)
         assert rows == [], "orphan-match silver row must be filtered out of Gold"
+
+    def test_no_legacy_entity_xref_in_executable_sql(self):
+        """#703: fct_player_unavailable must NOT reference gold.entity_xref in
+        executable SQL. Header/inline comments may legitimately mention the
+        historical breadcrumb (this file never JOINed entity_xref) — strip
+        ``-- ...`` lines first, then assert no executable reference survives."""
+        text = GOLD_SQL.read_text(encoding="utf-8")
+        non_comment = "\n".join(
+            line for line in text.splitlines()
+            if not line.lstrip().startswith("--")
+        )
+        assert "entity_xref" not in non_comment, (
+            "fct_player_unavailable.sql references entity_xref in executable "
+            "SQL — only comment breadcrumbs are allowed (#703)"
+        )
