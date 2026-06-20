@@ -246,6 +246,19 @@ SILVER_E3_TRANSFORMS = [
         'sofascore_shots',
     ),
     (
+        # issue #704 (Gold one-hop): shot-grained Understat shotmap conform,
+        # canonicalised to fct_shot's team/player IDs + enum domains. Reads
+        # bronze.understat_shots + bronze.understat_players (assist name dict)
+        # + silver.xref_{team,player} (source='understat') — MUST run after
+        # dag_transform_xref. Consumer: gold.fct_shot (#699) primary branch,
+        # which now reads this instead of bronze (keeping only the
+        # understat_schedule → fbref match bridge). The match_id bridge stays
+        # in Gold (cross-source; xref_match has no understat rows yet).
+        'understat_shots',
+        'dags/sql/silver/understat_shots.sql',
+        'understat_shots',
+    ),
+    (
         # issue #702: conform-only SofaScore standings snapshot. Reads
         # bronze.sofascore_league_table (dedup ROW_NUMBER, cast, season-slug as-is)
         # — NO silver.xref reads (canonical resolve deferred to Gold per charter §5),

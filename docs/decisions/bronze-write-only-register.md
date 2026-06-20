@@ -137,7 +137,65 @@ documented here; no tracking issue (avoids p3 issue-spam):
 
 ---
 
-## 5. Changelog
+## 5. Gold tables reading Bronze directly — one-hop audit (#704)
+
+> **Distinct category from the §1 write-only register.** These Bronze tables ARE
+> read (by Gold). #704 asked about **one-hop purity** (Gold = one-hop from
+> Silver), not write-only status. Full scan:
+> `grep -n 'iceberg\.bronze\.' dags/sql/gold/*.sql[.j2]` (non-comment FROM/JOIN).
+
+Verdict vocabulary: **norm** (sanctioned bridge or source-without-Silver — keep);
+**done** (already reads Silver); **fixed #704** (Silver lifted in this PR);
+**followup** (tracked issue).
+
+| Gold table | Bronze read | Type | Verdict |
+|---|---|---|---|
+| `fct_lineup` | `espn_schedule` | `*_schedule` bridge | norm |
+| `fct_match_timeline` | `whoscored_schedule` | `*_schedule` bridge | norm |
+| `fct_team_match` (`.j2`/`_audit`) | `whoscored_schedule` | `*_schedule` bridge | norm |
+| `fct_team_season_stats` (`.j2`/`_audit`) | `whoscored_schedule` | `*_schedule` bridge | norm |
+| `dim_match` | `fbref_match_managers` | source w/o Silver | norm |
+| `fct_manager_stint` | `fbref_match_managers` | source w/o Silver | norm |
+| `fct_team_elo` | `clubelo_ratings` (+`_historical`) | source w/o Silver | norm |
+| `fct_standings` | — | reads Silver | done (#702) |
+| `fct_event` | `whoscored_events` | `team_id→team_name` bridge (NOT event data; ~2 rows/fixture out; ADR-2 inline) | norm (sanctioned bridge) |
+| `fct_shot` | `understat_shots`, `understat_players` | shot DATA + assist dict | **fixed #704** |
+| `dim_venue` | `espn_matchsheet` | venue-name DATA | followup [#735] |
+| `fct_match_timeline` | `whoscored_events` | raw card/sub/goal DATA (fallback) | followup [#736] |
+| `fct_team_season_stats.j2` | `whoscored_events` | penalty DATA (#161) | followup [#736] |
+
+**`fct_event` (norm, not data):** the issue flagged it priority-#1 ("709k rows,
+high volume"), but the `bronze.whoscored_events` read is the `event_team_names`
+CTE — a `(game_id, team_id) → team_name` bridge feeding `xref_team`, NOT a read
+of SPADL event data (which comes from `silver.whoscored_events_spadl`). The 709k
+is fct_event's output grain, not the bronze scan result (~2 rows/fixture out).
+Documented as a sanctioned name-bridge (analogous to the `*_schedule` bridges);
+SQL unchanged. Optional future cleanup: carry `team` into
+`silver.whoscored_events_spadl` to drop the bridge entirely — low priority.
+
+**`fct_shot` fix (#704):** new `silver.understat_shots` (mirrors
+`silver.sofascore_shots`) conforms the Understat shotmap + resolves
+team/player/assist via `xref_*` with the `(league, season)` predicate;
+`gold.fct_shot` now reads it. The only bronze read kept in `fct_shot` is
+`bronze.understat_schedule` — the understat→fbref `*_schedule` match bridge —
+because `xref_match` has no `source='understat'` rows yet (Phase B), so the
+cross-source match-id bridge stays a Gold job by charter §5.
+
+Row-level `EXCEPT` diff (old vs new `gold.fct_shot`, 58580 rows each, PK-paired
+1:1 — no row added/dropped): **167 rows (0.285%) differ, all in canonical
+resolution only** — `team_id`, `xg`, coords, `result`, `minute` are identical.
+The shift is `player_id` (60) + `assist_player_id` (107), driven by the mandatory
+`(league, season)` xref predicate: the old Gold path joined `xref_player` on
+`source_id` alone (`ARBITRARY` across seasons), the new path joins the full key
+(charter R3, like `sofascore_shots`). 53 of these are `xref_player` season-coverage
+gaps the old cross-season borrow masked (now orphan-tolerant NULL); 7 are
+season-drift canonicals the new path resolves season-correctly. `null_player`
+225 vs ~172 — well within the `shot_orphan_player_rate ≤ 3290` DQ gate. Coverage
+gap tracked as followup [#738].
+
+---
+
+## 6. Changelog
 
 | Date | Change | Ref |
 |---|---|---|
@@ -150,6 +208,8 @@ documented here; no tracking issue (avoids p3 issue-spam):
 | 2026-06-20 | 3 FBref non-prod-producer orphans stopped + dropped (`fbref_player_stats_extended` 551, `fbref_team_stats_extended` 20, `fbref_keeper_stats` 40): producer existed only in selenium `scrape_all` (`--mode full`, never run by prod), not in the parser contract, 0 Silver/Gold readers, superseded by per-stat-type tables + Silver joins. Removed producer + orphan merge helpers/tests; dropped tables. Mirrors #604. Not part of the §1 write-only set. | #614 |
 | 2026-06-20 | `fbref_keeper_keeper_adv` scrape **stopped** + table **dropped**: removed `'keeper_adv'` from `KEEPER_STAT_TYPES` (DAG no longer creates the `keeper_keeper_adv` task), cleaned dormant url-mapping/schema/docstrings, dropped the 3 `audit_bronze_columns.py` entries (`EXPECTED_NULL`/`EXPECTED_CONSTANT`/contract), removed the OM description YAML, `DROP TABLE` via `scripts/drop_fbref_keeper_keeper_adv.sql`. 26 cols 100% NULL since FBref Feb-2026; core cols duplicate the consumed `fbref_keeper_keeper`. 3 → 2 live write-only. | #606 |
 
+| 2026-06-20 | §5 added — Gold→Bronze one-hop audit (#704): `fct_shot` lifted to `silver.understat_shots` (was direct `bronze.understat_shots` + `understat_players`; only the `understat_schedule` match bridge kept in Gold); `fct_event` documented as a sanctioned `team_id→name` bridge (SQL unchanged); `fct_standings` already Silver (#702); `dim_venue` (#735) + `whoscored_events` data reads in `fct_match_timeline`/`fct_team_season_stats` (#736) filed as followups. | #704 |
+
 [#476]: https://github.com/sergeykuznetsov1995/data-platform-football/issues/476
 [#600]: https://github.com/sergeykuznetsov1995/data-platform-football/issues/600
 [#601]: https://github.com/sergeykuznetsov1995/data-platform-football/issues/601
@@ -158,3 +218,7 @@ documented here; no tracking issue (avoids p3 issue-spam):
 [#604]: https://github.com/sergeykuznetsov1995/data-platform-football/issues/604
 [#606]: https://github.com/sergeykuznetsov1995/data-platform-football/issues/606
 [#614]: https://github.com/sergeykuznetsov1995/data-platform-football/issues/614
+[#704]: https://github.com/sergeykuznetsov1995/data-platform-football/issues/704
+[#735]: https://github.com/sergeykuznetsov1995/data-platform-football/issues/735
+[#736]: https://github.com/sergeykuznetsov1995/data-platform-football/issues/736
+[#738]: https://github.com/sergeykuznetsov1995/data-platform-football/issues/738
