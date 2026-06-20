@@ -217,3 +217,117 @@ class TestRunSofifaVersionsParsing:
         )
 
         assert scraper_cls.call_args.kwargs["versions"] == "all"
+
+
+# ---------------------------------------------------------------------------
+# #583: completeness-guard wiring
+# ---------------------------------------------------------------------------
+def _build_guard_scraper(*, guard_blocks: bool = False, with_edition: bool = True):
+    """Stub SoFIFAScraper whose ``read_teams`` returns a non-empty frame (every
+    other read stays empty) so exactly one ``save_to_iceberg`` is reached.
+    ``teams`` takes the direct save path (no ``_process_*`` step), keeping the
+    guard assertion isolated.
+
+    ``with_edition=False`` drops the ``fifa_edition`` column → the dynamic
+    ``part`` is ``None`` → the guard must NOT be armed (passing
+    ``min_replace_ratio`` without ``replace_partitions`` would raise
+    ``ValueError``). ``guard_blocks=True`` simulates the BaseScraper-level guard
+    refusing the save (``ReplaceGuardError``).
+    """
+    from scrapers.base.base_scraper import ReplaceGuardError
+
+    cols = {
+        'team': [f'Team {i}' for i in range(20)],
+        'overall': [70 + i for i in range(20)],
+    }
+    if with_edition:
+        cols = {'fifa_edition': ['24'] * 20, **cols}
+    df = pd.DataFrame(cols)
+
+    scraper = MagicMock()
+    scraper.get_traffic_stats.return_value = {}
+    for method in _READ_METHODS:
+        getattr(scraper, method).return_value = pd.DataFrame()
+    scraper.read_teams.return_value = df
+    if guard_blocks:
+        scraper.save_to_iceberg.side_effect = ReplaceGuardError(
+            "new=2 rows < 90% of existing=20 for bronze.sofifa_teams "
+            "— refusing replace_partitions save (would shrink the partition)"
+        )
+    else:
+        scraper.save_to_iceberg.return_value = 'iceberg.bronze.sofifa_teams'
+    scraper.__enter__ = MagicMock(return_value=scraper)
+    scraper.__exit__ = MagicMock(return_value=False)
+    return scraper
+
+
+class TestSofifaReplaceGuard:
+    """#583: completeness-guard wiring in the SoFIFA runner.
+
+    Arms the guard per-table, maps ``ReplaceGuardError`` to exit 3, lets
+    ``--force-replace`` disarm it, and — uniquely for SoFIFA — keeps the guard
+    OFF when the dynamic ``part`` is ``None`` (``fifa_edition`` absent).
+    """
+
+    @pytest.fixture
+    def temp_output(self):
+        fd, path = tempfile.mkstemp(suffix=".json", prefix="sofifa_")
+        os.close(fd)
+        yield path
+        if os.path.exists(path):
+            os.unlink(path)
+
+    @pytest.mark.unit
+    def test_guard_refusal_exits_3(self, temp_output):
+        """save_to_iceberg raises ReplaceGuardError → exit 3 +
+        SOFIFA_REPLACE_GUARD marker (distinct from the exit-1 path)."""
+        scraper = _build_guard_scraper(guard_blocks=True)
+
+        rc = _run_main(["--output", temp_output], MagicMock(return_value=scraper))
+
+        assert rc == 3
+        scraper.save_to_iceberg.assert_called_once()
+        with open(temp_output) as f:
+            payload = json.load(f)
+        assert any("SOFIFA_REPLACE_GUARD" in e for e in payload["errors"])
+
+    @pytest.mark.unit
+    def test_normal_path_arms_guard_exits_0(self, temp_output):
+        """Non-force run with fifa_edition present passes min_replace_ratio=0.9
+        (raw COUNT(*), no key)."""
+        scraper = _build_guard_scraper()
+
+        rc = _run_main(["--output", temp_output], MagicMock(return_value=scraper))
+
+        assert rc == 0
+        kwargs = scraper.save_to_iceberg.call_args.kwargs
+        assert kwargs["min_replace_ratio"] == 0.9
+        assert kwargs["replace_partitions"] == ["fifa_edition"]
+        # full-state per fifa_edition → raw COUNT(*), no replace_guard_key
+        assert "replace_guard_key" not in kwargs
+
+    @pytest.mark.unit
+    def test_force_replace_disarms_guard(self, temp_output):
+        """--force-replace must pass min_replace_ratio=None to the save."""
+        scraper = _build_guard_scraper()
+
+        rc = _run_main(
+            ["--force-replace", "--output", temp_output],
+            MagicMock(return_value=scraper),
+        )
+
+        assert rc == 0
+        assert scraper.save_to_iceberg.call_args.kwargs["min_replace_ratio"] is None
+
+    @pytest.mark.unit
+    def test_missing_partition_col_does_not_arm_guard(self, temp_output):
+        """No fifa_edition → dynamic part is None → guard stays OFF
+        (min_replace_ratio=None, replace_partitions=None) with NO ValueError."""
+        scraper = _build_guard_scraper(with_edition=False)
+
+        rc = _run_main(["--output", temp_output], MagicMock(return_value=scraper))
+
+        assert rc == 0
+        kwargs = scraper.save_to_iceberg.call_args.kwargs
+        assert kwargs["replace_partitions"] is None
+        assert kwargs["min_replace_ratio"] is None
