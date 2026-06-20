@@ -8,6 +8,10 @@
 --   reason — enum injury | suspension | other (raw source label kept in detail).
 --   PK verified duplicate-free on (match_id, player_id) pre-cutover (#426 step 0).
 --
+-- #703: dropped legacy gold.entity_xref breadcrumbs — this file never read it;
+--   it bridges via dim_match/dim_team + the silver.xref_team canonical slug
+--   universe. entity_xref physical drop = followup #211.
+--
 -- Sources:
 --   iceberg.silver.whoscored_player_unavailable  — primary
 --   iceberg.gold.dim_match                       — cross-source match bridge
@@ -17,7 +21,8 @@
 -- Cross-source resolution (architectural decisions D2 + D4):
 --   * match_id: Silver `match_id` is the WhoScored `game` string, NOT the FBref
 --     hex slug used by dim_match. We bridge via (match_date, home_slug, away_slug)
---     using the same slug algorithm as `entity_xref` for FBref teams.
+--     using the same canonical-slug algorithm that produces dim_match team_id
+--     (the FBref-canonical slug universe surfaced by `silver.xref_team`).
 --
 --   * team_id: canonical slug of the WhoScored team name. Mismatches (e.g.
 --     "Wolverhampton" vs "Wolves") surface as NULL team_id and are tracked via
@@ -32,8 +37,9 @@
 -- =============================================================================
 
 WITH u AS (
-    -- Compute the canonical team slug once — same algorithm as entity_xref
-    -- for FBref teams, so the match-bridge join below aligns slug universes.
+    -- Compute the canonical team slug once — same algorithm that produces the
+    -- FBref-canonical dim_match team_id (`silver.xref_team` canonical_id), so the
+    -- match-bridge join below aligns slug universes.
     SELECT
         match_date,
         league,
@@ -44,7 +50,8 @@ WITH u AS (
         reason,
         _bronze_ingested_at,
         -- Strip diacritics before slugging (issue #215) so the slug universe
-        -- aligns with entity_xref / dim_match regardless of accent spelling.
+        -- aligns with dim_match (`silver.xref_team` canonical slugs) regardless
+        -- of accent spelling.
         LOWER(REGEXP_REPLACE(
             REGEXP_REPLACE(NORMALIZE(team_name, NFD), '\p{Mn}+', ''),
             '[^a-zA-Z0-9]+', '_')) AS team_slug
