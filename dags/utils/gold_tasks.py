@@ -621,8 +621,12 @@ def _star_gate_dim_fk_checks() -> List:
         # Baseline 99.7% non-NULL (172/58580 NULL).
         CHECK.coverage('gold.fct_shot', column='player_id',
                        warn_threshold=0.95, error_threshold=0.85),
-        # Baseline 64.9% non-NULL — ESPN rows resolve no player_id for ~35%
-        # of the table (77K/220K); thresholds sit under the live share.
+        # #692: ESPN players now resolve via xref_player, so resolved ESPN rows
+        # dedup against their FBref twin and the non-NULL player_id share rises
+        # well above the pre-#692 64.9% baseline (only ESPN-exclusive / orphan /
+        # out-of-scope rows keep NULL). Thresholds stay as conservative lower
+        # bounds until the post-#692 live share is measured — re-baseline and
+        # tighten on the first prod run (tracked in the #692 verification step).
         CHECK.coverage('gold.fct_lineup', column='player_id',
                        warn_threshold=0.60, error_threshold=0.50),
     ]

@@ -112,7 +112,7 @@ SURNAME_MIN_LEN: int = 4
 #: read time, not by a dedicated tier.
 SOURCES: Tuple[str, ...] = (
     'fbref', 'understat', 'whoscored', 'fotmob', 'sofascore',
-    'transfermarkt', 'capology', 'sofifa',
+    'transfermarkt', 'capology', 'sofifa', 'espn',
 )
 
 #: Default batch size for ``INSERT INTO ... VALUES (...)``. 500 fits
@@ -645,6 +645,7 @@ def _orphan_prefix(source: str) -> str:
         'transfermarkt': 'tm',
         'capology':      'cap',
         'sofifa':        'sf',
+        'espn':          'es',
     }[source]
 
 
@@ -1214,6 +1215,59 @@ def _fetch_sofifa_players(
     return out
 
 
+def _fetch_espn_players(
+    conn, league: str, source_seasons: List[str]
+) -> List[Dict[str, Any]]:
+    """Read ESPN player anchor rows for the resolver cascade (#692).
+
+    ESPN's matchsheet lineups (``bronze.espn_lineup``) carry NO native
+    player_id — the only identity columns are the player display ``name`` and
+    the ``team``. We therefore synthesise ``source_id = '<player>|<team>'`` so
+    the ``xref_player`` PK ``(source, source_id, league, season)`` stays unique
+    even for namesakes on different clubs (mirrors the silver.espn_lineup dedup
+    grain of (match_id, team, player)). The downstream gold/fct_lineup JOIN
+    keys on (display_name, raw_team_name, league, season), NOT on this
+    composite, so the delimiter choice is internal to the resolver.
+
+    Season is the 4-digit slug ('2526') exactly as Understat/WhoScored store
+    it, so no slug conversion is needed. There is no minutes/games proxy on
+    ESPN lineups, so ``bronze_signal`` degenerates to the -1.0 sentinel (like
+    Transfermarkt / Capology / SoFIFA).
+    """
+    sql = f"""
+        SELECT
+            player,
+            team,
+            league,
+            CAST(season AS varchar) AS season
+        FROM iceberg.bronze.espn_lineup
+        WHERE league = '{_sql_escape(league)}'
+          AND season IN ({_seasons_in_clause(source_seasons)})
+          AND player IS NOT NULL
+          AND team IS NOT NULL
+        GROUP BY player, team, league, CAST(season AS varchar)
+    """
+    rows = _execute(conn, sql, fetch=True) or []
+    out: List[Dict[str, Any]] = []
+    for name, team, lg, season in rows:
+        out.append(
+            {
+                'source': 'espn',
+                # Composite identity — ESPN has no native player_id.
+                'source_id': f"{name}|{team}",
+                'player_name': name,
+                'raw_team_name': team,
+                'canonical_team': canonical_team_for_resolver(team, 'espn'),
+                'league': lg,
+                'season': season,
+                # No minutes/games proxy on ESPN lineups; dedup tiebreaker
+                # degenerates to source_id ordering for canonical collisions.
+                'bronze_signal': -1.0,
+            }
+        )
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Trino write helpers
 # ---------------------------------------------------------------------------
@@ -1475,6 +1529,7 @@ def _resolve_all(
     tm_rows: Optional[List[Dict[str, Any]]] = None,
     cap_rows: Optional[List[Dict[str, Any]]] = None,
     sf_rows: Optional[List[Dict[str, Any]]] = None,
+    es_rows: Optional[List[Dict[str, Any]]] = None,
     *,
     nn: Any = None,
     detected_at: Any = None,
@@ -1554,7 +1609,9 @@ def _resolve_all(
     tm_rows = tm_rows or []
     cap_rows = cap_rows or []
     sf_rows = sf_rows or []
-    for src_rows in (us_rows, ws_rows, fm_rows, ss_rows, tm_rows, cap_rows, sf_rows):
+    es_rows = es_rows or []
+    for src_rows in (us_rows, ws_rows, fm_rows, ss_rows, tm_rows, cap_rows,
+                     sf_rows, es_rows):
         for row in src_rows:
             ambiguity_info: Dict[str, Any] = {}
             cid, conf, score = cascade_resolve(
@@ -1887,9 +1944,13 @@ def run_resolver(
         sf = _fetch_sofifa_players(conn, league, source_seasons)
         logger.info("  %d SoFIFA players", len(sf))
 
+        logger.info("Reading ESPN players ...")
+        es = _fetch_espn_players(conn, league, source_seasons)
+        logger.info("  %d ESPN players", len(es))
+
         logger.info("Resolving identities ...")
         rows, review_rows, stats = _resolve_all(
-            fb, us, ws, ss, fm, tm, cap, sf, nn=nn, detected_at=detected_at
+            fb, us, ws, ss, fm, tm, cap, sf, es, nn=nn, detected_at=detected_at
         )
         logger.info(
             "  produced %d xref rows, %d review rows",

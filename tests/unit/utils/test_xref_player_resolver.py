@@ -655,6 +655,57 @@ class TestResolveAll:
             'total': 2, 'resolved': 1, 'orphan': 1, 'ambiguous': 0,
         }
 
+    def test_espn_cascade(self):
+        """ESPN (#692): no native player_id → source_id is the ``player|team``
+        composite built by ``_fetch_espn_players``. Rows cascade against the
+        FBref spine exactly like the other sources; orphans carry 'es_'.
+        """
+        fb = [self._fb_row('bc7dc64d', 'Bukayo Saka', 'Arsenal')]
+        # ESPN row: same name + team -> resolves to Saka.
+        es_match = self._src_row(
+            'espn', 'Bukayo Saka|Arsenal', 'Bukayo Saka', 'Arsenal',
+        )
+        # ESPN row: name unknown -> orphan with 'es_' prefix.
+        es_orphan = self._src_row(
+            'espn', 'Unknown Player|Arsenal', 'Unknown Player', 'Arsenal',
+        )
+
+        rows, _review, stats = xpr._resolve_all(
+            fb, [], [], [], None, None, None, None, [es_match, es_orphan],
+        )
+
+        by_src = {(r['source'], r['source_id']): r for r in rows}
+        assert by_src[('espn', 'Bukayo Saka|Arsenal')]['canonical_id'] == 'fb_bc7dc64d'
+        assert by_src[('espn', 'Bukayo Saka|Arsenal')]['confidence'] == 'name_team'
+        assert by_src[('espn', 'Unknown Player|Arsenal')]['canonical_id'] \
+            == 'es_Unknown Player|Arsenal'
+        assert by_src[('espn', 'Unknown Player|Arsenal')]['confidence'] == 'orphan'
+
+        assert stats['espn'] == {
+            'total': 2, 'resolved': 1, 'orphan': 1, 'ambiguous': 0,
+        }
+
+    def test_espn_namesakes_distinct_source_id(self):
+        """ESPN namesakes on different clubs must NOT collide on the
+        ``(source, source_id, league, season)`` PK — the ``player|team``
+        composite keeps them distinct even when both orphan.
+        """
+        fb = [self._fb_row('bc7dc64d', 'Bukayo Saka', 'Arsenal')]
+        es_a = self._src_row('espn', 'John Smith|Arsenal', 'John Smith', 'Arsenal')
+        es_b = self._src_row('espn', 'John Smith|Chelsea', 'John Smith', 'Chelsea')
+
+        rows, _review, _stats = xpr._resolve_all(
+            fb, [], [], [], None, None, None, None, [es_a, es_b],
+        )
+        es_rows = [r for r in rows if r['source'] == 'espn']
+        assert len(es_rows) == 2
+        assert {r['source_id'] for r in es_rows} == {
+            'John Smith|Arsenal', 'John Smith|Chelsea',
+        }
+        assert {r['canonical_id'] for r in es_rows} == {
+            'es_John Smith|Arsenal', 'es_John Smith|Chelsea',
+        }
+
 
 # ---------------------------------------------------------------------------
 # Season helpers

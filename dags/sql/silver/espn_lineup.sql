@@ -43,10 +43,11 @@
 --                                       (date, home_canonical_id, away_canonical_id).
 --   team                  varchar    -- direct
 --   player                varchar    -- direct (FBref column name preserved)
---   player_id             varchar    -- ESPN has NO native player_id → NULL.
---                                       xref_player resolves by (name, team) for ESPN
---                                       in a follow-up; fct_lineup carries 'es_<hash>'
---                                       orphan id assigned downstream if unresolved.
+--   player_id             varchar    -- ESPN has NO native player_id → NULL here.
+--                                       Resolution happens at Gold: fct_lineup
+--                                       LEFT JOINs silver.xref_player (source='espn',
+--                                       keyed on display_name+raw_team_name) to fill
+--                                       player_id_canonical by (name, team) (#692).
 --   is_starter            boolean    -- derived ONLY from sub_in = 'start'.
 --                                       formation_place is NOT a usable fallback
 --                                       (bench rows have '0', not NULL).

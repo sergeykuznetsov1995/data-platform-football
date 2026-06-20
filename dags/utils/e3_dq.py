@@ -823,7 +823,10 @@ def _build_fct_lineup_checks() -> List[Check]:
     Smoke-test verdict (pre-#693): 159,445 rows, FBref bulk + ESPN secondary
     (90.8% bridge success). row_count guards lock the distribution:
       * fbref     ≥ 100K (ERROR — FBref is the canonical source, must dominate)
-      * espn      ≥ 5K   (WARNING — ESPN coverage is partial by design)
+      * espn      ≥ 5K   (WARNING — #692 wired the ESPN player resolver, so
+        resolved ESPN rows now dedup UNDER their FBref twin; the surviving
+        lineup_source='espn' count = ESPN-exclusive / bridge-miss / unresolved
+        only. Re-baseline post-#692 live; this floor may need lowering.)
       * sofascore ≥ 500  (WARNING, #693 — net contribution = matches/players
         FBref does NOT already cover; most SofaScore rows dedup UNDER FBref, so
         the surviving count is small. Live 2026-06-20: 682 rows survived as
@@ -836,13 +839,13 @@ def _build_fct_lineup_checks() -> List[Check]:
     """
     table = 'iceberg.gold.fct_lineup'
 
-    # Orphan rate measured on FBref rows ONLY (#519). ESPN player_id is NULL
-    # by design — there is no ESPN player resolver (see fct_lineup.sql ADR
-    # "player_id resolution"), so every ESPN row is an expected NULL. Counting
-    # ESPN turned this guard into pure noise (~74.6K expected NULLs vs a 15.9K
-    # cap → permanently red, masking real resolver regressions). FBref ≈ 145K
-    # rows; the resolver legitimately misses out-of-scope seasons (~2.7K live).
-    # Cap at 10% × 145K ≈ 14,500.
+    # Orphan rate measured on FBref rows ONLY (#519). Scoping to FBref keeps
+    # this guard meaningful even after #692 wired the ESPN player resolver:
+    # ESPN rows now resolve via xref_player, but resolved ones dedup into their
+    # FBref twin (FBref priority wins), so the surviving ESPN population is the
+    # noisy tail (ESPN-exclusive / bridge-miss / out-of-scope) and would still
+    # muddy a whole-table orphan rate. FBref ≈ 145K rows; the resolver
+    # legitimately misses out-of-scope seasons (~2.7K live). Cap 10% × 145K.
     lineup_fbref_orphan_max = int(0.10 * 145_000)
 
     return [
@@ -905,7 +908,10 @@ def _build_fct_lineup_checks() -> List[Check]:
             severity='ERROR',
             name='fbref_coverage_dominant',
         ),
-        # ESPN coverage is partial by design — WARNING only.
+        # ESPN coverage — WARNING only. Post-#692 resolved ESPN rows dedup into
+        # their FBref twin, so surviving lineup_source='espn' rows are the tail
+        # (ESPN-exclusive / bridge-miss / unresolved). Floor kept at 5K pending
+        # a live re-baseline; lower it if the post-#692 survivor count is below.
         CHECK.row_count(
             table=table,
             min_rows=5_000,
