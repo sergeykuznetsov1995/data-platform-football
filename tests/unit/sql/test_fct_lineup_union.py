@@ -573,7 +573,8 @@ def bridge_conn(duck_conn):
     )
     duck_conn.execute(
         "CREATE TABLE silver_xref_player (source VARCHAR, source_id VARCHAR, "
-        "canonical_id VARCHAR, league VARCHAR, season VARCHAR)"
+        "canonical_id VARCHAR, league VARCHAR, season VARCHAR, "
+        "display_name VARCHAR, raw_team_name VARCHAR)"
     )
     yield duck_conn
 
@@ -786,7 +787,9 @@ class TestCaptainEnrichment:
             [_LEAGUE, _SEASON],
         )
         con.execute(
-            "INSERT INTO silver_xref_player VALUES ('fbref', 'p99', 'fb_p99', ?, ?)",
+            "INSERT INTO silver_xref_player "
+            "(source, source_id, canonical_id, league, season) "
+            "VALUES ('fbref', 'p99', 'fb_p99', ?, ?)",
             [_LEAGUE, _SEASON],
         )
 
@@ -799,7 +802,9 @@ class TestCaptainEnrichment:
             [_FB_HEX, _LEAGUE, _SEASON],
         )
         con.execute(
-            "INSERT INTO silver_xref_player VALUES ('sofascore', 'ssp', 'fb_p99', ?, ?)",
+            "INSERT INTO silver_xref_player "
+            "(source, source_id, canonical_id, league, season) "
+            "VALUES ('sofascore', 'ssp', 'fb_p99', ?, ?)",
             [_LEAGUE, _SEASON],
         )
         con.execute(
@@ -830,6 +835,67 @@ class TestCaptainEnrichment:
         out = _run_lineup_gold(bridge_conn)
         assert len(out) == 1, out
         assert out[0]["is_captain"] is None, out
+
+
+class TestEspnPlayerResolution:
+    """#692: ESPN lineup player_id resolves via silver.xref_player.
+
+    The espn_resolved CTE LEFT JOINs xref_player (source='espn') keyed on
+    (display_name, raw_team_name, league, season) — no native ESPN player_id
+    exists, so the resolver matches by name+team and surfaces the canonical_id.
+    """
+
+    def test_espn_player_resolves_to_canonical(self, bridge_conn):
+        """A matching xref_player ESPN row → player_id carries its canonical."""
+        _seed_espn_corpus(bridge_conn)
+        # Canonical xref_player row for the seeded ESPN lineup player.
+        # Column order: source, source_id, canonical_id, league, season,
+        # display_name, raw_team_name.
+        bridge_conn.execute(
+            "INSERT INTO silver_xref_player VALUES "
+            "('espn', 'ESPN Player A|Liverpool', 'fb_saka', ?, ?, "
+            "'ESPN Player A', 'Liverpool')",
+            [_LEAGUE, _SEASON],
+        )
+        # Schedule row so the bridge maps the espn match → FBref hex.
+        bridge_conn.execute(
+            _SCHEDULE_ROW,
+            [_LEAGUE, _SEASON, _GAME, "Liverpool", "2026-02-01 06:00:00"],
+        )
+        out = _run_lineup_gold(bridge_conn)
+        assert len(out) == 1, out
+        assert out[0]["player_id"] == "fb_saka", out
+        assert out[0]["lineup_source"] == "espn", out
+
+    def test_espn_player_unresolved_stays_null(self, bridge_conn):
+        """No matching xref_player row → player_id NULL (unresolved ESPN)."""
+        _seed_espn_corpus(bridge_conn)
+        bridge_conn.execute(
+            _SCHEDULE_ROW,
+            [_LEAGUE, _SEASON, _GAME, "Liverpool", "2026-02-01 06:00:00"],
+        )
+        out = _run_lineup_gold(bridge_conn)
+        assert len(out) == 1, out
+        assert out[0]["player_id"] is None, out
+
+    def test_espn_xref_player_join_does_not_fan_out(self, bridge_conn):
+        """A wrong-season xref_player row must NOT match (league+season
+        predicate present → no fan-out, footgun #205)."""
+        _seed_espn_corpus(bridge_conn)
+        # xref_player row for a DIFFERENT season → must not join.
+        bridge_conn.execute(
+            "INSERT INTO silver_xref_player VALUES "
+            "('espn', 'ESPN Player A|Liverpool', 'fb_saka', ?, '2425', "
+            "'ESPN Player A', 'Liverpool')",
+            [_LEAGUE],
+        )
+        bridge_conn.execute(
+            _SCHEDULE_ROW,
+            [_LEAGUE, _SEASON, _GAME, "Liverpool", "2026-02-01 06:00:00"],
+        )
+        out = _run_lineup_gold(bridge_conn)
+        assert len(out) == 1, out
+        assert out[0]["player_id"] is None, out
 
 
 class TestSqlInvariants:
@@ -890,3 +956,20 @@ class TestSqlInvariants:
         assert re.search(
             r"'espn'\s+AS\s+lineup_source", sql, re.IGNORECASE
         ), "missing `'espn' AS lineup_source`"
+
+    def test_espn_branch_resolves_player_via_xref_player(self):
+        """#692: espn_resolved must LEFT JOIN xref_player (source='espn') keyed
+        on display_name + raw_team_name, replacing the hardcoded NULL canonical.
+        """
+        normalised = re.sub(r"\s+", " ", self._sql())
+        assert re.search(
+            r"xref_player\s+\w+\s+ON\s+\w+\.source\s*=\s*'espn'",
+            normalised, re.IGNORECASE,
+        ), "espn_resolved must LEFT JOIN silver.xref_player on source='espn'"
+        # The JOIN keys on the ESPN identity (name + team), not a native id.
+        assert re.search(r"\.display_name\s*=", normalised, re.IGNORECASE), (
+            "ESPN xref_player JOIN must key on display_name"
+        )
+        assert re.search(r"\.raw_team_name\s*=", normalised, re.IGNORECASE), (
+            "ESPN xref_player JOIN must key on raw_team_name"
+        )

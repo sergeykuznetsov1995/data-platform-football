@@ -363,24 +363,25 @@ def build_xref_player_checks() -> List[Check]:
             severity='ERROR',
         ),
 
-        # source enum — 7 sources (issue #43 added Transfermarkt + Capology
-        # on top of FBref / Understat / WhoScored / FotMob / SofaScore).
+        # source enum — 9 sources (issue #43 added Transfermarkt + Capology
+        # on top of FBref / Understat / WhoScored / FotMob / SofaScore; #601
+        # added SoFIFA; #692 added ESPN lineups).
         check_enum_compliance(
             table, 'source',
             allowed=['fbref', 'understat', 'whoscored', 'fotmob', 'sofascore',
-                     'transfermarkt', 'capology', 'sofifa'],
+                     'transfermarkt', 'capology', 'sofifa', 'espn'],
             severity='ERROR',
         ),
 
-        # canonical_id format guard — must start with one of the 8 known
-        # prefixes (fb_/us_/ws_/fm_/ss_/tm_/cap_/sf_); see
+        # canonical_id format guard — must start with one of the 9 known
+        # prefixes (fb_/us_/ws_/fm_/ss_/tm_/cap_/sf_/es_); see
         # xref_player_resolver._orphan_prefix. Regex via Trino regexp_like;
         # we express this as a row_count of offending rows.
         CHECK.row_count(
             table=table,
             min_rows=0,
             max_rows=0,
-            where="NOT regexp_like(canonical_id, '^(fb|us|ws|fm|ss|tm|cap|sf)_.+$')",
+            where="NOT regexp_like(canonical_id, '^(fb|us|ws|fm|ss|tm|cap|sf|es)_.+$')",
             severity='ERROR',
             name='canonical_id_format[xref_player]',
         ),
@@ -459,7 +460,7 @@ def build_xref_player_review_checks() -> List[Check]:
         check_enum_compliance(
             table, 'source',
             allowed=['understat', 'whoscored', 'fotmob', 'sofascore',
-                     'transfermarkt', 'capology', 'sofifa'],
+                     'transfermarkt', 'capology', 'sofifa', 'espn'],
             severity='ERROR',
         ),
     ]

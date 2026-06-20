@@ -405,7 +405,8 @@ def test_xref_player_canonical_id_format_check():
     assert len(fmt_checks) == 1
     where = fmt_checks[0].params['where']
     assert "regexp_like" in where
-    assert "fb|us|ws|fm|ss|tm|cap" in where
+    # #601 added 'sf' (SoFIFA); #692 added 'es' (ESPN lineups).
+    assert "fb|us|ws|fm|ss|tm|cap|sf|es" in where
 
 
 def test_xref_player_no_duplicates_per_canonical_season_check():
