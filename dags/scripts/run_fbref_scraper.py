@@ -207,7 +207,7 @@ def _write_traffic_summary(
     Args:
         scraper: The active scraper (used for _stats + traffic metrics).
         label: Short identifier baked into the filename (e.g. 'match_all_data',
-            'match_schedule', 'player_stats', 'keeper_keeper_adv').
+            'match_schedule', 'player_stats', 'keeper_keeper').
         mode: Echoed into the JSON (matches the CLI --mode value).
         extra: Optional per-mode keys to merge in (e.g. matches_successes).
         explicit_path: Override the default `/tmp/fbref_traffic_<label>.json`.
@@ -299,7 +299,7 @@ def main():
         '--stat-type',
         type=str,
         default=None,
-        help='Stat type for single_stat mode (stats, shooting, playingtime, misc, keeper, keeper_adv)'
+        help='Stat type for single_stat mode (stats, shooting, playingtime, misc, keeper)'
     )
     parser.add_argument(
         '--data-category',

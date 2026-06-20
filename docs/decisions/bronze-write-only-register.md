@@ -23,7 +23,7 @@ Per-table verdict vocabulary (from #476):
 
 ---
 
-## 1. Register (3 live write-only tables, audit 2026-06-15; 4 SoFIFA via #601 + 4 FotMob via #600 + 3 Capology via #603 CONSUMED, 2026-06-17)
+## 1. Register (2 live write-only tables, audit 2026-06-15; 4 SoFIFA via #601 + 4 FotMob via #600 + 3 Capology via #603 CONSUMED, 2026-06-17)
 
 Cost class = cost of *stopping* the scrape. **FREE** = by-product of a request made anyway
 (removing it saves only HDFS/snapshots, not HTTP); **CHEAP** = 1 HTTP; **EXPENSIVE** =
@@ -31,7 +31,6 @@ per-item/per-season HTTP.
 
 | Table | Cost | Data-quality note | Verdict | Tracking issue |
 |---|---|---|---|---|
-| `fbref_keeper_keeper_adv` | EXPENSIVE (separate `/keepersadv/` page + CF bypass ~9.67s) | ⚠ 26 cols 100% NULL live (incl. 23 advanced GK, FBref Feb-2026); core dups `keeper` | **(c) stop** | [#606] |
 | `whoscored_season_stages` | FREE (same session as `scrape_schedule`, soccerdata cache) | ⚠ `stage` all-NULL; 6 rows | (b) keep | — (§3) |
 | `clubelo_team_history` | MODERATE (per-team histories) | no `rank`/`league`; **219,861 rows** (largest unread) | **(c) stop** | [#604] |
 
@@ -149,6 +148,7 @@ documented here; no tracking issue (avoids p3 issue-spam):
 | 2026-06-17 | 4 FotMob team/transfers tables promoted to Silver → **CONSUMED** (conform-only, canonical_id resolution deferred to Gold): `fotmob_team_profile.sql`, `fotmob_team_standings.sql` (from `fotmob_team_stats`), `fotmob_team_leaderboards.sql`, `fotmob_transfers.sql`; registered in `dag_transform_fotmob_silver.py` + bronze schemas added to fixture. 10 → 6 live write-only. | #600 |
 | 2026-06-17 | 3 Capology team-finance tables promoted to Silver → **CONSUMED**: `capology_team_payrolls.sql` (declared club payroll), `capology_transfer_window.sql` (net transfer balance), `capology_contract_extensions.sql` (player contract snapshot); registered in `dag_transform_capology_silver.py` + 3 render-tests. `canonical_id` resolved in Silver via existing `xref_team`/`xref_player` capology branches (team 239/240, contract 680/810 live). Gold wage bill untouched (Silver-only); replace/supplement = followup. 6 → 3 live write-only. | #603 |
 | 2026-06-20 | 3 FBref non-prod-producer orphans stopped + dropped (`fbref_player_stats_extended` 551, `fbref_team_stats_extended` 20, `fbref_keeper_stats` 40): producer existed only in selenium `scrape_all` (`--mode full`, never run by prod), not in the parser contract, 0 Silver/Gold readers, superseded by per-stat-type tables + Silver joins. Removed producer + orphan merge helpers/tests; dropped tables. Mirrors #604. Not part of the §1 write-only set. | #614 |
+| 2026-06-20 | `fbref_keeper_keeper_adv` scrape **stopped** + table **dropped**: removed `'keeper_adv'` from `KEEPER_STAT_TYPES` (DAG no longer creates the `keeper_keeper_adv` task), cleaned dormant url-mapping/schema/docstrings, dropped the 3 `audit_bronze_columns.py` entries (`EXPECTED_NULL`/`EXPECTED_CONSTANT`/contract), removed the OM description YAML, `DROP TABLE` via `scripts/drop_fbref_keeper_keeper_adv.sql`. 26 cols 100% NULL since FBref Feb-2026; core cols duplicate the consumed `fbref_keeper_keeper`. 3 → 2 live write-only. | #606 |
 
 [#476]: https://github.com/sergeykuznetsov1995/data-platform-football/issues/476
 [#600]: https://github.com/sergeykuznetsov1995/data-platform-football/issues/600

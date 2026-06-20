@@ -73,11 +73,12 @@ class TestFBrefScraperConstants:
             )
 
     def test_keeper_stat_types(self):
-        """Test that KEEPER_STAT_TYPES is defined."""
+        """KEEPER_STAT_TYPES holds 'keeper'; 'keeper_adv' dropped in #606."""
         from scrapers.fbref.constants import KEEPER_STAT_TYPES
 
         assert 'keeper' in KEEPER_STAT_TYPES
-        assert 'keeper_adv' in KEEPER_STAT_TYPES
+        # #606: keeper_adv scrape stopped (all-NULL advanced cols, dup core)
+        assert 'keeper_adv' not in KEEPER_STAT_TYPES
 
 
 class TestFBrefUrlBuilder:
