@@ -96,23 +96,25 @@ def _bootstrap(con) -> None:
         ('   ',             'ENG-Premier League', 2024, DATE '2024-11-02', 'A')
     """)
 
+    # #735: dim_venue now reads silver.espn_matchsheet (already trimmed, deduped
+    # per match, match_date derived) instead of bronze — fixture mirrors that.
     con.execute("""
-        CREATE TABLE bronze.espn_matchsheet (
-            venue VARCHAR, league VARCHAR, season VARCHAR, game VARCHAR, _ingested_at TIMESTAMP
+        CREATE TABLE silver.espn_matchsheet (
+            venue VARCHAR, match_date DATE, _bronze_ingested_at TIMESTAMP,
+            league VARCHAR, season VARCHAR
         )
     """)
     con.execute("""
-        INSERT INTO bronze.espn_matchsheet VALUES
-        -- curated, dup snapshot → keep latest _ingested_at
-        ('Etihad Stadium',  'ENG-Premier League', '2425', '2024-08-15-MCI-CHE', TIMESTAMP '2026-04-27 09:00:00'),
-        ('Etihad Stadium',  'ENG-Premier League', '2425', '2024-08-15-MCI-CHE', TIMESTAMP '2026-04-27 06:00:00'),
+        INSERT INTO silver.espn_matchsheet VALUES
+        -- curated, shared with the FBref feed
+        ('Etihad Stadium',  DATE '2024-08-15', TIMESTAMP '2026-04-27 09:00:00', 'ENG-Premier League', '2425'),
         -- curated, ESPN-only
-        ('Goodison Park',   'ENG-Premier League', '2425', '2024-08-22-EVE-LIV', TIMESTAMP '2026-04-27 09:00:00'),
+        ('Goodison Park',   DATE '2024-08-22', TIMESTAMP '2026-04-27 09:00:00', 'ENG-Premier League', '2425'),
         -- curated Brentford: ESPN carries the OLD spelling → must merge with 'Gtech'
-        ('Brentford Community Stadium', 'ENG-Premier League', '2425', '2024-08-23-BRE-ARS', TIMESTAMP '2026-04-27 09:00:00'),
-        -- filtered out
-        (NULL,              'ENG-Premier League', '2425', '2024-08-22-EVE-LIV', TIMESTAMP '2026-04-27 09:00:00'),
-        ('   ',             'ENG-Premier League', '2425', '2024-08-22-EVE-LIV', TIMESTAMP '2026-04-27 09:00:00')
+        ('Brentford Community Stadium', DATE '2024-08-23', TIMESTAMP '2026-04-27 09:00:00', 'ENG-Premier League', '2425'),
+        -- filtered out (dim_venue drops NULL/blank venue defensively)
+        (NULL,              DATE '2024-08-22', TIMESTAMP '2026-04-27 09:00:00', 'ENG-Premier League', '2425'),
+        ('   ',             DATE '2024-08-22', TIMESTAMP '2026-04-27 09:00:00', 'ENG-Premier League', '2425')
     """)
 
 
