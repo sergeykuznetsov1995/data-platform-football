@@ -50,3 +50,49 @@ aliases:
     fbref_player_id: "fe6e7156"
     season: "*"
     reason: "Savinho (FotMob) ↔ Sávio (FBref) Brazilian nickname"
+
+  # Issue #738 — Understat bare first-name "Gabriel" (5613, Arsenal) is
+  # ambiguous across three real Gabriels (Magalhães, Martinelli, Jesus);
+  # token_set_band scores 100 for all → review queue, never resolved. The
+  # Understat "Gabriel" entry is the centre-back Gabriel Magalhães.
+  - source: understat
+    source_id: "5613"
+    fbref_player_id: "67ac5bb8"
+    season: "*"
+    reason: "Gabriel (Understat) → Gabriel Magalhães (FBref), Arsenal CB"
+
+  # Issue #738 — Understat "Bobby Reid" (6827) is Bobby De Cordova-Reid.
+  # Surname-anchor mis-matches him onto "Harrison Reed" (reid↔reed Levenshtein
+  # 1), colliding with the real Harrison Reed (910) in the per-season dedup.
+  # FBref carries him as "Bobby De Cordova-Reid" (surname token cordova-reid).
+  - source: understat
+    source_id: "6827"
+    fbref_player_id: "0f7533cd"
+    season: "*"
+    reason: "Bobby Reid (Understat) → Bobby De Cordova-Reid (FBref); breaks Reid↔Reed collision"
+
+  # Issue #738 — Understat "Paris Maghoma" (10053) surname-collides with
+  # Jayden Meghoma (maghoma↔meghoma Levenshtein 1) → ambiguous. The Understat
+  # entry is Edmond-Paris Maghoma (Brentford).
+  - source: understat
+    source_id: "10053"
+    fbref_player_id: "8a3ddcd2"
+    season: "*"
+    reason: "Paris Maghoma (Understat) → Edmond-Paris Maghoma (FBref)"
+
+  # Issue #738 — Understat "Ameen Al Dakhil" (11699) token_set 93.3 lands in
+  # the 88-95 ambiguous band against the single correct candidate
+  # "Ameen Al-Dakhil" (hyphenation) → not auto-linked.
+  - source: understat
+    source_id: "11699"
+    fbref_player_id: "93e08bce"
+    season: "*"
+    reason: "Ameen Al Dakhil (Understat) → Ameen Al-Dakhil (FBref), hyphenation band miss"
+
+  # Issue #738 — Understat "Ali Al-Hamadi" (12751) token_set 92.3 lands in the
+  # 88-95 ambiguous band against the single correct candidate "Ali Al Hamadi".
+  - source: understat
+    source_id: "12751"
+    fbref_player_id: "8450467d"
+    season: "*"
+    reason: "Ali Al-Hamadi (Understat) → Ali Al Hamadi (FBref), hyphenation band miss"
