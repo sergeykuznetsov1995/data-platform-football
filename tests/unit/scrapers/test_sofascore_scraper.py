@@ -690,3 +690,74 @@ class TestNoShadowedPlayerStats:
             SofaScoreScraper.read_player_season_stats
         ).parameters
         assert 'league' in params and 'season' in params
+
+
+class TestPlayerProfileIdUniverse:
+    """#724: player_profile must cover the full match-grain squad (incl.
+    unused bench players without a rating), while season_stats stays on the
+    narrow rated-players universe."""
+
+    @pytest.fixture
+    def mock_dependencies(self):
+        with patch('scrapers.base.base_scraper.get_rate_limiter') as mock_rl, \
+             patch('scrapers.base.base_scraper.get_retry_policy') as mock_rp, \
+             patch('scrapers.base.base_scraper.get_circuit_breaker') as mock_cb, \
+             patch('scrapers.base.base_scraper.IcebergWriter') as mock_iw:
+            mock_rl.return_value = MagicMock()
+            mock_rp.return_value = MagicMock()
+            mock_cb.return_value = MagicMock()
+            mock_iw.return_value = MagicMock()
+            yield
+
+    @pytest.fixture
+    def scraper(self, mock_dependencies):
+        with patch.dict('sys.modules', {'soccerdata': MagicMock()}):
+            from scrapers.sofascore import SofaScoreScraper
+            return SofaScoreScraper(leagues=['ENG-Premier League'], seasons=[2024])
+
+    def test_profile_resolver_reads_match_grain_and_unions_ratings(self, scraper):
+        captured = {}
+
+        def _capture(sql, params):
+            captured['sql'] = sql
+            captured['params'] = params
+            return ['1', '2']
+
+        with patch.object(scraper, '_query_player_ids', side_effect=_capture):
+            ids = scraper._resolve_player_ids_for_profile(
+                'ENG-Premier League', '2526',
+            )
+
+        assert ids == ['1', '2']
+        assert 'sofascore_event_player_stats' in captured['sql']
+        assert 'sofascore_player_ratings' in captured['sql']
+        assert captured['params'] == (
+            'ENG-Premier League', '2526', 'ENG-Premier League', '2526',
+        )
+
+    def test_season_stats_resolver_stays_on_ratings_only(self, scraper):
+        captured = {}
+
+        def _capture(sql, params):
+            captured['sql'] = sql
+            return []
+
+        with patch.object(scraper, '_query_player_ids', side_effect=_capture):
+            scraper._resolve_player_ids_from_bronze('ENG-Premier League', '2526')
+
+        assert 'sofascore_player_ratings' in captured['sql']
+        assert 'sofascore_event_player_stats' not in captured['sql']
+
+    def test_read_player_profile_routes_through_match_grain_resolver(self, scraper):
+        with patch.object(
+            scraper, '_resolve_player_ids_for_profile', return_value=[],
+        ) as match_grain, patch.object(
+            scraper, '_resolve_player_ids_from_bronze',
+        ) as legacy:
+            df = scraper.read_player_profile('ENG-Premier League', 2024)
+
+        match_grain.assert_called_once()
+        assert match_grain.call_args.args[0] == 'ENG-Premier League'
+        assert match_grain.call_args.args[1] == '2425'  # 2024 → '2425' slug
+        legacy.assert_not_called()
+        assert df.empty

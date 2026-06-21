@@ -1372,13 +1372,10 @@ class SofaScoreScraper(SoccerdataScraper):
         )
         return None
 
-    def _resolve_player_ids_from_bronze(
-        self,
-        league: str,
-        season_short: str,
-        limit: Optional[int] = None,
-    ) -> List[str]:
-        """DISTINCT player_id from bronze.sofascore_player_ratings."""
+    def _query_player_ids(self, sql: str, params: tuple) -> List[str]:
+        """Execute a DISTINCT-player_id query against Iceberg and return
+        the id list (empty on any failure — caller treats it as a soft
+        fallback)."""
         try:
             import os
             import trino
@@ -1410,15 +1407,7 @@ class SofaScoreScraper(SoccerdataScraper):
                 )
 
             cur = conn.cursor()
-            sql = (
-                "SELECT DISTINCT CAST(player_id AS varchar) "
-                "FROM iceberg.bronze.sofascore_player_ratings "
-                "WHERE league = ? AND CAST(season AS varchar) = ? "
-                "  AND rating IS NOT NULL"
-            )
-            if limit:
-                sql = sql + f" LIMIT {int(limit)}"
-            cur.execute(sql, (league, season_short))
+            cur.execute(sql, params)
             rows = cur.fetchall()
             return [r[0] for r in rows if r and r[0]]
         except Exception as e:
@@ -1426,6 +1415,58 @@ class SofaScoreScraper(SoccerdataScraper):
                 "Could not resolve player_ids from bronze: %s", e,
             )
             return []
+
+    def _resolve_player_ids_from_bronze(
+        self,
+        league: str,
+        season_short: str,
+        limit: Optional[int] = None,
+    ) -> List[str]:
+        """DISTINCT player_id from bronze.sofascore_player_ratings (rated
+        players only — used to drive player_season_stats scraping)."""
+        sql = (
+            "SELECT DISTINCT CAST(player_id AS varchar) "
+            "FROM iceberg.bronze.sofascore_player_ratings "
+            "WHERE league = ? AND CAST(season AS varchar) = ? "
+            "  AND rating IS NOT NULL"
+        )
+        if limit:
+            sql = sql + f" LIMIT {int(limit)}"
+        return self._query_player_ids(sql, (league, season_short))
+
+    def _resolve_player_ids_for_profile(
+        self,
+        league: str,
+        season_short: str,
+        limit: Optional[int] = None,
+    ) -> List[str]:
+        """DISTINCT player_id covering the full match-grain squad (#724).
+
+        Profiles must cover every player appearing in match-grain
+        ``bronze.sofascore_event_player_stats`` — including unused bench
+        players who never earn a rating. Without a profile the player has
+        no name, so the xref_player resolver cannot match it to FBref and
+        ``fct_lineup.player_id`` stays NULL. UNION with the legacy
+        rated-players set (``sofascore_player_ratings``) guards against any
+        regression of the previously-covered universe.
+        """
+        sql = (
+            "SELECT DISTINCT CAST(player_id AS varchar) AS pid FROM ("
+            "  SELECT player_id "
+            "  FROM iceberg.bronze.sofascore_event_player_stats "
+            "  WHERE league = ? AND CAST(season AS varchar) = ? "
+            "    AND player_id IS NOT NULL "
+            "  UNION "
+            "  SELECT player_id "
+            "  FROM iceberg.bronze.sofascore_player_ratings "
+            "  WHERE league = ? AND CAST(season AS varchar) = ? "
+            "    AND rating IS NOT NULL"
+            ")"
+        )
+        params = (league, season_short, league, season_short)
+        if limit:
+            sql = sql + f" LIMIT {int(limit)}"
+        return self._query_player_ids(sql, params)
 
     @staticmethod
     def _flatten_player_season_stats(
@@ -1685,7 +1726,7 @@ class SofaScoreScraper(SoccerdataScraper):
             season_short = season_str
 
         if player_ids is None:
-            player_ids = self._resolve_player_ids_from_bronze(
+            player_ids = self._resolve_player_ids_for_profile(
                 league, season_short, limit=limit,
             )
 
