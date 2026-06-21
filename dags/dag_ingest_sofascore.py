@@ -352,6 +352,11 @@ python dags/scripts/run_sofascore_scraper.py \\
             'PYTHONPATH': '/opt/airflow:/opt/airflow/dags',
             'PATH': '/usr/local/bin:/usr/bin:/bin:/home/airflow/.local/bin',
             'HOME': '/home/airflow',
+            # Route the JSON endpoints through FlareSolverr (issue #751) —
+            # SofaScore's anti-bot 403s the tls_requests path. Harmless on the
+            # schedule task (it uses the soccerdata reader, not _fetch_json_endpoint).
+            'SOFASCORE_USE_FLARESOLVERR': '1',
+            'FLARESOLVERR_URL': os.environ.get('FLARESOLVERR_URL', 'http://flaresolverr:8191'),
         },
         append_env=True,
     )
@@ -380,6 +385,11 @@ exit $rc
             'PYTHONPATH': '/opt/airflow:/opt/airflow/dags',
             'PATH': '/usr/local/bin:/usr/bin:/bin:/home/airflow/.local/bin',
             'HOME': '/home/airflow',
+            # Route the JSON endpoints through FlareSolverr (issue #751) —
+            # SofaScore's anti-bot 403s the tls_requests path. Harmless on the
+            # schedule task (it uses the soccerdata reader, not _fetch_json_endpoint).
+            'SOFASCORE_USE_FLARESOLVERR': '1',
+            'FLARESOLVERR_URL': os.environ.get('FLARESOLVERR_URL', 'http://flaresolverr:8191'),
         },
         append_env=True,
     )
@@ -409,6 +419,11 @@ exit $rc
             'PYTHONPATH': '/opt/airflow:/opt/airflow/dags',
             'PATH': '/usr/local/bin:/usr/bin:/bin:/home/airflow/.local/bin',
             'HOME': '/home/airflow',
+            # Route the JSON endpoints through FlareSolverr (issue #751) —
+            # SofaScore's anti-bot 403s the tls_requests path. Harmless on the
+            # schedule task (it uses the soccerdata reader, not _fetch_json_endpoint).
+            'SOFASCORE_USE_FLARESOLVERR': '1',
+            'FLARESOLVERR_URL': os.environ.get('FLARESOLVERR_URL', 'http://flaresolverr:8191'),
         },
         append_env=True,
     )
@@ -438,6 +453,11 @@ exit $rc
             'PYTHONPATH': '/opt/airflow:/opt/airflow/dags',
             'PATH': '/usr/local/bin:/usr/bin:/bin:/home/airflow/.local/bin',
             'HOME': '/home/airflow',
+            # Route the JSON endpoints through FlareSolverr (issue #751) —
+            # SofaScore's anti-bot 403s the tls_requests path. Harmless on the
+            # schedule task (it uses the soccerdata reader, not _fetch_json_endpoint).
+            'SOFASCORE_USE_FLARESOLVERR': '1',
+            'FLARESOLVERR_URL': os.environ.get('FLARESOLVERR_URL', 'http://flaresolverr:8191'),
         },
         append_env=True,
     )
@@ -467,6 +487,11 @@ exit $rc
             'PYTHONPATH': '/opt/airflow:/opt/airflow/dags',
             'PATH': '/usr/local/bin:/usr/bin:/bin:/home/airflow/.local/bin',
             'HOME': '/home/airflow',
+            # Route the JSON endpoints through FlareSolverr (issue #751) —
+            # SofaScore's anti-bot 403s the tls_requests path. Harmless on the
+            # schedule task (it uses the soccerdata reader, not _fetch_json_endpoint).
+            'SOFASCORE_USE_FLARESOLVERR': '1',
+            'FLARESOLVERR_URL': os.environ.get('FLARESOLVERR_URL', 'http://flaresolverr:8191'),
         },
         append_env=True,
     )
@@ -495,6 +520,11 @@ exit $rc
             'PYTHONPATH': '/opt/airflow:/opt/airflow/dags',
             'PATH': '/usr/local/bin:/usr/bin:/bin:/home/airflow/.local/bin',
             'HOME': '/home/airflow',
+            # Route the JSON endpoints through FlareSolverr (issue #751) —
+            # SofaScore's anti-bot 403s the tls_requests path. Harmless on the
+            # schedule task (it uses the soccerdata reader, not _fetch_json_endpoint).
+            'SOFASCORE_USE_FLARESOLVERR': '1',
+            'FLARESOLVERR_URL': os.environ.get('FLARESOLVERR_URL', 'http://flaresolverr:8191'),
         },
         append_env=True,
     )
@@ -525,6 +555,11 @@ exit $rc
             'PYTHONPATH': '/opt/airflow:/opt/airflow/dags',
             'PATH': '/usr/local/bin:/usr/bin:/bin:/home/airflow/.local/bin',
             'HOME': '/home/airflow',
+            # Route the JSON endpoints through FlareSolverr (issue #751) —
+            # SofaScore's anti-bot 403s the tls_requests path. Harmless on the
+            # schedule task (it uses the soccerdata reader, not _fetch_json_endpoint).
+            'SOFASCORE_USE_FLARESOLVERR': '1',
+            'FLARESOLVERR_URL': os.environ.get('FLARESOLVERR_URL', 'http://flaresolverr:8191'),
         },
         append_env=True,
     )
