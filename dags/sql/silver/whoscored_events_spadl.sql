@@ -23,9 +23,16 @@
 --   match_id              varchar     CAST(game_id AS varchar)
 --   team_id_raw           varchar     bronze team_id (NOT resolved via xref —
 --                                     that is a Gold-job concern)
+--   team_name_raw         varchar     bronze team name passthrough (#736: Gold
+--                                     timeline resolves xref_team by name)
 --   player_id_raw         varchar     bronze player_id (double → varchar)
+--   related_player_id_raw varchar     bronze related_player_id (double → varchar;
+--                                     #736: assist / sub-on actor for Gold timeline)
 --   period                varchar     period passthrough
 --   expanded_minute       integer     TRY_CAST from bigint
+--   minute                bigint      bronze minute passthrough (#736: 0-based
+--                                     cumulative within half — Gold timeline base)
+--   second                integer     bronze second (double → integer) (#736)
 --   x, y, end_x, end_y    double      pitch coordinates (passthrough)
 --   action_canonical      varchar     ENUM (25 values, see below)
 --   action_source         varchar     literal 'whoscored_spadl_proprietary_v1'
@@ -215,6 +222,8 @@ WITH src AS (
         end_y,
         qualifiers,
         related_event_id,
+        related_player_id,
+        team,
         league,
         season,
         _ingested_at,
@@ -222,7 +231,8 @@ WITH src AS (
             PARTITION BY
                 game_id, period, minute, second, expanded_minute,
                 type, outcome_type, team_id, player_id,
-                x, y, end_x, end_y, qualifiers, related_event_id
+                x, y, end_x, end_y, qualifiers, related_event_id,
+                related_player_id, team
             ORDER BY _ingested_at DESC
         ) AS dedup_rn
     FROM iceberg.bronze.whoscored_events
@@ -273,11 +283,21 @@ SELECT
     -- against xref_*.source_id (canonical integer-string '95408'). Round
     -- through BIGINT first to keep digits intact. NULL stays NULL.
     CAST(CAST(team_id   AS BIGINT) AS varchar)               AS team_id_raw,
+    -- #736: raw team NAME passthrough — Gold timeline resolves xref_team
+    -- (source='whoscored') by name, and flips own-goal credit by name.
+    team                                                     AS team_name_raw,
     CAST(CAST(player_id AS BIGINT) AS varchar)               AS player_id_raw,
+    -- #736: assist / substitution-on actor — same double→varchar cast as
+    -- player_id_raw so Gold timeline joins xref_player directly.
+    CAST(CAST(related_player_id AS BIGINT) AS varchar)       AS related_player_id_raw,
 
     -- ========= Time / pitch coordinates =========
     CAST(period AS varchar)                                  AS period,
     TRY_CAST(expanded_minute AS integer)                     AS expanded_minute,
+    -- #736: raw Opta minute (0-based cumulative within half) + second — Gold
+    -- timeline derives FBref-scale minute/minute_added/event_seq from these.
+    minute                                                   AS minute,
+    CAST(second AS integer)                                  AS second,
     x,
     y,
     end_x,

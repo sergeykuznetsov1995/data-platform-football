@@ -161,8 +161,8 @@ Verdict vocabulary: **norm** (sanctioned bridge or source-without-Silver — kee
 | `fct_event` | `whoscored_events` | `team_id→team_name` bridge (NOT event data; ~2 rows/fixture out; ADR-2 inline) | norm (sanctioned bridge) |
 | `fct_shot` | `understat_shots`, `understat_players` | shot DATA + assist dict | **fixed #704** |
 | `dim_venue` | `espn_matchsheet` | venue-name DATA | followup [#735] |
-| `fct_match_timeline` | `whoscored_events` | raw card/sub/goal DATA (fallback) | followup [#736] |
-| `fct_team_season_stats.j2` | `whoscored_events` | penalty DATA (#161) | followup [#736] |
+| `fct_match_timeline` | ~~`whoscored_events`~~ → silver | raw card/sub/goal DATA (fallback), now via `silver.whoscored_events_spadl` audit cols (`_action_source_note`/`qualifiers_raw`) | done [#736] |
+| `fct_team_season_stats.j2` | ~~`whoscored_events`~~ → silver | penalty DATA (#161), now via silver audit cols | done [#736] |
 
 **`fct_event` (norm, not data):** the issue flagged it priority-#1 ("709k rows,
 high volume"), but the `bronze.whoscored_events` read is the `event_team_names`
@@ -170,8 +170,9 @@ CTE — a `(game_id, team_id) → team_name` bridge feeding `xref_team`, NOT a r
 of SPADL event data (which comes from `silver.whoscored_events_spadl`). The 709k
 is fct_event's output grain, not the bronze scan result (~2 rows/fixture out).
 Documented as a sanctioned name-bridge (analogous to the `*_schedule` bridges);
-SQL unchanged. Optional future cleanup: carry `team` into
-`silver.whoscored_events_spadl` to drop the bridge entirely — low priority.
+SQL unchanged. Optional future cleanup: `silver.whoscored_events_spadl` now
+carries `team_name_raw` (added in #736), so the `event_team_names` bridge CAN be
+dropped by reading the silver column directly — low-priority followup.
 
 **`fct_shot` fix (#704):** new `silver.understat_shots` (mirrors
 `silver.sofascore_shots`) conforms the Understat shotmap + resolves
@@ -209,6 +210,7 @@ gap tracked as followup [#738].
 | 2026-06-20 | `fbref_keeper_keeper_adv` scrape **stopped** + table **dropped**: removed `'keeper_adv'` from `KEEPER_STAT_TYPES` (DAG no longer creates the `keeper_keeper_adv` task), cleaned dormant url-mapping/schema/docstrings, dropped the 3 `audit_bronze_columns.py` entries (`EXPECTED_NULL`/`EXPECTED_CONSTANT`/contract), removed the OM description YAML, `DROP TABLE` via `scripts/drop_fbref_keeper_keeper_adv.sql`. 26 cols 100% NULL since FBref Feb-2026; core cols duplicate the consumed `fbref_keeper_keeper`. 3 → 2 live write-only. | #606 |
 
 | 2026-06-20 | §5 added — Gold→Bronze one-hop audit (#704): `fct_shot` lifted to `silver.understat_shots` (was direct `bronze.understat_shots` + `understat_players`; only the `understat_schedule` match bridge kept in Gold); `fct_event` documented as a sanctioned `team_id→name` bridge (SQL unchanged); `fct_standings` already Silver (#702); `dim_venue` (#735) + `whoscored_events` data reads in `fct_match_timeline`/`fct_team_season_stats` (#736) filed as followups. | #704 |
+| 2026-06-21 | §5 followups resolved — `fct_match_timeline` (raw card/sub/goal fallback) + `fct_team_season_stats.j2` (penalty data, #161) lifted off `bronze.whoscored_events` to `silver.whoscored_events_spadl` via its audit columns (`_action_source_note` = orig WhoScored type, `qualifiers_raw` = raw JSON). Silver extended with 4 raw passthrough cols (`team_name_raw`, `related_player_id_raw`, `minute`, `second`) so the timeline keeps byte-identical classification. Only the `whoscored_schedule` bridges remain (norm). | #736 |
 
 [#476]: https://github.com/sergeykuznetsov1995/data-platform-football/issues/476
 [#600]: https://github.com/sergeykuznetsov1995/data-platform-football/issues/600

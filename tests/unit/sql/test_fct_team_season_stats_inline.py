@@ -128,14 +128,17 @@ class TestInlineSourceRefs:
                     f"silver.{src}_team_match"
                 )
 
-    def test_bronze_events_scan_only_in_main(self):
-        """ws_penalties (#161) сканирует bronze.whoscored_events ТОЛЬКО в
-        main — аудит penalties не сравнивает, второй скан event-grain
-        таблицы за DAG-ран не нужен."""
+    def test_ws_penalties_reads_silver_not_bronze(self):
+        """#736: ws_penalties (#161) теперь one-hop — читает
+        silver.whoscored_events_spadl через audit-колонки (_action_source_note /
+        qualifiers_raw), а НЕ bronze.whoscored_events. Audit-файл penalties
+        вообще не считает (ни bronze, ни этот silver-скан)."""
         main_body = _strip_comments(_main_body())
         audit_body = _strip_comments(_audit_body())
-        assert "iceberg.bronze.whoscored_events" in main_body
+        assert "iceberg.silver.whoscored_events_spadl" in main_body
+        assert "iceberg.bronze.whoscored_events" not in main_body
         assert "iceberg.bronze.whoscored_events" not in audit_body
+        assert "iceberg.silver.whoscored_events_spadl" not in audit_body
 
 
 @pytest.mark.unit
