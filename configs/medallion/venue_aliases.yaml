@@ -6,7 +6,8 @@
 # (#143). Consumed by `dim_venue.sql.j2` via
 # `medallion_config.get_venue_alias_sql_values()` → a VALUES body of six-tuples
 #   ('raw_name', 'canonical_id', 'canonical_name', 'city', 'country', 'league')
-# (or seven-tuples with `capacity` when include_capacity=True, issue #434).
+# (or seven-tuples with `capacity` when include_capacity=True — dim_venue uses it
+# as a FALLBACK behind FotMob, #750).
 #
 # WHY a curated dictionary (issue #145):
 #   `gold.dim_venue` previously keyed venue_id on xxhash64(LOWER(TRIM(name))) —
@@ -21,15 +22,19 @@
 #     canonical_id:   "venue_old_trafford"  # IDENTITY slug, ^[a-z0-9_]+$
 #     city:           "Manchester"
 #     country:        "England"
-#     capacity:       74244                  # issue #434: curated capacity (int), optional → NULL
 #     aliases:
 #       _generic: ["Old Trafford"]          # every observed spelling, any source
 #     competition_scope: ["ENG-Premier League"]
 #
-# capacity (issue #434): curated all-seater stadium capacity from public sources
-# (Wikipedia infobox). Optional — omit when unknown (→ NULL in dim_venue). Values
-# are point-in-time (current/most-recent config); reconstructions drift them by a
-# few hundred, which is immaterial for the home-advantage / attendance features.
+# capacity (issue #750): PRIMARY source is now FotMob (silver.fotmob_team_profile,
+# auto + global) — dim_venue does COALESCE(fotmob_capacity, curated_capacity). The
+# hand-curated Wikipedia register (#434) was removed for the ~29 venues FotMob covers;
+# only a small CURATED FALLBACK remains for venues FotMob's team-profile cannot supply,
+# because that endpoint reports each club's CURRENT ground for every season. So clubs
+# that MOVED grounds (Goodison Park ← Everton 2016-24, White Hart Lane / Wembley ←
+# Spurs) and a few not in recent FotMob season squads keep a curated capacity. Omit
+# capacity for any venue FotMob covers. city/country stay curated (FotMob/SofaScore
+# only fill NULLs for non-curated / orphan venues).
 #
 # Matching: dim_venue normalises raw venue names (NFD + strip diacritics +
 # remove non-alphanumerics) and LEFT JOINs on that key. So apostrophe/period
@@ -51,7 +56,6 @@ venues:
     canonical_id: "venue_anfield"
     city: "Liverpool"
     country: "England"
-    capacity: 61276
     aliases:
       _generic: ["Anfield"]
     competition_scope: ["ENG-Premier League"]
@@ -60,7 +64,6 @@ venues:
     canonical_id: "venue_bet365_stadium"
     city: "Stoke-on-Trent"
     country: "England"
-    capacity: 30089
     aliases:
       _generic: ["Bet365 Stadium"]
     competition_scope: ["ENG-Premier League"]
@@ -69,7 +72,6 @@ venues:
     canonical_id: "venue_bramall_lane"
     city: "Sheffield"
     country: "England"
-    capacity: 32050
     aliases:
       _generic: ["Bramall Lane"]
     competition_scope: ["ENG-Premier League"]
@@ -80,7 +82,6 @@ venues:
     canonical_id: "venue_brentford_community"
     city: "London"
     country: "England"
-    capacity: 17250
     aliases:
       _generic: ["Gtech Community Stadium", "Brentford Community Stadium"]
     competition_scope: ["ENG-Premier League"]
@@ -89,7 +90,6 @@ venues:
     canonical_id: "venue_cardiff_city"
     city: "Cardiff"
     country: "Wales"
-    capacity: 33280
     aliases:
       _generic: ["Cardiff City Stadium"]
     competition_scope: ["ENG-Premier League"]
@@ -98,7 +98,6 @@ venues:
     canonical_id: "venue_carrow_road"
     city: "Norwich"
     country: "England"
-    capacity: 27150
     aliases:
       _generic: ["Carrow Road"]
     competition_scope: ["ENG-Premier League"]
@@ -107,7 +106,6 @@ venues:
     canonical_id: "venue_craven_cottage"
     city: "London"
     country: "England"
-    capacity: 28800
     aliases:
       _generic: ["Craven Cottage"]
     competition_scope: ["ENG-Premier League"]
@@ -116,7 +114,6 @@ venues:
     canonical_id: "venue_elland_road"
     city: "Leeds"
     country: "England"
-    capacity: 37645
     aliases:
       _generic: ["Elland Road"]
     competition_scope: ["ENG-Premier League"]
@@ -125,7 +122,6 @@ venues:
     canonical_id: "venue_emirates_stadium"
     city: "London"
     country: "England"
-    capacity: 60704
     aliases:
       _generic: ["Emirates Stadium"]
     competition_scope: ["ENG-Premier League"]
@@ -134,7 +130,6 @@ venues:
     canonical_id: "venue_etihad_stadium"
     city: "Manchester"
     country: "England"
-    capacity: 61470
     aliases:
       _generic: ["Etihad Stadium"]
     competition_scope: ["ENG-Premier League"]
@@ -143,7 +138,7 @@ venues:
     canonical_id: "venue_goodison_park"
     city: "Liverpool"
     country: "England"
-    capacity: 39414
+    capacity: 39414  # #750: FotMob-fallback (moved ground / sponsor rename — FotMob current-ground bias misses it)
     aliases:
       _generic: ["Goodison Park"]
     competition_scope: ["ENG-Premier League"]
@@ -153,7 +148,6 @@ venues:
     canonical_id: "venue_hill_dickinson"
     city: "Liverpool"
     country: "England"
-    capacity: 52769
     aliases:
       _generic: ["Hill Dickinson Stadium"]
     competition_scope: ["ENG-Premier League"]
@@ -162,7 +156,7 @@ venues:
     canonical_id: "venue_kenilworth_road"
     city: "Luton"
     country: "England"
-    capacity: 12056
+    capacity: 12056  # #750: FotMob-fallback (moved ground / sponsor rename — FotMob current-ground bias misses it)
     aliases:
       _generic: ["Kenilworth Road Stadium", "Kenilworth Road"]
     competition_scope: ["ENG-Premier League"]
@@ -171,7 +165,6 @@ venues:
     canonical_id: "venue_king_power"
     city: "Leicester"
     country: "England"
-    capacity: 32259
     aliases:
       _generic: ["King Power Stadium"]
     competition_scope: ["ENG-Premier League"]
@@ -182,7 +175,7 @@ venues:
     canonical_id: "venue_hull_city"
     city: "Kingston upon Hull"
     country: "England"
-    capacity: 25586
+    capacity: 25586  # #750: FotMob-fallback (moved ground / sponsor rename — FotMob current-ground bias misses it)
     aliases:
       _generic: ["Kingston Communications Stadium", "KCOM Stadium", "MKM Stadium"]
     competition_scope: ["ENG-Premier League"]
@@ -191,7 +184,7 @@ venues:
     canonical_id: "venue_swansea_com"
     city: "Swansea"
     country: "Wales"
-    capacity: 21088
+    capacity: 21088  # #750: FotMob-fallback (moved ground / sponsor rename — FotMob current-ground bias misses it)
     aliases:
       _generic: ["Liberty Stadium", "Swansea.com Stadium"]
     competition_scope: ["ENG-Premier League"]
@@ -200,7 +193,6 @@ venues:
     canonical_id: "venue_london_stadium"
     city: "London"
     country: "England"
-    capacity: 62500
     aliases:
       _generic: ["London Stadium"]
     competition_scope: ["ENG-Premier League"]
@@ -209,7 +201,6 @@ venues:
     canonical_id: "venue_molineux"
     city: "Wolverhampton"
     country: "England"
-    capacity: 31750
     aliases:
       _generic: ["Molineux Stadium", "Molineux"]
     competition_scope: ["ENG-Premier League"]
@@ -218,7 +209,6 @@ venues:
     canonical_id: "venue_old_trafford"
     city: "Manchester"
     country: "England"
-    capacity: 74244
     aliases:
       _generic: ["Old Trafford"]
     competition_scope: ["ENG-Premier League"]
@@ -228,7 +218,6 @@ venues:
     canonical_id: "venue_portman_road"
     city: "Ipswich"
     country: "England"
-    capacity: 30056
     aliases:
       _generic: ["Portman Road", "Portman Road Stadium"]
     competition_scope: ["ENG-Premier League"]
@@ -237,7 +226,6 @@ venues:
     canonical_id: "venue_riverside"
     city: "Middlesbrough"
     country: "England"
-    capacity: 34742
     aliases:
       _generic: ["Riverside Stadium"]
     competition_scope: ["ENG-Premier League"]
@@ -246,7 +234,6 @@ venues:
     canonical_id: "venue_selhurst_park"
     city: "London"
     country: "England"
-    capacity: 25486
     aliases:
       _generic: ["Selhurst Park"]
     competition_scope: ["ENG-Premier League"]
@@ -257,7 +244,6 @@ venues:
     canonical_id: "venue_st_james_park"
     city: "Newcastle upon Tyne"
     country: "England"
-    capacity: 52264
     aliases:
       _generic: ["St James' Park", "St. James' Park"]
     competition_scope: ["ENG-Premier League"]
@@ -266,7 +252,6 @@ venues:
     canonical_id: "venue_st_marys"
     city: "Southampton"
     country: "England"
-    capacity: 32384
     aliases:
       _generic: ["St Mary's Stadium", "St. Mary's Stadium"]
     competition_scope: ["ENG-Premier League"]
@@ -275,7 +260,6 @@ venues:
     canonical_id: "venue_stadium_of_light"
     city: "Sunderland"
     country: "England"
-    capacity: 49000
     aliases:
       _generic: ["Stadium of Light"]
     competition_scope: ["ENG-Premier League"]
@@ -284,7 +268,6 @@ venues:
     canonical_id: "venue_stamford_bridge"
     city: "London"
     country: "England"
-    capacity: 40044
     aliases:
       _generic: ["Stamford Bridge"]
     competition_scope: ["ENG-Premier League"]
@@ -296,7 +279,6 @@ venues:
     canonical_id: "venue_amex"
     city: "Brighton"
     country: "England"
-    capacity: 31876
     aliases:
       _generic:
         - "American Express Stadium"
@@ -308,7 +290,6 @@ venues:
     canonical_id: "venue_city_ground"
     city: "Nottingham"
     country: "England"
-    capacity: 31042
     aliases:
       _generic: ["The City Ground"]
     competition_scope: ["ENG-Premier League"]
@@ -317,7 +298,6 @@ venues:
     canonical_id: "venue_the_hawthorns"
     city: "West Bromwich"
     country: "England"
-    capacity: 27087
     aliases:
       _generic: ["The Hawthorns"]
     competition_scope: ["ENG-Premier League"]
@@ -326,7 +306,7 @@ venues:
     canonical_id: "venue_huddersfield"
     city: "Huddersfield"
     country: "England"
-    capacity: 24121
+    capacity: 24121  # #750: FotMob-fallback (moved ground / sponsor rename — FotMob current-ground bias misses it)
     aliases:
       _generic: ["The John Smith's Stadium", "John Smith's Stadium"]
     competition_scope: ["ENG-Premier League"]
@@ -335,7 +315,6 @@ venues:
     canonical_id: "venue_tottenham_hotspur"
     city: "London"
     country: "England"
-    capacity: 62850
     aliases:
       _generic: ["Tottenham Hotspur Stadium"]
     competition_scope: ["ENG-Premier League"]
@@ -344,7 +323,6 @@ venues:
     canonical_id: "venue_turf_moor"
     city: "Burnley"
     country: "England"
-    capacity: 21944
     aliases:
       _generic: ["Turf Moor"]
     competition_scope: ["ENG-Premier League"]
@@ -353,7 +331,7 @@ venues:
     canonical_id: "venue_vicarage_road"
     city: "Watford"
     country: "England"
-    capacity: 22220
+    capacity: 22220  # #750: FotMob-fallback (moved ground / sponsor rename — FotMob current-ground bias misses it)
     aliases:
       _generic: ["Vicarage Road Stadium", "Vicarage Road"]
     competition_scope: ["ENG-Premier League"]
@@ -362,7 +340,6 @@ venues:
     canonical_id: "venue_villa_park"
     city: "Birmingham"
     country: "England"
-    capacity: 43205
     aliases:
       _generic: ["Villa Park"]
     competition_scope: ["ENG-Premier League"]
@@ -371,7 +348,6 @@ venues:
     canonical_id: "venue_vitality"
     city: "Bournemouth"
     country: "England"
-    capacity: 11307
     aliases:
       _generic: ["Vitality Stadium", "Dean Court"]
     competition_scope: ["ENG-Premier League"]
@@ -382,7 +358,7 @@ venues:
     canonical_id: "venue_wembley"
     city: "London"
     country: "England"
-    capacity: 90000
+    capacity: 90000  # #750: FotMob-fallback (moved ground / sponsor rename — FotMob current-ground bias misses it)
     aliases:
       _generic: ["Wembley Stadium"]
     competition_scope: ["ENG-Premier League"]
@@ -393,7 +369,7 @@ venues:
     canonical_id: "venue_white_hart_lane"
     city: "London"
     country: "England"
-    capacity: 36284
+    capacity: 36284  # #750: FotMob-fallback (moved ground / sponsor rename — FotMob current-ground bias misses it)
     aliases:
       _generic: ["White Hart Lane"]
     competition_scope: ["ENG-Premier League"]

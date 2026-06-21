@@ -911,8 +911,12 @@
         "team_id": "bigint",
         "team_name": "varchar",
         "venue": "varchar",
+        "venue_capacity": "varchar",
+        "venue_city": "varchar",
         "venue_latitude": "varchar",
-        "venue_longitude": "varchar"
+        "venue_longitude": "varchar",
+        "venue_opened": "varchar",
+        "venue_surface": "varchar"
       }
     },
     "bronze.fotmob_team_squad": {
