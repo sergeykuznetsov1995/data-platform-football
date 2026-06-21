@@ -117,6 +117,24 @@ def _bootstrap(con) -> None:
         ('   ',             DATE '2024-08-22', TIMESTAMP '2026-04-27 09:00:00', 'ENG-Premier League', '2425')
     """)
 
+    # #719: stadium coords from silver.fotmob_team_profile, matched by normalised
+    # venue name. Lookup-only — must NOT add venues or fan out the grain. 'Gtech'
+    # spelling attaches to venue_brentford; Goodison is absent (curated, coords
+    # NULL); 'Phantom Arena' is unknown to fbref/espn (must NOT create a venue).
+    con.execute("""
+        CREATE TABLE silver.fotmob_team_profile (
+            venue VARCHAR, venue_latitude DOUBLE, venue_longitude DOUBLE, league VARCHAR
+        )
+    """)
+    con.execute("""
+        INSERT INTO silver.fotmob_team_profile VALUES
+        ('Etihad Stadium',           53.4831, -2.2004, 'ENG-Premier League'),
+        ('Anfield',                  53.4308, -2.9608, 'ENG-Premier League'),
+        ('Old Trafford',             53.4631, -2.2914, 'ENG-Premier League'),
+        ('Gtech Community Stadium',  51.4906, -0.2889, 'ENG-Premier League'),
+        ('Phantom Arena',            10.0000, 20.0000, 'ENG-Premier League')
+    """)
+
 
 @pytest.fixture(scope="module")
 def gold_rows():
@@ -229,3 +247,35 @@ class TestDimVenueLogic:
         assert None not in names
         assert "" not in names
         assert "   " not in names
+
+    # ---- #719: FotMob stadium coordinates ----------------------------------
+
+    def test_coords_attach_to_curated(self, gold_rows):
+        """Coords flow from silver.fotmob_team_profile onto the matching venue."""
+        etihad = _by_id(gold_rows, "venue_etihad")[0]
+        assert etihad["latitude"] == pytest.approx(53.4831)
+        assert etihad["longitude"] == pytest.approx(-2.2004)
+
+    def test_coords_survive_spelling_merge(self, gold_rows):
+        """FotMob's 'Gtech' spelling normalises onto venue_brentford even though
+        the venue is also seen as 'Brentford Community Stadium' via ESPN."""
+        brentford = _by_id(gold_rows, "venue_brentford")[0]
+        assert brentford["latitude"] == pytest.approx(51.4906)
+        assert brentford["longitude"] == pytest.approx(-0.2889)
+
+    def test_coords_null_without_fotmob_match(self, gold_rows):
+        """Curated venue with no FotMob row (Goodison) and the orphan both get
+        NULL coords — the LEFT JOIN must not invent values."""
+        goodison = _by_id(gold_rows, "venue_goodison")[0]
+        assert goodison["latitude"] is None
+        assert goodison["longitude"] is None
+        orphan = [r for r in gold_rows if r["venue_source"] == "orphan"][0]
+        assert orphan["latitude"] is None
+        assert orphan["longitude"] is None
+
+    def test_fotmob_coords_add_no_venues(self, gold_rows):
+        """'Phantom Arena' exists only in FotMob (not fbref/espn) → it must NOT
+        appear as a venue. Guards the lookup-only / no-fan-out contract."""
+        names = {r["venue_name"] for r in gold_rows}
+        assert "Phantom Arena" not in names
+        assert len(gold_rows) == 6  # unchanged by the coords join

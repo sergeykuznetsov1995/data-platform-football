@@ -910,7 +910,9 @@
         "short_name": "varchar",
         "team_id": "bigint",
         "team_name": "varchar",
-        "venue": "varchar"
+        "venue": "varchar",
+        "venue_latitude": "varchar",
+        "venue_longitude": "varchar"
       }
     },
     "bronze.fotmob_team_squad": {

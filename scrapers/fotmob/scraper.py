@@ -634,7 +634,14 @@ class FotMobScraper(BaseScraper):
             overview = data.get('overview') or {}
             history = data.get('history') or {}
 
-            venue = ((overview.get('venue') or {}).get('widget') or {}).get('name')
+            widget = (overview.get('venue') or {}).get('widget') or {}
+            venue = widget.get('name')
+            # widget.location = ["<lat>", "<lon>"] (strings) — kept raw, cast in
+            # Silver (TRY_CAST DOUBLE), same convention as overview_table_position.
+            # Used by gold.dim_venue for flight-distance features (#719).
+            loc = widget.get('location')
+            venue_latitude = loc[0] if isinstance(loc, list) and len(loc) == 2 else None
+            venue_longitude = loc[1] if isinstance(loc, list) and len(loc) == 2 else None
             tables = history.get('tables') or {}
             historic = tables.get('historic') if isinstance(tables, dict) else None
 
@@ -644,6 +651,8 @@ class FotMobScraper(BaseScraper):
                 'short_name': details.get('shortName'),
                 'country': details.get('country'),
                 'venue': venue,
+                'venue_latitude': venue_latitude,
+                'venue_longitude': venue_longitude,
                 'overview_season': overview.get('season'),
                 'overview_table_position': self._overview_table_position(overview, details.get('id') or tid),
                 'next_match': self._jdump(overview.get('nextMatch')),

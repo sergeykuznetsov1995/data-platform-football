@@ -7,6 +7,8 @@
 -- Sources:
 --   iceberg.silver.fbref_match_enriched   (sch.venue per match)
 --   iceberg.silver.espn_matchsheet        (conform: venue per match, dedup'd #735)
+--   iceberg.silver.fotmob_team_profile    (lat/long lookup only, #719 — does NOT
+--                                          contribute venue rows; grain unchanged)
 --
 -- Identity (issue #145): `venue_id` is the explicit `venue_<slug>` from
 -- `configs/medallion/venue_aliases.yaml` — NOT a hash of the raw name. The
@@ -31,6 +33,9 @@
 --   venue_name   = canonical_name from YAML, else MAX(name) fbref > espn
 --   city/country = from venue_aliases.yaml (NULL for orphans)
 --   capacity     = NULL placeholder (no source yet; enrichment followup)
+--   latitude/longitude = stadium coords from silver.fotmob_team_profile, matched
+--                  by normalised venue name (#719); NULL when no FotMob match.
+--                  Feeds flight-distance features for the home-advantage study (#558).
 --   venue_source = 'curated' (matched alias) | 'orphan' (unmatched) — kept
 --                  for the orphan-rate DQ check in validate_gold_quality
 --
@@ -95,6 +100,27 @@ espn_venues as (
       and trim(venue) <> ''
 ),
 
+-- FotMob stadium coordinates (#719): lat/long keyed by (league, normalised venue
+-- name). Enrichment lookup ONLY — joined into `resolved`, never UNION'd into the
+-- venue feed, so dim_venue's one-row-per-venue grain is untouched. Same norm idiom
+-- as the alias join; (league, norm) guards worldwide namesakes like the alias join.
+fotmob_venue_coords as (
+    select
+        league,
+        regexp_replace(
+            regexp_replace(normalize(lower(trim(venue)), NFD), '\p{Mn}+', ''),
+            '[^a-z0-9]+', ''
+        )                                            as norm,
+        max(venue_latitude)                          as latitude,
+        max(venue_longitude)                         as longitude
+    from iceberg.silver.fotmob_team_profile
+    where venue is not null
+      and trim(venue) <> ''
+      and venue_latitude is not null
+      and venue_longitude is not null
+    group by 1, 2
+),
+
 unioned as (
     select * from fbref_venues
     union all
@@ -113,6 +139,8 @@ resolved as (
         a.city,
         a.country,
         a.capacity,
+        f.latitude,
+        f.longitude,
         -- Curated alias -> explicit slug; orphan -> stable normalised-name hash.
         case
             when a.canonical_id is not null then a.canonical_id
@@ -130,6 +158,12 @@ resolved as (
                       regexp_replace(normalize(lower(trim(u.venue_raw)), NFD), '\p{Mn}+', ''),
                       '[^a-z0-9]+', ''
                   )
+    left join fotmob_venue_coords f
+      on f.league = u.league
+     and f.norm = regexp_replace(
+                      regexp_replace(normalize(lower(trim(u.venue_raw)), NFD), '\p{Mn}+', ''),
+                      '[^a-z0-9]+', ''
+                  )
 ),
 
 aggregated as (
@@ -140,6 +174,8 @@ aggregated as (
         max(city)                                    as city,
         max(country)                                 as country,
         max(capacity)                                as capacity,
+        max(latitude)                                as latitude,
+        max(longitude)                               as longitude,
         max(venue_raw) filter (where src = 'fbref')  as venue_fbref,
         max(venue_raw) filter (where src = 'espn')   as venue_espn,
         count(distinct match_date)                   as n_matches,
@@ -160,6 +196,10 @@ select
     -- venues without a curated value). ESPN's bronze column is 100% NULL — see
     -- feedback_bronze_expected_null_columns.
     cast(capacity as integer)                                                  as capacity,
+    -- latitude/longitude (issue #719): stadium coords from silver.fotmob_team_profile,
+    -- matched by normalised venue name. NULL when FotMob has no matching venue.
+    cast(latitude as double)                                                   as latitude,
+    cast(longitude as double)                                                  as longitude,
     -- Kept beyond the design's column list: the orphan-rate DQ check in
     -- gold_tasks.validate_gold_quality filters on venue_source = 'orphan'.
     case when canonical_id is not null then 'curated' else 'orphan' end        as venue_source
