@@ -888,25 +888,23 @@ class FotMobScraper(BaseScraper):
     # ------------------------------------------------------------------ #
 
     def _fetch_match_details(self, match_id: Any) -> Optional[Dict[str, Any]]:
-        """Resolve a match's ``_next/data`` payload via the 2-step slug path.
+        """Resolve a match's detail payload via the public ``matchDetails`` API.
 
-        Step 1: ``/api/data/match?id=`` -> ``pageUrl`` slug.
-        Step 2: ``/_next/data/<buildId>/matches/<slug>/<short_id>.json``.
+        Content comes from ``/api/data/matchDetails?matchId=`` — the slimmed
+        ``_next/data`` static payload drops ``content.stats`` (and other heavy
+        blobs) for archived matches, so a match missed during its live window
+        would lose its stats forever, while this API keeps the full payload
+        (issue #547). The cheap ``/api/data/match?id=`` call is kept only to
+        resolve the canonical ``pageUrl`` stored in Bronze.
         """
         header = self._fetch_api_json('match', params={'id': str(match_id)})
         if not header:
             return None
         page_url = header.get('pageUrl')
-        if not page_url:
+        payload = self._fetch_api_json('matchDetails', params={'matchId': str(match_id)})
+        if not payload:
             return None
-        # "/matches/<slug>/<short_id>#<match_id>" -> "<slug>/<short_id>"
-        slug_path = page_url.split('#')[0].strip('/')
-        if slug_path.startswith('matches/'):
-            slug_path = slug_path[len('matches/'):]
-        content_payload = self._fetch_next_data_payload(f'/matches/{slug_path}')
-        if not content_payload:
-            return None
-        content = (content_payload.get('pageProps') or {}).get('content')
+        content = payload.get('content')
         if content is None:
             return None
         return {'header': header, 'page_url': page_url, 'content': content}
