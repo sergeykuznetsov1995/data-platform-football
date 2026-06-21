@@ -120,16 +120,16 @@ xref_fm AS (
 -- WS-колонки заполнены для текущего сезона (обоснование #161 penalties fallback).
 ws_name_to_id AS (
     SELECT DISTINCT
-        CAST(home_team_id AS varchar) AS ws_team_id,
-        home_team                     AS ws_team_name,
+        CAST(CAST(home_team_id AS BIGINT) AS varchar) AS ws_team_id,
+        home_team                                     AS ws_team_name,
         league,
         season
     FROM iceberg.bronze.whoscored_schedule
     WHERE home_team_id IS NOT NULL
     UNION
     SELECT DISTINCT
-        CAST(away_team_id AS varchar) AS ws_team_id,
-        away_team                     AS ws_team_name,
+        CAST(CAST(away_team_id AS BIGINT) AS varchar) AS ws_team_id,
+        away_team                                     AS ws_team_name,
         league,
         season
     FROM iceberg.bronze.whoscored_schedule

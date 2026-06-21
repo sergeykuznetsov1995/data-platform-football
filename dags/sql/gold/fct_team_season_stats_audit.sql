@@ -25,8 +25,15 @@
 --
 -- #478: производный gold-этаж удалён — per-source season rollups (бывшие
 -- gold.*_team_season, #370) инлайнены ниже как УСЕЧЁННЫЕ CTE (только колонки,
--- нужные diff'ам; выражения дословно из main-файла). Без ws_penalties — аудит
--- пенальти не сравнивает и bronze.whoscored_events не сканирует.
+-- нужные diff'ам; выражения дословно из main-файла).
+--
+-- KNOWN GAP (#705, намеренно): main-факт публикует penalties_won/penalties_conceded
+-- (WhoScored fallback, #161), но здесь они НЕ аудируются — нет ws_penalties CTE и
+-- penalties_*_diff колонок. Это осознанный пропуск, не упущение:
+--   (а) FBref убрал PKwon/PKcon с сезона 2025/26 → у diff'а нет FBref-baseline
+--       (audit-конвенция = FBref − <source>); для текущего сезона он был бы вакуумным;
+--   (б) audit спроектирован дешёвым (Silver-only) и намеренно НЕ сканирует
+--       bronze.whoscored_events (именно его читает ws_penalties в main-файле).
 -- ⚠️ Синхронизировать вручную с fct_team_season_stats.sql.
 --
 -- #556: остаётся inline .sql (НЕ мигрирован на source_priority.yaml) — per-source
@@ -86,14 +93,14 @@ xref_fm AS (
 
 -- WhoScored numeric↔name mapping (see main fct file header for KNOWN GAP).
 ws_name_to_id AS (
-    SELECT DISTINCT CAST(home_team_id AS varchar) AS ws_team_id,
-                    home_team                     AS ws_team_name,
+    SELECT DISTINCT CAST(CAST(home_team_id AS BIGINT) AS varchar) AS ws_team_id,
+                    home_team                                     AS ws_team_name,
                     league, season
     FROM iceberg.bronze.whoscored_schedule
     WHERE home_team_id IS NOT NULL
     UNION
-    SELECT DISTINCT CAST(away_team_id AS varchar) AS ws_team_id,
-                    away_team                     AS ws_team_name,
+    SELECT DISTINCT CAST(CAST(away_team_id AS BIGINT) AS varchar) AS ws_team_id,
+                    away_team                                     AS ws_team_name,
                     league, season
     FROM iceberg.bronze.whoscored_schedule
     WHERE away_team_id IS NOT NULL

@@ -282,6 +282,8 @@ fbref_resolved AS (
     LEFT JOIN iceberg.silver.xref_match xm
         ON xm.source    = 'fbref'
        AND xm.source_id = fl.match_id
+       AND xm.league    = fl.league
+       AND xm.season    = fl.season
     -- #729: season-agnostic dedup. fbref_match_lineups.team carries short names
     -- (Tottenham / West Ham / Nottingham / Newcastle) that xref_team only holds
     -- for season 2526, so the old season-keyed JOIN dropped 2967 older-season

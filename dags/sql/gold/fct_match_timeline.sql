@@ -170,6 +170,8 @@ fb_resolved AS (
     LEFT JOIN iceberg.silver.xref_match xm
         ON xm.source    = 'fbref'
        AND xm.source_id = fb.src_match_id
+       AND xm.league    = fb.league
+       AND xm.season    = fb.season
     LEFT JOIN iceberg.silver.xref_team xt
         ON xt.source    = 'fbref'
        AND xt.source_id = fb.team_name_raw
