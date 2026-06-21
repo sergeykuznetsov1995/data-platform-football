@@ -2,6 +2,8 @@
 Tests for SofaScoreScraper.
 """
 
+import json
+
 import pytest
 from unittest.mock import MagicMock, patch
 
@@ -690,3 +692,132 @@ class TestNoShadowedPlayerStats:
             SofaScoreScraper.read_player_season_stats
         ).parameters
         assert 'league' in params and 'season' in params
+
+
+class TestFlareSolverrTransport:
+    """#751: SofaScore's anti-bot 403s every tls_requests endpoint, so the
+    JSON API is routed through a FlareSolverr (real Chromium) session. These
+    cover the JSON-unwrap helper, the _fetch_json_endpoint dispatcher, and the
+    FlareSolverr transport's status / rotation / recovery contract."""
+
+    @pytest.fixture
+    def _deps(self):
+        with patch('scrapers.base.base_scraper.get_rate_limiter') as mock_rl, \
+             patch('scrapers.base.base_scraper.get_retry_policy'), \
+             patch('scrapers.base.base_scraper.get_circuit_breaker'), \
+             patch('scrapers.base.base_scraper.IcebergWriter'):
+            mock_rl.return_value = MagicMock()
+            yield
+
+    def _make(self, _deps, **kwargs):
+        with patch.dict('sys.modules', {'soccerdata': MagicMock()}):
+            from scrapers.sofascore import SofaScoreScraper
+            return SofaScoreScraper(
+                leagues=['ENG-Premier League'], seasons=[2024], **kwargs
+            )
+
+    @pytest.fixture
+    def fs_scraper(self, _deps):
+        return self._make(_deps, use_flaresolverr=True)
+
+    @pytest.fixture
+    def tls_scraper(self, _deps):
+        return self._make(_deps, use_flaresolverr=False)
+
+    # --- JSON unwrap ---------------------------------------------------
+
+    def test_extract_json_from_pre_wrapper(self):
+        from scrapers.sofascore.scraper import _extract_json_from_html
+        html = '<html><body><pre>{&quot;a&quot;: 1}</pre></body></html>'
+        assert json.loads(_extract_json_from_html(html)) == {'a': 1}
+
+    def test_extract_json_from_body_wrapper(self):
+        from scrapers.sofascore.scraper import _extract_json_from_html
+        html = '<html><head></head><body>{"b": 2}</body></html>'
+        assert json.loads(_extract_json_from_html(html)) == {'b': 2}
+
+    # --- dispatcher ----------------------------------------------------
+
+    def test_default_use_flaresolverr_off_without_env(self, tls_scraper):
+        assert tls_scraper._use_flaresolverr is False
+
+    def test_use_flaresolverr_kwarg_on(self, fs_scraper):
+        assert fs_scraper._use_flaresolverr is True
+
+    def test_dispatcher_routes_to_flaresolverr_when_enabled(self, fs_scraper):
+        with patch.object(fs_scraper, '_fetch_json_via_flaresolverr',
+                          return_value={'ok': 1}) as fs, \
+             patch.object(fs_scraper, '_fetch_json_via_tls') as tls:
+            out = fs_scraper._fetch_json_endpoint('http://x', label='t')
+        assert out == {'ok': 1}
+        fs.assert_called_once()
+        tls.assert_not_called()
+
+    def test_dispatcher_routes_to_tls_when_disabled(self, tls_scraper):
+        with patch.object(tls_scraper, '_fetch_json_via_tls',
+                          return_value={'ok': 2}) as tls, \
+             patch.object(tls_scraper, '_fetch_json_via_flaresolverr') as fs:
+            out = tls_scraper._fetch_json_endpoint('http://x', label='t')
+        assert out == {'ok': 2}
+        tls.assert_called_once()
+        fs.assert_not_called()
+
+    # --- FlareSolverr transport contract -------------------------------
+
+    @staticmethod
+    def _solution(status, html=''):
+        return {'status': status, 'html': html, 'cookies': [], 'userAgent': ''}
+
+    def test_via_flaresolverr_200_returns_parsed_dict(self, fs_scraper):
+        client = MagicMock()
+        client.get.return_value = self._solution(200, '<pre>{"x": 5}</pre>')
+        with patch.object(fs_scraper, '_ensure_fs_session', return_value=(client, 'sid')):
+            out = fs_scraper._fetch_json_via_flaresolverr('http://x', label='lineups')
+        assert out == {'x': 5}
+        assert fs_scraper._stats['successes'] >= 1
+
+    def test_via_flaresolverr_404_is_legit_empty(self, fs_scraper):
+        client = MagicMock()
+        client.get.return_value = self._solution(404)
+        with patch.object(fs_scraper, '_ensure_fs_session', return_value=(client, 'sid')):
+            out = fs_scraper._fetch_json_via_flaresolverr('http://x', label='lineups')
+        assert out is None
+
+    def test_via_flaresolverr_403_rotates_and_records_error(self, fs_scraper):
+        client = MagicMock()
+        client.get.return_value = self._solution(403)
+        with patch.object(fs_scraper, '_ensure_fs_session', return_value=(client, 'sid')), \
+             patch.object(fs_scraper, '_recreate_fs_session') as recreate, \
+             patch('scrapers.sofascore.scraper.time.sleep'):
+            out = fs_scraper._fetch_json_via_flaresolverr(
+                'http://x', max_attempts=2, label='lineups', context={'event_id': '7'},
+            )
+        assert out is None
+        assert fs_scraper._last_endpoint_error['status'] == 403
+        assert fs_scraper._last_endpoint_error['event_id'] == '7'
+        assert recreate.call_count >= 1
+
+    def test_session_recreates_after_n_requests(self, fs_scraper):
+        client = MagicMock()
+        client.get.return_value = self._solution(200, '<pre>{}</pre>')
+        fs_scraper._fs_request_count = fs_scraper.FS_SESSION_RECREATE_EVERY
+        with patch.object(fs_scraper, '_ensure_fs_session', return_value=(client, 'sid')), \
+             patch.object(fs_scraper, '_recreate_fs_session') as recreate:
+            fs_scraper._fetch_json_via_flaresolverr('http://x', label='lineups')
+        recreate.assert_called_once()
+
+    def test_cf_challenge_recovers_then_succeeds(self, fs_scraper):
+        from scrapers.base.flaresolverr_client import FlareSolverrCFChallengeFailed
+        client = MagicMock()
+        client.get.side_effect = [
+            FlareSolverrCFChallengeFailed('challenge'),
+            self._solution(200, '<pre>{"ok": true}</pre>'),
+        ]
+        with patch.object(fs_scraper, '_ensure_fs_session', return_value=(client, 'sid')), \
+             patch.object(fs_scraper, '_recreate_fs_session') as recreate, \
+             patch('scrapers.sofascore.scraper.time.sleep'):
+            out = fs_scraper._fetch_json_via_flaresolverr(
+                'http://x', max_attempts=3, label='lineups',
+            )
+        assert out == {'ok': True}
+        assert recreate.call_count >= 1

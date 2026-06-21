@@ -7,7 +7,10 @@ Scraper for SofaScore match data, live scores, and statistics.
 Source: https://www.sofascore.com
 """
 
+import html as html_module
+import json
 import logging
+import os
 import re
 import time
 from datetime import datetime
@@ -103,6 +106,29 @@ SOFASCORE_TOURNAMENT_MAP: Dict[str, int] = {
 R0_2B_FALLBACK_MARKER = "R0.2B_FALLBACK"
 
 
+# FlareSolverr renders every response through Chromium, wrapping an
+# application/json body as ``<pre>{...}</pre>`` (HTML-escaped). These mirror
+# the proven regexes in scrapers/whoscored/flaresolverr_reader.py — kept local
+# so this module never imports the whoscored/soccerdata stack (issue #751).
+_FS_PRE_RE = re.compile(r"<pre[^>]*>(.*?)</pre>", re.DOTALL | re.IGNORECASE)
+_FS_BODY_RE = re.compile(r"<body[^>]*>(.*?)</body>", re.DOTALL | re.IGNORECASE)
+
+
+def _extract_json_from_html(html: str) -> str:
+    """Strip Chromium's HTML wrapper around a raw JSON response.
+
+    Tries the ``<pre>`` form first (HTML-unescaping the inner text), then a
+    plain ``<body>`` body, then passes the input through unchanged.
+    """
+    match = _FS_PRE_RE.search(html)
+    if match:
+        return html_module.unescape(match.group(1))
+    match = _FS_BODY_RE.search(html)
+    if match:
+        return match.group(1).strip()
+    return html
+
+
 class SofaScoreScraper(SoccerdataScraper):
     """
     Scraper for SofaScore football data.
@@ -124,14 +150,41 @@ class SofaScoreScraper(SoccerdataScraper):
     SOURCE_NAME = 'sofascore'
     DEFAULT_RATE_LIMIT = 20  # SofaScore can be strict
 
+    # FlareSolverr transport knobs (issue #751). SofaScore's CF marks the
+    # FS-issued cookies after a handful of requests (same ceiling as
+    # WhoScored), so rotate the session every N. The JSON API is light (no
+    # heavy SPA render), so a 45s maxTimeout is generous.
+    FS_SESSION_RECREATE_EVERY = 8
+    FS_MAX_TIMEOUT_MS = 45_000
+
     def __init__(
         self,
         leagues: Optional[List[str]] = None,
         seasons: Optional[List[int]] = None,
+        use_flaresolverr: Optional[bool] = None,
+        flaresolverr_url: Optional[str] = None,
         **kwargs
     ):
         super().__init__(leagues=leagues, seasons=seasons, **kwargs)
         self._reader = None
+
+        # SofaScore's anti-bot now 403s every tls_requests endpoint (issue
+        # #751), so route the JSON API through a real Chromium session (same
+        # path as WhoScored/SoFIFA). Opt-in via SOFASCORE_USE_FLARESOLVERR so
+        # existing tls-path callers/tests keep working unchanged; the ingest
+        # DAG sets the env. Explicit kwarg wins over env.
+        if use_flaresolverr is None:
+            use_flaresolverr = os.environ.get(
+                'SOFASCORE_USE_FLARESOLVERR', '',
+            ).strip().lower() in ('1', 'true', 'yes', 'on')
+        self._use_flaresolverr = use_flaresolverr
+        self._flaresolverr_url = (
+            flaresolverr_url
+            or os.environ.get('FLARESOLVERR_URL', 'http://flaresolverr:8191')
+        )
+        self._fs_client = None
+        self._fs_session_id = None
+        self._fs_request_count = 0
 
     def _get_reader(self):
         """Get soccerdata SofaScore reader."""
@@ -266,6 +319,25 @@ class SofaScoreScraper(SoccerdataScraper):
 
         return [str(int(g)) for g in df['game_id'].dropna().tolist()]
 
+    def _fetch_json_endpoint(
+        self,
+        url: str,
+        max_attempts: int = 3,
+        label: str = 'endpoint',
+        context: Optional[Dict] = None,
+    ) -> Optional[dict]:
+        """Dispatch a GET → JSON to FlareSolverr (issue #751) or the legacy
+        tls_requests path. All seven endpoint helpers funnel through here, so
+        flipping ``_use_flaresolverr`` migrates the whole scraper at once.
+        """
+        if self._use_flaresolverr:
+            return self._fetch_json_via_flaresolverr(
+                url, max_attempts=max_attempts, label=label, context=context,
+            )
+        return self._fetch_json_via_tls(
+            url, max_attempts=max_attempts, label=label, context=context,
+        )
+
     def _build_tls_session(self):
         """Create a tls_requests.Client bound to the next residential
         proxy, mirroring the JA3/JA4 fingerprint workaround the rest of
@@ -285,15 +357,20 @@ class SofaScoreScraper(SoccerdataScraper):
         client = tls_requests.Client(proxy=proxy_url) if proxy_url else tls_requests.Client()
         return client, proxy_obj
 
-    def _fetch_json_endpoint(
+    def _fetch_json_via_tls(
         self,
         url: str,
         max_attempts: int = 3,
         label: str = 'endpoint',
         context: Optional[Dict] = None,
     ) -> Optional[dict]:
-        """Generic GET → JSON over SofaScore's public REST API with proxy
-        rotation, rate-limit, retry, and graceful 404.
+        """Legacy GET → JSON over SofaScore's REST API via tls_requests with
+        proxy rotation, rate-limit, retry, and graceful 404.
+
+        NOTE (issue #751): SofaScore's anti-bot now 403s this path for every
+        endpoint. Kept behind ``_use_flaresolverr=False`` as an emergency
+        fallback / for the fingerprint-probe escape hatch; production routes
+        through :meth:`_fetch_json_via_flaresolverr`.
 
         Parameters
         ----------
@@ -394,6 +471,177 @@ class SofaScoreScraper(SoccerdataScraper):
             **(context or {}),
         }
         return None
+
+    def _pick_fs_proxy(self) -> Optional[str]:
+        """Proxy URL to bind the FlareSolverr session to (issue #751).
+
+        PROXY_FILTER_URL (ad-tech filter, #652) wins; else the next
+        residential proxy from the pool; else None (FlareSolverr solves CF
+        directly, proxy-less).
+        """
+        filter_url = os.environ.get('PROXY_FILTER_URL')
+        if filter_url:
+            return filter_url
+        if self._proxy_manager is not None and self._proxy_manager.total_count > 0:
+            proxy_obj = self._proxy_manager.get_proxy()
+            if proxy_obj is not None:
+                return proxy_obj.url
+        return self.proxy
+
+    def _ensure_fs_session(self):
+        """Lazily build the FlareSolverr client + a proxy-bound session.
+
+        Returns ``(client, session_id)``. Cheap to call repeatedly — both the
+        client and the session are cached until :meth:`_recreate_fs_session`
+        or :meth:`close` tear them down.
+        """
+        from scrapers.base.flaresolverr_client import (
+            FlareSolverrClient,
+            describe_proxy_mode,
+        )
+
+        if self._fs_client is None:
+            self._fs_client = FlareSolverrClient(url=self._flaresolverr_url)
+        if self._fs_session_id is None:
+            import uuid
+
+            proxy_url = self._pick_fs_proxy()
+            self._fs_session_id = f"sofascore-{uuid.uuid4().hex[:8]}"
+            self._fs_client.create_session(self._fs_session_id, proxy_url=proxy_url)
+            logger.info(
+                "FlareSolverr session %s created (proxy mode: %s)",
+                self._fs_session_id, describe_proxy_mode(proxy_url),
+            )
+            self._fs_request_count = 0
+        return self._fs_client, self._fs_session_id
+
+    def _recreate_fs_session(self) -> None:
+        """Destroy + rebuild the FS session — rotates CF state and proxy."""
+        if self._fs_client is not None and self._fs_session_id is not None:
+            self._fs_client.destroy_session(self._fs_session_id)
+        self._fs_session_id = None
+        self._ensure_fs_session()
+
+    def _fetch_json_via_flaresolverr(
+        self,
+        url: str,
+        max_attempts: int = 3,
+        label: str = 'endpoint',
+        context: Optional[Dict] = None,
+    ) -> Optional[dict]:
+        """GET → JSON over SofaScore's REST API through FlareSolverr (#751).
+
+        Mirrors :meth:`_fetch_json_via_tls`'s contract exactly — 200 → dict,
+        404 → ``None`` (legitimate-empty), ``None`` after exhausted attempts
+        with ``self._last_endpoint_error`` set — so the seven endpoint helpers
+        and the runner's R0.2B_FALLBACK classification are unchanged. Proxy
+        rotation happens by recreating the session (the proxy is bound at
+        session-create time).
+        """
+        from scrapers.base.flaresolverr_client import (
+            FlareSolverrCFChallengeFailed,
+            FlareSolverrError,
+            FlareSolverrErrorPage,
+            FlareSolverrTabCrashed,
+            FlareSolverrTimeout,
+            is_chromium_error_page,
+        )
+
+        last_status = None
+        last_error = None
+        for attempt in range(1, max_attempts + 1):
+            self._rate_limiter.acquire()
+            self._stats['requests'] += 1
+            try:
+                # Rotate the session before it ages out (CF marks FS cookies
+                # after a handful of requests).
+                if self._fs_request_count >= self.FS_SESSION_RECREATE_EVERY:
+                    self._recreate_fs_session()
+                client, session_id = self._ensure_fs_session()
+                self._fs_request_count += 1
+
+                solution = client.get(
+                    url, session_id, max_timeout_ms=self.FS_MAX_TIMEOUT_MS,
+                )
+                last_status = solution.get('status')
+                page = solution.get('html') or ''
+
+                if last_status == 200:
+                    if is_chromium_error_page(page):
+                        # Chromium net-error page served as HTTP 200 (e.g. a
+                        # dead proxy, #647) — rotate the session and retry.
+                        last_error = "chromium error page (transport)"
+                        self._recreate_fs_session()
+                    else:
+                        self._stats['successes'] += 1
+                        return json.loads(_extract_json_from_html(page))
+                elif last_status == 404:
+                    # Cancelled match / retired player / missing season —
+                    # legitimate empty, same as the tls path.
+                    logger.info("%s not exposed (%s) — 404", label, context or url)
+                    self._stats['successes'] += 1
+                    return None
+                elif last_status == 403:
+                    last_error = "HTTP 403 (anti-bot) — rotating FS session"
+                    self._recreate_fs_session()
+                elif last_status == 429:
+                    last_error = "HTTP 429 rate-limited"
+                    time.sleep(2 ** attempt)
+                else:
+                    last_error = f"HTTP {last_status}"
+            except json.JSONDecodeError as parse_err:
+                last_error = f"json_decode: {parse_err}"
+                logger.warning(
+                    "%s payload not JSON (%s): %s",
+                    label, context or url, parse_err,
+                )
+                break
+            except (
+                FlareSolverrCFChallengeFailed,
+                FlareSolverrTabCrashed,
+                FlareSolverrErrorPage,
+                FlareSolverrTimeout,
+            ) as e:
+                last_error = f"{type(e).__name__}: {e}"
+                try:
+                    self._recreate_fs_session()
+                except Exception:
+                    pass
+                time.sleep(3 * attempt)
+            except FlareSolverrError as e:
+                last_error = f"{type(e).__name__}: {e}"
+            except Exception as e:  # pragma: no cover - defensive
+                last_error = f"{type(e).__name__}: {e}"
+
+            logger.warning(
+                "%s attempt %d/%d failed (%s): %s",
+                label, attempt, max_attempts, context or url, last_error,
+            )
+
+        self._stats['failures'] += 1
+        self._last_endpoint_error = {
+            'label': label,
+            'status': last_status,
+            'error': last_error,
+            **(context or {}),
+        }
+        return None
+
+    def close(self) -> None:
+        """Tear down the FlareSolverr session and log traffic (issue #751)."""
+        if self._fs_client is not None:
+            try:
+                if self._fs_session_id is not None:
+                    self._fs_client.destroy_session(self._fs_session_id)
+                logger.info(
+                    "SofaScore FlareSolverr traffic: %s",
+                    self._fs_client.get_traffic_stats(),
+                )
+            except Exception as e:  # pragma: no cover - defensive
+                logger.warning("SofaScore close() FS cleanup failed: %s", e)
+            finally:
+                self._fs_session_id = None
+        super().close()
 
     def _fetch_lineup_payload(
         self,
