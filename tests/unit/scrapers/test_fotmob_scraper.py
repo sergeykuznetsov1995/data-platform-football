@@ -105,6 +105,34 @@ class TestFotMobScraperUnit:
         assert 'oldbuild' in fj.call_args_list[0][0][0]
         assert 'newbuild' in fj.call_args_list[1][0][0]
 
+    def test_fetch_match_details_uses_matchdetails_endpoint(self, mock_scraper):
+        """Content comes from /api/data/matchDetails, not the _next/data payload.
+
+        Issue #547: FotMob serves a slimmed _next/data static payload for
+        archived matches (``content.stats = null``), while the matchDetails API
+        still returns the full stats. The fetch must use matchDetails so a
+        missed match can be re-scraped with its stats intact.
+        """
+        header = {'pageUrl': '/matches/everton-vs-newcastle-united/2yo9qd#4813499'}
+        match_details = {'content': {
+            'stats': {'Periods': {'All': {'stats': [{'key': 'BallPossesion'}]}}},
+            'lineup': {'a': 1},
+        }}
+        with patch.object(mock_scraper, '_fetch_api_json',
+                          side_effect=[header, match_details]) as fj, \
+             patch.object(mock_scraper, '_fetch_next_data_payload') as nd:
+            res = mock_scraper._fetch_match_details(4813499)
+
+        assert res is not None
+        assert res['content'] == match_details['content']
+        assert res['content']['stats']            # the bug: null via _next/data
+        assert res['page_url'] == header['pageUrl']
+        nd.assert_not_called()                    # no longer uses _next/data
+        endpoints = [c.args[0] for c in fj.call_args_list]
+        assert 'matchDetails' in endpoints
+        md_call = next(c for c in fj.call_args_list if c.args[0] == 'matchDetails')
+        assert md_call.kwargs['params'] == {'matchId': '4813499'}
+
     def test_read_schedule_parses_data(self, mock_scraper):
         """Test schedule parsing from API response."""
         mock_data = {
