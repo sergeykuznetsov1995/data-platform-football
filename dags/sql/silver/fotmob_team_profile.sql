@@ -12,8 +12,9 @@
 -- Источник Bronze (см. scrapers/fotmob/scraper.py read_team_profile):
 --   bronze.fotmob_team_profile — team_id (bigint), team_name/short_name/country/
 --     venue (varchar), venue_latitude/venue_longitude (varchar — координаты
---     стадиона из widget.location, #719), overview_table_position (varchar —
---     stringified int), league (varchar), season (bigint year-start).
+--     стадиона из widget.location, #719), venue_city/venue_surface/venue_capacity/
+--     venue_opened (varchar — widget.city + statPairs, #750), overview_table_position
+--     (varchar — stringified int), league (varchar), season (bigint year-start).
 --
 -- Notes:
 --   * Снапшотные/низкоценные колонки НЕ переносим: next_match / last_match (сырой
@@ -50,6 +51,14 @@ SELECT
     -- ===== Attributes =====
     b.country,
     b.venue,
+    -- Venue attributes (#750): widget.city + statPairs (surface/capacity/opened).
+    -- Feeds gold.dim_venue (city fills non-curated NULLs; capacity replaces the
+    -- hand-curated #434 lookup; surface/opened are new attributes). Bronze holds
+    -- raw strings → cast numeric ones here (like table_position).
+    b.venue_city,
+    b.venue_surface,
+    TRY_CAST(b.venue_capacity AS INTEGER) AS venue_capacity,
+    TRY_CAST(b.venue_opened   AS INTEGER) AS venue_opened,
     -- Stadium coords (#719) for gold.dim_venue flight-distance features. Bronze
     -- holds raw strings from FotMob widget.location → cast here (like table_position).
     TRY_CAST(b.venue_latitude  AS DOUBLE) AS venue_latitude,

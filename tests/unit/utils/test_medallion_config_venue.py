@@ -226,12 +226,21 @@ def test_shipped_venue_yaml_loads_and_renders():
     # sponsor-rename merge survives into the rendered VALUES
     assert "'Gtech Community Stadium', 'venue_brentford_community'" in sql
     assert "'Brentford Community Stadium', 'venue_brentford_community'" in sql
-    # capacity (issue #434): shipped values are positive ints (or omitted) and
-    # render UNQUOTED in the include_capacity VALUES body.
-    for v in venues:
-        cap = v.get("capacity")
-        assert cap is None or (isinstance(cap, int) and not isinstance(cap, bool) and cap > 0), \
-            v["canonical_id"]
+    # capacity (issue #750): FotMob is the PRIMARY source; the shipped YAML keeps only
+    # a small CURATED FALLBACK for venues FotMob's current-ground team-profile can't
+    # supply (moved grounds). So most venues have NO curated capacity, while a handful
+    # (e.g. Goodison Park) still do. Guards that the bulk register was removed but the
+    # fallback survives.
+    with_cap = [v for v in venues if v.get("capacity") is not None]
+    assert 0 < len(with_cap) <= 12, f"expected a small curated fallback set, got {len(with_cap)}"
+    for v in with_cap:
+        cap = v["capacity"]
+        assert isinstance(cap, int) and not isinstance(cap, bool) and cap > 0, v["canonical_id"]
+    # Goodison Park (Everton's pre-2025 ground) is a fallback — FotMob reports the new
+    # Hill Dickinson Stadium for every season, so the curated value must remain.
+    goodison = [v for v in venues if v["canonical_id"] == "venue_goodison_park"]
+    assert goodison and goodison[0].get("capacity") == 39414, goodison
+    # Old Trafford is FotMob-covered → no curated fallback (renders NULL, UNQUOTED).
     sql_cap = mc.get_venue_alias_sql_values(include_capacity=True)
     ot_line = [ln for ln in sql_cap.splitlines() if "venue_old_trafford" in ln][0]
-    assert "74244" in ot_line and "'74244'" not in ot_line, ot_line
+    assert ot_line.rstrip().rstrip(",").endswith("NULL)"), ot_line

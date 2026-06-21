@@ -634,14 +634,24 @@ class FotMobScraper(BaseScraper):
             overview = data.get('overview') or {}
             history = data.get('history') or {}
 
-            widget = (overview.get('venue') or {}).get('widget') or {}
+            venue_obj = overview.get('venue') or {}
+            widget = venue_obj.get('widget') or {}
             venue = widget.get('name')
+            venue_city = widget.get('city')
             # widget.location = ["<lat>", "<lon>"] (strings) — kept raw, cast in
             # Silver (TRY_CAST DOUBLE), same convention as overview_table_position.
             # Used by gold.dim_venue for flight-distance features (#719).
             loc = widget.get('location')
             venue_latitude = loc[0] if isinstance(loc, list) and len(loc) == 2 else None
             venue_longitude = loc[1] if isinstance(loc, list) and len(loc) == 2 else None
+            # venue.statPairs = [["Surface","Grass"], ["Capacity",74244], ["Opened",1910]]
+            # — a list of [label, value] pairs, sibling of widget. Kept raw (str) like
+            # the coords; Silver TRY_CASTs capacity/opened to INTEGER. Promotes the venue
+            # attributes #719 left on the table → gold.dim_venue (#750).
+            stat_pairs = self._parse_venue_stat_pairs(venue_obj.get('statPairs'))
+            venue_surface = stat_pairs.get('surface')
+            venue_capacity = stat_pairs.get('capacity')
+            venue_opened = stat_pairs.get('opened')
             tables = history.get('tables') or {}
             historic = tables.get('historic') if isinstance(tables, dict) else None
 
@@ -651,8 +661,12 @@ class FotMobScraper(BaseScraper):
                 'short_name': details.get('shortName'),
                 'country': details.get('country'),
                 'venue': venue,
+                'venue_city': venue_city,
                 'venue_latitude': venue_latitude,
                 'venue_longitude': venue_longitude,
+                'venue_surface': venue_surface,
+                'venue_capacity': venue_capacity,
+                'venue_opened': venue_opened,
                 'overview_season': overview.get('season'),
                 'overview_table_position': self._overview_table_position(overview, details.get('id') or tid),
                 'next_match': self._jdump(overview.get('nextMatch')),
@@ -670,6 +684,25 @@ class FotMobScraper(BaseScraper):
         df = self._add_metadata(df, 'team_profile')
         logger.info(f"Parsed {len(df)} team profiles")
         return df
+
+    @staticmethod
+    def _parse_venue_stat_pairs(stat_pairs: Any) -> Dict[str, Optional[str]]:
+        """Fold FotMob ``venue.statPairs`` into a ``{lower(label): str(value)}`` dict (#750).
+
+        statPairs is a list of ``[label, value]`` pairs, e.g.
+        ``[["Surface","Grass"], ["Capacity",74244], ["Opened",1910]]``. Values
+        are kept raw (str) like the coords; Silver TRY_CASTs numeric ones. Robust
+        to ordering and to a missing/malformed list — unknown labels are absent.
+        """
+        out: Dict[str, Optional[str]] = {}
+        if not isinstance(stat_pairs, list):
+            return out
+        for pair in stat_pairs:
+            if isinstance(pair, (list, tuple)) and len(pair) == 2 and pair[0] is not None:
+                label = str(pair[0]).strip().lower()
+                value = pair[1]
+                out[label] = str(value) if value is not None else None
+        return out
 
     @staticmethod
     def _overview_table_position(overview: Dict[str, Any], team_id: Any) -> Optional[str]:
