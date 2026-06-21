@@ -97,7 +97,7 @@ _BRONZE_COLUMNS: List[str] = [
     "game_id", "period", "minute", "second", "expanded_minute",
     "type", "outcome_type", "team_id", "player_id",
     "x", "y", "end_x", "end_y",
-    "qualifiers", "related_event_id", "team",
+    "qualifiers", "related_event_id", "related_player_id", "team",
     "league", "season", "_ingested_at",
 ]
 
@@ -119,6 +119,7 @@ def _row(
     end_y: Optional[float] = 50.0,
     qualifiers: Optional[str] = None,
     related_event_id: Optional[int] = None,
+    related_player_id: Optional[int] = None,
     team: str = "Arsenal",
     league: str = "ENG-Premier League",
     season: str = "2526",
@@ -138,6 +139,7 @@ def _row(
         "x": x, "y": y, "end_x": end_x, "end_y": end_y,
         "qualifiers": qualifiers,
         "related_event_id": related_event_id,
+        "related_player_id": related_player_id,
         "team": team,
         "league": league,
         "season": season,
@@ -190,6 +192,7 @@ def _seed_and_run(con, fixture_rows: List[Dict[str, Any]]) -> List[Dict[str, Any
             end_y             DOUBLE,
             qualifiers        VARCHAR,
             related_event_id  BIGINT,
+            related_player_id DOUBLE,
             team              VARCHAR,
             league            VARCHAR,
             season            VARCHAR,
@@ -581,6 +584,38 @@ class TestSyntheticEventId:
     def test_match_id_is_varchar_game_id(self, duck_conn):
         out = _seed_and_run(duck_conn, [_row(game_id=400)])
         assert out[0]["match_id"] == "400"
+
+
+# ---------------------------------------------------------------------------
+# #736: raw passthrough columns for Gold fct_match_timeline one-hop
+# ---------------------------------------------------------------------------
+
+
+class TestRawPassthroughColumns736:
+    """#736: silver projects raw minute/second/related_player_id/team so Gold
+    fct_match_timeline reads the WhoScored fallback from silver (one-hop) instead
+    of bronze. Values are byte-for-byte the bronze columns (ids double-cast)."""
+
+    def test_minute_and_second_passthrough(self, duck_conn):
+        out = _seed_and_run(duck_conn, [
+            _row(game_id=500, minute=47, second=12, type_="Pass"),
+        ])
+        assert out[0]["minute"] == 47
+        assert out[0]["second"] == 12
+
+    def test_team_name_raw_passthrough(self, duck_conn):
+        out = _seed_and_run(duck_conn, [_row(team="Arsenal")])
+        assert out[0]["team_name_raw"] == "Arsenal"
+
+    def test_related_player_id_raw_double_cast(self, duck_conn):
+        # bronze related_player_id is DOUBLE; a naive CAST AS varchar yields
+        # scientific notation ('9.5408E4'). The BIGINT round-trip keeps digits.
+        out = _seed_and_run(duck_conn, [_row(related_player_id=95408)])
+        assert out[0]["related_player_id_raw"] == "95408"
+
+    def test_related_player_id_raw_null_stays_null(self, duck_conn):
+        out = _seed_and_run(duck_conn, [_row(related_player_id=None)])
+        assert out[0]["related_player_id_raw"] is None
 
 
 # ---------------------------------------------------------------------------

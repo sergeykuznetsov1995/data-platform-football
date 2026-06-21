@@ -319,27 +319,28 @@ ws_season_rollup AS (
     GROUP BY team_id, league, season
 ),
 
--- Penalties from raw Bronze (#161: FBref убрал PKwon/PKcon с сезона 2025/26 →
--- WhoScored fallback). Считаются ПРЯМО из bronze.whoscored_events, НЕ из
--- team_match/events_spadl: SPADL-канонизация разбрасывает пенальти
--- (Goal→'unknown', Save→'keeper_save', Foul→'foul'), теряя ~80% сигнала.
--- Маркер пенальти в bronze qualifiers — вложенный
--- `{"type": {"value": 9, "displayName": "Penalty"}}`. won = penalty-удар бьющей
--- команды; conceded = событие 'PenaltyFaced' командой вратаря (оба счётчика
--- сходятся 1:1 на APL 25/26). team_id double-cast как в events_spadl
--- (feedback_bronze_double_id_cast.md).
+-- Penalties from silver.whoscored_events_spadl AUDIT columns (#161: FBref убрал
+-- PKwon/PKcon с сезона 2025/26 → WhoScored fallback; #736: one-hop через silver,
+-- НЕ bronze). NB: считаем по `_action_source_note` (исходный WhoScored type) +
+-- `qualifiers_raw` (сырой JSON), а НЕ по `action_canonical` — SPADL-канонизация
+-- разбрасывает пенальти (Goal→'unknown'/shot, Save→'keeper_save', Foul→'foul'),
+-- теряя ~80% сигнала, но audit-колонки silver сохраняют оригинал. Маркер пенальти
+-- в qualifiers_raw — вложенный `{"type": {"value": 9, "displayName": "Penalty"}}`.
+-- won = penalty-удар бьющей команды; conceded = _action_source_note='PenaltyFaced'
+-- командой вратаря (оба счётчика сходятся 1:1 на APL 25/26). team_id_raw уже
+-- double-cast в silver (feedback_bronze_double_id_cast.md).
 ws_penalties AS (
     SELECT
-        CAST(CAST(team_id AS BIGINT) AS varchar)                                  AS team_id,
+        team_id_raw                                                              AS team_id,
         league,
         season,
-        COUNT_IF(type IN ('Goal', 'SavedShot', 'MissedShots', 'ShotOnPost')
-                 AND regexp_like(COALESCE(qualifiers, ''),
+        COUNT_IF(_action_source_note IN ('Goal', 'SavedShot', 'MissedShots', 'ShotOnPost')
+                 AND regexp_like(COALESCE(qualifiers_raw, ''),
                                  '"displayName"\s*:\s*"Penalty"'))                 AS penalties_won,
-        COUNT_IF(type = 'PenaltyFaced')                                           AS penalties_conceded
-    FROM iceberg.bronze.whoscored_events
-    WHERE team_id IS NOT NULL
-    GROUP BY CAST(CAST(team_id AS BIGINT) AS varchar), league, season
+        COUNT_IF(_action_source_note = 'PenaltyFaced')                            AS penalties_conceded
+    FROM iceberg.silver.whoscored_events_spadl
+    WHERE team_id_raw IS NOT NULL
+    GROUP BY team_id_raw, league, season
 ),
 
 ws_team_season AS (

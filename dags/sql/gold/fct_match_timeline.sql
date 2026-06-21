@@ -10,7 +10,7 @@
 -- Sources:
 --   iceberg.silver.fbref_match_events     — PRIMARY (already deduped, season
 --                                           already compact slug '2425')
---   iceberg.bronze.whoscored_events       — FALLBACK, per-match all-or-nothing:
+--   iceberg.silver.whoscored_events_spadl — FALLBACK, per-match all-or-nothing:
 --                                           a match takes WhoScored events ONLY
 --                                           when it has zero FBref events. No
 --                                           event-level cross-source dedup —
@@ -23,6 +23,11 @@
 --                                           teams) so an unbridged WS twin of
 --                                           an FBref-covered match can't
 --                                           double-enter under the raw id.
+--                                           #736: reads SILVER (one-hop), not
+--                                           bronze — original WhoScored type via
+--                                           `_action_source_note`, raw JSON via
+--                                           `qualifiers_raw`; silver is already
+--                                           deduped + double-ids pre-cast.
 --   iceberg.bronze.whoscored_schedule     — bridge spine (game_id → date/home/away)
 --   iceberg.silver.fbref_match_enriched   — bridge target (FBref hex match_id)
 --   iceberg.silver.xref_match/team/player — canonical resolvers
@@ -196,16 +201,30 @@ fb_resolved AS (
 -- ============================================================================
 -- SubstitutionOn rows are intentionally NOT selected: the Off row carries
 -- related_player_id = ON player, giving one timeline row per swap for free.
-ws_events_dedup AS (
-    SELECT *,
-           ROW_NUMBER() OVER (
-               PARTITION BY game_id, period, minute, second, type,
-                            team_id, player_id, qualifiers
-               ORDER BY _ingested_at DESC
-           ) AS rn
-    FROM iceberg.bronze.whoscored_events
-    WHERE type IN ('Goal', 'Card', 'SubstitutionOff',
-                   'MissedShots', 'SavedShot', 'ShotOnPost')
+-- #736: WhoScored fallback reads silver.whoscored_events_spadl (one-hop), NOT
+-- bronze. Silver already deduped re-scrapes (ROW_NUMBER over the full natural
+-- key) and pre-cast the double ids to varchar, so the former ws_events_dedup
+-- ROW_NUMBER pass is gone. `_action_source_note` carries the original WhoScored
+-- type (these 6 types are never 'Aerial', so it equals the raw type exactly);
+-- `qualifiers_raw` carries the original JSON — the classification below is the
+-- byte-for-byte bronze logic, just re-sourced.
+ws_events_src AS (
+    SELECT
+        match_id                  AS ws_game_id,    -- = CAST(game_id AS varchar)
+        period,
+        minute,
+        second,
+        _action_source_note       AS type,
+        qualifiers_raw            AS qualifiers,
+        player_id_raw,
+        related_player_id_raw,
+        team_name_raw,
+        league,
+        season,
+        _bronze_ingested_at       AS _ingested_at
+    FROM iceberg.silver.whoscored_events_spadl
+    WHERE _action_source_note IN ('Goal', 'Card', 'SubstitutionOff',
+                                  'MissedShots', 'SavedShot', 'ShotOnPost')
       AND period IN ('FirstHalf', 'SecondHalf',
                      'FirstPeriodOfExtraTime', 'SecondPeriodOfExtraTime')
 ),
@@ -300,7 +319,7 @@ ws_match_bridge AS (
 -- 'KeeperPenaltySaved' etc. — same trick the former fct_card.sql relied on.
 ws_classified AS (
     SELECT
-        CAST(CAST(we.game_id AS BIGINT) AS varchar)          AS ws_game_id,
+        we.ws_game_id                                        AS ws_game_id,
         we.period                                            AS period_raw,
         -- #521: Opta minute is 0-based cumulative; +1 → FBref 1-based scale
         CAST(we.minute AS integer) + 1                       AS minute_cum,
@@ -330,21 +349,20 @@ ws_classified AS (
                 THEN 'substitution'
             ELSE NULL                                        -- drop in WHERE below
         END                                                  AS event_type,
-        CAST(CAST(we.player_id AS BIGINT) AS varchar)        AS actor_raw,
+        we.player_id_raw                                     AS actor_raw,
         CASE
             WHEN we.type = 'SubstitutionOff'                 -- coming ON
-                THEN CAST(CAST(we.related_player_id AS BIGINT) AS varchar)
+                THEN we.related_player_id_raw
             WHEN we.type = 'Goal'                            -- assist
                  AND NOT regexp_like(we.qualifiers, '"displayName"\s*:\s*"OwnGoal"')
-                THEN CAST(CAST(we.related_player_id AS BIGINT) AS varchar)
+                THEN we.related_player_id_raw
             ELSE NULL
         END                                                  AS related_raw,
-        we.team                                              AS team_name_raw,
+        we.team_name_raw                                     AS team_name_raw,
         we.league                                            AS league,
         we.season                                            AS season,
         we._ingested_at                                      AS _ingested_at
-    FROM ws_events_dedup we
-    WHERE we.rn = 1
+    FROM ws_events_src we
 ),
 
 ws_resolved AS (

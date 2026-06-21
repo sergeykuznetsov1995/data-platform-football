@@ -53,7 +53,7 @@ EVENT_TYPE_DICT = {
 
 _ICEBERG_TO_LOCAL = {
     "iceberg.silver.fbref_match_events":     "silver_fbref_match_events",
-    "iceberg.bronze.whoscored_events":       "bronze_whoscored_events",
+    "iceberg.silver.whoscored_events_spadl": "silver_whoscored_events_spadl",
     "iceberg.bronze.whoscored_schedule":     "bronze_whoscored_schedule",
     "iceberg.silver.fbref_match_enriched":   "silver_fbref_match_enriched",
     "iceberg.silver.xref_match":             "silver_xref_match",
@@ -86,7 +86,7 @@ def duck_conn():
 @pytest.fixture(autouse=True)
 def _reset_schemas(duck_conn):
     for tbl in (
-        "silver_fbref_match_events", "bronze_whoscored_events",
+        "silver_fbref_match_events", "silver_whoscored_events_spadl",
         "bronze_whoscored_schedule", "silver_fbref_match_enriched",
         "silver_xref_match", "silver_xref_team", "silver_xref_player",
     ):
@@ -110,25 +110,24 @@ def _reset_schemas(duck_conn):
         )
         """
     )
+    # #736: timeline now reads silver.whoscored_events_spadl (one-hop), not
+    # bronze. Only the columns the WS-fallback CTE consumes are mirrored; silver
+    # already pre-casts the double ids to varchar and is deduped upstream.
     duck_conn.execute(
         """
-        CREATE TABLE bronze_whoscored_events (
-            game_id           DOUBLE,
-            period            VARCHAR,
-            minute            BIGINT,
-            second            BIGINT,
-            expanded_minute   BIGINT,
-            type              VARCHAR,
-            outcome_type      VARCHAR,
-            team_id           DOUBLE,
-            player_id         DOUBLE,
-            related_player_id DOUBLE,
-            qualifiers        VARCHAR,
-            related_event_id  DOUBLE,
-            team              VARCHAR,
-            league            VARCHAR,
-            season            VARCHAR,
-            _ingested_at      TIMESTAMP
+        CREATE TABLE silver_whoscored_events_spadl (
+            match_id              VARCHAR,
+            period                VARCHAR,
+            minute                BIGINT,
+            second                INTEGER,
+            _action_source_note   VARCHAR,
+            qualifiers_raw        VARCHAR,
+            player_id_raw         VARCHAR,
+            related_player_id_raw VARCHAR,
+            team_name_raw         VARCHAR,
+            league                VARCHAR,
+            season                VARCHAR,
+            _bronze_ingested_at   TIMESTAMP
         )
         """
     )
@@ -233,11 +232,11 @@ def _seed_corpus(duck_conn) -> None:
     yellow_q = _ws_qualifiers("Yellow")
     duck_conn.execute(
         f"""
-        INSERT INTO bronze_whoscored_events VALUES
-          (1.0, 'FirstHalf', 10, 0, 10, 'Goal', 'Successful',
-           100.0, 1000.0, NULL, '[]', NULL, 'Liverpool', '{_LG}', '2425', {_TS}),
-          (1.0, 'FirstHalf', 30, 0, 30, 'Card', 'Successful',
-           101.0, 1001.0, NULL, ?, NULL, 'Arsenal', '{_LG}', '2425', {_TS})
+        INSERT INTO silver_whoscored_events_spadl VALUES
+          ('1', 'FirstHalf', 10, 0, 'Goal', '[]', '1000', NULL,
+           'Liverpool', '{_LG}', '2425', {_TS}),
+          ('1', 'FirstHalf', 30, 0, 'Card', ?, '1001', NULL,
+           'Arsenal', '{_LG}', '2425', {_TS})
         """,
         [yellow_q],
     )
@@ -248,21 +247,21 @@ def _seed_corpus(duck_conn) -> None:
     # → +1 → 45+4 (#521).
     duck_conn.execute(
         f"""
-        INSERT INTO bronze_whoscored_events VALUES
-          (2.0, 'FirstHalf',  9, 30,  9, 'Goal', 'Successful',
-           200.0, 2001.0, 2002.0, '[]', NULL, 'Chelsea', '{_LG}', '2425', {_TS}),
-          (2.0, 'FirstHalf', 48,  0, 48, 'Card', 'Successful',
-           201.0, 2006.0, NULL, ?, NULL, 'Fulham', '{_LG}', '2425', {_TS}),
-          (2.0, 'SecondHalf', 50, 0, 50, 'Goal', 'Successful',
-           201.0, 2003.0, NULL, ?, NULL, 'Fulham', '{_LG}', '2425', {_TS}),
-          (2.0, 'SecondHalf', 60, 0, 60, 'SavedShot', 'Unsuccessful',
-           200.0, 2004.0, NULL, ?, NULL, 'Chelsea', '{_LG}', '2425', {_TS}),
-          (2.0, 'SecondHalf', 65, 0, 65, 'SubstitutionOff', 'Successful',
-           200.0, 2007.0, 2008.0, '[]', NULL, 'Chelsea', '{_LG}', '2425', {_TS}),
-          (2.0, 'SecondHalf', 65, 0, 65, 'SubstitutionOn', 'Successful',
-           200.0, 2008.0, 2007.0, '[]', NULL, 'Chelsea', '{_LG}', '2425', {_TS}),
-          (2.0, 'SecondHalf', 70, 0, 70, 'Goal', 'Successful',
-           201.0, 2005.0, NULL, ?, NULL, 'Fulham', '{_LG}', '2425', {_TS})
+        INSERT INTO silver_whoscored_events_spadl VALUES
+          ('2', 'FirstHalf',  9, 30, 'Goal', '[]', '2001', '2002',
+           'Chelsea', '{_LG}', '2425', {_TS}),
+          ('2', 'FirstHalf', 48,  0, 'Card', ?, '2006', NULL,
+           'Fulham', '{_LG}', '2425', {_TS}),
+          ('2', 'SecondHalf', 50, 0, 'Goal', ?, '2003', NULL,
+           'Fulham', '{_LG}', '2425', {_TS}),
+          ('2', 'SecondHalf', 60, 0, 'SavedShot', ?, '2004', NULL,
+           'Chelsea', '{_LG}', '2425', {_TS}),
+          ('2', 'SecondHalf', 65, 0, 'SubstitutionOff', '[]', '2007', '2008',
+           'Chelsea', '{_LG}', '2425', {_TS}),
+          ('2', 'SecondHalf', 65, 0, 'SubstitutionOn', '[]', '2008', '2007',
+           'Chelsea', '{_LG}', '2425', {_TS}),
+          ('2', 'SecondHalf', 70, 0, 'Goal', ?, '2005', NULL,
+           'Fulham', '{_LG}', '2425', {_TS})
         """,
         [
             yellow_q,
@@ -406,17 +405,17 @@ class TestFctMatchTimeline:
         _seed_corpus(duck_conn)
         duck_conn.execute(
             f"""
-            INSERT INTO bronze_whoscored_events VALUES
-              (3.0, 'FirstHalf',   0, 0,  0, 'Goal', 'Successful',
-               300.0, 3001.0, NULL, '[]', NULL, 'Brighton', '{_LG}', '2425', {_TS}),
-              (3.0, 'FirstHalf',  44, 0, 44, 'Goal', 'Successful',
-               300.0, 3002.0, NULL, '[]', NULL, 'Brighton', '{_LG}', '2425', {_TS}),
-              (3.0, 'FirstHalf',  45, 0, 45, 'Goal', 'Successful',
-               300.0, 3003.0, NULL, '[]', NULL, 'Brighton', '{_LG}', '2425', {_TS}),
-              (3.0, 'SecondHalf', 89, 0, 89, 'Goal', 'Successful',
-               300.0, 3004.0, NULL, '[]', NULL, 'Brighton', '{_LG}', '2425', {_TS}),
-              (3.0, 'SecondHalf', 90, 0, 90, 'Goal', 'Successful',
-               300.0, 3005.0, NULL, '[]', NULL, 'Brighton', '{_LG}', '2425', {_TS})
+            INSERT INTO silver_whoscored_events_spadl VALUES
+              ('3', 'FirstHalf',   0, 0, 'Goal', '[]', '3001', NULL,
+               'Brighton', '{_LG}', '2425', {_TS}),
+              ('3', 'FirstHalf',  44, 0, 'Goal', '[]', '3002', NULL,
+               'Brighton', '{_LG}', '2425', {_TS}),
+              ('3', 'FirstHalf',  45, 0, 'Goal', '[]', '3003', NULL,
+               'Brighton', '{_LG}', '2425', {_TS}),
+              ('3', 'SecondHalf', 89, 0, 'Goal', '[]', '3004', NULL,
+               'Brighton', '{_LG}', '2425', {_TS}),
+              ('3', 'SecondHalf', 90, 0, 'Goal', '[]', '3005', NULL,
+               'Brighton', '{_LG}', '2425', {_TS})
             """
         )
         out = _run_gold(duck_conn)
@@ -580,13 +579,11 @@ class TestSeasonScopedBridgeAndIdentityGate:
         yellow_q = _ws_qualifiers("Yellow")
         duck_conn.execute(
             f"""
-            INSERT INTO bronze_whoscored_events VALUES
-              (3.0, 'FirstHalf', 10, 0, 10, 'Goal', 'Successful',
-               100.0, 3001.0, 3002.0, '[]', NULL, 'Newcastle',
-               '{_LG}', '2425', {_TS}),
-              (3.0, 'SecondHalf', 60, 0, 60, 'Card', 'Successful',
-               101.0, 3003.0, NULL, ?, NULL, 'Liverpool',
-               '{_LG}', '2425', {_TS})
+            INSERT INTO silver_whoscored_events_spadl VALUES
+              ('3', 'FirstHalf', 10, 0, 'Goal', '[]', '3001', '3002',
+               'Newcastle', '{_LG}', '2425', {_TS}),
+              ('3', 'SecondHalf', 60, 0, 'Card', ?, '3003', NULL,
+               'Liverpool', '{_LG}', '2425', {_TS})
             """,
             [yellow_q],
         )
@@ -633,13 +630,11 @@ class TestSeasonScopedBridgeAndIdentityGate:
         yellow_q = _ws_qualifiers("Yellow")
         duck_conn.execute(
             f"""
-            INSERT INTO bronze_whoscored_events VALUES
-              (6.0, 'FirstHalf', 10, 0, 10, 'Goal', 'Successful',
-               100.0, 6001.0, 6002.0, '[]', NULL, 'Wolves',
-               '{_LG}', '2425', {_TS}),
-              (6.0, 'SecondHalf', 60, 0, 60, 'Card', 'Successful',
-               101.0, 6003.0, NULL, ?, NULL, 'Liverpool',
-               '{_LG}', '2425', {_TS})
+            INSERT INTO silver_whoscored_events_spadl VALUES
+              ('6', 'FirstHalf', 10, 0, 'Goal', '[]', '6001', '6002',
+               'Wolves', '{_LG}', '2425', {_TS}),
+              ('6', 'SecondHalf', 60, 0, 'Card', ?, '6003', NULL,
+               'Liverpool', '{_LG}', '2425', {_TS})
             """,
             [yellow_q],
         )
@@ -697,10 +692,9 @@ class TestSeasonScopedBridgeAndIdentityGate:
         # WS twin of the same physical match.
         duck_conn.execute(
             f"""
-            INSERT INTO bronze_whoscored_events VALUES
-              (4.0, 'FirstHalf', 30, 0, 30, 'Goal', 'Successful',
-               100.0, 4001.0, NULL, '[]', NULL, 'Newcastle',
-               '{_LG}', '2425', {_TS})
+            INSERT INTO silver_whoscored_events_spadl VALUES
+              ('4', 'FirstHalf', 30, 0, 'Goal', '[]', '4001', NULL,
+               'Newcastle', '{_LG}', '2425', {_TS})
             """
         )
         duck_conn.execute(
@@ -728,10 +722,9 @@ class TestSeasonScopedBridgeAndIdentityGate:
         )
         duck_conn.execute(
             f"""
-            INSERT INTO bronze_whoscored_events VALUES
-              (5.0, 'FirstHalf', 20, 0, 20, 'Goal', 'Successful',
-               100.0, 5001.0, NULL, '[]', NULL, 'Wigan',
-               '{_LG}', '2425', {_TS})
+            INSERT INTO silver_whoscored_events_spadl VALUES
+              ('5', 'FirstHalf', 20, 0, 'Goal', '[]', '5001', NULL,
+               'Wigan', '{_LG}', '2425', {_TS})
             """
         )
         out = _run_gold(duck_conn)
