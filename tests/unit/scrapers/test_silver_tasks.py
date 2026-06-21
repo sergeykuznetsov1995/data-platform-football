@@ -250,6 +250,72 @@ class TestRunSilverTransform:
         assert not any(s.startswith("DROP TABLE") for s in executed)
         assert not any("_new" in s for s in executed)
 
+    def test_positional_schema_drift_triggers_drop_and_retry(self, tmp_path):
+        """#741: when CREATE OR REPLACE trips the positional ICEBERG_COMMIT_ERROR
+        (the SQL added/reordered columns vs the stale physical table), the runner
+        auto-heals: DROP TABLE IF EXISTS, then re-run the same CTAS on empty
+        ground (no positional match). Order must be CTAS(fail) → DROP → CTAS(ok)."""
+        sql_file = tmp_path / "test.sql"
+        sql_file.write_text("SELECT 1 AS x")
+
+        # fetchall consumed for: SCHEMA, DROP, retry-CTAS, then COUNT fetch.
+        # (The failed CTAS raises in execute() before reaching fetchall.)
+        mock_conn, mock_cursor = self._make_conn(
+            fetchall_side_effect=[[], [], [], [[42]]]
+        )
+        drift = Exception(
+            "TrinoQueryError(type=EXTERNAL, name=ICEBERG_COMMIT_ERROR, "
+            "message=\"The following columns have types incompatible with the "
+            "existing columns in their respective positions: foo, bar\")"
+        )
+        # SCHEMA(ok) → CREATE OR REPLACE(drift) → DROP(ok) → CREATE OR REPLACE(ok) → COUNT(ok)
+        mock_cursor.execute.side_effect = [None, drift, None, None, None]
+
+        result = self._run_transform(
+            mock_conn, sql_file, table_name='t', trino_host='localhost',
+        )
+
+        assert result['status'] == 'success'
+        assert result['rows'] == 42
+
+        executed = [c[0][0] for c in mock_cursor.execute.call_args_list]
+        cor_idx = [
+            i for i, s in enumerate(executed)
+            if "CREATE OR REPLACE TABLE iceberg.silver.t" in s
+        ]
+        drop_idx = [
+            i for i, s in enumerate(executed)
+            if s.startswith("DROP TABLE IF EXISTS iceberg.silver.t")
+        ]
+        # Two CREATE OR REPLACE (original + retry) with exactly one DROP between them.
+        assert len(cor_idx) == 2, executed
+        assert len(drop_idx) == 1, executed
+        assert cor_idx[0] < drop_idx[0] < cor_idx[1]
+
+    def test_generic_commit_error_does_not_drop(self, tmp_path):
+        """#741 guard: a NON-positional ICEBERG_COMMIT_ERROR (e.g. a concurrent
+        commit conflict) must NOT trigger the DROP+retry heal — dropping a live
+        table on a transient conflict could destroy a table another writer needs.
+        Only the 'respective positions' signature heals."""
+        sql_file = tmp_path / "test.sql"
+        sql_file.write_text("SELECT 1 AS x")
+
+        mock_conn, mock_cursor = self._make_conn()
+        # SCHEMA(ok) → CREATE OR REPLACE(transient commit conflict, no positional sig)
+        mock_cursor.execute.side_effect = [
+            None,
+            Exception("ICEBERG_COMMIT_ERROR: Failed to commit during write: "
+                      "conflicting concurrent update"),
+        ]
+
+        with pytest.raises(RuntimeError, match="Silver transform failed"):
+            self._run_transform(
+                mock_conn, sql_file, table_name='t', trino_host='localhost',
+            )
+
+        executed = [c[0][0] for c in mock_cursor.execute.call_args_list]
+        assert not any(s.startswith("DROP TABLE") for s in executed)
+
 
 class TestValidateSilverTables:
     """Tests for validate_silver_tables function."""

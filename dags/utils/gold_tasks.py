@@ -59,8 +59,9 @@ def run_gold_transform(
 ) -> Dict[str, Any]:
     """Run a Gold-layer CTAS.
 
-    Delegates to ``run_silver_transform`` with ``schema='gold'``. Same
-    DROP+CTAS flow, same connection settings, same partitioning API.
+    Delegates to ``run_silver_transform`` with ``schema='gold'``. Same atomic
+    ``CREATE OR REPLACE`` CTAS engine (which auto-heals positional schema drift
+    via DROP + rebuild, #741), same connection settings, same partitioning API.
 
     Optional graceful-degrade mode for transforms that depend on optional
     Silver tables (e.g. ``fct_player_unavailable`` requires
