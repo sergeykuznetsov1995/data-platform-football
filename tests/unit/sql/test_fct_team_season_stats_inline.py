@@ -16,7 +16,11 @@ fct_team_season_stats_audit.sql (усечённые до diff-колонок, б
   ловит EXPLAIN (TYPE VALIDATE) при верификации — memory #426);
 * schema-freeze: список выходных колонок main-файла заморожен — CREATE OR
   REPLACE сверяет схему позиционно, молчаливый дрейф типов/состава колонок
-  ломает консьюмеров (feedback_silver_create_or_replace_positional_schema).
+  ломает консьюмеров (feedback_silver_create_or_replace_positional_schema);
+* структурный паритет близнеца (#740): ВСЕ общие CTE main∩audit держатся
+  синхронными динамически (TestAuditCteSync, без хардкод-списка), а каждая
+  cross-source метрика main имеет diff-колонку в audit либо числится в
+  задокументированном allowlist пропусков (TestAuditDiffCoverage).
 
 #542: main теперь .sql.j2 — его cross-source COALESCE рендерятся из
 configs/medallion/source_priority.yaml. Рендерим перед проверками
@@ -166,11 +170,41 @@ class TestMainSchemaFreeze:
         )
 
 
-# CTE, которые audit копирует ДОСЛОВНО из одноступенчатых CTE главного файла,
-# усечёнными до diff-колонок (#478). ss_team_season исключён: в main он
-# двухступенчатый (ss_match_rollup → ss_team_season), в audit одноступенчатый —
-# построчного соответствия нет (docs/decisions/season-audit-inline.md).
-_SYNCED_CTES = ["us_team_season", "ws_season_rollup", "fm_team_season"]
+# CTE, чьи проекции audit обязан держать синхронными с main: xref_*/ws_name_to_id
+# копируются байт-в-байт, per-source rollups (us/ws/fm_team_season) — усечены до
+# diff-колонок (#478). Раньше это был хардкод-список — сам по себе manual-sync
+# риск (#740): добавил общий CTE → забыл внести в список → дрейф не ловится.
+# Теперь набор берётся ДИНАМИЧЕСКИ как общие CTE обоих файлов минус явно
+# расходящиеся (_DIVERGENT_CTES).
+#
+# ss_team_season исключён: в main он двухступенчатый (ss_match_rollup →
+# ss_team_season), в audit одноступенчатый — построчного соответствия нет
+# (docs/decisions/season-audit-inline.md).
+_DIVERGENT_CTES = {"ss_team_season"}
+
+# CTE, которые ОБЯЗАНЫ попасть в покрытие — guard против вакуумного схлопывания
+# набора при рефакторе парсинга (#740). ws_name_to_id особенно: в #705 там
+# вручную правился double-cast в обоих файлах, прежний тест бы это не поймал.
+_MUST_COVER_CTES = {
+    "xref_fbref", "xref_ws", "xref_ss", "xref_fm", "ws_name_to_id",
+}
+
+
+def _cte_names(sql_body: str) -> set:
+    """Имена всех CTE верхнего уровня в SQL-теле (для intersection main∩audit)."""
+    tree = sqlglot.parse_one(sql_body, read="trino")
+    return {cte.alias_or_name for cte in tree.find_all(sqlglot.exp.CTE)}
+
+
+def _shared_synced_ctes() -> list:
+    """Общие CTE main ∩ audit (паритет обязателен), минус расходящиеся."""
+    shared = _cte_names(_main_body()) & _cte_names(_audit_body())
+    return sorted(shared - _DIVERGENT_CTES)
+
+
+# Вычисляем один раз на загрузке модуля — parametrize требует список на этапе
+# сбора тестов.
+_SYNCED_CTES = _shared_synced_ctes()
 
 
 def _cte_proj_map(sql_body: str, cte_name: str) -> dict:
@@ -182,8 +216,12 @@ def _cte_proj_map(sql_body: str, cte_name: str) -> dict:
     tree = sqlglot.parse_one(sql_body, read="trino")
     for cte in tree.find_all(sqlglot.exp.CTE):
         if cte.alias_or_name == cte_name:
+            # UNION-bodied CTE (ws_name_to_id): проекции живут на ЛЕВОМ SELECT —
+            # оба плеча несут одинаковые алиасы/выражения по построению. find()
+            # отдаёт сам узел для plain-SELECT и левый SELECT для set-операции.
+            select_node = cte.this.find(sqlglot.exp.Select)
             out = {}
-            for e in cte.this.expressions:
+            for e in select_node.expressions:
                 expr = e.this if isinstance(e, sqlglot.exp.Alias) else e
                 out[e.alias_or_name] = expr.sql(dialect="trino", comments=False)
             return out
@@ -192,9 +230,22 @@ def _cte_proj_map(sql_body: str, cte_name: str) -> dict:
 
 @pytest.mark.unit
 class TestAuditCteSync:
-    """#478/#556: усечённые per-source CTE audit — подмножество main, выражения
-    общих колонок совпадают. Закрепляет ручное ⚠️-предупреждение проверяемым
-    инвариантом (docs/decisions/season-audit-inline.md)."""
+    """#478/#556/#740: каждый общий CTE main∩audit — подмножество main,
+    выражения общих колонок совпадают. Набор вычисляется динамически
+    (_SYNCED_CTES = _shared_synced_ctes()), поэтому новый дословно-копируемый
+    CTE покрывается автоматически. Закрепляет ручное ⚠️-предупреждение
+    проверяемым инвариантом (docs/decisions/season-audit-inline.md)."""
+
+    def test_synced_set_covers_known_ctes(self):
+        """Guard: динамический набор не схлопнулся вакуумно (#740). xref-мосты и
+        ws_name_to_id обязаны проверяться — иначе регрессия их рассинхрона
+        пройдёт незамеченной (как было бы до #740)."""
+        missing = _MUST_COVER_CTES - set(_SYNCED_CTES)
+        assert not missing, (
+            f"Паритет-набор не покрывает {sorted(missing)} — рефактор парсинга "
+            f"CTE схлопнул _SYNCED_CTES? Проверь _cte_names/_shared_synced_ctes "
+            f"(#740: xref_*/ws_name_to_id обязаны быть в покрытии)."
+        )
 
     @pytest.mark.parametrize("cte_name", _SYNCED_CTES)
     def test_audit_cte_subset_of_main(self, cte_name):
@@ -211,3 +262,83 @@ class TestAuditCteSync:
                 f"main={main_map[alias]!r}. Синхронизировать усечённый CTE с "
                 f"fct_team_season_stats.sql.j2 (#478)."
             )
+
+
+# Карта между именами cross-source метрик в source_priority.yaml (ключи
+# fct_team_season_stats) и «базами» diff-колонок audit. Audit историч.
+# использует короткие имена: total_shots→shots, expected_goals→xg (#740).
+_AUDIT_NAME_MAP = {
+    "expected_goals": "xg",
+    "expected_goals_against": "xg_against",
+    "total_shots": "shots",
+}
+
+# HARD_FACT/MODELED метрики main, НАМЕРЕННО не аудируемые в близнеце, с
+# обоснованием. Превращает текстовый «KNOWN GAP» из шапки audit-файла (#705) в
+# проверяемый allowlist: новая метрика без diff упадёт в тесте, пока её сюда не
+# внесут осознанно.
+_AUDIT_INTENTIONAL_GAPS = {
+    "penalties_won": (
+        "KNOWN GAP #705: FBref убрал PKwon/PKcon с сезона 25/26 → нет "
+        "FBref-baseline для diff (audit-конвенция = FBref − source); audit "
+        "Silver-only и намеренно НЕ считает ws_penalties (event-grain скан)."
+    ),
+    "penalties_conceded": "KNOWN GAP #705: см. penalties_won.",
+    "minutes": (
+        "не входит в diff-набор audit: ≈ mp×90, низкий самостоятельный "
+        "cross-source DQ-сигнал (matches уже аудируется)."
+    ),
+    "npxg": (
+        "не входит в diff-набор audit: xG-семейство сверяется через xg / "
+        "xg_against (modeled us-vs-ss / us-vs-fm)."
+    ),
+    "touches_in_box": (
+        "не входит в diff-набор audit: WS NULL текущих сезонов (#120), "
+        "FotMob-only fallback — нет FBref-spine колонки для сверки."
+    ),
+}
+
+
+def _audit_diff_bases() -> set:
+    """Базовые метрики diff-колонок audit: `goals_diff_sofascore` → `goals`,
+    `xg_diff_us_vs_ss` → `xg`. Колонки без `_diff_` (PK/lineage) отбрасываются."""
+    tree = sqlglot.parse_one(_audit_body(), read="trino")
+    return {
+        sel.alias_or_name.split("_diff_")[0]
+        for sel in tree.selects
+        if "_diff_" in sel.alias_or_name
+    }
+
+
+def _audited_metrics() -> set:
+    """Cross-source HARD_FACT/MODELED метрики main = ключи fct_team_season_stats
+    в source_priority.yaml. Single-source/finance колонки сюда не попадают по
+    построению — у них нет cross-source diff."""
+    from utils.medallion_config import load_source_priority
+    return set(load_source_priority()["fct_team_season_stats"].keys())
+
+
+@pytest.mark.unit
+class TestAuditDiffCoverage:
+    """#740: каждая cross-source метрика main (source_priority.yaml) имеет
+    diff-колонку в audit-близнеце ИЛИ числится в задокументированном allowlist
+    пропусков. Ловит «добавил merge-метрику в main, забыл diff в audit»."""
+
+    def test_every_metric_has_diff_or_documented_gap(self):
+        bases = _audit_diff_bases()
+        for metric in sorted(_audited_metrics()):
+            base = _AUDIT_NAME_MAP.get(metric, metric)
+            assert base in bases or metric in _AUDIT_INTENTIONAL_GAPS, (
+                f"Метрика main {metric!r} (source_priority.yaml) не имеет "
+                f"diff-колонки в fct_team_season_stats_audit.sql и не внесена в "
+                f"_AUDIT_INTENTIONAL_GAPS. Добавь {base}_diff_<source> в audit "
+                f"ИЛИ задокументируй намеренный пропуск в allowlist (#740)."
+            )
+
+    def test_intentional_gaps_are_live_metrics(self):
+        """Allowlist не должен пухнуть мёртвыми ключами, которых уже нет в YAML."""
+        stale = set(_AUDIT_INTENTIONAL_GAPS) - _audited_metrics()
+        assert not stale, (
+            f"_AUDIT_INTENTIONAL_GAPS содержит ключи вне source_priority.yaml: "
+            f"{sorted(stale)} — удали устаревшие записи (#740)."
+        )
