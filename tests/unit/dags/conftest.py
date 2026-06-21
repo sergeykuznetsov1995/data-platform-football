@@ -191,6 +191,16 @@ def _install_airflow_stubs() -> None:
                         child._add_downstream(self)
             return other
 
+        def __rrshift__(self, other):
+            # Airflow fan-in: ``[a, b, ...] >> self``. Record each upstream
+            # item that tracks dependencies (PythonOperators); tolerate ones
+            # that don't (the lightweight _BashOperator stub). Returns self so
+            # ``[list] >> a >> b`` keeps chaining from ``a``.
+            for item in other:
+                if isinstance(item, _PythonOperator):
+                    item._add_downstream(self)
+            return self
+
     operators_python_mod.PythonOperator = _PythonOperator
 
     class _TriggerDagRunOperator(_PythonOperator):
