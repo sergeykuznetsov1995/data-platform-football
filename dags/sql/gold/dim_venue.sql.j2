@@ -6,7 +6,7 @@
 --
 -- Sources:
 --   iceberg.silver.fbref_match_enriched   (sch.venue per match)
---   iceberg.bronze.espn_matchsheet        (latest snapshot per (game, team))
+--   iceberg.silver.espn_matchsheet        (conform: venue per match, dedup'd #735)
 --
 -- Identity (issue #145): `venue_id` is the explicit `venue_<slug>` from
 -- `configs/medallion/venue_aliases.yaml` — NOT a hash of the raw name. The
@@ -80,26 +80,19 @@ fbref_venues as (
       and trim(venue) <> ''
 ),
 
-espn_dedup as (
+-- ESPN venue feed now one-hop from Silver (issue #735): silver.espn_matchsheet
+-- already trims venue, dedups per match (latest snapshot) and derives match_date,
+-- so this CTE mirrors fbref_venues — no bronze read, no ROW_NUMBER here.
+espn_venues as (
     select
         trim(venue)                                  as venue_raw,
         league,
-        season,  -- ESPN bronze is already slug '2526' → keep (FBref also slug, #404)
-        try_cast(substr(game, 1, 10) as date)        as match_date,
-        'espn'                                       as src,
-        row_number() over (
-            partition by trim(venue), league, season, game
-            order by _ingested_at desc
-        )                                            as rn
-    from iceberg.bronze.espn_matchsheet
+        season,  -- silver.espn_matchsheet keeps bronze slug '2526' (#404)
+        match_date,
+        'espn'                                       as src
+    from iceberg.silver.espn_matchsheet
     where venue is not null
       and trim(venue) <> ''
-),
-
-espn_venues as (
-    select venue_raw, league, season, match_date, src
-    from espn_dedup
-    where rn = 1
 ),
 
 unioned as (

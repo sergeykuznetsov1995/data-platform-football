@@ -134,6 +134,16 @@ SILVER_E3_TRANSFORMS = [
         'espn_lineup',
     ),
     (
+        # issue #735 (Gold one-hop, аудит #704): conform-only venue-проекция ESPN
+        # matchsheet. Dedup ROW_NUMBER перенесён сюда из gold.dim_venue, который
+        # читал bronze.espn_matchsheet напрямую. Single bronze source, без xref —
+        # НЕ зависит от dag_transform_xref. Consumer: gold.dim_venue (ESPN-сторона
+        # UNION), строится в dag_transform_fbref_gold (после e3).
+        'espn_matchsheet',
+        'dags/sql/silver/espn_matchsheet.sql',
+        'espn_matchsheet',
+    ),
+    (
         # B1 extension: per-(canonical_id, league, season) aggregate of
         # WhoScored event-level metrics. Reads silver.whoscored_events_spadl
         # so MUST run after the spadl task (sequential silver_e3 group

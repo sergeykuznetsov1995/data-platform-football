@@ -1,5 +1,5 @@
 {
-  "snapshot_at": "2026-06-02T20:06:01+00:00",
+  "snapshot_at": "2026-06-21T10:00:28+00:00",
   "missing_tables": [
     "fbref_shot_events"
   ],
@@ -245,6 +245,55 @@
         "total_goals": "double",
         "total_shots": "double",
         "yellow_cards": "double"
+      }
+    },
+    "bronze.espn_matchsheet": {
+      "columns": {
+        "_batch_id": "varchar",
+        "_entity_type": "varchar",
+        "_ingested_at": "timestamp(6)",
+        "_source": "varchar",
+        "accurate_crosses": "varchar",
+        "accurate_long_balls": "varchar",
+        "accurate_passes": "varchar",
+        "attendance": "bigint",
+        "blocked_shots": "varchar",
+        "capacity": "varchar",
+        "cross_pct": "varchar",
+        "effective_clearance": "varchar",
+        "effective_tackles": "varchar",
+        "fouls_committed": "varchar",
+        "game": "varchar",
+        "goal_assists": "varchar",
+        "goal_difference": "varchar",
+        "goals_conceded": "varchar",
+        "interceptions": "varchar",
+        "is_home": "boolean",
+        "league": "varchar",
+        "longball_pct": "varchar",
+        "offsides": "varchar",
+        "pass_pct": "varchar",
+        "penalty_kick_goals": "varchar",
+        "penalty_kick_shots": "varchar",
+        "possession_pct": "varchar",
+        "red_cards": "varchar",
+        "roster": "varchar",
+        "saves": "varchar",
+        "season": "varchar",
+        "shot_pct": "varchar",
+        "shots_on_target": "varchar",
+        "tackle_pct": "varchar",
+        "team": "varchar",
+        "total_clearance": "varchar",
+        "total_crosses": "varchar",
+        "total_goals": "varchar",
+        "total_long_balls": "varchar",
+        "total_passes": "varchar",
+        "total_shots": "varchar",
+        "total_tackles": "varchar",
+        "venue": "varchar",
+        "won_corners": "varchar",
+        "yellow_cards": "varchar"
       }
     },
     "bronze.espn_schedule": {
@@ -1122,7 +1171,7 @@
         "whca": "double",
         "whcd": "double",
         "whch": "double",
-        "ï»¿div": "varchar"
+        "\u00ef\u00bb\u00bfdiv": "varchar"
       }
     },
     "bronze.sofascore_event_player_stats": {
