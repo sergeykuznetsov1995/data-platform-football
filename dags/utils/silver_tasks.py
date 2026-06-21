@@ -103,6 +103,23 @@ def _execute(conn: trino_lib.dbapi.Connection, sql: str, fetch: bool = False):
         cursor.close()
 
 
+def _is_positional_schema_drift(exc: Exception) -> bool:
+    """True for the Trino ``ICEBERG_COMMIT_ERROR`` raised when ``CREATE OR
+    REPLACE`` matches a CHANGED column set POSITIONALLY against an existing
+    partitioned table (#741).
+
+    Signature: ``ICEBERG_COMMIT_ERROR: The following columns have types
+    incompatible with the existing columns in their respective positions: ...``.
+
+    Deliberately narrow — it must NOT match concurrent/transient commit
+    conflicts (also ``ICEBERG_COMMIT_ERROR``), because the heal path DROPs the
+    live table and a DROP+retry on a transient conflict could destroy a table
+    another writer legitimately needs.
+    """
+    msg = str(exc)
+    return "ICEBERG_COMMIT_ERROR" in msg and "respective positions" in msg
+
+
 def run_silver_transform(
     sql_file: str,
     table_name: str,
@@ -137,7 +154,11 @@ def run_silver_transform(
         4. Log the resulting row count
 
     On failure the live table is left untouched (CREATE OR REPLACE is atomic at
-    the Iceberg commit level) and the error is surfaced as a RuntimeError.
+    the Iceberg commit level) and the error is surfaced as a RuntimeError. The
+    one exception is positional schema drift (#741): when the SQL added/removed/
+    reordered columns vs the existing partitioned table, Trino's positional
+    commit fails with ``ICEBERG_COMMIT_ERROR`` — that single case is auto-healed
+    by a DROP + rebuild (brief, schema-change-only non-atomic window).
 
     Args:
         sql_file: Path to SQL file containing the SELECT query.
@@ -201,9 +222,14 @@ def run_silver_transform(
         # A single statement commits the new schema + data in one metastore
         # transaction. There is no staging table and no DROP-then-RENAME window,
         # so the TABLE_NOT_FOUND visibility flake and the post-DROP data-loss
-        # window of the #191 swap are both gone. CREATE OR REPLACE writes a
-        # fresh schema wholesale (not a positional ALTER), so it also sidesteps
-        # the ICEBERG_COMMIT_ERROR class seen with ALTER DROP COLUMN.
+        # window of the #191 swap are both gone.
+        #
+        # Caveat (#741): for an EXISTING partitioned Iceberg table, Trino matches
+        # the new SELECT against the old schema POSITIONALLY — it does NOT write a
+        # fresh schema wholesale. If the SQL added/removed/reordered columns vs the
+        # physical table, the commit fails with ICEBERG_COMMIT_ERROR ("... in their
+        # respective positions"). That case is auto-healed below (DROP + rebuild on
+        # empty ground); every other failure leaves the live table intact.
         partition_clause = ''
         if partition_columns:
             cols = ", ".join(f"'{c}'" for c in partition_columns)
@@ -231,7 +257,26 @@ def run_silver_transform(
             )
 
         logger.info(f"Executing CREATE OR REPLACE TABLE {full_table} ...")
-        _execute(conn, ctas_sql)
+        try:
+            _execute(conn, ctas_sql)
+        except Exception as e:
+            # #741: positional schema drift — the SQL added/reordered columns vs
+            # the stale physical table. Auto-heal: DROP the table and re-run the
+            # SAME CTAS on empty ground, where there is no old schema to match
+            # positionally. The original CTAS already passed planning/execution
+            # (the error is raised at commit time), so the retry is near-certain
+            # to succeed. This briefly drops the table (small, rare, schema-change
+            # -only window); all NON-positional failures re-raise untouched so the
+            # live table stays intact (#265 atomicity preserved for those).
+            if not _is_positional_schema_drift(e):
+                raise
+            logger.warning(
+                "Schema drift on %s (positional ICEBERG_COMMIT_ERROR) — auto-healing: "
+                "DROP TABLE + rebuild from scratch (#741). Original error: %s",
+                full_table, e,
+            )
+            _execute(conn, f"DROP TABLE IF EXISTS {full_table}")
+            _execute(conn, ctas_sql)
 
         # --- 5. Count rows ---
         count_result = _execute(
