@@ -551,7 +551,9 @@ def cascade_resolve(
         * ``confidence='name_team_subset'``    — token_set_ratio≥95.
         * ``confidence='name_team_nickname'``  — first-name nickname pair
                                                 + surname match.
-        * ``confidence='name_team_alias'``     — player_aliases.yaml lookup.
+        * ``confidence='name_team_alias'``     — player_aliases.yaml lookup
+                                                (Tier 1.5, ranks above the
+                                                fuzzy/ambiguous tiers).
         * ``confidence='orphan'``              — no tier matched. ``match_score``
                                                 is best score seen at tier-2.
         * ``confidence='ambiguous'``           — a fuzzy/dict tier had >1
@@ -572,6 +574,17 @@ def cascade_resolve(
     fid = spine.find_by_id(sid)
     if fid:
         return f'fb_{fid}', 'exact', None
+
+    # Tier 1.5: hand-curated player_aliases.yaml override. A human-curated
+    # alias is authoritative and MUST beat every fuzzy/dict tier — those tiers
+    # short-circuit on a wrong surname match or an ambiguous-band/collision
+    # verdict before the cascade would otherwise reach an alias, so an alias
+    # placed any later is unreachable for exactly the cases it is meant to fix
+    # (#738: 'Bobby Reid' surname-collides into 'Harrison Reed'; 'Gabriel'
+    # token_set_band is ambiguous across three real Gabriels).
+    alias_pid = _alias_lookup(src, sid, season)
+    if alias_pid:
+        return f'fb_{alias_pid}', 'name_team_alias', 100.0
 
     # Tier-2: legacy token_sort_ratio ≥ NAME_THRESHOLD.
     fid, name_team_score = spine.find_by_name_team(name, team, season)
@@ -617,10 +630,7 @@ def cascade_resolve(
             })
         return None, 'ambiguous', None
 
-    # Tier 3: hand-curated player_aliases.yaml.
-    alias_pid = _alias_lookup(src, sid, season)
-    if alias_pid:
-        return f'fb_{alias_pid}', 'name_team_alias', 100.0
+    # (alias is now Tier 1.5 above — it must outrank the fuzzy/ambiguous tiers.)
 
     # Else: orphan. Preserve best score from tier-2 (best fuzzy attempt).
     prefix = _orphan_prefix(src)

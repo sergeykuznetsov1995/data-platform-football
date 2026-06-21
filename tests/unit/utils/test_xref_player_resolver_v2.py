@@ -403,6 +403,65 @@ class TestAliasYaml:
         assert conf == 'name_team_alias'
         assert score == 100.0
 
+    def test_alias_overrides_wrong_surname_match(self, monkeypatch):
+        """#738 — alias (Tier 1.5) must outrank a WRONG surname-anchor match.
+
+        Without the alias, Understat 'Bobby Reid' surname-collides onto the
+        only Fulham 'Reed' in the bucket (Harrison Reed) — reid↔reed is
+        Levenshtein 1, both ≥ SURNAME_MIN_LEN — and would auto-link as
+        'name_team_surname'. The alias re-points him to the real FBref entry
+        (Bobby De Cordova-Reid), proving the alias is consulted before the
+        surname tier short-circuits.
+        """
+        spine = _spine([_fb_row('reed1', 'Harrison Reed', 'Fulham')])
+        cand = _candidate('understat', '6827', 'Bobby Reid', 'Fulham')
+
+        # Bug repro: with the alias tier disabled, the surname tier mis-links
+        # Bobby Reid onto Harrison Reed.
+        from utils import medallion_config
+        monkeypatch.setattr(
+            medallion_config, 'get_player_alias', lambda *a, **k: None,
+        )
+        buggy_cid, buggy_conf, _ = xpr.cascade_resolve(cand, spine)
+        assert (buggy_cid, buggy_conf) == ('fb_reed1', 'name_team_surname')
+
+        # Fix: the shipped player_aliases.yaml re-points 6827 → Bobby De
+        # Cordova-Reid, and the alias (Tier 1.5) wins before the surname tier.
+        monkeypatch.undo()
+        cid, conf, score = xpr.cascade_resolve(cand, spine)
+        assert cid == 'fb_0f7533cd'
+        assert conf == 'name_team_alias'
+        assert score == 100.0
+
+    def test_alias_overrides_ambiguous_band(self, monkeypatch):
+        """#738 — alias (Tier 1.5) must outrank an ambiguous-band verdict.
+
+        Bare 'Gabriel' is a token_set subset of multiple real Gabriels in the
+        same Arsenal bucket → ambiguous (review queue), never resolved. The
+        alias disambiguates to Gabriel Magalhães before the ambiguous branch
+        returns.
+        """
+        spine = _spine([
+            _fb_row('48a5a5d6', 'Gabriel Martinelli', 'Arsenal'),
+            _fb_row('67ac5bb8', 'Gabriel Magalhaes', 'Arsenal'),
+        ])
+        cand = _candidate('understat', '5613', 'Gabriel', 'Arsenal')
+
+        # Bug repro: with the alias tier disabled the cascade declares ambiguous.
+        from utils import medallion_config
+        monkeypatch.setattr(
+            medallion_config, 'get_player_alias', lambda *a, **k: None,
+        )
+        na_cid, na_conf, _ = xpr.cascade_resolve(cand, spine)
+        assert (na_cid, na_conf) == (None, 'ambiguous')
+
+        # Fix: the shipped player_aliases.yaml disambiguates 5613 → Magalhães.
+        monkeypatch.undo()
+        cid, conf, score = xpr.cascade_resolve(cand, spine)
+        assert cid == 'fb_67ac5bb8'
+        assert conf == 'name_team_alias'
+        assert score == 100.0
+
 
 # ---------------------------------------------------------------------------
 # Orphan terminal + uniqueness
