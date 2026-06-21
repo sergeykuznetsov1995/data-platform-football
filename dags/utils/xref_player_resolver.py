@@ -973,47 +973,50 @@ def _fetch_sofascore_players(
 ) -> List[Dict[str, Any]]:
     """Read SofaScore player anchor rows for the resolver cascade.
 
-    Bronze ``sofascore_player_season_stats`` does NOT carry a player_name
-    column (the season-stats flattener only emits team_name + IDs + stats).
-    The display name needed for the fuzzy ``name_team`` tier comes from a
-    LEFT JOIN to ``bronze.sofascore_player_profile`` which DOES carry
-    ``name`` / ``short_name``. If profile is sparse, the cascade will
-    silently fall through to orphan — that is expected.
+    Base universe is match-grain ``bronze.sofascore_event_player_stats``
+    (#724) — every player who appears in a match lineup, including unused
+    bench players who never earn a rating. The previous base, the
+    season-rollup ``sofascore_player_season_stats``, dropped those bench
+    players entirely, so they never reached xref_player and
+    ``fct_lineup.player_id`` stayed NULL for SofaScore-only rows.
+
+    Bronze ``sofascore_event_player_stats`` does NOT carry a player_name
+    column. The display name needed for the fuzzy ``name_team`` tier comes
+    from a LEFT JOIN to ``bronze.sofascore_player_profile`` which DOES carry
+    ``name`` / ``short_name``. If the profile is missing, the cascade falls
+    through to orphan — so profile coverage must track this same universe
+    (the profile scraper is broadened to match, #724).
+
+    ``bronze_signal`` = SUM(minutes_played) per (player, league, season),
+    the dedup tiebreaker in _dedup_canonical_per_season (issue #70); 0.0 for
+    unused bench players. Minutes are aggregated in the ``eps`` CTE so the
+    profile LEFT JOIN cannot fan out the sum.
     """
-    # Minutes-played proxy via SUM over bronze.sofascore_event_player_stats
-    # (per-match grain). Used as dedup tiebreaker in
-    # _dedup_canonical_per_season (issue #70). NULL fallback to 0.0.
     sql = f"""
-        WITH mins AS (
+        WITH eps AS (
             SELECT
-                player_id,
+                CAST(player_id AS varchar) AS pid,
                 league,
                 season,
+                MAX(team_name) AS team,
                 SUM(TRY_CAST(minutes_played AS DOUBLE)) AS minutes_played
             FROM iceberg.bronze.sofascore_event_player_stats
             WHERE league = '{_sql_escape(league)}'
               AND season IN ({_seasons_in_clause(source_seasons)})
               AND player_id IS NOT NULL
-            GROUP BY player_id, league, season
+            GROUP BY CAST(player_id AS varchar), league, season
         )
         SELECT
-            CAST(b.player_id AS varchar) AS pid,
+            e.pid AS pid,
             COALESCE(MAX(p.name), MAX(p.short_name)) AS player_name,
-            MAX(b.team_name) AS team,
-            b.league,
-            b.season,
-            COALESCE(MAX(m.minutes_played), 0.0) AS bronze_signal
-        FROM iceberg.bronze.sofascore_player_season_stats b
+            MAX(e.team) AS team,
+            e.league,
+            e.season,
+            COALESCE(MAX(e.minutes_played), 0.0) AS bronze_signal
+        FROM eps e
         LEFT JOIN iceberg.bronze.sofascore_player_profile p
-          ON p.player_id = b.player_id
-        LEFT JOIN mins m
-          ON m.player_id = b.player_id
-         AND m.league = b.league
-         AND m.season = b.season
-        WHERE b.league = '{_sql_escape(league)}'
-          AND b.season IN ({_seasons_in_clause(source_seasons)})
-          AND b.player_id IS NOT NULL
-        GROUP BY CAST(b.player_id AS varchar), b.league, b.season
+          ON p.player_id = e.pid
+        GROUP BY e.pid, e.league, e.season
     """
     rows = _execute(conn, sql, fetch=True) or []
     out: List[Dict[str, Any]] = []
