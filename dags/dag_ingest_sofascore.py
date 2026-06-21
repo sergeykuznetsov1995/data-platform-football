@@ -282,6 +282,49 @@ def validate_data(**context) -> Dict[str, Any]:
     return validation
 
 
+def validate_bronze_freshness(**context) -> None:
+    """Telegram-alert when bronze.sofascore_* stops refreshing (issue #751).
+
+    The scrape tasks soft-exit (R0.2B_FALLBACK, exit 2) when SofaScore's
+    anti-bot returns 403, so the DAG stays green while data silently goes
+    stale (match-data stalled 26 days before anyone noticed). ``validate_data``
+    only checks the row_count of the *current* run's JSON output — pre-existing
+    stale rows still pass that floor. A direct MAX(_ingested_at) freshness
+    check is what surfaces a multi-day ingestion stall.
+
+    WARNING-severity (not ERROR) on purpose: the goal is to stop being silent
+    (ping Telegram), not to hard-fail the DAG while the scraper fix (FlareSolverr
+    migration, PR B) lands. Promote to ERROR after that yields green runs.
+    """
+    import logging
+
+    from utils.alerts import telegram_dq_summary
+    from utils.data_quality import CHECK, run_checks
+
+    logger = logging.getLogger(__name__)
+
+    # Global table freshness (MAX(_ingested_at), no season filter) — robust to
+    # SofaScore's varchar season slug and catches any ingestion stall. 48h gives
+    # one missed daily run of grace before alerting.
+    checks = [
+        CHECK.freshness(
+            'bronze.sofascore_match_stats',
+            ts_col='_ingested_at', max_age_hours=48, severity='WARNING',
+        ),
+        CHECK.freshness(
+            'bronze.sofascore_event_player_stats',
+            ts_col='_ingested_at', max_age_hours=48, severity='WARNING',
+        ),
+        CHECK.freshness(
+            'bronze.sofascore_player_ratings',
+            ts_col='_ingested_at', max_age_hours=48, severity='WARNING',
+        ),
+    ]
+    report = run_checks(checks, raise_on_error=False)
+    logger.info("validate_bronze_freshness: %s", report.summary())
+    telegram_dq_summary(report, header='SofaScore Bronze freshness')
+
+
 # Build arguments for bash command
 leagues_str = ','.join(LEAGUES)
 
@@ -535,6 +578,14 @@ exit $rc
         trigger_rule='all_done',
     )
 
+    # Freshness gate over the Bronze tables themselves (issue #751). Runs
+    # all_done so a 403 soft-fail upstream still triggers the staleness alert.
+    validate_bronze_freshness_task = PythonOperator(
+        task_id='validate_bronze_freshness',
+        python_callable=validate_bronze_freshness,
+        trigger_rule='all_done',
+    )
+
     # schedule writes match_ids → ratings (depends on schedule),
     # then [shotmap, match_stats] in parallel (both need only schedule),
     # then [event_player_stats, player_season_stats, player_profile]
@@ -553,4 +604,4 @@ exit $rc
         scrape_event_player_stats_task,
         scrape_player_season_stats_task,
         scrape_player_profile_task,
-    ] >> validate_data_task
+    ] >> validate_data_task >> validate_bronze_freshness_task
