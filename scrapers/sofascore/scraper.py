@@ -835,20 +835,25 @@ class SofaScoreScraper(SoccerdataScraper):
         match_ids: Optional[List[str]] = None,
         limit: Optional[int] = None,
     ) -> Dict[str, pd.DataFrame]:
-        """ONE Camoufox capture pass per match → both ``player_ratings`` and
-        ``event_player_stats`` frames (#751 PR1).
+        """ONE Camoufox capture pass per match → four Bronze frames (#751 PR1+PR2).
 
-        Replaces two separate Turnstile-blocked passes with a single navigation
-        per match: the captured ``/lineups`` payload yields ratings (via
-        :meth:`_flatten_lineup_side`) AND per-player Opta stats (via
-        :meth:`_flatten_event_player_stats_from_lineups`); ``team_id``/
-        ``team_name`` come from the captured ``/event`` payload (best-effort —
-        NULL when ``event`` wasn't captured on that nav).
+        Replaces four separate Turnstile-blocked passes with a single navigation
+        per match. The same pass clicks all deep tabs and captures
+        ``/lineups`` + ``/event`` + ``/statistics`` + ``/shotmap``:
+          - ``player_ratings`` — :meth:`_flatten_lineup_side` over ``/lineups``;
+          - ``event_player_stats`` — :meth:`_flatten_event_player_stats_from_lineups`
+            over ``/lineups`` (per-player Opta block), with ``team_id``/
+            ``team_name`` from ``/event`` (``homeTeam``/``awayTeam``);
+          - ``match_stats`` — :meth:`_flatten_match_stats` over ``/statistics``;
+          - ``event_shotmap`` — :meth:`_flatten_shotmap` over ``/shotmap``.
 
-        Returns ``{'player_ratings': df, 'event_player_stats': df}``; both empty
-        on graceful fallback (caller emits ``R0.2B_FALLBACK``). Season slug is
-        coerced to the soccerdata short form (``2526``) so the partition matches
-        the schedule writer (#27).
+        statistics/shotmap are best-effort: a pass that doesn't fire them just
+        yields an empty frame for that table (the others still materialise).
+
+        Returns ``{'player_ratings', 'event_player_stats', 'match_stats',
+        'event_shotmap'}``; all empty on graceful fallback (caller emits
+        ``R0.2B_FALLBACK``). Season slug is coerced to the soccerdata short form
+        (``2526``) so the partition matches the schedule writer (#27).
         """
         ratings_cols = [
             'match_id', 'player_id', 'team_side', 'rating', 'position',
@@ -858,6 +863,17 @@ class SofaScoreScraper(SoccerdataScraper):
             'match_id', 'player_id', 'team_id', 'team_name', 'is_home',
             'position', 'position_specific', 'captain', 'substitute',
             'league', 'season',
+        ]
+        match_stats_cols = [
+            'match_id', 'period', 'stat_group', 'stat_name', 'stat_key',
+            'home_value', 'away_value', 'home_text', 'away_text',
+            'compare_code', 'value_type', 'league', 'season',
+        ]
+        shotmap_cols = [
+            'match_id', 'shot_id', 'player_id', 'team_id', 'is_home',
+            'minute', 'added_time', 'period', 'shot_type', 'situation',
+            'body_part', 'outcome', 'goal_type', 'x', 'y', 'goal_x',
+            'goal_y', 'xg', 'xgot', 'league', 'season',
         ]
 
         if match_ids is None:
@@ -872,6 +888,8 @@ class SofaScoreScraper(SoccerdataScraper):
         empty = {
             'player_ratings': pd.DataFrame(columns=ratings_cols + ['_ingested_at']),
             'event_player_stats': pd.DataFrame(columns=eps_cols + ['_ingested_at']),
+            'match_stats': pd.DataFrame(columns=match_stats_cols + ['_ingested_at']),
+            'event_shotmap': pd.DataFrame(columns=shotmap_cols + ['_ingested_at']),
         }
 
         if not match_ids:
@@ -891,13 +909,23 @@ class SofaScoreScraper(SoccerdataScraper):
 
         ratings_rows: List[Dict] = []
         eps_rows: List[Dict] = []
+        stats_rows: List[Dict] = []
+        shot_rows: List[Dict] = []
         consecutive_failures = 0
         max_consecutive = 10  # ~dead proxy / Turnstile not solved — bail early.
 
-        captures = self._iter_match_captures(match_ids, tabs=("Lineups",))
+        # Click ALL deep tabs so the SAME navigation also fires statistics +
+        # shotmap (#751 PR2). `event` is required alongside lineups so team_id/
+        # team_name (homeTeam/awayTeam) are populated, not NULL.
+        captures = self._iter_match_captures(
+            match_ids,
+            tabs=("Lineups", "Statistics", "Player statistics", "Shotmap"),
+            required=("lineups", "event"),
+        )
         try:
             for idx, (mid, endpoints) in enumerate(captures, start=1):
-                lineups = (endpoints or {}).get('lineups')
+                endpoints = endpoints or {}
+                lineups = endpoints.get('lineups')
                 if lineups is None:
                     consecutive_failures += 1
                     if consecutive_failures >= max_consecutive:
@@ -910,7 +938,7 @@ class SofaScoreScraper(SoccerdataScraper):
                     continue
 
                 consecutive_failures = 0
-                event_payload = (endpoints or {}).get('event')
+                event_payload = endpoints.get('event')
                 for side in ('home', 'away'):
                     ratings_rows.extend(self._flatten_lineup_side(
                         match_id=str(mid),
@@ -920,6 +948,15 @@ class SofaScoreScraper(SoccerdataScraper):
                 eps_rows.extend(self._flatten_event_player_stats_from_lineups(
                     str(mid), lineups, event_payload,
                 ))
+
+                # Best-effort: a match page may not fire statistics/shotmap on
+                # a given pass — absent keys just yield no rows for that table.
+                statistics = endpoints.get('statistics')
+                if statistics is not None:
+                    stats_rows.extend(self._flatten_match_stats(str(mid), statistics))
+                shotmap = endpoints.get('shotmap')
+                if shotmap is not None:
+                    shot_rows.extend(self._flatten_shotmap(str(mid), shotmap))
 
                 if idx % 25 == 0:
                     logger.info("match_capture progress: %d/%d matches",
@@ -957,6 +994,22 @@ class SofaScoreScraper(SoccerdataScraper):
         else:
             out['event_player_stats'] = empty['event_player_stats']
 
+        # match_stats + event_shotmap come from the SAME capture pass (#751 PR2).
+        def _tag(rows: List[Dict], entity_type: str) -> pd.DataFrame:
+            df = pd.DataFrame(rows)
+            df['league'] = league
+            df['season'] = season_short
+            df['_ingested_at'] = datetime.utcnow()
+            df['_source'] = self.SOURCE_NAME
+            df['_entity_type'] = entity_type
+            df['_batch_id'] = self._batch_id
+            return df
+
+        out['match_stats'] = (
+            _tag(stats_rows, 'match_stats') if stats_rows else empty['match_stats'])
+        out['event_shotmap'] = (
+            _tag(shot_rows, 'event_shotmap') if shot_rows else empty['event_shotmap'])
+
         if not ratings_rows and not eps_rows:
             logger.warning(
                 "%s: match_capture materialised zero rows across %d match attempts.",
@@ -964,9 +1017,10 @@ class SofaScoreScraper(SoccerdataScraper):
             )
 
         logger.info(
-            "match_capture: %d rating rows + %d eps rows across %d matches",
+            "match_capture: %d ratings + %d eps + %d match_stats + %d shots "
+            "across %d matches",
             len(out['player_ratings']), len(out['event_player_stats']),
-            len(match_ids),
+            len(out['match_stats']), len(out['event_shotmap']), len(match_ids),
         )
         return out
 
@@ -1253,6 +1307,11 @@ class SofaScoreScraper(SoccerdataScraper):
             return rows
 
         ev = event_payload if isinstance(event_payload, dict) else {}
+        # The captured /event/{id} body nests the event object under "event"
+        # ({"event": {homeTeam, awayTeam, ...}}); unwrap it (live-proven 2026-06-22,
+        # #751 PR2 — this is why PR1's team_id came back NULL).
+        if isinstance(ev.get('event'), dict):
+            ev = ev['event']
         team_by_side = {
             'home': ev.get('homeTeam') or {},
             'away': ev.get('awayTeam') or {},

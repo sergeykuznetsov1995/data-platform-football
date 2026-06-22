@@ -279,8 +279,30 @@ class TestEventPlayerStatsFromLineups:
         }
 
     def _event(self):
-        return {'homeTeam': {'id': 1, 'name': 'Team X'},
-                'awayTeam': {'id': 2, 'name': 'Team Y'}}
+        # Live /event/{id} nests the event object under "event" (proven
+        # 2026-06-22, #751 PR2 — flat access returned NULL team_id in PR1).
+        return {'event': {'homeTeam': {'id': 1, 'name': 'Team X'},
+                          'awayTeam': {'id': 2, 'name': 'Team Y'}}}
+
+    def test_unwraps_nested_event_for_team_mapping(self):
+        from scrapers.sofascore.scraper import SofaScoreScraper
+        rows = SofaScoreScraper._flatten_event_player_stats_from_lineups(
+            '1', self._lineups(), {'event': {
+                'homeTeam': {'id': 7, 'name': 'Nested FC'},
+                'awayTeam': {'id': 8, 'name': 'Away FC'}}},
+        )
+        home = next(r for r in rows if r['player_id'] == '11111')
+        assert home['team_id'] == 7 and home['team_name'] == 'Nested FC'
+
+    def test_flat_event_still_maps_teams(self):
+        # Defensive: a bare (un-nested) event object must still map.
+        from scrapers.sofascore.scraper import SofaScoreScraper
+        rows = SofaScoreScraper._flatten_event_player_stats_from_lineups(
+            '1', self._lineups(),
+            {'homeTeam': {'id': 3}, 'awayTeam': {'id': 4}},
+        )
+        home = next(r for r in rows if r['player_id'] == '11111')
+        assert home['team_id'] == 3
 
     def test_happy_path_home_and_away(self):
         from scrapers.sofascore.scraper import SofaScoreScraper
@@ -889,8 +911,27 @@ class TestReadMatchCapture:
                      'statistics': {'rating': '6.5', 'totalShots': 3}},
                 ]},
             },
-            'event': {'homeTeam': {'id': 1, 'name': 'Home FC'},
-                      'awayTeam': {'id': 2, 'name': 'Away FC'}},
+            # Live /event/{id} nests the event under "event" (#751 PR2).
+            'event': {'event': {'homeTeam': {'id': 1, 'name': 'Home FC'},
+                                'awayTeam': {'id': 2, 'name': 'Away FC'}}},
+            # #751 PR2 — same nav also captures statistics + shotmap.
+            'statistics': {'statistics': [
+                {'period': 'ALL', 'groups': [
+                    {'groupName': 'Possession', 'statisticsItems': [
+                        {'name': 'Ball possession', 'key': 'ballPossession',
+                         'home': '55%', 'away': '45%',
+                         'homeValue': 55, 'awayValue': 45,
+                         'compareCode': 1, 'valueType': 'team'},
+                    ]},
+                ]},
+            ]},
+            'shotmap': {'shotmap': [
+                {'id': 9001, 'player': {'id': 11111}, 'teamId': 1,
+                 'isHome': True, 'time': 23, 'incidentType': 'goal',
+                 'shotType': 'rightFoot', 'situation': 'open-play',
+                 'playerCoordinates': {'x': 90, 'y': 50},
+                 'goalMouthCoordinates': {'x': 100, 'y': 50}, 'xg': 0.45},
+            ]},
         }
 
     @pytest.mark.unit
@@ -932,6 +973,53 @@ class TestReadMatchCapture:
         assert away['total_shots'] == 3
 
     @pytest.mark.unit
+    def test_one_pass_yields_match_stats_and_shotmap(self):
+        # #751 PR2 — the SAME capture pass also materialises match_stats +
+        # event_shotmap from the statistics/shotmap endpoints.
+        scraper = self._scraper()
+
+        def fake_iter(match_ids, **kwargs):
+            for mid in match_ids:
+                yield str(mid), self._endpoints()
+
+        scraper._iter_match_captures = fake_iter
+
+        out = scraper.read_match_capture(
+            league='ENG-Premier League', season=2025, match_ids=['M1', 'M2'],
+        )
+
+        ms = out['match_stats']
+        sm = out['event_shotmap']
+        assert len(ms) == 2   # 2 matches × 1 stat item
+        assert len(sm) == 2   # 2 matches × 1 shot
+        assert set(ms['season']) == {'2526'}
+        assert set(sm['season']) == {'2526'}
+        assert set(ms['_entity_type']) == {'match_stats'}
+        assert set(sm['_entity_type']) == {'event_shotmap'}
+        assert set(ms['stat_name']) == {'Ball possession'}
+        assert set(sm['xg']) == {0.45}
+
+    @pytest.mark.unit
+    def test_requests_all_tabs_and_event(self):
+        # The "one nav" contract clicks ALL deep tabs and requires event so
+        # team_id is populated — assert _iter_match_captures is invoked so.
+        scraper = self._scraper()
+        captured_kwargs = {}
+
+        def fake_iter(match_ids, **kwargs):
+            captured_kwargs.update(kwargs)
+            for mid in match_ids:
+                yield str(mid), self._endpoints()
+
+        scraper._iter_match_captures = fake_iter
+        scraper.read_match_capture(
+            league='ENG-Premier League', season=2025, match_ids=['M1'],
+        )
+        assert 'Statistics' in captured_kwargs['tabs']
+        assert 'Shotmap' in captured_kwargs['tabs']
+        assert 'event' in captured_kwargs['required']
+
+    @pytest.mark.unit
     def test_graceful_empty_when_no_lineups(self):
         scraper = self._scraper()
 
@@ -944,10 +1032,10 @@ class TestReadMatchCapture:
         out = scraper.read_match_capture(
             league='ENG-Premier League', season=2025, match_ids=['M1'],
         )
-        assert out['player_ratings'].empty
-        assert out['event_player_stats'].empty
-        assert 'match_id' in out['player_ratings'].columns
-        assert 'match_id' in out['event_player_stats'].columns
+        for key in ('player_ratings', 'event_player_stats',
+                    'match_stats', 'event_shotmap'):
+            assert out[key].empty
+            assert 'match_id' in out[key].columns
 
 
 class TestCamoufoxProxy:
