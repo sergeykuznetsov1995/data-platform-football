@@ -74,3 +74,15 @@ opencv-python-headless>=4.8.0
 # Used as primary bypass before falling back to nodriver
 # -----------------------------------------------------------------------------
 DrissionPage>=4.1.0
+
+# -----------------------------------------------------------------------------
+# [camoufox] Anti-detect Firefox for SofaScore Cloudflare-Turnstile bypass (#757)
+# SofaScore's data API is Turnstile-gated; only a real Firefox (Camoufox) through
+# a residential proxy passes it invisibly. Driven via Playwright; we passively
+# capture the SPA's same-origin /api/v1 XHRs (scrapers/sofascore/camoufox_capture.py).
+# playwright MUST stay <1.60 — 1.60 crashes Camoufox on page errors (camoufox#617).
+# The Firefox binary is fetched at image-build time via `python -m camoufox fetch`
+# (see Dockerfile). Runs under Xvfb (headless="virtual"), already provisioned.
+# -----------------------------------------------------------------------------
+camoufox[geoip]>=0.4.11
+playwright>=1.59,<1.60
