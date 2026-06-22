@@ -554,6 +554,67 @@ class SofaScoreScraper(SoccerdataScraper):
             if row.get(col) is None and overlay.get(col) is not None:
                 row[col] = overlay[col]
 
+    def _camoufox_proxy(self) -> Optional[dict]:
+        """Build a Camoufox/Playwright proxy dict (creds split out — browsers
+        reject creds embedded in the URL) from the configured residential
+        proxy. Returns ``None`` when none is configured; SofaScore's Turnstile
+        then 403s every data XHR (#757), so a proxy is required in production.
+        Mirrors :meth:`_build_tls_session`'s proxy selection.
+        """
+        proxy_obj = None
+        if self._proxy_manager is not None and self._proxy_manager.total_count > 0:
+            proxy_obj = self._proxy_manager.get_proxy()
+        if proxy_obj is None:
+            logger.warning(
+                "No residential proxy configured for SofaScore capture — "
+                "Turnstile will 403 every data endpoint (#757)."
+            )
+            return None
+        d = {'server': f'http://{proxy_obj.host}:{proxy_obj.port}'}
+        if proxy_obj.username and proxy_obj.password:
+            d['username'] = proxy_obj.username
+            d['password'] = proxy_obj.password
+        logger.info("SofaScore capture proxy: %s", proxy_obj.masked_url)
+        return d
+
+    def _iter_lineup_payloads(self, match_ids: List[str]):
+        """Yield ``(match_id, lineups_payload | None)`` by capturing each match
+        page through ONE warmed Camoufox session (issue #757, path P2).
+
+        Replaces the dead ``tls_requests`` ``/lineups`` fetch: SofaScore's API
+        is Cloudflare-Turnstile-gated and only a real Firefox (Camoufox) behind
+        a residential proxy passes it. We let the SPA fire its own
+        ``/api/v1/event/{id}/lineups`` XHR and capture the response — see
+        ``scrapers/sofascore/camoufox_capture.py``. ``None`` means the lineups
+        endpoint wasn't captured (Turnstile not solved / proxy dead); the
+        caller treats it like a fetch miss. The generator owns the browser
+        session — the caller must ``.close()`` it (e.g. via try/finally) so the
+        session tears down even on an early circuit-breaker break.
+        """
+        from scrapers.sofascore.camoufox_capture import SofascoreCamoufoxCapture
+
+        proxy = self._camoufox_proxy()
+        with SofascoreCamoufoxCapture(proxy=proxy) as cap:
+            for mid in match_ids:
+                self._rate_limiter.acquire()
+                self._stats['requests'] += 1
+                try:
+                    endpoints = cap.capture_event(str(mid))
+                    lineups = endpoints.get('lineups')
+                except Exception as e:  # noqa: BLE001 — one bad event mustn't kill the loop
+                    logger.warning("camoufox capture failed for event=%s: %s", mid, e)
+                    lineups = None
+                if lineups is None:
+                    self._stats['failures'] += 1
+                    self._last_lineup_error = {
+                        'event_id': str(mid),
+                        'status': None,
+                        'error': 'lineups_not_captured',
+                    }
+                else:
+                    self._stats['successes'] += 1
+                yield str(mid), lineups
+
     def read_player_ratings(
         self,
         league: str,
@@ -611,31 +672,39 @@ class SofaScoreScraper(SoccerdataScraper):
 
         all_rows: List[Dict] = []
         consecutive_failures = 0
-        max_consecutive = 100  # preventive; live probe 2026-05-18 (#19) shows endpoint stable
+        max_consecutive = 100  # preventive circuit-breaker; bail to save proxy budget
 
-        for idx, mid in enumerate(match_ids, start=1):
-            payload = self._fetch_lineup_payload(str(mid))
-            if payload is None:
-                consecutive_failures += 1
-                if consecutive_failures >= max_consecutive:
-                    logger.error(
-                        "%s: %d consecutive lineup fetch failures — aborting "
-                        "scrape early to preserve proxy budget.",
-                        R0_2B_FALLBACK_MARKER, consecutive_failures,
-                    )
-                    break
-                continue
+        # #757: lineups now come from the Camoufox capture transport (the
+        # tls_requests REST path is Turnstile-blocked). The generator owns one
+        # warmed browser session for all matches — close it on early break.
+        payloads = self._iter_lineup_payloads(match_ids)
+        try:
+            for idx, (mid, payload) in enumerate(payloads, start=1):
+                if payload is None:
+                    consecutive_failures += 1
+                    if consecutive_failures >= max_consecutive:
+                        logger.error(
+                            "%s: %d consecutive lineup capture failures — aborting "
+                            "scrape early to preserve proxy budget.",
+                            R0_2B_FALLBACK_MARKER, consecutive_failures,
+                        )
+                        break
+                    continue
 
-            consecutive_failures = 0
-            for side in ('home', 'away'):
-                all_rows.extend(self._flatten_lineup_side(
-                    match_id=str(mid),
-                    side=side,
-                    side_payload=payload.get(side) or {},
-                ))
+                consecutive_failures = 0
+                for side in ('home', 'away'):
+                    all_rows.extend(self._flatten_lineup_side(
+                        match_id=str(mid),
+                        side=side,
+                        side_payload=payload.get(side) or {},
+                    ))
 
-            if idx % 25 == 0:
-                logger.info("Lineups progress: %d/%d matches", idx, len(match_ids))
+                if idx % 25 == 0:
+                    logger.info("Lineups progress: %d/%d matches", idx, len(match_ids))
+        finally:
+            close = getattr(payloads, 'close', None)
+            if callable(close):
+                close()  # tear down the Camoufox session
 
         if not all_rows:
             logger.warning(
