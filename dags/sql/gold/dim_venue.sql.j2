@@ -7,13 +7,16 @@
 -- Sources:
 --   iceberg.silver.fbref_match_enriched   (sch.venue per match)
 --   iceberg.silver.espn_matchsheet        (conform: venue per match, dedup'd #735)
+--   iceberg.silver.fotmob_team_profile    (venue-attribute lookup only, #719 coords +
+--                                          #750 city/surface/capacity/opened — does NOT
+--                                          contribute venue rows; grain unchanged)
 --
 -- Identity (issue #145): `venue_id` is the explicit `venue_<slug>` from
 -- `configs/medallion/venue_aliases.yaml` — NOT a hash of the raw name. The
 -- template renders ONE `{{ venue_aliases_values_sql }}` placeholder, filled by
--- `medallion_config.get_venue_alias_sql_values()` → a comma-separated list of
--- six-tuples `('raw_name','canonical_id','canonical_name','city','country',
--- 'league'), ...`. Every observed spelling of a stadium carries an alias row
+-- `medallion_config.get_venue_alias_sql_values(include_capacity=True)` → a list of
+-- seven-tuples `('raw_name','canonical_id','canonical_name','city','country',
+-- 'league', capacity), ...`. Every observed spelling of a stadium carries an alias row
 -- pointing at the same `canonical_id`, so "Brentford Community Stadium" and
 -- "Gtech Community Stadium" (sponsor rename) merge with zero fuzzy matching.
 --
@@ -29,14 +32,22 @@
 --
 -- Output columns (star-schema design, issue #425):
 --   venue_name   = canonical_name from YAML, else MAX(name) fbref > espn
---   city/country = from venue_aliases.yaml (NULL for orphans)
---   capacity     = NULL placeholder (no source yet; enrichment followup)
+--   city         = curated venue_aliases.yaml, else FotMob (#750 fills non-curated NULLs)
+--   country      = from venue_aliases.yaml (NULL for orphans)
+--   capacity     = COALESCE(FotMob, curated fallback) (#750): FotMob
+--                  silver.fotmob_team_profile is primary (replaced bulk of #434);
+--                  small curated fallback remains for moved grounds FotMob can't
+--                  supply. NULL only when neither source has it.
+--   surface/opened = FotMob venue.statPairs (#750); NULL when no FotMob match
+--   latitude/longitude = stadium coords from silver.fotmob_team_profile, matched
+--                  by normalised venue name (#719); NULL when no FotMob match.
+--                  Feeds flight-distance features for the home-advantage study (#558).
 --   venue_source = 'curated' (matched alias) | 'orphan' (unmatched) — kept
 --                  for the orphan-rate DQ check in validate_gold_quality
 --
 -- Notes:
---   * city / country come from venue_aliases.yaml for curated venues; NULL for
---     orphans. Fills the former R8 placeholder for in-scope (APL) venues.
+--   * city: curated venue_aliases.yaml wins; FotMob fills NULLs for non-curated /
+--     orphan venues (#750). country stays curated-only for now.
 --   * Normalisation key (NFD + strip diacritics + remove non-alphanumerics)
 --     folds apostrophe/period variants ("St James' Park" / "St. James' Park")
 --     automatically, so the curator only lists genuinely distinct spellings.
@@ -54,8 +65,9 @@ with aliases as (
         -- League predicate (issue #148): guard the JOIN on a.league = u.league
         -- so worldwide namesakes (one spelling, two cities) never cross-merge.
         league,
-        -- capacity (issue #434): curated stadium capacity (int) or NULL. Emitted
-        -- as a 7th, UNQUOTED column by get_venue_alias_sql_values(include_capacity=True).
+        -- capacity (issue #750): CURATED FALLBACK only — COALESCE'd BEHIND FotMob in
+        -- the final SELECT, kept just for venues FotMob's current-ground team-profile
+        -- can't supply (moved grounds). 7th UNQUOTED col (include_capacity=True).
         capacity,
         -- Normalised join key: lower -> strip diacritics (NFD + \p{Mn}) ->
         -- remove all non-alphanumerics. Same idiom as xref_referee.sql.j2.
@@ -95,6 +107,31 @@ espn_venues as (
       and trim(venue) <> ''
 ),
 
+-- FotMob venue enrichment (#719 coords + #750 city/surface/capacity/opened): keyed by
+-- (league, normalised venue name). Enrichment lookup ONLY — joined into `resolved`,
+-- never UNION'd into the venue feed, so dim_venue's one-row-per-venue grain is
+-- untouched. Same norm idiom as the alias join; (league, norm) guards worldwide
+-- namesakes. No coords filter (#750) — attributes may exist without coords; MAX
+-- ignores NULLs, so each attribute is aggregated independently.
+fotmob_venue as (
+    select
+        league,
+        regexp_replace(
+            regexp_replace(normalize(lower(trim(venue)), NFD), '\p{Mn}+', ''),
+            '[^a-z0-9]+', ''
+        )                                            as norm,
+        max(venue_latitude)                          as latitude,
+        max(venue_longitude)                         as longitude,
+        max(venue_city)                              as city,
+        max(venue_surface)                           as surface,
+        max(venue_capacity)                          as capacity,
+        max(venue_opened)                            as opened
+    from iceberg.silver.fotmob_team_profile
+    where venue is not null
+      and trim(venue) <> ''
+    group by 1, 2
+),
+
 unioned as (
     select * from fbref_venues
     union all
@@ -110,9 +147,15 @@ resolved as (
         u.src,
         a.canonical_id,
         a.canonical_name,
-        a.city,
-        a.country,
-        a.capacity,
+        a.city                                       as city_curated,
+        a.country                                    as country_curated,
+        a.capacity                                   as capacity_curated,
+        f.city                                       as city_fotmob,
+        f.capacity                                   as capacity_fotmob,
+        f.surface                                    as surface,
+        f.opened                                     as opened,
+        f.latitude,
+        f.longitude,
         -- Curated alias -> explicit slug; orphan -> stable normalised-name hash.
         case
             when a.canonical_id is not null then a.canonical_id
@@ -130,6 +173,12 @@ resolved as (
                       regexp_replace(normalize(lower(trim(u.venue_raw)), NFD), '\p{Mn}+', ''),
                       '[^a-z0-9]+', ''
                   )
+    left join fotmob_venue f
+      on f.league = u.league
+     and f.norm = regexp_replace(
+                      regexp_replace(normalize(lower(trim(u.venue_raw)), NFD), '\p{Mn}+', ''),
+                      '[^a-z0-9]+', ''
+                  )
 ),
 
 aggregated as (
@@ -137,9 +186,15 @@ aggregated as (
         venue_id,
         max(canonical_id)                            as canonical_id,
         max(canonical_name)                          as canonical_name,
-        max(city)                                    as city,
-        max(country)                                 as country,
-        max(capacity)                                as capacity,
+        max(city_curated)                            as city_curated,
+        max(city_fotmob)                             as city_fotmob,
+        max(country_curated)                         as country_curated,
+        max(capacity_fotmob)                         as capacity_fotmob,
+        max(capacity_curated)                        as capacity_curated,
+        max(surface)                                 as surface,
+        max(opened)                                  as opened,
+        max(latitude)                                as latitude,
+        max(longitude)                               as longitude,
         max(venue_raw) filter (where src = 'fbref')  as venue_fbref,
         max(venue_raw) filter (where src = 'espn')   as venue_espn,
         count(distinct match_date)                   as n_matches,
@@ -154,12 +209,23 @@ aggregated as (
 select
     venue_id,
     coalesce(canonical_name, venue_fbref, venue_espn)                          as venue_name,
-    city,
-    country,
-    -- capacity (issue #434): curated in venue_aliases.yaml (NULL for orphans /
-    -- venues without a curated value). ESPN's bronze column is 100% NULL — see
-    -- feedback_bronze_expected_null_columns.
-    cast(capacity as integer)                                                  as capacity,
+    -- city (issue #750): curated venue_aliases.yaml wins; FotMob fills the NULLs
+    -- (non-curated / orphan venues). country stays curated-only (FotMob carries team
+    -- country, not venue country; SofaScore venue country is a followup).
+    coalesce(city_curated, city_fotmob)                                        as city,
+    country_curated                                                            as country,
+    -- capacity (issue #750): FotMob silver.fotmob_team_profile is PRIMARY (auto +
+    -- global, replaced the bulk of #434); COALESCE to a small curated FALLBACK for
+    -- venues FotMob's current-ground team-profile can't supply (moved grounds like
+    -- Goodison Park / White Hart Lane / Wembley). NULL only when neither has it.
+    cast(coalesce(capacity_fotmob, capacity_curated) as integer)               as capacity,
+    -- surface / opened (issue #750): new attributes from FotMob venue.statPairs.
+    surface,
+    cast(opened as integer)                                                    as opened,
+    -- latitude/longitude (issue #719): stadium coords from silver.fotmob_team_profile,
+    -- matched by normalised venue name. NULL when FotMob has no matching venue.
+    cast(latitude as double)                                                   as latitude,
+    cast(longitude as double)                                                  as longitude,
     -- Kept beyond the design's column list: the orphan-rate DQ check in
     -- gold_tasks.validate_gold_quality filters on venue_source = 'orphan'.
     case when canonical_id is not null then 'curated' else 'orphan' end        as venue_source

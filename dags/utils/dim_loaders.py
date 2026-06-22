@@ -172,8 +172,10 @@ def render_dim_venue_sql(template_path: str, out_path: str) -> str:
 
     rendered = render_sql_template(
         Path(template_path),
-        # include_capacity=True (issue #434): dim_venue projects capacity;
-        # dim_match reuses the same dict WITHOUT capacity (6-col tuple).
+        # include_capacity=True: dim_venue sources capacity from FotMob first and
+        # COALESCEs to this curated value as a FALLBACK (#750) — kept only for venues
+        # FotMob's current-ground team-profile cannot supply (moved grounds, etc.).
+        # dim_match still uses the default (no-capacity) 6-tuple form.
         venue_aliases_values_sql=get_venue_alias_sql_values(include_capacity=True),
     )
     Path(out_path).write_text(rendered)

@@ -259,7 +259,15 @@ class TestFotMobScraperUnit:
             'details': {'id': 9825, 'name': 'Arsenal', 'shortName': 'Arsenal', 'country': 'ENG'},
             'overview': {
                 'season': '2025/2026',
-                'venue': {'widget': {'name': 'Emirates Stadium'}},
+                'venue': {
+                    'widget': {'name': 'Emirates Stadium',
+                               'location': ['51.5549', '-0.1084'],
+                               'city': 'London'},
+                    # statPairs = list of [label, value] pairs (#750).
+                    'statPairs': [['Surface', 'Grass'],
+                                  ['Capacity', 60704],
+                                  ['Opened', 2006]],
+                },
                 'table': [{'data': {'table': {'all': [{'id': 9825, 'idx': 2}]}}}],
                 'nextMatch': {'id': 1},
                 'lastMatch': {'id': 2},
@@ -292,10 +300,45 @@ class TestFotMobScraperUnit:
         assert row['team_id'] == 9825
         assert row['team_name'] == 'Arsenal'
         assert row['venue'] == 'Emirates Stadium'
+        # #719: stadium coords kept raw (strings) from widget.location.
+        assert row['venue_latitude'] == '51.5549'
+        assert row['venue_longitude'] == '-0.1084'
+        # #750: widget.city + statPairs (surface/capacity/opened), kept raw (str).
+        assert row['venue_city'] == 'London'
+        assert row['venue_surface'] == 'Grass'
+        assert row['venue_capacity'] == '60704'
+        assert row['venue_opened'] == '2006'
         assert row['overview_season'] == '2025/2026'
         assert row['overview_table_position'] == '2'
         assert row['history_seasons_count'] == '3'
         assert '"id": 1' in row['next_match']
+
+    def test_read_team_profile_without_location(self, mock_scraper, team_payload):
+        """#719: widget without 'location' → coords None (no crash)."""
+        team_payload['overview']['venue']['widget'].pop('location')
+        with patch.object(mock_scraper, '_team_ids_for_league', return_value=[9825]):
+            with patch.object(mock_scraper, '_get_team_data', return_value=team_payload):
+                df = mock_scraper.read_team_profile('ENG-Premier League', 2025)
+
+        row = df.iloc[0]
+        assert row['venue'] == 'Emirates Stadium'
+        assert row['venue_latitude'] is None
+        assert row['venue_longitude'] is None
+
+    def test_read_team_profile_without_stat_pairs(self, mock_scraper, team_payload):
+        """#750: venue without statPairs / city → those fields None (no crash)."""
+        team_payload['overview']['venue']['widget'].pop('city')
+        team_payload['overview']['venue'].pop('statPairs')
+        with patch.object(mock_scraper, '_team_ids_for_league', return_value=[9825]):
+            with patch.object(mock_scraper, '_get_team_data', return_value=team_payload):
+                df = mock_scraper.read_team_profile('ENG-Premier League', 2025)
+
+        row = df.iloc[0]
+        assert row['venue'] == 'Emirates Stadium'
+        assert row['venue_city'] is None
+        assert row['venue_surface'] is None
+        assert row['venue_capacity'] is None
+        assert row['venue_opened'] is None
 
     def test_read_team_squad(self, mock_scraper, team_payload):
         """team_squad flattens member.role and section title; rcards/ycards."""
