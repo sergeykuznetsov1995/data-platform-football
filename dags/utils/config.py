@@ -54,6 +54,10 @@ SCHEDULES: Dict[str, str] = {
     'dag_ingest_understat': '0 9 * * *',     # 9:00 UTC daily
     'dag_ingest_whoscored': '0 10 * * *',    # 10:00 UTC daily
     'dag_ingest_sofascore': '0 11 * * *',    # 11:00 UTC daily
+    # Weekly per-player capture (#751 PR3): ~526 Camoufox navs/run, hours-long.
+    # Saturday 15:00 UTC — after the daily ingest window + master pipeline (14:00),
+    # so the heavy player run doesn't contend with daily scrapes on the 11GB VM.
+    'dag_ingest_sofascore_players': '0 15 * * 6',  # 15:00 UTC Saturday (weekly)
     'dag_ingest_espn': '0 12 * * *',         # 12:00 UTC daily
     'dag_ingest_clubelo': '0 13 * * *',      # 13:00 UTC daily
     'dag_ingest_sofifa': '0 6 * * 0',        # 6:00 UTC Sunday (weekly)

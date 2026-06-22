@@ -16,9 +16,8 @@ Data collected:
 All data is written to Iceberg Bronze layer tables (via Parquet fallback).
 """
 
-import os
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 from airflow import DAG
 from airflow.exceptions import AirflowException
@@ -34,31 +33,8 @@ SCHEDULE_RESULT_PATH = '/tmp/sofascore_result.json'
 # per-match tables: player_ratings, event_player_stats, match_stats, shotmap
 # (replaces four separate tls passes).
 MATCH_CAPTURE_RESULT_PATH = '/tmp/sofascore_match_capture_result.json'
-PLAYER_SEASON_STATS_RESULT_PATH = '/tmp/sofascore_player_season_stats_result.json'
-PLAYER_PROFILE_RESULT_PATH = '/tmp/sofascore_player_profile_result.json'
-
-
-def _env_int(name: str) -> Optional[int]:
-    """Read an int from ENV; empty / unparseable / non-positive → None."""
-    raw = os.environ.get(name, '').strip()
-    if not raw:
-        return None
-    try:
-        v = int(raw)
-    except ValueError:
-        return None
-    return v if v > 0 else None
-
-
-# Per-endpoint safety knobs. Default = None (no cap, full coverage).
-# Override via ENV on dev / staging to keep runs bounded. Issue #69.
-PLAYER_SEASON_STATS_DAILY_LIMIT = _env_int('SS_PSS_LIMIT')
-PLAYER_PROFILE_DAILY_LIMIT = _env_int('SS_PP_LIMIT')
-
-
-def _limit_arg(limit: Optional[int]) -> str:
-    """Render ``--limit N`` only when limit is set; else empty string."""
-    return f"--limit {int(limit)}" if limit else ""
+# #751 PR3 — per-player profile + season_stats moved OUT of this daily DAG into
+# the weekly dag_ingest_sofascore_players (~526 Camoufox navs is too heavy daily).
 
 
 def _load_result(path: str, logger) -> Dict[str, Any]:
@@ -91,8 +67,6 @@ def validate_data(**context) -> Dict[str, Any]:
     # `rows`/`matches_with_ratings`, `eps_rows`/`eps_matches`,
     # `match_stats_rows`/`match_stats_matches`, `shotmap_rows`/`shotmap_matches`).
     capture_result = _load_result(MATCH_CAPTURE_RESULT_PATH, logger)
-    pss_result = _load_result(PLAYER_SEASON_STATS_RESULT_PATH, logger)
-    pp_result = _load_result(PLAYER_PROFILE_RESULT_PATH, logger)
 
     if not schedule_result:
         raise AirflowException(
@@ -117,17 +91,9 @@ def validate_data(**context) -> Dict[str, Any]:
             'match_stats_rows': capture_result.get('match_stats_rows', 0),
             'match_stats_matches': capture_result.get('match_stats_matches', 0),
             'match_stats_fallback': capture_result.get('fallback', False),
-            'player_season_stats_rows': pss_result.get('rows', 0),
-            'player_season_stats_players': pss_result.get('players_with_rows', 0),
-            'player_season_stats_fallback': pss_result.get('fallback', False),
-            'player_profile_rows': pp_result.get('rows', 0),
-            'player_profile_players': pp_result.get('players_with_rows', 0),
-            'player_profile_fallback': pp_result.get('fallback', False),
             'tables': (
                 schedule_result.get('tables', [])
                 + capture_result.get('tables', [])
-                + pss_result.get('tables', [])
-                + pp_result.get('tables', [])
             ),
         }
     }
@@ -135,8 +101,6 @@ def validate_data(**context) -> Dict[str, Any]:
     errors: List[str] = []
     errors.extend(schedule_result.get('errors', []) or [])
     errors.extend(capture_result.get('errors', []) or [])
-    errors.extend(pss_result.get('errors', []) or [])
-    errors.extend(pp_result.get('errors', []) or [])
     if errors:
         validation['warnings'] = errors
         total_rows = sum([
@@ -146,8 +110,6 @@ def validate_data(**context) -> Dict[str, Any]:
             validation['summary']['shotmap_rows'],
             validation['summary']['event_player_stats_rows'],
             validation['summary']['match_stats_rows'],
-            validation['summary']['player_season_stats_rows'],
-            validation['summary']['player_profile_rows'],
         ])
         validation['status'] = 'partial_success' if total_rows > 0 else 'failed'
 
@@ -228,39 +190,8 @@ def validate_data(**context) -> Dict[str, Any]:
                 f"{validation['summary']['match_stats_rows']} < 10000"
             )
 
-    # player_season_stats: 1 row per player. APL ≈ 526 active players.
-    # WARN-only threshold = 400 (issue #69).
-    if validation['summary']['player_season_stats_rows'] < 400:
-        if validation['summary']['player_season_stats_fallback']:
-            validation['warnings'].append(
-                f"player_season_stats R0.2B_FALLBACK: rows="
-                f"{validation['summary']['player_season_stats_rows']} players="
-                f"{validation['summary']['player_season_stats_players']}"
-            )
-            if validation['status'] == 'success':
-                validation['status'] = 'partial_success'
-        else:
-            validation['warnings'].append(
-                f"Low player_season_stats row count: "
-                f"{validation['summary']['player_season_stats_rows']} < 400"
-            )
-
-    # player_profile: 1 row per player. APL ≈ 526 active players.
-    # WARN-only threshold = 400 (issue #69).
-    if validation['summary']['player_profile_rows'] < 400:
-        if validation['summary']['player_profile_fallback']:
-            validation['warnings'].append(
-                f"player_profile R0.2B_FALLBACK: rows="
-                f"{validation['summary']['player_profile_rows']} players="
-                f"{validation['summary']['player_profile_players']}"
-            )
-            if validation['status'] == 'success':
-                validation['status'] = 'partial_success'
-        else:
-            validation['warnings'].append(
-                f"Low player_profile row count: "
-                f"{validation['summary']['player_profile_rows']} < 400"
-            )
+    # player_season_stats + player_profile moved to the weekly
+    # dag_ingest_sofascore_players (#751 PR3) — validated there, not here.
 
     logger.info(f"Data validation complete: {validation['status']}")
     logger.info(f"Summary: {validation['summary']}")
@@ -348,20 +279,21 @@ with DAG(
 
     - **Schedule**: Match dates, teams, scores, venues
     - **Team Stats**: Season-level team statistics
-    - **Player Stats**: Season-level player statistics
+
+    Per-player profile + season-aggregate stats are NOT here — they run weekly
+    in `dag_ingest_sofascore_players` (#751 PR3; ~526 Camoufox navs is too heavy
+    to carry daily).
 
     ### Daily limits (issue #69)
 
     No per-endpoint cap by default. Override via ENV on dev/staging:
-    `SS_SHOTMAP_LIMIT`, `SS_EPS_LIMIT`, `SS_MATCH_STATS_LIMIT`,
-    `SS_PSS_LIMIT`, `SS_PP_LIMIT` (positive int → cap).
+    `SS_SHOTMAP_LIMIT`, `SS_EPS_LIMIT`, `SS_MATCH_STATS_LIMIT` (positive int → cap).
 
-    ### Skip-existing (event-grain)
+    ### Full-state refresh
 
-    `shotmap`, `event_player_stats`, `match_stats` skip match_ids already
-    materialised in their bronze table → APPEND mode. Snapshot endpoints
-    (`player_season_stats`, `player_profile`) keep full refresh
-    (`replace_partitions=['league','season']`).
+    The consolidated `match_capture` rewrites each `(league, season)` partition
+    wholesale every run (`replace_partitions=['league','season']` + completeness
+    guard) — every finished match is re-captured, so the run is idempotent.
 
     **Manual full refresh**: `TRUNCATE iceberg.bronze.sofascore_<table>`
     via `make shell-trino`, then trigger the DAG.
@@ -426,63 +358,8 @@ exit $rc
     # #751 PR2: shotmap (#22) + match_stats (#25) no longer have their own tls
     # tasks — both come from the consolidated Camoufox capture above (same nav
     # also clicks the Statistics/Shotmap tabs). The dead tls path 403'd silently.
-
-    # #24 — season-aggregate per-player Opta stats. Depends on fresh
-    # bronze.sofascore_player_ratings (provides DISTINCT player_ids).
-    # Snapshot grain — full refresh every run (no skip-existing).
-    scrape_player_season_stats_task = BashOperator(
-        task_id='scrape_player_season_stats',
-        bash_command=f"""
-cd /opt/airflow && \\
-rm -f {PLAYER_SEASON_STATS_RESULT_PATH} && \\
-python dags/scripts/run_sofascore_scraper.py \\
-    --entity player_season_stats \\
-    --league "{LEAGUES[0]}" \\
-    --season {CURRENT_SEASON} \\
-    {_limit_arg(PLAYER_SEASON_STATS_DAILY_LIMIT)} \\
-    --output {PLAYER_SEASON_STATS_RESULT_PATH}
-rc=$?
-if [ $rc -eq 2 ]; then
-    echo "R0.2B_FALLBACK exit-code 2 (player_season_stats) — propagating as soft success."
-    exit 0
-fi
-exit $rc
-""",
-        env={
-            'PYTHONPATH': '/opt/airflow:/opt/airflow/dags',
-            'PATH': '/usr/local/bin:/usr/bin:/bin:/home/airflow/.local/bin',
-            'HOME': '/home/airflow',
-        },
-        append_env=True,
-    )
-
-    # #23 — biographical snapshot per player. Cheap, runs after ratings.
-    # Snapshot grain — full refresh every run (no skip-existing).
-    scrape_player_profile_task = BashOperator(
-        task_id='scrape_player_profile',
-        bash_command=f"""
-cd /opt/airflow && \\
-rm -f {PLAYER_PROFILE_RESULT_PATH} && \\
-python dags/scripts/run_sofascore_scraper.py \\
-    --entity player_profile \\
-    --league "{LEAGUES[0]}" \\
-    --season {CURRENT_SEASON} \\
-    {_limit_arg(PLAYER_PROFILE_DAILY_LIMIT)} \\
-    --output {PLAYER_PROFILE_RESULT_PATH}
-rc=$?
-if [ $rc -eq 2 ]; then
-    echo "R0.2B_FALLBACK exit-code 2 (player_profile) — propagating as soft success."
-    exit 0
-fi
-exit $rc
-""",
-        env={
-            'PYTHONPATH': '/opt/airflow:/opt/airflow/dags',
-            'PATH': '/usr/local/bin:/usr/bin:/bin:/home/airflow/.local/bin',
-            'HOME': '/home/airflow',
-        },
-        append_env=True,
-    )
+    # #751 PR3: player_season_stats (#24) + player_profile (#23) moved to the
+    # weekly dag_ingest_sofascore_players (~526 Camoufox navs too heavy daily).
 
     validate_data_task = PythonOperator(
         task_id='validate_data',
@@ -499,14 +376,7 @@ exit $rc
     )
 
     # schedule → match_capture (ratings + event_player_stats + match_stats +
-    # shotmap from ONE nav/match — #751 PR2), then [player_season_stats,
-    # player_profile] in parallel (both read bronze.sofascore_player_ratings,
-    # which match_capture writes), then validate_data on all_done.
+    # shotmap from ONE nav/match — #751 PR2), then validate_data on all_done.
+    # Per-player profile + season_stats run in the weekly player DAG (#751 PR3).
     scrape_data_task >> scrape_match_capture_task
-    scrape_match_capture_task >> scrape_player_season_stats_task
-    scrape_match_capture_task >> scrape_player_profile_task
-    [
-        scrape_match_capture_task,
-        scrape_player_season_stats_task,
-        scrape_player_profile_task,
-    ] >> validate_data_task >> validate_bronze_freshness_task
+    scrape_match_capture_task >> validate_data_task >> validate_bronze_freshness_task
