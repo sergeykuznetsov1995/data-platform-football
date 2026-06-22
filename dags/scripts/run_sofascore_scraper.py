@@ -87,6 +87,9 @@ ENTITY_EVENT_PLAYER_STATS = 'event_player_stats'
 ENTITY_MATCH_STATS = 'match_stats'
 ENTITY_PLAYER_SEASON_STATS = 'player_season_stats'
 ENTITY_PLAYER_PROFILE = 'player_profile'
+# #751 PR1 — consolidated per-match capture: ONE Camoufox nav/match feeds BOTH
+# player_ratings and event_player_stats from the same /lineups (+/event) payload.
+ENTITY_MATCH_CAPTURE = 'match_capture'
 
 VALID_ENTITIES = {
     ENTITY_SCHEDULE,
@@ -97,6 +100,7 @@ VALID_ENTITIES = {
     ENTITY_MATCH_STATS,
     ENTITY_PLAYER_SEASON_STATS,
     ENTITY_PLAYER_PROFILE,
+    ENTITY_MATCH_CAPTURE,
 }
 
 # Replace-partitions completeness guard (#513 → #583): refuse a save that would
@@ -390,6 +394,184 @@ def _run_player_ratings(
         return 3
     except Exception as e:
         logger.error("player_ratings scrape failed hard: %s", e, exc_info=True)
+        results['errors'].append(str(e))
+        _write_results(output_path, results)
+        return 1
+
+    _write_results(output_path, results)
+    return 0
+
+
+def _run_match_capture(
+    leagues: List[str],
+    season: int,
+    limit: Optional[int],
+    output_path: str,
+    force_replace: bool = False,
+) -> int:
+    """#751 PR1 — consolidated per-match capture entrypoint.
+
+    ONE Camoufox navigation per match feeds BOTH
+    ``bronze.sofascore_player_ratings`` and
+    ``bronze.sofascore_event_player_stats`` from the same captured ``/lineups``
+    (+ ``/event``) payload — replacing the two separate Turnstile-blocked
+    passes. Both tables are written full-state
+    (``replace_partitions=['league', 'season']`` + completeness guard): every
+    run re-captures the finished matches and rewrites the partition wholesale,
+    so ``event_player_stats`` no longer accumulates and comes essentially free
+    with the ratings capture (no per-player ``/player/{pid}/statistics`` calls).
+
+    Exit codes: 0 ok / 2 R0.2B_FALLBACK (nothing captured) / 3 ReplaceGuard /
+    1 hard failure.
+    """
+    from scrapers.base.base_scraper import ReplaceGuardError
+    from scrapers.sofascore import SofaScoreScraper
+    from scrapers.sofascore.scraper import R0_2B_FALLBACK_MARKER
+
+    league = leagues[0]
+    season_str = str(season)
+    if len(season_str) == 4 and season_str.isdigit():
+        season_short = f"{season_str[2:4]}{int(season_str[2:4]) + 1:02d}"
+    else:
+        season_short = season_str
+
+    logger.info(
+        "match_capture: league=%s season=%s (short=%s) limit=%s",
+        league, season, season_short, limit,
+    )
+
+    match_ids = _resolve_match_ids_from_bronze(league, season_short, limit)
+    if not match_ids:
+        match_ids = _resolve_match_ids_from_bronze(league, season_str, limit)
+    if match_ids:
+        logger.info("Resolved %d match_ids from bronze.sofascore_schedule",
+                    len(match_ids))
+    else:
+        logger.warning(
+            "bronze.sofascore_schedule empty for league=%s season=%s — will "
+            "resolve finished match_ids via Camoufox capture (#757).",
+            league, season_short,
+        )
+
+    proxy_file = os.environ.get('PROXY_FILE', '/opt/airflow/proxys.txt')
+    if not os.path.exists(proxy_file):
+        logger.warning(
+            "Proxy file %s not found — SofaScore is likely to 403 without "
+            "residential proxy.", proxy_file,
+        )
+        proxy_file = None
+
+    results = {
+        'entity': ENTITY_MATCH_CAPTURE,
+        'tables': [],
+        'rows': 0,                  # player_ratings rows (primary)
+        'matches_with_ratings': 0,
+        'eps_rows': 0,
+        'eps_matches': 0,
+        'fallback': False,
+        'fallback_reason': None,
+        'errors': [],
+    }
+
+    try:
+        with SofaScoreScraper(
+            leagues=[league], seasons=[season], proxy_file=proxy_file,
+        ) as scraper:
+            if not match_ids:
+                match_ids = scraper.resolve_finished_match_ids_via_capture(
+                    league, int(season),
+                )
+                if not match_ids:
+                    logger.error(
+                        "%s: no match_ids from bronze OR capture for "
+                        "league=%s season=%s.",
+                        R0_2B_FALLBACK_MARKER, league, season_short,
+                    )
+                    results['fallback'] = True
+                    results['fallback_reason'] = 'no_match_ids'
+                    results['errors'].append(
+                        f'{R0_2B_FALLBACK_MARKER}: no_match_ids')
+                    _write_results(output_path, results)
+                    return 2
+                if limit:
+                    match_ids = match_ids[: int(limit)]
+                logger.info("Resolved %d finished match_ids via capture",
+                            len(match_ids))
+
+            frames = scraper.read_match_capture(
+                league=league, season=int(season),
+                match_ids=match_ids, limit=limit,
+            )
+            ratings_df = frames.get('player_ratings')
+            eps_df = frames.get('event_player_stats')
+            ratings_empty = ratings_df is None or ratings_df.empty
+            eps_empty = eps_df is None or eps_df.empty
+
+            if ratings_empty and eps_empty:
+                last_err = getattr(scraper, '_last_lineup_error', None)
+                reason = 'empty_payload'
+                if last_err:
+                    status = last_err.get('status')
+                    if status == 403:
+                        reason = 'http_403'
+                    elif status == 429:
+                        reason = 'http_429'
+                    elif status is None:
+                        reason = 'transport_error'
+                    else:
+                        reason = f'http_{status}'
+                logger.error(
+                    "%s: SofaScore match_capture unavailable — reason=%s detail=%s",
+                    R0_2B_FALLBACK_MARKER, reason, last_err,
+                )
+                results['fallback'] = True
+                results['fallback_reason'] = reason
+                results['errors'].append(f'{R0_2B_FALLBACK_MARKER}: {reason}')
+                _write_results(output_path, results)
+                return 2
+
+            min_ratio = None if force_replace else _MIN_REPLACE_RATIO
+
+            # player_ratings — full-state refresh (+ completeness guard), as the
+            # standalone ratings entity does.
+            if not ratings_empty:
+                rpath = scraper.save_to_iceberg(
+                    df=ratings_df,
+                    table_name='sofascore_player_ratings',
+                    partition_cols=['league', 'season'],
+                    replace_partitions=['league', 'season'],
+                    min_replace_ratio=min_ratio,
+                )
+                results['tables'].append(rpath)
+                results['rows'] = int(len(ratings_df))
+                results['matches_with_ratings'] = int(
+                    ratings_df['match_id'].nunique())
+                logger.info("Saved %d rating rows -> %s", results['rows'], rpath)
+
+            # event_player_stats — same full-state refresh from the SAME capture
+            # pass (#751: switched from APPEND skip-existing to replace_partitions
+            # since every finished match is re-captured each run → idempotent).
+            if not eps_empty:
+                epath = scraper.save_to_iceberg(
+                    df=eps_df,
+                    table_name='sofascore_event_player_stats',
+                    partition_cols=['league', 'season'],
+                    replace_partitions=['league', 'season'],
+                    min_replace_ratio=min_ratio,
+                )
+                results['tables'].append(epath)
+                results['eps_rows'] = int(len(eps_df))
+                results['eps_matches'] = int(eps_df['match_id'].nunique())
+                logger.info("Saved %d eps rows -> %s", results['eps_rows'], epath)
+
+    except ReplaceGuardError as e:
+        msg = f"{REPLACE_GUARD_MARKER}: {e}"
+        logger.error(msg)
+        results['errors'].append(msg)
+        _write_results(output_path, results)
+        return 3
+    except Exception as e:
+        logger.error("match_capture scrape failed hard: %s", e, exc_info=True)
         results['errors'].append(str(e))
         _write_results(output_path, results)
         return 1
@@ -1034,6 +1216,15 @@ def main():
         "Starting SofaScore scraper: entity=%s leagues=%s season=%s limit=%s",
         entity, leagues, args.season, args.limit,
     )
+
+    if entity == ENTITY_MATCH_CAPTURE:
+        return _run_match_capture(
+            leagues=leagues,
+            season=args.season,
+            limit=args.limit,
+            output_path=args.output,
+            force_replace=args.force_replace,
+        )
 
     if entity == ENTITY_PLAYER_RATINGS:
         return _run_player_ratings(
