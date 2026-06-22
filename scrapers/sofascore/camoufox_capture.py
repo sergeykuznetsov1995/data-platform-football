@@ -99,6 +99,56 @@ def select_event_endpoints(buffer: Dict[str, dict], event_id) -> Dict[str, dict]
     return out
 
 
+_EVENTS_PATH_RE = re.compile(r"/api/v1/.+/events/(?:last|next)/\d+$")
+
+
+def extract_events(buffer: Dict[str, dict]) -> list:
+    """Collect SofaScore event objects from any ``.../events/last|next/N``
+    responses in a capture ``buffer``, de-duplicated by event id. These feed
+    schedule + event-id resolution for player_ratings (replaces the dead
+    soccerdata schedule reader)."""
+    seen = {}
+    for path, rec in buffer.items():
+        if not _EVENTS_PATH_RE.search(path):
+            continue
+        if rec.get("status") != 200 or rec.get("challenge") is not False:
+            continue
+        obj = rec.get("json")
+        events = obj.get("events") if isinstance(obj, dict) else None
+        if not isinstance(events, list):
+            continue
+        for ev in events:
+            if isinstance(ev, dict) and ev.get("id") is not None:
+                seen[ev["id"]] = ev
+    return list(seen.values())
+
+
+def normalize_event(ev: dict) -> dict:
+    """Flatten a SofaScore event object to the schedule row shape we persist."""
+    status = (ev.get("status") or {}).get("type")
+    return {
+        "event_id": str(ev.get("id")),
+        "status": status,
+        "start_timestamp": ev.get("startTimestamp"),
+        "home_team": (ev.get("homeTeam") or {}).get("name"),
+        "away_team": (ev.get("awayTeam") or {}).get("name"),
+        "home_score": (ev.get("homeScore") or {}).get("current"),
+        "away_score": (ev.get("awayScore") or {}).get("current"),
+    }
+
+
+def finished_event_ids(events: list) -> list:
+    """Event ids (as str) for events whose status is ``finished`` — the matches
+    that have lineups/ratings worth scraping."""
+    return [
+        str(ev["id"])
+        for ev in events
+        if isinstance(ev, dict)
+        and ev.get("id") is not None
+        and (ev.get("status") or {}).get("type") == "finished"
+    ]
+
+
 def parse_proxy_line(line: str) -> Optional[dict]:
     """``host:port:user:pass`` → a Playwright/Camoufox proxy dict (creds split
     out — browsers reject creds embedded in the URL). Returns ``None`` for a

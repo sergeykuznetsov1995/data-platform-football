@@ -9,8 +9,11 @@ import pytest
 
 from scrapers.sofascore.camoufox_capture import (
     event_url,
+    extract_events,
+    finished_event_ids,
     is_challenge,
     is_data_api_url,
+    normalize_event,
     parse_proxy_line,
     response_path,
     select_event_endpoints,
@@ -135,3 +138,60 @@ def test_parse_proxy_line_password_with_colons():
 @pytest.mark.parametrize("line", ["", "   ", "# comment", "host:port:only-three"])
 def test_parse_proxy_line_rejects_bad_lines(line):
     assert parse_proxy_line(line) is None
+
+
+# --------------------------------------------------------------------------- #
+#  events parsing (schedule + event-id resolution)                           #
+# --------------------------------------------------------------------------- #
+def _events_buffer():
+    """A capture buffer with one events/last page (finished + scheduled) plus a
+    challenged page and an unrelated entry — mirrors a real capture."""
+    return {
+        "/api/v1/unique-tournament/17/season/76986/events/last/0": {
+            "status": 200, "challenge": False, "json": {"events": [
+                {"id": 1, "status": {"type": "finished"},
+                 "homeTeam": {"name": "A"}, "awayTeam": {"name": "B"},
+                 "homeScore": {"current": 2}, "awayScore": {"current": 1},
+                 "startTimestamp": 1719000000},
+                {"id": 2, "status": {"type": "notstarted"},
+                 "homeTeam": {"name": "C"}, "awayTeam": {"name": "D"}},
+            ]},
+        },
+        # duplicate id 1 from the next page — must dedupe
+        "/api/v1/unique-tournament/17/season/76986/events/next/0": {
+            "status": 200, "challenge": False, "json": {"events": [
+                {"id": 1, "status": {"type": "finished"}, "homeTeam": {"name": "A"}},
+                {"id": 3, "status": {"type": "inprogress"}},
+            ]},
+        },
+        # challenged events page — must be ignored
+        "/api/v1/unique-tournament/99/season/1/events/last/0": {
+            "status": 403, "challenge": True, "json": {"error": {"reason": "challenge"}},
+        },
+        # unrelated entry
+        "/api/v1/event/1/lineups": {"status": 200, "challenge": False, "json": {"home": {}}},
+    }
+
+
+def test_extract_events_dedupes_across_pages_and_skips_challenged():
+    events = extract_events(_events_buffer())
+    ids = sorted(e["id"] for e in events)
+    assert ids == [1, 2, 3]  # deduped, challenged page skipped
+
+
+def test_finished_event_ids_only_finished():
+    events = extract_events(_events_buffer())
+    assert finished_event_ids(events) == ["1"]
+
+
+def test_normalize_event_flattens_row():
+    ev = {
+        "id": 15186878, "status": {"type": "finished"},
+        "homeTeam": {"name": "USA"}, "awayTeam": {"name": "Australia"},
+        "homeScore": {"current": 0}, "awayScore": {"current": 2},
+        "startTimestamp": 1719000000,
+    }
+    assert normalize_event(ev) == {
+        "event_id": "15186878", "status": "finished", "start_timestamp": 1719000000,
+        "home_team": "USA", "away_team": "Australia", "home_score": 0, "away_score": 2,
+    }
