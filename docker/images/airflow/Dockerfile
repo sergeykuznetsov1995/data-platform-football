@@ -90,5 +90,11 @@ RUN pip install --no-cache-dir -r /tmp/requirements.txt
 COPY requirements-scraping.txt /tmp/requirements-scraping.txt
 RUN pip install --no-cache-dir -r /tmp/requirements-scraping.txt
 
+# ===== СТАДИЯ 4: Camoufox (anti-detect Firefox) binary for SofaScore (#757) =====
+# Downloads the patched Firefox (~700MB) into /home/airflow/.cache/camoufox so the
+# SofaScore Turnstile-bypass capture transport works at runtime (no per-task fetch).
+# Runs as the airflow user (current USER) — the cache must live in its $HOME.
+RUN python -m camoufox fetch
+
 # Set working directory
 WORKDIR /opt/airflow

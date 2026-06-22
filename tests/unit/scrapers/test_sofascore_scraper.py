@@ -690,3 +690,84 @@ class TestNoShadowedPlayerStats:
             SofaScoreScraper.read_player_season_stats
         ).parameters
         assert 'league' in params and 'season' in params
+
+
+class TestReadPlayerRatingsCapture:
+    """read_player_ratings sources /lineups from the Camoufox capture
+    transport (#757) — the tls_requests REST path is Turnstile-blocked.
+    We patch the ``_iter_lineup_payloads`` seam so no browser is needed;
+    the per-side flatten + (league, season) tagging is what we assert here.
+    """
+
+    def _scraper(self):
+        from scrapers.sofascore.scraper import SofaScoreScraper
+        with patch('scrapers.base.base_scraper.get_rate_limiter'), \
+             patch('scrapers.base.base_scraper.get_retry_policy'), \
+             patch('scrapers.base.base_scraper.get_circuit_breaker'), \
+             patch('scrapers.base.base_scraper.IcebergWriter'):
+            return SofaScoreScraper(leagues=['ENG-Premier League'], seasons=[2025])
+
+    def _lineups(self):
+        return {
+            'home': {'players': [
+                {'player': {'id': 11111}, 'position': 'G',
+                 'statistics': {'rating': '7.2'}},
+            ]},
+            'away': {'players': [
+                {'player': {'id': 22222}, 'position': 'F',
+                 'statistics': {'rating': '6.5'}},
+            ]},
+        }
+
+    @pytest.mark.unit
+    def test_builds_rows_from_captured_lineups(self):
+        # Arrange
+        scraper = self._scraper()
+        captured = []
+
+        def fake_iter(match_ids):
+            for mid in match_ids:
+                captured.append(str(mid))
+                yield str(mid), self._lineups()
+
+        scraper._iter_lineup_payloads = fake_iter
+
+        # Act
+        df = scraper.read_player_ratings(
+            league='ENG-Premier League', season=2025, match_ids=['M1', 'M2'],
+        )
+
+        # Assert — one capture per match in order, 2 matches × 2 players.
+        assert captured == ['M1', 'M2']
+        assert len(df) == 4
+        rows = {(r['match_id'], r['player_id']): r for r in df.to_dict('records')}
+        assert rows[('M1', '11111')]['team_side'] == 'home'
+        assert rows[('M1', '11111')]['rating'] == 7.2
+        assert rows[('M1', '11111')]['position'] == 'G'
+        assert rows[('M1', '22222')]['team_side'] == 'away'
+        assert rows[('M1', '22222')]['rating'] == 6.5
+        # 2025 -> soccerdata short slug '2526' (partition key alignment, #27).
+        assert set(df['season']) == {'2526'}
+        assert set(df['league']) == {'ENG-Premier League'}
+        assert set(df['_entity_type']) == {'player_ratings'}
+
+    @pytest.mark.unit
+    def test_graceful_empty_when_no_lineups_captured(self):
+        # Arrange — every capture misses (Turnstile not solved / proxy dead).
+        scraper = self._scraper()
+
+        def fake_iter(match_ids):
+            for mid in match_ids:
+                yield str(mid), None
+
+        scraper._iter_lineup_payloads = fake_iter
+
+        # Act
+        df = scraper.read_player_ratings(
+            league='ENG-Premier League', season=2025, match_ids=['M1'],
+        )
+
+        # Assert — empty frame but column contract preserved (E4.4 stub path).
+        assert df.empty
+        assert 'match_id' in df.columns
+        assert 'rating' in df.columns
