@@ -4,14 +4,16 @@
 table:
   fullyQualifiedName: trino_iceberg.iceberg.gold.dim_venue
   description: |
-    Канонический справочник стадионов (звёздный дизайн, #425), объединённый
-    из FBref и ESPN. Одна строка на venue_id — стабильный explicit-слаг
-    `venue_<...>` из curated-справочника configs/medallion/venue_aliases.yaml
-    (issue #145), а НЕ хеш имени. Разные написания одного стадиона
-    ("Brentford Community Stadium" / "Gtech Community Stadium") сливаются в
-    один venue_id; тёзки в разных городах не склеиваются. Стадионы без алиаса
-    попадают как venue_source='orphan' (fallback на хеш нормализованного
-    имени) и сигналятся DQ-WARNING для куратора.
+    Канонический справочник стадионов (звёздный дизайн, #425). Базовый список
+    venue объединён из FBref и ESPN; атрибуты обогащаются из FotMob
+    (silver.fotmob_team_profile): city/capacity/surface/opened (#750) и
+    координаты latitude/longitude (#719). Одна строка на venue_id — стабильный
+    explicit-слаг `venue_<...>` из curated-справочника
+    configs/medallion/venue_aliases.yaml (issue #145), а НЕ хеш имени. Разные
+    написания одного стадиона ("Brentford Community Stadium" / "Gtech Community
+    Stadium") сливаются в один venue_id; тёзки в разных городах не склеиваются.
+    Стадионы без алиаса попадают как venue_source='orphan' (fallback на хеш
+    нормализованного имени) и сигналятся DQ-WARNING для куратора.
   tags:
     - Tier.Gold
     - Domain.Football
@@ -22,11 +24,19 @@ columns:
   - name: venue_name
     description: Каноническое имя стадиона из venue_aliases.yaml (для orphan — наблюдаемое имя FBref>ESPN).
   - name: city
-    description: Город стадиона из venue_aliases.yaml (NULL для orphan).
+    description: Город стадиона. COALESCE(curated, FotMob) — curated venue_aliases.yaml приоритетнее, FotMob (silver.fotmob_team_profile) заполняет NULL у non-curated/orphan venue (issue #750).
   - name: country
-    description: Страна стадиона из venue_aliases.yaml (NULL для orphan).
+    description: Страна стадиона из venue_aliases.yaml (NULL для orphan — FotMob несёт country команды, а не venue).
   - name: capacity
-    description: Вместимость стадиона. Пока NULL-заглушка — источника нет (ESPN capacity 100% NULL); обогащение — отдельная задача.
+    description: Вместимость стадиона. COALESCE(FotMob, curated) — primary источник FotMob (silver.fotmob_team_profile, auto+global, заменил основную массу ручного #434), curated fallback в venue_aliases.yaml для переехавших арен (Goodison Park / White Hart Lane / Wembley), которые FotMob отдать не может. Покрытие APL 37/37; NULL только если нет ни там, ни там (issue #750).
+  - name: surface
+    description: Покрытие поля (трава/синтетика) из FotMob venue.statPairs (issue #750). NULL, если у FotMob нет совпадающего venue.
+  - name: opened
+    description: Год открытия стадиона из FotMob venue.statPairs (issue #750). NULL, если у FotMob нет совпадающего venue.
+  - name: latitude
+    description: Широта стадиона из FotMob widget.location, matched по нормализованному имени; для flight-distance фич (issue #719). NULL без FotMob-match.
+  - name: longitude
+    description: Долгота стадиона из FotMob widget.location, matched по нормализованному имени; для flight-distance фич (issue #719). NULL без FotMob-match.
   - name: venue_source
     description: Происхождение идентичности ('curated' — матч по алиасу | 'orphan' — алиас не найден); используется DQ-чеком orphan-rate.
   - name: _silver_created_at
