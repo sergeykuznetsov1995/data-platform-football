@@ -330,26 +330,49 @@ class SofascoreCamoufoxCapture:
         """
         self._buffer = {}
         self._navigate(nav_url)
+        # Scroll to trigger lazy widgets, then nudge toward finished matches.
+        try:
+            self._page.mouse.wheel(0, 4000)
+            self._page.wait_for_timeout(self._tab_wait_ms)
+        except Exception:
+            pass
         self._nudge_results()
+        # Let late nudge-triggered XHR (and their body reads) settle into the
+        # buffer before we snapshot it — without this the by-date events race.
+        self._page.wait_for_timeout(self._settle_ms)
         return dict(self._buffer)
 
     def _nudge_results(self) -> None:
-        """Best-effort clicks so the SPA fetches finished matches (results / past
-        rounds) instead of only the default upcoming round (#757 B1)."""
-        for label in ("Matches", "Results"):
+        """Surface FINISHED matches: open the 'Matches' top-nav, then switch to
+        the BY DATE view (centres on recent/finished matches for an in-progress
+        season, firing /events/last|next + round XHR).
+
+        The Matches section is collapsed by default (Standings is the landing
+        view), so its toggles (``data-testid=tab-date/tab-round``) render
+        ``display:none`` and a Playwright ``.click()`` times out as non-actionable.
+        A JS ``.click()`` bypasses actionability and follows the SPA's own
+        handlers — live-proven on the EPL page (#757 B1: 10→30 captured events).
+        Best-effort: a miss just leaves the default round.
+        """
+        # tab-date/tab-round are embedded on the landing page's matches widget
+        # (display:none until activated). Click each DIRECTLY by its stable
+        # data-testid — clicking the 'Matches' top-nav first re-mounts the
+        # section and the toggles vanish before the next click lands. Render
+        # timing varies by proxy exit, so wait for each toggle to mount first.
+        for tid in ("tab-date", "tab-round"):
+            sel = '[data-testid="' + tid + '"]'
             try:
-                self._page.get_by_text(label, exact=False).first.click(timeout=3000)
+                self._page.wait_for_function(
+                    "() => !!document.querySelector('" + sel + "')", timeout=8000,
+                )
+                hit = self._page.evaluate(
+                    "() => { const e = document.querySelector('" + sel + "');"
+                    " if (e) { e.click(); return true; } return false; }"
+                )
+                logger.info("sofascore nudge %s -> %s", tid, hit)
                 self._page.wait_for_timeout(self._tab_wait_ms)
-            except Exception:
-                pass
-        # Previous-round arrows have no text — target by aria-label / testid.
-        for sel in ('button[aria-label*="previous" i]', '[data-testid*="prev"]'):
-            for _ in range(3):
-                try:
-                    self._page.locator(sel).first.click(timeout=2000)
-                    self._page.wait_for_timeout(self._tab_wait_ms)
-                except Exception:
-                    break
+            except Exception as e:  # noqa: BLE001 — nudge is best-effort
+                logger.info("sofascore nudge %s: not mounted (%s)", tid, e)
 
     # -- internals -------------------------------------------------------- #
     def _navigate(self, url: str, extra_settle_ms: int = 0) -> None:

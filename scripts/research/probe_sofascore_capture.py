@@ -169,37 +169,67 @@ def _sample_events(events, src) -> None:
 def _nudge_tournament(page, wait_ms: int = 2500) -> None:
     """Click likely controls so the SPA fetches FINISHED matches (results / past
     rounds) instead of only the default upcoming round (#757 B0 interaction)."""
-    # First: dump the visible tab/link/button labels so we know the real controls.
+    # First: hunt the REAL controls (SofaScore hangs data-testid on everything).
     try:
-        labels = page.evaluate(
-            """() => Array.from(document.querySelectorAll(
-                'a,button,[role=tab],[role=button]'))
-                .map(e => (e.innerText||e.getAttribute('aria-label')||'').trim())
-                .filter(t => t && t.length < 30)
-                .slice(0, 60)"""
+        info = page.evaluate(
+            """() => {
+                const out = {round: [], tabs: [], links: []};
+                const seen = new Set();
+                for (const e of document.querySelectorAll('button,[role=button],[role=tab],a,[data-testid]')) {
+                    const tx = (e.innerText||'').trim().slice(0,24);
+                    const al = (e.getAttribute('aria-label')||'').slice(0,32);
+                    const ti = (e.getAttribute('data-testid')||'');
+                    const blob = (tx+' '+al+' '+ti);
+                    if (/round|prev|next|result|fixture|arrow|chevron/i.test(blob)) {
+                        const k = 'r:'+tx+al+ti;
+                        if (!seen.has(k)) { seen.add(k); out.round.push({tx, al, ti}); }
+                    }
+                    if (['Matches','Results','Fixtures','Standings','Overview'].includes(tx)) {
+                        const k = 't:'+tx; if (!seen.has(k)) { seen.add(k); out.tabs.push({tx, ti}); }
+                    }
+                }
+                for (const a of document.querySelectorAll('a[href]')) {
+                    const h = a.getAttribute('href')||'';
+                    if (/\\/(matches|results|fixtures)/i.test(h) && !seen.has('h:'+h)) {
+                        seen.add('h:'+h); out.links.push(h.slice(0,80));
+                    }
+                }
+                const tids = [];
+                const ts = new Set();
+                for (const e of document.querySelectorAll('[data-testid]')) {
+                    const t = e.getAttribute('data-testid');
+                    if (t && !ts.has(t)) { ts.add(t); tids.push(t); }
+                }
+                return {round: out.round.slice(0,25), tabs: out.tabs,
+                        links: out.links.slice(0,15), testids: tids.slice(0,120)};
+            }"""
         )
-        log.info("visible controls (first 60): %s", labels)
+        log.info("DOM round/results controls: %s", info.get("round"))
+        log.info("DOM tab elements: %s", info.get("tabs"))
+        log.info("DOM matches/results links: %s", info.get("links"))
+        log.info("DOM all data-testids: %s", info.get("testids"))
     except Exception as e:
         log.info("control dump failed: %s", e)
-    for label in ("Matches", "Results", "Standings", "Matches"):
+    # The Matches section is collapsed by default (Standings shown) so its view
+    # toggles (tab-date/tab-round) render display:none → Playwright .click()
+    # times out. JS .click() bypasses actionability and follows the SPA's own
+    # handlers. Open the 'Matches' top-nav, then switch to the BY DATE view
+    # (surfaces recent/finished matches for an in-progress season). (#757 B1)
+    # Click tab-date/tab-round DIRECTLY by data-testid (clicking the 'Matches'
+    # top-nav re-mounts the section and the toggles vanish before the next
+    # click). Wait for each to mount — render timing varies by proxy exit.
+    for tid in ("tab-date", "tab-round"):
+        sel = '[data-testid="' + tid + '"]'
         try:
-            page.get_by_text(label, exact=False).first.click(timeout=3000)
+            page.wait_for_function(
+                "() => !!document.querySelector('" + sel + "')", timeout=8000)
+            hit = page.evaluate(
+                "() => { const e=document.querySelector('" + sel + "');"
+                " if(e){e.click();return true;} return false; }")
+            log.info("nudge %s -> %s", tid, hit)
             page.wait_for_timeout(wait_ms)
-            log.info("clicked tournament control: %s", label)
-        except Exception:
-            pass
-    # Try previous-round arrows (no text — target by aria-label / chevron / testid).
-    for sel in ('button[aria-label*="previous" i]',
-                'button[aria-label*="Previous round" i]',
-                '[data-testid*="prev"]',
-                'button:has-text("‹")'):
-        for _ in range(3):
-            try:
-                page.locator(sel).first.click(timeout=2000)
-                page.wait_for_timeout(wait_ms)
-                log.info("clicked prev-round via %s", sel)
-            except Exception:
-                break
+        except Exception as e:
+            log.info("nudge %s: not mounted (%s)", tid, e)
 
 
 def _probe_tournament(page, ut_id: int, captures: Dict[str, dict], settle_ms: int,
@@ -219,7 +249,7 @@ def _probe_tournament(page, ut_id: int, captures: Dict[str, dict], settle_ms: in
         page.wait_for_timeout(3000)
     except Exception:
         pass
-    # Interact: surface FINISHED matches (results / previous rounds).
+    # Interact: surface FINISHED matches (Matches nav -> by-date/by-round view).
     _nudge_tournament(page)
 
     log.info("-" * 70)
