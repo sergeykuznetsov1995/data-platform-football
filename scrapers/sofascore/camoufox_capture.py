@@ -238,14 +238,42 @@ class SofascoreCamoufoxCapture:
             pass
         self._buffer[response_path(url)] = rec
 
-    def capture_event(self, event_id) -> Dict[str, dict]:
+    def capture_event(
+        self,
+        event_id,
+        required=("lineups",),
+        max_attempts: int = 3,
+    ) -> Dict[str, dict]:
         """Navigate the match page, nudge the deep tabs, and return the captured
-        per-event endpoints (only those that came back as real JSON)."""
-        self._buffer = {}
-        self._navigate(event_url(event_id))
-        self._click_tabs()
-        self._page.wait_for_timeout(self._tab_wait_ms)
-        result = select_event_endpoints(self._buffer, event_id)
+        per-event endpoints (only those that came back as real JSON).
+
+        Capture is timing-flaky: a deep-tab XHR (or its body-read) can race and
+        drop an endpoint — the live runner saw ~1/2 lineup misses on a single
+        pass (#757). When any ``required`` endpoint is missing we re-navigate
+        (up to ``max_attempts``), widening the settle window each retry so a
+        slow page still fires the XHR. ``required=()`` takes one pass.
+        """
+        result: Dict[str, dict] = {}
+        required = tuple(required or ())
+        for attempt in range(1, max_attempts + 1):
+            self._buffer = {}
+            # Widen the settle window on retries — a slow page can drop the
+            # tab XHR on the first, tighter pass.
+            self._navigate(event_url(event_id), extra_settle_ms=(attempt - 1) * 2000)
+            self._click_tabs()
+            self._page.wait_for_timeout(self._tab_wait_ms)
+            result = select_event_endpoints(self._buffer, event_id)
+
+            missing_required = [r for r in required if r not in result]
+            if not missing_required:
+                break
+            if attempt < max_attempts:
+                logger.info(
+                    "sofascore capture event=%s attempt %d/%d missing "
+                    "required=%s — retrying",
+                    event_id, attempt, max_attempts, missing_required,
+                )
+
         missing = [k for k in _EVENT_ENDPOINTS if k not in result]
         logger.info("sofascore capture event=%s got=%s missing=%s",
                     event_id, sorted(result), missing)
@@ -259,10 +287,10 @@ class SofascoreCamoufoxCapture:
         return dict(self._buffer)
 
     # -- internals -------------------------------------------------------- #
-    def _navigate(self, url: str) -> None:
+    def _navigate(self, url: str, extra_settle_ms: int = 0) -> None:
         self._page.goto(url, wait_until="domcontentloaded", timeout=self._nav_timeout_ms)
         self._dismiss_consent()
-        self._page.wait_for_timeout(self._settle_ms)
+        self._page.wait_for_timeout(self._settle_ms + extra_settle_ms)
 
     def _dismiss_consent(self) -> None:
         for name in _CONSENT_BUTTONS:

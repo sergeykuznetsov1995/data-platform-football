@@ -195,3 +195,91 @@ def test_normalize_event_flattens_row():
         "event_id": "15186878", "status": "finished", "start_timestamp": 1719000000,
         "home_team": "USA", "away_team": "Australia", "home_score": 0, "away_score": 2,
     }
+
+
+# --------------------------------------------------------------------------- #
+#  capture_event retry (lineups reliability — #757)                           #
+# --------------------------------------------------------------------------- #
+class TestCaptureEventRetry:
+    """capture_event re-navigates when a required endpoint (default lineups)
+    is missing — the live runner saw ~1/2 lineup misses without retry (a tab
+    XHR or its body-read races). We patch _navigate/_click_tabs so no browser
+    is needed and drive the buffer state per attempt.
+    """
+
+    def _cap(self):
+        from unittest.mock import MagicMock
+        from scrapers.sofascore.camoufox_capture import SofascoreCamoufoxCapture
+        cap = SofascoreCamoufoxCapture(proxy=None)
+        cap._page = MagicMock()  # only wait_for_timeout is touched
+        return cap
+
+    def test_retries_until_lineups_present(self):
+        # Arrange — attempt 1 captures only the event; attempt 2 adds lineups.
+        cap = self._cap()
+        eid = 555
+        states = [
+            {f"/api/v1/event/{eid}": {"status": 200, "json": {"event": 1}, "challenge": False}},
+            {f"/api/v1/event/{eid}": {"status": 200, "json": {"event": 1}, "challenge": False},
+             f"/api/v1/event/{eid}/lineups": {"status": 200, "json": {"home": {}, "away": {}}, "challenge": False}},
+        ]
+        calls = {"n": 0}
+
+        def fake_navigate(url, extra_settle_ms=0):
+            cap._buffer = states[calls["n"]]
+            calls["n"] += 1
+
+        cap._navigate = fake_navigate
+        cap._click_tabs = lambda: None
+
+        # Act
+        result = cap.capture_event(eid, required=("lineups",), max_attempts=3)
+
+        # Assert — retried exactly once, lineups recovered.
+        assert calls["n"] == 2
+        assert "lineups" in result
+        assert "event" in result
+
+    def test_stops_after_max_attempts_when_lineups_never_arrive(self):
+        # Arrange — lineups never show up; event always does.
+        cap = self._cap()
+        eid = 777
+        calls = {"n": 0}
+
+        def fake_navigate(url, extra_settle_ms=0):
+            cap._buffer = {
+                f"/api/v1/event/{eid}": {"status": 200, "json": {"e": 1}, "challenge": False},
+            }
+            calls["n"] += 1
+
+        cap._navigate = fake_navigate
+        cap._click_tabs = lambda: None
+
+        # Act
+        result = cap.capture_event(eid, required=("lineups",), max_attempts=3)
+
+        # Assert — exhausted attempts, returns whatever was captured (no raise).
+        assert calls["n"] == 3
+        assert "lineups" not in result
+        assert "event" in result
+
+    def test_no_retry_when_required_empty(self):
+        # Arrange — required=() means "take one pass, don't retry".
+        cap = self._cap()
+        eid = 999
+        calls = {"n": 0}
+
+        def fake_navigate(url, extra_settle_ms=0):
+            cap._buffer = {
+                f"/api/v1/event/{eid}": {"status": 200, "json": {"e": 1}, "challenge": False},
+            }
+            calls["n"] += 1
+
+        cap._navigate = fake_navigate
+        cap._click_tabs = lambda: None
+
+        # Act
+        cap.capture_event(eid, required=(), max_attempts=3)
+
+        # Assert — single navigation, no retry loop.
+        assert calls["n"] == 1
