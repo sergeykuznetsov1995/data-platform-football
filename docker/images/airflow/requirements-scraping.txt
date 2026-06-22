@@ -1,13 +1,21 @@
 # =============================================================================
 # Web Scraping Dependencies (installed separately to avoid pip backtracking)
 # =============================================================================
+#
+# ⚠️  PINNING POLICY (#758)
+# Все версии ниже ЗАПИННЕНЫ (==). nodriver/curl_cffi/DrissionPage/camoufox — ядро
+# CF-байпаса; молчаливый bump при `make up-build` уже ломал нас (см.
+# memory/feedback_nodriver_048_parser_regressions.md).
+# BUMP ТОЛЬКО ОСОЗНАННО: после изменения версии — ОБЯЗАТЕЛЬНО live-прогон
+# FBref + WhoScored в контейнере (CF-байпас) до мержа. Хост держать в синхроне.
+# =============================================================================
 
 # -----------------------------------------------------------------------------
 # [rich] Rich library upgrade (required by soccerdata>=1.8.8)
 # Base Airflow image has rich 13.x, but soccerdata requires >=14.0.0
 # Must be installed FIRST to upgrade rich before soccerdata installation
 # -----------------------------------------------------------------------------
-rich>=14.0.0
+rich==14.3.4
 
 # -----------------------------------------------------------------------------
 # [soccerdata] Football data scraping library
@@ -24,16 +32,20 @@ soccerdata==1.8.8
 
 # -----------------------------------------------------------------------------
 # [selenium] Selenium tools (for Cloudflare bypass)
-# Don't pin selenium - let soccerdata/seleniumbase dictate version
+# selenium приходит транзитивно через seleniumbase (soccerdata>=1.8.8 → seleniumbase),
+# но seleniumbase сам не запиннен → selenium может "уплыть". Пиним обе строки явно,
+# чтобы полностью зафиксировать ветку. seleniumbase==4.38.3 сам требует selenium==4.32.0.
 # -----------------------------------------------------------------------------
-undetected-chromedriver>=3.5.0
-cloudscraper>=1.2.71
+selenium==4.32.0
+seleniumbase==4.38.3
+undetected-chromedriver==3.5.5
+cloudscraper==1.2.71
 
 # -----------------------------------------------------------------------------
 # [curl_cffi] Chrome TLS fingerprint impersonation (patches soccerdata)
 # Used for bypassing Cloudflare by impersonating real browser TLS fingerprint
 # -----------------------------------------------------------------------------
-curl_cffi>=0.7.0
+curl_cffi==0.15.0
 
 # Pin markdown-it-py to reduce backtracking with rich>=14
 markdown-it-py==3.0.0
@@ -42,18 +54,18 @@ mdit-py-plugins==0.4.2
 # -----------------------------------------------------------------------------
 # [display] Xvfb wrapper for Cloudflare bypass
 # -----------------------------------------------------------------------------
-pyvirtualdisplay>=3.0
+pyvirtualdisplay==3.0
 
 # -----------------------------------------------------------------------------
 # [proxy] SOCKS proxy support
 # -----------------------------------------------------------------------------
-PySocks>=1.7.1
+PySocks==1.7.1
 
 # -----------------------------------------------------------------------------
 # [nodriver] Advanced Cloudflare bypass (successor to undetected-chromedriver)
 # Uses async API and better fingerprint evasion
 # -----------------------------------------------------------------------------
-nodriver>=0.32
+nodriver==0.50.3
 
 # -----------------------------------------------------------------------------
 # [nodriver-cf-verify] Cloudflare Turnstile automatic bypass plugin for nodriver
@@ -66,14 +78,14 @@ nodriver>=0.32
 # [opencv] OpenCV for native nodriver tab.cf_verify() method
 # Enables image-based Turnstile checkbox detection as fallback
 # -----------------------------------------------------------------------------
-opencv-python-headless>=4.8.0
+opencv-python-headless==4.13.0.92
 
 # -----------------------------------------------------------------------------
 # [DrissionPage] CDP-based browser automation WITHOUT WebDriver protocol
 # Key advantage: No WebDriver signature that Cloudflare detects
 # Used as primary bypass before falling back to nodriver
 # -----------------------------------------------------------------------------
-DrissionPage>=4.1.0
+DrissionPage==4.1.1.4
 
 # -----------------------------------------------------------------------------
 # [camoufox] Anti-detect Firefox for SofaScore Cloudflare-Turnstile bypass (#757)
@@ -84,5 +96,5 @@ DrissionPage>=4.1.0
 # The Firefox binary is fetched at image-build time via `python -m camoufox fetch`
 # (see Dockerfile). Runs under Xvfb (headless="virtual"), already provisioned.
 # -----------------------------------------------------------------------------
-camoufox[geoip]>=0.4.11
-playwright>=1.59,<1.60
+camoufox[geoip]==0.4.11
+playwright==1.59.0
