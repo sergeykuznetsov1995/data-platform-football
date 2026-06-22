@@ -1180,10 +1180,11 @@ class TestResolveMatchIdsViaCapture:
 
 
 class TestReadPlayerCapture:
-    """read_player_capture (#751 PR3): ONE Camoufox nav per player → the
-    player_profile frame (bio from __NEXT_DATA__). We patch the
-    ``_iter_player_captures`` seam (no browser) and assert profile flattening +
-    (league, season) tagging. (Season-aggregate stats are deferred to PR3b.)"""
+    """read_player_capture (#751 PR3 + PR3b): ONE Camoufox nav per player → the
+    player_profile frame (bio from __NEXT_DATA__) AND the player_season_stats
+    frame (Season-tab picker capture). We patch the ``_iter_player_captures``
+    seam (no browser) and assert flattening + (league, season) tagging + the
+    season-guarded selection of the EPL overall out of the capture buffer."""
 
     def _scraper(self):
         from scrapers.sofascore.scraper import SofaScoreScraper
@@ -1193,19 +1194,39 @@ class TestReadPlayerCapture:
              patch('scrapers.base.base_scraper.IcebergWriter'):
             return SofaScoreScraper(leagues=['ENG-Premier League'], seasons=[2025])
 
-    def _capture(self, pid):
-        return {'profile': {
-            'id': int(pid), 'name': f'Player {pid}', 'slug': f'p-{pid}',
-            'position': 'F', 'height': 185, 'preferredFoot': 'Right',
-            'dateOfBirthTimestamp': 1180483200,
-            'team': {'id': 30, 'name': 'Brighton'}}}
+    def _season_buffer(self, pid):
+        """A Season-tab capture: /statistics/seasons map + the EPL (ut=17,
+        season 76986 = '25/26') overall. Mirrors a non-transferred APL player."""
+        return {
+            f'/api/v1/player/{pid}/statistics/seasons': {
+                'status': 200, 'challenge': False, 'json': {
+                    'uniqueTournamentSeasons': [
+                        {'uniqueTournament': {'id': 17, 'name': 'Premier League'},
+                         'seasons': [{'year': '25/26', 'id': 76986}]}]}},
+            f'/api/v1/player/{pid}/unique-tournament/17/season/76986/statistics/overall': {
+                'status': 200, 'challenge': False, 'json': {
+                    'team': {'id': 30, 'name': 'Brighton'},
+                    'statistics': {'rating': 7.0, 'totalGoals': 3}}},
+        }
+
+    def _capture(self, pid, with_season=True):
+        return {
+            'profile': {
+                'id': int(pid), 'name': f'Player {pid}', 'slug': f'p-{pid}',
+                'position': 'F', 'height': 185, 'preferredFoot': 'Right',
+                'dateOfBirthTimestamp': 1180483200,
+                'team': {'id': 30, 'name': 'Brighton'}},
+            'season_buffer': self._season_buffer(pid) if with_season else {},
+        }
 
     @pytest.mark.unit
-    def test_one_pass_yields_profile_frame(self):
+    def test_one_pass_yields_profile_and_season_frames(self):
         scraper = self._scraper()
         seen = []
+        picker_labels = []
 
-        def fake_iter(player_ids):
+        def fake_iter(player_ids, season_picker_label=None):
+            picker_labels.append(season_picker_label)
             for pid in player_ids:
                 seen.append(str(pid))
                 yield str(pid), self._capture(pid)
@@ -1215,6 +1236,9 @@ class TestReadPlayerCapture:
             league='ENG-Premier League', season=2025, player_ids=['101', '102'])
 
         assert seen == ['101', '102']   # ONE capture per player ("one nav")
+        # The EPL tournament display name is forwarded to drive the picker.
+        assert picker_labels == ['Premier League']
+
         prof = out['player_profile']
         assert len(prof) == 2
         assert set(prof['season']) == {'2526'}
@@ -1223,16 +1247,46 @@ class TestReadPlayerCapture:
         assert prow['height_cm'] == 185 and prow['preferred_foot'] == 'Right'
         assert prow['current_team_name'] == 'Brighton'
 
+        # Season-aggregate frame: the season-guarded EPL overall, flattened.
+        seas = out['player_season_stats']
+        assert len(seas) == 2
+        assert set(seas['season']) == {'2526'}
+        assert set(seas['_entity_type']) == {'player_season_stats'}
+        srow = {r['player_id']: r for r in seas.to_dict('records')}['101']
+        assert srow['unique_tournament_id'] == 17
+        assert srow['sofascore_season_id'] == 76986
+        assert srow['team_name'] == 'Brighton'
+        assert srow['rating'] == 7.0
+        assert srow['total_goals'] == 3
+
+    @pytest.mark.unit
+    def test_season_stats_empty_when_picker_missed(self):
+        # Profile still lands, but the picker never surfaced the EPL overall
+        # (transferred player) → player_season_stats is empty, not a crash.
+        scraper = self._scraper()
+
+        def fake_iter(player_ids, season_picker_label=None):
+            for pid in player_ids:
+                yield str(pid), self._capture(pid, with_season=False)
+
+        scraper._iter_player_captures = fake_iter
+        out = scraper.read_player_capture(
+            league='ENG-Premier League', season=2025, player_ids=['101'])
+        assert len(out['player_profile']) == 1
+        assert out['player_season_stats'].empty
+        assert 'player_id' in out['player_season_stats'].columns
+
     @pytest.mark.unit
     def test_graceful_empty_when_nothing_captured(self):
         scraper = self._scraper()
 
-        def fake_iter(player_ids):
+        def fake_iter(player_ids, season_picker_label=None):
             for pid in player_ids:
-                yield str(pid), {'profile': None}
+                yield str(pid), {'profile': None, 'season_buffer': {}}
 
         scraper._iter_player_captures = fake_iter
         out = scraper.read_player_capture(
             league='ENG-Premier League', season=2025, player_ids=['101'])
         assert out['player_profile'].empty
         assert 'player_id' in out['player_profile'].columns
+        assert out['player_season_stats'].empty

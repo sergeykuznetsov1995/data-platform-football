@@ -95,6 +95,7 @@ class TestWeeklyPlayerDag:
         checks = captured['checks']
         assert {c.params['table'] for c in checks} == {
             'bronze.sofascore_player_profile',
+            'bronze.sofascore_player_season_stats',
         }
         assert all(c.kind == 'freshness' for c in checks)
         assert all(c.severity == 'WARNING' for c in checks)
@@ -140,3 +141,28 @@ class TestValidateData:
             'tables': [], 'errors': ['R0_2B_FALLBACK: http_403']})
         with pytest.raises(Exception):
             dag_module.validate_data()
+
+    def test_low_season_stats_warns_but_succeeds(
+        self, dag_module, monkeypatch, tmp_path,
+    ):
+        # Full profile coverage, but the Season-tab picker captured few overall
+        # rows (#751 PR3b) → WARN-only, the run still succeeds.
+        self._write(dag_module, monkeypatch, tmp_path, {
+            'rows': 520, 'profile_players': 520,
+            'season_stats_rows': 12, 'season_stats_players': 12,
+            'fallback': False, 'tables': ['t'], 'errors': []})
+        out = dag_module.validate_data()
+        assert out['status'] == 'success'
+        assert out['summary']['player_season_stats_rows'] == 12
+        assert any('player_season_stats' in w for w in out['warnings'])
+
+    def test_full_season_stats_no_warning(
+        self, dag_module, monkeypatch, tmp_path,
+    ):
+        self._write(dag_module, monkeypatch, tmp_path, {
+            'rows': 520, 'profile_players': 520,
+            'season_stats_rows': 500, 'season_stats_players': 500,
+            'fallback': False, 'tables': ['t'], 'errors': []})
+        out = dag_module.validate_data()
+        assert out['status'] == 'success'
+        assert not any('player_season_stats' in w for w in out['warnings'])

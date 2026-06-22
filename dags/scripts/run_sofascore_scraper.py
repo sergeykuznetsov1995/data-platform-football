@@ -90,9 +90,9 @@ ENTITY_PLAYER_PROFILE = 'player_profile'
 # #751 PR1 — consolidated per-match capture: ONE Camoufox nav/match feeds BOTH
 # player_ratings and event_player_stats from the same /lineups (+/event) payload.
 ENTITY_MATCH_CAPTURE = 'match_capture'
-# #751 PR3 — per-player capture: ONE Camoufox nav/player writes player_profile
-# (bio SSR'd in __NEXT_DATA__). Replaces the dead tls player_profile pass.
-# (player_season_stats via the Season-tab picker is deferred to PR3b.)
+# #751 PR3 + PR3b — per-player capture: ONE Camoufox nav/player writes BOTH
+# player_profile (bio SSR'd in __NEXT_DATA__) and player_season_stats (Season-tab
+# picker capture). Replaces the dead tls player_profile/player_season_stats pass.
 ENTITY_PLAYER_CAPTURE = 'player_capture'
 
 VALID_ENTITIES = {
@@ -634,17 +634,20 @@ def _run_player_capture(
     output_path: str,
     force_replace: bool = False,
 ) -> int:
-    """#751 PR3 — per-player capture entrypoint (biographical profile).
+    """#751 PR3 + PR3b — per-player capture entrypoint (profile + season stats).
 
-    ONE Camoufox navigation per player writes ``sofascore_player_profile`` from
-    the bio SSR'd in ``__NEXT_DATA__`` — replacing the dead Turnstile-blocked tls
-    pass. Full-state (``replace_partitions=['league', 'season']`` + completeness
+    ONE Camoufox navigation per player writes ``sofascore_player_profile`` (bio
+    SSR'd in ``__NEXT_DATA__``) AND ``sofascore_player_season_stats`` (the target
+    competition's season-aggregate stats, captured by driving the Season tab +
+    season-picker) — replacing the dead Turnstile-blocked tls passes. Both are
+    full-state (``replace_partitions=['league', 'season']`` + completeness
     guard): every run re-captures the player universe and rewrites the partition.
 
-    Season-aggregate stats are deferred to PR3b (they need the Season tab + a
-    season-picker for transferred/multi-competition players).
+    Season-stats is secondary: it can be a strict subset of profile (the picker
+    misses for some transferred players), so its save is skipped (not a fallback)
+    when empty — profile still succeeds. The DAG row-floor WARNs on low coverage.
 
-    Exit codes: 0 ok / 2 R0.2B_FALLBACK (nothing captured) / 3 ReplaceGuard /
+    Exit codes: 0 ok / 2 R0.2B_FALLBACK (no profile captured) / 3 ReplaceGuard /
     1 hard failure.
     """
     from scrapers.base.base_scraper import ReplaceGuardError
@@ -676,6 +679,8 @@ def _run_player_capture(
         'tables': [],
         'rows': 0,                  # player_profile rows
         'profile_players': 0,
+        'season_stats_rows': 0,     # player_season_stats rows (#751 PR3b)
+        'season_stats_players': 0,
         'fallback': False,
         'fallback_reason': None,
         'errors': [],
@@ -729,6 +734,31 @@ def _run_player_capture(
             results['profile_players'] = int(profile_df['player_id'].nunique())
             logger.info("Saved %d player_profile rows -> %s",
                         results['rows'], ppath)
+
+            # player_season_stats — secondary (#751 PR3b, Season-tab picker). A
+            # strict subset of profile (the picker can miss for transferred /
+            # multi-competition players) → a WARN floor in the DAG, not a hard
+            # fail. Skip the save entirely when empty so an off day doesn't wipe
+            # a good partition (don't fall back — profile already succeeded).
+            season_df = frames.get('player_season_stats')
+            if season_df is not None and not season_df.empty:
+                spath = scraper.save_to_iceberg(
+                    df=season_df,
+                    table_name='sofascore_player_season_stats',
+                    partition_cols=['league', 'season'],
+                    replace_partitions=['league', 'season'],
+                    min_replace_ratio=min_ratio,
+                )
+                results['tables'].append(spath)
+                results['season_stats_rows'] = int(len(season_df))
+                results['season_stats_players'] = int(
+                    season_df['player_id'].nunique())
+                logger.info("Saved %d player_season_stats rows -> %s",
+                            results['season_stats_rows'], spath)
+            else:
+                logger.warning(
+                    "player_season_stats empty (Season-tab picker captured no "
+                    "%s overall) — skipping save; profile still written.", league)
 
     except ReplaceGuardError as e:
         msg = f"{REPLACE_GUARD_MARKER}: {e}"

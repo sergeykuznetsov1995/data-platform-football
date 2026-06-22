@@ -651,16 +651,19 @@ class SofaScoreScraper(SoccerdataScraper):
             if callable(close):
                 close()  # tear down the Camoufox session
 
-    def _iter_player_captures(self, player_ids: List[str]):
+    def _iter_player_captures(self, player_ids: List[str], season_picker_label=None):
         """Yield ``(player_id, capture)`` by navigating each player page through
-        ONE warmed Camoufox session (#751 PR3). ``capture`` is the
-        ``{'profile'}`` dict from
+        ONE warmed Camoufox session (#751 PR3 + PR3b). ``capture`` is the
+        ``{'profile', 'season_buffer'}`` dict from
         :meth:`SofascoreCamoufoxCapture.capture_player` — the bio SSR'd in
-        ``__NEXT_DATA__``. Mirrors :meth:`_iter_match_captures`. A
-        ``{'profile': None}`` means the capture missed (page didn't render /
-        proxy dead). The generator owns the browser session — the caller MUST
-        ``.close()`` it (try/finally) so it tears down even on an early
-        circuit-breaker break."""
+        ``__NEXT_DATA__`` plus the Season-tab season-stats capture. When
+        ``season_picker_label`` is given (the target tournament's display name,
+        e.g. ``'Premier League'``) the capture also drives the Season tab +
+        picker to fetch season-aggregate stats in the SAME navigation. Mirrors
+        :meth:`_iter_match_captures`. A ``{'profile': None}`` means the capture
+        missed (page didn't render / proxy dead). The generator owns the browser
+        session — the caller MUST ``.close()`` it (try/finally) so it tears down
+        even on an early circuit-breaker break."""
         from scrapers.sofascore.camoufox_capture import SofascoreCamoufoxCapture
 
         proxy = self._camoufox_proxy()
@@ -669,10 +672,11 @@ class SofaScoreScraper(SoccerdataScraper):
                 self._rate_limiter.acquire()
                 self._stats['requests'] += 1
                 try:
-                    capture = cap.capture_player(str(pid))
+                    capture = cap.capture_player(
+                        str(pid), season_picker_label=season_picker_label)
                 except Exception as e:  # noqa: BLE001 — one bad player mustn't kill the loop
                     logger.warning("camoufox capture failed for player=%s: %s", pid, e)
-                    capture = {'profile': None}
+                    capture = {'profile': None, 'season_buffer': {}}
                 if not capture.get('profile'):
                     self._stats['failures'] += 1
                     self._last_lineup_error = {
@@ -2248,21 +2252,36 @@ class SofaScoreScraper(SoccerdataScraper):
         SSR'd in ``__NEXT_DATA__`` (``props.pageProps.player``). The bio is
         server-rendered, so it needs no Turnstile-gated XHR.
 
-        Season-aggregate stats are deferred to PR3b (they need the Season tab + a
-        season-picker for transferred/multi-competition players whose default
-        Season tab is a non-EPL competition — live-proven on Paquetá).
+        Season-aggregate stats (``player_season_stats``) come from the SAME
+        navigation (#751 PR3b): the capture drives the Season tab + a
+        season-picker (the default Season tab is the player's PRIMARY
+        competition, not necessarily EPL for a transferred player — live-proven
+        Paquetá → World Cup), and the right ``(ut, season)`` overall is selected
+        season-guarded via the pure :func:`select_player_season_stats` /
+        :func:`extract_player_seasons_map`.
 
-        Returns ``{'player_profile'}`` (a dict so PR3b can add
-        ``'player_season_stats'`` to the same capture). Empty on graceful
+        Returns ``{'player_profile', 'player_season_stats'}``. The profile is the
+        primary deliverable; season-stats may be a strict subset (the picker can
+        miss for some players) — a WARN, not a failure. Empty frames on graceful
         fallback (caller emits ``R0.2B_FALLBACK``). Season slug is coerced to the
         soccerdata short form (``2526``) so the partition matches.
         """
+        from scrapers.sofascore.camoufox_capture import (
+            extract_player_seasons_map,
+            season_short_to_label,
+            select_player_season_stats,
+        )
+
         profile_cols = [
             'player_id', 'name', 'short_name', 'slug', 'position',
             'jersey_number', 'shirt_number', 'height_cm', 'preferred_foot',
             'date_of_birth', 'nationality', 'country_code',
             'current_team_id', 'current_team_name', 'retired',
             'league', 'season',
+        ]
+        season_cols = [
+            'player_id', 'unique_tournament_id', 'sofascore_season_id',
+            'team_id', 'team_name', 'league', 'season',
         ]
 
         season_str = str(season)
@@ -2273,7 +2292,15 @@ class SofaScoreScraper(SoccerdataScraper):
 
         empty = {
             'player_profile': pd.DataFrame(columns=profile_cols + ['_ingested_at']),
+            'player_season_stats': pd.DataFrame(columns=season_cols + ['_ingested_at']),
         }
+
+        # Target competition for the Season-tab picker. Only an in-scope league
+        # (known unique_tournament_id) drives the picker; otherwise profile-only.
+        # 'ENG-Premier League' -> ut=17, picker label 'Premier League'.
+        target_ut = SOFASCORE_TOURNAMENT_MAP.get(league)
+        picker_label = league.split('-', 1)[-1] if target_ut else None
+        target_season_label = season_short_to_label(season_short)
 
         if player_ids is None:
             player_ids = self._resolve_player_ids_from_bronze(
@@ -2289,15 +2316,17 @@ class SofaScoreScraper(SoccerdataScraper):
             player_ids = list(player_ids)[: int(limit)]
 
         logger.info(
-            "player_capture: capturing %d players (league=%s season=%s)",
-            len(player_ids), league, season_short,
+            "player_capture: capturing %d players (league=%s season=%s ut=%s)",
+            len(player_ids), league, season_short, target_ut,
         )
 
         profile_rows: List[Dict] = []
+        season_rows: List[Dict] = []
         consecutive_failures = 0
         max_consecutive = 10  # ~dead proxy / page not rendering — bail early.
 
-        captures = self._iter_player_captures(player_ids)
+        captures = self._iter_player_captures(
+            player_ids, season_picker_label=picker_label)
         try:
             for idx, (pid, capture) in enumerate(captures, start=1):
                 profile = (capture or {}).get('profile')
@@ -2316,6 +2345,23 @@ class SofaScoreScraper(SoccerdataScraper):
                 prow = self._flatten_player_profile({'player': profile})
                 if prow is not None:
                     profile_rows.append(prow)
+
+                # Season-aggregate stats (best-effort: the picker may miss for a
+                # transferred player → no row for them, which is a WARN).
+                if target_ut:
+                    season_buffer = (capture or {}).get('season_buffer') or {}
+                    if season_buffer:
+                        seasons_map = extract_player_seasons_map(season_buffer, pid)
+                        target_sid = seasons_map.get(target_ut, {}).get(
+                            target_season_label)
+                        sel = select_player_season_stats(
+                            season_buffer, pid, target_ut, target_sid)
+                        if sel is not None:
+                            ut, sid, payload = sel
+                            srow = self._flatten_player_season_stats(
+                                pid, ut, sid, payload)
+                            if srow is not None:
+                                season_rows.append(srow)
 
                 if idx % 25 == 0:
                     logger.info("player_capture progress: %d/%d players",
@@ -2340,11 +2386,27 @@ class SofaScoreScraper(SoccerdataScraper):
         df['_entity_type'] = 'player_profile'
         df['_batch_id'] = self._batch_id
 
+        result = {
+            'player_profile': df,
+            'player_season_stats': empty['player_season_stats'],
+        }
+
+        if season_rows:
+            sdf = pd.DataFrame(season_rows)
+            sdf['league'] = league
+            sdf['season'] = season_short
+            sdf['_ingested_at'] = datetime.utcnow()
+            sdf['_source'] = self.SOURCE_NAME
+            sdf['_entity_type'] = 'player_season_stats'
+            sdf['_batch_id'] = self._batch_id
+            result['player_season_stats'] = sdf
+
         logger.info(
-            "player_capture: %d profile rows across %d players",
-            len(df), len(player_ids),
+            "player_capture: %d profile rows + %d season-stats rows across "
+            "%d players", len(df), len(result['player_season_stats']),
+            len(player_ids),
         )
-        return {'player_profile': df}
+        return result
 
     def scrape_schedule(self) -> Dict[str, str]:
         """Scrape match schedule."""

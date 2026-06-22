@@ -53,6 +53,9 @@ _EVENT_TABS = ("Lineups", "Statistics", "Player statistics", "Shotmap")
 _TAB_TESTIDS = {
     "Lineups": "tab-lineups",
     "Statistics": "tab-statistics",
+    # Player-page Season tab (#751 PR3b) — fires /statistics/seasons + the
+    # default competition's season-statistics/overall.
+    "Season": "tab-season",
 }
 
 # Canonical per-event endpoints we want out of the capture buffer.
@@ -257,6 +260,99 @@ def extract_player_from_next_data(next_data, player_id) -> Optional[dict]:
 
 
 # --------------------------------------------------------------------------- #
+#  Per-player SEASON STATS helpers (issue #751 PR3b) — Season-tab picker       #
+# --------------------------------------------------------------------------- #
+# Clicking the Season tab fires /statistics/seasons (a year→season_id map) plus
+# one /unique-tournament/{ut}/season/{sid}/statistics/overall for whatever
+# competition the page defaults to. For transferred/multi-competition players
+# that default is NOT EPL (live-proven: Paquetá → World Cup), so the capture
+# also drives the season-picker to select the target tournament — firing a
+# SECOND overall XHR. These pure helpers pick the right one out of the buffer
+# without any tls fetch (the dead _resolve_season_id is no longer needed).
+_PLAYER_SEASON_STATS_RE = re.compile(
+    r"/api/v1/player/(\d+)/unique-tournament/(\d+)/season/(\d+)/statistics/overall$"
+)
+_PLAYER_SEASONS_LIST_RE = re.compile(r"/api/v1/player/(\d+)/statistics/seasons$")
+
+
+def season_short_to_label(season_short) -> str:
+    """Map a soccerdata short season (``'2526'``) to SofaScore's year label
+    (``'25/26'``) used in ``/statistics/seasons``. A 4-digit token is split;
+    anything else (e.g. an already-formatted ``'25/26'``) is returned unchanged.
+    """
+    s = str(season_short)
+    if len(s) == 4 and s.isdigit():
+        return f"{s[:2]}/{s[2:]}"
+    return s
+
+
+def extract_player_seasons_map(buffer: Dict[str, dict], player_id) -> Dict[int, Dict[str, int]]:
+    """``{unique_tournament_id: {year_label: season_id}}`` from the captured
+    ``/player/{id}/statistics/seasons`` response (probe FACT 2). Lets us map a
+    target ``(ut, year_label)`` to its SofaScore ``season_id`` without a tls
+    fetch. Returns ``{}`` when the seasons list wasn't captured / was challenged.
+    """
+    rec = buffer.get(f"/api/v1/player/{player_id}/statistics/seasons")
+    if not rec or rec.get("status") != 200 or rec.get("challenge") is not False:
+        return {}
+    obj = rec.get("json")
+    if not isinstance(obj, dict):
+        return {}
+    out: Dict[int, Dict[str, int]] = {}
+    for entry in obj.get("uniqueTournamentSeasons") or []:
+        if not isinstance(entry, dict):
+            continue
+        ut = (entry.get("uniqueTournament") or {}).get("id")
+        if ut is None:
+            continue
+        years: Dict[str, int] = {}
+        for s in entry.get("seasons") or []:
+            if isinstance(s, dict) and s.get("year") is not None and s.get("id") is not None:
+                years[str(s["year"])] = int(s["id"])
+        out[int(ut)] = years
+    return out
+
+
+def select_player_season_stats(
+    buffer: Dict[str, dict],
+    player_id,
+    target_ut,
+    target_season_id=None,
+) -> Optional[tuple]:
+    """Pick the season-statistics/overall XHR for the target unique-tournament
+    out of a player-page capture ``buffer``. Returns ``(ut_id, season_id,
+    payload)`` or ``None``.
+
+    Only real JSON (200, not a challenge) for THIS ``player_id`` and
+    ``target_ut`` is considered — so the default-tab overall of a different
+    competition (e.g. World Cup for a transferred player) is never mistaken for
+    the EPL row. When ``target_season_id`` is known (resolved via
+    :func:`extract_player_seasons_map`) it acts as a season-guard: only an exact
+    ``(ut, season)`` match qualifies. Without a guard the most recent season_id
+    wins (deterministic)."""
+    candidates = []
+    for path, rec in buffer.items():
+        m = _PLAYER_SEASON_STATS_RE.search(path)
+        if not m or str(m.group(1)) != str(player_id):
+            continue
+        if rec.get("status") != 200 or rec.get("challenge") is not False:
+            continue
+        payload = rec.get("json")
+        if not isinstance(payload, dict):
+            continue
+        ut, sid = int(m.group(2)), int(m.group(3))
+        if ut != int(target_ut):
+            continue
+        if target_season_id is not None and sid != int(target_season_id):
+            continue
+        candidates.append((ut, sid, payload))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda c: c[1])  # most-recent season_id last
+    return candidates[-1]
+
+
+# --------------------------------------------------------------------------- #
 #  Camoufox capture session                                                   #
 # --------------------------------------------------------------------------- #
 class SofascoreCamoufoxCapture:
@@ -384,21 +480,96 @@ class SofascoreCamoufoxCapture:
                     event_id, sorted(result), missing)
         return result
 
-    def capture_player(self, player_id) -> Dict:
-        """Navigate a player page and read the SSR'd bio from ``__NEXT_DATA__``
-        (#751 PR3). Returns ``{'profile': <player bio dict | None>}``.
+    def capture_player(self, player_id, *, season_picker_label=None) -> Dict:
+        """Navigate a player page, read the SSR'd bio from ``__NEXT_DATA__``, and
+        (when ``season_picker_label`` is given) drive the Season tab + picker to
+        capture the target competition's season-aggregate stats — all in ONE
+        navigation (#751 PR3 profile + PR3b season stats).
 
-        The bio is server-rendered (``props.pageProps.player``), NOT an XHR, so a
-        single navigation suffices and it survives even though SofaScore's data
-        XHRs are Turnstile-gated. Season-aggregate stats are deferred to PR3b
-        (they need the Season tab + a season-picker for transferred/multi-comp
-        players — see the module-level note)."""
+        Returns ``{'profile': <bio dict | None>, 'season_buffer': {path: rec}}``.
+        The bio is server-rendered (``props.pageProps.player``), NOT an XHR. The
+        ``season_buffer`` is the raw season-stats + ``/statistics/seasons``
+        captures; the caller selects the target ``(ut, season)`` via the pure,
+        season-guarded :func:`select_player_season_stats` /
+        :func:`extract_player_seasons_map`. ``season_picker_label`` is the
+        tournament display text to click in the picker (e.g. ``'Premier
+        League'``) — ``None`` keeps the PR3 profile-only behaviour."""
         self._buffer = {}
         self._navigate(player_url(player_id))
         profile = self._extract_player_next_data(player_id)
-        logger.info("sofascore capture player=%s profile=%s",
-                    player_id, profile is not None)
-        return {"profile": profile}
+
+        season_buffer: Dict[str, dict] = {}
+        if season_picker_label:
+            # Same nav: open the Season tab (fires /statistics/seasons + the
+            # default competition's overall), then switch the picker to the
+            # target tournament so ITS overall fires too.
+            self._click_tabs(("Season",))
+            self._drive_season_picker(season_picker_label)
+            self._page.wait_for_timeout(self._tab_wait_ms)
+            season_buffer = {
+                p: r for p, r in self._buffer.items()
+                if _PLAYER_SEASON_STATS_RE.search(p) or _PLAYER_SEASONS_LIST_RE.search(p)
+            }
+
+        logger.info("sofascore capture player=%s profile=%s season_xhrs=%d",
+                    player_id, profile is not None, len(season_buffer))
+        return {"profile": profile, "season_buffer": season_buffer}
+
+    def _drive_season_picker(self, tournament_label: str) -> None:
+        """Best-effort: open the season-statistics TOURNAMENT dropdown and select
+        the target competition so its season-statistics/overall XHR fires.
+
+        The default Season tab shows the player's PRIMARY competition — NOT
+        necessarily EPL for a transferred/multi-competition player (live-proven
+        Paquetá → World Cup, #751 PR3b). Live-proven DOM (probe): the widget has
+        a tournament dropdown — ``button.dropdown__button[aria-haspopup=
+        "listbox"]`` whose label is the current competition NAME (it has letters;
+        the sibling SEASON dropdown shows only a year). Clicking it opens a
+        ``ul.dropdown__list`` of ``li[role="option"]`` tournaments; clicking the
+        target option fires its overall XHR (Paquetá → EPL ut=17/season 76986
+        confirmed). Tournament names are NOT localized (English even under a
+        non-EN proxy), so matching the option by text is locale-safe. A miss just
+        leaves the default tab — :func:`select_player_season_stats` then returns
+        ``None`` for that player (a WARN, not a crash). JS clicks bypass
+        Playwright actionability (same trick as :meth:`_click_tabs`)."""
+        try:
+            opened = self._page.evaluate(
+                """() => {
+                    // The tournament dropdown trigger (NOT the year/season one):
+                    // a dropdown__button whose label carries letters.
+                    const btn = [...document.querySelectorAll(
+                            'button.dropdown__button[aria-haspopup="listbox"],'
+                            + '[aria-haspopup="listbox"]')]
+                        .find(e => /[a-z]/i.test((e.innerText||'')));
+                    if (btn) { btn.click(); return true; }
+                    return false;
+                }"""
+            )
+            if not opened:
+                logger.info("sofascore season-picker: tournament dropdown not found")
+                return
+            self._page.wait_for_timeout(self._tab_wait_ms)
+            clicked = self._page.evaluate(
+                """(label) => {
+                    // ONLY the dropdown options — never the page's plain
+                    // 'Premier League' <a> link (that navigates, fires nothing).
+                    const want = label.toLowerCase();
+                    const opts = [...document.querySelectorAll(
+                        'li[role="option"], .dropdown__listItem')];
+                    let opt = opts.find(
+                        e => (e.innerText||'').trim().toLowerCase() === want);
+                    if (!opt) opt = opts.find(
+                        e => (e.innerText||'').toLowerCase().includes(want));
+                    if (opt) { opt.click(); return true; }
+                    return false;
+                }""",
+                tournament_label,
+            )
+            logger.info("sofascore season-picker select %r -> %s",
+                        tournament_label, clicked)
+            self._page.wait_for_timeout(self._tab_wait_ms)
+        except Exception as e:  # noqa: BLE001 — picker driving is best-effort
+            logger.info("sofascore season-picker drive failed: %s", e)
 
     def capture_buffer(self, nav_url: str) -> Dict[str, dict]:
         """Navigate ``nav_url`` and return the whole capture buffer (path -> rec).

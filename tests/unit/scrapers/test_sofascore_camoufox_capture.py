@@ -509,3 +509,177 @@ def test_extract_player_from_next_data_none_on_id_mismatch():
 @pytest.mark.parametrize("nd", [None, {}, {"props": {}}, {"props": {"pageProps": {}}}])
 def test_extract_player_from_next_data_none_on_missing(nd):
     assert extract_player_from_next_data(nd, 1416535) is None
+
+
+# --------------------------------------------------------------------------- #
+#  Per-player SEASON STATS helpers (#751 PR3b) — season-tab picker selection   #
+#  Shapes mirror the live probe (scripts/research/probe_sofascore_player.py,   #
+#  FACT 2/4b): the player page captures /statistics/seasons (year→id map) plus #
+#  one /unique-tournament/{ut}/season/{sid}/statistics/overall per tab/picker. #
+# --------------------------------------------------------------------------- #
+def test_season_short_to_label_maps_four_digit():
+    from scrapers.sofascore.camoufox_capture import season_short_to_label
+    assert season_short_to_label("2526") == "25/26"
+    assert season_short_to_label("2122") == "21/22"
+
+
+def test_season_short_to_label_passthrough_non_four_digit():
+    from scrapers.sofascore.camoufox_capture import season_short_to_label
+    # already a label / unknown token — returned unchanged
+    assert season_short_to_label("25/26") == "25/26"
+    assert season_short_to_label("2026") == "20/26"  # 4-digit is always split
+
+
+def _seasons_payload():
+    """/statistics/seasons shape (probe FACT 2): per-unique-tournament year→id."""
+    return {
+        "uniqueTournamentSeasons": [
+            {"uniqueTournament": {"id": 17, "name": "Premier League"},
+             "seasons": [{"year": "25/26", "id": 76986},
+                         {"year": "24/25", "id": 61627}]},
+            {"uniqueTournament": {"id": 16, "name": "World Cup"},
+             "seasons": [{"year": "2026", "id": 58210}]},
+        ]
+    }
+
+
+def _player_season_buffer(pid=839981):
+    """A transferred player's season-tab capture: the default tab fired the
+    World Cup (ut=16) overall, then the picker selected EPL (ut=17) overall.
+    Plus the /statistics/seasons map and a challenged stray to be ignored."""
+    return {
+        f"/api/v1/player/{pid}/statistics/seasons": {
+            "status": 200, "challenge": False, "json": _seasons_payload()},
+        f"/api/v1/player/{pid}/unique-tournament/16/season/58210/statistics/overall": {
+            "status": 200, "challenge": False,
+            "json": {"team": {"id": 9, "name": "Brazil"},
+                     "statistics": {"rating": 7.1, "totalGoals": 1}}},
+        f"/api/v1/player/{pid}/unique-tournament/17/season/76986/statistics/overall": {
+            "status": 200, "challenge": False,
+            "json": {"team": {"id": 30, "name": "West Ham"},
+                     "statistics": {"rating": 6.8, "totalGoals": 4}}},
+        # challenged stray for ANOTHER player — must never be selected.
+        "/api/v1/player/111/unique-tournament/17/season/76986/statistics/overall": {
+            "status": 403, "challenge": True, "json": {"error": {"reason": "challenge"}}},
+    }
+
+
+def test_extract_player_seasons_map_builds_ut_year_to_id():
+    from scrapers.sofascore.camoufox_capture import extract_player_seasons_map
+    m = extract_player_seasons_map(_player_season_buffer(839981), 839981)
+    assert m[17]["25/26"] == 76986
+    assert m[17]["24/25"] == 61627
+    assert m[16]["2026"] == 58210
+
+
+def test_extract_player_seasons_map_empty_when_not_captured():
+    from scrapers.sofascore.camoufox_capture import extract_player_seasons_map
+    assert extract_player_seasons_map({}, 839981) == {}
+
+
+def test_extract_player_seasons_map_empty_on_challenge():
+    from scrapers.sofascore.camoufox_capture import extract_player_seasons_map
+    buf = {"/api/v1/player/5/statistics/seasons": {
+        "status": 403, "challenge": True, "json": {"error": {"reason": "challenge"}}}}
+    assert extract_player_seasons_map(buf, 5) == {}
+
+
+def test_select_player_season_stats_picks_target_ut_with_season_guard():
+    from scrapers.sofascore.camoufox_capture import select_player_season_stats
+    # target = EPL (ut=17), season 76986 — must NOT return the default World Cup tab.
+    sel = select_player_season_stats(
+        _player_season_buffer(839981), 839981, target_ut=17, target_season_id=76986)
+    assert sel is not None
+    ut, sid, payload = sel
+    assert (ut, sid) == (17, 76986)
+    assert payload["team"]["name"] == "West Ham"
+
+
+def test_select_player_season_stats_none_when_target_ut_absent():
+    from scrapers.sofascore.camoufox_capture import select_player_season_stats
+    # La Liga (ut=8) was never captured (picker missed) → None, not a wrong-comp row.
+    assert select_player_season_stats(
+        _player_season_buffer(839981), 839981, target_ut=8, target_season_id=99) is None
+
+
+def test_select_player_season_stats_season_guard_rejects_other_season():
+    from scrapers.sofascore.camoufox_capture import select_player_season_stats
+    # ut=17 present but only season 76986 — guarding on a different sid → None.
+    assert select_player_season_stats(
+        _player_season_buffer(839981), 839981, target_ut=17, target_season_id=61627) is None
+
+
+def test_select_player_season_stats_takes_latest_without_guard():
+    from scrapers.sofascore.camoufox_capture import select_player_season_stats
+    pid = 5
+    buf = {
+        f"/api/v1/player/{pid}/unique-tournament/17/season/61627/statistics/overall": {
+            "status": 200, "challenge": False, "json": {"statistics": {"rating": 1}}},
+        f"/api/v1/player/{pid}/unique-tournament/17/season/76986/statistics/overall": {
+            "status": 200, "challenge": False, "json": {"statistics": {"rating": 2}}},
+    }
+    # No season-guard → deterministic: the most recent season_id (76986).
+    ut, sid, _ = select_player_season_stats(buf, pid, target_ut=17)
+    assert (ut, sid) == (17, 76986)
+
+
+def test_select_player_season_stats_ignores_other_players_and_challenges():
+    from scrapers.sofascore.camoufox_capture import select_player_season_stats
+    # Only the challenged stray for player 111 matches ut/season; must be skipped.
+    buf = {
+        "/api/v1/player/111/unique-tournament/17/season/76986/statistics/overall": {
+            "status": 403, "challenge": True, "json": {"error": {"reason": "challenge"}}},
+    }
+    assert select_player_season_stats(buf, 839981, target_ut=17) is None
+
+
+# --------------------------------------------------------------------------- #
+#  capture_player season buffer (#751 PR3b) — Season tab + picker in ONE nav   #
+#  Browser steps are patched (no Firefox); we assert the buffer FILTERING that #
+#  hands the caller only the season-stats + /statistics/seasons paths.         #
+# --------------------------------------------------------------------------- #
+class TestCapturePlayerSeasonBuffer:
+    def _cap(self):
+        from unittest.mock import MagicMock
+        from scrapers.sofascore.camoufox_capture import SofascoreCamoufoxCapture
+        cap = SofascoreCamoufoxCapture(proxy=None)
+        cap._page = MagicMock()  # only wait_for_timeout is touched
+        return cap
+
+    def test_returns_profile_and_season_buffer_subset(self):
+        cap = self._cap()
+        pid = 839981
+        cap._navigate = lambda *a, **k: None
+        cap._extract_player_next_data = lambda p: {"id": int(p), "name": "Paqueta"}
+        cap._click_tabs = lambda *a, **k: None
+
+        def fake_drive(label):
+            # Simulate the tab + picker firing the season XHRs (+ unrelated noise).
+            cap._buffer = {
+                f"/api/v1/player/{pid}/statistics/seasons":
+                    {"status": 200, "json": {"x": 1}, "challenge": False},
+                f"/api/v1/player/{pid}/unique-tournament/17/season/76986/statistics/overall":
+                    {"status": 200, "json": {"s": 1}, "challenge": False},
+                # unrelated capture (events) — must be filtered OUT.
+                f"/api/v1/player/{pid}/events/last/0":
+                    {"status": 200, "json": {"events": []}, "challenge": False},
+            }
+
+        cap._drive_season_picker = fake_drive
+
+        out = cap.capture_player(pid, season_picker_label="Premier League")
+
+        assert out["profile"]["name"] == "Paqueta"
+        assert set(out["season_buffer"]) == {
+            f"/api/v1/player/{pid}/statistics/seasons",
+            f"/api/v1/player/{pid}/unique-tournament/17/season/76986/statistics/overall",
+        }
+
+    def test_profile_only_when_no_picker_label(self):
+        # Backward-compatible PR3 path: no picker label → no season capture.
+        cap = self._cap()
+        cap._navigate = lambda *a, **k: None
+        cap._extract_player_next_data = lambda p: {"id": int(p)}
+        out = cap.capture_player(7, season_picker_label=None)
+        assert out["season_buffer"] == {}
+        assert out["profile"] == {"id": 7}
