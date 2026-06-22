@@ -45,6 +45,14 @@ _NON_DATA_SEGMENTS = ("/image", "/flag", "/logo", "/jersey")
 _CONSENT_BUTTONS = ("Consent", "AGREE", "Agree", "Accept all", "I Accept", "Got it")
 # Tabs whose XHRs fire only on interaction (lineups often loads eagerly anyway).
 _EVENT_TABS = ("Lineups", "Statistics", "Player statistics", "Shotmap")
+# Stable data-testid per tab label (live-proven 2026-06-22, #751 PR2). Clicking
+# the Statistics tab fires BOTH /statistics (re-fetch, body captured) AND
+# /shotmap. A plain get_by_text('Statistics') grabbed a non-tab label element
+# (the match page renders two "Statistics" nodes) and fired nothing.
+_TAB_TESTIDS = {
+    "Lineups": "tab-lineups",
+    "Statistics": "tab-statistics",
+}
 
 # Canonical per-event endpoints we want out of the capture buffer.
 _EVENT_ENDPOINTS = {
@@ -81,6 +89,24 @@ def is_challenge(body) -> bool:
         and isinstance(body.get("error"), dict)
         and body["error"].get("reason") == "challenge"
     )
+
+
+def merge_capture(existing: Optional[dict], new: dict) -> dict:
+    """Choose the better of two capture records for the same ``/api/v1`` path.
+
+    A record carrying real JSON always beats one that does not. On a retry
+    re-navigation the browser serves already-fetched endpoints as ``304 Not
+    Modified`` with an empty body (``json=None``); without this guard that 304
+    would clobber the good ``200``+JSON capture from an earlier pass — exactly
+    why ``statistics``/``shotmap`` vanished on retry while ``lineups`` (the
+    ``required`` endpoint that forced the retry) survived (#751 PR2). A
+    body-read race (a large XHR firing twice, once with ``json=None``) is
+    covered by the same rule, order-independent."""
+    if existing is None:
+        return new
+    if existing.get("json") is not None and new.get("json") is None:
+        return existing
+    return new
 
 
 def event_url(event_id) -> str:
@@ -264,7 +290,10 @@ class SofascoreCamoufoxCapture:
             rec["challenge"] = is_challenge(obj)
         except Exception:  # noqa: BLE001 — non-JSON / body unavailable
             pass
-        self._buffer[response_path(url)] = rec
+        path = response_path(url)
+        # Never let a later empty/304 record overwrite a good earlier capture
+        # (see merge_capture — re-nav serves cached endpoints as 304/no-body).
+        self._buffer[path] = merge_capture(self._buffer.get(path), rec)
 
     def capture_event(
         self,
@@ -288,8 +317,13 @@ class SofascoreCamoufoxCapture:
         """
         result: Dict[str, dict] = {}
         required = tuple(required or ())
+        # Reset the buffer ONCE per event, then accumulate across retries. A
+        # re-navigation serves already-captured endpoints as 304/no-body, so a
+        # per-attempt reset would drop a good capture from an earlier pass
+        # (statistics/shotmap vanished while the required lineups survived —
+        # #751 PR2). merge_capture keeps the best record per path.
+        self._buffer = {}
         for attempt in range(1, max_attempts + 1):
-            self._buffer = {}
             # Widen the settle window on retries — a slow page can drop the
             # tab XHR on the first, tighter pass.
             self._navigate(event_url(event_id), extra_settle_ms=(attempt - 1) * 2000)
@@ -391,8 +425,28 @@ class SofascoreCamoufoxCapture:
 
     def _click_tabs(self, tabs=_EVENT_TABS) -> None:
         for label in tabs:
-            try:
-                self._page.get_by_text(label, exact=False).first.click(timeout=3000)
+            clicked = False
+            # Prefer the stable data-testid via a JS click (bypasses Playwright
+            # actionability and follows the SPA's own handler — same trick as
+            # _nudge_results). get_by_text is a fallback for tabs without a known
+            # testid, but it can grab a non-tab label node (#751 PR2).
+            testid = _TAB_TESTIDS.get(label)
+            if testid:
+                try:
+                    clicked = bool(self._page.evaluate(
+                        "(tid) => { const e = document.querySelector("
+                        "'[data-testid=\"' + tid + '\"]');"
+                        " if (e) { e.scrollIntoView(); e.click(); return true; }"
+                        " return false; }",
+                        testid,
+                    ))
+                except Exception:
+                    clicked = False
+            if not clicked:
+                try:
+                    self._page.get_by_text(label, exact=False).first.click(timeout=3000)
+                    clicked = True
+                except Exception:
+                    pass
+            if clicked:
                 self._page.wait_for_timeout(self._tab_wait_ms)
-            except Exception:
-                pass

@@ -13,6 +13,7 @@ from scrapers.sofascore.camoufox_capture import (
     finished_event_ids,
     is_challenge,
     is_data_api_url,
+    merge_capture,
     normalize_event,
     parse_proxy_line,
     response_path,
@@ -332,3 +333,135 @@ class TestCaptureEventRetry:
 
         # Assert — single navigation, no retry loop.
         assert calls["n"] == 1
+
+
+# --------------------------------------------------------------------------- #
+#  merge_capture — 304/no-body must not clobber a good capture (#751 PR2)      #
+# --------------------------------------------------------------------------- #
+def test_merge_capture_takes_new_when_no_existing():
+    new = {"status": 200, "json": {"a": 1}, "challenge": False}
+    assert merge_capture(None, new) is new
+
+
+def test_merge_capture_keeps_good_json_over_later_none():
+    # Arrange — a good 200+JSON already captured, then a 304/no-body arrives.
+    good = {"status": 200, "json": {"statistics": []}, "challenge": False}
+    empty = {"status": 304, "json": None, "challenge": None}
+
+    # Act + Assert — the good record survives the 304 clobber.
+    assert merge_capture(good, empty) is good
+
+
+def test_merge_capture_upgrades_none_to_good_json():
+    # Arrange — a body-read race stored json=None first, then the real body.
+    raced = {"status": 200, "json": None, "challenge": None}
+    good = {"status": 200, "json": {"shotmap": []}, "challenge": False}
+
+    # Act + Assert — the real body replaces the raced empty.
+    assert merge_capture(raced, good) is good
+
+
+def test_merge_capture_replaces_good_with_newer_good():
+    old = {"status": 200, "json": {"v": 1}, "challenge": False}
+    new = {"status": 200, "json": {"v": 2}, "challenge": False}
+    assert merge_capture(old, new) is new
+
+
+# --------------------------------------------------------------------------- #
+#  _on_response wiring + capture_event accumulation across retries (#751 PR2)  #
+# --------------------------------------------------------------------------- #
+class _FakeResp:
+    """Minimal Playwright Response stand-in: _on_response touches url/status/json."""
+
+    def __init__(self, url, status, json_obj, raise_json=False):
+        self.url = url
+        self.status = status
+        self._json = json_obj
+        self._raise = raise_json
+
+    def json(self):
+        if self._raise:
+            raise RuntimeError("body unavailable")
+        return self._json
+
+
+def _cap_no_browser():
+    from scrapers.sofascore.camoufox_capture import SofascoreCamoufoxCapture
+    cap = SofascoreCamoufoxCapture(proxy=None)
+    cap._buffer = {}
+    return cap
+
+
+def test_on_response_does_not_clobber_good_capture_with_304():
+    # Arrange — a good statistics body lands, then a 304 re-fetch of the same URL.
+    cap = _cap_no_browser()
+    url = "https://www.sofascore.com/api/v1/event/42/statistics"
+    cap._on_response(_FakeResp(url, 200, {"statistics": [{"period": "ALL"}]}))
+    cap._on_response(_FakeResp(url, 304, None, raise_json=True))
+
+    # Assert — the buffer still holds the good JSON, not the empty 304.
+    rec = cap._buffer["/api/v1/event/42/statistics"]
+    assert rec["json"] == {"statistics": [{"period": "ALL"}]}
+    assert rec["status"] == 200
+
+
+def test_click_tabs_clicks_statistics_by_testid():
+    # The Statistics tab must be clicked by its stable data-testid (fires both
+    # /statistics and /shotmap); get_by_text grabbed a non-tab node (#751 PR2).
+    from unittest.mock import MagicMock
+    cap = _cap_no_browser()
+    cap._page = MagicMock()
+    cap._page.evaluate.return_value = True
+
+    cap._click_tabs(("Statistics",))
+
+    # evaluate invoked with the tab-statistics testid; text fallback NOT used.
+    assert cap._page.evaluate.call_args[0][1] == "tab-statistics"
+    cap._page.get_by_text.assert_not_called()
+
+
+def test_click_tabs_falls_back_to_text_without_testid():
+    # A tab with no known testid (Player statistics) uses the get_by_text path.
+    from unittest.mock import MagicMock
+    cap = _cap_no_browser()
+    cap._page = MagicMock()
+
+    cap._click_tabs(("Player statistics",))
+
+    cap._page.get_by_text.assert_called_once()
+    assert cap._page.get_by_text.call_args[0][0] == "Player statistics"
+
+
+def test_capture_event_accumulates_statistics_across_retry():
+    """The retry that recovers a missing `lineups` must NOT lose a `statistics`
+    captured on an earlier pass (re-nav serves it as a 304/no-body). Pre-PR2
+    this regressed because the buffer was reset per attempt — RED then."""
+    from unittest.mock import MagicMock
+    cap = _cap_no_browser()
+    cap._page = MagicMock()  # only wait_for_timeout is touched
+    eid = 42
+    stats_url = f"https://www.sofascore.com/api/v1/event/{eid}/statistics"
+    lineups_url = f"https://www.sofascore.com/api/v1/event/{eid}/lineups"
+    calls = {"n": 0}
+
+    def fake_navigate(url, extra_settle_ms=0):
+        # Attempt 1: statistics arrives, lineups does NOT.
+        # Attempt 2: lineups arrives; statistics re-served as a 304/no-body.
+        if calls["n"] == 0:
+            cap._on_response(_FakeResp(stats_url, 200, {"statistics": [{"period": "ALL"}]}))
+        else:
+            cap._on_response(_FakeResp(lineups_url, 200, {"home": {}, "away": {}}))
+            cap._on_response(_FakeResp(stats_url, 304, None, raise_json=True))
+        calls["n"] += 1
+
+    cap._navigate = fake_navigate
+    cap._click_tabs = lambda *a, **k: None
+
+    # Act — require lineups so attempt 1 (no lineups) forces a retry.
+    result = cap.capture_event(eid, required=("lineups",), max_attempts=3)
+
+    # Assert — retried once, BOTH endpoints present (statistics survived).
+    assert calls["n"] == 2
+    assert "lineups" in result
+    assert "statistics" in result
+    assert result["statistics"] == {"statistics": [{"period": "ALL"}]}

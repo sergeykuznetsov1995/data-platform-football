@@ -409,17 +409,18 @@ def _run_match_capture(
     output_path: str,
     force_replace: bool = False,
 ) -> int:
-    """#751 PR1 — consolidated per-match capture entrypoint.
+    """#751 PR1+PR2 — consolidated per-match capture entrypoint.
 
-    ONE Camoufox navigation per match feeds BOTH
-    ``bronze.sofascore_player_ratings`` and
-    ``bronze.sofascore_event_player_stats`` from the same captured ``/lineups``
-    (+ ``/event``) payload — replacing the two separate Turnstile-blocked
-    passes. Both tables are written full-state
+    ONE Camoufox navigation per match feeds FOUR Bronze tables from the same
+    captured ``/lineups`` + ``/event`` + ``/statistics`` + ``/shotmap`` payloads:
+    ``sofascore_player_ratings``, ``sofascore_event_player_stats``,
+    ``sofascore_match_stats``, ``sofascore_event_shotmap`` — replacing four
+    separate Turnstile-blocked passes. All four are written full-state
     (``replace_partitions=['league', 'season']`` + completeness guard): every
     run re-captures the finished matches and rewrites the partition wholesale,
-    so ``event_player_stats`` no longer accumulates and comes essentially free
-    with the ratings capture (no per-player ``/player/{pid}/statistics`` calls).
+    so the secondary tables come essentially free with the ratings capture (no
+    per-player ``/player/{pid}/statistics`` nor per-event ``/statistics`` REST
+    calls). statistics/shotmap are best-effort — an empty frame is skipped.
 
     Exit codes: 0 ok / 2 R0.2B_FALLBACK (nothing captured) / 3 ReplaceGuard /
     1 hard failure.
@@ -468,6 +469,10 @@ def _run_match_capture(
         'matches_with_ratings': 0,
         'eps_rows': 0,
         'eps_matches': 0,
+        'match_stats_rows': 0,
+        'match_stats_matches': 0,
+        'shotmap_rows': 0,
+        'shotmap_matches': 0,
         'fallback': False,
         'fallback_reason': None,
         'errors': [],
@@ -504,8 +509,12 @@ def _run_match_capture(
             )
             ratings_df = frames.get('player_ratings')
             eps_df = frames.get('event_player_stats')
+            stats_df = frames.get('match_stats')
+            shot_df = frames.get('event_shotmap')
             ratings_empty = ratings_df is None or ratings_df.empty
             eps_empty = eps_df is None or eps_df.empty
+            stats_empty = stats_df is None or stats_df.empty
+            shot_empty = shot_df is None or shot_df.empty
 
             if ratings_empty and eps_empty:
                 last_err = getattr(scraper, '_last_lineup_error', None)
@@ -563,6 +572,39 @@ def _run_match_capture(
                 results['eps_rows'] = int(len(eps_df))
                 results['eps_matches'] = int(eps_df['match_id'].nunique())
                 logger.info("Saved %d eps rows -> %s", results['eps_rows'], epath)
+
+            # match_stats — same full-state refresh from the SAME capture pass
+            # (#751 PR2): every finished match is re-captured each run.
+            if not stats_empty:
+                spath = scraper.save_to_iceberg(
+                    df=stats_df,
+                    table_name='sofascore_match_stats',
+                    partition_cols=['league', 'season'],
+                    replace_partitions=['league', 'season'],
+                    min_replace_ratio=min_ratio,
+                )
+                results['tables'].append(spath)
+                results['match_stats_rows'] = int(len(stats_df))
+                results['match_stats_matches'] = int(stats_df['match_id'].nunique())
+                logger.info("Saved %d match_stats rows -> %s",
+                            results['match_stats_rows'], spath)
+
+            # event_shotmap — written LAST: the shotmap tab is the flakiest XHR,
+            # so if its completeness guard trips (exit 3) the other three tables
+            # are already committed.
+            if not shot_empty:
+                shpath = scraper.save_to_iceberg(
+                    df=shot_df,
+                    table_name='sofascore_event_shotmap',
+                    partition_cols=['league', 'season'],
+                    replace_partitions=['league', 'season'],
+                    min_replace_ratio=min_ratio,
+                )
+                results['tables'].append(shpath)
+                results['shotmap_rows'] = int(len(shot_df))
+                results['shotmap_matches'] = int(shot_df['match_id'].nunique())
+                logger.info("Saved %d shotmap rows -> %s",
+                            results['shotmap_rows'], shpath)
 
     except ReplaceGuardError as e:
         msg = f"{REPLACE_GUARD_MARKER}: {e}"
