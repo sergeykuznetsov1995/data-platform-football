@@ -49,8 +49,10 @@ _DEEP_HINTS = ("/lineups", "/statistics", "/shotmap", "/incidents", "/player/")
 _CF_MARKERS = ("just a moment", "verify you are human", "/cdn-cgi/challenge")
 
 
-def _first_proxy(proxy_file: str) -> Optional[dict]:
-    """First ``host:port:user:pass`` line → Camoufox/Playwright proxy dict."""
+def _first_proxy(proxy_file: str, index: int = 0) -> Optional[dict]:
+    """The ``index``-th valid ``host:port:user:pass`` line → Camoufox/Playwright
+    proxy dict. ``index`` lets us skip a dead sticky-session exit."""
+    valid = []
     try:
         with open(proxy_file, "r") as f:
             for line in f:
@@ -62,10 +64,13 @@ def _first_proxy(proxy_file: str) -> Optional[dict]:
                     continue
                 host, port, user = parts[0], parts[1], parts[2]
                 password = ":".join(parts[3:])
-                return {"server": f"http://{host}:{port}", "username": user, "password": password}
+                valid.append({"server": f"http://{host}:{port}", "username": user, "password": password})
     except FileNotFoundError:
         log.warning("proxy file %s not found", proxy_file)
-    return None
+        return None
+    if not valid:
+        return None
+    return valid[index % len(valid)]
 
 
 def _is_challenge(obj) -> Optional[bool]:
@@ -127,18 +132,215 @@ def _inpage_fetch(page, path: str) -> dict:
     )
 
 
+def _collect_event_dicts(obj, out=None) -> list:
+    """Recursively collect SofaScore event-like dicts (have homeTeam+awayTeam or a
+    startTimestamp) embedded anywhere in a parsed __NEXT_DATA__ blob — tells us
+    whether (and which) schedule is SSR'd rather than fetched via XHR."""
+    if out is None:
+        out = []
+    if isinstance(obj, dict):
+        if ("homeTeam" in obj and "awayTeam" in obj) or "startTimestamp" in obj:
+            out.append(obj)
+        for v in obj.values():
+            _collect_event_dicts(v, out)
+    elif isinstance(obj, list):
+        for v in obj:
+            _collect_event_dicts(v, out)
+    return out
+
+
+def _event_ut_id(ev) -> Optional[int]:
+    """unique-tournament id embedded on a SofaScore event dict, if present."""
+    if not isinstance(ev, dict):
+        return None
+    return ((ev.get("tournament") or {}).get("uniqueTournament") or {}).get("id")
+
+
+def _sample_events(events, src) -> None:
+    for ev in events[:4]:
+        if isinstance(ev, dict):
+            log.info("   [%s] id=%s status=%s ut=%s %s vs %s", src,
+                     ev.get("id"), (ev.get("status") or {}).get("type"),
+                     _event_ut_id(ev),
+                     (ev.get("homeTeam") or {}).get("name"),
+                     (ev.get("awayTeam") or {}).get("name"))
+
+
+def _nudge_tournament(page, wait_ms: int = 2500) -> None:
+    """Click likely controls so the SPA fetches FINISHED matches (results / past
+    rounds) instead of only the default upcoming round (#757 B0 interaction)."""
+    # First: hunt the REAL controls (SofaScore hangs data-testid on everything).
+    try:
+        info = page.evaluate(
+            """() => {
+                const out = {round: [], tabs: [], links: []};
+                const seen = new Set();
+                for (const e of document.querySelectorAll('button,[role=button],[role=tab],a,[data-testid]')) {
+                    const tx = (e.innerText||'').trim().slice(0,24);
+                    const al = (e.getAttribute('aria-label')||'').slice(0,32);
+                    const ti = (e.getAttribute('data-testid')||'');
+                    const blob = (tx+' '+al+' '+ti);
+                    if (/round|prev|next|result|fixture|arrow|chevron/i.test(blob)) {
+                        const k = 'r:'+tx+al+ti;
+                        if (!seen.has(k)) { seen.add(k); out.round.push({tx, al, ti}); }
+                    }
+                    if (['Matches','Results','Fixtures','Standings','Overview'].includes(tx)) {
+                        const k = 't:'+tx; if (!seen.has(k)) { seen.add(k); out.tabs.push({tx, ti}); }
+                    }
+                }
+                for (const a of document.querySelectorAll('a[href]')) {
+                    const h = a.getAttribute('href')||'';
+                    if (/\\/(matches|results|fixtures)/i.test(h) && !seen.has('h:'+h)) {
+                        seen.add('h:'+h); out.links.push(h.slice(0,80));
+                    }
+                }
+                const tids = [];
+                const ts = new Set();
+                for (const e of document.querySelectorAll('[data-testid]')) {
+                    const t = e.getAttribute('data-testid');
+                    if (t && !ts.has(t)) { ts.add(t); tids.push(t); }
+                }
+                return {round: out.round.slice(0,25), tabs: out.tabs,
+                        links: out.links.slice(0,15), testids: tids.slice(0,120)};
+            }"""
+        )
+        log.info("DOM round/results controls: %s", info.get("round"))
+        log.info("DOM tab elements: %s", info.get("tabs"))
+        log.info("DOM matches/results links: %s", info.get("links"))
+        log.info("DOM all data-testids: %s", info.get("testids"))
+    except Exception as e:
+        log.info("control dump failed: %s", e)
+    # The Matches section is collapsed by default (Standings shown) so its view
+    # toggles (tab-date/tab-round) render display:none → Playwright .click()
+    # times out. JS .click() bypasses actionability and follows the SPA's own
+    # handlers. Open the 'Matches' top-nav, then switch to the BY DATE view
+    # (surfaces recent/finished matches for an in-progress season). (#757 B1)
+    # Click tab-date/tab-round DIRECTLY by data-testid (clicking the 'Matches'
+    # top-nav re-mounts the section and the toggles vanish before the next
+    # click). Wait for each to mount — render timing varies by proxy exit.
+    for tid in ("tab-date", "tab-round"):
+        sel = '[data-testid="' + tid + '"]'
+        try:
+            page.wait_for_function(
+                "() => !!document.querySelector('" + sel + "')", timeout=8000)
+            hit = page.evaluate(
+                "() => { const e=document.querySelector('" + sel + "');"
+                " if(e){e.click();return true;} return false; }")
+            log.info("nudge %s -> %s", tid, hit)
+            page.wait_for_timeout(wait_ms)
+        except Exception as e:
+            log.info("nudge %s: not mounted (%s)", tid, e)
+
+
+def _probe_tournament(page, ut_id: int, captures: Dict[str, dict], settle_ms: int,
+                      nav_url: str = "") -> int:
+    """Navigate a league page and report HOW the match list (schedule) loads —
+    XHR ``/api/v1/.../events/last|next`` vs SSR ``__NEXT_DATA__`` (#757 B0 gate)."""
+    # /unique-tournament/{id} 404s; the canonical URL needs the country/slug.
+    url = nav_url or f"https://www.sofascore.com/unique-tournament/{ut_id}"
+    log.info(">>> goto tournament page: %s", url)
+    page.goto(url, wait_until="domcontentloaded", timeout=60000)
+    _dismiss_consent(page)
+    page.wait_for_timeout(settle_ms)
+    _diag(page, "tournament-post-load")
+    # Scroll to nudge any lazy events XHR the SPA fires on viewport.
+    try:
+        page.mouse.wheel(0, 4000)
+        page.wait_for_timeout(3000)
+    except Exception:
+        pass
+    # Interact: surface FINISHED matches (Matches nav -> by-date/by-round view).
+    _nudge_tournament(page)
+
+    log.info("-" * 70)
+    # XHR events scoped to the TARGET tournament (round/last/next under its ut_id).
+    tgt_re = re.compile(rf"/unique-tournament/{ut_id}/season/\d+/events/")
+    tgt_events, tgt_paths = {}, []
+    for k, v in captures.items():
+        if not tgt_re.search(k) or v.get("status") != 200:
+            continue
+        obj = v.get("json")
+        evs = obj.get("events") if isinstance(obj, dict) else None
+        if not isinstance(evs, list):
+            continue
+        tgt_paths.append(k)
+        for ev in evs:
+            if isinstance(ev, dict) and ev.get("id") is not None:
+                tgt_events[ev["id"]] = ev
+    log.info("XHR events for TARGET ut=%s: %d events across %d paths",
+             ut_id, len(tgt_events), len(tgt_paths))
+    for k in sorted(tgt_paths):
+        log.info("   XHR-path %s", k)
+    _sample_events(list(tgt_events.values()), "XHR")
+    finished_xhr = [e for e in tgt_events.values()
+                    if (e.get("status") or {}).get("type") == "finished"]
+    log.info("   -> finished via XHR: %d", len(finished_xhr))
+
+    # Also note the generic last|next (may be a DIFFERENT featured tournament).
+    other = {k for k, v in captures.items()
+             if re.search(r"/events/(last|next)/\d+$", k) and not tgt_re.search(k)}
+    if other:
+        log.info("NOTE: %d generic events/last|next paths are NOT the target ut "
+                 "(featured block) — extract_events must filter by ut_id: %s",
+                 len(other), sorted(other))
+
+    # __NEXT_DATA__ SSR check (scoped to target ut where derivable).
+    ssr_tgt = []
+    try:
+        nd = page.evaluate(
+            "() => { const e = document.getElementById('__NEXT_DATA__'); "
+            "return e ? e.textContent : null; }"
+        )
+        if nd:
+            ssr_all = _collect_event_dicts(json.loads(nd))
+            ssr_tgt = [e for e in ssr_all
+                       if _event_ut_id(e) in (ut_id, None)]
+            log.info("__NEXT_DATA__ present (len=%d); event-like dicts: %d total, "
+                     "%d target-ut", len(nd), len(ssr_all), len(ssr_tgt))
+            _sample_events(ssr_tgt, "SSR")
+        else:
+            log.info("__NEXT_DATA__ NOT present on tournament page")
+    except Exception as e:
+        log.info("__NEXT_DATA__ parse failed: %s", e)
+
+    log.info("=" * 70)
+    if tgt_events:
+        log.info("RESULT: XHR — target ut=%s schedule via /events/{round,last,next} "
+                 "(%d events, %d finished). B1: capture buffer, filter by ut_id.",
+                 ut_id, len(tgt_events), len(finished_xhr))
+        return 0
+    if ssr_tgt:
+        log.info("RESULT: SSR — no target-ut XHR, but %d target-ut event dicts in "
+                 "__NEXT_DATA__. B1: parse __NEXT_DATA__ (B4).", len(ssr_tgt))
+        return 0
+    log.info("RESULT: FAIL — no events via XHR or __NEXT_DATA__ (Turnstile not "
+             "solved / wrong URL / events behind interaction).")
+    return 1
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Capture SofaScore /api/v1 via Camoufox (#757 P2)")
     ap.add_argument("--event-id", type=int, default=DEFAULT_EVENT)
+    ap.add_argument("--mode", choices=("event", "tournament"), default="event",
+                    help="event: probe a match page (default). tournament: probe a "
+                         "league page to learn how the match list (schedule) loads "
+                         "— XHR /events/last|next vs SSR __NEXT_DATA__ (#757 B0).")
+    ap.add_argument("--tournament-id", type=int, default=17,
+                    help="SofaScore unique-tournament id (17=EPL) for --mode tournament.")
+    ap.add_argument("--tournament-url", default="",
+                    help="Override the league page URL for --mode tournament "
+                         "(e.g. canonical slug URL); blank → /unique-tournament/{id}.")
     ap.add_argument("--headless", default="virtual", help="virtual|true|false")
     ap.add_argument("--settle", type=int, default=10000)
     ap.add_argument("--proxy-file", default="/opt/airflow/proxys.txt")
+    ap.add_argument("--proxy-index", type=int, default=0,
+                    help="Which valid proxy line to use (skip a dead exit).")
     ap.add_argument("--use-proxy", action="store_true")
     args = ap.parse_args()
 
     headless = {"true": True, "false": False}.get(str(args.headless).lower(), "virtual")
     eid = args.event_id
-    proxy = _first_proxy(args.proxy_file) if args.use_proxy else None
+    proxy = _first_proxy(args.proxy_file, args.proxy_index) if args.use_proxy else None
 
     from camoufox.sync_api import Camoufox
 
@@ -182,6 +384,10 @@ def main() -> int:
 
         page.on("request", on_request)
         page.on("response", on_response)
+
+        if args.mode == "tournament":
+            return _probe_tournament(page, args.tournament_id, captures,
+                                     args.settle, args.tournament_url)
 
         murl = f"https://www.sofascore.com/event/{eid}"
         log.info(">>> goto match page: %s", murl)

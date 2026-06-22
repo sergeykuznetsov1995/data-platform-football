@@ -96,6 +96,18 @@ SOFASCORE_TOURNAMENT_MAP: Dict[str, int] = {
     'FRA-Ligue 1': 34,
 }
 
+# Canonical SofaScore league-page slug per soccerdata league key. The browser
+# capture nav URL needs country/competition slug + id — /unique-tournament/{id}
+# alone 404s (#757 B0). Only EPL is live-verified; the rest follow SofaScore's
+# /tournament/<slug>/<ut_id> pattern and should be confirmed before use.
+SOFASCORE_TOURNAMENT_SLUG: Dict[str, str] = {
+    'ENG-Premier League': 'football/england/premier-league',
+    'ESP-La Liga': 'football/spain/laliga',
+    'GER-Bundesliga': 'football/germany/bundesliga',
+    'ITA-Serie A': 'football/italy/serie-a',
+    'FRA-Ligue 1': 'football/france/ligue-1',
+}
+
 # R0.2b — graceful-fallback marker emitted when the lineups endpoint
 # is structurally unavailable (HTTP 403 / quota empty / repeated timeouts).
 # Downstream (E4.4 schema-stub path) keys off this marker to keep the
@@ -240,7 +252,9 @@ class SofaScoreScraper(SoccerdataScraper):
         """
         df = self.read_schedule()
         if df is None or df.empty:
-            return []
+            # soccerdata schedule is Turnstile-blocked (#757) — fall back to
+            # discovering finished matches via the Camoufox capture transport.
+            return self.resolve_finished_match_ids_via_capture(league, season)
 
         df = df.copy()
         # Coerce season to soccerdata 'YYZZ' string format if int passed.
@@ -599,7 +613,9 @@ class SofaScoreScraper(SoccerdataScraper):
                 self._rate_limiter.acquire()
                 self._stats['requests'] += 1
                 try:
-                    endpoints = cap.capture_event(str(mid))
+                    # ratings only needs /lineups — click just that tab to
+                    # avoid fetching Statistics/Shotmap (saves proxy bytes/time).
+                    endpoints = cap.capture_event(str(mid), tabs=("Lineups",))
                     lineups = endpoints.get('lineups')
                 except Exception as e:  # noqa: BLE001 — one bad event mustn't kill the loop
                     logger.warning("camoufox capture failed for event=%s: %s", mid, e)
@@ -614,6 +630,54 @@ class SofaScoreScraper(SoccerdataScraper):
                 else:
                     self._stats['successes'] += 1
                 yield str(mid), lineups
+
+    def resolve_finished_match_ids_via_capture(
+        self, league: str, season: int,
+    ) -> List[str]:
+        """Resolve finished match_ids for ``(league, season)`` by capturing the
+        SofaScore league page through Camoufox (#757 B1).
+
+        The soccerdata/tls schedule path is Turnstile-blocked, so when
+        ``bronze.sofascore_schedule`` is empty (e.g. a fresh season) we navigate
+        the league page, let the SPA fire its ``/events/{round,last}`` XHR, and
+        pull the finished matches from the captured JSON. Returns ``[]`` when the
+        league has no SofaScore slug/ut_id, capture fails, or no finished match
+        is on the page (off-season). ``season`` is currently informational — the
+        league page serves the CURRENT season (the new-season daily use case);
+        past-season resolution still relies on ``bronze.sofascore_schedule``.
+        """
+        from scrapers.sofascore.camoufox_capture import (
+            SofascoreCamoufoxCapture,
+            extract_tournament_events,
+            finished_event_ids,
+        )
+
+        ut_id = self._resolve_unique_tournament_id(league)
+        slug = SOFASCORE_TOURNAMENT_SLUG.get(league)
+        if ut_id is None or slug is None:
+            logger.warning(
+                "No SofaScore slug/ut_id for league=%s — capture schedule "
+                "resolution skipped.", league,
+            )
+            return []
+
+        nav_url = f"https://www.sofascore.com/tournament/{slug}/{ut_id}"
+        proxy = self._camoufox_proxy()
+        try:
+            self._rate_limiter.acquire()
+            with SofascoreCamoufoxCapture(proxy=proxy) as cap:
+                buffer = cap.capture_tournament(nav_url)
+        except Exception as e:  # noqa: BLE001 — capture failure must not crash the run
+            logger.warning("capture schedule failed for league=%s: %s", league, e)
+            return []
+
+        events = extract_tournament_events(buffer, ut_id)
+        match_ids = finished_event_ids(events)
+        logger.info(
+            "Capture schedule league=%s season=%s: %d ut=%d events, %d finished.",
+            league, season, len(events), ut_id, len(match_ids),
+        )
+        return match_ids
 
     def read_player_ratings(
         self,
@@ -672,7 +736,10 @@ class SofaScoreScraper(SoccerdataScraper):
 
         all_rows: List[Dict] = []
         consecutive_failures = 0
-        max_consecutive = 100  # preventive circuit-breaker; bail to save proxy budget
+        # Capture is expensive (browser nav + proxy bytes, ×3 internal retries
+        # per match); 10 consecutive misses ≈ dead proxy / Turnstile not solved
+        # — bail early to save proxy budget rather than grind all match_ids.
+        max_consecutive = 10
 
         # #757: lineups now come from the Camoufox capture transport (the
         # tls_requests REST path is Turnstile-blocked). The generator owns one

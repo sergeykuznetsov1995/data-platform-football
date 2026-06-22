@@ -267,25 +267,18 @@ def _run_player_ratings(
         # try with int-form season too — just in case the writer used int
         match_ids = _resolve_match_ids_from_bronze(league, season_str, limit)
 
-    if not match_ids:
-        logger.error(
-            "%s: no match_ids available for league=%s season=%s. "
-            "Run sofascore schedule scrape first or pass --match-ids.",
-            R0_2B_FALLBACK_MARKER, league, season_short,
+    if match_ids:
+        logger.info("Resolved %d match_ids from bronze.sofascore_schedule",
+                    len(match_ids))
+    else:
+        # bronze schedule is empty (e.g. fresh season — soccerdata schedule is
+        # Turnstile-blocked). Defer to the Camoufox capture resolver inside the
+        # scraper session below (#757 B2) before declaring R0.2B fallback.
+        logger.warning(
+            "bronze.sofascore_schedule empty for league=%s season=%s — will "
+            "resolve finished match_ids via Camoufox capture (#757).",
+            league, season_short,
         )
-        _write_results(output_path, {
-            'entity': ENTITY_PLAYER_RATINGS,
-            'tables': [],
-            'rows': 0,
-            'matches_attempted': 0,
-            'fallback': True,
-            'fallback_reason': 'no_match_ids_in_bronze',
-            'errors': [f'{R0_2B_FALLBACK_MARKER}: no_match_ids'],
-        })
-        return 2
-
-    logger.info("Resolved %d match_ids from bronze.sofascore_schedule",
-                len(match_ids))
 
     proxy_file = os.environ.get('PROXY_FILE', '/opt/airflow/proxys.txt')
     if not os.path.exists(proxy_file):
@@ -312,6 +305,31 @@ def _run_player_ratings(
             seasons=[season],
             proxy_file=proxy_file,
         ) as scraper:
+            if not match_ids:
+                # #757 B2: discover finished match_ids via Camoufox capture when
+                # bronze.sofascore_schedule is empty (Turnstile-blocked soccerdata).
+                match_ids = scraper.resolve_finished_match_ids_via_capture(
+                    league, int(season),
+                )
+                if not match_ids:
+                    logger.error(
+                        "%s: no match_ids from bronze OR capture for "
+                        "league=%s season=%s.",
+                        R0_2B_FALLBACK_MARKER, league, season_short,
+                    )
+                    results['fallback'] = True
+                    results['fallback_reason'] = 'no_match_ids'
+                    results['errors'].append(
+                        f'{R0_2B_FALLBACK_MARKER}: no_match_ids'
+                    )
+                    _write_results(output_path, results)
+                    return 2
+                if limit:
+                    match_ids = match_ids[: int(limit)]
+                results['matches_attempted'] = len(match_ids)
+                logger.info("Resolved %d finished match_ids via capture",
+                            len(match_ids))
+
             df = scraper.read_player_ratings(
                 league=league,
                 season=int(season),
