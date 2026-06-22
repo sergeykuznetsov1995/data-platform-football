@@ -149,6 +149,34 @@ def finished_event_ids(events: list) -> list:
     ]
 
 
+def extract_tournament_events(buffer: Dict[str, dict], ut_id) -> list:
+    """Collect SofaScore events for a SPECIFIC unique-tournament from a capture
+    ``buffer``'s ``/events/{round,last,next}/N`` responses, de-duplicated by id.
+
+    Filtering by ``ut_id`` is REQUIRED, not optional: a league page also fires a
+    *featured* OTHER tournament's ``/events/last|next`` (#757 B0 proved a naive
+    last|next capture on the EPL page grabbed unrelated ut=16 events). We match
+    only ``/unique-tournament/{ut_id}/season/{sid}/events/...`` paths.
+    """
+    pat = re.compile(
+        rf"/api/v1/unique-tournament/{int(ut_id)}/season/\d+/events/(?:round|last|next)/\d+$"
+    )
+    seen: Dict = {}
+    for path, rec in buffer.items():
+        if not pat.search(path):
+            continue
+        if rec.get("status") != 200 or rec.get("challenge") is not False:
+            continue
+        obj = rec.get("json")
+        events = obj.get("events") if isinstance(obj, dict) else None
+        if not isinstance(events, list):
+            continue
+        for ev in events:
+            if isinstance(ev, dict) and ev.get("id") is not None:
+                seen[ev["id"]] = ev
+    return list(seen.values())
+
+
 def parse_proxy_line(line: str) -> Optional[dict]:
     """``host:port:user:pass`` → a Playwright/Camoufox proxy dict (creds split
     out — browsers reject creds embedded in the URL). Returns ``None`` for a
@@ -243,6 +271,7 @@ class SofascoreCamoufoxCapture:
         event_id,
         required=("lineups",),
         max_attempts: int = 3,
+        tabs=_EVENT_TABS,
     ) -> Dict[str, dict]:
         """Navigate the match page, nudge the deep tabs, and return the captured
         per-event endpoints (only those that came back as real JSON).
@@ -252,6 +281,10 @@ class SofascoreCamoufoxCapture:
         pass (#757). When any ``required`` endpoint is missing we re-navigate
         (up to ``max_attempts``), widening the settle window each retry so a
         slow page still fires the XHR. ``required=()`` takes one pass.
+
+        ``tabs`` narrows which deep tabs to click — a ratings-only caller passes
+        ``tabs=("Lineups",)`` to avoid fetching Statistics/Shotmap it won't use
+        (saves proxy bytes + time). Defaults to all of ``_EVENT_TABS``.
         """
         result: Dict[str, dict] = {}
         required = tuple(required or ())
@@ -260,7 +293,7 @@ class SofascoreCamoufoxCapture:
             # Widen the settle window on retries — a slow page can drop the
             # tab XHR on the first, tighter pass.
             self._navigate(event_url(event_id), extra_settle_ms=(attempt - 1) * 2000)
-            self._click_tabs()
+            self._click_tabs(tabs)
             self._page.wait_for_timeout(self._tab_wait_ms)
             result = select_event_endpoints(self._buffer, event_id)
 
@@ -286,6 +319,38 @@ class SofascoreCamoufoxCapture:
         self._navigate(nav_url)
         return dict(self._buffer)
 
+    def capture_tournament(self, nav_url: str) -> Dict[str, dict]:
+        """Navigate a league page, nudge it toward FINISHED results (Matches /
+        previous rounds), and return the whole capture buffer. The caller runs
+        ``extract_tournament_events(buffer, ut_id)`` to pull the match list.
+
+        The default tournament view loads only the upcoming round; finished
+        matches need an interaction to fire their ``/events/{round,last}`` XHR
+        (#757 B1). Interaction is best-effort — a miss yields the default round.
+        """
+        self._buffer = {}
+        self._navigate(nav_url)
+        self._nudge_results()
+        return dict(self._buffer)
+
+    def _nudge_results(self) -> None:
+        """Best-effort clicks so the SPA fetches finished matches (results / past
+        rounds) instead of only the default upcoming round (#757 B1)."""
+        for label in ("Matches", "Results"):
+            try:
+                self._page.get_by_text(label, exact=False).first.click(timeout=3000)
+                self._page.wait_for_timeout(self._tab_wait_ms)
+            except Exception:
+                pass
+        # Previous-round arrows have no text — target by aria-label / testid.
+        for sel in ('button[aria-label*="previous" i]', '[data-testid*="prev"]'):
+            for _ in range(3):
+                try:
+                    self._page.locator(sel).first.click(timeout=2000)
+                    self._page.wait_for_timeout(self._tab_wait_ms)
+                except Exception:
+                    break
+
     # -- internals -------------------------------------------------------- #
     def _navigate(self, url: str, extra_settle_ms: int = 0) -> None:
         self._page.goto(url, wait_until="domcontentloaded", timeout=self._nav_timeout_ms)
@@ -301,8 +366,8 @@ class SofascoreCamoufoxCapture:
             except Exception:
                 pass
 
-    def _click_tabs(self) -> None:
-        for label in _EVENT_TABS:
+    def _click_tabs(self, tabs=_EVENT_TABS) -> None:
+        for label in tabs:
             try:
                 self._page.get_by_text(label, exact=False).first.click(timeout=3000)
                 self._page.wait_for_timeout(self._tab_wait_ms)

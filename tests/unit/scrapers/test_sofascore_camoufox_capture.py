@@ -198,6 +198,55 @@ def test_normalize_event_flattens_row():
 
 
 # --------------------------------------------------------------------------- #
+#  extract_tournament_events (ut_id-filtered schedule capture — #757 B1)      #
+# --------------------------------------------------------------------------- #
+def _tournament_buffer():
+    """A league-page capture buffer mirroring the #757 B0 spike: the target
+    ut=17 schedule arrives via /events/{round,last}, AND a FEATURED other
+    tournament (ut=16) fires its own /events/last|next that must be ignored."""
+    return {
+        "/api/v1/unique-tournament/17/season/96668/events/round/1": {
+            "status": 200, "challenge": False, "json": {"events": [
+                {"id": 101, "status": {"type": "finished"}},
+                {"id": 102, "status": {"type": "notstarted"}},
+            ]}},
+        # last page (finished) — id 101 overlaps round/1 and must dedupe.
+        "/api/v1/unique-tournament/17/season/96668/events/last/0": {
+            "status": 200, "challenge": False, "json": {"events": [
+                {"id": 101, "status": {"type": "finished"}},
+                {"id": 103, "status": {"type": "finished"}},
+            ]}},
+        # FEATURED other tournament — MUST be excluded (the B0 wrong-ut bug).
+        "/api/v1/unique-tournament/16/season/58210/events/last/0": {
+            "status": 200, "challenge": False, "json": {"events": [
+                {"id": 901, "status": {"type": "finished"}},
+            ]}},
+        # challenged target path — ignored.
+        "/api/v1/unique-tournament/17/season/96668/events/next/0": {
+            "status": 403, "challenge": True, "json": {"error": {"reason": "challenge"}}},
+    }
+
+
+def test_extract_tournament_events_filters_by_ut_id_and_dedupes():
+    from scrapers.sofascore.camoufox_capture import extract_tournament_events
+    events = extract_tournament_events(_tournament_buffer(), 17)
+    ids = sorted(e["id"] for e in events)
+    # 101 deduped across round+last; 901 (ut=16 featured) excluded; challenged out.
+    assert ids == [101, 102, 103]
+
+
+def test_extract_tournament_events_feeds_finished_event_ids():
+    from scrapers.sofascore.camoufox_capture import extract_tournament_events
+    events = extract_tournament_events(_tournament_buffer(), 17)
+    assert finished_event_ids(events) == ["101", "103"]
+
+
+def test_extract_tournament_events_empty_for_absent_ut():
+    from scrapers.sofascore.camoufox_capture import extract_tournament_events
+    assert extract_tournament_events(_tournament_buffer(), 8) == []
+
+
+# --------------------------------------------------------------------------- #
 #  capture_event retry (lineups reliability — #757)                           #
 # --------------------------------------------------------------------------- #
 class TestCaptureEventRetry:
@@ -230,7 +279,7 @@ class TestCaptureEventRetry:
             calls["n"] += 1
 
         cap._navigate = fake_navigate
-        cap._click_tabs = lambda: None
+        cap._click_tabs = lambda *a, **k: None
 
         # Act
         result = cap.capture_event(eid, required=("lineups",), max_attempts=3)
@@ -253,7 +302,7 @@ class TestCaptureEventRetry:
             calls["n"] += 1
 
         cap._navigate = fake_navigate
-        cap._click_tabs = lambda: None
+        cap._click_tabs = lambda *a, **k: None
 
         # Act
         result = cap.capture_event(eid, required=("lineups",), max_attempts=3)
@@ -276,7 +325,7 @@ class TestCaptureEventRetry:
             calls["n"] += 1
 
         cap._navigate = fake_navigate
-        cap._click_tabs = lambda: None
+        cap._click_tabs = lambda *a, **k: None
 
         # Act
         cap.capture_event(eid, required=(), max_attempts=3)

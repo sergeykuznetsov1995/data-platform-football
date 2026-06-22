@@ -771,3 +771,144 @@ class TestReadPlayerRatingsCapture:
         assert df.empty
         assert 'match_id' in df.columns
         assert 'rating' in df.columns
+
+
+class TestCamoufoxProxy:
+    """_camoufox_proxy builds a Playwright/Camoufox proxy dict from the
+    configured residential proxy, splitting creds out of the URL — browsers
+    reject creds embedded in the proxy URL (#757).
+    """
+
+    def _scraper(self):
+        from scrapers.sofascore.scraper import SofaScoreScraper
+        with patch('scrapers.base.base_scraper.get_rate_limiter'), \
+             patch('scrapers.base.base_scraper.get_retry_policy'), \
+             patch('scrapers.base.base_scraper.get_circuit_breaker'), \
+             patch('scrapers.base.base_scraper.IcebergWriter'):
+            return SofaScoreScraper(leagues=['ENG-Premier League'], seasons=[2025])
+
+    @staticmethod
+    def _proxy(**kw):
+        from types import SimpleNamespace
+        defaults = dict(host='1.2.3.4', port=10000, username='u', password='p',
+                        masked_url='http://u:***@1.2.3.4:10000')
+        defaults.update(kw)
+        return SimpleNamespace(**defaults)
+
+    @pytest.mark.unit
+    def test_returns_split_creds_dict_when_proxy_has_credentials(self):
+        # Arrange
+        scraper = self._scraper()
+        scraper._proxy_manager = MagicMock(total_count=1)
+        scraper._proxy_manager.get_proxy.return_value = self._proxy()
+
+        # Act
+        out = scraper._camoufox_proxy()
+
+        # Assert — server + creds split out of the URL.
+        assert out == {
+            'server': 'http://1.2.3.4:10000', 'username': 'u', 'password': 'p',
+        }
+
+    @pytest.mark.unit
+    def test_omits_creds_when_proxy_has_none(self):
+        # Arrange — proxy without username/password (e.g. IP-allowlisted exit).
+        scraper = self._scraper()
+        scraper._proxy_manager = MagicMock(total_count=1)
+        scraper._proxy_manager.get_proxy.return_value = self._proxy(
+            username=None, password=None,
+        )
+
+        # Act
+        out = scraper._camoufox_proxy()
+
+        # Assert — only the server key; no username/password.
+        assert out == {'server': 'http://1.2.3.4:10000'}
+
+    @pytest.mark.unit
+    def test_returns_none_when_no_proxy_configured(self):
+        # Arrange — no proxy manager / empty pool → capture runs proxy-less and
+        # Turnstile 403s every endpoint; _camoufox_proxy signals that with None.
+        scraper = self._scraper()
+
+        scraper._proxy_manager = None
+        assert scraper._camoufox_proxy() is None
+
+        scraper._proxy_manager = MagicMock(total_count=0)
+        assert scraper._camoufox_proxy() is None
+        scraper._proxy_manager.get_proxy.assert_not_called()
+
+
+class TestResolveMatchIdsViaCapture:
+    """resolve_finished_match_ids_via_capture navigates the league page through
+    Camoufox and pulls finished match_ids from the captured /events XHR (#757 B1).
+    We patch the capture session so no browser is needed.
+    """
+
+    def _scraper(self):
+        from scrapers.sofascore.scraper import SofaScoreScraper
+        with patch('scrapers.base.base_scraper.get_rate_limiter'), \
+             patch('scrapers.base.base_scraper.get_retry_policy'), \
+             patch('scrapers.base.base_scraper.get_circuit_breaker'), \
+             patch('scrapers.base.base_scraper.IcebergWriter'):
+            return SofaScoreScraper(leagues=['ENG-Premier League'], seasons=[2025])
+
+    @staticmethod
+    def _buffer():
+        return {
+            "/api/v1/unique-tournament/17/season/96668/events/last/0": {
+                "status": 200, "challenge": False, "json": {"events": [
+                    {"id": 101, "status": {"type": "finished"}},
+                    {"id": 102, "status": {"type": "notstarted"}},
+                    {"id": 103, "status": {"type": "finished"}},
+                ]}},
+        }
+
+    class _FakeCap:
+        def __init__(self, buffer):
+            self._buffer = buffer
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def capture_tournament(self, nav_url):
+            return self._buffer
+
+    @pytest.mark.unit
+    def test_returns_finished_ids_from_capture(self):
+        # Arrange
+        scraper = self._scraper()
+        scraper._proxy_manager = None
+        fake = self._FakeCap(self._buffer())
+
+        # Act — patch the capture session (imported lazily inside the method).
+        with patch('scrapers.sofascore.camoufox_capture.SofascoreCamoufoxCapture',
+                   return_value=fake):
+            out = scraper.resolve_finished_match_ids_via_capture(
+                'ENG-Premier League', 2025,
+            )
+
+        # Assert — only finished events, deduped, notstarted dropped.
+        assert out == ['101', '103']
+
+    @pytest.mark.unit
+    def test_returns_empty_when_no_slug_or_ut_id(self):
+        # Arrange — NED-Eredivisie is in neither the ut_id nor the slug map.
+        scraper = self._scraper()
+        # Act / Assert — bails before opening a browser.
+        assert scraper.resolve_finished_match_ids_via_capture('NED-Eredivisie', 2025) == []
+
+    @pytest.mark.unit
+    def test_returns_empty_when_capture_raises(self):
+        # Arrange — a dead proxy / browser crash must degrade to [] (not raise).
+        scraper = self._scraper()
+        scraper._proxy_manager = None
+        with patch('scrapers.sofascore.camoufox_capture.SofascoreCamoufoxCapture',
+                   side_effect=RuntimeError('browser boom')):
+            out = scraper.resolve_finished_match_ids_via_capture(
+                'ENG-Premier League', 2025,
+            )
+        assert out == []

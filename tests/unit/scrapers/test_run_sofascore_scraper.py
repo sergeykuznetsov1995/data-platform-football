@@ -214,3 +214,60 @@ class TestSofascoreReplaceGuard:
         kwargs = scraper.save_to_iceberg.call_args.kwargs
         assert kwargs["min_replace_ratio"] == 0.9
         assert kwargs["replace_partitions"] == ["league", "season"]
+
+
+class TestPlayerRatingsCaptureFallback:
+    """#757 B2: when bronze.sofascore_schedule is empty (fresh season — the
+    soccerdata schedule is Turnstile-blocked), the runner resolves finished
+    match_ids via the scraper's Camoufox capture resolver before declaring
+    R0.2B fallback.
+    """
+
+    @pytest.fixture
+    def temp_output(self):
+        fd, path = tempfile.mkstemp(suffix=".json", prefix="sofascore_")
+        os.close(fd)
+        yield path
+        if os.path.exists(path):
+            os.unlink(path)
+
+    @pytest.mark.unit
+    def test_empty_bronze_resolves_via_capture_then_saves(self, temp_output):
+        # Arrange — bronze returns [] for both season forms; capture finds ids.
+        scraper = _ratings_scraper()
+        scraper.resolve_finished_match_ids_via_capture.return_value = ['101', '103']
+
+        # Act
+        rc = _run_main(
+            ["--entity", "player_ratings", "--league", "ENG-Premier League",
+             "--season", "2024", "--output", temp_output],
+            MagicMock(return_value=scraper),
+            resolver_ids=[],
+        )
+
+        # Assert — capture drove the match_ids into read_player_ratings; save ran.
+        assert rc == 0
+        scraper.resolve_finished_match_ids_via_capture.assert_called_once()
+        assert scraper.read_player_ratings.call_args.kwargs['match_ids'] == ['101', '103']
+
+    @pytest.mark.unit
+    def test_empty_bronze_and_empty_capture_exits_2(self, temp_output):
+        # Arrange — neither bronze nor capture yields match_ids (off-season).
+        scraper = _ratings_scraper()
+        scraper.resolve_finished_match_ids_via_capture.return_value = []
+
+        # Act
+        rc = _run_main(
+            ["--entity", "player_ratings", "--league", "ENG-Premier League",
+             "--season", "2024", "--output", temp_output],
+            MagicMock(return_value=scraper),
+            resolver_ids=[],
+        )
+
+        # Assert — graceful R0.2B fallback (soft success), read_player_ratings skipped.
+        assert rc == 2
+        scraper.read_player_ratings.assert_not_called()
+        with open(temp_output) as f:
+            payload = json.load(f)
+        assert payload['fallback'] is True
+        assert payload['fallback_reason'] == 'no_match_ids'
