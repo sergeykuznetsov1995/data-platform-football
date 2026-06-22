@@ -249,6 +249,93 @@ class TestEventPlayerStatsFlatten:
         assert row['player_id'] == '1'
 
 
+class TestEventPlayerStatsFromLineups:
+    """Tests for deriving per-(match, player) stats from the captured /lineups
+    payload (#751 PR1). Live-verified 2026-06-22: lineups carries the full
+    per-player ``statistics`` block (33 Opta metrics) + anchors, so eps no
+    longer needs ~25 per-player /player/{pid}/statistics calls per match."""
+
+    def _lineups(self):
+        # Mirrors the live /event/{id}/lineups shape (APL 14023959, #751):
+        # per-player `statistics` holds the rich Opta block; anchors
+        # (position/substitute/captain) come straight off the entry; is_home
+        # off the side. `captain` present only on the captain's entry.
+        return {
+            'home': {'players': [
+                {'player': {'id': 11111, 'name': 'Keeper'}, 'position': 'G',
+                 'substitute': False, 'captain': True,
+                 'statistics': {
+                     'rating': '7.8', 'accuratePass': 35, 'totalPass': 40,
+                     'expectedAssists': {'value': 0.21, 'previousValue': 0.10},
+                     'goalsPrevented': 0.42, 'saves': 3,
+                     'noisyStruct': {'foo': 'bar'},
+                 }},
+            ]},
+            'away': {'players': [
+                {'player': {'id': 22222, 'name': 'Striker'}, 'position': 'F',
+                 'substitute': True,
+                 'statistics': {'rating': '6.5', 'totalShots': 2}},
+            ]},
+        }
+
+    def _event(self):
+        return {'homeTeam': {'id': 1, 'name': 'Team X'},
+                'awayTeam': {'id': 2, 'name': 'Team Y'}}
+
+    def test_happy_path_home_and_away(self):
+        from scrapers.sofascore.scraper import SofaScoreScraper
+
+        rows = SofaScoreScraper._flatten_event_player_stats_from_lineups(
+            '14023959', self._lineups(), self._event(),
+        )
+        assert len(rows) == 2
+        home = next(r for r in rows if r['player_id'] == '11111')
+        away = next(r for r in rows if r['player_id'] == '22222')
+
+        # Anchors — all populated directly from lineups (no overlay needed).
+        assert home['match_id'] == '14023959'
+        assert home['team_id'] == 1
+        assert home['team_name'] == 'Team X'
+        assert home['is_home'] is True
+        assert home['captain'] is True
+        assert home['substitute'] is False
+        assert home['position'] == 'G'
+        assert home['position_specific'] == 'G'
+
+        assert away['team_id'] == 2
+        assert away['is_home'] is False
+        # `captain` absent on non-captain entry → False, not None.
+        assert away['captain'] is False
+        assert away['substitute'] is True
+
+        # Stats auto-flattened (snake_case + struct unwrap), same rules as the
+        # dedicated-endpoint flattener.
+        assert home['rating'] == 7.8
+        assert home['accurate_pass'] == 35
+        assert home['total_pass'] == 40
+        assert home['expected_assists'] == 0.21
+        assert home['goals_prevented'] == 0.42
+        assert home['noisy_struct'] is None
+        assert away['total_shots'] == 2
+
+    def test_no_event_payload_team_fields_none(self):
+        from scrapers.sofascore.scraper import SofaScoreScraper
+        rows = SofaScoreScraper._flatten_event_player_stats_from_lineups(
+            '1', self._lineups(), None,
+        )
+        assert len(rows) == 2
+        assert all(r['team_id'] is None and r['team_name'] is None for r in rows)
+        # Anchors that come from lineups itself still populated.
+        assert rows[0]['is_home'] in (True, False)
+
+    def test_garbage_payload(self):
+        from scrapers.sofascore.scraper import SofaScoreScraper
+        assert SofaScoreScraper._flatten_event_player_stats_from_lineups(
+            '1', None, None) == []
+        assert SofaScoreScraper._flatten_event_player_stats_from_lineups(
+            '1', {'home': {'players': None}, 'away': {}}, None) == []
+
+
 class TestLineupOverlayLookup:
     """Tests for _build_lineup_overlay_lookup — the /lineups projection
     that back-fills is_home/captain/substitute/position_specific (#301)."""
@@ -771,6 +858,96 @@ class TestReadPlayerRatingsCapture:
         assert df.empty
         assert 'match_id' in df.columns
         assert 'rating' in df.columns
+
+
+class TestReadMatchCapture:
+    """read_match_capture (#751 PR1): ONE Camoufox capture pass per match →
+    both player_ratings and event_player_stats frames. We patch the
+    ``_iter_match_captures`` seam (no browser); per-side ratings + lineups-
+    derived eps + team mapping from /event + (league, season) tagging is what
+    we assert."""
+
+    def _scraper(self):
+        from scrapers.sofascore.scraper import SofaScoreScraper
+        with patch('scrapers.base.base_scraper.get_rate_limiter'), \
+             patch('scrapers.base.base_scraper.get_retry_policy'), \
+             patch('scrapers.base.base_scraper.get_circuit_breaker'), \
+             patch('scrapers.base.base_scraper.IcebergWriter'):
+            return SofaScoreScraper(leagues=['ENG-Premier League'], seasons=[2025])
+
+    def _endpoints(self):
+        return {
+            'lineups': {
+                'home': {'players': [
+                    {'player': {'id': 11111}, 'position': 'G',
+                     'substitute': False, 'captain': True,
+                     'statistics': {'rating': '7.2', 'totalPass': 30}},
+                ]},
+                'away': {'players': [
+                    {'player': {'id': 22222}, 'position': 'F',
+                     'substitute': False,
+                     'statistics': {'rating': '6.5', 'totalShots': 3}},
+                ]},
+            },
+            'event': {'homeTeam': {'id': 1, 'name': 'Home FC'},
+                      'awayTeam': {'id': 2, 'name': 'Away FC'}},
+        }
+
+    @pytest.mark.unit
+    def test_one_pass_yields_both_frames(self):
+        scraper = self._scraper()
+        seen = []
+
+        def fake_iter(match_ids, **kwargs):
+            for mid in match_ids:
+                seen.append(str(mid))
+                yield str(mid), self._endpoints()
+
+        scraper._iter_match_captures = fake_iter
+
+        out = scraper.read_match_capture(
+            league='ENG-Premier League', season=2025, match_ids=['M1', 'M2'],
+        )
+        # ONE capture per match (not one per table) — the "one nav" contract.
+        assert seen == ['M1', 'M2']
+
+        ratings = out['player_ratings']
+        eps = out['event_player_stats']
+        assert len(ratings) == 4   # 2 matches × 2 players
+        assert len(eps) == 4
+        assert set(ratings['season']) == {'2526'}
+        assert set(eps['season']) == {'2526'}
+        assert set(eps['_entity_type']) == {'event_player_stats'}
+
+        erows = {(r['match_id'], r['player_id']): r for r in eps.to_dict('records')}
+        home = erows[('M1', '11111')]
+        away = erows[('M1', '22222')]
+        # team mapping from the captured /event payload.
+        assert home['team_id'] == 1 and home['team_name'] == 'Home FC'
+        assert away['team_id'] == 2
+        # anchors straight from lineups (no overlay needed).
+        assert home['is_home'] and home['captain']
+        assert not away['is_home']
+        assert home['total_pass'] == 30
+        assert away['total_shots'] == 3
+
+    @pytest.mark.unit
+    def test_graceful_empty_when_no_lineups(self):
+        scraper = self._scraper()
+
+        def fake_iter(match_ids, **kwargs):
+            for mid in match_ids:
+                yield str(mid), {}
+
+        scraper._iter_match_captures = fake_iter
+
+        out = scraper.read_match_capture(
+            league='ENG-Premier League', season=2025, match_ids=['M1'],
+        )
+        assert out['player_ratings'].empty
+        assert out['event_player_stats'].empty
+        assert 'match_id' in out['player_ratings'].columns
+        assert 'match_id' in out['event_player_stats'].columns
 
 
 class TestCamoufoxProxy:

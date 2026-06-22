@@ -591,19 +591,27 @@ class SofaScoreScraper(SoccerdataScraper):
         logger.info("SofaScore capture proxy: %s", proxy_obj.masked_url)
         return d
 
-    def _iter_lineup_payloads(self, match_ids: List[str]):
-        """Yield ``(match_id, lineups_payload | None)`` by capturing each match
-        page through ONE warmed Camoufox session (issue #757, path P2).
+    def _iter_match_captures(
+        self,
+        match_ids: List[str],
+        tabs=("Lineups",),
+        required=("lineups",),
+    ):
+        """Yield ``(match_id, endpoints)`` by capturing each match page through
+        ONE warmed Camoufox session (issue #757, path P2). ``endpoints`` holds
+        whichever of ``event/lineups/statistics/shotmap/incidents`` came back as
+        real JSON (see ``camoufox_capture.select_event_endpoints``).
 
-        Replaces the dead ``tls_requests`` ``/lineups`` fetch: SofaScore's API
-        is Cloudflare-Turnstile-gated and only a real Firefox (Camoufox) behind
-        a residential proxy passes it. We let the SPA fire its own
-        ``/api/v1/event/{id}/lineups`` XHR and capture the response — see
-        ``scrapers/sofascore/camoufox_capture.py``. ``None`` means the lineups
-        endpoint wasn't captured (Turnstile not solved / proxy dead); the
-        caller treats it like a fetch miss. The generator owns the browser
-        session — the caller must ``.close()`` it (e.g. via try/finally) so the
-        session tears down even on an early circuit-breaker break.
+        Generalises the ratings-only lineup iterator so the daily consolidated
+        path (#751 PR1) also gets the ``event`` payload (``homeTeam``/
+        ``awayTeam`` — team mapping for ``event_player_stats``) from the SAME
+        single navigation. Replaces the dead ``tls_requests`` REST path:
+        SofaScore's API is Cloudflare-Turnstile-gated and only a real Firefox
+        (Camoufox) behind a residential proxy passes it; the SPA fires its own
+        XHRs and we capture the responses. ``endpoints`` without ``lineups``
+        means the capture missed (Turnstile not solved / proxy dead). The
+        generator owns the browser session — the caller MUST ``.close()`` it
+        (via try/finally) so it tears down even on an early circuit-breaker break.
         """
         from scrapers.sofascore.camoufox_capture import SofascoreCamoufoxCapture
 
@@ -613,14 +621,13 @@ class SofaScoreScraper(SoccerdataScraper):
                 self._rate_limiter.acquire()
                 self._stats['requests'] += 1
                 try:
-                    # ratings only needs /lineups — click just that tab to
-                    # avoid fetching Statistics/Shotmap (saves proxy bytes/time).
-                    endpoints = cap.capture_event(str(mid), tabs=("Lineups",))
-                    lineups = endpoints.get('lineups')
+                    endpoints = cap.capture_event(
+                        str(mid), tabs=tabs, required=required,
+                    )
                 except Exception as e:  # noqa: BLE001 — one bad event mustn't kill the loop
                     logger.warning("camoufox capture failed for event=%s: %s", mid, e)
-                    lineups = None
-                if lineups is None:
+                    endpoints = {}
+                if not endpoints.get('lineups'):
                     self._stats['failures'] += 1
                     self._last_lineup_error = {
                         'event_id': str(mid),
@@ -629,7 +636,20 @@ class SofaScoreScraper(SoccerdataScraper):
                     }
                 else:
                     self._stats['successes'] += 1
-                yield str(mid), lineups
+                yield str(mid), endpoints
+
+    def _iter_lineup_payloads(self, match_ids: List[str]):
+        """Yield ``(match_id, lineups_payload | None)`` — the ratings-only view
+        over :meth:`_iter_match_captures` (keeps ``read_player_ratings``
+        unchanged: it clicks just the Lineups tab and consumes ``lineups``)."""
+        captures = self._iter_match_captures(match_ids, tabs=("Lineups",))
+        try:
+            for mid, endpoints in captures:
+                yield mid, ((endpoints or {}).get('lineups'))
+        finally:
+            close = getattr(captures, 'close', None)
+            if callable(close):
+                close()  # tear down the Camoufox session
 
     def resolve_finished_match_ids_via_capture(
         self, league: str, season: int,
@@ -803,6 +823,152 @@ class SofaScoreScraper(SoccerdataScraper):
             len(df), df['match_id'].nunique(),
         )
         return df
+
+    # ------------------------------------------------------------------
+    # #751 PR1 — consolidated per-match capture (one nav → ratings + eps)
+    # ------------------------------------------------------------------
+
+    def read_match_capture(
+        self,
+        league: str,
+        season: int,
+        match_ids: Optional[List[str]] = None,
+        limit: Optional[int] = None,
+    ) -> Dict[str, pd.DataFrame]:
+        """ONE Camoufox capture pass per match → both ``player_ratings`` and
+        ``event_player_stats`` frames (#751 PR1).
+
+        Replaces two separate Turnstile-blocked passes with a single navigation
+        per match: the captured ``/lineups`` payload yields ratings (via
+        :meth:`_flatten_lineup_side`) AND per-player Opta stats (via
+        :meth:`_flatten_event_player_stats_from_lineups`); ``team_id``/
+        ``team_name`` come from the captured ``/event`` payload (best-effort —
+        NULL when ``event`` wasn't captured on that nav).
+
+        Returns ``{'player_ratings': df, 'event_player_stats': df}``; both empty
+        on graceful fallback (caller emits ``R0.2B_FALLBACK``). Season slug is
+        coerced to the soccerdata short form (``2526``) so the partition matches
+        the schedule writer (#27).
+        """
+        ratings_cols = [
+            'match_id', 'player_id', 'team_side', 'rating', 'position',
+            'league', 'season',
+        ]
+        eps_cols = [
+            'match_id', 'player_id', 'team_id', 'team_name', 'is_home',
+            'position', 'position_specific', 'captain', 'substitute',
+            'league', 'season',
+        ]
+
+        if match_ids is None:
+            match_ids = self._resolve_match_ids(league, season)
+
+        season_str = str(season)
+        if len(season_str) == 4 and season_str.isdigit():
+            season_short = f"{season_str[2:4]}{int(season_str[2:4]) + 1:02d}"
+        else:
+            season_short = season_str
+
+        empty = {
+            'player_ratings': pd.DataFrame(columns=ratings_cols + ['_ingested_at']),
+            'event_player_stats': pd.DataFrame(columns=eps_cols + ['_ingested_at']),
+        }
+
+        if not match_ids:
+            logger.warning(
+                "No match_ids resolved for match_capture (league=%s season=%s).",
+                league, season,
+            )
+            return empty
+
+        if limit:
+            match_ids = list(match_ids)[: int(limit)]
+
+        logger.info(
+            "match_capture: capturing %d matches (league=%s season=%s)",
+            len(match_ids), league, season,
+        )
+
+        ratings_rows: List[Dict] = []
+        eps_rows: List[Dict] = []
+        consecutive_failures = 0
+        max_consecutive = 10  # ~dead proxy / Turnstile not solved — bail early.
+
+        captures = self._iter_match_captures(match_ids, tabs=("Lineups",))
+        try:
+            for idx, (mid, endpoints) in enumerate(captures, start=1):
+                lineups = (endpoints or {}).get('lineups')
+                if lineups is None:
+                    consecutive_failures += 1
+                    if consecutive_failures >= max_consecutive:
+                        logger.error(
+                            "%s: %d consecutive lineup capture failures — "
+                            "aborting match_capture early to preserve proxy budget.",
+                            R0_2B_FALLBACK_MARKER, consecutive_failures,
+                        )
+                        break
+                    continue
+
+                consecutive_failures = 0
+                event_payload = (endpoints or {}).get('event')
+                for side in ('home', 'away'):
+                    ratings_rows.extend(self._flatten_lineup_side(
+                        match_id=str(mid),
+                        side=side,
+                        side_payload=lineups.get(side) or {},
+                    ))
+                eps_rows.extend(self._flatten_event_player_stats_from_lineups(
+                    str(mid), lineups, event_payload,
+                ))
+
+                if idx % 25 == 0:
+                    logger.info("match_capture progress: %d/%d matches",
+                                idx, len(match_ids))
+        finally:
+            close = getattr(captures, 'close', None)
+            if callable(close):
+                close()  # tear down the Camoufox session
+
+        out: Dict[str, pd.DataFrame] = {}
+
+        if ratings_rows:
+            rdf = pd.DataFrame(ratings_rows, columns=[
+                'match_id', 'player_id', 'team_side', 'rating', 'position',
+            ])
+            rdf['league'] = league
+            rdf['season'] = season_short
+            rdf['_ingested_at'] = datetime.utcnow()
+            rdf['_source'] = self.SOURCE_NAME
+            rdf['_entity_type'] = 'player_ratings'
+            rdf['_batch_id'] = self._batch_id
+            out['player_ratings'] = rdf
+        else:
+            out['player_ratings'] = empty['player_ratings']
+
+        if eps_rows:
+            edf = pd.DataFrame(eps_rows)
+            edf['league'] = league
+            edf['season'] = season_short
+            edf['_ingested_at'] = datetime.utcnow()
+            edf['_source'] = self.SOURCE_NAME
+            edf['_entity_type'] = 'event_player_stats'
+            edf['_batch_id'] = self._batch_id
+            out['event_player_stats'] = edf
+        else:
+            out['event_player_stats'] = empty['event_player_stats']
+
+        if not ratings_rows and not eps_rows:
+            logger.warning(
+                "%s: match_capture materialised zero rows across %d match attempts.",
+                R0_2B_FALLBACK_MARKER, len(match_ids),
+            )
+
+        logger.info(
+            "match_capture: %d rating rows + %d eps rows across %d matches",
+            len(out['player_ratings']), len(out['event_player_stats']),
+            len(match_ids),
+        )
+        return out
 
     # ------------------------------------------------------------------
     # #22 event shotmap — per-shot xG / coords / situation / body part
@@ -1058,6 +1224,89 @@ class SofaScoreScraper(SoccerdataScraper):
                 row['rating'] = None
 
         return row
+
+    @staticmethod
+    def _flatten_event_player_stats_from_lineups(
+        match_id: str,
+        lineups_payload: dict,
+        event_payload: Optional[dict] = None,
+    ) -> List[Dict]:
+        """Project the captured ``/lineups`` payload into per-(match, player)
+        Opta-stat rows — the Camoufox-capture replacement for the dead
+        ``/event/{id}/player/{pid}/statistics`` per-player calls (#751).
+
+        Live-verified 2026-06-22 (#751): each ``/lineups`` player entry carries
+        the full per-match ``statistics`` block (33 Opta metrics) PLUS the
+        anchors the dedicated endpoint omitted — ``is_home`` (from the side),
+        ``captain``/``substitute``/``position`` (from the entry). So unlike the
+        per-player path (which needed a /lineups overlay to back-fill those NULL
+        anchors, #301), this single payload populates them directly.
+
+        ``team_id``/``team_name`` are absent from ``/lineups``; they come from
+        the captured ``event_payload`` (``homeTeam``/``awayTeam``). A ``None``
+        event payload leaves them NULL. Stat keys auto-flatten through
+        ``_camel_to_snake`` + ``_coerce_scalar`` — identical rules to
+        :meth:`_flatten_event_player_stats`, so the Bronze schema is unchanged.
+        """
+        rows: List[Dict] = []
+        if not isinstance(lineups_payload, dict):
+            return rows
+
+        ev = event_payload if isinstance(event_payload, dict) else {}
+        team_by_side = {
+            'home': ev.get('homeTeam') or {},
+            'away': ev.get('awayTeam') or {},
+        }
+
+        for side in ('home', 'away'):
+            side_payload = lineups_payload.get(side) or {}
+            if not isinstance(side_payload, dict):
+                continue
+            team = team_by_side.get(side) or {}
+            for entry in side_payload.get('players', []) or []:
+                if not isinstance(entry, dict):
+                    continue
+                player = entry.get('player') or {}
+                pid = player.get('id')
+                if pid is None:
+                    continue
+                stats = entry.get('statistics') or {}
+
+                player_id_str = (
+                    str(int(pid)) if isinstance(pid, (int, float)) else str(pid)
+                )
+                row: Dict = {
+                    'match_id': str(match_id),
+                    'player_id': player_id_str,
+                    'team_id': team.get('id'),
+                    'team_name': team.get('name'),
+                    'is_home': side == 'home',
+                    'position': entry.get('position') or player.get('position') or None,
+                    'position_specific': entry.get('position') or None,
+                    'captain': bool(entry.get('captain')),
+                    'substitute': bool(entry.get('substitute')),
+                }
+
+                # Auto-flatten every numeric/scalar statistic (mirrors
+                # _flatten_event_player_stats). Skip the `position` re-export
+                # and never overwrite an anchor column.
+                for raw_key, raw_val in stats.items():
+                    if raw_key == 'position':
+                        continue
+                    snake = _camel_to_snake(str(raw_key))
+                    if snake in row:
+                        continue
+                    row[snake] = _coerce_scalar(raw_val)
+
+                if 'rating' not in row and stats.get('rating') is not None:
+                    try:
+                        row['rating'] = float(stats['rating'])
+                    except (TypeError, ValueError):
+                        row['rating'] = None
+
+                rows.append(row)
+
+        return rows
 
     def _fetch_event_player_stats_payload(
         self,

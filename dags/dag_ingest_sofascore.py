@@ -30,9 +30,10 @@ from utils.default_args import SCRAPER_ARGS
 
 
 SCHEDULE_RESULT_PATH = '/tmp/sofascore_result.json'
-PLAYER_RATINGS_RESULT_PATH = '/tmp/sofascore_player_ratings_result.json'
+# #751 PR1 — one consolidated Camoufox capture per match writes BOTH
+# player_ratings and event_player_stats (replaces two separate tls passes).
+MATCH_CAPTURE_RESULT_PATH = '/tmp/sofascore_match_capture_result.json'
 SHOTMAP_RESULT_PATH = '/tmp/sofascore_shotmap_result.json'
-EVENT_PLAYER_STATS_RESULT_PATH = '/tmp/sofascore_event_player_stats_result.json'
 MATCH_STATS_RESULT_PATH = '/tmp/sofascore_match_stats_result.json'
 PLAYER_SEASON_STATS_RESULT_PATH = '/tmp/sofascore_player_season_stats_result.json'
 PLAYER_PROFILE_RESULT_PATH = '/tmp/sofascore_player_profile_result.json'
@@ -53,7 +54,6 @@ def _env_int(name: str) -> Optional[int]:
 # Per-endpoint safety knobs. Default = None (no cap, full coverage).
 # Override via ENV on dev / staging to keep runs bounded. Issue #69.
 SHOTMAP_DAILY_LIMIT = _env_int('SS_SHOTMAP_LIMIT')
-EVENT_PLAYER_STATS_DAILY_LIMIT = _env_int('SS_EPS_LIMIT')
 MATCH_STATS_DAILY_LIMIT = _env_int('SS_MATCH_STATS_LIMIT')
 PLAYER_SEASON_STATS_DAILY_LIMIT = _env_int('SS_PSS_LIMIT')
 PLAYER_PROFILE_DAILY_LIMIT = _env_int('SS_PP_LIMIT')
@@ -89,9 +89,11 @@ def validate_data(**context) -> Dict[str, Any]:
     logger = logging.getLogger(__name__)
 
     schedule_result = _load_result(SCHEDULE_RESULT_PATH, logger)
-    ratings_result = _load_result(PLAYER_RATINGS_RESULT_PATH, logger)
+    # #751 PR1: ratings + event_player_stats now come from ONE consolidated
+    # capture run (single result file with both `rows`/`matches_with_ratings`
+    # and `eps_rows`/`eps_matches`).
+    capture_result = _load_result(MATCH_CAPTURE_RESULT_PATH, logger)
     shotmap_result = _load_result(SHOTMAP_RESULT_PATH, logger)
-    eps_result = _load_result(EVENT_PLAYER_STATS_RESULT_PATH, logger)
     match_stats_result = _load_result(MATCH_STATS_RESULT_PATH, logger)
     pss_result = _load_result(PLAYER_SEASON_STATS_RESULT_PATH, logger)
     pp_result = _load_result(PLAYER_PROFILE_RESULT_PATH, logger)
@@ -107,15 +109,15 @@ def validate_data(**context) -> Dict[str, Any]:
         'summary': {
             'schedule_rows': schedule_result.get('schedule_rows', 0),
             'league_table_rows': schedule_result.get('league_table_rows', 0),
-            'player_ratings_rows': ratings_result.get('rows', 0),
-            'player_ratings_matches': ratings_result.get('matches_with_ratings', 0),
-            'player_ratings_fallback': ratings_result.get('fallback', False),
+            'player_ratings_rows': capture_result.get('rows', 0),
+            'player_ratings_matches': capture_result.get('matches_with_ratings', 0),
+            'player_ratings_fallback': capture_result.get('fallback', False),
             'shotmap_rows': shotmap_result.get('rows', 0),
             'shotmap_matches': shotmap_result.get('matches_with_rows', 0),
             'shotmap_fallback': shotmap_result.get('fallback', False),
-            'event_player_stats_rows': eps_result.get('rows', 0),
-            'event_player_stats_matches': eps_result.get('matches_with_rows', 0),
-            'event_player_stats_fallback': eps_result.get('fallback', False),
+            'event_player_stats_rows': capture_result.get('eps_rows', 0),
+            'event_player_stats_matches': capture_result.get('eps_matches', 0),
+            'event_player_stats_fallback': capture_result.get('fallback', False),
             'match_stats_rows': match_stats_result.get('rows', 0),
             'match_stats_matches': match_stats_result.get('matches_with_rows', 0),
             'match_stats_fallback': match_stats_result.get('fallback', False),
@@ -127,9 +129,8 @@ def validate_data(**context) -> Dict[str, Any]:
             'player_profile_fallback': pp_result.get('fallback', False),
             'tables': (
                 schedule_result.get('tables', [])
-                + ratings_result.get('tables', [])
+                + capture_result.get('tables', [])
                 + shotmap_result.get('tables', [])
-                + eps_result.get('tables', [])
                 + match_stats_result.get('tables', [])
                 + pss_result.get('tables', [])
                 + pp_result.get('tables', [])
@@ -139,9 +140,8 @@ def validate_data(**context) -> Dict[str, Any]:
 
     errors: List[str] = []
     errors.extend(schedule_result.get('errors', []) or [])
-    errors.extend(ratings_result.get('errors', []) or [])
+    errors.extend(capture_result.get('errors', []) or [])
     errors.extend(shotmap_result.get('errors', []) or [])
-    errors.extend(eps_result.get('errors', []) or [])
     errors.extend(match_stats_result.get('errors', []) or [])
     errors.extend(pss_result.get('errors', []) or [])
     errors.extend(pp_result.get('errors', []) or [])
@@ -399,22 +399,26 @@ python dags/scripts/run_sofascore_scraper.py \\
         append_env=True,
     )
 
-    # R0.2B player_ratings: depends on freshly written bronze.sofascore_schedule
-    # (runner reads finished match_ids from there). Exit code 2 = graceful
-    # R0.2B_FALLBACK; treat as success at the bash level so validate_data runs.
-    scrape_player_ratings_task = BashOperator(
-        task_id='scrape_player_ratings',
+    # #751 PR1 — consolidated per-match capture: ONE Camoufox nav/match writes
+    # BOTH bronze.sofascore_player_ratings and bronze.sofascore_event_player_stats
+    # from the same /lineups (+/event) payload. Depends on freshly written
+    # bronze.sofascore_schedule (runner reads finished match_ids there; falls
+    # back to capture discovery when empty). Exit 2 = graceful R0.2B_FALLBACK
+    # (soft success so validate_data runs); exit 3 = completeness-guard refusal
+    # (propagates as a real failure).
+    scrape_match_capture_task = BashOperator(
+        task_id='scrape_match_capture',
         bash_command=f"""
 cd /opt/airflow && \\
-rm -f {PLAYER_RATINGS_RESULT_PATH} && \\
+rm -f {MATCH_CAPTURE_RESULT_PATH} && \\
 python dags/scripts/run_sofascore_scraper.py \\
-    --entity player_ratings \\
+    --entity match_capture \\
     --league "{LEAGUES[0]}" \\
     --season {CURRENT_SEASON} \\
-    --output {PLAYER_RATINGS_RESULT_PATH}
+    --output {MATCH_CAPTURE_RESULT_PATH}
 rc=$?
 if [ $rc -eq 2 ]; then
-    echo "R0.2B_FALLBACK exit-code 2 — propagating as soft success."
+    echo "R0.2B_FALLBACK exit-code 2 (match_capture) — propagating as soft success."
     exit 0
 fi
 exit $rc
@@ -542,36 +546,6 @@ exit $rc
         append_env=True,
     )
 
-    # #21 — per-(match, player) Opta stats. Depends on fresh
-    # bronze.sofascore_player_ratings (provides the player_id list per match).
-    # No daily cap by default (#69); runner skip-existing keeps steady-state
-    # runs ~10 min.
-    scrape_event_player_stats_task = BashOperator(
-        task_id='scrape_event_player_stats',
-        bash_command=f"""
-cd /opt/airflow && \\
-rm -f {EVENT_PLAYER_STATS_RESULT_PATH} && \\
-python dags/scripts/run_sofascore_scraper.py \\
-    --entity event_player_stats \\
-    --league "{LEAGUES[0]}" \\
-    --season {CURRENT_SEASON} \\
-    {_limit_arg(EVENT_PLAYER_STATS_DAILY_LIMIT)} \\
-    --output {EVENT_PLAYER_STATS_RESULT_PATH}
-rc=$?
-if [ $rc -eq 2 ]; then
-    echo "R0.2B_FALLBACK exit-code 2 (event_player_stats) — propagating as soft success."
-    exit 0
-fi
-exit $rc
-""",
-        env={
-            'PYTHONPATH': '/opt/airflow:/opt/airflow/dags',
-            'PATH': '/usr/local/bin:/usr/bin:/bin:/home/airflow/.local/bin',
-            'HOME': '/home/airflow',
-        },
-        append_env=True,
-    )
-
     validate_data_task = PythonOperator(
         task_id='validate_data',
         python_callable=validate_data,
@@ -586,22 +560,20 @@ exit $rc
         trigger_rule='all_done',
     )
 
-    # schedule writes match_ids → ratings (depends on schedule),
-    # then [shotmap, match_stats] in parallel (both need only schedule),
-    # then [event_player_stats, player_season_stats, player_profile]
-    # in parallel (all three need ratings for player_id list),
+    # schedule → match_capture (ratings + event_player_stats from ONE nav/match),
+    # plus [shotmap, match_stats] in parallel (both need only schedule),
+    # then [player_season_stats, player_profile] in parallel (both read
+    # bronze.sofascore_player_ratings, which match_capture writes),
     # then validate_data on all_done.
-    scrape_data_task >> scrape_player_ratings_task
+    scrape_data_task >> scrape_match_capture_task
     scrape_data_task >> scrape_shotmap_task
     scrape_data_task >> scrape_match_stats_task
-    scrape_player_ratings_task >> scrape_event_player_stats_task
-    scrape_player_ratings_task >> scrape_player_season_stats_task
-    scrape_player_ratings_task >> scrape_player_profile_task
+    scrape_match_capture_task >> scrape_player_season_stats_task
+    scrape_match_capture_task >> scrape_player_profile_task
     [
-        scrape_player_ratings_task,
+        scrape_match_capture_task,
         scrape_shotmap_task,
         scrape_match_stats_task,
-        scrape_event_player_stats_task,
         scrape_player_season_stats_task,
         scrape_player_profile_task,
     ] >> validate_data_task >> validate_bronze_freshness_task
