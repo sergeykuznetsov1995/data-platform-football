@@ -651,6 +651,38 @@ class SofaScoreScraper(SoccerdataScraper):
             if callable(close):
                 close()  # tear down the Camoufox session
 
+    def _iter_player_captures(self, player_ids: List[str]):
+        """Yield ``(player_id, capture)`` by navigating each player page through
+        ONE warmed Camoufox session (#751 PR3). ``capture`` is the
+        ``{'profile'}`` dict from
+        :meth:`SofascoreCamoufoxCapture.capture_player` — the bio SSR'd in
+        ``__NEXT_DATA__``. Mirrors :meth:`_iter_match_captures`. A
+        ``{'profile': None}`` means the capture missed (page didn't render /
+        proxy dead). The generator owns the browser session — the caller MUST
+        ``.close()`` it (try/finally) so it tears down even on an early
+        circuit-breaker break."""
+        from scrapers.sofascore.camoufox_capture import SofascoreCamoufoxCapture
+
+        proxy = self._camoufox_proxy()
+        with SofascoreCamoufoxCapture(proxy=proxy) as cap:
+            for pid in player_ids:
+                self._rate_limiter.acquire()
+                self._stats['requests'] += 1
+                try:
+                    capture = cap.capture_player(str(pid))
+                except Exception as e:  # noqa: BLE001 — one bad player mustn't kill the loop
+                    logger.warning("camoufox capture failed for player=%s: %s", pid, e)
+                    capture = {'profile': None}
+                if not capture.get('profile'):
+                    self._stats['failures'] += 1
+                    self._last_lineup_error = {
+                        'event_id': None, 'player_id': str(pid),
+                        'status': None, 'error': 'player_not_captured',
+                    }
+                else:
+                    self._stats['successes'] += 1
+                yield str(pid), capture
+
     def resolve_finished_match_ids_via_capture(
         self, league: str, season: int,
     ) -> List[str]:
@@ -2196,6 +2228,123 @@ class SofaScoreScraper(SoccerdataScraper):
             len(df), df['player_id'].nunique(),
         )
         return df
+
+    # ------------------------------------------------------------------
+    # #751 PR3 — per-player capture (biographical profile snapshot)
+    # ------------------------------------------------------------------
+
+    def read_player_capture(
+        self,
+        league: str,
+        season: int,
+        player_ids: Optional[List[str]] = None,
+        limit: Optional[int] = None,
+    ) -> Dict[str, pd.DataFrame]:
+        """ONE Camoufox navigation per player → the player_profile Bronze frame
+        (#751 PR3).
+
+        Replaces the dead tls ``read_player_profile`` pass (403'd on Turnstile)
+        with a player-page capture: :meth:`_flatten_player_profile` over the bio
+        SSR'd in ``__NEXT_DATA__`` (``props.pageProps.player``). The bio is
+        server-rendered, so it needs no Turnstile-gated XHR.
+
+        Season-aggregate stats are deferred to PR3b (they need the Season tab + a
+        season-picker for transferred/multi-competition players whose default
+        Season tab is a non-EPL competition — live-proven on Paquetá).
+
+        Returns ``{'player_profile'}`` (a dict so PR3b can add
+        ``'player_season_stats'`` to the same capture). Empty on graceful
+        fallback (caller emits ``R0.2B_FALLBACK``). Season slug is coerced to the
+        soccerdata short form (``2526``) so the partition matches.
+        """
+        profile_cols = [
+            'player_id', 'name', 'short_name', 'slug', 'position',
+            'jersey_number', 'shirt_number', 'height_cm', 'preferred_foot',
+            'date_of_birth', 'nationality', 'country_code',
+            'current_team_id', 'current_team_name', 'retired',
+            'league', 'season',
+        ]
+
+        season_str = str(season)
+        if len(season_str) == 4 and season_str.isdigit():
+            season_short = f"{season_str[2:4]}{int(season_str[2:4]) + 1:02d}"
+        else:
+            season_short = season_str
+
+        empty = {
+            'player_profile': pd.DataFrame(columns=profile_cols + ['_ingested_at']),
+        }
+
+        if player_ids is None:
+            player_ids = self._resolve_player_ids_from_bronze(
+                league, season_short, limit=limit,
+            )
+        if not player_ids:
+            logger.warning(
+                "No player_ids resolved for player_capture (league=%s season=%s).",
+                league, season_short,
+            )
+            return empty
+        if limit:
+            player_ids = list(player_ids)[: int(limit)]
+
+        logger.info(
+            "player_capture: capturing %d players (league=%s season=%s)",
+            len(player_ids), league, season_short,
+        )
+
+        profile_rows: List[Dict] = []
+        consecutive_failures = 0
+        max_consecutive = 10  # ~dead proxy / page not rendering — bail early.
+
+        captures = self._iter_player_captures(player_ids)
+        try:
+            for idx, (pid, capture) in enumerate(captures, start=1):
+                profile = (capture or {}).get('profile')
+                if not profile:
+                    consecutive_failures += 1
+                    if consecutive_failures >= max_consecutive:
+                        logger.error(
+                            "%s: %d consecutive player capture failures — aborting "
+                            "player_capture early to preserve proxy budget.",
+                            R0_2B_FALLBACK_MARKER, consecutive_failures,
+                        )
+                        break
+                    continue
+                consecutive_failures = 0
+
+                prow = self._flatten_player_profile({'player': profile})
+                if prow is not None:
+                    profile_rows.append(prow)
+
+                if idx % 25 == 0:
+                    logger.info("player_capture progress: %d/%d players",
+                                idx, len(player_ids))
+        finally:
+            close = getattr(captures, 'close', None)
+            if callable(close):
+                close()  # tear down the Camoufox session
+
+        if not profile_rows:
+            logger.warning(
+                "%s: player_capture materialised zero rows across %d players.",
+                R0_2B_FALLBACK_MARKER, len(player_ids),
+            )
+            return empty
+
+        df = pd.DataFrame(profile_rows)
+        df['league'] = league
+        df['season'] = season_short
+        df['_ingested_at'] = datetime.utcnow()
+        df['_source'] = self.SOURCE_NAME
+        df['_entity_type'] = 'player_profile'
+        df['_batch_id'] = self._batch_id
+
+        logger.info(
+            "player_capture: %d profile rows across %d players",
+            len(df), len(player_ids),
+        )
+        return {'player_profile': df}
 
     def scrape_schedule(self) -> Dict[str, str]:
         """Scrape match schedule."""

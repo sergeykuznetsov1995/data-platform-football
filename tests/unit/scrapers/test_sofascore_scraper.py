@@ -1177,3 +1177,62 @@ class TestResolveMatchIdsViaCapture:
                 'ENG-Premier League', 2025,
             )
         assert out == []
+
+
+class TestReadPlayerCapture:
+    """read_player_capture (#751 PR3): ONE Camoufox nav per player → the
+    player_profile frame (bio from __NEXT_DATA__). We patch the
+    ``_iter_player_captures`` seam (no browser) and assert profile flattening +
+    (league, season) tagging. (Season-aggregate stats are deferred to PR3b.)"""
+
+    def _scraper(self):
+        from scrapers.sofascore.scraper import SofaScoreScraper
+        with patch('scrapers.base.base_scraper.get_rate_limiter'), \
+             patch('scrapers.base.base_scraper.get_retry_policy'), \
+             patch('scrapers.base.base_scraper.get_circuit_breaker'), \
+             patch('scrapers.base.base_scraper.IcebergWriter'):
+            return SofaScoreScraper(leagues=['ENG-Premier League'], seasons=[2025])
+
+    def _capture(self, pid):
+        return {'profile': {
+            'id': int(pid), 'name': f'Player {pid}', 'slug': f'p-{pid}',
+            'position': 'F', 'height': 185, 'preferredFoot': 'Right',
+            'dateOfBirthTimestamp': 1180483200,
+            'team': {'id': 30, 'name': 'Brighton'}}}
+
+    @pytest.mark.unit
+    def test_one_pass_yields_profile_frame(self):
+        scraper = self._scraper()
+        seen = []
+
+        def fake_iter(player_ids):
+            for pid in player_ids:
+                seen.append(str(pid))
+                yield str(pid), self._capture(pid)
+
+        scraper._iter_player_captures = fake_iter
+        out = scraper.read_player_capture(
+            league='ENG-Premier League', season=2025, player_ids=['101', '102'])
+
+        assert seen == ['101', '102']   # ONE capture per player ("one nav")
+        prof = out['player_profile']
+        assert len(prof) == 2
+        assert set(prof['season']) == {'2526'}
+        assert set(prof['_entity_type']) == {'player_profile'}
+        prow = {r['player_id']: r for r in prof.to_dict('records')}['101']
+        assert prow['height_cm'] == 185 and prow['preferred_foot'] == 'Right'
+        assert prow['current_team_name'] == 'Brighton'
+
+    @pytest.mark.unit
+    def test_graceful_empty_when_nothing_captured(self):
+        scraper = self._scraper()
+
+        def fake_iter(player_ids):
+            for pid in player_ids:
+                yield str(pid), {'profile': None}
+
+        scraper._iter_player_captures = fake_iter
+        out = scraper.read_player_capture(
+            league='ENG-Premier League', season=2025, player_ids=['101'])
+        assert out['player_profile'].empty
+        assert 'player_id' in out['player_profile'].columns

@@ -10,12 +10,14 @@ import pytest
 from scrapers.sofascore.camoufox_capture import (
     event_url,
     extract_events,
+    extract_player_from_next_data,
     finished_event_ids,
     is_challenge,
     is_data_api_url,
     merge_capture,
     normalize_event,
     parse_proxy_line,
+    player_url,
     response_path,
     select_event_endpoints,
 )
@@ -465,3 +467,45 @@ def test_capture_event_accumulates_statistics_across_retry():
     assert "lineups" in result
     assert "statistics" in result
     assert result["statistics"] == {"statistics": [{"period": "ALL"}]}
+
+
+# --------------------------------------------------------------------------- #
+#  Per-player helpers (#751 PR3) — profile snapshot                           #
+#  Shapes mirror the live probe (scripts/research/probe_sofascore_player.py).  #
+# --------------------------------------------------------------------------- #
+def test_player_url_uses_dummy_slug():
+    assert player_url(1416535) == "https://www.sofascore.com/player/x/1416535"
+
+
+def _next_data(pid=1416535):
+    # bio at props.pageProps.player with the fields _flatten_player_profile reads.
+    return {
+        "props": {"pageProps": {"player": {
+            "id": pid, "name": "Charalampos Kostoulas",
+            "slug": "kostoulas-charalampos", "position": "F",
+            "height": 185, "preferredFoot": "Right",
+            "dateOfBirthTimestamp": 1180483200,
+            "team": {"id": 30, "name": "Brighton & Hove Albion"},
+        }}}
+    }
+
+
+def test_extract_player_from_next_data_digs_pageprops_player():
+    player = extract_player_from_next_data(_next_data(1416535), 1416535)
+    assert player is not None
+    assert player["name"] == "Charalampos Kostoulas"
+    assert player["height"] == 185
+
+
+def test_extract_player_from_next_data_matches_str_or_int_id():
+    assert extract_player_from_next_data(_next_data(1416535), "1416535") is not None
+
+
+def test_extract_player_from_next_data_none_on_id_mismatch():
+    # A wrong-page SSR (different player) must not yield a mismatched row.
+    assert extract_player_from_next_data(_next_data(999), 1416535) is None
+
+
+@pytest.mark.parametrize("nd", [None, {}, {"props": {}}, {"props": {"pageProps": {}}}])
+def test_extract_player_from_next_data_none_on_missing(nd):
+    assert extract_player_from_next_data(nd, 1416535) is None

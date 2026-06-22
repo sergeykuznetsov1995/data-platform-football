@@ -31,6 +31,7 @@ Operational requirements (see Dockerfile once integrated):
 """
 from __future__ import annotations
 
+import json
 import logging
 import re
 from typing import Dict, Optional
@@ -219,6 +220,43 @@ def parse_proxy_line(line: str) -> Optional[dict]:
 
 
 # --------------------------------------------------------------------------- #
+#  Per-player capture helpers (issue #751 PR3) — profile snapshot              #
+# --------------------------------------------------------------------------- #
+# Live-proven (scripts/research/probe_sofascore_player.py, 2026-06-22): the bio
+# is SSR'd at __NEXT_DATA__.props.pageProps.player (NOT an XHR), so the profile
+# capture needs no Turnstile-gated data XHR. Season-aggregate stats (which DO
+# need the Season tab + a season-picker for transferred/multi-competition
+# players) are deferred to PR3b — see memory/feedback_sofascore_player_page_capture.
+def player_url(player_id) -> str:
+    """A player page URL with a DUMMY slug — the SPA redirects to the real
+    ``/football/player/{real-slug}/{id}`` by trailing id (#751 PR3 spike), so we
+    never need to know the slug. Bare ``/player/{id}`` (no slug) does NOT load."""
+    return f"{BASE}/player/x/{player_id}"
+
+
+def extract_player_from_next_data(next_data, player_id) -> Optional[dict]:
+    """Pull the SSR'd player bio object out of a parsed ``__NEXT_DATA__`` blob.
+
+    The bio lives at ``props.pageProps.player`` (live-proven) and carries exactly
+    the fields :meth:`SofaScoreScraper._flatten_player_profile` reads under the
+    ``player`` key (name/slug/position/height/preferredFoot/dateOfBirthTimestamp/
+    team). Returns the player dict only when its ``id`` matches ``player_id`` (so
+    a wrong-page SSR never yields a mismatched row); ``None`` otherwise."""
+    if not isinstance(next_data, dict):
+        return None
+    page_props = (next_data.get("props") or {}).get("pageProps")
+    if not isinstance(page_props, dict):
+        return None
+    player = page_props.get("player")
+    if not isinstance(player, dict):
+        return None
+    pid = player.get("id")
+    if pid is None or str(pid) != str(player_id):
+        return None
+    return player
+
+
+# --------------------------------------------------------------------------- #
 #  Camoufox capture session                                                   #
 # --------------------------------------------------------------------------- #
 class SofascoreCamoufoxCapture:
@@ -346,6 +384,22 @@ class SofascoreCamoufoxCapture:
                     event_id, sorted(result), missing)
         return result
 
+    def capture_player(self, player_id) -> Dict:
+        """Navigate a player page and read the SSR'd bio from ``__NEXT_DATA__``
+        (#751 PR3). Returns ``{'profile': <player bio dict | None>}``.
+
+        The bio is server-rendered (``props.pageProps.player``), NOT an XHR, so a
+        single navigation suffices and it survives even though SofaScore's data
+        XHRs are Turnstile-gated. Season-aggregate stats are deferred to PR3b
+        (they need the Season tab + a season-picker for transferred/multi-comp
+        players — see the module-level note)."""
+        self._buffer = {}
+        self._navigate(player_url(player_id))
+        profile = self._extract_player_next_data(player_id)
+        logger.info("sofascore capture player=%s profile=%s",
+                    player_id, profile is not None)
+        return {"profile": profile}
+
     def capture_buffer(self, nav_url: str) -> Dict[str, dict]:
         """Navigate ``nav_url`` and return the whole capture buffer (path -> rec).
         Used for non-event pages (tournament events lists, standings)."""
@@ -450,3 +504,22 @@ class SofascoreCamoufoxCapture:
                     pass
             if clicked:
                 self._page.wait_for_timeout(self._tab_wait_ms)
+
+    def _extract_player_next_data(self, player_id) -> Optional[dict]:
+        """Read ``__NEXT_DATA__`` off the player page and dig the SSR'd bio out of
+        it (see module-level :func:`extract_player_from_next_data`)."""
+        try:
+            text = self._page.evaluate(
+                "() => { const e = document.getElementById('__NEXT_DATA__');"
+                " return e ? e.textContent : null; }"
+            )
+        except Exception:  # noqa: BLE001
+            logger.info("sofascore __NEXT_DATA__ read failed", exc_info=True)
+            return None
+        if not text:
+            return None
+        try:
+            return extract_player_from_next_data(json.loads(text), player_id)
+        except Exception:  # noqa: BLE001 — malformed SSR JSON
+            logger.info("sofascore __NEXT_DATA__ parse failed", exc_info=True)
+            return None

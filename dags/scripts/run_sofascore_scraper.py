@@ -90,6 +90,10 @@ ENTITY_PLAYER_PROFILE = 'player_profile'
 # #751 PR1 — consolidated per-match capture: ONE Camoufox nav/match feeds BOTH
 # player_ratings and event_player_stats from the same /lineups (+/event) payload.
 ENTITY_MATCH_CAPTURE = 'match_capture'
+# #751 PR3 — per-player capture: ONE Camoufox nav/player writes player_profile
+# (bio SSR'd in __NEXT_DATA__). Replaces the dead tls player_profile pass.
+# (player_season_stats via the Season-tab picker is deferred to PR3b.)
+ENTITY_PLAYER_CAPTURE = 'player_capture'
 
 VALID_ENTITIES = {
     ENTITY_SCHEDULE,
@@ -101,6 +105,7 @@ VALID_ENTITIES = {
     ENTITY_PLAYER_SEASON_STATS,
     ENTITY_PLAYER_PROFILE,
     ENTITY_MATCH_CAPTURE,
+    ENTITY_PLAYER_CAPTURE,
 }
 
 # Replace-partitions completeness guard (#513 → #583): refuse a save that would
@@ -614,6 +619,125 @@ def _run_match_capture(
         return 3
     except Exception as e:
         logger.error("match_capture scrape failed hard: %s", e, exc_info=True)
+        results['errors'].append(str(e))
+        _write_results(output_path, results)
+        return 1
+
+    _write_results(output_path, results)
+    return 0
+
+
+def _run_player_capture(
+    leagues: List[str],
+    season: int,
+    limit: Optional[int],
+    output_path: str,
+    force_replace: bool = False,
+) -> int:
+    """#751 PR3 — per-player capture entrypoint (biographical profile).
+
+    ONE Camoufox navigation per player writes ``sofascore_player_profile`` from
+    the bio SSR'd in ``__NEXT_DATA__`` — replacing the dead Turnstile-blocked tls
+    pass. Full-state (``replace_partitions=['league', 'season']`` + completeness
+    guard): every run re-captures the player universe and rewrites the partition.
+
+    Season-aggregate stats are deferred to PR3b (they need the Season tab + a
+    season-picker for transferred/multi-competition players).
+
+    Exit codes: 0 ok / 2 R0.2B_FALLBACK (nothing captured) / 3 ReplaceGuard /
+    1 hard failure.
+    """
+    from scrapers.base.base_scraper import ReplaceGuardError
+    from scrapers.sofascore import SofaScoreScraper
+    from scrapers.sofascore.scraper import R0_2B_FALLBACK_MARKER
+
+    league = leagues[0]
+    season_str = str(season)
+    if len(season_str) == 4 and season_str.isdigit():
+        season_short = f"{season_str[2:4]}{int(season_str[2:4]) + 1:02d}"
+    else:
+        season_short = season_str
+
+    logger.info(
+        "player_capture: league=%s season=%s (short=%s) limit=%s",
+        league, season, season_short, limit,
+    )
+
+    proxy_file = os.environ.get('PROXY_FILE', '/opt/airflow/proxys.txt')
+    if not os.path.exists(proxy_file):
+        logger.warning(
+            "Proxy file %s not found — SofaScore is likely to 403 without "
+            "residential proxy.", proxy_file,
+        )
+        proxy_file = None
+
+    results = {
+        'entity': ENTITY_PLAYER_CAPTURE,
+        'tables': [],
+        'rows': 0,                  # player_profile rows
+        'profile_players': 0,
+        'fallback': False,
+        'fallback_reason': None,
+        'errors': [],
+    }
+
+    try:
+        with SofaScoreScraper(
+            leagues=[league], seasons=[season], proxy_file=proxy_file,
+        ) as scraper:
+            frames = scraper.read_player_capture(
+                league=league, season=int(season), limit=limit,
+            )
+            profile_df = frames.get('player_profile')
+            profile_empty = profile_df is None or profile_df.empty
+
+            if profile_empty:
+                last_err = getattr(scraper, '_last_lineup_error', None)
+                reason = 'empty_payload'
+                if last_err:
+                    status = last_err.get('status')
+                    if status == 403:
+                        reason = 'http_403'
+                    elif status == 429:
+                        reason = 'http_429'
+                    elif status is None:
+                        reason = 'transport_error'
+                    else:
+                        reason = f'http_{status}'
+                logger.error(
+                    "%s: SofaScore player_capture unavailable — reason=%s detail=%s",
+                    R0_2B_FALLBACK_MARKER, reason, last_err,
+                )
+                results['fallback'] = True
+                results['fallback_reason'] = reason
+                results['errors'].append(f'{R0_2B_FALLBACK_MARKER}: {reason}')
+                _write_results(output_path, results)
+                return 2
+
+            min_ratio = None if force_replace else _MIN_REPLACE_RATIO
+
+            # player_profile — full-state refresh (+ completeness guard).
+            ppath = scraper.save_to_iceberg(
+                df=profile_df,
+                table_name='sofascore_player_profile',
+                partition_cols=['league', 'season'],
+                replace_partitions=['league', 'season'],
+                min_replace_ratio=min_ratio,
+            )
+            results['tables'].append(ppath)
+            results['rows'] = int(len(profile_df))
+            results['profile_players'] = int(profile_df['player_id'].nunique())
+            logger.info("Saved %d player_profile rows -> %s",
+                        results['rows'], ppath)
+
+    except ReplaceGuardError as e:
+        msg = f"{REPLACE_GUARD_MARKER}: {e}"
+        logger.error(msg)
+        results['errors'].append(msg)
+        _write_results(output_path, results)
+        return 3
+    except Exception as e:
+        logger.error("player_capture scrape failed hard: %s", e, exc_info=True)
         results['errors'].append(str(e))
         _write_results(output_path, results)
         return 1
@@ -1261,6 +1385,15 @@ def main():
 
     if entity == ENTITY_MATCH_CAPTURE:
         return _run_match_capture(
+            leagues=leagues,
+            season=args.season,
+            limit=args.limit,
+            output_path=args.output,
+            force_replace=args.force_replace,
+        )
+
+    if entity == ENTITY_PLAYER_CAPTURE:
+        return _run_player_capture(
             leagues=leagues,
             season=args.season,
             limit=args.limit,
