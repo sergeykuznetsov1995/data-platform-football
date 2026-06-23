@@ -280,23 +280,30 @@ class TestPlayerRatingsCaptureFallback:
 
 
 def _match_capture_scraper(*, guard_blocks: bool = False, empty: bool = False):
-    """Stub for the #751 match_capture path: read_match_capture returns all four
-    frames (player_ratings, event_player_stats, match_stats, event_shotmap) from
-    one capture pass."""
+    """Stub for the #751/#753 match_capture path: read_match_capture returns all
+    five frames (player_ratings, event_player_stats, match_stats, event_shotmap,
+    venue) from one capture pass."""
     from scrapers.base.base_scraper import ReplaceGuardError
 
     if empty:
         frames = {'player_ratings': pd.DataFrame(),
                   'event_player_stats': pd.DataFrame(),
                   'match_stats': pd.DataFrame(),
-                  'event_shotmap': pd.DataFrame()}
+                  'event_shotmap': pd.DataFrame(),
+                  'venue': pd.DataFrame()}
     else:
         def _df():
             return pd.DataFrame({'league': ['ENG-Premier League'] * 4,
                                  'season': ['2526'] * 4,
                                  'match_id': ['1', '1', '2', '2']})
+        # venue is keyed by game_id (one row per match), not match_id (#753).
+        venue_df = pd.DataFrame({'league': ['ENG-Premier League'] * 2,
+                                 'season': ['2526'] * 2,
+                                 'game_id': [1, 2],
+                                 'stadium': ['Etihad Stadium', 'Anfield']})
         frames = {'player_ratings': _df(), 'event_player_stats': _df(),
-                  'match_stats': _df(), 'event_shotmap': _df()}
+                  'match_stats': _df(), 'event_shotmap': _df(),
+                  'venue': venue_df}
 
     scraper = MagicMock()
     scraper.read_match_capture.return_value = frames
@@ -325,7 +332,7 @@ class TestMatchCaptureRunner:
             os.unlink(path)
 
     @pytest.mark.unit
-    def test_normal_path_saves_four_tables_arms_guard(self, temp_output):
+    def test_normal_path_saves_five_tables_arms_guard(self, temp_output):
         scraper = _match_capture_scraper()
         rc = _run_main(
             ["--entity", "match_capture", "--league", "ENG-Premier League",
@@ -334,14 +341,15 @@ class TestMatchCaptureRunner:
             resolver_ids=['1', '2'],
         )
         assert rc == 0
-        # one save per table — all four full-state with the guard (#751 PR2).
-        assert scraper.save_to_iceberg.call_count == 4
+        # one save per table — all five full-state with the guard (#751 PR2, #753).
+        assert scraper.save_to_iceberg.call_count == 5
         tables = [c.kwargs['table_name']
                   for c in scraper.save_to_iceberg.call_args_list]
         assert set(tables) == {'sofascore_player_ratings',
                                'sofascore_event_player_stats',
                                'sofascore_match_stats',
-                               'sofascore_event_shotmap'}
+                               'sofascore_event_shotmap',
+                               'sofascore_venue'}
         for c in scraper.save_to_iceberg.call_args_list:
             assert c.kwargs['replace_partitions'] == ['league', 'season']
             assert c.kwargs['min_replace_ratio'] == 0.9
@@ -349,6 +357,8 @@ class TestMatchCaptureRunner:
             payload = json.load(f)
         assert payload['rows'] == 4 and payload['eps_rows'] == 4
         assert payload['match_stats_rows'] == 4 and payload['shotmap_rows'] == 4
+        # #753: venue is keyed by game_id (one row per match) → 2 rows / 2 matches.
+        assert payload['venue_rows'] == 2 and payload['venue_matches'] == 2
 
     @pytest.mark.unit
     def test_guard_refusal_exits_3(self, temp_output):
