@@ -595,6 +595,100 @@ def test_extract_player_seasons_map_empty_when_not_captured():
     assert extract_player_seasons_map({}, 839981) == {}
 
 
+# --------------------------------------------------------------------------- #
+#  league standings parsers — live-proven shapes (EPL 24/25, #779)            #
+#  Fixtures mirror the REAL capture taken 2026-06-23 (sid 61627): the         #
+#  /standings/total 'total' block + the /unique-tournament/{ut}/seasons map.  #
+# --------------------------------------------------------------------------- #
+def _tournament_seasons_payload():
+    """Real /unique-tournament/17/seasons response (trimmed, #779). NOTE: this
+    endpoint does NOT fire on the standings landing — only when the matches
+    widget is nudged — so read_league_table falls back to the events."""
+    return {"seasons": [
+        {"year": "26/27", "id": 96668},
+        {"year": "25/26", "id": 76986},
+        {"year": "24/25", "id": 61627},
+        {"year": "23/24", "id": 52186},
+    ]}
+
+
+def _standings_buffer(sid=61627):
+    """Real EPL 24/25 standings/total capture (#779), trimmed to champion,
+    runner-up, bottom. The 'home' block is challenged → must be skipped."""
+    return {
+        f"/api/v1/unique-tournament/17/season/{sid}/standings/total": {
+            "status": 200, "challenge": False, "json": {"standings": [
+                {"type": "total", "rows": [
+                    {"team": {"name": "Liverpool FC", "id": 44, "shortName": "Liverpool"},
+                     "matches": 38, "wins": 25, "draws": 9, "losses": 4,
+                     "scoresFor": 86, "scoresAgainst": 41, "points": 84, "position": 1},
+                    {"team": {"name": "Arsenal", "id": 42, "shortName": "Arsenal"},
+                     "matches": 38, "wins": 20, "draws": 14, "losses": 4,
+                     "scoresFor": 69, "scoresAgainst": 34, "points": 74, "position": 2},
+                    {"team": {"name": "Southampton", "id": 45, "shortName": "Southampton"},
+                     "matches": 38, "wins": 2, "draws": 6, "losses": 30,
+                     "scoresFor": 26, "scoresAgainst": 86, "points": 12, "position": 20},
+                ]},
+            ]}},
+        f"/api/v1/unique-tournament/17/season/{sid}/standings/home": {
+            "status": 403, "challenge": True,
+            "json": {"error": {"reason": "challenge"}}},
+    }
+
+
+def test_extract_tournament_seasons_map_real_epl_payload():
+    from scrapers.sofascore.camoufox_capture import extract_tournament_seasons_map
+    buf = {"/api/v1/unique-tournament/17/seasons": {
+        "status": 200, "challenge": False, "json": _tournament_seasons_payload()}}
+    m = extract_tournament_seasons_map(buf, 17)
+    assert m["24/25"] == 61627
+    assert m["25/26"] == 76986
+
+
+def test_extract_tournament_seasons_map_empty_when_absent():
+    from scrapers.sofascore.camoufox_capture import extract_tournament_seasons_map
+    # live FACT (#779): /seasons does not fire on the standings landing.
+    assert extract_tournament_seasons_map({}, 17) == {}
+
+
+def test_extract_tournament_standings_returns_total_block_rows():
+    from scrapers.sofascore.camoufox_capture import extract_tournament_standings
+    rows = extract_tournament_standings(_standings_buffer(), 17, 61627)
+    assert [r["team"]["name"] for r in rows] == [
+        "Liverpool FC", "Arsenal", "Southampton"]
+
+
+def test_extract_tournament_standings_empty_for_wrong_sid():
+    from scrapers.sofascore.camoufox_capture import extract_tournament_standings
+    # off-season guard: the page may serve a DIFFERENT sid's standings.
+    assert extract_tournament_standings(_standings_buffer(sid=96668), 17, 61627) == []
+
+
+def test_normalize_standing_flattens_real_liverpool_row():
+    from scrapers.sofascore.camoufox_capture import (
+        extract_tournament_standings, normalize_standing)
+    rows = extract_tournament_standings(_standings_buffer(), 17, 61627)
+    assert normalize_standing(rows[0]) == {
+        "team": "Liverpool FC", "mp": 38, "w": 25, "d": 9, "l": 4,
+        "gf": 86, "ga": 41, "gd": 45, "pts": 84}
+
+
+def test_normalize_standing_invariants_hold_on_all_rows():
+    from scrapers.sofascore.camoufox_capture import (
+        extract_tournament_standings, normalize_standing)
+    rows = [normalize_standing(r)
+            for r in extract_tournament_standings(_standings_buffer(), 17, 61627)]
+    # gd is derived (the API row has none); pts = 3W + D for every real row.
+    assert all(r["gd"] == r["gf"] - r["ga"] for r in rows)
+    assert all(r["pts"] == 3 * r["w"] + r["d"] for r in rows)
+
+
+def test_normalize_standing_gd_none_when_scores_missing():
+    from scrapers.sofascore.camoufox_capture import normalize_standing
+    out = normalize_standing({"team": {"name": "X"}, "points": 0})
+    assert out["gd"] is None and out["gf"] is None
+
+
 def test_extract_player_seasons_map_empty_on_challenge():
     from scrapers.sofascore.camoufox_capture import extract_player_seasons_map
     buf = {"/api/v1/player/5/statistics/seasons": {
