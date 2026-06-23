@@ -1003,7 +1003,7 @@ class SofaScoreScraper(SoccerdataScraper):
         match_ids: Optional[List[str]] = None,
         limit: Optional[int] = None,
     ) -> Dict[str, pd.DataFrame]:
-        """ONE Camoufox capture pass per match → four Bronze frames (#751 PR1+PR2).
+        """ONE Camoufox capture pass per match → five Bronze frames (#751 PR1+PR2, #753).
 
         Replaces four separate Turnstile-blocked passes with a single navigation
         per match. The same pass clicks all deep tabs and captures
@@ -1013,13 +1013,15 @@ class SofaScoreScraper(SoccerdataScraper):
             over ``/lineups`` (per-player Opta block), with ``team_id``/
             ``team_name`` from ``/event`` (``homeTeam``/``awayTeam``);
           - ``match_stats`` — :meth:`_flatten_match_stats` over ``/statistics``;
-          - ``event_shotmap`` — :meth:`_flatten_shotmap` over ``/shotmap``.
+          - ``event_shotmap`` — :meth:`_flatten_shotmap` over ``/shotmap``;
+          - ``venue`` — :meth:`_flatten_event_venue` over ``/event`` (#753:
+            one row per match, stadium/city/country/coords).
 
-        statistics/shotmap are best-effort: a pass that doesn't fire them just
-        yields an empty frame for that table (the others still materialise).
+        statistics/shotmap/venue are best-effort: a pass that doesn't fire them
+        just yields an empty frame for that table (the others still materialise).
 
         Returns ``{'player_ratings', 'event_player_stats', 'match_stats',
-        'event_shotmap'}``; all empty on graceful fallback (caller emits
+        'event_shotmap', 'venue'}``; all empty on graceful fallback (caller emits
         ``R0.2B_FALLBACK``). Season slug is coerced to the soccerdata short form
         (``2526``) so the partition matches the schedule writer (#27).
         """
@@ -1043,6 +1045,10 @@ class SofaScoreScraper(SoccerdataScraper):
             'body_part', 'outcome', 'goal_type', 'x', 'y', 'goal_x',
             'goal_y', 'xg', 'xgot', 'league', 'season',
         ]
+        venue_cols = [
+            'game_id', 'stadium', 'city', 'country',
+            'venue_latitude', 'venue_longitude', 'league', 'season',
+        ]
 
         if match_ids is None:
             match_ids = self._resolve_match_ids(league, season)
@@ -1058,6 +1064,7 @@ class SofaScoreScraper(SoccerdataScraper):
             'event_player_stats': pd.DataFrame(columns=eps_cols + ['_ingested_at']),
             'match_stats': pd.DataFrame(columns=match_stats_cols + ['_ingested_at']),
             'event_shotmap': pd.DataFrame(columns=shotmap_cols + ['_ingested_at']),
+            'venue': pd.DataFrame(columns=venue_cols + ['_ingested_at']),
         }
 
         if not match_ids:
@@ -1079,6 +1086,7 @@ class SofaScoreScraper(SoccerdataScraper):
         eps_rows: List[Dict] = []
         stats_rows: List[Dict] = []
         shot_rows: List[Dict] = []
+        venue_rows: List[Dict] = []
         consecutive_failures = 0
         max_consecutive = 10  # ~dead proxy / Turnstile not solved — bail early.
 
@@ -1116,6 +1124,14 @@ class SofaScoreScraper(SoccerdataScraper):
                 eps_rows.extend(self._flatten_event_player_stats_from_lineups(
                     str(mid), lineups, event_payload,
                 ))
+
+                # venue (#753) — one row per match from the SAME `event`
+                # capture; SofaScore carries the per-match stadium (historically
+                # accurate, unlike FotMob's current-ground bias). Best-effort:
+                # a match whose event payload omits venue yields no row.
+                venue_row = self._flatten_event_venue(str(mid), event_payload)
+                if venue_row:
+                    venue_rows.append(venue_row)
 
                 # Best-effort: a match page may not fire statistics/shotmap on
                 # a given pass — absent keys just yield no rows for that table.
@@ -1177,6 +1193,8 @@ class SofaScoreScraper(SoccerdataScraper):
             _tag(stats_rows, 'match_stats') if stats_rows else empty['match_stats'])
         out['event_shotmap'] = (
             _tag(shot_rows, 'event_shotmap') if shot_rows else empty['event_shotmap'])
+        out['venue'] = (
+            _tag(venue_rows, 'venue') if venue_rows else empty['venue'])
 
         if not ratings_rows and not eps_rows:
             logger.warning(
@@ -1186,9 +1204,10 @@ class SofaScoreScraper(SoccerdataScraper):
 
         logger.info(
             "match_capture: %d ratings + %d eps + %d match_stats + %d shots "
-            "across %d matches",
+            "+ %d venues across %d matches",
             len(out['player_ratings']), len(out['event_player_stats']),
-            len(out['match_stats']), len(out['event_shotmap']), len(match_ids),
+            len(out['match_stats']), len(out['event_shotmap']),
+            len(out['venue']), len(match_ids),
         )
         return out
 
@@ -1534,6 +1553,73 @@ class SofaScoreScraper(SoccerdataScraper):
                 rows.append(row)
 
         return rows
+
+    @staticmethod
+    def _flatten_event_venue(match_id: str, event_payload) -> Optional[Dict]:
+        """Project the captured ``/event/{id}`` venue block into ONE Bronze row (#753).
+
+        SofaScore's ``event.venue`` records the stadium THIS match was played at,
+        so it stays historically accurate for clubs that moved grounds (Everton →
+        Goodison Park, Spurs → White Hart Lane) — exactly where FotMob's
+        current-ground ``team_profile`` is wrong (see gold.dim_venue). Returns
+        ``None`` when the payload carries no usable stadium.
+
+        Defensive on shape: SofaScore nests ``stadium``/``city``/``country`` as
+        ``{"name": ...}`` objects, but the issue documents a flat
+        ``{stadium, city, country}`` form — ``_name`` accepts either.
+
+        Live-verified 2026-06-23 (event 14023959, American Express Stadium): real
+        shape is the NESTED form — ``stadium``/``city``/``country`` are
+        ``{"name": ...}`` objects; ``city`` also carries country/id. Two caveats
+        the issue got wrong: (1) ``venueCoordinates`` was ABSENT for that venue, so
+        coords are sporadic and usually NULL — city/country are the reliable
+        value-add, coords a bonus when present; (2) ``capacity`` IS in the payload
+        (``stadium.capacity``) but stays FotMob-sourced (#750), so it (and
+        ``surface``/``opened``) is not extracted here. Like the other capture
+        flatteners the caller tags ``league``/``season``/lineage; this emits
+        business columns only.
+        """
+        ev = event_payload if isinstance(event_payload, dict) else {}
+        # The captured /event/{id} body nests the event under "event" (#751 PR2).
+        if isinstance(ev.get('event'), dict):
+            ev = ev['event']
+        venue = ev.get('venue')
+        if not isinstance(venue, dict):
+            return None
+
+        def _name(v):
+            """SofaScore ``{"name": X}`` object → X; a bare string passes through."""
+            return v.get('name') if isinstance(v, dict) else v
+
+        stadium = _name(venue.get('stadium'))
+        if stadium is None or str(stadium).strip() == '':
+            return None
+
+        def _f(v):
+            try:
+                return float(v) if v is not None else None
+            except (TypeError, ValueError):
+                return None
+
+        coords = venue.get('venueCoordinates')
+        coords = coords if isinstance(coords, dict) else {}
+
+        gid = ev.get('id')
+        if gid is None:
+            gid = match_id
+        try:
+            game_id = int(gid)
+        except (TypeError, ValueError):
+            game_id = None
+
+        return {
+            'game_id': game_id,
+            'stadium': str(stadium).strip(),
+            'city': _name(venue.get('city')),
+            'country': _name(venue.get('country')),
+            'venue_latitude': _f(coords.get('latitude')),
+            'venue_longitude': _f(coords.get('longitude')),
+        }
 
     def _fetch_event_player_stats_payload(
         self,

@@ -1537,6 +1537,22 @@
         "week": "bigint"
       }
     },
+    "bronze.sofascore_venue": {
+      "columns": {
+        "_batch_id": "varchar",
+        "_entity_type": "varchar",
+        "_ingested_at": "timestamp(6)",
+        "_source": "varchar",
+        "city": "varchar",
+        "country": "varchar",
+        "game_id": "bigint",
+        "league": "varchar",
+        "season": "varchar",
+        "stadium": "varchar",
+        "venue_latitude": "double",
+        "venue_longitude": "double"
+      }
+    },
     "bronze.sofifa_leagues": {
       "columns": {
         "_batch_id": "varchar",
