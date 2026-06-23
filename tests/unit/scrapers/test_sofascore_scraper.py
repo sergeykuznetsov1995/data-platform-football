@@ -1096,6 +1096,27 @@ class TestFlattenEventVenue:
         assert row['game_id'] == 99
 
     @pytest.mark.unit
+    def test_extracts_live_amex_shape_no_coords(self):
+        # Live-verified 2026-06-23 (event 14023959, American Express Stadium): the
+        # real payload nests stadium/city/country objects, carries capacity, and
+        # has NO venueCoordinates → coords resolve to NULL, not an error.
+        payload = {'event': {'id': 14023959, 'venue': {
+            'name': 'American Express Stadium',
+            'capacity': 31876,
+            'stadium': {'name': 'American Express Stadium', 'capacity': 31876},
+            'city': {'name': 'Falmer', 'country': {'name': 'England'}, 'id': 25144},
+            'country': {'name': 'England', 'alpha2': 'EN', 'alpha3': 'ENG'},
+            'slug': 'american-express-community-s-stadium', 'id': 2443,
+        }}}
+        row = self._flat(payload)
+        assert row['stadium'] == 'American Express Stadium'
+        assert row['city'] == 'Falmer'
+        assert row['country'] == 'England'
+        assert row['venue_latitude'] is None
+        assert row['venue_longitude'] is None
+        assert row['game_id'] == 14023959
+
+    @pytest.mark.unit
     def test_none_when_no_venue(self):
         assert self._flat({'event': {'id': 1}}) is None
 

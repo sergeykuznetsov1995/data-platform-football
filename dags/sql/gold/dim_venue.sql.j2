@@ -269,7 +269,9 @@ select
     cast(opened as integer)                                                    as opened,
     -- latitude/longitude (issue #719 + #753): FotMob stadium coords (matched by
     -- normalised venue name) are PRIMARY; SofaScore `event.venue.venueCoordinates`
-    -- fills NULLs — notably moved grounds whose historical name FotMob can't match.
+    -- fills NULLs WHEN PRESENT — but a live check 2026-06-23 found coords SPORADIC
+    -- in the SofaScore venue payload (often absent), so this is a bonus; the
+    -- reliable SofaScore value-add is city/country, not coords.
     cast(coalesce(latitude, latitude_sofascore) as double)                     as latitude,
     cast(coalesce(longitude, longitude_sofascore) as double)                   as longitude,
     -- Kept beyond the design's column list: the orphan-rate DQ check in

@@ -1567,9 +1567,17 @@ class SofaScoreScraper(SoccerdataScraper):
         Defensive on shape: SofaScore nests ``stadium``/``city``/``country`` as
         ``{"name": ...}`` objects, but the issue documents a flat
         ``{stadium, city, country}`` form — ``_name`` accepts either.
-        ``capacity``/``surface``/``opened`` stay FotMob-sourced (#750), so they are
-        not extracted here. Like the other capture flatteners the caller tags
-        ``league``/``season``/lineage; this emits business columns only.
+
+        Live-verified 2026-06-23 (event 14023959, American Express Stadium): real
+        shape is the NESTED form — ``stadium``/``city``/``country`` are
+        ``{"name": ...}`` objects; ``city`` also carries country/id. Two caveats
+        the issue got wrong: (1) ``venueCoordinates`` was ABSENT for that venue, so
+        coords are sporadic and usually NULL — city/country are the reliable
+        value-add, coords a bonus when present; (2) ``capacity`` IS in the payload
+        (``stadium.capacity``) but stays FotMob-sourced (#750), so it (and
+        ``surface``/``opened``) is not extracted here. Like the other capture
+        flatteners the caller tags ``league``/``season``/lineage; this emits
+        business columns only.
         """
         ev = event_payload if isinstance(event_payload, dict) else {}
         # The captured /event/{id} body nests the event under "event" (#751 PR2).
