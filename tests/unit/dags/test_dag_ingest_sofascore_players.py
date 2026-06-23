@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import importlib
 import sys
+from types import SimpleNamespace
 
 import pytest
 from unittest.mock import MagicMock
@@ -71,7 +72,7 @@ class TestWeeklyPlayerDag:
         assert validate is not None and fresh is not None
         assert 'validate_data' in fresh.upstream_task_ids
 
-    def test_freshness_checks_cover_player_tables_as_warning(
+    def test_freshness_checks_cover_player_tables_as_error(
         self, dag_module, monkeypatch,
     ):
         captured = {}
@@ -79,7 +80,7 @@ class TestWeeklyPlayerDag:
         def fake_run_checks(checks, raise_on_error=True):
             captured['checks'] = checks
             captured['raise_on_error'] = raise_on_error
-            return MagicMock()
+            return MagicMock(errors=[])
 
         import utils.alerts as al
         import utils.data_quality as dq
@@ -98,10 +99,41 @@ class TestWeeklyPlayerDag:
             'bronze.sofascore_player_season_stats',
         }
         assert all(c.kind == 'freshness' for c in checks)
-        assert all(c.severity == 'WARNING' for c in checks)
+        assert all(c.severity == 'ERROR' for c in checks)
         # Weekly cadence → 8-day window before alerting.
         assert all(c.params['max_age_hours'] == 192 for c in checks)
+        # raise_on_error stays False; the function re-raises manually so the
+        # Telegram summary lands before the hard-fail.
         assert captured['raise_on_error'] is False
+        assert captured.get('telegram') is True
+
+    def test_freshness_stale_player_tables_raises(
+        self, dag_module, monkeypatch,
+    ):
+        from airflow.exceptions import AirflowException
+
+        captured = {}
+        stale = SimpleNamespace(
+            name='freshness[bronze.sofascore_player_profile._ingested_at<192h]',
+            details='age 300h > 192h', error=None,
+        )
+
+        def fake_run_checks(checks, raise_on_error=True):
+            return MagicMock(errors=[stale])
+
+        import utils.alerts as al
+        import utils.data_quality as dq
+
+        monkeypatch.setattr(dq, 'run_checks', fake_run_checks)
+        monkeypatch.setattr(
+            al, 'telegram_dq_summary',
+            lambda *a, **k: captured.setdefault('telegram', True),
+        )
+
+        with pytest.raises(AirflowException):
+            dag_module.validate_bronze_freshness()
+
+        # Telegram must fire before the hard-fail.
         assert captured.get('telegram') is True
 
 

@@ -144,13 +144,13 @@ def validate_data(**context) -> Dict[str, Any]:
 
 
 def validate_bronze_freshness(**context) -> None:
-    """Telegram-alert when the player bronze tables stop refreshing (#751).
+    """Hard-fail when the player bronze tables stop refreshing (#751).
 
     The scrape task soft-exits (R0.2B_FALLBACK, exit 2) when SofaScore's anti-bot
     returns 403, so the DAG stays green while data silently goes stale. A direct
-    MAX(_ingested_at) check surfaces a multi-week stall. WARNING-severity (not
-    ERROR) for now — promote after the capture path yields green weekly runs
-    (PR4). 8-day window gives one missed weekly run of grace.
+    MAX(_ingested_at) check surfaces a multi-week stall. ERROR-severity: a stale
+    table fails the task (the Telegram summary fires first). 8-day window gives
+    one missed weekly run of grace.
     """
     import logging
 
@@ -162,16 +162,24 @@ def validate_bronze_freshness(**context) -> None:
     checks = [
         CHECK.freshness(
             'bronze.sofascore_player_profile',
-            ts_col='_ingested_at', max_age_hours=192, severity='WARNING',
+            ts_col='_ingested_at', max_age_hours=192, severity='ERROR',
         ),
         CHECK.freshness(
             'bronze.sofascore_player_season_stats',
-            ts_col='_ingested_at', max_age_hours=192, severity='WARNING',
+            ts_col='_ingested_at', max_age_hours=192, severity='ERROR',
         ),
     ]
+    # raise_on_error=False so the Telegram summary lands before we re-raise on
+    # ERROR-severity failures (same pattern as dag_transform_e4).
     report = run_checks(checks, raise_on_error=False)
     logger.info("validate_bronze_freshness: %s", report.summary())
     telegram_dq_summary(report, header='SofaScore player Bronze freshness')
+
+    if report.errors:
+        raise AirflowException(
+            f"SofaScore player Bronze freshness failed: {len(report.errors)} error(s). "
+            + "; ".join(f"{r.name}: {r.details or r.error}" for r in report.errors)
+        )
 
 
 with DAG(
