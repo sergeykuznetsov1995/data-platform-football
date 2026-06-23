@@ -208,6 +208,14 @@ def _install_airflow_stubs() -> None:
 
     operators_trigger_mod.TriggerDagRunOperator = _TriggerDagRunOperator
 
+    # ShortCircuitOperator behaves like PythonOperator for DAG-load tests
+    # (instance-tracked via the shared registry); its python_callable is the
+    # gate hook. Subclass so the gate task is discoverable by _python_task().
+    class _ShortCircuitOperator(_PythonOperator):
+        pass
+
+    operators_python_mod.ShortCircuitOperator = _ShortCircuitOperator
+
     # ---- airflow.operators.bash.BashOperator ----------------------------
     # Records every ctor kwarg so tests can assert on `append_env`,
     # `bash_command`, `env`, etc. exactly the same way a real BashOperator
