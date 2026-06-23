@@ -142,6 +142,27 @@ def _bootstrap(con) -> None:
         ('Phantom Arena',           10.0000, 20.0000, 'Nowhere',          'Grass',        100, 1900, 'ENG-Premier League')
     """)
 
+    # #753: SofaScore per-match venue (silver.sofascore_venue) — lookup-only
+    # enrichment BEHIND FotMob for city/coords, and the SOLE source of venue
+    # country. Etihad: FotMob primary must win over SofaScore's coords. Goodison:
+    # moved ground with NO FotMob row → SofaScore fills coords (the #753 win).
+    # New Orphan Park: orphan → SofaScore fills country FotMob/curated lack.
+    # 'SofaScore Phantom' is unknown to fbref/espn → must NOT create a venue.
+    con.execute("""
+        CREATE TABLE silver.sofascore_venue (
+            stadium VARCHAR, city VARCHAR, country VARCHAR,
+            venue_latitude DOUBLE, venue_longitude DOUBLE,
+            _bronze_ingested_at TIMESTAMP, league VARCHAR, season VARCHAR
+        )
+    """)
+    con.execute("""
+        INSERT INTO silver.sofascore_venue VALUES
+        ('Etihad Stadium',    'SS-Manchester',  'SS-England', 88.0000, 88.0000, TIMESTAMP '2026-06-23 09:00:00', 'ENG-Premier League', '2425'),
+        ('Goodison Park',     'Liverpool',      'England',    53.4388, -2.9663, TIMESTAMP '2026-06-23 09:00:00', 'ENG-Premier League', '2425'),
+        ('New Orphan Park',   'SS-Orphanville', 'Orphanland', 7.0000,  8.0000,  TIMESTAMP '2026-06-23 09:00:00', 'ENG-Premier League', '2425'),
+        ('SofaScore Phantom', 'Ghost City',     'Ghostland',  30.0000, 40.0000, TIMESTAMP '2026-06-23 09:00:00', 'ENG-Premier League', '2425')
+    """)
+
 
 @pytest.fixture(scope="module")
 def gold_rows():
@@ -221,8 +242,8 @@ class TestDimVenueLogic:
 
     def test_orphan_fallback(self, gold_rows):
         """Unmatched raw name → venue_source='orphan', hash-based venue_<hex> id
-        (not a YAML slug). city is now filled from FotMob (#750); country stays NULL
-        (no curated alias, and FotMob carries team — not venue — country)."""
+        (not a YAML slug). city is filled from FotMob (#750); country is now filled
+        from SofaScore event.venue (#753) — FotMob carries team, not venue, country."""
         orphans = [r for r in gold_rows if r["venue_source"] == "orphan"]
         assert len(orphans) == 1
         row = orphans[0]
@@ -232,8 +253,8 @@ class TestDimVenueLogic:
             "venue_etihad", "venue_anfield", "venue_old_trafford",
             "venue_goodison", "venue_brentford",
         }
-        assert row["city"] == "Orphanville"  # #750: FotMob fills non-curated city
-        assert row["country"] is None
+        assert row["city"] == "Orphanville"   # #750: FotMob fills non-curated city
+        assert row["country"] == "Orphanland"  # #753: SofaScore fills venue country
 
     def test_curated_city_wins_over_fotmob(self, gold_rows):
         """#750 precedence: curated venue_aliases.yaml city wins over FotMob.
@@ -290,13 +311,13 @@ class TestDimVenueLogic:
         assert brentford["latitude"] == pytest.approx(51.4906)
         assert brentford["longitude"] == pytest.approx(-0.2889)
 
-    def test_coords_null_without_fotmob_match(self, gold_rows):
-        """Curated venue with no FotMob row (Goodison) gets NULL coords — the LEFT
-        JOIN must not invent values. (The orphan now HAS a FotMob row, so its coords
-        are filled — see test_orphan_fallback / #750.)"""
+    def test_sofascore_coords_fill_moved_ground(self, gold_rows):
+        """#753: a moved ground with NO FotMob row (Goodison — FotMob's
+        current-ground bias mislabels it) now gets coords from SofaScore's
+        per-match venue. These were NULL before #753."""
         goodison = _by_id(gold_rows, "venue_goodison")[0]
-        assert goodison["latitude"] is None
-        assert goodison["longitude"] is None
+        assert goodison["latitude"] == pytest.approx(53.4388)
+        assert goodison["longitude"] == pytest.approx(-2.9663)
 
     def test_fotmob_coords_add_no_venues(self, gold_rows):
         """'Phantom Arena' exists only in FotMob (not fbref/espn) → it must NOT
@@ -304,3 +325,26 @@ class TestDimVenueLogic:
         names = {r["venue_name"] for r in gold_rows}
         assert "Phantom Arena" not in names
         assert len(gold_rows) == 6  # unchanged by the coords join
+
+    # ---- #753: SofaScore venue enrichment ----------------------------------
+
+    def test_fotmob_coords_win_over_sofascore(self, gold_rows):
+        """#753 precedence: FotMob coords are PRIMARY; SofaScore only fills NULLs.
+        Etihad has both — FotMob's 53.4831 must win over SofaScore's 88.0."""
+        etihad = _by_id(gold_rows, "venue_etihad")[0]
+        assert etihad["latitude"] == pytest.approx(53.4831)
+        assert etihad["longitude"] == pytest.approx(-2.2004)
+
+    def test_sofascore_fills_country_for_orphan(self, gold_rows):
+        """#753: venue country comes solely from SofaScore event.venue (FotMob
+        carries team country, not venue). An orphan with a SofaScore row — which
+        had NULL country before #753 — now resolves its country."""
+        orphan = [r for r in gold_rows if r["venue_source"] == "orphan"][0]
+        assert orphan["country"] == "Orphanland"
+
+    def test_sofascore_adds_no_venues(self, gold_rows):
+        """'SofaScore Phantom' exists only in SofaScore (not fbref/espn) → must NOT
+        appear as a venue. Guards the lookup-only / no-fan-out contract."""
+        names = {r["venue_name"] for r in gold_rows}
+        assert "SofaScore Phantom" not in names
+        assert len(gold_rows) == 6  # unchanged by the SofaScore join

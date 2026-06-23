@@ -567,10 +567,12 @@ def _run_match_capture(
             eps_df = frames.get('event_player_stats')
             stats_df = frames.get('match_stats')
             shot_df = frames.get('event_shotmap')
+            venue_df = frames.get('venue')
             ratings_empty = ratings_df is None or ratings_df.empty
             eps_empty = eps_df is None or eps_df.empty
             stats_empty = stats_df is None or stats_df.empty
             shot_empty = shot_df is None or shot_df.empty
+            venue_empty = venue_df is None or venue_df.empty
 
             if ratings_empty and eps_empty:
                 last_err = getattr(scraper, '_last_lineup_error', None)
@@ -661,6 +663,23 @@ def _run_match_capture(
                 results['shotmap_matches'] = int(shot_df['match_id'].nunique())
                 logger.info("Saved %d shotmap rows -> %s",
                             results['shotmap_rows'], shpath)
+
+            # venue (#753) — one row per match from the SAME capture pass;
+            # full-state refresh like the others. Best-effort: empty when the
+            # event payload carried no venue.
+            if not venue_empty:
+                vpath = scraper.save_to_iceberg(
+                    df=venue_df,
+                    table_name='sofascore_venue',
+                    partition_cols=['league', 'season'],
+                    replace_partitions=['league', 'season'],
+                    min_replace_ratio=min_ratio,
+                )
+                results['tables'].append(vpath)
+                results['venue_rows'] = int(len(venue_df))
+                results['venue_matches'] = int(venue_df['game_id'].nunique())
+                logger.info("Saved %d venue rows -> %s",
+                            results['venue_rows'], vpath)
 
     except ReplaceGuardError as e:
         msg = f"{REPLACE_GUARD_MARKER}: {e}"

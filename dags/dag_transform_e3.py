@@ -279,6 +279,17 @@ SILVER_E3_TRANSFORMS = [
         'dags/sql/silver/sofascore_league_table.sql',
         'sofascore_league_table',
     ),
+    (
+        # issue #753: conform-only SofaScore venue snapshot from the per-match
+        # event-capture (bronze.sofascore_venue, dedup ROW_NUMBER to one row per
+        # stadium, season-slug as-is). NO silver.xref reads (canonical resolve
+        # deferred to Gold per charter §5) → no dag_transform_xref dependency.
+        # Consumer: gold.dim_venue (sofascore_venue enrichment CTE — fills
+        # country FotMob lacks + city/coords for moved grounds).
+        'sofascore_venue',
+        'dags/sql/silver/sofascore_venue.sql',
+        'sofascore_venue',
+    ),
 ]
 
 GOLD_E3_TRANSFORMS = [

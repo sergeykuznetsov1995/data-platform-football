@@ -885,9 +885,20 @@ class TestReadMatchCapture:
                      'statistics': {'rating': '6.5', 'totalShots': 3}},
                 ]},
             },
-            # Live /event/{id} nests the event under "event" (#751 PR2).
-            'event': {'event': {'homeTeam': {'id': 1, 'name': 'Home FC'},
-                                'awayTeam': {'id': 2, 'name': 'Away FC'}}},
+            # Live /event/{id} nests the event under "event" (#751 PR2); the
+            # venue block is the SofaScore nested-object shape (#753).
+            'event': {'event': {'id': 14023959,
+                                'homeTeam': {'id': 1, 'name': 'Home FC'},
+                                'awayTeam': {'id': 2, 'name': 'Away FC'},
+                                'venue': {
+                                    'stadium': {'name': 'Etihad Stadium',
+                                                'capacity': 55097},
+                                    'city': {'name': 'Manchester'},
+                                    'country': {'name': 'England',
+                                                'alpha2': 'EN'},
+                                    'venueCoordinates': {
+                                        'latitude': 53.483056,
+                                        'longitude': -2.200278}}}},
             # #751 PR2 — same nav also captures statistics + shotmap.
             'statistics': {'statistics': [
                 {'period': 'ALL', 'groups': [
@@ -974,6 +985,35 @@ class TestReadMatchCapture:
         assert set(sm['xg']) == {0.45}
 
     @pytest.mark.unit
+    def test_one_pass_yields_venue_frame(self):
+        # #753 — the SAME capture pass materialises a venue frame from the
+        # /event payload's nested venue block (one row per match).
+        scraper = self._scraper()
+
+        def fake_iter(match_ids, **kwargs):
+            for mid in match_ids:
+                yield str(mid), self._endpoints()
+
+        scraper._iter_match_captures = fake_iter
+
+        out = scraper.read_match_capture(
+            league='ENG-Premier League', season=2025, match_ids=['M1', 'M2'],
+        )
+
+        ve = out['venue']
+        assert len(ve) == 2   # one row per match
+        assert set(ve['season']) == {'2526'}
+        assert set(ve['_entity_type']) == {'venue'}
+        row = ve.to_dict('records')[0]
+        # nested SofaScore {"name": ...} objects unwrapped to scalars.
+        assert row['stadium'] == 'Etihad Stadium'
+        assert row['city'] == 'Manchester'
+        assert row['country'] == 'England'
+        assert row['venue_latitude'] == 53.483056
+        assert row['venue_longitude'] == -2.200278
+        assert row['game_id'] == 14023959
+
+    @pytest.mark.unit
     def test_requests_all_tabs_and_event(self):
         # The "one nav" contract clicks ALL deep tabs and requires event so
         # team_id is populated — assert _iter_match_captures is invoked so.
@@ -1010,6 +1050,69 @@ class TestReadMatchCapture:
                     'match_stats', 'event_shotmap'):
             assert out[key].empty
             assert 'match_id' in out[key].columns
+        # venue is keyed by game_id (one row per match), not match_id.
+        assert out['venue'].empty
+        assert 'game_id' in out['venue'].columns
+
+
+class TestFlattenEventVenue:
+    """_flatten_event_venue (#753): project /event venue → one Bronze row.
+    Defensive across the SofaScore nested-object shape AND the flat shape the
+    issue documents; None when no usable stadium."""
+
+    def _flat(self, payload, match_id='14023959'):
+        from scrapers.sofascore.scraper import SofaScoreScraper
+        return SofaScoreScraper._flatten_event_venue(match_id, payload)
+
+    @pytest.mark.unit
+    def test_extracts_nested_sofascore_shape(self):
+        payload = {'event': {'id': 14023959, 'venue': {
+            'stadium': {'name': 'Etihad Stadium', 'capacity': 55097},
+            'city': {'name': 'Manchester'},
+            'country': {'name': 'England', 'alpha2': 'EN'},
+            'venueCoordinates': {'latitude': 53.483056, 'longitude': -2.200278},
+        }}}
+        assert self._flat(payload) == {
+            'game_id': 14023959,
+            'stadium': 'Etihad Stadium',
+            'city': 'Manchester',
+            'country': 'England',
+            'venue_latitude': 53.483056,
+            'venue_longitude': -2.200278,
+        }
+
+    @pytest.mark.unit
+    def test_extracts_flat_issue_shape(self):
+        # The issue documents a flat {stadium, city, country} string form.
+        payload = {'event': {'id': 99, 'venue': {
+            'stadium': 'Anfield', 'city': 'Liverpool', 'country': 'England',
+        }}}
+        row = self._flat(payload)
+        assert row['stadium'] == 'Anfield'
+        assert row['city'] == 'Liverpool'
+        assert row['country'] == 'England'
+        assert row['venue_latitude'] is None
+        assert row['venue_longitude'] is None
+        assert row['game_id'] == 99
+
+    @pytest.mark.unit
+    def test_none_when_no_venue(self):
+        assert self._flat({'event': {'id': 1}}) is None
+
+    @pytest.mark.unit
+    def test_none_when_no_stadium(self):
+        assert self._flat(
+            {'event': {'id': 1, 'venue': {'city': {'name': 'X'}}}}) is None
+
+    @pytest.mark.unit
+    def test_none_when_payload_not_dict(self):
+        assert self._flat(None) is None
+
+    @pytest.mark.unit
+    def test_game_id_falls_back_to_match_id(self):
+        # event payload without id → use the numeric match_id arg.
+        payload = {'event': {'venue': {'stadium': {'name': 'X'}}}}
+        assert self._flat(payload, match_id='555')['game_id'] == 555
 
 
 class TestCamoufoxProxy:
