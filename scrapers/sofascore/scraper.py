@@ -248,27 +248,95 @@ class SofaScoreScraper(SoccerdataScraper):
         return out
 
     def read_league_table(self) -> Optional[pd.DataFrame]:
+        """Read league standings via Camoufox capture (#777).
+
+        The soccerdata reader is Turnstile-blocked (#757), so we navigate the
+        SofaScore tournament page — whose LANDING view is the standings table —
+        and let the SPA fire ``/unique-tournament/{ut}/season/{sid}/standings/
+        total``, then flatten the captured rows into
+        ``bronze.sofascore_league_table`` via :func:`camoufox_capture.
+        normalize_standing`. Rows are labelled with ``self.seasons[0]`` in
+        soccerdata short form (``'2526'``).
+
+        The standings JSON carries no season, so the guard is the ``season_id``:
+        we resolve the target year's sid from the captured ``/seasons`` map and
+        accept ONLY the standings XHR for that exact sid. Off-season the page
+        rolls to the NEXT season, whose standings would otherwise overwrite the
+        current-season partition with an empty table — requiring our sid skips
+        it. Returns ``None`` when nothing matches (caller then skips the save).
         """
-        Read league table (standings).
+        from scrapers.sofascore.camoufox_capture import (
+            SofascoreCamoufoxCapture,
+            extract_tournament_seasons_map,
+            extract_tournament_standings,
+            normalize_standing,
+            season_short_to_label,
+        )
 
-        Returns:
-            DataFrame with league standings
-        """
-        reader = self._get_reader()
-        logger.info("Fetching SofaScore league table")
-
-        try:
-            df = self._execute_with_resilience(reader.read_league_table)
-
-            if df is not None and not df.empty:
-                df = df.reset_index()
-                df = self._add_metadata(df, 'league_table')
-
-            return df
-
-        except Exception as e:
-            logger.error(f"Error reading league table: {e}")
+        if not self.seasons:
+            logger.warning("read_league_table: no season configured — skipping.")
             return None
+        # Label rows with the soccerdata short form ('YYZZ', e.g. 2025 -> '2526')
+        # so the partition aligns with the other SofaScore writers (#27).
+        season_str = str(self.seasons[0])
+        if len(season_str) == 4 and season_str.isdigit():
+            season_short = f"{season_str[2:4]}{int(season_str[2:4]) + 1:02d}"
+        else:
+            season_short = season_str
+        target_year = season_short_to_label(season_short)  # '2526' -> '25/26'
+
+        proxy = self._camoufox_proxy()
+        frames: List[pd.DataFrame] = []
+        for league in self.leagues:
+            ut_id = self._resolve_unique_tournament_id(league)
+            slug = SOFASCORE_TOURNAMENT_SLUG.get(league)
+            if ut_id is None or slug is None:
+                logger.warning(
+                    "No SofaScore slug/ut_id for league=%s — league_table "
+                    "capture skipped.", league,
+                )
+                continue
+            nav_url = f"https://www.sofascore.com/tournament/{slug}/{ut_id}"
+            try:
+                self._rate_limiter.acquire()
+                with SofascoreCamoufoxCapture(proxy=proxy) as cap:
+                    buffer = cap.capture_buffer(nav_url)
+            except Exception as e:  # noqa: BLE001 — capture must not crash the run
+                logger.warning("capture league_table failed for league=%s: %s",
+                               league, e)
+                continue
+
+            seasons_map = extract_tournament_seasons_map(buffer, ut_id)
+            target_sid = seasons_map.get(target_year)
+            if target_sid is None:
+                logger.warning(
+                    "Capture league_table league=%s: season %s (year=%s) not in "
+                    "the /seasons map — page may serve a different season.",
+                    league, season_short, target_year,
+                )
+                continue
+            rows = extract_tournament_standings(buffer, ut_id, target_sid)
+            if not rows:
+                logger.warning(
+                    "Capture league_table league=%s: 0 standings rows for "
+                    "season=%s (sid=%s).", league, season_short, target_sid,
+                )
+                continue
+
+            df = pd.DataFrame([normalize_standing(r) for r in rows])
+            for col in ('mp', 'w', 'd', 'l', 'gf', 'ga', 'gd', 'pts'):
+                df[col] = df[col].astype('Int64')          # nullable bigint
+            df['league'] = league
+            df['season'] = season_short
+            logger.info("Capture league_table league=%s season=%s: %d rows.",
+                        league, season_short, len(df))
+            frames.append(df)
+
+        if not frames:
+            return None
+        out = pd.concat(frames, ignore_index=True)
+        out = self._add_metadata(out, 'league_table')
+        return out
 
     def read_team_season_stats(self) -> Optional[pd.DataFrame]:
         """

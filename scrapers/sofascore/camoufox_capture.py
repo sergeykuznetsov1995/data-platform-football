@@ -215,6 +215,74 @@ def extract_tournament_events(buffer: Dict[str, dict], ut_id) -> list:
     return list(seen.values())
 
 
+def extract_tournament_seasons_map(buffer: Dict[str, dict], ut_id) -> Dict[str, int]:
+    """``{year_label: season_id}`` from a captured
+    ``/unique-tournament/{ut_id}/seasons`` response (e.g. ``'25/26' -> 76986``).
+
+    Lets :meth:`SofaScoreScraper.read_league_table` map a target season year to
+    its SofaScore ``season_id`` — the ``/standings/total`` path is keyed by
+    ``season_id``, not by year, and the standings JSON itself carries no season.
+    Returns ``{}`` when the seasons list wasn't captured / came back challenged.
+    Mirrors :func:`extract_player_seasons_map` for the tournament endpoint."""
+    rec = buffer.get(f"/api/v1/unique-tournament/{int(ut_id)}/seasons")
+    if not rec or rec.get("status") != 200 or rec.get("challenge") is not False:
+        return {}
+    obj = rec.get("json")
+    if not isinstance(obj, dict):
+        return {}
+    out: Dict[str, int] = {}
+    for s in obj.get("seasons") or []:
+        if isinstance(s, dict) and s.get("year") is not None and s.get("id") is not None:
+            out[str(s["year"])] = int(s["id"])
+    return out
+
+
+def extract_tournament_standings(buffer: Dict[str, dict], ut_id, season_id) -> list:
+    """The ``rows`` of the TOTAL standings table for a SPECIFIC
+    ``(ut_id, season_id)`` from a capture ``buffer``'s
+    ``/unique-tournament/{ut}/season/{sid}/standings/total`` response.
+
+    The exact ``season_id`` in the path is the season-guard: a tournament page
+    that has rolled to the NEXT season off-season fires ``/standings/total`` for
+    a DIFFERENT sid, so requiring our target sid keeps it out of the current
+    partition (the caller then writes nothing). Returns ``[]`` when the standings
+    XHR for this sid wasn't captured / was challenged / carried no rows."""
+    rec = buffer.get(
+        f"/api/v1/unique-tournament/{int(ut_id)}/season/{int(season_id)}/standings/total"
+    )
+    if not rec or rec.get("status") != 200 or rec.get("challenge") is not False:
+        return []
+    obj = rec.get("json")
+    standings = obj.get("standings") if isinstance(obj, dict) else None
+    if not isinstance(standings, list) or not standings:
+        return []
+    # Prefer the 'total' table; fall back to the first block.
+    block = next((s for s in standings if isinstance(s, dict)
+                  and s.get("type") == "total"), standings[0])
+    rows = block.get("rows") if isinstance(block, dict) else None
+    return rows if isinstance(rows, list) else []
+
+
+def normalize_standing(row: dict) -> dict:
+    """Flatten a SofaScore standings row to a ``bronze.sofascore_league_table``
+    row (business columns only; the caller adds ``league`` / ``season`` /
+    metadata and casts the counts to nullable bigint). ``gd`` is derived — the
+    API row has no goal-difference field. Mirrors :func:`normalize_event`."""
+    gf = row.get("scoresFor")
+    ga = row.get("scoresAgainst")
+    return {
+        "team": (row.get("team") or {}).get("name"),
+        "mp": row.get("matches"),
+        "w": row.get("wins"),
+        "d": row.get("draws"),
+        "l": row.get("losses"),
+        "gf": gf,
+        "ga": ga,
+        "gd": (gf - ga) if gf is not None and ga is not None else None,
+        "pts": row.get("points"),
+    }
+
+
 def parse_proxy_line(line: str) -> Optional[dict]:
     """``host:port:user:pass`` → a Playwright/Camoufox proxy dict (creds split
     out — browsers reject creds embedded in the URL). Returns ``None`` for a
