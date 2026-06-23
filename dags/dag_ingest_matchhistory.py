@@ -22,6 +22,7 @@ from typing import Any, Dict, List
 
 from airflow import DAG
 from airflow.exceptions import AirflowException
+from airflow.models.param import Param
 from airflow.operators.bash import BashOperator
 from airflow.operators.python import PythonOperator
 
@@ -139,7 +140,23 @@ with DAG(
     max_active_runs=1,
     params={
         'leagues': LEAGUES,
-        'season': CURRENT_SEASON,
+        # Season is UI-configurable: the daily scheduled run uses the default
+        # (CURRENT_SEASON); to (re)ingest or backfill a past season, use
+        # "Trigger DAG w/ config" and set season (e.g. 2016 = 2016/17 season).
+        # New (league, season) partitions are written via replace_partitions —
+        # backfilling an early season leaves all other partitions untouched.
+        'season': Param(
+            default=CURRENT_SEASON,
+            type='integer',
+            minimum=2000,
+            maximum=CURRENT_SEASON,
+            title='Season (start year)',
+            description=(
+                'APL season start year (2016 = 2016/17 season). '
+                'Default = current season for the daily run. Override here to '
+                'ingest a past season (e.g. 2016…2020 to backfill early history).'
+            ),
+        ),
     },
     doc_md="""
     ## MatchHistory Data Ingestion
@@ -166,11 +183,15 @@ with DAG(
 
     scrape_data_task = BashOperator(
         task_id='scrape_match_results',
+        # --season is rendered at runtime from params.season (Jinja), so the
+        # season is configurable from the UI ("Trigger DAG w/ config") without a
+        # separate backfill DAG. f-string escapes {{ }} as {{{{ }}}} so the
+        # literal Jinja tag survives into the rendered command.
         bash_command=f"""
 cd /opt/airflow && \\
 python dags/scripts/run_matchhistory_scraper.py \\
     --leagues "{leagues_str}" \\
-    --season {CURRENT_SEASON} \\
+    --season {{{{ params.season }}}} \\
     --output /tmp/matchhistory_result.json \\
     --headless \\
     --use-xvfb
