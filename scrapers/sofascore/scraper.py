@@ -259,7 +259,8 @@ class SofaScoreScraper(SoccerdataScraper):
         soccerdata short form (``'2526'``).
 
         The standings JSON carries no season, so the guard is the ``season_id``:
-        we resolve the target year's sid from the captured ``/seasons`` map and
+        we resolve the target year's sid from the captured events (the
+        ``/seasons`` map does NOT fire on the standings landing — #779) and
         accept ONLY the standings XHR for that exact sid. Off-season the page
         rolls to the NEXT season, whose standings would otherwise overwrite the
         current-season partition with an empty table — requiring our sid skips
@@ -267,6 +268,7 @@ class SofaScoreScraper(SoccerdataScraper):
         """
         from scrapers.sofascore.camoufox_capture import (
             SofascoreCamoufoxCapture,
+            extract_tournament_events,
             extract_tournament_seasons_map,
             extract_tournament_standings,
             normalize_standing,
@@ -306,12 +308,25 @@ class SofaScoreScraper(SoccerdataScraper):
                                league, e)
                 continue
 
+            # Resolve the target year's SofaScore season_id. /seasons does NOT
+            # fire on the standings landing (live-proven #779: 0 of 3 capture
+            # passes saw it), so fall back to the captured events, which carry
+            # season.{id,year} — the same source read_schedule filters on. Off-
+            # season the page serves only the NEXT season's events, so a missing
+            # target sid still skips the league (no empty-table overwrite).
             seasons_map = extract_tournament_seasons_map(buffer, ut_id)
             target_sid = seasons_map.get(target_year)
             if target_sid is None:
+                for ev in extract_tournament_events(buffer, ut_id):
+                    s = ev.get('season') or {}
+                    if s.get('year') == target_year and s.get('id') is not None:
+                        target_sid = int(s['id'])
+                        break
+            if target_sid is None:
                 logger.warning(
-                    "Capture league_table league=%s: season %s (year=%s) not in "
-                    "the /seasons map — page may serve a different season.",
+                    "Capture league_table league=%s: season %s (year=%s) "
+                    "unresolved from /seasons or events — page may serve a "
+                    "different season.",
                     league, season_short, target_year,
                 )
                 continue

@@ -1659,3 +1659,87 @@ class TestReadPlayerCapture:
         assert out['player_profile'].empty
         assert 'player_id' in out['player_profile'].columns
         assert out['player_season_stats'].empty
+
+
+class TestReadLeagueTableCapture:
+    """read_league_table resolves the season_id from the captured EVENTS — the
+    /seasons map does NOT fire on the standings landing (live-proven #779: 0 of
+    3 capture passes saw it), so the prior /seasons-only resolution returned 0
+    rows even in-season. We patch the Camoufox seam with a real-shaped buffer
+    (EPL 24/25) carrying events + standings but NO /seasons and assert the
+    events fallback recovers the sid and flattens the table.
+    """
+
+    def _scraper(self):
+        from scrapers.sofascore.scraper import SofaScoreScraper
+        with patch('scrapers.base.base_scraper.get_rate_limiter'), \
+             patch('scrapers.base.base_scraper.get_retry_policy'), \
+             patch('scrapers.base.base_scraper.get_circuit_breaker'), \
+             patch('scrapers.base.base_scraper.IcebergWriter'):
+            return SofaScoreScraper(leagues=['ENG-Premier League'], seasons=[2024])
+
+    def _patch_capture(self, buffer):
+        fake = MagicMock()
+        fake.__enter__.return_value.capture_buffer.return_value = buffer
+        fake.__exit__.return_value = False
+        return patch(
+            'scrapers.sofascore.camoufox_capture.SofascoreCamoufoxCapture',
+            return_value=fake)
+
+    def _buffer_no_seasons(self, sid=61627):
+        """EPL 24/25 landing: events carry season {year:'24/25', id:61627};
+        standings/total for that sid; NO /seasons (it never fires)."""
+        return {
+            f"/api/v1/unique-tournament/17/season/{sid}/events/round/1": {
+                "status": 200, "challenge": False, "json": {"events": [
+                    {"id": 1, "season": {"year": "24/25", "id": sid}}]}},
+            f"/api/v1/unique-tournament/17/season/{sid}/standings/total": {
+                "status": 200, "challenge": False, "json": {"standings": [
+                    {"type": "total", "rows": [
+                        {"team": {"name": "Liverpool FC"}, "matches": 38, "wins": 25,
+                         "draws": 9, "losses": 4, "scoresFor": 86,
+                         "scoresAgainst": 41, "points": 84},
+                        {"team": {"name": "Southampton"}, "matches": 38, "wins": 2,
+                         "draws": 6, "losses": 30, "scoresFor": 26,
+                         "scoresAgainst": 86, "points": 12}]}]}},
+        }
+
+    @pytest.mark.unit
+    def test_resolves_sid_from_events_when_seasons_absent(self):
+        # Arrange — the real live scenario: /seasons missing, events present.
+        scraper = self._scraper()
+        scraper._camoufox_proxy = lambda: None
+
+        # Act
+        with self._patch_capture(self._buffer_no_seasons()):
+            df = scraper.read_league_table()
+
+        # Assert — sid recovered from events → 2 rows, correctly labelled.
+        assert df is not None and len(df) == 2
+        rows = {r['team']: r for r in df.to_dict('records')}
+        assert rows['Liverpool FC']['pts'] == 84
+        assert rows['Liverpool FC']['gd'] == 45          # derived gf-ga
+        assert set(df['season']) == {'2425'}             # 2024 -> soccerdata slug
+        assert set(df['league']) == {'ENG-Premier League'}
+        assert set(df['_entity_type']) == {'league_table'}
+
+    @pytest.mark.unit
+    def test_returns_none_when_target_season_not_served(self):
+        # Off-season: the page serves only the NEXT season (26/27); target 24/25
+        # is absent from both /seasons and events → skip (no empty overwrite).
+        scraper = self._scraper()
+        scraper._camoufox_proxy = lambda: None
+        buf = {
+            "/api/v1/unique-tournament/17/season/96668/events/round/1": {
+                "status": 200, "challenge": False, "json": {"events": [
+                    {"id": 9, "season": {"year": "26/27", "id": 96668}}]}},
+            "/api/v1/unique-tournament/17/season/96668/standings/total": {
+                "status": 200, "challenge": False, "json": {"standings": [
+                    {"type": "total", "rows": [
+                        {"team": {"name": "X"}, "matches": 0, "wins": 0, "draws": 0,
+                         "losses": 0, "scoresFor": 0, "scoresAgainst": 0,
+                         "points": 0}]}]}},
+        }
+        with self._patch_capture(buf):
+            df = scraper.read_league_table()
+        assert df is None
