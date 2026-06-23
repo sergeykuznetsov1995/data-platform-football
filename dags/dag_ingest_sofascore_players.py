@@ -2,15 +2,14 @@
 SofaScore Per-Player Ingestion DAG (weekly)
 ==========================================
 
-Issue #751 PR3. Captures the per-player **profile** (biographical snapshot) from
-SofaScore in ONE Camoufox navigation per player:
+Issue #751 PR3 + PR3b. Captures, in ONE Camoufox navigation per player:
 
   - ``bronze.sofascore_player_profile`` — bio SSR'd in ``__NEXT_DATA__``
-
-Season-aggregate stats (``sofascore_player_season_stats``) are deferred to PR3b:
-for transferred/multi-competition players the player page's default Season tab is
-a non-EPL competition, so a season-picker must be driven — see
-``memory/feedback_sofascore_player_page_capture``.
+  - ``bronze.sofascore_player_season_stats`` — the target competition's
+    season-aggregate stats, captured by driving the Season tab + a season-picker
+    (the default Season tab is the player's PRIMARY competition, not necessarily
+    EPL for a transferred player) — see
+    ``memory/feedback_sofascore_player_page_capture``.
 
 Why a SEPARATE weekly DAG (not the daily ``dag_ingest_sofascore``): the player
 universe is ~526 players, each a full browser navigation behind a residential
@@ -19,10 +18,12 @@ Profiles change rarely, so weekly cadence is plenty. Player ids are resolved fro
 ``bronze.sofascore_player_ratings`` (written by the daily ``match_capture``), so
 this DAG runs independently after that table is populated.
 
-The table is written full-state (``replace_partitions=['league', 'season']`` +
-completeness guard). Exit 2 = graceful R0.2B_FALLBACK (page didn't render / proxy
-dead) → soft success so ``validate_data`` still runs; exit 3 = completeness-guard
-refusal → real failure.
+Both tables are written full-state (``replace_partitions=['league', 'season']`` +
+completeness guard). Season-stats is secondary: a strict subset of profile (the
+picker misses for some transferred players), so its save is skipped when empty
+and the DAG row-floor only WARNs on low coverage. Exit 2 = graceful
+R0.2B_FALLBACK (page didn't render / proxy dead) → soft success so
+``validate_data`` still runs; exit 3 = completeness-guard refusal → real failure.
 """
 
 import os
@@ -94,6 +95,8 @@ def validate_data(**context) -> Dict[str, Any]:
         'summary': {
             'player_profile_rows': result.get('rows', 0),
             'player_profile_players': result.get('profile_players', 0),
+            'player_season_stats_rows': result.get('season_stats_rows', 0),
+            'player_season_stats_players': result.get('season_stats_players', 0),
             'fallback': result.get('fallback', False),
             'tables': result.get('tables', []),
         },
@@ -119,6 +122,16 @@ def validate_data(**context) -> Dict[str, Any]:
         else:
             validation['warnings'].append(
                 f"Low player_profile row count: {rows} < 400")
+
+    # player_season_stats (#751 PR3b) — a strict subset of profile (the Season
+    # picker can miss for transferred/multi-competition players). WARN-only
+    # floor: low coverage never fails the run, it just flags a possible picker
+    # regression. 300 is a conservative floor below ~526 active APL players.
+    season_rows = validation['summary']['player_season_stats_rows']
+    if season_rows < 300:
+        validation['warnings'].append(
+            f"Low player_season_stats row count: {season_rows} < 300 "
+            f"(Season-tab picker coverage)")
 
     logger.info("Data validation complete: %s", validation['status'])
     logger.info("Summary: %s", validation['summary'])
@@ -151,6 +164,10 @@ def validate_bronze_freshness(**context) -> None:
             'bronze.sofascore_player_profile',
             ts_col='_ingested_at', max_age_hours=192, severity='WARNING',
         ),
+        CHECK.freshness(
+            'bronze.sofascore_player_season_stats',
+            ts_col='_ingested_at', max_age_hours=192, severity='WARNING',
+        ),
     ]
     report = run_checks(checks, raise_on_error=False)
     logger.info("validate_bronze_freshness: %s", report.summary())
@@ -174,8 +191,10 @@ with DAG(
     ## SofaScore Per-Player Ingestion (weekly)
 
     ONE Camoufox navigation per player → ``bronze.sofascore_player_profile``
-    (bio from ``__NEXT_DATA__``). Replaces the dead tls pass (Turnstile-blocked,
-    #751). Season-aggregate stats are deferred to PR3b (need a season-picker).
+    (bio from ``__NEXT_DATA__``) + ``bronze.sofascore_player_season_stats`` (the
+    target competition's season-aggregate stats, captured by driving the Season
+    tab + a season-picker). Replaces the dead tls passes (Turnstile-blocked,
+    #751). Season-stats is secondary (WARN-only row floor; subset of profile).
 
     ### Why weekly + separate DAG
 

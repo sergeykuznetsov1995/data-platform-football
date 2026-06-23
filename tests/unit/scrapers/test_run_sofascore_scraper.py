@@ -384,18 +384,28 @@ class TestMatchCaptureRunner:
         scraper.save_to_iceberg.assert_not_called()
 
 
-def _player_capture_scraper(*, guard_blocks: bool = False, empty: bool = False):
-    """Stub for the #751 PR3 player_capture path: read_player_capture returns the
-    player_profile frame from one per-player capture."""
+def _player_capture_scraper(
+    *, guard_blocks: bool = False, empty: bool = False, season_empty: bool = False,
+):
+    """Stub for the #751 PR3 + PR3b player_capture path: read_player_capture
+    returns BOTH the player_profile and player_season_stats frames from one
+    per-player capture."""
     from scrapers.base.base_scraper import ReplaceGuardError
 
     if empty:
-        frames = {'player_profile': pd.DataFrame()}
+        frames = {'player_profile': pd.DataFrame(),
+                  'player_season_stats': pd.DataFrame()}
     else:
-        frames = {'player_profile': pd.DataFrame({
-            'league': ['ENG-Premier League'] * 3,
-            'season': ['2526'] * 3,
-            'player_id': ['1', '2', '3']})}
+        season_df = pd.DataFrame() if season_empty else pd.DataFrame({
+            'league': ['ENG-Premier League'] * 2, 'season': ['2526'] * 2,
+            'player_id': ['1', '2']})
+        frames = {
+            'player_profile': pd.DataFrame({
+                'league': ['ENG-Premier League'] * 3,
+                'season': ['2526'] * 3,
+                'player_id': ['1', '2', '3']}),
+            'player_season_stats': season_df,
+        }
 
     scraper = MagicMock()
     scraper.read_player_capture.return_value = frames
@@ -411,9 +421,10 @@ def _player_capture_scraper(*, guard_blocks: bool = False, empty: bool = False):
 
 
 class TestPlayerCaptureRunner:
-    """#751 PR3: the player_capture entity writes player_profile from one
-    per-player capture pass, full-state (replace_partitions + completeness
-    guard). (Season-aggregate stats are deferred to PR3b.)"""
+    """#751 PR3 + PR3b: the player_capture entity writes player_profile AND
+    player_season_stats from one per-player capture pass, full-state
+    (replace_partitions + completeness guard). Season-stats is secondary — its
+    save is skipped (not a fallback) when the picker captured nothing."""
 
     @pytest.fixture
     def temp_output(self):
@@ -424,7 +435,7 @@ class TestPlayerCaptureRunner:
             os.unlink(path)
 
     @pytest.mark.unit
-    def test_normal_path_saves_profile_arms_guard(self, temp_output):
+    def test_normal_path_saves_both_tables_arms_guard(self, temp_output):
         scraper = _player_capture_scraper()
         rc = _run_main(
             ["--entity", "player_capture", "--league", "ENG-Premier League",
@@ -432,14 +443,37 @@ class TestPlayerCaptureRunner:
             MagicMock(return_value=scraper),
         )
         assert rc == 0
-        assert scraper.save_to_iceberg.call_count == 1
-        c = scraper.save_to_iceberg.call_args_list[0]
-        assert c.kwargs['table_name'] == 'sofascore_player_profile'
-        assert c.kwargs['replace_partitions'] == ['league', 'season']
-        assert c.kwargs['min_replace_ratio'] == 0.9
+        assert scraper.save_to_iceberg.call_count == 2
+        saved = {c.kwargs['table_name']: c.kwargs
+                 for c in scraper.save_to_iceberg.call_args_list}
+        assert set(saved) == {'sofascore_player_profile',
+                              'sofascore_player_season_stats'}
+        for kwargs in saved.values():
+            assert kwargs['replace_partitions'] == ['league', 'season']
+            assert kwargs['min_replace_ratio'] == 0.9
         with open(temp_output) as f:
             payload = json.load(f)
         assert payload['rows'] == 3
+        assert payload['season_stats_rows'] == 2
+
+    @pytest.mark.unit
+    def test_season_empty_skips_second_save(self, temp_output):
+        # Picker captured no EPL overall for anyone → profile still saved, but
+        # the season-stats table is NOT touched (don't wipe a good partition).
+        scraper = _player_capture_scraper(season_empty=True)
+        rc = _run_main(
+            ["--entity", "player_capture", "--league", "ENG-Premier League",
+             "--season", "2025", "--output", temp_output],
+            MagicMock(return_value=scraper),
+        )
+        assert rc == 0
+        assert scraper.save_to_iceberg.call_count == 1
+        assert scraper.save_to_iceberg.call_args_list[0].kwargs['table_name'] == \
+            'sofascore_player_profile'
+        with open(temp_output) as f:
+            payload = json.load(f)
+        assert payload['rows'] == 3
+        assert payload['season_stats_rows'] == 0
 
     @pytest.mark.unit
     def test_guard_refusal_exits_3(self, temp_output):
