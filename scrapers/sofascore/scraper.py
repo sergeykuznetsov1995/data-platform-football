@@ -155,27 +155,97 @@ class SofaScoreScraper(SoccerdataScraper):
         return self._reader
 
     def read_schedule(self) -> Optional[pd.DataFrame]:
+        """Read the match schedule + results via Camoufox capture (#761).
+
+        The soccerdata schedule reader is Turnstile-blocked (#757), so for each
+        league we navigate its SofaScore tournament page, let the SPA fire its
+        ``/events/{round,last,next}`` XHRs (nudged toward finished matches), and
+        flatten the captured events into ``bronze.sofascore_schedule`` rows via
+        :func:`camoufox_capture.normalize_event`. The league page serves the
+        CURRENT season, so rows are labelled with ``self.seasons[0]`` in
+        soccerdata short form (``'2526'``); the runner merges this captured
+        window with the existing partition so a partial capture never shrinks it
+        (the completeness guard would otherwise refuse the save).
+
+        Returns ``None`` when nothing is captured (caller then skips the save,
+        leaving the existing partition intact).
         """
-        Read match schedule and results.
+        from scrapers.sofascore.camoufox_capture import (
+            SofascoreCamoufoxCapture,
+            extract_tournament_events,
+            normalize_event,
+            season_short_to_label,
+        )
 
-        Returns:
-            DataFrame with match schedule
-        """
-        reader = self._get_reader()
-        logger.info("Fetching SofaScore schedule")
-
-        try:
-            df = self._execute_with_resilience(reader.read_schedule)
-
-            if df is not None and not df.empty:
-                df = df.reset_index()
-                df = self._add_metadata(df, 'schedule')
-
-            return df
-
-        except Exception as e:
-            logger.error(f"Error reading schedule: {e}")
+        if not self.seasons:
+            logger.warning("read_schedule: no season configured — skipping.")
             return None
+        # Label rows with the soccerdata short form ('YYZZ', e.g. 2025 -> '2526')
+        # so the partition aligns with the ratings/match_capture writers (#27).
+        season_str = str(self.seasons[0])
+        if len(season_str) == 4 and season_str.isdigit():
+            season_short = f"{season_str[2:4]}{int(season_str[2:4]) + 1:02d}"
+        else:
+            season_short = season_str
+        # The tournament page serves whatever season SofaScore defaults to —
+        # NOT necessarily ours. Off-season it has already rolled to the NEXT
+        # season (live-proven 2026-06-23: the EPL page served 26/27 fixtures
+        # while CURRENT_SEASON was still 25/26). Keep only events whose season
+        # matches our target, so a roll-over never mislabels next-season
+        # fixtures as ours (and a partial capture never pollutes the partition).
+        target_season_year = season_short_to_label(season_short)  # '2526' -> '25/26'
+
+        proxy = self._camoufox_proxy()
+        frames: List[pd.DataFrame] = []
+        for league in self.leagues:
+            ut_id = self._resolve_unique_tournament_id(league)
+            slug = SOFASCORE_TOURNAMENT_SLUG.get(league)
+            if ut_id is None or slug is None:
+                logger.warning(
+                    "No SofaScore slug/ut_id for league=%s — schedule capture "
+                    "skipped.", league,
+                )
+                continue
+            nav_url = f"https://www.sofascore.com/tournament/{slug}/{ut_id}"
+            try:
+                self._rate_limiter.acquire()
+                with SofascoreCamoufoxCapture(proxy=proxy) as cap:
+                    buffer = cap.capture_tournament(nav_url)
+            except Exception as e:  # noqa: BLE001 — capture must not crash the run
+                logger.warning("capture schedule failed for league=%s: %s",
+                               league, e)
+                continue
+
+            events = extract_tournament_events(buffer, ut_id)
+            events = [
+                ev for ev in events
+                if (ev.get('season') or {}).get('year') == target_season_year
+            ]
+            if not events:
+                logger.warning(
+                    "Capture schedule league=%s: 0 events for season=%s "
+                    "(year=%s) — page may serve a different season.",
+                    league, season_short, target_season_year,
+                )
+                continue
+
+            df = pd.DataFrame([normalize_event(ev) for ev in events])
+            df['date'] = pd.to_datetime(df['date'], unit='s')
+            df['home_score'] = pd.to_numeric(df['home_score'], errors='coerce')
+            df['away_score'] = pd.to_numeric(df['away_score'], errors='coerce')
+            df['round'] = df['round'].astype('Int64')          # nullable bigint
+            df['week'] = pd.array([pd.NA] * len(df), dtype='Int64')
+            df['league'] = league
+            df['season'] = season_short
+            logger.info("Capture schedule league=%s season=%s: %d events.",
+                        league, season_short, len(df))
+            frames.append(df)
+
+        if not frames:
+            return None
+        out = pd.concat(frames, ignore_index=True)
+        out = self._add_metadata(out, 'schedule')
+        return out
 
     def read_league_table(self) -> Optional[pd.DataFrame]:
         """

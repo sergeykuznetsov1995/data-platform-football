@@ -1153,6 +1153,144 @@ class TestResolveMatchIdsViaCapture:
         assert out == []
 
 
+class TestReadScheduleViaCapture:
+    """read_schedule (#761) builds bronze.sofascore_schedule rows from a captured
+    tournament page (the soccerdata reader is Turnstile-blocked). We patch the
+    capture session so no browser is needed and assert the persisted schema."""
+
+    # The 15 columns of bronze.sofascore_schedule (mirrors bronze_schemas.json).
+    _EXPECTED_COLS = {
+        '_batch_id', '_entity_type', '_ingested_at', '_source',
+        'away_score', 'away_team', 'date', 'game', 'game_id',
+        'home_score', 'home_team', 'league', 'round', 'season', 'week',
+    }
+
+    def _scraper(self):
+        from scrapers.sofascore.scraper import SofaScoreScraper
+        with patch('scrapers.base.base_scraper.get_rate_limiter'), \
+             patch('scrapers.base.base_scraper.get_retry_policy'), \
+             patch('scrapers.base.base_scraper.get_circuit_breaker'), \
+             patch('scrapers.base.base_scraper.IcebergWriter'):
+            s = SofaScoreScraper(leagues=['ENG-Premier League'], seasons=[2025])
+        s._proxy_manager = None
+        return s
+
+    @staticmethod
+    def _buffer():
+        # ut=17 (EPL) 25/26 events: one finished (round 7, scores), one
+        # not-started (round 8). A 26/27 event (next season) must be filtered out
+        # by the season-year guard, and a featured ut=16 event by the ut_id.
+        s2526 = {"year": "25/26", "id": 76668}
+        return {
+            "/api/v1/unique-tournament/17/season/76668/events/last/0": {
+                "status": 200, "challenge": False, "json": {"events": [
+                    {"id": 101, "status": {"type": "finished"}, "season": s2526,
+                     "homeTeam": {"name": "Arsenal"}, "awayTeam": {"name": "Chelsea"},
+                     "homeScore": {"current": 2}, "awayScore": {"current": 1},
+                     "startTimestamp": 1719000000, "roundInfo": {"round": 7}},
+                ]}},
+            "/api/v1/unique-tournament/17/season/76668/events/next/0": {
+                "status": 200, "challenge": False, "json": {"events": [
+                    {"id": 102, "status": {"type": "notstarted"}, "season": s2526,
+                     "homeTeam": {"name": "Liverpool"}, "awayTeam": {"name": "Everton"},
+                     "startTimestamp": 1719600000, "roundInfo": {"round": 8}},
+                ]}},
+            # NEXT season (26/27) on the same ut — must be dropped by the guard.
+            "/api/v1/unique-tournament/17/season/96668/events/next/0": {
+                "status": 200, "challenge": False, "json": {"events": [
+                    {"id": 201, "status": {"type": "notstarted"},
+                     "season": {"year": "26/27", "id": 96668},
+                     "homeTeam": {"name": "Leeds"}, "awayTeam": {"name": "Sunderland"},
+                     "startTimestamp": 1755000000, "roundInfo": {"round": 1}},
+                ]}},
+            # Featured OTHER tournament — must be filtered out by ut_id.
+            "/api/v1/unique-tournament/16/season/58210/events/last/0": {
+                "status": 200, "challenge": False, "json": {"events": [
+                    {"id": 901, "status": {"type": "finished"},
+                     "season": {"year": "25/26", "id": 58210},
+                     "homeTeam": {"name": "X"}, "awayTeam": {"name": "Y"},
+                     "homeScore": {"current": 0}, "awayScore": {"current": 0},
+                     "startTimestamp": 1719000000, "roundInfo": {"round": 1}},
+                ]}},
+        }
+
+    class _FakeCap:
+        def __init__(self, buffer):
+            self._buffer = buffer
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def capture_tournament(self, nav_url):
+            return self._buffer
+
+    @pytest.mark.unit
+    def test_builds_schedule_rows_with_full_schema(self):
+        import pandas as pd
+
+        scraper = self._scraper()
+        fake = self._FakeCap(self._buffer())
+        with patch('scrapers.sofascore.camoufox_capture.SofascoreCamoufoxCapture',
+                   return_value=fake):
+            df = scraper.read_schedule()
+
+        # Exactly the two ut=17 events (901 from ut=16 is filtered out).
+        assert df is not None
+        assert sorted(df['game_id'].tolist()) == [101, 102]
+        # Persisted schema matches the bronze table (no add/drop columns).
+        assert set(df.columns) == self._EXPECTED_COLS
+        # Partition labels: league passthrough + season short form '2526'.
+        assert set(df['league']) == {'ENG-Premier League'}
+        assert set(df['season']) == {'2526'}
+        # Dtypes the table expects: date timestamp, round/week nullable bigint.
+        assert pd.api.types.is_datetime64_any_dtype(df['date'])
+        assert str(df['round'].dtype) == 'Int64'
+        assert str(df['week'].dtype) == 'Int64'
+        # week/game are NULL placeholders; scores are nullable doubles.
+        assert df['week'].isna().all()
+        assert df['game'].isna().all()
+        finished = df[df['game_id'] == 101].iloc[0]
+        assert finished['home_score'] == 2 and finished['away_score'] == 1
+        notstarted = df[df['game_id'] == 102].iloc[0]
+        assert pd.isna(notstarted['home_score'])
+
+    @pytest.mark.unit
+    def test_drops_next_season_events_when_page_rolled_over(self):
+        # Off-season: the page serves ONLY 26/27 fixtures while our target is
+        # 25/26 → the season guard drops them all → None (no partition pollution).
+        scraper = self._scraper()
+        buf = {
+            "/api/v1/unique-tournament/17/season/96668/events/next/0": {
+                "status": 200, "challenge": False, "json": {"events": [
+                    {"id": 201, "status": {"type": "notstarted"},
+                     "season": {"year": "26/27", "id": 96668},
+                     "homeTeam": {"name": "Leeds"}, "awayTeam": {"name": "Sunderland"},
+                     "startTimestamp": 1755000000, "roundInfo": {"round": 1}},
+                ]}},
+        }
+        with patch('scrapers.sofascore.camoufox_capture.SofascoreCamoufoxCapture',
+                   return_value=self._FakeCap(buf)):
+            assert scraper.read_schedule() is None
+
+    @pytest.mark.unit
+    def test_returns_none_when_capture_empty(self):
+        scraper = self._scraper()
+        fake = self._FakeCap({})  # no events captured
+        with patch('scrapers.sofascore.camoufox_capture.SofascoreCamoufoxCapture',
+                   return_value=fake):
+            assert scraper.read_schedule() is None
+
+    @pytest.mark.unit
+    def test_returns_none_when_capture_raises(self):
+        scraper = self._scraper()
+        with patch('scrapers.sofascore.camoufox_capture.SofascoreCamoufoxCapture',
+                   side_effect=RuntimeError('browser boom')):
+            assert scraper.read_schedule() is None
+
+
 class TestReadPlayerCapture:
     """read_player_capture (#751 PR3 + PR3b): ONE Camoufox nav per player → the
     player_profile frame (bio from __NEXT_DATA__) AND the player_season_stats

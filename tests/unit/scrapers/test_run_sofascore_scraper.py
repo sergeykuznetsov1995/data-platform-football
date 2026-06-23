@@ -39,12 +39,16 @@ class TestArgparseHardFail:
         assert _main_rc(['--season', 'notanumber']) == 1
 
 
-def _run_main(argv: list, scraper_cls, *, resolver_ids=None) -> int:
+def _run_main(argv: list, scraper_cls, *, resolver_ids=None,
+              existing_schedule=None) -> int:
     """Run ``main()`` with stubbed ``scrapers.sofascore[.scraper]`` modules.
 
     ``scrapers.base.base_scraper`` (for ``ReplaceGuardError``) imports for real.
     ``resolver_ids`` patches ``_resolve_match_ids_from_bronze`` so the
     player_ratings path skips its Trino lookup and reaches save_to_iceberg.
+    ``_read_existing_schedule`` is always patched (it would otherwise hit Trino)
+    to ``existing_schedule`` (default: an empty frame → captured rows save
+    as-is) so the #761 schedule merge runs offline + deterministically.
     """
     so_pkg = MagicMock()
     so_pkg.SofaScoreScraper = scraper_cls
@@ -61,6 +65,8 @@ def _run_main(argv: list, scraper_cls, *, resolver_ids=None) -> int:
         importlib.reload(mod)
         if resolver_ids is not None:
             mod._resolve_match_ids_from_bronze = lambda *a, **k: resolver_ids
+        _existing = pd.DataFrame() if existing_schedule is None else existing_schedule
+        mod._read_existing_schedule = lambda *a, **k: _existing
         return mod.main()
 
 
@@ -72,7 +78,7 @@ def _legacy_scraper(*, guard_blocks: bool = False):
     df = pd.DataFrame({
         'league': ['ENG-Premier League'] * 10,
         'season': [2024] * 10,
-        'x': list(range(10)),
+        'game_id': list(range(10)),
     })
     scraper = MagicMock()
     scraper.read_schedule.return_value = df
@@ -510,3 +516,92 @@ class TestPlayerCaptureRunner:
         )
         assert rc == 2
         scraper.save_to_iceberg.assert_not_called()
+
+
+def _schedule_module():
+    """Import the runner module for direct helper access — its module-level
+    imports are stdlib only (scrapers are lazy), so no stubbing is needed."""
+    sys.modules.pop("dags.scripts.run_sofascore_scraper", None)
+    return importlib.import_module("dags.scripts.run_sofascore_scraper")
+
+
+class TestScheduleMergePartition:
+    """#761 _merge_schedule_partition: union an existing schedule partition with
+    a captured window, keyed by game_id (captured wins). Never shrinks, so the
+    completeness guard passes even on a partial capture."""
+
+    @pytest.mark.unit
+    def test_empty_existing_returns_captured(self):
+        merge = _schedule_module()._merge_schedule_partition
+        captured = pd.DataFrame({'game_id': [1, 2], 'home_score': [1.0, 2.0]})
+        out = merge(pd.DataFrame(), captured)
+        assert sorted(out['game_id']) == [1, 2]
+
+    @pytest.mark.unit
+    def test_none_existing_returns_captured(self):
+        merge = _schedule_module()._merge_schedule_partition
+        captured = pd.DataFrame({'game_id': [1], 'home_score': [3.0]})
+        out = merge(None, captured)
+        assert out['game_id'].tolist() == [1]
+
+    @pytest.mark.unit
+    def test_union_keeps_captured_for_overlap_and_never_shrinks(self):
+        merge = _schedule_module()._merge_schedule_partition
+        existing = pd.DataFrame({
+            'game_id': [1, 2, 4, 5, 6],
+            'home_score': [0.0, 0.0, 3.0, 1.0, 2.0],
+        })
+        captured = pd.DataFrame({
+            'game_id': [1, 2, 3],          # 1,2 overlap (fresh scores); 3 new
+            'home_score': [1.0, 2.0, 9.0],
+        })
+        out = merge(existing, captured)
+        assert sorted(out['game_id']) == [1, 2, 3, 4, 5, 6]
+        assert len(out) >= len(existing)               # never shrinks
+        assert out.set_index('game_id').loc[1, 'home_score'] == 1.0  # captured wins
+        assert out.set_index('game_id').loc[2, 'home_score'] == 2.0
+        assert out.set_index('game_id').loc[4, 'home_score'] == 3.0  # existing kept
+
+
+class TestScheduleCaptureMergeRunner:
+    """#761 _run_legacy merges the captured schedule window with the existing
+    bronze partition before the replace_partitions save."""
+
+    @pytest.fixture
+    def temp_output(self):
+        fd, path = tempfile.mkstemp(suffix=".json", prefix="sofascore_")
+        os.close(fd)
+        yield path
+        if os.path.exists(path):
+            os.unlink(path)
+
+    @pytest.mark.unit
+    def test_merge_unions_with_existing_partition(self, temp_output):
+        captured = pd.DataFrame({
+            'league': ['ENG-Premier League'] * 3, 'season': ['2526'] * 3,
+            'game_id': [1, 2, 3], 'home_score': [1.0, 2.0, None],
+        })
+        existing = pd.DataFrame({
+            'league': ['ENG-Premier League'] * 5, 'season': ['2526'] * 5,
+            'game_id': [1, 2, 4, 5, 6], 'home_score': [0.0, 0.0, 3.0, 1.0, 2.0],
+        })
+        scraper = _legacy_scraper()
+        scraper.read_schedule.return_value = captured
+        scraper.read_league_table.return_value = pd.DataFrame()  # skip 2nd save
+
+        rc = _run_main(
+            ["--leagues", "ENG-Premier League", "--season", "2526",
+             "--output", temp_output],
+            MagicMock(return_value=scraper),
+            existing_schedule=existing,
+        )
+
+        assert rc == 0
+        schedule_call = next(
+            c for c in scraper.save_to_iceberg.call_args_list
+            if c.kwargs['table_name'] == 'sofascore_schedule'
+        )
+        saved = schedule_call.kwargs['df']
+        assert sorted(saved['game_id']) == [1, 2, 3, 4, 5, 6]   # union
+        assert len(saved) >= len(existing)                       # never shrinks
+        assert saved.set_index('game_id').loc[1, 'home_score'] == 1.0  # captured wins
