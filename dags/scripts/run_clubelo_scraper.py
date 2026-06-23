@@ -49,7 +49,15 @@ def main():
         choices=['daily', 'full'],
         default='daily',
         help="daily = current ratings only (fast, 1 HTTP call); "
-             "full = + historical ratings (heavy, weekly cadence)"
+             "full = + historical ratings (heavy, manual/backfill cadence)"
+    )
+    parser.add_argument(
+        '--days-back',
+        type=int,
+        default=365,
+        help="History depth in days for --mode full (weekly-sampled). "
+             "365 = rolling year; ~3650 = 10 APL seasons (issue #716). "
+             "Ignored in --mode daily."
     )
     parser.add_argument(
         '--force-replace',
@@ -61,7 +69,10 @@ def main():
     args = parser.parse_args()
 
     leagues = [l.strip() for l in args.leagues.split(',')]
-    logger.info(f"Starting ClubElo scraper (mode={args.mode}) with leagues: {leagues}")
+    depth = f", days_back={args.days_back}" if args.mode == 'full' else ""
+    logger.info(
+        f"Starting ClubElo scraper (mode={args.mode}{depth}) with leagues: {leagues}"
+    )
 
     results = {
         'tables': [],
@@ -128,6 +139,7 @@ def main():
                 # --- Stage 2: historical ratings (non-critical) ---
                 try:
                     hist = scraper.scrape_historical_ratings(
+                        days_back=args.days_back,
                         force_replace=args.force_replace
                     )
                     if hist.get('historical_ratings'):

@@ -238,10 +238,11 @@ def test_fotmob_contract_lists_all_nine_tables(table):
 # Regression guard: both ClubElo bronze tables must stay in the contract so the
 # --source clubelo audit keeps verifying full coverage. Both materialise + are
 # non-empty live (verified 2026-06-04, #283): ratings 2068 and
-# ratings_historical (~52 weekly snapshots) produced by the weekly
-# dag_ingest_clubelo_full with replace_partitions=['rating_date'] + weekly
-# cadence, neutralizing the daily-APPEND HDFS-overflow footgun (2026-05-04
-# incident). clubelo_team_history was dropped in #604 (write-only, never read).
+# ratings_historical (weekly-sampled snapshots) produced by dag_ingest_clubelo
+# in mode=full (UI-triggered backfill, #716) with
+# replace_partitions=['rating_date'], neutralizing the daily-APPEND
+# HDFS-overflow footgun (2026-05-04 incident). clubelo_team_history was dropped
+# in #604 (write-only, never read).
 @pytest.mark.parametrize('table', [
     'clubelo_ratings',
     'clubelo_ratings_historical',

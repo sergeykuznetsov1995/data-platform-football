@@ -143,3 +143,50 @@ class TestClubEloReplaceGuard:
         assert rc == 0
         kwargs = scraper.save_to_iceberg.call_args.kwargs
         assert kwargs["min_replace_ratio"] is None
+
+
+class TestClubEloFullMode:
+    """#716: mode=full forwards --days-back into scrape_historical_ratings so a
+    UI-triggered backfill can reach the 10-season depth (~3650 days)."""
+
+    @pytest.fixture
+    def temp_output(self):
+        fd, path = tempfile.mkstemp(suffix=".json", prefix="clubelo_")
+        os.close(fd)
+        yield path
+        if os.path.exists(path):
+            os.unlink(path)
+
+    @pytest.mark.unit
+    def test_full_mode_forwards_days_back(self, temp_output):
+        """--mode full --days-back 3650 must reach scrape_historical_ratings
+        with days_back=3650 (10-season backfill depth)."""
+        scraper = _build_guard_scraper()
+        scraper.scrape_historical_ratings.return_value = {
+            "historical_ratings": "iceberg.bronze.clubelo_ratings_historical",
+            "rows": 12345,
+        }
+
+        rc = _run_main(
+            ["--leagues", "ENG-Premier League", "--mode", "full",
+             "--days-back", "3650", "--output", temp_output],
+            MagicMock(return_value=scraper),
+        )
+
+        assert rc == 0
+        kwargs = scraper.scrape_historical_ratings.call_args.kwargs
+        assert kwargs["days_back"] == 3650
+        assert kwargs["force_replace"] is False
+
+    @pytest.mark.unit
+    def test_daily_mode_skips_history(self, temp_output):
+        """Default (daily) mode must not call the heavy historical stage."""
+        scraper = _build_guard_scraper()
+
+        rc = _run_main(
+            ["--leagues", "ENG-Premier League", "--output", temp_output],
+            MagicMock(return_value=scraper),
+        )
+
+        assert rc == 0
+        scraper.scrape_historical_ratings.assert_not_called()

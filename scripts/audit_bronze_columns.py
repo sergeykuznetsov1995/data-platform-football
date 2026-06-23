@@ -409,9 +409,10 @@ EXPECTED_TABLES: dict[str, dict[str, set[str]]] = {
         # `rank`/`league` are upstream-sparse but present (not all-NULL), so they
         # are intentionally NOT in the required set — extra live cols are not
         # errors. clubelo_ratings is the daily snapshot (partition rating_date);
-        # the heavy ratings_historical table is produced weekly by
-        # dag_ingest_clubelo_full with replace_partitions=['rating_date'] —
-        # never daily APPEND (2026-05-04 HDFS overflow).
+        # the heavy ratings_historical table is produced by dag_ingest_clubelo
+        # in mode=full (UI-triggered backfill, #716) with
+        # replace_partitions=['rating_date'] — never daily APPEND (2026-05-04
+        # HDFS overflow).
         'clubelo_ratings': {
             'team', 'country', 'level', 'elo', 'from', 'to', 'rating_date',
             *META_COLS,

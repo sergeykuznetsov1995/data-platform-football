@@ -1,11 +1,12 @@
 """
-Shared task callables for the ClubElo ingestion DAGs.
+Shared task callables for the ClubElo ingestion DAG.
 
-``validate_data`` is used by both ``dag_ingest_clubelo`` (daily) and
-``dag_ingest_clubelo_full`` (weekly). It lives here instead of a DAG file so
-neither DAG module imports the other — a cross-DAG import makes Airflow
-auto-register the imported DAG against the importing file and DagBag drops
-one of them as a duplicate (#488).
+``validate_data`` is used by ``dag_ingest_clubelo`` (daily current ratings +
+UI-triggered ``mode=full`` historical backfill — #716). It lives here rather
+than inline in the DAG file as a leftover of the former two-DAG split
+(``dag_ingest_clubelo_full`` was folded into the daily DAG in #716); keeping it
+in utils also avoids any cross-DAG import footgun should a second DAG ever
+reuse it (#488).
 """
 
 from typing import Any, Dict
