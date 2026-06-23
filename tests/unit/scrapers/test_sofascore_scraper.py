@@ -1291,6 +1291,139 @@ class TestReadScheduleViaCapture:
             assert scraper.read_schedule() is None
 
 
+class TestReadLeagueTableViaCapture:
+    """read_league_table (#777) builds bronze.sofascore_league_table rows from a
+    captured tournament page (the soccerdata reader is Turnstile-blocked). We
+    patch the capture session so no browser is needed and assert the persisted
+    schema + the season_id guard (only the target season's standings are kept)."""
+
+    # The 15 columns of bronze.sofascore_league_table (mirrors bronze_schemas.json).
+    _EXPECTED_COLS = {
+        '_batch_id', '_entity_type', '_ingested_at', '_source',
+        'team', 'mp', 'w', 'd', 'l', 'gf', 'ga', 'gd', 'pts', 'league', 'season',
+    }
+
+    def _scraper(self):
+        from scrapers.sofascore.scraper import SofaScoreScraper
+        with patch('scrapers.base.base_scraper.get_rate_limiter'), \
+             patch('scrapers.base.base_scraper.get_retry_policy'), \
+             patch('scrapers.base.base_scraper.get_circuit_breaker'), \
+             patch('scrapers.base.base_scraper.IcebergWriter'):
+            s = SofaScoreScraper(leagues=['ENG-Premier League'], seasons=[2025])
+        s._proxy_manager = None
+        return s
+
+    @staticmethod
+    def _row(name, mp, w, d, l, gf, ga, pts):
+        return {"team": {"id": hash(name) % 1000, "name": name}, "matches": mp,
+                "wins": w, "draws": d, "losses": l, "scoresFor": gf,
+                "scoresAgainst": ga, "points": pts}
+
+    @classmethod
+    def _buffer(cls):
+        # ut=17 (EPL): /seasons maps 25/26 -> 76986 (target) and 26/27 -> 99999.
+        # standings/total fires for the target sid (3 teams); a NEXT-season
+        # standings (sid 99999) and a featured OTHER tournament (ut=16) must be
+        # ignored by the (ut_id, season_id) guard.
+        return {
+            "/api/v1/unique-tournament/17/seasons": {
+                "status": 200, "challenge": False, "json": {"seasons": [
+                    {"year": "26/27", "id": 99999},
+                    {"year": "25/26", "id": 76986},
+                ]}},
+            "/api/v1/unique-tournament/17/season/76986/standings/total": {
+                "status": 200, "challenge": False, "json": {"standings": [
+                    {"type": "total", "rows": [
+                        cls._row("Arsenal", 20, 15, 3, 2, 45, 18, 48),
+                        cls._row("Liverpool", 20, 14, 4, 2, 42, 20, 46),
+                        cls._row("Chelsea", 20, 12, 5, 3, 38, 22, 41),
+                    ]},
+                    {"type": "home", "rows": [cls._row("Arsenal", 10, 9, 1, 0, 28, 6, 28)]},
+                ]}},
+            # NEXT season standings on the same ut — must be dropped by sid guard.
+            "/api/v1/unique-tournament/17/season/99999/standings/total": {
+                "status": 200, "challenge": False, "json": {"standings": [
+                    {"type": "total", "rows": [
+                        cls._row("Leeds", 0, 0, 0, 0, 0, 0, 0)]}]}},
+            # Featured OTHER tournament — never matched (exact ut/sid path).
+            "/api/v1/unique-tournament/16/season/58210/standings/total": {
+                "status": 200, "challenge": False, "json": {"standings": [
+                    {"type": "total", "rows": [
+                        cls._row("Real Madrid", 20, 16, 2, 2, 50, 15, 50)]}]}},
+        }
+
+    class _FakeCap:
+        def __init__(self, buffer):
+            self._buffer = buffer
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def capture_buffer(self, nav_url):
+            return self._buffer
+
+    @pytest.mark.unit
+    def test_builds_league_table_rows_with_full_schema(self):
+        scraper = self._scraper()
+        fake = self._FakeCap(self._buffer())
+        with patch('scrapers.sofascore.camoufox_capture.SofascoreCamoufoxCapture',
+                   return_value=fake):
+            df = scraper.read_league_table()
+
+        # Exactly the 3 target-season ut=17 rows (next-season + ut=16 dropped).
+        assert df is not None
+        assert sorted(df['team'].tolist()) == ['Arsenal', 'Chelsea', 'Liverpool']
+        # Persisted schema matches the bronze table (no add/drop columns).
+        assert set(df.columns) == self._EXPECTED_COLS
+        # Partition labels: league passthrough + season short form '2526'.
+        assert set(df['league']) == {'ENG-Premier League'}
+        assert set(df['season']) == {'2526'}
+        # gd is derived (scoresFor - scoresAgainst); counts are nullable bigint.
+        arsenal = df[df['team'] == 'Arsenal'].iloc[0]
+        assert arsenal['gd'] == 27 and arsenal['pts'] == 48 and arsenal['mp'] == 20
+        for col in ('mp', 'w', 'd', 'l', 'gf', 'ga', 'gd', 'pts'):
+            assert str(df[col].dtype) == 'Int64'
+
+    @pytest.mark.unit
+    def test_drops_next_season_when_page_rolled_over(self):
+        # Off-season: /seasons still lists our 25/26 sid, but the standings XHR
+        # that fired is for the NEXT season (99999) — the sid guard finds no
+        # standings for our target sid → None (no partition pollution).
+        scraper = self._scraper()
+        buf = {
+            "/api/v1/unique-tournament/17/seasons": {
+                "status": 200, "challenge": False, "json": {"seasons": [
+                    {"year": "26/27", "id": 99999},
+                    {"year": "25/26", "id": 76986},
+                ]}},
+            "/api/v1/unique-tournament/17/season/99999/standings/total": {
+                "status": 200, "challenge": False, "json": {"standings": [
+                    {"type": "total", "rows": [
+                        self._row("Leeds", 0, 0, 0, 0, 0, 0, 0)]}]}},
+        }
+        with patch('scrapers.sofascore.camoufox_capture.SofascoreCamoufoxCapture',
+                   return_value=self._FakeCap(buf)):
+            assert scraper.read_league_table() is None
+
+    @pytest.mark.unit
+    def test_returns_none_when_capture_empty(self):
+        scraper = self._scraper()
+        fake = self._FakeCap({})  # no seasons map, no standings captured
+        with patch('scrapers.sofascore.camoufox_capture.SofascoreCamoufoxCapture',
+                   return_value=fake):
+            assert scraper.read_league_table() is None
+
+    @pytest.mark.unit
+    def test_returns_none_when_capture_raises(self):
+        scraper = self._scraper()
+        with patch('scrapers.sofascore.camoufox_capture.SofascoreCamoufoxCapture',
+                   side_effect=RuntimeError('browser boom')):
+            assert scraper.read_league_table() is None
+
+
 class TestReadPlayerCapture:
     """read_player_capture (#751 PR3 + PR3b): ONE Camoufox nav per player → the
     player_profile frame (bio from __NEXT_DATA__) AND the player_season_stats
