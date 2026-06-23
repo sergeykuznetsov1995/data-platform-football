@@ -233,6 +233,68 @@ def _resolve_match_ids_from_bronze(
         return []
 
 
+# All 15 columns of bronze.sofascore_schedule, explicit (old Trino has no
+# SELECT * EXCEPT, and an explicit list keeps a stable shape for the merge).
+_SCHEDULE_COLUMNS = [
+    '_batch_id', '_entity_type', '_ingested_at', '_source',
+    'away_score', 'away_team', 'date', 'game', 'game_id',
+    'home_score', 'home_team', 'league', 'round', 'season', 'week',
+]
+
+
+def _read_existing_schedule(league: str, season: str):
+    """Read the existing ``bronze.sofascore_schedule`` (league, season) partition
+    into a DataFrame so the captured window can be MERGED with it rather than
+    replacing it (#761). Camoufox capture only surfaces a window of events
+    (current round + recent finished + upcoming), so a straight
+    ``replace_partitions`` would trip the completeness guard once the partition
+    has accumulated more than the window. Returns an EMPTY DataFrame when the
+    table/partition is missing or Trino is unreachable — the caller then saves
+    the captured rows as-is (a fresh-season partition is empty anyway).
+    """
+    import pandas as pd
+
+    empty = pd.DataFrame(columns=_SCHEDULE_COLUMNS)
+    conn = _trino_connect()
+    if conn is None:
+        return empty
+    try:
+        cur = conn.cursor()
+        cols = ", ".join(_SCHEDULE_COLUMNS)
+        cur.execute(
+            f"SELECT {cols} FROM iceberg.bronze.sofascore_schedule "
+            "WHERE league = ? AND CAST(season AS varchar) = ?",
+            (league, season),
+        )
+        rows = cur.fetchall()
+        return pd.DataFrame(rows, columns=_SCHEDULE_COLUMNS)
+    except Exception as e:
+        logger.warning(
+            "Could not read existing schedule partition (league=%s season=%s): "
+            "%s — saving captured rows as-is.", league, season, e,
+        )
+        return empty
+
+
+def _merge_schedule_partition(existing, captured):
+    """Union an existing schedule partition with a freshly-captured window,
+    keyed by ``game_id`` with the captured row winning (fresh scores). The
+    result is never smaller than ``existing``, so the completeness guard passes
+    even when the capture only surfaced a window of the season (#761). An empty
+    ``existing`` (fresh season / first run) just returns the captured rows.
+    """
+    import pandas as pd
+
+    if existing is None or existing.empty:
+        return captured.reset_index(drop=True)
+    existing = existing.reindex(columns=captured.columns)
+    return (
+        pd.concat([existing, captured], ignore_index=True)
+        .drop_duplicates(subset='game_id', keep='last')
+        .reset_index(drop=True)
+    )
+
+
 def _run_player_ratings(
     leagues: List[str],
     season: int,
@@ -1042,10 +1104,36 @@ def _run_legacy(
         from scrapers.base.base_scraper import ReplaceGuardError
         from scrapers.sofascore import SofaScoreScraper
 
-        with SofaScoreScraper(leagues=leagues, seasons=[season]) as scraper:
+        # read_schedule now captures via Camoufox (#761), which needs the
+        # residential proxy or SofaScore Turnstile-403s every event.
+        proxy_file = os.environ.get('PROXY_FILE', '/opt/airflow/proxys.txt')
+        if not os.path.exists(proxy_file):
+            logger.warning(
+                "Proxy file %s not found — SofaScore schedule capture is likely "
+                "to 403 without a residential proxy.", proxy_file,
+            )
+            proxy_file = None
+
+        with SofaScoreScraper(
+            leagues=leagues, seasons=[season], proxy_file=proxy_file,
+        ) as scraper:
             try:
-                df = scraper.read_schedule()
-                if df is not None and not df.empty:
+                import pandas as pd
+
+                captured = scraper.read_schedule()
+                if captured is not None and not captured.empty:
+                    # Merge the captured window with the existing partition so a
+                    # partial capture never shrinks it (#761). Per (league,
+                    # season): union by game_id, captured row wins (fresh
+                    # scores). union >= existing → the completeness guard passes.
+                    parts = []
+                    for (lg, sea), grp in captured.groupby(
+                        ['league', 'season'], sort=False,
+                    ):
+                        existing = _read_existing_schedule(lg, str(sea))
+                        parts.append(_merge_schedule_partition(existing, grp))
+                    df = pd.concat(parts, ignore_index=True)
+
                     table_path = scraper.save_to_iceberg(
                         df=df,
                         table_name='sofascore_schedule',
@@ -1057,7 +1145,10 @@ def _run_legacy(
                     )
                     results['tables'].append(table_path)
                     results['schedule_rows'] = len(df)
-                    logger.info(f"Saved {len(df)} schedule rows")
+                    logger.info(
+                        "Saved %d schedule rows (captured %d, merged with "
+                        "existing partition)", len(df), len(captured),
+                    )
             except ReplaceGuardError as e:
                 msg = f"{REPLACE_GUARD_MARKER}: schedule: {e}"
                 logger.error(msg)

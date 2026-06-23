@@ -188,16 +188,34 @@ def test_finished_event_ids_only_finished():
 
 
 def test_normalize_event_flattens_row():
+    # Full schedule-row shape (#761): game_id/date/round + NULL week/game.
     ev = {
         "id": 15186878, "status": {"type": "finished"},
         "homeTeam": {"name": "USA"}, "awayTeam": {"name": "Australia"},
         "homeScore": {"current": 0}, "awayScore": {"current": 2},
         "startTimestamp": 1719000000,
+        "roundInfo": {"round": 7},
     }
     assert normalize_event(ev) == {
-        "event_id": "15186878", "status": "finished", "start_timestamp": 1719000000,
-        "home_team": "USA", "away_team": "Australia", "home_score": 0, "away_score": 2,
+        "game_id": 15186878, "date": 1719000000,
+        "home_team": "USA", "away_team": "Australia",
+        "home_score": 0, "away_score": 2,
+        "round": 7, "week": None, "game": None,
     }
+
+
+def test_normalize_event_missing_round_and_scores():
+    # A not-started fixture: no roundInfo, scores absent → None placeholders.
+    ev = {
+        "id": 999, "status": {"type": "notstarted"},
+        "homeTeam": {"name": "Foo"}, "awayTeam": {"name": "Bar"},
+        "startTimestamp": 1720000000,
+    }
+    row = normalize_event(ev)
+    assert row["game_id"] == 999
+    assert row["round"] is None
+    assert row["home_score"] is None and row["away_score"] is None
+    assert row["week"] is None and row["game"] is None
 
 
 # --------------------------------------------------------------------------- #

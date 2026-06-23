@@ -154,16 +154,24 @@ def extract_events(buffer: Dict[str, dict]) -> list:
 
 
 def normalize_event(ev: dict) -> dict:
-    """Flatten a SofaScore event object to the schedule row shape we persist."""
-    status = (ev.get("status") or {}).get("type")
+    """Flatten a SofaScore event object to a ``bronze.sofascore_schedule`` row.
+
+    Emits the per-event business columns only; the caller adds ``league`` /
+    ``season`` and converts ``date`` (epoch seconds) → ``timestamp`` and
+    ``round`` → nullable bigint (see :meth:`SofaScoreScraper.read_schedule`).
+    ``week`` / ``game`` are soccerdata-only concepts absent from the API, so
+    they are NULL placeholders to keep the row aligned with the table schema.
+    """
     return {
-        "event_id": str(ev.get("id")),
-        "status": status,
-        "start_timestamp": ev.get("startTimestamp"),
+        "game_id": int(ev["id"]),
+        "date": ev.get("startTimestamp"),
         "home_team": (ev.get("homeTeam") or {}).get("name"),
         "away_team": (ev.get("awayTeam") or {}).get("name"),
         "home_score": (ev.get("homeScore") or {}).get("current"),
         "away_score": (ev.get("awayScore") or {}).get("current"),
+        "round": (ev.get("roundInfo") or {}).get("round"),
+        "week": None,
+        "game": None,
     }
 
 
