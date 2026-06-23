@@ -23,13 +23,6 @@ Supported entities:
                        must be fresh before this entity runs.
 - ``match_stats``     : team-level per-(match, period, stat) long-form
                        rows from ``/api/v1/event/{id}/statistics`` (#25).
-- ``player_season_stats``: season-aggregate Opta stats per player via
-                       ``/player/{pid}/unique-tournament/{ut}/season/{s}/
-                       statistics/overall`` (#24). Resolves
-                       ``(ut_id, season_id)`` once per run.
-- ``player_profile``  : biographical snapshot per player (height, foot,
-                       dob, nationality, current team) via
-                       ``/api/v1/player/{id}`` (#23).
 
 Exit codes:
     0 — scrape completed successfully (>= 1 row written)
@@ -85,8 +78,6 @@ ENTITY_PLAYER_RATINGS = 'player_ratings'
 ENTITY_SHOTMAP = 'shotmap'
 ENTITY_EVENT_PLAYER_STATS = 'event_player_stats'
 ENTITY_MATCH_STATS = 'match_stats'
-ENTITY_PLAYER_SEASON_STATS = 'player_season_stats'
-ENTITY_PLAYER_PROFILE = 'player_profile'
 # #751 PR1 — consolidated per-match capture: ONE Camoufox nav/match feeds BOTH
 # player_ratings and event_player_stats from the same /lineups (+/event) payload.
 ENTITY_MATCH_CAPTURE = 'match_capture'
@@ -102,8 +93,6 @@ VALID_ENTITIES = {
     ENTITY_SHOTMAP,
     ENTITY_EVENT_PLAYER_STATS,
     ENTITY_MATCH_STATS,
-    ENTITY_PLAYER_SEASON_STATS,
-    ENTITY_PLAYER_PROFILE,
     ENTITY_MATCH_CAPTURE,
     ENTITY_PLAYER_CAPTURE,
 }
@@ -1019,230 +1008,6 @@ def _run_match_stats(
     )
 
 
-def _run_player_season_stats(
-    leagues: List[str],
-    season: int,
-    limit: Optional[int],
-    output_path: str,
-    force_replace: bool = False,
-) -> int:
-    """#24 — season-aggregate Opta stats per (player, season).
-
-    Player ids are pulled from ``bronze.sofascore_player_ratings``
-    (single Trino query, not per-player); we additionally resolve
-    SofaScore's ``(unique_tournament_id, season_id)`` pair via one HTTP
-    lookup against ``/unique-tournament/{ut_id}/seasons`` cached on the
-    scraper instance.
-    """
-    from scrapers.base.base_scraper import ReplaceGuardError
-    from scrapers.sofascore import SofaScoreScraper
-    from scrapers.sofascore.scraper import R0_2B_FALLBACK_MARKER
-
-    league = leagues[0]
-    season_str = str(season)
-    if len(season_str) == 4 and season_str.isdigit():
-        season_short = f"{season_str[2:4]}{int(season_str[2:4]) + 1:02d}"
-    else:
-        season_short = season_str
-
-    results = {
-        'entity': ENTITY_PLAYER_SEASON_STATS,
-        'tables': [],
-        'rows': 0,
-        'players_with_rows': 0,
-        'fallback': False,
-        'fallback_reason': None,
-        'errors': [],
-    }
-
-    proxy_file = os.environ.get('PROXY_FILE', '/opt/airflow/proxys.txt')
-    if not os.path.exists(proxy_file):
-        proxy_file = None
-
-    try:
-        with SofaScoreScraper(
-            leagues=[league],
-            seasons=[season],
-            proxy_file=proxy_file,
-        ) as scraper:
-            df = scraper.read_player_season_stats(
-                league=league,
-                season=int(season),
-                limit=limit,
-            )
-
-            if df is None or df.empty:
-                last_err = getattr(scraper, '_last_endpoint_error', None)
-                reason = 'empty_payload'
-                if last_err:
-                    status = last_err.get('status')
-                    if status == 403:
-                        reason = 'http_403'
-                    elif status == 429:
-                        reason = 'http_429'
-                    elif status is None:
-                        reason = 'transport_error'
-                    else:
-                        reason = f'http_{status}'
-
-                logger.error(
-                    "%s: player_season_stats unavailable — reason=%s",
-                    R0_2B_FALLBACK_MARKER, reason,
-                )
-                results['fallback'] = True
-                results['fallback_reason'] = reason
-                results['errors'].append(
-                    f'{R0_2B_FALLBACK_MARKER}: {reason}'
-                )
-                _write_results(output_path, results)
-                return 2
-
-            table_path = scraper.save_to_iceberg(
-                df=df,
-                table_name='sofascore_player_season_stats',
-                partition_cols=['league', 'season'],
-                replace_partitions=['league', 'season'],
-                min_replace_ratio=(
-                    None if force_replace else _MIN_REPLACE_RATIO
-                ),
-            )
-            results['tables'].append(table_path)
-            results['rows'] = int(len(df))
-            results['players_with_rows'] = int(df['player_id'].nunique())
-            logger.info(
-                "Saved %d player_season_stats rows for %d players -> %s",
-                results['rows'], results['players_with_rows'], table_path,
-            )
-
-    except ReplaceGuardError as e:
-        msg = f"{REPLACE_GUARD_MARKER}: {e}"
-        logger.error(msg)
-        results['errors'].append(msg)
-        _write_results(output_path, results)
-        return 3
-    except Exception as e:
-        logger.error(
-            "player_season_stats scrape failed hard: %s", e, exc_info=True,
-        )
-        results['errors'].append(str(e))
-        _write_results(output_path, results)
-        return 1
-
-    _write_results(output_path, results)
-    return 0
-
-
-def _run_player_profile(
-    leagues: List[str],
-    season: int,
-    limit: Optional[int],
-    output_path: str,
-    force_replace: bool = False,
-) -> int:
-    """#23 — biographical snapshot per player (height, foot, dob,
-    nationality, current team). One HTTP call per player.
-
-    Player ids are pulled from ``bronze.sofascore_player_ratings``;
-    snapshot grain (1 row per player) partitioned by (league, season).
-    """
-    from scrapers.base.base_scraper import ReplaceGuardError
-    from scrapers.sofascore import SofaScoreScraper
-    from scrapers.sofascore.scraper import R0_2B_FALLBACK_MARKER
-
-    league = leagues[0]
-    season_str = str(season)
-    if len(season_str) == 4 and season_str.isdigit():
-        season_short = f"{season_str[2:4]}{int(season_str[2:4]) + 1:02d}"
-    else:
-        season_short = season_str
-
-    results = {
-        'entity': ENTITY_PLAYER_PROFILE,
-        'tables': [],
-        'rows': 0,
-        'players_with_rows': 0,
-        'fallback': False,
-        'fallback_reason': None,
-        'errors': [],
-    }
-
-    proxy_file = os.environ.get('PROXY_FILE', '/opt/airflow/proxys.txt')
-    if not os.path.exists(proxy_file):
-        proxy_file = None
-
-    try:
-        with SofaScoreScraper(
-            leagues=[league],
-            seasons=[season],
-            proxy_file=proxy_file,
-        ) as scraper:
-            df = scraper.read_player_profile(
-                league=league,
-                season=int(season),
-                limit=limit,
-            )
-
-            if df is None or df.empty:
-                last_err = getattr(scraper, '_last_endpoint_error', None)
-                reason = 'empty_payload'
-                if last_err:
-                    status = last_err.get('status')
-                    if status == 403:
-                        reason = 'http_403'
-                    elif status == 429:
-                        reason = 'http_429'
-                    elif status is None:
-                        reason = 'transport_error'
-                    else:
-                        reason = f'http_{status}'
-
-                logger.error(
-                    "%s: player_profile unavailable — reason=%s",
-                    R0_2B_FALLBACK_MARKER, reason,
-                )
-                results['fallback'] = True
-                results['fallback_reason'] = reason
-                results['errors'].append(
-                    f'{R0_2B_FALLBACK_MARKER}: {reason}'
-                )
-                _write_results(output_path, results)
-                return 2
-
-            table_path = scraper.save_to_iceberg(
-                df=df,
-                table_name='sofascore_player_profile',
-                partition_cols=['league', 'season'],
-                replace_partitions=['league', 'season'],
-                min_replace_ratio=(
-                    None if force_replace else _MIN_REPLACE_RATIO
-                ),
-            )
-            results['tables'].append(table_path)
-            results['rows'] = int(len(df))
-            results['players_with_rows'] = int(df['player_id'].nunique())
-            logger.info(
-                "Saved %d player_profile rows for %d players -> %s",
-                results['rows'], results['players_with_rows'], table_path,
-            )
-
-    except ReplaceGuardError as e:
-        msg = f"{REPLACE_GUARD_MARKER}: {e}"
-        logger.error(msg)
-        results['errors'].append(msg)
-        _write_results(output_path, results)
-        return 3
-    except Exception as e:
-        logger.error(
-            "player_profile scrape failed hard: %s", e, exc_info=True,
-        )
-        results['errors'].append(str(e))
-        _write_results(output_path, results)
-        return 1
-
-    _write_results(output_path, results)
-    return 0
-
-
 def _write_results(path: str, payload: dict) -> None:
     """Persist runner results to disk for Airflow XCom pickup."""
     try:
@@ -1462,24 +1227,6 @@ def main():
             season=args.season,
             limit=args.limit,
             output_path=args.output,
-        )
-
-    if entity == ENTITY_PLAYER_SEASON_STATS:
-        return _run_player_season_stats(
-            leagues=leagues,
-            season=args.season,
-            limit=args.limit,
-            output_path=args.output,
-            force_replace=args.force_replace,
-        )
-
-    if entity == ENTITY_PLAYER_PROFILE:
-        return _run_player_profile(
-            leagues=leagues,
-            season=args.season,
-            limit=args.limit,
-            output_path=args.output,
-            force_replace=args.force_replace,
         )
 
     # Default: legacy schedule+league_table flow.

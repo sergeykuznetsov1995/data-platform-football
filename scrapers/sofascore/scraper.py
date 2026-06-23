@@ -77,12 +77,6 @@ _LINEUPS_PATH = "/event/{event_id}/lineups"
 _SHOTMAP_PATH = "/event/{event_id}/shotmap"
 _EVENT_PLAYER_STATS_PATH = "/event/{event_id}/player/{player_id}/statistics"
 _MATCH_STATS_PATH = "/event/{event_id}/statistics"
-_PLAYER_PROFILE_PATH = "/player/{player_id}"
-_PLAYER_SEASON_STATS_PATH = (
-    "/player/{player_id}/unique-tournament/{ut_id}/season/{season_id}/"
-    "statistics/overall"
-)
-_TOURNAMENT_SEASONS_PATH = "/unique-tournament/{ut_id}/seasons"
 
 
 # SofaScore "unique-tournament" id per soccerdata league key. Discovered
@@ -1778,79 +1772,10 @@ class SofaScoreScraper(SoccerdataScraper):
         )
         return df
 
-    # ------------------------------------------------------------------
-    # #24 player_season_stats — season-aggregate Opta metrics per player
-    # ------------------------------------------------------------------
-
+    # SofaScore unique-tournament id per league — used by capture-path
+    # targeting (season picker + finished-match discovery).
     def _resolve_unique_tournament_id(self, league: str) -> Optional[int]:
         return SOFASCORE_TOURNAMENT_MAP.get(league)
-
-    def _resolve_season_id(
-        self,
-        league: str,
-        season: int,
-    ) -> Optional[Tuple[int, int]]:
-        """Map ``(league, season)`` to SofaScore's
-        ``(unique_tournament_id, season_id)``.
-
-        Cached on the scraper instance — one HTTP lookup per (league,
-        season) pair. Returns ``None`` when SofaScore doesn't expose a
-        season matching the soccerdata short slug (e.g. preseason gap).
-        """
-        if not hasattr(self, '_season_id_cache'):
-            self._season_id_cache: Dict[Tuple[str, str], Tuple[int, int]] = {}
-
-        season_str = str(season)
-        if len(season_str) == 4 and season_str.isdigit():
-            season_short = f"{season_str[2:4]}{int(season_str[2:4]) + 1:02d}"
-        else:
-            season_short = season_str
-
-        cache_key = (league, season_short)
-        if cache_key in self._season_id_cache:
-            return self._season_id_cache[cache_key]
-
-        ut_id = self._resolve_unique_tournament_id(league)
-        if ut_id is None:
-            logger.warning(
-                "No SOFASCORE_TOURNAMENT_MAP entry for league=%s — "
-                "season_id resolution skipped.", league,
-            )
-            return None
-
-        url = f"{_SOFASCORE_API}{_TOURNAMENT_SEASONS_PATH.format(ut_id=ut_id)}"
-        payload = self._fetch_json_endpoint(
-            url=url,
-            max_attempts=3,
-            label='tournament_seasons',
-            context={'league': league, 'ut_id': ut_id},
-        )
-        if not payload:
-            return None
-
-        # The "year" field is the official slug, e.g. "25/26".
-        # soccerdata short slug "2526" maps via the leading 4 digits.
-        if len(season_short) == 4:
-            target_year = f"{season_short[0:2]}/{season_short[2:4]}"
-        else:
-            target_year = season_short
-
-        for entry in (payload.get('seasons') or []):
-            if not isinstance(entry, dict):
-                continue
-            if entry.get('year') == target_year:
-                sid = entry.get('id')
-                if sid is None:
-                    continue
-                pair = (int(ut_id), int(sid))
-                self._season_id_cache[cache_key] = pair
-                return pair
-
-        logger.warning(
-            "SofaScore season for league=%s year=%s not found "
-            "(ut_id=%d).", league, target_year, ut_id,
-        )
-        return None
 
     def _resolve_player_ids_from_bronze(
         self,
@@ -1939,132 +1864,6 @@ class SofaScoreScraper(SoccerdataScraper):
             row[col] = _coerce_scalar(raw_val)
         return row
 
-    def _fetch_player_season_stats_payload(
-        self,
-        player_id: str,
-        ut_id: int,
-        season_id: int,
-        max_attempts: int = 3,
-    ) -> Optional[dict]:
-        url = f"{_SOFASCORE_API}{_PLAYER_SEASON_STATS_PATH.format(player_id=player_id, ut_id=ut_id, season_id=season_id)}"
-        return self._fetch_json_endpoint(
-            url=url,
-            max_attempts=max_attempts,
-            label='player_season_stats',
-            context={
-                'player_id': player_id,
-                'ut_id': ut_id,
-                'season_id': season_id,
-            },
-        )
-
-    def read_player_season_stats(
-        self,
-        league: str,
-        season: int,
-        player_ids: Optional[List[str]] = None,
-        limit: Optional[int] = None,
-    ) -> pd.DataFrame:
-        """Fetch per-(player, season) Opta-aggregate stats from
-        ``/api/v1/player/{pid}/unique-tournament/{ut}/season/{s}/
-        statistics/overall``.
-        """
-        anchor_cols = [
-            'player_id', 'unique_tournament_id', 'sofascore_season_id',
-            'team_id', 'team_name', 'league', 'season',
-        ]
-
-        season_str = str(season)
-        if len(season_str) == 4 and season_str.isdigit():
-            season_short = f"{season_str[2:4]}{int(season_str[2:4]) + 1:02d}"
-        else:
-            season_short = season_str
-
-        season_ids = self._resolve_season_id(league, season)
-        if season_ids is None:
-            logger.warning(
-                "%s: cannot resolve SofaScore season_id for league=%s "
-                "season=%s — player_season_stats skipped.",
-                R0_2B_FALLBACK_MARKER, league, season,
-            )
-            return pd.DataFrame(columns=anchor_cols + ['_ingested_at'])
-
-        ut_id, sofa_season_id = season_ids
-
-        if player_ids is None:
-            player_ids = self._resolve_player_ids_from_bronze(
-                league, season_short, limit=limit,
-            )
-
-        if not player_ids:
-            logger.warning(
-                "%s: no player_ids resolved for league=%s season=%s.",
-                R0_2B_FALLBACK_MARKER, league, season_short,
-            )
-            return pd.DataFrame(columns=anchor_cols + ['_ingested_at'])
-
-        if limit:
-            player_ids = list(player_ids)[: int(limit)]
-
-        logger.info(
-            "Fetching SofaScore player_season_stats for %d players "
-            "(league=%s season=%s ut=%d sid=%d)",
-            len(player_ids), league, season, ut_id, sofa_season_id,
-        )
-
-        all_rows: List[Dict] = []
-        consecutive_failures = 0
-        max_consecutive = 100
-
-        for idx, pid in enumerate(player_ids, start=1):
-            payload = self._fetch_player_season_stats_payload(
-                str(pid), ut_id, sofa_season_id,
-            )
-            if payload is None:
-                consecutive_failures += 1
-                if consecutive_failures >= max_consecutive:
-                    logger.error(
-                        "%s: %d consecutive player_season_stats failures.",
-                        R0_2B_FALLBACK_MARKER, consecutive_failures,
-                    )
-                    break
-                continue
-
-            consecutive_failures = 0
-            row = self._flatten_player_season_stats(
-                str(pid), ut_id, sofa_season_id, payload,
-            )
-            if row is not None:
-                all_rows.append(row)
-
-            if idx % 100 == 0:
-                logger.info(
-                    "player_season_stats progress: %d/%d players",
-                    idx, len(player_ids),
-                )
-
-        if not all_rows:
-            logger.warning(
-                "%s: zero player_season_stats rows materialised across "
-                "%d players.",
-                R0_2B_FALLBACK_MARKER, len(player_ids),
-            )
-            return pd.DataFrame(columns=anchor_cols + ['_ingested_at'])
-
-        df = pd.DataFrame(all_rows)
-        df['league'] = league
-        df['season'] = season_short
-        df['_ingested_at'] = datetime.utcnow()
-        df['_source'] = self.SOURCE_NAME
-        df['_entity_type'] = 'player_season_stats'
-        df['_batch_id'] = self._batch_id
-
-        logger.info(
-            "Materialised %d player_season_stats rows for %d players",
-            len(df), df['player_id'].nunique(),
-        )
-        return df
-
     # ------------------------------------------------------------------
     # #23 player_profile — snapshot (height, foot, dob, nationality, ...)
     # ------------------------------------------------------------------
@@ -2123,116 +1922,6 @@ class SofaScoreScraper(SoccerdataScraper):
             'retired': bool(player.get('retired')) if player.get('retired') is not None else None,
         }
 
-    def _fetch_player_profile_payload(
-        self,
-        player_id: str,
-        max_attempts: int = 3,
-    ) -> Optional[dict]:
-        url = f"{_SOFASCORE_API}{_PLAYER_PROFILE_PATH.format(player_id=player_id)}"
-        return self._fetch_json_endpoint(
-            url=url,
-            max_attempts=max_attempts,
-            label='player_profile',
-            context={'player_id': player_id},
-        )
-
-    def read_player_profile(
-        self,
-        league: str,
-        season: int,
-        player_ids: Optional[List[str]] = None,
-        limit: Optional[int] = None,
-    ) -> pd.DataFrame:
-        """Fetch per-player biographical snapshot from
-        ``/api/v1/player/{id}``.
-
-        Snapshot grain: 1 row per (player_id) per (league, season)
-        partition. Cross-source validation against FotMob T4
-        ``gold.dim_player_attributes`` lives in Silver, not here.
-        """
-        anchor_cols = [
-            'player_id', 'name', 'short_name', 'slug', 'position',
-            'jersey_number', 'shirt_number', 'height_cm', 'preferred_foot',
-            'date_of_birth', 'nationality', 'country_code',
-            'current_team_id', 'current_team_name', 'retired',
-            'league', 'season',
-        ]
-
-        season_str = str(season)
-        if len(season_str) == 4 and season_str.isdigit():
-            season_short = f"{season_str[2:4]}{int(season_str[2:4]) + 1:02d}"
-        else:
-            season_short = season_str
-
-        if player_ids is None:
-            player_ids = self._resolve_player_ids_from_bronze(
-                league, season_short, limit=limit,
-            )
-
-        if not player_ids:
-            logger.warning(
-                "%s: no player_ids resolved for player_profile "
-                "(league=%s season=%s).",
-                R0_2B_FALLBACK_MARKER, league, season_short,
-            )
-            return pd.DataFrame(columns=anchor_cols + ['_ingested_at'])
-
-        if limit:
-            player_ids = list(player_ids)[: int(limit)]
-
-        logger.info(
-            "Fetching SofaScore player_profile for %d players (league=%s season=%s)",
-            len(player_ids), league, season,
-        )
-
-        all_rows: List[Dict] = []
-        consecutive_failures = 0
-        max_consecutive = 100
-
-        for idx, pid in enumerate(player_ids, start=1):
-            payload = self._fetch_player_profile_payload(str(pid))
-            if payload is None:
-                consecutive_failures += 1
-                if consecutive_failures >= max_consecutive:
-                    logger.error(
-                        "%s: %d consecutive player_profile failures.",
-                        R0_2B_FALLBACK_MARKER, consecutive_failures,
-                    )
-                    break
-                continue
-
-            consecutive_failures = 0
-            row = self._flatten_player_profile(payload)
-            if row is not None:
-                all_rows.append(row)
-
-            if idx % 100 == 0:
-                logger.info(
-                    "player_profile progress: %d/%d players",
-                    idx, len(player_ids),
-                )
-
-        if not all_rows:
-            logger.warning(
-                "%s: zero player_profile rows materialised across %d players.",
-                R0_2B_FALLBACK_MARKER, len(player_ids),
-            )
-            return pd.DataFrame(columns=anchor_cols + ['_ingested_at'])
-
-        df = pd.DataFrame(all_rows)
-        df['league'] = league
-        df['season'] = season_short
-        df['_ingested_at'] = datetime.utcnow()
-        df['_source'] = self.SOURCE_NAME
-        df['_entity_type'] = 'player_profile'
-        df['_batch_id'] = self._batch_id
-
-        logger.info(
-            "Materialised %d player_profile rows for %d players",
-            len(df), df['player_id'].nunique(),
-        )
-        return df
-
     # ------------------------------------------------------------------
     # #751 PR3 — per-player capture (biographical profile snapshot)
     # ------------------------------------------------------------------
@@ -2247,7 +1936,7 @@ class SofaScoreScraper(SoccerdataScraper):
         """ONE Camoufox navigation per player → the player_profile Bronze frame
         (#751 PR3).
 
-        Replaces the dead tls ``read_player_profile`` pass (403'd on Turnstile)
+        Replaces the dead tls player_profile pass (403'd on Turnstile)
         with a player-page capture: :meth:`_flatten_player_profile` over the bio
         SSR'd in ``__NEXT_DATA__`` (``props.pageProps.player``). The bio is
         server-rendered, so it needs no Turnstile-gated XHR.

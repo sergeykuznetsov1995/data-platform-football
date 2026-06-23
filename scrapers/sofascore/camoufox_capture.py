@@ -268,7 +268,7 @@ def extract_player_from_next_data(next_data, player_id) -> Optional[dict]:
 # that default is NOT EPL (live-proven: Paquetá → World Cup), so the capture
 # also drives the season-picker to select the target tournament — firing a
 # SECOND overall XHR. These pure helpers pick the right one out of the buffer
-# without any tls fetch (the dead _resolve_season_id is no longer needed).
+# without any tls fetch (the old tls season-id resolution is no longer needed).
 _PLAYER_SEASON_STATS_RE = re.compile(
     r"/api/v1/player/(\d+)/unique-tournament/(\d+)/season/(\d+)/statistics/overall$"
 )
