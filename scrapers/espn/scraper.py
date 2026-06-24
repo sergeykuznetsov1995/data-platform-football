@@ -99,6 +99,37 @@ class ESPNScraper(SoccerdataScraper):
             logger.error(f"Error reading schedule: {e}")
             raise
 
+    def _sanitize_match_cache(self, reader, gid) -> bool:
+        """Drop roster players with an empty athlete record from the cached ESPN
+        match JSON so soccerdata can parse the rest of the match.
+
+        ESPN occasionally ships a substitute whose ``athlete`` is just
+        ``{'links': ...}`` — no displayName/id — and soccerdata then raises
+        ``KeyError: 'displayName'`` for the WHOLE match (#713; e.g. game 480573,
+        West Ham–Stoke 2018-04-16, one nameless Stoke sub). Returns True if any
+        player was removed (so the caller can retry the parse).
+        """
+        import json
+        fp = reader.data_dir / f"Summary_{int(gid)}.json"
+        if not fp.exists():
+            return False
+        try:
+            data = json.loads(fp.read_text())
+        except Exception:
+            return False
+        changed = False
+        for r in data.get("rosters", []):
+            roster = r.get("roster")
+            if not roster:
+                continue
+            kept = [p for p in roster if "displayName" in p.get("athlete", {})]
+            if len(kept) != len(roster):
+                r["roster"] = kept
+                changed = True
+        if changed:
+            fp.write_text(json.dumps(data))
+        return changed
+
     def _read_per_match(self, method_name: str, entity: str) -> Optional[pd.DataFrame]:
         """Read a per-match entity (lineup/matchsheet) match-by-match.
 
@@ -124,8 +155,25 @@ class ESPNScraper(SoccerdataScraper):
                 if d is not None and not d.empty:
                     frames.append(d)
             except Exception as e:
-                skipped.append(gid)
-                logger.warning(f"{entity}: skipping match {gid} (malformed ESPN data: {e})")
+                # One roster player with an empty athlete record (only 'links',
+                # no displayName) makes soccerdata KeyError on the WHOLE match.
+                # Drop the nameless player(s) from the cached match JSON and retry
+                # once, so the other ~35 players in that match survive (#713).
+                salvaged = False
+                if self._sanitize_match_cache(reader, gid):
+                    try:
+                        d = method(match_id=int(gid))
+                        if d is not None and not d.empty:
+                            frames.append(d)
+                        salvaged = True
+                        logger.info(
+                            f"{entity}: salvaged match {gid} after dropping nameless player(s)"
+                        )
+                    except Exception as e2:
+                        e = e2
+                if not salvaged:
+                    skipped.append(gid)
+                    logger.warning(f"{entity}: skipping match {gid} (malformed ESPN data: {e})")
         if skipped:
             logger.warning(
                 f"{entity}: skipped {len(skipped)}/{len(game_ids)} matches with malformed data"
