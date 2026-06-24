@@ -169,15 +169,16 @@ EXPECTED_TABLES: dict[str, dict[str, set[str]]] = {
             'game_id', 'league_id',
             *META_COLS,
         },
-        # scripts/backfill_espn_e3_5.py:119-122 (extra stat columns also land,
-        # but only these are required)
+        # Producer: ESPNScraper.read_lineup (dags/scripts/run_espn_scraper.py
+        # lineup branch). Extra stat columns also land, but only these are
+        # required.
         'espn_lineup': {
             'league', 'season', 'game', 'team', 'player', 'position',
             'formation_place', 'sub_in', 'sub_out',
             *META_COLS,
         },
-        # Producer: scripts/backfill_espn_e3_5.py matchsheet branch
-        # (soccerdata read_matchsheet — #298). One row per (game, team) with
+        # Producer: ESPNScraper.read_matchsheet (run_espn_scraper.py matchsheet
+        # branch; soccerdata read_matchsheet — #298). One row per (game, team) with
         # venue + ~35 team stat columns; only identity + venue are required
         # (extra stat columns are NOT errors; `capacity` is 100%-NULL and lives
         # in EXPECTED_NULL, so it is not listed here).

@@ -178,7 +178,8 @@ def test_whoscored_contract_lists_all_four_tables(table):
 # the contract — soccerdata's ESPN reader has no read_standings, so the table
 # never materialises (would be a permanent false-positive); the dead scrape
 # path was removed in #354. espn_matchsheet was legacy/ad-hoc but its write-path
-# is now formalized via scripts/backfill_espn_e3_5.py (soccerdata read_matchsheet, #298).
+# is now in the daily DAG runner (ESPNScraper.read_matchsheet, soccerdata
+# read_matchsheet — #298/#713; one DAG writes all three ESPN tables).
 @pytest.mark.parametrize('table', [
     'espn_schedule',
     'espn_lineup',

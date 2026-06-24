@@ -137,7 +137,15 @@ with DAG(
 
     ### Data Collected
 
-    - **Schedule**: Match dates, teams, scores, venues
+    One DAG = one source: the runner writes all three ESPN Bronze tables in a
+    single run (#713):
+
+    - **Schedule** (`bronze.espn_schedule`): match dates, teams, scores, venues
+    - **Lineup** (`bronze.espn_lineup`): one row per player per game
+    - **Matchsheet** (`bronze.espn_matchsheet`): match-level team stats + venue
+
+    Lineup/matchsheet iterate per-match endpoints, so a run is much heavier than
+    schedule-only — it holds the `ingest_scraper_pool` slot for the whole scrape.
 
     ### Notes
 

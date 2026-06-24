@@ -99,6 +99,56 @@ class ESPNScraper(SoccerdataScraper):
             logger.error(f"Error reading schedule: {e}")
             raise
 
+    def read_lineup(self) -> Optional[pd.DataFrame]:
+        """Read per-match lineups (one row per player per game).
+
+        soccerdata's ``read_lineup`` iterates the season's matches under the
+        hood (caching each match JSON), so this is much heavier than the single
+        ``read_schedule`` call.
+        """
+        reader = self._get_reader()
+        logger.info("Fetching ESPN lineup")
+        try:
+            df = self._execute_with_resilience(reader.read_lineup)
+            if df is not None and not df.empty:
+                df = df.reset_index()
+                df = self._add_metadata(df, 'lineup')
+                # bronze.espn_lineup declares these as varchar, but soccerdata
+                # returns int/float (when present) or NaN — coerce to nullable
+                # string (NaN -> None) to match the existing Iceberg schema.
+                for col in (
+                    'league', 'season', 'game', 'team', 'player',
+                    'position', 'formation_place', 'sub_in', 'sub_out',
+                ):
+                    if col in df.columns:
+                        df[col] = df[col].astype('string').where(df[col].notna(), None)
+            return df
+        except Exception as e:
+            logger.error(f"Error reading lineup: {e}")
+            raise
+
+    def read_matchsheet(self) -> Optional[pd.DataFrame]:
+        """Read match-level team stats + venue (one row per game per team)."""
+        reader = self._get_reader()
+        logger.info("Fetching ESPN matchsheet")
+        try:
+            df = self._execute_with_resilience(reader.read_matchsheet)
+            if df is not None and not df.empty:
+                df = df.reset_index()
+                df = self._add_metadata(df, 'matchsheet')
+                # bronze.espn_matchsheet declares every stat column as varchar,
+                # but soccerdata returns numeric/NaN — coerce every object column
+                # to nullable string (NaN -> None); keep is_home (bool),
+                # attendance (bigint) and _ingested_at (timestamp) at their types.
+                for col in df.columns:
+                    if col in ('is_home', 'attendance', '_ingested_at'):
+                        continue
+                    df[col] = df[col].astype('string').where(df[col].notna(), None)
+            return df
+        except Exception as e:
+            logger.error(f"Error reading matchsheet: {e}")
+            raise
+
     def _standardize_schedule(self, df: pd.DataFrame) -> pd.DataFrame:
         """
         Standardize schedule column names.

@@ -226,3 +226,88 @@ class TestEspnReplaceGuard:
         assert rc == 0
         kwargs = scraper.save_to_iceberg.call_args.kwargs
         assert kwargs["min_replace_ratio"] is None
+
+
+# ---------------------------------------------------------------------------
+# #713: the runner now writes all three ESPN bronze tables (schedule + lineup +
+# matchsheet) in one run — one DAG = one source. Cover the lineup/matchsheet
+# wiring (the column coercion itself lives in ESPNScraper.read_lineup /
+# read_matchsheet, exercised by test_espn_scraper.py).
+# ---------------------------------------------------------------------------
+def _build_full_scraper(*, lineup_raises: bool = False):
+    """Stub ESPNScraper returning non-empty frames for all three reads."""
+    sched = pd.DataFrame({
+        'league': ['ENG-Premier League'] * 10,
+        'season': [2024] * 10,
+        'match_date': ['2024-08-17'] * 10,
+    })
+    lineup = pd.DataFrame({'league': ['ENG-Premier League'] * 22, 'season': [2024] * 22})
+    matchsheet = pd.DataFrame({'league': ['ENG-Premier League'] * 2, 'season': [2024] * 2})
+
+    scraper = MagicMock()
+    scraper.read_schedule.return_value = sched
+    scraper._standardize_schedule.return_value = sched
+    if lineup_raises:
+        scraper.read_lineup.side_effect = RuntimeError("lineup boom")
+    else:
+        scraper.read_lineup.return_value = lineup
+    scraper.read_matchsheet.return_value = matchsheet
+    # Echo the table name back so tests can read call ordering off the result.
+    scraper.save_to_iceberg.side_effect = lambda **kw: f"iceberg.bronze.{kw['table_name']}"
+    scraper.__enter__ = MagicMock(return_value=scraper)
+    scraper.__exit__ = MagicMock(return_value=False)
+    return scraper
+
+
+class TestEspnAllTables:
+    """#713: one DAG run writes schedule + lineup + matchsheet."""
+
+    @pytest.fixture
+    def temp_output(self):
+        fd, path = tempfile.mkstemp(suffix=".json", prefix="espn_")
+        os.close(fd)
+        yield path
+        if os.path.exists(path):
+            os.unlink(path)
+
+    @pytest.mark.unit
+    def test_all_three_tables_saved(self, temp_output):
+        """All three reads return data → three saves, exit 0, per-table counts."""
+        scraper = _build_full_scraper()
+
+        rc = _run_main(
+            ["--leagues", "ENG-Premier League", "--season", "2024",
+             "--output", temp_output],
+            MagicMock(return_value=scraper),
+        )
+
+        assert rc == 0
+        saved = [c.kwargs["table_name"] for c in scraper.save_to_iceberg.call_args_list]
+        assert saved == ["espn_schedule", "espn_lineup", "espn_matchsheet"]
+        with open(temp_output) as f:
+            payload = json.load(f)
+        assert payload["lineup_rows"] == 22
+        assert payload["matchsheet_rows"] == 2
+        assert payload["errors"] == []
+
+    @pytest.mark.unit
+    def test_lineup_error_recorded_but_others_saved(self, temp_output):
+        """A lineup failure is recorded (exit 1) but does NOT abort the run:
+        schedule already saved and matchsheet is still attempted. Exit 3 stays
+        reserved for a schedule-level guard refusal only."""
+        scraper = _build_full_scraper(lineup_raises=True)
+
+        rc = _run_main(
+            ["--leagues", "ENG-Premier League", "--season", "2024",
+             "--output", temp_output],
+            MagicMock(return_value=scraper),
+        )
+
+        assert rc == 1
+        saved = [c.kwargs["table_name"] for c in scraper.save_to_iceberg.call_args_list]
+        assert "espn_schedule" in saved
+        assert "espn_matchsheet" in saved
+        assert "espn_lineup" not in saved
+        with open(temp_output) as f:
+            payload = json.load(f)
+        assert any("Lineup scraping failed" in e for e in payload["errors"])
