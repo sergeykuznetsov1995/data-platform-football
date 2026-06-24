@@ -411,6 +411,7 @@ def _run_player_ratings(
                 match_ids=match_ids,
                 limit=limit,
             )
+            results['traffic'] = scraper.get_traffic_stats()  # #789
 
             if df is None or df.empty:
                 # Look at scraper's last fetch error to classify the
@@ -980,6 +981,7 @@ def _run_event_endpoint(
             }
             kwargs.update(extra_kwargs or {})
             df = method(**kwargs)
+            results['traffic'] = scraper.get_traffic_stats()  # #789
 
             if df is None or df.empty:
                 last_err = getattr(scraper, '_last_endpoint_error', None)
@@ -1116,6 +1118,27 @@ def _write_results(path: str, payload: dict) -> None:
         print(json.dumps(payload, default=str))
     except Exception:
         pass
+    # Residential-proxy traffic per-run log + ops persist (#789 Phase 2). One
+    # grep-friendly "PROXY_TRAFFIC source=sofascore total=… MB" line + one row in
+    # iceberg.ops.proxy_traffic_runs. NOTE: counts only the tls REST path
+    # (`_fetch_json_endpoint`) — the Camoufox capture path is NOT instrumented,
+    # so this is a lower bound for SofaScore. Passive — never fails the run.
+    traffic = payload.get('traffic')
+    if traffic:
+        try:
+            from utils.proxy_traffic import (
+                log_traffic_summary,
+                record_traffic_run,
+                summarize_result_traffic,
+            )
+            summary = summarize_result_traffic('sofascore', traffic)
+            log_traffic_summary(summary)
+            record_traffic_run(
+                summary,
+                dag_run_id=os.environ.get('AIRFLOW_CTX_DAG_RUN_ID', ''),
+            )
+        except Exception as e:  # noqa: BLE001 — logging must not fail the run
+            logger.warning("proxy-traffic log failed: %s", e)
 
 
 def _run_legacy(

@@ -97,6 +97,26 @@ def _write_results(path: str, payload: dict) -> None:
         print(json.dumps(payload, default=str))
     except Exception:
         pass
+    # Residential-proxy traffic per-run log + ops persist (#789 Phase 2). One
+    # grep-friendly "PROXY_TRAFFIC source=capology total=… MB" line + one row in
+    # iceberg.ops.proxy_traffic_runs. `_write_results` fires once per subprocess
+    # (provably one exit point per `_run_*`). Passive — never fails the run.
+    traffic = payload.get('traffic')
+    if traffic:
+        try:
+            from utils.proxy_traffic import (
+                log_traffic_summary,
+                record_traffic_run,
+                summarize_result_traffic,
+            )
+            summary = summarize_result_traffic('capology', traffic)
+            log_traffic_summary(summary)
+            record_traffic_run(
+                summary,
+                dag_run_id=os.environ.get('AIRFLOW_CTX_DAG_RUN_ID', ''),
+            )
+        except Exception as e:  # noqa: BLE001 — logging must not fail the run
+            logger.warning("proxy-traffic log failed: %s", e)
 
 
 def _classify_fallback(scraper) -> str:
@@ -166,6 +186,7 @@ def _run_player_salaries(
             df = scraper.read_player_salaries(
                 league=league, season=int(season), currency=currency, limit=limit,
             )
+            results['traffic'] = scraper.get_traffic_stats()  # #789
             if df is None or df.empty:
                 reason = _classify_fallback(scraper)
                 logger.error(
@@ -251,6 +272,7 @@ def _run_product(
             df = getattr(scraper, method)(
                 league=league, season=int(season), limit=limit,
             )
+            results['traffic'] = scraper.get_traffic_stats()  # #789
             if df is None or df.empty:
                 reason = _classify_fallback(scraper)
                 logger.error(

@@ -119,18 +119,25 @@ def _write_results(path: str, payload: dict) -> None:
         print(json.dumps(payload, default=str))
     except Exception:
         pass
-    # Residential-proxy traffic per-run log (#789). Emits one grep-friendly
-    # "PROXY_TRAFFIC source=transfermarkt total=… MB" line when the entity
-    # captured a traffic block. Passive — never fails the run.
+    # Residential-proxy traffic per-run log + ops persist (#789). Emits one
+    # grep-friendly "PROXY_TRAFFIC source=transfermarkt total=… MB" line and
+    # records a row in iceberg.ops.proxy_traffic_runs when the entity captured a
+    # traffic block. `_write_results` fires exactly once per (entity) subprocess
+    # — provably one exit point per `_run_*` — so this persists one row per run.
+    # Passive — never fails the run.
     traffic = payload.get('traffic')
     if traffic:
         try:
             from utils.proxy_traffic import (
                 log_traffic_summary,
+                record_traffic_run,
                 summarize_result_traffic,
             )
-            log_traffic_summary(
-                summarize_result_traffic('transfermarkt', traffic)
+            summary = summarize_result_traffic('transfermarkt', traffic)
+            log_traffic_summary(summary)
+            record_traffic_run(
+                summary,
+                dag_run_id=os.environ.get('AIRFLOW_CTX_DAG_RUN_ID', ''),
             )
         except Exception as e:  # noqa: BLE001 — logging must not fail the run
             logger.warning("proxy-traffic log failed: %s", e)
