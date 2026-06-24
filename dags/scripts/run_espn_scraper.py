@@ -58,7 +58,15 @@ def main():
     args = parser.parse_args()
 
     leagues = [l.strip() for l in args.leagues.split(',')]
-    logger.info(f"Starting ESPN scraper: leagues={leagues}, season={args.season}")
+    # soccerdata reads a 4-digit int ambiguously: 2021 -> slug '2021' (2020/21),
+    # NOT the 2021/22 season — because 20,21 are consecutive and look like a
+    # season code (#713). Convert the year-start int to an explicit 4-char slug
+    # ('YYZZ', e.g. 2021 -> '2122') so EVERY season resolves unambiguously.
+    season_slug = f"{args.season % 100:02d}{(args.season + 1) % 100:02d}"
+    logger.info(
+        f"Starting ESPN scraper: leagues={leagues}, season={args.season} "
+        f"(soccerdata slug {season_slug})"
+    )
 
     results = {
         'tables': [],
@@ -72,7 +80,7 @@ def main():
         from scrapers.base.base_scraper import ReplaceGuardError
         from scrapers.espn import ESPNScraper
 
-        with ESPNScraper(leagues=leagues, seasons=[args.season]) as scraper:
+        with ESPNScraper(leagues=leagues, seasons=[season_slug]) as scraper:
             # Scrape schedule
             try:
                 df = scraper.read_schedule()
