@@ -113,6 +113,20 @@ def _classify_fallback(scraper) -> str:
     return f'http_{status}'
 
 
+def _fallback_exit_code(reason: str) -> int:
+    """Pick the runner exit code for a soft-fallback.
+
+    An active block — the source refused us (http_403/429/5xx) or a transport
+    error — is a real failure → exit 1, which the DAG bash wrapper lets turn the
+    task red (mirrors the ESPN/SoFIFA runners, #466). A genuinely empty result
+    (empty page, NO http error → ``empty_payload``) stays exit 2, mapped to a
+    soft green by the wrapper. (#790)
+    """
+    if reason and (reason.startswith('http_') or reason == 'transport_error'):
+        return 1
+    return 2
+
+
 def _run_player_salaries(
     league: str,
     season: int,
@@ -162,7 +176,7 @@ def _run_player_salaries(
                 results['fallback_reason'] = reason
                 results['errors'].append(f'{R0_2B_FALLBACK_MARKER}: {reason}')
                 _write_results(output_path, results)
-                return 2
+                return _fallback_exit_code(results['fallback_reason'])
 
             table_path = scraper.save_to_iceberg(
                 df=df,
@@ -247,7 +261,7 @@ def _run_product(
                 results['fallback_reason'] = reason
                 results['errors'].append(f'{R0_2B_FALLBACK_MARKER}: {reason}')
                 _write_results(output_path, results)
-                return 2
+                return _fallback_exit_code(results['fallback_reason'])
 
             table_path = scraper.save_to_iceberg(
                 df=df,

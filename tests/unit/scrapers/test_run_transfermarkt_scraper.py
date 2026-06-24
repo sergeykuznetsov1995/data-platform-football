@@ -258,6 +258,7 @@ class TestRunnerFlags:
 
 class TestFallbackPath:
     def test_empty_frame_exits_2_without_save(self, temp_output):
+        # No endpoint error recorded → genuine empty_payload → soft exit 2.
         scraper = _build_scraper(df=pd.DataFrame())
         rc = _run_main(
             ['--entity', 'players', '--output', temp_output], scraper,
@@ -266,6 +267,20 @@ class TestFallbackPath:
         scraper.save_to_iceberg.assert_not_called()
         results = _load_results(temp_output)
         assert results['fallback'] is True
+
+    def test_empty_frame_http_block_exits_1_red(self, temp_output):
+        """#790: an empty frame caused by an http block (403) is a real failure
+        → exit 1 (red), NOT the soft exit 2 of a genuine empty payload."""
+        scraper = _build_scraper(df=pd.DataFrame())
+        scraper._last_endpoint_error = {'status': 403}
+        rc = _run_main(
+            ['--entity', 'players', '--output', temp_output], scraper,
+        )
+        assert rc == 1
+        scraper.save_to_iceberg.assert_not_called()
+        results = _load_results(temp_output)
+        assert results['fallback'] is True
+        assert results['fallback_reason'] == 'http_403'
 
 
 # ---------------------------------------------------------------------------

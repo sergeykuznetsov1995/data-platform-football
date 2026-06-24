@@ -306,6 +306,10 @@ def _match_capture_scraper(*, guard_blocks: bool = False, empty: bool = False):
                   'venue': venue_df}
 
     scraper = MagicMock()
+    # No HTTP error recorded → an empty capture classifies as a genuine
+    # empty_payload (soft exit 2), not an http block (#790). Block tests set
+    # this explicitly to a status dict.
+    scraper._last_lineup_error = None
     scraper.read_match_capture.return_value = frames
     if guard_blocks:
         scraper.save_to_iceberg.side_effect = ReplaceGuardError(
@@ -399,6 +403,24 @@ class TestMatchCaptureRunner:
         assert rc == 2
         scraper.save_to_iceberg.assert_not_called()
 
+    @pytest.mark.unit
+    def test_http_block_capture_exits_1_red(self, temp_output):
+        """#790: an empty capture caused by an http block (403) is a real
+        failure → exit 1 (red), NOT the soft exit 2 of a genuine empty."""
+        scraper = _match_capture_scraper(empty=True)
+        scraper._last_lineup_error = {'status': 403}
+        rc = _run_main(
+            ["--entity", "match_capture", "--league", "ENG-Premier League",
+             "--season", "2025", "--output", temp_output],
+            MagicMock(return_value=scraper),
+            resolver_ids=['1', '2'],
+        )
+        assert rc == 1
+        scraper.save_to_iceberg.assert_not_called()
+        with open(temp_output) as f:
+            payload = json.load(f)
+        assert payload['fallback_reason'] == 'http_403'
+
 
 def _player_capture_scraper(
     *, guard_blocks: bool = False, empty: bool = False, season_empty: bool = False,
@@ -424,6 +446,10 @@ def _player_capture_scraper(
         }
 
     scraper = MagicMock()
+    # No HTTP error recorded → an empty capture classifies as a genuine
+    # empty_payload (soft exit 2), not an http block (#790). Block tests set
+    # this explicitly to a status dict.
+    scraper._last_lineup_error = None
     scraper.read_player_capture.return_value = frames
     if guard_blocks:
         scraper.save_to_iceberg.side_effect = ReplaceGuardError(
@@ -526,6 +552,23 @@ class TestPlayerCaptureRunner:
         )
         assert rc == 2
         scraper.save_to_iceberg.assert_not_called()
+
+    @pytest.mark.unit
+    def test_http_block_capture_exits_1_red(self, temp_output):
+        """#790: an empty player_capture caused by an http block (403) is a real
+        failure → exit 1 (red), NOT the soft exit 2 of a genuine empty."""
+        scraper = _player_capture_scraper(empty=True)
+        scraper._last_lineup_error = {'status': 403}
+        rc = _run_main(
+            ["--entity", "player_capture", "--league", "ENG-Premier League",
+             "--season", "2025", "--output", temp_output],
+            MagicMock(return_value=scraper),
+        )
+        assert rc == 1
+        scraper.save_to_iceberg.assert_not_called()
+        with open(temp_output) as f:
+            payload = json.load(f)
+        assert payload['fallback_reason'] == 'http_403'
 
 
 def _schedule_module():
