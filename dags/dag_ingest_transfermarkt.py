@@ -44,12 +44,14 @@ TRANSFERS_RESULT_PATH = '/tmp/transfermarkt_transfers_result.json'
 COACHES_RESULT_PATH = '/tmp/transfermarkt_coaches_result.json'
 
 # Smoke caps for the first weeks of the DAG — APL has ~600 player rows per
-# season, so PLAYERS_DAILY_LIMIT = None means full crawl. Dependent entities
-# are capped lower because they fan out per-player via the ceapi JSON
-# endpoints (1 HTTP call per player); 100 players ≈ 8 min at 12 req/min.
+# season, so PLAYERS_DAILY_LIMIT = None means full crawl. market_value_history
+# and transfers fan out per-player via the ceapi JSON endpoints (1 HTTP call per
+# player); 100 players ≈ 8 min at 12 req/min. This cap is the default for the
+# UI-configurable `mv_transfers_limit` Param: the weekly run keeps the rotating
+# 100-player window (#620), while a historical backfill overrides it with 0 (no
+# cap = full roster in one run, #793).
 PLAYERS_DAILY_LIMIT: int = None  # None == full league roster
 MV_HISTORY_DAILY_LIMIT: int = 100
-TRANSFERS_DAILY_LIMIT: int = 100
 
 
 def _load_result(path: str, logger) -> Dict[str, Any]:
@@ -192,6 +194,23 @@ with DAG(
                 'backfill a past season (e.g. 2016…2024 for 10-season history).'
             ),
         ),
+        # market_value_history / transfers fan out per-player, so the weekly run
+        # caps each at MV_HISTORY_DAILY_LIMIT (100) and rotates the roster window
+        # (#620) — the full roster accumulates over ~6 weeks. That one-shot
+        # window is too shallow for a historical backfill (~100 of ~750 players),
+        # so the cap is UI-configurable: set 0 = no cap = full roster in one run
+        # (issue #793). The default leaves the weekly window behaviour unchanged.
+        'mv_transfers_limit': Param(
+            default=MV_HISTORY_DAILY_LIMIT,
+            type='integer',
+            minimum=0,
+            title='MV/transfers roster cap',
+            description=(
+                'Players per run for market_value_history / transfers. '
+                '100 = weekly rotating window (#620). 0 = full roster in one '
+                'run (historical backfill, #793).'
+            ),
+        ),
     },
     doc_md="""
     ## Transfermarkt Data Ingestion (Issue #43)
@@ -225,10 +244,11 @@ with DAG(
     config" and set ``season`` to a start year (e.g. 2016 = 2016/17) to ingest a
     past season; ``replace_partitions`` keeps other ``(league, season)``
     partitions untouched. ``players`` and ``coaches`` are full per-season crawls.
-    NOTE: ``market_value_history`` / ``transfers`` still rotate one ~100-player
-    window per run (keyed on ``{{ ds }}``), so a single backfill trigger covers
-    only one window of that season — re-trigger ~6× (or raise the limit) for full
-    MV/transfer coverage of a historical season.
+    ``market_value_history`` / ``transfers`` default to one rotating ~100-player
+    window per run (keyed on ``{{ ds }}``); for a historical backfill that one
+    window is too shallow (~100 of ~750 players), so set ``mv_transfers_limit=0``
+    in the trigger config to scrape the **full roster in a single run** (issue
+    #793). Example backfill config: ``{"season": 2018, "mv_transfers_limit": 0}``.
     """,
 ) as dag:
 
@@ -273,7 +293,7 @@ python dags/scripts/run_transfermarkt_scraper.py \\
     --entity market_value_history \\
     --league "{league}" \\
     --season {{{{ params.season }}}} \\
-    --limit {MV_HISTORY_DAILY_LIMIT} \\
+    --limit {{{{ params.mv_transfers_limit }}}} \\
     --as-of-date {{{{ ds }}}} \\
     --output {MV_HISTORY_RESULT_PATH}
 rc=$?
@@ -300,7 +320,7 @@ python dags/scripts/run_transfermarkt_scraper.py \\
     --entity transfers \\
     --league "{league}" \\
     --season {{{{ params.season }}}} \\
-    --limit {TRANSFERS_DAILY_LIMIT} \\
+    --limit {{{{ params.mv_transfers_limit }}}} \\
     --as-of-date {{{{ ds }}}} \\
     --output {TRANSFERS_RESULT_PATH}
 rc=$?
