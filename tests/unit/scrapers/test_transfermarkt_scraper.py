@@ -815,13 +815,31 @@ class TestParseCoachProfile:
 # Trainer-history parser + season window (issue #619)
 # ---------------------------------------------------------------------------
 
-def _history_row(slug, cid, name, appointed, left, role='Manager'):
+def _history_row(slug, cid, name, appointed, left, dob='Jan 1, 1970'):
+    """Mirror one live mitarbeiterhistorie "Detailed view" row (issue #793).
+
+    Column 0 is an ``inline-table`` carrying a portrait link (SAME trainer href,
+    NO text) THEN the name link, with the date of birth below. Then: Nat. (flag,
+    no text) · Appointed · End · Time-in-post · Matches. The portrait-link-first
+    + DOB-in-name-cell shape is exactly what silently emptied the table before
+    #793, so the fixture must reproduce it (the old fixture assumed a flat
+    name-link-first row and never failed against the real layout).
+    """
     return (
         '<tr>'
-        f'<td class="hauptlink"><a href="/{slug}/profil/trainer/{cid}">{name}</a></td>'
+        '<td>'
+        '<table class="inline-table"><tr>'
+        f'<td rowspan="2"><a href="/{slug}/profil/trainer/{cid}">'
+        '<img src="portrait.png"/></a></td>'
+        f'<td><a href="/{slug}/profil/trainer/{cid}">{name}</a></td>'
+        '</tr>'
+        f'<tr><td>{dob}</td></tr></table>'
+        '</td>'
+        '<td class="zentriert"><img title="England"/></td>'
         f'<td class="zentriert">{appointed}</td>'
         f'<td class="zentriert">{left}</td>'
-        f'<td class="zentriert">{role}</td>'
+        '<td class="zentriert">02 years 1 month</td>'
+        '<td class="zentriert">80</td>'
         '</tr>'
     )
 
@@ -829,10 +847,13 @@ def _history_row(slug, cid, name, appointed, left, role='Manager'):
 def _history_html(rows: str) -> str:
     return (
         '<html><body>'
-        '<table class="items"><tbody>'
-        '<tr><th>Manager</th><th>Appointed</th><th>End</th><th>Function</th></tr>'
-        f'{rows}'
-        '</tbody></table>'
+        '<table class="items">'
+        '<thead><tr>'
+        '<th>Name/Date of birth</th><th>Nat.</th><th>Appointed</th>'
+        '<th>End of time in post</th><th>Time in post</th><th>Matches</th>'
+        '</tr></thead>'
+        f'<tbody>{rows}</tbody>'
+        '</table>'
         '</body></html>'
     )
 
@@ -842,11 +863,11 @@ class TestParseCoachHistory:
         import datetime
 
         rows = (
-            # incumbent (open-ended) + mid-season replacement + caretaker
+            # incumbent (open-ended '-' end) + a mid-season caretaker spell
             _history_row('regis-le-bris', '39286', 'Le Bris, Régis',
-                         'Jul 1, 2025', '-', 'Manager')
+                         'Jul 1, 2025', '-', dob='Mar 8, 1976')
             + _history_row('mike-dodds', '88888', 'Mike Dodds',
-                           'Jan 10, 2025', 'Jun 30, 2025', 'Caretaker Manager')
+                           'Jan 10, 2025', 'Jun 30, 2025', dob='Sep 1, 1990')
         )
         out = _parse_coach_history(_history_html(rows), club_id='289')
         assert len(out) == 2, out
@@ -854,16 +875,40 @@ class TestParseCoachHistory:
 
         bris = by_id['39286']
         assert bris['coach_slug'] == 'regis-le-bris'
+        # The name link, NOT the empty portrait link, supplies the name.
         assert bris['name'] == 'Le Bris, Régis'
-        assert bris['role'] == 'Manager'
         assert bris['appointed_date'] == datetime.date(2025, 7, 1)
         assert bris['left_date'] is None  # '-' → incumbent, open-ended
         assert bris['club_id'] == '289'
 
+        # The caretaker spell is still CAPTURED as its own stint (the coverage
+        # gap #619 closed); the detailed view has no role column, so it is not
+        # role-labelled — every entry defaults to 'Manager'.
         dodds = by_id['88888']
-        assert dodds['role'] == 'Caretaker Manager'  # caretaker KEPT (the gap)
+        assert dodds['role'] == 'Manager'
         assert dodds['appointed_date'] == datetime.date(2025, 1, 10)
         assert dodds['left_date'] == datetime.date(2025, 6, 30)
+
+    def test_portrait_link_first_still_extracts_coach(self):
+        # Regression for #793: each row's FIRST trainer link is the empty
+        # portrait <img> link; picking it gave a blank name and dropped every
+        # coach. The name link (2nd, with text) must be used instead.
+        row = _history_row('pep', '5672', 'Pep Guardiola', 'Jul 1, 2016', '-')
+        out = _parse_coach_history(_history_html(row), club_id='281')
+        assert len(out) == 1, out
+        assert out[0]['name'] == 'Pep Guardiola'
+        assert out[0]['coach_id'] == '5672'
+
+    def test_dob_in_name_cell_not_read_as_appointed(self):
+        # Regression for #793: the Name column also carries the DOB. Reading
+        # dates from every descendant <td> mistook the DOB for the appointed
+        # date — appointed must come from the Appointed column.
+        import datetime
+        row = _history_row('x', '7', 'X Coach', 'Aug 1, 2024', '-',
+                           dob='Jan 18, 1971')
+        out = _parse_coach_history(_history_html(row), club_id='9')
+        assert out[0]['appointed_date'] == datetime.date(2024, 8, 1)
+        assert out[0]['left_date'] is None
 
     def test_skips_rows_without_trainer_link(self):
         # A player link (spieler, not trainer) and a plain row must be ignored.
@@ -884,15 +929,9 @@ class TestParseCoachHistory:
         out = _parse_coach_history(_history_html(rows), club_id='281')
         assert len(out) == 1, out
 
-    def test_role_defaults_to_manager_when_column_absent(self):
-        # No function column → role defaults to 'Manager'.
-        row = (
-            '<tr>'
-            '<td class="hauptlink"><a href="/x/profil/trainer/7">X Coach</a></td>'
-            '<td class="zentriert">Aug 1, 2024</td>'
-            '<td class="zentriert">-</td>'
-            '</tr>'
-        )
+    def test_role_defaults_to_manager(self):
+        # The detailed view has no role/function column → always 'Manager'.
+        row = _history_row('x', '7', 'X Coach', 'Aug 1, 2024', '-')
         out = _parse_coach_history(_history_html(row), club_id='9')
         assert out[0]['role'] == 'Manager'
 

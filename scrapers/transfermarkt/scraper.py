@@ -510,20 +510,30 @@ def _parse_coach_profile(html: str, coach_id: str) -> Optional[Dict]:
 def _parse_coach_history(html: str, club_id: str) -> List[Dict]:
     """Extract every manager-stint from a club trainer-history page (issue #619).
 
-    The ``mitarbeiterhistorie`` page renders a ``table.items`` whose rows each
-    carry a manager link to ``/{slug}/profil/trainer/{id}``, the appointed and
-    end-of-tenure dates, and a role/function ("Manager", "Caretaker Manager",
-    "Interim Manager"). Returns one dict per stint:
+    The ``mitarbeiterhistorie`` "Detailed view" (``/plus/1``) renders a
+    ``table.items`` with one top-level ``tbody > tr`` per stint. Confirmed live
+    column layout (header): ``Name/Date of birth · Nat. · Appointed · End of
+    time in post · Time in post · Matches · W · D · L · PPG``. The first column
+    embeds an ``inline-table`` holding a portrait link AND a name link — both
+    point at ``/{slug}/profil/trainer/{id}`` but only the name link carries
+    text. Returns one dict per stint:
     ``{coach_id, coach_slug, name, role, appointed_date, left_date, club_id}``.
     The caller filters by season window and dedups coach_id.
 
-    Rows without a trainer link (section/header rows) are skipped. Caretakers
-    are KEPT — they are exactly the coverage gap this page closes vs the
-    end-of-season staff snapshot.
+    Two live-layout traps this parser handles (both silently emptied the table
+    before #793):
 
-    NB: TM's history table layout differs from the staff page; confirm the
-    selectors with scripts/probe_transfermarkt_coaches.py before the first prod
-    run (same probe-first discipline as _parse_staff_managers, #434).
+    - **Portrait link first.** Picking the first trainer link grabs the empty
+      portrait ``<img>`` link → blank name → the row was dropped. We take the
+      first trainer link that actually has text.
+    - **DOB in the name cell.** The Name column also holds the date of birth, so
+      reading dates from every descendant ``<td>`` mistook the DOB for the
+      appointed date. We read dates from the row's DIRECT ``<td>`` cells, skip
+      the first (Name/DoB), and take Appointed then End in order.
+
+    The detailed view has no role/function column, so role defaults to
+    ``'Manager'`` — caretakers are still CAPTURED (each as its own stint), they
+    just are not role-labelled here (#793 followup).
     """
     from bs4 import BeautifulSoup
 
@@ -531,13 +541,16 @@ def _parse_coach_history(html: str, club_id: str) -> List[Dict]:
     table = soup.find('table', {'class': 'items'})
     if table is None:
         return []
+    body = table.find('tbody') or table
 
     out: List[Dict] = []
     seen_stints: set = set()
-    for tr in table.find_all('tr'):
+    # Top-level rows only: each row embeds an inline-table whose nested <tr>/<td>
+    # would otherwise be walked as phantom rows / stray date cells.
+    for tr in body.find_all('tr', recursive=False):
         link = next(
             (a for a in tr.find_all('a', href=True)
-             if _COACH_HREF_RE.match(a['href'])),
+             if _COACH_HREF_RE.match(a['href']) and a.get_text(strip=True)),
             None,
         )
         if link is None:
@@ -545,14 +558,13 @@ def _parse_coach_history(html: str, club_id: str) -> List[Dict]:
         m = _COACH_HREF_RE.match(link['href'])
         coach_id = m.group('id')
         name = link.get_text(strip=True)
-        if not name:
-            continue
 
-        # Date cells, in row order. TM lists "Appointed" then "End of tenure"
-        # (the incumbent's end is blank / '-'). First parseable = appointed,
-        # second = left.
+        # Appointed + end dates live in the row's own columns. Read DIRECT <td>
+        # cells only and skip the first (the Name/Date-of-birth cell — its DOB
+        # would be mistaken for the appointed date). First parseable = appointed,
+        # second = end; a blank / '-' end → None = incumbent (open-ended).
         dates: List[date] = []
-        for td in tr.find_all('td'):
+        for td in tr.find_all('td', recursive=False)[1:]:
             d = _parse_tm_date(td.get_text(' ', strip=True))
             if d is not None:
                 dates.append(d)
@@ -565,24 +577,11 @@ def _parse_coach_history(html: str, club_id: str) -> List[Dict]:
             continue
         seen_stints.add(stint_key)
 
-        # Role/function: first plain-text (non-link) cell that contains a letter
-        # and is not a date. Link cells (manager name, club) are skipped, as are
-        # placeholders ('-', '?') and date cells. Defaults to 'Manager' when the
-        # column is absent (older layouts).
-        role = 'Manager'
-        for td in tr.find_all('td'):
-            if td.find('a', href=True):
-                continue
-            txt = td.get_text(' ', strip=True)
-            if txt and any(c.isalpha() for c in txt) and _parse_tm_date(txt) is None:
-                role = txt
-                break
-
         out.append({
             'coach_id': coach_id,
             'coach_slug': m.group('slug'),
             'name': name,
-            'role': role,
+            'role': 'Manager',
             'appointed_date': appointed,
             'left_date': left,
             'club_id': str(club_id),
