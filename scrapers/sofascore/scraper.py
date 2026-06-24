@@ -10,8 +10,10 @@ Source: https://www.sofascore.com
 import logging
 import re
 import time
+from collections import defaultdict
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
+from urllib.parse import urlsplit
 
 import pandas as pd
 
@@ -138,6 +140,50 @@ class SofaScoreScraper(SoccerdataScraper):
     ):
         super().__init__(leagues=leagues, seasons=seasons, **kwargs)
         self._reader = None
+        # Residential-proxy traffic audit (#789). Passive: response-body bytes of
+        # the tls_requests REST path (`_fetch_json_endpoint`), keyed by host.
+        # The Camoufox capture path (schedule/standings/lineups) is NOT counted
+        # here — instrumenting a browser session is out of scope for #789
+        # (followup if its residential share grows). Surfaced via get_traffic_stats().
+        self._proxy_bytes: int = 0
+        self._proxy_bytes_by_host: Dict[str, int] = defaultdict(int)
+
+    def get_traffic_stats(self) -> Dict:
+        """Residential-proxy bytes seen on the tls REST path this run (#789).
+
+        Lower bound: response-body bytes of ``_fetch_json_endpoint`` only
+        (Camoufox browser traffic excluded). Shape mirrors
+        ``FlareSolverrClient.get_traffic_stats`` so ``utils.proxy_traffic`` can
+        consume it uniformly.
+        """
+        by_host = sorted(
+            self._proxy_bytes_by_host.items(), key=lambda kv: -kv[1]
+        )
+        return {
+            'proxy_response_bytes': self._proxy_bytes,
+            'proxy_response_mb': round(self._proxy_bytes / 1024 / 1024, 4),
+            'requests': int(self._stats.get('requests', 0)),
+            'top_traffic_urls': [
+                {
+                    'url': host,
+                    'bytes': nbytes,
+                    'mb': round(nbytes / 1024 / 1024, 4),
+                }
+                for host, nbytes in by_host[:10]
+            ],
+        }
+
+    def _record_proxy_bytes(self, url: str, resp) -> None:
+        """Accumulate response-body bytes for the residential-proxy audit (#789).
+
+        Never raises — a passive traffic counter must not break a scrape.
+        """
+        try:
+            nbytes = len(resp.content or b"")
+        except Exception:  # noqa: BLE001 — counter must never break the fetch
+            return
+        self._proxy_bytes += nbytes
+        self._proxy_bytes_by_host[urlsplit(url).netloc or url] += nbytes
 
     def _get_reader(self):
         """Get soccerdata SofaScore reader."""
@@ -491,6 +537,7 @@ class SofaScoreScraper(SoccerdataScraper):
                 # hung proxy rotates instead of stalling the whole backfill
                 # (issue #30).
                 resp = client.get(url, timeout=(5.0, 8.0))
+                self._record_proxy_bytes(url, resp)  # #789
                 last_status = resp.status_code
                 if resp.status_code == 200:
                     if proxy_obj is not None:

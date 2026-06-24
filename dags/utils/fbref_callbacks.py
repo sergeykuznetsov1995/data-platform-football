@@ -289,7 +289,11 @@ def report_proxy_traffic(**context) -> Dict[str, Any]:
     """
     import logging
 
-    from utils.proxy_traffic import log_traffic_summary, summarize_fbref_traffic
+    from utils.proxy_traffic import (
+        log_traffic_summary,
+        record_traffic_run,
+        summarize_fbref_traffic,
+    )
 
     logger = logging.getLogger(__name__)
 
@@ -299,6 +303,14 @@ def report_proxy_traffic(**context) -> Dict[str, Any]:
     except Exception as exc:  # noqa: BLE001 — reporting must never fail the DAG
         logger.warning("report_proxy_traffic failed: %s", exc)
         return {'source': 'fbref', 'total_mb': None}
+
+    # Phase 2 (#789): persist this run to iceberg.ops.proxy_traffic_runs so the
+    # daily DAG can roll up per-source spend. record_traffic_run never raises.
+    dag_run_id = ''
+    dag_run = context.get('dag_run')
+    if dag_run is not None:
+        dag_run_id = getattr(dag_run, 'run_id', '') or ''
+    record_traffic_run(summary, dag_run_id=dag_run_id)
 
     ti = context.get('ti') or context.get('task_instance')
     if ti is not None:

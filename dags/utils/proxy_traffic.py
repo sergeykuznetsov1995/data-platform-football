@@ -134,3 +134,154 @@ def log_traffic_summary(summary: Dict[str, Any]) -> None:
         total_mb / 1024,
         top_str,
     )
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 (#789): persist each run to iceberg.ops + a daily per-source rollup.
+#
+# The connection helpers live in ``utils.silver_tasks`` (imports ``trino``
+# directly, NOT ``scrapers/`` — safe for the scheduler). We import them lazily
+# inside each function so this module stays import-light for callers that only
+# need the stdlib summarizers above.
+# ---------------------------------------------------------------------------
+
+OPS_SCHEMA = "iceberg.ops"
+OPS_TABLE = "iceberg.ops.proxy_traffic_runs"
+
+
+def _sql_str(value: Any) -> str:
+    """Quote a value as a Trino string literal, escaping embedded single quotes."""
+    return "'" + str(value if value is not None else "").replace("'", "''") + "'"
+
+
+def ensure_ops_table(conn) -> None:
+    """Idempotently create ``iceberg.ops.proxy_traffic_runs`` (#789 Phase 2).
+
+    ``conn`` is a Trino DBAPI connection (see ``utils.silver_tasks``). Uses
+    ``_execute`` so the post-DDL ``fetchall()`` runs — a bare ``cursor.close()``
+    without it cancels the statement (CLAUDE.md footgun → USER_CANCELED).
+
+    NOTE: a brand-new Iceberg schema needs its HDFS dir group-writable
+    (``chmod 777``) for the Airflow user to insert — see
+    ``feedback_gold_permissions``. That one-time container step is in the PR
+    test plan; the SQL below is the runtime half.
+    """
+    from utils.silver_tasks import _execute
+
+    _execute(conn, f"CREATE SCHEMA IF NOT EXISTS {OPS_SCHEMA}")
+    _execute(
+        conn,
+        f"CREATE TABLE IF NOT EXISTS {OPS_TABLE} ("
+        "run_ts timestamp(6), "
+        "run_date date, "
+        "source varchar, "
+        "dag_run_id varchar, "
+        "total_mb double, "
+        "top_domains varchar"
+        ") WITH (partitioning = ARRAY['run_date'])",
+    )
+
+
+def record_traffic_run(
+    summary: Dict[str, Any],
+    dag_run_id: str = "",
+    conn=None,
+) -> bool:
+    """Persist one per-run residential-traffic row to the ops table (#789 Phase 2).
+
+    ``summary`` is what :func:`summarize_fbref_traffic` / :func:`summarize_result_traffic`
+    return. Passive telemetry: **never raises** — a failed insert must not break
+    an ingest run (returns ``False`` and logs a warning).
+
+    When ``conn`` is None a connection is opened and closed here; pass one to
+    reuse a connection a caller already holds.
+    """
+    from datetime import datetime
+
+    own_conn = False
+    try:
+        from utils.silver_tasks import _execute, _get_trino_connection
+
+        if conn is None:
+            conn = _get_trino_connection()
+            own_conn = True
+
+        ensure_ops_table(conn)
+
+        source = str(summary.get("source") or "unknown")
+        total_mb = float(summary.get("total_mb") or 0.0)
+        top = summary.get("top_domains") or []
+        top_str = ", ".join(
+            f"{d.get('host')}={d.get('mb')}" for d in top if d.get("host")
+        )
+        now = datetime.now()
+        run_ts = now.strftime("%Y-%m-%d %H:%M:%S")
+        run_date = now.strftime("%Y-%m-%d")
+
+        _execute(
+            conn,
+            f"INSERT INTO {OPS_TABLE} "
+            "(run_ts, run_date, source, dag_run_id, total_mb, top_domains) VALUES ("
+            f"TIMESTAMP '{run_ts}', DATE '{run_date}', "
+            f"{_sql_str(source)}, {_sql_str(dag_run_id)}, "
+            f"{total_mb}, {_sql_str(top_str)})",
+        )
+        logger.info(
+            "PROXY_TRAFFIC persisted source=%s total=%.2f MB run=%s",
+            source,
+            total_mb,
+            dag_run_id or "?",
+        )
+        return True
+    except Exception as exc:  # noqa: BLE001 — telemetry must never fail an ingest
+        logger.warning(
+            "proxy_traffic: record_traffic_run skipped (non-fatal): %s", exc
+        )
+        return False
+    finally:
+        if own_conn and conn is not None:
+            try:
+                conn.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+
+def daily_rollup(conn) -> Dict[str, Any]:
+    """Per-source residential-traffic totals for *yesterday* (#789 Phase 2).
+
+    Reuses ``_execute`` (fetch=True). Returns
+    ``{total_mb, total_gb, by_source: [{source, mb, gb, runs}], report}`` where
+    ``report`` is the human line the daily DAG logs.
+    """
+    from utils.silver_tasks import _execute
+
+    ensure_ops_table(conn)
+    rows = (
+        _execute(
+            conn,
+            "SELECT source, sum(total_mb) AS mb, count(*) AS runs "
+            f"FROM {OPS_TABLE} "
+            "WHERE run_date = current_date - INTERVAL '1' DAY "
+            "GROUP BY source ORDER BY mb DESC",
+            fetch=True,
+        )
+        or []
+    )
+    by_source = [
+        {
+            "source": r[0],
+            "mb": round(float(r[1] or 0.0), 2),
+            "gb": round(float(r[1] or 0.0) / 1024, 3),
+            "runs": int(r[2] or 0),
+        }
+        for r in rows
+    ]
+    total_mb = round(sum(s["mb"] for s in by_source), 2)
+    parts = ", ".join(f"{s['source']} {s['gb']} GB" for s in by_source) or "—"
+    report = f"вчера прокси съели {round(total_mb / 1024, 3)} GB ({total_mb} MB): {parts}"
+    return {
+        "total_mb": total_mb,
+        "total_gb": round(total_mb / 1024, 3),
+        "by_source": by_source,
+        "report": report,
+    }
