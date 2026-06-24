@@ -135,3 +135,30 @@ class TestBronzeQualityGateFollowsParamSeason:
         assert dup[0].params['pk'] == [
             'league', 'season', 'player_id', 'current_club_id',
         ]
+
+
+class TestMvTransfersLimitParam:
+    """market_value_history / transfers are capped per run and rotate a roster
+    window (#620). The cap must be a UI Param defaulting to the weekly value so
+    the scheduled run is unchanged, while a historical backfill can override it
+    with 0 = no cap = full roster in one run (#793)."""
+
+    def test_limit_param_default_is_weekly_cap(self, dag_module):
+        param = dag_module.dag._dag_kwargs['params']['mv_transfers_limit']
+        # Default keeps the weekly rotating-window behaviour (#620) unchanged.
+        assert param.default == dag_module.MV_HISTORY_DAILY_LIMIT == 100
+
+    def test_mv_and_transfers_render_limit_from_param(self, dag_module):
+        # Only the per-player fan-out entities take the cap; players (full crawl)
+        # and coaches carry no --limit, so the Param must reach exactly these two.
+        for task_id in ('scrape_market_value_history', 'scrape_transfers'):
+            task = _bash_task(task_id)
+            assert task is not None, f"missing task {task_id}"
+            assert '--limit {{ params.mv_transfers_limit }}' in task.bash_command, (
+                f"{task_id} does not render the limit from params"
+            )
+            # Must not bake in the weekly cap — a hardcoded 100 is exactly what
+            # capped the #793 backfill to one shallow window per season.
+            assert '--limit 100' not in task.bash_command, (
+                f"{task_id} still hardcodes the 100-player cap"
+            )
