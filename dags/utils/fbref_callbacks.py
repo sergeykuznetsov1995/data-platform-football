@@ -276,3 +276,32 @@ def check_traffic_guard(
         'real_proxy_mb_by_resource_type': dict(mb_by_rtype),
         'threshold_mb': threshold_mb,
     }
+
+
+def report_proxy_traffic(**context) -> Dict[str, Any]:
+    """Aggregate this run's FBref residential-proxy bytes into one log line (#789).
+
+    Reads the per-task ``/tmp/fbref_traffic_*.json`` files the scraper already
+    writes (#44/#624) and logs a single ``PROXY_TRAFFIC source=fbref total=…``
+    line so the residential spend (~$4/GB) is visible per run. Passive — it never
+    raises (a reporting task must not fail the ingest DAG) and changes neither the
+    scrape path nor bronze row-counts.
+    """
+    import logging
+
+    from utils.proxy_traffic import log_traffic_summary, summarize_fbref_traffic
+
+    logger = logging.getLogger(__name__)
+
+    try:
+        summary = summarize_fbref_traffic()
+        log_traffic_summary(summary)
+    except Exception as exc:  # noqa: BLE001 — reporting must never fail the DAG
+        logger.warning("report_proxy_traffic failed: %s", exc)
+        return {'source': 'fbref', 'total_mb': None}
+
+    ti = context.get('ti') or context.get('task_instance')
+    if ti is not None:
+        ti.xcom_push(key='proxy_total_mb', value=summary['total_mb'])
+
+    return summary

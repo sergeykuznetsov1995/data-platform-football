@@ -58,6 +58,7 @@ from utils.fbref_tasks import (
 from utils.fbref_callbacks import (
     validate_all_data,
     check_traffic_guard,
+    report_proxy_traffic,
 )
 
 from scrapers.fbref.constants import (
@@ -425,6 +426,18 @@ with DAG(
     )
 
     # =========================================================================
+    # Residential-proxy traffic report (#789)
+    # =========================================================================
+    # Aggregate the per-task /tmp/fbref_traffic_*.json byte counters into one
+    # "PROXY_TRAFFIC source=fbref total=… MB" log line so the ~$4/GB residential
+    # spend is visible per run. Passive (never raises), runs even if tasks fail.
+    report_traffic = PythonOperator(
+        task_id='report_proxy_traffic',
+        python_callable=report_proxy_traffic,
+        trigger_rule='all_done',
+    )
+
+    # =========================================================================
     # Trigger Silver DAG after ingestion completes
     # =========================================================================
     trigger_silver = TriggerDagRunOperator(
@@ -435,7 +448,7 @@ with DAG(
     )
 
     # =========================================================================
-    # Dependencies: Start -> TaskGroups SEQUENTIAL -> Validate -> Trigger Silver
+    # Dependencies: Start -> TaskGroups SEQUENTIAL -> Validate -> Report -> Trigger Silver
     # Sequential execution to prevent OOM
     # =========================================================================
-    start >> player_stats_group >> team_stats_group >> keeper_stats_group >> match_data_group >> validate_task >> trigger_silver
+    start >> player_stats_group >> team_stats_group >> keeper_stats_group >> match_data_group >> validate_task >> report_traffic >> trigger_silver
