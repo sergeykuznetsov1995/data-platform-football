@@ -99,55 +99,121 @@ class ESPNScraper(SoccerdataScraper):
             logger.error(f"Error reading schedule: {e}")
             raise
 
-    def read_lineup(self) -> Optional[pd.DataFrame]:
-        """Read per-match lineups (one row per player per game).
+    def _sanitize_match_cache(self, reader, gid) -> bool:
+        """Drop roster players with an empty athlete record from the cached ESPN
+        match JSON so soccerdata can parse the rest of the match.
 
-        soccerdata's ``read_lineup`` iterates the season's matches under the
-        hood (caching each match JSON), so this is much heavier than the single
-        ``read_schedule`` call.
+        ESPN occasionally ships a substitute whose ``athlete`` is just
+        ``{'links': ...}`` — no displayName/id — and soccerdata then raises
+        ``KeyError: 'displayName'`` for the WHOLE match (#713; e.g. game 480573,
+        West Ham–Stoke 2018-04-16, one nameless Stoke sub). Returns True if any
+        player was removed (so the caller can retry the parse).
+        """
+        import json
+        fp = reader.data_dir / f"Summary_{int(gid)}.json"
+        if not fp.exists():
+            return False
+        try:
+            data = json.loads(fp.read_text())
+        except Exception:
+            return False
+        changed = False
+        for r in data.get("rosters", []):
+            roster = r.get("roster")
+            if not roster:
+                continue
+            kept = [p for p in roster if "displayName" in p.get("athlete", {})]
+            if len(kept) != len(roster):
+                r["roster"] = kept
+                changed = True
+        if changed:
+            fp.write_text(json.dumps(data))
+        return changed
+
+    def _read_per_match(self, method_name: str, entity: str) -> Optional[pd.DataFrame]:
+        """Read a per-match entity (lineup/matchsheet) match-by-match.
+
+        soccerdata's bulk ``read_lineup``/``read_matchsheet`` abort the WHOLE
+        season if a single match has malformed ESPN JSON — e.g.
+        ``KeyError: 'displayName'`` when a player lacks ``athlete.displayName``,
+        seen in some older seasons. Iterating per ``match_id`` and skipping only
+        the broken matches keeps the rest of the season instead of losing it all
+        (resilience for #713 historical backfill).
         """
         reader = self._get_reader()
-        logger.info("Fetching ESPN lineup")
-        try:
-            df = self._execute_with_resilience(reader.read_lineup)
-            if df is not None and not df.empty:
-                df = df.reset_index()
-                df = self._add_metadata(df, 'lineup')
-                # bronze.espn_lineup declares these as varchar, but soccerdata
-                # returns int/float (when present) or NaN — coerce to nullable
-                # string (NaN -> None) to match the existing Iceberg schema.
-                for col in (
-                    'league', 'season', 'game', 'team', 'player',
-                    'position', 'formation_place', 'sub_in', 'sub_out',
-                ):
-                    if col in df.columns:
-                        df[col] = df[col].astype('string').where(df[col].notna(), None)
-            return df
-        except Exception as e:
-            logger.error(f"Error reading lineup: {e}")
-            raise
+        logger.info(f"Fetching ESPN {entity} (per-match, resilient)")
+        sched = self._execute_with_resilience(reader.read_schedule)
+        if sched is None or sched.empty:
+            return None
+        game_ids = sched.reset_index()['game_id'].dropna().tolist()
+        method = getattr(reader, method_name)
+        frames: List[pd.DataFrame] = []
+        skipped: List = []
+        for gid in game_ids:
+            try:
+                d = method(match_id=int(gid))
+                if d is not None and not d.empty:
+                    frames.append(d)
+            except Exception as e:
+                # One roster player with an empty athlete record (only 'links',
+                # no displayName) makes soccerdata KeyError on the WHOLE match.
+                # Drop the nameless player(s) from the cached match JSON and retry
+                # once, so the other ~35 players in that match survive (#713).
+                salvaged = False
+                if self._sanitize_match_cache(reader, gid):
+                    try:
+                        d = method(match_id=int(gid))
+                        if d is not None and not d.empty:
+                            frames.append(d)
+                        salvaged = True
+                        logger.info(
+                            f"{entity}: salvaged match {gid} after dropping nameless player(s)"
+                        )
+                    except Exception as e2:
+                        e = e2
+                if not salvaged:
+                    skipped.append(gid)
+                    logger.warning(f"{entity}: skipping match {gid} (malformed ESPN data: {e})")
+        if skipped:
+            logger.warning(
+                f"{entity}: skipped {len(skipped)}/{len(game_ids)} matches with malformed data"
+            )
+        if not frames:
+            return None
+        return pd.concat(frames)
+
+    def read_lineup(self) -> Optional[pd.DataFrame]:
+        """Read per-match lineups (one row per player per game)."""
+        df = self._read_per_match('read_lineup', 'lineup')
+        if df is not None and not df.empty:
+            df = df.reset_index()
+            df = self._add_metadata(df, 'lineup')
+            # bronze.espn_lineup declares these as varchar, but soccerdata
+            # returns int/float (when present) or NaN — coerce to nullable
+            # string (NaN -> None) to match the existing Iceberg schema.
+            for col in (
+                'league', 'season', 'game', 'team', 'player',
+                'position', 'formation_place', 'sub_in', 'sub_out',
+            ):
+                if col in df.columns:
+                    df[col] = df[col].astype('string').where(df[col].notna(), None)
+        return df
 
     def read_matchsheet(self) -> Optional[pd.DataFrame]:
         """Read match-level team stats + venue (one row per game per team)."""
-        reader = self._get_reader()
-        logger.info("Fetching ESPN matchsheet")
-        try:
-            df = self._execute_with_resilience(reader.read_matchsheet)
-            if df is not None and not df.empty:
-                df = df.reset_index()
-                df = self._add_metadata(df, 'matchsheet')
-                # bronze.espn_matchsheet declares every stat column as varchar,
-                # but soccerdata returns numeric/NaN — coerce every object column
-                # to nullable string (NaN -> None); keep is_home (bool),
-                # attendance (bigint) and _ingested_at (timestamp) at their types.
-                for col in df.columns:
-                    if col in ('is_home', 'attendance', '_ingested_at'):
-                        continue
-                    df[col] = df[col].astype('string').where(df[col].notna(), None)
-            return df
-        except Exception as e:
-            logger.error(f"Error reading matchsheet: {e}")
-            raise
+        df = self._read_per_match('read_matchsheet', 'matchsheet')
+        if df is not None and not df.empty:
+            df = df.reset_index()
+            df = self._add_metadata(df, 'matchsheet')
+            # bronze.espn_matchsheet declares every stat column as varchar,
+            # but soccerdata returns numeric/NaN — coerce every object column
+            # to nullable string (NaN -> None); keep is_home (bool),
+            # attendance (bigint) and _ingested_at (timestamp) at their types.
+            for col in df.columns:
+                if col in ('is_home', 'attendance', '_ingested_at'):
+                    continue
+                df[col] = df[col].astype('string').where(df[col].notna(), None)
+        return df
 
     def _standardize_schedule(self, df: pd.DataFrame) -> pd.DataFrame:
         """

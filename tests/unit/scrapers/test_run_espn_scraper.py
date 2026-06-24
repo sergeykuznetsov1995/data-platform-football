@@ -311,3 +311,19 @@ class TestEspnAllTables:
         with open(temp_output) as f:
             payload = json.load(f)
         assert any("Lineup scraping failed" in e for e in payload["errors"])
+
+    @pytest.mark.unit
+    def test_season_int_converted_to_unambiguous_slug(self, temp_output):
+        """#713: --season 2021 must reach soccerdata as slug '2122' (2021/22).
+        Passing int 2021 directly is read as 2020/21 (20,21 look like a season
+        code), silently scraping the wrong season."""
+        scraper = _build_guard_scraper()
+        cls = MagicMock(return_value=scraper)
+
+        _run_main(
+            ["--leagues", "ENG-Premier League", "--season", "2021",
+             "--output", temp_output],
+            cls,
+        )
+
+        assert cls.call_args.kwargs["seasons"] == ["2122"]
