@@ -31,8 +31,10 @@ import json
 import logging
 import re
 import time
+from collections import defaultdict
 from datetime import date, datetime
 from typing import Dict, List, Optional, Tuple
+from urllib.parse import urlsplit
 
 import pandas as pd
 
@@ -710,8 +712,51 @@ class TransfermarktScraper(BaseScraper):
     ):
         super().__init__(leagues=leagues, seasons=seasons, **kwargs)
         self._last_endpoint_error: Optional[Dict] = None
+        # Residential-proxy traffic audit (#789). Passive: bytes of every HTTP
+        # response received through the proxy, keyed by host. Counts ALL statuses
+        # (a 403 CF block page is billed too). Surfaced via get_traffic_stats().
+        self._proxy_bytes: int = 0
+        self._proxy_bytes_by_host: Dict[str, int] = defaultdict(int)
+
+    def get_traffic_stats(self) -> Dict:
+        """Residential-proxy bytes seen this run (#789).
+
+        Lower bound: response-body bytes only (tls_requests gives no transport
+        framing), but Transfermarkt is a JSON/HTML fetch (no browser
+        sub-resources) so the body dominates the billed bytes. Shape mirrors
+        ``FlareSolverrClient.get_traffic_stats`` so ``utils.proxy_traffic`` can
+        consume either uniformly.
+        """
+        by_host = sorted(
+            self._proxy_bytes_by_host.items(), key=lambda kv: -kv[1]
+        )
+        return {
+            'proxy_response_bytes': self._proxy_bytes,
+            'proxy_response_mb': round(self._proxy_bytes / 1024 / 1024, 4),
+            'requests': int(self._stats.get('requests', 0)),
+            'top_traffic_urls': [
+                {
+                    'url': host,
+                    'bytes': nbytes,
+                    'mb': round(nbytes / 1024 / 1024, 4),
+                }
+                for host, nbytes in by_host[:10]
+            ],
+        }
 
     # -- HTTP plumbing (mirrors scrapers/sofascore/scraper.py:279 contract) --
+
+    def _record_proxy_bytes(self, url: str, resp) -> None:
+        """Accumulate response-body bytes for the residential-proxy audit (#789).
+
+        Never raises — a passive traffic counter must not break a scrape.
+        """
+        try:
+            nbytes = len(resp.content or b"")
+        except Exception:  # noqa: BLE001 — counter must never break the fetch
+            return
+        self._proxy_bytes += nbytes
+        self._proxy_bytes_by_host[urlsplit(url).netloc or url] += nbytes
 
     def _build_tls_session(self):
         """Create a ``tls_requests.Client`` bound to the next residential
@@ -761,6 +806,7 @@ class TransfermarktScraper(BaseScraper):
             client, proxy_obj = self._build_tls_session()
             try:
                 resp = client.get(url, timeout=(5.0, 12.0))
+                self._record_proxy_bytes(url, resp)
                 last_status = resp.status_code
                 if resp.status_code == 200:
                     if proxy_obj is not None:
