@@ -19,6 +19,7 @@ from typing import Any, Dict
 
 from airflow import DAG
 from airflow.exceptions import AirflowException
+from airflow.models.param import Param
 from airflow.operators.bash import BashOperator
 from airflow.operators.python import PythonOperator
 
@@ -106,7 +107,23 @@ with DAG(
     dagrun_timeout=timedelta(hours=3),
     params={
         'leagues': LEAGUES,
-        'season': CURRENT_SEASON,
+        # season UI-configurable: the daily scheduled run uses the default
+        # (CURRENT_SEASON); to backfill a past season use "Trigger DAG w/
+        # config" and set season (e.g. 2016 = 2016/17). New (league, season)
+        # partitions are written via replace_partitions — backfilling an early
+        # season leaves all other partitions untouched (#713, pattern #710).
+        'season': Param(
+            default=CURRENT_SEASON,
+            type='integer',
+            minimum=2000,
+            maximum=CURRENT_SEASON,
+            title='Season (start year)',
+            description=(
+                'APL season start year (2016 = 2016/17). Default = current '
+                'season for the daily run. Override to backfill early history '
+                '(2016…2020 → 10-season corpus, #713).'
+            ),
+        ),
     },
     doc_md="""
     ## ESPN Data Ingestion
@@ -120,7 +137,15 @@ with DAG(
 
     ### Data Collected
 
-    - **Schedule**: Match dates, teams, scores, venues
+    One DAG = one source: the runner writes all three ESPN Bronze tables in a
+    single run (#713):
+
+    - **Schedule** (`bronze.espn_schedule`): match dates, teams, scores, venues
+    - **Lineup** (`bronze.espn_lineup`): one row per player per game
+    - **Matchsheet** (`bronze.espn_matchsheet`): match-level team stats + venue
+
+    Lineup/matchsheet iterate per-match endpoints, so a run is much heavier than
+    schedule-only — it holds the `ingest_scraper_pool` slot for the whole scrape.
 
     ### Notes
 
@@ -131,11 +156,15 @@ with DAG(
 
     scrape_data_task = BashOperator(
         task_id='scrape_espn_data',
+        # --season is rendered at runtime from params.season (Jinja), so the
+        # season is configurable from the UI ("Trigger DAG w/ config") without
+        # a separate backfill DAG (#713, pattern #710). The f-string escapes
+        # {{ }} as {{{{ }}}} so the literal Jinja tag survives into the command.
         bash_command=f"""
 cd /opt/airflow && \\
 python dags/scripts/run_espn_scraper.py \\
     --leagues "{leagues_str}" \\
-    --season {CURRENT_SEASON} \\
+    --season {{{{ params.season }}}} \\
     --output /tmp/espn_result.json
 """,
         env={

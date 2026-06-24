@@ -63,6 +63,8 @@ def main():
     results = {
         'tables': [],
         'schedule_rows': 0,
+        'lineup_rows': 0,
+        'matchsheet_rows': 0,
         'errors': []
     }
 
@@ -103,6 +105,39 @@ def main():
                 logger.error(error_msg)
                 results['errors'].append(error_msg)
 
+            # Scrape per-match entities (lineup, matchsheet). Far heavier than
+            # the schedule — soccerdata iterates every match endpoint. A guard
+            # refusal here is recorded as an error (exit 1), NOT exit 3: the
+            # schedule (primary freshness signal) already saved above, so we
+            # reserve exit 3 for a schedule-level refusal only.
+            for entity, reader_fn in (
+                ('lineup', scraper.read_lineup),
+                ('matchsheet', scraper.read_matchsheet),
+            ):
+                try:
+                    df = reader_fn()
+                    if df is not None and not df.empty:
+                        table_path = scraper.save_to_iceberg(
+                            df=df,
+                            table_name=f'espn_{entity}',
+                            partition_cols=['league', 'season'],
+                            replace_partitions=['league', 'season'],
+                            min_replace_ratio=(
+                                None if args.force_replace else _MIN_REPLACE_RATIO
+                            ),
+                        )
+                        results['tables'].append(table_path)
+                        results[f'{entity}_rows'] = len(df)
+                        logger.info(f"Saved {len(df)} {entity} rows")
+                except ReplaceGuardError as e:
+                    msg = f"{REPLACE_GUARD_MARKER} ({entity}): {e}"
+                    logger.error(msg)
+                    results['errors'].append(msg)
+                except Exception as e:
+                    error_msg = f"{entity.capitalize()} scraping failed: {e}"
+                    logger.error(error_msg)
+                    results['errors'].append(error_msg)
+
     except Exception as e:
         logger.error(f"Scraper failed: {e}", exc_info=True)
         results['errors'].append(str(e))
@@ -114,7 +149,10 @@ def main():
     with open(args.output, 'w') as f:
         json.dump(results, f)
 
-    logger.info(f"Scraper complete: {results['schedule_rows']} total rows")
+    logger.info(
+        f"Scraper complete: schedule={results['schedule_rows']} "
+        f"lineup={results['lineup_rows']} matchsheet={results['matchsheet_rows']} rows"
+    )
     print(json.dumps(results))
     # Issue #466: non-zero exit when any scrape step failed — otherwise the
     # BashOperator stays green while bronze.espn_schedule silently goes stale.
