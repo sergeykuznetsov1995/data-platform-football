@@ -111,6 +111,56 @@ def _product_scraper(*, guard_blocks: bool = False):
     return scraper
 
 
+def _empty_salaries_scraper(*, block_status=None):
+    """Stub whose read_player_salaries returns an EMPTY frame → fallback path.
+
+    ``block_status=None`` → no endpoint error recorded → genuine empty_payload
+    (soft exit 2). A status int → an http block → exit 1 (red, #790).
+    """
+    scraper = MagicMock()
+    scraper.read_player_salaries.return_value = pd.DataFrame()
+    scraper._last_endpoint_error = {'status': block_status} if block_status else None
+    scraper.__enter__ = MagicMock(return_value=scraper)
+    scraper.__exit__ = MagicMock(return_value=False)
+    return scraper
+
+
+class TestCapologyFallback:
+    """#790: a genuine empty payload stays a soft exit 2; an http block is a
+    real failure → exit 1 (red) so the DAG task fails instead of going green."""
+
+    @pytest.fixture
+    def temp_output(self):
+        fd, path = tempfile.mkstemp(suffix=".json", prefix="capology_")
+        os.close(fd)
+        yield path
+        if os.path.exists(path):
+            os.unlink(path)
+
+    @pytest.mark.unit
+    def test_genuine_empty_exits_2(self, temp_output):
+        scraper = _empty_salaries_scraper()
+        rc = _run_main(
+            ["--entity", "player_salaries", "--output", temp_output],
+            MagicMock(return_value=scraper),
+        )
+        assert rc == 2
+        scraper.save_to_iceberg.assert_not_called()
+
+    @pytest.mark.unit
+    def test_http_block_exits_1_red(self, temp_output):
+        scraper = _empty_salaries_scraper(block_status=403)
+        rc = _run_main(
+            ["--entity", "player_salaries", "--output", temp_output],
+            MagicMock(return_value=scraper),
+        )
+        assert rc == 1
+        scraper.save_to_iceberg.assert_not_called()
+        with open(temp_output) as f:
+            payload = json.load(f)
+        assert payload['fallback_reason'] == 'http_403'
+
+
 class TestCapologyReplaceGuard:
     """#583: completeness-guard wiring in the Capology runner.
 

@@ -295,6 +295,21 @@ def _merge_schedule_partition(existing, captured):
     )
 
 
+def _fallback_exit_code(reason: str) -> int:
+    """Pick the runner exit code for a soft-fallback.
+
+    An active block — SofaScore refused us (http_403/429/5xx) or a transport
+    error — is a real failure → exit 1, which the DAG bash wrapper lets turn the
+    task red (mirrors the ESPN/SoFIFA runners, #466). A genuinely empty result —
+    no matches to scrape (``no_match_ids``) or an empty page with NO http error
+    (``empty_payload``) — stays exit 2, mapped to a soft green by the wrapper so
+    an off-season / no-fixtures day never fails the daily pipeline. (#790)
+    """
+    if reason and (reason.startswith('http_') or reason == 'transport_error'):
+        return 1
+    return 2
+
+
 def _run_player_ratings(
     leagues: List[str],
     season: int,
@@ -423,7 +438,7 @@ def _run_player_ratings(
                     f'{R0_2B_FALLBACK_MARKER}: {reason}'
                 )
                 _write_results(output_path, results)
-                return 2
+                return _fallback_exit_code(results['fallback_reason'])
 
             table_path = scraper.save_to_iceberg(
                 df=df,
@@ -595,7 +610,7 @@ def _run_match_capture(
                 results['fallback_reason'] = reason
                 results['errors'].append(f'{R0_2B_FALLBACK_MARKER}: {reason}')
                 _write_results(output_path, results)
-                return 2
+                return _fallback_exit_code(results['fallback_reason'])
 
             min_ratio = None if force_replace else _MIN_REPLACE_RATIO
 
@@ -787,7 +802,7 @@ def _run_player_capture(
                 results['fallback_reason'] = reason
                 results['errors'].append(f'{R0_2B_FALLBACK_MARKER}: {reason}')
                 _write_results(output_path, results)
-                return 2
+                return _fallback_exit_code(results['fallback_reason'])
 
             min_ratio = None if force_replace else _MIN_REPLACE_RATIO
 
@@ -988,7 +1003,7 @@ def _run_event_endpoint(
                 results['fallback_reason'] = reason
                 results['errors'].append(f'{R0_2B_FALLBACK_MARKER}: {reason}')
                 _write_results(output_path, results)
-                return 2
+                return _fallback_exit_code(results['fallback_reason'])
 
             # Skip-existing guarantees the fetched DataFrame contains only
             # NEW match_ids (no overlap with bronze) → safe APPEND

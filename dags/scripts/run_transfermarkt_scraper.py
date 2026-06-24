@@ -136,6 +136,21 @@ def _classify_fallback(scraper) -> str:
     return f'http_{status}'
 
 
+def _fallback_exit_code(reason: str) -> int:
+    """Pick the runner exit code for a soft-fallback.
+
+    An active block — the source refused us (http_403/429/5xx) or a transport
+    error — is a real failure → exit 1, which the DAG bash wrapper lets turn the
+    task red (mirrors the ESPN/SoFIFA runners, #466). A genuinely empty result
+    (an empty page with NO http error → ``empty_payload``) stays exit 2, which
+    the wrapper maps to a soft green — Transfermarkt always has data for an APL
+    season, but we still reserve the soft path for the no-error case. (#790)
+    """
+    if reason and (reason.startswith('http_') or reason == 'transport_error'):
+        return 1
+    return 2
+
+
 def _run_players(
     leagues: List[str],
     season: int,
@@ -187,7 +202,7 @@ def _run_players(
                 results['fallback_reason'] = reason
                 results['errors'].append(f'{R0_2B_FALLBACK_MARKER}: {reason}')
                 _write_results(output_path, results)
-                return 2
+                return _fallback_exit_code(results['fallback_reason'])
 
             results['rows'] = int(len(df))
             results['players_with_rows'] = int(df['player_id'].nunique())
@@ -285,7 +300,7 @@ def _run_mv_history(
                 results['fallback_reason'] = reason
                 results['errors'].append(f'{R0_2B_FALLBACK_MARKER}: {reason}')
                 _write_results(output_path, results)
-                return 2
+                return _fallback_exit_code(results['fallback_reason'])
 
             results['rows'] = int(len(df))
             results['players_with_rows'] = int(df['player_id'].nunique())
@@ -386,7 +401,7 @@ def _run_transfers(
                 results['fallback_reason'] = reason
                 results['errors'].append(f'{R0_2B_FALLBACK_MARKER}: {reason}')
                 _write_results(output_path, results)
-                return 2
+                return _fallback_exit_code(results['fallback_reason'])
 
             results['rows'] = int(len(df))
             results['players_with_rows'] = int(df['player_id'].nunique())
@@ -484,7 +499,7 @@ def _run_coaches(
                 results['fallback_reason'] = reason
                 results['errors'].append(f'{R0_2B_FALLBACK_MARKER}: {reason}')
                 _write_results(output_path, results)
-                return 2
+                return _fallback_exit_code(results['fallback_reason'])
 
             results['rows'] = int(len(df))
             results['coaches_with_rows'] = int(df['coach_id'].nunique())
