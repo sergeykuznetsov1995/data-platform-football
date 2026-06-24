@@ -129,6 +129,21 @@ def _install_airflow_stubs() -> None:
 
     models_mod.Variable = _StubVariable
 
+    # ---- airflow.models.param.Param -------------------------------------
+    # UI-configurable DAG params (e.g. season backfill in dag_ingest_*). The
+    # stub just stores ``default`` so ``params={'season': Param(default=...)}``
+    # captures cleanly and tests can read the default back.
+    models_param_mod = types.ModuleType("airflow.models.param")
+
+    class _Param:
+        def __init__(self, default=None, **kw):
+            self.value = default
+            self.default = default
+            self._kw = kw
+
+    models_param_mod.Param = _Param
+    models_mod.param = models_param_mod
+
     # ---- airflow.exceptions.AirflowException ----------------------------
     class _AirflowException(Exception):
         pass
@@ -330,6 +345,7 @@ def _install_airflow_stubs() -> None:
     sys.modules["airflow"] = airflow_mod
     sys.modules["airflow.decorators"] = decorators_mod
     sys.modules["airflow.models"] = models_mod
+    sys.modules["airflow.models.param"] = models_param_mod
     sys.modules["airflow.exceptions"] = exceptions_mod
     sys.modules["airflow.operators"] = operators_mod
     sys.modules["airflow.operators.python"] = operators_python_mod
