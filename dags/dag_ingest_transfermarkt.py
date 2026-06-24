@@ -29,6 +29,7 @@ from typing import Any, Dict, List
 
 from airflow import DAG
 from airflow.exceptions import AirflowException
+from airflow.models.param import Param
 from airflow.operators.bash import BashOperator
 from airflow.operators.python import PythonOperator
 from airflow.operators.trigger_dagrun import TriggerDagRunOperator
@@ -172,7 +173,26 @@ with DAG(
         ['scraping', 'transfermarkt', 'bronze', 'football'],
     ),
     max_active_runs=1,
-    params={'leagues': LEAGUES, 'season': CURRENT_SEASON},
+    params={
+        'leagues': LEAGUES,
+        # Season is UI-configurable: the weekly scheduled run uses the default
+        # (CURRENT_SEASON); to backfill a past season, use "Trigger DAG w/ config"
+        # and set season (e.g. 2016 = 2016/17). New (league, season) partitions
+        # are written via replace_partitions, so backfilling an early season
+        # leaves all other partitions untouched (issue #717, epic #708).
+        'season': Param(
+            default=CURRENT_SEASON,
+            type='integer',
+            minimum=2000,
+            maximum=CURRENT_SEASON,
+            title='Season (start year)',
+            description=(
+                'APL season start year (2016 = 2016/17 season). '
+                'Default = current season for the weekly run. Override here to '
+                'backfill a past season (e.g. 2016…2024 for 10-season history).'
+            ),
+        ),
+    },
     doc_md="""
     ## Transfermarkt Data Ingestion (Issue #43)
 
@@ -198,12 +218,25 @@ with DAG(
     NEXT rotating roster window (``--as-of-date {{ ds }}`` → window index) and
     **upserts by player** (``replace_partitions=['league','season','player_id']``)
     so prior windows accumulate — full roster covered over ~6 weekly runs (#620).
+
+    ### Backfill past seasons (issue #717, epic #708)
+
+    Season is UI-configurable via the ``season`` Param. Use "Trigger DAG w/
+    config" and set ``season`` to a start year (e.g. 2016 = 2016/17) to ingest a
+    past season; ``replace_partitions`` keeps other ``(league, season)``
+    partitions untouched. ``players`` and ``coaches`` are full per-season crawls.
+    NOTE: ``market_value_history`` / ``transfers`` still rotate one ~100-player
+    window per run (keyed on ``{{ ds }}``), so a single backfill trigger covers
+    only one window of that season — re-trigger ~6× (or raise the limit) for full
+    MV/transfer coverage of a historical season.
     """,
 ) as dag:
 
     league = LEAGUES[0]
-    season = CURRENT_SEASON
-
+    # --season is rendered at runtime from params.season (Jinja), so the season
+    # is UI-configurable ("Trigger DAG w/ config") without a separate backfill
+    # DAG. The f-string escapes {{ }} as {{{{ }}}} so the literal Jinja tag
+    # survives into the rendered command (mirrors dag_ingest_matchhistory #710).
     players_limit_arg = f' --limit {PLAYERS_DAILY_LIMIT}' if PLAYERS_DAILY_LIMIT else ''
 
     scrape_players_task = BashOperator(
@@ -214,7 +247,7 @@ rm -f {PLAYERS_RESULT_PATH} && \\
 python dags/scripts/run_transfermarkt_scraper.py \\
     --entity players \\
     --league "{league}" \\
-    --season {season}{players_limit_arg} \\
+    --season {{{{ params.season }}}}{players_limit_arg} \\
     --output {PLAYERS_RESULT_PATH}
 rc=$?
 if [ $rc -eq 2 ]; then
@@ -239,7 +272,7 @@ rm -f {MV_HISTORY_RESULT_PATH} && \\
 python dags/scripts/run_transfermarkt_scraper.py \\
     --entity market_value_history \\
     --league "{league}" \\
-    --season {season} \\
+    --season {{{{ params.season }}}} \\
     --limit {MV_HISTORY_DAILY_LIMIT} \\
     --as-of-date {{{{ ds }}}} \\
     --output {MV_HISTORY_RESULT_PATH}
@@ -266,7 +299,7 @@ rm -f {TRANSFERS_RESULT_PATH} && \\
 python dags/scripts/run_transfermarkt_scraper.py \\
     --entity transfers \\
     --league "{league}" \\
-    --season {season} \\
+    --season {{{{ params.season }}}} \\
     --limit {TRANSFERS_DAILY_LIMIT} \\
     --as-of-date {{{{ ds }}}} \\
     --output {TRANSFERS_RESULT_PATH}
@@ -295,7 +328,7 @@ rm -f {COACHES_RESULT_PATH} && \\
 python dags/scripts/run_transfermarkt_scraper.py \\
     --entity coaches \\
     --league "{league}" \\
-    --season {season} \\
+    --season {{{{ params.season }}}} \\
     --output {COACHES_RESULT_PATH}
 rc=$?
 if [ $rc -eq 2 ]; then
@@ -329,9 +362,14 @@ exit $rc
         """
         from utils.data_quality import CHECK, run_checks
 
+        # Season comes from params (UI-configurable, #717): a backfill run gates
+        # against the season it actually scraped, not CURRENT_SEASON — otherwise
+        # the checks query an empty (league, current-season) partition and the
+        # ERROR row_count gate fails the historical run.
+        season = int(ctx['params']['season'])
         season_short = (
-            f"{str(CURRENT_SEASON)[2:4]}"
-            f"{(int(str(CURRENT_SEASON)[2:4]) + 1) % 100:02d}"
+            f"{str(season)[2:4]}"
+            f"{(int(str(season)[2:4]) + 1) % 100:02d}"
         )
         where = f"league = '{LEAGUES[0]}' AND season = '{season_short}'"
         checks = [
@@ -339,9 +377,15 @@ exit $rc
                 'bronze.transfermarkt_players',
                 min_rows=400, where=where, severity='ERROR',
             ),
+            # PK includes current_club_id: a player can legitimately appear in
+            # two clubs' squads within one historical season (mid-season
+            # transfer / loan — e.g. Sancho, Rashford in 2024/25), so the raw
+            # Bronze grain is (league, season, player_id, club). Keying on
+            # player_id alone false-flagged ~9–31 such rows per backfilled
+            # season as duplicates (#717). Silver dedups to per-player.
             CHECK.no_duplicates(
                 'bronze.transfermarkt_players',
-                pk=['league', 'season', 'player_id'],
+                pk=['league', 'season', 'player_id', 'current_club_id'],
                 where=where, severity='ERROR',
             ),
             CHECK.no_nulls(
