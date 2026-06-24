@@ -114,3 +114,30 @@ class TestESPNScraper:
         # Assert
         mock_save.assert_called_once()
         assert mock_save.call_args.kwargs['min_replace_ratio'] == 0.9
+
+    def test_read_lineup_skips_malformed_match(self, scraper):
+        """#713: soccerdata's bulk read_lineup aborts the whole season on one
+        match with malformed JSON (KeyError 'displayName'). read_lineup must
+        iterate per match and skip only the broken one — good matches still land."""
+        sched = pd.DataFrame({'game_id': [101, 102, 103]})
+        good1 = pd.DataFrame({'player': ['A'], 'team': ['X']})
+        good3 = pd.DataFrame({'player': ['B'], 'team': ['Y']})
+
+        reader = MagicMock()
+
+        def fake_lineup(match_id=None):
+            if match_id == 102:
+                raise KeyError('displayName')
+            return good1 if match_id == 101 else good3
+
+        reader.read_lineup.side_effect = fake_lineup
+
+        with patch.object(scraper, '_get_reader', return_value=reader), \
+             patch.object(scraper, '_execute_with_resilience', return_value=sched), \
+             patch.object(scraper, '_add_metadata', side_effect=lambda d, e: d):
+            result = scraper.read_lineup()
+
+        # Malformed match 102 skipped (no raise); 101 + 103 concatenated.
+        assert result is not None
+        assert len(result) == 2
+        assert set(result['player']) == {'A', 'B'}
