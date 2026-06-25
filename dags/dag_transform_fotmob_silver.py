@@ -430,15 +430,23 @@ def _validate_silver_quality(**context) -> Dict[str, Any]:
             max_val=10,
             severity='WARNING',
         ),
+        # xG/xA exist on FotMob only from 2020/21 onward — the 2016/17–2019/20
+        # backfill (#714) has ~0% xG at source. Scope the coverage floor to the
+        # xG-era seasons so the check stays strict for modern data (catches an
+        # xG-ingest regression) without failing on history FotMob never had.
+        # season is a varchar short-slug ('1617'..'2526'); lexical >= '2021'
+        # selects exactly 2020/21+. (#804)
         CHECK.coverage(
             'silver.fotmob_team_match',
             column='expected_goals',
+            where="season >= '2021'",
             warn_threshold=0.95,
             error_threshold=0.80,
         ),
         CHECK.coverage(
             'silver.fotmob_team_match',
             column='expected_assists',
+            where="season >= '2021'",
             warn_threshold=0.95,
             error_threshold=0.80,
         ),
