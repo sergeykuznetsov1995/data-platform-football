@@ -246,6 +246,9 @@ def _validate_silver_quality(**context) -> Dict[str, Any]:
             warn_threshold=0.88,
             error_threshold=0.80,
             severity='WARNING',
+            # #803: меряем покрытие только за последний (текущий) сезон —
+            # canonical за историю намеренно NULL (xref не историзирован, #788).
+            where="season = (SELECT max(season) FROM iceberg.silver.transfermarkt_players)",
             name='canonical_coverage[silver.transfermarkt_players]',
         ),
 
@@ -321,6 +324,8 @@ def _validate_silver_quality(**context) -> Dict[str, Any]:
             warn_threshold=0.88,
             error_threshold=0.80,
             severity='WARNING',
+            # #803: покрытие только за последний (текущий) сезон.
+            where="season = (SELECT max(season) FROM iceberg.silver.transfermarkt_market_value_history)",
             name='canonical_coverage[silver.transfermarkt_market_value_history]',
         ),
 
@@ -389,6 +394,8 @@ def _validate_silver_quality(**context) -> Dict[str, Any]:
             warn_threshold=0.88,
             error_threshold=0.80,
             severity='WARNING',
+            # #803: покрытие только за последний (текущий) сезон.
+            where="season = (SELECT max(season) FROM iceberg.silver.transfermarkt_transfers)",
             name='canonical_coverage[silver.transfermarkt_transfers]',
         ),
 

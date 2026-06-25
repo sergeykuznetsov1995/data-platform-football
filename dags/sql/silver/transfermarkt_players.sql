@@ -51,6 +51,16 @@ xp AS (
     FROM iceberg.silver.xref_player
     WHERE source = 'transfermarkt'
       AND confidence <> 'orphan'
+      -- #803: canonical только за последний (текущий) сезон. На тонком
+      -- историческом FBref-spine резолвер даёт ложные совпадения (один
+      -- canonical → много игроков) → 24963 дубля (canonical_id, mv_date) в
+      -- transfermarkt_market_value_history. История остаётся canonical=NULL
+      -- до историзации xref (#788).
+      AND season = (
+          SELECT max(season)
+          FROM iceberg.silver.xref_player
+          WHERE source = 'transfermarkt'
+      )
 )
 
 SELECT
