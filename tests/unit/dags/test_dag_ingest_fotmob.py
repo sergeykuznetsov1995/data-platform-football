@@ -102,3 +102,46 @@ class TestFotmobBashOperatorEnv:
         assert task.env is not None, "explicit env dict must be set"
         assert "PYTHONPATH" in task.env
         assert "/opt/airflow" in task.env["PYTHONPATH"]
+
+
+class TestFotmobSeasonBackfillParam:
+    """#714: season must be a UI-configurable Param wired into the scrape
+    command via Jinja, so past seasons can be backfilled with "Trigger DAG
+    w/ config" (mirrors ESPN #713 / MatchHistory #710)."""
+
+    @pytest.mark.unit
+    def test_season_is_ui_configurable_param(self):
+        """``params['season']`` must be an Airflow ``Param`` defaulting to the
+        current season (not a bare int) so the UI exposes a season override."""
+        mod = _reload_dag_module()
+
+        from airflow.models.param import Param  # stub
+        from utils.config import CURRENT_SEASON
+
+        season = mod.dag._dag_kwargs["params"]["season"]
+        assert isinstance(season, Param), (
+            "season must be wrapped in a Param so it is UI-configurable for "
+            "backfill, not a hardcoded int"
+        )
+        assert season.default == CURRENT_SEASON, (
+            "the daily scheduled run must still default to CURRENT_SEASON"
+        )
+
+    @pytest.mark.unit
+    def test_scrape_command_renders_season_from_params(self):
+        """The bash command must pass ``--season {{ params.season }}`` (Jinja),
+        NOT a hardcoded season literal — otherwise the UI override is ignored
+        and every run scrapes CURRENT_SEASON."""
+        _reload_dag_module()
+
+        from airflow.operators.bash import BashOperator  # stub
+
+        task = next(
+            op for op in BashOperator._instances
+            if op.task_id == "scrape_fotmob_data"
+        )
+
+        assert "--season {{ params.season }}" in task.bash_command, (
+            "season must be rendered from params.season at runtime so the "
+            "backfill override takes effect"
+        )
