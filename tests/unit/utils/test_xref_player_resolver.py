@@ -873,7 +873,7 @@ class TestDedupCanonicalPerSeason:
         # #720: ESPN source_id is '<name>|<team>'. A within-season transfer
         # resolves both club-stints to the SAME canonical_id. Collapsing them
         # would drop one club's row, and fct_lineup's ESPN JOIN (keyed on
-        # raw_team_name) would NULL that club's player_id. ESPN is exempt.
+        # raw_team_name) would NULL that club's player_id. Same-name stints stay.
         a = {**_xrow('fb_palmer', 'espn', 'Cole Palmer|Manchester City'),
              'raw_team_name': 'Manchester City'}
         b = {**_xrow('fb_palmer', 'espn', 'Cole Palmer|Chelsea'),
@@ -882,6 +882,45 @@ class TestDedupCanonicalPerSeason:
         assert len(out) == 2
         assert {r['raw_team_name'] for r in out} == {'Manchester City', 'Chelsea'}
         assert removed == {}
+
+    def test_espn_namesake_false_match_demoted_to_orphan(self):
+        # #803: surname tier binds a DIFFERENT player onto an existing canonical
+        # on the thin historical spine (Steven Sessegnon → Ryan's fb_id). The
+        # strongest-tier identity (Ryan, name_team) keeps the canonical; the
+        # weaker (Steven, name_team_surname) is demoted to an es_<source_id>
+        # orphan so it cannot pollute the real canonical in Gold.
+        ryan = _xrow('fb_sessegnon', 'espn', 'Ryan Sessegnon|Fulham',
+                     confidence='name_team', season='1819')
+        steven = _xrow('fb_sessegnon', 'espn', 'Steven Sessegnon|Fulham',
+                       confidence='name_team_surname', season='1819')
+        out, removed = xpr._dedup_canonical_per_season([ryan, steven])
+        assert len(out) == 2
+        kept = [r for r in out if r['canonical_id'] == 'fb_sessegnon']
+        demoted = [r for r in out if r['confidence'] == 'orphan']
+        assert len(kept) == 1 and kept[0]['source_id'] == 'Ryan Sessegnon|Fulham'
+        assert len(demoted) == 1
+        assert demoted[0]['source_id'] == 'Steven Sessegnon|Fulham'
+        assert demoted[0]['canonical_id'] == 'es_Steven Sessegnon|Fulham'
+        assert removed == {'espn': 1}
+
+    def test_espn_multiteam_owner_keeps_all_stints_demotes_namesake(self):
+        # #803: combined case — Jonjo Shelvey legitimately at two clubs (#720)
+        # PLUS George Shelvey false-matched via surname. Owner = Jonjo (name_team
+        # beats name_team_surname); BOTH Jonjo club-stints survive, George only
+        # is demoted to orphan.
+        jonjo_a = _xrow('fb_shelvey', 'espn', 'Jonjo Shelvey|Nottingham Forest',
+                        confidence='name_team', season='2223')
+        jonjo_b = _xrow('fb_shelvey', 'espn', 'Jonjo Shelvey|Newcastle United',
+                        confidence='name_team', season='2223')
+        george = _xrow('fb_shelvey', 'espn', 'George Shelvey|Nottingham Forest',
+                       confidence='name_team_surname', season='2223')
+        out, removed = xpr._dedup_canonical_per_season([jonjo_a, jonjo_b, george])
+        kept = {r['source_id'] for r in out if r['canonical_id'] == 'fb_shelvey'}
+        assert kept == {'Jonjo Shelvey|Nottingham Forest',
+                        'Jonjo Shelvey|Newcastle United'}
+        demoted = [r for r in out if r['confidence'] == 'orphan']
+        assert len(demoted) == 1 and demoted[0]['source_id'] == 'George Shelvey|Nottingham Forest'
+        assert removed == {'espn': 1}
 
 
 # ---------------------------------------------------------------------------

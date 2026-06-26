@@ -388,10 +388,19 @@ def build_xref_player_checks() -> List[Check]:
 
         # Issue #70: prevent the fan-out pattern that prompted the Gold
         # ROW_NUMBER hack. A single canonical_id legitimately has one
-        # source_id per (source, league, season); >1 means a Gold JOIN on
-        # (source, source_id) without (league, season) will fan-out 2×.
-        # Dedup is enforced in xref_player_resolver._dedup_canonical_per_season;
-        # this gate makes regressions visible.
+        # *player* per (source, league, season); >1 distinct player means a
+        # Gold JOIN on (source, source_id) without (league, season) will
+        # fan-out 2×. Dedup is enforced in
+        # xref_player_resolver._dedup_canonical_per_season; this gate makes
+        # regressions visible.
+        #
+        # #803: count DISTINCT *player identity*, not source_id. ESPN's
+        # source_id is the '<name>|<team>' composite, so one player with two
+        # club-stints in a season (legit transfer, #720) is two source_ids on
+        # one canonical — NOT a fan-out. split_part(source_id,'|',1) collapses
+        # the team suffix to the player name; for every other source source_id
+        # has no '|' so split_part is a no-op (returns it unchanged). The check
+        # therefore fires only on TRUE different-player collisions.
         CHECK.row_count(
             table=table,
             min_rows=0,
@@ -402,7 +411,7 @@ def build_xref_player_checks() -> List[Check]:
                 "FROM iceberg.silver.xref_player "
                 "WHERE confidence <> 'orphan' "
                 "GROUP BY canonical_id, source, league, season "
-                "HAVING COUNT(DISTINCT source_id) > 1"
+                "HAVING COUNT(DISTINCT split_part(source_id, '|', 1)) > 1"
                 ") AND confidence <> 'orphan'"
             ),
             severity='ERROR',
@@ -583,6 +592,7 @@ def evaluate_orphan_rate_per_source(
     table: str = 'iceberg.silver.xref_player',
     warning_threshold: float = 10.0,
     error_threshold: float = 25.0,
+    current_season_only: bool = False,
 ) -> Dict[str, Any]:
     """Compute orphan-rate per ``source`` for an xref table and classify.
 
@@ -603,14 +613,28 @@ def evaluate_orphan_rate_per_source(
       * warning < pct ≤ error          — WARNING
       * pct > error_threshold          — ERROR
 
+    ``current_season_only`` (#803): when True, the rate is measured only on the
+    latest season (``season = (SELECT max(season) FROM <table>)``). After a
+    historical backfill the table spans ~10 seasons whose old, thin FBref spine
+    leaves most source rows legitimately orphan (#788) — table-wide that inflates
+    the rate into a false ERROR (fotmob 28.8% / xref_team TM 86.9%), while the
+    current season — where the spine is thick — is the meaningful resolver-health
+    signal (1.3% / 0%). Sources absent in the latest season drop out of the
+    GROUP BY and are simply not evaluated.
+
     NOTE: This function does NOT raise. Callers decide whether to escalate.
     """
     qualified = _qualify(table)
+    where = (
+        f"WHERE season = (SELECT max(season) FROM {qualified}) "
+        if current_season_only else ""
+    )
     sql = (
         "SELECT source, "
         "       COUNT(*) AS total, "
         "       COUNT_IF(confidence = 'orphan') AS orphans "
         f"FROM {qualified} "
+        f"{where}"
         "GROUP BY source"
     )
     conn = _get_conn()
