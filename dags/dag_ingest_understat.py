@@ -22,6 +22,7 @@ from typing import Any, Dict
 
 from airflow import DAG
 from airflow.exceptions import AirflowException
+from airflow.models.param import Param
 from airflow.operators.bash import BashOperator
 from airflow.operators.python import PythonOperator
 
@@ -125,7 +126,24 @@ with DAG(
     dagrun_timeout=timedelta(hours=3),
     params={
         'leagues': LEAGUES,
-        'season': CURRENT_SEASON,
+        # UI-configurable season for the 10-season backfill (#712, epic #708).
+        # Default = CURRENT_SEASON so the daily scheduled run is unchanged;
+        # override via "Trigger DAG w/ config" to ingest a past season.
+        'season': Param(
+            default=CURRENT_SEASON,
+            type='integer',
+            minimum=2000,
+            maximum=CURRENT_SEASON,
+            title='Season (start year)',
+            description=(
+                'APL season start year (2016 = 2016/17). Default = current '
+                'season for the daily run. Override here to backfill a past '
+                'season (2016…2019 closes the 10-season history). NB: '
+                'soccerdata #213 — the integer 2021 is read as slug 2021 '
+                '(=2020/21), so do NOT backfill 2021/22 via this Param (it '
+                'already exists as slug 2122).'
+            ),
+        ),
     },
     doc_md="""
     ## Understat Data Ingestion
@@ -163,7 +181,7 @@ with DAG(
 cd /opt/airflow && \\
 python dags/scripts/run_understat_scraper.py \\
     --leagues "{leagues_str}" \\
-    --season {CURRENT_SEASON} \\
+    --season {{{{ params.season }}}} \\
     --output /tmp/understat_result.json
 """,
         env={
