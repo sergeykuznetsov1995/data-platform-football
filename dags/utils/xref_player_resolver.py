@@ -1953,8 +1953,16 @@ def run_resolver(
         ss = _fetch_sofascore_players(conn, league, source_seasons)
         logger.info("  %d SofaScore players", len(ss))
 
-        logger.info("Reading Transfermarkt players ...")
-        tm = _fetch_transfermarkt_players(conn, league, source_seasons)
+        # #803: resolve TM only for the latest (current) season. On the thin
+        # historical FBref spine the fuzzy cascade false-matches many TM players
+        # onto one canonical_id (241 per-canonical-season collisions over the
+        # 10-season #793 backfill). Those rows are unused by TM Silver (canonical
+        # scoped to current season, #806) but polluted the shared xref_player.
+        # Other sources keep full-history resolution; TM history stays
+        # unresolved until xref is historized (#788).
+        tm_seasons = [max(source_seasons)] if source_seasons else source_seasons
+        logger.info("Reading Transfermarkt players (current season %s) ...", tm_seasons)
+        tm = _fetch_transfermarkt_players(conn, league, tm_seasons)
         logger.info("  %d Transfermarkt players", len(tm))
 
         logger.info("Reading Capology players ...")
