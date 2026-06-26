@@ -1091,7 +1091,7 @@ class TransfermarktScraper(BaseScraper):
                 'market_value_last_update': bio.get('market_value_last_update'),
                 'current_club_id': sp['club_id'],
                 'current_club_name': (
-                    bio.get('current_club_name') or sp.get('current_club_name')
+                    sp.get('current_club_name') or bio.get('current_club_name')
                 ),
             }
             rows.append(row)
