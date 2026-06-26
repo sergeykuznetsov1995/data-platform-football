@@ -1659,6 +1659,33 @@ def _resolve_all(
     return out, review, stats
 
 
+#: #803: confidence-tier strength for ESPN canonical-collision resolution
+#: (smaller = stronger). When two different ESPN players land on one canonical
+#: in a season, the strongest-tier match owns it; the others are demoted to
+#: orphan. Mirrors the resolver tier cascade order.
+_ESPN_TIER_RANK: Dict[str, int] = {
+    'exact': 0,
+    'name_team': 1,
+    'name_team_alias': 2,
+    'name_team_nickname': 3,
+    'name_team_subset': 4,
+    'name_team_surname': 5,
+    'name_team_jersey': 6,
+    'name_team_dob': 7,
+}
+
+
+def _espn_identity(row: Dict[str, Any]) -> str:
+    """Player identity behind an ESPN ``source_id`` (``'<name>|<team>'``).
+
+    The name part is the stable identity; the team part varies across
+    within-season transfers. Used by :func:`_dedup_canonical_per_season` to
+    tell a legit multi-team stint (same name, #720) from a surname-tier false
+    match (different names) sharing one canonical (#803).
+    """
+    return str(row.get('source_id', '')).split('|', 1)[0]
+
+
 def _dedup_canonical_per_season(
     rows: List[Dict[str, Any]],
 ) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
@@ -1683,16 +1710,21 @@ def _dedup_canonical_per_season(
     their canonical_id is source-private (``orphan:<...>``) so they cannot
     fan-out a real canonical in Gold.
 
-    ESPN rows are also exempt (#720). ESPN has no native player_id, so
-    ``source_id`` is the ``'<name>|<team>'`` composite and a within-season
-    transfer resolves both club-stints to the SAME canonical_id. Its only
-    downstream consumer — ``gold/fct_lineup.sql`` — JOINs on
+    ESPN gets per-identity handling (#720 + #803). ESPN has no native
+    player_id, so ``source_id`` is the ``'<name>|<team>'`` composite and a
+    within-season transfer resolves both club-stints to the SAME canonical_id.
+    Its only downstream consumer — ``gold/fct_lineup.sql`` — JOINs on
     ``(display_name, raw_team_name, league, season)``, which disambiguates by
-    club, so the two transfer rows are legitimate stints, NOT the fan-out this
-    function targets. Collapsing them would drop one club's row and NULL that
-    club's player_id in fct_lineup. ESPN Bronze rows are already unique per
-    ``(player, team, league, season)`` (``_fetch_espn_players`` GROUP BY), so
-    passing them through introduces no true duplicates.
+    club, so two stints of the SAME name are legitimate, NOT the fan-out this
+    function targets, and both survive (#720). But on a thin historical FBref
+    spine the surname tier can bind a DIFFERENT player onto an existing
+    canonical (e.g. ``Steven Sessegnon|Fulham`` onto Ryan's ``fb_…``). When a
+    canonical carries ≥2 distinct name-identities in one season, the
+    strongest-confidence-tier identity owns it (keeping all its club-stints)
+    and the rest are demoted to orphan (#803) so they cannot pollute the real
+    canonical. ESPN Bronze rows are unique per ``(player, team, league,
+    season)`` (``_fetch_espn_players`` GROUP BY), so same-name pass-through
+    introduces no true duplicates.
 
     Returns ``(deduped_rows, removed_per_source)``.
     """
@@ -1700,9 +1732,20 @@ def _dedup_canonical_per_season(
 
     out: List[Dict[str, Any]] = []
     groups: Dict[Tuple[str, str, str, str], List[Dict[str, Any]]] = defaultdict(list)
+    # #803: ESPN is no longer blanket-exempt — collected separately so a
+    # canonical bound to two DIFFERENT players in one season can be resolved
+    # (same-name multi-team stints still pass through, see below).
+    espn_groups: Dict[Tuple[str, str, str], List[Dict[str, Any]]] = defaultdict(list)
     for row in rows:
-        if row.get('confidence') == 'orphan' or row.get('source') == 'espn':
+        if row.get('confidence') == 'orphan':
             out.append(row)
+            continue
+        if row.get('source') == 'espn':
+            espn_groups[(
+                row['canonical_id'],
+                row['league'],
+                str(row['season']),
+            )].append(row)
             continue
         key = (
             row['canonical_id'],
@@ -1731,6 +1774,32 @@ def _dedup_canonical_per_season(
         winner = max(members, key=_tie_key)
         out.append(winner)
         removed[winner['source']] += len(members) - 1
+
+    # #803: ESPN canonical-collision resolution. One name-identity per canonical
+    # per season is the invariant; ≥2 distinct identities ⇒ keep the
+    # strongest-tier owner (all its club-stints) and demote the rest to orphan
+    # so a surname-tier false match cannot pollute a real canonical in Gold.
+    for members in espn_groups.values():
+        if len({_espn_identity(m) for m in members}) <= 1:
+            out.extend(members)
+            continue
+        best_rank = min(
+            _ESPN_TIER_RANK.get(m.get('confidence'), 99) for m in members
+        )
+        contenders = [
+            m for m in members
+            if _ESPN_TIER_RANK.get(m.get('confidence'), 99) == best_rank
+        ]
+        owner = _espn_identity(max(contenders, key=_tie_key))
+        for m in members:
+            if _espn_identity(m) == owner:
+                out.append(m)
+            else:
+                demoted = dict(m)
+                demoted['canonical_id'] = f"{_orphan_prefix('espn')}_{m['source_id']}"
+                demoted['confidence'] = 'orphan'
+                out.append(demoted)
+                removed['espn'] += 1
 
     return out, dict(removed)
 

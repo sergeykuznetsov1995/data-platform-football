@@ -301,21 +301,29 @@ def _validate_xref(**context) -> Dict[str, Any]:
     # coaches (#144) are noisier than team/player, so they get looser bands —
     # surfaced in the report, but won't fail the DAG below the error threshold.
     # ------------------------------------------------------------------
+    # #803: team/player orphan-rate is measured on the CURRENT season only.
+    # After the historical backfill these tables span ~10 seasons whose thin
+    # old FBref spine leaves most rows legitimately orphan (#788) — table-wide
+    # that turns into a false ERROR (fotmob 28.8%, xref_team TM 86.9%), while
+    # the current season is the real resolver-health signal (1.3%, 0%).
+    # Referee/manager stay table-wide: looser bands, not season-historized the
+    # same way, and not breaching — left untouched pending their own evidence.
     orphan_rates: Dict[str, Any] = {}
-    for entity, table, warn_t, err_t in (
-        ('team', 'iceberg.silver.xref_team', 10.0, 25.0),
-        ('player', 'iceberg.silver.xref_player', 10.0, 25.0),
+    for entity, table, warn_t, err_t, current_only in (
+        ('team', 'iceberg.silver.xref_team', 10.0, 25.0, True),
+        ('player', 'iceberg.silver.xref_player', 10.0, 25.0, True),
         # Referee feeds are noisier (initial-only MatchHistory forms) and have
         # no DOB disambiguator → looser band (issue #143).
-        ('referee', 'iceberg.silver.xref_referee', 15.0, 35.0),
+        ('referee', 'iceberg.silver.xref_referee', 15.0, 35.0, False),
         # manager (#144): FotMob orphans expected at worldwide scale → soft band.
-        ('manager', 'iceberg.silver.xref_manager', 25.0, 60.0),
+        ('manager', 'iceberg.silver.xref_manager', 25.0, 60.0, False),
     ):
         try:
             res = evaluate_orphan_rate_per_source(
                 table=table,
                 warning_threshold=warn_t,
                 error_threshold=err_t,
+                current_season_only=current_only,
             )
         except Exception as e:
             logger.exception("orphan_rate evaluation failed for %s", table)

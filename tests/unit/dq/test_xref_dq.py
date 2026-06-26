@@ -429,9 +429,12 @@ def test_xref_player_no_duplicates_per_canonical_season_check():
     assert chk.params['max_rows'] == 0
     where = chk.params['where']
     # The WHERE filters rows whose (canonical_id, source, league, season)
-    # appears more than once with distinct source_ids — the exact fan-out
-    # pattern that prompted the Gold ROW_NUMBER hack we just removed.
-    assert "COUNT(DISTINCT source_id) > 1" in where
+    # appears more than once with distinct *player identities* — the exact
+    # fan-out pattern that prompted the Gold ROW_NUMBER hack we just removed.
+    # #803: split_part(source_id,'|',1) so ESPN's '<name>|<team>' multi-team
+    # stints (same player, two clubs) are NOT counted as a collision; only
+    # genuinely different players trip the gate.
+    assert "COUNT(DISTINCT split_part(source_id, '|', 1)) > 1" in where
     assert "GROUP BY canonical_id, source, league, season" in where
     assert "confidence <> 'orphan'" in where
 
@@ -575,6 +578,42 @@ def test_orphan_rate_handles_empty_table(duck_conn):
     assert res['per_source'] == {}
     assert res['verdict'] == 'OK'
     assert res['breaches'] == []
+
+
+def test_orphan_rate_current_season_only_excludes_history(duck_conn):
+    """#803: a historical season heavy with orphans (thin old FBref spine,
+    #788) must NOT red the gate when ``current_season_only=True`` — only the
+    latest season is measured."""
+    duck_conn.execute(
+        "INSERT INTO iceberg.silver.xref_player VALUES "
+        # fotmob 2019 — 100 rows, 90 orphans → 90% (would be ERROR table-wide)
+        + ", ".join(
+            f"('fm_h{i}', 'fotmob', 'h{i}', 'H{i}', 'ENG', '1920', "
+            f"{'\'orphan\'' if i < 90 else '\'name_team\''}, NULL)"
+            for i in range(100)
+        )
+        + ", "
+        # fotmob 2025 — 100 rows, 2 orphans → 2% (current season = healthy)
+        + ", ".join(
+            f"('fm_c{i}', 'fotmob', 'c{i}', 'C{i}', 'ENG', '2526', "
+            f"{'\'orphan\'' if i < 2 else '\'name_team\''}, NULL)"
+            for i in range(100)
+        )
+    )
+
+    table_wide = xref_dq.evaluate_orphan_rate_per_source(
+        table='iceberg.silver.xref_player',
+    )
+    assert table_wide['per_source']['fotmob']['verdict'] == 'ERROR'
+
+    current = xref_dq.evaluate_orphan_rate_per_source(
+        table='iceberg.silver.xref_player',
+        current_season_only=True,
+    )
+    assert current['per_source']['fotmob']['orphans'] == 2
+    assert current['per_source']['fotmob']['verdict'] == 'OK'
+    assert current['verdict'] == 'OK'
+    assert current['breaches'] == []
 
 
 # ===========================================================================
