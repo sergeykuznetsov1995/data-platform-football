@@ -256,6 +256,17 @@ def _install_airflow_stubs() -> None:
 
     operators_bash_mod.BashOperator = _BashOperator
 
+    # ---- airflow.operators.empty.EmptyOperator --------------------------
+    # No-op marker operator (start/end markers in dag_transform_e3 etc.).
+    # Behaves like PythonOperator for DAG-load tests (instance-tracked,
+    # supports >>/<< topology wiring).
+    operators_empty_mod = types.ModuleType("airflow.operators.empty")
+
+    class _EmptyOperator(_PythonOperator):
+        pass
+
+    operators_empty_mod.EmptyOperator = _EmptyOperator
+
     # ---- airflow.sensors.external_task.ExternalTaskSensor ---------------
     class _ExternalTaskSensor(_PythonOperator):
         pass
@@ -351,6 +362,7 @@ def _install_airflow_stubs() -> None:
     sys.modules["airflow.operators.python"] = operators_python_mod
     sys.modules["airflow.operators.trigger_dagrun"] = operators_trigger_mod
     sys.modules["airflow.operators.bash"] = operators_bash_mod
+    sys.modules["airflow.operators.empty"] = operators_empty_mod
     sys.modules["airflow.sensors"] = sensors_mod
     sys.modules["airflow.sensors.external_task"] = sensors_ext_mod
     sys.modules["airflow.utils"] = utils_mod
@@ -364,6 +376,7 @@ def _install_airflow_stubs() -> None:
     airflow_mod.operators = operators_mod
     operators_mod.python = operators_python_mod
     operators_mod.bash = operators_bash_mod
+    operators_mod.empty = operators_empty_mod
     operators_mod.trigger_dagrun = operators_trigger_mod
     airflow_mod.sensors = sensors_mod
     airflow_mod.utils = utils_mod

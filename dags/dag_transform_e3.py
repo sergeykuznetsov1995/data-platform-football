@@ -292,6 +292,22 @@ SILVER_E3_TRANSFORMS = [
     ),
 ]
 
+# Graceful-degrade for Silver tables whose Bronze source is OPTIONAL (#812).
+# Keyed by table_name → required Bronze table(s) + an empty-schema fallback SQL.
+# When any required Bronze table is absent, `_run_silver_e3` runs the fallback
+# (identical schema, zero rows) instead of failing on TABLE_NOT_FOUND — which
+# otherwise cascades to the whole Gold layer (gold_e3 here AND
+# dag_transform_fbref_gold's dim_venue). Mirrors the run_gold_transform
+# require_silver/fallback_sql_file pattern used across dag_transform_fbref_gold.
+SILVER_E3_FALLBACKS = {
+    # bronze.sofascore_venue is written only when a SofaScore capture pass
+    # carries a `.venue` block (#753) — absent until then.
+    'sofascore_venue': {
+        'require_bronze': ['sofascore_venue'],
+        'fallback_sql_file': 'dags/sql/silver/sofascore_venue_empty.sql',
+    },
+}
+
 GOLD_E3_TRANSFORMS = [
     (
         'fct_event',
@@ -329,14 +345,39 @@ GOLD_E3_PARTITION_COLUMNS = ['league', 'season']
 # (the DAG parser must NOT pull ``scrapers/__init__.py`` ~1.5 GB).
 # ---------------------------------------------------------------------------
 
-def _run_silver_e3(sql_file: str, table_name: str, **context) -> Dict[str, Any]:
+def _run_silver_e3(
+    sql_file: str,
+    table_name: str,
+    require_bronze=None,
+    fallback_sql_file: str = None,
+    **context,
+) -> Dict[str, Any]:
     """Run an E3 Silver CTAS via :func:`utils.silver_tasks.run_silver_transform`.
 
     Thin wrapper -- exists only so the DAG can hand a uniform callable to
     every PythonOperator in ``silver_e3`` (and so the row-count returned
     by the runner is logged in a consistent format).
+
+    Graceful-degrade (#812): when ``require_bronze`` is given and any of those
+    Bronze tables is absent (optional source not yet populated, e.g.
+    bronze.sofascore_venue per #753), build ``fallback_sql_file`` instead — an
+    identical-schema, zero-row table — so the contract stays intact and the
+    Gold layer does not fail on TABLE_NOT_FOUND.
     """
-    from utils.silver_tasks import run_silver_transform
+    from utils.silver_tasks import check_bronze_table_exists, run_silver_transform
+
+    if require_bronze and fallback_sql_file:
+        missing = [
+            t for t in require_bronze
+            if not check_bronze_table_exists(table_name=t, schema='bronze')
+        ]
+        if missing:
+            logger.warning(
+                "silver_e3.%s: required Bronze table(s) %s not found — "
+                "falling back to '%s' (empty table, identical schema).",
+                table_name, missing, fallback_sql_file,
+            )
+            sql_file = fallback_sql_file
 
     result = run_silver_transform(
         sql_file=sql_file,
@@ -469,13 +510,16 @@ with DAG(
     with TaskGroup(group_id='silver_e3') as silver_group:
         prev = None
         for task_id, sql_file, table_name in SILVER_E3_TRANSFORMS:
+            op_kwargs = {
+                'sql_file': sql_file,
+                'table_name': table_name,
+            }
+            # Optional Bronze source → empty-schema fallback when absent (#812).
+            op_kwargs.update(SILVER_E3_FALLBACKS.get(table_name, {}))
             t = PythonOperator(
                 task_id=task_id,
                 python_callable=_run_silver_e3,
-                op_kwargs={
-                    'sql_file': sql_file,
-                    'table_name': table_name,
-                },
+                op_kwargs=op_kwargs,
             )
             if prev is not None:
                 prev >> t
