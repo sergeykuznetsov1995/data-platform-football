@@ -140,15 +140,17 @@ ws_name_to_id AS (
 -- TM/Capology team universe не имеет schedule → bridge через xref_team
 -- (source='transfermarkt'/'capology', добавлены в xref_team.sql.j2). Покрытие —
 -- только APL season slug '2526'; для прочих сезонов колонки останутся NULL.
+-- #814: dedup 2 TM-алиасов на canonical (MAX+GROUP BY) — синхрон с .sql.j2.
 xref_tm AS (
-    SELECT DISTINCT
+    SELECT
         canonical_id,
-        source_id                                         AS tm_club_name,
+        MAX(source_id)                                    AS tm_club_name,
         league,
         season                                            AS season_slug
     FROM iceberg.silver.xref_team
     WHERE source = 'transfermarkt'
       AND confidence <> 'orphan'
+    GROUP BY canonical_id, league, season
 ),
 
 xref_cap AS (

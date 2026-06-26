@@ -192,7 +192,11 @@ class TestStarGateDimFk:
 
     def test_player_money_dim_player_fks(self):
         """issue #430: salary / fifa_rating keep orphan ids ('cap_' / 'sf_'),
-        so the dim_player FK is WARNING rate-mode, not zero-tolerance ERROR."""
+        so the dim_player FK is WARNING rate-mode, not zero-tolerance ERROR.
+        #814: the #712 rebuild first populated these facts and exposed that the
+        canonical resolver matches neither capology nor sofifa — 100% orphan even
+        in the current season (resolver gap tracked in #815). error_rate dropped
+        to None (WARNING-only, never escalates) until coverage is restored."""
         for child in ('gold.fct_player_salary', 'gold.fct_player_fifa_rating'):
             checks = [
                 c for c in _build()
@@ -204,7 +208,8 @@ class TestStarGateDimFk:
             chk = checks[0]
             assert chk.params['key'] == 'player_id'
             assert chk.severity == 'WARNING'
-            assert chk.params['warn_rate'] <= chk.params['error_rate']
+            assert chk.params['warn_rate'] is not None
+            assert chk.params['error_rate'] is None  # #814 WARNING-only
 
     def test_player_facts_point_at_dim_player(self):
         """The design FK is player -> dim_player (NOT dim_player_attributes,
