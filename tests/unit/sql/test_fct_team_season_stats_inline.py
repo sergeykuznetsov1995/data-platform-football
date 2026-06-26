@@ -342,3 +342,35 @@ class TestAuditDiffCoverage:
             f"_AUDIT_INTENTIONAL_GAPS содержит ключи вне source_priority.yaml: "
             f"{sorted(stale)} — удали устаревшие записи (#740)."
         )
+
+
+@pytest.mark.unit
+class TestXrefTmDedup:
+    """#814: canonical-keyed мост xref_tm обязан схлопываться до 1 строки на
+    (canonical_id, league, season). silver.xref_team несёт 2 transfermarkt-
+    алиаса на canonical в сезоне (напр. 'Liverpool'/'Liverpool FC',
+    'Sheff Utd'/'Sheffield United') → SELECT DISTINCT по source_id оставляет оба,
+    и LEFT JOIN xref_tm двоит грейн (team_id,league,season) ×2 (18 дублей,
+    всплывших при пересборке #712). GROUP BY — структурный guard от регресса."""
+
+    def test_xref_tm_grouped_one_row_per_canonical_season(self):
+        tree = sqlglot.parse_one(_main_body(), read="trino")
+        cte = next((c for c in tree.find_all(sqlglot.exp.CTE)
+                    if c.alias_or_name == "xref_tm"), None)
+        assert cte is not None, "xref_tm CTE отсутствует в fct_team_season_stats"
+        group = cte.this.args.get("group")
+        assert group is not None, (
+            "xref_tm без GROUP BY → 2 TM-алиаса на canonical двоят грейн "
+            "fct_team_season_stats (#814). Сворачивай через MAX+GROUP BY."
+        )
+        group_cols = {e.sql(dialect="trino") for e in group.expressions}
+        assert {"canonical_id", "league", "season"} <= group_cols, (
+            f"xref_tm GROUP BY должен включать (canonical_id, league, season), "
+            f"получено {sorted(group_cols)}"
+        )
+        # tm_club_name берётся агрегатом (MAX), а не сырым source_id.
+        tm_expr = _cte_proj_map(_main_body(), "xref_tm")["tm_club_name"]
+        assert "MAX(" in tm_expr.upper(), (
+            f"tm_club_name должен агрегироваться (MAX) для дедупа, получено "
+            f"{tm_expr!r}"
+        )
