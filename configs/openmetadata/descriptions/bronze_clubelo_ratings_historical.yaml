@@ -4,9 +4,11 @@
 table:
   fullyQualifiedName: trino_iceberg.iceberg.bronze.clubelo_ratings_historical
   description: |
-    Еженедельные снимки клубных ELO-рейтингов с clubelo.com за последние ~365 дней
-    (метод soccerdata read_by_date в цикле +7 дней, через scrapers/clubelo,
-    dag_ingest_clubelo_full, еженедельно). Grain — один row на клуб за дату снимка.
+    Еженедельные снимки клубных ELO-рейтингов с clubelo.com (метод soccerdata
+    read_by_date в цикле +7 дней, через scrapers/clubelo). Скрейпится gated-веткой
+    dag_ingest_clubelo (воскресенье / ручной триггер run_full=True, #716);
+    еженедельный refresh покрывает последние ~365 дней, разовый бэкфилл #716 —
+    ~10 сезонов АПЛ. Grain — один row на клуб за дату снимка.
     Партиционирование ['rating_date']. Отличие от clubelo_ratings: rating_date —
     varchar 'YYYY-MM-DD' (строка нужна, чтобы replace_partitions строил корректный
     DELETE-фильтр).

@@ -143,3 +143,54 @@ class TestClubEloReplaceGuard:
         assert rc == 0
         kwargs = scraper.save_to_iceberg.call_args.kwargs
         assert kwargs["min_replace_ratio"] is None
+
+
+class TestFullModeDaysBack:
+    """#716: --mode full forwards --days-back to scrape_historical_ratings."""
+
+    @pytest.fixture
+    def temp_output(self):
+        fd, path = tempfile.mkstemp(suffix=".json", prefix="clubelo_")
+        os.close(fd)
+        yield path
+        if os.path.exists(path):
+            os.unlink(path)
+
+    @pytest.mark.unit
+    def test_days_back_and_force_replace_forwarded(self, temp_output):
+        """--mode full --days-back 3650 --force-replace → historical scrape gets
+        days_back=3650, force_replace=True (the deep #716 backfill)."""
+        scraper = _build_guard_scraper()
+        scraper.scrape_historical_ratings.return_value = {
+            'historical_ratings': 'iceberg.bronze.clubelo_ratings_historical',
+            'rows': 42,
+        }
+
+        rc = _run_main(
+            ["--leagues", "ENG-Premier League", "--mode", "full",
+             "--days-back", "3650", "--force-replace", "--output", temp_output],
+            MagicMock(return_value=scraper),
+        )
+
+        assert rc == 0
+        kwargs = scraper.scrape_historical_ratings.call_args.kwargs
+        assert kwargs["days_back"] == 3650
+        assert kwargs["force_replace"] is True
+
+    @pytest.mark.unit
+    def test_days_back_defaults_to_365(self, temp_output):
+        """--mode full without --days-back keeps the recurring 365-day refresh."""
+        scraper = _build_guard_scraper()
+        scraper.scrape_historical_ratings.return_value = {
+            'historical_ratings': 'iceberg.bronze.clubelo_ratings_historical',
+            'rows': 7,
+        }
+
+        rc = _run_main(
+            ["--leagues", "ENG-Premier League", "--mode", "full",
+             "--output", temp_output],
+            MagicMock(return_value=scraper),
+        )
+
+        assert rc == 0
+        assert scraper.scrape_historical_ratings.call_args.kwargs["days_back"] == 365

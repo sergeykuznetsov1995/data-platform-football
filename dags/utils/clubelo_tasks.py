@@ -1,16 +1,60 @@
 """
-Shared task callables for the ClubElo ingestion DAGs.
+Shared task callables for the ClubElo ingestion DAG.
 
-``validate_data`` is used by both ``dag_ingest_clubelo`` (daily) and
-``dag_ingest_clubelo_full`` (weekly). It lives here instead of a DAG file so
-neither DAG module imports the other — a cross-DAG import makes Airflow
-auto-register the imported DAG against the importing file and DagBag drops
-one of them as a duplicate (#488).
+One source = one DAG (#716): the former weekly ``dag_ingest_clubelo_full`` is
+folded into ``dag_ingest_clubelo`` as a gated branch. ``validate_data`` (daily
+current ratings) and ``gate_full_ratings`` (the Sunday/manual ShortCircuit gate
+for the heavy historical scrape) both live here rather than in the DAG module —
+keeping them importable for unit tests without parsing the DAG, and avoiding the
+cross-DAG import that made DagBag drop a duplicate (#488).
 """
 
 from typing import Any, Dict
 
 from airflow.exceptions import AirflowException
+
+
+def gate_full_ratings(**context) -> bool:
+    """ShortCircuitOperator hook — TRUE means "run the heavy historical scrape".
+
+    The historical-ratings scrape is full-state and weekly-sampled (a one-time
+    #716 backfill can span ~520 weekly snapshots, ~10 APL seasons), too heavy to
+    run on the daily path. It is gated so it runs only when:
+
+      - a manual "Trigger DAG w/ config" sets ``run_full=True`` (on demand —
+        used for the deep backfill, usually with ``days_back``/``force_replace``); or
+      - this is the DAG's OWN Sunday scheduled run — the weekly cadence the
+        former ``dag_ingest_clubelo_full`` had (``0 4 * * 0``).
+
+    Skipped otherwise: weekday scheduled runs, or any external trigger (e.g.
+    ``dag_master_pipeline``) — so the daily pipeline never waits on the heavy
+    historical scrape. Returning False short-circuits the downstream scrape to
+    ``skipped``.
+    """
+    import logging
+
+    logger = logging.getLogger(__name__)
+
+    params = context.get('params') or {}
+    if params.get('run_full'):
+        logger.info("run_full=True → running historical scrape on demand.")
+        return True
+
+    dag_run = context.get('dag_run')
+    if getattr(dag_run, 'external_trigger', False):
+        logger.info(
+            "External trigger (e.g. dag_master_pipeline) → skip historical "
+            "scrape to keep the daily pipeline fast."
+        )
+        return False
+
+    logical_date = context.get('logical_date') or context.get('execution_date')
+    if logical_date is not None and logical_date.weekday() == 6:  # Sunday
+        logger.info("Sunday scheduled run → running weekly historical scrape.")
+        return True
+
+    logger.info("Not Sunday and not forced → skip historical scrape.")
+    return False
 
 
 def validate_data(**context) -> Dict[str, Any]:
