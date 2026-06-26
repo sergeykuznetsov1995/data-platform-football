@@ -58,6 +58,15 @@ def main():
              'shrinks the existing partition. Use for a deliberate first '
              'backfill or a known legitimate shrink.'
     )
+    parser.add_argument(
+        '--days-back',
+        type=int,
+        default=365,
+        help='How many days of history to weekly-sample in --mode full '
+             '(default 365 = the recurring weekly refresh). Use a large value '
+             'for a one-time deep backfill, e.g. 3650 ≈ 10 seasons of APL '
+             '(issue #716). Ignored in --mode daily.'
+    )
     args = parser.parse_args()
 
     leagues = [l.strip() for l in args.leagues.split(',')]
@@ -128,7 +137,8 @@ def main():
                 # --- Stage 2: historical ratings (non-critical) ---
                 try:
                     hist = scraper.scrape_historical_ratings(
-                        force_replace=args.force_replace
+                        days_back=args.days_back,
+                        force_replace=args.force_replace,
                     )
                     if hist.get('historical_ratings'):
                         results['tables'].append(hist['historical_ratings'])

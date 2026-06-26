@@ -544,10 +544,11 @@ def _star_gate_dim_fk_checks() -> List:
         # APL ClubElo names resolve to dim_team canonicals via xref_team, but a
         # name absent from team_aliases.yaml falls back to a 'ce_<slug>' orphan
         # (kept by design, rule 2). WARNING rate-mode polices the orphan share.
-        # Baseline 2026-06-15: 6.1% (168/2760) — 138 are 'Forest' (Nottingham
-        # Forest unmapped in team_aliases.yaml) + 30 relegated teams present
-        # only in clubelo_ratings_historical; both tracked in #589. Falls to
-        # ~1.1% once #589 lands (still passes the 2% warn floor then).
+        # Baseline 2026-06-15: 6.1% (168/2760) — 'Forest' + relegated teams
+        # present only in clubelo_ratings_historical (#589). After the #716
+        # 10-season backfill + an xref_team rebuild it is 0% live (13180 rows,
+        # 34 historical APL teams all resolve) — comfortably under the 2% warn
+        # floor. Re-baseline here if a future clubelo name lands unmapped.
         CHECK.ref_integrity('gold.fct_team_elo', 'gold.dim_team', 'team_id',
                             warn_rate=0.02, error_rate=0.10, severity='WARNING'),
 
