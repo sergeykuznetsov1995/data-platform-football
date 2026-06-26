@@ -283,8 +283,16 @@ es_resolved AS (
           AND xt_a.league    = s.league
           AND xt_a.season    = CAST(s.season AS varchar)
     WHERE s.game_id IS NOT NULL
-)
+),
 
+-- =============================================================================
+-- unioned — 7-source cascade, one block per source. Wrapped in a CTE so the
+-- final SELECT can enforce the PK (canonical_id, source) invariant: a source
+-- whose bronze schedule carries the same physical match under two season
+-- labels (e.g. ESPN '2021' = a copy of '1920', #809) would otherwise emit two
+-- rows with identical (canonical_id, source). See dedup below.
+-- =============================================================================
+unioned AS (
 
 -- =============================================================================
 -- FBref spine — emits the canonical row per match
@@ -456,3 +464,47 @@ LEFT JOIN fbref_base fb
       -- date+canonical teams already uniquely identify the match, so keeping
       -- season out of the predicate is behaviour-stable (no fan-out).
 GROUP BY 1, 2, 3, 4, 5, 6, 7, 8
+
+),  -- end unioned
+
+-- =============================================================================
+-- Dedup to the PK (canonical_id, source) — #809
+-- =============================================================================
+-- The cascade bridges to the FBref spine on (date, teams, league) WITHOUT
+-- season (#404), emitting each source row's OWN season. When a source's bronze
+-- schedule carries one physical match under two season labels (ESPN '2021' is a
+-- byte-for-byte copy of '1920'), that source emits two rows sharing one
+-- canonical_id — violating the declared PK. Keep exactly one row per
+-- (canonical_id, source), preferring the row whose season matches the FBref
+-- spine's season for that canonical (the ground truth), so the bogus duplicate
+-- season is dropped rather than the real one. Single-row groups (the normal
+-- case, and all orphans which carry a unique source-prefixed canonical_id) keep
+-- rn=1 unchanged — behaviour-stable except for the intended dedup.
+fbref_season AS (
+    -- One season per canonical from the FBref spine. MIN()+GROUP BY guarantees
+    -- a single row per canonical so the LEFT JOIN below cannot fan out.
+    SELECT canonical_id, MIN(season) AS fb_season
+    FROM unioned
+    WHERE source = 'fbref'
+    GROUP BY canonical_id
+)
+SELECT
+    canonical_id,
+    source,
+    source_id,
+    display_name,
+    league,
+    season,
+    confidence,
+    match_score
+FROM (
+    SELECT
+        u.*,
+        ROW_NUMBER() OVER (
+            PARTITION BY u.canonical_id, u.source
+            ORDER BY CASE WHEN u.season = fs.fb_season THEN 0 ELSE 1 END, u.season
+        ) AS _rn
+    FROM unioned u
+    LEFT JOIN fbref_season fs ON fs.canonical_id = u.canonical_id
+)
+WHERE _rn = 1
