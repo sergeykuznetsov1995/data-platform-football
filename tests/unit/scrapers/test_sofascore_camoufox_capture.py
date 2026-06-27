@@ -795,3 +795,93 @@ class TestCapturePlayerSeasonBuffer:
         out = cap.capture_player(7, season_picker_label=None)
         assert out["season_buffer"] == {}
         assert out["profile"] == {"id": 7}
+
+
+# --------------------------------------------------------------------------- #
+#  paginate_tournament_season (#824)                                          #
+# --------------------------------------------------------------------------- #
+class TestPaginateTournamentSeason:
+    """paginate_tournament_season drives an in-page fetch of a SPECIFIC season's
+    ``/events/last/{page}`` so a historical-season backfill is not empty (#824).
+    We fake ``_page`` so no browser is needed and assert the URL sequence + the
+    loop-termination logic (no-next / empty page / max_pages)."""
+
+    class _RecordingPage:
+        def __init__(self, results):
+            self._results = list(results)
+            self.paths = []
+
+        def evaluate(self, js, arg=None):
+            self.paths.append(arg)
+            return self._results.pop(0) if self._results else {
+                "ok": False, "count": 0, "more": False}
+
+        def wait_for_timeout(self, ms):
+            pass
+
+    def _cap(self, results):
+        from scrapers.sofascore.camoufox_capture import SofascoreCamoufoxCapture
+        cap = SofascoreCamoufoxCapture(proxy=None)
+        cap._page = self._RecordingPage(results)
+        cap._buffer = {"sentinel": 1}
+        return cap
+
+    def test_pages_until_no_next_then_stops(self):
+        cap = self._cap([
+            {"ok": True, "count": 10, "more": True},
+            {"ok": True, "count": 10, "more": True},
+            {"ok": True, "count": 5, "more": False},   # last page
+        ])
+        out = cap.paginate_tournament_season(17, 12345)
+        # Exactly 3 fetches, paged 0..2 with the season-scoped path.
+        assert cap._page.paths == [
+            "/api/v1/unique-tournament/17/season/12345/events/last/0",
+            "/api/v1/unique-tournament/17/season/12345/events/last/1",
+            "/api/v1/unique-tournament/17/season/12345/events/last/2",
+        ]
+        # Returns the buffer snapshot (a copy of self._buffer).
+        assert out == {"sentinel": 1}
+
+    def test_stops_on_empty_events_page(self):
+        cap = self._cap([
+            {"ok": True, "count": 10, "more": True},
+            {"ok": True, "count": 0, "more": True},    # empty → stop even if more
+        ])
+        cap.paginate_tournament_season(17, 12345)
+        assert len(cap._page.paths) == 2
+
+    def test_stops_on_failed_page(self):
+        cap = self._cap([
+            {"ok": True, "count": 10, "more": True},
+            {"ok": False, "count": 0, "more": False},  # fetch !ok → stop
+        ])
+        cap.paginate_tournament_season(17, 12345)
+        assert len(cap._page.paths) == 2
+
+    def test_respects_max_pages_cap(self):
+        # Every page says there is more — the cap is the only stop.
+        cap = self._cap([{"ok": True, "count": 10, "more": True}] * 10)
+        cap.paginate_tournament_season(17, 12345, max_pages=3)
+        assert len(cap._page.paths) == 3
+
+    def test_evaluate_exception_breaks_gracefully(self):
+        from scrapers.sofascore.camoufox_capture import SofascoreCamoufoxCapture
+
+        class _BoomPage:
+            def __init__(self):
+                self.paths = []
+
+            def evaluate(self, js, arg=None):
+                self.paths.append(arg)
+                raise RuntimeError("page closed")
+
+            def wait_for_timeout(self, ms):
+                pass
+
+        cap = SofascoreCamoufoxCapture(proxy=None)
+        cap._page = _BoomPage()
+        cap._buffer = {"x": 1}
+        # Must not raise; returns whatever buffer was captured.
+        out = cap.paginate_tournament_season(17, 999)
+        assert out == {"x": 1}
+        assert len(cap._page.paths) == 1

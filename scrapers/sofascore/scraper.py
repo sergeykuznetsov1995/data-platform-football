@@ -257,6 +257,12 @@ class SofaScoreScraper(SoccerdataScraper):
                 self._rate_limiter.acquire()
                 with SofascoreCamoufoxCapture(proxy=proxy) as cap:
                     buffer = cap.capture_tournament(nav_url)
+                    # The landing serves only the CURRENT/next season; page the
+                    # TARGET season's events in so a historical backfill is not
+                    # empty (#824). For the current season this is a no-op-ish
+                    # extra (same sid) the year-filter below keeps consistent.
+                    buffer = self._capture_season_buffer(
+                        cap, buffer, ut_id, target_season_year)
             except Exception as e:  # noqa: BLE001 — capture must not crash the run
                 logger.warning("capture schedule failed for league=%s: %s",
                                league, e)
@@ -292,6 +298,41 @@ class SofaScoreScraper(SoccerdataScraper):
         out = pd.concat(frames, ignore_index=True)
         out = self._add_metadata(out, 'schedule')
         return out
+
+    def _capture_season_buffer(self, cap, buffer, ut_id, target_year):
+        """Resolve ``target_year``'s SofaScore ``season_id`` from a landing
+        ``buffer`` and page that season's events into the buffer so a historical
+        season is captured (#824).
+
+        The tournament landing only fires the CURRENT/next season's
+        ``/events/...`` XHR, so :func:`extract_tournament_events` finds nothing
+        for a past season. We resolve the target sid the same way
+        :meth:`read_league_table` does — the captured ``/seasons`` map first,
+        then the events' own ``season.id`` as a fallback — then drive
+        :meth:`SofascoreCamoufoxCapture.paginate_tournament_season` on the same
+        (already-navigated) page. Returns the extended buffer, or the original
+        unchanged when the season can't be resolved (the caller's
+        ``season.year`` filter then yields nothing → no save, no pollution)."""
+        from scrapers.sofascore.camoufox_capture import (
+            extract_tournament_events,
+            extract_tournament_seasons_map,
+        )
+
+        target_sid = extract_tournament_seasons_map(buffer, ut_id).get(target_year)
+        if target_sid is None:
+            for ev in extract_tournament_events(buffer, ut_id):
+                s = ev.get('season') or {}
+                if s.get('year') == target_year and s.get('id') is not None:
+                    target_sid = int(s['id'])
+                    break
+        if target_sid is None:
+            logger.warning(
+                "Season %s unresolved from /seasons or events for ut=%s — "
+                "page may serve a different season; skipping season paging.",
+                target_year, ut_id,
+            )
+            return buffer
+        return cap.paginate_tournament_season(ut_id, int(target_sid))
 
     def read_league_table(self) -> Optional[pd.DataFrame]:
         """Read league standings via Camoufox capture (#777).
@@ -887,19 +928,21 @@ class SofaScoreScraper(SoccerdataScraper):
         """Resolve finished match_ids for ``(league, season)`` by capturing the
         SofaScore league page through Camoufox (#757 B1).
 
-        The soccerdata/tls schedule path is Turnstile-blocked, so when
-        ``bronze.sofascore_schedule`` is empty (e.g. a fresh season) we navigate
-        the league page, let the SPA fire its ``/events/{round,last}`` XHR, and
-        pull the finished matches from the captured JSON. Returns ``[]`` when the
-        league has no SofaScore slug/ut_id, capture fails, or no finished match
-        is on the page (off-season). ``season`` is currently informational — the
-        league page serves the CURRENT season (the new-season daily use case);
-        past-season resolution still relies on ``bronze.sofascore_schedule``.
+        The soccerdata/tls schedule path is Turnstile-blocked, so we navigate
+        the league page, page the TARGET ``season``'s ``/events/last`` XHR in
+        (the landing serves only the current/next season — #824), and pull the
+        finished matches from the captured JSON. ``season`` is a YEAR int (e.g.
+        ``2024`` → 24/25): we resolve its SofaScore ``season_id`` and keep only
+        events whose ``season.year`` matches, so a past-season backfill is not
+        empty and a current-season page never mislabels another season's
+        matches. Returns ``[]`` when the league has no SofaScore slug/ut_id,
+        capture fails, the season is unresolved, or no finished match exists.
         """
         from scrapers.sofascore.camoufox_capture import (
             SofascoreCamoufoxCapture,
             extract_tournament_events,
             finished_event_ids,
+            season_short_to_label,
         )
 
         ut_id = self._resolve_unique_tournament_id(league)
@@ -911,21 +954,36 @@ class SofaScoreScraper(SoccerdataScraper):
             )
             return []
 
+        # season is a YEAR int (2024); the events carry the '24/25' year label.
+        season_str = str(season)
+        if len(season_str) == 4 and season_str.isdigit():
+            season_short = f"{season_str[2:4]}{int(season_str[2:4]) + 1:02d}"
+        else:
+            season_short = season_str
+        target_year = season_short_to_label(season_short)  # '2425' -> '24/25'
+
         nav_url = f"https://www.sofascore.com/tournament/{slug}/{ut_id}"
         proxy = self._camoufox_proxy()
         try:
             self._rate_limiter.acquire()
             with SofascoreCamoufoxCapture(proxy=proxy) as cap:
                 buffer = cap.capture_tournament(nav_url)
+                buffer = self._capture_season_buffer(
+                    cap, buffer, ut_id, target_year)
         except Exception as e:  # noqa: BLE001 — capture failure must not crash the run
             logger.warning("capture schedule failed for league=%s: %s", league, e)
             return []
 
         events = extract_tournament_events(buffer, ut_id)
+        events = [
+            ev for ev in events
+            if (ev.get('season') or {}).get('year') == target_year
+        ]
         match_ids = finished_event_ids(events)
         logger.info(
-            "Capture schedule league=%s season=%s: %d ut=%d events, %d finished.",
-            league, season, len(events), ut_id, len(match_ids),
+            "Capture schedule league=%s season=%s (year=%s): %d ut=%d events, "
+            "%d finished.",
+            league, season, target_year, len(events), ut_id, len(match_ids),
         )
         return match_ids
 

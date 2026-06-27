@@ -677,6 +677,62 @@ class SofascoreCamoufoxCapture:
         self._page.wait_for_timeout(self._settle_ms)
         return dict(self._buffer)
 
+    def paginate_tournament_season(
+        self, ut_id, season_id, max_pages: int = 25,
+    ) -> Dict[str, dict]:
+        """Page a SPECIFIC season's finished events on the ALREADY-NAVIGATED
+        tournament page, so a historical-season backfill sees the target
+        season's matches (#824).
+
+        The landing only fires the CURRENT/next season's ``/events/...`` XHR, so
+        :func:`extract_tournament_events` finds nothing for a past season. Here
+        we drive an in-page ``fetch`` of ``/unique-tournament/{ut}/season/{sid}/
+        events/last/{page}`` for page=0.. until a page returns no events or
+        ``hasNextPage`` is false. The page already passed Turnstile on
+        navigation, so a same-origin fetch carries the clearance cookie; each
+        response is captured by :meth:`_on_response` into ``self._buffer`` (keyed
+        by path) and read back by :func:`extract_tournament_events`. Returns the
+        whole buffer. Best-effort: a failed/challenged page stops the loop,
+        leaving whatever paged in. Call within the SAME capture session right
+        after a tournament navigation (no re-nav — that would re-warm Turnstile
+        and burn the rate-limit budget)."""
+        base = (
+            f"/api/v1/unique-tournament/{int(ut_id)}/season/{int(season_id)}"
+            "/events/last/"
+        )
+        pages = 0
+        for page in range(max_pages):
+            try:
+                res = self._page.evaluate(
+                    """async (path) => {
+                        try {
+                            const r = await fetch(path, {credentials: 'include',
+                                headers: {'accept': 'application/json'}});
+                            if (!r.ok) return {ok: false, count: 0, more: false};
+                            const j = await r.json();
+                            const ev = Array.isArray(j.events) ? j.events : [];
+                            return {ok: true, count: ev.length,
+                                    more: !!j.hasNextPage};
+                        } catch (e) { return {ok: false, count: 0, more: false}; }
+                    }""",
+                    base + str(page),
+                )
+            except Exception as e:  # noqa: BLE001 — paging is best-effort
+                logger.info("sofascore season-paging ut=%s sid=%s page=%s: %s",
+                            ut_id, season_id, page, e)
+                break
+            self._page.wait_for_timeout(self._tab_wait_ms)
+            if not res or not res.get("ok") or not res.get("count"):
+                break
+            pages += 1
+            if not res.get("more"):
+                break
+        logger.info("sofascore season-paging ut=%s sid=%s: %d page(s).",
+                    ut_id, season_id, pages)
+        # Let the last response bodies settle into the buffer before snapshot.
+        self._page.wait_for_timeout(self._settle_ms)
+        return dict(self._buffer)
+
     def _nudge_results(self) -> None:
         """Surface FINISHED matches: open the 'Matches' top-nav, then switch to
         the BY DATE view (centres on recent/finished matches for an in-progress
