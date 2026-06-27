@@ -57,6 +57,9 @@ class ESPNScraper(SoccerdataScraper):
     ):
         super().__init__(leagues=leagues, seasons=seasons, **kwargs)
         self._reader = None
+        # #817: guards the one-shot COVID-season calendar seed (see
+        # _seed_2021_season_calendar) so it re-downloads at most once per run.
+        self._covid_2021_seeded = False
 
     def _get_reader(self):
         """Get soccerdata ESPN reader."""
@@ -73,6 +76,48 @@ class ESPNScraper(SoccerdataScraper):
                 raise
         return self._reader
 
+    # ESPN public scoreboard API (matches soccerdata.espn.ESPN_API).
+    _ESPN_API = "http://site.api.espn.com/apis/site/v2/sports/soccer"
+
+    def _seed_2021_season_calendar(self, reader) -> None:
+        """Work around a soccerdata anchor bug for the COVID-disrupted 2020-21
+        season (#817).
+
+        soccerdata's ``read_schedule`` discovers a season's match dates from the
+        ESPN scoreboard at July 1 of the start year (``espn.py``:
+        ``start_date = 20{skey[:2]}0701``). For season code ``'2021'`` that is
+        ``2020-07-01`` — which falls INSIDE the COVID-extended 2019-20 Premier
+        League season (it ran to 2020-07-26). ESPN therefore returns the
+        *2019-20* calendar, and the "2020-21" scrape silently lands a byte-copy
+        of 2019-20 under partition ``season='2021'`` (no real 2020-21 data).
+
+        Fix: overwrite soccerdata's calendar cache file for that anchor with the
+        scoreboard from a post-COVID anchor (``2020-08-01``), whose ESPN calendar
+        is the real 2020-21 season (2020-09-12 … 2021-05-23). soccerdata then
+        reads the correct dates and fetches the right matches. ``MAXAGE=None``
+        means the seeded file is trusted on every subsequent read this run.
+
+        No-op for every other season (the daily run uses the current season).
+        """
+        if self._covid_2021_seeded:
+            return
+        if '2021' not in {str(s) for s in (self.seasons or [])}:
+            return
+        for league_id in reader._selected_leagues.values():
+            # soccerdata's calendar cache path for the buggy July-1 anchor.
+            seed_fp = reader.data_dir / f"Schedule_{league_id}_20200701.json"
+            url = f"{self._ESPN_API}/{league_id}/scoreboard?dates=20200801"
+            logger.info(
+                "ESPN #817: seeding real 2020-21 calendar for %s "
+                "(post-COVID anchor 2020-08-01 -> %s)",
+                league_id, seed_fp.name,
+            )
+            # no_cache=True forces a fresh download even if a stale (2019-20)
+            # calendar file is already cached; reuses soccerdata's get() so the
+            # request goes through the same proxy/retry machinery.
+            reader.get(url, seed_fp, no_cache=True)
+        self._covid_2021_seeded = True
+
     def read_schedule(self) -> Optional[pd.DataFrame]:
         """
         Read match schedule and results.
@@ -81,6 +126,7 @@ class ESPNScraper(SoccerdataScraper):
             DataFrame with match schedule
         """
         reader = self._get_reader()
+        self._seed_2021_season_calendar(reader)
         logger.info("Fetching ESPN schedule")
 
         try:
@@ -141,6 +187,9 @@ class ESPNScraper(SoccerdataScraper):
         (resilience for #713 historical backfill).
         """
         reader = self._get_reader()
+        # #817: per-match readers also discover game_ids via read_schedule, so
+        # the COVID-season calendar must be seeded here too (idempotent).
+        self._seed_2021_season_calendar(reader)
         logger.info(f"Fetching ESPN {entity} (per-match, resilient)")
         sched = self._execute_with_resilience(reader.read_schedule)
         if sched is None or sched.empty:

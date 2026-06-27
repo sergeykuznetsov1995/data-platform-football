@@ -2,6 +2,8 @@
 Tests for ESPNScraper.
 """
 
+from pathlib import Path
+
 import pytest
 import pandas as pd
 from unittest.mock import MagicMock, patch
@@ -26,11 +28,27 @@ class TestESPNScraper:
             yield
 
     @pytest.fixture
-    def scraper(self, mock_dependencies):
+    def make_scraper(self, mock_dependencies):
+        """Factory: build an ESPNScraper for arbitrary seasons."""
+        def _make(seasons):
+            with patch.dict('sys.modules', {'soccerdata': MagicMock()}):
+                from scrapers.espn import ESPNScraper
+                return ESPNScraper(leagues=['ENG-Premier League'], seasons=seasons)
+        return _make
+
+    @pytest.fixture
+    def scraper(self, make_scraper):
         """Create ESPNScraper instance."""
-        with patch.dict('sys.modules', {'soccerdata': MagicMock()}):
-            from scrapers.espn import ESPNScraper
-            return ESPNScraper(leagues=['ENG-Premier League'], seasons=[2024])
+        return make_scraper([2024])
+
+    @staticmethod
+    def _mock_reader():
+        """A soccerdata-reader stand-in with the attributes the COVID-2021
+        calendar seed touches (espn.py uses these exact names)."""
+        reader = MagicMock()
+        reader._selected_leagues = {'ENG-Premier League': 'eng.1'}
+        reader.data_dir = Path('/tmp/espn_test')
+        return reader
 
     def test_init(self, scraper):
         """Test ESPNScraper initialization."""
@@ -141,3 +159,61 @@ class TestESPNScraper:
         assert result is not None
         assert len(result) == 2
         assert set(result['player']) == {'A', 'B'}
+
+    def test_seed_2021_calendar_overrides_covid_anchor(self, make_scraper):
+        """#817: soccerdata anchors the ESPN season calendar at July 1 of the
+        start year (espn.py: 20{skey[:2]}0701). For 2020-21 (season code '2021')
+        that's 2020-07-01, which falls INSIDE the COVID-extended 2019-20 PL
+        season (ended 2020-07-26) — so ESPN returns the 2019-20 calendar. The
+        seed must overwrite that calendar cache file with a post-COVID anchor
+        (2020-08-01) so soccerdata reads the real 2020-21 dates."""
+        scraper = make_scraper(['2021'])
+        reader = self._mock_reader()
+
+        scraper._seed_2021_season_calendar(reader)
+
+        reader.get.assert_called_once()
+        url = reader.get.call_args.args[0]
+        seed_fp = reader.get.call_args.args[1]
+        assert 'eng.1' in url
+        assert 'dates=20200801' in url
+        assert Path(seed_fp) == reader.data_dir / 'Schedule_eng.1_20200701.json'
+        assert reader.get.call_args.kwargs['no_cache'] is True
+
+    def test_seed_2021_calendar_noop_for_other_seasons(self, make_scraper):
+        """The COVID workaround must touch ONLY season '2021' — the daily run
+        (season '2526') and every other backfill season are left untouched."""
+        scraper = make_scraper(['2526'])
+        reader = self._mock_reader()
+
+        scraper._seed_2021_season_calendar(reader)
+
+        reader.get.assert_not_called()
+
+    def test_seed_2021_calendar_runs_at_most_once(self, make_scraper):
+        """read_schedule and the per-match readers each seed defensively; the
+        helper must be idempotent so it re-downloads the calendar at most once
+        per process."""
+        scraper = make_scraper(['2021'])
+        reader = self._mock_reader()
+
+        scraper._seed_2021_season_calendar(reader)
+        scraper._seed_2021_season_calendar(reader)
+
+        reader.get.assert_called_once()
+
+    def test_read_schedule_seeds_2021_calendar_before_read(self, make_scraper):
+        """Wiring: read_schedule must seed the 2020-21 calendar before handing
+        off to soccerdata — otherwise soccerdata reads the wrong (2019-20)
+        calendar and the seed never takes effect."""
+        scraper = make_scraper(['2021'])
+        reader = self._mock_reader()
+
+        with patch.object(scraper, '_get_reader', return_value=reader), \
+             patch.object(scraper, '_seed_2021_season_calendar') as mock_seed, \
+             patch.object(scraper, '_execute_with_resilience',
+                          return_value=pd.DataFrame()), \
+             patch.object(scraper, '_add_metadata', side_effect=lambda d, e: d):
+            scraper.read_schedule()
+
+        mock_seed.assert_called_once_with(reader)
