@@ -231,6 +231,41 @@ class TestPlayerCaptureTasks:
         assert captured.get('telegram') is True
 
 
+class TestSeasonParam:
+    """#711 (epic #708): the season must be a UI Param defaulting to
+    CURRENT_SEASON so the scheduled daily run keeps ingesting the current
+    season unchanged, while a "Trigger DAG w/ config" override can backfill a
+    past season."""
+
+    def test_season_param_default_is_current_season(self, dag_module):
+        from utils.config import CURRENT_SEASON
+
+        season_param = dag_module.dag._dag_kwargs['params']['season']
+        # conftest's _Param stub stores the default (real Param also exposes it).
+        assert season_param.default == CURRENT_SEASON
+
+
+class TestSeasonRenderedFromParams:
+    """#711: every scrape task must inject the season via Jinja so an
+    overridden season (backfill) reaches the scraper — not a baked-in current
+    season. Covers the three bash tasks that scrape per (league, season):
+    schedule (legacy), match_capture (fouls → match_stats), player_capture."""
+
+    @pytest.mark.parametrize('task_id', [
+        'scrape_sofascore_data',
+        'scrape_match_capture',
+        'scrape_player_capture',
+    ])
+    def test_scrape_task_renders_season_from_params(self, dag_module, task_id):
+        task = _bash_task(task_id)
+        assert task is not None, f"missing task {task_id}"
+        # f-string collapses {{{{ }}}} -> {{ }}, so the literal Jinja tag
+        # survives into the rendered bash_command.
+        assert '--season {{ params.season }}' in task.bash_command, (
+            f"{task_id} does not render season from params"
+        )
+
+
 class TestValidatePlayerData:
     def _write(self, dag_module, monkeypatch, tmp_path, result):
         import json

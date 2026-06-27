@@ -33,6 +33,7 @@ from typing import Any, Dict, List
 
 from airflow import DAG
 from airflow.exceptions import AirflowException
+from airflow.models.param import Param
 from airflow.operators.bash import BashOperator
 from airflow.operators.python import PythonOperator, ShortCircuitOperator
 
@@ -450,7 +451,24 @@ with DAG(
     max_active_runs=1,
     params={
         'leagues': LEAGUES,
-        'season': CURRENT_SEASON,
+        # UI-configurable season for the 10-season backfill (#711, epic #708).
+        # Default = CURRENT_SEASON so the daily scheduled run is unchanged;
+        # override via "Trigger DAG w/ config" to ingest a past season. The
+        # season is the APL start year (2016 = 2016/17); the runner derives the
+        # soccerdata short form ("1617") from it.
+        'season': Param(
+            default=CURRENT_SEASON,
+            type='integer',
+            minimum=2000,
+            maximum=CURRENT_SEASON,
+            title='Season (start year)',
+            description=(
+                'APL season start year (2016 = 2016/17). Default = current '
+                'season for the daily run. Override here to backfill a past '
+                'season (2016…2024 closes the 10-season history → unblocks '
+                'fouls home-vs-away for #558).'
+            ),
+        ),
         # #782: force the heavy per-player capture in this run. Normally it
         # auto-runs only on the DAG's own Saturday scheduled run (see
         # _gate_player_capture); set True via "Trigger DAG w/ config" for an
@@ -514,7 +532,7 @@ cd /opt/airflow && \\
 rm -f {SCHEDULE_RESULT_PATH} && \\
 python dags/scripts/run_sofascore_scraper.py \\
     --leagues "{leagues_str}" \\
-    --season {CURRENT_SEASON} \\
+    --season {{{{ params.season }}}} \\
     --output {SCHEDULE_RESULT_PATH}
 """,
         env={
@@ -540,7 +558,7 @@ rm -f {MATCH_CAPTURE_RESULT_PATH} && \\
 python dags/scripts/run_sofascore_scraper.py \\
     --entity match_capture \\
     --league "{LEAGUES[0]}" \\
-    --season {CURRENT_SEASON} \\
+    --season {{{{ params.season }}}} \\
     --output {MATCH_CAPTURE_RESULT_PATH}
 rc=$?
 if [ $rc -eq 2 ]; then
@@ -596,7 +614,7 @@ rm -f {PLAYER_CAPTURE_RESULT_PATH} && \\
 python dags/scripts/run_sofascore_scraper.py \\
     --entity player_capture \\
     --league "{LEAGUES[0]}" \\
-    --season {CURRENT_SEASON} \\
+    --season {{{{ params.season }}}} \\
     {_limit_arg(PLAYER_CAPTURE_LIMIT)} \\
     --output {PLAYER_CAPTURE_RESULT_PATH}
 rc=$?
