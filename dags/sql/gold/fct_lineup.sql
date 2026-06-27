@@ -596,6 +596,26 @@ sofascore_captain AS (
        AND xp.season     = spa.season
     WHERE spa.is_captain IS NOT NULL
     GROUP BY 1, 2
+),
+
+-- ============================================================================
+-- 6) FBref-covered matches — drop redundant non-FBref duplicates (#819)
+-- ============================================================================
+-- For a match FBref already covers, the FBref lineup is authoritative and
+-- complete (see ADR "Dedup priority FBref > SofaScore > …"). A non-FBref row
+-- for the SAME match whose player did NOT resolve to a real 'fb_' canonical is
+-- a pure duplicate: its player key (NULL / source-prefixed orphan) differs from
+-- the FBref twin, so cross-source dedup cannot collapse it and it survives only
+-- to inflate the player_id NULL/orphan share. These are the bulk of fct_lineup
+-- FK orphans (#819: ~109k fotmob/espn rows sit in FBref-covered matches because
+-- xref_player has a per-season coverage gradient and never resolves them).
+-- Resolved non-FBref rows ('fb_…') and rows in matches FBref does NOT cover are
+-- KEPT — they add real coverage. Note the bridge itself is NOT broken: before
+-- dedup ~93-99% of sofascore/whoscored/espn rows DO resolve, they just win
+-- under lineup_source='fbref' via source_priority.
+fbref_covered_matches AS (
+    SELECT DISTINCT match_id_canonical
+    FROM fbref_resolved
 )
 
 SELECT
@@ -618,5 +638,18 @@ FROM dedup d
 LEFT JOIN sofascore_captain sc
        ON sc.match_id_canonical  = d.match_id_canonical
       AND sc.player_id_canonical = d.player_id_canonical
+LEFT JOIN fbref_covered_matches fcm
+       ON fcm.match_id_canonical = d.match_id_canonical
 WHERE d.rn = 1
   AND d.match_id_canonical IS NOT NULL
+  -- #819: drop redundant non-FBref rows in FBref-covered matches whose player
+  -- did not resolve to a real 'fb_' canonical (NULL or source-prefixed orphan).
+  -- FBref already carries the authoritative lineup for those matches, so the
+  -- unresolved twin only inflates the player_id NULL/orphan share. Resolved
+  -- ('fb_…') rows and rows in FBref-uncovered matches are untouched.
+  AND NOT (
+            d.lineup_source <> 'fbref'
+        AND fcm.match_id_canonical IS NOT NULL
+        AND (d.player_id_canonical IS NULL
+             OR d.player_id_canonical NOT LIKE 'fb\_%' ESCAPE '\')
+  )

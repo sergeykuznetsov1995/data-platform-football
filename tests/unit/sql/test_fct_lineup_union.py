@@ -1471,6 +1471,116 @@ class TestWhoscoredSource:
         assert out[0]["is_starter"] is False, out
 
 
+class TestFbrefCoveredDuplicateDrop:
+    """#819: a non-FBref row in a match FBref ALREADY covers, whose player did
+    NOT resolve to a real 'fb_' canonical, is a pure duplicate of the
+    authoritative FBref lineup — it survives dedup only because its player key
+    (NULL / orphan) cannot collapse against the FBref twin, and it inflates the
+    player_id NULL/orphan share. fct_lineup.sql drops these via the
+    fbref_covered_matches filter. Resolved ('fb_…') rows and rows in matches
+    FBref does NOT cover are kept (no over-drop).
+    """
+
+    @staticmethod
+    def _seed_fbref_cover(con, *, player_id="p1", canonical="fb_p1") -> None:
+        """One FBref lineup row at the FBref hex match → that match is covered."""
+        con.execute(
+            """
+            INSERT INTO silver_fbref_match_lineups VALUES
+              (?, 'Liverpool', 'FB Player', ?, TRUE, 'F', 9, ?, ?,
+               TIMESTAMP '2026-02-01 06:00:00')
+            """,
+            [_FB_HEX, player_id, _LEAGUE, _SEASON],
+        )
+        con.execute(
+            "INSERT INTO silver_xref_team VALUES "
+            "('fbref', 'Liverpool', 'liverpool', ?, ?, 'name_alias')",
+            [_LEAGUE, _SEASON],
+        )
+        con.execute(
+            "INSERT INTO silver_xref_player "
+            "(source, source_id, canonical_id, league, season) "
+            "VALUES ('fbref', ?, ?, ?, ?)",
+            [player_id, canonical, _LEAGUE, _SEASON],
+        )
+
+    @staticmethod
+    def _seed_fotmob_at_match(
+        con, *, fm_game, canonical_match, fm_player_id, xref_canonical=None
+    ) -> None:
+        """A FotMob lineup row bridged (via xref_match) to ``canonical_match``.
+
+        If ``xref_canonical`` is None the player has NO xref_player row →
+        player_id_canonical resolves to NULL (the unresolved case).
+        """
+        con.execute(
+            "INSERT INTO silver_xref_match VALUES "
+            "('fotmob', ?, ?, ?, ?, 'date_team_match')",
+            [fm_game, canonical_match, _LEAGUE, _SEASON],
+        )
+        con.execute(
+            "INSERT INTO silver_xref_team VALUES "
+            "('fotmob', 'Liverpool', 'liverpool', ?, ?, 'name_alias')",
+            [_LEAGUE, _SEASON],
+        )
+        if xref_canonical is not None:
+            con.execute(
+                "INSERT INTO silver_xref_player "
+                "(source, source_id, canonical_id, league, season) "
+                "VALUES ('fotmob', ?, ?, ?, ?)",
+                [fm_player_id, xref_canonical, _LEAGUE, _SEASON],
+            )
+        con.execute(
+            "INSERT INTO silver_fotmob_lineup "
+            "(match_id, player_id, player_name, team_name, is_home, is_starter, "
+            "is_captain, position, jersey_number, league, season) "
+            "VALUES (?, ?, 'Sub Player', 'Liverpool', true, FALSE, NULL, "
+            "'30', 30, ?, ?)",
+            [fm_game, fm_player_id, _LEAGUE, _SEASON],
+        )
+
+    def test_unresolved_fotmob_in_fbref_covered_match_dropped(self, bridge_conn):
+        """The core #819 case: FBref covers the match; an UNRESOLVED FotMob row
+        for the SAME canonical match is dropped, leaving only the FBref row."""
+        self._seed_fbref_cover(bridge_conn)
+        self._seed_fotmob_at_match(
+            bridge_conn, fm_game="fm1", canonical_match=_FB_HEX,
+            fm_player_id="fmUNRES", xref_canonical=None,
+        )
+        out = _run_lineup_gold(bridge_conn)
+        assert len(out) == 1, out
+        assert out[0]["lineup_source"] == "fbref", out
+        assert out[0]["player_id"] == "fb_p1", out
+
+    def test_unresolved_fotmob_in_uncovered_match_kept(self, bridge_conn):
+        """No FBref lineup for the match → not covered → the unresolved FotMob
+        row survives with NULL player_id (the filter must not over-drop)."""
+        self._seed_fotmob_at_match(
+            bridge_conn, fm_game="fm2", canonical_match="fm_only_match",
+            fm_player_id="fmUNRES2", xref_canonical=None,
+        )
+        out = _run_lineup_gold(bridge_conn)
+        assert len(out) == 1, out
+        assert out[0]["lineup_source"] == "fotmob", out
+        assert out[0]["match_id"] == "fm_only_match", out
+        assert out[0]["player_id"] is None, out
+
+    def test_resolved_fotmob_in_covered_match_kept(self, bridge_conn):
+        """A FotMob row in a FBref-covered match whose player RESOLVES to a
+        'fb_' canonical that the FBref lineup does not carry must survive (it
+        adds real coverage; only unresolved duplicates are dropped)."""
+        self._seed_fbref_cover(bridge_conn, player_id="p1", canonical="fb_p1")
+        self._seed_fotmob_at_match(
+            bridge_conn, fm_game="fm3", canonical_match=_FB_HEX,
+            fm_player_id="fmRES", xref_canonical="fb_other",
+        )
+        out = _run_lineup_gold(bridge_conn)
+        assert len(out) == 2, out
+        by_src = {r["lineup_source"]: r for r in out}
+        assert by_src["fbref"]["player_id"] == "fb_p1", out
+        assert by_src["fotmob"]["player_id"] == "fb_other", out
+
+
 class TestSqlInvariants:
     """Lock the SQL-text invariants that this behavioural harness CANNOT see."""
 

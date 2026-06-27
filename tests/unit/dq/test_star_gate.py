@@ -237,10 +237,14 @@ class TestStarGateDimFk:
         checks = [c for c in _build() if c.kind == 'coverage']
         by_table = {c.params['table']: c for c in checks}
         assert set(by_table) == {'gold.fct_shot', 'gold.fct_lineup'}
-        # fct_lineup thresholds sit under the live 64.9% non-NULL baseline —
-        # anything tighter would fire permanently on healthy data.
+        # #819: dropping FBref-covered non-FBref duplicates removes ~82k NULL
+        # player_id rows, lifting the non-NULL share to 98.2% live. Thresholds
+        # tightened to warn 0.95 / error 0.90 (sit just under the floor so
+        # healthy data passes, a real coverage regression fires).
         lineup = by_table['gold.fct_lineup']
-        assert lineup.params['warn_threshold'] <= 0.62
+        assert lineup.params['warn_threshold'] == 0.95
+        assert lineup.params['error_threshold'] == 0.90
+        assert lineup.params['warn_threshold'] >= lineup.params['error_threshold']
 
 
 @pytest.mark.unit
