@@ -615,19 +615,22 @@ def _star_gate_dim_fk_checks() -> List:
                             'player_id', parent_key='player_id',
                             warn_rate=0.05, error_rate=0.15, severity='WARNING'),
         # issue #430 — salary keeps 'cap_' orphans, fifa_rating keeps 'sf_'
-        # orphans; both kept by design (rule 2), policed by rate-mode. #814: the
-        # #712 rebuild first populated these facts (capology/sofifa silver were
-        # empty before → empty-fallback gave 0 rows, vacuous pass), revealing the
-        # canonical resolver matches neither source — 100% orphan in the CURRENT
-        # season (526/526 cap_, 546/546 sf_). Dropped error_rate → WARNING-only
-        # (never escalate); restoring coverage is tracked in #815. Re-add an
-        # error ceiling once resolution lands.
+        # orphans; both kept by design (rule 2), policed by rate-mode. #814 saw
+        # 100% orphan in the CURRENT season (526/526 cap_, 546/546 sf_) after the
+        # #712 rebuild first populated these facts, and dropped error_rate to
+        # WARNING-only. #815 root-caused it as STALE silver, NOT a resolver
+        # failure: the manual #712 gold rebuild (run_gold_transform) never re-ran
+        # the capology/sofifa silver DAGs, so silver.{capology_player_salaries,
+        # sofifa_player_profile}.canonical_id stayed NULL while a freshly-rebuilt
+        # xref_player already resolved ~90.5%/85% of them. Re-running silver
+        # restores the structural floor (cap_ ≈ 9.5%, sf_ ≈ 15%: roster/loan-out
+        # players with no FBref appearance). error_rate restored (≈2× floor).
         CHECK.ref_integrity('gold.fct_player_salary', 'gold.dim_player',
                             'player_id',
-                            warn_rate=0.12, severity='WARNING'),
+                            warn_rate=0.12, error_rate=0.25, severity='WARNING'),
         CHECK.ref_integrity('gold.fct_player_fifa_rating', 'gold.dim_player',
                             'player_id',
-                            warn_rate=0.18, severity='WARNING'),
+                            warn_rate=0.18, error_rate=0.35, severity='WARNING'),
 
         # ----- NULL-key shares (ref_integrity ignores NULLs by contract) -----
         # Baseline 99.7% non-NULL (172/58580 NULL).
