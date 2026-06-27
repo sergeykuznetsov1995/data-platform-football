@@ -583,10 +583,15 @@ def _star_gate_dim_fk_checks() -> List:
         # twin to dedup against). Restore a tight ceiling (~3× floor); warn ~2×.
         CHECK.ref_integrity('gold.fct_lineup', 'gold.dim_player', 'player_id',
                             warn_rate=0.03, error_rate=0.05, severity='WARNING'),
-        # Whole-table complement to the fbref-scoped ERROR check in e3_dq
-        # (espn pseudo-ids + ~0.9% unbridged tolerated via rate).
+        # Whole-table complement to the fbref-scoped ERROR check in e3_dq.
+        # Orphans = ESPN-only / non-FBref-only matches (espn_/fm_/ss_/ws_ pseudo
+        # match-ids) with no FBref-spine dim_match row — a fixed, stable set.
+        # #819: dropping the FBref-covered non-FBref duplicates shrank the
+        # denominator (258k→150k rows) without touching that orphan set, so the
+        # rate rose 1.6%→2.7% live (2026-06-27: 4030/149699). Re-baseline
+        # warn 0.02→0.04, error 0.05→0.06 so the stable floor passes clean.
         CHECK.ref_integrity('gold.fct_lineup', 'gold.dim_match', 'match_id',
-                            warn_rate=0.02, error_rate=0.05, severity='WARNING',
+                            warn_rate=0.04, error_rate=0.06, severity='WARNING',
                             name='star_fk[fct_lineup.match_id->dim_match all-sources]'),
 
         # ----- fct_match_odds (baseline 0%; matchhistory fixture-bridge) -----
