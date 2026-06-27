@@ -1218,12 +1218,15 @@ class TestResolveMatchIdsViaCapture:
 
     @staticmethod
     def _buffer():
+        # season 2025 -> target year '25/26' (sid 96668 in the path); events
+        # carry that season so the season-year guard keeps them (#824).
+        s = {"year": "25/26", "id": 96668}
         return {
             "/api/v1/unique-tournament/17/season/96668/events/last/0": {
                 "status": 200, "challenge": False, "json": {"events": [
-                    {"id": 101, "status": {"type": "finished"}},
-                    {"id": 102, "status": {"type": "notstarted"}},
-                    {"id": 103, "status": {"type": "finished"}},
+                    {"id": 101, "status": {"type": "finished"}, "season": s},
+                    {"id": 102, "status": {"type": "notstarted"}, "season": s},
+                    {"id": 103, "status": {"type": "finished"}, "season": s},
                 ]}},
         }
 
@@ -1238,6 +1241,11 @@ class TestResolveMatchIdsViaCapture:
             return False
 
         def capture_tournament(self, nav_url):
+            return self._buffer
+
+        def paginate_tournament_season(self, ut_id, season_id, max_pages=25):
+            # Real impl pages the season's events into the buffer; the fixture
+            # pre-populates them, so just return the buffer unchanged (#824).
             return self._buffer
 
     @pytest.mark.unit
@@ -1349,6 +1357,11 @@ class TestReadScheduleViaCapture:
             return False
 
         def capture_tournament(self, nav_url):
+            return self._buffer
+
+        def paginate_tournament_season(self, ut_id, season_id, max_pages=25):
+            # Real impl pages the target season's events into the buffer; the
+            # fixture pre-populates them, so return the buffer unchanged (#824).
             return self._buffer
 
     @pytest.mark.unit
@@ -1743,3 +1756,74 @@ class TestReadLeagueTableCapture:
         with self._patch_capture(buf):
             df = scraper.read_league_table()
         assert df is None
+
+
+class TestCaptureSeasonBuffer:
+    """_capture_season_buffer resolves a target year's SofaScore season_id from
+    the landing buffer and pages that season's events in, so a historical-season
+    backfill is not empty (#824). We fake the capture session (paginate records
+    its args) and drive the resolution paths."""
+
+    def _scraper(self):
+        from scrapers.sofascore.scraper import SofaScoreScraper
+        with patch('scrapers.base.base_scraper.get_rate_limiter'), \
+             patch('scrapers.base.base_scraper.get_retry_policy'), \
+             patch('scrapers.base.base_scraper.get_circuit_breaker'), \
+             patch('scrapers.base.base_scraper.IcebergWriter'):
+            return SofaScoreScraper(leagues=['ENG-Premier League'], seasons=[2024])
+
+    class _RecCap:
+        def __init__(self):
+            self.calls = []
+
+        def paginate_tournament_season(self, ut_id, season_id, max_pages=25):
+            self.calls.append((ut_id, season_id))
+            return {"paged": (ut_id, season_id)}
+
+    @pytest.mark.unit
+    def test_resolves_sid_from_seasons_map_and_pages(self):
+        scraper = self._scraper()
+        cap = self._RecCap()
+        buffer = {
+            "/api/v1/unique-tournament/17/seasons": {
+                "status": 200, "challenge": False, "json": {"seasons": [
+                    {"year": "24/25", "id": 75612},
+                    {"year": "25/26", "id": 76986},
+                ]}},
+        }
+        out = scraper._capture_season_buffer(cap, buffer, 17, "24/25")
+        # /seasons map wins → paginate the 24/25 sid.
+        assert cap.calls == [(17, 75612)]
+        assert out == {"paged": (17, 75612)}
+
+    @pytest.mark.unit
+    def test_falls_back_to_event_season_id(self):
+        scraper = self._scraper()
+        cap = self._RecCap()
+        # No /seasons map; the captured events carry season.{year,id}.
+        buffer = {
+            "/api/v1/unique-tournament/17/season/75612/events/last/0": {
+                "status": 200, "challenge": False, "json": {"events": [
+                    {"id": 1, "status": {"type": "finished"},
+                     "season": {"year": "24/25", "id": 75612}},
+                ]}},
+        }
+        scraper._capture_season_buffer(cap, buffer, 17, "24/25")
+        assert cap.calls == [(17, 75612)]
+
+    @pytest.mark.unit
+    def test_returns_buffer_unchanged_when_unresolved(self):
+        scraper = self._scraper()
+        cap = self._RecCap()
+        # Only a DIFFERENT season is present → target unresolved → no paging,
+        # original buffer returned (caller's year-filter then yields nothing).
+        buffer = {
+            "/api/v1/unique-tournament/17/season/96668/events/next/0": {
+                "status": 200, "challenge": False, "json": {"events": [
+                    {"id": 201, "status": {"type": "notstarted"},
+                     "season": {"year": "26/27", "id": 96668}},
+                ]}},
+        }
+        out = scraper._capture_season_buffer(cap, buffer, 17, "24/25")
+        assert cap.calls == []
+        assert out is buffer
