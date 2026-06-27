@@ -248,3 +248,61 @@ class TestSchemaShape:
         # Allow either `home`/`away` (FBref) or `home_team`/`away_team` (others).
         assert "CONCAT(" in sql.upper(), "display_name should be built via CONCAT()"
         assert "' vs '" in sql, "display_name separator ' vs ' must appear"
+
+
+# ---------------------------------------------------------------------------
+# PK dedup (#809) — one row per (canonical_id, source)
+# ---------------------------------------------------------------------------
+
+class TestPkDedup:
+    """The cascade bridges WITHOUT season (#404) and emits each source row's own
+    season. A source whose bronze schedule carries one physical match under two
+    season labels (ESPN '2021' is a byte-for-byte copy of '1920') would emit two
+    rows sharing one canonical_id — violating PK (canonical_id, source). The
+    final SELECT must dedup to exactly one row per (canonical_id, source),
+    preferring the season consistent with the FBref spine."""
+
+    def test_cascade_wrapped_in_unioned_cte(self):
+        """The 7-source UNION ALL is wrapped in a `unioned` CTE for dedup."""
+        sql = _read_sql()
+        assert re.search(r"\bunioned\s+AS\b", sql), (
+            "expected the 7-source cascade to be wrapped in a `unioned` CTE"
+        )
+
+    def test_fbref_season_ground_truth_cte(self):
+        """A `fbref_season` CTE supplies the canonical's true season (one row
+        per canonical via MIN()+GROUP BY so the dedup JOIN cannot fan out)."""
+        sql = _read_sql()
+        assert re.search(r"\bfbref_season\s+AS\b", sql), (
+            "expected a `fbref_season` CTE as the season ground-truth"
+        )
+        non_comment = _strip_comments(sql)
+        assert "MIN(season)" in non_comment, (
+            "fbref_season must collapse to one row per canonical via MIN(season)"
+        )
+
+    def test_row_number_partitions_by_canonical_and_source(self):
+        """Dedup uses ROW_NUMBER() OVER (PARTITION BY canonical_id, source)."""
+        sql = _read_sql()
+        assert re.search(r"ROW_NUMBER\s*\(\s*\)\s*OVER", sql, re.IGNORECASE), (
+            "expected ROW_NUMBER() OVER (...) for the PK dedup"
+        )
+        assert re.search(
+            r"PARTITION\s+BY\s+u\.canonical_id\s*,\s*u\.source",
+            sql, re.IGNORECASE,
+        ), "ROW_NUMBER must PARTITION BY (canonical_id, source) to enforce the PK"
+
+    def test_keeps_only_first_ranked_row(self):
+        """Final SELECT keeps `_rn = 1` — one row per (canonical_id, source)."""
+        non_comment = _strip_comments(_read_sql())
+        assert re.search(r"WHERE\s+_rn\s*=\s*1", non_comment, re.IGNORECASE), (
+            "expected `WHERE _rn = 1` to keep a single row per PK group"
+        )
+
+    def test_tiebreaker_prefers_fbref_season(self):
+        """The ORDER BY prefers the row whose season matches the FBref spine."""
+        non_comment = _strip_comments(_read_sql())
+        assert "fs.fb_season" in non_comment, (
+            "dedup ORDER BY must reference the FBref-spine season (fs.fb_season) "
+            "so the season-consistent row wins"
+        )
