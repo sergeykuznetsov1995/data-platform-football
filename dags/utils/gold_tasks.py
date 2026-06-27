@@ -571,13 +571,18 @@ def _star_gate_dim_fk_checks() -> List:
         # ----- fct_lineup (baseline: all 0% among non-NULL keys) -----
         CHECK.ref_integrity('gold.fct_lineup', 'gold.dim_team', 'team_id',
                             warn_rate=0.02, error_rate=0.10, severity='WARNING'),
-        # #814: post-#712 the 10-season + ESPN/historical lineups push player_id
-        # orphans from a 0% baseline to 13.4% table-wide (2021 peak 27.1%, even
-        # current 2526 = 12.3%) — a player-resolution gap tracked in #815. Raise
-        # error_rate 0.10→0.30 (loose ceiling still catches a total dim_player
-        # break) and keep warn_rate=0.02 so the regression stays a tracked WARNING.
+        # #819: the #814 0.30 loose ceiling was a workaround for a wrong
+        # diagnosis. The xref_player bridge is NOT broken — before cross-source
+        # dedup ~93-99% of sofascore/whoscored/espn (28% fotmob) rows resolve to
+        # 'fb_' and then win under lineup_source='fbref' via source_priority.
+        # The 13.4% orphans were non-FBref rows in FBref-COVERED matches whose
+        # player failed to resolve (xref_player per-season coverage gradient) —
+        # pure duplicates of the authoritative FBref lineup. fct_lineup.sql now
+        # drops them (the fbref_covered_matches filter). Live 2026-06-27: orphan
+        # 1.7% (2508/147123), all ESPN players in ESPN-only matches (no FBref
+        # twin to dedup against). Restore a tight ceiling (~3× floor); warn ~2×.
         CHECK.ref_integrity('gold.fct_lineup', 'gold.dim_player', 'player_id',
-                            warn_rate=0.02, error_rate=0.30, severity='WARNING'),
+                            warn_rate=0.03, error_rate=0.05, severity='WARNING'),
         # Whole-table complement to the fbref-scoped ERROR check in e3_dq
         # (espn pseudo-ids + ~0.9% unbridged tolerated via rate).
         CHECK.ref_integrity('gold.fct_lineup', 'gold.dim_match', 'match_id',
@@ -636,14 +641,13 @@ def _star_gate_dim_fk_checks() -> List:
         # Baseline 99.7% non-NULL (172/58580 NULL).
         CHECK.coverage('gold.fct_shot', column='player_id',
                        warn_threshold=0.95, error_threshold=0.85),
-        # #692: ESPN players now resolve via xref_player, so resolved ESPN rows
-        # dedup against their FBref twin and the non-NULL player_id share rises
-        # well above the pre-#692 64.9% baseline (only ESPN-exclusive / orphan /
-        # out-of-scope rows keep NULL). Thresholds stay as conservative lower
-        # bounds until the post-#692 live share is measured — re-baseline and
-        # tighten on the first prod run (tracked in the #692 verification step).
+        # #819: dropping the FBref-covered non-FBref duplicates (their unresolved
+        # player twins) also removes ~82k NULL player_id rows, so the non-NULL
+        # share jumps from the pre-#819 ~67% to 98.2% live (2026-06-27:
+        # 147123/149888 non-NULL). Only ESPN-only matches with unresolved players
+        # keep NULL. Tighten the lower bounds (floor 98.2%, warn ~3pp below).
         CHECK.coverage('gold.fct_lineup', column='player_id',
-                       warn_threshold=0.60, error_threshold=0.50),
+                       warn_threshold=0.95, error_threshold=0.90),
     ]
 
 
