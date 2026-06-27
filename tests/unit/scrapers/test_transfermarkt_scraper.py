@@ -607,6 +607,55 @@ class TestPartialScrapeRatio:
 
 
 # ---------------------------------------------------------------------------
+# current_club_name must agree with current_club_id (#800)
+#
+# current_club_id is always the season squad club. The name must come from the
+# same squad — NOT the player's scrape-time profile club. A player who later
+# transferred away (Ederson: 281 Man City in 2018 → Fenerbahçe by 2025) would
+# otherwise get id=281 but name='Fenerbahçe' — id and name about different clubs.
+# ---------------------------------------------------------------------------
+
+class TestReadPlayersCurrentClub:
+    @pytest.fixture
+    def scraper(self):
+        return TransfermarktScraper(
+            leagues=['ENG-Premier League'], seasons=[2018],
+        )
+
+    def test_current_club_name_comes_from_season_squad_not_profile(
+        self, scraper, monkeypatch,
+    ):
+        import scrapers.transfermarkt.scraper as tm
+        monkeypatch.setattr(tm, '_parse_club_listing', lambda html: [
+            {'club_id': '281', 'club_slug': 'manchester-city',
+             'club_name': 'Man City'},
+        ])
+        monkeypatch.setattr(tm, '_parse_squad_page', lambda html, club_id: [
+            {'player_id': '238223', 'player_slug': 'ederson',
+             'name': 'Ederson', 'club_id': club_id, 'market_value_eur': None},
+        ])
+        # Profile reports the club the player moved to after this season.
+        monkeypatch.setattr(
+            tm, '_parse_player_profile',
+            lambda payload, player_id: {
+                'name': 'Ederson', 'current_club_name': 'Fenerbahçe',
+            },
+        )
+        monkeypatch.setattr(
+            scraper, '_fetch_html',
+            lambda url, label='html', context=None: '<html/>',
+        )
+
+        df = scraper.read_players(league='ENG-Premier League', season=2018)
+
+        assert len(df) == 1
+        row = df.iloc[0]
+        assert row['current_club_id'] == '281'
+        # Name must agree with the id → season squad club, not the profile.
+        assert row['current_club_name'] == 'Man City'
+
+
+# ---------------------------------------------------------------------------
 # Shared Trino DB-API stubs for bronze-lookup tests
 # ---------------------------------------------------------------------------
 
