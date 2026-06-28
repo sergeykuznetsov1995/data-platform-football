@@ -831,11 +831,22 @@ class SofaScoreScraper(SoccerdataScraper):
         match_ids: List[str],
         tabs=("Lineups",),
         required=("lineups",),
+        session_max: int = 120,
     ):
-        """Yield ``(match_id, endpoints)`` by capturing each match page through
-        ONE warmed Camoufox session (issue #757, path P2). ``endpoints`` holds
-        whichever of ``event/lineups/statistics/shotmap/incidents`` came back as
-        real JSON (see ``camoufox_capture.select_event_endpoints``).
+        """Yield ``(match_id, endpoints)`` by capturing each match page through a
+        Camoufox session, RESTARTED every ``session_max`` matches (issue #757
+        path P2; #829). ``endpoints`` holds whichever of
+        ``event/lineups/statistics/shotmap/incidents`` came back as real JSON
+        (see ``camoufox_capture.select_event_endpoints``).
+
+        Firefox accumulates memory across navigations and the browser dies
+        ~200 page loads in: on a full-season backfill (380 matches) one
+        long-lived session crashed at ~211, the consecutive-failure breaker then
+        aborted, and the season landed only ~55% (#829). Restarting the session
+        every ``session_max`` matches keeps a full-season run alive — the few
+        extra browser starts are negligible against hours of capture, and the
+        daily run (a handful of matches) never crosses the threshold, so its
+        single-session behaviour is unchanged.
 
         Generalises the ratings-only lineup iterator so the daily consolidated
         path (#751 PR1) also gets the ``event`` payload (``homeTeam``/
@@ -851,27 +862,37 @@ class SofaScoreScraper(SoccerdataScraper):
         from scrapers.sofascore.camoufox_capture import SofascoreCamoufoxCapture
 
         proxy = self._camoufox_proxy()
-        with SofascoreCamoufoxCapture(proxy=proxy) as cap:
-            for mid in match_ids:
-                self._rate_limiter.acquire()
-                self._stats['requests'] += 1
-                try:
-                    endpoints = cap.capture_event(
-                        str(mid), tabs=tabs, required=required,
-                    )
-                except Exception as e:  # noqa: BLE001 — one bad event mustn't kill the loop
-                    logger.warning("camoufox capture failed for event=%s: %s", mid, e)
-                    endpoints = {}
-                if not endpoints.get('lineups'):
-                    self._stats['failures'] += 1
-                    self._last_lineup_error = {
-                        'event_id': str(mid),
-                        'status': None,
-                        'error': 'lineups_not_captured',
-                    }
-                else:
-                    self._stats['successes'] += 1
-                yield str(mid), endpoints
+        match_ids = list(match_ids)
+        step = max(1, session_max)
+        for start in range(0, len(match_ids), step):
+            chunk = match_ids[start:start + step]
+            if start:
+                logger.info(
+                    "match_capture: restarting Camoufox session at match %d/%d "
+                    "(Firefox memory longevity — #829).",
+                    start, len(match_ids),
+                )
+            with SofascoreCamoufoxCapture(proxy=proxy) as cap:
+                for mid in chunk:
+                    self._rate_limiter.acquire()
+                    self._stats['requests'] += 1
+                    try:
+                        endpoints = cap.capture_event(
+                            str(mid), tabs=tabs, required=required,
+                        )
+                    except Exception as e:  # noqa: BLE001 — one bad event mustn't kill the loop
+                        logger.warning("camoufox capture failed for event=%s: %s", mid, e)
+                        endpoints = {}
+                    if not endpoints.get('lineups'):
+                        self._stats['failures'] += 1
+                        self._last_lineup_error = {
+                            'event_id': str(mid),
+                            'status': None,
+                            'error': 'lineups_not_captured',
+                        }
+                    else:
+                        self._stats['successes'] += 1
+                    yield str(mid), endpoints
 
     def _iter_lineup_payloads(self, match_ids: List[str]):
         """Yield ``(match_id, lineups_payload | None)`` — the ratings-only view
