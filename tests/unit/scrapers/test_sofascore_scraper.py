@@ -1827,3 +1827,60 @@ class TestCaptureSeasonBuffer:
         out = scraper._capture_season_buffer(cap, buffer, 17, "24/25")
         assert cap.calls == []
         assert out is buffer
+
+
+class TestMatchCaptureSessionRestart:
+    """_iter_match_captures restarts the Camoufox session every ``session_max``
+    matches so a full-season backfill survives the ~200-navigation Firefox
+    crash that capped coverage at ~55% (#829)."""
+
+    def _scraper(self):
+        from scrapers.sofascore.scraper import SofaScoreScraper
+        with patch('scrapers.base.base_scraper.get_rate_limiter'), \
+             patch('scrapers.base.base_scraper.get_retry_policy'), \
+             patch('scrapers.base.base_scraper.get_circuit_breaker'), \
+             patch('scrapers.base.base_scraper.IcebergWriter'):
+            s = SofaScoreScraper(leagues=['ENG-Premier League'], seasons=[2024])
+        s._proxy_manager = None
+        return s
+
+    @staticmethod
+    def _fakecap_cls(instances):
+        class _FakeCap:
+            def __init__(self, *a, **k):
+                instances.append(self)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def capture_event(self, mid, tabs=(), required=()):
+                return {'lineups': {'home': {}, 'away': {}}, 'event': {}}
+        return _FakeCap
+
+    @pytest.mark.unit
+    def test_restarts_session_every_n_matches(self):
+        scraper = self._scraper()
+        instances = []
+        ids = [str(i) for i in range(250)]
+        with patch('scrapers.sofascore.camoufox_capture.SofascoreCamoufoxCapture',
+                   self._fakecap_cls(instances)):
+            out = list(scraper._iter_match_captures(ids, session_max=100))
+        # Every match yielded, in order — none dropped at a chunk boundary.
+        assert [m for m, _ in out] == ids
+        # 250 / 100 -> 3 browser sessions (100, 100, 50).
+        assert len(instances) == 3
+
+    @pytest.mark.unit
+    def test_single_session_under_threshold(self):
+        # Daily run (a handful of matches) keeps ONE session — behaviour unchanged.
+        scraper = self._scraper()
+        instances = []
+        ids = [str(i) for i in range(5)]
+        with patch('scrapers.sofascore.camoufox_capture.SofascoreCamoufoxCapture',
+                   self._fakecap_cls(instances)):
+            out = list(scraper._iter_match_captures(ids, session_max=120))
+        assert len(out) == 5
+        assert len(instances) == 1
