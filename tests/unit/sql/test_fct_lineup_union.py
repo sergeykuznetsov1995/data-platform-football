@@ -1581,6 +1581,58 @@ class TestFbrefCoveredDuplicateDrop:
         assert by_src["fotmob"]["player_id"] == "fb_other", out
 
 
+class TestNullTeamDropped:
+    """#828: a non-FBref lineup row whose team did not resolve in xref_team has
+    no dim_team FK and is unusable. fct_lineup.sql drops it — scoped to non-FBref
+    so a NULL team_id on the FBref spine still reds the no_nulls(team_id) gate
+    (the FBref-spine guard lives in TestOrphanTeamExcluded). Surfaced by a stray
+    sofascore 2024-25 sample with neither xref_team aliases nor an FBref bridge,
+    which left 120 NULL-team_id orphan rows reddening validate_e3.
+    """
+
+    @staticmethod
+    def _seed_sofascore_orphan(con, *, with_team_alias: bool) -> None:
+        """A sofascore match with NO xref_match bridge (→ orphan 'ss_' match_id).
+
+        ``with_team_alias`` toggles whether xref_team resolves the team, isolating
+        the NULL-team_id drop from the orphan-match-id fallback.
+        """
+        if with_team_alias:
+            con.execute(
+                "INSERT INTO silver_xref_team VALUES "
+                "('sofascore', 'Brentford', 'brentford', ?, '2425', 'name_alias')",
+                [_LEAGUE],
+            )
+        con.execute(
+            "INSERT INTO silver_sofascore_player_match_aggregate "
+            "(match_id, player_id, team_name, is_starter, position, is_captain, "
+            "league, season) "
+            "VALUES ('12436564', 'ssp1', 'Brentford', TRUE, 'D', NULL, ?, '2425')",
+            [_LEAGUE],
+        )
+
+    def test_sofascore_orphan_null_team_dropped(self, bridge_conn):
+        """No xref_match (orphan ss_ id) AND no xref_team (NULL team_id) → the
+        unusable row is dropped, so the no_nulls(team_id) gate stays green."""
+        self._seed_sofascore_orphan(bridge_conn, with_team_alias=False)
+        out = _run_lineup_gold(bridge_conn)
+        assert out == [], (
+            f"non-FBref row with NULL team_id must be dropped (#828): {out}"
+        )
+
+    def test_sofascore_orphan_resolved_team_kept(self, bridge_conn):
+        """No over-drop: the SAME orphan match WITH a resolving xref_team alias
+        keeps its row (orphan match_id, resolved team_id) — only NULL-team rows
+        are dropped, not all orphan-match rows."""
+        self._seed_sofascore_orphan(bridge_conn, with_team_alias=True)
+        out = _run_lineup_gold(bridge_conn)
+        assert len(out) == 1, out
+        r = out[0]
+        assert r["lineup_source"] == "sofascore", r
+        assert r["match_id"] == "ss_12436564", r   # orphan fallback id, still kept
+        assert r["team_id"] == "brentford", r
+
+
 class TestSqlInvariants:
     """Lock the SQL-text invariants that this behavioural harness CANNOT see."""
 
@@ -1660,3 +1712,13 @@ class TestSqlInvariants:
         assert re.search(r"\.raw_team_name\s*=", normalised, re.IGNORECASE), (
             "ESPN xref_player JOIN must key on raw_team_name"
         )
+
+    def test_null_team_dropped_for_non_fbref(self):
+        """#828: the final WHERE must drop non-FBref rows whose team did not
+        resolve (NULL team_id_canonical), scoped so an FBref NULL stays a gate
+        ERROR rather than being silently dropped."""
+        normalised = re.sub(r"\s+", " ", self._sql())
+        assert re.search(
+            r"lineup_source\s*<>\s*'fbref'\s+AND\s+\w*\.?team_id_canonical\s+IS\s+NULL",
+            normalised, re.IGNORECASE,
+        ), "fct_lineup.sql must drop non-FBref rows with NULL team_id (#828)"
