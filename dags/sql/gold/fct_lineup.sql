@@ -642,6 +642,12 @@ LEFT JOIN fbref_covered_matches fcm
        ON fcm.match_id_canonical = d.match_id_canonical
 WHERE d.rn = 1
   AND d.match_id_canonical IS NOT NULL
+  -- #828: a lineup row whose team did not resolve in xref_team has no dim_team
+  -- FK and is unusable (surfaced by a stray sofascore 2024-25 sample with no
+  -- xref_team aliases / no FBref bridge yet; #711 backfill will resolve it).
+  -- FBref is the spine and always carries its own team, so a NULL there stays a
+  -- gate ERROR rather than being silently dropped.
+  AND NOT (d.lineup_source <> 'fbref' AND d.team_id_canonical IS NULL)
   -- #819: drop redundant non-FBref rows in FBref-covered matches whose player
   -- did not resolve to a real 'fb_' canonical (NULL or source-prefixed orphan).
   -- FBref already carries the authoritative lineup for those matches, so the
