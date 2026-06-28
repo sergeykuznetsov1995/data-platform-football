@@ -832,53 +832,63 @@ class SofaScoreScraper(SoccerdataScraper):
         tabs=("Lineups",),
         required=("lineups",),
         session_max: int = 120,
+        proxy_fail_max: int = 4,
     ):
         """Yield ``(match_id, endpoints)`` by capturing each match page through a
-        Camoufox session, RESTARTED every ``session_max`` matches (issue #757
-        path P2; #829). ``endpoints`` holds whichever of
+        Camoufox session, restarted on a FRESH proxy every ``session_max``
+        matches OR after ``proxy_fail_max`` consecutive failures (issue #757 path
+        P2; #829, #832). ``endpoints`` holds whichever of
         ``event/lineups/statistics/shotmap/incidents`` came back as real JSON
         (see ``camoufox_capture.select_event_endpoints``).
 
-        Firefox accumulates memory across navigations and the browser dies
-        ~200 page loads in: on a full-season backfill (380 matches) one
-        long-lived session crashed at ~211, the consecutive-failure breaker then
-        aborted, and the season landed only ~55% (#829). Restarting the session
-        every ``session_max`` matches keeps a full-season run alive — the few
-        extra browser starts are negligible against hours of capture, and the
-        daily run (a handful of matches) never crosses the threshold, so its
-        single-session behaviour is unchanged.
+        Two failure modes abort a long full-season backfill (380 matches) if the
+        session never restarts:
+        - Firefox accumulates memory across navigations and the browser dies
+          ~200 page loads in (#829) — covered by the ``session_max`` restart.
+        - the single residential proxy can die mid-run (``NS_ERROR_PROXY_*`` /
+          ``CONNECTION_REFUSED``); since one proxy is picked per session, every
+          later capture then fails and the consecutive-failure breaker aborts at
+          ~half the season (#832). Picking a FRESH proxy on each (re)start and
+          restarting after ``proxy_fail_max`` consecutive failures keeps the run
+          alive across a dead proxy. The handful of matches captured during the
+          dead-proxy burst are skipped (yielded empty) — re-running the season
+          backfills them under the completeness guard.
 
-        Generalises the ratings-only lineup iterator so the daily consolidated
-        path (#751 PR1) also gets the ``event`` payload (``homeTeam``/
-        ``awayTeam`` — team mapping for ``event_player_stats``) from the SAME
-        single navigation. Replaces the dead ``tls_requests`` REST path:
-        SofaScore's API is Cloudflare-Turnstile-gated and only a real Firefox
-        (Camoufox) behind a residential proxy passes it; the SPA fires its own
-        XHRs and we capture the responses. ``endpoints`` without ``lineups``
-        means the capture missed (Turnstile not solved / proxy dead). The
-        generator owns the browser session — the caller MUST ``.close()`` it
-        (via try/finally) so it tears down even on an early circuit-breaker break.
+        The daily run (a handful of matches) crosses neither threshold, so it
+        keeps its single-session behaviour. Generalises the ratings-only lineup
+        iterator so the daily consolidated path (#751 PR1) also gets the
+        ``event`` payload (``homeTeam``/``awayTeam`` — team mapping for
+        ``event_player_stats``) from the SAME navigation. Replaces the dead
+        ``tls_requests`` REST path: SofaScore's API is Cloudflare-Turnstile-gated
+        and only a real Firefox (Camoufox) behind a residential proxy passes it;
+        the SPA fires its own XHRs and we capture the responses. ``endpoints``
+        without ``lineups`` means the capture missed (Turnstile not solved /
+        proxy dead). The generator owns the browser session — the caller MUST
+        ``.close()`` it (via try/finally) so it tears down even on an early
+        circuit-breaker break.
         """
         from scrapers.sofascore.camoufox_capture import SofascoreCamoufoxCapture
 
-        proxy = self._camoufox_proxy()
-        match_ids = list(match_ids)
-        step = max(1, session_max)
-        for start in range(0, len(match_ids), step):
-            chunk = match_ids[start:start + step]
-            if start:
+        match_ids = [str(m) for m in match_ids]
+        n = len(match_ids)
+        i = 0
+        while i < n:
+            proxy = self._camoufox_proxy()  # fresh proxy per (re)start (#832)
+            if i:
                 logger.info(
-                    "match_capture: restarting Camoufox session at match %d/%d "
-                    "(Firefox memory longevity — #829).",
-                    start, len(match_ids),
+                    "match_capture: restarting Camoufox session on a fresh proxy "
+                    "at match %d/%d (#829 memory / #832 proxy rotation).", i, n,
                 )
+            in_session = 0
+            consec_fail = 0
             with SofascoreCamoufoxCapture(proxy=proxy) as cap:
-                for mid in chunk:
+                while i < n and in_session < session_max and consec_fail < proxy_fail_max:
+                    mid = match_ids[i]
                     self._rate_limiter.acquire()
                     self._stats['requests'] += 1
                     try:
                         endpoints = cap.capture_event(
-                            str(mid), tabs=tabs, required=required,
+                            mid, tabs=tabs, required=required,
                         )
                     except Exception as e:  # noqa: BLE001 — one bad event mustn't kill the loop
                         logger.warning("camoufox capture failed for event=%s: %s", mid, e)
@@ -886,13 +896,23 @@ class SofaScoreScraper(SoccerdataScraper):
                     if not endpoints.get('lineups'):
                         self._stats['failures'] += 1
                         self._last_lineup_error = {
-                            'event_id': str(mid),
+                            'event_id': mid,
                             'status': None,
                             'error': 'lineups_not_captured',
                         }
+                        consec_fail += 1
                     else:
                         self._stats['successes'] += 1
-                    yield str(mid), endpoints
+                        consec_fail = 0
+                    yield mid, endpoints
+                    i += 1
+                    in_session += 1
+            if consec_fail >= proxy_fail_max and i < n:
+                logger.warning(
+                    "match_capture: %d consecutive failures at match %d/%d — "
+                    "likely a dead proxy; rotating proxy + restarting session "
+                    "(#832).", consec_fail, i, n,
+                )
 
     def _iter_lineup_payloads(self, match_ids: List[str]):
         """Yield ``(match_id, lineups_payload | None)`` — the ratings-only view

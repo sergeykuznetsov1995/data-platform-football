@@ -1884,3 +1884,40 @@ class TestMatchCaptureSessionRestart:
             out = list(scraper._iter_match_captures(ids, session_max=120))
         assert len(out) == 5
         assert len(instances) == 1
+
+    @pytest.mark.unit
+    def test_rotates_proxy_after_consecutive_failures(self):
+        # A dead proxy (first session captures nothing) must not abort the run:
+        # after proxy_fail_max consecutive failures the session restarts on a
+        # fresh proxy and finishes the remaining matches (#832).
+        scraper = self._scraper()
+        instances = []
+
+        class _DeadThenOk:
+            def __init__(self, *a, **k):
+                self.idx = len(instances) + 1
+                instances.append(self)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def capture_event(self, mid, tabs=(), required=()):
+                if self.idx == 1:
+                    return {}  # dead proxy — no lineups
+                return {'lineups': {'home': {}, 'away': {}}, 'event': {}}
+
+        ids = [str(k) for k in range(20)]
+        with patch('scrapers.sofascore.camoufox_capture.SofascoreCamoufoxCapture',
+                   _DeadThenOk):
+            out = list(scraper._iter_match_captures(
+                ids, session_max=100, proxy_fail_max=4))
+        # Every match_id is still yielded, in order.
+        assert [m for m, _ in out] == ids
+        # Rotated to (at least) a second session after the dead one.
+        assert len(instances) >= 2
+        # The 4 dead-proxy matches were skipped (empty); the rest captured.
+        assert all(ep == {} for _, ep in out[:4])
+        assert out[4][1].get('lineups') is not None
