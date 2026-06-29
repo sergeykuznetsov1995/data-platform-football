@@ -1,0 +1,68 @@
+# =============================================================================
+# OpenMetadata description: iceberg.bronze.fbref_team_playingtime
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.bronze.fbref_team_playingtime
+  description: |
+    Сезонная статистика игрового времени команд из FBref (Squad Playing Time).
+    Гранулярность: один row на (squad, league, season). Источник: FBref scrape
+    (dag_ingest_fbref).
+  tags:
+    - Tier.Bronze
+    - Domain.Football
+    - PII.None
+columns:
+  - name: squad
+    description: Название команды.
+  - name: "# pl"
+    description: Число игроков, использованных командой за сезон (Players used).
+  - name: age
+    description: Средний возраст состава.
+  - name: mp
+    description: Сыграно матчей (Matches Played).
+  - name: min
+    description: Сыграно минут (суммарно).
+  - name: mn/mp
+    description: Минут на матч (Minutes per Match Played).
+  - name: min%
+    description: Доля сыгранных командных минут, % .
+  - name: 90s
+    description: Число 90-минуток (минуты / 90).
+  - name: starts
+    description: Сумма выходов в старте по игрокам.
+  - name: mn/start
+    description: Минут на матч в старте.
+  - name: compl
+    description: Матчи, сыгранные игроками полностью (Complete matches).
+  - name: subs
+    description: Выходы на замену (как запасной).
+  - name: mn/sub
+    description: Минут на выход с замены.
+  - name: unsub
+    description: Матчи на скамейке без выхода на поле (Unused sub).
+  - name: ppm
+    description: Очков за матч (Points per Match).
+  - name: ong
+    description: Голы команды, забитые при игроке на поле (суммарно).
+  - name: onga
+    description: Голы команды, пропущенные при игроке на поле (суммарно).
+  - name: +/-
+    description: Разница голов (ong − onga).
+  - name: +/-90
+    description: Разница голов на 90 минут.
+  - name: team_id
+    description: FBref ID команды.
+  - name: league
+    description: Лига (partition key).
+  - name: season
+    description: Сезон — год начала (bigint, напр. 2025 = сезон 2025/26).
+  - name: stat_type
+    description: Категория stat-таблицы FBref (для этой таблицы — playing_time).
+  - name: _source
+    description: Источник данных Bronze (всегда 'fbref').
+  - name: _entity_type
+    description: Внутренняя метка типа сущности ingest-конвейера FBref.
+  - name: _ingested_at
+    description: Timestamp ingest'а строки в Bronze.
+  - name: _batch_id
+    description: ID batch'а загрузки (трассировка и идемпотентность ingest).

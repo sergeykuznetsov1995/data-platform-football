@@ -1,0 +1,94 @@
+# =============================================================================
+# OpenMetadata description: iceberg.bronze.capology_team_payrolls
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.bronze.capology_team_payrolls
+  description: |
+    Клубные фонды зарплат с capology.com (через scrapers/capology, dag_ingest_capology,
+    еженедельно). Grain — один row на (клуб, сезон): суммарный платёжный фонд клуба
+    (gross/net, недельный/годовой, бонусы, итоги) сразу в трёх валютах GBP/EUR/USD;
+    единицы — целые единицы валюты. Охват: только ENG-Premier League (много сезонов
+    2014/15…2025/26). Партиционирование ['league','season'].
+  tags:
+    - Tier.Bronze
+    - Domain.Football
+    - PII.None
+columns:
+  - name: club_slug
+    description: Capology URL-слаг клуба.
+  - name: club_name
+    description: Название клуба.
+  - name: club_code
+    description: Короткий код клуба (может быть NULL).
+  - name: weekly_gross_gbp
+    description: Недельный фонд зарплат до налога, GBP (bigint); = annual_gross / 52.
+  - name: weekly_gross_eur
+    description: Недельный фонд зарплат до налога, EUR (bigint).
+  - name: weekly_gross_usd
+    description: Недельный фонд зарплат до налога, USD (bigint).
+  - name: weekly_net_gbp
+    description: Недельный фонд зарплат после налога, GBP (bigint).
+  - name: weekly_net_eur
+    description: Недельный фонд зарплат после налога, EUR (bigint).
+  - name: weekly_net_usd
+    description: Недельный фонд зарплат после налога, USD (bigint).
+  - name: annual_gross_gbp
+    description: Годовой фонд зарплат до налога, GBP (bigint).
+  - name: annual_gross_eur
+    description: Годовой фонд зарплат до налога, EUR (bigint).
+  - name: annual_gross_usd
+    description: Годовой фонд зарплат до налога, USD (bigint).
+  - name: annual_net_gbp
+    description: Годовой фонд зарплат после налога, GBP (bigint).
+  - name: annual_net_eur
+    description: Годовой фонд зарплат после налога, EUR (bigint).
+  - name: annual_net_usd
+    description: Годовой фонд зарплат после налога, USD (bigint).
+  - name: bonus_gross_gbp
+    description: Суммарные бонусы клуба до налога, GBP (bigint); часто NULL.
+  - name: bonus_gross_eur
+    description: Суммарные бонусы клуба до налога, EUR (bigint); часто NULL.
+  - name: bonus_gross_usd
+    description: Суммарные бонусы клуба до налога, USD (bigint); часто NULL.
+  - name: bonus_net_gbp
+    description: Суммарные бонусы клуба после налога, GBP (bigint); часто NULL.
+  - name: bonus_net_eur
+    description: Суммарные бонусы клуба после налога, EUR (bigint); часто NULL.
+  - name: bonus_net_usd
+    description: Суммарные бонусы клуба после налога, USD (bigint); часто NULL.
+  - name: total_gross_gbp
+    description: Итог до налога (зарплаты + бонусы), GBP (bigint).
+  - name: total_gross_eur
+    description: Итог до налога (зарплаты + бонусы), EUR (bigint).
+  - name: total_gross_usd
+    description: Итог до налога (зарплаты + бонусы), USD (bigint).
+  - name: total_net_gbp
+    description: Итог после налога (зарплаты + бонусы), GBP (bigint).
+  - name: total_net_eur
+    description: Итог после налога (зарплаты + бонусы), EUR (bigint).
+  - name: total_net_usd
+    description: Итог после налога (зарплаты + бонусы), USD (bigint).
+  - name: adjusted_total_gross_gbp
+    description: Скорректированный итог до налога, GBP (bigint); часто NULL.
+  - name: adjusted_total_gross_eur
+    description: Скорректированный итог до налога, EUR (bigint); часто NULL.
+  - name: adjusted_total_gross_usd
+    description: Скорректированный итог до налога, USD (bigint); часто NULL.
+  - name: adjusted_total_net_gbp
+    description: Скорректированный итог после налога, GBP (bigint); часто NULL.
+  - name: adjusted_total_net_eur
+    description: Скорректированный итог после налога, EUR (bigint); часто NULL.
+  - name: adjusted_total_net_usd
+    description: Скорректированный итог после налога, USD (bigint); часто NULL.
+  - name: league
+    description: Лига (e.g. 'ENG-Premier League'); partition key.
+  - name: season
+    description: Сезон в коротком виде (e.g. '2526'); partition key.
+  - name: _source
+    description: Источник данных ('capology'); метаколонка Bronze.
+  - name: _entity_type
+    description: Тип сущности в Bronze; метаколонка.
+  - name: _ingested_at
+    description: Timestamp ingest'а строки в Bronze; метаколонка.
+  - name: _batch_id
+    description: Идентификатор батча ingest'а; метаколонка.

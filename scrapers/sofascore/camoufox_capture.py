@@ -1,0 +1,828 @@
+"""
+Camoufox passive-capture transport for SofaScore (issue #757, path P2).
+
+Why this module exists
+----------------------
+SofaScore's data API is gated by Cloudflare Turnstile (proven in #757). A cold
+request — ``tls_requests`` (#751), Chromium-FlareSolverr (#751), byparr/Firefox
+(#755) — gets ``403 {"reason":"challenge"}``. The only thing that works is a
+real **Firefox (Camoufox) driven through a residential proxy**, where Turnstile
+passes invisibly and the SPA's own XHRs to **same-origin**
+``www.sofascore.com/api/v1/*`` return real JSON. A naive in-page ``fetch()``
+still 403s (it lacks the token header the SPA attaches), so we cannot replay
+arbitrary URLs — we must let the SPA fire its own requests and **capture the
+responses** (``page.on("response")``). See ``scripts/research/
+probe_sofascore_capture.py`` for the spike that established all of this.
+
+This transport drives Camoufox via Playwright, navigates SofaScore SPA pages,
+nudges the deep tabs (Lineups / Statistics / Shotmap) so the SPA fetches them,
+and returns the captured JSON keyed by entity. Downstream parsing reuses the
+existing helpers on ``SofaScoreScraper`` (``_flatten_lineup_side``,
+``_flatten_shotmap``, ``_build_lineup_overlay_lookup``).
+
+Heavy deps (camoufox/playwright) are imported lazily inside ``__enter__`` so this
+module stays cheap to import (unit tests exercise the pure helpers only).
+
+Operational requirements (see Dockerfile once integrated):
+  - ``pip install 'camoufox[geoip]'`` and ``python -m camoufox fetch``
+  - **playwright < 1.60** (1.60 crashes Camoufox on page errors — camoufox#617)
+  - a residential proxy (Turnstile 403s on a datacenter IP)
+  - Xvfb (already in the image) for ``headless="virtual"``
+"""
+from __future__ import annotations
+
+import json
+import logging
+import re
+from typing import Dict, Optional
+
+logger = logging.getLogger(__name__)
+
+BASE = "https://www.sofascore.com"
+_API_PATH = "/api/v1/"
+# Binary/static endpoints under /api/v1 that are not JSON data — skip them.
+_NON_DATA_SEGMENTS = ("/image", "/flag", "/logo", "/jersey")
+
+_CONSENT_BUTTONS = ("Consent", "AGREE", "Agree", "Accept all", "I Accept", "Got it")
+# Tabs whose XHRs fire only on interaction (lineups often loads eagerly anyway).
+_EVENT_TABS = ("Lineups", "Statistics", "Player statistics", "Shotmap")
+# Stable data-testid per tab label (live-proven 2026-06-22, #751 PR2). Clicking
+# the Statistics tab fires BOTH /statistics (re-fetch, body captured) AND
+# /shotmap. A plain get_by_text('Statistics') grabbed a non-tab label element
+# (the match page renders two "Statistics" nodes) and fired nothing.
+_TAB_TESTIDS = {
+    "Lineups": "tab-lineups",
+    "Statistics": "tab-statistics",
+    # Player-page Season tab (#751 PR3b) — fires /statistics/seasons + the
+    # default competition's season-statistics/overall.
+    "Season": "tab-season",
+}
+
+# Canonical per-event endpoints we want out of the capture buffer.
+_EVENT_ENDPOINTS = {
+    "event": "/api/v1/event/{eid}",
+    "lineups": "/api/v1/event/{eid}/lineups",
+    "statistics": "/api/v1/event/{eid}/statistics",
+    "shotmap": "/api/v1/event/{eid}/shotmap",
+    "incidents": "/api/v1/event/{eid}/incidents",
+}
+
+
+# --------------------------------------------------------------------------- #
+#  Pure helpers (unit-tested without a browser)                               #
+# --------------------------------------------------------------------------- #
+def response_path(url: str) -> str:
+    """Strip scheme+host and query → just the ``/api/v1/...`` path."""
+    return re.sub(r"^https?://[^/]+", "", url.split("?")[0])
+
+
+def is_data_api_url(url: str) -> bool:
+    """True for a SofaScore ``/api/v1`` JSON-data response (host-agnostic: the
+    SPA uses www.sofascore.com, the public host is api.sofascore.com), excluding
+    binary endpoints (crests/flags/logos/jerseys)."""
+    if "sofascore.com" not in url or _API_PATH not in url:
+        return False
+    path = response_path(url)
+    return not any(seg in path for seg in _NON_DATA_SEGMENTS)
+
+
+def is_challenge(body) -> bool:
+    """True if the body is SofaScore's ``{"error":{"reason":"challenge"}}``."""
+    return (
+        isinstance(body, dict)
+        and isinstance(body.get("error"), dict)
+        and body["error"].get("reason") == "challenge"
+    )
+
+
+def merge_capture(existing: Optional[dict], new: dict) -> dict:
+    """Choose the better of two capture records for the same ``/api/v1`` path.
+
+    A record carrying real JSON always beats one that does not. On a retry
+    re-navigation the browser serves already-fetched endpoints as ``304 Not
+    Modified`` with an empty body (``json=None``); without this guard that 304
+    would clobber the good ``200``+JSON capture from an earlier pass — exactly
+    why ``statistics``/``shotmap`` vanished on retry while ``lineups`` (the
+    ``required`` endpoint that forced the retry) survived (#751 PR2). A
+    body-read race (a large XHR firing twice, once with ``json=None``) is
+    covered by the same rule, order-independent."""
+    if existing is None:
+        return new
+    if existing.get("json") is not None and new.get("json") is None:
+        return existing
+    return new
+
+
+def event_url(event_id) -> str:
+    return f"{BASE}/event/{event_id}"
+
+
+def select_event_endpoints(buffer: Dict[str, dict], event_id) -> Dict[str, dict]:
+    """From a capture ``buffer`` (path -> {status, json, challenge}), return the
+    canonical per-event endpoints that came back as real JSON, keyed by entity
+    name (``event``/``lineups``/``statistics``/``shotmap``/``incidents``)."""
+    out: Dict[str, dict] = {}
+    for name, tmpl in _EVENT_ENDPOINTS.items():
+        rec = buffer.get(tmpl.format(eid=event_id))
+        if rec and rec.get("status") == 200 and rec.get("challenge") is False and rec.get("json") is not None:
+            out[name] = rec["json"]
+    return out
+
+
+_EVENTS_PATH_RE = re.compile(r"/api/v1/.+/events/(?:last|next)/\d+$")
+
+
+def extract_events(buffer: Dict[str, dict]) -> list:
+    """Collect SofaScore event objects from any ``.../events/last|next/N``
+    responses in a capture ``buffer``, de-duplicated by event id. These feed
+    schedule + event-id resolution for player_ratings (replaces the dead
+    soccerdata schedule reader)."""
+    seen = {}
+    for path, rec in buffer.items():
+        if not _EVENTS_PATH_RE.search(path):
+            continue
+        if rec.get("status") != 200 or rec.get("challenge") is not False:
+            continue
+        obj = rec.get("json")
+        events = obj.get("events") if isinstance(obj, dict) else None
+        if not isinstance(events, list):
+            continue
+        for ev in events:
+            if isinstance(ev, dict) and ev.get("id") is not None:
+                seen[ev["id"]] = ev
+    return list(seen.values())
+
+
+def normalize_event(ev: dict) -> dict:
+    """Flatten a SofaScore event object to a ``bronze.sofascore_schedule`` row.
+
+    Emits the per-event business columns only; the caller adds ``league`` /
+    ``season`` and converts ``date`` (epoch seconds) → ``timestamp`` and
+    ``round`` → nullable bigint (see :meth:`SofaScoreScraper.read_schedule`).
+    ``week`` / ``game`` are soccerdata-only concepts absent from the API, so
+    they are NULL placeholders to keep the row aligned with the table schema.
+    """
+    return {
+        "game_id": int(ev["id"]),
+        "date": ev.get("startTimestamp"),
+        "home_team": (ev.get("homeTeam") or {}).get("name"),
+        "away_team": (ev.get("awayTeam") or {}).get("name"),
+        "home_score": (ev.get("homeScore") or {}).get("current"),
+        "away_score": (ev.get("awayScore") or {}).get("current"),
+        "round": (ev.get("roundInfo") or {}).get("round"),
+        "week": None,
+        "game": None,
+    }
+
+
+def finished_event_ids(events: list) -> list:
+    """Event ids (as str) for events whose status is ``finished`` — the matches
+    that have lineups/ratings worth scraping."""
+    return [
+        str(ev["id"])
+        for ev in events
+        if isinstance(ev, dict)
+        and ev.get("id") is not None
+        and (ev.get("status") or {}).get("type") == "finished"
+    ]
+
+
+def extract_tournament_events(buffer: Dict[str, dict], ut_id) -> list:
+    """Collect SofaScore events for a SPECIFIC unique-tournament from a capture
+    ``buffer``'s ``/events/{round,last,next}/N`` responses, de-duplicated by id.
+
+    Filtering by ``ut_id`` is REQUIRED, not optional: a league page also fires a
+    *featured* OTHER tournament's ``/events/last|next`` (#757 B0 proved a naive
+    last|next capture on the EPL page grabbed unrelated ut=16 events). We match
+    only ``/unique-tournament/{ut_id}/season/{sid}/events/...`` paths.
+    """
+    pat = re.compile(
+        rf"/api/v1/unique-tournament/{int(ut_id)}/season/\d+/events/(?:round|last|next)/\d+$"
+    )
+    seen: Dict = {}
+    for path, rec in buffer.items():
+        if not pat.search(path):
+            continue
+        if rec.get("status") != 200 or rec.get("challenge") is not False:
+            continue
+        obj = rec.get("json")
+        events = obj.get("events") if isinstance(obj, dict) else None
+        if not isinstance(events, list):
+            continue
+        for ev in events:
+            if isinstance(ev, dict) and ev.get("id") is not None:
+                seen[ev["id"]] = ev
+    return list(seen.values())
+
+
+def extract_tournament_seasons_map(buffer: Dict[str, dict], ut_id) -> Dict[str, int]:
+    """``{year_label: season_id}`` from a captured
+    ``/unique-tournament/{ut_id}/seasons`` response (e.g. ``'25/26' -> 76986``).
+
+    Lets :meth:`SofaScoreScraper.read_league_table` map a target season year to
+    its SofaScore ``season_id`` — the ``/standings/total`` path is keyed by
+    ``season_id``, not by year, and the standings JSON itself carries no season.
+    Returns ``{}`` when the seasons list wasn't captured / came back challenged.
+    Mirrors :func:`extract_player_seasons_map` for the tournament endpoint."""
+    rec = buffer.get(f"/api/v1/unique-tournament/{int(ut_id)}/seasons")
+    if not rec or rec.get("status") != 200 or rec.get("challenge") is not False:
+        return {}
+    obj = rec.get("json")
+    if not isinstance(obj, dict):
+        return {}
+    out: Dict[str, int] = {}
+    for s in obj.get("seasons") or []:
+        if isinstance(s, dict) and s.get("year") is not None and s.get("id") is not None:
+            out[str(s["year"])] = int(s["id"])
+    return out
+
+
+def extract_tournament_standings(buffer: Dict[str, dict], ut_id, season_id) -> list:
+    """The ``rows`` of the TOTAL standings table for a SPECIFIC
+    ``(ut_id, season_id)`` from a capture ``buffer``'s
+    ``/unique-tournament/{ut}/season/{sid}/standings/total`` response.
+
+    The exact ``season_id`` in the path is the season-guard: a tournament page
+    that has rolled to the NEXT season off-season fires ``/standings/total`` for
+    a DIFFERENT sid, so requiring our target sid keeps it out of the current
+    partition (the caller then writes nothing). Returns ``[]`` when the standings
+    XHR for this sid wasn't captured / was challenged / carried no rows."""
+    rec = buffer.get(
+        f"/api/v1/unique-tournament/{int(ut_id)}/season/{int(season_id)}/standings/total"
+    )
+    if not rec or rec.get("status") != 200 or rec.get("challenge") is not False:
+        return []
+    obj = rec.get("json")
+    standings = obj.get("standings") if isinstance(obj, dict) else None
+    if not isinstance(standings, list) or not standings:
+        return []
+    # Prefer the 'total' table; fall back to the first block.
+    block = next((s for s in standings if isinstance(s, dict)
+                  and s.get("type") == "total"), standings[0])
+    rows = block.get("rows") if isinstance(block, dict) else None
+    return rows if isinstance(rows, list) else []
+
+
+def normalize_standing(row: dict) -> dict:
+    """Flatten a SofaScore standings row to a ``bronze.sofascore_league_table``
+    row (business columns only; the caller adds ``league`` / ``season`` /
+    metadata and casts the counts to nullable bigint). ``gd`` is derived — the
+    API row has no goal-difference field. Mirrors :func:`normalize_event`."""
+    gf = row.get("scoresFor")
+    ga = row.get("scoresAgainst")
+    return {
+        "team": (row.get("team") or {}).get("name"),
+        "mp": row.get("matches"),
+        "w": row.get("wins"),
+        "d": row.get("draws"),
+        "l": row.get("losses"),
+        "gf": gf,
+        "ga": ga,
+        "gd": (gf - ga) if gf is not None and ga is not None else None,
+        "pts": row.get("points"),
+    }
+
+
+def parse_proxy_line(line: str) -> Optional[dict]:
+    """``host:port:user:pass`` → a Playwright/Camoufox proxy dict (creds split
+    out — browsers reject creds embedded in the URL). Returns ``None`` for a
+    blank/comment/malformed line."""
+    line = (line or "").strip()
+    if not line or line.startswith("#"):
+        return None
+    parts = line.split(":")
+    if len(parts) < 4:
+        return None
+    host, port, user = parts[0], parts[1], parts[2]
+    password = ":".join(parts[3:])  # password may contain colons
+    return {"server": f"http://{host}:{port}", "username": user, "password": password}
+
+
+# --------------------------------------------------------------------------- #
+#  Per-player capture helpers (issue #751 PR3) — profile snapshot              #
+# --------------------------------------------------------------------------- #
+# Live-proven (scripts/research/probe_sofascore_player.py, 2026-06-22): the bio
+# is SSR'd at __NEXT_DATA__.props.pageProps.player (NOT an XHR), so the profile
+# capture needs no Turnstile-gated data XHR. Season-aggregate stats (which DO
+# need the Season tab + a season-picker for transferred/multi-competition
+# players) are deferred to PR3b — see memory/feedback_sofascore_player_page_capture.
+def player_url(player_id) -> str:
+    """A player page URL with a DUMMY slug — the SPA redirects to the real
+    ``/football/player/{real-slug}/{id}`` by trailing id (#751 PR3 spike), so we
+    never need to know the slug. Bare ``/player/{id}`` (no slug) does NOT load."""
+    return f"{BASE}/player/x/{player_id}"
+
+
+def extract_player_from_next_data(next_data, player_id) -> Optional[dict]:
+    """Pull the SSR'd player bio object out of a parsed ``__NEXT_DATA__`` blob.
+
+    The bio lives at ``props.pageProps.player`` (live-proven) and carries exactly
+    the fields :meth:`SofaScoreScraper._flatten_player_profile` reads under the
+    ``player`` key (name/slug/position/height/preferredFoot/dateOfBirthTimestamp/
+    team). Returns the player dict only when its ``id`` matches ``player_id`` (so
+    a wrong-page SSR never yields a mismatched row); ``None`` otherwise."""
+    if not isinstance(next_data, dict):
+        return None
+    page_props = (next_data.get("props") or {}).get("pageProps")
+    if not isinstance(page_props, dict):
+        return None
+    player = page_props.get("player")
+    if not isinstance(player, dict):
+        return None
+    pid = player.get("id")
+    if pid is None or str(pid) != str(player_id):
+        return None
+    return player
+
+
+# --------------------------------------------------------------------------- #
+#  Per-player SEASON STATS helpers (issue #751 PR3b) — Season-tab picker       #
+# --------------------------------------------------------------------------- #
+# Clicking the Season tab fires /statistics/seasons (a year→season_id map) plus
+# one /unique-tournament/{ut}/season/{sid}/statistics/overall for whatever
+# competition the page defaults to. For transferred/multi-competition players
+# that default is NOT EPL (live-proven: Paquetá → World Cup), so the capture
+# also drives the season-picker to select the target tournament — firing a
+# SECOND overall XHR. These pure helpers pick the right one out of the buffer
+# without any tls fetch (the old tls season-id resolution is no longer needed).
+_PLAYER_SEASON_STATS_RE = re.compile(
+    r"/api/v1/player/(\d+)/unique-tournament/(\d+)/season/(\d+)/statistics/overall$"
+)
+_PLAYER_SEASONS_LIST_RE = re.compile(r"/api/v1/player/(\d+)/statistics/seasons$")
+
+
+def season_short_to_label(season_short) -> str:
+    """Map a soccerdata short season (``'2526'``) to SofaScore's year label
+    (``'25/26'``) used in ``/statistics/seasons``. A 4-digit token is split;
+    anything else (e.g. an already-formatted ``'25/26'``) is returned unchanged.
+    """
+    s = str(season_short)
+    if len(s) == 4 and s.isdigit():
+        return f"{s[:2]}/{s[2:]}"
+    return s
+
+
+def extract_player_seasons_map(buffer: Dict[str, dict], player_id) -> Dict[int, Dict[str, int]]:
+    """``{unique_tournament_id: {year_label: season_id}}`` from the captured
+    ``/player/{id}/statistics/seasons`` response (probe FACT 2). Lets us map a
+    target ``(ut, year_label)`` to its SofaScore ``season_id`` without a tls
+    fetch. Returns ``{}`` when the seasons list wasn't captured / was challenged.
+    """
+    rec = buffer.get(f"/api/v1/player/{player_id}/statistics/seasons")
+    if not rec or rec.get("status") != 200 or rec.get("challenge") is not False:
+        return {}
+    obj = rec.get("json")
+    if not isinstance(obj, dict):
+        return {}
+    out: Dict[int, Dict[str, int]] = {}
+    for entry in obj.get("uniqueTournamentSeasons") or []:
+        if not isinstance(entry, dict):
+            continue
+        ut = (entry.get("uniqueTournament") or {}).get("id")
+        if ut is None:
+            continue
+        years: Dict[str, int] = {}
+        for s in entry.get("seasons") or []:
+            if isinstance(s, dict) and s.get("year") is not None and s.get("id") is not None:
+                years[str(s["year"])] = int(s["id"])
+        out[int(ut)] = years
+    return out
+
+
+def select_player_season_stats(
+    buffer: Dict[str, dict],
+    player_id,
+    target_ut,
+    target_season_id=None,
+) -> Optional[tuple]:
+    """Pick the season-statistics/overall XHR for the target unique-tournament
+    out of a player-page capture ``buffer``. Returns ``(ut_id, season_id,
+    payload)`` or ``None``.
+
+    Only real JSON (200, not a challenge) for THIS ``player_id`` and
+    ``target_ut`` is considered — so the default-tab overall of a different
+    competition (e.g. World Cup for a transferred player) is never mistaken for
+    the EPL row. When ``target_season_id`` is known (resolved via
+    :func:`extract_player_seasons_map`) it acts as a season-guard: only an exact
+    ``(ut, season)`` match qualifies. Without a guard the most recent season_id
+    wins (deterministic)."""
+    candidates = []
+    for path, rec in buffer.items():
+        m = _PLAYER_SEASON_STATS_RE.search(path)
+        if not m or str(m.group(1)) != str(player_id):
+            continue
+        if rec.get("status") != 200 or rec.get("challenge") is not False:
+            continue
+        payload = rec.get("json")
+        if not isinstance(payload, dict):
+            continue
+        ut, sid = int(m.group(2)), int(m.group(3))
+        if ut != int(target_ut):
+            continue
+        if target_season_id is not None and sid != int(target_season_id):
+            continue
+        candidates.append((ut, sid, payload))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda c: c[1])  # most-recent season_id last
+    return candidates[-1]
+
+
+# --------------------------------------------------------------------------- #
+#  Camoufox capture session                                                   #
+# --------------------------------------------------------------------------- #
+class SofascoreCamoufoxCapture:
+    """A warmed Camoufox session that captures SofaScore /api/v1 JSON.
+
+    Usage::
+
+        with SofascoreCamoufoxCapture(proxy=parse_proxy_line(line)) as cap:
+            data = cap.capture_event(12345678)   # {'lineups': {...}, ...}
+    """
+
+    def __init__(
+        self,
+        proxy: Optional[dict] = None,
+        *,
+        geoip: bool = True,
+        headless="virtual",
+        settle_ms: int = 8000,
+        tab_wait_ms: int = 2500,
+        nav_timeout_ms: int = 60000,
+    ) -> None:
+        self._proxy = proxy
+        self._geoip = geoip
+        self._headless = headless
+        self._settle_ms = settle_ms
+        self._tab_wait_ms = tab_wait_ms
+        self._nav_timeout_ms = nav_timeout_ms
+        self._cm = None
+        self._browser = None
+        self._page = None
+        self._buffer: Dict[str, dict] = {}
+
+    # -- lifecycle -------------------------------------------------------- #
+    def __enter__(self) -> "SofascoreCamoufoxCapture":
+        from camoufox.sync_api import Camoufox  # lazy: heavy (Firefox)
+
+        kwargs = {"headless": self._headless}
+        if self._proxy:
+            kwargs["proxy"] = self._proxy
+            kwargs["geoip"] = self._geoip  # match locale/timezone to proxy exit
+        else:
+            logger.warning(
+                "SofascoreCamoufoxCapture started WITHOUT a proxy — Turnstile 403s "
+                "on a datacenter IP; data endpoints will be empty."
+            )
+        self._cm = Camoufox(**kwargs)
+        self._browser = self._cm.__enter__()
+        self._page = self._browser.new_page()
+        self._page.on("response", self._on_response)
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> bool:
+        if self._cm is not None:
+            try:
+                self._cm.__exit__(exc_type, exc_val, exc_tb)
+            except Exception:  # noqa: BLE001 — browser teardown is best-effort
+                logger.warning("Camoufox teardown failed", exc_info=True)
+        return False
+
+    # -- capture ---------------------------------------------------------- #
+    def _on_response(self, resp) -> None:
+        url = resp.url
+        if not is_data_api_url(url):
+            return
+        rec = {"status": resp.status, "json": None, "challenge": None}
+        try:
+            obj = resp.json()
+            rec["json"] = obj
+            rec["challenge"] = is_challenge(obj)
+        except Exception:  # noqa: BLE001 — non-JSON / body unavailable
+            pass
+        path = response_path(url)
+        # Never let a later empty/304 record overwrite a good earlier capture
+        # (see merge_capture — re-nav serves cached endpoints as 304/no-body).
+        self._buffer[path] = merge_capture(self._buffer.get(path), rec)
+
+    def capture_event(
+        self,
+        event_id,
+        required=("lineups",),
+        max_attempts: int = 3,
+        tabs=_EVENT_TABS,
+    ) -> Dict[str, dict]:
+        """Navigate the match page, nudge the deep tabs, and return the captured
+        per-event endpoints (only those that came back as real JSON).
+
+        Capture is timing-flaky: a deep-tab XHR (or its body-read) can race and
+        drop an endpoint — the live runner saw ~1/2 lineup misses on a single
+        pass (#757). When any ``required`` endpoint is missing we re-navigate
+        (up to ``max_attempts``), widening the settle window each retry so a
+        slow page still fires the XHR. ``required=()`` takes one pass.
+
+        ``tabs`` narrows which deep tabs to click — a ratings-only caller passes
+        ``tabs=("Lineups",)`` to avoid fetching Statistics/Shotmap it won't use
+        (saves proxy bytes + time). Defaults to all of ``_EVENT_TABS``.
+        """
+        result: Dict[str, dict] = {}
+        required = tuple(required or ())
+        # Reset the buffer ONCE per event, then accumulate across retries. A
+        # re-navigation serves already-captured endpoints as 304/no-body, so a
+        # per-attempt reset would drop a good capture from an earlier pass
+        # (statistics/shotmap vanished while the required lineups survived —
+        # #751 PR2). merge_capture keeps the best record per path.
+        self._buffer = {}
+        for attempt in range(1, max_attempts + 1):
+            # Widen the settle window on retries — a slow page can drop the
+            # tab XHR on the first, tighter pass.
+            self._navigate(event_url(event_id), extra_settle_ms=(attempt - 1) * 2000)
+            self._click_tabs(tabs)
+            self._page.wait_for_timeout(self._tab_wait_ms)
+            result = select_event_endpoints(self._buffer, event_id)
+
+            missing_required = [r for r in required if r not in result]
+            if not missing_required:
+                break
+            if attempt < max_attempts:
+                logger.info(
+                    "sofascore capture event=%s attempt %d/%d missing "
+                    "required=%s — retrying",
+                    event_id, attempt, max_attempts, missing_required,
+                )
+
+        missing = [k for k in _EVENT_ENDPOINTS if k not in result]
+        logger.info("sofascore capture event=%s got=%s missing=%s",
+                    event_id, sorted(result), missing)
+        return result
+
+    def capture_player(self, player_id, *, season_picker_label=None) -> Dict:
+        """Navigate a player page, read the SSR'd bio from ``__NEXT_DATA__``, and
+        (when ``season_picker_label`` is given) drive the Season tab + picker to
+        capture the target competition's season-aggregate stats — all in ONE
+        navigation (#751 PR3 profile + PR3b season stats).
+
+        Returns ``{'profile': <bio dict | None>, 'season_buffer': {path: rec}}``.
+        The bio is server-rendered (``props.pageProps.player``), NOT an XHR. The
+        ``season_buffer`` is the raw season-stats + ``/statistics/seasons``
+        captures; the caller selects the target ``(ut, season)`` via the pure,
+        season-guarded :func:`select_player_season_stats` /
+        :func:`extract_player_seasons_map`. ``season_picker_label`` is the
+        tournament display text to click in the picker (e.g. ``'Premier
+        League'``) — ``None`` keeps the PR3 profile-only behaviour."""
+        self._buffer = {}
+        self._navigate(player_url(player_id))
+        profile = self._extract_player_next_data(player_id)
+
+        season_buffer: Dict[str, dict] = {}
+        if season_picker_label:
+            # Same nav: open the Season tab (fires /statistics/seasons + the
+            # default competition's overall), then switch the picker to the
+            # target tournament so ITS overall fires too.
+            self._click_tabs(("Season",))
+            self._drive_season_picker(season_picker_label)
+            self._page.wait_for_timeout(self._tab_wait_ms)
+            season_buffer = {
+                p: r for p, r in self._buffer.items()
+                if _PLAYER_SEASON_STATS_RE.search(p) or _PLAYER_SEASONS_LIST_RE.search(p)
+            }
+
+        logger.info("sofascore capture player=%s profile=%s season_xhrs=%d",
+                    player_id, profile is not None, len(season_buffer))
+        return {"profile": profile, "season_buffer": season_buffer}
+
+    def _drive_season_picker(self, tournament_label: str) -> None:
+        """Best-effort: open the season-statistics TOURNAMENT dropdown and select
+        the target competition so its season-statistics/overall XHR fires.
+
+        The default Season tab shows the player's PRIMARY competition — NOT
+        necessarily EPL for a transferred/multi-competition player (live-proven
+        Paquetá → World Cup, #751 PR3b). Live-proven DOM (probe): the widget has
+        a tournament dropdown — ``button.dropdown__button[aria-haspopup=
+        "listbox"]`` whose label is the current competition NAME (it has letters;
+        the sibling SEASON dropdown shows only a year). Clicking it opens a
+        ``ul.dropdown__list`` of ``li[role="option"]`` tournaments; clicking the
+        target option fires its overall XHR (Paquetá → EPL ut=17/season 76986
+        confirmed). Tournament names are NOT localized (English even under a
+        non-EN proxy), so matching the option by text is locale-safe. A miss just
+        leaves the default tab — :func:`select_player_season_stats` then returns
+        ``None`` for that player (a WARN, not a crash). JS clicks bypass
+        Playwright actionability (same trick as :meth:`_click_tabs`)."""
+        try:
+            opened = self._page.evaluate(
+                """() => {
+                    // The tournament dropdown trigger (NOT the year/season one):
+                    // a dropdown__button whose label carries letters.
+                    const btn = [...document.querySelectorAll(
+                            'button.dropdown__button[aria-haspopup="listbox"],'
+                            + '[aria-haspopup="listbox"]')]
+                        .find(e => /[a-z]/i.test((e.innerText||'')));
+                    if (btn) { btn.click(); return true; }
+                    return false;
+                }"""
+            )
+            if not opened:
+                logger.info("sofascore season-picker: tournament dropdown not found")
+                return
+            self._page.wait_for_timeout(self._tab_wait_ms)
+            clicked = self._page.evaluate(
+                """(label) => {
+                    // ONLY the dropdown options — never the page's plain
+                    // 'Premier League' <a> link (that navigates, fires nothing).
+                    const want = label.toLowerCase();
+                    const opts = [...document.querySelectorAll(
+                        'li[role="option"], .dropdown__listItem')];
+                    let opt = opts.find(
+                        e => (e.innerText||'').trim().toLowerCase() === want);
+                    if (!opt) opt = opts.find(
+                        e => (e.innerText||'').toLowerCase().includes(want));
+                    if (opt) { opt.click(); return true; }
+                    return false;
+                }""",
+                tournament_label,
+            )
+            logger.info("sofascore season-picker select %r -> %s",
+                        tournament_label, clicked)
+            self._page.wait_for_timeout(self._tab_wait_ms)
+        except Exception as e:  # noqa: BLE001 — picker driving is best-effort
+            logger.info("sofascore season-picker drive failed: %s", e)
+
+    def capture_buffer(self, nav_url: str) -> Dict[str, dict]:
+        """Navigate ``nav_url`` and return the whole capture buffer (path -> rec).
+        Used for non-event pages (tournament events lists, standings)."""
+        self._buffer = {}
+        self._navigate(nav_url)
+        return dict(self._buffer)
+
+    def capture_tournament(self, nav_url: str) -> Dict[str, dict]:
+        """Navigate a league page, nudge it toward FINISHED results (Matches /
+        previous rounds), and return the whole capture buffer. The caller runs
+        ``extract_tournament_events(buffer, ut_id)`` to pull the match list.
+
+        The default tournament view loads only the upcoming round; finished
+        matches need an interaction to fire their ``/events/{round,last}`` XHR
+        (#757 B1). Interaction is best-effort — a miss yields the default round.
+        """
+        self._buffer = {}
+        self._navigate(nav_url)
+        # Scroll to trigger lazy widgets, then nudge toward finished matches.
+        try:
+            self._page.mouse.wheel(0, 4000)
+            self._page.wait_for_timeout(self._tab_wait_ms)
+        except Exception:
+            pass
+        self._nudge_results()
+        # Let late nudge-triggered XHR (and their body reads) settle into the
+        # buffer before we snapshot it — without this the by-date events race.
+        self._page.wait_for_timeout(self._settle_ms)
+        return dict(self._buffer)
+
+    def paginate_tournament_season(
+        self, ut_id, season_id, max_pages: int = 25,
+    ) -> Dict[str, dict]:
+        """Page a SPECIFIC season's finished events on the ALREADY-NAVIGATED
+        tournament page, so a historical-season backfill sees the target
+        season's matches (#824).
+
+        The landing only fires the CURRENT/next season's ``/events/...`` XHR, so
+        :func:`extract_tournament_events` finds nothing for a past season. Here
+        we drive an in-page ``fetch`` of ``/unique-tournament/{ut}/season/{sid}/
+        events/last/{page}`` for page=0.. until a page returns no events or
+        ``hasNextPage`` is false. The page already passed Turnstile on
+        navigation, so a same-origin fetch carries the clearance cookie; each
+        response is captured by :meth:`_on_response` into ``self._buffer`` (keyed
+        by path) and read back by :func:`extract_tournament_events`. Returns the
+        whole buffer. Best-effort: a failed/challenged page stops the loop,
+        leaving whatever paged in. Call within the SAME capture session right
+        after a tournament navigation (no re-nav — that would re-warm Turnstile
+        and burn the rate-limit budget)."""
+        base = (
+            f"/api/v1/unique-tournament/{int(ut_id)}/season/{int(season_id)}"
+            "/events/last/"
+        )
+        pages = 0
+        for page in range(max_pages):
+            try:
+                res = self._page.evaluate(
+                    """async (path) => {
+                        try {
+                            const r = await fetch(path, {credentials: 'include',
+                                headers: {'accept': 'application/json'}});
+                            if (!r.ok) return {ok: false, count: 0, more: false};
+                            const j = await r.json();
+                            const ev = Array.isArray(j.events) ? j.events : [];
+                            return {ok: true, count: ev.length,
+                                    more: !!j.hasNextPage};
+                        } catch (e) { return {ok: false, count: 0, more: false}; }
+                    }""",
+                    base + str(page),
+                )
+            except Exception as e:  # noqa: BLE001 — paging is best-effort
+                logger.info("sofascore season-paging ut=%s sid=%s page=%s: %s",
+                            ut_id, season_id, page, e)
+                break
+            self._page.wait_for_timeout(self._tab_wait_ms)
+            if not res or not res.get("ok") or not res.get("count"):
+                break
+            pages += 1
+            if not res.get("more"):
+                break
+        logger.info("sofascore season-paging ut=%s sid=%s: %d page(s).",
+                    ut_id, season_id, pages)
+        # Let the last response bodies settle into the buffer before snapshot.
+        self._page.wait_for_timeout(self._settle_ms)
+        return dict(self._buffer)
+
+    def _nudge_results(self) -> None:
+        """Surface FINISHED matches: open the 'Matches' top-nav, then switch to
+        the BY DATE view (centres on recent/finished matches for an in-progress
+        season, firing /events/last|next + round XHR).
+
+        The Matches section is collapsed by default (Standings is the landing
+        view), so its toggles (``data-testid=tab-date/tab-round``) render
+        ``display:none`` and a Playwright ``.click()`` times out as non-actionable.
+        A JS ``.click()`` bypasses actionability and follows the SPA's own
+        handlers — live-proven on the EPL page (#757 B1: 10→30 captured events).
+        Best-effort: a miss just leaves the default round.
+        """
+        # tab-date/tab-round are embedded on the landing page's matches widget
+        # (display:none until activated). Click each DIRECTLY by its stable
+        # data-testid — clicking the 'Matches' top-nav first re-mounts the
+        # section and the toggles vanish before the next click lands. Render
+        # timing varies by proxy exit, so wait for each toggle to mount first.
+        for tid in ("tab-date", "tab-round"):
+            sel = '[data-testid="' + tid + '"]'
+            try:
+                self._page.wait_for_function(
+                    "() => !!document.querySelector('" + sel + "')", timeout=8000,
+                )
+                hit = self._page.evaluate(
+                    "() => { const e = document.querySelector('" + sel + "');"
+                    " if (e) { e.click(); return true; } return false; }"
+                )
+                logger.info("sofascore nudge %s -> %s", tid, hit)
+                self._page.wait_for_timeout(self._tab_wait_ms)
+            except Exception as e:  # noqa: BLE001 — nudge is best-effort
+                logger.info("sofascore nudge %s: not mounted (%s)", tid, e)
+
+    # -- internals -------------------------------------------------------- #
+    def _navigate(self, url: str, extra_settle_ms: int = 0) -> None:
+        self._page.goto(url, wait_until="domcontentloaded", timeout=self._nav_timeout_ms)
+        self._dismiss_consent()
+        self._page.wait_for_timeout(self._settle_ms + extra_settle_ms)
+
+    def _dismiss_consent(self) -> None:
+        for name in _CONSENT_BUTTONS:
+            try:
+                self._page.get_by_role("button", name=re.compile(name, re.I)).first.click(timeout=2000)
+                self._page.wait_for_timeout(1000)
+                return
+            except Exception:
+                pass
+
+    def _click_tabs(self, tabs=_EVENT_TABS) -> None:
+        for label in tabs:
+            clicked = False
+            # Prefer the stable data-testid via a JS click (bypasses Playwright
+            # actionability and follows the SPA's own handler — same trick as
+            # _nudge_results). get_by_text is a fallback for tabs without a known
+            # testid, but it can grab a non-tab label node (#751 PR2).
+            testid = _TAB_TESTIDS.get(label)
+            if testid:
+                try:
+                    clicked = bool(self._page.evaluate(
+                        "(tid) => { const e = document.querySelector("
+                        "'[data-testid=\"' + tid + '\"]');"
+                        " if (e) { e.scrollIntoView(); e.click(); return true; }"
+                        " return false; }",
+                        testid,
+                    ))
+                except Exception:
+                    clicked = False
+            if not clicked:
+                try:
+                    self._page.get_by_text(label, exact=False).first.click(timeout=3000)
+                    clicked = True
+                except Exception:
+                    pass
+            if clicked:
+                self._page.wait_for_timeout(self._tab_wait_ms)
+
+    def _extract_player_next_data(self, player_id) -> Optional[dict]:
+        """Read ``__NEXT_DATA__`` off the player page and dig the SSR'd bio out of
+        it (see module-level :func:`extract_player_from_next_data`)."""
+        try:
+            text = self._page.evaluate(
+                "() => { const e = document.getElementById('__NEXT_DATA__');"
+                " return e ? e.textContent : null; }"
+            )
+        except Exception:  # noqa: BLE001
+            logger.info("sofascore __NEXT_DATA__ read failed", exc_info=True)
+            return None
+        if not text:
+            return None
+        try:
+            return extract_player_from_next_data(json.loads(text), player_id)
+        except Exception:  # noqa: BLE001 — malformed SSR JSON
+            logger.info("sofascore __NEXT_DATA__ parse failed", exc_info=True)
+            return None

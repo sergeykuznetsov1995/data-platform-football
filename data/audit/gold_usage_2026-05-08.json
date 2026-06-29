@@ -1,0 +1,218 @@
+{
+  "generated_at": "2026-05-08T09:21:30.334218+00:00",
+  "trino_method": "shows_tables",
+  "trino_query_method": "dag_sql_scan",
+  "tables": [
+    {
+      "table": "dim_competition",
+      "fqn": "iceberg.gold.dim_competition",
+      "dag_sql_refs": 0,
+      "superset_dataset_id": null,
+      "superset_chart_count": 0,
+      "openmetadata_downstream_count": 0,
+      "verdict": "unused"
+    },
+    {
+      "table": "dim_match",
+      "fqn": "iceberg.gold.dim_match",
+      "dag_sql_refs": 5,
+      "superset_dataset_id": null,
+      "superset_chart_count": 0,
+      "openmetadata_downstream_count": 0,
+      "verdict": "active"
+    },
+    {
+      "table": "dim_player",
+      "fqn": "iceberg.gold.dim_player",
+      "dag_sql_refs": 1,
+      "superset_dataset_id": null,
+      "superset_chart_count": 0,
+      "openmetadata_downstream_count": 0,
+      "verdict": "active"
+    },
+    {
+      "table": "dim_referee",
+      "fqn": "iceberg.gold.dim_referee",
+      "dag_sql_refs": 0,
+      "superset_dataset_id": null,
+      "superset_chart_count": 0,
+      "openmetadata_downstream_count": 0,
+      "verdict": "unused"
+    },
+    {
+      "table": "dim_season",
+      "fqn": "iceberg.gold.dim_season",
+      "dag_sql_refs": 0,
+      "superset_dataset_id": null,
+      "superset_chart_count": 0,
+      "openmetadata_downstream_count": 0,
+      "verdict": "unused"
+    },
+    {
+      "table": "dim_standings",
+      "fqn": "iceberg.gold.dim_standings",
+      "dag_sql_refs": 0,
+      "superset_dataset_id": null,
+      "superset_chart_count": 0,
+      "openmetadata_downstream_count": 0,
+      "verdict": "unused"
+    },
+    {
+      "table": "dim_team",
+      "fqn": "iceberg.gold.dim_team",
+      "dag_sql_refs": 1,
+      "superset_dataset_id": null,
+      "superset_chart_count": 0,
+      "openmetadata_downstream_count": 0,
+      "verdict": "active"
+    },
+    {
+      "table": "dim_venue",
+      "fqn": "iceberg.gold.dim_venue",
+      "dag_sql_refs": 0,
+      "superset_dataset_id": null,
+      "superset_chart_count": 0,
+      "openmetadata_downstream_count": 0,
+      "verdict": "unused"
+    },
+    {
+      "table": "entity_xref",
+      "fqn": "iceberg.gold.entity_xref",
+      "dag_sql_refs": 4,
+      "superset_dataset_id": null,
+      "superset_chart_count": 0,
+      "openmetadata_downstream_count": 0,
+      "verdict": "active"
+    },
+    {
+      "table": "fct_match",
+      "fqn": "iceberg.gold.fct_match",
+      "dag_sql_refs": 3,
+      "superset_dataset_id": null,
+      "superset_chart_count": 0,
+      "openmetadata_downstream_count": 0,
+      "verdict": "active"
+    },
+    {
+      "table": "fct_match_test",
+      "fqn": "iceberg.gold.fct_match_test",
+      "dag_sql_refs": 0,
+      "superset_dataset_id": null,
+      "superset_chart_count": 0,
+      "openmetadata_downstream_count": 0,
+      "verdict": "unused"
+    },
+    {
+      "table": "fct_match_train",
+      "fqn": "iceberg.gold.fct_match_train",
+      "dag_sql_refs": 0,
+      "superset_dataset_id": null,
+      "superset_chart_count": 0,
+      "openmetadata_downstream_count": 0,
+      "verdict": "unused"
+    },
+    {
+      "table": "fct_player_match",
+      "fqn": "iceberg.gold.fct_player_match",
+      "dag_sql_refs": 1,
+      "superset_dataset_id": null,
+      "superset_chart_count": 0,
+      "openmetadata_downstream_count": 0,
+      "verdict": "active"
+    },
+    {
+      "table": "fct_player_unavailable",
+      "fqn": "iceberg.gold.fct_player_unavailable",
+      "dag_sql_refs": 1,
+      "superset_dataset_id": null,
+      "superset_chart_count": 0,
+      "openmetadata_downstream_count": 0,
+      "verdict": "active"
+    },
+    {
+      "table": "fct_team_match",
+      "fqn": "iceberg.gold.fct_team_match",
+      "dag_sql_refs": 3,
+      "superset_dataset_id": null,
+      "superset_chart_count": 0,
+      "openmetadata_downstream_count": 0,
+      "verdict": "active"
+    },
+    {
+      "table": "feat_player_form",
+      "fqn": "iceberg.gold.feat_player_form",
+      "dag_sql_refs": 0,
+      "superset_dataset_id": null,
+      "superset_chart_count": 0,
+      "openmetadata_downstream_count": 0,
+      "verdict": "unused"
+    },
+    {
+      "table": "feat_player_season",
+      "fqn": "iceberg.gold.feat_player_season",
+      "dag_sql_refs": 0,
+      "superset_dataset_id": null,
+      "superset_chart_count": 0,
+      "openmetadata_downstream_count": 0,
+      "verdict": "unused"
+    },
+    {
+      "table": "feat_team_elo",
+      "fqn": "iceberg.gold.feat_team_elo",
+      "dag_sql_refs": 0,
+      "superset_dataset_id": null,
+      "superset_chart_count": 0,
+      "openmetadata_downstream_count": 0,
+      "verdict": "unused"
+    },
+    {
+      "table": "feat_team_form",
+      "fqn": "iceberg.gold.feat_team_form",
+      "dag_sql_refs": 1,
+      "superset_dataset_id": null,
+      "superset_chart_count": 0,
+      "openmetadata_downstream_count": 0,
+      "verdict": "active"
+    },
+    {
+      "table": "feat_team_h2h",
+      "fqn": "iceberg.gold.feat_team_h2h",
+      "dag_sql_refs": 1,
+      "superset_dataset_id": null,
+      "superset_chart_count": 0,
+      "openmetadata_downstream_count": 0,
+      "verdict": "active"
+    },
+    {
+      "table": "feat_team_xg_form",
+      "fqn": "iceberg.gold.feat_team_xg_form",
+      "dag_sql_refs": 1,
+      "superset_dataset_id": null,
+      "superset_chart_count": 0,
+      "openmetadata_downstream_count": 0,
+      "verdict": "active"
+    },
+    {
+      "table": "match_outcomes",
+      "fqn": "iceberg.gold.match_outcomes",
+      "dag_sql_refs": 2,
+      "superset_dataset_id": null,
+      "superset_chart_count": 0,
+      "openmetadata_downstream_count": 0,
+      "verdict": "active"
+    },
+    {
+      "table": "predictions_input",
+      "fqn": "iceberg.gold.predictions_input",
+      "dag_sql_refs": 0,
+      "superset_dataset_id": null,
+      "superset_chart_count": 0,
+      "openmetadata_downstream_count": 0,
+      "verdict": "unused"
+    }
+  ],
+  "summary": {
+    "active": 12,
+    "unused": 11
+  }
+}

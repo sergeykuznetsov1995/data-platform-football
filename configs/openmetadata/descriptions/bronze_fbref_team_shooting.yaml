@@ -1,0 +1,55 @@
+# =============================================================================
+# OpenMetadata description: iceberg.bronze.fbref_team_shooting
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.bronze.fbref_team_shooting
+  description: |
+    Сезонная статистика ударов команд из FBref (Squad Shooting). Гранулярность:
+    один row на (squad, league, season). Источник: FBref scrape (dag_ingest_fbref).
+  tags:
+    - Tier.Bronze
+    - Domain.Football
+    - PII.None
+columns:
+  - name: squad
+    description: Название команды.
+  - name: "# pl"
+    description: Число игроков, использованных командой за сезон (Players used).
+  - name: 90s
+    description: Число 90-минуток (минуты / 90).
+  - name: gls
+    description: Голы.
+  - name: sh
+    description: Удары (всего).
+  - name: sot
+    description: Удары в створ (Shots on Target).
+  - name: sot%
+    description: Доля ударов в створ, % (SoT / Shots).
+  - name: sh/90
+    description: Удары на 90 минут.
+  - name: sot/90
+    description: Удары в створ на 90 минут.
+  - name: g/sh
+    description: Голов на удар (Goals per Shot).
+  - name: g/sot
+    description: Голов на удар в створ (Goals per Shot on Target).
+  - name: pk
+    description: Забитые пенальти.
+  - name: pkatt
+    description: Пробитые пенальти (попытки).
+  - name: team_id
+    description: FBref ID команды.
+  - name: league
+    description: Лига (partition key).
+  - name: season
+    description: Сезон — год начала (bigint, напр. 2025 = сезон 2025/26).
+  - name: stat_type
+    description: Категория stat-таблицы FBref (для этой таблицы — shooting).
+  - name: _source
+    description: Источник данных Bronze (всегда 'fbref').
+  - name: _entity_type
+    description: Внутренняя метка типа сущности ingest-конвейера FBref.
+  - name: _ingested_at
+    description: Timestamp ingest'а строки в Bronze.
+  - name: _batch_id
+    description: ID batch'а загрузки (трассировка и идемпотентность ingest).

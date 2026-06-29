@@ -1,0 +1,162 @@
+---
+# =============================================================================
+# Superset datasources — declarative source of truth
+# =============================================================================
+# Декларативное описание подключений и датасетов Superset.
+# Применяется через configs/superset/import_datasources.py при bootstrap.
+#
+# Формат — нативный для Superset 4.x: одна database, плоский список tables.
+# В Superset 4.x официальный CLI `superset import_datasources` принимает только
+# ZIP-архивы (см. https://github.com/apache/superset/blob/master/docs/admin_docs/
+# configuration/importing-exporting-datasources.mdx). Поэтому bootstrap.sh
+# использует Python-имплантат, который читает этот YAML и создаёт объекты
+# через Superset SDK (SupersetSecurityManager + SqlaTable).
+#
+# При первом импорте `sqlalchemy_uri` будет заменён на боевой URI с паролем
+# из переменной окружения TRINO_SUPERSET_PASSWORD (см. bootstrap.sh).
+# =============================================================================
+
+databases:
+  - database_name: trino_iceberg
+    # Boilerplate URI без пароля; bootstrap.sh подставит реальный пароль через
+    # `superset set-database-uri`.
+    sqlalchemy_uri: trino://superset@trino:8443/iceberg
+    expose_in_sqllab: true
+    allow_ctas: false
+    allow_cvas: false
+    allow_dml: false
+    allow_run_async: true
+    cache_timeout: 3600
+    extra: |
+      {
+        "metadata_params": {},
+        "engine_params": {
+          "connect_args": {
+            "http_scheme": "https",
+            "verify": false,
+            "source": "superset"
+          },
+          "pool_pre_ping": true,
+          "pool_recycle": 1800
+        },
+        "schemas_allowed_for_file_upload": []
+      }
+
+    tables:
+
+      # -----------------------------------------------------------------------
+      # Dimensions
+      # -----------------------------------------------------------------------
+      - table_name: dim_team
+        schema: gold
+        description: |
+          Канонический справочник клубов (#425: одна строка = один клуб,
+          PK team_id; team_name/country/short_name из team_aliases.yaml).
+          Используется как FK target из fct_team_match и других фактов.
+        default_endpoint: null
+        cache_timeout: 3600
+
+      - table_name: dim_player
+        schema: gold
+        description: |
+          Канонический справочник игроков (#425: одна строка = один игрок,
+          PK player_id; dob/nationality/height_cm/preferred_foot/primary_position
+          через multi-source COALESCE). FK target из fct_player_match и пр.
+        default_endpoint: null
+        cache_timeout: 3600
+
+      - table_name: dim_match
+        schema: gold
+        description: |
+          Паспорт матча (#425): match_date, kickoff_time, тур, FK на команды,
+          судью (referee_id), стадион (venue_id), тренеров, счёт, исход 1X2.
+          PK match_id. Центр звезды — FK target для всех fct_*-таблиц.
+        default_endpoint: null
+        cache_timeout: 3600
+
+      # -----------------------------------------------------------------------
+      # Facts
+      # -----------------------------------------------------------------------
+      - table_name: fct_team_match
+        schema: gold
+        description: |
+          Long-form факт: одна строка на (match_id, team_id) — обе команды матча.
+          Per-match командные метрики 5 источников (FBref spine).
+        default_endpoint: null
+        cache_timeout: 1800
+
+      - table_name: fct_player_match
+        schema: gold
+        description: |
+          Multi-source per-match player stats (FBref + SofaScore + Understat + WhoScored).
+          PK: (match_id_canonical, player_id_canonical) — cross-source canonical через xref_*.
+          FBref-метрики: голы, ассисты, минуты, удары, карточки, отборы, перехваты.
+          SofaScore: rating (0-10), ground_duels_won, aerial_duels_won.
+          Understat: expected_goals, expected_assists, key_passes.
+          WhoScored: dribbles.
+          Источник для per-match timeline-аналитики.
+        default_endpoint: null
+        cache_timeout: 1800
+
+      # -----------------------------------------------------------------------
+      # E3/E4 facts (event-level + narrow facts)
+      # -----------------------------------------------------------------------
+      - table_name: fct_event
+        schema: gold
+        description: |
+          Event-grain факт (~695k строк): SPADL-канонизированные события
+          WhoScored с x/y координатами (0-100).
+          PK (event_id_canonical). Партиции (league, season).
+        default_endpoint: null
+        cache_timeout: 3600
+
+      - table_name: fct_shot
+        schema: gold
+        description: |
+          Shot-grain факт с xG (Understat). Один удар = одна строка.
+          Содержит player_id, assist_player_id, xg, is_goal, x/y. Партиции (league, season).
+        default_endpoint: null
+        cache_timeout: 3600
+
+      - table_name: fct_lineup
+        schema: gold
+        description: |
+          Стартовые составы и замены (ESPN). Per-(match, team, player).
+          Используется для расчёта minutes_played и tactical analytics.
+        default_endpoint: null
+        cache_timeout: 3600
+
+      - table_name: fct_match_timeline
+        schema: gold
+        description: |
+          Единая поминутная хроника матча (#427): голы, карточки, замены в одной
+          таблице. Заменяет дропнутые fct_goal/fct_card/fct_substitution (#448).
+          Зерно: (match_id, event_seq). Источники: silver.fbref_match_events
+          (primary) ∪ bronze.whoscored_events (per-match fallback).
+          event_type — словарь из 8 значений; score_home/away_after — счёт после события.
+        default_endpoint: null
+        cache_timeout: 3600
+
+      - table_name: fct_match_odds
+        schema: gold
+        description: |
+          Pre-match букмекерские коэффициенты 1X2 + totals + BTTS
+          (football-data.co.uk). Используется как baseline для ML.
+        default_endpoint: null
+        cache_timeout: 3600
+
+      - table_name: fct_match_rating
+        schema: gold
+        description: |
+          Per-(match, player) рейтинг SofaScore (0-10). Источник
+          для performance-аналитики и aggregated team performance.
+        default_endpoint: null
+        cache_timeout: 3600
+
+      - table_name: fct_player_unavailable
+        schema: gold
+        description: |
+          Travail/injuries/suspensions: per-(match, player, reason).
+          Источник: silver.whoscored_missing_players. E5.
+        default_endpoint: null
+        cache_timeout: 3600

@@ -1,0 +1,83 @@
+# =============================================================================
+# OpenMetadata description: iceberg.bronze.fbref_match_player_stats
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.bronze.fbref_match_player_stats
+  description: |
+    Индивидуальная статистика игроков за матч из сводных таблиц FBref
+    (stats_<team>_summary). Гранулярность: один row на (match_id, player).
+    Счётчики уже приведены к числовым типам; pkwon/pkcon часто NULL (ожидаемо,
+    см. expected-NULL allowlist). Источник: FBref scrape (dag_ingest_fbref).
+  tags:
+    - Tier.Bronze
+    - Domain.Football
+    - PII.Low
+columns:
+  - name: player
+    description: Имя игрока.
+    tags:
+      - PII.Low
+  - name: "#"
+    description: Игровой номер игрока.
+  - name: nation
+    description: Код страны игрока (напр. "eng ENG").
+  - name: pos
+    description: Позиция игрока в матче.
+  - name: age
+    description: Возраст игрока на дату матча (формат "ГГ-ДДД").
+  - name: min
+    description: Сыграно минут.
+  - name: gls
+    description: Голы.
+  - name: ast
+    description: Голевые передачи (ассисты).
+  - name: pk
+    description: Забитые пенальти.
+  - name: pkatt
+    description: Пробитые пенальти (попытки).
+  - name: sh
+    description: Удары (всего).
+  - name: sot
+    description: Удары в створ.
+  - name: crdy
+    description: Жёлтые карточки.
+  - name: crdr
+    description: Красные карточки.
+  - name: fls
+    description: Фолы совершённые.
+  - name: fld
+    description: Фолы заработанные (на игроке сфолили).
+  - name: "off"
+    description: Положения вне игры (офсайды).
+  - name: crs
+    description: Навесы (crosses).
+  - name: tklw
+    description: Отборы с возвратом владения (Tackles Won).
+  - name: int
+    description: Перехваты (interceptions).
+  - name: og
+    description: Автоголы.
+  - name: pkwon
+    description: Заработанные пенальти (часто NULL).
+  - name: pkcon
+    description: Привезённые пенальти (часто NULL).
+  - name: player_id
+    description: FBref ID игрока.
+  - name: team_side
+    description: Сторона команды (Home / Away).
+  - name: team
+    description: Название команды игрока.
+  - name: match_id
+    description: FBref ID матча.
+  - name: league
+    description: Лига (partition key).
+  - name: season
+    description: Сезон — год начала (bigint, напр. 2025 = сезон 2025/26).
+  - name: _source
+    description: Источник данных Bronze (всегда 'fbref').
+  - name: _entity_type
+    description: Внутренняя метка типа сущности ingest-конвейера FBref.
+  - name: _ingested_at
+    description: Timestamp ingest'а строки в Bronze.
+  - name: _batch_id
+    description: ID batch'а загрузки (трассировка и идемпотентность ingest).

@@ -1,0 +1,617 @@
+"""
+Tests for IcebergWriter.
+
+Tests the new Trino-based IcebergWriter that writes data directly
+to Iceberg tables via Trino INSERT statements.
+"""
+
+import pytest
+import pandas as pd
+from datetime import datetime
+from unittest.mock import MagicMock, patch
+
+
+class TestIcebergWriterInit:
+    """Tests for IcebergWriter initialization."""
+
+    def test_init_default_values(self):
+        """Test IcebergWriter default initialization values."""
+        with patch.dict('sys.modules', {'trino': MagicMock(), 'trino.dbapi': MagicMock()}):
+            with patch.dict('os.environ', {}, clear=False):
+                from scrapers.base.iceberg_writer import IcebergWriter
+                writer = IcebergWriter()
+                assert writer.trino_host == 'trino'
+                assert writer.trino_port is None  # TrinoTableManager decides port based on auth mode
+                assert writer.catalog == 'iceberg'
+
+    def test_init_custom_values(self):
+        """Test IcebergWriter custom initialization values."""
+        with patch.dict('sys.modules', {'trino': MagicMock(), 'trino.dbapi': MagicMock()}):
+            from scrapers.base.iceberg_writer import IcebergWriter
+            writer = IcebergWriter(
+                trino_host='custom-trino',
+                trino_port=9090,
+                catalog='custom_catalog',
+            )
+            assert writer.trino_host == 'custom-trino'
+            assert writer.trino_port == 9090
+            assert writer.catalog == 'custom_catalog'
+
+    def test_init_from_environment(self):
+        """Test IcebergWriter reads from environment variables."""
+        with patch.dict('sys.modules', {'trino': MagicMock(), 'trino.dbapi': MagicMock()}):
+            with patch.dict('os.environ', {'TRINO_HOST': 'env-trino', 'TRINO_PORT': '8888'}):
+                from scrapers.base.iceberg_writer import IcebergWriter
+                writer = IcebergWriter()
+                assert writer.trino_host == 'env-trino'
+                assert writer.trino_port is None  # TRINO_PORT resolved by TrinoTableManager, not IcebergWriter
+
+
+class TestIcebergWriterMetadata:
+    """Tests for metadata column handling."""
+
+    def test_add_metadata_columns(self):
+        """Test adding metadata columns to DataFrame."""
+        with patch.dict('sys.modules', {'trino': MagicMock(), 'trino.dbapi': MagicMock()}):
+            from scrapers.base.iceberg_writer import IcebergWriter
+            writer = IcebergWriter()
+
+            df = pd.DataFrame({'col1': [1, 2, 3]})
+            result = writer._add_metadata_columns(df, source='test_source')
+
+            assert '_source' in result.columns
+            assert '_ingested_at' in result.columns
+            assert '_batch_id' in result.columns
+            assert result['_source'].iloc[0] == 'test_source'
+            assert isinstance(result['_ingested_at'].iloc[0], datetime)
+
+    def test_add_metadata_columns_custom_batch_id(self):
+        """Test adding metadata columns with custom batch_id."""
+        with patch.dict('sys.modules', {'trino': MagicMock(), 'trino.dbapi': MagicMock()}):
+            from scrapers.base.iceberg_writer import IcebergWriter
+            writer = IcebergWriter()
+
+            df = pd.DataFrame({'col1': [1, 2]})
+            result = writer._add_metadata_columns(df, source='test', batch_id='custom-batch-123')
+
+            assert result['_batch_id'].iloc[0] == 'custom-batch-123'
+
+
+class TestIcebergWriterTrinoManager:
+    """Tests for TrinoTableManager integration."""
+
+    def test_get_trino_manager_creates_instance(self):
+        """Test _get_trino_manager creates TrinoTableManager."""
+        with patch.dict('sys.modules', {'trino': MagicMock(), 'trino.dbapi': MagicMock()}):
+            from scrapers.base.iceberg_writer import IcebergWriter
+            writer = IcebergWriter()
+
+            # Mock the TrinoTableManager import inside _get_trino_manager
+            with patch('scrapers.base.trino_manager.TrinoTableManager') as MockTrino:
+                mock_manager = MagicMock()
+                MockTrino.return_value = mock_manager
+
+                result = writer._get_trino_manager()
+                assert result is not None
+
+    def test_namespace_exists_delegates_to_trino(self):
+        """Test namespace_exists delegates to TrinoTableManager."""
+        with patch.dict('sys.modules', {'trino': MagicMock(), 'trino.dbapi': MagicMock()}):
+            from scrapers.base.iceberg_writer import IcebergWriter
+            writer = IcebergWriter()
+
+            mock_trino = MagicMock()
+            mock_trino.schema_exists.return_value = True
+            writer._trino_manager = mock_trino
+
+            result = writer.namespace_exists('bronze')
+
+            assert result is True
+            mock_trino.schema_exists.assert_called_once_with('bronze')
+
+    def test_table_exists_delegates_to_trino(self):
+        """Test table_exists delegates to TrinoTableManager."""
+        with patch.dict('sys.modules', {'trino': MagicMock(), 'trino.dbapi': MagicMock()}):
+            from scrapers.base.iceberg_writer import IcebergWriter
+            writer = IcebergWriter()
+
+            mock_trino = MagicMock()
+            mock_trino.table_exists.return_value = True
+            writer._trino_manager = mock_trino
+
+            result = writer.table_exists('bronze', 'test_table')
+
+            assert result is True
+            mock_trino.table_exists.assert_called_once_with('bronze', 'test_table')
+
+
+class TestIcebergWriterWriteDataFrame:
+    """Tests for write_dataframe operation."""
+
+    def test_write_dataframe_empty(self):
+        """Test writing empty DataFrame returns table name without writing."""
+        with patch.dict('sys.modules', {'trino': MagicMock(), 'trino.dbapi': MagicMock()}):
+            from scrapers.base.iceberg_writer import IcebergWriter
+            writer = IcebergWriter()
+
+            df = pd.DataFrame()
+            result = writer.write_dataframe(df, 'bronze', 'test_table')
+
+            assert result == 'iceberg.bronze.test_table'
+
+    def test_write_dataframe_calls_write_to_iceberg(self):
+        """Test write_dataframe calls _write_to_iceberg."""
+        with patch.dict('sys.modules', {'trino': MagicMock(), 'trino.dbapi': MagicMock()}):
+            from scrapers.base.iceberg_writer import IcebergWriter
+            writer = IcebergWriter()
+
+            df = pd.DataFrame({'col1': [1, 2, 3]})
+
+            with patch.object(writer, '_write_to_iceberg', return_value='iceberg.bronze.test') as mock_write:
+                writer.write_dataframe(df, 'bronze', 'test_table')
+                mock_write.assert_called_once()
+
+    def test_write_dataframe_adds_metadata(self):
+        """Test write_dataframe adds metadata columns when requested."""
+        with patch.dict('sys.modules', {'trino': MagicMock(), 'trino.dbapi': MagicMock()}):
+            from scrapers.base.iceberg_writer import IcebergWriter
+            writer = IcebergWriter()
+
+            df = pd.DataFrame({'col1': [1, 2]})
+
+            with patch.object(writer, '_write_to_iceberg') as mock_write:
+                writer.write_dataframe(df, 'bronze', 'test', add_metadata=True, source='my_source')
+
+                # Check that the DataFrame passed to _write_to_iceberg has metadata
+                call_args = mock_write.call_args
+                written_df = call_args[0][0]
+                assert '_source' in written_df.columns
+                assert '_ingested_at' in written_df.columns
+                assert '_batch_id' in written_df.columns
+
+    def test_write_dataframe_skips_metadata_when_disabled(self):
+        """Test write_dataframe skips metadata when add_metadata=False."""
+        with patch.dict('sys.modules', {'trino': MagicMock(), 'trino.dbapi': MagicMock()}):
+            from scrapers.base.iceberg_writer import IcebergWriter
+            writer = IcebergWriter()
+
+            df = pd.DataFrame({'col1': [1, 2]})
+
+            with patch.object(writer, '_write_to_iceberg') as mock_write:
+                writer.write_dataframe(df, 'bronze', 'test', add_metadata=False)
+
+                call_args = mock_write.call_args
+                written_df = call_args[0][0]
+                assert '_source' not in written_df.columns
+
+
+class TestIcebergWriterWriteToIceberg:
+    """Tests for _write_to_iceberg internal method."""
+
+    def test_write_to_iceberg_creates_table(self):
+        """Test _write_to_iceberg creates table if not exists."""
+        with patch.dict('sys.modules', {'trino': MagicMock(), 'trino.dbapi': MagicMock()}):
+            from scrapers.base.iceberg_writer import IcebergWriter
+            writer = IcebergWriter()
+
+            mock_trino = MagicMock()
+            mock_trino.table_exists.return_value = False
+            mock_trino.arrow_schema_to_trino.return_value = {'col1': 'BIGINT'}
+            mock_trino.insert_dataframe_atomic.return_value = 3
+            writer._trino_manager = mock_trino
+
+            df = pd.DataFrame({'col1': [1, 2, 3]})
+            result = writer._write_to_iceberg(df, 'bronze', 'test_table', None)
+
+            mock_trino.create_iceberg_table.assert_called_once()
+            mock_trino.insert_dataframe_atomic.assert_called_once()
+            assert result == 'iceberg.bronze.test_table'
+
+    def test_write_to_iceberg_skips_table_creation_if_exists(self):
+        """Test _write_to_iceberg skips table creation if exists."""
+        with patch.dict('sys.modules', {'trino': MagicMock(), 'trino.dbapi': MagicMock()}):
+            from scrapers.base.iceberg_writer import IcebergWriter
+            writer = IcebergWriter()
+
+            mock_trino = MagicMock()
+            mock_trino.table_exists.return_value = True
+            mock_trino.insert_dataframe_atomic.return_value = 3
+            writer._trino_manager = mock_trino
+
+            df = pd.DataFrame({'col1': [1, 2, 3]})
+            writer._write_to_iceberg(df, 'bronze', 'test_table', None)
+
+            mock_trino.create_iceberg_table.assert_not_called()
+            mock_trino.insert_dataframe_atomic.assert_called_once()
+
+    def test_write_to_iceberg_overwrite_mode(self):
+        """Test _write_to_iceberg deletes data in overwrite mode."""
+        with patch.dict('sys.modules', {'trino': MagicMock(), 'trino.dbapi': MagicMock()}):
+            from scrapers.base.iceberg_writer import IcebergWriter
+            writer = IcebergWriter()
+
+            mock_trino = MagicMock()
+            mock_trino.table_exists.return_value = True
+            mock_trino.insert_dataframe_atomic.return_value = 2
+            writer._trino_manager = mock_trino
+
+            df = pd.DataFrame({'col1': [1, 2]})
+            writer._write_to_iceberg(df, 'bronze', 'test', None, mode='overwrite')
+
+            # Should call DELETE before INSERT
+            mock_trino._execute.assert_called()
+            delete_call = mock_trino._execute.call_args[0][0]
+            assert 'DELETE FROM' in delete_call
+
+    def test_write_to_iceberg_with_partitions(self):
+        """Test _write_to_iceberg creates table with partitions."""
+        with patch.dict('sys.modules', {'trino': MagicMock(), 'trino.dbapi': MagicMock()}):
+            from scrapers.base.iceberg_writer import IcebergWriter
+            writer = IcebergWriter()
+
+            mock_trino = MagicMock()
+            mock_trino.table_exists.return_value = False
+            mock_trino.arrow_schema_to_trino.return_value = {
+                'col1': 'BIGINT',
+                'league': 'VARCHAR',
+            }
+            mock_trino.insert_dataframe_atomic.return_value = 1
+            writer._trino_manager = mock_trino
+
+            df = pd.DataFrame({'col1': [1], 'league': ['EPL']})
+            partition_spec = [('league', 'identity')]
+
+            writer._write_to_iceberg(df, 'bronze', 'test', partition_spec)
+
+            # Check partition columns were passed
+            call_args = mock_trino.create_iceberg_table.call_args
+            assert call_args.kwargs.get('partition_columns') == ['league']
+
+    def test_write_to_iceberg_routes_delete_filter_into_atomic(self):
+        """replace_partitions (#314): the writer hands delete_filter to
+        insert_dataframe_atomic instead of issuing its own DELETE — so the swap
+        is atomic (stage-first) and a failed INSERT can't leave the table empty."""
+        with patch.dict('sys.modules', {'trino': MagicMock(), 'trino.dbapi': MagicMock()}):
+            from scrapers.base.iceberg_writer import IcebergWriter
+            writer = IcebergWriter()
+
+            mock_trino = MagicMock()
+            mock_trino.table_exists.return_value = True
+            mock_trino.insert_dataframe_atomic.return_value = 2
+            writer._trino_manager = mock_trino
+
+            df = pd.DataFrame({'col1': [1, 2], 'league': ['EPL', 'EPL']})
+            writer._write_to_iceberg(
+                df, 'bronze', 'test', None, delete_filter="league = 'EPL'",
+            )
+
+            # delete_filter is forwarded to the atomic writer...
+            assert mock_trino.insert_dataframe_atomic.call_args.kwargs.get(
+                'delete_filter'
+            ) == "league = 'EPL'"
+            # ...and the writer no longer issues a standalone partition DELETE.
+            delete_calls = [
+                c for c in mock_trino._execute.call_args_list
+                if 'DELETE FROM' in str(c)
+            ]
+            assert delete_calls == []
+
+
+class TestIcebergWriterArrowConversion:
+    """Tests for Arrow conversion."""
+
+    def test_pandas_to_arrow(self):
+        """Test pandas to arrow conversion."""
+        with patch.dict('sys.modules', {'trino': MagicMock(), 'trino.dbapi': MagicMock()}):
+            from scrapers.base.iceberg_writer import IcebergWriter
+            writer = IcebergWriter()
+
+            df = pd.DataFrame({
+                'int_col': [1, 2, 3],
+                'str_col': ['a', 'b', 'c'],
+                'float_col': [1.1, 2.2, 3.3],
+            })
+
+            arrow_table = writer._pandas_to_arrow(df)
+
+            assert arrow_table.num_rows == 3
+            assert len(arrow_table.schema) == 3
+
+    def test_pandas_to_arrow_handles_timestamps(self):
+        """Test pandas to arrow conversion handles timestamps."""
+        with patch.dict('sys.modules', {'trino': MagicMock(), 'trino.dbapi': MagicMock()}):
+            from scrapers.base.iceberg_writer import IcebergWriter
+            writer = IcebergWriter()
+
+            df = pd.DataFrame({
+                'ts_col': pd.to_datetime(['2024-01-01', '2024-01-02']),
+            })
+
+            arrow_table = writer._pandas_to_arrow(df)
+
+            assert arrow_table.num_rows == 2
+            # Should be converted to microseconds
+            assert 'timestamp' in str(arrow_table.schema[0].type).lower()
+
+
+class TestIcebergWriterTableOperations:
+    """Tests for table operation methods."""
+
+    def test_create_table_if_not_exists_creates(self):
+        """Test create_table_if_not_exists creates table when not exists."""
+        with patch.dict('sys.modules', {'trino': MagicMock(), 'trino.dbapi': MagicMock()}):
+            import pyarrow as pa
+            from scrapers.base.iceberg_writer import IcebergWriter
+            writer = IcebergWriter()
+
+            mock_trino = MagicMock()
+            mock_trino.table_exists.return_value = False
+            mock_trino.arrow_schema_to_trino.return_value = {'col1': 'BIGINT'}
+            writer._trino_manager = mock_trino
+
+            schema = pa.schema([('col1', pa.int64())])
+            writer.create_table_if_not_exists('bronze', 'test', schema)
+
+            mock_trino.create_iceberg_table.assert_called_once()
+
+    def test_create_table_if_not_exists_skips_if_exists(self):
+        """Test create_table_if_not_exists skips if table exists."""
+        with patch.dict('sys.modules', {'trino': MagicMock(), 'trino.dbapi': MagicMock()}):
+            import pyarrow as pa
+            from scrapers.base.iceberg_writer import IcebergWriter
+            writer = IcebergWriter()
+
+            mock_trino = MagicMock()
+            mock_trino.table_exists.return_value = True
+            writer._trino_manager = mock_trino
+
+            schema = pa.schema([('col1', pa.int64())])
+            writer.create_table_if_not_exists('bronze', 'test', schema)
+
+            mock_trino.create_iceberg_table.assert_not_called()
+
+    def test_compact_table(self):
+        """Test compact_table calls optimize."""
+        with patch.dict('sys.modules', {'trino': MagicMock(), 'trino.dbapi': MagicMock()}):
+            from scrapers.base.iceberg_writer import IcebergWriter
+            writer = IcebergWriter()
+
+            mock_trino = MagicMock()
+            writer._trino_manager = mock_trino
+
+            writer.compact_table('bronze', 'test')
+
+            mock_trino._execute.assert_called_once()
+            sql = mock_trino._execute.call_args[0][0]
+            assert 'EXECUTE optimize' in sql
+
+    def test_expire_snapshots(self):
+        """Test expire_snapshots calls expire_snapshots."""
+        with patch.dict('sys.modules', {'trino': MagicMock(), 'trino.dbapi': MagicMock()}):
+            from scrapers.base.iceberg_writer import IcebergWriter
+            writer = IcebergWriter()
+
+            mock_trino = MagicMock()
+            writer._trino_manager = mock_trino
+
+            writer.expire_snapshots('bronze', 'test', retention_days=14)
+
+            mock_trino._execute.assert_called_once()
+            sql = mock_trino._execute.call_args[0][0]
+            assert 'expire_snapshots' in sql
+            assert '14d' in sql
+
+
+class TestIcebergWriterMetadataRecovery:
+    """Tests for ICEBERG_INVALID_METADATA recovery logic."""
+
+    def test_evolve_schema_triggers_recovery(self):
+        """get_table_columns raises ICEBERG_INVALID_METADATA → drop+create+hdfs_clean called, insert succeeds."""
+        with patch.dict('sys.modules', {'trino': MagicMock(), 'trino.dbapi': MagicMock()}):
+            from scrapers.base.iceberg_writer import IcebergWriter
+            from scrapers.base.trino_manager import TrinoError
+            writer = IcebergWriter()
+
+            # Simulate: table_exists=True, but get_table_columns fails with ICEBERG_INVALID_METADATA
+            cause = Exception("Error accessing metadata file")
+            cause.error_name = 'ICEBERG_INVALID_METADATA'
+            metadata_error = TrinoError("SQL execution failed")
+            metadata_error.__cause__ = cause
+
+            mock_trino = MagicMock()
+            mock_trino.table_exists.return_value = True
+            mock_trino.get_table_columns.side_effect = metadata_error
+            mock_trino.arrow_schema_to_trino.return_value = {'col1': 'BIGINT'}
+            mock_trino.insert_dataframe_atomic.return_value = 3
+            writer._trino_manager = mock_trino
+
+            df = pd.DataFrame({'col1': [1, 2, 3]})
+
+            with patch('scrapers.base.iceberg_writer.IcebergWriter._clean_hdfs_table_dir') as mock_clean:
+                result = writer._write_to_iceberg(df, 'bronze', 'test_table', None)
+
+                # Recovery: drop + hdfs_clean + create should have been called
+                mock_trino.drop_table.assert_called_once_with('bronze', 'test_table', if_exists=True)
+                mock_clean.assert_called_once_with('bronze', 'test_table')
+                mock_trino.create_iceberg_table.assert_called_once()
+                # Insert should still proceed
+                mock_trino.insert_dataframe_atomic.assert_called_once()
+                assert result == 'iceberg.bronze.test_table'
+
+    def test_reraises_non_metadata_errors(self):
+        """Regular TrinoError in _evolve_schema → drop NOT called, error re-raised."""
+        with patch.dict('sys.modules', {'trino': MagicMock(), 'trino.dbapi': MagicMock()}):
+            from scrapers.base.iceberg_writer import IcebergWriter
+            from scrapers.base.trino_manager import TrinoError
+            writer = IcebergWriter()
+
+            regular_error = TrinoError("Connection refused")
+
+            mock_trino = MagicMock()
+            mock_trino.table_exists.return_value = True
+            mock_trino.get_table_columns.side_effect = regular_error
+            mock_trino.arrow_schema_to_trino.return_value = {'col1': 'BIGINT'}
+            writer._trino_manager = mock_trino
+
+            df = pd.DataFrame({'col1': [1, 2, 3]})
+
+            with pytest.raises(TrinoError, match="Connection refused"):
+                writer._write_to_iceberg(df, 'bronze', 'test_table', None)
+
+            mock_trino.drop_table.assert_not_called()
+
+    def test_recovery_fails_propagates(self):
+        """drop_table also fails → error propagated to caller."""
+        with patch.dict('sys.modules', {'trino': MagicMock(), 'trino.dbapi': MagicMock()}):
+            from scrapers.base.iceberg_writer import IcebergWriter
+            from scrapers.base.trino_manager import TrinoError
+            writer = IcebergWriter()
+
+            cause = Exception("Error accessing metadata file")
+            cause.error_name = 'ICEBERG_INVALID_METADATA'
+            metadata_error = TrinoError("SQL execution failed")
+            metadata_error.__cause__ = cause
+
+            mock_trino = MagicMock()
+            mock_trino.table_exists.return_value = True
+            mock_trino.get_table_columns.side_effect = metadata_error
+            mock_trino.arrow_schema_to_trino.return_value = {'col1': 'BIGINT'}
+            mock_trino.drop_table.side_effect = TrinoError("DROP failed: permission denied")
+            writer._trino_manager = mock_trino
+
+            df = pd.DataFrame({'col1': [1, 2, 3]})
+
+            with pytest.raises(TrinoError, match="DROP failed"):
+                writer._write_to_iceberg(df, 'bronze', 'test_table', None)
+
+    def test_clean_hdfs_deletes_orphaned_dirs_with_uuid(self):
+        """_clean_hdfs_table_dir deletes dirs matching table name and table-{uuid} pattern."""
+        with patch.dict('sys.modules', {'trino': MagicMock(), 'trino.dbapi': MagicMock()}):
+            from scrapers.base.iceberg_writer import IcebergWriter
+            writer = IcebergWriter()
+
+            mock_hdfs = MagicMock()
+            mock_hdfs.exists.return_value = True
+            mock_hdfs.list_dir.return_value = [
+                {'name': 'fbref_player_stats', 'type': 'DIRECTORY'},
+                {'name': 'fbref_player_stats-abc123', 'type': 'DIRECTORY'},
+                {'name': 'fbref_player_stats-def456', 'type': 'DIRECTORY'},
+                {'name': 'fbref_schedule', 'type': 'DIRECTORY'},
+            ]
+
+            with patch('scrapers.base.hdfs_client.HDFSClient', return_value=mock_hdfs):
+                writer._clean_hdfs_table_dir('bronze', 'fbref_player_stats')
+
+                assert mock_hdfs.delete.call_count == 3
+                deleted_paths = [c[0][0] for c in mock_hdfs.delete.call_args_list]
+                assert '/user/hive/warehouse/bronze.db/fbref_player_stats' in deleted_paths
+                assert '/user/hive/warehouse/bronze.db/fbref_player_stats-abc123' in deleted_paths
+                assert '/user/hive/warehouse/bronze.db/fbref_player_stats-def456' in deleted_paths
+
+    def test_clean_hdfs_skips_nonexistent_schema_dir(self):
+        """_clean_hdfs_table_dir does nothing if schema dir doesn't exist."""
+        with patch.dict('sys.modules', {'trino': MagicMock(), 'trino.dbapi': MagicMock()}):
+            from scrapers.base.iceberg_writer import IcebergWriter
+            writer = IcebergWriter()
+
+            mock_hdfs = MagicMock()
+            mock_hdfs.exists.return_value = False
+
+            with patch('scrapers.base.hdfs_client.HDFSClient', return_value=mock_hdfs):
+                writer._clean_hdfs_table_dir('bronze', 'fbref_player_stats')
+
+                mock_hdfs.delete.assert_not_called()
+                mock_hdfs.list_dir.assert_not_called()
+
+    def test_clean_hdfs_failure_does_not_raise(self):
+        """_clean_hdfs_table_dir logs warning but does not raise on HDFS errors."""
+        with patch.dict('sys.modules', {'trino': MagicMock(), 'trino.dbapi': MagicMock()}):
+            from scrapers.base.iceberg_writer import IcebergWriter
+            writer = IcebergWriter()
+
+            with patch('scrapers.base.hdfs_client.HDFSClient', side_effect=ConnectionError("HDFS down")):
+                # Should not raise — best-effort cleanup
+                writer._clean_hdfs_table_dir('bronze', 'fbref_player_stats')
+
+
+class TestIcebergWriterReadOperations:
+    """Tests for read operation methods."""
+
+    def test_read_table(self):
+        """Test read_table executes SELECT query."""
+        with patch.dict('sys.modules', {'trino': MagicMock(), 'trino.dbapi': MagicMock()}):
+            from scrapers.base.iceberg_writer import IcebergWriter
+            writer = IcebergWriter()
+
+            mock_trino = MagicMock()
+            mock_trino.execute_query.return_value = [(1, 'a'), (2, 'b')]
+            mock_cursor = MagicMock()
+            mock_cursor.description = [('col1',), ('col2',)]
+            mock_trino.connection.cursor.return_value = mock_cursor
+            writer._trino_manager = mock_trino
+
+            result = writer.read_table('bronze', 'test')
+
+            assert mock_trino.execute_query.called
+            sql = mock_trino.execute_query.call_args[0][0]
+            assert 'SELECT * FROM iceberg.bronze.test' in sql
+
+    def test_read_table_with_columns(self):
+        """Test read_table with specific columns."""
+        with patch.dict('sys.modules', {'trino': MagicMock(), 'trino.dbapi': MagicMock()}):
+            from scrapers.base.iceberg_writer import IcebergWriter
+            writer = IcebergWriter()
+
+            mock_trino = MagicMock()
+            mock_trino.execute_query.return_value = []
+            writer._trino_manager = mock_trino
+
+            writer.read_table('bronze', 'test', columns=['col1', 'col2'])
+
+            sql = mock_trino.execute_query.call_args[0][0]
+            assert '"col1", "col2"' in sql
+
+    def test_read_table_with_filter(self):
+        """Test read_table with filter expression."""
+        with patch.dict('sys.modules', {'trino': MagicMock(), 'trino.dbapi': MagicMock()}):
+            from scrapers.base.iceberg_writer import IcebergWriter
+            writer = IcebergWriter()
+
+            mock_trino = MagicMock()
+            mock_trino.execute_query.return_value = []
+            writer._trino_manager = mock_trino
+
+            writer.read_table('bronze', 'test', filter_expr="rating > 1500")
+
+            sql = mock_trino.execute_query.call_args[0][0]
+            assert 'WHERE rating > 1500' in sql
+
+    def test_get_table_history(self):
+        """Test get_table_history queries snapshots table."""
+        with patch.dict('sys.modules', {'trino': MagicMock(), 'trino.dbapi': MagicMock()}):
+            from scrapers.base.iceberg_writer import IcebergWriter
+            writer = IcebergWriter()
+
+            mock_trino = MagicMock()
+            mock_trino.execute_query.return_value = []
+            writer._trino_manager = mock_trino
+
+            writer.get_table_history('bronze', 'test')
+
+            sql = mock_trino.execute_query.call_args[0][0]
+            assert '$snapshots' in sql
+
+    def test_read_snapshot(self):
+        """Test read_snapshot uses VERSION AS OF."""
+        with patch.dict('sys.modules', {'trino': MagicMock(), 'trino.dbapi': MagicMock()}):
+            from scrapers.base.iceberg_writer import IcebergWriter
+            writer = IcebergWriter()
+
+            mock_trino = MagicMock()
+            mock_trino.execute_query.return_value = []
+            writer._trino_manager = mock_trino
+
+            writer.read_snapshot('bronze', 'test', snapshot_id=12345)
+
+            sql = mock_trino.execute_query.call_args[0][0]
+            assert 'FOR VERSION AS OF 12345' in sql

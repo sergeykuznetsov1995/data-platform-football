@@ -1,0 +1,17 @@
+# Pre-commit gate for the Silver Layer Charter (issue #372).
+#
+# Setup once:  pip install pre-commit && pre-commit install
+# Manual run:  pre-commit run silver-charter-audit --all-files
+#
+# The hook runs Layer A of scripts/audit_silver_charter.py (static regex over
+# dags/sql/silver/*.sql[.j2], NO Trino) and blocks the commit on any
+# *unsanctioned ERROR* finding — see docs/decisions/silver-charter.md.
+repos:
+  - repo: local
+    hooks:
+      - id: silver-charter-audit
+        name: Silver Charter audit (Layer A)
+        entry: python scripts/audit_silver_charter.py --check
+        language: system
+        files: ^dags/sql/silver/.*\.sql(\.j2)?$
+        pass_filenames: false

@@ -1,0 +1,83 @@
+# =============================================================================
+# OpenMetadata description: iceberg.silver.whoscored_player_match_aggregate
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.silver.whoscored_player_match_aggregate
+  description: |
+    Статистика игрока за матч из WhoScored — один row на
+    (match_id, player_id, team_id, league, season). Источник: bronze.whoscored_events,
+    дедуп re-scrape'ов (ROW_NUMBER по натуральному ключу события ORDER BY
+    _ingested_at DESC), затем GROUP BY игрок+матч с COUNT_IF по сырым Opta-типам
+    (goals, shots, passes, отборы, дисциплина, касания). Сырые WhoScored id
+    (double→BIGINT→varchar); xref_player/xref_team резолвятся на Gold. Служит
+    bridge-таблицей для LEFT JOIN в gold.fct_player_match.
+  tags:
+    - Tier.Silver
+    - Domain.Football
+    - PII.None
+columns:
+  - name: match_id
+    description: ID матча (сырой WhoScored game_id, CAST в varchar); часть PK.
+  - name: player_id
+    description: Сырой WhoScored player_id (double→BIGINT→varchar); часть PK; xref_player на Gold.
+  - name: team_id
+    description: Сырой WhoScored team_id (double→BIGINT→varchar) команды игрока; xref_team на Gold.
+  - name: total_events
+    description: Всего событий игрока в матче (COUNT(*)).
+  - name: goals
+    description: Забитые голы (type='Goal'); автоголы идут как 'OwnGoal' отдельно, без двойного счёта.
+  - name: shots
+    description: Удары, всего (SavedShot + MissedShots + ShotOnPost + ChanceMissed + Goal).
+  - name: shots_on_target
+    description: Удары в створ (SavedShot + Goal); штанги и мимо исключены.
+  - name: passes
+    description: Передачи, всего (type IN ('Pass','OffsidePass')).
+  - name: passes_completed
+    description: Точные передачи (те же типы с outcome_type='Successful').
+  - name: key_passes
+    description: Ключевые передачи (Pass с qualifier 'KeyPass' — пас привёл к удару).
+  - name: crosses
+    description: Навесы (Pass с qualifier 'Cross').
+  - name: tackles
+    description: Отборы, всего (type='Tackle').
+  - name: tackles_won
+    description: Выигранные отборы (Tackle с outcome_type='Successful').
+  - name: interceptions
+    description: Перехваты (type='Interception').
+  - name: clearances
+    description: Выносы мяча (type='Clearance').
+  - name: ball_recoveries
+    description: Возвраты владения мячом (type='BallRecovery').
+  - name: blocks
+    description: Заблокированные передачи (type='BlockedPass').
+  - name: aerials_won
+    description: Выигранные воздушные единоборства (Aerial с outcome_type='Successful').
+  - name: aerial_duels_total
+    description: Воздушные единоборства, всего (type='Aerial'; парные строки — победитель+проигравший).
+  - name: dribbles_attempted
+    description: Попытки обводки / take-on (type='TakeOn').
+  - name: dribbles_won
+    description: Удачные обводки (TakeOn с outcome_type='Successful').
+  - name: fouls_committed
+    description: Совершённые фолы (type='Foul').
+  - name: fouls_drawn
+    description: Заработанные фолы (Foul с qualifier 'OffenceFouled' — на игроке сфолили).
+  - name: offsides
+    description: Положения вне игры (type='OffsideGiven').
+  - name: yellow_cards
+    description: Жёлтые карточки (Card с qualifier 'Yellow').
+  - name: red_cards
+    description: Красные карточки (Card с qualifier 'Red').
+  - name: second_yellow_cards
+    description: Вторые жёлтые карточки (Card с qualifier 'SecondYellow').
+  - name: touches
+    description: Касания мяча (пасы / обводки / отборы / перехваты / возвраты / выносы / удары / BallTouch / Dispossessed).
+  - name: dispossessed
+    description: Потери мяча в единоборстве — отобрали (type='Dispossessed').
+  - name: league
+    description: Лига (partition key).
+  - name: season
+    description: Сезон slug '2526' (partition key, varchar).
+  - name: _silver_created_at
+    description: Технический timestamp создания строки в Silver-слое (добавляется CTAS-раннером).
+relationships: []

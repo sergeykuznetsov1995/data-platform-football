@@ -1,0 +1,347 @@
+# =============================================================================
+# Cross-source referee-name aliases — APL referees (E1, issue #143)
+# =============================================================================
+# Curated map source-specific raw referee-name → canonical referee identity.
+# Mirrors `team_aliases.yaml` (#141/#148). Referees have NO stable source ID
+# (both FBref and MatchHistory emit plain name strings), so identity is an
+# explicit slug here and FBref spelling is the canonical (spine) form.
+#
+# Структура одной записи:
+#   - canonical_name: <FBref spelling>          # display; FBref is the spine
+#     canonical_id:   ref_<stable slug>          # IDENTITY — see below
+#     aliases:
+#       _generic:    [forms valid in any source — optional]
+#       fbref:       [FBref full-name form, e.g. "Michael Oliver"]
+#       matchhistory:[MatchHistory "Initial Surname" form, e.g. "M Oliver"]
+#     competition_scope: [competition.id where valid]
+#
+# Why canonical_id (issue #141/#143)?
+#   Identity must NOT be derived from the raw name. MatchHistory writes
+#   "M Oliver", FBref writes "Michael Oliver" — same person. The explicit
+#   `ref_<slug>` slug (owned here) lets BOTH forms point at one identity via
+#   their per-source alias rows, with zero fuzzy matching. Convention:
+#   `^[a-z0-9_]+$` (loader enforces), `ref_` prefix, lower-snake-case.
+#   At worldwide scale disambiguate namesakes with a country suffix
+#   (e.g. ref_michael_oliver_eng) — never reuse a slug for two real people.
+#
+# Why no fuzzy / no initials algorithm?
+#   With only ~44 APL referees a hand-curated dictionary is exact and cheaper
+#   than a resolver (cf. worldfootballR's 6100-player manual dictionary). The
+#   "M Oliver" ↔ "Michael Oliver" merge is just two alias rows — the SQL norm
+#   (NFD diacritics + strip non-alnum) only canonicalises cosmetics.
+#
+# MatchHistory form note: forms are "Initial Surname" WITHOUT a period
+#   ("M Oliver", "A Taylor"). Surname collisions are disambiguated by initial:
+#   A Madley→Andy, R Madley→Robert; J Smith→Joshua, L Smith→Lewis;
+#   R Jones→Robert (Mike Jones has no MH form). Two suspected MH mis-keys
+#   ("K Kavanagh", "O Oliver") map to the single existing surname-holder —
+#   flagged inline; revisit if a real new namesake appears.
+#
+# competition_scope: ["ENG-Premier League"] for everything — E1 is APL-only,
+#   same as team_aliases.yaml. Other competitions add their own blocks later.
+#
+# Discovery source: SELECT DISTINCT referee FROM bronze.{fbref_schedule,
+#   matchhistory_games} WHERE league='ENG-Premier League' (2026-06-03).
+# =============================================================================
+
+referees:
+  - canonical_name: "Andre Marriner"
+    canonical_id: "ref_andre_marriner"
+    aliases:
+      fbref: ["Andre Marriner"]
+      matchhistory: ["A Marriner"]
+    competition_scope: ["ENG-Premier League"]
+
+  - canonical_name: "Andrew Kitchen"
+    canonical_id: "ref_andrew_kitchen"
+    aliases:
+      fbref: ["Andrew Kitchen"]
+      matchhistory: ["A Kitchen"]
+    competition_scope: ["ENG-Premier League"]
+
+  - canonical_name: "Andy Madley"
+    canonical_id: "ref_andy_madley"
+    aliases:
+      fbref: ["Andy Madley"]
+      matchhistory: ["A Madley"]   # surname collision w/ Robert Madley → initial A
+    competition_scope: ["ENG-Premier League"]
+
+  - canonical_name: "Anthony Taylor"
+    canonical_id: "ref_anthony_taylor"
+    aliases:
+      fbref: ["Anthony Taylor"]
+      matchhistory: ["A Taylor"]
+    competition_scope: ["ENG-Premier League"]
+
+  - canonical_name: "Chris Kavanagh"
+    canonical_id: "ref_chris_kavanagh"
+    aliases:
+      fbref: ["Chris Kavanagh"]
+      matchhistory: ["C Kavanagh", "K Kavanagh"]   # K = suspected MH typo; only one Kavanagh in PL
+    competition_scope: ["ENG-Premier League"]
+
+  - canonical_name: "Craig Pawson"
+    canonical_id: "ref_craig_pawson"
+    aliases:
+      fbref: ["Craig Pawson"]
+      matchhistory: ["C Pawson"]
+    competition_scope: ["ENG-Premier League"]
+
+  - canonical_name: "Darren Bond"
+    canonical_id: "ref_darren_bond"
+    aliases:
+      fbref: ["Darren Bond"]
+      matchhistory: ["D Bond"]
+    competition_scope: ["ENG-Premier League"]
+
+  - canonical_name: "Darren England"
+    canonical_id: "ref_darren_england"
+    aliases:
+      fbref: ["Darren England"]
+      matchhistory: ["D England"]
+    competition_scope: ["ENG-Premier League"]
+
+  - canonical_name: "David Coote"
+    canonical_id: "ref_david_coote"
+    aliases:
+      fbref: ["David Coote"]
+      matchhistory: ["D Coote"]
+    competition_scope: ["ENG-Premier League"]
+
+  - canonical_name: "David Webb"
+    canonical_id: "ref_david_webb"
+    aliases:
+      fbref: ["David Webb"]
+      matchhistory: ["D Webb"]
+    competition_scope: ["ENG-Premier League"]
+
+  - canonical_name: "Farai Hallam"
+    canonical_id: "ref_farai_hallam"
+    aliases:
+      fbref: ["Farai Hallam"]
+      matchhistory: ["F Hallam"]
+    competition_scope: ["ENG-Premier League"]
+
+  - canonical_name: "Graham Scott"
+    canonical_id: "ref_graham_scott"
+    aliases:
+      fbref: ["Graham Scott"]
+      matchhistory: ["G Scott"]
+    competition_scope: ["ENG-Premier League"]
+
+  - canonical_name: "Jarred Gillett"
+    canonical_id: "ref_jarred_gillett"
+    aliases:
+      fbref: ["Jarred Gillett"]
+      matchhistory: ["J Gillett"]   # trailing-space variant 'J Gillett ' normalises identically
+    competition_scope: ["ENG-Premier League"]
+
+  - canonical_name: "John Brooks"
+    canonical_id: "ref_john_brooks"
+    aliases:
+      fbref: ["John Brooks"]
+      matchhistory: ["J Brooks"]
+    competition_scope: ["ENG-Premier League"]
+
+  - canonical_name: "Jonathan Moss"
+    canonical_id: "ref_jonathan_moss"
+    aliases:
+      fbref: ["Jonathan Moss"]
+      matchhistory: ["J Moss"]
+    competition_scope: ["ENG-Premier League"]
+
+  - canonical_name: "Joshua Smith"
+    canonical_id: "ref_joshua_smith"
+    aliases:
+      fbref: ["Joshua Smith"]
+      matchhistory: ["J Smith"]   # surname collision w/ Lewis Smith → initial J
+    competition_scope: ["ENG-Premier League"]
+
+  - canonical_name: "Kevin Friend"
+    canonical_id: "ref_kevin_friend"
+    aliases:
+      fbref: ["Kevin Friend"]
+      matchhistory: ["K Friend"]
+    competition_scope: ["ENG-Premier League"]
+
+  - canonical_name: "Lee Mason"
+    canonical_id: "ref_lee_mason"
+    aliases:
+      fbref: ["Lee Mason"]   # FBref-only (no MatchHistory form observed)
+    competition_scope: ["ENG-Premier League"]
+
+  - canonical_name: "Lee Probert"
+    canonical_id: "ref_lee_probert"
+    aliases:
+      fbref: ["Lee Probert"]   # FBref-only
+    competition_scope: ["ENG-Premier League"]
+
+  - canonical_name: "Lewis Smith"
+    canonical_id: "ref_lewis_smith"
+    aliases:
+      fbref: ["Lewis Smith"]
+      matchhistory: ["L Smith"]   # surname collision w/ Joshua Smith → initial L
+    competition_scope: ["ENG-Premier League"]
+
+  - canonical_name: "Mark Clattenburg"
+    canonical_id: "ref_mark_clattenburg"
+    aliases:
+      fbref: ["Mark Clattenburg"]   # FBref-only
+    competition_scope: ["ENG-Premier League"]
+
+  - canonical_name: "Martin Atkinson"
+    canonical_id: "ref_martin_atkinson"
+    aliases:
+      fbref: ["Martin Atkinson"]
+      matchhistory: ["M Atkinson"]
+    competition_scope: ["ENG-Premier League"]
+
+  - canonical_name: "Matt Donohue"
+    canonical_id: "ref_matt_donohue"
+    aliases:
+      fbref: ["Matt Donohue"]
+      matchhistory: ["M Donohue"]
+    competition_scope: ["ENG-Premier League"]
+
+  - canonical_name: "Michael Oliver"
+    canonical_id: "ref_michael_oliver"
+    aliases:
+      fbref: ["Michael Oliver"]
+      matchhistory: ["M Oliver", "O Oliver"]   # O = suspected MH typo; only one Oliver in PL
+    competition_scope: ["ENG-Premier League"]
+
+  - canonical_name: "Michael Salisbury"
+    canonical_id: "ref_michael_salisbury"
+    aliases:
+      fbref: ["Michael Salisbury"]
+      matchhistory: ["M Salisbury"]
+    competition_scope: ["ENG-Premier League"]
+
+  - canonical_name: "Mike Dean"
+    canonical_id: "ref_mike_dean"
+    aliases:
+      fbref: ["Mike Dean"]
+      matchhistory: ["M Dean"]
+    competition_scope: ["ENG-Premier League"]
+
+  - canonical_name: "Mike Jones"
+    canonical_id: "ref_mike_jones"
+    aliases:
+      fbref: ["Mike Jones"]   # FBref-only (MH 'R Jones' = Robert Jones)
+    competition_scope: ["ENG-Premier League"]
+
+  - canonical_name: "Niel Swarbrick"
+    canonical_id: "ref_niel_swarbrick"
+    aliases:
+      fbref: ["Niel Swarbrick"]   # FBref-only
+    competition_scope: ["ENG-Premier League"]
+
+  - canonical_name: "Oliver Langford"
+    canonical_id: "ref_oliver_langford"
+    aliases:
+      fbref: ["Oliver Langford"]   # FBref-only
+    competition_scope: ["ENG-Premier League"]
+
+  - canonical_name: "Paul Tierney"
+    canonical_id: "ref_paul_tierney"
+    aliases:
+      fbref: ["Paul Tierney"]
+      matchhistory: ["P Tierney"]
+    competition_scope: ["ENG-Premier League"]
+
+  - canonical_name: "Peter Bankes"
+    canonical_id: "ref_peter_bankes"
+    aliases:
+      fbref: ["Peter Bankes"]
+      matchhistory: ["P Bankes"]
+    competition_scope: ["ENG-Premier League"]
+
+  - canonical_name: "Rebecca Welch"
+    canonical_id: "ref_rebecca_welch"
+    aliases:
+      fbref: ["Rebecca Welch"]
+      matchhistory: ["R Welch"]
+    competition_scope: ["ENG-Premier League"]
+
+  - canonical_name: "Robert Jones"
+    canonical_id: "ref_robert_jones"
+    aliases:
+      fbref: ["Robert Jones"]
+      matchhistory: ["R Jones"]   # surname collision w/ Mike Jones → initial R
+    competition_scope: ["ENG-Premier League"]
+
+  - canonical_name: "Robert Madley"
+    canonical_id: "ref_robert_madley"
+    aliases:
+      fbref: ["Robert Madley"]
+      matchhistory: ["R Madley"]   # surname collision w/ Andy Madley → initial R
+    competition_scope: ["ENG-Premier League"]
+
+  - canonical_name: "Roger East"
+    canonical_id: "ref_roger_east"
+    aliases:
+      fbref: ["Roger East"]   # FBref-only
+    competition_scope: ["ENG-Premier League"]
+
+  - canonical_name: "Samuel Allison"
+    canonical_id: "ref_samuel_allison"
+    aliases:
+      fbref: ["Samuel Allison"]
+      matchhistory: ["S Allison"]
+    competition_scope: ["ENG-Premier League"]
+
+  - canonical_name: "Samuel Barrott"
+    canonical_id: "ref_samuel_barrott"
+    aliases:
+      fbref: ["Samuel Barrott"]
+      matchhistory: ["S Barrott"]
+    competition_scope: ["ENG-Premier League"]
+
+  - canonical_name: "Simon Hooper"
+    canonical_id: "ref_simon_hooper"
+    aliases:
+      fbref: ["Simon Hooper"]
+      matchhistory: ["S Hooper"]
+    competition_scope: ["ENG-Premier League"]
+
+  - canonical_name: "Stuart Attwell"
+    canonical_id: "ref_stuart_attwell"
+    aliases:
+      fbref: ["Stuart Attwell"]
+      matchhistory: ["S Attwell"]
+    competition_scope: ["ENG-Premier League"]
+
+  - canonical_name: "Sunny Singh"
+    canonical_id: "ref_sunny_singh"
+    aliases:
+      fbref: ["Sunny Singh"]
+      matchhistory: ["S Singh"]
+    competition_scope: ["ENG-Premier League"]
+
+  - canonical_name: "Thomas Bramall"
+    canonical_id: "ref_thomas_bramall"
+    aliases:
+      fbref: ["Thomas Bramall"]
+      matchhistory: ["T Bramall"]
+    competition_scope: ["ENG-Premier League"]
+
+  - canonical_name: "Thomas Kirk"
+    canonical_id: "ref_thomas_kirk"
+    aliases:
+      fbref: ["Thomas Kirk"]
+      matchhistory: ["T Kirk"]
+    competition_scope: ["ENG-Premier League"]
+
+  - canonical_name: "Tim Robinson"
+    canonical_id: "ref_tim_robinson"
+    aliases:
+      fbref: ["Tim Robinson"]
+      matchhistory: ["T Robinson"]
+    competition_scope: ["ENG-Premier League"]
+
+  - canonical_name: "Tony Harrington"
+    canonical_id: "ref_tony_harrington"
+    aliases:
+      fbref: ["Tony Harrington"]
+      matchhistory: ["T Harrington"]
+    competition_scope: ["ENG-Premier League"]

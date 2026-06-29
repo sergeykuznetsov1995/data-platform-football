@@ -1,0 +1,106 @@
+# =============================================================================
+# OpenMetadata description: iceberg.gold.fct_shot_audit
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.gold.fct_shot_audit
+  description: |
+    Cross-source DQ-audit таблица для согласованности ударов между Understat и
+    SofaScore. НЕ business-витрина: содержит сырые источниковые метрики (us_*/ss_*)
+    + технические diff-колонки + PK + coverage-флаг.
+
+    Grain: (match_id, team_id) — одна строка на команду x матч. Spine = Understat
+    (gold.fct_shot, агрегированный до team-match). SofaScore (silver.sofascore_shots)
+    — LEFT JOIN → diff = NULL при отсутствии записи (has_sofascore = FALSE).
+    Инвариант audit ⊆ fct_shot (каждый ключ audit есть в fct_shot).
+
+    Convention: diff = Understat − SofaScore (US — established xG primary, RX2).
+    ABS(diff) мал ⇒ источники согласны.
+
+    Coverage: fct_shot покрывает APL 2021-2526; SofaScore shotmap — только 2526,
+    поэтому has_sofascore = TRUE лишь для 2526; исторические сезоны несут NULL ss_*
+    diff'ы by design.
+
+    Source-read deviation (documented): Understat-сторона читает gold.fct_shot
+    (gold-on-gold), потому что silver.understat_shots НЕ существует — fct_shot и есть
+    каноничная Understat-проекция ударов. Остальные *_audit перечитывают Silver, но
+    здесь Silver для этого источника отсутствует.
+
+    WARNING-only DQ: таблица не блокирует pipeline.
+  tags:
+    - Tier.Gold
+    - Domain.Football
+    - PII.None
+columns:
+  # ─── PK ───
+  - name: match_id
+    description: |
+      Канонический ID матча (PK part). Из gold.fct_shot (Understat-спайн).
+      FK → gold.fct_shot.match_id.
+  - name: team_id
+    description: |
+      Канонический ID команды, наносящей удары (PK part). Из gold.fct_shot,
+      team_id IS NOT NULL.
+      FK → gold.fct_shot.team_id.
+
+  # ─── shot counts ───
+  - name: us_shots
+    description: "Кол-во ударов по Understat: COUNT(*) из gold.fct_shot на team x match."
+  - name: ss_shots
+    description: "Кол-во ударов по SofaScore: COUNT(*) из silver.sofascore_shots. NULL если SS отсутствует."
+  - name: shots_diff
+    description: "Diff ударов: us_shots − ss_shots. NULL если SofaScore-запись отсутствует."
+
+  # ─── xG (Understat primary) ───
+  - name: us_xg
+    description: "Сумма xG по Understat: ROUND(SUM(xg), 4) из gold.fct_shot."
+  - name: ss_xg
+    description: "Сумма xG по SofaScore: ROUND(SUM(xg), 4) из silver.sofascore_shots. NULL если SS отсутствует."
+  - name: xg_diff
+    description: |
+      Кросс-модельный diff xG: ROUND(us_xg − ss_xg, 4). Understat-модель vs
+      SofaScore/Opta — расхождение ожидаемо (разные методологии). NULL если SS отсутствует.
+
+  # ─── goals ───
+  - name: us_goals
+    description: |
+      Голы по Understat: SUM(result = 'goal'), own_goal ИСКЛЮЧЁН (атрибуция
+      автогола — source-convention, не DQ-сигнал).
+  - name: ss_goals
+    description: "Голы по SofaScore: SUM(result = 'goal'), own_goal исключён. NULL если SS отсутствует."
+  - name: goals_diff
+    description: "Diff голов: us_goals − ss_goals. NULL если SofaScore-запись отсутствует."
+
+  # ─── shots on target ───
+  - name: us_sot
+    description: "Удары в створ по Understat: SUM(result IN ('goal','saved'))."
+  - name: ss_sot
+    description: "Удары в створ по SofaScore: SUM(result IN ('goal','saved')). NULL если SS отсутствует."
+  - name: sot_diff
+    description: "Diff ударов в створ: us_sot − ss_sot. NULL если SofaScore-запись отсутствует."
+
+  # ─── coverage flag ───
+  - name: has_sofascore
+    description: |
+      Coverage-флаг: TRUE если для (match_id, team_id) найдена SofaScore-запись
+      (LEFT JOIN не пуст), FALSE для исторических сезонов без shotmap. Все ss_*/
+      *_diff при FALSE = NULL.
+
+  # ─── Lineage / partition keys ───
+  - name: league
+    description: Лига (partition key).
+  - name: season
+    description: Сезон, slug-форма '2526' (из gold.fct_shot). Partition key.
+  - name: _silver_created_at
+    description: >-
+      Технический timestamp создания строки в Gold-слое: инжектируется
+      runner'ом (run_silver_transform) поверх SQL.
+
+relationships:
+  - from: match_id
+    to: trino_iceberg.iceberg.gold.fct_shot.match_id
+    type: FOREIGN_KEY
+    description: N:1 — main business-fct с тем же ключом (audit ⊆ fct_shot).
+  - from: team_id
+    to: trino_iceberg.iceberg.gold.fct_shot.team_id
+    type: FOREIGN_KEY
+    description: N:1 — main business-fct с тем же ключом (audit ⊆ fct_shot).

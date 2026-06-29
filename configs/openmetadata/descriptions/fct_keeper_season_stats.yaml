@@ -1,0 +1,122 @@
+# =============================================================================
+# OpenMetadata description: iceberg.gold.fct_keeper_season_stats
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.gold.fct_keeper_season_stats
+  description: |
+    Wide per-season per-goalkeeper stats: FBref keeper spine + FotMob keeper +
+    WhoScored event-aggregate, объединённые через silver.xref_player.
+    Структурно зеркально fct_player_season_stats, но только вратари.
+
+      * HARD_FACT overlap (matches / minutes / clean_sheets / yellow_cards /
+        red_cards): single column через COALESCE(FBref → FotMob). FBref —
+        primary spine. Cross-source diff'ы → gold.fct_keeper_season_stats_audit.
+      * UNIQUE_FBREF (keeper): goals_against, saves, save_pct, wins / draws /
+        losses, clean_sheet_pct, pk_* — single column из FBref.
+      * UNIQUE_FOTMOB: save_percentage_fotmob (шкала не калибрована — отдельно
+        от FBref save_pct, без COALESCE), saves_per_90, psxg_minus_ga (≡ PSxG −
+        GA; FBref PSxG мёртв с Feb-2026), fotmob_rating, …_per_90 passing.
+      * UNIQUE_WHOSCORED: keeper_saves / pickups / claims из SPADL
+        event-aggregate (другая дефиниция, чем FBref saves).
+
+    Мульти-squad агрегация (#515, Вариант B): при зимнем трансфере ВНУТРИ лиги
+    FBref хранит строку на каждый клуб. Счётные FBref-метрики (matches /
+    minutes / clean_sheets / saves / goals_against / …) СУММИРУЮТСЯ по клубам
+    сезона; team_id — от клуба с максимумом минут; ratio с известной формулой
+    (save_pct / clean_sheet_pct / goals_against_per90 / pk_save_pct)
+    пересчитываются из суммированных счётчиков. FotMob / WhoScored колонки не
+    затронуты. Одноклубные вратари идентичны прежнему Варианту A.
+
+    Зерно: (player_id, league, season) — star design §5.3 (#428). FK:
+    player_id → dim_player, team_id → dim_team (orphan-fallback 'fb_<slug>').
+    Partitioning: (league, season).
+  tags:
+    - Tier.Gold
+    - Domain.Football
+    - PII.Low
+columns:
+  # ─── PK / FK ───
+  - name: player_id
+    description: Канонический ID вратаря (PK part; #428 ex-player_id_canonical). FK → dim_player / dim_player_attributes.
+  - name: league
+    description: Лига (partition key).
+  - name: season
+    description: Сезон — varchar slug ('2425' = сезон 2024/25). Partition key.
+  - name: team_id
+    description: Клуб вратаря в сезоне (#428) — canonical id через xref_team, orphan-fallback 'fb_<slug>'. FK → dim_team. При трансфере внутри лиги = клуб с максимумом минут (#515).
+
+  # ─── HARD_FACT overlap (single column COALESCE FBref → FotMob) ───
+  - name: matches
+    description: Matches played (COALESCE FBref → FotMob). FBref-часть суммируется по клубам при трансфере (#515).
+  - name: minutes
+    description: Minutes played (COALESCE FBref → FotMob). FBref-часть суммируется по клубам при трансфере (#515).
+  - name: clean_sheets
+    description: Сухие матчи (COALESCE FBref → FotMob). FBref-часть суммируется по клубам при трансфере (#515).
+  - name: yellow_cards
+    description: Жёлтые карточки (COALESCE FBref → FotMob). FBref-часть суммируется по клубам при трансфере (#515).
+  - name: red_cards
+    description: Красные карточки (COALESCE FBref → FotMob). FBref-часть суммируется по клубам при трансфере (#515).
+
+  # ─── UNIQUE_FBREF (keeper-specific) ───
+  - name: goals_against
+    description: Пропущенные голы (FBref-only; сумма по клубам сезона при трансфере, #515).
+  - name: goals_against_per90
+    description: Пропущенные за 90 минут (FBref). При трансфере пересчитывается из суммированных GA / минут (#515).
+  - name: shots_on_target_against
+    description: Удары в створ по воротам (FBref-only; сумма по клубам сезона при трансфере, #515).
+  - name: saves
+    description: Сейвы (FBref-only; сумма по клубам сезона при трансфере, #515).
+  - name: save_pct
+    description: Save % (FBref primary; шкала FotMob не калибрована → save_percentage_fotmob отдельной колонкой). При трансфере пересчитывается из суммированных saves / shots_on_target_against (#515).
+  - name: wins
+    description: Победы команды с вратарём в составе (FBref-only; сумма по клубам сезона при трансфере, #515).
+  - name: draws
+    description: Ничьи (FBref-only; сумма по клубам сезона при трансфере, #515).
+  - name: losses
+    description: Поражения (FBref-only; сумма по клубам сезона при трансфере, #515).
+  - name: clean_sheet_pct
+    description: "% сухих матчей (FBref). При трансфере пересчитывается из суммированных clean_sheets / matches (#515)."
+  - name: pk_faced
+    description: Пенальти, пробитые по воротам (FBref-only; сумма по клубам сезона при трансфере, #515).
+  - name: pk_allowed
+    description: Пенальти, пропущенные (FBref-only; сумма по клубам сезона при трансфере, #515).
+  - name: pk_saved
+    description: Отражённые пенальти (FBref-only; сумма по клубам сезона при трансфере, #515).
+  - name: pk_missed
+    description: Пенальти, не реализованные соперником (мимо/штанга) (FBref-only; сумма по клубам сезона при трансфере, #515).
+  - name: pk_save_pct
+    description: "% отражённых пенальти (FBref). При трансфере пересчитывается из суммированных pk_saved / pk_faced (#515)."
+
+  # ─── UNIQUE_FOTMOB (не затронуты #515 — из FotMob, не FBref) ───
+  - name: save_percentage_fotmob
+    description: Save % по версии FotMob (отдельная колонка — шкала не калибрована с FBref save_pct, без COALESCE).
+  - name: saves_per_90
+    description: Сейвы за 90 минут (FotMob).
+  - name: psxg_minus_ga
+    description: PSxG − GA — предотвращённые голы (FotMob goals_prevented; #428 §5.3, FBref PSxG мёртв с Feb-2026).
+  - name: accurate_passes_per_90
+    description: Точные передачи за 90 минут (FotMob).
+  - name: accurate_long_balls_per_90
+    description: Точные длинные передачи за 90 минут (FotMob).
+  - name: fotmob_rating
+    description: Рейтинг FotMob за сезон.
+
+  # ─── UNIQUE_WHOSCORED (event-aggregate из SPADL; не затронуты #515) ───
+  - name: keeper_saves_whoscored
+    description: Сейвы по событиям WhoScored (SPADL keeper_save — иная дефиниция, чем FBref saves).
+  - name: keeper_pickups_whoscored
+    description: Подборы/фиксации мяча вратарём (WhoScored event-aggregate).
+  - name: keeper_claims_whoscored
+    description: Выносы/перехваты навесов вратарём (WhoScored event-aggregate).
+
+  - name: _gold_created_at
+    description: Технический timestamp создания строки в Gold-слое.
+relationships:
+  - from: player_id
+    to: trino_iceberg.iceberg.gold.dim_player_attributes.player_id_canonical
+    type: FOREIGN_KEY
+    description: N:1 — атрибуты игрока (snapshot per canonical_id).
+  - from: team_id
+    to: trino_iceberg.iceberg.gold.dim_team.team_id
+    type: FOREIGN_KEY
+    description: N:1 — клуб вратаря в сезоне (#428; orphan 'fb_<slug>' вне dim_team).

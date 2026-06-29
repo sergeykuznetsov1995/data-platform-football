@@ -1,0 +1,95 @@
+# Ad-tech / tracker / analytics domain blocklist for the FlareSolverr proxy filter (#652).
+#
+# Derived from the per-domain CONNECT-byte observe run on 2026-06-18
+# (scripts/proxy_filter/filter_proxy.py in observe mode; see
+# docs/research/flaresolverr-proxy-traffic-audit.md). For WhoScored ~90% and SoFIFA
+# ~60% of residential-proxy bytes go to third-party ad-tech served from the domains
+# below — none of it is needed to parse matchCentreData / SoFIFA ratings.
+#
+# Matching: a CONNECT host is blocked if it == an entry OR endswith "." + entry
+# (so "doubleclick.net" also blocks "securepubads.g.doubleclick.net"). Lines starting
+# with "#" and blanks are ignored.
+#
+# SAFE tier (this file): only third-party ad/tracker/analytics base domains. The target
+# sites (whoscored.com, *.sofifa.net, sofifa.com), Cloudflare challenge
+# (challenges.cloudflare.com), fonts and core google/gstatic are deliberately NOT here
+# so the page still renders and the CF Turnstile still solves.
+#
+# NOT blocked on purpose (page render / CF / fonts):
+#   challenges.cloudflare.com  *.sofifa.net  sofifa.com  whoscored.com  cdn.whoscored.com
+#   fonts.gstatic.com  fonts.googleapis.com  www.gstatic.com  www.google.com
+#   accounts.google.com  gvt1.com (Google component CDN — kept in SAFE tier)
+
+# --- Google ad/analytics (specific hosts only — never block google.com itself) ---
+googletagmanager.com
+google-analytics.com
+analytics.google.com
+googlesyndication.com
+doubleclick.net
+fundingchoicesmessages.google.com
+
+# --- Cloudflare insights tracker (NOT the challenge — challenge stays allowed) ---
+static.cloudflareinsights.com
+
+# --- Social trackers ---
+connect.facebook.net
+facebook.com
+facebook.net
+
+# --- Ad exchanges / SSPs / prebid / header-bidding ---
+adnxs.com
+rubiconproject.com
+pubmatic.com
+criteo.com
+openx.net
+3lift.com
+adsrvr.org
+pbstck.com
+adform.net
+smartadserver.com
+teads.tv
+amazon-adsystem.com
+adlightning.com
+seedtag.com
+360yield.com
+gumgum.com
+nexx360.io
+optidigital.com
+opti-digital.com
+omnitagjs.com
+richaudience.com
+smilewanted.com
+onetag-sys.com
+id5-sync.com
+the-ozone-project.com
+a-mo.net
+cootlogix.com
+nextmillmedia.com
+4dex.io
+ingage.tech
+ad-delivery.net
+adsafeprotected.com
+sharethrough.com
+
+# --- Consent / ad loaders / anti-adblock ---
+btloader.com
+getadmiral.com
+sentrymagic.com
+
+# --- Push / re-engagement / id-sync trackers ---
+webpu.sh
+xtremepush.com
+uidapi.com
+anonymised.io
+anonm.io
+dns-finder.com
+rapidedge.io
+
+# --- Site-specific ad widgets / networks seen in the observe run ---
+oddschecker.com
+podname.com
+intergient.com
+snack-media.com
+ad.gt
+creativecdn.com
+d2zywfiolv4f83.cloudfront.net

@@ -1,0 +1,1034 @@
+# =============================================================================
+# Data Platform - Docker Compose
+# Medallion Architecture: Bronze -> Silver -> Gold
+# =============================================================================
+
+name: data-platform
+
+x-airflow-common: &airflow-common
+  build:
+    context: ./docker/images/airflow
+    dockerfile: Dockerfile
+  shm_size: '512m'  # Chrome uses /dev/shm for IPC; Docker default 64MB causes crashes
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+  cap_add:
+    - CHOWN
+    - SETGID
+    - SETUID
+    - SYS_PTRACE  # Required for Chrome/nodriver browser automation
+  environment:
+    &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: ${AIRFLOW__CORE__EXECUTOR}
+    AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW__CORE__FERNET_KEY}
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: ${AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION}
+    AIRFLOW__CORE__LOAD_EXAMPLES: ${AIRFLOW__CORE__LOAD_EXAMPLES}
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: ${AIRFLOW__DATABASE__SQL_ALCHEMY_CONN}
+    AIRFLOW__CELERY__RESULT_BACKEND: ${AIRFLOW__CELERY__RESULT_BACKEND}
+    AIRFLOW__CELERY__BROKER_URL: ${AIRFLOW__CELERY__BROKER_URL}
+    AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW__WEBSERVER__SECRET_KEY}
+    AIRFLOW__WEBSERVER__EXPOSE_CONFIG: ${AIRFLOW__WEBSERVER__EXPOSE_CONFIG}
+    SPARK_MASTER_URL: ${SPARK_MASTER_URL}
+    TRINO_PASSWORD: ${TRINO_PASSWORD}
+    TRINO_PORT: ${TRINO_PORT}
+    # Route FlareSolverr scrapers (WhoScored/SoFIFA) through the ad-tech filter (#652).
+    # Off by default — set to http://proxy_filter:8899 to cut residential traffic.
+    PROXY_FILTER_URL: ${PROXY_FILTER_URL:-}
+    TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+    TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+    ALERT_ENV: ${ALERT_ENV:-dev}
+    JAVA_HOME: /usr/lib/jvm/java-17-openjdk-amd64
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - ./logs:/opt/airflow/logs
+    - ./spark_jobs:/opt/airflow/spark_jobs
+    - ./configs/spark:/opt/spark/conf
+    # E1 medallion config: team_aliases.yaml + competitions.yaml — read-only
+    # for utils/medallion_config.py (default CONFIG_DIR=/opt/airflow/configs/medallion)
+    - ./configs/medallion:/opt/airflow/configs/medallion:ro
+    - ./scrapers:/opt/airflow/scrapers
+    - ./scripts:/opt/airflow/scripts
+    - ./proxys.txt:/opt/airflow/proxys.txt:ro
+  networks:
+    - frontend
+    - backend
+    - storage
+  depends_on:
+    postgres:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+    trino:
+      condition: service_healthy
+
+services:
+  # ===========================================================================
+  # HDFS - Distributed File System
+  # ===========================================================================
+  namenode:
+    build:
+      context: ./docker/images/hdfs
+      dockerfile: Dockerfile
+    container_name: namenode
+    hostname: namenode
+    restart: unless-stopped
+    environment:
+      - CLUSTER_NAME=data-platform
+      - HDFS_NAMENODE_USER=root
+      - HDFS_DATANODE_USER=root
+      - HDFS_SECONDARYNAMENODE_USER=root
+    ports:
+      - "127.0.0.1:9870:9870"  # Web UI
+      - "127.0.0.1:9000:9000"  # HDFS port
+    volumes:
+      - namenode_data:/hadoop/dfs/name
+      - ./configs/hdfs:/opt/hadoop/etc/hadoop
+    networks:
+      - storage
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://namenode:9870/"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    command: ["hdfs", "namenode"]
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+        reservations:
+          memory: 512M
+
+  datanode1:
+    build:
+      context: ./docker/images/hdfs
+      dockerfile: Dockerfile
+    container_name: datanode1
+    hostname: datanode1
+    restart: unless-stopped
+    environment:
+      - HDFS_NAMENODE_USER=root
+      - HDFS_DATANODE_USER=root
+    volumes:
+      - datanode1_data:/hadoop/dfs/data
+      - ./configs/hdfs:/opt/hadoop/etc/hadoop
+    networks:
+      - storage
+    depends_on:
+      namenode:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://$(hostname):9864/ || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    command: ["hdfs", "datanode"]
+    deploy:
+      resources:
+        limits:
+          memory: 640M
+        reservations:
+          memory: 256M
+
+  datanode2:
+    build:
+      context: ./docker/images/hdfs
+      dockerfile: Dockerfile
+    container_name: datanode2
+    hostname: datanode2
+    restart: unless-stopped
+    environment:
+      - HDFS_NAMENODE_USER=root
+      - HDFS_DATANODE_USER=root
+    volumes:
+      - datanode2_data:/hadoop/dfs/data
+      - ./configs/hdfs:/opt/hadoop/etc/hadoop
+    networks:
+      - storage
+    depends_on:
+      namenode:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://$(hostname):9864/ || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    command: ["hdfs", "datanode"]
+    deploy:
+      resources:
+        limits:
+          memory: 640M
+        reservations:
+          memory: 256M
+
+  # ===========================================================================
+  # PostgreSQL - Metadata Storage
+  # ===========================================================================
+  postgres:
+    image: postgres:16-alpine
+    container_name: postgres
+    hostname: postgres
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETGID
+      - SETUID
+      - FOWNER
+      - DAC_READ_SEARCH
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      AIRFLOW_DB_PASSWORD: ${AIRFLOW_DB_PASSWORD}
+      HIVE_METASTORE_DB_PASSWORD: ${HIVE_METASTORE_DB_PASSWORD}
+      SUPERSET_DB_PASSWORD: ${SUPERSET_DB_PASSWORD}
+      OPENMETADATA_DB_PASSWORD: ${OPENMETADATA_DB_PASSWORD}
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./docker/images/postgres/init-databases.sh:/docker-entrypoint-initdb.d/init-databases.sh
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+        reservations:
+          memory: 128M
+
+  # ===========================================================================
+  # Hive Metastore
+  # ===========================================================================
+  hive-metastore:
+    build:
+      context: ./docker/images/hive
+      dockerfile: Dockerfile
+    container_name: hive-metastore
+    hostname: hive-metastore
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETGID
+      - SETUID
+    environment:
+      SERVICE_NAME: metastore
+      DB_DRIVER: postgres
+      HADOOP_CLIENT_OPTS: >-
+        -Xmx512m
+      SERVICE_OPTS: >-
+        -Djavax.jdo.option.ConnectionDriverName=org.postgresql.Driver
+        -Djavax.jdo.option.ConnectionURL=jdbc:postgresql://postgres:5432/hive_metastore
+        -Djavax.jdo.option.ConnectionUserName=hive
+        -Djavax.jdo.option.ConnectionPassword=${HIVE_METASTORE_DB_PASSWORD}
+    ports:
+      - "127.0.0.1:9083:9083"
+    volumes:
+      - ./configs/hive:/opt/hive/conf
+      - hive_warehouse:/user/hive/warehouse
+    networks:
+      - backend
+      - storage
+    depends_on:
+      postgres:
+        condition: service_healthy
+      namenode:
+        condition: service_healthy
+      datanode1:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'echo > /dev/tcp/localhost/9083'"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
+    deploy:
+      resources:
+        limits:
+          memory: 768M
+        reservations:
+          memory: 384M
+
+  # ===========================================================================
+  # Spark Cluster
+  # ===========================================================================
+  spark-master:
+    profiles: ["heavy"]
+    build:
+      context: ./docker/images/spark
+      dockerfile: Dockerfile
+    container_name: spark-master
+    hostname: spark-master
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETGID
+      - SETUID
+    environment:
+      - SPARK_MODE=master
+      - SPARK_MASTER_HOST=spark-master
+      - SPARK_MASTER_PORT=7077
+      - SPARK_MASTER_WEBUI_PORT=8080
+    ports:
+      - "127.0.0.1:8080:8080"  # Web UI
+      - "127.0.0.1:7077:7077"  # Spark Master
+    volumes:
+      - ./configs/spark:/opt/spark/conf
+      - ./spark_jobs:/opt/spark_jobs
+    networks:
+      - storage
+    depends_on:
+      hive-metastore:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.master.Master"]
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 256M
+
+  spark-worker-1:
+    profiles: ["heavy"]
+    build:
+      context: ./docker/images/spark
+      dockerfile: Dockerfile
+    container_name: spark-worker-1
+    hostname: spark-worker-1
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETGID
+      - SETUID
+    environment:
+      - SPARK_MODE=worker
+      - SPARK_MASTER_URL=spark://spark-master:7077
+      - SPARK_WORKER_MEMORY=512M
+      - SPARK_WORKER_CORES=2
+    volumes:
+      - ./configs/spark:/opt/spark/conf
+      - ./spark_jobs:/opt/spark_jobs
+    networks:
+      - storage
+    depends_on:
+      spark-master:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8081/"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.worker.Worker", "spark://spark-master:7077"]
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 256M
+
+  spark-worker-2:
+    profiles: ["heavy"]
+    build:
+      context: ./docker/images/spark
+      dockerfile: Dockerfile
+    container_name: spark-worker-2
+    hostname: spark-worker-2
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETGID
+      - SETUID
+    environment:
+      - SPARK_MODE=worker
+      - SPARK_MASTER_URL=spark://spark-master:7077
+      - SPARK_WORKER_MEMORY=512M
+      - SPARK_WORKER_CORES=2
+    volumes:
+      - ./configs/spark:/opt/spark/conf
+      - ./spark_jobs:/opt/spark_jobs
+    networks:
+      - storage
+    depends_on:
+      spark-master:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8081/"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.worker.Worker", "spark://spark-master:7077"]
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 256M
+
+  # ===========================================================================
+  # Redis - Celery Broker for Airflow
+  # ===========================================================================
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    hostname: redis
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETGID
+      - SETUID
+    command: redis-server --requirepass ${REDIS_PASSWORD} --protected-mode yes --rename-command FLUSHALL "" --rename-command FLUSHDB ""
+    ports:
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+        reservations:
+          memory: 64M
+
+  # ===========================================================================
+  # Tor Proxy - Alternative for Cloudflare bypass
+  # ===========================================================================
+  tor:
+    profiles: ["heavy"]
+    image: dperson/torproxy:0.3.1
+    container_name: tor
+    hostname: tor
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETGID
+      - SETUID
+    ports:
+      - "127.0.0.1:9150:9050"   # SOCKS5 proxy (mapped to 9150 to avoid conflict)
+      - "127.0.0.1:9151:9051"   # Control port
+    networks:
+      - backend
+    environment:
+      - TOR_NewCircuitPeriod=30
+      - TOR_MaxCircuitDirtiness=60
+      - PASSWORD=${TOR_CONTROL_PASSWORD}
+    healthcheck:
+      test: ["CMD-SHELL", "curl --socks5 localhost:9050 -s https://check.torproject.org/api/ip | grep -q IsTor || exit 1"]
+      interval: 60s
+      timeout: 30s
+      retries: 3
+      start_period: 60s
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+        reservations:
+          memory: 64M
+
+  # ===========================================================================
+  # Airflow
+  # ===========================================================================
+  airflow-init:
+    <<: *airflow-common
+    container_name: airflow-init
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        airflow db migrate
+        airflow users create \
+          --username $${_AIRFLOW_WWW_USER_USERNAME} \
+          --password $${_AIRFLOW_WWW_USER_PASSWORD} \
+          --firstname Admin \
+          --lastname User \
+          --role Admin \
+          --email admin@example.com || true
+        # Serialize heavy ingest scrapers to 1 concurrent task platform-wide:
+        # two browser/FlareSolverr scrapers at once exhaust VM swap → scheduler
+        # stalls → live tasks get orphan-reset (#671). Idempotent (create/update).
+        airflow pools set 'ingest_scraper_pool' 1 'Serialize heavy ingest scrapers to avoid VM swap (#671)'
+        echo "Airflow initialization complete"
+    environment:
+      <<: *airflow-common-env
+      _AIRFLOW_WWW_USER_USERNAME: ${_AIRFLOW_WWW_USER_USERNAME}
+      _AIRFLOW_WWW_USER_PASSWORD: ${_AIRFLOW_WWW_USER_PASSWORD}
+    restart: "no"
+
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: airflow-scheduler
+    command: scheduler
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+      airflow-webserver:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "airflow jobs check --job-type SchedulerJob --hostname \"$${HOSTNAME}\""]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+        reservations:
+          memory: 1G
+    # Swap as safety buffer for memory spikes (matches the limit above).
+    memswap_limit: 6G
+
+  airflow-webserver:
+    <<: *airflow-common
+    container_name: airflow-webserver
+    command: webserver
+    ports:
+      - "127.0.0.1:8081:8080"
+    environment:
+      <<: *airflow-common-env
+      AIRFLOW__WEBSERVER__WORKERS: "2"
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+        reservations:
+          memory: 512M
+    memswap_limit: 2G
+
+  # ===========================================================================
+  # Trino - Distributed SQL Query Engine
+  # ===========================================================================
+  trino:
+    image: trinodb/trino:479
+    container_name: trino
+    hostname: trino
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETGID
+      - SETUID
+    environment:
+      - HADOOP_CONF_DIR=/etc/trino
+      - TRINO_KEYSTORE_PASSWORD=${TRINO_KEYSTORE_PASSWORD:-changeit}
+    ports:
+      - "127.0.0.1:8082:8443"
+      - "[::1]:8082:8443"
+    volumes:
+      - ./configs/trino:/etc/trino
+    networks:
+      - frontend
+      - backend
+      - storage
+    depends_on:
+      hive-metastore:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "-k", "https://localhost:8443/v1/info"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          memory: 5G
+        reservations:
+          memory: 1G
+
+  # ===========================================================================
+  # Superset - BI / Dashboards
+  # ===========================================================================
+  superset:
+    image: data-platform/superset:4.1.1
+    container_name: superset
+    hostname: superset
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETGID
+      - SETUID
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      trino:
+        condition: service_started
+    networks:
+      - frontend
+      - backend
+    ports:
+      - "127.0.0.1:8088:8088"
+    environment:
+      SUPERSET_SECRET_KEY: ${SUPERSET_SECRET_KEY}
+      DATABASE_URL: postgresql+psycopg2://superset:${SUPERSET_DB_PASSWORD}@postgres:5432/superset
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_DB: 2
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+      SUPERSET_ADMIN_PASSWORD: ${SUPERSET_ADMIN_PASSWORD}
+      TRINO_SUPERSET_PASSWORD: ${TRINO_SUPERSET_PASSWORD}
+      PYTHONPATH: /app/pythonpath:/app/pythonpath_dev
+    volumes:
+      - ./configs/superset/superset_config.py:/app/pythonpath/superset_config.py:ro
+      - ./configs/superset/bootstrap.sh:/app/pythonpath/bootstrap.sh:ro
+      - ./configs/superset/datasources.yaml:/app/pythonpath/datasources.yaml:ro
+      - ./configs/superset/import_datasources.py:/app/pythonpath/import_datasources.py:ro
+      - ./configs/superset/dashboards:/app/pythonpath/dashboards:ro
+      - superset_home:/app/superset_home
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8088/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    deploy:
+      resources:
+        limits:
+          memory: 1500M
+        reservations:
+          memory: 512M
+
+  superset-worker:
+    profiles: ["heavy"]
+    image: data-platform/superset:4.1.1
+    container_name: superset-worker
+    hostname: superset-worker
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETGID
+      - SETUID
+    command: ["celery", "--app=superset.tasks.celery_app:app", "worker", "--pool=prefork", "-O", "fair", "-c", "4"]
+    depends_on:
+      superset:
+        condition: service_healthy
+    networks:
+      - backend
+    environment:
+      SUPERSET_SECRET_KEY: ${SUPERSET_SECRET_KEY}
+      DATABASE_URL: postgresql+psycopg2://superset:${SUPERSET_DB_PASSWORD}@postgres:5432/superset
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_DB: 2
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+      TRINO_SUPERSET_PASSWORD: ${TRINO_SUPERSET_PASSWORD}
+      PYTHONPATH: /app/pythonpath:/app/pythonpath_dev
+    volumes:
+      - ./configs/superset/superset_config.py:/app/pythonpath/superset_config.py:ro
+      - ./configs/superset/bootstrap.sh:/app/pythonpath/bootstrap.sh:ro
+      - ./configs/superset/datasources.yaml:/app/pythonpath/datasources.yaml:ro
+      - ./configs/superset/import_datasources.py:/app/pythonpath/import_datasources.py:ro
+      - ./configs/superset/dashboards:/app/pythonpath/dashboards:ro
+      - superset_home:/app/superset_home
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 500M
+        reservations:
+          memory: 256M
+
+  superset-beat:
+    profiles: ["heavy"]
+    image: data-platform/superset:4.1.1
+    container_name: superset-beat
+    hostname: superset-beat
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETGID
+      - SETUID
+    command: ["celery", "--app=superset.tasks.celery_app:app", "beat", "--pidfile", "/tmp/celerybeat.pid", "-f", "/tmp/celery_beat.log"]
+    depends_on:
+      superset-worker:
+        condition: service_started
+    networks:
+      - backend
+    environment:
+      SUPERSET_SECRET_KEY: ${SUPERSET_SECRET_KEY}
+      DATABASE_URL: postgresql+psycopg2://superset:${SUPERSET_DB_PASSWORD}@postgres:5432/superset
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_DB: 2
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+      PYTHONPATH: /app/pythonpath:/app/pythonpath_dev
+    volumes:
+      - ./configs/superset/superset_config.py:/app/pythonpath/superset_config.py:ro
+      - ./configs/superset/bootstrap.sh:/app/pythonpath/bootstrap.sh:ro
+      - ./configs/superset/datasources.yaml:/app/pythonpath/datasources.yaml:ro
+      - ./configs/superset/import_datasources.py:/app/pythonpath/import_datasources.py:ro
+      - ./configs/superset/dashboards:/app/pythonpath/dashboards:ro
+      - superset_home:/app/superset_home
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 200M
+        reservations:
+          memory: 64M
+
+  # ===========================================================================
+  # Elasticsearch - search backend for OpenMetadata
+  # ===========================================================================
+  elasticsearch:
+    profiles: ["heavy"]
+    image: elasticsearch:8.11.4
+    container_name: elasticsearch
+    hostname: elasticsearch
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETGID
+      - SETUID
+      - DAC_OVERRIDE
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - ES_JAVA_OPTS=-Xms512m -Xmx512m
+      - cluster.name=openmetadata-cluster
+      - bootstrap.memory_lock=false
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+    volumes:
+      - es_data:/usr/share/elasticsearch/data
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9200/_cluster/health | grep -q -E '\"status\":\"(yellow|green)\"'"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+        reservations:
+          memory: 512M
+
+  # ===========================================================================
+  # OpenMetadata - Data Catalog & Lineage
+  # ===========================================================================
+  openmetadata-server:
+    profiles: ["heavy"]
+    image: openmetadata/server:1.5.0
+    container_name: openmetadata-server
+    hostname: openmetadata-server
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETGID
+      - SETUID
+      - DAC_OVERRIDE
+    depends_on:
+      postgres:
+        condition: service_healthy
+      elasticsearch:
+        condition: service_healthy
+    networks:
+      - frontend
+      - backend
+    ports:
+      - "127.0.0.1:8585:8585"
+      - "127.0.0.1:8586:8586"
+    environment:
+      # Database (Postgres)
+      DB_DRIVER_CLASS: org.postgresql.Driver
+      DB_SCHEME: postgresql
+      DB_USE_SSL: "false"
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_USER: openmetadata
+      DB_USER_PASSWORD: ${OPENMETADATA_DB_PASSWORD}
+      OM_DATABASE: openmetadata
+      # Search (Elasticsearch)
+      ELASTICSEARCH_HOST: elasticsearch
+      ELASTICSEARCH_PORT: 9200
+      ELASTICSEARCH_SCHEME: http
+      ELASTICSEARCH_USER: ""
+      ELASTICSEARCH_PASSWORD: ""
+      SEARCH_TYPE: elasticsearch
+      # Authentication / Authorization (basic auth, single admin)
+      AUTHENTICATION_PROVIDER: basic
+      AUTHENTICATION_AUTHORITY: https://accounts.google.com
+      AUTHORIZER_CLASS_NAME: org.openmetadata.service.security.DefaultAuthorizer
+      AUTHORIZER_REQUEST_FILTER: org.openmetadata.service.security.JwtFilter
+      AUTHORIZER_ADMIN_PRINCIPALS: "[admin]"
+      AUTHORIZER_PRINCIPAL_DOMAIN: openmetadata.org
+      AUTHORIZER_INGESTION_PRINCIPALS: "[ingestion-bot]"
+      AUTHORIZER_ENFORCE_PRINCIPAL_DOMAIN: "false"
+      AUTHORIZER_ENABLE_SECURE_SOCKET_CONNECTION: "false"
+      # Server
+      OPENMETADATA_CLUSTER_NAME: openmetadata
+      SERVER_PORT: 8585
+      SERVER_ADMIN_PORT: 8586
+      LOG_LEVEL: INFO
+      # Migrations on startup
+      MIGRATION_LIMIT_PARAM: 1200
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8586/healthcheck | grep -q '\"healthy\":true' || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 180s
+    deploy:
+      resources:
+        limits:
+          memory: 1500M
+        reservations:
+          memory: 768M
+
+  openmetadata-ingestion:
+    profiles: ["heavy"]
+    image: openmetadata/ingestion:1.5.0
+    container_name: openmetadata-ingestion
+    hostname: openmetadata-ingestion
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETGID
+      - SETUID
+      - DAC_OVERRIDE
+    depends_on:
+      openmetadata-server:
+        condition: service_started
+    networks:
+      - backend
+    # Standalone CLI container — used to run `metadata ingest -c /opt/configs/<file>.yaml`
+    # on demand. Keep it alive so users can `docker compose exec openmetadata-ingestion bash`.
+    entrypoint: ["/bin/bash", "-c"]
+    command: ["echo 'OpenMetadata ingestion container ready. Use: docker compose exec openmetadata-ingestion metadata ingest -c /opt/configs/<file>.yaml'; tail -f /dev/null"]
+    environment:
+      OM_HOST_PORT: http://openmetadata-server:8585/api
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      PYTHONUNBUFFERED: "1"
+      # Resolved by `metadata ingest` CLI when expanding ${VAR} in YAML configs.
+      # Empty defaults are intentional — workflows fail with a clear error
+      # ("OM_JWT_TOKEN is empty") instead of silently using "${OM_JWT_TOKEN}"
+      # as a literal token string.
+      TRINO_OPENMETADATA_PASSWORD: ${TRINO_OPENMETADATA_PASSWORD:-}
+      OM_JWT_TOKEN: ${OM_JWT_TOKEN:-}
+    volumes:
+      - ./configs/openmetadata:/opt/configs:ro
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 800M
+        reservations:
+          memory: 256M
+
+  # ===========================================================================
+  # FlareSolverr - Cloudflare challenge solver (proxy over Chromium)
+  # Used by WhoScored events scraper via HTTP at port 8191
+  # ===========================================================================
+  flaresolverr:
+    image: ghcr.io/flaresolverr/flaresolverr:v3.4.6
+    container_name: flaresolverr
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETGID
+      - SETUID
+    ports:
+      - "127.0.0.1:8191:8191"
+    environment:
+      LOG_LEVEL: info
+      LOG_HTML: "false"
+      CAPTCHA_SOLVER: none
+      TZ: UTC
+    shm_size: "1g"
+    healthcheck:
+      # v3.4.6 image dropped wget (only curl is present); /health returns
+      # {"status": "ok"}. Using wget here marks the container unhealthy even
+      # though FlareSolverr serves fine.
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8191/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 256M
+    networks:
+      - backend
+
+  # ===========================================================================
+  # proxy_filter - ad-tech filtering proxy between FlareSolverr and the
+  # residential pool (#652). Cuts billable residential traffic by refusing
+  # ad-tech CONNECT hosts (no MITM — preserves Chrome's TLS fingerprint).
+  # Holds the residential creds and rotates the upstream per FlareSolverr session
+  # (idle-refresh: a fresh exit is drawn only when no tunnel is open, so a page and
+  # its CF challenge share one IP). Scrapers route here when the global
+  # PROXY_FILTER_URL=http://proxy_filter:8899 toggle is set.
+  # ===========================================================================
+  proxy_filter:
+    build:
+      context: ./docker/images/airflow
+      dockerfile: Dockerfile
+    container_name: proxy_filter
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    environment:
+      PYTHONPATH: /opt/airflow
+    command:
+      - python
+      - /opt/airflow/scripts/proxy_filter/filter_proxy.py
+      - --listen
+      - 0.0.0.0:8899
+      - --blocklist
+      - /opt/airflow/configs/proxy_filter/blocklist.txt
+      - --out
+      - /tmp/filter_bytes.json
+    volumes:
+      - ./scripts:/opt/airflow/scripts
+      - ./scrapers:/opt/airflow/scrapers
+      - ./proxys.txt:/opt/airflow/proxys.txt:ro
+      - ./configs/proxy_filter:/opt/airflow/configs/proxy_filter:ro
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+        reservations:
+          memory: 64M
+    depends_on:
+      - flaresolverr
+    networks:
+      - backend
+
+# =============================================================================
+# Networks
+# =============================================================================
+networks:
+  # Frontend: services with web UI accessible from host
+  frontend:
+    driver: bridge
+    name: dp-frontend
+  # Backend: application services (Airflow, Hive, PostgreSQL, Redis)
+  backend:
+    driver: bridge
+    name: dp-backend
+  # Storage: data storage layer (HDFS, Spark)
+  storage:
+    driver: bridge
+    name: dp-storage
+
+# =============================================================================
+# Volumes
+# =============================================================================
+volumes:
+  namenode_data:
+    name: namenode_data
+  datanode1_data:
+    name: datanode1_data
+  datanode2_data:
+    name: datanode2_data
+  postgres_data:
+    name: postgres_data
+  hive_warehouse:
+    name: hive_warehouse
+  redis_data:
+    name: redis_data
+  superset_home:
+    name: superset_home
+  es_data:
+    name: es_data

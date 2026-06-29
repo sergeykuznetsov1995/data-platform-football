@@ -1,0 +1,63 @@
+-- =============================================================================
+-- Silver: sofascore_venue   (from bronze.sofascore_venue)
+-- =============================================================================
+--
+-- One row per (league, season, stadium) — conform-only projection of the
+-- per-match venue block captured from SofaScore `/api/v1/event/{id}.venue`
+-- (#753). SofaScore records the stadium THIS match was played at, so it stays
+-- historically accurate for clubs that moved grounds (Everton → Goodison Park,
+-- Spurs → White Hart Lane) — exactly where FotMob's current-ground
+-- `team_profile` is wrong. Feeds the `sofascore_venue` enrichment CTE in
+-- gold.dim_venue (LEFT JOIN by (league, normalised stadium name); COALESCE'd
+-- BEHIND FotMob for city/coords, and supplies country FotMob cannot).
+--
+-- Source Bronze (см. scrapers/sofascore + run_sofascore_scraper match_capture):
+--   bronze.sofascore_venue — game_id (bigint), stadium/city/country (varchar),
+--     venue_latitude/venue_longitude (double), league (varchar), season
+--     (varchar slug). Full-state replace_partitions, но bronze несёт одну
+--     строку на МАТЧ (game_id) → dedup ROW_NUMBER до одной на стадион здесь.
+--
+-- Notes:
+--   * Грейн bronze = per-match; many matches share a home stadium, so dedup to
+--     one row per (league, season, stadium), latest snapshot wins.
+--   * Season НЕ конвертируем — bronze SofaScore уже slug '2526' (#404). Эмитим
+--     as-is (ср. sofascore_league_table.sql).
+--   * coords уже double в bronze (scraper coerces) — pass-through.
+--   * canonical venue identity (alias-resolve) отложен в Gold (charter §5);
+--     dim_venue джойнит по нормализованному имени стадиона.
+-- =============================================================================
+
+WITH bronze_dedup AS (
+    SELECT *
+    FROM (
+        SELECT
+            v.*,
+            ROW_NUMBER() OVER (
+                PARTITION BY league, season, stadium
+                ORDER BY _ingested_at DESC
+            ) AS rn
+        FROM iceberg.bronze.sofascore_venue v
+        WHERE stadium IS NOT NULL
+          AND trim(stadium) <> ''
+    )
+    WHERE rn = 1
+)
+
+SELECT
+    -- ===== Identity =====
+    b.stadium                                             AS stadium,
+
+    -- ===== Attributes =====
+    b.city,
+    b.country,
+    b.venue_latitude,
+    b.venue_longitude,
+
+    -- ===== Lineage =====
+    b._ingested_at                                        AS _bronze_ingested_at,
+
+    -- ===== Partition keys (season already slug '2526' in bronze, #404) =====
+    b.league,
+    b.season
+
+FROM bronze_dedup b

@@ -1,0 +1,64 @@
+# =============================================================================
+# OpenMetadata description: iceberg.bronze.understat_schedule
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.bronze.understat_schedule
+  description: |
+    Сырое расписание матчей из Understat (soccerdata UnderstatScraper,
+    read_schedule). Grain — один row на матч (wide-формат: home_* / away_*
+    колонки в одной строке). Несёт итоговый счёт и team-grain xG обеих сторон.
+    Партиционирование ['league','season']. has_data/is_result отмечают
+    доступность Understat-данных и факт завершения матча.
+  tags:
+    - Tier.Bronze
+    - Domain.Football
+    - PII.None
+columns:
+  - name: league
+    description: Лига (e.g. 'ENG-Premier League'); partition key.
+  - name: season
+    description: Сезон в формате Understat (e.g. '2526'); partition key.
+  - name: game
+    description: Строковый идентификатор матча Understat (slug).
+  - name: game_id
+    description: Числовой Understat match_id.
+  - name: date
+    description: Дата и время начала матча.
+  - name: home_team
+    description: Название домашней команды.
+  - name: home_team_code
+    description: Краткий код домашней команды.
+  - name: home_team_id
+    description: Understat team_id домашней команды.
+  - name: home_goals
+    description: Голы домашней команды (итог матча).
+  - name: home_xg
+    description: Ожидаемые голы (xG) домашней команды.
+  - name: away_team
+    description: Название гостевой команды.
+  - name: away_team_code
+    description: Краткий код гостевой команды.
+  - name: away_team_id
+    description: Understat team_id гостевой команды.
+  - name: away_goals
+    description: Голы гостевой команды (итог матча).
+  - name: away_xg
+    description: Ожидаемые голы (xG) гостевой команды.
+  - name: has_data
+    description: Доступны ли детальные Understat-данные по матчу.
+  - name: is_result
+    description: Матч завершён (true) или ещё не сыгран (false).
+  - name: url
+    description: URL страницы матча на understat.com.
+  - name: league_id
+    description: Внутренний идентификатор лиги Understat.
+  - name: season_id
+    description: Внутренний идентификатор сезона Understat.
+  - name: _source
+    description: Источник данных ('understat'); метаколонка Bronze.
+  - name: _entity_type
+    description: Тип сущности в Bronze; метаколонка.
+  - name: _ingested_at
+    description: Timestamp ingest'а строки в Bronze; метаколонка.
+  - name: _batch_id
+    description: Идентификатор батча ingest'а; метаколонка.

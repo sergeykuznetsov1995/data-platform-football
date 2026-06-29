@@ -1,0 +1,50 @@
+# =============================================================================
+# OpenMetadata description: iceberg.bronze.sofascore_match_stats
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.bronze.sofascore_match_stats
+  description: |
+    Сырая командная статистика матча из SofaScore (endpoint /event/{id}/statistics
+    через dag_ingest_sofascore, задача _run_match_stats). Long-form: grain —
+    один row на (match_id, period, stat_name); значения хозяев/гостей лежат в
+    отдельных колонках. Скрапер skip-existing (не перечитывает прошлые матчи, #69).
+    Партиционирование ['league','season'].
+  tags:
+    - Tier.Bronze
+    - Domain.Football
+    - PII.None
+columns:
+  - name: match_id
+    description: SofaScore event/match id (varchar).
+  - name: period
+    description: Период статистики ('ALL' / '1ST' / '2ND').
+  - name: stat_group
+    description: Группа статистики (e.g. 'Possession','Shots','Passes').
+  - name: stat_name
+    description: Человекочитаемое имя метрики (e.g. 'Ball possession').
+  - name: stat_key
+    description: Машинный ключ метрики (e.g. 'ballPossession').
+  - name: home_value
+    description: Числовое значение метрики для хозяев (double).
+  - name: away_value
+    description: Числовое значение метрики для гостей (double).
+  - name: home_text
+    description: Текстовое значение метрики для хозяев (как показано в UI, e.g. '55%').
+  - name: away_text
+    description: Текстовое значение метрики для гостей.
+  - name: compare_code
+    description: Код сравнения сторон по версии SofaScore (bigint).
+  - name: value_type
+    description: Тип значения метрики (e.g. 'value','percent').
+  - name: league
+    description: Лига (e.g. 'ENG-Premier League'); partition key.
+  - name: season
+    description: Сезон в формате 'YYZZ' (e.g. '2526'); partition key.
+  - name: _ingested_at
+    description: Timestamp ingest'а строки в Bronze; метаколонка.
+  - name: _source
+    description: Источник данных ('sofascore'); метаколонка Bronze.
+  - name: _entity_type
+    description: Тип сущности в Bronze; метаколонка.
+  - name: _batch_id
+    description: Идентификатор батча ingest'а; метаколонка.

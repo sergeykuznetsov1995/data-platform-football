@@ -1,0 +1,80 @@
+# =============================================================================
+# OpenMetadata description: iceberg.bronze.fotmob_player_details
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.bronze.fotmob_player_details
+  description: |
+    Сырые анкеты игроков из FotMob (endpoint /_next/data/<buildId>/players/<id>.json
+    через scrapers/fotmob, dag_ingest_fotmob). Grain — один row на игрока (snapshot,
+    full refresh каждый прогон). Несёт базовую биографию + 11 сырых JSON-блобов
+    (карьера, травмы, трофеи, рыночная стоимость, статистика), распаковываемых в
+    Silver. Партиционирование ['league','season'].
+  tags:
+    - Tier.Bronze
+    - Domain.Football
+    - PII.Low
+columns:
+  - name: player_id
+    description: FotMob player_id (varchar).
+  - name: name
+    description: Имя игрока/тренера.
+    tags:
+      - PII.Low
+  - name: birth_date
+    description: Дата рождения (varchar).
+    tags:
+      - PII.Low
+  - name: is_coach
+    description: Является ли запись тренером (boolean).
+  - name: is_captain
+    description: Капитан ли игрок (boolean).
+  - name: gender
+    description: Пол (varchar).
+  - name: primary_team_id
+    description: FotMob id основной команды (bigint).
+  - name: primary_team_name
+    description: Название основной команды.
+  - name: position_description
+    description: Текстовое описание позиции игрока.
+  - name: main_league_id
+    description: FotMob id основной лиги игрока (double).
+  - name: main_league_name
+    description: Название основной лиги игрока.
+  - name: contract_end
+    description: Дата окончания контракта (varchar; NULL если неизвестна).
+  - name: player_information_json
+    description: Сырой JSON анкетных данных игрока (распаковывается в Silver).
+  - name: injury_information_json
+    description: Сырой JSON информации о травмах (распаковывается в Silver).
+  - name: trophies_json
+    description: Сырой JSON трофеев игрока (распаковывается в Silver).
+  - name: career_history_json
+    description: Сырой JSON истории карьеры (распаковывается в Silver).
+  - name: stat_seasons_json
+    description: Сырой JSON посезонной статистики (распаковывается в Silver).
+  - name: first_season_stats_json
+    description: Сырой JSON статистики первого сезона (распаковывается в Silver).
+  - name: recent_matches_json
+    description: Сырой JSON последних матчей (распаковывается в Silver).
+  - name: market_values_json
+    description: Сырой JSON истории рыночной стоимости (распаковывается в Silver silver_fotmob_player_market_value_history).
+  - name: traits_json
+    description: Сырой JSON сильных/слабых сторон игрока (распаковывается в Silver).
+  - name: meta_json
+    description: Сырой JSON служебных метаданных ответа (распаковывается в Silver).
+  - name: coach_stats_json
+    description: Сырой JSON тренерской статистики (для записей-тренеров; распаковывается в Silver).
+  - name: next_match_json
+    description: Сырой JSON ближайшего матча игрока (распаковывается в Silver).
+  - name: league
+    description: Лига (e.g. 'ENG-Premier League'); partition key.
+  - name: season
+    description: Сезон — год начала (bigint, e.g. 2025); partition key.
+  - name: _source
+    description: Источник данных ('fotmob'); метаколонка Bronze.
+  - name: _entity_type
+    description: Тип сущности в Bronze; метаколонка.
+  - name: _ingested_at
+    description: Timestamp ingest'а строки в Bronze; метаколонка.
+  - name: _batch_id
+    description: Идентификатор батча ingest'а; метаколонка.

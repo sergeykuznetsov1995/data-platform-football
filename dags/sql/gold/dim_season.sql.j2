@@ -1,0 +1,32 @@
+-- =============================================================================
+-- Gold: dim_season  (Jinja template, rendered by dim_loaders.py)
+-- =============================================================================
+-- Static dimension of football seasons. One row per season slug, unioned
+-- across the in-scope competitions of configs/medallion/competitions.yaml.
+-- Aligned to the star-schema design (issue #425).
+--
+-- Source:       configs/medallion/competitions.yaml (seasons of in_scope
+--               leagues) -> rendered into VALUES rows by
+--               dags/utils/dim_loaders.py::render_dim_season_sql()
+-- PK:           season  (4-char slug '2425' — same value as the `season`
+--               column on every fact after #404, so JOINs need no mapping)
+-- Partitioning: NONE  (config-driven dim, a handful of rows)
+--
+-- is_current: the latest season already started (max slug with
+-- start_date <= today). Exactly one row is TRUE year-round — a plain
+-- "today BETWEEN start AND end" would flag zero rows during the summer gap.
+--
+-- The {{ rows }} placeholder is substituted by render_dim_season_sql();
+-- one tuple per distinct season slug.
+-- Each tuple MUST follow the column order declared in the AS t(...) clause.
+-- =============================================================================
+
+select * from (values
+{{ rows }}
+) as t(
+    season,               -- PK, slug e.g. '2425'
+    season_name,          -- e.g. '2024-25'
+    start_date,           -- DATE, first matchday from competitions.yaml
+    end_date,             -- DATE, last matchday from competitions.yaml
+    is_current            -- BOOLEAN — exactly one row TRUE
+)

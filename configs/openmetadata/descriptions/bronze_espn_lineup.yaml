@@ -1,0 +1,75 @@
+# =============================================================================
+# OpenMetadata description: iceberg.bronze.espn_lineup
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.bronze.espn_lineup
+  description: |
+    Сырые составы и индивидуальная статистика игроков за матч из ESPN
+    (soccerdata ESPN.read_lineup; backfill scripts/backfill_espn_e3_5.py).
+    Grain — один row на (game, team, player). Кормит Silver espn_lineup →
+    Gold fct_event / fct_shot / fct_lineup. Партиционирование ['league','season'].
+  tags:
+    - Tier.Bronze
+    - Domain.Football
+    - PII.Low
+columns:
+  - name: league
+    description: Лига (e.g. 'ENG-Premier League'); partition key.
+  - name: season
+    description: Сезон в формате 'YYZZ' (e.g. '2526'); partition key.
+  - name: game
+    description: Строковый идентификатор матча ESPN (slug с префиксом-датой).
+  - name: team
+    description: Команда игрока.
+  - name: player
+    description: Имя игрока.
+    tags:
+      - PII.Low
+  - name: is_home
+    description: Играет ли команда дома (true) или в гостях (false).
+  - name: position
+    description: Позиция игрока в матче.
+  - name: formation_place
+    description: Номер места игрока в схеме построения команды.
+  - name: sub_in
+    description: Минута выхода на замену (если выходил).
+  - name: sub_out
+    description: Минута ухода с поля заменой (если заменён).
+  - name: appearances
+    description: Признак появления игрока в матче (0/1).
+  - name: fouls_committed
+    description: Совершено фолов.
+  - name: fouls_suffered
+    description: Заработано фолов на себе.
+  - name: own_goals
+    description: Автоголы.
+  - name: red_cards
+    description: Красные карточки.
+  - name: sub_ins
+    description: Количество выходов на замену.
+  - name: yellow_cards
+    description: Жёлтые карточки.
+  - name: goals_conceded
+    description: Пропущено голов (для вратаря).
+  - name: saves
+    description: Сейвы (для вратаря).
+  - name: shots_faced
+    description: Удары по воротам, отражённые/принятые (для вратаря).
+  - name: goal_assists
+    description: Голевые передачи.
+  - name: shots_on_target
+    description: Удары в створ.
+  - name: total_goals
+    description: Забитые голы.
+  - name: total_shots
+    description: Всего ударов.
+  - name: offsides
+    description: Положения вне игры.
+  - name: _source
+    description: Источник данных ('espn'); метаколонка Bronze.
+  - name: _entity_type
+    description: Тип сущности в Bronze; метаколонка.
+  - name: _ingested_at
+    description: Timestamp ingest'а строки в Bronze; метаколонка.
+  - name: _batch_id
+    description: Идентификатор батча ingest'а; метаколонка.

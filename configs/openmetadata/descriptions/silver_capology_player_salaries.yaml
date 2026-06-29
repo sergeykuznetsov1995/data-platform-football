@@ -1,0 +1,63 @@
+# =============================================================================
+# OpenMetadata description: iceberg.silver.capology_player_salaries
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.silver.capology_player_salaries
+  description: |
+    Snapshot зарплат игроков из Capology. Один row per (player_slug, league,
+    season) после фильтра currency='GBP' + (active=true OR loan=true) —
+    Bronze несёт ~28% inactive (release/academy/youth) без FBref counterpart,
+    отбрасываются до Silver. canonical_id через silver.xref_player
+    (source='capology'); orphan rate ≈10.5% APL 2025/26 — DoD ≤7%
+    aspirational, требует resolver-tune. annual_gross_gbp вычисляется как
+    weekly_gross_gbp*52 (формульная консистентность, Bronze значение
+    игнорируется). MVP — single-currency GBP; EUR/USD расширение отдельным
+    issue.
+    Источник: bronze.capology_player_salaries (weekly Mon 05:00 UTC).
+  tags:
+    - Tier.Silver
+    - Domain.Football
+    - PII.Low
+columns:
+  - name: player_slug
+    description: Capology player slug (e.g., "harry-kane").
+  - name: canonical_id
+    description: |
+      Канонический ID игрока из silver.xref_player. NULL для Capology-only
+      игроков.
+  - name: player_name
+    description: Полное имя игрока (PII.Low).
+    tags:
+      - PII.Low
+  - name: club_slug
+    description: Capology slug клуба.
+  - name: club_name
+    description: Название клуба (как на Capology).
+  - name: position
+    description: Позиция (GK / DF / MF / FW).
+  - name: weekly_gross_gbp
+    description: Недельная gross зарплата в GBP (DECIMAL(12,2)).
+  - name: annual_gross_gbp
+    description: Годовая gross зарплата = weekly_gross_gbp * 52 (DECIMAL(14,2)).
+  - name: age
+    description: Возраст игрока.
+  - name: status
+    description: Контрактный статус (e.g., "Senior", "Reserve").
+  - name: active
+    description: Активный контракт.
+  - name: loan
+    description: Игрок в аренде.
+  - name: verified
+    description: Capology verified-флаг (зарплата подтверждена).
+  - name: currency
+    description: Валюта (всегда 'GBP' в MVP).
+  - name: _bronze_ingested_at
+    description: Timestamp ingest'а Bronze.
+  - name: league
+    description: Лига (partition key).
+  - name: season
+    description: Сезон short-form '2526' (partition key).
+relationships:
+  - from: canonical_id
+    to: trino_iceberg.iceberg.silver.xref_player.canonical_id
+    type: FOREIGN_KEY

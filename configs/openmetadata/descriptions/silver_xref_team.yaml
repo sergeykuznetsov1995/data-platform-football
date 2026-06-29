@@ -1,0 +1,40 @@
+# =============================================================================
+# OpenMetadata description: iceberg.silver.xref_team
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.silver.xref_team
+  description: |
+    Кросс-источниковый справочник команд — мост между сырыми названиями команд
+    из 10 источников и единым каноническим идентификатором. Один row на
+    (source, source_id, league, season), где source_id = сырое название команды
+    в источнике (например 'Wolves' vs 'Wolverhampton Wanderers'). canonical_id
+    берётся из configs/medallion (team_aliases.yaml) — это явный slug
+    (например 'wolverhampton_wanderers'), НЕ выводится из имени. Команда без
+    записи в YAML получает orphan-id с префиксом источника ('fb_arsenal',
+    'us_liverpool', 'mh_manchester_city') и confidence='orphan'. Используется
+    xref_match (резолв home/away) и xref_player (бакетинг по команде).
+    season может быть NULL для clubelo (в Bronze нет колонки сезона).
+  tags:
+    - Tier.Silver
+    - Domain.Football
+    - PII.None
+columns:
+  - name: canonical_id
+    description: Канонический slug команды из team_aliases.yaml (например 'arsenal'); orphan-id '<src>_<slug>' если команды нет в YAML.
+  - name: source
+    description: Источник названия — fbref / understat / whoscored / sofascore / fotmob / matchhistory / clubelo / espn / transfermarkt / capology.
+  - name: source_id
+    description: Сырое название команды в источнике (например 'Wolves', 'Manchester City').
+  - name: display_name
+    description: Каноническое имя из YAML если команда сматчена, иначе source_id.
+  - name: league
+    description: Код лиги (например 'ENG-Premier League'); partition-hint.
+  - name: season
+    description: Нормализованный сезон-slug (varchar); NULL для clubelo (нет сезона в Bronze).
+  - name: confidence
+    description: "Уровень привязки: 'name_alias' — сматчено с team_aliases.yaml; 'orphan' — записи в YAML нет."
+  - name: match_score
+    description: Всегда NULL — fuzzy-скоринга для команд нет (только точный alias-матч).
+  - name: _silver_created_at
+    description: Технический timestamp создания строки в Silver-слое (добавляется CTAS-раннером).
+relationships: []

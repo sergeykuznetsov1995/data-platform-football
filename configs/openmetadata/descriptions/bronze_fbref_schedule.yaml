@@ -1,0 +1,56 @@
+# =============================================================================
+# OpenMetadata description: iceberg.bronze.fbref_schedule
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.bronze.fbref_schedule
+  description: |
+    Сырое расписание/результаты матчей из FBref (таблица Scores & Fixtures лиги).
+    Гранулярность: один row на матч в пределах (league, season). Колонки —
+    как на странице FBref (текстовые, без приведения типов); парсинг и
+    дедупликация — в Silver. match_url несёт ссылку на страницу матча, из
+    которой Silver извлекает match_id. Источник: FBref scrape (dag_ingest_fbref).
+  tags:
+    - Tier.Bronze
+    - Domain.Football
+    - PII.Low
+columns:
+  - name: wk
+    description: Игровой тур (gameweek) — как в колонке "Wk" FBref.
+  - name: day
+    description: День недели матча (Mon/Tue/…).
+  - name: date
+    description: Дата матча (текст, как на FBref; парсится в Silver).
+  - name: time
+    description: Время начала матча (локальное, текст).
+  - name: home
+    description: Название домашней команды.
+  - name: score
+    description: Итоговый счёт строкой (напр. "2–1"; разделитель — Unicode-дефис).
+  - name: away
+    description: Название гостевой команды.
+  - name: attendance
+    description: Посещаемость (текст с разделителями тысяч).
+  - name: venue
+    description: Название стадиона.
+  - name: referee
+    description: Имя главного арбитра матча.
+    tags:
+      - PII.Low
+  - name: match report
+    description: Текст ссылки "Match Report" (служебная колонка из scrape).
+  - name: notes
+    description: Примечания к матчу (перенос, отмена и т.п.; обычно пусто).
+  - name: match_url
+    description: URL страницы матча на FBref; источник match_id для Silver.
+  - name: league
+    description: Лига (partition key).
+  - name: season
+    description: Сезон — год начала (bigint, напр. 2025 = сезон 2025/26).
+  - name: _source
+    description: Источник данных Bronze (всегда 'fbref').
+  - name: _entity_type
+    description: Внутренняя метка типа сущности ingest-конвейера FBref.
+  - name: _ingested_at
+    description: Timestamp ingest'а строки в Bronze.
+  - name: _batch_id
+    description: ID batch'а загрузки (трассировка и идемпотентность ingest).

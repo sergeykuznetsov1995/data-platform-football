@@ -1,0 +1,85 @@
+# =============================================================================
+# OpenMetadata description: iceberg.bronze.whoscored_events
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.bronze.whoscored_events
+  description: |
+    Сырые Opta-события матчей из WhoScored. В отличие от прочих whoscored-таблиц
+    парсится не soccerdata, а кастомным разбором matchCentreData JSON через
+    FlareSolverr (events_fetcher.parse_matchcentre_to_events_df). Grain — один
+    row на событие (~1500-2000 на матч). Несёт тип/исход события, координаты на
+    поле (шкала 0-100) и qualifiers — основу SPADL-разметки в Silver.
+    Партиционирование ['league','season'].
+  tags:
+    - Tier.Bronze
+    - Domain.Football
+    - PII.Low
+columns:
+  - name: league
+    description: Лига (e.g. 'ENG-Premier League'); partition key.
+  - name: season
+    description: Сезон в формате WhoScored 'YYZZ' (e.g. '2425'); partition key.
+  - name: game
+    description: Строковый идентификатор матча WhoScored (slug).
+  - name: game_id
+    description: Числовой WhoScored match_id (bigint).
+  - name: period
+    description: Игровой период события (e.g. FirstHalf / SecondHalf).
+  - name: minute
+    description: Минута события внутри периода.
+  - name: second
+    description: Секунда события внутри минуты.
+  - name: expanded_minute
+    description: Непрерывная минута от начала матча (сквозная).
+  - name: type
+    description: Тип Opta-события (~39 значений; e.g. Pass / Tackle / Goal / SavedShot).
+  - name: outcome_type
+    description: Исход события (e.g. Successful / Unsuccessful).
+  - name: team_id
+    description: WhoScored team_id команды события (bigint).
+  - name: team
+    description: Название команды события.
+  - name: player_id
+    description: WhoScored player_id (double; downstream CAST(CAST(x AS BIGINT) AS varchar) против научной нотации).
+  - name: player
+    description: Имя игрока события.
+    tags:
+      - PII.Low
+  - name: x
+    description: X-координата события на поле (шкала 0-100).
+  - name: y
+    description: Y-координата события на поле (шкала 0-100).
+  - name: end_x
+    description: Конечная X-координата (для паса/удара; шкала 0-100).
+  - name: end_y
+    description: Конечная Y-координата (для паса/удара; шкала 0-100).
+  - name: goal_mouth_y
+    description: Y-координата точки в створе ворот (для удара).
+  - name: goal_mouth_z
+    description: Z-координата (высота) в створе ворот (для удара).
+  - name: blocked_x
+    description: X-координата точки блокировки паса/удара.
+  - name: blocked_y
+    description: Y-координата точки блокировки паса/удара.
+  - name: qualifiers
+    description: Массив qualifier-объектов в JSON-строке; Silver матчит по вложенному displayName (не по type.value) для SPADL-разметки.
+  - name: is_touch
+    description: Является ли событие касанием мяча.
+  - name: is_shot
+    description: Является ли событие ударом.
+  - name: is_goal
+    description: Является ли событие голом.
+  - name: card_type
+    description: Тип карточки (если событие — карточка).
+  - name: related_event_id
+    description: ID связанного события (double; e.g. предшествующее событие).
+  - name: related_player_id
+    description: ID связанного игрока (double; e.g. на принимающей стороне).
+  - name: _source
+    description: Источник данных ('whoscored'); метаколонка Bronze.
+  - name: _entity_type
+    description: Тип сущности в Bronze; метаколонка.
+  - name: _ingested_at
+    description: Timestamp ingest'а строки в Bronze; метаколонка.
+  - name: _batch_id
+    description: Идентификатор батча ingest'а; метаколонка.

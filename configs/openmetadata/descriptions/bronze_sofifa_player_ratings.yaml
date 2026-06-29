@@ -1,0 +1,142 @@
+# =============================================================================
+# OpenMetadata description: iceberg.bronze.sofifa_player_ratings
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.bronze.sofifa_player_ratings
+  description: |
+    Детальные атрибуты игроков из карточек видеоигры EA Sports FC / FIFA (sofifa.com,
+    per-player страницы через scrapers/sofifa + FlareSolverr, dag_ingest_sofifa,
+    еженедельно). Grain — один row на (игрок, издание игры). Несёт общий рейтинг +
+    потенциал, 6 агрегатов карты, 34 детальных навыка, 5 вратарских и рыночно-контрактные
+    поля. Большинство навыков — шкала 0-99. Партиционирование ['fifa_edition'].
+  tags:
+    - Tier.Bronze
+    - Domain.Football
+    - PII.Low
+columns:
+  - name: player
+    description: Имя игрока.
+    tags:
+      - PII.Low
+  - name: player_id
+    description: SoFIFA id игрока (bigint).
+  - name: fifa_edition
+    description: Издание игры (e.g. 'FC 26'); partition key.
+  - name: update
+    description: Метка обновления ростера на sofifa.com (e.g. 'Jun 2, 2026').
+  - name: overallrating
+    description: Общий рейтинг игрока (0-99).
+  - name: potential
+    description: Потенциал — потолок будущего рейтинга (0-99).
+  - name: crossing
+    description: Навык навесов/кроссов (0-99).
+  - name: finishing
+    description: Завершение атак (0-99).
+  - name: headingaccuracy
+    description: Точность игры головой (0-99).
+  - name: shortpassing
+    description: Короткий пас (0-99).
+  - name: volleys
+    description: Удары с лёта (0-99).
+  - name: dribbling_detail
+    description: Детальный навык дриблинга (0-99); НЕ путать с агрегатом dribbling.
+  - name: curve
+    description: Закрутка мяча (0-99).
+  - name: fk_accuracy
+    description: Точность ударов со штрафных (0-99).
+  - name: longpassing
+    description: Длинный пас (0-99).
+  - name: ballcontrol
+    description: Контроль мяча (0-99).
+  - name: acceleration
+    description: Ускорение (0-99).
+  - name: sprintspeed
+    description: Максимальная скорость спринта (0-99).
+  - name: agility
+    description: Ловкость (0-99).
+  - name: reactions
+    description: Скорость реакции (0-99).
+  - name: balance
+    description: Равновесие/баланс (0-99).
+  - name: shotpower
+    description: Сила удара (0-99).
+  - name: jumping
+    description: Прыгучесть (0-99).
+  - name: stamina
+    description: Выносливость (0-99).
+  - name: strength
+    description: Физическая сила (0-99).
+  - name: longshots
+    description: Дальние удары (0-99).
+  - name: aggression
+    description: Агрессивность в единоборствах (0-99).
+  - name: interceptions
+    description: Перехваты мяча (0-99).
+  - name: positioning
+    description: Позиционирование в атаке (0-99); на sofifa.com помечено как «Attack position».
+  - name: vision
+    description: Видение поля (0-99).
+  - name: penalties
+    description: Исполнение пенальти (0-99).
+  - name: composure
+    description: Хладнокровие под давлением (0-99).
+  - name: defensiveawareness
+    description: Оборонительное чутьё/позиционирование в защите (0-99).
+  - name: standingtackle
+    description: Отбор мяча в положении стоя (0-99).
+  - name: slidingtackle
+    description: Отбор мяча в подкате (0-99).
+  - name: gk_diving
+    description: Вратарь — броски/нырки за мячом (0-99).
+  - name: gk_handling
+    description: Вратарь — фиксация/игра руками (0-99).
+  - name: gk_kicking
+    description: Вратарь — удары от ворот (0-99).
+  - name: gk_positioning
+    description: Вратарь — позиционирование в воротах (0-99).
+  - name: gk_reflexes
+    description: Вратарь — рефлексы (0-99).
+  - name: pace
+    description: Агрегат скорости карты FIFA (0-99).
+  - name: shooting
+    description: Агрегат ударов карты FIFA (0-99).
+  - name: passing
+    description: Агрегат паса карты FIFA (0-99).
+  - name: dribbling
+    description: Агрегат дриблинга карты FIFA (0-99); НЕ путать с dribbling_detail.
+  - name: defending
+    description: Агрегат обороны карты FIFA (0-99).
+  - name: physical
+    description: Агрегат физики карты FIFA (0-99).
+  - name: value_eur
+    description: Рыночная стоимость игрока, EUR (bigint).
+  - name: wage_eur
+    description: Недельная зарплата игрока, EUR (bigint).
+  - name: release_clause_eur
+    description: Сумма отступных по контракту, EUR (bigint); ~4% NULL (есть не у всех).
+  - name: contract_valid_until
+    description: Год окончания контракта (bigint); ~4% NULL.
+  - name: joined
+    description: Дата перехода игрока в текущий клуб (timestamp).
+  - name: position
+    description: Позиция(и) игрока (e.g. 'ST', 'CB,RB').
+  - name: dob
+    description: Дата рождения игрока (varchar, e.g. 'Jun 24, 1987').
+    tags:
+      - PII.Low
+  - name: height_cm
+    description: Рост игрока, см (bigint).
+  - name: weight_kg
+    description: Вес игрока, кг (bigint).
+  - name: nationality
+    description: Гражданство игрока.
+    tags:
+      - PII.Low
+  - name: _source
+    description: Источник данных ('sofifa'); метаколонка Bronze.
+  - name: _entity_type
+    description: Тип сущности в Bronze; метаколонка.
+  - name: _ingested_at
+    description: Timestamp ingest'а строки в Bronze; метаколонка.
+  - name: _batch_id
+    description: Идентификатор батча ingest'а; метаколонка.

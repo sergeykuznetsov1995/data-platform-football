@@ -1,0 +1,64 @@
+# =============================================================================
+# OpenMetadata description: iceberg.bronze.capology_transfer_window
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.bronze.capology_transfer_window
+  description: |
+    Клубная трансферная активность с capology.com (через scrapers/capology,
+    dag_ingest_capology, еженедельно). Grain — один row на (клуб, сезон): доходы/расходы
+    и сальдо трансферов сразу в трёх валютах GBP/EUR/USD (абсолютные суммы, не делятся
+    на недели). Охват: только ENG-Premier League (много сезонов 2014/15…2025/26).
+    Партиционирование ['league','season'].
+  tags:
+    - Tier.Bronze
+    - Domain.Football
+    - PII.None
+columns:
+  - name: club_slug
+    description: Capology URL-слаг клуба.
+  - name: club_name
+    description: Название клуба.
+  - name: club_code
+    description: Короткий код клуба (может быть NULL).
+  - name: players
+    description: Число трансферных сделок за окно (bigint).
+  - name: age
+    description: Средний возраст пришедших игроков (double); NULL если сделок нет.
+  - name: foreign
+    description: Число иностранных (не британских) игроков среди трансферов (bigint).
+  - name: income_gbp
+    description: Доход от продаж игроков, GBP (bigint).
+  - name: income_eur
+    description: Доход от продаж игроков, EUR (bigint).
+  - name: income_usd
+    description: Доход от продаж игроков, USD (bigint).
+  - name: expense_gbp
+    description: Расходы на покупку игроков, GBP (bigint).
+  - name: expense_eur
+    description: Расходы на покупку игроков, EUR (bigint).
+  - name: expense_usd
+    description: Расходы на покупку игроков, USD (bigint).
+  - name: balance_gbp
+    description: Сальдо (доход − расход), GBP (bigint); отрицательное = чистые траты.
+  - name: balance_eur
+    description: Сальдо (доход − расход), EUR (bigint); отрицательное = чистые траты.
+  - name: balance_usd
+    description: Сальдо (доход − расход), USD (bigint); отрицательное = чистые траты.
+  - name: adjbalance_gbp
+    description: Скорректированное сальдо, GBP (bigint).
+  - name: adjbalance_eur
+    description: Скорректированное сальдо, EUR (bigint).
+  - name: adjbalance_usd
+    description: Скорректированное сальдо, USD (bigint).
+  - name: league
+    description: Лига (e.g. 'ENG-Premier League'); partition key.
+  - name: season
+    description: Сезон в коротком виде (e.g. '2526'); partition key.
+  - name: _source
+    description: Источник данных ('capology'); метаколонка Bronze.
+  - name: _entity_type
+    description: Тип сущности в Bronze; метаколонка.
+  - name: _ingested_at
+    description: Timestamp ingest'а строки в Bronze; метаколонка.
+  - name: _batch_id
+    description: Идентификатор батча ingest'а; метаколонка.

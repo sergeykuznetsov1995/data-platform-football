@@ -1,0 +1,108 @@
+# =============================================================================
+# OpenMetadata description: iceberg.bronze.espn_matchsheet
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.bronze.espn_matchsheet
+  description: |
+    Сырой протокол матча и командная статистика из ESPN (soccerdata
+    ESPN.read_matchsheet; backfill scripts/backfill_espn_e3_5.py, #298).
+    Grain — один row на (game, team). Несёт стадион/посещаемость и ~30
+    командных метрик строками. Кормит Gold dim_venue (написания стадионов).
+    Партиционирование ['league','season']. Backfill-only, не в daily dag_ingest_espn.
+  tags:
+    - Tier.Bronze
+    - Domain.Football
+    - PII.Low
+columns:
+  - name: league
+    description: Лига (e.g. 'ENG-Premier League'); partition key.
+  - name: season
+    description: Сезон в формате 'YYZZ' (e.g. '2526'); partition key.
+  - name: game
+    description: Строковый идентификатор матча ESPN (slug с префиксом-датой).
+  - name: team
+    description: Команда строки протокола.
+  - name: is_home
+    description: Играет ли команда дома (true) или в гостях (false).
+  - name: venue
+    description: Название стадиона; читается Gold dim_venue.
+  - name: attendance
+    description: Посещаемость матча (bigint).
+  - name: capacity
+    description: Вместимость стадиона; 100% NULL (current soccerdata не эмитит — по allowlist).
+  - name: roster
+    description: Состав команды (список игроков) строкой.
+    tags:
+      - PII.Low
+  - name: fouls_committed
+    description: Совершено фолов командой.
+  - name: yellow_cards
+    description: Жёлтые карточки команды.
+  - name: red_cards
+    description: Красные карточки команды.
+  - name: offsides
+    description: Положения вне игры команды.
+  - name: won_corners
+    description: Заработано угловых.
+  - name: saves
+    description: Сейвы вратаря команды.
+  - name: possession_pct
+    description: Владение мячом, % .
+  - name: total_shots
+    description: Всего ударов командой.
+  - name: shots_on_target
+    description: Удары в створ.
+  - name: shot_pct
+    description: Доля ударов в створ, % .
+  - name: penalty_kick_goals
+    description: Голы с пенальти.
+  - name: penalty_kick_shots
+    description: Удары с пенальти.
+  - name: accurate_passes
+    description: Точные передачи.
+  - name: total_passes
+    description: Всего передач.
+  - name: pass_pct
+    description: Точность передач, % .
+  - name: accurate_crosses
+    description: Точные навесы.
+  - name: total_crosses
+    description: Всего навесов.
+  - name: cross_pct
+    description: Точность навесов, % .
+  - name: total_long_balls
+    description: Всего длинных передач.
+  - name: accurate_long_balls
+    description: Точные длинные передачи.
+  - name: longball_pct
+    description: Точность длинных передач, % .
+  - name: blocked_shots
+    description: Заблокированные удары.
+  - name: effective_tackles
+    description: Удачные отборы.
+  - name: total_tackles
+    description: Всего отборов.
+  - name: tackle_pct
+    description: Доля удачных отборов, % .
+  - name: interceptions
+    description: Перехваты.
+  - name: effective_clearance
+    description: Удачные выносы.
+  - name: total_clearance
+    description: Всего выносов.
+  - name: _source
+    description: Источник данных ('espn'); метаколонка Bronze.
+  - name: _entity_type
+    description: Тип сущности в Bronze; метаколонка.
+  - name: _ingested_at
+    description: Timestamp ingest'а строки в Bronze; метаколонка.
+  - name: _batch_id
+    description: Идентификатор батча ingest'а; метаколонка.
+  - name: goal_difference
+    description: Разница мячей; legacy-колонка (~96% NULL, старый продюсер; новый backfill пишет NULL; не дропаем — Iceberg DROP COLUMN bug).
+  - name: total_goals
+    description: Забитые голы; legacy-колонка (~96% NULL, новый backfill не эмитит).
+  - name: goal_assists
+    description: Голевые передачи; legacy-колонка (~96% NULL, новый backfill не эмитит).
+  - name: goals_conceded
+    description: Пропущенные голы; legacy-колонка (~96% NULL, новый backfill не эмитит).

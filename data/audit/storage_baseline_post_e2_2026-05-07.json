@@ -1,0 +1,42 @@
+{
+  "schema_version": "v1",
+  "generated_at": "2026-05-07T12:35:04.240046+00:00",
+  "summary": {
+    "total_tables": 0,
+    "total_rows": null,
+    "total_hdfs_bytes": null,
+    "total_iceberg_metadata_bytes": null,
+    "schemas": {
+      "bronze": {
+        "table_count": 0,
+        "rows": 0,
+        "hdfs_bytes": 0,
+        "iceberg_metadata_bytes": 0
+      },
+      "silver": {
+        "table_count": 0,
+        "rows": 0,
+        "hdfs_bytes": 0,
+        "iceberg_metadata_bytes": 0
+      },
+      "gold": {
+        "table_count": 0,
+        "rows": 0,
+        "hdfs_bytes": 0,
+        "iceberg_metadata_bytes": 0
+      }
+    }
+  },
+  "hdfs_overall": {
+    "total_bytes": 211164733440,
+    "used_bytes": 6291431424,
+    "available_bytes": 100519391232,
+    "used_pct": 3.0
+  },
+  "host_disk": {
+    "total_bytes": 105582366720,
+    "used_bytes": 55305904128,
+    "used_pct": 53.0
+  },
+  "tables": []
+}

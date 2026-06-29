@@ -1,0 +1,123 @@
+{
+  "snapshot_date": "2026-05-09",
+  "snapshot_source": "E1-postmortem.md + E1-dual-run-parity-runbook.md (T6 deliverable from E1)",
+  "purpose": "Baseline parity_summary at start of E1.5 cutover prep. Drift from this baseline during the 3-day gate-watch window is the cutover trigger.",
+  "diff_threshold_current": 100,
+  "diff_threshold_target_post_cutover": 10,
+  "gate_target_earliest": "2026-05-11",
+  "gate_target_realistic": "2026-05-12",
+  "entities": {
+    "team": {
+      "silver_rows": 626,
+      "matched_pairs": 200,
+      "cid_match": 157,
+      "cid_diff": 43,
+      "silver_only_estimate": 426,
+      "gold_only": 0,
+      "canonical_id_match_pct": 0.785,
+      "verdict": "DIFF_DETECTED",
+      "diff_kind_breakdown": {
+        "alias_canonicalisation": 43,
+        "regression": 0
+      },
+      "known_alias_drift_examples": [
+        "manchester_utd -> manchester_united",
+        "west_brom -> west_bromwich_albion",
+        "bournemouth -> afc_bournemouth"
+      ],
+      "expected_dod_post_cutover": {
+        "canonical_id_match_pct": 1.0,
+        "scope": "FBref-only subset (alias-drift becomes new canonical, gold absorbs)"
+      }
+    },
+    "match": {
+      "silver_rows": 3801,
+      "matched_pairs": 3800,
+      "cid_match": 3800,
+      "cid_diff": 0,
+      "silver_only": 1,
+      "gold_only": 0,
+      "canonical_id_match_pct": 1.0,
+      "verdict": "PARITY_OK",
+      "expected_dod_post_cutover": {
+        "canonical_id_match_pct": 1.0,
+        "scope": "FBref-only — already met"
+      }
+    },
+    "referee": {
+      "silver_rows": 342,
+      "comment": "FBref 219 + MatchHistory 123. No legacy gold equivalent — N/A for parity."
+    },
+    "manager": {
+      "silver_rows": 0,
+      "comment": "STUB at E1; populated by Phase 1.5 (R0.2c FotMob OR R0.2a FBref match-page parser)."
+    },
+    "player": {
+      "silver_rows_per_season_avg": 1500,
+      "legacy_status": "LEGACY_ABSENT",
+      "rejection_rate": {
+        "fbref": 0.0,
+        "understat": 0.0694,
+        "whoscored": 0.0489
+      },
+      "rejection_rate_followup_2026_05_09": {
+        "comment": "E1-postmortem followup #5 surfaced higher rates after multi-season spine bug",
+        "understat_2425": 0.162,
+        "understat_2526": 0.193,
+        "whoscored_2425": 0.193,
+        "whoscored_2526": 0.197,
+        "root_cause": "_FBrefSpine.__init__ dedup picks first row per player_id across seasons; mid-season transfers route to wrong team-bucket",
+        "fix_track": "R2-followup (Phase 1.5) — NOT blocking for E1.5 cutover"
+      },
+      "expected_dod_post_cutover": {
+        "comment": "Player canonical prefix: legacy gold uses raw player_id; silver uses 'fb_<id>' — EVERY FBref player row is cid_diff until E1.5 reconciles dim_player.sql"
+      }
+    }
+  },
+  "downstream_consumers_to_watch": {
+    "gold_facts_using_silver_xref": [
+      "iceberg.gold.fct_event",
+      "iceberg.gold.fct_shot",
+      "iceberg.gold.fct_lineup",
+      "iceberg.gold.fct_goal",
+      "iceberg.gold.fct_card",
+      "iceberg.gold.fct_substitution",
+      "iceberg.gold.fct_match_odds",
+      "iceberg.gold.fct_match_rating"
+    ],
+    "gold_tables_using_legacy_entity_xref_pre_cutover": [
+      "iceberg.gold.dim_team",
+      "iceberg.gold.dim_match",
+      "iceberg.gold.dim_player",
+      "iceberg.gold.dim_standings",
+      "iceberg.gold.fct_player_match",
+      "iceberg.gold.match_outcomes"
+    ],
+    "cascade_through_dim_match": [
+      "iceberg.gold.fct_team_match",
+      "iceberg.gold.feat_team_form",
+      "iceberg.gold.feat_team_h2h",
+      "iceberg.gold.feat_team_xg_form",
+      "iceberg.gold.feat_team_event_style",
+      "iceberg.gold.feat_referee_bias",
+      "iceberg.gold.fct_match",
+      "iceberg.gold.fct_match_train",
+      "iceberg.gold.fct_match_test",
+      "iceberg.gold.predictions_input",
+      "iceberg.gold.predictions_input_v2",
+      "iceberg.gold.mart_scouting_radar",
+      "iceberg.gold.mart_referee_dashboard",
+      "iceberg.gold.mart_event_heatmap"
+    ],
+    "cascade_through_dim_player": [
+      "iceberg.gold.feat_player_form",
+      "iceberg.gold.fct_player_match",
+      "iceberg.gold.mart_scouting_radar"
+    ]
+  },
+  "notes": [
+    "All E3/E4 facts already write silver-canonical team_ids (manchester_united); legacy 6 SQL files write gold-regex canonical (manchester_utd). Cutover unifies the universe.",
+    "Gold DAG runs DROP+CREATE every execution → single Gold run after execute-PR rewrites all cascade tables with new canonical_ids; no historical backfill needed.",
+    "Iceberg snapshot retention 30 days (E0 policy) provides rollback window."
+  ]
+}

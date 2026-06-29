@@ -1,0 +1,54 @@
+# =============================================================================
+# OpenMetadata description: iceberg.gold.fct_player_salary
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.gold.fct_player_salary
+  description: |
+    Зарплаты игроков (Capology, issue #430). Один row per
+    (player_id, league, season). Проекция silver.capology_player_salaries —
+    canonical_id уже разрешён в Silver (LEFT JOIN xref_player,
+    source='capology'), xref-хопа здесь нет. Coverage: только APL (scope
+    ingest'а Capology). Все три валюты (GBP/EUR/USD) приходят inline широкими
+    колонками из одной Silver-строки (issue #195) — без валютной партиции.
+    Orphan-ID: для ≈9.5% игроков canonical_id NULL (контрактный roster-снэпшот:
+    suspended / injured / backup-GK / youth / loan-out без FBref-counterpart —
+    структурный floor) → детерминированный 'cap_'-префикс; soft FK к dim_player
+    therefore WARNING-severity.
+  tags:
+    - Tier.Gold
+    - Domain.Football
+    - PII.Low
+columns:
+  - name: player_id
+    description: ID игрока — canonical_id или 'cap_'-orphan (soft FK → dim_player, WARNING rate-mode). Часть PK (player_id, league, season).
+  - name: player_name
+    description: Имя игрока (Capology).
+  - name: club_name
+    description: Клуб игрока на момент снэпшота (Capology roster).
+  - name: weekly_gross_eur
+    description: Недельная gross-зарплата в EUR.
+  - name: annual_gross_eur
+    description: Годовая gross-зарплата в EUR.
+  - name: weekly_gross_gbp
+    description: Недельная gross-зарплата в GBP.
+  - name: annual_gross_gbp
+    description: Годовая gross-зарплата в GBP.
+  - name: weekly_gross_usd
+    description: Недельная gross-зарплата в USD.
+  - name: annual_gross_usd
+    description: Годовая gross-зарплата в USD.
+  - name: contract_status
+    description: Контрактный статус игрока (Capology 'status').
+  - name: is_verified
+    description: Флаг верификации зарплаты Capology (verified).
+  - name: _bronze_ingested_at
+    description: Timestamp Bronze ingest'а из Capology.
+  - name: league
+    description: Лига (partition key; coverage = только APL).
+  - name: season
+    description: Сезон — varchar slug ('2526' = сезон 2025/26), partition key.
+relationships:
+  - from: trino_iceberg.iceberg.gold.fct_player_salary
+    to:   trino_iceberg.iceberg.gold.dim_player
+    type: FOREIGN_KEY
+    description: player_id -> dim_player.player_id (soft, ≈9.5% 'cap_'-orphan).

@@ -1,0 +1,98 @@
+# player_aliases.yaml — final-tier override for the v2 player resolver.
+#
+# Hand-curated mapping for residual non-Anglo / locale-specific name forms
+# that are not covered by the upstream tiers:
+#   - surname-anchor (Levenshtein <= 1)
+#   - token_set_ratio >= 95
+#   - nicknames PyPI package (~1100 English short<->full pairs)
+#
+# Keep this file SMALL (<= 30 entries). Growth beyond ~30 is a signal that
+# a structural tier rule is missing or that a locale-specific nickname
+# package should be introduced (Spanish/Portuguese/French short forms).
+#
+# Schema:
+#   aliases:
+#     - source: understat | whoscored | sofascore | fotmob | matchhistory | transfermarkt | capology | sofifa
+#       source_id: "<the source's player_id, varchar>"
+#       fbref_player_id: "<FBref player_id, WITHOUT the 'fb_' prefix>"
+#       season: "<4-digit slug, e.g. '2425'>"  | "*"  (any season)
+#       reason: "<short comment for the reviewer>"
+#
+# Lookup contract (see utils.medallion_config.get_player_alias):
+#   * (source, source_id, season) is matched first.
+#   * If no row matches the exact season, a row with season='*' is tried.
+#   * Returns the FBref player_id without 'fb_' prefix, or None.
+
+aliases:
+  # Issue #84 — Capology "Jamie Bynoe-Gittens" (full legal surname) vs
+  # FBref "Jamie Gittens" (display-only short surname). Same player; token_set
+  # 81.25 < 95, surname-anchor fails (Bynoe-Gittens vs Gittens distinct tokens).
+  - source: capology
+    source_id: "jamie-bynoe-gittens-38207"
+    fbref_player_id: "10745192"
+    season: "*"
+    reason: "Bynoe-Gittens (Capology) ↔ Gittens (FBref) surname extension"
+
+  # Issue #500 — Transfermarkt "Savinho" (743591) vs FBref "Sávio" (fe6e7156).
+  # Brazilian nickname: TM stores "Savinho", FBref the birth-name short form
+  # "Sávio". Distinct tokens → surname-anchor / token_set / nicknames all miss.
+  - source: transfermarkt
+    source_id: "743591"
+    fbref_player_id: "fe6e7156"
+    season: "*"
+    reason: "Savinho (Transfermarkt) ↔ Sávio (FBref) Brazilian nickname"
+
+  # Issue #563 — FotMob "Savinho" (1174337) vs FBref "Sávio" (fe6e7156), Man City.
+  # Same Brazilian nickname miss as #500, but FotMob carries a distinct source_id
+  # so the Transfermarkt alias above doesn't cover it. token_set 83 < 95.
+  - source: fotmob
+    source_id: "1174337"
+    fbref_player_id: "fe6e7156"
+    season: "*"
+    reason: "Savinho (FotMob) ↔ Sávio (FBref) Brazilian nickname"
+
+  # Issue #738 — Understat bare first-name "Gabriel" (5613, Arsenal) is
+  # ambiguous across three real Gabriels (Magalhães, Martinelli, Jesus);
+  # token_set_band scores 100 for all → review queue, never resolved. The
+  # Understat "Gabriel" entry is the centre-back Gabriel Magalhães.
+  - source: understat
+    source_id: "5613"
+    fbref_player_id: "67ac5bb8"
+    season: "*"
+    reason: "Gabriel (Understat) → Gabriel Magalhães (FBref), Arsenal CB"
+
+  # Issue #738 — Understat "Bobby Reid" (6827) is Bobby De Cordova-Reid.
+  # Surname-anchor mis-matches him onto "Harrison Reed" (reid↔reed Levenshtein
+  # 1), colliding with the real Harrison Reed (910) in the per-season dedup.
+  # FBref carries him as "Bobby De Cordova-Reid" (surname token cordova-reid).
+  - source: understat
+    source_id: "6827"
+    fbref_player_id: "0f7533cd"
+    season: "*"
+    reason: "Bobby Reid (Understat) → Bobby De Cordova-Reid (FBref); breaks Reid↔Reed collision"
+
+  # Issue #738 — Understat "Paris Maghoma" (10053) surname-collides with
+  # Jayden Meghoma (maghoma↔meghoma Levenshtein 1) → ambiguous. The Understat
+  # entry is Edmond-Paris Maghoma (Brentford).
+  - source: understat
+    source_id: "10053"
+    fbref_player_id: "8a3ddcd2"
+    season: "*"
+    reason: "Paris Maghoma (Understat) → Edmond-Paris Maghoma (FBref)"
+
+  # Issue #738 — Understat "Ameen Al Dakhil" (11699) token_set 93.3 lands in
+  # the 88-95 ambiguous band against the single correct candidate
+  # "Ameen Al-Dakhil" (hyphenation) → not auto-linked.
+  - source: understat
+    source_id: "11699"
+    fbref_player_id: "93e08bce"
+    season: "*"
+    reason: "Ameen Al Dakhil (Understat) → Ameen Al-Dakhil (FBref), hyphenation band miss"
+
+  # Issue #738 — Understat "Ali Al-Hamadi" (12751) token_set 92.3 lands in the
+  # 88-95 ambiguous band against the single correct candidate "Ali Al Hamadi".
+  - source: understat
+    source_id: "12751"
+    fbref_player_id: "8450467d"
+    season: "*"
+    reason: "Ali Al-Hamadi (Understat) → Ali Al Hamadi (FBref), hyphenation band miss"

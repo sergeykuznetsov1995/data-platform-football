@@ -1,0 +1,112 @@
+-- =============================================================================
+-- Silver: transfermarkt_coaches   (Jinja-template — `.sql.j2`)
+-- =============================================================================
+--
+-- Coach roster from Transfermarkt: dob + nationality per (coach_id, league,
+-- season). Bronze scraper harvests every head coach a club had in the season
+-- — the end-of-season "Manager" plus mid-season replacements and caretakers
+-- via the club trainer-history page (scrapers/transfermarkt/scraper.py
+-- ::_parse_coach_history, issue #619; was a single end-of-season snapshot in
+-- #434). Assistants/analysts are dropped upstream.
+--
+-- Feeds gold.dim_manager nationality/dob enrichment as the historical-coverage
+-- source on top of FotMob (which only covers current-season coaches).
+--
+-- canonical_id (issue #434/#619): derived here with the SAME diacritic-stripping
+-- name-normalize idiom as silver.xref_manager.sql — NOT via an xref bridge.
+-- Managers canonicalise deterministically by name (no fuzzy resolver), so the
+-- TM coach lands on the same canonical_id as the FBref/FotMob spine and
+-- dim_manager's LEFT JOIN enriches it. A TM name that matches no spine coach
+-- simply fails the JOIN (does not pollute dim_manager).
+--
+-- Alias override (issue #619): a few TM coaches store a different spelling /
+-- name order (surname-first "Le Bris, Régis") that name-normalises to a
+-- DIFFERENT id than the FBref spine → orphan. The `manager_aliases` CTE remaps
+-- those TM raw forms onto the spine canonical_id. The VALUES body is rendered
+-- from configs/medallion/manager_aliases.yaml via
+-- `medallion_config.get_manager_alias_sql_values()` into the single
+-- `{{ manager_aliases_values_sql }}` placeholder (same machinery as
+-- xref_team.sql.j2 / xref_referee.sql.j2).
+--
+-- DAG-integration note: `dag_transform_transfermarkt_silver._run_transform`
+-- renders this through `medallion_config.render_sql_template()` then wraps the
+-- result in `CREATE OR REPLACE TABLE iceberg.silver.transfermarkt_coaches AS
+-- ...` via `silver_tasks.run_silver_transform()`. This file MUST stay a pure
+-- SELECT.
+--
+-- Notes:
+--   * Grain = (coach_id, league, season), matching Bronze. ROW_NUMBER dedup
+--     because Bronze ingest mode = replace_partitions.
+--   * dob is already a DATE (parsed in the scraper via _parse_tm_date);
+--     nationality is a full country name ('Spain'), consistent with FotMob.
+-- =============================================================================
+
+WITH bronze_dedup AS (
+    SELECT *
+    FROM (
+        SELECT
+            b.*,
+            ROW_NUMBER() OVER (
+                PARTITION BY coach_id, league, season
+                ORDER BY _ingested_at DESC
+            ) AS rn
+        FROM iceberg.bronze.transfermarkt_coaches b
+        WHERE coach_id IS NOT NULL
+          AND name IS NOT NULL AND name <> ''
+    )
+    WHERE rn = 1
+),
+
+-- Manager-name aliases (issue #619). One row per (norm, league); MAX guards the
+-- LEFT JOIN against fan-out (#465; precedent xref_team / dim_match.venue_aliases).
+-- `norm` uses the IDENTICAL name-normalize as the canonical_id fallback below,
+-- so an alias raw form keyed on the TM spelling matches the TM coach name.
+manager_aliases AS (
+    SELECT
+        league,
+        LOWER(REGEXP_REPLACE(
+            REGEXP_REPLACE(NORMALIZE(raw_name, NFD), '\p{Mn}+', ''),
+            '[^a-zA-Z0-9]+', '_'))                 AS norm,
+        MAX(canonical_id)                          AS canonical_id
+    FROM (VALUES
+        {{ manager_aliases_values_sql }}
+    ) AS t(raw_name, canonical_id, league)
+    -- NB Trino: GROUP BY cannot reference the same-level SELECT alias `norm`
+    -- (COLUMN_NOT_FOUND), so the expression is repeated.
+    GROUP BY
+        LOWER(REGEXP_REPLACE(
+            REGEXP_REPLACE(NORMALIZE(raw_name, NFD), '\p{Mn}+', ''),
+            '[^a-zA-Z0-9]+', '_')),
+        league
+)
+
+SELECT
+    b.coach_id,
+    -- Alias override (issue #619) wins; else the shared name-normalize id
+    -- (same idiom as xref_manager.sql).
+    COALESCE(
+        a.canonical_id,
+        LOWER(REGEXP_REPLACE(
+            REGEXP_REPLACE(NORMALIZE(b.name, NFD), '\p{Mn}+', ''),
+            '[^a-zA-Z0-9]+', '_'))
+    )                                              AS canonical_id,
+    b.name,
+    b.role,
+    b.dob,
+    b.nationality,
+
+    b.current_club_id,
+    b.current_club_name,
+
+    b._ingested_at                                 AS _bronze_ingested_at,
+
+    -- Partition keys last (matching writer convention).
+    b.league,
+    b.season
+
+FROM bronze_dedup b
+LEFT JOIN manager_aliases a
+    ON  a.league = b.league
+    AND a.norm = LOWER(REGEXP_REPLACE(
+            REGEXP_REPLACE(NORMALIZE(b.name, NFD), '\p{Mn}+', ''),
+            '[^a-zA-Z0-9]+', '_'))

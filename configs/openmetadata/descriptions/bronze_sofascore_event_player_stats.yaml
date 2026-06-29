@@ -1,0 +1,211 @@
+# =============================================================================
+# OpenMetadata description: iceberg.bronze.sofascore_event_player_stats
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.bronze.sofascore_event_player_stats
+  description: |
+    Сырая статистика игроков за матч из SofaScore (endpoint
+    /event/{id}/player/{pid}/statistics через dag_ingest_sofascore, задача
+    _run_event_player_stats). Grain — один row на (match_id, player_id):
+    ~80 Opta-метрик за матч плюс контекст состава (is_home/captain/substitute/
+    position_specific обогащены из /lineups, #301/#337). Скрапер skip-existing
+    (#69). Партиционирование ['league','season'].
+  tags:
+    - Tier.Bronze
+    - Domain.Football
+    - PII.Low
+columns:
+  - name: match_id
+    description: SofaScore event/match id (varchar).
+  - name: player_id
+    description: SofaScore player_id (varchar).
+  - name: team_id
+    description: SofaScore id команды игрока (bigint).
+  - name: team_name
+    description: Название команды игрока.
+  - name: is_home
+    description: Играет ли игрок за домашнюю команду (varchar 'True'/'False'; обогащено из /lineups).
+  - name: position
+    description: Позиция игрока в матче (буквенный код).
+  - name: position_specific
+    description: Уточнённая позиция игрока (из /lineups).
+  - name: captain
+    description: Капитан ли игрок (varchar 'True'/'False'; из /lineups).
+  - name: substitute
+    description: Вышел ли с замены (varchar 'True'/'False'; из /lineups).
+  - name: total_pass
+    description: Всего передач.
+  - name: accurate_pass
+    description: Точные передачи.
+  - name: total_long_balls
+    description: Всего длинных передач.
+  - name: accurate_long_balls
+    description: Точные длинные передачи.
+  - name: goal_assist
+    description: Голевые передачи.
+  - name: accurate_own_half_passes
+    description: Точные передачи на своей половине.
+  - name: total_own_half_passes
+    description: Всего передач на своей половине.
+  - name: accurate_opposition_half_passes
+    description: Точные передачи на чужой половине.
+  - name: total_opposition_half_passes
+    description: Всего передач на чужой половине.
+  - name: ball_recovery
+    description: Возвраты мяча.
+  - name: good_high_claim
+    description: Удачный забор верхового мяча (GK).
+  - name: saved_shots_from_inside_the_box
+    description: Сейвы по ударам из штрафной (GK).
+  - name: saves
+    description: Сейвы (GK).
+  - name: minutes_played
+    description: Сыграно минут.
+  - name: touches
+    description: Касания мяча.
+  - name: rating
+    description: Рейтинг игрока за матч (double).
+  - name: possession_lost_ctrl
+    description: Потери контроля владения.
+  - name: expected_assists
+    description: Ожидаемые ассисты за матч, xA (double).
+  - name: total_ball_carries_distance
+    description: Суммарная дистанция продвижения мяча ведением, м.
+  - name: ball_carries_count
+    description: Число продвижений мяча ведением.
+  - name: total_progression
+    description: Суммарное продвижение мяча (пасы + ведения).
+  - name: progressive_ball_carries_count
+    description: Число прогрессивных ведений.
+  - name: keeper_save_value
+    description: Ценность сейвов вратаря (модель SofaScore; GK).
+  - name: rating_versions
+    description: Служебная версия рейтинга (double).
+  - name: total_shots
+    description: Всего ударов.
+  - name: goals_prevented
+    description: Предотвращённые голы (GK-метрика над xGOT).
+  - name: pass_value_normalized
+    description: Нормированная ценность передач (модель SofaScore).
+  - name: dribble_value_normalized
+    description: Нормированная ценность дриблинга.
+  - name: defensive_value_normalized
+    description: Нормированная ценность оборонительных действий.
+  - name: goalkeeper_value_normalized
+    description: Нормированная ценность вратарских действий.
+  - name: statistics_type
+    description: Passthrough-тип блока статистики soccerdata.
+  - name: total_cross
+    description: Всего навесов.
+  - name: accurate_cross
+    description: Точные навесы.
+  - name: aerial_lost
+    description: Проигранные верховые единоборства.
+  - name: aerial_won
+    description: Выигранные верховые единоборства.
+  - name: duel_lost
+    description: Проигранные единоборства.
+  - name: duel_won
+    description: Выигранные единоборства.
+  - name: challenge_lost
+    description: Проигранные попытки отбора (обыграли в дриблинге).
+  - name: total_clearance
+    description: Всего выносов.
+  - name: total_tackle
+    description: Всего отборов.
+  - name: won_tackle
+    description: Удачные отборы.
+  - name: unsuccessful_touch
+    description: Неудачные касания (потеря мяча).
+  - name: was_fouled
+    description: Сфолено на игроке.
+  - name: best_ball_carry_progression
+    description: Лучшее продвижение мяча ведением за матч, м.
+  - name: total_progressive_ball_carries_distance
+    description: Суммарная дистанция прогрессивных ведений, м.
+  - name: key_pass
+    description: Ключевые передачи (под удар).
+  - name: outfielder_block
+    description: Блоки полевого игрока.
+  - name: interception_won
+    description: Перехваты.
+  - name: error_lead_to_a_shot
+    description: Ошибки, приведшие к удару.
+  - name: dispossessed
+    description: Потери мяча при отборе соперником.
+  - name: blocked_scoring_attempt
+    description: Заблокированные удары соперника.
+  - name: fouls
+    description: Совершено фолов.
+  - name: expected_goals
+    description: Ожидаемые голы за матч, xG (double).
+  - name: shot_value_normalized
+    description: Нормированная ценность ударов (модель SofaScore).
+  - name: total_contest
+    description: Всего попыток обводки.
+  - name: on_target_scoring_attempt
+    description: Удары в створ.
+  - name: expected_goals_on_target
+    description: Ожидаемые голы по ударам в створ, xGOT (double).
+  - name: won_contest
+    description: Удачные обводки.
+  - name: shot_off_target
+    description: Удары мимо.
+  - name: total_offside
+    description: Положения вне игры.
+  - name: big_chance_created
+    description: Созданные явные моменты.
+  - name: goals
+    description: Голы за матч.
+  - name: error_lead_to_a_goal
+    description: Ошибки, приведшие к голу.
+  - name: total_keeper_sweeper
+    description: Всего выходов вратаря на подбор/перехват (GK).
+  - name: accurate_keeper_sweeper
+    description: Удачные выходы вратаря на подбор (GK).
+  - name: big_chance_missed
+    description: Упущенные явные моменты.
+  - name: hit_woodwork
+    description: Попадания в каркас ворот.
+  - name: last_man_tackle
+    description: Отбор последним защитником.
+  - name: punches
+    description: Выносы мяча кулаками (GK).
+  - name: penalty_conceded
+    description: Сфолил на пенальти (отдал пенальти).
+  - name: penalty_faced
+    description: Пенальти против вратаря (GK).
+  - name: penalty_won
+    description: Заработано пенальти.
+  - name: league
+    description: Лига (e.g. 'ENG-Premier League'); partition key.
+  - name: season
+    description: Сезон в формате 'YYZZ' (e.g. '2526'); partition key.
+  - name: _ingested_at
+    description: Timestamp ingest'а строки в Bronze; метаколонка.
+  - name: _source
+    description: Источник данных ('sofascore'); метаколонка Bronze.
+  - name: _entity_type
+    description: Тип сущности в Bronze; метаколонка.
+  - name: _batch_id
+    description: Идентификатор батча ingest'а; метаколонка.
+  - name: own_goals
+    description: Автоголы (разрежено — событийная метрика).
+  - name: clearance_off_line
+    description: Выносы мяча с линии ворот (разрежено).
+  - name: cross_not_claimed
+    description: Невыбранный навес (GK; разрежено).
+  - name: penalty_save
+    description: Отражённые пенальти (GK; разрежено).
+  - name: penalty_miss
+    description: Незабитые пенальти (разрежено).
+  - name: meters_covered_walking_km
+    description: Пройдено шагом, км (tracking-метрика; есть не для всех матчей).
+  - name: meters_covered_jogging_km
+    description: Пройдено трусцой, км (tracking-метрика; есть не для всех матчей).
+  - name: meters_covered_running_km
+    description: Пройдено бегом, км (tracking-метрика; есть не для всех матчей).
+  - name: meters_covered_high_speed_running_km
+    description: Пройдено на высокой скорости, км (tracking-метрика; есть не для всех матчей).
+  - name: meters_covered_sprinting_km
+    description: Пройдено на спринте, км (tracking-метрика; есть не для всех матчей).

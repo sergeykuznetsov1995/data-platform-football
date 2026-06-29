@@ -1,0 +1,43 @@
+# =============================================================================
+# OpenMetadata description: iceberg.bronze.fbref_lineups
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.bronze.fbref_lineups
+  description: |
+    Сырые составы команд на матч из FBref. Гранулярность: один row на
+    (match_id, team, player). is_starter различает стартовый состав и запас;
+    position обогащается из per-match сводных stat-таблиц (data-stat="position").
+    Источник: FBref scrape (dag_ingest_fbref).
+  tags:
+    - Tier.Bronze
+    - Domain.Football
+    - PII.Low
+columns:
+  - name: team
+    description: Название команды, к которой относится игрок состава.
+  - name: player
+    description: Имя игрока.
+    tags:
+      - PII.Low
+  - name: player_id
+    description: FBref ID игрока.
+  - name: is_starter
+    description: TRUE — игрок в стартовом составе; FALSE — на скамейке/вышел на замену.
+  - name: position
+    description: Позиция игрока в матче (GK/DF/MF/FW и т.п.; из сводных stat-таблиц).
+  - name: number
+    description: Игровой номер (текст; приводится к INT в Silver).
+  - name: match_id
+    description: FBref ID матча.
+  - name: league
+    description: Лига (partition key).
+  - name: season
+    description: Сезон — год начала (bigint, напр. 2025 = сезон 2025/26).
+  - name: _source
+    description: Источник данных Bronze (всегда 'fbref').
+  - name: _entity_type
+    description: Внутренняя метка типа сущности ingest-конвейера FBref.
+  - name: _ingested_at
+    description: Timestamp ingest'а строки в Bronze.
+  - name: _batch_id
+    description: ID batch'а загрузки (трассировка и идемпотентность ingest).

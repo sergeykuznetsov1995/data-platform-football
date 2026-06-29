@@ -1,0 +1,54 @@
+{
+  "label": "baseline",
+  "source": "whoscored-schedule",
+  "matches_attempted": 1,
+  "matches_succeeded": 1,
+  "success_rate": 1.0,
+  "total_seconds": 89.67,
+  "mean_seconds": 86.44,
+  "fs_response_mb": 5.9291,
+  "fs_response_bytes": 6217098,
+  "requests": 14,
+  "sessions_created": 2,
+  "cf_challenge_failures": 0,
+  "top_traffic_urls": [
+    {
+      "url": "www.whoscored.com/Regions/252/Tournaments/2/Seasons/10743/Stages/24533",
+      "bytes": 1483549,
+      "mb": 1.4148,
+      "requests": 1
+    },
+    {
+      "url": "www.whoscored.com/Regions/252/Tournaments/2/Seasons/10743",
+      "bytes": 1483443,
+      "mb": 1.4147,
+      "requests": 1
+    },
+    {
+      "url": "www.whoscored.com/Regions/252/Tournaments/2",
+      "bytes": 1483405,
+      "mb": 1.4147,
+      "requests": 1
+    },
+    {
+      "url": "www.whoscored.com",
+      "bytes": 1069567,
+      "mb": 1.02,
+      "requests": 1
+    },
+    {
+      "url": "www.whoscored.com/tournaments/24533/data/",
+      "bytes": 696636,
+      "mb": 0.6644,
+      "requests": 10
+    }
+  ],
+  "per_match": [
+    {
+      "i": 1,
+      "rows": 380,
+      "seconds": 86.44,
+      "success": true
+    }
+  ]
+}

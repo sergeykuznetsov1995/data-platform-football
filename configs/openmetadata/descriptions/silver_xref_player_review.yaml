@@ -1,0 +1,46 @@
+# =============================================================================
+# OpenMetadata description: iceberg.silver.xref_player_review
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.silver.xref_player_review
+  description: |
+    Clerical-review очередь резолвера игроков (Fellegi-Sunter «серая зона») —
+    sibling-таблица к silver.xref_player. Сюда попадают игроки, которых
+    v2-каскад резолвера НЕ смог однозначно сматчить: несколько одинаково
+    хороших кандидатов в бакете (season, canonical_team), либо token_set score
+    в диапазоне 88-94. Такие строки НИКОГДА не попадают в xref_player — только
+    сюда. Заполняется тем же прогоном резолвера (dags/utils/xref_player_resolver.py,
+    DROP+CREATE каждый run). Ревьюер разбирает очередь через Superset/BI и либо
+    вручную промоутит игрока в xref_player, либо дописывает player_aliases.yaml,
+    чтобы следующий прогон авто-резолвил кейс. rule показывает, какое правило
+    флагнуло неоднозначность; candidates/candidate_names несут множество
+    FBref-кандидатов. Партиционирование: (league, season).
+  tags:
+    - Tier.Silver
+    - Domain.Football
+    - PII.Low
+columns:
+  - name: source
+    description: Источник несматченного игрока (fbref/understat/whoscored/sofascore/fotmob/transfermarkt/capology).
+  - name: source_id
+    description: ID игрока в его источнике (varchar) — идентифицирующий кортеж вместе с source.
+  - name: display_name
+    description: Имя игрока как в источнике (то, что не удалось однозначно сматчить).
+  - name: raw_team_name
+    description: Сырое название команды игрока из источника (до канонизации).
+  - name: canonical_team
+    description: Каноническое название команды (через medallion_config.get_canonical_team_name) — ключ бакета кандидатов.
+  - name: league
+    description: Лига (partition key).
+  - name: season
+    description: Сезон slug '2526' (partition key, varchar).
+  - name: candidates
+    description: ARRAY(varchar) — множество FBref player_id кандидатов, между которыми резолвер не смог выбрать.
+  - name: candidate_names
+    description: ARRAY(varchar) — имена кандидатов, параллельно candidates (для ручного разбора ревьюером).
+  - name: rule
+    description: Правило, флагнувшее неоднозначность — surname_collision / token_set_band / nickname_collision.
+  - name: score
+    description: Скор похожести имени (0-100, token_set/token_sort) на момент флага; для token_set_band в зоне 88-94, DOUBLE.
+  - name: detected_at
+    description: Timestamp (с таймзоной) обнаружения кейса в прогоне резолвера.

@@ -1,0 +1,188 @@
+# =============================================================================
+# OpenMetadata description: iceberg.gold.fct_player_season_stats
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.gold.fct_player_season_stats
+  description: |
+    Wide per-season per-player stats объединяющие 5 источников
+    (FBref / FotMob / WhoScored / Understat / SofaScore) через silver.xref_player.
+
+    Правило выбора колонок (см. docs/research/RX_cross_source_player_profile.md
+    D3 + docs/research/RX2_xg_source_selection.md):
+
+      * HARD_FACT (счётные event-метрики, identical definition): single
+        column через variadic COALESCE(fb→fm→ws→us→ss). FBref — primary
+        spine. Cross-source diff'ы хранятся в gold.fct_player_season_stats_audit.
+      * MODELED (разные модели у разных платформ): xG публикуется с
+        per-source suffix — три разные модели (FotMob StatsBomb-derived,
+        Understat own, SofaScore Opta-derived). После RX2 verdict может
+        свернуться в single `expected_goals`.
+      * RATING: SofaScore (Opta-derived) выбран как единственный источник —
+        FotMob rating дропнут из business-fct, cross-source diff
+        остаётся в audit-таблице.
+      * UNIQUE_<source>: метрика отсутствует у других источников →
+        single column без суффикса.
+
+    Мульти-squad агрегация (#515, Вариант B): если игрок зимой сменил клуб
+    ВНУТРИ лиги, FBref хранит отдельную строку на каждый клуб. Счётные
+    FBref-метрики (matches/minutes/goals/… и FBref-only счётчики) СУММИРУЮТСЯ
+    по клубам сезона — тоталы сходятся с FotMob/Understat/SofaScore/WhoScored
+    (дают сумму за лигу-сезон). team_id и несуммируемые ratio (points_per_match)
+    берутся от клуба с максимумом минут; ratio с известной формулой
+    (goals_per_shot) пересчитываются из суммированных счётчиков. Одноклубные
+    игроки не затронуты (поведение идентично прежнему Варианту A).
+
+    Зерно: (player_id, league, season) — star design §5.2 (#428). FK:
+    player_id → dim_player, team_id → dim_team (orphan-fallback 'fb_<slug>').
+    Outfield-only (вратари в fct_keeper_season_stats).
+    Partitioning: (league, season).
+  tags:
+    - Tier.Gold
+    - Domain.Football
+    - PII.Low
+columns:
+  # ─── PK / FK ───
+  - name: player_id
+    description: Канонический ID игрока (PK part; #428 ex-player_id_canonical). FK → dim_player / dim_player_attributes.
+  - name: league
+    description: Лига (partition key).
+  - name: season
+    description: Сезон — varchar slug ('2425' = сезон 2024/25). Partition key.
+  - name: team_id
+    description: Клуб игрока в сезоне (#428) — canonical id через xref_team, orphan-fallback 'fb_<slug>'. FK → dim_team. При трансфере внутри лиги = клуб с максимумом минут (#515).
+
+  # ─── HARD_FACT (key metrics — single column COALESCE) ───
+  - name: matches
+    description: Matches played (COALESCE FBref → FotMob → WhoScored → Understat). FBref-часть суммируется по клубам при трансфере (#515).
+  - name: minutes
+    description: Minutes played (COALESCE FBref → FotMob → Understat). FBref-часть суммируется по клубам при трансфере (#515).
+  - name: goals
+    description: Голы (COALESCE FBref → FotMob → Understat). FBref-часть суммируется по клубам при трансфере (#515).
+  - name: assists
+    description: Ассисты (COALESCE FBref → FotMob → Understat). FBref-часть суммируется по клубам при трансфере (#515).
+  - name: yellow_cards
+    description: Жёлтые карточки. FBref-часть суммируется по клубам при трансфере (#515).
+  - name: red_cards
+    description: Красные карточки. FBref-часть суммируется по клубам при трансфере (#515).
+  - name: shots
+    description: Все удары (COALESCE FBref → FotMob → WS → Understat → SofaScore). FBref-часть суммируется по клубам при трансфере (#515).
+  - name: shots_on_target
+    description: Удары в створ. FBref-часть суммируется по клубам при трансфере (#515).
+  - name: interceptions
+    description: Перехваты (COALESCE FBref → FotMob → WhoScored → SofaScore). FBref-часть суммируется по клубам при трансфере (#515).
+  - name: tackles_won
+    description: Выигранные отборы. FBref-часть суммируется по клубам при трансфере (#515).
+  - name: tackles_attempted
+    description: Все попытки отбора.
+  - name: successful_dribbles
+    description: Успешные дриблинги (COALESCE FotMob → WhoScored → SofaScore).
+  - name: key_passes
+    description: Передачи под удар (COALESCE Understat → SofaScore).
+  - name: non_penalty_goals
+    description: Голы без пенальти (COALESCE Understat → derived FBref).
+  - name: pass_pct
+    description: Pass accuracy % (COALESCE WhoScored → SofaScore — расхождение моделей ≤2%, приемлемо).
+  - name: take_on_pct
+    description: Take-on / dribble success %.
+  - name: tackle_pct
+    description: Tackle success %.
+
+  # ─── MODELED (single column after RX2) ───
+  - name: expected_goals
+    description: |
+      xG через COALESCE(Understat → FotMob → SofaScore). Understat — primary
+      источник (coverage 99% в APL 2025/26, r≥0.989 с другими). Cross-source
+      diff'ы хранятся в fct_player_season_stats_audit для DQ-мониторинга.
+      См. docs/research/RX2_xg_source_selection.md.
+  - name: expected_assists
+    description: xA через COALESCE(Understat → FotMob). Single column after RX2.
+  - name: expected_goals_on_target
+    description: xGOT (FotMob proprietary — нет аналогов у других источников).
+  - name: non_penalty_xg_understat
+    description: Non-penalty xG (Understat-only).
+  - name: xg_chain_understat
+    description: xG Chain — суммарный xG атак с участием игрока (Understat-only).
+  - name: xg_buildup_understat
+    description: xG Buildup — xG Chain без своих shots/assists (Understat-only).
+  - name: rating_sofascore
+    description: SofaScore rating (0-10, Opta-style). Единственный rating-источник.
+
+  # ─── UNIQUE_FBREF (FBref-only метрики) ───
+  - name: complete_matches
+    description: Полные матчи (FBref-only; сумма по клубам сезона при трансфере, #515).
+  - name: starts
+    description: Стартовые составы (FBref-only; сумма по клубам сезона при трансфере, #515).
+  - name: subs
+    description: Выходы на замену (FBref-only; сумма по клубам сезона при трансфере, #515).
+  - name: plus_minus
+    description: Plus/minus (FBref-only; сумма по клубам сезона при трансфере, #515).
+  - name: points_per_match
+    description: Points per match (FBref). При трансфере = значение клуба с максимумом минут (несуммируемо, #515).
+  - name: goals_per_shot
+    description: Голы на удар (FBref). При трансфере пересчитывается из суммированных голов/ударов (#515).
+
+  # ─── UNIQUE_FOTMOB ───
+  - name: defensive_actions_per_90
+    description: Composite defensive actions per 90 (FotMob proprietary).
+  - name: big_chances_created
+    description: Big chances created (FotMob).
+  - name: big_chances_missed
+    description: Big chances missed (FotMob).
+  - name: chances_created
+    description: Chances created (FotMob).
+
+  # ─── UNIQUE_WHOSCORED ───
+  - name: bad_touches
+    description: Плохие касания / потери (WhoScored-only).
+  - name: touches_in_box
+    description: Касания в чужой штрафной (WhoScored-only).
+  - name: avg_x
+    description: Средняя X-координата действий (WhoScored).
+  - name: avg_y
+    description: Средняя Y-координата действий (WhoScored).
+
+  # ─── UNIQUE_SOFASCORE (key only — duels / errors / goal structure) ───
+  - name: ground_duels_won
+    description: Выигранные наземные дуэли (SofaScore-only).
+  - name: aerial_duels_won
+    description: Выигранные верховые дуэли.
+  - name: total_duels_won
+    description: Все выигранные дуэли.
+  - name: errors_lead_to_goal
+    description: Ошибки, приведшие к голу (критическая дефенсивная метрика).
+  - name: errors_lead_to_shot
+    description: Ошибки, приведшие к удару соперника.
+  - name: touches
+    description: Все касания мяча (SofaScore-only).
+  - name: dispossessed
+    description: Потери мяча через отбор.
+  - name: possession_lost
+    description: Все потери владения.
+  - name: shots_inside_box
+    description: Удары из чужой штрафной.
+  - name: shots_outside_box
+    description: Удары из-за штрафной.
+  - name: goals_inside_box
+    description: Голы из чужой штрафной.
+  - name: goals_outside_box
+    description: Голы из-за штрафной.
+  - name: headed_goals
+    description: Голы головой.
+  - name: left_foot_goals
+    description: Голы левой ногой.
+  - name: right_foot_goals
+    description: Голы правой ногой.
+  - name: goal_conversion_pct
+    description: "% конверсии ударов в голы."
+
+  - name: _gold_created_at
+    description: Технический timestamp создания строки в Gold-слое.
+relationships:
+  - from: player_id
+    to: trino_iceberg.iceberg.gold.dim_player_attributes.player_id_canonical
+    type: FOREIGN_KEY
+    description: N:1 — атрибуты игрока (snapshot per canonical_id).
+  - from: team_id
+    to: trino_iceberg.iceberg.gold.dim_team.team_id
+    type: FOREIGN_KEY
+    description: N:1 — клуб игрока в сезоне (#428; orphan 'fb_<slug>' вне dim_team).

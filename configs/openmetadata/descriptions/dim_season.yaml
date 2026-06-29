@@ -1,0 +1,29 @@
+# =============================================================================
+# OpenMetadata description: iceberg.gold.dim_season
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.gold.dim_season
+  description: |
+    Справочник сезонов (звёздный дизайн, #425). Одна строка = один сезон-slug,
+    union сезонов in-scope лиг из configs/medallion/competitions.yaml —
+    конфиг является source of truth, точные даты старта/конца берутся из него.
+    is_current помечает последний начавшийся сезон (ровно одна строка TRUE,
+    в том числе в летнюю паузу между сезонами).
+  tags:
+    - Tier.Gold
+    - Domain.Football
+    - PII.None
+columns:
+  - name: season
+    description: PK — сезон-slug ('2425' = 2024-25); то же значение, что несёт колонка season всех фактов (#404).
+  - name: season_name
+    description: Человекочитаемое имя сезона ('2024-25').
+  - name: start_date
+    description: Дата первого тура сезона (из competitions.yaml).
+  - name: end_date
+    description: Дата последнего тура сезона (из competitions.yaml).
+  - name: is_current
+    description: TRUE для последнего начавшегося сезона — ровно одна строка.
+  - name: _silver_created_at
+    description: Технический timestamp создания строки CTAS-раннером.
+relationships: []

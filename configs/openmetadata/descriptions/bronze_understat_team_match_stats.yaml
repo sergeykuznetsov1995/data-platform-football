@@ -1,0 +1,82 @@
+# =============================================================================
+# OpenMetadata description: iceberg.bronze.understat_team_match_stats
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.bronze.understat_team_match_stats
+  description: |
+    Командная статистика матча из Understat (soccerdata UnderstatScraper,
+    read_team_match_stats). Grain — один row на матч (wide-формат: home_* /
+    away_* колонки в одной строке; Silver разворачивает в два row на команду).
+    Несёт xG/npxG, PPDA, deep completions, expected points обеих сторон.
+    Партиционирование ['league','season'].
+  tags:
+    - Tier.Bronze
+    - Domain.Football
+    - PII.None
+columns:
+  - name: league
+    description: Лига (e.g. 'ENG-Premier League'); partition key.
+  - name: season
+    description: Сезон в формате Understat (e.g. '2526'); partition key.
+  - name: game_id
+    description: Числовой Understat match_id.
+  - name: game
+    description: Строковый идентификатор матча Understat (slug).
+  - name: date
+    description: Дата и время начала матча.
+  - name: home_team
+    description: Название домашней команды.
+  - name: home_team_code
+    description: Краткий код домашней команды.
+  - name: home_team_id
+    description: Understat team_id домашней команды.
+  - name: home_goals
+    description: Голы домашней команды.
+  - name: home_xg
+    description: Ожидаемые голы (xG) домашней команды.
+  - name: home_np_xg
+    description: Ожидаемые голы без пенальти (npxG) домашней команды.
+  - name: home_np_xg_difference
+    description: Разница npxG домашней команды (свой npxG − npxG соперника).
+  - name: home_points
+    description: Фактически набранные очки домашней команды (0/1/3).
+  - name: home_expected_points
+    description: Ожидаемые очки (xPTS) домашней команды на основе xG-симуляции.
+  - name: home_ppda
+    description: PPDA домашней команды (passes allowed per defensive action) — метрика прессинга.
+  - name: home_deep_completions
+    description: Deep completions домашней команды — передачи/паса в зону ~20м от ворот соперника.
+  - name: away_team
+    description: Название гостевой команды.
+  - name: away_team_code
+    description: Краткий код гостевой команды.
+  - name: away_team_id
+    description: Understat team_id гостевой команды.
+  - name: away_goals
+    description: Голы гостевой команды.
+  - name: away_xg
+    description: Ожидаемые голы (xG) гостевой команды.
+  - name: away_np_xg
+    description: Ожидаемые голы без пенальти (npxG) гостевой команды.
+  - name: away_np_xg_difference
+    description: Разница npxG гостевой команды (свой npxG − npxG соперника).
+  - name: away_points
+    description: Фактически набранные очки гостевой команды (0/1/3).
+  - name: away_expected_points
+    description: Ожидаемые очки (xPTS) гостевой команды на основе xG-симуляции.
+  - name: away_ppda
+    description: PPDA гостевой команды (passes allowed per defensive action) — метрика прессинга.
+  - name: away_deep_completions
+    description: Deep completions гостевой команды — передачи/паса в зону ~20м от ворот соперника.
+  - name: league_id
+    description: Внутренний идентификатор лиги Understat.
+  - name: season_id
+    description: Внутренний идентификатор сезона Understat.
+  - name: _source
+    description: Источник данных ('understat'); метаколонка Bronze.
+  - name: _entity_type
+    description: Тип сущности в Bronze; метаколонка.
+  - name: _ingested_at
+    description: Timestamp ingest'а строки в Bronze; метаколонка.
+  - name: _batch_id
+    description: Идентификатор батча ingest'а; метаколонка.

@@ -1,0 +1,48 @@
+# =============================================================================
+# OpenMetadata description: iceberg.silver.xref_player
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.silver.xref_player
+  description: |
+    Кросс-источниковый справочник игроков из 8 источников. Spine — FBref.
+    Материализуется Python-резолвером (dags/utils/xref_player_resolver.py) с
+    rapidfuzz/unidecode — это нельзя выразить чистым Trino SQL, поэтому файл
+    dags/sql/silver/xref_player.sql является лишь read-only валидационным probe,
+    НЕ источником схемы. Один row на (source, source_id, league, season).
+    canonical_id = 'fb_<player_id>' при exact-матче на FBref player_id, либо
+    name+team fuzzy-матч (token_sort_ratio≥90), либо orphan '<src>_<id>'
+    ('us_1234', 'ws_5678'). Игроки группируются по канонической команде
+    (canonical_team из xref_team), что повышает точность fuzzy-матчинга.
+    Помимо 8 общих xref-колонок несёт raw_team_name и canonical_team.
+  tags:
+    - Tier.Silver
+    - Domain.Football
+    - PII.Low
+columns:
+  - name: canonical_id
+    description: "Идентификатор 'fb_<player_id>' при привязке к FBref; orphan '<src>_<source_id>' если игрок не сматчен."
+  - name: source
+    description: Источник игрока — fbref / understat / whoscored / fotmob / sofascore / transfermarkt / capology / sofifa.
+  - name: source_id
+    description: Сырой player_id игрока в источнике.
+  - name: display_name
+    description: Сырое имя игрока из Bronze (персональные данные).
+  - name: league
+    description: Код лиги (например 'ENG-Premier League').
+  - name: season
+    description: Нормализованный сезон-slug (varchar, например '2425').
+  - name: confidence
+    description: "Уровень привязки: 'exact' (source_id = FBref player_id), 'name_team*' (fuzzy-варианты — surname/subset/nickname/alias) или 'orphan' (нет матча)."
+  - name: match_score
+    description: Скор fuzzy-матчинга (token_sort_ratio); NULL для exact-матчей.
+  - name: raw_team_name
+    description: Сырое название команды игрока из Bronze (не каноническое).
+  - name: canonical_team
+    description: Каноническое имя команды (YAML-маппинг), по которому игроки бакетятся при матчинге.
+  - name: _silver_created_at
+    description: Технический timestamp материализации строки резолвером.
+relationships:
+  - from: trino_iceberg.iceberg.silver.xref_player
+    to: trino_iceberg.iceberg.silver.xref_team
+    type: FOREIGN_KEY
+    description: canonical_team берётся из xref_team для бакетинга игроков по команде.

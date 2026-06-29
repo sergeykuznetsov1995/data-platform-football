@@ -1,0 +1,48 @@
+# =============================================================================
+# OpenMetadata description: iceberg.bronze.transfermarkt_transfers
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.bronze.transfermarkt_transfers
+  description: |
+    Трансферные события игроков с transfermarkt.com (JSON ceapi transferHistory через
+    scrapers/transfermarkt, dag_ingest_transfermarkt, еженедельно). Grain — один row на
+    трансфер (player_id, transfer_date, from_club_id, to_club_id). Несёт клубы «из/в»,
+    сумму и рыночную стоимость в EUR, флаг будущего трансфера. Охват: только
+    ENG-Premier League (MVP). Партиционирование ['league','season'].
+  tags:
+    - Tier.Bronze
+    - Domain.Football
+    - PII.None
+columns:
+  - name: player_id
+    description: Transfermarkt id игрока (varchar).
+  - name: transfer_date
+    description: Дата трансфера (date); NULL у будущих/ожидаемых переходов.
+  - name: season
+    description: Сезон ingest'а в коротком виде (e.g. '2526'), НЕ сезон самого события; partition key.
+  - name: from_club_id
+    description: Transfermarkt id клуба-отправителя (varchar); NULL если не распознан.
+  - name: from_club_name
+    description: Название клуба-отправителя.
+  - name: to_club_id
+    description: Transfermarkt id клуба-получателя (varchar); NULL если не распознан.
+  - name: to_club_name
+    description: Название клуба-получателя.
+  - name: fee_text
+    description: Сырой текст суммы трансфера ('€30.00m','loan transfer','free','?').
+  - name: fee_eur
+    description: Сумма трансфера в EUR (double); ~76% NULL (аренды/free/неразобранные).
+  - name: market_value_eur
+    description: Рыночная стоимость игрока на момент трансфера, EUR (double); ~42% NULL.
+  - name: is_upcoming
+    description: Будущий/ожидаемый трансфер (boolean) — нет финальной даты/суммы.
+  - name: league
+    description: Лига (e.g. 'ENG-Premier League'); partition key.
+  - name: _source
+    description: Источник данных ('transfermarkt'); метаколонка Bronze.
+  - name: _entity_type
+    description: Тип сущности в Bronze; метаколонка.
+  - name: _ingested_at
+    description: Timestamp ingest'а строки в Bronze; метаколонка.
+  - name: _batch_id
+    description: Идентификатор батча ingest'а; метаколонка.

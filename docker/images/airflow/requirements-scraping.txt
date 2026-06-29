@@ -1,0 +1,100 @@
+# =============================================================================
+# Web Scraping Dependencies (installed separately to avoid pip backtracking)
+# =============================================================================
+#
+# ⚠️  PINNING POLICY (#758)
+# Все версии ниже ЗАПИННЕНЫ (==). nodriver/curl_cffi/DrissionPage/camoufox — ядро
+# CF-байпаса; молчаливый bump при `make up-build` уже ломал нас (см.
+# memory/feedback_nodriver_048_parser_regressions.md).
+# BUMP ТОЛЬКО ОСОЗНАННО: после изменения версии — ОБЯЗАТЕЛЬНО live-прогон
+# FBref + WhoScored в контейнере (CF-байпас) до мержа. Хост держать в синхроне.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# [rich] Rich library upgrade (required by soccerdata>=1.8.8)
+# Base Airflow image has rich 13.x, but soccerdata requires >=14.0.0
+# Must be installed FIRST to upgrade rich before soccerdata installation
+# -----------------------------------------------------------------------------
+rich==14.3.4
+
+# -----------------------------------------------------------------------------
+# [soccerdata] Football data scraping library
+# Brings seleniumbase as dependency
+#
+# Pinned to 1.8.8 (issue #67): 1.9.0 migrated FBref to BaseSeleniumReader,
+# которая в нашем airflow image не пробивает CF на fbref.com (требует
+# python3-tk для uc_gui_click_captcha + ломается с residential proxies
+# через host_resolver_rules). Decision: HOLD до появления overridable
+# _validate_page timeout / passive Turnstile bypass в seleniumbase.
+# Research-doc: docs/research/issue_67_soccerdata_19_fbref_migration.md
+# -----------------------------------------------------------------------------
+soccerdata==1.8.8
+
+# -----------------------------------------------------------------------------
+# [selenium] Selenium tools (for Cloudflare bypass)
+# selenium приходит транзитивно через seleniumbase (soccerdata>=1.8.8 → seleniumbase),
+# но seleniumbase сам не запиннен → selenium может "уплыть". Пиним обе строки явно,
+# чтобы полностью зафиксировать ветку. seleniumbase==4.38.3 сам требует selenium==4.32.0.
+# -----------------------------------------------------------------------------
+selenium==4.32.0
+seleniumbase==4.38.3
+undetected-chromedriver==3.5.5
+cloudscraper==1.2.71
+
+# -----------------------------------------------------------------------------
+# [curl_cffi] Chrome TLS fingerprint impersonation (patches soccerdata)
+# Used for bypassing Cloudflare by impersonating real browser TLS fingerprint
+# -----------------------------------------------------------------------------
+curl_cffi==0.15.0
+
+# Pin markdown-it-py to reduce backtracking with rich>=14
+markdown-it-py==3.0.0
+mdit-py-plugins==0.4.2
+
+# -----------------------------------------------------------------------------
+# [display] Xvfb wrapper for Cloudflare bypass
+# -----------------------------------------------------------------------------
+pyvirtualdisplay==3.0
+
+# -----------------------------------------------------------------------------
+# [proxy] SOCKS proxy support
+# -----------------------------------------------------------------------------
+PySocks==1.7.1
+
+# -----------------------------------------------------------------------------
+# [nodriver] Advanced Cloudflare bypass (successor to undetected-chromedriver)
+# Uses async API and better fingerprint evasion
+# -----------------------------------------------------------------------------
+nodriver==0.50.3
+
+# -----------------------------------------------------------------------------
+# [nodriver-cf-verify] Cloudflare Turnstile automatic bypass plugin for nodriver
+# Clicks Turnstile checkbox automatically instead of passive waiting
+# https://github.com/KlozetLabs/nodriver-cf-bypass
+# Note: Bundled locally in scrapers/base/browser/nodriver_cf_verify/
+# -----------------------------------------------------------------------------
+
+# -----------------------------------------------------------------------------
+# [opencv] OpenCV for native nodriver tab.cf_verify() method
+# Enables image-based Turnstile checkbox detection as fallback
+# -----------------------------------------------------------------------------
+opencv-python-headless==4.13.0.92
+
+# -----------------------------------------------------------------------------
+# [DrissionPage] CDP-based browser automation WITHOUT WebDriver protocol
+# Key advantage: No WebDriver signature that Cloudflare detects
+# Used as primary bypass before falling back to nodriver
+# -----------------------------------------------------------------------------
+DrissionPage==4.1.1.4
+
+# -----------------------------------------------------------------------------
+# [camoufox] Anti-detect Firefox for SofaScore Cloudflare-Turnstile bypass (#757)
+# SofaScore's data API is Turnstile-gated; only a real Firefox (Camoufox) through
+# a residential proxy passes it invisibly. Driven via Playwright; we passively
+# capture the SPA's same-origin /api/v1 XHRs (scrapers/sofascore/camoufox_capture.py).
+# playwright MUST stay <1.60 — 1.60 crashes Camoufox on page errors (camoufox#617).
+# The Firefox binary is fetched at image-build time via `python -m camoufox fetch`
+# (see Dockerfile). Runs under Xvfb (headless="virtual"), already provisioned.
+# -----------------------------------------------------------------------------
+camoufox[geoip]==0.4.11
+playwright==1.59.0

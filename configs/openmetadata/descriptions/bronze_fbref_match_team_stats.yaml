@@ -1,0 +1,56 @@
+# =============================================================================
+# OpenMetadata description: iceberg.bronze.fbref_match_team_stats
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.bronze.fbref_match_team_stats
+  description: |
+    Командные сводные показатели матча из FBref (блок Team Stats). Гранулярность:
+    один row на match_id с парными home_/away_ метриками. Источник: FBref scrape
+    (dag_ingest_fbref).
+  tags:
+    - Tier.Bronze
+    - Domain.Football
+    - PII.None
+columns:
+  - name: home_team
+    description: Название домашней команды.
+  - name: away_team
+    description: Название гостевой команды.
+  - name: home_possession
+    description: Владение мячом домашней команды, % .
+  - name: away_possession
+    description: Владение мячом гостевой команды, % .
+  - name: home_shots
+    description: Удары домашней команды (всего).
+  - name: away_shots
+    description: Удары гостевой команды (всего).
+  - name: home_sot
+    description: Удары в створ (Shots on Target) домашней команды.
+  - name: away_sot
+    description: Удары в створ (Shots on Target) гостевой команды.
+  - name: home_saves
+    description: Сейвы домашней команды.
+  - name: away_saves
+    description: Сейвы гостевой команды.
+  - name: home_yellow_cards
+    description: Жёлтые карточки домашней команды.
+  - name: home_red_cards
+    description: Красные карточки домашней команды.
+  - name: away_yellow_cards
+    description: Жёлтые карточки гостевой команды.
+  - name: away_red_cards
+    description: Красные карточки гостевой команды.
+  - name: match_id
+    description: FBref ID матча.
+  - name: league
+    description: Лига (partition key).
+  - name: season
+    description: Сезон — год начала (bigint, напр. 2025 = сезон 2025/26).
+  - name: _source
+    description: Источник данных Bronze (всегда 'fbref').
+  - name: _entity_type
+    description: Внутренняя метка типа сущности ingest-конвейера FBref.
+  - name: _ingested_at
+    description: Timestamp ingest'а строки в Bronze.
+  - name: _batch_id
+    description: ID batch'а загрузки (трассировка и идемпотентность ingest).

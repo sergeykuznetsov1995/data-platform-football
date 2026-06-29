@@ -1,0 +1,32 @@
+# =============================================================================
+# OpenMetadata description: iceberg.gold.fct_match_officials
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.gold.fct_match_officials
+  description: |
+    Narrow-факт судейской бригады на матч (issue #613). Гранулярность: один row
+    на (match_id, role). Расширяет покрытие за главного судью (он уже в
+    dim_match.referee_id) на ассистентов / 4th / VAR. referee_id резолвится
+    best-effort через silver.xref_referee — NULL для чистых ассистентов/VAR
+    (single-source FBref, canonical_id избыточен).
+  tags:
+    - Tier.Gold
+    - Domain.Football
+    - PII.Low
+columns:
+  - name: match_id
+    description: FBref ID матча (FK → dim_match).
+  - name: role
+    description: Роль судьи (referee / ar1 / ar2 / fourth_official / var).
+  - name: referee_id
+    description: Canonical ID судьи (FK → dim_referee). NULL для чистых ассистентов/VAR.
+  - name: official_name
+    description: Имя судьи в этой роли.
+    tags:
+      - PII.Low
+  - name: league
+    description: Лига (partition key).
+  - name: season
+    description: Сезон — slug ('2526'), partition key.
+  - name: _silver_created_at
+    description: Timestamp материализации факта (добавляется gold runner'ом).

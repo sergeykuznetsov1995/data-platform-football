@@ -1,0 +1,291 @@
+-- =============================================================================
+-- Silver: xref_team   (Jinja-template — `.sql.j2`)
+-- =============================================================================
+-- Maps source-specific team-name → canonical team_id across 10 sources.
+--
+-- This template renders ONE `{{ team_aliases_values_sql }}` placeholder which
+-- is filled by `medallion_config.get_team_alias_sql_values(with_canonical_id=True,
+-- with_league=True)`. The placeholder must produce a comma-separated list of
+-- four-tuples `('raw_name', 'canonical_name', 'canonical_id', 'league'), ...`.
+-- See `medallion_config.py` for escape rules and the public-API contract.
+--
+-- Identity (issue #141): `canonical_id` is the explicit identity slug declared
+-- in `team_aliases.yaml` — it is NOT derived from the display name here. Two
+-- real clubs with similar names (Spartak Moscow vs Nalchik) get distinct slugs
+-- in YAML and therefore never silently merge.
+--
+-- DAG-integration note: T4 will wrap this SELECT in
+-- `CREATE TABLE iceberg.silver.xref_team AS ...` via
+-- `silver_tasks.run_silver_transform()`, after rendering through
+-- `medallion_config.render_sql_template()`. This file MUST stay a pure
+-- SELECT — do not add `CREATE TABLE` here.
+--
+-- =============================================================================
+-- Schema (frozen for E1 dual-run)
+-- =============================================================================
+--   canonical_id   varchar  -- 'wolverhampton_wanderers' | 'fb_<slug>' | 'mh_<slug>' | ...
+--   source         varchar  -- 'fbref' | 'understat' | 'whoscored' | 'sofascore' |
+--                              'fotmob' | 'matchhistory' | 'clubelo' | 'espn' |
+--                              'transfermarkt' | 'capology' | 'sofifa'
+--   source_id      varchar  -- raw team-name as it appears in Bronze
+--   display_name   varchar  -- canonical_name when aliased, else source_id
+--   league         varchar  -- partitioning hint (e.g. 'ENG-Premier League')
+--   season         varchar  -- partitioning hint, normalised to varchar
+--   confidence     varchar  -- 'name_alias' (matched in YAML) | 'orphan' (no match)
+--   match_score    double   -- always NULL for team xref (fuzzy lives in T3 player)
+--
+-- Testable invariants (T5):
+--   * PK = (source, source_id, league, season) — guaranteed by final GROUP BY.
+--   * All 11 sources are represented in the UNION ALL below; T5 should
+--     SELECT DISTINCT source FROM iceberg.silver.xref_team and assert
+--     that the set equals the 11 prefixes documented above.
+--   * canonical_id is NEVER NULL (CASE branch covers every source).
+--   * confidence ∈ {'name_alias', 'orphan'}.
+--   * aliases CTE is unique on (norm, league) — GROUP BY guard against
+--     alias-JOIN fan-out (#465; precedent dim_match.venue_aliases / #425).
+--
+-- =============================================================================
+-- Bronze column-name reference (verified via DESCRIBE on 2026-05-08)
+-- =============================================================================
+--   fbref_schedule        : home, away, league, season (BIGINT — needs CAST)
+--   fbref_match_player_stats : team, league, season (BIGINT) — match-page FULL names (#445)
+--   fbref_match_events    : team, league, season (BIGINT) — match-page FULL names (#445)
+--   understat_schedule    : home_team, away_team, league, season (varchar)
+--   whoscored_schedule    : home_team, away_team, league, season (varchar)
+--                          (NB: whoscored_events has only `team`, not home/away)
+--   sofascore_schedule    : home_team, away_team, league, season (varchar)
+--   fotmob_schedule       : home_team, away_team, league, season (BIGINT)
+--   matchhistory_results  : home_team, away_team (renamed via COLUMN_MAPPING), league, season (BIGINT)
+--                          (NB: lowercase, single-token — NOT CamelCase)
+--   clubelo_ratings       : team, league (no season — see CAST(NULL AS varchar))
+--                          (clubelo_team_history has no league either; we
+--                           prefer clubelo_ratings as the team-name source)
+--   espn_schedule         : home_team, away_team, league, season (varchar)
+-- =============================================================================
+
+WITH aliases AS (
+    SELECT
+        -- League predicate (issue #148, #141 stage 2): each alias is tagged with
+        -- the competition it applies to, so the JOIN below can guard on
+        -- `a.league = rt.league` and disambiguate a bare short name (e.g.
+        -- "Spartak") by league at worldwide scope. APL-only today → no-op.
+        league,
+        -- Normalised join key (issue #141, stage 3): lower → strip diacritics →
+        -- drop a trailing legal-form suffix (FC/AFC/CF) → remove all remaining
+        -- non-alphanumerics. Lets "Liverpool FC" match the "Liverpool" alias
+        -- without a hand-written row, and absorbs ~80% of cosmetic variants.
+        regexp_replace(
+            regexp_replace(
+                regexp_replace(normalize(lower(raw_name), NFD), '\p{Mn}+', ''),
+                '\s+(fc|afc|cf)$', ''
+            ),
+            '[^a-z0-9]+', ''
+        ) AS norm,
+        -- #465 guard (precedent: dim_match.venue_aliases / #425): collapse to
+        -- ONE row per (norm, league) so the LEFT JOIN in `resolved` can never
+        -- fan out raw_teams rows (PK = source, source_id, league, season).
+        -- Same-norm rows share one canonical by construction (two DIFFERENT
+        -- canonicals on one norm = YAML curation error), so MAX is exact,
+        -- not a tiebreak.
+        MAX(canonical_name) AS canonical_name,
+        MAX(canonical_id)   AS canonical_id
+    FROM (VALUES
+        {{ team_aliases_values_sql }}
+    ) AS t(raw_name, canonical_name, canonical_id, league)
+    -- NB Trino: GROUP BY cannot reference the same-level SELECT alias `norm`
+    -- (COLUMN_NOT_FOUND; DuckDB-based tests mask this dialect gap — see
+    -- feedback_trino_window_alias_duckdb_gap), so the expression is repeated.
+    GROUP BY
+        regexp_replace(
+            regexp_replace(
+                regexp_replace(normalize(lower(raw_name), NFD), '\p{Mn}+', ''),
+                '\s+(fc|afc|cf)$', ''
+            ),
+            '[^a-z0-9]+', ''
+        ),
+        league
+),
+
+raw_teams AS (
+    -- ===== fbref (home/away from schedule) =====
+    SELECT 'fbref' AS source, home AS source_id, league, LPAD(CAST(MOD(season, 100) AS varchar), 2, '0') || LPAD(CAST(MOD(season + 1, 100) AS varchar), 2, '0') AS season  -- year-start bigint → slug '2425' (#404)
+      FROM iceberg.bronze.fbref_schedule WHERE home IS NOT NULL
+    UNION
+    SELECT 'fbref' AS source, away AS source_id, league, LPAD(CAST(MOD(season, 100) AS varchar), 2, '0') || LPAD(CAST(MOD(season + 1, 100) AS varchar), 2, '0') AS season  -- year-start bigint → slug '2425' (#404)
+      FROM iceberg.bronze.fbref_schedule WHERE away IS NOT NULL
+
+    UNION
+    -- ===== fbref (match-page full names — #445) =====
+    -- Match pages carry FULL club names ('Wolverhampton Wanderers',
+    -- 'Brighton & Hove Albion') where the schedule carries SHORT ones
+    -- ('Wolves', 'Brighton'). Both variants must exist as xref rows so
+    -- name-keyed Gold JOINs resolve either spelling.
+    -- NB: this makes TWO fbref rows per (canonical_id, league, season) legal —
+    -- canonical→fbref-name bridges must aggregate (see the GROUP BY guards in
+    -- fct_match_timeline.ws_match_bridge / fct_lineup.espn_match_bridge).
+    SELECT 'fbref' AS source, team AS source_id, league, LPAD(CAST(MOD(season, 100) AS varchar), 2, '0') || LPAD(CAST(MOD(season + 1, 100) AS varchar), 2, '0') AS season  -- year-start bigint → slug '2425' (#404)
+      FROM iceberg.bronze.fbref_match_player_stats WHERE team IS NOT NULL
+    UNION
+    SELECT 'fbref' AS source, team AS source_id, league, LPAD(CAST(MOD(season, 100) AS varchar), 2, '0') || LPAD(CAST(MOD(season + 1, 100) AS varchar), 2, '0') AS season  -- year-start bigint → slug '2425' (#404)
+      FROM iceberg.bronze.fbref_match_events WHERE team IS NOT NULL
+
+    UNION
+    -- ===== understat =====
+    SELECT 'understat' AS source, home_team AS source_id, league, CAST(season AS varchar) AS season
+      FROM iceberg.bronze.understat_schedule WHERE home_team IS NOT NULL
+    UNION
+    SELECT 'understat' AS source, away_team AS source_id, league, CAST(season AS varchar) AS season
+      FROM iceberg.bronze.understat_schedule WHERE away_team IS NOT NULL
+
+    UNION
+    -- ===== whoscored (using schedule, not events) =====
+    SELECT 'whoscored' AS source, home_team AS source_id, league, CAST(season AS varchar) AS season
+      FROM iceberg.bronze.whoscored_schedule WHERE home_team IS NOT NULL
+    UNION
+    SELECT 'whoscored' AS source, away_team AS source_id, league, CAST(season AS varchar) AS season
+      FROM iceberg.bronze.whoscored_schedule WHERE away_team IS NOT NULL
+
+    UNION
+    -- ===== sofascore =====
+    SELECT 'sofascore' AS source, home_team AS source_id, league, CAST(season AS varchar) AS season
+      FROM iceberg.bronze.sofascore_schedule WHERE home_team IS NOT NULL
+    UNION
+    SELECT 'sofascore' AS source, away_team AS source_id, league, CAST(season AS varchar) AS season
+      FROM iceberg.bronze.sofascore_schedule WHERE away_team IS NOT NULL
+
+    UNION
+    -- ===== fotmob =====
+    SELECT 'fotmob' AS source, home_team AS source_id, league, LPAD(CAST(MOD(season, 100) AS varchar), 2, '0') || LPAD(CAST(MOD(season + 1, 100) AS varchar), 2, '0') AS season  -- year-start bigint → slug '2425' (#404)
+      FROM iceberg.bronze.fotmob_schedule WHERE home_team IS NOT NULL
+    UNION
+    SELECT 'fotmob' AS source, away_team AS source_id, league, LPAD(CAST(MOD(season, 100) AS varchar), 2, '0') || LPAD(CAST(MOD(season + 1, 100) AS varchar), 2, '0') AS season  -- year-start bigint → slug '2425' (#404)
+      FROM iceberg.bronze.fotmob_schedule WHERE away_team IS NOT NULL
+
+    UNION
+    -- ===== matchhistory (#307: cols renamed home_team/away_team via COLUMN_MAPPING) =====
+    SELECT 'matchhistory' AS source, home_team AS source_id, league, LPAD(CAST(MOD(season, 100) AS varchar), 2, '0') || LPAD(CAST(MOD(season + 1, 100) AS varchar), 2, '0') AS season  -- year-start bigint → slug '2425' (#404)
+      FROM iceberg.bronze.matchhistory_results WHERE home_team IS NOT NULL
+    UNION
+    SELECT 'matchhistory' AS source, away_team AS source_id, league, LPAD(CAST(MOD(season, 100) AS varchar), 2, '0') || LPAD(CAST(MOD(season + 1, 100) AS varchar), 2, '0') AS season  -- year-start bigint → slug '2425' (#404)
+      FROM iceberg.bronze.matchhistory_results WHERE away_team IS NOT NULL
+
+    UNION
+    -- ===== clubelo (column name is `team`; no season column → NULL) =====
+    -- ⚠️ TRAP (#477): clubelo rows carry season = NULL BY DESIGN — ClubElo is a
+    -- point-in-time daily ELO snapshot with no season concept. Consumers MUST
+    -- NOT add a `season = '<slug>'` predicate to clubelo rows: NULL = '2526'
+    -- is NULL (never TRUE), so such a JOIN silently returns ZERO clubelo rows.
+    -- Join clubelo on (source, source_id, league) ONLY — see fct_team_elo.sql
+    -- which deliberately omits the season predicate for exactly this reason.
+    SELECT 'clubelo' AS source, team AS source_id, league, CAST(NULL AS varchar) AS season
+      FROM iceberg.bronze.clubelo_ratings
+     WHERE team IS NOT NULL
+       AND league = 'ENG-Premier League'   -- ClubElo trackет всю English pyramid; фильтруем не-APL
+    UNION
+    -- ===== clubelo (historical snapshots — relegated APL teams, #589) =====
+    -- `clubelo_ratings` (daily, current) carries only teams CURRENTLY in the
+    -- APL; teams that have since dropped (Leicester/Southampton/Ipswich) live
+    -- only in `clubelo_ratings_historical`. Both are name-only sources for
+    -- xref; the UNION + the final GROUP BY collapse the duplicate
+    -- (clubelo, team, league, NULL) rows, so no fan-out.
+    SELECT 'clubelo' AS source, team AS source_id, league, CAST(NULL AS varchar) AS season
+      FROM iceberg.bronze.clubelo_ratings_historical
+     WHERE team IS NOT NULL
+       AND league = 'ENG-Premier League'
+
+    UNION
+    -- ===== espn =====
+    SELECT 'espn' AS source, home_team AS source_id, league, CAST(season AS varchar) AS season
+      FROM iceberg.bronze.espn_schedule WHERE home_team IS NOT NULL
+    UNION
+    SELECT 'espn' AS source, away_team AS source_id, league, CAST(season AS varchar) AS season
+      FROM iceberg.bronze.espn_schedule WHERE away_team IS NOT NULL
+
+    UNION
+    -- ===== transfermarkt (team universe = player roster's current club; issue #192) =====
+    SELECT 'transfermarkt' AS source, current_club_name AS source_id, league, CAST(season AS varchar) AS season
+      FROM iceberg.bronze.transfermarkt_players WHERE current_club_name IS NOT NULL
+
+    UNION
+    -- ===== capology (team universe = salary roster's club; issue #192) =====
+    SELECT 'capology' AS source, club_name AS source_id, league, CAST(season AS varchar) AS season
+      FROM iceberg.bronze.capology_player_salaries WHERE club_name IS NOT NULL
+
+    UNION
+    -- ===== sofifa (team universe = FIFA-edition team listing; issue #601) =====
+    -- No `season` column — derive the slug from fifa_edition ('FC 26' -> '2526'),
+    -- the SAME expression sofifa_team_profile.sql uses so the canonical_id JOIN
+    -- aligns on season.
+    SELECT 'sofifa' AS source, team AS source_id, league,
+           LPAD(CAST(CAST(regexp_extract(fifa_edition, '(\d+)', 1) AS INTEGER) - 1 AS varchar), 2, '0')
+           || LPAD(regexp_extract(fifa_edition, '(\d+)', 1), 2, '0') AS season
+      FROM iceberg.bronze.sofifa_teams WHERE team IS NOT NULL
+),
+
+resolved AS (
+    SELECT
+        rt.source,
+        rt.source_id,
+        rt.league,
+        rt.season,
+        a.canonical_name,
+        a.canonical_id,
+        CASE WHEN a.canonical_id IS NOT NULL THEN 'name_alias' ELSE 'orphan' END
+            AS confidence
+    FROM raw_teams rt
+    -- Match on the normalised key (NOT the raw string). Same normalisation as
+    -- the `aliases.norm` column above, applied to the Bronze raw team-name.
+    -- The `a.league = rt.league` guard (issue #148) disambiguates same-named
+    -- clubs in different leagues; all 10 Bronze sources emit the identical
+    -- league literal (e.g. 'ENG-Premier League'), so APL resolution is a no-op.
+    LEFT JOIN aliases a
+      ON a.league = rt.league
+     AND a.norm = regexp_replace(
+                      regexp_replace(
+                          regexp_replace(
+                              normalize(lower(rt.source_id), NFD), '\p{Mn}+', ''
+                          ),
+                          '\s+(fc|afc|cf)$', ''
+                      ),
+                      '[^a-z0-9]+', ''
+                  )
+)
+
+SELECT
+    CASE
+        WHEN canonical_id IS NOT NULL
+          THEN canonical_id   -- explicit identity slug from YAML (issue #141)
+        ELSE
+            -- orphan fallback: source-prefixed slug of the raw name. Unchanged
+            -- from the original — orphan canonical_ids are excluded from every
+            -- cross-source Gold JOIN (confidence <> 'orphan'), so their format
+            -- must stay stable for dim_team.
+            CASE source
+                WHEN 'fbref'        THEN 'fb_'
+                WHEN 'understat'    THEN 'us_'
+                WHEN 'whoscored'    THEN 'ws_'
+                WHEN 'sofascore'    THEN 'ss_'
+                WHEN 'fotmob'       THEN 'fm_'
+                WHEN 'matchhistory' THEN 'mh_'
+                WHEN 'clubelo'      THEN 'ce_'
+                WHEN 'espn'         THEN 'es_'
+                WHEN 'transfermarkt' THEN 'tm_'
+                WHEN 'capology'     THEN 'cap_'
+                WHEN 'sofifa'       THEN 'sf_'
+            END
+            || LOWER(REGEXP_REPLACE(source_id, '[^a-zA-Z0-9]+', '_'))
+    END                                       AS canonical_id,
+    source,
+    source_id,
+    COALESCE(canonical_name, source_id)       AS display_name,
+    league,
+    season,
+    MIN(confidence)                           AS confidence,
+    CAST(NULL AS double)                      AS match_score
+FROM resolved
+GROUP BY
+    -- canonical_id is now the explicit YAML slug (1:1 with canonical_name) or the
+    -- orphan fallback (a function of source + source_id) — so grouping by
+    -- (canonical_id-expr, source, source_id, league, season, canonical_name) is
+    -- enough to enforce the documented PK and dedupe identical UNION rows.
+    1, source, source_id, league, season, canonical_name

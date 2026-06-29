@@ -1,0 +1,51 @@
+# =============================================================================
+# OpenMetadata description: iceberg.bronze.fotmob_team_stats
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.bronze.fotmob_team_stats
+  description: |
+    Сырая турнирная таблица из FotMob (endpoint /api/data/leagues через
+    scrapers/fotmob, dag_ingest_fotmob). Grain — один row на команду за сезон:
+    место и итоговые показатели (игры/победы/голы/очки). Snapshot позиции на
+    момент ingest'а. Партиционирование ['league','season'].
+  tags:
+    - Tier.Bronze
+    - Domain.Football
+    - PII.None
+columns:
+  - name: team_id
+    description: FotMob id команды (bigint).
+  - name: team_name
+    description: Название команды.
+  - name: position
+    description: Место в таблице.
+  - name: played
+    description: Сыграно матчей.
+  - name: wins
+    description: Победы.
+  - name: draws
+    description: Ничьи.
+  - name: losses
+    description: Поражения.
+  - name: goals_for
+    description: Забито голов.
+  - name: goals_against
+    description: Пропущено голов.
+  - name: goal_diff
+    description: Разница мячей.
+  - name: points
+    description: Очки.
+  - name: league
+    description: Лига (e.g. 'ENG-Premier League'); partition key.
+  - name: season
+    description: Сезон — год начала (bigint, e.g. 2025); partition key.
+  - name: _source
+    description: Источник данных ('fotmob'); метаколонка Bronze.
+  - name: _entity_type
+    description: Тип сущности в Bronze; метаколонка.
+  - name: _ingested_at
+    description: Timestamp ingest'а строки в Bronze; метаколонка.
+  - name: _batch_id
+    description: Идентификатор батча ingest'а; метаколонка.
+  - name: form
+    description: Строка последней формы команды; 100% NULL (вариативность ответа FotMob, текущий продюсер не заполняет).

@@ -1,0 +1,292 @@
+{
+  "total_mb": 4.503,
+  "hosts": [
+    {
+      "host": "challenges.cloudflare.com",
+      "conns": 3,
+      "down_mb": 0.484,
+      "up_mb": 0.191,
+      "total_mb": 0.675
+    },
+    {
+      "host": "fundingchoicesmessages.google.com",
+      "conns": 2,
+      "down_mb": 0.568,
+      "up_mb": 0.012,
+      "total_mb": 0.581
+    },
+    {
+      "host": "cdn.intergient.com",
+      "conns": 10,
+      "down_mb": 0.47,
+      "up_mb": 0.037,
+      "total_mb": 0.507
+    },
+    {
+      "host": "r3---sn-bvvbaxivnuxqqu5b-4g5l.gvt1.com",
+      "conns": 1,
+      "down_mb": 0.437,
+      "up_mb": 0.002,
+      "total_mb": 0.439
+    },
+    {
+      "host": "cdn.sofifa.net",
+      "conns": 3,
+      "down_mb": 0.332,
+      "up_mb": 0.025,
+      "total_mb": 0.358
+    },
+    {
+      "host": "www.googletagmanager.com",
+      "conns": 2,
+      "down_mb": 0.307,
+      "up_mb": 0.004,
+      "total_mb": 0.311
+    },
+    {
+      "host": "static.sofifa.net",
+      "conns": 3,
+      "down_mb": 0.27,
+      "up_mb": 0.007,
+      "total_mb": 0.277
+    },
+    {
+      "host": "securepubads.g.doubleclick.net",
+      "conns": 2,
+      "down_mb": 0.257,
+      "up_mb": 0.005,
+      "total_mb": 0.262
+    },
+    {
+      "host": "sofifa.com",
+      "conns": 3,
+      "down_mb": 0.221,
+      "up_mb": 0.032,
+      "total_mb": 0.253
+    },
+    {
+      "host": "s3u.sofifa.net",
+      "conns": 6,
+      "down_mb": 0.135,
+      "up_mb": 0.011,
+      "total_mb": 0.146
+    },
+    {
+      "host": "fonts.gstatic.com",
+      "conns": 1,
+      "down_mb": 0.072,
+      "up_mb": 0.003,
+      "total_mb": 0.075
+    },
+    {
+      "host": "btloader.com",
+      "conns": 4,
+      "down_mb": 0.066,
+      "up_mb": 0.008,
+      "total_mb": 0.074
+    },
+    {
+      "host": "www.google.com",
+      "conns": 3,
+      "down_mb": 0.057,
+      "up_mb": 0.007,
+      "total_mb": 0.064
+    },
+    {
+      "host": "sentrymagic.com",
+      "conns": 3,
+      "down_mb": 0.052,
+      "up_mb": 0.01,
+      "total_mb": 0.062
+    },
+    {
+      "host": "metrics.rapidedge.io",
+      "conns": 1,
+      "down_mb": 0.033,
+      "up_mb": 0.002,
+      "total_mb": 0.036
+    },
+    {
+      "host": "pagead2.googlesyndication.com",
+      "conns": 1,
+      "down_mb": 0.032,
+      "up_mb": 0.002,
+      "total_mb": 0.035
+    },
+    {
+      "host": "aax.amazon-adsystem.com",
+      "conns": 4,
+      "down_mb": 0.016,
+      "up_mb": 0.009,
+      "total_mb": 0.025
+    },
+    {
+      "host": "i.ytimg.com",
+      "conns": 1,
+      "down_mb": 0.022,
+      "up_mb": 0.002,
+      "total_mb": 0.024
+    },
+    {
+      "host": "static.cloudflareinsights.com",
+      "conns": 2,
+      "down_mb": 0.019,
+      "up_mb": 0.004,
+      "total_mb": 0.023
+    },
+    {
+      "host": "ad-delivery.net",
+      "conns": 4,
+      "down_mb": 0.015,
+      "up_mb": 0.008,
+      "total_mb": 0.023
+    },
+    {
+      "host": "prod.uidapi.com",
+      "conns": 1,
+      "down_mb": 0.019,
+      "up_mb": 0.002,
+      "total_mb": 0.021
+    },
+    {
+      "host": "ad.doubleclick.net",
+      "conns": 2,
+      "down_mb": 0.014,
+      "up_mb": 0.006,
+      "total_mb": 0.021
+    },
+    {
+      "host": "www.gstatic.com",
+      "conns": 3,
+      "down_mb": 0.014,
+      "up_mb": 0.005,
+      "total_mb": 0.02
+    },
+    {
+      "host": "android.clients.google.com",
+      "conns": 2,
+      "down_mb": 0.012,
+      "up_mb": 0.006,
+      "total_mb": 0.018
+    },
+    {
+      "host": "redirector.gvt1.com",
+      "conns": 3,
+      "down_mb": 0.014,
+      "up_mb": 0.004,
+      "total_mb": 0.018
+    },
+    {
+      "host": "fonts.googleapis.com",
+      "conns": 1,
+      "down_mb": 0.014,
+      "up_mb": 0.003,
+      "total_mb": 0.016
+    },
+    {
+      "host": "region1.analytics.google.com",
+      "conns": 2,
+      "down_mb": 0.01,
+      "up_mb": 0.006,
+      "total_mb": 0.016
+    },
+    {
+      "host": "content-autofill.googleapis.com",
+      "conns": 1,
+      "down_mb": 0.009,
+      "up_mb": 0.004,
+      "total_mb": 0.013
+    },
+    {
+      "host": "cdn.btloader.com",
+      "conns": 2,
+      "down_mb": 0.008,
+      "up_mb": 0.004,
+      "total_mb": 0.013
+    },
+    {
+      "host": "csi.gstatic.com",
+      "conns": 1,
+      "down_mb": 0.007,
+      "up_mb": 0.005,
+      "total_mb": 0.012
+    },
+    {
+      "host": "region1.google-analytics.com",
+      "conns": 1,
+      "down_mb": 0.007,
+      "up_mb": 0.003,
+      "total_mb": 0.011
+    },
+    {
+      "host": "optimizationguide-pa.googleapis.com",
+      "conns": 1,
+      "down_mb": 0.007,
+      "up_mb": 0.003,
+      "total_mb": 0.01
+    },
+    {
+      "host": "api.btloader.com",
+      "conns": 1,
+      "down_mb": 0.005,
+      "up_mb": 0.004,
+      "total_mb": 0.009
+    },
+    {
+      "host": "mtalk.google.com",
+      "conns": 1,
+      "down_mb": 0.007,
+      "up_mb": 0.002,
+      "total_mb": 0.008
+    },
+    {
+      "host": "accounts.google.com",
+      "conns": 1,
+      "down_mb": 0.006,
+      "up_mb": 0.002,
+      "total_mb": 0.008
+    },
+    {
+      "host": "stats.g.doubleclick.net",
+      "conns": 1,
+      "down_mb": 0.006,
+      "up_mb": 0.002,
+      "total_mb": 0.008
+    },
+    {
+      "host": "www.google.de",
+      "conns": 1,
+      "down_mb": 0.005,
+      "up_mb": 0.003,
+      "total_mb": 0.008
+    },
+    {
+      "host": "ab.dns-finder.com",
+      "conns": 1,
+      "down_mb": 0.005,
+      "up_mb": 0.002,
+      "total_mb": 0.007
+    },
+    {
+      "host": "raw.githubusercontent.com",
+      "conns": 1,
+      "down_mb": 0.005,
+      "up_mb": 0.002,
+      "total_mb": 0.007
+    },
+    {
+      "host": "cdn.api.btloader.com",
+      "conns": 1,
+      "down_mb": 0.004,
+      "up_mb": 0.002,
+      "total_mb": 0.006
+    },
+    {
+      "host": "clients2.google.com",
+      "conns": 1,
+      "down_mb": 0.001,
+      "up_mb": 0.0,
+      "total_mb": 0.001
+    }
+  ]
+}

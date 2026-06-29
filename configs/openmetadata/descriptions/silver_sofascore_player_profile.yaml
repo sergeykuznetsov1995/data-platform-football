@@ -1,0 +1,77 @@
+# =============================================================================
+# OpenMetadata description: iceberg.silver.sofascore_player_profile
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.silver.sofascore_player_profile
+  description: |
+    Время-инвариантные атрибуты игрока из SofaScore (рост, ведущая нога, дата
+    рождения, национальность, номера) — один row на (player_id, league, season).
+    Источник: bronze.sofascore_player_profile + LEFT JOIN silver.xref_player
+    (source='sofascore', non-orphan) для canonical_id. JOIN-предикат обязателен
+    по (league, season). Дедупликация: ROW_NUMBER PARTITION BY
+    (player_id, league, season) ORDER BY _ingested_at DESC. canonical_id
+    оставлен NULLable — SofaScore-игроки без bridge'а к FBref-spine (U21,
+    резерв, новые подписания) сохраняются как orphan, фильтрация на Gold.
+    canonical_id — FK → gold.dim_player.player_id.
+  tags:
+    - Tier.Silver
+    - Domain.Football
+    - PII.Low
+columns:
+  - name: player_id
+    description: Сырой SofaScore player_id игрока.
+  - name: canonical_id
+    description: Канонический ID игрока из xref_player (FK → gold.dim_player.player_id); NULL для orphan-игроков без bridge'а.
+  - name: player_name
+    description: Полное имя игрока.
+    tags:
+      - PII.Low
+  - name: short_name
+    description: Краткое (отображаемое) имя игрока.
+    tags:
+      - PII.Low
+  - name: slug
+    description: URL-friendly slug имени игрока на SofaScore.
+  - name: position
+    description: Основная позиция игрока.
+  - name: height_cm
+    description: Рост игрока в сантиметрах (CAST bigint→INTEGER).
+    tags:
+      - PII.Low
+  - name: shirt_number
+    description: Игровой номер на футболке (CAST bigint→INTEGER).
+  - name: jersey_number
+    description: Игровой номер (varchar, свободный формат из Bronze).
+  - name: preferred_foot
+    description: Ведущая нога ('left' / 'right' / 'both').
+  - name: date_of_birth
+    description: Дата рождения (TRY_CAST из varchar ISO YYYY-MM-DD; может быть NULL).
+    tags:
+      - PII.Low
+  - name: nationality
+    description: Национальность игрока (полное название страны, например "England").
+    tags:
+      - PII.Low
+  - name: country_code
+    description: Код страны игрока (например "ENG").
+    tags:
+      - PII.Low
+  - name: current_team_id
+    description: Сырой SofaScore team_id текущей команды (CAST bigint→varchar).
+  - name: current_team_name
+    description: Название текущей команды игрока.
+  - name: retired
+    description: BOOLEAN — завершил ли игрок карьеру.
+  - name: _bronze_ingested_at
+    description: Технический timestamp ingest'а Bronze (lineage).
+  - name: league
+    description: Лига (partition key).
+  - name: season
+    description: Сезон slug '2526' (partition key, varchar).
+  - name: _silver_created_at
+    description: Технический timestamp создания строки в Silver-слое (добавляется CTAS-раннером).
+relationships:
+  - from: canonical_id
+    to: trino_iceberg.iceberg.gold.dim_player.player_id
+    type: FOREIGN_KEY
+    description: N:1 — профиль игрока к каноническому измерению игрока.

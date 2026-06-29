@@ -1,0 +1,27 @@
+# =============================================================================
+# OpenMetadata description: iceberg.gold.dim_competition
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.gold.dim_competition
+  description: |
+    Каталог лиг (звёздный дизайн, #425; 8 строк — 1 in-scope + 7 стабов,
+    источник — configs/medallion/competitions.yaml). Это статический словарь,
+    а не active-set: новые лиги добавляются строками в конфиг. PK league =
+    слаг лиги, то же значение, что несёт колонка league всех фактов — JOIN
+    без mapping-таблицы.
+  tags:
+    - Tier.Gold
+    - Domain.Football
+    - PII.None
+columns:
+  - name: league
+    description: PK — слаг лиги ('ENG-Premier League'), идентичен колонке league фактов.
+  - name: competition_name
+    description: Полное имя лиги ('English Premier League').
+  - name: country
+    description: Страна лиги ('England'; 'Europe' для турниров UEFA).
+  - name: tier
+    description: Уровень лиги (1 = высший дивизион).
+  - name: _silver_created_at
+    description: Технический timestamp создания строки CTAS-раннером.
+relationships: []

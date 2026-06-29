@@ -1,0 +1,124 @@
+{
+  "total_mb": 2.267,
+  "allowed_hosts": [
+    {
+      "host": "challenges.cloudflare.com",
+      "conns": 3,
+      "down_mb": 0.486,
+      "up_mb": 0.191,
+      "total_mb": 0.677
+    },
+    {
+      "host": "r2---sn-bvvbaxivnuxq8vq54voxqx-4g5l.gvt1.com",
+      "conns": 1,
+      "down_mb": 0.437,
+      "up_mb": 0.002,
+      "total_mb": 0.439
+    },
+    {
+      "host": "cdn.sofifa.net",
+      "conns": 6,
+      "down_mb": 0.329,
+      "up_mb": 0.024,
+      "total_mb": 0.352
+    },
+    {
+      "host": "static.sofifa.net",
+      "conns": 2,
+      "down_mb": 0.268,
+      "up_mb": 0.005,
+      "total_mb": 0.272
+    },
+    {
+      "host": "sofifa.com",
+      "conns": 2,
+      "down_mb": 0.214,
+      "up_mb": 0.022,
+      "total_mb": 0.237
+    },
+    {
+      "host": "www.google.com",
+      "conns": 6,
+      "down_mb": 0.128,
+      "up_mb": 0.012,
+      "total_mb": 0.14
+    },
+    {
+      "host": "s3u.sofifa.net",
+      "conns": 6,
+      "down_mb": 0.059,
+      "up_mb": 0.009,
+      "total_mb": 0.069
+    },
+    {
+      "host": "www.gstatic.com",
+      "conns": 3,
+      "down_mb": 0.014,
+      "up_mb": 0.005,
+      "total_mb": 0.02
+    },
+    {
+      "host": "redirector.gvt1.com",
+      "conns": 2,
+      "down_mb": 0.008,
+      "up_mb": 0.004,
+      "total_mb": 0.012
+    },
+    {
+      "host": "android.clients.google.com",
+      "conns": 1,
+      "down_mb": 0.009,
+      "up_mb": 0.003,
+      "total_mb": 0.012
+    },
+    {
+      "host": "content-autofill.googleapis.com",
+      "conns": 1,
+      "down_mb": 0.007,
+      "up_mb": 0.003,
+      "total_mb": 0.01
+    },
+    {
+      "host": "accounts.google.com",
+      "conns": 2,
+      "down_mb": 0.006,
+      "up_mb": 0.004,
+      "total_mb": 0.01
+    },
+    {
+      "host": "optimizationguide-pa.googleapis.com",
+      "conns": 1,
+      "down_mb": 0.006,
+      "up_mb": 0.003,
+      "total_mb": 0.009
+    },
+    {
+      "host": "mtalk.google.com",
+      "conns": 1,
+      "down_mb": 0.005,
+      "up_mb": 0.002,
+      "total_mb": 0.007
+    },
+    {
+      "host": "clients2.google.com",
+      "conns": 1,
+      "down_mb": 0.001,
+      "up_mb": 0.0,
+      "total_mb": 0.001
+    }
+  ],
+  "blocked_hosts": [
+    {
+      "host": "cdn.intergient.com",
+      "attempts": 12
+    },
+    {
+      "host": "www.googletagmanager.com",
+      "attempts": 3
+    },
+    {
+      "host": "static.cloudflareinsights.com",
+      "attempts": 3
+    }
+  ]
+}

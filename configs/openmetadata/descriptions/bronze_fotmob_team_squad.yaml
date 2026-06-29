@@ -1,0 +1,75 @@
+# =============================================================================
+# OpenMetadata description: iceberg.bronze.fotmob_team_squad
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.bronze.fotmob_team_squad
+  description: |
+    Сырой состав команды из FotMob (endpoint /api/data/teams, секция squad, через
+    scrapers/fotmob, dag_ingest_fotmob). Grain — один row на члена состава (игроки
+    + тренерский штаб). Несёт анкету (возраст/рост/ДР/позиция) и сезонные
+    показатели игрока. Партиционирование ['league','season'].
+  tags:
+    - Tier.Bronze
+    - Domain.Football
+    - PII.Low
+columns:
+  - name: team_id
+    description: FotMob id команды (bigint).
+  - name: team_name
+    description: Название команды.
+  - name: role
+    description: Раздел состава ('Players' / 'Coaching Staff').
+  - name: player_id
+    description: FotMob player_id (bigint).
+  - name: player_name
+    description: Имя игрока/члена штаба.
+    tags:
+      - PII.Low
+  - name: shirt_number
+    description: Игровой номер (double; ~10% NULL).
+  - name: position_id
+    description: Числовой код позиции FotMob (double).
+  - name: country
+    description: Гражданство.
+  - name: country_code
+    description: Код страны гражданства.
+  - name: age
+    description: Возраст (bigint).
+  - name: height_cm
+    description: Рост, см (double).
+  - name: date_of_birth
+    description: Дата рождения (varchar).
+    tags:
+      - PII.Low
+  - name: rating
+    description: Средний рейтинг FotMob за сезон (double; NULL для не игравших / штаба).
+  - name: goals
+    description: Голы за сезон (double).
+  - name: assists
+    description: Голевые передачи за сезон (double).
+  - name: penalties
+    description: Голы с пенальти за сезон (double).
+  - name: red_cards
+    description: Красные карточки за сезон (double).
+  - name: yellow_cards
+    description: Жёлтые карточки за сезон (double).
+  - name: injury_text
+    description: Описание травмы/ожидаемого возвращения (NULL для здоровых — заполнено лишь у травмированных).
+  - name: exclude_from_ranking
+    description: Флаг исключения из рейтингов (boolean).
+  - name: league
+    description: Лига (e.g. 'ENG-Premier League'); partition key.
+  - name: season
+    description: Сезон — год начала (bigint, e.g. 2025); partition key.
+  - name: _source
+    description: Источник данных ('fotmob'); метаколонка Bronze.
+  - name: _entity_type
+    description: Тип сущности в Bronze; метаколонка.
+  - name: _ingested_at
+    description: Timestamp ingest'а строки в Bronze; метаколонка.
+  - name: _batch_id
+    description: Идентификатор батча ingest'а; метаколонка.
+  - name: position_label_key
+    description: Машинный ключ метки позиции.
+  - name: position_label_fallback
+    description: Человекочитаемая метка позиции (fallback).

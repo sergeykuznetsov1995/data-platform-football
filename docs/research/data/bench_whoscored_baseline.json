@@ -1,0 +1,148 @@
+{
+  "label": "baseline",
+  "source": "whoscored",
+  "matches_attempted": 10,
+  "matches_succeeded": 10,
+  "success_rate": 1.0,
+  "total_seconds": 75.48,
+  "mean_seconds": 7.11,
+  "fs_response_mb": 18.1239,
+  "fs_response_bytes": 19004243,
+  "requests": 10,
+  "sessions_created": 1,
+  "cf_challenge_failures": 0,
+  "top_traffic_urls": [
+    {
+      "url": "www.whoscored.com/Matches/1903411/Live",
+      "bytes": 2051739,
+      "mb": 1.9567,
+      "requests": 1
+    },
+    {
+      "url": "www.whoscored.com/Matches/1903430/Live",
+      "bytes": 1951417,
+      "mb": 1.861,
+      "requests": 1
+    },
+    {
+      "url": "www.whoscored.com/Matches/1903413/Live",
+      "bytes": 1939749,
+      "mb": 1.8499,
+      "requests": 1
+    },
+    {
+      "url": "www.whoscored.com/Matches/1903417/Live",
+      "bytes": 1923948,
+      "mb": 1.8348,
+      "requests": 1
+    },
+    {
+      "url": "www.whoscored.com/Matches/1903428/Live",
+      "bytes": 1905311,
+      "mb": 1.817,
+      "requests": 1
+    },
+    {
+      "url": "www.whoscored.com/Matches/1903436/Live",
+      "bytes": 1900838,
+      "mb": 1.8128,
+      "requests": 1
+    },
+    {
+      "url": "www.whoscored.com/Matches/1903426/Live",
+      "bytes": 1900753,
+      "mb": 1.8127,
+      "requests": 1
+    },
+    {
+      "url": "www.whoscored.com/Matches/1903432/Live",
+      "bytes": 1861854,
+      "mb": 1.7756,
+      "requests": 1
+    },
+    {
+      "url": "www.whoscored.com/Matches/1903422/Live",
+      "bytes": 1810666,
+      "mb": 1.7268,
+      "requests": 1
+    },
+    {
+      "url": "www.whoscored.com/Matches/1903424/Live",
+      "bytes": 1757648,
+      "mb": 1.6762,
+      "requests": 1
+    }
+  ],
+  "per_match": [
+    {
+      "i": 1,
+      "match_id": 1903417,
+      "seconds": 9.22,
+      "html_bytes": 1924124,
+      "success": true
+    },
+    {
+      "i": 2,
+      "match_id": 1903411,
+      "seconds": 4.61,
+      "html_bytes": 2051739,
+      "success": true
+    },
+    {
+      "i": 3,
+      "match_id": 1903413,
+      "seconds": 6.02,
+      "html_bytes": 1939749,
+      "success": true
+    },
+    {
+      "i": 4,
+      "match_id": 1903422,
+      "seconds": 7.3,
+      "html_bytes": 1810666,
+      "success": true
+    },
+    {
+      "i": 5,
+      "match_id": 1903428,
+      "seconds": 6.31,
+      "html_bytes": 1905311,
+      "success": true
+    },
+    {
+      "i": 6,
+      "match_id": 1903430,
+      "seconds": 7.39,
+      "html_bytes": 1951417,
+      "success": true
+    },
+    {
+      "i": 7,
+      "match_id": 1903432,
+      "seconds": 6.54,
+      "html_bytes": 1861854,
+      "success": true
+    },
+    {
+      "i": 8,
+      "match_id": 1903436,
+      "seconds": 8.14,
+      "html_bytes": 1900838,
+      "success": true
+    },
+    {
+      "i": 9,
+      "match_id": 1903424,
+      "seconds": 7.66,
+      "html_bytes": 1757648,
+      "success": true
+    },
+    {
+      "i": 10,
+      "match_id": 1903426,
+      "seconds": 7.88,
+      "html_bytes": 1900753,
+      "success": true
+    }
+  ]
+}

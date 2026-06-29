@@ -1,0 +1,62 @@
+# =============================================================================
+# OpenMetadata description: iceberg.silver.understat_player_season_aggregate
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.silver.understat_player_season_aggregate
+  description: |
+    Сезонная статистика игрока из Understat — один row на
+    (canonical_id, league, season). Источник: bronze.understat_players
+    (уже season-grain) INNER JOIN silver.xref_player (source='understat') с
+    обязательным предикатом (league, season) — без него игрок, активный в
+    нескольких сезонах, fan-out'ится. Orphan-игроки (confidence='orphan')
+    отфильтрованы — не bridge'атся к FBref-spine на Gold. Один игрок иногда
+    идёт под двумя Understat player_id (resolver мапит оба на один
+    canonical_id) → берём «активную» запись по большему minutes (ROW_NUMBER).
+    canonical_id — FK → gold.dim_player.player_id. Форма зеркалит
+    sofascore/whoscored player_season_aggregate для LEFT JOIN на Gold.
+  tags:
+    - Tier.Silver
+    - Domain.Football
+    - PII.None
+columns:
+  - name: canonical_id
+    description: Канонический ID игрока из xref_player (FK → gold.dim_player.player_id).
+  - name: games_played
+    description: Сыграно матчей за сезон (Understat `matches`).
+  - name: minutes_played
+    description: Сыграно минут за сезон.
+  - name: goals
+    description: Забитые голы за сезон.
+  - name: assists
+    description: Голевые передачи за сезон.
+  - name: yellow_cards
+    description: Жёлтые карточки за сезон.
+  - name: red_cards
+    description: Красные карточки за сезон.
+  - name: expected_goals
+    description: Expected Goals (xG) за сезон — модельная вероятность голов по ударам, DOUBLE.
+  - name: expected_assists
+    description: Expected Assists (xA) за сезон — модельная вероятность ассистов по передачам, DOUBLE.
+  - name: non_penalty_goals
+    description: Голы без учёта пенальти за сезон (Understat `np_goals`).
+  - name: non_penalty_xg
+    description: xG без учёта пенальти за сезон (Understat `np_xg`), DOUBLE.
+  - name: xg_chain
+    description: xGChain — суммарный xG владений с касанием игрока за сезон, DOUBLE.
+  - name: xg_buildup
+    description: xGBuildup — xGChain без касаний, завершившихся ударом/ключевой передачей, DOUBLE.
+  - name: key_passes
+    description: Ключевые передачи за сезон (после которых партнёр наносил удар).
+  - name: shots
+    description: Удары за сезон, всего.
+  - name: league
+    description: Лига (partition key).
+  - name: season
+    description: Сезон slug '2526' (partition key, varchar).
+  - name: _silver_created_at
+    description: Технический timestamp создания строки в Silver-слое (добавляется CTAS-раннером).
+relationships:
+  - from: canonical_id
+    to: trino_iceberg.iceberg.gold.dim_player.player_id
+    type: FOREIGN_KEY
+    description: N:1 — сезонная статистика к каноническому игроку.

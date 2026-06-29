@@ -1,0 +1,70 @@
+# =============================================================================
+# OpenMetadata description: iceberg.bronze.understat_shots
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.bronze.understat_shots
+  description: |
+    Сырые удары (shot events) из Understat (soccerdata UnderstatScraper,
+    read_shot_events). Grain — один row на удар. Несёт per-shot xG, координаты
+    на поле (нормализованные 0-1), ситуацию/часть тела и игрока-ассистента.
+    Источник penalty-xG для Silver-агрегатов. Партиционирование
+    ['league','season'].
+  tags:
+    - Tier.Bronze
+    - Domain.Football
+    - PII.Low
+columns:
+  - name: league
+    description: Лига (e.g. 'ENG-Premier League'); partition key.
+  - name: season
+    description: Сезон в формате Understat (e.g. '2526'); partition key.
+  - name: game_id
+    description: Числовой Understat match_id удара.
+  - name: game
+    description: Строковый идентификатор матча Understat (slug).
+  - name: shot_id
+    description: Уникальный Understat идентификатор удара.
+  - name: date
+    description: Дата и время матча.
+  - name: minute
+    description: Минута матча, на которой нанесён удар.
+  - name: player
+    description: Имя бьющего игрока (PII.Low).
+    tags:
+      - PII.Low
+  - name: player_id
+    description: Understat player_id бьющего игрока.
+  - name: team
+    description: Название бьющей команды.
+  - name: team_id
+    description: Understat team_id бьющей команды.
+  - name: location_x
+    description: X-координата удара, нормализована 0-1 (доля длины поля).
+  - name: location_y
+    description: Y-координата удара, нормализована 0-1 (доля ширины поля).
+  - name: xg
+    description: Expected Goals (xG) удара.
+  - name: result
+    description: Результат удара (Goal / SavedShot / MissedShots / BlockedShot и т.д.).
+  - name: situation
+    description: Игровая ситуация (OpenPlay / SetPiece / FromCorner / Penalty / DirectFreekick).
+  - name: body_part
+    description: Часть тела (RightFoot / LeftFoot / Head / OtherBodyPart).
+  - name: assist_player
+    description: Имя игрока-ассистента, если был (PII.Low).
+    tags:
+      - PII.Low
+  - name: assist_player_id
+    description: Understat player_id ассистента (NULL без ассиста).
+  - name: league_id
+    description: Внутренний идентификатор лиги Understat.
+  - name: season_id
+    description: Внутренний идентификатор сезона Understat.
+  - name: _source
+    description: Источник данных ('understat'); метаколонка Bronze.
+  - name: _entity_type
+    description: Тип сущности в Bronze; метаколонка.
+  - name: _ingested_at
+    description: Timestamp ingest'а строки в Bronze; метаколонка.
+  - name: _batch_id
+    description: Идентификатор батча ingest'а; метаколонка.

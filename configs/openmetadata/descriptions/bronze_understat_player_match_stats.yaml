@@ -1,0 +1,74 @@
+# =============================================================================
+# OpenMetadata description: iceberg.bronze.understat_player_match_stats
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.bronze.understat_player_match_stats
+  description: |
+    Статистика игроков по матчам из Understat (soccerdata UnderstatScraper,
+    read_player_match_stats). Grain — один row на (match, player). Per-match
+    xG-семейство (xG, xA, npxG-вклад через xGChain/xGBuildup), минуты, голы,
+    ассисты, удары, ключевые передачи, карточки. Партиционирование
+    ['league','season'].
+  tags:
+    - Tier.Bronze
+    - Domain.Football
+    - PII.Low
+columns:
+  - name: league
+    description: Лига (e.g. 'ENG-Premier League'); partition key.
+  - name: season
+    description: Сезон в формате Understat (e.g. '2526'); partition key.
+  - name: game_id
+    description: Числовой Understat match_id.
+  - name: game
+    description: Строковый идентификатор матча Understat (slug).
+  - name: player
+    description: Имя игрока (PII.Low).
+    tags:
+      - PII.Low
+  - name: player_id
+    description: Understat player_id.
+  - name: team
+    description: Название команды игрока в этом матче.
+  - name: team_id
+    description: Understat team_id команды.
+  - name: position
+    description: Позиция игрока в матче (e.g. FW / Sub / GK).
+  - name: position_id
+    description: Числовой идентификатор позиции Understat.
+  - name: minutes
+    description: Сыграно минут в матче.
+  - name: goals
+    description: Голы в матче.
+  - name: assists
+    description: Ассисты в матче.
+  - name: shots
+    description: Удары в матче.
+  - name: xg
+    description: Ожидаемые голы (xG) игрока в матче.
+  - name: xa
+    description: Ожидаемые ассисты (xA) игрока в матче.
+  - name: key_passes
+    description: Ключевые передачи (приведшие к удару) в матче.
+  - name: xg_chain
+    description: xGChain — суммарный xG владений, в которых игрок участвовал, в матче.
+  - name: xg_buildup
+    description: xGBuildup — xGChain без вкладов в удары/ключевые передачи (построение атак), в матче.
+  - name: yellow_cards
+    description: Жёлтые карточки в матче.
+  - name: red_cards
+    description: Красные карточки в матче.
+  - name: own_goals
+    description: Автоголы в матче.
+  - name: league_id
+    description: Внутренний идентификатор лиги Understat.
+  - name: season_id
+    description: Внутренний идентификатор сезона Understat.
+  - name: _source
+    description: Источник данных ('understat'); метаколонка Bronze.
+  - name: _entity_type
+    description: Тип сущности в Bronze; метаколонка.
+  - name: _ingested_at
+    description: Timestamp ingest'а строки в Bronze; метаколонка.
+  - name: _batch_id
+    description: Идентификатор батча ingest'а; метаколонка.

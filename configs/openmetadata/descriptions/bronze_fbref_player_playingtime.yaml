@@ -1,0 +1,83 @@
+# =============================================================================
+# OpenMetadata description: iceberg.bronze.fbref_player_playingtime
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.bronze.fbref_player_playingtime
+  description: |
+    Сезонная статистика игрового времени игроков из FBref (Playing Time).
+    Гранулярность: один row на (player, squad, league, season). Метрики —
+    текстовые (приведение типов в Silver). Источник: FBref scrape
+    (dag_ingest_fbref).
+  tags:
+    - Tier.Bronze
+    - Domain.Football
+    - PII.Low
+columns:
+  - name: rk
+    description: Порядковый номер строки (Rank) в таблице FBref.
+  - name: player
+    description: Имя игрока.
+    tags:
+      - PII.Low
+  - name: nation
+    description: Код страны игрока (напр. "eng ENG").
+  - name: pos
+    description: Позиция игрока.
+  - name: squad
+    description: Клуб игрока.
+  - name: age
+    description: Возраст игрока.
+  - name: born
+    description: Год рождения игрока.
+  - name: mp
+    description: Сыграно матчей (Matches Played).
+  - name: min
+    description: Сыграно минут.
+  - name: mn/mp
+    description: Минут на матч (Minutes per Match Played).
+  - name: min%
+    description: Доля сыгранных командных минут, % .
+  - name: 90s
+    description: Число сыгранных 90-минуток (минуты / 90).
+  - name: starts
+    description: Матчи в стартовом составе.
+  - name: mn/start
+    description: Минут на матч в старте.
+  - name: compl
+    description: Матчи, сыгранные полностью (Complete matches).
+  - name: subs
+    description: Выходы на замену (как запасной).
+  - name: mn/sub
+    description: Минут на выход с замены.
+  - name: unsub
+    description: Матчи на скамейке без выхода на поле (Unused sub).
+  - name: ppm
+    description: Очков команды за матч с игроком на поле (Points per Match).
+  - name: ong
+    description: Голы команды, забитые при игроке на поле (Goals scored On pitch).
+  - name: onga
+    description: Голы команды, пропущенные при игроке на поле (Goals Against On pitch).
+  - name: +/-
+    description: Разница голов команды при игроке на поле (ong − onga).
+  - name: +/-90
+    description: Разница голов на 90 минут.
+  - name: on-off
+    description: Разница +/- на 90 при игроке на поле и вне поля (On-Off).
+  - name: matches
+    description: Текст ссылки "Matches" на FBref (служебная колонка из scrape).
+  - name: player_id
+    description: FBref ID игрока.
+  - name: league
+    description: Лига (partition key).
+  - name: season
+    description: Сезон — год начала (bigint, напр. 2025 = сезон 2025/26).
+  - name: stat_type
+    description: Категория stat-таблицы FBref (для этой таблицы — playing_time).
+  - name: _source
+    description: Источник данных Bronze (всегда 'fbref').
+  - name: _entity_type
+    description: Внутренняя метка типа сущности ingest-конвейера FBref.
+  - name: _ingested_at
+    description: Timestamp ingest'а строки в Bronze.
+  - name: _batch_id
+    description: ID batch'а загрузки (трассировка и идемпотентность ingest).

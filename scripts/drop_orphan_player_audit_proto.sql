@@ -1,0 +1,48 @@
+-- =============================================================================
+-- Drop orphan Iceberg tables (June 2026) — issue #475
+-- =============================================================================
+--
+-- Context:
+--   Trino-инвентаризация (project review 2026-06-11) нашла 2 таблицы без
+--   producer'а и без консьюмеров — ни один DAG / gold|silver SQL / spark-job /
+--   config их не читает и не пишет (0 grep-хитов по всему репо на 2026-06-17):
+--
+--     iceberg.gold.dim_player_attributes_audit   — остаток T4-разработки.
+--         Строки залиты ныне удалённым T4-кодом; в текущем git нет ни SQL-файла,
+--         ни DAG-задачи, ни OM-описания. Никто не читает, пересобрать нечем —
+--         мёртвый снимок.
+--     iceberg.default.r2_xref_player_proto       — scratch-таблица research-
+--         прототипа scripts/r2_resolver_proto.py (R2-спайк; standalone-скрипт,
+--         НЕ DAG). Прод-логика портирована в dags/utils/xref_player_resolver.py.
+--         После закрытия спайка черновик не нужен.
+--
+--   Данные НЕ теряются для пайплайна: ни одна gold/silver витрина обе таблицы
+--   не использует. r2_xref_player_proto при необходимости пересобирается CTAS-ом
+--   из Bronze тем же scripts/r2_resolver_proto.py; dim_player_attributes_audit —
+--   замороженный orphan без потребителей.
+--
+--   Row counts на момент верификации (2026-06-17, прод-Trino):
+--     iceberg.gold.dim_player_attributes_audit   — 1244  rows
+--     iceberg.default.r2_xref_player_proto       — 1615  rows
+--
+-- Execution (manual; not auto-applied):
+--   Построчно через интерактивный шелл (пароль — по prompt):
+--     make shell-trino
+--     trino> DROP TABLE IF EXISTS iceberg.gold.dim_player_attributes_audit;
+--     trino> DROP TABLE IF EXISTS iceberg.default.r2_xref_player_proto;
+--
+--   Либо неинтерактивно (пароль из .env через env-переменную):
+--     docker compose exec -e TRINO_PASSWORD="$TRINO_PASSWORD" -T trino \
+--       trino --server https://localhost:8443 --user airflow --password --insecure \
+--       < scripts/drop_orphan_player_audit_proto.sql
+--
+--   При исполнении через python trino-клиент: после КАЖДОГО DROP обязателен
+--   cursor.fetchall() перед close — иначе клиент шлёт DELETE → USER_CANCELED.
+--   После — `make om-ingest-trino`, чтобы каталог не показывал призраков.
+--
+-- WARNING: DROP TABLE у Iceberg-managed таблиц сносит и метастор-запись, и данные
+-- в HDFS. Undo нет (git history хранит код прототипа r2_resolver_proto.py).
+-- =============================================================================
+
+DROP TABLE IF EXISTS iceberg.gold.dim_player_attributes_audit;
+DROP TABLE IF EXISTS iceberg.default.r2_xref_player_proto;

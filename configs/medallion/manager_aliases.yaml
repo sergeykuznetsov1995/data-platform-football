@@ -1,0 +1,62 @@
+# =============================================================================
+# Cross-source manager-name aliases — APL head coaches (issue #619)
+# =============================================================================
+# Curated map: Transfermarkt raw coach-name → canonical (FBref-spine) identity.
+# Mirrors `referee_aliases.yaml` (#143) — managers, like referees, have NO
+# stable source id in the FBref spine (FBref emits a plain name string).
+#
+# WHY THIS FILE (issue #619, followup of #434/#618):
+#   gold.dim_manager enriches nationality/dob from silver.transfermarkt_coaches,
+#   joined to the FBref spine by a SHARED diacritic-stripping name-normalize
+#   (silver/transfermarkt_coaches.sql.j2 == silver/xref_manager.sql). Most TM
+#   coaches glue automatically. A handful do NOT: TM may store a different
+#   spelling / name order (e.g. surname-first "Le Bris, Régis") that normalises
+#   to a DIFFERENT canonical_id than the FBref spine. Those become orphans —
+#   the TM bio (nationality/dob) never reaches dim_manager. This dictionary
+#   remaps the TM raw form onto the spine id so the JOIN succeeds.
+#
+# Структура одной записи:
+#   - canonical_name: <FBref spelling>           # display; FBref is the spine
+#     canonical_id:   <BARE spine slug>           # IDENTITY — see below
+#     aliases:
+#       _generic:      [forms valid in any source — optional]
+#       transfermarkt: [the TM raw coach-name that mis-normalises]
+#     competition_scope: [competition.id where valid]
+#
+# canonical_id (issue #619):
+#   The BARE FBref-spine name-normalize id — e.g. "regis_le_bris", NO `mgr_`
+#   prefix (referee uses `ref_`; managers do NOT, because dim_manager.manager_id
+#   IS the bare name-normalize id and the alias must equal it to JOIN). Convention
+#   `^[a-z0-9_]+$` (loader enforces). It MUST be the exact id the FBref name
+#   produces: LOWER( strip-NFD-diacritics( name ) → non-alnum→'_' ).
+#   "Régis Le Bris" → "regis_le_bris".
+#
+# Application is a NO-OP when the alias raw form does not normalise to any TM
+# coach name, so a wrong/stale entry cannot mis-map a real coach (the LEFT JOIN
+# simply does not fire). An empty/absent file degrades to "no aliases" (pre-#619
+# behaviour) — the emitter ships a non-matching sentinel row.
+#
+# -----------------------------------------------------------------------------
+# DISCOVERY (run on the target VM to obtain the authoritative orphan list):
+#   -- TM canonical_ids that DON'T glue to the FBref spine:
+#   SELECT tc.canonical_id AS tm_canonical, tc.name AS tm_name
+#   FROM iceberg.silver.transfermarkt_coaches tc
+#   LEFT JOIN iceberg.gold.dim_manager dm ON dm.manager_id = tc.canonical_id
+#   WHERE dm.manager_id IS NULL
+#   ORDER BY tc.name;
+#   -- For each orphan, find the matching FBref spine id + spelling:
+#   SELECT DISTINCT manager_id, manager_name FROM iceberg.gold.dim_manager
+#   ORDER BY manager_name;   -- pick the row that is the SAME human
+# Append one entry per confirmed orphan below, then re-run the silver transform.
+# =============================================================================
+
+managers:
+  # Worked example (verify against the discovery query above before merge):
+  # Régis Le Bris — Sunderland, promoted to the APL for 2025/26. FBref renders
+  # "Régis Le Bris" (→ regis_le_bris); Transfermarkt's surname-first staff form
+  # "Le Bris, Régis" normalises to "le_bris_regis" and orphans without this row.
+  - canonical_name: "Régis Le Bris"
+    canonical_id: "regis_le_bris"
+    aliases:
+      transfermarkt: ["Le Bris, Régis"]
+    competition_scope: ["ENG-Premier League"]
