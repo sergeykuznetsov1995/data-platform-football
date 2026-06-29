@@ -320,19 +320,20 @@ def _validate_silver_quality(**context) -> Dict[str, Any]:
             where='canonical_id IS NOT NULL',
         ),
 
-        # canonical_id coverage — sibling-policy (как players).
+        # canonical_id coverage — WARNING-only сигнал (#835). После историзации
+        # большинство MV-точек = карьера игрока ВНЕ АПЛ: Bronze хранит ПОЛНЫЙ
+        # career-graph каждого экс-АПЛ игрока за 10 сезонов (live: 59 523 точки),
+        # а canonical ставится только за АПЛ-сезон самой точки → ~23% покрытие
+        # ОЖИДАЕМО и не является поломкой резолвера
+        # (feedback_xref_resolver_historical_backfill). error_threshold=0.0 →
+        # проверка НИКОГДА не эскалирует в ERROR; warn=0.20 ловит лишь полный
+        # коллапс резолвера (coverage → 0).
         CHECK.coverage(
             'silver.transfermarkt_market_value_history',
             column='canonical_id',
-            warn_threshold=0.88,
-            error_threshold=0.80,
+            warn_threshold=0.20,
+            error_threshold=0.0,
             severity='WARNING',
-            # #788: market_value_history остаётся scoped на текущий сезон (в
-            # отличие от players/transfers) — Bronze повторяет полную MV-историю
-            # в каждом сезонном snapshot (×3.18 дубли), поэтому canonical
-            # историзируется только для per-season таблиц. Правильная
-            # историзация MV (дедуп по player_id+mv_date) = followup.
-            where="season = (SELECT max(season) FROM iceberg.silver.transfermarkt_market_value_history)",
             name='canonical_coverage[silver.transfermarkt_market_value_history]',
         ),
 
