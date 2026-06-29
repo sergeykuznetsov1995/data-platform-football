@@ -10,12 +10,13 @@ canonical to tm_<id> orphans (see ``_dedup_canonical_per_season``), and each
 JOIN carries a season predicate, so per-season canonical matches without
 fan-out.
 
-``market_value_history`` is the exception and STAYS scoped to the latest season:
-Bronze writes a player's FULL career MV graph into EVERY season snapshot, so one
-(player_id, mv_date) repeats across all season partitions (~×3.18). Removing the
-scope re-introduces duplicate (canonical_id, mv_date) rows — not a resolver
-fan-out, but a Bronze snapshot-semantics artifact. Proper historization needs a
-(player_id, mv_date) dedup → tracked as a followup.
+#835 historizes ``market_value_history`` too, but differently: Bronze writes a
+player's FULL career MV graph into EVERY season snapshot, so one (player_id,
+mv_date) repeats across all season partitions (~×3.18). The Silver SQL now
+collapses to ONE row per (player_id, mv_date) and DERIVES the season from
+mv_date (a football season, NOT the bronze snapshot season), then joins
+canonical per derived season. The per-season two-pass dedup keeps
+(canonical_id, mv_date) unique by construction.
 
 These are static-content guards (no Trino).
 """
@@ -27,16 +28,15 @@ import pytest
 
 SQL_DIR = Path(__file__).resolve().parents[3] / 'dags' / 'sql' / 'silver'
 
-# #788: per-season tables — canonical historized across all seasons (no scope).
+# #788/#835: all TM canonical tables are historized across all seasons (no
+# max(season) scope). market_value_history (#835) derives the season from
+# mv_date and collapses to one row per (player_id, mv_date) — see docstring.
 TM_HISTORIZED_SQL = [
     'transfermarkt_players.sql',
     'transfermarkt_transfers.sql.j2',
-]
-# market_value_history — stays latest-season-scoped (Bronze snapshot dup).
-TM_SCOPED_SQL = [
     'transfermarkt_market_value_history.sql',
 ]
-TM_CANONICAL_SQL = TM_HISTORIZED_SQL + TM_SCOPED_SQL
+TM_CANONICAL_SQL = TM_HISTORIZED_SQL
 
 _MAX_SEASON_RE = re.compile(
     r"season\s*=\s*\(\s*SELECT\s+max\(\s*season\s*\)", re.IGNORECASE
@@ -62,19 +62,6 @@ def test_historized_not_scoped_to_latest_season(sql_file):
         f"{sql_file}: canonical is still scoped to the latest season — #788 "
         f"historizes it across all seasons (remove the max(season) subquery; "
         f"fan-out is prevented by the resolver demote + season JOIN)"
-    )
-
-
-@pytest.mark.unit
-@pytest.mark.parametrize('sql_file', TM_SCOPED_SQL)
-def test_market_value_history_scoped_to_latest_season(sql_file):
-    """market_value_history MUST stay latest-season-scoped — Bronze repeats the
-    full MV graph in every season snapshot, so an unscoped join fans out
-    duplicate (canonical_id, mv_date) rows. See module docstring / #788."""
-    text = (SQL_DIR / sql_file).read_text(encoding='utf-8')
-    assert _MAX_SEASON_RE.search(text) is not None, (
-        f"{sql_file}: lost the latest-season scope — duplicate "
-        f"(canonical_id, mv_date) rows will return (Bronze snapshot ×3.18)"
     )
 
 

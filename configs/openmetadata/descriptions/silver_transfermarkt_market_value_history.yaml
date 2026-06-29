@@ -5,11 +5,13 @@ table:
   fullyQualifiedName: trino_iceberg.iceberg.silver.transfermarkt_market_value_history
   description: |
     Time-series рыночной стоимости игроков. Один row per (player_id,
-    mv_date, league, season) — точка timeline = snapshot MV на конкретную
-    дату с club_name/age. Открывает путь к Gold fct_player_market_value
-    (issue #11). canonical_id NULLable: TM orphan rate ≈10% APL 2025/26.
-    mv_date может уходить глубоко в прошлое (timeline за всю карьеру),
-    при этом partition season = current ingest season.
+    mv_date) — точка timeline = snapshot MV на конкретную дату с
+    club_name/age. Открывает путь к Gold fct_player_market_value
+    (issue #11). #835: историзировано — кросс-сезонные дубли Bronze
+    схлопнуты, season ВЫВЕДЕН из mv_date (футбольный, не окно скрейпа),
+    canonical джойнится per-season → покрыты и игроки, ушедшие из АПЛ.
+    canonical_id NULLable: точки за сезоны вне АПЛ-xref (карьера до/после
+    АПЛ) остаются NULL (≈77% точек = полный career-graph вне АПЛ).
     Источник: bronze.transfermarkt_market_value_history (ceapi JSON через
     weekly TM ingest).
   tags:
@@ -36,7 +38,9 @@ columns:
   - name: league
     description: Лига (partition key, текущая лига ingest'а).
   - name: season
-    description: Сезон short-form '2526' (partition key, current ingest window).
+    description: |
+      Футбольный сезон точки short-form '2526' (partition key), ВЫВЕДЕН
+      из mv_date (Aug–Jun), #835 — не окно скрейпа Bronze.
 relationships:
   - from: canonical_id
     to: trino_iceberg.iceberg.silver.xref_player.canonical_id
