@@ -1075,14 +1075,17 @@ def validate_gold_quality() -> Dict[str, Any]:
                   'is_loan', 'is_upcoming'],
         ),
         # #432: rate thresholds replace the absolute orphan_players row_count
-        # proxy. player_id: live baseline 136/750 ≈ 18.1% tm_-orphans
-        # (measured 2026-06-12). #814: after the #712 full rebuild populated the
-        # multi-season TM history, the orphan share jumped to 97.6% — historical
-        # players largely outside the current dim_player universe + the capology/
-        # TM resolver gap. Dropped error_rate → WARNING-only (never escalate),
-        # like the from/to_team checks below; orphan share tracked in #815.
+        # proxy. player_id: a historized fct_transfer (#788) references players
+        # outside the current dim_player FBref-spine (left the league + non-spine
+        # clubs). #814: the #712 rebuild first surfaced this at 97.6% orphan; the
+        # #788 TM alias-fix + two-pass resolver cut it to 43.7% live (gradient
+        # 2526=10.3% → 1920=57.1%, aggregate pulled up by history). WARNING-only
+        # (never escalate). warn 0.55 re-baselined for historized transfers (was
+        # 0.27, current-season era): passes the honest historical orphan, still
+        # alerts on a regression back toward the resolver-gap state. Full
+        # player-spine historization = #825; orphan share tracked in #815.
         CHECK.ref_integrity('gold.fct_transfer', 'gold.dim_player',
-                            'player_id', warn_rate=0.27,
+                            'player_id', warn_rate=0.55,
                             severity='WARNING'),
         # from/to team: foreign clubs are legitimately outside dim_team —
         # baseline 82%/69% orphans. warn 0.90 only alerts on a total break

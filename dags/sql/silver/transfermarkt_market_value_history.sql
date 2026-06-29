@@ -47,10 +47,14 @@ xp AS (
     FROM iceberg.silver.xref_player
     WHERE source = 'transfermarkt'
       AND confidence <> 'orphan'
-      -- #803: canonical только за последний (текущий) сезон. На тонком
-      -- историческом FBref-spine резолвер даёт ложные совпадения (один
-      -- canonical → много игроков) → 24963 дубля (canonical_id, mv_date).
-      -- История остаётся canonical=NULL до историзации xref (#788).
+      -- #788: market_value_history, в отличие от players/_transfers, НЕ
+      -- историзируется по сезонам. Bronze кладёт ПОЛНУЮ карьерную MV-историю
+      -- игрока в КАЖДЫЙ сезонный snapshot, поэтому одна (player_id, mv_date)
+      -- повторяется во всех season-партициях (×3.18 избыточность). Снятие scope
+      -- вернуло бы дубли (canonical_id, mv_date) — НЕ резолвер-fan-out (тот = 0),
+      -- а артефакт snapshot-семантики Bronze. Корректная историзация требует
+      -- дедупа по (player_id, mv_date) → followup. Пока canonical scoped на
+      -- текущий сезон (как #803).
       AND season = (
           SELECT max(season)
           FROM iceberg.silver.xref_player
