@@ -139,9 +139,36 @@ class TestCanonicalTeamForResolver:
 
     def test_unmapped_passes_through_stripped(self):
         # Identity fallback: unknown clubs still produce SOMETHING so the
-        # within-team fuzzy lookup can group rows that share a raw name.
+        # within-team fuzzy lookup can group rows that share a raw name. The
+        # trailing FC/AFC is normalized away (#836), but grouping is preserved
+        # (every "Acme FC" row maps to the same "Acme" bucket).
         result = xpr.canonical_team_for_resolver("  Acme FC ", "fbref")
-        assert result == "Acme FC"
+        assert result == "Acme"
+
+    def test_fc_suffix_normalized_to_spine_bucket(self):
+        # #836: Transfermarkt's official "<name> FC" / "<name> AFC" names must
+        # land in the same canonical bucket as the FBref spine ("<name>"), or the
+        # whole roster orphans. The mapped canonical_name has no suffix.
+        assert (
+            xpr.canonical_team_for_resolver("Arsenal FC", "transfermarkt")
+            == "Arsenal"
+        )
+        assert (
+            xpr.canonical_team_for_resolver("Chelsea FC", "transfermarkt")
+            == "Chelsea"
+        )
+        assert (
+            xpr.canonical_team_for_resolver("Sunderland AFC", "transfermarkt")
+            == "Sunderland"
+        )
+
+    def test_leading_afc_not_stripped(self):
+        # "AFC Bournemouth" has AFC as a PREFIX — the $-anchored strip must not
+        # touch it (it already maps correctly).
+        assert (
+            xpr.canonical_team_for_resolver("AFC Bournemouth", "transfermarkt")
+            == "AFC Bournemouth"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -827,15 +854,17 @@ class TestDedupCanonicalPerSeason:
         assert out[0]['source_id'] == '6827'
         assert removed == {'understat': 1}
 
-    def test_tie_on_bronze_signal_falls_back_to_max_source_id(self):
+    def test_capology_tie_on_bronze_signal_falls_back_to_max_source_id(self):
         # When the signal proxy ties (e.g. both unavailable -1), the larger
-        # numeric source_id wins. This is the Transfermarkt / Capology path.
-        a = _xrow('fb_x', 'transfermarkt', '111', bronze_signal=-1.0)
-        b = _xrow('fb_x', 'transfermarkt', '999', bronze_signal=-1.0)
+        # numeric source_id wins. Capology uses the generic groups path — two
+        # distinct source_ids on one canonical collapse to the winner (the
+        # loser is dropped, since Capology has no TM-style demote path).
+        a = _xrow('fb_x', 'capology', '111', bronze_signal=-1.0)
+        b = _xrow('fb_x', 'capology', '999', bronze_signal=-1.0)
         out, removed = xpr._dedup_canonical_per_season([a, b])
         assert len(out) == 1
         assert out[0]['source_id'] == '999'
-        assert removed == {'transfermarkt': 1}
+        assert removed == {'capology': 1}
 
     def test_orphans_pass_through_unchanged(self):
         # Orphan rows carry source-private canonical_ids (e.g. orphan:us:foo)
@@ -921,6 +950,127 @@ class TestDedupCanonicalPerSeason:
         demoted = [r for r in out if r['confidence'] == 'orphan']
         assert len(demoted) == 1 and demoted[0]['source_id'] == 'George Shelvey|Nottingham Forest'
         assert removed == {'espn': 1}
+
+    def test_transfermarkt_collision_demotes_loser_to_orphan(self):
+        # #788: TM source_id is a stable player_id — two DISTINCT source_ids on
+        # one canonical/season is a false fuzzy-match on the thin historical
+        # spine, NOT one player. Unlike the generic groups path (which drops the
+        # loser), TM keeps the strongest-tier player on the canonical and demotes
+        # the rest to tm_<source_id> orphans so they survive the table but cannot
+        # fan-out the real canonical in Gold.
+        a = _xrow('fb_x', 'transfermarkt', '111', confidence='name_team',
+                  season='1819')
+        b = _xrow('fb_x', 'transfermarkt', '999', confidence='name_team_surname',
+                  season='1819')
+        out, removed = xpr._dedup_canonical_per_season([a, b])
+        assert len(out) == 2
+        kept = [r for r in out if r['canonical_id'] == 'fb_x']
+        demoted = [r for r in out if r['confidence'] == 'orphan']
+        # Owner = strongest tier (name_team beats name_team_surname).
+        assert len(kept) == 1 and kept[0]['source_id'] == '111'
+        assert len(demoted) == 1
+        assert demoted[0]['source_id'] == '999'
+        assert demoted[0]['canonical_id'] == 'tm_999'
+        assert removed == {'transfermarkt': 1}
+
+    def test_transfermarkt_tier_tie_breaks_on_signal_then_source_id(self):
+        # Same tier on both → fall back to _tie_key (bronze_signal, then numeric
+        # source_id). TM signal is -1 for all, so the larger source_id owns the
+        # canonical; the smaller is demoted to orphan (not dropped).
+        a = _xrow('fb_y', 'transfermarkt', '111', confidence='name_team',
+                  season='1920')
+        b = _xrow('fb_y', 'transfermarkt', '999', confidence='name_team',
+                  season='1920')
+        out, removed = xpr._dedup_canonical_per_season([a, b])
+        assert len(out) == 2
+        kept = [r for r in out if r['canonical_id'] == 'fb_y']
+        demoted = [r for r in out if r['confidence'] == 'orphan']
+        assert kept[0]['source_id'] == '999'
+        assert demoted[0]['source_id'] == '111'
+        assert demoted[0]['canonical_id'] == 'tm_111'
+        assert removed == {'transfermarkt': 1}
+
+    def test_transfermarkt_same_player_id_club_stints_collapse_to_one(self):
+        # A mid-season transfer gives the SAME TM player_id two anchor rows
+        # (different raw_team). They resolve to the same canonical; the PK
+        # (source, source_id, season) has no team, so they MUST collapse to one
+        # row — and it is NOT a false match, so the canonical is kept (no orphan).
+        a = {**_xrow('fb_z', 'transfermarkt', '555', confidence='name_team',
+                     season='2425'),
+             'raw_team_name': 'Manchester United'}
+        b = {**_xrow('fb_z', 'transfermarkt', '555', confidence='name_team',
+                     season='2425'),
+             'raw_team_name': 'Aston Villa'}
+        out, removed = xpr._dedup_canonical_per_season([a, b])
+        assert len(out) == 1
+        assert out[0]['source_id'] == '555'
+        assert out[0]['canonical_id'] == 'fb_z'
+        assert out[0]['confidence'] != 'orphan'
+        assert removed == {'transfermarkt': 1}
+
+    def test_transfermarkt_owner_keeps_canonical_demotes_two_namesakes(self):
+        # Three distinct TM players false-matched onto one canonical: the
+        # strongest tier (subset) owns it, the two weaker (surname) become
+        # tm_<source_id> orphans.
+        owner = _xrow('fb_w', 'transfermarkt', '100',
+                      confidence='name_team_subset', season='1718')
+        n1 = _xrow('fb_w', 'transfermarkt', '200',
+                   confidence='name_team_surname', season='1718')
+        n2 = _xrow('fb_w', 'transfermarkt', '300',
+                   confidence='name_team_surname', season='1718')
+        out, removed = xpr._dedup_canonical_per_season([owner, n1, n2])
+        kept = {r['source_id'] for r in out if r['canonical_id'] == 'fb_w'}
+        assert kept == {'100'}
+        demoted = {r['source_id']: r['canonical_id']
+                   for r in out if r['confidence'] == 'orphan'}
+        assert demoted == {'200': 'tm_200', '300': 'tm_300'}
+        assert removed == {'transfermarkt': 2}
+
+    def test_transfermarkt_different_seasons_no_collision(self):
+        # The collision-demote is per (canonical, season): the same two distinct
+        # source_ids in DIFFERENT seasons are independent and both keep canonical.
+        a = _xrow('fb_v', 'transfermarkt', '111', confidence='name_team',
+                  season='2324')
+        b = _xrow('fb_v', 'transfermarkt', '999', confidence='name_team',
+                  season='2425')
+        out, removed = xpr._dedup_canonical_per_season([a, b])
+        assert len(out) == 2
+        assert all(r['confidence'] != 'orphan' for r in out)
+        assert removed == {}
+
+    def test_transfermarkt_resolved_plus_orphan_stint_collapses_to_resolved(self):
+        # #788 PK fix: a mid-season transfer gives ONE TM player_id two anchor
+        # rows (different clubs). One stint resolves to FBref, the other orphans
+        # (club not on the spine). The PK (source, source_id, league, season) has
+        # no club, so they MUST collapse to one row — and a player found in ANY
+        # club is resolved, so prefer the resolved stint (NOT a PK duplicate).
+        resolved = {**_xrow('fb_p', 'transfermarkt', '243028',
+                            confidence='name_team', season='2223'),
+                    'raw_team_name': 'Aston Villa'}
+        orphan = {**_xrow('tm_243028', 'transfermarkt', '243028',
+                          confidence='orphan', season='2223'),
+                  'raw_team_name': 'Southampton FC'}
+        out, removed = xpr._dedup_canonical_per_season([resolved, orphan])
+        assert len(out) == 1
+        assert out[0]['source_id'] == '243028'
+        assert out[0]['canonical_id'] == 'fb_p'
+        assert out[0]['confidence'] == 'name_team'
+        assert removed == {'transfermarkt': 1}
+
+    def test_transfermarkt_all_orphan_stints_collapse_to_one_orphan(self):
+        # Both club-stints of one player_id orphan (player on neither club's
+        # spine) → exactly one orphan row survives (PK), not two.
+        a = {**_xrow('tm_500', 'transfermarkt', '500', confidence='orphan',
+                     season='1819'),
+             'raw_team_name': 'Cardiff City'}
+        b = {**_xrow('tm_500', 'transfermarkt', '500', confidence='orphan',
+                     season='1819'),
+             'raw_team_name': 'Huddersfield Town'}
+        out, removed = xpr._dedup_canonical_per_season([a, b])
+        assert len(out) == 1
+        assert out[0]['source_id'] == '500'
+        assert out[0]['confidence'] == 'orphan'
+        assert removed == {'transfermarkt': 1}
 
 
 # ---------------------------------------------------------------------------

@@ -246,8 +246,11 @@ def _validate_silver_quality(**context) -> Dict[str, Any]:
             warn_threshold=0.88,
             error_threshold=0.80,
             severity='WARNING',
-            # #803: меряем покрытие только за последний (текущий) сезон —
-            # canonical за историю намеренно NULL (xref не историзирован, #788).
+            # #788: меряем покрытие только за последний (текущий) сезон — это
+            # health-сигнал на толстом current-season FBref-spine. Canonical теперь
+            # историзирован за все сезоны (#788), но за старые сезоны покрытие
+            # структурно низкое (тонкий spine) и красило бы ERROR не по вине
+            # резолва — исторический градиент сглаживается в #825.
             where="season = (SELECT max(season) FROM iceberg.silver.transfermarkt_players)",
             name='canonical_coverage[silver.transfermarkt_players]',
         ),
@@ -324,7 +327,11 @@ def _validate_silver_quality(**context) -> Dict[str, Any]:
             warn_threshold=0.88,
             error_threshold=0.80,
             severity='WARNING',
-            # #803: покрытие только за последний (текущий) сезон.
+            # #788: market_value_history остаётся scoped на текущий сезон (в
+            # отличие от players/transfers) — Bronze повторяет полную MV-историю
+            # в каждом сезонном snapshot (×3.18 дубли), поэтому canonical
+            # историзируется только для per-season таблиц. Правильная
+            # историзация MV (дедуп по player_id+mv_date) = followup.
             where="season = (SELECT max(season) FROM iceberg.silver.transfermarkt_market_value_history)",
             name='canonical_coverage[silver.transfermarkt_market_value_history]',
         ),
@@ -394,7 +401,8 @@ def _validate_silver_quality(**context) -> Dict[str, Any]:
             warn_threshold=0.88,
             error_threshold=0.80,
             severity='WARNING',
-            # #803: покрытие только за последний (текущий) сезон.
+            # #788: health-сигнал на current-season spine. Canonical историзирован
+            # за все сезоны, исторический градиент покрытия сглаживается в #825.
             where="season = (SELECT max(season) FROM iceberg.silver.transfermarkt_transfers)",
             name='canonical_coverage[silver.transfermarkt_transfers]',
         ),

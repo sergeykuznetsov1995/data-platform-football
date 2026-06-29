@@ -225,7 +225,19 @@ def canonical_team_for_resolver(
     from utils.medallion_config import get_canonical_team_name
 
     canonical = get_canonical_team_name(raw, source=source)
-    return canonical if canonical else raw
+    if canonical:
+        return canonical
+    # #836: some sources carry an official "<name> FC" / "<name> AFC" suffix that
+    # the alias map keys without (Transfermarkt: "Arsenal FC", "Sunderland AFC",
+    # "Liverpool FC" — 11 APL clubs). Without normalization the whole roster lands
+    # in a "<name> FC" bucket that never meets the FBref spine's "<name>" bucket,
+    # so every player orphans. Strip a trailing FC/AFC and retry before falling
+    # back to identity. ("AFC Bournemouth" keeps its leading AFC — anchored to $.)
+    stripped = re.sub(r'\s+A?FC$', '', raw).strip()
+    if stripped and stripped != raw:
+        canonical = get_canonical_team_name(stripped, source=source)
+        return canonical if canonical else stripped
+    return raw
 
 
 # ---------------------------------------------------------------------------
@@ -1659,11 +1671,12 @@ def _resolve_all(
     return out, review, stats
 
 
-#: #803: confidence-tier strength for ESPN canonical-collision resolution
-#: (smaller = stronger). When two different ESPN players land on one canonical
-#: in a season, the strongest-tier match owns it; the others are demoted to
-#: orphan. Mirrors the resolver tier cascade order.
-_ESPN_TIER_RANK: Dict[str, int] = {
+#: #803/#788: confidence-tier strength for canonical-collision resolution
+#: (smaller = stronger). When two different players land on one canonical in a
+#: season (ESPN namesakes #803, or Transfermarkt false matches on the thin
+#: historical spine #788), the strongest-tier match owns it; the others are
+#: demoted to orphan. Mirrors the resolver tier cascade order.
+_TIER_RANK: Dict[str, int] = {
     'exact': 0,
     'name_team': 1,
     'name_team_alias': 2,
@@ -1736,7 +1749,18 @@ def _dedup_canonical_per_season(
     # canonical bound to two DIFFERENT players in one season can be resolved
     # (same-name multi-team stints still pass through, see below).
     espn_groups: Dict[Tuple[str, str, str], List[Dict[str, Any]]] = defaultdict(list)
+    # #788: ALL Transfermarkt rows (resolved + orphan) go to a two-pass dedup
+    # below. TM Bronze is per-(player, club, season), so one player_id with a
+    # mid-season transfer yields two anchor rows that can resolve DIFFERENTLY
+    # (one to FBref, the other orphan / to a different fb_id). The PK is
+    # (source, source_id, league, season) — no club — so they MUST collapse to
+    # one row, else a PK duplicate. Collected here (TM-check before the orphan
+    # passthrough so TM orphans land in the same dedup).
+    tm_rows: List[Dict[str, Any]] = []
     for row in rows:
+        if row.get('source') == 'transfermarkt':
+            tm_rows.append(row)
+            continue
         if row.get('confidence') == 'orphan':
             out.append(row)
             continue
@@ -1784,11 +1808,11 @@ def _dedup_canonical_per_season(
             out.extend(members)
             continue
         best_rank = min(
-            _ESPN_TIER_RANK.get(m.get('confidence'), 99) for m in members
+            _TIER_RANK.get(m.get('confidence'), 99) for m in members
         )
         contenders = [
             m for m in members
-            if _ESPN_TIER_RANK.get(m.get('confidence'), 99) == best_rank
+            if _TIER_RANK.get(m.get('confidence'), 99) == best_rank
         ]
         owner = _espn_identity(max(contenders, key=_tie_key))
         for m in members:
@@ -1800,6 +1824,63 @@ def _dedup_canonical_per_season(
                 demoted['confidence'] = 'orphan'
                 out.append(demoted)
                 removed['espn'] += 1
+
+    # #788: Transfermarkt two-pass dedup.
+    # Pass 1 (PK): one row per (source_id, league, season). A mid-season transfer
+    # gives a player_id two anchor rows (different clubs) that resolve
+    # differently; the PK has no club, so collapse to ONE — prefer the
+    # strongest-tier RESOLVED stint (a player found in any club is resolved),
+    # else a single orphan. Without this, a resolved stint + an orphan stint of
+    # the same player_id are a PK duplicate (#788 live: 141 dups, all TM).
+    tm_pk: Dict[Tuple[str, str, str], List[Dict[str, Any]]] = defaultdict(list)
+    for r in tm_rows:
+        tm_pk[(str(r['source_id']), r['league'], str(r['season']))].append(r)
+
+    def _tm_pk_key(r: Dict[str, Any]) -> Tuple[int, int, float, int]:
+        # Prefer resolved over orphan, then stronger tier, then _tie_key (signal,
+        # source_id) — negated so a single ``min`` picks the best stint.
+        is_orphan = 0 if r.get('confidence') != 'orphan' else 1
+        tier = _TIER_RANK.get(r.get('confidence'), 99)
+        sig_f, sid_int, _ = _tie_key(r)
+        return (is_orphan, tier, -sig_f, -sid_int)
+
+    tm_pk_winners: List[Dict[str, Any]] = []
+    for members in tm_pk.values():
+        if len(members) > 1:
+            removed['transfermarkt'] += len(members) - 1
+        tm_pk_winners.append(min(members, key=_tm_pk_key))
+
+    # Pass 2 (fan-out): ≥2 DISTINCT source_ids on one canonical/season is a false
+    # fuzzy-match on the thin spine — keep the strongest-tier owner, demote the
+    # rest to tm_<source_id> orphans so they don't fan-out the real canonical.
+    tm_canon: Dict[Tuple[str, str, str], List[Dict[str, Any]]] = defaultdict(list)
+    for r in tm_pk_winners:
+        if r.get('confidence') == 'orphan':
+            out.append(r)
+            continue
+        tm_canon[(r['canonical_id'], r['league'], str(r['season']))].append(r)
+
+    for members in tm_canon.values():
+        if len(members) == 1:
+            out.append(members[0])
+            continue
+        best_rank = min(
+            _TIER_RANK.get(m.get('confidence'), 99) for m in members
+        )
+        contenders = [
+            m for m in members
+            if _TIER_RANK.get(m.get('confidence'), 99) == best_rank
+        ]
+        owner_id = str(max(contenders, key=_tie_key)['source_id'])
+        for m in members:
+            if str(m['source_id']) == owner_id:
+                out.append(m)
+            else:
+                demoted = dict(m)
+                demoted['canonical_id'] = f"{_orphan_prefix('transfermarkt')}_{m['source_id']}"
+                demoted['confidence'] = 'orphan'
+                out.append(demoted)
+                removed['transfermarkt'] += 1
 
     return out, dict(removed)
 
@@ -2022,16 +2103,13 @@ def run_resolver(
         ss = _fetch_sofascore_players(conn, league, source_seasons)
         logger.info("  %d SofaScore players", len(ss))
 
-        # #803: resolve TM only for the latest (current) season. On the thin
-        # historical FBref spine the fuzzy cascade false-matches many TM players
-        # onto one canonical_id (241 per-canonical-season collisions over the
-        # 10-season #793 backfill). Those rows are unused by TM Silver (canonical
-        # scoped to current season, #806) but polluted the shared xref_player.
-        # Other sources keep full-history resolution; TM history stays
-        # unresolved until xref is historized (#788).
-        tm_seasons = [max(source_seasons)] if source_seasons else source_seasons
-        logger.info("Reading Transfermarkt players (current season %s) ...", tm_seasons)
-        tm = _fetch_transfermarkt_players(conn, league, tm_seasons)
+        # #788: resolve TM across ALL seasons (was current-season-only in #803).
+        # The per-canonical fan-out that motivated the restriction (241 collisions
+        # over the 10-season #793 backfill) is now handled in
+        # _dedup_canonical_per_season: distinct TM player_ids false-matched onto
+        # one canonical demote to tm_<id> orphans instead of duplicating it.
+        logger.info("Reading Transfermarkt players ...")
+        tm = _fetch_transfermarkt_players(conn, league, source_seasons)
         logger.info("  %d Transfermarkt players", len(tm))
 
         logger.info("Reading Capology players ...")
