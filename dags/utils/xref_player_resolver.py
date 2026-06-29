@@ -904,46 +904,83 @@ def _fetch_fotmob_players(
 ) -> List[Dict[str, Any]]:
     """Read FotMob player anchor rows for the resolver cascade.
 
-    Bronze ``fotmob_player_details`` carries player_id + name + primary_team
-    per (league, season=bigint). Season is the FBref-style year-of-start
-    (e.g. 2025 for 2025/26) — convert to slug ('2526') before emission so
-    the spine index keys agree with Understat/WhoScored.
+    Identity (player_id + name + team) comes from ``silver.fotmob_lineup``
+    (per-match lineups parsed from bronze.fotmob_match_details.lineup_json),
+    NOT from ``bronze.fotmob_player_details``. Rationale (#825): the
+    player_details scraper seeds player ids from the *current* team squads
+    (``_get_team_data`` takes no season arg), so its historical partitions
+    carry today's squad members rather than the players who actually appeared
+    that season — only ~41/620 anchors survived for 2016/17. fotmob_lineup is
+    season-accurate (team_name = the team the player lined up for in that
+    match), giving a full anchor per real season participant across all 10
+    seasons. primary_team = the team with the most appearances that season
+    (max_by) so a mid-season transfer maps to its dominant club.
+
+    The minutes-played signal still comes from ``bronze.fotmob_player_stats``
+    (participant_id == fotmob player id, so the join matches the lineup
+    player_id historically too). Used for the senior-appearance signal<=0
+    filter (#563) and the _dedup_canonical_per_season tiebreaker (#70).
+
+    fotmob_lineup.season is already a slug ('2526'); convert the incoming
+    FBref-style year list to slugs for the filter. player_stats season is a
+    bigint year-of-start → fold to a slug in-query so the minutes join aligns.
     """
-    # Minutes-played proxy from bronze.fotmob_player_stats (native
-    # `minutes_played` column; long-format `stat_name='mins_played'` retired
-    # together with `player_id` → `participant_id` rename, issue #88).
-    # Used as dedup tiebreaker in _dedup_canonical_per_season (issue #70).
-    # NULL fallback to 0.0. CAST to VARCHAR mirrors silver
-    # fotmob_player_season_profile.sql so JOIN keys agree with player_details.
+    season_slugs = [_fbref_year_to_slug(y) for y in fbref_seasons]
     sql = f"""
-        WITH mins AS (
+        WITH stats_slug AS (
             SELECT
                 CAST(participant_id AS VARCHAR) AS player_id,
                 league,
-                season,
-                MAX(minutes_played) AS minutes_played
+                LPAD(CAST(MOD(season,     100) AS varchar), 2, '0')
+                    || LPAD(CAST(MOD(season + 1, 100) AS varchar), 2, '0')
+                    AS season,
+                minutes_played
             FROM iceberg.bronze.fotmob_player_stats
             WHERE league = '{_sql_escape(league)}'
               AND season IN ({_seasons_in_clause(fbref_seasons)})
-            GROUP BY participant_id, league, season
+        ),
+        mins AS (
+            SELECT player_id, league, season,
+                   MAX(minutes_played) AS minutes_played
+            FROM stats_slug
+            GROUP BY player_id, league, season
+        ),
+        per_team AS (
+            SELECT
+                player_id,
+                league,
+                season,
+                team_name,
+                arbitrary(player_name) AS player_name,
+                COUNT(*) AS apps
+            FROM iceberg.silver.fotmob_lineup
+            WHERE league = '{_sql_escape(league)}'
+              AND season IN ({_seasons_in_clause(season_slugs)})
+              AND player_id IS NOT NULL
+              AND player_name IS NOT NULL
+            GROUP BY player_id, league, season, team_name
+        ),
+        anchors AS (
+            SELECT
+                player_id,
+                max_by(player_name, apps) AS name,
+                max_by(team_name, apps)   AS primary_team_name,
+                league,
+                season
+            FROM per_team
+            GROUP BY player_id, league, season
         )
-        SELECT d.player_id,
-               d.name,
-               d.primary_team_name,
-               d.league,
-               d.season,
+        SELECT a.player_id,
+               a.name,
+               a.primary_team_name,
+               a.league,
+               a.season,
                COALESCE(m.minutes_played, 0.0) AS bronze_signal
-        FROM iceberg.bronze.fotmob_player_details d
+        FROM anchors a
         LEFT JOIN mins m
-          ON m.player_id = d.player_id
-         AND m.league = d.league
-         AND m.season = d.season
-        WHERE d.league = '{_sql_escape(league)}'
-          AND d.season IN ({_seasons_in_clause(fbref_seasons)})
-          AND COALESCE(d.is_coach, false) = false
-          AND d.name IS NOT NULL
-        GROUP BY d.player_id, d.name, d.primary_team_name, d.league, d.season,
-                 COALESCE(m.minutes_played, 0.0)
+          ON m.player_id = a.player_id
+         AND m.league    = a.league
+         AND m.season    = a.season
     """
     rows = _execute(conn, sql, fetch=True) or []
     out: List[Dict[str, Any]] = []
@@ -956,12 +993,11 @@ def _fetch_fotmob_players(
         # rate ~10pp. Mirrors the Capology active+loan filter (_fetch_capology).
         if _is_youth_team(team) or float(signal or 0.0) <= 0.0:
             continue
-        # Dedup by (pid, team, season) — same reasoning as
-        # _fetch_understat_players above. Bronze fotmob_player_details
-        # is partitioned by season (bigint), so each season is a distinct
-        # snapshot; multi-season players need separate xref rows.
-        season_slug = _fbref_year_to_slug(season)
-        key = (str(pid), team, season_slug)
+        # Dedup by (pid, team, season). silver.fotmob_lineup season is already a
+        # slug, and `anchors` collapses to one row per (player_id, season), so
+        # this is a belt-and-braces guard; multi-season players keep separate
+        # xref rows.
+        key = (str(pid), team, season)
         if key in seen:
             continue
         seen.add(key)
@@ -973,7 +1009,7 @@ def _fetch_fotmob_players(
                 'raw_team_name': team,
                 'canonical_team': canonical_team_for_resolver(team, 'fotmob'),
                 'league': lg,
-                'season': season_slug,
+                'season': season,
                 'bronze_signal': float(signal) if signal is not None else 0.0,
             }
         )
