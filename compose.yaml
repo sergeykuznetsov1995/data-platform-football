@@ -30,7 +30,6 @@ x-airflow-common: &airflow-common
     AIRFLOW__CELERY__BROKER_URL: ${AIRFLOW__CELERY__BROKER_URL}
     AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW__WEBSERVER__SECRET_KEY}
     AIRFLOW__WEBSERVER__EXPOSE_CONFIG: ${AIRFLOW__WEBSERVER__EXPOSE_CONFIG}
-    SPARK_MASTER_URL: ${SPARK_MASTER_URL}
     TRINO_PASSWORD: ${TRINO_PASSWORD}
     TRINO_PORT: ${TRINO_PORT}
     # Route FlareSolverr scrapers (WhoScored/SoFIFA) through the ad-tech filter (#652).
@@ -43,8 +42,6 @@ x-airflow-common: &airflow-common
   volumes:
     - ./dags:/opt/airflow/dags
     - ./logs:/opt/airflow/logs
-    - ./spark_jobs:/opt/airflow/spark_jobs
-    - ./configs/spark:/opt/spark/conf
     # E1 medallion config: team_aliases.yaml + competitions.yaml — read-only
     # for utils/medallion_config.py (default CONFIG_DIR=/opt/airflow/configs/medallion)
     - ./configs/medallion:/opt/airflow/configs/medallion:ro
@@ -268,138 +265,6 @@ services:
           memory: 384M
 
   # ===========================================================================
-  # Spark Cluster
-  # ===========================================================================
-  spark-master:
-    profiles: ["heavy"]
-    build:
-      context: ./docker/images/spark
-      dockerfile: Dockerfile
-    container_name: spark-master
-    hostname: spark-master
-    security_opt:
-      - no-new-privileges:true
-    cap_drop:
-      - ALL
-    cap_add:
-      - CHOWN
-      - SETGID
-      - SETUID
-    environment:
-      - SPARK_MODE=master
-      - SPARK_MASTER_HOST=spark-master
-      - SPARK_MASTER_PORT=7077
-      - SPARK_MASTER_WEBUI_PORT=8080
-    ports:
-      - "127.0.0.1:8080:8080"  # Web UI
-      - "127.0.0.1:7077:7077"  # Spark Master
-    volumes:
-      - ./configs/spark:/opt/spark/conf
-      - ./spark_jobs:/opt/spark_jobs
-    networks:
-      - storage
-    depends_on:
-      hive-metastore:
-        condition: service_healthy
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/"]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-      start_period: 30s
-    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.master.Master"]
-    deploy:
-      resources:
-        limits:
-          memory: 512M
-        reservations:
-          memory: 256M
-
-  spark-worker-1:
-    profiles: ["heavy"]
-    build:
-      context: ./docker/images/spark
-      dockerfile: Dockerfile
-    container_name: spark-worker-1
-    hostname: spark-worker-1
-    security_opt:
-      - no-new-privileges:true
-    cap_drop:
-      - ALL
-    cap_add:
-      - CHOWN
-      - SETGID
-      - SETUID
-    environment:
-      - SPARK_MODE=worker
-      - SPARK_MASTER_URL=spark://spark-master:7077
-      - SPARK_WORKER_MEMORY=512M
-      - SPARK_WORKER_CORES=2
-    volumes:
-      - ./configs/spark:/opt/spark/conf
-      - ./spark_jobs:/opt/spark_jobs
-    networks:
-      - storage
-    depends_on:
-      spark-master:
-        condition: service_healthy
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8081/"]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-      start_period: 30s
-    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.worker.Worker", "spark://spark-master:7077"]
-    deploy:
-      resources:
-        limits:
-          memory: 512M
-        reservations:
-          memory: 256M
-
-  spark-worker-2:
-    profiles: ["heavy"]
-    build:
-      context: ./docker/images/spark
-      dockerfile: Dockerfile
-    container_name: spark-worker-2
-    hostname: spark-worker-2
-    security_opt:
-      - no-new-privileges:true
-    cap_drop:
-      - ALL
-    cap_add:
-      - CHOWN
-      - SETGID
-      - SETUID
-    environment:
-      - SPARK_MODE=worker
-      - SPARK_MASTER_URL=spark://spark-master:7077
-      - SPARK_WORKER_MEMORY=512M
-      - SPARK_WORKER_CORES=2
-    volumes:
-      - ./configs/spark:/opt/spark/conf
-      - ./spark_jobs:/opt/spark_jobs
-    networks:
-      - storage
-    depends_on:
-      spark-master:
-        condition: service_healthy
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8081/"]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-      start_period: 30s
-    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.worker.Worker", "spark://spark-master:7077"]
-    deploy:
-      resources:
-        limits:
-          memory: 512M
-        reservations:
-          memory: 256M
-
-  # ===========================================================================
   # Redis - Celery Broker for Airflow
   # ===========================================================================
   redis:
@@ -557,7 +422,7 @@ services:
   # Trino - Distributed SQL Query Engine
   # ===========================================================================
   trino:
-    image: trinodb/trino:479
+    image: trinodb/trino:482
     container_name: trino
     hostname: trino
     restart: unless-stopped
@@ -601,7 +466,10 @@ services:
   # Superset - BI / Dashboards
   # ===========================================================================
   superset:
-    image: data-platform/superset:4.1.1
+    image: data-platform/superset:4.1.2
+    build:
+      context: ./docker/images/superset
+      dockerfile: Dockerfile
     container_name: superset
     hostname: superset
     security_opt:
@@ -657,7 +525,7 @@ services:
 
   superset-worker:
     profiles: ["heavy"]
-    image: data-platform/superset:4.1.1
+    image: data-platform/superset:4.1.2
     container_name: superset-worker
     hostname: superset-worker
     security_opt:
@@ -700,7 +568,7 @@ services:
 
   superset-beat:
     profiles: ["heavy"]
-    image: data-platform/superset:4.1.1
+    image: data-platform/superset:4.1.2
     container_name: superset-beat
     hostname: superset-beat
     security_opt:
