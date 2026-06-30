@@ -8,25 +8,19 @@
 
 # -----------------------------------------------------------------------------
 # [airflow-core] Pin Airflow version to prevent automatic upgrade to 3.x
-# Base image already has 2.7.3, but providers may try to upgrade it
+# Base image already has 2.11.2, but providers may try to upgrade it
 # -----------------------------------------------------------------------------
-# Pin connexion to avoid PyYAML<6 requirement (won't build on Python 3.11)
-connexion[flask,swagger-ui]==2.14.2
-apache-airflow==2.7.3
+# Pin connexion to the version Airflow 2.11.2 is tested with (constraints-2.11.2)
+connexion[flask,swagger-ui]==2.15.1
+apache-airflow==2.11.2
 
 # -----------------------------------------------------------------------------
 # [airflow-providers] Apache Airflow Providers
-# Compatible with Airflow 2.7.x (pinned versions to avoid 3.x requirements)
+# Compatible with Airflow 2.11.x (versions from constraints-2.11.2)
+# Spark provider + pyspark removed: Spark dropped from the stack in Tier 1.
 # -----------------------------------------------------------------------------
-apache-airflow-providers-apache-spark==4.0.1
-apache-airflow-providers-redis==3.3.2
-apache-airflow-providers-http==4.5.2
-
-
-# -----------------------------------------------------------------------------
-# [spark] PySpark
-# -----------------------------------------------------------------------------
-pyspark==3.5.3
+apache-airflow-providers-redis==4.4.2
+apache-airflow-providers-http==6.0.0
 
 
 # -----------------------------------------------------------------------------
@@ -49,7 +43,9 @@ lxml>=5.0.0
 # [database] Database Connectors
 # -----------------------------------------------------------------------------
 psycopg2-binary>=2.9.9
-redis>=4.5.2,<5.0.0
+# Upper bound dropped: redis provider 4.4.2 is tested with redis 6.x; the redis
+# client is not imported directly by Airflow DAG/scraper code.
+redis>=4.5.2
 
 # Trino Python client for DDL operations
 trino>=0.328.0

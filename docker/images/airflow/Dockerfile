@@ -1,4 +1,4 @@
-FROM apache/airflow:2.7.3-python3.11
+FROM apache/airflow:2.11.2-python3.11
 
 USER root
 
@@ -52,8 +52,8 @@ ENV PYTHONPATH="/opt/airflow/dags:/opt/airflow/scrapers:/opt/airflow:${PYTHONPAT
 # Switch to airflow user for pip installs
 USER airflow
 
-# ===== СТАДИЯ 1: Airflow 2.7.x (уже включен в базовый образ) =====
-# Базовый образ apache/airflow:2.7.3-python3.11 уже содержит Airflow
+# ===== СТАДИЯ 1: Airflow 2.11.x (уже включен в базовый образ) =====
+# Базовый образ apache/airflow:2.11.2-python3.11 уже содержит Airflow
 # Дополнительная установка Airflow не требуется
 
 # ===== СТАДИЯ 2: Core dependencies (Airflow providers, data processing) =====
