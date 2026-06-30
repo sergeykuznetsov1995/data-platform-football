@@ -398,6 +398,56 @@ class CHECK:
 
 
 # ---------------------------------------------------------------------------
+# Generic baseline checks (tier-1 #8 thin sweep)
+# ---------------------------------------------------------------------------
+
+def build_generic_table_checks(
+    table: str,
+    pk: Optional[List[str]] = None,
+    not_null: Optional[List[str]] = None,
+    min_rows: int = 1,
+    where: Optional[str] = None,
+    severity: str = 'ERROR',
+) -> List[Check]:
+    """Build a small set of baseline DQ checks reusable on any table.
+
+    Composes the existing :class:`CHECK` factories — no new check kinds:
+
+    - ``row_count``     — table has at least ``min_rows`` rows
+    - ``no_nulls``      — primary-key columns and ``not_null`` columns are non-NULL
+    - ``no_duplicates`` — ``pk`` columns are unique
+
+    A sub-check is only emitted when its argument is supplied. ``pk`` columns
+    are folded into the NOT NULL set, since a uniqueness/PK assertion is
+    meaningless when the key can be NULL.
+
+    Example::
+
+        checks = build_generic_table_checks(
+            'gold.dim_manager', pk=['manager_id'], not_null=['manager_name'],
+        )
+        run_checks(checks, raise_on_error=False)
+    """
+    checks: List[Check] = [
+        CHECK.row_count(table, min_rows=min_rows, where=where, severity=severity)
+    ]
+
+    # Preserve order, drop duplicates: pk columns must also be non-NULL.
+    null_cols = list(dict.fromkeys(list(pk or []) + list(not_null or [])))
+    if null_cols:
+        checks.append(
+            CHECK.no_nulls(table, cols=null_cols, where=where, severity=severity)
+        )
+
+    if pk:
+        checks.append(
+            CHECK.no_duplicates(table, pk=list(pk), where=where, severity=severity)
+        )
+
+    return checks
+
+
+# ---------------------------------------------------------------------------
 # Check runners (one per kind)
 # ---------------------------------------------------------------------------
 
