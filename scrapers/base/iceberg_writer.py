@@ -214,44 +214,20 @@ class IcebergWriter:
 
     def _clean_hdfs_table_dir(self, database: str, table: str) -> None:
         """
-        Remove orphaned HDFS directories for a dropped Iceberg table.
+        No-op on the Iceberg REST catalog (Lakekeeper) + S3 (SeaweedFS) backend.
 
-        After DROP TABLE with corrupt metadata, Iceberg may leave behind
-        orphaned files on HDFS that prevent CREATE TABLE from succeeding
-        with ICEBERG_COMMIT_ERROR: "Failed to write manifest list file".
-
-        Iceberg creates directories with UUID suffix:
-          /user/hive/warehouse/{schema}.db/{table}-{uuid}
-        We match all directories starting with the table name.
+        The original HDFS implementation deleted orphaned
+        ``/user/hive/warehouse/{schema}.db/{table}-{uuid}`` directories left
+        behind by DROP TABLE under the Hive Metastore. With the REST catalog,
+        DROP TABLE purges table data/metadata through the catalog, so no manual
+        object-store cleanup is required here. If a corrupt-metadata recreate
+        still fails because of leftover S3 objects, delete the table prefix
+        ``s3://{warehouse-bucket}/warehouse/{schema}/{table}-*`` manually.
         """
-        schema_dir = f"/user/hive/warehouse/{database}.db"
-        try:
-            from scrapers.base.hdfs_client import HDFSClient
-            hdfs = HDFSClient()
-            if not hdfs.exists(schema_dir):
-                logger.debug(f"HDFS schema directory does not exist: {schema_dir}")
-                return
-
-            entries = hdfs.list_dir(schema_dir)
-            # Match exact name or name-{uuid} pattern
-            prefix = f"{table}-"
-            orphaned = [
-                e['name'] for e in entries
-                if e['name'] == table or e['name'].startswith(prefix)
-            ]
-
-            for dirname in orphaned:
-                hdfs_path = f"{schema_dir}/{dirname}"
-                hdfs.delete(hdfs_path, recursive=True)
-                logger.info(f"Cleaned orphaned HDFS directory: {hdfs_path}")
-
-            if not orphaned:
-                logger.debug(f"No orphaned HDFS directories for {table}")
-        except Exception as e:
-            logger.warning(
-                f"Could not clean HDFS directories for {table}: {e}. "
-                f"CREATE TABLE may fail if orphaned files remain."
-            )
+        logger.debug(
+            "_clean_hdfs_table_dir is a no-op on the REST/S3 backend "
+            "(DROP TABLE purges via the catalog) for %s.%s", database, table
+        )
 
     def write_dataframe(
         self,

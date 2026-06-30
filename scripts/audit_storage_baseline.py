@@ -142,6 +142,7 @@ def collect_trino_metrics(conn, schema: str, table: str) -> dict[str, Any]:
         "row_count": None,
         "partition_count": None,
         "iceberg_files_count": None,
+        "iceberg_total_bytes": None,
         "iceberg_snapshot_count": None,
         "latest_snapshot_committed_at": None,
     }
@@ -172,6 +173,17 @@ def collect_trino_metrics(conn, schema: str, table: str) -> dict[str, Any]:
         )
     except Exception as e:
         logger.debug(f"  {schema}.{table}: files_count failed: {e}")
+
+    # iceberg_total_bytes — backend-agnostic table size from the catalog
+    # ($files.file_size_in_bytes). Replaces the old `hdfs dfs -du` measurement,
+    # which is null post-migration (no namenode container).
+    try:
+        metrics["iceberg_total_bytes"] = _trino_scalar(
+            conn,
+            f'SELECT COALESCE(SUM(file_size_in_bytes), 0) FROM iceberg.{schema}."{table}$files"',
+        )
+    except Exception as e:
+        logger.debug(f"  {schema}.{table}: total_bytes failed: {e}")
 
     # iceberg_snapshot_count
     try:

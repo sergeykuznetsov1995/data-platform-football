@@ -484,54 +484,19 @@ class TestIcebergWriterMetadataRecovery:
             with pytest.raises(TrinoError, match="DROP failed"):
                 writer._write_to_iceberg(df, 'bronze', 'test_table', None)
 
-    def test_clean_hdfs_deletes_orphaned_dirs_with_uuid(self):
-        """_clean_hdfs_table_dir deletes dirs matching table name and table-{uuid} pattern."""
+    def test_clean_hdfs_table_dir_is_noop(self):
+        """_clean_hdfs_table_dir is a no-op on the REST/S3 backend.
+
+        DROP TABLE purges data/metadata through the Iceberg REST catalog
+        (Lakekeeper), so no HDFS/S3 client call is made here. The method must
+        not raise and must not require any object-store client.
+        """
         with patch.dict('sys.modules', {'trino': MagicMock(), 'trino.dbapi': MagicMock()}):
             from scrapers.base.iceberg_writer import IcebergWriter
             writer = IcebergWriter()
 
-            mock_hdfs = MagicMock()
-            mock_hdfs.exists.return_value = True
-            mock_hdfs.list_dir.return_value = [
-                {'name': 'fbref_player_stats', 'type': 'DIRECTORY'},
-                {'name': 'fbref_player_stats-abc123', 'type': 'DIRECTORY'},
-                {'name': 'fbref_player_stats-def456', 'type': 'DIRECTORY'},
-                {'name': 'fbref_schedule', 'type': 'DIRECTORY'},
-            ]
-
-            with patch('scrapers.base.hdfs_client.HDFSClient', return_value=mock_hdfs):
-                writer._clean_hdfs_table_dir('bronze', 'fbref_player_stats')
-
-                assert mock_hdfs.delete.call_count == 3
-                deleted_paths = [c[0][0] for c in mock_hdfs.delete.call_args_list]
-                assert '/user/hive/warehouse/bronze.db/fbref_player_stats' in deleted_paths
-                assert '/user/hive/warehouse/bronze.db/fbref_player_stats-abc123' in deleted_paths
-                assert '/user/hive/warehouse/bronze.db/fbref_player_stats-def456' in deleted_paths
-
-    def test_clean_hdfs_skips_nonexistent_schema_dir(self):
-        """_clean_hdfs_table_dir does nothing if schema dir doesn't exist."""
-        with patch.dict('sys.modules', {'trino': MagicMock(), 'trino.dbapi': MagicMock()}):
-            from scrapers.base.iceberg_writer import IcebergWriter
-            writer = IcebergWriter()
-
-            mock_hdfs = MagicMock()
-            mock_hdfs.exists.return_value = False
-
-            with patch('scrapers.base.hdfs_client.HDFSClient', return_value=mock_hdfs):
-                writer._clean_hdfs_table_dir('bronze', 'fbref_player_stats')
-
-                mock_hdfs.delete.assert_not_called()
-                mock_hdfs.list_dir.assert_not_called()
-
-    def test_clean_hdfs_failure_does_not_raise(self):
-        """_clean_hdfs_table_dir logs warning but does not raise on HDFS errors."""
-        with patch.dict('sys.modules', {'trino': MagicMock(), 'trino.dbapi': MagicMock()}):
-            from scrapers.base.iceberg_writer import IcebergWriter
-            writer = IcebergWriter()
-
-            with patch('scrapers.base.hdfs_client.HDFSClient', side_effect=ConnectionError("HDFS down")):
-                # Should not raise — best-effort cleanup
-                writer._clean_hdfs_table_dir('bronze', 'fbref_player_stats')
+            # Must not raise — no HDFS/S3 dependency remains.
+            writer._clean_hdfs_table_dir('bronze', 'fbref_player_stats')
 
 
 class TestIcebergWriterReadOperations:

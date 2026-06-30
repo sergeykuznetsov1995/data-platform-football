@@ -2,7 +2,7 @@
 # Data Platform - Makefile
 # =============================================================================
 
-.PHONY: help build up up-lite up-full up-build down restart logs ps clean health test-trino init-hdfs init-storage shell-airflow shell-trino test-fbref-curl test-fbref-nodriver test-fbref-full test-proxy-stats up-bi up-catalog down-bi down-catalog superset-init superset-import superset-dashboards om-ingest-trino om-lineage-trino om-apply-descriptions om-cleanup-lineage logs-superset logs-om shell-superset shell-om
+.PHONY: help build up up-lite up-full up-build down restart logs ps clean health test-trino bootstrap-catalog render-secrets init-storage shell-airflow shell-trino test-fbref-curl test-fbref-nodriver test-fbref-full test-proxy-stats up-bi up-catalog down-bi down-catalog superset-init superset-import superset-dashboards om-ingest-trino om-lineage-trino om-apply-descriptions om-cleanup-lineage logs-superset logs-om shell-superset shell-om
 
 # Default target
 help:
@@ -19,8 +19,8 @@ help:
 	@echo "  make clean        - Remove all containers and volumes"
 	@echo "  make health       - Check health of all services"
 	@echo ""
-	@echo "  make init-hdfs    - Initialize HDFS Medallion directories (legacy)"
-	@echo "  make init-storage - Initialize HDFS + Hive schemas (recommended)"
+	@echo "  make bootstrap-catalog - Bootstrap Lakekeeper + create warehouse (run once)"
+	@echo "  make init-storage - Create Iceberg schemas bronze/silver/gold"
 	@echo "  make test-trino   - Run Trino integration test"
 	@echo ""
 	@echo "  make shell-airflow - Open shell in Airflow webserver"
@@ -108,14 +108,17 @@ clean:
 health:
 	@echo "Checking service health..."
 	@echo ""
-	@echo "=== HDFS NameNode ==="
-	@curl -sf http://localhost:9870/ > /dev/null && echo "OK: http://localhost:9870" || echo "FAIL: NameNode not responding"
+	@echo "=== SeaweedFS (S3) ==="
+	@curl -sf http://localhost:8333/status > /dev/null && echo "OK: http://localhost:8333" || echo "FAIL: SeaweedFS not responding"
+	@echo ""
+	@echo "=== Lakekeeper (Iceberg REST catalog) ==="
+	@curl -sf http://localhost:8181/health > /dev/null && echo "OK: http://localhost:8181" || echo "FAIL: Lakekeeper not responding"
 	@echo ""
 	@echo "=== Airflow ==="
 	@curl -sf http://localhost:8081/health > /dev/null && echo "OK: http://localhost:8081" || echo "FAIL: Airflow not responding"
 	@echo ""
 	@echo "=== Trino ==="
-	@curl -sf http://localhost:8082/v1/info > /dev/null && echo "OK: http://localhost:8082" || echo "FAIL: Trino not responding"
+	@curl -sf -k https://localhost:8082/v1/info > /dev/null && echo "OK: https://localhost:8082" || echo "FAIL: Trino not responding"
 	@echo ""
 	@echo "=== PostgreSQL ==="
 	@docker compose exec -T postgres pg_isready -U postgres > /dev/null && echo "OK: PostgreSQL ready" || echo "FAIL: PostgreSQL not ready"
@@ -123,14 +126,34 @@ health:
 	@echo "=== Redis ==="
 	@docker compose exec -T redis redis-cli -a redis123 ping 2>/dev/null | grep -q PONG && echo "OK: Redis ready" || echo "FAIL: Redis not ready"
 
-# Initialize HDFS directories (legacy - uses shell script)
-init-hdfs:
-	@echo "Initializing HDFS Medallion directories..."
-	docker compose exec namenode /usr/local/bin/init-medallion.sh
+# Bootstrap Lakekeeper (accept terms) and create the `football` warehouse with
+# the SeaweedFS S3 storage profile. Idempotent-ish: re-running is harmless
+# (bootstrap returns 4xx once done; warehouse create returns 409 if it exists).
+# S3 keys are read from .env and substituted into configs/lakekeeper/warehouse.json.
+bootstrap-catalog:
+	@echo "Bootstrapping Lakekeeper..."
+	@curl -sf -X POST http://localhost:8181/management/v1/bootstrap \
+		-H 'Content-Type: application/json' \
+		--data '{"accept-terms-of-use": true}' >/dev/null 2>&1 && echo "  bootstrap OK" || echo "  bootstrap already done (or returned non-2xx)"
+	@echo "Creating warehouse 'football'..."
+	@S3_KEY=$$(grep -E '^S3_ACCESS_KEY=' .env | cut -d= -f2); \
+	 S3_SECRET=$$(grep -E '^S3_SECRET_KEY=' .env | cut -d= -f2); \
+	 sed -e "s|__S3_ACCESS_KEY__|$$S3_KEY|" -e "s|__S3_SECRET_KEY__|$$S3_SECRET|" configs/lakekeeper/warehouse.json \
+	 | curl -sf -X POST http://localhost:8181/management/v1/warehouse \
+		-H 'Content-Type: application/json' --data @- >/dev/null 2>&1 \
+		&& echo "  warehouse 'football' created" || echo "  warehouse exists or create returned non-2xx"
 
-# Initialize storage (HDFS + Hive schemas via Python)
+# Render the SeaweedFS S3 credentials file from .env (gitignored secret).
+render-secrets:
+	@S3_KEY=$$(grep -E '^S3_ACCESS_KEY=' .env | cut -d= -f2); \
+	 S3_SECRET=$$(grep -E '^S3_SECRET_KEY=' .env | cut -d= -f2); \
+	 sed -e "s|<S3_ACCESS_KEY>|$$S3_KEY|" -e "s|<S3_SECRET_KEY>|$$S3_SECRET|" \
+	     configs/seaweedfs/s3.config.json.example > configs/seaweedfs/s3.config.json; \
+	 echo "rendered configs/seaweedfs/s3.config.json from .env"
+
+# Initialize storage — create Iceberg schemas bronze/silver/gold (run after bootstrap-catalog)
 init-storage:
-	@echo "Initializing storage (HDFS directories + Hive schemas)..."
+	@echo "Creating Iceberg schemas (bronze/silver/gold)..."
 	docker compose exec airflow-scheduler python /opt/airflow/scripts/init_storage.py
 
 # Test Trino
@@ -138,8 +161,8 @@ test-trino:
 	@echo "Testing Trino connectivity..."
 	@docker compose exec trino trino --execute "SHOW CATALOGS"
 	@echo ""
-	@echo "Testing Hive catalog..."
-	@docker compose exec trino trino --execute "SHOW SCHEMAS FROM hive"
+	@echo "Testing iceberg catalog..."
+	@docker compose exec trino trino --execute "SHOW SCHEMAS FROM iceberg"
 	@echo ""
 	@echo "Trino integration test completed!"
 
@@ -150,13 +173,11 @@ shell-airflow:
 shell-trino:
 	docker compose exec trino /bin/bash
 
-shell-namenode:
-	docker compose exec namenode /bin/bash
-
 # Show Web UI URLs
 urls:
 	@echo "Web UI URLs:"
-	@echo "  HDFS NameNode:  http://localhost:9870"
+	@echo "  SeaweedFS (S3): http://localhost:8333"
+	@echo "  Lakekeeper:     http://localhost:8181"
 	@echo "  Airflow:        http://localhost:8081 (admin/admin)"
 	@echo "  Trino:          http://localhost:8082"
 	@echo "  Superset:       http://localhost:8088"

@@ -1,7 +1,7 @@
 #!/bin/bash
 # =============================================================================
 # Data Platform - PostgreSQL Initialization Script
-# Creates databases and users for Airflow, Hive Metastore, Superset, OpenMetadata
+# Creates databases and users for Airflow, Lakekeeper, Superset, OpenMetadata
 # Idempotent: safe to re-run; checks existence before creating users/databases.
 # =============================================================================
 
@@ -13,8 +13,8 @@ if [ -z "$AIRFLOW_DB_PASSWORD" ]; then
     exit 1
 fi
 
-if [ -z "$HIVE_METASTORE_DB_PASSWORD" ]; then
-    echo "ERROR: HIVE_METASTORE_DB_PASSWORD environment variable is required"
+if [ -z "$LAKEKEEPER_DB_PASSWORD" ]; then
+    echo "ERROR: LAKEKEEPER_DB_PASSWORD environment variable is required"
     exit 1
 fi
 
@@ -42,18 +42,18 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<-E
     GRANT ALL PRIVILEGES ON DATABASE airflow TO airflow;
 EOSQL
 
-echo "Creating Hive Metastore database and user (idempotent)..."
+echo "Creating Lakekeeper database and user (idempotent)..."
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<-EOSQL
     DO \$\$
     BEGIN
-        IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'hive') THEN
-            CREATE USER hive WITH PASSWORD '${HIVE_METASTORE_DB_PASSWORD}';
+        IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'lakekeeper') THEN
+            CREATE USER lakekeeper WITH PASSWORD '${LAKEKEEPER_DB_PASSWORD}';
         END IF;
     END
     \$\$;
-    SELECT 'CREATE DATABASE hive_metastore OWNER hive'
-    WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = 'hive_metastore')\gexec
-    GRANT ALL PRIVILEGES ON DATABASE hive_metastore TO hive;
+    SELECT 'CREATE DATABASE lakekeeper OWNER lakekeeper'
+    WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = 'lakekeeper')\gexec
+    GRANT ALL PRIVILEGES ON DATABASE lakekeeper TO lakekeeper;
 EOSQL
 
 echo "Creating Superset database and user (idempotent)..."
@@ -91,11 +91,11 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "airflow" <<-EOSQL
     ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON SEQUENCES TO airflow;
 EOSQL
 
-echo "Granting schema permissions for Hive..."
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "hive_metastore" <<-EOSQL
-    GRANT ALL ON SCHEMA public TO hive;
-    ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO hive;
-    ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON SEQUENCES TO hive;
+echo "Granting schema permissions for Lakekeeper..."
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "lakekeeper" <<-EOSQL
+    GRANT ALL ON SCHEMA public TO lakekeeper;
+    ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO lakekeeper;
+    ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON SEQUENCES TO lakekeeper;
 EOSQL
 
 echo "Granting schema permissions for Superset..."
@@ -113,5 +113,5 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "openmetadata" <<-E
 EOSQL
 
 echo "Database initialization complete!"
-echo "Created databases: airflow, hive_metastore, superset, openmetadata"
-echo "Created users: airflow, hive, superset, openmetadata"
+echo "Created databases: airflow, lakekeeper, superset, openmetadata"
+echo "Created users: airflow, lakekeeper, superset, openmetadata"

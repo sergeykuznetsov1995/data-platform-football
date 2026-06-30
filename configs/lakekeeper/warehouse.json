@@ -1,0 +1,20 @@
+{
+  "warehouse-name": "football",
+  "project-id": "00000000-0000-0000-0000-000000000000",
+  "storage-profile": {
+    "type": "s3",
+    "bucket": "football",
+    "key-prefix": "warehouse",
+    "endpoint": "http://seaweedfs:8333",
+    "region": "us-east-1",
+    "path-style-access": true,
+    "flavor": "s3-compat",
+    "sts-enabled": false
+  },
+  "storage-credential": {
+    "type": "s3",
+    "credential-type": "access-key",
+    "access-key-id": "__S3_ACCESS_KEY__",
+    "secret-access-key": "__S3_SECRET_KEY__"
+  }
+}
