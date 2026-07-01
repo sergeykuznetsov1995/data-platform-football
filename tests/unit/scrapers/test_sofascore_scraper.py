@@ -623,8 +623,12 @@ class TestMatchStatsFlatten:
                                 {
                                     'name': 'Total shots',
                                     'key': 'totalShotsOnGoal',
-                                    'home': '14',
-                                    'away': '7',
+                                    # #840: SofaScore sends `home`/`away` as a
+                                    # JSON *number* for count/decimal stats (not
+                                    # a string) — reproduce that heterogeneity so
+                                    # the str-pinning is exercised.
+                                    'home': 14,
+                                    'away': 7,
                                     'homeValue': 14,
                                     'awayValue': 7,
                                     'compareCode': 1,
@@ -633,8 +637,8 @@ class TestMatchStatsFlatten:
                                 {
                                     'name': 'Expected goals',
                                     'key': 'expectedGoals',
-                                    'home': '1.8',
-                                    'away': '0.6',
+                                    'home': 1.8,
+                                    'away': 0.6,
                                     'homeValue': 1.8,
                                     'awayValue': 0.6,
                                     'compareCode': 1,
@@ -703,6 +707,16 @@ class TestMatchStatsFlatten:
         )
         assert bp_1st['home_value'] == 58
 
+        # #840: `home`/`away` are display text — ALWAYS str, even when SofaScore
+        # sent a JSON number (count/decimal stats). Numeric-source values are
+        # stringified ('14', '1.8'), not upcast, so the Bronze column is a stable
+        # varchar the PyArrow->Iceberg writer can serialize.
+        ts = next(r for r in rows if r['name'] == 'Total shots')
+        assert ts['home'] == '14' and isinstance(ts['home'], str)
+        assert xg['home'] == '1.8' and isinstance(xg['home'], str)
+        assert all(isinstance(r['home'], str) for r in rows)
+        assert all(isinstance(r['away'], str) for r in rows)
+
     def test_flatten_handles_garbage(self):
         from scrapers.sofascore.scraper import SofaScoreScraper
         assert SofaScoreScraper._flatten_match_stats('1', None) == []
@@ -712,6 +726,29 @@ class TestMatchStatsFlatten:
         assert SofaScoreScraper._flatten_match_stats(
             '1', {'statistics': [{'period': 'ALL'}]}
         ) == []
+
+    def test_home_away_are_iceberg_serializable(self):
+        """#840 regression (found in live e2e): SofaScore's `home`/`away` are
+        heterogeneous JSON — str '55%' for percent, int 14 for count, float 1.8
+        for decimal. Left raw, _coerce_scalar upcast the numeric ones while the
+        percent stayed str, yielding a mixed int/float/str object column that
+        crashed the PyArrow->Iceberg writer ("Expected bytes, got a 'float'").
+        Pinning them to str keeps the Bronze column a single-type varchar.
+        """
+        import pandas as pd
+
+        from scrapers.sofascore.scraper import SofaScoreScraper
+
+        df = pd.DataFrame(
+            SofaScoreScraper._flatten_match_stats('m', self._payload())
+        )
+        for col in ('home', 'away'):
+            types = {type(v).__name__ for v in df[col].dropna()}
+            assert types == {'str'}, f"{col} has mixed types: {types}"
+
+        # The exact prod failure path: pandas -> Arrow must not raise.
+        pa = pytest.importorskip('pyarrow')
+        pa.Table.from_pandas(df, preserve_index=False)
 
 
 class TestPlayerSeasonStatsFlatten:

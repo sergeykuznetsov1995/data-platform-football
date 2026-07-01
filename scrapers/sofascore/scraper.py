@@ -1988,6 +1988,19 @@ class SofaScoreScraper(SoccerdataScraper):
                         'period': str(period),
                         'stat_group': stat_group,
                     }
+                    # #840: home/away are SofaScore *display* strings — "55%",
+                    # "3 (1)", "91.6 km", "2.61" — heterogeneous units across
+                    # stats. Pin them to str BEFORE _auto_flatten (whose
+                    # `if col in out: continue` then leaves them untouched) so the
+                    # Bronze column stays a stable varchar. Otherwise _coerce_scalar
+                    # upcasts the numeric-looking ones (int/float) while "55%" stays
+                    # str, yielding a mixed-type object column that the PyArrow ->
+                    # Iceberg writer cannot serialize. Numeric canonicals live in
+                    # home_value/away_value (clean doubles); Silver maps
+                    # home_text<-home, away_text<-away.
+                    for _disp in ('home', 'away'):
+                        if item.get(_disp) is not None:
+                            row[_disp] = str(item[_disp])
                     _auto_flatten(item, row)
                     rows.append(row)
 
