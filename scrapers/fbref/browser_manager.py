@@ -605,6 +605,78 @@ class FBrefBrowserMixin:
         except Exception:
             pass
 
+    # ------------------------------------------------------------------
+    # Camoufox transport (#CF-2026-07) — Turnstile bypass via anti-detect FF
+    # ------------------------------------------------------------------
+
+    def _camoufox_proxy_provider(self):
+        """Zero-arg callable yielding a Playwright proxy dict from the proxy
+        manager (rotates each call), or None when no proxy is configured."""
+        def _next():
+            if self._proxy_manager and self._proxy_manager.total_count > 0:
+                p = self._proxy_manager.get_proxy()
+                if p:
+                    self._current_proxy_obj = p
+                    return {
+                        "server": f"http://{p.host}:{p.port}",
+                        "username": p.username,
+                        "password": p.password,
+                    }
+            if self.proxy:
+                return {"server": self.proxy}
+            return None
+        return _next
+
+    def _get_camoufox_transport(self):
+        """Lazily build the warm CamoufoxFbrefTransport (one Firefox session
+        reused across the whole scrape; cf_clearance persists across pages)."""
+        if self._camoufox_transport is None:
+            from scrapers.fbref.camoufox_fetch import CamoufoxFbrefTransport
+            self._camoufox_transport = CamoufoxFbrefTransport(
+                proxy_provider=self._camoufox_proxy_provider(),
+                geoip=True,
+                headless=getattr(self, 'headless', True),
+                humanize=True,
+                block_resources=True,
+            )
+        return self._camoufox_transport
+
+    def _fetch_page_camoufox(
+        self, url: str, use_cache: bool = True, page_type: str = 'other'
+    ) -> Optional[str]:
+        """Fetch one FBref page via Camoufox (Turnstile solve + resource block).
+
+        Mirrors _fetch_page's caching, rate-limiting and stats bookkeeping so
+        the traffic guard / diagnostics see the same keys as the nodriver path.
+        """
+        self._rate_limiter.acquire()
+        transport = self._get_camoufox_transport()
+        html = transport.fetch(url)
+
+        # Merge transport proxy-byte + CF counters into _stats regardless of
+        # outcome (a failed page still cost bytes / a CF attempt).
+        ts = transport.traffic_stats()
+        self._stats['real_bytes_downloaded'] = ts['real_bytes_downloaded']
+        self._stats['real_requests_count'] = ts['real_requests_count']
+        self._stats['real_bytes_by_resource_type'] = ts['real_bytes_by_resource_type']
+        self._stats['cf_challenge_attempts'] = ts['cf_challenge_attempts']
+        self._stats['cf_challenges_passed'] = ts['cf_challenges_passed']
+        self._stats['cf_challenges_failed'] = ts['cf_challenges_failed']
+
+        if not html:
+            self._stats['failures'] = self._stats.get('failures', 0) + 1
+            self._consecutive_fetch_failures += 1
+            logger.warning(f"Camoufox transport returned no HTML for {url}")
+            return None
+
+        self._consecutive_fetch_failures = 0
+        self._stats['successes'] = self._stats.get('successes', 0) + 1
+        if use_cache:
+            self._page_cache[url] = html
+            self._manage_cache_size()
+        self._track_download(len(html), page_type)
+        return html
+
     def _fetch_page(self, url: str, use_cache: bool = True, page_type: str = 'other') -> Optional[str]:
         """
         Fetch page HTML with caching support.
@@ -623,6 +695,13 @@ class FBrefBrowserMixin:
         if use_cache and url in self._page_cache:
             logger.debug(f"Using cached page: {url}")
             return self._page_cache[url]
+
+        # Camoufox transport (#CF-2026-07): the whole nodriver + curl_cffi
+        # fast-path below is dead against fbref's current Cloudflare managed
+        # interstitial. When FBREF_TRANSPORT=camoufox, fetch through the
+        # anti-detect Firefox Turnstile solver instead.
+        if getattr(self, 'fbref_transport', 'nodriver') == 'camoufox':
+            return self._fetch_page_camoufox(url, use_cache, page_type)
 
         from scrapers.base.browser.nodriver_bypass import SlowProxyError
 
@@ -1071,4 +1150,12 @@ class FBrefBrowserMixin:
     def _close_all(self) -> None:
         """Close browser AND shared Xvfb (final cleanup)."""
         self._close_browser()
+        # Camoufox transport is a warm session that lives for the whole scrape
+        # (it rotates proxies internally); tear it down only at final cleanup.
+        if getattr(self, '_camoufox_transport', None) is not None:
+            try:
+                self._camoufox_transport.close()
+            except Exception as e:  # noqa: BLE001 — teardown is best-effort
+                logger.warning(f"Error closing Camoufox transport: {e}")
+            self._camoufox_transport = None
         self._stop_shared_xvfb()
