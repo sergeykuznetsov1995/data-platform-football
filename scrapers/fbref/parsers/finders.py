@@ -982,6 +982,80 @@ def parse_player_match_stats_tables(
     return combined
 
 
+# ------------------------------------------------------------------
+# Keeper match stats (per-match goalkeeper stats from keeper_stats tables)
+# ------------------------------------------------------------------
+
+def parse_keeper_match_stats_tables(
+    soup: BeautifulSoup,
+    comment_tables: Dict[str, BeautifulSoup],
+) -> Optional[pd.DataFrame]:
+    """
+    Parse goalkeeper match stats from ``keeper_stats_{team_id}`` tables.
+
+    FBref match pages contain one goalkeeper table per team. Post the
+    Apr-2026 FBref restriction the advanced columns (PSxG, launches,
+    sweeper) are gone, but the basic ones (SoTA, GA, Saves, Save%) are
+    still populated — verified on a 2026-05-24 match page.
+
+    Returns a combined DataFrame with ``team_side`` ('home'/'away')
+    and ``team`` columns, mirroring parse_player_match_stats_tables.
+    """
+    team_names = _extract_team_names_from_scorebox(soup)
+
+    seen_ids: set = set()
+    keeper_ids: list = []
+
+    for table in soup.find_all('table'):
+        table_id = table.get('id', '')
+        if table_id and 'keeper_stats' in table_id:
+            if table_id not in seen_ids:
+                seen_ids.add(table_id)
+                keeper_ids.append(table_id)
+
+    if comment_tables:
+        for table_id in comment_tables:
+            if 'keeper_stats' in table_id:
+                if table_id not in seen_ids:
+                    seen_ids.add(table_id)
+                    keeper_ids.append(table_id)
+
+    if not keeper_ids:
+        logger.debug("No keeper_stats_* tables found for keeper match stats")
+        return None
+
+    all_dfs = []
+    for table_id in keeper_ids:
+        df = parse_table(soup, table_id, comment_tables, extract_player_ids=True)
+        if df is not None and not df.empty:
+            all_dfs.append(df)
+
+    if not all_dfs:
+        logger.debug("keeper_stats_* tables found but all empty")
+        return None
+
+    sides = ['home', 'away']
+    team_list = [team_names.get('home', ''), team_names.get('away', '')]
+
+    result_dfs = []
+    for i, df in enumerate(all_dfs):
+        df = df.copy()
+        df['team_side'] = sides[i] if i < len(sides) else f'team_{i + 1}'
+        df['team'] = team_list[i] if i < len(team_list) else ''
+        result_dfs.append(df)
+
+    combined = pd.concat(result_dfs, ignore_index=True)
+
+    if combined.empty:
+        return None
+
+    logger.debug(
+        f"Parsed {len(combined)} keeper match stats rows "
+        f"from {len(all_dfs)} keeper tables"
+    )
+    return combined
+
+
 # Match scorebox label "Manager:" / "Manager :" / "MANAGER:" etc.
 # FBref's current scorebox renders the label as
 # ``<div class="datapoint"><strong>Manager</strong>: Name</div>`` —

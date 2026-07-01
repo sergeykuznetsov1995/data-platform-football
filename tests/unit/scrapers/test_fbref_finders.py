@@ -936,3 +936,110 @@ class TestParsePlayerMatchStatsTables:
         assert df is not None
         assert len(df) == 1
         assert df.iloc[0]['team_side'] == 'home'
+
+
+# ===========================================================================
+# TestParseKeeperMatchStatsTables
+# ===========================================================================
+
+# Mirrors the real post-Apr-2026 keeper_stats_{team_id} structure: an
+# over_header row ("Shot Stopping"), player name in a <th data-stat="player">
+# with a /en/players/{id}/ link, basic GK columns only (no PSxG/launches).
+# Home table lives in the DOM, away table inside an HTML comment — both
+# discovery paths must work.
+_KEEPER_TABLE_TMPL = """
+<table id="keeper_stats_{tid}">
+  <thead>
+    <tr class="over_header">
+      <th colspan="3"></th>
+      <th colspan="4" data-stat="header_gk_shot_stopping">Shot Stopping</th>
+    </tr>
+    <tr>
+      <th data-stat="player">Player</th>
+      <th data-stat="age">Age</th>
+      <th data-stat="minutes">Min</th>
+      <th data-stat="gk_shots_on_target_against">SoTA</th>
+      <th data-stat="gk_goals_against">GA</th>
+      <th data-stat="gk_saves">Saves</th>
+      <th data-stat="gk_save_pct">Save%</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <th data-stat="player" data-append-csv="{pid}">
+        <a href="/en/players/{pid}/">{name}</a></th>
+      <td data-stat="age">23-127</td>
+      <td data-stat="minutes">90</td>
+      <td data-stat="gk_shots_on_target_against">{sota}</td>
+      <td data-stat="gk_goals_against">{ga}</td>
+      <td data-stat="gk_saves">{saves}</td>
+      <td data-stat="gk_save_pct">{pct}</td>
+    </tr>
+  </tbody>
+</table>
+"""
+
+KEEPER_MATCH_HTML = (
+    '<html><body>'
+    '<div class="scorebox">'
+    '<div><strong><a href="/en/squads/8ef52968/Sunderland">Sunderland</a></strong></div>'
+    '<div><strong><a href="/en/squads/cff3d9bb/Chelsea">Chelsea</a></strong></div>'
+    '</div>'
+    + _KEEPER_TABLE_TMPL.format(
+        tid='8ef52968', pid='349fa918', name='Robin Roefs',
+        sota='3', ga='1', saves='2', pct='66.7',
+    )
+    + '<!--'
+    + _KEEPER_TABLE_TMPL.format(
+        tid='cff3d9bb', pid='58b1b5b6', name='Robert Sanchez',
+        sota='7', ga='2', saves='5', pct='71.4',
+    )
+    + '-->'
+    '</body></html>'
+)
+
+
+class TestParseKeeperMatchStatsTables:
+    """parse_keeper_match_stats_tables — per-match GK tables."""
+
+    def _parse(self):
+        from scrapers.fbref.parsers.finders import parse_keeper_match_stats_tables
+        from scrapers.fbref.parsers.table_parser import extract_tables_from_comments
+
+        soup = BeautifulSoup(KEEPER_MATCH_HTML, 'html.parser')
+        comment_tables = extract_tables_from_comments(soup)
+        return parse_keeper_match_stats_tables(soup, comment_tables)
+
+    @pytest.mark.unit
+    def test_both_tables_parsed_dom_and_comment(self):
+        df = self._parse()
+        assert df is not None
+        assert len(df) == 2
+
+    @pytest.mark.unit
+    def test_team_side_assignment(self):
+        df = self._parse()
+        assert list(df['team_side']) == ['home', 'away']
+        assert list(df['team']) == ['Sunderland', 'Chelsea']
+
+    @pytest.mark.unit
+    def test_player_ids_extracted(self):
+        df = self._parse()
+        assert set(df['player_id']) == {'349fa918', '58b1b5b6'}
+
+    @pytest.mark.unit
+    def test_basic_gk_values_present(self):
+        df = self._parse()
+        sota_cols = [c for c in df.columns if 'SoTA' in str(c)]
+        saves_cols = [c for c in df.columns if 'Saves' in str(c)]
+        assert sota_cols and saves_cols
+        assert [str(v) for v in df[sota_cols[0]]] == ['3', '7']
+        assert [str(v) for v in df[saves_cols[0]]] == ['2', '5']
+
+    @pytest.mark.unit
+    def test_no_keeper_tables_returns_none(self):
+        from scrapers.fbref.parsers.finders import parse_keeper_match_stats_tables
+
+        soup = BeautifulSoup('<html><body><p>no tables</p></body></html>',
+                             'html.parser')
+        assert parse_keeper_match_stats_tables(soup, {}) is None
