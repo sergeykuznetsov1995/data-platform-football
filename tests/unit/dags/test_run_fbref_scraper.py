@@ -422,3 +422,79 @@ class TestSingleStatReplaceGuard:
 
         assert rc == 0
         assert scraper.scrape_single_stat_type.call_args.kwargs['force_replace'] is True
+
+
+class TestNodriverUnsupportedMode:
+    """Nodriver branch must reject modes it does not implement (footgun fix).
+
+    Before the fix, --scraper-type nodriver --mode combined_match_data fell
+    through into the 'full' else-branch and silently ran a full season scrape.
+    """
+
+    @pytest.fixture
+    def temp_output_file(self):
+        fd, path = tempfile.mkstemp(suffix='.json')
+        os.close(fd)
+        yield path
+        if os.path.exists(path):
+            os.unlink(path)
+
+    def _run(self, mock_scraper_class, args: list) -> int:
+        sys.argv = ['run_fbref_scraper.py'] + args
+        with patch(
+            'scrapers.nodriver_fbref.NodriverFBrefScraper', mock_scraper_class
+        ):
+            import importlib
+            import dags.scripts.run_fbref_scraper as scraper_module
+            importlib.reload(scraper_module)
+            return scraper_module.main()
+
+    @pytest.mark.unit
+    def test_combined_match_data_exits_2_without_scraping(self, temp_output_file):
+        """nodriver + combined_match_data → exit 2, scrape_all NOT called."""
+        scraper = MagicMock()
+        scraper.__enter__ = MagicMock(return_value=scraper)
+        scraper.__exit__ = MagicMock(return_value=False)
+        mock_class = MagicMock(return_value=scraper)
+
+        with pytest.raises(SystemExit) as exc:
+            self._run(mock_class, [
+                '--scraper-type', 'nodriver',
+                '--mode', 'combined_match_data',
+                '--leagues', 'ENG-Premier League',
+                '--season', '2024',
+                '--output', temp_output_file,
+            ])
+
+        assert exc.value.code == 2
+        scraper.scrape_all.assert_not_called()
+        mock_class.assert_not_called()
+
+        with open(temp_output_file) as f:
+            result = json.load(f)
+        assert any('not supported by the nodriver scraper' in e
+                   for e in result['errors'])
+
+    @pytest.mark.unit
+    def test_full_mode_still_runs_scrape_all(self, temp_output_file):
+        """Regression: explicit 'full' mode still reaches scrape_all."""
+        scraper = MagicMock()
+        scraper.__enter__ = MagicMock(return_value=scraper)
+        scraper.__exit__ = MagicMock(return_value=False)
+        scraper.scrape_all.return_value = {
+            'schedule': 'iceberg.bronze.fbref_schedule'
+        }
+        scraper._stats = {'successes': 1, 'failures': 0}
+        scraper.get_stats.return_value = scraper._stats
+        mock_class = MagicMock(return_value=scraper)
+
+        rc = self._run(mock_class, [
+            '--scraper-type', 'nodriver',
+            '--mode', 'full',
+            '--leagues', 'ENG-Premier League',
+            '--season', '2024',
+            '--output', temp_output_file,
+        ])
+
+        assert rc in (0, None)
+        scraper.scrape_all.assert_called_once()

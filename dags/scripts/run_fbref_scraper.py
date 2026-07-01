@@ -499,6 +499,22 @@ def main():
     # Nodriver scraper (recommended, Cloudflare Turnstile bypass)
     # ==========================================================================
     if args.scraper_type == 'nodriver':
+        # Modes NOT in this set (e.g. combined_match_data) used to fall through
+        # into the 'full' else-branch and silently run a full season scrape —
+        # wrong tables and a lot of wasted proxy MB. Fail loudly instead.
+        _NODRIVER_MODES = {'single_stat', 'match_data', 'full'}
+        if args.mode not in _NODRIVER_MODES:
+            error_msg = (
+                f"Mode '{args.mode}' is not supported by the nodriver scraper "
+                f"(supported: {sorted(_NODRIVER_MODES)}). "
+                f"Use --scraper-type selenium for this mode."
+            )
+            logger.error(error_msg)
+            results['errors'].append(error_msg)
+            with open(args.output, 'w') as f:
+                json.dump(results, f)
+            sys.exit(2)
+
         logger.info("Using nodriver scraper (Cloudflare Turnstile bypass)")
         logger.info(f"Headless: {args.headless}, use_xvfb: {args.use_xvfb}")
         logger.info(f"Cloudflare wait: {args.cloudflare_wait}s, cf-verify retries: {args.cf_verify_retries}")
@@ -623,7 +639,7 @@ def main():
                 # =============================================================
                 # MODE: full (not recommended for nodriver - use single_stat)
                 # =============================================================
-                else:  # mode == 'full'
+                elif args.mode == 'full':
                     logger.info(
                         "Full mode with nodriver: sequential collection "
                         "(schedule → player → team → keeper stats)"
