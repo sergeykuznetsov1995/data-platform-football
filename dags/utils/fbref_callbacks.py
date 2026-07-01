@@ -210,6 +210,12 @@ def check_traffic_guard(
         return {'status': 'unreadable', 'label': label, 'real_proxy_mb': None}
 
     real_mb = float(summary.get('real_proxy_mb') or 0.0)
+    # HTTP fast-path bytes (curl_cffi after CF bypass) go through the SAME
+    # paid residential proxy but are tracked separately from the browser's
+    # CDP counter. Guarding only real_proxy_mb left them invisible — the
+    # threshold now applies to the total.
+    http_mb = float(summary.get('http_mb_downloaded') or 0.0)
+    total_mb = real_mb + http_mb
     requests = int(summary.get('real_proxy_requests') or 0)
     # `matches_successes` only exists in combined_match_data summaries;
     # other modes ship `successes` instead. Fall back to either.
@@ -228,6 +234,8 @@ def check_traffic_guard(
     ti = context.get('ti') or context.get('task_instance')
     if ti is not None:
         ti.xcom_push(key='real_proxy_mb', value=real_mb)
+        ti.xcom_push(key='http_mb', value=http_mb)
+        ti.xcom_push(key='total_proxy_mb', value=total_mb)
         ti.xcom_push(key='real_proxy_requests', value=requests)
         ti.xcom_push(key='matches_scraped', value=successes)
         ti.xcom_push(key='cf_challenge_attempts', value=cf_attempts)
@@ -250,14 +258,16 @@ def check_traffic_guard(
 
     logger.info(
         f"Traffic guard [{label}]: real_proxy_mb={real_mb:.2f}, "
+        f"http_mb={http_mb:.2f}, total_mb={total_mb:.2f}, "
         f"requests={requests}, successes={successes}, "
         f"cf_attempts={cf_attempts}/passed={cf_passed}/failed={cf_failed}, "
         f"restarts={dict(restart_reasons)}, threshold={threshold_mb:.2f} MB"
     )
 
-    if real_mb > threshold_mb:
+    if total_mb > threshold_mb:
         raise AirflowException(
-            f"Proxy traffic {real_mb:.2f} MB for {label} exceeded threshold "
+            f"Proxy traffic {total_mb:.2f} MB (browser {real_mb:.2f} + "
+            f"http fast-path {http_mb:.2f}) for {label} exceeded threshold "
             f"{threshold_mb:.2f} MB. Review Airflow Variable "
             f"`{per_task_var}` or `{threshold_variable}`, or investigate "
             f"the run."
@@ -267,6 +277,8 @@ def check_traffic_guard(
         'status': 'ok',
         'label': label,
         'real_proxy_mb': real_mb,
+        'http_mb': http_mb,
+        'total_proxy_mb': total_mb,
         'real_proxy_requests': requests,
         'matches_scraped': successes,
         'cf_challenge_attempts': cf_attempts,

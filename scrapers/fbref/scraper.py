@@ -163,6 +163,14 @@ class FBrefScraper(
         self._pages_fetched: int = 0  # Counter for browser restart
         self._nodriver_browser = None  # Separate instance for nodriver
 
+        # Fetch transport (#CF-2026-07): nodriver+Chromium 149 can no longer
+        # pass fbref's Cloudflare managed interstitial. FBREF_TRANSPORT=camoufox
+        # routes _fetch_page through the Camoufox (anti-detect Firefox)
+        # Turnstile solver instead; 'nodriver' (default) keeps the legacy path.
+        self.fbref_transport = os.environ.get(
+            "FBREF_TRANSPORT", "nodriver").strip().lower()
+        self._camoufox_transport = None  # lazy CamoufoxFbrefTransport
+
         # Real traffic accumulator base — preserves bytes across browser
         # restarts (each new nodriver browser resets its counter to 0).
         # Flushed in _close_browser() before browser goes away.

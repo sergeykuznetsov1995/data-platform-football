@@ -30,6 +30,11 @@ TASK_ENV = {
     'TRINO_HOST': os.environ.get('TRINO_HOST', 'trino'),
     'TRINO_PORT': os.environ.get('TRINO_PORT', '8443'),
     'TRINO_PASSWORD': os.environ.get('TRINO_PASSWORD', ''),
+    # #CF-2026-07: nodriver+Chromium 149 can no longer pass fbref's Cloudflare
+    # managed interstitial. Route FBrefScraper._fetch_page through the Camoufox
+    # (anti-detect Firefox) Turnstile solver. Overridable per-deploy; unset
+    # (or =nodriver) reverts to the legacy path.
+    'FBREF_TRANSPORT': os.environ.get('FBREF_TRANSPORT', 'camoufox'),
 }
 
 
@@ -133,6 +138,8 @@ def _build_selenium_command(
             f'--mode combined_match_data \\\n'
             f'    --max-matches {max_matches}'
         )
+    elif mode == 'combined_season_stats':
+        mode_args = '--mode combined_season_stats'
 
     return f"""
 cd /opt/airflow && \\
@@ -389,6 +396,72 @@ def create_combined_match_data_task(
         env=TASK_ENV,
         append_env=True,
         execution_timeout=timedelta(hours=4),
+    )
+
+
+def create_combined_season_stats_task(
+    leagues_str: str,
+    season: int,
+    use_xvfb: bool = True,
+    headless: bool = True,
+    use_nodriver: bool = True,
+    nodriver_cloudflare_wait: float = 30.0,
+    proxy_file: str | None = None,
+) -> BashOperator:
+    """
+    Create a BashOperator task for ALL season stats in one pass.
+
+    Replaces the nine sequential single_stat tasks (player x4, team x4,
+    keeper x1). Player and team stats share the same season page for
+    stats/shooting/misc, so one process fetches 5 unique pages per
+    (league, season) instead of 9 — and pays for a single CF bypass
+    instead of nine (one per task process before).
+
+    Proxy traffic per league/season: ~24 MB (9 nodriver processes)
+    -> ~3.5 MB (1 CF bootstrap + 4 HTTP fast-path pages).
+
+    Args:
+        leagues_str: Comma-separated leagues string
+        season: Season year
+        use_xvfb: Use Xvfb virtual display
+        headless: Run browser in headless mode
+        use_nodriver: Use nodriver (for selenium scraper type)
+        nodriver_cloudflare_wait: Time to wait for Cloudflare challenge (seconds)
+        proxy_file: Path to file with proxy list (format: host:port:user:pass)
+
+    Returns:
+        BashOperator task
+    """
+    task_id = 'season_stats_all'
+    output_file = '/tmp/fbref_season_stats.json'
+
+    bash_command = _build_selenium_command(
+        mode='combined_season_stats',
+        leagues_str=leagues_str,
+        season=season,
+        output_file=output_file,
+        headless=headless,
+        use_xvfb=use_xvfb,
+        use_nodriver=use_nodriver,
+        nodriver_cloudflare_wait=nodriver_cloudflare_wait,
+        proxy_file=proxy_file,
+    )
+
+    # Stale per-stat success files from the pre-combined architecture would
+    # otherwise be picked up by validate_all_data (glob fbref_*.json) and
+    # mask real failures.
+    cleanup_cmd = (
+        'rm -f /tmp/fbref_player_*.json /tmp/fbref_team_*.json '
+        '/tmp/fbref_keeper_*.json'
+    )
+    bash_command = f'{cleanup_cmd} && {bash_command}'
+
+    return BashOperator(
+        task_id=task_id,
+        bash_command=bash_command,
+        env=TASK_ENV,
+        append_env=True,
+        execution_timeout=timedelta(hours=2),
     )
 
 
