@@ -29,12 +29,16 @@ class TestValidateTableFailClosed:
     @pytest.mark.unit
     def test_known_key_passes_when_rows_above_threshold(self, monkeypatch):
         mod = _load_module()
-        monkeypatch.setattr(mod, "bronze_count", lambda _t: 400)
+        # Derive the passing row count from the configured threshold so the
+        # test survives threshold re-scaling (e.g. × len(WHOSCORED_LEAGUES)).
+        threshold = mod.MIN_ROW_THRESHOLDS["whoscored_schedule"]
+        rows = threshold + 60
+        monkeypatch.setattr(mod, "bronze_count", lambda _t: rows)
 
         result = mod.validate_table("whoscored_schedule", "whoscored_schedule")
 
-        assert result["rows"] == 400
-        assert result["threshold"] == mod.MIN_ROW_THRESHOLDS["whoscored_schedule"]
+        assert result["rows"] == rows
+        assert result["threshold"] == threshold
 
     @pytest.mark.unit
     def test_missing_key_raises_instead_of_silent_pass(self, monkeypatch):

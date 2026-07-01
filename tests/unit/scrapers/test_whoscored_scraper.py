@@ -710,11 +710,30 @@ class TestEventsParser:
 
 @pytest.mark.unit
 class TestWhoScoredSeasonHelper:
+    """Mirrors soccerdata ``SeasonCode.MULTI_YEAR.parse`` for 4-digit tokens.
+
+    The DAG passes SEASONS_STR short tokens ('2122,...,2526'); legacy callers
+    pass year-start ints (2024). Both forms must land on the same bronze
+    ``season`` value — the old year-only converter mapped '2526' → '2627'
+    (nonexistent season), silently turning the daily events scrape into a
+    no-op."""
+
     @pytest.mark.parametrize('season,expected', [
+        # year-start form (legacy CLI --season)
         (2024, '2425'),
         (2023, '2324'),
         (1999, '9900'),
         (2099, '9900'),
+        (2016, '1617'),
+        # already-short YYZZ form (SEASONS_STR tokens) — passthrough
+        (2526, '2526'),
+        ('2526', '2526'),
+        (2122, '2122'),
+        (1617, '1617'),
+        # ambiguous '2021' — soccerdata resolves as the 20/21 season
+        (2021, '2021'),
+        # year whose short form is NOT consecutive → year semantics
+        (2020, '2021'),
     ])
     def test_season_to_soccerdata_str(self, season, expected):
         from scrapers.whoscored.scraper import _season_to_soccerdata_str
@@ -852,10 +871,316 @@ class TestResolvePlayerIdsFromBronze:
             'scrapers.base.trino_manager.TrinoTableManager',
             return_value=mgr_instance,
         ):
-            ids = scraper._resolve_player_ids_from_bronze(limit=5)
+            ids = scraper._resolve_player_ids_from_bronze(
+                'ENG-Premier League', '2526', limit=5,
+            )
 
         assert ids == ['355401', '355402']
         sql = mgr_instance._execute.call_args.args[0]
         assert 'CAST(CAST(player_id AS BIGINT) AS varchar)' in sql
-        assert "season IN ('2526')" in sql
+        assert "season = '2526'" in sql
+        assert "league = 'ENG-Premier League'" in sql
         assert 'LIMIT 5' in sql
+
+
+# -----------------------------------------------------------------------------
+# Lineups / ratings parser: matchCentreData home/away.players[] (issue #708).
+# Field map mirrors socceraction's Opta WhoScored parser (extract_players /
+# extract_playergamestats) — the same JSON the events parser already fetches.
+# -----------------------------------------------------------------------------
+def _mcd_fixture() -> dict:
+    """Synthetic matchCentreData with the player-block shapes we parse."""
+    return {
+        'expandedMaxMinute': 94,
+        'events': [{'id': 1}],
+        'playerIdNameDictionary': {'11': 'Full Game', '12': 'Subbed Out'},
+        'home': {
+            'teamId': 26,
+            'name': 'Liverpool',
+            'incidentEvents': [],
+            'players': [
+                {   # starter, played the full game, MOTM
+                    'playerId': 11, 'name': 'Full Game', 'shirtNo': 4,
+                    'position': 'DC', 'isFirstEleven': True,
+                    'isManOfTheMatch': True, 'age': 27, 'height': 191,
+                    'weight': 84,
+                    'stats': {'ratings': {'45': 6.9, '94': 7.71}},
+                },
+                {   # starter, subbed out at 70
+                    'playerId': 12, 'name': 'Subbed Out', 'shirtNo': 10,
+                    'position': 'FW', 'isFirstEleven': True,
+                    'subbedOutExpandedMinute': 70,
+                    'stats': {'ratings': {'70': 6.31}},
+                },
+                {   # bench, came on at 70
+                    'playerId': 13, 'name': 'Sub In', 'shirtNo': 20,
+                    'position': 'Sub', 'isFirstEleven': False,
+                    'subbedInExpandedMinute': 70,
+                    'stats': {'ratings': {'94': 6.05}},
+                },
+                {   # unused substitute — no events, no ratings
+                    'playerId': 14, 'name': 'Unused Sub', 'shirtNo': 31,
+                    'position': 'Sub', 'isFirstEleven': False,
+                    'stats': {},
+                },
+            ],
+        },
+        'away': {
+            'teamId': 167,
+            'name': 'Manchester City',
+            'incidentEvents': [
+                {   # red card at 55 → minutes_played capped for player 21
+                    'playerId': 21, 'expandedMinute': 55,
+                    'cardType': {'value': 33, 'displayName': 'Red'},
+                },
+            ],
+            'players': [
+                {   # starter sent off at 55
+                    'playerId': 21, 'name': 'Sent Off', 'shirtNo': 5,
+                    'position': 'DC', 'isFirstEleven': True,
+                    'stats': {'ratings': {'55': 5.2}},
+                },
+            ],
+        },
+    }
+
+
+@pytest.mark.unit
+class TestLineupsParser:
+    def _parse(self, data):
+        from scrapers.whoscored.events_fetcher import (
+            parse_matchcentre_to_lineups_df,
+        )
+        return parse_matchcentre_to_lineups_df(
+            data,
+            league='ENG-Premier League',
+            season='2526',
+            game_id=1903117,
+            game_name='2025-08-16 Liverpool-Manchester City',
+        )
+
+    def test_one_row_per_player_with_index(self):
+        df = self._parse(_mcd_fixture())
+        assert len(df) == 5
+        assert df.index.names == ['league', 'season', 'game']
+        assert set(df['game_id']) == {1903117}
+        assert set(df['side']) == {'home', 'away'}
+        assert set(df.loc[df['side'] == 'home', 'team']) == {'Liverpool'}
+        assert set(df.loc[df['side'] == 'home', 'team_id']) == {26}
+
+    def test_lineup_fields(self):
+        df = self._parse(_mcd_fixture()).reset_index().set_index('player_id')
+        assert bool(df.loc[11, 'is_starter']) is True
+        assert bool(df.loc[13, 'is_starter']) is False
+        assert bool(df.loc[11, 'is_man_of_the_match']) is True
+        assert df.loc[11, 'shirt_no'] == 4
+        assert df.loc[12, 'position'] == 'FW'
+        assert df.loc[11, 'player'] == 'Full Game'
+
+    def test_minutes_played_socceraction_semantics(self):
+        df = self._parse(_mcd_fixture()).reset_index().set_index('player_id')
+        assert df.loc[11, 'minutes_played'] == 94   # full game
+        assert df.loc[12, 'minutes_played'] == 70   # starter subbed out
+        assert df.loc[13, 'minutes_played'] == 24   # sub on 70 → 94
+        assert df.loc[14, 'minutes_played'] == 0    # unused sub
+        assert df.loc[21, 'minutes_played'] == 55   # red card at 55
+
+    def test_rating_is_last_minute_value(self):
+        df = self._parse(_mcd_fixture()).reset_index().set_index('player_id')
+        assert df.loc[11, 'rating'] == pytest.approx(7.71)
+        assert df.loc[12, 'rating'] == pytest.approx(6.31)
+        assert pd.isna(df.loc[14, 'rating'])  # no ratings dict → NULL
+
+    def test_garbage_returns_empty(self):
+        assert self._parse(None).empty
+        assert self._parse({}).empty
+        assert self._parse({'events': [], 'home': {}, 'away': {}}).empty
+
+
+# -----------------------------------------------------------------------------
+# scrape_events: multi-season metadata + lineups-aware skip / dual append.
+# -----------------------------------------------------------------------------
+@pytest.mark.unit
+class TestScrapeEventsSeasonsAndLineups:
+    def test_metadata_sql_uses_short_tokens_verbatim(
+        self, mock_base_dependencies, mock_enhanced_whoscored
+    ):
+        """SEASONS_STR short tokens must reach the schedule query unchanged —
+        the old converter shifted them one season forward ('2526' → '2627'),
+        so the daily events scrape matched zero schedule rows."""
+        from scrapers.whoscored import WhoScoredScraper
+
+        scraper = WhoScoredScraper(
+            leagues=['ENG-Premier League'], seasons=[2122, 2526],
+        )
+        mgr_instance = MagicMock()
+        mgr_instance._execute.return_value = []
+        with patch(
+            'scrapers.base.trino_manager.TrinoTableManager',
+            return_value=mgr_instance,
+        ):
+            scraper._read_events_metadata_from_bronze()
+
+        sql = mgr_instance._execute.call_args.args[0]
+        assert "'2122'" in sql and "'2526'" in sql
+        assert "'2223'" not in sql and "'2627'" not in sql
+
+    def test_existing_ids_table_parameter(
+        self, mock_base_dependencies, mock_enhanced_whoscored
+    ):
+        from scrapers.whoscored import WhoScoredScraper
+
+        scraper = WhoScoredScraper(leagues=['ENG-Premier League'], seasons=[2526])
+        mgr_instance = MagicMock()
+        mgr_instance._execute.return_value = [(1,)]
+        with patch(
+            'scrapers.base.trino_manager.TrinoTableManager',
+            return_value=mgr_instance,
+        ):
+            out = scraper._fetch_existing_event_game_ids(table='whoscored_lineups')
+
+        assert out == {1}
+        sql = mgr_instance._execute.call_args.args[0]
+        assert 'iceberg.bronze.whoscored_lineups' in sql
+        assert "season IN ('2526')" in sql
+
+    def test_lineup_only_match_refetched_without_events_reappend(
+        self, mock_base_dependencies, mock_enhanced_whoscored
+    ):
+        """A match already in whoscored_events but missing from
+        whoscored_lineups is refetched; only lineups rows are appended (events
+        must NOT re-append — the events save is APPEND-only)."""
+        from scrapers.whoscored import scraper as scraper_mod
+        from scrapers.whoscored import events_fetcher as ef_mod
+        from scrapers.whoscored import WhoScoredScraper
+
+        meta = [
+            _make_meta_row(1, 'ENG-Premier League', '2526', 'g1'),
+            _make_meta_row(2, 'ENG-Premier League', '2526', 'g2'),
+        ]
+        scraper = WhoScoredScraper(leagues=['ENG-Premier League'], seasons=[2526])
+        save_mock = MagicMock(return_value='iceberg.bronze.whoscored_lineups')
+        fetch_mock = MagicMock(return_value=_mcd_fixture())
+
+        def _existing(table='whoscored_events'):
+            return {1, 2} if table == 'whoscored_events' else {2}
+
+        with patch.object(
+            scraper, '_read_events_metadata_from_bronze', return_value=meta
+        ), patch.object(
+            scraper, '_fetch_existing_event_game_ids', side_effect=_existing
+        ), patch.object(scraper, '_close_reader'), patch.object(
+            scraper, 'save_to_iceberg', save_mock
+        ), patch.object(
+            scraper_mod, 'FlareSolverrClient', MagicMock(return_value=MagicMock())
+        ), patch.object(
+            ef_mod, 'fetch_match_events_via_flaresolverr', fetch_mock
+        ):
+            result = scraper.scrape_events(chunk_size=10)
+
+        # only match 1 (events-done, lineups-missing) is fetched
+        assert fetch_mock.call_count == 1
+        # exactly one save — the lineups table; events untouched
+        tables = [c.kwargs['table_name'] for c in save_mock.call_args_list]
+        assert tables == ['whoscored_lineups']
+        saved = save_mock.call_args.kwargs['df']
+        assert set(saved['game_id']) == {1}
+        assert result == {'lineups': 'iceberg.bronze.whoscored_lineups'}
+
+    def test_new_match_appends_events_and_lineups(
+        self, mock_base_dependencies, mock_enhanced_whoscored
+    ):
+        from scrapers.whoscored import scraper as scraper_mod
+        from scrapers.whoscored import events_fetcher as ef_mod
+        from scrapers.whoscored import WhoScoredScraper
+
+        meta = [_make_meta_row(3, 'ENG-Premier League', '2526', 'g3')]
+        scraper = WhoScoredScraper(leagues=['ENG-Premier League'], seasons=[2526])
+        save_mock = MagicMock(
+            side_effect=lambda **kw: f"iceberg.bronze.{kw['table_name']}"
+        )
+        fetch_mock = MagicMock(return_value=_mcd_fixture())
+        parse_mock = MagicMock(side_effect=lambda data, **kw: _events_df(kw['game_id']))
+
+        with patch.object(
+            scraper, '_read_events_metadata_from_bronze', return_value=meta
+        ), patch.object(
+            scraper, '_fetch_existing_event_game_ids', return_value=set()
+        ), patch.object(scraper, '_close_reader'), patch.object(
+            scraper, 'save_to_iceberg', save_mock
+        ), patch.object(
+            scraper_mod, 'FlareSolverrClient', MagicMock(return_value=MagicMock())
+        ), patch.object(
+            ef_mod, 'fetch_match_events_via_flaresolverr', fetch_mock
+        ), patch.object(
+            ef_mod, 'parse_matchcentre_to_events_df', parse_mock
+        ):
+            result = scraper.scrape_events(chunk_size=10)
+
+        tables = sorted(c.kwargs['table_name'] for c in save_mock.call_args_list)
+        assert tables == ['whoscored_events', 'whoscored_lineups']
+        assert result == {
+            'events': 'iceberg.bronze.whoscored_events',
+            'lineups': 'iceberg.bronze.whoscored_lineups',
+        }
+        # lineups rows carry the entity metadata for OM lineage
+        lineups_df = next(
+            c.kwargs['df'] for c in save_mock.call_args_list
+            if c.kwargs['table_name'] == 'whoscored_lineups'
+        )
+        assert lineups_df['_entity_type'].iloc[0] == 'lineups'
+        assert len(lineups_df) == 5
+
+
+# -----------------------------------------------------------------------------
+# scrape_player_profile: per-league partition tagging (multi-league fix).
+# -----------------------------------------------------------------------------
+@pytest.mark.unit
+class TestScrapePlayerProfileMultiLeague:
+    def test_rows_tagged_per_league_and_profiles_fetched_once(
+        self, mock_base_dependencies
+    ):
+        """Old code tagged EVERY profile with leagues[0] — under a multi-league
+        config all rows landed in the first league's partition. Rosters must be
+        resolved per league and rows tagged accordingly; a player appearing in
+        two leagues is fetched once but materialised in both partitions."""
+        from scrapers.whoscored import WhoScoredScraper
+        from scrapers.whoscored import scraper as scraper_mod
+
+        scraper = WhoScoredScraper(
+            leagues=['ENG-Premier League', 'ESP-La Liga'], seasons=[2526],
+        )
+        client_instance = MagicMock()
+        client_instance.get.return_value = {
+            'status': 200, 'html': _PLAYER_PROFILE_HTML,
+            'cookies': [], 'userAgent': '',
+        }
+        save_mock = MagicMock(return_value='iceberg.bronze.whoscored_player_profile')
+
+        def _resolve(league, season_str, limit=None):
+            assert season_str == '2526'
+            return {'ENG-Premier League': ['1', '2'],
+                    'ESP-La Liga': ['2', '3']}[league]
+
+        with patch.object(
+            scraper_mod, 'FlareSolverrClient',
+            MagicMock(return_value=client_instance),
+        ), patch.object(
+            scraper, '_resolve_player_ids_from_bronze', side_effect=_resolve
+        ), patch.object(scraper, 'save_to_iceberg', save_mock):
+            result = scraper.scrape_player_profile()
+
+        # player '2' plays in both leagues but its page is fetched only once
+        assert client_instance.get.call_count == 3
+
+        df = save_mock.call_args.kwargs['df']
+        assert len(df) == 4
+        by_league = df.groupby('league')['player_id'].apply(set).to_dict()
+        assert by_league == {
+            'ENG-Premier League': {'1', '2'},
+            'ESP-La Liga': {'2', '3'},
+        }
+        assert set(df['season']) == {'2526'}
+        assert result == {
+            'player_profile': 'iceberg.bronze.whoscored_player_profile'
+        }
