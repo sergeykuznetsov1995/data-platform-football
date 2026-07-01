@@ -726,8 +726,17 @@ class SofaScoreScraper(SoccerdataScraper):
     ) -> List[Dict]:
         """Project SofaScore's nested player-list into flat rows.
 
+        #840: keep each lineup entry's own fields as-is (captain, substitute,
+        shirt_number, ... — previously dropped). ``rating`` stays raw (the
+        0.0-means-"did-not-play" -> NULL rule moved to Silver, which already
+        applies it); ``position`` keeps the per-event -> nominal fallback. The
+        nested ``statistics`` Opta block is deliberately NOT duplicated here — it
+        is captured in full by ``event_player_stats`` from the SAME /lineups
+        payload, so no source field is lost. The ``player`` identity object is
+        skipped (its id is the anchor).
+
         Schema per row:
-            match_id, player_id, team_side, rating, position
+            match_id, player_id, team_side, rating, position, + entry fields.
         """
         rows: List[Dict] = []
         if not isinstance(side_payload, dict):
@@ -743,35 +752,20 @@ class SofaScoreScraper(SoccerdataScraper):
             if pid is None:
                 continue
 
-            raw_rating = stats.get('rating')
-            try:
-                rating_val = float(raw_rating) if raw_rating is not None else None
-            except (TypeError, ValueError):
-                rating_val = None
-            # SofaScore reports 0.0 for players who didn't enter the pitch
-            # — it's not a rating, treat as NULL (matches Opta semantics).
-            if rating_val is not None and rating_val == 0.0:
-                rating_val = None
-
-            # Position priority: per-event role (e.g. "G","D","M","F"),
-            # falling back to the player's nominal position string.
-            position = (
-                entry.get('position')
-                or player.get('position')
-                or None
-            )
-
             player_id_str = (
                 str(int(pid)) if isinstance(pid, (int, float)) else str(pid)
             )
 
-            rows.append({
+            row: Dict = {
                 'match_id': str(match_id),
                 'player_id': player_id_str,
                 'team_side': side,
-                'rating': rating_val,
-                'position': position,
-            })
+                # rating raw (Silver drops 0.0); position per-event or nominal.
+                'rating': _coerce_scalar(stats.get('rating')),
+                'position': entry.get('position') or player.get('position') or None,
+            }
+            _auto_flatten(entry, row, skip=('player', 'statistics'))
+            rows.append(row)
 
         return rows
 
@@ -1233,8 +1227,9 @@ class SofaScoreScraper(SoccerdataScraper):
         (``2526``) so the partition matches the schedule writer (#27).
         """
         ratings_cols = [
+            # #840: rating/position kept; entry-level fields now preserved too.
             'match_id', 'player_id', 'team_side', 'rating', 'position',
-            'league', 'season',
+            'captain', 'substitute', 'shirt_number', 'league', 'season',
         ]
         eps_cols = [
             'match_id', 'player_id', 'team_id', 'team_name', 'is_home',
@@ -1242,9 +1237,10 @@ class SofaScoreScraper(SoccerdataScraper):
             'league', 'season',
         ]
         match_stats_cols = [
-            'match_id', 'period', 'stat_group', 'stat_name', 'stat_key',
-            'home_value', 'away_value', 'home_text', 'away_text',
-            'compare_code', 'value_type', 'league', 'season',
+            # #840: source-key names (Bronze as-is); Silver renames/derives.
+            'match_id', 'period', 'stat_group', 'name', 'key',
+            'statistics_type', 'home_value', 'away_value', 'home', 'away',
+            'compare_code', 'value_type', 'render_type', 'league', 'season',
         ]
         shotmap_cols = [
             # #840: source-key names (Bronze as-is); Silver renames/derives.
@@ -1256,8 +1252,11 @@ class SofaScoreScraper(SoccerdataScraper):
             'xg', 'xgot', 'league', 'season',
         ]
         venue_cols = [
-            'game_id', 'stadium', 'city', 'country',
-            'venue_latitude', 'venue_longitude', 'league', 'season',
+            # #840: source-key names (Bronze as-is); Silver renames/derives.
+            'game_id', 'stadium_name', 'stadium_capacity', 'city_name',
+            'country_name', 'country_alpha2',
+            'venue_coordinates_latitude', 'venue_coordinates_longitude',
+            'league', 'season',
         ]
 
         if match_ids is None:
@@ -1776,10 +1775,10 @@ class SofaScoreScraper(SoccerdataScraper):
         the issue got wrong: (1) ``venueCoordinates`` was ABSENT for that venue, so
         coords are sporadic and usually NULL — city/country are the reliable
         value-add, coords a bonus when present; (2) ``capacity`` IS in the payload
-        (``stadium.capacity``) but stays FotMob-sourced (#750), so it (and
-        ``surface``/``opened``) is not extracted here. Like the other capture
-        flatteners the caller tags ``league``/``season``/lineage; this emits
-        business columns only.
+        (``stadium.capacity``) but stays FotMob-sourced (#750), so Silver ignores
+        it — but Bronze now keeps it as ``stadium_capacity`` per #840 (all source
+        fields preserved). Like the other capture flatteners the caller tags
+        ``league``/``season``/lineage; this emits business columns only.
         """
         ev = event_payload if isinstance(event_payload, dict) else {}
         # The captured /event/{id} body nests the event under "event" (#751 PR2).
@@ -1793,18 +1792,10 @@ class SofaScoreScraper(SoccerdataScraper):
             """SofaScore ``{"name": X}`` object → X; a bare string passes through."""
             return v.get('name') if isinstance(v, dict) else v
 
+        # Row guard only — no usable stadium name → skip (unchanged contract).
         stadium = _name(venue.get('stadium'))
         if stadium is None or str(stadium).strip() == '':
             return None
-
-        def _f(v):
-            try:
-                return float(v) if v is not None else None
-            except (TypeError, ValueError):
-                return None
-
-        coords = venue.get('venueCoordinates')
-        coords = coords if isinstance(coords, dict) else {}
 
         gid = ev.get('id')
         if gid is None:
@@ -1814,14 +1805,14 @@ class SofaScoreScraper(SoccerdataScraper):
         except (TypeError, ValueError):
             game_id = None
 
-        return {
-            'game_id': game_id,
-            'stadium': str(stadium).strip(),
-            'city': _name(venue.get('city')),
-            'country': _name(venue.get('country')),
-            'venue_latitude': _f(coords.get('latitude')),
-            'venue_longitude': _f(coords.get('longitude')),
-        }
+        # #840: keep the whole venue block as-is. Nested {"name": ...} objects
+        # flatten to stadium_name / city_name / country_name; venueCoordinates
+        # to venue_coordinates_latitude/longitude (+ bonus stadium_capacity,
+        # country_alpha2, ...). Silver renames back to
+        # stadium/city/country/venue_latitude/venue_longitude.
+        row: Dict = {'game_id': game_id}
+        _auto_flatten(venue, row)
+        return row
 
     def _fetch_event_player_stats_payload(
         self,
@@ -2056,14 +2047,6 @@ class SofaScoreScraper(SoccerdataScraper):
         if not isinstance(periods, list):
             return rows
 
-        def _f(v):
-            if v is None:
-                return None
-            try:
-                return float(v)
-            except (TypeError, ValueError):
-                return None
-
         for period_block in periods:
             if not isinstance(period_block, dict):
                 continue
@@ -2077,23 +2060,19 @@ class SofaScoreScraper(SoccerdataScraper):
                 for item in (group_block.get('statisticsItems') or []):
                     if not isinstance(item, dict):
                         continue
-                    rows.append({
+                    # #840: only the position anchors are hard-coded; every
+                    # statisticsItem field auto-flattens (source-key names:
+                    # name, key, statistics_type, home/away, home_value/away_value,
+                    # compare_code, value_type, render_type, ...). Silver renames
+                    # stat_name<-name, stat_key<-key||statistics_type,
+                    # home_text<-home, away_text<-away.
+                    row: Dict = {
                         'match_id': str(match_id),
                         'period': str(period),
                         'stat_group': stat_group,
-                        'stat_name': item.get('name'),
-                        'stat_key': item.get('key') or item.get('statisticsType'),
-                        'home_value': _f(item.get('homeValue')),
-                        'away_value': _f(item.get('awayValue')),
-                        'home_text': (
-                            str(item.get('home')) if item.get('home') is not None else None
-                        ),
-                        'away_text': (
-                            str(item.get('away')) if item.get('away') is not None else None
-                        ),
-                        'compare_code': item.get('compareCode'),
-                        'value_type': item.get('valueType'),
-                    })
+                    }
+                    _auto_flatten(item, row)
+                    rows.append(row)
 
         return rows
 
@@ -2298,11 +2277,14 @@ class SofaScoreScraper(SoccerdataScraper):
     def _flatten_player_profile(payload: dict) -> Optional[Dict]:
         """Project ``/player/{id}`` payload into a snapshot row.
 
-        SofaScore wraps the relevant data under a top-level ``player``
-        key — we project a fixed set of identity / biographical fields.
-        Unlike the stats-flatteners we don't auto-flatten the rest of
-        the player object: it contains marketing fields (userCount,
-        retiredStatus) we don't need in Bronze.
+        #840: Bronze keeps the whole ``player`` block as-is (auto-passthrough);
+        only ``player_id`` is a hard-coded anchor. Renames/derivations move to
+        Silver: ``height_cm`` <- ``height``, ``date_of_birth`` <-
+        ``date_of_birth_timestamp``, ``country_code`` <- ``country.alpha2``,
+        ``current_team_*`` <- ``team.*``, and the ``nationality`` <-
+        ``country.name`` fallback. Extra/marketing fields the old fixed list
+        dropped (``user_count``, ``retired_status``, name translations) are now
+        preserved (source-as-is contract).
         """
         if not isinstance(payload, dict):
             return None
@@ -2315,38 +2297,13 @@ class SofaScoreScraper(SoccerdataScraper):
         if pid is None:
             return None
 
-        dob_ts = player.get('dateOfBirthTimestamp')
-        dob = None
-        if isinstance(dob_ts, (int, float)) and dob_ts > 0:
-            try:
-                dob = datetime.utcfromtimestamp(int(dob_ts)).date().isoformat()
-            except (OverflowError, OSError, ValueError):
-                dob = None
-
-        nationality = player.get('nationality')
-        country = player.get('country') or {}
-        if not nationality and isinstance(country, dict):
-            nationality = country.get('name')
-
-        team = player.get('team') or {}
-
-        return {
+        row: Dict = {
             'player_id': str(int(pid)) if isinstance(pid, (int, float)) else str(pid),
-            'name': player.get('name'),
-            'short_name': player.get('shortName'),
-            'slug': player.get('slug'),
-            'position': player.get('position'),
-            'jersey_number': player.get('jerseyNumber'),
-            'shirt_number': player.get('shirtNumber'),
-            'height_cm': player.get('height'),
-            'preferred_foot': player.get('preferredFoot'),
-            'date_of_birth': dob,
-            'nationality': nationality,
-            'country_code': (country or {}).get('alpha2') if isinstance(country, dict) else None,
-            'current_team_id': team.get('id'),
-            'current_team_name': team.get('name'),
-            'retired': bool(player.get('retired')) if player.get('retired') is not None else None,
         }
+        # Nested `country`/`team` flatten to country_name/country_alpha2/team_id/
+        # team_name/... ; `dateOfBirthTimestamp` stays raw (Silver -> date).
+        _auto_flatten(player, row)
+        return row
 
     # ------------------------------------------------------------------
     # #751 PR3 — per-player capture (biographical profile snapshot)
@@ -2388,11 +2345,12 @@ class SofaScoreScraper(SoccerdataScraper):
         )
 
         profile_cols = [
-            'player_id', 'name', 'short_name', 'slug', 'position',
-            'jersey_number', 'shirt_number', 'height_cm', 'preferred_foot',
-            'date_of_birth', 'nationality', 'country_code',
-            'current_team_id', 'current_team_name', 'retired',
-            'league', 'season',
+            # #840: source-key names (Bronze as-is); Silver renames/derives.
+            'player_id', 'id', 'name', 'short_name', 'slug', 'position',
+            'jersey_number', 'shirt_number', 'height', 'preferred_foot',
+            'date_of_birth_timestamp', 'nationality',
+            'country_name', 'country_alpha2',
+            'team_id', 'team_name', 'retired', 'league', 'season',
         ]
         season_cols = [
             'player_id', 'unique_tournament_id', 'sofascore_season_id',

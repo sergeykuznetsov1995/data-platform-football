@@ -12,10 +12,13 @@
 -- BEHIND FotMob for city/coords, and supplies country FotMob cannot).
 --
 -- Source Bronze (см. scrapers/sofascore + run_sofascore_scraper match_capture):
---   bronze.sofascore_venue — game_id (bigint), stadium/city/country (varchar),
---     venue_latitude/venue_longitude (double), league (varchar), season
---     (varchar slug). Full-state replace_partitions, но bronze несёт одну
---     строку на МАТЧ (game_id) → dedup ROW_NUMBER до одной на стадион здесь.
+--   bronze.sofascore_venue — #840 auto-passthrough: game_id (bigint),
+--     stadium_name/city_name/country_name (varchar),
+--     venue_coordinates_latitude/longitude (double), + bonus stadium_capacity,
+--     country_alpha2, league, season (varchar slug). Pre-#840 legacy names
+--     stadium/city/country/venue_latitude/venue_longitude bridged via
+--     COALESCE in the `src` CTE. Full-state replace_partitions, но bronze несёт
+--     одну строку на МАТЧ (game_id) → dedup ROW_NUMBER до одной на стадион здесь.
 --
 -- Notes:
 --   * Грейн bronze = per-match; many matches share a home stadium, so dedup to
@@ -27,7 +30,23 @@
 --     dim_venue джойнит по нормализованному имени стадиона.
 -- =============================================================================
 
-WITH bronze_dedup AS (
+WITH
+-- #840: Bronze is now auto-passthrough (source-key names). Rename/derive here.
+-- COALESCE(old, new) bridges pre-#840 partitions and freshly re-scraped ones.
+src AS (
+    SELECT
+        game_id,
+        COALESCE(stadium, stadium_name)                         AS stadium,
+        COALESCE(city, city_name)                               AS city,
+        COALESCE(country, country_name)                         AS country,
+        COALESCE(venue_latitude, venue_coordinates_latitude)    AS venue_latitude,
+        COALESCE(venue_longitude, venue_coordinates_longitude)  AS venue_longitude,
+        _ingested_at,
+        league,
+        season
+    FROM iceberg.bronze.sofascore_venue
+),
+bronze_dedup AS (
     SELECT *
     FROM (
         SELECT
@@ -36,7 +55,7 @@ WITH bronze_dedup AS (
                 PARTITION BY league, season, stadium
                 ORDER BY _ingested_at DESC
             ) AS rn
-        FROM iceberg.bronze.sofascore_venue v
+        FROM src v
         WHERE stadium IS NOT NULL
           AND trim(stadium) <> ''
     )
