@@ -6,13 +6,13 @@ WhoScored Scraper Runner Script
 Standalone script to run :class:`WhoScoredScraper`. Called from Airflow via
 BashOperator to avoid memory issues with PythonOperator.
 
-The new soccerdata-backed WhoScoredScraper exposes 4 high-level methods:
+The WhoScoredScraper exposes these high-level methods:
     * scrape_schedule()         — fixtures (full N seasons)
     * scrape_missing_players()  — pre-match injury / suspension list
     * scrape_season_stages()    — cup vs league stage metadata
-    * scrape_events()           — per-match Opta events; defaults to
-                                  the latest configured season because
-                                  events are heavy (~600k rows / season).
+    * scrape_events()           — per-match Opta events + lineups/ratings for
+                                  ALL configured seasons; skip-existing per
+                                  match keeps re-runs cheap (append-only).
 
 W3 contract:
     --leagues       CSV (default: "ENG-Premier League")
