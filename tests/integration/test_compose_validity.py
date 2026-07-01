@@ -90,7 +90,7 @@ class TestComposeFile:
             "superset",
             "superset-worker",
             "superset-beat",
-            "elasticsearch",
+            "opensearch",
             "openmetadata-server",
             "openmetadata-ingestion",
         }
@@ -115,14 +115,14 @@ class TestComposeFile:
                 f"superset must depend_on '{required}' (got {sorted(dep_names)})"
             )
 
-    def test_elasticsearch_no_published_ports(self):
-        """Security: ES must NOT expose 9200 to the host (HDFS-like internal only)."""
+    def test_opensearch_no_published_ports(self):
+        """Security: OpenSearch must NOT expose 9200 to the host (internal only)."""
         cfg = _compose_config_json()
-        es = cfg["services"]["elasticsearch"]
+        es = cfg["services"]["opensearch"]
         ports = es.get("ports") or []
         # Allow empty list or absent key. Anything else is a leak.
         assert ports == [] or ports is None, (
-            f"elasticsearch must NOT publish ports (got {ports})"
+            f"opensearch must NOT publish ports (got {ports})"
         )
 
     @pytest.mark.parametrize(
@@ -131,7 +131,7 @@ class TestComposeFile:
             "superset",
             "superset-worker",
             "superset-beat",
-            "elasticsearch",
+            "opensearch",
             "openmetadata-server",
             "openmetadata-ingestion",
         ],

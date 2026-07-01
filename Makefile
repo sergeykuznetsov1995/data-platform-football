@@ -34,7 +34,7 @@ help:
 	@echo ""
 	@echo "BI / Catalog:"
 	@echo "  make up-bi                - Start Superset stack (web + worker + beat)"
-	@echo "  make up-catalog           - Start OpenMetadata stack (server + ingestion + ES)"
+	@echo "  make up-catalog           - Start OpenMetadata stack (server + ingestion + OpenSearch)"
 	@echo "  make down-bi              - Stop Superset stack"
 	@echo "  make down-catalog         - Stop OpenMetadata stack"
 	@echo "  make superset-init        - Bootstrap Superset (admin + datasources + dashboards)"
@@ -68,7 +68,7 @@ up-build:
 	@$(MAKE) ps
 
 # Start LITE stack (core only: HDFS + Hive + Postgres + Redis + Airflow + Trino + Superset + FlareSolverr).
-# Skips: superset-worker/beat, elasticsearch, openmetadata-*, tor. Use when RAM-constrained.
+# Skips: superset-worker/beat, opensearch, openmetadata-*, tor. Use when RAM-constrained.
 up-lite:
 	docker compose up -d
 	@echo ""
@@ -259,9 +259,9 @@ for p in stats['proxies'][:5]: \
 up-bi:
 	@docker compose up -d superset superset-worker superset-beat
 
-# Start OpenMetadata stack (server + ingestion + Elasticsearch)
+# Start OpenMetadata stack (server + ingestion + OpenSearch)
 up-catalog:
-	@docker compose up -d elasticsearch openmetadata-server openmetadata-ingestion
+	@docker compose up -d opensearch openmetadata-migrate openmetadata-server openmetadata-ingestion
 
 # Stop Superset stack
 down-bi:
@@ -269,7 +269,7 @@ down-bi:
 
 # Stop OpenMetadata stack
 down-catalog:
-	@docker compose stop openmetadata-server openmetadata-ingestion elasticsearch
+	@docker compose stop openmetadata-server openmetadata-ingestion opensearch
 
 # Bootstrap Superset (creates admin, runs db upgrade, imports datasources/dashboards)
 superset-init:

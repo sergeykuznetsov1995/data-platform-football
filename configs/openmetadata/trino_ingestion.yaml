@@ -1,5 +1,5 @@
 # =============================================================================
-# OpenMetadata 1.5.x — Trino Metadata Ingestion Workflow
+# OpenMetadata 1.13.x — Trino Metadata Ingestion Workflow
 # =============================================================================
 # Schema: openmetadata-spec/.../entity/services/connections/database/trinoConnection.json
 #

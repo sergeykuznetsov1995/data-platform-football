@@ -1,5 +1,5 @@
 # =============================================================================
-# OpenMetadata 1.5.x — Trino Lineage Workflow
+# OpenMetadata 1.13.x — Trino Lineage Workflow
 # =============================================================================
 # Reads recent Trino query history (system.runtime.queries on the coordinator)
 # and parses CTAS / INSERT statements to auto-build Bronze → Silver → Gold lineage.
@@ -32,7 +32,8 @@ source:
       authType:
         password: "${TRINO_OPENMETADATA_PASSWORD}"
       catalog: iceberg
-      verifySSL: no-ssl
+      # SSL verify control forwarded via connectionArguments only (the top-level
+      # verifySSL field was dropped from the TrinoConnection schema).
       connectionArguments:
         http_scheme: https
         verify: false

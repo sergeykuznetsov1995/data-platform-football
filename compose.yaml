@@ -566,13 +566,14 @@ services:
           memory: 64M
 
   # ===========================================================================
-  # Elasticsearch - search backend for OpenMetadata
+  # OpenSearch - search backend for OpenMetadata (replaces Elasticsearch).
+  # OM 1.13 ships/tests with opensearchproject/opensearch:3.4.0.
   # ===========================================================================
-  elasticsearch:
+  opensearch:
     profiles: ["heavy"]
-    image: elasticsearch:8.11.4
-    container_name: elasticsearch
-    hostname: elasticsearch
+    image: opensearchproject/opensearch:3.4.0
+    container_name: opensearch
+    hostname: opensearch
     security_opt:
       - no-new-privileges:true
     cap_drop:
@@ -583,11 +584,15 @@ services:
       - SETUID
       - DAC_OVERRIDE
     environment:
+      - cluster.name=opensearch-cluster
+      - node.name=opensearch-node1
       - discovery.type=single-node
-      - xpack.security.enabled=false
-      - ES_JAVA_OPTS=-Xms512m -Xmx512m
-      - cluster.name=openmetadata-cluster
       - bootstrap.memory_lock=false
+      - DISABLE_SECURITY_PLUGIN=true
+      - DISABLE_INSTALL_DEMO_CONFIG=true
+      # Heap trimmed from OM's stock 2g/4g — small catalog, plenty of headroom.
+      - OPENSEARCH_JAVA_OPTS=-Xms1g -Xmx1g
+      - cluster.routing.allocation.disk.threshold_enabled=false
     ulimits:
       memlock:
         soft: -1
@@ -596,7 +601,7 @@ services:
         soft: 65536
         hard: 65536
     volumes:
-      - es_data:/usr/share/elasticsearch/data
+      - opensearch_data:/usr/share/opensearch/data
     networks:
       - backend
     healthcheck:
@@ -609,39 +614,29 @@ services:
     deploy:
       resources:
         limits:
-          memory: 1G
+          memory: 2G
         reservations:
-          memory: 512M
+          memory: 1G
 
   # ===========================================================================
   # OpenMetadata - Data Catalog & Lineage
   # ===========================================================================
-  openmetadata-server:
+  # OM 1.13.x no longer self-migrates on server startup — schema migrations must
+  # run as a separate one-shot (`openmetadata-ops.sh migrate`) before the server
+  # boots. The server depends on it completing successfully.
+  openmetadata-migrate:
     profiles: ["heavy"]
-    image: openmetadata/server:1.5.0
-    container_name: openmetadata-server
-    hostname: openmetadata-server
-    security_opt:
-      - no-new-privileges:true
-    cap_drop:
-      - ALL
-    cap_add:
-      - CHOWN
-      - SETGID
-      - SETUID
-      - DAC_OVERRIDE
+    image: openmetadata/server:1.13.1
+    container_name: openmetadata-migrate
+    command: ["./bootstrap/openmetadata-ops.sh", "migrate"]
     depends_on:
       postgres:
         condition: service_healthy
-      elasticsearch:
+      opensearch:
         condition: service_healthy
     networks:
-      - frontend
       - backend
-    ports:
-      - "127.0.0.1:8585:8585"
-      - "127.0.0.1:8586:8586"
-    environment:
+    environment: &openmetadata-env
       # Database (Postgres)
       DB_DRIVER_CLASS: org.postgresql.Driver
       DB_SCHEME: postgresql
@@ -651,13 +646,14 @@ services:
       DB_USER: openmetadata
       DB_USER_PASSWORD: ${OPENMETADATA_DB_PASSWORD}
       OM_DATABASE: openmetadata
-      # Search (Elasticsearch)
-      ELASTICSEARCH_HOST: elasticsearch
+      # Search (OpenSearch). OM keeps the ELASTICSEARCH_* keys and switches the
+      # client implementation via SEARCH_TYPE=opensearch.
+      ELASTICSEARCH_HOST: opensearch
       ELASTICSEARCH_PORT: 9200
       ELASTICSEARCH_SCHEME: http
       ELASTICSEARCH_USER: ""
       ELASTICSEARCH_PASSWORD: ""
-      SEARCH_TYPE: elasticsearch
+      SEARCH_TYPE: opensearch
       # Authentication / Authorization (basic auth, single admin)
       AUTHENTICATION_PROVIDER: basic
       AUTHENTICATION_AUTHORITY: https://accounts.google.com
@@ -675,6 +671,37 @@ services:
       LOG_LEVEL: INFO
       # Migrations on startup
       MIGRATION_LIMIT_PARAM: 1200
+    restart: "no"
+
+  openmetadata-server:
+    profiles: ["heavy"]
+    image: openmetadata/server:1.13.1
+    container_name: openmetadata-server
+    hostname: openmetadata-server
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETGID
+      - SETUID
+      - DAC_OVERRIDE
+    depends_on:
+      postgres:
+        condition: service_healthy
+      opensearch:
+        condition: service_healthy
+      openmetadata-migrate:
+        condition: service_completed_successfully
+    networks:
+      - frontend
+      - backend
+    ports:
+      - "127.0.0.1:8585:8585"
+      - "127.0.0.1:8586:8586"
+    environment:
+      <<: *openmetadata-env
     restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://localhost:8586/healthcheck | grep -q '\"healthy\":true' || exit 1"]
@@ -685,13 +712,13 @@ services:
     deploy:
       resources:
         limits:
-          memory: 1500M
+          memory: 2G
         reservations:
-          memory: 768M
+          memory: 1G
 
   openmetadata-ingestion:
     profiles: ["heavy"]
-    image: openmetadata/ingestion:1.5.0
+    image: openmetadata/ingestion:1.13.1
     container_name: openmetadata-ingestion
     hostname: openmetadata-ingestion
     security_opt:
@@ -849,5 +876,5 @@ volumes:
     name: redis_data
   superset_home:
     name: superset_home
-  es_data:
-    name: es_data
+  opensearch_data:
+    name: opensearch_data
