@@ -73,8 +73,11 @@ def _extract_card_extras(raw_html: str, tree) -> dict:
 
     Covers the main-6 card aggregates (JS), market value / wage / release clause,
     contract dates, the profile header (position / dob / height / weight /
-    nationality), and preferred foot (#663). All fields degrade to ``None``
-    when absent so a partial page never aborts the run.
+    nationality), preferred foot (#663), the star-rated Profile fields
+    (weak foot / skill moves / international reputation), body type / real
+    face, best position / best overall, and the PlayStyles + specialities tag
+    lists. All fields degrade to ``None`` when absent so a partial page never
+    aborts the run.
     """
     out: dict = {}
     for col, ab in _MAIN6_JS.items():
@@ -127,6 +130,51 @@ def _extract_card_extras(raw_html: str, tree) -> dict:
         "//label[normalize-space()='Preferred foot']/following-sibling::text()[1]"
     )
     out['preferred_foot'] = foot[0].strip() if foot and foot[0].strip() else None
+
+    # Star-rated Profile fields — the rating number sits BEFORE the label
+    # inside the same <p> ('<p>4 <svg class="star"/> <label>Weak foot</label></p>'),
+    # so take the <p>'s first text node. Confirmed on the FC-26 player page
+    # (snapshot 2025-09-22). "Work rate" no longer exists on the FC-26 page
+    # (removed by EA alongside the team-tactics block, cf. #601) — not scraped.
+    for col, label in (
+        ('weak_foot', 'Weak foot'),
+        ('skill_moves', 'Skill moves'),
+        ('international_reputation', 'International reputation'),
+    ):
+        txt = root.xpath(f"//p[label[normalize-space()='{label}']]/text()[1]")
+        val = txt[0].strip() if txt else ''
+        out[col] = int(val) if val.isdigit() else None
+
+    # Text Profile fields — value is the label's tail text, same pattern as
+    # preferred_foot above ('<p><label>Body type</label> Unique</p>').
+    for col, label in (('body_type', 'Body type'), ('real_face', 'Real face')):
+        txt = root.xpath(
+            f"//label[normalize-space()='{label}']/following-sibling::text()[1]"
+        )
+        out[col] = txt[0].strip() if txt and txt[0].strip() else None
+
+    # Best position / best overall — their own "attribute" block below the
+    # position map: '<p><label>Best position</label> <span class="pos">ST</span></p>
+    # <p><label>Best overall</label> <em title="93">93</em></p>'.
+    bp = root.xpath("//p[label[normalize-space()='Best position']]/span/text()")
+    out['best_position'] = bp[0].strip() if bp and bp[0].strip() else None
+    bo = root.xpath("//p[label[normalize-space()='Best overall']]/em/text()")
+    out['best_overall'] = (
+        int(bo[0].strip()) if bo and bo[0].strip().isdigit() else None
+    )
+
+    # PlayStyles (FC-24+ traits, '<span>Quick Step +</span>' — trailing '+'
+    # marks a PlayStyle+) and Player specialities ('<a>#Speedster</a>') — tag
+    # lists in their own <h5>-titled columns, flattened to one comma-separated
+    # string per player (Iceberg-friendly).
+    ps = root.xpath("//div[h5[normalize-space()='PlayStyles']]/p//span/text()")
+    out['playstyles'] = ', '.join(t.strip() for t in ps if t.strip()) or None
+    sp = root.xpath(
+        "//div[h5[normalize-space()='Player specialities']]/p/a/text()"
+    )
+    out['specialities'] = (
+        ', '.join(t.strip().lstrip('#') for t in sp if t.strip()) or None
+    )
     return out
 
 
@@ -366,6 +414,12 @@ class FlareSolverrSoFIFAReader(sd.SoFIFA):
             scores: dict = {
                 "player_id": int(pid),
                 "player": before_br if before_br else after_br,
+                # version.to_dict() carries only (fifa_edition, update); the
+                # update DATE TEXT is not unique across roster updates, so the
+                # numeric id is the only reliable "which sofifa version is
+                # this row" key — the incremental skip in run_sofifa_scraper
+                # compares Bronze MAX(version_id) against the live homepage.
+                "version_id": int(version_id),
                 **version.to_dict(),
             }
             for s in score_labels:
@@ -442,7 +496,12 @@ class FlareSolverrSoFIFAReader(sd.SoFIFA):
         urlmask = SO_FIFA_API + "/teams?lg={}&r={}&set=true"
         for rating_id in ratings:
             urlmask += f"&showCol[]={rating_id}"
-        filemask = "teams_{}_{}.html"
+        # NOT upstream's "teams_{}_{}.html": read_teams caches the plain
+        # listing (no showCol[]) under that name first (via read_players'
+        # bootstrap), so sharing the filemask makes this method parse a page
+        # that only happens to carry the rating cells in the default FC-26
+        # view. A dedicated cache file keeps the showCol URL honest.
+        filemask = "team_ratings_{}_{}.html"
 
         leagues = self.read_leagues()
 

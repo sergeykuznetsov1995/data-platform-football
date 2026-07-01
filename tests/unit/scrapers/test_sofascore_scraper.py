@@ -1735,7 +1735,7 @@ class TestReadPlayerCapture:
         seen = []
         picker_labels = []
 
-        def fake_iter(player_ids, season_picker_label=None):
+        def fake_iter(player_ids, season_picker_label=None, **kwargs):
             picker_labels.append(season_picker_label)
             for pid in player_ids:
                 seen.append(str(pid))
@@ -1776,7 +1776,7 @@ class TestReadPlayerCapture:
         # (transferred player) → player_season_stats is empty, not a crash.
         scraper = self._scraper()
 
-        def fake_iter(player_ids, season_picker_label=None):
+        def fake_iter(player_ids, season_picker_label=None, **kwargs):
             for pid in player_ids:
                 yield str(pid), self._capture(pid, with_season=False)
 
@@ -1791,7 +1791,7 @@ class TestReadPlayerCapture:
     def test_graceful_empty_when_nothing_captured(self):
         scraper = self._scraper()
 
-        def fake_iter(player_ids, season_picker_label=None):
+        def fake_iter(player_ids, season_picker_label=None, **kwargs):
             for pid in player_ids:
                 yield str(pid), {'profile': None, 'season_buffer': {}}
 
@@ -2050,3 +2050,218 @@ class TestMatchCaptureSessionRestart:
         # The 4 dead-proxy matches were skipped (empty); the rest captured.
         assert all(ep == {} for _, ep in out[:4])
         assert out[4][1].get('lineups') is not None
+
+
+class TestMatchCaptureInPageFetch:
+    """#842 in-page fetch: only the session's FIRST match navigates (solves
+    Turnstile); later matches pull their endpoints via same-origin fetch. A
+    fetch that misses a required endpoint falls back to a full navigation for
+    that match; SOFASCORE_INPAGE_FETCH=0 restores nav-per-match."""
+
+    _GOOD = {'lineups': {'home': {}, 'away': {}}, 'event': {}}
+
+    def _scraper(self):
+        from scrapers.sofascore.scraper import SofaScoreScraper
+        with patch('scrapers.base.base_scraper.get_rate_limiter'), \
+             patch('scrapers.base.base_scraper.get_retry_policy'), \
+             patch('scrapers.base.base_scraper.get_circuit_breaker'), \
+             patch('scrapers.base.base_scraper.IcebergWriter'):
+            s = SofaScoreScraper(leagues=['ENG-Premier League'], seasons=[2024])
+        s._proxy_manager = None
+        return s
+
+    def _fakecap_cls(self, calls, fetch_results=None):
+        good = self._GOOD
+
+        class _FakeCap:
+            def __init__(self, *a, **k):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def capture_event(self, mid, tabs=(), required=()):
+                calls.append(('nav', mid))
+                return good
+
+            def fetch_event(self, mid, names=()):
+                calls.append(('fetch', mid))
+                if fetch_results is not None:
+                    return fetch_results.get(mid, good)
+                return good
+        return _FakeCap
+
+    @pytest.mark.unit
+    def test_first_match_navigates_then_fetches(self):
+        scraper = self._scraper()
+        calls = []
+        with patch('scrapers.sofascore.camoufox_capture.SofascoreCamoufoxCapture',
+                   self._fakecap_cls(calls)):
+            out = list(scraper._iter_match_captures(['1', '2', '3']))
+        assert [m for m, _ in out] == ['1', '2', '3']
+        assert calls == [('nav', '1'), ('fetch', '2'), ('fetch', '3')]
+
+    @pytest.mark.unit
+    def test_fetch_miss_falls_back_to_navigation(self):
+        # Match 2's fetch misses the required lineups (clearance expired) —
+        # it re-navigates; match 3 goes back to the cheap fetch path.
+        scraper = self._scraper()
+        calls = []
+        with patch('scrapers.sofascore.camoufox_capture.SofascoreCamoufoxCapture',
+                   self._fakecap_cls(calls, fetch_results={'2': {}})):
+            out = list(scraper._iter_match_captures(['1', '2', '3']))
+        assert calls == [('nav', '1'),
+                         ('fetch', '2'), ('nav', '2'),
+                         ('fetch', '3')]
+        # The fallback navigation recovered match 2 — nothing lost.
+        assert all(ep.get('lineups') for _, ep in out)
+
+    @pytest.mark.unit
+    def test_kill_switch_restores_nav_per_match(self, monkeypatch):
+        monkeypatch.setenv('SOFASCORE_INPAGE_FETCH', '0')
+        scraper = self._scraper()
+        calls = []
+        with patch('scrapers.sofascore.camoufox_capture.SofascoreCamoufoxCapture',
+                   self._fakecap_cls(calls)):
+            list(scraper._iter_match_captures(['1', '2']))
+        assert calls == [('nav', '1'), ('nav', '2')]
+
+    @pytest.mark.unit
+    def test_cap_without_fetch_event_degrades_to_nav(self):
+        # A capture layer without fetch_event (or a fetch bug) must degrade to
+        # the old nav-per-match behaviour, not fail the run.
+        scraper = self._scraper()
+        calls = []
+
+        class _NavOnly:
+            def __init__(self, *a, **k):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def capture_event(self, mid, tabs=(), required=()):
+                calls.append(('nav', mid))
+                return {'lineups': {'home': {}, 'away': {}}, 'event': {}}
+
+        with patch('scrapers.sofascore.camoufox_capture.SofascoreCamoufoxCapture',
+                   _NavOnly):
+            out = list(scraper._iter_match_captures(['1', '2']))
+        assert [m for m, _ in out] == ['1', '2']
+        assert calls == [('nav', '1'), ('nav', '2')]
+        assert all(ep.get('lineups') for _, ep in out)
+
+
+class TestPlayerCaptureInPageFetch:
+    """#842 players: only the session's FIRST player navigates (solves
+    Turnstile); later players pull /api/v1/player/{id} (+ season endpoints)
+    via same-origin fetch. A fetch that misses the profile falls back to a
+    full navigation; SOFASCORE_INPAGE_FETCH=0 restores nav-per-player."""
+
+    _GOOD = {'profile': {'id': 1, 'name': 'X'}, 'season_buffer': {}}
+
+    def _scraper(self):
+        from scrapers.sofascore.scraper import SofaScoreScraper
+        with patch('scrapers.base.base_scraper.get_rate_limiter'), \
+             patch('scrapers.base.base_scraper.get_retry_policy'), \
+             patch('scrapers.base.base_scraper.get_circuit_breaker'), \
+             patch('scrapers.base.base_scraper.IcebergWriter'):
+            s = SofaScoreScraper(leagues=['ENG-Premier League'], seasons=[2024])
+        s._proxy_manager = None
+        return s
+
+    def _fakecap_cls(self, calls, fetch_results=None):
+        good = self._GOOD
+
+        class _FakeCap:
+            def __init__(self, *a, **k):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def capture_player(self, pid, season_picker_label=None):
+                calls.append(('nav', pid))
+                return good
+
+            def fetch_player(self, pid, target_ut=None, target_year=None):
+                calls.append(('fetch', pid, target_ut, target_year))
+                if fetch_results is not None:
+                    return fetch_results.get(pid, good)
+                return good
+        return _FakeCap
+
+    @pytest.mark.unit
+    def test_first_player_navigates_then_fetches_with_target(self):
+        scraper = self._scraper()
+        calls = []
+        with patch('scrapers.sofascore.camoufox_capture.SofascoreCamoufoxCapture',
+                   self._fakecap_cls(calls)):
+            out = list(scraper._iter_player_captures(
+                ['1', '2', '3'], season_picker_label='Premier League',
+                target_ut=17, target_year='25/26'))
+        assert [p for p, _ in out] == ['1', '2', '3']
+        # First player warms the session via navigation; the rest fetch with
+        # the (ut, year) target for the precise season-stats resolution.
+        assert calls == [('nav', '1'),
+                         ('fetch', '2', 17, '25/26'),
+                         ('fetch', '3', 17, '25/26')]
+
+    @pytest.mark.unit
+    def test_fetch_miss_falls_back_to_navigation(self):
+        scraper = self._scraper()
+        calls = []
+        miss = {'profile': None, 'season_buffer': {}}
+        with patch('scrapers.sofascore.camoufox_capture.SofascoreCamoufoxCapture',
+                   self._fakecap_cls(calls, fetch_results={'2': miss})):
+            out = list(scraper._iter_player_captures(
+                ['1', '2', '3'], target_ut=17, target_year='25/26'))
+        assert [c[:2] for c in calls] == [('nav', '1'),
+                                          ('fetch', '2'), ('nav', '2'),
+                                          ('fetch', '3')]
+        # The fallback navigation recovered player 2 — nothing lost.
+        assert all(c.get('profile') for _, c in out)
+
+    @pytest.mark.unit
+    def test_kill_switch_restores_nav_per_player(self, monkeypatch):
+        monkeypatch.setenv('SOFASCORE_INPAGE_FETCH', '0')
+        scraper = self._scraper()
+        calls = []
+        with patch('scrapers.sofascore.camoufox_capture.SofascoreCamoufoxCapture',
+                   self._fakecap_cls(calls)):
+            list(scraper._iter_player_captures(['1', '2']))
+        assert calls == [('nav', '1'), ('nav', '2')]
+
+    @pytest.mark.unit
+    def test_cap_without_fetch_player_degrades_to_nav(self):
+        scraper = self._scraper()
+        calls = []
+
+        class _NavOnly:
+            def __init__(self, *a, **k):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def capture_player(self, pid, season_picker_label=None):
+                calls.append(('nav', pid))
+                return {'profile': {'id': int(pid)}, 'season_buffer': {}}
+
+        with patch('scrapers.sofascore.camoufox_capture.SofascoreCamoufoxCapture',
+                   _NavOnly):
+            out = list(scraper._iter_player_captures(['1', '2']))
+        assert calls == [('nav', '1'), ('nav', '2')]
+        assert all(c.get('profile') for _, c in out)

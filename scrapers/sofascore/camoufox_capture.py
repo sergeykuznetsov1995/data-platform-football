@@ -8,11 +8,13 @@ request — ``tls_requests`` (#751), Chromium-FlareSolverr (#751), byparr/Firefo
 (#755) — gets ``403 {"reason":"challenge"}``. The only thing that works is a
 real **Firefox (Camoufox) driven through a residential proxy**, where Turnstile
 passes invisibly and the SPA's own XHRs to **same-origin**
-``www.sofascore.com/api/v1/*`` return real JSON. A naive in-page ``fetch()``
-still 403s (it lacks the token header the SPA attaches), so we cannot replay
-arbitrary URLs — we must let the SPA fire its own requests and **capture the
-responses** (``page.on("response")``). See ``scripts/research/
-probe_sofascore_capture.py`` for the spike that established all of this.
+``www.sofascore.com/api/v1/*`` return real JSON. An in-page ``fetch()`` 403s
+only while Turnstile is UNSOLVED (datacenter IP / cold page); once a navigation
+has passed the challenge, a same-origin fetch carries the clearance cookie and
+succeeds — proven by :meth:`paginate_tournament_season` (#824) and now the
+basis of the cheap per-match path :meth:`fetch_event` (#842). Navigation +
+passive capture (``page.on("response")``) remains the warm-up and fallback.
+See ``scripts/research/probe_sofascore_capture.py`` for the original spike.
 
 This transport drives Camoufox via Playwright, navigates SofaScore SPA pages,
 nudges the deep tabs (Lineups / Statistics / Shotmap) so the SPA fetches them,
@@ -70,6 +72,29 @@ _EVENT_ENDPOINTS = {
     "shotmap": "/api/v1/event/{eid}/shotmap",
     "incidents": "/api/v1/event/{eid}/incidents",
 }
+
+# Deep-tab label → endpoint name(s) an in-page fetch must pull to match what a
+# navigation that clicked that tab would have captured (#842). Both the
+# Statistics and Player-statistics tabs ride on /statistics.
+_TAB_FETCH_NAMES = {
+    "Lineups": ("lineups",),
+    "Statistics": ("statistics",),
+    "Player statistics": ("statistics",),
+    "Shotmap": ("shotmap",),
+}
+
+
+def fetch_names_for_tabs(tabs) -> tuple:
+    """Endpoint names an in-page fetch pass must pull for these deep tabs
+    (#842). ``event`` and ``lineups`` always ride along: navigation mode gets
+    them for free on page load, ``event`` carries homeTeam/awayTeam (the team
+    mapping for event_player_stats) and ``lineups`` is the required primary
+    payload. Unknown labels are ignored; order follows ``_EVENT_ENDPOINTS``
+    for determinism."""
+    wanted = {"event", "lineups"}
+    for tab in tabs or ():
+        wanted.update(_TAB_FETCH_NAMES.get(tab, ()))
+    return tuple(n for n in _EVENT_ENDPOINTS if n in wanted)
 
 # Non-essential resource types we abort via page.route to cut proxy bytes (#842).
 # The SPA only needs its own JS to run + fire the /api/v1 XHRs, so document /
@@ -649,14 +674,86 @@ class SofascoreCamoufoxCapture:
                     event_id, attempt, max_attempts, missing_required,
                 )
 
+        self._log_event_capture(event_id, result, kind="capture")
+        return result
+
+    # In-page fetch JS (#842): same-origin, so it carries the Turnstile
+    # clearance cookie; returns status + raw body text so Python parses it
+    # deterministically (no settle-window race on page.on("response")).
+    _FETCH_JS = """async (path) => {
+        try {
+            const r = await fetch(path, {credentials: 'include',
+                headers: {'accept': 'application/json'}});
+            const t = await r.text();
+            return {status: r.status, body: t};
+        } catch (e) { return {status: null, body: null, error: String(e)}; }
+    }"""
+
+    def fetch_event(
+        self,
+        event_id,
+        names=None,
+        fetch_wait_ms: int = 250,
+    ) -> Dict[str, dict]:
+        """Pull the per-event endpoints via same-origin in-page ``fetch`` on
+        the ALREADY-NAVIGATED page — no re-navigation (#842).
+
+        A navigation costs ~2 MB of residential proxy per match: ``page.route``
+        (resource blocking) disables the HTTP cache, so every nav re-downloads
+        the SPA JS bundle. The session's first navigation already passed
+        Turnstile, so a same-origin fetch carries the clearance cookie — the
+        exact mechanism live-proven by :meth:`paginate_tournament_season`
+        (#824). Only the JSON endpoints travel (~0.1-0.2 MB/match).
+
+        Each response is parsed HERE and merged into the buffer with the same
+        record shape as :meth:`_on_response` (which also fires for the fetch —
+        ``merge_capture`` keeps the best record per path), then read back via
+        :func:`select_event_endpoints`. A challenged endpoint (Turnstile
+        clearance expired) or a failed fetch just stays missing — the caller
+        falls back to a full :meth:`capture_event` navigation, which re-solves
+        Turnstile for the fetches that follow. MUST be called after a
+        navigation in this session (the fetch needs the sofascore.com origin).
+        """
+        names = tuple(names or _EVENT_ENDPOINTS)
+        self._buffer = {}
+        for name in names:
+            tmpl = _EVENT_ENDPOINTS.get(name)
+            if tmpl is None:
+                continue
+            path = tmpl.format(eid=event_id)
+            try:
+                res = self._page.evaluate(self._FETCH_JS, path) or {}
+            except Exception as e:  # noqa: BLE001 — one endpoint mustn't kill the pass
+                logger.info("sofascore fetch event=%s %s failed: %s",
+                            event_id, name, e)
+                res = {}
+            rec = {"status": res.get("status"), "json": None, "challenge": None}
+            body = res.get("body")
+            if body:
+                try:
+                    obj = json.loads(body)
+                    rec["json"] = obj
+                    rec["challenge"] = is_challenge(obj)
+                except Exception:  # noqa: BLE001 — non-JSON body
+                    pass
+            self._buffer[path] = merge_capture(self._buffer.get(path), rec)
+            try:
+                self._page.wait_for_timeout(fetch_wait_ms)
+            except Exception:  # noqa: BLE001 — pacing must not break the pass
+                pass
+        result = select_event_endpoints(self._buffer, event_id)
+        self._log_event_capture(event_id, result, kind="fetch")
+        return result
+
+    def _log_event_capture(self, event_id, result, kind: str) -> None:
+        """Per-event capture summary + byte/block deltas (#842 accounting)."""
         missing = [k for k in _EVENT_ENDPOINTS if k not in result]
         delta = self._bytes_total - self._bytes_at_event_start
         self._bytes_at_event_start = self._bytes_total
         blocked = self._blocked_count - self._blocked_at_event_start
         self._blocked_at_event_start = self._blocked_count
-        logger.info("sofascore capture event=%s got=%s missing=%s bytes=%.0fKB blocked=%d",
-                    event_id, sorted(result), missing, delta / 1024, blocked)
-        return result
+        logger.info("sofascore %s event=%s got=%s missing=%s bytes=%.0fKB blocked=%d",
+                    kind, event_id, sorted(result), missing, delta / 1024, blocked)
 
     def capture_player(self, player_id, *, season_picker_label=None) -> Dict:
         """Navigate a player page, read the SSR'd bio from ``__NEXT_DATA__``, and
@@ -752,6 +849,87 @@ class SofascoreCamoufoxCapture:
             self._page.wait_for_timeout(self._tab_wait_ms)
         except Exception as e:  # noqa: BLE001 — picker driving is best-effort
             logger.info("sofascore season-picker drive failed: %s", e)
+
+    def fetch_player(
+        self,
+        player_id,
+        target_ut=None,
+        target_year=None,
+        fetch_wait_ms: int = 250,
+    ) -> Dict:
+        """Pull a player's bio + season-aggregate stats via same-origin
+        in-page ``fetch`` — no navigation (#842). Returns the same
+        ``{'profile', 'season_buffer'}`` shape as :meth:`capture_player`.
+
+        The player page SSRs ``props.pageProps.player`` from the very same
+        ``/api/v1/player/{id}`` payload (live-probed 2026-07-02: identical
+        keys AND values), so the fetch replaces reading ``__NEXT_DATA__``.
+        Season stats skip the Season-tab picker entirely:
+        ``/statistics/seasons`` resolves the target ``(ut, year)`` →
+        ``season_id`` in Python, then the exact ``statistics/overall`` is
+        fetched — more precise than the picker, which missed for transferred
+        players (#751 PR3b). A challenged/failed bio fetch returns
+        ``profile=None`` — the caller falls back to a full
+        :meth:`capture_player` navigation (re-solves Turnstile). MUST be
+        called after a navigation in this session (same-origin fetch).
+        """
+        pid = str(player_id)
+        buffer: Dict[str, dict] = {}
+
+        def _fetch(path: str) -> dict:
+            try:
+                res = self._page.evaluate(self._FETCH_JS, path) or {}
+            except Exception as e:  # noqa: BLE001 — one endpoint mustn't kill the pass
+                logger.info("sofascore fetch player=%s %s failed: %s",
+                            pid, path, e)
+                res = {}
+            rec = {"status": res.get("status"), "json": None, "challenge": None}
+            body = res.get("body")
+            if body:
+                try:
+                    obj = json.loads(body)
+                    rec["json"] = obj
+                    rec["challenge"] = is_challenge(obj)
+                except Exception:  # noqa: BLE001 — non-JSON body
+                    pass
+            buffer[path] = rec
+            try:
+                self._page.wait_for_timeout(fetch_wait_ms)
+            except Exception:  # noqa: BLE001 — pacing must not break the pass
+                pass
+            return rec
+
+        rec = _fetch(f"/api/v1/player/{pid}")
+        profile = None
+        if (rec.get("status") == 200 and rec.get("challenge") is False
+                and isinstance(rec.get("json"), dict)):
+            p = rec["json"].get("player")
+            profile = p if isinstance(p, dict) else None
+
+        season_buffer: Dict[str, dict] = {}
+        if profile is not None and target_ut is not None:
+            _fetch(f"/api/v1/player/{pid}/statistics/seasons")
+            sid = (extract_player_seasons_map(buffer, pid)
+                   .get(int(target_ut)) or {}).get(str(target_year))
+            if sid is not None:
+                _fetch(
+                    f"/api/v1/player/{pid}/unique-tournament/{int(target_ut)}"
+                    f"/season/{int(sid)}/statistics/overall")
+            season_buffer = {
+                p: r for p, r in buffer.items()
+                if _PLAYER_SEASON_STATS_RE.search(p)
+                or _PLAYER_SEASONS_LIST_RE.search(p)
+            }
+
+        delta = self._bytes_total - self._bytes_at_event_start
+        self._bytes_at_event_start = self._bytes_total
+        blocked = self._blocked_count - self._blocked_at_event_start
+        self._blocked_at_event_start = self._blocked_count
+        logger.info(
+            "sofascore fetch player=%s profile=%s season_xhrs=%d "
+            "bytes=%.0fKB blocked=%d",
+            pid, profile is not None, len(season_buffer), delta / 1024, blocked)
+        return {"profile": profile, "season_buffer": season_buffer}
 
     def capture_buffer(self, nav_url: str) -> Dict[str, dict]:
         """Navigate ``nav_url`` and return the whole capture buffer (path -> rec).

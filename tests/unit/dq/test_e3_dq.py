@@ -85,7 +85,11 @@ class TestCheckCounts:
 
     def test_gold_e3_total_check_count(self):
         """Gold builders total: fct_event (11) + fct_shot (7) + fct_shot_audit (4,
-        #602) + fct_lineup (13) = 35.
+        #602) + fct_lineup (14) = 36.
+
+        fct_lineup grew by 1 in #839 — added the ``lineup_starter_orphan_zero``
+        ERROR gate (every FBref starter must resolve; unused-sub NULLs are an
+        accepted structural floor).
 
         fct_event grew by 1 check in Task 2.1 — Phase B re-enabled the
         ``ref_integrity[fct_event.match_id -> silver.xref_match]``
@@ -97,8 +101,8 @@ class TestCheckCounts:
         fct_shot_audit (#602): no_duplicates + no_nulls + coverage + xg_divergence.
         """
         checks = e3_dq.build_gold_e3_checks()
-        assert len(checks) == 35, (
-            f"Gold E3 expected 35 checks, got {len(checks)}: "
+        assert len(checks) == 36, (
+            f"Gold E3 expected 36 checks, got {len(checks)}: "
             f"{[c.name for c in checks]}"
         )
 
@@ -135,16 +139,16 @@ class TestCheckCounts:
             if c.params.get("table") == "iceberg.gold.fct_lineup"
             or c.params.get("child") == "gold.fct_lineup"
         ]
-        assert len(fct_lineup) == 13  # +sofascore +fotmob +whoscored coverage (#693)
+        assert len(fct_lineup) == 14  # +lineup_starter_orphan_zero ERROR (#839)
 
     def test_build_all_e3_checks_total(self):
-        """40 silver + 35 gold = 75 total E3 standard DQ checks.
+        """40 silver + 36 gold = 76 total E3 standard DQ checks.
 
         Bump when either ``build_silver_e3_checks`` (40) or
-        ``build_gold_e3_checks`` (35) gains a builder.
+        ``build_gold_e3_checks`` (36) gains a builder.
         """
         all_checks = e3_dq.build_all_e3_checks()
-        assert len(all_checks) == 75
+        assert len(all_checks) == 76
 
 
 # ===========================================================================
@@ -308,6 +312,25 @@ class TestErrorSeverityChecks:
         coverage = [c for c in checks if c.name == "fbref_coverage_dominant"]
         assert len(coverage) == 1
         assert coverage[0].severity == "ERROR"
+
+    def test_fct_lineup_starter_orphan_zero_is_error(self):
+        """#839: every FBref starter must resolve — 0 starter orphans (ERROR).
+
+        Unused substitutes (is_starter=false) with no senior FBref stats row are
+        an accepted structural NULL floor, but a NULL-player STARTER means the
+        resolver dropped someone who actually played — a real regression that
+        must fail the gate, not degrade to a WARNING.
+        """
+        checks = e3_dq.build_gold_e3_checks()
+        starter = [c for c in checks if c.name == "lineup_starter_orphan_zero"]
+        assert len(starter) == 1
+        c = starter[0]
+        assert c.severity == "ERROR"
+        assert c.params.get("max_rows") == 0
+        where = c.params.get("where")
+        assert "is_starter = true" in where
+        assert "player_id IS NULL" in where
+        assert "lineup_source = 'fbref'" in where
 
     def test_xg_value_range_present_with_zero_one_bounds(self):
         """xG bounds [0, 1] — out-of-bounds = upstream model regression.
@@ -522,12 +545,14 @@ class TestOrphanAndCoverageGuards:
     def test_lineup_orphan_player_rate_scoped_to_fbref(self):
         """#519: orphan rate must measure FBref rows only — ESPN player_id is
         NULL by design (no ESPN resolver), so an unscoped guard is permanent
-        noise. Cap re-derived from FBref row count (10% × 145K)."""
+        noise. #839: cap tightened 10% → 3% of 145K — the residual is a
+        structural unused-sub floor (~1.9%), so a 3% ceiling still passes clean
+        while catching a resolver regression that drops real players."""
         checks = e3_dq.build_gold_e3_checks()
         ln = next(c for c in checks if c.name == "lineup_orphan_player_rate")
         assert ln.severity == "WARNING"
         assert "lineup_source = 'fbref'" in ln.params["where"]
-        assert ln.params["max_rows"] == int(0.10 * 145_000)
+        assert ln.params["max_rows"] == int(0.03 * 145_000)
 
     def test_spadl_unknown_rate_capped(self):
         """spadl_coverage_unknown_rate must cap at 40K rows (R3 baseline 17.5K

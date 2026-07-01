@@ -8,6 +8,7 @@ Source: https://www.sofascore.com
 """
 
 import logging
+import os
 import time
 from collections import defaultdict
 from datetime import datetime
@@ -823,8 +824,25 @@ class SofaScoreScraper(SoccerdataScraper):
         proxy dead). The generator owns the browser session — the caller MUST
         ``.close()`` it (via try/finally) so it tears down even on an early
         circuit-breaker break.
+
+        #842 in-page fetch: only the session's FIRST match navigates (solving
+        Turnstile; ~2 MB — page.route disables the HTTP cache, so every nav
+        re-downloads the SPA bundle). Every later match pulls just its JSON
+        endpoints via same-origin ``fetch_event`` (~0.1-0.2 MB). A fetch that
+        raises or misses a ``required`` endpoint (clearance expired, transient
+        miss) falls back to a full ``capture_event`` navigation for that match,
+        which re-solves Turnstile for the fetches that follow. Kill-switch
+        ``SOFASCORE_INPAGE_FETCH=0`` restores nav-per-match (mirrors
+        ``SOFASCORE_BLOCK_RESOURCES``).
         """
-        from scrapers.sofascore.camoufox_capture import SofascoreCamoufoxCapture
+        from scrapers.sofascore.camoufox_capture import (
+            SofascoreCamoufoxCapture,
+            fetch_names_for_tabs,
+        )
+
+        env = os.environ.get('SOFASCORE_INPAGE_FETCH')
+        use_fetch = env is None or env.strip().lower() not in ('0', 'false', 'no')
+        fetch_names = fetch_names_for_tabs(tabs)
 
         match_ids = [str(m) for m in match_ids]
         n = len(match_ids)
@@ -838,18 +856,35 @@ class SofaScoreScraper(SoccerdataScraper):
                 )
             in_session = 0
             consec_fail = 0
+            warmed = False  # True after this session's first full navigation
             with SofascoreCamoufoxCapture(proxy=proxy) as cap:
                 while i < n and in_session < session_max and consec_fail < proxy_fail_max:
                     mid = match_ids[i]
                     self._rate_limiter.acquire()
                     self._stats['requests'] += 1
-                    try:
-                        endpoints = cap.capture_event(
-                            mid, tabs=tabs, required=required,
-                        )
-                    except Exception as e:  # noqa: BLE001 — one bad event mustn't kill the loop
-                        logger.warning("camoufox capture failed for event=%s: %s", mid, e)
-                        endpoints = {}
+                    endpoints = None
+                    if use_fetch and warmed:
+                        try:
+                            endpoints = cap.fetch_event(mid, names=fetch_names)
+                        except Exception as e:  # noqa: BLE001 — degrade to a full nav
+                            logger.info(
+                                "in-page fetch failed for event=%s: %s", mid, e)
+                            endpoints = None
+                        if endpoints is not None and any(
+                                r not in endpoints for r in required):
+                            logger.info(
+                                "in-page fetch missed a required endpoint for "
+                                "event=%s — falling back to full navigation.", mid)
+                            endpoints = None
+                    if endpoints is None:
+                        try:
+                            endpoints = cap.capture_event(
+                                mid, tabs=tabs, required=required,
+                            )
+                            warmed = True
+                        except Exception as e:  # noqa: BLE001 — one bad event mustn't kill the loop
+                            logger.warning("camoufox capture failed for event=%s: %s", mid, e)
+                            endpoints = {}
                     if not endpoints.get('lineups'):
                         self._stats['failures'] += 1
                         self._last_lineup_error = {
@@ -884,32 +919,59 @@ class SofaScoreScraper(SoccerdataScraper):
             if callable(close):
                 close()  # tear down the Camoufox session
 
-    def _iter_player_captures(self, player_ids: List[str], season_picker_label=None):
-        """Yield ``(player_id, capture)`` by navigating each player page through
-        ONE warmed Camoufox session (#751 PR3 + PR3b). ``capture`` is the
-        ``{'profile', 'season_buffer'}`` dict from
-        :meth:`SofascoreCamoufoxCapture.capture_player` — the bio SSR'd in
-        ``__NEXT_DATA__`` plus the Season-tab season-stats capture. When
+    def _iter_player_captures(self, player_ids: List[str], season_picker_label=None,
+                              target_ut=None, target_year=None):
+        """Yield ``(player_id, capture)`` through ONE warmed Camoufox session
+        (#751 PR3 + PR3b). ``capture`` is the ``{'profile', 'season_buffer'}``
+        dict — the bio plus the season-stats capture. When
         ``season_picker_label`` is given (the target tournament's display name,
-        e.g. ``'Premier League'``) the capture also drives the Season tab +
-        picker to fetch season-aggregate stats in the SAME navigation. Mirrors
+        e.g. ``'Premier League'``) the navigation path also drives the Season
+        tab + picker in the SAME navigation. Mirrors
         :meth:`_iter_match_captures`. A ``{'profile': None}`` means the capture
         missed (page didn't render / proxy dead). The generator owns the browser
         session — the caller MUST ``.close()`` it (try/finally) so it tears down
-        even on an early circuit-breaker break."""
+        even on an early circuit-breaker break.
+
+        #842 in-page fetch: only the FIRST player navigates (solves Turnstile,
+        ~2 MB); every later player pulls ``/api/v1/player/{id}`` (+ the two
+        season-stats endpoints resolved via ``target_ut``/``target_year``) via
+        same-origin fetch (~30 KB). A fetch that raises or misses the profile
+        falls back to a full ``capture_player`` navigation for that player.
+        Kill-switch ``SOFASCORE_INPAGE_FETCH=0`` restores nav-per-player."""
         from scrapers.sofascore.camoufox_capture import SofascoreCamoufoxCapture
 
+        env = os.environ.get('SOFASCORE_INPAGE_FETCH')
+        use_fetch = env is None or env.strip().lower() not in ('0', 'false', 'no')
+
         proxy = self._camoufox_proxy()
+        warmed = False  # True after this session's first full navigation
         with SofascoreCamoufoxCapture(proxy=proxy) as cap:
             for pid in player_ids:
                 self._rate_limiter.acquire()
                 self._stats['requests'] += 1
-                try:
-                    capture = cap.capture_player(
-                        str(pid), season_picker_label=season_picker_label)
-                except Exception as e:  # noqa: BLE001 — one bad player mustn't kill the loop
-                    logger.warning("camoufox capture failed for player=%s: %s", pid, e)
-                    capture = {'profile': None, 'season_buffer': {}}
+                capture = None
+                if use_fetch and warmed:
+                    try:
+                        capture = cap.fetch_player(
+                            str(pid), target_ut=target_ut,
+                            target_year=target_year)
+                    except Exception as e:  # noqa: BLE001 — degrade to a full nav
+                        logger.info(
+                            "in-page fetch failed for player=%s: %s", pid, e)
+                        capture = None
+                    if capture is not None and not capture.get('profile'):
+                        logger.info(
+                            "in-page fetch missed profile for player=%s — "
+                            "falling back to full navigation.", pid)
+                        capture = None
+                if capture is None:
+                    try:
+                        capture = cap.capture_player(
+                            str(pid), season_picker_label=season_picker_label)
+                        warmed = True
+                    except Exception as e:  # noqa: BLE001 — one bad player mustn't kill the loop
+                        logger.warning("camoufox capture failed for player=%s: %s", pid, e)
+                        capture = {'profile': None, 'season_buffer': {}}
                 if not capture.get('profile'):
                     self._stats['failures'] += 1
                     self._last_lineup_error = {
@@ -2246,20 +2308,24 @@ class SofaScoreScraper(SoccerdataScraper):
         player_ids: Optional[List[str]] = None,
         limit: Optional[int] = None,
     ) -> Dict[str, pd.DataFrame]:
-        """ONE Camoufox navigation per player → the player_profile Bronze frame
-        (#751 PR3).
+        """Per-player capture → the player_profile Bronze frame (#751 PR3).
 
-        Replaces the dead tls player_profile pass (403'd on Turnstile)
-        with a player-page capture: :meth:`_flatten_player_profile` over the bio
-        SSR'd in ``__NEXT_DATA__`` (``props.pageProps.player``). The bio is
-        server-rendered, so it needs no Turnstile-gated XHR.
+        Replaces the dead tls player_profile pass (403'd on Turnstile). #842:
+        only the FIRST player navigates its page (solving Turnstile); every
+        later player pulls ``/api/v1/player/{id}`` via same-origin in-page
+        fetch (~30 KB vs ~2 MB per navigation) — the page SSRs the identical
+        ``player`` object into ``__NEXT_DATA__``, so both paths feed
+        :meth:`_flatten_player_profile` the same shape. A fetch miss falls
+        back to a full navigation for that player.
 
         Season-aggregate stats (``player_season_stats``) come from the SAME
-        navigation (#751 PR3b): the capture drives the Season tab + a
-        season-picker (the default Season tab is the player's PRIMARY
-        competition, not necessarily EPL for a transferred player — live-proven
-        Paquetá → World Cup), and the right ``(ut, season)`` overall is selected
-        season-guarded via the pure :func:`select_player_season_stats` /
+        pass (#751 PR3b): the fetch path resolves the exact ``(ut, season_id)``
+        from ``/statistics/seasons`` and pulls its ``statistics/overall``;
+        the navigation path drives the Season tab + a season-picker (the
+        default Season tab is the player's PRIMARY competition, not
+        necessarily EPL for a transferred player — live-proven Paquetá →
+        World Cup). Either way the right overall is selected season-guarded
+        via the pure :func:`select_player_season_stats` /
         :func:`extract_player_seasons_map`.
 
         Returns ``{'player_profile', 'player_season_stats'}``. The profile is the
@@ -2329,7 +2395,8 @@ class SofaScoreScraper(SoccerdataScraper):
         max_consecutive = 10  # ~dead proxy / page not rendering — bail early.
 
         captures = self._iter_player_captures(
-            player_ids, season_picker_label=picker_label)
+            player_ids, season_picker_label=picker_label,
+            target_ut=target_ut, target_year=target_season_label)
         try:
             for idx, (pid, capture) in enumerate(captures, start=1):
                 profile = (capture or {}).get('profile')

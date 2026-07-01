@@ -220,6 +220,144 @@ class TestRunSofifaVersionsParsing:
 
 
 # ---------------------------------------------------------------------------
+# Incremental version_id skip
+# ---------------------------------------------------------------------------
+_HEAVY_METHODS = (
+    'read_players', 'read_teams', 'read_team_ratings', 'read_player_ratings',
+)
+_LIGHT_METHODS = ('read_versions', 'read_leagues')
+
+
+def _build_versioned_scraper():
+    """Stub scraper whose reader exposes a real ``versions`` frame, so the
+    incremental check resolves latest version_id = 260035 ('FC 26')."""
+    scraper = _build_scraper(errors=False).return_value
+    reader = MagicMock()
+    reader.versions = pd.DataFrame(
+        [{'fifa_edition': 'FC 26', 'update': 'Jun 24, 2026'}],
+        index=pd.Index([260035], name='version_id'),
+    )
+    scraper._get_reader.return_value = reader
+    return scraper
+
+
+def _run_main_with_probe(args, scraper, *, bronze_current):
+    """Like ``_run_main`` but stubs the Bronze probe on the reloaded module.
+
+    Returns ``(exit_code, probe_mock)``.
+    """
+    stub_pkg = MagicMock()
+    stub_pkg.SoFIFAScraper = MagicMock(return_value=scraper)
+    sys.argv = ["run_sofifa_scraper.py"] + args
+    with patch.dict(sys.modules, {"scrapers.sofifa": stub_pkg}):
+        sys.modules.pop("dags.scripts.run_sofifa_scraper", None)
+        mod = importlib.import_module("dags.scripts.run_sofifa_scraper")
+        importlib.reload(mod)
+        probe = MagicMock(return_value=bronze_current)
+        mod._bronze_up_to_date = probe
+        return mod.main(), probe
+
+
+class TestSofifaIncrementalSkip:
+    """When Bronze already carries the latest sofifa version_id, the heavy
+    steps (players/teams/team_ratings/player_ratings) must not run at all —
+    only the two 1-request lookups (versions/leagues) refresh."""
+
+    @pytest.fixture
+    def temp_output(self):
+        fd, path = tempfile.mkstemp(suffix=".json", prefix="sofifa_")
+        os.close(fd)
+        yield path
+        if os.path.exists(path):
+            os.unlink(path)
+
+    @pytest.mark.unit
+    def test_skip_when_bronze_current(self, temp_output):
+        scraper = _build_versioned_scraper()
+
+        rc, probe = _run_main_with_probe(
+            ["--output", temp_output], scraper, bronze_current=True,
+        )
+
+        assert rc == 0
+        probe.assert_called_once_with(260035, 'FC 26', 'Jun 24, 2026')
+        for m in _HEAVY_METHODS:
+            getattr(scraper, m).assert_not_called()
+        for m in _LIGHT_METHODS:
+            getattr(scraper, m).assert_called_once()
+        with open(temp_output) as f:
+            payload = json.load(f)
+        assert payload["skipped"] == {
+            "reason": "version_unchanged", "version_id": 260035,
+        }
+        assert payload["errors"] == []
+
+    @pytest.mark.unit
+    def test_full_run_when_bronze_stale(self, temp_output):
+        scraper = _build_versioned_scraper()
+
+        rc, probe = _run_main_with_probe(
+            ["--output", temp_output], scraper, bronze_current=False,
+        )
+
+        assert rc == 0
+        probe.assert_called_once()
+        for m in _HEAVY_METHODS:
+            getattr(scraper, m).assert_called_once()
+        with open(temp_output) as f:
+            payload = json.load(f)
+        assert "skipped" not in payload
+
+    @pytest.mark.unit
+    def test_force_full_bypasses_probe(self, temp_output):
+        scraper = _build_versioned_scraper()
+
+        rc, probe = _run_main_with_probe(
+            ["--force-full", "--output", temp_output],
+            scraper, bronze_current=True,
+        )
+
+        assert rc == 0
+        probe.assert_not_called()
+        for m in _HEAVY_METHODS:
+            getattr(scraper, m).assert_called_once()
+
+    @pytest.mark.unit
+    def test_explicit_versions_bypass_probe(self, temp_output):
+        """An explicit version list is a deliberate backfill — never skipped."""
+        scraper = _build_versioned_scraper()
+
+        rc, probe = _run_main_with_probe(
+            ["--versions", "180084", "--output", temp_output],
+            scraper, bronze_current=True,
+        )
+
+        assert rc == 0
+        probe.assert_not_called()
+        for m in _HEAVY_METHODS:
+            getattr(scraper, m).assert_called_once()
+
+    @pytest.mark.unit
+    def test_probe_error_falls_back_to_full_run(self, temp_output):
+        """Fail-open: a broken probe (Trino down etc.) must never block the
+        scrape — and must not fail the run either."""
+        scraper = _build_versioned_scraper()
+        stub_pkg = MagicMock()
+        stub_pkg.SoFIFAScraper = MagicMock(return_value=scraper)
+        sys.argv = ["run_sofifa_scraper.py", "--output", temp_output]
+        with patch.dict(sys.modules, {"scrapers.sofifa": stub_pkg}):
+            sys.modules.pop("dags.scripts.run_sofifa_scraper", None)
+            mod = importlib.import_module("dags.scripts.run_sofifa_scraper")
+            importlib.reload(mod)
+            mod._bronze_up_to_date = MagicMock(side_effect=RuntimeError("boom"))
+            rc = mod.main()
+
+        assert rc == 0
+        for m in _HEAVY_METHODS:
+            getattr(scraper, m).assert_called_once()
+
+
+# ---------------------------------------------------------------------------
 # #583: completeness-guard wiring
 # ---------------------------------------------------------------------------
 def _build_guard_scraper(*, guard_blocks: bool = False, with_edition: bool = True):

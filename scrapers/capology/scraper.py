@@ -48,13 +48,20 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 _CAPOLOGY_BASE = "https://www.capology.com"
-_SALARIES_PATH = "/uk/{league_slug}/salaries/{season_long}/"
-_PAYROLLS_PATH = "/uk/{league_slug}/payrolls/{season_long}/"
-_CONTRACTS_PATH = "/uk/{league_slug}/contract-extensions/{season_long}/"
-_TRANSFERS_PATH = "/uk/{league_slug}/transfer-window/{season_long}/"
+_SALARIES_PATH = "/{country}/{league_slug}/salaries/{season_long}/"
+_PAYROLLS_PATH = "/{country}/{league_slug}/payrolls/{season_long}/"
+_CONTRACTS_PATH = "/{country}/{league_slug}/contract-extensions/{season_long}/"
+_TRANSFERS_PATH = "/{country}/{league_slug}/transfer-window/{season_long}/"
 
-CAPOLOGY_LEAGUE_MAP: Dict[str, str] = {
-    'ENG-Premier League': 'premier-league',
+# league key → (country prefix, league slug). The first URL segment is the
+# LEAGUE's country code, not a display locale: /uk/la-liga/... 404s while
+# /es/la-liga/... serves data (probed live 2026-07-01).
+CAPOLOGY_LEAGUE_MAP: Dict[str, tuple] = {
+    'ENG-Premier League': ('uk', 'premier-league'),
+    'ESP-La Liga': ('es', 'la-liga'),
+    'GER-Bundesliga': ('de', '1-bundesliga'),
+    'ITA-Serie A': ('it', 'serie-a'),
+    'FRA-Ligue 1': ('fr', 'ligue-1'),
 }
 
 CAPOLOGY_SUPPORTED_CURRENCIES = ('GBP', 'EUR', 'USD')
@@ -199,74 +206,46 @@ def _extract_anchor_text(html_snippet: str) -> Optional[str]:
 def _parse_row_block(block: str) -> Optional[Dict]:
     """Project one ``{...}`` row from the inline JS array.
 
-    Capology's row literal is JS, not JSON; we extract by field-by-field
-    regex (more robust than `json.loads` after quote normalisation, given
-    the embedded HTML strings + ``accounting.formatMoney(...)`` calls).
+    Capology's row literal is JS, not JSON; extraction is field-by-field via
+    the quote-tolerant helpers (``_Q``) — the site has shipped both `'` and
+    `"` key quoting (salaries vs payrolls differ today), so a quote-style
+    switch on the salaries page must not zero the parse.
     """
-    out: Dict[str, object] = {}
-
     # `name` → HTML <a>; extract slug + display name.
-    name_match = re.search(r"'name'\s*:\s*\"([^\"]*)\"", block)
-    if name_match:
-        name_html = name_match.group(1)
-        slug_m = _NAME_HREF_RE.search(name_html)
-        out['player_slug'] = slug_m.group(1) if slug_m else None
-        out['player_name'] = _extract_anchor_text(name_html)
-    else:
+    name_html = _str_field(block, 'name')
+    if not name_html:
         return None
+    out: Dict[str, object] = {}
+    slug_m = _NAME_HREF_RE.search(name_html)
+    out['player_slug'] = slug_m.group(1) if slug_m else None
+    out['player_name'] = _extract_anchor_text(name_html)
 
     # `club` → HTML <a> or plain string.
-    club_match = re.search(r"'club'\s*:\s*\"([^\"]*)\"", block)
-    if club_match:
-        club_html = club_match.group(1)
-        slug_m = _CLUB_HREF_RE.search(club_html)
-        out['club_slug'] = slug_m.group(1) if slug_m else None
-        out['club_name'] = _extract_anchor_text(club_html) or club_html
-    else:
-        out['club_slug'] = None
-        out['club_name'] = None
+    out['club_slug'], out['club_name'] = _club_anchor(block)
 
     # `country` → plain string ("Norway") on the live site; older dumps wrap
     # it in an <img class='flag'> snippet. Handle both.
-    country_match = re.search(r"'country'\s*:\s*\"([^\"]*)\"", block)
-    if country_match:
-        country_val = country_match.group(1)
-        if '<img' in country_val:
-            flag = _FLAG_RE.search(country_val)
-            out['country_code'] = flag.group(1) if flag else None
-        else:
-            out['country_code'] = country_val or None
+    country_val = _str_field(block, 'country')
+    if country_val and '<img' in country_val:
+        flag = _FLAG_RE.search(country_val)
+        out['country_code'] = flag.group(1) if flag else None
     else:
-        out['country_code'] = None
+        out['country_code'] = country_val or None
 
     # `verified` → either an HTML <img> with verified-green icon, or a
     # plain "True"/"False" string (Capology has shipped both shapes).
-    verified_match = re.search(r"'verified'\s*:\s*\"([^\"]*)\"", block)
-    if verified_match:
-        val = verified_match.group(1)
-        out['verified'] = (
-            'verified-green' in val.lower() or val.lower() == 'true'
-        )
-    else:
-        out['verified'] = False
+    verified_val = _str_field(block, 'verified') or ''
+    out['verified'] = (
+        'verified-green' in verified_val.lower()
+        or verified_val.lower() == 'true'
+    )
 
     # `age` is wrapped in ``Math.round("24")``; extract the numeric literal.
-    age_match = re.search(r"'age'\s*:\s*Math\.round\(\s*\"?([\d\.\-]+)", block)
-    if age_match:
-        try:
-            out['age'] = int(float(age_match.group(1)))
-        except ValueError:
-            out['age'] = None
-    else:
-        m = re.search(r"'age'\s*:\s*\"?(-?\d+)", block)
-        out['age'] = int(m.group(1)) if m else None
+    out['age'] = _int_field(block, 'age')
 
     # `position` (plain literal) + `status` (sometimes HTML span).
-    for field, key in [('position', 'position'), ('status', 'status')]:
-        m = re.search(
-            rf"'{field}'\s*:\s*(?:\"([^\"]*)\"|'([^']*)')", block,
-        )
-        val = (m.group(1) or m.group(2)) if m else None
+    for key in ('position', 'status'):
+        val = _str_field(block, key)
         if val and '<' in val:
             txt = re.search(r'>([^<>]+)</', val)
             val = txt.group(1).strip() if txt else None
@@ -274,39 +253,20 @@ def _parse_row_block(block: str) -> Optional[Dict]:
 
     # Booleans arrive either as JS literal (`true`/`false`) or quoted string
     # (`"True"`/`"False"`).
-    for field, key in [('active', 'active'), ('loan', 'loan')]:
+    for key in ('active', 'loan'):
         m = re.search(
-            rf"'{field}'\s*:\s*(true|false|\"True\"|\"False\")", block,
+            rf"{_Q}{key}{_Q}\s*:\s*(true|false|\"True\"|\"False\"|'True'|'False')",
+            block,
         )
         if not m:
             out[key] = None
             continue
-        out[key] = m.group(1).strip('"').lower() == 'true'
+        out[key] = m.group(1).strip('"\'').lower() == 'true'
 
     # Salary fields — all three currencies (GBP/EUR/USD) arrive inline in the
     # same row as `{base}_{gbp,eur,usd}` keys, so we extract the full symmetric
     # set in one pass (no extra HTTP). Currency partition still tags 'GBP'.
-    for base in CAPOLOGY_MONEY_BASES:
-        for ccy in CAPOLOGY_MONEY_CURRENCIES:
-            field = f'{base}_{ccy}'
-            m = re.search(
-                rf"'{field}'\s*:\s*accounting\.formatMoney\(\s*\"?(\-?[\d.]+)",
-                block,
-            )
-            if m:
-                raw = m.group(1)
-                try:
-                    # Some fields are wrapped in a divide expression
-                    # (e.g. ``"27300000"/52``) — the value we capture is
-                    # already the dividend, so floor-divide by 52 for weekly.
-                    if base.startswith('weekly_'):
-                        out[field] = int(float(raw)) // 52
-                    else:
-                        out[field] = int(float(raw))
-                except (TypeError, ValueError):
-                    out[field] = None
-            else:
-                out[field] = None
+    out.update(_money_cols(block, CAPOLOGY_MONEY_BASES))
 
     return out
 
@@ -559,6 +519,11 @@ class CapologyScraper(BaseScraper):
         # (a 403 CF block page is billed too). Surfaced via get_traffic_stats().
         self._proxy_bytes: int = 0
         self._proxy_bytes_by_host: Dict[str, int] = defaultdict(int)
+        # True once any request actually went through a proxy — lets the
+        # runner skip the proxy_traffic_runs persist for direct-connection
+        # runs (Capology runs proxy-less by default) so the daily report
+        # doesn't over-attribute residential spend.
+        self._proxy_in_use: bool = False
 
     def get_traffic_stats(self) -> Dict:
         """Residential-proxy bytes seen this run (#789).
@@ -574,6 +539,7 @@ class CapologyScraper(BaseScraper):
         return {
             'proxy_response_bytes': self._proxy_bytes,
             'proxy_response_mb': round(self._proxy_bytes / 1024 / 1024, 4),
+            'proxied': self._proxy_in_use,
             'requests': int(self._stats.get('requests', 0)),
             'top_traffic_urls': [
                 {
@@ -612,6 +578,8 @@ class CapologyScraper(BaseScraper):
         elif self.proxy:
             proxy_url = self.proxy
 
+        if proxy_url:
+            self._proxy_in_use = True
         client = (
             tls_requests.Client(proxy=proxy_url)
             if proxy_url else tls_requests.Client()
@@ -678,10 +646,21 @@ class CapologyScraper(BaseScraper):
                     last_error = "HTTP 429 rate-limited"
                     time.sleep(2 ** attempt)
                 elif resp.status_code == 404:
-                    logger.info(
-                        "%s not exposed (%s) — 404", label, context or url,
+                    # A 404 on a mapped league is a real problem (wrong
+                    # country prefix / league slug / season URL) — record it
+                    # so the runner classifies http_404 (red), not a silent
+                    # empty_payload soft-success.
+                    logger.warning(
+                        "%s 404 (%s) — check league slug / country prefix "
+                        "/ season URL", label, context or url,
                     )
-                    self._stats['successes'] += 1
+                    self._stats['failures'] += 1
+                    self._last_endpoint_error = {
+                        'label': label,
+                        'status': 404,
+                        'error': 'HTTP 404',
+                        **(context or {}),
+                    }
                     return None
                 else:
                     if proxy_obj is not None:
@@ -745,13 +724,14 @@ class CapologyScraper(BaseScraper):
             )
             return pd.DataFrame(columns=anchor_cols + ['_ingested_at'])
 
-        league_slug = CAPOLOGY_LEAGUE_MAP[league]
+        country, league_slug = CAPOLOGY_LEAGUE_MAP[league]
         season_long = _season_long(season)
         season_short = _season_short(season)
         url = (
             f"{_CAPOLOGY_BASE}"
             + _SALARIES_PATH.format(
-                league_slug=league_slug, season_long=season_long,
+                country=country, league_slug=league_slug,
+                season_long=season_long,
             )
         )
 
@@ -818,11 +798,11 @@ class CapologyScraper(BaseScraper):
             )
             return pd.DataFrame(columns=cols)
 
-        league_slug = CAPOLOGY_LEAGUE_MAP[league]
+        country, league_slug = CAPOLOGY_LEAGUE_MAP[league]
         season_long = _season_long(season)
         season_short = _season_short(season)
         url = _CAPOLOGY_BASE + path_tmpl.format(
-            league_slug=league_slug, season_long=season_long,
+            country=country, league_slug=league_slug, season_long=season_long,
         )
 
         html = self._fetch_html(

@@ -5,12 +5,15 @@ integration — covered by ``scripts/research/probe_sofascore_capture.py``. Here
 test the pure response-classification / selection logic that decides what counts
 as real data, which has no browser dependency.
 """
+import json
+
 import pytest
 
 from scrapers.sofascore.camoufox_capture import (
     event_url,
     extract_events,
     extract_player_from_next_data,
+    fetch_names_for_tabs,
     finished_event_ids,
     is_challenge,
     is_data_api_url,
@@ -496,6 +499,167 @@ def test_capture_event_accumulates_statistics_across_retry():
     assert "lineups" in result
     assert "statistics" in result
     assert result["statistics"] == {"statistics": [{"period": "ALL"}]}
+
+
+# --------------------------------------------------------------------------- #
+#  In-page fetch (#842) — fetch_names_for_tabs + fetch_event                   #
+# --------------------------------------------------------------------------- #
+def test_fetch_names_for_tabs_all_event_tabs():
+    names = fetch_names_for_tabs(
+        ("Lineups", "Statistics", "Player statistics", "Shotmap"))
+    assert names == ("event", "lineups", "statistics", "shotmap")
+
+
+def test_fetch_names_for_tabs_lineups_only_and_unknown():
+    # event + lineups always ride along; unknown tab labels are ignored.
+    assert fetch_names_for_tabs(("Lineups",)) == ("event", "lineups")
+    assert fetch_names_for_tabs(("Season",)) == ("event", "lineups")
+    assert fetch_names_for_tabs(()) == ("event", "lineups")
+
+
+class TestFetchEvent:
+    """fetch_event (#842): same-origin in-page fetch of the per-event JSON
+    endpoints on the already-navigated page — no re-navigation. Bodies are
+    parsed in Python (no settle-window race) and selected via
+    select_event_endpoints; a challenged/failed endpoint stays missing so the
+    caller can fall back to a full capture_event navigation."""
+
+    def _cap_with_page(self, responder):
+        from unittest.mock import MagicMock
+        cap = _cap_no_browser()
+        cap._page = MagicMock()
+        cap._page.evaluate.side_effect = lambda js, path=None: responder(path)
+        return cap
+
+    def test_fetches_named_endpoints_and_selects_json(self):
+        eid = 42
+        bodies = {
+            f"/api/v1/event/{eid}": {"event": {"id": eid}},
+            f"/api/v1/event/{eid}/lineups": {"home": {}, "away": {}},
+            f"/api/v1/event/{eid}/statistics": {"statistics": []},
+            f"/api/v1/event/{eid}/shotmap": {"shotmap": []},
+        }
+        cap = self._cap_with_page(
+            lambda path: {"status": 200, "body": json.dumps(bodies[path])})
+
+        result = cap.fetch_event(
+            eid, names=("event", "lineups", "statistics", "shotmap"),
+            fetch_wait_ms=0,
+        )
+
+        assert set(result) == {"event", "lineups", "statistics", "shotmap"}
+        assert result["lineups"] == {"home": {}, "away": {}}
+        # No navigation happened — only in-page evaluate calls.
+        cap._page.goto.assert_not_called()
+
+    def test_challenged_endpoint_stays_missing(self):
+        # Clearance expired mid-session: the API starts answering 403 challenge.
+        eid = 7
+
+        def responder(path):
+            if path.endswith("/lineups"):
+                return {"status": 403,
+                        "body": json.dumps({"error": {"reason": "challenge"}})}
+            return {"status": 200, "body": json.dumps({"ok": 1})}
+
+        cap = self._cap_with_page(responder)
+        result = cap.fetch_event(eid, names=("event", "lineups"), fetch_wait_ms=0)
+
+        assert "lineups" not in result   # caller will fall back to a full nav
+        assert "event" in result
+
+    def test_evaluate_error_yields_missing_not_raise(self):
+        def responder(path):
+            raise RuntimeError("page gone")
+
+        cap = self._cap_with_page(responder)
+        result = cap.fetch_event(9, names=("event", "lineups"), fetch_wait_ms=0)
+        assert result == {}
+
+    def test_non_json_body_stays_missing(self):
+        cap = self._cap_with_page(
+            lambda path: {"status": 200, "body": "<html>cf challenge</html>"})
+        result = cap.fetch_event(5, names=("lineups",), fetch_wait_ms=0)
+        assert result == {}
+
+
+class TestFetchPlayer:
+    """fetch_player (#842): in-page fetch of the player bio + season stats —
+    no navigation. /api/v1/player/{id} SSRs the identical `player` object into
+    __NEXT_DATA__ (live-probed 2026-07-02), and the target (ut, season_id) is
+    resolved from /statistics/seasons in Python instead of the picker."""
+
+    _PID = "924378"
+    _PLAYER = {"id": 924378, "name": "Sepp van den Berg", "height": 192}
+    _SEASONS = {"uniqueTournamentSeasons": [{
+        "uniqueTournament": {"id": 17},
+        "seasons": [{"year": "25/26", "id": 76986},
+                    {"year": "24/25", "id": 61627}],
+    }]}
+    _OVERALL = {"statistics": {"rating": 7.1, "appearances": 30}}
+
+    def _cap_with_page(self, responder):
+        from unittest.mock import MagicMock
+        cap = _cap_no_browser()
+        cap._page = MagicMock()
+        cap._page.evaluate.side_effect = lambda js, path=None: responder(path)
+        return cap
+
+    def _responder(self, path):
+        bodies = {
+            f"/api/v1/player/{self._PID}": {"player": self._PLAYER},
+            f"/api/v1/player/{self._PID}/statistics/seasons": self._SEASONS,
+            (f"/api/v1/player/{self._PID}/unique-tournament/17"
+             f"/season/76986/statistics/overall"): self._OVERALL,
+        }
+        return {"status": 200, "body": json.dumps(bodies[path])}
+
+    def test_profile_and_season_stats_fetched(self):
+        cap = self._cap_with_page(self._responder)
+        out = cap.fetch_player(self._PID, target_ut=17, target_year="25/26",
+                               fetch_wait_ms=0)
+        assert out["profile"] == self._PLAYER
+        # seasons list + the EXACT (ut=17, sid=76986) overall — resolved in
+        # Python, no Season-tab picker involved.
+        assert set(out["season_buffer"]) == {
+            f"/api/v1/player/{self._PID}/statistics/seasons",
+            (f"/api/v1/player/{self._PID}/unique-tournament/17"
+             f"/season/76986/statistics/overall"),
+        }
+        # The overall record carries real JSON, ready for
+        # select_player_season_stats downstream.
+        overall = out["season_buffer"][
+            (f"/api/v1/player/{self._PID}/unique-tournament/17"
+             f"/season/76986/statistics/overall")]
+        assert overall["json"] == self._OVERALL
+
+    def test_challenged_bio_returns_profile_none(self):
+        cap = self._cap_with_page(lambda path: {
+            "status": 403,
+            "body": json.dumps({"error": {"reason": "challenge"}}),
+        })
+        out = cap.fetch_player(self._PID, target_ut=17, target_year="25/26",
+                               fetch_wait_ms=0)
+        assert out["profile"] is None       # caller falls back to a full nav
+        assert out["season_buffer"] == {}
+
+    def test_no_target_ut_fetches_bio_only(self):
+        cap = self._cap_with_page(self._responder)
+        out = cap.fetch_player(self._PID, fetch_wait_ms=0)
+        assert out["profile"] == self._PLAYER
+        assert out["season_buffer"] == {}
+        assert cap._page.evaluate.call_count == 1
+
+    def test_unresolved_season_skips_overall_fetch(self):
+        # The player never played the target competition/season — the seasons
+        # list has no (ut, year) match, so no overall fetch fires.
+        cap = self._cap_with_page(self._responder)
+        out = cap.fetch_player(self._PID, target_ut=17, target_year="19/20",
+                               fetch_wait_ms=0)
+        assert out["profile"] == self._PLAYER
+        assert set(out["season_buffer"]) == {
+            f"/api/v1/player/{self._PID}/statistics/seasons"}
+        assert cap._page.evaluate.call_count == 2
 
 
 # --------------------------------------------------------------------------- #

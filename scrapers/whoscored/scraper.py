@@ -589,6 +589,12 @@ class WhoScoredScraper(SoccerdataScraper):
             if not chunk:
                 return
             combined = pd.concat(chunk, ignore_index=True)
+            # JSON-encode list/dict columns (e.g. ``qualifiers``) BEFORE the
+            # Trino INSERT, mirroring the schedule path (see ``_save``). Without
+            # this, ``trino_manager._format_sql_value`` calls ``pd.isna(list)``
+            # and raises "truth value of an empty array is ambiguous" on events
+            # whose ``qualifiers`` is an empty list.
+            combined = self._serialize_nested_columns(combined)
             combined = self._add_metadata(combined, 'events')
             path = self.save_to_iceberg(
                 df=combined,

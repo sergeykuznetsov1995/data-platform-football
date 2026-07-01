@@ -4,6 +4,8 @@ Covers the JS literal parser and helpers. Live HTTP path is covered by
 the probe script + DAG smoke runs in a container.
 """
 
+from unittest.mock import MagicMock, patch
+
 import pytest
 
 from scrapers.capology import CapologyScraper
@@ -196,6 +198,25 @@ class TestIterRowBlocks:
         assert row['annual_gross_usd'] is None
         assert row['age'] is None
 
+    def test_double_quoted_keys_variant(self):
+        # payrolls/transfer-window already quote keys with `"`; the salaries
+        # parser must survive the same switch (quote-tolerant helpers).
+        block = (
+            '{'
+            '"name": "<a href=\'/player/x-1/\'>X</a>",'
+            '"age": Math.round("24"),'
+            '"active": "True",'
+            '"annual_gross_gbp": accounting.formatMoney("100000", "£ ", 0),'
+            '"weekly_gross_gbp": accounting.formatMoney(("100000"/52), "£ ", 0)'
+            '}'
+        )
+        row = _parse_row_block(block)
+        assert row['player_slug'] == 'x-1'
+        assert row['age'] == 24
+        assert row['active'] is True
+        assert row['annual_gross_gbp'] == 100_000
+        assert row['weekly_gross_gbp'] == 100_000 // 52
+
 
 class TestParseSalaryTable:
     def test_picks_up_multiple_rows(self):
@@ -223,7 +244,15 @@ class TestParseSalaryTable:
 
 class TestConstants:
     def test_league_map(self):
-        assert CAPOLOGY_LEAGUE_MAP['ENG-Premier League'] == 'premier-league'
+        # (country prefix, slug) — the first URL segment is the league's
+        # country code, not a locale (probed live 2026-07-01).
+        assert CAPOLOGY_LEAGUE_MAP['ENG-Premier League'] == (
+            'uk', 'premier-league',
+        )
+        assert CAPOLOGY_LEAGUE_MAP['ESP-La Liga'] == ('es', 'la-liga')
+        assert CAPOLOGY_LEAGUE_MAP['GER-Bundesliga'] == ('de', '1-bundesliga')
+        assert CAPOLOGY_LEAGUE_MAP['ITA-Serie A'] == ('it', 'serie-a')
+        assert CAPOLOGY_LEAGUE_MAP['FRA-Ligue 1'] == ('fr', 'ligue-1')
 
     def test_supported_currencies(self):
         assert CAPOLOGY_SUPPORTED_CURRENCIES == ('GBP', 'EUR', 'USD')
@@ -343,3 +372,59 @@ class TestContractHistoryFloor:
         assert df.empty
         # schema preserved so the runner still soft-falls back cleanly
         assert 'contract_total_gross_gbp' in df.columns
+
+
+# ---------------------------------------------------------------------------
+# Big-5 URL construction: the country prefix belongs to the LEAGUE
+# (/uk/la-liga/ → 404, /es/la-liga/ → 200; probed live 2026-07-01).
+# ---------------------------------------------------------------------------
+
+class TestLeagueUrls:
+    @pytest.mark.parametrize("league,expected_url", [
+        ('ENG-Premier League',
+         'https://www.capology.com/uk/premier-league/salaries/2024-2025/'),
+        ('ESP-La Liga',
+         'https://www.capology.com/es/la-liga/salaries/2024-2025/'),
+        ('GER-Bundesliga',
+         'https://www.capology.com/de/1-bundesliga/salaries/2024-2025/'),
+        ('ITA-Serie A',
+         'https://www.capology.com/it/serie-a/salaries/2024-2025/'),
+        ('FRA-Ligue 1',
+         'https://www.capology.com/fr/ligue-1/salaries/2024-2025/'),
+    ])
+    def test_salaries_url_per_league(self, league, expected_url):
+        scr = CapologyScraper(leagues=[league], seasons=[2024])
+        with patch.object(scr, '_fetch_html', return_value=None) as fetch:
+            scr.read_player_salaries(league, 2024)
+        assert fetch.call_args.args[0] == expected_url
+
+    def test_product_url_uses_league_country_prefix(self):
+        scr = CapologyScraper(leagues=['ESP-La Liga'], seasons=[2024])
+        with patch.object(scr, '_fetch_html', return_value=None) as fetch:
+            scr.read_team_payrolls('ESP-La Liga', 2024)
+        assert fetch.call_args.args[0] == (
+            'https://www.capology.com/es/la-liga/payrolls/2024-2025/'
+        )
+
+
+class Test404RecordsEndpointError:
+    """A 404 on a mapped league means a broken URL (wrong prefix/slug/season)
+    — must surface as http_404 (runner exit 1), not a silent empty_payload."""
+
+    def test_404_sets_last_endpoint_error_and_failure(self):
+        scr = CapologyScraper(leagues=['ENG-Premier League'], seasons=[2024])
+        resp = MagicMock(status_code=404, content=b'', text='not found')
+        client = MagicMock()
+        client.get.return_value = resp
+        with patch.object(
+            scr, '_build_tls_session', return_value=(client, None),
+        ):
+            out = scr._fetch_html(
+                'https://www.capology.com/uk/premier-league/salaries/1990-1991/',
+                label='salaries', context={'league': 'ENG-Premier League'},
+            )
+        assert out is None
+        assert scr._last_endpoint_error['status'] == 404
+        assert scr._stats['failures'] == 1
+        # single deterministic attempt — no retry loop on 404
+        assert client.get.call_count == 1

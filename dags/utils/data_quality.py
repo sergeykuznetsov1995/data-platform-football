@@ -431,7 +431,7 @@ def _run_row_count(conn, check: Check) -> Dict[str, Any]:
     passed = count >= min_r and (max_r is None or count <= max_r)
     return {
         'passed': passed,
-        'details': f"count={count}, expected>={min_r}" + (f", <={max_r}" if max_r else ""),
+        'details': f"count={count}, expected>={min_r}" + (f", <={max_r}" if max_r is not None else ""),
         'value': count,
     }
 
