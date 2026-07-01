@@ -357,10 +357,13 @@ with DAG(
         # Pre-flight: verify Trino is reachable before schedule/match tasks
         trino_check = create_trino_health_check_task()
 
-        # Schedule task uses nodriver
+        # Schedule task runs through the selenium scraper-type so it uses
+        # FBrefScraper (and thus the Camoufox transport via FBREF_TRANSPORT);
+        # the nodriver NodriverFBrefScraper can no longer pass fbref's
+        # Cloudflare interstitial (#CF-2026-07).
         schedule_task = create_match_data_task(
             data_type='schedule',
-            **COMMON_TASK_KWARGS,
+            **{**COMMON_TASK_KWARGS, 'scraper_type': 'selenium'},
         )
 
         # Issue #44: guard on schedule's own CF/asset traffic. The schedule

@@ -30,6 +30,11 @@ TASK_ENV = {
     'TRINO_HOST': os.environ.get('TRINO_HOST', 'trino'),
     'TRINO_PORT': os.environ.get('TRINO_PORT', '8443'),
     'TRINO_PASSWORD': os.environ.get('TRINO_PASSWORD', ''),
+    # #CF-2026-07: nodriver+Chromium 149 can no longer pass fbref's Cloudflare
+    # managed interstitial. Route FBrefScraper._fetch_page through the Camoufox
+    # (anti-detect Firefox) Turnstile solver. Overridable per-deploy; unset
+    # (or =nodriver) reverts to the legacy path.
+    'FBREF_TRANSPORT': os.environ.get('FBREF_TRANSPORT', 'camoufox'),
 }
 
 
