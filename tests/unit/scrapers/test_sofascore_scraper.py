@@ -674,27 +674,34 @@ class TestMatchStatsFlatten:
         # 3 in ALL (1 possession + 2 shots) + 1 in 1ST = 4
         assert len(rows) == 4
 
+        # #840: source-key names (Bronze as-is); Silver renames name->stat_name,
+        # key->stat_key, home->home_text, away->away_text.
         bp_all = next(
             r for r in rows
-            if r['period'] == 'ALL' and r['stat_name'] == 'Ball possession'
+            if r['period'] == 'ALL' and r['name'] == 'Ball possession'
         )
         assert bp_all['match_id'] == '14023925'
         assert bp_all['stat_group'] == 'Possession'
-        assert bp_all['stat_key'] == 'ballPossession'
-        assert bp_all['home_value'] == 55.0
-        assert bp_all['away_value'] == 45.0
-        assert bp_all['home_text'] == '55%'
-        assert bp_all['away_text'] == '45%'
+        assert bp_all['key'] == 'ballPossession'
+        assert bp_all['home_value'] == 55
+        assert bp_all['away_value'] == 45
+        assert bp_all['home'] == '55%'
+        assert bp_all['away'] == '45%'
+        assert bp_all['compare_code'] == 1
+        assert bp_all['value_type'] == 'percent'
+        # Old renamed names are gone (moved to Silver).
+        for dead in ('stat_name', 'stat_key', 'home_text', 'away_text'):
+            assert dead not in bp_all
 
-        xg = next(r for r in rows if r['stat_name'] == 'Expected goals')
+        xg = next(r for r in rows if r['name'] == 'Expected goals')
         assert xg['home_value'] == 1.8
         assert xg['away_value'] == 0.6
 
         bp_1st = next(
             r for r in rows
-            if r['period'] == '1ST' and r['stat_name'] == 'Ball possession'
+            if r['period'] == '1ST' and r['name'] == 'Ball possession'
         )
-        assert bp_1st['home_value'] == 58.0
+        assert bp_1st['home_value'] == 58
 
     def test_flatten_handles_garbage(self):
         from scrapers.sofascore.scraper import SofaScoreScraper
@@ -788,20 +795,28 @@ class TestPlayerProfileFlatten:
         }
         row = SofaScoreScraper._flatten_player_profile(payload)
         assert row is not None
+        # Anchor.
         assert row['player_id'] == '11111'
+        # #840: source-key names (Bronze as-is); Silver renames/derives.
         assert row['name'] == 'John Doe'
         assert row['short_name'] == 'J. Doe'
         assert row['slug'] == 'john-doe'
         assert row['position'] == 'F'
+        assert row['jersey_number'] == 9                  # _coerce_scalar upcasts '9'->9
         assert row['shirt_number'] == 9
-        assert row['height_cm'] == 182
+        assert row['height'] == 182                       # was height_cm
         assert row['preferred_foot'] == 'Right'
-        assert row['date_of_birth'] == '1990-01-01'
+        assert row['date_of_birth_timestamp'] == 631152000  # raw epoch, no derive
         assert row['nationality'] == 'England'
-        assert row['country_code'] == 'EN'
-        assert row['current_team_id'] == 1
-        assert row['current_team_name'] == 'Team X'
+        assert row['country_name'] == 'England'
+        assert row['country_alpha2'] == 'EN'              # was country_code
+        assert row['team_id'] == 1                        # was current_team_id
+        assert row['team_name'] == 'Team X'               # was current_team_name
         assert row['retired'] is False
+        # Old derived/renamed names are gone (moved to Silver).
+        for dead in ('height_cm', 'date_of_birth', 'country_code',
+                     'current_team_id', 'current_team_name'):
+            assert dead not in row
 
     def test_garbage(self):
         from scrapers.sofascore.scraper import SofaScoreScraper
@@ -810,17 +825,21 @@ class TestPlayerProfileFlatten:
         # No player.id → None
         assert SofaScoreScraper._flatten_player_profile({'player': {'name': 'X'}}) is None
 
-    def test_dob_fallback_when_timestamp_invalid(self):
+    def test_dob_timestamp_kept_raw(self):
         from scrapers.sofascore.scraper import SofaScoreScraper
+        # #840: Bronze keeps the raw epoch; epoch->date derivation is Silver's job.
         payload = {
             'player': {'id': 1, 'dateOfBirthTimestamp': None},
         }
         row = SofaScoreScraper._flatten_player_profile(payload)
         assert row is not None
-        assert row['date_of_birth'] is None
+        assert row['date_of_birth_timestamp'] is None
+        assert 'date_of_birth' not in row
 
-    def test_country_fallback_for_nationality(self):
+    def test_country_kept_raw_no_fallback_in_bronze(self):
         from scrapers.sofascore.scraper import SofaScoreScraper
+        # #840: nationality<-country.name fallback moved to Silver; Bronze keeps
+        # the nested country block as-is (no synthetic nationality here).
         payload = {
             'player': {
                 'id': 1,
@@ -828,8 +847,10 @@ class TestPlayerProfileFlatten:
             }
         }
         row = SofaScoreScraper._flatten_player_profile(payload)
-        assert row['nationality'] == 'Brazil'
-        assert row['country_code'] == 'BR'
+        assert row['country_name'] == 'Brazil'
+        assert row['country_alpha2'] == 'BR'
+        assert 'nationality' not in row     # no country.name fallback in Bronze
+        assert 'country_code' not in row
 
 
 class TestReadPlayerRatingsCapture:
@@ -1038,7 +1059,7 @@ class TestReadMatchCapture:
         assert set(sm['season']) == {'2526'}
         assert set(ms['_entity_type']) == {'match_stats'}
         assert set(sm['_entity_type']) == {'event_shotmap'}
-        assert set(ms['stat_name']) == {'Ball possession'}
+        assert set(ms['name']) == {'Ball possession'}   # #840 source-key name
         assert set(sm['xg']) == {0.45}
 
     @pytest.mark.unit
@@ -1062,13 +1083,20 @@ class TestReadMatchCapture:
         assert set(ve['season']) == {'2526'}
         assert set(ve['_entity_type']) == {'venue'}
         row = ve.to_dict('records')[0]
-        # nested SofaScore {"name": ...} objects unwrapped to scalars.
-        assert row['stadium'] == 'Etihad Stadium'
-        assert row['city'] == 'Manchester'
-        assert row['country'] == 'England'
-        assert row['venue_latitude'] == 53.483056
-        assert row['venue_longitude'] == -2.200278
+        # #840: nested SofaScore objects auto-flatten to source-key names
+        # (stadium.name -> stadium_name); Silver renames back.
         assert row['game_id'] == 14023959
+        assert row['stadium_name'] == 'Etihad Stadium'
+        assert row['city_name'] == 'Manchester'
+        assert row['country_name'] == 'England'
+        assert row['venue_coordinates_latitude'] == 53.483056
+        assert row['venue_coordinates_longitude'] == -2.200278
+        # Passthrough bonus fields the old fixed list dropped.
+        assert row['stadium_capacity'] == 55097
+        assert row['country_alpha2'] == 'EN'
+        # Old derived/renamed names are gone (moved to Silver).
+        for dead in ('stadium', 'city', 'country', 'venue_latitude', 'venue_longitude'):
+            assert dead not in row
 
     @pytest.mark.unit
     def test_requests_all_tabs_and_event(self):
@@ -1123,24 +1151,31 @@ class TestFlattenEventVenue:
 
     @pytest.mark.unit
     def test_extracts_nested_sofascore_shape(self):
+        # #840: nested {"name": ...} objects auto-flatten to source-key names
+        # (stadium.name -> stadium_name); Silver renames back.
         payload = {'event': {'id': 14023959, 'venue': {
             'stadium': {'name': 'Etihad Stadium', 'capacity': 55097},
             'city': {'name': 'Manchester'},
             'country': {'name': 'England', 'alpha2': 'EN'},
             'venueCoordinates': {'latitude': 53.483056, 'longitude': -2.200278},
         }}}
-        assert self._flat(payload) == {
-            'game_id': 14023959,
-            'stadium': 'Etihad Stadium',
-            'city': 'Manchester',
-            'country': 'England',
-            'venue_latitude': 53.483056,
-            'venue_longitude': -2.200278,
-        }
+        row = self._flat(payload)
+        assert row['game_id'] == 14023959
+        assert row['stadium_name'] == 'Etihad Stadium'
+        assert row['stadium_capacity'] == 55097          # passthrough bonus
+        assert row['city_name'] == 'Manchester'
+        assert row['country_name'] == 'England'
+        assert row['country_alpha2'] == 'EN'
+        assert row['venue_coordinates_latitude'] == 53.483056
+        assert row['venue_coordinates_longitude'] == -2.200278
+        for dead in ('stadium', 'city', 'country', 'venue_latitude', 'venue_longitude'):
+            assert dead not in row
 
     @pytest.mark.unit
     def test_extracts_flat_issue_shape(self):
-        # The issue documents a flat {stadium, city, country} string form.
+        # The flat {stadium, city, country} string form: auto-flatten keeps the
+        # bare-string keys as-is (stadium/city/country) — Silver's COALESCE bridges
+        # both shapes.
         payload = {'event': {'id': 99, 'venue': {
             'stadium': 'Anfield', 'city': 'Liverpool', 'country': 'England',
         }}}
@@ -1148,15 +1183,14 @@ class TestFlattenEventVenue:
         assert row['stadium'] == 'Anfield'
         assert row['city'] == 'Liverpool'
         assert row['country'] == 'England'
-        assert row['venue_latitude'] is None
-        assert row['venue_longitude'] is None
+        assert 'venue_coordinates_latitude' not in row
         assert row['game_id'] == 99
 
     @pytest.mark.unit
     def test_extracts_live_amex_shape_no_coords(self):
         # Live-verified 2026-06-23 (event 14023959, American Express Stadium): the
         # real payload nests stadium/city/country objects, carries capacity, and
-        # has NO venueCoordinates → coords resolve to NULL, not an error.
+        # has NO venueCoordinates → coords absent, not an error.
         payload = {'event': {'id': 14023959, 'venue': {
             'name': 'American Express Stadium',
             'capacity': 31876,
@@ -1166,12 +1200,15 @@ class TestFlattenEventVenue:
             'slug': 'american-express-community-s-stadium', 'id': 2443,
         }}}
         row = self._flat(payload)
-        assert row['stadium'] == 'American Express Stadium'
-        assert row['city'] == 'Falmer'
-        assert row['country'] == 'England'
-        assert row['venue_latitude'] is None
-        assert row['venue_longitude'] is None
         assert row['game_id'] == 14023959
+        assert row['stadium_name'] == 'American Express Stadium'
+        assert row['city_name'] == 'Falmer'
+        assert row['country_name'] == 'England'
+        # Deeper nesting + extra fields preserved (#840 "keep everything").
+        assert row['city_country_name'] == 'England'
+        assert row['country_alpha3'] == 'ENG'
+        assert row['slug'] == 'american-express-community-s-stadium'
+        assert 'venue_coordinates_latitude' not in row
 
     @pytest.mark.unit
     def test_none_when_no_venue(self):
@@ -1683,8 +1720,9 @@ class TestReadPlayerCapture:
         assert set(prof['season']) == {'2526'}
         assert set(prof['_entity_type']) == {'player_profile'}
         prow = {r['player_id']: r for r in prof.to_dict('records')}['101']
-        assert prow['height_cm'] == 185 and prow['preferred_foot'] == 'Right'
-        assert prow['current_team_name'] == 'Brighton'
+        # #840: Bronze source-key names (Silver renames height->height_cm etc.).
+        assert prow['height'] == 185 and prow['preferred_foot'] == 'Right'
+        assert prow['team_name'] == 'Brighton'
 
         # Season-aggregate frame: the season-guarded EPL overall, flattened.
         seas = out['player_season_stats']

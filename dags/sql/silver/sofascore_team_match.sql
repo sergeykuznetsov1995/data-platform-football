@@ -57,7 +57,29 @@
 --     against re-ingests (replace_partitions=True should keep this 1:1).
 -- =============================================================================
 
-WITH stats_dedup AS (
+-- #840: Bronze is now auto-passthrough (source-key names per statisticsItem).
+-- Rename/derive here; COALESCE(old, new) bridges pre-#840 partitions. "key" is a
+-- Trino reserved word → double-quoted.
+WITH src AS (
+    SELECT
+        match_id,
+        period,
+        stat_group,
+        COALESCE(stat_name, name)                       AS stat_name,
+        COALESCE(stat_key, "key", statistics_type)      AS stat_key,
+        home_value,
+        away_value,
+        COALESCE(home_text, CAST(home AS varchar))      AS home_text,
+        COALESCE(away_text, CAST(away AS varchar))      AS away_text,
+        compare_code,
+        value_type,
+        _ingested_at,
+        league,
+        season
+    FROM iceberg.bronze.sofascore_match_stats
+),
+
+stats_dedup AS (
     SELECT *
     FROM (
         SELECT
@@ -66,7 +88,7 @@ WITH stats_dedup AS (
                 PARTITION BY match_id, period, stat_key
                 ORDER BY _ingested_at DESC
             ) AS rn
-        FROM iceberg.bronze.sofascore_match_stats b
+        FROM src b
         WHERE match_id IS NOT NULL
           AND period = 'ALL'
     )
