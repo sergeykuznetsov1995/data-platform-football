@@ -1,0 +1,57 @@
+# =============================================================================
+# OpenMetadata description: iceberg.bronze.transfermarkt_coaches
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.bronze.transfermarkt_coaches
+  description: |
+    Главные тренеры клубов с transfermarkt.com (страница mitarbeiterhistorie
+    клуба + профиль тренера через scrapers/transfermarkt,
+    dag_ingest_transfermarkt, еженедельно). Grain — один row на
+    (league, season, coach_id, current_club_id). Включает всех тренеров, чей
+    период работы пересекается с сезоном: постоянных, промежуточные назначения
+    и caretaker'ов (issue #619); ассистенты/аналитики отброшены. Bio
+    (dob/nationality) переиспользуется из уже собранных bronze-строк — профиль
+    качается только для новых тренеров. Охват: только ENG-Premier League (MVP).
+    Партиционирование ['league','season'].
+  tags:
+    - Tier.Bronze
+    - Domain.Football
+    - PII.Low
+columns:
+  - name: coach_id
+    description: Transfermarkt id тренера (varchar).
+  - name: coach_slug
+    description: URL-слаг тренера (e.g. 'pep-guardiola').
+  - name: name
+    description: Имя тренера.
+    tags:
+      - PII.Low
+  - name: role
+    description: |
+      Роль в клубе. Всегда 'Manager' — trainer-history не отдаёт колонку роли,
+      значение захардкожено в парсере (#793 followup: caretaker'ы тоже
+      помечены 'Manager').
+  - name: dob
+    description: Дата рождения тренера (date); с профильной страницы.
+    tags:
+      - PII.Low
+  - name: nationality
+    description: Гражданство тренера; с профильной страницы.
+    tags:
+      - PII.Low
+  - name: current_club_id
+    description: Transfermarkt id клуба, в котором тренер работал в сезоне (varchar).
+  - name: current_club_name
+    description: Название клуба сезона (из league listing, не из профиля).
+  - name: league
+    description: Лига (e.g. 'ENG-Premier League'); partition key.
+  - name: season
+    description: Сезон в коротком виде (e.g. '2526'); partition key.
+  - name: _source
+    description: Источник данных ('transfermarkt'); метаколонка Bronze.
+  - name: _entity_type
+    description: Тип сущности в Bronze ('coaches'); метаколонка.
+  - name: _ingested_at
+    description: Timestamp ingest'а строки в Bronze; метаколонка.
+  - name: _batch_id
+    description: Идентификатор батча ingest'а; метаколонка.
