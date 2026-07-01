@@ -535,21 +535,21 @@ def test_orphan_rate_per_source_classifies_correctly(duck_conn):
         # fbref — 100 rows, 0 orphans → OK
         + ", ".join(
             f"('fb_p{i}', 'fbref', 'p{i}', 'P{i}', 'ENG', '2024', "
-            f"{'\'orphan\'' if False else '\'exact\''}, NULL)"
+            f"'{'orphan' if False else 'exact'}', NULL)"
             for i in range(100)
         )
         + ", "
         # understat — 100 rows, 12 orphans → WARNING (12% > 10% but <25%)
         + ", ".join(
             f"('us_p{i}', 'understat', 'p{i}', 'P{i}', 'ENG', '2024', "
-            f"{'\'orphan\'' if i < 12 else '\'name_team\''}, NULL)"
+            f"'{'orphan' if i < 12 else 'name_team'}', NULL)"
             for i in range(100)
         )
         + ", "
         # whoscored — 100 rows, 30 orphans → ERROR (>25%)
         + ", ".join(
             f"('ws_p{i}', 'whoscored', 'p{i}', 'P{i}', 'ENG', '2024', "
-            f"{'\'orphan\'' if i < 30 else '\'name_team\''}, NULL)"
+            f"'{'orphan' if i < 30 else 'name_team'}', NULL)"
             for i in range(100)
         )
     )
@@ -589,14 +589,14 @@ def test_orphan_rate_current_season_only_excludes_history(duck_conn):
         # fotmob 2019 — 100 rows, 90 orphans → 90% (would be ERROR table-wide)
         + ", ".join(
             f"('fm_h{i}', 'fotmob', 'h{i}', 'H{i}', 'ENG', '1920', "
-            f"{'\'orphan\'' if i < 90 else '\'name_team\''}, NULL)"
+            f"'{'orphan' if i < 90 else 'name_team'}', NULL)"
             for i in range(100)
         )
         + ", "
         # fotmob 2025 — 100 rows, 2 orphans → 2% (current season = healthy)
         + ", ".join(
             f"('fm_c{i}', 'fotmob', 'c{i}', 'C{i}', 'ENG', '2526', "
-            f"{'\'orphan\'' if i < 2 else '\'name_team\''}, NULL)"
+            f"'{'orphan' if i < 2 else 'name_team'}', NULL)"
             for i in range(100)
         )
     )
