@@ -48,8 +48,12 @@ def _compose_config_json() -> dict:
     if not _docker_available():
         pytest.skip("docker CLI not available on this host")
 
+    # --profile heavy so profiled services (opensearch, openmetadata-*,
+    # superset-worker/beat) appear in the rendered config — otherwise they are
+    # excluded and the BI/catalog assertions below KeyError.
     proc = subprocess.run(
-        ["docker", "compose", "-f", str(COMPOSE_FILE), "config", "--format", "json"],
+        ["docker", "compose", "--profile", "heavy", "-f", str(COMPOSE_FILE),
+         "config", "--format", "json"],
         cwd=str(PROJECT_ROOT),
         capture_output=True,
         text=True,
@@ -73,7 +77,8 @@ class TestComposeFile:
         if not _docker_available():
             pytest.skip("docker CLI not available")
         proc = subprocess.run(
-            ["docker", "compose", "-f", str(COMPOSE_FILE), "config", "--quiet"],
+            ["docker", "compose", "--profile", "heavy", "-f", str(COMPOSE_FILE),
+             "config", "--quiet"],
             cwd=str(PROJECT_ROOT),
             capture_output=True,
             text=True,
