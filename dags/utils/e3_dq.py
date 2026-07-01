@@ -858,9 +858,21 @@ def _build_fct_lineup_checks() -> List[Check]:
     # ESPN rows now resolve via xref_player, but resolved ones dedup into their
     # FBref twin (FBref priority wins), so the surviving ESPN population is the
     # noisy tail (ESPN-exclusive / bridge-miss / out-of-scope) and would still
-    # muddy a whole-table orphan rate. FBref ≈ 145K rows; the resolver
-    # legitimately misses out-of-scope seasons (~2.7K live). Cap 10% × 145K.
-    lineup_fbref_orphan_max = int(0.10 * 145_000)
+    # muddy a whole-table orphan rate.
+    #
+    # #839: the residual FBref orphan is a STRUCTURAL floor, not the
+    # out-of-scope seasons #519 assumed. Live 2026-07-01: 2,746 / 145,614 FBref
+    # rows = 1.89%, and ALL of it is is_starter=false — unused substitutes
+    # (mostly 3rd-choice keepers benched a whole season) who never earned a
+    # senior FBref appearance, so bronze.fbref_player_stats has no stats row to
+    # anchor them in xref_player. Of the 573 distinct orphan players, 0 are
+    # present in fbref_player_stats under any other stat_type, so no filter
+    # relaxation recovers them. Decision (#839): accept the floor; the strong
+    # invariant — every STARTER resolves — is enforced as ERROR below. Tighten
+    # this rate ceiling 10% → 3% (~1.6× the 1.89% floor) so a real regression (a
+    # resolver break dropping actual players) trips it while the sub floor
+    # passes clean.
+    lineup_fbref_orphan_max = int(0.03 * 145_000)
 
     return [
         # PK guard. With player_id possibly NULL (ESPN edge case),
@@ -981,6 +993,22 @@ def _build_fct_lineup_checks() -> List[Check]:
             where="player_id IS NULL AND lineup_source = 'fbref'",
             severity='WARNING',
             name='lineup_orphan_player_rate',
+        ),
+
+        # #839: every FBref STARTER must resolve to a canonical player. Unused
+        # substitutes without a senior appearance are an accepted NULL floor
+        # (see lineup_orphan_player_rate above), but a starter with a NULL
+        # player_id means the resolver dropped a player who actually played —
+        # a real regression, not a structural gap. Live 2026-07-01: 0 starter
+        # orphans (all 2,746 NULL-player rows are is_starter=false). ERROR.
+        CHECK.row_count(
+            table=table,
+            min_rows=0,
+            max_rows=0,
+            where="is_starter = true AND player_id IS NULL "
+                  "AND lineup_source = 'fbref'",
+            severity='ERROR',
+            name='lineup_starter_orphan_zero',
         ),
 
         # is_captain coverage (#439) — SofaScore /lineups enrich the FBref
