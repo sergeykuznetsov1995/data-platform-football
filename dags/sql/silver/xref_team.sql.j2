@@ -147,11 +147,14 @@ raw_teams AS (
 
     UNION
     -- ===== sofascore =====
-    SELECT 'sofascore' AS source, home_team AS source_id, league, CAST(season AS varchar) AS season
-      FROM iceberg.bronze.sofascore_schedule WHERE home_team IS NOT NULL
+    -- #840: Bronze auto-passthrough renamed home_team->home_team_name; COALESCE
+    -- bridges pre-#840 partitions. Team-name VALUES are unchanged, so identity
+    -- resolution is identical — only the column reference moves.
+    SELECT 'sofascore' AS source, COALESCE(home_team, home_team_name) AS source_id, league, CAST(season AS varchar) AS season
+      FROM iceberg.bronze.sofascore_schedule WHERE COALESCE(home_team, home_team_name) IS NOT NULL
     UNION
-    SELECT 'sofascore' AS source, away_team AS source_id, league, CAST(season AS varchar) AS season
-      FROM iceberg.bronze.sofascore_schedule WHERE away_team IS NOT NULL
+    SELECT 'sofascore' AS source, COALESCE(away_team, away_team_name) AS source_id, league, CAST(season AS varchar) AS season
+      FROM iceberg.bronze.sofascore_schedule WHERE COALESCE(away_team, away_team_name) IS NOT NULL
 
     UNION
     -- ===== fotmob =====

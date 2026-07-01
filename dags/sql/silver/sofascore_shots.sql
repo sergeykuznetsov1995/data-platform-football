@@ -142,7 +142,12 @@ sched AS (
     SELECT game_id, home_team, away_team, league, season
     FROM (
         SELECT
-            game_id, home_team, away_team, league, season,
+            game_id,
+            -- #840: Bronze auto-passthrough renamed home_team->home_team_name;
+            -- COALESCE bridges pre-#840 partitions.
+            COALESCE(home_team, home_team_name) AS home_team,
+            COALESCE(away_team, away_team_name) AS away_team,
+            league, season,
             ROW_NUMBER() OVER (
                 PARTITION BY game_id
                 ORDER BY _ingested_at DESC
