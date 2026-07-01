@@ -33,6 +33,20 @@ LEAGUES: List[str] = [
     'ENG-Premier League',
 ]
 
+# WhoScored multi-league scope (#708). Deliberately independent of the global
+# LEAGUES — flipping LEAGUES switches EVERY source at once (see OOM note
+# above), while WhoScored scales safely per league: dag_ingest_whoscored fans
+# out one sequential task per league and events skip-existing keeps the
+# steady-state cost at "new matches only". First run per new league is heavy
+# (~380 matches/season × 5 seasons through FlareSolverr) but resumable.
+WHOSCORED_LEAGUES: List[str] = [
+    'ENG-Premier League',
+    'ESP-La Liga',
+    'GER-Bundesliga',
+    'ITA-Serie A',
+    'FRA-Ligue 1',
+]
+
 # Current season (dynamically calculated)
 CURRENT_SEASON: int = get_current_season()
 
@@ -79,10 +93,14 @@ MIN_ROW_THRESHOLDS: Dict[str, int] = {
     'elo_ratings': 100,     # ClubElo not in FBref-only roadmap; left unchanged
     # WhoScored (issue #106): hidden-enabler thresholds. Without these keys,
     # validate_table() falls back to 0 and silently passes an empty schedule
-    # scrape (root cause of #102). Sized for APL 1 season.
-    'whoscored_schedule': 340,    # 380 fixtures/season - 5-10% margin
-    'whoscored_events': 500_000,  # ~540k events/season - 7% margin
-    'whoscored_player_profile': 300,  # ~531 distinct players/season (#37) - margin for fetch/parse loss
+    # scrape (root cause of #102). schedule scales with WHOSCORED_LEAGUES
+    # (every league is scraped each run, replace semantics); events /
+    # player_profile floors stay 1-league-sized until the multi-league
+    # backfill lands — they are append-only wipe-floors, and multiplying them
+    # now would false-fail while the new leagues ramp up (#708).
+    'whoscored_schedule': 340 * len(WHOSCORED_LEAGUES),  # 380 fixtures/season/league - margin
+    'whoscored_events': 500_000,  # ~540k events/season - 7% margin; raise after #708 backfill
+    'whoscored_player_profile': 300,  # ~531 players/season/league (#37); raise after #708 backfill
     # ESPN / Understat / SoFIFA (issue #466): same silent-fail class as #102 —
     # read_* swallowed errors and runners exited 0. Floors calibrated against
     # live Bronze counts on 2026-06-11.
