@@ -22,9 +22,7 @@ from scrapers.transfermarkt.scraper import (
     _parse_coach_profile,
     _parse_height_cm,
     _parse_mv_history,
-    _parse_player_profile,
     _parse_squad_page,
-    _parse_staff_managers,
     _parse_tm_date,
     _parse_tm_money_eur,
     _parse_transfers,
@@ -233,50 +231,131 @@ class TestParseSquadPage:
         assert _parse_squad_page('<no-table>', '281') == []
 
 
-class TestParsePlayerProfile:
-    def test_happy_path(self):
-        html = """
-        <html><body>
-        <h1 class="data-header__headline-wrapper"><span>#25</span>Gianluigi Donnarumma</h1>
-        <a class="data-header__market-value-wrapper">€ 45.00 m Last update: Dec 9, 2025</a>
-        <span itemprop="birthDate">Feb 25, 1999 (26)</span>
-        <span itemprop="height">1,96 m</span>
-        <span itemprop="nationality">Italy</span>
-        <dd class="detail-position__position">Goalkeeper</dd>
-        <span class="data-header__club">Man City</span>
-        <span class="info-table__content--regular">Foot:</span>
-        <span class="info-table__content--bold">right</span>
-        <span class="info-table__content--regular">Contract expires:</span>
-        <span class="info-table__content--bold">Jun 30, 2030</span>
-        </body></html>
-        """
-        bio = _parse_player_profile(html, '315858')
-        assert bio is not None
-        assert bio['player_id'] == '315858'
-        assert bio['name'] == 'Gianluigi Donnarumma'
-        assert bio['position'] == 'Goalkeeper'
-        assert bio['dob'] == date(1999, 2, 25)
-        assert bio['height_cm'] == 196
-        assert bio['foot'] == 'right'
-        assert bio['nationality'] == 'Italy'
-        assert bio['current_club_name'] == 'Man City'
-        assert bio['contract_until'] == date(2030, 6, 30)
-        assert bio['market_value_eur'] == 45_000_000
-        assert bio['market_value_last_update'] == date(2025, 12, 9)
+class TestParseSquadPageBio:
+    """Header-driven bio extraction from the detailed (`/plus/1`) squad table.
 
-    def test_missing_name_returns_none(self):
-        # No <h1.data-header__headline-wrapper> means the page didn't load
-        # or selector drifted — we'd rather propagate None than guess.
-        assert _parse_player_profile('<html><body></body></html>', '1') is None
+    The column set differs by view (verified live 2026-07-01): the season TM
+    considers current renders `Contract`; past seasons swap in `Current club`.
+    The parser must map columns by <thead> text and tolerate either set.
+    """
 
-    def test_partial_fields_ok(self):
-        html = '<h1 class="data-header__headline-wrapper">Player Name</h1>'
-        bio = _parse_player_profile(html, '1')
-        assert bio is not None
-        assert bio['name'] == 'Player Name'
-        assert bio['dob'] is None
-        assert bio['height_cm'] is None
-        assert bio['market_value_eur'] is None
+    @staticmethod
+    def _html(headers: list, cells: str) -> str:
+        thead = ''.join(f'<th>{h}</th>' for h in headers)
+        return (
+            f'<table class="items"><thead><tr>{thead}</tr></thead>'
+            f'<tbody><tr>{cells}</tr></tbody></table>'
+        )
+
+    _PLAYER_TD = (
+        '<td class="posrela"><table class="inline-table">'
+        '<tr><td class="hauptlink">'
+        '<a href="/david-raya/profil/spieler/262749">David Raya</a>'
+        '</td></tr>'
+        '<tr><td>Goalkeeper</td></tr>'
+        '</table></td>'
+    )
+
+    def test_current_season_variant_with_contract(self):
+        headers = [
+            '#', 'Player', 'Date of birth/Age', 'Nat.', 'Height', 'Foot',
+            'Joined', 'Signed from', 'Contract', 'Market value',
+        ]
+        cells = (
+            '<td class="zentriert">1</td>'
+            + self._PLAYER_TD +
+            '<td class="zentriert">Sep 15, 1995 (30)</td>'
+            '<td class="zentriert"><img title="Spain"/></td>'
+            '<td class="zentriert">1,86m</td>'
+            '<td class="zentriert">right</td>'
+            '<td class="zentriert">Jul 4, 2024</td>'
+            '<td class="zentriert"><img title="Brentford FC"/></td>'
+            '<td class="zentriert">Jun 30, 2028</td>'
+            '<td class="rechts hauptlink">€30.00m</td>'
+        )
+        players = _parse_squad_page(self._html(headers, cells), club_id='11')
+        assert len(players) == 1
+        p = players[0]
+        assert p['player_id'] == '262749'
+        assert p['name'] == 'David Raya'
+        assert p['position'] == 'Goalkeeper'
+        assert p['dob'] == date(1995, 9, 15)
+        assert p['age'] == 30
+        assert p['nationality'] == 'Spain'
+        assert p['height_cm'] == 186
+        assert p['foot'] == 'right'
+        assert p['contract_until'] == date(2028, 6, 30)
+        assert p['market_value_eur'] == 30_000_000
+
+    def test_past_season_variant_without_contract(self):
+        headers = [
+            '#', 'Player', 'Date of birth/Age', 'Nat.', 'Current club',
+            'Height', 'Foot', 'Joined', 'Signed from', 'Market value',
+        ]
+        cells = (
+            '<td class="zentriert">1</td>'
+            + self._PLAYER_TD +
+            '<td class="zentriert">Sep 15, 1995 (30)</td>'
+            '<td class="zentriert"><img title="Spain"/></td>'
+            '<td class="zentriert"><img title="Arsenal FC"/></td>'
+            '<td class="zentriert">1,86m</td>'
+            '<td class="zentriert">right</td>'
+            '<td class="zentriert">Jul 4, 2024</td>'
+            '<td class="zentriert"><img title="Brentford FC"/></td>'
+            '<td class="rechts hauptlink">€30.00m</td>'
+        )
+        players = _parse_squad_page(self._html(headers, cells), club_id='11')
+        assert len(players) == 1
+        p = players[0]
+        assert p['dob'] == date(1995, 9, 15)
+        assert p['height_cm'] == 186
+        assert p['foot'] == 'right'
+        assert p['contract_until'] is None  # column absent in this view
+
+    def test_dash_and_empty_cells_are_none(self):
+        headers = [
+            '#', 'Player', 'Date of birth/Age', 'Nat.', 'Height', 'Foot',
+            'Joined', 'Signed from', 'Contract', 'Market value',
+        ]
+        cells = (
+            '<td class="zentriert">1</td>'
+            + self._PLAYER_TD +
+            '<td class="zentriert">-</td>'
+            '<td class="zentriert"></td>'
+            '<td class="zentriert"></td>'
+            '<td class="zentriert">-</td>'
+            '<td class="zentriert"></td>'
+            '<td class="zentriert"></td>'
+            '<td class="zentriert">-</td>'
+            '<td class="rechts hauptlink">-</td>'
+        )
+        players = _parse_squad_page(self._html(headers, cells), club_id='11')
+        p = players[0]
+        assert p['dob'] is None
+        assert p['age'] is None
+        assert p['nationality'] is None
+        assert p['height_cm'] is None
+        assert p['foot'] is None
+        assert p['contract_until'] is None
+        assert p['market_value_eur'] is None
+
+    def test_cell_count_mismatch_skips_bio_not_row(self):
+        # A row whose top-level td count differs from the header count
+        # (e.g. colspan separator quirks) must keep the stable core fields
+        # and drop only the header-mapped bio.
+        headers = [
+            '#', 'Player', 'Date of birth/Age', 'Nat.', 'Height', 'Foot',
+            'Joined', 'Signed from', 'Contract', 'Market value',
+        ]
+        cells = (
+            '<td class="zentriert">1</td>'
+            + self._PLAYER_TD +
+            '<td class="zentriert">Sep 15, 1995 (30)</td>'
+        )
+        players = _parse_squad_page(self._html(headers, cells), club_id='11')
+        assert len(players) == 1
+        assert players[0]['player_id'] == '262749'
+        assert players[0]['dob'] is None
 
 
 # ---------------------------------------------------------------------------
@@ -419,29 +498,6 @@ class TestConsecutiveFailureRaise:
             leagues=['ENG-Premier League'], seasons=[2025],
         )
 
-    def test_read_players_raises_on_consecutive_profile_failures(
-        self, scraper, monkeypatch,
-    ):
-        import scrapers.transfermarkt.scraper as tm
-        monkeypatch.setattr(tm, '_MAX_CONSECUTIVE_FAILURES', 3)
-        monkeypatch.setattr(tm, '_parse_club_listing', lambda html: [
-            {'club_id': '11', 'club_slug': 'fc-arsenal', 'club_name': 'Arsenal'},
-        ])
-        monkeypatch.setattr(tm, '_parse_squad_page', lambda html, club_id: [
-            {'player_id': str(i), 'player_slug': f'player-{i}',
-             'name': f'P{i}', 'club_id': club_id, 'market_value_eur': None}
-            for i in range(5)
-        ])
-        monkeypatch.setattr(
-            scraper, '_fetch_html',
-            lambda url, label='html', context=None:
-                None if label == 'profile' else '<html/>',
-        )
-        with pytest.raises(
-            ConsecutiveFailureError, match='consecutive profile failures',
-        ):
-            scraper.read_players(league='ENG-Premier League', season=2025)
-
     def test_read_mv_history_raises_on_consecutive_failures(
         self, scraper, monkeypatch,
     ):
@@ -517,34 +573,41 @@ class TestPartialScrapeRatio:
             leagues=['ENG-Premier League'], seasons=[2025],
         )
 
-    def _patch_players_pipeline(self, monkeypatch, scraper, profile_responses):
+    def _patch_players_pipeline(self, monkeypatch, scraper, squad_responses):
+        # One club per response; a None response = failed squad-page fetch.
+        # Each fetched squad yields one player keyed by the club id.
         import scrapers.transfermarkt.scraper as tm
         monkeypatch.setattr(tm, '_parse_club_listing', lambda html: [
-            {'club_id': '11', 'club_slug': 'fc-arsenal', 'club_name': 'Arsenal'},
+            {'club_id': str(i), 'club_slug': f'club-{i}', 'club_name': f'C{i}'}
+            for i in range(len(squad_responses))
         ])
         monkeypatch.setattr(tm, '_parse_squad_page', lambda html, club_id: [
-            {'player_id': str(i), 'player_slug': f'player-{i}',
-             'name': f'P{i}', 'club_id': club_id, 'market_value_eur': None}
-            for i in range(len(profile_responses))
+            {'player_id': f'p{club_id}', 'player_slug': f'player-{club_id}',
+             'name': f'P{club_id}', 'club_id': club_id,
+             'market_value_eur': None},
         ])
-        responses = iter(profile_responses)
+        responses = iter(squad_responses)
         monkeypatch.setattr(
             scraper, '_fetch_html',
             lambda url, label='html', context=None:
-                next(responses) if label == 'profile' else '<html/>',
+                next(responses) if label == 'squad' else '<html/>',
+        )
+        monkeypatch.setattr(
+            scraper, '_resolve_contracts_from_bronze',
+            lambda league, season_short: {},
         )
 
-    def test_read_players_raises_on_low_success_ratio(
+    def test_read_players_raises_on_low_squad_success_ratio(
         self, scraper, monkeypatch,
     ):
-        # alternating failures: ratio 0.5 < 0.9, never 2 consecutive
+        # alternating squad failures: ratio 0.5 < 0.9
         self._patch_players_pipeline(
             monkeypatch, scraper, [None, '<html/>'] * 5,
         )
-        with pytest.raises(PartialScrapeError, match='player profiles'):
+        with pytest.raises(PartialScrapeError, match='squad pages'):
             scraper.read_players(league='ENG-Premier League', season=2025)
 
-    def test_read_players_passes_on_high_success_ratio(
+    def test_read_players_passes_on_high_squad_success_ratio(
         self, scraper, monkeypatch,
     ):
         # 1 failure of 10 → ratio 0.9, exactly at threshold → no raise
@@ -622,7 +685,7 @@ class TestReadPlayersCurrentClub:
             leagues=['ENG-Premier League'], seasons=[2018],
         )
 
-    def test_current_club_name_comes_from_season_squad_not_profile(
+    def test_current_club_name_comes_from_season_squad(
         self, scraper, monkeypatch,
     ):
         import scrapers.transfermarkt.scraper as tm
@@ -634,16 +697,13 @@ class TestReadPlayersCurrentClub:
             {'player_id': '238223', 'player_slug': 'ederson',
              'name': 'Ederson', 'club_id': club_id, 'market_value_eur': None},
         ])
-        # Profile reports the club the player moved to after this season.
-        monkeypatch.setattr(
-            tm, '_parse_player_profile',
-            lambda payload, player_id: {
-                'name': 'Ederson', 'current_club_name': 'Fenerbahçe',
-            },
-        )
         monkeypatch.setattr(
             scraper, '_fetch_html',
             lambda url, label='html', context=None: '<html/>',
+        )
+        monkeypatch.setattr(
+            scraper, '_resolve_contracts_from_bronze',
+            lambda league, season_short: {},
         )
 
         df = scraper.read_players(league='ENG-Premier League', season=2018)
@@ -651,8 +711,147 @@ class TestReadPlayersCurrentClub:
         assert len(df) == 1
         row = df.iloc[0]
         assert row['current_club_id'] == '281'
-        # Name must agree with the id → season squad club, not the profile.
+        # Name must agree with the id → season squad club (#800).
         assert row['current_club_name'] == 'Man City'
+
+
+# ---------------------------------------------------------------------------
+# contract_until carry-forward (July gap)
+#
+# TM renders the Contract column only for the season IT considers current and
+# flips to the new season in early July, while CURRENT_SEASON flips in August.
+# A July run therefore scrapes contract_until=None for every player — the
+# partition replace must fill those from the existing bronze partition, not
+# wipe last week's values.
+# ---------------------------------------------------------------------------
+
+class TestReadPlayersContractCarryForward:
+    @pytest.fixture
+    def scraper(self):
+        return TransfermarktScraper(
+            leagues=['ENG-Premier League'], seasons=[2025],
+        )
+
+    def _patch_pipeline(self, monkeypatch, scraper, squad_rows):
+        import scrapers.transfermarkt.scraper as tm
+        monkeypatch.setattr(tm, '_parse_club_listing', lambda html: [
+            {'club_id': '11', 'club_slug': 'fc-arsenal', 'club_name': 'Arsenal'},
+        ])
+        monkeypatch.setattr(
+            tm, '_parse_squad_page', lambda html, club_id: squad_rows,
+        )
+        monkeypatch.setattr(
+            scraper, '_fetch_html',
+            lambda url, label='html', context=None: '<html/>',
+        )
+
+    def test_missing_contracts_filled_from_bronze(self, scraper, monkeypatch):
+        self._patch_pipeline(monkeypatch, scraper, [
+            {'player_id': '1', 'player_slug': 'a', 'name': 'A',
+             'club_id': '11', 'market_value_eur': None,
+             'contract_until': None},
+            {'player_id': '2', 'player_slug': 'b', 'name': 'B',
+             'club_id': '11', 'market_value_eur': None,
+             'contract_until': None},
+        ])
+        monkeypatch.setattr(
+            scraper, '_resolve_contracts_from_bronze',
+            lambda league, season_short: {'1': date(2028, 6, 30)},
+        )
+        df = scraper.read_players(league='ENG-Premier League', season=2025)
+        by_id = df.set_index('player_id')
+        assert by_id.loc['1', 'contract_until'] == date(2028, 6, 30)
+        assert by_id.loc['2', 'contract_until'] is None
+
+    def test_scraped_contract_wins_over_bronze(self, scraper, monkeypatch):
+        self._patch_pipeline(monkeypatch, scraper, [
+            {'player_id': '1', 'player_slug': 'a', 'name': 'A',
+             'club_id': '11', 'market_value_eur': None,
+             'contract_until': date(2030, 6, 30)},
+        ])
+        called = []
+        monkeypatch.setattr(
+            scraper, '_resolve_contracts_from_bronze',
+            lambda league, season_short: called.append(1) or {},
+        )
+        df = scraper.read_players(league='ENG-Premier League', season=2025)
+        assert df.iloc[0]['contract_until'] == date(2030, 6, 30)
+        # All contracts present → bronze lookup skipped entirely.
+        assert called == []
+
+    def test_resolver_reads_bronze_via_trino(self, scraper):
+        from unittest.mock import patch
+        import sys
+
+        cursor = _StubCursor([('1', date(2028, 6, 30)), ('2', None)])
+        with patch.dict(sys.modules, _stub_trino_modules(cursor)):
+            out = scraper._resolve_contracts_from_bronze(
+                'ENG-Premier League', '2526',
+            )
+        assert out == {'1': date(2028, 6, 30)}
+        sql, params = cursor.executed[0]
+        assert 'contract_until IS NOT NULL' in sql
+        assert params == ('ENG-Premier League', '2526')
+
+
+# ---------------------------------------------------------------------------
+# Coach-bio reuse from bronze (proxy-traffic fix)
+#
+# Coach bios (dob/nationality) are immutable — a profile materialised by any
+# earlier run must be reused instead of re-fetched, so a weekly run downloads
+# profiles only for genuinely new appointments.
+# ---------------------------------------------------------------------------
+
+class TestReadCoachesBronzeReuse:
+    @pytest.fixture
+    def scraper(self):
+        return TransfermarktScraper(
+            leagues=['ENG-Premier League'], seasons=[2025],
+        )
+
+    def test_known_coach_skips_profile_fetch(self, scraper, monkeypatch):
+        import scrapers.transfermarkt.scraper as tm
+        monkeypatch.setattr(tm, '_parse_club_listing', lambda html: [
+            {'club_id': '11', 'club_slug': 'fc-arsenal', 'club_name': 'Arsenal'},
+        ])
+        monkeypatch.setattr(tm, '_parse_coach_history', lambda html, club_id: [
+            {'coach_id': '100', 'coach_slug': 'known-coach', 'name': 'Known',
+             'role': 'Manager', 'club_id': club_id},
+            {'coach_id': '200', 'coach_slug': 'new-coach', 'name': 'New',
+             'role': 'Manager', 'club_id': club_id},
+        ])
+        monkeypatch.setattr(
+            tm, '_stint_overlaps_season', lambda stint, s, e: True,
+        )
+        monkeypatch.setattr(
+            scraper, '_resolve_coach_bios_from_bronze',
+            lambda: {'100': {'name': 'Known Coach',
+                             'dob': date(1971, 1, 18),
+                             'nationality': 'Spain'}},
+        )
+        monkeypatch.setattr(
+            tm, '_parse_coach_profile',
+            lambda payload, coach_id: {'name': 'New Coach',
+                                       'dob': date(1980, 2, 2),
+                                       'nationality': 'Italy'},
+        )
+        fetched = []
+
+        def _fake_fetch(url, label='html', context=None):
+            fetched.append(label)
+            return '<html/>'
+
+        monkeypatch.setattr(scraper, '_fetch_html', _fake_fetch)
+
+        df = scraper.read_coaches(league='ENG-Premier League', season=2025)
+
+        # Only the unknown coach costs a profile request.
+        assert fetched.count('coach_profile') == 1
+        by_id = df.set_index('coach_id')
+        assert by_id.loc['100', 'name'] == 'Known Coach'
+        assert by_id.loc['100', 'nationality'] == 'Spain'
+        assert by_id.loc['200', 'name'] == 'New Coach'
+        assert by_id.loc['200', 'dob'] == date(1980, 2, 2)
 
 
 # ---------------------------------------------------------------------------
@@ -764,66 +963,6 @@ class TestResolverDeterministicLimit:
 # ---------------------------------------------------------------------------
 # Coach parsers (issue #434)
 # ---------------------------------------------------------------------------
-
-def _staff_row(slug: str, cid: str, name: str, role: str) -> str:
-    """One staff person: name in an inline-table, role on the second line."""
-    return (
-        '<tr><td>'
-        '<table class="inline-table"><tr>'
-        '<td><img></td>'
-        f'<td class="hauptlink"><a href="/{slug}/profil/trainer/{cid}">{name}</a></td>'
-        '</tr><tr><td></td><td>'
-        f'{role}</td></tr></table>'
-        '</td><td class="zentriert">50</td></tr>'
-    )
-
-
-def _staff_html(coaching_rows: str) -> str:
-    """A staff page: a 'Coaching Staff' section then an empty 'Management' one."""
-    return (
-        '<html><body>'
-        '<div class="content-box-headline">Coaching Staff</div>'
-        f'<table class="items"><tbody>{coaching_rows}</tbody></table>'
-        '<div class="content-box-headline">Management</div>'
-        '<table class="items"><tbody></tbody></table>'
-        '</body></html>'
-    )
-
-
-class TestParseStaffManagers:
-    def test_keeps_only_manager_role(self):
-        rows = (
-            _staff_row('pep-guardiola', '5672', 'Pep Guardiola', 'Manager')
-            + _staff_row('kolo-toure', '56390', 'Kolo Touré', 'Assistant Manager')
-            + _staff_row('richard-wright', '93678', 'Richard Wright', 'Goalkeeping Coach')
-        )
-        mgrs = _parse_staff_managers(_staff_html(rows), club_id='281')
-        assert len(mgrs) == 1, mgrs
-        m = mgrs[0]
-        assert m['coach_id'] == '5672'
-        assert m['coach_slug'] == 'pep-guardiola'
-        assert m['name'] == 'Pep Guardiola'
-        assert m['role'] == 'Manager'
-        assert m['club_id'] == '281'
-
-    def test_no_coaching_staff_section_returns_empty(self):
-        html = (
-            '<html><body><div class="content-box-headline">Management</div>'
-            '<table class="items"></table></body></html>'
-        )
-        assert _parse_staff_managers(html, club_id='1') == []
-
-    def test_dedups_by_coach_id(self):
-        rows = (
-            _staff_row('pep-guardiola', '5672', 'Pep Guardiola', 'Manager')
-            + _staff_row('pep-guardiola', '5672', 'Pep Guardiola', 'Manager')
-        )
-        assert len(_parse_staff_managers(_staff_html(rows), club_id='281')) == 1
-
-    def test_garbage_input(self):
-        assert _parse_staff_managers('', club_id='1') == []
-        assert _parse_staff_managers('<not-html>', club_id='1') == []
-
 
 def _coach_profile_html(name: str, dob: str, nat: str) -> str:
     return (
