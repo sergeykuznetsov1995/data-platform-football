@@ -624,3 +624,161 @@ class TestKeeperMatchStatsWiring:
         assert calls['fbref_match_keeper_stats']['replace_partitions'] == ['match_id']
         assert calls['fbref_match_keeper_stats']['partition_cols'] == ['league', 'season']
         assert results['match_keeper_stats'] == 'iceberg.bronze.fbref_match_keeper_stats'
+
+
+# ===========================================================================
+# Test: scrape_combined_season_stats — one fetch per page, 9 tables
+# ===========================================================================
+
+class TestScrapeCombinedSeasonStats:
+    """Combined season pass: 5 unique page fetches per (league, season),
+    both player and squad tables parsed from the same HTML, each of the 9
+    bronze tables saved independently with the completeness guard."""
+
+    @staticmethod
+    def _frame():
+        return pd.DataFrame({'Player': ['Some Player'], 'value': [1]})
+
+    def _scraper(self):
+        scraper = StubScraper()
+        scraper._fetch_page = MagicMock(return_value='<html></html>')
+        scraper.save_to_iceberg = MagicMock(
+            side_effect=lambda df, table_name, **kw: f'iceberg.bronze.{table_name}'
+        )
+        return scraper
+
+    @pytest.mark.unit
+    def test_five_fetches_nine_saves(self):
+        scraper = self._scraper()
+
+        with patch('scrapers.fbref.data_readers.extract_tables_from_comments',
+                   return_value={}), \
+             patch('scrapers.fbref.data_readers.find_player_stats_table',
+                   side_effect=lambda *a, **k: self._frame()), \
+             patch('scrapers.fbref.data_readers.find_team_stats_table',
+                   side_effect=lambda *a, **k: self._frame()), \
+             patch('scrapers.fbref.data_readers.time.sleep'):
+            result = scraper.scrape_combined_season_stats()
+
+        # 5 unique season pages: stats, shooting, playingtime, misc, keepers
+        assert scraper._fetch_page.call_count == 5
+        urls = [c.args[0] for c in scraper._fetch_page.call_args_list]
+        assert len(set(urls)) == 5
+
+        saved_tables = sorted(
+            c.kwargs['table_name']
+            for c in scraper.save_to_iceberg.call_args_list
+        )
+        assert saved_tables == sorted([
+            'fbref_player_stats', 'fbref_player_shooting',
+            'fbref_player_playingtime', 'fbref_player_misc',
+            'fbref_team_stats', 'fbref_team_shooting',
+            'fbref_team_playingtime', 'fbref_team_misc',
+            'fbref_keeper_keeper',
+        ])
+        assert len(result['tables']) == 9
+        assert result['guard_refusals'] == []
+        assert result['errors'] == []
+
+        # Guard semantics identical to scrape_single_stat_type (#513/#583)
+        for c in scraper.save_to_iceberg.call_args_list:
+            assert c.kwargs['replace_partitions'] == ['league', 'season']
+            assert c.kwargs['partition_cols'] == ['league', 'season']
+            assert c.kwargs['min_replace_ratio'] == 0.9
+
+    @pytest.mark.unit
+    def test_force_replace_disables_guard(self):
+        scraper = self._scraper()
+
+        with patch('scrapers.fbref.data_readers.extract_tables_from_comments',
+                   return_value={}), \
+             patch('scrapers.fbref.data_readers.find_player_stats_table',
+                   side_effect=lambda *a, **k: self._frame()), \
+             patch('scrapers.fbref.data_readers.find_team_stats_table',
+                   side_effect=lambda *a, **k: self._frame()), \
+             patch('scrapers.fbref.data_readers.time.sleep'):
+            scraper.scrape_combined_season_stats(force_replace=True)
+
+        for c in scraper.save_to_iceberg.call_args_list:
+            assert c.kwargs['min_replace_ratio'] is None
+
+    @pytest.mark.unit
+    def test_guard_refusal_does_not_block_other_tables(self):
+        from scrapers.base.base_scraper import ReplaceGuardError
+
+        scraper = self._scraper()
+
+        def _save(df, table_name, **kw):
+            if table_name == 'fbref_player_stats':
+                raise ReplaceGuardError('new=2 < 90% of existing=380')
+            return f'iceberg.bronze.{table_name}'
+
+        scraper.save_to_iceberg = MagicMock(side_effect=_save)
+
+        with patch('scrapers.fbref.data_readers.extract_tables_from_comments',
+                   return_value={}), \
+             patch('scrapers.fbref.data_readers.find_player_stats_table',
+                   side_effect=lambda *a, **k: self._frame()), \
+             patch('scrapers.fbref.data_readers.find_team_stats_table',
+                   side_effect=lambda *a, **k: self._frame()), \
+             patch('scrapers.fbref.data_readers.time.sleep'):
+            result = scraper.scrape_combined_season_stats()
+
+        assert len(result['tables']) == 8
+        assert 'player_stats' not in result['tables']
+        assert len(result['guard_refusals']) == 1
+        assert 'fbref_player_stats' in result['guard_refusals'][0]
+
+    @pytest.mark.unit
+    def test_playingtime_squad_url_fallback(self):
+        """Squad playingtime missing on the player page → ONE extra fetch of
+        the dedicated /playing_time/ squad URL."""
+        scraper = self._scraper()
+
+        # find_team_stats_table call order: stats, shooting,
+        # playingtime (player page -> None), playingtime (squad page), misc
+        team_results = [self._frame(), self._frame(), None,
+                        self._frame(), self._frame()]
+
+        with patch('scrapers.fbref.data_readers.extract_tables_from_comments',
+                   return_value={}), \
+             patch('scrapers.fbref.data_readers.find_player_stats_table',
+                   side_effect=lambda *a, **k: self._frame()), \
+             patch('scrapers.fbref.data_readers.find_team_stats_table',
+                   side_effect=team_results), \
+             patch('scrapers.fbref.data_readers.time.sleep'):
+            result = scraper.scrape_combined_season_stats()
+
+        # 5 season pages + 1 squad playing_time fallback
+        assert scraper._fetch_page.call_count == 6
+        urls = [c.args[0] for c in scraper._fetch_page.call_args_list]
+        assert any('playing_time' in u for u in urls)
+        assert 'team_playingtime' in result['tables']
+        assert len(result['tables']) == 9
+
+    @pytest.mark.unit
+    def test_fetch_failure_skips_page_not_run(self):
+        """A failed page fetch skips that page's tables but the run and the
+        other pages continue."""
+        scraper = self._scraper()
+
+        def _fetch(url, **kw):
+            if '/shooting/' in url:
+                return None
+            return '<html></html>'
+
+        scraper._fetch_page = MagicMock(side_effect=_fetch)
+
+        with patch('scrapers.fbref.data_readers.extract_tables_from_comments',
+                   return_value={}), \
+             patch('scrapers.fbref.data_readers.find_player_stats_table',
+                   side_effect=lambda *a, **k: self._frame()), \
+             patch('scrapers.fbref.data_readers.find_team_stats_table',
+                   side_effect=lambda *a, **k: self._frame()), \
+             patch('scrapers.fbref.data_readers.time.sleep'):
+            result = scraper.scrape_combined_season_stats()
+
+        assert 'player_shooting' not in result['tables']
+        assert 'team_shooting' not in result['tables']
+        assert 'player_stats' in result['tables']
+        assert len(result['tables']) == 7

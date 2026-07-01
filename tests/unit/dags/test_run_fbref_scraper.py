@@ -498,3 +498,165 @@ class TestNodriverUnsupportedMode:
 
         assert rc in (0, None)
         scraper.scrape_all.assert_called_once()
+
+
+class TestCombinedSeasonStatsRunner:
+    """Runner wiring for --mode combined_season_stats (selenium branch)."""
+
+    @pytest.fixture
+    def temp_output_file(self):
+        fd, path = tempfile.mkstemp(suffix='.json')
+        os.close(fd)
+        yield path
+        if os.path.exists(path):
+            os.unlink(path)
+
+    @pytest.fixture
+    def temp_traffic_file(self):
+        fd, path = tempfile.mkstemp(suffix='.json')
+        os.close(fd)
+        yield path
+        if os.path.exists(path):
+            os.unlink(path)
+
+    @staticmethod
+    def _args(output, traffic, *, force=False):
+        args = [
+            '--scraper-type', 'selenium',
+            '--use-nodriver',
+            '--mode', 'combined_season_stats',
+            '--leagues', 'ENG-Premier League',
+            '--season', '2025',
+            '--output', output,
+            '--traffic-output', traffic,
+        ]
+        if force:
+            args.append('--force-replace')
+        return args
+
+    @staticmethod
+    def _stub_scraper():
+        scraper = MagicMock()
+        scraper._stats = {'successes': 5, 'failures': 0}
+        scraper.get_stats.return_value = scraper._stats
+        scraper.__enter__ = MagicMock(return_value=scraper)
+        scraper.__exit__ = MagicMock(return_value=False)
+        return scraper
+
+    @staticmethod
+    def _run(scraper, args):
+        sys.argv = ['run_fbref_scraper.py'] + args
+        with patch(
+            'scrapers.fbref.FBrefScraper',
+            MagicMock(return_value=scraper),
+        ):
+            import importlib
+            import dags.scripts.run_fbref_scraper as m
+            importlib.reload(m)
+            return m.main()
+
+    @pytest.mark.unit
+    def test_success_exit_0_and_traffic_json(
+        self, temp_output_file, temp_traffic_file
+    ):
+        scraper = self._stub_scraper()
+        scraper.scrape_combined_season_stats.return_value = {
+            'tables': {
+                'player_stats': 'iceberg.bronze.fbref_player_stats',
+                'team_stats': 'iceberg.bronze.fbref_team_stats',
+                'keeper_keeper': 'iceberg.bronze.fbref_keeper_keeper',
+            },
+            'guard_refusals': [],
+            'errors': [],
+        }
+
+        rc = self._run(scraper, self._args(temp_output_file, temp_traffic_file))
+
+        assert rc in (0, None)
+        with open(temp_output_file) as f:
+            result = json.load(f)
+        assert 'iceberg.bronze.fbref_player_stats' in result['tables']
+        assert result['errors'] == []
+
+        with open(temp_traffic_file) as f:
+            traffic = json.load(f)
+        assert traffic['label'] == 'season_stats'
+        assert traffic['mode'] == 'combined_season_stats'
+
+    @pytest.mark.unit
+    def test_guard_refusals_exit_3_with_marker(
+        self, temp_output_file, temp_traffic_file
+    ):
+        scraper = self._stub_scraper()
+        scraper.scrape_combined_season_stats.return_value = {
+            'tables': {'team_stats': 'iceberg.bronze.fbref_team_stats'},
+            'guard_refusals': [
+                'fbref_player_stats: new=2 rows < 90% of existing=380',
+            ],
+            'errors': [],
+        }
+
+        with pytest.raises(SystemExit) as exc:
+            self._run(scraper, self._args(temp_output_file, temp_traffic_file))
+
+        assert exc.value.code == 3
+        with open(temp_output_file) as f:
+            result = json.load(f)
+        assert any('FBREF_REPLACE_GUARD' in e for e in result['errors'])
+
+    @pytest.mark.unit
+    def test_empty_result_exits_1(self, temp_output_file, temp_traffic_file):
+        """combined_season_stats is a critical mode — 0 tables must fail."""
+        scraper = self._stub_scraper()
+        scraper.scrape_combined_season_stats.return_value = {
+            'tables': {}, 'guard_refusals': [], 'errors': [],
+        }
+
+        rc = self._run(scraper, self._args(temp_output_file, temp_traffic_file))
+
+        assert rc == 1
+
+    @pytest.mark.unit
+    def test_force_replace_threads_true(
+        self, temp_output_file, temp_traffic_file
+    ):
+        scraper = self._stub_scraper()
+        scraper.scrape_combined_season_stats.return_value = {
+            'tables': {'player_stats': 'iceberg.bronze.fbref_player_stats'},
+            'guard_refusals': [], 'errors': [],
+        }
+
+        rc = self._run(
+            scraper, self._args(temp_output_file, temp_traffic_file, force=True)
+        )
+
+        assert rc in (0, None)
+        kwargs = scraper.scrape_combined_season_stats.call_args.kwargs
+        assert kwargs['force_replace'] is True
+
+    @pytest.mark.unit
+    def test_nodriver_branch_rejects_combined_season_stats(
+        self, temp_output_file
+    ):
+        """The nodriver scraper does not implement this mode → exit 2."""
+        scraper = self._stub_scraper()
+        mock_class = MagicMock(return_value=scraper)
+
+        sys.argv = ['run_fbref_scraper.py'] + [
+            '--scraper-type', 'nodriver',
+            '--mode', 'combined_season_stats',
+            '--leagues', 'ENG-Premier League',
+            '--season', '2025',
+            '--output', temp_output_file,
+        ]
+        with patch(
+            'scrapers.nodriver_fbref.NodriverFBrefScraper', mock_class
+        ):
+            import importlib
+            import dags.scripts.run_fbref_scraper as m
+            importlib.reload(m)
+            with pytest.raises(SystemExit) as exc:
+                m.main()
+
+        assert exc.value.code == 2
+        mock_class.assert_not_called()

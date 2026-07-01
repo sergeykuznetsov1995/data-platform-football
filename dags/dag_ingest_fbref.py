@@ -10,9 +10,7 @@ Supports two scraper backends:
    match-level data only)
 
 Architecture:
-- TaskGroup player_stats: 4 SEQUENTIAL tasks (stats, shooting, playingtime, misc)
-- TaskGroup team_stats: 4 SEQUENTIAL tasks (same as player_stats)
-- TaskGroup keeper_stats: 1 SEQUENTIAL task (keeper)
+- season_stats_all: ONE combined task for all player/team/keeper season stats
 - TaskGroup match_data: schedule -> match_all_data (OPTIMIZED)
 - validate_all_data: final validation
 
@@ -21,6 +19,15 @@ OPTIMIZATION (Feb 2026):
 - After:  schedule -> match_all_data (2 tasks, N page loads)
 - HTTP requests reduction: 3x (e.g., 1141 -> 381 for 380 matches)
 - Time reduction: ~2-4 hours -> ~15-25 minutes
+
+OPTIMIZATION (Jul 2026):
+- Before: 9 single_stat tasks (player x4, team x4, keeper x1), each a separate
+  process with its own browser + CF bypass; player and team stats pages
+  downloaded twice (same URL for stats/shooting/misc).
+- After: ONE season_stats_all task — 5 unique pages per (league, season),
+  both player and squad tables parsed from the same HTML, single CF bypass,
+  HTTP fast-path for the rest.
+- Proxy traffic per run (1 league): ~24 MB -> ~3.5 MB.
 
 CLEANUP (Apr 2026):
 - Removed 5 player/team stat_types (passing, passing_types, gca, defense,
@@ -50,21 +57,15 @@ from airflow.operators.trigger_dagrun import TriggerDagRunOperator
 from utils.config import LEAGUES, CURRENT_SEASON, SCHEDULES, DAG_TAGS
 from utils.default_args import SELENIUM_ARGS
 from utils.fbref_tasks import (
-    create_single_stat_task,
     create_match_data_task,
     create_combined_match_data_task,
+    create_combined_season_stats_task,
     create_trino_health_check_task,
 )
 from utils.fbref_callbacks import (
     validate_all_data,
     check_traffic_guard,
     report_proxy_traffic,
-)
-
-from scrapers.fbref.constants import (
-    PLAYER_STAT_TYPES,
-    TEAM_STAT_TYPES,
-    KEEPER_STAT_TYPES,
 )
 
 # =============================================================================
@@ -162,35 +163,6 @@ def _make_traffic_guard(label: str, group_suffix: str = '') -> PythonOperator:
     )
 
 
-def _build_sequential_stat_group(stat_types, data_category):
-    """Build a list of sequential stat tasks within a TaskGroup context.
-
-    Issue #44: each stat task is followed by a traffic_guard sibling
-    reading `/tmp/fbref_traffic_<data_category>_<stat>.json`. The guards
-    are chained between consecutive stats so a budget breach short-circuits
-    the rest of the group (concurrency=1, so this preserves order).
-    """
-    tasks = []
-    prev_task = None
-    for stat_type in stat_types:
-        task = create_single_stat_task(
-            stat_type=stat_type,
-            data_category=data_category,
-            **COMMON_TASK_KWARGS,
-        )
-        label = f'{data_category}_{stat_type}'
-        guard = _make_traffic_guard(label=label)
-        task >> guard
-        # Chain tasks sequentially to prevent OOM (now via the guard so
-        # XCom from the guard is visible before the next stat starts).
-        if prev_task is not None:
-            prev_task >> task
-        prev_task = guard
-        tasks.append(task)
-        tasks.append(guard)
-    return tasks
-
-
 # =============================================================================
 # DAG DEFINITION
 # =============================================================================
@@ -262,22 +234,18 @@ with DAG(
 
     ```
     dag_ingest_fbref
-    ├── TaskGroup: player_stats (4 SEQUENTIAL tasks)
-    │   └── player_stats, player_shooting, player_playingtime, player_misc
-    ├── TaskGroup: team_stats (4 SEQUENTIAL tasks)
-    │   └── (same stat_types as player)
-    ├── TaskGroup: keeper_stats (1 task)
-    │   └── keeper_keeper
+    ├── season_stats_all (combined: 9 bronze tables from 5 pages per league/season)
+    │   └── traffic_guard_season_stats
     ├── TaskGroup: match_data (OPTIMIZED)
     │   ├── match_schedule
-    │   └── match_all_data (combined: 5 data types in single pass)
+    │   └── match_all_data (combined: 6 data types in single pass)
     └── validate_all_data
     ```
 
     Note (Apr 2026): passing, passing_types, gca, defense, possession were
     removed — FBref restricted these stats and the tables were 100% empty.
 
-    ### Tables Created (15 tables)
+    ### Tables Created (16 tables)
 
     **Player Stats (4 tables):**
     - fbref_player_stats, fbref_player_shooting
@@ -290,9 +258,10 @@ with DAG(
     **Keeper Stats (1 table):**
     - fbref_keeper_keeper
 
-    **Match Data (6 tables):**
+    **Match Data (7 tables):**
     - fbref_schedule, fbref_match_events, fbref_lineups
     - fbref_match_team_stats, fbref_match_player_stats, fbref_match_managers
+    - fbref_match_keeper_stats
 
     ### Testing nodriver scraper with residential proxies
 
@@ -348,22 +317,27 @@ with DAG(
     start = EmptyOperator(task_id='start')
 
     # =========================================================================
-    # TaskGroup: Player Stats (9 SEQUENTIAL tasks to prevent OOM)
+    # Season Stats: ONE combined task (replaces 9 single_stat tasks)
     # =========================================================================
-    with TaskGroup(group_id='player_stats') as player_stats_group:
-        player_tasks = _build_sequential_stat_group(PLAYER_STAT_TYPES, 'player')
+    # OPTIMIZATION (Jul 2026): player and team stats share the same season
+    # page for stats/shooting/misc (squad tables in the DOM, player table in
+    # an HTML comment), so one process fetches 5 unique pages per
+    # (league, season) instead of 9 — and pays ONE CF bypass instead of nine
+    # (each of the old task processes bootstrapped its own browser at
+    # ~2.7 MB proxy traffic per CF challenge). Uses the FBrefScraper HTTP
+    # fast-path stack (same as match_all_data).
+    #
+    # Proxy traffic per run (1 league): ~24 MB -> ~3.5 MB.
+    # =========================================================================
+    season_stats_task = create_combined_season_stats_task(
+        **COMBINED_MATCH_KWARGS,
+    )
 
-    # =========================================================================
-    # TaskGroup: Team Stats (9 SEQUENTIAL tasks to prevent OOM)
-    # =========================================================================
-    with TaskGroup(group_id='team_stats') as team_stats_group:
-        team_tasks = _build_sequential_stat_group(TEAM_STAT_TYPES, 'team')
+    # Guard reads /tmp/fbref_traffic_season_stats.json; per-task threshold via
+    # Airflow Variable `fbref_proxy_mb_threshold_season_stats`.
+    season_guard = _make_traffic_guard(label='season_stats')
 
-    # =========================================================================
-    # TaskGroup: Keeper Stats (2 SEQUENTIAL tasks to prevent OOM)
-    # =========================================================================
-    with TaskGroup(group_id='keeper_stats') as keeper_stats_group:
-        keeper_tasks = _build_sequential_stat_group(KEEPER_STAT_TYPES, 'keeper')
+    season_stats_task >> season_guard
 
     # =========================================================================
     # TaskGroup: Match Data (OPTIMIZED - combined task for 5x efficiency)
@@ -448,7 +422,8 @@ with DAG(
     )
 
     # =========================================================================
-    # Dependencies: Start -> TaskGroups SEQUENTIAL -> Validate -> Report -> Trigger Silver
+    # Dependencies: Start -> Season Stats -> Match Data -> Validate -> Report -> Trigger Silver
     # Sequential execution to prevent OOM
     # =========================================================================
-    start >> player_stats_group >> team_stats_group >> keeper_stats_group >> match_data_group >> validate_task >> report_traffic >> trigger_silver
+    start >> season_stats_task
+    season_guard >> match_data_group >> validate_task >> report_traffic >> trigger_silver
