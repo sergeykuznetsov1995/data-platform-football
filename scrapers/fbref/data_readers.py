@@ -40,6 +40,7 @@ from scrapers.fbref.html_parser import (
     parse_events_from_scorebox,
     parse_team_match_stats_table,
     parse_player_match_stats_tables,
+    parse_keeper_match_stats_tables,
     parse_match_managers,
     parse_match_officials,
     diagnose_html_structure,
@@ -720,10 +721,11 @@ class FBrefDataReaderMixin:
         all_match_player_stats: List[pd.DataFrame] = None,
         all_match_managers: List[pd.DataFrame] = None,
         all_match_officials: List[pd.DataFrame] = None,
+        all_match_keeper_stats: List[pd.DataFrame] = None,
     ) -> Set[str]:
         """
         Process a single match page: extract shots, events, lineups,
-        team match stats, and player match stats.
+        team match stats, player match stats, and keeper match stats.
 
         Parses HTML once with BeautifulSoup and calls parsers directly,
         avoiding redundant BS4 parsing that read_* methods would do.
@@ -815,6 +817,18 @@ class FBrefDataReaderMixin:
                 all_match_officials.append(officials_df)
                 got_types.add('match_officials')
 
+        # Keeper match stats (keeper_stats_{team_id} tables — basic GK
+        # columns still populated after the Apr-2026 FBref restriction)
+        if all_match_keeper_stats is not None:
+            keeper_df = parse_keeper_match_stats_tables(soup, comment_tables)
+            if keeper_df is not None and not keeper_df.empty:
+                keeper_df['match_id'] = match_id
+                keeper_df['league'] = league
+                keeper_df['season'] = season
+                keeper_df = self._add_metadata(keeper_df, 'match_keeper_stats')
+                all_match_keeper_stats.append(keeper_df)
+                got_types.add('match_keeper_stats')
+
         # Free memory: decompose soup tree and remove from cache
         soup.decompose()
         del comment_tables
@@ -851,6 +865,7 @@ class FBrefDataReaderMixin:
         all_match_player_stats: List[pd.DataFrame] = None,
         all_match_managers: List[pd.DataFrame] = None,
         all_match_officials: List[pd.DataFrame] = None,
+        all_match_keeper_stats: List[pd.DataFrame] = None,
     ) -> None:
         """
         Save accumulated match data to Iceberg and clear the lists.
@@ -881,6 +896,7 @@ class FBrefDataReaderMixin:
             (all_match_player_stats, 'fbref_match_player_stats', 'match_player_stats', ['match_id']),
             (all_match_managers, 'fbref_match_managers', 'match_managers', ['match_id']),
             (all_match_officials, 'fbref_match_officials', 'match_officials', ['match_id']),
+            (all_match_keeper_stats, 'fbref_match_keeper_stats', 'match_keeper_stats', ['match_id']),
         ]
 
         for data_list, table_name, result_key, replace_keys in save_items:
@@ -1209,6 +1225,7 @@ class FBrefDataReaderMixin:
         all_match_player_stats = []
         all_match_managers = []
         all_match_officials = []
+        all_match_keeper_stats = []
 
         total_matches_processed = 0
         total_pages_fetched = 0
@@ -1222,6 +1239,7 @@ class FBrefDataReaderMixin:
             all_match_player_stats=all_match_player_stats,
             all_match_managers=all_match_managers,
             all_match_officials=all_match_officials,
+            all_match_keeper_stats=all_match_keeper_stats,
         )
 
         for league in self.leagues:
@@ -1326,6 +1344,7 @@ class FBrefDataReaderMixin:
                                 all_match_team_stats, all_match_player_stats,
                                 all_match_managers,
                                 all_match_officials,
+                                all_match_keeper_stats,
                             )
 
                             if got_types:
@@ -1405,6 +1424,7 @@ class FBrefDataReaderMixin:
                                     all_match_team_stats, all_match_player_stats,
                                     all_match_managers,
                                     all_match_officials,
+                                    all_match_keeper_stats,
                                 )
                                 if got_types and 'match_player_stats' in got_types:
                                     recovered += 1

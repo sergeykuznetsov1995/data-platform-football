@@ -536,3 +536,91 @@ class TestBatchSaveRetryDedup:
         df = scraper.save_to_iceberg.call_args.kwargs['df']
         assert sorted(df['match_id']) == ['m1', 'm2']
         assert df.set_index('match_id').loc['m1', 'pass_marker'] == 'retry'
+
+
+# ===========================================================================
+# Test: keeper match stats wiring (parse → buffer → batch save)
+# ===========================================================================
+
+class TestKeeperMatchStatsWiring:
+    """fbref_match_keeper_stats: _process_single_match fills the buffer and
+    _batch_save_match_data writes it with replace_partitions=['match_id']."""
+
+    @staticmethod
+    def _keeper_frame(match_id):
+        return pd.DataFrame({
+            'match_id': [match_id], 'league': ['ENG-Premier League'],
+            'season': [2025], 'Player': ['Robin Roefs'],
+            'gk_saves': ['2'], 'team_side': ['home'],
+        })
+
+    def test_process_single_match_fills_keeper_buffer(self):
+        scraper = StubScraper()
+        scraper._fetch_page = MagicMock(return_value='<html></html>')
+
+        keeper_buffer = []
+        with patch('scrapers.fbref.data_readers.extract_tables_from_comments',
+                   return_value={}), \
+             patch('scrapers.fbref.data_readers.parse_shots_table',
+                   return_value=None), \
+             patch('scrapers.fbref.data_readers.parse_events_from_scorebox',
+                   return_value=None), \
+             patch('scrapers.fbref.data_readers.parse_lineup_table',
+                   return_value=None), \
+             patch('scrapers.fbref.data_readers.parse_keeper_match_stats_tables',
+                   return_value=self._keeper_frame('m1')) as keeper_mock:
+            got = scraper._process_single_match(
+                'm1', 'ENG-Premier League', 2025,
+                [], [], [],
+                all_match_keeper_stats=keeper_buffer,
+            )
+
+        keeper_mock.assert_called_once()
+        assert 'match_keeper_stats' in got
+        assert len(keeper_buffer) == 1
+        assert keeper_buffer[0]['match_id'].iloc[0] == 'm1'
+
+    def test_keeper_parser_skipped_without_buffer(self):
+        """Backward compat: no keeper buffer → parser not invoked."""
+        scraper = StubScraper()
+        scraper._fetch_page = MagicMock(return_value='<html></html>')
+
+        with patch('scrapers.fbref.data_readers.extract_tables_from_comments',
+                   return_value={}), \
+             patch('scrapers.fbref.data_readers.parse_shots_table',
+                   return_value=None), \
+             patch('scrapers.fbref.data_readers.parse_events_from_scorebox',
+                   return_value=None), \
+             patch('scrapers.fbref.data_readers.parse_lineup_table',
+                   return_value=None), \
+             patch('scrapers.fbref.data_readers.parse_keeper_match_stats_tables',
+                   return_value=self._keeper_frame('m1')) as keeper_mock:
+            got = scraper._process_single_match(
+                'm1', 'ENG-Premier League', 2025,
+                [], [], [],
+            )
+
+        keeper_mock.assert_not_called()
+        assert 'match_keeper_stats' not in got
+
+    def test_batch_save_writes_keeper_table_with_match_id_replace(self):
+        scraper = StubScraper()
+        scraper.save_to_iceberg = MagicMock(
+            side_effect=lambda df, table_name, **kw: f'iceberg.bronze.{table_name}'
+        )
+
+        results = {}
+        scraper._batch_save_match_data(
+            [], [], [],
+            results=results,
+            all_match_keeper_stats=[self._keeper_frame('m1')],
+        )
+
+        calls = {
+            c.kwargs['table_name']: c.kwargs
+            for c in scraper.save_to_iceberg.call_args_list
+        }
+        assert 'fbref_match_keeper_stats' in calls
+        assert calls['fbref_match_keeper_stats']['replace_partitions'] == ['match_id']
+        assert calls['fbref_match_keeper_stats']['partition_cols'] == ['league', 'season']
+        assert results['match_keeper_stats'] == 'iceberg.bronze.fbref_match_keeper_stats'
