@@ -4,10 +4,18 @@ CERT_DIR="configs/trino/certs"
 mkdir -p "$CERT_DIR"
 KEYSTORE_PASS="${TRINO_KEYSTORE_PASSWORD:-changeit}"
 
-# Generate key and certificate
+# Idempotent: keytool import appends, so clear prior stores before regenerating.
+rm -f "$CERT_DIR/keystore.jks" "$CERT_DIR/truststore.jks"
+
+# Generate key and certificate.
+# subjectAltName is REQUIRED: modern TLS clients (Python ssl/requests, and thus
+# dbt-trino) ignore CN and verify the hostname against SAN only. Without it,
+# dbt-trino fails with "certificate is not valid for 'trino'" (it has no
+# verify=false escape hatch, unlike the trino python client used elsewhere).
 openssl req -x509 -newkey rsa:4096 -keyout "$CERT_DIR/trino.key" \
   -out "$CERT_DIR/trino.crt" -days 365 -nodes \
-  -subj "/CN=trino/O=DataPlatform"
+  -subj "/CN=trino/O=DataPlatform" \
+  -addext "subjectAltName=DNS:trino,DNS:localhost,IP:127.0.0.1"
 
 # PKCS12
 openssl pkcs12 -export -in "$CERT_DIR/trino.crt" -inkey "$CERT_DIR/trino.key" \
@@ -19,5 +27,14 @@ keytool -importkeystore -srckeystore "$CERT_DIR/trino.p12" -srcstoretype PKCS12 
   -deststoretype JKS -deststorepass "$KEYSTORE_PASS" -noprompt
 
 chmod 644 "$CERT_DIR/keystore.jks"
+
+# Truststore: internal-communication.https.truststore.path must trust our own
+# self-signed cert, so it has to be regenerated alongside the keystore — else a
+# fresh cert breaks node<->node (single-node: node<->self) internal TLS.
+keytool -importcert -noprompt -alias trino -file "$CERT_DIR/trino.crt" \
+  -keystore "$CERT_DIR/truststore.jks" -storepass "$KEYSTORE_PASS"
+chmod 644 "$CERT_DIR/truststore.jks"
+
 echo "Certificates generated in $CERT_DIR"
-echo "Keystore: $CERT_DIR/keystore.jks"
+echo "Keystore:   $CERT_DIR/keystore.jks"
+echo "Truststore: $CERT_DIR/truststore.jks"
