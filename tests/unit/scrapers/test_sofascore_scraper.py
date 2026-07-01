@@ -64,6 +64,9 @@ class TestShotmapFlatten:
                     'goalMouthCoordinates': {'x': 100.0, 'y': 52.3},
                     'xg': 0.72,
                     'xgot': 0.84,
+                    # #840: extra/unknown source fields must pass through.
+                    'draw': True,
+                    'isOwnGoal': False,
                 },
                 {
                     'id': 102,
@@ -103,22 +106,34 @@ class TestShotmapFlatten:
         assert len(rows) == 3
 
         goal = rows[0]
+        # Anchors / PK — unchanged contract.
         assert goal['match_id'] == '14023925'
         assert goal['shot_id'] == '101'
         assert goal['player_id'] == '11111'
         assert goal['team_id'] == 1
         assert goal['is_home'] is True
-        assert goal['minute'] == 12
-        assert goal['period'] == 1
+        # #840: source-key names (Bronze as-is), NOT the old derived names.
+        assert goal['id'] == 101
+        assert goal['time'] == 12
+        assert goal['added_time'] == 0
+        assert goal['reversed_period_count'] == 1
         assert goal['shot_type'] == 'rightFoot'
         assert goal['situation'] == 'open-play'
         assert goal['body_part'] == 'rightFoot'
-        assert goal['outcome'] == 'goal'
+        assert goal['incident_type'] == 'goal'
         assert goal['goal_type'] == 'regular'
-        assert goal['x'] == 88.5
-        assert goal['y'] == 50.0
+        assert goal['player_coordinates_x'] == 88.5
+        assert goal['player_coordinates_y'] == 50.0
+        assert goal['goal_mouth_coordinates_x'] == 100.0
+        assert goal['goal_mouth_coordinates_y'] == 52.3
         assert goal['xg'] == 0.72
         assert goal['xgot'] == 0.84
+        # Unknown/extra source fields pass through automatically (the #840 point).
+        assert goal['draw'] is True
+        assert goal['is_own_goal'] is False
+        # Old derived/renamed column names are gone (moved to Silver).
+        for dead in ('minute', 'period', 'outcome', 'x', 'y', 'goal_x', 'goal_y'):
+            assert dead not in goal
 
     def test_flatten_missing_id_falls_back_to_composite(self):
         from scrapers.sofascore.scraper import SofaScoreScraper
@@ -128,9 +143,10 @@ class TestShotmapFlatten:
         # composite: match-time-player-addedTime
         assert third['shot_id'] == '14023925-78-33333-0'
         assert third['player_id'] == '33333'
-        assert third['outcome'] == 'miss'
-        # xgot absent → None
-        assert third['xgot'] is None
+        assert third['incident_type'] == 'miss'
+        # #840: absent source key -> absent column (not a None-valued column).
+        assert 'xgot' not in third
+        assert 'added_time' not in third
 
     def test_flatten_handles_garbage(self):
         from scrapers.sofascore.scraper import SofaScoreScraper
@@ -139,30 +155,71 @@ class TestShotmapFlatten:
         assert SofaScoreScraper._flatten_shotmap('1', None) == []
         assert SofaScoreScraper._flatten_shotmap('1', {}) == []
         assert SofaScoreScraper._flatten_shotmap('1', {'shotmap': 'oops'}) == []
+        # #840: an empty shot yields anchors only — no None-filled derived cols.
         assert SofaScoreScraper._flatten_shotmap('1', {'shotmap': [{}]}) == [
-            # Empty dict still yields a row with mostly None values + composite shot_id
             {
                 'match_id': '1',
                 'shot_id': '1-NA-NA-0',
                 'player_id': None,
                 'team_id': None,
                 'is_home': None,
-                'minute': None,
-                'added_time': None,
-                'period': None,
-                'shot_type': None,
-                'situation': None,
-                'body_part': None,
-                'outcome': None,
-                'goal_type': None,
-                'x': None,
-                'y': None,
-                'goal_x': None,
-                'goal_y': None,
-                'xg': None,
-                'xgot': None,
             }
         ]
+
+
+class TestAutoFlatten:
+    """Unit tests for the recursive Bronze auto-flatten helper (#840)."""
+
+    def test_scalar_coercion(self):
+        from scrapers.sofascore.scraper import _auto_flatten
+        out = {}
+        _auto_flatten({'accuratePass': '12', 'ratingText': 'n/a', 'flag': True}, out)
+        assert out['accurate_pass'] == 12       # numeric string upcast
+        assert out['rating_text'] == 'n/a'      # non-numeric string kept
+        assert out['flag'] is True
+
+    def test_value_wrapper_unwrapped(self):
+        from scrapers.sofascore.scraper import _auto_flatten
+        out = {}
+        _auto_flatten({'goals': {'value': 3, 'previousValue': 2}}, out)
+        # {"value": X, ...} collapses to X — not recursed into a prefix.
+        assert out['goals'] == 3
+        assert 'goals_value' not in out
+
+    def test_nested_dict_prefixed(self):
+        from scrapers.sofascore.scraper import _auto_flatten
+        out = {}
+        _auto_flatten({'playerCoordinates': {'x': 88.5, 'y': 50.0}}, out)
+        assert out['player_coordinates_x'] == 88.5
+        assert out['player_coordinates_y'] == 50.0
+
+    def test_lists_skipped(self):
+        from scrapers.sofascore.scraper import _auto_flatten
+        out = {}
+        _auto_flatten({'tags': [1, 2, 3], 'n': 5}, out)
+        assert 'tags' not in out                 # lists don't flatten into columns
+        assert out['n'] == 5
+
+    def test_skip_and_anchor_not_clobbered(self):
+        from scrapers.sofascore.scraper import _auto_flatten
+        out = {'team_id': 1}                      # pre-seeded anchor
+        _auto_flatten(
+            {'team': {'id': 999}, 'teamId': 999, 'x': 1},
+            out, skip=('team',),
+        )
+        assert out['team_id'] == 1                # anchor preserved (teamId did not clobber)
+        assert out['x'] == 1                      # skip removed only 'team', not siblings
+
+    def test_depth_cap(self):
+        from scrapers.sofascore.scraper import _auto_flatten, _MAX_FLATTEN_DEPTH
+        node = {'deep_leaf': 1}
+        for _ in range(_MAX_FLATTEN_DEPTH + 2):
+            node = {'d': node}
+        node['shallow'] = 2
+        out = {}
+        _auto_flatten(node, out)
+        assert out['shallow'] == 2                # shallow content kept
+        assert 1 not in out.values()             # too-deep leaf dropped by the cap
 
 
 class TestCamelToSnake:
