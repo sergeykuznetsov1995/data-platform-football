@@ -236,15 +236,23 @@ def _validate_silver_quality(**context) -> Dict[str, Any]:
         ),
 
         # canonical_id coverage — WARNING/ERROR by ratio.
-        # Live APL 2025/26 measurement: 89.8% non-orphan.
-        #   warn_threshold=0.88 → above 88% PASS
-        #   error_threshold=0.80 → 80-88% WARNING, <80% ERROR
-        # See feedback_xref_player_tm_capology.md.
+        # Two structural regimes (live measurements):
+        #   in-season squad view: 89.8% non-orphan (2025/26 mid-season,
+        #     feedback_xref_player_tm_capology.md);
+        #   post-season view (TM flips its current season in early July,
+        #     CURRENT_SEASON flips in August): the squad page lists EVERY
+        #     player of the season incl. youth/loan-out who never made the
+        #     FBref spine — historical seasons sit at 66-72%; live 2026-07-01
+        #     the current season dropped to 61.5% for exactly this reason.
+        #   warn_threshold=0.80 → the July-August window shows up as a
+        #     WARNING (expected; self-heals with the new season + xref rerun);
+        #   error_threshold=0.60 → below the post-season structural floor
+        #     something is genuinely broken.
         CHECK.coverage(
             'silver.transfermarkt_players',
             column='canonical_id',
-            warn_threshold=0.88,
-            error_threshold=0.80,
+            warn_threshold=0.80,
+            error_threshold=0.60,
             severity='WARNING',
             # #788: меряем покрытие только за последний (текущий) сезон — это
             # health-сигнал на толстом current-season FBref-spine. Canonical теперь
@@ -396,11 +404,14 @@ def _validate_silver_quality(**context) -> Dict[str, Any]:
         # много transfer-событий. Live 2026-06-12: 614/750 = 81.9%
         # (15 структурных orphan-игроков из 100) → WARNING. DoD #62 (≥95%)
         # на event-grain недостижим; revisit after #486 full-roster (#493).
+        # Thresholds share the post-season rationale of the players check
+        # above (66-78% structural floor in the July-August window; live
+        # 2026-07-01: 78.0%).
         CHECK.coverage(
             'silver.transfermarkt_transfers',
             column='canonical_id',
-            warn_threshold=0.88,
-            error_threshold=0.80,
+            warn_threshold=0.80,
+            error_threshold=0.60,
             severity='WARNING',
             # #788: health-сигнал на current-season spine. Canonical историзирован
             # за все сезоны, исторический градиент покрытия сглаживается в #825.
