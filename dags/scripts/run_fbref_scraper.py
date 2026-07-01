@@ -290,10 +290,12 @@ def main():
     parser.add_argument(
         '--mode',
         type=str,
-        choices=['full', 'single_stat', 'match_data', 'combined_match_data'],
+        choices=['full', 'single_stat', 'match_data', 'combined_match_data',
+                 'combined_season_stats'],
         default='full',
         help='Scraping mode: full (all data), single_stat (one stat_type), '
-             'match_data (one match data type), combined_match_data (all match data in one pass)'
+             'match_data (one match data type), combined_match_data (all match data in one pass), '
+             'combined_season_stats (all player/team/keeper season stats in one pass)'
     )
     parser.add_argument(
         '--stat-type',
@@ -499,6 +501,22 @@ def main():
     # Nodriver scraper (recommended, Cloudflare Turnstile bypass)
     # ==========================================================================
     if args.scraper_type == 'nodriver':
+        # Modes NOT in this set (e.g. combined_match_data) used to fall through
+        # into the 'full' else-branch and silently run a full season scrape —
+        # wrong tables and a lot of wasted proxy MB. Fail loudly instead.
+        _NODRIVER_MODES = {'single_stat', 'match_data', 'full'}
+        if args.mode not in _NODRIVER_MODES:
+            error_msg = (
+                f"Mode '{args.mode}' is not supported by the nodriver scraper "
+                f"(supported: {sorted(_NODRIVER_MODES)}). "
+                f"Use --scraper-type selenium for this mode."
+            )
+            logger.error(error_msg)
+            results['errors'].append(error_msg)
+            with open(args.output, 'w') as f:
+                json.dump(results, f)
+            sys.exit(2)
+
         logger.info("Using nodriver scraper (Cloudflare Turnstile bypass)")
         logger.info(f"Headless: {args.headless}, use_xvfb: {args.use_xvfb}")
         logger.info(f"Cloudflare wait: {args.cloudflare_wait}s, cf-verify retries: {args.cf_verify_retries}")
@@ -623,7 +641,7 @@ def main():
                 # =============================================================
                 # MODE: full (not recommended for nodriver - use single_stat)
                 # =============================================================
-                else:  # mode == 'full'
+                elif args.mode == 'full':
                     logger.info(
                         "Full mode with nodriver: sequential collection "
                         "(schedule → player → team → keeper stats)"
@@ -920,6 +938,59 @@ def main():
                             )
 
                 # =============================================================
+                # MODE: combined_season_stats (one fetch per season page,
+                # player + team tables parsed from the same HTML)
+                # =============================================================
+                elif args.mode == 'combined_season_stats':
+                    logger.info(
+                        "Combined season stats mode: all player/team/keeper "
+                        "stats in one pass (5 pages per league/season)"
+                    )
+
+                    scrape_results = scraper.scrape_combined_season_stats(
+                        force_replace=args.force_replace,
+                    )
+
+                    results['tables'] = list(scrape_results['tables'].values())
+                    results['errors'].extend(scrape_results['errors'])
+
+                    results['diagnostics']['scraper_stats'] = {
+                        'successes': scraper._stats.get('successes', 0),
+                        'failures': scraper._stats.get('failures', 0),
+                    }
+                    results['diagnostics']['traffic'] = _get_traffic_diagnostics(scraper)
+
+                    _write_traffic_summary(
+                        scraper,
+                        label='season_stats',
+                        mode='combined_season_stats',
+                        extra={
+                            'successes': scraper._stats.get('successes', 0),
+                            'failures': scraper._stats.get('failures', 0),
+                            'guard_refusals': scrape_results['guard_refusals'],
+                        },
+                        explicit_path=args.traffic_output,
+                    )
+
+                    logger.info(
+                        f"Combined season stats completed: "
+                        f"{sorted(scrape_results['tables'].keys())}"
+                    )
+
+                    # #583 semantics: a refused guard is a distinct exit 3 so
+                    # the operator can tell it from a hard failure. Tables that
+                    # did save are idempotent (replace_partitions) — a re-run
+                    # after fixing the guard just rewrites them.
+                    if scrape_results['guard_refusals']:
+                        for refusal in scrape_results['guard_refusals']:
+                            msg = f"{REPLACE_GUARD_MARKER}: {refusal}"
+                            logger.error(msg)
+                            results['errors'].append(msg)
+                        with open(args.output, 'w') as f:
+                            json.dump(results, f)
+                        sys.exit(3)
+
+                # =============================================================
                 # MODE: full
                 # =============================================================
                 else:  # mode == 'full'
@@ -1003,7 +1074,7 @@ def main():
         # For modes that MUST produce data, 0 tables is always a failure
         mode = results.get('mode', args.mode if hasattr(args, 'mode') else '')
         match_data_type = results.get('match_data_type', '')
-        critical_modes = {'combined_match_data', 'schedule'}
+        critical_modes = {'combined_match_data', 'combined_season_stats', 'schedule'}
         if mode in critical_modes or match_data_type == 'schedule':
             logger.error(
                 f"Scraper finished with no data and no errors for mode='{mode}' "

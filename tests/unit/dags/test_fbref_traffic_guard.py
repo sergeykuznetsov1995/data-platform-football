@@ -149,3 +149,58 @@ class TestCheckTrafficGuardParameterized:
 
         assert result['status'] == 'missing'
         assert result['real_proxy_mb'] is None
+
+
+class TestTrafficGuardHttpFastPath:
+    """The threshold must apply to browser + HTTP fast-path MB combined —
+    fast-path bytes go through the same paid residential proxy."""
+
+    @pytest.mark.unit
+    def test_http_mb_included_in_threshold_sum(
+        self, write_traffic_json, airflow_ti
+    ):
+        from airflow.exceptions import AirflowException
+        from dags.utils.fbref_callbacks import check_traffic_guard
+
+        # 6 browser MB + 5 http MB = 11 total > 10 threshold: must raise
+        # even though real_proxy_mb alone is under the limit.
+        path = write_traffic_json('season_stats', {
+            'real_proxy_mb': 6.0,
+            'http_mb_downloaded': 5.0,
+        })
+
+        with patch('airflow.models.Variable.get', return_value='10'):
+            with pytest.raises(AirflowException) as exc:
+                check_traffic_guard(
+                    traffic_path=path,
+                    label='season_stats',
+                    ti=airflow_ti,
+                )
+
+        assert '11.00 MB' in str(exc.value)
+
+    @pytest.mark.unit
+    def test_total_and_http_mb_pushed_to_xcom(
+        self, write_traffic_json, airflow_ti
+    ):
+        from dags.utils.fbref_callbacks import check_traffic_guard
+
+        path = write_traffic_json('season_stats', {
+            'real_proxy_mb': 2.5,
+            'http_mb_downloaded': 1.5,
+        })
+
+        with patch('airflow.models.Variable.get', return_value='500'):
+            result = check_traffic_guard(
+                traffic_path=path,
+                label='season_stats',
+                ti=airflow_ti,
+            )
+
+        assert result['status'] == 'ok'
+        assert result['http_mb'] == 1.5
+        assert result['total_proxy_mb'] == 4.0
+        assert airflow_ti.pushed['http_mb'] == 1.5
+        assert airflow_ti.pushed['total_proxy_mb'] == 4.0
+        # Existing key must stay intact for downstream consumers
+        assert airflow_ti.pushed['real_proxy_mb'] == 2.5
