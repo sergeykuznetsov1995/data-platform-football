@@ -1,18 +1,17 @@
 """
-Integration tests for dag_ingest_fbref with TaskGroup architecture.
+Integration tests for dag_ingest_fbref.
 
 These tests verify:
 - DAG loads without errors
-- TaskGroup structure is correct
+- Task structure is correct (combined season stats + match_data group)
 - Task dependencies are properly configured
 - All expected tasks exist
 
-Issue #495: ожидания выводятся из ``scrapers.fbref.constants``
-({PLAYER,TEAM,KEEPER}_STAT_TYPES) вместо хардкода — списки урезаны после
-FBref-ограничения Apr-2026 (passing/gca/defense/possession пустые), и каждый
-stat-таск имеет traffic_guard-близнеца (#44). Группы выполняются
-ПОСЛЕДОВАТЕЛЬНО (player >> team >> keeper >> match_data >> validate) — OOM
-safety, не параллельно.
+Architecture (Jul 2026): the nine single_stat tasks (player x4, team x4,
+keeper x1 + traffic-guard twins) were replaced by ONE combined
+``season_stats_all`` task — player and team stats share the same season
+page for stats/shooting/misc, so one process fetches 5 unique pages per
+(league, season) instead of 9 and pays a single CF bypass (~2.7 MB each).
 """
 
 import os
@@ -24,16 +23,6 @@ import pytest
 # sys.path setup (project root + dags folder) is centralised in the root conftest.py.
 PROJECT_ROOT = Path(__file__).parent.parent.parent.parent
 DAGS_FOLDER = PROJECT_ROOT / 'dags'
-
-
-def _stat_types():
-    """Актуальные stat types — единственный источник правды для ожиданий."""
-    from scrapers.fbref.constants import (
-        PLAYER_STAT_TYPES,
-        TEAM_STAT_TYPES,
-        KEEPER_STAT_TYPES,
-    )
-    return PLAYER_STAT_TYPES, TEAM_STAT_TYPES, KEEPER_STAT_TYPES
 
 
 @pytest.fixture(scope='module')
@@ -83,65 +72,26 @@ class TestFBrefDAGLoading:
 
 
 @pytest.mark.integration
-class TestFBrefTaskGroups:
-    """Tests for TaskGroup structure.
+class TestFBrefTaskStructure:
+    """Tests for the combined-season-stats + match_data structure."""
 
-    Каждая stat-группа содержит 2×len(STAT_TYPES) task'ов: stat-таск +
-    traffic_guard-близнец (#44, _build_sequential_stat_group).
-    """
-
-    def test_dag_has_taskgroups(self, fbref_dag):
-        """Test that DAG uses TaskGroups."""
+    def test_season_stats_combined_task_exists(self, fbref_dag):
+        """ONE season_stats_all task replaces the nine single_stat tasks."""
         task_ids = list(fbref_dag.task_dict.keys())
 
-        # TaskGroup tasks have prefixed IDs like 'player_stats.player_shooting'
-        taskgroup_prefixes = ['player_stats.', 'team_stats.', 'keeper_stats.', 'match_data.']
+        assert 'season_stats_all' in task_ids, \
+            f"Expected season_stats_all task, got: {task_ids}"
+        assert 'traffic_guard_season_stats' in task_ids, \
+            f"Expected traffic_guard_season_stats task, got: {task_ids}"
 
-        has_taskgroups = any(
-            any(task_id.startswith(prefix) for prefix in taskgroup_prefixes)
-            for task_id in task_ids
-        )
-
-        assert has_taskgroups, f"Expected TaskGroup tasks, got: {task_ids}"
-
-    def test_taskgroup_player_stats_task_count(self, fbref_dag):
-        """player_stats: stat-таск + guard на каждый PLAYER_STAT_TYPES."""
-        player_types, _, _ = _stat_types()
-        player_stat_tasks = [
+    def test_no_legacy_single_stat_taskgroups(self, fbref_dag):
+        """The old per-stat TaskGroups must be gone (Jul-2026 optimization)."""
+        legacy_prefixes = ('player_stats.', 'team_stats.', 'keeper_stats.')
+        legacy = [
             task_id for task_id in fbref_dag.task_dict.keys()
-            if task_id.startswith('player_stats.')
+            if task_id.startswith(legacy_prefixes)
         ]
-
-        expected_count = 2 * len(player_types)
-        assert len(player_stat_tasks) == expected_count, \
-            f"Expected {expected_count} player_stats tasks (stat+guard на " \
-            f"{player_types}), got {len(player_stat_tasks)}: {player_stat_tasks}"
-
-    def test_taskgroup_team_stats_task_count(self, fbref_dag):
-        """team_stats: stat-таск + guard на каждый TEAM_STAT_TYPES."""
-        _, team_types, _ = _stat_types()
-        team_stat_tasks = [
-            task_id for task_id in fbref_dag.task_dict.keys()
-            if task_id.startswith('team_stats.')
-        ]
-
-        expected_count = 2 * len(team_types)
-        assert len(team_stat_tasks) == expected_count, \
-            f"Expected {expected_count} team_stats tasks, got " \
-            f"{len(team_stat_tasks)}: {team_stat_tasks}"
-
-    def test_taskgroup_keeper_stats_task_count(self, fbref_dag):
-        """keeper_stats: stat-таск + guard на каждый KEEPER_STAT_TYPES."""
-        _, _, keeper_types = _stat_types()
-        keeper_stat_tasks = [
-            task_id for task_id in fbref_dag.task_dict.keys()
-            if task_id.startswith('keeper_stats.')
-        ]
-
-        expected_count = 2 * len(keeper_types)
-        assert len(keeper_stat_tasks) == expected_count, \
-            f"Expected {expected_count} keeper_stats tasks, got " \
-            f"{len(keeper_stat_tasks)}: {keeper_stat_tasks}"
+        assert not legacy, f"Legacy single_stat tasks still present: {legacy}"
 
     def test_taskgroup_match_data_structure(self, fbref_dag):
         """match_data: 2 Trino-чека + schedule(+guard) + combined
@@ -181,25 +131,28 @@ class TestFBrefTaskDependencies:
             f"Expected traffic_guard_match_schedule downstream of schedule, " \
             f"got: {downstream_ids}"
 
-    def test_taskgroups_run_sequentially(self, fbref_dag):
-        """Группы выполняются последовательно (OOM safety): validate берёт
-        upstream только из match_data (последней группы), а цепочка
-        player → team → keeper → match_data связана через граничные task'и."""
-        validate_task = fbref_dag.task_dict.get('validate_all_data')
+    def test_season_stats_runs_before_match_data(self, fbref_dag):
+        """season_stats_all → guard → match_data (последовательно, OOM
+        safety); validate берёт upstream из match_data."""
+        season_task = fbref_dag.task_dict['season_stats_all']
+        downstream_ids = [t.task_id for t in season_task.downstream_list]
+        assert 'traffic_guard_season_stats' in downstream_ids, \
+            f"Expected traffic_guard_season_stats downstream of " \
+            f"season_stats_all, got: {downstream_ids}"
 
+        guard = fbref_dag.task_dict['traffic_guard_season_stats']
+        guard_downstream = [t.task_id for t in guard.downstream_list]
+        assert any(tid.startswith('match_data.') for tid in guard_downstream), \
+            f"match_data must run after the season stats guard, " \
+            f"got: {guard_downstream}"
+
+        validate_task = fbref_dag.task_dict.get('validate_all_data')
         if validate_task is None:
             pytest.skip("Validate task not found")
 
         upstream_ids = [task.task_id for task in validate_task.upstream_list]
         assert any(tid.startswith('match_data.') for tid in upstream_ids), \
             f"validate_all_data must depend on match_data group, got: {upstream_ids}"
-
-        # Граница групп: первый таск team_stats имеет upstream из player_stats.
-        _, team_types, _ = _stat_types()
-        first_team = fbref_dag.task_dict[f'team_stats.team_{team_types[0]}']
-        team_upstream = [t.task_id for t in first_team.upstream_list]
-        assert any(tid.startswith('player_stats.') for tid in team_upstream), \
-            f"team_stats must run after player_stats, got upstream: {team_upstream}"
 
     def test_validate_task_has_trigger_rule_all_done(self, fbref_dag):
         """Test that validate task runs even if some upstream tasks fail."""
@@ -217,34 +170,22 @@ class TestFBrefTaskDependencies:
 class TestFBrefTaskConfiguration:
     """Tests for individual task configuration."""
 
-    def test_player_stat_tasks_are_bash_operators(self, fbref_dag):
-        """Stat-таски — BashOperator; traffic_guard-близнецы — PythonOperator
-        (#44), их фильтруем по префиксу id."""
+    def test_season_stats_task_is_bash_operator(self, fbref_dag):
+        """season_stats_all — BashOperator; его traffic_guard — PythonOperator."""
         from airflow.operators.bash import BashOperator
 
-        player_stat_tasks = [
-            fbref_dag.task_dict[task_id]
-            for task_id in fbref_dag.task_dict.keys()
-            if task_id.startswith('player_stats.player_')
-        ]
-        assert player_stat_tasks, "no player stat tasks found"
+        season_task = fbref_dag.task_dict['season_stats_all']
+        assert isinstance(season_task, BashOperator), \
+            f"Expected BashOperator for season_stats_all, got {type(season_task)}"
 
-        for task in player_stat_tasks:
-            assert isinstance(task, BashOperator), \
-                f"Expected BashOperator for {task.task_id}, got {type(task)}"
-
-    def test_tasks_use_single_stat_mode(self, fbref_dag):
-        """Test that stat tasks use --mode single_stat in bash command."""
-        player_stat_tasks = [
-            fbref_dag.task_dict[task_id]
-            for task_id in fbref_dag.task_dict.keys()
-            if task_id.startswith('player_stats.')
-        ]
-
-        for task in player_stat_tasks:
-            if hasattr(task, 'bash_command'):
-                assert '--mode single_stat' in task.bash_command, \
-                    f"Expected --mode single_stat in {task.task_id} bash_command"
+    def test_season_stats_task_mode(self, fbref_dag):
+        """season_stats_all → --mode combined_season_stats + очистка
+        устаревших per-stat JSON результатов старой архитектуры."""
+        season_task = fbref_dag.task_dict['season_stats_all']
+        assert '--mode combined_season_stats' in season_task.bash_command, \
+            "Expected --mode combined_season_stats in season_stats_all bash_command"
+        assert 'rm -f /tmp/fbref_player_' in season_task.bash_command, \
+            "Expected stale per-stat JSON cleanup in season_stats_all bash_command"
 
     def test_match_data_tasks_modes(self, fbref_dag):
         """schedule → --mode match_data; комбинированный match_all_data →
@@ -271,33 +212,15 @@ class TestFBrefTaskCount:
     """Tests for total task counts."""
 
     def test_total_task_count(self, fbref_dag):
-        """Total = 2×(player+team+keeper) + 6 match_data + start/validate/
-        trigger_silver."""
-        player_types, team_types, keeper_types = _stat_types()
+        """Total = season_stats_all + guard + 6 match_data + start +
+        validate_all_data + report_proxy_traffic + trigger_silver_transform."""
         total_tasks = len(fbref_dag.task_dict)
 
         expected_min = (
-            2 * (len(player_types) + len(team_types) + len(keeper_types))
-            + 6   # match_data group
-            + 3   # start + validate_all_data + trigger_silver_transform
+            2   # season_stats_all + traffic_guard_season_stats
+            + 6  # match_data group
+            + 4  # start + validate + report_proxy_traffic + trigger_silver
         )
 
         assert total_tasks >= expected_min, \
             f"Expected at least {expected_min} tasks, got {total_tasks}"
-
-    def test_expected_stat_types_exist(self, fbref_dag):
-        """Каждый stat type из constants имеет таск и traffic_guard."""
-        player_types, team_types, keeper_types = _stat_types()
-        groups = [
-            ('player_stats', 'player', player_types),
-            ('team_stats', 'team', team_types),
-            ('keeper_stats', 'keeper', keeper_types),
-        ]
-        for group_id, category, types in groups:
-            for stat_type in types:
-                task_id = f'{group_id}.{category}_{stat_type}'
-                guard_id = f'{group_id}.traffic_guard_{category}_{stat_type}'
-                assert task_id in fbref_dag.task_dict, \
-                    f"Expected task {task_id} not found in DAG"
-                assert guard_id in fbref_dag.task_dict, \
-                    f"Expected guard {guard_id} not found in DAG (#44)"
