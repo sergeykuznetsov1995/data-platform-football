@@ -179,12 +179,15 @@ schedule_dim AS (
     -- snapshots of one game_id with different scores (live 0:0 vs final 2:1)
     -- both survive DISTINCT → ×2 fan-out in home_side/away_side. Take the
     -- freshest by _ingested_at (= final score); _batch_id breaks ties (#464).
+    -- #840: Bronze auto-passthrough (source-key names). COALESCE(old,new)
+    -- bridges pre-#840 partitions: home_team->home_team_name,
+    -- home_score->home_score_current.
     SELECT
-        CAST(game_id AS varchar)   AS match_id,
-        CAST(home_team AS varchar) AS home_team_id,
-        CAST(away_team AS varchar) AS away_team_id,
-        CAST(home_score AS INTEGER) AS home_score,
-        CAST(away_score AS INTEGER) AS away_score,
+        CAST(game_id AS varchar)                                  AS match_id,
+        CAST(COALESCE(home_team, home_team_name) AS varchar)      AS home_team_id,
+        CAST(COALESCE(away_team, away_team_name) AS varchar)      AS away_team_id,
+        CAST(COALESCE(home_score, home_score_current) AS INTEGER) AS home_score,
+        CAST(COALESCE(away_score, away_score_current) AS INTEGER) AS away_score,
         league,
         season
     FROM (
@@ -194,8 +197,8 @@ schedule_dim AS (
                    ORDER BY _ingested_at DESC, _batch_id DESC
                ) AS rn
         FROM iceberg.bronze.sofascore_schedule
-        WHERE home_score IS NOT NULL
-          AND away_score IS NOT NULL
+        WHERE COALESCE(home_score, home_score_current) IS NOT NULL
+          AND COALESCE(away_score, away_score_current) IS NOT NULL
           AND game_id IS NOT NULL
     )
     WHERE rn = 1
