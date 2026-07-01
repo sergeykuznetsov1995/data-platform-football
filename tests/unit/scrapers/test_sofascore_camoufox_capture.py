@@ -20,6 +20,7 @@ from scrapers.sofascore.camoufox_capture import (
     player_url,
     response_path,
     select_event_endpoints,
+    should_block_request,
 )
 
 pytestmark = pytest.mark.unit
@@ -895,3 +896,145 @@ class TestPaginateTournamentSeason:
         out = cap.paginate_tournament_season(17, 999)
         assert out == {"x": 1}
         assert len(cap._page.paths) == 1
+
+
+# --------------------------------------------------------------------------- #
+#  should_block_request (#842 — cut proxy bytes via route-abort)              #
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize("resource_type", ["image", "media", "font", "stylesheet"])
+def test_should_block_request_blocks_static_resource_types(resource_type):
+    # Non-essential static that the SPA doesn't need to fire its /api/v1 XHRs.
+    assert should_block_request(resource_type, "https://www.sofascore.com/static/x") is True
+
+
+@pytest.mark.parametrize("url", [
+    "https://www.google-analytics.com/collect",
+    "https://stats.g.doubleclick.net/j/collect",
+    "https://static.hotjar.com/c/hotjar-123.js",
+    "https://connect.facebook.net/en_US/fbevents.js",
+    "https://cloudflareinsights.com/cdn-cgi/rum",
+])
+def test_should_block_request_blocks_analytics_hosts(url):
+    # resource_type=script, but a tracking host — block by URL substring.
+    assert should_block_request("script", url) is True
+
+
+@pytest.mark.parametrize("resource_type", [
+    "document", "script", "xhr", "fetch", "websocket",
+])
+def test_should_block_request_allows_essential_types_on_first_party(resource_type):
+    # The SPA's own JS/HTML/XHR must load so it can fire the data endpoints.
+    assert should_block_request(resource_type, "https://www.sofascore.com/event/123") is False
+
+
+@pytest.mark.parametrize("url", [
+    "https://www.sofascore.com/api/v1/event/123/lineups",
+    "https://api.sofascore.com/api/v1/event/123/statistics",
+])
+def test_should_block_request_never_blocks_data_endpoints(url):
+    # The 5 payloads we came for — never block even if mislabelled.
+    assert should_block_request("xhr", url) is False
+
+
+def test_should_block_request_blocks_crest_image_under_api_path():
+    # Crests live under /api/v1/.../image (excluded from is_data_api_url) and
+    # arrive as resource_type=image → block them to save bytes.
+    url = "https://www.sofascore.com/api/v1/team/4724/image"
+    assert should_block_request("image", url) is True
+
+
+def test_should_block_request_never_blocks_turnstile_script():
+    # Cloudflare Turnstile/challenge assets are required for the bypass.
+    url = "https://challenges.cloudflare.com/turnstile/v0/api.js"
+    assert should_block_request("script", url) is False
+
+
+@pytest.mark.parametrize("resource_type,url", [
+    ("stylesheet", "https://challenges.cloudflare.com/cdn-cgi/challenge-platform/h/b/style.css"),
+    ("font", "https://challenges.cloudflare.com/turnstile/v0/g/font.woff2"),
+    ("image", "https://challenges.cloudflare.com/cdn-cgi/challenge-platform/x.png"),
+])
+def test_should_block_request_never_blocks_cloudflare_challenge_assets(resource_type, url):
+    # The challenge iframe pulls its OWN css/font/img — the bare type block would
+    # otherwise abort them and starve the bypass (#842 evasion review).
+    assert should_block_request(resource_type, url) is False
+
+
+# --------------------------------------------------------------------------- #
+#  _maybe_block / _on_request_finished (route + byte accounting, #842)        #
+# --------------------------------------------------------------------------- #
+class _FakeRequest:
+    def __init__(self, resource_type, url, *, sizes=None, sizes_raises=False):
+        self.resource_type = resource_type
+        self.url = url
+        self._sizes = sizes or {}
+        self._sizes_raises = sizes_raises
+
+    def sizes(self):
+        if self._sizes_raises:
+            raise RuntimeError("sizes unavailable")
+        return self._sizes
+
+
+class _FakeRoute:
+    def __init__(self, resource_type, url, *, abort_raises=False):
+        self.request = _FakeRequest(resource_type, url)
+        self._abort_raises = abort_raises
+        self.aborted = False
+        self.continued = False
+
+    def abort(self):
+        if self._abort_raises:
+            raise RuntimeError("Route is already handled")
+        self.aborted = True
+
+    def continue_(self):
+        self.continued = True
+
+
+def _cap():
+    from scrapers.sofascore.camoufox_capture import SofascoreCamoufoxCapture
+    return SofascoreCamoufoxCapture(proxy=None)
+
+
+class TestMaybeBlock:
+    def test_aborts_blockable_and_counts(self):
+        cap = _cap()
+        route = _FakeRoute("image", "https://www.sofascore.com/static/x.png")
+        cap._maybe_block(route)
+        assert route.aborted is True
+        assert route.continued is False
+        assert cap._blocked_count == 1
+
+    def test_continues_essential(self):
+        cap = _cap()
+        route = _FakeRoute("xhr", "https://www.sofascore.com/api/v1/event/1/lineups")
+        cap._maybe_block(route)
+        assert route.continued is True
+        assert route.aborted is False
+        assert cap._blocked_count == 0
+
+    def test_abort_error_falls_back_to_continue(self):
+        # A routing error must never stall the navigation.
+        cap = _cap()
+        route = _FakeRoute("image", "https://www.sofascore.com/static/x.png", abort_raises=True)
+        cap._maybe_block(route)  # must not raise
+        assert route.continued is True
+
+
+class TestOnRequestFinished:
+    def test_sums_all_four_size_fields(self):
+        cap = _cap()
+        req = _FakeRequest("script", "https://x/app.js", sizes={
+            "requestBodySize": 1, "requestHeadersSize": 2,
+            "responseBodySize": 100, "responseHeadersSize": 10,
+        })
+        cap._on_request_finished(req)
+        assert cap._bytes_total == 113
+        assert cap._bytes_by_type["script"] == 113
+
+    def test_sizes_exception_is_swallowed(self):
+        cap = _cap()
+        req = _FakeRequest("script", "https://x/app.js", sizes_raises=True)
+        cap._on_request_finished(req)  # must not raise
+        assert cap._bytes_total == 0
