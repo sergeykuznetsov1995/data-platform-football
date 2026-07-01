@@ -649,8 +649,12 @@ def _star_gate_dim_fk_checks() -> List:
         # #819: dropping the FBref-covered non-FBref duplicates (their unresolved
         # player twins) also removes ~82k NULL player_id rows, so the non-NULL
         # share jumps from the pre-#819 ~67% to 98.2% live (2026-06-27:
-        # 147123/149888 non-NULL). Only ESPN-only matches with unresolved players
-        # keep NULL. Tighten the lower bounds (floor 98.2%, warn ~3pp below).
+        # 147123/149888 non-NULL). #839: the remaining NULLs are entirely FBref
+        # unused substitutes (is_starter=false, no senior FBref stats row to
+        # anchor in xref_player) — an accepted structural floor (live 2026-07-01:
+        # 2746/145658 = 1.9%, all fbref, 0 espn). Tighten the lower bounds (floor
+        # 98.1%, warn ~3pp below); e3_dq enforces the starter-resolves ERROR
+        # invariant so a dropped real player still trips a gate.
         CHECK.coverage('gold.fct_lineup', column='player_id',
                        warn_threshold=0.95, error_threshold=0.90),
     ]

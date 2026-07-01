@@ -89,6 +89,9 @@ class TestBronzeFreshnessGate:
             al, 'telegram_dq_summary',
             lambda *a, **k: captured.setdefault('telegram', True),
         )
+        # #842: freshness now reads the match_capture result file to detect a
+        # skip-existing no-op — pin it to "no result" so the checks always run.
+        monkeypatch.setattr(dag_module, '_load_result', lambda *a, **k: {})
 
         dag_module.validate_bronze_freshness()
 
@@ -104,6 +107,101 @@ class TestBronzeFreshnessGate:
         # WARNING-only gate must not hard-fail the DAG.
         assert captured['raise_on_error'] is False
         assert captured.get('telegram') is True
+
+
+class TestValidateDataIncrementalNoop:
+    """#842 incremental match_capture: a clean skip-existing no-op run (all
+    resolved matches already in bronze) reports 0 captured rows by design —
+    the capture row-floors must not WARN and the freshness gate is skipped.
+    A genuinely-low non-noop run still WARNs (incl. the new venue floor)."""
+
+    SCHEDULE_OK = {'schedule_rows': 381, 'league_table_rows': 20,
+                   'tables': [], 'errors': []}
+
+    @staticmethod
+    def _patch_results(dag_module, monkeypatch, schedule_result, capture_result):
+        monkeypatch.setattr(
+            dag_module, '_load_result',
+            lambda path, logger: (
+                capture_result
+                if path == dag_module.MATCH_CAPTURE_RESULT_PATH
+                else schedule_result
+            ),
+        )
+
+    @staticmethod
+    def _noop_capture():
+        return {'rows': 0, 'eps_rows': 0, 'match_stats_rows': 0,
+                'shotmap_rows': 0, 'venue_rows': 0,
+                'matches_total': 380, 'matches_skipped_existing': 380,
+                'fallback': False, 'errors': [], 'tables': []}
+
+    def test_noop_run_skips_capture_row_floors(self, dag_module, monkeypatch):
+        self._patch_results(dag_module, monkeypatch,
+                            dict(self.SCHEDULE_OK), self._noop_capture())
+        validation = dag_module.validate_data()
+        assert validation['status'] == 'success'
+        assert validation['warnings'] == []
+
+    def test_zero_rows_without_skip_still_warns(self, dag_module, monkeypatch):
+        capture = self._noop_capture()
+        capture['matches_skipped_existing'] = 0    # nothing skipped → real gap
+        self._patch_results(dag_module, monkeypatch,
+                            dict(self.SCHEDULE_OK), capture)
+        validation = dag_module.validate_data()
+        warned = ' '.join(validation['warnings'])
+        for table in ('player_ratings', 'shotmap', 'event_player_stats',
+                      'match_stats', 'venue'):
+            assert table in warned
+
+    def test_venue_floor_warns_when_low(self, dag_module, monkeypatch):
+        capture = {'rows': 25000, 'matches_with_ratings': 380,
+                   'eps_rows': 12000, 'match_stats_rows': 34000,
+                   'shotmap_rows': 9500, 'venue_rows': 5, 'venue_matches': 5,
+                   'matches_total': 380, 'matches_skipped_existing': 0,
+                   'fallback': False, 'errors': [], 'tables': []}
+        self._patch_results(dag_module, monkeypatch,
+                            dict(self.SCHEDULE_OK), capture)
+        validation = dag_module.validate_data()
+        assert any('venue' in w for w in validation['warnings'])
+        assert len(validation['warnings']) == 1
+
+    def test_freshness_skipped_on_noop(self, dag_module, monkeypatch):
+        captured = {}
+        import utils.alerts as al
+        import utils.data_quality as dq
+        monkeypatch.setattr(
+            dq, 'run_checks',
+            lambda *a, **k: captured.setdefault('ran', True) and MagicMock())
+        monkeypatch.setattr(
+            al, 'telegram_dq_summary',
+            lambda *a, **k: captured.setdefault('telegram', True))
+        monkeypatch.setattr(dag_module, '_load_result',
+                            lambda *a, **k: self._noop_capture())
+        dag_module.validate_bronze_freshness()
+        assert 'ran' not in captured and 'telegram' not in captured
+
+    def test_freshness_runs_on_fallback_capture(self, dag_module, monkeypatch):
+        """A failed/fallback capture is NOT a no-op — the stall alert must
+        still fire even when every match was 'skipped'."""
+        capture = self._noop_capture()
+        capture['fallback'] = True
+        captured = {}
+        import utils.alerts as al
+        import utils.data_quality as dq
+
+        def fake_run_checks(checks, raise_on_error=True):
+            captured['ran'] = True
+            return MagicMock()
+
+        monkeypatch.setattr(dq, 'run_checks', fake_run_checks)
+        monkeypatch.setattr(
+            al, 'telegram_dq_summary',
+            lambda *a, **k: captured.setdefault('telegram', True))
+        monkeypatch.setattr(dag_module, '_load_result',
+                            lambda *a, **k: capture)
+        dag_module.validate_bronze_freshness()
+        assert captured.get('ran') is True
 
 
 class TestPlayerCaptureGate:

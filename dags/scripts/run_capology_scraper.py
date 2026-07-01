@@ -104,6 +104,16 @@ def _write_results(path: str, payload: dict) -> None:
     traffic = payload.get('traffic')
     if traffic:
         try:
+            # Direct-connection runs (no proxy — Capology's default) must NOT
+            # land in proxy_traffic_runs: those bytes are free, and recording
+            # them over-attributes residential spend in the daily report.
+            if not traffic.get('proxied', True):
+                logger.info(
+                    "capology ran direct (no proxy): %.2f MB — not recorded "
+                    "to proxy_traffic_runs.",
+                    float(traffic.get('proxy_response_mb') or 0.0),
+                )
+                return
             from utils.proxy_traffic import (
                 log_traffic_summary,
                 record_traffic_run,

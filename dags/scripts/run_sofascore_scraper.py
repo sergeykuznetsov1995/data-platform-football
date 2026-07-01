@@ -302,6 +302,84 @@ def _merge_schedule_partition(existing, captured):
     )
 
 
+def _read_existing_partition(table: str, league: str, season: str):
+    """Read an existing ``bronze.<table>`` (league, season) partition into a
+    DataFrame so freshly-captured rows can be MERGED with it before a
+    ``replace_partitions`` save (#842 incremental match_capture — generalises
+    ``_read_existing_schedule`` #761). Returns an EMPTY DataFrame when the
+    table/partition is missing or Trino is unreachable — the caller then saves
+    the captured rows as-is, and the completeness guard still protects a
+    non-empty partition from being replaced by a partial frame.
+    """
+    import pandas as pd
+
+    empty = pd.DataFrame()
+    conn = _trino_connect()
+    if conn is None:
+        return empty
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            f"SELECT * FROM iceberg.bronze.{table} "
+            "WHERE league = ? AND CAST(season AS varchar) = ?",
+            (league, season),
+        )
+        rows = cur.fetchall()
+        cols = [d[0] for d in cur.description]
+        return pd.DataFrame(rows, columns=cols)
+    except Exception as e:
+        logger.warning(
+            "Could not read existing bronze.%s partition (league=%s "
+            "season=%s): %s — saving captured rows as-is.",
+            table, league, season, e,
+        )
+        return empty
+
+
+def _merge_match_partition(existing, captured, key: str):
+    """Union an existing per-match partition with freshly-captured rows, keyed
+    by ``key`` (``match_id``; ``game_id`` for venue) with the captured match
+    winning wholesale — its existing rows are dropped before the concat so a
+    re-captured match never carries stale partial rows. Same completeness-guard
+    rationale as ``_merge_schedule_partition`` (#761): union >= existing, so the
+    guard passes even though the capture only fetched the NEW matches (#842).
+    """
+    import pandas as pd
+
+    if existing is None or existing.empty:
+        return captured.reset_index(drop=True)
+    captured_keys = set(captured[key].astype(str))
+    existing = existing.reindex(columns=captured.columns)
+    keep = existing[~existing[key].astype(str).isin(captured_keys)]
+    return pd.concat([keep, captured], ignore_index=True)
+
+
+def _filter_new_match_ids(
+    match_ids: List[str],
+    league: str,
+    season_short: str,
+    season_str: str,
+) -> tuple:
+    """#842 incremental match_capture: drop match_ids already materialised in
+    ``bronze.sofascore_player_ratings`` — the pass's primary table, written on
+    every successful match capture (FBref keys its skip-existing the same way
+    on its authoritative table, #69). Finished-match data is immutable, so
+    re-capturing burns ~1-4 MB of residential proxy per match for identical
+    rows. Trade-off: a match whose best-effort statistics/shotmap tab flaked
+    while lineups succeeded is not re-captured — repair with ``--force-replace``.
+
+    Returns ``(new_ids, skipped_count)``. Probe failure / missing table →
+    empty existing set → nothing skipped (first run captures everything).
+    """
+    existing = _existing_match_ids_in_bronze(
+        'sofascore_player_ratings', league, season_short)
+    if not existing:
+        existing = _existing_match_ids_in_bronze(
+            'sofascore_player_ratings', league, season_str)
+    new_ids = [m for m in match_ids if str(m) not in existing]
+    return new_ids, len(match_ids) - len(new_ids)
+
+
 def _fallback_exit_code(reason: str) -> int:
     """Pick the runner exit code for a soft-fallback.
 
@@ -494,15 +572,22 @@ def _run_match_capture(
     captured ``/lineups`` + ``/event`` + ``/statistics`` + ``/shotmap`` payloads:
     ``sofascore_player_ratings``, ``sofascore_event_player_stats``,
     ``sofascore_match_stats``, ``sofascore_event_shotmap`` — replacing four
-    separate Turnstile-blocked passes. All four are written full-state
-    (``replace_partitions=['league', 'season']`` + completeness guard): every
-    run re-captures the finished matches and rewrites the partition wholesale,
-    so the secondary tables come essentially free with the ratings capture (no
-    per-player ``/player/{pid}/statistics`` nor per-event ``/statistics`` REST
-    calls). statistics/shotmap are best-effort — an empty frame is skipped.
+    separate Turnstile-blocked passes. The secondary tables come essentially
+    free with the ratings capture (no per-player ``/player/{pid}/statistics``
+    nor per-event ``/statistics`` REST calls). statistics/shotmap are
+    best-effort — an empty frame is skipped.
 
-    Exit codes: 0 ok / 2 R0.2B_FALLBACK (nothing captured) / 3 ReplaceGuard /
-    1 hard failure.
+    #842 incremental: matches already in ``bronze.sofascore_player_ratings``
+    are skipped (finished-match data is immutable; re-capturing the whole
+    season daily burned ~1.6 GB of residential proxy per run). Only the NEW
+    matches are captured; each frame is then MERGED with its existing
+    partition (union by ``match_id``/``game_id``, #761 pattern) so the
+    ``replace_partitions=['league', 'season']`` save + completeness guard
+    keep their full-state semantics. ``--force-replace`` restores the old
+    full re-capture (and disarms the guard) for backfills/repairs.
+
+    Exit codes: 0 ok (incl. the nothing-new no-op) / 2 R0.2B_FALLBACK
+    (nothing captured) / 3 ReplaceGuard / 1 hard failure.
     """
     from scrapers.base.base_scraper import ReplaceGuardError
     from scrapers.sofascore import SofaScoreScraper
@@ -552,10 +637,37 @@ def _run_match_capture(
         'match_stats_matches': 0,
         'shotmap_rows': 0,
         'shotmap_matches': 0,
+        'venue_rows': 0,
+        'venue_matches': 0,
+        'matches_total': 0,             # resolved before skip-existing (#842)
+        'matches_skipped_existing': 0,  # already in bronze → not re-captured
         'fallback': False,
         'fallback_reason': None,
         'errors': [],
     }
+
+    # #842 skip-existing: don't re-capture matches already in bronze. When
+    # nothing is new (off-season / no fixtures since yesterday) exit 0 before
+    # even opening the scraper session — zero proxy bytes spent.
+    if match_ids and not force_replace:
+        total = len(match_ids)
+        match_ids, skipped = _filter_new_match_ids(
+            match_ids, league, season_short, season_str)
+        results['matches_total'] = total
+        results['matches_skipped_existing'] = skipped
+        if skipped:
+            logger.info(
+                "match_capture skip-existing: %d/%d matches already in "
+                "bronze.sofascore_player_ratings; capturing %d new.",
+                skipped, total, len(match_ids),
+            )
+        if not match_ids:
+            logger.info(
+                "match_capture: all %d matches already captured — nothing "
+                "to do, partitions left untouched.", total,
+            )
+            _write_results(output_path, results)
+            return 0
 
     try:
         with SofaScoreScraper(
@@ -581,6 +693,22 @@ def _run_match_capture(
                     match_ids = match_ids[: int(limit)]
                 logger.info("Resolved %d finished match_ids via capture",
                             len(match_ids))
+                # #842 skip-existing for the capture-resolved path too (bronze
+                # schedule empty but ratings may still hold prior matches).
+                if not force_replace:
+                    total = len(match_ids)
+                    match_ids, skipped = _filter_new_match_ids(
+                        match_ids, league, season_short, season_str)
+                    results['matches_total'] = total
+                    results['matches_skipped_existing'] = skipped
+                    if not match_ids:
+                        logger.info(
+                            "match_capture: all %d matches already captured "
+                            "— nothing to do, partitions left untouched.",
+                            total,
+                        )
+                        _write_results(output_path, results)
+                        return 0
 
             frames = scraper.read_match_capture(
                 league=league, season=int(season),
@@ -622,9 +750,23 @@ def _run_match_capture(
 
             min_ratio = None if force_replace else _MIN_REPLACE_RATIO
 
+            def _merged(df, table, key):
+                """#842: the captured frame holds only NEW matches (skip-
+                existing above) — union it with the existing partition so the
+                replace_partitions save keeps prior matches and the guard
+                passes. --force-replace = write the captured frame as-is."""
+                if force_replace:
+                    return df
+                return _merge_match_partition(
+                    _read_existing_partition(table, league, season_short),
+                    df, key,
+                )
+
             # player_ratings — full-state refresh (+ completeness guard), as the
             # standalone ratings entity does.
             if not ratings_empty:
+                ratings_df = _merged(
+                    ratings_df, 'sofascore_player_ratings', 'match_id')
                 rpath = scraper.save_to_iceberg(
                     df=ratings_df,
                     table_name='sofascore_player_ratings',
@@ -638,10 +780,11 @@ def _run_match_capture(
                     ratings_df['match_id'].nunique())
                 logger.info("Saved %d rating rows -> %s", results['rows'], rpath)
 
-            # event_player_stats — same full-state refresh from the SAME capture
-            # pass (#751: switched from APPEND skip-existing to replace_partitions
-            # since every finished match is re-captured each run → idempotent).
+            # event_player_stats — same merged full-state refresh from the SAME
+            # capture pass (#751; #842 merges instead of re-capturing).
             if not eps_empty:
+                eps_df = _merged(
+                    eps_df, 'sofascore_event_player_stats', 'match_id')
                 epath = scraper.save_to_iceberg(
                     df=eps_df,
                     table_name='sofascore_event_player_stats',
@@ -654,9 +797,11 @@ def _run_match_capture(
                 results['eps_matches'] = int(eps_df['match_id'].nunique())
                 logger.info("Saved %d eps rows -> %s", results['eps_rows'], epath)
 
-            # match_stats — same full-state refresh from the SAME capture pass
-            # (#751 PR2): every finished match is re-captured each run.
+            # match_stats — same merged full-state refresh from the SAME
+            # capture pass (#751 PR2; #842 merges instead of re-capturing).
             if not stats_empty:
+                stats_df = _merged(
+                    stats_df, 'sofascore_match_stats', 'match_id')
                 spath = scraper.save_to_iceberg(
                     df=stats_df,
                     table_name='sofascore_match_stats',
@@ -674,6 +819,8 @@ def _run_match_capture(
             # so if its completeness guard trips (exit 3) the other three tables
             # are already committed.
             if not shot_empty:
+                shot_df = _merged(
+                    shot_df, 'sofascore_event_shotmap', 'match_id')
                 shpath = scraper.save_to_iceberg(
                     df=shot_df,
                     table_name='sofascore_event_shotmap',
@@ -691,6 +838,7 @@ def _run_match_capture(
             # full-state refresh like the others. Best-effort: empty when the
             # event payload carried no venue.
             if not venue_empty:
+                venue_df = _merged(venue_df, 'sofascore_venue', 'game_id')
                 vpath = scraper.save_to_iceberg(
                     df=venue_df,
                     table_name='sofascore_venue',

@@ -80,14 +80,14 @@ class TestSofifaValidateData:
 
     @pytest.mark.unit
     def test_partial_rows_warns_but_succeeds(self, dag_module, write_result):
-        """545 players (PL-only scrape) is below the 1000 advisory threshold
-        but is legitimate partial success — must NOT raise."""
+        """A genuinely low count (below the per-league floor of 450 players /
+        18 teams) is legitimate partial success — warns but must NOT raise."""
         write_result({
             "tables": ["iceberg.bronze.sofifa_players"],
             "table_keys": ["versions", "teams", "players"],
             "errors": [],
-            "players_rows": 545,
-            "teams_rows": 96,
+            "players_rows": 300,
+            "teams_rows": 10,
         })
 
         # Must not raise — partial success is valid.
@@ -95,6 +95,43 @@ class TestSofifaValidateData:
         assert result["status"] == "success"
         # The low-count warning is still useful for ops visibility.
         assert any("Low player count" in w for w in result["warnings"])
+        assert any("Low team count" in w for w in result["warnings"])
+
+    @pytest.mark.unit
+    def test_apl_full_scrape_no_noise(self, dag_module, write_result):
+        """A healthy single-league scrape (546 players / 20 teams / 546
+        ratings) must produce ZERO warnings. The old fixed thresholds
+        (players<1000, teams<100) warned on every successful APL run."""
+        write_result({
+            "tables": ["iceberg.bronze.sofifa_players"],
+            "table_keys": ["versions", "teams", "players"],
+            "errors": [],
+            "players_rows": 546,
+            "teams_rows": 20,
+            "player_ratings_rows": 546,
+        })
+
+        result = dag_module.validate_data()
+        assert result["status"] == "success"
+        assert result["warnings"] == []
+
+    @pytest.mark.unit
+    def test_skipped_marker_short_circuits(self, dag_module, write_result):
+        """Incremental no-op (sofifa version unchanged → heavy steps skipped):
+        zero *_rows must NOT raise 'Zero rows' — the skip marker short-circuits
+        validation, Bronze completeness stays guarded by the floor tasks."""
+        write_result({
+            "tables": [],
+            "errors": [],
+            "players_rows": 0,
+            "teams_rows": 0,
+            "skipped": {"reason": "version_unchanged", "version_id": 260035},
+        })
+
+        result = dag_module.validate_data()
+        assert result["status"] == "skipped"
+        assert result["summary"]["skipped"]["version_id"] == 260035
+        assert result["warnings"] == []
 
     @pytest.mark.unit
     def test_full_rows_clean_success(self, dag_module, write_result):

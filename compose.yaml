@@ -51,6 +51,11 @@ x-airflow-common: &airflow-common
     - ./scrapers:/opt/airflow/scrapers
     - ./scripts:/opt/airflow/scripts
     - ./proxys.txt:/opt/airflow/proxys.txt:ro
+    # soccerdata page cache (SoFIFA et al.): survives container recreation so
+    # a task retry / redeploy mid long crawl (~546 player pages) reuses cached
+    # pages instead of refetching. Files are keyed by sofifa version_id, so
+    # the cache never goes stale by content.
+    - soccerdata_cache:/home/airflow/soccerdata
   networks:
     - frontend
     - backend
@@ -1016,6 +1021,8 @@ networks:
 # Volumes
 # =============================================================================
 volumes:
+  soccerdata_cache:
+    name: soccerdata_cache
   namenode_data:
     name: namenode_data
   datanode1_data:

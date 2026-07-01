@@ -79,6 +79,16 @@ def validate_data(**context) -> Dict[str, Any]:
         }
     }
 
+    # Инкрементальный no-op: sofifa version_id не изменился с прошлого рана,
+    # скрейпер осознанно пропустил тяжёлые шаги (players/teams/team_ratings/
+    # player_ratings). Нулевые *_rows здесь — норма, а полноту Bronze всё равно
+    # сторожат validate_<table> floor-задачи (whole-table COUNT, #466).
+    if scrape_result.get('skipped'):
+        validation['status'] = 'skipped'
+        validation['summary']['skipped'] = scrape_result['skipped']
+        logger.info(f"Scrape skipped (no-op): {scrape_result['skipped']}")
+        return validation
+
     if scrape_result.get('errors'):
         validation['warnings'] = scrape_result['errors']
         total_rows = validation['summary']['players_rows'] + validation['summary']['teams_rows']
@@ -93,16 +103,20 @@ def validate_data(**context) -> Dict[str, Any]:
             "Zero rows scraped (players=0, teams=0) — SoFIFA Bronze is empty"
         )
 
-    # SoFIFA has lots of players, so we expect significant data
-    if validation['summary']['players_rows'] < 1000:
+    # Пороги масштабируются от числа лиг: ~546 игроков и 20 клубов на лигу
+    # (floor'ы = MIN_ROW_THRESHOLDS на лигу). Прежние константы (1000/100)
+    # были рассчитаны на несколько лиг и шумели warning'ом на КАЖДОМ успешном
+    # APL-ране (546 players / 20 teams).
+    n_leagues = max(1, len(LEAGUES))
+    if validation['summary']['players_rows'] < 450 * n_leagues:
         validation['warnings'].append("Low player count - possible scraping issue")
 
-    if validation['summary']['teams_rows'] < 100:
+    if validation['summary']['teams_rows'] < 18 * n_leagues:
         validation['warnings'].append("Low team count - possible scraping issue")
 
-    # Player ratings (issue #42): ~545 per APL edition. A near-empty table
+    # Player ratings (issue #42): ~545 per league edition. A near-empty table
     # usually means FlareSolverr could not clear the Turnstile this run.
-    if validation['summary']['player_ratings_rows'] < 100:
+    if validation['summary']['player_ratings_rows'] < 450 * n_leagues:
         validation['warnings'].append(
             "Low player_ratings count - possible FlareSolverr/Turnstile issue"
         )
@@ -194,9 +208,12 @@ python dags/scripts/run_sofifa_scraper.py \\
         # Inherit container env (TRINO_PASSWORD/TRINO_PORT) so the Iceberg writer
         # connects via HTTPS:8443 with auth instead of falling back to HTTP:8080.
         append_env=True,
-        # player_ratings fetches ~545 player pages through FlareSolverr with
-        # session rotation (~12s + occasional ~15s rotation each) → up to ~2h.
-        execution_timeout=timedelta(hours=4),
+        # player_ratings fetches ~545 player pages per league through
+        # FlareSolverr with session rotation (~12s + occasional ~15s rotation
+        # each) → ~2h per league, serial across LEAGUES. 12h covers Big-5;
+        # with the incremental version_id skip a full crawl only happens on
+        # roster-update weeks, so the loose bound costs nothing on no-op runs.
+        execution_timeout=timedelta(hours=12),
     )
 
     validate_data_task = PythonOperator(

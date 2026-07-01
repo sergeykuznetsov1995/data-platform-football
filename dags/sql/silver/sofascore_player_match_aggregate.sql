@@ -50,29 +50,17 @@ SELECT
     CAST(team_id AS varchar)               AS team_id,
     team_name,
     is_home,
-    -- is_captain (#439): bronze.captain is varchar 'True'/'False' (from the
-    -- /lineups overlay, #301 — confirmed live 760 'True' / 14.4K 'False').
-    -- Conform to boolean via CASE, NOT TRY_CAST(boolean) which would silently
-    -- NULL the capitalised literals. NULL = lineup overlay missed for this row.
-    CASE
-        WHEN captain = 'True'  THEN true
-        WHEN captain = 'False' THEN false
-        ELSE NULL
-    END                                    AS is_captain,
-    -- is_starter (#693): bronze.substitute is varchar 'True'/'False' from the
-    -- same /lineups overlay (#301; scraper.py overlay → real bool stored as
-    -- text). A starter == NOT a substitute. Conform via CASE, NOT
-    -- TRY_CAST(boolean) which would silently NULL the capitalised literals.
-    -- NULL = lineup overlay missed for this row.
+    -- is_captain (#439): bronze.captain is a real boolean (scraper writes
+    -- bool(); /lineups overlay #301). NULL = lineup overlay missed this row.
+    captain                                AS is_captain,
+    -- is_starter (#693): a starter == NOT a substitute. bronze.substitute is a
+    -- real boolean (scraper writes bool(); /lineups overlay #301). NOT of NULL
+    -- stays NULL = lineup overlay missed this row.
     -- Coverage note: bronze.sofascore_event_player_stats only carries players
     -- with a statistics block (starters + subs who came on) — unused bench
     -- players are absent, so SofaScore lineup ⊂ FBref matchsheet. fct_lineup
     -- keeps FBref primary; SofaScore adds rows where FBref is missing (#693).
-    CASE
-        WHEN substitute = 'False' THEN true
-        WHEN substitute = 'True'  THEN false
-        ELSE NULL
-    END                                    AS is_starter,
+    NOT substitute                         AS is_starter,
     position,
     position_specific,
 
