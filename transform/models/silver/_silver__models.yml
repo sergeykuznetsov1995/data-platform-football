@@ -1,0 +1,84 @@
+version: 2
+
+# dbt tests mirror the ERROR-severity DQ checks in dag_transform_fbref_silver
+# (_validate_silver_quality): PK not_null + PK uniqueness. Composite PKs use
+# dbt_utils.unique_combination_of_columns.
+models:
+  - name: fbref_match_enriched
+    description: Enriched match data (schedule + team_stats + events + lineups).
+    columns:
+      - name: match_id
+        tests: [not_null, unique]
+      - name: date
+        tests: [not_null]
+
+  - name: fbref_player_season_profile
+    description: Wide per-(player, squad, season) profile.
+    tests:
+      - dbt_utils.unique_combination_of_columns:
+          combination_of_columns: [player_id, squad, league, season]
+    columns:
+      - name: player_id
+        tests: [not_null]
+      - name: squad
+        tests: [not_null]
+      - name: league
+        tests: [not_null]
+      - name: season
+        tests: [not_null]
+
+  - name: fbref_keeper_profile
+    description: Goalkeeper per-(player, squad, season) profile.
+    tests:
+      - dbt_utils.unique_combination_of_columns:
+          combination_of_columns: [player_id, squad, league, season]
+    columns:
+      - name: player_id
+        tests: [not_null]
+      - name: squad
+        tests: [not_null]
+
+  - name: fbref_player_match_stats
+    description: Deduplicated per-match player stats (typed).
+    tests:
+      - dbt_utils.unique_combination_of_columns:
+          combination_of_columns: [match_id, player_id, team]
+          config:
+            where: "player_id IS NOT NULL"
+    columns:
+      - name: match_id
+        tests: [not_null]
+
+  - name: fbref_match_events
+    description: Detailed match events (goals, cards, subs).
+    columns:
+      - name: match_id
+        tests: [not_null]
+
+  - name: fbref_match_lineups
+    description: Detailed lineup entries per match.
+    columns:
+      - name: match_id
+        tests: [not_null]
+      - name: player_id
+        tests: [not_null]
+
+  - name: fbref_team_season_profile
+    description: Per-(team, league, season) team profile.
+    tests:
+      - dbt_utils.unique_combination_of_columns:
+          combination_of_columns: [team, league, season]
+    columns:
+      - name: team
+        tests: [not_null]
+
+  - name: fbref_match_officials
+    description: Match officials unpivoted (referee/ar1/ar2/4th/var).
+    columns:
+      - name: match_id
+        tests: [not_null]
+      - name: role
+        tests: [not_null]
+
+  - name: fbref_shot_events
+    description: Per-shot xG data.

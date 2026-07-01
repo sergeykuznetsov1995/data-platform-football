@@ -1,0 +1,23 @@
+# dbt-trino connection for the Silver pilot.
+#   auth : Trino PASSWORD authenticator over HTTPS -> method: ldap (user+password)
+#   ssl  : Trino serves a self-signed cert. dbt-trino has no `verify: false`, so
+#          the server cert PEM must be supplied via `cert` (TRINO_CERT_PATH).
+#          Extract once:  openssl s_client -connect trino:8443 </dev/null \
+#                           | openssl x509 > configs/trino/certs/trino.pem
+#   target schema `silver_dbt` keeps the pilot isolated from the live `silver`
+#   schema for A/B parity; cutover flips this to `silver`.
+football:
+  target: dev
+  outputs:
+    dev:
+      type: trino
+      method: ldap
+      user: "{{ env_var('TRINO_USER', 'airflow') }}"
+      password: "{{ env_var('TRINO_PASSWORD') }}"
+      host: "{{ env_var('TRINO_HOST', 'trino') }}"
+      port: "{{ env_var('TRINO_PORT', '8443') | as_number }}"
+      database: iceberg
+      schema: silver_dbt
+      http_scheme: https
+      cert: "{{ env_var('TRINO_CERT_PATH', '/opt/airflow/configs/trino/certs/trino.pem') }}"
+      threads: 4

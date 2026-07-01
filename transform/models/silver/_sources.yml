@@ -1,0 +1,24 @@
+version: 2
+
+sources:
+  - name: bronze
+    description: Raw scraped FBref data (Bronze medallion layer).
+    database: iceberg          # Trino catalog
+    schema: bronze
+    tables:
+      - name: fbref_keeper_keeper
+      - name: fbref_lineups
+      - name: fbref_match_events
+      - name: fbref_match_officials
+      - name: fbref_match_player_stats
+      - name: fbref_match_team_stats
+      - name: fbref_player_misc
+      - name: fbref_player_playingtime
+      - name: fbref_player_shooting
+      - name: fbref_player_stats
+      - name: fbref_schedule
+      - name: fbref_shot_events
+      - name: fbref_team_misc
+      - name: fbref_team_playingtime
+      - name: fbref_team_shooting
+      - name: fbref_team_stats

@@ -70,5 +70,13 @@ RUN pip install --no-cache-dir -r /tmp/requirements-scraping.txt
 # Runs as the airflow user (current USER) — the cache must live in its $HOME.
 RUN python -m camoufox fetch
 
+# ===== СТАДИЯ 5: dbt-trino в изолированном venv (Tier-2 dbt-пилот) =====
+# dbt-core конфликтует с Airflow по shared-зависимостям (protobuf<5 vs 6.x,
+# opentelemetry 1.27 vs 1.43), поэтому ставим dbt в ОТДЕЛЬНЫЙ venv. Cosmos
+# (в основном окружении Airflow — см. requirements.txt) вызывает его как
+# subprocess через dbt_executable_path=/home/airflow/dbt-venv/bin/dbt.
+RUN python -m venv /home/airflow/dbt-venv \
+    && /home/airflow/dbt-venv/bin/pip install --no-cache-dir "dbt-trino==1.10.2"
+
 # Set working directory
 WORKDIR /opt/airflow

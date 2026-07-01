@@ -48,6 +48,9 @@ x-airflow-common: &airflow-common
     - ./scrapers:/opt/airflow/scrapers
     - ./scripts:/opt/airflow/scripts
     - ./proxys.txt:/opt/airflow/proxys.txt:ro
+    # Tier-2 dbt pilot: dbt project rendered/run by Cosmos (dag_dbt_fbref_silver).
+    # rw so `dbt deps`/`dbt` can write dbt_packages/ + target/ (both gitignored).
+    - ./transform:/opt/airflow/transform
   networks:
     - frontend
     - backend

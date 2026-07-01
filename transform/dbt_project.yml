@@ -1,0 +1,22 @@
+name: 'football_transform'
+version: '1.0.0'
+config-version: 2
+
+# Uses the 'football' profile from transform/profiles.yml (DBT_PROFILES_DIR).
+profile: 'football'
+
+model-paths: ["models"]
+macro-paths: ["macros"]
+seed-paths: ["seeds"]
+test-paths: ["tests"]
+target-path: "target"
+clean-targets: ["target", "dbt_packages"]
+
+# Silver layer: atomic table rebuild mirroring the legacy Trino CTAS engine
+# (CREATE OR REPLACE TABLE ... WITH (partitioning = ARRAY['league','season'])).
+# Partitioning is set per-model (config block) because it is model-specific.
+models:
+  football_transform:
+    silver:
+      +materialized: table
+      +on_table_exists: replace

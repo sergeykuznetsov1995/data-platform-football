@@ -50,6 +50,13 @@ redis>=4.5.2
 # Trino Python client for DDL operations
 trino>=0.328.0
 
+# -----------------------------------------------------------------------------
+# [dbt] Airflow<->dbt orchestration (Tier-2 pilot). Cosmos runs in the Airflow
+# env; dbt-trino itself is installed in an ISOLATED venv (see Dockerfile stage 5)
+# because dbt-core conflicts with Airflow on protobuf/opentelemetry pins.
+# -----------------------------------------------------------------------------
+astronomer-cosmos==1.14.2
+
 
 # -----------------------------------------------------------------------------
 # [resilience] Resilience Patterns
