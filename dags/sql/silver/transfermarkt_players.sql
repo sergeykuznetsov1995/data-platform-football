@@ -56,6 +56,17 @@ xp AS (
       -- ложные TM-совпадения демоутятся в tm_<id> orphan (исключены условием
       -- выше), поэтому дублей (canonical_id, mv_date) нет. JOIN ниже включает
       -- season-predicate, так что per-season canonical матчится точно.
+),
+
+-- Squad-first ingest (proxy-traffic fix): bronze.market_value_last_update
+-- больше не скрейпится (жил только на профильной странице). Производим
+-- mv_last_update из MV-истории: последняя точка таймлайна игрока — глобальное
+-- свойство игрока (не per-season), поэтому GROUP BY только player_id.
+-- COALESCE ниже сохраняет значение для строк, записанных до фикса.
+mvh_last AS (
+    SELECT player_id, MAX(mv_date) AS last_mv_date
+    FROM iceberg.bronze.transfermarkt_market_value_history
+    GROUP BY player_id
 )
 
 SELECT
@@ -73,7 +84,7 @@ SELECT
 
     b.contract_until,
     CAST(b.market_value_eur AS BIGINT)         AS current_market_value_eur,
-    b.market_value_last_update                 AS mv_last_update,
+    COALESCE(b.market_value_last_update, mvh.last_mv_date) AS mv_last_update,
 
     b.current_club_id,
     b.current_club_name,
@@ -89,3 +100,5 @@ LEFT JOIN xp
     ON xp.source_id = b.player_id
    AND xp.league    = b.league
    AND xp.season    = b.season
+LEFT JOIN mvh_last mvh
+    ON mvh.player_id = b.player_id

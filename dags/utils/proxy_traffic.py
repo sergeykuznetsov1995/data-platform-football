@@ -117,6 +117,72 @@ def summarize_result_traffic(source: str, traffic: Dict[str, Any]) -> Dict[str, 
     }
 
 
+def check_result_traffic_guard(
+    entity_paths: Dict[str, str],
+    threshold_variable: str = "tm_proxy_mb_threshold",
+    default_thresholds: Dict[str, float] = None,
+    default_threshold_mb: float = 50.0,
+) -> Dict[str, Any]:
+    """Per-entity residential-MB kill-switch over run-result JSONs.
+
+    Mirrors the FBref guard (``utils.fbref_callbacks.check_traffic_guard``)
+    for scrapers that ship one ``traffic`` dict in their run-result JSON
+    (tls_requests style, e.g. Transfermarkt). Threshold lookup order per
+    entity: Airflow Variable ``<threshold_variable>_<entity>`` →
+    Variable ``<threshold_variable>`` → ``default_thresholds[entity]`` →
+    ``default_threshold_mb``.
+
+    A missing/unreadable result file is a warning, not a failure — the
+    scrape task itself is red in that case. A breach raises
+    AirflowException: the pool bills ~$4/GB, so crossing the budget must
+    be loud (an exhausted/burned proxy pool retrying 403 pages is exactly
+    the failure mode this catches).
+    """
+    from airflow.exceptions import AirflowException
+    from airflow.models import Variable
+
+    default_thresholds = default_thresholds or {}
+    checked: Dict[str, Any] = {}
+    breaches: List[str] = []
+    for entity, path in entity_paths.items():
+        try:
+            with open(path) as fh:
+                result = json.load(fh)
+        except (OSError, json.JSONDecodeError) as exc:
+            logger.warning(
+                "traffic guard: skipping %s — unreadable %s: %s",
+                entity, path, exc,
+            )
+            continue
+        traffic = (result or {}).get("traffic") or {}
+        mb = float(
+            traffic.get("proxy_response_mb")
+            or traffic.get("fs_response_mb")
+            or 0.0
+        )
+        raw = Variable.get(f"{threshold_variable}_{entity}", default_var=None)
+        if raw is None:
+            raw = Variable.get(threshold_variable, default_var=None)
+        if raw is not None:
+            threshold = float(raw)
+        else:
+            threshold = float(
+                default_thresholds.get(entity, default_threshold_mb)
+            )
+        checked[entity] = {"mb": round(mb, 2), "threshold_mb": threshold}
+        logger.info(
+            "traffic guard: %s spent %.2f MB (threshold %.0f MB)",
+            entity, mb, threshold,
+        )
+        if mb > threshold:
+            breaches.append(f"{entity}: {mb:.2f} MB > {threshold:.0f} MB")
+    if breaches:
+        raise AirflowException(
+            "residential proxy budget exceeded — " + "; ".join(breaches)
+        )
+    return checked
+
+
 def log_traffic_summary(summary: Dict[str, Any]) -> None:
     """Emit the per-run residential-traffic line to the Airflow task log.
 

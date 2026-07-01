@@ -1,0 +1,51 @@
+# =============================================================================
+# OpenMetadata description: iceberg.silver.transfermarkt_coaches
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.silver.transfermarkt_coaches
+  description: |
+    Типизированный roster тренеров из Transfermarkt с привязкой к canonical_id.
+    Один row per (coach_id, league, season) — grain совпадает с Bronze (dedup
+    через ROW_NUMBER). canonical_id выводится детерминированно из имени тем же
+    diacritic-stripping идиомом, что и silver.xref_manager (не через xref-мост);
+    редкие расхождения написания перекрываются manager_aliases
+    (configs/medallion/manager_aliases.yaml, issue #619). Питает
+    gold.dim_manager (dob/nationality enrichment) как источник исторического
+    покрытия поверх FotMob. Источник: bronze.transfermarkt_coaches (ingest
+    weekly Mon 04:00 UTC).
+  tags:
+    - Tier.Silver
+    - Domain.Football
+    - PII.Low
+columns:
+  - name: coach_id
+    description: Стабильный Transfermarkt coach_id (numeric varchar).
+  - name: canonical_id
+    description: |
+      Канонический ID тренера: alias-override из manager_aliases, иначе
+      name-normalize (NFD, strip диакритики, snake_case) — тот же идиом, что
+      в silver.xref_manager, поэтому совпадает со spine FBref/FotMob.
+  - name: name
+    description: Полное имя тренера (PII.Low — публично известное лицо).
+    tags:
+      - PII.Low
+  - name: role
+    description: Роль ('Manager' для всех строк, см. bronze-описание).
+  - name: dob
+    description: Дата рождения тренера (date).
+    tags:
+      - PII.Low
+  - name: nationality
+    description: Гражданство тренера.
+    tags:
+      - PII.Low
+  - name: current_club_id
+    description: Transfermarkt id клуба сезона (varchar).
+  - name: current_club_name
+    description: Название клуба сезона.
+  - name: _bronze_ingested_at
+    description: Timestamp ingest'а исходной Bronze-строки; метаколонка.
+  - name: league
+    description: Лига (e.g. 'ENG-Premier League'); partition key.
+  - name: season
+    description: Сезон в коротком виде (e.g. '2526'); partition key.
