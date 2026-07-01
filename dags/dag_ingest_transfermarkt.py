@@ -75,6 +75,7 @@ def validate_data(**context) -> Dict[str, Any]:
     players = _load_result(PLAYERS_RESULT_PATH, logger)
     mv = _load_result(MV_HISTORY_RESULT_PATH, logger)
     transfers = _load_result(TRANSFERS_RESULT_PATH, logger)
+    coaches = _load_result(COACHES_RESULT_PATH, logger)
 
     if not players:
         raise AirflowException(
@@ -94,10 +95,13 @@ def validate_data(**context) -> Dict[str, Any]:
             'transfers_rows': transfers.get('rows', 0),
             'transfers_players': transfers.get('players_with_rows', 0),
             'transfers_fallback': transfers.get('fallback', False),
+            'coaches_rows': coaches.get('rows', 0),
+            'coaches_fallback': coaches.get('fallback', False),
             'tables': (
                 players.get('tables', [])
                 + mv.get('tables', [])
                 + transfers.get('tables', [])
+                + coaches.get('tables', [])
             ),
         },
     }
@@ -106,12 +110,14 @@ def validate_data(**context) -> Dict[str, Any]:
     errors.extend(players.get('errors', []) or [])
     errors.extend(mv.get('errors', []) or [])
     errors.extend(transfers.get('errors', []) or [])
+    errors.extend(coaches.get('errors', []) or [])
     if errors:
         validation['warnings'] = errors
         total_rows = sum([
             validation['summary']['players_rows'],
             validation['summary']['mv_history_rows'],
             validation['summary']['transfers_rows'],
+            validation['summary']['coaches_rows'],
         ])
         validation['status'] = 'partial_success' if total_rows > 0 else 'failed'
 
@@ -152,6 +158,19 @@ def validate_data(**context) -> Dict[str, Any]:
         else:
             validation['warnings'].append(
                 f"Low transfers row count: {validation['summary']['transfers_rows']} < 50"
+            )
+
+    # Coaches: ~20 head coaches + mid-season replacements per season (#434).
+    if validation['summary']['coaches_rows'] < 15:
+        if validation['summary']['coaches_fallback']:
+            validation['warnings'].append(
+                f"coaches TM_FALLBACK: rows={validation['summary']['coaches_rows']}"
+            )
+            if validation['status'] == 'success':
+                validation['status'] = 'partial_success'
+        else:
+            validation['warnings'].append(
+                f"Low coaches row count: {validation['summary']['coaches_rows']} < 15"
             )
 
     logger.info("Validation: status=%s summary=%s", validation['status'], validation['summary'])
@@ -371,6 +390,41 @@ exit $rc
         trigger_rule='all_done',
     )
 
+    def _check_traffic_guard(**ctx):
+        """Residential-MB kill-switch per entity (mirrors the FBref guard).
+
+        Thresholds are sized for the squad-first crawl (players ≈ 4-5 MB,
+        coaches ≈ 3-4 MB, ceapi entities ≈ 0.5-7 MB incl. full-roster
+        backfills) with headroom for retries. Override per entity via
+        Airflow Variable ``tm_proxy_mb_threshold_<entity>`` or globally via
+        ``tm_proxy_mb_threshold``.
+        """
+        from utils.proxy_traffic import check_result_traffic_guard
+
+        return check_result_traffic_guard(
+            entity_paths={
+                'players': PLAYERS_RESULT_PATH,
+                'market_value_history': MV_HISTORY_RESULT_PATH,
+                'transfers': TRANSFERS_RESULT_PATH,
+                'coaches': COACHES_RESULT_PATH,
+            },
+            default_thresholds={
+                'players': 10.0,
+                'market_value_history': 4.0,
+                'transfers': 8.0,
+                'coaches': 6.0,
+            },
+        )
+
+    # Parallel leaf, not part of the validate → silver chain: a budget breach
+    # turns the run red (Telegram via SCRAPER_ARGS callbacks) but does NOT
+    # block promoting the already-paid-for data to Silver.
+    traffic_guard_task = PythonOperator(
+        task_id='check_traffic_guard',
+        python_callable=_check_traffic_guard,
+        trigger_rule='all_done',
+    )
+
     def _validate_bronze_quality(**ctx) -> None:
         """Trino-level CHECK gate over the 3 Transfermarkt Bronze tables.
 
@@ -432,6 +486,33 @@ exit $rc
                 'bronze.transfermarkt_coaches',
                 min_rows=15, where=where, severity='WARNING',
             ),
+            # Rotating-window roster coverage (#620): every player of the
+            # scraped season should accumulate mv_history/transfers rows
+            # within ~6 weekly runs. WARNING-only (error_threshold=0):
+            # the first weeks after a season start / fresh backfill are
+            # legitimately below target and must not block Silver.
+            CHECK.coverage(
+                'bronze.transfermarkt_players',
+                condition=(
+                    'player_id IN (SELECT player_id FROM '
+                    'iceberg.bronze.transfermarkt_market_value_history)'
+                ),
+                where=where,
+                warn_threshold=0.90,
+                error_threshold=0.0,
+                name='mv_history_roster_coverage',
+            ),
+            CHECK.coverage(
+                'bronze.transfermarkt_players',
+                condition=(
+                    'player_id IN (SELECT player_id FROM '
+                    'iceberg.bronze.transfermarkt_transfers)'
+                ),
+                where=where,
+                warn_threshold=0.90,
+                error_threshold=0.0,
+                name='transfers_roster_coverage',
+            ),
         ]
         report = run_checks(checks, raise_on_error=True)
         import logging
@@ -463,3 +544,9 @@ exit $rc
         scrape_transfers_task,
         scrape_coaches_task,
     ] >> validate_task >> validate_bronze_quality_task >> trigger_silver_task
+    [
+        scrape_players_task,
+        scrape_mv_history_task,
+        scrape_transfers_task,
+        scrape_coaches_task,
+    ] >> traffic_guard_task

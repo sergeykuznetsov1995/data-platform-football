@@ -58,14 +58,9 @@ _LEAGUE_LISTING_PATH = (
 # variant exposes the wider, detailed squad table — same selector contract
 # as the default page but with extra metadata columns visible.)
 _CLUB_SQUAD_PATH = "/{club_slug}/kader/verein/{club_id}/saison_id/{year}/plus/1"
-# /{player_slug}/profil/spieler/{player_id}
-_PLAYER_PROFILE_PATH = "/{player_slug}/profil/spieler/{player_id}"
 # JSON, no auth, no proxy required cookie-wise (but TM CF still requires proxy).
 _PLAYER_MV_HISTORY_PATH = "/ceapi/marketValueDevelopment/graph/{player_id}"
 _PLAYER_TRANSFERS_PATH = "/ceapi/transferHistory/list/{player_id}"
-# Coaches (issue #434). Staff page lists the whole backroom; we keep only the
-# "Coaching Staff" section row whose role is exactly "Manager" (head coach).
-_CLUB_STAFF_PATH = "/{club_slug}/mitarbeiter/verein/{club_id}/saison_id/{year}"
 _COACH_PROFILE_PATH = "/{coach_slug}/profil/trainer/{coach_id}"
 # Club trainer-history (issue #619). The staff page above is a single
 # end-of-season snapshot → it misses mid-season replacements and caretakers
@@ -288,18 +283,38 @@ def _parse_club_listing(html: str) -> List[Dict]:
     return clubs
 
 
+# Header text (lowercased) → bio field for the detailed (`/plus/1`) squad
+# table. The column SET varies by view: TM renders `Contract` only for the
+# season IT considers current and swaps in `Current club` for past seasons
+# (verified live 2026-07-01), so columns are mapped by <thead> text, not by
+# position.
+_SQUAD_HEADER_FIELDS = {
+    'date of birth/age': 'dob',
+    'nat.': 'nationality',
+    'height': 'height_cm',
+    'foot': 'foot',
+    'contract': 'contract_until',
+}
+
+_AGE_IN_PARENS_RE = re.compile(r'\((\d+)\)\s*$')
+
+
 def _parse_squad_page(html: str, club_id: str) -> List[Dict]:
-    """Extract per-player rows from a club's squad page.
+    """Extract per-player rows from a club's detailed (`/plus/1`) squad page.
 
     Selectors:
+        table.items > thead > th          → header-driven column map
         table.items > tbody > tr (per-player rows)
-            td.hauptlink > a  → player link (slug, id, name)
-            td.zentriert     → numeric/centered cells (varies by column)
-            td.rechts        → market value (right-aligned)
+            td.hauptlink > a              → player link (slug, id, name)
+            td.posrela inline-table       → position (second inline row)
+            td.rechts                     → market value (right-aligned)
 
-    The squad table layout has shifted several times; we only commit to the
-    fields that have a stable selector (id, slug, name, market_value_eur).
-    Profile-page fetch fills in age/height/foot/dob/nationality/contract.
+    The `/plus/1` view already carries the full bio — dob/age, nationality,
+    height, foot and (for the TM-current season) contract expiry — which is
+    why the former per-player profile fetch (~530 req/run, ~58 MB residential
+    proxy) is gone. Bio cells are read via ``_SQUAD_HEADER_FIELDS``; a page
+    without the expected headers degrades to the stable core fields
+    (id, slug, name, market_value_eur) with bio fields ``None``.
     """
     from bs4 import BeautifulSoup
 
@@ -307,6 +322,22 @@ def _parse_squad_page(html: str, club_id: str) -> List[Dict]:
     table = soup.find('table', {'class': 'items'})
     if not table:
         return []
+
+    # Header-driven column map: index → bio field.
+    col_fields: Dict[int, str] = {}
+    n_headers = 0
+    thead = table.find('thead')
+    if thead:
+        headers = [
+            th.get_text(' ', strip=True).lower()
+            for th in thead.find_all('th')
+        ]
+        n_headers = len(headers)
+        col_fields = {
+            i: _SQUAD_HEADER_FIELDS[h]
+            for i, h in enumerate(headers)
+            if h in _SQUAD_HEADER_FIELDS
+        }
 
     players: List[Dict] = []
     seen: set = set()
@@ -340,143 +371,56 @@ def _parse_squad_page(html: str, club_id: str) -> List[Dict]:
                     mv_eur = mv
                     break
 
-        players.append({
+        row: Dict = {
             'player_id': pid,
             'player_slug': m.group('slug'),
             'name': a.get_text(strip=True),
             'club_id': str(club_id),
             'market_value_eur': mv_eur,
-        })
+            'position': None,
+            'dob': None,
+            'age': None,
+            'height_cm': None,
+            'foot': None,
+            'nationality': None,
+            'contract_until': None,
+        }
+
+        # Position: second row of the inline name/position table.
+        pos_td = tr.find('td', {'class': 'posrela'})
+        inline = pos_td.find('table', {'class': 'inline-table'}) if pos_td else None
+        if inline:
+            inline_trs = inline.find_all('tr')
+            if len(inline_trs) >= 2:
+                row['position'] = inline_trs[-1].get_text(' ', strip=True) or None
+
+        # Bio cells by header index. Only trust the map when the row's
+        # top-level cell count matches the header count (colspan rows,
+        # e.g. separators, would otherwise misalign every field).
+        cells = tr.find_all('td', recursive=False)
+        if col_fields and len(cells) == n_headers:
+            for idx, field in col_fields.items():
+                td = cells[idx]
+                text = td.get_text(' ', strip=True)
+                if field == 'dob':
+                    row['dob'] = _parse_tm_date(text)
+                    age_m = _AGE_IN_PARENS_RE.search(text)
+                    row['age'] = int(age_m.group(1)) if age_m else None
+                elif field == 'nationality':
+                    img = td.find('img')
+                    row['nationality'] = (
+                        (img.get('title') or img.get('alt') or '').strip() or None
+                        if img else None
+                    )
+                elif field == 'height_cm':
+                    row['height_cm'] = _parse_height_cm(text)
+                elif field == 'foot':
+                    row['foot'] = text.lower() if text not in ('', '-') else None
+                elif field == 'contract_until':
+                    row['contract_until'] = _parse_tm_date(text)
+
+        players.append(row)
     return players
-
-
-def _parse_player_profile(html: str, player_id: str) -> Optional[Dict]:
-    """Extract bio + current-state snapshot from a player profile page.
-
-    Selectors (verified by probe 2026-05-23):
-        h1.data-header__headline-wrapper                       → display name (incl. shirt#)
-        a.data-header__market-value-wrapper                    → MV current + ``Last update: <date>``
-        span[itemprop=birthDate|height|nationality]            → bio fields
-        span.data-header__club                                 → current club name
-        dd.detail-position__position                           → primary position
-        span.data-header__label  (with 'Contract expires:')    → contract end date
-    """
-    from bs4 import BeautifulSoup
-
-    soup = BeautifulSoup(html, 'html.parser')
-
-    name_el = soup.find('h1', {'class': 'data-header__headline-wrapper'})
-    if not name_el:
-        return None
-
-    # Strip optional leading shirt #25 prefix.
-    raw_name = re.sub(r'\s+', ' ', name_el.get_text(' ', strip=True))
-    full_name = re.sub(r'^#\d+\s*', '', raw_name)
-
-    mv_el = soup.find('a', {'class': 'data-header__market-value-wrapper'})
-    mv_raw = mv_el.get_text(' ', strip=True) if mv_el else None
-    mv_eur = _parse_tm_money_eur(mv_raw)
-    mv_last_update = None
-    if mv_raw:
-        m = re.search(r'Last update:\s*([A-Za-z]{3,9}\s+\d{1,2},\s*\d{4})', mv_raw)
-        if m:
-            mv_last_update = _parse_tm_date(m.group(1))
-
-    dob_el = soup.find('span', {'itemprop': 'birthDate'})
-    dob = _parse_tm_date(dob_el.get_text(' ', strip=True)) if dob_el else None
-
-    h_el = soup.find('span', {'itemprop': 'height'})
-    height_cm = _parse_height_cm(h_el.get_text(' ', strip=True)) if h_el else None
-
-    nat_el = soup.find('span', {'itemprop': 'nationality'})
-    nationality = nat_el.get_text(' ', strip=True) if nat_el else None
-
-    pos_el = soup.find('dd', {'class': 'detail-position__position'})
-    position = pos_el.get_text(' ', strip=True) if pos_el else None
-
-    club_el = soup.find('span', {'class': 'data-header__club'})
-    current_club = club_el.get_text(' ', strip=True) if club_el else None
-
-    foot = None
-    contract_until = None
-    for label_el in soup.find_all('span', {'class': 'info-table__content--regular'}):
-        label = label_el.get_text(' ', strip=True).rstrip(':').lower()
-        value_el = label_el.find_next_sibling('span', {'class': 'info-table__content--bold'})
-        if value_el is None:
-            continue
-        value = value_el.get_text(' ', strip=True)
-        if label == 'foot':
-            foot = value.lower() if value else None
-        elif 'contract expires' in label:
-            contract_until = _parse_tm_date(value)
-
-    return {
-        'player_id': str(player_id),
-        'name': full_name,
-        'position': position,
-        'dob': dob,
-        'height_cm': height_cm,
-        'foot': foot,
-        'nationality': nationality,
-        'current_club_name': current_club,
-        'contract_until': contract_until,
-        'market_value_eur': mv_eur,
-        'market_value_last_update': mv_last_update,
-    }
-
-
-def _parse_staff_managers(html: str, club_id: str) -> List[Dict]:
-    """Extract the head coach(es) from a club staff (`mitarbeiter`) page.
-
-    The staff page groups people under section headers
-    (``div.content-box-headline``): "Coaching Staff", "Management", "Medical
-    department", … Each person sits in a ``table.inline-table`` whose first
-    cell links to ``/{slug}/profil/trainer/{id}`` and whose second line is the
-    role. We keep ONLY the "Coaching Staff" section rows whose role is exactly
-    ``"Manager"`` (the head coach) — assistants / GK coaches / analysts are
-    dropped. Verified by scripts/probe_transfermarkt_coaches.py (2026-06-16).
-    """
-    from bs4 import BeautifulSoup
-
-    soup = BeautifulSoup(html, 'html.parser')
-    hdr = soup.find(
-        lambda t: bool(t.get('class'))
-        and any('content-box-headline' in c for c in (t.get('class') or []))
-        and 'Coaching Staff' in t.get_text()
-    )
-    if hdr is None:
-        return []
-    table = hdr.find_next('table')
-    if table is None:
-        return []
-
-    managers: List[Dict] = []
-    seen: set = set()
-    for a in table.find_all('a', href=True):
-        m = _COACH_HREF_RE.match(a['href'])
-        if not m:
-            continue
-        coach_id = m.group('id')
-        if coach_id in seen:
-            continue
-        name = a.get_text(strip=True)
-        inline = a.find_parent('table', {'class': 'inline-table'})
-        full = (
-            re.sub(r'\s+', ' ', inline.get_text(' ', strip=True))
-            if inline else name
-        )
-        role = full.replace(name, '').strip()
-        if role != 'Manager':
-            continue
-        seen.add(coach_id)
-        managers.append({
-            'coach_id': coach_id,
-            'coach_slug': m.group('slug'),
-            'name': name,
-            'role': role,
-            'club_id': str(club_id),
-        })
-    return managers
 
 
 def _parse_coach_profile(html: str, coach_id: str) -> Optional[Dict]:
@@ -948,6 +892,70 @@ class TransfermarktScraper(BaseScraper):
         start = (int(window_offset) * int(limit)) % n
         return (roster + roster)[start:start + int(limit)]
 
+    def _resolve_coach_bios_from_bronze(self) -> Dict[str, Dict]:
+        """``coach_id → {name, dob, nationality}`` from bronze, all seasons.
+
+        Coach bios are immutable, so a profile materialised by ANY earlier
+        run can be reused instead of re-fetching ~20-40 profile pages every
+        weekly run. Rows with neither dob nor nationality are excluded —
+        they carry no enrichment, so a live fetch is still worth attempting.
+        Empty dict on any error — reuse is best-effort.
+        """
+        try:
+            conn = self._bronze_connection()
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT coach_id, max(name), max(dob), max(nationality) "
+                "FROM iceberg.bronze.transfermarkt_coaches "
+                "WHERE dob IS NOT NULL OR nationality IS NOT NULL "
+                "GROUP BY coach_id"
+            )
+            return {
+                str(r[0]): {'name': r[1], 'dob': r[2], 'nationality': r[3]}
+                for r in cur.fetchall()
+                if r and r[0]
+            }
+        except Exception as e:
+            logger.warning(
+                "Could not resolve coach bios from bronze: %s", e,
+            )
+            return {}
+
+    def _resolve_contracts_from_bronze(
+        self,
+        league: str,
+        season_short: str,
+    ) -> Dict[str, date]:
+        """``player_id → contract_until`` from the existing bronze partition.
+
+        Feeds the July carry-forward in ``read_players``: when TM's squad
+        page stops rendering the Contract column (TM flips to the new season
+        weeks before our CURRENT_SEASON does), the partition replace must not
+        wipe the contract dates scraped in previous runs. Empty dict on any
+        error — carry-forward is best-effort.
+        """
+        try:
+            conn = self._bronze_connection()
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT player_id, max(contract_until) "
+                "FROM iceberg.bronze.transfermarkt_players "
+                "WHERE league = ? AND season = ? "
+                "AND contract_until IS NOT NULL "
+                "GROUP BY player_id",
+                (league, season_short),
+            )
+            return {
+                str(r[0]): r[1]
+                for r in cur.fetchall()
+                if r and r[0] and r[1] is not None
+            }
+        except Exception as e:
+            logger.warning(
+                "Could not resolve contract_until from bronze: %s", e,
+            )
+            return {}
+
     # ---------------------- read_* entry points ------------------------------
 
     def read_players(
@@ -956,7 +964,7 @@ class TransfermarktScraper(BaseScraper):
         season: int,
         limit: Optional[int] = None,
     ) -> pd.DataFrame:
-        """Listing → squad pages → per-player profile pages.
+        """Listing → detailed squad pages (2 HTTP hops, no profile fetches).
 
         Returns one row per (league, season, player_id). ``limit`` caps the
         total number of players the scraper materialises (useful for smoke
@@ -1005,8 +1013,12 @@ class TransfermarktScraper(BaseScraper):
             len(clubs), league, season,
         )
 
-        # Step 2 — per-club squad page → players (id + slug + name + MV).
+        # Step 2 — per-club detailed squad page → full player rows. The
+        # `/plus/1` table carries the whole bio, so this is the LAST HTTP
+        # hop: the former per-player profile loop (~530 req / ~58 MB
+        # residential proxy per weekly run) is gone.
         squad_players: List[Dict] = []
+        squad_successes = 0
         for club in clubs:
             squad_url = (
                 f"{_TM_BASE}"
@@ -1023,6 +1035,7 @@ class TransfermarktScraper(BaseScraper):
             )
             if html is None:
                 continue
+            squad_successes += 1
             for p in _parse_squad_page(html, club_id=club['club_id']):
                 p['current_club_name'] = club['club_name']
                 squad_players.append(p)
@@ -1034,84 +1047,66 @@ class TransfermarktScraper(BaseScraper):
             )
             return pd.DataFrame(columns=anchor_cols + ['_ingested_at'])
 
+        # A partial squad sweep would be saved with replace_partitions and
+        # shrink the bronze partition — abort instead (#484 semantics, moved
+        # from the former profile loop to the squad loop).
+        if squad_successes < _MIN_SUCCESS_RATIO * len(clubs):
+            raise PartialScrapeError(
+                f"only {squad_successes}/{len(clubs)} squad pages fetched "
+                f"(< {_MIN_SUCCESS_RATIO:.0%}) — aborting to protect "
+                f"existing partition"
+            )
+
         if limit:
             squad_players = squad_players[: int(limit)]
 
-        logger.info("TM squad pages → %d players to enrich", len(squad_players))
+        logger.info("TM squad pages → %d players", len(squad_players))
 
-        # Step 3 — per-player profile page → enrich bio fields.
-        rows: List[Dict] = []
-        consecutive_failures = 0
-        successes = 0
         today = datetime.utcnow().date()
-        for idx, sp in enumerate(squad_players, start=1):
-            profile_url = (
-                f"{_TM_BASE}"
-                + _PLAYER_PROFILE_PATH.format(
-                    player_slug=sp['player_slug'], player_id=sp['player_id'],
-                )
-            )
-            payload = self._fetch_html(
-                profile_url,
-                label='profile',
-                context={'player_id': sp['player_id']},
-            )
-            if payload is None:
-                consecutive_failures += 1
-                if consecutive_failures >= _MAX_CONSECUTIVE_FAILURES:
-                    raise ConsecutiveFailureError(
-                        f"{consecutive_failures} consecutive profile failures "
-                        f"at {idx}/{len(squad_players)} — aborting to protect "
-                        f"existing partition"
-                    )
-                continue
-            consecutive_failures = 0
-            successes += 1
-            bio = _parse_player_profile(payload, sp['player_id']) or {}
-
-            # Merge squad-level MV / club_id with profile-level enrichment.
-            row = {
+        rows: List[Dict] = []
+        for sp in squad_players:
+            dob = sp.get('dob')
+            rows.append({
                 'player_id': sp['player_id'],
                 'player_slug': sp['player_slug'],
-                'name': bio.get('name') or sp['name'],
-                'position': bio.get('position'),
-                'dob': bio.get('dob'),
+                'name': sp['name'],
+                'position': sp.get('position'),
+                'dob': dob,
                 'age': (
-                    (today.year - bio['dob'].year
-                     - ((today.month, today.day) < (bio['dob'].month, bio['dob'].day)))
-                    if bio.get('dob') else None
+                    (today.year - dob.year
+                     - ((today.month, today.day) < (dob.month, dob.day)))
+                    if dob else sp.get('age')
                 ),
-                'height_cm': bio.get('height_cm'),
-                'foot': bio.get('foot'),
-                'nationality': bio.get('nationality'),
-                'contract_until': bio.get('contract_until'),
-                'market_value_eur': (
-                    bio.get('market_value_eur') or sp.get('market_value_eur')
-                ),
-                'market_value_last_update': bio.get('market_value_last_update'),
+                'height_cm': sp.get('height_cm'),
+                'foot': sp.get('foot'),
+                'nationality': sp.get('nationality'),
+                'contract_until': sp.get('contract_until'),
+                'market_value_eur': sp.get('market_value_eur'),
+                # Profile-only field, no longer scraped; Silver derives
+                # mv_last_update from bronze.transfermarkt_market_value_history.
+                'market_value_last_update': None,
                 'current_club_id': sp['club_id'],
-                'current_club_name': (
-                    sp.get('current_club_name') or bio.get('current_club_name')
-                ),
-            }
-            rows.append(row)
+                'current_club_name': sp.get('current_club_name'),
+            })
 
-            if idx % 50 == 0:
-                logger.info("profile progress: %d/%d", idx, len(squad_players))
-
-        if not rows:
-            logger.warning(
-                "%s: zero player_profile rows materialised.",
-                R0_2B_FALLBACK_MARKER,
-            )
-            return pd.DataFrame(columns=anchor_cols + ['_ingested_at'])
-
-        if successes < _MIN_SUCCESS_RATIO * len(squad_players):
-            raise PartialScrapeError(
-                f"only {successes}/{len(squad_players)} player profiles "
-                f"fetched (< {_MIN_SUCCESS_RATIO:.0%}) — aborting to protect "
-                f"existing partition"
-            )
+        # TM renders the Contract column only for the season IT considers
+        # current, and it flips to the new season in early July while our
+        # CURRENT_SEASON flips in August. In that window the squad page has
+        # no contract data and a plain partition replace would wipe last
+        # week's values — carry the existing bronze ones forward.
+        if any(r['contract_until'] is None for r in rows):
+            known = self._resolve_contracts_from_bronze(league, season_short)
+            filled = 0
+            for r in rows:
+                if r['contract_until'] is None:
+                    carried = known.get(r['player_id'])
+                    if carried is not None:
+                        r['contract_until'] = carried
+                        filled += 1
+            if filled:
+                logger.info(
+                    "contract_until carry-forward from bronze: %d rows", filled,
+                )
 
         df = pd.DataFrame(rows)
         df['league'] = league
@@ -1226,33 +1221,44 @@ class TransfermarktScraper(BaseScraper):
             "TM trainer-history → %d in-season coaches to enrich", len(managers)
         )
 
-        # Step 3 — per-coach profile page → dob + nationality.
+        # Step 3 — per-coach profile page → dob + nationality. Coach bios
+        # are immutable, so profiles already materialised in bronze (any
+        # season) are reused instead of re-fetched — a typical weekly run
+        # downloads only genuinely new appointments (proxy-traffic fix).
+        known_bios = self._resolve_coach_bios_from_bronze()
         rows: List[Dict] = []
         consecutive_failures = 0
         successes = 0
+        attempted = 0
+        reused = 0
         for idx, mgr in enumerate(managers, start=1):
-            profile_url = (
-                f"{_TM_BASE}"
-                + _COACH_PROFILE_PATH.format(
-                    coach_slug=mgr['coach_slug'], coach_id=mgr['coach_id'],
-                )
-            )
-            payload = self._fetch_html(
-                profile_url, label='coach_profile',
-                context={'coach_id': mgr['coach_id']},
-            )
-            if payload is None:
-                consecutive_failures += 1
-                if consecutive_failures >= _MAX_CONSECUTIVE_FAILURES:
-                    raise ConsecutiveFailureError(
-                        f"{consecutive_failures} consecutive coach-profile "
-                        f"failures at {idx}/{len(managers)} — aborting to "
-                        f"protect existing partition"
+            bio = known_bios.get(mgr['coach_id'])
+            if bio is not None:
+                reused += 1
+            else:
+                attempted += 1
+                profile_url = (
+                    f"{_TM_BASE}"
+                    + _COACH_PROFILE_PATH.format(
+                        coach_slug=mgr['coach_slug'], coach_id=mgr['coach_id'],
                     )
-                continue
-            consecutive_failures = 0
-            successes += 1
-            bio = _parse_coach_profile(payload, mgr['coach_id']) or {}
+                )
+                payload = self._fetch_html(
+                    profile_url, label='coach_profile',
+                    context={'coach_id': mgr['coach_id']},
+                )
+                if payload is None:
+                    consecutive_failures += 1
+                    if consecutive_failures >= _MAX_CONSECUTIVE_FAILURES:
+                        raise ConsecutiveFailureError(
+                            f"{consecutive_failures} consecutive coach-profile "
+                            f"failures at {idx}/{len(managers)} — aborting to "
+                            f"protect existing partition"
+                        )
+                    continue
+                consecutive_failures = 0
+                successes += 1
+                bio = _parse_coach_profile(payload, mgr['coach_id']) or {}
             rows.append({
                 'coach_id': mgr['coach_id'],
                 'coach_slug': mgr['coach_slug'],
@@ -1264,6 +1270,11 @@ class TransfermarktScraper(BaseScraper):
                 'current_club_name': mgr.get('current_club_name'),
             })
 
+        if reused:
+            logger.info(
+                "coach bios reused from bronze: %d/%d", reused, len(managers),
+            )
+
         if not rows:
             logger.warning(
                 "%s: zero coach_profile rows materialised.",
@@ -1271,9 +1282,9 @@ class TransfermarktScraper(BaseScraper):
             )
             return pd.DataFrame(columns=anchor_cols + ['_ingested_at'])
 
-        if successes < _MIN_SUCCESS_RATIO * len(managers):
+        if attempted and successes < _MIN_SUCCESS_RATIO * attempted:
             raise PartialScrapeError(
-                f"only {successes}/{len(managers)} coach profiles fetched "
+                f"only {successes}/{attempted} coach profiles fetched "
                 f"(< {_MIN_SUCCESS_RATIO:.0%}) — aborting to protect partition"
             )
 
