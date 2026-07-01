@@ -70,6 +70,52 @@ def _coerce_scalar(v):
     except (TypeError, ValueError):
         return s
 
+
+# Bronze payloads nest shallowly (SofaScore: ~2-3 levels). Cap recursion so a
+# pathological / cyclic payload can never blow the stack or explode column count.
+_MAX_FLATTEN_DEPTH = 4
+
+
+def _auto_flatten(payload, out, prefix='', skip=(), _depth=0):
+    """Recursively flatten a SofaScore dict into Bronze-safe snake_case scalar
+    columns, IN PLACE on ``out`` (#840). Generalises the inline loop in
+    :meth:`SofaScoreScraper._flatten_event_player_stats`.
+
+    Rules:
+        * scalar (str/int/float/bool/None) -> out[prefix+snake] = _coerce_scalar(v)
+        * dict WITH a ``value`` wrapper     -> out[prefix+snake] = _coerce_scalar(v)
+          (SofaScore's ``{"value": X, "previousValue": Y, ...}`` UI shape -> X)
+        * plain nested dict (NO ``value``)  -> recurse, prefix = snake + '_'
+          (e.g. ``playerCoordinates.x`` -> ``player_coordinates_x``)
+        * list / tuple                      -> skipped (Bronze stays flat)
+
+    ``skip`` lists TOP-LEVEL keys to ignore entirely (identity objects already
+    projected as hard-coded anchors, e.g. ``player`` / ``team``). Keys already
+    present in ``out`` (the PK / identity anchors) are NEVER overwritten, so the
+    anchor types (stringified ids, coerced bools) stay authoritative.
+    """
+    if not isinstance(payload, dict) or _depth > _MAX_FLATTEN_DEPTH:
+        return out
+    for raw_key, raw_val in payload.items():
+        if raw_key in skip:
+            continue
+        if isinstance(raw_val, (list, tuple)):
+            # Bronze stays flat — arrays aren't projected to columns (would only
+            # yield an all-NULL column via _coerce_scalar; re-derive from raw JSON).
+            continue
+        col = f"{prefix}{_camel_to_snake(str(raw_key))}"
+        if isinstance(raw_val, dict) and 'value' not in raw_val:
+            # Plain nested object -> recurse with a path prefix. ``skip`` is
+            # deliberately NOT propagated (it targets top-level identity keys).
+            _auto_flatten(raw_val, out, prefix=f"{col}_", _depth=_depth + 1)
+        else:
+            # Scalar, or a {"value": ...} wrapper -> Bronze scalar.
+            if col in out:
+                continue  # never clobber a hard-coded anchor
+            out[col] = _coerce_scalar(raw_val)
+    return out
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -1201,10 +1247,13 @@ class SofaScoreScraper(SoccerdataScraper):
             'compare_code', 'value_type', 'league', 'season',
         ]
         shotmap_cols = [
+            # #840: source-key names (Bronze as-is); Silver renames/derives.
             'match_id', 'shot_id', 'player_id', 'team_id', 'is_home',
-            'minute', 'added_time', 'period', 'shot_type', 'situation',
-            'body_part', 'outcome', 'goal_type', 'x', 'y', 'goal_x',
-            'goal_y', 'xg', 'xgot', 'league', 'season',
+            'id', 'time', 'added_time', 'reversed_period_count', 'period',
+            'shot_type', 'situation', 'body_part', 'incident_type', 'goal_type',
+            'player_coordinates_x', 'player_coordinates_y',
+            'goal_mouth_coordinates_x', 'goal_mouth_coordinates_y',
+            'xg', 'xgot', 'league', 'season',
         ]
         venue_cols = [
             'game_id', 'stadium', 'city', 'country',
@@ -1380,10 +1429,19 @@ class SofaScoreScraper(SoccerdataScraper):
     def _flatten_shotmap(match_id: str, payload: dict) -> List[Dict]:
         """Project the ``shotmap`` block into one row per shot.
 
-        Schema per row:
-            match_id, shot_id, player_id, team_id, is_home, minute,
-            added_time, period, situation, shot_type, body_part,
-            outcome, x, y, goal_x, goal_y, xg, xgot
+        #840: Bronze keeps EVERY source field. Only the primary key + identity
+        anchors that Silver joins on (and that need type / format stabilisation)
+        are hard-coded: ``match_id``, ``shot_id`` (composite fallback),
+        ``player_id``, ``team_id``, ``is_home``. Every other scalar auto-flattens
+        through :func:`_auto_flatten`, so new SofaScore fields land in Bronze
+        automatically. Renames / derivations (``minute`` <- ``time``, ``x`` <-
+        ``player_coordinates_x``, ``outcome`` <- ``incidentType``, the xg
+        coalesce, ...) move to Silver.
+
+        Nested objects flatten with a path prefix::
+
+            playerCoordinates.x     -> player_coordinates_x
+            goalMouthCoordinates.x  -> goal_mouth_coordinates_x
         """
         rows: List[Dict] = []
         if not isinstance(payload, dict):
@@ -1392,12 +1450,6 @@ class SofaScoreScraper(SoccerdataScraper):
         shots = payload.get('shotmap') or []
         if not isinstance(shots, list):
             return rows
-
-        def _f(v):
-            try:
-                return float(v) if v is not None else None
-            except (TypeError, ValueError):
-                return None
 
         def _i(v):
             try:
@@ -1409,11 +1461,13 @@ class SofaScoreScraper(SoccerdataScraper):
             if not isinstance(shot, dict):
                 continue
 
+            player = shot.get('player') or {}
+
+            # --- PK: shot id, composite fallback when SofaScore omits id ---
             sid = shot.get('id')
             if sid is None:
                 # Fall back to composite (match, time, player) so that
                 # downstream PK stays unique even when SofaScore omits id.
-                player = shot.get('player') or {}
                 sid = (
                     f"{match_id}-"
                     f"{shot.get('time', 'NA')}-"
@@ -1425,42 +1479,26 @@ class SofaScoreScraper(SoccerdataScraper):
                 else str(sid)
             )
 
-            player = shot.get('player') or {}
             pid = player.get('id')
             player_id_str = (
                 str(int(pid)) if isinstance(pid, (int, float)) and pid is not None
                 else (str(pid) if pid is not None else None)
             )
 
-            coords = shot.get('playerCoordinates') or {}
-            goal = shot.get('goalMouthCoordinates') or {}
-
-            rows.append({
+            # Identity anchors set FIRST so _auto_flatten never clobbers them.
+            row: Dict = {
                 'match_id': str(match_id),
                 'shot_id': shot_id_str,
                 'player_id': player_id_str,
                 'team_id': _i(shot.get('teamId') or (shot.get('team') or {}).get('id')),
                 'is_home': bool(shot.get('isHome')) if shot.get('isHome') is not None else None,
-                'minute': _i(shot.get('time')),
-                'added_time': _i(shot.get('addedTime')),
-                'period': _i(shot.get('reversedPeriodCount') or shot.get('period')),
-                # SofaScore taxonomy: incidentType=goal/miss/save/post/block,
-                # shotType=header/leftFoot/rightFoot/other,
-                # bodyPart=head/leftFoot/rightFoot/other (richer than shotType
-                # but not always populated), situation=open-play/corner/free-kick/penalty,
-                # goalType (populated for incidentType=goal): regular/own/penalty.
-                'shot_type': shot.get('shotType') or None,
-                'situation': shot.get('situation') or None,
-                'body_part': shot.get('bodyPart') or None,
-                'outcome': shot.get('incidentType') or None,
-                'goal_type': shot.get('goalType') or None,
-                'x': _f(coords.get('x')),
-                'y': _f(coords.get('y')),
-                'goal_x': _f(goal.get('x')),
-                'goal_y': _f(goal.get('y')),
-                'xg': _f(shot.get('xg') if shot.get('xg') is not None else shot.get('expectedGoals')),
-                'xgot': _f(shot.get('xgot') if shot.get('xgot') is not None else shot.get('expectedGoalsOnTarget')),
-            })
+            }
+
+            # Auto-passthrough everything else. Skip identity objects already
+            # projected as anchors (player.id -> player_id, team.id -> team_id).
+            _auto_flatten(shot, row, skip=('player', 'team'))
+
+            rows.append(row)
 
         return rows
 
@@ -1491,10 +1529,13 @@ class SofaScoreScraper(SoccerdataScraper):
         ``R0.2B_FALLBACK`` and exits with code 2).
         """
         cols = [
+            # #840: source-key names (Bronze as-is); Silver renames/derives.
             'match_id', 'shot_id', 'player_id', 'team_id', 'is_home',
-            'minute', 'added_time', 'period', 'shot_type', 'situation',
-            'body_part', 'outcome', 'goal_type', 'x', 'y', 'goal_x',
-            'goal_y', 'xg', 'xgot', 'league', 'season',
+            'id', 'time', 'added_time', 'reversed_period_count', 'period',
+            'shot_type', 'situation', 'body_part', 'incident_type', 'goal_type',
+            'player_coordinates_x', 'player_coordinates_y',
+            'goal_mouth_coordinates_x', 'goal_mouth_coordinates_y',
+            'xg', 'xgot', 'league', 'season',
         ]
 
         if match_ids is None:
