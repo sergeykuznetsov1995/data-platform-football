@@ -33,7 +33,9 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
+from collections import Counter
 from typing import Dict, Optional
 
 from scrapers.sofascore._flatten import _auto_flatten
@@ -68,6 +70,31 @@ _EVENT_ENDPOINTS = {
     "shotmap": "/api/v1/event/{eid}/shotmap",
     "incidents": "/api/v1/event/{eid}/incidents",
 }
+
+# Non-essential resource types we abort via page.route to cut proxy bytes (#842).
+# The SPA only needs its own JS to run + fire the /api/v1 XHRs, so document /
+# script / xhr / fetch / websocket must pass; images / fonts / media / CSS do not.
+_BLOCK_RESOURCE_TYPES = frozenset({"image", "media", "font", "stylesheet"})
+# Cloudflare / Turnstile assets — always pass, even css/font/img served by the
+# challenge iframe. The bare resource-type block would otherwise abort them and
+# starve a visible challenge, degrading the bypass. Checked BEFORE the type block.
+_ALLOW_URL_SUBSTRINGS = (
+    "challenges.cloudflare.com",
+    "turnstile.cloudflare.com",
+    "/cdn-cgi/challenge-platform/",
+)
+# Analytics / tracking hosts to abort regardless of type (ported from
+# nodriver_bypass.BLOCKED_URL_PATTERNS, globs -> substrings). Do NOT add
+# challenges/turnstile.cloudflare.com here — they are required for the bypass.
+_BLOCK_URL_SUBSTRINGS = (
+    "google-analytics.com", "googletagmanager.com", "doubleclick.net",
+    "googlesyndication.com", "googleadservices.com", "googletagservices.com",
+    "facebook.net", "facebook.com/tr", "twitter.com/i/", "platform.twitter.com",
+    "amazon-adsystem.com", "adsafeprotected.com", "adsrvr.org",
+    "scorecardresearch.com", "quantserve.com", "cloudflareinsights.com",
+    "newrelic.com", "nr-data.net", "hotjar.com", "segment.io", "mixpanel.com",
+    "snap.licdn.com", "bat.bing.com", "hs-scripts.com", "hs-analytics.net",
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -129,6 +156,27 @@ def select_event_endpoints(buffer: Dict[str, dict], event_id) -> Dict[str, dict]
         if rec and rec.get("status") == 200 and rec.get("challenge") is False and rec.get("json") is not None:
             out[name] = rec["json"]
     return out
+
+
+def should_block_request(resource_type: str, url: str) -> bool:
+    """True → abort this request to save proxy bytes (#842): non-essential static
+    (image/media/font/stylesheet) or a known analytics/tracking host.
+
+    Never blocks document/script/xhr/fetch/websocket — the SPA needs them to run
+    and fire the ``/api/v1`` XHRs — nor the ``/api/v1`` data endpoints, nor any
+    Cloudflare/Turnstile asset (the challenge iframe pulls its own css/font/img,
+    which the bare resource-type block would otherwise abort and starve the
+    bypass). Both guards run before the type block, so a crest served under
+    ``/api/v1/.../image`` is still blocked as an image while the 5 JSON payloads
+    and challenge assets always pass."""
+    if is_data_api_url(url):
+        return False
+    low = url.lower()
+    if any(s in low for s in _ALLOW_URL_SUBSTRINGS):
+        return False
+    if resource_type in _BLOCK_RESOURCE_TYPES:
+        return True
+    return any(s in low for s in _BLOCK_URL_SUBSTRINGS)
 
 
 _EVENTS_PATH_RE = re.compile(r"/api/v1/.+/events/(?:last|next)/\d+$")
@@ -447,6 +495,7 @@ class SofascoreCamoufoxCapture:
         settle_ms: int = 8000,
         tab_wait_ms: int = 2500,
         nav_timeout_ms: int = 60000,
+        block_resources: bool = True,
     ) -> None:
         self._proxy = proxy
         self._geoip = geoip
@@ -454,10 +503,18 @@ class SofascoreCamoufoxCapture:
         self._settle_ms = settle_ms
         self._tab_wait_ms = tab_wait_ms
         self._nav_timeout_ms = nav_timeout_ms
+        self._block_resources = block_resources
         self._cm = None
         self._browser = None
         self._page = None
         self._buffer: Dict[str, dict] = {}
+        # Proxy-byte accounting (#842) — rx+tx tallied from request.sizes(), the
+        # same metric the issue measured (~4.2 MB/match before blocking).
+        self._bytes_total = 0
+        self._bytes_at_event_start = 0
+        self._bytes_by_type: Counter = Counter()
+        self._blocked_count = 0
+        self._blocked_at_event_start = 0
 
     # -- lifecycle -------------------------------------------------------- #
     def __enter__(self) -> "SofascoreCamoufoxCapture":
@@ -475,16 +532,59 @@ class SofascoreCamoufoxCapture:
         self._cm = Camoufox(**kwargs)
         self._browser = self._cm.__enter__()
         self._page = self._browser.new_page()
+        # Cut proxy bytes by aborting images/fonts/media/CSS/analytics (#842).
+        # Env kill-switch lets ops disable without a redeploy if Turnstile 403s.
+        env = os.environ.get("SOFASCORE_BLOCK_RESOURCES")
+        block = self._block_resources if env is None else env.strip().lower() not in ("0", "false", "no")
+        if block:
+            # Trade-off: enabling page.route disables the browser HTTP cache, so a
+            # capture_event retry re-fetches script/document instead of serving
+            # them from cache. Still a net win — image/media/font/CSS dwarf the
+            # re-fetched JS — but the canary must measure bytes/match WITH retries.
+            self._page.route("**/*", self._maybe_block)
         self._page.on("response", self._on_response)
+        self._page.on("requestfinished", self._on_request_finished)
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> bool:
+        top = ", ".join(f"{t}={b // 1024}KB" for t, b in self._bytes_by_type.most_common(4))
+        logger.info("sofascore capture session total=%.1fMB blocked=%d top=[%s]",
+                    self._bytes_total / 1_048_576, self._blocked_count, top)
         if self._cm is not None:
             try:
                 self._cm.__exit__(exc_type, exc_val, exc_tb)
             except Exception:  # noqa: BLE001 — browser teardown is best-effort
                 logger.warning("Camoufox teardown failed", exc_info=True)
         return False
+
+    # -- byte accounting / resource blocking (#842) ----------------------- #
+    def _maybe_block(self, route) -> None:
+        """page.route handler: abort non-essential requests, pass the rest.
+        Never lets a routing error stall a navigation (falls back to continue)."""
+        try:
+            req = route.request
+            if should_block_request(req.resource_type, req.url):
+                self._blocked_count += 1
+                route.abort()
+                return
+            route.continue_()
+        except Exception:  # noqa: BLE001 — routing must not break the capture
+            try:
+                route.continue_()
+            except Exception:
+                pass
+
+    def _on_request_finished(self, req) -> None:
+        """Tally rx+tx bytes per resource type (aborted requests never fire this,
+        so blocked resources correctly count as zero)."""
+        try:
+            s = req.sizes()
+            n = (s.get("responseBodySize", 0) + s.get("responseHeadersSize", 0)
+                 + s.get("requestBodySize", 0) + s.get("requestHeadersSize", 0))
+            self._bytes_by_type[req.resource_type] += n
+            self._bytes_total += n
+        except Exception:  # noqa: BLE001 — sizes() can race on teardown
+            pass
 
     # -- capture ---------------------------------------------------------- #
     def _on_response(self, resp) -> None:
@@ -550,8 +650,12 @@ class SofascoreCamoufoxCapture:
                 )
 
         missing = [k for k in _EVENT_ENDPOINTS if k not in result]
-        logger.info("sofascore capture event=%s got=%s missing=%s",
-                    event_id, sorted(result), missing)
+        delta = self._bytes_total - self._bytes_at_event_start
+        self._bytes_at_event_start = self._bytes_total
+        blocked = self._blocked_count - self._blocked_at_event_start
+        self._blocked_at_event_start = self._blocked_count
+        logger.info("sofascore capture event=%s got=%s missing=%s bytes=%.0fKB blocked=%d",
+                    event_id, sorted(result), missing, delta / 1024, blocked)
         return result
 
     def capture_player(self, player_id, *, season_picker_label=None) -> Dict:
@@ -585,8 +689,12 @@ class SofascoreCamoufoxCapture:
                 if _PLAYER_SEASON_STATS_RE.search(p) or _PLAYER_SEASONS_LIST_RE.search(p)
             }
 
-        logger.info("sofascore capture player=%s profile=%s season_xhrs=%d",
-                    player_id, profile is not None, len(season_buffer))
+        delta = self._bytes_total - self._bytes_at_event_start
+        self._bytes_at_event_start = self._bytes_total
+        blocked = self._blocked_count - self._blocked_at_event_start
+        self._blocked_at_event_start = self._blocked_count
+        logger.info("sofascore capture player=%s profile=%s season_xhrs=%d bytes=%.0fKB blocked=%d",
+                    player_id, profile is not None, len(season_buffer), delta / 1024, blocked)
         return {"profile": profile, "season_buffer": season_buffer}
 
     def _drive_season_picker(self, tournament_label: str) -> None:
