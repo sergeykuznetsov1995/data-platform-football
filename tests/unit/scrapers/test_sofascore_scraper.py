@@ -1384,13 +1384,6 @@ class TestReadScheduleViaCapture:
     tournament page (the soccerdata reader is Turnstile-blocked). We patch the
     capture session so no browser is needed and assert the persisted schema."""
 
-    # The 15 columns of bronze.sofascore_schedule (mirrors bronze_schemas.json).
-    _EXPECTED_COLS = {
-        '_batch_id', '_entity_type', '_ingested_at', '_source',
-        'away_score', 'away_team', 'date', 'game', 'game_id',
-        'home_score', 'home_team', 'league', 'round', 'season', 'week',
-    }
-
     def _scraper(self):
         from scrapers.sofascore.scraper import SofaScoreScraper
         with patch('scrapers.base.base_scraper.get_rate_limiter'), \
@@ -1471,22 +1464,26 @@ class TestReadScheduleViaCapture:
         # Exactly the two ut=17 events (901 from ut=16 is filtered out).
         assert df is not None
         assert sorted(df['game_id'].tolist()) == [101, 102]
-        # Persisted schema matches the bronze table (no add/drop columns).
-        assert set(df.columns) == self._EXPECTED_COLS
         # Partition labels: league passthrough + season short form '2526'.
         assert set(df['league']) == {'ENG-Premier League'}
         assert set(df['season']) == {'2526'}
-        # Dtypes the table expects: date timestamp, round/week nullable bigint.
-        assert pd.api.types.is_datetime64_any_dtype(df['date'])
-        assert str(df['round'].dtype) == 'Int64'
-        assert str(df['week'].dtype) == 'Int64'
-        # week/game are NULL placeholders; scores are nullable doubles.
-        assert df['week'].isna().all()
-        assert df['game'].isna().all()
+        # #840: Bronze as-is — source-key names, raw types. Renames + type
+        # derivations (epoch->timestamp, round->bigint) moved to the schedule
+        # consumers (xref_match, team_match, shots).
+        cols = set(df.columns)
+        assert {'game_id', 'home_team_name', 'away_team_name',
+                'home_score_current', 'start_timestamp', 'round_info_round',
+                'status_type'} <= cols
+        assert not ({'date', 'home_team', 'away_team', 'home_score',
+                     'away_score', 'round', 'week', 'game'} & cols)
+        # start_timestamp stays a raw epoch int (no pandas timestamp coercion).
         finished = df[df['game_id'] == 101].iloc[0]
-        assert finished['home_score'] == 2 and finished['away_score'] == 1
+        assert finished['start_timestamp'] == 1719000000
+        assert finished['home_team_name'] == 'Arsenal'
+        assert finished['home_score_current'] == 2 and finished['away_score_current'] == 1
+        # not-started event has no score → NaN in the unioned frame.
         notstarted = df[df['game_id'] == 102].iloc[0]
-        assert pd.isna(notstarted['home_score'])
+        assert pd.isna(notstarted['home_score_current'])
 
     @pytest.mark.unit
     def test_drops_next_season_events_when_page_rolled_over(self):

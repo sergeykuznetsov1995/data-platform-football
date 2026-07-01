@@ -188,7 +188,8 @@ def test_finished_event_ids_only_finished():
 
 
 def test_normalize_event_flattens_row():
-    # Full schedule-row shape (#761): game_id/date/round + NULL week/game.
+    # #840: auto-passthrough — source-key names, nested objects flatten with a
+    # path prefix (homeTeam.name -> home_team_name). Silver renames/derives.
     ev = {
         "id": 15186878, "status": {"type": "finished"},
         "homeTeam": {"name": "USA"}, "awayTeam": {"name": "Australia"},
@@ -196,16 +197,24 @@ def test_normalize_event_flattens_row():
         "startTimestamp": 1719000000,
         "roundInfo": {"round": 7},
     }
-    assert normalize_event(ev) == {
-        "game_id": 15186878, "date": 1719000000,
-        "home_team": "USA", "away_team": "Australia",
-        "home_score": 0, "away_score": 2,
-        "round": 7, "week": None, "game": None,
-    }
+    row = normalize_event(ev)
+    assert row["game_id"] == 15186878
+    assert row["start_timestamp"] == 1719000000       # raw epoch (was `date`)
+    assert row["home_team_name"] == "USA"
+    assert row["away_team_name"] == "Australia"
+    assert row["home_score_current"] == 0
+    assert row["away_score_current"] == 2
+    assert row["round_info_round"] == 7
+    assert row["status_type"] == "finished"           # passthrough bonus
+    # Old renamed/derived names + dropped soccerdata placeholders are gone.
+    for dead in ("date", "home_team", "away_team", "home_score", "away_score",
+                 "round", "week", "game"):
+        assert dead not in row
 
 
 def test_normalize_event_missing_round_and_scores():
-    # A not-started fixture: no roundInfo, scores absent → None placeholders.
+    # A not-started fixture: no roundInfo, scores absent → those columns absent
+    # (#840: absent source key -> absent column, not a None placeholder).
     ev = {
         "id": 999, "status": {"type": "notstarted"},
         "homeTeam": {"name": "Foo"}, "awayTeam": {"name": "Bar"},
@@ -213,9 +222,10 @@ def test_normalize_event_missing_round_and_scores():
     }
     row = normalize_event(ev)
     assert row["game_id"] == 999
-    assert row["round"] is None
-    assert row["home_score"] is None and row["away_score"] is None
-    assert row["week"] is None and row["game"] is None
+    assert row["home_team_name"] == "Foo"
+    assert row["start_timestamp"] == 1720000000
+    assert "round_info_round" not in row
+    assert "home_score_current" not in row and "away_score_current" not in row
 
 
 # --------------------------------------------------------------------------- #

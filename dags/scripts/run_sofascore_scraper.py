@@ -212,12 +212,16 @@ def _resolve_match_ids_from_bronze(
             )
 
         cur = conn.cursor()
+        # #840: Bronze auto-passthrough renamed home_score->home_score_current,
+        # date->start_timestamp. COALESCE bridges pre-#840 partitions; if only
+        # one schema's columns exist the other reference raises and the caller's
+        # except-branch falls back to the capture resolver.
         sql = (
             "SELECT CAST(game_id AS varchar) AS gid "
             "FROM iceberg.bronze.sofascore_schedule "
             "WHERE league = ? AND CAST(season AS varchar) = ? "
-            "  AND home_score IS NOT NULL "
-            "ORDER BY date DESC"
+            "  AND COALESCE(home_score, home_score_current) IS NOT NULL "
+            "ORDER BY COALESCE(start_timestamp, to_unixtime(date)) DESC"
         )
         if limit:
             # Trino dialect: LIMIT goes in SQL; bind params don't bind it.
@@ -233,13 +237,12 @@ def _resolve_match_ids_from_bronze(
         return []
 
 
-# All 15 columns of bronze.sofascore_schedule, explicit (old Trino has no
-# SELECT * EXCEPT, and an explicit list keeps a stable shape for the merge).
-_SCHEDULE_COLUMNS = [
-    '_batch_id', '_entity_type', '_ingested_at', '_source',
-    'away_score', 'away_team', 'date', 'game', 'game_id',
-    'home_score', 'home_team', 'league', 'round', 'season', 'week',
-]
+# Fallback column shape for an EMPTY existing partition (fresh season / Trino
+# unreachable). #840: Bronze is auto-passthrough now, so the live column set
+# evolves — _read_existing_schedule reads it dynamically via SELECT *; this list
+# only shapes the empty DataFrame (which _merge_schedule_partition replaces with
+# the captured rows wholesale anyway).
+_SCHEDULE_COLUMNS = ['game_id', 'league', 'season']
 
 
 def _read_existing_schedule(league: str, season: str):
@@ -260,14 +263,18 @@ def _read_existing_schedule(league: str, season: str):
         return empty
     try:
         cur = conn.cursor()
-        cols = ", ".join(_SCHEDULE_COLUMNS)
+        # #840: schema-agnostic SELECT * — Bronze auto-passthrough evolves the
+        # column set; _merge_schedule_partition reindexes to the captured columns,
+        # so a full-season capture rewrites the partition cleanly on the #840
+        # transition (partial captures then merge in the new schema unchanged).
         cur.execute(
-            f"SELECT {cols} FROM iceberg.bronze.sofascore_schedule "
+            "SELECT * FROM iceberg.bronze.sofascore_schedule "
             "WHERE league = ? AND CAST(season AS varchar) = ?",
             (league, season),
         )
         rows = cur.fetchall()
-        return pd.DataFrame(rows, columns=_SCHEDULE_COLUMNS)
+        cols = [d[0] for d in cur.description]
+        return pd.DataFrame(rows, columns=cols)
     except Exception as e:
         logger.warning(
             "Could not read existing schedule partition (league=%s season=%s): "

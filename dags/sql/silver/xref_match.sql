@@ -160,21 +160,28 @@ us_resolved AS (
 ss_resolved AS (
     SELECT
         CAST(s.game_id AS varchar)                                     AS source_id,
-        TRY_CAST(s.date AS date)                                       AS match_date,
+        -- #840: Bronze auto-passthrough. date is now raw epoch start_timestamp;
+        -- derive here (old TIMESTAMP `date` bridged via COALESCE). home_team ->
+        -- home_team_name; VALUES unchanged so xref_team join is identical.
+        COALESCE(
+            TRY_CAST(s.date AS date),
+            CAST(from_unixtime(s.start_timestamp) AS date)
+        )                                                              AS match_date,
         s.league,
         CAST(s.season AS varchar)                                      AS season,
         xt_h.canonical_id                                              AS home_canonical_id,
         xt_a.canonical_id                                              AS away_canonical_id,
-        CONCAT(s.home_team, ' vs ', s.away_team)                       AS display_name
+        CONCAT(COALESCE(s.home_team, s.home_team_name), ' vs ',
+               COALESCE(s.away_team, s.away_team_name))                AS display_name
     FROM iceberg.bronze.sofascore_schedule s
     LEFT JOIN iceberg.silver.xref_team xt_h
            ON xt_h.source    = 'sofascore'
-          AND xt_h.source_id = s.home_team
+          AND xt_h.source_id = COALESCE(s.home_team, s.home_team_name)
           AND xt_h.league    = s.league
           AND xt_h.season    = CAST(s.season AS varchar)
     LEFT JOIN iceberg.silver.xref_team xt_a
            ON xt_a.source    = 'sofascore'
-          AND xt_a.source_id = s.away_team
+          AND xt_a.source_id = COALESCE(s.away_team, s.away_team_name)
           AND xt_a.league    = s.league
           AND xt_a.season    = CAST(s.season AS varchar)
     WHERE s.game_id IS NOT NULL
