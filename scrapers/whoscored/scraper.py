@@ -46,11 +46,25 @@ from scrapers.base.flaresolverr_client import (
 logger = logging.getLogger(__name__)
 
 
-def _season_to_soccerdata_str(season: int) -> str:
-    """Convert int year (2024) to soccerdata short season format ('2425')."""
-    start = int(season) % 100
-    end = (int(season) + 1) % 100
-    return f"{start:02d}{end:02d}"
+def _season_to_soccerdata_str(season) -> str:
+    """Normalize a 4-digit season token to soccerdata's short 'YYZZ' form.
+
+    Mirrors ``soccerdata.SeasonCode.MULTI_YEAR.parse`` for 4-digit inputs:
+    already-short tokens pass through ('2526' → '2526'; the ambiguous '2021'
+    resolves to the 20/21 season, like soccerdata), year-start values convert
+    (2024 → '2425', 1999 → '9900'). The DAG passes SEASONS_STR short tokens
+    while legacy callers pass year-start ints — both forms must hit the same
+    bronze ``season`` partition values. The old year-only conversion mapped
+    '2526' → '2627' (nonexistent), silently no-op'ing the events scrape.
+    """
+    s = str(season)
+    if len(s) != 4 or not s.isdigit():
+        raise ValueError(f"Unrecognized season token: {season!r}")
+    if (int(s[:2]) + 1) % 100 == int(s[2:]):
+        return s
+    if s[2:] == "99":
+        return "9900"
+    return s[-2:] + f"{(int(s[-2:]) + 1) % 100:02d}"
 
 
 class WhoScoredScraper(SoccerdataScraper):
@@ -63,6 +77,8 @@ class WhoScoredScraper(SoccerdataScraper):
     * ``whoscored_missing_players`` — pre-match injury / suspension list.
     * ``whoscored_season_stages`` — cup vs league stage metadata.
     * ``whoscored_events`` — per-match Opta events (~1500-2000 rows/match).
+    * ``whoscored_lineups`` — per-match lineups + WhoScored player ratings
+      parsed from the same ``matchCentreData`` payload as events (issue #708).
 
     Usage::
 
@@ -242,32 +258,28 @@ class WhoScoredScraper(SoccerdataScraper):
     # ---------- Player profile: FlareSolverr-based ----------
 
     def _resolve_player_ids_from_bronze(
-        self, limit: Optional[int] = None
+        self,
+        league: str,
+        season_str: str,
+        limit: Optional[int] = None,
     ) -> List[str]:
-        """DISTINCT player_id from bronze.whoscored_events (configured league/season).
+        """DISTINCT player_id from bronze.whoscored_events for ONE (league, season).
 
-        ``player_id`` is ``DOUBLE`` in Bronze — the double-cast footgun: a plain
-        ``CAST AS varchar`` yields ``'3.55401E5'``. Cast through ``BIGINT`` first
-        (CLAUDE.md → top footguns). WhoScored has no ratings table, so events is
-        the player roster of record.
+        Per-league resolution keeps multi-league rosters in their own
+        partitions (the old all-leagues query tagged every profile with
+        ``leagues[0]``). ``player_id`` is ``DOUBLE`` in Bronze — the
+        double-cast footgun: a plain ``CAST AS varchar`` yields ``'3.55401E5'``.
+        Cast through ``BIGINT`` first (CLAUDE.md → top footguns).
         """
         from scrapers.base.trino_manager import TrinoTableManager
 
-        leagues = list(self.leagues or [])
-        # bronze.whoscored_events.season is the soccerdata SHORT form ('2526');
-        # SEASONS_STR tokens are already short form, so compare str(token)
-        # directly — NOT via _season_to_soccerdata_str (that expects a year-start
-        # int, 2025→'2526', and would map a short token 2526 to '2627' = no match).
-        season_strs = [str(s) for s in (self.seasons or [])]
-        if not leagues or not season_strs:
+        if not league or not season_str:
             return []
 
-        leagues_in = ", ".join(f"'{l}'" for l in leagues)
-        seasons_in = ", ".join(f"'{s}'" for s in season_strs)
         sql = (
             "SELECT DISTINCT CAST(CAST(player_id AS BIGINT) AS varchar) "
             "FROM iceberg.bronze.whoscored_events "
-            f"WHERE league IN ({leagues_in}) AND season IN ({seasons_in}) "
+            f"WHERE league = '{league}' AND season = '{season_str}' "
             "AND player_id IS NOT NULL"
         )
         if limit:
@@ -302,20 +314,47 @@ class WhoScoredScraper(SoccerdataScraper):
             parse_player_profile,
         )
 
-        league = (self.leagues or [None])[0]
-        # Tag the partition with the bronze short-form season (see resolver note).
-        season_str = str(self.seasons[0]) if self.seasons else None
-
-        if player_ids is None:
-            player_ids = self._resolve_player_ids_from_bronze(limit=limit)
-        if not player_ids:
+        leagues = list(self.leagues or [])
+        # Latest configured season, normalized to the bronze short form.
+        season_str = (
+            _season_to_soccerdata_str(max(self.seasons, key=lambda s: int(s)))
+            if self.seasons else None
+        )
+        if not leagues or not season_str:
             logger.warning(
-                "WhoScored: no player_ids resolved for player_profile "
-                "(league=%s season=%s)", league, season_str,
+                "WhoScored: player_profile needs leagues + seasons configured"
             )
             return {}
-        if limit:
-            player_ids = list(player_ids)[: int(limit)]
+
+        # Resolve the roster PER league so each profile row lands in its own
+        # (league, season) partition — the old code tagged every row with
+        # leagues[0], corrupting multi-league runs. Explicit player_ids apply
+        # to every configured league (smoke runs pass a single league).
+        ids_by_league: Dict[str, List[str]] = {}
+        for league in leagues:
+            ids = (
+                list(player_ids)
+                if player_ids is not None
+                else self._resolve_player_ids_from_bronze(
+                    league, season_str, limit=limit
+                )
+            )
+            if limit:
+                ids = list(ids)[: int(limit)]
+            if ids:
+                ids_by_league[league] = ids
+        if not ids_by_league:
+            logger.warning(
+                "WhoScored: no player_ids resolved for player_profile "
+                "(leagues=%s season=%s)", leagues, season_str,
+            )
+            return {}
+
+        # A player can appear in several leagues (mid-season transfer) — fetch
+        # each profile page once, materialise a row per league below.
+        player_ids = list(dict.fromkeys(
+            pid for ids in ids_by_league.values() for pid in ids
+        ))
 
         # Release the schedule selenium/FS reader before opening our own session.
         self._close_reader()
@@ -342,7 +381,7 @@ class WhoScoredScraper(SoccerdataScraper):
             client.create_session(sid, proxy_url=proxy_url)
             return sid
 
-        rows: List[Dict] = []
+        profiles: Dict[str, Dict] = {}
         try:
             for i, pid in enumerate(player_ids, 1):
                 if i > 1 and (i - 1) % self.PLAYER_PROFILE_SESSION_RECREATE_EVERY == 0:
@@ -366,11 +405,23 @@ class WhoScoredScraper(SoccerdataScraper):
 
                 if not html:
                     continue
-                row = parse_player_profile(html, pid, league, season_str)
+                # The profile page is league-independent; the league tag is
+                # applied per partition below.
+                row = parse_player_profile(html, pid, '', season_str)
                 if row is not None:
-                    rows.append(row)
+                    profiles[pid] = row
         finally:
             client.destroy_session(session_id)
+
+        rows: List[Dict] = []
+        for league, ids in ids_by_league.items():
+            for pid in ids:
+                base = profiles.get(pid)
+                if base is None:
+                    continue
+                row = dict(base)
+                row['league'] = league
+                rows.append(row)
 
         if not rows:
             logger.warning(
@@ -396,23 +447,19 @@ class WhoScoredScraper(SoccerdataScraper):
     # ---------- Events: FlareSolverr-based ----------
 
     def _read_events_metadata_from_bronze(
-        self, target_season: Optional[str] = None
+        self,
     ) -> List[Tuple[int, str, str, str]]:
         """Pull (game_id, league, season, game) tuples from bronze.whoscored_schedule.
 
         Replaces a Cloudflare-prone ``read_schedule`` round-trip during events
-        scraping. Filters by current ``self.leagues`` + ``self.seasons``.
-
-        Args:
-            target_season: Optional 'YYZZ' season; if set, restricts the
-                returned tuples to that season only.
+        scraping. Filters by current ``self.leagues`` + ``self.seasons`` — ALL
+        configured seasons; ``skip_existing`` (not a latest-season cutoff)
+        keeps the steady-state run cheap and lets season gaps self-heal.
         """
         from scrapers.base.trino_manager import TrinoTableManager
 
         leagues = list(self.leagues or [])
         season_strs = [_season_to_soccerdata_str(s) for s in (self.seasons or [])]
-        if target_season:
-            season_strs = [s for s in season_strs if s == target_season]
         if not leagues or not season_strs:
             return []
 
@@ -460,24 +507,24 @@ class WhoScoredScraper(SoccerdataScraper):
           on-disk cache, no soccerdata invocation for events.
 
         Args:
-            match_ids: Optional explicit list. If None, picks latest season
-                from bronze schedule.
+            match_ids: Optional explicit list. If None, takes every game in
+                bronze schedule for the configured leagues/seasons.
             chunk_size: Save to Iceberg every N matches (default 50).
-            skip_existing: If True, skip game_ids already in bronze.
+            skip_existing: If True, skip game_ids already in bronze — a match
+                counts as done only when it has BOTH events and lineups rows;
+                events-only matches (scraped before the lineups table existed)
+                are refetched once and get their lineups backfilled without
+                re-appending events.
             max_matches: Optional cap (smoke / verification runs).
         """
         from scrapers.whoscored.events_fetcher import (
             fetch_match_events_via_flaresolverr,
             parse_matchcentre_to_events_df,
+            parse_matchcentre_to_lineups_df,
         )
 
-        # 1. Resolve game_ids + per-match metadata.
-        target_season_str = (
-            _season_to_soccerdata_str(max(self.seasons))
-            if self.seasons and match_ids is None
-            else None
-        )
-        meta = self._read_events_metadata_from_bronze(target_season_str)
+        # 1. Resolve game_ids + per-match metadata (all configured seasons).
+        meta = self._read_events_metadata_from_bronze()
         if not meta:
             logger.warning(
                 "WhoScored: no rows in bronze.whoscored_schedule — run "
@@ -492,18 +539,27 @@ class WhoScoredScraper(SoccerdataScraper):
             ids = list(meta_by_id.keys())
 
         # 2. Resume — skip already-saved. A transient failure here MUST raise,
-        # not be swallowed: with `done` left empty the whole season would be
-        # re-appended (events save is APPEND-only). TABLE_NOT_FOUND is already
-        # handled inside _fetch_existing_event_game_ids (returns set()).
+        # not be swallowed: with the done-sets left empty the whole season
+        # would be re-appended (both saves are APPEND-only). TABLE_NOT_FOUND is
+        # already handled inside _fetch_existing_event_game_ids (returns set()).
+        done_events: set = set()
+        done_lineups: set = set()
         if skip_existing and ids:
-            done = self._fetch_existing_event_game_ids()
-            if done:
-                before = len(ids)
-                ids = [mid for mid in ids if mid not in done]
-                logger.info(
-                    f"WhoScored: skip_existing — {before - len(ids)} of "
-                    f"{before} already in bronze, {len(ids)} remaining"
-                )
+            done_events = self._fetch_existing_event_game_ids()
+            done_lineups = self._fetch_existing_event_game_ids(
+                table='whoscored_lineups'
+            )
+            before = len(ids)
+            ids = [
+                mid for mid in ids
+                if mid not in done_events or mid not in done_lineups
+            ]
+            lineups_only = sum(1 for mid in ids if mid in done_events)
+            logger.info(
+                f"WhoScored: skip_existing — {before - len(ids)} of {before} "
+                f"already complete, {len(ids)} remaining "
+                f"({lineups_only} lineups-backfill only)"
+            )
 
         if max_matches is not None:
             ids = ids[: int(max_matches)]
@@ -528,7 +584,9 @@ class WhoScoredScraper(SoccerdataScraper):
         )
 
         path: Optional[str] = None
+        lineups_path: Optional[str] = None
         chunk: List[pd.DataFrame] = []
+        lineups_chunk: List[pd.DataFrame] = []
 
         def _pick_proxy_url() -> Optional[str]:
             """Pull a proxy from ProxyManager (preferred) or fall back to
@@ -578,36 +636,47 @@ class WhoScoredScraper(SoccerdataScraper):
             client.create_session(session_id, proxy_url=_pick_proxy_url())
 
         def _flush_chunk(progress: Optional[int] = None) -> None:
-            """Persist accumulated event frames as one Iceberg append, reset.
+            """Persist accumulated event + lineup frames as Iceberg appends.
 
-            Called when the chunk fills mid-loop AND once after the loop — the
+            Called when a chunk fills mid-loop AND once after the loop — the
             post-loop call guards the tail chunk against the final match(es)
             failing (issue #467), where the old ``i == total`` trigger was
             bypassed by ``continue``.
             """
-            nonlocal chunk, path
-            if not chunk:
-                return
-            combined = pd.concat(chunk, ignore_index=True)
-            # JSON-encode list/dict columns (e.g. ``qualifiers``) BEFORE the
-            # Trino INSERT, mirroring the schedule path (see ``_save``). Without
-            # this, ``trino_manager._format_sql_value`` calls ``pd.isna(list)``
-            # and raises "truth value of an empty array is ambiguous" on events
-            # whose ``qualifiers`` is an empty list.
-            combined = self._serialize_nested_columns(combined)
-            combined = self._add_metadata(combined, 'events')
-            path = self.save_to_iceberg(
-                df=combined,
-                table_name='whoscored_events',
-                partition_cols=['league', 'season'],
-            )
+            nonlocal chunk, lineups_chunk, path, lineups_path
             where = (
                 f"{progress}/{total}" if progress is not None else f"final/{total}"
             )
-            logger.info(
-                f"WhoScored: saved chunk @ {where} ({len(combined)} rows)"
-            )
-            chunk = []
+            if chunk:
+                combined = pd.concat(chunk, ignore_index=True)
+                # JSON-encode list/dict columns (e.g. ``qualifiers``) BEFORE the
+                # Trino INSERT, mirroring the schedule path (see ``_save``). Without
+                # this, ``trino_manager._format_sql_value`` calls ``pd.isna(list)``
+                # and raises "truth value of an empty array is ambiguous" on events
+                # whose ``qualifiers`` is an empty list.
+                combined = self._serialize_nested_columns(combined)
+                combined = self._add_metadata(combined, 'events')
+                path = self.save_to_iceberg(
+                    df=combined,
+                    table_name='whoscored_events',
+                    partition_cols=['league', 'season'],
+                )
+                logger.info(
+                    f"WhoScored: saved events chunk @ {where} ({len(combined)} rows)"
+                )
+                chunk = []
+            if lineups_chunk:
+                combined = pd.concat(lineups_chunk, ignore_index=True)
+                combined = self._add_metadata(combined, 'lineups')
+                lineups_path = self.save_to_iceberg(
+                    df=combined,
+                    table_name='whoscored_lineups',
+                    partition_cols=['league', 'season'],
+                )
+                logger.info(
+                    f"WhoScored: saved lineups chunk @ {where} ({len(combined)} rows)"
+                )
+                lineups_chunk = []
 
         try:
             for i, mid in enumerate(ids, 1):
@@ -672,22 +741,42 @@ class WhoScoredScraper(SoccerdataScraper):
                     )
                     continue
 
-                df = parse_matchcentre_to_events_df(
-                    data,
-                    league=league,
-                    season=season,
-                    game_id=mid,
-                    game_name=game_name,
-                )
-                if df is not None and not df.empty:
-                    chunk.append(df.reset_index())
-                else:
-                    logger.warning(
-                        f"WhoScored: no events parsed for game_id={mid} "
-                        f"({i}/{total})"
+                # Events: append only when the match is not already saved —
+                # a lineups-backfill refetch must not duplicate the stream.
+                if mid not in done_events:
+                    df = parse_matchcentre_to_events_df(
+                        data,
+                        league=league,
+                        season=season,
+                        game_id=mid,
+                        game_name=game_name,
                     )
+                    if df is not None and not df.empty:
+                        chunk.append(df.reset_index())
+                    else:
+                        logger.warning(
+                            f"WhoScored: no events parsed for game_id={mid} "
+                            f"({i}/{total})"
+                        )
 
-                if len(chunk) >= chunk_size:
+                # Lineups / ratings from the same payload (zero extra traffic).
+                if mid not in done_lineups:
+                    lineup_df = parse_matchcentre_to_lineups_df(
+                        data,
+                        league=league,
+                        season=season,
+                        game_id=mid,
+                        game_name=game_name,
+                    )
+                    if lineup_df is not None and not lineup_df.empty:
+                        lineups_chunk.append(lineup_df.reset_index())
+                    else:
+                        logger.warning(
+                            f"WhoScored: no lineups parsed for game_id={mid} "
+                            f"({i}/{total})"
+                        )
+
+                if len(chunk) >= chunk_size or len(lineups_chunk) >= chunk_size:
                     _flush_chunk(i)
             # Final flush — guards the tail chunk when the last match(es) gave
             # up via `continue` and never tripped the in-loop flush (issue #467).
@@ -702,10 +791,14 @@ class WhoScoredScraper(SoccerdataScraper):
         # (issue #616). The client accumulated across all session recycles.
         self._last_events_traffic = client.get_traffic_stats()
 
-        if path is None:
+        out: Dict[str, str] = {}
+        if path:
+            out['events'] = path
+        if lineups_path:
+            out['lineups'] = lineups_path
+        if not out:
             logger.warning("WhoScored: events scrape produced no rows")
-            return {}
-        return {'events': path}
+        return out
 
     # ---------- Helpers ----------
 
@@ -736,8 +829,10 @@ class WhoScoredScraper(SoccerdataScraper):
             return f"http://{user}:{pw}@{host}:{port}"
         return self.proxy
 
-    def _fetch_existing_event_game_ids(self) -> set:
-        """Query bronze.whoscored_events for already-saved game_ids."""
+    def _fetch_existing_event_game_ids(
+        self, table: str = 'whoscored_events'
+    ) -> set:
+        """Query a bronze per-match table for already-saved game_ids."""
         from scrapers.base.trino_manager import TrinoTableManager
         season_strs = [
             _season_to_soccerdata_str(s) for s in (self.seasons or [])
@@ -749,7 +844,7 @@ class WhoScoredScraper(SoccerdataScraper):
         seasons_in = ", ".join(f"'{s}'" for s in season_strs)
         sql = (
             f"SELECT DISTINCT game_id "
-            f"FROM iceberg.bronze.whoscored_events "
+            f"FROM iceberg.bronze.{table} "
             f"WHERE league IN ({leagues_in}) AND season IN ({seasons_in})"
         )
         mgr = TrinoTableManager()
