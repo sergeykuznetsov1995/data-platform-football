@@ -40,6 +40,7 @@ from scrapers.fbref.html_parser import (
     parse_events_from_scorebox,
     parse_team_match_stats_table,
     parse_player_match_stats_tables,
+    parse_keeper_match_stats_tables,
     parse_match_managers,
     parse_match_officials,
     diagnose_html_structure,
@@ -700,6 +701,204 @@ class FBrefDataReaderMixin:
         return results
 
     # ------------------------------------------------------------------
+    # Combined season stats: one fetch per page, all tables parsed
+    # ------------------------------------------------------------------
+
+    # Season page plan: (url_stat_type, [(data_category, stat_type), ...]).
+    # Player and squad stats share the same URL for 'stats'/'shooting'/'misc'
+    # (url_builder.get_stats_url builds an identical URL for both) — the squad
+    # tables sit in the main DOM and the player table hides in an HTML
+    # comment, so ONE fetch feeds BOTH bronze tables. 'playingtime' is the
+    # only split case (player /playingtime/ vs squad /playing_time/):
+    # _parse_season_page falls back to the squad URL when the squad table is
+    # missing from the player page. 5 fetches replace the 9 the separate
+    # single_stat tasks used to make.
+    _SEASON_PAGE_PLAN = [
+        ('stats', (('player', 'stats'), ('team', 'stats'))),
+        ('shooting', (('player', 'shooting'), ('team', 'shooting'))),
+        ('playingtime', (('player', 'playingtime'), ('team', 'playingtime'))),
+        ('misc', (('player', 'misc'), ('team', 'misc'))),
+        ('keeper', (('keeper', 'keeper'),)),
+    ]
+
+    def _parse_season_page(
+        self,
+        league: str,
+        season: int,
+        url_stat_type: str,
+        extracts,
+    ) -> Dict[str, pd.DataFrame]:
+        """Fetch ONE season stats page and parse all its tables.
+
+        Returns {'{category}_{stat_type}': DataFrame} for every extract that
+        produced data. Missing tables are logged and skipped, except the
+        squad playingtime table which gets one extra fetch of the dedicated
+        squad URL (/playing_time/) before giving up.
+        """
+        url = get_stats_url(league, season, url_stat_type, for_squads=False)
+        logger.debug(f"Fetching FBref season page ({url_stat_type}): {url}")
+
+        html = self._fetch_page(url, page_type='season_stat')
+        if not html:
+            logger.warning(
+                f"Season page fetch failed for {league} {season} ({url_stat_type})"
+            )
+            return {}
+
+        soup = BeautifulSoup(html, 'html.parser')
+        comment_tables = extract_tables_from_comments(soup)
+
+        out: Dict[str, pd.DataFrame] = {}
+        for category, stat_type in extracts:
+            if category == 'team':
+                df = find_team_stats_table(soup, comment_tables, stat_type)
+                if (df is None or df.empty) and url_stat_type == 'playingtime':
+                    # Squad playing time lives on its own URL (/playing_time/)
+                    # if it's absent from the player page — one extra fetch.
+                    squad_url = get_stats_url(
+                        league, season, stat_type, for_squads=True
+                    )
+                    if squad_url != url:
+                        logger.warning(
+                            f"Squad playingtime table missing on {url}, "
+                            f"fetching dedicated squad URL"
+                        )
+                        squad_html = self._fetch_page(
+                            squad_url, page_type='season_stat'
+                        )
+                        if squad_html:
+                            squad_soup = BeautifulSoup(squad_html, 'html.parser')
+                            squad_comments = extract_tables_from_comments(squad_soup)
+                            df = find_team_stats_table(
+                                squad_soup, squad_comments, stat_type
+                            )
+            else:
+                # 'player' and 'keeper' both use the player-table finder
+                df = find_player_stats_table(soup, comment_tables, stat_type)
+
+            if df is None or df.empty:
+                logger.warning(
+                    f"No {category}_{stat_type} table for {league} {season} "
+                    f"on season page '{url_stat_type}'"
+                )
+                continue
+
+            # Clean player names (remove rank numbers) — mirrors read_*
+            if category in ('player', 'keeper') and 'Player' in df.columns:
+                df['Player'] = df['Player'].astype(str).str.replace(
+                    r'^\d+\s*', '', regex=True
+                )
+
+            df['league'] = league
+            df['season'] = season
+            df['stat_type'] = stat_type
+            df = self._add_metadata(df, f'{category}_stats_{stat_type}')
+            out[f'{category}_{stat_type}'] = df
+
+        return out
+
+    def scrape_combined_season_stats(
+        self,
+        force_replace: bool = False,
+    ) -> Dict[str, object]:
+        """Scrape ALL season stats (player + team + keeper) in one pass.
+
+        Replaces the nine separate single_stat runs: each unique season page
+        is downloaded once (5 pages per league/season instead of 9) and every
+        table on it feeds its own bronze table. Reuses the HTTP fast-path in
+        _fetch_page, so only the first request pays the CF-bypass cost.
+
+        Each of the 9 tables is saved independently with the same
+        replace_partitions + completeness guard semantics as
+        scrape_single_stat_type — a ReplaceGuardError on one table does not
+        block the others.
+
+        Args:
+            force_replace: Bypass the completeness guard (#513/#583) for a
+                deliberate first backfill.
+
+        Returns:
+            {'tables': {key: iceberg_path}, 'guard_refusals': [msg],
+             'errors': [msg]}
+        """
+        from scrapers.base.base_scraper import ReplaceGuardError
+
+        logger.info(
+            f"Starting combined season stats scrape: "
+            f"leagues={self.leagues}, seasons={self.seasons}"
+        )
+
+        buffers: Dict[str, List[pd.DataFrame]] = {}
+
+        for league in self.leagues:
+            for season in self.seasons:
+                for url_stat_type, extracts in self._SEASON_PAGE_PLAN:
+                    try:
+                        parsed = self._parse_season_page(
+                            league, season, url_stat_type, extracts
+                        )
+                    except Exception as e:
+                        logger.error(
+                            f"Error parsing season page '{url_stat_type}' "
+                            f"for {league} {season}: {e}"
+                        )
+                        continue
+
+                    for key, df in parsed.items():
+                        buffers.setdefault(key, []).append(df)
+                        logger.info(
+                            f"Collected {len(df)} rows for {key} "
+                            f"({league}, {season})"
+                        )
+
+                    # Rate limiting between pages (mirrors single_stat)
+                    time.sleep(1)
+
+            self._cleanup_after_league()
+
+        results: Dict[str, str] = {}
+        guard_refusals: List[str] = []
+        errors: List[str] = []
+
+        for key, frames in buffers.items():
+            combined_df = pd.concat(frames, ignore_index=True)
+            table_name = f'fbref_{key}'
+            try:
+                # Same semantics as scrape_single_stat_type (#536, #513/#583)
+                table_path = self.save_to_iceberg(
+                    df=combined_df,
+                    table_name=table_name,
+                    partition_cols=['league', 'season'],
+                    replace_partitions=['league', 'season'],
+                    min_replace_ratio=(None if force_replace else 0.9),
+                )
+                results[key] = table_path
+                logger.info(f"Saved {len(combined_df)} rows to {table_name}")
+            except ReplaceGuardError as e:
+                msg = f"{table_name}: {e}"
+                guard_refusals.append(msg)
+                logger.error(f"Replace guard refused {table_name}: {e}")
+            except Exception as e:
+                msg = f"{table_name}: {e}"
+                errors.append(msg)
+                logger.error(f"Error saving {table_name}: {e}", exc_info=True)
+
+        expected_keys = {
+            f'{cat}_{stat}'
+            for _, extracts in self._SEASON_PAGE_PLAN
+            for cat, stat in extracts
+        }
+        missing = sorted(expected_keys - set(buffers))
+        if missing:
+            logger.warning(f"No data collected for: {missing}")
+
+        return {
+            'tables': results,
+            'guard_refusals': guard_refusals,
+            'errors': errors,
+        }
+
+    # ------------------------------------------------------------------
     # Combined match data: helpers
     # ------------------------------------------------------------------
 
@@ -720,10 +919,11 @@ class FBrefDataReaderMixin:
         all_match_player_stats: List[pd.DataFrame] = None,
         all_match_managers: List[pd.DataFrame] = None,
         all_match_officials: List[pd.DataFrame] = None,
+        all_match_keeper_stats: List[pd.DataFrame] = None,
     ) -> Set[str]:
         """
         Process a single match page: extract shots, events, lineups,
-        team match stats, and player match stats.
+        team match stats, player match stats, and keeper match stats.
 
         Parses HTML once with BeautifulSoup and calls parsers directly,
         avoiding redundant BS4 parsing that read_* methods would do.
@@ -815,6 +1015,18 @@ class FBrefDataReaderMixin:
                 all_match_officials.append(officials_df)
                 got_types.add('match_officials')
 
+        # Keeper match stats (keeper_stats_{team_id} tables — basic GK
+        # columns still populated after the Apr-2026 FBref restriction)
+        if all_match_keeper_stats is not None:
+            keeper_df = parse_keeper_match_stats_tables(soup, comment_tables)
+            if keeper_df is not None and not keeper_df.empty:
+                keeper_df['match_id'] = match_id
+                keeper_df['league'] = league
+                keeper_df['season'] = season
+                keeper_df = self._add_metadata(keeper_df, 'match_keeper_stats')
+                all_match_keeper_stats.append(keeper_df)
+                got_types.add('match_keeper_stats')
+
         # Free memory: decompose soup tree and remove from cache
         soup.decompose()
         del comment_tables
@@ -851,6 +1063,7 @@ class FBrefDataReaderMixin:
         all_match_player_stats: List[pd.DataFrame] = None,
         all_match_managers: List[pd.DataFrame] = None,
         all_match_officials: List[pd.DataFrame] = None,
+        all_match_keeper_stats: List[pd.DataFrame] = None,
     ) -> None:
         """
         Save accumulated match data to Iceberg and clear the lists.
@@ -881,6 +1094,7 @@ class FBrefDataReaderMixin:
             (all_match_player_stats, 'fbref_match_player_stats', 'match_player_stats', ['match_id']),
             (all_match_managers, 'fbref_match_managers', 'match_managers', ['match_id']),
             (all_match_officials, 'fbref_match_officials', 'match_officials', ['match_id']),
+            (all_match_keeper_stats, 'fbref_match_keeper_stats', 'match_keeper_stats', ['match_id']),
         ]
 
         for data_list, table_name, result_key, replace_keys in save_items:
@@ -1209,6 +1423,7 @@ class FBrefDataReaderMixin:
         all_match_player_stats = []
         all_match_managers = []
         all_match_officials = []
+        all_match_keeper_stats = []
 
         total_matches_processed = 0
         total_pages_fetched = 0
@@ -1222,6 +1437,7 @@ class FBrefDataReaderMixin:
             all_match_player_stats=all_match_player_stats,
             all_match_managers=all_match_managers,
             all_match_officials=all_match_officials,
+            all_match_keeper_stats=all_match_keeper_stats,
         )
 
         for league in self.leagues:
@@ -1326,6 +1542,7 @@ class FBrefDataReaderMixin:
                                 all_match_team_stats, all_match_player_stats,
                                 all_match_managers,
                                 all_match_officials,
+                                all_match_keeper_stats,
                             )
 
                             if got_types:
@@ -1405,6 +1622,7 @@ class FBrefDataReaderMixin:
                                     all_match_team_stats, all_match_player_stats,
                                     all_match_managers,
                                     all_match_officials,
+                                    all_match_keeper_stats,
                                 )
                                 if got_types and 'match_player_stats' in got_types:
                                     recovered += 1
