@@ -102,6 +102,62 @@ class TestBackfillCommand:
 
 
 @pytest.mark.unit
+class TestValidateData:
+    """validate_data: the low-rows threshold scales with len(LEAGUES).
+
+    The old hard-coded ``rows < 100`` fired on EVERY daily run — with
+    LEAGUES=['ENG-Premier League'] a full healthy snapshot is ~20 rows — so
+    the warning was permanent noise. sofifa precedent: thresholds derive from
+    len(LEAGUES) (utils/config.py).
+    """
+
+    def _run_validate(self, tmp_path, monkeypatch, payload, leagues):
+        import json
+
+        import utils.clubelo_tasks as ct
+        import utils.config as config
+
+        result_file = tmp_path / 'clubelo_result.json'
+        result_file.write_text(json.dumps(payload))
+        monkeypatch.setattr(ct, 'RESULTS_PATH', str(result_file))
+        monkeypatch.setattr(config, 'LEAGUES', leagues)
+        return ct.validate_data()
+
+    def test_healthy_single_league_run_has_no_low_rows_warning(
+        self, tmp_path, monkeypatch
+    ):
+        # 20 clubs = a full Premier League snapshot → healthy, no warning.
+        res = self._run_validate(
+            tmp_path, monkeypatch,
+            {'rows': 20, 'tables': ['iceberg.bronze.clubelo_ratings'],
+             'rating_date': '2026-07-01'},
+            ['ENG-Premier League'],
+        )
+        assert res['status'] == 'success'
+        assert not any('Low ratings count' in w for w in res['warnings'])
+
+    def test_low_rows_still_warns(self, tmp_path, monkeypatch):
+        # 10 rows for one league (< 15/league) → genuine shrink, warn.
+        res = self._run_validate(
+            tmp_path, monkeypatch,
+            {'rows': 10, 'tables': ['iceberg.bronze.clubelo_ratings'],
+             'rating_date': '2026-07-01'},
+            ['ENG-Premier League'],
+        )
+        assert any('Low ratings count' in w for w in res['warnings'])
+
+    def test_threshold_scales_with_league_count(self, tmp_path, monkeypatch):
+        # 20 rows would be fine for 1 league but is low for 2 (< 2×15).
+        res = self._run_validate(
+            tmp_path, monkeypatch,
+            {'rows': 20, 'tables': ['iceberg.bronze.clubelo_ratings'],
+             'rating_date': '2026-07-01'},
+            ['ENG-Premier League', 'ESP-La Liga'],
+        )
+        assert any('Low ratings count' in w for w in res['warnings'])
+
+
+@pytest.mark.unit
 class TestGateFullRatings:
     """gate_full_ratings: Sunday OWN run or manual run_full=True; else skip."""
 
