@@ -25,14 +25,30 @@ from utils.config import CURRENT_SEASON, DAG_TAGS, LEAGUES, SCHEDULES
 from utils.default_args import SCRAPER_ARGS
 
 
-SALARIES_RESULT_PATH = '/tmp/capology_player_salaries_result.json'
+SALARIES_RESULT_TMPL = '/tmp/capology_player_salaries_{slug}_result.json'
 
-# Capology ships the whole APL season (~526 rows) in one response — no smoke
+# Capology ships the whole season (~500 rows) in one response — no smoke
 # cap needed; we want the full snapshot on every weekly run.
 SALARIES_DAILY_LIMIT: int = None
 
 # MVP currency scope per issue #43. EUR/USD lift is a separate followup.
 DEFAULT_CURRENCY: str = 'GBP'
+
+# Per-league soft floor on salary rows: clubs × ~25 players, floored at ~80%.
+# 20-club leagues → 400; 18-club (Bundesliga / Ligue 1) → 360.
+LEAGUE_ROW_FLOORS = {
+    'ENG-Premier League': 400,
+    'ESP-La Liga': 400,
+    'ITA-Serie A': 400,
+    'GER-Bundesliga': 360,
+    'FRA-Ligue 1': 360,
+}
+DEFAULT_ROW_FLOOR = 360
+
+
+def _league_slug(league: str) -> str:
+    """``'ENG-Premier League'`` → ``'eng_premier_league'`` (task-id / path safe)."""
+    return league.lower().replace(' ', '_').replace('-', '_')
 
 
 def _load_result(path: str, logger) -> Dict[str, Any]:
@@ -49,48 +65,70 @@ def _load_result(path: str, logger) -> Dict[str, Any]:
 
 
 def validate_data(**context) -> Dict[str, Any]:
-    """Aggregate per-entity row counts + flag soft fallbacks."""
+    """Aggregate per-league salary row counts + flag soft fallbacks."""
     import logging
 
     logger = logging.getLogger(__name__)
-    salaries = _load_result(SALARIES_RESULT_PATH, logger)
-
-    if not salaries:
-        raise AirflowException(
-            f"Salaries results file {SALARIES_RESULT_PATH} missing"
-        )
 
     validation = {
         'status': 'success',
         'warnings': [],
         'summary': {
-            'salary_rows': salaries.get('rows', 0),
-            'unique_players': salaries.get('players_with_rows', 0),
-            'currency': salaries.get('currency', DEFAULT_CURRENCY),
-            'fallback': salaries.get('fallback', False),
-            'tables': salaries.get('tables', []),
+            'salary_rows': 0,
+            'unique_players': 0,
+            'currency': DEFAULT_CURRENCY,
+            'leagues': {},
         },
     }
+    files_found = 0
 
-    errors: List[str] = list(salaries.get('errors', []) or [])
-    if errors:
-        validation['warnings'] = errors
-        validation['status'] = (
-            'partial_success' if validation['summary']['salary_rows'] > 0 else 'failed'
+    for league in LEAGUES:
+        path = SALARIES_RESULT_TMPL.format(slug=_league_slug(league))
+        salaries = _load_result(path, logger)
+        if not salaries:
+            validation['warnings'].append(
+                f"{league}: salaries results file {path} missing"
+            )
+            validation['summary']['leagues'][league] = {'salary_rows': 0}
+            continue
+        files_found += 1
+
+        rows = salaries.get('rows', 0)
+        fallback = salaries.get('fallback', False)
+        validation['summary']['salary_rows'] += rows
+        validation['summary']['unique_players'] += salaries.get(
+            'players_with_rows', 0,
+        )
+        validation['summary']['leagues'][league] = {
+            'salary_rows': rows,
+            'fallback': fallback,
+            'tables': salaries.get('tables', []),
+        }
+
+        errors: List[str] = list(salaries.get('errors', []) or [])
+        validation['warnings'].extend(f"{league}: {e}" for e in errors)
+
+        floor = LEAGUE_ROW_FLOORS.get(league, DEFAULT_ROW_FLOOR)
+        if rows < floor:
+            if fallback:
+                validation['warnings'].append(
+                    f"{league}: player_salaries CAPOLOGY_FALLBACK rows={rows}"
+                )
+            else:
+                validation['warnings'].append(
+                    f"{league}: low salary row count {rows} < {floor}"
+                )
+
+    if files_found == 0:
+        raise AirflowException(
+            f"No salaries results files found for any league in {LEAGUES}"
         )
 
-    # APL has 20 clubs × ~25 players ≈ 500 salaries — soft floor at 400.
-    if validation['summary']['salary_rows'] < 400:
-        if validation['summary']['fallback']:
-            validation['warnings'].append(
-                f"player_salaries CAPOLOGY_FALLBACK: rows={validation['summary']['salary_rows']}"
-            )
-            if validation['status'] == 'success':
-                validation['status'] = 'partial_success'
-        else:
-            validation['warnings'].append(
-                f"Low salary row count: {validation['summary']['salary_rows']} < 400"
-            )
+    if validation['warnings']:
+        validation['status'] = (
+            'partial_success'
+            if validation['summary']['salary_rows'] > 0 else 'failed'
+        )
 
     logger.info("Validation: status=%s summary=%s", validation['status'], validation['summary'])
     if validation['warnings']:
@@ -113,6 +151,9 @@ with DAG(
         ['scraping', 'capology', 'bronze', 'football', 'salaries'],
     ),
     max_active_runs=1,
+    # Fan-out is per (league, product); cap concurrent tasks so parallel
+    # subprocesses can't burst-request Capology (>5 req/s trips CF).
+    max_active_tasks=4,
     params={'leagues': LEAGUES, 'season': CURRENT_SEASON},
     doc_md=f"""
     ## Capology Data Ingestion (Issue #43)
@@ -121,9 +162,11 @@ with DAG(
 
     ### Architecture
 
-    - BashOperator runs the scraper in an isolated subprocess.
+    - One BashOperator per (league, product) runs the scraper in an
+      isolated subprocess — fan-out over ``utils.config.LEAGUES``.
     - ``validate_data`` (PythonOperator, ``trigger_rule='all_done'``)
-      summarises row counts and flags soft CAPOLOGY_FALLBACK exits.
+      summarises per-league row counts and flags soft CAPOLOGY_FALLBACK
+      exits (row floor per league via ``LEAGUE_ROW_FLOORS``).
 
     ### Bronze table
     - ``iceberg.bronze.capology_player_salaries``
@@ -136,57 +179,40 @@ with DAG(
     """,
 ) as dag:
 
-    league = LEAGUES[0]
     season = CURRENT_SEASON
 
     salaries_limit_arg = (
         f' --limit {SALARIES_DAILY_LIMIT}' if SALARIES_DAILY_LIMIT else ''
     )
 
-    scrape_salaries_task = BashOperator(
-        task_id='scrape_player_salaries',
-        bash_command=f"""
-cd /opt/airflow && \\
-rm -f {SALARIES_RESULT_PATH} && \\
-python dags/scripts/run_capology_scraper.py \\
-    --entity player_salaries \\
-    --league "{league}" \\
-    --season {season} \\
-    --currency {DEFAULT_CURRENCY}{salaries_limit_arg} \\
-    --output {SALARIES_RESULT_PATH}
-rc=$?
-if [ $rc -eq 2 ]; then
-    echo "CAPOLOGY_FALLBACK exit-code 2 — propagating as soft success."
-    exit 0
-fi
-exit $rc
-""",
-        env={
-            'PYTHONPATH': '/opt/airflow:/opt/airflow/dags',
-            'PATH': '/usr/local/bin:/usr/bin:/bin:/home/airflow/.local/bin',
-            'HOME': '/home/airflow',
-        },
-        append_env=True,
-    )
+    _TASK_ENV = {
+        'PYTHONPATH': '/opt/airflow:/opt/airflow/dags',
+        'PATH': '/usr/local/bin:/usr/bin:/bin:/home/airflow/.local/bin',
+        'HOME': '/home/airflow',
+    }
 
-    # The other three APL data products (issue #321): same runner, one
-    # BashOperator each, partition (league, season). All soft-fall back on a
-    # CAPOLOGY_FALLBACK exit-code-2 like salaries do.
+    # Fan-out: one BashOperator per (league, product). Salaries + the three
+    # club/contract products (issue #321); every league in utils.config
+    # LEAGUES is scraped (previously only LEAGUES[0]). All tasks soft-fall
+    # back on a CAPOLOGY_FALLBACK exit-code-2.
     PRODUCT_ENTITIES = [
         'team_payrolls', 'contract_extensions', 'transfer_window',
     ]
-    product_tasks = []
-    for _entity in PRODUCT_ENTITIES:
-        _task = BashOperator(
-            task_id=f'scrape_{_entity}',
+    scrape_tasks = []
+    for _league in LEAGUES:
+        _slug = _league_slug(_league)
+        _salaries_result = SALARIES_RESULT_TMPL.format(slug=_slug)
+        scrape_tasks.append(BashOperator(
+            task_id=f'scrape_player_salaries_{_slug}',
             bash_command=f"""
 cd /opt/airflow && \\
-rm -f /tmp/capology_{_entity}_result.json && \\
+rm -f {_salaries_result} && \\
 python dags/scripts/run_capology_scraper.py \\
-    --entity {_entity} \\
-    --league "{league}" \\
+    --entity player_salaries \\
+    --league "{_league}" \\
     --season {season} \\
-    --output /tmp/capology_{_entity}_result.json
+    --currency {DEFAULT_CURRENCY}{salaries_limit_arg} \\
+    --output {_salaries_result}
 rc=$?
 if [ $rc -eq 2 ]; then
     echo "CAPOLOGY_FALLBACK exit-code 2 — propagating as soft success."
@@ -194,14 +220,31 @@ if [ $rc -eq 2 ]; then
 fi
 exit $rc
 """,
-            env={
-                'PYTHONPATH': '/opt/airflow:/opt/airflow/dags',
-                'PATH': '/usr/local/bin:/usr/bin:/bin:/home/airflow/.local/bin',
-                'HOME': '/home/airflow',
-            },
+            env=_TASK_ENV,
             append_env=True,
-        )
-        product_tasks.append(_task)
+        ))
+        for _entity in PRODUCT_ENTITIES:
+            _result = f'/tmp/capology_{_entity}_{_slug}_result.json'
+            scrape_tasks.append(BashOperator(
+                task_id=f'scrape_{_entity}_{_slug}',
+                bash_command=f"""
+cd /opt/airflow && \\
+rm -f {_result} && \\
+python dags/scripts/run_capology_scraper.py \\
+    --entity {_entity} \\
+    --league "{_league}" \\
+    --season {season} \\
+    --output {_result}
+rc=$?
+if [ $rc -eq 2 ]; then
+    echo "CAPOLOGY_FALLBACK exit-code 2 — propagating as soft success."
+    exit 0
+fi
+exit $rc
+""",
+                env=_TASK_ENV,
+                append_env=True,
+            ))
 
     validate_task = PythonOperator(
         task_id='validate_data',
@@ -212,9 +255,11 @@ exit $rc
     def _validate_bronze_quality(**ctx) -> None:
         """Trino-level CHECK gate over bronze.capology_player_salaries.
 
-        row_count / no_duplicates are ERROR-severity (promoted after green
-        weekly runs, issue #48); no_nulls / freshness stay WARNING so a
-        CAPOLOGY_FALLBACK soft-exit doesn't hard-fail the gate.
+        One check set per league in LEAGUES (row floor from
+        LEAGUE_ROW_FLOORS). row_count / no_duplicates are ERROR-severity
+        (promoted after green weekly runs, issue #48); no_nulls / freshness
+        stay WARNING so a CAPOLOGY_FALLBACK soft-exit doesn't hard-fail the
+        gate.
         """
         from utils.data_quality import CHECK, run_checks
 
@@ -222,31 +267,34 @@ exit $rc
             f"{str(CURRENT_SEASON)[2:4]}"
             f"{(int(str(CURRENT_SEASON)[2:4]) + 1) % 100:02d}"
         )
-        where = (
-            f"league = '{LEAGUES[0]}' AND season = '{season_short}' "
-            f"AND currency = '{DEFAULT_CURRENCY}'"
-        )
-        checks = [
-            CHECK.row_count(
-                'bronze.capology_player_salaries',
-                min_rows=400, where=where, severity='ERROR',
-            ),
-            CHECK.no_duplicates(
-                'bronze.capology_player_salaries',
-                pk=['league', 'season', 'currency', 'player_slug', 'club_slug'],
-                where=where, severity='ERROR',
-            ),
-            CHECK.no_nulls(
-                'bronze.capology_player_salaries',
-                cols=['player_slug', 'player_name'],
-                where=where, severity='WARNING',
-            ),
-            CHECK.freshness(
-                'bronze.capology_player_salaries',
-                ts_col='_ingested_at', max_age_hours=48,
-                where=where, severity='WARNING',
-            ),
-        ]
+        checks = []
+        for league in LEAGUES:
+            where = (
+                f"league = '{league}' AND season = '{season_short}' "
+                f"AND currency = '{DEFAULT_CURRENCY}'"
+            )
+            checks += [
+                CHECK.row_count(
+                    'bronze.capology_player_salaries',
+                    min_rows=LEAGUE_ROW_FLOORS.get(league, DEFAULT_ROW_FLOOR),
+                    where=where, severity='ERROR',
+                ),
+                CHECK.no_duplicates(
+                    'bronze.capology_player_salaries',
+                    pk=['league', 'season', 'currency', 'player_slug', 'club_slug'],
+                    where=where, severity='ERROR',
+                ),
+                CHECK.no_nulls(
+                    'bronze.capology_player_salaries',
+                    cols=['player_slug', 'player_name'],
+                    where=where, severity='WARNING',
+                ),
+                CHECK.freshness(
+                    'bronze.capology_player_salaries',
+                    ts_col='_ingested_at', max_age_hours=48,
+                    where=where, severity='WARNING',
+                ),
+            ]
         report = run_checks(checks, raise_on_error=True)
         import logging
         logging.getLogger(__name__).info(
@@ -269,5 +317,5 @@ exit $rc
         reset_dag_run=True,
     )
 
-    [scrape_salaries_task, *product_tasks] >> validate_task \
+    scrape_tasks >> validate_task \
         >> validate_bronze_quality_task >> trigger_silver_task

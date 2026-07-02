@@ -65,6 +65,35 @@ def test_zero_traffic_shape(scraper):
     assert scraper.get_traffic_stats() == {
         'proxy_response_bytes': 0,
         'proxy_response_mb': 0.0,
+        'proxied': False,
         'requests': 0,
         'top_traffic_urls': [],
     }
+
+
+@pytest.mark.unit
+def test_proxied_flag_set_when_proxy_configured(scraper, monkeypatch):
+    """Once a session is built over a proxy, `proxied` flips True so the
+    runner persists the run to proxy_traffic_runs; direct runs stay False
+    and are skipped (no residential spend to attribute)."""
+    import sys
+    from unittest.mock import MagicMock
+
+    monkeypatch.setitem(sys.modules, 'tls_requests', MagicMock())
+    scraper.proxy = 'http://user:pass@127.0.0.1:8080'
+
+    scraper._build_tls_session()
+
+    assert scraper.get_traffic_stats()['proxied'] is True
+
+
+@pytest.mark.unit
+def test_proxied_stays_false_on_direct_session(scraper, monkeypatch):
+    import sys
+    from unittest.mock import MagicMock
+
+    monkeypatch.setitem(sys.modules, 'tls_requests', MagicMock())
+
+    scraper._build_tls_session()
+
+    assert scraper.get_traffic_stats()['proxied'] is False
