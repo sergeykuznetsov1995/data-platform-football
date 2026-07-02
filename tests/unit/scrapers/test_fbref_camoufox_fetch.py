@@ -1,6 +1,11 @@
 """Unit tests for the FBref Camoufox transport (Turnstile solver, resource
-blocking, byte accounting, proxy rotation) — all with a faked Playwright page,
-no real browser. The live end-to-end fetch is covered by a sandbox e2e run."""
+blocking, byte accounting, proxy rotation) and the FBrefBrowserMixin camoufox
+fetch path (validation, proxy health, curl_cffi fast-path) — all with faked
+Playwright pages / mocked transports, no real browser. The live end-to-end
+fetch is covered by a sandbox e2e run."""
+
+from collections import Counter
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -42,6 +47,27 @@ class TestShouldBlockRequest:
         assert should_block_request(
             "script", "https://fbref.com/cdn-cgi/challenge-platform/h/b/x.js"
         ) is False
+
+    @pytest.mark.unit
+    def test_blocks_fbref_autocomplete_cache(self):
+        # ~1.65 MB search_list.csv — top per-URL consumer in the #616 audit.
+        assert should_block_request(
+            "xhr", "https://fbref.com/short/inc/players_search_list.csv"
+        ) is True
+
+    @pytest.mark.unit
+    def test_block_scripts_flag(self):
+        url = "https://fbref.com/static/js/sr.min.js"
+        # Off by default — scripts pass.
+        assert should_block_request("script", url) is False
+        # FBREF_CAMOUFOX_BLOCK_SCRIPTS=1 → first-party scripts blocked...
+        assert should_block_request("script", url, block_scripts=True) is True
+        # ...but Cloudflare challenge JS and documents still pass.
+        assert should_block_request(
+            "script", "https://challenges.cloudflare.com/turnstile/v0/x.js",
+            block_scripts=True,
+        ) is False
+        assert should_block_request("document", url, block_scripts=True) is False
 
 
 class TestIsCloudflareBlocked:
@@ -90,6 +116,14 @@ class _FakeFrame:
         return _Loc()
 
 
+class _FakeContext:
+    def __init__(self, cookies=None):
+        self._cookies = cookies or []
+
+    def cookies(self, _urls=None):
+        return self._cookies
+
+
 class _FakePage:
     """Configurable fake: ``table_after`` polls return has_table=True; frames
     expose a Turnstile iframe with a bounding box for the click path."""
@@ -107,6 +141,7 @@ class _FakePage:
         self.mouse = _FakeMouse()
         self._eval_calls = 0
         self.goto_calls = []
+        self.context = _FakeContext()
 
     def title(self):
         return self._title
@@ -117,6 +152,9 @@ class _FakePage:
             if self._table_after is None:  # never shows a table
                 return False
             return self._eval_calls >= self._table_after
+        if "navigator.userAgent" in js:
+            return ("Mozilla/5.0 (X11; Linux x86_64; rv:135.0) "
+                    "Gecko/20100101 Firefox/135.0")
         return None  # FBREF_UNCOMMENT_TABLES_JS etc.
 
     def content(self):
@@ -200,6 +238,8 @@ class TestFetch:
         t = _transport(monkeypatch, page)
         html = t.fetch("https://fbref.com/x")
         assert html is not None and "<table" in html
+        # The fake page shows a Turnstile iframe → one attempt, one pass.
+        assert t.cf_challenge_attempts == 1
         assert t.cf_challenges_passed == 1
         assert page.goto_calls == ["https://fbref.com/x"]
 
@@ -220,8 +260,11 @@ class TestFetch:
         t = _transport(monkeypatch, page)
         html = t.fetch("https://fbref.com/x")
         assert html is not None
-        assert t.cf_challenges_failed == 1  # first goto failed
-        assert t.cf_challenges_passed == 1  # second solved
+        # A goto failure is a nav problem, NOT a CF challenge stat — only the
+        # second attempt saw (and passed) the challenge.
+        assert t.cf_challenges_failed == 0
+        assert t.cf_challenge_attempts == 1
+        assert t.cf_challenges_passed == 1
 
     @pytest.mark.unit
     def test_returns_none_after_exhausting_rotations(self, monkeypatch):
@@ -275,3 +318,298 @@ class TestByteAccounting:
         t._maybe_block(_Route())
         assert aborted["n"] == 1 and continued["n"] == 0
         assert t._blocked_count == 1
+
+
+# ---------------------------------------------------------------------------
+# CF counter semantics (#B5): attempts only when a challenge shell is seen
+# ---------------------------------------------------------------------------
+
+class TestChallengeCounterSemantics:
+    @pytest.mark.unit
+    def test_warm_page_is_not_a_challenge_attempt(self, monkeypatch):
+        # No CF iframe, real content immediately → warm page, no CF stats.
+        page = _FakePage(table_after=1, frames=[])
+        t = _transport(monkeypatch, page)
+        html = t.fetch("https://fbref.com/x")
+        assert html is not None
+        assert t.cf_challenge_attempts == 0
+        assert t.cf_challenges_passed == 0
+        assert t.cf_challenges_failed == 0
+
+    @pytest.mark.unit
+    def test_shell_without_iframe_still_counts_attempt(self, monkeypatch):
+        # Content shows a table but is still the CF shell (no iframe) — each
+        # solve attempt must be counted and failed.
+        page = _FakePage(
+            table_after=1, frames=[],
+            content_html="<html>Just a moment...<table></table></html>")
+        t = _transport(monkeypatch, page)
+        assert t.fetch("https://fbref.com/x") is None
+        assert t.cf_challenge_attempts == t.MAX_PROXY_ROTATIONS + 1
+        assert t.cf_challenges_failed == t.MAX_PROXY_ROTATIONS + 1
+        assert t.cf_challenges_passed == 0
+
+
+# ---------------------------------------------------------------------------
+# Page-count restart (Firefox memory cap)
+# ---------------------------------------------------------------------------
+
+class TestPageLimitRestart:
+    @pytest.mark.unit
+    def test_restarts_after_page_limit(self, monkeypatch):
+        page = _FakePage(table_after=1, frames=[])
+        t = _transport(monkeypatch, page)
+        t._max_pages_per_session = 2
+        restarts = {"n": 0}
+
+        def counting_restart():
+            restarts["n"] += 1
+            t._page = page
+            t._pages_this_session = 0  # mirrors real _restart → _start
+        monkeypatch.setattr(t, "_restart", counting_restart)
+
+        for i in range(5):
+            assert t.fetch(f"https://fbref.com/{i}") is not None
+        # Limit 2 → restart before pages 3 and 5.
+        assert restarts["n"] == 2
+
+    @pytest.mark.unit
+    def test_default_limit_from_env(self, monkeypatch):
+        monkeypatch.setenv("FBREF_CAMOUFOX_MAX_PAGES", "37")
+        t = CamoufoxFbrefTransport(proxy=None)
+        assert t._max_pages_per_session == 37
+        monkeypatch.delenv("FBREF_CAMOUFOX_MAX_PAGES")
+        t2 = CamoufoxFbrefTransport(proxy=None)
+        assert t2._max_pages_per_session == 200
+
+
+# ---------------------------------------------------------------------------
+# get_clearance (curl_cffi fast-path export)
+# ---------------------------------------------------------------------------
+
+class TestGetClearance:
+    @pytest.mark.unit
+    def test_exports_cookies_ua_proxy(self, monkeypatch):
+        page = _FakePage(table_after=1)
+        page.context = _FakeContext([
+            {"name": "cf_clearance", "value": "tok123"},
+            {"name": "sid", "value": "s1"},
+        ])
+        t = _transport(monkeypatch, page)
+        t._page = page
+        t._proxy = {"server": "http://p.example.io:10000",
+                    "username": "u", "password": "pw"}
+        clearance = t.get_clearance()
+        assert clearance["cookies"] == {"cf_clearance": "tok123", "sid": "s1"}
+        assert "Firefox" in clearance["user_agent"]
+        assert clearance["proxy"]["server"] == "http://p.example.io:10000"
+
+    @pytest.mark.unit
+    def test_none_without_cf_clearance(self, monkeypatch):
+        page = _FakePage(table_after=1)
+        page.context = _FakeContext([{"name": "sid", "value": "s1"}])
+        t = _transport(monkeypatch, page)
+        t._page = page
+        assert t.get_clearance() is None
+
+    @pytest.mark.unit
+    def test_none_without_page(self):
+        t = CamoufoxFbrefTransport(proxy=None)
+        assert t.get_clearance() is None
+
+
+# ---------------------------------------------------------------------------
+# FBrefBrowserMixin camoufox path: validation, proxy health, HTTP fast-path
+# ---------------------------------------------------------------------------
+
+_SEASON_HTML = ('<html><body><table id="stats_standard">'
+                + 'x' * 6000 + '</table></body></html>')
+_MATCH_OK_HTML = (
+    '<html><body>'
+    '<table id="stats_18bb7c10_summary"><tr><td>x</td></tr></table>'
+    + 'x' * 6000 + '</body></html>')
+# Lineup table parsed fine, but no stats_*_summary — the ~5% truncated load.
+_MATCH_TRUNCATED_HTML = (
+    '<html><body><table id="lineup_a"><tr><td>x</td></tr></table>'
+    + 'x' * 6000 + '</body></html>')
+
+
+def _make_camoufox_host(transport_html=_MATCH_OK_HTML):
+    """FBrefScraper stub wired for the camoufox fetch path only."""
+    from scrapers.fbref.scraper import FBrefScraper
+
+    s = FBrefScraper.__new__(FBrefScraper)
+    s.fbref_transport = 'camoufox'
+    s._page_cache = {}
+    s._rate_limiter = MagicMock()
+    s._proxy_manager = MagicMock()
+    s._current_proxy_obj = MagicMock()
+    s._consecutive_fetch_failures = 0
+    s._last_validation_failure = None
+    s._nodriver_browser = None
+    s._http_session = None
+    s._http_cookies_time = None
+    s._http_request_count = 0
+    s._http_proxy_minted = None
+    s._http_consecutive_fallbacks = 0
+    s.HTTP_MAX_FALLBACKS_BEFORE_REMINT = 2
+    s.HTTP_COOKIE_TTL_MINUTES = 25
+    s.HTTP_MAX_REQUESTS = 150
+    s._real_traffic_base_bytes = 0
+    s._real_traffic_base_requests = 0
+    s._real_traffic_base_bytes_by_rtype = Counter()
+    s._real_traffic_base_requests_by_rtype = Counter()
+    s._cf_challenge_attempts_base = 0
+    s._cf_challenges_passed_base = 0
+    s._cf_challenges_failed_base = 0
+    s._stats = {'failures': 0, 'successes': 0}
+    s._track_download = MagicMock()
+    s._manage_cache_size = MagicMock()
+
+    transport = MagicMock()
+    transport.fetch.return_value = transport_html
+    transport.traffic_stats.return_value = {
+        'real_bytes_downloaded': 100,
+        'real_requests_count': 2,
+        'real_bytes_by_resource_type': {'document': 100},
+        'cf_challenge_attempts': 1,
+        'cf_challenges_passed': 1,
+        'cf_challenges_failed': 0,
+        'blocked_count': 0,
+    }
+    transport.get_clearance.return_value = None
+    s._camoufox_transport = transport
+    s._get_camoufox_transport = MagicMock(return_value=transport)
+    return s, transport
+
+
+class TestCamoufoxPathValidation:
+    """#A1: the camoufox path must run the same page validation as nodriver."""
+
+    @pytest.mark.unit
+    def test_truncated_match_page_is_failure(self):
+        s, _ = _make_camoufox_host(_MATCH_TRUNCATED_HTML)
+        html = s._fetch_page_camoufox(
+            'https://fbref.com/en/matches/x', page_type='match')
+        assert html is None
+        assert s._stats['failures'] == 1
+        assert s._last_validation_failure == 'no_match_summary'
+        s._proxy_manager.record_result.assert_called_once_with(
+            s._current_proxy_obj, success=False, error_type='cloudflare')
+
+    @pytest.mark.unit
+    def test_valid_match_page_succeeds_and_records_proxy(self):
+        s, _ = _make_camoufox_host(_MATCH_OK_HTML)
+        html = s._fetch_page_camoufox(
+            'https://fbref.com/en/matches/x', page_type='match')
+        assert html == _MATCH_OK_HTML
+        assert s._stats['successes'] == 1
+        assert s._last_validation_failure is None
+        s._proxy_manager.record_result.assert_called_once_with(
+            s._current_proxy_obj, success=True)
+
+    @pytest.mark.unit
+    def test_no_html_records_proxy_failure(self):
+        s, _ = _make_camoufox_host(None)
+        html = s._fetch_page_camoufox('https://fbref.com/x', page_type='other')
+        assert html is None
+        assert s._stats['failures'] == 1
+        s._proxy_manager.record_result.assert_called_once_with(
+            s._current_proxy_obj, success=False, error_type='cloudflare')
+
+
+class TestCamoufoxHttpFastPath:
+    """Camoufox parity with the nodriver curl_cffi fast-path (#624)."""
+
+    @pytest.mark.unit
+    def test_mints_http_session_after_transport_success(self):
+        s, transport = _make_camoufox_host(_SEASON_HTML)
+        transport.get_clearance.return_value = {
+            'cookies': {'cf_clearance': 'tok'},
+            'user_agent': 'UA-Firefox',
+            'proxy': {'server': 'http://p.example.io:1',
+                      'username': 'u', 'password': 'pw'},
+        }
+        session = MagicMock()
+        s._create_http_session = MagicMock(return_value=session)
+
+        html = s._fetch_page_camoufox('https://fbref.com/x', page_type='other')
+
+        assert html == _SEASON_HTML
+        kwargs = s._create_http_session.call_args.kwargs
+        assert kwargs['impersonate'] == 'firefox135'
+        assert kwargs['user_agent'] == 'UA-Firefox'
+        assert kwargs['proxy_url'] == 'http://u:pw@p.example.io:1'
+        assert s._http_session is session
+        assert s._http_proxy_minted == 'p.example.io:1'
+
+    @pytest.mark.unit
+    def test_uses_http_fast_path_when_session_live(self):
+        s, transport = _make_camoufox_host()
+        s._http_session = MagicMock()
+        s._http_cookies_expired = MagicMock(return_value=False)
+        s._fetch_page_http = MagicMock(return_value=_SEASON_HTML)
+
+        html = s._fetch_page_camoufox('https://fbref.com/x', page_type='other')
+
+        assert html == _SEASON_HTML
+        transport.fetch.assert_not_called()
+        assert s._stats['http_fetch_ok'] == 1
+        # An HTTP-path result says nothing about the browser's current proxy.
+        s._proxy_manager.record_result.assert_not_called()
+
+    @pytest.mark.unit
+    def test_fallback_drops_session_at_threshold_and_remints(self):
+        s, transport = _make_camoufox_host(_SEASON_HTML)
+        s._http_session = MagicMock()
+        s._http_cookies_expired = MagicMock(return_value=False)
+        s._fetch_page_http = MagicMock(return_value=None)
+        s._http_consecutive_fallbacks = 1  # one miss away from threshold (2)
+
+        html = s._fetch_page_camoufox('https://fbref.com/x', page_type='other')
+
+        assert html == _SEASON_HTML  # camoufox fallback succeeded
+        assert s._stats['http_fetch_fallback'] == 1
+        assert s._http_consecutive_fallbacks == 0
+        # Session dropped at threshold, then the transport success re-mints.
+        transport.get_clearance.assert_called_once()
+
+
+class TestMergeCamoufoxTraffic:
+    """#B5: transport counters merge ON TOP of the accumulated base instead
+    of overwriting run totals."""
+
+    @pytest.mark.unit
+    def test_accumulates_on_top_of_base(self):
+        s, transport = _make_camoufox_host()
+        s._real_traffic_base_bytes = 1000
+        s._real_traffic_base_requests = 10
+        s._real_traffic_base_bytes_by_rtype = Counter({'document': 1000})
+        s._cf_challenge_attempts_base = 5
+
+        s._merge_camoufox_traffic(transport)
+
+        assert s._stats['real_bytes_downloaded'] == 1100
+        assert s._stats['real_requests_count'] == 12
+        assert s._stats['real_bytes_by_resource_type']['document'] == 1100
+        assert s._stats['cf_challenge_attempts'] == 6
+
+
+class TestPlaywrightProxyToUrl:
+    @pytest.mark.unit
+    def test_with_credentials(self):
+        from scrapers.fbref.browser_manager import FBrefBrowserMixin
+        assert FBrefBrowserMixin._playwright_proxy_to_url(
+            {'server': 'http://h:1', 'username': 'u', 'password': 'p'}
+        ) == 'http://u:p@h:1'
+
+    @pytest.mark.unit
+    def test_without_credentials(self):
+        from scrapers.fbref.browser_manager import FBrefBrowserMixin
+        assert FBrefBrowserMixin._playwright_proxy_to_url(
+            {'server': 'http://h:1'}) == 'http://h:1'
+
+    @pytest.mark.unit
+    def test_none_proxy(self):
+        from scrapers.fbref.browser_manager import FBrefBrowserMixin
+        assert FBrefBrowserMixin._playwright_proxy_to_url(None) is None

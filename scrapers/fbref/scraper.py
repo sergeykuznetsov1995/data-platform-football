@@ -194,6 +194,11 @@ class FBrefScraper(
         self._real_traffic_base_bytes_by_url: _Counter = _Counter()
         self._real_traffic_base_requests_by_url: _Counter = _Counter()
 
+        # Reason of the last _validate_fetched_html failure (None = last page
+        # was valid). Read by scrape_combined_match_data to tombstone matches
+        # that persistently lack stats_*_summary tables.
+        self._last_validation_failure: Optional[str] = None
+
         # Consecutive fetch failure tracking for automatic proxy rotation
         # 3→15: higher MAX_SLOW_PROXY_RETRIES already handles dead proxies per URL;
         # this counter is a last-resort systemic guard, don't let it restart the
