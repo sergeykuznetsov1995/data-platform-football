@@ -399,8 +399,11 @@ class TestTrinoTableManagerFastFail:
 
         manager = TrinoTableManager(host='trino', port=8443)
 
-        with pytest.raises(TrinoError, match="Failed to connect"):
-            _ = manager.connection
+        # #847 widened the retry window to ~113s of backoff — mock the sleeps
+        # so the exhausted-retries path stays instant.
+        with patch('scrapers.base.trino_manager.time.sleep', return_value=None):
+            with pytest.raises(TrinoError, match="Failed to connect"):
+                _ = manager.connection
 
         # Now the class-level flag should be set
         assert TrinoTableManager._trino_unreachable is True
@@ -410,9 +413,9 @@ class TestTrinoTableManagerFastFail:
         with pytest.raises(TrinoError, match="fast-fail"):
             _ = manager2.connection
 
-        # connect should have been called only during the first manager's retries
-        # (3 retries), not again for manager2
-        assert mock_connect.call_count == 3
+        # connect should have been called only during the first manager's
+        # retries (_CONNECT_RETRIES of them), not again for manager2
+        assert mock_connect.call_count == TrinoTableManager._CONNECT_RETRIES
 
     @patch('trino.dbapi.connect')
     def test_successful_connection_resets_cache(self, mock_connect):
