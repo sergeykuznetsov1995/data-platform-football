@@ -287,14 +287,25 @@ class FBrefBrowserMixin:
             logger.warning(f"Could not extract cookies from nodriver: {e}")
             return {}
 
-    def _create_http_session(self, cookies: dict, proxy_url: Optional[str] = None):
-        """Create curl_cffi session with chrome120 impersonation, cookies and proxy."""
+    def _create_http_session(
+        self,
+        cookies: dict,
+        proxy_url: Optional[str] = None,
+        impersonate: str = 'chrome120',
+        user_agent: Optional[str] = None,
+    ):
+        """Create curl_cffi session with browser impersonation, cookies and proxy.
+
+        Defaults reproduce the legacy nodriver pairing (chrome120). The
+        Camoufox mint passes a firefox impersonation target + the session's
+        real User-Agent — cf_clearance is fingerprint-bound.
+        """
         from curl_cffi.requests import Session
 
-        session = Session(impersonate='chrome120')
+        session = Session(impersonate=impersonate)
         session.cookies.update(cookies)
         session.headers.update({
-            'User-Agent': _CHROME120_UA,
+            'User-Agent': user_agent or _CHROME120_UA,
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
             'Accept-Language': 'en-US,en;q=0.9',
             'Accept-Encoding': 'gzip, deflate, br',
@@ -605,6 +616,90 @@ class FBrefBrowserMixin:
         except Exception:
             pass
 
+    def _validate_fetched_html(
+        self, html: Optional[str], url: str, page_type: str
+    ) -> bool:
+        """Validate that fetched HTML is a complete FBref page.
+
+        Shared by the nodriver and Camoufox fetch paths — the Camoufox path
+        used to skip these checks entirely, so truncated match pages (no
+        stats_*_summary table, ~5% of fetches) were recorded as success and
+        left silent holes in fbref_match_player_stats.
+
+        Sets ``self._last_validation_failure`` to the failure reason (or
+        None on success) so scrape_combined_match_data can tombstone matches
+        that persistently lack summary tables (awarded/forfeited fixtures).
+        """
+        self._last_validation_failure = None
+
+        if not html:
+            logger.warning(f"Empty HTML returned for {url}")
+            self._last_validation_failure = 'empty'
+            return False
+
+        html_len = len(html)
+        has_tables = '<table' in html
+        has_cloudflare = any(cf in html.lower() for cf in [
+            'just a moment', 'checking your browser',
+            'cf-browser-verification', 'challenge-running'
+        ])
+
+        logger.debug(
+            f"Page fetched: {url} | "
+            f"length={html_len}, has_tables={has_tables}, "
+            f"cloudflare_blocked={has_cloudflare}"
+        )
+
+        if has_cloudflare:
+            logger.warning(
+                f"Cloudflare challenge detected in response for {url}. "
+                f"HTML preview: {html[:500]}"
+            )
+            self._last_validation_failure = 'cloudflare'
+            return False
+
+        if not has_tables and html_len < 5000:
+            logger.warning(
+                f"Page appears incomplete or blocked: {url}. "
+                f"HTML preview: {html[:500]}"
+            )
+            self._last_validation_failure = 'incomplete'
+            return False
+
+        # Detect pages that loaded but have no real content
+        # FBref pages with tables are typically >50KB; pages <50KB
+        # without visible tables should also have comment-embedded tables
+        if not has_tables and html_len < 50000:
+            has_comment_tables = '<!--' in html and '<table' in html
+            if not has_comment_tables:
+                logger.warning(
+                    f"Page has no tables and no comment tables: {url}, "
+                    f"len={html_len}. Likely incomplete load after browser issue."
+                )
+                self._last_validation_failure = 'no_tables'
+                return False
+
+        # Match pages must contain at least one stats_*_summary table.
+        # Without it, parse_player_match_stats_tables silently returns
+        # None while lineups parse fine — data loss is invisible.
+        # We saw ~5% of match fetches return 200KB truncated HTML with
+        # lineup tables but no summary tables.
+        if page_type == 'match':
+            if not _MATCH_SUMMARY_RE.search(html):
+                proxy_desc = (
+                    f"{self._current_proxy_obj.host}:{self._current_proxy_obj.port}"
+                    if self._current_proxy_obj else 'no-proxy'
+                )
+                logger.warning(
+                    f"Match page missing stats_*_summary table: {url}, "
+                    f"len={html_len}, proxy={proxy_desc}. "
+                    f"Treating as incomplete load."
+                )
+                self._last_validation_failure = 'no_match_summary'
+                return False
+
+        return True
+
     # ------------------------------------------------------------------
     # Camoufox transport (#CF-2026-07) — Turnstile bypass via anti-detect FF
     # ------------------------------------------------------------------
@@ -641,6 +736,88 @@ class FBrefBrowserMixin:
             )
         return self._camoufox_transport
 
+    def _merge_camoufox_traffic(self, transport) -> None:
+        """Merge Camoufox transport counters into _stats on top of the
+        accumulated base (mirrors _sync_real_traffic_stats for nodriver).
+
+        The transport keeps cumulative counters for its own lifetime; the
+        base absorbs them in _close_all() when the transport is torn down,
+        so a transport re-creation mid-run no longer resets run totals.
+        """
+        ts = transport.traffic_stats()
+        self._stats['real_bytes_downloaded'] = (
+            self._real_traffic_base_bytes + ts['real_bytes_downloaded']
+        )
+        self._stats['real_requests_count'] = (
+            self._real_traffic_base_requests + ts['real_requests_count']
+        )
+        bytes_by_rtype = dict(self._real_traffic_base_bytes_by_rtype)
+        for k, v in (ts['real_bytes_by_resource_type'] or {}).items():
+            bytes_by_rtype[k] = bytes_by_rtype.get(k, 0) + v
+        self._stats['real_bytes_by_resource_type'] = bytes_by_rtype
+        self._stats['cf_challenge_attempts'] = (
+            self._cf_challenge_attempts_base + ts['cf_challenge_attempts']
+        )
+        self._stats['cf_challenges_passed'] = (
+            self._cf_challenges_passed_base + ts['cf_challenges_passed']
+        )
+        self._stats['cf_challenges_failed'] = (
+            self._cf_challenges_failed_base + ts['cf_challenges_failed']
+        )
+
+    @staticmethod
+    def _playwright_proxy_to_url(proxy: Optional[dict]) -> Optional[str]:
+        """Convert a Playwright proxy dict to a curl-style proxy URL."""
+        if not proxy or not proxy.get('server'):
+            return None
+        server = proxy['server']
+        scheme, sep, host = server.partition('://')
+        if not sep:
+            scheme, host = 'http', server
+        username = proxy.get('username')
+        if username:
+            return f"{scheme}://{username}:{proxy.get('password', '')}@{host}"
+        return f"{scheme}://{host}"
+
+    def _try_init_http_session_camoufox(self, transport) -> None:
+        """Mint the curl_cffi fast-path session from the Camoufox session's
+        cf_clearance (Camoufox parity with _try_init_http_session / #624).
+
+        cf_clearance is bound to the exit IP + browser fingerprint, so the
+        curl session pins the transport's CURRENT proxy and impersonates
+        Firefox with the session's real User-Agent. When the transport later
+        rotates to another proxy, HTTP fetches start failing and the
+        fallback counter re-mints the session from the fresh clearance.
+        """
+        clearance = transport.get_clearance()
+        if not clearance:
+            logger.info(
+                "No cf_clearance in Camoufox session, HTTP fast-path not initialized"
+            )
+            return
+
+        proxy_url = self._playwright_proxy_to_url(clearance.get('proxy'))
+        try:
+            self._http_session = self._create_http_session(
+                clearance['cookies'],
+                proxy_url=proxy_url,
+                impersonate=os.environ.get('FBREF_HTTP_IMPERSONATE', 'firefox135'),
+                user_agent=clearance.get('user_agent'),
+            )
+            self._http_cookies_time = time.time()
+            self._http_request_count = 0
+            self._http_proxy_minted = self._sanitize_proxy_url(proxy_url)
+            logger.info(
+                f"HTTP fast-path minted from Camoufox: "
+                f"{len(clearance['cookies'])} cookies, "
+                f"proxy: {self._http_proxy_minted or 'none'}, "
+                f"impersonate=firefox"
+            )
+        except Exception as e:
+            logger.warning(f"Failed to create HTTP session from Camoufox: {e}")
+            self._http_session = None
+            self._http_proxy_minted = None
+
     def _fetch_page_camoufox(
         self, url: str, use_cache: bool = True, page_type: str = 'other'
     ) -> Optional[str]:
@@ -648,33 +825,79 @@ class FBrefBrowserMixin:
 
         Mirrors _fetch_page's caching, rate-limiting and stats bookkeeping so
         the traffic guard / diagnostics see the same keys as the nodriver path.
+        Once the warm Firefox session holds a live cf_clearance, pages go
+        through the curl_cffi fast-path (same mechanics as the nodriver flow,
+        issue #624): ~HTML-sized transfers instead of a full browser load.
         """
         self._rate_limiter.acquire()
-        transport = self._get_camoufox_transport()
-        html = transport.fetch(url)
 
-        # Merge transport proxy-byte + CF counters into _stats regardless of
-        # outcome (a failed page still cost bytes / a CF attempt).
-        ts = transport.traffic_stats()
-        self._stats['real_bytes_downloaded'] = ts['real_bytes_downloaded']
-        self._stats['real_requests_count'] = ts['real_requests_count']
-        self._stats['real_bytes_by_resource_type'] = ts['real_bytes_by_resource_type']
-        self._stats['cf_challenge_attempts'] = ts['cf_challenge_attempts']
-        self._stats['cf_challenges_passed'] = ts['cf_challenges_passed']
-        self._stats['cf_challenges_failed'] = ts['cf_challenges_failed']
+        # HTTP fast-path first (cf_clearance minted from the Camoufox session).
+        html = None
+        fetched_via_http = False
+        if self._http_session is not None and not self._http_cookies_expired():
+            html = self._fetch_page_http(url)
+            if html is not None:
+                self._stats.setdefault('http_fetch_ok', 0)
+                self._stats['http_fetch_ok'] += 1
+                self._http_consecutive_fallbacks = 0
+                fetched_via_http = True
+            else:
+                self._stats.setdefault('http_fetch_fallback', 0)
+                self._stats['http_fetch_fallback'] += 1
+                self._http_consecutive_fallbacks += 1
+                if self._http_consecutive_fallbacks >= self.HTTP_MAX_FALLBACKS_BEFORE_REMINT:
+                    self._http_session = None
+                    self._http_proxy_minted = None
+                    self._http_consecutive_fallbacks = 0
+                    logger.info(
+                        "[http-fast-path] %d consecutive fallbacks — dropping "
+                        "curl session to re-mint from the Camoufox session",
+                        self.HTTP_MAX_FALLBACKS_BEFORE_REMINT,
+                    )
 
-        if not html:
+        transport = None
+        if html is None:
+            transport = self._get_camoufox_transport()
+            html = transport.fetch(url)
+            # Merge transport proxy-byte + CF counters into _stats regardless
+            # of outcome (a failed page still cost bytes / a CF attempt).
+            self._merge_camoufox_traffic(transport)
+
+        if not html or not self._validate_fetched_html(html, url, page_type):
+            # Same validation as the nodriver path — a truncated match page
+            # (no stats_*_summary) must be a failure, not a silent success.
+            if html is None:
+                logger.warning(f"Camoufox transport returned no HTML for {url}")
             self._stats['failures'] = self._stats.get('failures', 0) + 1
             self._consecutive_fetch_failures += 1
-            logger.warning(f"Camoufox transport returned no HTML for {url}")
+            # Feed the proxy manager so dead proxies get benched — every
+            # avoidable rotation costs a ~4 MB CF cold-start. Only transport
+            # fetches are attributed: an HTTP-path failure says nothing about
+            # the browser's current proxy.
+            if (not fetched_via_http and self._proxy_manager
+                    and self._current_proxy_obj):
+                self._proxy_manager.record_result(
+                    self._current_proxy_obj, success=False,
+                    error_type='cloudflare',
+                )
             return None
 
         self._consecutive_fetch_failures = 0
         self._stats['successes'] = self._stats.get('successes', 0) + 1
+        if (not fetched_via_http and self._proxy_manager
+                and self._current_proxy_obj):
+            self._proxy_manager.record_result(
+                self._current_proxy_obj, success=True,
+            )
         if use_cache:
             self._page_cache[url] = html
             self._manage_cache_size()
         self._track_download(len(html), page_type)
+
+        # Mint the curl fast-path session from the fresh Camoufox clearance.
+        if not fetched_via_http and self._http_session is None and transport is not None:
+            self._try_init_http_session_camoufox(transport)
+
         return html
 
     def _fetch_page(self, url: str, use_cache: bool = True, page_type: str = 'other') -> Optional[str]:
@@ -752,74 +975,12 @@ class FBrefBrowserMixin:
                     else:
                         html = self._fetch_page_selenium(url)
 
-                # Diagnostic logging
-                if html:
-                    html_len = len(html)
-                    has_tables = '<table' in html
-                    has_cloudflare = any(cf in html.lower() for cf in [
-                        'just a moment', 'checking your browser',
-                        'cf-browser-verification', 'challenge-running'
-                    ])
-
-                    logger.debug(
-                        f"Page fetched: {url} | "
-                        f"length={html_len}, has_tables={has_tables}, "
-                        f"cloudflare_blocked={has_cloudflare}"
-                    )
-
-
-                    if has_cloudflare:
-                        logger.warning(
-                            f"Cloudflare challenge detected in response for {url}. "
-                            f"HTML preview: {html[:500]}"
-                        )
-                        # Return None if page is still blocked
-                        self._stats['failures'] += 1
-                        return None
-
-                    if not has_tables and html_len < 5000:
-                        logger.warning(
-                            f"Page appears incomplete or blocked: {url}. "
-                            f"HTML preview: {html[:500]}"
-                        )
-                        self._stats['failures'] += 1
-                        return None
-
-                    # Detect pages that loaded but have no real content
-                    # FBref pages with tables are typically >50KB; pages <50KB
-                    # without visible tables should also have comment-embedded tables
-                    if not has_tables and html_len < 50000:
-                        has_comment_tables = '<!--' in html and '<table' in html
-                        if not has_comment_tables:
-                            logger.warning(
-                                f"Page has no tables and no comment tables: {url}, "
-                                f"len={html_len}. Likely incomplete load after browser issue."
-                            )
-                            self._stats['failures'] += 1
-                            return None
-
-                    # Match pages must contain at least one stats_*_summary table.
-                    # Without it, parse_player_match_stats_tables silently returns
-                    # None while lineups parse fine — data loss is invisible.
-                    # We saw ~5% of match fetches return 200KB truncated HTML with
-                    # lineup tables but no summary tables.
-                    if page_type == 'match':
-                        if not _MATCH_SUMMARY_RE.search(html):
-                            proxy_desc = (
-                                f"{self._current_proxy_obj.host}:{self._current_proxy_obj.port}"
-                                if self._current_proxy_obj else 'no-proxy'
-                            )
-                            logger.warning(
-                                f"Match page missing stats_*_summary table: {url}, "
-                                f"len={html_len}, proxy={proxy_desc}. "
-                                f"Treating as incomplete load."
-                            )
-                            self._stats['failures'] += 1
-                            return None
-                else:
-                    logger.warning(f"Empty HTML returned for {url}")
+                # Validation (CF shell / truncated page / missing summary) —
+                # shared with the Camoufox path via _validate_fetched_html.
+                if not self._validate_fetched_html(html, url, page_type):
                     self._stats['failures'] += 1
                     return None
+                html_len = len(html)
 
                 # Track successful download
                 self._track_download(html_len, page_type)
@@ -1153,6 +1314,20 @@ class FBrefBrowserMixin:
         # Camoufox transport is a warm session that lives for the whole scrape
         # (it rotates proxies internally); tear it down only at final cleanup.
         if getattr(self, '_camoufox_transport', None) is not None:
+            # Flush transport counters into the persistent base first, so a
+            # transport re-creation later in the process keeps run totals
+            # (mirrors the nodriver flush in _close_browser).
+            try:
+                ts = self._camoufox_transport.traffic_stats()
+                self._real_traffic_base_bytes += ts['real_bytes_downloaded']
+                self._real_traffic_base_requests += ts['real_requests_count']
+                for k, v in (ts['real_bytes_by_resource_type'] or {}).items():
+                    self._real_traffic_base_bytes_by_rtype[k] += v
+                self._cf_challenge_attempts_base += ts['cf_challenge_attempts']
+                self._cf_challenges_passed_base += ts['cf_challenges_passed']
+                self._cf_challenges_failed_base += ts['cf_challenges_failed']
+            except Exception as e:  # noqa: BLE001 — flush is best-effort
+                logger.debug(f"Could not flush Camoufox traffic stats: {e}")
             try:
                 self._camoufox_transport.close()
             except Exception as e:  # noqa: BLE001 — teardown is best-effort
