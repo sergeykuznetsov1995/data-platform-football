@@ -494,11 +494,16 @@ services:
       SUPERSET_ADMIN_PASSWORD: ${SUPERSET_ADMIN_PASSWORD}
       TRINO_SUPERSET_PASSWORD: ${TRINO_SUPERSET_PASSWORD}
       PYTHONPATH: /app/pythonpath:/app/pythonpath_dev
+      # SSO через Keycloak (superset_config.py); false = обычная форма логина
+      SUPERSET_OAUTH_ENABLED: ${SUPERSET_OAUTH_ENABLED:-false}
+      SUPERSET_OIDC_CLIENT_SECRET: ${SUPERSET_OIDC_CLIENT_SECRET:-}
+      OIDC_ISSUER: https://${TS_HOSTNAME:-unset}:8443/realms/football
     volumes:
       - ./configs/superset/superset_config.py:/app/pythonpath/superset_config.py:ro
       - ./configs/superset/bootstrap.sh:/app/pythonpath/bootstrap.sh:ro
       - ./configs/superset/datasources.yaml:/app/pythonpath/datasources.yaml:ro
       - ./configs/superset/import_datasources.py:/app/pythonpath/import_datasources.py:ro
+      - ./configs/superset/create_analyst_role.py:/app/pythonpath/create_analyst_role.py:ro
       - ./configs/superset/dashboards:/app/pythonpath/dashboards:ro
       - superset_home:/app/superset_home
     restart: unless-stopped
@@ -548,6 +553,7 @@ services:
       - ./configs/superset/bootstrap.sh:/app/pythonpath/bootstrap.sh:ro
       - ./configs/superset/datasources.yaml:/app/pythonpath/datasources.yaml:ro
       - ./configs/superset/import_datasources.py:/app/pythonpath/import_datasources.py:ro
+      - ./configs/superset/create_analyst_role.py:/app/pythonpath/create_analyst_role.py:ro
       - ./configs/superset/dashboards:/app/pythonpath/dashboards:ro
       - superset_home:/app/superset_home
     restart: unless-stopped
@@ -590,6 +596,7 @@ services:
       - ./configs/superset/bootstrap.sh:/app/pythonpath/bootstrap.sh:ro
       - ./configs/superset/datasources.yaml:/app/pythonpath/datasources.yaml:ro
       - ./configs/superset/import_datasources.py:/app/pythonpath/import_datasources.py:ro
+      - ./configs/superset/create_analyst_role.py:/app/pythonpath/create_analyst_role.py:ro
       - ./configs/superset/dashboards:/app/pythonpath/dashboards:ro
       - superset_home:/app/superset_home
     restart: unless-stopped

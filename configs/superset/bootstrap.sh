@@ -58,6 +58,11 @@ if [ -f "${DATASOURCES_YAML}" ] && [ -f "${IMPORT_SCRIPT}" ]; then
         echo "[superset-bootstrap] WARNING: TRINO_SUPERSET_PASSWORD is empty — Trino connection will fail until set"
     fi
     python "${IMPORT_SCRIPT}" "${DATASOURCES_YAML}"
+    # (4b) роль analyst_data для SSO-аналитиков (фаза 7): database_access на
+    # trino_iceberg. Идемпотентно; требует уже импортированную БД.
+    echo "[superset-bootstrap] (4b) ensuring analyst_data role..."
+    python "${PYTHONPATH_DIR}/create_analyst_role.py" \
+        || echo "[superset-bootstrap] create_analyst_role failed — continuing"
 else
     echo "[superset-bootstrap] (4/5) datasources.yaml or import_datasources.py not found; skipping"
 fi

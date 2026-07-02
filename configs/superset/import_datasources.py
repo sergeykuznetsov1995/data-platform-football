@@ -92,6 +92,9 @@ def _upsert_database(spec: dict[str, Any]) -> Database:
     existing.allow_run_async = bool(spec.get("allow_run_async", True))
     existing.cache_timeout = spec.get("cache_timeout")
     existing.extra = extra_str
+    # SQL Lab/чарты выполняются под именем залогиненного юзера (X-Trino-User);
+    # права режет Trino: rules.json + groups.txt (фаза 7)
+    existing.impersonate_user = bool(spec.get("impersonate_user", False))
 
     db.session.commit()
     log.info("database '%s' upserted (id=%s)", name, existing.id)
