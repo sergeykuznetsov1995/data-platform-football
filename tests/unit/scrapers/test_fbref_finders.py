@@ -1043,3 +1043,91 @@ class TestParseKeeperMatchStatsTables:
         soup = BeautifulSoup('<html><body><p>no tables</p></body></html>',
                              'html.parser')
         assert parse_keeper_match_stats_tables(soup, {}) is None
+
+
+# ===========================================================================
+# TestTeamSideById — home/away from the {team_id} in the table id (#A2)
+# ===========================================================================
+
+_SUMMARY_TABLE_TMPL = """
+<table id="stats_{tid}_summary">
+  <thead><tr><th>Player</th><th>Min</th></tr></thead>
+  <tbody>
+    <tr>
+      <td data-stat="player"><a href="/en/players/{pid}/">{name}</a></td>
+      <td data-stat="minutes">90</td>
+    </tr>
+  </tbody>
+</table>
+"""
+
+
+class TestTeamSideById:
+    """team_side must come from the {team_id} embedded in the table id, not
+    from table order — order flips on partially-uncommented pages."""
+
+    _SCOREBOX = (
+        '<div class="scorebox">'
+        '<div><strong><a href="/en/squads/18bb7c10/Arsenal">Arsenal</a></strong></div>'
+        '<div><strong><a href="/en/squads/b8fd03ef/Manchester-City">'
+        'Manchester City</a></strong></div>'
+        '</div>'
+    )
+
+    @pytest.mark.unit
+    def test_player_summary_sides_correct_when_away_table_first(self):
+        html = (
+            '<html><body>' + self._SCOREBOX
+            # AWAY (City) summary table comes FIRST in the DOM
+            + _SUMMARY_TABLE_TMPL.format(
+                tid='b8fd03ef', pid='abc12345', name='Erling Haaland')
+            + _SUMMARY_TABLE_TMPL.format(
+                tid='18bb7c10', pid='b66315ae', name='Bukayo Saka')
+            + '</body></html>'
+        )
+        soup = BeautifulSoup(html, 'html.parser')
+        df = parse_player_match_stats_tables(soup, {})
+        by_player = df.set_index('Player')
+        assert by_player.loc['Erling Haaland', 'team_side'] == 'away'
+        assert by_player.loc['Erling Haaland', 'team'] == 'Manchester City'
+        assert by_player.loc['Bukayo Saka', 'team_side'] == 'home'
+        assert by_player.loc['Bukayo Saka', 'team'] == 'Arsenal'
+
+    @pytest.mark.unit
+    def test_keeper_sides_correct_when_away_table_first(self):
+        from scrapers.fbref.parsers.finders import parse_keeper_match_stats_tables
+
+        html = (
+            '<html><body>'
+            '<div class="scorebox">'
+            '<div><strong><a href="/en/squads/8ef52968/Sunderland">'
+            'Sunderland</a></strong></div>'
+            '<div><strong><a href="/en/squads/cff3d9bb/Chelsea">'
+            'Chelsea</a></strong></div>'
+            '</div>'
+            # AWAY (Chelsea) keeper table comes FIRST in the DOM
+            + _KEEPER_TABLE_TMPL.format(
+                tid='cff3d9bb', pid='58b1b5b6', name='Robert Sanchez',
+                sota='7', ga='2', saves='5', pct='71.4')
+            + _KEEPER_TABLE_TMPL.format(
+                tid='8ef52968', pid='349fa918', name='Robin Roefs',
+                sota='3', ga='1', saves='2', pct='66.7')
+            + '</body></html>'
+        )
+        soup = BeautifulSoup(html, 'html.parser')
+        df = parse_keeper_match_stats_tables(soup, {})
+        assert list(df['team_side']) == ['away', 'home']
+        assert list(df['team']) == ['Chelsea', 'Sunderland']
+
+    @pytest.mark.unit
+    def test_unknown_team_id_falls_back_to_order(self):
+        html = (
+            '<html><body>' + self._SCOREBOX
+            # Table id whose team_id matches neither scorebox squad
+            + _SUMMARY_TABLE_TMPL.format(
+                tid='deadbeef', pid='abc12345', name='Somebody')
+            + '</body></html>'
+        )
+        soup = BeautifulSoup(html, 'html.parser')
+        df = parse_player_match_stats_tables(soup, {})
+        assert df.iloc[0]['team_side'] == 'home'  # order fallback

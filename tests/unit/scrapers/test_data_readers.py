@@ -785,3 +785,55 @@ class TestScrapeCombinedSeasonStats:
         assert 'team_shooting' not in result['tables']
         assert 'player_stats' in result['tables']
         assert len(result['tables']) == 7
+
+
+# ===========================================================================
+# Test: no-summary tombstones (#A5)
+# ===========================================================================
+
+class TestNoStatsTombstone:
+    """Matches whose page lacks stats_*_summary in both passes of a run get a
+    tombstone row in bronze.fbref_match_no_stats; after NO_STATS_TOMBSTONE_RUNS
+    confirmed runs they join the incremental skip set."""
+
+    @staticmethod
+    def _writer_with_tombstones(no_stats_df):
+        writer = MagicMock()
+        writer.table_exists.side_effect = (
+            lambda db, table: table == 'fbref_match_no_stats'
+        )
+        writer.read_table.return_value = no_stats_df
+        return writer
+
+    @pytest.mark.unit
+    def test_skips_only_after_enough_confirmations(self):
+        scraper = StubScraper()
+        # m1 confirmed in 3 runs (>= threshold), m2 only in 2 → keep retrying
+        scraper._iceberg_writer = self._writer_with_tombstones(pd.DataFrame({
+            'match_id': ['m1'] * 3 + ['m2'] * 2,
+        }))
+
+        sets_ = scraper._load_match_id_sets('ENG-Premier League', 2025)
+
+        assert sets_['no_stats'] == {'m1'}
+        assert sets_['player_stats'] == set()
+
+    @pytest.mark.unit
+    def test_missing_tombstone_table_yields_empty_set(self):
+        scraper = StubScraper()
+        writer = MagicMock()
+        writer.table_exists.return_value = False
+        scraper._iceberg_writer = writer
+
+        sets_ = scraper._load_match_id_sets('ENG-Premier League', 2025)
+
+        assert sets_['no_stats'] == set()
+
+    @pytest.mark.unit
+    def test_existing_ids_union_includes_tombstones(self):
+        scraper = StubScraper()
+        scraper._load_match_id_sets = MagicMock(return_value={
+            'player_stats': {'a'}, 'lineups': set(), 'no_stats': {'b'},
+        })
+
+        assert scraper._get_existing_match_ids('L', 2025) == {'a', 'b'}
