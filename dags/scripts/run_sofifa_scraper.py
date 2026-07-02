@@ -10,6 +10,7 @@ Called from Airflow via BashOperator to avoid memory issues with PythonOperator.
 import argparse
 import json
 import logging
+import os
 import sys
 
 logging.basicConfig(
@@ -29,6 +30,78 @@ logger = logging.getLogger(__name__)
 # ReplaceGuardError → exit 3; bypass with --force-replace for a first backfill.
 _MIN_REPLACE_RATIO = 0.9
 REPLACE_GUARD_MARKER = 'SOFIFA_REPLACE_GUARD'
+
+
+def _trino_connect():
+    """Open a Trino dbapi connection from env. Returns None on import error.
+
+    Mirrors run_sofascore_scraper._trino_connect (#69 skip-existing path).
+    """
+    try:
+        import trino
+        import trino.auth as trino_auth
+    except ImportError as e:
+        logger.error("trino client unavailable: %s", e)
+        return None
+
+    user = os.environ.get('TRINO_USER', 'airflow')
+    password = os.environ.get('TRINO_PASSWORD')
+    if password:
+        return trino.dbapi.connect(
+            host=os.environ.get('TRINO_HOST', 'trino'),
+            port=int(os.environ.get('TRINO_PORT', 8443)),
+            user=user,
+            catalog='iceberg',
+            http_scheme='https',
+            auth=trino_auth.BasicAuthentication(user, password),
+            verify=False,
+        )
+    return trino.dbapi.connect(
+        host=os.environ.get('TRINO_HOST', 'trino'),
+        port=int(os.environ.get('TRINO_PORT', 8080)),
+        user=user,
+        catalog='iceberg',
+    )
+
+
+def _bronze_up_to_date(latest_vid: int, fifa_edition: str, update: str) -> bool:
+    """True when Bronze already carries the latest sofifa roster update.
+
+    Two probes, both must pass:
+    - ``MAX(version_id)`` in ``sofifa_player_ratings`` equals the homepage's
+      latest version id (the heavy ~546-page step is current);
+    - ``sofifa_players`` has rows for (fifa_edition, update) — guards the rare
+      run where player_ratings succeeded but the earlier players step failed
+      on every retry.
+
+    Any error (table absent, version_id column absent before the first
+    post-deploy write, Trino down) → False → full scrape. Fail-open by
+    design: a wasted full run is safe, a wrong skip lets Bronze go stale.
+    """
+    conn = _trino_connect()
+    if conn is None:
+        return False
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT MAX(version_id) FROM iceberg.bronze.sofifa_player_ratings"
+        )
+        row = cur.fetchone()
+        if not row or row[0] is None or int(row[0]) != latest_vid:
+            return False
+        # "update" is a Trino reserved word — must stay quoted.
+        cur.execute(
+            'SELECT COUNT(*) FROM iceberg.bronze.sofifa_players '
+            'WHERE fifa_edition = ? AND "update" = ?',
+            (fifa_edition, update),
+        )
+        row = cur.fetchone()
+        return bool(row and row[0])
+    except Exception as e:
+        logger.warning(
+            "incremental probe on Bronze failed (%s) — running full scrape", e
+        )
+        return False
 
 
 def main():
@@ -57,6 +130,12 @@ def main():
         help='Bypass the completeness guard — write even if the scraped frame '
              'shrinks the existing partition. Use for a deliberate first '
              'backfill or a known legitimate shrink.'
+    )
+    parser.add_argument(
+        '--force-full',
+        action='store_true',
+        help='Bypass the incremental version_id check and always run the '
+             'full scrape (players/teams/team_ratings/player_ratings).'
     )
     args = parser.parse_args()
 
@@ -91,9 +170,44 @@ def main():
         from scrapers.sofifa import SoFIFAScraper
 
         with SoFIFAScraper(leagues=leagues, versions=versions) as scraper:
+            # Incremental skip: sofifa content only changes when a new roster
+            # update (version_id) is published — every scraped URL is keyed by
+            # ?r=<version_id>. When Bronze already carries the latest id, the
+            # heavy steps (23-request read_players bootstrap + ~546 player
+            # pages, ~2h) would re-download identical data, so they are
+            # skipped and only the two 1-request lookups (versions, leagues)
+            # refresh. 'latest'-mode only: an explicit version list is a
+            # deliberate backfill.
+            skip_heavy = False
+            latest_vid = None
+            if versions == 'latest' and not args.force_full:
+                try:
+                    reader = scraper._get_reader()  # 1 homepage request
+                    latest_vid = int(reader.versions.index.max())
+                    vrow = reader.versions.loc[latest_vid]
+                    skip_heavy = _bronze_up_to_date(
+                        latest_vid,
+                        str(vrow['fifa_edition']),
+                        str(vrow['update']),
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "incremental version check failed (%s) — full scrape", e
+                    )
+            if skip_heavy:
+                results['skipped'] = {
+                    'reason': 'version_unchanged',
+                    'version_id': latest_vid,
+                }
+                logger.info(
+                    "Bronze already at sofifa version %s — skipping "
+                    "players/teams/team_ratings/player_ratings",
+                    latest_vid,
+                )
+
             # Scrape players
             try:
-                df = scraper.read_players()
+                df = None if skip_heavy else scraper.read_players()
                 if df is not None and not df.empty:
                     df = scraper.filter_by_league(df)
                     df = scraper._process_player_data(df)
@@ -125,7 +239,7 @@ def main():
 
             # Scrape teams
             try:
-                df = scraper.read_teams()
+                df = None if skip_heavy else scraper.read_teams()
                 if df is not None and not df.empty:
                     part = ['fifa_edition'] if 'fifa_edition' in df.columns else None
                     table_path = scraper.save_to_iceberg(
@@ -154,7 +268,7 @@ def main():
             # Scrape per-team ratings (overall/attack/midfield/defence + subs).
             # Single league-level page — cheap.
             try:
-                df = scraper.read_team_ratings()
+                df = None if skip_heavy else scraper.read_team_ratings()
                 if df is not None and not df.empty:
                     part = ['fifa_edition'] if 'fifa_edition' in df.columns else None
                     table_path = scraper.save_to_iceberg(
@@ -240,7 +354,7 @@ def main():
             # Scrape per-player attribute ratings (issue #42).
             # ~545 player pages per APL edition — slowest step by far.
             try:
-                df = scraper.read_player_ratings()
+                df = None if skip_heavy else scraper.read_player_ratings()
                 if df is not None and not df.empty:
                     df = scraper._process_rating_data(df)
                     if not df.empty:
