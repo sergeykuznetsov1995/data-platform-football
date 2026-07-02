@@ -160,6 +160,21 @@ class TestCapologyFallback:
             payload = json.load(f)
         assert payload['fallback_reason'] == 'http_403'
 
+    @pytest.mark.unit
+    def test_http_404_exits_1_red(self, temp_output):
+        """A 404 (wrong league slug/country prefix) must fail red, not
+        soft-green — otherwise a misconfigured new league silently no-ops."""
+        scraper = _empty_salaries_scraper(block_status=404)
+        rc = _run_main(
+            ["--entity", "player_salaries", "--output", temp_output],
+            MagicMock(return_value=scraper),
+        )
+        assert rc == 1
+        scraper.save_to_iceberg.assert_not_called()
+        with open(temp_output) as f:
+            payload = json.load(f)
+        assert payload['fallback_reason'] == 'http_404'
+
 
 class TestCapologyReplaceGuard:
     """#583: completeness-guard wiring in the Capology runner.
@@ -255,3 +270,43 @@ class TestCapologyReplaceGuard:
         with open(temp_output) as f:
             payload = json.load(f)
         assert any("CAPOLOGY_REPLACE_GUARD" in e for e in payload["errors"])
+
+
+class TestTrafficPersistSkip:
+    """Direct-connection traffic (proxied=False — Capology's default) must not
+    be persisted to proxy_traffic_runs; proxied traffic still is."""
+
+    @pytest.fixture
+    def temp_output(self):
+        fd, path = tempfile.mkstemp(suffix=".json", prefix="capology_")
+        os.close(fd)
+        yield path
+        if os.path.exists(path):
+            os.unlink(path)
+
+    def _write_results_with_traffic(self, temp_output, traffic):
+        proxy_traffic_mod = MagicMock()
+        with patch.dict(sys.modules, {"utils.proxy_traffic": proxy_traffic_mod}):
+            sys.modules.pop("dags.scripts.run_capology_scraper", None)
+            mod = importlib.import_module("dags.scripts.run_capology_scraper")
+            importlib.reload(mod)
+            mod._write_results(temp_output, {
+                'entity': 'player_salaries', 'rows': 10, 'traffic': traffic,
+            })
+        return proxy_traffic_mod
+
+    @pytest.mark.unit
+    def test_direct_run_not_recorded(self, temp_output):
+        traffic = {'proxied': False, 'proxy_response_mb': 2.85,
+                   'top_traffic_urls': []}
+        mod = self._write_results_with_traffic(temp_output, traffic)
+        mod.record_traffic_run.assert_not_called()
+        mod.log_traffic_summary.assert_not_called()
+
+    @pytest.mark.unit
+    def test_proxied_run_recorded(self, temp_output):
+        traffic = {'proxied': True, 'proxy_response_mb': 2.85,
+                   'top_traffic_urls': []}
+        mod = self._write_results_with_traffic(temp_output, traffic)
+        mod.record_traffic_run.assert_called_once()
+        mod.log_traffic_summary.assert_called_once()
