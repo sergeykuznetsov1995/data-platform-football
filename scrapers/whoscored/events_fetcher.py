@@ -286,3 +286,132 @@ def parse_matchcentre_to_events_df(
     df = df.set_index(["league", "season", "game"]).sort_index()
     df = df[list(COLS_EVENTS.keys())]
     return df
+
+
+# ---------------------------------------------------------------------------
+# Lineups / ratings from the same matchCentreData payload (issue #708).
+# ---------------------------------------------------------------------------
+# Field map mirrors socceraction's Opta WhoScored parser (extract_players /
+# extract_playergamestats): home/away.players[] carries playerId / shirtNo /
+# position / isFirstEleven / isManOfTheMatch / subbedIn(Out)ExpandedMinute and
+# per-minute cumulative ratings in stats.ratings. The events scraper used to
+# discard this block entirely — parsing it costs zero extra traffic.
+
+def _final_rating(stats: Optional[dict]) -> Optional[float]:
+    """Last per-minute value of ``stats.ratings`` = the player's match rating."""
+    ratings = (stats or {}).get("ratings")
+    if not isinstance(ratings, dict) or not ratings:
+        return None
+    try:
+        last_key = max(ratings, key=lambda k: int(k))
+        value = ratings[last_key]
+        return float(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _minutes_played(
+    is_starter: bool,
+    minute_start: Optional[int],
+    minute_end: Optional[int],
+    expanded_max: Optional[int],
+) -> Optional[int]:
+    """socceraction ``extract_playergamestats`` minutes semantics.
+
+    ``minute_end`` is the effective off-pitch minute (sub-off or red card).
+    """
+    if expanded_max is None:
+        return None
+    if is_starter:
+        return int(minute_end) if minute_end is not None else int(expanded_max)
+    if minute_start is not None:
+        end = int(minute_end) if minute_end is not None else int(expanded_max)
+        return end - int(minute_start)
+    return 0  # unused substitute
+
+
+def parse_matchcentre_to_lineups_df(
+    data: Optional[dict],
+    league: str,
+    season: str,
+    game_id: int,
+    game_name: str,
+) -> pd.DataFrame:
+    """One row per (team, player) from ``matchCentreData`` home/away.players[].
+
+    Same (league, season, game) MultiIndex contract as
+    :func:`parse_matchcentre_to_events_df` — the caller ``reset_index()``es
+    before the Bronze append. Returns an empty DataFrame when the payload has
+    no player blocks (never raises on shape drift).
+    """
+    if not isinstance(data, dict):
+        return pd.DataFrame()
+
+    expanded_max = data.get("expandedMaxMinute")
+    rows = []
+    for side in ("home", "away"):
+        side_obj = data.get(side) or {}
+        team_id = side_obj.get("teamId")
+        team_name = side_obj.get("name")
+
+        # Red cards end a player's match like a sub-off (socceraction parity).
+        red_minutes: Dict[Any, Any] = {}
+        for ev in side_obj.get("incidentEvents") or []:
+            card = ev.get("cardType")
+            if (
+                isinstance(card, dict)
+                and card.get("displayName") in ("Red", "SecondYellow")
+                and "playerId" in ev
+            ):
+                red_minutes[ev["playerId"]] = ev.get("expandedMinute")
+
+        for p in side_obj.get("players") or []:
+            player_id = p.get("playerId")
+            if player_id is None:
+                continue
+            is_starter = bool(p.get("isFirstEleven", False))
+            sub_in = p.get("subbedInExpandedMinute")
+            sub_out = p.get("subbedOutExpandedMinute")
+            effective_end = (
+                sub_out if sub_out is not None else red_minutes.get(player_id)
+            )
+            rows.append({
+                "game_id": game_id,
+                "team_id": team_id,
+                "team": team_name,
+                "side": side,
+                "player_id": player_id,
+                "player": p.get("name"),
+                "shirt_no": p.get("shirtNo"),
+                "position": p.get("position"),
+                "is_starter": is_starter,
+                "is_man_of_the_match": bool(p.get("isManOfTheMatch", False)),
+                "subbed_in_expanded_minute": sub_in,
+                "subbed_out_expanded_minute": sub_out,
+                "minutes_played": _minutes_played(
+                    is_starter, sub_in, effective_end, expanded_max
+                ),
+                "rating": _final_rating(p.get("stats")),
+                "height": p.get("height"),
+                "weight": p.get("weight"),
+                "age": p.get("age"),
+            })
+
+    if not rows:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(rows)
+    # Pin every nullable numeric to float64 (bronze DOUBLE convention, same as
+    # events). Otherwise a chunk where e.g. every shirt_no is present becomes
+    # int64 → the auto-created Iceberg column is BIGINT, and the next chunk
+    # with a missing value (NaN → float64) fails the Trino INSERT.
+    for col in (
+        "game_id", "team_id", "player_id", "shirt_no",
+        "subbed_in_expanded_minute", "subbed_out_expanded_minute",
+        "minutes_played", "rating", "height", "weight", "age",
+    ):
+        df[col] = pd.to_numeric(df[col], errors="coerce").astype("float64")
+    df["league"] = league
+    df["season"] = season
+    df["game"] = game_name
+    return df.set_index(["league", "season", "game"]).sort_index()
