@@ -378,6 +378,8 @@ services:
       OIDC_ISSUER: https://${TS_HOSTNAME:-unset}:8443/realms/football
       # За Caddy: доверять X-Forwarded-* (иначе redirect_uri будет http://)
       AIRFLOW__WEBSERVER__ENABLE_PROXY_FIX: "true"
+      # 2 gunicorn-воркера по ~550MB RSS (с SSO) — в 1G ловили memcg-OOM
+      # (тихий kill воркеров, 502 за Caddy; паттерн #847). Лимит ниже — 2G.
     depends_on:
       airflow-init:
         condition: service_completed_successfully
@@ -391,7 +393,7 @@ services:
     deploy:
       resources:
         limits:
-          memory: 1G
+          memory: 2G
         reservations:
           memory: 512M
     memswap_limit: 2G
