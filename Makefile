@@ -319,3 +319,17 @@ shell-superset:
 shell-om:
 	@docker compose exec openmetadata-server bash
 
+
+# --- Analyst access (docs/design/analyst-access.md) ---
+
+# Рендер realm-импорта Keycloak из шаблона (секреты из .env)
+render-keycloak-realm:
+	@python3 scripts/render_keycloak_realm.py
+
+# Создать базу keycloak в работающем postgres (идемпотентно)
+keycloak-db:
+	@bash scripts/create_keycloak_db.sh
+
+# Tail Keycloak logs
+logs-keycloak:
+	@docker compose logs -f --tail=100 keycloak
