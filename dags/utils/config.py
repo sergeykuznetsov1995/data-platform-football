@@ -105,6 +105,14 @@ MIN_ROW_THRESHOLDS: Dict[str, int] = {
     # read_* swallowed errors and runners exited 0. Floors calibrated against
     # live Bronze counts on 2026-06-11.
     'espn_schedule': 340,                  # 380 fixtures/season - 10% margin
+    # espn_lineup / espn_matchsheet: the per-match tables were the unguarded
+    # half of the #466 class — only espn_schedule had a floor, so a wiped or
+    # frozen lineup/matchsheet table passed silently. Whole-table wipe-floors
+    # sized to ONE season (~28 lineup rows and 2 matchsheet rows per match
+    # x 340 matches - margin); live tables hold 10 seasons (~145k / 7.6k
+    # rows), so these never false-fail if scope shrinks to a single season.
+    'espn_lineup': 9000,
+    'espn_matchsheet': 620,
     'understat_schedule': 340,             # 380 fixtures/season - 10% margin
     'understat_players': 450,              # ~547 player-season rows/season - 18%
     'understat_shots': 8000,               # ~9.8k shots/season - 20% margin
