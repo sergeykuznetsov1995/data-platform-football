@@ -64,6 +64,68 @@ class TestSeasonParam:
         assert season_param.default == CURRENT_SEASON
 
 
+class TestValidateData:
+    """Row floors must scale with the number of leagues the runner actually
+    scraped (results JSON ``leagues``), and the summary must read the runner's
+    real keys (``team_match_stats_rows``/``player_match_stats_rows`` — the old
+    ``team_stats_rows`` key never existed in the results file)."""
+
+    RESULTS_PATH = '/tmp/understat_result.json'
+
+    @pytest.fixture
+    def write_results(self):
+        import json
+        import os
+
+        def _write(payload):
+            with open(self.RESULTS_PATH, 'w') as f:
+                json.dump(payload, f)
+
+        yield _write
+        if os.path.exists(self.RESULTS_PATH):
+            os.unlink(self.RESULTS_PATH)
+
+    @staticmethod
+    def _payload(n_leagues=1, scale=1.0, errors=None):
+        leagues = ['ENG-Premier League', 'ESP-La Liga'][:n_leagues]
+        return {
+            'tables': ['iceberg.bronze.understat_x'],
+            'leagues': leagues,
+            'schedule_rows': int(380 * n_leagues * scale),
+            'shots_rows': int(9800 * n_leagues * scale),
+            'player_stats_rows': int(550 * n_leagues * scale),
+            'team_match_stats_rows': int(380 * n_leagues * scale),
+            'player_match_stats_rows': int(11000 * n_leagues * scale),
+            'errors': errors or [],
+        }
+
+    def test_full_two_league_run_passes_clean(self, dag_module, write_results):
+        write_results(self._payload(n_leagues=2))
+        validation = dag_module.validate_data()
+        assert validation['status'] == 'success'
+        assert validation['warnings'] == []
+        assert validation['summary']['team_match_stats_rows'] == 760
+
+    def test_floors_scale_with_league_count(self, dag_module, write_results):
+        """A row count above the single-league floor but below the two-league
+        floor must warn on a two-league run — a flat floor would wave it
+        through."""
+        payload = self._payload(n_leagues=2)
+        # floor is 1000/league: 1500 passes 1 league, fails 2 leagues (2000)
+        payload['player_match_stats_rows'] = 1500
+        write_results(payload)
+        validation = dag_module.validate_data()
+        assert any('player_match_stats_rows' in w for w in validation['warnings'])
+
+    def test_zero_rows_with_errors_fails(self, dag_module, write_results):
+        from airflow.exceptions import AirflowException
+
+        payload = self._payload(scale=0.0, errors=['understat_schedule: empty'])
+        write_results(payload)
+        with pytest.raises(AirflowException, match='Validation failed'):
+            dag_module.validate_data()
+
+
 class TestSeasonRenderedFromParams:
     """The scrape task must inject the season via Jinja so an overridden
     season (backfill) reaches the scraper — not a baked-in current season."""

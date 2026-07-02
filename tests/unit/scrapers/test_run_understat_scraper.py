@@ -27,13 +27,23 @@ import pytest
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-def _build_scraper(*, errors: bool):
+_READ_METHODS = (
+    'read_schedule',
+    'read_shot_events',
+    'read_player_season_stats',
+    'read_team_match_stats',
+    'read_player_match_stats',
+)
+
+
+def _build_scraper(*, errors: bool = False, empty: bool = False):
     """Build a stub UnderstatScraper context-manager.
 
-    Successful path: every read_*() returns an EMPTY DataFrame so the
-    runner just skips the corresponding save_to_iceberg() call but does
-    NOT append to errors. ``read_player_match_stats`` returns an empty
-    DataFrame too (the runner checks ``df.empty`` on it).
+    Successful path: every read_*() returns a non-empty DataFrame and
+    save_to_iceberg() succeeds — no errors. ``empty=True`` makes every
+    read_*() return an EMPTY DataFrame: since the rollover fail-closed fix
+    the runner must record an error per table (an empty frame means the
+    season is missing from the source, not "nothing to do").
     """
     scraper = MagicMock()
 
@@ -41,18 +51,20 @@ def _build_scraper(*, errors: bool):
         def _boom(*a, **k):
             raise RuntimeError("forced failure")
 
-        scraper.read_schedule.side_effect = _boom
-        scraper.read_shot_events.side_effect = _boom
-        scraper.read_player_season_stats.side_effect = _boom
-        scraper.read_team_match_stats.side_effect = _boom
-        scraper.read_player_match_stats.side_effect = _boom
+        for m in _READ_METHODS:
+            getattr(scraper, m).side_effect = _boom
+    elif empty:
+        for m in _READ_METHODS:
+            getattr(scraper, m).return_value = pd.DataFrame()
     else:
-        empty = pd.DataFrame()
-        scraper.read_schedule.return_value = empty
-        scraper.read_shot_events.return_value = empty
-        scraper.read_player_season_stats.return_value = empty
-        scraper.read_team_match_stats.return_value = empty
-        scraper.read_player_match_stats.return_value = empty
+        df = pd.DataFrame({
+            'league': ['ENG-Premier League'] * 3,
+            'season': [2024] * 3,
+            'id': ['1', '2', '3'],
+        })
+        for m in _READ_METHODS:
+            getattr(scraper, m).return_value = df
+        scraper.save_to_iceberg.return_value = 'iceberg.bronze.understat_x'
 
     scraper.__enter__ = MagicMock(return_value=scraper)
     scraper.__exit__ = MagicMock(return_value=False)
@@ -92,9 +104,10 @@ class TestRunUnderstatExitCode:
 
     @pytest.mark.unit
     def test_exit_zero_when_no_errors(self, temp_output):
-        """Empty DataFrames + clean dict from scrape_player_match_stats
-        → no errors → exit 0."""
-        scraper_cls = _build_scraper(errors=False)
+        """Non-empty DataFrames + successful saves → no errors → exit 0,
+        and the leagues actually scraped land in the results JSON (the DAG
+        scales its row floors by them)."""
+        scraper_cls = _build_scraper()
 
         rc = _run_main(
             [
@@ -109,6 +122,29 @@ class TestRunUnderstatExitCode:
         with open(temp_output) as f:
             payload = json.load(f)
         assert payload["errors"] == []
+        assert payload["leagues"] == ["ENG-Premier League"]
+
+    @pytest.mark.unit
+    def test_exit_one_when_all_empty(self, temp_output):
+        """Rollover fail-closed: every read_*() returning an empty frame is
+        an ERROR per table (frozen leagues.json cache scenario) → exit 1,
+        never a silent green run."""
+        scraper_cls = _build_scraper(empty=True)
+
+        rc = _run_main(
+            [
+                "--leagues", "ENG-Premier League",
+                "--season", "2024",
+                "--output", temp_output,
+            ],
+            scraper_cls,
+        )
+
+        assert rc == 1
+        with open(temp_output) as f:
+            payload = json.load(f)
+        assert len(payload["errors"]) == 5
+        assert all("empty scrape result" in e for e in payload["errors"])
 
     @pytest.mark.unit
     def test_exit_one_when_errors(self, temp_output):
@@ -145,17 +181,10 @@ class TestRunUnderstatExitCode:
 
     @pytest.mark.unit
     def test_exit_one_with_partial_failure(self, temp_output):
-        """One step fails, the rest are empty — exit MUST be 1 (any
+        """One step fails, the rest succeed — exit MUST be 1 (any
         non-empty ``errors`` ⇒ failure)."""
-        scraper = MagicMock()
-        empty = pd.DataFrame()
-        scraper.read_schedule.return_value = empty
+        scraper = _build_scraper().return_value
         scraper.read_shot_events.side_effect = RuntimeError("HTTP 500")
-        scraper.read_player_season_stats.return_value = empty
-        scraper.read_team_match_stats.return_value = empty
-        scraper.read_player_match_stats.return_value = empty
-        scraper.__enter__ = MagicMock(return_value=scraper)
-        scraper.__exit__ = MagicMock(return_value=False)
         scraper_cls = MagicMock(return_value=scraper)
 
         rc = _run_main(
