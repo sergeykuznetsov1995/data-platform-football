@@ -410,6 +410,9 @@ services:
       # Referenced as ${ENV:S3_ACCESS_KEY} / ${ENV:S3_SECRET_KEY} in iceberg.properties.
       - S3_ACCESS_KEY=${S3_ACCESS_KEY}
       - S3_SECRET_KEY=${S3_SECRET_KEY}
+      # OAuth2 (SSO людей через Keycloak; машинные аккаунты — по-прежнему password.db)
+      - TRINO_OIDC_CLIENT_SECRET=${TRINO_OIDC_CLIENT_SECRET}
+      - TRINO_OAUTH2_ISSUER=https://${TS_HOSTNAME}:8443/realms/football
     ports:
       - "127.0.0.1:8082:8443"
       - "[::1]:8082:8443"
