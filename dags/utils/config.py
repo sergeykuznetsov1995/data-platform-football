@@ -47,6 +47,21 @@ WHOSCORED_LEAGUES: List[str] = [
     'FRA-Ligue 1',
 ]
 
+# MatchHistory (football-data.co.uk) multi-league scope. Independent of the
+# global LEAGUES for the same reason as WHOSCORED_LEAGUES. Cheapest source on
+# the platform: one season CSV ≈ 200 KB per league, fetched directly (no
+# proxy), and the scraper sends conditional requests (ETag/If-Modified-Since)
+# so an unchanged CSV costs a 0-byte 304. No OOM risk. Backfilling a past
+# season for these leagues = manual DAG trigger with the season param.
+# Scraper supports 18 league codes (MatchHistoryScraper.LEAGUE_CODES).
+MATCHHISTORY_LEAGUES: List[str] = [
+    'ENG-Premier League',
+    'ESP-La Liga',
+    'GER-Bundesliga',
+    'ITA-Serie A',
+    'FRA-Ligue 1',
+]
+
 # Current season (dynamically calculated)
 CURRENT_SEASON: int = get_current_season()
 
