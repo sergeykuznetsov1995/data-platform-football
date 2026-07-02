@@ -28,10 +28,11 @@ if os.environ.get("AIRFLOW_OAUTH_ENABLED", "").lower() == "true":
             "remote_app": {
                 "client_id": "airflow",
                 "client_secret": os.environ["AIRFLOW_OIDC_CLIENT_SECRET"],
+                # discovery: token/authorize/jwks_uri из metadata (без jwks_uri
+                # authlib падает на валидации id_token: Missing "jwks_uri")
+                "server_metadata_url": f"{ISSUER}/.well-known/openid-configuration",
+                # FAB-провайдер keycloak дёргает {api_base_url}openid-connect/userinfo
                 "api_base_url": f"{ISSUER}/protocol/",
-                "access_token_url": f"{ISSUER}/protocol/openid-connect/token",
-                "authorize_url": f"{ISSUER}/protocol/openid-connect/auth",
-                "request_token_url": None,
                 "client_kwargs": {"scope": "openid email profile"},
             },
         }
