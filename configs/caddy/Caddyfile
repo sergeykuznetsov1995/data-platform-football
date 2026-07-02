@@ -4,6 +4,11 @@
 # включённый HTTPS в админке tailnet). Порты публикуются только на ${TS_IP} —
 # см. сервис caddy в compose.yaml; 127.0.0.1-биндинги сервисов не трогаем.
 
+# JupyterHub — главная страница платформы для аналитиков.
+https://{$TS_HOSTNAME} {
+	reverse_proxy jupyterhub:8000
+}
+
 https://{$TS_HOSTNAME}:8081 {
 	reverse_proxy airflow-webserver:8080
 }
