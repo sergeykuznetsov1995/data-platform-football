@@ -941,8 +941,15 @@ class TestFindPlayerStatsTableFallback:
         assert df is not None
         assert len(df) == 1
 
-    def test_find_by_player_header(self):
-        """Test finding stats table by Player header."""
+    def test_bare_player_header_table_is_not_returned(self, caplog):
+        """A bare table with only a Player header must NOT be returned.
+
+        The old last-resort fallback ("any table with a Player header")
+        silently filed the WRONG stat table into bronze when FBref changed
+        layout — now the finder fails loudly with an ERROR instead.
+        """
+        import logging
+
         from bs4 import BeautifulSoup
         from scrapers.fbref.html_parser import find_player_stats_table
 
@@ -960,10 +967,12 @@ class TestFindPlayerStatsTableFallback:
         """
 
         soup = BeautifulSoup(html, 'html.parser')
-        df = find_player_stats_table(soup, {}, 'standard')
+        with caplog.at_level(logging.ERROR):
+            df = find_player_stats_table(soup, {}, 'standard')
 
-        assert df is not None
-        assert len(df) == 1
+        assert df is None
+        assert any('No player stats table found' in r.message
+                   for r in caplog.records)
 
     def test_find_in_comment_tables(self):
         """Test finding stats table from comment tables."""
