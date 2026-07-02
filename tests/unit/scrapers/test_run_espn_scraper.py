@@ -313,6 +313,52 @@ class TestEspnAllTables:
         assert any("Lineup scraping failed" in e for e in payload["errors"])
 
     @pytest.mark.unit
+    def test_per_match_saves_use_per_game_replace(self, temp_output):
+        """Incremental runs scrape only NEW games, so lineup/matchsheet saves
+        must delete+insert per (league, season, game) — a whole-partition
+        replace would wipe the already-ingested games the scrape skipped."""
+        scraper = _build_full_scraper()
+
+        rc = _run_main(
+            ["--leagues", "ENG-Premier League", "--season", "2024",
+             "--output", temp_output],
+            MagicMock(return_value=scraper),
+        )
+
+        assert rc == 0
+        by_table = {c.kwargs["table_name"]: c.kwargs
+                    for c in scraper.save_to_iceberg.call_args_list}
+        for table in ("espn_lineup", "espn_matchsheet"):
+            assert by_table[table]["replace_partitions"] == \
+                ["league", "season", "game"]
+        # schedule keeps whole-partition replace (always scraped in full)
+        assert by_table["espn_schedule"]["replace_partitions"] == \
+            ["league", "season"]
+
+    @pytest.mark.unit
+    def test_skip_existing_wired_to_force_replace(self, temp_output):
+        """Default run: read_lineup/read_matchsheet get skip_existing=True
+        (steady-state = new matches only). --force-replace flips it to False
+        for a deliberate full re-scrape."""
+        scraper = _build_full_scraper()
+        _run_main(
+            ["--leagues", "ENG-Premier League", "--season", "2024",
+             "--output", temp_output],
+            MagicMock(return_value=scraper),
+        )
+        assert scraper.read_lineup.call_args.kwargs["skip_existing"] is True
+        assert scraper.read_matchsheet.call_args.kwargs["skip_existing"] is True
+
+        scraper = _build_full_scraper()
+        _run_main(
+            ["--leagues", "ENG-Premier League", "--season", "2024",
+             "--force-replace", "--output", temp_output],
+            MagicMock(return_value=scraper),
+        )
+        assert scraper.read_lineup.call_args.kwargs["skip_existing"] is False
+        assert scraper.read_matchsheet.call_args.kwargs["skip_existing"] is False
+
+    @pytest.mark.unit
     def test_season_int_converted_to_unambiguous_slug(self, temp_output):
         """#713: --season 2021 must reach soccerdata as slug '2122' (2021/22).
         Passing int 2021 directly is read as 2020/21 (20,21 look like a season

@@ -118,18 +118,25 @@ def main():
             # refusal here is recorded as an error (exit 1), NOT exit 3: the
             # schedule (primary freshness signal) already saved above, so we
             # reserve exit 3 for a schedule-level refusal only.
+            #
+            # Incremental by default: skip-existing drops games already in
+            # bronze, so the frame holds only NEW games — hence the saves
+            # replace per (league, season, game), not the whole partition
+            # (a whole-partition replace would wipe the skipped games).
+            # --force-replace disables the skip for a deliberate full
+            # re-scrape; per-game replace keeps that duplicate-safe too.
             for entity, reader_fn in (
                 ('lineup', scraper.read_lineup),
                 ('matchsheet', scraper.read_matchsheet),
             ):
                 try:
-                    df = reader_fn()
+                    df = reader_fn(skip_existing=not args.force_replace)
                     if df is not None and not df.empty:
                         table_path = scraper.save_to_iceberg(
                             df=df,
                             table_name=f'espn_{entity}',
                             partition_cols=['league', 'season'],
-                            replace_partitions=['league', 'season'],
+                            replace_partitions=['league', 'season', 'game'],
                             min_replace_ratio=(
                                 None if args.force_replace else _MIN_REPLACE_RATIO
                             ),

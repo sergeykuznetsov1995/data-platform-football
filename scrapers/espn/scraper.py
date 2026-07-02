@@ -7,8 +7,9 @@ Scraper for ESPN football data including schedules and results.
 Source: https://www.espn.com
 """
 
+import json
 import logging
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set
 
 import pandas as pd
 
@@ -23,7 +24,10 @@ class ESPNScraper(SoccerdataScraper):
 
     ESPN provides:
     - Match schedules and results
-    - Basic team information
+    - Per-match lineups and match sheets (team stats + venue)
+
+    League name -> ESPN league id mapping lives in soccerdata
+    (``soccerdata._config.LEAGUE_DICT``).
 
     Usage:
         scraper = ESPNScraper(
@@ -36,19 +40,6 @@ class ESPNScraper(SoccerdataScraper):
     SOURCE_NAME = 'espn'
     DEFAULT_RATE_LIMIT = 30
 
-    # ESPN league ID mapping
-    LEAGUE_IDS = {
-        'ENG-Premier League': 'eng.1',
-        'ESP-La Liga': 'esp.1',
-        'GER-Bundesliga': 'ger.1',
-        'ITA-Serie A': 'ita.1',
-        'FRA-Ligue 1': 'fra.1',
-        'USA-MLS': 'usa.1',
-        'ENG-Championship': 'eng.2',
-        'ENG-League One': 'eng.3',
-        'ENG-League Two': 'eng.4',
-    }
-
     def __init__(
         self,
         leagues: Optional[List[str]] = None,
@@ -60,6 +51,10 @@ class ESPNScraper(SoccerdataScraper):
         # #817: guards the one-shot COVID-season calendar seed (see
         # _seed_2021_season_calendar) so it re-downloads at most once per run.
         self._covid_2021_seeded = False
+        # game_ids whose cached pre-kickoff Summary stub was already
+        # re-downloaded this run (see _prepare_summary_fetch) — bounds the
+        # heal path to one request per match per run.
+        self._stale_refetched: Set[int] = set()
 
     def _get_reader(self):
         """Get soccerdata ESPN reader."""
@@ -134,6 +129,7 @@ class ESPNScraper(SoccerdataScraper):
 
             if df is not None and not df.empty:
                 df = df.reset_index()
+                df = self._enrich_schedule_from_scoreboards(df, reader)
                 df = self._add_metadata(df, 'schedule')
 
             return df
@@ -145,6 +141,81 @@ class ESPNScraper(SoccerdataScraper):
             logger.error(f"Error reading schedule: {e}")
             raise
 
+    # Result columns joined onto the schedule from the scoreboard JSONs.
+    _SCHEDULE_RESULT_COLS = ('home_goals', 'away_goals', 'status', 'venue',
+                             'attendance')
+
+    def _enrich_schedule_from_scoreboards(
+        self, df: pd.DataFrame, reader
+    ) -> pd.DataFrame:
+        """Join score/status/venue/attendance onto the schedule from the
+        scoreboard JSONs ``read_schedule`` just fetched/cached.
+
+        soccerdata's ESPN reader extracts only date/teams/game_id, so without
+        this bronze.espn_schedule carries no result columns at all. Zero extra
+        traffic: only cache files already written for the schedule's own match
+        dates are read. Values stay nullable strings (bronze is stringly
+        typed; silver casts). A missing/broken cache file leaves NULLs — this
+        never fails the schedule save.
+        """
+        required = {'date', 'league_id', 'game_id'}
+        if not required.issubset(df.columns):
+            logger.warning(
+                "schedule enrichment skipped — missing columns %s",
+                sorted(required - set(df.columns)),
+            )
+            return df
+
+        df = df.copy()
+        events: Dict[int, Dict] = {}
+        dates = pd.to_datetime(df['date'], utc=True, errors='coerce')
+        pairs = {
+            (str(lid), d.strftime('%Y%m%d'))
+            for lid, d in zip(df['league_id'], dates)
+            if pd.notna(d) and pd.notna(lid)
+        }
+        for lkey, day in sorted(pairs):
+            fp = reader.data_dir / f"Schedule_{lkey}_{day}.json"
+            if not fp.exists():
+                continue
+            try:
+                data = json.loads(fp.read_text())
+            except Exception:
+                continue
+            for e in data.get('events', []):
+                try:
+                    comp = e['competitions'][0]
+                    comps = comp.get('competitors', [])
+                    home = next(
+                        (c for c in comps if c.get('homeAway') == 'home'), None
+                    )
+                    away = next(
+                        (c for c in comps if c.get('homeAway') == 'away'), None
+                    )
+                    events[int(e['id'])] = {
+                        'home_goals': (home or {}).get('score'),
+                        'away_goals': (away or {}).get('score'),
+                        'status': ((e.get('status') or {}).get('type')
+                                   or {}).get('name'),
+                        'venue': (comp.get('venue') or {}).get('fullName'),
+                        'attendance': comp.get('attendance'),
+                    }
+                except Exception:
+                    continue
+
+        if not events:
+            logger.warning(
+                "schedule: no scoreboard cache files readable — result "
+                "columns stay NULL"
+            )
+        for col in self._SCHEDULE_RESULT_COLS:
+            df[col] = [
+                events.get(int(g), {}).get(col) if pd.notna(g) else None
+                for g in df['game_id']
+            ]
+            df[col] = df[col].astype('string').where(df[col].notna(), None)
+        return df
+
     def _sanitize_match_cache(self, reader, gid) -> bool:
         """Drop roster players with an empty athlete record from the cached ESPN
         match JSON so soccerdata can parse the rest of the match.
@@ -155,7 +226,6 @@ class ESPNScraper(SoccerdataScraper):
         West Ham–Stoke 2018-04-16, one nameless Stoke sub). Returns True if any
         player was removed (so the caller can retry the parse).
         """
-        import json
         fp = reader.data_dir / f"Summary_{int(gid)}.json"
         if not fp.exists():
             return False
@@ -176,7 +246,12 @@ class ESPNScraper(SoccerdataScraper):
             fp.write_text(json.dumps(data))
         return changed
 
-    def _read_per_match(self, method_name: str, entity: str) -> Optional[pd.DataFrame]:
+    def _read_per_match(
+        self,
+        method_name: str,
+        entity: str,
+        skip_existing: bool = True,
+    ) -> Optional[pd.DataFrame]:
         """Read a per-match entity (lineup/matchsheet) match-by-match.
 
         soccerdata's bulk ``read_lineup``/``read_matchsheet`` abort the WHOLE
@@ -185,55 +260,206 @@ class ESPNScraper(SoccerdataScraper):
         seen in some older seasons. Iterating per ``match_id`` and skipping only
         the broken matches keeps the rest of the season instead of losing it all
         (resilience for #713 historical backfill).
+
+        Traffic/staleness contract:
+        - unplayed matches are never fetched — their Summary would be cached
+          forever (soccerdata MAXAGE=None) as a pre-kickoff stub, permanently
+          masking the real lineups/stats;
+        - a cached stub for an already-played match is re-downloaded once per
+          run (heals a poisoned cache; see _prepare_summary_fetch);
+        - ``reader.read_schedule`` is memoized for the duration of the loop:
+          soccerdata re-runs it inside EVERY per-match call, and in a live
+          season that re-downloads every date scoreboard with no_cache=True —
+          O(matches x match days) HTTP requests without the memo;
+        - with ``skip_existing`` games already materialised in bronze are
+          dropped up front (#842 pattern), so a steady-state daily run costs
+          only the new matches.
         """
         reader = self._get_reader()
         # #817: per-match readers also discover game_ids via read_schedule, so
         # the COVID-season calendar must be seeded here too (idempotent).
         self._seed_2021_season_calendar(reader)
         logger.info(f"Fetching ESPN {entity} (per-match, resilient)")
-        sched = self._execute_with_resilience(reader.read_schedule)
-        if sched is None or sched.empty:
+        sched_raw = self._execute_with_resilience(reader.read_schedule)
+        if sched_raw is None or sched_raw.empty:
             return None
-        game_ids = sched.reset_index()['game_id'].dropna().tolist()
+        sched = sched_raw.reset_index()
+        sched = sched[sched['game_id'].notna()]
+
+        kickoff = pd.to_datetime(sched['date'], utc=True, errors='coerce')
+        played = sched[kickoff.notna() & (kickoff < pd.Timestamp.now(tz='UTC'))]
+        if len(played) < len(sched):
+            logger.info(
+                f"{entity}: {len(sched) - len(played)}/{len(sched)} matches "
+                f"not played yet — deferred to a later run"
+            )
+        sched = played
+
+        if skip_existing:
+            existing = self._existing_game_keys(
+                f'espn_{entity}',
+                sched,
+                # A pre-fix matchsheet stub row (venue only, no stats) must
+                # not count as ingested — probe on a stats column so the stub
+                # is re-scraped and healed.
+                non_null_col='total_shots' if entity == 'matchsheet' else None,
+            )
+            if existing:
+                before = len(sched)
+                sched = sched[~sched['game'].isin(existing)]
+                logger.info(
+                    f"{entity}: skip-existing dropped {before - len(sched)}/"
+                    f"{before} already-ingested matches"
+                )
+        if sched.empty:
+            logger.info(f"{entity}: no new matches to fetch (no-op)")
+            return None
+
         method = getattr(reader, method_name)
         frames: List[pd.DataFrame] = []
         skipped: List = []
-        for gid in game_ids:
-            try:
-                d = method(match_id=int(gid))
-                if d is not None and not d.empty:
-                    frames.append(d)
-            except Exception as e:
-                # One roster player with an empty athlete record (only 'links',
-                # no displayName) makes soccerdata KeyError on the WHOLE match.
-                # Drop the nameless player(s) from the cached match JSON and retry
-                # once, so the other ~35 players in that match survive (#713).
-                salvaged = False
-                if self._sanitize_match_cache(reader, gid):
-                    try:
-                        d = method(match_id=int(gid))
-                        if d is not None and not d.empty:
-                            frames.append(d)
-                        salvaged = True
-                        logger.info(
-                            f"{entity}: salvaged match {gid} after dropping nameless player(s)"
-                        )
-                    except Exception as e2:
-                        e = e2
-                if not salvaged:
+        # Memoize the schedule while iterating — soccerdata's per-match
+        # readers call read_schedule() again on EVERY invocation.
+        orig_read_schedule = reader.read_schedule
+        reader.read_schedule = lambda *args, **kwargs: sched_raw
+        try:
+            for row in sched.itertuples(index=False):
+                gid = int(row.game_id)
+                self._prepare_summary_fetch(reader, row.league_id, gid)
+                try:
+                    d = method(match_id=gid)
+                    if d is not None and not d.empty:
+                        frames.append(d)
+                except ConnectionError as e:
+                    # soccerdata already retried the download 5x internally —
+                    # transient outage, not malformed data. The next run picks
+                    # the match up again (it never reached bronze, so
+                    # skip-existing won't drop it).
                     skipped.append(gid)
-                    logger.warning(f"{entity}: skipping match {gid} (malformed ESPN data: {e})")
+                    logger.warning(
+                        f"{entity}: skipping match {gid} (network error: {e})"
+                    )
+                except Exception as e:
+                    # One roster player with an empty athlete record (only
+                    # 'links', no displayName) makes soccerdata KeyError on the
+                    # WHOLE match. Drop the nameless player(s) from the cached
+                    # match JSON and retry once, so the other ~35 players in
+                    # that match survive (#713).
+                    salvaged = False
+                    if self._sanitize_match_cache(reader, gid):
+                        try:
+                            d = method(match_id=gid)
+                            if d is not None and not d.empty:
+                                frames.append(d)
+                            salvaged = True
+                            logger.info(
+                                f"{entity}: salvaged match {gid} after "
+                                f"dropping nameless player(s)"
+                            )
+                        except Exception as e2:
+                            e = e2
+                    if not salvaged:
+                        skipped.append(gid)
+                        logger.warning(
+                            f"{entity}: skipping match {gid} "
+                            f"(malformed ESPN data: {e})"
+                        )
+        finally:
+            reader.read_schedule = orig_read_schedule
         if skipped:
             logger.warning(
-                f"{entity}: skipped {len(skipped)}/{len(game_ids)} matches with malformed data"
+                f"{entity}: skipped {len(skipped)}/{len(sched)} matches"
             )
         if not frames:
             return None
         return pd.concat(frames)
 
-    def read_lineup(self) -> Optional[pd.DataFrame]:
+    def _prepare_summary_fetch(self, reader, league_id, gid: int) -> None:
+        """Pace and pre-heal the Summary download for one match.
+
+        - Summary not cached yet: the per-match reader is about to download
+          it — take a rate-limiter slot (soccerdata's own rate_limit is 0 and
+          ``_execute_with_resilience`` never sees these inner requests).
+        - Summary cached WITHOUT any roster for an already-played match: a
+          pre-kickoff stub that soccerdata would trust forever (MAXAGE=None).
+          Force one re-download per run via ``reader.get`` so the request
+          reuses soccerdata's session/retry machinery.
+        """
+        fp = reader.data_dir / f"Summary_{gid}.json"
+        if not fp.exists():
+            self._rate_limiter.acquire()
+            return
+        if gid in self._stale_refetched or not self._summary_is_stub(fp):
+            return
+        self._stale_refetched.add(gid)
+        self._rate_limiter.acquire()
+        url = f"{self._ESPN_API}/{league_id}/summary?event={gid}"
+        logger.info(f"re-fetching pre-kickoff Summary stub for match {gid}")
+        reader.get(url, fp, no_cache=True)
+
+    @staticmethod
+    def _summary_is_stub(fp) -> bool:
+        """True when the cached match JSON carries no lineup at all — the
+        shape ESPN serves before kickoff. Unreadable file -> False (leave it
+        to the normal parse/sanitize path)."""
+        try:
+            data = json.loads(fp.read_text())
+        except Exception:
+            return False
+        return not any(
+            r.get("roster") for r in data.get("rosters", [])
+            if isinstance(r, dict)
+        )
+
+    def _existing_game_keys(
+        self,
+        table: str,
+        sched: pd.DataFrame,
+        non_null_col: Optional[str] = None,
+    ) -> Optional[Set[str]]:
+        """Game keys already materialised in ``bronze.<table>`` for the
+        (league, season) pairs in ``sched`` — the skip-existing probe
+        (pattern #842; SofaScore/FBref key theirs the same way).
+
+        ``non_null_col`` narrows the probe to rows where that column is
+        filled. Returns ``None`` when the probe fails — the caller then
+        treats every match as new, which is duplicate-safe because the saves
+        replace per (league, season, game).
+        """
+        try:
+            if not self._iceberg_writer.table_exists('bronze', table):
+                return set()
+            trino = self._iceberg_writer._get_trino_manager()
+            catalog = self._iceberg_writer.catalog
+            keys: Set[str] = set()
+            pairs = sched[['league', 'season']].drop_duplicates()
+            for lg, ss in pairs.itertuples(index=False):
+                lg_esc = str(lg).replace("'", "''")
+                ss_esc = str(ss).replace("'", "''")
+                where = (
+                    f"league = '{lg_esc}' "
+                    f"AND CAST(season AS varchar) = '{ss_esc}'"
+                )
+                if non_null_col:
+                    where += f" AND {non_null_col} IS NOT NULL"
+                rows = trino.execute_query(
+                    f"SELECT DISTINCT game FROM {catalog}.bronze.{table} "
+                    f"WHERE {where}"
+                )
+                keys.update(r[0] for r in rows if r and r[0])
+            return keys
+        except Exception as e:
+            logger.warning(
+                f"skip-existing probe on bronze.{table} failed ({e}) — "
+                f"treating all matches as new"
+            )
+            return None
+
+    def read_lineup(self, skip_existing: bool = True) -> Optional[pd.DataFrame]:
         """Read per-match lineups (one row per player per game)."""
-        df = self._read_per_match('read_lineup', 'lineup')
+        df = self._read_per_match(
+            'read_lineup', 'lineup', skip_existing=skip_existing
+        )
         if df is not None and not df.empty:
             df = df.reset_index()
             df = self._add_metadata(df, 'lineup')
@@ -248,11 +474,16 @@ class ESPNScraper(SoccerdataScraper):
                     df[col] = df[col].astype('string').where(df[col].notna(), None)
         return df
 
-    def read_matchsheet(self) -> Optional[pd.DataFrame]:
+    def read_matchsheet(self, skip_existing: bool = True) -> Optional[pd.DataFrame]:
         """Read match-level team stats + venue (one row per game per team)."""
-        df = self._read_per_match('read_matchsheet', 'matchsheet')
+        df = self._read_per_match(
+            'read_matchsheet', 'matchsheet', skip_existing=skip_existing
+        )
         if df is not None and not df.empty:
             df = df.reset_index()
+            # The raw roster blob duplicates espn_lineup row-by-row and only
+            # bloats the partition — never ship it to bronze.
+            df = df.drop(columns=['roster'], errors='ignore')
             df = self._add_metadata(df, 'matchsheet')
             # bronze.espn_matchsheet declares every stat column as varchar,
             # but soccerdata returns numeric/NaN — coerce every object column
@@ -279,20 +510,10 @@ class ESPNScraper(SoccerdataScraper):
 
         df = df.copy()
 
-        # Common column renames
-        column_mapping = {
-            'date': 'match_date',
-            'home_team': 'home_team',
-            'away_team': 'away_team',
-            'home_score': 'home_goals',
-            'away_score': 'away_goals',
-            'venue': 'venue',
-            'attendance': 'attendance',
-        }
-
-        for old_col, new_col in column_mapping.items():
-            if old_col in df.columns and old_col != new_col:
-                df = df.rename(columns={old_col: new_col})
+        # Result columns (home_goals, venue, ...) arrive pre-named from
+        # _enrich_schedule_from_scoreboards; only the date needs renaming.
+        if 'date' in df.columns:
+            df = df.rename(columns={'date': 'match_date'})
 
         return df
 
@@ -317,7 +538,11 @@ class ESPNScraper(SoccerdataScraper):
 
     def scrape_all(self) -> Dict[str, str]:
         """
-        Scrape all ESPN data.
+        Scrape the ESPN schedule (schedule-only convenience entrypoint).
+
+        The production path is ``dags/scripts/run_espn_scraper.py``, which
+        writes all three bronze tables (schedule + lineup + matchsheet) and
+        wires the completeness guard / skip-existing flags per entity.
 
         Returns:
             Dictionary mapping data type to Iceberg table path
