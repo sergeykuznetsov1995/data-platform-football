@@ -89,6 +89,13 @@ def main():
              'shrinks the existing partition. Use for a deliberate first '
              'backfill or a known legitimate shrink.'
     )
+    parser.add_argument(
+        '--full-players',
+        action='store_true',
+        help='Re-fetch every squad player in player_details instead of only '
+             'players missing from Bronze. Run periodically to refresh stale '
+             'career/market-value payloads.'
+    )
     args = parser.parse_args()
 
     leagues = [l.strip() for l in args.leagues.split(',')]
@@ -109,7 +116,8 @@ def main():
         from scrapers.base.base_scraper import ReplaceGuardError
         from scrapers.fotmob import FotMobScraper
 
-        with FotMobScraper(leagues=leagues, seasons=[args.season]) as scraper:
+        with FotMobScraper(leagues=leagues, seasons=[args.season],
+                           full_players=args.full_players) as scraper:
             for key, table_name, read_fn in entities:
                 row_count = 0
                 for league in leagues:
