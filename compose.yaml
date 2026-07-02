@@ -30,7 +30,6 @@ x-airflow-common: &airflow-common
     AIRFLOW__CELERY__BROKER_URL: ${AIRFLOW__CELERY__BROKER_URL}
     AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW__WEBSERVER__SECRET_KEY}
     AIRFLOW__WEBSERVER__EXPOSE_CONFIG: ${AIRFLOW__WEBSERVER__EXPOSE_CONFIG}
-    SPARK_MASTER_URL: ${SPARK_MASTER_URL}
     TRINO_PASSWORD: ${TRINO_PASSWORD}
     TRINO_PORT: ${TRINO_PORT}
     # Route FlareSolverr scrapers (WhoScored/SoFIFA) through the ad-tech filter (#652).
@@ -43,14 +42,15 @@ x-airflow-common: &airflow-common
   volumes:
     - ./dags:/opt/airflow/dags
     - ./logs:/opt/airflow/logs
-    - ./spark_jobs:/opt/airflow/spark_jobs
-    - ./configs/spark:/opt/spark/conf
     # E1 medallion config: team_aliases.yaml + competitions.yaml — read-only
     # for utils/medallion_config.py (default CONFIG_DIR=/opt/airflow/configs/medallion)
     - ./configs/medallion:/opt/airflow/configs/medallion:ro
     - ./scrapers:/opt/airflow/scrapers
     - ./scripts:/opt/airflow/scripts
     - ./proxys.txt:/opt/airflow/proxys.txt:ro
+    # Tier-2 dbt pilot: dbt project rendered/run by Cosmos (dag_dbt_fbref_silver).
+    # rw so `dbt deps`/`dbt` can write dbt_packages/ + target/ (both gitignored).
+    - ./transform:/opt/airflow/transform
     # soccerdata page cache (SoFIFA et al.): survives container recreation so
     # a task retry / redeploy mid long crawl (~546 player pages) reuses cached
     # pages instead of refetching. Files are keyed by sofifa version_id, so
@@ -70,105 +70,113 @@ x-airflow-common: &airflow-common
 
 services:
   # ===========================================================================
-  # HDFS - Distributed File System
+  # SeaweedFS - S3-compatible object storage (replaces HDFS)
+  # `mini` = single-process dev mode (master+volume+filer+S3). -bucket pre-creates
+  # the warehouse bucket; -s3.config supplies static credentials (no STS/vending).
   # ===========================================================================
-  namenode:
-    build:
-      context: ./docker/images/hdfs
-      dockerfile: Dockerfile
-    container_name: namenode
-    hostname: namenode
+  seaweedfs:
+    image: chrislusf/seaweedfs:4.36
+    container_name: seaweedfs
+    hostname: seaweedfs
     restart: unless-stopped
-    environment:
-      - CLUSTER_NAME=data-platform
-      - HDFS_NAMENODE_USER=root
-      - HDFS_DATANODE_USER=root
-      - HDFS_SECONDARYNAMENODE_USER=root
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETGID
+      - SETUID
+      - DAC_OVERRIDE
+      - FOWNER
+    command:
+      - mini
+      - -dir=/data
+      - -bucket=${ICEBERG_WAREHOUSE}
+      - -s3.config=/etc/seaweedfs/s3.config.json
     ports:
-      - "127.0.0.1:9870:9870"  # Web UI
-      - "127.0.0.1:9000:9000"  # HDFS port
+      - "127.0.0.1:8333:8333"  # S3 API
     volumes:
-      - namenode_data:/hadoop/dfs/name
-      - ./configs/hdfs:/opt/hadoop/etc/hadoop
+      - seaweedfs_data:/data
+      - ./configs/seaweedfs/s3.config.json:/etc/seaweedfs/s3.config.json:ro
     networks:
       - storage
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://namenode:9870/"]
-      interval: 30s
-      timeout: 10s
+      test: ["CMD", "curl", "-f", "http://localhost:8333/status"]
+      interval: 10s
+      timeout: 5s
       retries: 5
-      start_period: 60s
-    command: ["hdfs", "namenode"]
+      start_period: 20s
     deploy:
       resources:
         limits:
           memory: 1G
         reservations:
+          memory: 256M
+
+  # ===========================================================================
+  # Lakekeeper - Iceberg REST Catalog (replaces Hive Metastore)
+  # Rust single binary backed by Postgres. `migrate` runs schema migrations once;
+  # `serve` exposes the REST catalog on :8181. Warehouse + bootstrap created via
+  # `make bootstrap-catalog` (curl to the management API).
+  # ===========================================================================
+  lakekeeper-migrate:
+    image: quay.io/lakekeeper/catalog:v0.13.0
+    container_name: lakekeeper-migrate
+    command: ["migrate"]
+    restart: "no"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    environment:
+      LAKEKEEPER__PG_ENCRYPTION_KEY: ${LAKEKEEPER_PG_ENCRYPTION_KEY}
+      LAKEKEEPER__PG_DATABASE_URL_READ: postgresql://lakekeeper:${LAKEKEEPER_DB_PASSWORD}@postgres:5432/lakekeeper
+      LAKEKEEPER__PG_DATABASE_URL_WRITE: postgresql://lakekeeper:${LAKEKEEPER_DB_PASSWORD}@postgres:5432/lakekeeper
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - backend
+
+  lakekeeper:
+    image: quay.io/lakekeeper/catalog:v0.13.0
+    container_name: lakekeeper
+    hostname: lakekeeper
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    command: ["serve"]
+    environment:
+      LAKEKEEPER__PG_ENCRYPTION_KEY: ${LAKEKEEPER_PG_ENCRYPTION_KEY}
+      LAKEKEEPER__PG_DATABASE_URL_READ: postgresql://lakekeeper:${LAKEKEEPER_DB_PASSWORD}@postgres:5432/lakekeeper
+      LAKEKEEPER__PG_DATABASE_URL_WRITE: postgresql://lakekeeper:${LAKEKEEPER_DB_PASSWORD}@postgres:5432/lakekeeper
+    ports:
+      - "127.0.0.1:8181:8181"
+    networks:
+      - backend
+      - storage
+    depends_on:
+      lakekeeper-migrate:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      seaweedfs:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/home/nonroot/lakekeeper", "healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    deploy:
+      resources:
+        limits:
           memory: 512M
-
-  datanode1:
-    build:
-      context: ./docker/images/hdfs
-      dockerfile: Dockerfile
-    container_name: datanode1
-    hostname: datanode1
-    restart: unless-stopped
-    environment:
-      - HDFS_NAMENODE_USER=root
-      - HDFS_DATANODE_USER=root
-    volumes:
-      - datanode1_data:/hadoop/dfs/data
-      - ./configs/hdfs:/opt/hadoop/etc/hadoop
-    networks:
-      - storage
-    depends_on:
-      namenode:
-        condition: service_healthy
-    healthcheck:
-      test: ["CMD-SHELL", "curl -f http://$(hostname):9864/ || exit 1"]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-      start_period: 30s
-    command: ["hdfs", "datanode"]
-    deploy:
-      resources:
-        limits:
-          memory: 640M
         reservations:
-          memory: 256M
-
-  datanode2:
-    build:
-      context: ./docker/images/hdfs
-      dockerfile: Dockerfile
-    container_name: datanode2
-    hostname: datanode2
-    restart: unless-stopped
-    environment:
-      - HDFS_NAMENODE_USER=root
-      - HDFS_DATANODE_USER=root
-    volumes:
-      - datanode2_data:/hadoop/dfs/data
-      - ./configs/hdfs:/opt/hadoop/etc/hadoop
-    networks:
-      - storage
-    depends_on:
-      namenode:
-        condition: service_healthy
-    healthcheck:
-      test: ["CMD-SHELL", "curl -f http://$(hostname):9864/ || exit 1"]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-      start_period: 30s
-    command: ["hdfs", "datanode"]
-    deploy:
-      resources:
-        limits:
-          memory: 640M
-        reservations:
-          memory: 256M
+          memory: 128M
 
   # ===========================================================================
   # PostgreSQL - Metadata Storage
@@ -193,7 +201,7 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       POSTGRES_DB: ${POSTGRES_DB}
       AIRFLOW_DB_PASSWORD: ${AIRFLOW_DB_PASSWORD}
-      HIVE_METASTORE_DB_PASSWORD: ${HIVE_METASTORE_DB_PASSWORD}
+      LAKEKEEPER_DB_PASSWORD: ${LAKEKEEPER_DB_PASSWORD}
       SUPERSET_DB_PASSWORD: ${SUPERSET_DB_PASSWORD}
       OPENMETADATA_DB_PASSWORD: ${OPENMETADATA_DB_PASSWORD}
     ports:
@@ -212,197 +220,12 @@ services:
     deploy:
       resources:
         limits:
-          memory: 256M
+          # One instance serves Airflow + Lakekeeper + Superset + OpenMetadata;
+          # 256M sat at ~82% during normal load — backfill bursts (Airflow
+          # heartbeats + Lakekeeper commits) need headroom (#847).
+          memory: 1G
         reservations:
           memory: 128M
-
-  # ===========================================================================
-  # Hive Metastore
-  # ===========================================================================
-  hive-metastore:
-    build:
-      context: ./docker/images/hive
-      dockerfile: Dockerfile
-    container_name: hive-metastore
-    hostname: hive-metastore
-    restart: unless-stopped
-    security_opt:
-      - no-new-privileges:true
-    cap_drop:
-      - ALL
-    cap_add:
-      - CHOWN
-      - SETGID
-      - SETUID
-    environment:
-      SERVICE_NAME: metastore
-      DB_DRIVER: postgres
-      HADOOP_CLIENT_OPTS: >-
-        -Xmx512m
-      SERVICE_OPTS: >-
-        -Djavax.jdo.option.ConnectionDriverName=org.postgresql.Driver
-        -Djavax.jdo.option.ConnectionURL=jdbc:postgresql://postgres:5432/hive_metastore
-        -Djavax.jdo.option.ConnectionUserName=hive
-        -Djavax.jdo.option.ConnectionPassword=${HIVE_METASTORE_DB_PASSWORD}
-    ports:
-      - "127.0.0.1:9083:9083"
-    volumes:
-      - ./configs/hive:/opt/hive/conf
-      - hive_warehouse:/user/hive/warehouse
-    networks:
-      - backend
-      - storage
-    depends_on:
-      postgres:
-        condition: service_healthy
-      namenode:
-        condition: service_healthy
-      datanode1:
-        condition: service_healthy
-    healthcheck:
-      test: ["CMD-SHELL", "bash -c 'echo > /dev/tcp/localhost/9083'"]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-      start_period: 120s
-    deploy:
-      resources:
-        limits:
-          memory: 768M
-        reservations:
-          memory: 384M
-
-  # ===========================================================================
-  # Spark Cluster
-  # ===========================================================================
-  spark-master:
-    profiles: ["heavy"]
-    build:
-      context: ./docker/images/spark
-      dockerfile: Dockerfile
-    container_name: spark-master
-    hostname: spark-master
-    security_opt:
-      - no-new-privileges:true
-    cap_drop:
-      - ALL
-    cap_add:
-      - CHOWN
-      - SETGID
-      - SETUID
-    environment:
-      - SPARK_MODE=master
-      - SPARK_MASTER_HOST=spark-master
-      - SPARK_MASTER_PORT=7077
-      - SPARK_MASTER_WEBUI_PORT=8080
-    ports:
-      - "127.0.0.1:8080:8080"  # Web UI
-      - "127.0.0.1:7077:7077"  # Spark Master
-    volumes:
-      - ./configs/spark:/opt/spark/conf
-      - ./spark_jobs:/opt/spark_jobs
-    networks:
-      - storage
-    depends_on:
-      hive-metastore:
-        condition: service_healthy
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/"]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-      start_period: 30s
-    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.master.Master"]
-    deploy:
-      resources:
-        limits:
-          memory: 512M
-        reservations:
-          memory: 256M
-
-  spark-worker-1:
-    profiles: ["heavy"]
-    build:
-      context: ./docker/images/spark
-      dockerfile: Dockerfile
-    container_name: spark-worker-1
-    hostname: spark-worker-1
-    security_opt:
-      - no-new-privileges:true
-    cap_drop:
-      - ALL
-    cap_add:
-      - CHOWN
-      - SETGID
-      - SETUID
-    environment:
-      - SPARK_MODE=worker
-      - SPARK_MASTER_URL=spark://spark-master:7077
-      - SPARK_WORKER_MEMORY=512M
-      - SPARK_WORKER_CORES=2
-    volumes:
-      - ./configs/spark:/opt/spark/conf
-      - ./spark_jobs:/opt/spark_jobs
-    networks:
-      - storage
-    depends_on:
-      spark-master:
-        condition: service_healthy
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8081/"]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-      start_period: 30s
-    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.worker.Worker", "spark://spark-master:7077"]
-    deploy:
-      resources:
-        limits:
-          memory: 512M
-        reservations:
-          memory: 256M
-
-  spark-worker-2:
-    profiles: ["heavy"]
-    build:
-      context: ./docker/images/spark
-      dockerfile: Dockerfile
-    container_name: spark-worker-2
-    hostname: spark-worker-2
-    security_opt:
-      - no-new-privileges:true
-    cap_drop:
-      - ALL
-    cap_add:
-      - CHOWN
-      - SETGID
-      - SETUID
-    environment:
-      - SPARK_MODE=worker
-      - SPARK_MASTER_URL=spark://spark-master:7077
-      - SPARK_WORKER_MEMORY=512M
-      - SPARK_WORKER_CORES=2
-    volumes:
-      - ./configs/spark:/opt/spark/conf
-      - ./spark_jobs:/opt/spark_jobs
-    networks:
-      - storage
-    depends_on:
-      spark-master:
-        condition: service_healthy
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8081/"]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-      start_period: 30s
-    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.worker.Worker", "spark://spark-master:7077"]
-    deploy:
-      resources:
-        limits:
-          memory: 512M
-        reservations:
-          memory: 256M
 
   # ===========================================================================
   # Redis - Celery Broker for Airflow
@@ -462,7 +285,9 @@ services:
     environment:
       - TOR_NewCircuitPeriod=30
       - TOR_MaxCircuitDirtiness=60
-      - PASSWORD=${TOR_CONTROL_PASSWORD}
+      # :- default silences the unset-variable warning on every compose call
+      # (tor is heavy-profile only; control port is bound to 127.0.0.1).
+      - PASSWORD=${TOR_CONTROL_PASSWORD:-}
     healthcheck:
       test: ["CMD-SHELL", "curl --socks5 localhost:9050 -s https://check.torproject.org/api/ip | grep -q IsTor || exit 1"]
       interval: 60s
@@ -527,11 +352,13 @@ services:
         limits:
           # 4G OOM-killed a long sofifa backfill run (python rss ~3G after 5h
           # of FS-crashloop retries + scheduler ~0.8G, dmesg 2026-07-02).
-          # 8G gives console-run scrapers headroom next to the scheduler.
+          # 8G gives console-run scrapers headroom next to the scheduler (#847).
           memory: 8G
         reservations:
           memory: 1G
-    # Swap as safety buffer for memory spikes (matches the limit above).
+    # NOTE: host swap is currently 0 — memswap_limit is a no-op (ceiling equals
+    # the 8G memory limit). Kept for the day a swapfile is enabled; do NOT rely
+    # on it as a buffer beyond the limit (#847 review).
     memswap_limit: 10G
 
   airflow-webserver:
@@ -565,7 +392,7 @@ services:
   # Trino - Distributed SQL Query Engine
   # ===========================================================================
   trino:
-    image: trinodb/trino:479
+    image: trinodb/trino:482
     container_name: trino
     hostname: trino
     restart: unless-stopped
@@ -578,8 +405,11 @@ services:
       - SETGID
       - SETUID
     environment:
-      - HADOOP_CONF_DIR=/etc/trino
       - TRINO_KEYSTORE_PASSWORD=${TRINO_KEYSTORE_PASSWORD:-changeit}
+      # Static S3 credentials for the Iceberg REST catalog (no vended creds).
+      # Referenced as ${ENV:S3_ACCESS_KEY} / ${ENV:S3_SECRET_KEY} in iceberg.properties.
+      - S3_ACCESS_KEY=${S3_ACCESS_KEY}
+      - S3_SECRET_KEY=${S3_SECRET_KEY}
     ports:
       - "127.0.0.1:8082:8443"
       - "[::1]:8082:8443"
@@ -590,7 +420,9 @@ services:
       - backend
       - storage
     depends_on:
-      hive-metastore:
+      lakekeeper:
+        condition: service_healthy
+      seaweedfs:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "curl", "-f", "-k", "https://localhost:8443/v1/info"]
@@ -601,7 +433,13 @@ services:
     deploy:
       resources:
         limits:
-          memory: 5G
+          # 5G caused silent memcg-OOM restarts every 20-50 min under bronze
+          # write load (#847): JVM RSS = 3.5G heap + parquet/direct buffers +
+          # metaspace + code cache > 5G; the kernel kills java, the launcher
+          # (PID 1) exits 0, so Docker never sets OOMKilled — it looks like an
+          # external restart. 8G leaves ~4G native headroom over the 4G heap
+          # (configs/trino/jvm.config).
+          memory: 8G
         reservations:
           memory: 1G
 
@@ -609,7 +447,10 @@ services:
   # Superset - BI / Dashboards
   # ===========================================================================
   superset:
-    image: data-platform/superset:4.1.1
+    image: data-platform/superset:4.1.2
+    build:
+      context: ./docker/images/superset
+      dockerfile: Dockerfile
     container_name: superset
     hostname: superset
     security_opt:
@@ -665,7 +506,7 @@ services:
 
   superset-worker:
     profiles: ["heavy"]
-    image: data-platform/superset:4.1.1
+    image: data-platform/superset:4.1.2
     container_name: superset-worker
     hostname: superset-worker
     security_opt:
@@ -708,7 +549,7 @@ services:
 
   superset-beat:
     profiles: ["heavy"]
-    image: data-platform/superset:4.1.1
+    image: data-platform/superset:4.1.2
     container_name: superset-beat
     hostname: superset-beat
     security_opt:
@@ -749,13 +590,14 @@ services:
           memory: 64M
 
   # ===========================================================================
-  # Elasticsearch - search backend for OpenMetadata
+  # OpenSearch - search backend for OpenMetadata (replaces Elasticsearch).
+  # OM 1.13 ships/tests with opensearchproject/opensearch:3.4.0.
   # ===========================================================================
-  elasticsearch:
+  opensearch:
     profiles: ["heavy"]
-    image: elasticsearch:8.11.4
-    container_name: elasticsearch
-    hostname: elasticsearch
+    image: opensearchproject/opensearch:3.4.0
+    container_name: opensearch
+    hostname: opensearch
     security_opt:
       - no-new-privileges:true
     cap_drop:
@@ -766,11 +608,15 @@ services:
       - SETUID
       - DAC_OVERRIDE
     environment:
+      - cluster.name=opensearch-cluster
+      - node.name=opensearch-node1
       - discovery.type=single-node
-      - xpack.security.enabled=false
-      - ES_JAVA_OPTS=-Xms512m -Xmx512m
-      - cluster.name=openmetadata-cluster
       - bootstrap.memory_lock=false
+      - DISABLE_SECURITY_PLUGIN=true
+      - DISABLE_INSTALL_DEMO_CONFIG=true
+      # Heap trimmed from OM's stock 2g/4g — small catalog, plenty of headroom.
+      - OPENSEARCH_JAVA_OPTS=-Xms1g -Xmx1g
+      - cluster.routing.allocation.disk.threshold_enabled=false
     ulimits:
       memlock:
         soft: -1
@@ -779,7 +625,7 @@ services:
         soft: 65536
         hard: 65536
     volumes:
-      - es_data:/usr/share/elasticsearch/data
+      - opensearch_data:/usr/share/opensearch/data
     networks:
       - backend
     healthcheck:
@@ -792,39 +638,29 @@ services:
     deploy:
       resources:
         limits:
-          memory: 1G
+          memory: 2G
         reservations:
-          memory: 512M
+          memory: 1G
 
   # ===========================================================================
   # OpenMetadata - Data Catalog & Lineage
   # ===========================================================================
-  openmetadata-server:
+  # OM 1.13.x no longer self-migrates on server startup — schema migrations must
+  # run as a separate one-shot (`openmetadata-ops.sh migrate`) before the server
+  # boots. The server depends on it completing successfully.
+  openmetadata-migrate:
     profiles: ["heavy"]
-    image: openmetadata/server:1.5.0
-    container_name: openmetadata-server
-    hostname: openmetadata-server
-    security_opt:
-      - no-new-privileges:true
-    cap_drop:
-      - ALL
-    cap_add:
-      - CHOWN
-      - SETGID
-      - SETUID
-      - DAC_OVERRIDE
+    image: openmetadata/server:1.13.1
+    container_name: openmetadata-migrate
+    command: ["./bootstrap/openmetadata-ops.sh", "migrate"]
     depends_on:
       postgres:
         condition: service_healthy
-      elasticsearch:
+      opensearch:
         condition: service_healthy
     networks:
-      - frontend
       - backend
-    ports:
-      - "127.0.0.1:8585:8585"
-      - "127.0.0.1:8586:8586"
-    environment:
+    environment: &openmetadata-env
       # Database (Postgres)
       DB_DRIVER_CLASS: org.postgresql.Driver
       DB_SCHEME: postgresql
@@ -834,13 +670,14 @@ services:
       DB_USER: openmetadata
       DB_USER_PASSWORD: ${OPENMETADATA_DB_PASSWORD}
       OM_DATABASE: openmetadata
-      # Search (Elasticsearch)
-      ELASTICSEARCH_HOST: elasticsearch
+      # Search (OpenSearch). OM keeps the ELASTICSEARCH_* keys and switches the
+      # client implementation via SEARCH_TYPE=opensearch.
+      ELASTICSEARCH_HOST: opensearch
       ELASTICSEARCH_PORT: 9200
       ELASTICSEARCH_SCHEME: http
       ELASTICSEARCH_USER: ""
       ELASTICSEARCH_PASSWORD: ""
-      SEARCH_TYPE: elasticsearch
+      SEARCH_TYPE: opensearch
       # Authentication / Authorization (basic auth, single admin)
       AUTHENTICATION_PROVIDER: basic
       AUTHENTICATION_AUTHORITY: https://accounts.google.com
@@ -858,6 +695,37 @@ services:
       LOG_LEVEL: INFO
       # Migrations on startup
       MIGRATION_LIMIT_PARAM: 1200
+    restart: "no"
+
+  openmetadata-server:
+    profiles: ["heavy"]
+    image: openmetadata/server:1.13.1
+    container_name: openmetadata-server
+    hostname: openmetadata-server
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETGID
+      - SETUID
+      - DAC_OVERRIDE
+    depends_on:
+      postgres:
+        condition: service_healthy
+      opensearch:
+        condition: service_healthy
+      openmetadata-migrate:
+        condition: service_completed_successfully
+    networks:
+      - frontend
+      - backend
+    ports:
+      - "127.0.0.1:8585:8585"
+      - "127.0.0.1:8586:8586"
+    environment:
+      <<: *openmetadata-env
     restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://localhost:8586/healthcheck | grep -q '\"healthy\":true' || exit 1"]
@@ -868,13 +736,13 @@ services:
     deploy:
       resources:
         limits:
-          memory: 1500M
+          memory: 2G
         reservations:
-          memory: 768M
+          memory: 1G
 
   openmetadata-ingestion:
     profiles: ["heavy"]
-    image: openmetadata/ingestion:1.5.0
+    image: openmetadata/ingestion:1.13.1
     container_name: openmetadata-ingestion
     hostname: openmetadata-ingestion
     security_opt:
@@ -954,7 +822,7 @@ services:
           # 512M held Chromium in a permanent memcg-OOM crashloop during long
           # sofifa/whoscored crawls (dmesg 2026-07-02: chromium killed every
           # ~60s → «tab crashed» storm, ~60s/page). 2G keeps one browser +
-          # session churn comfortably below the ceiling.
+          # session churn comfortably below the ceiling (#847).
           memory: 2G
         reservations:
           memory: 512M
@@ -1015,11 +883,11 @@ networks:
   frontend:
     driver: bridge
     name: dp-frontend
-  # Backend: application services (Airflow, Hive, PostgreSQL, Redis)
+  # Backend: application services (Airflow, Lakekeeper, PostgreSQL, Redis)
   backend:
     driver: bridge
     name: dp-backend
-  # Storage: data storage layer (HDFS, Spark)
+  # Storage: data storage + catalog layer (SeaweedFS, Lakekeeper, Trino)
   storage:
     driver: bridge
     name: dp-storage
@@ -1030,19 +898,13 @@ networks:
 volumes:
   soccerdata_cache:
     name: soccerdata_cache
-  namenode_data:
-    name: namenode_data
-  datanode1_data:
-    name: datanode1_data
-  datanode2_data:
-    name: datanode2_data
+  seaweedfs_data:
+    name: seaweedfs_data
   postgres_data:
     name: postgres_data
-  hive_warehouse:
-    name: hive_warehouse
   redis_data:
     name: redis_data
   superset_home:
     name: superset_home
-  es_data:
-    name: es_data
+  opensearch_data:
+    name: opensearch_data

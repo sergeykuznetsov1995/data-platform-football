@@ -1091,3 +1091,72 @@ class TestFormatSqlValueHardening:
         m = self._manager()
         val = "2024-01-01 00:00:00' x"
         assert m._format_sql_value(val, "TIMESTAMP") == "TIMESTAMP '" + val.replace("'", "''") + "'"
+
+
+class TestTrinoManagerRestartResilience:
+    """#847: a Trino container restart takes ~30-60s (SERVER STARTED ~13s +
+    authenticator warm-up), but the old 3-attempt/18s connect window gave up
+    mid-restart — a backfill that hit the window lost its bronze write (APL
+    16/17, #842). The connect window must outlast a full restart, and the
+    warm-up error ("authenticators were not loaded") must reset the
+    connection exactly like a network-level connection error."""
+
+    def _manager(self):
+        from scrapers.base.trino_manager import TrinoTableManager
+        TrinoTableManager._trino_unreachable = False  # isolate class-level cache
+        return TrinoTableManager()
+
+    def test_connect_retry_window_survives_restart(self):
+        """Cumulative backoff across connect attempts covers >=90s."""
+        with patch.dict('sys.modules', {'trino': MagicMock(), 'trino.dbapi': MagicMock()}):
+            from scrapers.base import trino_manager as tm_mod
+
+            # Arrange — every attempt but the last dies on a refused socket.
+            manager = self._manager()
+            failures = manager._CONNECT_RETRIES - 1
+            attempts = {'n': 0}
+
+            def _flaky():
+                attempts['n'] += 1
+                if attempts['n'] <= failures:
+                    raise ConnectionError('Connection refused')
+                return MagicMock()
+
+            sleeps = []
+            # Act
+            with patch.object(manager, '_create_connection', side_effect=_flaky), \
+                 patch.object(tm_mod.time, 'sleep', side_effect=sleeps.append):
+                manager._connect_with_retry()
+
+            # Assert — connection recovered and total wait outlasts a restart.
+            assert manager._conn is not None
+            assert sum(sleeps) >= 90
+
+    def test_authenticators_not_loaded_resets_connection(self):
+        """The Trino warm-up 500 resets the connection and _execute retries."""
+        with patch.dict('sys.modules', {'trino': MagicMock(), 'trino.dbapi': MagicMock()}):
+            # Arrange — first cursor hits the warm-up 500, reconnect succeeds.
+            manager = self._manager()
+
+            warm_cursor = MagicMock()
+            warm_cursor.execute.side_effect = Exception(
+                'TrinoQueryError: error 500: authenticators were not loaded')
+            warm_conn = MagicMock()
+            warm_conn.cursor.return_value = warm_cursor
+
+            ok_cursor = MagicMock()
+            ok_cursor.fetchall.return_value = []
+            ok_conn = MagicMock()
+            ok_conn.cursor.return_value = ok_cursor
+
+            manager._conn = warm_conn
+            reconnect = MagicMock(
+                side_effect=lambda: setattr(manager, '_conn', ok_conn))
+
+            # Act
+            with patch.object(manager, '_connect_with_retry', reconnect):
+                manager._execute('SELECT 1')
+
+            # Assert — reconnected once, statement re-ran on the new connection.
+            reconnect.assert_called_once()
+            ok_cursor.execute.assert_called_once_with('SELECT 1')
