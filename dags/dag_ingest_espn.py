@@ -88,6 +88,18 @@ def validate_schedule(**context) -> Dict[str, Any]:
     return validate_table('espn_schedule', 'espn_schedule')
 
 
+def validate_lineup(**context) -> Dict[str, Any]:
+    """Fail-closed COUNT(*) wipe-floor for espn_lineup — the per-match tables
+    were the unguarded half of the #466 class (only the schedule had a floor,
+    so a wiped/frozen lineup table passed silently)."""
+    return validate_table('espn_lineup', 'espn_lineup')
+
+
+def validate_matchsheet(**context) -> Dict[str, Any]:
+    """Fail-closed COUNT(*) wipe-floor for espn_matchsheet (see validate_lineup)."""
+    return validate_table('espn_matchsheet', 'espn_matchsheet')
+
+
 # Build arguments for bash command
 leagues_str = ','.join(LEAGUES)
 
@@ -140,12 +152,17 @@ with DAG(
     One DAG = one source: the runner writes all three ESPN Bronze tables in a
     single run (#713):
 
-    - **Schedule** (`bronze.espn_schedule`): match dates, teams, scores, venues
+    - **Schedule** (`bronze.espn_schedule`): match dates, teams + result
+      columns (goals/status/venue/attendance) enriched from the scoreboard
+      JSONs the schedule fetch already downloaded (zero extra traffic)
     - **Lineup** (`bronze.espn_lineup`): one row per player per game
     - **Matchsheet** (`bronze.espn_matchsheet`): match-level team stats + venue
 
-    Lineup/matchsheet iterate per-match endpoints, so a run is much heavier than
-    schedule-only — it holds the `ingest_scraper_pool` slot for the whole scrape.
+    Lineup/matchsheet are incremental: unplayed matches are deferred (a
+    pre-kickoff Summary would be cached forever as a stub) and games already
+    in bronze are skipped, so the steady-state daily run fetches only new
+    matches. Saves replace per (league, season, game). A full re-scrape needs
+    the runner's `--force-replace`.
 
     ### Notes
 
@@ -184,11 +201,29 @@ python dags/scripts/run_espn_scraper.py \\
 
     # Issue #466: hard Trino COUNT(*) floor — runs even if the scrape task
     # failed (trigger_rule='all_done'), so an empty/wiped Bronze table can
-    # never pass silently.
+    # never pass silently. Lineup/matchsheet get the same wipe-floor (they
+    # were the unguarded half of the #466 class).
     validate_schedule_task = PythonOperator(
         task_id='validate_schedule',
         python_callable=validate_schedule,
         trigger_rule='all_done',
     )
 
-    scrape_data_task >> [validate_data_task, validate_schedule_task]
+    validate_lineup_task = PythonOperator(
+        task_id='validate_lineup',
+        python_callable=validate_lineup,
+        trigger_rule='all_done',
+    )
+
+    validate_matchsheet_task = PythonOperator(
+        task_id='validate_matchsheet',
+        python_callable=validate_matchsheet,
+        trigger_rule='all_done',
+    )
+
+    scrape_data_task >> [
+        validate_data_task,
+        validate_schedule_task,
+        validate_lineup_task,
+        validate_matchsheet_task,
+    ]
