@@ -28,6 +28,16 @@ _MIN_REPLACE_RATIO = 0.9
 REPLACE_GUARD_MARKER = 'UNDERSTAT_REPLACE_GUARD'
 
 
+def _record_empty(results: dict, table: str) -> None:
+    """Fail-closed on an empty scrape: an empty frame here means the season is
+    missing from the source/seasons index (e.g. frozen leagues.json cache at
+    season rollover), not "nothing to do" — silence would keep the DAG green
+    while Bronze goes stale."""
+    msg = f"{table}: empty scrape result (0 rows) — season missing on Understat?"
+    logger.error(msg)
+    results['errors'].append(msg)
+
+
 def main():
     parser = argparse.ArgumentParser(description='Run Understat scraper')
     parser.add_argument(
@@ -62,6 +72,7 @@ def main():
 
     results = {
         'tables': [],
+        'leagues': leagues,
         'schedule_rows': 0,
         'shots_rows': 0,
         'player_stats_rows': 0,
@@ -92,6 +103,8 @@ def main():
                     results['tables'].append(table_path)
                     results['schedule_rows'] = len(df)
                     logger.info(f"Saved {len(df)} schedule rows")
+                else:
+                    _record_empty(results, 'understat_schedule')
             except ReplaceGuardError as e:
                 msg = f"{REPLACE_GUARD_MARKER}: {e}"
                 logger.error(msg)
@@ -118,6 +131,8 @@ def main():
                     results['tables'].append(table_path)
                     results['shots_rows'] = len(df)
                     logger.info(f"Saved {len(df)} shot events")
+                else:
+                    _record_empty(results, 'understat_shots')
             except ReplaceGuardError as e:
                 msg = f"{REPLACE_GUARD_MARKER}: {e}"
                 logger.error(msg)
@@ -144,6 +159,8 @@ def main():
                     results['tables'].append(table_path)
                     results['player_stats_rows'] = len(df)
                     logger.info(f"Saved {len(df)} player stats")
+                else:
+                    _record_empty(results, 'understat_players')
             except ReplaceGuardError as e:
                 msg = f"{REPLACE_GUARD_MARKER}: {e}"
                 logger.error(msg)
@@ -170,6 +187,8 @@ def main():
                     results['tables'].append(table_path)
                     results['team_match_stats_rows'] = len(df)
                     logger.info(f"Saved {len(df)} team match stats")
+                else:
+                    _record_empty(results, 'understat_team_match_stats')
             except ReplaceGuardError as e:
                 msg = f"{REPLACE_GUARD_MARKER}: {e}"
                 logger.error(msg)
@@ -196,6 +215,8 @@ def main():
                     results['tables'].append(table_path)
                     results['player_match_stats_rows'] = len(df)
                     logger.info(f"Saved {len(df)} player match stats")
+                else:
+                    _record_empty(results, 'understat_player_match_stats')
             except ReplaceGuardError as e:
                 msg = f"{REPLACE_GUARD_MARKER}: {e}"
                 logger.error(msg)

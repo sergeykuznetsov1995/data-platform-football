@@ -59,11 +59,17 @@ class TestUnderstatScraper:
                 'player': ['Haaland'],
                 'xg': [15.5],
             })
-            reader.read_team_season_stats.return_value = pd.DataFrame({
+            reader.read_team_match_stats.return_value = pd.DataFrame({
                 'league': ['ENG-Premier League'],
                 'season': [2024],
-                'team': ['Man City'],
-                'xg': [75.5],
+                'home_team': ['Man City'],
+                'home_xg': [2.5],
+            })
+            reader.read_player_match_stats.return_value = pd.DataFrame({
+                'league': ['ENG-Premier League'],
+                'season': [2024],
+                'player': ['Haaland'],
+                'xg': [0.9],
             })
 
             sd.Understat.return_value = reader
@@ -100,6 +106,58 @@ class TestUnderstatScraper:
         assert 'ENG-Premier League' in scraper.leagues
         assert 'USA-MLS' not in scraper.leagues
 
+    def test_all_leagues_unsupported_raises(self, mock_dependencies,
+                                            mock_soccerdata_understat):
+        """A league set that filters down to nothing must fail loudly, not
+        crash later inside soccerdata with an opaque message."""
+        from scrapers.understat import UnderstatScraper
+
+        with pytest.raises(ValueError, match='No supported Understat leagues'):
+            UnderstatScraper(leagues=['USA-MLS'], seasons=[2024])
+
+    # -- season-rollover guard ------------------------------------------------
+    # soccerdata caches the seasons index (leagues.json) forever and the cache
+    # volume persists — a frozen index hides a new season and every read_*
+    # silently returns empty. The scraper must re-download the index once per
+    # run.
+
+    def test_leagues_index_refreshed_once_per_run(self, scraper,
+                                                  mock_soccerdata_understat):
+        scraper._get_reader()
+        scraper._get_reader()
+        mock_soccerdata_understat._read_leagues.assert_called_once_with(
+            no_cache=True
+        )
+
+    def test_shot_events_standalone_refreshes_index(self, scraper,
+                                                    mock_soccerdata_understat):
+        """read_shot_events builds its own per-league readers (never touches
+        _get_reader) — it must trigger the rollover refresh on its own."""
+        scraper.read_shot_events()
+        mock_soccerdata_understat._read_leagues.assert_called_once_with(
+            no_cache=True
+        )
+
+    # -- league JSON reuse (traffic) ------------------------------------------
+    # Each read_* re-downloads the current-season league JSON (~95 KB wire per
+    # league) unless told otherwise; after read_schedule() fetched it fresh,
+    # later calls in the same run must reuse it via force_cache.
+
+    def test_force_cache_false_without_prior_schedule(self, scraper,
+                                                      mock_soccerdata_understat):
+        scraper.read_player_season_stats()
+        kwargs = mock_soccerdata_understat.read_player_season_stats.call_args.kwargs
+        assert kwargs.get('force_cache') is False
+
+    def test_force_cache_after_schedule(self, scraper, mock_soccerdata_understat):
+        scraper.read_schedule()
+        scraper.read_player_season_stats()
+        scraper.read_team_match_stats()
+        assert (mock_soccerdata_understat.read_player_season_stats
+                .call_args.kwargs.get('force_cache') is True)
+        assert (mock_soccerdata_understat.read_team_match_stats
+                .call_args.kwargs.get('force_cache') is True)
+
     def test_read_schedule(self, scraper, mock_soccerdata_understat):
         """Test reading schedule with xG."""
         df = scraper.read_schedule()
@@ -122,17 +180,35 @@ class TestUnderstatScraper:
         assert df is not None
         assert 'xg' in df.columns
 
-    def test_scrape_shots(self, scraper, mock_soccerdata_understat):
-        """Test scraping shots."""
-        result = scraper.scrape_shots()
+    def test_scrape_all_covers_all_tables_with_guard(self, scraper,
+                                                     mock_soccerdata_understat):
+        """Drift regression: scrape_all must save ALL 5 bronze tables and arm
+        the replace-completeness guard (the old version covered 3 tables and
+        saved unguarded)."""
+        with patch.object(scraper, 'save_to_iceberg',
+                          return_value='iceberg.bronze.understat_x') as save:
+            result = scraper.scrape_all()
 
-        assert 'shots' in result
+        assert save.call_count == 5
+        saved_tables = {c.kwargs['table_name'] for c in save.call_args_list}
+        assert saved_tables == {
+            'understat_schedule',
+            'understat_shots',
+            'understat_players',
+            'understat_team_match_stats',
+            'understat_player_match_stats',
+        }
+        assert all(c.kwargs['min_replace_ratio'] == 0.9
+                   for c in save.call_args_list)
+        assert len(result) == 5
 
-    def test_scrape_all(self, scraper, mock_soccerdata_understat):
-        """Test full scrape."""
-        result = scraper.scrape_all()
-
-        assert isinstance(result, dict)
+    def test_scrape_all_raises_on_empty_table(self, scraper,
+                                              mock_soccerdata_understat):
+        """Fail-closed: an empty frame is a missing season, not a no-op."""
+        mock_soccerdata_understat.read_schedule.return_value = pd.DataFrame()
+        with patch.object(scraper, 'save_to_iceberg'):
+            with pytest.raises(ValueError, match='empty scrape result'):
+                scraper.scrape_all()
 
     @pytest.mark.parametrize('method', [
         'read_schedule',
@@ -207,6 +283,27 @@ class TestUnderstatScraper:
         df = scraper.read_shot_events()
         ids = set(df['assist_player_id'].dropna().tolist())
         assert ids == {12}
+
+    def test_assist_remap_is_per_league_season(self, scraper,
+                                               mock_soccerdata_understat):
+        """Namesakes across leagues must not cross-match: the name→id map is
+        keyed per (league, season). A whole-frame dict would let the LAST
+        'John Smith' row win for every league."""
+        mock_soccerdata_understat.read_shot_events.return_value = pd.DataFrame({
+            # ESP rows first, ENG namesake last — whole-frame dict would map
+            # the ESP assist to the ENG id (1).
+            'league': ['ESP-La Liga', 'ESP-La Liga', 'ENG-Premier League'],
+            'season': [2024] * 3,
+            'player': ['John Smith', 'Carlos Vela', 'John Smith'],
+            'player_id': pd.array([2, 3, 1], dtype='Int64'),
+            'assist_player': [None, 'John Smith', None],
+            'assist_player_id': pd.array([500001, 500002, 500003], dtype='Int64'),
+            'xg': [0.2, 0.4, 0.1],
+            'result': ['Goal', 'Goal', 'Missed Shot'],
+        })
+        df = scraper.read_shot_events()
+        row = df[df['player'] == 'Carlos Vela'].iloc[0]
+        assert row['assist_player_id'] == 2  # the ESP John Smith, not the ENG one
 
 
 class TestUnderstatSupportedLeagues:
