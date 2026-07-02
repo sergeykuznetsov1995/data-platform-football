@@ -5,6 +5,7 @@ Tests scraper logic with mocked HTTP responses. The scraper uses FotMob's
 public ``/api/data`` JSON endpoints (no browser / cookies).
 """
 
+import time
 from unittest.mock import MagicMock, patch
 
 import pandas as pd
@@ -104,6 +105,70 @@ class TestFotMobScraperUnit:
         assert gb.call_count == 2                      # refreshed once
         assert 'oldbuild' in fj.call_args_list[0][0][0]
         assert 'newbuild' in fj.call_args_list[1][0][0]
+
+    def test_league_data_cached_per_league_season(self, mock_scraper):
+        """The ~65KB league payload is fetched once per (league, season) run."""
+        with patch.object(mock_scraper, '_fetch_api_json',
+                          return_value={'table': []}) as fj:
+            d1 = mock_scraper._get_league_data('ENG-Premier League', 2025)
+            d2 = mock_scraper._get_league_data('ENG-Premier League', 2025)
+            mock_scraper._get_league_data('ENG-Premier League', 2024)
+
+        assert d1 is d2
+        assert fj.call_count == 2                 # second season = separate fetch
+
+    def test_league_data_failure_not_cached(self, mock_scraper):
+        """A failed league fetch must not poison the cache for later entities."""
+        with patch.object(mock_scraper, '_fetch_api_json',
+                          side_effect=[None, {'table': []}]) as fj:
+            assert mock_scraper._get_league_data('ENG-Premier League', 2025) is None
+            assert mock_scraper._get_league_data('ENG-Premier League', 2025) == {'table': []}
+
+        assert fj.call_count == 2
+
+    def test_fetch_api_json_404_not_retried(self, mock_scraper):
+        """404 is permanent — retrying only burns rate-limit budget."""
+        mock_response = MagicMock()
+        mock_response.status_code = 404
+        mock_scraper._session.get.return_value = mock_response
+
+        assert mock_scraper._fetch_api_json('test-endpoint', retry_count=3) is None
+        assert mock_scraper._session.get.call_count == 1
+
+    def test_fetch_api_json_5xx_retried_with_backoff(self, mock_scraper):
+        """Transient 5xx is retried with a pause between attempts."""
+        mock_response = MagicMock()
+        mock_response.status_code = 503
+        mock_scraper._session.get.return_value = mock_response
+
+        with patch('scrapers.fotmob.scraper.time.sleep') as sleep:
+            assert mock_scraper._fetch_api_json('test-endpoint', retry_count=3) is None
+
+        assert mock_scraper._session.get.call_count == 3
+        assert sleep.call_count == 2
+
+    def test_next_data_no_retry_when_buildid_unchanged(self, mock_scraper):
+        """A miss with a fresh buildId is a genuine 404 — no duplicate request."""
+        with patch.object(mock_scraper, '_get_build_id',
+                          side_effect=['same', 'same']) as gb, \
+             patch.object(mock_scraper, '_fetch_api_json',
+                          return_value=None) as fj:
+            assert mock_scraper._fetch_next_data_payload('/players/1') is None
+
+        assert gb.call_count == 2
+        fj.assert_called_once()
+
+    def test_next_data_buildid_refresh_throttled(self, mock_scraper):
+        """Repeated misses must not re-download the homepage more than 1×/min."""
+        mock_scraper._build_id_verified_at = time.monotonic()
+        with patch.object(mock_scraper, '_get_build_id',
+                          return_value='b1') as gb, \
+             patch.object(mock_scraper, '_fetch_api_json',
+                          return_value=None) as fj:
+            assert mock_scraper._fetch_next_data_payload('/players/1') is None
+
+        assert gb.call_count == 1                 # no refresh within the window
+        fj.assert_called_once()
 
     def test_fetch_match_details_uses_matchdetails_endpoint(self, mock_scraper):
         """Content comes from /api/data/matchDetails, not the _next/data payload.
