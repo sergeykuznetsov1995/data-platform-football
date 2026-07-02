@@ -4,3 +4,6 @@
 # admin — локальный админ Superset: его дашборды под impersonation тоже
 # должны читать данные (read-only достаточно).
 analysts:test-analyst,admin
+# ВАЖНО: Trino берёт группы ТОЛЬКО отсюда (oauth2 groups-field в 482 нет),
+# поэтому админы платформы тоже перечисляются здесь.
+platform-admins:sergey
