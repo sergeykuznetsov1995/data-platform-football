@@ -11,7 +11,6 @@ import argparse
 import json
 import logging
 import sys
-from datetime import datetime
 
 logging.basicConfig(
     level=logging.INFO,
@@ -20,13 +19,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Replace-partitions completeness guard (#513 → #583): refuse a save that would
-# shrink a clubelo_ratings* partition below this share of its existing rows, so
-# a partial/failed scrape can't wipe a good partition. COUNT(*) (full-state
-# snapshot per rating_date — no replace_guard_key needed). ReplaceGuardError →
-# exit 3 (current ratings, critical); the historical stage records the marker
-# but stays non-fatal. Bypass with --force-replace for a deliberate backfill.
-_MIN_REPLACE_RATIO = 0.9
+# Replace-partitions completeness guard (#513 → #583): the scraper methods
+# refuse a save that would shrink a clubelo_ratings* partition below 90% of its
+# existing rows, so a partial/failed scrape can't wipe a good partition.
+# ReplaceGuardError → exit 3 (current ratings, critical); the historical stage
+# records the marker but stays non-fatal. Bypass with --force-replace for a
+# deliberate backfill.
 REPLACE_GUARD_MARKER = 'CLUBELO_REPLACE_GUARD'
 
 
@@ -49,7 +47,8 @@ def main():
         choices=['daily', 'full'],
         default='daily',
         help="daily = current ratings only (fast, 1 HTTP call); "
-             "full = + historical ratings (heavy, weekly cadence)"
+             "full = historical ratings ONLY (heavy, weekly cadence; the "
+             "daily task in the DAG chain already covers current ratings)"
     )
     parser.add_argument(
         '--force-replace',
@@ -90,29 +89,11 @@ def main():
         from scrapers.clubelo import ClubEloScraper
 
         with ClubEloScraper(leagues=leagues) as scraper:
-            today = datetime.now()
-            logger.info(f"Fetching ratings for {today.date()}")
-
-            # --- Stage 1: current ratings (CRITICAL, every mode) ---
-            df = scraper.read_by_date(today)
-
-            if df is not None and not df.empty:
+            if args.mode == 'daily':
+                # --- Current ratings (CRITICAL) ---
                 try:
-                    table_path = scraper.save_to_iceberg(
-                        df=df,
-                        table_name='clubelo_ratings',
-                        partition_cols=['rating_date'],
-                        # Replace the day's partition so a same-day rerun / Airflow
-                        # retry overwrites instead of appending a duplicate snapshot.
-                        # read_by_date now yields a date-only ISO rating_date and the
-                        # table column is varchar, so the delete predicate is valid
-                        # (#554, split from #470 bug 5). This runner inlines the save
-                        # instead of calling scrape_current_ratings(), so the fix must
-                        # live here too — not only on the scraper method.
-                        replace_partitions=['rating_date'],
-                        min_replace_ratio=(
-                            None if args.force_replace else _MIN_REPLACE_RATIO
-                        ),
+                    current = scraper.scrape_current_ratings(
+                        force_replace=args.force_replace,
                     )
                 except ReplaceGuardError as e:
                     # Guard refused: a partial scrape would shrink today's
@@ -124,17 +105,24 @@ def main():
                     with open(args.output, 'w') as f:
                         json.dump(results, f)
                     return 3
-                results['tables'].append(table_path)
-                results['rows'] = len(df)
-                results['rating_date'] = today.strftime('%Y-%m-%d')
-                logger.info(f"Saved {len(df)} ELO ratings for {today.date()}")
-            else:
-                critical_failed = True
-                results['errors'].append('current_ratings: no data returned')
-                logger.warning("No data returned from scraper")
 
-            if args.mode == 'full':
-                # --- Stage 2: historical ratings (non-critical) ---
+                if current.get('current_ratings'):
+                    results['tables'].append(current['current_ratings'])
+                    results['rows'] = current.get('rows', 0)
+                    results['rating_date'] = current.get('rating_date')
+                    logger.info(
+                        f"Saved {results['rows']} ELO ratings "
+                        f"for {results['rating_date']}"
+                    )
+                else:
+                    critical_failed = True
+                    results['errors'].append('current_ratings: no data returned')
+                    logger.warning("No data returned from scraper")
+            else:
+                # --- Historical ratings ONLY (--mode full, non-critical) ---
+                # The daily task already scraped current ratings earlier in the
+                # DAG chain (scrape_ratings >> gate >> full); re-scraping them
+                # here was a duplicate HTTP call + duplicate partition write.
                 try:
                     hist = scraper.scrape_historical_ratings(
                         days_back=args.days_back,
@@ -146,6 +134,11 @@ def main():
                         logger.info(
                             f"Saved {results['history_rows']} historical rows"
                         )
+                    else:
+                        # Not silent (#716 keeps the stage non-critical, exit 0,
+                        # but the error must surface in the results JSON).
+                        results['errors'].append('historical: no data returned')
+                        logger.error("historical_ratings returned no data")
                 except ReplaceGuardError as e:
                     # Non-critical stage: a refused historical guard is a
                     # warning, not a DAG failure (exit stays 0). The marker
