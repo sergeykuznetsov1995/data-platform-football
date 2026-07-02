@@ -26,6 +26,7 @@ Requirements (already in the image, do NOT bump):
 """
 
 import logging
+import os
 import time
 from collections import Counter
 from typing import Callable, Dict, Optional
@@ -52,6 +53,11 @@ _ALLOW_URL_SUBSTRINGS = (
 # Analytics / tracking hosts aborted regardless of type. Do NOT add
 # challenges/turnstile.cloudflare.com here — they are required for the bypass.
 _BLOCK_URL_SUBSTRINGS = (
+    # FBref autocomplete cache (~1.65 MB, top per-URL consumer in the #616
+    # audit). CDP-pattern blocking missed it (activated after first load);
+    # Playwright route() is registered before the first navigation, so the
+    # block is effective here.
+    "fbref.com/short/inc/",
     "google-analytics.com", "googletagmanager.com", "doubleclick.net",
     "googlesyndication.com", "googleadservices.com", "googletagservices.com",
     "facebook.net", "facebook.com/tr", "twitter.com/i/", "platform.twitter.com",
@@ -68,16 +74,24 @@ _CF_MARKERS = (
 )
 
 
-def should_block_request(resource_type: str, url: str) -> bool:
+def should_block_request(
+    resource_type: str, url: str, block_scripts: bool = False
+) -> bool:
     """True → abort this request to save proxy bytes.
 
-    Never blocks document/script/xhr/fetch (FBref's page + any challenge JS),
-    nor any Cloudflare/Turnstile asset. Both guards run before the type block.
+    Never blocks document/xhr/fetch (FBref's page itself), nor any
+    Cloudflare/Turnstile asset — the allow-guard runs before the type block.
+    ``block_scripts=True`` (FBREF_CAMOUFOX_BLOCK_SCRIPTS=1, experimental)
+    additionally aborts script resources: the Python parser reads tables from
+    HTML comments server-side, so FBref's own JS is not needed for content,
+    and challenge JS is covered by the allow-list.
     """
     low = url.lower()
     if any(s in low for s in _ALLOW_URL_SUBSTRINGS):
         return False
     if resource_type in _BLOCK_RESOURCE_TYPES:
+        return True
+    if block_scripts and resource_type == "script":
         return True
     return any(s in low for s in _BLOCK_URL_SUBSTRINGS)
 
@@ -149,6 +163,17 @@ class CamoufoxFbrefTransport:
         self.cf_challenge_attempts = 0
         self.cf_challenges_passed = 0
         self.cf_challenges_failed = 0
+        # Env-tunables: experimental script blocking + page-count restart
+        # (Firefox memory creep on 380+-page backfills). A restart costs a
+        # full CF cold-start (~4 MB measured) — keep the limit high.
+        self._block_scripts = os.environ.get(
+            "FBREF_CAMOUFOX_BLOCK_SCRIPTS", "").strip() == "1"
+        try:
+            self._max_pages_per_session = int(
+                os.environ.get("FBREF_CAMOUFOX_MAX_PAGES") or 200)
+        except ValueError:
+            self._max_pages_per_session = 200
+        self._pages_this_session = 0
 
     # -- lifecycle -------------------------------------------------------- #
     def _start(self) -> None:
@@ -170,6 +195,7 @@ class CamoufoxFbrefTransport:
         if self._block_resources:
             self._page.route("**/*", self._maybe_block)
         self._page.on("requestfinished", self._on_request_finished)
+        self._pages_this_session = 0
         server = (self._proxy or {}).get("server", "direct")
         logger.info("Camoufox session started (proxy=%s, humanize=%s)",
                     server, self._humanize)
@@ -206,7 +232,8 @@ class CamoufoxFbrefTransport:
     def _maybe_block(self, route) -> None:
         try:
             req = route.request
-            if should_block_request(req.resource_type, req.url):
+            if should_block_request(req.resource_type, req.url,
+                                    self._block_scripts):
                 self._blocked_count += 1
                 route.abort()
                 return
@@ -229,6 +256,16 @@ class CamoufoxFbrefTransport:
             pass
 
     # -- Turnstile solve -------------------------------------------------- #
+    def _challenge_frame_present(self) -> bool:
+        """True when the challenges.cloudflare.com iframe is on the page."""
+        try:
+            return any(
+                "challenges.cloudflare.com" in (f.url or "")
+                for f in self._page.frames
+            )
+        except Exception:  # noqa: BLE001 — frames can detach mid-nav
+            return False
+
     def _click_turnstile(self) -> bool:
         """Click the Turnstile checkbox inside the CF iframe. Returns True if a
         click was dispatched."""
@@ -262,9 +299,16 @@ class CamoufoxFbrefTransport:
         deadline = time.time() + self.CF_SOLVE_TIMEOUT_S
         clicks = 0
         polls = 0
+        # A challenge "attempt" is counted only when a CF shell is actually
+        # observed (iframe or interstitial markers) — a plain warm-page nav
+        # is NOT an attempt, so passed/attempts stays a real solve rate.
+        challenge_seen = False
         while time.time() < deadline:
             time.sleep(self.POLL_INTERVAL_S)
             polls += 1
+            if not challenge_seen and self._challenge_frame_present():
+                challenge_seen = True
+                self.cf_challenge_attempts += 1
             try:
                 has_table = self._page.evaluate(
                     "!!document.querySelector('table')")
@@ -281,10 +325,18 @@ class CamoufoxFbrefTransport:
                 html = self._page.content()
                 # Sanity: never return a challenge shell as success.
                 if not is_cloudflare_blocked(html):
+                    if challenge_seen:
+                        self.cf_challenges_passed += 1
                     return html
+                if not challenge_seen:
+                    # Shell markers without the iframe still mean a challenge.
+                    challenge_seen = True
+                    self.cf_challenge_attempts += 1
             if polls >= self.CLICK_AFTER_POLLS and clicks < self.CLICK_ATTEMPTS:
                 if self._click_turnstile():
                     clicks += 1
+        if challenge_seen:
+            self.cf_challenges_failed += 1
         return None
 
     # -- public fetch ----------------------------------------------------- #
@@ -296,9 +348,13 @@ class CamoufoxFbrefTransport:
         """
         if self._page is None:
             self._start()
+        elif self._pages_this_session >= self._max_pages_per_session:
+            logger.info(
+                "Camoufox session page limit reached (%d) — restarting to cap "
+                "Firefox memory", self._pages_this_session)
+            self._restart()
 
         for attempt in range(self.MAX_PROXY_ROTATIONS + 1):
-            self.cf_challenge_attempts += 1
             try:
                 self._page.goto(
                     url, wait_until="domcontentloaded",
@@ -307,25 +363,55 @@ class CamoufoxFbrefTransport:
             except Exception as e:  # noqa: BLE001 — dead proxy / nav timeout
                 logger.warning("Camoufox goto failed (attempt %d): %s",
                                attempt + 1, e)
-                self.cf_challenges_failed += 1
                 if attempt < self.MAX_PROXY_ROTATIONS:
                     self._restart()
                 continue
 
+            # CF challenge counters live in _solve_current_page — only navs
+            # that actually surfaced a challenge shell count as attempts.
             html = self._solve_current_page()
             if html is not None:
-                self.cf_challenges_passed += 1
+                self._pages_this_session += 1
                 logger.info("Camoufox fetched %s (%d bytes html)", url, len(html))
                 return html
 
             logger.warning(
                 "Camoufox could not solve Turnstile for %s (attempt %d/%d)",
                 url, attempt + 1, self.MAX_PROXY_ROTATIONS + 1)
-            self.cf_challenges_failed += 1
             if attempt < self.MAX_PROXY_ROTATIONS:
                 self._restart()
 
         return None
+
+    # -- clearance export (HTTP fast-path) --------------------------------- #
+    def get_clearance(self) -> Optional[dict]:
+        """Export cf_clearance + fingerprint facts for the curl_cffi fast-path.
+
+        Returns ``{'cookies': {name: value}, 'user_agent': str,
+        'proxy': <playwright proxy dict or None>}`` from the live Firefox
+        session, or ``None`` when there is no session / no cf_clearance yet.
+        cf_clearance is bound to the exit IP and the browser fingerprint —
+        the caller must reuse the same proxy and a Firefox impersonation.
+        """
+        if self._page is None:
+            return None
+        try:
+            cookies = {
+                c.get("name"): c.get("value")
+                for c in self._page.context.cookies("https://fbref.com/")
+                if c.get("name")
+            }
+            if "cf_clearance" not in cookies:
+                return None
+            user_agent = self._page.evaluate("navigator.userAgent")
+            return {
+                "cookies": cookies,
+                "user_agent": user_agent,
+                "proxy": self._proxy,
+            }
+        except Exception as e:  # noqa: BLE001 — session may be tearing down
+            logger.debug("get_clearance failed: %s", e)
+            return None
 
     # -- traffic stats ---------------------------------------------------- #
     def traffic_stats(self) -> Dict[str, object]:
