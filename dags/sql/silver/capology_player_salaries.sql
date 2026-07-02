@@ -32,7 +32,9 @@
 --     EUR/USD теперь переносятся как weekly/annual_gross_{eur,usd} колонки
 --     (issue #195), фильтр оставлен как guard против будущих партиций.
 --   * Scope = ТОЛЬКО текущий сезон (issue #632): bronze_dedup фильтрует
---     season = (SELECT MAX(season) ... WHERE currency='GBP'). Bronze копит
+--     (league, season) IN (SELECT league, MAX(season) ... GROUP BY league) —
+--     максимум сезона per league, чтобы лига с отстающим бэкфиллом не
+--     выпадала из Silver при мультилиговом ingest. Bronze копит
 --     исторические партиции (backfill), но Silver-снепшот — current-season
 --     only: xref-резолвер и DQ-пороги (canonical_coverage 0.80,
 --     no_nulls weekly_gross_gbp) калиброваны под активный APL-сезон. Без
@@ -66,12 +68,15 @@ WITH bronze_dedup AS (
           AND (active = true OR loan = true)
           -- issue #632: scope to current season only. Bronze копит исторические
           -- партиции (backfill); без этого фильтра CTAS промоутил все ~13 APL
-          -- сезонов (7121 строк) → coverage 67%, 600 undisclosed-NULL. MAX(season)
-          -- = активный сезон (недельный ingest пишет только CURRENT_SEASON).
-          AND b.season = (
-              SELECT MAX(season)
+          -- сезонов (7121 строк) → coverage 67%, 600 undisclosed-NULL.
+          -- MAX(season) считается PER LEAGUE (GROUP BY): глобальный MAX молча
+          -- выкидывал бы лигу, у которой ещё нет строк текущего сезона
+          -- (разная глубина бэкфилла при мультилиговом ingest).
+          AND (b.league, b.season) IN (
+              SELECT league, MAX(season)
               FROM iceberg.bronze.capology_player_salaries
               WHERE currency = 'GBP'
+              GROUP BY league
           )
     )
     WHERE rn = 1
