@@ -26,7 +26,7 @@ from airflow.models.param import Param
 from airflow.operators.bash import BashOperator
 from airflow.operators.python import PythonOperator
 
-from utils.config import LEAGUES, CURRENT_SEASON, SCHEDULES, DAG_TAGS
+from utils.config import MATCHHISTORY_LEAGUES, CURRENT_SEASON, SCHEDULES, DAG_TAGS
 from utils.default_args import SELENIUM_ARGS
 
 
@@ -52,12 +52,15 @@ def validate_data(**context) -> Dict[str, Any]:
         logger.error(f"Invalid JSON in results: {e}")
         raise AirflowException(f"Invalid JSON in results: {e}")
 
+    skipped = scrape_result.get('skipped_not_modified', [])
+
     validation = {
         'status': 'success',
         'warnings': [],
         'summary': {
             'total_rows': scrape_result.get('rows', 0),
             'leagues_scraped': len(scrape_result.get('league_details', {})),
+            'leagues_skipped_not_modified': skipped,
             'league_details': scrape_result.get('league_details', {}),
             'tables': scrape_result.get('tables', []),
         }
@@ -65,17 +68,30 @@ def validate_data(**context) -> Dict[str, Any]:
 
     # Check for errors
     if scrape_result.get('errors'):
-        validation['warnings'] = scrape_result['errors']
+        validation['warnings'] = list(scrape_result['errors'])
         validation['status'] = 'partial_success' if validation['summary']['total_rows'] > 0 else 'failed'
+    elif validation['summary']['total_rows'] == 0:
+        if skipped:
+            # Every league answered 304 (CSV unchanged) — clean no-op, the
+            # partitions already hold this data. Not a scraping issue.
+            validation['status'] = 'no_op'
+        else:
+            # 0 rows, nothing skipped, no errors reported: a silently empty
+            # scrape. Previously this was masked as a warning-only success.
+            validation['status'] = 'failed'
+            validation['warnings'].append("0 rows scraped and no leagues skipped")
 
-    # Check minimum data thresholds
-    if validation['summary']['total_rows'] < 100:
-        validation['warnings'].append("Low total row count - possible scraping issue")
+    # Row-count thresholds apply only to leagues that actually fetched —
+    # 304-skipped leagues are complete by definition. Total threshold scales
+    # with the number of fetched leagues (MATCHHISTORY_LEAGUES is multi-league).
+    fetched = validation['summary']['league_details']
+    if fetched:
+        if validation['summary']['total_rows'] < 100 * len(fetched):
+            validation['warnings'].append("Low total row count - possible scraping issue")
 
-    # Check per-league thresholds
-    for league, count in validation['summary']['league_details'].items():
-        if count < 10:
-            validation['warnings'].append(f"Low match count for {league}: {count}")
+        for league, count in fetched.items():
+            if count < 10:
+                validation['warnings'].append(f"Low match count for {league}: {count}")
 
     logger.info(f"Data validation complete: {validation['status']}")
     logger.info(f"Summary: {validation['summary']}")
@@ -126,7 +142,7 @@ def generate_stats_report(**context) -> Dict[str, Any]:
 
 
 # Build arguments for bash command
-leagues_str = ','.join(LEAGUES)
+leagues_str = ','.join(MATCHHISTORY_LEAGUES)
 
 # DAG definition
 with DAG(
@@ -139,7 +155,7 @@ with DAG(
     tags=DAG_TAGS.get('matchhistory', ['scraping', 'matchhistory', 'bronze', 'football', 'odds']),
     max_active_runs=1,
     params={
-        'leagues': LEAGUES,
+        'leagues': MATCHHISTORY_LEAGUES,
         # Season is UI-configurable: the daily scheduled run uses the default
         # (CURRENT_SEASON); to (re)ingest or backfill a past season, use
         # "Trigger DAG w/ config" and set season (e.g. 2016 = 2016/17 season).
@@ -178,6 +194,8 @@ with DAG(
 
     - Uses Selenium with xvfb for headless browser operation
     - Written to Parquet fallback (PyIceberg disabled for stability)
+    - Conditional GET: an unchanged season CSV answers 304 (0 bytes) and the
+      league is skipped; if every league is skipped the run is a clean no-op
     """,
 ) as dag:
 
