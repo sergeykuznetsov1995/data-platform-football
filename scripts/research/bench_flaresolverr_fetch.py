@@ -84,10 +84,7 @@ def _bench_whoscored(n: int, proxy_file: str, fs_url: str, league: str, season: 
     """Fetch N WhoScored matchCentreData pages sequentially (no Iceberg write)."""
     from scrapers.base.flaresolverr_client import FlareSolverrClient, FlareSolverrError
     from scrapers.whoscored.events_fetcher import fetch_match_events_via_flaresolverr
-    from scrapers.whoscored.scraper import (
-        WhoScoredScraper,
-        _season_to_soccerdata_str,
-    )
+    from scrapers.whoscored.scraper import WhoScoredScraper
 
     proxy_url, mgr = _pick_proxy_url(proxy_file)
 
@@ -100,9 +97,9 @@ def _bench_whoscored(n: int, proxy_file: str, fs_url: str, league: str, season: 
             leagues=[league], seasons=[season],
             proxy_file=proxy_file, flaresolverr_url=fs_url,
         )
-        meta = scraper._read_events_metadata_from_bronze(
-            _season_to_soccerdata_str(season)
-        )
+        # The scraper filters by its configured seasons=[season] itself; the
+        # old target_season parameter was removed with the all-seasons change.
+        meta = scraper._read_events_metadata_from_bronze()
         ids = [m[0] for m in meta][:n]
     if not ids:
         raise SystemExit(
