@@ -79,9 +79,13 @@ class TrinoTableManager:
             logger.info("TRINO_PASSWORD not set, connecting via HTTP (no auth)")
         self._conn = None
 
-    # Retry settings for connection
-    _CONNECT_RETRIES = 3
-    _CONNECT_BACKOFF = (3, 5, 10)  # seconds (reduced from 5, 10, 20)
+    # Retry settings for connection. A Trino container restart takes ~30-60s
+    # (SERVER STARTED ~13s + authenticator warm-up), so the cumulative window
+    # must outlast it: 3+5+10+20+30+45 = 113s (#847). The old 3-attempt/18s
+    # window gave up mid-restart and the bronze write was lost (#842 APL 16/17
+    # — ~20 min of residential proxy spent on a half-saved season).
+    _CONNECT_RETRIES = 7
+    _CONNECT_BACKOFF = (3, 5, 10, 20, 30, 45)  # seconds between attempts
 
     # Class-level fail-fast cache: if Trino was unreachable in this process,
     # skip retries to avoid wasting 18+ seconds per call
@@ -170,7 +174,11 @@ class TrinoTableManager:
             self._conn = None
         TrinoTableManager._trino_unreachable = False
 
-    _CONNECTION_ERRORS = ('Connection refused', 'Connection reset', 'Connection aborted')
+    # 'authenticators were not loaded' is the HTTP 500 Trino serves during its
+    # post-restart warm-up, before PASSWORD auth is wired (#847) — functionally
+    # "not up yet", so treat it exactly like a refused/reset connection.
+    _CONNECTION_ERRORS = ('Connection refused', 'Connection reset',
+                          'Connection aborted', 'authenticators were not loaded')
 
     def _execute(self, sql: str, fetch: bool = False) -> Optional[List[Any]]:
         """Execute SQL statement.
