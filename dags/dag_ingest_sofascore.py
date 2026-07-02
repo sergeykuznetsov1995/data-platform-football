@@ -17,8 +17,9 @@ Data collected:
 - Per-match capture: player_ratings, event_player_stats, match_stats, shotmap (daily)
 - Per-player profile + season-aggregate stats (weekly — heavy, gated; see below)
 
-The per-player capture (~526 Camoufox navigations, hours long) is too heavy to
-run daily, so a ``ShortCircuitOperator`` gates it: it runs only on the DAG's OWN
+The per-player capture (~526 players; since #842 one navigation + in-page
+fetches, ~30-40 min) still isn't worth running daily, so a
+``ShortCircuitOperator`` gates it: it runs only on the DAG's OWN
 Saturday scheduled run, or on a manual "Trigger DAG w/ config" with
 ``run_players=True``. It is skipped on weekday scheduled runs and whenever an
 external trigger (e.g. ``dag_master_pipeline``) fires this DAG, so the daily
@@ -87,6 +88,21 @@ def _load_result(path: str, logger) -> Dict[str, Any]:
         return {}
 
 
+def _capture_noop(capture_result: Dict[str, Any]) -> bool:
+    """#842 incremental match_capture: True when the run resolved matches but
+    skipped them ALL (already in bronze) with no fallback/errors — a clean
+    no-op that wrote nothing by design (off-season / no new finished matches).
+    """
+    return bool(
+        capture_result
+        and not capture_result.get('fallback')
+        and not (capture_result.get('errors') or [])
+        and capture_result.get('matches_total', 0) > 0
+        and capture_result.get('matches_skipped_existing', 0)
+        >= capture_result.get('matches_total', 0)
+    )
+
+
 def validate_data(**context) -> Dict[str, Any]:
     """
     Validate scraped data quality across both scrape tasks (schedule+league_table
@@ -126,6 +142,14 @@ def validate_data(**context) -> Dict[str, Any]:
             'match_stats_rows': capture_result.get('match_stats_rows', 0),
             'match_stats_matches': capture_result.get('match_stats_matches', 0),
             'match_stats_fallback': capture_result.get('fallback', False),
+            # venue (#753) — one row per match from the same capture pass.
+            'venue_rows': capture_result.get('venue_rows', 0),
+            'venue_matches': capture_result.get('venue_matches', 0),
+            'venue_fallback': capture_result.get('fallback', False),
+            # #842 incremental capture bookkeeping.
+            'matches_total': capture_result.get('matches_total', 0),
+            'matches_skipped_existing': capture_result.get(
+                'matches_skipped_existing', 0),
             'tables': (
                 schedule_result.get('tables', [])
                 + capture_result.get('tables', [])
@@ -155,9 +179,22 @@ def validate_data(**context) -> Dict[str, Any]:
     if validation['summary']['league_table_rows'] < 10:
         validation['warnings'].append("Low league_table row count - possible scraping issue")
 
+    # #842 incremental match_capture: a clean run that skipped every resolved
+    # match (already in bronze) legitimately reports 0 captured rows — the
+    # partitions were left untouched, so the capture row-floors below don't
+    # apply. Schedule/league_table floors above still do (that task refreshes
+    # daily regardless).
+    capture_noop = _capture_noop(capture_result)
+    if capture_noop:
+        logger.info(
+            "match_capture skip-existing no-op: all %d matches already in "
+            "bronze — capture row-floors skipped.",
+            validation['summary']['matches_total'],
+        )
+
     # APL has ~300 matches/season; ratings emit ~25K rows. Anything < 300 rows
     # means we scraped at most a handful of matches → DAG defect or hard CF block.
-    if validation['summary']['player_ratings_rows'] < 300:
+    if not capture_noop and validation['summary']['player_ratings_rows'] < 300:
         if validation['summary']['player_ratings_fallback']:
             validation['warnings'].append(
                 f"player_ratings R0.2B_FALLBACK: rows="
@@ -176,7 +213,7 @@ def validate_data(**context) -> Dict[str, Any]:
 
     # Shotmap: full APL season ≈ 380 matches × ~25 shots/match ≈ 9.5K rows.
     # WARN-only threshold = 300 (issue #69; covers first few gameweeks too).
-    if validation['summary']['shotmap_rows'] < 300:
+    if not capture_noop and validation['summary']['shotmap_rows'] < 300:
         if validation['summary']['shotmap_fallback']:
             validation['warnings'].append(
                 f"shotmap R0.2B_FALLBACK: rows="
@@ -193,7 +230,7 @@ def validate_data(**context) -> Dict[str, Any]:
 
     # event_player_stats: full APL season ≈ 380 matches × ~25 played players
     # ≈ 9.5K rows. WARN-only threshold = 10K (issue #69).
-    if validation['summary']['event_player_stats_rows'] < 10000:
+    if not capture_noop and validation['summary']['event_player_stats_rows'] < 10000:
         if validation['summary']['event_player_stats_fallback']:
             validation['warnings'].append(
                 f"event_player_stats R0.2B_FALLBACK: rows="
@@ -210,7 +247,7 @@ def validate_data(**context) -> Dict[str, Any]:
 
     # match_stats: full APL season ≈ 380 matches × 3 periods × ~30 stats
     # ≈ 34K rows. WARN-only threshold = 10K (issue #69).
-    if validation['summary']['match_stats_rows'] < 10000:
+    if not capture_noop and validation['summary']['match_stats_rows'] < 10000:
         if validation['summary']['match_stats_fallback']:
             validation['warnings'].append(
                 f"match_stats R0.2B_FALLBACK: rows="
@@ -223,6 +260,24 @@ def validate_data(**context) -> Dict[str, Any]:
             validation['warnings'].append(
                 f"Low match_stats row count: "
                 f"{validation['summary']['match_stats_rows']} < 10000"
+            )
+
+    # venue (#753): one row per match → full APL season ≈ 380 rows. WARN-only
+    # threshold = 300, in line with shotmap. Was previously unvalidated — a
+    # silently-empty venue capture never surfaced.
+    if not capture_noop and validation['summary']['venue_rows'] < 300:
+        if validation['summary']['venue_fallback']:
+            validation['warnings'].append(
+                f"venue R0.2B_FALLBACK: rows="
+                f"{validation['summary']['venue_rows']} matches="
+                f"{validation['summary']['venue_matches']}"
+            )
+            if validation['status'] == 'success':
+                validation['status'] = 'partial_success'
+        else:
+            validation['warnings'].append(
+                f"Low venue row count: "
+                f"{validation['summary']['venue_rows']} < 300"
             )
 
     # player_season_stats + player_profile are validated by validate_player_data
@@ -260,6 +315,19 @@ def validate_bronze_freshness(**context) -> None:
     from utils.data_quality import CHECK, run_checks
 
     logger = logging.getLogger(__name__)
+
+    # #842 incremental match_capture: on a clean skip-existing no-op nothing
+    # new is written BY DESIGN (off-season / international break), so
+    # MAX(_ingested_at) ages without the data being stale. Skip the alert —
+    # a failed/fallback capture still falls through to the checks below.
+    capture_result = _load_result(MATCH_CAPTURE_RESULT_PATH, logger)
+    if _capture_noop(capture_result):
+        logger.info(
+            "validate_bronze_freshness: skipped — match_capture was a clean "
+            "skip-existing no-op (all %d matches already in bronze).",
+            capture_result.get('matches_total', 0),
+        )
+        return
 
     # Global table freshness (MAX(_ingested_at), no season filter) — robust to
     # SofaScore's varchar season slug and catches any ingestion stall. 48h gives
@@ -494,9 +562,9 @@ with DAG(
 
     ### One source = one DAG (#782)
 
-    The former weekly `dag_ingest_sofascore_players` is folded in here. The heavy
-    per-player capture (~526 Camoufox navs, hours long) is gated by a
-    `ShortCircuitOperator`:
+    The former weekly `dag_ingest_sofascore_players` is folded in here. The
+    per-player capture (~526 players; one nav + in-page fetches since #842)
+    is gated by a `ShortCircuitOperator`:
 
     - auto-runs only on the DAG's **own Saturday scheduled run** (weekly cadence);
     - or on demand via **"Trigger DAG w/ config"** with `run_players=true`;
@@ -509,14 +577,19 @@ with DAG(
     `SS_SHOTMAP_LIMIT`, `SS_EPS_LIMIT`, `SS_MATCH_STATS_LIMIT`,
     `SS_PLAYER_CAPTURE_LIMIT` (positive int → cap).
 
-    ### Full-state refresh
+    ### Incremental full-state refresh (#842)
 
-    The consolidated `match_capture` rewrites each `(league, season)` partition
-    wholesale every run (`replace_partitions=['league','season']` + completeness
-    guard) — every finished match is re-captured, so the run is idempotent.
+    The consolidated `match_capture` captures only matches NOT yet in
+    `bronze.sofascore_player_ratings` (finished-match data is immutable;
+    re-capturing the whole season daily burned ~1.6 GB of residential proxy),
+    merges them with the existing partition and rewrites it
+    (`replace_partitions=['league','season']` + completeness guard). A day
+    with no new finished matches is a clean no-op (zero proxy spend).
 
-    **Manual full refresh**: `TRUNCATE iceberg.bronze.sofascore_<table>`
-    via `make shell-trino`, then trigger the DAG.
+    **Manual full re-capture**: run the scraper with `--force-replace`
+    (bypasses skip-existing AND the guard), or `TRUNCATE
+    iceberg.bronze.sofascore_<table>` via `make shell-trino`, then trigger
+    the DAG.
 
     ### Notes
 

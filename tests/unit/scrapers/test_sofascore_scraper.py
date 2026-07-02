@@ -64,6 +64,9 @@ class TestShotmapFlatten:
                     'goalMouthCoordinates': {'x': 100.0, 'y': 52.3},
                     'xg': 0.72,
                     'xgot': 0.84,
+                    # #840: extra/unknown source fields must pass through.
+                    'draw': True,
+                    'isOwnGoal': False,
                 },
                 {
                     'id': 102,
@@ -103,22 +106,34 @@ class TestShotmapFlatten:
         assert len(rows) == 3
 
         goal = rows[0]
+        # Anchors / PK — unchanged contract.
         assert goal['match_id'] == '14023925'
         assert goal['shot_id'] == '101'
         assert goal['player_id'] == '11111'
         assert goal['team_id'] == 1
         assert goal['is_home'] is True
-        assert goal['minute'] == 12
-        assert goal['period'] == 1
+        # #840: source-key names (Bronze as-is), NOT the old derived names.
+        assert goal['id'] == 101
+        assert goal['time'] == 12
+        assert goal['added_time'] == 0
+        assert goal['reversed_period_count'] == 1
         assert goal['shot_type'] == 'rightFoot'
         assert goal['situation'] == 'open-play'
         assert goal['body_part'] == 'rightFoot'
-        assert goal['outcome'] == 'goal'
+        assert goal['incident_type'] == 'goal'
         assert goal['goal_type'] == 'regular'
-        assert goal['x'] == 88.5
-        assert goal['y'] == 50.0
+        assert goal['player_coordinates_x'] == 88.5
+        assert goal['player_coordinates_y'] == 50.0
+        assert goal['goal_mouth_coordinates_x'] == 100.0
+        assert goal['goal_mouth_coordinates_y'] == 52.3
         assert goal['xg'] == 0.72
         assert goal['xgot'] == 0.84
+        # Unknown/extra source fields pass through automatically (the #840 point).
+        assert goal['draw'] is True
+        assert goal['is_own_goal'] is False
+        # Old derived/renamed column names are gone (moved to Silver).
+        for dead in ('minute', 'period', 'outcome', 'x', 'y', 'goal_x', 'goal_y'):
+            assert dead not in goal
 
     def test_flatten_missing_id_falls_back_to_composite(self):
         from scrapers.sofascore.scraper import SofaScoreScraper
@@ -128,9 +143,10 @@ class TestShotmapFlatten:
         # composite: match-time-player-addedTime
         assert third['shot_id'] == '14023925-78-33333-0'
         assert third['player_id'] == '33333'
-        assert third['outcome'] == 'miss'
-        # xgot absent → None
-        assert third['xgot'] is None
+        assert third['incident_type'] == 'miss'
+        # #840: absent source key -> absent column (not a None-valued column).
+        assert 'xgot' not in third
+        assert 'added_time' not in third
 
     def test_flatten_handles_garbage(self):
         from scrapers.sofascore.scraper import SofaScoreScraper
@@ -139,30 +155,71 @@ class TestShotmapFlatten:
         assert SofaScoreScraper._flatten_shotmap('1', None) == []
         assert SofaScoreScraper._flatten_shotmap('1', {}) == []
         assert SofaScoreScraper._flatten_shotmap('1', {'shotmap': 'oops'}) == []
+        # #840: an empty shot yields anchors only — no None-filled derived cols.
         assert SofaScoreScraper._flatten_shotmap('1', {'shotmap': [{}]}) == [
-            # Empty dict still yields a row with mostly None values + composite shot_id
             {
                 'match_id': '1',
                 'shot_id': '1-NA-NA-0',
                 'player_id': None,
                 'team_id': None,
                 'is_home': None,
-                'minute': None,
-                'added_time': None,
-                'period': None,
-                'shot_type': None,
-                'situation': None,
-                'body_part': None,
-                'outcome': None,
-                'goal_type': None,
-                'x': None,
-                'y': None,
-                'goal_x': None,
-                'goal_y': None,
-                'xg': None,
-                'xgot': None,
             }
         ]
+
+
+class TestAutoFlatten:
+    """Unit tests for the recursive Bronze auto-flatten helper (#840)."""
+
+    def test_scalar_coercion(self):
+        from scrapers.sofascore.scraper import _auto_flatten
+        out = {}
+        _auto_flatten({'accuratePass': '12', 'ratingText': 'n/a', 'flag': True}, out)
+        assert out['accurate_pass'] == 12       # numeric string upcast
+        assert out['rating_text'] == 'n/a'      # non-numeric string kept
+        assert out['flag'] is True
+
+    def test_value_wrapper_unwrapped(self):
+        from scrapers.sofascore.scraper import _auto_flatten
+        out = {}
+        _auto_flatten({'goals': {'value': 3, 'previousValue': 2}}, out)
+        # {"value": X, ...} collapses to X — not recursed into a prefix.
+        assert out['goals'] == 3
+        assert 'goals_value' not in out
+
+    def test_nested_dict_prefixed(self):
+        from scrapers.sofascore.scraper import _auto_flatten
+        out = {}
+        _auto_flatten({'playerCoordinates': {'x': 88.5, 'y': 50.0}}, out)
+        assert out['player_coordinates_x'] == 88.5
+        assert out['player_coordinates_y'] == 50.0
+
+    def test_lists_skipped(self):
+        from scrapers.sofascore.scraper import _auto_flatten
+        out = {}
+        _auto_flatten({'tags': [1, 2, 3], 'n': 5}, out)
+        assert 'tags' not in out                 # lists don't flatten into columns
+        assert out['n'] == 5
+
+    def test_skip_and_anchor_not_clobbered(self):
+        from scrapers.sofascore.scraper import _auto_flatten
+        out = {'team_id': 1}                      # pre-seeded anchor
+        _auto_flatten(
+            {'team': {'id': 999}, 'teamId': 999, 'x': 1},
+            out, skip=('team',),
+        )
+        assert out['team_id'] == 1                # anchor preserved (teamId did not clobber)
+        assert out['x'] == 1                      # skip removed only 'team', not siblings
+
+    def test_depth_cap(self):
+        from scrapers.sofascore.scraper import _auto_flatten, _MAX_FLATTEN_DEPTH
+        node = {'deep_leaf': 1}
+        for _ in range(_MAX_FLATTEN_DEPTH + 2):
+            node = {'d': node}
+        node['shallow'] = 2
+        out = {}
+        _auto_flatten(node, out)
+        assert out['shallow'] == 2                # shallow content kept
+        assert 1 not in out.values()             # too-deep leaf dropped by the cap
 
 
 class TestCamelToSnake:
@@ -566,8 +623,12 @@ class TestMatchStatsFlatten:
                                 {
                                     'name': 'Total shots',
                                     'key': 'totalShotsOnGoal',
-                                    'home': '14',
-                                    'away': '7',
+                                    # #840: SofaScore sends `home`/`away` as a
+                                    # JSON *number* for count/decimal stats (not
+                                    # a string) — reproduce that heterogeneity so
+                                    # the str-pinning is exercised.
+                                    'home': 14,
+                                    'away': 7,
                                     'homeValue': 14,
                                     'awayValue': 7,
                                     'compareCode': 1,
@@ -576,8 +637,8 @@ class TestMatchStatsFlatten:
                                 {
                                     'name': 'Expected goals',
                                     'key': 'expectedGoals',
-                                    'home': '1.8',
-                                    'away': '0.6',
+                                    'home': 1.8,
+                                    'away': 0.6,
                                     'homeValue': 1.8,
                                     'awayValue': 0.6,
                                     'compareCode': 1,
@@ -617,27 +678,44 @@ class TestMatchStatsFlatten:
         # 3 in ALL (1 possession + 2 shots) + 1 in 1ST = 4
         assert len(rows) == 4
 
+        # #840: source-key names (Bronze as-is); Silver renames name->stat_name,
+        # key->stat_key, home->home_text, away->away_text.
         bp_all = next(
             r for r in rows
-            if r['period'] == 'ALL' and r['stat_name'] == 'Ball possession'
+            if r['period'] == 'ALL' and r['name'] == 'Ball possession'
         )
         assert bp_all['match_id'] == '14023925'
         assert bp_all['stat_group'] == 'Possession'
-        assert bp_all['stat_key'] == 'ballPossession'
-        assert bp_all['home_value'] == 55.0
-        assert bp_all['away_value'] == 45.0
-        assert bp_all['home_text'] == '55%'
-        assert bp_all['away_text'] == '45%'
+        assert bp_all['key'] == 'ballPossession'
+        assert bp_all['home_value'] == 55
+        assert bp_all['away_value'] == 45
+        assert bp_all['home'] == '55%'
+        assert bp_all['away'] == '45%'
+        assert bp_all['compare_code'] == 1
+        assert bp_all['value_type'] == 'percent'
+        # Old renamed names are gone (moved to Silver).
+        for dead in ('stat_name', 'stat_key', 'home_text', 'away_text'):
+            assert dead not in bp_all
 
-        xg = next(r for r in rows if r['stat_name'] == 'Expected goals')
+        xg = next(r for r in rows if r['name'] == 'Expected goals')
         assert xg['home_value'] == 1.8
         assert xg['away_value'] == 0.6
 
         bp_1st = next(
             r for r in rows
-            if r['period'] == '1ST' and r['stat_name'] == 'Ball possession'
+            if r['period'] == '1ST' and r['name'] == 'Ball possession'
         )
-        assert bp_1st['home_value'] == 58.0
+        assert bp_1st['home_value'] == 58
+
+        # #840: `home`/`away` are display text — ALWAYS str, even when SofaScore
+        # sent a JSON number (count/decimal stats). Numeric-source values are
+        # stringified ('14', '1.8'), not upcast, so the Bronze column is a stable
+        # varchar the PyArrow->Iceberg writer can serialize.
+        ts = next(r for r in rows if r['name'] == 'Total shots')
+        assert ts['home'] == '14' and isinstance(ts['home'], str)
+        assert xg['home'] == '1.8' and isinstance(xg['home'], str)
+        assert all(isinstance(r['home'], str) for r in rows)
+        assert all(isinstance(r['away'], str) for r in rows)
 
     def test_flatten_handles_garbage(self):
         from scrapers.sofascore.scraper import SofaScoreScraper
@@ -648,6 +726,29 @@ class TestMatchStatsFlatten:
         assert SofaScoreScraper._flatten_match_stats(
             '1', {'statistics': [{'period': 'ALL'}]}
         ) == []
+
+    def test_home_away_are_iceberg_serializable(self):
+        """#840 regression (found in live e2e): SofaScore's `home`/`away` are
+        heterogeneous JSON — str '55%' for percent, int 14 for count, float 1.8
+        for decimal. Left raw, _coerce_scalar upcast the numeric ones while the
+        percent stayed str, yielding a mixed int/float/str object column that
+        crashed the PyArrow->Iceberg writer ("Expected bytes, got a 'float'").
+        Pinning them to str keeps the Bronze column a single-type varchar.
+        """
+        import pandas as pd
+
+        from scrapers.sofascore.scraper import SofaScoreScraper
+
+        df = pd.DataFrame(
+            SofaScoreScraper._flatten_match_stats('m', self._payload())
+        )
+        for col in ('home', 'away'):
+            types = {type(v).__name__ for v in df[col].dropna()}
+            assert types == {'str'}, f"{col} has mixed types: {types}"
+
+        # The exact prod failure path: pandas -> Arrow must not raise.
+        pa = pytest.importorskip('pyarrow')
+        pa.Table.from_pandas(df, preserve_index=False)
 
 
 class TestPlayerSeasonStatsFlatten:
@@ -731,20 +832,28 @@ class TestPlayerProfileFlatten:
         }
         row = SofaScoreScraper._flatten_player_profile(payload)
         assert row is not None
+        # Anchor.
         assert row['player_id'] == '11111'
+        # #840: source-key names (Bronze as-is); Silver renames/derives.
         assert row['name'] == 'John Doe'
         assert row['short_name'] == 'J. Doe'
         assert row['slug'] == 'john-doe'
         assert row['position'] == 'F'
+        assert row['jersey_number'] == 9                  # _coerce_scalar upcasts '9'->9
         assert row['shirt_number'] == 9
-        assert row['height_cm'] == 182
+        assert row['height'] == 182                       # was height_cm
         assert row['preferred_foot'] == 'Right'
-        assert row['date_of_birth'] == '1990-01-01'
+        assert row['date_of_birth_timestamp'] == 631152000  # raw epoch, no derive
         assert row['nationality'] == 'England'
-        assert row['country_code'] == 'EN'
-        assert row['current_team_id'] == 1
-        assert row['current_team_name'] == 'Team X'
+        assert row['country_name'] == 'England'
+        assert row['country_alpha2'] == 'EN'              # was country_code
+        assert row['team_id'] == 1                        # was current_team_id
+        assert row['team_name'] == 'Team X'               # was current_team_name
         assert row['retired'] is False
+        # Old derived/renamed names are gone (moved to Silver).
+        for dead in ('height_cm', 'date_of_birth', 'country_code',
+                     'current_team_id', 'current_team_name'):
+            assert dead not in row
 
     def test_garbage(self):
         from scrapers.sofascore.scraper import SofaScoreScraper
@@ -753,17 +862,21 @@ class TestPlayerProfileFlatten:
         # No player.id → None
         assert SofaScoreScraper._flatten_player_profile({'player': {'name': 'X'}}) is None
 
-    def test_dob_fallback_when_timestamp_invalid(self):
+    def test_dob_timestamp_kept_raw(self):
         from scrapers.sofascore.scraper import SofaScoreScraper
+        # #840: Bronze keeps the raw epoch; epoch->date derivation is Silver's job.
         payload = {
             'player': {'id': 1, 'dateOfBirthTimestamp': None},
         }
         row = SofaScoreScraper._flatten_player_profile(payload)
         assert row is not None
-        assert row['date_of_birth'] is None
+        assert row['date_of_birth_timestamp'] is None
+        assert 'date_of_birth' not in row
 
-    def test_country_fallback_for_nationality(self):
+    def test_country_kept_raw_no_fallback_in_bronze(self):
         from scrapers.sofascore.scraper import SofaScoreScraper
+        # #840: nationality<-country.name fallback moved to Silver; Bronze keeps
+        # the nested country block as-is (no synthetic nationality here).
         payload = {
             'player': {
                 'id': 1,
@@ -771,8 +884,10 @@ class TestPlayerProfileFlatten:
             }
         }
         row = SofaScoreScraper._flatten_player_profile(payload)
-        assert row['nationality'] == 'Brazil'
-        assert row['country_code'] == 'BR'
+        assert row['country_name'] == 'Brazil'
+        assert row['country_alpha2'] == 'BR'
+        assert 'nationality' not in row     # no country.name fallback in Bronze
+        assert 'country_code' not in row
 
 
 class TestReadPlayerRatingsCapture:
@@ -981,7 +1096,7 @@ class TestReadMatchCapture:
         assert set(sm['season']) == {'2526'}
         assert set(ms['_entity_type']) == {'match_stats'}
         assert set(sm['_entity_type']) == {'event_shotmap'}
-        assert set(ms['stat_name']) == {'Ball possession'}
+        assert set(ms['name']) == {'Ball possession'}   # #840 source-key name
         assert set(sm['xg']) == {0.45}
 
     @pytest.mark.unit
@@ -1005,13 +1120,20 @@ class TestReadMatchCapture:
         assert set(ve['season']) == {'2526'}
         assert set(ve['_entity_type']) == {'venue'}
         row = ve.to_dict('records')[0]
-        # nested SofaScore {"name": ...} objects unwrapped to scalars.
-        assert row['stadium'] == 'Etihad Stadium'
-        assert row['city'] == 'Manchester'
-        assert row['country'] == 'England'
-        assert row['venue_latitude'] == 53.483056
-        assert row['venue_longitude'] == -2.200278
+        # #840: nested SofaScore objects auto-flatten to source-key names
+        # (stadium.name -> stadium_name); Silver renames back.
         assert row['game_id'] == 14023959
+        assert row['stadium_name'] == 'Etihad Stadium'
+        assert row['city_name'] == 'Manchester'
+        assert row['country_name'] == 'England'
+        assert row['venue_coordinates_latitude'] == 53.483056
+        assert row['venue_coordinates_longitude'] == -2.200278
+        # Passthrough bonus fields the old fixed list dropped.
+        assert row['stadium_capacity'] == 55097
+        assert row['country_alpha2'] == 'EN'
+        # Old derived/renamed names are gone (moved to Silver).
+        for dead in ('stadium', 'city', 'country', 'venue_latitude', 'venue_longitude'):
+            assert dead not in row
 
     @pytest.mark.unit
     def test_requests_all_tabs_and_event(self):
@@ -1066,24 +1188,31 @@ class TestFlattenEventVenue:
 
     @pytest.mark.unit
     def test_extracts_nested_sofascore_shape(self):
+        # #840: nested {"name": ...} objects auto-flatten to source-key names
+        # (stadium.name -> stadium_name); Silver renames back.
         payload = {'event': {'id': 14023959, 'venue': {
             'stadium': {'name': 'Etihad Stadium', 'capacity': 55097},
             'city': {'name': 'Manchester'},
             'country': {'name': 'England', 'alpha2': 'EN'},
             'venueCoordinates': {'latitude': 53.483056, 'longitude': -2.200278},
         }}}
-        assert self._flat(payload) == {
-            'game_id': 14023959,
-            'stadium': 'Etihad Stadium',
-            'city': 'Manchester',
-            'country': 'England',
-            'venue_latitude': 53.483056,
-            'venue_longitude': -2.200278,
-        }
+        row = self._flat(payload)
+        assert row['game_id'] == 14023959
+        assert row['stadium_name'] == 'Etihad Stadium'
+        assert row['stadium_capacity'] == 55097          # passthrough bonus
+        assert row['city_name'] == 'Manchester'
+        assert row['country_name'] == 'England'
+        assert row['country_alpha2'] == 'EN'
+        assert row['venue_coordinates_latitude'] == 53.483056
+        assert row['venue_coordinates_longitude'] == -2.200278
+        for dead in ('stadium', 'city', 'country', 'venue_latitude', 'venue_longitude'):
+            assert dead not in row
 
     @pytest.mark.unit
     def test_extracts_flat_issue_shape(self):
-        # The issue documents a flat {stadium, city, country} string form.
+        # The flat {stadium, city, country} string form: auto-flatten keeps the
+        # bare-string keys as-is (stadium/city/country) — Silver's COALESCE bridges
+        # both shapes.
         payload = {'event': {'id': 99, 'venue': {
             'stadium': 'Anfield', 'city': 'Liverpool', 'country': 'England',
         }}}
@@ -1091,15 +1220,14 @@ class TestFlattenEventVenue:
         assert row['stadium'] == 'Anfield'
         assert row['city'] == 'Liverpool'
         assert row['country'] == 'England'
-        assert row['venue_latitude'] is None
-        assert row['venue_longitude'] is None
+        assert 'venue_coordinates_latitude' not in row
         assert row['game_id'] == 99
 
     @pytest.mark.unit
     def test_extracts_live_amex_shape_no_coords(self):
         # Live-verified 2026-06-23 (event 14023959, American Express Stadium): the
         # real payload nests stadium/city/country objects, carries capacity, and
-        # has NO venueCoordinates → coords resolve to NULL, not an error.
+        # has NO venueCoordinates → coords absent, not an error.
         payload = {'event': {'id': 14023959, 'venue': {
             'name': 'American Express Stadium',
             'capacity': 31876,
@@ -1109,12 +1237,15 @@ class TestFlattenEventVenue:
             'slug': 'american-express-community-s-stadium', 'id': 2443,
         }}}
         row = self._flat(payload)
-        assert row['stadium'] == 'American Express Stadium'
-        assert row['city'] == 'Falmer'
-        assert row['country'] == 'England'
-        assert row['venue_latitude'] is None
-        assert row['venue_longitude'] is None
         assert row['game_id'] == 14023959
+        assert row['stadium_name'] == 'American Express Stadium'
+        assert row['city_name'] == 'Falmer'
+        assert row['country_name'] == 'England'
+        # Deeper nesting + extra fields preserved (#840 "keep everything").
+        assert row['city_country_name'] == 'England'
+        assert row['country_alpha3'] == 'ENG'
+        assert row['slug'] == 'american-express-community-s-stadium'
+        assert 'venue_coordinates_latitude' not in row
 
     @pytest.mark.unit
     def test_none_when_no_venue(self):
@@ -1290,13 +1421,6 @@ class TestReadScheduleViaCapture:
     tournament page (the soccerdata reader is Turnstile-blocked). We patch the
     capture session so no browser is needed and assert the persisted schema."""
 
-    # The 15 columns of bronze.sofascore_schedule (mirrors bronze_schemas.json).
-    _EXPECTED_COLS = {
-        '_batch_id', '_entity_type', '_ingested_at', '_source',
-        'away_score', 'away_team', 'date', 'game', 'game_id',
-        'home_score', 'home_team', 'league', 'round', 'season', 'week',
-    }
-
     def _scraper(self):
         from scrapers.sofascore.scraper import SofaScoreScraper
         with patch('scrapers.base.base_scraper.get_rate_limiter'), \
@@ -1377,22 +1501,26 @@ class TestReadScheduleViaCapture:
         # Exactly the two ut=17 events (901 from ut=16 is filtered out).
         assert df is not None
         assert sorted(df['game_id'].tolist()) == [101, 102]
-        # Persisted schema matches the bronze table (no add/drop columns).
-        assert set(df.columns) == self._EXPECTED_COLS
         # Partition labels: league passthrough + season short form '2526'.
         assert set(df['league']) == {'ENG-Premier League'}
         assert set(df['season']) == {'2526'}
-        # Dtypes the table expects: date timestamp, round/week nullable bigint.
-        assert pd.api.types.is_datetime64_any_dtype(df['date'])
-        assert str(df['round'].dtype) == 'Int64'
-        assert str(df['week'].dtype) == 'Int64'
-        # week/game are NULL placeholders; scores are nullable doubles.
-        assert df['week'].isna().all()
-        assert df['game'].isna().all()
+        # #840: Bronze as-is — source-key names, raw types. Renames + type
+        # derivations (epoch->timestamp, round->bigint) moved to the schedule
+        # consumers (xref_match, team_match, shots).
+        cols = set(df.columns)
+        assert {'game_id', 'home_team_name', 'away_team_name',
+                'home_score_current', 'start_timestamp', 'round_info_round',
+                'status_type'} <= cols
+        assert not ({'date', 'home_team', 'away_team', 'home_score',
+                     'away_score', 'round', 'week', 'game'} & cols)
+        # start_timestamp stays a raw epoch int (no pandas timestamp coercion).
         finished = df[df['game_id'] == 101].iloc[0]
-        assert finished['home_score'] == 2 and finished['away_score'] == 1
+        assert finished['start_timestamp'] == 1719000000
+        assert finished['home_team_name'] == 'Arsenal'
+        assert finished['home_score_current'] == 2 and finished['away_score_current'] == 1
+        # not-started event has no score → NaN in the unioned frame.
         notstarted = df[df['game_id'] == 102].iloc[0]
-        assert pd.isna(notstarted['home_score'])
+        assert pd.isna(notstarted['home_score_current'])
 
     @pytest.mark.unit
     def test_drops_next_season_events_when_page_rolled_over(self):
@@ -1607,7 +1735,7 @@ class TestReadPlayerCapture:
         seen = []
         picker_labels = []
 
-        def fake_iter(player_ids, season_picker_label=None):
+        def fake_iter(player_ids, season_picker_label=None, **kwargs):
             picker_labels.append(season_picker_label)
             for pid in player_ids:
                 seen.append(str(pid))
@@ -1626,8 +1754,9 @@ class TestReadPlayerCapture:
         assert set(prof['season']) == {'2526'}
         assert set(prof['_entity_type']) == {'player_profile'}
         prow = {r['player_id']: r for r in prof.to_dict('records')}['101']
-        assert prow['height_cm'] == 185 and prow['preferred_foot'] == 'Right'
-        assert prow['current_team_name'] == 'Brighton'
+        # #840: Bronze source-key names (Silver renames height->height_cm etc.).
+        assert prow['height'] == 185 and prow['preferred_foot'] == 'Right'
+        assert prow['team_name'] == 'Brighton'
 
         # Season-aggregate frame: the season-guarded EPL overall, flattened.
         seas = out['player_season_stats']
@@ -1647,7 +1776,7 @@ class TestReadPlayerCapture:
         # (transferred player) → player_season_stats is empty, not a crash.
         scraper = self._scraper()
 
-        def fake_iter(player_ids, season_picker_label=None):
+        def fake_iter(player_ids, season_picker_label=None, **kwargs):
             for pid in player_ids:
                 yield str(pid), self._capture(pid, with_season=False)
 
@@ -1662,7 +1791,7 @@ class TestReadPlayerCapture:
     def test_graceful_empty_when_nothing_captured(self):
         scraper = self._scraper()
 
-        def fake_iter(player_ids, season_picker_label=None):
+        def fake_iter(player_ids, season_picker_label=None, **kwargs):
             for pid in player_ids:
                 yield str(pid), {'profile': None, 'season_buffer': {}}
 
@@ -1921,3 +2050,218 @@ class TestMatchCaptureSessionRestart:
         # The 4 dead-proxy matches were skipped (empty); the rest captured.
         assert all(ep == {} for _, ep in out[:4])
         assert out[4][1].get('lineups') is not None
+
+
+class TestMatchCaptureInPageFetch:
+    """#842 in-page fetch: only the session's FIRST match navigates (solves
+    Turnstile); later matches pull their endpoints via same-origin fetch. A
+    fetch that misses a required endpoint falls back to a full navigation for
+    that match; SOFASCORE_INPAGE_FETCH=0 restores nav-per-match."""
+
+    _GOOD = {'lineups': {'home': {}, 'away': {}}, 'event': {}}
+
+    def _scraper(self):
+        from scrapers.sofascore.scraper import SofaScoreScraper
+        with patch('scrapers.base.base_scraper.get_rate_limiter'), \
+             patch('scrapers.base.base_scraper.get_retry_policy'), \
+             patch('scrapers.base.base_scraper.get_circuit_breaker'), \
+             patch('scrapers.base.base_scraper.IcebergWriter'):
+            s = SofaScoreScraper(leagues=['ENG-Premier League'], seasons=[2024])
+        s._proxy_manager = None
+        return s
+
+    def _fakecap_cls(self, calls, fetch_results=None):
+        good = self._GOOD
+
+        class _FakeCap:
+            def __init__(self, *a, **k):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def capture_event(self, mid, tabs=(), required=()):
+                calls.append(('nav', mid))
+                return good
+
+            def fetch_event(self, mid, names=()):
+                calls.append(('fetch', mid))
+                if fetch_results is not None:
+                    return fetch_results.get(mid, good)
+                return good
+        return _FakeCap
+
+    @pytest.mark.unit
+    def test_first_match_navigates_then_fetches(self):
+        scraper = self._scraper()
+        calls = []
+        with patch('scrapers.sofascore.camoufox_capture.SofascoreCamoufoxCapture',
+                   self._fakecap_cls(calls)):
+            out = list(scraper._iter_match_captures(['1', '2', '3']))
+        assert [m for m, _ in out] == ['1', '2', '3']
+        assert calls == [('nav', '1'), ('fetch', '2'), ('fetch', '3')]
+
+    @pytest.mark.unit
+    def test_fetch_miss_falls_back_to_navigation(self):
+        # Match 2's fetch misses the required lineups (clearance expired) —
+        # it re-navigates; match 3 goes back to the cheap fetch path.
+        scraper = self._scraper()
+        calls = []
+        with patch('scrapers.sofascore.camoufox_capture.SofascoreCamoufoxCapture',
+                   self._fakecap_cls(calls, fetch_results={'2': {}})):
+            out = list(scraper._iter_match_captures(['1', '2', '3']))
+        assert calls == [('nav', '1'),
+                         ('fetch', '2'), ('nav', '2'),
+                         ('fetch', '3')]
+        # The fallback navigation recovered match 2 — nothing lost.
+        assert all(ep.get('lineups') for _, ep in out)
+
+    @pytest.mark.unit
+    def test_kill_switch_restores_nav_per_match(self, monkeypatch):
+        monkeypatch.setenv('SOFASCORE_INPAGE_FETCH', '0')
+        scraper = self._scraper()
+        calls = []
+        with patch('scrapers.sofascore.camoufox_capture.SofascoreCamoufoxCapture',
+                   self._fakecap_cls(calls)):
+            list(scraper._iter_match_captures(['1', '2']))
+        assert calls == [('nav', '1'), ('nav', '2')]
+
+    @pytest.mark.unit
+    def test_cap_without_fetch_event_degrades_to_nav(self):
+        # A capture layer without fetch_event (or a fetch bug) must degrade to
+        # the old nav-per-match behaviour, not fail the run.
+        scraper = self._scraper()
+        calls = []
+
+        class _NavOnly:
+            def __init__(self, *a, **k):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def capture_event(self, mid, tabs=(), required=()):
+                calls.append(('nav', mid))
+                return {'lineups': {'home': {}, 'away': {}}, 'event': {}}
+
+        with patch('scrapers.sofascore.camoufox_capture.SofascoreCamoufoxCapture',
+                   _NavOnly):
+            out = list(scraper._iter_match_captures(['1', '2']))
+        assert [m for m, _ in out] == ['1', '2']
+        assert calls == [('nav', '1'), ('nav', '2')]
+        assert all(ep.get('lineups') for _, ep in out)
+
+
+class TestPlayerCaptureInPageFetch:
+    """#842 players: only the session's FIRST player navigates (solves
+    Turnstile); later players pull /api/v1/player/{id} (+ season endpoints)
+    via same-origin fetch. A fetch that misses the profile falls back to a
+    full navigation; SOFASCORE_INPAGE_FETCH=0 restores nav-per-player."""
+
+    _GOOD = {'profile': {'id': 1, 'name': 'X'}, 'season_buffer': {}}
+
+    def _scraper(self):
+        from scrapers.sofascore.scraper import SofaScoreScraper
+        with patch('scrapers.base.base_scraper.get_rate_limiter'), \
+             patch('scrapers.base.base_scraper.get_retry_policy'), \
+             patch('scrapers.base.base_scraper.get_circuit_breaker'), \
+             patch('scrapers.base.base_scraper.IcebergWriter'):
+            s = SofaScoreScraper(leagues=['ENG-Premier League'], seasons=[2024])
+        s._proxy_manager = None
+        return s
+
+    def _fakecap_cls(self, calls, fetch_results=None):
+        good = self._GOOD
+
+        class _FakeCap:
+            def __init__(self, *a, **k):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def capture_player(self, pid, season_picker_label=None):
+                calls.append(('nav', pid))
+                return good
+
+            def fetch_player(self, pid, target_ut=None, target_year=None):
+                calls.append(('fetch', pid, target_ut, target_year))
+                if fetch_results is not None:
+                    return fetch_results.get(pid, good)
+                return good
+        return _FakeCap
+
+    @pytest.mark.unit
+    def test_first_player_navigates_then_fetches_with_target(self):
+        scraper = self._scraper()
+        calls = []
+        with patch('scrapers.sofascore.camoufox_capture.SofascoreCamoufoxCapture',
+                   self._fakecap_cls(calls)):
+            out = list(scraper._iter_player_captures(
+                ['1', '2', '3'], season_picker_label='Premier League',
+                target_ut=17, target_year='25/26'))
+        assert [p for p, _ in out] == ['1', '2', '3']
+        # First player warms the session via navigation; the rest fetch with
+        # the (ut, year) target for the precise season-stats resolution.
+        assert calls == [('nav', '1'),
+                         ('fetch', '2', 17, '25/26'),
+                         ('fetch', '3', 17, '25/26')]
+
+    @pytest.mark.unit
+    def test_fetch_miss_falls_back_to_navigation(self):
+        scraper = self._scraper()
+        calls = []
+        miss = {'profile': None, 'season_buffer': {}}
+        with patch('scrapers.sofascore.camoufox_capture.SofascoreCamoufoxCapture',
+                   self._fakecap_cls(calls, fetch_results={'2': miss})):
+            out = list(scraper._iter_player_captures(
+                ['1', '2', '3'], target_ut=17, target_year='25/26'))
+        assert [c[:2] for c in calls] == [('nav', '1'),
+                                          ('fetch', '2'), ('nav', '2'),
+                                          ('fetch', '3')]
+        # The fallback navigation recovered player 2 — nothing lost.
+        assert all(c.get('profile') for _, c in out)
+
+    @pytest.mark.unit
+    def test_kill_switch_restores_nav_per_player(self, monkeypatch):
+        monkeypatch.setenv('SOFASCORE_INPAGE_FETCH', '0')
+        scraper = self._scraper()
+        calls = []
+        with patch('scrapers.sofascore.camoufox_capture.SofascoreCamoufoxCapture',
+                   self._fakecap_cls(calls)):
+            list(scraper._iter_player_captures(['1', '2']))
+        assert calls == [('nav', '1'), ('nav', '2')]
+
+    @pytest.mark.unit
+    def test_cap_without_fetch_player_degrades_to_nav(self):
+        scraper = self._scraper()
+        calls = []
+
+        class _NavOnly:
+            def __init__(self, *a, **k):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def capture_player(self, pid, season_picker_label=None):
+                calls.append(('nav', pid))
+                return {'profile': {'id': int(pid)}, 'season_buffer': {}}
+
+        with patch('scrapers.sofascore.camoufox_capture.SofascoreCamoufoxCapture',
+                   _NavOnly):
+            out = list(scraper._iter_player_captures(['1', '2']))
+        assert calls == [('nav', '1'), ('nav', '2')]
+        assert all(c.get('profile') for _, c in out)

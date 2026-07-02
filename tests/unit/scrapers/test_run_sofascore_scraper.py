@@ -40,7 +40,8 @@ class TestArgparseHardFail:
 
 
 def _run_main(argv: list, scraper_cls, *, resolver_ids=None,
-              existing_schedule=None) -> int:
+              existing_schedule=None, existing_capture_ids=None,
+              existing_partition=None) -> int:
     """Run ``main()`` with stubbed ``scrapers.sofascore[.scraper]`` modules.
 
     ``scrapers.base.base_scraper`` (for ``ReplaceGuardError``) imports for real.
@@ -49,6 +50,10 @@ def _run_main(argv: list, scraper_cls, *, resolver_ids=None,
     ``_read_existing_schedule`` is always patched (it would otherwise hit Trino)
     to ``existing_schedule`` (default: an empty frame → captured rows save
     as-is) so the #761 schedule merge runs offline + deterministically.
+    ``existing_capture_ids`` / ``existing_partition`` patch the #842
+    match_capture skip-existing probe (``_existing_match_ids_in_bronze``) and
+    partition merge read (``_read_existing_partition``) — defaults (empty set /
+    empty frame) mean "nothing in bronze yet": no skip, merge is a no-op.
     """
     so_pkg = MagicMock()
     so_pkg.SofaScoreScraper = scraper_cls
@@ -67,6 +72,10 @@ def _run_main(argv: list, scraper_cls, *, resolver_ids=None,
             mod._resolve_match_ids_from_bronze = lambda *a, **k: resolver_ids
         _existing = pd.DataFrame() if existing_schedule is None else existing_schedule
         mod._read_existing_schedule = lambda *a, **k: _existing
+        _ids = set() if existing_capture_ids is None else set(existing_capture_ids)
+        mod._existing_match_ids_in_bronze = lambda *a, **k: _ids
+        _part = pd.DataFrame() if existing_partition is None else existing_partition
+        mod._read_existing_partition = lambda *a, **k: _part
         return mod.main()
 
 
@@ -421,6 +430,94 @@ class TestMatchCaptureRunner:
             payload = json.load(f)
         assert payload['fallback_reason'] == 'http_403'
 
+    @pytest.mark.unit
+    def test_skip_existing_captures_only_new_matches(self, temp_output):
+        """#842: matches already in bronze.sofascore_player_ratings are not
+        re-captured — the capture call receives only the NEW match_ids."""
+        scraper = _match_capture_scraper()
+        rc = _run_main(
+            ["--entity", "match_capture", "--league", "ENG-Premier League",
+             "--season", "2025", "--output", temp_output],
+            MagicMock(return_value=scraper),
+            resolver_ids=['1', '2', '3'],
+            existing_capture_ids={'3'},
+        )
+        assert rc == 0
+        assert (scraper.read_match_capture.call_args.kwargs['match_ids']
+                == ['1', '2'])
+        with open(temp_output) as f:
+            payload = json.load(f)
+        assert payload['matches_total'] == 3
+        assert payload['matches_skipped_existing'] == 1
+
+    @pytest.mark.unit
+    def test_all_existing_noops_without_opening_scraper(self, temp_output):
+        """#842: nothing new → exit 0 BEFORE the scraper session is even
+        constructed (zero proxy spend), no capture, no save."""
+        scraper_cls = MagicMock()
+        rc = _run_main(
+            ["--entity", "match_capture", "--league", "ENG-Premier League",
+             "--season", "2025", "--output", temp_output],
+            scraper_cls,
+            resolver_ids=['1', '2'],
+            existing_capture_ids={'1', '2'},
+        )
+        assert rc == 0
+        scraper_cls.assert_not_called()
+        with open(temp_output) as f:
+            payload = json.load(f)
+        assert payload['matches_total'] == 2
+        assert payload['matches_skipped_existing'] == 2
+        assert payload['rows'] == 0 and payload['fallback'] is False
+
+    @pytest.mark.unit
+    def test_force_replace_recaptures_existing(self, temp_output):
+        """#842: --force-replace restores the old full re-capture — the
+        skip-existing probe must not filter anything."""
+        scraper = _match_capture_scraper()
+        rc = _run_main(
+            ["--entity", "match_capture", "--league", "ENG-Premier League",
+             "--season", "2025", "--force-replace", "--output", temp_output],
+            MagicMock(return_value=scraper),
+            resolver_ids=['1', '2'],
+            existing_capture_ids={'1', '2'},
+        )
+        assert rc == 0
+        assert (scraper.read_match_capture.call_args.kwargs['match_ids']
+                == ['1', '2'])
+        with open(temp_output) as f:
+            payload = json.load(f)
+        assert payload['matches_skipped_existing'] == 0
+
+    @pytest.mark.unit
+    def test_merge_unions_with_existing_partition(self, temp_output):
+        """#842: the captured frame (new matches only) is unioned with the
+        existing partition before the replace_partitions save — the saved
+        frame never shrinks, so the completeness guard passes."""
+        existing = pd.DataFrame({
+            'league': ['ENG-Premier League'] * 4, 'season': ['2526'] * 4,
+            'match_id': ['8', '8', '9', '9'],
+        })
+        scraper = _match_capture_scraper()
+        rc = _run_main(
+            ["--entity", "match_capture", "--league", "ENG-Premier League",
+             "--season", "2025", "--output", temp_output],
+            MagicMock(return_value=scraper),
+            resolver_ids=['1', '2'],
+            existing_partition=existing,
+        )
+        assert rc == 0
+        ratings_call = next(
+            c for c in scraper.save_to_iceberg.call_args_list
+            if c.kwargs['table_name'] == 'sofascore_player_ratings'
+        )
+        saved = ratings_call.kwargs['df']
+        assert sorted(set(saved['match_id'])) == ['1', '2', '8', '9']
+        assert len(saved) == 8   # 4 existing + 4 captured — never shrinks
+        with open(temp_output) as f:
+            payload = json.load(f)
+        assert payload['rows'] == 8
+
 
 def _player_capture_scraper(
     *, guard_blocks: bool = False, empty: bool = False, season_empty: bool = False,
@@ -658,3 +755,83 @@ class TestScheduleCaptureMergeRunner:
         assert sorted(saved['game_id']) == [1, 2, 3, 4, 5, 6]   # union
         assert len(saved) >= len(existing)                       # never shrinks
         assert saved.set_index('game_id').loc[1, 'home_score'] == 1.0  # captured wins
+
+
+class TestMergeMatchPartition:
+    """#842 _merge_match_partition: union an existing per-match partition with
+    captured rows for NEW matches, keyed by match_id/game_id. A re-captured
+    match replaces its existing rows wholesale; the union never shrinks, so
+    the completeness guard passes."""
+
+    @pytest.mark.unit
+    def test_empty_existing_returns_captured(self):
+        merge = _schedule_module()._merge_match_partition
+        captured = pd.DataFrame({'match_id': ['1', '1'], 'rating': [6.5, 7.0]})
+        out = merge(pd.DataFrame(), captured, key='match_id')
+        assert len(out) == 2
+
+    @pytest.mark.unit
+    def test_none_existing_returns_captured(self):
+        merge = _schedule_module()._merge_match_partition
+        captured = pd.DataFrame({'match_id': ['1'], 'rating': [6.5]})
+        out = merge(None, captured, key='match_id')
+        assert out['match_id'].tolist() == ['1']
+
+    @pytest.mark.unit
+    def test_union_never_shrinks_and_recaptured_match_wins(self):
+        merge = _schedule_module()._merge_match_partition
+        existing = pd.DataFrame({
+            'match_id': ['1', '1', '2'], 'rating': [5.0, 5.5, 6.0],
+        })
+        captured = pd.DataFrame({
+            'match_id': ['2', '3'],       # 2 re-captured, 3 new
+            'rating': [9.0, 8.0],
+        })
+        out = merge(existing, captured, key='match_id')
+        assert sorted(out['match_id']) == ['1', '1', '2', '3']
+        assert len(out) >= len(existing)                 # never shrinks
+        # the re-captured match's OLD row is dropped wholesale — no stale mix.
+        assert out.set_index('match_id').loc['2', 'rating'] == 9.0
+
+    @pytest.mark.unit
+    def test_key_type_mismatch_coerced_via_str(self):
+        """Trino returns varchar keys; a captured frame may carry ints (venue
+        game_id) — the key comparison must coerce both sides to str."""
+        merge = _schedule_module()._merge_match_partition
+        existing = pd.DataFrame({'game_id': ['1', '2'], 'stadium': ['A', 'B']})
+        captured = pd.DataFrame({'game_id': [2, 3], 'stadium': ['B2', 'C']})
+        out = merge(existing, captured, key='game_id')
+        assert len(out) == 3                             # '2' replaced, not doubled
+        assert set(out['stadium']) == {'A', 'B2', 'C'}
+
+
+class TestFilterNewMatchIds:
+    """#842 _filter_new_match_ids: drop match_ids already materialised in
+    bronze.sofascore_player_ratings (the authoritative already-captured key)."""
+
+    @pytest.mark.unit
+    def test_filters_and_counts(self, monkeypatch):
+        mod = _schedule_module()
+        monkeypatch.setattr(mod, '_existing_match_ids_in_bronze',
+                            lambda *a, **k: {'2', '3'})
+        new, skipped = mod._filter_new_match_ids(
+            ['1', '2', '3'], 'ENG-Premier League', '2526', '2025')
+        assert new == ['1'] and skipped == 2
+
+    @pytest.mark.unit
+    def test_empty_probe_skips_nothing(self, monkeypatch):
+        mod = _schedule_module()
+        monkeypatch.setattr(mod, '_existing_match_ids_in_bronze',
+                            lambda *a, **k: set())
+        new, skipped = mod._filter_new_match_ids(
+            ['1', '2'], 'ENG-Premier League', '2526', '2025')
+        assert new == ['1', '2'] and skipped == 0
+
+    @pytest.mark.unit
+    def test_int_ids_compared_as_str(self, monkeypatch):
+        mod = _schedule_module()
+        monkeypatch.setattr(mod, '_existing_match_ids_in_bronze',
+                            lambda *a, **k: {'10'})
+        new, skipped = mod._filter_new_match_ids(
+            [10, 11], 'ENG-Premier League', '2526', '2025')
+        assert new == [11] and skipped == 1
