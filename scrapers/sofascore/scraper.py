@@ -8,7 +8,7 @@ Source: https://www.sofascore.com
 """
 
 import logging
-import re
+import os
 import time
 from collections import defaultdict
 from datetime import datetime
@@ -20,55 +20,15 @@ import pandas as pd
 from scrapers.base.base_scraper import SoccerdataScraper
 
 
-# camelCase -> snake_case for Bronze column names.
-_CAMEL_RE_1 = re.compile(r'([A-Z]+)([A-Z][a-z])')
-_CAMEL_RE_2 = re.compile(r'([a-z\d])([A-Z])')
-
-
-def _camel_to_snake(name: str) -> str:
-    """Convert a camelCase / PascalCase key to snake_case.
-
-    Examples:
-        ``goalsPrevented`` -> ``goals_prevented``
-        ``XGOnTarget``     -> ``xg_on_target``
-        ``totalAttemptAssist`` -> ``total_attempt_assist``
-    """
-    s1 = _CAMEL_RE_1.sub(r'\1_\2', name)
-    return _CAMEL_RE_2.sub(r'\1_\2', s1).lower()
-
-
-def _coerce_scalar(v):
-    """Coerce a JSON value to a Bronze-safe scalar.
-
-    SofaScore stats often nest a structure like
-    ``{"value": 3, "previousValue": 2, ...}`` for richer UI rendering.
-    For Bronze we only keep the canonical ``value``; richer payloads
-    can be re-derived from raw JSON if ever needed.
-    """
-    if isinstance(v, dict):
-        # Most common SofaScore shape: {"key": "...", "value": ...}.
-        if 'value' in v:
-            return _coerce_scalar(v['value'])
-        return None
-    if isinstance(v, (list, tuple)):
-        return None
-    if isinstance(v, bool):
-        return v
-    if isinstance(v, (int, float)):
-        return v
-    if v is None:
-        return None
-    # String — try numeric upcast (SofaScore returns e.g. "12.4" for some
-    # rating sub-stats). Fall back to the raw string.
-    s = str(v).strip()
-    if not s:
-        return None
-    try:
-        if '.' in s:
-            return float(s)
-        return int(s)
-    except (TypeError, ValueError):
-        return s
+# Bronze-flatten helpers live in a lightweight stdlib-only module so the
+# capture layer (camoufox_capture) can reuse them without importing this heavy
+# module (#840). Re-exported here for existing callers/tests.
+from scrapers.sofascore._flatten import (  # noqa: E402
+    _MAX_FLATTEN_DEPTH,
+    _auto_flatten,
+    _camel_to_snake,
+    _coerce_scalar,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -282,11 +242,10 @@ class SofaScoreScraper(SoccerdataScraper):
                 continue
 
             df = pd.DataFrame([normalize_event(ev) for ev in events])
-            df['date'] = pd.to_datetime(df['date'], unit='s')
-            df['home_score'] = pd.to_numeric(df['home_score'], errors='coerce')
-            df['away_score'] = pd.to_numeric(df['away_score'], errors='coerce')
-            df['round'] = df['round'].astype('Int64')          # nullable bigint
-            df['week'] = pd.array([pd.NA] * len(df), dtype='Int64')
+            # #840: Bronze as-is — no epoch->timestamp / round->bigint conversion
+            # here; the schedule consumers (xref_match, team_match, shots) derive
+            # from the raw start_timestamp / round_info_round columns. Only tag
+            # partition keys + lineage (added by _add_metadata below).
             df['league'] = league
             df['season'] = season_short
             logger.info("Capture schedule league=%s season=%s: %d events.",
@@ -504,10 +463,15 @@ class SofaScoreScraper(SoccerdataScraper):
             )
             df = df[mask]
 
-        # Keep only finished matches (have a score) — schedule writer
-        # leaves home_score NaN for unplayed games.
-        if 'home_score' in df.columns:
-            df = df[df['home_score'].notna()]
+        # Keep only finished matches (have a score) — unplayed games have no
+        # score. #840: read_schedule now emits the raw source key
+        # ``home_score_current`` (was the derived ``home_score``).
+        score_col = next(
+            (c for c in ('home_score_current', 'home_score') if c in df.columns),
+            None,
+        )
+        if score_col is not None:
+            df = df[df[score_col].notna()]
 
         if 'game_id' not in df.columns:
             return []
@@ -680,8 +644,17 @@ class SofaScoreScraper(SoccerdataScraper):
     ) -> List[Dict]:
         """Project SofaScore's nested player-list into flat rows.
 
+        #840: keep each lineup entry's own fields as-is (captain, substitute,
+        shirt_number, ... — previously dropped). ``rating`` stays raw (the
+        0.0-means-"did-not-play" -> NULL rule moved to Silver, which already
+        applies it); ``position`` keeps the per-event -> nominal fallback. The
+        nested ``statistics`` Opta block is deliberately NOT duplicated here — it
+        is captured in full by ``event_player_stats`` from the SAME /lineups
+        payload, so no source field is lost. The ``player`` identity object is
+        skipped (its id is the anchor).
+
         Schema per row:
-            match_id, player_id, team_side, rating, position
+            match_id, player_id, team_side, rating, position, + entry fields.
         """
         rows: List[Dict] = []
         if not isinstance(side_payload, dict):
@@ -697,35 +670,20 @@ class SofaScoreScraper(SoccerdataScraper):
             if pid is None:
                 continue
 
-            raw_rating = stats.get('rating')
-            try:
-                rating_val = float(raw_rating) if raw_rating is not None else None
-            except (TypeError, ValueError):
-                rating_val = None
-            # SofaScore reports 0.0 for players who didn't enter the pitch
-            # — it's not a rating, treat as NULL (matches Opta semantics).
-            if rating_val is not None and rating_val == 0.0:
-                rating_val = None
-
-            # Position priority: per-event role (e.g. "G","D","M","F"),
-            # falling back to the player's nominal position string.
-            position = (
-                entry.get('position')
-                or player.get('position')
-                or None
-            )
-
             player_id_str = (
                 str(int(pid)) if isinstance(pid, (int, float)) else str(pid)
             )
 
-            rows.append({
+            row: Dict = {
                 'match_id': str(match_id),
                 'player_id': player_id_str,
                 'team_side': side,
-                'rating': rating_val,
-                'position': position,
-            })
+                # rating raw (Silver drops 0.0); position per-event or nominal.
+                'rating': _coerce_scalar(stats.get('rating')),
+                'position': entry.get('position') or player.get('position') or None,
+            }
+            _auto_flatten(entry, row, skip=('player', 'statistics'))
+            rows.append(row)
 
         return rows
 
@@ -866,8 +824,25 @@ class SofaScoreScraper(SoccerdataScraper):
         proxy dead). The generator owns the browser session — the caller MUST
         ``.close()`` it (via try/finally) so it tears down even on an early
         circuit-breaker break.
+
+        #842 in-page fetch: only the session's FIRST match navigates (solving
+        Turnstile; ~2 MB — page.route disables the HTTP cache, so every nav
+        re-downloads the SPA bundle). Every later match pulls just its JSON
+        endpoints via same-origin ``fetch_event`` (~0.1-0.2 MB). A fetch that
+        raises or misses a ``required`` endpoint (clearance expired, transient
+        miss) falls back to a full ``capture_event`` navigation for that match,
+        which re-solves Turnstile for the fetches that follow. Kill-switch
+        ``SOFASCORE_INPAGE_FETCH=0`` restores nav-per-match (mirrors
+        ``SOFASCORE_BLOCK_RESOURCES``).
         """
-        from scrapers.sofascore.camoufox_capture import SofascoreCamoufoxCapture
+        from scrapers.sofascore.camoufox_capture import (
+            SofascoreCamoufoxCapture,
+            fetch_names_for_tabs,
+        )
+
+        env = os.environ.get('SOFASCORE_INPAGE_FETCH')
+        use_fetch = env is None or env.strip().lower() not in ('0', 'false', 'no')
+        fetch_names = fetch_names_for_tabs(tabs)
 
         match_ids = [str(m) for m in match_ids]
         n = len(match_ids)
@@ -881,18 +856,35 @@ class SofaScoreScraper(SoccerdataScraper):
                 )
             in_session = 0
             consec_fail = 0
+            warmed = False  # True after this session's first full navigation
             with SofascoreCamoufoxCapture(proxy=proxy) as cap:
                 while i < n and in_session < session_max and consec_fail < proxy_fail_max:
                     mid = match_ids[i]
                     self._rate_limiter.acquire()
                     self._stats['requests'] += 1
-                    try:
-                        endpoints = cap.capture_event(
-                            mid, tabs=tabs, required=required,
-                        )
-                    except Exception as e:  # noqa: BLE001 — one bad event mustn't kill the loop
-                        logger.warning("camoufox capture failed for event=%s: %s", mid, e)
-                        endpoints = {}
+                    endpoints = None
+                    if use_fetch and warmed:
+                        try:
+                            endpoints = cap.fetch_event(mid, names=fetch_names)
+                        except Exception as e:  # noqa: BLE001 — degrade to a full nav
+                            logger.info(
+                                "in-page fetch failed for event=%s: %s", mid, e)
+                            endpoints = None
+                        if endpoints is not None and any(
+                                r not in endpoints for r in required):
+                            logger.info(
+                                "in-page fetch missed a required endpoint for "
+                                "event=%s — falling back to full navigation.", mid)
+                            endpoints = None
+                    if endpoints is None:
+                        try:
+                            endpoints = cap.capture_event(
+                                mid, tabs=tabs, required=required,
+                            )
+                            warmed = True
+                        except Exception as e:  # noqa: BLE001 — one bad event mustn't kill the loop
+                            logger.warning("camoufox capture failed for event=%s: %s", mid, e)
+                            endpoints = {}
                     if not endpoints.get('lineups'):
                         self._stats['failures'] += 1
                         self._last_lineup_error = {
@@ -927,32 +919,59 @@ class SofaScoreScraper(SoccerdataScraper):
             if callable(close):
                 close()  # tear down the Camoufox session
 
-    def _iter_player_captures(self, player_ids: List[str], season_picker_label=None):
-        """Yield ``(player_id, capture)`` by navigating each player page through
-        ONE warmed Camoufox session (#751 PR3 + PR3b). ``capture`` is the
-        ``{'profile', 'season_buffer'}`` dict from
-        :meth:`SofascoreCamoufoxCapture.capture_player` — the bio SSR'd in
-        ``__NEXT_DATA__`` plus the Season-tab season-stats capture. When
+    def _iter_player_captures(self, player_ids: List[str], season_picker_label=None,
+                              target_ut=None, target_year=None):
+        """Yield ``(player_id, capture)`` through ONE warmed Camoufox session
+        (#751 PR3 + PR3b). ``capture`` is the ``{'profile', 'season_buffer'}``
+        dict — the bio plus the season-stats capture. When
         ``season_picker_label`` is given (the target tournament's display name,
-        e.g. ``'Premier League'``) the capture also drives the Season tab +
-        picker to fetch season-aggregate stats in the SAME navigation. Mirrors
+        e.g. ``'Premier League'``) the navigation path also drives the Season
+        tab + picker in the SAME navigation. Mirrors
         :meth:`_iter_match_captures`. A ``{'profile': None}`` means the capture
         missed (page didn't render / proxy dead). The generator owns the browser
         session — the caller MUST ``.close()`` it (try/finally) so it tears down
-        even on an early circuit-breaker break."""
+        even on an early circuit-breaker break.
+
+        #842 in-page fetch: only the FIRST player navigates (solves Turnstile,
+        ~2 MB); every later player pulls ``/api/v1/player/{id}`` (+ the two
+        season-stats endpoints resolved via ``target_ut``/``target_year``) via
+        same-origin fetch (~30 KB). A fetch that raises or misses the profile
+        falls back to a full ``capture_player`` navigation for that player.
+        Kill-switch ``SOFASCORE_INPAGE_FETCH=0`` restores nav-per-player."""
         from scrapers.sofascore.camoufox_capture import SofascoreCamoufoxCapture
 
+        env = os.environ.get('SOFASCORE_INPAGE_FETCH')
+        use_fetch = env is None or env.strip().lower() not in ('0', 'false', 'no')
+
         proxy = self._camoufox_proxy()
+        warmed = False  # True after this session's first full navigation
         with SofascoreCamoufoxCapture(proxy=proxy) as cap:
             for pid in player_ids:
                 self._rate_limiter.acquire()
                 self._stats['requests'] += 1
-                try:
-                    capture = cap.capture_player(
-                        str(pid), season_picker_label=season_picker_label)
-                except Exception as e:  # noqa: BLE001 — one bad player mustn't kill the loop
-                    logger.warning("camoufox capture failed for player=%s: %s", pid, e)
-                    capture = {'profile': None, 'season_buffer': {}}
+                capture = None
+                if use_fetch and warmed:
+                    try:
+                        capture = cap.fetch_player(
+                            str(pid), target_ut=target_ut,
+                            target_year=target_year)
+                    except Exception as e:  # noqa: BLE001 — degrade to a full nav
+                        logger.info(
+                            "in-page fetch failed for player=%s: %s", pid, e)
+                        capture = None
+                    if capture is not None and not capture.get('profile'):
+                        logger.info(
+                            "in-page fetch missed profile for player=%s — "
+                            "falling back to full navigation.", pid)
+                        capture = None
+                if capture is None:
+                    try:
+                        capture = cap.capture_player(
+                            str(pid), season_picker_label=season_picker_label)
+                        warmed = True
+                    except Exception as e:  # noqa: BLE001 — one bad player mustn't kill the loop
+                        logger.warning("camoufox capture failed for player=%s: %s", pid, e)
+                        capture = {'profile': None, 'season_buffer': {}}
                 if not capture.get('profile'):
                     self._stats['failures'] += 1
                     self._last_lineup_error = {
@@ -1187,8 +1206,9 @@ class SofaScoreScraper(SoccerdataScraper):
         (``2526``) so the partition matches the schedule writer (#27).
         """
         ratings_cols = [
+            # #840: rating/position kept; entry-level fields now preserved too.
             'match_id', 'player_id', 'team_side', 'rating', 'position',
-            'league', 'season',
+            'captain', 'substitute', 'shirt_number', 'league', 'season',
         ]
         eps_cols = [
             'match_id', 'player_id', 'team_id', 'team_name', 'is_home',
@@ -1196,19 +1216,26 @@ class SofaScoreScraper(SoccerdataScraper):
             'league', 'season',
         ]
         match_stats_cols = [
-            'match_id', 'period', 'stat_group', 'stat_name', 'stat_key',
-            'home_value', 'away_value', 'home_text', 'away_text',
-            'compare_code', 'value_type', 'league', 'season',
+            # #840: source-key names (Bronze as-is); Silver renames/derives.
+            'match_id', 'period', 'stat_group', 'name', 'key',
+            'statistics_type', 'home_value', 'away_value', 'home', 'away',
+            'compare_code', 'value_type', 'render_type', 'league', 'season',
         ]
         shotmap_cols = [
+            # #840: source-key names (Bronze as-is); Silver renames/derives.
             'match_id', 'shot_id', 'player_id', 'team_id', 'is_home',
-            'minute', 'added_time', 'period', 'shot_type', 'situation',
-            'body_part', 'outcome', 'goal_type', 'x', 'y', 'goal_x',
-            'goal_y', 'xg', 'xgot', 'league', 'season',
+            'id', 'time', 'added_time', 'reversed_period_count', 'period',
+            'shot_type', 'situation', 'body_part', 'incident_type', 'goal_type',
+            'player_coordinates_x', 'player_coordinates_y',
+            'goal_mouth_coordinates_x', 'goal_mouth_coordinates_y',
+            'xg', 'xgot', 'league', 'season',
         ]
         venue_cols = [
-            'game_id', 'stadium', 'city', 'country',
-            'venue_latitude', 'venue_longitude', 'league', 'season',
+            # #840: source-key names (Bronze as-is); Silver renames/derives.
+            'game_id', 'stadium_name', 'stadium_capacity', 'city_name',
+            'country_name', 'country_alpha2',
+            'venue_coordinates_latitude', 'venue_coordinates_longitude',
+            'league', 'season',
         ]
 
         if match_ids is None:
@@ -1380,10 +1407,19 @@ class SofaScoreScraper(SoccerdataScraper):
     def _flatten_shotmap(match_id: str, payload: dict) -> List[Dict]:
         """Project the ``shotmap`` block into one row per shot.
 
-        Schema per row:
-            match_id, shot_id, player_id, team_id, is_home, minute,
-            added_time, period, situation, shot_type, body_part,
-            outcome, x, y, goal_x, goal_y, xg, xgot
+        #840: Bronze keeps EVERY source field. Only the primary key + identity
+        anchors that Silver joins on (and that need type / format stabilisation)
+        are hard-coded: ``match_id``, ``shot_id`` (composite fallback),
+        ``player_id``, ``team_id``, ``is_home``. Every other scalar auto-flattens
+        through :func:`_auto_flatten`, so new SofaScore fields land in Bronze
+        automatically. Renames / derivations (``minute`` <- ``time``, ``x`` <-
+        ``player_coordinates_x``, ``outcome`` <- ``incidentType``, the xg
+        coalesce, ...) move to Silver.
+
+        Nested objects flatten with a path prefix::
+
+            playerCoordinates.x     -> player_coordinates_x
+            goalMouthCoordinates.x  -> goal_mouth_coordinates_x
         """
         rows: List[Dict] = []
         if not isinstance(payload, dict):
@@ -1392,12 +1428,6 @@ class SofaScoreScraper(SoccerdataScraper):
         shots = payload.get('shotmap') or []
         if not isinstance(shots, list):
             return rows
-
-        def _f(v):
-            try:
-                return float(v) if v is not None else None
-            except (TypeError, ValueError):
-                return None
 
         def _i(v):
             try:
@@ -1409,11 +1439,13 @@ class SofaScoreScraper(SoccerdataScraper):
             if not isinstance(shot, dict):
                 continue
 
+            player = shot.get('player') or {}
+
+            # --- PK: shot id, composite fallback when SofaScore omits id ---
             sid = shot.get('id')
             if sid is None:
                 # Fall back to composite (match, time, player) so that
                 # downstream PK stays unique even when SofaScore omits id.
-                player = shot.get('player') or {}
                 sid = (
                     f"{match_id}-"
                     f"{shot.get('time', 'NA')}-"
@@ -1425,42 +1457,26 @@ class SofaScoreScraper(SoccerdataScraper):
                 else str(sid)
             )
 
-            player = shot.get('player') or {}
             pid = player.get('id')
             player_id_str = (
                 str(int(pid)) if isinstance(pid, (int, float)) and pid is not None
                 else (str(pid) if pid is not None else None)
             )
 
-            coords = shot.get('playerCoordinates') or {}
-            goal = shot.get('goalMouthCoordinates') or {}
-
-            rows.append({
+            # Identity anchors set FIRST so _auto_flatten never clobbers them.
+            row: Dict = {
                 'match_id': str(match_id),
                 'shot_id': shot_id_str,
                 'player_id': player_id_str,
                 'team_id': _i(shot.get('teamId') or (shot.get('team') or {}).get('id')),
                 'is_home': bool(shot.get('isHome')) if shot.get('isHome') is not None else None,
-                'minute': _i(shot.get('time')),
-                'added_time': _i(shot.get('addedTime')),
-                'period': _i(shot.get('reversedPeriodCount') or shot.get('period')),
-                # SofaScore taxonomy: incidentType=goal/miss/save/post/block,
-                # shotType=header/leftFoot/rightFoot/other,
-                # bodyPart=head/leftFoot/rightFoot/other (richer than shotType
-                # but not always populated), situation=open-play/corner/free-kick/penalty,
-                # goalType (populated for incidentType=goal): regular/own/penalty.
-                'shot_type': shot.get('shotType') or None,
-                'situation': shot.get('situation') or None,
-                'body_part': shot.get('bodyPart') or None,
-                'outcome': shot.get('incidentType') or None,
-                'goal_type': shot.get('goalType') or None,
-                'x': _f(coords.get('x')),
-                'y': _f(coords.get('y')),
-                'goal_x': _f(goal.get('x')),
-                'goal_y': _f(goal.get('y')),
-                'xg': _f(shot.get('xg') if shot.get('xg') is not None else shot.get('expectedGoals')),
-                'xgot': _f(shot.get('xgot') if shot.get('xgot') is not None else shot.get('expectedGoalsOnTarget')),
-            })
+            }
+
+            # Auto-passthrough everything else. Skip identity objects already
+            # projected as anchors (player.id -> player_id, team.id -> team_id).
+            _auto_flatten(shot, row, skip=('player', 'team'))
+
+            rows.append(row)
 
         return rows
 
@@ -1491,10 +1507,13 @@ class SofaScoreScraper(SoccerdataScraper):
         ``R0.2B_FALLBACK`` and exits with code 2).
         """
         cols = [
+            # #840: source-key names (Bronze as-is); Silver renames/derives.
             'match_id', 'shot_id', 'player_id', 'team_id', 'is_home',
-            'minute', 'added_time', 'period', 'shot_type', 'situation',
-            'body_part', 'outcome', 'goal_type', 'x', 'y', 'goal_x',
-            'goal_y', 'xg', 'xgot', 'league', 'season',
+            'id', 'time', 'added_time', 'reversed_period_count', 'period',
+            'shot_type', 'situation', 'body_part', 'incident_type', 'goal_type',
+            'player_coordinates_x', 'player_coordinates_y',
+            'goal_mouth_coordinates_x', 'goal_mouth_coordinates_y',
+            'xg', 'xgot', 'league', 'season',
         ]
 
         if match_ids is None:
@@ -1735,10 +1754,10 @@ class SofaScoreScraper(SoccerdataScraper):
         the issue got wrong: (1) ``venueCoordinates`` was ABSENT for that venue, so
         coords are sporadic and usually NULL — city/country are the reliable
         value-add, coords a bonus when present; (2) ``capacity`` IS in the payload
-        (``stadium.capacity``) but stays FotMob-sourced (#750), so it (and
-        ``surface``/``opened``) is not extracted here. Like the other capture
-        flatteners the caller tags ``league``/``season``/lineage; this emits
-        business columns only.
+        (``stadium.capacity``) but stays FotMob-sourced (#750), so Silver ignores
+        it — but Bronze now keeps it as ``stadium_capacity`` per #840 (all source
+        fields preserved). Like the other capture flatteners the caller tags
+        ``league``/``season``/lineage; this emits business columns only.
         """
         ev = event_payload if isinstance(event_payload, dict) else {}
         # The captured /event/{id} body nests the event under "event" (#751 PR2).
@@ -1752,18 +1771,10 @@ class SofaScoreScraper(SoccerdataScraper):
             """SofaScore ``{"name": X}`` object → X; a bare string passes through."""
             return v.get('name') if isinstance(v, dict) else v
 
+        # Row guard only — no usable stadium name → skip (unchanged contract).
         stadium = _name(venue.get('stadium'))
         if stadium is None or str(stadium).strip() == '':
             return None
-
-        def _f(v):
-            try:
-                return float(v) if v is not None else None
-            except (TypeError, ValueError):
-                return None
-
-        coords = venue.get('venueCoordinates')
-        coords = coords if isinstance(coords, dict) else {}
 
         gid = ev.get('id')
         if gid is None:
@@ -1773,14 +1784,14 @@ class SofaScoreScraper(SoccerdataScraper):
         except (TypeError, ValueError):
             game_id = None
 
-        return {
-            'game_id': game_id,
-            'stadium': str(stadium).strip(),
-            'city': _name(venue.get('city')),
-            'country': _name(venue.get('country')),
-            'venue_latitude': _f(coords.get('latitude')),
-            'venue_longitude': _f(coords.get('longitude')),
-        }
+        # #840: keep the whole venue block as-is. Nested {"name": ...} objects
+        # flatten to stadium_name / city_name / country_name; venueCoordinates
+        # to venue_coordinates_latitude/longitude (+ bonus stadium_capacity,
+        # country_alpha2, ...). Silver renames back to
+        # stadium/city/country/venue_latitude/venue_longitude.
+        row: Dict = {'game_id': game_id}
+        _auto_flatten(venue, row)
+        return row
 
     def _fetch_event_player_stats_payload(
         self,
@@ -2015,14 +2026,6 @@ class SofaScoreScraper(SoccerdataScraper):
         if not isinstance(periods, list):
             return rows
 
-        def _f(v):
-            if v is None:
-                return None
-            try:
-                return float(v)
-            except (TypeError, ValueError):
-                return None
-
         for period_block in periods:
             if not isinstance(period_block, dict):
                 continue
@@ -2036,23 +2039,32 @@ class SofaScoreScraper(SoccerdataScraper):
                 for item in (group_block.get('statisticsItems') or []):
                     if not isinstance(item, dict):
                         continue
-                    rows.append({
+                    # #840: only the position anchors are hard-coded; every
+                    # statisticsItem field auto-flattens (source-key names:
+                    # name, key, statistics_type, home/away, home_value/away_value,
+                    # compare_code, value_type, render_type, ...). Silver renames
+                    # stat_name<-name, stat_key<-key||statistics_type,
+                    # home_text<-home, away_text<-away.
+                    row: Dict = {
                         'match_id': str(match_id),
                         'period': str(period),
                         'stat_group': stat_group,
-                        'stat_name': item.get('name'),
-                        'stat_key': item.get('key') or item.get('statisticsType'),
-                        'home_value': _f(item.get('homeValue')),
-                        'away_value': _f(item.get('awayValue')),
-                        'home_text': (
-                            str(item.get('home')) if item.get('home') is not None else None
-                        ),
-                        'away_text': (
-                            str(item.get('away')) if item.get('away') is not None else None
-                        ),
-                        'compare_code': item.get('compareCode'),
-                        'value_type': item.get('valueType'),
-                    })
+                    }
+                    # #840: home/away are SofaScore *display* strings — "55%",
+                    # "3 (1)", "91.6 km", "2.61" — heterogeneous units across
+                    # stats. Pin them to str BEFORE _auto_flatten (whose
+                    # `if col in out: continue` then leaves them untouched) so the
+                    # Bronze column stays a stable varchar. Otherwise _coerce_scalar
+                    # upcasts the numeric-looking ones (int/float) while "55%" stays
+                    # str, yielding a mixed-type object column that the PyArrow ->
+                    # Iceberg writer cannot serialize. Numeric canonicals live in
+                    # home_value/away_value (clean doubles); Silver maps
+                    # home_text<-home, away_text<-away.
+                    for _disp in ('home', 'away'):
+                        if item.get(_disp) is not None:
+                            row[_disp] = str(item[_disp])
+                    _auto_flatten(item, row)
+                    rows.append(row)
 
         return rows
 
@@ -2257,11 +2269,14 @@ class SofaScoreScraper(SoccerdataScraper):
     def _flatten_player_profile(payload: dict) -> Optional[Dict]:
         """Project ``/player/{id}`` payload into a snapshot row.
 
-        SofaScore wraps the relevant data under a top-level ``player``
-        key — we project a fixed set of identity / biographical fields.
-        Unlike the stats-flatteners we don't auto-flatten the rest of
-        the player object: it contains marketing fields (userCount,
-        retiredStatus) we don't need in Bronze.
+        #840: Bronze keeps the whole ``player`` block as-is (auto-passthrough);
+        only ``player_id`` is a hard-coded anchor. Renames/derivations move to
+        Silver: ``height_cm`` <- ``height``, ``date_of_birth`` <-
+        ``date_of_birth_timestamp``, ``country_code`` <- ``country.alpha2``,
+        ``current_team_*`` <- ``team.*``, and the ``nationality`` <-
+        ``country.name`` fallback. Extra/marketing fields the old fixed list
+        dropped (``user_count``, ``retired_status``, name translations) are now
+        preserved (source-as-is contract).
         """
         if not isinstance(payload, dict):
             return None
@@ -2274,38 +2289,13 @@ class SofaScoreScraper(SoccerdataScraper):
         if pid is None:
             return None
 
-        dob_ts = player.get('dateOfBirthTimestamp')
-        dob = None
-        if isinstance(dob_ts, (int, float)) and dob_ts > 0:
-            try:
-                dob = datetime.utcfromtimestamp(int(dob_ts)).date().isoformat()
-            except (OverflowError, OSError, ValueError):
-                dob = None
-
-        nationality = player.get('nationality')
-        country = player.get('country') or {}
-        if not nationality and isinstance(country, dict):
-            nationality = country.get('name')
-
-        team = player.get('team') or {}
-
-        return {
+        row: Dict = {
             'player_id': str(int(pid)) if isinstance(pid, (int, float)) else str(pid),
-            'name': player.get('name'),
-            'short_name': player.get('shortName'),
-            'slug': player.get('slug'),
-            'position': player.get('position'),
-            'jersey_number': player.get('jerseyNumber'),
-            'shirt_number': player.get('shirtNumber'),
-            'height_cm': player.get('height'),
-            'preferred_foot': player.get('preferredFoot'),
-            'date_of_birth': dob,
-            'nationality': nationality,
-            'country_code': (country or {}).get('alpha2') if isinstance(country, dict) else None,
-            'current_team_id': team.get('id'),
-            'current_team_name': team.get('name'),
-            'retired': bool(player.get('retired')) if player.get('retired') is not None else None,
         }
+        # Nested `country`/`team` flatten to country_name/country_alpha2/team_id/
+        # team_name/... ; `dateOfBirthTimestamp` stays raw (Silver -> date).
+        _auto_flatten(player, row)
+        return row
 
     # ------------------------------------------------------------------
     # #751 PR3 — per-player capture (biographical profile snapshot)
@@ -2318,20 +2308,24 @@ class SofaScoreScraper(SoccerdataScraper):
         player_ids: Optional[List[str]] = None,
         limit: Optional[int] = None,
     ) -> Dict[str, pd.DataFrame]:
-        """ONE Camoufox navigation per player → the player_profile Bronze frame
-        (#751 PR3).
+        """Per-player capture → the player_profile Bronze frame (#751 PR3).
 
-        Replaces the dead tls player_profile pass (403'd on Turnstile)
-        with a player-page capture: :meth:`_flatten_player_profile` over the bio
-        SSR'd in ``__NEXT_DATA__`` (``props.pageProps.player``). The bio is
-        server-rendered, so it needs no Turnstile-gated XHR.
+        Replaces the dead tls player_profile pass (403'd on Turnstile). #842:
+        only the FIRST player navigates its page (solving Turnstile); every
+        later player pulls ``/api/v1/player/{id}`` via same-origin in-page
+        fetch (~30 KB vs ~2 MB per navigation) — the page SSRs the identical
+        ``player`` object into ``__NEXT_DATA__``, so both paths feed
+        :meth:`_flatten_player_profile` the same shape. A fetch miss falls
+        back to a full navigation for that player.
 
         Season-aggregate stats (``player_season_stats``) come from the SAME
-        navigation (#751 PR3b): the capture drives the Season tab + a
-        season-picker (the default Season tab is the player's PRIMARY
-        competition, not necessarily EPL for a transferred player — live-proven
-        Paquetá → World Cup), and the right ``(ut, season)`` overall is selected
-        season-guarded via the pure :func:`select_player_season_stats` /
+        pass (#751 PR3b): the fetch path resolves the exact ``(ut, season_id)``
+        from ``/statistics/seasons`` and pulls its ``statistics/overall``;
+        the navigation path drives the Season tab + a season-picker (the
+        default Season tab is the player's PRIMARY competition, not
+        necessarily EPL for a transferred player — live-proven Paquetá →
+        World Cup). Either way the right overall is selected season-guarded
+        via the pure :func:`select_player_season_stats` /
         :func:`extract_player_seasons_map`.
 
         Returns ``{'player_profile', 'player_season_stats'}``. The profile is the
@@ -2347,11 +2341,12 @@ class SofaScoreScraper(SoccerdataScraper):
         )
 
         profile_cols = [
-            'player_id', 'name', 'short_name', 'slug', 'position',
-            'jersey_number', 'shirt_number', 'height_cm', 'preferred_foot',
-            'date_of_birth', 'nationality', 'country_code',
-            'current_team_id', 'current_team_name', 'retired',
-            'league', 'season',
+            # #840: source-key names (Bronze as-is); Silver renames/derives.
+            'player_id', 'id', 'name', 'short_name', 'slug', 'position',
+            'jersey_number', 'shirt_number', 'height', 'preferred_foot',
+            'date_of_birth_timestamp', 'nationality',
+            'country_name', 'country_alpha2',
+            'team_id', 'team_name', 'retired', 'league', 'season',
         ]
         season_cols = [
             'player_id', 'unique_tournament_id', 'sofascore_season_id',
@@ -2400,7 +2395,8 @@ class SofaScoreScraper(SoccerdataScraper):
         max_consecutive = 10  # ~dead proxy / page not rendering — bail early.
 
         captures = self._iter_player_captures(
-            player_ids, season_picker_label=picker_label)
+            player_ids, season_picker_label=picker_label,
+            target_ut=target_ut, target_year=target_season_label)
         try:
             for idx, (pid, capture) in enumerate(captures, start=1):
                 profile = (capture or {}).get('profile')
