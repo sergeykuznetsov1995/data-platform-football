@@ -1,0 +1,4 @@
+# Формат: группа:юзер1,юзер2  (hot-reload 30с, рестарт Trino не нужен)
+# Нового аналитика добавляй сюда ТОЖЕ (плюс Keycloak) — иначе Superset
+# SQL Lab (impersonation) не даст ему прав группы analysts.
+analysts:test-analyst
