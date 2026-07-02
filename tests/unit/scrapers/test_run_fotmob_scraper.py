@@ -124,6 +124,35 @@ class TestFotmobReplaceGuard:
         assert "replace_guard_key" not in kwargs
 
     @pytest.mark.unit
+    def test_full_players_flag_passed_to_scraper(self, temp_output):
+        """--full-players → FotMobScraper(full_players=True); default False."""
+        scraper = _build_guard_scraper()
+        cls = MagicMock(return_value=scraper)
+
+        rc = _run_main(
+            ["--leagues", "ENG-Premier League", "--season", "2025",
+             "--entities", "schedule", "--full-players", "--output", temp_output],
+            cls,
+        )
+
+        assert rc == 0
+        assert cls.call_args.kwargs["full_players"] is True
+
+    @pytest.mark.unit
+    def test_full_players_defaults_false(self, temp_output):
+        scraper = _build_guard_scraper()
+        cls = MagicMock(return_value=scraper)
+
+        rc = _run_main(
+            ["--leagues", "ENG-Premier League", "--season", "2025",
+             "--entities", "schedule", "--output", temp_output],
+            cls,
+        )
+
+        assert rc == 0
+        assert cls.call_args.kwargs["full_players"] is False
+
+    @pytest.mark.unit
     def test_force_replace_disarms_guard(self, temp_output):
         """--force-replace must pass min_replace_ratio=None to the save."""
         scraper = _build_guard_scraper()
