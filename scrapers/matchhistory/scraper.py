@@ -12,10 +12,13 @@ This scraper uses standard requests first, then falls back to
 Selenium if that fails.
 """
 
+import json
 import logging
+import os
 import time
 from io import StringIO
-from typing import Any, Dict, List, Optional
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Union
 
 import pandas as pd
 import requests
@@ -24,6 +27,18 @@ from scrapers.base.base_scraper import SeleniumScraper
 from scrapers.base.browser import CloudflareBypass
 
 logger = logging.getLogger(__name__)
+
+
+class _NotModified:
+    """Sentinel: server answered 304 — CSV unchanged since the last ingest."""
+
+    def __repr__(self) -> str:
+        return '<NOT_MODIFIED>'
+
+
+# Distinct from None (= fetch failed): a 304 must NOT trigger the Selenium
+# fallback and must NOT be reported as a scrape error — it is a clean no-op.
+NOT_MODIFIED = _NotModified()
 
 class MatchHistoryScraper(SeleniumScraper):
     """
@@ -113,6 +128,10 @@ class MatchHistoryScraper(SeleniumScraper):
         'VCH': 'odds_home_vc',
         'VCD': 'odds_draw_vc',
         'VCA': 'odds_away_vc',
+        # Legacy Betbrain aggregates (Bb*): football-data.co.uk dropped these
+        # columns around 2019, so they only match when backfilling seasons
+        # <= 2018/19. Modern files ship AHh / Max* / Avg* instead — those pass
+        # through raw (lowercased) and are read as-is by the silver SQL.
         # Asian handicap odds
         'BbAHh': 'asian_handicap_home',
         'BbAH': 'asian_handicap_line',
@@ -130,6 +149,7 @@ class MatchHistoryScraper(SeleniumScraper):
         seasons: Optional[List[int]] = None,
         headless: bool = True,
         use_xvfb: bool = True,
+        force_refresh: bool = False,
         **kwargs
     ):
         """
@@ -140,6 +160,8 @@ class MatchHistoryScraper(SeleniumScraper):
             seasons: List of seasons to scrape (e.g., [2023, 2024])
             headless: Run browser in headless mode (for Selenium fallback)
             use_xvfb: Use Xvfb virtual display
+            force_refresh: Skip conditional-request headers — always
+                re-download the CSV even if unchanged (deliberate re-ingest)
             **kwargs: Additional arguments for SeleniumScraper
         """
         super().__init__(
@@ -149,7 +171,21 @@ class MatchHistoryScraper(SeleniumScraper):
             **kwargs
         )
         self.use_xvfb = use_xvfb
+        self.force_refresh = force_refresh
         self._session: Optional[requests.Session] = None
+        # Conditional-GET validators (ETag/Last-Modified) per URL, persisted on
+        # the soccerdata_cache volume so the daily run answers 304 (0 bytes)
+        # for an unchanged season CSV instead of re-downloading ~200 KB.
+        self._http_meta_path = (
+            Path(os.environ.get('SOCCERDATA_DIR', str(Path.home() / 'soccerdata')))
+            / 'matchhistory_http_meta.json'
+        )
+        self._http_meta: Optional[Dict[str, Dict[str, str]]] = None
+        # Validators seen this run; merged into the store ONLY after the
+        # Iceberg save succeeds (commit_http_meta) — otherwise a failed write
+        # (footgun #183) would leave the store claiming data we never landed,
+        # and every later run would 304-skip it forever.
+        self._pending_http_meta: Dict[str, Dict[str, str]] = {}
 
     def _get_browser(self) -> CloudflareBypass:
         """Get browser for Selenium fallback."""
@@ -174,6 +210,41 @@ class MatchHistoryScraper(SeleniumScraper):
                 'Connection': 'keep-alive',
             })
         return self._session
+
+    def _load_http_meta(self) -> Dict[str, Dict[str, str]]:
+        """Load persisted conditional-GET validators (fail-open on any error)."""
+        if self._http_meta is None:
+            try:
+                with open(self._http_meta_path, 'r') as f:
+                    self._http_meta = json.load(f)
+            except FileNotFoundError:
+                self._http_meta = {}
+            except Exception as e:
+                logger.warning(f"Unreadable HTTP meta store {self._http_meta_path}: {e}")
+                self._http_meta = {}
+        return self._http_meta
+
+    def commit_http_meta(self) -> None:
+        """
+        Persist validators collected this run. Call ONLY after the Iceberg
+        save succeeded — see the note in __init__.
+        """
+        if not self._pending_http_meta:
+            return
+        meta = self._load_http_meta()
+        meta.update(self._pending_http_meta)
+        try:
+            self._http_meta_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(self._http_meta_path, 'w') as f:
+                json.dump(meta, f, indent=0)
+            logger.info(
+                f"Committed HTTP meta for {len(self._pending_http_meta)} URL(s) "
+                f"to {self._http_meta_path}"
+            )
+        except Exception as e:
+            # Fail-open: losing validators only costs a re-download next run.
+            logger.warning(f"Could not persist HTTP meta store: {e}")
+        self._pending_http_meta = {}
 
     def _format_season(self, season: int) -> str:
         """
@@ -210,15 +281,20 @@ class MatchHistoryScraper(SeleniumScraper):
         season_str = self._format_season(season)
         return f"{self.BASE_URL}/mmz4281/{season_str}/{league_code}.csv"
 
-    def _fetch_csv_with_requests(self, url: str) -> Optional[pd.DataFrame]:
+    def _fetch_csv_with_requests(self, url: str) -> Union[pd.DataFrame, _NotModified, None]:
         """
         Fetch CSV data using requests library.
+
+        Sends conditional-request headers (If-None-Match/If-Modified-Since)
+        when validators from a previous successful ingest are stored;
+        football-data.co.uk serves static CSVs and answers 304 with an empty
+        body, so an unchanged file costs ~0 bytes.
 
         Args:
             url: URL to CSV file
 
         Returns:
-            DataFrame with CSV data or None
+            DataFrame with CSV data, NOT_MODIFIED on 304, or None on failure
         """
         session = self._get_session()
 
@@ -226,17 +302,46 @@ class MatchHistoryScraper(SeleniumScraper):
             # Rate limiting
             self._rate_limiter.acquire()
 
-            response = session.get(url, timeout=30)
+            headers = {}
+            if not self.force_refresh:
+                known = self._load_http_meta().get(url, {})
+                if known.get('etag'):
+                    headers['If-None-Match'] = known['etag']
+                if known.get('last_modified'):
+                    headers['If-Modified-Since'] = known['last_modified']
+
+            response = session.get(url, timeout=30, headers=headers)
+
+            if response.status_code == 304:
+                self._stats['successes'] += 1
+                logger.info(f"Not modified (304), skipping: {url}")
+                return NOT_MODIFIED
 
             if response.status_code == 200:
                 self._stats['successes'] += 1
 
+                # Modern files (season >= 2425) are UTF-8 with a BOM; older
+                # ones are latin-1. The server sends no charset, so decode
+                # explicitly instead of trusting response.text (which assumes
+                # latin-1 and mojibakes accented names in modern files).
+                try:
+                    text = response.content.decode('utf-8-sig')
+                except UnicodeDecodeError:
+                    text = response.content.decode('latin-1')
+
                 # Parse CSV
                 df = pd.read_csv(
-                    StringIO(response.text),
-                    encoding='utf-8',
+                    StringIO(text),
                     on_bad_lines='skip',
                 )
+
+                validators = {}
+                if response.headers.get('ETag'):
+                    validators['etag'] = response.headers['ETag']
+                if response.headers.get('Last-Modified'):
+                    validators['last_modified'] = response.headers['Last-Modified']
+                if validators:
+                    self._pending_http_meta[url] = validators
 
                 return df
 
@@ -350,7 +455,7 @@ class MatchHistoryScraper(SeleniumScraper):
         self,
         league: str = None,
         season: int = None
-    ) -> Optional[pd.DataFrame]:
+    ) -> Union[pd.DataFrame, _NotModified, None]:
         """
         Read match results and statistics.
 
@@ -359,7 +464,8 @@ class MatchHistoryScraper(SeleniumScraper):
             season: Season year (uses first configured if not specified)
 
         Returns:
-            DataFrame with match data
+            DataFrame with match data, NOT_MODIFIED if the season CSV is
+            unchanged since the last ingest (clean no-op), or None on failure
         """
         league = league or (self.leagues[0] if self.leagues else None)
         season = season or (self.seasons[0] if self.seasons else None)
@@ -376,6 +482,12 @@ class MatchHistoryScraper(SeleniumScraper):
 
         # Try requests first
         df = self._fetch_csv_with_requests(url)
+
+        # Unchanged CSV: clean no-op for this (league, season) — the existing
+        # partition already holds this data. Not a failure: no Selenium.
+        if df is NOT_MODIFIED:
+            logger.info(f"CSV not modified for {league} {season} — skipping")
+            return NOT_MODIFIED
 
         # Fallback to Selenium if requests failed
         if df is None:
@@ -457,6 +569,9 @@ class MatchHistoryScraper(SeleniumScraper):
                 try:
                     df = self.read_games(league, season)
 
+                    if df is NOT_MODIFIED:
+                        continue
+
                     if df is not None and not df.empty:
                         # Calculate odds statistics
                         df = self.calculate_odds_stats(df)
@@ -479,6 +594,8 @@ class MatchHistoryScraper(SeleniumScraper):
                 replace_partitions=['league', 'season'],
             )
             results['match_results'] = table_path
+            # Data landed — safe to remember the validators for 304 skips.
+            self.commit_http_meta()
 
         logger.info(f"MatchHistory scrape complete: {list(results.keys())}")
         return results

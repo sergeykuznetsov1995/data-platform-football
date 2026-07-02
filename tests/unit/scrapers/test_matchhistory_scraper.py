@@ -21,8 +21,8 @@ class TestMatchHistoryScraperUnit:
         return MatchHistoryScraper
 
     @pytest.fixture
-    def mock_scraper(self, scraper_class):
-        """Create scraper with mocked browser."""
+    def mock_scraper(self, scraper_class, tmp_path):
+        """Create scraper with mocked browser and hermetic HTTP-meta store."""
         with patch.object(scraper_class, '_get_browser'):
             scraper = scraper_class(
                 leagues=['ENG-Premier League'],
@@ -30,6 +30,7 @@ class TestMatchHistoryScraperUnit:
                 headless=True,
             )
             scraper._session = MagicMock()
+            scraper._http_meta_path = tmp_path / 'matchhistory_http_meta.json'
             yield scraper
             scraper.close()
 
@@ -82,7 +83,8 @@ class TestMatchHistoryScraperUnit:
 """
         mock_response = MagicMock()
         mock_response.status_code = 200
-        mock_response.text = csv_content
+        mock_response.content = csv_content.encode('utf-8')
+        mock_response.headers = {}
 
         mock_scraper._session.get.return_value = mock_response
 
@@ -168,7 +170,8 @@ class TestMatchHistoryScraperUnit:
 """
         mock_response = MagicMock()
         mock_response.status_code = 200
-        mock_response.text = csv_content
+        mock_response.content = csv_content.encode('utf-8')
+        mock_response.headers = {}
 
         mock_scraper._session.get.return_value = mock_response
 
@@ -265,7 +268,8 @@ class TestMatchHistoryScraperUnit:
 """
         mock_response = MagicMock()
         mock_response.status_code = 200
-        mock_response.text = csv_content
+        mock_response.content = csv_content.encode('utf-8')
+        mock_response.headers = {}
 
         mock_scraper._session.get.return_value = mock_response
 
@@ -275,6 +279,169 @@ class TestMatchHistoryScraperUnit:
         assert '_entity_type' in df.columns
         assert '_ingested_at' in df.columns
         assert df.iloc[0]['_source'] == 'matchhistory'
+
+    # ------------------------------------------------------------------
+    # Conditional GET (ETag/If-Modified-Since) + encoding
+    # ------------------------------------------------------------------
+
+    def test_fetch_304_returns_not_modified_sentinel(self, mock_scraper):
+        """304 → NOT_MODIFIED sentinel, distinct from None (= failure)."""
+        from scrapers.matchhistory import NOT_MODIFIED
+
+        mock_response = MagicMock()
+        mock_response.status_code = 304
+
+        mock_scraper._session.get.return_value = mock_response
+
+        result = mock_scraper._fetch_csv_with_requests('http://test.com/data.csv')
+
+        assert result is NOT_MODIFIED
+
+    def test_read_games_304_skips_selenium_fallback(self, mock_scraper):
+        """A 304 is a clean no-op: read_games must propagate NOT_MODIFIED and
+        must NOT fall back to Selenium (that path is for real failures)."""
+        from scrapers.matchhistory import NOT_MODIFIED
+
+        mock_response = MagicMock()
+        mock_response.status_code = 304
+        mock_scraper._session.get.return_value = mock_response
+
+        with patch.object(mock_scraper, '_fetch_csv_with_selenium') as mock_selenium:
+            result = mock_scraper.read_games('ENG-Premier League', 2024)
+
+        assert result is NOT_MODIFIED
+        mock_selenium.assert_not_called()
+
+    def test_fetch_sends_conditional_headers_from_meta(self, mock_scraper):
+        """Stored validators are sent as If-None-Match/If-Modified-Since."""
+        url = 'https://www.football-data.co.uk/mmz4281/2425/E0.csv'
+        mock_scraper._http_meta = {
+            url: {'etag': '"abc-123"', 'last_modified': 'Mon, 25 May 2026 19:01:01 GMT'},
+        }
+        mock_response = MagicMock()
+        mock_response.status_code = 304
+        mock_scraper._session.get.return_value = mock_response
+
+        mock_scraper._fetch_csv_with_requests(url)
+
+        headers = mock_scraper._session.get.call_args.kwargs['headers']
+        assert headers['If-None-Match'] == '"abc-123"'
+        assert headers['If-Modified-Since'] == 'Mon, 25 May 2026 19:01:01 GMT'
+
+    def test_force_refresh_skips_conditional_headers(self, scraper_class, tmp_path):
+        """force_refresh=True must re-download even with stored validators."""
+        url = 'https://www.football-data.co.uk/mmz4281/2425/E0.csv'
+        with patch.object(scraper_class, '_get_browser'):
+            scraper = scraper_class(
+                leagues=['ENG-Premier League'],
+                seasons=[2024],
+                force_refresh=True,
+            )
+            scraper._session = MagicMock()
+            scraper._http_meta_path = tmp_path / 'matchhistory_http_meta.json'
+            scraper._http_meta = {url: {'etag': '"abc-123"'}}
+
+            mock_response = MagicMock()
+            mock_response.status_code = 200
+            mock_response.content = b'Date,HomeTeam\n15/01/2024,Arsenal\n'
+            mock_response.headers = {}
+            scraper._session.get.return_value = mock_response
+
+            scraper._fetch_csv_with_requests(url)
+
+            assert mock_scraper_headers_empty(scraper._session.get.call_args.kwargs)
+            scraper.close()
+
+    def test_meta_committed_only_after_explicit_commit(self, mock_scraper):
+        """Validators from a 200 land in the pending buffer and reach the
+        on-disk store only via commit_http_meta() (i.e. after the Iceberg save
+        succeeded) — a failed write must not poison the 304 short-circuit."""
+        import json as _json
+
+        url = 'http://test.com/data.csv'
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.content = b'Date,HomeTeam\n15/01/2024,Arsenal\n'
+        mock_response.headers = {
+            'ETag': '"abc-123"',
+            'Last-Modified': 'Mon, 25 May 2026 19:01:01 GMT',
+        }
+        mock_scraper._session.get.return_value = mock_response
+
+        mock_scraper._fetch_csv_with_requests(url)
+
+        assert mock_scraper._pending_http_meta[url]['etag'] == '"abc-123"'
+        assert not mock_scraper._http_meta_path.exists()
+
+        mock_scraper.commit_http_meta()
+
+        with open(mock_scraper._http_meta_path) as f:
+            stored = _json.load(f)
+        assert stored[url]['last_modified'] == 'Mon, 25 May 2026 19:01:01 GMT'
+        assert mock_scraper._pending_http_meta == {}
+
+    def test_decode_utf8_sig_strips_bom_and_keeps_accents(self, mock_scraper):
+        """Modern files (season >= 2425): UTF-8 with BOM — the BOM must not
+        leak into the first header and accented names must survive."""
+        csv_bytes = '﻿Div,HomeTeam,Referee\nE0,Arsenal,José María\n'.encode('utf-8')
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.content = csv_bytes
+        mock_response.headers = {}
+        mock_scraper._session.get.return_value = mock_response
+
+        df = mock_scraper._fetch_csv_with_requests('http://test.com/data.csv')
+
+        assert 'Div' in df.columns
+        assert df.iloc[0]['Referee'] == 'José María'
+
+    def test_decode_latin1_fallback_for_old_files(self, mock_scraper):
+        """Pre-2425 files are latin-1 (invalid as UTF-8) — fallback decodes."""
+        csv_bytes = 'Date,HomeTeam,Referee\n15/01/2018,Arsenal,André\n'.encode('latin-1')
+        assert b'\xe9' in csv_bytes  # invalid as UTF-8 → exercises the fallback
+
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.content = csv_bytes
+        mock_response.headers = {}
+        mock_scraper._session.get.return_value = mock_response
+
+        df = mock_scraper._fetch_csv_with_requests('http://test.com/data.csv')
+
+        assert df.iloc[0]['Referee'] == 'André'
+
+    def test_scrape_all_skips_not_modified_and_commits_meta(self, mock_scraper):
+        """scrape_all: NOT_MODIFIED leagues are skipped without failing, and
+        HTTP meta is committed after a successful save."""
+        from scrapers.matchhistory import NOT_MODIFIED
+
+        mock_games = pd.DataFrame({
+            'match_date': ['15/01/2024'],
+            'home_team': ['Arsenal'],
+            'away_team': ['Chelsea'],
+            'league': ['ENG-Premier League'],
+            'season': [2024],
+        })
+        mock_scraper.leagues = ['ENG-Premier League', 'ESP-La Liga']
+        mock_scraper._pending_http_meta = {'http://x': {'etag': '"e"'}}
+
+        with patch.object(mock_scraper, 'read_games',
+                          side_effect=[NOT_MODIFIED, mock_games]):
+            with patch.object(mock_scraper, 'save_to_iceberg',
+                              return_value='iceberg.bronze.test') as mock_save:
+                results = mock_scraper.scrape_all()
+
+        assert 'match_results' in results
+        mock_save.assert_called_once()
+        # meta committed after the save
+        assert mock_scraper._pending_http_meta == {}
+        assert mock_scraper._http_meta_path.exists()
+
+
+def mock_scraper_headers_empty(kwargs) -> bool:
+    """True if the session.get call carried no conditional headers."""
+    headers = kwargs.get('headers') or {}
+    return 'If-None-Match' not in headers and 'If-Modified-Since' not in headers
 
 
 class TestMatchHistoryLeagueMapping:
