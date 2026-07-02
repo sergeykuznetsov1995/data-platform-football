@@ -27,6 +27,10 @@ databases:
     allow_dml: false
     allow_run_async: true
     cache_timeout: 3600
+    # Запросы идут под именем залогиненного юзера (аутентификация остаётся
+    # superset'ом, Trino проверяет impersonation-правило + группы groups.txt).
+    # Аналитик в SQL Lab = read-only silver/gold на стороне Trino.
+    impersonate_user: true
     extra: |
       {
         "metadata_params": {},
