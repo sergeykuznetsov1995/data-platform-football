@@ -80,25 +80,35 @@ def main():
         'tables': [],
         'rows': 0,
         'errors': [],
-        'league_details': {}
+        'league_details': {},
+        'skipped_not_modified': [],
     }
 
     try:
         import pandas as pd
         from scrapers.base.base_scraper import ReplaceGuardError
-        from scrapers.matchhistory import MatchHistoryScraper
+        from scrapers.matchhistory import NOT_MODIFIED, MatchHistoryScraper
 
         with MatchHistoryScraper(
             leagues=leagues,
             seasons=[args.season],
             headless=args.headless,
             use_xvfb=args.use_xvfb,
+            # A deliberate re-ingest must also bypass the 304 short-circuit,
+            # not just the completeness guard.
+            force_refresh=args.force_replace,
         ) as scraper:
             all_matches = []
 
             for league in leagues:
                 try:
                     df = scraper.read_games(league, args.season)
+                    if df is NOT_MODIFIED:
+                        # Season CSV unchanged since the last successful
+                        # ingest — the partition already holds this data.
+                        results['skipped_not_modified'].append(league)
+                        logger.info(f"{league}: CSV not modified — skipping")
+                        continue
                     if df is not None and not df.empty:
                         # Calculate odds statistics
                         df = scraper.calculate_odds_stats(df)
@@ -130,17 +140,27 @@ def main():
                     )
                     results['tables'].append(table_path)
                     logger.info(f"Saved {len(combined_df)} total rows")
+                    # Data landed — now it is safe to persist the ETag/
+                    # Last-Modified validators so the next run can 304-skip.
+                    scraper.commit_http_meta()
                 except ReplaceGuardError as e:
                     # Guard refused the save (partial scrape would shrink the
                     # partition) — nothing written. Distinct exit 3 so an
                     # operator can tell a refused guard from a hard scrape
-                    # failure (#583).
+                    # failure (#583). Meta NOT committed: next run refetches.
                     msg = f"{REPLACE_GUARD_MARKER}: {e}"
                     logger.error(msg)
                     results['errors'].append(msg)
                     with open(args.output, 'w') as f:
                         json.dump(results, f)
                     return 3
+            elif results['skipped_not_modified'] and not results['errors']:
+                # Every league answered 304 — clean no-op, nothing to write.
+                results['status'] = 'no_op'
+                logger.info(
+                    "All leagues not modified "
+                    f"({len(results['skipped_not_modified'])}) — no-op run"
+                )
 
     except Exception as e:
         logger.error(f"Scraper failed: {e}", exc_info=True)
