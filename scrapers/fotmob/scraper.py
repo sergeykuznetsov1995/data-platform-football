@@ -140,6 +140,7 @@ class FotMobScraper(BaseScraper):
         self,
         leagues: Optional[List[str]] = None,
         seasons: Optional[List[int]] = None,
+        full_players: bool = False,
         **kwargs
     ):
         """
@@ -148,12 +149,23 @@ class FotMobScraper(BaseScraper):
         Args:
             leagues: List of leagues to scrape
             seasons: List of seasons to scrape (e.g., [2024, 2025])
+            full_players: Re-fetch every squad player in ``read_player_details``
+                instead of only players missing from Bronze (skip-existing).
+                Career/market-value payloads go stale, so run a full refresh
+                periodically via the runner's ``--full-players`` flag.
             **kwargs: Additional arguments for BaseScraper
         """
         super().__init__(leagues=leagues, seasons=seasons, **kwargs)
+        self.full_players = full_players
         self._session: Optional[requests.Session] = None
         self._build_id: Optional[str] = None
+        # When the buildId was last confirmed fresh — refreshing costs a full
+        # homepage download, so _fetch_next_data_payload throttles it to 1/min.
+        self._build_id_verified_at: float = float('-inf')
         self._team_data_cache: Dict[str, Optional[Dict[str, Any]]] = {}
+        # The league payload (~65KB) feeds every league-level entity; without a
+        # cache one scrape run fetches it 8× per (league, season).
+        self._league_data_cache: Dict[str, Dict[str, Any]] = {}
 
     # ------------------------------------------------------------------ #
     # HTTP plumbing
@@ -213,6 +225,10 @@ class FotMobScraper(BaseScraper):
                     return response.json()
 
                 logger.warning(f"FotMob API returned {response.status_code} for {url}")
+                if response.status_code == 404:
+                    break  # permanent — retrying only burns rate-limit budget
+                if attempt < retry_count - 1:
+                    time.sleep(2 ** attempt)
 
             except requests.exceptions.RequestException as e:
                 logger.error(f"Request error for {url}: {e}")
@@ -226,16 +242,29 @@ class FotMobScraper(BaseScraper):
         return None
 
     def _get_league_data(self, league: str, season: int) -> Optional[Dict[str, Any]]:
-        """Get league payload (`/api/data/leagues`)."""
+        """Get league payload (`/api/data/leagues`), cached per (league, season).
+
+        Every league-level ``read_*`` starts from this payload; the cache keeps
+        one scrape run at a single fetch instead of 8. Failed fetches are not
+        cached so a later entity gets its own retry.
+        """
         league_id = self.LEAGUE_IDS.get(league)
         if not league_id:
             logger.error(f"Unknown league: {league}")
             return None
 
-        return self._fetch_api_json(
+        key = f"{league}|{season}"
+        cached = self._league_data_cache.get(key)
+        if cached is not None:
+            return cached
+
+        data = self._fetch_api_json(
             'leagues',
             params={'id': league_id, 'season': self._format_season(season)},
         )
+        if data is not None:
+            self._league_data_cache[key] = data
+        return data
 
     def _get_build_id(self) -> Optional[str]:
         """Fetch and cache the Next.js ``buildId`` from the homepage.
@@ -282,10 +311,17 @@ class FotMobScraper(BaseScraper):
         if payload is not None:
             return payload
 
-        # Possible buildId rotation — refresh once and retry.
+        # Possible buildId rotation — but a refresh costs a full homepage
+        # download (~100KB), so verify at most once a minute, and retry the
+        # payload only when the id actually changed. A miss with a fresh
+        # buildId is a genuine 404 (payload gone) — nothing to retry.
+        if time.monotonic() - self._build_id_verified_at < 60:
+            return None
+        stale = build_id
         self._build_id = None
         build_id = self._get_build_id()
-        if not build_id:
+        self._build_id_verified_at = time.monotonic()
+        if not build_id or build_id == stale:
             return None
         return self._fetch_api_json(
             f"{self.BASE_URL}/_next/data/{build_id}{path}.json"
@@ -976,8 +1012,44 @@ class FotMobScraper(BaseScraper):
             logger.warning(f"No finished matches for {league} {season}")
             return None
 
+        # Skip-existing: read the Bronze partition once and re-fetch only
+        # matches that are missing or hold an empty stats_json — a finished
+        # match's payload is immutable, so re-downloading ~380 × ~27KB daily
+        # buys nothing. The same frame feeds keep-last-good (#544) and the
+        # partition merge below. Defensive: any read failure (first run, table
+        # absent, Trino down) falls back to today's full scrape.
+        existing: Optional[pd.DataFrame] = None
+        try:
+            existing = self._iceberg_writer.read_table(
+                'bronze',
+                'fotmob_match_details',
+                filter_expr=f"league = '{league}' AND season = {int(season)}",
+            )
+        except Exception as e:  # noqa: BLE001 — defensive, must never block scrape
+            logger.warning(
+                "skip-existing: Bronze read failed for %s %s (%s) — full scrape",
+                league, season, e,
+            )
+
+        done_ids: set = set()
+        if existing is not None and len(existing) \
+                and 'match_id' in existing.columns and 'stats_json' in existing.columns:
+            good = existing[~existing['stats_json'].map(_is_empty_json_value)]
+            done_ids = set(good['match_id'].astype(str))
+
+        to_fetch = [m for m in finished if str(m.get('id')) not in done_ids]
+        if done_ids:
+            logger.info(
+                "skip-existing: %d/%d matches already good in Bronze for %s %s, "
+                "fetching %d",
+                len(done_ids), len(finished), league, season, len(to_fetch),
+            )
+        if not to_fetch:
+            logger.info(f"No new matches for {league} {season} — skipping write")
+            return None
+
         rows = []
-        for i, match in enumerate(finished):
+        for i, match in enumerate(to_fetch):
             mid = match.get('id')
             details = self._fetch_match_details(mid)
             if not details:
@@ -1015,7 +1087,7 @@ class FotMobScraper(BaseScraper):
                 'momentum_json': self._jdump(content.get('momentum')),
             })
             if (i + 1) % 50 == 0:
-                logger.info(f"  match details progress: {i + 1}/{len(finished)}")
+                logger.info(f"  match details progress: {i + 1}/{len(to_fetch)}")
 
         if not rows:
             logger.warning(f"No match details parsed for {league} {season}")
@@ -1028,16 +1100,9 @@ class FotMobScraper(BaseScraper):
         # #544 keep-last-good: under replace_partitions a match whose content
         # re-fetched empty (stats_json = None) would overwrite a previously-good
         # Bronze row. Backfill the content JSON columns from the existing Bronze
-        # partition so good payloads survive a failed re-scrape. Defensive: any
-        # read failure (first run, table absent, Trino down) falls back to the
-        # freshly-scraped frame unchanged — never worse than today's behaviour.
-        try:
-            existing = self._iceberg_writer.read_table(
-                'bronze',
-                'fotmob_match_details',
-                columns=['match_id', *_PRESERVE_JSON_COLS],
-                filter_expr=f"league = '{league}' AND season = {int(season)}",
-            )
+        # partition (already read for skip-existing above) so good payloads
+        # survive a failed re-scrape.
+        if existing is not None and len(existing):
             before = df
             df = _backfill_empty_json(df, existing)
             preserved = sum(
@@ -1050,13 +1115,20 @@ class FotMobScraper(BaseScraper):
                     "%s %s where the re-scrape returned empty (#544)",
                     preserved, league, season,
                 )
-        except Exception as e:  # noqa: BLE001 — defensive, must never block save
-            logger.warning(
-                "keep-last-good skipped for %s %s (%s) — using fresh scrape",
-                league, season, e,
-            )
 
         df = self._add_metadata(df, 'match_details')
+
+        # Partition merge: replace_partitions rewrites the whole (league,
+        # season) partition, so carry over every existing Bronze row not
+        # re-fetched this run — including identity rows whose re-fetch failed
+        # and rows no longer present in the fixtures list. The partition never
+        # shrinks (completeness guard stays green).
+        if existing is not None and len(existing) and 'match_id' in existing.columns:
+            new_ids = set(df['match_id'].astype(str))
+            keep = existing[~existing['match_id'].astype(str).isin(new_ids)]
+            if len(keep):
+                df = pd.concat([keep, df], ignore_index=True)
+
         logger.info(f"Parsed {len(df)} match details")
         return df
 
@@ -1099,8 +1171,41 @@ class FotMobScraper(BaseScraper):
             logger.warning(f"No player ids for {league} {season}")
             return None
 
+        # Skip-existing: fetch only players missing from the Bronze partition
+        # (~600 × ~35KB daily otherwise); ``full_players=True`` re-fetches
+        # everyone to refresh stale career/market-value payloads. Defensive:
+        # any read failure falls back to the full scrape.
+        existing: Optional[pd.DataFrame] = None
+        if not self.full_players:
+            try:
+                existing = self._iceberg_writer.read_table(
+                    'bronze',
+                    'fotmob_player_details',
+                    filter_expr=f"league = '{league}' AND season = {int(season)}",
+                )
+            except Exception as e:  # noqa: BLE001 — defensive, must never block scrape
+                logger.warning(
+                    "skip-existing: Bronze read failed for %s %s (%s) — full scrape",
+                    league, season, e,
+                )
+
+        done_ids: set = set()
+        if existing is not None and len(existing) and 'player_id' in existing.columns:
+            done_ids = set(existing['player_id'].astype(str))
+
+        to_fetch = [pid for pid in player_ids if str(pid) not in done_ids]
+        if done_ids:
+            logger.info(
+                "skip-existing: %d/%d players already in Bronze for %s %s, "
+                "fetching %d",
+                len(done_ids), len(player_ids), league, season, len(to_fetch),
+            )
+        if not to_fetch:
+            logger.info(f"No new players for {league} {season} — skipping write")
+            return None
+
         rows = []
-        for i, pid in enumerate(player_ids):
+        for i, pid in enumerate(to_fetch):
             payload = self._fetch_next_data_payload(f'/players/{pid}')
             d = ((payload or {}).get('pageProps') or {}).get('data') if payload else None
             if not d:
@@ -1135,7 +1240,7 @@ class FotMobScraper(BaseScraper):
                 'next_match_json': self._jdump(d.get('nextMatch')),
             })
             if (i + 1) % 100 == 0:
-                logger.info(f"  player details progress: {i + 1}/{len(player_ids)}")
+                logger.info(f"  player details progress: {i + 1}/{len(to_fetch)}")
 
         if not rows:
             logger.warning(f"No player details parsed for {league} {season}")
@@ -1145,6 +1250,16 @@ class FotMobScraper(BaseScraper):
         df['league'] = league
         df['season'] = season
         df = self._add_metadata(df, 'player_details')
+
+        # Partition merge: carry over existing Bronze rows not re-fetched this
+        # run (replace_partitions rewrites the whole partition) — departed
+        # players keep their history and the partition never shrinks.
+        if existing is not None and len(existing) and 'player_id' in existing.columns:
+            new_ids = set(df['player_id'].astype(str))
+            keep = existing[~existing['player_id'].astype(str).isin(new_ids)]
+            if len(keep):
+                df = pd.concat([keep, df], ignore_index=True)
+
         logger.info(f"Parsed {len(df)} player details")
         return df
 
