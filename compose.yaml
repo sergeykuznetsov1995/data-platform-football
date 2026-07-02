@@ -45,6 +45,8 @@ x-airflow-common: &airflow-common
     # E1 medallion config: team_aliases.yaml + competitions.yaml — read-only
     # for utils/medallion_config.py (default CONFIG_DIR=/opt/airflow/configs/medallion)
     - ./configs/medallion:/opt/airflow/configs/medallion:ro
+    # SSO-конфиг: читает только webserver, scheduler игнорирует (фаза 6)
+    - ./configs/airflow/webserver_config.py:/opt/airflow/webserver_config.py:ro
     - ./scrapers:/opt/airflow/scrapers
     - ./scripts:/opt/airflow/scripts
     - ./proxys.txt:/opt/airflow/proxys.txt:ro
@@ -370,6 +372,12 @@ services:
     environment:
       <<: *airflow-common-env
       AIRFLOW__WEBSERVER__WORKERS: "2"
+      # SSO через Keycloak (webserver_config.py); false = обычная форма логина
+      AIRFLOW_OAUTH_ENABLED: ${AIRFLOW_OAUTH_ENABLED:-false}
+      AIRFLOW_OIDC_CLIENT_SECRET: ${AIRFLOW_OIDC_CLIENT_SECRET:-}
+      OIDC_ISSUER: https://${TS_HOSTNAME:-unset}:8443/realms/football
+      # За Caddy: доверять X-Forwarded-* (иначе redirect_uri будет http://)
+      AIRFLOW__WEBSERVER__ENABLE_PROXY_FIX: "true"
     depends_on:
       airflow-init:
         condition: service_completed_successfully
