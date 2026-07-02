@@ -139,3 +139,45 @@ def FLASK_APP_MUTATOR(app):
     @app.before_request
     def _make_session_permanent() -> None:
         session.permanent = True
+
+
+# -----------------------------------------------------------------------------
+# SSO через Keycloak (docs/design/analyst-access.md, фаза 7).
+# SUPERSET_OAUTH_ENABLED=true  -> AUTH_OAUTH: analysts = Gamma+sql_lab+analyst_data,
+#                                 platform-admins = Admin, авторегистрация
+# иначе                        -> обычная форма логина (локальный admin)
+# Break-glass: SUPERSET_OAUTH_ENABLED=false в .env + пересоздать superset.
+# FAB >= 4.3 нативно знает провайдера keycloak (role_keys = groups из userinfo).
+# -----------------------------------------------------------------------------
+if os.environ.get("SUPERSET_OAUTH_ENABLED", "").lower() == "true":
+    from flask_appbuilder.security.manager import AUTH_OAUTH
+
+    _ISSUER = os.environ["OIDC_ISSUER"]
+
+    AUTH_TYPE = AUTH_OAUTH
+    OAUTH_PROVIDERS = [
+        {
+            "name": "keycloak",
+            "icon": "fa-key",
+            "token_key": "access_token",
+            "remote_app": {
+                "client_id": "superset",
+                "client_secret": os.environ["SUPERSET_OIDC_CLIENT_SECRET"],
+                # discovery обязателен: без jwks_uri authlib падает на id_token
+                "server_metadata_url": f"{_ISSUER}/.well-known/openid-configuration",
+                "api_base_url": f"{_ISSUER}/protocol/",
+                "client_kwargs": {"scope": "openid email profile"},
+            },
+        }
+    ]
+
+    AUTH_USER_REGISTRATION = True
+    AUTH_USER_REGISTRATION_ROLE = "Gamma"
+    AUTH_ROLES_SYNC_AT_LOGIN = True
+    AUTH_ROLES_MAPPING = {
+        "analysts": ["Gamma", "sql_lab", "analyst_data"],
+        "platform-admins": ["Admin"],
+    }
+
+    # За Caddy: доверять X-Forwarded-*, иначе redirect_uri будет http://
+    ENABLE_PROXY_FIX = True
