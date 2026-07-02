@@ -49,7 +49,9 @@ def main() -> int:
 
     json.loads(rendered)  # валидность JSON после подстановки
     TARGET.write_text(rendered)
-    TARGET.chmod(0o600)
+    # 644, не 600: контейнер keycloak работает от UID 1000 и должен читать файл;
+    # на хосте каталог /root и так 700
+    TARGET.chmod(0o644)
     print(f"OK: {TARGET.relative_to(REPO)}")
     return 0
 
