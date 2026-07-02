@@ -333,3 +333,12 @@ keycloak-db:
 # Tail Keycloak logs
 logs-keycloak:
 	@docker compose logs -f --tail=100 keycloak
+
+# Собрать образы JupyterHub и ноутбука аналитика
+build-jupyter:
+	@docker build -t data-platform/jupyterhub:5.3 docker/images/jupyterhub
+	@docker build -t data-platform/jupyter-singleuser:latest docker/images/jupyter-singleuser
+
+# Tail JupyterHub logs
+logs-jupyterhub:
+	@docker compose logs -f --tail=100 jupyterhub
