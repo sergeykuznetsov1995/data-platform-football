@@ -295,8 +295,9 @@ class SoFIFAScraper(SoccerdataScraper):
         df = df.copy()
         string_cols = {
             'player', 'fifa_edition', 'update', 'joined', 'dob', 'position',
-            'nationality', 'preferred_foot', '_source', '_entity_type',
-            '_batch_id',
+            'nationality', 'preferred_foot', 'body_type', 'real_face',
+            'best_position', 'playstyles', 'specialities', '_source',
+            '_entity_type', '_batch_id',
         }
         for col in df.columns:
             if col in string_cols or col == 'player_id':
