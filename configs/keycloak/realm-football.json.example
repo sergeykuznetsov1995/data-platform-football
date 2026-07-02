@@ -35,6 +35,118 @@
           }
         }
       ]
+    },
+    {
+      "name": "profile",
+      "description": "preferred_username и имя (импорт создаёт ТОЛЬКО то, что в файле — встроенных скоупов в realm нет, поэтому определяем явно)",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "true",
+        "display.on.consent.screen": "false"
+      },
+      "protocolMappers": [
+        {
+          "name": "username",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-attribute-mapper",
+          "consentRequired": false,
+          "config": {
+            "user.attribute": "username",
+            "claim.name": "preferred_username",
+            "jsonType.label": "String",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "true"
+          }
+        },
+        {
+          "name": "given name",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-attribute-mapper",
+          "consentRequired": false,
+          "config": {
+            "user.attribute": "firstName",
+            "claim.name": "given_name",
+            "jsonType.label": "String",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "true"
+          }
+        },
+        {
+          "name": "family name",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-attribute-mapper",
+          "consentRequired": false,
+          "config": {
+            "user.attribute": "lastName",
+            "claim.name": "family_name",
+            "jsonType.label": "String",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "true"
+          }
+        }
+      ]
+    },
+    {
+      "name": "email",
+      "description": "email пользователя",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "true",
+        "display.on.consent.screen": "false"
+      },
+      "protocolMappers": [
+        {
+          "name": "email",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-attribute-mapper",
+          "consentRequired": false,
+          "config": {
+            "user.attribute": "email",
+            "claim.name": "email",
+            "jsonType.label": "String",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "true"
+          }
+        },
+        {
+          "name": "email verified",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-attribute-mapper",
+          "consentRequired": false,
+          "config": {
+            "user.attribute": "emailVerified",
+            "claim.name": "email_verified",
+            "jsonType.label": "boolean",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "true"
+          }
+        }
+      ]
+    },
+    {
+      "name": "basic",
+      "description": "sub в access-токене",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "false",
+        "display.on.consent.screen": "false"
+      },
+      "protocolMappers": [
+        {
+          "name": "sub",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-sub-mapper",
+          "consentRequired": false,
+          "config": {
+            "access.token.claim": "true"
+          }
+        }
+      ]
     }
   ],
   "clients": [
@@ -52,8 +164,8 @@
       "serviceAccountsEnabled": false,
       "redirectUris": ["https://__TS_HOSTNAME__:8081/oauth-authorized/keycloak"],
       "webOrigins": ["https://__TS_HOSTNAME__:8081"],
-      "defaultClientScopes": ["web-origins", "acr", "profile", "roles", "email", "basic", "groups"],
-      "optionalClientScopes": ["offline_access", "microprofile-jwt"]
+      "defaultClientScopes": ["profile", "email", "basic", "groups"],
+      "optionalClientScopes": ["offline_access"]
     },
     {
       "clientId": "superset",
@@ -69,8 +181,8 @@
       "serviceAccountsEnabled": false,
       "redirectUris": ["https://__TS_HOSTNAME__:8088/oauth-authorized/keycloak"],
       "webOrigins": ["https://__TS_HOSTNAME__:8088"],
-      "defaultClientScopes": ["web-origins", "acr", "profile", "roles", "email", "basic", "groups"],
-      "optionalClientScopes": ["offline_access", "microprofile-jwt"]
+      "defaultClientScopes": ["profile", "email", "basic", "groups"],
+      "optionalClientScopes": ["offline_access"]
     },
     {
       "clientId": "jupyterhub",
@@ -86,8 +198,8 @@
       "serviceAccountsEnabled": false,
       "redirectUris": ["https://__TS_HOSTNAME__/hub/oauth_callback"],
       "webOrigins": ["https://__TS_HOSTNAME__"],
-      "defaultClientScopes": ["web-origins", "acr", "profile", "roles", "email", "basic", "groups"],
-      "optionalClientScopes": ["offline_access", "microprofile-jwt"]
+      "defaultClientScopes": ["profile", "email", "basic", "groups"],
+      "optionalClientScopes": ["offline_access"]
     },
     {
       "clientId": "trino",
@@ -103,8 +215,8 @@
       "serviceAccountsEnabled": false,
       "redirectUris": ["https://__TS_HOSTNAME__:8444/oauth2/callback"],
       "webOrigins": ["https://__TS_HOSTNAME__:8444"],
-      "defaultClientScopes": ["web-origins", "acr", "profile", "roles", "email", "basic", "groups"],
-      "optionalClientScopes": ["offline_access", "microprofile-jwt"]
+      "defaultClientScopes": ["profile", "email", "basic", "groups"],
+      "optionalClientScopes": ["offline_access"]
     }
   ]
 }
