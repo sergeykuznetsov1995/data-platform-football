@@ -181,7 +181,7 @@ def _run_players(
     dry_run: bool = False,
     force_replace: bool = False,
 ) -> int:
-    """Anchor entity: league listing → squad pages → per-player profiles.
+    """Anchor entity: league listing → detailed squad pages (no profile hop).
 
     Writes ``bronze.transfermarkt_players`` with replace-partitions on
     ``(league, season)``.
