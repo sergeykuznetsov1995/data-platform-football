@@ -141,9 +141,11 @@ def _existing_match_ids_in_bronze(
     table: str,
     league: str,
     season_short: str,
+    id_col: str = 'match_id',
 ) -> set:
-    """Return distinct ``match_id`` strings already materialised in
-    ``iceberg.bronze.<table>`` for the given partition.
+    """Return distinct ``id_col`` strings already materialised in
+    ``iceberg.bronze.<table>`` for the given partition. ``id_col`` defaults to
+    ``match_id``; the venue table keys its rows by ``game_id`` (#847).
 
     Returns an empty set when the table does not yet exist (first run)
     or any Trino-side error occurs — caller then treats input as fully
@@ -155,7 +157,7 @@ def _existing_match_ids_in_bronze(
     try:
         cur = conn.cursor()
         sql = (
-            f"SELECT DISTINCT CAST(match_id AS varchar) "
+            f"SELECT DISTINCT CAST({id_col} AS varchar) "
             f"FROM iceberg.bronze.{table} "
             f"WHERE league = ? AND CAST(season AS varchar) = ?"
         )
@@ -361,21 +363,25 @@ def _filter_new_match_ids(
     season_str: str,
 ) -> tuple:
     """#842 incremental match_capture: drop match_ids already materialised in
-    ``bronze.sofascore_player_ratings`` — the pass's primary table, written on
-    every successful match capture (FBref keys its skip-existing the same way
-    on its authoritative table, #69). Finished-match data is immutable, so
-    re-capturing burns ~1-4 MB of residential proxy per match for identical
-    rows. Trade-off: a match whose best-effort statistics/shotmap tab flaked
-    while lineups succeeded is not re-captured — repair with ``--force-replace``.
+    ``bronze.sofascore_venue`` — the LAST table the capture pass writes (#847).
+    Probing the first table (player_ratings) made a mid-save crash invisible:
+    a Trino restart between saves left ratings/eps/stats committed and
+    shotmap/venue missing (APL 16/17), and the plain rerun skipped the match —
+    only ``--force-replace`` repaired it. Keying on the last table means a
+    half-written match IS re-captured on rerun. Finished-match data is
+    immutable, so a skipped match never needs re-capturing. Trade-off: a match
+    whose event payload carried no venue at all is re-probed each run (rare,
+    and bounded — the recapture is one match of proxy spend, vs a permanent
+    data hole the other way round).
 
     Returns ``(new_ids, skipped_count)``. Probe failure / missing table →
     empty existing set → nothing skipped (first run captures everything).
     """
     existing = _existing_match_ids_in_bronze(
-        'sofascore_player_ratings', league, season_short)
+        'sofascore_venue', league, season_short, id_col='game_id')
     if not existing:
         existing = _existing_match_ids_in_bronze(
-            'sofascore_player_ratings', league, season_str)
+            'sofascore_venue', league, season_str, id_col='game_id')
     new_ids = [m for m in match_ids if str(m) not in existing]
     return new_ids, len(match_ids) - len(new_ids)
 
@@ -658,7 +664,7 @@ def _run_match_capture(
         if skipped:
             logger.info(
                 "match_capture skip-existing: %d/%d matches already in "
-                "bronze.sofascore_player_ratings; capturing %d new.",
+                "bronze.sofascore_venue; capturing %d new.",
                 skipped, total, len(match_ids),
             )
         if not match_ids:

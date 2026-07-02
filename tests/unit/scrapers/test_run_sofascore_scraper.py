@@ -835,3 +835,53 @@ class TestFilterNewMatchIds:
         new, skipped = mod._filter_new_match_ids(
             [10, 11], 'ENG-Premier League', '2526', '2025')
         assert new == [11] and skipped == 1
+
+
+class TestSkipExistingProbesLastWrittenTable:
+    """#847: the match_capture skip-existing probe must key on the LAST table
+    the pass writes (``sofascore_venue``), not the first
+    (``sofascore_player_ratings``) — a mid-save crash (Trino restart) leaves
+    the early tables committed and the late ones missing; probing the first
+    table made such half-written matches invisible to a plain rerun (APL
+    16/17: shotmap/venue stayed at 0 rows until --force-replace)."""
+
+    @pytest.mark.unit
+    def test_filter_probes_venue_keyed_by_game_id(self, monkeypatch):
+        # Arrange — record which (table, id_col) the probe is asked for;
+        # only match '1' has reached the last table.
+        mod = _schedule_module()
+        calls = []
+
+        def _probe(table, league, season, id_col='match_id'):
+            calls.append((table, id_col))
+            return {'1'}
+
+        monkeypatch.setattr(mod, '_existing_match_ids_in_bronze', _probe)
+
+        # Act
+        new, skipped = mod._filter_new_match_ids(
+            ['1', '2'], 'ENG-Premier League', '2526', '2025')
+
+        # Assert — '2' (missing from venue) is re-captured; probe hit venue.
+        assert new == ['2'] and skipped == 1
+        assert calls and all(t == 'sofascore_venue' for t, _ in calls)
+        assert all(c == 'game_id' for _, c in calls)
+
+    @pytest.mark.unit
+    def test_probe_sql_selects_the_requested_id_col(self, monkeypatch):
+        # Arrange — venue rows are keyed by game_id, not match_id.
+        mod = _schedule_module()
+        cur = MagicMock()
+        cur.fetchall.return_value = [('101',), ('103',)]
+        conn = MagicMock()
+        conn.cursor.return_value = cur
+        monkeypatch.setattr(mod, '_trino_connect', lambda: conn)
+
+        # Act
+        ids = mod._existing_match_ids_in_bronze(
+            'sofascore_venue', 'ENG-Premier League', '2526', id_col='game_id')
+
+        # Assert — the DISTINCT projection follows id_col.
+        sql = cur.execute.call_args[0][0]
+        assert 'DISTINCT CAST(game_id AS varchar)' in sql
+        assert ids == {'101', '103'}
