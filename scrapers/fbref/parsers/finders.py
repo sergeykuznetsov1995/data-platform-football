@@ -22,6 +22,7 @@ from scrapers.fbref.parsers.table_parser import (
 from scrapers.fbref.parsers.id_extractors import (
     MANAGER_ID_PATTERN,
     PLAYER_ID_PATTERN,
+    TEAM_ID_PATTERN,
 )
 
 logger = logging.getLogger(__name__)
@@ -214,15 +215,7 @@ def find_player_stats_table(
                 logger.info(f"Found stats table by class: {table_class_str}")
                 return df
 
-    # Option 3: Last resort - find table with 'Player' header
-    for table in all_tables:
-        if _table_has_player_header(table):
-            df = _parse_table_element(table, extract_player_ids)
-            if df is not None and not df.empty:
-                logger.info("Found stats table by 'Player' header")
-                return df
-
-    # Option 4: Try comment tables with any stats-related key
+    # Option 3: Try comment tables with any stats-related key
     for key in comment_tables.keys():
         if 'stats' in key.lower() and 'squad' not in key.lower():
             df = parse_table(
@@ -233,6 +226,14 @@ def find_player_stats_table(
                 logger.info(f"Found player stats table in comments: {key}")
                 return df
 
+    # No "any table with a Player header" last resort: on an FBref layout
+    # change it silently returned the WRONG stat table (e.g. misc rows filed
+    # into the shooting bronze table). Fail loudly instead.
+    logger.error(
+        f"No player stats table found for stat_type={stat_type!r}. "
+        f"DOM table IDs: {[t.get('id', '<no-id>') for t in all_tables]}, "
+        f"comment table IDs: {list(comment_tables.keys())}"
+    )
     return None
 
 
@@ -662,6 +663,54 @@ def _extract_team_names_from_scorebox(
     return result
 
 
+def _extract_team_ids_from_scorebox(
+    soup: BeautifulSoup,
+) -> Dict[str, str]:
+    """Extract home/away team_ids from scorebox ``/squads/{id}/`` links."""
+    result: Dict[str, str] = {'home': '', 'away': ''}
+    scorebox = soup.find('div', class_='scorebox')
+    if not scorebox:
+        return result
+
+    ids = []
+    for link in scorebox.find_all(
+        'a', href=lambda x: x and '/squads/' in str(x)
+    ):
+        m = TEAM_ID_PATTERN.search(link.get('href', ''))
+        if m:
+            ids.append(m.group(1))
+    if ids:
+        result['home'] = ids[0]
+    if len(ids) >= 2:
+        result['away'] = ids[1]
+    return result
+
+
+# {team_id} embedded in match-page table ids: stats_{team_id}_summary,
+# keeper_stats_{team_id}. Boundary-anchored so a longer hex run can't match.
+_TABLE_TEAM_ID_RE = re.compile(r'_([a-f0-9]{8})(?:_|$)')
+
+
+def _side_for_table_id(
+    table_id: str, team_ids_by_side: Dict[str, str]
+) -> Optional[str]:
+    """Resolve 'home'/'away' from the {team_id} embedded in a table id.
+
+    Table order (DOM first, then comment tables) is NOT a reliable side
+    signal on partially-uncommented pages — matching the id against the
+    scorebox squads is. Returns None when the id matches neither side.
+    """
+    m = _TABLE_TEAM_ID_RE.search(table_id)
+    if not m:
+        return None
+    tid = m.group(1)
+    if tid and tid == team_ids_by_side.get('home'):
+        return 'home'
+    if tid and tid == team_ids_by_side.get('away'):
+        return 'away'
+    return None
+
+
 def _detect_event_type(div) -> str:
     """Detect event type from CSS classes of nested elements and text."""
     # Check inner div/span classes
@@ -942,25 +991,30 @@ def parse_player_match_stats_tables(
         logger.debug("No stats_*_summary tables found for player match stats")
         return None
 
-    all_dfs = []
+    parsed = []
     for table_id in summary_ids:
         df = parse_table(soup, table_id, comment_tables, extract_player_ids=True)
         if df is not None and not df.empty:
-            all_dfs.append(df)
+            parsed.append((table_id, df))
 
-    if not all_dfs:
+    if not parsed:
         logger.debug("stats_*_summary tables found but all empty")
         return None
 
-    # Assign team_side and team name (first table = home, second = away)
+    # Assign team_side by matching the {team_id} in the table id against the
+    # scorebox squads; table order is only the fallback (order is unreliable
+    # on partially-uncommented pages).
+    team_ids_by_side = _extract_team_ids_from_scorebox(soup)
     sides = ['home', 'away']
-    team_list = [team_names.get('home', ''), team_names.get('away', '')]
 
     result_dfs = []
-    for i, df in enumerate(all_dfs):
+    for i, (table_id, df) in enumerate(parsed):
         df = df.copy()
-        df['team_side'] = sides[i] if i < len(sides) else f'team_{i + 1}'
-        df['team'] = team_list[i] if i < len(team_list) else ''
+        side = _side_for_table_id(table_id, team_ids_by_side)
+        if side is None:
+            side = sides[i] if i < len(sides) else f'team_{i + 1}'
+        df['team_side'] = side
+        df['team'] = team_names.get(side, '')
         result_dfs.append(df)
 
     combined = pd.concat(result_dfs, ignore_index=True)
@@ -977,7 +1031,7 @@ def parse_player_match_stats_tables(
 
     logger.debug(
         f"Parsed {len(combined)} player match stats rows "
-        f"from {len(all_dfs)} summary tables"
+        f"from {len(parsed)} summary tables"
     )
     return combined
 
@@ -1024,24 +1078,29 @@ def parse_keeper_match_stats_tables(
         logger.debug("No keeper_stats_* tables found for keeper match stats")
         return None
 
-    all_dfs = []
+    parsed = []
     for table_id in keeper_ids:
         df = parse_table(soup, table_id, comment_tables, extract_player_ids=True)
         if df is not None and not df.empty:
-            all_dfs.append(df)
+            parsed.append((table_id, df))
 
-    if not all_dfs:
+    if not parsed:
         logger.debug("keeper_stats_* tables found but all empty")
         return None
 
+    # Side by {team_id} in the table id, order only as fallback — mirrors
+    # parse_player_match_stats_tables.
+    team_ids_by_side = _extract_team_ids_from_scorebox(soup)
     sides = ['home', 'away']
-    team_list = [team_names.get('home', ''), team_names.get('away', '')]
 
     result_dfs = []
-    for i, df in enumerate(all_dfs):
+    for i, (table_id, df) in enumerate(parsed):
         df = df.copy()
-        df['team_side'] = sides[i] if i < len(sides) else f'team_{i + 1}'
-        df['team'] = team_list[i] if i < len(team_list) else ''
+        side = _side_for_table_id(table_id, team_ids_by_side)
+        if side is None:
+            side = sides[i] if i < len(sides) else f'team_{i + 1}'
+        df['team_side'] = side
+        df['team'] = team_names.get(side, '')
         result_dfs.append(df)
 
     combined = pd.concat(result_dfs, ignore_index=True)
@@ -1051,7 +1110,7 @@ def parse_keeper_match_stats_tables(
 
     logger.debug(
         f"Parsed {len(combined)} keeper match stats rows "
-        f"from {len(all_dfs)} keeper tables"
+        f"from {len(parsed)} keeper tables"
     )
     return combined
 

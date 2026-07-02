@@ -907,6 +907,13 @@ class FBrefDataReaderMixin:
     # 50→20: reduce memory pressure (OOM killer hit 2G scheduler limit at ~200 matches)
     BATCH_SAVE_INTERVAL = 20
 
+    # A match whose page lacks stats_*_summary in BOTH passes of a run gets a
+    # tombstone row in bronze.fbref_match_no_stats; after this many runs of
+    # confirmations it is skipped by _get_existing_match_ids. Without the
+    # tombstone, awarded/forfeited fixtures (their pages never grow summary
+    # tables) are refetched + retried on every DAG run forever.
+    NO_STATS_TOMBSTONE_RUNS = 3
+
     def _process_single_match(
         self,
         match_id: str,
@@ -932,6 +939,9 @@ class FBrefDataReaderMixin:
         (e.g. {'lineups', 'match_player_stats'}).  Empty set on total failure.
         """
         url = f"{BASE_URL}/en/matches/{match_id}"
+        # Reset so a stale reason from a previous match can't leak into the
+        # tombstone classification below (cached pages skip validation).
+        self._last_validation_failure = None
         html = self._fetch_page(url, use_cache=True, page_type='match')
         if not html:
             return set()
@@ -1154,8 +1164,9 @@ class FBrefDataReaderMixin:
         """Read match_id sets from authoritative bronze tables.
 
         Returns:
-            {'player_stats': set[str], 'lineups': set[str]} — either set may
-            be empty if the table is missing or unreadable.
+            {'player_stats': set[str], 'lineups': set[str],
+             'no_stats': set[str]} — any set may be empty if the table is
+            missing or unreadable.
 
         ``player_stats`` is the authoritative skip-source: it's written last
         in ``_batch_save_match_data`` and is also what Silver depends on. If
@@ -1163,7 +1174,7 @@ class FBrefDataReaderMixin:
         version of the pipeline (before match_player_stats was added) and
         must be re-scraped — see :meth:`_get_existing_match_ids`.
         """
-        result = {'player_stats': set(), 'lineups': set()}
+        result = {'player_stats': set(), 'lineups': set(), 'no_stats': set()}
 
         try:
             if not hasattr(self, '_iceberg_writer') or self._iceberg_writer is None:
@@ -1193,6 +1204,26 @@ class FBrefDataReaderMixin:
                     result[key] = set(df['match_id'].astype(str).unique())
             except Exception as e:
                 logger.warning(f"Could not read {table}: {e}")
+
+        # Tombstones: fbref_match_no_stats gets one row per run for a match
+        # that failed the summary-presence check even after retry. Only
+        # matches confirmed in >= NO_STATS_TOMBSTONE_RUNS runs are skipped,
+        # so transient truncated loads keep retrying.
+        try:
+            if self._iceberg_writer.table_exists('bronze', 'fbref_match_no_stats'):
+                df = self._iceberg_writer.read_table(
+                    database='bronze',
+                    table='fbref_match_no_stats',
+                    columns=['match_id'],
+                    filter_expr=filter_expr,
+                )
+                if df is not None and not df.empty:
+                    counts = df['match_id'].astype(str).value_counts()
+                    result['no_stats'] = set(
+                        counts[counts >= self.NO_STATS_TOMBSTONE_RUNS].index
+                    )
+        except Exception as e:
+            logger.warning(f"Could not read fbref_match_no_stats: {e}")
 
         return result
 
@@ -1224,13 +1255,18 @@ class FBrefDataReaderMixin:
         sets = self._load_match_id_sets(league, season)
         stats_ids = sets['player_stats']
         lineup_ids = sets['lineups']
+        no_stats_ids = sets['no_stats']
 
+        # Confirmed no-summary tombstones join the skip set: those pages
+        # never grow summary tables (awarded/forfeited fixtures).
+        skip_ids = stats_ids | no_stats_ids
         logger.info(
             f"Existing IDs (player_stats authoritative): "
             f"player_stats={len(stats_ids)}, lineups={len(lineup_ids)}, "
-            f"skip={len(stats_ids)} for {league} {season}"
+            f"no_stats_tombstoned={len(no_stats_ids)}, "
+            f"skip={len(skip_ids)} for {league} {season}"
         )
-        return stats_ids
+        return skip_ids
 
     def _read_schedule_from_iceberg(self, league: str, season: int) -> Optional[pd.DataFrame]:
         """Read schedule from Iceberg (saved by schedule_task) instead of HTTP to FBref."""
@@ -1522,6 +1558,10 @@ class FBrefDataReaderMixin:
                         self._nodriver_browser.restart_browser(reason='post_schedule')
 
                     failed_match_ids = []
+                    # Matches whose fetch failed specifically because the page
+                    # had no stats_*_summary table — tombstone candidates if
+                    # the retry pass confirms (see NO_STATS_TOMBSTONE_RUNS).
+                    no_summary_ids = set()
                     # Matches where page loaded but match_player_stats was missing
                     # (e.g. lineups parsed OK, but stats_*_summary table absent).
                     # These need a retry too — without it, holes in
@@ -1556,6 +1596,8 @@ class FBrefDataReaderMixin:
                                     )
                             else:
                                 failed_match_ids.append(match_id)
+                                if self._last_validation_failure == 'no_match_summary':
+                                    no_summary_ids.add(match_id)
                                 consecutive_failures += 1
                                 logger.warning(
                                     f"No data extracted for match {match_id}, "
@@ -1614,6 +1656,7 @@ class FBrefDataReaderMixin:
                             self._nodriver_browser.restart_browser(reason='retry_failed_matches')
 
                         recovered = 0
+                        confirmed_no_summary = []
                         for match_id in retry_ids:
                             try:
                                 got_types = self._process_single_match(
@@ -1628,6 +1671,14 @@ class FBrefDataReaderMixin:
                                     recovered += 1
                                     if match_id in failed_match_ids:
                                         total_matches_processed += 1
+                                elif (
+                                    match_id in no_summary_ids
+                                    and self._last_validation_failure == 'no_match_summary'
+                                ):
+                                    # No summary table in BOTH passes — likely
+                                    # an awarded/forfeited fixture, not a
+                                    # truncated load. Tombstone candidate.
+                                    confirmed_no_summary.append(match_id)
                                 time.sleep(1)
                             except Exception as e:
                                 logger.debug(f"Retry failed for match {match_id}: {e}")
@@ -1635,6 +1686,34 @@ class FBrefDataReaderMixin:
                         logger.info(
                             f"Retry complete: recovered {recovered}/{len(retry_ids)} matches (player_stats)"
                         )
+
+                        if confirmed_no_summary:
+                            tomb_df = pd.DataFrame({
+                                'match_id': confirmed_no_summary,
+                                'league': league,
+                                'season': season,
+                                'reason': 'no_match_summary',
+                            })
+                            tomb_df = self._add_metadata(tomb_df, 'match_no_stats')
+                            try:
+                                # Plain append by design: one row per run is
+                                # the confirmation counter that
+                                # _load_match_id_sets compares against
+                                # NO_STATS_TOMBSTONE_RUNS.
+                                self.save_to_iceberg(
+                                    df=tomb_df,
+                                    table_name='fbref_match_no_stats',
+                                    partition_cols=['league', 'season'],
+                                )
+                                logger.info(
+                                    f"Tombstoned {len(confirmed_no_summary)} "
+                                    f"no-summary matches for {league} {season}: "
+                                    f"{confirmed_no_summary}"
+                                )
+                            except Exception as e:
+                                logger.warning(
+                                    f"Could not save no-stats tombstones: {e}"
+                                )
                     # Save remaining data after each league/season
                     self._batch_save_match_data(
                         all_shot_events, all_match_events, all_lineups,
