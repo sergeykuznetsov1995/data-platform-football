@@ -133,12 +133,16 @@ _MH_COLUMNS = [
     "odds_home_ps",   "odds_draw_ps",   "odds_away_ps",
     "odds_home_wh",   "odds_draw_wh",   "odds_away_wh",
     "odds_home_vc",   "odds_draw_vc",   "odds_away_vc",
+    "maxh",  "maxd",  "maxa",
+    "avgh",  "avgd",  "avga",
     "b365ch", "b365cd", "b365ca",
     "bwch",   "bwcd",   "bwca",
     "iwch",   "iwcd",   "iwca",
     "psch",   "pscd",   "psca",
     "whch",   "whcd",   "whca",
     "vcch",   "vccd",   "vcca",
+    "maxch",  "maxcd",  "maxca",
+    "avgch",  "avgcd",  "avgca",
     "ahh",
     "b365ahh", "b365aha",
     "pahh", "paha",
@@ -225,6 +229,10 @@ def _mh_row(
     whh: float = 2.05,  whd: float = 3.40,  wha: float = 3.50,
     vch: float = 2.10,  vcd: float = 3.30,  vca: float = 3.45,
     psch: float = 2.20, pscd: float = 3.25, psca: float = 3.40,
+    # 1x2 market consensus (Max/Avg) — default NULL so pre-existing
+    # expectations (rows dropped by the all-NULL WHERE filter) hold.
+    maxh: float = None, maxd: float = None, maxa: float = None,
+    avgh: float = None, avgd: float = None, avga: float = None,
 ) -> List[Any]:
     """Build a row matching _MH_COLUMNS order. Most odds default to NULL.
 
@@ -261,6 +269,12 @@ def _mh_row(
     values[idx["psch"]] = psch
     values[idx["pscd"]] = pscd
     values[idx["psca"]] = psca
+    values[idx["maxh"]] = maxh
+    values[idx["maxd"]] = maxd
+    values[idx["maxa"]] = maxa
+    values[idx["avgh"]] = avgh
+    values[idx["avgd"]] = avgd
+    values[idx["avga"]] = avga
     return values
 
 
@@ -415,6 +429,45 @@ class TestFctMatchOddsBridge:
         out = _run_gold(duck_conn)
         # Expect ≥ 30 surviving rows across 5 matches × ≥6 books per match.
         assert len(out) >= 30, f"too few unfolded rows: {len(out)}"
+
+    def test_1x2_market_consensus_avg_max_promoted(self, duck_conn):
+        """maxh/avgh (market consensus) seeded → AVG/MAX 1x2 rows surface,
+        symmetric with the AH/OU blocks that already promote Max/Avg."""
+        placeholders = ", ".join(["?"] * len(_MH_COLUMNS))
+        cols_quoted = ", ".join(f'"{c}"' for c in _MH_COLUMNS)
+        duck_conn.execute(
+            f'INSERT INTO bronze_matchhistory_results ({cols_quoted}) VALUES ({placeholders})',
+            _mh_row(
+                date="17/08/2024", home="Wolves", away="Tottenham",
+                maxh=2.30, maxd=3.60, maxa=3.80,
+                avgh=2.12, avgd=3.35, avga=3.52,
+            ),
+        )
+        # Same 'mh_<md5>' formula as _seed_corpus (DuckDB translation rewrites
+        # xxhash64→md5), keyed on the raw bronze natural key.
+        duck_conn.execute(
+            """
+            INSERT INTO silver_xref_match VALUES
+            ('M_WV_TT', 'matchhistory',
+             'mh_' || lower(md5(
+                 CAST(strptime('17/08/2024', '%d/%m/%Y') AS DATE)::varchar
+                 || '|' || lower('Wolves') || '|' || lower('Tottenham')
+                 || '|' || 'ENG-Premier League' || '|' || '2024'
+             )),
+             'Wolves vs Tottenham', 'ENG-Premier League', '2425',
+             'date_team_match', 1.0)
+            """
+        )
+        _materialize_silver(duck_conn)
+        out = _run_gold(duck_conn)
+        consensus = {
+            r["bookmaker"]: r for r in out
+            if r["market"] == "1x2" and r["bookmaker"] in ("AVG", "MAX")
+            and r["is_closing"] is False
+        }
+        assert set(consensus) == {"AVG", "MAX"}, f"got: {sorted(consensus)}"
+        assert float(consensus["MAX"]["odds_home"]) == pytest.approx(2.30)
+        assert float(consensus["AVG"]["odds_home"]) == pytest.approx(2.12)
 
     def test_closing_flag_detected_for_psc(self, duck_conn):
         """PSCH/PSCD/PSCA seeded → is_closing=TRUE for PS-1x2-closing rows."""

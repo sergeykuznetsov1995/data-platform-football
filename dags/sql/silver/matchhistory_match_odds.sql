@@ -39,9 +39,10 @@
 --             season (bigint)
 --   Score:    home_goals, away_goals, result, …  (bigint / varchar)
 --
---   1x2 open    : odds_home/draw/away_b365, …_bw, iwh/d/a (raw), …_ps, …_wh, …_vc
+--   1x2 open    : odds_home/draw/away_b365, …_bw, iwh/d/a (raw), …_ps, …_wh,
+--                 …_vc, maxh/d/a, avgh/d/a (market consensus, raw)
 --   1x2 closing : b365ch/cd/ca, bwch/cd/ca, psch/pscd/psca, whch/whcd/whca,
---                 vcch/vccd/vcca, iwch/iwcd/iwca
+--                 vcch/vccd/vcca, iwch/iwcd/iwca, maxch/cd/ca, avgch/cd/ca
 --   AH open     : ahh (handicap line), b365ahh/aha, pahh/paha, maxahh/maxaha,
 --                 avgahh/avgaha
 --   AH closing  : ahch (handicap line), b365cahh/caha, pcahh/pcaha,
@@ -129,6 +130,10 @@ WITH mh AS (
         odds_home_ps   AS psh,   odds_draw_ps   AS psd,   odds_away_ps   AS psa,
         odds_home_wh   AS whh,   odds_draw_wh   AS whd,   odds_away_wh   AS wha,
         odds_home_vc   AS vch,   odds_draw_vc   AS vcd,   odds_away_vc   AS vca,
+        -- Market consensus (raw; present since ~2019 files, NULL before) —
+        -- same MAX/AVG aggregates the AH/OU blocks already promote.
+        maxh, maxd, maxa,
+        avgh, avgd, avga,
 
         -- ---- 1x2 closing ----
         b365ch, b365cd, b365ca,
@@ -137,6 +142,8 @@ WITH mh AS (
         psch,   pscd,   psca,
         whch,   whcd,   whca,
         vcch,   vccd,   vcca,
+        maxch,  maxcd,  maxca,
+        avgch,  avgcd,  avgca,
 
         -- ---- AH open (handicap line: ahh) ----
         ahh,
@@ -223,12 +230,16 @@ mh_bridged AS (
         c.psh,   c.psd,   c.psa,
         c.whh,   c.whd,   c.wha,
         c.vch,   c.vcd,   c.vca,
+        c.maxh,  c.maxd,  c.maxa,
+        c.avgh,  c.avgd,  c.avga,
         c.b365ch, c.b365cd, c.b365ca,
         c.bwch,   c.bwcd,   c.bwca,
         c.iwch,   c.iwcd,   c.iwca,
         c.psch,   c.pscd,   c.psca,
         c.whch,   c.whcd,   c.whca,
         c.vcch,   c.vccd,   c.vcca,
+        c.maxch,  c.maxcd,  c.maxca,
+        c.avgch,  c.avgcd,  c.avgca,
 
         c.ahh,
         c.b365ahh, c.b365aha,
@@ -287,6 +298,12 @@ mh_unfolded AS (
     UNION ALL
     SELECT match_id_canonical, 'VC', '1x2', vch, vcd, vca, NULL, NULL, FALSE,
            league, season, _ingested_at FROM mh_bridged
+    UNION ALL
+    SELECT match_id_canonical, 'AVG', '1x2', avgh, avgd, avga, NULL, NULL, FALSE,
+           league, season, _ingested_at FROM mh_bridged
+    UNION ALL
+    SELECT match_id_canonical, 'MAX', '1x2', maxh, maxd, maxa, NULL, NULL, FALSE,
+           league, season, _ingested_at FROM mh_bridged
 
     -- ===== 1x2 CLOSING =====
     UNION ALL
@@ -306,6 +323,12 @@ mh_unfolded AS (
            NULL, NULL, TRUE, league, season, _ingested_at FROM mh_bridged
     UNION ALL
     SELECT match_id_canonical, 'VC', '1x2', vcch, vccd, vcca,
+           NULL, NULL, TRUE, league, season, _ingested_at FROM mh_bridged
+    UNION ALL
+    SELECT match_id_canonical, 'AVG', '1x2', avgch, avgcd, avgca,
+           NULL, NULL, TRUE, league, season, _ingested_at FROM mh_bridged
+    UNION ALL
+    SELECT match_id_canonical, 'MAX', '1x2', maxch, maxcd, maxca,
            NULL, NULL, TRUE, league, season, _ingested_at FROM mh_bridged
 
     -- ===== AH OPEN (odds_d=NULL — market=ah имеет only home/away) =====
