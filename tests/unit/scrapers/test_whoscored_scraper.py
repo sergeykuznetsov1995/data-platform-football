@@ -996,6 +996,18 @@ class TestLineupsParser:
         assert self._parse({}).empty
         assert self._parse({'events': [], 'home': {}, 'away': {}}).empty
 
+    def test_numeric_columns_pinned_to_float64(self):
+        """A chunk where every optional field is present must NOT come out
+        int64 — the auto-created Iceberg column would be BIGINT and the next
+        chunk carrying a NaN (float64) would fail the Trino INSERT."""
+        df = self._parse(_mcd_fixture()).reset_index()
+        for col in (
+            'game_id', 'team_id', 'player_id', 'shirt_no', 'minutes_played',
+            'rating', 'subbed_in_expanded_minute', 'subbed_out_expanded_minute',
+            'height', 'weight', 'age',
+        ):
+            assert df[col].dtype == 'float64', col
+
 
 # -----------------------------------------------------------------------------
 # scrape_events: multi-season metadata + lineups-aware skip / dual append.

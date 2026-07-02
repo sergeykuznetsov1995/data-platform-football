@@ -401,6 +401,16 @@ def parse_matchcentre_to_lineups_df(
         return pd.DataFrame()
 
     df = pd.DataFrame(rows)
+    # Pin every nullable numeric to float64 (bronze DOUBLE convention, same as
+    # events). Otherwise a chunk where e.g. every shirt_no is present becomes
+    # int64 → the auto-created Iceberg column is BIGINT, and the next chunk
+    # with a missing value (NaN → float64) fails the Trino INSERT.
+    for col in (
+        "game_id", "team_id", "player_id", "shirt_no",
+        "subbed_in_expanded_minute", "subbed_out_expanded_minute",
+        "minutes_played", "rating", "height", "weight", "age",
+    ):
+        df[col] = pd.to_numeric(df[col], errors="coerce").astype("float64")
     df["league"] = league
     df["season"] = season
     df["game"] = game_name
