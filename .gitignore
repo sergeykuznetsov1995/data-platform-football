@@ -192,6 +192,8 @@ password.db
 credentials/
 proxys.txt
 configs/trino/certs/
+# SeaweedFS S3 static credentials (rendered from .env; template *.example is committed)
+configs/seaweedfs/s3.config.json
 
 # Documentation (local only)
 CLAUDE.md
