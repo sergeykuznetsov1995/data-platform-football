@@ -36,16 +36,24 @@ class TestClubEloScraper:
 
     @pytest.fixture
     def mock_soccerdata_clubelo(self):
-        """Mock soccerdata ClubElo reader."""
+        """Mock soccerdata ClubElo reader.
+
+        Mirrors the real read_by_date frame: soccerdata already translates
+        ClubElo's country_level into canonical league IDs ('ENG_1' →
+        'ENG-Premier League'); untranslated levels (e.g. Championship) come
+        back as NaN. The Championship row must be filtered OUT by the scraper.
+        """
         with patch.dict('sys.modules', {'soccerdata': MagicMock()}):
             import soccerdata as sd
 
             reader = MagicMock()
             reader.read_by_date.return_value = pd.DataFrame({
-                'club': ['Manchester City', 'Arsenal', 'Liverpool'],
+                'team': ['Manchester City', 'Arsenal', 'Leeds'],
                 'country': ['ENG', 'ENG', 'ENG'],
-                'elo': [2050, 1980, 1950],
-                'rank': [1, 2, 3],
+                'level': [1, 1, 2],
+                'league': ['ENG-Premier League', 'ENG-Premier League', float('nan')],
+                'elo': [2050, 1980, 1700],
+                'rank': [1, 2, float('nan')],
             })
 
             sd.ClubElo.return_value = reader
@@ -63,22 +71,46 @@ class TestClubEloScraper:
         assert scraper.SOURCE_NAME == 'clubelo'
         assert 'ENG-Premier League' in scraper.leagues
 
-    def test_rate_limit(self, scraper):
-        """Test ClubElo has permissive rate limit."""
-        assert scraper.DEFAULT_RATE_LIMIT == 60
-
-    def test_league_mapping(self, scraper):
-        """Test league code mapping."""
-        assert scraper.LEAGUE_MAPPING['ENG-Premier League'] == 'ENG'
-        assert scraper.LEAGUE_MAPPING['ESP-La Liga'] == 'ESP'
-
     def test_read_by_date(self, scraper, mock_soccerdata_clubelo):
         """Test reading ratings by date."""
         df = scraper.read_by_date(date(2024, 1, 15))
 
         assert df is not None
-        assert 'club' in df.columns
+        assert 'team' in df.columns
         assert 'elo' in df.columns
+
+    # ------------------------------------------------------------------
+    # League scalability: filter on the CANONICAL league column soccerdata
+    # already provides ('ENG_1' → 'ENG-Premier League'), not on country.
+    # A country filter also kept lower-division clubs (league=NaN) — 24
+    # Championship rows/day that became orphans in xref_team/fct_team_elo.
+    # ------------------------------------------------------------------
+    def test_read_by_date_filters_by_canonical_league(
+        self, scraper, mock_soccerdata_clubelo
+    ):
+        """Only rows of the requested canonical leagues survive; lower-level
+        clubs of the same country (league=NaN) are dropped."""
+        df = scraper.read_by_date(date(2024, 1, 15))
+
+        assert set(df['league']) == {'ENG-Premier League'}
+        assert 'Leeds' not in df['team'].tolist()  # level-2, league=NaN
+        assert len(df) == 2
+
+    def test_read_by_date_warns_on_league_with_no_rows(
+        self, mock_dependencies, mock_soccerdata_clubelo, caplog
+    ):
+        """A requested league absent from the snapshot (unmapped or not
+        covered by ClubElo) must produce a WARNING, not silent 0 rows."""
+        import logging
+
+        from scrapers.clubelo import ClubEloScraper
+
+        scraper = ClubEloScraper(leagues=['USA-Major League Soccer'])
+        with caplog.at_level(logging.WARNING):
+            df = scraper.read_by_date(date(2024, 1, 15))
+
+        assert df is not None and df.empty
+        assert any('USA-Major League Soccer' in r.message for r in caplog.records)
 
     def test_read_by_date_default(self, scraper, mock_soccerdata_clubelo):
         """Test reading ratings for today."""
@@ -87,10 +119,48 @@ class TestClubEloScraper:
         assert df is not None
 
     def test_scrape_current_ratings(self, scraper, mock_soccerdata_clubelo):
-        """Test scraping current ratings."""
+        """Test scraping current ratings; result carries rows + rating_date
+        so the runner can report them without re-implementing the save."""
         result = scraper.scrape_current_ratings()
 
         assert 'current_ratings' in result
+        assert result['rows'] == 2
+        assert result['rating_date'] is not None
+
+    # ------------------------------------------------------------------
+    # #583 guard parity: the completeness guard must live on the METHOD, not
+    # only inlined in the runner — the two paths had already drifted (the
+    # runner armed min_replace_ratio, scrape_current_ratings did not).
+    # ------------------------------------------------------------------
+    def test_scrape_current_ratings_arms_replace_guard(
+        self, scraper, mock_soccerdata_clubelo
+    ):
+        """Default call passes min_replace_ratio=0.9; force_replace disarms."""
+        with patch.object(
+            scraper, "save_to_iceberg", return_value="iceberg.bronze.clubelo_ratings"
+        ) as mock_save:
+            scraper.scrape_current_ratings()
+        assert mock_save.call_args.kwargs["min_replace_ratio"] == 0.9
+
+        with patch.object(
+            scraper, "save_to_iceberg", return_value="iceberg.bronze.clubelo_ratings"
+        ) as mock_save:
+            scraper.scrape_current_ratings(force_replace=True)
+        assert mock_save.call_args.kwargs["min_replace_ratio"] is None
+
+    def test_scrape_historical_ratings_empty_logs_error(
+        self, scraper, mock_soccerdata_clubelo, caplog
+    ):
+        """All per-date reads failing must NOT be silent: {} + ERROR log
+        (the runner turns this into results['errors'])."""
+        import logging
+
+        with patch.object(scraper, "read_by_date", return_value=None):
+            with caplog.at_level(logging.ERROR):
+                result = scraper.scrape_historical_ratings(days_back=14)
+
+        assert result == {}
+        assert any(r.levelno >= logging.ERROR for r in caplog.records)
 
     def test_scrape_all(self, scraper, mock_soccerdata_clubelo):
         """Test full scrape."""
@@ -187,16 +257,3 @@ class TestClubEloScraper:
         assert all(len(v) == 10 and v[4] == '-' and v[7] == '-' for v in rating_dates)
 
         assert result["current_ratings"] == "iceberg.bronze.clubelo_ratings"
-
-
-class TestTopEnglishClubs:
-    """Tests for predefined club lists."""
-
-    def test_top_english_clubs(self):
-        """Test top English clubs are defined."""
-        from scrapers.clubelo.scraper import TOP_ENGLISH_CLUBS
-
-        assert 'Manchester City' in TOP_ENGLISH_CLUBS
-        assert 'Arsenal' in TOP_ENGLISH_CLUBS
-        assert 'Liverpool' in TOP_ENGLISH_CLUBS
-        assert len(TOP_ENGLISH_CLUBS) == 20

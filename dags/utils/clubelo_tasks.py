@@ -13,6 +13,13 @@ from typing import Any, Dict
 
 from airflow.exceptions import AirflowException
 
+RESULTS_PATH = '/tmp/clubelo_result.json'
+
+# Low-rows floor per league: a full league snapshot is ~20 clubs; 15 leaves
+# 25% headroom. Scaled by len(LEAGUES) at validation time (sofifa precedent,
+# utils/config.py) — the old hard-coded 100 fired on every single-league run.
+MIN_ROWS_PER_LEAGUE = 15
+
 
 def gate_full_ratings(**context) -> bool:
     """ShortCircuitOperator hook — TRUE means "run the heavy historical scrape".
@@ -67,10 +74,12 @@ def validate_data(**context) -> Dict[str, Any]:
     import json
     import logging
 
+    from utils.config import LEAGUES
+
     logger = logging.getLogger(__name__)
 
     try:
-        with open('/tmp/clubelo_result.json', 'r') as f:
+        with open(RESULTS_PATH, 'r') as f:
             ratings_result = json.load(f)
     except FileNotFoundError:
         logger.error("Results file not found - scraping may have failed")
@@ -98,9 +107,15 @@ def validate_data(**context) -> Dict[str, Any]:
             else 'failed'
         )
 
-    # ClubElo should have ratings for many clubs
-    if validation['summary']['ratings_rows'] < 100:
-        validation['warnings'].append("Low ratings count - possible scraping issue")
+    # A full league snapshot is ~20 clubs → threshold scales with the number
+    # of configured leagues instead of a hard-coded 100 (which fired on every
+    # healthy single-league run).
+    min_rows = MIN_ROWS_PER_LEAGUE * len(LEAGUES)
+    if validation['summary']['ratings_rows'] < min_rows:
+        validation['warnings'].append(
+            f"Low ratings count - possible scraping issue "
+            f"({validation['summary']['ratings_rows']} < {min_rows})"
+        )
 
     logger.info(f"Data validation complete: {validation['status']}")
     logger.info(f"Summary: {validation['summary']}")

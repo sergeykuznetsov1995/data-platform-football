@@ -11,7 +11,7 @@ Source: http://clubelo.com
 
 import logging
 from datetime import date, datetime, timedelta
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import pandas as pd
 
@@ -35,21 +35,6 @@ class ClubEloScraper(SoccerdataScraper):
     """
 
     SOURCE_NAME = 'clubelo'
-    DEFAULT_RATE_LIMIT = 60  # ClubElo is quite permissive
-
-    # Club ELO doesn't use standard league codes
-    LEAGUE_MAPPING = {
-        'ENG-Premier League': 'ENG',
-        'ESP-La Liga': 'ESP',
-        'GER-Bundesliga': 'GER',
-        'ITA-Serie A': 'ITA',
-        'FRA-Ligue 1': 'FRA',
-        'NED-Eredivisie': 'NED',
-        'POR-Primeira Liga': 'POR',
-        'RUS-Premier League': 'RUS',
-        'TUR-Super Lig': 'TUR',
-        'UKR-Premier League': 'UKR',
-    }
 
     def __init__(
         self,
@@ -107,14 +92,20 @@ class ClubEloScraper(SoccerdataScraper):
                 # APPEND. This mirrors the historical path (#470, precedent #283/#314).
                 df['rating_date'] = pd.Timestamp(date_val).strftime('%Y-%m-%d')
 
-                # Filter by leagues if specified
-                if self.leagues:
-                    country_codes = [
-                        self.LEAGUE_MAPPING.get(league, league[:3])
-                        for league in self.leagues
-                    ]
-                    if 'country' in df.columns:
-                        df = df[df['country'].isin(country_codes)]
+                # Filter on the CANONICAL league column soccerdata provides
+                # ('ENG_1' → 'ENG-Premier League'; untranslated levels → NaN).
+                # A country-based filter also kept lower-division clubs
+                # (league=NaN) that became orphans in xref_team/fct_team_elo.
+                if self.leagues and 'league' in df.columns:
+                    df = df[df['league'].isin(self.leagues)]
+                    missing = set(self.leagues) - set(df['league'])
+                    if missing:
+                        logger.warning(
+                            f"No ClubElo rows for requested leagues "
+                            f"{sorted(missing)} on {date_val:%Y-%m-%d} — "
+                            f"league not covered by ClubElo (Europe only) or "
+                            f"not in soccerdata's canonical league map."
+                        )
 
                 df = self._add_metadata(df, 'elo_ratings')
 
@@ -124,12 +115,20 @@ class ClubEloScraper(SoccerdataScraper):
             logger.error(f"Error reading ClubElo by date: {e}")
             return None
 
-    def scrape_current_ratings(self) -> Dict[str, str]:
+    def scrape_current_ratings(self, force_replace: bool = False) -> Dict[str, Any]:
         """
         Scrape current ELO ratings for all clubs.
 
+        Args:
+            force_replace: Bypass the completeness guard (#513/#583) — for a
+                deliberate legitimate shrink of today's snapshot partition.
+
         Returns:
-            Dictionary with table path
+            Dictionary with table path, row count and rating_date (so the
+            runner can report them without re-implementing the save).
+
+        Raises:
+            ReplaceGuardError: If the guard refuses a shrinking save.
         """
         df = self.read_by_date()
 
@@ -143,8 +142,16 @@ class ClubEloScraper(SoccerdataScraper):
                 # full snapshot (#470). rating_date is date-only ISO (see
                 # read_by_date) so the partition-delete filter is valid SQL.
                 replace_partitions=['rating_date'],
+                # Completeness guard (#513/#583): refuse a partial scrape that
+                # would shrink today's snapshot partition below 90% of its
+                # existing rows (full-state per rating_date → raw COUNT(*)).
+                min_replace_ratio=(None if force_replace else 0.9),
             )
-            return {'current_ratings': table_path}
+            return {
+                'current_ratings': table_path,
+                'rows': len(df),
+                'rating_date': df['rating_date'].iloc[0],
+            }
 
         return {}
 
@@ -180,29 +187,35 @@ class ClubEloScraper(SoccerdataScraper):
             # Sample weekly for historical data
             current_date += timedelta(days=7)
 
-        if all_data:
-            combined_df = pd.concat(all_data, ignore_index=True)
-            # rating_date arrives as a datetime; normalize to ISO 'YYYY-MM-DD'
-            # so _build_partition_delete_filter emits a quoted, valid predicate
-            # (rating_date = '2026-06-04'). Without this the filter is raw/
-            # unquoted, the DELETE fails, and the writer SILENTLY falls back to
-            # plain APPEND — the 2026-05-04 HDFS-overflow footgun.
-            combined_df['rating_date'] = (
-                pd.to_datetime(combined_df['rating_date']).dt.strftime('%Y-%m-%d')
+        if not all_data:
+            # Not silent: the runner records this in results['errors'] so a
+            # completely failed historical scrape surfaces in validation.
+            logger.error(
+                f"historical_ratings: no data returned for any sampled date "
+                f"({start_date} → {end_date}, weekly)"
             )
-            table_path = self.save_to_iceberg(
-                df=combined_df,
-                table_name='clubelo_ratings_historical',
-                partition_cols=['rating_date'],
-                replace_partitions=['rating_date'],
-                # Completeness guard (#513/#583): refuse a partial historical
-                # scrape that would shrink the partition below 90% of its
-                # existing rows (full-state per rating_date → raw COUNT(*)).
-                min_replace_ratio=(None if force_replace else 0.9),
-            )
-            return {'historical_ratings': table_path, 'rows': len(combined_df)}
+            return {}
 
-        return {}
+        combined_df = pd.concat(all_data, ignore_index=True)
+        # rating_date arrives as a datetime; normalize to ISO 'YYYY-MM-DD'
+        # so _build_partition_delete_filter emits a quoted, valid predicate
+        # (rating_date = '2026-06-04'). Without this the filter is raw/
+        # unquoted, the DELETE fails, and the writer SILENTLY falls back to
+        # plain APPEND — the 2026-05-04 HDFS-overflow footgun.
+        combined_df['rating_date'] = (
+            pd.to_datetime(combined_df['rating_date']).dt.strftime('%Y-%m-%d')
+        )
+        table_path = self.save_to_iceberg(
+            df=combined_df,
+            table_name='clubelo_ratings_historical',
+            partition_cols=['rating_date'],
+            replace_partitions=['rating_date'],
+            # Completeness guard (#513/#583): refuse a partial historical
+            # scrape that would shrink the partition below 90% of its
+            # existing rows (full-state per rating_date → raw COUNT(*)).
+            min_replace_ratio=(None if force_replace else 0.9),
+        )
+        return {'historical_ratings': table_path, 'rows': len(combined_df)}
 
     def scrape_all(self) -> Dict[str, str]:
         """
@@ -220,28 +233,3 @@ class ClubEloScraper(SoccerdataScraper):
 
         logger.info(f"ClubElo scrape complete: {list(results.keys())}")
         return results
-
-
-# Default teams for English clubs (top 20)
-TOP_ENGLISH_CLUBS = [
-    'Manchester City',
-    'Arsenal',
-    'Liverpool',
-    'Chelsea',
-    'Manchester United',
-    'Tottenham',
-    'Newcastle United',
-    'Brighton',
-    'Aston Villa',
-    'West Ham',
-    'Brentford',
-    'Crystal Palace',
-    'Fulham',
-    'Wolverhampton',
-    'Bournemouth',
-    'Nottingham Forest',
-    'Everton',
-    'Leicester',
-    'Leeds United',
-    'Southampton',
-]
