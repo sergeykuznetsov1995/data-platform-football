@@ -337,6 +337,99 @@ class TestReadPlayerRatingsPreferredFoot:
         assert pd.isna(df.iloc[0]['preferred_foot'])
 
 
+class TestReadPlayerRatingsProfileExtras:
+    """Profile fields added by the sofifa parsing review: star ratings
+    (weak foot / skill moves / international reputation), body type / real
+    face, best position / best overall, PlayStyles and specialities.
+
+    Star fields put the rating number BEFORE their label; text fields are the
+    label's tail (same as preferred_foot, #663); PlayStyles / specialities are
+    tag lists in <h5>-titled columns. Markup mirrors the live FC-26 player
+    page (snapshot 2025-09-22, player 231747).
+    """
+
+    _PLAYER_HTML = (
+        '<html><body>'
+        '<div class="profile"><h1>Test Player</h1></div>'
+        '<div class="grid attribute"><div class="col"><h5>Profile</h5>'
+        '<p><label>Preferred foot</label> Right</p>'
+        '<p>5 <svg class="star"><path d="M12"></path></svg> <label>Skill moves</label></p>'
+        '<p>4 <svg class="star"><path d="M12"></path></svg> <label>Weak foot</label></p>'
+        '<p>3 <svg class="star"><path d="M12"></path></svg> <label>International reputation</label></p>'
+        '<p><label>Body type</label> Unique</p>'
+        '<p><label>Real face</label> Yes</p>'
+        '</div>'
+        '<div class="col"><h5>Player specialities</h5>'
+        '<p><a href="/players?sc[]=2">#Speedster</a></p>'
+        '<p><a href="/players?sc[]=8">#Dribbler</a></p>'
+        '</div>'
+        '<div class="col"><h5>PlayStyles</h5>'
+        '<p><span data-tippy-content="x">Quick Step +</span></p>'
+        '<p><span data-tippy-content="y">Finesse Shot</span></p>'
+        '</div>'
+        '</div>'
+        '<div class="attribute">'
+        '<p><label>Best position</label> <span class="pos pos25">ST</span></p>'
+        '<p><label>Best overall</label> <em title="93">93</em></p>'
+        '</div>'
+        '</body></html>'
+    )
+
+    # Player page with only the profile header — every extra must degrade to None.
+    _BARE_HTML = (
+        '<html><body>'
+        '<div class="profile"><h1>Bare Player</h1></div>'
+        '</body></html>'
+    )
+
+    def _read_one(self, reader, tmp_path, html):
+        import io as _io
+
+        import pandas as pd
+
+        reader.data_dir = tmp_path
+        reader.versions = pd.DataFrame([{'update': 'Jun 2 2026'}], index=[260035])
+        reader.get = MagicMock(
+            side_effect=lambda *a, **k: _io.BytesIO(html.encode('utf-8'))
+        )
+        return reader.read_player_ratings(player=[12345])
+
+    def test_star_ratings_extracted(self, reader, tmp_path):
+        row = self._read_one(reader, tmp_path, self._PLAYER_HTML).iloc[0]
+        assert row['weak_foot'] == 4
+        assert row['skill_moves'] == 5
+        assert row['international_reputation'] == 3
+        # preferred_foot must not be polluted by the star numbers (#663)
+        assert row['preferred_foot'] == 'Right'
+
+    def test_text_profile_fields_extracted(self, reader, tmp_path):
+        row = self._read_one(reader, tmp_path, self._PLAYER_HTML).iloc[0]
+        assert row['body_type'] == 'Unique'
+        assert row['real_face'] == 'Yes'
+
+    def test_best_position_and_overall(self, reader, tmp_path):
+        row = self._read_one(reader, tmp_path, self._PLAYER_HTML).iloc[0]
+        assert row['best_position'] == 'ST'
+        assert row['best_overall'] == 93
+
+    def test_tag_lists_flattened(self, reader, tmp_path):
+        row = self._read_one(reader, tmp_path, self._PLAYER_HTML).iloc[0]
+        assert row['playstyles'] == 'Quick Step +, Finesse Shot'
+        # leading '#' stripped from specialities
+        assert row['specialities'] == 'Speedster, Dribbler'
+
+    def test_missing_blocks_degrade_to_none(self, reader, tmp_path):
+        import pandas as pd
+
+        row = self._read_one(reader, tmp_path, self._BARE_HTML).iloc[0]
+        for col in (
+            'weak_foot', 'skill_moves', 'international_reputation',
+            'body_type', 'real_face', 'best_position', 'best_overall',
+            'playstyles', 'specialities',
+        ):
+            assert pd.isna(row[col]), f"{col} must be None on a bare page"
+
+
 class TestReadTeamRatingsParsing:
     """#601: read_team_ratings must scrape only the 8 columns sofifa.com still
     renders on the FC 26 team page and never emit the 15 dead-tactics columns
@@ -417,6 +510,15 @@ class TestReadTeamRatingsParsing:
         assert 'showCol[]=oa' in url and 'showCol[]=sa' in url
         assert 'showCol[]=bs' not in url  # build_up_speed
         assert 'showCol[]=ip' not in url  # international_prestige
+
+    def test_cache_file_distinct_from_read_teams(self, reader, tmp_path):
+        """The showCol page must NOT share upstream's ``teams_{}_{}.html``
+        cache name — read_teams caches the plain listing there first, and a
+        shared name silently feeds this method the wrong page."""
+        self._prime(reader, tmp_path)
+        reader.read_team_ratings()
+        filepath = reader.get.call_args.args[1]
+        assert filepath.name == 'team_ratings_13_260035.html'
 
 
 # Post-EA-FC homepage: the edition/roster pickers moved to id-based <select>s

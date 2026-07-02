@@ -51,6 +51,11 @@ x-airflow-common: &airflow-common
     - ./scrapers:/opt/airflow/scrapers
     - ./scripts:/opt/airflow/scripts
     - ./proxys.txt:/opt/airflow/proxys.txt:ro
+    # soccerdata page cache (SoFIFA et al.): survives container recreation so
+    # a task retry / redeploy mid long crawl (~546 player pages) reuses cached
+    # pages instead of refetching. Files are keyed by sofifa version_id, so
+    # the cache never goes stale by content.
+    - soccerdata_cache:/home/airflow/soccerdata
   networks:
     - frontend
     - backend
@@ -520,11 +525,14 @@ services:
     deploy:
       resources:
         limits:
-          memory: 4G
+          # 4G OOM-killed a long sofifa backfill run (python rss ~3G after 5h
+          # of FS-crashloop retries + scheduler ~0.8G, dmesg 2026-07-02).
+          # 8G gives console-run scrapers headroom next to the scheduler.
+          memory: 8G
         reservations:
           memory: 1G
     # Swap as safety buffer for memory spikes (matches the limit above).
-    memswap_limit: 6G
+    memswap_limit: 10G
 
   airflow-webserver:
     <<: *airflow-common
@@ -943,9 +951,13 @@ services:
     deploy:
       resources:
         limits:
-          memory: 512M
+          # 512M held Chromium in a permanent memcg-OOM crashloop during long
+          # sofifa/whoscored crawls (dmesg 2026-07-02: chromium killed every
+          # ~60s → «tab crashed» storm, ~60s/page). 2G keeps one browser +
+          # session churn comfortably below the ceiling.
+          memory: 2G
         reservations:
-          memory: 256M
+          memory: 512M
     networks:
       - backend
 
@@ -1016,6 +1028,8 @@ networks:
 # Volumes
 # =============================================================================
 volumes:
+  soccerdata_cache:
+    name: soccerdata_cache
   namenode_data:
     name: namenode_data
   datanode1_data:
