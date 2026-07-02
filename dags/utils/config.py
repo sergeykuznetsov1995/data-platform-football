@@ -110,12 +110,15 @@ MIN_ROW_THRESHOLDS: Dict[str, int] = {
     'understat_shots': 8000,               # ~9.8k shots/season - 20% margin
     'understat_team_match_stats': 340,     # 380 team-match rows/season - 10%
     'understat_player_match_stats': 10_000,  # ~11.1k rows/season - 10% margin
-    'sofifa_players': 450,                 # 546 players / APL edition - 18%
-    'sofifa_teams': 18,                    # 20 APL clubs - 10%
-    'sofifa_team_ratings': 18,             # 20 APL clubs - 10%
+    # sofifa_*: масштабируются от len(LEAGUES) — ~546 игроков и 20 клубов на
+    # лигу за edition; иначе при добавлении лиг floor перестаёт защищать
+    # (остаётся в N раз ниже нормы). sofifa_versions от лиг не зависит.
+    'sofifa_players': 450 * len(LEAGUES),        # 546 players / league edition - 18%
+    'sofifa_teams': 18 * len(LEAGUES),           # 20 clubs / league - 10%
+    'sofifa_team_ratings': 18 * len(LEAGUES),    # 20 clubs / league - 10%
     'sofifa_versions': 15,                 # ~20 editions (FIFA 07→FC 26) on post-EA-FC homepage (#654/#670); +1/yr
-    'sofifa_leagues': 1,                   # 1-row lookup (APL-only scope)
-    'sofifa_player_ratings': 450,          # 546 per-player pages / edition - 18%
+    'sofifa_leagues': len(LEAGUES),              # 1 lookup row per league
+    'sofifa_player_ratings': 450 * len(LEAGUES),  # 546 per-player pages / league edition - 18%
 }
 
 # Tags for DAG organization
