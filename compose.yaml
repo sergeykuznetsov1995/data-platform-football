@@ -45,6 +45,8 @@ x-airflow-common: &airflow-common
     # E1 medallion config: team_aliases.yaml + competitions.yaml — read-only
     # for utils/medallion_config.py (default CONFIG_DIR=/opt/airflow/configs/medallion)
     - ./configs/medallion:/opt/airflow/configs/medallion:ro
+    # SSO-конфиг: читает только webserver, scheduler игнорирует (фаза 6)
+    - ./configs/airflow/webserver_config.py:/opt/airflow/webserver_config.py:ro
     - ./scrapers:/opt/airflow/scrapers
     - ./scripts:/opt/airflow/scripts
     - ./proxys.txt:/opt/airflow/proxys.txt:ro
@@ -370,6 +372,14 @@ services:
     environment:
       <<: *airflow-common-env
       AIRFLOW__WEBSERVER__WORKERS: "2"
+      # SSO через Keycloak (webserver_config.py); false = обычная форма логина
+      AIRFLOW_OAUTH_ENABLED: ${AIRFLOW_OAUTH_ENABLED:-false}
+      AIRFLOW_OIDC_CLIENT_SECRET: ${AIRFLOW_OIDC_CLIENT_SECRET:-}
+      OIDC_ISSUER: https://${TS_HOSTNAME:-unset}:8443/realms/football
+      # За Caddy: доверять X-Forwarded-* (иначе redirect_uri будет http://)
+      AIRFLOW__WEBSERVER__ENABLE_PROXY_FIX: "true"
+      # 2 gunicorn-воркера по ~550MB RSS (с SSO) — в 1G ловили memcg-OOM
+      # (тихий kill воркеров, 502 за Caddy; паттерн #847). Лимит ниже — 2G.
     depends_on:
       airflow-init:
         condition: service_completed_successfully
@@ -383,7 +393,7 @@ services:
     deploy:
       resources:
         limits:
-          memory: 1G
+          memory: 2G
         reservations:
           memory: 512M
     memswap_limit: 2G
@@ -410,6 +420,9 @@ services:
       # Referenced as ${ENV:S3_ACCESS_KEY} / ${ENV:S3_SECRET_KEY} in iceberg.properties.
       - S3_ACCESS_KEY=${S3_ACCESS_KEY}
       - S3_SECRET_KEY=${S3_SECRET_KEY}
+      # OAuth2 (SSO людей через Keycloak; машинные аккаунты — по-прежнему password.db)
+      - TRINO_OIDC_CLIENT_SECRET=${TRINO_OIDC_CLIENT_SECRET}
+      - TRINO_OAUTH2_ISSUER=https://${TS_HOSTNAME}:8443/realms/football
     ports:
       - "127.0.0.1:8082:8443"
       - "[::1]:8082:8443"
@@ -483,11 +496,16 @@ services:
       SUPERSET_ADMIN_PASSWORD: ${SUPERSET_ADMIN_PASSWORD}
       TRINO_SUPERSET_PASSWORD: ${TRINO_SUPERSET_PASSWORD}
       PYTHONPATH: /app/pythonpath:/app/pythonpath_dev
+      # SSO через Keycloak (superset_config.py); false = обычная форма логина
+      SUPERSET_OAUTH_ENABLED: ${SUPERSET_OAUTH_ENABLED:-false}
+      SUPERSET_OIDC_CLIENT_SECRET: ${SUPERSET_OIDC_CLIENT_SECRET:-}
+      OIDC_ISSUER: https://${TS_HOSTNAME:-unset}:8443/realms/football
     volumes:
       - ./configs/superset/superset_config.py:/app/pythonpath/superset_config.py:ro
       - ./configs/superset/bootstrap.sh:/app/pythonpath/bootstrap.sh:ro
       - ./configs/superset/datasources.yaml:/app/pythonpath/datasources.yaml:ro
       - ./configs/superset/import_datasources.py:/app/pythonpath/import_datasources.py:ro
+      - ./configs/superset/create_analyst_role.py:/app/pythonpath/create_analyst_role.py:ro
       - ./configs/superset/dashboards:/app/pythonpath/dashboards:ro
       - superset_home:/app/superset_home
     restart: unless-stopped
@@ -537,6 +555,7 @@ services:
       - ./configs/superset/bootstrap.sh:/app/pythonpath/bootstrap.sh:ro
       - ./configs/superset/datasources.yaml:/app/pythonpath/datasources.yaml:ro
       - ./configs/superset/import_datasources.py:/app/pythonpath/import_datasources.py:ro
+      - ./configs/superset/create_analyst_role.py:/app/pythonpath/create_analyst_role.py:ro
       - ./configs/superset/dashboards:/app/pythonpath/dashboards:ro
       - superset_home:/app/superset_home
     restart: unless-stopped
@@ -579,6 +598,7 @@ services:
       - ./configs/superset/bootstrap.sh:/app/pythonpath/bootstrap.sh:ro
       - ./configs/superset/datasources.yaml:/app/pythonpath/datasources.yaml:ro
       - ./configs/superset/import_datasources.py:/app/pythonpath/import_datasources.py:ro
+      - ./configs/superset/create_analyst_role.py:/app/pythonpath/create_analyst_role.py:ro
       - ./configs/superset/dashboards:/app/pythonpath/dashboards:ro
       - superset_home:/app/superset_home
     restart: unless-stopped
@@ -875,6 +895,161 @@ services:
     networks:
       - backend
 
+  # ---------------------------------------------------------------------------
+  # Caddy: вход для аналитиков через tailnet (docs/design/analyst-access.md).
+  # Порты публикуются ТОЛЬКО на ${TS_IP} (tailscale-интерфейс) — из интернета
+  # недоступно; все 127.0.0.1-биндинги сервисов остаются для SSH-туннелей.
+  # Alias = tailnet-FQDN: контейнеры резолвят тот же URL, что и ноутбуки (OIDC).
+  # ---------------------------------------------------------------------------
+  caddy:
+    image: caddy:2.10-alpine
+    container_name: caddy
+    hostname: caddy
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+    networks:
+      frontend:
+        aliases:
+          - ${TS_HOSTNAME:-caddy-alias-unset}
+      # В сети ноутбуков Caddy — единственный «выход наружу»: через его alias
+      # юзер-контейнеры ходят в Trino (:8444) и Keycloak (:8443)
+      analyst:
+        aliases:
+          - ${TS_HOSTNAME:-caddy-alias-unset}
+    ports:
+      - "${TS_IP:?}:443:443"
+      - "${TS_IP:?TS_IP not set — tailscale ip -4}:8081:8081"
+      - "${TS_IP:?}:8088:8088"
+      - "${TS_IP:?}:8443:8443"
+      - "${TS_IP:?}:8444:8444"
+      - "${TS_IP:?}:8585:8585"
+    environment:
+      TS_HOSTNAME: ${TS_HOSTNAME:?TS_HOSTNAME not set — tailscale status --json .Self.DNSName}
+    volumes:
+      - ./configs/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - /var/run/tailscale/tailscaled.sock:/var/run/tailscale/tailscaled.sock
+      - caddy_data:/data
+      - caddy_config:/config
+    restart: unless-stopped
+    healthcheck:
+      # именно 127.0.0.1: busybox-wget резолвит localhost в ::1, а admin-порт
+      # caddy слушает только IPv4 -> ложный unhealthy
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:2019/config/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+        reservations:
+          memory: 64M
+
+  # ---------------------------------------------------------------------------
+  # Keycloak: единый вход (SSO) для аналитиков (docs/design/analyst-access.md).
+  # Люди логинятся через него; машинные аккаунты (password.db, локальные админы)
+  # от Keycloak НЕ зависят — его падение не трогает пайплайны.
+  # База keycloak в общем postgres: на живом проде создать scripts/create_keycloak_db.sh
+  # (init-databases.sh выполняется только на свежем томе).
+  # Перед первым запуском: make render-keycloak-realm (иначе docker создаст
+  # ПАПКУ вместо файла realm-football.json и импорт сломается).
+  # ---------------------------------------------------------------------------
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.3
+    container_name: keycloak
+    hostname: keycloak
+    command: ["start", "--import-realm"]
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - frontend
+      - backend
+    ports:
+      - "127.0.0.1:8180:8080"
+    environment:
+      KC_DB: postgres
+      KC_DB_URL: jdbc:postgresql://postgres:5432/keycloak
+      KC_DB_USERNAME: keycloak
+      KC_DB_PASSWORD: ${KEYCLOAK_DB_PASSWORD:?}
+      KC_HOSTNAME: https://${TS_HOSTNAME:?}:8443
+      KC_HTTP_ENABLED: "true"
+      KC_PROXY_HEADERS: xforwarded
+      KC_HEALTH_ENABLED: "true"
+      KC_BOOTSTRAP_ADMIN_USERNAME: ${KC_BOOTSTRAP_ADMIN_USERNAME:-admin}
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${KC_BOOTSTRAP_ADMIN_PASSWORD:?}
+      # JVM-готча проекта: heap ≤ 50-70% cgroup-лимита, иначе тихий OOM-kill
+      JAVA_OPTS_KC_HEAP: "-Xms256m -Xmx512m"
+    volumes:
+      - ./configs/keycloak/realm-football.json:/opt/keycloak/data/import/realm-football.json:ro
+    restart: unless-stopped
+    healthcheck:
+      # в образе нет curl/wget; health-эндпоинты на management-порту 9000
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/9000 && printf 'GET /health/ready HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n' >&3 && grep -q UP <&3"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 90s
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+        reservations:
+          memory: 256M
+
+  # ---------------------------------------------------------------------------
+  # JupyterHub: ноутбуки аналитиков (docs/design/analyst-access.md, фаза 5).
+  # Вход через Keycloak; на юзера — свой контейнер (2G/2cpu) в сети dp-analyst,
+  # из которой видны только hub и Caddy (не postgres/lakekeeper/seaweedfs).
+  # docker.sock нужен DockerSpawner'у (осознанный риск v1, см. риск-регистр).
+  # ---------------------------------------------------------------------------
+  jupyterhub:
+    image: data-platform/jupyterhub:5.3
+    build:
+      context: ./docker/images/jupyterhub
+      dockerfile: Dockerfile
+    container_name: jupyterhub
+    hostname: jupyterhub
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    networks:
+      - frontend
+      - analyst
+    environment:
+      TS_HOSTNAME: ${TS_HOSTNAME:?}
+      OIDC_ISSUER: https://${TS_HOSTNAME:?}:8443/realms/football
+      JUPYTERHUB_OIDC_CLIENT_SECRET: ${JUPYTERHUB_OIDC_CLIENT_SECRET:?}
+      TRINO_ANALYST_SVC_PASSWORD: ${TRINO_ANALYST_SVC_PASSWORD:?}
+    command: ["jupyterhub", "-f", "/srv/jupyterhub/jupyterhub_config.py"]
+    volumes:
+      - ./configs/jupyterhub/jupyterhub_config.py:/srv/jupyterhub/jupyterhub_config.py:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+      - jupyterhub_data:/srv/jupyterhub
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/hub/health', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 128M
+
 # =============================================================================
 # Networks
 # =============================================================================
@@ -891,6 +1066,11 @@ networks:
   storage:
     driver: bridge
     name: dp-storage
+  # Analyst: JupyterHub + юзер-контейнеры + Caddy (alias). Изолирована от
+  # postgres/redis/lakekeeper/seaweedfs — ноутбуки ходят только через Caddy.
+  analyst:
+    driver: bridge
+    name: dp-analyst
 
 # =============================================================================
 # Volumes
@@ -908,3 +1088,9 @@ volumes:
     name: superset_home
   opensearch_data:
     name: opensearch_data
+  caddy_data:
+    name: caddy_data
+  caddy_config:
+    name: caddy_config
+  jupyterhub_data:
+    name: jupyterhub_data
