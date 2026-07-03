@@ -500,6 +500,10 @@ services:
       SUPERSET_OAUTH_ENABLED: ${SUPERSET_OAUTH_ENABLED:-false}
       SUPERSET_OIDC_CLIENT_SECRET: ${SUPERSET_OIDC_CLIENT_SECRET:-}
       OIDC_ISSUER: https://${TS_HOSTNAME:-unset}:8443/realms/football
+      # ~100 юзеров (issue #861): дефолт образа — 1 gunicorn-воркер.
+      # 4 воркера x gthread; лимит памяти ниже поднят 1500M -> 3G
+      # (правило #847: воркеры ~400-500M RSS каждый, тихий memcg-OOM)
+      SERVER_WORKER_AMOUNT: "4"
     volumes:
       - ./configs/superset/superset_config.py:/app/pythonpath/superset_config.py:ro
       - ./configs/superset/bootstrap.sh:/app/pythonpath/bootstrap.sh:ro
@@ -518,7 +522,7 @@ services:
     deploy:
       resources:
         limits:
-          memory: 1500M
+          memory: 3G
         reservations:
           memory: 512M
 

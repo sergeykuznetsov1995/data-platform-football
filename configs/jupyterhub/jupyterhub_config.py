@@ -1,6 +1,6 @@
 # JupyterHub для аналитиков (docs/design/analyst-access.md, фаза 5).
 # Вход через Keycloak (группа analysts), у каждого юзера свой контейнер
-# (2G/2cpu) в изолированной сети dp-analyst с персональным томом.
+# (1G/1cpu) в изолированной сети dp-analyst с персональным томом.
 import os
 import sys
 
@@ -16,8 +16,9 @@ c.JupyterHub.hub_ip = "0.0.0.0"
 c.JupyterHub.hub_connect_ip = "jupyterhub"
 c.JupyterHub.db_url = "sqlite:////srv/jupyterhub/jupyterhub.sqlite"
 c.JupyterHub.cookie_secret_file = "/srv/jupyterhub/jupyterhub_cookie_secret"
-# Защита RAM: не больше 6 одновременно работающих ноутбуков (6 x 2G)
-c.JupyterHub.active_server_limit = 6
+# Защита RAM: не больше 12 одновременно работающих ноутбуков (12 x 1G).
+# Jupyter — инструмент продвинутых (~10-20 из ~100 юзеров); остальным Superset.
+c.JupyterHub.active_server_limit = 12
 
 # --- Вход через Keycloak -----------------------------------------------------
 from oauthenticator.generic import GenericOAuthenticator  # noqa: E402
@@ -44,8 +45,8 @@ c.JupyterHub.spawner_class = DockerSpawner
 c.DockerSpawner.image = "data-platform/jupyter-singleuser:latest"
 c.DockerSpawner.network_name = "dp-analyst"
 c.DockerSpawner.remove = True
-c.DockerSpawner.mem_limit = "2G"
-c.DockerSpawner.cpu_limit = 2
+c.DockerSpawner.mem_limit = "1G"
+c.DockerSpawner.cpu_limit = 1
 c.DockerSpawner.notebook_dir = "/home/jovyan/work"
 c.DockerSpawner.volumes = {"jupyterhub-user-{username}": "/home/jovyan/work"}
 # Подключение к Trino из ноутбуков: через Caddy (доверенный серт), общий
@@ -58,7 +59,7 @@ c.DockerSpawner.environment = {
     "TRINO_PASSWORD": os.environ["TRINO_ANALYST_SVC_PASSWORD"],
 }
 
-# --- Idle-culler: гасим ноутбуки без активности час --------------------------
+# --- Idle-culler: гасим ноутбуки без активности 30 минут ---------------------
 c.JupyterHub.load_roles = [
     {
         "name": "idle-culler-role",
@@ -69,6 +70,6 @@ c.JupyterHub.load_roles = [
 c.JupyterHub.services = [
     {
         "name": "idle-culler",
-        "command": [sys.executable, "-m", "jupyterhub_idle_culler", "--timeout=3600"],
+        "command": [sys.executable, "-m", "jupyterhub_idle_culler", "--timeout=1800"],
     }
 ]
