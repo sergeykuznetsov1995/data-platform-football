@@ -132,6 +132,14 @@ fct_player_match:
       - {src: understat, expr: "us.xa"}
       - {src: fotmob,    expr: "fm.xa"}
       - {src: sofascore, expr: "ss.xa"}
+  # rating: обе шкалы 0.1–10.0 (Opta-derived у SofaScore, собственная у FotMob).
+  # SofaScore primary; FotMob-fallback закрывает сезоны с дырами xref(sofascore)
+  # (R5: 1718 покрытие 11%, 2425 — 33% при ~94% заполненности fm.rating с 1617).
+  rating:
+    wrap: "ROUND({coalesce}, 2)"
+    sources:
+      - {src: sofascore, expr: "ss.rating"}
+      - {src: fotmob,    expr: "fm.rating"}
   key_passes:
     wrap: "CAST({coalesce} AS BIGINT)"
     sources:

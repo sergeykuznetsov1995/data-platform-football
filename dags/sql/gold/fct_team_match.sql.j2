@@ -35,9 +35,9 @@
 --   * xref_team.season is slug '2526' for all sources after #404; dim_match.season
 --     is slug too — bridge JOINs are slug = slug (no LPAD/MOD conversion needed).
 --   * silver.whoscored_team_match.team_id is NUMERIC varchar ('16'), xref source_id
---     is NAME ('Liverpool'). Bridge via bronze.whoscored_schedule (numeric+name pair)
---     is populated only for season='2021' — WS block is intentionally NULL for current
---     seasons until issue #120 lands canonical resolution in Silver.
+--     is NAME ('Liverpool'). Bridge via bronze.whoscored_schedule (numeric+name pair).
+--     R5 (2026-07-03): schedule заполнен для всех сезонов 1617–2526 — WS-блок живой
+--     (~100% заполненность ws-only метрик в gold); старое «only season='2021'» неактуально.
 --   * FotMob xref_team/xref_match.season is slug '2526' after #404 (bronze.fotmob_schedule
 --     season is still bigint year-start), matching silver.fotmob_team_match.season —
 --     bridge JOINs are slug = slug.
@@ -147,10 +147,10 @@ xref_match_fm AS (
 
 -- ===== WS team_id NUMERIC ↔ NAME bridge =====
 -- silver.whoscored_team_match.team_id is numeric ('16'); xref_team.source_id is
--- name ('Liverpool'). bronze.whoscored_schedule has both fields per row but is
--- populated only for season='2021'. For other seasons this CTE returns 0 rows
--- and the LEFT JOIN below leaves the WS block as NULL — acceptable per #95
--- decision (see CLAUDE.md / feedback_whoscored_team_id_numeric_vs_xref_name.md).
+-- name ('Liverpool'). bronze.whoscored_schedule has both fields per row.
+-- R5 (2026-07-03): schedule заполнен для всех сезонов 1617–2526 (home_team_id
+-- 100%), мост работает во всех сезонах; старая оговорка «only season='2021'»
+-- (#95) неактуальна после бэкфила whoscored_schedule.
 ws_team_name_bridge AS (
     SELECT DISTINCT
         CAST(CAST(home_team_id AS BIGINT) AS varchar) AS ws_team_id_numeric,
