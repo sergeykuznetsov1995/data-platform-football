@@ -38,6 +38,14 @@ Public API contract (frozen for T2/T3)
 The signatures above are the only thing T2/T3 may rely on. Internal
 helpers (``_escape_sql_string``, ``_iter_team_aliases``) may change
 without warning.
+
+TODO(multi-league): every ``*_in_scope`` / ``_iter_*_aliases`` helper
+defaults a missing ``competition_scope`` to ``['ENG-Premier League']`` —
+a silent APL fallback that becomes a trap the moment a second league is
+in scope (an unscoped alias would leak into ALL leagues as APL-only, or
+worse, be assumed APL when meant for the new league). Before onboarding
+league #2, make ``competition_scope`` MANDATORY in the YAML schema
+validators and drop the ``or ['ENG-Premier League']`` defaults.
 """
 
 from __future__ import annotations

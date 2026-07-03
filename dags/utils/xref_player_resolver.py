@@ -151,22 +151,32 @@ SOURCES: Tuple[str, ...] = (
 #: our per-row payload size (~150 bytes).
 DEFAULT_CHUNK_SIZE = 500
 
-#: Known APL 2024-25 pairs the resolver MUST resolve to a single
-#: canonical_id across all three sources. Pulled from R2 spike — hard-coded
+#: Known pairs per league that the resolver MUST resolve to a single
+#: canonical_id across the core sources. Pulled from the R2 spike — hard-coded
 #: rather than configurable so a regression in alias or threshold tuning
 #: surfaces immediately. Kept in sync with ``scripts/r2_resolver_proto.py``
-#: (KNOWN_PAIRS at the bottom).
+#: (KNOWN_PAIRS at the bottom). A league with NO entry here SKIPS the
+#: regression gate with a WARNING (multi-league prep) — add anchors when a
+#: league is onboarded, do not fail it on an empty anchor set.
+KNOWN_PAIRS_BY_LEAGUE: Dict[str, Tuple[Tuple[str, str], ...]] = {
+    'ENG-Premier League': (
+        ('Bukayo Saka', 'fb_bc7dc64d'),
+        ('Mohamed Salah', 'fb_e342ad68'),
+        ('Erling Haaland', 'fb_1f44ac21'),
+        ('Bruno Fernandes', 'fb_507c7bdf'),
+        ('Rodri', 'fb_6434f10d'),
+        ('Son Heung-min', 'fb_92e7e919'),
+        ('Virgil van Dijk', 'fb_e06683ca'),
+        ('Cole Palmer', 'fb_dc7f8a28'),
+        ('Bruno Guimarães', 'fb_82518f62'),
+        ('Joško Gvardiol', 'fb_5ad50391'),
+    ),
+}
+
+#: Back-compat alias — the APL anchor set (tests and the proto script refer
+#: to the flat tuple).
 KNOWN_PAIRS: Tuple[Tuple[str, str], ...] = (
-    ('Bukayo Saka', 'fb_bc7dc64d'),
-    ('Mohamed Salah', 'fb_e342ad68'),
-    ('Erling Haaland', 'fb_1f44ac21'),
-    ('Bruno Fernandes', 'fb_507c7bdf'),
-    ('Rodri', 'fb_6434f10d'),
-    ('Son Heung-min', 'fb_92e7e919'),
-    ('Virgil van Dijk', 'fb_e06683ca'),
-    ('Cole Palmer', 'fb_dc7f8a28'),
-    ('Bruno Guimarães', 'fb_82518f62'),
-    ('Joško Gvardiol', 'fb_5ad50391'),
+    KNOWN_PAIRS_BY_LEAGUE['ENG-Premier League']
 )
 
 #: Below this pass-rate the resolver raises ResolverError. 8/10 is the
@@ -2278,6 +2288,7 @@ _KNOWN_PAIR_EXT_SOURCES = frozenset({'fbref', 'sofascore', 'fotmob'})
 def _verify_known_pairs(
     rows: List[Dict[str, Any]],
     required_sources: frozenset = _KNOWN_PAIR_CORE_SOURCES,
+    pairs: Optional[Tuple[Tuple[str, str], ...]] = None,
 ) -> Tuple[int, int]:
     """Return (passed, total). A pair "passes" iff the expected canonical_id
     appears with at least one row from each of ``required_sources``.
@@ -2287,17 +2298,21 @@ def _verify_known_pairs(
 
     The default (core) source set is the hard ResolverError gate; the
     extended set (:data:`_KNOWN_PAIR_EXT_SOURCES`) is evaluated WARNING-only
-    by :func:`run_resolver`.
+    by :func:`run_resolver`. ``pairs`` defaults to the APL anchor set
+    (:data:`KNOWN_PAIRS`); :func:`run_resolver` passes the league-scoped set
+    from :data:`KNOWN_PAIRS_BY_LEAGUE`.
     """
+    if pairs is None:
+        pairs = KNOWN_PAIRS
     by_cid: Dict[str, set] = {}
     for r in rows:
         by_cid.setdefault(r['canonical_id'], set()).add(r['source'])
     passed = 0
-    for _, expected_cid in KNOWN_PAIRS:
+    for _, expected_cid in pairs:
         sources = by_cid.get(expected_cid, set())
         if required_sources <= sources:
             passed += 1
-    return passed, len(KNOWN_PAIRS)
+    return passed, len(pairs)
 
 
 # ---------------------------------------------------------------------------
@@ -2398,23 +2413,32 @@ def run_resolver(
     drop_before_insert: bool = True,
     review_table: str = DEFAULT_REVIEW_TABLE,
     materialize_review: bool = True,
+    write_mode: str = 'rebuild',
 ) -> Dict[str, Any]:
     """Full pipeline: read 5 Bronze sources -> resolve -> write Iceberg.
 
     Args:
         target_table: Fully-qualified Iceberg table for the canonical
             xref_player rows.
-        league: League id from ``competitions.yaml``. Currently only
-            ``ENG-Premier League`` is in scope (E1 baseline).
+        league: League id from ``competitions.yaml``. The APL default is a
+            CLI/debug convenience only — the DAG always passes the league
+            explicitly (it loops over ``get_in_scope_competitions()``).
         seasons: List of season slugs (e.g. ``[2425]`` for 2024-25). Use
             slug format (``yyXX``), NOT year-of-start. ``None`` means
             "all configured seasons for ``league``" pulled from
             ``competitions.yaml``.
         chunk_size: Rows per ``INSERT VALUES`` batch.
-        drop_before_insert: If True (default), full rebuild semantics —
-            DROP TABLE + CREATE + INSERT. Set False only if you want to
-            run the resolver as a smoke-test without rewriting Iceberg
-            (mostly useful in dual-run validation).
+        drop_before_insert: If True (default), the Iceberg tables are
+            (re)written according to ``write_mode``. Set False only if you
+            want to run the resolver as a smoke-test without touching
+            Iceberg at all (mostly useful in dual-run validation).
+        write_mode: ``'rebuild'`` (default) — DROP TABLE + CREATE + INSERT,
+            the historical single-league semantics. ``'replace_league'`` —
+            ``DELETE FROM <table> WHERE league = <league>`` + INSERT, so a
+            multi-league loop can materialise league N without erasing
+            league N-1 (the DAG uses rebuild for the first league of a run
+            and replace_league for the rest). Only consulted when
+            ``drop_before_insert`` is True.
         review_table: Fully-qualified Iceberg table for the Fellegi-Sunter
             clerical-review band rows.
         materialize_review: If True (default), DROP+CREATE+INSERT the
@@ -2449,6 +2473,11 @@ def run_resolver(
             < KNOWN_PAIR_MIN_PASS (8/10).
     """
     from datetime import datetime, timezone
+
+    if write_mode not in ('rebuild', 'replace_league'):
+        raise ValueError(
+            f"write_mode must be 'rebuild' or 'replace_league', got {write_mode!r}"
+        )
 
     started = time.time()
     detected_at = datetime.now(tz=timezone.utc)
@@ -2557,38 +2586,77 @@ def run_resolver(
         # touching the Iceberg table.
         # Bind to dedicated names so the per-source `total` rebind below
         # cannot shadow these (was a real bug — summary showed e.g. "10/491").
-        known_passed, known_total = _verify_known_pairs(rows)
-        if known_passed < KNOWN_PAIR_MIN_PASS:
-            raise ResolverError(
-                f"Known-pair regression: {known_passed}/{known_total} passed, "
-                f"target ≥{KNOWN_PAIR_MIN_PASS}/{known_total}. "
-                "Inspect alias YAML / threshold tuning before retrying."
-            )
-
-        # Extended gate (FBref+SofaScore+FotMob) — WARNING-only for now, see
-        # KNOWN_PAIR_EXT_MIN_PASS. Never aborts the run.
-        ext_passed, ext_total = _verify_known_pairs(
-            rows, required_sources=_KNOWN_PAIR_EXT_SOURCES
-        )
-        if ext_passed < KNOWN_PAIR_EXT_MIN_PASS:
+        league_pairs = KNOWN_PAIRS_BY_LEAGUE.get(league)
+        if not league_pairs:
+            # Multi-league prep: a league without curated anchors SKIPS the
+            # gate (WARNING) instead of failing — curate anchors when the
+            # league's data settles, then this branch stops firing.
             logger.warning(
-                "Extended known-pair gate (fbref+sofascore+fotmob): %d/%d "
-                "passed, soft target ≥%d/%d — NOT failing the run "
-                "(WARNING-only gate).",
-                ext_passed, ext_total, KNOWN_PAIR_EXT_MIN_PASS, ext_total,
+                "No known-pair anchors configured for league=%r — "
+                "regression gate SKIPPED this run.", league,
             )
+            known_passed = known_total = None
+            ext_passed = ext_total = None
+        else:
+            known_passed, known_total = _verify_known_pairs(
+                rows, pairs=league_pairs
+            )
+            if known_passed < KNOWN_PAIR_MIN_PASS:
+                raise ResolverError(
+                    f"Known-pair regression: {known_passed}/{known_total} passed, "
+                    f"target ≥{KNOWN_PAIR_MIN_PASS}/{known_total}. "
+                    "Inspect alias YAML / threshold tuning before retrying."
+                )
+
+            # Extended gate (FBref+SofaScore+FotMob) — WARNING-only for now,
+            # see KNOWN_PAIR_EXT_MIN_PASS. Never aborts the run.
+            ext_passed, ext_total = _verify_known_pairs(
+                rows, required_sources=_KNOWN_PAIR_EXT_SOURCES,
+                pairs=league_pairs,
+            )
+            if ext_passed < KNOWN_PAIR_EXT_MIN_PASS:
+                logger.warning(
+                    "Extended known-pair gate (fbref+sofascore+fotmob): %d/%d "
+                    "passed, soft target ≥%d/%d — NOT failing the run "
+                    "(WARNING-only gate).",
+                    ext_passed, ext_total, KNOWN_PAIR_EXT_MIN_PASS, ext_total,
+                )
 
         rows_inserted = 0
         review_inserted = 0
         if drop_before_insert:
-            logger.info("Rewriting Iceberg target %s ...", target_table)
-            _create_target_table(conn, target_table)
+            if write_mode == 'replace_league':
+                # Multi-league loop: erase only THIS league's partition so
+                # previously-materialised leagues survive the INSERT below.
+                logger.info(
+                    "Replacing league partition %r in %s ...",
+                    league, target_table,
+                )
+                _execute(
+                    conn,
+                    f"DELETE FROM {target_table} "
+                    f"WHERE league = '{_sql_escape(league)}'",
+                )
+            else:
+                logger.info("Rewriting Iceberg target %s ...", target_table)
+                _create_target_table(conn, target_table)
             rows_inserted = _insert_rows(conn, target_table, rows, chunk_size)
             logger.info("  inserted %d rows into %s", rows_inserted, target_table)
 
             if materialize_review:
-                logger.info("Rewriting Iceberg review %s ...", review_table)
-                _create_review_table(conn, review_table)
+                if write_mode == 'replace_league':
+                    logger.info(
+                        "Replacing league partition %r in %s ...",
+                        league, review_table,
+                    )
+                    _execute(
+                        conn,
+                        f"DELETE FROM {review_table} "
+                        f"WHERE league = '{_sql_escape(league)}'",
+                    )
+                else:
+                    logger.info("Rewriting Iceberg review %s ...", review_table)
+                    _create_review_table(conn, review_table)
                 if review_rows:
                     review_inserted = _insert_review_rows(
                         conn, review_table, review_rows, chunk_size
@@ -2634,8 +2702,14 @@ def run_resolver(
         'review_inserted': review_inserted,
         'per_source': per_source,
         'dedup_removed_per_source': dedup_removed,
-        'known_pair_pass_rate': f"{known_passed}/{known_total}",
-        'known_pair_pass_rate_ext': f"{ext_passed}/{ext_total}",
+        'known_pair_pass_rate': (
+            'skipped' if known_passed is None
+            else f"{known_passed}/{known_total}"
+        ),
+        'known_pair_pass_rate_ext': (
+            'skipped' if ext_passed is None
+            else f"{ext_passed}/{ext_total}"
+        ),
         'dob': {
             'candidates_with_dob': candidates_with_dob,
             'canonical_dob_map': dob_stats.get('canonical_dob_map', 0),
