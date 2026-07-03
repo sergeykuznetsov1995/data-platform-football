@@ -106,6 +106,8 @@
 --                                       --   (own_goal — deviation from design §4.3, kept for
 --                                       --    shooter attribution; design doc amended)
 --   is_goal                  boolean    -- result IN ('goal','own_goal')
+--   is_sot                   boolean    -- удар в створ: result IN ('goal','saved')
+--                                       --   (конвенция silver.sofascore_shots; R5)
 --   shot_source              varchar    -- 'understat_v1' (primary) | 'sofascore_v1' (fallback)
 --   shot_version             varchar    -- literal 'v1'
 --   league                   varchar
@@ -248,6 +250,9 @@ understat_final AS (
 
         sn.result,
         sn.is_goal,
+        -- is_sot: конвенция silver.sofascore_shots (goal|save = on target);
+        -- для Understat это result IN ('goal','saved') — blocked/post мимо створа.
+        (sn.result IN ('goal', 'saved'))               AS is_sot,
 
         sn.shot_source,                                -- literal 'understat_v1'
         CAST('v1' AS varchar)                          AS shot_version,
@@ -301,6 +306,7 @@ sofascore_final AS (
 
         ss.result,
         ss.is_goal,
+        ss.is_sot,
 
         ss.shot_source,                                -- literal 'sofascore_v1'
         CAST('v1' AS varchar)                          AS shot_version,
@@ -319,12 +325,12 @@ sofascore_final AS (
 -- 4) Union both sources ------------------------------------------------------
 all_shots AS (
     SELECT shot_id, match_id, team_id, player_id, assist_player_id, minute,
-           x, y, body_part, situation, xg, psxg, result, is_goal,
+           x, y, body_part, situation, xg, psxg, result, is_goal, is_sot,
            shot_source, shot_version, league, season, source_priority
     FROM understat_final
     UNION ALL
     SELECT shot_id, match_id, team_id, player_id, assist_player_id, minute,
-           x, y, body_part, situation, xg, psxg, result, is_goal,
+           x, y, body_part, situation, xg, psxg, result, is_goal, is_sot,
            shot_source, shot_version, league, season, source_priority
     FROM sofascore_final
 ),
@@ -359,6 +365,7 @@ SELECT
     a.psxg,
     a.result,
     a.is_goal,
+    a.is_sot,
     a.shot_source,
     a.shot_version,
     a.league,

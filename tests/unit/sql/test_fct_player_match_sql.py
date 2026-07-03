@@ -219,17 +219,18 @@ class TestFctPlayerMatchSql:
                 f"(matched `{stale}`); they live in fct_player_match_audit"
             )
 
-    def test_rating_single_source_sofascore(self):
-        """RX2: rating берётся ТОЛЬКО из SofaScore (Opta-derived).
-        FotMob rating дропнут (на match-grain его и нет). Single-column
-        `rating` либо `rating_sofascore` — допустимо до cutover, но
-        НИКАКИХ rating_fotmob / rating_diff."""
+    def test_rating_single_column_sofascore_first(self):
+        """R5 (2026-07-03): rating — единая колонка COALESCE(ss.rating,
+        fm.rating): SofaScore (Opta) primary, FotMob fallback (закрывает
+        сезоны с дырами xref sofascore). По-прежнему НИКАКИХ
+        rating_fotmob / rating_diff отдельными колонками."""
         sql = _read_sql()
-        # rating должен идти из ss.* (SofaScore alias) — точно не
-        # из us./ws./fb.; не должно быть rating_fotmob.
         assert not re.search(r"\bAS\s+rating_fotmob\b", sql, re.IGNORECASE), (
-            "rating_fotmob must NOT be in fct_player_match (RX2 verdict)"
+            "rating_fotmob must NOT be in fct_player_match (single-column rule)"
         )
+        assert re.search(
+            r"COALESCE\(\s*ss\.rating\s*,\s*fm\.rating\s*\)", sql, re.IGNORECASE
+        ), "rating must be COALESCE(ss.rating, fm.rating) — SofaScore first (R5)"
 
     def test_partition_columns_projected_last(self):
         """`league`, `season` обязаны быть выпроецированы (CTAS-обёртка

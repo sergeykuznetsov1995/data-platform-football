@@ -115,6 +115,7 @@ _TABLES: Dict[str, str] = {
         xgot        DOUBLE,
         result      VARCHAR,
         is_goal     BOOLEAN,
+        is_sot      BOOLEAN,
         shot_source VARCHAR,
         league      VARCHAR,
         season      VARCHAR
