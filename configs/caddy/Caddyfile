@@ -1,0 +1,37 @@
+# Реверс-прокси для доступа аналитиков через tailnet.
+# Один hostname (MagicDNS), роутинг по портам. Сертификат *.ts.net Caddy получает
+# сам у tailscaled (нужен смонтированный /var/run/tailscale/tailscaled.sock и
+# включённый HTTPS в админке tailnet). Порты публикуются только на ${TS_IP} —
+# см. сервис caddy в compose.yaml; 127.0.0.1-биндинги сервисов не трогаем.
+
+# JupyterHub — главная страница платформы для аналитиков.
+https://{$TS_HOSTNAME} {
+	reverse_proxy jupyterhub:8000
+}
+
+https://{$TS_HOSTNAME}:8081 {
+	reverse_proxy airflow-webserver:8080
+}
+
+https://{$TS_HOSTNAME}:8088 {
+	reverse_proxy superset:8088
+}
+
+# Keycloak (OIDC issuer): KC_PROXY_HEADERS=xforwarded, TLS терминируется здесь.
+https://{$TS_HOSTNAME}:8443 {
+	reverse_proxy keycloak:8080
+}
+
+# Trino говорит HTTPS сам (self-signed) — Caddy переупаковывает в доверенный серт.
+https://{$TS_HOSTNAME}:8444 {
+	reverse_proxy https://trino:8443 {
+		transport http {
+			tls
+			tls_insecure_skip_verify
+		}
+	}
+}
+
+https://{$TS_HOSTNAME}:8585 {
+	reverse_proxy openmetadata-server:8585
+}

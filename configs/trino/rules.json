@@ -1,0 +1,50 @@
+{
+  "catalogs": [
+    { "user": "airflow|superset|openmetadata", "allow": "all" },
+    { "group": "platform-admins", "allow": "all" },
+    { "group": "analysts", "catalog": "iceberg|system", "allow": "read-only" },
+    { "user": "analyst_svc", "catalog": "iceberg|system", "allow": "read-only" },
+    { "allow": "none" }
+  ],
+  "schemas": [
+    { "user": "airflow|superset|openmetadata", "owner": true },
+    { "group": "platform-admins", "owner": true },
+    { "owner": false }
+  ],
+  "tables": [
+    {
+      "user": "airflow|superset|openmetadata",
+      "privileges": ["SELECT", "INSERT", "DELETE", "UPDATE", "OWNERSHIP"]
+    },
+    {
+      "group": "platform-admins",
+      "privileges": ["SELECT", "INSERT", "DELETE", "UPDATE", "OWNERSHIP"]
+    },
+    {
+      "group": "analysts",
+      "catalog": "iceberg",
+      "schema": "silver|gold",
+      "privileges": ["SELECT"]
+    },
+    {
+      "user": "analyst_svc",
+      "catalog": "iceberg",
+      "schema": "silver|gold",
+      "privileges": ["SELECT"]
+    },
+    { "privileges": [] }
+  ],
+  "procedures": [
+    {
+      "user": "airflow|superset|openmetadata",
+      "privileges": ["EXECUTE", "GRANT_EXECUTE"]
+    },
+    {
+      "group": "platform-admins",
+      "privileges": ["EXECUTE", "GRANT_EXECUTE"]
+    }
+  ],
+  "impersonation": [
+    { "original_user": "superset", "new_user": ".*" }
+  ]
+}

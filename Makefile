@@ -319,3 +319,26 @@ shell-superset:
 shell-om:
 	@docker compose exec openmetadata-server bash
 
+
+# --- Analyst access (docs/design/analyst-access.md) ---
+
+# Рендер realm-импорта Keycloak из шаблона (секреты из .env)
+render-keycloak-realm:
+	@python3 scripts/render_keycloak_realm.py
+
+# Создать базу keycloak в работающем postgres (идемпотентно)
+keycloak-db:
+	@bash scripts/create_keycloak_db.sh
+
+# Tail Keycloak logs
+logs-keycloak:
+	@docker compose logs -f --tail=100 keycloak
+
+# Собрать образы JupyterHub и ноутбука аналитика
+build-jupyter:
+	@docker build -t data-platform/jupyterhub:5.3 docker/images/jupyterhub
+	@docker build -t data-platform/jupyter-singleuser:latest docker/images/jupyter-singleuser
+
+# Tail JupyterHub logs
+logs-jupyterhub:
+	@docker compose logs -f --tail=100 jupyterhub
