@@ -1,35 +1,51 @@
 # Доступ юзеров к платформе
 
-Дизайн и устройство: [design/analyst-access.md](design/analyst-access.md).
-Хост платформы (tailnet): `386844.tailb2c32a.ts.net` — далее `<host>`.
+Дизайн и устройство: [design/analyst-access.md](design/analyst-access.md),
+сеть — [HEADSCALE_MIGRATION.md](HEADSCALE_MIGRATION.md). Домен: `sk-vpn-2026.uk`.
 
 ## Два класса юзеров
 
-| Класс (группа Keycloak) | Что получает |
-|---|---|
-| `viewers` — «простой» юзер | только Superset: дашборды (без SQL Lab) |
-| `analysts` — аналитик | всё из таблицы ниже |
-
-Сервисы аналитика:
-
-| Сервис | Адрес | Права |
+| Класс (группа Keycloak) | Что получает | VPN нужен? |
 |---|---|---|
-| JupyterHub | `https://<host>/` | свой контейнер (1 ГБ), персональный диск |
-| Superset | `https://<host>:8088` | дашборды + SQL Lab (read-only) |
-| Airflow | `https://<host>:8081` | просмотр DAG'ов (Viewer) |
-| Trino | `https://<host>:8444` | SQL read-only к `silver`/`gold`; `bronze` невидим |
+| `viewers` — «простой» юзер | только Superset-дашборды | нет |
+| `analysts` — аналитик | всё из таблицы ниже | да (Headscale) |
 
-Писать в данные нельзя — это гарантирует Trino, а не вежливость: любой
-не-машинный юзер получает от rules.json только SELECT на `silver`/`gold`
-(catch-all; правки конфигов на нового юзера НЕ нужны). Запросы людей идут
-в ресурсной группе `humans` (лимит 8 одновременно, 30% памяти) и не могут
-задушить пайплайны.
+| Сервис | Адрес | Кому | Права |
+|---|---|---|---|
+| Superset | `https://bi.sk-vpn-2026.uk` | все | дашборды (viewers) + SQL Lab (analysts) |
+| JupyterHub | `https://jupyter.sk-vpn-2026.uk` | analysts | свой контейнер (1 ГБ), диск |
+| Airflow | `https://airflow.sk-vpn-2026.uk` | analysts | просмотр DAG'ов (Viewer) |
+| Trino | `https://trino.sk-vpn-2026.uk` | analysts | SQL read-only `silver`/`gold` |
 
-## Онбординг (~2 минуты, без рестартов)
+`bi`/`auth` — публичные (обычный интернет). `jupyter`/`airflow`/`trino`/`meta` —
+только из VPN. Писать в данные нельзя: любой не-машинный юзер получает от
+rules.json только SELECT на `silver`/`gold` (catch-all; правки конфигов на нового
+юзера НЕ нужны). Запросы людей идут в ресурсной группе `humans` (лимит 8
+одновременно, 30% памяти) и не могут задушить пайплайны.
 
-1. **Tailscale**: пригласи юзера в tailnet (админка → Users → Invite) —
-   он ставит клиент с https://tailscale.com/download и логинится.
-2. **Аккаунт** одной командой (создаёт юзера в Keycloak с временным паролем
+## Онбординг
+
+### Простой юзер (viewer) — ~1 минута, без VPN
+
+1. `scripts/onboard_user.sh <username> <email>` (на VM) — заводит в Keycloak.
+2. Отправь ссылку `https://bi.sk-vpn-2026.uk` + временный пароль из вывода скрипта.
+
+### Аналитик — + доступ в VPN
+
+1. **Headscale-клиент**: юзер ставит Tailscale-клиент
+   (https://tailscale.com/download) и подключается к нашему серверу:
+   ```bash
+   tailscale up --login-server https://hs.sk-vpn-2026.uk --accept-dns=true
+   ```
+   Откроется браузер — вход тем же аккаунтом Keycloak (группа analysts).
+2. **VPN-имена в /etc/hosts** (split-DNS через MagicDNS на macOS/Windows
+   приложениями не подхватывается — прописать явно, один раз на машину;
+   `100.64.0.1` = `tailscale ip -4` на VM):
+   ```bash
+   echo "100.64.0.1 jupyter.sk-vpn-2026.uk airflow.sk-vpn-2026.uk trino.sk-vpn-2026.uk meta.sk-vpn-2026.uk" | sudo tee -a /etc/hosts
+   ```
+   `bi`/`auth` сюда НЕ добавлять — они публичные.
+3. **Аккаунт** одной командой (создаёт юзера в Keycloak с временным паролем
    и кладёт в группу):
 
    ```bash
@@ -88,7 +104,7 @@ conn = trino.dbapi.connect(
 ## DBeaver / JDBC
 
 ```
-jdbc:trino://<host>:8444?SSL=true&externalAuthentication=true
+jdbc:trino://trino.sk-vpn-2026.uk:443?SSL=true&externalAuthentication=true
 ```
 
 При подключении откроется браузер с единым логином. Логин в поле user
