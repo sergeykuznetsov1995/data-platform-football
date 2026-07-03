@@ -653,6 +653,7 @@ def evaluate_orphan_rate_per_source(
     warning_threshold: float = 10.0,
     error_threshold: float = 25.0,
     current_season_only: bool = False,
+    group_by_league: bool = False,
 ) -> Dict[str, Any]:
     """Compute orphan-rate per ``source`` for an xref table and classify.
 
@@ -674,29 +675,53 @@ def evaluate_orphan_rate_per_source(
       * pct > error_threshold          — ERROR
 
     ``current_season_only`` (#803): when True, the rate is measured only on the
-    latest season (``season = (SELECT max(season) FROM <table>)``). After a
-    historical backfill the table spans ~10 seasons whose old, thin FBref spine
-    leaves most source rows legitimately orphan (#788) — table-wide that inflates
-    the rate into a false ERROR (fotmob 28.8% / xref_team TM 86.9%), while the
-    current season — where the spine is thick — is the meaningful resolver-health
-    signal (1.3% / 0%). Sources absent in the latest season drop out of the
-    GROUP BY and are simply not evaluated.
+    latest season. After a historical backfill the table spans ~10 seasons whose
+    old, thin FBref spine leaves most source rows legitimately orphan (#788) —
+    table-wide that inflates the rate into a false ERROR (fotmob 28.8% /
+    xref_team TM 86.9%), while the current season — where the spine is thick —
+    is the meaningful resolver-health signal (1.3% / 0%). Sources absent in the
+    latest season drop out of the GROUP BY and are simply not evaluated.
+
+    ``group_by_league`` (multi-league prep): when True, rates are computed per
+    ``(source, league)`` — ``per_source`` keys become ``'{source}|{league}'``
+    and breaches carry a ``league`` field. The latest-season filter is then
+    evaluated PER LEAGUE (a table-wide max season would mask a league whose
+    freshest data is older). When False (default) the output is byte-identical
+    to the historical single-league shape.
 
     NOTE: This function does NOT raise. Callers decide whether to escalate.
     """
     qualified = _qualify(table)
-    where = (
-        f"WHERE season = (SELECT max(season) FROM {qualified}) "
-        if current_season_only else ""
-    )
-    sql = (
-        "SELECT source, "
-        "       COUNT(*) AS total, "
-        "       COUNT_IF(confidence = 'orphan') AS orphans "
-        f"FROM {qualified} "
-        f"{where}"
-        "GROUP BY source"
-    )
+    if group_by_league:
+        # Per-league latest season via a window — a table-wide max(season)
+        # would silently exclude any league whose freshest partition is older.
+        inner = (
+            "SELECT source, league, confidence, season, "
+            "MAX(season) OVER (PARTITION BY league) AS max_season "
+            f"FROM {qualified}"
+        )
+        where = "WHERE season = max_season " if current_season_only else ""
+        sql = (
+            "SELECT source, league, "
+            "       COUNT(*) AS total, "
+            "       COUNT_IF(confidence = 'orphan') AS orphans "
+            f"FROM ({inner}) "
+            f"{where}"
+            "GROUP BY source, league"
+        )
+    else:
+        where = (
+            f"WHERE season = (SELECT max(season) FROM {qualified}) "
+            if current_season_only else ""
+        )
+        sql = (
+            "SELECT source, "
+            "       COUNT(*) AS total, "
+            "       COUNT_IF(confidence = 'orphan') AS orphans "
+            f"FROM {qualified} "
+            f"{where}"
+            "GROUP BY source"
+        )
     conn = _get_conn()
     try:
         cur = conn.cursor()
@@ -714,7 +739,14 @@ def evaluate_orphan_rate_per_source(
     overall_orphans = 0
     overall_verdict = 'OK'
 
-    for src, total, orphans in rows:
+    for row in rows:
+        if group_by_league:
+            src, league, total, orphans = row
+            key = f"{src}|{league}"
+        else:
+            src, total, orphans = row
+            league = None
+            key = src
         pct = (100.0 * orphans / total) if total else 0.0
         if pct > error_threshold:
             verdict = 'ERROR'
@@ -723,14 +755,17 @@ def evaluate_orphan_rate_per_source(
         else:
             verdict = 'OK'
 
-        per_source[src] = {
+        per_source[key] = {
             'total': int(total),
             'orphans': int(orphans),
             'pct': round(pct, 2),
             'verdict': verdict,
         }
         if verdict != 'OK':
-            breaches.append({'source': src, 'pct': round(pct, 2), 'verdict': verdict})
+            breach = {'source': src, 'pct': round(pct, 2), 'verdict': verdict}
+            if league is not None:
+                breach['league'] = league
+            breaches.append(breach)
         overall_total += int(total)
         overall_orphans += int(orphans)
 

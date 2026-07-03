@@ -184,6 +184,7 @@ raw_teams AS (
       FROM iceberg.bronze.clubelo_ratings
      WHERE team IS NOT NULL
        AND league = 'ENG-Premier League'   -- ClubElo trackет всю English pyramid; фильтруем не-APL
+                                           -- TODO(E8b): мультилига требует clubelo↔league маппинг
     UNION
     -- ===== clubelo (historical snapshots — relegated APL teams, #589) =====
     -- `clubelo_ratings` (daily, current) carries only teams CURRENTLY in the
@@ -194,7 +195,7 @@ raw_teams AS (
     SELECT 'clubelo' AS source, team AS source_id, league, CAST(NULL AS varchar) AS season
       FROM iceberg.bronze.clubelo_ratings_historical
      WHERE team IS NOT NULL
-       AND league = 'ENG-Premier League'
+       AND league = 'ENG-Premier League'   -- TODO(E8b): см. комментарий выше
 
     UNION
     -- ===== espn =====
