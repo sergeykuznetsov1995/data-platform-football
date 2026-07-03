@@ -52,6 +52,16 @@ dns:
     global:
       - 1.1.1.1
       - 8.8.8.8
+    # Split-DNS: регистрирует __PLATFORM_DOMAIN__ как match-domain на клиенте,
+    # чтобы приложения (curl/DataGrip/браузер) слали *.__PLATFORM_DOMAIN__ в
+    # резолвер tailscale (100.100.100.100) — тогда extra_records ниже
+    # перехватываются локально, а bi/auth форвардятся в паблик. Без этого
+    # приложения на macOS резолвят голый домен в обычном DNS -> публичный IP
+    # (нужен был /etc/hosts). ВАЖНО: внешние DNS, не 100.100.100.100 (петля).
+    split:
+      __PLATFORM_DOMAIN__:
+        - 1.1.1.1
+        - 8.8.8.8
   search_domains: []
   # Split-DNS: внутри VPN сервисные имена резолвятся в headscale-IP VM,
   # снаружи те же имена смотрят на публичный IP (нужно для ACME), где Caddy
