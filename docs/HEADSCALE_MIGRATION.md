@@ -23,18 +23,26 @@ Headscale ── https://hs.<домен> (вход в VPN через тот же
    `PLATFORM_DOMAIN`, `PUBLIC_IP`, `HEADSCALE_OIDC_CLIENT_SECRET`,
    `COMPOSE_PROFILES=headscale`. Cutover-переключатели — ПОКА не заполнять.
 4. Открыть на файрволе VM: tcp/80, tcp/443, udp/3478.
-5. **Docker: `userland-proxy: false`** — обязательно для VPN-гейта Caddy.
-   С включённым docker-proxy (дефолт) запросы приходят в Caddy с source
-   `172.x` (bridge-gateway), и `remote_ip 100.64.0.0/10` НИКОГДА не матчит
-   VPN-клиента → все VPN-сервисы отдают 403. Фикс (требует рестарт docker —
-   единоразовый даунтайм стека, ~2-3 мин; volumes целы, пайплайны на паузе):
-   ```bash
-   echo '{"userland-proxy": false}' > /etc/docker/daemon.json
-   systemctl restart docker
-   ```
-   С `--snat-subnet-routes=false` (шаг cutover) + этим флагом Caddy видит
-   настоящий 100.64.x → гейт работает; заодно /admin-гейт Keycloak и будущий
-   rate-limit получают реальный client IP.
+### VPN-гейт: bind-изоляция, НЕ remote_ip
+
+Разделение «публичное / только-из-VPN» держится на том, на какой **хостовый
+IP** опубликован порт Caddy, а не на `remote_ip` в Caddyfile. Причина:
+docker при форвардинге tailscale0→bridge подменяет source-IP на bridge-gateway
+(172.x) — даже с `userland-proxy: false`, — поэтому `remote_ip 100.64.0.0/10`
+в Caddy НИКОГДА не матчит VPN-клиента (всё отдаёт 403). Проверено live.
+
+Схема (см. `configs/caddy/Caddyfile.hybrid.example` + ports сервиса caddy):
+- Caddy слушает два контейнерных порта: `:443` (публичные bi/auth/hs) и
+  `:8443` (VPN jupyter/airflow/trino/meta — site-address с явным `:8443`).
+- compose публикует: `${PUBLIC_IP}:443→:443`, `${PUBLIC_IP}:80→:80` (ACME),
+  `${TS_IP}:443→:8443`.
+- Клиенты ВЕЗДЕ ходят на `:443` (порт в URL не нужен). split-DNS (extra_records)
+  резолвит VPN-сервисы в `${TS_IP}` → docker DNAT на контейнерный `:8443`;
+  bi/auth/hs резолвятся публичным DNS в `${PUBLIC_IP}` → `:443`.
+- Из интернета VPN-сервисов на `:443` нет (другой listener) → недоступны
+  (Caddy отдаёт пустой 200, контент не проксируется).
+- Серты LE — на все 7 доменов (A-записи → `${PUBLIC_IP}`, ACME HTTP-01 на :80);
+  серт по домену, порт listener'а не важен.
 
 ## 1. Подготовка (без даунтайма, старый Tailscale продолжает работать)
 

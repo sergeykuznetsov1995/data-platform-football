@@ -932,16 +932,13 @@ services:
           - auth.${PLATFORM_DOMAIN:-platform-domain-unset}
           - trino.${PLATFORM_DOMAIN:-platform-domain-unset}
     ports:
-      - "${TS_IP:?}:443:443"
-      - "${TS_IP:?TS_IP not set — tailscale ip -4}:8081:8081"
-      - "${TS_IP:?}:8088:8088"
-      - "${TS_IP:?}:8443:8443"
-      - "${TS_IP:?}:8444:8444"
-      - "${TS_IP:?}:8585:8585"
-      # Гибрид: публичный вход (bi/auth/hs + ACME HTTP-01). До cutover
-      # PUBLIC_IP не задан — байнд на 127.0.0.1 безвреден.
-      - "${PUBLIC_IP:-127.0.0.1}:80:80"
-      - "${PUBLIC_IP:-127.0.0.1}:443:443"
+      # Гибрид (bind-изоляция, docs/HEADSCALE_MIGRATION.md):
+      # публичный вход на PUBLIC_IP (listener :443 = bi/auth/hs) + ACME :80;
+      # VPN-вход на TS_IP:443 -> контейнерный :8443 (listener VPN-сайтов).
+      # Гейт «кто куда» = какой хостовый IP, а не remote_ip (docker подменяет src).
+      - "${PUBLIC_IP:?PUBLIC_IP not set}:80:80"
+      - "${PUBLIC_IP:?}:443:443"
+      - "${TS_IP:?TS_IP not set — tailscale ip -4}:443:8443"
     environment:
       TS_HOSTNAME: ${TS_HOSTNAME:?TS_HOSTNAME not set — tailscale status --json .Self.DNSName}
       PLATFORM_DOMAIN: ${PLATFORM_DOMAIN:-platform-domain-unset}
