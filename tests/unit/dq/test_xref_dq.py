@@ -290,21 +290,33 @@ def test_xref_referee_known_pairs_guard():
     assert 'COUNT(DISTINCT source) < 2' in where
 
 
-def test_xref_manager_two_source_checks():
-    """xref_manager — FBref spine + FotMob coachId mirror (issue #144).
+def test_xref_manager_three_source_checks():
+    """xref_manager — FBref spine + FotMob coachId mirror (#144) + TM bridge.
 
     Check set: row count bounds, PK uniqueness, NOT NULL on canonical,
-    source enum {fbref, fotmob}, confidence enum {name_normalize, orphan},
-    and a WARNING-severity FotMob name-collision guard.
+    source enum {fbref, fotmob, transfermarkt}, confidence enum
+    {name_alias, name_normalize, name_initial, orphan}, per-source
+    WARNING-severity name-collision guards, TM source-present floor and the
+    known-manager anchor guard.
     """
     checks = xref_dq.build_xref_manager_checks()
 
-    # Row count: positive lower bound (must produce rows).
-    # NB: enum_compliance uses kind='row_count' under the hood, so we
-    # filter by name (the dedicated row_count check has no enum prefix).
+    # Row counts: the plain table bound, the TM source-present floor and the
+    # anchor guard (all kind='row_count'; enum_compliance shares the kind so
+    # filter by name).
     rc = [c for c in checks if c.kind == 'row_count' and 'enum_compliance' not in c.name]
-    assert len(rc) == 1
-    assert rc[0].params.get('min_rows', 0) > 0
+    assert len(rc) == 3
+    plain = [c for c in rc if c.name == 'row_count[iceberg.silver.xref_manager]']
+    assert len(plain) == 1 and plain[0].params.get('min_rows', 0) > 0
+    present = [c for c in rc if c.name == 'source_present[xref_manager.transfermarkt]']
+    assert len(present) == 1
+    assert present[0].severity == 'WARNING'
+    assert present[0].params['where'] == "source = 'transfermarkt'"
+    anchors = [c for c in rc if c.name == 'known_manager_anchors[xref_manager]']
+    assert len(anchors) == 1
+    assert anchors[0].severity == 'WARNING'
+    for cid in xref_dq.KNOWN_MANAGER_CANONICALS:
+        assert f"'{cid}'" in anchors[0].params['where']
 
     # PK uniqueness on (source, source_id, league, season).
     pk = [
@@ -314,50 +326,53 @@ def test_xref_manager_two_source_checks():
     ]
     assert len(pk) == 1
 
-    # Collision guard: WARNING-only no_duplicates on (canonical_id, league,
-    # season) restricted to FotMob — catches two distinct coachIds collapsing
-    # to one slug.
+    # Collision guards: WARNING-only no_duplicates on (canonical_id, league,
+    # season) per mirror source — two distinct coach ids collapsing to one
+    # slug is a suspected false merge.
     collision = [
         c for c in checks
         if c.kind == 'no_duplicates'
         and c.params['pk'] == ['canonical_id', 'league', 'season']
     ]
-    assert len(collision) == 1
-    assert collision[0].severity == 'WARNING'
-    assert collision[0].params.get('where') == "source = 'fotmob'"
+    assert len(collision) == 2
+    assert all(c.severity == 'WARNING' for c in collision)
+    assert {c.params.get('where') for c in collision} == {
+        "source = 'fotmob'", "source = 'transfermarkt'",
+    }
 
     # NOT NULL on canonical / source / source_id.
     nn = [c for c in checks if c.kind == 'no_nulls']
     assert len(nn) == 1
     assert set(nn[0].params['cols']) >= {'canonical_id', 'source', 'source_id'}
 
-    # Source enum: FBref spine + FotMob mirror.
+    # Source enum: FBref spine + FotMob mirror + TM bridge.
     src_enum = [
         c for c in checks
         if 'enum_compliance' in c.name and '.source' in c.name
     ]
     assert len(src_enum) == 1
     where_src = src_enum[0].params['where']
-    assert "'fbref'" in where_src and "'fotmob'" in where_src
+    for allowed in ['fbref', 'fotmob', 'transfermarkt']:
+        assert f"'{allowed}'" in where_src
     for forbidden in ['understat', 'whoscored', 'sofascore',
                       'matchhistory', 'clubelo', 'espn']:
         assert f"'{forbidden}'" not in where_src, (
             f"xref_manager source enum must NOT include {forbidden!r} — only "
-            "FBref + FotMob carry coach identity in Bronze"
+            "FBref + FotMob + TM carry coach identity in Bronze"
         )
 
-    # Confidence enum: name_normalize (glued) + orphan (un-glued FotMob).
+    # Confidence enum: the 3-tier cascade + orphan.
     conf_enum = [
         c for c in checks
         if 'enum_compliance' in c.name and 'confidence' in c.name
     ]
     assert len(conf_enum) == 1
     where_conf = conf_enum[0].params['where']
-    assert "'name_normalize'" in where_conf
-    assert "'orphan'" in where_conf
-    for forbidden in ['exact', 'name_team', 'ambiguous']:
-        assert f"'{forbidden}'" not in where_conf, (
-            f"xref_manager confidence enum must NOT include {forbidden!r}"
+    for allowed in ['name_alias', 'name_normalize', 'name_initial', 'orphan']:
+        assert f"'{allowed}'" in where_conf
+    for forbidden in ["'exact'", "'name_team'", "'ambiguous'"]:
+        assert forbidden not in where_conf, (
+            f"xref_manager confidence enum must NOT include {forbidden}"
         )
 
 
@@ -889,3 +904,57 @@ def test_evaluate_dob_conflicts_empty_table_is_ok(duck_conn):
     )
     assert res == {'conflicts': 0, 'rows': [], 'truncated': False,
                    'verdict': 'OK'}
+
+
+def _seed_manager_dob_fixture(duck_conn, tm_dob: str):
+    """xref_manager + fotmob_manager_profile + transfermarkt_coaches."""
+    duck_conn.execute(
+        """
+        CREATE TABLE iceberg.silver.xref_manager (
+            canonical_id VARCHAR, source VARCHAR, source_id VARCHAR,
+            display_name VARCHAR, league VARCHAR, season VARCHAR,
+            confidence VARCHAR, match_score DOUBLE
+        )
+        """
+    )
+    duck_conn.execute(
+        "INSERT INTO iceberg.silver.xref_manager VALUES "
+        "('coach_a', 'fbref', 'Coach A', 'Coach A', 'ENG', '2425', "
+        " 'name_normalize', NULL), "
+        "('coach_a', 'fotmob', '500', 'Coach A', 'ENG', '2425', "
+        " 'name_normalize', NULL), "
+        "('coach_a', 'transfermarkt', '900', 'C. A', 'ENG', '2425', "
+        " 'name_initial', NULL)"
+    )
+    duck_conn.execute(
+        "CREATE TABLE iceberg.silver.fotmob_manager_profile AS "
+        "SELECT '500' AS player_id, 'Coach A' AS name, "
+        "'1970-01-01' AS date_of_birth, 'ENG' AS league, '2425' AS season"
+    )
+    duck_conn.execute(
+        f"CREATE TABLE iceberg.silver.transfermarkt_coaches AS "
+        f"SELECT '900' AS coach_id, 'C. A' AS name, DATE '{tm_dob}' AS dob, "
+        f"'ENG' AS league, '2425' AS season"
+    )
+
+
+def test_evaluate_manager_dob_collisions_flags_mismatch(duck_conn):
+    """FotMob-vs-TM dob disagreement on one canonical → WARNING with the TM
+    row's confidence exposed (name_initial = suspected false merge)."""
+    _seed_manager_dob_fixture(duck_conn, tm_dob='1965-05-05')
+    res = xref_dq.evaluate_manager_dob_collisions()
+    assert res['verdict'] == 'WARNING'
+    assert res['collisions'] == 1
+    row = res['rows'][0]
+    assert row['canonical_id'] == 'coach_a'
+    assert row['tm_confidence'] == 'name_initial'
+    assert row['fotmob_dob'] == '1970-01-01'
+    assert row['tm_dob'] == '1965-05-05'
+
+
+def test_evaluate_manager_dob_collisions_ok_when_agreeing(duck_conn):
+    _seed_manager_dob_fixture(duck_conn, tm_dob='1970-01-01')
+    res = xref_dq.evaluate_manager_dob_collisions()
+    assert res['verdict'] == 'OK'
+    assert res['collisions'] == 0
+    assert res['rows'] == []
