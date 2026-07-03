@@ -1,19 +1,31 @@
 # =============================================================================
 # Cross-source manager-name aliases — APL head coaches (issue #619)
 # =============================================================================
-# Curated map: Transfermarkt raw coach-name → canonical (FBref-spine) identity.
+# Curated map: raw coach-name → canonical (FBref-spine) identity.
 # Mirrors `referee_aliases.yaml` (#143) — managers, like referees, have NO
 # stable source id in the FBref spine (FBref emits a plain name string).
 #
+# PRIMARY CONSUMER (xref-improvements): silver/xref_manager.sql.j2 — the
+# `name_alias` tier of the 3-source manager cascade (FBref spine + FotMob
+# coachId + Transfermarkt coach_id), rendered via
+# `get_manager_alias_sql_values(source=None)` (all buckets merged; a raw form
+# keyed on a TM spelling simply never matches a FotMob name — safe no-op).
+# transfermarkt_coaches.sql.j2 still renders the same VALUES during the
+# transition (its canonical_id column is DEPRECATED — dim_manager now reads
+# TM bio through the xref bridge).
+#
+# NB: two entries whose raw forms normalise to ONE (norm, league) key but
+# point at DIFFERENT canonical_ids are silently collapsed by MAX() in the
+# consumers — keep the file free of norm collisions.
+#
 # WHY THIS FILE (issue #619, followup of #434/#618):
-#   gold.dim_manager enriches nationality/dob from silver.transfermarkt_coaches,
-#   joined to the FBref spine by a SHARED diacritic-stripping name-normalize
-#   (silver/transfermarkt_coaches.sql.j2 == silver/xref_manager.sql). Most TM
-#   coaches glue automatically. A handful do NOT: TM may store a different
+#   Most coaches glue automatically via the shared diacritic-stripping
+#   name-normalize (and, since xref-improvements, the surname+first-initial
+#   `name_initial` tier). A handful do NOT: a source may store a different
 #   spelling / name order (e.g. surname-first "Le Bris, Régis") that normalises
 #   to a DIFFERENT canonical_id than the FBref spine. Those become orphans —
 #   the TM bio (nationality/dob) never reaches dim_manager. This dictionary
-#   remaps the TM raw form onto the spine id so the JOIN succeeds.
+#   remaps the raw form onto the spine id so the JOIN succeeds.
 #
 # Структура одной записи:
 #   - canonical_name: <FBref spelling>           # display; FBref is the spine
@@ -38,12 +50,11 @@
 #
 # -----------------------------------------------------------------------------
 # DISCOVERY (run on the target VM to obtain the authoritative orphan list):
-#   -- TM canonical_ids that DON'T glue to the FBref spine:
-#   SELECT tc.canonical_id AS tm_canonical, tc.name AS tm_name
-#   FROM iceberg.silver.transfermarkt_coaches tc
-#   LEFT JOIN iceberg.gold.dim_manager dm ON dm.manager_id = tc.canonical_id
-#   WHERE dm.manager_id IS NULL
-#   ORDER BY tc.name;
+#   -- Source rows that DON'T glue to the FBref spine (any source):
+#   SELECT source, source_id, display_name, league, season
+#   FROM iceberg.silver.xref_manager
+#   WHERE confidence = 'orphan'
+#   ORDER BY source, display_name;
 #   -- For each orphan, find the matching FBref spine id + spelling:
 #   SELECT DISTINCT manager_id, manager_name FROM iceberg.gold.dim_manager
 #   ORDER BY manager_name;   -- pick the row that is the SAME human

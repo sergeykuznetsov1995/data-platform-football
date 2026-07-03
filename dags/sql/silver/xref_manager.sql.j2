@@ -1,0 +1,318 @@
+-- =============================================================================
+-- Silver: xref_manager   (Jinja-template — `.sql.j2`)
+-- =============================================================================
+-- Manager (head-coach) cross-reference. Three sources (#144, TM added by the
+-- xref-improvements pass):
+--   * FBref         — iceberg.bronze.fbref_match_managers (scorebox parser,
+--                     scrapers/fbref/parsers/finders.py::parse_match_managers).
+--                     Spine; has only a manager NAME (no stable id).
+--   * FotMob        — iceberg.bronze.fotmob_player_details WHERE is_coach =
+--                     true. Carries a STABLE coachId (player_id) kept verbatim
+--                     in source_id, plus the coach name for cross-source gluing.
+--   * Transfermarkt — iceberg.bronze.transfermarkt_coaches (club trainer-history
+--                     pages, #619). Carries a STABLE coach_id (source_id) plus
+--                     dob/nationality consumed downstream by dim_manager via
+--                     the xref bridge (was: direct name-join in
+--                     transfermarkt_coaches.sql.j2, now DEPRECATED there).
+--
+-- Cross-source identity — match cascade (strongest first):
+--   1. name_alias     — manager_aliases.yaml override (human-curated raw form →
+--                       spine canonical_id; heals surname-first "Le Bris, Régis"
+--                       and other mis-normalising spellings).
+--   2. name_normalize — identical diacritic-stripping name-normalize slug on
+--                       both sides (FBref "Mikel Arteta" == TM "Mikel Arteta").
+--   3. name_initial   — (surname, first-initial) equality, UNIQUE within
+--                       (league, season) on BOTH sides (TM "M. Arteta" →
+--                       ('arteta', 'm') → spine "Mikel Arteta"). Ambiguity
+--                       guards: a spine (surname, initial) key claimed by two
+--                       coaches is dropped from the key set (HAVING), and a TM
+--                       coach sharing its key with another TM coach in the same
+--                       (league, season) may not claim it (initial_key_dup).
+--   4. orphan         — no tier matched; canonical_id stays the source's own
+--                       name slug (surfaced by the Phase 2 orphan-rate report
+--                       and the manager_aliases.yaml DISCOVERY workflow).
+--
+-- Why name-normalize + a curated dictionary, not a rapidfuzz resolver
+-- (cf. xref_player): managers are tiny (~20-30 per league-season) and mostly
+-- spelled identically across sources; a full fuzzy resolver is
+-- over-engineering here. canonical_id stays NAME-based (not coachId-anchored)
+-- on purpose — anchoring on an id would rewrite every existing FBref
+-- canonical_id and change dim_manager output, breaking the "refactor without
+-- behaviour change" contract. Source ids are preserved in source_id for a
+-- future ID-anchor endgame (mirrors xref_team team_id, #141).
+--
+-- DOB corroboration is intentionally NOT part of this CTAS (schema frozen,
+-- Bronze-only inputs): TM-vs-FotMob dob disagreement per canonical is a DQ
+-- WARNING — see xref_dq.evaluate_manager_dob_collisions (strongest signal
+-- exactly for name_initial rows).
+--
+-- Alias VALUES are rendered from configs/medallion/manager_aliases.yaml via
+-- `medallion_config.get_manager_alias_sql_values(source=None)` into the single
+-- `manager_aliases_values_sql` placeholder (same machinery as
+-- xref_team.sql.j2 / xref_referee.sql.j2). source=None merges the `_generic`
+-- bucket with every per-source bucket: an alias keyed on a TM spelling simply
+-- never matches a FotMob name — safe no-op.
+--
+-- DAG-integration note: rendered by `dag_transform_xref._run_xref_manager`
+-- into a tempfile, then wrapped in `CREATE OR REPLACE TABLE
+-- iceberg.silver.xref_manager AS ...` via `silver_tasks.run_silver_transform()`.
+-- This file MUST stay a pure SELECT.
+--
+-- =============================================================================
+-- Schema (frozen — identical to xref_team / xref_referee)
+-- =============================================================================
+--   canonical_id   varchar  -- LOWER(REGEXP_REPLACE(strip_diacritics(name),'[^a-zA-Z0-9]+','_'))
+--   source         varchar  -- 'fbref' | 'fotmob' | 'transfermarkt'
+--   source_id      varchar  -- FBref: raw manager_name; FotMob: coachId; TM: coach_id
+--   display_name   varchar  -- raw name as stored in the source
+--   league         varchar
+--   season         varchar  -- slug ('2425'); FBref/FotMob Bronze store BIGINT,
+--                           -- TM Bronze already stores the slug varchar
+--   confidence     varchar  -- 'name_alias' | 'name_normalize' | 'name_initial' | 'orphan'
+--   match_score    double   -- always NULL (no fuzzy scoring)
+--
+-- Testable invariants (xref_dq.build_xref_manager_checks):
+--   * PK = (source, source_id, league, season).
+--   * canonical_id is NEVER NULL.
+--   * source ∈ {'fbref', 'fotmob', 'transfermarkt'}.
+--   * confidence ∈ {'name_alias', 'name_normalize', 'name_initial', 'orphan'}.
+--   * Every LEFT JOIN target below is pre-collapsed to 1 row per join key —
+--     the TM block's row count equals tm_coach's by construction (no fan-out).
+-- =============================================================================
+
+WITH manager_aliases AS (
+    -- Curated overrides (tier 1). One row per (norm, league); MAX guards the
+    -- LEFT JOINs against fan-out (#465). NB: two different canonical_ids on
+    -- one (norm, league) would be silently collapsed by MAX — keep the YAML
+    -- free of norm collisions (documented in its header).
+    SELECT
+        league,
+        LOWER(REGEXP_REPLACE(
+            REGEXP_REPLACE(NORMALIZE(raw_name, NFD), '\p{Mn}+', ''),
+            '[^a-zA-Z0-9]+', '_'))                 AS norm,
+        MAX(canonical_id)                          AS canonical_id
+    FROM (VALUES
+        {{ manager_aliases_values_sql }}
+    ) AS t(raw_name, canonical_id, league)
+    -- NB Trino: GROUP BY cannot reference the same-level SELECT alias `norm`
+    -- (COLUMN_NOT_FOUND), so the expression is repeated.
+    GROUP BY
+        LOWER(REGEXP_REPLACE(
+            REGEXP_REPLACE(NORMALIZE(raw_name, NFD), '\p{Mn}+', ''),
+            '[^a-zA-Z0-9]+', '_')),
+        league
+),
+
+fbref_spine AS (
+    -- Season-grained spine (needed by the name_initial tier). DISTINCT — the
+    -- Bronze table is match-grain (~38 rows per manager-season).
+    SELECT DISTINCT
+        LOWER(REGEXP_REPLACE(
+            REGEXP_REPLACE(NORMALIZE(manager_name, NFD), '\p{Mn}+', ''),
+            '[^a-zA-Z0-9]+', '_'))                              AS canonical_id,
+        league,
+        LPAD(CAST(MOD(season, 100) AS varchar), 2, '0')
+            || LPAD(CAST(MOD(season + 1, 100) AS varchar), 2, '0') AS season
+    FROM iceberg.bronze.fbref_match_managers
+    WHERE manager_name IS NOT NULL AND manager_name <> ''
+),
+
+fbref_canon AS (
+    -- Distinct FBref canonical_ids per league — the name_normalize glue target
+    -- for FotMob / TM. DISTINCT keeps the LEFT JOINs below 1:1 (no fan-out).
+    SELECT DISTINCT canonical_id, league
+    FROM fbref_spine
+),
+
+fbref_initial_keys AS (
+    -- name_initial tier target: (surname-token, first-initial) that maps to
+    -- EXACTLY ONE spine canonical within (league, season). HAVING is the
+    -- spine-side ambiguity guard: two spine coaches sharing (surname, initial)
+    -- drop out entirely, so the tier can never mis-assign between them.
+    SELECT
+        league,
+        season,
+        element_at(split(canonical_id, '_'), -1)                AS surname,
+        substr(canonical_id, 1, 1)                              AS first_initial,
+        MAX(canonical_id)                                       AS canonical_id
+    FROM fbref_spine
+    GROUP BY
+        league,
+        season,
+        element_at(split(canonical_id, '_'), -1),
+        substr(canonical_id, 1, 1)
+    HAVING COUNT(DISTINCT canonical_id) = 1
+),
+
+fotmob_coach AS (
+    -- One coach row per (player_id, league, season). bronze.fotmob_player_details
+    -- can carry >1 physical row per player across scrape runs (same dedup idiom
+    -- as fotmob_player_profile.sql) — collapse to one so source_id=player_id
+    -- stays unique for the (source, source_id, league, season) PK.
+    SELECT player_id, name, league, season
+    FROM (
+        SELECT
+            CAST(player_id AS varchar)                          AS player_id,
+            name,
+            league,
+            season,
+            ROW_NUMBER() OVER (
+                PARTITION BY CAST(player_id AS varchar), league, season
+                ORDER BY name
+            )                                                   AS rn
+        FROM iceberg.bronze.fotmob_player_details
+        WHERE is_coach = true
+          AND name IS NOT NULL AND name <> ''
+    )
+    WHERE rn = 1
+),
+
+tm_coach AS (
+    -- One coach row per (coach_id, league, season); Bronze ingest mode is
+    -- replace_partitions so ROW_NUMBER keeps the freshest physical row (same
+    -- dedup idiom as transfermarkt_coaches.sql.j2). season is ALREADY the
+    -- varchar slug in TM Bronze (scrapers/transfermarkt/scraper.py::_season_short)
+    -- — no LPAD conversion, and the name_initial join below is slug=slug.
+    SELECT
+        coach_id,
+        name,
+        league,
+        season,
+        norm,
+        -- TM-side ambiguity guard for name_initial: if two TM coaches in one
+        -- (league, season) share (surname, initial), neither may claim the key.
+        COUNT(*) OVER (
+            PARTITION BY league, season,
+                         element_at(split(norm, '_'), -1),
+                         substr(norm, 1, 1)
+        )                                                       AS initial_key_dup
+    FROM (
+        SELECT
+            CAST(coach_id AS varchar)                           AS coach_id,
+            name,
+            league,
+            season,
+            LOWER(REGEXP_REPLACE(
+                REGEXP_REPLACE(NORMALIZE(name, NFD), '\p{Mn}+', ''),
+                '[^a-zA-Z0-9]+', '_'))                          AS norm,
+            ROW_NUMBER() OVER (
+                PARTITION BY coach_id, league, season
+                ORDER BY _ingested_at DESC
+            )                                                   AS rn
+        FROM iceberg.bronze.transfermarkt_coaches
+        WHERE coach_id IS NOT NULL
+          AND name IS NOT NULL AND name <> ''
+    )
+    WHERE rn = 1
+),
+
+tm_resolved AS (
+    SELECT
+        t.coach_id,
+        t.name,
+        t.league,
+        t.season,
+        t.norm,
+        a.canonical_id                                          AS alias_cid,
+        fc.canonical_id                                         AS exact_cid,
+        CASE WHEN t.initial_key_dup = 1
+             THEN fik.canonical_id END                          AS initial_cid
+    FROM tm_coach t
+    LEFT JOIN manager_aliases a
+        ON  a.league = t.league
+        AND a.norm   = t.norm
+    LEFT JOIN fbref_canon fc
+        ON  fc.canonical_id = t.norm
+        AND fc.league       = t.league
+    LEFT JOIN fbref_initial_keys fik
+        ON  fik.league        = t.league
+        AND fik.season        = t.season
+        AND fik.surname       = element_at(split(t.norm, '_'), -1)
+        AND fik.first_initial = substr(t.norm, 1, 1)
+)
+
+-- ===== fbref (spine) =====
+SELECT
+    -- Transliterate diacritics before slugging (issue #201): FBref emits the
+    -- same manager name both with and without accents ("Régis Le Bris" vs
+    -- "Regis Le Bris"). A bare `[^a-zA-Z0-9]+ -> _` collapses each accent to
+    -- '_', so the two spellings yield DIFFERENT canonical_ids and dim_manager's
+    -- LAG-based stint detector then splits one continuous stint into several,
+    -- breaking the (manager, team, valid_from) PK. NORMALIZE(NFD) decomposes
+    -- "é" -> "e" + combining mark, `\p{Mn}+` strips the mark, leaving ASCII
+    -- "e". Same idiom as xref_team.sql.j2.
+    LOWER(REGEXP_REPLACE(
+        REGEXP_REPLACE(NORMALIZE(manager_name, NFD), '\p{Mn}+', ''),
+        '[^a-zA-Z0-9]+', '_'))                                  AS canonical_id,
+    'fbref'                                                     AS source,
+    manager_name                                                AS source_id,
+    manager_name                                                AS display_name,
+    league,
+    -- season → slug ('2425'); bronze fbref_match_managers is year-start bigint (#404).
+    LPAD(CAST(MOD(season, 100) AS varchar), 2, '0')
+        || LPAD(CAST(MOD(season + 1, 100) AS varchar), 2, '0')  AS season,
+    'name_normalize'                                            AS confidence,
+    CAST(NULL AS double)                                        AS match_score
+FROM iceberg.bronze.fbref_match_managers
+WHERE manager_name IS NOT NULL AND manager_name <> ''
+GROUP BY
+    -- GROUP BY all output columns — also serves as DISTINCT
+    1, manager_name, league, season
+
+UNION ALL
+
+-- ===== fotmob (coachId mirror) =====
+SELECT
+    -- Alias override wins over the coach's own name slug (heals the same
+    -- mis-normalising spellings as the TM block; a TM-only raw form simply
+    -- never matches — safe no-op).
+    COALESCE(
+        a.canonical_id,
+        LOWER(REGEXP_REPLACE(
+            REGEXP_REPLACE(NORMALIZE(d.name, NFD), '\p{Mn}+', ''),
+            '[^a-zA-Z0-9]+', '_'))
+    )                                                           AS canonical_id,
+    'fotmob'                                                    AS source,
+    CAST(d.player_id AS varchar)                                AS source_id,
+    d.name                                                      AS display_name,
+    d.league,
+    -- season → slug ('2425'); bronze fotmob_player_details is year-start bigint (#404).
+    LPAD(CAST(MOD(d.season, 100) AS varchar), 2, '0')
+        || LPAD(CAST(MOD(d.season + 1, 100) AS varchar), 2, '0')  AS season,
+    -- 'name_alias' when a curated alias fired; 'name_normalize' when this
+    -- coach glues to an FBref canonical in the same league; 'orphan' otherwise
+    -- (surfaced by the Phase 2 orphan-rate report).
+    CASE WHEN a.canonical_id IS NOT NULL THEN 'name_alias'
+         WHEN fc.canonical_id IS NOT NULL THEN 'name_normalize'
+         ELSE 'orphan'
+    END                                                         AS confidence,
+    CAST(NULL AS double)                                        AS match_score
+FROM fotmob_coach d
+LEFT JOIN manager_aliases a
+    ON  a.league = d.league
+    AND a.norm = LOWER(REGEXP_REPLACE(
+            REGEXP_REPLACE(NORMALIZE(d.name, NFD), '\p{Mn}+', ''),
+            '[^a-zA-Z0-9]+', '_'))
+LEFT JOIN fbref_canon fc
+    ON  fc.canonical_id = LOWER(REGEXP_REPLACE(
+            REGEXP_REPLACE(NORMALIZE(d.name, NFD), '\p{Mn}+', ''),
+            '[^a-zA-Z0-9]+', '_'))
+    AND fc.league = d.league
+
+UNION ALL
+
+-- ===== transfermarkt (coach_id + dob/nationality carrier) =====
+SELECT
+    COALESCE(t.alias_cid, t.exact_cid, t.initial_cid, t.norm)   AS canonical_id,
+    'transfermarkt'                                             AS source,
+    t.coach_id                                                  AS source_id,
+    t.name                                                      AS display_name,
+    t.league,
+    t.season,
+    CASE WHEN t.alias_cid   IS NOT NULL THEN 'name_alias'
+         WHEN t.exact_cid   IS NOT NULL THEN 'name_normalize'
+         WHEN t.initial_cid IS NOT NULL THEN 'name_initial'
+         ELSE 'orphan'
+    END                                                         AS confidence,
+    CAST(NULL AS double)                                        AS match_score
+FROM tm_resolved t
