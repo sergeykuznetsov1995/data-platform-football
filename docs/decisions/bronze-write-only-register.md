@@ -33,7 +33,7 @@ per-item/per-season HTTP.
 |---|---|---|---|---|
 | `whoscored_season_stages` | FREE (same session as `scrape_schedule`, soccerdata cache) | ⚠ `stage` all-NULL; 6 rows | (b) keep | — (§3) |
 | `clubelo_team_history` | MODERATE (per-team histories) | no `rank`/`league`; **219,861 rows** (largest unread) | **(c) stop** | [#604] |
-| `fbref_match_keeper_stats` | FREE (parsed from the same match page as `combined_match_data`, `data_readers.py:1107`) | per-match GK stats (SoTA/GA/saves/save%); 7,677 rows; found in R5 review — was never registered | **(b) future** (per-match keeper block is absent from Gold entirely) | R5 §5.2 |
+| `fbref_match_keeper_stats` | FREE (parsed from the same match page as `combined_match_data`, `data_readers.py:1107`) | per-match GK stats (SoTA/GA/saves/save%); 7,677 rows; found in R5 review — was never registered | **(b) future** (per-match keeper block is absent from Gold entirely) | [#870] |
 
 ### Resolved since the 2026-06-11 inventory
 
@@ -225,4 +225,5 @@ gap tracked as followup [#738].
 [#704]: https://github.com/sergeykuznetsov1995/data-platform-football/issues/704
 [#735]: https://github.com/sergeykuznetsov1995/data-platform-football/issues/735
 [#736]: https://github.com/sergeykuznetsov1995/data-platform-football/issues/736
+[#870]: https://github.com/sergeykuznetsov1995/data-platform-football/issues/870
 [#738]: https://github.com/sergeykuznetsov1995/data-platform-football/issues/738
