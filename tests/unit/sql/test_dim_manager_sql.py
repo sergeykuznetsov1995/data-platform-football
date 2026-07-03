@@ -65,7 +65,18 @@ def _bootstrap(con) -> None:
          'ENG-Premier League', '2526', 'orphan', NULL),
         -- FBref-only historical manager (no FotMob) — enriched by Transfermarkt.
         ('sam_allardyce','fbref',  'Sam Allardyce','Sam Allardyce',
-         'ENG-Premier League', '2122', 'name_normalize', NULL)
+         'ENG-Premier League', '2122', 'name_normalize', NULL),
+        -- TM bridge rows (xref-improvements): dim_manager reaches TM
+        -- dob/nationality through xref_manager (source_id = coach_id), not the
+        -- old direct name-join. Allardyce glued via the name_initial tier —
+        -- the case the old join could not see.
+        ('mikel_arteta', 'transfermarkt', '5672', 'Mikel Arteta',
+         'ENG-Premier League', '2526', 'name_normalize', NULL),
+        ('sam_allardyce','transfermarkt', '9999', 'Allardyce, Sam',
+         'ENG-Premier League', '2122', 'name_initial', NULL),
+        -- TM orphan: must NOT mint a manager_id row and must NOT enrich.
+        ('unknown_coach','transfermarkt', '7777', 'Unknown Coach',
+         'ENG-Premier League', '2526', 'orphan', NULL)
         """
     )
     # issue #434: FotMob coach profile enriches nationality/dob by coachId.
@@ -105,7 +116,10 @@ def _bootstrap(con) -> None:
         ('5672', 'mikel_arteta', 'Mikel Arteta', 'Manager',
          DATE '1972-01-01', 'TM-Spain', '11', 'Arsenal', NULL,
          'ENG-Premier League', '2526'),
-        ('9999', 'sam_allardyce', 'Sam Allardyce', 'Manager',
+        -- NB: the DEPRECATED local canonical_id is the mis-normalised
+        -- surname-first slug — the old direct join on it would MISS this row;
+        -- only the xref bridge (coach_id 9999 → sam_allardyce) reaches it.
+        ('9999', 'allardyce_sam', 'Allardyce, Sam', 'Manager',
          DATE '1954-10-19', 'England', '99', 'West Brom', NULL,
          'ENG-Premier League', '2122')
         """
@@ -134,11 +148,18 @@ pytestmark = pytest.mark.unit
 
 class TestDimManagerDictionary:
     def test_one_row_per_canonical_manager(self, gold_rows):
-        """5 xref rows across sources/seasons collapse to 3 dim rows
-        (mikel_arteta, fm_mgr_unai, sam_allardyce)."""
+        """8 xref rows across sources/seasons collapse to 3 dim rows
+        (mikel_arteta, fm_mgr_unai, sam_allardyce); the TM orphan is excluded
+        from the spine."""
         assert len(gold_rows) == 3, gold_rows
         ids = [r["manager_id"] for r in gold_rows]
         assert len(ids) == len(set(ids)), f"duplicate manager_id: {ids}"
+
+    def test_tm_orphan_does_not_mint_manager(self, gold_rows):
+        """An un-glued TM coach (confidence='orphan') is almost always a
+        mis-normalised duplicate of an existing canonical — it must not
+        become its own manager_id row."""
+        assert not [r for r in gold_rows if r["manager_id"] == "unknown_coach"]
 
     def test_fbref_display_name_preferred(self, gold_rows):
         arteta = [r for r in gold_rows if r["manager_id"] == "mikel_arteta"]
@@ -176,8 +197,11 @@ class TestDimManagerDictionary:
         assert arteta["dob"] == datetime.date(1982, 3, 26), arteta  # not 1972
 
     def test_transfermarkt_fills_when_fotmob_absent(self, gold_rows):
-        """issue #434: a FBref-only historical manager gets nationality/dob
-        from Transfermarkt (canonical_id JOIN, no FotMob coverage)."""
+        """issue #434 + xref-improvements: a FBref-only historical manager
+        gets nationality/dob from Transfermarkt through the xref bridge
+        (coach_id → canonical_id) — here via a name_initial-tier link the old
+        direct canonical_id join could not see (xref carries the surname-first
+        'Allardyce, Sam' spelling)."""
         import datetime
 
         sam = [r for r in gold_rows if r["manager_id"] == "sam_allardyce"][0]
