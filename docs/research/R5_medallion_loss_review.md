@@ -131,12 +131,14 @@ whole-source-winner (shots/standings/lineups) вместо COALESCE там, гд
 3. `fct_team_match.sql.j2`: устаревшие комментарии про WS-мост приведены к факту.
 4. `bronze-write-only-register.md`: + fbref_match_keeper_stats (вердикт (b) future).
 
-## 5. Рекомендации (issues, не в этом PR)
+## 5. Рекомендации (issues заведены 2026-07-03)
 
-1. **Перезапуск xref для 1718/2425** (+13 матчей understat 1617) и пересборка e3/e4/gold — HIGH-1/MEDIUM-3/MEDIUM-5.
-2. Silver + gold для fbref_match_keeper_stats (повматчевые вратарские) — HIGH-2.
-3. fct_player_market_value: сохранять orphan-строки с префиксными id — MEDIUM-1.
-4. Gold-потребители: fotmob_transfers, capology_contract_extensions, sofifa_team_profile, fotmob_team_leaderboards — MEDIUM-4.
-5. **Reconciliation-DQ**: WARNING-гейт «silver rows vs gold attach» по образцу запросов B1/B2
-   этого ревью — сегодня потерю строк не ловит ни один гейт (audit-таблицы меряют только
+1. **#869** — бэкфил bronze SofaScore 1718/2425 (корень HIGH-1 — неполный bronze, не резолвер)
+   + xref + пересборка gold (+13 матчей understat 1617, MEDIUM-3/MEDIUM-5).
+2. **#870** — silver + gold для fbref_match_keeper_stats (повматчевые вратарские) — HIGH-2.
+3. **#871** — fct_player_market_value: сохранять orphan-строки с префиксными id — MEDIUM-1.
+4. **#873** — gold-потребители: fotmob_transfers, capology_contract_extensions,
+   sofifa_team_profile, fotmob_team_leaderboards — MEDIUM-4.
+5. **#872** — Reconciliation-DQ: WARNING-гейт «silver rows vs gold attach» по образцу запросов
+   B1/B2 этого ревью — сегодня потерю строк не ловит ни один гейт (audit-таблицы меряют только
    согласие значений, row floors — только грубый минимум). Дыра HIGH-1 жила незамеченной.
