@@ -958,3 +958,60 @@ def test_evaluate_manager_dob_collisions_ok_when_agreeing(duck_conn):
     assert res['verdict'] == 'OK'
     assert res['collisions'] == 0
     assert res['rows'] == []
+
+
+def test_orphan_rate_group_by_league(duck_conn):
+    """Multi-league prep: rates per (source, league), keys 'src|league',
+    latest-season filter evaluated PER league (table-wide max would mask the
+    league whose freshest partition is older)."""
+    duck_conn.execute(
+        "INSERT INTO iceberg.silver.xref_player VALUES "
+        # ENG latest season 2526: 10 rows, 0 orphans → OK.
+        + ", ".join(
+            f"('fb_e{i}', 'understat', 'e{i}', 'P{i}', 'ENG', '2526', "
+            f"'name_team', NULL)"
+            for i in range(10)
+        )
+        + ", "
+        # ENG stale season 2425: all orphans — must be EXCLUDED by the filter.
+        + ", ".join(
+            f"('us_o{i}', 'understat', 'o{i}', 'P{i}', 'ENG', '2425', "
+            f"'orphan', NULL)"
+            for i in range(10)
+        )
+        + ", "
+        # ESP latest season is only 2425 (older than ENG's): 10 rows,
+        # 5 orphans → ERROR at 50%. A table-wide max(season)=2526 would have
+        # dropped ESP from the evaluation entirely.
+        + ", ".join(
+            f"('fb_s{i}', 'understat', 's{i}', 'P{i}', 'ESP', '2425', "
+            f"'{'orphan' if i < 5 else 'name_team'}', NULL)"
+            for i in range(10)
+        )
+    )
+
+    res = xref_dq.evaluate_orphan_rate_per_source(
+        table='iceberg.silver.xref_player',
+        warning_threshold=10.0,
+        error_threshold=25.0,
+        current_season_only=True,
+        group_by_league=True,
+    )
+
+    assert res['per_source']['understat|ENG']['verdict'] == 'OK'
+    assert res['per_source']['understat|ENG']['orphans'] == 0
+    assert res['per_source']['understat|ESP']['verdict'] == 'ERROR'
+    assert res['per_source']['understat|ESP']['orphans'] == 5
+    breach = [b for b in res['breaches'] if b.get('league') == 'ESP']
+    assert len(breach) == 1 and breach[0]['source'] == 'understat'
+
+
+def test_orphan_rate_default_shape_unchanged(duck_conn):
+    """group_by_league=False keeps the historical single-league key shape."""
+    duck_conn.execute(
+        "INSERT INTO iceberg.silver.xref_player VALUES "
+        "('fb_a', 'understat', 'a', 'P', 'ENG', '2526', 'name_team', NULL)"
+    )
+    res = xref_dq.evaluate_orphan_rate_per_source(
+        table='iceberg.silver.xref_player')
+    assert set(res['per_source'].keys()) == {'understat'}
