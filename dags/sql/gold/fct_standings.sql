@@ -151,3 +151,11 @@ select
     snapshot_at,
     cast(snapshot_at as date)                             as as_of_date
 from unioned
+-- Scope to the canonical season universe (gold.dim_season, rendered from
+-- configs/medallion/competitions.yaml). The Silver standings sources carry
+-- FotMob/SofaScore HISTORICAL seasons beyond the platform's FBref spine
+-- (e.g. 2010/11-2015/16) that dim_season does NOT list; without this filter
+-- they orphan ref_integrity[fct_standings.season -> dim_season] and fail
+-- validate_gold_quality. dim_season is a tiny config dim materialised in an
+-- earlier Gold layer (s2a_config_dims), so it always exists when this runs.
+where season in (select season from iceberg.gold.dim_season)
