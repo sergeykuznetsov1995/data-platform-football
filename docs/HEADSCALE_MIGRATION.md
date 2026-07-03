@@ -40,7 +40,7 @@ docker compose --profile headscale up -d headscale
 docker compose up -d caddy   # подхватит PUBLIC_IP-порты; серты для bi/auth/hs
 # юзер платформы в headscale появится при первом OIDC-логине; для VM нужен свой:
 docker compose exec headscale headscale users create platform
-docker compose exec headscale headscale preauthkeys create --user platform --expiration 1h
+docker compose exec headscale headscale preauthkeys create --user <ID из users list> --expiration 1h
 ```
 
 Проверка: `https://hs.<домен>/health` отвечает из интернета с валидным сертом.
