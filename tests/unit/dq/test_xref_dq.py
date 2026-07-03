@@ -813,3 +813,79 @@ def test_post_cutover_fct_player_match_predicates_match_sql_schema():
                 f"{check.name}: predicate references '{col}' which is not an "
                 f"output column of fct_player_match.sql"
             )
+
+
+# ===========================================================================
+# DOB corroboration DQ (companion to the resolver name_team_dob tier)
+# ===========================================================================
+
+def test_xref_player_review_rule_enum_includes_dob_veto():
+    """The resolver's DOB-veto pass emits rule='dob_veto' — the enum gate
+    must allow it or the first vetoed row turns the DAG red."""
+    checks = xref_dq.build_xref_player_review_checks()
+    rule_checks = [c for c in checks
+                   if 'enum_compliance' in c.name and '.rule' in c.name]
+    assert len(rule_checks) == 1
+    assert "'dob_veto'" in rule_checks[0].params['where']
+
+
+def test_default_player_dob_projections_are_bronze_only():
+    """Circularity guard: DOB must come from Bronze — silver profile tables
+    depend on xref_player themselves."""
+    for src, proj in xref_dq.DEFAULT_PLAYER_DOB_PROJECTIONS:
+        assert 'iceberg.bronze.' in proj, f"{src}: non-Bronze DOB projection"
+        assert 'silver' not in proj, f"{src}: circular silver read"
+    assert {s for s, _ in xref_dq.DEFAULT_PLAYER_DOB_PROJECTIONS} == {
+        'fotmob', 'sofascore', 'transfermarkt', 'sofifa', 'whoscored',
+    }
+
+
+def _seed_dob_conflict_fixture(duck_conn, tm_dob: str):
+    """xref_player + two injectable DOB projections (fotmob vs TM)."""
+    duck_conn.execute(
+        "INSERT INTO iceberg.silver.xref_player VALUES "
+        "('fb_a', 'fotmob', '10', 'Player A', 'ENG', '2425', 'name_team', 95.0), "
+        "('fb_a', 'transfermarkt', '77', 'Player A', 'ENG', '2425', "
+        " 'name_team_surname', 99.0), "
+        # Orphans are excluded from the conflict scan by design.
+        "('tm_99', 'transfermarkt', '99', 'Player X', 'ENG', '2425', 'orphan', NULL)"
+    )
+    duck_conn.execute(
+        "CREATE TABLE dob_fm AS SELECT '10' AS source_id, DATE '1998-03-01' AS dob"
+    )
+    duck_conn.execute(
+        f"CREATE TABLE dob_tm AS SELECT '77' AS source_id, DATE '{tm_dob}' AS dob "
+        "UNION ALL SELECT '99', DATE '1990-01-01'"
+    )
+    return (
+        ('fotmob', 'SELECT source_id, dob FROM dob_fm'),
+        ('transfermarkt', 'SELECT source_id, dob FROM dob_tm'),
+    )
+
+
+def test_evaluate_dob_conflicts_flags_disagreement(duck_conn):
+    projections = _seed_dob_conflict_fixture(duck_conn, tm_dob='1995-07-20')
+    res = xref_dq.evaluate_dob_conflicts(dob_projections=projections)
+    assert res['verdict'] == 'WARNING'
+    assert res['conflicts'] == 1
+    assert res['rows'][0]['canonical_id'] == 'fb_a'
+    assert res['rows'][0]['n_sources'] == 2
+    assert res['rows'][0]['spread_days'] > 1
+    assert res['truncated'] is False
+
+
+def test_evaluate_dob_conflicts_tolerates_one_day(duck_conn):
+    projections = _seed_dob_conflict_fixture(duck_conn, tm_dob='1998-03-02')
+    res = xref_dq.evaluate_dob_conflicts(dob_projections=projections)
+    assert res['verdict'] == 'OK'
+    assert res['conflicts'] == 0
+    assert res['rows'] == []
+
+
+def test_evaluate_dob_conflicts_empty_table_is_ok(duck_conn):
+    duck_conn.execute("CREATE TABLE dob_empty (source_id VARCHAR, dob DATE)")
+    res = xref_dq.evaluate_dob_conflicts(
+        dob_projections=(('fotmob', 'SELECT source_id, dob FROM dob_empty'),)
+    )
+    assert res == {'conflicts': 0, 'rows': [], 'truncated': False,
+                   'verdict': 'OK'}
