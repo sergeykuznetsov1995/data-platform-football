@@ -23,6 +23,18 @@ Headscale ── https://hs.<домен> (вход в VPN через тот же
    `PLATFORM_DOMAIN`, `PUBLIC_IP`, `HEADSCALE_OIDC_CLIENT_SECRET`,
    `COMPOSE_PROFILES=headscale`. Cutover-переключатели — ПОКА не заполнять.
 4. Открыть на файрволе VM: tcp/80, tcp/443, udp/3478.
+5. **Docker: `userland-proxy: false`** — обязательно для VPN-гейта Caddy.
+   С включённым docker-proxy (дефолт) запросы приходят в Caddy с source
+   `172.x` (bridge-gateway), и `remote_ip 100.64.0.0/10` НИКОГДА не матчит
+   VPN-клиента → все VPN-сервисы отдают 403. Фикс (требует рестарт docker —
+   единоразовый даунтайм стека, ~2-3 мин; volumes целы, пайплайны на паузе):
+   ```bash
+   echo '{"userland-proxy": false}' > /etc/docker/daemon.json
+   systemctl restart docker
+   ```
+   С `--snat-subnet-routes=false` (шаг cutover) + этим флагом Caddy видит
+   настоящий 100.64.x → гейт работает; заодно /admin-гейт Keycloak и будущий
+   rate-limit получают реальный client IP.
 
 ## 1. Подготовка (без даунтайма, старый Tailscale продолжает работать)
 
