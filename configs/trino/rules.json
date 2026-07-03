@@ -2,8 +2,7 @@
   "catalogs": [
     { "user": "airflow|superset|openmetadata", "allow": "all" },
     { "group": "platform-admins", "allow": "all" },
-    { "group": "analysts", "catalog": "iceberg|system", "allow": "read-only" },
-    { "user": "analyst_svc", "catalog": "iceberg|system", "allow": "read-only" },
+    { "catalog": "iceberg|system", "allow": "read-only" },
     { "allow": "none" }
   ],
   "schemas": [
@@ -21,13 +20,6 @@
       "privileges": ["SELECT", "INSERT", "DELETE", "UPDATE", "OWNERSHIP"]
     },
     {
-      "group": "analysts",
-      "catalog": "iceberg",
-      "schema": "silver|gold",
-      "privileges": ["SELECT"]
-    },
-    {
-      "user": "analyst_svc",
       "catalog": "iceberg",
       "schema": "silver|gold",
       "privileges": ["SELECT"]
