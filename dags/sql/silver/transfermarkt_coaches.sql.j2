@@ -12,12 +12,13 @@
 -- Feeds gold.dim_manager nationality/dob enrichment as the historical-coverage
 -- source on top of FotMob (which only covers current-season coaches).
 --
--- canonical_id (issue #434/#619): derived here with the SAME diacritic-stripping
--- name-normalize idiom as silver.xref_manager.sql — NOT via an xref bridge.
--- Managers canonicalise deterministically by name (no fuzzy resolver), so the
--- TM coach lands on the same canonical_id as the FBref/FotMob spine and
--- dim_manager's LEFT JOIN enriches it. A TM name that matches no spine coach
--- simply fails the JOIN (does not pollute dim_manager).
+-- canonical_id (issue #434/#619) — DEPRECATED since the xref-improvements
+-- pass: gold.dim_manager now reaches TM dob/nationality through
+-- silver.xref_manager (source='transfermarkt', source_id=coach_id), whose
+-- cascade also covers name_alias / name_initial matches this locally-computed
+-- name slug cannot see. The column is kept for the transition (no external
+-- consumer left besides ad-hoc queries); dropping it + the alias JOIN below
+-- is a follow-up.
 --
 -- Alias override (issue #619): a few TM coaches store a different spelling /
 -- name order (surname-first "Le Bris, Régis") that name-normalises to a
