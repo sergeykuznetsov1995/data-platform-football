@@ -81,11 +81,9 @@ PURE_SQL_XREF_TRANSFORMS = [
     ),
     # xref_referee moved to a dedicated Jinja-template callable (_run_xref_referee,
     # issue #143) — it now embeds referee_aliases.yaml like xref_team.
-    (
-        'xref_manager',
-        'dags/sql/silver/xref_manager.sql',
-        'xref_manager',
-    ),
+    # xref_manager moved to a dedicated Jinja-template callable
+    # (_run_xref_manager, xref-improvements) — it now embeds
+    # manager_aliases.yaml and bridges Transfermarkt coaches.
 ]
 
 
@@ -213,11 +211,68 @@ def _run_xref_referee(**context) -> Dict[str, Any]:
             logger.warning("Failed to cleanup temp file %s: %s", tmp_path, e)
 
 
-def _run_pure_sql_xref(sql_file: str, table_name: str, **context) -> Dict[str, Any]:
-    """Generic CTAS runner for xref_match / xref_referee / xref_manager.
+def _run_xref_manager(**context) -> Dict[str, Any]:
+    """Render the xref_manager Jinja template and run it as a Silver CTAS.
 
-    These three are pure-SELECT files (no Jinja) so we can call
-    ``run_silver_transform`` directly with the relative path.
+    Mirror of :func:`_run_xref_referee`: embeds the curated
+    manager_aliases.yaml as inline VALUES so mis-normalising spellings
+    (surname-first TM forms etc.) resolve onto the FBref-spine canonical_id.
+    ``source=None`` merges the ``_generic`` bucket with every per-source
+    bucket — one alias map serves TM and FotMob alike (a TM-only raw form
+    never matches a FotMob name, safe no-op). The tempfile is removed in
+    ``finally`` regardless of CTAS outcome.
+    """
+    from pathlib import Path
+
+    from utils.medallion_config import (
+        get_manager_alias_sql_values,
+        render_sql_template,
+    )
+    from utils.silver_tasks import run_silver_transform
+
+    template_path = Path('/opt/airflow/dags/sql/silver/xref_manager.sql.j2')
+    if not template_path.exists():
+        raise FileNotFoundError(f"xref_manager template not found: {template_path}")
+
+    rendered_sql = render_sql_template(
+        template_path,
+        manager_aliases_values_sql=get_manager_alias_sql_values(source=None),
+    )
+    logger.info("Rendered xref_manager.sql.j2 — %d chars", len(rendered_sql))
+
+    with tempfile.NamedTemporaryFile(
+        mode='w',
+        suffix='_xref_manager.sql',
+        delete=False,
+        encoding='utf-8',
+    ) as tmp:
+        tmp.write(rendered_sql)
+        tmp_path = tmp.name
+
+    try:
+        result = run_silver_transform(
+            sql_file=tmp_path,
+            table_name='xref_manager',
+            schema='silver',
+        )
+        logger.info(
+            "xref_manager CTAS complete: %d rows in %s",
+            result.get('rows', 0),
+            result.get('table'),
+        )
+        return result
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError as e:
+            logger.warning("Failed to cleanup temp file %s: %s", tmp_path, e)
+
+
+def _run_pure_sql_xref(sql_file: str, table_name: str, **context) -> Dict[str, Any]:
+    """Generic CTAS runner for xref_match (pure-SELECT, no Jinja).
+
+    Kept list-driven for any future pure-SQL xref additions; xref_referee and
+    xref_manager graduated to dedicated Jinja callables.
     """
     from utils.silver_tasks import run_silver_transform
 
@@ -236,29 +291,51 @@ def _run_pure_sql_xref(sql_file: str, table_name: str, **context) -> Dict[str, A
 
 
 def _run_xref_player(**context) -> Dict[str, Any]:
-    """Run the Python xref_player resolver (T3 deliverable).
+    """Run the Python xref_player resolver (T3 deliverable) per in-scope league.
 
-    Materialises ``iceberg.silver.xref_player`` from FBref + Understat +
-    WhoScored Bronze data. ``run_resolver`` raises ``ResolverError`` if
-    the known-pair regression check (10/10 APL anchors) drops below 8/10
-    — that aborts the DAG before partial data lands.
+    Materialises ``iceberg.silver.xref_player`` for every league flagged
+    ``in_scope: true`` in competitions.yaml — a SEQUENTIAL in-task loop, NOT
+    Airflow dynamic task mapping, deliberately: (a) ``max_active_tasks=1``
+    serialises mapped instances anyway, so mapping buys no parallelism here;
+    (b) the first league runs ``write_mode='rebuild'`` (DROP+CREATE) and the
+    rest ``'replace_league'`` — an ordering a retry of one mapped instance
+    cannot guarantee; (c) mapped instances would fragment the summary XCom the
+    DQ task consumes. Revisit ``.expand()`` once leagues are fully independent.
 
-    Summary dict is pushed to XCom for the downstream DQ check (T6)
-    to consume.
+    ``run_resolver`` raises ``ResolverError`` if a league's known-pair
+    regression drops below the gate — that aborts the DAG before the
+    remaining leagues run (a league with no curated anchors skips the gate
+    with a WARNING).
+
+    Summary dict (keyed by league) is pushed to XCom for the downstream DQ
+    check (T6) to consume.
     """
+    from utils.medallion_config import get_in_scope_competitions
     from utils.xref_player_resolver import run_resolver
 
-    summary = run_resolver(
-        target_table='iceberg.silver.xref_player',
-        league='ENG-Premier League',
-        seasons=None,                # all configured seasons (E1: APL only)
-        chunk_size=500,
-        drop_before_insert=True,
-    )
+    leagues = get_in_scope_competitions()
+    if not leagues:
+        raise ValueError(
+            "competitions.yaml has no in_scope leagues — refusing to "
+            "materialise an empty xref_player."
+        )
 
-    logger.info("xref_player resolver summary: %s", summary)
-    context['ti'].xcom_push(key='resolver_summary', value=summary)
-    return summary
+    summaries: Dict[str, Any] = {}
+    for i, league in enumerate(leagues):
+        summaries[league] = run_resolver(
+            target_table='iceberg.silver.xref_player',
+            league=league,
+            seasons=None,            # all configured seasons for the league
+            chunk_size=500,
+            drop_before_insert=True,
+            write_mode='rebuild' if i == 0 else 'replace_league',
+        )
+        logger.info(
+            "xref_player resolver summary (%s): %s", league, summaries[league]
+        )
+
+    context['ti'].xcom_push(key='resolver_summary', value=summaries)
+    return summaries
 
 
 def _validate_xref(**context) -> Dict[str, Any]:
@@ -285,6 +362,8 @@ def _validate_xref(**context) -> Dict[str, Any]:
     from utils.xref_dq import (
         build_all_xref_checks,
         evaluate_bronze_xref_freshness_gap,
+        evaluate_dob_conflicts,
+        evaluate_manager_dob_collisions,
         evaluate_orphan_rate_per_source,
         report_orphan_teams,
     )
@@ -382,6 +461,64 @@ def _validate_xref(**context) -> Dict[str, Any]:
         logger.exception("orphan team report failed (non-fatal)")
 
     # ------------------------------------------------------------------
+    # Phase 2.7 — cross-source DOB conflicts (companion to name_team_dob)
+    # A canonical whose linked sources disagree on birth date by >1 day is
+    # a suspected false merge; the resolver excludes such canonicals from
+    # its own DOB map, so this WARNING report is where they surface.
+    # ------------------------------------------------------------------
+    try:
+        dob_conflicts = evaluate_dob_conflicts()
+        verdict = dob_conflicts['verdict']
+        report.results.append(CheckResult(
+            name='dob_conflicts[xref_player]',
+            kind='coverage',
+            severity='WARNING',
+            passed=verdict == 'OK',
+            details=(
+                f"verdict={verdict}, conflicts={dob_conflicts['conflicts']}, "
+                f"rows={dob_conflicts['rows'][:10]}"
+            ),
+            value=float(dob_conflicts['conflicts']),
+        ))
+        context['ti'].xcom_push(key='dob_conflicts', value=dob_conflicts)
+    except Exception as e:
+        logger.exception("dob-conflict evaluation failed (non-fatal)")
+        report.results.append(CheckResult(
+            name='dob_conflicts[xref_player]',
+            kind='coverage',
+            severity='WARNING',
+            passed=False,
+            error=str(e),
+        ))
+
+    # Manager DOB corroboration: FotMob-vs-TM disagreement per canonical is a
+    # suspected false merge (strongest signal for name_initial-tier rows).
+    try:
+        mgr_dob = evaluate_manager_dob_collisions()
+        report.results.append(CheckResult(
+            name='dob_collisions[xref_manager]',
+            kind='coverage',
+            severity='WARNING',
+            passed=mgr_dob['verdict'] == 'OK',
+            details=(
+                f"verdict={mgr_dob['verdict']}, "
+                f"collisions={mgr_dob['collisions']}, "
+                f"rows={mgr_dob['rows'][:10]}"
+            ),
+            value=float(mgr_dob['collisions']),
+        ))
+        context['ti'].xcom_push(key='manager_dob_collisions', value=mgr_dob)
+    except Exception as e:
+        logger.exception("manager dob-collision evaluation failed (non-fatal)")
+        report.results.append(CheckResult(
+            name='dob_collisions[xref_manager]',
+            kind='coverage',
+            severity='WARNING',
+            passed=False,
+            error=str(e),
+        ))
+
+    # ------------------------------------------------------------------
     # Phase 2.5 — Bronze-vs-xref freshness gap (Issue #15 regression guard)
     # ------------------------------------------------------------------
     try:
@@ -475,7 +612,7 @@ with DAG(
         )
         xref_team_task >> xref_referee_task
 
-        # xref_match / xref_manager — plain SELECT files
+        # xref_match — plain SELECT file
         prev = xref_referee_task
         for task_id, sql_file, table_name in PURE_SQL_XREF_TRANSFORMS:
             t = PythonOperator(
@@ -488,6 +625,14 @@ with DAG(
             )
             prev >> t
             prev = t
+
+        # xref_manager — Jinja template (.sql.j2), embeds manager_aliases.yaml
+        # and bridges Transfermarkt coach_ids onto the FBref name-spine.
+        xref_manager_task = PythonOperator(
+            task_id='xref_manager',
+            python_callable=_run_xref_manager,
+        )
+        prev >> xref_manager_task
 
     # =========================================================================
     # xref_player — Python resolver (rapidfuzz / unidecode, NOT a Trino CTAS)

@@ -23,9 +23,9 @@ Verified against the SQL files on 2026-05-08:
 * ``xref_match``    — {``exact``}
 * ``xref_referee``  — {``name_normalize``}
 * ``xref_player``   — {``exact``, ``name_team``, ``name_team_jersey``,
-                       ``name_team_dob``, ``orphan``}  (jersey/dob are
-                       reserved STUBS but allowed in the enum so adding
-                       a single tier later does not require touching DQ.)
+                       ``name_team_dob``, ``orphan``}  (``name_team_dob``
+                       is live since the DOB-corroboration tier; jersey
+                       remains a reserved STUB.)
 
 Sources (xref_team / xref_referee / xref_match / xref_player) values
 are also enforced via enum checks against the documented schema.
@@ -275,19 +275,29 @@ def build_xref_referee_checks() -> List[Check]:
     ]
 
 
-def build_xref_manager_checks() -> List[Check]:
-    """DQ for ``iceberg.silver.xref_manager`` — FBref spine + FotMob mirror (#144).
+#: Anchor canonical_ids for the manager 2-source regression guard (mirrors
+#: KNOWN_REFEREE_CANONICALS). Long-tenured APL head coaches present in both
+#: the FBref spine and at least one mirror source across recent seasons.
+KNOWN_MANAGER_CANONICALS = (
+    'mikel_arteta',
+    'pep_guardiola',
+    'unai_emery',
+)
 
-    Sources: FBref scorebox parser (bronze.fbref_match_managers) +
-    FotMob coachId mirror (bronze.fotmob_player_details WHERE is_coach).
-    Bounds sized for APL across 8 seasons: ~30-50 distinct managers × per-season
-    presence × 2 sources ≈ 60-400 rows. Upper bound is generous for future
-    multi-league expansion. Per-source orphan-rate (FotMob coaches not glued to
-    an FBref counterpart) is evaluated separately by
-    :func:`evaluate_orphan_rate_per_source` and appended by the DAG callable.
+
+def build_xref_manager_checks() -> List[Check]:
+    """DQ for ``iceberg.silver.xref_manager`` — FBref spine + FotMob coachId
+    mirror (#144) + Transfermarkt coach_id bridge (xref-improvements).
+
+    Bounds sized for APL across ~10 seasons: ~30-50 distinct managers ×
+    per-season presence × 3 sources ≈ 900 rows worst case — max 2000 keeps
+    headroom; revisit per league onboarded. Per-source orphan-rate is
+    evaluated separately by :func:`evaluate_orphan_rate_per_source` and
+    appended by the DAG callable; TM-vs-FotMob dob disagreement by
+    :func:`evaluate_manager_dob_collisions` (Phase 2.7).
     """
     table = 'iceberg.silver.xref_manager'
-    return [
+    checks = [
         CHECK.row_count(table, min_rows=20, max_rows=2000),
 
         CHECK.no_duplicates(
@@ -299,13 +309,15 @@ def build_xref_manager_checks() -> List[Check]:
 
         check_enum_compliance(
             table, 'source',
-            allowed=['fbref', 'fotmob'],
+            allowed=['fbref', 'fotmob', 'transfermarkt'],
             severity='ERROR',
         ),
 
+        # name_alias / name_initial added with the TM bridge (alias YAML tier
+        # + surname-and-first-initial tier); see xref_manager.sql.j2 header.
         check_enum_compliance(
             table, 'confidence',
-            allowed=['name_normalize', 'orphan'],
+            allowed=['name_alias', 'name_normalize', 'name_initial', 'orphan'],
             severity='ERROR',
         ),
 
@@ -322,7 +334,53 @@ def build_xref_manager_checks() -> List[Check]:
             severity='WARNING',
             name='manager_collision[fotmob.canonical_id]',
         ),
+
+        # Same guard for the TM bridge: two distinct coach_ids landing on one
+        # canonical within (league, season) is a suspected false merge (most
+        # likely a name_initial mis-fire) — WARNING, inspect + alias-fix.
+        CHECK.no_duplicates(
+            table,
+            pk=['canonical_id', 'league', 'season'],
+            where="source = 'transfermarkt'",
+            severity='WARNING',
+            name='manager_collision[transfermarkt.canonical_id]',
+        ),
+
+        # 3rd source presence: TM coaches must actually reach the table.
+        # WARNING until the TM coaches backfill is confirmed on the target
+        # env, then promote to ERROR.
+        CHECK.row_count(
+            table=table,
+            min_rows=1,
+            where="source = 'transfermarkt'",
+            severity='WARNING',
+            name='source_present[xref_manager.transfermarkt]',
+        ),
     ]
+
+    # Anchor regression (mirrors the referee anchors): each known manager
+    # canonical must carry ≥2 distinct non-orphan sources. Implemented as
+    # "0 offending anchors" via row_count over a per-anchor aggregate.
+    anchors_in = ", ".join(f"'{cid}'" for cid in KNOWN_MANAGER_CANONICALS)
+    checks.append(
+        CHECK.row_count(
+            table=table,
+            min_rows=0,
+            max_rows=0,
+            where=(
+                "canonical_id IN ("
+                f"SELECT canonical_id FROM {table} "
+                f"WHERE canonical_id IN ({anchors_in}) "
+                "AND confidence <> 'orphan' "
+                "GROUP BY canonical_id "
+                "HAVING COUNT(DISTINCT source) < 2"
+                f") AND canonical_id IN ({anchors_in})"
+            ),
+            severity='WARNING',
+            name='known_manager_anchors[xref_manager]',
+        )
+    )
+    return checks
 
 
 def build_xref_player_checks() -> List[Check]:
@@ -348,12 +406,12 @@ def build_xref_player_checks() -> List[Check]:
 
         # confidence — mirror the resolver cascade tier names verbatim.
         # 'name_team_surname' / 'name_team_subset' / 'name_team_nickname' /
-        # 'name_team_alias' added by R2-followup v2 resolver. 'name_team_jersey'
-        # / 'name_team_dob' remain reserved STUBs (Bronze does not yet expose
-        # cross-source jersey/DOB consistently). 'ambiguous' is INTENTIONALLY
-        # NOT in this list — Fellegi-Sunter clerical-review rows must land in
-        # silver.xref_player_review, not xref_player. An 'ambiguous' value
-        # here is therefore a DQ ERROR by design.
+        # 'name_team_alias' added by R2-followup v2 resolver. 'name_team_dob'
+        # is live (DOB-corroboration adjudication of ambiguous rows);
+        # 'name_team_jersey' remains a reserved STUB. 'ambiguous' is
+        # INTENTIONALLY NOT in this list — Fellegi-Sunter clerical-review rows
+        # must land in silver.xref_player_review, not xref_player. An
+        # 'ambiguous' value here is therefore a DQ ERROR by design.
         check_enum_compliance(
             table, 'confidence',
             allowed=['exact', 'name_team', 'name_team_surname',
@@ -440,7 +498,9 @@ def build_xref_player_review_checks() -> List[Check]:
       * no_nulls on identifying columns.
       * enum compliance on ``rule`` — must match the rule labels emitted
         by the cascade (``surname_collision``, ``token_set_band``,
-        ``nickname_collision``).
+        ``nickname_collision``) plus the DOB-veto pass (``dob_veto`` —
+        a fuzzy link whose Bronze DOB contradicts the canonical's
+        consolidated DOB, demoted to review by the resolver).
       * enum compliance on ``source`` — six cascaded sources (everything
         except the FBref spine, which never lands in clerical review).
     """
@@ -462,7 +522,7 @@ def build_xref_player_review_checks() -> List[Check]:
         check_enum_compliance(
             table, 'rule',
             allowed=['surname_collision', 'token_set_band',
-                     'nickname_collision'],
+                     'nickname_collision', 'dob_veto'],
             severity='ERROR',
         ),
 
@@ -593,6 +653,7 @@ def evaluate_orphan_rate_per_source(
     warning_threshold: float = 10.0,
     error_threshold: float = 25.0,
     current_season_only: bool = False,
+    group_by_league: bool = False,
 ) -> Dict[str, Any]:
     """Compute orphan-rate per ``source`` for an xref table and classify.
 
@@ -614,29 +675,53 @@ def evaluate_orphan_rate_per_source(
       * pct > error_threshold          — ERROR
 
     ``current_season_only`` (#803): when True, the rate is measured only on the
-    latest season (``season = (SELECT max(season) FROM <table>)``). After a
-    historical backfill the table spans ~10 seasons whose old, thin FBref spine
-    leaves most source rows legitimately orphan (#788) — table-wide that inflates
-    the rate into a false ERROR (fotmob 28.8% / xref_team TM 86.9%), while the
-    current season — where the spine is thick — is the meaningful resolver-health
-    signal (1.3% / 0%). Sources absent in the latest season drop out of the
-    GROUP BY and are simply not evaluated.
+    latest season. After a historical backfill the table spans ~10 seasons whose
+    old, thin FBref spine leaves most source rows legitimately orphan (#788) —
+    table-wide that inflates the rate into a false ERROR (fotmob 28.8% /
+    xref_team TM 86.9%), while the current season — where the spine is thick —
+    is the meaningful resolver-health signal (1.3% / 0%). Sources absent in the
+    latest season drop out of the GROUP BY and are simply not evaluated.
+
+    ``group_by_league`` (multi-league prep): when True, rates are computed per
+    ``(source, league)`` — ``per_source`` keys become ``'{source}|{league}'``
+    and breaches carry a ``league`` field. The latest-season filter is then
+    evaluated PER LEAGUE (a table-wide max season would mask a league whose
+    freshest data is older). When False (default) the output is byte-identical
+    to the historical single-league shape.
 
     NOTE: This function does NOT raise. Callers decide whether to escalate.
     """
     qualified = _qualify(table)
-    where = (
-        f"WHERE season = (SELECT max(season) FROM {qualified}) "
-        if current_season_only else ""
-    )
-    sql = (
-        "SELECT source, "
-        "       COUNT(*) AS total, "
-        "       COUNT_IF(confidence = 'orphan') AS orphans "
-        f"FROM {qualified} "
-        f"{where}"
-        "GROUP BY source"
-    )
+    if group_by_league:
+        # Per-league latest season via a window — a table-wide max(season)
+        # would silently exclude any league whose freshest partition is older.
+        inner = (
+            "SELECT source, league, confidence, season, "
+            "MAX(season) OVER (PARTITION BY league) AS max_season "
+            f"FROM {qualified}"
+        )
+        where = "WHERE season = max_season " if current_season_only else ""
+        sql = (
+            "SELECT source, league, "
+            "       COUNT(*) AS total, "
+            "       COUNT_IF(confidence = 'orphan') AS orphans "
+            f"FROM ({inner}) "
+            f"{where}"
+            "GROUP BY source, league"
+        )
+    else:
+        where = (
+            f"WHERE season = (SELECT max(season) FROM {qualified}) "
+            if current_season_only else ""
+        )
+        sql = (
+            "SELECT source, "
+            "       COUNT(*) AS total, "
+            "       COUNT_IF(confidence = 'orphan') AS orphans "
+            f"FROM {qualified} "
+            f"{where}"
+            "GROUP BY source"
+        )
     conn = _get_conn()
     try:
         cur = conn.cursor()
@@ -654,7 +739,14 @@ def evaluate_orphan_rate_per_source(
     overall_orphans = 0
     overall_verdict = 'OK'
 
-    for src, total, orphans in rows:
+    for row in rows:
+        if group_by_league:
+            src, league, total, orphans = row
+            key = f"{src}|{league}"
+        else:
+            src, total, orphans = row
+            league = None
+            key = src
         pct = (100.0 * orphans / total) if total else 0.0
         if pct > error_threshold:
             verdict = 'ERROR'
@@ -663,14 +755,17 @@ def evaluate_orphan_rate_per_source(
         else:
             verdict = 'OK'
 
-        per_source[src] = {
+        per_source[key] = {
             'total': int(total),
             'orphans': int(orphans),
             'pct': round(pct, 2),
             'verdict': verdict,
         }
         if verdict != 'OK':
-            breaches.append({'source': src, 'pct': round(pct, 2), 'verdict': verdict})
+            breach = {'source': src, 'pct': round(pct, 2), 'verdict': verdict}
+            if league is not None:
+                breach['league'] = league
+            breaches.append(breach)
         overall_total += int(total)
         overall_orphans += int(orphans)
 
@@ -748,6 +843,208 @@ def report_orphan_teams(
         'per_source': per_source,
         'rows': out_rows,
         'truncated': len(rows) > limit,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Cross-source DOB conflicts (companion to the resolver's name_team_dob tier)
+# ---------------------------------------------------------------------------
+
+#: Bronze DOB projections per source: (source, SQL yielding (source_id, dob)).
+#: Mirrors xref_player_resolver._fetch_dob_maps (Bronze only — silver profile
+#: tables depend on xref_player, reading them here would be circular). Trino
+#: dialect; tests inject DuckDB-compatible projections instead.
+DEFAULT_PLAYER_DOB_PROJECTIONS = (
+    ('fotmob',
+     "SELECT CAST(player_id AS varchar) AS source_id, "
+     "max_by(TRY_CAST(date_of_birth AS DATE), _ingested_at) AS dob "
+     "FROM iceberg.bronze.fotmob_team_squad WHERE player_id IS NOT NULL "
+     "GROUP BY CAST(player_id AS varchar)"),
+    ('sofascore',
+     "SELECT CAST(player_id AS varchar) AS source_id, "
+     "max_by(TRY_CAST(date_of_birth AS DATE), _ingested_at) AS dob "
+     "FROM iceberg.bronze.sofascore_player_profile WHERE player_id IS NOT NULL "
+     "GROUP BY CAST(player_id AS varchar)"),
+    ('transfermarkt',
+     "SELECT CAST(player_id AS varchar) AS source_id, "
+     "max_by(dob, _ingested_at) AS dob "
+     "FROM iceberg.bronze.transfermarkt_players WHERE player_id IS NOT NULL "
+     "GROUP BY CAST(player_id AS varchar)"),
+    ('sofifa',
+     "SELECT CAST(player_id AS varchar) AS source_id, "
+     "max_by(TRY(CAST(date_parse(dob, '%b %e, %Y') AS DATE)), _ingested_at) AS dob "
+     "FROM iceberg.bronze.sofifa_player_ratings "
+     "WHERE player_id IS NOT NULL AND dob IS NOT NULL "
+     "GROUP BY CAST(player_id AS varchar)"),
+    ('whoscored',
+     "SELECT CAST(CAST(player_id AS bigint) AS varchar) AS source_id, "
+     "max_by(TRY_CAST(date_of_birth AS DATE), _ingested_at) AS dob "
+     "FROM iceberg.bronze.whoscored_player_profile WHERE player_id IS NOT NULL "
+     "GROUP BY CAST(CAST(player_id AS bigint) AS varchar)"),
+)
+
+
+def evaluate_dob_conflicts(
+    xref_table: str = 'iceberg.silver.xref_player',
+    dob_projections=DEFAULT_PLAYER_DOB_PROJECTIONS,
+    tolerance_days: int = 1,
+    limit: int = 50,
+) -> Dict[str, Any]:
+    """Report canonical players whose linked sources disagree on birth date.
+
+    Companion check to the resolver's DOB-corroboration tier: when two
+    non-orphan sources bound to one ``fb_…`` canonical carry Bronze DOBs more
+    than ``tolerance_days`` apart, at least one link is a suspected false
+    merge (or one source's DOB is dirty). The resolver already EXCLUDES such
+    canonicals from its own DOB map (they can neither veto nor promote), so
+    this report is the only place the disagreement surfaces.
+
+    Returns::
+
+        {
+            'conflicts': int,          # canonicals with a DOB spread > tolerance
+            'rows': [{'canonical_id', 'min_dob', 'max_dob', 'spread_days',
+                      'n_sources'}, ...],   # ≤ limit
+            'truncated': bool,
+            'verdict': 'OK' | 'WARNING',
+        }
+
+    Informational (WARNING-max) — never escalates to ERROR and lets the
+    caller decide how to report. ``dob_projections`` is injectable for tests
+    (the defaults use Trino-only TRY/date_parse).
+    """
+    qualified = _qualify(xref_table)
+    union = "\nUNION ALL\n".join(
+        f"SELECT '{src}' AS source, source_id, dob FROM ({proj})"
+        for src, proj in dob_projections
+    )
+    sql = (
+        f"WITH dob_src AS (\n{union}\n)\n"
+        "SELECT x.canonical_id,\n"
+        "       MIN(d.dob) AS min_dob,\n"
+        "       MAX(d.dob) AS max_dob,\n"
+        "       COUNT(DISTINCT d.source) AS n_sources\n"
+        f"FROM {qualified} x\n"
+        "JOIN dob_src d\n"
+        "  ON d.source = x.source AND d.source_id = x.source_id\n"
+        "WHERE x.confidence <> 'orphan'\n"
+        "  AND x.canonical_id LIKE 'fb\\_%' ESCAPE '\\'\n"
+        "  AND d.dob IS NOT NULL\n"
+        "GROUP BY x.canonical_id\n"
+        f"HAVING date_diff('day', MIN(d.dob), MAX(d.dob)) > {int(tolerance_days)}\n"
+        "ORDER BY x.canonical_id"
+    )
+    conn = _get_conn()
+    try:
+        cur = conn.cursor()
+        try:
+            cur.execute(sql)
+            rows = cur.fetchall()
+        finally:
+            cur.close()
+    finally:
+        conn.close()
+
+    out_rows: List[Dict[str, Any]] = []
+    for cid, min_dob, max_dob, n_sources in rows[:limit]:
+        spread = (max_dob - min_dob).days if (min_dob and max_dob) else None
+        out_rows.append({
+            'canonical_id': cid,
+            'min_dob': str(min_dob),
+            'max_dob': str(max_dob),
+            'spread_days': spread,
+            'n_sources': int(n_sources),
+        })
+    return {
+        'conflicts': len(rows),
+        'rows': out_rows,
+        'truncated': len(rows) > limit,
+        'verdict': 'OK' if not rows else 'WARNING',
+    }
+
+
+def evaluate_manager_dob_collisions(
+    xref_table: str = 'iceberg.silver.xref_manager',
+    fotmob_profile_table: str = 'iceberg.silver.fotmob_manager_profile',
+    tm_coaches_table: str = 'iceberg.silver.transfermarkt_coaches',
+    tolerance_days: int = 1,
+    limit: int = 50,
+) -> Dict[str, Any]:
+    """Report manager canonicals where FotMob and TM disagree on birth date.
+
+    DOB corroboration for the manager bridge: a canonical carrying both a
+    FotMob coachId and a TM coach_id whose profile DOBs differ by more than
+    ``tolerance_days`` is a suspected false merge — the strongest signal for
+    ``name_initial``-tier rows (the confidence of the TM row is included so
+    the reviewer sees which tier produced the link). Candidates for a
+    ``manager_aliases.yaml`` correction.
+
+    Reads the two profile silver tables (not Bronze): unlike the player DOB
+    maps this is NOT circular — fotmob_manager_profile / transfermarkt_coaches
+    do not consume xref_manager.
+
+    Returns ``{'collisions': N, 'rows': [...≤limit], 'truncated': bool,
+    'verdict': 'OK'|'WARNING'}`` — never escalates to ERROR.
+    """
+    xq = _qualify(xref_table)
+    fmq = _qualify(fotmob_profile_table)
+    tmq = _qualify(tm_coaches_table)
+    sql = (
+        "WITH fm AS (\n"
+        "    SELECT x.canonical_id, x.league, x.season,\n"
+        "           MAX(TRY_CAST(p.date_of_birth AS DATE)) AS fm_dob\n"
+        f"    FROM {xq} x\n"
+        f"    JOIN {fmq} p\n"
+        "      ON p.player_id = x.source_id\n"
+        "     AND p.league = x.league AND p.season = x.season\n"
+        "    WHERE x.source = 'fotmob' AND x.confidence <> 'orphan'\n"
+        "    GROUP BY x.canonical_id, x.league, x.season\n"
+        "),\n"
+        "tm AS (\n"
+        "    SELECT x.canonical_id, x.league, x.season, x.confidence,\n"
+        "           MAX(c.dob) AS tm_dob\n"
+        f"    FROM {xq} x\n"
+        f"    JOIN {tmq} c\n"
+        "      ON CAST(c.coach_id AS varchar) = x.source_id\n"
+        "     AND c.league = x.league AND c.season = x.season\n"
+        "    WHERE x.source = 'transfermarkt' AND x.confidence <> 'orphan'\n"
+        "    GROUP BY x.canonical_id, x.league, x.season, x.confidence\n"
+        ")\n"
+        "SELECT tm.canonical_id, tm.league, tm.season, tm.confidence,\n"
+        "       fm.fm_dob, tm.tm_dob\n"
+        "FROM tm\n"
+        "JOIN fm ON fm.canonical_id = tm.canonical_id\n"
+        "       AND fm.league = tm.league AND fm.season = tm.season\n"
+        "WHERE fm.fm_dob IS NOT NULL AND tm.tm_dob IS NOT NULL\n"
+        f"  AND abs(date_diff('day', fm.fm_dob, tm.tm_dob)) > {int(tolerance_days)}\n"
+        "ORDER BY tm.canonical_id, tm.season"
+    )
+    conn = _get_conn()
+    try:
+        cur = conn.cursor()
+        try:
+            cur.execute(sql)
+            rows = cur.fetchall()
+        finally:
+            cur.close()
+    finally:
+        conn.close()
+
+    out_rows: List[Dict[str, Any]] = []
+    for cid, league, season, confidence, fm_dob, tm_dob in rows[:limit]:
+        out_rows.append({
+            'canonical_id': cid,
+            'league': league,
+            'season': season,
+            'tm_confidence': confidence,
+            'fotmob_dob': str(fm_dob),
+            'tm_dob': str(tm_dob),
+        })
+    return {
+        'collisions': len(rows),
+        'rows': out_rows,
+        'truncated': len(rows) > limit,
+        'verdict': 'OK' if not rows else 'WARNING',
     }
 
 

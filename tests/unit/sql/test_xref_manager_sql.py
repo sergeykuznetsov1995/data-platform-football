@@ -1,19 +1,23 @@
 """
-Unit tests for ``dags/sql/silver/xref_manager.sql`` — two sources (issue #144).
+Unit tests for ``dags/sql/silver/xref_manager.sql.j2`` — three sources
+(issue #144 + the xref-improvements Transfermarkt bridge).
 
 Strategy
 --------
 Pure regex/keyword sanity over the raw SQL — same approach as
-``test_xref_referee_sql.py`` and ``test_xref_team_sql.py``.
+``test_xref_referee_sql.py`` and ``test_xref_team_sql.py`` — plus a render
+smoke test through ``medallion_config.render_sql_template`` (the file is a
+Jinja template with the ``{{ manager_aliases_values_sql }}`` placeholder).
 
 Documented invariants we exercise:
-  * source ∈ {'fbref', 'fotmob'} (FBref spine + FotMob coachId mirror).
+  * source ∈ {'fbref', 'fotmob', 'transfermarkt'}.
   * canonical_id = LOWER(REGEXP_REPLACE(<name>, '[^a-zA-Z0-9]+', '_')).
-  * confidence ∈ {'name_normalize', 'orphan'} (orphan = FotMob coach with no
-    FBref counterpart in the same league).
-  * Reads bronze.fbref_match_managers (spine) and bronze.fotmob_player_details
-    filtered to is_coach (coachId mirror).
-  * FotMob source_id is the stable coachId (CAST(player_id AS varchar)).
+  * confidence ∈ {'name_alias', 'name_normalize', 'name_initial', 'orphan'}
+    with the cascade precedence alias > exact > initial > orphan.
+  * Reads bronze.fbref_match_managers (spine), bronze.fotmob_player_details
+    (is_coach rows) and bronze.transfermarkt_coaches (coach_id bridge).
+  * name_initial ambiguity guards on both sides (HAVING unique spine key +
+    TM-side initial_key_dup window).
   * NULL/empty manager/coach name is filtered out.
 """
 
@@ -26,7 +30,7 @@ import pytest
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
-SQL_PATH = PROJECT_ROOT / "dags" / "sql" / "silver" / "xref_manager.sql"
+SQL_PATH = PROJECT_ROOT / "dags" / "sql" / "silver" / "xref_manager.sql.j2"
 
 
 def _read_sql() -> str:
@@ -37,12 +41,12 @@ pytestmark = pytest.mark.unit
 
 
 class TestXrefManagerStructure:
-    """Regex/keyword sanity over ``xref_manager.sql``."""
+    """Regex/keyword sanity over ``xref_manager.sql.j2``."""
 
-    def test_emits_fbref_and_fotmob_sources(self):
-        """Two sources: FBref spine + FotMob coachId mirror (issue #144)."""
+    def test_emits_three_sources(self):
+        """FBref spine + FotMob coachId mirror + Transfermarkt coach_id."""
         sql = _read_sql().lower()
-        for src in ("'fbref'", "'fotmob'"):
+        for src in ("'fbref'", "'fotmob'", "'transfermarkt'"):
             pattern = re.compile(
                 re.escape(src) + r"\s+as\s+source",
                 re.IGNORECASE,
@@ -50,8 +54,8 @@ class TestXrefManagerStructure:
             assert pattern.search(sql), f"missing `{src} AS source` literal"
 
     def test_no_other_sources_emitted(self):
-        """Only 'fbref' and 'fotmob' may be emitted — others have no manager
-        metadata in Bronze."""
+        """Only fbref/fotmob/transfermarkt may be emitted — others have no
+        manager metadata in Bronze."""
         sql = _read_sql().lower()
         for forbidden in [
             "'understat'", "'whoscored'", "'sofascore'",
@@ -63,7 +67,7 @@ class TestXrefManagerStructure:
             )
             assert not pattern.search(sql), (
                 f"source label {forbidden} must not be emitted in xref_manager — "
-                "only FBref + FotMob carry coach identity in Bronze"
+                "only FBref + FotMob + TM carry coach identity in Bronze"
             )
 
     def test_reads_bronze_fbref_match_managers(self):
@@ -82,6 +86,14 @@ class TestXrefManagerStructure:
             "bronze.fotmob_player_details (is_coach rows)"
         )
 
+    def test_reads_bronze_transfermarkt_coaches(self):
+        """TM bridge reads from iceberg.bronze.transfermarkt_coaches."""
+        sql_lower = _read_sql().lower()
+        assert "iceberg.bronze.transfermarkt_coaches" in sql_lower, (
+            "xref_manager must read TM coaches from bronze.transfermarkt_coaches "
+            "(coach_id + dob/nationality carrier)"
+        )
+
     def test_fotmob_filters_is_coach(self):
         """FotMob block keeps only coaches (is_coach = true)."""
         sql_lower = _read_sql().lower()
@@ -97,6 +109,72 @@ class TestXrefManagerStructure:
             r"CAST\s*\(\s*d?\.?player_id\s+AS\s+varchar\s*\)",
             sql, re.IGNORECASE,
         ), "expected CAST(player_id AS varchar) AS source_id for FotMob coachId"
+
+    def test_tm_source_id_is_coach_id(self):
+        """TM source_id is the stable coach_id (cast to varchar in tm_coach)."""
+        sql = _read_sql()
+        assert re.search(
+            r"CAST\s*\(\s*coach_id\s+AS\s+varchar\s*\)",
+            sql, re.IGNORECASE,
+        ), "expected CAST(coach_id AS varchar) for the TM source_id"
+
+    def test_alias_placeholder_present_once(self):
+        """Single standalone `{{ manager_aliases_values_sql }}` placeholder —
+        the contract of render_sql_template's placeholder regex."""
+        sql = _read_sql()
+        occurrences = re.findall(
+            r"^\s*\{\{\s*manager_aliases_values_sql\s*\}\}\s*$",
+            sql, re.MULTILINE,
+        )
+        assert len(occurrences) == 1, (
+            "expected exactly one standalone {{ manager_aliases_values_sql }} "
+            f"placeholder line, found {len(occurrences)}"
+        )
+
+    def test_confidence_cascade_literals_present(self):
+        """All four cascade confidences appear."""
+        sql = _read_sql()
+        for lit in ("'name_alias'", "'name_normalize'", "'name_initial'",
+                    "'orphan'"):
+            assert lit in sql, f"expected confidence literal {lit}"
+
+    def test_confidence_cascade_precedence(self):
+        """CASE precedence: alias → exact/normalize → initial → orphan
+        (in the TM block)."""
+        sql = _read_sql()
+        m = re.search(
+            r"CASE\s+WHEN\s+t\.alias_cid.*?THEN\s+'name_alias'\s*"
+            r"WHEN\s+t\.exact_cid.*?THEN\s+'name_normalize'\s*"
+            r"WHEN\s+t\.initial_cid.*?THEN\s+'name_initial'\s*"
+            r"ELSE\s+'orphan'",
+            sql, re.IGNORECASE | re.DOTALL,
+        )
+        assert m, (
+            "TM confidence CASE must rank name_alias > name_normalize > "
+            "name_initial > orphan"
+        )
+
+    def test_canonical_id_coalesce_precedence(self):
+        """TM canonical_id COALESCE mirrors the confidence precedence."""
+        sql = _read_sql()
+        assert re.search(
+            r"COALESCE\s*\(\s*t\.alias_cid\s*,\s*t\.exact_cid\s*,"
+            r"\s*t\.initial_cid\s*,\s*t\.norm\s*\)",
+            sql, re.IGNORECASE,
+        ), "expected COALESCE(alias_cid, exact_cid, initial_cid, norm)"
+
+    def test_initial_tier_guards(self):
+        """name_initial ambiguity guards on BOTH sides: unique spine key
+        (HAVING) + TM-side initial_key_dup window."""
+        sql = _read_sql()
+        assert re.search(
+            r"HAVING\s+COUNT\s*\(\s*DISTINCT\s+canonical_id\s*\)\s*=\s*1",
+            sql, re.IGNORECASE,
+        ), "spine-side guard: HAVING COUNT(DISTINCT canonical_id) = 1 missing"
+        assert "initial_key_dup" in sql, "TM-side initial_key_dup guard missing"
+        assert re.search(
+            r"element_at\s*\(\s*split\s*\(", sql, re.IGNORECASE,
+        ), "surname extraction via element_at(split(...), -1) missing"
 
     def test_canonical_id_normalize_pattern(self):
         """canonical_id = LOWER(REGEXP_REPLACE(<name>, '[^a-zA-Z0-9]+', '_'))."""
@@ -132,23 +210,8 @@ class TestXrefManagerStructure:
             "expected `\\p{Mn}` (Unicode combining marks) regex to strip diacritics"
         )
 
-    def test_confidence_name_normalize(self):
-        """confidence carries the literal 'name_normalize'."""
-        sql = _read_sql()
-        assert "'name_normalize'" in sql, (
-            "expected confidence='name_normalize' for glued rows"
-        )
-
-    def test_confidence_allows_orphan(self):
-        """FotMob coach with no FBref counterpart is flagged 'orphan' so the
-        Phase 2 orphan-rate report (evaluate_orphan_rate_per_source) can see it."""
-        sql = _read_sql()
-        assert "'orphan'" in sql, (
-            "expected confidence='orphan' branch for un-glued FotMob coaches"
-        )
-
     def test_match_score_null(self):
-        """match_score must be NULL — no fuzzy matching at Phase 1.5."""
+        """match_score must be NULL — no fuzzy matching for managers."""
         sql = _read_sql()
         assert (
             "CAST(NULL AS double)" in sql
@@ -156,11 +219,11 @@ class TestXrefManagerStructure:
         ), "match_score must be CAST(NULL AS double) for xref_manager"
 
     def test_season_cast_to_varchar(self):
-        """#404: bronze season is year-start bigint → converted to a slug varchar
-        ('2425') via LPAD(MOD(...)), matching every other xref table."""
+        """#404: FBref/FotMob bronze season is year-start bigint → slug varchar
+        ('2425') via LPAD(MOD(...)); TM bronze already stores the slug."""
         sql = _read_sql()
         assert "LPAD(CAST(MOD(season" in sql or "LPAD(CAST(MOD(d.season" in sql, (
-            "xref_manager.sql must build a slug season via LPAD(MOD(...)) (#404)"
+            "xref_manager must build a slug season via LPAD(MOD(...)) (#404)"
         )
 
     def test_pure_select_no_create_table(self):
@@ -170,7 +233,7 @@ class TestXrefManagerStructure:
             if not line.lstrip().startswith("--")
         )
         assert "CREATE TABLE" not in non_comment.upper(), (
-            "xref_manager.sql must stay pure SELECT in executable SQL"
+            "xref_manager.sql.j2 must stay pure SELECT in executable SQL"
         )
 
     def test_filters_null_and_empty_manager(self):
@@ -199,19 +262,52 @@ class TestXrefManagerStructure:
             )
             assert pattern.search(sql), (
                 f"schema column {col!r} missing as `AS {col}` alias in "
-                "xref_manager.sql — Gold dim_manager will JOIN against this column"
+                "xref_manager.sql.j2 — Gold dim_manager will JOIN against this column"
             )
         # ``league`` and ``season`` come from Bronze with the right name,
         # so the SQL forwards them bare (matches xref_referee.sql convention).
         for col in ("league", "season"):
             assert re.search(rf"\b{col}\b", sql, re.IGNORECASE), (
-                f"schema column {col!r} missing from xref_manager.sql SELECT"
+                f"schema column {col!r} missing from xref_manager.sql.j2 SELECT"
             )
 
     def test_pk_grouping_present(self):
-        """GROUP BY enforces the documented PK = (source, source_id, league, season)."""
+        """GROUP BY / ROW_NUMBER dedup enforce the documented PK =
+        (source, source_id, league, season)."""
         sql_lower = _read_sql().lower()
         assert "group by" in sql_lower, (
             "expected GROUP BY clause to act as DISTINCT for the (source, "
             "source_id, league, season) PK contract"
         )
+        assert "row_number() over" in sql_lower, (
+            "expected ROW_NUMBER dedup for the FotMob / TM per-(id, league, "
+            "season) grain"
+        )
+
+
+class TestXrefManagerRender:
+    """Render smoke test through the real Jinja machinery."""
+
+    def test_render_with_live_aliases(self):
+        """The shipped manager_aliases.yaml renders into valid, placeholder-free
+        SQL through get_manager_alias_sql_values(source=None)."""
+        import sys
+        DAGS_DIR = PROJECT_ROOT / "dags"
+        for p in (str(PROJECT_ROOT), str(DAGS_DIR)):
+            if p not in sys.path:
+                sys.path.insert(0, p)
+        from utils.medallion_config import (          # noqa: E402
+            get_manager_alias_sql_values,
+            render_sql_template,
+        )
+
+        rendered = render_sql_template(
+            SQL_PATH,
+            manager_aliases_values_sql=get_manager_alias_sql_values(source=None),
+        )
+        assert "{{" not in rendered and "}}" not in rendered, (
+            "rendered SQL must not contain unexpanded Jinja placeholders"
+        )
+        # The alias VALUES body must parse as tuples of 3 (raw, cid, league).
+        assert re.search(r"\)\s+AS\s+t\s*\(raw_name,\s*canonical_id,\s*league\)",
+                         rendered), "alias VALUES table shape changed"
