@@ -936,7 +936,9 @@ services:
       - caddy_config:/config
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "wget", "-q", "--spider", "http://localhost:2019/config/"]
+      # именно 127.0.0.1: busybox-wget резолвит localhost в ::1, а admin-порт
+      # caddy слушает только IPv4 -> ложный unhealthy
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:2019/config/"]
       interval: 30s
       timeout: 5s
       retries: 3
