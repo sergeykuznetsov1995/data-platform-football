@@ -14,8 +14,8 @@
 --       - xG / xA: Understat primary (RX2 — coverage 99% vs 82-85%), then
 --         FotMob (independent xG model), then SofaScore fallback. Single column
 --         через COALESCE(us → fm → ss).
---       - rating: SofaScore (Opta) единственный источник на match-grain
---         (FotMob match-level rating не собираем).
+--       - rating: SofaScore (Opta) primary, FotMob fallback (R5 — fm.rating
+--         заполнен ~94% с 1617 и закрывает сезоны с дырами xref sofascore).
 --   * duels_won — total duels won (SofaScore only).
 --
 -- Design contract: docs/design/gold-star-schema.md §4.4 (issue #426).
@@ -242,8 +242,8 @@ SELECT
     ROUND(us.xg_chain, 4)                                AS xg_chain,
     ROUND(us.xg_buildup, 4)                              AS xg_buildup,
 
-    -- Rating — SofaScore (Opta) единственный источник на match-grain.
-    ROUND(ss.rating, 2)                                  AS rating,
+    -- Rating — SofaScore primary, FotMob fallback (порядок в source_priority.yaml).
+    {{ m_rating }}
 
     -- ========= Partition keys (LAST in SELECT) =========
     xfp.league                                           AS league,

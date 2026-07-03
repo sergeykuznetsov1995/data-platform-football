@@ -242,8 +242,8 @@ SELECT
     ROUND(us.xg_chain, 4)                                AS xg_chain,
     ROUND(us.xg_buildup, 4)                              AS xg_buildup,
 
-    -- Rating — SofaScore (Opta) единственный источник на match-grain.
-    ROUND(ss.rating, 2)                                  AS rating,
+    -- Rating — SofaScore primary, FotMob fallback (R5, 2026-07-03).
+    ROUND(COALESCE(ss.rating, fm.rating), 2)             AS rating,
 
     -- ========= Partition keys (LAST in SELECT) =========
     xfp.league                                           AS league,
