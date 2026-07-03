@@ -75,7 +75,9 @@ HS_UID=$(docker compose exec -T headscale headscale users list --output json \
 KEY=$(docker compose exec -T headscale headscale preauthkeys create --user "$HS_UID" --expiration 1h --output json \
     | python3 -c 'import json,sys; print(json.load(sys.stdin)["key"])')
 tailscale logout || true
-tailscale up --login-server "https://hs.$D" --authkey "$KEY" --accept-dns=false
+# --snat-subnet-routes=false: иначе tailscale MASQUERADE'ит транзит в docker-bridge
+# и Caddy видит 172.x вместо 100.64.x — VPN-гейт (remote_ip) отдаёт 403
+tailscale up --login-server "https://hs.$D" --authkey "$KEY" --accept-dns=false --snat-subnet-routes=false
 NEWIP=$(tailscale ip -4)
 echo "   headscale-IP VM: $NEWIP"
 

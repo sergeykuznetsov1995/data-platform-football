@@ -51,9 +51,14 @@ docker compose exec headscale headscale preauthkeys create --user <ID из users
 
    ```bash
    tailscale logout
-   tailscale up --login-server https://hs.<домен> --authkey <preauth-key из шага 1>
+   tailscale up --login-server https://hs.<домен> --authkey <preauth-key из шага 1> \
+       --accept-dns=false --snat-subnet-routes=false
    tailscale ip -4    # новый 100.x-адрес VM
    ```
+
+   `--accept-dns=false` — VM-сервер не должен менять свой резолвер;
+   `--snat-subnet-routes=false` — без него tailscale MASQUERADE'ит транзит
+   в docker-bridge, Caddy видит 172.x вместо 100.64.x и VPN-гейт отдаёт 403.
 
 2. `.env`: `TS_IP=<новый 100.x>`, `TS_HOSTNAME=386844.tail.<домен>`,
    раскомментировать cutover-переключатели (`OIDC_ISSUER`, `KC_PUBLIC_URL`,
