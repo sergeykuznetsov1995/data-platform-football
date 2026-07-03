@@ -249,12 +249,12 @@ security.refresh-period=30s
 
 | Группа | Состав | Лимиты |
 |---|---|---|
-| Существующее (core) | seaweedfs 1G, lakekeeper 0.5G, postgres 1G, redis 0.13G, scheduler 8G, webserver 1G, trino 8G, superset 1.5G, flaresolverr 2G, proxy_filter 0.25G | ~23.4G |
+| Существующее (core) | seaweedfs 1G, lakekeeper 0.5G, postgres 1G, redis 0.13G, scheduler 8G, webserver 2G (1G→2G в фазе 6: memcg-OOM воркеров с SSO), trino 8G, superset 1.5G, flaresolverr 2G, proxy_filter 0.25G | ~24.4G |
 | Существующее (heavy) | opensearch 2G, om-server 2G, om-ingestion 0.8G, superset-worker 0.5G, -beat 0.2G, tor 0.25G | ~5.8G |
 | Новое | keycloak 1G, caddy 0.25G, jupyterhub 0.5G | 1.75G |
 | Ноутбуки | 5 активных × 2G | 10G |
-| **Итого** | всё включено + 5 ноутбуков | **~41G / 62G** |
-| Худший случай | 10 активных ноутбуков | ~51G (жёстко, но живо; защита — culler + server_limit=6) |
+| **Итого** | всё включено + 5 ноутбуков | **~42G / 62G** |
+| Худший случай | 10 активных ноутбуков | ~52G (жёстко, но живо; защита — culler + server_limit=6) |
 
 Postgres получает лёгкого жильца (Keycloak) — лимит 1G остаётся, наблюдать на фазе 2.
 

@@ -62,7 +62,7 @@ if [ -f "${DATASOURCES_YAML}" ] && [ -f "${IMPORT_SCRIPT}" ]; then
     # trino_iceberg. Идемпотентно; требует уже импортированную БД.
     echo "[superset-bootstrap] (4b) ensuring analyst_data role..."
     python "${PYTHONPATH_DIR}/create_analyst_role.py" \
-        || echo "[superset-bootstrap] create_analyst_role failed — continuing"
+        || echo "[superset-bootstrap] WARNING: create_analyst_role failed — SSO-аналитики не увидят данные (роль analyst_data); повторить вручную: docker compose exec superset python /app/pythonpath/create_analyst_role.py"
 else
     echo "[superset-bootstrap] (4/5) datasources.yaml or import_datasources.py not found; skipping"
 fi
