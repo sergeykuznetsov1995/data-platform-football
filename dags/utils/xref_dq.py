@@ -23,9 +23,9 @@ Verified against the SQL files on 2026-05-08:
 * ``xref_match``    — {``exact``}
 * ``xref_referee``  — {``name_normalize``}
 * ``xref_player``   — {``exact``, ``name_team``, ``name_team_jersey``,
-                       ``name_team_dob``, ``orphan``}  (jersey/dob are
-                       reserved STUBS but allowed in the enum so adding
-                       a single tier later does not require touching DQ.)
+                       ``name_team_dob``, ``orphan``}  (``name_team_dob``
+                       is live since the DOB-corroboration tier; jersey
+                       remains a reserved STUB.)
 
 Sources (xref_team / xref_referee / xref_match / xref_player) values
 are also enforced via enum checks against the documented schema.
@@ -348,12 +348,12 @@ def build_xref_player_checks() -> List[Check]:
 
         # confidence — mirror the resolver cascade tier names verbatim.
         # 'name_team_surname' / 'name_team_subset' / 'name_team_nickname' /
-        # 'name_team_alias' added by R2-followup v2 resolver. 'name_team_jersey'
-        # / 'name_team_dob' remain reserved STUBs (Bronze does not yet expose
-        # cross-source jersey/DOB consistently). 'ambiguous' is INTENTIONALLY
-        # NOT in this list — Fellegi-Sunter clerical-review rows must land in
-        # silver.xref_player_review, not xref_player. An 'ambiguous' value
-        # here is therefore a DQ ERROR by design.
+        # 'name_team_alias' added by R2-followup v2 resolver. 'name_team_dob'
+        # is live (DOB-corroboration adjudication of ambiguous rows);
+        # 'name_team_jersey' remains a reserved STUB. 'ambiguous' is
+        # INTENTIONALLY NOT in this list — Fellegi-Sunter clerical-review rows
+        # must land in silver.xref_player_review, not xref_player. An
+        # 'ambiguous' value here is therefore a DQ ERROR by design.
         check_enum_compliance(
             table, 'confidence',
             allowed=['exact', 'name_team', 'name_team_surname',
@@ -440,7 +440,9 @@ def build_xref_player_review_checks() -> List[Check]:
       * no_nulls on identifying columns.
       * enum compliance on ``rule`` — must match the rule labels emitted
         by the cascade (``surname_collision``, ``token_set_band``,
-        ``nickname_collision``).
+        ``nickname_collision``) plus the DOB-veto pass (``dob_veto`` —
+        a fuzzy link whose Bronze DOB contradicts the canonical's
+        consolidated DOB, demoted to review by the resolver).
       * enum compliance on ``source`` — six cascaded sources (everything
         except the FBref spine, which never lands in clerical review).
     """
@@ -462,7 +464,7 @@ def build_xref_player_review_checks() -> List[Check]:
         check_enum_compliance(
             table, 'rule',
             allowed=['surname_collision', 'token_set_band',
-                     'nickname_collision'],
+                     'nickname_collision', 'dob_veto'],
             severity='ERROR',
         ),
 
@@ -748,6 +750,123 @@ def report_orphan_teams(
         'per_source': per_source,
         'rows': out_rows,
         'truncated': len(rows) > limit,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Cross-source DOB conflicts (companion to the resolver's name_team_dob tier)
+# ---------------------------------------------------------------------------
+
+#: Bronze DOB projections per source: (source, SQL yielding (source_id, dob)).
+#: Mirrors xref_player_resolver._fetch_dob_maps (Bronze only — silver profile
+#: tables depend on xref_player, reading them here would be circular). Trino
+#: dialect; tests inject DuckDB-compatible projections instead.
+DEFAULT_PLAYER_DOB_PROJECTIONS = (
+    ('fotmob',
+     "SELECT CAST(player_id AS varchar) AS source_id, "
+     "max_by(TRY_CAST(date_of_birth AS DATE), _ingested_at) AS dob "
+     "FROM iceberg.bronze.fotmob_team_squad WHERE player_id IS NOT NULL "
+     "GROUP BY CAST(player_id AS varchar)"),
+    ('sofascore',
+     "SELECT CAST(player_id AS varchar) AS source_id, "
+     "max_by(TRY_CAST(date_of_birth AS DATE), _ingested_at) AS dob "
+     "FROM iceberg.bronze.sofascore_player_profile WHERE player_id IS NOT NULL "
+     "GROUP BY CAST(player_id AS varchar)"),
+    ('transfermarkt',
+     "SELECT CAST(player_id AS varchar) AS source_id, "
+     "max_by(dob, _ingested_at) AS dob "
+     "FROM iceberg.bronze.transfermarkt_players WHERE player_id IS NOT NULL "
+     "GROUP BY CAST(player_id AS varchar)"),
+    ('sofifa',
+     "SELECT CAST(player_id AS varchar) AS source_id, "
+     "max_by(TRY(CAST(date_parse(dob, '%b %e, %Y') AS DATE)), _ingested_at) AS dob "
+     "FROM iceberg.bronze.sofifa_player_ratings "
+     "WHERE player_id IS NOT NULL AND dob IS NOT NULL "
+     "GROUP BY CAST(player_id AS varchar)"),
+    ('whoscored',
+     "SELECT CAST(CAST(player_id AS bigint) AS varchar) AS source_id, "
+     "max_by(TRY_CAST(date_of_birth AS DATE), _ingested_at) AS dob "
+     "FROM iceberg.bronze.whoscored_player_profile WHERE player_id IS NOT NULL "
+     "GROUP BY CAST(CAST(player_id AS bigint) AS varchar)"),
+)
+
+
+def evaluate_dob_conflicts(
+    xref_table: str = 'iceberg.silver.xref_player',
+    dob_projections=DEFAULT_PLAYER_DOB_PROJECTIONS,
+    tolerance_days: int = 1,
+    limit: int = 50,
+) -> Dict[str, Any]:
+    """Report canonical players whose linked sources disagree on birth date.
+
+    Companion check to the resolver's DOB-corroboration tier: when two
+    non-orphan sources bound to one ``fb_…`` canonical carry Bronze DOBs more
+    than ``tolerance_days`` apart, at least one link is a suspected false
+    merge (or one source's DOB is dirty). The resolver already EXCLUDES such
+    canonicals from its own DOB map (they can neither veto nor promote), so
+    this report is the only place the disagreement surfaces.
+
+    Returns::
+
+        {
+            'conflicts': int,          # canonicals with a DOB spread > tolerance
+            'rows': [{'canonical_id', 'min_dob', 'max_dob', 'spread_days',
+                      'n_sources'}, ...],   # ≤ limit
+            'truncated': bool,
+            'verdict': 'OK' | 'WARNING',
+        }
+
+    Informational (WARNING-max) — never escalates to ERROR and lets the
+    caller decide how to report. ``dob_projections`` is injectable for tests
+    (the defaults use Trino-only TRY/date_parse).
+    """
+    qualified = _qualify(xref_table)
+    union = "\nUNION ALL\n".join(
+        f"SELECT '{src}' AS source, source_id, dob FROM ({proj})"
+        for src, proj in dob_projections
+    )
+    sql = (
+        f"WITH dob_src AS (\n{union}\n)\n"
+        "SELECT x.canonical_id,\n"
+        "       MIN(d.dob) AS min_dob,\n"
+        "       MAX(d.dob) AS max_dob,\n"
+        "       COUNT(DISTINCT d.source) AS n_sources\n"
+        f"FROM {qualified} x\n"
+        "JOIN dob_src d\n"
+        "  ON d.source = x.source AND d.source_id = x.source_id\n"
+        "WHERE x.confidence <> 'orphan'\n"
+        "  AND x.canonical_id LIKE 'fb\\_%' ESCAPE '\\'\n"
+        "  AND d.dob IS NOT NULL\n"
+        "GROUP BY x.canonical_id\n"
+        f"HAVING date_diff('day', MIN(d.dob), MAX(d.dob)) > {int(tolerance_days)}\n"
+        "ORDER BY x.canonical_id"
+    )
+    conn = _get_conn()
+    try:
+        cur = conn.cursor()
+        try:
+            cur.execute(sql)
+            rows = cur.fetchall()
+        finally:
+            cur.close()
+    finally:
+        conn.close()
+
+    out_rows: List[Dict[str, Any]] = []
+    for cid, min_dob, max_dob, n_sources in rows[:limit]:
+        spread = (max_dob - min_dob).days if (min_dob and max_dob) else None
+        out_rows.append({
+            'canonical_id': cid,
+            'min_dob': str(min_dob),
+            'max_dob': str(max_dob),
+            'spread_days': spread,
+            'n_sources': int(n_sources),
+        })
+    return {
+        'conflicts': len(rows),
+        'rows': out_rows,
+        'truncated': len(rows) > limit,
+        'verdict': 'OK' if not rows else 'WARNING',
     }
 
 

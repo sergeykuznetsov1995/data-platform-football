@@ -18,8 +18,15 @@ Pipeline
     - ``name_team`` — fuzzy match on canonical-team bucket using
       ``rapidfuzz.fuzz.token_sort_ratio`` after ``unidecode + lower``;
       threshold ≥ 90.
-    - ``name_team_jersey`` / ``name_team_dob`` — STUBS (Bronze does not carry
-      jersey or cross-source DOB consistently). Reserved in schema.
+    - ``name_team_dob`` — cross-source DOB corroboration: an ambiguous
+      candidate (surname collision / token_set 88-94 band) is promoted when
+      its Bronze date-of-birth uniquely matches the DOB consolidated for one
+      FBref canonical from already-linked sources (see
+      :func:`build_canonical_dob_map`). The FBref spine itself carries no
+      DOB, so this is corroboration between non-FBref sources, never a
+      direct spine comparison.
+    - ``name_team_jersey`` — STUB (Bronze does not carry jersey
+      consistently). Reserved in schema.
     - ``orphan`` — no match: ``canonical_id = '<src>_' || source_id`` where
       ``src`` ∈ {``us``, ``ws``, ``ss``}. ``ss`` (SofaScore) reserved for
       R0.2 follow-up.
@@ -106,6 +113,30 @@ SURNAME_LEVENSHTEIN_MAX: int = 1
 #: too many false matches (Cole/Cone/Cool, Saka/Sako).
 SURNAME_MIN_LEN: int = 4
 
+#: DOB corroboration tolerance in days. ±1 absorbs off-by-one dates from
+#: timezone-shifted feeds (SofaScore stores an epoch upstream); a difference
+#: > 1 day is treated as "different person". Missing DOB on either side is
+#: NO signal — the row falls through unchanged (strictly additive feature).
+DOB_TOLERANCE_DAYS: int = 1
+
+#: Tiers trusted to seed the per-canonical DOB map (near-zero false-positive
+#: rate). ``exact`` = cross-source id match; ``name_team_alias`` = human-curated
+#: YAML; ``name_team`` = token_sort_ratio ≥ 90. Weaker fuzzy tiers are excluded
+#: so a surname-tier false match cannot poison the map with its own DOB.
+DOB_ANCHOR_TIERS: Tuple[str, ...] = ('exact', 'name_team_alias', 'name_team')
+
+#: Fuzzy tiers subject to the DOB veto: when the candidate row carries a DOB
+#: AND the canonical's consolidated DOB is known AND they differ by more than
+#: DOB_TOLERANCE_DAYS, the link is demoted to the review queue (rule
+#: 'dob_veto') — a wrong link is worse than a missing one. ``exact`` and
+#: ``name_team_alias`` are never vetoed (authoritative). ``name_team`` IS
+#: vetoable even though it also anchors the map: a row can never contradict
+#: its own contribution, and a two-source disagreement excludes the canonical
+#: from the map entirely (surfaced via the dob_conflicts DQ report instead).
+DOB_VETO_TIERS: Tuple[str, ...] = (
+    'name_team', 'name_team_surname', 'name_team_subset', 'name_team_nickname',
+)
+
 #: Sources covered. ``sofifa`` bridges on the standard name+team cascade after
 #: mapping its FIFA/FC edition to a football-season slug (``'FC 26'`` -> ``'2526'``,
 #: see :func:`_fetch_sofifa_players`) — the edition/season mismatch is handled at
@@ -141,6 +172,13 @@ KNOWN_PAIRS: Tuple[Tuple[str, str], ...] = (
 #: Below this pass-rate the resolver raises ResolverError. 8/10 is the
 #: target codified in docs/research/R2_player_resolver.md.
 KNOWN_PAIR_MIN_PASS = 8
+
+#: Extended known-pair gate over FBref+SofaScore+FotMob. WARNING-only for
+#: now: the historical exclusion reason (sparse sofascore_player_profile
+#: names) must be empirically disproven on live data before this can raise
+#: ResolverError like the core gate. TODO(#xref-dob): promote to a hard gate
+#: after observing the live pass-rate for a few green runs.
+KNOWN_PAIR_EXT_MIN_PASS = 8
 
 
 # ---------------------------------------------------------------------------
@@ -669,6 +707,103 @@ def _orphan_prefix(source: str) -> str:
         'sofifa':        'sf',
         'espn':          'es',
     }[source]
+
+
+# ---------------------------------------------------------------------------
+# DOB corroboration (tier name_team_dob + dob_veto)
+# ---------------------------------------------------------------------------
+def _dob_close(a: Any, b: Any) -> bool:
+    """True when both dates are present and within :data:`DOB_TOLERANCE_DAYS`.
+
+    Missing on either side → False (callers must treat that as "no signal",
+    not as a contradiction — see the veto predicate in :func:`_resolve_all`).
+    """
+    if a is None or b is None:
+        return False
+    return abs((a - b).days) <= DOB_TOLERANCE_DAYS
+
+
+def build_canonical_dob_map(
+    rows: List[Dict[str, Any]],
+) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+    """Consolidate a per-canonical DOB from already-resolved non-FBref rows.
+
+    Only rows whose confidence is in :data:`DOB_ANCHOR_TIERS`, whose
+    canonical_id is a real FBref spine id (``fb_…``) and which carry an
+    in-memory ``dob`` (annotated by :func:`run_resolver` from the Bronze DOB
+    maps) contribute. Per canonical:
+
+    * all observed DOBs pairwise within :data:`DOB_TOLERANCE_DAYS` → the
+      canonical gets ``min(dates)`` (deterministic representative);
+    * any wider disagreement → the canonical is EXCLUDED from the map and
+      recorded in the returned conflict list — a poisoned/ambiguous DOB must
+      neither veto nor promote anything.
+
+    Returns ``(canonical_dob, dob_conflicts)`` where ``dob_conflicts`` items
+    are ``{'canonical_id': ..., 'values': [(source, dob), ...]}``.
+
+    Pure function — unit-testable without Trino.
+    """
+    from collections import defaultdict
+
+    observed: Dict[str, List[Tuple[str, Any]]] = defaultdict(list)
+    for row in rows:
+        if row.get('source') == 'fbref':
+            continue
+        if row.get('confidence') not in DOB_ANCHOR_TIERS:
+            continue
+        cid = row.get('canonical_id') or ''
+        if not cid.startswith('fb_'):
+            continue
+        dob = row.get('dob')
+        if dob is None:
+            continue
+        observed[cid].append((row['source'], dob))
+
+    canonical_dob: Dict[str, Any] = {}
+    conflicts: List[Dict[str, Any]] = []
+    for cid, pairs in observed.items():
+        dates = [d for _, d in pairs]
+        if all(_dob_close(a, b) for a in dates for b in dates):
+            canonical_dob[cid] = min(dates)
+        else:
+            conflicts.append({'canonical_id': cid, 'values': pairs})
+    return canonical_dob, conflicts
+
+
+def adjudicate_ambiguous_with_dob(
+    candidate: Dict[str, Any],
+    ambiguity_info: Dict[str, Any],
+    canonical_dob: Dict[str, Any],
+) -> Optional[Tuple[str, str, float]]:
+    """Try to resolve an ambiguous candidate via DOB corroboration.
+
+    Among the ambiguity candidates (``(fbref_id, name, score)`` tuples from
+    the cascade), keep those whose consolidated canonical DOB matches the
+    candidate's Bronze DOB within tolerance. Promote **iff exactly one**
+    matches — spine candidates with an unknown DOB do not block the unique
+    match (the residual "namesake sharing a birthday inside one club+season"
+    risk is negligible). ``match_score`` is the matching candidate's own tier
+    score so the name-signal strength stays visible; the DOB corroboration is
+    expressed by the ``name_team_dob`` confidence label.
+
+    Returns ``(canonical_id, 'name_team_dob', match_score)`` or ``None``.
+
+    Pure function — unit-testable without Trino.
+    """
+    dob = candidate.get('dob')
+    if dob is None:
+        return None
+    cands: List[Tuple[str, str, float]] = ambiguity_info.get('candidates') or []
+    matches = [
+        (pid, name, score)
+        for pid, name, score in cands
+        if _dob_close(dob, canonical_dob.get(f'fb_{pid}'))
+    ]
+    if len(matches) == 1:
+        pid, _name, score = matches[0]
+        return f'fb_{pid}', 'name_team_dob', float(score)
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -1327,6 +1462,96 @@ def _fetch_espn_players(
 
 
 # ---------------------------------------------------------------------------
+# Bronze DOB readers (cross-source corroboration, tier name_team_dob)
+# ---------------------------------------------------------------------------
+# DOB is a time-invariant attribute → each map is keyed by source_id only
+# (no season), taking the freshest Bronze value via max_by(..., _ingested_at).
+# Every reader degrades to an empty map on ANY error (missing table, absent
+# column) — the DOB feature is strictly additive and must never fail a run.
+# Bronze only: silver profile tables JOIN xref_player themselves, so reading
+# them here would create a wrong-link feedback loop (see module docstring).
+
+
+def _fetch_dob_map(conn, sql: str, source: str) -> Dict[str, Any]:
+    """Run one DOB projection; ``{source_id: date}`` or empty map on error."""
+    try:
+        rows = _execute(conn, sql, fetch=True) or []
+    except Exception as e:
+        logger.warning(
+            "DOB fetch for %s failed (%s) — corroboration disabled for "
+            "this source this run.", source, e,
+        )
+        return {}
+    return {str(pid): dob for pid, dob in rows if pid is not None and dob is not None}
+
+
+def _fetch_dob_maps(
+    conn, league: str, source_seasons: List[str]
+) -> Dict[str, Dict[str, Any]]:
+    """DOB maps for the 5 DOB-carrying sources.
+
+    Returns ``{source: {source_id: datetime.date}}``. Understat / Capology /
+    ESPN carry no DOB in Bronze; FBref (the spine) is not scraped for DOB —
+    hence corroboration between non-FBref sources (module docstring).
+    """
+    lg = _sql_escape(league)
+    seasons = _seasons_in_clause(source_seasons)
+    queries = {
+        # date_of_birth is a varchar passthrough (ISO) — TRY_CAST like
+        # gold/dim_player.sql.j2 does.
+        'fotmob': f"""
+            SELECT CAST(player_id AS varchar),
+                   max_by(TRY_CAST(date_of_birth AS DATE), _ingested_at)
+            FROM iceberg.bronze.fotmob_team_squad
+            WHERE league = '{lg}' AND player_id IS NOT NULL
+            GROUP BY CAST(player_id AS varchar)
+        """,
+        'sofascore': f"""
+            SELECT CAST(player_id AS varchar),
+                   max_by(TRY_CAST(date_of_birth AS DATE), _ingested_at)
+            FROM iceberg.bronze.sofascore_player_profile
+            WHERE player_id IS NOT NULL
+            GROUP BY CAST(player_id AS varchar)
+        """,
+        'transfermarkt': f"""
+            SELECT CAST(player_id AS varchar), max_by(dob, _ingested_at)
+            FROM iceberg.bronze.transfermarkt_players
+            WHERE league = '{lg}' AND season IN ({seasons})
+              AND player_id IS NOT NULL
+            GROUP BY CAST(player_id AS varchar)
+        """,
+        # SoFIFA dob is 'Mon D, YYYY' ('Nov 9, 1982') — date_parse pattern
+        # proven in gold/dim_player.sql.j2 (#584). No league column filter:
+        # ratings are keyed (player_id, fifa_edition) and the map is only
+        # consulted for anchors already scoped to this league.
+        'sofifa': f"""
+            SELECT CAST(player_id AS varchar),
+                   max_by(TRY(CAST(date_parse(dob, '%b %e, %Y') AS DATE)),
+                          _ingested_at)
+            FROM iceberg.bronze.sofifa_player_ratings
+            WHERE player_id IS NOT NULL AND dob IS NOT NULL
+            GROUP BY CAST(player_id AS varchar)
+        """,
+        # whoscored_player_profile.date_of_birth is normalised to ISO by the
+        # scraper. player_id cast mirrors _fetch_whoscored_players so map
+        # keys line up with anchor source_ids.
+        'whoscored': f"""
+            SELECT CAST(CAST(player_id AS bigint) AS varchar),
+                   max_by(TRY_CAST(date_of_birth AS DATE), _ingested_at)
+            FROM iceberg.bronze.whoscored_player_profile
+            WHERE player_id IS NOT NULL
+            GROUP BY CAST(CAST(player_id AS bigint) AS varchar)
+        """,
+    }
+    maps = {src: _fetch_dob_map(conn, sql, src) for src, sql in queries.items()}
+    logger.info(
+        "DOB maps: %s",
+        {src: len(m) for src, m in maps.items()},
+    )
+    return maps
+
+
+# ---------------------------------------------------------------------------
 # Trino write helpers
 # ---------------------------------------------------------------------------
 def _sql_escape(s: str) -> str:
@@ -1591,14 +1816,38 @@ def _resolve_all(
     *,
     nn: Any = None,
     detected_at: Any = None,
+    dob_stats_out: Optional[Dict[str, Any]] = None,
 ) -> Tuple[
     List[Dict[str, Any]],
     List[Dict[str, Any]],
     Dict[str, Dict[str, int]],
 ]:
-    """Apply the cascade across all 5 sources.
+    """Apply the cascade across all non-FBref sources, then DOB-adjudicate.
+
+    Three phases (the cascade itself, :func:`cascade_resolve`, is untouched):
+
+    1. Cascade every candidate as before, but DEFER ambiguous rows instead
+       of emitting review rows immediately.
+    2. Consolidate a per-canonical DOB map from resolved anchor-tier rows
+       (:func:`build_canonical_dob_map`); rows lacking DOB contribute
+       nothing, so with no DOB anywhere the output is byte-identical to the
+       pre-DOB behaviour.
+    3. (a) VETO: a fuzzy-resolved row (:data:`DOB_VETO_TIERS`) whose DOB
+       contradicts the canonical's consolidated DOB moves to the review
+       queue with ``rule='dob_veto'`` (a wrong link is worse than a missing
+       one — a human or a ``player_aliases.yaml`` entry decides).
+       (b) ADJUDICATE: a deferred ambiguous row whose DOB uniquely matches
+       one candidate is promoted with ``confidence='name_team_dob'``;
+       otherwise it lands in review exactly as before.
 
     Returns ``(xref_rows, review_rows, per_source_stats)``.
+
+    Args:
+        dob_stats_out: optional dict mutated in place with DOB-phase counters
+            (``canonical_dob_map``, ``dob_conflicts``, ``conflicts`` list,
+            ``promoted_from_review``, ``vetoed``) — mirrors the
+            ``ambiguity_out`` style so the 3-tuple return contract stays
+            frozen for the T4 DAG integration.
 
     ``per_source_stats`` shape::
 
@@ -1668,6 +1917,9 @@ def _resolve_all(
     cap_rows = cap_rows or []
     sf_rows = sf_rows or []
     es_rows = es_rows or []
+    # Phase 1 — cascade. Ambiguous rows are deferred (DOB corroboration in
+    # Phase 3b may still promote them); everything else is emitted as before.
+    pending: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
     for src_rows in (us_rows, ws_rows, fm_rows, ss_rows, tm_rows, cap_rows,
                      sf_rows, es_rows):
         for row in src_rows:
@@ -1678,8 +1930,7 @@ def _resolve_all(
             stats[row['source']]['total'] += 1
 
             if conf == 'ambiguous':
-                review.append(_build_review_row(row, ambiguity_info, detected_at))
-                stats[row['source']]['ambiguous'] += 1
+                pending.append((row, ambiguity_info))
                 continue
 
             out.append(
@@ -1697,12 +1948,102 @@ def _resolve_all(
                     # In-memory only — consumed by _dedup_canonical_per_season,
                     # not written to Iceberg (_value_tuple skips it).
                     'bronze_signal': row.get('bronze_signal', -1.0),
+                    # In-memory only — DOB corroboration (Phases 2-3).
+                    'dob': row.get('dob'),
                 }
             )
             if conf == 'orphan':
                 stats[row['source']]['orphan'] += 1
             else:
                 stats[row['source']]['resolved'] += 1
+
+    # Phase 2 — consolidate per-canonical DOB from anchor-tier rows. Vetoable
+    # tiers other than name_team never feed the map; a name_team row cannot
+    # contradict its own contribution, and any two-source disagreement drops
+    # the canonical from the map (recorded as a conflict) — see
+    # DOB_VETO_TIERS docstring.
+    canonical_dob, dob_conflicts = build_canonical_dob_map(out)
+    dob_stats: Dict[str, Any] = {
+        'canonical_dob_map': len(canonical_dob),
+        'dob_conflicts': len(dob_conflicts),
+        'promoted_from_review': 0,
+        'vetoed': 0,
+    }
+
+    # Phase 3a — veto: fuzzy link whose DOB contradicts the canonical's.
+    if canonical_dob:
+        kept: List[Dict[str, Any]] = []
+        for row in out:
+            if (
+                row['source'] != 'fbref'
+                and row.get('confidence') in DOB_VETO_TIERS
+                and row.get('dob') is not None
+            ):
+                known = canonical_dob.get(row['canonical_id'])
+                if known is not None and not _dob_close(row['dob'], known):
+                    pid = row['canonical_id'][3:]
+                    spine_name = (spine.by_id.get(pid) or {}).get('player_name') or ''
+                    review.append(_build_review_row(
+                        {
+                            'source': row['source'],
+                            'source_id': row['source_id'],
+                            'player_name': row['display_name'],
+                            'raw_team_name': row.get('raw_team_name'),
+                            'canonical_team': row.get('canonical_team'),
+                            'league': row.get('league'),
+                            'season': row.get('season'),
+                        },
+                        {
+                            'rule': 'dob_veto',
+                            'candidates': [(
+                                pid,
+                                spine_name,
+                                float(row.get('match_score') or 0.0),
+                            )],
+                            'best_score': float(row.get('match_score') or 0.0),
+                        },
+                        detected_at,
+                    ))
+                    stats[row['source']]['resolved'] -= 1
+                    stats[row['source']]['ambiguous'] += 1
+                    dob_stats['vetoed'] += 1
+                    continue
+            kept.append(row)
+        out = kept
+
+    # Phase 3b — adjudicate deferred ambiguous rows.
+    for row, ambiguity_info in pending:
+        promoted = (
+            adjudicate_ambiguous_with_dob(row, ambiguity_info, canonical_dob)
+            if canonical_dob else None
+        )
+        if promoted is not None:
+            cid, conf, score = promoted
+            out.append(
+                {
+                    'canonical_id': cid,
+                    'source': row['source'],
+                    'source_id': row['source_id'],
+                    'display_name': row['player_name'],
+                    'league': row['league'],
+                    'season': row['season'],
+                    'confidence': conf,
+                    'match_score': score,
+                    'raw_team_name': row['raw_team_name'],
+                    'canonical_team': row['canonical_team'],
+                    'bronze_signal': row.get('bronze_signal', -1.0),
+                    'dob': row.get('dob'),
+                }
+            )
+            stats[row['source']]['resolved'] += 1
+            dob_stats['promoted_from_review'] += 1
+        else:
+            review.append(_build_review_row(row, ambiguity_info, detected_at))
+            stats[row['source']]['ambiguous'] += 1
+
+    if dob_stats_out is not None:
+        dob_stats_out.update(dob_stats)
+        dob_stats_out['conflicts'] = dob_conflicts
 
     return out, review, stats
 
@@ -1716,11 +2057,14 @@ _TIER_RANK: Dict[str, int] = {
     'exact': 0,
     'name_team': 1,
     'name_team_alias': 2,
-    'name_team_nickname': 3,
-    'name_team_subset': 4,
-    'name_team_surname': 5,
-    'name_team_jersey': 6,
-    'name_team_dob': 7,
+    # DOB-corroborated identity outranks the weak fuzzy tiers: when a
+    # canonical collision pits a name_team_dob row against e.g. a
+    # name_team_surname row, the birth-date-confirmed link owns the canonical.
+    'name_team_dob': 3,
+    'name_team_nickname': 4,
+    'name_team_subset': 5,
+    'name_team_surname': 6,
+    'name_team_jersey': 7,
 }
 
 
@@ -1921,20 +2265,29 @@ def _dedup_canonical_per_season(
     return out, dict(removed)
 
 
-def _verify_known_pairs(rows: List[Dict[str, Any]]) -> Tuple[int, int]:
+#: Core hard-gate source set — the original R2 regression contract.
+_KNOWN_PAIR_CORE_SOURCES = frozenset({'fbref', 'understat', 'whoscored'})
+
+#: Extended WARNING-only gate: SofaScore names come from a possibly-sparse
+#: profile JOIN and FotMob has a separate ingest, so these were historically
+#: excluded from the hard assertion. Verified softly until live pass-rates
+#: justify promotion (see KNOWN_PAIR_EXT_MIN_PASS).
+_KNOWN_PAIR_EXT_SOURCES = frozenset({'fbref', 'sofascore', 'fotmob'})
+
+
+def _verify_known_pairs(
+    rows: List[Dict[str, Any]],
+    required_sources: frozenset = _KNOWN_PAIR_CORE_SOURCES,
+) -> Tuple[int, int]:
     """Return (passed, total). A pair "passes" iff the expected canonical_id
-    appears with at least one row from each of FBref, Understat, WhoScored.
+    appears with at least one row from each of ``required_sources``.
 
     Done in-memory rather than as a Trino query so the regression check
     works even when the INSERT step is mocked out (e.g. unit tests).
 
-    NOTE: SofaScore intentionally excluded from the regression set —
-    first full backfill may not produce 10/10 SofaScore matches against
-    the FBref known-pair canonical_ids (player name JOIN-ed from
-    sofascore_player_profile which may be sparse). FotMob also excluded
-    from the strict assertion (separate ingest, sparser name match).
-    Their resolution rate is verified via per-source stats (logged) and
-    orphan-rate DQ.
+    The default (core) source set is the hard ResolverError gate; the
+    extended set (:data:`_KNOWN_PAIR_EXT_SOURCES`) is evaluated WARNING-only
+    by :func:`run_resolver`.
     """
     by_cid: Dict[str, set] = {}
     for r in rows:
@@ -1942,7 +2295,7 @@ def _verify_known_pairs(rows: List[Dict[str, Any]]) -> Tuple[int, int]:
     passed = 0
     for _, expected_cid in KNOWN_PAIRS:
         sources = by_cid.get(expected_cid, set())
-        if {'fbref', 'understat', 'whoscored'} <= sources:
+        if required_sources <= sources:
             passed += 1
     return passed, len(KNOWN_PAIRS)
 
@@ -2160,9 +2513,30 @@ def run_resolver(
         es = _fetch_espn_players(conn, league, source_seasons)
         logger.info("  %d ESPN players", len(es))
 
+        # DOB corroboration input — annotate candidates with their Bronze
+        # date-of-birth (in-memory field like bronze_signal; never written).
+        logger.info("Reading Bronze DOB maps ...")
+        dob_maps = _fetch_dob_maps(conn, league, source_seasons)
+        candidates_with_dob = 0
+        for src_rows, src in (
+            (fm, 'fotmob'), (ss, 'sofascore'), (tm, 'transfermarkt'),
+            (sf, 'sofifa'), (ws, 'whoscored'),
+        ):
+            m = dob_maps.get(src) or {}
+            if not m:
+                continue
+            for r in src_rows:
+                dob = m.get(str(r['source_id']))
+                if dob is not None:
+                    r['dob'] = dob
+                    candidates_with_dob += 1
+        logger.info("  %d candidates annotated with DOB", candidates_with_dob)
+
         logger.info("Resolving identities ...")
+        dob_stats: Dict[str, Any] = {}
         rows, review_rows, stats = _resolve_all(
-            fb, us, ws, ss, fm, tm, cap, sf, es, nn=nn, detected_at=detected_at
+            fb, us, ws, ss, fm, tm, cap, sf, es, nn=nn,
+            detected_at=detected_at, dob_stats_out=dob_stats,
         )
         logger.info(
             "  produced %d xref rows, %d review rows",
@@ -2189,6 +2563,19 @@ def run_resolver(
                 f"Known-pair regression: {known_passed}/{known_total} passed, "
                 f"target ≥{KNOWN_PAIR_MIN_PASS}/{known_total}. "
                 "Inspect alias YAML / threshold tuning before retrying."
+            )
+
+        # Extended gate (FBref+SofaScore+FotMob) — WARNING-only for now, see
+        # KNOWN_PAIR_EXT_MIN_PASS. Never aborts the run.
+        ext_passed, ext_total = _verify_known_pairs(
+            rows, required_sources=_KNOWN_PAIR_EXT_SOURCES
+        )
+        if ext_passed < KNOWN_PAIR_EXT_MIN_PASS:
+            logger.warning(
+                "Extended known-pair gate (fbref+sofascore+fotmob): %d/%d "
+                "passed, soft target ≥%d/%d — NOT failing the run "
+                "(WARNING-only gate).",
+                ext_passed, ext_total, KNOWN_PAIR_EXT_MIN_PASS, ext_total,
             )
 
         rows_inserted = 0
@@ -2248,6 +2635,14 @@ def run_resolver(
         'per_source': per_source,
         'dedup_removed_per_source': dedup_removed,
         'known_pair_pass_rate': f"{known_passed}/{known_total}",
+        'known_pair_pass_rate_ext': f"{ext_passed}/{ext_total}",
+        'dob': {
+            'candidates_with_dob': candidates_with_dob,
+            'canonical_dob_map': dob_stats.get('canonical_dob_map', 0),
+            'dob_conflicts': dob_stats.get('dob_conflicts', 0),
+            'promoted_from_review': dob_stats.get('promoted_from_review', 0),
+            'vetoed': dob_stats.get('vetoed', 0),
+        },
         'duration_sec': round(time.time() - started, 2),
     }
     logger.info("Resolver summary: %s", summary)
