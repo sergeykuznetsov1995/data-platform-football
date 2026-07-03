@@ -261,6 +261,15 @@ def _bootstrap(con) -> None:
          'ESP-La Liga', '2425', 'name_alias')
     """)
 
+    # --- gold.dim_season -----------------------------------------------------
+    # Canonical season universe (rendered from competitions.yaml). fct_standings
+    # is scoped to these seasons so historical FotMob/SofaScore seasons beyond
+    # the FBref spine cannot orphan ref_integrity[fct_standings.season ->
+    # dim_season]. All fixture rows are season '2425', so it must be in-scope.
+    con.execute("CREATE SCHEMA IF NOT EXISTS gold")
+    con.execute("CREATE TABLE gold.dim_season (season VARCHAR)")
+    con.execute("INSERT INTO gold.dim_season VALUES ('2425')")
+
 
 @pytest.fixture(scope="module")
 def gold_rows():
