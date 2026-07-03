@@ -249,12 +249,11 @@ security.refresh-period=30s
 
 | Группа | Состав | Лимиты |
 |---|---|---|
-| Существующее (core) | seaweedfs 1G, lakekeeper 0.5G, postgres 1G, redis 0.13G, scheduler 8G, webserver 2G (1G→2G в фазе 6: memcg-OOM воркеров с SSO), trino 8G, superset 1.5G, flaresolverr 2G, proxy_filter 0.25G | ~24.4G |
+| Существующее (core) | seaweedfs 1G, lakekeeper 0.5G, postgres 1G, redis 0.13G, scheduler 8G, webserver 2G (1G→2G в фазе 6: memcg-OOM воркеров с SSO), trino 8G, superset 3G (1.5G→3G под 4 gunicorn-воркера, issue #861), flaresolverr 2G, proxy_filter 0.25G | ~25.9G |
 | Существующее (heavy) | opensearch 2G, om-server 2G, om-ingestion 0.8G, superset-worker 0.5G, -beat 0.2G, tor 0.25G | ~5.8G |
 | Новое | keycloak 1G, caddy 0.25G, jupyterhub 0.5G | 1.75G |
-| Ноутбуки | 5 активных × 2G | 10G |
-| **Итого** | всё включено + 5 ноутбуков | **~42G / 62G** |
-| Худший случай | 10 активных ноутбуков | ~52G (жёстко, но живо; защита — culler + server_limit=6) |
+| Ноутбуки | лимит 12 активных × 1G (issue #861; было 6×2G) | 12G |
+| **Итого** | всё включено + все 12 ноутбуков | **~45.5G / 62G** |
 
 Postgres получает лёгкого жильца (Keycloak) — лимит 1G остаётся, наблюдать на фазе 2.
 
@@ -337,3 +336,46 @@ Offboarding: disable юзера в Keycloak + убрать девайс из tai
 - `Makefile`: `keycloak-db`, `render-keycloak-realm`, `build-jupyter`, `trino-acl-test`,
   `logs-keycloak`, `logs-jupyterhub`
 - `docs/SECURITY_TODO.md`: ротация ✓; отложенные эпики OM-OIDC и Lakekeeper-OIDC
+
+## 10. Масштаб ~100 юзеров (issue #861, 2026-07-03)
+
+Вводная: скоро ~100 юзеров (большинство — «простые», только Superset-дашборды;
+аналитиков с Jupyter/SQL — 10–20), VM та же. Что изменено:
+
+1. **Ресурсные группы Trino** (`resource-groups.properties` + `resource-groups.json`,
+   нужен рестарт Trino): машинные аккаунты и `platform-admins` (по userGroup из
+   groups.txt) — группа `machine` без практических лимитов; все остальные люди —
+   `humans` (8 одновременных запросов, 30% памяти, очередь 50). Проверено на
+   одноразовом Trino: 12 параллельных запросов → RUNNING=8, QUEUED=4, пайплайны
+   не задеты.
+2. **Catch-all в rules.json**: любой не-машинный юзер = SELECT только
+   `iceberg.silver|gold` (bronze/ops и каталог lakekeeper невидимы — проверено
+   15 тестами). Строка в groups.txt на юзера больше НЕ нужна (осталась только
+   `platform-admins:`). Онбординг = один шаг в Keycloak.
+3. **Класс `viewers`**: группа в Keycloak (в живой realm добавить руками/kcadm —
+   `--import-realm` существующий realm не обновляет), маппинг в Superset
+   `viewers → Gamma+analyst_data` (дашборды без SQL Lab); в JupyterHub/Airflow
+   viewers не пускаются (allowed_groups/маппинги не включают их).
+4. **JupyterHub**: 1G/1cpu на ноутбук, active_server_limit 12, culler 30 мин.
+5. **Superset**: 4 gunicorn-воркера (`SERVER_WORKER_AMOUNT`), лимит 3G.
+6. **`scripts/onboard_user.sh`**: юзер+temp-пароль+группа одной командой (kcadm).
+
+### Сеть при 100 юзерах (решение НЕ принято — за владельцем)
+
+Tailscale free теперь 6 юзеров; дальше Standard ~$8/юзер/мес (100 юзеров ≈
+$800/мес). Бесплатные альтернативы (ресёрч 2026-07):
+
+- **Рекомендация (1-е место): гибрид** — Superset+Keycloak публикуются на
+  публичный домен через Caddy (простым юзерам ноль установки, поверхность
+  атаки минимальна: оба уже за SSO с brute-force protection; чек-лист:
+  фиксированный KC_HOSTNAME, /admin закрыть по IP, CrowdSec/fail2ban,
+  rate-limit, обновления Keycloak); аналитикам (10–20) — **Headscale**
+  (self-hosted control-plane, официальные Tailscale-клиенты, один бинарь).
+  Гоча: OIDC issuer один для всех → Keycloak обязан быть публичным, а
+  контейнеры должны резолвить публичный FQDN в Caddy (alias/extra_hosts —
+  тот же приём, что с tailnet-FQDN).
+- 2-е место: тот же гибрид, но аналитикам платный Tailscale ($80–160/мес).
+- 3-е место: NetBird self-hosted для всех (бесплатно, логин через наш Keycloak,
+  но 100 «простых» ставят клиент + 4 компонента ops).
+- Отпадают: ZeroTier (free 10 устройств, $2/устройство), Cloudflare Access
+  (free 50 seats, дальше $7/юзер за всех; JDBC не дружит без WARP).

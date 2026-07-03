@@ -1,43 +1,59 @@
-# Доступ аналитика к платформе
+# Доступ юзеров к платформе
 
 Дизайн и устройство: [design/analyst-access.md](design/analyst-access.md).
 Хост платформы (tailnet): `386844.tailb2c32a.ts.net` — далее `<host>`.
 
-## Что получает аналитик
+## Два класса юзеров
 
-Один аккаунт (Keycloak, группа `analysts`) открывает:
+| Класс (группа Keycloak) | Что получает |
+|---|---|
+| `viewers` — «простой» юзер | только Superset: дашборды (без SQL Lab) |
+| `analysts` — аналитик | всё из таблицы ниже |
+
+Сервисы аналитика:
 
 | Сервис | Адрес | Права |
 |---|---|---|
-| JupyterHub | `https://<host>/` | свой контейнер (2 ГБ), персональный диск |
+| JupyterHub | `https://<host>/` | свой контейнер (1 ГБ), персональный диск |
 | Superset | `https://<host>:8088` | дашборды + SQL Lab (read-only) |
 | Airflow | `https://<host>:8081` | просмотр DAG'ов (Viewer) |
 | Trino | `https://<host>:8444` | SQL read-only к `silver`/`gold`; `bronze` невидим |
 
-Писать в данные нельзя — это гарантирует Trino, а не вежливость.
+Писать в данные нельзя — это гарантирует Trino, а не вежливость: любой
+не-машинный юзер получает от rules.json только SELECT на `silver`/`gold`
+(catch-all; правки конфигов на нового юзера НЕ нужны). Запросы людей идут
+в ресурсной группе `humans` (лимит 8 одновременно, 30% памяти) и не могут
+задушить пайплайны.
 
-## Онбординг нового аналитика (~5 минут, без рестартов)
+## Онбординг (~2 минуты, без рестартов)
 
 1. **Tailscale**: пригласи юзера в tailnet (админка → Users → Invite) —
    он ставит клиент с https://tailscale.com/download и логинится.
-2. **Keycloak** `https://<host>:8443/admin` (realm `football`):
-   Users → Create user (username, email) → Credentials → временный пароль
-   (галка Temporary) → Groups → Join `analysts`.
-3. **Trino-группы**: добавь username в строку `analysts:` файла
-   `configs/trino/groups.txt` (подхватывается за 30 секунд, рестарт не нужен).
-   Без этого шага SQL Lab в Superset не даст прав на данные.
-4. Отправь юзеру ссылки из таблицы выше. Первый вход сам заведёт его
-   в каждом сервисе с нужной ролью.
+2. **Аккаунт** одной командой (создаёт юзера в Keycloak с временным паролем
+   и кладёт в группу):
 
-Админа платформы заводят так же, но группа `platform-admins`
-и строка `platform-admins:` в groups.txt.
+   ```bash
+   scripts/onboard_user.sh <username> <email>            # viewer (default)
+   scripts/onboard_user.sh <username> <email> analysts   # аналитик
+   ```
+
+   Скрипт напечатает временный пароль — отправь его юзеру вместе со ссылками.
+   Viewers достаточно одной: `https://<host>:8088`.
+3. Первый вход сам заведёт юзера в каждом сервисе с нужной ролью
+   (viewers в JupyterHub/Airflow не пускаются).
+
+Руками через админку (`https://<host>:8443/admin`, realm `football`) — тоже
+можно: Users → Create user → Credentials (Temporary) → Groups → Join.
+
+Админа платформы заводят так же (группа `platform-admins`), плюс строка
+`platform-admins:` в `configs/trino/groups.txt` — это единственный случай,
+когда groups.txt ещё нужен.
 
 ## Оффбординг
 
 1. Keycloak → Users → Disable.
 2. Tailscale-админка → удалить устройство юзера.
-3. Убрать username из `configs/trino/groups.txt`.
-4. Ротация общего пароля ноутбуков (юзер мог его видеть):
+3. Только для аналитиков — ротация общего пароля ноутбуков (юзер мог его видеть):
    новое значение `TRINO_ANALYST_SVC_PASSWORD` в `.env`, перегенерить строку
    `analyst_svc` в `password.db` (`htpasswd -nbB -C 10`, cost ≥ 8!),
    пересоздать jupyterhub. Живые ноутбуки получат пароль при следующем спавне.

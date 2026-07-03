@@ -9,6 +9,7 @@
   "bruteForceProtected": true,
   "groups": [
     { "name": "analysts", "path": "/analysts" },
+    { "name": "viewers", "path": "/viewers" },
     { "name": "platform-admins", "path": "/platform-admins" }
   ],
   "clientScopes": [

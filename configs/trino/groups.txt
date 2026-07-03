@@ -1,9 +1,7 @@
 # Формат: группа:юзер1,юзер2  (hot-reload 30с, рестарт Trino не нужен)
-# Нового аналитика добавляй сюда ТОЖЕ (плюс Keycloak) — иначе Superset
-# SQL Lab (impersonation) не даст ему прав группы analysts.
-# admin — локальный админ Superset: его дашборды под impersonation тоже
-# должны читать данные (read-only достаточно).
-analysts:test-analyst,admin,katya
-# ВАЖНО: Trino берёт группы ТОЛЬКО отсюда (oauth2 groups-field в 482 нет),
-# поэтому админы платформы тоже перечисляются здесь.
+# Обычным юзерам (аналитики/viewers) запись здесь НЕ нужна: catch-all в
+# rules.json даёт любому не-машинному юзеру SELECT на silver/gold автоматом
+# (включая Superset-impersonation и локального админа Superset).
+# Здесь остаются только админы платформы (полный доступ в Trino).
+# Trino берёт группы ТОЛЬКО отсюда (oauth2 groups-field в 482 нет).
 platform-admins:sergey
