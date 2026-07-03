@@ -63,7 +63,8 @@ dns:
   #  - { name: "trino.__PLATFORM_DOMAIN__",   type: "A", value: "<headscale-IP VM>" }
   #  - { name: "meta.__PLATFORM_DOMAIN__",    type: "A", value: "<headscale-IP VM>" }
 
-unix_socket: /var/run/headscale/headscale.sock
+# Сокет в /var/lib (writable volume): без root контейнер не может создать /var/run/headscale
+unix_socket: /var/lib/headscale/headscale.sock
 unix_socket_permission: "0770"
 
 # Вход юзеров через наш Keycloak: `tailscale up --login-server https://hs.<домен>`
