@@ -23,7 +23,7 @@ Per-table verdict vocabulary (from #476):
 
 ---
 
-## 1. Register (2 live write-only tables, audit 2026-06-15; 4 SoFIFA via #601 + 4 FotMob via #600 + 3 Capology via #603 CONSUMED, 2026-06-17)
+## 1. Register (3 live write-only tables; audit 2026-06-15, +1 found in R5 review 2026-07-03; 4 SoFIFA via #601 + 4 FotMob via #600 + 3 Capology via #603 CONSUMED, 2026-06-17)
 
 Cost class = cost of *stopping* the scrape. **FREE** = by-product of a request made anyway
 (removing it saves only HDFS/snapshots, not HTTP); **CHEAP** = 1 HTTP; **EXPENSIVE** =
@@ -33,6 +33,7 @@ per-item/per-season HTTP.
 |---|---|---|---|---|
 | `whoscored_season_stages` | FREE (same session as `scrape_schedule`, soccerdata cache) | ⚠ `stage` all-NULL; 6 rows | (b) keep | — (§3) |
 | `clubelo_team_history` | MODERATE (per-team histories) | no `rank`/`league`; **219,861 rows** (largest unread) | **(c) stop** | [#604] |
+| `fbref_match_keeper_stats` | FREE (parsed from the same match page as `combined_match_data`, `data_readers.py:1107`) | per-match GK stats (SoTA/GA/saves/save%); 7,677 rows; found in R5 review — was never registered | **(b) future** (per-match keeper block is absent from Gold entirely) | [#870] |
 
 ### Resolved since the 2026-06-11 inventory
 
@@ -210,6 +211,7 @@ gap tracked as followup [#738].
 | 2026-06-20 | `fbref_keeper_keeper_adv` scrape **stopped** + table **dropped**: removed `'keeper_adv'` from `KEEPER_STAT_TYPES` (DAG no longer creates the `keeper_keeper_adv` task), cleaned dormant url-mapping/schema/docstrings, dropped the 3 `audit_bronze_columns.py` entries (`EXPECTED_NULL`/`EXPECTED_CONSTANT`/contract), removed the OM description YAML, `DROP TABLE` via `scripts/drop_fbref_keeper_keeper_adv.sql`. 26 cols 100% NULL since FBref Feb-2026; core cols duplicate the consumed `fbref_keeper_keeper`. 3 → 2 live write-only. | #606 |
 
 | 2026-06-20 | §5 added — Gold→Bronze one-hop audit (#704): `fct_shot` lifted to `silver.understat_shots` (was direct `bronze.understat_shots` + `understat_players`; only the `understat_schedule` match bridge kept in Gold); `fct_event` documented as a sanctioned `team_id→name` bridge (SQL unchanged); `fct_standings` already Silver (#702); `dim_venue` (#735) + `whoscored_events` data reads in `fct_match_timeline`/`fct_team_season_stats` (#736) filed as followups. | #704 |
+| 2026-07-03 | R5 medallion-loss review: `fbref_match_keeper_stats` added — live prod producer (`data_readers.py:1107`), 0 Silver/Gold readers, was never in the register or the #476 inventory; verdict (b) future. `whoscored_player_profile` checked and NOT added: it has a live `dags/utils` reader (`xref_player_resolver.py`), which counts per §2. 2 → 3 live write-only. | `docs/research/R5_medallion_loss_review.md` |
 | 2026-06-21 | §5 followups resolved — `fct_match_timeline` (raw card/sub/goal fallback) + `fct_team_season_stats.j2` (penalty data, #161) lifted off `bronze.whoscored_events` to `silver.whoscored_events_spadl` via its audit columns (`_action_source_note` = orig WhoScored type, `qualifiers_raw` = raw JSON). Silver extended with 4 raw passthrough cols (`team_name_raw`, `related_player_id_raw`, `minute`, `second`) so the timeline keeps byte-identical classification. Only the `whoscored_schedule` bridges remain (norm). | #736 |
 
 [#476]: https://github.com/sergeykuznetsov1995/data-platform-football/issues/476
@@ -223,4 +225,5 @@ gap tracked as followup [#738].
 [#704]: https://github.com/sergeykuznetsov1995/data-platform-football/issues/704
 [#735]: https://github.com/sergeykuznetsov1995/data-platform-football/issues/735
 [#736]: https://github.com/sergeykuznetsov1995/data-platform-football/issues/736
+[#870]: https://github.com/sergeykuznetsov1995/data-platform-football/issues/870
 [#738]: https://github.com/sergeykuznetsov1995/data-platform-football/issues/738
