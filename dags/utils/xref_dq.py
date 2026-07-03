@@ -275,19 +275,29 @@ def build_xref_referee_checks() -> List[Check]:
     ]
 
 
-def build_xref_manager_checks() -> List[Check]:
-    """DQ for ``iceberg.silver.xref_manager`` — FBref spine + FotMob mirror (#144).
+#: Anchor canonical_ids for the manager 2-source regression guard (mirrors
+#: KNOWN_REFEREE_CANONICALS). Long-tenured APL head coaches present in both
+#: the FBref spine and at least one mirror source across recent seasons.
+KNOWN_MANAGER_CANONICALS = (
+    'mikel_arteta',
+    'pep_guardiola',
+    'unai_emery',
+)
 
-    Sources: FBref scorebox parser (bronze.fbref_match_managers) +
-    FotMob coachId mirror (bronze.fotmob_player_details WHERE is_coach).
-    Bounds sized for APL across 8 seasons: ~30-50 distinct managers × per-season
-    presence × 2 sources ≈ 60-400 rows. Upper bound is generous for future
-    multi-league expansion. Per-source orphan-rate (FotMob coaches not glued to
-    an FBref counterpart) is evaluated separately by
-    :func:`evaluate_orphan_rate_per_source` and appended by the DAG callable.
+
+def build_xref_manager_checks() -> List[Check]:
+    """DQ for ``iceberg.silver.xref_manager`` — FBref spine + FotMob coachId
+    mirror (#144) + Transfermarkt coach_id bridge (xref-improvements).
+
+    Bounds sized for APL across ~10 seasons: ~30-50 distinct managers ×
+    per-season presence × 3 sources ≈ 900 rows worst case — max 2000 keeps
+    headroom; revisit per league onboarded. Per-source orphan-rate is
+    evaluated separately by :func:`evaluate_orphan_rate_per_source` and
+    appended by the DAG callable; TM-vs-FotMob dob disagreement by
+    :func:`evaluate_manager_dob_collisions` (Phase 2.7).
     """
     table = 'iceberg.silver.xref_manager'
-    return [
+    checks = [
         CHECK.row_count(table, min_rows=20, max_rows=2000),
 
         CHECK.no_duplicates(
@@ -299,13 +309,15 @@ def build_xref_manager_checks() -> List[Check]:
 
         check_enum_compliance(
             table, 'source',
-            allowed=['fbref', 'fotmob'],
+            allowed=['fbref', 'fotmob', 'transfermarkt'],
             severity='ERROR',
         ),
 
+        # name_alias / name_initial added with the TM bridge (alias YAML tier
+        # + surname-and-first-initial tier); see xref_manager.sql.j2 header.
         check_enum_compliance(
             table, 'confidence',
-            allowed=['name_normalize', 'orphan'],
+            allowed=['name_alias', 'name_normalize', 'name_initial', 'orphan'],
             severity='ERROR',
         ),
 
@@ -322,7 +334,53 @@ def build_xref_manager_checks() -> List[Check]:
             severity='WARNING',
             name='manager_collision[fotmob.canonical_id]',
         ),
+
+        # Same guard for the TM bridge: two distinct coach_ids landing on one
+        # canonical within (league, season) is a suspected false merge (most
+        # likely a name_initial mis-fire) — WARNING, inspect + alias-fix.
+        CHECK.no_duplicates(
+            table,
+            pk=['canonical_id', 'league', 'season'],
+            where="source = 'transfermarkt'",
+            severity='WARNING',
+            name='manager_collision[transfermarkt.canonical_id]',
+        ),
+
+        # 3rd source presence: TM coaches must actually reach the table.
+        # WARNING until the TM coaches backfill is confirmed on the target
+        # env, then promote to ERROR.
+        CHECK.row_count(
+            table=table,
+            min_rows=1,
+            where="source = 'transfermarkt'",
+            severity='WARNING',
+            name='source_present[xref_manager.transfermarkt]',
+        ),
     ]
+
+    # Anchor regression (mirrors the referee anchors): each known manager
+    # canonical must carry ≥2 distinct non-orphan sources. Implemented as
+    # "0 offending anchors" via row_count over a per-anchor aggregate.
+    anchors_in = ", ".join(f"'{cid}'" for cid in KNOWN_MANAGER_CANONICALS)
+    checks.append(
+        CHECK.row_count(
+            table=table,
+            min_rows=0,
+            max_rows=0,
+            where=(
+                "canonical_id IN ("
+                f"SELECT canonical_id FROM {table} "
+                f"WHERE canonical_id IN ({anchors_in}) "
+                "AND confidence <> 'orphan' "
+                "GROUP BY canonical_id "
+                "HAVING COUNT(DISTINCT source) < 2"
+                f") AND canonical_id IN ({anchors_in})"
+            ),
+            severity='WARNING',
+            name='known_manager_anchors[xref_manager]',
+        )
+    )
+    return checks
 
 
 def build_xref_player_checks() -> List[Check]:
@@ -864,6 +922,91 @@ def evaluate_dob_conflicts(
         })
     return {
         'conflicts': len(rows),
+        'rows': out_rows,
+        'truncated': len(rows) > limit,
+        'verdict': 'OK' if not rows else 'WARNING',
+    }
+
+
+def evaluate_manager_dob_collisions(
+    xref_table: str = 'iceberg.silver.xref_manager',
+    fotmob_profile_table: str = 'iceberg.silver.fotmob_manager_profile',
+    tm_coaches_table: str = 'iceberg.silver.transfermarkt_coaches',
+    tolerance_days: int = 1,
+    limit: int = 50,
+) -> Dict[str, Any]:
+    """Report manager canonicals where FotMob and TM disagree on birth date.
+
+    DOB corroboration for the manager bridge: a canonical carrying both a
+    FotMob coachId and a TM coach_id whose profile DOBs differ by more than
+    ``tolerance_days`` is a suspected false merge — the strongest signal for
+    ``name_initial``-tier rows (the confidence of the TM row is included so
+    the reviewer sees which tier produced the link). Candidates for a
+    ``manager_aliases.yaml`` correction.
+
+    Reads the two profile silver tables (not Bronze): unlike the player DOB
+    maps this is NOT circular — fotmob_manager_profile / transfermarkt_coaches
+    do not consume xref_manager.
+
+    Returns ``{'collisions': N, 'rows': [...≤limit], 'truncated': bool,
+    'verdict': 'OK'|'WARNING'}`` — never escalates to ERROR.
+    """
+    xq = _qualify(xref_table)
+    fmq = _qualify(fotmob_profile_table)
+    tmq = _qualify(tm_coaches_table)
+    sql = (
+        "WITH fm AS (\n"
+        "    SELECT x.canonical_id, x.league, x.season,\n"
+        "           MAX(TRY_CAST(p.date_of_birth AS DATE)) AS fm_dob\n"
+        f"    FROM {xq} x\n"
+        f"    JOIN {fmq} p\n"
+        "      ON p.player_id = x.source_id\n"
+        "     AND p.league = x.league AND p.season = x.season\n"
+        "    WHERE x.source = 'fotmob' AND x.confidence <> 'orphan'\n"
+        "    GROUP BY x.canonical_id, x.league, x.season\n"
+        "),\n"
+        "tm AS (\n"
+        "    SELECT x.canonical_id, x.league, x.season, x.confidence,\n"
+        "           MAX(c.dob) AS tm_dob\n"
+        f"    FROM {xq} x\n"
+        f"    JOIN {tmq} c\n"
+        "      ON CAST(c.coach_id AS varchar) = x.source_id\n"
+        "     AND c.league = x.league AND c.season = x.season\n"
+        "    WHERE x.source = 'transfermarkt' AND x.confidence <> 'orphan'\n"
+        "    GROUP BY x.canonical_id, x.league, x.season, x.confidence\n"
+        ")\n"
+        "SELECT tm.canonical_id, tm.league, tm.season, tm.confidence,\n"
+        "       fm.fm_dob, tm.tm_dob\n"
+        "FROM tm\n"
+        "JOIN fm ON fm.canonical_id = tm.canonical_id\n"
+        "       AND fm.league = tm.league AND fm.season = tm.season\n"
+        "WHERE fm.fm_dob IS NOT NULL AND tm.tm_dob IS NOT NULL\n"
+        f"  AND abs(date_diff('day', fm.fm_dob, tm.tm_dob)) > {int(tolerance_days)}\n"
+        "ORDER BY tm.canonical_id, tm.season"
+    )
+    conn = _get_conn()
+    try:
+        cur = conn.cursor()
+        try:
+            cur.execute(sql)
+            rows = cur.fetchall()
+        finally:
+            cur.close()
+    finally:
+        conn.close()
+
+    out_rows: List[Dict[str, Any]] = []
+    for cid, league, season, confidence, fm_dob, tm_dob in rows[:limit]:
+        out_rows.append({
+            'canonical_id': cid,
+            'league': league,
+            'season': season,
+            'tm_confidence': confidence,
+            'fotmob_dob': str(fm_dob),
+            'tm_dob': str(tm_dob),
+        })
+    return {
+        'collisions': len(rows),
         'rows': out_rows,
         'truncated': len(rows) > limit,
         'verdict': 'OK' if not rows else 'WARNING',
