@@ -424,6 +424,8 @@ services:
       # OAuth2 (SSO людей через Keycloak; машинные аккаунты — по-прежнему password.db)
       - TRINO_OIDC_CLIENT_SECRET=${TRINO_OIDC_CLIENT_SECRET}
       - TRINO_OAUTH2_ISSUER=${OIDC_ISSUER:-https://${TS_HOSTNAME}:8443/realms/football}
+      # Фикс. ключ шифрования refresh-токенов (иначе рестарт Trino разлогинивает людей)
+      - TRINO_OAUTH2_REFRESH_KEY=${TRINO_OAUTH2_REFRESH_KEY}
     ports:
       - "127.0.0.1:8082:8443"
       - "[::1]:8082:8443"
