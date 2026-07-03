@@ -85,17 +85,21 @@ echo "== 6/8 .env: новые TS_IP/TS_HOSTNAME + split-DNS"
 sed -i "s|^TS_IP=.*|TS_IP=$NEWIP|" .env
 sed -i "s|^TS_HOSTNAME=.*|TS_HOSTNAME=386844.tail.$D|" .env
 make render-headscale-config
-NEWIP="$NEWIP" D="$D" python3 - <<'PYEOF'
+PUB=$(grep '^PUBLIC_IP=' .env | cut -d= -f2-)
+NEWIP="$NEWIP" PUB="$PUB" D="$D" python3 - <<'PYEOF'
 import os
-ip, d = os.environ["NEWIP"], os.environ["D"]
+ip, pub, d = os.environ["NEWIP"], os.environ["PUB"], os.environ["D"]
 p = "configs/headscale/config.yaml"
 recs = "extra_records:\n" + "\n".join(
-    f'    - {{ name: "{n}.{d}", type: "A", value: "{ip}" }}'
-    for n in ["jupyter", "airflow", "trino", "meta"])
+    [f'    - {{ name: "{n}.{d}", type: "A", value: "{ip}" }}'
+     for n in ["jupyter", "airflow", "trino", "meta"]]
+    # bi/auth/hs — публичный IP явно, чтобы split не форвардил их (SERVFAIL)
+    + [f'    - {{ name: "{n}.{d}", type: "A", value: "{pub}" }}'
+       for n in ["bi", "auth", "hs"]])
 t = open(p).read()
 assert "extra_records: []" in t, "extra_records не найден"
 open(p, "w").write(t.replace("extra_records: []", recs))
-print("   extra_records OK")
+print("   extra_records OK (4 VPN + 3 public)")
 PYEOF
 docker compose restart headscale
 
