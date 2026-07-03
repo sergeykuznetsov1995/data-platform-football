@@ -8,6 +8,11 @@ c = get_config()  # noqa: F821
 
 TS_HOSTNAME = os.environ["TS_HOSTNAME"]
 ISSUER = os.environ["OIDC_ISSUER"]
+# Гибрид (docs/HEADSCALE_MIGRATION.md): jupyter.<домен> вместо tailnet-FQDN
+# и trino.<домен>:8444->443; пустые env = текущая tailnet-схема
+PUBLIC_HOST = os.environ.get("JUPYTER_PUBLIC_HOST") or TS_HOSTNAME
+TRINO_HOST = os.environ.get("TRINO_PUBLIC_HOST") or TS_HOSTNAME
+TRINO_PORT = os.environ.get("TRINO_PUBLIC_PORT") or "8444"
 
 # --- Сеть/база -------------------------------------------------------------
 c.JupyterHub.bind_url = "http://0.0.0.0:8000"
@@ -26,7 +31,7 @@ from oauthenticator.generic import GenericOAuthenticator  # noqa: E402
 c.JupyterHub.authenticator_class = GenericOAuthenticator
 c.GenericOAuthenticator.client_id = "jupyterhub"
 c.GenericOAuthenticator.client_secret = os.environ["JUPYTERHUB_OIDC_CLIENT_SECRET"]
-c.GenericOAuthenticator.oauth_callback_url = f"https://{TS_HOSTNAME}/hub/oauth_callback"
+c.GenericOAuthenticator.oauth_callback_url = f"https://{PUBLIC_HOST}/hub/oauth_callback"
 c.GenericOAuthenticator.authorize_url = f"{ISSUER}/protocol/openid-connect/auth"
 c.GenericOAuthenticator.token_url = f"{ISSUER}/protocol/openid-connect/token"
 c.GenericOAuthenticator.userdata_url = f"{ISSUER}/protocol/openid-connect/userinfo"
@@ -53,8 +58,8 @@ c.DockerSpawner.volumes = {"jupyterhub-user-{username}": "/home/jovyan/work"}
 # read-only аккаунт analyst_svc. Персональный вариант — OAuth2Authentication()
 # (см. docs/ANALYST_ONBOARDING.md).
 c.DockerSpawner.environment = {
-    "TRINO_HOST": TS_HOSTNAME,
-    "TRINO_PORT": "8444",
+    "TRINO_HOST": TRINO_HOST,
+    "TRINO_PORT": TRINO_PORT,
     "TRINO_USER": "analyst_svc",
     "TRINO_PASSWORD": os.environ["TRINO_ANALYST_SVC_PASSWORD"],
 }

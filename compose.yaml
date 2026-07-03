@@ -375,7 +375,8 @@ services:
       # SSO через Keycloak (webserver_config.py); false = обычная форма логина
       AIRFLOW_OAUTH_ENABLED: ${AIRFLOW_OAUTH_ENABLED:-false}
       AIRFLOW_OIDC_CLIENT_SECRET: ${AIRFLOW_OIDC_CLIENT_SECRET:-}
-      OIDC_ISSUER: https://${TS_HOSTNAME:-unset}:8443/realms/football
+      # OIDC_ISSUER в .env переопределяет tailnet-дефолт (гибрид: auth.<домен>)
+      OIDC_ISSUER: ${OIDC_ISSUER:-https://${TS_HOSTNAME:-unset}:8443/realms/football}
       # За Caddy: доверять X-Forwarded-* (иначе redirect_uri будет http://)
       AIRFLOW__WEBSERVER__ENABLE_PROXY_FIX: "true"
       # 2 gunicorn-воркера по ~550MB RSS (с SSO) — в 1G ловили memcg-OOM
@@ -422,7 +423,7 @@ services:
       - S3_SECRET_KEY=${S3_SECRET_KEY}
       # OAuth2 (SSO людей через Keycloak; машинные аккаунты — по-прежнему password.db)
       - TRINO_OIDC_CLIENT_SECRET=${TRINO_OIDC_CLIENT_SECRET}
-      - TRINO_OAUTH2_ISSUER=https://${TS_HOSTNAME}:8443/realms/football
+      - TRINO_OAUTH2_ISSUER=${OIDC_ISSUER:-https://${TS_HOSTNAME}:8443/realms/football}
     ports:
       - "127.0.0.1:8082:8443"
       - "[::1]:8082:8443"
@@ -499,7 +500,8 @@ services:
       # SSO через Keycloak (superset_config.py); false = обычная форма логина
       SUPERSET_OAUTH_ENABLED: ${SUPERSET_OAUTH_ENABLED:-false}
       SUPERSET_OIDC_CLIENT_SECRET: ${SUPERSET_OIDC_CLIENT_SECRET:-}
-      OIDC_ISSUER: https://${TS_HOSTNAME:-unset}:8443/realms/football
+      # OIDC_ISSUER в .env переопределяет tailnet-дефолт (гибрид: auth.<домен>)
+      OIDC_ISSUER: ${OIDC_ISSUER:-https://${TS_HOSTNAME:-unset}:8443/realms/football}
       # ~100 юзеров (issue #861): дефолт образа — 1 gunicorn-воркер.
       # 4 воркера x gthread; лимит памяти ниже поднят 1500M -> 3G
       # (правило #847: воркеры ~400-500M RSS каждый, тихий memcg-OOM)
@@ -919,11 +921,16 @@ services:
       frontend:
         aliases:
           - ${TS_HOSTNAME:-caddy-alias-unset}
+          # Гибрид: контейнеры резолвят публичные имена в Caddy (issuer/Trino)
+          - auth.${PLATFORM_DOMAIN:-platform-domain-unset}
+          - trino.${PLATFORM_DOMAIN:-platform-domain-unset}
       # В сети ноутбуков Caddy — единственный «выход наружу»: через его alias
       # юзер-контейнеры ходят в Trino (:8444) и Keycloak (:8443)
       analyst:
         aliases:
           - ${TS_HOSTNAME:-caddy-alias-unset}
+          - auth.${PLATFORM_DOMAIN:-platform-domain-unset}
+          - trino.${PLATFORM_DOMAIN:-platform-domain-unset}
     ports:
       - "${TS_IP:?}:443:443"
       - "${TS_IP:?TS_IP not set — tailscale ip -4}:8081:8081"
@@ -931,8 +938,13 @@ services:
       - "${TS_IP:?}:8443:8443"
       - "${TS_IP:?}:8444:8444"
       - "${TS_IP:?}:8585:8585"
+      # Гибрид: публичный вход (bi/auth/hs + ACME HTTP-01). До cutover
+      # PUBLIC_IP не задан — байнд на 127.0.0.1 безвреден.
+      - "${PUBLIC_IP:-127.0.0.1}:80:80"
+      - "${PUBLIC_IP:-127.0.0.1}:443:443"
     environment:
       TS_HOSTNAME: ${TS_HOSTNAME:?TS_HOSTNAME not set — tailscale status --json .Self.DNSName}
+      PLATFORM_DOMAIN: ${PLATFORM_DOMAIN:-platform-domain-unset}
     volumes:
       - ./configs/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
       - /var/run/tailscale/tailscaled.sock:/var/run/tailscale/tailscaled.sock
@@ -985,7 +997,8 @@ services:
       KC_DB_URL: jdbc:postgresql://postgres:5432/keycloak
       KC_DB_USERNAME: keycloak
       KC_DB_PASSWORD: ${KEYCLOAK_DB_PASSWORD:?}
-      KC_HOSTNAME: https://${TS_HOSTNAME:?}:8443
+      # KC_PUBLIC_URL в .env переопределяет tailnet-дефолт (гибрид: https://auth.<домен>)
+      KC_HOSTNAME: ${KC_PUBLIC_URL:-https://${TS_HOSTNAME:?}:8443}
       KC_HTTP_ENABLED: "true"
       KC_PROXY_HEADERS: xforwarded
       KC_HEALTH_ENABLED: "true"
@@ -1032,9 +1045,14 @@ services:
       - analyst
     environment:
       TS_HOSTNAME: ${TS_HOSTNAME:?}
-      OIDC_ISSUER: https://${TS_HOSTNAME:?}:8443/realms/football
+      OIDC_ISSUER: ${OIDC_ISSUER:-https://${TS_HOSTNAME:?}:8443/realms/football}
       JUPYTERHUB_OIDC_CLIENT_SECRET: ${JUPYTERHUB_OIDC_CLIENT_SECRET:?}
       TRINO_ANALYST_SVC_PASSWORD: ${TRINO_ANALYST_SVC_PASSWORD:?}
+      # Гибрид (docs/HEADSCALE_MIGRATION.md): свой hostname хаба и адрес Trino
+      # для ноутбуков; пусто = tailnet-дефолты (TS_HOSTNAME / :8444)
+      JUPYTER_PUBLIC_HOST: ${JUPYTER_PUBLIC_HOST:-}
+      TRINO_PUBLIC_HOST: ${TRINO_PUBLIC_HOST:-}
+      TRINO_PUBLIC_PORT: ${TRINO_PUBLIC_PORT:-8444}
     command: ["jupyterhub", "-f", "/srv/jupyterhub/jupyterhub_config.py"]
     volumes:
       - ./configs/jupyterhub/jupyterhub_config.py:/srv/jupyterhub/jupyterhub_config.py:ro
@@ -1053,6 +1071,46 @@ services:
           memory: 512M
         reservations:
           memory: 128M
+
+  # ---------------------------------------------------------------------------
+  # Headscale: self-hosted control-plane VPN (docs/HEADSCALE_MIGRATION.md).
+  # Под профилем `headscale` — НЕ стартует, пока в .env нет
+  # COMPOSE_PROFILES=headscale (активация на cutover, нужен домен).
+  # Перед стартом: make render-headscale-config (иначе docker создаст ПАПКУ
+  # вместо config.yaml — та же гоча, что у realm-football.json).
+  # Клиенты ходят на https://hs.<домен> через Caddy; STUN — напрямую (3478/udp).
+  # ---------------------------------------------------------------------------
+  headscale:
+    image: headscale/headscale:0.29.2
+    container_name: headscale
+    hostname: headscale
+    profiles: ["headscale"]
+    command: ["serve"]
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    networks:
+      - frontend
+    ports:
+      - "3478:3478/udp"
+    volumes:
+      - ./configs/headscale/config.yaml:/etc/headscale/config.yaml:ro
+      - headscale_data:/var/lib/headscale
+    restart: unless-stopped
+    healthcheck:
+      # образ distroless (нет shell) — проверка встроенной командой
+      test: ["CMD", "headscale", "health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+        reservations:
+          memory: 64M
 
 # =============================================================================
 # Networks
@@ -1098,3 +1156,5 @@ volumes:
     name: caddy_config
   jupyterhub_data:
     name: jupyterhub_data
+  headscale_data:
+    name: headscale_data
