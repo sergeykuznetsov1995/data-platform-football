@@ -291,29 +291,51 @@ def _run_pure_sql_xref(sql_file: str, table_name: str, **context) -> Dict[str, A
 
 
 def _run_xref_player(**context) -> Dict[str, Any]:
-    """Run the Python xref_player resolver (T3 deliverable).
+    """Run the Python xref_player resolver (T3 deliverable) per in-scope league.
 
-    Materialises ``iceberg.silver.xref_player`` from FBref + Understat +
-    WhoScored Bronze data. ``run_resolver`` raises ``ResolverError`` if
-    the known-pair regression check (10/10 APL anchors) drops below 8/10
-    — that aborts the DAG before partial data lands.
+    Materialises ``iceberg.silver.xref_player`` for every league flagged
+    ``in_scope: true`` in competitions.yaml — a SEQUENTIAL in-task loop, NOT
+    Airflow dynamic task mapping, deliberately: (a) ``max_active_tasks=1``
+    serialises mapped instances anyway, so mapping buys no parallelism here;
+    (b) the first league runs ``write_mode='rebuild'`` (DROP+CREATE) and the
+    rest ``'replace_league'`` — an ordering a retry of one mapped instance
+    cannot guarantee; (c) mapped instances would fragment the summary XCom the
+    DQ task consumes. Revisit ``.expand()`` once leagues are fully independent.
 
-    Summary dict is pushed to XCom for the downstream DQ check (T6)
-    to consume.
+    ``run_resolver`` raises ``ResolverError`` if a league's known-pair
+    regression drops below the gate — that aborts the DAG before the
+    remaining leagues run (a league with no curated anchors skips the gate
+    with a WARNING).
+
+    Summary dict (keyed by league) is pushed to XCom for the downstream DQ
+    check (T6) to consume.
     """
+    from utils.medallion_config import get_in_scope_competitions
     from utils.xref_player_resolver import run_resolver
 
-    summary = run_resolver(
-        target_table='iceberg.silver.xref_player',
-        league='ENG-Premier League',
-        seasons=None,                # all configured seasons (E1: APL only)
-        chunk_size=500,
-        drop_before_insert=True,
-    )
+    leagues = get_in_scope_competitions()
+    if not leagues:
+        raise ValueError(
+            "competitions.yaml has no in_scope leagues — refusing to "
+            "materialise an empty xref_player."
+        )
 
-    logger.info("xref_player resolver summary: %s", summary)
-    context['ti'].xcom_push(key='resolver_summary', value=summary)
-    return summary
+    summaries: Dict[str, Any] = {}
+    for i, league in enumerate(leagues):
+        summaries[league] = run_resolver(
+            target_table='iceberg.silver.xref_player',
+            league=league,
+            seasons=None,            # all configured seasons for the league
+            chunk_size=500,
+            drop_before_insert=True,
+            write_mode='rebuild' if i == 0 else 'replace_league',
+        )
+        logger.info(
+            "xref_player resolver summary (%s): %s", league, summaries[league]
+        )
+
+    context['ti'].xcom_push(key='resolver_summary', value=summaries)
+    return summaries
 
 
 def _validate_xref(**context) -> Dict[str, Any]:
