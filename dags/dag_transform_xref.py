@@ -285,6 +285,7 @@ def _validate_xref(**context) -> Dict[str, Any]:
     from utils.xref_dq import (
         build_all_xref_checks,
         evaluate_bronze_xref_freshness_gap,
+        evaluate_dob_conflicts,
         evaluate_orphan_rate_per_source,
         report_orphan_teams,
     )
@@ -380,6 +381,37 @@ def _validate_xref(**context) -> Dict[str, Any]:
         context['ti'].xcom_push(key='orphan_teams', value=orphan_teams)
     except Exception:
         logger.exception("orphan team report failed (non-fatal)")
+
+    # ------------------------------------------------------------------
+    # Phase 2.7 — cross-source DOB conflicts (companion to name_team_dob)
+    # A canonical whose linked sources disagree on birth date by >1 day is
+    # a suspected false merge; the resolver excludes such canonicals from
+    # its own DOB map, so this WARNING report is where they surface.
+    # ------------------------------------------------------------------
+    try:
+        dob_conflicts = evaluate_dob_conflicts()
+        verdict = dob_conflicts['verdict']
+        report.results.append(CheckResult(
+            name='dob_conflicts[xref_player]',
+            kind='coverage',
+            severity='WARNING',
+            passed=verdict == 'OK',
+            details=(
+                f"verdict={verdict}, conflicts={dob_conflicts['conflicts']}, "
+                f"rows={dob_conflicts['rows'][:10]}"
+            ),
+            value=float(dob_conflicts['conflicts']),
+        ))
+        context['ti'].xcom_push(key='dob_conflicts', value=dob_conflicts)
+    except Exception as e:
+        logger.exception("dob-conflict evaluation failed (non-fatal)")
+        report.results.append(CheckResult(
+            name='dob_conflicts[xref_player]',
+            kind='coverage',
+            severity='WARNING',
+            passed=False,
+            error=str(e),
+        ))
 
     # ------------------------------------------------------------------
     # Phase 2.5 — Bronze-vs-xref freshness gap (Issue #15 regression guard)
