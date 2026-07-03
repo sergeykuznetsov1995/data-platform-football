@@ -59,7 +59,7 @@ class TestFotMobScraperIntegration:
 
         assert df is not None, "Player stats should be returned"
         assert not df.empty, "Player stats should not be empty"
-        assert 'player_name' in df.columns
+        assert 'participant_name' in df.columns
         assert 'stat_value' in df.columns
 
     @pytest.mark.flaky
