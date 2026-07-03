@@ -64,6 +64,15 @@ def _get_trino_connection(
     user = os.environ.get('TRINO_USER', 'airflow')
     password = os.environ.get('TRINO_PASSWORD')
 
+    # Disable Trino dynamic filtering for all pipeline transforms. Iceberg's
+    # manifest Evaluator throws NullPointerException in CharSequenceSet.contains
+    # when a join produces a dynamic filter ``<string_col> IN (..., NULL)`` that
+    # is pushed into an Iceberg string-column scan (reproduced deterministically
+    # on gold.fct_team_season_stats_audit reading silver.xref_team). DF is a pure
+    # optimization, so disabling it preserves correctness — the only cost is
+    # un-pruned probe-side scans on these batch-sized transforms.
+    session_properties = {'enable_dynamic_filtering': 'false'}
+
     if password:
         port = port or int(os.environ.get('TRINO_PORT', 8443))
         return trino_lib.dbapi.connect(
@@ -74,6 +83,7 @@ def _get_trino_connection(
             http_scheme='https',
             auth=trino_lib.auth.BasicAuthentication(user, password),
             verify=False,
+            session_properties=session_properties,
         )
 
     port = port or int(os.environ.get('TRINO_PORT', 8080))
@@ -83,6 +93,7 @@ def _get_trino_connection(
         port=port,
         user=user,
         catalog=catalog,
+        session_properties=session_properties,
     )
 
 
