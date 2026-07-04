@@ -125,7 +125,7 @@ lineups_agg AS (
 SELECT
     -- ========= Schedule (sch) — typed =========
     sch.match_id,
-    TRY_CAST(sch.wk AS INTEGER)                     AS gameweek,
+    TRY_CAST(TRY_CAST(sch.wk AS DOUBLE) AS INTEGER) AS gameweek,  -- wk arrives as float-strings ('1.0') from the pandas-parsed bronze schedule
     sch.day,
     TRY_CAST(sch.date AS DATE)                      AS date,
     sch.time,
@@ -134,7 +134,7 @@ SELECT
     sch.score,
     TRY_CAST(REGEXP_EXTRACT(sch.score, '(\d+)', 1) AS INTEGER)         AS home_score,
     TRY_CAST(REGEXP_EXTRACT(sch.score, '\d+\D+(\d+)', 1) AS INTEGER)   AS away_score,
-    TRY_CAST(sch.attendance AS INTEGER)             AS attendance,
+    TRY_CAST(TRY_CAST(sch.attendance AS DOUBLE) AS INTEGER) AS attendance,  -- float-strings ('34977.0') from the pandas-parsed bronze schedule
     sch.venue,
     sch.referee,
     sch.match_url,
