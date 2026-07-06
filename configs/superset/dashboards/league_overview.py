@@ -2,19 +2,18 @@
 # =============================================================================
 # Superset dashboard: "Обзор лиги + игроки"
 # =============================================================================
-# Мультилиговый обзорный дашборд: таблица лиги (Understat-стиль), командные
-# метрики (xG/xGA, реализация, PPDA, деньги), динамика Elo и игроцкая
-# аналитика (топы, scatter'ы, сводная таблица).
-#
-# Layout (top-to-bottom):
-#   1. Markdown header
-#   2. KPI row: Команд / Голов / Средний xG / Средний рейтинг
-#   3. Таблица лиги (full width, cell bars, «сверх-очки» = points − xPTS)
-#   4. Команды 2×2: xG vs xGA · голы − xG · PPDA · стоимость состава vs очки
-#   5. Elo по времени (линия = команда, недельное среднее)
-#   6. Игроки — топ-15 ×6: голы · xG · ассисты · рейтинг · стоимость · зарплата
-#   7. Аналитика: xG vs голы · стоимость vs Г+А · big chances · голы − xG
-#   8. Сводная таблица игроков с поиском
+# Мультилиговый дашборд на пяти вкладках (TABS в position_json):
+#   1. Обзор лиги   — KPI, таблица лиги (cell bars, «сверх-очки» = points −
+#                     xPTS), команды 2×2 (xG/xGA, реализация, PPDA, деньги
+#                     vs очки), Elo по времени
+#   2. Игроки       — топ-15 ×6, scatter'ы (xG/голы, стоимость/Г+А),
+#                     big chances, финишеры, сводная таблица с поиском
+#   3. Трансферы и деньги — топ покупок, баланс клубов, динамика стоимости
+#                     (топ-10 + фильтр «Игрок»), стоимость состава и фонд ЗП
+#                     по сезонам, таблица всех сделок
+#   4. Форма по турам — гонка за титул (кумулятивные очки), скользящий
+#                     xG-баланс за 5 матчей, форма игрока по матчам
+#   5. Вратари      — % сейвов, сухие матчи, PSxG − GA, сводная таблица
 #
 # В отличие от player_overview.py здесь НЕТ хардкода league/season: все
 # виртуальные датасеты отдают все сезоны с колонками league/season, фильтрация
@@ -219,12 +218,25 @@ SELECT
   tss.goals - tss.expected_goals AS finishing_delta,
   tss.ppda, tss.oppda, tss.deep_completions,
   tss.possession_pct, tss.big_chances,
-  tss.squad_market_value_eur, tss.total_wage_bill_eur
+  tss.squad_market_value_eur, tss.total_wage_bill_eur,
+  tss.transfer_income_eur, tss.transfer_expense_eur, tss.transfer_balance_eur,
+  pay.annual_gross_eur AS payroll_annual_gross_eur,
+  ds.start_date AS season_start
 FROM iceberg.gold.fct_standings st
 LEFT JOIN iceberg.gold.fct_team_season_stats tss
   ON  tss.team_id = st.team_id
   AND tss.league  = st.league
   AND tss.season  = st.season
+LEFT JOIN (
+  SELECT canonical_id, league, season, annual_gross_eur,
+         ROW_NUMBER() OVER (
+           PARTITION BY canonical_id, league, season
+           ORDER BY _bronze_ingested_at DESC
+         ) AS rn
+  FROM iceberg.silver.capology_team_payrolls
+) pay
+  ON  pay.canonical_id = st.team_id
+  AND pay.league = st.league AND pay.season = st.season AND pay.rn = 1
 LEFT JOIN iceberg.gold.dim_team   dt ON dt.team_id = st.team_id
 LEFT JOIN iceberg.gold.dim_season ds ON ds.season  = st.season"""
 
@@ -321,6 +333,121 @@ LEFT JOIN tm
   ON  tm.canonical_id = ps.player_id AND tm.league = ps.league
   AND tm.season       = ps.season    AND tm.rn = 1"""
 
+    # Трансферы (грейн = сделка). team_name-колонки нет — фильтр «Команда»
+    # к этим чартам не применяется (generic scope по колонкам).
+    v_transfer = """\
+SELECT
+  t.player_id,
+  COALESCE(dp.player_name, t.player_id) AS player_name,
+  t.transfer_date,
+  COALESCE(dtf.team_name, t.from_club_name) AS from_club,
+  COALESCE(dtt.team_name, t.to_club_name) AS to_club,
+  t.fee_eur,
+  t.market_value_at_transfer_eur,
+  CASE WHEN t.is_loan THEN 'аренда' ELSE 'трансфер' END AS transfer_type,
+  t.league, t.season
+FROM iceberg.gold.fct_transfer t
+LEFT JOIN iceberg.gold.dim_player dp ON dp.player_id = t.player_id
+LEFT JOIN iceberg.gold.dim_team dtf ON dtf.team_id = t.from_team_id
+LEFT JOIN iceberg.gold.dim_team dtt ON dtt.team_id = t.to_team_id
+WHERE NOT t.is_upcoming"""
+
+    # Таймлайн стоимости (TM) в окне сезона + ранг по пику стоимости —
+    # чарт «топ-10» фильтрует mv_rank <= 10, не тащит 500 линий.
+    v_player_mv = """\
+WITH mv AS (
+  SELECT
+    ps.player_id, ps.league, ps.season, ps.team_id,
+    h.valuation_date, h.market_value_eur
+  FROM iceberg.gold.fct_player_season_stats ps
+  JOIN iceberg.gold.dim_season ds ON ds.season = ps.season
+  JOIN iceberg.gold.fct_player_market_value h
+    ON  h.player_id = ps.player_id
+    AND h.source = 'transfermarkt'
+    AND h.valuation_date BETWEEN ds.start_date AND ds.end_date
+),
+ranked AS (
+  SELECT player_id, league, season,
+         RANK() OVER (
+           PARTITION BY league, season
+           ORDER BY MAX(market_value_eur) DESC
+         ) AS mv_rank
+  FROM mv
+  GROUP BY player_id, league, season
+)
+SELECT
+  m.player_id,
+  COALESCE(dp.player_name, m.player_id) AS player_name,
+  REGEXP_EXTRACT(dp.primary_position, '^([A-Z]{2})') AS position_primary,
+  COALESCE(dt.team_name, m.team_id) AS team_name,
+  m.league, m.season, m.valuation_date, m.market_value_eur,
+  r.mv_rank
+FROM mv m
+JOIN ranked r
+  ON  r.player_id = m.player_id
+  AND r.league = m.league AND r.season = m.season
+LEFT JOIN iceberg.gold.dim_player dp ON dp.player_id = m.player_id
+LEFT JOIN iceberg.gold.dim_team   dt ON dt.team_id = m.team_id"""
+
+    # По-туровая форма команд: кумулятивные очки + скользящий xG-баланс.
+    v_team_form = """\
+SELECT
+  tm.team_id,
+  COALESCE(dt.team_name, tm.team_id) AS team_name,
+  tm.league, tm.season, tm.gameweek,
+  tm.date AS match_date,
+  tm.points,
+  SUM(tm.points) OVER (
+    PARTITION BY tm.team_id, tm.league, tm.season
+    ORDER BY tm.date, tm.match_id
+  ) AS cum_points,
+  tm.goals_for, tm.goals_against, tm.result,
+  tm.xg, tm.xga,
+  AVG(tm.xg - tm.xga) OVER (
+    PARTITION BY tm.team_id, tm.league, tm.season
+    ORDER BY tm.date
+    ROWS BETWEEN 4 PRECEDING AND CURRENT ROW
+  ) AS xg_diff_rolling5
+FROM iceberg.gold.fct_team_match tm
+LEFT JOIN iceberg.gold.dim_team dt ON dt.team_id = tm.team_id
+WHERE tm.is_completed"""
+
+    # По-матчевая форма игрока (рейтинг, xG/xA) — чарты осмысленны с фильтром
+    # «Игрок» (без него сотни линий; см. markdown-подпись на вкладке).
+    v_player_form = """\
+SELECT
+  fpm.player_id,
+  COALESCE(dp.player_name, fpm.player_id) AS player_name,
+  REGEXP_EXTRACT(dp.primary_position, '^([A-Z]{2})') AS position_primary,
+  COALESCE(dt.team_name, fpm.team_id) AS team_name,
+  fpm.league, fpm.season,
+  dm.match_date,
+  fpm.minutes_played AS minutes,
+  fpm.goals, fpm.assists,
+  fpm.xg AS expected_goals,
+  fpm.xa AS expected_assists,
+  fpm.rating, fpm.key_passes
+FROM iceberg.gold.fct_player_match fpm
+JOIN iceberg.gold.dim_match dm ON dm.match_id = fpm.match_id
+LEFT JOIN iceberg.gold.dim_player dp ON dp.player_id = fpm.player_id
+LEFT JOIN iceberg.gold.dim_team   dt ON dt.team_id = fpm.team_id"""
+
+    v_keeper_season = """\
+SELECT
+  k.player_id,
+  COALESCE(dp.player_name, k.player_id) AS player_name,
+  COALESCE(dt.team_name, k.team_id) AS team_name,
+  k.league, k.season,
+  k.matches, k.minutes,
+  k.saves, k.save_pct, k.saves_per_90,
+  k.clean_sheets, k.clean_sheet_pct,
+  k.goals_against, k.goals_against_per90,
+  k.pk_faced, k.pk_saved, k.pk_save_pct,
+  k.psxg_minus_ga, k.fotmob_rating
+FROM iceberg.gold.fct_keeper_season_stats k
+LEFT JOIN iceberg.gold.dim_player dp ON dp.player_id = k.player_id
+LEFT JOIN iceberg.gold.dim_team   dt ON dt.team_id = k.team_id"""
+
     team_labels = {
         "position": "Место", "team_name": "Команда", "played": "И",
         "wins": "В", "draws": "Н", "losses": "П",
@@ -328,6 +455,8 @@ LEFT JOIN tm
         "goal_diff": "Разница", "points": "Очки",
         "xg": "xG", "xga": "xGA", "xpts": "xPTS",
         "over_points": "Сверх-очки",
+        "transfer_balance_eur": "Трансферный баланс (€)",
+        "payroll_annual_gross_eur": "Фонд ЗП (€/год)",
     }
     player_labels = {
         "player_name": "Игрок", "team_name": "Клуб",
@@ -347,6 +476,25 @@ LEFT JOIN tm
         "contract_status": "Контракт (статус)", "contract_until": "Контракт до",
     }
 
+    transfer_labels = {
+        "player_name": "Игрок", "transfer_date": "Дата",
+        "from_club": "Откуда", "to_club": "Куда",
+        "fee_eur": "Сумма (€)",
+        "market_value_at_transfer_eur": "Стоимость на момент (€)",
+        "transfer_type": "Тип",
+    }
+    keeper_labels = {
+        "player_name": "Вратарь", "team_name": "Клуб",
+        "matches": "Матчи", "minutes": "Минуты",
+        "saves": "Сейвы", "save_pct": "% сейвов",
+        "saves_per_90": "Сейвов/90",
+        "clean_sheets": "Сухие", "clean_sheet_pct": "% сухих",
+        "goals_against": "Пропущено", "goals_against_per90": "Пропущено/90",
+        "pk_faced": "Пен. против", "pk_saved": "Пен. отбито",
+        "pk_save_pct": "% отбитых пен.",
+        "psxg_minus_ga": "PSxG − GA", "fotmob_rating": "Рейтинг FotMob",
+    }
+
     return {
         "v_lo_team_season": _ensure_virtual_dataset(
             ctx, database, schema, "v_lo_team_season", v_team_season,
@@ -359,6 +507,23 @@ LEFT JOIN tm
             ctx, database, schema, "v_lo_player_season", v_player_season,
             labels=player_labels,
         ),
+        "v_lo_transfer": _ensure_virtual_dataset(
+            ctx, database, schema, "v_lo_transfer", v_transfer,
+            labels=transfer_labels,
+        ),
+        "v_lo_player_mv": _ensure_virtual_dataset(
+            ctx, database, schema, "v_lo_player_mv", v_player_mv
+        ),
+        "v_lo_team_form": _ensure_virtual_dataset(
+            ctx, database, schema, "v_lo_team_form", v_team_form
+        ),
+        "v_lo_player_form": _ensure_virtual_dataset(
+            ctx, database, schema, "v_lo_player_form", v_player_form
+        ),
+        "v_lo_keeper_season": _ensure_virtual_dataset(
+            ctx, database, schema, "v_lo_keeper_season", v_keeper_season,
+            labels=keeper_labels,
+        ),
     }
 
 
@@ -369,6 +534,11 @@ def _build_slices(ctx: _Ctx, vds: dict[str, Any]) -> list[Any]:
     team = vds["v_lo_team_season"]
     elo = vds["v_lo_team_elo"]
     player = vds["v_lo_player_season"]
+    transfer = vds["v_lo_transfer"]
+    player_mv = vds["v_lo_player_mv"]
+    team_form = vds["v_lo_team_form"]
+    player_form = vds["v_lo_player_form"]
+    keeper = vds["v_lo_keeper_season"]
 
     slices: list[Any] = []
 
@@ -741,6 +911,256 @@ def _build_slices(ctx: _Ctx, vds: dict[str, Any]) -> list[Any]:
         },
     ))
 
+    # --- 21..26 Вкладка «Трансферы и деньги» -----------------------------------
+    slices.append(_make_slice(ctx,
+        "Топ-15 покупок сезона (€)", "echarts_timeseries_bar", transfer,
+        {
+            "x_axis": "player_name",
+            "x_axis_sort": "Сумма (€)",
+            "x_axis_sort_asc": True,
+            "metrics": [_metric("Сумма (€)", "MAX", "fee_eur")],
+            "adhoc_filters": [_sql_where("fee_eur IS NOT NULL")],
+            "row_limit": 15,
+            **_hbar,
+            "y_axis_format": ".2s",
+        },
+    ))
+
+    slices.append(_make_slice(ctx,
+        "Трансферный баланс клубов (€)", "echarts_timeseries_bar", team,
+        {
+            "x_axis": "team_name",
+            "x_axis_sort": "Баланс (€)",
+            "x_axis_sort_asc": True,
+            "metrics": [_metric("Баланс (€)", "SUM", "transfer_balance_eur")],
+            "adhoc_filters": [_sql_where("transfer_balance_eur IS NOT NULL")],
+            "row_limit": 25,
+            **_hbar,
+            "y_axis_format": "+.3s",
+        },
+    ))
+
+    slices.append(_make_slice(ctx,
+        "Динамика стоимости: топ-10 сезона (€)", "echarts_timeseries_line",
+        player_mv,
+        {
+            "time_range": "No filter",
+            "x_axis": "valuation_date",
+            "metrics": [_metric("Стоимость (€)", "MAX", "market_value_eur")],
+            "groupby": ["player_name"],
+            "adhoc_filters": [_sql_where("mv_rank <= 10")],
+            "row_limit": 50000,
+            "show_legend": True,
+            "rich_tooltip": True,
+            "truncateYAxis": True,
+            "x_axis_title": "Дата оценки (Transfermarkt)",
+            "y_axis_format": ".2s",
+        },
+    ))
+
+    # По сезонам (ось = дата начала сезона) — эти 2 чарта исключены из
+    # фильтра «Сезон» (см. _build_native_filters), иначе была бы одна точка.
+    slices.append(_make_slice(ctx,
+        "Стоимость состава по сезонам (€)", "echarts_timeseries_line", team,
+        {
+            "time_range": "No filter",
+            "x_axis": "season_start",
+            "metrics": [_metric("Стоимость состава (€)", "MAX", "squad_market_value_eur")],
+            "groupby": ["team_name"],
+            "adhoc_filters": [_sql_where("squad_market_value_eur IS NOT NULL")],
+            "row_limit": 5000,
+            "show_legend": True,
+            "rich_tooltip": True,
+            "x_axis_title": "Сезон (дата старта)",
+            "y_axis_format": ".2s",
+        },
+    ))
+
+    slices.append(_make_slice(ctx,
+        "Зарплатный фонд по сезонам (€/год)", "echarts_timeseries_line", team,
+        {
+            "time_range": "No filter",
+            "x_axis": "season_start",
+            "metrics": [_metric("Фонд ЗП (€/год)", "MAX", "payroll_annual_gross_eur")],
+            "groupby": ["team_name"],
+            "adhoc_filters": [_sql_where("payroll_annual_gross_eur IS NOT NULL")],
+            "row_limit": 5000,
+            "show_legend": True,
+            "rich_tooltip": True,
+            "x_axis_title": "Сезон (дата старта)",
+            "y_axis_format": ".2s",
+        },
+    ))
+
+    slices.append(_make_slice(ctx,
+        "Все трансферы", "table", transfer,
+        {
+            "query_mode": "raw",
+            "all_columns": [
+                "transfer_date", "player_name", "from_club", "to_club",
+                "transfer_type", "fee_eur", "market_value_at_transfer_eur",
+            ],
+            "order_by_cols": ['["transfer_date", false]'],
+            "row_limit": 2000,
+            "include_search": True,
+            "show_cell_bars": True,
+            "column_config": {
+                "fee_eur": {"d3NumberFormat": ".2s"},
+                "market_value_at_transfer_eur": {"d3NumberFormat": ".2s"},
+                "transfer_date": {"d3TimeFormat": "%Y-%m-%d"},
+            },
+            "table_timestamp_format": "%Y-%m-%d",
+        },
+    ))
+
+    # --- 27..30 Вкладка «Форма по турам» ---------------------------------------
+    # Ось X = тур (gameweek), не дата: серии в ECharts выравниваются на общую
+    # сетку X, а даты матчей у команд разные → null-разрывы в линиях. Сетка
+    # туров одинакова у всех — линии сплошные.
+    slices.append(_make_slice(ctx,
+        "Гонка за титул: очки по турам", "echarts_timeseries_line", team_form,
+        {
+            "time_range": "No filter",
+            "x_axis": "gameweek",
+            "metrics": [_metric("Очки (кумулятивно)", "MAX", "cum_points")],
+            "groupby": ["team_name"],
+            "adhoc_filters": [_sql_where("gameweek IS NOT NULL")],
+            "row_limit": 50000,
+            "show_legend": True,
+            "rich_tooltip": True,
+            "x_axis_title": "Тур",
+            "y_axis_format": ".0f",
+        },
+    ))
+
+    slices.append(_make_slice(ctx,
+        "xG-форма: скользящий баланс за 5 матчей", "echarts_timeseries_line",
+        team_form,
+        {
+            "time_range": "No filter",
+            "x_axis": "gameweek",
+            "metrics": [_metric(
+                "xG − xGA (среднее за 5 матчей)", "AVG", "xg_diff_rolling5"
+            )],
+            "groupby": ["team_name"],
+            "adhoc_filters": [_sql_where("xg IS NOT NULL AND gameweek IS NOT NULL")],
+            "row_limit": 50000,
+            "show_legend": True,
+            "rich_tooltip": True,
+            "truncateYAxis": True,
+            "x_axis_title": "Тур",
+            "y_axis_format": "+.2f",
+        },
+    ))
+
+    slices.append(_make_slice(ctx,
+        "Рейтинг по матчам (выберите игрока)", "echarts_timeseries_line",
+        player_form,
+        {
+            "time_range": "No filter",
+            "x_axis": "match_date",
+            "metrics": [_metric("Рейтинг", "AVG", "rating")],
+            "groupby": ["player_name"],
+            "adhoc_filters": [_sql_where("rating IS NOT NULL")],
+            "row_limit": 50000,
+            "show_legend": True,
+            "rich_tooltip": True,
+            "truncateYAxis": True,
+            "y_axis_format": ".2f",
+        },
+    ))
+
+    slices.append(_make_slice(ctx,
+        "xG и xA по матчам (выберите игрока)", "echarts_timeseries_line",
+        player_form,
+        {
+            "time_range": "No filter",
+            "x_axis": "match_date",
+            "metrics": [
+                _metric("xG", "SUM", "expected_goals"),
+                _metric("xA", "SUM", "expected_assists"),
+            ],
+            "groupby": ["player_name"],
+            "row_limit": 50000,
+            "show_legend": True,
+            "rich_tooltip": True,
+            "y_axis_format": ".2f",
+        },
+    ))
+
+    # --- 31..34 Вкладка «Вратари» -----------------------------------------------
+    slices.append(_make_slice(ctx,
+        "Топ-15 по % сейвов", "echarts_timeseries_bar", keeper,
+        {
+            "x_axis": "player_name",
+            "x_axis_sort": "% сейвов",
+            "x_axis_sort_asc": True,
+            "metrics": [_metric("% сейвов", "AVG", "save_pct")],
+            "adhoc_filters": [_sql_where(
+                "minutes >= 900 AND save_pct IS NOT NULL"
+            )],
+            "row_limit": 15,
+            **_hbar,
+            "y_axis_format": ".1f",
+        },
+    ))
+
+    slices.append(_make_slice(ctx,
+        "Топ-15 по сухим матчам", "echarts_timeseries_bar", keeper,
+        {
+            "x_axis": "player_name",
+            "x_axis_sort": "Сухие матчи",
+            "x_axis_sort_asc": True,
+            "metrics": [_metric("Сухие матчи", "SUM", "clean_sheets")],
+            "adhoc_filters": [_sql_where("clean_sheets IS NOT NULL")],
+            "row_limit": 15,
+            **_hbar,
+            "y_axis_format": "SMART_NUMBER",
+        },
+    ))
+
+    slices.append(_make_slice(ctx,
+        "PSxG − пропущено: кто тащит", "echarts_timeseries_bar", keeper,
+        {
+            "x_axis": "player_name",
+            "x_axis_sort": "PSxG − GA",
+            "x_axis_sort_asc": True,
+            "metrics": [_metric("PSxG − GA", "SUM", "psxg_minus_ga")],
+            "adhoc_filters": [_sql_where("psxg_minus_ga IS NOT NULL")],
+            "row_limit": 15,
+            **_hbar,
+            "y_axis_format": "+.1f",
+        },
+    ))
+
+    slices.append(_make_slice(ctx,
+        "Сводная таблица вратарей", "table", keeper,
+        {
+            "query_mode": "raw",
+            "all_columns": [
+                "player_name", "team_name", "matches", "minutes",
+                "saves", "save_pct", "saves_per_90",
+                "clean_sheets", "clean_sheet_pct",
+                "goals_against", "goals_against_per90",
+                "pk_faced", "pk_saved", "pk_save_pct",
+                "psxg_minus_ga", "fotmob_rating",
+            ],
+            "order_by_cols": ['["minutes", false]'],
+            "row_limit": 200,
+            "include_search": True,
+            "show_cell_bars": True,
+            "column_config": {
+                "save_pct": {"d3NumberFormat": ".1f"},
+                "saves_per_90": {"d3NumberFormat": ".2f"},
+                "clean_sheet_pct": {"d3NumberFormat": ".1f"},
+                "goals_against_per90": {"d3NumberFormat": ".2f"},
+                "pk_save_pct": {"d3NumberFormat": ".1f"},
+                "psxg_minus_ga": {"d3NumberFormat": "+.1f"},
+                "fotmob_rating": {"d3NumberFormat": ".2f"},
+            },
+        },
+    ))
+
     return slices
 
 
@@ -748,11 +1168,13 @@ def _build_slices(ctx: _Ctx, vds: dict[str, Any]) -> list[Any]:
 # Layout (position_json) — grid 12-wide rows
 # ---------------------------------------------------------------------------
 def _build_position_json(slices: list[Any]) -> dict[str, Any]:
+    """Grid v2 с вкладками: шапка над TABS, пять TAB-контейнеров внутри."""
     pos: dict[str, Any] = {"DASHBOARD_VERSION_KEY": "v2"}
 
-    grid_id = "GRID_ID"
     root_id = "ROOT_ID"
-    pos["ROOT_ID"] = {"type": "ROOT", "id": root_id, "children": [grid_id]}
+    grid_id = "GRID_ID"
+    tabs_id = "TABS-lo"
+    pos[root_id] = {"type": "ROOT", "id": root_id, "children": [grid_id]}
     pos[grid_id] = {
         "type": "GRID",
         "id": grid_id,
@@ -760,25 +1182,34 @@ def _build_position_json(slices: list[Any]) -> dict[str, Any]:
         "parents": [root_id],
         "meta": {},
     }
+    pos[tabs_id] = {
+        "type": "TABS",
+        "id": tabs_id,
+        "children": [],
+        "parents": [root_id, grid_id],
+        "meta": {},
+    }
 
-    def _markdown(text: str, height: int = 4) -> str:
+    def _markdown(parents: list[str], text: str, height: int = 12) -> str:
+        # Высоты: 1 юнит ≈ 8px; H2 + строка текста не влезают в 3-4 юнита
+        # (текст обрезался) — блокам с подзаголовком нужно ~12.
         mid = f"MARKDOWN-{abs(hash(text)) % (10**8)}"
         pos[mid] = {
             "type": "MARKDOWN",
             "id": mid,
             "children": [],
-            "parents": [root_id, grid_id],
+            "parents": parents,
             "meta": {"width": 12, "height": height, "code": text, "background": "BACKGROUND_TRANSPARENT"},
         }
         return mid
 
-    def _row(child_ids: list[str]) -> str:
+    def _row(parents: list[str], child_ids: list[str]) -> str:
         rid = f"ROW-{abs(hash(tuple(child_ids))) % (10**8)}"
         pos[rid] = {
             "type": "ROW",
             "id": rid,
             "children": child_ids,
-            "parents": [root_id, grid_id],
+            "parents": parents,
             "meta": {"background": "BACKGROUND_TRANSPARENT"},
         }
         return rid
@@ -789,7 +1220,7 @@ def _build_position_json(slices: list[Any]) -> dict[str, Any]:
             "type": "CHART",
             "id": cid,
             "children": [],
-            "parents": [root_id, grid_id, "row_placeholder"],
+            "parents": [root_id, grid_id, tabs_id],
             "meta": {
                 "width": width,
                 "height": height,
@@ -799,57 +1230,108 @@ def _build_position_json(slices: list[Any]) -> dict[str, Any]:
         }
         return cid
 
-    children: list[str] = []
-    children.append(_markdown(
-        "# Обзор лиги + игроки\n\n"
-        "Мультилиговый обзор: таблица, командные метрики, Elo и игроки. "
-        "Источники: FBref · Understat (xG, xPTS, PPDA) · SofaScore (рейтинги, дуэли) · "
-        "FotMob · Transfermarkt (стоимость, контракты) · Capology (зарплаты) · ClubElo.",
-        height=10,
-    ))
-    children.append(_row([_chart(slices[i], 3, height=25) for i in range(0, 4)]))
+    def _tab(key: str, title: str) -> tuple[list[str], list[str]]:
+        tid = f"TAB-lo-{key}"
+        pos[tid] = {
+            "type": "TAB",
+            "id": tid,
+            "children": [],
+            "parents": [root_id, grid_id, tabs_id],
+            "meta": {"text": title, "defaultText": "Tab title",
+                     "placeholder": "Tab title"},
+        }
+        pos[tabs_id]["children"].append(tid)
+        return pos[tid]["children"], [root_id, grid_id, tabs_id, tid]
 
-    # Высоты markdown: 1 юнит ≈ 8px; H2 + строка текста не влезают в 3-4 юнита
-    # (текст обрезался) — блокам с подзаголовком нужно ~12.
-    children.append(_markdown(
+    # --- Шапка над вкладками -------------------------------------------------
+    header = _markdown(
+        [root_id, grid_id],
+        "# Обзор лиги + игроки\n\n"
+        "Мультилиговый обзор: таблица, командные метрики, Elo, игроки, "
+        "трансферы, форма и вратари. Источники: FBref · Understat (xG, xPTS, PPDA) · "
+        "SofaScore (рейтинги, дуэли) · FotMob · Transfermarkt (стоимость, контракты) · "
+        "Capology (зарплаты) · ClubElo.",
+        height=10,
+    )
+    pos[grid_id]["children"] = [header, tabs_id]
+
+    # --- Таб 1. Обзор лиги -----------------------------------------------------
+    c, p = _tab("overview", "Обзор лиги")
+    c.append(_row(p, [_chart(slices[i], 3, height=25) for i in range(0, 4)]))
+    c.append(_markdown(p,
         "## Таблица лиги\n\n"
         "«Сверх-очки» = очки − xPTS (Understat): плюс — команда набирает больше, "
         "чем заслуживает по качеству моментов (везёт), минус — недобирает.",
-        height=12,
     ))
-    children.append(_row([_chart(slices[4], 12, height=70)]))
-
-    children.append(_markdown("## Команды", height=8))
-    children.append(_row([_chart(slices[5], 6, height=55), _chart(slices[6], 6, height=55)]))
-    children.append(_row([_chart(slices[7], 6, height=55), _chart(slices[8], 6, height=55)]))
-
-    children.append(_markdown(
+    c.append(_row(p, [_chart(slices[4], 12, height=70)]))
+    c.append(_markdown(p, "## Команды", height=8))
+    c.append(_row(p, [_chart(slices[5], 6, height=55), _chart(slices[6], 6, height=55)]))
+    c.append(_row(p, [_chart(slices[7], 6, height=55), _chart(slices[8], 6, height=55)]))
+    c.append(_markdown(p,
         "## Динамика силы — Elo\n\n"
         "Недельное среднее ClubElo в границах выбранного сезона.",
-        height=12,
     ))
-    children.append(_row([_chart(slices[9], 12, height=60)]))
+    c.append(_row(p, [_chart(slices[9], 12, height=60)]))
 
-    children.append(_markdown(
+    # --- Таб 2. Игроки -----------------------------------------------------------
+    c, p = _tab("players", "Игроки")
+    c.append(_markdown(p,
         "## Игроки — топы\n\n"
         "⚠️ Зарплаты (Capology) есть только для сезона 2025/26 — "
         "на других сезонах бар зарплат и колонки зарплат пусты.",
-        height=12,
     ))
-    children.append(_row([_chart(slices[i], 4, height=50) for i in range(10, 13)]))
-    children.append(_row([_chart(slices[i], 4, height=50) for i in range(13, 16)]))
-
-    children.append(_markdown(
+    c.append(_row(p, [_chart(slices[i], 4, height=50) for i in range(10, 13)]))
+    c.append(_row(p, [_chart(slices[i], 4, height=50) for i in range(13, 16)]))
+    c.append(_markdown(p,
         "## Аналитика игроков\n\n"
         "Scatter'ы — минимум 270 сыгранных минут; рейтинг и «финишеры» — минимум 450.",
-        height=12,
     ))
-    children.append(_row([_chart(slices[16], 6, height=60), _chart(slices[17], 6, height=60)]))
-    children.append(_row([_chart(slices[18], 6, height=50), _chart(slices[19], 6, height=50)]))
+    c.append(_row(p, [_chart(slices[16], 6, height=60), _chart(slices[17], 6, height=60)]))
+    c.append(_row(p, [_chart(slices[18], 6, height=50), _chart(slices[19], 6, height=50)]))
+    c.append(_row(p, [_chart(slices[20], 12, height=90)]))
 
-    children.append(_row([_chart(slices[20], 12, height=90)]))
+    # --- Таб 3. Трансферы и деньги -----------------------------------------------
+    c, p = _tab("money", "Трансферы и деньги")
+    c.append(_markdown(p,
+        "## Трансферы и деньги\n\n"
+        "Суммы сделок публичны примерно у каждой шестой (Transfermarkt); "
+        "баланс клуба = доход − расход за сезонное окно.",
+    ))
+    c.append(_row(p, [_chart(slices[21], 6, height=55), _chart(slices[22], 6, height=55)]))
+    c.append(_markdown(p,
+        "## Динамика стоимости\n\n"
+        "Топ-10 сезона по пиковой стоимости; выбери игрока в фильтре «Игрок», "
+        "чтобы посмотреть его линию. Графики «по сезонам» не зависят от фильтра «Сезон».",
+    ))
+    c.append(_row(p, [_chart(slices[23], 12, height=55)]))
+    c.append(_row(p, [_chart(slices[24], 6, height=55), _chart(slices[25], 6, height=55)]))
+    c.append(_row(p, [_chart(slices[26], 12, height=85)]))
 
-    pos[grid_id]["children"] = children
+    # --- Таб 4. Форма по турам -----------------------------------------------------
+    c, p = _tab("form", "Форма по турам")
+    c.append(_markdown(p,
+        "## Форма команд\n\n"
+        "Гонка за титул — кумулятивные очки; xG-форма — скользящий баланс "
+        "xG − xGA за последние 5 матчей (выше нуля = создаёт больше, чем допускает).",
+    ))
+    c.append(_row(p, [_chart(slices[27], 12, height=60)]))
+    c.append(_row(p, [_chart(slices[28], 12, height=55)]))
+    c.append(_markdown(p,
+        "## Форма игрока\n\n"
+        "Выбери игрока в фильтре «Игрок» — без выбора на графиках сотни линий.",
+    ))
+    c.append(_row(p, [_chart(slices[29], 6, height=55), _chart(slices[30], 6, height=55)]))
+
+    # --- Таб 5. Вратари ---------------------------------------------------------------
+    c, p = _tab("keepers", "Вратари")
+    c.append(_markdown(p,
+        "## Вратари\n\n"
+        "PSxG − GA (FBref) — «вытащенные» голы сверх ожидаемого; "
+        "метрика заполнена не для всех сезонов.",
+    ))
+    c.append(_row(p, [_chart(slices[31], 4, height=50), _chart(slices[32], 4, height=50), _chart(slices[33], 4, height=50)]))
+    c.append(_row(p, [_chart(slices[34], 12, height=70)]))
+
     return pos
 
 
@@ -879,19 +1361,30 @@ def _build_native_filters(
 ) -> list[dict[str, Any]]:
     """Пять фильтров: Лига → Сезон → Команда → (Позиция) → Игрок.
 
-    Лига/Сезон/Команда применяются ко всем чартам (колонки league/season/
-    team_name есть во всех трёх виртуалках). Позиция/Игрок — только к чартам
-    на v_lo_player_season: scope собираем по datasource_id (а не по индексам —
-    перестановка слайсов не сломает scope), иначе team/elo-чарты падали бы
-    500 на несуществующей колонке.
+    Scope каждого фильтра — только чарты, в чьём датасете есть колонка
+    фильтра (фильтр по отсутствующей колонке = 500). Собирается по фактическим
+    колонкам SqlaTable, а не по индексам слайсов. Чарты «по сезонам» вручную
+    исключены из фильтра «Сезон» (иначе на графике одна точка).
     """
     team_ds_id = vds["v_lo_team_season"].id
-    player_ds_id = vds["v_lo_player_season"].id
+
+    ds_columns = {
+        t.id: {c.column_name for c in t.columns} for t in vds.values()
+    }
+    by_season_slices = {
+        "Стоимость состава по сезонам (€)",
+        "Зарплатный фонд по сезонам (€/год)",
+    }
+
+    def _charts_with(column: str, skip_names: set[str] | None = None) -> list[int]:
+        skip = skip_names or set()
+        return [
+            slc.id for slc in slices
+            if column in ds_columns.get(slc.datasource_id, set())
+            and slc.slice_name not in skip
+        ]
 
     all_chart_ids = [slc.id for slc in slices]
-    player_chart_ids = [
-        slc.id for slc in slices if slc.datasource_id == player_ds_id
-    ]
 
     def _filter(
         fid: str, name: str, column: str, dataset_id: int, multiple: bool,
@@ -940,20 +1433,22 @@ def _build_native_filters(
 
     return [
         _filter(f_league, "Лига", "league", team_ds_id,
-                multiple=False, target_chart_ids=all_chart_ids),
+                multiple=False, target_chart_ids=_charts_with("league")),
         _filter(f_season, "Сезон", "season", team_ds_id,
-                multiple=False, target_chart_ids=all_chart_ids,
+                multiple=False,
+                target_chart_ids=_charts_with("season", by_season_slices),
                 cascade_parent_ids=[f_league],
                 required=True, default_value=current_season),
         _filter(f_team, "Команда", "team_name", team_ds_id,
-                multiple=True, target_chart_ids=all_chart_ids,
+                multiple=True, target_chart_ids=_charts_with("team_name"),
                 cascade_parent_ids=[f_league, f_season]),
         _filter(f_position, "Позиция", "position_primary",
                 vds["v_lo_player_season"].id,
-                multiple=True, target_chart_ids=player_chart_ids),
+                multiple=True,
+                target_chart_ids=_charts_with("position_primary")),
         _filter("NATIVE_FILTER-lo-player", "Игрок", "player_name",
                 vds["v_lo_player_season"].id,
-                multiple=True, target_chart_ids=player_chart_ids,
+                multiple=True, target_chart_ids=_charts_with("player_name"),
                 cascade_parent_ids=[f_league, f_season, f_team, f_position]),
     ]
 
