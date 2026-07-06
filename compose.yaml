@@ -112,7 +112,11 @@ services:
     deploy:
       resources:
         limits:
-          memory: 1G
+          # 1G caused a memcg-OOM crashloop (weed RSS ~1G under Iceberg
+          # read/write + metadata load; 5 restarts in ~1h during a bronze
+          # backfill). S3 store dying mid-write corrupts the edition write.
+          # 4G leaves headroom over the observed ~1G working set.
+          memory: 4G
         reservations:
           memory: 256M
 
@@ -427,6 +431,8 @@ services:
       # OAuth2 (SSO людей через Keycloak; машинные аккаунты — по-прежнему password.db)
       - TRINO_OIDC_CLIENT_SECRET=${TRINO_OIDC_CLIENT_SECRET}
       - TRINO_OAUTH2_ISSUER=${OIDC_ISSUER:-https://${TS_HOSTNAME}:8443/realms/football}
+      # Фикс. ключ шифрования refresh-токенов (иначе рестарт Trino разлогинивает людей)
+      - TRINO_OAUTH2_REFRESH_KEY=${TRINO_OAUTH2_REFRESH_KEY}
     ports:
       - "127.0.0.1:8082:8443"
       - "[::1]:8082:8443"
@@ -454,9 +460,11 @@ services:
           # write load (#847): JVM RSS = 3.5G heap + parquet/direct buffers +
           # metaspace + code cache > 5G; the kernel kills java, the launcher
           # (PID 1) exits 0, so Docker never sets OOMKilled — it looks like an
-          # external restart. 8G leaves ~4G native headroom over the 4G heap
-          # (configs/trino/jvm.config).
-          memory: 8G
+          # external restart. 8G left ~4G native headroom over the 4G heap
+          # (configs/trino/jvm.config) — but OpenMetadata table profiling
+          # (heavy profile) pushed RSS to 8.3G and OOM'd twice; 12G covers the
+          # profiling-driven off-heap spikes.
+          memory: 12G
         reservations:
           memory: 1G
 
@@ -852,7 +860,9 @@ services:
           # sofifa/whoscored crawls (dmesg 2026-07-02: chromium killed every
           # ~60s → «tab crashed» storm, ~60s/page). 2G keeps one browser +
           # session churn comfortably below the ceiling (#847).
-          memory: 2G
+          # 4G: 2 parallel sofifa pools (2026-07-03 speedup) run 2 concurrent
+          # browser sessions (~0.9G each) with churn headroom.
+          memory: 4G
         reservations:
           memory: 512M
     networks:
@@ -935,16 +945,13 @@ services:
           - auth.${PLATFORM_DOMAIN:-platform-domain-unset}
           - trino.${PLATFORM_DOMAIN:-platform-domain-unset}
     ports:
-      - "${TS_IP:?}:443:443"
-      - "${TS_IP:?TS_IP not set — tailscale ip -4}:8081:8081"
-      - "${TS_IP:?}:8088:8088"
-      - "${TS_IP:?}:8443:8443"
-      - "${TS_IP:?}:8444:8444"
-      - "${TS_IP:?}:8585:8585"
-      # Гибрид: публичный вход (bi/auth/hs + ACME HTTP-01). До cutover
-      # PUBLIC_IP не задан — байнд на 127.0.0.1 безвреден.
-      - "${PUBLIC_IP:-127.0.0.1}:80:80"
-      - "${PUBLIC_IP:-127.0.0.1}:443:443"
+      # Гибрид (bind-изоляция, docs/HEADSCALE_MIGRATION.md):
+      # публичный вход на PUBLIC_IP (listener :443 = bi/auth/hs) + ACME :80;
+      # VPN-вход на TS_IP:443 -> контейнерный :8443 (listener VPN-сайтов).
+      # Гейт «кто куда» = какой хостовый IP, а не remote_ip (docker подменяет src).
+      - "${PUBLIC_IP:?PUBLIC_IP not set}:80:80"
+      - "${PUBLIC_IP:?}:443:443"
+      - "${TS_IP:?TS_IP not set — tailscale ip -4}:443:8443"
     environment:
       TS_HOSTNAME: ${TS_HOSTNAME:?TS_HOSTNAME not set — tailscale status --json .Self.DNSName}
       PLATFORM_DOMAIN: ${PLATFORM_DOMAIN:-platform-domain-unset}
