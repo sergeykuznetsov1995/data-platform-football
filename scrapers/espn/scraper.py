@@ -434,17 +434,16 @@ class ESPNScraper(SoccerdataScraper):
             keys: Set[str] = set()
             pairs = sched[['league', 'season']].drop_duplicates()
             for lg, ss in pairs.itertuples(index=False):
-                lg_esc = str(lg).replace("'", "''")
-                ss_esc = str(ss).replace("'", "''")
-                where = (
-                    f"league = '{lg_esc}' "
-                    f"AND CAST(season AS varchar) = '{ss_esc}'"
-                )
+                # Values go through ? bind params; only internal identifiers
+                # (catalog/table/column) stay interpolated — same split as
+                # run_sofascore_scraper._existing_match_ids_in_bronze.
+                where = "league = ? AND CAST(season AS varchar) = ?"
                 if non_null_col:
                     where += f" AND {non_null_col} IS NOT NULL"
                 rows = trino.execute_query(
                     f"SELECT DISTINCT game FROM {catalog}.bronze.{table} "
-                    f"WHERE {where}"
+                    f"WHERE {where}",
+                    params=(str(lg), str(ss)),
                 )
                 keys.update(r[0] for r in rows if r and r[0])
             return keys
