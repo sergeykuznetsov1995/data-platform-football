@@ -651,6 +651,13 @@ def _build_slices(ctx: _Ctx, vds: dict[str, Any]) -> list[Any]:
         "rich_tooltip": True,
         "showTooltipTotal": False,
         "showTooltipPercentage": False,
+        # строки тултипа — по убыванию значения в наведённой точке (иначе
+        # порядок = порядок серий, и на конкретную дату значения вразнобой)
+        "tooltipSortByMetric": True,
+        # легенда и порядок серий — по убыванию суммы серии (лидер сверху),
+        # а не в порядке выборки
+        "sort_series_type": "sum",
+        "sort_series_ascending": False,
         # с дефолтным отступом заголовок оси X («Тур», «Дата») наезжал на тики
         "x_axis_title_margin": 30,
     }
