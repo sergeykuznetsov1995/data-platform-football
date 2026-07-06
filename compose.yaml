@@ -112,7 +112,11 @@ services:
     deploy:
       resources:
         limits:
-          memory: 1G
+          # 1G caused a memcg-OOM crashloop (weed RSS ~1G under Iceberg
+          # read/write + metadata load; 5 restarts in ~1h during a bronze
+          # backfill). S3 store dying mid-write corrupts the edition write.
+          # 4G leaves headroom over the observed ~1G working set.
+          memory: 4G
         reservations:
           memory: 256M
 
@@ -856,7 +860,9 @@ services:
           # sofifa/whoscored crawls (dmesg 2026-07-02: chromium killed every
           # ~60s → «tab crashed» storm, ~60s/page). 2G keeps one browser +
           # session churn comfortably below the ceiling (#847).
-          memory: 2G
+          # 4G: 2 parallel sofifa pools (2026-07-03 speedup) run 2 concurrent
+          # browser sessions (~0.9G each) with churn headroom.
+          memory: 4G
         reservations:
           memory: 512M
     networks:
