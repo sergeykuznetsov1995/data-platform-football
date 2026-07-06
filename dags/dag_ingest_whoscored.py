@@ -39,6 +39,7 @@ from utils.config import (
     WHOSCORED_LEAGUES,
 )
 from utils.default_args import SELENIUM_ARGS
+from utils.ingest_helpers import league_slug as _league_slug
 
 
 # Extended timeout for WhoScored due to Cloudflare + heavy events scrape.
@@ -50,11 +51,6 @@ WHOSCORED_ARGS = {
     'retries': 3,
     'retry_delay': timedelta(minutes=15),
 }
-
-
-def _league_slug(league: str) -> str:
-    """``'ENG-Premier League'`` → ``'eng_premier_league'`` (task-id / path safe)."""
-    return league.lower().replace(' ', '_').replace('-', '_')
 
 
 def validate_schedule(**context) -> Dict[str, Any]:

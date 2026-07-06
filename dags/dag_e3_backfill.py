@@ -220,6 +220,7 @@ def _pre_check_bronze(**context) -> Dict[str, Any]:
     AirflowException if any ERROR-severity table is empty.
     """
     from utils.data_quality import _get_conn
+    from utils.e3_dq import _safe_predicate_value
 
     params = _read_params(context)
     season, league = params['season'], params['league']
@@ -227,6 +228,10 @@ def _pre_check_bronze(**context) -> Dict[str, Any]:
         "pre_check_bronze: season=%s league=%s — verifying Bronze inventory",
         season, league,
     )
+    # Params come straight from a manual "Trigger DAG w/ config" — escape them
+    # like every other inline predicate in this pipeline (e3_dq/silver_tasks).
+    season_sql = _safe_predicate_value(season)
+    league_sql = _safe_predicate_value(league)
 
     summary: Dict[str, Any] = {}
     errors: list = []
@@ -236,7 +241,7 @@ def _pre_check_bronze(**context) -> Dict[str, Any]:
         for table, severity in _BRONZE_TABLES:
             sql = (
                 f"SELECT COUNT(*) FROM {table} "
-                f"WHERE season = '{season}' AND league = '{league}'"
+                f"WHERE season = '{season_sql}' AND league = '{league_sql}'"
             )
             try:
                 cur.execute(sql)

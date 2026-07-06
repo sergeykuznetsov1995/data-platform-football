@@ -2265,3 +2265,28 @@ class TestPlayerCaptureInPageFetch:
             out = list(scraper._iter_player_captures(['1', '2']))
         assert calls == [('nav', '1'), ('nav', '2')]
         assert all(c.get('profile') for _, c in out)
+
+
+class TestSeasonToShort:
+    """_season_to_short — shared season-token normalizer (extracted from 10
+    inline copies that mapped an already-short '2526' to a nonexistent '2627')."""
+
+    @pytest.fixture
+    def season_to_short(self):
+        with patch.dict('sys.modules', {'soccerdata': MagicMock()}):
+            from scrapers.sofascore.scraper import _season_to_short
+        return _season_to_short
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize('token, expected', [
+        (2024, '2425'),      # year-start int
+        ('2025', '2526'),    # year-start str
+        ('2526', '2526'),    # already-short passthrough (old inline code -> '2627')
+        ('2021', '2021'),    # ambiguous token resolves as short 20/21, like soccerdata
+        (1999, '9900'),      # century wrap
+        ('9900', '9900'),    # already-short century wrap passthrough
+        ('abc', 'abc'),      # non-4-digit passthrough (legacy else branch)
+        ('25/26', '25/26'),  # non-digit passthrough
+    ])
+    def test_normalizes_tokens(self, season_to_short, token, expected):
+        assert season_to_short(token) == expected

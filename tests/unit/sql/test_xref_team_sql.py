@@ -266,6 +266,8 @@ class TestXrefTeamRendered:
     @pytest.fixture(scope="class")
     def rendered(self) -> str:
         from utils.medallion_config import (  # type: ignore[import-not-found]
+            _escape_sql_string,
+            get_in_scope_competitions,
             get_team_alias_sql_values,
             render_sql_template,
             reset_cache,
@@ -275,7 +277,15 @@ class TestXrefTeamRendered:
         reset_cache()
         # xref_team consumes 4-column tuples (issue #148) — match the DAG call.
         values = get_team_alias_sql_values(with_canonical_id=True, with_league=True)
-        return render_sql_template(SQL_PATH, team_aliases_values_sql=values)
+        # ClubElo league scoping mirrors dag_transform_xref.py (in_scope leagues).
+        clubelo_leagues = ', '.join(
+            f"'{_escape_sql_string(lg)}'" for lg in get_in_scope_competitions()
+        )
+        return render_sql_template(
+            SQL_PATH,
+            team_aliases_values_sql=values,
+            clubelo_in_scope_leagues=clubelo_leagues,
+        )
 
     def test_render_leaves_no_active_jinja_placeholders(self, rendered: str):
         """No leftover *active* `{{ ... }}` placeholder after substitution.
@@ -320,6 +330,19 @@ class TestXrefTeamRendered:
         assert "'Forest', 'Nottingham Forest', 'nottingham_forest'" in rendered, (
             "expected ClubElo alias 'Forest' -> nottingham_forest in VALUES"
         )
+
+    def test_render_scopes_clubelo_to_in_scope_leagues(self, rendered: str):
+        """ClubElo league filter renders from competitions.yaml in_scope flags
+        instead of a hardcoded 'ENG-Premier League' literal (former TODO(E8b))."""
+        from utils.medallion_config import get_in_scope_competitions
+
+        assert "AND league IN (" in rendered, (
+            "expected rendered clubelo filter 'AND league IN (...)'"
+        )
+        for league in get_in_scope_competitions():
+            assert f"'{league}'" in rendered, (
+                f"in_scope league {league!r} missing from rendered clubelo filter"
+            )
 
     def test_render_references_expected_bronze_tables(self, rendered: str):
         """Rendered SQL reads the documented Bronze sources by table name."""

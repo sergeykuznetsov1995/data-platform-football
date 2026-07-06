@@ -267,6 +267,39 @@ def test_load_team_aliases_rejects_invalid_canonical_id_slug(tmp_path, monkeypat
         medallion_config.load_team_aliases()
 
 
+def test_load_team_aliases_rejects_duplicate_canonical_id(tmp_path, monkeypatch):
+    # Two teams sharing one slug (copy-paste error) must fail at load — same
+    # guard the referee/manager/venue validators already have; without it the
+    # dupe silently fans out gold.dim_team rows.
+    (tmp_path / "team_aliases.yaml").write_text(
+        "teams:\n"
+        "  - canonical_name: 'X'\n"
+        "    canonical_id: 'x_fc'\n"
+        "    country: 'England'\n"
+        "    short_name: 'X'\n"
+        "    aliases:\n"
+        "      _generic: ['X']\n"
+        "  - canonical_name: 'Y'\n"
+        "    canonical_id: 'x_fc'\n"
+        "    country: 'England'\n"
+        "    short_name: 'Y'\n"
+        "    aliases:\n"
+        "      _generic: ['Y']\n"
+    )
+    (tmp_path / "competitions.yaml").write_text(_MOCK_COMPETITIONS)
+    monkeypatch.setenv("MEDALLION_CONFIG_DIR", str(tmp_path))
+
+    import importlib
+    from utils import medallion_config
+    importlib.reload(medallion_config)
+    medallion_config.reset_cache()
+
+    with pytest.raises(
+        medallion_config.MedallionConfigError, match="duplicate canonical_id"
+    ):
+        medallion_config.load_team_aliases()
+
+
 # ---------------------------------------------------------------------------
 # get_team_alias_pairs
 # ---------------------------------------------------------------------------

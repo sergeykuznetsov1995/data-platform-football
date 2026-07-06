@@ -180,7 +180,8 @@ class TrinoTableManager:
     _CONNECTION_ERRORS = ('Connection refused', 'Connection reset',
                           'Connection aborted', 'authenticators were not loaded')
 
-    def _execute(self, sql: str, fetch: bool = False) -> Optional[List[Any]]:
+    def _execute(self, sql: str, fetch: bool = False,
+                 params: Optional[tuple] = None) -> Optional[List[Any]]:
         """Execute SQL statement.
 
         Always consumes query results to prevent USER_CANCELED errors.
@@ -192,12 +193,18 @@ class TrinoTableManager:
         as TrinoError even for DDL/DML, never a silent success (#456).
 
         On connection errors, resets connection and retries once.
+
+        ``params`` binds ``?`` placeholders in ``sql`` (Trino prepared
+        statement) — prefer it over interpolating values into the string.
         """
         for attempt in range(2):
             cursor = self.connection.cursor()
             try:
                 logger.debug(f"Executing SQL: {sql[:200]}...")
-                cursor.execute(sql)
+                if params:
+                    cursor.execute(sql, params)
+                else:
+                    cursor.execute(sql)
 
                 if fetch:
                     return cursor.fetchall()
@@ -708,17 +715,18 @@ WITH (
 
         return columns
 
-    def execute_query(self, sql: str) -> List[Any]:
+    def execute_query(self, sql: str, params: Optional[tuple] = None) -> List[Any]:
         """
         Execute arbitrary SQL query.
 
         Args:
-            sql: SQL query
+            sql: SQL query (may contain ``?`` placeholders)
+            params: optional bind values for the ``?`` placeholders
 
         Returns:
             Query results
         """
-        return self._execute(sql, fetch=True)
+        return self._execute(sql, fetch=True, params=params)
 
     def arrow_schema_to_trino(self, arrow_schema: pa.Schema) -> Dict[str, str]:
         """

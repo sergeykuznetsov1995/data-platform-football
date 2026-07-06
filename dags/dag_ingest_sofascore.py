@@ -40,6 +40,7 @@ from airflow.operators.python import PythonOperator, ShortCircuitOperator
 
 from utils.config import LEAGUES, CURRENT_SEASON, SCHEDULES, DAG_TAGS
 from utils.default_args import SCRAPER_ARGS
+from utils.ingest_helpers import load_result as _load_result
 
 
 SCHEDULE_RESULT_PATH = '/tmp/sofascore_result.json'
@@ -71,21 +72,6 @@ PLAYER_CAPTURE_LIMIT = _env_int('SS_PLAYER_CAPTURE_LIMIT')
 
 def _limit_arg(limit) -> str:
     return f"--limit {int(limit)}" if limit else ""
-
-
-def _load_result(path: str, logger) -> Dict[str, Any]:
-    """Load a runner JSON output. Missing file → empty dict (treated as failure)."""
-    import json
-
-    try:
-        with open(path, 'r') as f:
-            return json.load(f)
-    except FileNotFoundError:
-        logger.error("Results file %s not found", path)
-        return {}
-    except json.JSONDecodeError as e:
-        logger.error("Invalid JSON in %s: %s", path, e)
-        return {}
 
 
 def _capture_noop(capture_result: Dict[str, Any]) -> bool:

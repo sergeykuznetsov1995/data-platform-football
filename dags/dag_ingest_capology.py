@@ -23,6 +23,8 @@ from airflow.operators.trigger_dagrun import TriggerDagRunOperator
 
 from utils.config import CURRENT_SEASON, DAG_TAGS, LEAGUES, SCHEDULES
 from utils.default_args import SCRAPER_ARGS
+from utils.ingest_helpers import league_slug as _league_slug
+from utils.ingest_helpers import load_result as _load_result
 
 
 SALARIES_RESULT_TMPL = '/tmp/capology_player_salaries_{slug}_result.json'
@@ -44,24 +46,6 @@ LEAGUE_ROW_FLOORS = {
     'FRA-Ligue 1': 360,
 }
 DEFAULT_ROW_FLOOR = 360
-
-
-def _league_slug(league: str) -> str:
-    """``'ENG-Premier League'`` → ``'eng_premier_league'`` (task-id / path safe)."""
-    return league.lower().replace(' ', '_').replace('-', '_')
-
-
-def _load_result(path: str, logger) -> Dict[str, Any]:
-    import json
-    try:
-        with open(path, 'r') as f:
-            return json.load(f)
-    except FileNotFoundError:
-        logger.error("Results file %s not found", path)
-        return {}
-    except json.JSONDecodeError as e:
-        logger.error("Invalid JSON in %s: %s", path, e)
-        return {}
 
 
 def validate_data(**context) -> Dict[str, Any]:

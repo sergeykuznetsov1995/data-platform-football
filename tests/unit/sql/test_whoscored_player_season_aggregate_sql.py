@@ -219,14 +219,15 @@ def _seed_and_run(con, spadl_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]
             source_id    VARCHAR,
             source       VARCHAR,
             league       VARCHAR,
-            season       VARCHAR
+            season       VARCHAR,
+            confidence   VARCHAR
         )
         """
     )
     # One whoscored player (555) -> canonical fb_999, resolvable for 2526 APL.
     con.execute(
         "INSERT INTO silver_xref_player VALUES "
-        "('fb_999', '555', 'whoscored', 'ENG-Premier League', '2526')"
+        "('fb_999', '555', 'whoscored', 'ENG-Premier League', '2526', 'name_alias')"
     )
     placeholders = ", ".join(["?"] * len(_SPADL_COLUMNS))
     insert_sql = (
