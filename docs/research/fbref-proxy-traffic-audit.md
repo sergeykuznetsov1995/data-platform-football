@@ -385,3 +385,44 @@ works — the spikes are bad-proxy/CF days where it falls back. Diagnose with th
 existing `http_fetch_diag` (#65) on the production VM when
 `http_fetch_fallback > 0`. Blocklist tuning and fingerprint matching are **not**
 the levers (this section).
+
+## 10. Issue #877 — top-5 schedule backfill route + skip-existing (2026-07-06)
+
+Context: the top-5 backfill drove fbref through the default **nodriver** path,
+which no longer passes the 2026-07 CF managed interstitial — ~3 MB of proxy
+traffic per 20-min attempt, 0 rows, proxies banned after 2 CF blocks.
+`bronze.fbref_schedule` had 0 seasons for ESP/GER/ITA/FRA.
+
+### 10.1 Route verdict — camoufox stays primary
+
+Canary (ESP-La Liga 2024, `--scraper-type selenium` + `FBREF_TRANSPORT=camoufox`,
+runner from #877):
+
+| metric | nodriver (before) | camoufox (after) |
+|---|---|---|
+| rows saved | 0 | 426 |
+| real proxy MB / schedule page | ~3 (wasted) | **1.01** (cold start incl. 1/1 CF solve) |
+| wall time | 20 min (exhausted) | ~30 s |
+
+Re-run with `--skip-existing` (#877): **0.0 MB, ~1 s, browser never starts** —
+zeroed traffic JSON is written so `traffic_guard` still passes.
+
+### 10.2 FlareSolverr evaluated as primary — rejected, kept as option B
+
+Live probe (v3.4.6, residential proxy via separate `{url,username,password}`
+fields, one La Liga fixtures URL): **CF solved in 14.8 s, HTTP 200,
+HTML 0.78 MB, 402 match links** — it works. But FlareSolverr has **no request
+interception** (see flaresolverr-proxy-traffic-audit.md): sub-resources are not
+blockable and `fs_response_bytes` is a lower bound, so per-page proxy cost is
+strictly worse than the camoufox path (1.01 MB cold / ~0.3 MB warm with asset
+blocking + curl_cffi fast-path). Use FlareSolverr for fbref only if the
+camoufox solver degrades.
+
+### 10.3 Orphan fix
+
+`timeout N docker exec …` kills only the host docker client — python and its
+~1 GB camoufox/Firefox child keep running in the container. Fixed in #877:
+SIGTERM/SIGINT handlers in `run_fbref_scraper.py` raise `SystemExit(128+signum)`
+which unwinds the scraper context manager and closes the browser. Wrap runs
+with `docker exec … timeout -k 30 N python …` (timeout INSIDE the container).
+Verified: SIGTERM mid-CF-solve → 0 firefox/camoufox processes left.
