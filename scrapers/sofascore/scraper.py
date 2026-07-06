@@ -11,6 +11,7 @@ import logging
 import os
 import time
 from collections import defaultdict
+from contextlib import contextmanager
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import urlsplit
@@ -113,6 +114,10 @@ class SofaScoreScraper(SoccerdataScraper):
 
     SOURCE_NAME = 'sofascore'
     DEFAULT_RATE_LIMIT = 20  # SofaScore can be strict
+    # Camoufox capture attempts per league (schedule / league_table). Each
+    # attempt gets a FRESH residential proxy — the weekend top-5 backfill lost
+    # whole league-seasons to single transient proxy failures (#879).
+    _CAPTURE_ATTEMPTS = 3
 
     def __init__(
         self,
@@ -122,28 +127,35 @@ class SofaScoreScraper(SoccerdataScraper):
     ):
         super().__init__(leagues=leagues, seasons=seasons, **kwargs)
         self._reader = None
-        # Residential-proxy traffic audit (#789). Passive: response-body bytes of
-        # the tls_requests REST path (`_fetch_json_endpoint`), keyed by host.
-        # The Camoufox capture path (schedule/standings/lineups) is NOT counted
-        # here — instrumenting a browser session is out of scope for #789
-        # (followup if its residential share grows). Surfaced via get_traffic_stats().
+        # Residential-proxy traffic audit (#789 + #879). Passive:
+        # - response-body bytes of the tls_requests REST path
+        #   (`_fetch_json_endpoint`), keyed by host;
+        # - rx+tx bytes of each Camoufox capture session (schedule/standings/
+        #   lineups), folded in at session teardown via `_camoufox_session`.
+        # Surfaced via get_traffic_stats().
         self._proxy_bytes: int = 0
         self._proxy_bytes_by_host: Dict[str, int] = defaultdict(int)
+        self._camoufox_bytes: int = 0
 
     def get_traffic_stats(self) -> Dict:
-        """Residential-proxy bytes seen on the tls REST path this run (#789).
+        """Residential-proxy bytes seen this run (#789 tls path + #879 Camoufox).
 
-        Lower bound: response-body bytes of ``_fetch_json_endpoint`` only
-        (Camoufox browser traffic excluded). Shape mirrors
-        ``FlareSolverrClient.get_traffic_stats`` so ``utils.proxy_traffic`` can
-        consume it uniformly.
+        ``proxy_response_bytes/mb`` cover BOTH transports; ``camoufox_bytes/mb``
+        break the browser share out. Units caveat: the Camoufox share counts
+        rx+tx including headers (``request.sizes()``), the tls share counts
+        response bodies only — so the total is still a slight lower bound of
+        billable traffic. Shape mirrors ``FlareSolverrClient.get_traffic_stats``
+        so ``utils.proxy_traffic`` can consume it uniformly.
         """
         by_host = sorted(
             self._proxy_bytes_by_host.items(), key=lambda kv: -kv[1]
         )
+        total = self._proxy_bytes + self._camoufox_bytes
         return {
-            'proxy_response_bytes': self._proxy_bytes,
-            'proxy_response_mb': round(self._proxy_bytes / 1024 / 1024, 4),
+            'proxy_response_bytes': total,
+            'proxy_response_mb': round(total / 1024 / 1024, 4),
+            'camoufox_bytes': self._camoufox_bytes,
+            'camoufox_mb': round(self._camoufox_bytes / 1024 / 1024, 4),
             'requests': int(self._stats.get('requests', 0)),
             'top_traffic_urls': [
                 {
@@ -154,6 +166,34 @@ class SofaScoreScraper(SoccerdataScraper):
                 for host, nbytes in by_host[:10]
             ],
         }
+
+    @contextmanager
+    def _camoufox_session(self, proxy: Optional[dict]):
+        """Open a ``SofascoreCamoufoxCapture`` session and fold its rx+tx bytes
+        into the traffic audit on teardown (#879).
+
+        The accumulation lives in ``finally`` (not after the ``with``) because
+        generator callers (`_iter_match_captures`/`_iter_player_captures`) can
+        be ``.close()``d mid-iteration — GeneratorExit skips any code after the
+        block. The lazy import keeps the existing test seam
+        (``patch('scrapers.sofascore.camoufox_capture.SofascoreCamoufoxCapture')``)
+        working.
+        """
+        from scrapers.sofascore.camoufox_capture import SofascoreCamoufoxCapture
+
+        cap = None
+        try:
+            with SofascoreCamoufoxCapture(proxy=proxy) as cap:
+                yield cap
+        finally:
+            if cap is not None:
+                try:
+                    nbytes = int(getattr(cap, '_bytes_total', 0) or 0)
+                except (TypeError, ValueError):
+                    nbytes = 0
+                if nbytes > 0:
+                    self._camoufox_bytes += nbytes
+                    self._proxy_bytes_by_host['camoufox:www.sofascore.com'] += nbytes
 
     def _record_proxy_bytes(self, url: str, resp) -> None:
         """Accumulate response-body bytes for the residential-proxy audit (#789).
@@ -199,8 +239,6 @@ class SofaScoreScraper(SoccerdataScraper):
         leaving the existing partition intact).
         """
         from scrapers.sofascore.camoufox_capture import (
-            SofascoreCamoufoxCapture,
-            extract_tournament_events,
             normalize_event,
             season_short_to_label,
         )
@@ -219,7 +257,6 @@ class SofaScoreScraper(SoccerdataScraper):
         # fixtures as ours (and a partial capture never pollutes the partition).
         target_season_year = season_short_to_label(season_short)  # '2526' -> '25/26'
 
-        proxy = self._camoufox_proxy()
         frames: List[pd.DataFrame] = []
         for league in self.leagues:
             ut_id = self._resolve_unique_tournament_id(league)
@@ -231,32 +268,9 @@ class SofaScoreScraper(SoccerdataScraper):
                 )
                 continue
             nav_url = f"https://www.sofascore.com/tournament/{slug}/{ut_id}"
-            try:
-                self._rate_limiter.acquire()
-                with SofascoreCamoufoxCapture(proxy=proxy) as cap:
-                    buffer = cap.capture_tournament(nav_url)
-                    # The landing serves only the CURRENT/next season; page the
-                    # TARGET season's events in so a historical backfill is not
-                    # empty (#824). For the current season this is a no-op-ish
-                    # extra (same sid) the year-filter below keeps consistent.
-                    buffer = self._capture_season_buffer(
-                        cap, buffer, ut_id, target_season_year)
-            except Exception as e:  # noqa: BLE001 — capture must not crash the run
-                logger.warning("capture schedule failed for league=%s: %s",
-                               league, e)
-                continue
-
-            events = extract_tournament_events(buffer, ut_id)
-            events = [
-                ev for ev in events
-                if (ev.get('season') or {}).get('year') == target_season_year
-            ]
+            events = self._capture_schedule_events(
+                nav_url, ut_id, league, season_short, target_season_year)
             if not events:
-                logger.warning(
-                    "Capture schedule league=%s: 0 events for season=%s "
-                    "(year=%s) — page may serve a different season.",
-                    league, season_short, target_season_year,
-                )
                 continue
 
             df = pd.DataFrame([normalize_event(ev) for ev in events])
@@ -276,6 +290,78 @@ class SofaScoreScraper(SoccerdataScraper):
         out = self._add_metadata(out, 'schedule')
         return out
 
+    def _capture_schedule_events(
+        self, nav_url: str, ut_id, league: str, season_short: str, target_year: str,
+    ) -> list:
+        """Capture ``target_year``'s events for one league page, retrying up to
+        ``_CAPTURE_ATTEMPTS`` times on a FRESH proxy (#879).
+
+        The weekend top-5 backfill lost whole league-seasons to single
+        transient failures (proxy connect refused / NS_ERROR_* timeouts) and to
+        an unresolved season sid — each attempt picks a new residential exit so
+        one dead proxy can't silently no-op the unit. Retryable: a capture
+        exception, an unresolved sid, a resolved sid whose events page never
+        answered. NOT retried: a real 200 answer with zero events for the
+        target season (legitimately empty, e.g. fixtures not yet published).
+        """
+        from scrapers.sofascore.camoufox_capture import extract_tournament_events
+
+        for attempt in range(1, self._CAPTURE_ATTEMPTS + 1):
+            proxy = self._camoufox_proxy()  # fresh exit per attempt (#879)
+            sid = None
+            buffer = {}
+            try:
+                self._rate_limiter.acquire()
+                with self._camoufox_session(proxy) as cap:
+                    buffer = cap.capture_tournament(nav_url)
+                    # The landing serves only the CURRENT/next season; page the
+                    # TARGET season's events in so a historical backfill is not
+                    # empty (#824). For the current season this is a no-op-ish
+                    # extra (same sid) the year-filter below keeps consistent.
+                    sid = self._resolve_target_sid(cap, buffer, ut_id, target_year)
+                    if sid is not None:
+                        buffer = cap.paginate_tournament_season(ut_id, int(sid))
+            except Exception as e:  # noqa: BLE001 — capture must not crash the run
+                logger.warning(
+                    "capture schedule failed for league=%s (attempt %d/%d): %s",
+                    league, attempt, self._CAPTURE_ATTEMPTS, e)
+                continue
+
+            events = [
+                ev for ev in extract_tournament_events(buffer, ut_id)
+                if (ev.get('season') or {}).get('year') == target_year
+            ]
+            if events:
+                return events
+            if sid is None:
+                logger.warning(
+                    "Capture schedule league=%s: 0 events for season=%s "
+                    "(year=%s) — season unresolved, page may serve a different "
+                    "season (attempt %d/%d).",
+                    league, season_short, target_year,
+                    attempt, self._CAPTURE_ATTEMPTS,
+                )
+                continue
+            page0 = (
+                f"/api/v1/unique-tournament/{int(ut_id)}/season/{int(sid)}"
+                "/events/last/0"
+            )
+            if self._rec_answered(buffer.get(page0)):
+                # The season's own events page answered with nothing — a real
+                # empty, not a capture miss. Don't burn retries on it.
+                logger.warning(
+                    "Capture schedule league=%s: 0 events for season=%s "
+                    "(year=%s, sid=%s) — season served empty.",
+                    league, season_short, target_year, sid,
+                )
+                return []
+            logger.warning(
+                "Capture schedule league=%s: target-season events page missing "
+                "from capture (season=%s, sid=%s, attempt %d/%d).",
+                league, season_short, sid, attempt, self._CAPTURE_ATTEMPTS,
+            )
+        return []
+
     def _capture_season_buffer(self, cap, buffer, ut_id, target_year):
         """Resolve ``target_year``'s SofaScore ``season_id`` from a landing
         ``buffer`` and page that season's events into the buffer so a historical
@@ -283,25 +369,14 @@ class SofaScoreScraper(SoccerdataScraper):
 
         The tournament landing only fires the CURRENT/next season's
         ``/events/...`` XHR, so :func:`extract_tournament_events` finds nothing
-        for a past season. We resolve the target sid the same way
-        :meth:`read_league_table` does — the captured ``/seasons`` map first,
-        then the events' own ``season.id`` as a fallback — then drive
+        for a past season. We resolve the target sid via
+        :meth:`_resolve_target_sid` (buffer sources first, then an in-page
+        ``/seasons`` fetch — #879), then drive
         :meth:`SofascoreCamoufoxCapture.paginate_tournament_season` on the same
         (already-navigated) page. Returns the extended buffer, or the original
         unchanged when the season can't be resolved (the caller's
         ``season.year`` filter then yields nothing → no save, no pollution)."""
-        from scrapers.sofascore.camoufox_capture import (
-            extract_tournament_events,
-            extract_tournament_seasons_map,
-        )
-
-        target_sid = extract_tournament_seasons_map(buffer, ut_id).get(target_year)
-        if target_sid is None:
-            for ev in extract_tournament_events(buffer, ut_id):
-                s = ev.get('season') or {}
-                if s.get('year') == target_year and s.get('id') is not None:
-                    target_sid = int(s['id'])
-                    break
+        target_sid = self._resolve_target_sid(cap, buffer, ut_id, target_year)
         if target_sid is None:
             logger.warning(
                 "Season %s unresolved from /seasons or events for ut=%s — "
@@ -310,6 +385,63 @@ class SofaScoreScraper(SoccerdataScraper):
             )
             return buffer
         return cap.paginate_tournament_season(ut_id, int(target_sid))
+
+    def _fetch_api_rec(self, cap, path: str) -> Optional[dict]:
+        """In-page fetch of an ``/api/v1`` ``path`` via the capture session
+        (#879). getattr-guarded: test fakes may not implement the method.
+        Returns the buffer-shaped record or ``None`` on any failure."""
+        fetch = getattr(cap, 'fetch_api_json', None)
+        if not callable(fetch):
+            return None
+        try:
+            rec = fetch(path)
+        except Exception as e:  # noqa: BLE001 — a probe fetch mustn't kill the run
+            logger.info("in-page fetch %s failed: %s", path, e)
+            return None
+        return rec if isinstance(rec, dict) else None
+
+    @staticmethod
+    def _rec_answered(*recs) -> bool:
+        """True when any capture record is a real 200, non-challenged answer —
+        the 'legitimately empty' signal that stops a capture retry (#879).
+
+        ``challenge is False`` (not merely falsy) and ``json is not None`` on
+        purpose: a body-read race leaves ``{'status': 200, 'json': None,
+        'challenge': None}`` (see ``merge_capture``) — that's a transport
+        failure worth retrying, not an empty answer."""
+        return any(
+            isinstance(r, dict) and r.get('status') == 200
+            and r.get('json') is not None and r.get('challenge') is False
+            for r in recs if r is not None
+        )
+
+    def _resolve_target_sid(self, cap, buffer, ut_id, target_year) -> Optional[int]:
+        """Resolve ``target_year``'s SofaScore ``season_id``: the captured
+        ``/seasons`` map first, the captured events' own ``season.id`` second,
+        and an in-page ``/seasons`` fetch last (#879 — neither buffer source
+        fires reliably when the landing serves another season)."""
+        from scrapers.sofascore.camoufox_capture import (
+            extract_tournament_events,
+            extract_tournament_seasons_map,
+        )
+
+        sid = extract_tournament_seasons_map(buffer, ut_id).get(target_year)
+        if sid is not None:
+            return int(sid)
+        for ev in extract_tournament_events(buffer, ut_id):
+            s = ev.get('season') or {}
+            if s.get('year') == target_year and s.get('id') is not None:
+                return int(s['id'])
+        path = f"/api/v1/unique-tournament/{int(ut_id)}/seasons"
+        rec = self._fetch_api_rec(cap, path)
+        if rec is not None:
+            sid = extract_tournament_seasons_map({path: rec}, ut_id).get(target_year)
+            if sid is not None:
+                logger.info(
+                    "Season %s resolved via in-page /seasons fetch for ut=%s "
+                    "(sid=%s).", target_year, ut_id, sid)
+                return int(sid)
+        return None
 
     def read_league_table(self) -> Optional[pd.DataFrame]:
         """Read league standings via Camoufox capture (#777).
@@ -323,18 +455,15 @@ class SofaScoreScraper(SoccerdataScraper):
         soccerdata short form (``'2526'``).
 
         The standings JSON carries no season, so the guard is the ``season_id``:
-        we resolve the target year's sid from the captured events (the
-        ``/seasons`` map does NOT fire on the standings landing — #779) and
-        accept ONLY the standings XHR for that exact sid. Off-season the page
-        rolls to the NEXT season, whose standings would otherwise overwrite the
-        current-season partition with an empty table — requiring our sid skips
-        it. Returns ``None`` when nothing matches (caller then skips the save).
+        we resolve the target year's sid (buffer sources first, then an in-page
+        ``/seasons`` fetch — the map does NOT fire on the standings landing,
+        #779) and accept ONLY standings for that exact sid. When the landing
+        buffer lacks the target sid's standings XHR (historical season /
+        off-season roll-over) the table is fetched in-page by that sid (#879) —
+        same guard, no dependency on the SPA firing the XHR spontaneously.
+        Returns ``None`` when nothing matches (caller then skips the save).
         """
         from scrapers.sofascore.camoufox_capture import (
-            SofascoreCamoufoxCapture,
-            extract_tournament_events,
-            extract_tournament_seasons_map,
-            extract_tournament_standings,
             normalize_standing,
             season_short_to_label,
         )
@@ -347,7 +476,6 @@ class SofaScoreScraper(SoccerdataScraper):
         season_short = _season_to_short(self.seasons[0])
         target_year = season_short_to_label(season_short)  # '2526' -> '25/26'
 
-        proxy = self._camoufox_proxy()
         frames: List[pd.DataFrame] = []
         for league in self.leagues:
             ut_id = self._resolve_unique_tournament_id(league)
@@ -359,43 +487,9 @@ class SofaScoreScraper(SoccerdataScraper):
                 )
                 continue
             nav_url = f"https://www.sofascore.com/tournament/{slug}/{ut_id}"
-            try:
-                self._rate_limiter.acquire()
-                with SofascoreCamoufoxCapture(proxy=proxy) as cap:
-                    buffer = cap.capture_buffer(nav_url)
-            except Exception as e:  # noqa: BLE001 — capture must not crash the run
-                logger.warning("capture league_table failed for league=%s: %s",
-                               league, e)
-                continue
-
-            # Resolve the target year's SofaScore season_id. /seasons does NOT
-            # fire on the standings landing (live-proven #779: 0 of 3 capture
-            # passes saw it), so fall back to the captured events, which carry
-            # season.{id,year} — the same source read_schedule filters on. Off-
-            # season the page serves only the NEXT season's events, so a missing
-            # target sid still skips the league (no empty-table overwrite).
-            seasons_map = extract_tournament_seasons_map(buffer, ut_id)
-            target_sid = seasons_map.get(target_year)
-            if target_sid is None:
-                for ev in extract_tournament_events(buffer, ut_id):
-                    s = ev.get('season') or {}
-                    if s.get('year') == target_year and s.get('id') is not None:
-                        target_sid = int(s['id'])
-                        break
-            if target_sid is None:
-                logger.warning(
-                    "Capture league_table league=%s: season %s (year=%s) "
-                    "unresolved from /seasons or events — page may serve a "
-                    "different season.",
-                    league, season_short, target_year,
-                )
-                continue
-            rows = extract_tournament_standings(buffer, ut_id, target_sid)
+            rows = self._capture_league_table_rows(
+                nav_url, ut_id, league, season_short, target_year)
             if not rows:
-                logger.warning(
-                    "Capture league_table league=%s: 0 standings rows for "
-                    "season=%s (sid=%s).", league, season_short, target_sid,
-                )
                 continue
 
             df = pd.DataFrame([normalize_standing(r) for r in rows])
@@ -412,6 +506,76 @@ class SofaScoreScraper(SoccerdataScraper):
         out = pd.concat(frames, ignore_index=True)
         out = self._add_metadata(out, 'league_table')
         return out
+
+    def _capture_league_table_rows(
+        self, nav_url: str, ut_id, league: str, season_short: str, target_year: str,
+    ) -> list:
+        """Capture ``target_year``'s standings rows for one league page,
+        retrying up to ``_CAPTURE_ATTEMPTS`` times on a FRESH proxy (#879).
+
+        The weekend top-5 backfill lost league-seasons to single transient
+        failures (proxy connect refused / NS_ERROR_* timeouts) — each attempt
+        picks a new residential exit so one dead proxy can't no-op the unit.
+        Retryable: a capture exception, an unresolved sid, standings that never
+        answered. NOT retried: a real 200 answer with zero rows for our sid.
+        """
+        from scrapers.sofascore.camoufox_capture import extract_tournament_standings
+
+        for attempt in range(1, self._CAPTURE_ATTEMPTS + 1):
+            proxy = self._camoufox_proxy()  # fresh exit per attempt (#879)
+            sid = None
+            rows = []
+            std_path = None
+            fetched_rec = None
+            buffer = {}
+            try:
+                self._rate_limiter.acquire()
+                with self._camoufox_session(proxy) as cap:
+                    buffer = cap.capture_buffer(nav_url)
+                    sid = self._resolve_target_sid(cap, buffer, ut_id, target_year)
+                    if sid is not None:
+                        std_path = (
+                            f"/api/v1/unique-tournament/{int(ut_id)}/season/"
+                            f"{int(sid)}/standings/total"
+                        )
+                        rows = extract_tournament_standings(buffer, ut_id, sid)
+                        if not rows:
+                            # The landing only fires the DEFAULT season's
+                            # standings XHR — fetch the TARGET sid's in-page
+                            # (same session, same Turnstile clearance, #879).
+                            fetched_rec = self._fetch_api_rec(cap, std_path)
+                            if fetched_rec is not None:
+                                rows = extract_tournament_standings(
+                                    {std_path: fetched_rec}, ut_id, sid)
+            except Exception as e:  # noqa: BLE001 — capture must not crash the run
+                logger.warning(
+                    "capture league_table failed for league=%s "
+                    "(attempt %d/%d): %s",
+                    league, attempt, self._CAPTURE_ATTEMPTS, e)
+                continue
+            if rows:
+                return rows
+            if sid is None:
+                logger.warning(
+                    "Capture league_table league=%s: season %s (year=%s) "
+                    "unresolved from /seasons or events — page may serve a "
+                    "different season (attempt %d/%d).",
+                    league, season_short, target_year,
+                    attempt, self._CAPTURE_ATTEMPTS,
+                )
+                continue
+            if self._rec_answered(buffer.get(std_path), fetched_rec):
+                logger.warning(
+                    "Capture league_table league=%s: 0 standings rows for "
+                    "season=%s (sid=%s).", league, season_short, sid,
+                )
+                return []
+            logger.warning(
+                "Capture league_table league=%s: standings for sid=%s never "
+                "answered (season=%s, attempt %d/%d).",
+                league, sid, season_short, attempt, self._CAPTURE_ATTEMPTS,
+            )
+        return []
 
     def read_team_season_stats(self) -> Optional[pd.DataFrame]:
         """
@@ -846,10 +1010,7 @@ class SofaScoreScraper(SoccerdataScraper):
         ``SOFASCORE_INPAGE_FETCH=0`` restores nav-per-match (mirrors
         ``SOFASCORE_BLOCK_RESOURCES``).
         """
-        from scrapers.sofascore.camoufox_capture import (
-            SofascoreCamoufoxCapture,
-            fetch_names_for_tabs,
-        )
+        from scrapers.sofascore.camoufox_capture import fetch_names_for_tabs
 
         env = os.environ.get('SOFASCORE_INPAGE_FETCH')
         use_fetch = env is None or env.strip().lower() not in ('0', 'false', 'no')
@@ -868,7 +1029,7 @@ class SofaScoreScraper(SoccerdataScraper):
             in_session = 0
             consec_fail = 0
             warmed = False  # True after this session's first full navigation
-            with SofascoreCamoufoxCapture(proxy=proxy) as cap:
+            with self._camoufox_session(proxy) as cap:
                 while i < n and in_session < session_max and consec_fail < proxy_fail_max:
                     mid = match_ids[i]
                     self._rate_limiter.acquire()
@@ -949,14 +1110,12 @@ class SofaScoreScraper(SoccerdataScraper):
         same-origin fetch (~30 KB). A fetch that raises or misses the profile
         falls back to a full ``capture_player`` navigation for that player.
         Kill-switch ``SOFASCORE_INPAGE_FETCH=0`` restores nav-per-player."""
-        from scrapers.sofascore.camoufox_capture import SofascoreCamoufoxCapture
-
         env = os.environ.get('SOFASCORE_INPAGE_FETCH')
         use_fetch = env is None or env.strip().lower() not in ('0', 'false', 'no')
 
         proxy = self._camoufox_proxy()
         warmed = False  # True after this session's first full navigation
-        with SofascoreCamoufoxCapture(proxy=proxy) as cap:
+        with self._camoufox_session(proxy) as cap:
             for pid in player_ids:
                 self._rate_limiter.acquire()
                 self._stats['requests'] += 1
@@ -1010,7 +1169,6 @@ class SofaScoreScraper(SoccerdataScraper):
         capture fails, the season is unresolved, or no finished match exists.
         """
         from scrapers.sofascore.camoufox_capture import (
-            SofascoreCamoufoxCapture,
             extract_tournament_events,
             finished_event_ids,
             season_short_to_label,
@@ -1033,7 +1191,7 @@ class SofaScoreScraper(SoccerdataScraper):
         proxy = self._camoufox_proxy()
         try:
             self._rate_limiter.acquire()
-            with SofascoreCamoufoxCapture(proxy=proxy) as cap:
+            with self._camoufox_session(proxy) as cap:
                 buffer = cap.capture_tournament(nav_url)
                 buffer = self._capture_season_buffer(
                     cap, buffer, ut_id, target_year)

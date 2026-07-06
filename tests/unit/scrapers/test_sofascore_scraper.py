@@ -1555,6 +1555,105 @@ class TestReadScheduleViaCapture:
                    side_effect=RuntimeError('browser boom')):
             assert scraper.read_schedule() is None
 
+    @pytest.mark.unit
+    def test_retries_on_fresh_proxy_after_transient_capture_failure(self):
+        # #879: the top-5 weekend backfill lost whole league-seasons to ONE
+        # dead proxy — a transient capture failure must retry on a fresh
+        # residential exit instead of silently no-opping the unit.
+        scraper = self._scraper()
+        scraper._camoufox_proxy = MagicMock(
+            side_effect=[{'server': 'http://dead:1'},
+                         {'server': 'http://alive:2'}])
+        good = self._FakeCap(self._buffer())
+        with patch('scrapers.sofascore.camoufox_capture.SofascoreCamoufoxCapture',
+                   side_effect=[RuntimeError('Failed to connect to proxy'),
+                                good]):
+            df = scraper.read_schedule()
+
+        assert df is not None
+        assert sorted(df['game_id'].tolist()) == [101, 102]
+        assert scraper._camoufox_proxy.call_count == 2  # fresh proxy per attempt
+
+    def _sid_resolvable_buffer(self, page0_rec):
+        """Target 25/26 sid resolvable from /seasons; its events page0 carries
+        ``page0_rec`` — the record whose 'answered-ness' drives retry (#879)."""
+        return {
+            "/api/v1/unique-tournament/17/seasons": {
+                "status": 200, "challenge": False, "json": {"seasons": [
+                    {"year": "25/26", "id": 76668}]}},
+            "/api/v1/unique-tournament/17/season/76668/events/last/0": page0_rec,
+        }
+
+    def _run_with_session_counter(self, scraper, buf):
+        sessions = {'n': 0}
+
+        class _Cap:
+            def __init__(self, **kwargs):
+                sessions['n'] += 1
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def capture_tournament(self, nav_url):
+                return dict(buf)
+
+            def paginate_tournament_season(self, ut_id, season_id, max_pages=25):
+                return dict(buf)
+
+        with patch('scrapers.sofascore.camoufox_capture.SofascoreCamoufoxCapture',
+                   _Cap):
+            df = scraper.read_schedule()
+        return df, sessions['n']
+
+    @pytest.mark.unit
+    def test_answered_empty_season_not_retried(self):
+        # The target season's OWN events page answered 200 with zero events —
+        # legitimately empty (e.g. fixtures not yet published) → one attempt.
+        scraper = self._scraper()
+        scraper._camoufox_proxy = MagicMock(return_value=None)
+        buf = self._sid_resolvable_buffer({
+            "status": 200, "challenge": False, "json": {"events": []}})
+
+        df, sessions = self._run_with_session_counter(scraper, buf)
+
+        assert df is None
+        assert sessions == 1
+
+    @pytest.mark.unit
+    def test_body_read_race_record_is_retried(self):
+        # #879 review (HIGH): a body-read race leaves {'status': 200,
+        # 'json': None, 'challenge': None} — a transport failure, NOT a
+        # legitimate empty. It must burn the retry budget, not short-circuit.
+        scraper = self._scraper()
+        scraper._camoufox_proxy = MagicMock(return_value=None)
+        buf = self._sid_resolvable_buffer({
+            "status": 200, "challenge": None, "json": None})
+
+        df, sessions = self._run_with_session_counter(scraper, buf)
+
+        assert df is None
+        assert sessions == 3  # all attempts spent — never treated as answered
+
+    @pytest.mark.unit
+    def test_unanswered_events_page_is_retried(self):
+        # sid resolved but the target season's events page never made it into
+        # the buffer (challenged / dropped XHR) → retry on a fresh proxy.
+        scraper = self._scraper()
+        scraper._camoufox_proxy = MagicMock(return_value=None)
+        buf = {
+            "/api/v1/unique-tournament/17/seasons": {
+                "status": 200, "challenge": False, "json": {"seasons": [
+                    {"year": "25/26", "id": 76668}]}},
+        }
+
+        df, sessions = self._run_with_session_counter(scraper, buf)
+
+        assert df is None
+        assert sessions == 3
+
 
 class TestReadLeagueTableViaCapture:
     """read_league_table (#777) builds bronze.sofascore_league_table rows from a
@@ -1886,6 +1985,87 @@ class TestReadLeagueTableCapture:
             df = scraper.read_league_table()
         assert df is None
 
+    def _fetch_cap_cls(self, landing, fetch_map, init_counter=None):
+        """Fake capture class: landing buffer + in-page fetch map (#879)."""
+        class _Cap:
+            def __init__(self, **kwargs):
+                if init_counter is not None:
+                    init_counter['n'] += 1
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def capture_buffer(self, nav_url):
+                return dict(landing)
+
+            def fetch_api_json(self, path):
+                return fetch_map.get(path)
+
+        return _Cap
+
+    @pytest.mark.unit
+    def test_historical_season_fetched_in_page(self):
+        # #879: off-season/historical — the landing serves 26/27 only; the
+        # target 24/25 sid comes from the in-page /seasons fetch and its table
+        # from the in-page standings fetch, both keyed by EXACT sid (the same
+        # season-guard as before — just no dependency on the SPA firing it).
+        scraper = self._scraper()
+        scraper._camoufox_proxy = lambda: None
+        sid = 61627
+        landing = {
+            "/api/v1/unique-tournament/17/season/96668/events/round/1": {
+                "status": 200, "challenge": False, "json": {"events": [
+                    {"id": 9, "season": {"year": "26/27", "id": 96668}}]}},
+        }
+        fetch_map = {
+            "/api/v1/unique-tournament/17/seasons": {
+                "status": 200, "challenge": False, "json": {"seasons": [
+                    {"year": "26/27", "id": 96668},
+                    {"year": "24/25", "id": sid}]}},
+            f"/api/v1/unique-tournament/17/season/{sid}/standings/total": {
+                "status": 200, "challenge": False, "json": {"standings": [
+                    {"type": "total", "rows": [
+                        {"team": {"name": "Liverpool FC"}, "matches": 38,
+                         "wins": 25, "draws": 9, "losses": 4, "scoresFor": 86,
+                         "scoresAgainst": 41, "points": 84}]}]}},
+        }
+
+        with patch('scrapers.sofascore.camoufox_capture.SofascoreCamoufoxCapture',
+                   self._fetch_cap_cls(landing, fetch_map)):
+            df = scraper.read_league_table()
+
+        assert df is not None and len(df) == 1
+        assert df.iloc[0]['team'] == 'Liverpool FC'
+        assert df.iloc[0]['pts'] == 84
+        assert set(df['season']) == {'2425'}
+
+    @pytest.mark.unit
+    def test_zero_rows_with_answered_standings_not_retried(self):
+        # A real 200 answer with zero rows for OUR sid is legitimately empty —
+        # no retry burn (the retry budget is for transport/resolution misses).
+        scraper = self._scraper()
+        scraper._camoufox_proxy = MagicMock(return_value=None)
+        sid = 61627
+        fetch_map = {
+            "/api/v1/unique-tournament/17/seasons": {
+                "status": 200, "challenge": False, "json": {"seasons": [
+                    {"year": "24/25", "id": sid}]}},
+            f"/api/v1/unique-tournament/17/season/{sid}/standings/total": {
+                "status": 200, "challenge": False, "json": {"standings": [
+                    {"type": "total", "rows": []}]}},
+        }
+        sessions = {'n': 0}
+
+        with patch('scrapers.sofascore.camoufox_capture.SofascoreCamoufoxCapture',
+                   self._fetch_cap_cls({}, fetch_map, init_counter=sessions)):
+            df = scraper.read_league_table()
+
+        assert df is None
+        assert sessions['n'] == 1
+
 
 class TestCaptureSeasonBuffer:
     """_capture_season_buffer resolves a target year's SofaScore season_id from
@@ -1956,6 +2136,29 @@ class TestCaptureSeasonBuffer:
         out = scraper._capture_season_buffer(cap, buffer, 17, "24/25")
         assert cap.calls == []
         assert out is buffer
+
+    @pytest.mark.unit
+    def test_resolves_sid_via_in_page_fetch_when_buffer_lacks_it(self):
+        # #879: neither /seasons nor the events carry the target season (the
+        # FRA-2020 backfill hole) — the in-page /seasons fetch resolves it.
+        scraper = self._scraper()
+
+        class _FetchCap(self._RecCap):
+            def __init__(self):
+                super().__init__()
+                self.fetched = []
+
+            def fetch_api_json(self, path):
+                self.fetched.append(path)
+                return {"status": 200, "challenge": False, "json": {"seasons": [
+                    {"year": "25/26", "id": 76986},
+                    {"year": "24/25", "id": 75612}]}}
+
+        cap = _FetchCap()
+        out = scraper._capture_season_buffer(cap, {}, 17, "24/25")
+        assert cap.fetched == ["/api/v1/unique-tournament/17/seasons"]
+        assert cap.calls == [(17, 75612)]
+        assert out == {"paged": (17, 75612)}
 
 
 class TestMatchCaptureSessionRestart:

@@ -1,10 +1,12 @@
-"""SofaScore residential-proxy byte counter (issue #789 Phase 2).
+"""SofaScore residential-proxy byte counter (issue #789 Phase 2 + #879).
 
 Counts response-body bytes of the tls REST path (`_fetch_json_endpoint`) per
-host. The Camoufox capture path is deliberately NOT instrumented (out of scope
-for #789), so this is a documented lower bound. The counter must count every
-status, aggregate by host, and never raise on a malformed response.
+host, plus — since #879 — the rx+tx bytes of each Camoufox capture session,
+folded in at session teardown by `_camoufox_session`. The counter must count
+every status, aggregate by host, and never raise on a malformed response.
 """
+
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -64,6 +66,79 @@ def test_zero_traffic_shape(scraper):
     assert scraper.get_traffic_stats() == {
         'proxy_response_bytes': 0,
         'proxy_response_mb': 0.0,
+        'camoufox_bytes': 0,
+        'camoufox_mb': 0.0,
         'requests': 0,
         'top_traffic_urls': [],
     }
+
+
+@pytest.mark.unit
+def test_camoufox_session_bytes_fold_into_totals(scraper):
+    # #879: a capture session's rx+tx bytes must land in BOTH the camoufox
+    # breakdown and the proxy_response totals (they are billable residential
+    # bytes), plus a per-host row for the domain breakdown.
+    fake = MagicMock()
+    fake.__enter__.return_value._bytes_total = 3 * 1024 * 1024
+
+    with patch('scrapers.sofascore.camoufox_capture.SofascoreCamoufoxCapture',
+               return_value=fake):
+        with scraper._camoufox_session(None):
+            pass
+
+    stats = scraper.get_traffic_stats()
+    assert stats['camoufox_bytes'] == 3 * 1024 * 1024
+    assert stats['camoufox_mb'] == 3.0
+    assert stats['proxy_response_bytes'] == 3 * 1024 * 1024
+    assert stats['top_traffic_urls'][0]['url'] == 'camoufox:www.sofascore.com'
+
+
+@pytest.mark.unit
+def test_camoufox_bytes_sum_with_tls_bytes(scraper):
+    fake = MagicMock()
+    fake.__enter__.return_value._bytes_total = 2 * 1024 * 1024
+    scraper._record_proxy_bytes('https://api.sofascore.com/a', _FakeResp(b'a' * 1000))
+
+    with patch('scrapers.sofascore.camoufox_capture.SofascoreCamoufoxCapture',
+               return_value=fake):
+        with scraper._camoufox_session(None):
+            pass
+
+    stats = scraper.get_traffic_stats()
+    assert stats['proxy_response_bytes'] == 2 * 1024 * 1024 + 1000
+    assert stats['camoufox_bytes'] == 2 * 1024 * 1024
+
+
+@pytest.mark.unit
+def test_camoufox_bytes_folded_even_when_session_body_raises(scraper):
+    # The accumulation lives in finally — a crash inside the session must not
+    # lose the bytes already spent through the proxy.
+    fake = MagicMock()
+    fake.__enter__.return_value._bytes_total = 1024
+
+    with patch('scrapers.sofascore.camoufox_capture.SofascoreCamoufoxCapture',
+               return_value=fake):
+        with pytest.raises(RuntimeError):
+            with scraper._camoufox_session(None):
+                raise RuntimeError('mid-session crash')
+
+    assert scraper.get_traffic_stats()['camoufox_bytes'] == 1024
+
+
+@pytest.mark.unit
+def test_camoufox_fake_without_counter_is_ignored(scraper):
+    # Test fakes (and a session that failed to start) have no _bytes_total —
+    # the fold must silently count zero, never raise.
+    class _Bare:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    with patch('scrapers.sofascore.camoufox_capture.SofascoreCamoufoxCapture',
+               return_value=_Bare()):
+        with scraper._camoufox_session(None):
+            pass
+
+    assert scraper.get_traffic_stats()['camoufox_bytes'] == 0
