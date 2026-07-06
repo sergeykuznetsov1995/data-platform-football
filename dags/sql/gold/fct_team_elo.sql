@@ -32,9 +32,12 @@
 --   Orphan prefix 'ce_' mirrors xref_team.sql.j2. Rows are never dropped
 --   (design §6 rule 2); the orphan share is policed by DQ.
 --
--- Scope: league='ENG-Premier League' (same APL scope as xref_team + dim_team;
---   ClubElo tracks the whole pyramid, so without this filter every non-APL club
---   would become a 'ce_' orphan and inflate the orphan rate).
+-- Scope: leagues that xref_team resolves for clubelo (rendered there from
+--   configs/medallion/competitions.yaml in_scope flags). ClubElo tracks whole
+--   national pyramids, so without this filter every out-of-scope club would
+--   become a 'ce_' orphan and inflate the orphan rate. Sourcing the league
+--   set from silver.xref_team keeps gold in lockstep with the silver scope —
+--   flipping in_scope in competitions.yaml widens both layers at once.
 --
 -- Snapshot semantics:
 --   ratings + ratings_historical overlap on (team, rating_date). Deduplicated
@@ -42,16 +45,24 @@
 --   the freshest snapshot — guarantees a unique (team_id, elo_date).
 -- =============================================================================
 
-with elo_raw as (
+with in_scope_leagues as (
+    -- League universe = what silver.xref_team resolves for clubelo (scoped by
+    -- competitions.yaml in_scope at render time) — no hardcoded league here.
+    select distinct league
+    from iceberg.silver.xref_team
+    where source = 'clubelo'
+),
+
+elo_raw as (
     select team, league, rating_date, elo, rank, _ingested_at
     from iceberg.bronze.clubelo_ratings
     where team is not null
-      and league = 'ENG-Premier League'
+      and league in (select league from in_scope_leagues)
     union all
     select team, league, rating_date, elo, rank, _ingested_at
     from iceberg.bronze.clubelo_ratings_historical
     where team is not null
-      and league = 'ENG-Premier League'
+      and league in (select league from in_scope_leagues)
 ),
 
 resolved as (

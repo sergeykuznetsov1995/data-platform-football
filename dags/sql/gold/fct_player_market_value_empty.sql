@@ -8,7 +8,7 @@
 -- =============================================================================
 
 SELECT
-    CAST(NULL AS varchar)      AS player_id_canonical,
+    CAST(NULL AS varchar)      AS player_id,
     CAST(NULL AS date)         AS valuation_date,
     CAST(NULL AS bigint)       AS market_value_eur,
     CAST(NULL AS varchar)      AS currency,
