@@ -298,12 +298,13 @@ SELECT
   COALESCE(dt.team_name, ps.team_id) AS team_name,
   ps.league, ps.season,
   ps.matches, ps.minutes,
-  ps.goals, ps.assists, ps.non_penalty_goals, ps.shots, ps.key_passes,
-  ps.expected_goals, ps.expected_assists,
+  ps.goals, ps.assists, ps.non_penalty_goals, ps.shots, ps.shots_on_target,
+  ps.key_passes, ps.expected_goals, ps.expected_assists,
   ps.goals - ps.expected_goals AS finishing_delta,
   ps.rating_sofascore,
   ps.successful_dribbles, ps.take_on_pct, ps.total_duels_won_pct,
   ps.big_chances_created,
+  ps.tackles_won, ps.interceptions, ps.yellow_cards, ps.red_cards,
   mv.market_value_eur,
   sal.annual_gross_eur, sal.weekly_gross_eur, sal.contract_status,
   tm.contract_until
@@ -333,6 +334,12 @@ LEFT JOIN tm
         "primary_position": "Позиция", "matches": "Матчи",
         "minutes": "Минуты", "goals": "Голы", "assists": "Ассисты",
         "expected_goals": "xG", "expected_assists": "xA",
+        "shots": "Удары", "shots_on_target": "В створ",
+        "key_passes": "Ключевые передачи",
+        "big_chances_created": "Big chances",
+        "successful_dribbles": "Обводки",
+        "tackles_won": "Отборы", "interceptions": "Перехваты",
+        "yellow_cards": "ЖК", "red_cards": "КК",
         "rating_sofascore": "Рейтинг",
         "total_duels_won_pct": "% единоборств", "take_on_pct": "% обводок",
         "market_value_eur": "Стоимость (€)",
@@ -369,14 +376,14 @@ def _build_slices(ctx: _Ctx, vds: dict[str, Any]) -> list[Any]:
     # injects a default time window that filters everything out.
     _kpi_time = {"time_range": "No filter"}
 
-    # Общие параметры топ-баров (dist_bar — легаси, но проверен этим же
-    # инстансом в player_overview.py; TODO мигрировать на echarts к Superset 5).
-    _bar = {
-        "order_desc": True,
+    # Общие параметры топ-баров: горизонтальный echarts-бар — имена целиком,
+    # значения справа не наезжают (вертикальный dist_bar сливал подписи).
+    # Сортировка по метрике задаётся per-чарт через x_axis_sort(_asc).
+    _hbar = {
+        "orientation": "horizontal",
         "show_legend": False,
-        "show_bar_value": True,
-        "x_ticks_layout": "45°",
-        "bottom_margin": 120,
+        "show_value": True,
+        "rich_tooltip": True,
     }
 
     # --- 0..3 KPI -----------------------------------------------------------
@@ -469,28 +476,32 @@ def _build_slices(ctx: _Ctx, vds: dict[str, Any]) -> list[Any]:
     ))
 
     slices.append(_make_slice(ctx,
-        "Реализация: голы − xG", "dist_bar", team,
+        "Реализация: голы − xG", "echarts_timeseries_bar", team,
         {
+            "x_axis": "team_name",
+            "x_axis_sort": "Голы − xG",
+            "x_axis_sort_asc": True,   # horizontal: лучшие сверху
             "metrics": [_metric(
                 "Голы − xG", "SUM", None,
                 sql="SUM(goals_fbref) - SUM(xg)",
             )],
-            "groupby": ["team_name"],
             "adhoc_filters": [_sql_where("xg IS NOT NULL")],
             "row_limit": 25,
-            **_bar,
+            **_hbar,
             "y_axis_format": "+.1f",
         },
     ))
 
     slices.append(_make_slice(ctx,
-        "PPDA: интенсивность прессинга", "dist_bar", team,
+        "PPDA: интенсивность прессинга", "echarts_timeseries_bar", team,
         {
+            "x_axis": "team_name",
+            "x_axis_sort": "PPDA",
+            "x_axis_sort_asc": False,  # меньше = агрессивнее, сверху
             "metrics": [_metric("PPDA", "AVG", "ppda")],
-            "groupby": ["team_name"],
             "adhoc_filters": [_sql_where("ppda IS NOT NULL")],
             "row_limit": 25,
-            **{**_bar, "order_desc": False},  # меньше = агрессивнее, слева
+            **_hbar,
             "y_axis_format": ".1f",
         },
     ))
@@ -533,49 +544,57 @@ def _build_slices(ctx: _Ctx, vds: dict[str, Any]) -> list[Any]:
 
     # --- 10..15 Игроки: топ-15 ----------------------------------------------
     slices.append(_make_slice(ctx,
-        "Топ-15 бомбардиров", "dist_bar", player,
+        "Топ-15 бомбардиров", "echarts_timeseries_bar", player,
         {
+            "x_axis": "player_name",
+            "x_axis_sort": "Голы",
+            "x_axis_sort_asc": True,
             "metrics": [_metric("Голы", "SUM", "goals")],
-            "groupby": ["player_name"],
             "row_limit": 15,
-            **_bar,
+            **_hbar,
             "y_axis_format": "SMART_NUMBER",
         },
     ))
 
     slices.append(_make_slice(ctx,
-        "Топ-15 по xG", "dist_bar", player,
+        "Топ-15 по xG", "echarts_timeseries_bar", player,
         {
+            "x_axis": "player_name",
+            "x_axis_sort": "xG",
+            "x_axis_sort_asc": True,
             "metrics": [_metric("xG", "SUM", "expected_goals")],
-            "groupby": ["player_name"],
             "adhoc_filters": [_sql_where("expected_goals IS NOT NULL")],
             "row_limit": 15,
-            **_bar,
+            **_hbar,
             "y_axis_format": ".1f",
         },
     ))
 
     slices.append(_make_slice(ctx,
-        "Топ-15 ассистентов", "dist_bar", player,
+        "Топ-15 ассистентов", "echarts_timeseries_bar", player,
         {
+            "x_axis": "player_name",
+            "x_axis_sort": "Ассисты",
+            "x_axis_sort_asc": True,
             "metrics": [_metric("Ассисты", "SUM", "assists")],
-            "groupby": ["player_name"],
             "row_limit": 15,
-            **_bar,
+            **_hbar,
             "y_axis_format": "SMART_NUMBER",
         },
     ))
 
     slices.append(_make_slice(ctx,
-        "Топ-15 по рейтингу SofaScore", "dist_bar", player,
+        "Топ-15 по рейтингу SofaScore", "echarts_timeseries_bar", player,
         {
+            "x_axis": "player_name",
+            "x_axis_sort": "Рейтинг",
+            "x_axis_sort_asc": True,
             "metrics": [_metric("Рейтинг", "AVG", "rating_sofascore")],
-            "groupby": ["player_name"],
             "adhoc_filters": [_sql_where(
                 "minutes >= 450 AND rating_sofascore IS NOT NULL"
             )],
             "row_limit": 15,
-            **_bar,
+            **_hbar,
             "y_axis_format": ".2f",
         },
     ))
@@ -583,28 +602,31 @@ def _build_slices(ctx: _Ctx, vds: dict[str, Any]) -> list[Any]:
     # MAX, не SUM: при выборе нескольких сезонов SUM суммировал бы оценки
     # игрока по сезонам.
     slices.append(_make_slice(ctx,
-        "Топ-15 по трансферной стоимости (€)", "dist_bar", player,
+        "Топ-15 по трансферной стоимости (€)", "echarts_timeseries_bar", player,
         {
+            "x_axis": "player_name",
+            "x_axis_sort": "Стоимость (€)",
+            "x_axis_sort_asc": True,
             "metrics": [_metric("Стоимость (€)", "MAX", "market_value_eur")],
-            "groupby": ["player_name"],
             "adhoc_filters": [_sql_where("market_value_eur IS NOT NULL")],
             "row_limit": 15,
-            **_bar,
+            **_hbar,
             "y_axis_format": ".2s",
         },
     ))
 
     slices.append(_make_slice(ctx,
-        "Топ-15 по зарплате (€/год)", "dist_bar", player,
+        "Топ-15 по зарплате (€/год)", "echarts_timeseries_bar", player,
         {
-            # IS NOT NULL обязателен: на сезонах без Capology (всё, кроме 2526)
-            # метрика из сплошных NULL роняет legacy dist_bar 500-й ошибкой;
-            # с фильтром пустой сезон даёт чистое «No results».
+            # IS NOT NULL: на сезонах без Capology (всё, кроме 2526) метрика —
+            # сплошные NULL; с фильтром пустой сезон даёт чистое «No results».
+            "x_axis": "player_name",
+            "x_axis_sort": "Зарплата (€/год)",
+            "x_axis_sort_asc": True,
             "metrics": [_metric("Зарплата (€/год)", "MAX", "annual_gross_eur")],
-            "groupby": ["player_name"],
             "adhoc_filters": [_sql_where("annual_gross_eur IS NOT NULL")],
             "row_limit": 15,
-            **_bar,
+            **_hbar,
             "y_axis_format": ".2s",
         },
     ))
@@ -651,30 +673,34 @@ def _build_slices(ctx: _Ctx, vds: dict[str, Any]) -> list[Any]:
     ))
 
     slices.append(_make_slice(ctx,
-        "Топ-15 по big chances created", "dist_bar", player,
+        "Топ-15 по big chances created", "echarts_timeseries_bar", player,
         {
+            "x_axis": "player_name",
+            "x_axis_sort": "Big chances created",
+            "x_axis_sort_asc": True,
             "metrics": [_metric("Big chances created", "SUM", "big_chances_created")],
-            "groupby": ["player_name"],
             "adhoc_filters": [_sql_where("big_chances_created IS NOT NULL")],
             "row_limit": 15,
-            **_bar,
+            **_hbar,
             "y_axis_format": "SMART_NUMBER",
         },
     ))
 
     slices.append(_make_slice(ctx,
-        "Финишеры: голы − xG", "dist_bar", player,
+        "Финишеры: голы − xG", "echarts_timeseries_bar", player,
         {
+            "x_axis": "player_name",
+            "x_axis_sort": "Голы − xG",
+            "x_axis_sort_asc": True,
             "metrics": [_metric(
                 "Голы − xG", "SUM", None,
                 sql="SUM(goals) - SUM(expected_goals)",
             )],
-            "groupby": ["player_name"],
             "adhoc_filters": [_sql_where(
                 "minutes >= 450 AND expected_goals IS NOT NULL"
             )],
             "row_limit": 15,
-            **_bar,
+            **_hbar,
             "y_axis_format": "+.1f",
         },
     ))
@@ -687,7 +713,11 @@ def _build_slices(ctx: _Ctx, vds: dict[str, Any]) -> list[Any]:
             "all_columns": [
                 "player_name", "team_name", "primary_position",
                 "matches", "minutes", "goals", "assists",
-                "expected_goals", "expected_assists", "rating_sofascore",
+                "expected_goals", "expected_assists",
+                "shots", "shots_on_target", "key_passes",
+                "big_chances_created", "successful_dribbles",
+                "tackles_won", "interceptions",
+                "yellow_cards", "red_cards", "rating_sofascore",
                 "total_duels_won_pct", "take_on_pct",
                 "market_value_eur", "annual_gross_eur",
                 "contract_status", "contract_until",
@@ -699,6 +729,7 @@ def _build_slices(ctx: _Ctx, vds: dict[str, Any]) -> list[Any]:
             "column_config": {
                 "expected_goals": {"d3NumberFormat": ".1f"},
                 "expected_assists": {"d3NumberFormat": ".1f"},
+                "big_chances_created": {"d3NumberFormat": ".0f"},
                 "rating_sofascore": {"d3NumberFormat": ".2f"},
                 "total_duels_won_pct": {"d3NumberFormat": ".1f"},
                 "take_on_pct": {"d3NumberFormat": ".1f"},
@@ -778,38 +809,40 @@ def _build_position_json(slices: list[Any]) -> dict[str, Any]:
     ))
     children.append(_row([_chart(slices[i], 3, height=25) for i in range(0, 4)]))
 
+    # Высоты markdown: 1 юнит ≈ 8px; H2 + строка текста не влезают в 3-4 юнита
+    # (текст обрезался) — блокам с подзаголовком нужно ~12.
     children.append(_markdown(
-        "## Таблица лиги\n"
+        "## Таблица лиги\n\n"
         "«Сверх-очки» = очки − xPTS (Understat): плюс — команда набирает больше, "
         "чем заслуживает по качеству моментов (везёт), минус — недобирает.",
-        height=4,
+        height=12,
     ))
     children.append(_row([_chart(slices[4], 12, height=70)]))
 
-    children.append(_markdown("## Команды", height=3))
+    children.append(_markdown("## Команды", height=8))
     children.append(_row([_chart(slices[5], 6, height=55), _chart(slices[6], 6, height=55)]))
     children.append(_row([_chart(slices[7], 6, height=55), _chart(slices[8], 6, height=55)]))
 
     children.append(_markdown(
-        "## Динамика силы — Elo\n"
+        "## Динамика силы — Elo\n\n"
         "Недельное среднее ClubElo в границах выбранного сезона.",
-        height=3,
+        height=12,
     ))
     children.append(_row([_chart(slices[9], 12, height=60)]))
 
     children.append(_markdown(
-        "## Игроки — топы\n"
+        "## Игроки — топы\n\n"
         "⚠️ Зарплаты (Capology) есть только для сезона 2025/26 — "
         "на других сезонах бар зарплат и колонки зарплат пусты.",
-        height=4,
+        height=12,
     ))
     children.append(_row([_chart(slices[i], 4, height=50) for i in range(10, 13)]))
     children.append(_row([_chart(slices[i], 4, height=50) for i in range(13, 16)]))
 
     children.append(_markdown(
-        "## Аналитика игроков\n"
+        "## Аналитика игроков\n\n"
         "Scatter'ы — минимум 270 сыгранных минут; рейтинг и «финишеры» — минимум 450.",
-        height=3,
+        height=12,
     ))
     children.append(_row([_chart(slices[16], 6, height=60), _chart(slices[17], 6, height=60)]))
     children.append(_row([_chart(slices[18], 6, height=50), _chart(slices[19], 6, height=50)]))
