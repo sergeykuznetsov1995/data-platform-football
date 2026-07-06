@@ -353,42 +353,96 @@ LEFT JOIN tm
 
     # Трансферы (грейн = сделка). team_name-колонки нет — фильтр «Команда»
     # к этим чартам не применяется (generic scope по колонкам).
+    # fct_transfer.season = окно СКРЕЙПА (TM отдаёт всю карьеру игрока), не
+    # сезон сделки — season здесь пересчитан из transfer_date (июль—июнь);
+    # иначе «Топ покупок сезона» показывал топ сделок за всю карьеру.
+    # Имена tm_*-орфанов (U21 и т.п., нет в dim_player) добираются из
+    # silver.transfermarkt_players по сырому TM id (покрытие 1324/1325).
     v_transfer = """\
-SELECT
-  t.player_id,
-  COALESCE(dp.player_name, t.player_id) AS player_name,
-  t.transfer_date,
-  COALESCE(dtf.team_name, t.from_club_name) AS from_club,
-  COALESCE(dtt.team_name, t.to_club_name) AS to_club,
-  t.fee_eur,
-  t.market_value_at_transfer_eur,
-  CASE WHEN t.is_loan THEN 'аренда' ELSE 'трансфер' END AS transfer_type,
-  t.league, t.season
-FROM iceberg.gold.fct_transfer t
-LEFT JOIN iceberg.gold.dim_player dp ON dp.player_id = t.player_id
-LEFT JOIN iceberg.gold.dim_team dtf ON dtf.team_id = t.from_team_id
-LEFT JOIN iceberg.gold.dim_team dtt ON dtt.team_id = t.to_team_id
-WHERE NOT t.is_upcoming"""
+WITH tm_names AS (
+  SELECT player_id, name,
+         ROW_NUMBER() OVER (
+           PARTITION BY player_id ORDER BY _bronze_ingested_at DESC
+         ) AS rn
+  FROM iceberg.silver.transfermarkt_players
+),
+base AS (
+  SELECT
+    t.player_id,
+    COALESCE(dp.player_name, tn.name, t.player_id) AS player_name,
+    t.transfer_date,
+    COALESCE(dtf.team_name, t.from_club_name) AS from_club,
+    COALESCE(dtt.team_name, t.to_club_name) AS to_club,
+    t.fee_eur,
+    t.market_value_at_transfer_eur,
+    CASE WHEN t.is_loan THEN 'аренда' ELSE 'трансфер' END AS transfer_type,
+    t.league,
+    CASE WHEN MONTH(t.transfer_date) >= 7
+         THEN LPAD(CAST(YEAR(t.transfer_date) % 100 AS varchar), 2, '0')
+              || LPAD(CAST((YEAR(t.transfer_date) + 1) % 100 AS varchar), 2, '0')
+         ELSE LPAD(CAST((YEAR(t.transfer_date) - 1) % 100 AS varchar), 2, '0')
+              || LPAD(CAST(YEAR(t.transfer_date) % 100 AS varchar), 2, '0')
+    END AS season
+  FROM iceberg.gold.fct_transfer t
+  LEFT JOIN iceberg.gold.dim_player dp ON dp.player_id = t.player_id
+  LEFT JOIN tm_names tn
+    ON  tn.rn = 1
+    AND SUBSTR(t.player_id, 1, 3) = 'tm_'
+    AND tn.player_id = SUBSTR(t.player_id, 4)
+  LEFT JOIN iceberg.gold.dim_team dtf ON dtf.team_id = t.from_team_id
+  LEFT JOIN iceberg.gold.dim_team dtt ON dtt.team_id = t.to_team_id
+  WHERE NOT t.is_upcoming
+)
+SELECT b.*, b.player_name || ' → ' || b.to_club AS deal
+FROM base b"""
 
     # Таймлайн стоимости (TM) в окне сезона. Чарт режет серии series-limit'ом
     # (топ-10 по пиковой стоимости) — лимит применяется ПОСЛЕ фильтров, так
     # что выбранный в фильтре «Игрок» показывается, даже если он не из топа.
+    # As-of на МЕСЯЧНОЙ сетке (forward-fill), не сырые даты оценок: TM
+    # оценивает игроков в разные дни 2-4 раза за сезон, а ECharts выравнивает
+    # серии на общую X-сетку — у игрока с 1-2 оценками линии не было вовсе
+    # (одинокие маркеры, «игроки пропадают»).
     v_player_mv = """\
+WITH months AS (
+  SELECT ds.season, m AS month_date
+  FROM iceberg.gold.dim_season ds
+  CROSS JOIN UNNEST(SEQUENCE(
+    DATE_TRUNC('month', ds.start_date),
+    DATE_TRUNC('month', ds.end_date),
+    INTERVAL '1' MONTH
+  )) AS t(m)
+  WHERE m <= CURRENT_DATE
+),
+pts AS (
+  SELECT DISTINCT player_id, valuation_date, market_value_eur
+  FROM iceberg.gold.fct_player_market_value
+  WHERE source = 'transfermarkt'
+),
+grid AS (
+  SELECT
+    ps.player_id, ps.team_id, ps.league, ps.season, m.month_date,
+    p.market_value_eur,
+    ROW_NUMBER() OVER (
+      PARTITION BY ps.player_id, ps.league, ps.season, m.month_date
+      ORDER BY p.valuation_date DESC
+    ) AS rn
+  FROM iceberg.gold.fct_player_season_stats ps
+  JOIN months m ON m.season = ps.season
+  LEFT JOIN pts p
+    ON  p.player_id = ps.player_id
+    AND p.valuation_date <= LAST_DAY_OF_MONTH(m.month_date)
+)
 SELECT
-  ps.player_id,
-  COALESCE(dp.player_name, ps.player_id) AS player_name,
+  g.player_id,
+  COALESCE(dp.player_name, g.player_id) AS player_name,
   REGEXP_EXTRACT(dp.primary_position, '^([A-Z]{2})') AS position_primary,
-  COALESCE(dt.team_name, ps.team_id) AS team_name,
-  ps.league, ps.season,
-  h.valuation_date, h.market_value_eur
-FROM iceberg.gold.fct_player_season_stats ps
-JOIN iceberg.gold.dim_season ds ON ds.season = ps.season
-JOIN iceberg.gold.fct_player_market_value h
-  ON  h.player_id = ps.player_id
-  AND h.source = 'transfermarkt'
-  AND h.valuation_date BETWEEN ds.start_date AND ds.end_date
-LEFT JOIN iceberg.gold.dim_player dp ON dp.player_id = ps.player_id
-LEFT JOIN iceberg.gold.dim_team   dt ON dt.team_id = ps.team_id"""
+  COALESCE(dt.team_name, g.team_id) AS team_name,
+  g.league, g.season, g.month_date, g.market_value_eur
+FROM grid g
+LEFT JOIN iceberg.gold.dim_player dp ON dp.player_id = g.player_id
+LEFT JOIN iceberg.gold.dim_team   dt ON dt.team_id = g.team_id
+WHERE g.rn = 1 AND g.market_value_eur IS NOT NULL"""
 
     # По-туровая форма команд: кумулятивные очки + скользящий xG-баланс.
     # Окна строго ORDER BY gameweek (не по дате!): ось чартов — тур, и
@@ -486,7 +540,11 @@ LEFT JOIN iceberg.gold.dim_team   dt ON dt.team_id = k.team_id"""
         "from_club": "Откуда", "to_club": "Куда",
         "fee_eur": "Сумма (€)",
         "market_value_at_transfer_eur": "Стоимость на момент (€)",
-        "transfer_type": "Тип",
+        "transfer_type": "Тип", "deal": "Сделка",
+    }
+    mv_labels = {
+        "player_name": "Игрок", "team_name": "Клуб",
+        "month_date": "Месяц", "market_value_eur": "Стоимость (€)",
     }
     keeper_labels = {
         "player_name": "Вратарь", "team_name": "Клуб",
@@ -517,7 +575,8 @@ LEFT JOIN iceberg.gold.dim_team   dt ON dt.team_id = k.team_id"""
             labels=transfer_labels,
         ),
         "v_lo_player_mv": _ensure_virtual_dataset(
-            ctx, database, schema, "v_lo_player_mv", v_player_mv
+            ctx, database, schema, "v_lo_player_mv", v_player_mv,
+            labels=mv_labels,
         ),
         "v_lo_team_form": _ensure_virtual_dataset(
             ctx, database, schema, "v_lo_team_form", v_team_form
@@ -559,6 +618,15 @@ def _build_slices(ctx: _Ctx, vds: dict[str, Any]) -> list[Any]:
         "show_legend": False,
         "show_value": True,
         "rich_tooltip": True,
+    }
+
+    # Тултип line-чартов: только абсолютные значения. Дефолтные Total и «доля
+    # от Total» бессмысленны для Elo/кумулятивных очков, а на метриках с
+    # суммой около нуля (скользящий xG-баланс) доля взрывалась до 10^17 %.
+    _line_tt = {
+        "rich_tooltip": True,
+        "showTooltipTotal": False,
+        "showTooltipPercentage": False,
     }
 
     # --- 0..3 KPI -----------------------------------------------------------
@@ -709,7 +777,7 @@ def _build_slices(ctx: _Ctx, vds: dict[str, Any]) -> list[Any]:
             "groupby": ["team_name"],
             "row_limit": 50000,
             "show_legend": True,
-            "rich_tooltip": True,
+            **_line_tt,
             "truncateYAxis": True,  # без этого ось от 0 сжимает линии в полосу
             "x_axis_title": "Дата",
             "y_axis_title": "Elo (ClubElo)",
@@ -921,17 +989,20 @@ def _build_slices(ctx: _Ctx, vds: dict[str, Any]) -> list[Any]:
     ))
 
     # --- 21..26 Вкладка «Трансферы и деньги» -----------------------------------
+    # Ось — «Игрок → Клуб» (deal), не игрок: два перехода одного игрока в
+    # одном окне (лето + зима) остаются двумя отдельными планками.
     slices.append(_make_slice(ctx,
         "Топ-15 покупок сезона (€)", "echarts_timeseries_bar", transfer,
         {
-            "x_axis": "player_name",
+            "x_axis": "deal",
             "x_axis_sort": "Сумма (€)",
             "x_axis_sort_asc": True,
             "metrics": [_metric("Сумма (€)", "MAX", "fee_eur")],
             "adhoc_filters": [_sql_where("fee_eur IS NOT NULL")],
             "row_limit": 15,
             **_hbar,
-            "y_axis_format": ".2s",
+            # .3s, не .2s: суммы сделок некруглые (145M превращалось в «150M»)
+            "y_axis_format": ".3s",
         },
     ))
 
@@ -957,7 +1028,7 @@ def _build_slices(ctx: _Ctx, vds: dict[str, Any]) -> list[Any]:
         player_mv,
         {
             "time_range": "No filter",
-            "x_axis": "valuation_date",
+            "x_axis": "month_date",
             "metrics": [_metric("Стоимость (€)", "MAX", "market_value_eur")],
             "groupby": ["player_name"],
             "limit": 10,
@@ -966,9 +1037,9 @@ def _build_slices(ctx: _Ctx, vds: dict[str, Any]) -> list[Any]:
             ),
             "row_limit": 50000,
             "show_legend": True,
-            "rich_tooltip": True,
+            **_line_tt,
             "truncateYAxis": True,
-            "x_axis_title": "Дата оценки (Transfermarkt)",
+            "x_axis_title": "Месяц (as-of оценка Transfermarkt)",
             "y_axis_format": ".2s",
         },
     ))
@@ -985,7 +1056,7 @@ def _build_slices(ctx: _Ctx, vds: dict[str, Any]) -> list[Any]:
             "adhoc_filters": [_sql_where("squad_market_value_eur IS NOT NULL")],
             "row_limit": 5000,
             "show_legend": True,
-            "rich_tooltip": True,
+            **_line_tt,
             "x_axis_title": "Сезон (дата старта)",
             "y_axis_format": ".2s",
         },
@@ -1001,7 +1072,7 @@ def _build_slices(ctx: _Ctx, vds: dict[str, Any]) -> list[Any]:
             "adhoc_filters": [_sql_where("payroll_annual_gross_eur IS NOT NULL")],
             "row_limit": 5000,
             "show_legend": True,
-            "rich_tooltip": True,
+            **_line_tt,
             "x_axis_title": "Сезон (дата старта)",
             "y_axis_format": ".2s",
         },
@@ -1042,7 +1113,7 @@ def _build_slices(ctx: _Ctx, vds: dict[str, Any]) -> list[Any]:
             "adhoc_filters": [_sql_where("gameweek IS NOT NULL")],
             "row_limit": 50000,
             "show_legend": True,
-            "rich_tooltip": True,
+            **_line_tt,
             "x_axis_title": "Тур",
             "y_axis_format": ".0f",
         },
@@ -1061,7 +1132,7 @@ def _build_slices(ctx: _Ctx, vds: dict[str, Any]) -> list[Any]:
             "adhoc_filters": [_sql_where("xg IS NOT NULL AND gameweek IS NOT NULL")],
             "row_limit": 50000,
             "show_legend": True,
-            "rich_tooltip": True,
+            **_line_tt,
             "truncateYAxis": True,
             "x_axis_title": "Тур",
             "y_axis_format": "+.2f",
@@ -1085,7 +1156,7 @@ def _build_slices(ctx: _Ctx, vds: dict[str, Any]) -> list[Any]:
             )],
             "row_limit": 50000,
             "show_legend": True,
-            "rich_tooltip": True,
+            **_line_tt,
             "truncateYAxis": True,
             "x_axis_title": "Тур",
             "y_axis_format": ".2f",
@@ -1110,7 +1181,7 @@ def _build_slices(ctx: _Ctx, vds: dict[str, Any]) -> list[Any]:
             "adhoc_filters": [_sql_where("gameweek IS NOT NULL")],
             "row_limit": 50000,
             "show_legend": True,
-            "rich_tooltip": True,
+            **_line_tt,
             "x_axis_title": "Тур",
             "y_axis_format": ".2f",
         },
@@ -1323,14 +1394,16 @@ def _build_position_json(slices: list[Any]) -> dict[str, Any]:
     c, p = _tab("money", "Трансферы и деньги")
     c.append(_markdown(p,
         "## Трансферы и деньги\n\n"
-        "Суммы сделок публичны примерно у каждой шестой (Transfermarkt); "
-        "баланс клуба = доход − расход за сезонное окно.",
+        "Сезон сделки = трансферное окно июль—июнь (переход 1 июля 2026 — "
+        "уже сезон 2026/27). Суммы сделок публичны примерно у каждой шестой "
+        "(Transfermarkt); баланс клуба = доход − расход за сезонное окно.",
     ))
     c.append(_row(p, [_chart(slices[21], 6, height=55), _chart(slices[22], 6, height=55)]))
     c.append(_markdown(p,
         "## Динамика стоимости\n\n"
         "Топ-10 сезона по пиковой стоимости; выбери игрока в фильтре «Игрок», "
-        "чтобы посмотреть его линию. Графики «по сезонам» не зависят от фильтра «Сезон».",
+        "чтобы посмотреть его линию. Точка месяца = последняя оценка "
+        "Transfermarkt на его конец. Графики «по сезонам» не зависят от фильтра «Сезон».",
     ))
     c.append(_row(p, [_chart(slices[23], 12, height=55)]))
     c.append(_row(p, [_chart(slices[24], 6, height=55), _chart(slices[25], 6, height=55)]))
