@@ -74,10 +74,15 @@ _CLUB_COACH_HISTORY_PATH = (
     "/{club_slug}/mitarbeiterhistorie/verein/{club_id}/plus/1"
 )
 
-# Canonical league-slug + competition-id mapping. MVP: APL only. Extend with
-# {'ESP-La Liga': ('laliga', 'ES1'), ...} when the issue's scope widens.
+# Canonical league-slug + competition-id mapping. Top-5 European leagues.
+# The {comp_id} (wettbewerb/GB1…) is the load-bearing key; the {league_slug}
+# is cosmetic in the URL. Codes are the long-stable Transfermarkt comp ids.
 TM_LEAGUE_MAP: Dict[str, Tuple[str, str]] = {
     'ENG-Premier League': ('premier-league', 'GB1'),
+    'ESP-La Liga': ('laliga', 'ES1'),
+    'GER-Bundesliga': ('bundesliga', 'L1'),
+    'ITA-Serie A': ('serie-a', 'IT1'),
+    'FRA-Ligue 1': ('ligue-1', 'FR1'),
 }
 
 R0_2B_FALLBACK_MARKER = 'TM_FALLBACK'
