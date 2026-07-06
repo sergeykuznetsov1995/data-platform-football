@@ -1,0 +1,22 @@
+{
+  "rootGroups": [
+    {
+      "name": "machine",
+      "softMemoryLimit": "100%",
+      "hardConcurrencyLimit": 60,
+      "maxQueued": 200
+    },
+    {
+      "name": "humans",
+      "softMemoryLimit": "30%",
+      "hardConcurrencyLimit": 8,
+      "maxQueued": 50,
+      "schedulingPolicy": "fair"
+    }
+  ],
+  "selectors": [
+    { "user": "airflow|superset|openmetadata", "group": "machine" },
+    { "userGroup": "platform-admins", "group": "machine" },
+    { "group": "humans" }
+  ]
+}

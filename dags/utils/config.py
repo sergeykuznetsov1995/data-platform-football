@@ -47,6 +47,17 @@ WHOSCORED_LEAGUES: List[str] = [
     'FRA-Ligue 1',
 ]
 
+# Understat multi-league scope. Independent of the global LEAGUES for the same
+# reason as WHOSCORED_LEAGUES (flipping LEAGUES switches every source at once).
+# Extending is a deliberate step: first run per new league backfills ~380
+# match JSONs (~5 KB wire each ≈ 2 MB) + the league JSON — direct traffic, no
+# proxy; steady-state is "new matches only" (persistent soccerdata_cache).
+# Understat covers the top-5 leagues out of the box; RUS-Premier League needs a
+# custom soccerdata league_dict.json first (see UnderstatScraper.SUPPORTED_LEAGUES).
+UNDERSTAT_LEAGUES: List[str] = [
+    'ENG-Premier League',
+]
+
 # MatchHistory (football-data.co.uk) multi-league scope. Independent of the
 # global LEAGUES for the same reason as WHOSCORED_LEAGUES. Cheapest source on
 # the platform: one season CSV ≈ 200 KB per league, fetched directly (no

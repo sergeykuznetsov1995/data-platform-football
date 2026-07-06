@@ -366,6 +366,59 @@ class TestWhoScoredScrapeEventsViaFlaresolverr:
         assert save_mock.called
         assert result == {'events': 'iceberg.bronze.whoscored_events'}
 
+    def test_events_flush_serializes_qualifiers_lists(
+        self, mock_base_dependencies, mock_enhanced_whoscored
+    ):
+        """Regression: the events save path must JSON-encode list columns
+        (``qualifiers``) like the schedule path does, otherwise
+        ``trino_manager._format_sql_value`` calls ``pd.isna(list)`` and crashes
+        with "truth value of an empty array is ambiguous" on old-season events
+        whose first event carries an empty ``qualifiers`` list."""
+        from scrapers.whoscored import scraper as scraper_mod
+        from scrapers.whoscored import events_fetcher as ef_mod
+        from scrapers.whoscored import WhoScoredScraper
+
+        meta = [_make_meta_row(9, 'ENG-Premier League', '2425', 'g9')]
+        scraper = WhoScoredScraper(leagues=['ENG-Premier League'], seasons=[2024])
+
+        def _events_df_qual(data, **kw):
+            idx = pd.MultiIndex.from_tuples(
+                [('ENG-Premier League', '2425', 'g9')],
+                names=['league', 'season', 'game'],
+            )
+            return pd.DataFrame(
+                {
+                    'game_id': [kw['game_id']],
+                    'type': ['Goal'],
+                    'qualifiers': [[]],  # empty list — the crashing shape
+                },
+                index=idx,
+            )
+
+        save_mock = MagicMock(return_value='iceberg.bronze.whoscored_events')
+        with patch.object(
+            scraper, '_read_events_metadata_from_bronze', return_value=meta
+        ), patch.object(
+            scraper, '_fetch_existing_event_game_ids', return_value=set()
+        ), patch.object(scraper, '_close_reader'), patch.object(
+            scraper, 'save_to_iceberg', save_mock
+        ), patch.object(
+            scraper_mod, 'FlareSolverrClient',
+            MagicMock(return_value=MagicMock()),
+        ), patch.object(
+            ef_mod, 'fetch_match_events_via_flaresolverr',
+            MagicMock(return_value={'events': [{}]}),
+        ), patch.object(
+            ef_mod, 'parse_matchcentre_to_events_df',
+            MagicMock(side_effect=_events_df_qual),
+        ):
+            scraper.scrape_events(match_ids=[9], chunk_size=1)
+
+        assert save_mock.called
+        saved_df = save_mock.call_args.kwargs['df']
+        # qualifiers must reach save as a JSON string, not a Python list.
+        assert saved_df['qualifiers'].tolist() == ['[]']
+
     def test_session_recycle_every_n_matches(
         self, mock_base_dependencies, mock_enhanced_whoscored, monkeypatch
     ):

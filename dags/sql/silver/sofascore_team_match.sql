@@ -57,7 +57,29 @@
 --     against re-ingests (replace_partitions=True should keep this 1:1).
 -- =============================================================================
 
-WITH stats_dedup AS (
+-- #840: Bronze is now auto-passthrough (source-key names per statisticsItem).
+-- Rename/derive here; COALESCE(old, new) bridges pre-#840 partitions. "key" is a
+-- Trino reserved word → double-quoted.
+WITH src AS (
+    SELECT
+        match_id,
+        period,
+        stat_group,
+        COALESCE(stat_name, name)                       AS stat_name,
+        COALESCE(stat_key, "key", statistics_type)      AS stat_key,
+        home_value,
+        away_value,
+        COALESCE(home_text, CAST(home AS varchar))      AS home_text,
+        COALESCE(away_text, CAST(away AS varchar))      AS away_text,
+        compare_code,
+        value_type,
+        _ingested_at,
+        league,
+        season
+    FROM iceberg.bronze.sofascore_match_stats
+),
+
+stats_dedup AS (
     SELECT *
     FROM (
         SELECT
@@ -66,7 +88,7 @@ WITH stats_dedup AS (
                 PARTITION BY match_id, period, stat_key
                 ORDER BY _ingested_at DESC
             ) AS rn
-        FROM iceberg.bronze.sofascore_match_stats b
+        FROM src b
         WHERE match_id IS NOT NULL
           AND period = 'ALL'
     )
@@ -157,12 +179,15 @@ schedule_dim AS (
     -- snapshots of one game_id with different scores (live 0:0 vs final 2:1)
     -- both survive DISTINCT → ×2 fan-out in home_side/away_side. Take the
     -- freshest by _ingested_at (= final score); _batch_id breaks ties (#464).
+    -- #840: Bronze auto-passthrough (source-key names). COALESCE(old,new)
+    -- bridges pre-#840 partitions: home_team->home_team_name,
+    -- home_score->home_score_current.
     SELECT
-        CAST(game_id AS varchar)   AS match_id,
-        CAST(home_team AS varchar) AS home_team_id,
-        CAST(away_team AS varchar) AS away_team_id,
-        CAST(home_score AS INTEGER) AS home_score,
-        CAST(away_score AS INTEGER) AS away_score,
+        CAST(game_id AS varchar)                                  AS match_id,
+        CAST(COALESCE(home_team, home_team_name) AS varchar)      AS home_team_id,
+        CAST(COALESCE(away_team, away_team_name) AS varchar)      AS away_team_id,
+        CAST(COALESCE(home_score, home_score_current) AS INTEGER) AS home_score,
+        CAST(COALESCE(away_score, away_score_current) AS INTEGER) AS away_score,
         league,
         season
     FROM (
@@ -172,8 +197,8 @@ schedule_dim AS (
                    ORDER BY _ingested_at DESC, _batch_id DESC
                ) AS rn
         FROM iceberg.bronze.sofascore_schedule
-        WHERE home_score IS NOT NULL
-          AND away_score IS NOT NULL
+        WHERE COALESCE(home_score, home_score_current) IS NOT NULL
+          AND COALESCE(away_score, away_score_current) IS NOT NULL
           AND game_id IS NOT NULL
     )
     WHERE rn = 1
