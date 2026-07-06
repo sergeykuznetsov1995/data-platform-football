@@ -427,6 +427,8 @@ services:
       # OAuth2 (SSO людей через Keycloak; машинные аккаунты — по-прежнему password.db)
       - TRINO_OIDC_CLIENT_SECRET=${TRINO_OIDC_CLIENT_SECRET}
       - TRINO_OAUTH2_ISSUER=${OIDC_ISSUER:-https://${TS_HOSTNAME}:8443/realms/football}
+      # Фикс. ключ шифрования refresh-токенов (иначе рестарт Trino разлогинивает людей)
+      - TRINO_OAUTH2_REFRESH_KEY=${TRINO_OAUTH2_REFRESH_KEY}
     ports:
       - "127.0.0.1:8082:8443"
       - "[::1]:8082:8443"
@@ -454,9 +456,11 @@ services:
           # write load (#847): JVM RSS = 3.5G heap + parquet/direct buffers +
           # metaspace + code cache > 5G; the kernel kills java, the launcher
           # (PID 1) exits 0, so Docker never sets OOMKilled — it looks like an
-          # external restart. 8G leaves ~4G native headroom over the 4G heap
-          # (configs/trino/jvm.config).
-          memory: 8G
+          # external restart. 8G left ~4G native headroom over the 4G heap
+          # (configs/trino/jvm.config) — but OpenMetadata table profiling
+          # (heavy profile) pushed RSS to 8.3G and OOM'd twice; 12G covers the
+          # profiling-driven off-heap spikes.
+          memory: 12G
         reservations:
           memory: 1G
 
