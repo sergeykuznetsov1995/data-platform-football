@@ -18,6 +18,78 @@ from scrapers.base.base_scraper import SoccerdataScraper
 logger = logging.getLogger(__name__)
 
 
+def _install_understat_roster_patch() -> None:
+    """Patch soccerdata 1.8.8's Understat._read_match for list-shaped rosters.
+
+    Understat's per-match ``rosters["h"]/["a"]`` are normally a dict keyed by
+    player id, but for some matches (observed GER-Bundesliga 2024/25) the site
+    returns a *list* instead. Stock ``_read_match`` does
+    ``next(iter(rosters[side].values()))`` and downstream code iterates
+    ``rostersData.values()`` — both raise ``'list' object has no attribute
+    'values'`` and kill the whole shots / player_match_stats scrape. We
+    normalize a list roster to a dict keyed by player id so both this method and
+    its downstream consumers parse cleanly. Faithful reimplementation of the
+    v1.8.8 method with only that normalization added; applied once at import.
+    """
+    import json
+
+    try:
+        import soccerdata.understat as _us
+    except Exception:
+        # soccerdata not importable as a real package (e.g. mocked in unit
+        # tests). The patch is a runtime-only fix; skip silently.
+        return
+
+    if getattr(_us.Understat, "_dpf_roster_patch", False):
+        return
+
+    def _read_match(self, url, match_id):
+        self._ensure_cookies()
+        try:
+            api_url = _us.UNDERSTAT_URL + f"/getMatchData/{match_id}"
+            filepath = self.data_dir / f"match_{match_id}.json"
+            reader = self._request_api(api_url, filepath)
+            data = json.load(reader)
+
+            home_team_name = self._extract_team_name(data["tmpl"]["home"])
+            away_team_name = self._extract_team_name(data["tmpl"]["away"])
+            rosters = data["rosters"]
+            # Normalize list-shaped rosters to a dict keyed by player id.
+            for side in ("h", "a"):
+                if isinstance(rosters.get(side), list):
+                    rosters[side] = {
+                        str(p.get("id", i)): p
+                        for i, p in enumerate(rosters[side])
+                    }
+            # A match with an empty roster (a data-less fixture that slipped the
+            # schedule filter) has no usable team ids — skip it like a failed
+            # fetch; the callers do ``if data is None: continue``.
+            if not rosters.get("h") or not rosters.get("a"):
+                return None
+            home_team_id = next(iter(rosters["h"].values()))["team_id"]
+            away_team_id = next(iter(rosters["a"].values()))["team_id"]
+
+            match_info = {
+                "h": home_team_id,
+                "a": away_team_id,
+                "team_h": home_team_name,
+                "team_a": away_team_name,
+            }
+            return {
+                "match_info": match_info,
+                "rostersData": rosters,
+                "shotsData": data["shots"],
+            }
+        except ConnectionError:
+            return None
+
+    _us.Understat._read_match = _read_match
+    _us.Understat._dpf_roster_patch = True
+
+
+_install_understat_roster_patch()
+
+
 class UnderstatScraper(SoccerdataScraper):
     """
     Scraper for Understat xG statistics.
