@@ -754,3 +754,242 @@ class TestSignalHandlers:
 
         assert exc.value.code == 143
         assert scraper.__exit__.called
+
+
+class TestCompletedScheduleLeagues:
+    """Issue #877: Trino probe for already-backfilled schedule seasons."""
+
+    def _fake_conn(self, rows=None, raise_exc=None):
+        cursor = MagicMock()
+        if raise_exc is not None:
+            cursor.execute.side_effect = raise_exc
+        cursor.fetchall.return_value = rows or []
+        conn = MagicMock()
+        conn.cursor.return_value = cursor
+        return conn, cursor
+
+    @pytest.mark.unit
+    def test_league_at_or_above_floor_is_complete(self):
+        import dags.scripts.run_fbref_scraper as m
+
+        conn, cursor = self._fake_conn(
+            rows=[('ESP-La Liga', 380), ('GER-Bundesliga', 120)]
+        )
+        with patch.object(m, '_trino_connect', return_value=conn):
+            done = m._completed_schedule_leagues(
+                ['ESP-La Liga', 'GER-Bundesliga'], 2018
+            )
+
+        assert done == {'ESP-La Liga'}
+        sql = cursor.execute.call_args.args[0]
+        assert 'bronze.fbref_schedule' in sql
+        assert cursor.execute.call_args.args[1][0] == 2018
+
+    @pytest.mark.unit
+    def test_floor_overridable_via_env(self, monkeypatch):
+        import dags.scripts.run_fbref_scraper as m
+
+        monkeypatch.setenv('FBREF_SCHEDULE_MIN_ROWS', '400')
+        conn, _ = self._fake_conn(rows=[('ESP-La Liga', 380)])
+        with patch.object(m, '_trino_connect', return_value=conn):
+            done = m._completed_schedule_leagues(['ESP-La Liga'], 2018)
+
+        assert done == set()
+
+    @pytest.mark.unit
+    def test_fail_open_on_trino_error(self):
+        import dags.scripts.run_fbref_scraper as m
+
+        conn, _ = self._fake_conn(raise_exc=RuntimeError('trino down'))
+        with patch.object(m, '_trino_connect', return_value=conn):
+            done = m._completed_schedule_leagues(['ESP-La Liga'], 2018)
+
+        assert done == set()
+
+    @pytest.mark.unit
+    def test_fail_open_when_no_connection(self):
+        import dags.scripts.run_fbref_scraper as m
+
+        with patch.object(m, '_trino_connect', return_value=None):
+            done = m._completed_schedule_leagues(['ESP-La Liga'], 2018)
+
+        assert done == set()
+
+
+class TestSkipExisting:
+    """Issue #877: --skip-existing must avoid re-fetching complete schedule
+    seasons (no browser start, zeroed traffic JSON, exit 0)."""
+
+    @pytest.fixture
+    def temp_output_file(self):
+        fd, path = tempfile.mkstemp(suffix='.json')
+        os.close(fd)
+        yield path
+        if os.path.exists(path):
+            os.unlink(path)
+
+    @pytest.fixture
+    def temp_traffic_file(self):
+        fd, path = tempfile.mkstemp(suffix='.json')
+        os.close(fd)
+        os.unlink(path)  # runner must create it
+        yield path
+        if os.path.exists(path):
+            os.unlink(path)
+
+    def _make_scraper(self):
+        scraper = MagicMock()
+        scraper._stats = {'successes': 1, 'failures': 0}
+        scraper.get_stats.return_value = scraper._stats
+        scraper.__enter__ = MagicMock(return_value=scraper)
+        scraper.__exit__ = MagicMock(return_value=False)
+        scraper.scrape_schedule.return_value = {
+            'schedule': 'iceberg.bronze.fbref_schedule'
+        }
+        return scraper
+
+    def _run(self, module, args, mock_class):
+        sys.argv = ['run_fbref_scraper.py'] + args
+        with patch(
+            'scrapers.nodriver_fbref.NodriverFBrefScraper', mock_class
+        ):
+            return module.main()
+
+    def _reload(self):
+        import importlib
+        import dags.scripts.run_fbref_scraper as m
+        importlib.reload(m)
+        return m
+
+    @pytest.mark.unit
+    def test_full_skip_is_noop_exit_0(self, temp_output_file, temp_traffic_file):
+        m = self._reload()
+        mock_class = MagicMock(return_value=self._make_scraper())
+
+        with patch.object(
+            m, '_completed_schedule_leagues',
+            return_value={'ESP-La Liga'},
+        ) as probe:
+            rc = self._run(m, [
+                '--scraper-type', 'nodriver',
+                '--mode', 'match_data',
+                '--match-data-type', 'schedule',
+                '--leagues', 'ESP-La Liga',
+                '--season', '2018',
+                '--skip-existing',
+                '--output', temp_output_file,
+                '--traffic-output', temp_traffic_file,
+            ], mock_class)
+
+        assert rc in (0, None)
+        probe.assert_called_once()
+        mock_class.assert_not_called()  # no browser start
+
+        with open(temp_output_file) as f:
+            result = json.load(f)
+        assert result['diagnostics']['all_already_scraped'] is True
+        assert result['diagnostics']['skipped_leagues'] == ['ESP-La Liga']
+        assert result['tables'] == ['iceberg.bronze.fbref_schedule']
+
+        with open(temp_traffic_file) as f:
+            traffic = json.load(f)
+        assert traffic['real_proxy_mb'] == 0.0
+        assert traffic['http_mb_downloaded'] == 0.0
+        assert traffic['skip_existing'] is True
+        assert traffic['label'] == 'match_schedule'
+
+    @pytest.mark.unit
+    def test_partial_skip_scrapes_remaining_leagues(self, temp_output_file):
+        m = self._reload()
+        scraper = self._make_scraper()
+        mock_class = MagicMock(return_value=scraper)
+
+        with patch.object(
+            m, '_completed_schedule_leagues',
+            return_value={'ESP-La Liga'},
+        ):
+            rc = self._run(m, [
+                '--scraper-type', 'nodriver',
+                '--mode', 'match_data',
+                '--match-data-type', 'schedule',
+                '--leagues', 'ESP-La Liga,GER-Bundesliga',
+                '--season', '2018',
+                '--skip-existing',
+                '--output', temp_output_file,
+            ], mock_class)
+
+        assert rc in (0, None)
+        assert mock_class.call_args.kwargs['leagues'] == ['GER-Bundesliga']
+
+    @pytest.mark.unit
+    def test_fail_open_scrapes_everything(self, temp_output_file):
+        m = self._reload()
+        scraper = self._make_scraper()
+        mock_class = MagicMock(return_value=scraper)
+
+        with patch.object(
+            m, '_completed_schedule_leagues', return_value=set()
+        ):
+            rc = self._run(m, [
+                '--scraper-type', 'nodriver',
+                '--mode', 'match_data',
+                '--match-data-type', 'schedule',
+                '--leagues', 'ESP-La Liga',
+                '--season', '2018',
+                '--skip-existing',
+                '--output', temp_output_file,
+            ], mock_class)
+
+        assert rc in (0, None)
+        assert mock_class.call_args.kwargs['leagues'] == ['ESP-La Liga']
+
+    @pytest.mark.unit
+    def test_current_season_never_skipped(self, temp_output_file):
+        m = self._reload()
+        scraper = self._make_scraper()
+        mock_class = MagicMock(return_value=scraper)
+
+        from datetime import datetime as _dt
+        _now = _dt.now()
+        current = _now.year if _now.month >= 8 else _now.year - 1
+
+        with patch.object(
+            m, '_completed_schedule_leagues',
+            return_value={'ESP-La Liga'},
+        ) as probe:
+            rc = self._run(m, [
+                '--scraper-type', 'nodriver',
+                '--mode', 'match_data',
+                '--match-data-type', 'schedule',
+                '--leagues', 'ESP-La Liga',
+                '--season', str(current),
+                '--skip-existing',
+                '--output', temp_output_file,
+            ], mock_class)
+
+        assert rc in (0, None)
+        probe.assert_not_called()
+        assert mock_class.call_args.kwargs['leagues'] == ['ESP-La Liga']
+
+    @pytest.mark.unit
+    def test_without_flag_probe_not_called(self, temp_output_file):
+        m = self._reload()
+        scraper = self._make_scraper()
+        mock_class = MagicMock(return_value=scraper)
+
+        with patch.object(
+            m, '_completed_schedule_leagues',
+            return_value={'ESP-La Liga'},
+        ) as probe:
+            rc = self._run(m, [
+                '--scraper-type', 'nodriver',
+                '--mode', 'match_data',
+                '--match-data-type', 'schedule',
+                '--leagues', 'ESP-La Liga',
+                '--season', '2018',
+                '--output', temp_output_file,
+            ], mock_class)
+
+        assert rc in (0, None)
+        probe.assert_not_called()
+        assert mock_class.call_args.kwargs['leagues'] == ['ESP-La Liga']
