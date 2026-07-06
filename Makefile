@@ -2,14 +2,14 @@
 # Data Platform - Makefile
 # =============================================================================
 
-.PHONY: help build up up-lite up-full up-build down restart logs ps clean health test-spark test-trino init-hdfs init-storage shell-spark shell-airflow shell-trino test-fbref-curl test-fbref-nodriver test-fbref-full test-proxy-stats up-bi up-catalog down-bi down-catalog superset-init superset-import superset-dashboards om-ingest-trino om-lineage-trino om-apply-descriptions om-cleanup-lineage logs-superset logs-om shell-superset shell-om
+.PHONY: help build up up-lite up-full up-build down restart logs ps clean health test-trino init-storage shell-airflow shell-trino test-fbref-curl test-fbref-nodriver test-fbref-full test-proxy-stats up-bi up-catalog down-bi down-catalog superset-init superset-import superset-dashboards om-ingest-trino om-lineage-trino om-apply-descriptions om-cleanup-lineage logs-superset logs-om shell-superset shell-om
 
 # Default target
 help:
 	@echo "Data Platform Commands:"
 	@echo ""
 	@echo "  make build        - Build all Docker images"
-	@echo "  make up           - Start ALL services (core + heavy: spark, OM, ES, superset-worker/beat, tor)"
+	@echo "  make up           - Start ALL services (core + heavy: OM, ES, superset-worker/beat, tor)"
 	@echo "  make up-lite      - Start CORE only (saves ~4GB RAM; recommended on 11GB VM)"
 	@echo "  make up-full      - Alias for 'make up' (all services)"
 	@echo "  make down         - Stop all services"
@@ -19,12 +19,9 @@ help:
 	@echo "  make clean        - Remove all containers and volumes"
 	@echo "  make health       - Check health of all services"
 	@echo ""
-	@echo "  make init-hdfs    - Initialize HDFS Medallion directories (legacy)"
 	@echo "  make init-storage - Initialize HDFS + Hive schemas (recommended)"
-	@echo "  make test-spark   - Run Spark integration test"
 	@echo "  make test-trino   - Run Trino integration test"
 	@echo ""
-	@echo "  make shell-spark  - Open shell in Spark master"
 	@echo "  make shell-airflow - Open shell in Airflow webserver"
 	@echo "  make shell-trino  - Open shell in Trino"
 	@echo ""
@@ -53,7 +50,7 @@ help:
 build:
 	docker compose build
 
-# Start services (FULL: core + heavy profile = spark, OM, ES, superset-worker/beat, tor)
+# Start services (FULL: core + heavy profile = OM, ES, superset-worker/beat, tor)
 up:
 	docker compose --profile heavy up -d
 	@echo ""
@@ -69,8 +66,8 @@ up-build:
 	@sleep 10
 	@$(MAKE) ps
 
-# Start LITE stack (core only: HDFS + Hive + Postgres + Redis + Airflow + Trino + Superset + FlareSolverr).
-# Skips: spark-*, superset-worker/beat, elasticsearch, openmetadata-*, tor. Use when RAM-constrained.
+# Start LITE stack (core only: SeaweedFS + Lakekeeper + Postgres + Redis + Airflow + Trino + Superset + FlareSolverr).
+# Skips: superset-worker/beat, elasticsearch, openmetadata-*, tor. Use when RAM-constrained.
 up-lite:
 	docker compose up -d
 	@echo ""
@@ -128,24 +125,10 @@ health:
 	@echo "=== Redis ==="
 	@docker compose exec -T redis redis-cli -a redis123 ping 2>/dev/null | grep -q PONG && echo "OK: Redis ready" || echo "FAIL: Redis not ready"
 
-# Initialize HDFS directories (legacy - uses shell script)
-init-hdfs:
-	@echo "Initializing HDFS Medallion directories..."
-	docker compose exec namenode /usr/local/bin/init-medallion.sh
-
 # Initialize storage (HDFS + Hive schemas via Python)
 init-storage:
 	@echo "Initializing storage (HDFS directories + Hive schemas)..."
 	docker compose exec airflow-scheduler python /opt/airflow/scripts/init_storage.py
-
-# Test Spark integration
-test-spark:
-	@echo "Running Spark integration test..."
-	docker compose exec spark-master spark-submit \
-		--master spark://spark-master:7077 \
-		/opt/spark_jobs/test/hello_world.py
-	@echo ""
-	@echo "Spark integration test completed!"
 
 # Test Trino
 test-trino:
@@ -158,9 +141,6 @@ test-trino:
 	@echo "Trino integration test completed!"
 
 # Shell access
-shell-spark:
-	docker compose exec spark-master /bin/bash
-
 shell-airflow:
 	docker compose exec airflow-webserver /bin/bash
 

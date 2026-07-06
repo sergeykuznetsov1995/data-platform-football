@@ -3,10 +3,13 @@
 -- =============================================================================
 -- Maps source-specific team-name → canonical team_id across 10 sources.
 --
--- This template renders ONE `{{ team_aliases_values_sql }}` placeholder which
--- is filled by `medallion_config.get_team_alias_sql_values(with_canonical_id=True,
--- with_league=True)`. The placeholder must produce a comma-separated list of
--- four-tuples `('raw_name', 'canonical_name', 'canonical_id', 'league'), ...`.
+-- This template renders TWO placeholders (both filled by dag_transform_xref.py
+-- via `medallion_config.render_sql_template`):
+--   * `{{ team_aliases_values_sql }}` — comma-separated four-tuples
+--     `('raw_name', 'canonical_name', 'canonical_id', 'league'), ...` from
+--     `get_team_alias_sql_values(with_canonical_id=True, with_league=True)`;
+--   * `{{ clubelo_in_scope_leagues }}` — comma-separated quoted league slugs
+--     from `get_in_scope_competitions()` (scopes the season-less ClubElo feed).
 -- See `medallion_config.py` for escape rules and the public-API contract.
 --
 -- Identity (issue #141): `canonical_id` is the explicit identity slug declared
@@ -180,8 +183,12 @@ raw_teams AS (
     SELECT 'clubelo' AS source, team AS source_id, league, CAST(NULL AS varchar) AS season
       FROM iceberg.bronze.clubelo_ratings
      WHERE team IS NOT NULL
-       AND league = 'ENG-Premier League'   -- ClubElo trackет всю English pyramid; фильтруем не-APL
-                                           -- TODO(E8b): мультилига требует clubelo↔league маппинг
+       -- ClubElo trackет целые национальные пирамиды; скоупим до in_scope-лиг из
+       -- configs/medallion/competitions.yaml (E8b: лига включается флагом in_scope).
+       -- {{ clubelo_in_scope_leagues }} рендерится dag_transform_xref.py.
+       AND league IN (
+           {{ clubelo_in_scope_leagues }}
+       )
     UNION
     -- ===== clubelo (historical snapshots — relegated APL teams, #589) =====
     -- `clubelo_ratings` (daily, current) carries only teams CURRENTLY in the
@@ -192,7 +199,9 @@ raw_teams AS (
     SELECT 'clubelo' AS source, team AS source_id, league, CAST(NULL AS varchar) AS season
       FROM iceberg.bronze.clubelo_ratings_historical
      WHERE team IS NOT NULL
-       AND league = 'ENG-Premier League'   -- TODO(E8b): см. комментарий выше
+       AND league IN (
+           {{ clubelo_in_scope_leagues }}
+       )   -- тот же in_scope-скоуп, что у clubelo_ratings выше
 
     UNION
     -- ===== espn =====

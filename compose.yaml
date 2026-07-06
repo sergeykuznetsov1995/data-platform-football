@@ -354,14 +354,17 @@ services:
         limits:
           # 4G OOM-killed a long sofifa backfill run (python rss ~3G after 5h
           # of FS-crashloop retries + scheduler ~0.8G, dmesg 2026-07-02).
-          # 8G gives console-run scrapers headroom next to the scheduler (#847).
-          memory: 8G
+          # 8G gave console-run scrapers headroom next to the scheduler (#847).
+          # 16G: one sofifa edition peaks ~5-6G at write; 2 parallel backfill
+          # pools (2026-07-03 speedup) need ~12G + scheduler base.
+          memory: 16G
         reservations:
           memory: 1G
     # NOTE: host swap is currently 0 — memswap_limit is a no-op (ceiling equals
-    # the 8G memory limit). Kept for the day a swapfile is enabled; do NOT rely
-    # on it as a buffer beyond the limit (#847 review).
-    memswap_limit: 10G
+    # the 16G memory limit). Kept for the day a swapfile is enabled; do NOT rely
+    # on it as a buffer beyond the limit (#847 review). Must stay >= the memory
+    # limit above — docker rejects memswap < memory at container create.
+    memswap_limit: 16G
 
   airflow-webserver:
     <<: *airflow-common
