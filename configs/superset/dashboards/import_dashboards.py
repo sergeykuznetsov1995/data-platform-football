@@ -13,10 +13,9 @@
 # =============================================================================
 from __future__ import annotations
 
-import importlib
 import logging
+import subprocess
 import sys
-import traceback
 from pathlib import Path
 
 logging.basicConfig(
@@ -31,38 +30,31 @@ log = logging.getLogger("import_dashboards")
 # -----------------------------------------------------------------------------
 DASHBOARDS: list[str] = [
     "player_overview",
+    "league_overview",
 ]
 
 
 def main() -> int:
-    # Гарантируем, что модули из текущей директории импортируются первыми.
     here = Path(__file__).resolve().parent
-    if str(here) not in sys.path:
-        sys.path.insert(0, str(here))
 
     failures: list[tuple[str, str]] = []
 
     for module_name in DASHBOARDS:
-        log.info("importing dashboard module: %s", module_name)
-        try:
-            module = importlib.import_module(module_name)
-        except Exception as exc:  # pylint: disable=broad-except
-            tb = traceback.format_exc()
-            log.error("import failed for '%s': %s\n%s", module_name, exc, tb)
-            failures.append((module_name, f"import: {exc}"))
+        script = here / f"{module_name}.py"
+        log.info("running dashboard module: %s", module_name)
+        if not script.exists():
+            log.error("module script not found: %s", script)
+            failures.append((module_name, "script not found"))
             continue
 
-        if not hasattr(module, "create_dashboard"):
-            log.error("module '%s' does not define create_dashboard()", module_name)
-            failures.append((module_name, "missing create_dashboard()"))
-            continue
-
-        try:
-            module.create_dashboard()
-        except Exception as exc:  # pylint: disable=broad-except
-            tb = traceback.format_exc()
-            log.error("create_dashboard() failed for '%s': %s\n%s", module_name, exc, tb)
-            failures.append((module_name, f"create: {exc}"))
+        # Каждый модуль — в отдельном процессе: superset.app.create_app()
+        # нельзя вызвать дважды в одном процессе (FAB/flask-limiter держат
+        # глобальное состояние и падают на повторной регистрации views).
+        proc = subprocess.run([sys.executable, str(script)], cwd=str(here))
+        if proc.returncode != 0:
+            log.error("module '%s' failed with exit code %d",
+                      module_name, proc.returncode)
+            failures.append((module_name, f"exit code {proc.returncode}"))
 
     if failures:
         log.error("dashboard import finished with %d failure(s):", len(failures))
