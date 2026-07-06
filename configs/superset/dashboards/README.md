@@ -22,6 +22,7 @@
 | Slug | Title | Чартов | Источники |
 |------|-------|--------|-----------|
 | `player-overview` | Player overview | — | `fct_player_match`, `fct_shot`, `fct_match_rating`, `dim_*` |
+| `league-overview` | Обзор лиги + игроки | 21 | `fct_standings`, `fct_team_season_stats`, `fct_team_elo`, `fct_player_season_stats`, `fct_player_salary`, `fct_player_market_value`, `dim_*`, `silver.transfermarkt_players` |
 
 (Дашборды производного gold-этажа — team-form-overview, match-outcomes,
 scouting-radar, referee-dashboard, event-heatmap — удалены в epic #478.)
