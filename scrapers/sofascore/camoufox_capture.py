@@ -555,20 +555,34 @@ class SofascoreCamoufoxCapture:
                 "on a datacenter IP; data endpoints will be empty."
             )
         self._cm = Camoufox(**kwargs)
-        self._browser = self._cm.__enter__()
-        self._page = self._browser.new_page()
-        # Cut proxy bytes by aborting images/fonts/media/CSS/analytics (#842).
-        # Env kill-switch lets ops disable without a redeploy if Turnstile 403s.
-        env = os.environ.get("SOFASCORE_BLOCK_RESOURCES")
-        block = self._block_resources if env is None else env.strip().lower() not in ("0", "false", "no")
-        if block:
-            # Trade-off: enabling page.route disables the browser HTTP cache, so a
-            # capture_event retry re-fetches script/document instead of serving
-            # them from cache. Still a net win — image/media/font/CSS dwarf the
-            # re-fetched JS — but the canary must measure bytes/match WITH retries.
-            self._page.route("**/*", self._maybe_block)
-        self._page.on("response", self._on_response)
-        self._page.on("requestfinished", self._on_request_finished)
+        try:
+            self._browser = self._cm.__enter__()
+            self._page = self._browser.new_page()
+            # Cut proxy bytes by aborting images/fonts/media/CSS/analytics (#842).
+            # Env kill-switch lets ops disable without a redeploy if Turnstile 403s.
+            env = os.environ.get("SOFASCORE_BLOCK_RESOURCES")
+            block = self._block_resources if env is None else env.strip().lower() not in ("0", "false", "no")
+            if block:
+                # Trade-off: enabling page.route disables the browser HTTP cache, so a
+                # capture_event retry re-fetches script/document instead of serving
+                # them from cache. Still a net win — image/media/font/CSS dwarf the
+                # re-fetched JS — but the canary must measure bytes/match WITH retries.
+                self._page.route("**/*", self._maybe_block)
+            self._page.on("response", self._on_response)
+            self._page.on("requestfinished", self._on_request_finished)
+        except BaseException as e:
+            # A failed start (proxy connect refused, geoip lookup, new_page crash)
+            # leaves the sync-playwright loop running in this thread; without a
+            # teardown the NEXT session in the same process dies with "Sync API
+            # inside the asyncio loop" (#879, live-hit on ESP-2016/GER-2022).
+            # Camoufox.__exit__ tolerates a browser that never opened.
+            try:
+                self._cm.__exit__(type(e), e, e.__traceback__)
+            except Exception:  # noqa: BLE001 — teardown is best-effort
+                logger.warning("Camoufox teardown after failed start also failed",
+                               exc_info=True)
+            self._cm = None
+            raise
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> bool:
@@ -744,6 +758,37 @@ class SofascoreCamoufoxCapture:
         result = select_event_endpoints(self._buffer, event_id)
         self._log_event_capture(event_id, result, kind="fetch")
         return result
+
+    def fetch_api_json(self, path: str) -> Optional[dict]:
+        """Fetch an arbitrary same-origin ``/api/v1/...`` ``path`` on the
+        ALREADY-NAVIGATED page and return its buffer-shaped capture record
+        (``{'status', 'json', 'challenge'}``), or ``None`` when the in-page
+        fetch itself failed (#879).
+
+        Rides the session's Turnstile clearance exactly like
+        :meth:`paginate_tournament_season` / :meth:`fetch_event`; the record is
+        also merged into the live buffer so snapshot-based extractors see it.
+        Callers feed the record to the season-guarded extractors as a
+        one-entry buffer (``extract_tournament_seasons_map({path: rec}, ut)``)
+        — a 200 record with no usable rows is a legitimate-empty answer, a
+        ``None`` return is a transport failure worth retrying.
+        """
+        try:
+            res = self._page.evaluate(self._FETCH_JS, path) or {}
+        except Exception as e:  # noqa: BLE001 — a probe fetch mustn't kill the run
+            logger.info("sofascore fetch_api_json %s failed: %s", path, e)
+            return None
+        rec = {"status": res.get("status"), "json": None, "challenge": None}
+        body = res.get("body")
+        if body:
+            try:
+                obj = json.loads(body)
+                rec["json"] = obj
+                rec["challenge"] = is_challenge(obj)
+            except Exception:  # noqa: BLE001 — non-JSON body
+                pass
+        self._buffer[path] = merge_capture(self._buffer.get(path), rec)
+        return rec
 
     def _log_event_capture(self, event_id, result, kind: str) -> None:
         """Per-event capture summary + byte/block deltas (#842 accounting)."""

@@ -1202,3 +1202,118 @@ class TestOnRequestFinished:
         req = _FakeRequest("script", "https://x/app.js", sizes_raises=True)
         cap._on_request_finished(req)  # must not raise
         assert cap._bytes_total == 0
+
+
+# --------------------------------------------------------------------------- #
+#  __enter__ cleanup on failed start (#879)                                   #
+# --------------------------------------------------------------------------- #
+class TestEnterCleanupOnFailedStart:
+    """A failed Camoufox start must tear the half-open manager down and
+    re-raise — otherwise the sync-playwright loop stays armed in the thread and
+    the NEXT session in the same process dies with "Sync API inside the asyncio
+    loop" (#879, live-hit on the ESP-2016/GER-2022 backfill units)."""
+
+    def _enter_with_fake_camoufox(self, cm):
+        import sys
+        from unittest.mock import MagicMock, patch
+
+        from scrapers.sofascore.camoufox_capture import SofascoreCamoufoxCapture
+
+        cap = SofascoreCamoufoxCapture(proxy={"server": "http://exit:1"})
+        fake_sync_api = MagicMock()
+        fake_sync_api.Camoufox.return_value = cm
+        with patch.dict(sys.modules, {
+            "camoufox": MagicMock(sync_api=fake_sync_api),
+            "camoufox.sync_api": fake_sync_api,
+        }):
+            with pytest.raises(RuntimeError):
+                cap.__enter__()
+        return cap
+
+    def test_failed_cm_enter_is_torn_down_and_reraised(self):
+        from unittest.mock import MagicMock
+
+        cm = MagicMock()
+        cm.__enter__.side_effect = RuntimeError("Failed to connect to proxy")
+
+        cap = self._enter_with_fake_camoufox(cm)
+
+        assert cm.__exit__.called
+        assert cap._cm is None  # our __exit__ stays an idempotent no-op
+
+    def test_failed_new_page_is_torn_down_and_reraised(self):
+        from unittest.mock import MagicMock
+
+        cm = MagicMock()
+        cm.__enter__.return_value.new_page.side_effect = RuntimeError(
+            "tab crashed")
+
+        cap = self._enter_with_fake_camoufox(cm)
+
+        assert cm.__exit__.called
+        assert cap._cm is None
+
+    def test_teardown_failure_does_not_mask_original_error(self):
+        from unittest.mock import MagicMock
+
+        cm = MagicMock()
+        cm.__enter__.side_effect = RuntimeError("Failed to connect to proxy")
+        cm.__exit__.side_effect = RuntimeError("teardown also broke")
+
+        cap = self._enter_with_fake_camoufox(cm)  # raises the ORIGINAL error
+
+        assert cap._cm is None
+
+
+# --------------------------------------------------------------------------- #
+#  fetch_api_json (#879)                                                      #
+# --------------------------------------------------------------------------- #
+class TestFetchApiJson:
+    """Generic in-page fetch of an arbitrary /api/v1 path. Returns the
+    buffer-shaped record (status/json/challenge) and merges it into the live
+    buffer; None only on a transport failure — callers use that distinction to
+    separate 'legitimately empty' from 'worth retrying' (#879)."""
+
+    def _cap_with_page(self, evaluate_result=None, evaluate_raises=None):
+        from unittest.mock import MagicMock
+
+        cap = _cap()
+        cap._page = MagicMock()
+        if evaluate_raises is not None:
+            cap._page.evaluate.side_effect = evaluate_raises
+        else:
+            cap._page.evaluate.return_value = evaluate_result
+        return cap
+
+    def test_returns_rec_and_merges_into_buffer(self):
+        path = "/api/v1/unique-tournament/8/seasons"
+        body = json.dumps({"seasons": [{"year": "24/25", "id": 61643}]})
+        cap = self._cap_with_page({"status": 200, "body": body})
+
+        rec = cap.fetch_api_json(path)
+
+        assert rec["status"] == 200
+        assert rec["challenge"] is False
+        assert rec["json"]["seasons"][0]["id"] == 61643
+        assert cap._buffer[path]["json"] == rec["json"]
+
+    def test_returns_none_when_evaluate_raises(self):
+        cap = self._cap_with_page(evaluate_raises=RuntimeError("page gone"))
+
+        assert cap.fetch_api_json("/api/v1/unique-tournament/8/seasons") is None
+
+    def test_non_json_body_keeps_json_none(self):
+        cap = self._cap_with_page({"status": 403, "body": "<html>blocked</html>"})
+
+        rec = cap.fetch_api_json("/api/v1/unique-tournament/8/seasons")
+
+        assert rec["status"] == 403
+        assert rec["json"] is None
+
+    def test_challenge_body_is_flagged(self):
+        body = json.dumps({"error": {"code": 403, "reason": "challenge"}})
+        cap = self._cap_with_page({"status": 200, "body": body})
+
+        rec = cap.fetch_api_json("/api/v1/unique-tournament/8/seasons")
+
+        assert rec["challenge"] is True
