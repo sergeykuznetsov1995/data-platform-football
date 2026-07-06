@@ -101,6 +101,7 @@ def _validate_team_aliases_schema(doc: Dict) -> None:
         raise MedallionConfigError(
             "team_aliases.yaml: 'teams' must be a list"
         )
+    seen_ids: set = set()
     for i, t in enumerate(teams):
         if not isinstance(t, dict):
             raise MedallionConfigError(
@@ -124,6 +125,12 @@ def _validate_team_aliases_schema(doc: Dict) -> None:
                 f"missing/invalid 'canonical_id' (must match ^[a-z0-9_]+$, "
                 f"got {cid!r})"
             )
+        if cid in seen_ids:
+            raise MedallionConfigError(
+                f"team_aliases.yaml: duplicate canonical_id {cid!r} "
+                f"(teams[{i}]) — one slug must map to one team"
+            )
+        seen_ids.add(cid)
         # country / short_name feed gold.dim_team (issue #425) — non-empty
         # strings required, same contract as venue city/country.
         for field in ('country', 'short_name'):

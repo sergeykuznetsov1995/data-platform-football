@@ -105,6 +105,8 @@ def _run_xref_team(**context) -> Dict[str, Any]:
     from pathlib import Path
 
     from utils.medallion_config import (
+        _escape_sql_string,
+        get_in_scope_competitions,
         get_team_alias_sql_values,
         render_sql_template,
     )
@@ -114,11 +116,19 @@ def _run_xref_team(**context) -> Dict[str, Any]:
     if not template_path.exists():
         raise FileNotFoundError(f"xref_team template not found: {template_path}")
 
+    # ClubElo tracks whole national pyramids — scope its xref rows to the
+    # in_scope leagues from competitions.yaml (multi-league rollout = flip the
+    # in_scope flag, no SQL edit needed).
+    clubelo_leagues_sql = ', '.join(
+        f"'{_escape_sql_string(league)}'" for league in get_in_scope_competitions()
+    )
+
     rendered_sql = render_sql_template(
         template_path,
         team_aliases_values_sql=get_team_alias_sql_values(
             with_canonical_id=True, with_league=True
         ),
+        clubelo_in_scope_leagues=clubelo_leagues_sql,
     )
     logger.info(
         "Rendered xref_team.sql.j2 — %d chars (template embeds %d alias pairs)",

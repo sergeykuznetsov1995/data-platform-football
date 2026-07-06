@@ -158,15 +158,19 @@ xref_tm AS (
     GROUP BY canonical_id, league, season
 ),
 
+-- Same #814 fan-out guard as xref_tm above: 2 capology-алиаса на один canonical
+-- в сезоне задвоили бы всю строку fct_team_season_stats через LEFT JOIN
+-- cap_finance ниже. Сворачиваем к одному алиасу тем же MAX+GROUP BY.
 xref_cap AS (
-    SELECT DISTINCT
+    SELECT
         canonical_id,
-        source_id                                         AS cap_club_name,
+        MAX(source_id)                                    AS cap_club_name,
         league,
         season                                            AS season_slug
     FROM iceberg.silver.xref_team
     WHERE source = 'capology'
       AND confidence <> 'orphan'
+    GROUP BY canonical_id, league, season
 ),
 
 -- Squad market value: SUM рыночной стоимости состава (EUR, снимок «сейчас»).

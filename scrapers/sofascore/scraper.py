@@ -71,6 +71,28 @@ SOFASCORE_TOURNAMENT_SLUG: Dict[str, str] = {
 R0_2B_FALLBACK_MARKER = "R0.2B_FALLBACK"
 
 
+def _season_to_short(season) -> str:
+    """Normalize a season token to soccerdata's short 'YYZZ' form.
+
+    Mirrors ``scrapers/whoscored/scraper.py::_season_to_soccerdata_str``:
+    already-short tokens pass through ('2526' -> '2526'; the ambiguous
+    '2021' resolves to the 20/21 season, like soccerdata), year-start
+    values convert (2024 -> '2425', 1999 -> '9900'). The old inline
+    conversion mapped '2526' -> '2627' (a nonexistent season), silently
+    no-op'ing scrapes triggered with the documented short form.
+    Non-4-digit tokens pass through unchanged (legacy behaviour of the
+    inline ``else`` branch this helper replaces).
+    """
+    s = str(season)
+    if len(s) != 4 or not s.isdigit():
+        return s
+    if (int(s[:2]) + 1) % 100 == int(s[2:]):
+        return s
+    if s[2:] == "99":
+        return "9900"
+    return s[-2:] + f"{(int(s[-2:]) + 1) % 100:02d}"
+
+
 class SofaScoreScraper(SoccerdataScraper):
     """
     Scraper for SofaScore football data.
@@ -188,11 +210,7 @@ class SofaScoreScraper(SoccerdataScraper):
             return None
         # Label rows with the soccerdata short form ('YYZZ', e.g. 2025 -> '2526')
         # so the partition aligns with the ratings/match_capture writers (#27).
-        season_str = str(self.seasons[0])
-        if len(season_str) == 4 and season_str.isdigit():
-            season_short = f"{season_str[2:4]}{int(season_str[2:4]) + 1:02d}"
-        else:
-            season_short = season_str
+        season_short = _season_to_short(self.seasons[0])
         # The tournament page serves whatever season SofaScore defaults to —
         # NOT necessarily ours. Off-season it has already rolled to the NEXT
         # season (live-proven 2026-06-23: the EPL page served 26/27 fixtures
@@ -326,11 +344,7 @@ class SofaScoreScraper(SoccerdataScraper):
             return None
         # Label rows with the soccerdata short form ('YYZZ', e.g. 2025 -> '2526')
         # so the partition aligns with the other SofaScore writers (#27).
-        season_str = str(self.seasons[0])
-        if len(season_str) == 4 and season_str.isdigit():
-            season_short = f"{season_str[2:4]}{int(season_str[2:4]) + 1:02d}"
-        else:
-            season_short = season_str
+        season_short = _season_to_short(self.seasons[0])
         target_year = season_short_to_label(season_short)  # '2526' -> '25/26'
 
         proxy = self._camoufox_proxy()
@@ -452,10 +466,7 @@ class SofaScoreScraper(SoccerdataScraper):
         df = df.copy()
         # Coerce season to soccerdata 'YYZZ' string format if int passed.
         season_str = str(season)
-        if len(season_str) == 4 and season_str.isdigit():
-            season_short = f"{season_str[2:4]}{int(season_str[2:4]) + 1:02d}"
-        else:
-            season_short = season_str
+        season_short = _season_to_short(season_str)
 
         if 'league' in df.columns and 'season' in df.columns:
             mask = (df['league'] == league) & (
@@ -1015,11 +1026,7 @@ class SofaScoreScraper(SoccerdataScraper):
             return []
 
         # season is a YEAR int (2024); the events carry the '24/25' year label.
-        season_str = str(season)
-        if len(season_str) == 4 and season_str.isdigit():
-            season_short = f"{season_str[2:4]}{int(season_str[2:4]) + 1:02d}"
-        else:
-            season_short = season_str
+        season_short = _season_to_short(season)
         target_year = season_short_to_label(season_short)  # '2425' -> '24/25'
 
         nav_url = f"https://www.sofascore.com/tournament/{slug}/{ut_id}"
@@ -1155,11 +1162,7 @@ class SofaScoreScraper(SoccerdataScraper):
         # Match the slug used by the schedule writer (soccerdata short form
         # 'YYZZ', e.g. 2025 -> '2526'). Mismatch would split the partition
         # and break replace_partitions dedup — see issue #27.
-        season_str = str(season)
-        if len(season_str) == 4 and season_str.isdigit():
-            season_short = f"{season_str[2:4]}{int(season_str[2:4]) + 1:02d}"
-        else:
-            season_short = season_str
+        season_short = _season_to_short(season)
         df['season'] = season_short
         df['_ingested_at'] = datetime.utcnow()
         df['_source'] = self.SOURCE_NAME
@@ -1241,11 +1244,7 @@ class SofaScoreScraper(SoccerdataScraper):
         if match_ids is None:
             match_ids = self._resolve_match_ids(league, season)
 
-        season_str = str(season)
-        if len(season_str) == 4 and season_str.isdigit():
-            season_short = f"{season_str[2:4]}{int(season_str[2:4]) + 1:02d}"
-        else:
-            season_short = season_str
+        season_short = _season_to_short(season)
 
         empty = {
             'player_ratings': pd.DataFrame(columns=ratings_cols + ['_ingested_at']),
@@ -1569,11 +1568,7 @@ class SofaScoreScraper(SoccerdataScraper):
         # Match the slug used by the schedule writer (soccerdata short form
         # 'YYZZ', e.g. 2025 -> '2526'). Mismatch would split the partition
         # and break replace_partitions dedup — see issue #27.
-        season_str = str(season)
-        if len(season_str) == 4 and season_str.isdigit():
-            season_short = f"{season_str[2:4]}{int(season_str[2:4]) + 1:02d}"
-        else:
-            season_short = season_str
+        season_short = _season_to_short(season)
         df['season'] = season_short
         df['_ingested_at'] = datetime.utcnow()
         df['_source'] = self.SOURCE_NAME
@@ -1891,11 +1886,7 @@ class SofaScoreScraper(SoccerdataScraper):
             'league', 'season',
         ]
 
-        season_str = str(season)
-        if len(season_str) == 4 and season_str.isdigit():
-            season_short = f"{season_str[2:4]}{int(season_str[2:4]) + 1:02d}"
-        else:
-            season_short = season_str
+        season_short = _season_to_short(season)
 
         if player_ids_by_match is None:
             player_ids_by_match = self._resolve_match_players_from_bronze(
@@ -2152,11 +2143,7 @@ class SofaScoreScraper(SoccerdataScraper):
         df = pd.DataFrame(all_rows)
         df['league'] = league
 
-        season_str = str(season)
-        if len(season_str) == 4 and season_str.isdigit():
-            season_short = f"{season_str[2:4]}{int(season_str[2:4]) + 1:02d}"
-        else:
-            season_short = season_str
+        season_short = _season_to_short(season)
         df['season'] = season_short
         df['_ingested_at'] = datetime.utcnow()
         df['_source'] = self.SOURCE_NAME
@@ -2353,11 +2340,7 @@ class SofaScoreScraper(SoccerdataScraper):
             'team_id', 'team_name', 'league', 'season',
         ]
 
-        season_str = str(season)
-        if len(season_str) == 4 and season_str.isdigit():
-            season_short = f"{season_str[2:4]}{int(season_str[2:4]) + 1:02d}"
-        else:
-            season_short = season_str
+        season_short = _season_to_short(season)
 
         empty = {
             'player_profile': pd.DataFrame(columns=profile_cols + ['_ingested_at']),

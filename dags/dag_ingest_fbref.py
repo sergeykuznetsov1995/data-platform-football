@@ -49,7 +49,7 @@ NOTE: As of 2025-2026, FBref uses Cloudflare Turnstile CAPTCHA.
 from datetime import datetime, timedelta
 
 from airflow import DAG
-from airflow.operators.python import PythonOperator
+from airflow.operators.python import PythonOperator, ShortCircuitOperator
 from airflow.utils.task_group import TaskGroup
 from airflow.operators.empty import EmptyOperator
 from airflow.operators.trigger_dagrun import TriggerDagRunOperator
@@ -163,6 +163,43 @@ def _make_traffic_guard(label: str, group_suffix: str = '') -> PythonOperator:
     )
 
 
+def _gate_scrape(**context) -> bool:
+    """ShortCircuitOperator hook — TRUE means "run the FBref scrape".
+
+    The FBref run is the most anti-bot-fragile path in the platform (nodriver
+    Cloudflare-Turnstile bypass, ~15-25 min per run). The DAG's own cron is
+    weekly (Monday), but ``dag_master_pipeline`` triggers this DAG daily via
+    ``TriggerDagRunOperator``, which ignores the child cron — without a gate
+    that means 7 CF bypasses a week instead of 1. Mirrors the sofascore /
+    clubelo gates. Runs only when:
+
+      - a manual "Trigger DAG w/ config" sets ``run_scrape=True`` (on demand); or
+      - this is the DAG's OWN weekly scheduled run.
+
+    Skipped on any external trigger (e.g. ``dag_master_pipeline``). Returning
+    False short-circuits every downstream task to ``skipped``.
+    """
+    import logging
+
+    logger = logging.getLogger(__name__)
+
+    params = context.get('params') or {}
+    if params.get('run_scrape'):
+        logger.info("run_scrape=True → running FBref scrape on demand.")
+        return True
+
+    dag_run = context.get('dag_run')
+    if getattr(dag_run, 'external_trigger', False):
+        logger.info(
+            "External trigger (e.g. dag_master_pipeline) → skip the heavy "
+            "CF-bypass scrape; the DAG's own weekly cron covers FBref."
+        )
+        return False
+
+    logger.info("Own scheduled run → running weekly FBref scrape.")
+    return True
+
+
 # =============================================================================
 # DAG DEFINITION
 # =============================================================================
@@ -182,6 +219,7 @@ with DAG(
         'season': CURRENT_SEASON,
         'max_matches': 0,  # 0 = no limit
         'scraper_type': DEFAULT_SCRAPER_TYPE,  # 'nodriver' or 'selenium'
+        'run_scrape': False,  # True = force the scrape on a manual/external trigger
     },
     doc_md="""
     ## FBref Data Ingestion (Refactored + Optimized)
@@ -288,7 +326,7 @@ with DAG(
     pm = ProxyManager()
     pm.load_from_file_custom_format('/opt/airflow/proxys.txt', ProxyType.HTTP)
     print(f'Loaded {pm.total_count} proxies')
-    print(f'First proxy URL: {pm.get_http_proxy_url()}')
+    print(f'First proxy: {pm.get_proxy().masked_url}')  # creds masked — do not log full URLs
     "
     ```
 
@@ -315,6 +353,14 @@ with DAG(
     # Start Task
     # =========================================================================
     start = EmptyOperator(task_id='start')
+
+    # Gate the whole scrape on external triggers (dag_master_pipeline runs
+    # daily; FBref must stay weekly — see _gate_scrape). Short-circuiting here
+    # skips every downstream task, including the all_done validators.
+    gate_scrape = ShortCircuitOperator(
+        task_id='gate_scrape',
+        python_callable=_gate_scrape,
+    )
 
     # =========================================================================
     # Season Stats: ONE combined task (replaces 9 single_stat tasks)
@@ -425,8 +471,8 @@ with DAG(
     )
 
     # =========================================================================
-    # Dependencies: Start -> Season Stats -> Match Data -> Validate -> Report -> Trigger Silver
+    # Dependencies: Start -> Gate -> Season Stats -> Match Data -> Validate -> Report -> Trigger Silver
     # Sequential execution to prevent OOM
     # =========================================================================
-    start >> season_stats_task
+    start >> gate_scrape >> season_stats_task
     season_guard >> match_data_group >> validate_task >> report_traffic >> trigger_silver

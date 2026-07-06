@@ -154,14 +154,15 @@ xref_tm AS (
 ),
 
 xref_cap AS (
-    SELECT DISTINCT
+    SELECT
         canonical_id,
-        source_id                                         AS cap_club_name,
+        MAX(source_id)                                    AS cap_club_name,
         league,
         season                                            AS season_slug
     FROM iceberg.silver.xref_team
     WHERE source = 'capology'
       AND confidence <> 'orphan'
+    GROUP BY canonical_id, league, season
 ),
 
 -- Squad market value: SUM рыночной стоимости состава (EUR, снимок «сейчас»).

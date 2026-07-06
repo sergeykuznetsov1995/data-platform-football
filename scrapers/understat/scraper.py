@@ -65,6 +65,10 @@ def _install_understat_roster_patch() -> None:
             # schedule filter) has no usable team ids — skip it like a failed
             # fetch; the callers do ``if data is None: continue``.
             if not rosters.get("h") or not rosters.get("a"):
+                logger.warning(
+                    "Skipping match %s: empty roster (data-less fixture)",
+                    match_id,
+                )
                 return None
             home_team_id = next(iter(rosters["h"].values()))["team_id"]
             away_team_id = next(iter(rosters["a"].values()))["team_id"]
