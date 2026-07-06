@@ -36,6 +36,7 @@ from airflow.operators.trigger_dagrun import TriggerDagRunOperator
 
 from utils.config import CURRENT_SEASON, DAG_TAGS, LEAGUES, SCHEDULES
 from utils.default_args import SCRAPER_ARGS
+from utils.ingest_helpers import load_result as _load_result
 
 
 PLAYERS_RESULT_PATH = '/tmp/transfermarkt_players_result.json'
@@ -52,19 +53,6 @@ COACHES_RESULT_PATH = '/tmp/transfermarkt_coaches_result.json'
 # cap = full roster in one run, #793).
 PLAYERS_DAILY_LIMIT: int = None  # None == full league roster
 MV_HISTORY_DAILY_LIMIT: int = 100
-
-
-def _load_result(path: str, logger) -> Dict[str, Any]:
-    import json
-    try:
-        with open(path, 'r') as f:
-            return json.load(f)
-    except FileNotFoundError:
-        logger.error("Results file %s not found", path)
-        return {}
-    except json.JSONDecodeError as e:
-        logger.error("Invalid JSON in %s: %s", path, e)
-        return {}
 
 
 def validate_data(**context) -> Dict[str, Any]:

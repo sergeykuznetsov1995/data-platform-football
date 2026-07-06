@@ -83,11 +83,16 @@ def load_silver_sql(sql_path: Path) -> str:
         mc = _load_medallion_config()
         # Pass every known alias-VALUES context; render_sql_template ignores
         # unused keys, so one call covers team / referee / manager templates alike.
+        clubelo_leagues = ", ".join(
+            f"'{mc._escape_sql_string(lg)}'"
+            for lg in mc.get_in_scope_competitions()
+        )
         return mc.render_sql_template(
             str(sql_path),
             team_aliases_values_sql=mc.get_team_alias_sql_values(),
             referee_aliases_values_sql=mc.get_referee_alias_sql_values(),
             manager_aliases_values_sql=mc.get_manager_alias_sql_values(),
+            clubelo_in_scope_leagues=clubelo_leagues,
         )
     return sql_path.read_text()
 

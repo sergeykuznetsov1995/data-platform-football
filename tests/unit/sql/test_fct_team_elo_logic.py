@@ -76,11 +76,19 @@ class TestFctTeamEloStructure:
         sql = _strip_comments(_read_sql())
         assert re.search(r"confidence\s*<>\s*'orphan'", sql, re.IGNORECASE)
 
-    def test_apl_scope_filter(self):
-        """APL scope mirrors xref_team + dim_team; without it every non-APL
-        club becomes a 'ce_' orphan and inflates the orphan rate."""
+    def test_league_scope_follows_xref_team(self):
+        """League scope is sourced from silver.xref_team's clubelo rows
+        (rendered there from competitions.yaml in_scope) — no hardcoded
+        league literal. Without the filter every out-of-scope club becomes
+        a 'ce_' orphan and inflates the orphan rate."""
         sql = _strip_comments(_read_sql())
-        assert re.search(r"league\s*=\s*'ENG-Premier League'", sql, re.IGNORECASE)
+        assert re.search(
+            r"league\s+in\s*\(\s*select\s+league\s+from\s+in_scope_leagues\s*\)",
+            sql, re.IGNORECASE,
+        )
+        assert not re.search(
+            r"league\s*=\s*'ENG-Premier League'", sql, re.IGNORECASE,
+        ), "hardcoded league literal must not return (former TODO(E8b))"
 
     def test_no_season_predicate(self):
         """ClubElo has NO season — the executable SQL must not reference a

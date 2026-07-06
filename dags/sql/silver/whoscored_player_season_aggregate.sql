@@ -52,6 +52,7 @@ xp AS (
     SELECT canonical_id, source_id, league, season
     FROM iceberg.silver.xref_player
     WHERE source = 'whoscored'
+      AND confidence <> 'orphan'  -- consistent with understat/sofascore aggregates
 ),
 
 joined AS (
