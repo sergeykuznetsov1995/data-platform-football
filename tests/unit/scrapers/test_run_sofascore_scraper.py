@@ -374,6 +374,33 @@ class TestMatchCaptureRunner:
         assert payload['venue_rows'] == 2 and payload['venue_matches'] == 2
 
     @pytest.mark.unit
+    def test_traffic_stats_land_in_payload(self, temp_output):
+        # #879: match_capture must report get_traffic_stats() (incl. the
+        # camoufox share) so the canary / PROXY_TRAFFIC tooling sees the
+        # residential spend of the heaviest SofaScore path.
+        scraper = _match_capture_scraper()
+        scraper.get_traffic_stats.return_value = {
+            'proxy_response_bytes': 2 * 1024 * 1024,
+            'proxy_response_mb': 2.0,
+            'camoufox_bytes': 2 * 1024 * 1024,
+            'camoufox_mb': 2.0,
+            'requests': 4,
+            'top_traffic_urls': [],
+        }
+        with patch.dict(sys.modules, {'utils.proxy_traffic': MagicMock()}):
+            rc = _run_main(
+                ["--entity", "match_capture", "--league", "ENG-Premier League",
+                 "--season", "2025", "--output", temp_output],
+                MagicMock(return_value=scraper),
+                resolver_ids=['1', '2'],
+            )
+        assert rc == 0
+        with open(temp_output) as f:
+            payload = json.load(f)
+        assert payload['traffic']['proxy_response_mb'] == 2.0
+        assert payload['traffic']['camoufox_mb'] == 2.0
+
+    @pytest.mark.unit
     def test_guard_refusal_exits_3(self, temp_output):
         scraper = _match_capture_scraper(guard_blocks=True)
         rc = _run_main(
