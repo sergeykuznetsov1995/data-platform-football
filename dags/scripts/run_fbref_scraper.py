@@ -7,28 +7,36 @@ Standalone script to run FBref scraper.
 Called from Airflow via BashOperator to avoid memory issues with PythonOperator.
 
 Supports two scraper types:
-1. nodriver (default, recommended) - Browser-based with Cloudflare Turnstile bypass
-2. selenium - Browser-based with undetected-chromedriver (used for combined
-   match-level data: shot_events, match_events, lineups, match_team_stats,
-   match_player_stats)
+1. nodriver (default) - Browser-based with Cloudflare Turnstile bypass.
+   DEAD against the managed interstitial CF rolled out ~2026-07 (#877) —
+   do not use for new scrapes.
+2. selenium - FBrefScraper; with FBREF_TRANSPORT=camoufox this is the
+   working Cloudflare path (#846/#853) used by the prod DAG for schedule
+   and combined match-level data.
 
 Usage:
-    # Using nodriver (recommended for Cloudflare Turnstile)
-    python run_fbref_scraper.py --scraper-type nodriver --proxy-file /path/to/proxys.txt
-
-    # Using nodriver with specific settings
-    python run_fbref_scraper.py --scraper-type nodriver --cloudflare-wait 120 --cf-verify-retries 15
+    # Schedule via the working camoufox transport (#CF-2026-07, #877)
+    FBREF_TRANSPORT=camoufox python run_fbref_scraper.py --scraper-type selenium \
+        --mode match_data --match-data-type schedule --proxy-file /path/to/proxys.txt
 
 NOTE: As of 2025-2026, FBref uses Cloudflare Turnstile CAPTCHA.
       The deprecated soccerdata/curl_cffi scraper was removed (Apr 2026) —
       it cannot execute JavaScript, so it never bypassed the Turnstile.
-      nodriver with cf-verify plugin is the only HTTP-replacement that works.
+
+NOTE (#877): when wrapping this runner with a timeout from the host, put
+      `timeout` INSIDE the container command:
+          docker exec ... airflow-scheduler timeout -k 30 <secs> python dags/scripts/run_fbref_scraper.py ...
+      A host-side `timeout N docker exec ...` only kills the docker client;
+      the python process (and its ~1 GB camoufox/Firefox child) keeps running
+      in the container. SIGTERM/SIGINT are handled: the runner exits non-zero
+      and closes the browser child cleanly.
 """
 
 import argparse
 import json
 import logging
 import os
+import signal
 import sys
 from collections import Counter
 from datetime import datetime
@@ -64,6 +72,134 @@ def _configure_logging(verbose: bool = False) -> None:
     if not verbose:
         for name in _NOISY_LOGGERS:
             logging.getLogger(name).setLevel(logging.WARNING)
+
+
+def _handle_termination(signum, frame):
+    """Translate SIGTERM/SIGINT into SystemExit so the ``with <Scraper>``
+    block in main() unwinds and closes the browser child (camoufox/Firefox,
+    ~1 GB RSS) instead of orphaning it inside the container (#877).
+
+    SystemExit is a BaseException — the generic ``except Exception`` error
+    handling below does not swallow it.
+    """
+    raise SystemExit(128 + signum)  # 143 for SIGTERM, 130 for SIGINT
+
+
+def _install_signal_handlers() -> None:
+    signal.signal(signal.SIGTERM, _handle_termination)
+    signal.signal(signal.SIGINT, _handle_termination)
+
+
+def _trino_connect():
+    """Open a Trino dbapi connection from env. Returns None on import error.
+
+    Same pattern as run_sofascore_scraper.py (#842 skip-existing probe):
+    TRINO_PASSWORD set -> https:8443 BasicAuth, else plain http:8080.
+    """
+    try:
+        import trino
+        import trino.auth as trino_auth
+    except ImportError as e:
+        logger.error("trino client unavailable: %s", e)
+        return None
+
+    user = os.environ.get('TRINO_USER', 'airflow')
+    password = os.environ.get('TRINO_PASSWORD')
+    if password:
+        return trino.dbapi.connect(
+            host=os.environ.get('TRINO_HOST', 'trino'),
+            port=int(os.environ.get('TRINO_PORT', 8443)),
+            user=user,
+            catalog='iceberg',
+            http_scheme='https',
+            auth=trino_auth.BasicAuthentication(user, password),
+            verify=False,
+        )
+    return trino.dbapi.connect(
+        host=os.environ.get('TRINO_HOST', 'trino'),
+        port=int(os.environ.get('TRINO_PORT', 8080)),
+        user=user,
+        catalog='iceberg',
+    )
+
+
+def _completed_schedule_leagues(leagues: list, season: int) -> set:
+    """Return the leagues whose ``bronze.fbref_schedule`` (league, season)
+    partition already looks complete, i.e. has >= FBREF_SCHEDULE_MIN_ROWS
+    rows (#877 --skip-existing probe).
+
+    Floor default 270 covers every top-5 full season (GER=306, covid
+    FRA-2019=279, others 380) while rejecting genuinely partial data.
+    Partial partitions are not a concern: the schedule page is parsed
+    atomically and saved with replace_partitions per (league, season).
+
+    Fail-open: any Trino error returns an empty set (scrape everything) —
+    a false "not complete" costs one page (~0.3 MB), a false "complete"
+    would silently lose data.
+    """
+    floor = int(os.environ.get('FBREF_SCHEDULE_MIN_ROWS', '270'))
+    conn = _trino_connect()
+    if conn is None:
+        return set()
+    try:
+        cur = conn.cursor()
+        placeholders = ', '.join('?' for _ in leagues)
+        sql = (
+            "SELECT league, COUNT(*) "
+            "FROM iceberg.bronze.fbref_schedule "
+            f"WHERE season = ? AND league IN ({placeholders}) "
+            "GROUP BY league"
+        )
+        cur.execute(sql, (season, *leagues))
+        counts = {r[0]: r[1] for r in cur.fetchall() if r and r[0] is not None}
+        done = {lg for lg, cnt in counts.items() if cnt >= floor}
+        logger.info(
+            "skip-existing probe season=%s floor=%s: counts=%s -> complete=%s",
+            season, floor, counts, sorted(done),
+        )
+        return done
+    except Exception as e:
+        logger.warning(
+            "skip-existing probe on bronze.fbref_schedule failed (%s) — "
+            "scraping all requested leagues.", e,
+        )
+        return set()
+
+
+def _write_noop_traffic_summary(
+    label: str,
+    mode: str,
+    extra: Optional[dict] = None,
+    explicit_path: Optional[str] = None,
+) -> None:
+    """Write a zeroed `/tmp/fbref_traffic_<label>.json` for a skip-existing
+    no-op run (#877), so the Airflow `traffic_guard_<label>` task sees a
+    valid file with 0.0 MB instead of a stale one from a previous run.
+    """
+    payload = {
+        'mode': mode,
+        'label': label,
+        'real_proxy_mb': 0.0,
+        'real_proxy_bytes': 0,
+        'real_proxy_requests': 0,
+        'http_mb_downloaded': 0.0,
+        'pages_downloaded': 0,
+        'cf_challenge_attempts': 0,
+        'cf_challenges_passed': 0,
+        'cf_challenges_failed': 0,
+        'successes': 0,
+        'failures': 0,
+    }
+    if extra:
+        payload.update(extra)
+
+    path = explicit_path or f'/tmp/fbref_traffic_{label}.json'
+    try:
+        with open(path, 'w') as fh:
+            json.dump(payload, fh, indent=2)
+        logger.info(f"TRAFFIC_SUMMARY_JSON={json.dumps(payload)}")
+    except Exception as e:
+        logger.warning(f"Could not write traffic summary JSON to {path}: {e}")
 
 
 def _get_traffic_diagnostics(scraper) -> dict:
@@ -274,6 +410,10 @@ def _write_traffic_summary(
 
 
 def main():
+    # #877: must be first — a SIGTERM before handlers are installed would
+    # kill the runner without unwinding the scraper context manager.
+    _install_signal_handlers()
+
     parser = argparse.ArgumentParser(description='Run FBref scraper')
 
     # === Scraper type selection ===
@@ -446,6 +586,15 @@ def main():
         help='Maximum matches to scrape per league/season (0 = no limit, selenium only)'
     )
     parser.add_argument(
+        '--skip-existing',
+        action='store_true',
+        help='[match_data schedule mode, #877] Probe bronze.fbref_schedule '
+             'and skip leagues whose (league, season) partition already has '
+             '>= FBREF_SCHEDULE_MIN_ROWS rows (default 270). Never skips the '
+             'current season. Do not use for competitions with <270 matches '
+             'per season (e.g. UCL, WC). Fail-open: probe errors scrape all.'
+    )
+    parser.add_argument(
         '--no-incremental',
         action='store_true',
         help='[combined_match_data mode] Re-scrape matches even if they '
@@ -493,6 +642,51 @@ def main():
         'errors': [],
         'diagnostics': {}
     }
+
+    # #877: --skip-existing — don't re-fetch schedule seasons that are
+    # already complete in bronze. Runs BEFORE the scraper is created, so a
+    # full skip never starts Firefox/xvfb. Current season is never skipped
+    # (it keeps growing until season end).
+    if (
+        args.skip_existing
+        and args.mode == 'match_data'
+        and args.match_data_type == 'schedule'
+        and args.season < _current_season
+    ):
+        _done = _completed_schedule_leagues(leagues, args.season)
+        _skipped = sorted(set(leagues) & _done)
+        if _skipped:
+            leagues = [lg for lg in leagues if lg not in _done]
+            logger.info(
+                f"skip-existing: schedule already complete for {_skipped} "
+                f"season={args.season}; remaining leagues: {leagues}"
+            )
+            results['diagnostics']['skipped_leagues'] = _skipped
+        if not leagues:
+            # Full no-op: same sanctioned pattern as the combined_match_data
+            # all-already-scraped path — populate tables so the
+            # "no data and no errors -> exit 1" check passes.
+            results['tables'] = ['iceberg.bronze.fbref_schedule']
+            results['diagnostics']['all_already_scraped'] = True
+            results['match_data_type'] = args.match_data_type
+            _write_noop_traffic_summary(
+                label=f"match_{args.match_data_type}",
+                mode='match_data',
+                extra={
+                    'match_data_type': args.match_data_type,
+                    'skip_existing': True,
+                    'skipped_leagues': _skipped,
+                },
+                explicit_path=args.traffic_output,
+            )
+            with open(args.output, 'w') as f:
+                json.dump(results, f, indent=2)
+            logger.info(
+                f"skip-existing: nothing to scrape "
+                f"(all leagues complete for season={args.season}); exiting 0"
+            )
+            print(json.dumps(results, indent=2))
+            return 0
 
     # max_matches=0 means no limit (None)
     max_matches = args.max_matches if args.max_matches > 0 else None
