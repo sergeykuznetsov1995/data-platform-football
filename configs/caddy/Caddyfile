@@ -1,29 +1,44 @@
-# Реверс-прокси для доступа аналитиков через tailnet.
-# Один hostname (MagicDNS), роутинг по портам. Сертификат *.ts.net Caddy получает
-# сам у tailscaled (нужен смонтированный /var/run/tailscale/tailscaled.sock и
-# включённый HTTPS в админке tailnet). Порты публикуются только на ${TS_IP} —
-# см. сервис caddy в compose.yaml; 127.0.0.1-биндинги сервисов не трогаем.
+# Гибридная схема через bind-изоляцию (docs/HEADSCALE_MIGRATION.md).
+# Два контейнерных listener'а, разведённые published-портами compose:
+#   :443  <- ${PUBLIC_IP}:443  — публичные сайты (bi/auth/hs), видны из интернета
+#   :8443 <- ${TS_IP}:443      — VPN-сайты (jupyter/airflow/trino/meta)
+# Клиенты ВЕЗДЕ ходят на :443 (порт в URL не нужен): split-DNS резолвит
+# jupyter/airflow/trino/meta в headscale-IP VM (${TS_IP}), docker DNAT'ит
+# ${TS_IP}:443 -> контейнерный 8443; bi/auth/hs резолвятся в ${PUBLIC_IP}.
+# Из интернета VPN-сайтов на :443 нет (другой listener) -> недоступны.
+# Гейт по listener'у, НЕ по remote_ip: docker подменяет source IP при
+# форвардинге tailscale0->bridge, remote_ip-матчинг там не работает.
+# ACME HTTP-01: все A-записи -> ${PUBLIC_IP}, :80 опубликован там же.
 
-# JupyterHub — главная страница платформы для аналитиков.
-https://{$TS_HOSTNAME} {
-	reverse_proxy jupyterhub:8000
-}
+# --- Публичные (listener :443) -----------------------------------------------
 
-https://{$TS_HOSTNAME}:8081 {
-	reverse_proxy airflow-webserver:8080
-}
-
-https://{$TS_HOSTNAME}:8088 {
+# Superset: дашборды для «простых» юзеров. Защита — Keycloak SSO.
+https://bi.{$PLATFORM_DOMAIN} {
 	reverse_proxy superset:8088
 }
 
-# Keycloak (OIDC issuer): KC_PROXY_HEADERS=xforwarded, TLS терминируется здесь.
-https://{$TS_HOSTNAME}:8443 {
+# Keycloak: обязан быть публичным — на него редиректят браузеры юзеров (OIDC).
+https://auth.{$PLATFORM_DOMAIN} {
 	reverse_proxy keycloak:8080
 }
 
-# Trino говорит HTTPS сам (self-signed) — Caddy переупаковывает в доверенный серт.
-https://{$TS_HOSTNAME}:8444 {
+# Headscale: контрольный сервер VPN (клиенты ходят сюда при логине и keepalive).
+https://hs.{$PLATFORM_DOMAIN} {
+	reverse_proxy headscale:8080
+}
+
+# --- Только из VPN (listener :8443, published лишь на ${TS_IP}) ---------------
+
+https://jupyter.{$PLATFORM_DOMAIN}:8443 {
+	reverse_proxy jupyterhub:8000
+}
+
+https://airflow.{$PLATFORM_DOMAIN}:8443 {
+	reverse_proxy airflow-webserver:8080
+}
+
+# Trino говорит HTTPS сам (self-signed) — re-encrypt.
+https://trino.{$PLATFORM_DOMAIN}:8443 {
 	reverse_proxy https://trino:8443 {
 		transport http {
 			tls
@@ -32,6 +47,6 @@ https://{$TS_HOSTNAME}:8444 {
 	}
 }
 
-https://{$TS_HOSTNAME}:8585 {
+https://meta.{$PLATFORM_DOMAIN}:8443 {
 	reverse_proxy openmetadata-server:8585
 }
