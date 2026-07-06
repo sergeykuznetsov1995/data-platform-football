@@ -150,6 +150,11 @@ def _make_slice(
     if existing is not None:
         existing.viz_type = viz_type
         existing.params = encoded
+        # Сохранённый query_context имеет приоритет над form_data в
+        # data_for_slices (payload дашборда): протухший контекст прячет
+        # добавленные колонки (сырые имена вместо verbose_name). Сбрасываем —
+        # Superset пересоберёт его из свежих params.
+        existing.query_context = None
         ctx.db.session.commit()
         log.info("updated slice '%s' (id=%s)", name, existing.id)
         return existing
@@ -313,8 +318,21 @@ SELECT
   ps.goals, ps.assists, ps.non_penalty_goals, ps.shots, ps.shots_on_target,
   ps.key_passes, ps.expected_goals, ps.expected_assists,
   ps.goals - ps.expected_goals AS finishing_delta,
-  ps.rating_sofascore,
-  ps.successful_dribbles, ps.take_on_pct, ps.total_duels_won_pct,
+  -- Ratio-метрики только при 270+ минут: у сыгравшего 1 минуту "100%
+  -- единоборств" — мусор, который всплывает при сортировке таблицы.
+  CASE WHEN ps.minutes >= 270 THEN ps.rating_sofascore END AS rating_sofascore,
+  CASE WHEN ps.minutes >= 270 THEN ps.take_on_pct END AS take_on_pct,
+  CASE WHEN ps.minutes >= 270 THEN ps.total_duels_won_pct END AS total_duels_won_pct,
+  CASE WHEN ps.minutes >= 270
+       THEN (ps.goals + ps.assists) * 90.0 / NULLIF(ps.minutes, 0)
+  END AS ga_per90,
+  CASE WHEN ps.minutes >= 270
+       THEN ps.expected_goals * 90.0 / NULLIF(ps.minutes, 0)
+  END AS xg_per90,
+  CASE WHEN ps.minutes >= 270
+       THEN ps.expected_assists * 90.0 / NULLIF(ps.minutes, 0)
+  END AS xa_per90,
+  ps.successful_dribbles,
   ps.big_chances_created,
   ps.tackles_won, ps.interceptions, ps.yellow_cards, ps.red_cards,
   mv.market_value_eur,
@@ -352,44 +370,30 @@ LEFT JOIN iceberg.gold.dim_team dtf ON dtf.team_id = t.from_team_id
 LEFT JOIN iceberg.gold.dim_team dtt ON dtt.team_id = t.to_team_id
 WHERE NOT t.is_upcoming"""
 
-    # Таймлайн стоимости (TM) в окне сезона + ранг по пику стоимости —
-    # чарт «топ-10» фильтрует mv_rank <= 10, не тащит 500 линий.
+    # Таймлайн стоимости (TM) в окне сезона. Чарт режет серии series-limit'ом
+    # (топ-10 по пиковой стоимости) — лимит применяется ПОСЛЕ фильтров, так
+    # что выбранный в фильтре «Игрок» показывается, даже если он не из топа.
     v_player_mv = """\
-WITH mv AS (
-  SELECT
-    ps.player_id, ps.league, ps.season, ps.team_id,
-    h.valuation_date, h.market_value_eur
-  FROM iceberg.gold.fct_player_season_stats ps
-  JOIN iceberg.gold.dim_season ds ON ds.season = ps.season
-  JOIN iceberg.gold.fct_player_market_value h
-    ON  h.player_id = ps.player_id
-    AND h.source = 'transfermarkt'
-    AND h.valuation_date BETWEEN ds.start_date AND ds.end_date
-),
-ranked AS (
-  SELECT player_id, league, season,
-         RANK() OVER (
-           PARTITION BY league, season
-           ORDER BY MAX(market_value_eur) DESC
-         ) AS mv_rank
-  FROM mv
-  GROUP BY player_id, league, season
-)
 SELECT
-  m.player_id,
-  COALESCE(dp.player_name, m.player_id) AS player_name,
+  ps.player_id,
+  COALESCE(dp.player_name, ps.player_id) AS player_name,
   REGEXP_EXTRACT(dp.primary_position, '^([A-Z]{2})') AS position_primary,
-  COALESCE(dt.team_name, m.team_id) AS team_name,
-  m.league, m.season, m.valuation_date, m.market_value_eur,
-  r.mv_rank
-FROM mv m
-JOIN ranked r
-  ON  r.player_id = m.player_id
-  AND r.league = m.league AND r.season = m.season
-LEFT JOIN iceberg.gold.dim_player dp ON dp.player_id = m.player_id
-LEFT JOIN iceberg.gold.dim_team   dt ON dt.team_id = m.team_id"""
+  COALESCE(dt.team_name, ps.team_id) AS team_name,
+  ps.league, ps.season,
+  h.valuation_date, h.market_value_eur
+FROM iceberg.gold.fct_player_season_stats ps
+JOIN iceberg.gold.dim_season ds ON ds.season = ps.season
+JOIN iceberg.gold.fct_player_market_value h
+  ON  h.player_id = ps.player_id
+  AND h.source = 'transfermarkt'
+  AND h.valuation_date BETWEEN ds.start_date AND ds.end_date
+LEFT JOIN iceberg.gold.dim_player dp ON dp.player_id = ps.player_id
+LEFT JOIN iceberg.gold.dim_team   dt ON dt.team_id = ps.team_id"""
 
     # По-туровая форма команд: кумулятивные очки + скользящий xG-баланс.
+    # Окна строго ORDER BY gameweek (не по дате!): ось чартов — тур, и
+    # перенесённый матч, сыгранный позже своего тура, при date-порядке давал
+    # немонотонный кумулятив («провал очков» на графике).
     v_team_form = """\
 SELECT
   tm.team_id,
@@ -399,21 +403,21 @@ SELECT
   tm.points,
   SUM(tm.points) OVER (
     PARTITION BY tm.team_id, tm.league, tm.season
-    ORDER BY tm.date, tm.match_id
+    ORDER BY tm.gameweek
   ) AS cum_points,
   tm.goals_for, tm.goals_against, tm.result,
   tm.xg, tm.xga,
   AVG(tm.xg - tm.xga) OVER (
     PARTITION BY tm.team_id, tm.league, tm.season
-    ORDER BY tm.date
+    ORDER BY tm.gameweek
     ROWS BETWEEN 4 PRECEDING AND CURRENT ROW
   ) AS xg_diff_rolling5
 FROM iceberg.gold.fct_team_match tm
 LEFT JOIN iceberg.gold.dim_team dt ON dt.team_id = tm.team_id
-WHERE tm.is_completed"""
+WHERE tm.is_completed AND tm.gameweek IS NOT NULL"""
 
-    # По-матчевая форма игрока (рейтинг, xG/xA) — чарты осмысленны с фильтром
-    # «Игрок» (без него сотни линий; см. markdown-подпись на вкладке).
+    # По-матчевая форма игрока (рейтинг, xG/xA). Чарты по умолчанию режутся
+    # series-limit'ом до топ-8 по минутам; фильтр «Игрок» показывает любого.
     v_player_form = """\
 SELECT
   fpm.player_id,
@@ -421,7 +425,7 @@ SELECT
   REGEXP_EXTRACT(dp.primary_position, '^([A-Z]{2})') AS position_primary,
   COALESCE(dt.team_name, fpm.team_id) AS team_name,
   fpm.league, fpm.season,
-  dm.match_date,
+  dm.match_date, dm.gameweek,
   fpm.minutes_played AS minutes,
   fpm.goals, fpm.assists,
   fpm.xg AS expected_goals,
@@ -463,6 +467,7 @@ LEFT JOIN iceberg.gold.dim_team   dt ON dt.team_id = k.team_id"""
         "primary_position": "Позиция", "matches": "Матчи",
         "minutes": "Минуты", "goals": "Голы", "assists": "Ассисты",
         "expected_goals": "xG", "expected_assists": "xA",
+        "ga_per90": "Г+А/90", "xg_per90": "xG/90", "xa_per90": "xA/90",
         "shots": "Удары", "shots_on_target": "В створ",
         "key_passes": "Ключевые передачи",
         "big_chances_created": "Big chances",
@@ -884,6 +889,7 @@ def _build_slices(ctx: _Ctx, vds: dict[str, Any]) -> list[Any]:
                 "player_name", "team_name", "primary_position",
                 "matches", "minutes", "goals", "assists",
                 "expected_goals", "expected_assists",
+                "ga_per90", "xg_per90", "xa_per90",
                 "shots", "shots_on_target", "key_passes",
                 "big_chances_created", "successful_dribbles",
                 "tackles_won", "interceptions",
@@ -899,6 +905,9 @@ def _build_slices(ctx: _Ctx, vds: dict[str, Any]) -> list[Any]:
             "column_config": {
                 "expected_goals": {"d3NumberFormat": ".1f"},
                 "expected_assists": {"d3NumberFormat": ".1f"},
+                "ga_per90": {"d3NumberFormat": ".2f"},
+                "xg_per90": {"d3NumberFormat": ".2f"},
+                "xa_per90": {"d3NumberFormat": ".2f"},
                 "big_chances_created": {"d3NumberFormat": ".0f"},
                 "rating_sofascore": {"d3NumberFormat": ".2f"},
                 "total_duels_won_pct": {"d3NumberFormat": ".1f"},
@@ -940,6 +949,9 @@ def _build_slices(ctx: _Ctx, vds: dict[str, Any]) -> list[Any]:
         },
     ))
 
+    # Series limit (не adhoc-фильтр): топ-10 серий по пиковой стоимости
+    # считается ПОСЛЕ фильтров дашборда — выбранный в фильтре «Игрок»
+    # показывается, даже если он не из топ-10.
     slices.append(_make_slice(ctx,
         "Динамика стоимости: топ-10 сезона (€)", "echarts_timeseries_line",
         player_mv,
@@ -948,7 +960,10 @@ def _build_slices(ctx: _Ctx, vds: dict[str, Any]) -> list[Any]:
             "x_axis": "valuation_date",
             "metrics": [_metric("Стоимость (€)", "MAX", "market_value_eur")],
             "groupby": ["player_name"],
-            "adhoc_filters": [_sql_where("mv_rank <= 10")],
+            "limit": 10,
+            "timeseries_limit_metric": _metric(
+                "Пик стоимости", "MAX", "market_value_eur"
+            ),
             "row_limit": 50000,
             "show_legend": True,
             "rich_tooltip": True,
@@ -1053,37 +1068,50 @@ def _build_slices(ctx: _Ctx, vds: dict[str, Any]) -> list[Any]:
         },
     ))
 
+    # Ось = тур (общая сетка → сплошные линии) + series limit «топ-8 по
+    # минутам» — без выбранного игрока чарт читаем, с выбранным показывает его.
     slices.append(_make_slice(ctx,
-        "Рейтинг по матчам (выберите игрока)", "echarts_timeseries_line",
+        "Рейтинг по матчам", "echarts_timeseries_line",
         player_form,
         {
             "time_range": "No filter",
-            "x_axis": "match_date",
+            "x_axis": "gameweek",
             "metrics": [_metric("Рейтинг", "AVG", "rating")],
             "groupby": ["player_name"],
-            "adhoc_filters": [_sql_where("rating IS NOT NULL")],
+            "limit": 8,
+            "timeseries_limit_metric": _metric("Минуты", "SUM", "minutes"),
+            "adhoc_filters": [_sql_where(
+                "rating IS NOT NULL AND gameweek IS NOT NULL"
+            )],
             "row_limit": 50000,
             "show_legend": True,
             "rich_tooltip": True,
             "truncateYAxis": True,
+            "x_axis_title": "Тур",
             "y_axis_format": ".2f",
         },
     ))
 
     slices.append(_make_slice(ctx,
-        "xG и xA по матчам (выберите игрока)", "echarts_timeseries_line",
+        "xG и xA по матчам", "echarts_timeseries_line",
         player_form,
         {
             "time_range": "No filter",
-            "x_axis": "match_date",
+            "x_axis": "gameweek",
             "metrics": [
                 _metric("xG", "SUM", "expected_goals"),
                 _metric("xA", "SUM", "expected_assists"),
             ],
             "groupby": ["player_name"],
+            "limit": 4,
+            "timeseries_limit_metric": _metric(
+                "Суммарный xG", "SUM", "expected_goals"
+            ),
+            "adhoc_filters": [_sql_where("gameweek IS NOT NULL")],
             "row_limit": 50000,
             "show_legend": True,
             "rich_tooltip": True,
+            "x_axis_title": "Тур",
             "y_axis_format": ".2f",
         },
     ))
@@ -1284,7 +1312,8 @@ def _build_position_json(slices: list[Any]) -> dict[str, Any]:
     c.append(_row(p, [_chart(slices[i], 4, height=50) for i in range(13, 16)]))
     c.append(_markdown(p,
         "## Аналитика игроков\n\n"
-        "Scatter'ы — минимум 270 сыгранных минут; рейтинг и «финишеры» — минимум 450.",
+        "Scatter'ы — минимум 270 сыгранных минут; рейтинг и «финишеры» — минимум 450. "
+        "В таблице %-метрики, рейтинг и per-90 показываются только при 270+ минут.",
     ))
     c.append(_row(p, [_chart(slices[16], 6, height=60), _chart(slices[17], 6, height=60)]))
     c.append(_row(p, [_chart(slices[18], 6, height=50), _chart(slices[19], 6, height=50)]))
@@ -1318,7 +1347,8 @@ def _build_position_json(slices: list[Any]) -> dict[str, Any]:
     c.append(_row(p, [_chart(slices[28], 12, height=55)]))
     c.append(_markdown(p,
         "## Форма игрока\n\n"
-        "Выбери игрока в фильтре «Игрок» — без выбора на графиках сотни линий.",
+        "По умолчанию — топ-8 по минутам (рейтинг) и топ-4 по xG (xG/xA); "
+        "выбери игрока в фильтре «Игрок», чтобы посмотреть любого.",
     ))
     c.append(_row(p, [_chart(slices[29], 6, height=55), _chart(slices[30], 6, height=55)]))
 
