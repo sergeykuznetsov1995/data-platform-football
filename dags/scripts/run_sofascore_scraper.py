@@ -693,6 +693,9 @@ def _run_match_capture(
                     results['fallback_reason'] = 'no_match_ids'
                     results['errors'].append(
                         f'{R0_2B_FALLBACK_MARKER}: no_match_ids')
+                    # #879: the capture-resolve above spent real camoufox
+                    # bytes — report them even on this early exit.
+                    results['traffic'] = scraper.get_traffic_stats()
                     _write_results(output_path, results)
                     return 2
                 if limit:
@@ -713,6 +716,7 @@ def _run_match_capture(
                             "— nothing to do, partitions left untouched.",
                             total,
                         )
+                        results['traffic'] = scraper.get_traffic_stats()  # #879
                         _write_results(output_path, results)
                         return 0
 
@@ -720,6 +724,7 @@ def _run_match_capture(
                 league=league, season=int(season),
                 match_ids=match_ids, limit=limit,
             )
+            results['traffic'] = scraper.get_traffic_stats()  # #789 + #879 camoufox
             ratings_df = frames.get('player_ratings')
             eps_df = frames.get('event_player_stats')
             stats_df = frames.get('match_stats')
@@ -940,6 +945,7 @@ def _run_player_capture(
             frames = scraper.read_player_capture(
                 league=league, season=int(season), limit=limit,
             )
+            results['traffic'] = scraper.get_traffic_stats()  # #789 + #879 camoufox
             profile_df = frames.get('player_profile')
             profile_empty = profile_df is None or profile_df.empty
 
@@ -1281,11 +1287,11 @@ def _write_results(path: str, payload: dict) -> None:
         pass
     # Residential-proxy traffic per-run log + ops persist (#789 Phase 2). One
     # grep-friendly "PROXY_TRAFFIC source=sofascore total=… MB" line + one row in
-    # iceberg.ops.proxy_traffic_runs. NOTE: counts only the tls REST path
-    # (`_fetch_json_endpoint`) — the Camoufox capture path is NOT instrumented,
-    # so this is a lower bound for SofaScore. Passive — never fails the run.
+    # iceberg.ops.proxy_traffic_runs. Counts the tls REST path AND, since #879,
+    # the Camoufox capture sessions (rx+tx) — still a slight lower bound (the
+    # tls share counts response bodies only). Passive — never fails the run.
     traffic = payload.get('traffic')
-    if traffic:
+    if isinstance(traffic, dict) and traffic:
         try:
             from utils.proxy_traffic import (
                 log_traffic_summary,
@@ -1401,6 +1407,7 @@ def _run_legacy(
                 error_msg = f"League table scraping failed: {e}"
                 logger.error(error_msg)
                 results['errors'].append(error_msg)
+            results['traffic'] = scraper.get_traffic_stats()  # #879 camoufox bytes
     except Exception as e:
         logger.error(f"Scraper failed: {e}", exc_info=True)
         results['errors'].append(str(e))
