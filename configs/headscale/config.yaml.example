@@ -1,0 +1,80 @@
+# Headscale 0.29 — self-hosted control-plane для официальных Tailscale-клиентов.
+# Шаблон: __VAR__ подставляются из .env командой `make render-headscale-config`
+# (результат configs/headscale/config.yaml — в .gitignore).
+# Ключи сверены с config-example.yaml релиза v0.29.2.
+# Миграция и cutover: docs/HEADSCALE_MIGRATION.md
+
+# Публичный адрес контрольного сервера (за Caddy, TLS терминируется там).
+server_url: https://hs.__PLATFORM_DOMAIN__
+listen_addr: 0.0.0.0:8080
+metrics_listen_addr: 127.0.0.1:9090
+grpc_listen_addr: 127.0.0.1:50443
+
+noise:
+  private_key_path: /var/lib/headscale/noise_private.key
+
+# Тот же CGNAT-диапазон, что у Tailscale — матчер remote_ip 100.64.0.0/10
+# в Caddyfile.hybrid отличает VPN-клиентов от интернета.
+prefixes:
+  v4: 100.64.0.0/10
+  v6: fd7a:115c:a1e0::/48
+
+derp:
+  server:
+    # Встроенный DERP-релей (fallback, когда прямой WireGuard не пробился).
+    # Требует HTTPS на server_url; STUN-порт 3478/udp публикуется в compose.
+    enabled: true
+    region_id: 999
+    region_code: "vm"
+    region_name: "Platform VM"
+    stun_listen_addr: "0.0.0.0:3478"
+    private_key_path: /var/lib/headscale/derp_server_private.key
+  # Плюс публичные DERP-релеи Tailscale как запасные
+  urls:
+    - https://controlplane.tailscale.com/derpmap/default
+  paths: []
+  auto_update_enabled: true
+  update_frequency: 24h
+
+database:
+  type: sqlite
+  sqlite:
+    path: /var/lib/headscale/db.sqlite
+
+log:
+  level: info
+
+dns:
+  magic_dns: true
+  # ВАЖНО: base_domain обязан отличаться от домена server_url
+  base_domain: tail.__PLATFORM_DOMAIN__
+  nameservers:
+    global:
+      - 1.1.1.1
+      - 8.8.8.8
+  search_domains: []
+  # Split-DNS: внутри VPN сервисные имена резолвятся в headscale-IP VM,
+  # снаружи те же имена смотрят на публичный IP (нужно для ACME), где Caddy
+  # отвечает 403 не-VPN клиентам. Заполняется на cutover (IP появится после
+  # входа VM в headscale) — см. docs/HEADSCALE_MIGRATION.md:
+  extra_records: []
+  #  - { name: "jupyter.__PLATFORM_DOMAIN__", type: "A", value: "<headscale-IP VM>" }
+  #  - { name: "airflow.__PLATFORM_DOMAIN__", type: "A", value: "<headscale-IP VM>" }
+  #  - { name: "trino.__PLATFORM_DOMAIN__",   type: "A", value: "<headscale-IP VM>" }
+  #  - { name: "meta.__PLATFORM_DOMAIN__",    type: "A", value: "<headscale-IP VM>" }
+
+unix_socket: /var/run/headscale/headscale.sock
+unix_socket_permission: "0770"
+
+# Вход юзеров через наш Keycloak: `tailscale up --login-server https://hs.<домен>`
+# открывает браузер с обычным SSO-логином; нода регистрируется сама, админ
+# не нужен. Клиент headscale в realm создаётся kcadm'ом (см. миграционный док).
+oidc:
+  issuer: "https://auth.__PLATFORM_DOMAIN__/realms/football"
+  client_id: "headscale"
+  client_secret: "__HEADSCALE_OIDC_CLIENT_SECRET__"
+  scope: ["openid", "profile", "email"]
+  # Пускаем только группы платформы (claim groups из нашего realm)
+  allowed_groups:
+    - analysts
+    - platform-admins

@@ -28,22 +28,27 @@
 -- =============================================================================
 -- Bronze schema (verified via DESCRIBE on 2026-06-16)
 -- =============================================================================
---   match_id   varchar   -- SofaScore game_id, stringified (= xref source_id)
---   shot_id    varchar   -- SofaScore shot id (or composite fallback)
---   player_id  varchar   -- SofaScore player id, stringified
---   team_id    varchar   -- 100% NULL upstream -> team derived from is_home
---   is_home    boolean   -- TRUE = home side took the shot
---   minute     bigint
---   x, y       double    -- playerCoordinates on a 0..100 grid (NOT 0..1!)
---   xg         double    -- 0..1 expected goals
---   xgot       double    -- 0..1 expected goals on target (post-shot xG proxy)
---   shot_type  varchar   -- {miss, block, save, goal, post}  <- this is the RESULT
---   outcome    varchar   -- always 'shot' upstream -> USELESS, ignored
---   goal_type  varchar   -- {NULL, regular, penalty, own} (non-NULL iff goal)
---   body_part  varchar   -- {right-foot, left-foot, head, other}
---   situation  varchar   -- {assisted, regular, fast-break, corner, free-kick,
---                         --  penalty, set-piece, throw-in-set-piece}
---   league, season       varchar  (season is slug '2526')
+-- #840: Bronze is now auto-passthrough (source-key names, all fields kept).
+-- Renamed keys: minute->"time", x->player_coordinates_x, y->player_coordinates_y,
+-- period->reversed_period_count, outcome->incident_type. The COALESCE(old,new)
+-- in the `sm` CTE bridges pre-#840 partitions until every partition re-scrapes.
+--   match_id             varchar   -- SofaScore game_id, stringified (= xref source_id)
+--   shot_id              varchar   -- SofaScore shot id (or composite fallback)
+--   player_id            varchar   -- SofaScore player id, stringified
+--   team_id              varchar   -- 100% NULL upstream -> team derived from is_home
+--   is_home              boolean   -- TRUE = home side took the shot
+--   "time"               bigint    -- (old: minute)
+--   player_coordinates_x double    -- (old: x) on a 0..100 grid (NOT 0..1!)
+--   player_coordinates_y double    -- (old: y) on a 0..100 grid (NOT 0..1!)
+--   xg                   double    -- 0..1 expected goals
+--   xgot                 double    -- 0..1 expected goals on target (post-shot xG proxy)
+--   shot_type            varchar   -- {miss, block, save, goal, post}  <- this is the RESULT
+--   incident_type        varchar   -- (old: outcome) always 'shot' upstream -> USELESS, ignored
+--   goal_type            varchar   -- {NULL, regular, penalty, own} (non-NULL iff goal)
+--   body_part            varchar   -- {right-foot, left-foot, head, other}
+--   situation            varchar   -- {assisted, regular, fast-break, corner, free-kick,
+--                                  --  penalty, set-piece, throw-in-set-piece}
+--   league, season       varchar   -- (season is slug '2526')
 --
 -- Live-probe note (2026-06-16): bronze has APL 2526 only, 9543 shots; x in
 -- [0.4, 89.3], y in [0.8, 99.5] -> 0..100 grid, normalised to 0..1 below.
@@ -109,9 +114,12 @@ sm AS (
         shot_id,
         player_id,
         is_home,
-        minute,
-        x,
-        y,
+        -- #840: Bronze no longer renames/derives; do it here. COALESCE bridges
+        -- old (pre-#840) partitions and freshly re-scraped ones. "time" is a
+        -- Trino reserved word -> MUST be double-quoted.
+        COALESCE(minute, "time")            AS minute,
+        COALESCE(x, player_coordinates_x)   AS x,
+        COALESCE(y, player_coordinates_y)   AS y,
         xg,
         xgot,
         shot_type,
@@ -134,7 +142,12 @@ sched AS (
     SELECT game_id, home_team, away_team, league, season
     FROM (
         SELECT
-            game_id, home_team, away_team, league, season,
+            game_id,
+            -- #840: Bronze auto-passthrough renamed home_team->home_team_name;
+            -- COALESCE bridges pre-#840 partitions.
+            COALESCE(home_team, home_team_name) AS home_team,
+            COALESCE(away_team, away_team_name) AS away_team,
+            league, season,
             ROW_NUMBER() OVER (
                 PARTITION BY game_id
                 ORDER BY _ingested_at DESC

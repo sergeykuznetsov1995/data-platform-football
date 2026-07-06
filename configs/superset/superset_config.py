@@ -176,6 +176,9 @@ if os.environ.get("SUPERSET_OAUTH_ENABLED", "").lower() == "true":
     AUTH_ROLES_SYNC_AT_LOGIN = True
     AUTH_ROLES_MAPPING = {
         "analysts": ["Gamma", "sql_lab", "analyst_data"],
+        # «Простые» юзеры: дашборды без SQL Lab (и без Jupyter/Airflow —
+        # группа viewers не входит в allowed_groups/маппинги этих сервисов)
+        "viewers": ["Gamma", "analyst_data"],
         "platform-admins": ["Admin"],
     }
 

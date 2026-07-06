@@ -27,7 +27,7 @@ from airflow.operators.bash import BashOperator
 from airflow.operators.python import PythonOperator
 
 from utils.bronze_validation import validate_table
-from utils.config import LEAGUES, CURRENT_SEASON, SCHEDULES, DAG_TAGS
+from utils.config import UNDERSTAT_LEAGUES, CURRENT_SEASON, SCHEDULES, DAG_TAGS
 from utils.default_args import SCRAPER_ARGS
 
 # Issue #466: every Bronze table this DAG writes gets a fail-closed Trino
@@ -70,7 +70,8 @@ def validate_data(**context) -> Dict[str, Any]:
             'schedule_rows': scrape_result.get('schedule_rows', 0),
             'shots_rows': scrape_result.get('shots_rows', 0),
             'player_stats_rows': scrape_result.get('player_stats_rows', 0),
-            'team_stats_rows': scrape_result.get('team_stats_rows', 0),
+            'team_match_stats_rows': scrape_result.get('team_match_stats_rows', 0),
+            'player_match_stats_rows': scrape_result.get('player_match_stats_rows', 0),
             'tables': scrape_result.get('tables', []),
         }
     }
@@ -81,19 +82,29 @@ def validate_data(**context) -> Dict[str, Any]:
             validation['summary']['schedule_rows'],
             validation['summary']['shots_rows'],
             validation['summary']['player_stats_rows'],
-            validation['summary']['team_stats_rows'],
+            validation['summary']['team_match_stats_rows'],
+            validation['summary']['player_match_stats_rows'],
         ])
         validation['status'] = 'partial_success' if total_rows > 0 else 'failed'
 
-    # Check minimum thresholds
-    if validation['summary']['schedule_rows'] < 100:
-        validation['warnings'].append("Low schedule row count - possible scraping issue")
-
-    if validation['summary']['shots_rows'] < 500:
-        validation['warnings'].append("Low shots row count - possible scraping issue")
-
-    if validation['summary']['player_stats_rows'] < 100:
-        validation['warnings'].append("Low player stats row count - possible scraping issue")
+    # Check minimum thresholds — per-league baselines (one EPL season: 380
+    # fixtures, ~9.8k shots, ~550 player-seasons, ~11k player-match rows)
+    # scaled by the number of leagues actually scraped this run.
+    n_leagues = len(scrape_result.get('leagues', [])) or 1
+    per_league_floors = {
+        'schedule_rows': 100,
+        'shots_rows': 500,
+        'player_stats_rows': 100,
+        'team_match_stats_rows': 100,
+        'player_match_stats_rows': 1000,
+    }
+    for key, floor in per_league_floors.items():
+        if validation['summary'][key] < floor * n_leagues:
+            validation['warnings'].append(
+                f"Low {key} ({validation['summary'][key]} < "
+                f"{floor * n_leagues} for {n_leagues} league(s)) "
+                f"- possible scraping issue"
+            )
 
     logger.info(f"Data validation complete: {validation['status']}")
     logger.info(f"Summary: {validation['summary']}")
@@ -107,8 +118,11 @@ def validate_data(**context) -> Dict[str, Any]:
     return validation
 
 
-# Build arguments for bash command
-leagues_str = ','.join(LEAGUES)
+# Build arguments for bash command. Scaling to more leagues = extend
+# UNDERSTAT_LEAGUES (utils/config.py). If the single task ever gets heavy or
+# needs per-league failure isolation (read_shot_events is fail-fast across the
+# whole league set), split into one task per league like dag_ingest_whoscored.
+leagues_str = ','.join(UNDERSTAT_LEAGUES)
 
 # DAG definition
 with DAG(
@@ -125,7 +139,7 @@ with DAG(
     # leaves headroom for the scrape + downstream validation tasks.
     dagrun_timeout=timedelta(hours=3),
     params={
-        'leagues': LEAGUES,
+        'leagues': UNDERSTAT_LEAGUES,
         # UI-configurable season for the 10-season backfill (#712, epic #708).
         # Default = CURRENT_SEASON so the daily scheduled run is unchanged;
         # override via "Trigger DAG w/ config" to ingest a past season.
