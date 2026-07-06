@@ -660,3 +660,97 @@ class TestCombinedSeasonStatsRunner:
 
         assert exc.value.code == 2
         mock_class.assert_not_called()
+
+
+class TestSignalHandlers:
+    """Issue #877: SIGTERM/SIGINT must unwind the scraper context manager so
+    the camoufox/Firefox child dies with the runner instead of orphaning
+    ~1 GB inside the container."""
+
+    @pytest.fixture
+    def temp_output_file(self):
+        fd, path = tempfile.mkstemp(suffix='.json')
+        os.close(fd)
+        yield path
+        if os.path.exists(path):
+            os.unlink(path)
+
+    @pytest.mark.unit
+    def test_handle_termination_raises_systemexit_143(self):
+        import signal as _signal
+        import dags.scripts.run_fbref_scraper as m
+
+        with pytest.raises(SystemExit) as exc:
+            m._handle_termination(_signal.SIGTERM, None)
+        assert exc.value.code == 128 + _signal.SIGTERM  # 143
+
+    @pytest.mark.unit
+    def test_main_installs_sigterm_and_sigint_handlers(self, temp_output_file):
+        import signal as _signal
+
+        scraper = MagicMock()
+        scraper._stats = {'successes': 1, 'failures': 0}
+        scraper.get_stats.return_value = scraper._stats
+        scraper.__enter__ = MagicMock(return_value=scraper)
+        scraper.__exit__ = MagicMock(return_value=False)
+        scraper.scrape_schedule.return_value = {
+            'schedule': 'iceberg.bronze.fbref_schedule'
+        }
+        mock_class = MagicMock(return_value=scraper)
+
+        sys.argv = ['run_fbref_scraper.py'] + [
+            '--scraper-type', 'nodriver',
+            '--mode', 'match_data',
+            '--match-data-type', 'schedule',
+            '--leagues', 'ENG-Premier League',
+            '--season', '2024',
+            '--output', temp_output_file,
+        ]
+        with patch(
+            'scrapers.nodriver_fbref.NodriverFBrefScraper', mock_class
+        ):
+            import importlib
+            import dags.scripts.run_fbref_scraper as m
+            importlib.reload(m)
+            with patch.object(m.signal, 'signal') as mock_signal:
+                m.main()
+
+        registered = {call.args[0] for call in mock_signal.call_args_list}
+        assert _signal.SIGTERM in registered
+        assert _signal.SIGINT in registered
+        for call in mock_signal.call_args_list:
+            if call.args[0] in (_signal.SIGTERM, _signal.SIGINT):
+                assert call.args[1] is m._handle_termination
+
+    @pytest.mark.unit
+    def test_systemexit_unwinds_scraper_context(self, temp_output_file):
+        """SystemExit raised mid-scrape must propagate (not be swallowed by
+        the generic error handling) AND call the scraper __exit__ so the
+        browser child is closed."""
+        scraper = MagicMock()
+        scraper._stats = {'successes': 0, 'failures': 0}
+        scraper.get_stats.return_value = scraper._stats
+        scraper.__enter__ = MagicMock(return_value=scraper)
+        scraper.__exit__ = MagicMock(return_value=False)
+        scraper.scrape_schedule.side_effect = SystemExit(143)
+        mock_class = MagicMock(return_value=scraper)
+
+        sys.argv = ['run_fbref_scraper.py'] + [
+            '--scraper-type', 'nodriver',
+            '--mode', 'match_data',
+            '--match-data-type', 'schedule',
+            '--leagues', 'ENG-Premier League',
+            '--season', '2024',
+            '--output', temp_output_file,
+        ]
+        with patch(
+            'scrapers.nodriver_fbref.NodriverFBrefScraper', mock_class
+        ):
+            import importlib
+            import dags.scripts.run_fbref_scraper as m
+            importlib.reload(m)
+            with pytest.raises(SystemExit) as exc:
+                m.main()
+
+        assert exc.value.code == 143
+        assert scraper.__exit__.called

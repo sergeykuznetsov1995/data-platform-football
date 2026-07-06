@@ -7,28 +7,36 @@ Standalone script to run FBref scraper.
 Called from Airflow via BashOperator to avoid memory issues with PythonOperator.
 
 Supports two scraper types:
-1. nodriver (default, recommended) - Browser-based with Cloudflare Turnstile bypass
-2. selenium - Browser-based with undetected-chromedriver (used for combined
-   match-level data: shot_events, match_events, lineups, match_team_stats,
-   match_player_stats)
+1. nodriver (default) - Browser-based with Cloudflare Turnstile bypass.
+   DEAD against the managed interstitial CF rolled out ~2026-07 (#877) —
+   do not use for new scrapes.
+2. selenium - FBrefScraper; with FBREF_TRANSPORT=camoufox this is the
+   working Cloudflare path (#846/#853) used by the prod DAG for schedule
+   and combined match-level data.
 
 Usage:
-    # Using nodriver (recommended for Cloudflare Turnstile)
-    python run_fbref_scraper.py --scraper-type nodriver --proxy-file /path/to/proxys.txt
-
-    # Using nodriver with specific settings
-    python run_fbref_scraper.py --scraper-type nodriver --cloudflare-wait 120 --cf-verify-retries 15
+    # Schedule via the working camoufox transport (#CF-2026-07, #877)
+    FBREF_TRANSPORT=camoufox python run_fbref_scraper.py --scraper-type selenium \
+        --mode match_data --match-data-type schedule --proxy-file /path/to/proxys.txt
 
 NOTE: As of 2025-2026, FBref uses Cloudflare Turnstile CAPTCHA.
       The deprecated soccerdata/curl_cffi scraper was removed (Apr 2026) —
       it cannot execute JavaScript, so it never bypassed the Turnstile.
-      nodriver with cf-verify plugin is the only HTTP-replacement that works.
+
+NOTE (#877): when wrapping this runner with a timeout from the host, put
+      `timeout` INSIDE the container command:
+          docker exec ... airflow-scheduler timeout -k 30 <secs> python dags/scripts/run_fbref_scraper.py ...
+      A host-side `timeout N docker exec ...` only kills the docker client;
+      the python process (and its ~1 GB camoufox/Firefox child) keeps running
+      in the container. SIGTERM/SIGINT are handled: the runner exits non-zero
+      and closes the browser child cleanly.
 """
 
 import argparse
 import json
 import logging
 import os
+import signal
 import sys
 from collections import Counter
 from datetime import datetime
@@ -64,6 +72,22 @@ def _configure_logging(verbose: bool = False) -> None:
     if not verbose:
         for name in _NOISY_LOGGERS:
             logging.getLogger(name).setLevel(logging.WARNING)
+
+
+def _handle_termination(signum, frame):
+    """Translate SIGTERM/SIGINT into SystemExit so the ``with <Scraper>``
+    block in main() unwinds and closes the browser child (camoufox/Firefox,
+    ~1 GB RSS) instead of orphaning it inside the container (#877).
+
+    SystemExit is a BaseException — the generic ``except Exception`` error
+    handling below does not swallow it.
+    """
+    raise SystemExit(128 + signum)  # 143 for SIGTERM, 130 for SIGINT
+
+
+def _install_signal_handlers() -> None:
+    signal.signal(signal.SIGTERM, _handle_termination)
+    signal.signal(signal.SIGINT, _handle_termination)
 
 
 def _get_traffic_diagnostics(scraper) -> dict:
@@ -274,6 +298,10 @@ def _write_traffic_summary(
 
 
 def main():
+    # #877: must be first — a SIGTERM before handlers are installed would
+    # kill the runner without unwinding the scraper context manager.
+    _install_signal_handlers()
+
     parser = argparse.ArgumentParser(description='Run FBref scraper')
 
     # === Scraper type selection ===
