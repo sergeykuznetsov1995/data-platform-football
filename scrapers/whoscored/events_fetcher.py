@@ -264,6 +264,20 @@ def parse_matchcentre_to_events_df(
 
     if "player_id" in df.columns and player_names:
         df["player"] = df["player_id"].replace(player_names)
+        # A player_id missing from playerIdNameDictionary survives replace()
+        # as a float, leaving a mixed str/float column that pyarrow refuses
+        # to write ("Expected bytes, got a 'float' object" — #878, killed the
+        # GER-2020 events unit). Null those out; player_id keeps the raw id.
+        unresolved = df["player"].notna() & ~df["player"].apply(
+            lambda v: isinstance(v, str)
+        )
+        if unresolved.any():
+            logger.warning(
+                "%d events reference player_ids missing from "
+                "playerIdNameDictionary (game_id=%s); player set to null",
+                int(unresolved.sum()), game_id,
+            )
+            df.loc[unresolved, "player"] = np.nan
     elif "player" not in df.columns:
         df["player"] = np.nan
 
