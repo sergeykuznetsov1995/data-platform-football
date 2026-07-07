@@ -12,7 +12,8 @@
 #                     (топ-10 + фильтр «Игрок»), стоимость состава и фонд ЗП
 #                     по сезонам, таблица всех сделок
 #   4. Форма по турам — гонка за титул (кумулятивные очки), скользящий
-#                     xG-баланс за 5 матчей, форма игрока по матчам
+#                     xG-баланс за 5 матчей, гонка бомбардиров (кумулятив
+#                     Г+А), рейтинг игрока за 5 матчей
 #   5. Вратари      — % сейвов, сухие матчи, PSxG − GA, сводная таблица
 #
 # В отличие от player_overview.py здесь НЕТ хардкода league/season: все
@@ -494,8 +495,12 @@ FROM iceberg.gold.fct_team_match tm
 LEFT JOIN iceberg.gold.dim_team dt ON dt.team_id = tm.team_id
 WHERE tm.is_completed AND tm.gameweek IS NOT NULL"""
 
-    # По-матчевая форма игрока (рейтинг, xG/xA). Чарты по умолчанию режутся
-    # series-limit'ом до топ-8 по минутам; фильтр «Игрок» показывает любого.
+    # По-матчевая форма игрока. Сырые per-match значения (рейтинг, xG/xA)
+    # линиями не читались (шум 6–8 у рейтинга, пила у xG) — чарты строятся
+    # на оконных колонках: кумулятив Г+А («гонка бомбардиров») и рейтинг,
+    # сглаженный за 5 матчей. Окна строго ORDER BY gameweek (см. v_team_form);
+    # season_minutes — для порога «только регулярные игроки» в форм-чарте.
+    # COALESCE в кумулятиве: NULL-гол в одном матче не дырявит всю сумму.
     v_player_form = f"""\
 SELECT
   fpm.player_id,
@@ -508,11 +513,24 @@ SELECT
   fpm.goals, fpm.assists,
   fpm.xg AS expected_goals,
   fpm.xa AS expected_assists,
-  fpm.rating, fpm.key_passes
+  fpm.rating, fpm.key_passes,
+  SUM(COALESCE(fpm.goals, 0) + COALESCE(fpm.assists, 0)) OVER (
+    PARTITION BY fpm.player_id, fpm.league, fpm.season
+    ORDER BY dm.gameweek
+  ) AS cum_goal_contrib,
+  AVG(fpm.rating) OVER (
+    PARTITION BY fpm.player_id, fpm.league, fpm.season
+    ORDER BY dm.gameweek
+    ROWS BETWEEN 4 PRECEDING AND CURRENT ROW
+  ) AS rating_rolling5,
+  SUM(fpm.minutes_played) OVER (
+    PARTITION BY fpm.player_id, fpm.league, fpm.season
+  ) AS season_minutes
 FROM iceberg.gold.fct_player_match fpm
 JOIN iceberg.gold.dim_match dm ON dm.match_id = fpm.match_id
 LEFT JOIN iceberg.gold.dim_player dp ON dp.player_id = fpm.player_id
-LEFT JOIN iceberg.gold.dim_team   dt ON dt.team_id = fpm.team_id"""
+LEFT JOIN iceberg.gold.dim_team   dt ON dt.team_id = fpm.team_id
+WHERE dm.gameweek IS NOT NULL"""
 
     v_keeper_season = """\
 SELECT
@@ -1189,49 +1207,51 @@ def _build_slices(ctx: _Ctx, vds: dict[str, Any]) -> list[Any]:
         },
     ))
 
-    # Ось = тур (общая сетка → сплошные линии) + series limit «топ-8 по
-    # минутам» — без выбранного игрока чарт читаем, с выбранным показывает его.
+    # Замена сырых per-match линий (шумели, не читались): «гонка бомбардиров»
+    # — кумулятивные Г+А по турам, монотонные линии как у «Гонки за титул».
+    # Series limit топ-8 по пиковому кумулятиву; фильтр «Игрок» покажет любого.
     slices.append(_make_slice(ctx,
-        "Рейтинг по матчам", "echarts_timeseries_line",
+        "Гонка бомбардиров: Г+А по турам", "echarts_timeseries_line",
         player_form,
         {
             "time_range": "No filter",
             "x_axis": "gameweek",
-            "metrics": [_metric("Рейтинг", "AVG", "rating")],
+            "metrics": [_metric("Г+А (кумулятивно)", "MAX", "cum_goal_contrib")],
             "groupby": ["player_name"],
             "limit": 8,
-            "timeseries_limit_metric": _metric("Минуты", "SUM", "minutes"),
+            "timeseries_limit_metric": _metric(
+                "Пик Г+А", "MAX", "cum_goal_contrib"
+            ),
+            "row_limit": 50000,
+            "show_legend": True,
+            **_line_tt,
+            "x_axis_title": "Тур",
+            "y_axis_format": ".0f",
+        },
+    ))
+
+    # Рейтинг, сглаженный окном 5 матчей: видны спады/подъёмы формы вместо
+    # пилы 6–8. Топ-8 по СРЕДНЕМУ рейтингу (не по минутам — там сплошь
+    # вратари), порог season_minutes >= 900 отсекает малые выборки.
+    slices.append(_make_slice(ctx,
+        "Форма: рейтинг за 5 матчей", "echarts_timeseries_line",
+        player_form,
+        {
+            "time_range": "No filter",
+            "x_axis": "gameweek",
+            "metrics": [_metric(
+                "Рейтинг (ср. за 5 матчей)", "AVG", "rating_rolling5"
+            )],
+            "groupby": ["player_name"],
+            "limit": 8,
+            "timeseries_limit_metric": _metric("Средний рейтинг", "AVG", "rating"),
             "adhoc_filters": [_sql_where(
-                "rating IS NOT NULL AND gameweek IS NOT NULL"
+                "rating_rolling5 IS NOT NULL AND season_minutes >= 900"
             )],
             "row_limit": 50000,
             "show_legend": True,
             **_line_tt,
             "truncateYAxis": True,
-            "x_axis_title": "Тур",
-            "y_axis_format": ".2f",
-        },
-    ))
-
-    slices.append(_make_slice(ctx,
-        "xG и xA по матчам", "echarts_timeseries_line",
-        player_form,
-        {
-            "time_range": "No filter",
-            "x_axis": "gameweek",
-            "metrics": [
-                _metric("xG", "SUM", "expected_goals"),
-                _metric("xA", "SUM", "expected_assists"),
-            ],
-            "groupby": ["player_name"],
-            "limit": 4,
-            "timeseries_limit_metric": _metric(
-                "Суммарный xG", "SUM", "expected_goals"
-            ),
-            "adhoc_filters": [_sql_where("gameweek IS NOT NULL")],
-            "row_limit": 50000,
-            "show_legend": True,
-            **_line_tt,
             "x_axis_title": "Тур",
             "y_axis_format": ".2f",
         },
@@ -1472,8 +1492,10 @@ def _build_position_json(slices: list[Any]) -> dict[str, Any]:
     c.append(_row(p, [_chart(slices[28], 12, height=55)]))
     c.append(_markdown(p,
         "## Форма игрока\n\n"
-        "По умолчанию — топ-8 по минутам (рейтинг) и топ-4 по xG (xG/xA); "
-        "выбери игрока в фильтре «Игрок», чтобы посмотреть любого.",
+        "Гонка бомбардиров — кумулятивные гол+пас по турам (топ-8 сезона). "
+        "Форма — рейтинг SofaScore, сглаженный за последние 5 матчей "
+        "(топ-8 по среднему рейтингу, минимум 900 минут). "
+        "Выбери игрока в фильтре «Игрок», чтобы посмотреть любого.",
     ))
     c.append(_row(p, [_chart(slices[29], 6, height=55), _chart(slices[30], 6, height=55)]))
 
