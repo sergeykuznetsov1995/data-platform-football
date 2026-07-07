@@ -760,6 +760,36 @@ class TestEventsParser:
         assert df.iloc[0]['expanded_minute'] == 12
         assert df.iloc[0]['goal_mouth_y'] == 33.0
 
+    def test_parse_unresolved_player_id_is_nulled(self):
+        """#878 regression (GER-2020): a player_id missing from
+        playerIdNameDictionary used to survive ``replace()`` as a float,
+        producing a mixed str/float ``player`` column that pyarrow refuses
+        to write ("Expected bytes, got a 'float' object")."""
+        import pandas as pd
+
+        from scrapers.whoscored.events_fetcher import (
+            parse_matchcentre_to_events_df,
+        )
+        data = {
+            'events': [
+                {'eventId': 1, 'teamId': 1, 'playerId': 100},
+                # 999 is NOT in the dictionary — must become null, not 999.0
+                {'eventId': 2, 'teamId': 2, 'playerId': 999},
+            ],
+            'playerIdNameDictionary': {'100': 'Player A'},
+            'home': {'teamId': 1, 'name': 'H'},
+            'away': {'teamId': 2, 'name': 'A'},
+        }
+        df = parse_matchcentre_to_events_df(
+            data, league='X', season='2021', game_id=1, game_name='g',
+        )
+        assert df.iloc[0]['player'] == 'Player A'
+        assert pd.isna(df.iloc[1]['player'])
+        # Column must be pyarrow-safe: every value is str or null.
+        assert all(
+            isinstance(v, str) or pd.isna(v) for v in df['player'].tolist()
+        )
+
 
 @pytest.mark.unit
 class TestWhoScoredSeasonHelper:
