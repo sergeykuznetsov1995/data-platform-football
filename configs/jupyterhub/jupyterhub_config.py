@@ -6,13 +6,11 @@ import sys
 
 c = get_config()  # noqa: F821
 
-TS_HOSTNAME = os.environ["TS_HOSTNAME"]
 ISSUER = os.environ["OIDC_ISSUER"]
-# Гибрид (docs/HEADSCALE_MIGRATION.md): jupyter.<домен> вместо tailnet-FQDN
-# и trino.<домен>:8444->443; пустые env = текущая tailnet-схема
-PUBLIC_HOST = os.environ.get("JUPYTER_PUBLIC_HOST") or TS_HOSTNAME
-TRINO_HOST = os.environ.get("TRINO_PUBLIC_HOST") or TS_HOSTNAME
-TRINO_PORT = os.environ.get("TRINO_PUBLIC_PORT") or "8444"
+# Публичная схема (без VPN): все адреса — публичные FQDN за Caddy :443
+PUBLIC_HOST = os.environ["JUPYTER_PUBLIC_HOST"]
+TRINO_HOST = os.environ["TRINO_PUBLIC_HOST"]
+TRINO_PORT = os.environ.get("TRINO_PUBLIC_PORT", "443")
 
 # --- Сеть/база -------------------------------------------------------------
 c.JupyterHub.bind_url = "http://0.0.0.0:8000"

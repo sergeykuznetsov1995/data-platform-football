@@ -1,52 +1,55 @@
-# Гибридная схема через bind-изоляцию (docs/HEADSCALE_MIGRATION.md).
-# Два контейнерных listener'а, разведённые published-портами compose:
-#   :443  <- ${PUBLIC_IP}:443  — публичные сайты (bi/auth/hs), видны из интернета
-#   :8443 <- ${TS_IP}:443      — VPN-сайты (jupyter/airflow/trino/meta)
-# Клиенты ВЕЗДЕ ходят на :443 (порт в URL не нужен): split-DNS резолвит
-# jupyter/airflow/trino/meta в headscale-IP VM (${TS_IP}), docker DNAT'ит
-# ${TS_IP}:443 -> контейнерный 8443; bi/auth/hs резолвятся в ${PUBLIC_IP}.
-# Из интернета VPN-сайтов на :443 нет (другой listener) -> недоступны.
-# Гейт по listener'у, НЕ по remote_ip: docker подменяет source IP при
-# форвардинге tailscale0->bridge, remote_ip-матчинг там не работает.
+# Публичная схема (без VPN): один listener :443 на ${PUBLIC_IP}.
+# Гейт — Keycloak SSO у каждого сервиса (Superset/JupyterHub/Airflow — OAuth,
+# Trino — PASSWORD для машинных + OAUTH2 для людей).
+# /admin и master-realm Keycloak закрыты снаружи: админка — через SSH-туннель
+# на 127.0.0.1:8180 (KC_HOSTNAME_ADMIN в compose.yaml).
+# OpenMetadata НЕ публикуется (basic auth, один админ) — SSH-туннель 127.0.0.1:8585.
 # ACME HTTP-01: все A-записи -> ${PUBLIC_IP}, :80 опубликован там же.
+# JSON access-log на /var/log/caddy (bind на хост) — его читает fail2ban.
 
-# --- Публичные (listener :443) -----------------------------------------------
+(logging) {
+	log {
+		output file /var/log/caddy/access.log {
+			roll_size 20MiB
+			roll_keep 5
+		}
+		format json {
+			time_format rfc3339
+		}
+	}
+}
 
-# Superset: дашборды для «простых» юзеров. Защита — Keycloak SSO.
+# Superset: дашборды. Защита — Keycloak SSO.
 https://bi.{$PLATFORM_DOMAIN} {
+	import logging
 	reverse_proxy superset:8088
 }
 
-# Keycloak: обязан быть публичным — на него редиректят браузеры юзеров (OIDC).
+# Keycloak: публичен только юзер-флоу (realm football).
 https://auth.{$PLATFORM_DOMAIN} {
+	import logging
+	@admin path /admin /admin/* /realms/master /realms/master/*
+	respond @admin 403
 	reverse_proxy keycloak:8080
 }
 
-# Headscale: контрольный сервер VPN (клиенты ходят сюда при логине и keepalive).
-https://hs.{$PLATFORM_DOMAIN} {
-	reverse_proxy headscale:8080
-}
-
-# --- Только из VPN (listener :8443, published лишь на ${TS_IP}) ---------------
-
-https://jupyter.{$PLATFORM_DOMAIN}:8443 {
+https://jupyter.{$PLATFORM_DOMAIN} {
+	import logging
 	reverse_proxy jupyterhub:8000
 }
 
-https://airflow.{$PLATFORM_DOMAIN}:8443 {
+https://airflow.{$PLATFORM_DOMAIN} {
+	import logging
 	reverse_proxy airflow-webserver:8080
 }
 
 # Trino говорит HTTPS сам (self-signed) — re-encrypt.
-https://trino.{$PLATFORM_DOMAIN}:8443 {
+https://trino.{$PLATFORM_DOMAIN} {
+	import logging
 	reverse_proxy https://trino:8443 {
 		transport http {
 			tls
 			tls_insecure_skip_verify
 		}
 	}
-}
-
-https://meta.{$PLATFORM_DOMAIN}:8443 {
-	reverse_proxy openmetadata-server:8585
 }
