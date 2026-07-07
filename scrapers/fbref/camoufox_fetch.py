@@ -25,6 +25,7 @@ Requirements (already in the image, do NOT bump):
 - a residential proxy (Turnstile 403s on a datacenter IP)
 """
 
+import asyncio
 import logging
 import os
 import time
@@ -178,6 +179,29 @@ class CamoufoxFbrefTransport:
     # -- lifecycle -------------------------------------------------------- #
     def _start(self) -> None:
         from camoufox.sync_api import Camoufox  # lazy: heavy (Firefox)
+
+        # Recover from a poisoned thread. camoufox's ``Camoufox.__exit__`` calls
+        # an UNGUARDED ``browser.close()`` before playwright's event-loop
+        # teardown; when a prior session's browser is dead/hung (e.g. a failed
+        # Turnstile solve), that close() raises and playwright never closes its
+        # sync loop, leaving it bound-and-running on this thread. playwright's
+        # sync ``__enter__`` then hits ``get_running_loop().is_running()`` and
+        # raises "Sync API inside the asyncio loop", which cascades to every
+        # remaining fetch in the process (observed poisoning combined_season_stats
+        # after a single failed Turnstile). Detaching the stale running-loop flag
+        # here lets this start build a fresh loop. No-op on the normal path
+        # (no running loop -> RuntimeError -> pass).
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            pass
+        else:
+            logger.warning(
+                "Stale running asyncio loop detected before Camoufox start "
+                "(prior teardown left it bound); detaching so the session can "
+                "start clean."
+            )
+            asyncio.events._set_running_loop(None)
 
         self._proxy = self._proxy_provider() if self._proxy_provider else None
         if not self._proxy:
