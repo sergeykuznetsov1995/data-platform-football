@@ -435,7 +435,11 @@ def _validate_e3(**context) -> Dict[str, Any]:
 
     from utils.alerts import telegram_dq_summary
     from utils.data_quality import CheckResult, run_checks
-    from utils.e3_dq import build_all_e3_checks, parity_check_event_counts
+    from utils.e3_dq import (
+        build_all_e3_checks,
+        completeness_check_events,
+        parity_check_event_counts,
+    )
 
     all_checks = build_all_e3_checks()
     logger.info("E3 DQ: running %d standard checks from utils.e3_dq", len(all_checks))
@@ -454,6 +458,21 @@ def _validate_e3(**context) -> Dict[str, Any]:
         logger.exception("parity_check_event_counts crashed; recording WARNING")
         report.results.append(CheckResult(
             name='parity_check_event_counts',
+            kind='custom',
+            severity='WARNING',
+            passed=False,
+            error=str(e),
+        ))
+
+    # Schedule->events completeness gate (custom — #895). ERROR on any
+    # scheduled fixture missing events that is NOT in the sanctioned floor.
+    try:
+        completeness_result = completeness_check_events()
+        report.results.append(completeness_result)
+    except Exception as e:
+        logger.exception("completeness_check_events crashed; recording WARNING")
+        report.results.append(CheckResult(
+            name='completeness_check_events',
             kind='custom',
             severity='WARNING',
             passed=False,

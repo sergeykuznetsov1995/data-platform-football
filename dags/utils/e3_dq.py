@@ -136,6 +136,51 @@ assert len(WHOSCORED_KNOWN_TYPES_39) == 39, (
 
 
 # ---------------------------------------------------------------------------
+# Sanctioned known-missing game_ids — WhoScored events backfill (#895)
+# ---------------------------------------------------------------------------
+# The #878 top-5 × 10-season events backfill (PR #885 fast-schedule path +
+# PR #890 player_id parser fix) loaded 17901/17950 scheduled fixtures into
+# bronze.whoscored_events (99.73%). The 49 residual fixtures below are a
+# SANCTIONED completeness floor — NOT a scraper defect. Validated 2026-07-08
+# against the live table (the schedule↔events missing set == this list, exact)
+# and cross-checked against the backfill run logs (/root/ws878_backfill/state/).
+#
+# Three sanctioned reasons (full register:
+# docs/decisions/whoscored-events-backfill-known-missing.md §2):
+#   * FRA-1920 ×21 — Ligue 1 COVID cancellation (fixtures 2020-03, never played);
+#   * FRA-1617 ×2  — abandoned matches (Bastia–Lyon pitch invasion, Metz–Lyon);
+#   * ×26 played fixtures WhoScored serves no matchCentreData for (3 backfill
+#     retry rounds, ~12 attempts/match, all re-confirmed absent).
+#
+# The completeness gate (:func:`completeness_check_events`) treats these as
+# expected: any scheduled game_id absent from events but NOT in this set is a
+# real gap → ERROR. Source of truth = the decision record; keep both in sync.
+WHOSCORED_KNOWN_MISSING_GAME_IDS: frozenset = frozenset({
+    # FRA-Ligue 1 1920 — COVID cancellation (21)
+    1376707, 1376716, 1376717, 1376718, 1376719, 1376720, 1376721, 1376722,
+    1376723, 1376724, 1376725, 1376726, 1376727, 1376728, 1376729, 1376730,
+    1376731, 1376732, 1376733, 1376734, 1376735,
+    # FRA-Ligue 1 1617 — abandoned (2)
+    1076372, 1351262,
+    # Played fixtures with no matchCentreData from WhoScored (26)
+    1376255,                                               # ENG 1920 (1)
+    1549586, 1549627, 1549733,                             # ENG 2122 (3)
+    1559829,                                               # ESP 2122 (1)
+    1558343, 1558457, 1558484, 1558514, 1558548,          # FRA 2122 (5)
+    1643925,                                               # FRA 2223 (1)
+    1741059,                                               # FRA 2324 (1)
+    1643097, 1643214,                                      # GER 2223 (2)
+    1575817, 1575876, 1575881, 1575889, 1575891, 1575896, # ITA 2122 (6)
+    1651493, 1651573, 1651673, 1651695, 1651772, 1651789, # ITA 2223 (6)
+})
+
+assert len(WHOSCORED_KNOWN_MISSING_GAME_IDS) == 49, (
+    "WHOSCORED_KNOWN_MISSING_GAME_IDS must have exactly 49 entries — "
+    f"got {len(WHOSCORED_KNOWN_MISSING_GAME_IDS)}"
+)
+
+
+# ---------------------------------------------------------------------------
 # Per-season DQ helpers (E3.5 backfill)
 # ---------------------------------------------------------------------------
 
@@ -1418,11 +1463,141 @@ def append_parity_check_to_report(report: Any) -> None:
         logger.error(f"  FAIL {result.name} — {result.details or result.error}")
 
 
+# ---------------------------------------------------------------------------
+# Custom schedule→events completeness check (CheckResult, runs as side-task)
+# ---------------------------------------------------------------------------
+
+def _run_completeness(name: str, sql: str) -> CheckResult:
+    """Execute a schedule→events completeness query and diff vs the floor.
+
+    ``sql`` must SELECT the scheduled ``game_id``s that have NO row in
+    ``bronze.whoscored_events``. Any returned id NOT in
+    :data:`WHOSCORED_KNOWN_MISSING_GAME_IDS` (the #895 sanctioned floor) is an
+    unsanctioned gap → ERROR fail. Returns a single :class:`CheckResult` ready
+    to append to a ``RunReport``.
+    """
+    conn = _get_conn()
+    try:
+        cur = conn.cursor()
+        try:
+            cur.execute(sql)
+            rows = cur.fetchall()
+        finally:
+            cur.close()
+
+        missing = {int(r[0]) for r in rows if r and r[0] is not None}
+        sanctioned = missing & WHOSCORED_KNOWN_MISSING_GAME_IDS
+        unsanctioned = sorted(missing - WHOSCORED_KNOWN_MISSING_GAME_IDS)
+        passed = not unsanctioned
+
+        details = (
+            f"{len(missing)} scheduled fixture(s) missing events "
+            f"({len(sanctioned)} sanctioned, {len(unsanctioned)} unsanctioned)"
+        )
+        if unsanctioned:
+            preview = ", ".join(str(g) for g in unsanctioned[:20])
+            more = "" if len(unsanctioned) <= 20 else f" (+{len(unsanctioned) - 20} more)"
+            details += (
+                f" — UNSANCTIONED missing game_id(s): {preview}{more}. "
+                "Re-scrape the fixture(s); if legitimately unavailable, add to "
+                "utils.e3_dq.WHOSCORED_KNOWN_MISSING_GAME_IDS + "
+                "docs/decisions/whoscored-events-backfill-known-missing.md."
+            )
+        return CheckResult(
+            name=name,
+            kind='completeness',
+            severity='ERROR',
+            passed=passed,
+            details=details,
+            value={
+                'missing_total': len(missing),
+                'sanctioned': len(sanctioned),
+                'unsanctioned': len(unsanctioned),
+                'unsanctioned_ids': unsanctioned[:50],
+            },
+        )
+    except Exception as e:
+        logger.exception("completeness check raised")
+        return CheckResult(
+            name=name,
+            kind='completeness',
+            severity='ERROR',
+            passed=False,
+            error=str(e),
+        )
+    finally:
+        conn.close()
+
+
+def completeness_check_events() -> CheckResult:
+    """Schedule→events completeness gate for ``bronze.whoscored_events``.
+
+    Every scheduled fixture (``bronze.whoscored_schedule``, ``game_id`` NOT
+    NULL) must have events. Fixtures whose only gap is in the #895 sanctioned
+    floor (:data:`WHOSCORED_KNOWN_MISSING_GAME_IDS` — COVID/abandoned/no
+    matchCentreData) are excluded, so the gate fails only on NEW gaps.
+
+    ERROR severity: an unsanctioned missing fixture means an ingest/backfill
+    silently dropped a match before Silver/Gold. Mirrors
+    :func:`parity_check_event_counts` (custom CheckResult, not a CHECK.*).
+    """
+    name = 'completeness[bronze.whoscored_schedule→events]'
+    sql = (
+        "SELECT s.game_id "
+        "FROM iceberg.bronze.whoscored_schedule s "
+        "LEFT JOIN (SELECT DISTINCT game_id FROM iceberg.bronze.whoscored_events) e "
+        "  ON e.game_id = s.game_id "
+        "WHERE e.game_id IS NULL AND s.game_id IS NOT NULL"
+    )
+    return _run_completeness(name, sql)
+
+
+def completeness_check_events_per_season(
+    season: str,
+    league: str = 'ENG-Premier League',
+) -> CheckResult:
+    """Per-season variant of :func:`completeness_check_events`.
+
+    Scoped to one ``(season, league)`` tuple; used by the E3.5 backfill DAG's
+    ``validate_backfill`` task alongside
+    :func:`parity_check_event_counts_per_season`.
+    """
+    name = (
+        "completeness[bronze.whoscored_schedule→events "
+        f"season={season} league={league}]"
+    )
+    safe_season = _safe_predicate_value(season)
+    safe_league = _safe_predicate_value(league)
+    sql = (
+        "SELECT s.game_id "
+        "FROM iceberg.bronze.whoscored_schedule s "
+        "LEFT JOIN (SELECT DISTINCT game_id FROM iceberg.bronze.whoscored_events) e "
+        "  ON e.game_id = s.game_id "
+        "WHERE e.game_id IS NULL AND s.game_id IS NOT NULL "
+        f"AND s.season = '{safe_season}' AND s.league = '{safe_league}'"
+    )
+    return _run_completeness(name, sql)
+
+
+def append_completeness_check_to_report(report: Any) -> None:
+    """Append :func:`completeness_check_events` result to a ``RunReport``.
+
+    Convenience wrapper mirroring :func:`append_parity_check_to_report`.
+    """
+    result = completeness_check_events()
+    report.results.append(result)
+    if result.passed:
+        logger.info(f"  OK   {result.name} — {result.details}")
+    else:
+        logger.error(f"  FAIL {result.name} — {result.details or result.error}")
+
+
 __all__ = [
     'SPADL_ACTION_ENUM',
     'SPADL_ACTION_SOURCE',
     'SPADL_ACTION_VERSION',
     'WHOSCORED_KNOWN_TYPES_39',
+    'WHOSCORED_KNOWN_MISSING_GAME_IDS',
     'build_silver_e3_checks',
     'build_gold_e3_checks',
     'build_all_e3_checks',
@@ -1430,5 +1605,8 @@ __all__ = [
     'parity_check_event_counts',
     'parity_check_event_counts_per_season',
     'taxonomy_diff_check',
+    'completeness_check_events',
+    'completeness_check_events_per_season',
     'append_parity_check_to_report',
+    'append_completeness_check_to_report',
 ]

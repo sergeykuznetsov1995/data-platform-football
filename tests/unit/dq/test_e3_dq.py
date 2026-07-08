@@ -642,3 +642,94 @@ class TestParityCheckExportedAndShape:
         assert "SPADL_ACTION_ENUM" in e3_dq.__all__
         assert "SPADL_ACTION_SOURCE" in e3_dq.__all__
         assert "SPADL_ACTION_VERSION" in e3_dq.__all__
+
+
+# ===========================================================================
+# Completeness gate (#895) — schedule→events + sanctioned known-missing floor
+# ===========================================================================
+
+
+def _conn_returning_missing(missing_ids):
+    """Fake Trino conn whose cursor.fetchall() yields ``(game_id,)`` rows."""
+    from unittest.mock import MagicMock
+
+    cursor = MagicMock()
+    cursor.fetchall.return_value = [(int(g),) for g in missing_ids]
+    conn = MagicMock()
+    conn.cursor.return_value = cursor
+    conn.close.return_value = None
+    return conn
+
+
+class TestKnownMissingFloor:
+    """The #895 sanctioned known-missing floor is pinned at exactly 49."""
+
+    def test_known_missing_has_49_entries(self):
+        assert len(e3_dq.WHOSCORED_KNOWN_MISSING_GAME_IDS) == 49
+
+    def test_known_missing_is_frozenset_of_int(self):
+        assert isinstance(e3_dq.WHOSCORED_KNOWN_MISSING_GAME_IDS, frozenset)
+        assert all(isinstance(g, int) for g in e3_dq.WHOSCORED_KNOWN_MISSING_GAME_IDS)
+
+    def test_completeness_api_exported(self):
+        assert callable(e3_dq.completeness_check_events)
+        assert callable(e3_dq.completeness_check_events_per_season)
+        assert callable(e3_dq.append_completeness_check_to_report)
+        for name in (
+            'WHOSCORED_KNOWN_MISSING_GAME_IDS',
+            'completeness_check_events',
+            'completeness_check_events_per_season',
+            'append_completeness_check_to_report',
+        ):
+            assert name in e3_dq.__all__
+
+
+class TestCompletenessCheck:
+    """schedule→events completeness gate: sanctioned pass, unsanctioned ERROR."""
+
+    def test_passes_when_all_missing_are_sanctioned(self):
+        from unittest.mock import patch
+
+        sanctioned = list(e3_dq.WHOSCORED_KNOWN_MISSING_GAME_IDS)[:5]
+        conn = _conn_returning_missing(sanctioned)
+        with patch.object(e3_dq, '_get_conn', return_value=conn):
+            result = e3_dq.completeness_check_events()
+        assert result.passed is True
+        assert result.severity == 'ERROR'
+        assert result.kind == 'completeness'
+        assert result.value['unsanctioned'] == 0
+        assert result.value['sanctioned'] == 5
+
+    def test_passes_when_nothing_missing(self):
+        from unittest.mock import patch
+
+        conn = _conn_returning_missing([])
+        with patch.object(e3_dq, '_get_conn', return_value=conn):
+            result = e3_dq.completeness_check_events()
+        assert result.passed is True
+        assert result.value['missing_total'] == 0
+
+    def test_fails_on_unsanctioned_missing(self):
+        from unittest.mock import patch
+
+        # one sanctioned id + one NEW gap (99999999 is not in the floor)
+        some_sanctioned = next(iter(e3_dq.WHOSCORED_KNOWN_MISSING_GAME_IDS))
+        conn = _conn_returning_missing([some_sanctioned, 99999999])
+        with patch.object(e3_dq, '_get_conn', return_value=conn):
+            result = e3_dq.completeness_check_events()
+        assert result.passed is False
+        assert result.severity == 'ERROR'
+        assert result.value['unsanctioned'] == 1
+        assert 99999999 in result.value['unsanctioned_ids']
+        assert '99999999' in result.details
+
+    def test_per_season_variant_uses_same_floor(self):
+        from unittest.mock import patch
+
+        conn = _conn_returning_missing([99999999])
+        with patch.object(e3_dq, '_get_conn', return_value=conn):
+            result = e3_dq.completeness_check_events_per_season(
+                season='2122', league='ITA-Serie A',
+            )
+        assert result.passed is False
+        assert 'season=2122' in result.name

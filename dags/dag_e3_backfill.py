@@ -398,6 +398,7 @@ def _validate_backfill(**context) -> Dict[str, Any]:
     from utils.data_quality import CheckResult, run_checks
     from utils.e3_dq import (
         build_per_season_e3_checks,
+        completeness_check_events_per_season,
         parity_check_event_counts_per_season,
     )
 
@@ -423,6 +424,25 @@ def _validate_backfill(**context) -> Dict[str, Any]:
         report.results.append(CheckResult(
             name=(
                 "parity_check_event_counts_per_season "
+                f"season={season} league={league}"
+            ),
+            kind='custom',
+            severity='WARNING',
+            passed=False,
+            error=str(e),
+        ))
+
+    # ---- Per-season schedule->events completeness gate (custom — #895) ----
+    try:
+        completeness_result = completeness_check_events_per_season(
+            season=season, league=league
+        )
+        report.results.append(completeness_result)
+    except Exception as e:
+        logger.exception("completeness_check_events_per_season crashed; recording WARNING")
+        report.results.append(CheckResult(
+            name=(
+                "completeness_check_events_per_season "
                 f"season={season} league={league}"
             ),
             kind='custom',
