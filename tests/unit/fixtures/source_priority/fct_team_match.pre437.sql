@@ -386,5 +386,6 @@ LEFT JOIN iceberg.silver.fotmob_team_match fm
     AND fm.league   = u.league
     AND fm.season   = u.season_slug
 
-WHERE u.match_id IS NOT NULL
-  AND u.team_id  IS NOT NULL
+WHERE u.match_id    IS NOT NULL
+  AND u.team_id     IS NOT NULL
+  AND u.opponent_id IS NOT NULL

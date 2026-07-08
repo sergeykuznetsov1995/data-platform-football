@@ -71,9 +71,10 @@ Known limitations (carried over from the SQL-level ADRs)
 * **fct_shot rejection ~1.8%** -- shots whose (date, home_canonical, away_canonical)
   do not resolve to a Gold dim_match row are dropped (INNER JOIN). Acceptable
   per E3.4 spec.
-* **fct_lineup ESPN bridge ~90.8% success** -- the xxhash64-based name match
-  leaves ~9% of ESPN players orphan. The orphan rows are NOT inserted (the
-  bridge is INNER JOIN); see ADR in ``dags/sql/gold/fct_lineup.sql``.
+* **fct_lineup ESPN bridge** -- #867: resolves through ``silver.xref_match``
+  (source='espn'). Games outside the FBref spine keep their ``espn_<hash>``
+  pseudo-id (LEFT JOIN, rows preserved); see ADR in
+  ``dags/sql/gold/fct_lineup.sql``.
 
 DQ wiring (validate_e3)
 -----------------------
