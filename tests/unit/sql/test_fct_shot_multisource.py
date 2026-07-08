@@ -326,6 +326,16 @@ class TestFctShotMultiSourceStructure:
         assert "iceberg.bronze.understat_players" not in sql
         assert "iceberg.bronze.understat_schedule" in sql
 
+    def test_fbref_is_not_an_xg_source(self):
+        """#892: FBref stopped serving xG/npxG/xA/PSxG/SCA/GCA in Feb-2026 —
+        bronze.fbref_* carries zero xg columns. xG comes from Understat
+        (primary) with SofaScore as fallback; fbref_shot_events is dead and
+        must never be wired back in as a shot source."""
+        sql = _strip_comments(_read_sql())
+        assert "fbref_shot_events" not in sql
+        assert "iceberg.silver.understat_shots" in sql
+        assert "iceberg.silver.sofascore_shots" in sql
+
     def test_has_match_winner_cte(self):
         sql = _strip_comments(_read_sql()).lower()
         assert "match_winner" in sql

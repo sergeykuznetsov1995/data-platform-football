@@ -1,24 +1,40 @@
 #!/usr/bin/env python3
 """
-One-shot dedup of iceberg.bronze.fbref_schedule.
+One-shot cleanup of iceberg.bronze.fbref_schedule (issue #892, P2).
 
-Background: schedule writers used to APPEND on every run, producing many
-duplicate rows per match (~5x for older seasons, ~10x for active ones).
-The newer code path uses partition-replace, but existing rows still need
-cleanup.
+Background
+----------
+Schedule writers used to APPEND on every run, so this script was originally a
+dedup over ``match_url``. The writers moved to partition-replace and the
+duplicates are gone — a 2026-07-08 audit found **zero** duplicate ``match_url``
+values (20 981 rows / 18 835 distinct urls / 2 146 rows with ``match_url IS
+NULL``).
 
-Strategy:
-  1. CTAS into staging table, keeping latest row per match_url
-  2. Verify counts match expectation
-  3. DROP original, RENAME staging → fbref_schedule
+What is left is a different kind of bloat: 2 146 rows where *every* field is
+NULL — blank separator rows the FBref HTML parser captures between gameweeks.
+Silver already discards them (``fbref_match_enriched.sql`` filters
+``sch.date IS NOT NULL``), so this is pure Bronze hygiene.
+
+Why row-level DELETE instead of the previous CTAS + DROP + RENAME
+-----------------------------------------------------------------
+The CTAS spelled out an explicit column list. Bronze schema evolves (the
+``round`` column appeared 2026-07-06 during the Top-5 backfill and carries the
+German/French relegation play-off labels), so any column added after the script
+was written would be silently destroyed by the DROP + RENAME. A DELETE names no
+columns and cannot lose them. The table is ``format_version = 2``, so Trino
+does a merge-on-read delete.
 
 Run inside the airflow container (so it can talk to Trino on the docker
 network):
 
     docker compose exec airflow-webserver \
         python /opt/airflow/scripts/dedup_fbref_schedule.py
+
+Flags:
+    --dry-run   only report what would be deleted
 """
 
+import argparse
 import logging
 import os
 import sys
@@ -32,6 +48,8 @@ logging.basicConfig(
     datefmt='%H:%M:%S',
 )
 logger = logging.getLogger('dedup')
+
+TABLE = 'iceberg.bronze.fbref_schedule'
 
 
 def get_conn():
@@ -54,91 +72,68 @@ def get_conn():
 
 
 def execute(c, sql):
-    logger.info(f"EXEC: {sql[:120]}{'…' if len(sql) > 120 else ''}")
+    logger.info(f"EXEC: {sql[:140]}{'…' if len(sql) > 140 else ''}")
     c.execute(sql)
     return c.fetchall()
 
 
-def main():
-    conn = get_conn()
-    c = conn.cursor()
-
-    # Baseline counts
+def purge_null_url_rows(c, dry_run: bool) -> None:
     rows = execute(
         c,
-        'SELECT COUNT(*), COUNT(DISTINCT match_url) '
-        'FROM iceberg.bronze.fbref_schedule'
+        f'SELECT COUNT(*), COUNT(match_url), COUNT(DISTINCT match_url) FROM {TABLE}'
     )
-    total, uniq = rows[0]
-    logger.info(f"Before: total={total} unique_match_urls={uniq}")
+    total, with_url, uniq = rows[0]
+    null_url = total - with_url
+    logger.info(f"Before: total={total} with_url={with_url} unique_urls={uniq}")
 
     if uniq == 0:
         logger.error('Empty unique set — refusing to proceed')
         sys.exit(1)
 
-    if total == uniq:
-        logger.info('Already deduplicated — nothing to do')
+    # Duplicate match_urls are out of scope: choosing a survivor needs a
+    # score-aware ORDER BY (a null-score placeholder can be ingested *after*
+    # the played row), so `ORDER BY _ingested_at DESC` would silently drop
+    # results. Refuse rather than guess.
+    if with_url != uniq:
+        logger.error(
+            f"Found {with_url - uniq} duplicate match_url rows. This script "
+            f"only purges all-NULL rows; deduplication needs a score-aware "
+            f"survivor rule — aborting for manual review."
+        )
+        sys.exit(3)
+
+    if null_url == 0:
+        logger.info('No NULL-match_url rows — nothing to do')
         return
 
-    # Existing partitioning is (league, season). Keep it on staging.
-    # ROW_NUMBER over PARTITION BY match_url ORDER BY _ingested_at DESC
-    # picks the freshest row per match.
-    staging = 'iceberg.bronze.fbref_schedule_dedup_staging'
+    logger.info(f"Rows to delete (match_url IS NULL): {null_url}")
+    if dry_run:
+        logger.info('--dry-run, no changes')
+        return
 
-    # Drop staging if a previous attempt left it behind
-    try:
-        execute(c, f'DROP TABLE IF EXISTS {staging}')
-    except Exception as e:
-        logger.warning(f"Could not drop pre-existing staging: {e}")
+    execute(c, f'DELETE FROM {TABLE} WHERE match_url IS NULL')
 
-    execute(c, f"""
-        CREATE TABLE {staging}
-        WITH (partitioning = ARRAY['league', 'season'])
-        AS
-        SELECT
-            wk, day, date, time, home, score, away, attendance, venue,
-            referee, "match report", notes, match_url, league, season,
-            _source, _entity_type, _ingested_at, _batch_id
-        FROM (
-            SELECT s.*,
-                ROW_NUMBER() OVER (
-                    PARTITION BY match_url
-                    ORDER BY _ingested_at DESC
-                ) AS rn
-            FROM iceberg.bronze.fbref_schedule s
-            WHERE match_url IS NOT NULL
-        )
-        WHERE rn = 1
-    """)
-
-    rows = execute(c, f'SELECT COUNT(*), COUNT(DISTINCT match_url) FROM {staging}')
-    s_total, s_uniq = rows[0]
-    logger.info(f"Staging: total={s_total} unique_match_urls={s_uniq}")
-
-    if s_uniq < uniq * 0.95:
-        logger.error(
-            f"Staging has fewer unique urls than expected "
-            f"({s_uniq} < {uniq} × 0.95). Aborting — staging table left for "
-            f"manual inspection."
-        )
-        sys.exit(2)
-
-    # Atomic-ish swap: drop original, rename staging
-    execute(c, 'DROP TABLE iceberg.bronze.fbref_schedule')
-    execute(c, f'ALTER TABLE {staging} RENAME TO iceberg.bronze.fbref_schedule')
-
-    # Verify final counts
-    rows = execute(
-        c,
-        'SELECT COUNT(*), COUNT(DISTINCT match_url) '
-        'FROM iceberg.bronze.fbref_schedule'
-    )
-    f_total, f_uniq = rows[0]
-    logger.info(f"After: total={f_total} unique_match_urls={f_uniq}")
+    rows = execute(c, f'SELECT COUNT(*) FROM {TABLE}')
+    final = rows[0][0]
+    logger.info(f"After: total={final}")
+    if final != uniq:
+        logger.error(f"Expected {uniq} rows after delete, got {final}")
+        sys.exit(4)
     logger.info(
-        f"Removed {total - f_total} duplicate rows "
-        f"({(1 - f_total / total) * 100:.1f}% reduction)"
+        f"Removed {total - final} all-NULL rows "
+        f"({(1 - final / total) * 100:.1f}% reduction)"
     )
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--dry-run', action='store_true',
+                        help='only report what would be deleted')
+    args = parser.parse_args()
+
+    conn = get_conn()
+    c = conn.cursor()
+    purge_null_url_rows(c, args.dry_run)
 
 
 if __name__ == '__main__':
