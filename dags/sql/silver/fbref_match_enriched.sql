@@ -21,7 +21,7 @@
 --   * lineups has no team_side — determined via JOIN with schedule (team = home/away).
 --   * event_type values are lowercase: goal, penalty, own_goal, yellow_card, second_yellow_card, red_card, substitution.
 --   * All numeric columns use TRY_CAST to enforce proper types in Silver.
---   * Score is parsed into home_score/away_score via REGEXP_EXTRACT.
+--   * Score is the OFFICIAL result — see the home_score/away_score comment below (#898).
 --   * Partitioning by (league, season) is applied externally by Python CTAS.
 -- =============================================================================
 
@@ -132,8 +132,16 @@ SELECT
     sch.home,
     sch.away,
     sch.score,
-    TRY_CAST(REGEXP_EXTRACT(sch.score, '(\d+)', 1) AS INTEGER)         AS home_score,
-    TRY_CAST(REGEXP_EXTRACT(sch.score, '\d+\D+(\d+)', 1) AS INTEGER)   AS away_score,
+    -- score holds the OFFICIAL result, separator is EN DASH (U+2013):
+    --   * awarded matches carry the forfeit score ('0–3'), explained by `notes` (#898);
+    --     the on-pitch result stays available as home_goals_events/away_goals_events.
+    --   * a shoot-out renders as '(4) 1–1 (5)' — strip the penalty counts first, else the
+    --     leading '(5)' of '(5) 0–3 (6)' is read as the home score (Düsseldorf 5–0 Bochum).
+    -- Same normalisation as scripts/crossvalidate_fbref_scores.py.
+    TRY_CAST(TRIM(SPLIT_PART(REGEXP_REPLACE(sch.score, '\(\d+\)\s*', ''), CHR(8211), 1)) AS INTEGER) AS home_score,
+    TRY_CAST(TRIM(SPLIT_PART(REGEXP_REPLACE(sch.score, '\(\d+\)\s*', ''), CHR(8211), 2)) AS INTEGER) AS away_score,
+    sch.notes,
+    LOWER(COALESCE(sch.notes, '')) LIKE 'match awarded to%'            AS is_awarded,
     TRY_CAST(TRY_CAST(sch.attendance AS DOUBLE) AS INTEGER) AS attendance,  -- float-strings ('34977.0') from the pandas-parsed bronze schedule
     sch.venue,
     sch.referee,

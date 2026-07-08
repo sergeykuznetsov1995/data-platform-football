@@ -282,6 +282,21 @@ def _validate_silver_quality(**context) -> Dict[str, Any]:
             where='player_id IS NOT NULL',
         ),
 
+        # #898: home_score/away_score must reconstruct the Bronze score string once
+        # the shoot-out counts are stripped. Guards the parser in
+        # fbref_match_enriched.sql — the old REGEXP silently read '(5) 0–3 (6)' as
+        # 5–0. Live baseline after the fix: 0 violating rows.
+        CHECK.row_count(
+            'silver.fbref_match_enriched',
+            min_rows=0, max_rows=0,
+            where=(r"score IS NOT NULL AND score <> '' AND ("
+                   r"home_score IS NULL OR away_score IS NULL OR "
+                   r"TRIM(REGEXP_REPLACE(score, '\(\d+\)\s*', '')) <> "
+                   r"CAST(home_score AS varchar) || CHR(8211) || CAST(away_score AS varchar))"),
+            severity='ERROR',
+            name='score_roundtrip[silver.fbref_match_enriched]',
+        ),
+
         # Referential integrity — ERROR (#258, restored from WARNING #240). The
         # orphan match_ids were duplicate alternate-hex scrapes, not lost matches:
         # bronze.fbref_schedule used to emit the SAME fixture as two rows with
