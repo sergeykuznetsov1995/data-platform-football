@@ -940,10 +940,11 @@ def _build_fct_lineup_checks() -> List[Check]:
         ),
 
         # ref_integrity fct_lineup → xref_match — WARNING (not ERROR).
-        # ESPN bridge through (date, home_canonical, away_canonical) leaves
-        # ~35 distinct match_ids unbridged (1.4K rows / 0.9% of total) when
-        # the FBref/ESPN team-canonicalisation drifts on promotion teams.
-        # Tightens to ERROR after E1.5 cutover (xref_match adds ESPN source).
+        # #867: the ESPN bridge now reads xref_match itself, so a bridge MISS is
+        # no longer possible — but rows for games outside the FBref spine keep
+        # their source pseudo-id ('espn_<hash>', 'fm_'/'ss_'/'ws_'), which is not
+        # an xref_match.canonical_id. They stay orphans here by design (273K rows
+        # live 2026-07-08, mostly ESPN APL 2000/01-2015/16), hence WARNING.
         CHECK.ref_integrity(
             child='gold.fct_lineup',
             parent='silver.xref_match',

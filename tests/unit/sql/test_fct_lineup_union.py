@@ -701,9 +701,9 @@ class TestProjection:
 # ESPN→FBref bridge is invisible to it. The tests below run the actual gold
 # SQL after the same Trino→DuckDB text-substitution pass used by
 # test_fct_card_union.py (xxhash64→md5, to_utf8/to_hex collapsed), so the
-# bridge fan-out bugs (#461) are reproducible:
-#   * bronze.espn_schedule read without re-ingest dedup;
-#   * season-less xref_team_by_canonical (the #459 mechanism).
+# bridge bugs are reproducible:
+#   * bronze.espn_schedule read without re-ingest dedup (#461);
+#   * a season predicate on the xref_match JOIN (#809 / #867).
 
 import hashlib
 
@@ -742,7 +742,6 @@ _ICEBERG_TO_LOCAL = {
     "iceberg.bronze.espn_schedule":          "bronze_espn_schedule",
     "iceberg.silver.espn_lineup":            "silver_espn_lineup",
     "iceberg.silver.fbref_match_lineups":    "silver_fbref_match_lineups",
-    "iceberg.silver.fbref_match_enriched":   "silver_fbref_match_enriched",
     "iceberg.silver.xref_match":             "silver_xref_match",
     "iceberg.silver.xref_team":              "silver_xref_team",
     "iceberg.silver.xref_player":            "silver_xref_player",
@@ -829,17 +828,6 @@ def bridge_conn(duck_conn):
         """
     )
     duck_conn.execute(
-        """
-        CREATE TABLE silver_fbref_match_enriched (
-            match_id  VARCHAR,
-            league    VARCHAR,
-            home      VARCHAR,
-            away      VARCHAR,
-            date      DATE
-        )
-        """
-    )
-    duck_conn.execute(
         "CREATE TABLE silver_xref_match "
         "(source VARCHAR, source_id VARCHAR, canonical_id VARCHAR, "
         "league VARCHAR, season VARCHAR, confidence VARCHAR)"
@@ -880,26 +868,26 @@ def bridge_conn(duck_conn):
     yield duck_conn
 
 
-def _seed_espn_corpus(con, *, fbref_xref_season: str = _SEASON) -> None:
-    """One ESPN lineup row + the xref/fme spine the bridge needs.
+def _seed_espn_corpus(con, *, xref_confidence: str = "date_team_match",
+                      xref_season: str = _SEASON) -> None:
+    """One ESPN lineup row + the xref spine the bridge needs.
 
-    ``fbref_xref_season`` lets tests move the FBref alias rows to another
-    season to probe the season-scoped JOIN.
+    #867: the bridge reads silver.xref_match (source='espn', source_id=game_id).
+    ``xref_confidence='orphan'`` simulates a game outside the FBref spine;
+    ``xref_season`` proves the JOIN carries NO season predicate (#809).
     """
     con.execute(
         """
         INSERT INTO silver_xref_team VALUES
           ('espn',  'Liverpool', 'liverpool', ?, ?, 'name_alias'),
-          ('espn',  'Arsenal',   'arsenal',   ?, ?, 'name_alias'),
-          ('fbref', 'Liverpool', 'liverpool', ?, ?, 'name_alias'),
-          ('fbref', 'Arsenal',   'arsenal',   ?, ?, 'name_alias')
+          ('espn',  'Arsenal',   'arsenal',   ?, ?, 'name_alias')
         """,
-        [_LEAGUE, _SEASON, _LEAGUE, _SEASON,
-         _LEAGUE, fbref_xref_season, _LEAGUE, fbref_xref_season],
+        [_LEAGUE, _SEASON, _LEAGUE, _SEASON],
     )
     con.execute(
-        "INSERT INTO silver_fbref_match_enriched VALUES (?, ?, ?, ?, ?)",
-        [_FB_HEX, _LEAGUE, "Liverpool", "Arsenal", "2026-01-06"],
+        "INSERT INTO silver_xref_match VALUES ('espn', '401', ?, ?, ?, ?)",
+        [_FB_HEX if xref_confidence != "orphan" else "es_401",
+         _LEAGUE, xref_season, xref_confidence],
     )
     con.execute(
         """
@@ -925,27 +913,23 @@ def _run_lineup_gold(con) -> List[Dict[str, Any]]:
 
 
 class TestEspnBridgeDedup:
-    """#461: espn_match_bridge must dedup bronze re-ingests and season-scope
-    the xref_team JOINs — a stale/variant row must NOT yield a second bridge
-    row that duplicates the lineup under the 'espn_<hash>' pseudo-id.
+    """#867: espn_match_bridge maps the 'espn_<hash>' pseudo-id to game_id via
+    bronze.espn_schedule, then reads the canonical match_id from
+    silver.xref_match (source='espn'). It must dedup bronze re-ingests, never
+    fan out, and fall back to the pseudo-id for non-spine games.
     """
 
     def test_reingest_schedule_dup_does_not_duplicate_lineup(self, bridge_conn):
-        """Two bronze ingests of the same game — the stale one carries a team
-        spelling that misses xref. Old SQL: lineup row surfaces twice (hex +
-        pseudo-id). Fixed SQL: once, bridged to the FBref hex id."""
+        """#461: two bronze ingests of the same game must collapse to the
+        freshest row before the bridge — otherwise the lineup surfaces twice."""
         _seed_espn_corpus(bridge_conn)
-        # Stale ingest: 'Liverpool FC' is not an xref alias → bridge miss.
         bridge_conn.execute(
             _SCHEDULE_ROW,
-            [_LEAGUE, _SEASON, _GAME, "Liverpool FC",
-             "2026-01-07 06:00:00"],
+            [_LEAGUE, _SEASON, _GAME, "Liverpool", "2026-01-07 06:00:00"],
         )
-        # Fresh ingest: canonical spelling → bridge hit.
         bridge_conn.execute(
             _SCHEDULE_ROW,
-            [_LEAGUE, _SEASON, _GAME, "Liverpool",
-             "2026-02-01 06:00:00"],
+            [_LEAGUE, _SEASON, _GAME, "Liverpool", "2026-02-01 06:00:00"],
         )
         out = _run_lineup_gold(bridge_conn)
         assert len(out) == 1, (
@@ -953,53 +937,40 @@ class TestEspnBridgeDedup:
         )
         assert out[0]["match_id"] == _FB_HEX, out
 
-    def test_historical_variant_does_not_duplicate_lineup(self, bridge_conn):
-        """#459 mechanism: an FBref alias from ANOTHER season with the same
-        canonical_id must not fan the bridge out into a NULL twin."""
+    def test_duplicate_xref_match_rows_do_not_fan_out(self, bridge_conn):
+        """A second xref_match row for the same (source_id, league) must not
+        duplicate the lineup — the bridge aggregates to one row per game."""
         _seed_espn_corpus(bridge_conn)
         bridge_conn.execute(
-            """
-            INSERT INTO silver_xref_team VALUES
-              ('fbref', 'Liverpool FC', 'liverpool', ?, '2425', 'name_alias')
-            """,
-            [_LEAGUE],
+            "INSERT INTO silver_xref_match VALUES "
+            "('espn', '401', ?, ?, '2425', 'date_team_match')",
+            [_FB_HEX, _LEAGUE],
         )
         bridge_conn.execute(
             _SCHEDULE_ROW,
             [_LEAGUE, _SEASON, _GAME, "Liverpool", "2026-02-01 06:00:00"],
         )
         out = _run_lineup_gold(bridge_conn)
-        assert len(out) == 1, (
-            f"historical-variant fan-out duplicated the lineup row: {out}"
-        )
+        assert len(out) == 1, f"xref_match fan-out duplicated the row: {out}"
         assert out[0]["match_id"] == _FB_HEX, out
 
-    def test_same_season_variant_does_not_duplicate_lineup(self, bridge_conn):
-        """#445: xref_team now legally carries a SAME-season second FBref
-        spelling per canonical (match-page full name next to the schedule
-        short name) — season-scoping alone can't save the bridge; it must
-        aggregate the variant fan-out instead of emitting a NULL twin."""
-        _seed_espn_corpus(bridge_conn)
-        bridge_conn.execute(
-            """
-            INSERT INTO silver_xref_team VALUES
-              ('fbref', 'Liverpool FC', 'liverpool', ?, ?, 'name_alias')
-            """,
-            [_LEAGUE, _SEASON],
-        )
+    def test_bridge_ignores_xref_match_season(self, bridge_conn):
+        """#809 regression guard: bronze.espn_schedule reuses one game_id across
+        season labels, so xref_match holds NO row for some of them. The JOIN
+        must key on (source_id, league) only — a season predicate would unbridge
+        seasons 0102/0203/0910 live."""
+        _seed_espn_corpus(bridge_conn, xref_season="0001")
         bridge_conn.execute(
             _SCHEDULE_ROW,
             [_LEAGUE, _SEASON, _GAME, "Liverpool", "2026-02-01 06:00:00"],
         )
         out = _run_lineup_gold(bridge_conn)
-        assert len(out) == 1, (
-            f"same-season variant fan-out duplicated the lineup row: {out}"
-        )
+        assert len(out) == 1, out
         assert out[0]["match_id"] == _FB_HEX, out
 
     def test_clean_bridge_resolves_hex(self, bridge_conn):
-        """Happy path stays intact: one schedule row, full xref → one lineup
-        row under the FBref hex id."""
+        """Happy path: one schedule row, resolved xref_match → one lineup row
+        under the FBref hex id."""
         _seed_espn_corpus(bridge_conn)
         bridge_conn.execute(
             _SCHEDULE_ROW,
@@ -1011,15 +982,23 @@ class TestEspnBridgeDedup:
         assert out[0]["lineup_source"] == "espn", out
         assert out[0]["player_id"] is None, out
 
-    def test_missing_xref_season_degrades_to_single_pseudo_row(self, bridge_conn):
-        """When xref_team has NO FBref aliases for the schedule's season the
-        bridge degrades to exactly ONE unbridged row (pseudo-id, no dup) —
-        it must NOT resolve via an alias borrowed from another season."""
-        _seed_espn_corpus(bridge_conn, fbref_xref_season="2425")
+    def test_orphan_xref_match_degrades_to_single_pseudo_row(self, bridge_conn):
+        """A game outside the FBref spine (xref_match confidence='orphan', e.g.
+        APL 2000/01-2015/16) keeps exactly ONE row under the 'espn_<hash>'
+        pseudo-id — lineage preserved, namespace unchanged, no dup."""
+        _seed_espn_corpus(bridge_conn, xref_confidence="orphan")
         bridge_conn.execute(
             _SCHEDULE_ROW,
             [_LEAGUE, _SEASON, _GAME, "Liverpool", "2026-02-01 06:00:00"],
         )
+        out = _run_lineup_gold(bridge_conn)
+        assert len(out) == 1, out
+        assert out[0]["match_id"] == _espn_match_id(), out
+
+    def test_schedule_gap_degrades_to_single_pseudo_row(self, bridge_conn):
+        """No bronze.espn_schedule row at all (game_id unknown) → pseudo-id
+        fallback, the lineup row is never dropped."""
+        _seed_espn_corpus(bridge_conn)
         out = _run_lineup_gold(bridge_conn)
         assert len(out) == 1, out
         assert out[0]["match_id"] == _espn_match_id(), out

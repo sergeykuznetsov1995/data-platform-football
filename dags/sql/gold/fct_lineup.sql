@@ -17,45 +17,47 @@
 --                                          player_id + is_starter (appeared & not
 --                                          subbed-on); position/captain/jersey NULL
 --   iceberg.silver.espn_lineup           — secondary (E3.2 deliverable)
---   iceberg.silver.xref_match            — match_id resolution (FBref-only in MVP)
+--   iceberg.silver.xref_match            — match_id resolution (all sources incl. ESPN)
 --   iceberg.silver.xref_team             — team alias canonicalisation
 --   iceberg.silver.xref_player           — player canonical id (FBref/US/WS only)
---   iceberg.silver.fbref_match_enriched  — bridge spine for ESPN → FBref match_id
---   iceberg.bronze.espn_schedule         — provides `date` for bridge JOIN
+--   iceberg.bronze.espn_schedule         — maps the ESPN `espn_<hash>` pseudo-id to
+--                                          `game_id` (silver.espn_lineup carries no
+--                                          game_id — see silver/espn_lineup.sql:22)
 --
 -- Design contract: docs/design/gold-star-schema.md §4.5 (issue #426).
 -- PK:           (match_id, player_id)
 -- Partitioning: (league, season)  — applied externally by Python CTAS.
 --
 -- =============================================================================
--- ADR — match_id bridging (ESPN ↔ FBref)
+-- ADR — match_id bridging (ESPN ↔ FBref)   [#867: Phase B cutover done]
 -- =============================================================================
---   silver.xref_match in E1 MVP carries `source = 'fbref'` ONLY (Phase B
---   cross-source bridging is the planned follow-up but not yet shipped —
---   see project_medallion_e1.md "Open follow-ups"). This file therefore
---   implements the bridge inline so fct_lineup can ship now.
+--   xref_match Phase B shipped: silver/xref_match.sql now emits source='espn'
+--   with source_id = CAST(espn_schedule.game_id AS varchar) and canonical_id =
+--   the FBref hex (confidence='date_team_match'), or an 'es_<game_id>' orphan
+--   where no FBref match exists. The old inline bridge — a fuzzy JOIN on
+--   (date, home_canonical_id, away_canonical_id) against fbref_match_enriched —
+--   is retired: it re-derived what xref_match already computes, and any date
+--   shift in the FBref spine (rescheduling, the COVID 1920 season) silently
+--   pushed a matched game onto its pseudo-id.
 --
 --   Strategy:
 --     * FBref rows  -> JOIN silver.xref_match (source='fbref') for canonical_id
 --                       (1:1, exact, lossless).
---     * ESPN rows   -> bridge via (date, home_canonical_id, away_canonical_id)
---                       to silver.fbref_match_enriched (which carries the
---                       authoritative FBref match_id). The bridge CTE rebuilds
---                       ESPN's deterministic match_id (`espn_<xxhash64>` from
---                       (league, season, game) — the same xxhash seed used in
---                       silver/espn_lineup.sql) and returns
---                       (espn_match_id, fbref_match_id_canonical).
---                       Where the bridge fails (no date / no team-canonical
---                       match), the row is kept with match_id_canonical = the
---                       ESPN pseudo-id ('espn_<hash>'), preserving lineage and
+--     * ESPN rows   -> JOIN silver.xref_match (source='espn'). silver.espn_lineup
+--                       has no game_id (only the `game` display string), so
+--                       bronze.espn_schedule stays as the (league, season, game)
+--                       -> game_id lookup that reaches xref_match's source_id.
+--                       Where xref_match holds no resolved canonical (ESPN
+--                       seasons outside the FBref spine — APL 2000/01-2015/16),
+--                       the row is kept with match_id_canonical = the ESPN
+--                       pseudo-id ('espn_<hash>'), preserving lineage and
 --                       letting downstream DQ surface the orphan rate.
 --
---   Why inline (not via xref_match Phase B):
---     * Phase B requires a resolved xref_team to fuzzy-match teams; xref_team
---       already exists, so the bridge is composable here without touching
---       xref_match. When Phase B ships, this CTE is the migration target —
---       just replace it with a JOIN on silver.xref_match WHERE source='espn'.
---     * Keeps the SQL self-contained and ships unblocked.
+--   Footgun — do NOT add `season` to the xref_match JOIN predicate:
+--     xref_match dedups to (canonical_id, source), and bronze.espn_schedule
+--     reuses one game_id across season labels (#809: 0001/0102/0203, 0809/0910,
+--     1920/2021), so xref_match has NO rows for seasons 0102/0203/0910. A
+--     season predicate would unbridge them. (source_id, league) is unique there.
 --
 -- =============================================================================
 -- ADR — player_id resolution (ESPN ↔ canonical)
@@ -136,31 +138,12 @@ WITH
 -- ============================================================================
 -- 1) ESPN → FBref match_id bridge
 -- ============================================================================
--- Reconstructs the same xxhash64 seed used by silver/espn_lineup.sql and
--- joins to fbref_match_enriched via (date, home_canonical_id, away_canonical_id).
--- xref_team.canonical_id makes the team-name comparison alias-tolerant.
--- #461 (same mechanism as #459 in fct_card/fct_substitution/fct_match_timeline):
--- xref_team is season-grained (PK = source, source_id, league, season; season
--- is the compact slug '2526' for ALL sources since #404). Without the season
--- key one canonical_id expands to every historical FBref name variant; the
--- variant that misses fme.home/away produces a second bridge row with
--- fbref_match_id = NULL and duplicates the lineup under the 'espn_<hash>'
--- pseudo-id (the final dedup partitions by match_id_canonical and cannot
--- collapse the twins).
--- #445: season-scoping alone no longer suffices — xref_team now legally
--- carries TWO same-season fbref spellings per canonical (schedule short name
--- + match-page full name), so espn_match_bridge below aggregates to one row
--- per ESPN game instead of relying on (canonical, league, season) uniqueness.
-xref_team_by_canonical AS (
-    SELECT DISTINCT source, source_id, canonical_id, league, season
-    FROM iceberg.silver.xref_team
-    -- #506: canonical_id IS NOT NULL does NOT exclude orphans — orphan rows
-    -- carry a non-NULL source-prefixed canonical ('es_<slug>'/'fb_<slug>').
-    -- Add the contract filter so the ESPN→FBref bridge never matches on a
-    -- pseudo-canonical. xref_team.sql.j2: orphans excluded from cross-source JOIN.
-    WHERE canonical_id IS NOT NULL
-      AND confidence <> 'orphan'
-),
+-- Reconstructs the same xxhash64 seed used by silver/espn_lineup.sql to reach
+-- bronze.espn_schedule.game_id, then reads the canonical match_id straight from
+-- silver.xref_match (source='espn'). See the ADR above: the fuzzy
+-- (date, home_canonical, away_canonical) JOIN against fbref_match_enriched —
+-- and the #445/#461 xref_team fan-out guards it needed — are gone with it.
+--
 -- Collapse silver.xref_player (PK source, source_id, season) to one row per
 -- (source, source_id) so the FBref player JOIN below stays 1:1 — see the
 -- rationale on that JOIN. Mirrors the fix pattern in fct_shot.sql (#204).
@@ -187,20 +170,19 @@ xref_team_dedup AS (
     GROUP BY source, source_id, league
 ),
 -- #461: bronze.espn_schedule re-ingests of the same game must collapse to the
--- freshest row BEFORE the bridge — a stale duplicate whose team spelling /
--- date no longer resolves produces a second bridge row with
--- fbref_match_id = NULL, surfacing the lineup twice (hex + pseudo-id).
+-- freshest row BEFORE the bridge, so the bridge emits ≤1 row per espn_match_id.
 -- Partition by (league, season, game) — exactly the xxhash64 seed of
--- espn_match_id below — so the bridge emits ≤1 row per espn_match_id.
+-- espn_match_id below. game_id is the key into xref_match (source='espn').
 espn_schedule_dedup AS (
     SELECT
-        league, season, game, match_date, home_team, away_team,
+        league, season, game, game_id,
         ROW_NUMBER() OVER (
             PARTITION BY league, season, game
             ORDER BY _ingested_at DESC
         ) AS rn
     FROM iceberg.bronze.espn_schedule
     WHERE game IS NOT NULL
+      AND game_id IS NOT NULL
 ),
 espn_match_bridge AS (
     SELECT
@@ -210,41 +192,21 @@ espn_match_bridge AS (
             || '|' || COALESCE(CAST(es.season AS varchar), '')
             || '|' || COALESCE(es.game, '')
         ))))                                                AS espn_match_id,
-        -- #445: the xt_*_fb reverse lookups fan out across same-season fbref
-        -- name variants; only the schedule spelling can match fme.home/away,
-        -- so MAX over the NULL twins is exact (not a tiebreak).
-        MAX(fme.match_id)                                   AS fbref_match_id,
+        -- (source_id, league) is unique in xref_match(source='espn'), so MAX is
+        -- an identity over ≤1 row — it exists only to satisfy the GROUP BY that
+        -- collapses the hash seed. Orphan canonicals ('es_<game_id>') are
+        -- filtered out, so a non-spine game leaves this NULL and espn_resolved
+        -- falls back to the 'espn_<hash>' pseudo-id (lineage preserved).
+        MAX(xm.canonical_id)                                AS fbref_match_id,
         es.league                                           AS league,
         es.season                                           AS season  -- #404: ESPN bronze slug ('2526')
     FROM espn_schedule_dedup es
-    LEFT JOIN xref_team_by_canonical xt_home_es
-        ON xt_home_es.source    = 'espn'
-       AND xt_home_es.source_id = es.home_team
-       AND xt_home_es.league    = es.league
-       AND xt_home_es.season    = es.season         -- #461
-    LEFT JOIN xref_team_by_canonical xt_away_es
-        ON xt_away_es.source    = 'espn'
-       AND xt_away_es.source_id = es.away_team
-       AND xt_away_es.league    = es.league
-       AND xt_away_es.season    = es.season         -- #461
-    LEFT JOIN xref_team_by_canonical xt_home_fb
-        ON xt_home_fb.source       = 'fbref'
-       AND xt_home_fb.canonical_id = xt_home_es.canonical_id
-       AND xt_home_fb.league       = es.league
-       AND xt_home_fb.season       = es.season      -- #461
-    LEFT JOIN xref_team_by_canonical xt_away_fb
-        ON xt_away_fb.source       = 'fbref'
-       AND xt_away_fb.canonical_id = xt_away_es.canonical_id
-       AND xt_away_fb.league       = es.league
-       AND xt_away_fb.season       = es.season      -- #461
-    LEFT JOIN iceberg.silver.fbref_match_enriched fme
-        ON fme.league = es.league
-       AND fme.home   = xt_home_fb.source_id
-       AND fme.away   = xt_away_fb.source_id
-       -- bronze.espn_schedule.match_date is timestamp(6); fme.date is date.
-       -- Compare on the date part. Rescheduling within a day is rare for
-       -- APL fixtures and surfaces as bridge-miss in DQ.
-       AND fme.date   = CAST(es.match_date AS date)
+    LEFT JOIN iceberg.silver.xref_match xm
+        ON  xm.source     = 'espn'
+        AND xm.source_id  = CAST(es.game_id AS varchar)
+        AND xm.league     = es.league
+        -- NO season predicate — see the footgun in the ADR above (#809).
+        AND xm.confidence <> 'orphan'
     WHERE es.rn = 1
     -- #445: ordinals, NOT select aliases — Trino raises COLUMN_NOT_FOUND on
     -- same-level aliases in GROUP BY (DuckDB-based tests mask this).
