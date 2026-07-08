@@ -51,7 +51,6 @@ def _season_label(league: str, season) -> str:
     to ``_season_to_short`` for every league — mirror that fallback."""
     return _season_to_short(season)
 
-
 class TestArgparseHardFail:
     def test_unknown_flag_returns_1_not_2(self):
         assert _main_rc(['--entity', 'schedule', '--bogus-flag', 'x']) == 1
