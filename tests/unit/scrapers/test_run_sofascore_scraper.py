@@ -30,6 +30,21 @@ def _main_rc(argv: list) -> int:
     return mod.main()
 
 
+def _season_to_short(season) -> str:
+    """Offline mirror of ``scrapers.sofascore.scraper._season_to_short`` so the
+    stubbed ``scrapers.sofascore.scraper`` module the runner imports it from
+    behaves like the real helper (a bare MagicMock would return a MagicMock and
+    break season_short). Keep in sync with the real one."""
+    s = str(season)
+    if len(s) != 4 or not s.isdigit():
+        return s
+    if (int(s[:2]) + 1) % 100 == int(s[2:]):
+        return s
+    if s[2:] == "99":
+        return "9900"
+    return s[-2:] + f"{(int(s[-2:]) + 1) % 100:02d}"
+
+
 class TestArgparseHardFail:
     def test_unknown_flag_returns_1_not_2(self):
         assert _main_rc(['--entity', 'schedule', '--bogus-flag', 'x']) == 1
@@ -59,6 +74,7 @@ def _run_main(argv: list, scraper_cls, *, resolver_ids=None,
     so_pkg.SofaScoreScraper = scraper_cls
     so_scraper_mod = MagicMock()
     so_scraper_mod.R0_2B_FALLBACK_MARKER = 'R0_2B_FALLBACK'
+    so_scraper_mod._season_to_short = _season_to_short
 
     sys.argv = ["run_sofascore_scraper.py"] + argv
     with patch.dict(sys.modules, {
@@ -544,6 +560,72 @@ class TestMatchCaptureRunner:
         with open(temp_output) as f:
             payload = json.load(f)
         assert payload['rows'] == 8
+
+
+class TestSeasonTokenNoShift:
+    """#888: the runner must resolve match_ids for the SAME season it labels.
+    The old inline formula (``s[2:4]+ (s[2:4]+1)``) always shifted, while the
+    scraper labels rows via ``_season_to_short`` (which passes an already-short
+    token through). For a short-form ``--season`` the two diverged and the
+    partition was silently written under the +1 season. Both paths now use
+    ``_season_to_short`` — a short-form token must resolve to itself."""
+
+    @pytest.fixture
+    def temp_output(self):
+        fd, path = tempfile.mkstemp(suffix=".json", prefix="sofascore_")
+        os.close(fd)
+        yield path
+        if os.path.exists(path):
+            os.unlink(path)
+
+    def _record_resolve_season(self, argv, scraper):
+        seen = []
+        so_pkg = MagicMock()
+        so_pkg.SofaScoreScraper = MagicMock(return_value=scraper)
+        so_scraper_mod = MagicMock()
+        so_scraper_mod.R0_2B_FALLBACK_MARKER = 'R0_2B_FALLBACK'
+        so_scraper_mod._season_to_short = _season_to_short
+        sys.argv = ["run_sofascore_scraper.py"] + argv
+        with patch.dict(sys.modules, {
+            "scrapers.sofascore": so_pkg,
+            "scrapers.sofascore.scraper": so_scraper_mod,
+        }):
+            sys.modules.pop("dags.scripts.run_sofascore_scraper", None)
+            mod = importlib.import_module("dags.scripts.run_sofascore_scraper")
+            importlib.reload(mod)
+
+            def _resolver(_league, season_short, _limit=None):
+                seen.append(season_short)
+                return ['1', '2']
+
+            mod._resolve_match_ids_from_bronze = _resolver
+            mod._existing_match_ids_in_bronze = lambda *a, **k: set()
+            mod._read_existing_partition = lambda *a, **k: pd.DataFrame()
+            rc = mod.main()
+        return rc, seen
+
+    @pytest.mark.unit
+    def test_short_form_season_resolves_without_plus_one_shift(self, temp_output):
+        # 2122 is the poison case: old inline gave '2223' (2022/23), mislabelling
+        # the 2021/22 partition. It must resolve '2122'.
+        rc, seen = self._record_resolve_season(
+            ["--entity", "match_capture", "--league", "ENG-Premier League",
+             "--season", "2122", "--output", temp_output],
+            _match_capture_scraper(),
+        )
+        assert rc == 0
+        assert seen and seen[0] == '2122'
+
+    @pytest.mark.unit
+    def test_start_year_season_still_resolves_to_short(self, temp_output):
+        # Start-year tokens were always correct and must stay so: 2023 -> '2324'.
+        rc, seen = self._record_resolve_season(
+            ["--entity", "match_capture", "--league", "ENG-Premier League",
+             "--season", "2023", "--output", temp_output],
+            _match_capture_scraper(),
+        )
+        assert rc == 0
+        assert seen and seen[0] == '2324'
 
 
 def _player_capture_scraper(

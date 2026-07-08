@@ -411,15 +411,18 @@ def _run_player_ratings(
     """R0.2b player-ratings entrypoint. Returns process exit code."""
     from scrapers.base.base_scraper import ReplaceGuardError
     from scrapers.sofascore import SofaScoreScraper
-    from scrapers.sofascore.scraper import R0_2B_FALLBACK_MARKER
+    from scrapers.sofascore.scraper import R0_2B_FALLBACK_MARKER, _season_to_short
 
     league = leagues[0]  # ratings scrape is single-league per invocation
     # Schedule writer stores season as the soccerdata short form (e.g. "2526")
     season_str = str(season)
-    if len(season_str) == 4 and season_str.isdigit():
-        season_short = f"{season_str[2:4]}{int(season_str[2:4]) + 1:02d}"
-    else:
-        season_short = season_str
+    # Use the canonical helper for BOTH resolve and label. The old inline
+    # formula only shifted (start-year → short), while the scraper labels rows
+    # via _season_to_short (which passes already-short tokens through). For a
+    # short-form --season (e.g. 2122) the two diverged: resolve fetched the +1
+    # season while the label stayed put, silently mislabelling the partition by
+    # +1 (#888).
+    season_short = _season_to_short(season_str)
 
     logger.info(
         "R0.2b player_ratings: league=%s season=%s (short=%s) limit=%s",
@@ -597,14 +600,17 @@ def _run_match_capture(
     """
     from scrapers.base.base_scraper import ReplaceGuardError
     from scrapers.sofascore import SofaScoreScraper
-    from scrapers.sofascore.scraper import R0_2B_FALLBACK_MARKER
+    from scrapers.sofascore.scraper import R0_2B_FALLBACK_MARKER, _season_to_short
 
     league = leagues[0]
     season_str = str(season)
-    if len(season_str) == 4 and season_str.isdigit():
-        season_short = f"{season_str[2:4]}{int(season_str[2:4]) + 1:02d}"
-    else:
-        season_short = season_str
+    # Use the canonical helper for BOTH resolve and label. The old inline
+    # formula only shifted (start-year → short), while the scraper labels rows
+    # via _season_to_short (which passes already-short tokens through). For a
+    # short-form --season (e.g. 2122) the two diverged: resolve fetched the +1
+    # season while the label stayed put, silently mislabelling the partition by
+    # +1 (#888).
+    season_short = _season_to_short(season_str)
 
     logger.info(
         "match_capture: league=%s season=%s (short=%s) limit=%s",
@@ -904,14 +910,17 @@ def _run_player_capture(
     """
     from scrapers.base.base_scraper import ReplaceGuardError
     from scrapers.sofascore import SofaScoreScraper
-    from scrapers.sofascore.scraper import R0_2B_FALLBACK_MARKER
+    from scrapers.sofascore.scraper import R0_2B_FALLBACK_MARKER, _season_to_short
 
     league = leagues[0]
     season_str = str(season)
-    if len(season_str) == 4 and season_str.isdigit():
-        season_short = f"{season_str[2:4]}{int(season_str[2:4]) + 1:02d}"
-    else:
-        season_short = season_str
+    # Use the canonical helper for BOTH resolve and label. The old inline
+    # formula only shifted (start-year → short), while the scraper labels rows
+    # via _season_to_short (which passes already-short tokens through). For a
+    # short-form --season (e.g. 2122) the two diverged: resolve fetched the +1
+    # season while the label stayed put, silently mislabelling the partition by
+    # +1 (#888).
+    season_short = _season_to_short(season_str)
 
     logger.info(
         "player_capture: league=%s season=%s (short=%s) limit=%s",
@@ -1056,14 +1065,17 @@ def _run_event_endpoint(
     ``player_ids`` for event_player_stats).
     """
     from scrapers.sofascore import SofaScoreScraper
-    from scrapers.sofascore.scraper import R0_2B_FALLBACK_MARKER
+    from scrapers.sofascore.scraper import R0_2B_FALLBACK_MARKER, _season_to_short
 
     league = leagues[0]
     season_str = str(season)
-    if len(season_str) == 4 and season_str.isdigit():
-        season_short = f"{season_str[2:4]}{int(season_str[2:4]) + 1:02d}"
-    else:
-        season_short = season_str
+    # Use the canonical helper for BOTH resolve and label. The old inline
+    # formula only shifted (start-year → short), while the scraper labels rows
+    # via _season_to_short (which passes already-short tokens through). For a
+    # short-form --season (e.g. 2122) the two diverged: resolve fetched the +1
+    # season while the label stayed put, silently mislabelling the partition by
+    # +1 (#888).
+    season_short = _season_to_short(season_str)
 
     logger.info(
         "%s: league=%s season=%s (short=%s) limit=%s",
