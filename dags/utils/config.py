@@ -125,7 +125,7 @@ MIN_ROW_THRESHOLDS: Dict[str, int] = {
     # backfill lands — they are append-only wipe-floors, and multiplying them
     # now would false-fail while the new leagues ramp up (#708).
     'whoscored_schedule': 340 * len(WHOSCORED_LEAGUES),  # 380 fixtures/season/league - margin
-    'whoscored_events': 500_000,  # ~540k events/season - 7% margin; raise after #708 backfill
+    'whoscored_events': 20_000_000,  # #895: top-5×10-season backfill landed (27.9M rows, append-only); wipe-floor ~72% of live
     'whoscored_player_profile': 300,  # ~531 players/season/league (#37); raise after #708 backfill
     # ESPN / Understat / SoFIFA (issue #466): same silent-fail class as #102 —
     # read_* swallowed errors and runners exited 0. Floors calibrated against
