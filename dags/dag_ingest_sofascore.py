@@ -331,6 +331,18 @@ def validate_bronze_freshness(**context) -> None:
             'bronze.sofascore_player_ratings',
             ts_col='_ingested_at', max_age_hours=48, severity='WARNING',
         ),
+        # #711: a partial /statistics capture (proxy degradation) can write
+        # match_stats rows that carry the group + numeric values but NO stat
+        # label (name/stat_name empty) — the row-count floors in validate_data
+        # still pass, yet every stat is anonymous so Silver can't tell which
+        # row is "Fouls". Assert most rows are labelled. Historic damage:
+        # APL seasons 2122-2425 (~99% empty) surfaces here until re-scraped.
+        CHECK.coverage(
+            'bronze.sofascore_match_stats',
+            condition="COALESCE(name, '') <> '' OR COALESCE(stat_name, '') <> ''",
+            warn_threshold=0.99, error_threshold=0.95, severity='WARNING',
+            name='match_stats_labelled',
+        ),
     ]
     report = run_checks(checks, raise_on_error=False)
     logger.info("validate_bronze_freshness: %s", report.summary())
