@@ -620,3 +620,35 @@ class TestFotMobLeagueMapping:
         for league in major_leagues:
             assert league in FotMobScraper.LEAGUE_IDS
             assert FotMobScraper.LEAGUE_IDS[league] is not None
+
+
+class TestTeamIdsForLeague:
+    """#913: WC group standings live in data.tables[] (one block per group,
+    plus a 'Best 3rd placed teams' block repeating teams) — the flat
+    data.table.all shape is club-league only."""
+
+    def _scraper(self, payload):
+        from unittest.mock import patch as _patch
+
+        from scrapers.fotmob import FotMobScraper
+        scraper = FotMobScraper(leagues=['INT-World Cup'], seasons=[2026])
+        _patch.object(scraper, '_get_league_data', return_value=payload).start()
+        return scraper
+
+    def test_flat_club_table_shape_still_works(self):
+        payload = {'table': [{'data': {'table': {'all': [
+            {'id': 1, 'name': 'Arsenal'}, {'id': 2, 'name': 'Leeds'}]}}}]}
+        assert self._scraper(payload)._team_ids_for_league(
+            'ENG-Premier League', 2025) == [1, 2]
+
+    def test_grouped_wc_tables_collect_all_groups_and_dedupe(self):
+        payload = {'table': [{'data': {'tables': [
+            {'leagueName': 'Group A', 'table': {'all': [
+                {'id': 10, 'name': 'Mexico'}, {'id': 11, 'name': 'Czechia'}]}},
+            {'leagueName': 'Group B', 'table': {'all': [
+                {'id': 20, 'name': 'Canada'}]}},
+            {'leagueName': 'Best 3rd placed teams', 'table': {'all': [
+                {'id': 11, 'name': 'Czechia'}]}},  # repeat — must dedupe
+        ]}}]}
+        assert self._scraper(payload)._team_ids_for_league(
+            'INT-World Cup', 2026) == [10, 11, 20]

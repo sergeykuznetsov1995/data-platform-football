@@ -563,3 +563,69 @@ class TestESPNConfigFloors:
         # sized as wipe-floors against the whole table (>=1 season retained).
         assert MIN_ROW_THRESHOLDS.get('espn_lineup', 0) >= 9000
         assert MIN_ROW_THRESHOLDS.get('espn_matchsheet', 0) >= 600
+
+
+class TestSeedSingleYearCupCalendar:
+    """#913: fifa.world serves the calendar as STAGE DICTS — the seeder must
+    rewrite the cached anchor into the flat day-string list soccerdata's
+    read_schedule expects, fetching content from July 1 of the tournament
+    year (the soccerdata anchor formula degenerates to 2020 for skey '2026')."""
+
+    _CAL = {
+        "leagues": [{"calendar": [{
+            "label": "FIFA World Cup",
+            "startDate": "2026-06-11T04:00Z",
+            "endDate": "2026-12-31T04:59Z",   # outer shell — must be ignored
+            "entries": [
+                {"label": "Group", "startDate": "2026-06-11T07:00Z",
+                 "endDate": "2026-06-13T06:59Z"},
+                {"label": "Final", "startDate": "2026-07-19T07:00Z",
+                 "endDate": "2026-07-19T23:59Z"},
+            ],
+        }]}],
+        "events": [],
+    }
+
+    def _reader(self, tmp_path, payload):
+        import io
+
+        reader = MagicMock()
+        reader.data_dir = tmp_path
+        reader._selected_leagues = {'INT-World Cup': 'fifa.world'}
+        reader.seasons = ['2026']
+        reader.get = MagicMock(
+            return_value=io.StringIO(json.dumps(payload)))
+        return reader
+
+    def test_rewrites_stage_dict_calendar_to_day_strings(
+            self, make_scraper, tmp_path):
+        scraper = make_scraper(['2026'])
+        reader = self._reader(tmp_path, self._CAL)
+        scraper._seed_single_year_cup_calendar(reader)
+
+        # Content fetched from July 1 of the TOURNAMENT year, not 2020.
+        url = reader.get.call_args[0][0]
+        assert 'dates=20260701' in url
+        assert reader.get.call_args[1] == {'no_cache': True}
+        # Rewritten into soccerdata's anchor path (its formula → 20200701).
+        fp = tmp_path / 'Schedule_fifa.world_20200701.json'
+        assert fp.exists()
+        cal = json.loads(fp.read_text())['leagues'][0]['calendar']
+        # 3 Group days + 1 Final day; outer Dec-31 shell ignored.
+        assert cal == ['2026-06-11T12:00Z', '2026-06-12T12:00Z',
+                       '2026-06-13T12:00Z', '2026-07-19T12:00Z']
+
+    def test_noop_for_flat_club_calendar(self, make_scraper, tmp_path):
+        payload = {"leagues": [{"calendar": ["2025-08-16T14:00Z"]}],
+                   "events": []}
+        scraper = make_scraper(['2026'])
+        reader = self._reader(tmp_path, payload)
+        scraper._seed_single_year_cup_calendar(reader)
+        assert not (tmp_path / 'Schedule_fifa.world_20200701.json').exists()
+
+    def test_noop_without_world_cup_league(self, make_scraper, tmp_path):
+        scraper = make_scraper(['2026'])
+        reader = self._reader(tmp_path, self._CAL)
+        reader._selected_leagues = {'ENG-Premier League': 'eng.1'}
+        scraper._seed_single_year_cup_calendar(reader)
+        reader.get.assert_not_called()
