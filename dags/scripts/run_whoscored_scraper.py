@@ -318,10 +318,23 @@ def main() -> int:
 
     # #913 Phase 1: WhoScored (5th source). The DAG always passes multi-year
     # SEASONS_STR. For INT-World Cup we must use single-year season ('2026')
-    # so that soccerdata and Bronze get the correct partition. Separate task
-    # per league helps, but we still override here.
+    # so that soccerdata and Bronze get the correct partition. soccerdata
+    # silently degrades when single-year and multi-year leagues share one
+    # reader (SeasonCode.from_leagues → UserWarning + wrong parse), and the
+    # old blanket `seasons = [2026]` override corrupted CLUB seasons in mixed
+    # calls — so in a mixed call WC is dropped (scrape it dedicated), and the
+    # single-year override applies only to the dedicated WC call.
     if 'INT-World Cup' in leagues:
-        seasons = [2026]
+        if len(leagues) > 1:
+            logger.warning(
+                "INT-World Cup requires a dedicated single-year call and is "
+                "DROPPED from this mixed run (soccerdata cannot mix single- "
+                f"and multi-year leagues in one reader): leagues={leagues}. "
+                "Scrape it separately with --leagues 'INT-World Cup'."
+            )
+            leagues = [l for l in leagues if l != 'INT-World Cup']
+        else:
+            seasons = [2026]
 
     logger.info(
         f"Starting WhoScored scraper: leagues={leagues}, seasons={seasons}, "

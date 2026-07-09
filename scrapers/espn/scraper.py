@@ -55,6 +55,9 @@ class ESPNScraper(SoccerdataScraper):
         # re-downloaded this run (see _prepare_summary_fetch) — bounds the
         # heal path to one request per match per run.
         self._stale_refetched: Set[int] = set()
+        # #913: guards the one-shot WC calendar rewrite (see
+        # _seed_single_year_cup_calendar).
+        self._wc_calendar_seeded = False
 
     def _get_reader(self):
         """Get soccerdata ESPN reader."""
@@ -69,6 +72,7 @@ class ESPNScraper(SoccerdataScraper):
             except ImportError:
                 logger.error("soccerdata library not installed")
                 raise
+            self._seed_single_year_cup_calendar(self._reader)
         return self._reader
 
     # ESPN public scoreboard API (matches soccerdata.espn.ESPN_API).
@@ -112,6 +116,83 @@ class ESPNScraper(SoccerdataScraper):
             # request goes through the same proxy/retry machinery.
             reader.get(url, seed_fp, no_cache=True)
         self._covid_2021_seeded = True
+
+    def _seed_single_year_cup_calendar(self, reader) -> None:
+        """Work around soccerdata's calendar parse for cup tournaments (#913).
+
+        Club leagues' ESPN scoreboard carries ``leagues[0].calendar`` as a flat
+        list of date STRINGS; ``fifa.world`` serves a list of STAGE DICTS
+        (``{label, startDate, endDate, entries: [...]}``) instead, and
+        soccerdata's ``read_schedule`` crashes on it with ``strptime() argument
+        1 must be str, not dict``.
+
+        Fix (same cache-seeding pattern as ``_seed_2021_season_calendar``):
+        fetch the calendar anchor through ``reader.get`` (same proxy/retry
+        machinery), and when the calendar is stage-shaped rewrite the cached
+        file with one ``%Y-%m-%dT%H:%MZ`` string per tournament day, derived
+        from the stage entries' date ranges. soccerdata then walks those days
+        exactly like a club season. Stage blocks longer than ~3 months are the
+        outer season shell (fifa.world pads endDate to Dec 31) and are skipped.
+        """
+        if self._wc_calendar_seeded:
+            return
+        from datetime import datetime, timedelta, timezone
+
+        for league, lkey in getattr(reader, '_selected_leagues', {}).items():
+            if league != 'INT-World Cup':
+                continue
+            for skey in {str(s) for s in (reader.seasons or [])}:
+                # Mirror soccerdata's calendar-anchor formula (espn.py) for the
+                # CACHE PATH — that's the file its read_schedule will read. For
+                # a single-year skey the formula degenerates ('2026' ->
+                # 20200701, ESPN answers with the 2018 WC calendar there), so
+                # the CONTENT is fetched from July 1 of the tournament year
+                # instead, and no_cache=True overwrites any stale anchor.
+                if int(skey[:2]) > int(str(datetime.now(tz=timezone.utc).year + 1)[-2:]):
+                    start_date = "".join(["19", skey[:2], "07", "01"])
+                else:
+                    start_date = "".join(["20", skey[:2], "07", "01"])
+                fp = reader.data_dir / f"Schedule_{lkey}_{start_date}.json"
+                url = f"{self._ESPN_API}/{lkey}/scoreboard?dates={int(skey):04d}0701"
+                try:
+                    data = json.load(reader.get(url, fp, no_cache=True))
+                except Exception as e:  # noqa: BLE001 — seed must not kill the run
+                    logger.warning(
+                        "ESPN #913: calendar probe failed for %s (%s)", lkey, e)
+                    continue
+                cal = ((data.get('leagues') or [{}])[0].get('calendar')) or []
+                if not cal or not isinstance(cal[0], dict):
+                    continue  # already the flat day-string shape
+                days = set()
+                for block in cal:
+                    for entry in (block.get('entries') or [block]):
+                        try:
+                            d0 = datetime.strptime(
+                                entry['startDate'][:10], '%Y-%m-%d').date()
+                            d1 = datetime.strptime(
+                                entry['endDate'][:10], '%Y-%m-%d').date()
+                        except Exception:  # noqa: BLE001 — skip malformed entry
+                            continue
+                        if (d1 - d0).days > 92:
+                            continue  # outer season shell, not a stage
+                        d = d0
+                        while d <= d1:
+                            days.add(d)
+                            d += timedelta(days=1)
+                if not days:
+                    logger.warning(
+                        "ESPN #913: no stage dates in %s calendar — cache "
+                        "left as-is", lkey)
+                    continue
+                data['leagues'][0]['calendar'] = [
+                    d.strftime('%Y-%m-%dT12:00Z') for d in sorted(days)
+                ]
+                fp.write_text(json.dumps(data))
+                logger.info(
+                    "ESPN #913: rewrote %s calendar into %d day entries "
+                    "(season %s)", lkey, len(days), skey,
+                )
+        self._wc_calendar_seeded = True
 
     def read_schedule(self) -> Optional[pd.DataFrame]:
         """
