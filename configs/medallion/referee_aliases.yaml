@@ -345,3 +345,1111 @@ referees:
       fbref: ["Tony Harrington"]
       matchhistory: ["T Harrington"]
     competition_scope: ["ENG-Premier League"]
+
+  # ===== ESP-La Liga (E8b, автогенерация из FBref-спайна) =====
+  - canonical_name: "Adrián Cordero"
+    canonical_id: "ref_adrian_cordero"
+    aliases:
+      fbref: ["Adrián Cordero"]
+    competition_scope: ["ESP-La Liga"]
+  - canonical_name: "Alberto Undiano"
+    canonical_id: "ref_alberto_undiano"
+    aliases:
+      fbref: ["Alberto Undiano"]
+    competition_scope: ["ESP-La Liga"]
+  - canonical_name: "Alejandro Hernández"
+    canonical_id: "ref_alejandro_hernandez"
+    aliases:
+      fbref: ["Alejandro Hernández"]
+    competition_scope: ["ESP-La Liga"]
+  - canonical_name: "Alejandro Muñíz"
+    canonical_id: "ref_alejandro_muniz"
+    aliases:
+      fbref: ["Alejandro Muñíz"]
+    competition_scope: ["ESP-La Liga"]
+  - canonical_name: "Alejandro Quintero"
+    canonical_id: "ref_alejandro_quintero"
+    aliases:
+      fbref: ["Alejandro Quintero"]
+    competition_scope: ["ESP-La Liga"]
+  - canonical_name: "Alfonso Álvarez"
+    canonical_id: "ref_alfonso_alvarez"
+    aliases:
+      fbref: ["Alfonso Álvarez"]
+    competition_scope: ["ESP-La Liga"]
+  - canonical_name: "Antonio Matéu"
+    canonical_id: "ref_antonio_mateu"
+    aliases:
+      fbref: ["Antonio Matéu"]
+    competition_scope: ["ESP-La Liga"]
+  - canonical_name: "Antonio Matéu Lahoz"
+    canonical_id: "ref_antonio_mateu_lahoz"
+    aliases:
+      fbref: ["Antonio Matéu Lahoz"]
+    competition_scope: ["ESP-La Liga"]
+  - canonical_name: "Carlos Clos"
+    canonical_id: "ref_carlos_clos"
+    aliases:
+      fbref: ["Carlos Clos"]
+    competition_scope: ["ESP-La Liga"]
+  - canonical_name: "Carlos del Cerro"
+    canonical_id: "ref_carlos_del_cerro"
+    aliases:
+      fbref: ["Carlos del Cerro"]
+    competition_scope: ["ESP-La Liga"]
+  - canonical_name: "César Soto"
+    canonical_id: "ref_cesar_soto"
+    aliases:
+      fbref: ["César Soto"]
+    competition_scope: ["ESP-La Liga"]
+  - canonical_name: "Daniel Ask"
+    canonical_id: "ref_daniel_ask"
+    aliases:
+      fbref: ["Daniel Ask"]
+    competition_scope: ["ESP-La Liga"]
+  - canonical_name: "Daniel Ocón"
+    canonical_id: "ref_daniel_ocon"
+    aliases:
+      fbref: ["Daniel Ocón"]
+    competition_scope: ["ESP-La Liga"]
+  - canonical_name: "Daniel Trujillo"
+    canonical_id: "ref_daniel_trujillo"
+    aliases:
+      fbref: ["Daniel Trujillo"]
+    competition_scope: ["ESP-La Liga"]
+  - canonical_name: "David Fernández"
+    canonical_id: "ref_david_fernandez"
+    aliases:
+      fbref: ["David Fernández"]
+    competition_scope: ["ESP-La Liga"]
+  - canonical_name: "David Medié"
+    canonical_id: "ref_david_medie"
+    aliases:
+      fbref: ["David Medié"]
+    competition_scope: ["ESP-La Liga"]
+  - canonical_name: "Eduardo Prieto"
+    canonical_id: "ref_eduardo_prieto"
+    aliases:
+      fbref: ["Eduardo Prieto"]
+    competition_scope: ["ESP-La Liga"]
+  - canonical_name: "Francisco Hernández"
+    canonical_id: "ref_francisco_hernandez"
+    aliases:
+      fbref: ["Francisco Hernández"]
+    competition_scope: ["ESP-La Liga"]
+  - canonical_name: "Guillermo Cuadra"
+    canonical_id: "ref_guillermo_cuadra"
+    aliases:
+      fbref: ["Guillermo Cuadra"]
+    competition_scope: ["ESP-La Liga"]
+  - canonical_name: "Hsu Jason"
+    canonical_id: "ref_hsu_jason"
+    aliases:
+      fbref: ["Hsu Jason"]
+    competition_scope: ["ESP-La Liga"]
+  - canonical_name: "Ignacio Iglesias"
+    canonical_id: "ref_ignacio_iglesias"
+    aliases:
+      fbref: ["Ignacio Iglesias"]
+    competition_scope: ["ESP-La Liga"]
+  - canonical_name: "Iosu Galech"
+    canonical_id: "ref_iosu_galech"
+    aliases:
+      fbref: ["Iosu Galech"]
+    competition_scope: ["ESP-La Liga"]
+  - canonical_name: "Isidro Díaz de Mera"
+    canonical_id: "ref_isidro_diaz_de_mera"
+    aliases:
+      fbref: ["Isidro Díaz de Mera"]
+    competition_scope: ["ESP-La Liga"]
+  - canonical_name: "Iñaki Bikandi"
+    canonical_id: "ref_inaki_bikandi"
+    aliases:
+      fbref: ["Iñaki Bikandi"]
+    competition_scope: ["ESP-La Liga"]
+  - canonical_name: "Javier Alberola"
+    canonical_id: "ref_javier_alberola"
+    aliases:
+      fbref: ["Javier Alberola"]
+    competition_scope: ["ESP-La Liga"]
+  - canonical_name: "Javier Villanueva"
+    canonical_id: "ref_javier_villanueva"
+    aliases:
+      fbref: ["Javier Villanueva"]
+    competition_scope: ["ESP-La Liga"]
+  - canonical_name: "Jesús Gil"
+    canonical_id: "ref_jesus_gil"
+    aliases:
+      fbref: ["Jesús Gil"]
+    competition_scope: ["ESP-La Liga"]
+  - canonical_name: "Jorge Figueroa"
+    canonical_id: "ref_jorge_figueroa"
+    aliases:
+      fbref: ["Jorge Figueroa"]
+    competition_scope: ["ESP-La Liga"]
+  - canonical_name: "Jose Maria Sánchez"
+    canonical_id: "ref_jose_maria_sanchez"
+    aliases:
+      fbref: ["Jose Maria Sánchez"]
+    competition_scope: ["ESP-La Liga"]
+  - canonical_name: "José González"
+    canonical_id: "ref_jose_gonzalez"
+    aliases:
+      fbref: ["José González"]
+    competition_scope: ["ESP-La Liga"]
+  - canonical_name: "José Guzmán"
+    canonical_id: "ref_jose_guzman"
+    aliases:
+      fbref: ["José Guzmán"]
+    competition_scope: ["ESP-La Liga"]
+  - canonical_name: "José Luis Munuera"
+    canonical_id: "ref_jose_luis_munuera"
+    aliases:
+      fbref: ["José Luis Munuera"]
+    competition_scope: ["ESP-La Liga"]
+  - canonical_name: "José Munuera"
+    canonical_id: "ref_jose_munuera"
+    aliases:
+      fbref: ["José Munuera"]
+    competition_scope: ["ESP-La Liga"]
+  - canonical_name: "José Sánchez"
+    canonical_id: "ref_jose_sanchez"
+    aliases:
+      fbref: ["José Sánchez"]
+    competition_scope: ["ESP-La Liga"]
+  - canonical_name: "Juan Martínez"
+    canonical_id: "ref_juan_martinez"
+    aliases:
+      fbref: ["Juan Martínez"]
+    competition_scope: ["ESP-La Liga"]
+  - canonical_name: "Juan Pulido"
+    canonical_id: "ref_juan_pulido"
+    aliases:
+      fbref: ["Juan Pulido"]
+    competition_scope: ["ESP-La Liga"]
+  - canonical_name: "Mario Melero"
+    canonical_id: "ref_mario_melero"
+    aliases:
+      fbref: ["Mario Melero"]
+    competition_scope: ["ESP-La Liga"]
+  - canonical_name: "Mateo Busquets"
+    canonical_id: "ref_mateo_busquets"
+    aliases:
+      fbref: ["Mateo Busquets"]
+    competition_scope: ["ESP-La Liga"]
+  - canonical_name: "Miguel Sesma"
+    canonical_id: "ref_miguel_sesma"
+    aliases:
+      fbref: ["Miguel Sesma"]
+    competition_scope: ["ESP-La Liga"]
+  - canonical_name: "Miguel Ángel Ortiz Arias"
+    canonical_id: "ref_miguel_angel_ortiz_arias"
+    aliases:
+      fbref: ["Miguel Ángel Ortiz Arias"]
+    competition_scope: ["ESP-La Liga"]
+  - canonical_name: "Pablo González"
+    canonical_id: "ref_pablo_gonzalez"
+    aliases:
+      fbref: ["Pablo González"]
+    competition_scope: ["ESP-La Liga"]
+  - canonical_name: "Ricardo de Burgos"
+    canonical_id: "ref_ricardo_de_burgos"
+    aliases:
+      fbref: ["Ricardo de Burgos"]
+    competition_scope: ["ESP-La Liga"]
+  - canonical_name: "Santiago Jaime"
+    canonical_id: "ref_santiago_jaime"
+    aliases:
+      fbref: ["Santiago Jaime"]
+    competition_scope: ["ESP-La Liga"]
+  - canonical_name: "Valentín Pizarro"
+    canonical_id: "ref_valentin_pizarro"
+    aliases:
+      fbref: ["Valentín Pizarro"]
+    competition_scope: ["ESP-La Liga"]
+  - canonical_name: "Víctor Acosta"
+    canonical_id: "ref_victor_acosta"
+    aliases:
+      fbref: ["Víctor Acosta"]
+    competition_scope: ["ESP-La Liga"]
+  - canonical_name: "Víctor García"
+    canonical_id: "ref_victor_garcia"
+    aliases:
+      fbref: ["Víctor García"]
+    competition_scope: ["ESP-La Liga"]
+  - canonical_name: "Xavi Estrada"
+    canonical_id: "ref_xavi_estrada"
+    aliases:
+      fbref: ["Xavi Estrada"]
+    competition_scope: ["ESP-La Liga"]
+
+  # ===== FRA-Ligue 1 (E8b, автогенерация из FBref-спайна) =====
+  - canonical_name: "Abdelatif Kherradji"
+    canonical_id: "ref_abdelatif_kherradji"
+    aliases:
+      fbref: ["Abdelatif Kherradji"]
+    competition_scope: ["FRA-Ligue 1"]
+  - canonical_name: "Alain Bieri"
+    canonical_id: "ref_alain_bieri"
+    aliases:
+      fbref: ["Alain Bieri"]
+    competition_scope: ["FRA-Ligue 1"]
+  - canonical_name: "Amaury Delerue"
+    canonical_id: "ref_amaury_delerue"
+    aliases:
+      fbref: ["Amaury Delerue"]
+    competition_scope: ["FRA-Ligue 1"]
+  - canonical_name: "Antony Gautier"
+    canonical_id: "ref_antony_gautier"
+    aliases:
+      fbref: ["Antony Gautier"]
+    competition_scope: ["FRA-Ligue 1"]
+  - canonical_name: "António Nobre"
+    canonical_id: "ref_antonio_nobre"
+    aliases:
+      fbref: ["António Nobre"]
+    competition_scope: ["FRA-Ligue 1"]
+  - canonical_name: "Aurélien Petit"
+    canonical_id: "ref_aurelien_petit"
+    aliases:
+      fbref: ["Aurélien Petit"]
+    competition_scope: ["FRA-Ligue 1"]
+  - canonical_name: "Bartolomeu Varela"
+    canonical_id: "ref_bartolomeu_varela"
+    aliases:
+      fbref: ["Bartolomeu Varela"]
+    competition_scope: ["FRA-Ligue 1"]
+  - canonical_name: "Bastien Dechepy"
+    canonical_id: "ref_bastien_dechepy"
+    aliases:
+      fbref: ["Bastien Dechepy"]
+    competition_scope: ["FRA-Ligue 1"]
+  - canonical_name: "Benoît Bastien"
+    canonical_id: "ref_benoit_bastien"
+    aliases:
+      fbref: ["Benoît Bastien"]
+    competition_scope: ["FRA-Ligue 1"]
+  - canonical_name: "Benoît Millot"
+    canonical_id: "ref_benoit_millot"
+    aliases:
+      fbref: ["Benoît Millot"]
+    competition_scope: ["FRA-Ligue 1"]
+  - canonical_name: "Clément Turpin"
+    canonical_id: "ref_clement_turpin"
+    aliases:
+      fbref: ["Clément Turpin"]
+    competition_scope: ["FRA-Ligue 1"]
+  - canonical_name: "Eric Wattellier"
+    canonical_id: "ref_eric_wattellier"
+    aliases:
+      fbref: ["Eric Wattellier"]
+    competition_scope: ["FRA-Ligue 1"]
+  - canonical_name: "Florent Batta"
+    canonical_id: "ref_florent_batta"
+    aliases:
+      fbref: ["Florent Batta"]
+    competition_scope: ["FRA-Ligue 1"]
+  - canonical_name: "Franck Schneider"
+    canonical_id: "ref_franck_schneider"
+    aliases:
+      fbref: ["Franck Schneider"]
+    competition_scope: ["FRA-Ligue 1"]
+  - canonical_name: "François Letexier"
+    canonical_id: "ref_francois_letexier"
+    aliases:
+      fbref: ["François Letexier"]
+    competition_scope: ["FRA-Ligue 1"]
+  - canonical_name: "Frédy Fautrel"
+    canonical_id: "ref_fredy_fautrel"
+    aliases:
+      fbref: ["Frédy Fautrel"]
+    competition_scope: ["FRA-Ligue 1"]
+  - canonical_name: "Gaël Angoula"
+    canonical_id: "ref_gael_angoula"
+    aliases:
+      fbref: ["Gaël Angoula"]
+    competition_scope: ["FRA-Ligue 1"]
+  - canonical_name: "Guillaume Paradis"
+    canonical_id: "ref_guillaume_paradis"
+    aliases:
+      fbref: ["Guillaume Paradis"]
+    competition_scope: ["FRA-Ligue 1"]
+  - canonical_name: "Gustavo Correia"
+    canonical_id: "ref_gustavo_correia"
+    aliases:
+      fbref: ["Gustavo Correia"]
+    competition_scope: ["FRA-Ligue 1"]
+  - canonical_name: "Hakim Ben El Hadj Salem"
+    canonical_id: "ref_hakim_ben_el_hadj_salem"
+    aliases:
+      fbref: ["Hakim Ben El Hadj Salem"]
+    competition_scope: ["FRA-Ligue 1"]
+  - canonical_name: "Hugo Miguel"
+    canonical_id: "ref_hugo_miguel"
+    aliases:
+      fbref: ["Hugo Miguel"]
+    competition_scope: ["FRA-Ligue 1"]
+  - canonical_name: "Jeremy Stinat"
+    canonical_id: "ref_jeremy_stinat"
+    aliases:
+      fbref: ["Jeremy Stinat"]
+    competition_scope: ["FRA-Ligue 1"]
+  - canonical_name: "Johan Hamel"
+    canonical_id: "ref_johan_hamel"
+    aliases:
+      fbref: ["Johan Hamel"]
+    competition_scope: ["FRA-Ligue 1"]
+  - canonical_name: "Jérémie Pignard"
+    canonical_id: "ref_jeremie_pignard"
+    aliases:
+      fbref: ["Jérémie Pignard"]
+    competition_scope: ["FRA-Ligue 1"]
+  - canonical_name: "Jérôme Brisard"
+    canonical_id: "ref_jerome_brisard"
+    aliases:
+      fbref: ["Jérôme Brisard"]
+    competition_scope: ["FRA-Ligue 1"]
+  - canonical_name: "Jérôme Miguelgorry"
+    canonical_id: "ref_jerome_miguelgorry"
+    aliases:
+      fbref: ["Jérôme Miguelgorry"]
+    competition_scope: ["FRA-Ligue 1"]
+  - canonical_name: "Karim Abed"
+    canonical_id: "ref_karim_abed"
+    aliases:
+      fbref: ["Karim Abed"]
+    competition_scope: ["FRA-Ligue 1"]
+  - canonical_name: "Lionel Jaffredo"
+    canonical_id: "ref_lionel_jaffredo"
+    aliases:
+      fbref: ["Lionel Jaffredo"]
+    competition_scope: ["FRA-Ligue 1"]
+  - canonical_name: "Luís Godinho"
+    canonical_id: "ref_luis_godinho"
+    aliases:
+      fbref: ["Luís Godinho"]
+    competition_scope: ["FRA-Ligue 1"]
+  - canonical_name: "Marc Bollengier"
+    canonical_id: "ref_marc_bollengier"
+    aliases:
+      fbref: ["Marc Bollengier"]
+    competition_scope: ["FRA-Ligue 1"]
+  - canonical_name: "Mathieu Vernice"
+    canonical_id: "ref_mathieu_vernice"
+    aliases:
+      fbref: ["Mathieu Vernice"]
+    competition_scope: ["FRA-Ligue 1"]
+  - canonical_name: "Miguel Nogueira"
+    canonical_id: "ref_miguel_nogueira"
+    aliases:
+      fbref: ["Miguel Nogueira"]
+    competition_scope: ["FRA-Ligue 1"]
+  - canonical_name: "Mikael Lesage"
+    canonical_id: "ref_mikael_lesage"
+    aliases:
+      fbref: ["Mikael Lesage"]
+    competition_scope: ["FRA-Ligue 1"]
+  - canonical_name: "Nicolas Rainville"
+    canonical_id: "ref_nicolas_rainville"
+    aliases:
+      fbref: ["Nicolas Rainville"]
+    competition_scope: ["FRA-Ligue 1"]
+  - canonical_name: "Olivier Thual"
+    canonical_id: "ref_olivier_thual"
+    aliases:
+      fbref: ["Olivier Thual"]
+    competition_scope: ["FRA-Ligue 1"]
+  - canonical_name: "Pierre Gaillouste"
+    canonical_id: "ref_pierre_gaillouste"
+    aliases:
+      fbref: ["Pierre Gaillouste"]
+    competition_scope: ["FRA-Ligue 1"]
+  - canonical_name: "Romain Lissorgue"
+    canonical_id: "ref_romain_lissorgue"
+    aliases:
+      fbref: ["Romain Lissorgue"]
+    competition_scope: ["FRA-Ligue 1"]
+  - canonical_name: "Ruddy Buquet"
+    canonical_id: "ref_ruddy_buquet"
+    aliases:
+      fbref: ["Ruddy Buquet"]
+    competition_scope: ["FRA-Ligue 1"]
+  - canonical_name: "Sandro Schärer"
+    canonical_id: "ref_sandro_scharer"
+    aliases:
+      fbref: ["Sandro Schärer"]
+    competition_scope: ["FRA-Ligue 1"]
+  - canonical_name: "Saïd Ennjimi"
+    canonical_id: "ref_said_ennjimi"
+    aliases:
+      fbref: ["Saïd Ennjimi"]
+    competition_scope: ["FRA-Ligue 1"]
+  - canonical_name: "Stephan Klossner"
+    canonical_id: "ref_stephan_klossner"
+    aliases:
+      fbref: ["Stephan Klossner"]
+    competition_scope: ["FRA-Ligue 1"]
+  - canonical_name: "Stéphane Jochem"
+    canonical_id: "ref_stephane_jochem"
+    aliases:
+      fbref: ["Stéphane Jochem"]
+    competition_scope: ["FRA-Ligue 1"]
+  - canonical_name: "Stéphane Lannoy"
+    canonical_id: "ref_stephane_lannoy"
+    aliases:
+      fbref: ["Stéphane Lannoy"]
+    competition_scope: ["FRA-Ligue 1"]
+  - canonical_name: "Stéphanie Frappart"
+    canonical_id: "ref_stephanie_frappart"
+    aliases:
+      fbref: ["Stéphanie Frappart"]
+    competition_scope: ["FRA-Ligue 1"]
+  - canonical_name: "Sébastien Desiage"
+    canonical_id: "ref_sebastien_desiage"
+    aliases:
+      fbref: ["Sébastien Desiage"]
+    competition_scope: ["FRA-Ligue 1"]
+  - canonical_name: "Sébastien Moreira"
+    canonical_id: "ref_sebastien_moreira"
+    aliases:
+      fbref: ["Sébastien Moreira"]
+    competition_scope: ["FRA-Ligue 1"]
+  - canonical_name: "Thomas Léonard"
+    canonical_id: "ref_thomas_leonard"
+    aliases:
+      fbref: ["Thomas Léonard"]
+    competition_scope: ["FRA-Ligue 1"]
+  - canonical_name: "Tony Chapron"
+    canonical_id: "ref_tony_chapron"
+    aliases:
+      fbref: ["Tony Chapron"]
+    competition_scope: ["FRA-Ligue 1"]
+  - canonical_name: "Vitor Ferreira Fernandes"
+    canonical_id: "ref_vitor_ferreira_fernandes"
+    aliases:
+      fbref: ["Vitor Ferreira Fernandes"]
+    competition_scope: ["FRA-Ligue 1"]
+  - canonical_name: "Willy Delajod"
+    canonical_id: "ref_willy_delajod"
+    aliases:
+      fbref: ["Willy Delajod"]
+    competition_scope: ["FRA-Ligue 1"]
+
+  # ===== GER-Bundesliga (E8b, автогенерация из FBref-спайна) =====
+  - canonical_name: "Bastian Dankert"
+    canonical_id: "ref_bastian_dankert"
+    aliases:
+      fbref: ["Bastian Dankert"]
+    competition_scope: ["GER-Bundesliga"]
+  - canonical_name: "Benjamin Brand"
+    canonical_id: "ref_benjamin_brand"
+    aliases:
+      fbref: ["Benjamin Brand"]
+    competition_scope: ["GER-Bundesliga"]
+  - canonical_name: "Benjamin Cortus"
+    canonical_id: "ref_benjamin_cortus"
+    aliases:
+      fbref: ["Benjamin Cortus"]
+    competition_scope: ["GER-Bundesliga"]
+  - canonical_name: "Bibiana Steinhaus"
+    canonical_id: "ref_bibiana_steinhaus"
+    aliases:
+      fbref: ["Bibiana Steinhaus"]
+    competition_scope: ["GER-Bundesliga"]
+  - canonical_name: "Christian Dingert"
+    canonical_id: "ref_christian_dingert"
+    aliases:
+      fbref: ["Christian Dingert"]
+    competition_scope: ["GER-Bundesliga"]
+  - canonical_name: "Daniel Schlager"
+    canonical_id: "ref_daniel_schlager"
+    aliases:
+      fbref: ["Daniel Schlager"]
+    competition_scope: ["GER-Bundesliga"]
+  - canonical_name: "Daniel Siebert"
+    canonical_id: "ref_daniel_siebert"
+    aliases:
+      fbref: ["Daniel Siebert"]
+    competition_scope: ["GER-Bundesliga"]
+  - canonical_name: "Deniz Aytekin"
+    canonical_id: "ref_deniz_aytekin"
+    aliases:
+      fbref: ["Deniz Aytekin"]
+    competition_scope: ["GER-Bundesliga"]
+  - canonical_name: "Felix Brych"
+    canonical_id: "ref_felix_brych"
+    aliases:
+      fbref: ["Felix Brych"]
+    competition_scope: ["GER-Bundesliga"]
+  - canonical_name: "Felix Zwayer"
+    canonical_id: "ref_felix_zwayer"
+    aliases:
+      fbref: ["Felix Zwayer"]
+    competition_scope: ["GER-Bundesliga"]
+  - canonical_name: "Florian Badstübner"
+    canonical_id: "ref_florian_badstubner"
+    aliases:
+      fbref: ["Florian Badstübner"]
+    competition_scope: ["GER-Bundesliga"]
+  - canonical_name: "Florian Exner"
+    canonical_id: "ref_florian_exner"
+    aliases:
+      fbref: ["Florian Exner"]
+    competition_scope: ["GER-Bundesliga"]
+  - canonical_name: "Frank Willenborg"
+    canonical_id: "ref_frank_willenborg"
+    aliases:
+      fbref: ["Frank Willenborg"]
+    competition_scope: ["GER-Bundesliga"]
+  - canonical_name: "Guido Winkmann"
+    canonical_id: "ref_guido_winkmann"
+    aliases:
+      fbref: ["Guido Winkmann"]
+    competition_scope: ["GER-Bundesliga"]
+  - canonical_name: "Günter Perl"
+    canonical_id: "ref_gunter_perl"
+    aliases:
+      fbref: ["Günter Perl"]
+    competition_scope: ["GER-Bundesliga"]
+  - canonical_name: "Harm Osmers"
+    canonical_id: "ref_harm_osmers"
+    aliases:
+      fbref: ["Harm Osmers"]
+    competition_scope: ["GER-Bundesliga"]
+  - canonical_name: "Jochen Drees"
+    canonical_id: "ref_jochen_drees"
+    aliases:
+      fbref: ["Jochen Drees"]
+    competition_scope: ["GER-Bundesliga"]
+  - canonical_name: "Manuel Gräfe"
+    canonical_id: "ref_manuel_grafe"
+    aliases:
+      fbref: ["Manuel Gräfe"]
+    competition_scope: ["GER-Bundesliga"]
+  - canonical_name: "Marco Fritz"
+    canonical_id: "ref_marco_fritz"
+    aliases:
+      fbref: ["Marco Fritz"]
+    competition_scope: ["GER-Bundesliga"]
+  - canonical_name: "Markus Schmidt"
+    canonical_id: "ref_markus_schmidt"
+    aliases:
+      fbref: ["Markus Schmidt"]
+    competition_scope: ["GER-Bundesliga"]
+  - canonical_name: "Martin Petersen"
+    canonical_id: "ref_martin_petersen"
+    aliases:
+      fbref: ["Martin Petersen"]
+    competition_scope: ["GER-Bundesliga"]
+  - canonical_name: "Matthias Jöllenbeck"
+    canonical_id: "ref_matthias_jollenbeck"
+    aliases:
+      fbref: ["Matthias Jöllenbeck"]
+    competition_scope: ["GER-Bundesliga"]
+  - canonical_name: "Max Burda"
+    canonical_id: "ref_max_burda"
+    aliases:
+      fbref: ["Max Burda"]
+    competition_scope: ["GER-Bundesliga"]
+  - canonical_name: "Patrick Ittrich"
+    canonical_id: "ref_patrick_ittrich"
+    aliases:
+      fbref: ["Patrick Ittrich"]
+    competition_scope: ["GER-Bundesliga"]
+  - canonical_name: "Robert Hartmann"
+    canonical_id: "ref_robert_hartmann"
+    aliases:
+      fbref: ["Robert Hartmann"]
+    competition_scope: ["GER-Bundesliga"]
+  - canonical_name: "Robert Kampka"
+    canonical_id: "ref_robert_kampka"
+    aliases:
+      fbref: ["Robert Kampka"]
+    competition_scope: ["GER-Bundesliga"]
+  - canonical_name: "Robert Schröder"
+    canonical_id: "ref_robert_schroder"
+    aliases:
+      fbref: ["Robert Schröder"]
+    competition_scope: ["GER-Bundesliga"]
+  - canonical_name: "Robert Schörgenhofer"
+    canonical_id: "ref_robert_schorgenhofer"
+    aliases:
+      fbref: ["Robert Schörgenhofer"]
+    competition_scope: ["GER-Bundesliga"]
+  - canonical_name: "Robin Braun"
+    canonical_id: "ref_robin_braun"
+    aliases:
+      fbref: ["Robin Braun"]
+    competition_scope: ["GER-Bundesliga"]
+  - canonical_name: "Sascha Stegemann"
+    canonical_id: "ref_sascha_stegemann"
+    aliases:
+      fbref: ["Sascha Stegemann"]
+    competition_scope: ["GER-Bundesliga"]
+  - canonical_name: "Sven Jablonski"
+    canonical_id: "ref_sven_jablonski"
+    aliases:
+      fbref: ["Sven Jablonski"]
+    competition_scope: ["GER-Bundesliga"]
+  - canonical_name: "Sören Storks"
+    canonical_id: "ref_soren_storks"
+    aliases:
+      fbref: ["Sören Storks"]
+    competition_scope: ["GER-Bundesliga"]
+  - canonical_name: "Timo Gerach"
+    canonical_id: "ref_timo_gerach"
+    aliases:
+      fbref: ["Timo Gerach"]
+    competition_scope: ["GER-Bundesliga"]
+  - canonical_name: "Tobias Reichel"
+    canonical_id: "ref_tobias_reichel"
+    aliases:
+      fbref: ["Tobias Reichel"]
+    competition_scope: ["GER-Bundesliga"]
+  - canonical_name: "Tobias Stieler"
+    canonical_id: "ref_tobias_stieler"
+    aliases:
+      fbref: ["Tobias Stieler"]
+    competition_scope: ["GER-Bundesliga"]
+  - canonical_name: "Tobias Welz"
+    canonical_id: "ref_tobias_welz"
+    aliases:
+      fbref: ["Tobias Welz"]
+    competition_scope: ["GER-Bundesliga"]
+  - canonical_name: "Wolfgang Stark"
+    canonical_id: "ref_wolfgang_stark"
+    aliases:
+      fbref: ["Wolfgang Stark"]
+    competition_scope: ["GER-Bundesliga"]
+
+  # ===== ITA-Serie A (E8b, автогенерация из FBref-спайна) =====
+  - canonical_name: "Alberto Arena"
+    canonical_id: "ref_alberto_arena"
+    aliases:
+      fbref: ["Alberto Arena"]
+    competition_scope: ["ITA-Serie A"]
+  - canonical_name: "Alberto Santoro"
+    canonical_id: "ref_alberto_santoro"
+    aliases:
+      fbref: ["Alberto Santoro"]
+    competition_scope: ["ITA-Serie A"]
+  - canonical_name: "Aleandro Di Paolo"
+    canonical_id: "ref_aleandro_di_paolo"
+    aliases:
+      fbref: ["Aleandro Di Paolo"]
+    competition_scope: ["ITA-Serie A"]
+  - canonical_name: "Alessandro Prontera"
+    canonical_id: "ref_alessandro_prontera"
+    aliases:
+      fbref: ["Alessandro Prontera"]
+    competition_scope: ["ITA-Serie A"]
+  - canonical_name: "Andrea Calzavara"
+    canonical_id: "ref_andrea_calzavara"
+    aliases:
+      fbref: ["Andrea Calzavara"]
+    competition_scope: ["ITA-Serie A"]
+  - canonical_name: "Andrea Colombo"
+    canonical_id: "ref_andrea_colombo"
+    aliases:
+      fbref: ["Andrea Colombo"]
+    competition_scope: ["ITA-Serie A"]
+  - canonical_name: "Andrea Zanotti"
+    canonical_id: "ref_andrea_zanotti"
+    aliases:
+      fbref: ["Andrea Zanotti"]
+    competition_scope: ["ITA-Serie A"]
+  - canonical_name: "Antonio Damato"
+    canonical_id: "ref_antonio_damato"
+    aliases:
+      fbref: ["Antonio Damato"]
+    competition_scope: ["ITA-Serie A"]
+  - canonical_name: "Antonio Di Martino"
+    canonical_id: "ref_antonio_di_martino"
+    aliases:
+      fbref: ["Antonio Di Martino"]
+    competition_scope: ["ITA-Serie A"]
+  - canonical_name: "Antonio Giua"
+    canonical_id: "ref_antonio_giua"
+    aliases:
+      fbref: ["Antonio Giua"]
+    competition_scope: ["ITA-Serie A"]
+  - canonical_name: "Antonio Rapuano"
+    canonical_id: "ref_antonio_rapuano"
+    aliases:
+      fbref: ["Antonio Rapuano"]
+    competition_scope: ["ITA-Serie A"]
+  - canonical_name: "Carmine Russo"
+    canonical_id: "ref_carmine_russo"
+    aliases:
+      fbref: ["Carmine Russo"]
+    competition_scope: ["ITA-Serie A"]
+  - canonical_name: "Claudio Gavillucci"
+    canonical_id: "ref_claudio_gavillucci"
+    aliases:
+      fbref: ["Claudio Gavillucci"]
+    competition_scope: ["ITA-Serie A"]
+  - canonical_name: "Cosso Cosso"
+    canonical_id: "ref_cosso_cosso"
+    aliases:
+      fbref: ["Cosso Cosso"]
+    competition_scope: ["ITA-Serie A"]
+  - canonical_name: "Daniel Amabile"
+    canonical_id: "ref_daniel_amabile"
+    aliases:
+      fbref: ["Daniel Amabile"]
+    competition_scope: ["ITA-Serie A"]
+  - canonical_name: "Daniele Chiffi"
+    canonical_id: "ref_daniele_chiffi"
+    aliases:
+      fbref: ["Daniele Chiffi"]
+    competition_scope: ["ITA-Serie A"]
+  - canonical_name: "Daniele Doveri"
+    canonical_id: "ref_daniele_doveri"
+    aliases:
+      fbref: ["Daniele Doveri"]
+    competition_scope: ["ITA-Serie A"]
+  - canonical_name: "Daniele Martinelli"
+    canonical_id: "ref_daniele_martinelli"
+    aliases:
+      fbref: ["Daniele Martinelli"]
+    competition_scope: ["ITA-Serie A"]
+  - canonical_name: "Daniele Minelli"
+    canonical_id: "ref_daniele_minelli"
+    aliases:
+      fbref: ["Daniele Minelli"]
+    competition_scope: ["ITA-Serie A"]
+  - canonical_name: "Daniele Orsato"
+    canonical_id: "ref_daniele_orsato"
+    aliases:
+      fbref: ["Daniele Orsato"]
+    competition_scope: ["ITA-Serie A"]
+  - canonical_name: "Daniele Paterna"
+    canonical_id: "ref_daniele_paterna"
+    aliases:
+      fbref: ["Daniele Paterna"]
+    competition_scope: ["ITA-Serie A"]
+  - canonical_name: "Daniele Perenzoni"
+    canonical_id: "ref_daniele_perenzoni"
+    aliases:
+      fbref: ["Daniele Perenzoni"]
+    competition_scope: ["ITA-Serie A"]
+  - canonical_name: "Daniele Rutella"
+    canonical_id: "ref_daniele_rutella"
+    aliases:
+      fbref: ["Daniele Rutella"]
+    competition_scope: ["ITA-Serie A"]
+  - canonical_name: "Davide Di Marco"
+    canonical_id: "ref_davide_di_marco"
+    aliases:
+      fbref: ["Davide Di Marco"]
+    competition_scope: ["ITA-Serie A"]
+  - canonical_name: "Davide Ghersini"
+    canonical_id: "ref_davide_ghersini"
+    aliases:
+      fbref: ["Davide Ghersini"]
+    competition_scope: ["ITA-Serie A"]
+  - canonical_name: "Davide Massa"
+    canonical_id: "ref_davide_massa"
+    aliases:
+      fbref: ["Davide Massa"]
+    competition_scope: ["ITA-Serie A"]
+  - canonical_name: "Domenico Celi"
+    canonical_id: "ref_domenico_celi"
+    aliases:
+      fbref: ["Domenico Celi"]
+    competition_scope: ["ITA-Serie A"]
+  - canonical_name: "Ermanno Feliciani"
+    canonical_id: "ref_ermanno_feliciani"
+    aliases:
+      fbref: ["Ermanno Feliciani"]
+    competition_scope: ["ITA-Serie A"]
+  - canonical_name: "Eugenio Abbattista"
+    canonical_id: "ref_eugenio_abbattista"
+    aliases:
+      fbref: ["Eugenio Abbattista"]
+    competition_scope: ["ITA-Serie A"]
+  - canonical_name: "Fabio Maresca"
+    canonical_id: "ref_fabio_maresca"
+    aliases:
+      fbref: ["Fabio Maresca"]
+    competition_scope: ["ITA-Serie A"]
+  - canonical_name: "Fabrizio Pasqua"
+    canonical_id: "ref_fabrizio_pasqua"
+    aliases:
+      fbref: ["Fabrizio Pasqua"]
+    competition_scope: ["ITA-Serie A"]
+  - canonical_name: "Federico Dionisi"
+    canonical_id: "ref_federico_dionisi"
+    aliases:
+      fbref: ["Federico Dionisi"]
+    competition_scope: ["ITA-Serie A"]
+  - canonical_name: "Federico La Penna"
+    canonical_id: "ref_federico_la_penna"
+    aliases:
+      fbref: ["Federico La Penna"]
+    competition_scope: ["ITA-Serie A"]
+  - canonical_name: "Francesco Cosso"
+    canonical_id: "ref_francesco_cosso"
+    aliases:
+      fbref: ["Francesco Cosso"]
+    competition_scope: ["ITA-Serie A"]
+  - canonical_name: "Francesco Fourneau"
+    canonical_id: "ref_francesco_fourneau"
+    aliases:
+      fbref: ["Francesco Fourneau"]
+    competition_scope: ["ITA-Serie A"]
+  - canonical_name: "Francesco Meraviglia"
+    canonical_id: "ref_francesco_meraviglia"
+    aliases:
+      fbref: ["Francesco Meraviglia"]
+    competition_scope: ["ITA-Serie A"]
+  - canonical_name: "Giacomo Camplone"
+    canonical_id: "ref_giacomo_camplone"
+    aliases:
+      fbref: ["Giacomo Camplone"]
+    competition_scope: ["ITA-Serie A"]
+  - canonical_name: "Giampaolo Calvarese"
+    canonical_id: "ref_giampaolo_calvarese"
+    aliases:
+      fbref: ["Giampaolo Calvarese"]
+    competition_scope: ["ITA-Serie A"]
+  - canonical_name: "Gianluca Aureliano"
+    canonical_id: "ref_gianluca_aureliano"
+    aliases:
+      fbref: ["Gianluca Aureliano"]
+    competition_scope: ["ITA-Serie A"]
+  - canonical_name: "Gianluca Manganiello"
+    canonical_id: "ref_gianluca_manganiello"
+    aliases:
+      fbref: ["Gianluca Manganiello"]
+    competition_scope: ["ITA-Serie A"]
+  - canonical_name: "Gianluca Rocchi"
+    canonical_id: "ref_gianluca_rocchi"
+    aliases:
+      fbref: ["Gianluca Rocchi"]
+    competition_scope: ["ITA-Serie A"]
+  - canonical_name: "Gianpiero Miele"
+    canonical_id: "ref_gianpiero_miele"
+    aliases:
+      fbref: ["Gianpiero Miele"]
+    competition_scope: ["ITA-Serie A"]
+  - canonical_name: "Giovanni Ayroldi"
+    canonical_id: "ref_giovanni_ayroldi"
+    aliases:
+      fbref: ["Giovanni Ayroldi"]
+    competition_scope: ["ITA-Serie A"]
+  - canonical_name: "Giuseppe Collu"
+    canonical_id: "ref_giuseppe_collu"
+    aliases:
+      fbref: ["Giuseppe Collu"]
+    competition_scope: ["ITA-Serie A"]
+  - canonical_name: "Giuseppe Mucera"
+    canonical_id: "ref_giuseppe_mucera"
+    aliases:
+      fbref: ["Giuseppe Mucera"]
+    competition_scope: ["ITA-Serie A"]
+  - canonical_name: "Ivan Pezzuto"
+    canonical_id: "ref_ivan_pezzuto"
+    aliases:
+      fbref: ["Ivan Pezzuto"]
+    competition_scope: ["ITA-Serie A"]
+  - canonical_name: "Juan Luca Sacchi"
+    canonical_id: "ref_juan_luca_sacchi"
+    aliases:
+      fbref: ["Juan Luca Sacchi"]
+    competition_scope: ["ITA-Serie A"]
+  - canonical_name: "Juan Sacchi"
+    canonical_id: "ref_juan_sacchi"
+    aliases:
+      fbref: ["Juan Sacchi"]
+    competition_scope: ["ITA-Serie A"]
+  - canonical_name: "Kevin Bonacina"
+    canonical_id: "ref_kevin_bonacina"
+    aliases:
+      fbref: ["Kevin Bonacina"]
+    competition_scope: ["ITA-Serie A"]
+  - canonical_name: "Livio Marinelli"
+    canonical_id: "ref_livio_marinelli"
+    aliases:
+      fbref: ["Livio Marinelli"]
+    competition_scope: ["ITA-Serie A"]
+  - canonical_name: "Lorenzo Illuzzi"
+    canonical_id: "ref_lorenzo_illuzzi"
+    aliases:
+      fbref: ["Lorenzo Illuzzi"]
+    competition_scope: ["ITA-Serie A"]
+  - canonical_name: "Lorenzo Maggioni"
+    canonical_id: "ref_lorenzo_maggioni"
+    aliases:
+      fbref: ["Lorenzo Maggioni"]
+    competition_scope: ["ITA-Serie A"]
+  - canonical_name: "Luca Banti"
+    canonical_id: "ref_luca_banti"
+    aliases:
+      fbref: ["Luca Banti"]
+    competition_scope: ["ITA-Serie A"]
+  - canonical_name: "Luca Massimi"
+    canonical_id: "ref_luca_massimi"
+    aliases:
+      fbref: ["Luca Massimi"]
+    competition_scope: ["ITA-Serie A"]
+  - canonical_name: "Luca Pairetto"
+    canonical_id: "ref_luca_pairetto"
+    aliases:
+      fbref: ["Luca Pairetto"]
+    competition_scope: ["ITA-Serie A"]
+  - canonical_name: "Luca Zufferli"
+    canonical_id: "ref_luca_zufferli"
+    aliases:
+      fbref: ["Luca Zufferli"]
+    competition_scope: ["ITA-Serie A"]
+  - canonical_name: "Luigi Nasca"
+    canonical_id: "ref_luigi_nasca"
+    aliases:
+      fbref: ["Luigi Nasca"]
+    competition_scope: ["ITA-Serie A"]
+  - canonical_name: "Manuel Volpi"
+    canonical_id: "ref_manuel_volpi"
+    aliases:
+      fbref: ["Manuel Volpi"]
+    competition_scope: ["ITA-Serie A"]
+  - canonical_name: "Marco Di Bello"
+    canonical_id: "ref_marco_di_bello"
+    aliases:
+      fbref: ["Marco Di Bello"]
+    competition_scope: ["ITA-Serie A"]
+  - canonical_name: "Marco Guida"
+    canonical_id: "ref_marco_guida"
+    aliases:
+      fbref: ["Marco Guida"]
+    competition_scope: ["ITA-Serie A"]
+  - canonical_name: "Marco Monaldi"
+    canonical_id: "ref_marco_monaldi"
+    aliases:
+      fbref: ["Marco Monaldi"]
+    competition_scope: ["ITA-Serie A"]
+  - canonical_name: "Marco Piccinini"
+    canonical_id: "ref_marco_piccinini"
+    aliases:
+      fbref: ["Marco Piccinini"]
+    competition_scope: ["ITA-Serie A"]
+  - canonical_name: "Marco Serra"
+    canonical_id: "ref_marco_serra"
+    aliases:
+      fbref: ["Marco Serra"]
+    competition_scope: ["ITA-Serie A"]
+  - canonical_name: "Maria Sole Ferrieri Caputi"
+    canonical_id: "ref_maria_sole_ferrieri_caputi"
+    aliases:
+      fbref: ["Maria Sole Ferrieri Caputi"]
+    competition_scope: ["ITA-Serie A"]
+  - canonical_name: "Mario Perri"
+    canonical_id: "ref_mario_perri"
+    aliases:
+      fbref: ["Mario Perri"]
+    competition_scope: ["ITA-Serie A"]
+  - canonical_name: "Massimiliano Irrati"
+    canonical_id: "ref_massimiliano_irrati"
+    aliases:
+      fbref: ["Massimiliano Irrati"]
+    competition_scope: ["ITA-Serie A"]
+  - canonical_name: "Matteo Gariglio"
+    canonical_id: "ref_matteo_gariglio"
+    aliases:
+      fbref: ["Matteo Gariglio"]
+    competition_scope: ["ITA-Serie A"]
+  - canonical_name: "Matteo Marcenaro"
+    canonical_id: "ref_matteo_marcenaro"
+    aliases:
+      fbref: ["Matteo Marcenaro"]
+    competition_scope: ["ITA-Serie A"]
+  - canonical_name: "Matteo Marchetti"
+    canonical_id: "ref_matteo_marchetti"
+    aliases:
+      fbref: ["Matteo Marchetti"]
+    competition_scope: ["ITA-Serie A"]
+  - canonical_name: "Maurizio Mariani"
+    canonical_id: "ref_maurizio_mariani"
+    aliases:
+      fbref: ["Maurizio Mariani"]
+    competition_scope: ["ITA-Serie A"]
+  - canonical_name: "Michael Fabbri"
+    canonical_id: "ref_michael_fabbri"
+    aliases:
+      fbref: ["Michael Fabbri"]
+    competition_scope: ["ITA-Serie A"]
+  - canonical_name: "Niccolò Baroni"
+    canonical_id: "ref_niccolo_baroni"
+    aliases:
+      fbref: ["Niccolò Baroni"]
+    competition_scope: ["ITA-Serie A"]
+  - canonical_name: "Niccolò Turrini"
+    canonical_id: "ref_niccolo_turrini"
+    aliases:
+      fbref: ["Niccolò Turrini"]
+    competition_scope: ["ITA-Serie A"]
+  - canonical_name: "Nicola Rizzoli"
+    canonical_id: "ref_nicola_rizzoli"
+    aliases:
+      fbref: ["Nicola Rizzoli"]
+    competition_scope: ["ITA-Serie A"]
+  - canonical_name: "Paolo Mazzoleni"
+    canonical_id: "ref_paolo_mazzoleni"
+    aliases:
+      fbref: ["Paolo Mazzoleni"]
+    competition_scope: ["ITA-Serie A"]
+  - canonical_name: "Paolo Tagliavento"
+    canonical_id: "ref_paolo_tagliavento"
+    aliases:
+      fbref: ["Paolo Tagliavento"]
+    competition_scope: ["ITA-Serie A"]
+  - canonical_name: "Paolo Valeri"
+    canonical_id: "ref_paolo_valeri"
+    aliases:
+      fbref: ["Paolo Valeri"]
+    competition_scope: ["ITA-Serie A"]
+  - canonical_name: "Paride Tremolada"
+    canonical_id: "ref_paride_tremolada"
+    aliases:
+      fbref: ["Paride Tremolada"]
+    competition_scope: ["ITA-Serie A"]
+  - canonical_name: "Piero Giacomelli"
+    canonical_id: "ref_piero_giacomelli"
+    aliases:
+      fbref: ["Piero Giacomelli"]
+    competition_scope: ["ITA-Serie A"]
+  - canonical_name: "Riccardo Pinzani"
+    canonical_id: "ref_riccardo_pinzani"
+    aliases:
+      fbref: ["Riccardo Pinzani"]
+    competition_scope: ["ITA-Serie A"]
+  - canonical_name: "Riccardo Ros"
+    canonical_id: "ref_riccardo_ros"
+    aliases:
+      fbref: ["Riccardo Ros"]
+    competition_scope: ["ITA-Serie A"]
+  - canonical_name: "Rosario Abisso"
+    canonical_id: "ref_rosario_abisso"
+    aliases:
+      fbref: ["Rosario Abisso"]
+    competition_scope: ["ITA-Serie A"]
+  - canonical_name: "Simone Galipò"
+    canonical_id: "ref_simone_galipo"
+    aliases:
+      fbref: ["Simone Galipò"]
+    competition_scope: ["ITA-Serie A"]
+  - canonical_name: "Simone Sozza"
+    canonical_id: "ref_simone_sozza"
+    aliases:
+      fbref: ["Simone Sozza"]
+    competition_scope: ["ITA-Serie A"]
+  - canonical_name: "Valerio Crezzini"
+    canonical_id: "ref_valerio_crezzini"
+    aliases:
+      fbref: ["Valerio Crezzini"]
+    competition_scope: ["ITA-Serie A"]
+  - canonical_name: "Valerio Marini"
+    canonical_id: "ref_valerio_marini"
+    aliases:
+      fbref: ["Valerio Marini"]
+    competition_scope: ["ITA-Serie A"]

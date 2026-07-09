@@ -80,6 +80,38 @@ def check_enum_compliance(
     )
 
 
+def _in_scope_leagues() -> int:
+    """Number of competitions with ``in_scope: true`` (E8b: 5, was 1)."""
+    from utils.medallion_config import get_in_scope_competitions
+    return max(1, len(get_in_scope_competitions()))
+
+
+def _spine_season_predicate() -> str:
+    """SQL predicate limiting a check to seasons the FBref spine covers.
+
+    Bronze depth is NOT uniform: ``matchhistory`` carries 26 seasons and
+    ``espn`` 13, while the FBref spine only goes back to 1617. A bridged-row
+    coverage ratio computed over the WHOLE table therefore measures scrape
+    depth, not bridge quality — every pre-spine row is an unavoidable orphan
+    (``bridge_coverage[xref_match.matchhistory]`` sat at 7.5% for that reason
+    alone). Scoping to the in-scope season set makes the ratio mean what its
+    name says. Seasons come from competitions.yaml, so onboarding a season
+    widens the window automatically.
+    """
+    from utils.medallion_config import (
+        get_competition_seasons,
+        get_in_scope_competitions,
+    )
+    slugs = sorted({
+        f"{int(s):04d}"
+        for league in get_in_scope_competitions()
+        for s in get_competition_seasons(league)
+    })
+    if not slugs:
+        return 'TRUE'
+    return "season IN (" + ", ".join(f"'{s}'" for s in slugs) + ")"
+
+
 # ---------------------------------------------------------------------------
 # Per-table DQ definitions
 # ---------------------------------------------------------------------------
@@ -98,8 +130,9 @@ def build_xref_team_checks() -> List[Check]:
     table = 'iceberg.silver.xref_team'
     return [
         # Row count: 8 sources × ~50 distinct teams across seasons — min 400.
-        # Upper bound 5000 covers 5 seasons of growth before triggering.
-        CHECK.row_count(table, min_rows=400, max_rows=5000),
+        # Upper bound 5000 per in-scope league covers 5 seasons of growth
+        # before triggering (E8b: ×5 leagues).
+        CHECK.row_count(table, min_rows=400, max_rows=5000 * _in_scope_leagues()),
 
         # PK uniqueness — guaranteed by SQL GROUP BY but DQ-enforced.
         CHECK.no_duplicates(
@@ -145,8 +178,10 @@ def build_xref_match_checks() -> List[Check]:
         'fotmob', 'matchhistory', 'espn',
     ]
     checks: List[Check] = [
-        # 5 seasons × ~380 APL fixtures × 7 sources ≈ 13K; cap 60K with headroom.
-        CHECK.row_count(table, min_rows=1900, max_rows=60_000),
+        # 5 seasons × ~380 fixtures × 7 sources ≈ 13K per league; cap 60K each,
+        # with headroom (E8b: ×5 leagues). NB: matchhistory/espn also carry
+        # pre-spine seasons, which is why the cap is generous.
+        CHECK.row_count(table, min_rows=1900, max_rows=60_000 * _in_scope_leagues()),
 
         # PK is composite — bridged sources share canonical_id with FBref.
         CHECK.no_duplicates(table, pk=['canonical_id', 'source']),
@@ -171,13 +206,15 @@ def build_xref_match_checks() -> List[Check]:
     # Per-source bridge coverage (skip fbref — it's the spine, always 'exact').
     # Two-tier semantics via the data_quality coverage runner:
     #   ratio >= 0.95 -> OK; 0.80-0.95 -> WARNING; <0.80 -> ERROR.
+    # Scoped to spine seasons — see _spine_season_predicate().
+    season_pred = _spine_season_predicate()
     for src in sources:
         if src == 'fbref':
             continue
         checks.append(CHECK.coverage(
             table=table,
             condition="confidence != 'orphan'",
-            where=f"source = '{src}'",
+            where=f"source = '{src}' AND {season_pred}",
             warn_threshold=0.95,
             error_threshold=0.80,
             severity='WARNING',  # runner promotes to ERROR when ratio < 0.80
@@ -298,7 +335,7 @@ def build_xref_manager_checks() -> List[Check]:
     """
     table = 'iceberg.silver.xref_manager'
     checks = [
-        CHECK.row_count(table, min_rows=20, max_rows=2000),
+        CHECK.row_count(table, min_rows=20, max_rows=2000 * _in_scope_leagues()),
 
         CHECK.no_duplicates(
             table,
@@ -395,7 +432,7 @@ def build_xref_player_checks() -> List[Check]:
     return [
         # T3 hotfix produced ~1500 rows for ENG-Premier League; lower bound
         # 400 stays conservative. Upper bound 50k allows multi-season growth.
-        CHECK.row_count(table, min_rows=400, max_rows=50000),
+        CHECK.row_count(table, min_rows=400, max_rows=50000 * _in_scope_leagues()),
 
         CHECK.no_duplicates(
             table,
@@ -506,7 +543,7 @@ def build_xref_player_review_checks() -> List[Check]:
     """
     table = 'iceberg.silver.xref_player_review'
     return [
-        CHECK.row_count(table, min_rows=0, max_rows=200),
+        CHECK.row_count(table, min_rows=0, max_rows=200 * _in_scope_leagues()),
 
         CHECK.no_duplicates(
             table,
