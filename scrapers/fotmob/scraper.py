@@ -349,8 +349,22 @@ class FotMobScraper(BaseScraper):
             table = data.get('table') or []
             if not table:
                 return []
-            standings = table[0].get('data', {}).get('table', {}).get('all', [])
-            return [t['id'] for t in standings if t.get('id') is not None]
+            data_block = table[0].get('data', {})
+            standings = data_block.get('table', {}).get('all', [])
+            if not standings:
+                # Group tournaments (INT-World Cup, #913): no flat data.table —
+                # data.tables[] holds one block per group (+ a 'Best 3rd placed
+                # teams' block that repeats teams, hence the dedupe below).
+                standings = [
+                    t for g in (data_block.get('tables') or [])
+                    for t in ((g.get('table') or {}).get('all') or [])
+                ]
+            ids: List[int] = []
+            for t in standings:
+                tid = t.get('id')
+                if tid is not None and tid not in ids:
+                    ids.append(tid)
+            return ids
         except (KeyError, IndexError, TypeError) as e:
             logger.error(f"Error extracting team ids for {league} {season}: {e}")
             return []
@@ -448,8 +462,8 @@ class FotMobScraper(BaseScraper):
                     'home_score': home_score,
                     'away_score': away_score,
                     'is_finished': status.get('finished', False),
-                    'round': match.get('round'),
-                    'round_name': match.get('roundName'),
+                    'round': match.get('round') or match.get('roundName'),
+                    'round_name': (str(match.get('roundName')) if match.get('roundName') is not None else None) if league != 'INT-World Cup' else None,
                 }
                 matches.append(match_info)
 
@@ -508,14 +522,27 @@ class FotMobScraper(BaseScraper):
                 # Handle different table formats
                 if isinstance(table_data, list) and table_data:
                     table = table_data[0] if isinstance(table_data[0], dict) else {'data': {'table': {'all': table_data}}}
-                    standings = table.get('data', {}).get('table', {}).get('all', [])
 
+                    standings = []
+                    group_name = None
+
+                    # WC group tables support (Фаза 4 #913): table[0].data.tables -> Grp. A..L + Best 3rd
+                    if league == 'INT-World Cup':
+                        tables = table.get('data', {}).get('tables') or table.get('tables') or []
+                        if isinstance(tables, list) and tables:
+                            for tbl in tables:
+                                g = tbl.get('name') or tbl.get('group') or tbl.get('category') or 'unknown'
+                                inner = tbl.get('data', {}).get('table', {}).get('all', []) or tbl.get('table', {}).get('all', []) or []
+                                for team in inner:
+                                    tcopy = dict(team)
+                                    tcopy['_group'] = g
+                                    standings.append(tcopy)
                     if not standings:
-                        standings = table.get('table', {}).get('all', [])
-
-                    if not standings and isinstance(table_data[0], dict):
-                        # Direct table format
-                        standings = table_data
+                        standings = table.get('data', {}).get('table', {}).get('all', [])
+                        if not standings:
+                            standings = table.get('table', {}).get('all', [])
+                        if not standings and isinstance(table_data[0], dict):
+                            standings = table_data
 
                     for team in standings:
                         team_info = {
@@ -531,8 +558,13 @@ class FotMobScraper(BaseScraper):
                             'goal_diff': team.get('goalConDiff'),
                             'points': team.get('pts') or team.get('points'),
                             'form': team.get('form'),
+                            'group': team.get('_group') or team.get('group'),
                         }
                         teams.append(team_info)
+                    # ensure group key for non-WC path
+                    if league != 'INT-World Cup' and teams:
+                        for ti in teams:
+                            ti.setdefault('group', None)
 
             if not teams:
                 logger.warning(f"No team stats found for {league} {season}")

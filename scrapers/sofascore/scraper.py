@@ -96,6 +96,31 @@ def _season_to_short(season) -> str:
     return s[-2:] + f"{(int(s[-2:]) + 1) % 100:02d}"
 
 
+def _is_single_year(league: str, season) -> bool:
+    """True when (league, season) is a single_year competition per
+    ``competitions.yaml`` (INT-World Cup 2026, #913). False on any lookup
+    failure (medallion config unavailable outside the Airflow container)."""
+    try:
+        from dags.utils.medallion_config import get_competition_season_format
+        return get_competition_season_format(league, int(season)) == 'single_year'
+    except Exception:
+        return False
+
+
+def _season_label(league: str, season) -> str:
+    """Bronze ``season`` partition label for (league, season).
+
+    Club leagues use the soccerdata short form (``'2526'``); single_year
+    competitions use the literal year (``'2026'`` — INT-World Cup, #913).
+    The label MUST match the schedule writer, else ``replace_partitions``
+    dedup splits the partition (#27) — ``_season_to_short(2026)`` would
+    mislabel WC rows as ``'2627'``.
+    """
+    if _is_single_year(league, season):
+        return str(int(season))
+    return _season_to_short(season)
+
+
 class SofaScoreScraper(SoccerdataScraper):
     """
     Scraper for SofaScore football data.
@@ -248,16 +273,29 @@ class SofaScoreScraper(SoccerdataScraper):
         if not self.seasons:
             logger.warning("read_schedule: no season configured — skipping.")
             return None
-        # Label rows with the soccerdata short form ('YYZZ', e.g. 2025 -> '2526')
-        # so the partition aligns with the ratings/match_capture writers (#27).
-        season_short = _season_to_short(self.seasons[0])
-        # The tournament page serves whatever season SofaScore defaults to —
-        # NOT necessarily ours. Off-season it has already rolled to the NEXT
-        # season (live-proven 2026-06-23: the EPL page served 26/27 fixtures
-        # while CURRENT_SEASON was still 25/26). Keep only events whose season
-        # matches our target, so a roll-over never mislabels next-season
-        # fixtures as ours (and a partial capture never pollutes the partition).
-        target_season_year = season_short_to_label(season_short)  # '2526' -> '25/26'
+
+        # #913 Phase 1/2: single_year support for INT-World Cup etc.
+        # Use medallion config so bronze 'season' is the correct slug ('2026')
+        # and the capture year filter matches what SofaScore actually puts in
+        # event.season.year for that competition.
+        try:
+            from dags.utils.medallion_config import get_competition_season_format
+        except Exception:
+            get_competition_season_format = None
+
+        def _effective_slug_and_year(league: str, raw_season: int) -> tuple[str, str]:
+            if get_competition_season_format is not None:
+                try:
+                    if get_competition_season_format(league, raw_season) == 'single_year':
+                        s = str(raw_season)
+                        return s, s
+                except Exception:
+                    pass
+            # default (split-year club leagues)
+            ss = _season_to_short(raw_season)
+            return ss, season_short_to_label(ss)
+
+        # per-league slug/year decided inside the loop using get_competition_season_format for single_year (#913)
 
         frames: List[pd.DataFrame] = []
         for league in self.leagues:
@@ -269,9 +307,10 @@ class SofaScoreScraper(SoccerdataScraper):
                     "skipped.", league,
                 )
                 continue
+            season_slug, target_year = _effective_slug_and_year(league, self.seasons[0])
             nav_url = f"https://www.sofascore.com/tournament/{slug}/{ut_id}"
             events = self._capture_schedule_events(
-                nav_url, ut_id, league, season_short, target_season_year)
+                nav_url, ut_id, league, season_slug, target_year)
             if not events:
                 continue
 
@@ -281,9 +320,9 @@ class SofaScoreScraper(SoccerdataScraper):
             # from the raw start_timestamp / round_info_round columns. Only tag
             # partition keys + lineage (added by _add_metadata below).
             df['league'] = league
-            df['season'] = season_short
+            df['season'] = season_slug
             logger.info("Capture schedule league=%s season=%s: %d events.",
-                        league, season_short, len(df))
+                        league, season_slug, len(df))
             frames.append(df)
 
         if not frames:
@@ -454,7 +493,9 @@ class SofaScoreScraper(SoccerdataScraper):
         total``, then flatten the captured rows into
         ``bronze.sofascore_league_table`` via :func:`camoufox_capture.
         normalize_standing`. Rows are labelled with ``self.seasons[0]`` in
-        soccerdata short form (``'2526'``).
+        soccerdata short form (``'2526'``), or the literal year (``'2026'``)
+        for single_year competitions (#913 — the sid RESOLVE and the row LABEL
+        must use the same convention, else WC rows land under ``'2627'``).
 
         The standings JSON carries no season, so the guard is the ``season_id``:
         we resolve the target year's sid (buffer sources first, then an in-page
@@ -473,10 +514,22 @@ class SofaScoreScraper(SoccerdataScraper):
         if not self.seasons:
             logger.warning("read_league_table: no season configured — skipping.")
             return None
-        # Label rows with the soccerdata short form ('YYZZ', e.g. 2025 -> '2526')
-        # so the partition aligns with the other SofaScore writers (#27).
-        season_short = _season_to_short(self.seasons[0])
-        target_year = season_short_to_label(season_short)  # '2526' -> '25/26'
+        # #913: single_year aware (reuse same helper logic as schedule)
+        try:
+            from dags.utils.medallion_config import get_competition_season_format
+        except Exception:
+            get_competition_season_format = None
+
+        def _effective_slug_and_year(league: str, raw_season: int) -> tuple[str, str]:
+            if get_competition_season_format is not None:
+                try:
+                    if get_competition_season_format(league, raw_season) == 'single_year':
+                        s = str(raw_season)
+                        return s, s
+                except Exception:
+                    pass
+            ss = _season_to_short(raw_season)
+            return ss, season_short_to_label(ss)
 
         frames: List[pd.DataFrame] = []
         for league in self.leagues:
@@ -488,9 +541,10 @@ class SofaScoreScraper(SoccerdataScraper):
                     "capture skipped.", league,
                 )
                 continue
+            season_slug, target_y = _effective_slug_and_year(league, self.seasons[0])
             nav_url = f"https://www.sofascore.com/tournament/{slug}/{ut_id}"
             rows = self._capture_league_table_rows(
-                nav_url, ut_id, league, season_short, target_year)
+                nav_url, ut_id, league, season_slug, target_y)
             if not rows:
                 continue
 
@@ -498,9 +552,9 @@ class SofaScoreScraper(SoccerdataScraper):
             for col in ('mp', 'w', 'd', 'l', 'gf', 'ga', 'gd', 'pts'):
                 df[col] = df[col].astype('Int64')          # nullable bigint
             df['league'] = league
-            df['season'] = season_short
+            df['season'] = season_slug
             logger.info("Capture league_table league=%s season=%s: %d rows.",
-                        league, season_short, len(df))
+                        league, season_slug, len(df))
             frames.append(df)
 
         if not frames:
@@ -1185,9 +1239,14 @@ class SofaScoreScraper(SoccerdataScraper):
             )
             return []
 
-        # season is a YEAR int (2024); the events carry the '24/25' year label.
-        season_short = _season_to_short(season)
-        target_year = season_short_to_label(season_short)  # '2425' -> '24/25'
+        # season is a YEAR int (2024); the events carry the '24/25' year label
+        # ('2026' literal for single_year competitions, #913).
+        if _is_single_year(league, season):
+            season_short = str(int(season))
+            target_year = season_short              # WC events: year == '2026'
+        else:
+            season_short = _season_to_short(season)
+            target_year = season_short_to_label(season_short)  # '2425' -> '24/25'
 
         nav_url = f"https://www.sofascore.com/tournament/{slug}/{ut_id}"
         proxy = self._camoufox_proxy()
@@ -1322,7 +1381,7 @@ class SofaScoreScraper(SoccerdataScraper):
         # Match the slug used by the schedule writer (soccerdata short form
         # 'YYZZ', e.g. 2025 -> '2526'). Mismatch would split the partition
         # and break replace_partitions dedup — see issue #27.
-        season_short = _season_to_short(season)
+        season_short = _season_label(league, season)
         df['season'] = season_short
         df['_ingested_at'] = datetime.utcnow()
         df['_source'] = self.SOURCE_NAME
@@ -1404,7 +1463,7 @@ class SofaScoreScraper(SoccerdataScraper):
         if match_ids is None:
             match_ids = self._resolve_match_ids(league, season)
 
-        season_short = _season_to_short(season)
+        season_short = _season_label(league, season)
 
         empty = {
             'player_ratings': pd.DataFrame(columns=ratings_cols + ['_ingested_at']),
@@ -1728,7 +1787,7 @@ class SofaScoreScraper(SoccerdataScraper):
         # Match the slug used by the schedule writer (soccerdata short form
         # 'YYZZ', e.g. 2025 -> '2526'). Mismatch would split the partition
         # and break replace_partitions dedup — see issue #27.
-        season_short = _season_to_short(season)
+        season_short = _season_label(league, season)
         df['season'] = season_short
         df['_ingested_at'] = datetime.utcnow()
         df['_source'] = self.SOURCE_NAME
@@ -2046,7 +2105,7 @@ class SofaScoreScraper(SoccerdataScraper):
             'league', 'season',
         ]
 
-        season_short = _season_to_short(season)
+        season_short = _season_label(league, season)
 
         if player_ids_by_match is None:
             player_ids_by_match = self._resolve_match_players_from_bronze(
@@ -2303,7 +2362,7 @@ class SofaScoreScraper(SoccerdataScraper):
         df = pd.DataFrame(all_rows)
         df['league'] = league
 
-        season_short = _season_to_short(season)
+        season_short = _season_label(league, season)
         df['season'] = season_short
         df['_ingested_at'] = datetime.utcnow()
         df['_source'] = self.SOURCE_NAME
@@ -2500,7 +2559,7 @@ class SofaScoreScraper(SoccerdataScraper):
             'team_id', 'team_name', 'league', 'season',
         ]
 
-        season_short = _season_to_short(season)
+        season_short = _season_label(league, season)
 
         empty = {
             'player_profile': pd.DataFrame(columns=profile_cols + ['_ingested_at']),

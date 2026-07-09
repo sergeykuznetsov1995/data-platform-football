@@ -45,6 +45,13 @@ def _season_to_short(season) -> str:
     return s[-2:] + f"{(int(s[-2:]) + 1) % 100:02d}"
 
 
+def _season_label(league: str, season) -> str:
+    """Offline mirror of ``scrapers.sofascore.scraper._season_label`` (#913).
+    Without the medallion config on the test host the real helper falls back
+    to ``_season_to_short`` for every league — mirror that fallback."""
+    return _season_to_short(season)
+
+
 class TestArgparseHardFail:
     def test_unknown_flag_returns_1_not_2(self):
         assert _main_rc(['--entity', 'schedule', '--bogus-flag', 'x']) == 1
@@ -75,6 +82,7 @@ def _run_main(argv: list, scraper_cls, *, resolver_ids=None,
     so_scraper_mod = MagicMock()
     so_scraper_mod.R0_2B_FALLBACK_MARKER = 'R0_2B_FALLBACK'
     so_scraper_mod._season_to_short = _season_to_short
+    so_scraper_mod._season_label = _season_label
 
     sys.argv = ["run_sofascore_scraper.py"] + argv
     with patch.dict(sys.modules, {
@@ -568,7 +576,8 @@ class TestSeasonTokenNoShift:
     scraper labels rows via ``_season_to_short`` (which passes an already-short
     token through). For a short-form ``--season`` the two diverged and the
     partition was silently written under the +1 season. Both paths now use
-    ``_season_to_short`` — a short-form token must resolve to itself."""
+    ``_season_label`` (#913: falls back to ``_season_to_short`` for club
+    leagues) — a short-form token must resolve to itself."""
 
     @pytest.fixture
     def temp_output(self):
@@ -585,6 +594,7 @@ class TestSeasonTokenNoShift:
         so_scraper_mod = MagicMock()
         so_scraper_mod.R0_2B_FALLBACK_MARKER = 'R0_2B_FALLBACK'
         so_scraper_mod._season_to_short = _season_to_short
+        so_scraper_mod._season_label = _season_label
         sys.argv = ["run_sofascore_scraper.py"] + argv
         with patch.dict(sys.modules, {
             "scrapers.sofascore": so_pkg,

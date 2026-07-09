@@ -243,6 +243,12 @@ def normalize_event(ev: dict) -> dict:
     """
     row = {"game_id": int(ev["id"])}
     _auto_flatten(ev, row)
+    # #913: season.year is a str for clubs ('25/26') but an INT for
+    # single-year cups (2026 on INT-World Cup) — bronze season_year is
+    # varchar, and a mixed-type batch breaks pa.Table.from_pandas (same
+    # class of bug as the #840 match_stats home/away fix). Pin to str.
+    if row.get("season_year") is not None:
+        row["season_year"] = str(row["season_year"])
     return row
 
 
@@ -327,11 +333,26 @@ def extract_tournament_standings(buffer: Dict[str, dict], ut_id, season_id) -> l
     standings = obj.get("standings") if isinstance(obj, dict) else None
     if not isinstance(standings, list) or not standings:
         return []
-    # Prefer the 'total' table; fall back to the first block.
-    block = next((s for s in standings if isinstance(s, dict)
-                  and s.get("type") == "total"), standings[0])
-    rows = block.get("rows") if isinstance(block, dict) else None
-    return rows if isinstance(rows, list) else []
+    # A league fires ONE 'total' block; a group tournament fires one 'total'
+    # block PER GROUP (INT-World Cup 2026 = 12 blocks, #913). Collect them all
+    # and stamp each row with its block's group name — taking only the first
+    # block silently collapses the cup to Group A.
+    blocks = [s for s in standings if isinstance(s, dict)
+              and s.get("type") == "total"]
+    if not blocks and isinstance(standings[0], dict):
+        blocks = [standings[0]]
+    multi_group = len(blocks) > 1
+    rows: list = []
+    for block in blocks:
+        block_rows = block.get("rows")
+        if not isinstance(block_rows, list):
+            continue
+        group_name = block.get("name") if multi_group else None
+        for row in block_rows:
+            if multi_group and isinstance(row, dict) and not row.get("group"):
+                row = {**row, "group": group_name}
+            rows.append(row)
+    return rows
 
 
 def normalize_standing(row: dict) -> dict:
@@ -351,6 +372,9 @@ def normalize_standing(row: dict) -> dict:
         "ga": ga,
         "gd": (gf - ga) if gf is not None and ga is not None else None,
         "pts": row.get("points"),
+        # group support for WC (Фаза 4 #913). Try to pull from row if the
+        # standings response includes per-group info (e.g. for INT-World Cup).
+        "group": row.get("group") or None,
     }
 
 
