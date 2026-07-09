@@ -84,6 +84,10 @@ FBREF_SQL = f"""
            TRY_CAST(split_part({_FBREF_SCORE}, '{EN_DASH}', 2) AS integer) AS ag
     FROM iceberg.bronze.fbref_schedule
     WHERE match_url IS NOT NULL AND score IS NOT NULL AND score <> ''
+      -- #898: for an awarded match FBref publishes the forfeit score (Sassuolo 0–3
+      -- Pescara) while every other feed keeps the on-pitch result (2–1). Comparing
+      -- them is meaningless, so drop these 7 matches instead of reporting them.
+      AND lower(coalesce(notes, '')) NOT LIKE 'match awarded to%'
 """
 
 SOURCES = {

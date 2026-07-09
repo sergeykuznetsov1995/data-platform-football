@@ -12,8 +12,9 @@ table:
     match_id: реальный hex-slug из match_url, либо синтетический
     'fut_<xxhash64>' для будущих матчей без опубликованной страницы (по
     приоритету gameweek+season+home+away, иначе date+home+away) — гарантирует
-    non-NULL и survive в Gold. home_score/away_score
-    парсятся REGEXP из строки score. Каждый источник дедуплицируется
+    non-NULL и survive в Gold. home_score/away_score — ОФИЦИАЛЬНЫЙ результат,
+    разобранный из строки score (у присуждённых матчей это техническое
+    поражение, см. is_awarded). Каждый источник дедуплицируется
     независимо через ROW_NUMBER ... ORDER BY _ingested_at DESC.
     Идентификаторы сырые FBref (canonical-резолюция — в Gold).
   tags:
@@ -39,11 +40,31 @@ columns:
   - name: away
     description: Команда гостей (название как на FBref, до alias-нормализации).
   - name: score
-    description: Итоговый счёт строкой (например "2–1"), как опубликован FBref.
+    description: |
+      Итоговый счёт строкой, как опубликован FBref (разделитель — EN DASH
+      U+2013). Это ОФИЦИАЛЬНЫЙ результат: у присуждённых матчей здесь стоит
+      техническое поражение ("0–3"), а не счёт на поле. Серия пенальти
+      рендерится как "(4) 1–1 (5)".
   - name: home_score
-    description: Голы хозяев — INTEGER, извлечён REGEXP из score.
+    description: |
+      Голы хозяев — INTEGER. Официальный результат (см. score): для
+      is_awarded = true это присуждённый счёт. Счёт по пенальти отброшен.
+      Результат на поле — home_goals_events.
   - name: away_score
-    description: Голы гостей — INTEGER, извлечён REGEXP из score.
+    description: |
+      Голы гостей — INTEGER. Официальный результат (см. score): для
+      is_awarded = true это присуждённый счёт. Счёт по пенальти отброшен.
+      Результат на поле — away_goals_events.
+  - name: notes
+    description: |
+      Примечание FBref к матчу, как есть: "Match awarded to <team>",
+      "Match Cancelled", "Match Suspended", "Leg 2 of 2; ..." — иначе NULL.
+  - name: is_awarded
+    description: |
+      BOOLEAN: матч присуждён «за столом» (notes начинается с "Match awarded
+      to"). У таких матчей home_score/away_score расходятся с
+      home_goals_events/away_goals_events — исключать из сверок счёта с
+      событиями и с другими источниками (#898).
   - name: attendance
     description: Посещаемость (количество зрителей), INTEGER.
   - name: venue

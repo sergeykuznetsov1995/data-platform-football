@@ -449,6 +449,17 @@ _STAR_FACT_TABLES = [
     'gold.fct_player_salary',
 ]
 
+# #867: a match_id that still carries its source prefix never resolved to the
+# FBref spine, so it cannot have a dim_match row. Rows keyed by one are excluded
+# from the fct_lineup->dim_match FK and counted as the non-spine share instead.
+_SPINE_MATCH_ID = (
+    r"match_id NOT LIKE 'espn\_%' ESCAPE '\' "
+    r"AND match_id NOT LIKE 'es\_%' ESCAPE '\' "
+    r"AND match_id NOT LIKE 'fm\_%' ESCAPE '\' "
+    r"AND match_id NOT LIKE 'ss\_%' ESCAPE '\' "
+    r"AND match_id NOT LIKE 'ws\_%' ESCAPE '\'"
+)
+
 
 def _star_gate_pk_checks() -> List:
     """Design-grain PK uniqueness for the 3 facts missing from the central
@@ -584,15 +595,25 @@ def _star_gate_dim_fk_checks() -> List:
         CHECK.ref_integrity('gold.fct_lineup', 'gold.dim_player', 'player_id',
                             warn_rate=0.03, error_rate=0.05, severity='WARNING'),
         # Whole-table complement to the fbref-scoped ERROR check in e3_dq.
-        # Orphans = ESPN-only / non-FBref-only matches (espn_/fm_/ss_/ws_ pseudo
-        # match-ids) with no FBref-spine dim_match row — a fixed, stable set.
-        # #819: dropping the FBref-covered non-FBref duplicates shrank the
-        # denominator (258k→150k rows) without touching that orphan set, so the
-        # rate rose 1.6%→2.7% live (2026-06-27: 4030/149699). Re-baseline
-        # warn 0.02→0.04, error 0.05→0.06 so the stable floor passes clean.
+        # #867: the old all-sources form measured orphans over EVERY row, so its
+        # denominator moved with the archive depth of the non-FBref sources. A
+        # pseudo match-id ('espn_/es_/fm_/ss_/ws_') means "no FBref match exists"
+        # — dim_match is FBref-spined, so those rows are orphans BY CONSTRUCTION,
+        # not a bridge failure. After the ESPN full-history backfill they are
+        # 206k of the ~350k silver.espn_lineup rows (APL 2000/01-2015/16) and
+        # would have dragged the rate to ~20-50%, way past error_rate=0.06.
+        # Scope the FK to spine rows — those genuinely MUST land on dim_match —
+        # and keep it tight; track the non-spine share separately below.
         CHECK.ref_integrity('gold.fct_lineup', 'gold.dim_match', 'match_id',
-                            warn_rate=0.04, error_rate=0.06, severity='WARNING',
-                            name='star_fk[fct_lineup.match_id->dim_match all-sources]'),
+                            where=_SPINE_MATCH_ID,
+                            warn_rate=0.005, error_rate=0.02, severity='WARNING',
+                            name='star_fk[fct_lineup.match_id->dim_match spine]'),
+        # #867: observability, not a gate — the spine share shrinks as archival
+        # non-FBref history grows (legitimate coverage), so the floor is loose.
+        CHECK.coverage('gold.fct_lineup', condition=_SPINE_MATCH_ID,
+                       warn_threshold=0.40, error_threshold=0.20,
+                       severity='WARNING',
+                       name='star_coverage[fct_lineup spine-share]'),
 
         # ----- fct_match_odds (baseline 0%; matchhistory fixture-bridge) -----
         CHECK.ref_integrity('gold.fct_match_odds', 'gold.dim_match', 'match_id',
@@ -676,6 +697,19 @@ def _star_gate_grain_checks() -> List:
                    "GROUP BY match_id HAVING COUNT(*) <> 2)"),
             severity='ERROR',
             name='star_grain[fct_team_match=2rows/match]',
+        ),
+        # #867: fct_team_match drops a match whole when xref_team fails to
+        # resolve one of its teams (dim_match then carries a NULL side). Without
+        # this check that drop is silent — the grain check above stays green
+        # because the match simply vanishes. Baseline 0: every dim_match row
+        # comes from fbref_match_enriched, which is fct_team_match's own spine.
+        # Non-zero => an xref_team gap; fix configs/medallion/team_aliases.yaml.
+        CHECK.row_count(
+            'gold.dim_match', min_rows=0, max_rows=0,
+            where=("match_id NOT IN (SELECT match_id "
+                   "FROM iceberg.gold.fct_team_match)"),
+            severity='WARNING',
+            name='star_coverage[dim_match->fct_team_match]',
         ),
         # ~20 teams per (league, season): 18 (Bundesliga/Ligue 1) to 24
         # (Championship). PK uniqueness is asserted separately, so COUNT(*)

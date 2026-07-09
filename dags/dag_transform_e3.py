@@ -71,9 +71,10 @@ Known limitations (carried over from the SQL-level ADRs)
 * **fct_shot rejection ~1.8%** -- shots whose (date, home_canonical, away_canonical)
   do not resolve to a Gold dim_match row are dropped (INNER JOIN). Acceptable
   per E3.4 spec.
-* **fct_lineup ESPN bridge ~90.8% success** -- the xxhash64-based name match
-  leaves ~9% of ESPN players orphan. The orphan rows are NOT inserted (the
-  bridge is INNER JOIN); see ADR in ``dags/sql/gold/fct_lineup.sql``.
+* **fct_lineup ESPN bridge** -- #867: resolves through ``silver.xref_match``
+  (source='espn'). Games outside the FBref spine keep their ``espn_<hash>``
+  pseudo-id (LEFT JOIN, rows preserved); see ADR in
+  ``dags/sql/gold/fct_lineup.sql``.
 
 DQ wiring (validate_e3)
 -----------------------
@@ -435,7 +436,11 @@ def _validate_e3(**context) -> Dict[str, Any]:
 
     from utils.alerts import telegram_dq_summary
     from utils.data_quality import CheckResult, run_checks
-    from utils.e3_dq import build_all_e3_checks, parity_check_event_counts
+    from utils.e3_dq import (
+        build_all_e3_checks,
+        completeness_check_events,
+        parity_check_event_counts,
+    )
 
     all_checks = build_all_e3_checks()
     logger.info("E3 DQ: running %d standard checks from utils.e3_dq", len(all_checks))
@@ -454,6 +459,21 @@ def _validate_e3(**context) -> Dict[str, Any]:
         logger.exception("parity_check_event_counts crashed; recording WARNING")
         report.results.append(CheckResult(
             name='parity_check_event_counts',
+            kind='custom',
+            severity='WARNING',
+            passed=False,
+            error=str(e),
+        ))
+
+    # Schedule->events completeness gate (custom — #895). ERROR on any
+    # scheduled fixture missing events that is NOT in the sanctioned floor.
+    try:
+        completeness_result = completeness_check_events()
+        report.results.append(completeness_result)
+    except Exception as e:
+        logger.exception("completeness_check_events crashed; recording WARNING")
+        report.results.append(CheckResult(
+            name='completeness_check_events',
             kind='custom',
             severity='WARNING',
             passed=False,

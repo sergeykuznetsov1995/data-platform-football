@@ -387,5 +387,14 @@ LEFT JOIN iceberg.silver.fotmob_team_match fm
     AND fm.league   = u.league
     AND fm.season   = u.season_slug
 
-WHERE u.match_id IS NOT NULL
-  AND u.team_id  IS NOT NULL
+-- #867: opponent_id must be filtered SYMMETRICALLY with team_id. Both come from
+-- the same dim_match pair (home_team_id / away_team_id), mirrored per side; a
+-- xref_team miss on ONE team leaves that side NULL. Filtering team_id alone drops
+-- the row where the miss lands in team_id but KEEPS its twin with a NULL
+-- opponent_id — the match then carries 1 row instead of 2, breaking
+-- star_grain[fct_team_match=2rows/match] and no_nulls(opponent_id) at once.
+-- Dropping the match whole keeps "exactly 2 rows per match" true by construction;
+-- star_coverage[dim_match->fct_team_match] surfaces the dropped matches.
+WHERE u.match_id    IS NOT NULL
+  AND u.team_id     IS NOT NULL
+  AND u.opponent_id IS NOT NULL
