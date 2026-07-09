@@ -312,6 +312,22 @@ def diagnose_html_structure(soup: BeautifulSoup) -> Dict[str, Any]:
     return diagnosis
 
 
+def drop_blank_rows(df: pd.DataFrame) -> pd.DataFrame:
+    """Drop rows where every column is NaN.
+
+    FBref puts blank separator rows between gameweeks; pd.read_html turns them
+    into all-NaN rows that reach Bronze as pure bloat (2146 rows — 10% of
+    bronze.fbref_schedule — before issue #892). A future fixture is NOT blank:
+    it still carries date/home/away even though FBref has not published its
+    match_url yet, so it survives this filter.
+    """
+    blank = df.isna().all(axis=1)
+    if blank.any():
+        logger.debug(f"Dropping {int(blank.sum())} blank rows")
+        df = df[~blank]
+    return df
+
+
 def parse_table(
     soup: BeautifulSoup,
     table_id: str,
@@ -437,6 +453,9 @@ def parse_table(
             if 'Home' in df.columns:
                 df = df[df['Home'] != 'Home']
 
+            # Drop FBref's blank separator rows (issue #892)
+            df = drop_blank_rows(df)
+
             # Reset index after filtering
             df = df.reset_index(drop=True)
 
@@ -519,6 +538,9 @@ def _parse_table_element(
             # — see parse_table (issue #189).
             if 'Home' in df.columns:
                 df = df[df['Home'] != 'Home']
+
+            # Drop FBref's blank separator rows (issue #892)
+            df = drop_blank_rows(df)
 
             # Reset index after filtering
             df = df.reset_index(drop=True)

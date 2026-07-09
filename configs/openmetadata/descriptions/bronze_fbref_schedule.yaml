@@ -40,6 +40,13 @@ columns:
     description: Текст ссылки "Match Report" (служебная колонка из scrape).
   - name: notes
     description: Примечания к матчу (перенос, отмена и т.п.; обычно пусто).
+  - name: round
+    description: >-
+      Фаза турнира по версии FBref. Заполнена только у лиг с плей-офф-стадиями:
+      обычные туры помечены названием лиги ("Bundesliga", "Ligue 1", "Serie A"),
+      стыковые матчи — "German/French 1/2 Relegation/Promotion play-offs",
+      "Relegation tie-breaker". NULL для лиг без плей-офф (напр. АПЛ). Колонка
+      появилась при бэкфиле топ-5 (2026-07-06, issue #892).
   - name: match_url
     description: URL страницы матча на FBref; источник match_id для Silver.
   - name: league

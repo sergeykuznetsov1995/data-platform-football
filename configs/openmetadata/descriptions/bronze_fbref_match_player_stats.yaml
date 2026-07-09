@@ -8,6 +8,10 @@ table:
     (stats_<team>_summary). Гранулярность: один row на (match_id, player).
     Счётчики уже приведены к числовым типам; pkwon/pkcon часто NULL (ожидаемо,
     см. expected-NULL allowlist). Источник: FBref scrape (dag_ingest_fbref).
+
+    Advanced-метрик здесь НЕТ: с февраля 2026 FBref не отдаёт xG/npxG/xA/SCA/GCA
+    — во всём слое bronze.fbref_* ноль колонок с xg (issue #892). Единственный
+    источник xG — silver.understat_shots (fallback silver.sofascore_shots).
   tags:
     - Tier.Bronze
     - Domain.Football
