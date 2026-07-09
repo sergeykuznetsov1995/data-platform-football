@@ -96,15 +96,22 @@ class TestBronzeFreshnessGate:
         dag_module.validate_bronze_freshness()
 
         checks = captured['checks']
-        assert {c.params['table'] for c in checks} == {
+        # Freshness checks cover the three match-grain tables.
+        freshness = [c for c in checks if c.kind == 'freshness']
+        assert {c.params['table'] for c in freshness} == {
             'bronze.sofascore_match_stats',
             'bronze.sofascore_event_player_stats',
             'bronze.sofascore_player_ratings',
         }
-        assert all(c.kind == 'freshness' for c in checks)
-        assert all(c.params['ts_col'] == '_ingested_at' for c in checks)
-        assert all(c.severity == 'WARNING' for c in checks)
+        assert all(c.params['ts_col'] == '_ingested_at' for c in freshness)
+        # #711: a label-coverage guard on match_stats flags a partial /statistics
+        # capture (group + numeric values present, stat name/key empty) that the
+        # row-count floors in validate_data miss.
+        coverage = [c for c in checks if c.kind == 'coverage']
+        assert len(coverage) == 1
+        assert coverage[0].params['table'] == 'bronze.sofascore_match_stats'
         # WARNING-only gate must not hard-fail the DAG.
+        assert all(c.severity == 'WARNING' for c in checks)
         assert captured['raise_on_error'] is False
         assert captured.get('telegram') is True
 
