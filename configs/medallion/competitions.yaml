@@ -394,3 +394,20 @@ competitions:
       fallback: []
     in_scope: false
     notes: "stub for E8c (EL + cup competitions)"
+
+  - id: "INT-World Cup"
+    name: "FIFA World Cup"
+    country: "World"
+    tier: 1
+    seasons:
+      - id: 2026
+        season_format: single_year
+        format: group_knockout
+        team_count: 48
+        start: "2026-06-11"
+        end: "2026-07-19"
+    sources:
+      primary: ["fbref", "fotmob", "sofascore", "espn", "whoscored"]
+      fallback: []
+    in_scope: true
+    notes: "ЧМ-2026 (issue #913 Phase 1). 5 источников. single-year сезон. Bronze ingest до финала 19 июля."

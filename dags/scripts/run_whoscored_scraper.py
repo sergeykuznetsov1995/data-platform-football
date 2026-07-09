@@ -315,6 +315,14 @@ def main() -> int:
 
     leagues = [l.strip() for l in args.leagues.split(',') if l.strip()]
     seasons = _parse_seasons(args)
+
+    # #913 Phase 1: WhoScored (5th source). The DAG always passes multi-year
+    # SEASONS_STR. For INT-World Cup we must use single-year season ('2026')
+    # so that soccerdata and Bronze get the correct partition. Separate task
+    # per league helps, but we still override here.
+    if 'INT-World Cup' in leagues:
+        seasons = [2026]
+
     logger.info(
         f"Starting WhoScored scraper: leagues={leagues}, seasons={seasons}, "
         f"skip_events={args.skip_events}, "
