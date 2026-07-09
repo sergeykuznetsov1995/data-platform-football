@@ -109,45 +109,269 @@ competitions:
     name: "Spanish La Liga"
     country: "Spain"
     tier: 1
-    seasons: []
+    seasons:
+      # E8b: даты = MIN/MAX(date) из silver.fbref_match_enriched (спайн), как у APL.
+      - id: 1617
+        format: "league_round_robin"
+        team_count: 20
+        start: "2016-08-19"
+        end: "2017-05-21"
+      - id: 1718
+        format: "league_round_robin"
+        team_count: 20
+        start: "2017-08-18"
+        end: "2018-05-20"
+      - id: 1819
+        format: "league_round_robin"
+        team_count: 20
+        start: "2018-08-17"
+        end: "2019-05-19"
+      - id: 1920
+        format: "league_round_robin"
+        team_count: 20
+        start: "2019-08-16"
+        end: "2020-07-19"
+      - id: 2021
+        format: "league_round_robin"
+        team_count: 20
+        start: "2020-09-12"
+        end: "2021-05-23"
+      - id: 2122
+        format: "league_round_robin"
+        team_count: 20
+        start: "2021-08-13"
+        end: "2022-05-22"
+      - id: 2223
+        format: "league_round_robin"
+        team_count: 20
+        start: "2022-08-12"
+        end: "2023-06-04"
+      - id: 2324
+        format: "league_round_robin"
+        team_count: 20
+        start: "2023-08-11"
+        end: "2024-05-26"
+      - id: 2425
+        format: "league_round_robin"
+        team_count: 20
+        start: "2024-08-15"
+        end: "2025-05-25"
+      - id: 2526
+        format: "league_round_robin"
+        team_count: 20
+        start: "2025-08-15"
+        end: "2026-05-24"
     sources:
-      primary: []
-      fallback: []
-    in_scope: false
-    notes: "stub for E8b (Top-5 European leagues)"
+      primary: ["fbref", "understat"]
+      fallback:
+        - "whoscored"
+        - "sofascore"
+        - "fotmob"
+        - "matchhistory"
+        - "espn"
+    in_scope: true
+    notes: "E8b spine-минимум: clubelo не заскрейплен для этой лиги (нет fct_team_elo)"
 
   - id: "ITA-Serie A"
     name: "Italian Serie A"
     country: "Italy"
     tier: 1
-    seasons: []
+    seasons:
+      - id: 1617
+        format: "league_round_robin"
+        team_count: 20
+        start: "2016-08-20"
+        end: "2017-05-28"
+      - id: 1718
+        format: "league_round_robin"
+        team_count: 20
+        start: "2017-08-19"
+        end: "2018-05-20"
+      - id: 1819
+        format: "league_round_robin"
+        team_count: 20
+        start: "2018-08-18"
+        end: "2019-05-26"
+      - id: 1920
+        format: "league_round_robin"
+        team_count: 20
+        start: "2019-08-24"
+        end: "2020-08-02"
+      - id: 2021
+        format: "league_round_robin"
+        team_count: 20
+        start: "2020-09-19"
+        end: "2021-05-23"
+      - id: 2122
+        format: "league_round_robin"
+        team_count: 20
+        start: "2021-08-21"
+        end: "2022-05-22"
+      - id: 2223
+        format: "league_round_robin"
+        team_count: 20
+        start: "2022-08-13"
+        end: "2023-06-11"
+      - id: 2324
+        format: "league_round_robin"
+        team_count: 20
+        start: "2023-08-19"
+        end: "2024-06-02"
+      - id: 2425
+        format: "league_round_robin"
+        team_count: 20
+        start: "2024-08-17"
+        end: "2025-05-25"
+      - id: 2526
+        format: "league_round_robin"
+        team_count: 20
+        start: "2025-08-23"
+        end: "2026-05-24"
     sources:
-      primary: []
-      fallback: []
-    in_scope: false
-    notes: "stub for E8b (Top-5 European leagues)"
+      primary: ["fbref", "understat"]
+      fallback:
+        - "whoscored"
+        - "sofascore"
+        - "fotmob"
+        - "matchhistory"
+        - "espn"
+    in_scope: true
+    notes: "E8b spine-минимум: clubelo не заскрейплен для этой лиги (нет fct_team_elo)"
 
   - id: "GER-Bundesliga"
     name: "German Bundesliga"
     country: "Germany"
     tier: 1
-    seasons: []
+    seasons:
+      # 18 клубов; в спайне 308 матчей = 306 + 2 матча релегационного плей-офф.
+      - id: 1617
+        format: "league_round_robin"
+        team_count: 18
+        start: "2016-08-26"
+        end: "2017-05-29"
+      - id: 1718
+        format: "league_round_robin"
+        team_count: 18
+        start: "2017-08-18"
+        end: "2018-05-21"
+      - id: 1819
+        format: "league_round_robin"
+        team_count: 18
+        start: "2018-08-24"
+        end: "2019-05-27"
+      - id: 1920
+        format: "league_round_robin"
+        team_count: 18
+        start: "2019-08-16"
+        end: "2020-07-06"
+      - id: 2021
+        format: "league_round_robin"
+        team_count: 18
+        start: "2020-09-18"
+        end: "2021-05-29"
+      - id: 2122
+        format: "league_round_robin"
+        team_count: 18
+        start: "2021-08-13"
+        end: "2022-05-23"
+      - id: 2223
+        format: "league_round_robin"
+        team_count: 18
+        start: "2022-08-05"
+        end: "2023-06-05"
+      - id: 2324
+        format: "league_round_robin"
+        team_count: 18
+        start: "2023-08-18"
+        end: "2024-05-27"
+      - id: 2425
+        format: "league_round_robin"
+        team_count: 18
+        start: "2024-08-23"
+        end: "2025-05-26"
+      - id: 2526
+        format: "league_round_robin"
+        team_count: 18
+        start: "2025-08-22"
+        end: "2026-05-25"
     sources:
-      primary: []
-      fallback: []
-    in_scope: false
-    notes: "stub for E8b (Top-5 European leagues)"
+      primary: ["fbref", "understat"]
+      fallback:
+        - "whoscored"
+        - "sofascore"
+        - "fotmob"
+        - "matchhistory"
+        - "espn"
+    in_scope: true
+    notes: "E8b spine-минимум: clubelo не заскрейплен для этой лиги (нет fct_team_elo)"
 
   - id: "FRA-Ligue 1"
     name: "French Ligue 1"
     country: "France"
     tier: 1
-    seasons: []
+    seasons:
+      # C 2023/24 лига сократилась до 18 клубов. Спайн: 382/308 матчей —
+      # round-robin + 2 матча барража (кроме covid-сезона 1920: 380).
+      - id: 1617
+        format: "league_round_robin"
+        team_count: 20
+        start: "2016-08-12"
+        end: "2017-05-28"
+      - id: 1718
+        format: "league_round_robin"
+        team_count: 20
+        start: "2017-08-04"
+        end: "2018-05-27"
+      - id: 1819
+        format: "league_round_robin"
+        team_count: 20
+        start: "2018-08-10"
+        end: "2019-06-02"
+      - id: 1920
+        format: "league_round_robin"
+        team_count: 20
+        start: "2019-08-09"
+        end: "2020-05-23"
+      - id: 2021
+        format: "league_round_robin"
+        team_count: 20
+        start: "2020-08-21"
+        end: "2021-05-30"
+      - id: 2122
+        format: "league_round_robin"
+        team_count: 20
+        start: "2021-08-06"
+        end: "2022-05-29"
+      - id: 2223
+        format: "league_round_robin"
+        team_count: 20
+        start: "2022-08-05"
+        end: "2023-06-03"
+      - id: 2324
+        format: "league_round_robin"
+        team_count: 18
+        start: "2023-08-11"
+        end: "2024-06-02"
+      - id: 2425
+        format: "league_round_robin"
+        team_count: 18
+        start: "2024-08-16"
+        end: "2025-05-29"
+      - id: 2526
+        format: "league_round_robin"
+        team_count: 18
+        start: "2025-08-15"
+        end: "2026-05-29"
     sources:
-      primary: []
-      fallback: []
-    in_scope: false
-    notes: "stub for E8b (Top-5 European leagues)"
+      primary: ["fbref", "understat"]
+      fallback:
+        - "whoscored"
+        - "sofascore"
+        - "fotmob"
+        - "matchhistory"
+        - "espn"
+    in_scope: true
+    notes: "E8b spine-минимум: clubelo не заскрейплен для этой лиги (нет fct_team_elo)"
 
   - id: "NED-Eredivisie"
     name: "Dutch Eredivisie"

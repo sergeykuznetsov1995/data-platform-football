@@ -645,8 +645,19 @@ def test_real_config_loads_without_error(real_config_dir):
     assert len(competitions["competitions"]) >= 1
 
 
-def test_real_config_in_scope_is_apl_only(real_config_dir):
-    assert real_config_dir.get_in_scope_competitions() == ["ENG-Premier League"]
+def test_real_config_in_scope_is_top5(real_config_dir):
+    # E8b: Top-5 rollout flipped in_scope for the four new leagues. Each one
+    # must carry a non-empty `seasons` list — an in_scope competition with
+    # `seasons: []` silently drops its rows from dim_season (issue #425).
+    assert set(real_config_dir.get_in_scope_competitions()) == {
+        "ENG-Premier League",
+        "ESP-La Liga",
+        "ITA-Serie A",
+        "GER-Bundesliga",
+        "FRA-Ligue 1",
+    }
+    for league in real_config_dir.get_in_scope_competitions():
+        assert real_config_dir.get_competition_seasons(league), league
 
 
 def test_real_config_apl_seasons_cover_ingested_history(real_config_dir):
