@@ -14,9 +14,9 @@ dag_ingest_fbref single_stat tasks plain-appended a full copy of each
 Each historical run wrote one full copy tagged with its own _batch_id. The
 latest batch per (league, season) is a complete copy (verified: latest row
 count == max batch row count for every partition), so the dedup keeps only
-the newest batch per (league, season) and drops the rest. Same CTAS +
-DROP + RENAME strategy as scripts/dedup_fbref_schedule.py, generalised over
-columns via DESCRIBE.
+the newest batch per (league, season) and drops the rest. CTAS + DROP +
+RENAME strategy, with the column list read from DESCRIBE so schema evolution
+cannot silently drop a column.
 
 Usage (inside a container that can reach Trino, e.g. airflow-scheduler):
     python scripts/dedup_fbref_single_stat_bloat.py --dry-run

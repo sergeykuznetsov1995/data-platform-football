@@ -1221,6 +1221,62 @@ class TestParseScheduleRepeatedHeaders:
         assert len(df) == 2
 
 
+class TestParseScheduleBlankRows:
+    """FBref's blank separator rows must not reach Bronze (issue #892).
+
+    Before the fix they landed in bronze.fbref_schedule as 2146 all-NULL rows
+    (~10% of the table). A *future* fixture — no score, no match report — is
+    not blank and must survive.
+    """
+
+    SCHEDULE_HTML = """
+    <html>
+    <table id="sched_2025-2026_9_1">
+        <thead>
+            <tr><th>Wk</th><th>Home</th><th>Score</th><th>Away</th></tr>
+        </thead>
+        <tbody>
+            <tr><td>1</td><td>Arsenal</td><td>2–1</td><td>Chelsea</td></tr>
+            <!-- FBref's blank separator row between gameweeks -->
+            <tr><td></td><td></td><td></td><td></td></tr>
+            <tr><td>2</td><td>Liverpool</td><td></td><td>Everton</td></tr>
+        </tbody>
+    </table>
+    </html>
+    """
+
+    def test_parse_table_drops_blank_rows_but_keeps_future_fixture(self):
+        from bs4 import BeautifulSoup
+        from scrapers.fbref.html_parser import parse_table
+
+        soup = BeautifulSoup(self.SCHEDULE_HTML, 'html.parser')
+        df = parse_table(soup, 'sched_2025-2026_9_1')
+
+        assert df is not None
+        assert len(df) == 2
+        # The unplayed Liverpool–Everton fixture has no score, but it is not blank.
+        assert set(df['Home']) == {'Arsenal', 'Liverpool'}
+
+    def test_parse_table_element_drops_blank_rows(self):
+        from bs4 import BeautifulSoup
+        from scrapers.fbref.html_parser import _parse_table_element
+
+        soup = BeautifulSoup(self.SCHEDULE_HTML, 'html.parser')
+        table = soup.find('table')
+        df = _parse_table_element(table)
+
+        assert df is not None
+        assert len(df) == 2
+
+    def test_drop_blank_rows_is_a_noop_on_clean_frames(self):
+        from scrapers.fbref.html_parser import drop_blank_rows
+
+        df = pd.DataFrame({'Home': ['Arsenal'], 'Score': [None]})
+        out = drop_blank_rows(df)
+
+        assert len(out) == 1
+
+
 class TestExtractMatchUrlsFromSchedule:
     """match_url must stay aligned with the right fixture even when the
     schedule HTML interleaves spacer rows, repeated header rows, and future
