@@ -134,6 +134,7 @@ class FotMobScraper(BaseScraper):
         'POR-Primeira Liga': '61',
         'UEFA-Champions League': '42',
         'UEFA-Europa League': '73',
+        'INT-World Cup': '77',
     }
 
     def __init__(
@@ -171,8 +172,13 @@ class FotMobScraper(BaseScraper):
     # HTTP plumbing
     # ------------------------------------------------------------------ #
 
-    def _format_season(self, season: int) -> str:
-        """Format season year to FotMob format (e.g. 2023 -> '2023/2024')."""
+    def _format_season(self, season: int, league: str = None) -> str:
+        """Format season year to FotMob format.
+
+        For INT-World Cup (single-year) return '2026', not '2026/2027'.
+        """
+        if league == 'INT-World Cup':
+            return str(season)
         return f"{season}/{season + 1}"
 
     def _get_session(self) -> requests.Session:
@@ -260,7 +266,7 @@ class FotMobScraper(BaseScraper):
 
         data = self._fetch_api_json(
             'leagues',
-            params={'id': league_id, 'season': self._format_season(season)},
+            params={'id': league_id, 'season': self._format_season(season, league)},
         )
         if data is not None:
             self._league_data_cache[key] = data

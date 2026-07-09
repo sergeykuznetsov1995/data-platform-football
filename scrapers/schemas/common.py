@@ -64,6 +64,12 @@ LEAGUE_ALIASES = {
     'FRA-Ligue 1': 'FRA-Ligue 1',
     'Ligue 1': 'FRA-Ligue 1',
     'France': 'FRA-Ligue 1',
+
+    # World Cup (INT)
+    'INT-World Cup': 'INT-World Cup',
+    'World Cup': 'INT-World Cup',
+    'FIFA World Cup': 'INT-World Cup',
+    'World Championship': 'INT-World Cup',
 }
 
 

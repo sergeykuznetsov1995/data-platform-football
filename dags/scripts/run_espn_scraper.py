@@ -58,14 +58,21 @@ def main():
     args = parser.parse_args()
 
     leagues = [l.strip() for l in args.leagues.split(',')]
-    # soccerdata reads a 4-digit int ambiguously: 2021 -> slug '2021' (2020/21),
-    # NOT the 2021/22 season — because 20,21 are consecutive and look like a
-    # season code (#713). Convert the year-start int to an explicit 4-char slug
-    # ('YYZZ', e.g. 2021 -> '2122') so EVERY season resolves unambiguously.
-    season_slug = f"{args.season % 100:02d}{(args.season + 1) % 100:02d}"
+    # #913 Phase 1 (WC0 recon): soccerdata SeasonCode is per-league.
+    # INT-World Cup is single-year ('2026'), clubs are 2-year ('2627').
+    # NEVER mix them in one sd.ESPN(leagues=..., seasons=...) call — it silently
+    # forces multi-year and breaks WC season. We build per-league tokens and
+    # scrape each league in its own (tiny) scraper instance.
+    per_league = []
+    for lg in leagues:
+        if lg == 'INT-World Cup':
+            tok = str(args.season)  # single-year
+        else:
+            tok = f"{args.season % 100:02d}{(args.season + 1) % 100:02d}"
+        per_league.append((lg, tok))
     logger.info(
         f"Starting ESPN scraper: leagues={leagues}, season={args.season} "
-        f"(soccerdata slug {season_slug})"
+        f"per-league tokens={[t for _,t in per_league]}"
     )
 
     results = {
@@ -80,78 +87,80 @@ def main():
         from scrapers.base.base_scraper import ReplaceGuardError
         from scrapers.espn import ESPNScraper
 
-        with ESPNScraper(leagues=leagues, seasons=[season_slug]) as scraper:
-            # Scrape schedule
-            try:
-                df = scraper.read_schedule()
-                if df is not None and not df.empty:
-                    df = scraper._standardize_schedule(df)
-                    table_path = scraper.save_to_iceberg(
-                        df=df,
-                        table_name='espn_schedule',
-                        partition_cols=['league', 'season'],
-                        replace_partitions=['league', 'season'],
-                        min_replace_ratio=(
-                            None if args.force_replace else _MIN_REPLACE_RATIO
-                        ),
-                    )
-                    results['tables'].append(table_path)
-                    results['schedule_rows'] = len(df)
-                    logger.info(f"Saved {len(df)} schedule rows")
-            except ReplaceGuardError as e:
-                # Guard refused the save (partial scrape would shrink the
-                # partition) — nothing written. Distinct exit 3 so an operator
-                # can tell a refused guard from a hard scrape failure (#583).
-                msg = f"{REPLACE_GUARD_MARKER}: {e}"
-                logger.error(msg)
-                results['errors'].append(msg)
-                with open(args.output, 'w') as f:
-                    json.dump(results, f)
-                return 3
-            except Exception as e:
-                error_msg = f"Schedule scraping failed: {e}"
-                logger.error(error_msg)
-                results['errors'].append(error_msg)
-
-            # Scrape per-match entities (lineup, matchsheet). Far heavier than
-            # the schedule — soccerdata iterates every match endpoint. A guard
-            # refusal here is recorded as an error (exit 1), NOT exit 3: the
-            # schedule (primary freshness signal) already saved above, so we
-            # reserve exit 3 for a schedule-level refusal only.
-            #
-            # Incremental by default: skip-existing drops games already in
-            # bronze, so the frame holds only NEW games — hence the saves
-            # replace per (league, season, game), not the whole partition
-            # (a whole-partition replace would wipe the skipped games).
-            # --force-replace disables the skip for a deliberate full
-            # re-scrape; per-game replace keeps that duplicate-safe too.
-            for entity, reader_fn in (
-                ('lineup', scraper.read_lineup),
-                ('matchsheet', scraper.read_matchsheet),
-            ):
+        # #913: one league per scraper instance → no mixed season_code ever.
+        for lg, tok in per_league:
+            with ESPNScraper(leagues=[lg], seasons=[tok]) as scraper:
+                # Scrape schedule
                 try:
-                    df = reader_fn(skip_existing=not args.force_replace)
+                    df = scraper.read_schedule()
                     if df is not None and not df.empty:
+                        df = scraper._standardize_schedule(df)
                         table_path = scraper.save_to_iceberg(
                             df=df,
-                            table_name=f'espn_{entity}',
+                            table_name='espn_schedule',
                             partition_cols=['league', 'season'],
-                            replace_partitions=['league', 'season', 'game'],
+                            replace_partitions=['league', 'season'],
                             min_replace_ratio=(
                                 None if args.force_replace else _MIN_REPLACE_RATIO
                             ),
                         )
                         results['tables'].append(table_path)
-                        results[f'{entity}_rows'] = len(df)
-                        logger.info(f"Saved {len(df)} {entity} rows")
+                        results['schedule_rows'] += len(df)
+                        logger.info(f"Saved {len(df)} schedule rows for {lg}")
                 except ReplaceGuardError as e:
-                    msg = f"{REPLACE_GUARD_MARKER} ({entity}): {e}"
+                    # Guard refused the save (partial scrape would shrink the
+                    # partition) — nothing written. Distinct exit 3 so an operator
+                    # can tell a refused guard from a hard scrape failure (#583).
+                    msg = f"{REPLACE_GUARD_MARKER}: {e}"
                     logger.error(msg)
                     results['errors'].append(msg)
+                    with open(args.output, 'w') as f:
+                        json.dump(results, f)
+                    return 3
                 except Exception as e:
-                    error_msg = f"{entity.capitalize()} scraping failed: {e}"
+                    error_msg = f"Schedule scraping failed: {e}"
                     logger.error(error_msg)
                     results['errors'].append(error_msg)
+
+                # Scrape per-match entities (lineup, matchsheet). Far heavier than
+                # the schedule — soccerdata iterates every match endpoint. A guard
+                # refusal here is recorded as an error (exit 1), NOT exit 3: the
+                # schedule (primary freshness signal) already saved above, so we
+                # reserve exit 3 for a schedule-level refusal only.
+                #
+                # Incremental by default: skip-existing drops games already in
+                # bronze, so the frame holds only NEW games — hence the saves
+                # replace per (league, season, game), not the whole partition
+                # (a whole-partition replace would wipe the skipped games).
+                # --force-replace disables the skip for a deliberate full
+                # re-scrape; per-game replace keeps that duplicate-safe too.
+                for entity, reader_fn in (
+                    ('lineup', scraper.read_lineup),
+                    ('matchsheet', scraper.read_matchsheet),
+                ):
+                    try:
+                        df = reader_fn(skip_existing=not args.force_replace)
+                        if df is not None and not df.empty:
+                            table_path = scraper.save_to_iceberg(
+                                df=df,
+                                table_name=f'espn_{entity}',
+                                partition_cols=['league', 'season'],
+                                replace_partitions=['league', 'season', 'game'],
+                                min_replace_ratio=(
+                                    None if args.force_replace else _MIN_REPLACE_RATIO
+                                ),
+                            )
+                            results['tables'].append(table_path)
+                            results[f'{entity}_rows'] += len(df)
+                            logger.info(f"Saved {len(df)} {entity} rows for {lg}")
+                    except ReplaceGuardError as e:
+                        msg = f"{REPLACE_GUARD_MARKER} ({entity}): {e}"
+                        logger.error(msg)
+                        results['errors'].append(msg)
+                    except Exception as e:
+                        error_msg = f"{entity.capitalize()} scraping failed: {e}"
+                        logger.error(error_msg)
+                        results['errors'].append(error_msg)
 
     except Exception as e:
         logger.error(f"Scraper failed: {e}", exc_info=True)

@@ -31,6 +31,7 @@ def get_current_season() -> int:
 # 'ESP-La Liga', 'GER-Bundesliga', 'ITA-Serie A', 'FRA-Ligue 1'
 LEAGUES: List[str] = [
     'ENG-Premier League',
+    'INT-World Cup',  # #913 Phase 1 (single-year WC). Targeting 5 sources: fbref, fotmob, sofascore, espn, whoscored. Club-only sources (sofifa etc) protected in thresholds.
 ]
 
 # WhoScored multi-league scope (#708). Deliberately independent of the global
@@ -45,6 +46,7 @@ WHOSCORED_LEAGUES: List[str] = [
     'GER-Bundesliga',
     'ITA-Serie A',
     'FRA-Ligue 1',
+    'INT-World Cup',  # #913 Phase 1 (5th source; may be blocked by FlareSolverr 512M)
 ]
 
 # Understat multi-league scope. Independent of the global LEAGUES for the same
@@ -107,10 +109,12 @@ SCHEDULES: Dict[str, str] = {
 # Minimum row thresholds for validation (per single DagRun = 1 league x 1 season).
 # Consumed by validate_table() in dags/utils/bronze_validation.py (fail-closed
 # on a missing key, #106/#110) via the validate tasks in the whoscored / espn /
-# understat / sofifa ingest DAGs. Currently LEAGUES=['ENG-Premier League'] and
-# CURRENT_SEASON is one season, so values below are sized for 1 APL season
-# (floor against a wiped/empty table — whole-table COUNT(*), so they must not
-# false-fail if the configured scope ever shrinks to one season).
+# understat / sofifa ingest DAGs.
+#
+# #913 Phase 1: thresholds are still whole-table (not fully per-competition yet).
+# WC has ~104 matches vs ~380 for APL. For now we rely on aggregate counts being
+# high enough + protected sofifa scaling above. Future: make validate league-aware.
+# Currently LEAGUES includes INT-World Cup (for supported sources) + clubs.
 MIN_ROW_THRESHOLDS: Dict[str, int] = {
     'schedule': 350,        # 380 APL matches/season, allow ~5-10% missing/postponed
     'player_stats': 500,    # ~600-800 unique player-season rows expected, ~25% margin
@@ -144,15 +148,14 @@ MIN_ROW_THRESHOLDS: Dict[str, int] = {
     'understat_shots': 8000,               # ~9.8k shots/season - 20% margin
     'understat_team_match_stats': 340,     # 380 team-match rows/season - 10%
     'understat_player_match_stats': 10_000,  # ~11.1k rows/season - 10% margin
-    # sofifa_*: масштабируются от len(LEAGUES) — ~546 игроков и 20 клубов на
-    # лигу за edition; иначе при добавлении лиг floor перестаёт защищать
-    # (остаётся в N раз ниже нормы). sofifa_versions от лиг не зависит.
-    'sofifa_players': 450 * len(LEAGUES),        # 546 players / league edition - 18%
-    'sofifa_teams': 18 * len(LEAGUES),           # 20 clubs / league - 10%
-    'sofifa_team_ratings': 18 * len(LEAGUES),    # 20 clubs / league - 10%
+    # sofifa_*: масштабируются от количества клубных лиг (INT-World Cup не покрывается sofifa).
+    # Для #913: считаем только клубные (чтобы floor не завышался при добавлении WC).
+    'sofifa_players': 450 * len([l for l in LEAGUES if not l.startswith('INT-')]),        # 546 players / league edition - 18%
+    'sofifa_teams': 18 * len([l for l in LEAGUES if not l.startswith('INT-')]),           # 20 clubs / league - 10%
+    'sofifa_team_ratings': 18 * len([l for l in LEAGUES if not l.startswith('INT-')]),    # 20 clubs / league - 10%
     'sofifa_versions': 15,                 # ~20 editions (FIFA 07→FC 26) on post-EA-FC homepage (#654/#670); +1/yr
-    'sofifa_leagues': len(LEAGUES),              # 1 lookup row per league
-    'sofifa_player_ratings': 450 * len(LEAGUES),  # 546 per-player pages / league edition - 18%
+    'sofifa_leagues': len([l for l in LEAGUES if not l.startswith('INT-')]),              # 1 lookup row per league
+    'sofifa_player_ratings': 450 * len([l for l in LEAGUES if not l.startswith('INT-')]),  # 546 per-player pages / league edition - 18%
 }
 
 # Tags for DAG organization

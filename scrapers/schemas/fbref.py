@@ -25,6 +25,10 @@ FBREF_SCHEDULE_SCHEMA = create_schema_with_metadata([
     pa.field('attendance', pa.int32(), nullable=True),
     pa.field('match_id', pa.string(), nullable=True),
     pa.field('match_url', pa.string(), nullable=True),
+    # WC and some cups use these (FBref schedule table has Wk + Round columns).
+    # They were present in Bronze but missing from the declared PyArrow schema (#913 Phase 1).
+    pa.field('wk', pa.string(), nullable=True),
+    pa.field('round', pa.string(), nullable=True),
 ])
 
 # Player stats (season summary)
