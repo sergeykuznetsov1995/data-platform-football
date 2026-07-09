@@ -51,6 +51,7 @@ SOFASCORE_TOURNAMENT_MAP: Dict[str, int] = {
     'GER-Bundesliga': 35,
     'ITA-Serie A': 23,
     'FRA-Ligue 1': 34,
+    'INT-World Cup': 16,
 }
 
 # Canonical SofaScore league-page slug per soccerdata league key. The browser
@@ -63,6 +64,7 @@ SOFASCORE_TOURNAMENT_SLUG: Dict[str, str] = {
     'GER-Bundesliga': 'football/germany/bundesliga',
     'ITA-Serie A': 'football/italy/serie-a',
     'FRA-Ligue 1': 'football/france/ligue-1',
+    'INT-World Cup': 'football/world/world-championship',
 }
 
 # R0.2b — graceful-fallback marker emitted when the lineups endpoint
