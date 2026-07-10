@@ -535,16 +535,19 @@ def _build_whoscored_events_spadl_checks() -> List[Check]:
         CHECK.row_count(table, min_rows=600_000),
 
         # SPADL coverage drift guard. R3 verdict: ~2.88% unknown baseline on
-        # 2425+2526 corpus. After full multi-season backfill the rate ran at
-        # ~4.1% (~28.4K / 695,144) — meta-event types Card/Substitution etc.
-        # map to 'unknown' by design (Goal moved to the shot family in #462,
-        # dropping ~1,288 rows out of 'unknown'). Cap at 40K (~5.75%) so a fresh
-        # taxonomy drift (new WhoScored type) still trips before silently
-        # corrupting downstream stats.
+        # 2425+2526 corpus; after multi-season backfill the healthy rate is
+        # ~3.8-4.1% per league-season — meta-event types Card/Substitution etc.
+        # map to 'unknown' by design (Goal moved to the shot family in #462).
+        # The registry has no `ratio` primitive, so this is an absolute cap
+        # over the WHOLE table: sized as ~40K (≈5.75% of ~700K rows) per
+        # league-season × 12 league-seasons headroom (9 EPL + WC-2026 live
+        # now, #913 measured 230,935 = 3.76% total). Per-season drift is the
+        # job of spadl_unknown_rate[season=...] in build_per_season_e3_checks;
+        # this table-wide cap only catches a wholesale taxonomy break.
         CHECK.row_count(
             table=table,
             min_rows=0,
-            max_rows=40_000,
+            max_rows=480_000,
             where="action_canonical = 'unknown'",
             severity='ERROR',
             name='spadl_coverage_unknown_rate',
