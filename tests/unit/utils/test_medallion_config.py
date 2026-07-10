@@ -933,6 +933,42 @@ competitions:
         with pytest.raises(mod.MedallionConfigError, match="match_count"):
             mod.load_competitions()
 
+    def test_bad_top_level_competition_format_rejected(
+            self, tmp_path, monkeypatch):
+        # A typo here would silently disable is_group_knockout() — group
+        # standings parsed by the club branch with no load-time signal.
+        mod = _write_competitions(tmp_path, monkeypatch, """\
+competitions:
+  - id: "INT-World Cup"
+    name: "FIFA World Cup"
+    country: "World"
+    tier: 1
+    competition_format: groupknockout
+    seasons: []
+    sources: {primary: [], fallback: []}
+    in_scope: false
+""")
+        with pytest.raises(mod.MedallionConfigError, match="competition_format"):
+            mod.load_competitions()
+
+    def test_gk_seasons_require_top_level_competition_format(
+            self, tmp_path, monkeypatch):
+        mod = _write_competitions(tmp_path, monkeypatch, f"""\
+competitions:
+  - id: "INT-World Cup"
+    name: "FIFA World Cup"
+    country: "World"
+    tier: 1
+    seasons:
+{_GK_SEASON}
+    sources: {{primary: [], fallback: []}}
+    in_scope: true
+""")
+        with pytest.raises(
+                mod.MedallionConfigError,
+                match="no top-level 'competition_format"):
+            mod.load_competitions()
+
     def test_bool_team_count_rejected(self, tmp_path, monkeypatch):
         # YAML `team_count: true` is an int subclass in Python — must not
         # slip through the positive-int check.

@@ -2,17 +2,21 @@
 Competition-format lookups for scrapers (#920 Phase 3).
 
 One shared implementation of the pattern sofascore pioneered: consult
-``dags.utils.medallion_config`` lazily and fall back to the club default on
-ANY failure. Scrapers previously hardcoded ``league == 'INT-World Cup'`` in
-their season-format branches, so onboarding the NEXT tournament silently
-fetched the club-formula page ('2028-2029') — the wrong-season class that
-destroyed WC bronze on 2026-07-09 (#920 pinned comment).
+``dags.utils.medallion_config`` lazily and fall back on failure. Scrapers
+previously hardcoded ``league == 'INT-World Cup'`` in their season-format
+branches, so onboarding the NEXT tournament silently fetched the
+club-formula page ('2028-2029') — the wrong-season class that destroyed WC
+bronze on 2026-07-09 (#920 pinned comment).
 
-The fallback is conservative on purpose: a wrong club default keeps today's
-behavior and surfaces as a loud ID miss / empty scrape later, never as a
-silently mislabelled partition. With medallion_config's repo-relative
-CONFIG_DIR fallback the except-branch is truly exceptional (it used to fire
-on every host run because the container path didn't exist there).
+The fallback is asymmetric on purpose (#920 review hardening): for a CLUB
+league a failed lookup returns the club default (today's behavior — a loud
+ID miss later at worst); for an ``INT-``-prefixed tournament league it
+RAISES — a silent club fallback there IS the wrong-season / wrong-partition
+incident class, and the INT- prefix is already a load-bearing convention
+(sofifa floor filter, coherence test). With medallion_config's
+repo-relative CONFIG_DIR fallback the failure branch is truly exceptional
+(it used to fire on every host run because the container path didn't exist
+there).
 """
 
 import logging
@@ -22,27 +26,41 @@ logger = logging.getLogger(__name__)
 _warned: set = set()
 
 
-def _warn_once(what: str, exc: Exception) -> None:
+def _fallback(league, what: str, exc: Exception) -> bool:
+    """Club default on lookup failure — but NEVER for a tournament league."""
+    if str(league).startswith('INT-'):
+        raise RuntimeError(
+            f"medallion config unavailable for {what} and {league!r} is a "
+            f"tournament (INT-*) — refusing the silent club fallback "
+            f"(wrong-season/partition class of the 2026-07-09 incident): {exc}"
+        ) from exc
     if what not in _warned:
         _warned.add(what)
         logger.warning(
             "medallion config unavailable for %s (%s) — falling back to the "
-            "club default. Tournament leagues will NOT resolve correctly in "
-            "this environment.", what, exc,
+            "club default.", what, exc,
         )
+    return False
 
 
 def is_single_year(league, season) -> bool:
-    """True when (league, season) is a single_year competition per
-    competitions.yaml. Conservative False on any lookup failure."""
+    """True when (league, season) is single_year per competitions.yaml.
+
+    A season id missing from the yaml falls back to the COMPETITION-level
+    answer: get_competition_season_format defaults unlisted seasons to
+    'split_year', which for a historical tournament backfill (WC 2022,
+    Euro 2024 — only current editions are configured) would silently
+    reintroduce the club-formula URL/label the old literal was immune to.
+    """
     if not league:
         return False
     try:
         from dags.utils.medallion_config import get_competition_season_format
-        return get_competition_season_format(league, int(season)) == 'single_year'
-    except Exception as e:  # noqa: BLE001 — never break a club scrape
-        _warn_once(f'is_single_year({league!r})', e)
-        return False
+        if get_competition_season_format(league, int(season)) == 'single_year':
+            return True
+        return is_single_year_competition(league)
+    except Exception as e:  # noqa: BLE001 — club default; raises for INT-*
+        return _fallback(league, f'is_single_year({league!r})', e)
 
 
 def is_single_year_competition(league) -> bool:
@@ -56,8 +74,7 @@ def is_single_year_competition(league) -> bool:
         )
         return _impl(league)
     except Exception as e:  # noqa: BLE001
-        _warn_once(f'is_single_year_competition({league!r})', e)
-        return False
+        return _fallback(league, f'is_single_year_competition({league!r})', e)
 
 
 def is_group_knockout(league) -> bool:
@@ -71,5 +88,4 @@ def is_group_knockout(league) -> bool:
         from dags.utils.medallion_config import get_competition_format
         return get_competition_format(league) == 'group_knockout'
     except Exception as e:  # noqa: BLE001
-        _warn_once(f'is_group_knockout({league!r})', e)
-        return False
+        return _fallback(league, f'is_group_knockout({league!r})', e)

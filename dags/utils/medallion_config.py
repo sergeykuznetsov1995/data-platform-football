@@ -409,6 +409,16 @@ def _validate_competitions_schema(doc: Dict) -> None:
                 f"competitions.yaml: competitions[{i}] ({c.get('id')}) "
                 f"missing/empty 'country' (required for gold.dim_competition)"
             )
+        # Top-level competition_format drives payload-shape scraper branches
+        # (get_competition_format) — a typo would silently fall back to
+        # 'league' and skip group-table parsing (#920 review hardening).
+        comp_fmt = c.get('competition_format')
+        if comp_fmt is not None and comp_fmt not in ('league', 'group_knockout'):
+            raise MedallionConfigError(
+                f"competitions.yaml: competitions[{i}] ({c.get('id')}) "
+                f"competition_format must be 'league' or 'group_knockout' "
+                f"(got {comp_fmt!r})"
+            )
         # Validate seasons list and season_format (issue #913 Phase 2).
         # season_format per-season is optional; default 'split_year' everywhere
         # except explicit single-year tournaments (e.g. INT-World Cup 2026).
@@ -464,6 +474,20 @@ def _validate_competitions_schema(doc: Dict) -> None:
                     f"({c.get('id')}): group_knockout seasons require an "
                     f"explicit 'match_count'"
                 )
+        # Cross-check: a group_knockout season under a competition whose
+        # top-level competition_format was forgotten would leave
+        # is_group_knockout() False — group tables silently parsed by the
+        # club branch (#920 review hardening).
+        if comp_fmt != 'group_knockout' and any(
+            s.get('format') == 'group_knockout'
+            for s in (c.get('seasons') or [])
+            if isinstance(s, dict)
+        ):
+            raise MedallionConfigError(
+                f"competitions.yaml: competitions[{i}] ({c.get('id')}) has "
+                f"group_knockout seasons but no top-level "
+                f"'competition_format: group_knockout'"
+            )
 
 
 def _validate_country_codes_schema(doc: Dict) -> None:

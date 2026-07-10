@@ -84,6 +84,7 @@ _COMPETITIONS_YAML_CONTENT = textwrap.dedent("""\
         name: "FIFA World Cup"
         country: "World"
         tier: 1
+        competition_format: "group_knockout"
         seasons:
           - id: 2026
             season_format: "single_year"

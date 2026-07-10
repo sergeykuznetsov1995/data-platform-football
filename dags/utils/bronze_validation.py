@@ -56,6 +56,18 @@ def _guarded_count(fn: Callable[[], Any], table_name: str) -> Any:
         ) from e
 
 
+def _out_of_window_tournament(league: str) -> bool:
+    """True when ``league`` is a single-year tournament whose active window
+    is closed — the state in which its ingest runner no-ops by design."""
+    from utils.medallion_config import (
+        get_active_season, is_single_year_competition,
+    )
+    return (
+        is_single_year_competition(league)
+        and get_active_season(league) is None
+    )
+
+
 def bronze_count(table_name: str) -> int:
     """Count rows in iceberg.bronze.{table_name} via Trino."""
     from utils.silver_tasks import _get_trino_connection, _validate_identifier
@@ -107,14 +119,20 @@ def validate_table(
 ) -> Dict[str, Any]:
     """Run a row-count check for one Bronze table.
 
-    Without ``leagues`` (or for a threshold key with no per-league base —
-    the whole-table wipe-floors) the historical semantics apply unchanged:
-    whole-table COUNT(*) vs MIN_ROW_THRESHOLDS. With ``leagues`` and a key
-    in PER_LEAGUE_FLOOR_BASES, every league in the scope is compared against
-    its own competitions.yaml-derived floor; ALL shortfalls are reported in
-    one failure so a red run shows the full damage, not the first casualty.
+    Without ``leagues`` (None or empty — an empty derived scope must not
+    silently validate nothing, #102/#110 class) the historical semantics
+    apply unchanged: whole-table COUNT(*) vs MIN_ROW_THRESHOLDS. With
+    ``leagues``, the key MUST be registered in PER_LEAGUE_FLOOR_BASES —
+    a silent downgrade to the whole-table aggregate would reintroduce the
+    exact masking this function exists to remove (review hardening). Every
+    league in the scope is compared against its own competitions.yaml-derived
+    floor; ALL shortfalls are reported in one failure so a red run shows the
+    full damage, not the first casualty. One deliberate grace: a single-year
+    tournament with ZERO rows outside its window is the healthy
+    pre-activation state (scrape is a no-op by design), not a failure —
+    a partial partition below its floor still fails, in or out of window.
     """
-    if leagues is None or threshold_key not in PER_LEAGUE_FLOOR_BASES:
+    if not leagues:
         try:
             threshold = MIN_ROW_THRESHOLDS[threshold_key]
         except KeyError as e:
@@ -133,6 +151,15 @@ def validate_table(
                 f"{table_name}: {rows} rows < threshold {threshold}"
             )
         return summary
+
+    if threshold_key not in PER_LEAGUE_FLOOR_BASES:
+        raise AirflowException(
+            f"validate_table('{table_name}', leagues=...) requested per-league "
+            f"floors, but '{threshold_key}' has no PER_LEAGUE_FLOOR_BASES "
+            f"entry — add one in dags/utils/config.py or call without "
+            f"`leagues` for a whole-table wipe-floor. Refusing the silent "
+            f"whole-table downgrade (#920 masking class)."
+        )
 
     # Per-league path (#920 Phase 2). Floor derivation is fail-closed: an
     # unknown league / stub competition / broken YAML raises instead of
@@ -161,11 +188,24 @@ def validate_table(
     }
     logger.info(f"Validation: {summary}")
 
-    failures = [
-        f"{lg}: {v['rows']} rows < {v['threshold']}"
-        for lg, v in per_league.items()
-        if v['rows'] < v['threshold']
-    ]
+    failures = []
+    for lg, v in per_league.items():
+        if v['rows'] >= v['threshold']:
+            continue
+        if v['rows'] == 0 and _out_of_window_tournament(lg):
+            # Pre-activation (or post-tournament after a clean removal):
+            # the runner no-ops outside the window by design, so an empty
+            # partition is the expected state, not damage. Known blind spot,
+            # accepted: a FULL post-tournament wipe also lands here (master
+            # hid it behind the whole-table aggregate anyway); a PARTIAL
+            # wipe still fails the floor above.
+            logger.info(
+                f"{table_name}: {lg} has 0 rows outside its tournament "
+                f"window — floor {v['threshold']} skipped (pre-activation "
+                f"grace)."
+            )
+            continue
+        failures.append(f"{lg}: {v['rows']} rows < {v['threshold']}")
     if failures:
         raise AirflowException(
             f"{table_name}: league floors failed: {'; '.join(failures)}"

@@ -351,9 +351,17 @@ def validate_data(**context) -> Dict[str, Any]:
         _t_summary: Dict[str, Any] = {}
 
         _t_schedule = _load_result(f'/tmp/sofascore_result_{_slug}.json', logger)
-        # Missing file or the runner's out-of-window no-op marker: silent
-        # skip — outside the tournament window this is the healthy state.
-        if _t_schedule and not _t_schedule.get('skipped'):
+        # The runner ALWAYS writes its output file — out-of-window no-ops
+        # write the 'skipped' marker. A missing/unreadable file therefore
+        # means the runner died before writing (OOM/timeout after the bash
+        # rm -f) — WARN, don't silently pass (review hardening). Only the
+        # explicit 'skipped' marker is the healthy silent state.
+        if not _t_schedule:
+            validation['warnings'].append(
+                f"{_t_league}: schedule result file missing/unreadable "
+                f"(runner died before writing?)"
+            )
+        elif not _t_schedule.get('skipped'):
             for err in _t_schedule.get('errors') or []:
                 validation['warnings'].append(f"{_t_league}: {err}")
             for key in ('schedule_rows', 'league_table_rows'):
@@ -366,9 +374,13 @@ def validate_data(**context) -> Dict[str, Any]:
 
         _t_capture = _load_result(
             f'/tmp/sofascore_match_capture_result_{_slug}.json', logger)
-        if (
-            _t_capture
-            and not _t_capture.get('skipped')
+        if not _t_capture:
+            validation['warnings'].append(
+                f"{_t_league}: match_capture result file missing/unreadable "
+                f"(runner died before writing?)"
+            )
+        elif (
+            not _t_capture.get('skipped')
             and not _capture_noop(_t_capture)
         ):
             for err in _t_capture.get('errors') or []:
