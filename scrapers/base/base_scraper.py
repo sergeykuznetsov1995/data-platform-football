@@ -552,6 +552,12 @@ class SoccerdataScraper(BaseScraper):
     ):
         super().__init__(leagues=leagues, seasons=seasons, **kwargs)
 
+        # #920 Phase 3: install the repo's league_dict fragment BEFORE the
+        # lazy `import soccerdata` in _get_reader — soccerdata merges
+        # ~/soccerdata/config/league_dict.json exactly once, at import time.
+        from scrapers.base.soccerdata_config import ensure_league_dict
+        ensure_league_dict(required_leagues=self.leagues)
+
         # soccerdata specific options
         self._sd_kwargs = {
             'no_cache': self.no_cache,
