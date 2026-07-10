@@ -706,3 +706,36 @@ def test_real_config_savinho_alias_resolves(real_config_dir):
     assert real_config_dir.get_player_alias(
         "transfermarkt", "743591", "2526"
     ) == "fe6e7156"
+
+
+class TestGetActiveSingleYearSeason:
+    """#920 bridge: ingest runners substitute the tournament year for
+    single_year competitions while [start, end + grace] contains today."""
+
+    def _fn(self):
+        from utils.medallion_config import get_active_single_year_season
+        return get_active_single_year_season
+
+    def test_inside_window_returns_tournament_year(self):
+        import datetime
+        assert self._fn()(
+            'INT-World Cup', today=datetime.date(2026, 7, 10)) == 2026
+
+    def test_grace_after_final_keeps_window_open(self):
+        import datetime
+        assert self._fn()(
+            'INT-World Cup', today=datetime.date(2026, 7, 30)) == 2026
+
+    def test_out_of_window_returns_none(self):
+        import datetime
+        assert self._fn()(
+            'INT-World Cup', today=datetime.date(2026, 9, 1)) is None
+
+    def test_split_year_league_returns_none(self):
+        import datetime
+        assert self._fn()(
+            'ENG-Premier League', today=datetime.date(2026, 7, 10)) is None
+
+    def test_unknown_competition_returns_none(self):
+        import datetime
+        assert self._fn()('XX-Nope', today=datetime.date(2026, 7, 10)) is None

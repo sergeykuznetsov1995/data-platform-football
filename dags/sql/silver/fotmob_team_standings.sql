@@ -57,7 +57,8 @@ SELECT
     b.points,
 
     -- group_id for WC (Фаза 4 #913). NULL for regular leagues.
-    b.group                                               AS group_id,
+    -- "group" is a Trino reserved word — must stay quoted.
+    b."group"                                             AS group_id,
 
     -- ===== Lineage =====
     b._ingested_at AS _bronze_ingested_at,

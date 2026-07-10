@@ -162,3 +162,9 @@ LEFT JOIN mi
     AND s.season    = mi.season
     AND mi.rn       = 1
 WHERE s.rn = 1
+  -- A handful of bronze rows carry an EMPTY player_id (player row without an
+  -- FBref profile link, e.g. Serie A 16/17 youth one-appearance players).
+  -- The Silver PK is (player_id, squad, league, season) and downstream xref
+  -- joins on player_id — a blank key row is unusable and trips the no_nulls
+  -- DQ gate. Same convention as the other silver player tables.
+  AND NULLIF(s.player_id, '') IS NOT NULL
