@@ -52,6 +52,9 @@ SELECT
     CAST(b.gd  AS integer)                                AS goal_diff,
     CAST(b.pts AS integer)                                AS points,
 
+    -- group_id for WC group stage (Фаза 4 #913). NULL for club leagues / knockout.
+    b.group                                               AS group_id,
+
     -- ===== Lineage =====
     b._ingested_at                                        AS _bronze_ingested_at,
 

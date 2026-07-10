@@ -86,6 +86,7 @@ def _reset_schemas(duck_conn):
         """
         CREATE TABLE bronze_fbref_schedule (
             wk           VARCHAR,
+            round        VARCHAR,  -- #913 Phase 3: WC stage carrier (NULL for clubs)
             day          VARCHAR,
             date         VARCHAR,
             time         VARCHAR,

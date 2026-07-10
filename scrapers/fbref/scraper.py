@@ -242,9 +242,9 @@ class FBrefScraper(
     # URL helper delegates (backwards compatibility)
     # ------------------------------------------------------------------
 
-    def _format_season(self, season: int) -> str:
-        """Format season year to FBref format."""
-        return format_season(season)
+    def _format_season(self, season: int, league: str = None) -> str:
+        """Format season year to FBref format (single_year aware for WC)."""
+        return format_season(season, league)
 
     def _get_schedule_url(self, league: str, season: int) -> str:
         """Build URL for schedule/fixtures page."""

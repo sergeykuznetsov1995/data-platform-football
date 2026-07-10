@@ -240,8 +240,12 @@ SELECT
 
     -- ========= Partition keys (season → slug to match xref / other Silver) =====
     league,
-    LPAD(CAST(MOD(season,     100) AS varchar), 2, '0')
-        || LPAD(CAST(MOD(season + 1, 100) AS varchar), 2, '0') AS season
+    -- #913 Phase 2
+    CASE WHEN league = 'INT-World Cup'
+         THEN LPAD(CAST(season AS varchar), 4, '0')
+         ELSE LPAD(CAST(MOD(season, 100) AS varchar), 2, '0')
+              || LPAD(CAST(MOD(season + 1, 100) AS varchar), 2, '0')
+    END AS season
 
 FROM player_pivot
 WHERE team_id_numeric IS NOT NULL

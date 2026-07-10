@@ -119,8 +119,12 @@ WITH mh AS (
         -- season → slug ('2425'); matchhistory bronze stores year-start bigint.
         -- Converted here so the xref_match bridge JOIN (slug after #404) and
         -- the final projection are both slug.
-        LPAD(CAST(MOD(season,     100) AS varchar), 2, '0')
-            || LPAD(CAST(MOD(season + 1, 100) AS varchar), 2, '0') AS season,
+        -- #913 Phase 2
+        CASE WHEN league = 'INT-World Cup'
+             THEN LPAD(CAST(season AS varchar), 4, '0')
+             ELSE LPAD(CAST(MOD(season, 100) AS varchar), 2, '0')
+                  || LPAD(CAST(MOD(season + 1, 100) AS varchar), 2, '0')
+        END AS season,
         _ingested_at,
 
         -- ---- 1x2 open (B365/BW/PS/WH/VC renamed via COLUMN_MAPPING; IW raw) ----

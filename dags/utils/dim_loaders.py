@@ -8,7 +8,8 @@ from a Bronze/Silver source — they are projections of the medallion config
 
   * ``dim_competition``   <- ``configs/medallion/competitions.yaml``
   * ``dim_season``        <- union of ``seasons`` across in-scope
-                            competitions in the same YAML
+                            competitions in the same YAML (now carries
+                            season_kind for single_year support, #913 Phase 2)
 
 Both are stored as Jinja-style templates (``dags/sql/gold/dim_*.sql.j2``)
 with a single ``{{ rows }}`` placeholder for the VALUES tuples. The renderer
@@ -67,11 +68,14 @@ def render_dim_competition_sql(template_path: str, out_path: str) -> str:
     truth) and emits one VALUES row per competition — stubs included, the
     dim is a dictionary — with the columns declared in the template's
     ``AS t(...)`` clause:
-        league, competition_name, country, tier
+        league, competition_name, country, tier, competition_format, is_international
 
     PK ``league`` is the competition slug ('ENG-Premier League'), identical
     to the ``league`` value carried by every Bronze/Silver/Gold row, so
     fact-to-dim JOINs need no mapping table.
+
+    competition_format / is_international added for #913 Phase 3 (INT-World Cup
+    and future cups). Defaults: 'league_round_robin', false.
 
     The template's ``{{ rows }}`` literal is replaced with the joined tuples.
     Returns ``out_path`` for the convenience of pipeline glue code.
@@ -82,11 +86,14 @@ def render_dim_competition_sql(template_path: str, out_path: str) -> str:
 
     rows: List[str] = []
     for c in load_competitions()['competitions']:
+        fmt = c.get('competition_format') or 'league_round_robin'
+        intl = 'true' if c.get('is_international') else 'false'
         rows.append(
             f"('{_escape_sql_string(c['id'])}', "
             f"'{_escape_sql_string(c['name'])}', "
             f"'{_escape_sql_string(c['country'])}', "
-            f"{int(c['tier'])})"
+            f"{int(c['tier'])}, "
+            f"'{_escape_sql_string(fmt)}', {intl})"
         )
 
     body = ',\n    '.join(rows)
@@ -104,45 +111,60 @@ def render_dim_season_sql(template_path: str, out_path: str) -> str:
     (earliest start / latest end win, so two leagues sharing slug '2425'
     produce one covering row), and emits the columns declared in the
     template's ``AS t(...)`` clause:
-        season, season_name, start_date, end_date, is_current
+        season, season_name, start_date, end_date, is_current, season_kind
 
-    PK ``season`` is the 4-char slug ('2425') — the same value carried by
-    every Bronze/Silver/Gold row after #404.
+    PK ``season`` is the 4-char slug ('2425' or '2026') — the same value
+    carried by every Bronze/Silver/Gold row after #404.
 
-    ``is_current``: the LATEST season already started (max slug with
-    start_date <= today). A plain BETWEEN would flag zero seasons during
-    the summer gap between end_date and the next start_date.
+    ``is_current``: the LATEST season already started (the one with max
+    start_date among those with start_date <= today). Computed by date
+    (not lexical slug max) so mixed split_year + single_year seasons
+    behave correctly (#913 Phase 2).
+
+    ``season_kind`` comes from competitions.yaml seasons[].season_format
+    (default 'split_year').
     """
     from utils.medallion_config import load_competitions
 
-    seasons: dict = {}  # slug -> {'start': date, 'end': date}
+    # slug -> {'start': date, 'end': date, 'kind': str}
+    seasons: dict = {}
     for c in load_competitions()['competitions']:
         if not c.get('in_scope'):
             continue
         for s in c.get('seasons') or []:
-            # YAML season id is an int (2425) — format as 4-digit slug so a
-            # hypothetical '0203' season keeps its leading zero.
+            # YAML season id is an int (2425 or 2026) — format as 4-digit slug.
             slug = f"{int(s['id']):04d}"
             start = date.fromisoformat(str(s['start']))
             end = date.fromisoformat(str(s['end']))
+            kind = s.get('season_format', 'split_year')
             if slug in seasons:
                 seasons[slug]['start'] = min(seasons[slug]['start'], start)
                 seasons[slug]['end'] = max(seasons[slug]['end'], end)
+                # kind should be consistent for same slug; keep first seen
+                if 'kind' not in seasons[slug]:
+                    seasons[slug]['kind'] = kind
             else:
-                seasons[slug] = {'start': start, 'end': end}
+                seasons[slug] = {'start': start, 'end': end, 'kind': kind}
 
     today = date.today()
     started = [slug for slug, w in seasons.items() if w['start'] <= today]
-    current_slug = max(started) if started else None
+    if started:
+        current_slug = max(started, key=lambda sl: seasons[sl]['start'])
+    else:
+        current_slug = None
 
     rows: List[str] = []
     for slug in sorted(seasons):
         w = seasons[slug]
-        name = f"20{slug[:2]}-{slug[2:]}"
+        kind = w.get('kind', 'split_year')
+        if kind == 'single_year':
+            name = slug
+        else:
+            name = f"20{slug[:2]}-{slug[2:]}"
         is_current = 'true' if slug == current_slug else 'false'
         rows.append(
             f"('{slug}', '{name}', "
-            f"DATE '{w['start']}', DATE '{w['end']}', {is_current})"
+            f"DATE '{w['start']}', DATE '{w['end']}', {is_current}, '{kind}')"
         )
 
     body = ',\n    '.join(rows)
@@ -186,8 +208,8 @@ def render_dim_team_sql(template_path: str, out_path: str) -> str:
     """Render ``dim_team.sql.j2`` to ``out_path`` (issue #425).
 
     Fills the single ``{{ team_meta_values_sql }}`` placeholder with
-    ``(team_id, team_name, country, short_name)`` tuples from
-    ``team_aliases.yaml`` — the club-attribute side of the dim; the row
+    ``(team_id, team_name, country, short_name, team_type)`` tuples from
+    ``team_aliases.yaml`` (club + national teams, #913 Phase 3); the row
     spine still comes from ``silver.xref_team`` inside the template.
     """
     from utils.medallion_config import (

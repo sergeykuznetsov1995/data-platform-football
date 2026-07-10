@@ -47,9 +47,12 @@ base AS (
     SELECT
         match_id,
         league,
-        -- bigint year-start → slug '2526' (matches xref / other Silver).
-        LPAD(CAST(MOD(season,     100) AS varchar), 2, '0')
-            || LPAD(CAST(MOD(season + 1, 100) AS varchar), 2, '0') AS season,
+        -- #913 Phase 2
+        CASE WHEN league = 'INT-World Cup'
+             THEN LPAD(CAST(season AS varchar), 4, '0')
+             ELSE LPAD(CAST(MOD(season, 100) AS varchar), 2, '0')
+                  || LPAD(CAST(MOD(season + 1, 100) AS varchar), 2, '0')
+        END AS season,
         _ingested_at,
         lineup_json
     FROM match_dedup

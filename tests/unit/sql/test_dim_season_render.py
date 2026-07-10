@@ -80,6 +80,23 @@ _COMPETITIONS_YAML_CONTENT = textwrap.dedent("""\
           fallback: []
         in_scope: true
 
+      - id: "INT-World Cup"
+        name: "FIFA World Cup"
+        country: "World"
+        tier: 1
+        seasons:
+          - id: 2026
+            season_format: "single_year"
+            format: "group_knockout"
+            team_count: 48
+            start: "2026-06-11"
+            end: "2026-07-19"
+        sources:
+          primary: ["fbref"]
+          fallback: []
+        in_scope: true
+        notes: "#913 Phase 2 test entry"
+
       - id: "ESP-La Liga"
         name: "Spanish La Liga"
         country: "Spain"
@@ -139,12 +156,12 @@ def rendered_sql(monkeypatch, tmp_path) -> str:
 
 
 def _tuples(rendered_sql: str) -> dict:
-    """Parse rendered VALUES rows into {slug: (name, start, end, is_current)}."""
+    """Parse rendered VALUES rows into {slug: (name, start, end, is_current, kind)}."""
     rows = re.findall(
-        r"\('(\d{4})', '([\d-]+)', DATE '([\d-]+)', DATE '([\d-]+)', (true|false)\)",
+        r"\('(\d{4})', '([\d-]+)', DATE '([\d-]+)', DATE '([\d-]+)', (true|false), '(single_year|split_year)'\)",
         rendered_sql,
     )
-    return {slug: (name, start, end, cur) for slug, name, start, end, cur in rows}
+    return {slug: (name, start, end, cur, kind) for slug, name, start, end, cur, kind in rows}
 
 
 @pytest.mark.unit
@@ -154,13 +171,13 @@ class TestDimSeasonRender:
                              flags=re.MULTILINE)
 
     def test_one_row_per_distinct_slug_in_scope_only(self, rendered_sql):
-        """3 distinct slugs from in-scope leagues; the stub's '1920' excluded."""
+        """4 distinct slugs from in-scope (incl. single_year WC '2026'); stub excluded."""
         t = _tuples(rendered_sql)
-        assert set(t) == {"2324", "2425", "2526"}
+        assert set(t) == {"2324", "2425", "2526", "2026"}
 
     def test_shared_slug_deduped_min_start_max_end(self, rendered_sql):
         """ENG + ESP both carry '2425' → one row, widest covering window."""
-        _, start, end, _ = _tuples(rendered_sql)["2425"]
+        _, start, end, _, _ = _tuples(rendered_sql)["2425"]
         assert start == "2024-08-10", "dedup must take the EARLIEST start"
         assert end == "2025-06-01", "dedup must take the LATEST end"
 
@@ -169,20 +186,24 @@ class TestDimSeasonRender:
         assert t["2324"][0] == "2023-24"
         assert t["2425"][0] == "2024-25"
         assert t["2526"][0] == "2025-26"
+        # #913 Phase 2: single_year uses literal year as name
+        assert t["2026"][0] == "2026"
+        assert t["2026"][4] == "single_year"
 
     def test_is_current_exactly_one_row_summer_gap(self, rendered_sql):
         """Frozen today=2025-06-15 sits BETWEEN seasons. The latest started
-        slug ('2425') must be current; '2526' has not started yet."""
+        (by start_date) must be current; WC 2026 has not started."""
         t = _tuples(rendered_sql)
         assert t["2425"][3] == "true"
         assert t["2324"][3] == "false"
         assert t["2526"][3] == "false"
+        assert t["2026"][3] == "false"
         flags = [v[3] for v in t.values()]
         assert flags.count("true") == 1, "exactly one is_current row"
 
     def test_columns_declared(self, rendered_sql):
         for col in ["season", "season_name", "start_date", "end_date",
-                    "is_current"]:
+                    "is_current", "season_kind"]:
             assert col in rendered_sql
 
 

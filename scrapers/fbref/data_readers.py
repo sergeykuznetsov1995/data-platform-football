@@ -126,7 +126,8 @@ class FBrefDataReaderMixin:
         logger.debug(f"Found {len(comment_tables)} tables in comments")
 
         # Get league info for table ID
-        season_str = format_season(season)
+        # #913: pass league so WC uses single-year formatting (2026 not 2026-2027)
+        season_str = format_season(season, league)
         league_info = LEAGUE_IDS.get(league, {})
         comp_id = league_info.get('comp_id', '9')
 
