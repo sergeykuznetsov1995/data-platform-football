@@ -1376,6 +1376,44 @@ def get_competition_season_format(competition_id: str, season_id: int) -> str:
     return 'split_year'
 
 
+def get_active_single_year_season(
+    competition_id: str,
+    today: Optional['datetime.date'] = None,
+    grace_days: int = 14,
+) -> Optional[int]:
+    """The single_year season id whose [start, end + grace] window contains
+    ``today``, or None when the tournament is out of window / unknown.
+
+    Bridge until #920: ingest runners pass the club-formula CURRENT_SEASON
+    (July 2026 -> 2025) to every league, which for INT-World Cup silently
+    fetched the WRONG edition on some sources (ESPN answered the 2018 WC) or
+    mislabelled current data under season=2025 (FotMob/FBref daily runs).
+    Runners call this to substitute the tournament year for single_year
+    competitions while the tournament is running; ``grace_days`` keeps the
+    window open after the final for late re-scrapes/fix-ups.
+    """
+    import datetime as _dt
+
+    if today is None:
+        today = _dt.date.today()
+    doc = load_competitions()
+    for c in doc['competitions']:
+        if c['id'] != competition_id:
+            continue
+        for s in (c.get('seasons') or []):
+            if s.get('season_format') != 'single_year':
+                continue
+            try:
+                start = _dt.date.fromisoformat(str(s['start']))
+                end = _dt.date.fromisoformat(str(s['end']))
+            except (KeyError, ValueError):
+                continue
+            if start <= today <= end + _dt.timedelta(days=grace_days):
+                return int(s['id'])
+        break
+    return None
+
+
 # ---------------------------------------------------------------------------
 # SQL template rendering
 # ---------------------------------------------------------------------------

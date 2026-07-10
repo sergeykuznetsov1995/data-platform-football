@@ -66,7 +66,20 @@ def main():
     per_league = []
     for lg in leagues:
         if lg == 'INT-World Cup':
-            tok = str(args.season)  # single-year
+            # #920 bridge: the DAG passes the club-formula CURRENT_SEASON
+            # (July 2026 -> 2025) — substitute the active tournament year from
+            # competitions.yaml; skip the league entirely out of window.
+            from utils.medallion_config import get_active_single_year_season
+            _wc_season = get_active_single_year_season(lg)
+            if _wc_season is None:
+                logger.warning(
+                    f"{lg}: out of its tournament window — skipping league.")
+                continue
+            if int(args.season) != int(_wc_season):
+                logger.info(
+                    f"{lg}: overriding --season {args.season} -> {_wc_season} "
+                    f"(active single_year season, #920 bridge).")
+            tok = str(_wc_season)  # single-year
         else:
             tok = f"{args.season % 100:02d}{(args.season + 1) % 100:02d}"
         per_league.append((lg, tok))
