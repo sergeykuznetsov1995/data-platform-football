@@ -266,9 +266,14 @@ def parity_check_event_counts_per_season(
         f"WHERE season = '{safe_season}' "
         f"AND league = '{safe_league}'"
     )
+    # Bronze is APPEND-mode: re-scrapes stack full duplicate copies of a
+    # partition (WC-2026 hit 3x after daily re-ingests) and the spadl dedup
+    # removes them BY DESIGN — so parity must count DISTINCT natural-key
+    # events, not raw rows (same 17-col key as the spadl dedup window).
     sql = (
         "SELECT "
-        f"  (SELECT COUNT(*) FROM iceberg.bronze.whoscored_events {where}) AS bronze_cnt, "
+        "  (SELECT COUNT(*) FROM (SELECT DISTINCT game_id, period, minute, second, expanded_minute, type, outcome_type, team_id, player_id, x, y, end_x, end_y, qualifiers, related_event_id, related_player_id, team "
+        f"   FROM iceberg.bronze.whoscored_events {where})) AS bronze_cnt, "
         f"  (SELECT COUNT(*) FROM iceberg.silver.whoscored_events_spadl {where}) AS silver_cnt, "
         f"  (SELECT COUNT(*) FROM iceberg.gold.fct_event {where}) AS gold_cnt"
     )
@@ -1324,9 +1329,13 @@ def parity_check_event_counts() -> CheckResult:
          poison every downstream feature.
     """
     name = 'parity[bronze→silver→gold event counts]'
+    # DISTINCT natural-key bronze count — see the per-season variant: bronze
+    # is APPEND-mode and duplicate re-scrape copies are dropped by the spadl
+    # dedup deliberately.
     sql = (
         "SELECT "
-        "  (SELECT COUNT(*) FROM iceberg.bronze.whoscored_events) AS bronze_cnt, "
+        "  (SELECT COUNT(*) FROM (SELECT DISTINCT game_id, period, minute, second, expanded_minute, type, outcome_type, team_id, player_id, x, y, end_x, end_y, qualifiers, related_event_id, related_player_id, team "
+        "   FROM iceberg.bronze.whoscored_events)) AS bronze_cnt, "
         "  (SELECT COUNT(*) FROM iceberg.silver.whoscored_events_spadl) AS silver_cnt, "
         "  (SELECT COUNT(*) FROM iceberg.gold.fct_event) AS gold_cnt"
     )
