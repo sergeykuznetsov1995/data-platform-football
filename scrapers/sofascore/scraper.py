@@ -546,6 +546,29 @@ class SofaScoreScraper(SoccerdataScraper):
             for r in recs if r is not None
         )
 
+    @staticmethod
+    def _rec_terminal_empty(rec) -> bool:
+        """True for an explicit no-page response from SofaScore.
+
+        A finished season can expose every match through ``events/last`` while
+        ``events/next/0`` returns a JSON 404 instead of a 200-empty list. That
+        page-zero 404 is a terminal empty direction, not a proxy failure. A
+        404 after a page that advertised ``hasNextPage`` remains incomplete and
+        must still trigger a fresh-session retry.
+        """
+        if not isinstance(rec, dict):
+            return False
+        if rec.get("status") == 204:
+            return rec.get("challenge") is not True
+        obj = rec.get("json")
+        error = obj.get("error") if isinstance(obj, dict) else None
+        return (
+            rec.get("status") == 404
+            and rec.get("challenge") is False
+            and isinstance(error, dict)
+            and str(error.get("code")) == "404"
+        )
+
     @classmethod
     def _event_direction_complete(
         cls,
@@ -562,14 +585,19 @@ class SofaScoreScraper(SoccerdataScraper):
         """
         for page in range(max_pages):
             rec = buffer.get(f"{event_prefix}/{direction}/{page}")
+            if page == 0 and cls._rec_terminal_empty(rec):
+                return True
             if not cls._rec_answered(rec):
                 return False
             obj = rec.get("json")
             events = obj.get("events") if isinstance(obj, dict) else None
             if not isinstance(events, list):
                 return False
-            if not events or not obj.get("hasNextPage"):
-                return True
+            if obj.get("hasNextPage") is True:
+                if not events:
+                    return False
+                continue
+            return True
         return False
 
     def _resolve_target_sid(self, cap, buffer, ut_id, target_year) -> Optional[int]:
