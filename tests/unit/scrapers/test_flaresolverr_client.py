@@ -104,6 +104,23 @@ class TestFlareSolverrGet:
         payload = sess.post.call_args.kwargs['json']
         assert payload['returnOnlyCookies'] is True
 
+    def test_get_can_disable_media_per_navigation(self):
+        client = FlareSolverrClient()
+        with patch.object(client, 'session', new=MagicMock()) as sess:
+            sess.post.return_value = _ok_response(_ok_solution_payload())
+            client.get('https://x.com', 's1', disable_media=True)
+
+        payload = sess.post.call_args.kwargs['json']
+        assert payload['disableMedia'] is True
+
+    def test_post_commands_are_not_retried_by_http_adapter(self):
+        client = FlareSolverrClient()
+
+        retries = client.session.get_adapter('http://').max_retries
+
+        assert retries.total == 2
+        assert retries.allowed_methods == frozenset({'GET'})
+
     @pytest.mark.parametrize(
         'message',
         [
@@ -221,6 +238,33 @@ class TestFlareSolverrSessions:
 
         payload = sess.post.call_args.kwargs['json']
         assert payload['proxy'] == {'url': 'http://h:1'}
+
+    def test_create_session_decodes_percent_encoded_lease_credentials(self):
+        client = FlareSolverrClient()
+        with patch.object(client, 'session', new=MagicMock()) as sess:
+            sess.post.return_value = _ok_response({'status': 'ok'})
+            client.create_session(
+                'id', proxy_url='http://lease:s%2Fecret%2Btoken@proxy_filter:8900'
+            )
+
+        payload = sess.post.call_args.kwargs['json']
+        assert payload['proxy'] == {
+            'url': 'http://proxy_filter:8900',
+            'username': 'lease',
+            'password': 's/ecret+token',
+        }
+
+    def test_create_session_log_never_contains_proxy_credentials(self, caplog):
+        client = FlareSolverrClient()
+        with patch.object(client, 'session', new=MagicMock()) as sess:
+            sess.post.return_value = _ok_response({'status': 'ok'})
+            with caplog.at_level('INFO'):
+                client.create_session(
+                    'id', proxy_url='http://lease:top-secret@proxy_filter:8900'
+                )
+
+        assert 'top-secret' not in caplog.text
+        assert 'ad-tech filter' in caplog.text
 
     def test_destroy_session_idempotent(self):
         client = FlareSolverrClient()

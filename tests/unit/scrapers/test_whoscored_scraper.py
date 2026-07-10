@@ -1137,7 +1137,9 @@ class TestScrapeEventsSeasonsAndLineups:
         assert out == {1}
         sql = mgr_instance._execute.call_args.args[0]
         assert 'iceberg.bronze.whoscored_lineups' in sql
-        assert "season IN ('2526')" in sql
+        # Scope filters stay paired so a canonical single-year season cannot
+        # accidentally be cross-matched with a split-year competition.
+        assert "league = 'ENG-Premier League' AND season = '2526'" in sql
 
     def test_lineup_only_match_refetched_without_events_reappend(
         self, mock_base_dependencies, mock_enhanced_whoscored

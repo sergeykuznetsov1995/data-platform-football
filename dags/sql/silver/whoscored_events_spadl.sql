@@ -1,7 +1,8 @@
 -- =============================================================================
 -- Silver: whoscored_events_spadl
 -- =============================================================================
--- Normalises `iceberg.bronze.whoscored_events` (Opta-derived JSON, 39 distinct
+-- Normalises `iceberg.bronze.whoscored_events_current` (latest successful
+-- manifest batch per match; Opta-derived JSON, 39 distinct
 -- WhoScored type values, ~700K rows / season for APL) into a SPADL-shaped
 -- canonical action vocabulary plus a single proprietary supplement
 -- (`ball_recovery`).
@@ -19,7 +20,10 @@
 -- =============================================================================
 -- Output schema (frozen for E3 wave-1)
 -- =============================================================================
---   event_id              varchar     synthetic stable id (game_id || '_' || seq)
+--   event_id              varchar     source-backed stable id for v2 rows;
+--                                     legacy fallback = game_id || '_' || seq
+--   source_event_id_raw   varchar     original WhoScored/Opta event id
+--   related_event_id_raw  varchar     original related Opta event id
 --   match_id              varchar     CAST(game_id AS varchar)
 --   team_id_raw           varchar     bronze team_id (NOT resolved via xref —
 --                                     that is a Gold-job concern)
@@ -185,7 +189,8 @@
 --     credited as a shot to the deflecting defender.
 --   * CornerAwarded / OffsideProvoked / OffsideGiven: marker events with
 --     no SPADL action; mapped to 'unknown' to preserve event-count parity.
---   * BronZE re-scrape duplicates: deduplicated via ROW_NUMBER() over the
+--   * Bronze current view exposes only successful logical commits. Legacy
+--     re-scrape duplicates are additionally deduplicated via ROW_NUMBER() over the
 --     full natural key (15-col tuple verified unique on 2425 corpus —
 --     166,453 rows / 166,453 distinct natural keys). Dedup ORDER BY
 --     _ingested_at DESC keeps the most recent re-scrape.
@@ -198,8 +203,8 @@
 --   * Bronze schema verified via DESCRIBE on 2026-05-08 (33 cols, type list
 --     above matches).
 --   * 39 distinct `type` values verified; all 39 covered in CASE tree.
---   * event_id uniqueness verified: game_id || '_' || LPAD(seq,5,'0') yields
---     166,453 unique IDs on 166,453 rows (100% PK uniqueness).
+--   * v2 event_id = 'ws:' || game_id || ':' || source_event_id. Historical
+--     rows with source_event_id=NULL retain the verified synthetic sequence.
 --   * EXPLAIN parsability: TODO — execute via `make shell-trino` once SQL
 --     is wrapped in CTAS by silver_tasks (this file is a SELECT-only fragment
 --     and `EXPLAIN <SELECT>` will succeed standalone).
@@ -208,6 +213,7 @@
 WITH src AS (
     SELECT
         game_id,
+        source_event_id,
         period,
         minute,
         second,
@@ -235,13 +241,14 @@ WITH src AS (
             -- the ENTIRE bronze table (heap-OOM'd Trino on the #913 WC run).
             PARTITION BY
                 league, season,
-                game_id, period, minute, second, expanded_minute,
+                game_id, source_event_id,
+                period, minute, second, expanded_minute,
                 type, outcome_type, team_id, player_id,
                 x, y, end_x, end_y, qualifiers, related_event_id,
                 related_player_id, team
             ORDER BY _ingested_at DESC
         ) AS dedup_rn
-    FROM iceberg.bronze.whoscored_events
+    FROM iceberg.bronze.whoscored_events_current
 ),
 
 dedup AS (
@@ -284,10 +291,20 @@ seq AS (
 )
 
 SELECT
-    -- ========= Synthetic stable PK =========
-    CAST(game_id AS varchar)
-        || '_' || LPAD(CAST(event_seq AS varchar), 5, '0')   AS event_id,
+    -- ========= Source-backed stable PK with legacy fallback =========
+    CASE
+        WHEN source_event_id IS NOT NULL THEN
+            'ws:' || CAST(game_id AS varchar)
+                  || ':' || CAST(source_event_id AS varchar)
+        ELSE CAST(game_id AS varchar)
+                  || '_' || LPAD(CAST(event_seq AS varchar), 5, '0')
+    END                                                      AS event_id,
     CAST(game_id AS varchar)                                 AS match_id,
+
+    -- Keep the source relationship explicit instead of forcing consumers to
+    -- parse the canonical event_id string.
+    CAST(source_event_id AS varchar)                          AS source_event_id_raw,
+    CAST(related_event_id AS varchar)                         AS related_event_id_raw,
 
     -- ========= Raw entity references (resolved in Gold via xref) =========
     -- bronze stores team_id / player_id as DOUBLE; direct CAST to varchar

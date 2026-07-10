@@ -4,14 +4,14 @@ Unit tests for ``dags/sql/silver/whoscored_player_match_aggregate.sql`` (#572).
 Strategy
 --------
 This Silver aggregate counts WhoScored ``goals`` / ``shots`` / ``shots_on_target``
-directly from ``bronze.whoscored_events`` per Opta ``type``. Own-goals are NOT a
+directly from ``bronze.whoscored_events_current`` per Opta ``type``. Own-goals are NOT a
 distinct ``type='OwnGoal'`` row — they arrive as ``type='Goal'`` carrying the
 qualifier ``"displayName":"OwnGoal"`` (#572 finding). They must NOT be credited
 as a goal/shot to the scorer (the defender who deflected into his own net).
 
 We reuse the ``test_spadl_mapping.py`` DuckDB-bridge approach: seed a fixture
 ``bronze_whoscored_events`` table, rewrite the two Trino-specific constructs the
-file uses (``iceberg.bronze.whoscored_events`` ref + ``regexp_like``) into DuckDB
+file uses (the Bronze current-view ref + ``regexp_like``) into DuckDB
 spelling, and execute the SELECT. DuckDB (>=1.5) supports ``COUNT_IF`` natively.
 """
 
@@ -47,7 +47,10 @@ def _translate_trino_to_duckdb(sql: str) -> str:
       * ``regexp_like`` -> ``regexp_matches`` (identical POSIX-regex semantics).
     ``COUNT_IF`` / ``COALESCE`` / ``ROW_NUMBER OVER`` are DuckDB-native.
     """
-    sql = sql.replace("iceberg.bronze.whoscored_events", "bronze_whoscored_events")
+    sql = sql.replace(
+        "iceberg.bronze.whoscored_events_current",
+        "bronze_whoscored_events",
+    )
     sql = re.sub(r"\bregexp_like\s*\(", "regexp_matches(", sql, flags=re.IGNORECASE)
     return sql
 
@@ -59,7 +62,7 @@ def _read_sql() -> str:
 # Bronze columns the player_match_aggregate SELECT consumes (dedup natural key
 # adds period/minute/second; the rest are projected/counted).
 _BRONZE_COLUMNS: List[str] = [
-    "game_id", "period", "minute", "second",
+    "game_id", "source_event_id", "period", "minute", "second",
     "type", "outcome_type", "team_id", "player_id",
     "qualifiers", "league", "season", "_ingested_at",
 ]
@@ -68,6 +71,7 @@ _BRONZE_COLUMNS: List[str] = [
 def _row(
     *,
     game_id: int = 100,
+    source_event_id: Optional[int] = None,
     period: str = "FirstHalf",
     minute: int = 5,
     second: int = 0,
@@ -83,6 +87,7 @@ def _row(
     """Build a single bronze fixture row with sensible defaults."""
     return {
         "game_id": game_id,
+        "source_event_id": source_event_id,
         "period": period,
         "minute": minute,
         "second": second,
@@ -120,6 +125,7 @@ def _seed_and_run(con, fixture_rows: List[Dict[str, Any]]) -> List[Dict[str, Any
         """
         CREATE TABLE bronze_whoscored_events (
             game_id       BIGINT,
+            source_event_id BIGINT,
             period        VARCHAR,
             minute        BIGINT,
             second        BIGINT,
