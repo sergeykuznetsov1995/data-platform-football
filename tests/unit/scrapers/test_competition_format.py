@@ -79,10 +79,28 @@ class TestIsSingleYear:
         from scrapers.utils.competition_format import is_single_year
         assert is_single_year(None, 2026) is False
 
-    def test_broken_env_falls_back_false_without_raise(self, reload_medallion):
+    def test_unlisted_tournament_season_stays_single_year(
+            self, reload_medallion):
+        # Historical backfill (WC 2022 — only the 2026 edition is configured):
+        # falling back to the club form would silently fetch the wrong-edition
+        # page, the exact class the old literal was immune to.
+        reload_medallion(env=None)
+        from scrapers.utils.competition_format import is_single_year
+        assert is_single_year('INT-World Cup', 2022) is True
+
+    def test_broken_env_club_league_falls_back_false(self, reload_medallion):
         reload_medallion(env='/nonexistent-medallion-920')
         from scrapers.utils.competition_format import is_single_year
-        assert is_single_year('INT-World Cup', 2026) is False
+        assert is_single_year('ENG-Premier League', 2025) is False
+
+    def test_broken_env_tournament_raises_not_club_fallback(
+            self, reload_medallion):
+        # A silent club fallback for an INT-* league IS the wrong-season /
+        # wrong-partition incident class — must raise, never return False.
+        reload_medallion(env='/nonexistent-medallion-920')
+        from scrapers.utils.competition_format import is_single_year
+        with pytest.raises(RuntimeError, match='INT-'):
+            is_single_year('INT-World Cup', 2026)
 
 
 @pytest.mark.unit

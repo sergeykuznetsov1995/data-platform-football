@@ -128,14 +128,17 @@ class TestValidateDataIncrementalNoop:
 
     @staticmethod
     def _patch_results(dag_module, monkeypatch, schedule_result, capture_result):
-        # Tournament-leg paths (#920 Phase 2) resolve to {} = missing file =
-        # silent skip, so these club-batch tests stay leg-agnostic.
+        # Tournament-leg paths (#920 Phase 2) resolve to the runner's healthy
+        # out-of-window marker, so these club-batch tests stay leg-agnostic
+        # (a missing leg file now WARNs — see TestValidateDataTournamentLegs).
+        skipped = {'skipped': 'out_of_window', 'errors': [], 'tables': []}
+
         def _fake_load(path, logger):
             if path == dag_module.MATCH_CAPTURE_RESULT_PATH:
                 return capture_result
             if path == dag_module.SCHEDULE_RESULT_PATH:
                 return schedule_result
-            return {}
+            return dict(skipped)
 
         monkeypatch.setattr(dag_module, '_load_result', _fake_load)
 
@@ -267,10 +270,15 @@ class TestValidateDataTournamentLegs:
         assert validation['status'] == 'success'
         assert validation['warnings'] == []
 
-    def test_missing_leg_files_are_silent(self, dag_module, monkeypatch):
+    def test_missing_leg_files_warn(self, dag_module, monkeypatch):
+        # The runner ALWAYS writes its output file (out-of-window runs write
+        # the 'skipped' marker) — a missing file means the runner died
+        # before writing and must not pass silently (review hardening).
         self._patch(dag_module, monkeypatch, {}, {})
         validation = dag_module.validate_data()
-        assert validation['warnings'] == []
+        assert validation['status'] == 'success'      # WARN-only, no escalation
+        missing = [w for w in validation['warnings'] if 'missing/unreadable' in w]
+        assert len(missing) == 2                       # schedule + capture legs
 
     def test_low_tournament_leg_warns_but_never_escalates(
             self, dag_module, monkeypatch):

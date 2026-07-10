@@ -82,13 +82,19 @@ class TestValidateTablePerLeague:
 
     _LEAGUES = ["ENG-Premier League", "INT-World Cup"]
 
-    def _patched(self, monkeypatch, counts):
+    def _patched(self, monkeypatch, counts, out_of_window=False):
         mod = _load_module()
         # Floors: EPL 340, WC 93 — the real competitions.yaml-derived values,
-        # pinned here so the test doesn't need MEDALLION_CONFIG_DIR.
+        # pinned here so the test doesn't need MEDALLION_CONFIG_DIR. The
+        # window predicate is pinned too — the real one flips when the WC
+        # window closes (2026-08-02) and would make these tests date-bombs.
         floors = {"ENG-Premier League": 340, "INT-World Cup": 93}
         monkeypatch.setattr(
             mod, "get_min_row_threshold", lambda key, lg: floors[lg]
+        )
+        monkeypatch.setattr(
+            mod, "_out_of_window_tournament",
+            lambda lg: out_of_window and lg.startswith("INT-"),
         )
         monkeypatch.setattr(mod, "bronze_count_by_league", lambda _t: counts)
         return mod
@@ -138,24 +144,77 @@ class TestValidateTablePerLeague:
         assert "INT-World Cup: 5 rows < 93" in msg
 
     @pytest.mark.unit
-    def test_whole_table_key_ignores_leagues(self, monkeypatch):
-        """Wipe-floor keys (no per-league base) must keep whole-table
-        semantics even when the caller passes a league scope — that's how
-        the sofifa loop covers sofifa_versions/player_ratings."""
+    def test_unregistered_key_with_leagues_refuses_downgrade(self, monkeypatch):
+        """Requesting per-league scope for a key without a per-league base
+        must raise, not silently fall back to the whole-table aggregate —
+        the silent downgrade would reintroduce the masking this API exists
+        to remove (a dev wires leagues= for a new table, forgets the
+        PER_LEAGUE_FLOOR_BASES entry, gets green aggregate checks)."""
+        mod = _load_module()
+        from airflow.exceptions import AirflowException
+
+        monkeypatch.setattr(
+            mod, "bronze_count",
+            lambda _t: (_ for _ in ()).throw(AssertionError("unreachable")),
+        )
+        with pytest.raises(
+            AirflowException, match="no PER_LEAGUE_FLOOR_BASES entry"
+        ):
+            mod.validate_table(
+                "espn_lineup", "espn_lineup", leagues=self._LEAGUES
+            )
+
+    @pytest.mark.unit
+    def test_empty_league_scope_falls_back_to_whole_table(self, monkeypatch):
+        """leagues=[] must NOT take the per-league path (zero floors, zero
+        checks, silent pass) — a derived scope that empties out falls back
+        to the whole-table floor (the sofifa NON_INTERNATIONAL_LEAGUES list
+        empties if LEAGUES ever goes tournament-only)."""
         mod = _load_module()
 
         def _no_group_by(_t):
-            raise AssertionError("per-league count must not run for wipe-floor keys")
+            raise AssertionError("per-league count must not run for []")
 
         monkeypatch.setattr(mod, "bronze_count_by_league", _no_group_by)
         monkeypatch.setattr(
-            mod, "bronze_count", lambda _t: mod.MIN_ROW_THRESHOLDS["espn_lineup"]
+            mod, "bronze_count",
+            lambda _t: mod.MIN_ROW_THRESHOLDS["whoscored_schedule"],
         )
-
         result = mod.validate_table(
-            "espn_lineup", "espn_lineup", leagues=self._LEAGUES
+            "whoscored_schedule", "whoscored_schedule", leagues=[]
         )
-        assert result["threshold"] == mod.MIN_ROW_THRESHOLDS["espn_lineup"]
+        assert result["threshold"] == mod.MIN_ROW_THRESHOLDS["whoscored_schedule"]
+
+    @pytest.mark.unit
+    def test_out_of_window_tournament_with_zero_rows_passes(self, monkeypatch):
+        """Pre-activation grace: a single-year tournament league with an
+        EMPTY partition outside its window is the healthy no-op state (the
+        yaml activation recipe adds the league weeks before the window
+        opens) — not a failure."""
+        mod = self._patched(
+            monkeypatch, {"ENG-Premier League": 9_500}, out_of_window=True
+        )
+        result = mod.validate_table(
+            "whoscored_schedule", "whoscored_schedule", leagues=self._LEAGUES
+        )
+        assert result["per_league"]["INT-World Cup"]["rows"] == 0
+
+    @pytest.mark.unit
+    def test_out_of_window_partial_partition_still_fails(self, monkeypatch):
+        """The grace covers ONLY rows == 0: a partially wiped tournament
+        partition below its floor fails, in or out of window."""
+        mod = self._patched(
+            monkeypatch,
+            {"ENG-Premier League": 9_500, "INT-World Cup": 40},
+            out_of_window=True,
+        )
+        from airflow.exceptions import AirflowException
+
+        with pytest.raises(AirflowException, match="INT-World Cup: 40 rows < 93"):
+            mod.validate_table(
+                "whoscored_schedule", "whoscored_schedule",
+                leagues=self._LEAGUES,
+            )
 
     @pytest.mark.unit
     def test_unknown_key_with_leagues_still_fails_closed(self, monkeypatch):
@@ -166,7 +225,9 @@ class TestValidateTablePerLeague:
             mod, "bronze_count",
             lambda _t: (_ for _ in ()).throw(AssertionError("unreachable")),
         )
-        with pytest.raises(AirflowException, match="missing key 'nope_table'"):
+        with pytest.raises(
+            AirflowException, match="no PER_LEAGUE_FLOOR_BASES entry"
+        ):
             mod.validate_table("nope", "nope_table", leagues=self._LEAGUES)
 
     @pytest.mark.unit

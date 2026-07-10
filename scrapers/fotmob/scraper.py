@@ -447,6 +447,10 @@ class FotMobScraper(BaseScraper):
             if not all_matches:
                 all_matches = match_data.get('data', {}).get('allMatches', [])
 
+            # Hoisted out of the loop: the lookup re-reads competitions.yaml
+            # metadata per call, and league is fixed for the whole schedule.
+            group_knockout = is_group_knockout(league)
+
             for match in all_matches:
                 status = match.get('status', {})
                 score_str = status.get('scoreStr', '')
@@ -476,7 +480,7 @@ class FotMobScraper(BaseScraper):
                     # group_knockout tournaments: roundName duplicates the
                     # stage already carried by 'round' — keep it None
                     # (#913 WC convention, generalized in #920 Phase 3).
-                    'round_name': (str(match.get('roundName')) if match.get('roundName') is not None else None) if not is_group_knockout(league) else None,
+                    'round_name': (str(match.get('roundName')) if match.get('roundName') is not None else None) if not group_knockout else None,
                 }
                 matches.append(match_info)
 
