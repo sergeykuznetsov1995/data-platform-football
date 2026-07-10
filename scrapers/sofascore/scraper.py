@@ -98,13 +98,10 @@ def _season_to_short(season) -> str:
 
 def _is_single_year(league: str, season) -> bool:
     """True when (league, season) is a single_year competition per
-    ``competitions.yaml`` (INT-World Cup 2026, #913). False on any lookup
-    failure (medallion config unavailable outside the Airflow container)."""
-    try:
-        from dags.utils.medallion_config import get_competition_season_format
-        return get_competition_season_format(league, int(season)) == 'single_year'
-    except Exception:
-        return False
+    ``competitions.yaml`` (INT-World Cup 2026, #913). Delegates to the shared
+    scraper helper (#920 Phase 3 — one implementation for all scrapers)."""
+    from scrapers.utils.competition_format import is_single_year
+    return is_single_year(league, season)
 
 
 def _season_label(league: str, season) -> str:

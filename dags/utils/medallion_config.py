@@ -59,10 +59,19 @@ import yaml
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
-# Default container path; override via env var for unit tests on the host.
-# In the Airflow image, configs/ is bind-mounted at /opt/airflow/configs.
+# Default container path; override via env var. On hosts without the container
+# mount (unit tests, console runs) fall back to the repo checkout relative to
+# this file (dags/utils/ -> <repo>/configs/medallion). Without the fallback,
+# every host-side caller of the scraper helpers silently landed in their
+# except-branch club default ('split_year') — the exact silent wrong-season
+# class of the 2026-07-09 WC bronze incident (#920 Phase 3). In the Airflow
+# image both candidates resolve to the same bind-mounted /opt/airflow path.
+_CONTAINER_CONFIG_DIR = Path('/opt/airflow/configs/medallion')
+_REPO_CONFIG_DIR = Path(__file__).resolve().parents[2] / 'configs' / 'medallion'
 CONFIG_DIR = Path(
-    os.environ.get('MEDALLION_CONFIG_DIR', '/opt/airflow/configs/medallion')
+    os.environ.get('MEDALLION_CONFIG_DIR')
+    or (_CONTAINER_CONFIG_DIR if _CONTAINER_CONFIG_DIR.is_dir()
+        else _REPO_CONFIG_DIR)
 )
 
 TEAM_ALIASES_FILE = 'team_aliases.yaml'
@@ -1463,6 +1472,23 @@ def get_competition_floor_basis(competition_id: str) -> Tuple[int, int]:
     raise MedallionConfigError(
         f"competition not found in competitions.yaml: {competition_id!r}"
     )
+
+
+def get_competition_format(competition_id: str) -> str:
+    """Top-level ``competition_format`` ('group_knockout' for cup
+    tournaments), default 'league' — club leagues omit the field.
+
+    Drives scraper branches that depend on PAYLOAD SHAPE (group standings
+    tables, stage-shaped calendars), not on season windows: single-year
+    round-robin leagues exist (Brasileirão class), so this must NOT alias
+    season_format (#920 Phase 3). Unknown competition -> 'league', mirroring
+    get_competition_season_format's silent club default.
+    """
+    doc = load_competitions()
+    for c in doc['competitions']:
+        if c['id'] == competition_id:
+            return c.get('competition_format', 'league')
+    return 'league'
 
 
 def get_active_single_year_season(
