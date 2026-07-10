@@ -334,7 +334,20 @@ def main() -> int:
             )
             leagues = [l for l in leagues if l != 'INT-World Cup']
         else:
-            seasons = [2026]
+            # #920 bridge: the tournament year comes from competitions.yaml
+            # (was a 2026 hardcode); out of window the run is a clean no-op.
+            from utils.medallion_config import get_active_single_year_season
+            _wc_season = get_active_single_year_season('INT-World Cup')
+            if _wc_season is None:
+                logger.warning(
+                    "INT-World Cup is out of its tournament window — nothing "
+                    "to scrape; exiting 0.")
+                with open(args.output, 'w') as f:
+                    json.dump({'rows': 0, 'errors': [], 'tables': [],
+                               'tables_by_entity': {},
+                               'skipped': 'out_of_window'}, f)
+                return 0
+            seasons = [int(_wc_season)]
 
     logger.info(
         f"Starting WhoScored scraper: leagues={leagues}, seasons={seasons}, "
