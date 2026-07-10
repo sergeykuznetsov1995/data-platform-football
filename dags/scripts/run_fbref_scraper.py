@@ -491,6 +491,13 @@ def main():
         default=None,
         help='Path to file with proxies (format: host:port:user:pass)'
     )
+    parser.add_argument(
+        '--raw-store-uri',
+        type=str,
+        default=None,
+        help='Raw-first store URI. Defaults to FBREF_RAW_STORE_URI; used only '
+             'by the active FBref match-page path.'
+    )
 
     # === Selenium-specific arguments ===
     parser.add_argument(
@@ -977,6 +984,7 @@ def main():
                 proxy_file=args.proxy_file,
                 use_nodriver=args.use_nodriver,
                 nodriver_cloudflare_wait=args.nodriver_cloudflare_wait,
+                raw_store_uri=args.raw_store_uri,
             ) as scraper:
 
                 # =============================================================

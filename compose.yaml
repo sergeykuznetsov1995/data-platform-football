@@ -32,6 +32,13 @@ x-airflow-common: &airflow-common
     AIRFLOW__WEBSERVER__EXPOSE_CONFIG: ${AIRFLOW__WEBSERVER__EXPOSE_CONFIG}
     TRINO_PASSWORD: ${TRINO_PASSWORD}
     TRINO_PORT: ${TRINO_PORT}
+    # Raw-first FBref pages share the existing SeaweedFS bucket but live
+    # outside Iceberg table prefixes. The parser uses pyarrow.fs directly.
+    S3_ACCESS_KEY: ${S3_ACCESS_KEY}
+    S3_SECRET_KEY: ${S3_SECRET_KEY}
+    FBREF_RAW_STORE_URI: s3://${ICEBERG_WAREHOUSE}/raw/fbref
+    FBREF_RAW_S3_ENDPOINT: seaweedfs:8333
+    FBREF_RAW_S3_SCHEME: http
     # Route FlareSolverr scrapers (WhoScored/SoFIFA) through the ad-tech filter (#652).
     # Off by default — set to http://proxy_filter:8899 to cut residential traffic.
     PROXY_FILTER_URL: ${PROXY_FILTER_URL:-}
