@@ -108,8 +108,8 @@ def main():
     # Mixed club+WC calls can't carry two seasons -> WC is dropped (dedicated
     # call), mirroring run_whoscored_scraper / run_fbref_scraper.
     if 'INT-World Cup' in leagues:
-        from utils.medallion_config import get_active_single_year_season
-        _wc_season = get_active_single_year_season('INT-World Cup')
+        from utils.medallion_config import get_active_season
+        _wc_season = get_active_season('INT-World Cup')
         if len(leagues) > 1:
             logger.warning(
                 "INT-World Cup dropped from mixed call (needs its own season; "

@@ -106,8 +106,12 @@ def validate_data(**context) -> Dict[str, Any]:
     # Пороги масштабируются от числа лиг: ~546 игроков и 20 клубов на лигу
     # (floor'ы = MIN_ROW_THRESHOLDS на лигу). Прежние константы (1000/100)
     # были рассчитаны на несколько лиг и шумели warning'ом на КАЖДОМ успешном
-    # APL-ране (546 players / 20 teams).
-    n_leagues = max(1, len(LEAGUES))
+    # APL-ране (546 players / 20 teams). Считаем только клубные лиги —
+    # SoFIFA не покрывает международные турниры (INT-World Cup и т.п., #913),
+    # иначе их появление в LEAGUES задвоило бы floor и зашумило здоровый
+    # однолиговый ран (тот же фильтр, что уже применяется к
+    # MIN_ROW_THRESHOLDS['sofifa_*'] в utils/config.py).
+    n_leagues = max(1, len([lg for lg in LEAGUES if not lg.startswith('INT-')]))
     if validation['summary']['players_rows'] < 450 * n_leagues:
         validation['warnings'].append("Low player count - possible scraping issue")
 

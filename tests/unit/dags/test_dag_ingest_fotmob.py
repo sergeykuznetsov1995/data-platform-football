@@ -28,9 +28,25 @@ def _reload_dag_module():
     """Force a fresh import of the FotMob DAG module so each test sees
     a clean ``BashOperator._instances`` list (the stubbed BashOperator
     registers every constructed instance globally for inspection)."""
+    from pathlib import Path
+
     from airflow.operators.bash import BashOperator  # stub
 
     BashOperator._instances.clear()
+
+    # #920 Phase 1: the DAG module now calls is_single_year_competition() at
+    # import time to build its task graph — point CONFIG_DIR at the real
+    # shipped configs/medallion (on the host, it otherwise defaults to
+    # /opt/airflow/configs/medallion, which only exists in the container).
+    # CONFIG_DIR is resolved once at medallion_config import time, so patch
+    # the module attribute directly (mirrors
+    # tests/unit/sql/test_dim_competition_render.py).
+    from utils import medallion_config
+
+    medallion_config.CONFIG_DIR = (
+        Path(__file__).resolve().parents[3] / "configs" / "medallion"
+    )
+    medallion_config.reset_cache()
 
     # Drop cached module so DAG body re-executes (and re-creates operators)
     sys.modules.pop("dag_ingest_fotmob", None)
@@ -145,3 +161,53 @@ class TestFotmobSeasonBackfillParam:
             "season must be rendered from params.season at runtime so the "
             "backfill override takes effect"
         )
+
+
+class TestTournamentFanOut:
+    """#920 Phase 1: club leagues stay in the original scrape_fotmob_data
+    task (task_id/output/Jinja-season unchanged); each single-year tournament
+    (e.g. INT-World Cup) gets its own dedicated task, always present in the
+    graph (the runner's own #920 bridge resolves/no-ops it)."""
+
+    @pytest.mark.unit
+    def test_club_task_excludes_tournament_leagues(self):
+        _reload_dag_module()
+
+        from airflow.operators.bash import BashOperator  # stub
+
+        task = next(
+            op for op in BashOperator._instances
+            if op.task_id == "scrape_fotmob_data"
+        )
+        assert '--leagues "ENG-Premier League"' in task.bash_command
+        assert "INT-World Cup" not in task.bash_command
+        assert "/tmp/fotmob_result.json" in task.bash_command
+
+    @pytest.mark.unit
+    def test_tournament_task_exists_dedicated(self):
+        _reload_dag_module()
+
+        from airflow.operators.bash import BashOperator  # stub
+
+        task = next(
+            (op for op in BashOperator._instances
+             if op.task_id == "scrape_fotmob_data_int_world_cup"),
+            None,
+        )
+        assert task is not None
+        assert '--leagues "INT-World Cup"' in task.bash_command
+        assert "--season {{ params.season }}" in task.bash_command
+        assert "/tmp/fotmob_result_int_world_cup.json" in task.bash_command
+
+    @pytest.mark.unit
+    def test_club_only_leagues_produce_no_tournament_task(self, monkeypatch):
+        import utils.config as config
+
+        monkeypatch.setattr(config, "LEAGUES", ["ENG-Premier League"])
+        _reload_dag_module()
+
+        from airflow.operators.bash import BashOperator  # stub
+
+        task_ids = {op.task_id for op in BashOperator._instances}
+        assert "scrape_fotmob_data_int_world_cup" not in task_ids
+        assert "scrape_fotmob_data" in task_ids

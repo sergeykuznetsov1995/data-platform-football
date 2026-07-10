@@ -36,7 +36,7 @@ def _reload_dag_module():
 
 
 @pytest.fixture
-def dag_module():
+def dag_module(real_medallion_config_dir):
     return _reload_dag_module()
 
 
@@ -370,6 +370,64 @@ class TestSeasonRenderedFromParams:
         assert '--season {{ params.season }}' in task.bash_command, (
             f"{task_id} does not render season from params"
         )
+
+
+class TestTournamentFanOut:
+    """#920 Phase 1: club leagues stay batched in the original tasks
+    (task_id/output/Jinja-season unchanged — regression guard for the
+    'клубные лиги не должны измениться' acceptance criterion); each
+    single-year tournament (e.g. INT-World Cup) gets its own dedicated
+    schedule + match_capture task, present in the graph year-round (the
+    runner's own #920 bridge resolves/no-ops it, not DAG-parse-time date
+    logic)."""
+
+    def test_club_schedule_task_excludes_tournament_leagues(self, dag_module):
+        task = _bash_task('scrape_sofascore_data')
+        assert task is not None
+        assert '--leagues "ENG-Premier League"' in task.bash_command
+        assert 'INT-World Cup' not in task.bash_command
+
+    def test_club_schedule_task_output_path_unchanged(self, dag_module):
+        task = _bash_task('scrape_sofascore_data')
+        assert '/tmp/sofascore_result.json' in task.bash_command
+
+    def test_tournament_schedule_task_exists_dedicated(self, dag_module):
+        task = _bash_task('scrape_sofascore_data_int_world_cup')
+        assert task is not None
+        assert '--leagues "INT-World Cup"' in task.bash_command
+        assert '--season {{ params.season }}' in task.bash_command
+        assert '/tmp/sofascore_result_int_world_cup.json' in task.bash_command
+
+    def test_club_match_capture_task_id_and_output_unchanged(self, dag_module):
+        task = _bash_task('scrape_match_capture')
+        assert task is not None
+        assert '--league "ENG-Premier League"' in task.bash_command
+        assert '/tmp/sofascore_match_capture_result.json' in task.bash_command
+        assert 'int_world_cup' not in task.bash_command
+
+    def test_tournament_match_capture_task_exists_dedicated(self, dag_module):
+        task = _bash_task('scrape_match_capture_int_world_cup')
+        assert task is not None
+        assert '--league "INT-World Cup"' in task.bash_command
+        assert '--season {{ params.season }}' in task.bash_command
+        assert (
+            '/tmp/sofascore_match_capture_result_int_world_cup.json'
+            in task.bash_command
+        )
+
+    def test_club_only_leagues_produce_no_tournament_tasks(
+        self, monkeypatch, real_medallion_config_dir,
+    ):
+        import utils.config as config
+
+        monkeypatch.setattr(config, 'LEAGUES', ['ENG-Premier League'])
+        _reload_dag_module()
+
+        assert _bash_task('scrape_sofascore_data_int_world_cup') is None
+        assert _bash_task('scrape_match_capture_int_world_cup') is None
+        # the club tasks must still exist untouched
+        assert _bash_task('scrape_sofascore_data') is not None
+        assert _bash_task('scrape_match_capture') is not None
 
 
 class TestValidatePlayerData:
