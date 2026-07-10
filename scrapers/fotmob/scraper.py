@@ -136,6 +136,11 @@ class FotMobScraper(BaseScraper):
         'UEFA-Champions League': '42',
         'UEFA-Europa League': '73',
         'INT-World Cup': '77',
+        # #920 Phase 3 — live-verified via /api/data/leagues?id=X (T0 recon);
+        # NB id=290 — это Asian Cup, НЕ AFCON.
+        'INT-European Championship': '50',
+        'INT-Africa Cup of Nations': '289',
+        'INT-Copa America': '44',
     }
 
     def __init__(

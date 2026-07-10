@@ -422,3 +422,80 @@ competitions:
       fallback: []
     in_scope: true
     notes: "ЧМ-2026 (issue #913 Phase 1). 5 источников. single-year сезон. Bronze ingest до финала 19 июля."
+
+  # ---------------------------------------------------------------------------
+  # #920 Phase 3: онбординг следующих турниров сборных. ID источников —
+  # live-verified (docs/research/T0_tournaments_2027_2028_recon.md).
+  # in_scope: false = не материализованы в Gold (данных ещё нет). Активация
+  # ближе к турниру: добавить id в config.py LEAGUES (+WHOSCORED_LEAGUES),
+  # flip in_scope — окна Phase 1 гарантируют no-op до старта.
+  # Отборочные циклы (multi-year) сознательно ВНЕ scope — см. PR #920 Phase 3.
+  # ---------------------------------------------------------------------------
+
+  - id: "INT-European Championship"
+    name: "UEFA European Championship"
+    country: "Europe"
+    tier: 1
+    competition_format: group_knockout
+    is_international: true
+    seasons:
+      - id: 2028
+        season_format: single_year
+        format: group_knockout
+        team_count: 24
+        # 36 групповых (6 групп x 4 RR) + 15 плей-офф (R16..финал, БЕЗ матча
+        # за 3-е место — у Евро его нет).
+        match_count: 51
+        start: "2028-06-09"
+        end: "2028-07-09"
+    sources:
+      primary: ["fbref", "fotmob", "sofascore", "espn", "whoscored"]
+      fallback: []
+    in_scope: false
+    notes: "Euro 2028 (#920 Phase 3, finals only). Хозяева ENG/SCO/WAL/IRL; открытие Кардифф 09.06, финал Уэмбли 09.07 (анонс UEFA). Активация ≈ 2028-05."
+
+  - id: "INT-Africa Cup of Nations"
+    name: "Africa Cup of Nations"
+    country: "Africa"
+    tier: 1
+    competition_format: group_knockout
+    is_international: true
+    seasons:
+      - id: 2027
+        season_format: single_year
+        format: group_knockout
+        team_count: 24
+        # 36 групповых + 16 плей-офф (R16..финал, ВКЛ. матч за 3-е место) —
+        # формат 24 команд, как в розыгрышах 2023/2025.
+        match_count: 52
+        start: "2027-06-19"
+        end: "2027-07-17"
+    sources:
+      primary: ["fbref", "fotmob", "sofascore", "espn", "whoscored"]
+      fallback: []
+    in_scope: false
+    notes: "AFCON 2027 (#920 Phase 3, finals only). Хозяева KEN/UGA/TAN (PAMOJA), даты — официальный анонс CAF. Активация ≈ 2027-05."
+
+  - id: "INT-Copa America"
+    name: "Copa América"
+    country: "South America"
+    tier: 1
+    competition_format: group_knockout
+    is_international: true
+    seasons:
+      # Хозяин/даты/формат розыгрыша-2028 НЕ объявлены (CONMEBOL). start/end
+      # сознательно отсутствуют: get_active_single_year_season пропускает
+      # бездатные сезоны -> перманентный no-op до анонса. Даты НЕ выдумывать —
+      # фиктивное окно может открыть live-scrape (класс инцидента 2026-07-09).
+      - id: 2028
+        season_format: single_year
+        format: group_knockout
+        # 16 команд / 32 матча — экстраполяция формата-2024, официально TBA;
+        # уточнить при активации вместе с датами.
+        team_count: 16
+        match_count: 32
+    sources:
+      primary: ["fbref", "fotmob", "sofascore", "espn", "whoscored"]
+      fallback: []
+    in_scope: false
+    notes: "Copa América 2028 (#920 Phase 3, provisional). Хозяин TBA (Эквадор по ротации / США / ARG-PAR-URU). Активация = заполнить start/end + team/match_count по анонсу, добавить в LEAGUES, flip in_scope."

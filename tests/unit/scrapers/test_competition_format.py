@@ -118,6 +118,23 @@ class TestSeasonFormatConsumers:
         assert s._format_season(2024, 'ENG-Premier League') == '2024/2025'
         assert s._format_season(2024) == '2024/2025'
 
+    def test_onboarded_tournaments_get_single_year_form(self, reload_medallion):
+        # The Phase-3 acceptance case: Euro 2028 must NOT get the club
+        # '2028-2029' page (the exact silent wrong-edition failure that
+        # required onboarding to be code, not config).
+        reload_medallion(env=None)
+        from scrapers.fbref.url_builder import format_season, get_schedule_url
+        assert format_season(2028, 'INT-European Championship') == '2028'
+        assert '/676/2028/' in get_schedule_url('INT-European Championship', 2028)
+        from scrapers.utils.competition_format import (
+            is_group_knockout, is_single_year, is_single_year_competition,
+        )
+        assert is_single_year_competition('INT-Africa Cup of Nations') is True
+        # Copa América: season_format resolvable even while the season is
+        # inert (no start/end until CONMEBOL announces).
+        assert is_single_year('INT-Copa America', 2028) is True
+        assert is_group_knockout('INT-European Championship') is True
+
 
 @pytest.mark.unit
 class TestIsGroupKnockout:
