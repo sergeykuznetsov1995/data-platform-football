@@ -190,7 +190,8 @@ home AS (
         m.home_yellow_cards AS yellow_cards,
         m.home_red_cards   AS red_cards,
         m.home_saves       AS saves,
-        dm.is_completed
+        dm.is_completed,
+        dm.is_knockout
     FROM iceberg.gold.dim_match dm
     JOIN iceberg.silver.fbref_match_enriched m ON m.match_id = dm.match_id
 ),
@@ -212,7 +213,8 @@ away AS (
         m.away_yellow_cards AS yellow_cards,
         m.away_red_cards   AS red_cards,
         m.away_saves       AS saves,
-        dm.is_completed
+        dm.is_completed,
+        dm.is_knockout
     FROM iceberg.gold.dim_match dm
     JOIN iceberg.silver.fbref_match_enriched m ON m.match_id = dm.match_id
 ),
@@ -250,7 +252,7 @@ SELECT
     -- matches, is_completed = FALSE) fall through to NULL, not 0/'L'.
     -- #913 Phase 3: points meaningless for knockout (WC etc.); NULL when is_knockout.
     CASE
-        WHEN dm.is_knockout THEN NULL
+        WHEN u.is_knockout THEN NULL
         WHEN u.goals_for > u.goals_against THEN 3
         WHEN u.goals_for = u.goals_against THEN 1
         WHEN u.goals_for < u.goals_against THEN 0
