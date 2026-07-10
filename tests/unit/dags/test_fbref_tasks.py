@@ -3,7 +3,8 @@
 ``task_id_suffix`` lets ``dag_ingest_fbref.py`` build a second, parallel
 mini-pipeline for a single-year tournament (e.g. INT-World Cup) without
 colliding with the default (club) call's task_id/output_file/traffic-output
-path. Default ``''`` must leave existing callers byte-identical.
+path. Default ``''`` keeps the original task IDs while paths stay quoted and
+run-scoped through ``artifact_dir``.
 """
 
 from __future__ import annotations
@@ -20,9 +21,9 @@ class TestTaskIdSuffixDefaultsToUnchangedBehavior:
             leagues_str='ENG-Premier League', season=2025,
         )
         assert task.task_id == 'season_stats_all'
-        assert '--output /tmp/fbref_season_stats.json' in task.bash_command
+        assert '--output "/tmp/fbref_season_stats.json"' in task.bash_command
         assert (
-            '--traffic-output /tmp/fbref_traffic_season_stats.json'
+            '--traffic-output "/tmp/fbref_traffic_season_stats.json"'
             in task.bash_command
         )
 
@@ -34,9 +35,9 @@ class TestTaskIdSuffixDefaultsToUnchangedBehavior:
             season=2025, scraper_type='selenium',
         )
         assert task.task_id == 'match_schedule'
-        assert '--output /tmp/fbref_match_schedule.json' in task.bash_command
+        assert '--output "/tmp/fbref_match_schedule.json"' in task.bash_command
         assert (
-            '--traffic-output /tmp/fbref_traffic_match_schedule.json'
+            '--traffic-output "/tmp/fbref_traffic_match_schedule.json"'
             in task.bash_command
         )
 
@@ -47,9 +48,9 @@ class TestTaskIdSuffixDefaultsToUnchangedBehavior:
             leagues_str='ENG-Premier League', season=2025,
         )
         assert task.task_id == 'match_all_data'
-        assert '--output /tmp/fbref_match_all_data.json' in task.bash_command
+        assert '--output "/tmp/fbref_match_all_data.json"' in task.bash_command
         assert (
-            '--traffic-output /tmp/fbref_traffic_match_all_data.json'
+            '--traffic-output "/tmp/fbref_traffic_match_all_data.json"'
             in task.bash_command
         )
 
@@ -63,9 +64,9 @@ class TestTaskIdSuffixParametrizesEverything:
             leagues_str='INT-World Cup', season=2026, task_id_suffix='_wc',
         )
         assert task.task_id == 'season_stats_all_wc'
-        assert '--output /tmp/fbref_season_stats_wc.json' in task.bash_command
+        assert '--output "/tmp/fbref_season_stats_wc.json"' in task.bash_command
         assert (
-            '--traffic-output /tmp/fbref_traffic_season_stats_wc.json'
+            '--traffic-output "/tmp/fbref_traffic_season_stats_wc.json"'
             in task.bash_command
         )
 
@@ -77,9 +78,9 @@ class TestTaskIdSuffixParametrizesEverything:
             scraper_type='selenium', task_id_suffix='_wc',
         )
         assert task.task_id == 'match_schedule_wc'
-        assert '--output /tmp/fbref_match_schedule_wc.json' in task.bash_command
+        assert '--output "/tmp/fbref_match_schedule_wc.json"' in task.bash_command
         assert (
-            '--traffic-output /tmp/fbref_traffic_match_schedule_wc.json'
+            '--traffic-output "/tmp/fbref_traffic_match_schedule_wc.json"'
             in task.bash_command
         )
 
@@ -90,9 +91,9 @@ class TestTaskIdSuffixParametrizesEverything:
             leagues_str='INT-World Cup', season=2026, task_id_suffix='_wc',
         )
         assert task.task_id == 'match_all_data_wc'
-        assert '--output /tmp/fbref_match_all_data_wc.json' in task.bash_command
+        assert '--output "/tmp/fbref_match_all_data_wc.json"' in task.bash_command
         assert (
-            '--traffic-output /tmp/fbref_traffic_match_all_data_wc.json'
+            '--traffic-output "/tmp/fbref_traffic_match_all_data_wc.json"'
             in task.bash_command
         )
 
@@ -148,10 +149,10 @@ class TestBuildCommandTrafficOutputFlag:
             season=2026, output_file='/tmp/fbref_season_stats_wc.json',
             headless=True, use_xvfb=True, use_nodriver=True,
             nodriver_cloudflare_wait=30.0, proxy_file=None,
-            traffic_output='/tmp/fbref_traffic_season_stats_wc.json',
+            traffic_output_file='/tmp/fbref_traffic_season_stats_wc.json',
         )
         assert (
-            '--traffic-output /tmp/fbref_traffic_season_stats_wc.json' in cmd
+            '--traffic-output "/tmp/fbref_traffic_season_stats_wc.json"' in cmd
         )
 
     def test_nodriver_command_includes_flag_when_set(self):
@@ -163,8 +164,8 @@ class TestBuildCommandTrafficOutputFlag:
             use_xvfb=True, proxy_file=None, cloudflare_wait=30.0,
             content_timeout=45.0, max_retries=2, cf_verify_retries=6,
             match_data_type='schedule',
-            traffic_output='/tmp/fbref_traffic_match_schedule_wc.json',
+            traffic_output_file='/tmp/fbref_traffic_match_schedule_wc.json',
         )
         assert (
-            '--traffic-output /tmp/fbref_traffic_match_schedule_wc.json' in cmd
+            '--traffic-output "/tmp/fbref_traffic_match_schedule_wc.json"' in cmd
         )

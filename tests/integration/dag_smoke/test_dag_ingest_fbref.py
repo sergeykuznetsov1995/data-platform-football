@@ -154,16 +154,39 @@ class TestFBrefTaskDependencies:
         assert any(tid.startswith('match_data.') for tid in upstream_ids), \
             f"validate_all_data must depend on match_data group, got: {upstream_ids}"
 
-    def test_validate_task_has_trigger_rule_all_done(self, fbref_dag):
-        """Test that validate task runs even if some upstream tasks fail."""
+    def test_validate_task_requires_successful_producers(self, fbref_dag):
+        """Validation must not turn a failed producer into a green path."""
         validate_task = fbref_dag.task_dict.get('validate_all_data')
 
         if validate_task is None:
             pytest.skip("Validate task not found")
 
-        # Should use 'all_done' trigger rule to run even if some tasks fail
-        assert validate_task.trigger_rule == 'all_done', \
-            f"Expected trigger_rule='all_done', got: {validate_task.trigger_rule}"
+        assert validate_task.trigger_rule == 'all_success', \
+            f"Expected trigger_rule='all_success', got: {validate_task.trigger_rule}"
+
+        upstream_ids = {t.task_id for t in validate_task.upstream_list}
+        assert upstream_ids == {
+            'match_data.match_all_data',
+            'match_data.traffic_guard_match_all_data',
+        }
+
+    def test_observers_do_not_mask_producer_failures(self, fbref_dag):
+        trino_first = fbref_dag.task_dict['match_data.check_trino_health']
+        trino_second = fbref_dag.task_dict[
+            'match_data.check_trino_before_match'
+        ]
+        trigger = fbref_dag.task_dict['trigger_silver_transform']
+
+        assert {t.task_id for t in trino_first.upstream_list} == {
+            'season_stats_all', 'traffic_guard_season_stats',
+        }
+        assert {t.task_id for t in trino_second.upstream_list} == {
+            'match_data.match_schedule',
+            'match_data.traffic_guard_match_schedule',
+        }
+        assert {t.task_id for t in trigger.upstream_list} == {
+            'validate_all_data', 'report_proxy_traffic',
+        }
 
 
 @pytest.mark.integration
@@ -184,7 +207,7 @@ class TestFBrefTaskConfiguration:
         season_task = fbref_dag.task_dict['season_stats_all']
         assert '--mode combined_season_stats' in season_task.bash_command, \
             "Expected --mode combined_season_stats in season_stats_all bash_command"
-        assert 'rm -f /tmp/fbref_player_' in season_task.bash_command, \
+        assert '/fbref_player_' in season_task.bash_command, \
             "Expected stale per-stat JSON cleanup in season_stats_all bash_command"
 
     def test_match_data_tasks_modes(self, fbref_dag):
@@ -198,6 +221,39 @@ class TestFBrefTaskConfiguration:
             "Expected --mode match_data in match_schedule bash_command"
         assert '--mode combined_match_data' in match_all.bash_command, \
             "Expected --mode combined_match_data in match_all_data bash_command"
+
+    def test_runtime_scope_params_are_rendered(self, fbref_dag):
+        """League and chunk params must affect commands, not be dead UI."""
+        season = fbref_dag.task_dict['season_stats_all'].bash_command
+        schedule = fbref_dag.task_dict['match_data.match_schedule'].bash_command
+        matches = fbref_dag.task_dict['match_data.match_all_data'].bash_command
+
+        assert 'params.leagues' in fbref_dag.task_dict[
+            'season_stats_all'
+        ].env['FBREF_LEAGUES']
+        assert 'params.leagues' in fbref_dag.task_dict[
+            'match_data.match_schedule'
+        ].env['FBREF_LEAGUES']
+        assert 'params.leagues' in fbref_dag.task_dict[
+            'match_data.match_all_data'
+        ].env['FBREF_LEAGUES']
+        assert 'params.max_matches' in matches
+
+    def test_artifacts_are_scoped_to_airflow_run(self, fbref_dag):
+        season = fbref_dag.task_dict['season_stats_all']
+        schedule = fbref_dag.task_dict['match_data.match_schedule']
+        matches = fbref_dag.task_dict['match_data.match_all_data']
+
+        for task in (season, schedule, matches):
+            assert '/tmp/fbref_runs/' in task.bash_command
+            assert 'dag_run.id' in task.bash_command
+            assert '--traffic-output' in task.bash_command
+            assert '/tmp/fbref_runs/' in task.env['FBREF_RUN_DIR']
+
+        validate = fbref_dag.task_dict['validate_all_data']
+        report = fbref_dag.task_dict['report_proxy_traffic']
+        assert '/tmp/fbref_runs/' in validate.op_kwargs['result_dir']
+        assert '/tmp/fbref_runs/' in report.op_kwargs['glob_pattern']
 
     def test_dag_has_concurrency_limit(self, fbref_dag):
         """Test that DAG has concurrency limit for rate limiting."""

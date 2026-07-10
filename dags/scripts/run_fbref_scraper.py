@@ -237,6 +237,7 @@ def _get_traffic_diagnostics(scraper) -> dict:
     # real_bytes_*). Aggregated with CDP into total_proxy_*_by_resource_type
     # to give one canonical proxy-attribution view across both fetch paths.
     http_bytes = stats.get('http_bytes_downloaded', 0)
+    http_html_bytes = stats.get('http_html_bytes_downloaded', 0)
     http_requests = stats.get('http_requests_count', 0)
     http_bytes_by_rtype = dict(stats.get('http_bytes_by_resource_type', {}) or {})
     http_reqs_by_rtype = dict(stats.get('http_requests_by_resource_type', {}) or {})
@@ -306,6 +307,8 @@ def _get_traffic_diagnostics(scraper) -> dict:
         # Issue #124 — curl_cffi HTTP fast-path audit + CDP+HTTP aggregate.
         'http_bytes_downloaded': http_bytes,
         'http_mb_downloaded': round(http_bytes / 1024 / 1024, 3),
+        'http_html_bytes_downloaded': http_html_bytes,
+        'http_html_mb_downloaded': round(http_html_bytes / 1024 / 1024, 3),
         'http_requests_count': http_requests,
         'http_bytes_by_resource_type': http_bytes_by_rtype,
         'http_mb_by_resource_type': http_mb_by_rtype,
@@ -377,6 +380,9 @@ def _write_traffic_summary(
         'overhead_ratio': traffic.get('overhead_ratio'),
         # Issue #124 — curl_cffi HTTP fast-path audit + CDP+HTTP aggregate.
         'http_mb_downloaded': traffic.get('http_mb_downloaded', 0.0),
+        'http_html_mb_downloaded': traffic.get(
+            'http_html_mb_downloaded', 0.0
+        ),
         'http_requests_count': traffic.get('http_requests_count', 0),
         'http_mb_by_resource_type': traffic.get('http_mb_by_resource_type', {}),
         'http_requests_by_resource_type': traffic.get(
@@ -629,6 +635,14 @@ def main():
     # Configure logging AFTER parsing args so --verbose takes effect
     _configure_logging(verbose=args.verbose)
 
+    for artifact_path in (args.output, args.traffic_output):
+        if artifact_path:
+            os.makedirs(os.path.dirname(artifact_path) or '.', exist_ok=True)
+            try:
+                os.unlink(artifact_path)
+            except FileNotFoundError:
+                pass
+
     leagues = [l.strip() for l in args.leagues.split(',')]
 
     # #920 bridge: single_year tournaments must never inherit the club-formula
@@ -649,6 +663,23 @@ def main():
             logger.warning(
                 "INT-World Cup is out of its tournament window "
                 f"(competitions.yaml) — nothing to scrape; exiting 0.")
+            if args.mode == 'combined_season_stats':
+                traffic_label = 'season_stats'
+            elif args.mode == 'combined_match_data':
+                traffic_label = 'match_all_data'
+            elif args.mode == 'match_data':
+                traffic_label = f'match_{args.match_data_type}'
+            else:
+                traffic_label = args.mode
+            _write_noop_traffic_summary(
+                label=traffic_label,
+                mode=args.mode,
+                extra={
+                    'skipped': 'out_of_window',
+                    'league': 'INT-World Cup',
+                },
+                explicit_path=args.traffic_output,
+            )
             with open(args.output, 'w') as f:
                 json.dump({'mode': args.mode, 'tables': [], 'errors': [],
                            'skipped': 'out_of_window'}, f)
@@ -667,6 +698,7 @@ def main():
         'mode': args.mode,
         'scraper_type': args.scraper_type,
         'tables': [],
+        'fallback_files': [],
         'errors': [],
         'diagnostics': {}
     }
@@ -838,6 +870,16 @@ def main():
                         results['match_data_type'] = args.match_data_type
                         results['diagnostics']['scraper_stats'] = scraper.get_stats()
                         results['diagnostics']['traffic'] = _get_traffic_diagnostics(scraper)
+                        schedule_scope_errors = list(
+                            scraper._stats.get('scope_errors', []) or []
+                        )
+                        if schedule_scope_errors:
+                            results['diagnostics']['scope_errors'] = (
+                                schedule_scope_errors
+                            )
+                            results['errors'].extend(
+                                schedule_scope_errors
+                            )
 
                         # Issue #44: emit traffic JSON for the schedule task
                         # (nodriver-only path — selenium path handles its own).
@@ -1017,6 +1059,14 @@ def main():
                         'failures': scraper._stats.get('failures', 0),
                     }
                     results['diagnostics']['traffic'] = _get_traffic_diagnostics(scraper)
+                    match_scope_errors = list(
+                        scraper._stats.get('scope_errors', []) or []
+                    )
+                    if match_scope_errors:
+                        results['diagnostics']['scope_errors'] = (
+                            match_scope_errors
+                        )
+                        results['errors'].extend(match_scope_errors)
 
                     # Issue #44: emit /tmp/fbref_traffic_match_<type>.json
                     # for schedule / shot_events / etc. — currently only
@@ -1060,7 +1110,29 @@ def main():
                         incremental=not args.no_incremental,
                     )
 
-                    results['tables'] = list(scrape_results.values())
+                    fallback_results = {
+                        key: value
+                        for key, value in scrape_results.items()
+                        if key.endswith('_fallback')
+                    }
+                    iceberg_results = {
+                        key: value
+                        for key, value in scrape_results.items()
+                        if not key.endswith('_fallback')
+                    }
+                    results['tables'] = list(iceberg_results.values())
+                    results['fallback_files'] = list(
+                        fallback_results.values()
+                    )
+                    if fallback_results:
+                        results['diagnostics']['write_fallbacks'] = (
+                            fallback_results
+                        )
+                        results['errors'].append(
+                            'Iceberg persistence was incomplete; local JSON '
+                            f'fallbacks were written for '
+                            f'{sorted(fallback_results)}'
+                        )
                     results['mode'] = 'combined_match_data'
 
                     results['diagnostics']['scraper_stats'] = {
@@ -1103,12 +1175,63 @@ def main():
                     skipped = stats.get('skipped_league_seasons', 0)
                     schedule_source = stats.get('schedule_source', 'unknown')
                     trino_available = stats.get('trino_available', None)
+                    eligible_match_ids = int(
+                        stats.get('eligible_match_ids', 0) or 0
+                    )
+                    pending_match_ids = int(
+                        stats.get('pending_match_ids', 0) or 0
+                    )
+                    verified_noop = bool(
+                        stats.get('all_already_scraped', False)
+                    )
+                    verified_noop_paths = list(
+                        stats.get('verified_noop_table_paths', []) or []
+                    )
+                    missing_noop_tables = list(
+                        stats.get('missing_noop_tables', []) or []
+                    )
 
                     results['diagnostics']['schedule_source'] = schedule_source
                     results['diagnostics']['skipped_league_seasons'] = skipped
                     results['diagnostics']['trino_available'] = trino_available
+                    results['diagnostics']['eligible_match_ids'] = (
+                        eligible_match_ids
+                    )
+                    results['diagnostics']['pending_match_ids'] = (
+                        pending_match_ids
+                    )
+                    results['diagnostics']['missing_noop_tables'] = (
+                        missing_noop_tables
+                    )
+                    tombstone_refusals = list(
+                        stats.get('tombstone_guard_refusals', []) or []
+                    )
+                    if tombstone_refusals:
+                        results['diagnostics']['tombstone_guard_refusals'] = (
+                            tombstone_refusals
+                        )
+                        results['errors'].extend(tombstone_refusals)
+                    persistence_errors = list(
+                        stats.get('persistence_errors', []) or []
+                    )
+                    if persistence_errors:
+                        results['diagnostics']['persistence_errors'] = (
+                            persistence_errors
+                        )
+                        results['errors'].extend(persistence_errors)
+                    scope_errors = list(
+                        stats.get('scope_errors', []) or []
+                    )
+                    if scope_errors:
+                        results['diagnostics']['scope_errors'] = scope_errors
+                        results['errors'].extend(scope_errors)
+                    if skipped > 0:
+                        results['errors'].append(
+                            f"{skipped} requested league/season target(s) "
+                            "were skipped"
+                        )
 
-                    if not scrape_results:
+                    if not iceberg_results:
                         if trino_available is False and failures > 0:
                             error_msg = (
                                 f"Trino unavailable: schedule could not be read from Iceberg. "
@@ -1127,27 +1250,24 @@ def main():
                             )
                             logger.error(error_msg)
                             results['errors'].append(error_msg)
-                        elif successes == 0 and skipped == 0 and schedule_source in ('file', 'iceberg'):
-                            # Schedule was found but no new matches — everything already scraped.
-                            # This is NOT an error: incremental mode correctly detected all matches exist.
+                        elif verified_noop and verified_noop_paths:
+                            # The scraper verified eligible targets, no pending
+                            # IDs, no skipped scope, and all required tables.
                             logger.info(
-                                f"No new matches for combined_match_data — all matches already in Iceberg "
-                                f"(schedule_source={schedule_source}, successes={successes}, "
-                                f"failures={failures}, skipped={skipped})"
+                                "No new matches for combined_match_data — "
+                                "%d eligible IDs are already persisted",
+                                eligible_match_ids,
                             )
-                            # Populate tables with known Iceberg paths so downstream checks pass
-                            results['tables'] = [
-                                'iceberg.bronze.fbref_match_events',
-                                'iceberg.bronze.fbref_lineups',
-                                'iceberg.bronze.fbref_match_team_stats',
-                                'iceberg.bronze.fbref_match_player_stats',
-                            ]
+                            results['tables'] = verified_noop_paths
                             results['diagnostics']['all_already_scraped'] = True
                         elif successes == 0:
                             error_msg = (
                                 f"No matches processed for combined_match_data. "
-                                f"Schedule not found (schedule_source={schedule_source}). "
-                                f"Ensure schedule_task completed and Trino is available. "
+                                f"No verified no-op contract "
+                                f"(schedule_source={schedule_source}, "
+                                f"eligible={eligible_match_ids}, "
+                                f"pending={pending_match_ids}, "
+                                f"missing_tables={missing_noop_tables}). "
                                 f"successes={successes}, failures={failures}, "
                                 f"skipped_league_seasons={skipped}"
                             )
@@ -1284,6 +1404,40 @@ def main():
     )
     print(json.dumps(results, indent=2))
 
+    mode = results.get(
+        'mode', args.mode if hasattr(args, 'mode') else ''
+    )
+    match_data_type = results.get('match_data_type', '')
+    if total_errors > 0 and (
+        mode in {'combined_match_data', 'combined_season_stats'}
+        or match_data_type == 'schedule'
+    ):
+        logger.error(
+            "Critical combined mode completed with errors: %s",
+            results['errors'],
+        )
+        return 1
+
+    if results.get('fallback_files'):
+        logger.error(
+            "Scraper produced local fallback files instead of complete "
+            "Iceberg writes: %s",
+            results['fallback_files'],
+        )
+        return 1
+    if results.get('diagnostics', {}).get('tombstone_guard_refusals'):
+        logger.error(
+            "No-stats tombstone guard detected a systemic page-contract "
+            "failure; refusing a green ingest result"
+        )
+        return 1
+    if results.get('diagnostics', {}).get('persistence_errors'):
+        logger.error(
+            "Both Iceberg and fallback persistence failed for one or more "
+            "datasets"
+        )
+        return 1
+
     # Exit with error if no data was collected
     if total_tables == 0:
         if total_errors > 0:
@@ -1294,8 +1448,6 @@ def main():
             return 1
 
         # For modes that MUST produce data, 0 tables is always a failure
-        mode = results.get('mode', args.mode if hasattr(args, 'mode') else '')
-        match_data_type = results.get('match_data_type', '')
         critical_modes = {'combined_match_data', 'combined_season_stats', 'schedule'}
         if mode in critical_modes or match_data_type == 'schedule':
             logger.error(

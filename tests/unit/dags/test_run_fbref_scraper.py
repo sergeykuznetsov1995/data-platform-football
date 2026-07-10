@@ -114,6 +114,38 @@ class TestExitCodeLogic:
         assert len(result['tables']) > 0, "Tables should be recorded on success"
         assert len(result['errors']) == 0, "No errors should be recorded on success"
 
+    @pytest.mark.unit
+    def test_partial_multi_league_schedule_exits_nonzero(
+        self, mock_scraper, temp_output_file
+    ):
+        mock_scraper.scrape_schedule.return_value = {
+            'schedule': 'iceberg.bronze.fbref_schedule'
+        }
+        mock_scraper._stats = {
+            'successes': 1,
+            'failures': 1,
+            'scope_errors': ['Missing schedule targets: bad-league'],
+        }
+        mock_scraper.get_stats.return_value = mock_scraper._stats
+
+        rc = self.run_scraper_main(
+            [
+                '--scraper-type', 'nodriver',
+                '--mode', 'match_data',
+                '--match-data-type', 'schedule',
+                '--leagues', 'good-league,bad-league',
+                '--season', '2025',
+                '--output', temp_output_file,
+            ],
+            MagicMock(return_value=mock_scraper),
+        )
+
+        assert rc == 1
+        with open(temp_output_file) as handle:
+            result = json.load(handle)
+        assert result['tables']
+        assert result['errors']
+
 
 class TestSingleStatExitCode:
     """Test exit code behavior for single_stat mode."""
@@ -756,6 +788,49 @@ class TestSignalHandlers:
         assert scraper.__exit__.called
 
 
+class TestTournamentOutOfWindow:
+    @pytest.mark.unit
+    @pytest.mark.parametrize(
+        ('mode_args', 'expected_label'),
+        [
+            (['--mode', 'combined_season_stats'], 'season_stats'),
+            (['--mode', 'combined_match_data'], 'match_all_data'),
+            (
+                ['--mode', 'match_data', '--match-data-type', 'schedule'],
+                'match_schedule',
+            ),
+        ],
+    )
+    def test_writes_zero_traffic_manifest(
+        self, tmp_path, mode_args, expected_label
+    ):
+        import importlib
+        import dags.scripts.run_fbref_scraper as module
+
+        module = importlib.reload(module)
+        output = tmp_path / 'result.json'
+        traffic = tmp_path / 'traffic.json'
+        sys.argv = ['run_fbref_scraper.py'] + mode_args + [
+            '--scraper-type', 'selenium',
+            '--leagues', 'INT-World Cup',
+            '--season', '2025',
+            '--output', str(output),
+            '--traffic-output', str(traffic),
+        ]
+
+        with patch(
+            'utils.medallion_config.get_active_season', return_value=None
+        ):
+            rc = module.main()
+
+        assert rc == 0
+        assert json.loads(output.read_text())['skipped'] == 'out_of_window'
+        traffic_payload = json.loads(traffic.read_text())
+        assert traffic_payload['label'] == expected_label
+        assert traffic_payload['real_proxy_mb'] == 0.0
+        assert traffic_payload['skipped'] == 'out_of_window'
+
+
 class TestCompletedScheduleLeagues:
     """Issue #877: Trino probe for already-backfilled schedule seasons."""
 
@@ -993,3 +1068,118 @@ class TestSkipExisting:
         assert rc in (0, None)
         probe.assert_not_called()
         assert mock_class.call_args.kwargs['leagues'] == ['ESP-La Liga']
+class TestCombinedMatchFallbackManifest:
+    """Local JSON recovery is not a successful Iceberg table write."""
+
+    @staticmethod
+    def _run(scraper, output, traffic):
+        sys.argv = ['run_fbref_scraper.py'] + [
+            '--scraper-type', 'selenium',
+            '--use-nodriver',
+            '--mode', 'combined_match_data',
+            '--leagues', 'ENG-Premier League',
+            '--season', '2025',
+            '--output', output,
+            '--traffic-output', traffic,
+        ]
+        with patch(
+            'scrapers.fbref.FBrefScraper',
+            MagicMock(return_value=scraper),
+        ):
+            import importlib
+            import dags.scripts.run_fbref_scraper as module
+            importlib.reload(module)
+            return module.main()
+
+    @pytest.mark.unit
+    def test_fallback_is_separate_from_tables_and_exits_nonzero(self, tmp_path):
+        scraper = MagicMock()
+        scraper.__enter__ = MagicMock(return_value=scraper)
+        scraper.__exit__ = MagicMock(return_value=False)
+        scraper._stats = {
+            'successes': 1,
+            'failures': 0,
+            'schedule_source': 'iceberg',
+            'trino_available': True,
+        }
+        fallback = str(tmp_path / 'fbref_batch_lineups.json')
+        scraper.scrape_combined_match_data.return_value = {
+            'match_events': 'iceberg.bronze.fbref_match_events',
+            'lineups_fallback': fallback,
+        }
+        output = str(tmp_path / 'result.json')
+        traffic = str(tmp_path / 'traffic.json')
+
+        rc = self._run(scraper, output, traffic)
+
+        assert rc == 1
+        with open(output) as handle:
+            result = json.load(handle)
+        assert result['tables'] == [
+            'iceberg.bronze.fbref_match_events'
+        ]
+        assert result['fallback_files'] == [fallback]
+        assert any('Iceberg persistence was incomplete' in error
+                   for error in result['errors'])
+
+    @pytest.mark.unit
+    def test_verified_incremental_noop_exits_zero(self, tmp_path):
+        scraper = MagicMock()
+        scraper.__enter__ = MagicMock(return_value=scraper)
+        scraper.__exit__ = MagicMock(return_value=False)
+        verified = [
+            'iceberg.bronze.fbref_match_events',
+            'iceberg.bronze.fbref_lineups',
+            'iceberg.bronze.fbref_match_team_stats',
+            'iceberg.bronze.fbref_match_player_stats',
+        ]
+        scraper._stats = {
+            'successes': 0,
+            'failures': 0,
+            'schedule_source': 'file',
+            'trino_available': True,
+            'eligible_match_ids': 10,
+            'pending_match_ids': 0,
+            'all_already_scraped': True,
+            'verified_noop_table_paths': verified,
+            'missing_noop_tables': [],
+        }
+        scraper.scrape_combined_match_data.return_value = {}
+        output = str(tmp_path / 'result.json')
+        traffic = str(tmp_path / 'traffic.json')
+
+        rc = self._run(scraper, output, traffic)
+
+        assert rc in (0, None)
+        with open(output) as handle:
+            result = json.load(handle)
+        assert result['tables'] == verified
+        assert result['diagnostics']['all_already_scraped'] is True
+
+    @pytest.mark.unit
+    def test_unverified_empty_schedule_cannot_fabricate_tables(self, tmp_path):
+        scraper = MagicMock()
+        scraper.__enter__ = MagicMock(return_value=scraper)
+        scraper.__exit__ = MagicMock(return_value=False)
+        scraper._stats = {
+            'successes': 0,
+            'failures': 0,
+            'schedule_source': 'file',
+            'trino_available': True,
+            'eligible_match_ids': 0,
+            'pending_match_ids': 0,
+            'all_already_scraped': False,
+            'verified_noop_table_paths': [],
+            'missing_noop_tables': [],
+        }
+        scraper.scrape_combined_match_data.return_value = {}
+        output = str(tmp_path / 'result.json')
+        traffic = str(tmp_path / 'traffic.json')
+
+        rc = self._run(scraper, output, traffic)
+
+        assert rc == 1
+        with open(output) as handle:
+            result = json.load(handle)
+        assert result['tables'] == []
+        assert result['errors']

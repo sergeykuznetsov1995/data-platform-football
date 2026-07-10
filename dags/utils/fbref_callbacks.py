@@ -10,26 +10,17 @@ Callback and callable functions for FBref DAG PythonOperator tasks.
 from typing import Any, Dict
 
 
-def validate_all_data(**context) -> Dict[str, Any]:
-    """
-    Validate all scraped data from all TaskGroups.
+def validate_all_data(
+    result_dir: str = '/tmp',
+    manifest_suffixes: list[str] | None = None,
+    **context,
+) -> Dict[str, Any]:
+    """Validate every scope manifest produced by the current DAG run.
 
-    Checks /tmp/fbref_*.json result files and validates minimum
-    data thresholds (at least 12 out of expected ~26 tables).
-
-    Expected tables (26 total):
-    - 9 player stats + 9 team stats + 2 keeper stats = 20
-    - 6 match data: schedule, shot_events, match_events, lineups,
-      match_team_stats, match_player_stats
-
-    Args:
-        **context: Airflow context (passed by PythonOperator)
-
-    Returns:
-        Validation results dictionary
-
-    Raises:
-        AirflowException: If validation fails (no tables collected)
+    Counting every fbref_*.json in shared /tmp let successful files from an
+    older run hide a failed producer. The DAG now supplies a run-scoped
+    directory and explicit club/tournament suffixes. Each scope must either
+    contain the current core tables or be consistently marked out-of-window.
     """
     import json
     import logging
@@ -45,96 +36,124 @@ def validate_all_data(**context) -> Dict[str, Any]:
         'tables_collected': [],
         'errors': [],
         'fallback_files': [],
-        'missing_match_tables': [],
+        'missing_tables': [],
+        'missing_tables_by_scope': {},
+        'skipped_scopes': [],
     }
 
-    # Check for fallback JSON files (created when Trino was unavailable during batch save)
-    result_dir = Path('/tmp')
-
-    for fallback_file in result_dir.glob('fbref_batch_*.json'):
-        validation['fallback_files'].append(str(fallback_file))
-        logger.warning(
-            f"Fallback JSON detected: {fallback_file.name} — "
-            f"data was saved locally because Trino was unavailable during batch save. "
-            f"This data needs to be re-ingested into Iceberg."
-        )
-
-    if validation['fallback_files']:
-        validation['warnings'].append(
-            f"{len(validation['fallback_files'])} fallback JSON file(s) found — "
-            f"Trino was unavailable during batch save"
-        )
-
-    # Check all result files
-    for result_file in result_dir.glob('fbref_*.json'):
-        # Skip fallback files (already handled above)
-        if result_file.name.startswith('fbref_batch_'):
-            continue
-        try:
-            with open(result_file, 'r') as f:
-                result = json.load(f)
-
-            if not isinstance(result, dict):
-                logger.debug(f"Skipping {result_file.name}: not a result dict")
-                continue
-
-            tables = result.get('tables', [])
-            errors = result.get('errors', [])
-
-            if tables:
-                validation['tables_collected'].extend(tables)
-
-            if errors:
-                validation['errors'].extend(errors)
-                validation['warnings'].append(
-                    f"{result_file.name}: {len(errors)} error(s)"
-                )
-
-        except (FileNotFoundError, json.JSONDecodeError) as e:
-            validation['warnings'].append(f"Error reading {result_file}: {e}")
-
-    # Check minimum data thresholds
-    total_tables = len(validation['tables_collected'])
-
-    # We expect 26 tables in total:
-    # - 9 player tables + 9 team tables + 2 keeper tables = 20
-    # - 6 match data tables (schedule, shot_events, match_events, lineups,
-    #   match_team_stats, match_player_stats)
-    # Some may fail — we accept >= 12 as partial success.
-    if total_tables == 0:
-        validation['status'] = 'failed'
-        validation['warnings'].append('No tables were collected')
-    elif total_tables < 12:
-        validation['status'] = 'partial_success'
-        validation['warnings'].append(
-            f"Only {total_tables} tables collected (expected ~26)"
-        )
-    else:
-        logger.info(f"Collected {total_tables} tables successfully")
-
-    # Explicit check for the two new match-level tables added in Feb 2026.
-    # Silver DAG (fbref_match_enriched.sql) depends on them — missing data
-    # here will cascade into CTAS failures downstream.
-    required_match_tables = {
+    required_tables = {
+        'fbref_player_stats',
+        'fbref_player_shooting',
+        'fbref_player_playingtime',
+        'fbref_player_misc',
+        'fbref_team_stats',
+        'fbref_team_shooting',
+        'fbref_team_playingtime',
+        'fbref_team_misc',
+        'fbref_keeper_keeper',
+        'fbref_schedule',
         'fbref_match_team_stats',
         'fbref_match_player_stats',
         'fbref_match_events',
         'fbref_lineups',
     }
-    tables_set = set(validation['tables_collected'])
-    for tbl in required_match_tables:
-        if tbl not in tables_set:
-            validation['missing_match_tables'].append(tbl)
-            validation['warnings'].append(
-                f"Missing match table: {tbl} — Silver CTAS may fail"
+    suffixes = list(manifest_suffixes or [''])
+    result_path = Path(result_dir)
+
+    for suffix in suffixes:
+        scope = suffix.lstrip('_') or 'club'
+        expected_manifests = (
+            f'fbref_season_stats{suffix}.json',
+            f'fbref_match_schedule{suffix}.json',
+            f'fbref_match_all_data{suffix}.json',
+        )
+        scope_tables = []
+        scope_skip_reasons = []
+        readable_manifests = 0
+
+        for filename in expected_manifests:
+            result_file = result_path / filename
+            if not result_file.exists():
+                validation['errors'].append(
+                    f'Missing current-run result manifest: {result_file}'
+                )
+                continue
+            try:
+                with open(result_file, 'r') as f:
+                    result = json.load(f)
+
+                if not isinstance(result, dict):
+                    validation['errors'].append(
+                        f'{result_file.name}: result is not a JSON object'
+                    )
+                    continue
+
+                readable_manifests += 1
+                tables = result.get('tables', [])
+                errors = result.get('errors', [])
+                fallbacks = result.get('fallback_files', [])
+                skipped = result.get('skipped')
+
+                if tables:
+                    scope_tables.extend(tables)
+                    validation['tables_collected'].extend(tables)
+
+                if errors:
+                    validation['errors'].extend(
+                        f'{scope}: {error}' for error in errors
+                    )
+                if fallbacks:
+                    validation['fallback_files'].extend(fallbacks)
+                if skipped:
+                    scope_skip_reasons.append(skipped)
+
+            except (FileNotFoundError, json.JSONDecodeError) as e:
+                validation['errors'].append(
+                    f"Error reading {result_file}: {e}"
+                )
+
+        if scope_skip_reasons:
+            if (
+                readable_manifests == len(expected_manifests)
+                and scope_skip_reasons == ['out_of_window'] * len(expected_manifests)
+            ):
+                validation['skipped_scopes'].append(scope)
+                validation['missing_tables_by_scope'][scope] = []
+                continue
+            validation['errors'].append(
+                f'{scope}: inconsistent skipped manifests '
+                f'{scope_skip_reasons}'
             )
 
+        scope_table_names = {
+            str(table).rsplit('.', 1)[-1]
+            for table in scope_tables
+        }
+        scope_missing = sorted(required_tables - scope_table_names)
+        validation['missing_tables_by_scope'][scope] = scope_missing
+        if scope_missing:
+            validation['missing_tables'].extend(
+                f'{scope}:{table}' for table in scope_missing
+            )
+            validation['errors'].append(
+                f'{scope}: Missing required tables: {scope_missing}'
+            )
+
+    tables_set = {
+        str(table).rsplit('.', 1)[-1]
+        for table in validation['tables_collected']
+    }
+
+    if validation['fallback_files']:
+        validation['errors'].append(
+            f"{len(validation['fallback_files'])} local fallback file(s) "
+            f"were produced instead of Iceberg writes"
+        )
     if validation['errors']:
-        if validation['status'] == 'success':
-            validation['status'] = 'partial_success'
+        validation['status'] = 'failed'
 
     logger.info(f"Validation complete: {validation['status']}")
-    logger.info(f"Tables collected: {total_tables}")
+    logger.info(f"Tables collected: {len(tables_set)}")
 
     if validation['warnings']:
         logger.warning(f"Warnings: {validation['warnings']}")
@@ -169,7 +188,8 @@ def check_traffic_guard(
         airflow variables set fbref_proxy_mb_threshold 800  # global
 
     Behaviour:
-    - Missing JSON file is a warning (task may have failed before writing).
+    - Missing/unreadable JSON is a hard failure: accepting it would let an
+      all_done observer hide the producer failure or consume a stale artifact.
     - Threshold breach raises AirflowException (hard fail — user is paying
       $4/GB, so crossing the budget matters).
     - Uses module-level imports only from airflow + stdlib (no scrapers/
@@ -196,18 +216,18 @@ def check_traffic_guard(
     summary_path = Path(traffic_path)
 
     if not summary_path.exists():
-        logger.warning(
+        raise AirflowException(
             f"Traffic summary not found at {summary_path}. "
             f"Upstream task ({label}) may have failed before writing it."
         )
-        return {'status': 'missing', 'label': label, 'real_proxy_mb': None}
 
     try:
         with open(summary_path) as f:
             summary = json.load(f)
     except (json.JSONDecodeError, OSError) as e:
-        logger.warning(f"Could not read traffic summary {summary_path}: {e}")
-        return {'status': 'unreadable', 'label': label, 'real_proxy_mb': None}
+        raise AirflowException(
+            f"Could not read traffic summary {summary_path}: {e}"
+        ) from e
 
     real_mb = float(summary.get('real_proxy_mb') or 0.0)
     # HTTP fast-path bytes (curl_cffi after CF bypass) go through the SAME
@@ -290,7 +310,10 @@ def check_traffic_guard(
     }
 
 
-def report_proxy_traffic(**context) -> Dict[str, Any]:
+def report_proxy_traffic(
+    glob_pattern: str = '/tmp/fbref_traffic_*.json',
+    **context,
+) -> Dict[str, Any]:
     """Aggregate this run's FBref residential-proxy bytes into one log line (#789).
 
     Reads the per-task ``/tmp/fbref_traffic_*.json`` files the scraper already
@@ -310,7 +333,7 @@ def report_proxy_traffic(**context) -> Dict[str, Any]:
     logger = logging.getLogger(__name__)
 
     try:
-        summary = summarize_fbref_traffic()
+        summary = summarize_fbref_traffic(glob_pattern=glob_pattern)
         log_traffic_summary(summary)
     except Exception as exc:  # noqa: BLE001 — reporting must never fail the DAG
         logger.warning("report_proxy_traffic failed: %s", exc)
