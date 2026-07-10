@@ -912,30 +912,59 @@ class TestParsePlayerMatchStatsTables:
         main_html = """
         <html><body>
         <div class="scorebox">
-          <div><a href="/squads/aaa/Home">Home</a></div>
-          <div><a href="/squads/bbb/Away">Away</a></div>
+          <div><a href="/squads/aaaaaaaa/Home">Home</a></div>
+          <div><a href="/squads/bbbbbbbb/Away">Away</a></div>
         </div>
         </body></html>
         """
         soup = BeautifulSoup(main_html, 'html.parser')
 
         comment_html = """
-        <table id="stats_aaa_summary">
+        <table id="stats_aaaaaaaa_summary">
           <thead><tr><th>Player</th><th>Min</th></tr></thead>
           <tbody>
             <tr><td>Player A</td><td>90</td></tr>
           </tbody>
         </table>
+        <table id="stats_bbbbbbbb_summary">
+          <thead><tr><th>Player</th><th>Min</th></tr></thead>
+          <tbody>
+            <tr><td>Player B</td><td>90</td></tr>
+          </tbody>
+        </table>
         """
         comment_soup = BeautifulSoup(comment_html, 'html.parser')
-        comment_table = comment_soup.find('table')
+        comment_tables = {
+            table['id']: table for table in comment_soup.find_all('table')
+        }
 
         df = parse_player_match_stats_tables(
-            soup, {'stats_aaa_summary': comment_table}
+            soup, comment_tables
         )
         assert df is not None
-        assert len(df) == 1
+        assert len(df) == 2
         assert df.iloc[0]['team_side'] == 'home'
+
+    def test_one_team_summary_is_rejected(self):
+        soup = self._make_soup()
+        soup.find('table', id='stats_b8fd03ef_summary').decompose()
+
+        assert parse_player_match_stats_tables(soup, {}) is None
+
+    def test_summary_suffix_is_not_a_supported_dataset(self):
+        soup = self._make_soup()
+        soup.find(
+            'table', id='stats_b8fd03ef_summary'
+        )['id'] = 'stats_b8fd03ef_summary_extra'
+
+        assert parse_player_match_stats_tables(soup, {}) is None
+
+    def test_one_of_two_unparseable_summaries_is_rejected(self):
+        soup = self._make_soup()
+        away = soup.find('table', id='stats_b8fd03ef_summary')
+        away.find('tbody').decompose()
+
+        assert parse_player_match_stats_tables(soup, {}) is None
 
 
 # ===========================================================================
@@ -1044,6 +1073,13 @@ class TestParseKeeperMatchStatsTables:
                              'html.parser')
         assert parse_keeper_match_stats_tables(soup, {}) is None
 
+    @pytest.mark.unit
+    def test_one_keeper_side_is_rejected(self):
+        from scrapers.fbref.parsers.finders import parse_keeper_match_stats_tables
+
+        soup = BeautifulSoup(KEEPER_MATCH_HTML, 'html.parser')
+        assert parse_keeper_match_stats_tables(soup, {}) is None
+
 
 # ===========================================================================
 # TestTeamSideById — home/away from the {team_id} in the table id (#A2)
@@ -1094,6 +1130,34 @@ class TestTeamSideById:
         assert by_player.loc['Bukayo Saka', 'team'] == 'Arsenal'
 
     @pytest.mark.unit
+    def test_duplicate_crest_and_name_links_do_not_duplicate_team_id(self):
+        scorebox = (
+            '<div class="scorebox">'
+            '<div><a href="/en/squads/18bb7c10/Arsenal"><img></a>'
+            '<a href="/en/squads/18bb7c10/Arsenal">Arsenal</a></div>'
+            '<div><a href="/en/squads/b8fd03ef/Manchester-City"><img></a>'
+            '<a href="/en/squads/b8fd03ef/Manchester-City">'
+            'Manchester City</a></div></div>'
+        )
+        html = (
+            '<html><body>' + scorebox
+            + _SUMMARY_TABLE_TMPL.format(
+                tid='b8fd03ef', pid='abc12345', name='Erling Haaland')
+            + _SUMMARY_TABLE_TMPL.format(
+                tid='18bb7c10', pid='b66315ae', name='Bukayo Saka')
+            + '</body></html>'
+        )
+
+        df = parse_player_match_stats_tables(
+            BeautifulSoup(html, 'html.parser'), {}
+        )
+
+        assert df is not None
+        by_player = df.set_index('Player')
+        assert by_player.loc['Erling Haaland', 'team_side'] == 'away'
+        assert by_player.loc['Erling Haaland', 'team'] == 'Manchester City'
+
+    @pytest.mark.unit
     def test_keeper_sides_correct_when_away_table_first(self):
         from scrapers.fbref.parsers.finders import parse_keeper_match_stats_tables
 
@@ -1120,14 +1184,16 @@ class TestTeamSideById:
         assert list(df['team']) == ['Chelsea', 'Sunderland']
 
     @pytest.mark.unit
-    def test_unknown_team_id_falls_back_to_order(self):
+    def test_unknown_team_ids_fail_strict_player_contract(self):
         html = (
             '<html><body>' + self._SCOREBOX
             # Table id whose team_id matches neither scorebox squad
             + _SUMMARY_TABLE_TMPL.format(
                 tid='deadbeef', pid='abc12345', name='Somebody')
+            + _SUMMARY_TABLE_TMPL.format(
+                tid='feedface', pid='def67890', name='Somebody Else')
             + '</body></html>'
         )
         soup = BeautifulSoup(html, 'html.parser')
         df = parse_player_match_stats_tables(soup, {})
-        assert df.iloc[0]['team_side'] == 'home'  # order fallback
+        assert df is None

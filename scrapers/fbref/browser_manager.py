@@ -29,11 +29,12 @@ from scrapers.fbref.constants import FBREF_UNCOMMENT_TABLES_JS
 
 logger = logging.getLogger(__name__)
 
-# Match pages must contain at least one stats_*_summary table — without it
-# parse_player_match_stats_tables silently returns None. Matches the raw HTML
-# (tables may be in DOM or inside HTML comments).
+# A complete match page has one summary table per team.  A single table is a
+# partially streamed response: accepting it can replace one side of a good
+# Iceberg match partition with incomplete data.
 _MATCH_SUMMARY_RE = re.compile(
-    r'<table[^>]*\bid="stats_[a-f0-9]+_summary[a-z_]*"'
+    r'<table[^>]*\bid=["\']stats_([a-f0-9]{8})_summary["\']',
+    re.IGNORECASE,
 )
 
 # Chrome 120 User-Agent (must match container's Chromium for TLS fingerprint)
@@ -66,6 +67,28 @@ def _content_type_to_resource_type(ct: str) -> str:
     if mime.startswith('font/') or mime.startswith('application/font-'):
         return 'Font'
     return 'Other'
+
+
+def _response_wire_size(response) -> int:
+    """Best available curl_cffi request + response byte count.
+
+    ``len(response.text)`` counts decoded Python characters, not paid proxy
+    traffic. curl_cffi exposes libcurl transfer counters for the response body,
+    response headers, request headers, and upload body.  Older versions/mocks
+    may not expose them, so fall back to encoded response content.
+    """
+    components = []
+    for attr in ('download_size', 'header_size', 'request_size', 'upload_size'):
+        value = getattr(response, attr, None)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            components.append(max(0, int(value)))
+    if components and sum(components) > 0:
+        return sum(components)
+
+    content = getattr(response, 'content', None)
+    if isinstance(content, (bytes, bytearray)):
+        return len(content)
+    return len((getattr(response, 'text', '') or '').encode('utf-8'))
 
 
 class FBrefBrowserMixin:
@@ -342,6 +365,7 @@ class FBrefBrowserMixin:
             self._http_session = self._create_http_session(cookies, proxy_url=proxy_url)
             self._http_cookies_time = time.time()
             self._http_request_count = 0
+            self._http_consecutive_fallbacks = 0
             # Issue #624: remember the proxy this session is bound to so a later
             # fallback diag can flag proxy-mismatch (drift vs current nodriver proxy).
             self._http_proxy_minted = self._sanitize_proxy_url(proxy_url)
@@ -368,6 +392,40 @@ class FBrefBrowserMixin:
         if self._http_request_count >= self.HTTP_MAX_REQUESTS:
             logger.info(f"HTTP cookies expired after {self._http_request_count} requests")
             return True
+        return False
+
+    def _reset_http_session(self, reason: str) -> None:
+        """Close and forget the curl fast-path session.
+
+        Keeping an expired, failed, or explicitly closed session object around
+        prevents the browser path from minting a replacement because the old
+        code used ``self._http_session is None`` as the re-mint signal.  That
+        made every page after ``HTTP_MAX_REQUESTS`` (150 by default) fall back
+        to a full browser navigation for the rest of a large backfill.
+        """
+        session = self._http_session
+        if session is not None:
+            try:
+                session.close()
+            except Exception:  # noqa: BLE001 — teardown is best-effort
+                logger.debug("HTTP session close failed", exc_info=True)
+        self._http_session = None
+        self._http_cookies_time = None
+        self._http_request_count = 0
+        self._http_proxy_minted = None
+        self._http_consecutive_fallbacks = 0
+        logger.info("HTTP fast-path session reset (reason=%s)", reason)
+
+    def _http_session_is_usable(self) -> bool:
+        """Return True for a live fast-path session, expiring stale state."""
+        if self._http_session is None:
+            return False
+        if not self._http_cookies_expired():
+            return True
+        self._stats['http_session_expired'] = (
+            self._stats.get('http_session_expired', 0) + 1
+        )
+        self._reset_http_session('ttl_or_request_limit')
         return False
 
     @staticmethod
@@ -440,6 +498,49 @@ class FBrefBrowserMixin:
             if exception:
                 logger.info(f"[http-fast-path] exception: {exception}")
 
+    def _try_http_fast_path(
+        self, url: str, page_type: str
+    ) -> tuple[Optional[str], bool]:
+        """Try curl once and return ``(validated_html, used_http)``.
+
+        Generic response checks live in :meth:`_fetch_page_http`; the shared
+        page-type validator runs here *before* an HTTP hit is counted.  A
+        truncated match page therefore falls back to the warm browser instead
+        of being returned as a failure without a recovery attempt.
+        """
+        if not self._http_session_is_usable():
+            return None, False
+
+        html = self._fetch_page_http(url)
+        if html is not None and self._validate_fetched_html(html, url, page_type):
+            self._stats['http_fetch_ok'] = self._stats.get('http_fetch_ok', 0) + 1
+            self._http_consecutive_fallbacks = 0
+            return html, True
+
+        if html is not None:
+            reason = self._last_validation_failure or 'page_validation'
+            self._record_http_diag(
+                url,
+                status=200,
+                html_len=len(html),
+                reason=f"page_validation_{reason}",
+                html_preview=html[:500],
+            )
+
+        self._stats['http_fetch_fallback'] = (
+            self._stats.get('http_fetch_fallback', 0) + 1
+        )
+        self._http_consecutive_fallbacks += 1
+        if self._http_consecutive_fallbacks >= self.HTTP_MAX_FALLBACKS_BEFORE_REMINT:
+            threshold = self.HTTP_MAX_FALLBACKS_BEFORE_REMINT
+            self._reset_http_session('consecutive_fallbacks')
+            logger.info(
+                "[http-fast-path] %d consecutive fallbacks — browser must "
+                "re-mint the session",
+                threshold,
+            )
+        return None, False
+
     def _fetch_page_http(self, url: str) -> Optional[str]:
         """Fetch page via HTTP (curl_cffi) using CF cookies from nodriver."""
         if self._http_session is None:
@@ -449,16 +550,19 @@ class FBrefBrowserMixin:
             response = self._http_session.get(url, timeout=30)
             self._http_request_count += 1
 
-            # Issue #124: account proxy bytes by resource_type for HTTP path.
-            # Counted before status check — proxy spent bytes regardless of
-            # response code. Uses decoded body length to match the legacy
-            # bytes_downloaded metric (acceptance: Document ≈ html_mb).
-            size = len(response.text or '')
+            # Account paid proxy traffic before status validation: failed
+            # responses still consume quota.  Keep decoded HTML bytes as a
+            # separate diagnostic; ``http_bytes_downloaded`` is wire traffic.
+            size = _response_wire_size(response)
+            html_size = len((response.text or '').encode('utf-8'))
             rtype = _content_type_to_resource_type(
                 response.headers.get('content-type', '') or ''
             )
             self._stats['http_bytes_downloaded'] = (
                 self._stats.get('http_bytes_downloaded', 0) + size
+            )
+            self._stats['http_html_bytes_downloaded'] = (
+                self._stats.get('http_html_bytes_downloaded', 0) + html_size
             )
             self._stats['http_requests_count'] = (
                 self._stats.get('http_requests_count', 0) + 1
@@ -679,23 +783,29 @@ class FBrefBrowserMixin:
                 self._last_validation_failure = 'no_tables'
                 return False
 
-        # Match pages must contain at least one stats_*_summary table.
-        # Without it, parse_player_match_stats_tables silently returns
-        # None while lineups parse fine — data loss is invisible.
+        # Match pages must contain a summary table for both teams. Without
+        # both, parse_player_match_stats_tables can silently return a partial
+        # frame while lineups parse fine — data loss is invisible.
         # We saw ~5% of match fetches return 200KB truncated HTML with
         # lineup tables but no summary tables.
         if page_type == 'match':
-            if not _MATCH_SUMMARY_RE.search(html):
+            summary_team_ids = set(_MATCH_SUMMARY_RE.findall(html))
+            if len(summary_team_ids) < 2:
                 proxy_desc = (
                     f"{self._current_proxy_obj.host}:{self._current_proxy_obj.port}"
                     if self._current_proxy_obj else 'no-proxy'
                 )
                 logger.warning(
-                    f"Match page missing stats_*_summary table: {url}, "
+                    f"Match page has {len(summary_team_ids)}/2 "
+                    f"stats_*_summary team tables: {url}, "
                     f"len={html_len}, proxy={proxy_desc}. "
                     f"Treating as incomplete load."
                 )
-                self._last_validation_failure = 'no_match_summary'
+                self._last_validation_failure = (
+                    'no_match_summary'
+                    if not summary_team_ids
+                    else 'incomplete_match_summaries'
+                )
                 return False
 
         return True
@@ -708,6 +818,7 @@ class FBrefBrowserMixin:
         """Zero-arg callable yielding a Playwright proxy dict from the proxy
         manager (rotates each call), or None when no proxy is configured."""
         def _next():
+            self._current_proxy_obj = None
             if self._proxy_manager and self._proxy_manager.total_count > 0:
                 p = self._proxy_manager.get_proxy()
                 if p:
@@ -722,6 +833,17 @@ class FBrefBrowserMixin:
             return None
         return _next
 
+    def _record_camoufox_proxy_result(
+        self, success: bool, error_type: Optional[str] = None
+    ) -> None:
+        """Record every Camoufox proxy attempt, including internal rotations."""
+        if not (self._proxy_manager and self._current_proxy_obj):
+            return
+        kwargs = {'success': success}
+        if error_type:
+            kwargs['error_type'] = error_type
+        self._proxy_manager.record_result(self._current_proxy_obj, **kwargs)
+
     def _get_camoufox_transport(self):
         """Lazily build the warm CamoufoxFbrefTransport (one Firefox session
         reused across the whole scrape; cf_clearance persists across pages)."""
@@ -729,6 +851,7 @@ class FBrefBrowserMixin:
             from scrapers.fbref.camoufox_fetch import CamoufoxFbrefTransport
             self._camoufox_transport = CamoufoxFbrefTransport(
                 proxy_provider=self._camoufox_proxy_provider(),
+                proxy_result_callback=self._record_camoufox_proxy_result,
                 geoip=True,
                 headless=getattr(self, 'headless', True),
                 humanize=True,
@@ -807,6 +930,7 @@ class FBrefBrowserMixin:
             self._http_cookies_time = time.time()
             self._http_request_count = 0
             self._http_proxy_minted = self._sanitize_proxy_url(proxy_url)
+            self._http_consecutive_fallbacks = 0
             logger.info(
                 f"HTTP fast-path minted from Camoufox: "
                 f"{len(clearance['cookies'])} cookies, "
@@ -832,28 +956,7 @@ class FBrefBrowserMixin:
         self._rate_limiter.acquire()
 
         # HTTP fast-path first (cf_clearance minted from the Camoufox session).
-        html = None
-        fetched_via_http = False
-        if self._http_session is not None and not self._http_cookies_expired():
-            html = self._fetch_page_http(url)
-            if html is not None:
-                self._stats.setdefault('http_fetch_ok', 0)
-                self._stats['http_fetch_ok'] += 1
-                self._http_consecutive_fallbacks = 0
-                fetched_via_http = True
-            else:
-                self._stats.setdefault('http_fetch_fallback', 0)
-                self._stats['http_fetch_fallback'] += 1
-                self._http_consecutive_fallbacks += 1
-                if self._http_consecutive_fallbacks >= self.HTTP_MAX_FALLBACKS_BEFORE_REMINT:
-                    self._http_session = None
-                    self._http_proxy_minted = None
-                    self._http_consecutive_fallbacks = 0
-                    logger.info(
-                        "[http-fast-path] %d consecutive fallbacks — dropping "
-                        "curl session to re-mint from the Camoufox session",
-                        self.HTTP_MAX_FALLBACKS_BEFORE_REMINT,
-                    )
+        html, fetched_via_http = self._try_http_fast_path(url, page_type)
 
         transport = None
         if html is None:
@@ -870,32 +973,21 @@ class FBrefBrowserMixin:
                 logger.warning(f"Camoufox transport returned no HTML for {url}")
             self._stats['failures'] = self._stats.get('failures', 0) + 1
             self._consecutive_fetch_failures += 1
-            # Feed the proxy manager so dead proxies get benched — every
-            # avoidable rotation costs a ~4 MB CF cold-start. Only transport
-            # fetches are attributed: an HTTP-path failure says nothing about
-            # the browser's current proxy.
-            if (not fetched_via_http and self._proxy_manager
-                    and self._current_proxy_obj):
-                self._proxy_manager.record_result(
-                    self._current_proxy_obj, success=False,
-                    error_type='cloudflare',
-                )
             return None
 
         self._consecutive_fetch_failures = 0
         self._stats['successes'] = self._stats.get('successes', 0) + 1
-        if (not fetched_via_http and self._proxy_manager
-                and self._current_proxy_obj):
-            self._proxy_manager.record_result(
-                self._current_proxy_obj, success=True,
-            )
         if use_cache:
             self._page_cache[url] = html
             self._manage_cache_size()
         self._track_download(len(html), page_type)
 
         # Mint the curl fast-path session from the fresh Camoufox clearance.
-        if not fetched_via_http and self._http_session is None and transport is not None:
+        if (
+            not fetched_via_http
+            and self._http_session is None
+            and transport is not None
+        ):
             self._try_init_http_session_camoufox(transport)
 
         return html
@@ -937,36 +1029,11 @@ class FBrefBrowserMixin:
                 # previous nodriver fetch, try curl_cffi first (~1-2s vs ~8-15s).
                 # Falls back to nodriver on CF challenge or incomplete HTML.
                 html = None
-                if (
-                    self.use_nodriver
-                    and self._http_session is not None
-                    and not self._http_cookies_expired()
-                ):
-                    html = self._fetch_page_http(url)
-                    if html is not None:
-                        self._stats.setdefault('http_fetch_ok', 0)
-                        self._stats['http_fetch_ok'] += 1
-                        self._http_consecutive_fallbacks = 0
-                    else:
-                        self._stats.setdefault('http_fetch_fallback', 0)
-                        self._stats['http_fetch_fallback'] += 1
-                        # Issue #624: the curl session keeps its OWN proxy across
-                        # nodriver restarts, so the proxy-manager never bans it on
-                        # failure. A run of fallbacks means that pinned proxy is
-                        # dead — drop the session so the next nodriver fetch
-                        # re-mints cf_clearance on the current (healthy) proxy.
-                        # Bounds the dead-proxy streak; reset the counter so we
-                        # don't re-trip before the re-mint lands.
-                        self._http_consecutive_fallbacks += 1
-                        if self._http_consecutive_fallbacks >= self.HTTP_MAX_FALLBACKS_BEFORE_REMINT:
-                            self._http_session = None
-                            self._http_proxy_minted = None
-                            self._http_consecutive_fallbacks = 0
-                            logger.info(
-                                "[http-fast-path] %d consecutive fallbacks — dropping "
-                                "curl session to re-mint on next nodriver fetch",
-                                self.HTTP_MAX_FALLBACKS_BEFORE_REMINT,
-                            )
+                fetched_via_http = False
+                if self.use_nodriver:
+                    html, fetched_via_http = self._try_http_fast_path(
+                        url, page_type
+                    )
 
                 # Fallback / first-time path: nodriver (or selenium)
                 if html is None:
@@ -1006,7 +1073,11 @@ class FBrefBrowserMixin:
                 # Cookie.from_json in nodriver 0.48.1 so the event loop is not
                 # corrupted. Subsequent _fetch_page() calls will try HTTP first
                 # and fall back to nodriver on CF challenge.
-                if self._http_session is None:
+                if (
+                    self.use_nodriver
+                    and not fetched_via_http
+                    and self._http_session is None
+                ):
                     self._try_init_http_session()
 
                 return html

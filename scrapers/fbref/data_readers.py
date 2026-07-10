@@ -29,6 +29,13 @@ from scrapers.fbref.url_builder import (
     get_schedule_url,
     get_stats_url,
 )
+from scrapers.fbref.match_parser import (
+    MATCH_COMPLETION_CONTRACT_VERSION as PARSER_COMPLETION_CONTRACT_VERSION,
+    DatasetStatus,
+    MatchPageParseError,
+    parse_match_html,
+)
+from scrapers.fbref.raw_store import match_page_target
 from scrapers.fbref.html_parser import (
     extract_tables_from_comments,
     parse_table,
@@ -47,6 +54,13 @@ from scrapers.fbref.html_parser import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _fbref_artifact_path(filename: str) -> str:
+    """Return a run-scoped artifact path (``/tmp`` outside Airflow)."""
+    artifact_dir = os.environ.get('FBREF_RUN_DIR', '/tmp')
+    os.makedirs(artifact_dir, exist_ok=True)
+    return os.path.join(artifact_dir, filename)
 
 
 class FBrefDataReaderMixin:
@@ -830,22 +844,31 @@ class FBrefDataReaderMixin:
         )
 
         buffers: Dict[str, List[pd.DataFrame]] = {}
+        errors: List[str] = []
+        expected_keys = {
+            f'{category}_{stat_type}'
+            for _, extracts in self._SEASON_PAGE_PLAN
+            for category, stat_type in extracts
+        }
 
         for league in self.leagues:
             for season in self.seasons:
+                target_keys = set()
                 for url_stat_type, extracts in self._SEASON_PAGE_PLAN:
                     try:
                         parsed = self._parse_season_page(
                             league, season, url_stat_type, extracts
                         )
                     except Exception as e:
-                        logger.error(
-                            f"Error parsing season page '{url_stat_type}' "
-                            f"for {league} {season}: {e}"
+                        msg = (
+                            f"{league} {season} page={url_stat_type}: {e}"
                         )
+                        errors.append(msg)
+                        logger.error("Error parsing season page: %s", msg)
                         continue
 
                     for key, df in parsed.items():
+                        target_keys.add(key)
                         buffers.setdefault(key, []).append(df)
                         logger.info(
                             f"Collected {len(df)} rows for {key} "
@@ -855,11 +878,19 @@ class FBrefDataReaderMixin:
                     # Rate limiting between pages (mirrors single_stat)
                     time.sleep(1)
 
+                missing_for_target = sorted(expected_keys - target_keys)
+                if missing_for_target:
+                    msg = (
+                        f"{league} {season}: missing season datasets "
+                        f"{missing_for_target}"
+                    )
+                    errors.append(msg)
+                    logger.error(msg)
+
             self._cleanup_after_league()
 
         results: Dict[str, str] = {}
         guard_refusals: List[str] = []
-        errors: List[str] = []
 
         for key, frames in buffers.items():
             combined_df = pd.concat(frames, ignore_index=True)
@@ -884,15 +915,6 @@ class FBrefDataReaderMixin:
                 errors.append(msg)
                 logger.error(f"Error saving {table_name}: {e}", exc_info=True)
 
-        expected_keys = {
-            f'{cat}_{stat}'
-            for _, extracts in self._SEASON_PAGE_PLAN
-            for cat, stat in extracts
-        }
-        missing = sorted(expected_keys - set(buffers))
-        if missing:
-            logger.warning(f"No data collected for: {missing}")
-
         return {
             'tables': results,
             'guard_refusals': guard_refusals,
@@ -914,6 +936,36 @@ class FBrefDataReaderMixin:
     # tombstone, awarded/forfeited fixtures (their pages never grow summary
     # tables) are refetched + retried on every DAG run forever.
     NO_STATS_TOMBSTONE_RUNS = 3
+    NO_STATS_TOMBSTONE_TTL_DAYS = 30
+    NO_STATS_TOMBSTONE_MAX_PER_RUN = 5
+    NO_STATS_TOMBSTONE_MAX_RATIO = 0.10
+    NO_STATS_TOMBSTONE_RATIO_MIN_ATTEMPTS = 10
+    MATCH_COMPLETION_CONTRACT_VERSION = PARSER_COMPLETION_CONTRACT_VERSION
+
+    def _no_stats_tombstone_guard_reason(
+        self, confirmed_count: int, attempted_count: int
+    ) -> Optional[str]:
+        """Return a refusal reason for a suspicious no-summary batch."""
+        systemic_ratio = (
+            (
+                attempted_count
+                >= self.NO_STATS_TOMBSTONE_RATIO_MIN_ATTEMPTS
+                and confirmed_count / max(attempted_count, 1)
+                > self.NO_STATS_TOMBSTONE_MAX_RATIO
+            )
+            or (
+                attempted_count >= 3
+                and confirmed_count == attempted_count
+            )
+        )
+        too_many = confirmed_count > self.NO_STATS_TOMBSTONE_MAX_PER_RUN
+        if not (systemic_ratio or too_many):
+            return None
+        return (
+            "Refusing no-stats tombstone batch: "
+            f"confirmed={confirmed_count}, attempted={attempted_count}. "
+            "Possible FBref layout/fetch regression."
+        )
 
     def _process_single_match(
         self,
@@ -929,120 +981,122 @@ class FBrefDataReaderMixin:
         all_match_officials: List[pd.DataFrame] = None,
         all_match_keeper_stats: List[pd.DataFrame] = None,
     ) -> Set[str]:
-        """
-        Process a single match page: extract shots, events, lineups,
-        team match stats, player match stats, and keeper match stats.
-
-        Parses HTML once with BeautifulSoup and calls parsers directly,
-        avoiding redundant BS4 parsing that read_* methods would do.
-
-        Returns set of successfully extracted data type names
-        (e.g. {'lineups', 'match_player_stats'}).  Empty set on total failure.
-        """
+        """Load one page once, parse it offline, and commit only a full result."""
         url = f"{BASE_URL}/en/matches/{match_id}"
         # Reset so a stale reason from a previous match can't leak into the
         # tombstone classification below (cached pages skip validation).
         self._last_validation_failure = None
-        html = self._fetch_page(url, use_cache=True, page_type='match')
-        if not html:
-            return set()
+        raw_store = getattr(self, '_raw_page_store', None)
+        raw_record = None
+        if raw_store is None:
+            html = self._fetch_page(url, use_cache=False, page_type='match')
+            if not html:
+                return set()
+        else:
+            target = match_page_target(match_id)
+            if raw_store.has_page(target):
+                html, raw_record = raw_store.load_html(target)
+                self._stats['raw_page_hits'] = (
+                    self._stats.get('raw_page_hits', 0) + 1
+                )
+            else:
+                html = self._fetch_page(url, use_cache=False, page_type='match')
+                if not html:
+                    return set()
+                raw_record = raw_store.store_html(
+                    target,
+                    html,
+                    fetcher_version='fbref-match-loader-v1',
+                )
+                self._stats['raw_page_writes'] = (
+                    self._stats.get('raw_page_writes', 0) + 1
+                )
 
-        # ONE BS4 parse + ONE comment table extraction
-        soup = BeautifulSoup(html, 'html.parser')
-        comment_tables = extract_tables_from_comments(soup)
+        enabled_datasets = {'shot_events', 'match_events', 'lineups'}
+        optional_buffers = {
+            'match_team_stats': all_match_team_stats,
+            'match_player_stats': all_match_player_stats,
+            'match_managers': all_match_managers,
+            'match_officials': all_match_officials,
+            'match_keeper_stats': all_match_keeper_stats,
+        }
+        enabled_datasets.update(
+            name for name, buffer in optional_buffers.items()
+            if buffer is not None
+        )
+        result = parse_match_html(
+            html,
+            match_id=match_id,
+            league=league,
+            season=season,
+            enabled_datasets=enabled_datasets,
+            require_player_contract=(all_match_player_stats is not None),
+            # Keep the long-standing monkeypatch surface used by existing
+            # parser tests while the pure parser owns the production flow.
+            parser_overrides={
+                'extract_tables': extract_tables_from_comments,
+                'shot_events': parse_shots_table,
+                'match_events': parse_events_from_scorebox,
+                'lineups': parse_lineup_table,
+                'match_team_stats': parse_team_match_stats_table,
+                'match_player_stats': parse_player_match_stats_tables,
+                'match_managers': parse_match_managers,
+                'match_officials': parse_match_officials,
+                'match_keeper_stats': parse_keeper_match_stats_tables,
+            },
+        )
+        if raw_store is not None and raw_record is not None:
+            raw_store.write_parse_manifests(raw_record, result)
+        parser_exceptions = [
+            dataset.exception for dataset in result.datasets.values()
+            if dataset.exception is not None
+        ]
+        if parser_exceptions:
+            raise parser_exceptions[0]
+        if result.has_errors and raw_store is not None:
+            errors = [
+                f"{name}:{dataset.reason or dataset.error_type}"
+                for name, dataset in result.datasets.items()
+                if dataset.status == DatasetStatus.ERROR
+            ]
+            raise MatchPageParseError(
+                f"Match {match_id} parse failed: {', '.join(errors)}"
+            )
+
+        target_by_dataset = {
+            'shot_events': all_shot_events,
+            'match_events': all_match_events,
+            'lineups': all_lineups,
+            'match_team_stats': all_match_team_stats,
+            'match_player_stats': all_match_player_stats,
+            'match_managers': all_match_managers,
+            'match_officials': all_match_officials,
+            'match_keeper_stats': all_match_keeper_stats,
+        }
+        staged = []
         got_types: Set[str] = set()
+        for name, dataset in result.datasets.items():
+            target_buffer = target_by_dataset.get(name)
+            if (
+                target_buffer is None
+                or dataset.status != DatasetStatus.AVAILABLE
+                or dataset.frame is None
+            ):
+                continue
+            frame = self._add_metadata(dataset.frame, name)
+            staged.append((target_buffer, frame))
+            got_types.add(name)
 
-        # Shot events (needs comment_tables for shots table)
-        shots_df = parse_shots_table(soup, comment_tables)
-        if shots_df is not None and not shots_df.empty:
-            shots_df['match_id'] = match_id
-            shots_df['league'] = league
-            shots_df['season'] = season
-            shots_df = self._add_metadata(shots_df, 'shot_events')
-            all_shot_events.append(shots_df)
-            got_types.add('shot_events')
+        # Legacy in-memory mode keeps its partial diagnostic return so the
+        # existing independent-network retry/tombstone flow stays unchanged.
+        # Raw-first mode above records and raises the same contract failure.
+        if result.has_errors:
+            return got_types
 
-        # Match events (from scorebox — no comment_tables needed)
-        events_df = parse_events_from_scorebox(soup)
-        if events_df is not None and not events_df.empty:
-            events_df['match_id'] = match_id
-            events_df['league'] = league
-            events_df['season'] = season
-            events_df = self._add_metadata(events_df, 'match_events')
-            all_match_events.append(events_df)
-            got_types.add('match_events')
-
-        # Lineups (positions enriched from stats summary comment_tables)
-        lineup_df = parse_lineup_table(soup, comment_tables=comment_tables)
-        if lineup_df is not None and not lineup_df.empty:
-            lineup_df['match_id'] = match_id
-            lineup_df['league'] = league
-            lineup_df['season'] = season
-            lineup_df = self._add_metadata(lineup_df, 'lineups')
-            all_lineups.append(lineup_df)
-            got_types.add('lineups')
-
-        # Team match stats (div#team_stats + div#team_stats_extra)
-        if all_match_team_stats is not None:
-            team_stats_df = parse_team_match_stats_table(soup, comment_tables)
-            if team_stats_df is not None and not team_stats_df.empty:
-                team_stats_df['match_id'] = match_id
-                team_stats_df['league'] = league
-                team_stats_df['season'] = season
-                team_stats_df = self._add_metadata(team_stats_df, 'match_team_stats')
-                all_match_team_stats.append(team_stats_df)
-                got_types.add('match_team_stats')
-
-        # Player match stats (stats_*_summary tables)
-        if all_match_player_stats is not None:
-            player_match_df = parse_player_match_stats_tables(soup, comment_tables)
-            if player_match_df is not None and not player_match_df.empty:
-                player_match_df['match_id'] = match_id
-                player_match_df['league'] = league
-                player_match_df['season'] = season
-                player_match_df = self._add_metadata(player_match_df, 'match_player_stats')
-                all_match_player_stats.append(player_match_df)
-                got_types.add('match_player_stats')
-
-        # Match managers (scorebox info-table — one row per side)
-        if all_match_managers is not None:
-            managers_df = parse_match_managers(soup)
-            if managers_df is not None and not managers_df.empty:
-                managers_df['match_id'] = match_id
-                managers_df['league'] = league
-                managers_df['season'] = season
-                managers_df = self._add_metadata(managers_df, 'match_managers')
-                all_match_managers.append(managers_df)
-                got_types.add('match_managers')
-
-        # Match officials (scorebox_meta — one wide row: referee/ar1/ar2/4th/var)
-        if all_match_officials is not None:
-            officials_df = parse_match_officials(soup)
-            if officials_df is not None and not officials_df.empty:
-                officials_df['match_id'] = match_id
-                officials_df['league'] = league
-                officials_df['season'] = season
-                officials_df = self._add_metadata(officials_df, 'match_officials')
-                all_match_officials.append(officials_df)
-                got_types.add('match_officials')
-
-        # Keeper match stats (keeper_stats_{team_id} tables — basic GK
-        # columns still populated after the Apr-2026 FBref restriction)
-        if all_match_keeper_stats is not None:
-            keeper_df = parse_keeper_match_stats_tables(soup, comment_tables)
-            if keeper_df is not None and not keeper_df.empty:
-                keeper_df['match_id'] = match_id
-                keeper_df['league'] = league
-                keeper_df['season'] = season
-                keeper_df = self._add_metadata(keeper_df, 'match_keeper_stats')
-                all_match_keeper_stats.append(keeper_df)
-                got_types.add('match_keeper_stats')
-
-        # Free memory: decompose soup tree and remove from cache
-        soup.decompose()
-        del comment_tables
-        self._page_cache.pop(url, None)
-
+        # The required player contract has already passed. Commit all staged
+        # frames together so no optional parser can leak a partial match.
+        for target_buffer, frame in staged:
+            target_buffer.append(frame)
         return got_types
 
     def _save_fallback_json(
@@ -1053,7 +1107,7 @@ class FBrefDataReaderMixin:
     ) -> None:
         """Save DataFrame to JSON fallback when Iceberg/Trino is unavailable."""
         ts = int(time.time())
-        path = f'/tmp/fbref_batch_{data_type}_{ts}.json'
+        path = _fbref_artifact_path(f'fbref_batch_{data_type}_{ts}.json')
         try:
             df.to_json(path, orient='records', date_format='iso')
             results[f'{data_type}_fallback'] = path
@@ -1062,6 +1116,11 @@ class FBrefDataReaderMixin:
             )
         except Exception as fallback_err:
             logger.error(f"Failed to save JSON fallback for {data_type}: {fallback_err}")
+            msg = f'{data_type}: fallback persistence failed: {fallback_err}'
+            self._stats['persistence_failures'] = (
+                self._stats.get('persistence_failures', 0) + 1
+            )
+            self._stats.setdefault('persistence_errors', []).append(msg)
 
     def _batch_save_match_data(
         self,
@@ -1102,12 +1161,15 @@ class FBrefDataReaderMixin:
             (all_match_events, 'fbref_match_events', 'match_events', ['match_id']),
             (all_lineups, 'fbref_lineups', 'lineups', ['match_id']),
             (all_match_team_stats, 'fbref_match_team_stats', 'match_team_stats', ['match_id']),
-            (all_match_player_stats, 'fbref_match_player_stats', 'match_player_stats', ['match_id']),
             (all_match_managers, 'fbref_match_managers', 'match_managers', ['match_id']),
             (all_match_officials, 'fbref_match_officials', 'match_officials', ['match_id']),
             (all_match_keeper_stats, 'fbref_match_keeper_stats', 'match_keeper_stats', ['match_id']),
+            # Incremental skip marker goes LAST. If any preceding available
+            # dataset failed to persist, do not mark these matches complete.
+            (all_match_player_stats, 'fbref_match_player_stats', 'match_player_stats', ['match_id']),
         ]
 
+        batch_write_failed = False
         for data_list, table_name, result_key, replace_keys in save_items:
             if not data_list:
                 continue
@@ -1126,6 +1188,16 @@ class FBrefDataReaderMixin:
                 data_list.clear()
                 continue
             combined_df = pd.concat(latest_by_match.values(), ignore_index=True)
+
+            if result_key == 'match_player_stats' and batch_write_failed:
+                logger.error(
+                    "Not writing fbref_match_player_stats completion marker: "
+                    "an earlier dataset in this batch failed to persist"
+                )
+                self._save_fallback_json(combined_df, result_key, results)
+                data_list.clear()
+                continue
+
             try:
                 table_path = self.save_to_iceberg(
                     df=combined_df,
@@ -1139,6 +1211,7 @@ class FBrefDataReaderMixin:
                     f"Batch save{batch_label}: {len(combined_df)} {result_key} rows"
                 )
             except Exception as e:
+                batch_write_failed = True
                 error_str = str(e)
                 is_conn_error = any(
                     msg in error_str
@@ -1198,28 +1271,73 @@ class FBrefDataReaderMixin:
                 df = self._iceberg_writer.read_table(
                     database='bronze',
                     table=table,
-                    columns=['match_id'],
+                    columns=(
+                        ['match_id', 'parser_contract_version']
+                        if key == 'player_stats'
+                        else ['match_id']
+                    ),
                     filter_expr=filter_expr,
                 )
                 if df is not None and not df.empty:
+                    if key == 'player_stats':
+                        if 'parser_contract_version' not in df.columns:
+                            logger.warning(
+                                "Ignoring legacy player rows without the "
+                                "current completion contract"
+                            )
+                            continue
+                        df = df[
+                            df['parser_contract_version']
+                            == self.MATCH_COMPLETION_CONTRACT_VERSION
+                        ]
                     result[key] = set(df['match_id'].astype(str).unique())
             except Exception as e:
                 logger.warning(f"Could not read {table}: {e}")
 
-        # Tombstones: fbref_match_no_stats gets one row per run for a match
-        # that failed the summary-presence check even after retry. Only
-        # matches confirmed in >= NO_STATS_TOMBSTONE_RUNS runs are skipped,
-        # so transient truncated loads keep retrying.
+        # Tombstones are observations, not raw retry counters. Count distinct
+        # logical DAG runs within a TTL so task retries cannot permanently
+        # suppress a match and old exclusions are periodically re-checked.
         try:
             if self._iceberg_writer.table_exists('bronze', 'fbref_match_no_stats'):
                 df = self._iceberg_writer.read_table(
                     database='bronze',
                     table='fbref_match_no_stats',
-                    columns=['match_id'],
+                    columns=[
+                        'match_id', 'confirmation_id', 'confirmed_at'
+                    ],
                     filter_expr=filter_expr,
                 )
                 if df is not None and not df.empty:
-                    counts = df['match_id'].astype(str).value_counts()
+                    required = {
+                        'match_id', 'confirmation_id', 'confirmed_at'
+                    }
+                    if not required.issubset(df.columns):
+                        logger.warning(
+                            "Ignoring legacy no-stats rows without logical-run "
+                            "identity/TTL columns"
+                        )
+                        return result
+                    confirmed_at = pd.to_datetime(
+                        df['confirmed_at'], errors='coerce', utc=True
+                    )
+                    cutoff = (
+                        pd.Timestamp.now(tz='UTC')
+                        - pd.Timedelta(
+                            days=self.NO_STATS_TOMBSTONE_TTL_DAYS
+                        )
+                    )
+                    live = df[
+                        confirmed_at.ge(cutoff)
+                        & df['confirmation_id'].notna()
+                        & df['confirmation_id'].astype(str).ne('')
+                    ].copy()
+                    live['match_id'] = live['match_id'].astype(str)
+                    live['confirmation_id'] = (
+                        live['confirmation_id'].astype(str)
+                    )
+                    counts = live.groupby('match_id')[
+                        'confirmation_id'
+                    ].nunique()
                     result['no_stats'] = set(
                         counts[counts >= self.NO_STATS_TOMBSTONE_RUNS].index
                     )
@@ -1360,7 +1478,9 @@ class FBrefDataReaderMixin:
     ) -> Optional[pd.DataFrame]:
         """Read schedule from JSON file saved by schedule_task."""
         safe_league = league.replace(' ', '_').replace('-', '_')
-        path = f'/tmp/fbref_schedule_{safe_league}_{season}.json'
+        path = _fbref_artifact_path(
+            f'fbref_schedule_{safe_league}_{season}.json'
+        )
 
         if not os.path.exists(path):
             logger.debug(f"Schedule JSON not found: {path}")
@@ -1466,7 +1586,11 @@ class FBrefDataReaderMixin:
         total_pages_fetched = 0
         total_league_seasons = 0
         skipped_league_seasons = 0
+        total_eligible_match_ids = 0
+        total_pending_match_ids = 0
         results = {}
+        tombstone_attempted_ids = set()
+        pending_no_stats_observations = []
 
         # Shared kwargs for _batch_save_match_data
         batch_kw = dict(
@@ -1523,7 +1647,12 @@ class FBrefDataReaderMixin:
                         continue
 
                     logger.info(f"Extracting match IDs from schedule ({len(schedule_df)} rows)...")
-                    match_ids = self._extract_match_ids(schedule_df, max_matches)
+                    # Extract the full ordered schedule first.  Applying the
+                    # limit before the incremental filter can permanently stall
+                    # a backfill: once the first N fixtures exist, every run
+                    # keeps selecting and then discarding those same N rows.
+                    match_ids = self._extract_match_ids(schedule_df, None)
+                    total_eligible_match_ids += len(match_ids)
                     del schedule_df  # Free ~1MB DataFrame
 
                     # Incremental: skip matches already in fbref_match_player_stats.
@@ -1540,6 +1669,14 @@ class FBrefDataReaderMixin:
                             f"{len(new_match_ids)} new matches to process"
                         )
                         match_ids = new_match_ids
+
+                    total_pending_match_ids += len(match_ids)
+                    if max_matches is not None:
+                        match_ids = match_ids[:max_matches]
+                        logger.info(
+                            f"Applied max_matches={max_matches} after incremental "
+                            f"filter: {len(match_ids)} matches selected"
+                        )
 
                     if not match_ids:
                         logger.info(
@@ -1559,6 +1696,8 @@ class FBrefDataReaderMixin:
                         self._nodriver_browser.restart_browser(reason='post_schedule')
 
                     failed_match_ids = []
+                    completed_match_ids = set()
+                    confirmed_no_summary_ids = set()
                     # Matches whose fetch failed specifically because the page
                     # had no stats_*_summary table — tombstone candidates if
                     # the retry pass confirms (see NO_STATS_TOMBSTONE_RUNS).
@@ -1576,6 +1715,9 @@ class FBrefDataReaderMixin:
 
                     for idx, match_id in enumerate(match_ids):
                         logger.info(f"Processing match {idx+1}/{len(match_ids)}: {match_id}")
+                        tombstone_attempted_ids.add(
+                            (league, season, match_id)
+                        )
                         try:
                             got_types = self._process_single_match(
                                 match_id, league, season,
@@ -1587,9 +1729,11 @@ class FBrefDataReaderMixin:
                             )
 
                             if got_types:
-                                total_matches_processed += 1
                                 consecutive_failures = 0
-                                if 'match_player_stats' not in got_types:
+                                if 'match_player_stats' in got_types:
+                                    total_matches_processed += 1
+                                    completed_match_ids.add(match_id)
+                                else:
                                     partial_match_ids.append(match_id)
                                     logger.warning(
                                         f"Partial data for match {match_id}: "
@@ -1670,8 +1814,8 @@ class FBrefDataReaderMixin:
                                 )
                                 if got_types and 'match_player_stats' in got_types:
                                     recovered += 1
-                                    if match_id in failed_match_ids:
-                                        total_matches_processed += 1
+                                    total_matches_processed += 1
+                                    completed_match_ids.add(match_id)
                                 elif (
                                     match_id in no_summary_ids
                                     and self._last_validation_failure == 'no_match_summary'
@@ -1680,6 +1824,7 @@ class FBrefDataReaderMixin:
                                     # an awarded/forfeited fixture, not a
                                     # truncated load. Tombstone candidate.
                                     confirmed_no_summary.append(match_id)
+                                    confirmed_no_summary_ids.add(match_id)
                                 time.sleep(1)
                             except Exception as e:
                                 logger.debug(f"Retry failed for match {match_id}: {e}")
@@ -1689,32 +1834,42 @@ class FBrefDataReaderMixin:
                         )
 
                         if confirmed_no_summary:
-                            tomb_df = pd.DataFrame({
-                                'match_id': confirmed_no_summary,
-                                'league': league,
-                                'season': season,
-                                'reason': 'no_match_summary',
-                            })
-                            tomb_df = self._add_metadata(tomb_df, 'match_no_stats')
-                            try:
-                                # Plain append by design: one row per run is
-                                # the confirmation counter that
-                                # _load_match_id_sets compares against
-                                # NO_STATS_TOMBSTONE_RUNS.
-                                self.save_to_iceberg(
-                                    df=tomb_df,
-                                    table_name='fbref_match_no_stats',
-                                    partition_cols=['league', 'season'],
-                                )
-                                logger.info(
-                                    f"Tombstoned {len(confirmed_no_summary)} "
-                                    f"no-summary matches for {league} {season}: "
-                                    f"{confirmed_no_summary}"
-                                )
-                            except Exception as e:
-                                logger.warning(
-                                    f"Could not save no-stats tombstones: {e}"
-                                )
+                            pending_no_stats_observations.extend(
+                                {
+                                    'match_id': match_id,
+                                    'league': league,
+                                    'season': season,
+                                }
+                                for match_id in set(confirmed_no_summary)
+                            )
+
+                    attempted_for_scope = {
+                        attempted_match_id
+                        for attempted_league, attempted_season,
+                        attempted_match_id in tombstone_attempted_ids
+                        if attempted_league == league
+                        and attempted_season == season
+                    }
+                    selected_ids = set(match_ids)
+                    unattempted_ids = selected_ids - attempted_for_scope
+                    unresolved_ids = (
+                        attempted_for_scope
+                        - completed_match_ids
+                        - confirmed_no_summary_ids
+                    )
+                    if unattempted_ids or unresolved_ids:
+                        msg = (
+                            f"{league} {season}: incomplete match scope; "
+                            f"unattempted={len(unattempted_ids)}, "
+                            f"unresolved={len(unresolved_ids)}"
+                        )
+                        logger.error(msg)
+                        self._stats['failures'] = (
+                            self._stats.get('failures', 0) + 1
+                        )
+                        self._stats.setdefault(
+                            'scope_errors', []
+                        ).append(msg)
                     # Save remaining data after each league/season
                     self._batch_save_match_data(
                         all_shot_events, all_match_events, all_lineups,
@@ -1724,9 +1879,15 @@ class FBrefDataReaderMixin:
                     )
 
                 except Exception as e:
-                    logger.error(
-                        f"Error processing {league} {season} for combined match data: {e}"
+                    msg = (
+                        f"Error processing {league} {season} for combined "
+                        f"match data: {e}"
                     )
+                    logger.error(msg)
+                    self._stats['failures'] = (
+                        self._stats.get('failures', 0) + 1
+                    )
+                    self._stats.setdefault('scope_errors', []).append(msg)
                     # Save whatever we have so far
                     self._batch_save_match_data(
                         all_shot_events, all_match_events, all_lineups,
@@ -1738,6 +1899,102 @@ class FBrefDataReaderMixin:
                 finally:
                     # Memory cleanup after each league/season
                     self._cleanup_after_league()
+
+        # Commit no-summary observations only after evaluating the whole run.
+        # A per-league guard can otherwise approve a few bad pages in each of
+        # hundreds of competitions and mass-tombstone them over three runs.
+        if pending_no_stats_observations:
+            tomb_df = pd.DataFrame(
+                pending_no_stats_observations
+            ).drop_duplicates(
+                subset=['league', 'season', 'match_id']
+            )
+            confirmed_count = len(tomb_df)
+            attempted_count = len(tombstone_attempted_ids)
+            guard_reason = self._no_stats_tombstone_guard_reason(
+                confirmed_count, attempted_count
+            )
+            if guard_reason:
+                logger.error(guard_reason)
+                self._stats['failures'] = (
+                    self._stats.get('failures', 0) + 1
+                )
+                self._stats.setdefault(
+                    'tombstone_guard_refusals', []
+                ).append(guard_reason)
+            else:
+                confirmation_id = (
+                    os.environ.get('FBREF_RUN_ID')
+                    or os.environ.get('AIRFLOW_CTX_DAG_RUN_ID')
+                    or getattr(self, '_batch_id', '')
+                )
+                tomb_df['reason'] = 'no_match_summary'
+                tomb_df['confirmation_id'] = confirmation_id
+                tomb_df['confirmed_at'] = pd.Timestamp.now(tz='UTC')
+                tomb_df = self._add_metadata(
+                    tomb_df, 'match_no_stats'
+                )
+                try:
+                    self.save_to_iceberg(
+                        df=tomb_df,
+                        table_name='fbref_match_no_stats',
+                        partition_cols=['league', 'season'],
+                        replace_partitions=[
+                            'match_id', 'confirmation_id'
+                        ],
+                    )
+                    logger.info(
+                        "Recorded %d no-summary observations across %d "
+                        "attempted matches",
+                        confirmed_count, attempted_count,
+                    )
+                except Exception as error:
+                    msg = (
+                        "match_no_stats observation persistence failed: "
+                        f"{error}"
+                    )
+                    logger.error(msg)
+                    self._stats['persistence_failures'] = (
+                        self._stats.get('persistence_failures', 0) + 1
+                    )
+                    self._stats.setdefault(
+                        'persistence_errors', []
+                    ).append(msg)
+
+        self._stats['eligible_match_ids'] = total_eligible_match_ids
+        self._stats['pending_match_ids'] = total_pending_match_ids
+        noop_candidate = (
+            incremental
+            and total_eligible_match_ids > 0
+            and total_pending_match_ids == 0
+            and skipped_league_seasons == 0
+        )
+        verified_noop_paths = []
+        missing_noop_tables = []
+        if noop_candidate:
+            for table_name in (
+                'fbref_match_events',
+                'fbref_lineups',
+                'fbref_match_team_stats',
+                'fbref_match_player_stats',
+            ):
+                try:
+                    exists = self._iceberg_writer.table_exists(
+                        'bronze', table_name
+                    )
+                except Exception:
+                    exists = False
+                if exists:
+                    verified_noop_paths.append(
+                        f'iceberg.bronze.{table_name}'
+                    )
+                else:
+                    missing_noop_tables.append(table_name)
+        self._stats['all_already_scraped'] = (
+            noop_candidate and not missing_noop_tables
+        )
+        self._stats['verified_noop_table_paths'] = verified_noop_paths
+        self._stats['missing_noop_tables'] = missing_noop_tables
 
         if skipped_league_seasons == total_league_seasons and total_league_seasons > 0:
             logger.error(
@@ -1786,6 +2043,12 @@ class FBrefDataReaderMixin:
         if data_type == 'schedule':
             # Schedule doesn't need match IDs, collect directly
             all_schedules = []
+            requested_targets = {
+                (league, season)
+                for league in self.leagues
+                for season in self.seasons
+            }
+            collected_targets = set()
 
             for league in self.leagues:
                 for season in self.seasons:
@@ -1793,16 +2056,33 @@ class FBrefDataReaderMixin:
                         df = self.read_schedule(league, season)
                         if df is not None and not df.empty:
                             all_schedules.append(df)
+                            collected_targets.add((league, season))
                             logger.info(
                                 f"Collected {len(df)} schedule rows "
                                 f"({league}, {season})"
                             )
                         time.sleep(1)  # Reduced from 3s - rate limiter handles main delays
                     except Exception as e:
-                        logger.error(
-                            f"Error collecting schedule for {league} {season}: {e}"
+                        msg = (
+                            f"Error collecting schedule for {league} "
+                            f"{season}: {e}"
                         )
+                        logger.error(msg)
+                        self._stats.setdefault(
+                            'scope_errors', []
+                        ).append(msg)
                         continue
+
+            missing_targets = sorted(
+                requested_targets - collected_targets
+            )
+            if missing_targets:
+                msg = f"Missing schedule targets: {missing_targets}"
+                logger.error(msg)
+                self._stats['failures'] = (
+                    self._stats.get('failures', 0) + 1
+                )
+                self._stats.setdefault('scope_errors', []).append(msg)
 
             if all_schedules:
                 combined_df = pd.concat(all_schedules, ignore_index=True)
@@ -1816,7 +2096,9 @@ class FBrefDataReaderMixin:
                         ]
                         if not league_df.empty:
                             safe_league = league.replace(' ', '_').replace('-', '_')
-                            path = f'/tmp/fbref_schedule_{safe_league}_{season}.json'
+                            path = _fbref_artifact_path(
+                                f'fbref_schedule_{safe_league}_{season}.json'
+                            )
                             league_df.to_json(
                                 path, orient='records', date_format='iso'
                             )
