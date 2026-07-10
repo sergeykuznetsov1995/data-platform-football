@@ -149,7 +149,10 @@ def _bootstrap(con) -> None:
         ('b2c3d4e5', DATE '2024-09-21', '2425', 'ENG-Premier League', '5',
          'arsenal', 'tottenham_hotspur', TRUE),
         ('c3d4e5f6', DATE '2025-05-25', '2425', 'ENG-Premier League', '38',
-         'liverpool', 'arsenal', FALSE)
+         'liverpool', 'arsenal', FALSE),
+        -- #867: away team missed xref_team -> dim_match.away_team_id is NULL.
+        ('d4e5f6a7', DATE '2024-10-05', '2425', 'ENG-Premier League', '7',
+         'chelsea', NULL, TRUE)
     """)
 
     # ===== spine: silver.fbref_match_enriched =====
@@ -178,7 +181,8 @@ def _bootstrap(con) -> None:
         ('a1b2c3d4', 3, 1, 23, 10, 12, 4, 61, 39, 1, 0, 0, 0, 3, 9),
         ('b2c3d4e5', 1, 1, 14, 14, 5, 5, 50, 50, 2, 3, 0, 0, 4, 4),
         ('c3d4e5f6', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
-         NULL, NULL, NULL, NULL, NULL, NULL)
+         NULL, NULL, NULL, NULL, NULL, NULL),
+        ('d4e5f6a7', 2, 0, 15, 8, 6, 2, 55, 45, 1, 1, 0, 0, 2, 6)
     """)
 
     # ===== empty stubs for the cross-source LEFT JOIN blocks =====
@@ -284,7 +288,14 @@ def _row(rows, match_id, team_id):
 class TestFctTeamMatchPointsResultLogic:
 
     def test_two_rows_per_match(self, fct_rows):
-        assert len(fct_rows) == 6  # 3 matches × 2 sides
+        assert len(fct_rows) == 6  # 3 resolvable matches × 2 sides
+
+    def test_unresolved_team_drops_the_whole_match(self, fct_rows):
+        """#867: dim_match.away_team_id NULL (xref_team miss) must drop BOTH
+        sides. Filtering team_id alone kept the home row with a NULL
+        opponent_id — 1 row/match, breaking star_grain and no_nulls at once."""
+        assert not [r for r in fct_rows if r["match_id"] == "d4e5f6a7"]
+        assert not [r for r in fct_rows if r["opponent_id"] is None]
 
     def test_home_win_points_and_result(self, fct_rows):
         home = _row(fct_rows, "a1b2c3d4", "liverpool")

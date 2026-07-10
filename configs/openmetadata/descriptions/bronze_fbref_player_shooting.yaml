@@ -7,6 +7,12 @@ table:
     Сезонная статистика ударов игроков из FBref (Shooting). Гранулярность:
     один row на (player, squad, league, season). Метрики — текстовые (приведение
     типов в Silver). Источник: FBref scrape (dag_ingest_fbref).
+
+    Только базовые метрики (gls/sh/sot/sot%/g_sh). Advanced-метрик здесь НЕТ:
+    с февраля 2026 FBref не отдаёт xG/npxG/xA/PSxG/SCA/GCA — во всём слое
+    bronze.fbref_* ноль колонок с xg (issue #892). Единственный источник xG —
+    silver.understat_shots (fallback silver.sofascore_shots); gold.fct_shot
+    собирается из них и не ждёт xG от FBref.
   tags:
     - Tier.Bronze
     - Domain.Football

@@ -459,7 +459,11 @@ class WhoScoredScraper(SoccerdataScraper):
         from scrapers.base.trino_manager import TrinoTableManager
 
         leagues = list(self.leagues or [])
-        season_strs = [_season_to_soccerdata_str(s) for s in (self.seasons or [])]
+        # #913: for INT-World Cup use literal year '2026' (single-year), do not convert to '2627'
+        if "INT-World Cup" in leagues:
+            season_strs = [str(s) for s in (self.seasons or [])]
+        else:
+            season_strs = [_season_to_soccerdata_str(s) for s in (self.seasons or [])]
         if not leagues or not season_strs:
             return []
 

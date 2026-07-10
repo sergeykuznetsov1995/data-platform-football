@@ -96,13 +96,19 @@ class TestBronzeFreshnessGate:
         dag_module.validate_bronze_freshness()
 
         checks = captured['checks']
-        assert {c.params['table'] for c in checks} == {
+        freshness = [c for c in checks if c.kind == 'freshness']
+        assert {c.params['table'] for c in freshness} == {
             'bronze.sofascore_match_stats',
             'bronze.sofascore_event_player_stats',
             'bronze.sofascore_player_ratings',
         }
-        assert all(c.kind == 'freshness' for c in checks)
-        assert all(c.params['ts_col'] == '_ingested_at' for c in checks)
+        assert all(c.params['ts_col'] == '_ingested_at' for c in freshness)
+        # #711: the gate also carries ONE labelled-stats coverage check —
+        # a partial /statistics capture writes rows without name/stat_name.
+        coverage = [c for c in checks if c.kind == 'coverage']
+        assert [c.params['table'] for c in coverage] == [
+            'bronze.sofascore_match_stats']
+        assert len(checks) == len(freshness) + len(coverage)
         assert all(c.severity == 'WARNING' for c in checks)
         # WARNING-only gate must not hard-fail the DAG.
         assert captured['raise_on_error'] is False

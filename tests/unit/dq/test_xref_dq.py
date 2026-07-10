@@ -499,12 +499,12 @@ def test_xref_player_review_source_enum_excludes_fbref():
 
 
 def test_xref_player_review_row_count_soft_ceiling():
-    """Soft ceiling 200 rows across the entire review table."""
+    """Soft ceiling 200 rows per in-scope league (E8b: 5 leagues -> 1000)."""
     checks = xref_dq.build_xref_player_review_checks()
     rc = [c for c in checks if c.kind == 'row_count' and 'enum' not in c.name]
     assert len(rc) == 1
     assert rc[0].params['min_rows'] == 0
-    assert rc[0].params['max_rows'] == 200
+    assert rc[0].params['max_rows'] == 200 * xref_dq._in_scope_leagues()
 
 
 def test_check_enum_compliance_helper_basic():

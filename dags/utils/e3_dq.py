@@ -804,14 +804,15 @@ def _build_fct_shot_checks() -> List[Check]:
 
         # Volume — APL multi-season ≈ 47K shots smoke-tested. Min 20K
         # WARNING for partial-backfill grace.
-        CHECK.row_count(table, min_rows=20_000, severity='WARNING'),
+        # #913 Phase 4: scope out INT-World Cup (no Understat coverage).
+        CHECK.row_count(table, min_rows=20_000, where="league <> 'INT-World Cup'", severity='WARNING'),
 
         # Player orphan rate guard — see threshold derivation above.
         CHECK.row_count(
             table=table,
             min_rows=0,
             max_rows=shot_orphan_max,
-            where="player_id IS NULL",
+            where="player_id IS NULL AND league <> 'INT-World Cup'",
             severity='WARNING',
             name='shot_orphan_player_rate',
         ),
@@ -895,10 +896,11 @@ def _build_fct_lineup_checks() -> List[Check]:
         ),
 
         # ref_integrity fct_lineup → xref_match — WARNING (not ERROR).
-        # ESPN bridge through (date, home_canonical, away_canonical) leaves
-        # ~35 distinct match_ids unbridged (1.4K rows / 0.9% of total) when
-        # the FBref/ESPN team-canonicalisation drifts on promotion teams.
-        # Tightens to ERROR after E1.5 cutover (xref_match adds ESPN source).
+        # #867: the ESPN bridge now reads xref_match itself, so a bridge MISS is
+        # no longer possible — but rows for games outside the FBref spine keep
+        # their source pseudo-id ('espn_<hash>', 'fm_'/'ss_'/'ws_'), which is not
+        # an xref_match.canonical_id. They stay orphans here by design (273K rows
+        # live 2026-07-08, mostly ESPN APL 2000/01-2015/16), hence WARNING.
         CHECK.ref_integrity(
             child='gold.fct_lineup',
             parent='silver.xref_match',

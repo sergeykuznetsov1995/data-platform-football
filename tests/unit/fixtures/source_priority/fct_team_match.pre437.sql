@@ -248,7 +248,9 @@ SELECT
     u.goals_against,
     -- #452: explicit `<` branch instead of ELSE — NULL goals (unplayed
     -- matches, is_completed = FALSE) fall through to NULL, not 0/'L'.
+    -- #913 Phase 3: points meaningless for knockout (WC etc.); NULL when is_knockout.
     CASE
+        WHEN dm.is_knockout THEN NULL
         WHEN u.goals_for > u.goals_against THEN 3
         WHEN u.goals_for = u.goals_against THEN 1
         WHEN u.goals_for < u.goals_against THEN 0
@@ -386,5 +388,6 @@ LEFT JOIN iceberg.silver.fotmob_team_match fm
     AND fm.league   = u.league
     AND fm.season   = u.season_slug
 
-WHERE u.match_id IS NOT NULL
-  AND u.team_id  IS NOT NULL
+WHERE u.match_id    IS NOT NULL
+  AND u.team_id     IS NOT NULL
+  AND u.opponent_id IS NOT NULL

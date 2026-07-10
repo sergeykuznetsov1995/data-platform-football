@@ -611,3 +611,2333 @@ teams:
     aliases:
       _generic: ["Middlesbrough"]
     competition_scope: ["ENG-Premier League"]
+
+  # ===========================================================================
+  # ESP-La Liga (E8b)
+  # ===========================================================================
+
+  # ====== Deportivo Alavés ======
+  - canonical_name: "Deportivo Alavés"
+    canonical_id: "alaves"
+    country: "Spain"
+    short_name: "Alavés"
+    aliases:
+      _generic:
+        - "Alaves"
+        - "Alavés"
+        - "Deportivo Alavés"
+      fbref: ["Alavés"]
+      understat: ["Alaves"]
+      matchhistory: ["Alaves"]
+    competition_scope: ["ESP-La Liga"]
+
+  # ====== UD Almería ======
+  - canonical_name: "UD Almería"
+    canonical_id: "almeria"
+    country: "Spain"
+    short_name: "Almería"
+    aliases:
+      _generic:
+        - "Almeria"
+        - "Almería"
+        - "UD Almería"
+      fbref: ["Almería"]
+      understat: ["Almeria"]
+      matchhistory: ["Almeria"]
+    competition_scope: ["ESP-La Liga"]
+
+  # ====== Athletic Club ======
+  - canonical_name: "Athletic Club"
+    canonical_id: "athletic_club"
+    country: "Spain"
+    short_name: "Athletic"
+    aliases:
+      _generic:
+        - "Ath Bilbao"
+        - "Athletic Club"
+      fbref: ["Athletic Club"]
+      understat: ["Athletic Club"]
+      matchhistory: ["Ath Bilbao"]
+    competition_scope: ["ESP-La Liga"]
+
+  # ====== Atlético Madrid ======
+  - canonical_name: "Atlético Madrid"
+    canonical_id: "atletico_madrid"
+    country: "Spain"
+    short_name: "Atlético"
+    aliases:
+      _generic:
+        - "Ath Madrid"
+        - "Atletico Madrid"
+        - "Atlético Madrid"
+      fbref: ["Atlético Madrid"]
+      understat: ["Atletico Madrid"]
+      matchhistory: ["Ath Madrid"]
+    competition_scope: ["ESP-La Liga"]
+
+  # ====== FC Barcelona ======
+  - canonical_name: "FC Barcelona"
+    canonical_id: "barcelona_es"
+    country: "Spain"
+    short_name: "Barcelona"
+    aliases:
+      _generic:
+        - "Barcelona"
+        - "FC Barcelona"
+      fbref: ["Barcelona"]
+      understat: ["Barcelona"]
+      matchhistory: ["Barcelona"]
+    competition_scope: ["ESP-La Liga"]
+
+  # ====== Cádiz CF ======
+  - canonical_name: "Cádiz CF"
+    canonical_id: "cadiz"
+    country: "Spain"
+    short_name: "Cádiz"
+    aliases:
+      _generic:
+        - "Cadiz"
+        - "Cádiz"
+        - "Cádiz CF"
+      fbref: ["Cádiz"]
+      understat: ["Cadiz"]
+      matchhistory: ["Cadiz"]
+    competition_scope: ["ESP-La Liga"]
+
+  # ====== Celta Vigo ======
+  - canonical_name: "Celta Vigo"
+    canonical_id: "celta_vigo"
+    country: "Spain"
+    short_name: "Celta"
+    aliases:
+      _generic:
+        - "Celta"
+        - "Celta Vigo"
+      fbref: ["Celta Vigo"]
+      understat: ["Celta Vigo"]
+      matchhistory: ["Celta"]
+    competition_scope: ["ESP-La Liga"]
+
+  # ====== Deportivo La Coruña ======
+  - canonical_name: "Deportivo La Coruña"
+    canonical_id: "deportivo_la_coruna"
+    country: "Spain"
+    short_name: "Dep La Coruña"
+    aliases:
+      _generic:
+        - "Dep La Coruña"
+        - "Deportivo La Coruna"
+        - "Deportivo La Coruña"
+        - "La Coruna"
+      fbref: ["Dep La Coruña", "Deportivo La Coruña"]
+      understat: ["Deportivo La Coruna"]
+      matchhistory: ["La Coruna"]
+    competition_scope: ["ESP-La Liga"]
+
+  # ====== SD Eibar ======
+  - canonical_name: "SD Eibar"
+    canonical_id: "eibar"
+    country: "Spain"
+    short_name: "Eibar"
+    aliases:
+      _generic:
+        - "Eibar"
+        - "SD Eibar"
+      fbref: ["Eibar"]
+      understat: ["Eibar"]
+      matchhistory: ["Eibar"]
+    competition_scope: ["ESP-La Liga"]
+
+  # ====== Elche CF ======
+  - canonical_name: "Elche CF"
+    canonical_id: "elche"
+    country: "Spain"
+    short_name: "Elche"
+    aliases:
+      _generic:
+        - "Elche"
+        - "Elche CF"
+      fbref: ["Elche"]
+      understat: ["Elche"]
+      matchhistory: ["Elche"]
+    competition_scope: ["ESP-La Liga"]
+
+  # ====== RCD Espanyol ======
+  - canonical_name: "RCD Espanyol"
+    canonical_id: "espanyol"
+    country: "Spain"
+    short_name: "Espanyol"
+    aliases:
+      _generic:
+        - "Espanol"
+        - "Espanyol"
+        - "RCD Espanyol"
+      fbref: ["Espanyol"]
+      understat: ["Espanyol"]
+      matchhistory: ["Espanol"]
+    competition_scope: ["ESP-La Liga"]
+
+  # ====== Getafe CF ======
+  - canonical_name: "Getafe CF"
+    canonical_id: "getafe"
+    country: "Spain"
+    short_name: "Getafe"
+    aliases:
+      _generic:
+        - "Getafe"
+        - "Getafe CF"
+      fbref: ["Getafe"]
+      understat: ["Getafe"]
+      matchhistory: ["Getafe"]
+    competition_scope: ["ESP-La Liga"]
+
+  # ====== Girona FC ======
+  - canonical_name: "Girona FC"
+    canonical_id: "girona"
+    country: "Spain"
+    short_name: "Girona"
+    aliases:
+      _generic:
+        - "Girona"
+        - "Girona FC"
+      fbref: ["Girona"]
+      understat: ["Girona"]
+      matchhistory: ["Girona"]
+    competition_scope: ["ESP-La Liga"]
+
+  # ====== Granada CF ======
+  - canonical_name: "Granada CF"
+    canonical_id: "granada"
+    country: "Spain"
+    short_name: "Granada"
+    aliases:
+      _generic:
+        - "Granada"
+        - "Granada CF"
+      fbref: ["Granada"]
+      understat: ["Granada"]
+      matchhistory: ["Granada"]
+    competition_scope: ["ESP-La Liga"]
+
+  # ====== SD Huesca ======
+  - canonical_name: "SD Huesca"
+    canonical_id: "huesca"
+    country: "Spain"
+    short_name: "Huesca"
+    aliases:
+      _generic:
+        - "Huesca"
+        - "SD Huesca"
+      fbref: ["Huesca"]
+      understat: ["SD Huesca"]
+      matchhistory: ["Huesca"]
+    competition_scope: ["ESP-La Liga"]
+
+  # ====== UD Las Palmas ======
+  - canonical_name: "UD Las Palmas"
+    canonical_id: "las_palmas"
+    country: "Spain"
+    short_name: "Las Palmas"
+    aliases:
+      _generic:
+        - "Las Palmas"
+        - "UD Las Palmas"
+      fbref: ["Las Palmas"]
+      understat: ["Las Palmas"]
+      matchhistory: ["Las Palmas"]
+    competition_scope: ["ESP-La Liga"]
+
+  # ====== CD Leganés ======
+  - canonical_name: "CD Leganés"
+    canonical_id: "leganes"
+    country: "Spain"
+    short_name: "Leganés"
+    aliases:
+      _generic:
+        - "CD Leganés"
+        - "Leganes"
+        - "Leganés"
+      fbref: ["Leganés"]
+      understat: ["Leganes"]
+      matchhistory: ["Leganes"]
+    competition_scope: ["ESP-La Liga"]
+
+  # ====== Levante UD ======
+  - canonical_name: "Levante UD"
+    canonical_id: "levante"
+    country: "Spain"
+    short_name: "Levante"
+    aliases:
+      _generic:
+        - "Levante"
+        - "Levante UD"
+      fbref: ["Levante"]
+      understat: ["Levante"]
+      matchhistory: ["Levante"]
+    competition_scope: ["ESP-La Liga"]
+
+  # ====== Málaga CF ======
+  - canonical_name: "Málaga CF"
+    canonical_id: "malaga"
+    country: "Spain"
+    short_name: "Málaga"
+    aliases:
+      _generic:
+        - "Malaga"
+        - "Málaga"
+        - "Málaga CF"
+      fbref: ["Málaga"]
+      understat: ["Malaga"]
+      matchhistory: ["Malaga"]
+    competition_scope: ["ESP-La Liga"]
+
+  # ====== RCD Mallorca ======
+  - canonical_name: "RCD Mallorca"
+    canonical_id: "mallorca"
+    country: "Spain"
+    short_name: "Mallorca"
+    aliases:
+      _generic:
+        - "Mallorca"
+        - "RCD Mallorca"
+      fbref: ["Mallorca"]
+      understat: ["Mallorca"]
+      matchhistory: ["Mallorca"]
+    competition_scope: ["ESP-La Liga"]
+
+  # ====== CA Osasuna ======
+  - canonical_name: "CA Osasuna"
+    canonical_id: "osasuna"
+    country: "Spain"
+    short_name: "Osasuna"
+    aliases:
+      _generic:
+        - "CA Osasuna"
+        - "Osasuna"
+      fbref: ["Osasuna"]
+      understat: ["Osasuna"]
+      matchhistory: ["Osasuna"]
+    competition_scope: ["ESP-La Liga"]
+
+  # ====== Real Oviedo ======
+  - canonical_name: "Real Oviedo"
+    canonical_id: "real_oviedo"
+    country: "Spain"
+    short_name: "Oviedo"
+    aliases:
+      _generic:
+        - "Oviedo"
+        - "Real Oviedo"
+      fbref: ["Oviedo"]
+      understat: ["Real Oviedo"]
+      matchhistory: ["Oviedo"]
+    competition_scope: ["ESP-La Liga"]
+
+  # ====== Rayo Vallecano ======
+  - canonical_name: "Rayo Vallecano"
+    canonical_id: "rayo_vallecano"
+    country: "Spain"
+    short_name: "Rayo"
+    aliases:
+      _generic:
+        - "Rayo Vallecano"
+        - "Vallecano"
+      fbref: ["Rayo Vallecano"]
+      understat: ["Rayo Vallecano"]
+      matchhistory: ["Vallecano"]
+    competition_scope: ["ESP-La Liga"]
+
+  # ====== Real Betis ======
+  - canonical_name: "Real Betis"
+    canonical_id: "real_betis"
+    country: "Spain"
+    short_name: "Betis"
+    aliases:
+      _generic:
+        - "Betis"
+        - "Real Betis"
+      fbref: ["Real Betis"]
+      understat: ["Real Betis"]
+      matchhistory: ["Betis"]
+    competition_scope: ["ESP-La Liga"]
+
+  # ====== Real Madrid ======
+  - canonical_name: "Real Madrid"
+    canonical_id: "real_madrid"
+    country: "Spain"
+    short_name: "Real Madrid"
+    aliases:
+      _generic:
+        - "Real Madrid"
+      fbref: ["Real Madrid"]
+      understat: ["Real Madrid"]
+      matchhistory: ["Real Madrid"]
+    competition_scope: ["ESP-La Liga"]
+
+  # ====== Real Sociedad ======
+  - canonical_name: "Real Sociedad"
+    canonical_id: "real_sociedad"
+    country: "Spain"
+    short_name: "Real Sociedad"
+    aliases:
+      _generic:
+        - "Real Sociedad"
+        - "Sociedad"
+      fbref: ["Real Sociedad"]
+      understat: ["Real Sociedad"]
+      matchhistory: ["Sociedad"]
+    competition_scope: ["ESP-La Liga"]
+
+  # ====== Sevilla FC ======
+  - canonical_name: "Sevilla FC"
+    canonical_id: "sevilla"
+    country: "Spain"
+    short_name: "Sevilla"
+    aliases:
+      _generic:
+        - "Sevilla"
+        - "Sevilla FC"
+      fbref: ["Sevilla"]
+      understat: ["Sevilla"]
+      matchhistory: ["Sevilla"]
+    competition_scope: ["ESP-La Liga"]
+
+  # ====== Sporting Gijón ======
+  - canonical_name: "Sporting Gijón"
+    canonical_id: "sporting_gijon"
+    country: "Spain"
+    short_name: "Sporting"
+    aliases:
+      _generic:
+        - "Sp Gijon"
+        - "Sporting Gijon"
+        - "Sporting Gijón"
+      fbref: ["Sporting Gijón"]
+      understat: ["Sporting Gijon"]
+      matchhistory: ["Sp Gijon"]
+    competition_scope: ["ESP-La Liga"]
+
+  # ====== Valencia CF ======
+  - canonical_name: "Valencia CF"
+    canonical_id: "valencia_es"
+    country: "Spain"
+    short_name: "Valencia"
+    aliases:
+      _generic:
+        - "Valencia"
+        - "Valencia CF"
+      fbref: ["Valencia"]
+      understat: ["Valencia"]
+      matchhistory: ["Valencia"]
+    competition_scope: ["ESP-La Liga"]
+
+  # ====== Real Valladolid ======
+  - canonical_name: "Real Valladolid"
+    canonical_id: "real_valladolid"
+    country: "Spain"
+    short_name: "Valladolid"
+    aliases:
+      _generic:
+        - "Real Valladolid"
+        - "Valladolid"
+      fbref: ["Valladolid"]
+      understat: ["Real Valladolid"]
+      matchhistory: ["Valladolid"]
+    competition_scope: ["ESP-La Liga"]
+
+  # ====== Villarreal CF ======
+  - canonical_name: "Villarreal CF"
+    canonical_id: "villarreal"
+    country: "Spain"
+    short_name: "Villarreal"
+    aliases:
+      _generic:
+        - "Villarreal"
+        - "Villarreal CF"
+      fbref: ["Villarreal"]
+      understat: ["Villarreal"]
+      matchhistory: ["Villarreal"]
+    competition_scope: ["ESP-La Liga"]
+
+  # ===========================================================================
+  # FRA-Ligue 1 (E8b)
+  # ===========================================================================
+
+  # ====== AC Ajaccio ======
+  - canonical_name: "AC Ajaccio"
+    canonical_id: "ac_ajaccio"
+    country: "France"
+    short_name: "Ajaccio"
+    aliases:
+      _generic:
+        - "AC Ajaccio"
+        - "Ajaccio"
+      fbref: ["Ajaccio"]
+      understat: ["Ajaccio"]
+      matchhistory: ["Ajaccio"]
+    competition_scope: ["FRA-Ligue 1"]
+
+  # ====== Amiens SC ======
+  - canonical_name: "Amiens SC"
+    canonical_id: "amiens"
+    country: "France"
+    short_name: "Amiens"
+    aliases:
+      _generic:
+        - "Amiens"
+        - "Amiens SC"
+      fbref: ["Amiens"]
+      understat: ["Amiens"]
+      matchhistory: ["Amiens"]
+    competition_scope: ["FRA-Ligue 1"]
+
+  # ====== Angers SCO ======
+  - canonical_name: "Angers SCO"
+    canonical_id: "angers"
+    country: "France"
+    short_name: "Angers"
+    aliases:
+      _generic:
+        - "Angers"
+        - "Angers SCO"
+      fbref: ["Angers"]
+      understat: ["Angers"]
+      matchhistory: ["Angers"]
+    competition_scope: ["FRA-Ligue 1"]
+
+  # ====== AJ Auxerre ======
+  - canonical_name: "AJ Auxerre"
+    canonical_id: "auxerre"
+    country: "France"
+    short_name: "Auxerre"
+    aliases:
+      _generic:
+        - "AJ Auxerre"
+        - "Auxerre"
+      fbref: ["Auxerre"]
+      understat: ["Auxerre"]
+      matchhistory: ["Auxerre"]
+    competition_scope: ["FRA-Ligue 1"]
+
+  # ====== SC Bastia ======
+  - canonical_name: "SC Bastia"
+    canonical_id: "bastia"
+    country: "France"
+    short_name: "Bastia"
+    aliases:
+      _generic:
+        - "Bastia"
+        - "SC Bastia"
+      fbref: ["Bastia"]
+      understat: ["SC Bastia"]
+      matchhistory: ["Bastia"]
+    competition_scope: ["FRA-Ligue 1"]
+
+  # ====== Girondins de Bordeaux ======
+  - canonical_name: "Girondins de Bordeaux"
+    canonical_id: "bordeaux"
+    country: "France"
+    short_name: "Bordeaux"
+    aliases:
+      _generic:
+        - "Bordeaux"
+        - "Girondins de Bordeaux"
+      fbref: ["Bordeaux"]
+      understat: ["Bordeaux"]
+      matchhistory: ["Bordeaux"]
+    competition_scope: ["FRA-Ligue 1"]
+
+  # ====== Stade Brestois 29 ======
+  - canonical_name: "Stade Brestois 29"
+    canonical_id: "brest"
+    country: "France"
+    short_name: "Brest"
+    aliases:
+      _generic:
+        - "Brest"
+        - "Stade Brestois 29"
+      fbref: ["Brest"]
+      understat: ["Brest"]
+      matchhistory: ["Brest"]
+    competition_scope: ["FRA-Ligue 1"]
+
+  # ====== SM Caen ======
+  - canonical_name: "SM Caen"
+    canonical_id: "caen"
+    country: "France"
+    short_name: "Caen"
+    aliases:
+      _generic:
+        - "Caen"
+        - "SM Caen"
+      fbref: ["Caen"]
+      understat: ["Caen"]
+      matchhistory: ["Caen"]
+    competition_scope: ["FRA-Ligue 1"]
+
+  # ====== Clermont Foot 63 ======
+  - canonical_name: "Clermont Foot 63"
+    canonical_id: "clermont_foot"
+    country: "France"
+    short_name: "Clermont"
+    aliases:
+      _generic:
+        - "Clermont"
+        - "Clermont Foot"
+        - "Clermont Foot 63"
+      fbref: ["Clermont Foot"]
+      understat: ["Clermont Foot"]
+      matchhistory: ["Clermont"]
+    competition_scope: ["FRA-Ligue 1"]
+
+  # ====== Dijon FCO ======
+  - canonical_name: "Dijon FCO"
+    canonical_id: "dijon"
+    country: "France"
+    short_name: "Dijon"
+    aliases:
+      _generic:
+        - "Dijon"
+        - "Dijon FCO"
+      fbref: ["Dijon"]
+      understat: ["Dijon"]
+      matchhistory: ["Dijon"]
+    competition_scope: ["FRA-Ligue 1"]
+
+  # ====== EA Guingamp ======
+  - canonical_name: "EA Guingamp"
+    canonical_id: "guingamp"
+    country: "France"
+    short_name: "Guingamp"
+    aliases:
+      _generic:
+        - "EA Guingamp"
+        - "Guingamp"
+      fbref: ["Guingamp"]
+      understat: ["Guingamp"]
+      matchhistory: ["Guingamp"]
+    competition_scope: ["FRA-Ligue 1"]
+
+  # ====== Le Havre AC ======
+  - canonical_name: "Le Havre AC"
+    canonical_id: "le_havre"
+    country: "France"
+    short_name: "Le Havre"
+    aliases:
+      _generic:
+        - "Le Havre"
+        - "Le Havre AC"
+      fbref: ["Le Havre"]
+      understat: ["Le Havre"]
+      matchhistory: ["Le Havre"]
+    competition_scope: ["FRA-Ligue 1"]
+
+  # ====== RC Lens ======
+  - canonical_name: "RC Lens"
+    canonical_id: "lens"
+    country: "France"
+    short_name: "Lens"
+    aliases:
+      _generic:
+        - "Lens"
+        - "RC Lens"
+      fbref: ["Lens"]
+      understat: ["Lens"]
+      matchhistory: ["Lens"]
+    competition_scope: ["FRA-Ligue 1"]
+
+  # ====== LOSC Lille ======
+  - canonical_name: "LOSC Lille"
+    canonical_id: "lille"
+    country: "France"
+    short_name: "Lille"
+    aliases:
+      _generic:
+        - "LOSC Lille"
+        - "Lille"
+      fbref: ["Lille"]
+      understat: ["Lille"]
+      matchhistory: ["Lille"]
+    competition_scope: ["FRA-Ligue 1"]
+
+  # ====== FC Lorient ======
+  - canonical_name: "FC Lorient"
+    canonical_id: "lorient"
+    country: "France"
+    short_name: "Lorient"
+    aliases:
+      _generic:
+        - "FC Lorient"
+        - "Lorient"
+      fbref: ["Lorient"]
+      understat: ["Lorient"]
+      matchhistory: ["Lorient"]
+    competition_scope: ["FRA-Ligue 1"]
+
+  # ====== Olympique Lyonnais ======
+  - canonical_name: "Olympique Lyonnais"
+    canonical_id: "lyon"
+    country: "France"
+    short_name: "Lyon"
+    aliases:
+      _generic:
+        - "Lyon"
+        - "Olympique Lyonnais"
+      fbref: ["Lyon"]
+      understat: ["Lyon"]
+      matchhistory: ["Lyon"]
+    competition_scope: ["FRA-Ligue 1"]
+
+  # ====== Olympique de Marseille ======
+  - canonical_name: "Olympique de Marseille"
+    canonical_id: "marseille"
+    country: "France"
+    short_name: "Marseille"
+    aliases:
+      _generic:
+        - "Marseille"
+        - "Olympique de Marseille"
+      fbref: ["Marseille"]
+      understat: ["Marseille"]
+      matchhistory: ["Marseille"]
+    competition_scope: ["FRA-Ligue 1"]
+
+  # ====== FC Metz ======
+  - canonical_name: "FC Metz"
+    canonical_id: "metz"
+    country: "France"
+    short_name: "Metz"
+    aliases:
+      _generic:
+        - "FC Metz"
+        - "Metz"
+      fbref: ["Metz"]
+      understat: ["Metz"]
+      matchhistory: ["Metz"]
+    competition_scope: ["FRA-Ligue 1"]
+
+  # ====== AS Monaco ======
+  - canonical_name: "AS Monaco"
+    canonical_id: "monaco"
+    country: "France"
+    short_name: "Monaco"
+    aliases:
+      _generic:
+        - "AS Monaco"
+        - "Monaco"
+      fbref: ["Monaco"]
+      understat: ["Monaco"]
+      matchhistory: ["Monaco"]
+    competition_scope: ["FRA-Ligue 1"]
+
+  # ====== Montpellier HSC ======
+  - canonical_name: "Montpellier HSC"
+    canonical_id: "montpellier"
+    country: "France"
+    short_name: "Montpellier"
+    aliases:
+      _generic:
+        - "Montpellier"
+        - "Montpellier HSC"
+      fbref: ["Montpellier"]
+      understat: ["Montpellier"]
+      matchhistory: ["Montpellier"]
+    competition_scope: ["FRA-Ligue 1"]
+
+  # ====== AS Nancy Lorraine ======
+  - canonical_name: "AS Nancy Lorraine"
+    canonical_id: "nancy"
+    country: "France"
+    short_name: "Nancy"
+    aliases:
+      _generic:
+        - "AS Nancy Lorraine"
+        - "Nancy"
+      fbref: ["Nancy"]
+      understat: ["Nancy"]
+      matchhistory: ["Nancy"]
+    competition_scope: ["FRA-Ligue 1"]
+
+  # ====== FC Nantes ======
+  - canonical_name: "FC Nantes"
+    canonical_id: "nantes"
+    country: "France"
+    short_name: "Nantes"
+    aliases:
+      _generic:
+        - "FC Nantes"
+        - "Nantes"
+      fbref: ["Nantes"]
+      understat: ["Nantes"]
+      matchhistory: ["Nantes"]
+    competition_scope: ["FRA-Ligue 1"]
+
+  # ====== OGC Nice ======
+  - canonical_name: "OGC Nice"
+    canonical_id: "nice"
+    country: "France"
+    short_name: "Nice"
+    aliases:
+      _generic:
+        - "Nice"
+        - "OGC Nice"
+      fbref: ["Nice"]
+      understat: ["Nice"]
+      matchhistory: ["Nice"]
+    competition_scope: ["FRA-Ligue 1"]
+
+  # ====== Nîmes Olympique ======
+  - canonical_name: "Nîmes Olympique"
+    canonical_id: "nimes"
+    country: "France"
+    short_name: "Nîmes"
+    aliases:
+      _generic:
+        - "Nimes"
+        - "Nîmes"
+        - "Nîmes Olympique"
+      fbref: ["Nîmes"]
+      understat: ["Nimes"]
+      matchhistory: ["Nimes"]
+    competition_scope: ["FRA-Ligue 1"]
+
+  # ====== Paris FC ======
+  - canonical_name: "Paris FC"
+    canonical_id: "paris_fc"
+    country: "France"
+    short_name: "Paris FC"
+    aliases:
+      _generic:
+        - "Paris FC"
+      fbref: ["Paris FC"]
+      understat: ["Paris FC"]
+      matchhistory: ["Paris FC"]
+    competition_scope: ["FRA-Ligue 1"]
+
+  # ====== Paris Saint-Germain ======
+  - canonical_name: "Paris Saint-Germain"
+    canonical_id: "paris_saint_germain"
+    country: "France"
+    short_name: "PSG"
+    aliases:
+      _generic:
+        - "PSG"
+        - "Paris SG"
+        - "Paris Saint Germain"
+        - "Paris Saint-Germain"
+      fbref: ["PSG", "Paris Saint-Germain"]
+      understat: ["Paris Saint Germain"]
+      matchhistory: ["Paris SG"]
+    competition_scope: ["FRA-Ligue 1"]
+
+  # ====== Stade de Reims ======
+  - canonical_name: "Stade de Reims"
+    canonical_id: "reims"
+    country: "France"
+    short_name: "Reims"
+    aliases:
+      _generic:
+        - "Reims"
+        - "Stade de Reims"
+      fbref: ["Reims"]
+      understat: ["Reims"]
+      matchhistory: ["Reims"]
+    competition_scope: ["FRA-Ligue 1"]
+
+  # ====== Stade Rennais ======
+  - canonical_name: "Stade Rennais"
+    canonical_id: "rennes"
+    country: "France"
+    short_name: "Rennes"
+    aliases:
+      _generic:
+        - "Rennes"
+        - "Stade Rennais"
+      fbref: ["Rennes"]
+      understat: ["Rennes"]
+      matchhistory: ["Rennes"]
+    competition_scope: ["FRA-Ligue 1"]
+
+  # ====== AS Saint-Étienne ======
+  - canonical_name: "AS Saint-Étienne"
+    canonical_id: "saint_etienne"
+    country: "France"
+    short_name: "Saint-Étienne"
+    aliases:
+      _generic:
+        - "AS Saint-Étienne"
+        - "Saint-Etienne"
+        - "Saint-Étienne"
+        - "St Etienne"
+      fbref: ["Saint-Étienne"]
+      understat: ["Saint-Etienne"]
+      matchhistory: ["St Etienne"]
+    competition_scope: ["FRA-Ligue 1"]
+
+  # ====== RC Strasbourg Alsace ======
+  - canonical_name: "RC Strasbourg Alsace"
+    canonical_id: "strasbourg"
+    country: "France"
+    short_name: "Strasbourg"
+    aliases:
+      _generic:
+        - "RC Strasbourg Alsace"
+        - "Strasbourg"
+      fbref: ["Strasbourg"]
+      understat: ["Strasbourg"]
+      matchhistory: ["Strasbourg"]
+    competition_scope: ["FRA-Ligue 1"]
+
+  # ====== Toulouse FC ======
+  - canonical_name: "Toulouse FC"
+    canonical_id: "toulouse"
+    country: "France"
+    short_name: "Toulouse"
+    aliases:
+      _generic:
+        - "Toulouse"
+        - "Toulouse FC"
+      fbref: ["Toulouse"]
+      understat: ["Toulouse"]
+      matchhistory: ["Toulouse"]
+    competition_scope: ["FRA-Ligue 1"]
+
+  # ====== ES Troyes AC ======
+  - canonical_name: "ES Troyes AC"
+    canonical_id: "troyes"
+    country: "France"
+    short_name: "Troyes"
+    aliases:
+      _generic:
+        - "ES Troyes AC"
+        - "Troyes"
+      fbref: ["Troyes"]
+      understat: ["Troyes"]
+      matchhistory: ["Troyes"]
+    competition_scope: ["FRA-Ligue 1"]
+
+  # ===========================================================================
+  # GER-Bundesliga (E8b)
+  # ===========================================================================
+
+  # ====== Arminia Bielefeld ======
+  - canonical_name: "Arminia Bielefeld"
+    canonical_id: "arminia_bielefeld"
+    country: "Germany"
+    short_name: "Arminia"
+    aliases:
+      _generic:
+        - "Arminia"
+        - "Arminia Bielefeld"
+        - "Bielefeld"
+      fbref: ["Arminia", "Arminia Bielefeld"]
+      understat: ["Arminia Bielefeld"]
+      matchhistory: ["Bielefeld"]
+    competition_scope: ["GER-Bundesliga"]
+
+  # ====== FC Augsburg ======
+  - canonical_name: "FC Augsburg"
+    canonical_id: "augsburg"
+    country: "Germany"
+    short_name: "Augsburg"
+    aliases:
+      _generic:
+        - "Augsburg"
+        - "FC Augsburg"
+      fbref: ["Augsburg"]
+      understat: ["Augsburg"]
+      matchhistory: ["Augsburg"]
+    competition_scope: ["GER-Bundesliga"]
+
+  # ====== Bayer 04 Leverkusen ======
+  - canonical_name: "Bayer 04 Leverkusen"
+    canonical_id: "bayer_leverkusen"
+    country: "Germany"
+    short_name: "Leverkusen"
+    aliases:
+      _generic:
+        - "Bayer 04 Leverkusen"
+        - "Bayer Leverkusen"
+        - "Leverkusen"
+      fbref: ["Leverkusen"]
+      understat: ["Bayer Leverkusen"]
+      matchhistory: ["Leverkusen"]
+    competition_scope: ["GER-Bundesliga"]
+
+  # ====== Bayern München ======
+  - canonical_name: "Bayern München"
+    canonical_id: "bayern_munich"
+    country: "Germany"
+    short_name: "Bayern"
+    aliases:
+      _generic:
+        - "Bayern Munich"
+        - "Bayern München"
+      fbref: ["Bayern Munich"]
+      understat: ["Bayern Munich"]
+      matchhistory: ["Bayern Munich"]
+    competition_scope: ["GER-Bundesliga"]
+
+  # ====== VfL Bochum ======
+  - canonical_name: "VfL Bochum"
+    canonical_id: "bochum"
+    country: "Germany"
+    short_name: "Bochum"
+    aliases:
+      _generic:
+        - "Bochum"
+        - "VfL Bochum"
+      fbref: ["Bochum"]
+      understat: ["Bochum"]
+      matchhistory: ["Bochum"]
+    competition_scope: ["GER-Bundesliga"]
+
+  # ====== Borussia Dortmund ======
+  - canonical_name: "Borussia Dortmund"
+    canonical_id: "borussia_dortmund"
+    country: "Germany"
+    short_name: "Dortmund"
+    aliases:
+      _generic:
+        - "Borussia Dortmund"
+        - "Dortmund"
+      fbref: ["Dortmund"]
+      understat: ["Borussia Dortmund"]
+      matchhistory: ["Dortmund"]
+    competition_scope: ["GER-Bundesliga"]
+
+  # ====== Borussia Mönchengladbach ======
+  - canonical_name: "Borussia Mönchengladbach"
+    canonical_id: "borussia_monchengladbach"
+    country: "Germany"
+    short_name: "Gladbach"
+    aliases:
+      _generic:
+        - "Borussia M.Gladbach"
+        - "Borussia Mönchengladbach"
+        - "Gladbach"
+        - "M'gladbach"
+        - "Mönchengladbach"
+      fbref: ["Gladbach", "Mönchengladbach"]
+      understat: ["Borussia M.Gladbach"]
+      matchhistory: ["M'gladbach"]
+    competition_scope: ["GER-Bundesliga"]
+
+  # ====== SV Darmstadt 98 ======
+  - canonical_name: "SV Darmstadt 98"
+    canonical_id: "darmstadt_98"
+    country: "Germany"
+    short_name: "Darmstadt"
+    aliases:
+      _generic:
+        - "Darmstadt"
+        - "Darmstadt 98"
+        - "SV Darmstadt 98"
+      fbref: ["Darmstadt 98"]
+      understat: ["Darmstadt"]
+      matchhistory: ["Darmstadt"]
+    competition_scope: ["GER-Bundesliga"]
+
+  # ====== Eintracht Braunschweig ======
+  - canonical_name: "Eintracht Braunschweig"
+    canonical_id: "eintracht_braunschweig"
+    country: "Germany"
+    short_name: "Braunschweig"
+    aliases:
+      _generic:
+        - "BTSV"
+        - "Eintracht Braunschweig"
+      fbref: ["BTSV"]
+    competition_scope: ["GER-Bundesliga"]
+
+  # ====== Eintracht Frankfurt ======
+  - canonical_name: "Eintracht Frankfurt"
+    canonical_id: "eintracht_frankfurt"
+    country: "Germany"
+    short_name: "Frankfurt"
+    aliases:
+      _generic:
+        - "Ein Frankfurt"
+        - "Eintracht Frankfurt"
+        - "Frankfurt"
+      fbref: ["Eintracht Frankfurt", "Frankfurt"]
+      understat: ["Eintracht Frankfurt"]
+      matchhistory: ["Ein Frankfurt"]
+    competition_scope: ["GER-Bundesliga"]
+
+  # ====== SV Elversberg ======
+  - canonical_name: "SV Elversberg"
+    canonical_id: "elversberg"
+    country: "Germany"
+    short_name: "Elversberg"
+    aliases:
+      _generic:
+        - "Elversberg"
+        - "SV Elversberg"
+      fbref: ["Elversberg"]
+    competition_scope: ["GER-Bundesliga"]
+
+  # ====== Fortuna Düsseldorf ======
+  - canonical_name: "Fortuna Düsseldorf"
+    canonical_id: "fortuna_dusseldorf"
+    country: "Germany"
+    short_name: "Düsseldorf"
+    aliases:
+      _generic:
+        - "Düsseldorf"
+        - "Fortuna Duesseldorf"
+        - "Fortuna Dusseldorf"
+        - "Fortuna Düsseldorf"
+      fbref: ["Düsseldorf"]
+      understat: ["Fortuna Duesseldorf"]
+      matchhistory: ["Fortuna Dusseldorf"]
+    competition_scope: ["GER-Bundesliga"]
+
+  # ====== SC Freiburg ======
+  - canonical_name: "SC Freiburg"
+    canonical_id: "freiburg"
+    country: "Germany"
+    short_name: "Freiburg"
+    aliases:
+      _generic:
+        - "Freiburg"
+        - "SC Freiburg"
+      fbref: ["Freiburg"]
+      understat: ["Freiburg"]
+      matchhistory: ["Freiburg"]
+    competition_scope: ["GER-Bundesliga"]
+
+  # ====== Greuther Fürth ======
+  - canonical_name: "Greuther Fürth"
+    canonical_id: "greuther_furth"
+    country: "Germany"
+    short_name: "Fürth"
+    aliases:
+      _generic:
+        - "Greuther Furth"
+        - "Greuther Fürth"
+      fbref: ["Greuther Fürth"]
+      matchhistory: ["Greuther Furth"]
+    competition_scope: ["GER-Bundesliga"]
+
+  # ====== Hamburger SV ======
+  - canonical_name: "Hamburger SV"
+    canonical_id: "hamburger_sv"
+    country: "Germany"
+    short_name: "HSV"
+    aliases:
+      _generic:
+        - "Hamburg"
+        - "Hamburger SV"
+      fbref: ["Hamburger SV"]
+      understat: ["Hamburger SV"]
+      matchhistory: ["Hamburg"]
+    competition_scope: ["GER-Bundesliga"]
+
+  # ====== Hannover 96 ======
+  - canonical_name: "Hannover 96"
+    canonical_id: "hannover_96"
+    country: "Germany"
+    short_name: "Hannover"
+    aliases:
+      _generic:
+        - "Hannover"
+        - "Hannover 96"
+      fbref: ["Hannover 96"]
+      understat: ["Hannover 96"]
+      matchhistory: ["Hannover"]
+    competition_scope: ["GER-Bundesliga"]
+
+  # ====== 1. FC Heidenheim ======
+  - canonical_name: "1. FC Heidenheim"
+    canonical_id: "heidenheim"
+    country: "Germany"
+    short_name: "Heidenheim"
+    aliases:
+      _generic:
+        - "1. FC Heidenheim"
+        - "FC Heidenheim"
+        - "Heidenheim"
+      fbref: ["Heidenheim"]
+      understat: ["FC Heidenheim"]
+      matchhistory: ["Heidenheim"]
+    competition_scope: ["GER-Bundesliga"]
+
+  # ====== Hertha BSC ======
+  - canonical_name: "Hertha BSC"
+    canonical_id: "hertha_bsc"
+    country: "Germany"
+    short_name: "Hertha"
+    aliases:
+      _generic:
+        - "Hertha"
+        - "Hertha BSC"
+        - "Hertha Berlin"
+      fbref: ["Hertha BSC"]
+      understat: ["Hertha Berlin"]
+      matchhistory: ["Hertha"]
+    competition_scope: ["GER-Bundesliga"]
+
+  # ====== TSG Hoffenheim ======
+  - canonical_name: "TSG Hoffenheim"
+    canonical_id: "hoffenheim"
+    country: "Germany"
+    short_name: "Hoffenheim"
+    aliases:
+      _generic:
+        - "Hoffenheim"
+        - "TSG Hoffenheim"
+      fbref: ["Hoffenheim"]
+      understat: ["Hoffenheim"]
+      matchhistory: ["Hoffenheim"]
+    competition_scope: ["GER-Bundesliga"]
+
+  # ====== Holstein Kiel ======
+  - canonical_name: "Holstein Kiel"
+    canonical_id: "holstein_kiel"
+    country: "Germany"
+    short_name: "Kiel"
+    aliases:
+      _generic:
+        - "Holstein Kiel"
+      fbref: ["Holstein Kiel"]
+      understat: ["Holstein Kiel"]
+      matchhistory: ["Holstein Kiel"]
+    competition_scope: ["GER-Bundesliga"]
+
+  # ====== FC Ingolstadt 04 ======
+  - canonical_name: "FC Ingolstadt 04"
+    canonical_id: "ingolstadt"
+    country: "Germany"
+    short_name: "Ingolstadt"
+    aliases:
+      _generic:
+        - "FC Ingolstadt 04"
+        - "Ingolstadt"
+      fbref: ["Ingolstadt"]
+      understat: ["Ingolstadt"]
+      matchhistory: ["Ingolstadt"]
+    competition_scope: ["GER-Bundesliga"]
+
+  # ====== 1. FC Köln ======
+  - canonical_name: "1. FC Köln"
+    canonical_id: "koln"
+    country: "Germany"
+    short_name: "Köln"
+    aliases:
+      _generic:
+        - "1. FC Köln"
+        - "FC Cologne"
+        - "FC Koln"
+        - "Köln"
+      fbref: ["Köln"]
+      understat: ["FC Cologne"]
+      matchhistory: ["FC Koln"]
+    competition_scope: ["GER-Bundesliga"]
+
+  # ====== 1. FSV Mainz 05 ======
+  - canonical_name: "1. FSV Mainz 05"
+    canonical_id: "mainz_05"
+    country: "Germany"
+    short_name: "Mainz"
+    aliases:
+      _generic:
+        - "1. FSV Mainz 05"
+        - "Mainz"
+        - "Mainz 05"
+      fbref: ["Mainz 05"]
+      understat: ["Mainz 05"]
+      matchhistory: ["Mainz"]
+    competition_scope: ["GER-Bundesliga"]
+
+  # ====== 1. FC Nürnberg ======
+  - canonical_name: "1. FC Nürnberg"
+    canonical_id: "nurnberg"
+    country: "Germany"
+    short_name: "Nürnberg"
+    aliases:
+      _generic:
+        - "1. FC Nürnberg"
+        - "Nuernberg"
+        - "Nurnberg"
+        - "Nürnberg"
+      fbref: ["Nürnberg"]
+      understat: ["Nuernberg"]
+      matchhistory: ["Nurnberg"]
+    competition_scope: ["GER-Bundesliga"]
+
+  # ====== SC Paderborn 07 ======
+  - canonical_name: "SC Paderborn 07"
+    canonical_id: "paderborn_07"
+    country: "Germany"
+    short_name: "Paderborn"
+    aliases:
+      _generic:
+        - "Paderborn"
+        - "Paderborn 07"
+        - "SC Paderborn 07"
+      fbref: ["Paderborn 07"]
+      understat: ["Paderborn"]
+      matchhistory: ["Paderborn"]
+    competition_scope: ["GER-Bundesliga"]
+
+  # ====== RB Leipzig ======
+  - canonical_name: "RB Leipzig"
+    canonical_id: "rb_leipzig"
+    country: "Germany"
+    short_name: "Leipzig"
+    aliases:
+      _generic:
+        - "RB Leipzig"
+        - "RasenBallsport Leipzig"
+      fbref: ["RB Leipzig"]
+      understat: ["RasenBallsport Leipzig"]
+      matchhistory: ["RB Leipzig"]
+    competition_scope: ["GER-Bundesliga"]
+
+  # ====== FC Schalke 04 ======
+  - canonical_name: "FC Schalke 04"
+    canonical_id: "schalke_04"
+    country: "Germany"
+    short_name: "Schalke"
+    aliases:
+      _generic:
+        - "FC Schalke 04"
+        - "Schalke 04"
+      fbref: ["Schalke 04"]
+      understat: ["Schalke 04"]
+      matchhistory: ["Schalke 04"]
+    competition_scope: ["GER-Bundesliga"]
+
+  # ====== FC St. Pauli ======
+  - canonical_name: "FC St. Pauli"
+    canonical_id: "st_pauli"
+    country: "Germany"
+    short_name: "St. Pauli"
+    aliases:
+      _generic:
+        - "FC St. Pauli"
+        - "St Pauli"
+        - "St. Pauli"
+      fbref: ["St Pauli"]
+      understat: ["St. Pauli"]
+      matchhistory: ["St Pauli"]
+    competition_scope: ["GER-Bundesliga"]
+
+  # ====== VfB Stuttgart ======
+  - canonical_name: "VfB Stuttgart"
+    canonical_id: "vfb_stuttgart"
+    country: "Germany"
+    short_name: "Stuttgart"
+    aliases:
+      _generic:
+        - "Stuttgart"
+        - "VfB Stuttgart"
+      fbref: ["Stuttgart"]
+      understat: ["VfB Stuttgart"]
+      matchhistory: ["Stuttgart"]
+    competition_scope: ["GER-Bundesliga"]
+
+  # ====== 1. FC Union Berlin ======
+  - canonical_name: "1. FC Union Berlin"
+    canonical_id: "union_berlin"
+    country: "Germany"
+    short_name: "Union"
+    aliases:
+      _generic:
+        - "1. FC Union Berlin"
+        - "Union Berlin"
+      fbref: ["Union Berlin"]
+      understat: ["Union Berlin"]
+      matchhistory: ["Union Berlin"]
+    competition_scope: ["GER-Bundesliga"]
+
+  # ====== Werder Bremen ======
+  - canonical_name: "Werder Bremen"
+    canonical_id: "werder_bremen"
+    country: "Germany"
+    short_name: "Werder"
+    aliases:
+      _generic:
+        - "Werder Bremen"
+      fbref: ["Werder Bremen"]
+      understat: ["Werder Bremen"]
+      matchhistory: ["Werder Bremen"]
+    competition_scope: ["GER-Bundesliga"]
+
+  # ====== VfL Wolfsburg ======
+  - canonical_name: "VfL Wolfsburg"
+    canonical_id: "wolfsburg"
+    country: "Germany"
+    short_name: "Wolfsburg"
+    aliases:
+      _generic:
+        - "VfL Wolfsburg"
+        - "Wolfsburg"
+      fbref: ["Wolfsburg"]
+      understat: ["Wolfsburg"]
+      matchhistory: ["Wolfsburg"]
+    competition_scope: ["GER-Bundesliga"]
+
+  # ===========================================================================
+  # ITA-Serie A (E8b)
+  # ===========================================================================
+
+  # ====== Atalanta ======
+  - canonical_name: "Atalanta"
+    canonical_id: "atalanta"
+    country: "Italy"
+    short_name: "Atalanta"
+    aliases:
+      _generic:
+        - "Atalanta"
+      fbref: ["Atalanta"]
+      understat: ["Atalanta"]
+      matchhistory: ["Atalanta"]
+    competition_scope: ["ITA-Serie A"]
+
+  # ====== Benevento ======
+  - canonical_name: "Benevento"
+    canonical_id: "benevento"
+    country: "Italy"
+    short_name: "Benevento"
+    aliases:
+      _generic:
+        - "Benevento"
+      fbref: ["Benevento"]
+      understat: ["Benevento"]
+      matchhistory: ["Benevento"]
+    competition_scope: ["ITA-Serie A"]
+
+  # ====== Bologna ======
+  - canonical_name: "Bologna"
+    canonical_id: "bologna"
+    country: "Italy"
+    short_name: "Bologna"
+    aliases:
+      _generic:
+        - "Bologna"
+      fbref: ["Bologna"]
+      understat: ["Bologna"]
+      matchhistory: ["Bologna"]
+    competition_scope: ["ITA-Serie A"]
+
+  # ====== Brescia ======
+  - canonical_name: "Brescia"
+    canonical_id: "brescia"
+    country: "Italy"
+    short_name: "Brescia"
+    aliases:
+      _generic:
+        - "Brescia"
+      fbref: ["Brescia"]
+      understat: ["Brescia"]
+      matchhistory: ["Brescia"]
+    competition_scope: ["ITA-Serie A"]
+
+  # ====== Cagliari ======
+  - canonical_name: "Cagliari"
+    canonical_id: "cagliari"
+    country: "Italy"
+    short_name: "Cagliari"
+    aliases:
+      _generic:
+        - "Cagliari"
+      fbref: ["Cagliari"]
+      understat: ["Cagliari"]
+      matchhistory: ["Cagliari"]
+    competition_scope: ["ITA-Serie A"]
+
+  # ====== Chievo Verona ======
+  - canonical_name: "Chievo Verona"
+    canonical_id: "chievo"
+    country: "Italy"
+    short_name: "Chievo"
+    aliases:
+      _generic:
+        - "Chievo"
+        - "Chievo Verona"
+      fbref: ["Chievo"]
+      understat: ["Chievo"]
+      matchhistory: ["Chievo"]
+    competition_scope: ["ITA-Serie A"]
+
+  # ====== Como 1907 ======
+  - canonical_name: "Como 1907"
+    canonical_id: "como"
+    country: "Italy"
+    short_name: "Como"
+    aliases:
+      _generic:
+        - "Como"
+        - "Como 1907"
+      fbref: ["Como"]
+      understat: ["Como"]
+      matchhistory: ["Como"]
+    competition_scope: ["ITA-Serie A"]
+
+  # ====== Cremonese ======
+  - canonical_name: "Cremonese"
+    canonical_id: "cremonese"
+    country: "Italy"
+    short_name: "Cremonese"
+    aliases:
+      _generic:
+        - "Cremonese"
+      fbref: ["Cremonese"]
+      understat: ["Cremonese"]
+      matchhistory: ["Cremonese"]
+    competition_scope: ["ITA-Serie A"]
+
+  # ====== Crotone ======
+  - canonical_name: "Crotone"
+    canonical_id: "crotone"
+    country: "Italy"
+    short_name: "Crotone"
+    aliases:
+      _generic:
+        - "Crotone"
+      fbref: ["Crotone"]
+      understat: ["Crotone"]
+      matchhistory: ["Crotone"]
+    competition_scope: ["ITA-Serie A"]
+
+  # ====== Empoli ======
+  - canonical_name: "Empoli"
+    canonical_id: "empoli"
+    country: "Italy"
+    short_name: "Empoli"
+    aliases:
+      _generic:
+        - "Empoli"
+      fbref: ["Empoli"]
+      understat: ["Empoli"]
+      matchhistory: ["Empoli"]
+    competition_scope: ["ITA-Serie A"]
+
+  # ====== Fiorentina ======
+  - canonical_name: "Fiorentina"
+    canonical_id: "fiorentina"
+    country: "Italy"
+    short_name: "Fiorentina"
+    aliases:
+      _generic:
+        - "Fiorentina"
+      fbref: ["Fiorentina"]
+      understat: ["Fiorentina"]
+      matchhistory: ["Fiorentina"]
+    competition_scope: ["ITA-Serie A"]
+
+  # ====== Frosinone ======
+  - canonical_name: "Frosinone"
+    canonical_id: "frosinone"
+    country: "Italy"
+    short_name: "Frosinone"
+    aliases:
+      _generic:
+        - "Frosinone"
+      fbref: ["Frosinone"]
+      understat: ["Frosinone"]
+      matchhistory: ["Frosinone"]
+    competition_scope: ["ITA-Serie A"]
+
+  # ====== Genoa ======
+  - canonical_name: "Genoa"
+    canonical_id: "genoa"
+    country: "Italy"
+    short_name: "Genoa"
+    aliases:
+      _generic:
+        - "Genoa"
+      fbref: ["Genoa"]
+      understat: ["Genoa"]
+      matchhistory: ["Genoa"]
+    competition_scope: ["ITA-Serie A"]
+
+  # ====== Hellas Verona ======
+  - canonical_name: "Hellas Verona"
+    canonical_id: "hellas_verona"
+    country: "Italy"
+    short_name: "Verona"
+    aliases:
+      _generic:
+        - "Hellas Verona"
+        - "Verona"
+      fbref: ["Hellas Verona"]
+      understat: ["Verona"]
+      matchhistory: ["Verona"]
+    competition_scope: ["ITA-Serie A"]
+
+  # ====== Inter Milan ======
+  - canonical_name: "Inter Milan"
+    canonical_id: "internazionale"
+    country: "Italy"
+    short_name: "Inter"
+    aliases:
+      _generic:
+        - "Inter"
+        - "Inter Milan"
+        - "Internazionale"
+      fbref: ["Inter", "Internazionale"]
+      understat: ["Inter"]
+      matchhistory: ["Inter"]
+    competition_scope: ["ITA-Serie A"]
+
+  # ====== Juventus ======
+  - canonical_name: "Juventus"
+    canonical_id: "juventus"
+    country: "Italy"
+    short_name: "Juventus"
+    aliases:
+      _generic:
+        - "Juventus"
+      fbref: ["Juventus"]
+      understat: ["Juventus"]
+      matchhistory: ["Juventus"]
+    competition_scope: ["ITA-Serie A"]
+
+  # ====== Lazio ======
+  - canonical_name: "Lazio"
+    canonical_id: "lazio"
+    country: "Italy"
+    short_name: "Lazio"
+    aliases:
+      _generic:
+        - "Lazio"
+      fbref: ["Lazio"]
+      understat: ["Lazio"]
+      matchhistory: ["Lazio"]
+    competition_scope: ["ITA-Serie A"]
+
+  # ====== Lecce ======
+  - canonical_name: "Lecce"
+    canonical_id: "lecce"
+    country: "Italy"
+    short_name: "Lecce"
+    aliases:
+      _generic:
+        - "Lecce"
+      fbref: ["Lecce"]
+      understat: ["Lecce"]
+      matchhistory: ["Lecce"]
+    competition_scope: ["ITA-Serie A"]
+
+  # ====== AC Milan ======
+  - canonical_name: "AC Milan"
+    canonical_id: "ac_milan"
+    country: "Italy"
+    short_name: "Milan"
+    aliases:
+      _generic:
+        - "AC Milan"
+        - "Milan"
+      fbref: ["Milan"]
+      understat: ["AC Milan"]
+      matchhistory: ["Milan"]
+    competition_scope: ["ITA-Serie A"]
+
+  # ====== Monza ======
+  - canonical_name: "Monza"
+    canonical_id: "monza"
+    country: "Italy"
+    short_name: "Monza"
+    aliases:
+      _generic:
+        - "Monza"
+      fbref: ["Monza"]
+      understat: ["Monza"]
+      matchhistory: ["Monza"]
+    competition_scope: ["ITA-Serie A"]
+
+  # ====== Napoli ======
+  - canonical_name: "Napoli"
+    canonical_id: "napoli"
+    country: "Italy"
+    short_name: "Napoli"
+    aliases:
+      _generic:
+        - "Napoli"
+      fbref: ["Napoli"]
+      understat: ["Napoli"]
+      matchhistory: ["Napoli"]
+    competition_scope: ["ITA-Serie A"]
+
+  # ====== Palermo ======
+  - canonical_name: "Palermo"
+    canonical_id: "palermo"
+    country: "Italy"
+    short_name: "Palermo"
+    aliases:
+      _generic:
+        - "Palermo"
+      fbref: ["Palermo"]
+      understat: ["Palermo"]
+      matchhistory: ["Palermo"]
+    competition_scope: ["ITA-Serie A"]
+
+  # ====== Parma Calcio 1913 ======
+  - canonical_name: "Parma Calcio 1913"
+    canonical_id: "parma"
+    country: "Italy"
+    short_name: "Parma"
+    aliases:
+      _generic:
+        - "Parma"
+        - "Parma Calcio 1913"
+      fbref: ["Parma"]
+      understat: ["Parma Calcio 1913"]
+      matchhistory: ["Parma"]
+    competition_scope: ["ITA-Serie A"]
+
+  # ====== Pescara ======
+  - canonical_name: "Pescara"
+    canonical_id: "pescara"
+    country: "Italy"
+    short_name: "Pescara"
+    aliases:
+      _generic:
+        - "Pescara"
+      fbref: ["Pescara"]
+      understat: ["Pescara"]
+      matchhistory: ["Pescara"]
+    competition_scope: ["ITA-Serie A"]
+
+  # ====== Pisa ======
+  - canonical_name: "Pisa"
+    canonical_id: "pisa"
+    country: "Italy"
+    short_name: "Pisa"
+    aliases:
+      _generic:
+        - "Pisa"
+      fbref: ["Pisa"]
+      understat: ["Pisa"]
+      matchhistory: ["Pisa"]
+    competition_scope: ["ITA-Serie A"]
+
+  # ====== AS Roma ======
+  - canonical_name: "AS Roma"
+    canonical_id: "roma"
+    country: "Italy"
+    short_name: "Roma"
+    aliases:
+      _generic:
+        - "AS Roma"
+        - "Roma"
+      fbref: ["Roma"]
+      understat: ["Roma"]
+      matchhistory: ["Roma"]
+    competition_scope: ["ITA-Serie A"]
+
+  # ====== Salernitana ======
+  - canonical_name: "Salernitana"
+    canonical_id: "salernitana"
+    country: "Italy"
+    short_name: "Salernitana"
+    aliases:
+      _generic:
+        - "Salernitana"
+      fbref: ["Salernitana"]
+      understat: ["Salernitana"]
+      matchhistory: ["Salernitana"]
+    competition_scope: ["ITA-Serie A"]
+
+  # ====== Sampdoria ======
+  - canonical_name: "Sampdoria"
+    canonical_id: "sampdoria"
+    country: "Italy"
+    short_name: "Sampdoria"
+    aliases:
+      _generic:
+        - "Sampdoria"
+      fbref: ["Sampdoria"]
+      understat: ["Sampdoria"]
+      matchhistory: ["Sampdoria"]
+    competition_scope: ["ITA-Serie A"]
+
+  # ====== Sassuolo ======
+  - canonical_name: "Sassuolo"
+    canonical_id: "sassuolo"
+    country: "Italy"
+    short_name: "Sassuolo"
+    aliases:
+      _generic:
+        - "Sassuolo"
+      fbref: ["Sassuolo"]
+      understat: ["Sassuolo"]
+      matchhistory: ["Sassuolo"]
+    competition_scope: ["ITA-Serie A"]
+
+  # ====== SPAL ======
+  - canonical_name: "SPAL"
+    canonical_id: "spal"
+    country: "Italy"
+    short_name: "SPAL"
+    aliases:
+      _generic:
+        - "SPAL"
+        - "SPAL 2013"
+        - "Spal"
+      fbref: ["SPAL"]
+      understat: ["SPAL 2013"]
+      matchhistory: ["Spal"]
+    competition_scope: ["ITA-Serie A"]
+
+  # ====== Spezia ======
+  - canonical_name: "Spezia"
+    canonical_id: "spezia"
+    country: "Italy"
+    short_name: "Spezia"
+    aliases:
+      _generic:
+        - "Spezia"
+      fbref: ["Spezia"]
+      understat: ["Spezia"]
+      matchhistory: ["Spezia"]
+    competition_scope: ["ITA-Serie A"]
+
+  # ====== Torino ======
+  - canonical_name: "Torino"
+    canonical_id: "torino"
+    country: "Italy"
+    short_name: "Torino"
+    aliases:
+      _generic:
+        - "Torino"
+      fbref: ["Torino"]
+      understat: ["Torino"]
+      matchhistory: ["Torino"]
+    competition_scope: ["ITA-Serie A"]
+
+  # ====== Udinese ======
+  - canonical_name: "Udinese"
+    canonical_id: "udinese"
+    country: "Italy"
+    short_name: "Udinese"
+    aliases:
+      _generic:
+        - "Udinese"
+      fbref: ["Udinese"]
+      understat: ["Udinese"]
+      matchhistory: ["Udinese"]
+    competition_scope: ["ITA-Serie A"]
+
+  # ====== Venezia ======
+  - canonical_name: "Venezia"
+    canonical_id: "venezia"
+    country: "Italy"
+    short_name: "Venezia"
+    aliases:
+      _generic:
+        - "Venezia"
+      fbref: ["Venezia"]
+      understat: ["Venezia"]
+      matchhistory: ["Venezia"]
+    competition_scope: ["ITA-Serie A"]
+
+# =============================================================================
+# National teams for INT-World Cup (and future international comps) — #913 Phase 3
+# =============================================================================
+# canonical_id prefix `nt_` disambiguates from clubs.
+# team_type + explicit competition_scope required for correct scoping.
+# Aliases kept minimal (generic + fbref primary) — extend with real variants
+# from bronze after first WC scrape (SofaScore/FotMob/ESPN/WhoScored spellings).
+# country = FIFA nation; short_name = common 3-letter or short display.
+# =============================================================================
+
+  # Co-hosts
+  - canonical_name: "Canada"
+    canonical_id: "nt_canada"
+    country: "Canada"
+    short_name: "CAN"
+    team_type: "national"
+    aliases:
+      _generic: ["Canada"]
+      fbref: ["Canada"]
+    competition_scope: ["INT-World Cup"]
+
+  - canonical_name: "Mexico"
+    canonical_id: "nt_mexico"
+    country: "Mexico"
+    short_name: "MEX"
+    team_type: "national"
+    aliases:
+      _generic: ["Mexico"]
+      fbref: ["Mexico"]
+    competition_scope: ["INT-World Cup"]
+
+  - canonical_name: "United States"
+    canonical_id: "nt_united_states"
+    country: "United States"
+    short_name: "USA"
+    team_type: "national"
+    aliases:
+      _generic: ["United States", "USA", "USMNT"]
+      fbref: ["United States"]
+    competition_scope: ["INT-World Cup"]
+
+  # AFC (selected for brevity in plan; full 9 in real fill)
+  - canonical_name: "Argentina"
+    canonical_id: "nt_argentina"
+    country: "Argentina"
+    short_name: "ARG"
+    team_type: "national"
+    aliases:
+      _generic: ["Argentina"]
+      fbref: ["Argentina"]
+    competition_scope: ["INT-World Cup"]
+
+  - canonical_name: "Brazil"
+    canonical_id: "nt_brazil"
+    country: "Brazil"
+    short_name: "BRA"
+    team_type: "national"
+    aliases:
+      _generic: ["Brazil"]
+      fbref: ["Brazil"]
+    competition_scope: ["INT-World Cup"]
+
+  - canonical_name: "England"
+    canonical_id: "nt_england"
+    country: "England"
+    short_name: "ENG"
+    team_type: "national"
+    aliases:
+      _generic: ["England"]
+      fbref: ["England"]
+    competition_scope: ["INT-World Cup"]
+
+  - canonical_name: "France"
+    canonical_id: "nt_france"
+    country: "France"
+    short_name: "FRA"
+    team_type: "national"
+    aliases:
+      _generic: ["France"]
+      fbref: ["France"]
+    competition_scope: ["INT-World Cup"]
+
+  - canonical_name: "Germany"
+    canonical_id: "nt_germany"
+    country: "Germany"
+    short_name: "GER"
+    team_type: "national"
+    aliases:
+      _generic: ["Germany"]
+      fbref: ["Germany"]
+    competition_scope: ["INT-World Cup"]
+
+  - canonical_name: "Spain"
+    canonical_id: "nt_spain"
+    country: "Spain"
+    short_name: "ESP"
+    team_type: "national"
+    aliases:
+      _generic: ["Spain"]
+      fbref: ["Spain"]
+    competition_scope: ["INT-World Cup"]
+
+  - canonical_name: "Portugal"
+    canonical_id: "nt_portugal"
+    country: "Portugal"
+    short_name: "POR"
+    team_type: "national"
+    aliases:
+      _generic: ["Portugal"]
+      fbref: ["Portugal"]
+    competition_scope: ["INT-World Cup"]
+
+  # --- Remaining national teams for INT-World Cup (Фаза 4 #913). Total 48.
+  # canonical_id convention: nt_<lower_snake>, team_type=national, competition_scope only WC.
+  # Aliases minimal (expand from live scrapes); fbref names preferred for spine.
+  # Names follow FIFA / Wikipedia convention for canonical_name.
+
+  # AFC (9)
+  - canonical_name: "Australia"
+    canonical_id: "nt_australia"
+    country: "Australia"
+    short_name: "AUS"
+    team_type: "national"
+    aliases:
+      _generic: ["Australia"]
+      fbref: ["Australia"]
+    competition_scope: ["INT-World Cup"]
+
+  - canonical_name: "Iraq"
+    canonical_id: "nt_iraq"
+    country: "Iraq"
+    short_name: "IRQ"
+    team_type: "national"
+    aliases:
+      _generic: ["Iraq"]
+      fbref: ["Iraq"]
+    competition_scope: ["INT-World Cup"]
+
+  - canonical_name: "IR Iran"
+    canonical_id: "nt_ir_iran"
+    country: "Iran"
+    short_name: "IRN"
+    team_type: "national"
+    aliases:
+      _generic: ["IR Iran", "Iran"]
+      fbref: ["IR Iran"]
+    competition_scope: ["INT-World Cup"]
+
+  - canonical_name: "Japan"
+    canonical_id: "nt_japan"
+    country: "Japan"
+    short_name: "JPN"
+    team_type: "national"
+    aliases:
+      _generic: ["Japan"]
+      fbref: ["Japan"]
+    competition_scope: ["INT-World Cup"]
+
+  - canonical_name: "Jordan"
+    canonical_id: "nt_jordan"
+    country: "Jordan"
+    short_name: "JOR"
+    team_type: "national"
+    aliases:
+      _generic: ["Jordan"]
+      fbref: ["Jordan"]
+    competition_scope: ["INT-World Cup"]
+
+  - canonical_name: "Korea Republic"
+    canonical_id: "nt_korea_republic"
+    country: "South Korea"
+    short_name: "KOR"
+    team_type: "national"
+    aliases:
+      _generic: ["Korea Republic", "South Korea", "Korea"]
+      fbref: ["Korea Republic"]
+    competition_scope: ["INT-World Cup"]
+
+  - canonical_name: "Qatar"
+    canonical_id: "nt_qatar"
+    country: "Qatar"
+    short_name: "QAT"
+    team_type: "national"
+    aliases:
+      _generic: ["Qatar"]
+      fbref: ["Qatar"]
+    competition_scope: ["INT-World Cup"]
+
+  - canonical_name: "Saudi Arabia"
+    canonical_id: "nt_saudi_arabia"
+    country: "Saudi Arabia"
+    short_name: "KSA"
+    team_type: "national"
+    aliases:
+      _generic: ["Saudi Arabia"]
+      fbref: ["Saudi Arabia"]
+    competition_scope: ["INT-World Cup"]
+
+  - canonical_name: "Uzbekistan"
+    canonical_id: "nt_uzbekistan"
+    country: "Uzbekistan"
+    short_name: "UZB"
+    team_type: "national"
+    aliases:
+      _generic: ["Uzbekistan"]
+      fbref: ["Uzbekistan"]
+    competition_scope: ["INT-World Cup"]
+
+  # CAF (10)
+  - canonical_name: "Algeria"
+    canonical_id: "nt_algeria"
+    country: "Algeria"
+    short_name: "ALG"
+    team_type: "national"
+    aliases:
+      _generic: ["Algeria"]
+      fbref: ["Algeria"]
+    competition_scope: ["INT-World Cup"]
+
+  - canonical_name: "Cabo Verde"
+    canonical_id: "nt_cabo_verde"
+    country: "Cape Verde"
+    short_name: "CPV"
+    team_type: "national"
+    aliases:
+      _generic: ["Cabo Verde", "Cape Verde"]
+      fbref: ["Cabo Verde"]
+    competition_scope: ["INT-World Cup"]
+
+  - canonical_name: "Congo DR"
+    canonical_id: "nt_congo_dr"
+    country: "Congo DR"
+    short_name: "COD"
+    team_type: "national"
+    aliases:
+      _generic: ["Congo DR", "DR Congo"]
+      fbref: ["Congo DR"]
+    competition_scope: ["INT-World Cup"]
+
+  - canonical_name: "Côte d'Ivoire"
+    canonical_id: "nt_cote_divoire"
+    country: "Côte d'Ivoire"
+    short_name: "CIV"
+    team_type: "national"
+    aliases:
+      _generic: ["Côte d'Ivoire", "Ivory Coast"]
+      fbref: ["Côte d'Ivoire"]
+    competition_scope: ["INT-World Cup"]
+
+  - canonical_name: "Egypt"
+    canonical_id: "nt_egypt"
+    country: "Egypt"
+    short_name: "EGY"
+    team_type: "national"
+    aliases:
+      _generic: ["Egypt"]
+      fbref: ["Egypt"]
+    competition_scope: ["INT-World Cup"]
+
+  - canonical_name: "Ghana"
+    canonical_id: "nt_ghana"
+    country: "Ghana"
+    short_name: "GHA"
+    team_type: "national"
+    aliases:
+      _generic: ["Ghana"]
+      fbref: ["Ghana"]
+    competition_scope: ["INT-World Cup"]
+
+  - canonical_name: "Morocco"
+    canonical_id: "nt_morocco"
+    country: "Morocco"
+    short_name: "MAR"
+    team_type: "national"
+    aliases:
+      _generic: ["Morocco"]
+      fbref: ["Morocco"]
+    competition_scope: ["INT-World Cup"]
+
+  - canonical_name: "Senegal"
+    canonical_id: "nt_senegal"
+    country: "Senegal"
+    short_name: "SEN"
+    team_type: "national"
+    aliases:
+      _generic: ["Senegal"]
+      fbref: ["Senegal"]
+    competition_scope: ["INT-World Cup"]
+
+  - canonical_name: "South Africa"
+    canonical_id: "nt_south_africa"
+    country: "South Africa"
+    short_name: "RSA"
+    team_type: "national"
+    aliases:
+      _generic: ["South Africa"]
+      fbref: ["South Africa"]
+    competition_scope: ["INT-World Cup"]
+
+  - canonical_name: "Tunisia"
+    canonical_id: "nt_tunisia"
+    country: "Tunisia"
+    short_name: "TUN"
+    team_type: "national"
+    aliases:
+      _generic: ["Tunisia"]
+      fbref: ["Tunisia"]
+    competition_scope: ["INT-World Cup"]
+
+  # CONCACAF additional (3)
+  - canonical_name: "Curaçao"
+    canonical_id: "nt_curacao"
+    country: "Curaçao"
+    short_name: "CUW"
+    team_type: "national"
+    aliases:
+      _generic: ["Curaçao"]
+      fbref: ["Curaçao"]
+    competition_scope: ["INT-World Cup"]
+
+  - canonical_name: "Haiti"
+    canonical_id: "nt_haiti"
+    country: "Haiti"
+    short_name: "HAI"
+    team_type: "national"
+    aliases:
+      _generic: ["Haiti"]
+      fbref: ["Haiti"]
+    competition_scope: ["INT-World Cup"]
+
+  - canonical_name: "Panama"
+    canonical_id: "nt_panama"
+    country: "Panama"
+    short_name: "PAN"
+    team_type: "national"
+    aliases:
+      _generic: ["Panama"]
+      fbref: ["Panama"]
+    competition_scope: ["INT-World Cup"]
+
+  # CONMEBOL (4 more; Arg+Bra already)
+  - canonical_name: "Colombia"
+    canonical_id: "nt_colombia"
+    country: "Colombia"
+    short_name: "COL"
+    team_type: "national"
+    aliases:
+      _generic: ["Colombia"]
+      fbref: ["Colombia"]
+    competition_scope: ["INT-World Cup"]
+
+  - canonical_name: "Ecuador"
+    canonical_id: "nt_ecuador"
+    country: "Ecuador"
+    short_name: "ECU"
+    team_type: "national"
+    aliases:
+      _generic: ["Ecuador"]
+      fbref: ["Ecuador"]
+    competition_scope: ["INT-World Cup"]
+
+  - canonical_name: "Paraguay"
+    canonical_id: "nt_paraguay"
+    country: "Paraguay"
+    short_name: "PAR"
+    team_type: "national"
+    aliases:
+      _generic: ["Paraguay"]
+      fbref: ["Paraguay"]
+    competition_scope: ["INT-World Cup"]
+
+  - canonical_name: "Uruguay"
+    canonical_id: "nt_uruguay"
+    country: "Uruguay"
+    short_name: "URU"
+    team_type: "national"
+    aliases:
+      _generic: ["Uruguay"]
+      fbref: ["Uruguay"]
+    competition_scope: ["INT-World Cup"]
+
+  # OFC (1)
+  - canonical_name: "New Zealand"
+    canonical_id: "nt_new_zealand"
+    country: "New Zealand"
+    short_name: "NZL"
+    team_type: "national"
+    aliases:
+      _generic: ["New Zealand"]
+      fbref: ["New Zealand"]
+    competition_scope: ["INT-World Cup"]
+
+  # UEFA (11 more; Eng/Fra/Ger/Spa/Por already)
+  - canonical_name: "Austria"
+    canonical_id: "nt_austria"
+    country: "Austria"
+    short_name: "AUT"
+    team_type: "national"
+    aliases:
+      _generic: ["Austria"]
+      fbref: ["Austria"]
+    competition_scope: ["INT-World Cup"]
+
+  - canonical_name: "Belgium"
+    canonical_id: "nt_belgium"
+    country: "Belgium"
+    short_name: "BEL"
+    team_type: "national"
+    aliases:
+      _generic: ["Belgium"]
+      fbref: ["Belgium"]
+    competition_scope: ["INT-World Cup"]
+
+  - canonical_name: "Bosnia and Herzegovina"
+    canonical_id: "nt_bosnia_and_herzegovina"
+    country: "Bosnia and Herzegovina"
+    short_name: "BIH"
+    team_type: "national"
+    aliases:
+      _generic: ["Bosnia and Herzegovina", "Bosnia"]
+      fbref: ["Bosnia and Herzegovina"]
+    competition_scope: ["INT-World Cup"]
+
+  - canonical_name: "Croatia"
+    canonical_id: "nt_croatia"
+    country: "Croatia"
+    short_name: "CRO"
+    team_type: "national"
+    aliases:
+      _generic: ["Croatia"]
+      fbref: ["Croatia"]
+    competition_scope: ["INT-World Cup"]
+
+  - canonical_name: "Czechia"
+    canonical_id: "nt_czechia"
+    country: "Czechia"
+    short_name: "CZE"
+    team_type: "national"
+    aliases:
+      _generic: ["Czechia", "Czech Republic"]
+      fbref: ["Czechia"]
+    competition_scope: ["INT-World Cup"]
+
+  - canonical_name: "Netherlands"
+    canonical_id: "nt_netherlands"
+    country: "Netherlands"
+    short_name: "NED"
+    team_type: "national"
+    aliases:
+      _generic: ["Netherlands", "Holland"]
+      fbref: ["Netherlands"]
+    competition_scope: ["INT-World Cup"]
+
+  - canonical_name: "Norway"
+    canonical_id: "nt_norway"
+    country: "Norway"
+    short_name: "NOR"
+    team_type: "national"
+    aliases:
+      _generic: ["Norway"]
+      fbref: ["Norway"]
+    competition_scope: ["INT-World Cup"]
+
+  - canonical_name: "Scotland"
+    canonical_id: "nt_scotland"
+    country: "Scotland"
+    short_name: "SCO"
+    team_type: "national"
+    aliases:
+      _generic: ["Scotland"]
+      fbref: ["Scotland"]
+    competition_scope: ["INT-World Cup"]
+
+  - canonical_name: "Sweden"
+    canonical_id: "nt_sweden"
+    country: "Sweden"
+    short_name: "SWE"
+    team_type: "national"
+    aliases:
+      _generic: ["Sweden"]
+      fbref: ["Sweden"]
+    competition_scope: ["INT-World Cup"]
+
+  - canonical_name: "Switzerland"
+    canonical_id: "nt_switzerland"
+    country: "Switzerland"
+    short_name: "SUI"
+    team_type: "national"
+    aliases:
+      _generic: ["Switzerland"]
+      fbref: ["Switzerland"]
+    competition_scope: ["INT-World Cup"]
+
+  - canonical_name: "Türkiye"
+    canonical_id: "nt_turkiye"
+    country: "Türkiye"
+    short_name: "TUR"
+    team_type: "national"
+    aliases:
+      _generic: ["Türkiye", "Turkey"]
+      fbref: ["Türkiye"]
+    competition_scope: ["INT-World Cup"]
+
+# NOTE: 48 NT entries complete (Фаза 4 #913). Aliases seeded from FIFA names; enrich _generic/fbref/sofascore etc from live Bronze data as needed.
+# competition_scope mandatory (enforced in medallion_config validator).
+# team_type used by dim_team (already prepared).

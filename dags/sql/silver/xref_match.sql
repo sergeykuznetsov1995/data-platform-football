@@ -76,8 +76,12 @@ WITH derived AS (
         away,
         league,
         -- season → slug ('2425'); the match_id hash above keeps year-start (ids stable).
-        LPAD(CAST(MOD(season, 100) AS varchar), 2, '0')
-            || LPAD(CAST(MOD(season + 1, 100) AS varchar), 2, '0')  AS season
+        -- #913 Phase 2
+        CASE WHEN league = 'INT-World Cup'
+             THEN LPAD(CAST(season AS varchar), 4, '0')
+             ELSE LPAD(CAST(MOD(season, 100) AS varchar), 2, '0')
+                  || LPAD(CAST(MOD(season + 1, 100) AS varchar), 2, '0')
+        END  AS season
     FROM iceberg.bronze.fbref_schedule
 ),
 
@@ -199,8 +203,12 @@ fm_resolved AS (
         TRY_CAST(SUBSTR(s.date, 1, 10) AS date)                        AS match_date,
         s.league,
         -- season → slug ('2425'); bronze fotmob_schedule is year-start bigint.
-        LPAD(CAST(MOD(s.season, 100) AS varchar), 2, '0')
-            || LPAD(CAST(MOD(s.season + 1, 100) AS varchar), 2, '0')   AS season,
+        -- #913 Phase 2
+        CASE WHEN s.league = 'INT-World Cup'
+             THEN LPAD(CAST(s.season AS varchar), 4, '0')
+             ELSE LPAD(CAST(MOD(s.season, 100) AS varchar), 2, '0')
+                  || LPAD(CAST(MOD(s.season + 1, 100) AS varchar), 2, '0')
+        END   AS season,
         xt_h.canonical_id                                              AS home_canonical_id,
         xt_a.canonical_id                                              AS away_canonical_id,
         CONCAT(s.home_team, ' vs ', s.away_team)                       AS display_name
@@ -209,14 +217,20 @@ fm_resolved AS (
            ON xt_h.source    = 'fotmob'
           AND xt_h.source_id = s.home_team
           AND xt_h.league    = s.league
-          AND xt_h.season    = LPAD(CAST(MOD(s.season, 100) AS varchar), 2, '0')
-                               || LPAD(CAST(MOD(s.season + 1, 100) AS varchar), 2, '0')
+          AND xt_h.season    = CASE WHEN s.league = 'INT-World Cup'
+                                     THEN LPAD(CAST(s.season AS varchar), 4, '0')
+                                     ELSE LPAD(CAST(MOD(s.season, 100) AS varchar), 2, '0')
+                                          || LPAD(CAST(MOD(s.season + 1, 100) AS varchar), 2, '0')
+                               END
     LEFT JOIN iceberg.silver.xref_team xt_a
            ON xt_a.source    = 'fotmob'
           AND xt_a.source_id = s.away_team
           AND xt_a.league    = s.league
-          AND xt_a.season    = LPAD(CAST(MOD(s.season, 100) AS varchar), 2, '0')
-                               || LPAD(CAST(MOD(s.season + 1, 100) AS varchar), 2, '0')
+          AND xt_a.season    = CASE WHEN s.league = 'INT-World Cup'
+                                     THEN LPAD(CAST(s.season AS varchar), 4, '0')
+                                     ELSE LPAD(CAST(MOD(s.season, 100) AS varchar), 2, '0')
+                                          || LPAD(CAST(MOD(s.season + 1, 100) AS varchar), 2, '0')
+                               END
     WHERE s.match_id IS NOT NULL
 ),
 
@@ -244,8 +258,12 @@ mh_resolved AS (
         s.league,
         -- season → slug ('2425'); bronze matchhistory is year-start bigint.
         -- (The source_id hash above keeps year-start so ids stay stable.)
-        LPAD(CAST(MOD(s.season, 100) AS varchar), 2, '0')
-            || LPAD(CAST(MOD(s.season + 1, 100) AS varchar), 2, '0')   AS season,
+        -- #913 Phase 2
+        CASE WHEN s.league = 'INT-World Cup'
+             THEN LPAD(CAST(s.season AS varchar), 4, '0')
+             ELSE LPAD(CAST(MOD(s.season, 100) AS varchar), 2, '0')
+                  || LPAD(CAST(MOD(s.season + 1, 100) AS varchar), 2, '0')
+        END   AS season,
         xt_h.canonical_id                                              AS home_canonical_id,
         xt_a.canonical_id                                              AS away_canonical_id,
         CONCAT(CAST(s.home_team AS varchar), ' vs ',
@@ -255,14 +273,20 @@ mh_resolved AS (
            ON xt_h.source    = 'matchhistory'
           AND xt_h.source_id = CAST(s.home_team AS varchar)
           AND xt_h.league    = s.league
-          AND xt_h.season    = LPAD(CAST(MOD(s.season, 100) AS varchar), 2, '0')
-                               || LPAD(CAST(MOD(s.season + 1, 100) AS varchar), 2, '0')
+          AND xt_h.season    = CASE WHEN s.league = 'INT-World Cup'
+                                     THEN LPAD(CAST(s.season AS varchar), 4, '0')
+                                     ELSE LPAD(CAST(MOD(s.season, 100) AS varchar), 2, '0')
+                                          || LPAD(CAST(MOD(s.season + 1, 100) AS varchar), 2, '0')
+                               END
     LEFT JOIN iceberg.silver.xref_team xt_a
            ON xt_a.source    = 'matchhistory'
           AND xt_a.source_id = CAST(s.away_team AS varchar)
           AND xt_a.league    = s.league
-          AND xt_a.season    = LPAD(CAST(MOD(s.season, 100) AS varchar), 2, '0')
-                               || LPAD(CAST(MOD(s.season + 1, 100) AS varchar), 2, '0')
+          AND xt_a.season    = CASE WHEN s.league = 'INT-World Cup'
+                                     THEN LPAD(CAST(s.season AS varchar), 4, '0')
+                                     ELSE LPAD(CAST(MOD(s.season, 100) AS varchar), 2, '0')
+                                          || LPAD(CAST(MOD(s.season + 1, 100) AS varchar), 2, '0')
+                               END
     WHERE s.match_date IS NOT NULL
 ),
 

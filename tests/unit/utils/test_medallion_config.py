@@ -279,12 +279,14 @@ def test_load_team_aliases_rejects_duplicate_canonical_id(tmp_path, monkeypatch)
         "    short_name: 'X'\n"
         "    aliases:\n"
         "      _generic: ['X']\n"
+        "    competition_scope: ['ENG-Premier League']\n"
         "  - canonical_name: 'Y'\n"
         "    canonical_id: 'x_fc'\n"
         "    country: 'England'\n"
         "    short_name: 'Y'\n"
         "    aliases:\n"
         "      _generic: ['Y']\n"
+        "    competition_scope: ['ENG-Premier League']\n"
     )
     (tmp_path / "competitions.yaml").write_text(_MOCK_COMPETITIONS)
     monkeypatch.setenv("MEDALLION_CONFIG_DIR", str(tmp_path))
@@ -527,7 +529,7 @@ def test_sql_values_raises_on_empty_result(mock_config_dir):
     # Filtering by an unknown source AND an unknown competition produces
     # zero rows — the loader refuses to emit invalid Trino syntax.
     with pytest.raises(mock_config_dir.MedallionConfigError, match="0 pairs"):
-        mock_config_dir.get_team_alias_sql_values(competition="EUR-Champions League")
+        mock_config_dir.get_team_alias_sql_values(competition="EUR-Champions League")  # unknown now that EUR fixed to UEFA; still 0 rows
 
 
 def test_sql_values_rejects_backslash_in_alias(tmp_path, monkeypatch):
@@ -645,8 +647,20 @@ def test_real_config_loads_without_error(real_config_dir):
     assert len(competitions["competitions"]) >= 1
 
 
-def test_real_config_in_scope_is_apl_only(real_config_dir):
-    assert real_config_dir.get_in_scope_competitions() == ["ENG-Premier League"]
+def test_real_config_in_scope_is_top5(real_config_dir):
+    # E8b: Top-5 rollout flipped in_scope for the four new leagues. Each one
+    # must carry a non-empty `seasons` list — an in_scope competition with
+    # `seasons: []` silently drops its rows from dim_season (issue #425).
+    assert set(real_config_dir.get_in_scope_competitions()) == {
+        "ENG-Premier League",
+        "ESP-La Liga",
+        "ITA-Serie A",
+        "GER-Bundesliga",
+        "FRA-Ligue 1",
+        "INT-World Cup",  # #913 Phase 2 (single_year)
+    }
+    for league in real_config_dir.get_in_scope_competitions():
+        assert real_config_dir.get_competition_seasons(league), league
 
 
 def test_real_config_apl_seasons_cover_ingested_history(real_config_dir):

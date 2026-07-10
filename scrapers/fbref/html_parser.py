@@ -18,6 +18,7 @@ from scrapers.fbref.parsers import (  # noqa: F811 — explicit re-exports for I
     normalize_column_names,
     extract_tables_from_comments,
     diagnose_html_structure,
+    drop_blank_rows,
     parse_table,
     _parse_table_element,
     _table_has_player_header,

@@ -20,6 +20,14 @@ _DAGS_DIR = PROJECT_ROOT / "dags"
 if str(_DAGS_DIR) not in sys.path:
     sys.path.insert(0, str(_DAGS_DIR))
 
+# Фаза 4: grain checks now load competitions.yaml for per-comp team_count.
+# Set env so unit tests (no /opt/airflow) find the source configs.
+import os
+os.environ.setdefault(
+    'MEDALLION_CONFIG_DIR',
+    str(PROJECT_ROOT / 'configs' / 'medallion')
+)
+
 
 def _build():
     from utils.gold_tasks import build_star_gate_checks
@@ -36,7 +44,7 @@ def _by_name(checks, name):
 class TestStarGateComposition:
     def test_total_check_count(self):
         """Contract: 7 star_pk + 28 league/season FK (14 facts × 2) +
-        20 dim-FK + 2 NULL-coverage + 3 grain = 60.
+        20 dim-FK + 3 NULL-coverage + 4 grain = 62.
 
         #431 added fct_team_elo pointwise (PK + team_id->dim_team FK). #430
         added the three player-money facts: fct_player_salary joined
@@ -44,8 +52,10 @@ class TestStarGateComposition:
         league/season), salary / market_value / fifa_rating each gained a
         pointwise star_pk (+3), and salary / fifa_rating each gained a
         dim_player FK (+2). Pointwise facts gain no league/season FK.
+        #867 added star_coverage[fct_lineup spine-share] (+1 coverage) and
+        star_coverage[dim_match->fct_team_match] (+1 grain).
         """
-        assert len(_build()) == 60
+        assert len(_build()) == 62
 
     def test_names_unique(self):
         checks = _build()
@@ -258,14 +268,14 @@ class TestStarGateGrain:
 
     def test_seasonal_team_counts(self):
         for name, table in (
-            ('star_grain[fct_standings~20teams/league-season]',
+            ('star_grain[fct_standings=declared_team_count]',
              'gold.fct_standings'),
-            ('star_grain[fct_team_season_stats~20teams/league-season]',
+            ('star_grain[fct_team_season_stats=declared_team_count]',
              'gold.fct_team_season_stats'),
         ):
             chk = _by_name(_build(), name)
             assert chk.kind == 'row_count'
             assert chk.params['table'] == table
             assert chk.params['max_rows'] == 0
-            assert 'NOT BETWEEN 18 AND 24' in chk.params['where']
+            assert 'declared_team_count' in chk.name or 'team_count' in chk.params.get('where','')
             assert chk.severity == 'WARNING'

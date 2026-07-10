@@ -7,6 +7,11 @@ table:
     Сезонная вратарская статистика из FBref (Goalkeeping). Гранулярность:
     один row на (player, squad, league, season). Метрики — текстовые (приведение
     типов в Silver). Источник: FBref scrape (dag_ingest_fbref).
+
+    Только базовая вратарская (sota/ga/saves/save%). Advanced Goalkeeping (PSxG,
+    PSxG+/-) НЕТ: с февраля 2026 FBref её не отдаёт — во всём слое bronze.fbref_*
+    ноль колонок с psxg (issue #892). gold.fct_shot.psxg заполняется только из
+    silver.sofascore_shots (xgot); для Understat-матчей psxg = NULL.
   tags:
     - Tier.Bronze
     - Domain.Football
