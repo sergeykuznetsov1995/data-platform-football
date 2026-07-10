@@ -18,6 +18,7 @@ Output:
 """
 from __future__ import annotations
 
+import gzip
 import json
 import logging
 import os
@@ -32,10 +33,17 @@ logging.basicConfig(
 )
 log = logging.getLogger("bench")
 
-sys.path.insert(0, "/opt/airflow")
+REPO_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPO_ROOT))
 
 LABEL = os.environ.get("BENCH_LABEL", "unlabeled")
-REPORT_PATH = f"/tmp/bench_fbref_{LABEL}.json"
+REPORT_PATH = os.environ.get(
+    "FBREF_BENCH_REPORT_PATH", f"/tmp/bench_fbref_{LABEL}.json"
+)
+PROXY_FILE = os.environ.get(
+    "FBREF_BENCH_PROXY_FILE", "/opt/airflow/proxys.txt"
+)
+HTML_DIR = os.environ.get("FBREF_BENCH_HTML_DIR")
 
 MATCH_PATHS = [
     "/en/matches/a071faa8/Liverpool-Bournemouth-August-15-2025-Premier-League",
@@ -54,7 +62,19 @@ MATCH_PATHS = [
 def main() -> None:
     from scrapers.fbref import FBrefScraper
 
-    log.info(f"BENCH_LABEL={LABEL}, fetching {len(MATCH_PATHS)} matches")
+    match_limit = max(
+        1,
+        min(
+            len(MATCH_PATHS),
+            int(os.environ.get("FBREF_BENCH_MATCH_LIMIT", len(MATCH_PATHS))),
+        ),
+    )
+    match_paths = MATCH_PATHS[:match_limit]
+    log.info(f"BENCH_LABEL={LABEL}, fetching {len(match_paths)} matches")
+
+    html_dir = Path(HTML_DIR) if HTML_DIR else None
+    if html_dir is not None:
+        html_dir.mkdir(parents=True, exist_ok=True)
 
     per_match = []
     bench_t0 = time.monotonic()
@@ -64,7 +84,7 @@ def main() -> None:
         seasons=[2025],
         headless=True,
         use_xvfb=True,
-        proxy_file="/opt/airflow/proxys.txt",
+        proxy_file=PROXY_FILE,
         use_nodriver=True,
         nodriver_cloudflare_wait=90,
     ) as scraper:
@@ -76,7 +96,7 @@ def main() -> None:
         if os.environ.get("BENCH_FORCE_NODRIVER") == "1":
             scraper._fetch_page_http = lambda *a, **k: None
             log.info("BENCH_FORCE_NODRIVER=1 — HTTP fast-path disabled (cold regime)")
-        for i, path in enumerate(MATCH_PATHS, 1):
+        for i, path in enumerate(match_paths, 1):
             url = "https://fbref.com" + path
             t0 = time.monotonic()
             html = None
@@ -101,8 +121,12 @@ def main() -> None:
             if err:
                 entry["error"] = err
             per_match.append(entry)
+            if html_dir is not None and html:
+                match_id = path.split("/", 4)[3]
+                with gzip.open(html_dir / f"{match_id}.html.gz", "wt") as fh:
+                    fh.write(html)
             log.info(
-                f"  [{i:2d}/{len(MATCH_PATHS)}] {elapsed:6.2f}s "
+                f"  [{i:2d}/{len(match_paths)}] {elapsed:6.2f}s "
                 f"bytes={entry['bytes']:>7,} success={entry['success']} "
                 f"http_ok={entry['http_fetch_ok_cumul']} "
                 f"http_fb={entry['http_fetch_fallback_cumul']}"
@@ -112,22 +136,35 @@ def main() -> None:
 
     bench_total = round(time.monotonic() - bench_t0, 2)
     durations = [m["seconds"] for m in per_match if m["success"]]
+    browser_bytes = int(final_stats.get("real_bytes_downloaded", 0) or 0)
+    browser_requests = int(final_stats.get("real_requests_count", 0) or 0)
+    http_bytes = int(final_stats.get("http_bytes_downloaded", 0) or 0)
+    http_requests = int(final_stats.get("http_requests_count", 0) or 0)
+    total_proxy_bytes = browser_bytes + http_bytes
+    total_proxy_requests = browser_requests + http_requests
     report = {
         "label": LABEL,
-        "matches_attempted": len(MATCH_PATHS),
+        "transport": os.environ.get("FBREF_TRANSPORT", "nodriver"),
+        "matches_attempted": len(match_paths),
         "matches_succeeded": sum(1 for m in per_match if m["success"]),
         "total_seconds": bench_total,
         "mean_seconds": round(statistics.mean(durations), 2) if durations else None,
         "p50_seconds": round(statistics.median(durations), 2) if durations else None,
         "p95_seconds": round(sorted(durations)[int(len(durations) * 0.95)], 2)
         if len(durations) >= 3 else None,
-        "success_rate": round(sum(1 for m in per_match if m["success"]) / len(MATCH_PATHS), 2),
+        "success_rate": round(sum(1 for m in per_match if m["success"]) / len(match_paths), 2),
         "http_fetch_ok_total": final_stats.get("http_fetch_ok", 0),
         "http_fetch_fallback_total": final_stats.get("http_fetch_fallback", 0),
-        "real_bytes_mb": round(
-            final_stats.get("real_bytes_downloaded", 0) / 1024 / 1024, 2
-        ),
-        "real_requests": final_stats.get("real_requests_count", 0),
+        "real_bytes_mb": round(browser_bytes / 1024 / 1024, 3),
+        "real_requests": browser_requests,
+        "http_bytes_mb": round(http_bytes / 1024 / 1024, 3),
+        "http_requests": http_requests,
+        "total_proxy_bytes": total_proxy_bytes,
+        "total_proxy_mb": round(total_proxy_bytes / 1024 / 1024, 3),
+        "total_proxy_requests": total_proxy_requests,
+        "cf_challenge_attempts": final_stats.get("cf_challenge_attempts", 0),
+        "cf_challenges_passed": final_stats.get("cf_challenges_passed", 0),
+        "cf_challenges_failed": final_stats.get("cf_challenges_failed", 0),
         "scraper_failures": final_stats.get("failures", 0),
         # Issue #616 — per-URL audit: top consumers + first/third-party split.
         "top_traffic_urls": final_stats.get("top_traffic_urls", []),
