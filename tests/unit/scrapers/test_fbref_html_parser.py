@@ -917,8 +917,8 @@ class TestTableHasPlayerHeader:
 class TestFindPlayerStatsTableFallback:
     """Tests for find_player_stats_table fallback logic."""
 
-    def test_find_by_class(self):
-        """Test finding stats table by class attribute."""
+    def test_generic_class_table_is_not_returned(self):
+        """A CSS class cannot prove which stat_type the table contains."""
         from bs4 import BeautifulSoup
         from scrapers.fbref.html_parser import find_player_stats_table
 
@@ -938,8 +938,7 @@ class TestFindPlayerStatsTableFallback:
         soup = BeautifulSoup(html, 'html.parser')
         df = find_player_stats_table(soup, {}, 'standard')
 
-        assert df is not None
-        assert len(df) == 1
+        assert df is None
 
     def test_bare_player_header_table_is_not_returned(self, caplog):
         """A bare table with only a Player header must NOT be returned.

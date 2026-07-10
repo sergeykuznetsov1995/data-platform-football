@@ -32,6 +32,7 @@ class _StubScraper:
         self.use_nodriver = False
         self._nodriver_browser = None
         self.BATCH_SAVE_INTERVAL = 50
+        self._batch_id = 'test-batch'
 
     def _add_metadata(self, df, entity_type):
         return df
@@ -56,6 +57,38 @@ from scrapers.fbref.data_readers import FBrefDataReaderMixin
 
 class StubScraper(_StubScraper, FBrefDataReaderMixin):
     pass
+
+
+@pytest.mark.unit
+def test_incremental_limit_is_applied_after_completed_ids():
+    """A chunked backfill must advance past an already completed prefix."""
+    scraper = StubScraper()
+    schedule = pd.DataFrame({'match_id': ['m1', 'm2', 'm3', 'm4']})
+    scraper._read_schedule_from_file = MagicMock(return_value=schedule)
+    scraper._read_schedule_from_iceberg = MagicMock(return_value=None)
+    scraper._extract_match_ids = MagicMock(
+        return_value=['m1', 'm2', 'm3', 'm4']
+    )
+    scraper._get_existing_match_ids = MagicMock(return_value={'m1', 'm2'})
+    scraper._process_single_match = MagicMock(
+        return_value={'match_player_stats'}
+    )
+    scraper._batch_save_match_data = MagicMock()
+
+    writer = MagicMock()
+    cursor = MagicMock()
+    writer._get_trino_manager.return_value.connection.cursor.return_value = cursor
+    scraper._iceberg_writer = writer
+
+    with patch('scrapers.fbref.data_readers.time.sleep'):
+        scraper.scrape_combined_match_data(max_matches=2, incremental=True)
+
+    scraper._extract_match_ids.assert_called_once()
+    extract_args = scraper._extract_match_ids.call_args.args
+    assert extract_args[0] is schedule
+    assert extract_args[1] is None
+    processed = [call.args[0] for call in scraper._process_single_match.call_args_list]
+    assert processed == ['m3', 'm4']
 
 
 # ===========================================================================
@@ -111,6 +144,55 @@ class TestReadScheduleFromIcebergTrinoDown:
         assert any('unexpected error' in msg for msg in caplog.messages)
 
 
+@pytest.mark.unit
+def test_schedule_file_is_read_only_from_current_run_dir(tmp_path, monkeypatch):
+    scraper = StubScraper()
+    monkeypatch.setenv('FBREF_RUN_DIR', str(tmp_path))
+    path = tmp_path / 'fbref_schedule_ENG_Premier_League_2025.json'
+    expected = pd.DataFrame({
+        'match_url': ['https://fbref.com/en/matches/m1'],
+        'league': ['ENG-Premier League'],
+        'season': [2025],
+    })
+    expected.to_json(path, orient='records')
+
+    actual = scraper._read_schedule_from_file(
+        'ENG-Premier League', 2025
+    )
+
+    assert actual is not None
+    assert actual['match_url'].tolist() == expected['match_url'].tolist()
+
+
+@pytest.mark.unit
+def test_schedule_success_for_one_league_cannot_hide_missing_scope(
+    tmp_path, monkeypatch
+):
+    scraper = StubScraper()
+    scraper.leagues = ['good-league', 'bad-league']
+    monkeypatch.setenv('FBREF_RUN_DIR', str(tmp_path))
+    good = pd.DataFrame({
+        'match_url': ['https://fbref.com/en/matches/m1'],
+        'league': ['good-league'],
+        'season': [2025],
+    })
+    scraper.read_schedule = MagicMock(
+        side_effect=lambda league, _season: (
+            good if league == 'good-league' else None
+        )
+    )
+    scraper.save_to_iceberg = MagicMock(
+        return_value='iceberg.bronze.fbref_schedule'
+    )
+
+    with patch('scrapers.fbref.data_readers.time.sleep'):
+        result = scraper.scrape_match_data('schedule')
+
+    assert result['schedule'] == 'iceberg.bronze.fbref_schedule'
+    assert scraper._stats['scope_errors']
+    assert 'bad-league' in scraper._stats['scope_errors'][-1]
+
+
 # ===========================================================================
 # Test: _batch_save_match_data — JSON fallback
 # ===========================================================================
@@ -137,7 +219,9 @@ class TestBatchSaveMatchDataFallback:
         ]
         results = {}
 
-        with patch('scrapers.fbref.data_readers.time') as mock_time:
+        with patch.dict(
+            os.environ, {'FBREF_RUN_DIR': str(tmp_path)}
+        ), patch('scrapers.fbref.data_readers.time') as mock_time:
             mock_time.time.return_value = 1234567890
 
             scraper._batch_save_match_data(
@@ -151,6 +235,7 @@ class TestBatchSaveMatchDataFallback:
         assert 'shot_events_fallback' in results
         fallback_path = results['shot_events_fallback']
         assert os.path.exists(fallback_path)
+        assert os.path.dirname(fallback_path) == str(tmp_path)
 
         # Verify data is readable
         df = pd.read_json(fallback_path, orient='records')
@@ -252,6 +337,39 @@ class TestBatchSaveMatchDataFallback:
             'fbref_match_player_stats', 'fbref_match_managers',
         ):
             assert by_table[table] == ['match_id'], table
+
+        assert scraper.save_to_iceberg.call_args_list[-1].kwargs[
+            'table_name'
+        ] == 'fbref_match_player_stats'
+
+    def test_write_failure_does_not_persist_incremental_completion_marker(self):
+        """A partial Iceberg batch must be retried on the next DAG run."""
+        scraper = StubScraper()
+        scraper.save_to_iceberg = MagicMock(
+            side_effect=Exception('Connection reset by peer')
+        )
+        scraper._save_fallback_json = MagicMock()
+
+        def _row(**extra):
+            return pd.DataFrame({
+                'match_id': ['m1'], 'league': ['ENG-Premier League'],
+                'season': [2025], **{k: [v] for k, v in extra.items()},
+            })
+
+        scraper._batch_save_match_data(
+            all_shot_events=[],
+            all_match_events=[],
+            all_lineups=[_row(player='p1')],
+            results={},
+            all_match_player_stats=[_row(player='p1', goals=1)],
+        )
+
+        written_tables = [
+            call.kwargs['table_name']
+            for call in scraper.save_to_iceberg.call_args_list
+        ]
+        assert written_tables == ['fbref_lineups']
+        assert scraper._save_fallback_json.call_count == 2
 
 
 # ===========================================================================
@@ -371,6 +489,45 @@ class TestCombinedMatchDataPreflightProbe:
         assert result == {}
         # Schedule source should be 'none'
         assert scraper._stats.get('schedule_source') == 'none'
+
+    @pytest.mark.unit
+    def test_noop_is_explicitly_verified_against_required_tables(self):
+        scraper = StubScraper()
+        schedule = pd.DataFrame({'match_id': ['m1']})
+        scraper._read_schedule_from_file = MagicMock(return_value=schedule)
+        scraper._extract_match_ids = MagicMock(return_value=['m1'])
+        scraper._get_existing_match_ids = MagicMock(return_value={'m1'})
+
+        writer = MagicMock()
+        writer.table_exists.return_value = True
+        scraper._iceberg_writer = writer
+
+        result = scraper.scrape_combined_match_data()
+
+        assert result == {}
+        assert scraper._stats['eligible_match_ids'] == 1
+        assert scraper._stats['pending_match_ids'] == 0
+        assert scraper._stats['all_already_scraped'] is True
+        assert len(scraper._stats['verified_noop_table_paths']) == 4
+
+    @pytest.mark.unit
+    def test_noop_is_not_verified_when_required_table_is_missing(self):
+        scraper = StubScraper()
+        schedule = pd.DataFrame({'match_id': ['m1']})
+        scraper._read_schedule_from_file = MagicMock(return_value=schedule)
+        scraper._extract_match_ids = MagicMock(return_value=['m1'])
+        scraper._get_existing_match_ids = MagicMock(return_value={'m1'})
+
+        writer = MagicMock()
+        writer.table_exists.side_effect = (
+            lambda _database, table: table != 'fbref_lineups'
+        )
+        scraper._iceberg_writer = writer
+
+        scraper.scrape_combined_match_data()
+
+        assert scraper._stats['all_already_scraped'] is False
+        assert scraper._stats['missing_noop_tables'] == ['fbref_lineups']
 
 
 # ===========================================================================
@@ -493,10 +650,11 @@ class TestBatchSaveRetryDedup:
             first_pass = scraper._process_single_match(*process_args)
             retry_pass = scraper._process_single_match(*process_args)
 
-        # Bug precondition reproduced: partial first pass, both copies buffered
+        # Partial first pass is diagnostic only; only the complete retry may
+        # commit match buffers.
         assert 'match_player_stats' not in first_pass
         assert 'match_player_stats' in retry_pass
-        assert len(all_lineups) == 2
+        assert len(all_lineups) == 1
 
         scraper._batch_save_match_data(
             all_shot_events, all_match_events, all_lineups,
@@ -539,6 +697,38 @@ class TestBatchSaveRetryDedup:
         df = scraper.save_to_iceberg.call_args.kwargs['df']
         assert sorted(df['match_id']) == ['m1', 'm2']
         assert df.set_index('match_id').loc['m1', 'pass_marker'] == 'retry'
+
+    def test_late_parser_exception_does_not_leak_partial_buffers(self):
+        scraper = StubScraper()
+        scraper._fetch_page = MagicMock(return_value='<html></html>')
+        events, lineups, team_stats, player_stats = [], [], [], []
+
+        with patch('scrapers.fbref.data_readers.extract_tables_from_comments',
+                   return_value={}), \
+             patch('scrapers.fbref.data_readers.parse_shots_table',
+                   return_value=None), \
+             patch('scrapers.fbref.data_readers.parse_events_from_scorebox',
+                   return_value=self._frame('m1', 'event')), \
+             patch('scrapers.fbref.data_readers.parse_lineup_table',
+                   return_value=self._frame('m1', 'lineup')), \
+             patch('scrapers.fbref.data_readers.parse_team_match_stats_table',
+                   side_effect=ValueError('layout drift')):
+            with pytest.raises(ValueError, match='layout drift'):
+                scraper._process_single_match(
+                    'm1', 'ENG-Premier League', 2025,
+                    [], events, lineups,
+                    team_stats, player_stats,
+                )
+
+        assert events == []
+        assert lineups == []
+        assert team_stats == []
+        assert player_stats == []
+        scraper._fetch_page.assert_called_once_with(
+            'https://fbref.com/en/matches/m1',
+            use_cache=False,
+            page_type='match',
+        )
 
 
 # ===========================================================================
@@ -786,10 +976,76 @@ class TestScrapeCombinedSeasonStats:
         assert 'player_stats' in result['tables']
         assert len(result['tables']) == 7
 
+    @pytest.mark.unit
+    def test_good_league_cannot_hide_missing_second_league(self):
+        scraper = self._scraper()
+        scraper.leagues = ['good-league', 'bad-league']
+
+        def _parse(league, _season, _page, extracts):
+            if league == 'bad-league':
+                raise ValueError('layout drift')
+            return {
+                f'{category}_{stat_type}': self._frame()
+                for category, stat_type in extracts
+            }
+
+        scraper._parse_season_page = MagicMock(side_effect=_parse)
+
+        with patch('scrapers.fbref.data_readers.time.sleep'):
+            result = scraper.scrape_combined_season_stats()
+
+        assert len(result['tables']) == 9
+        assert any('bad-league' in error for error in result['errors'])
+        assert any('missing season datasets' in error
+                   for error in result['errors'])
+
 
 # ===========================================================================
 # Test: no-summary tombstones (#A5)
 # ===========================================================================
+
+
+class TestMatchCompletionContractVersion:
+    @pytest.mark.unit
+    def test_legacy_player_rows_are_not_incremental_completion_markers(self):
+        scraper = StubScraper()
+        writer = MagicMock()
+        writer.table_exists.side_effect = (
+            lambda _database, table: table == 'fbref_match_player_stats'
+        )
+        writer.read_table.return_value = pd.DataFrame({
+            'match_id': ['legacy-match'],
+        })
+        scraper._iceberg_writer = writer
+
+        sets_ = scraper._load_match_id_sets(
+            'ENG-Premier League', 2025
+        )
+
+        assert sets_['player_stats'] == set()
+
+    @pytest.mark.unit
+    def test_current_contract_player_rows_are_safe_to_skip(self):
+        scraper = StubScraper()
+        writer = MagicMock()
+        writer.table_exists.side_effect = (
+            lambda _database, table: table == 'fbref_match_player_stats'
+        )
+        writer.read_table.return_value = pd.DataFrame({
+            'match_id': ['current-match', 'old-match'],
+            'parser_contract_version': [
+                scraper.MATCH_COMPLETION_CONTRACT_VERSION,
+                'old-contract',
+            ],
+        })
+        scraper._iceberg_writer = writer
+
+        sets_ = scraper._load_match_id_sets(
+            'ENG-Premier League', 2025
+        )
+
+        assert sets_['player_stats'] == {'current-match'}
+
 
 class TestNoStatsTombstone:
     """Matches whose page lacks stats_*_summary in both passes of a run get a
@@ -811,12 +1067,44 @@ class TestNoStatsTombstone:
         # m1 confirmed in 3 runs (>= threshold), m2 only in 2 → keep retrying
         scraper._iceberg_writer = self._writer_with_tombstones(pd.DataFrame({
             'match_id': ['m1'] * 3 + ['m2'] * 2,
+            'confirmation_id': ['r1', 'r2', 'r3', 'r1', 'r2'],
+            'confirmed_at': [pd.Timestamp.now(tz='UTC')] * 5,
         }))
 
         sets_ = scraper._load_match_id_sets('ENG-Premier League', 2025)
 
         assert sets_['no_stats'] == {'m1'}
         assert sets_['player_stats'] == set()
+
+    @pytest.mark.unit
+    def test_task_retries_in_one_dag_run_count_once(self):
+        scraper = StubScraper()
+        scraper._iceberg_writer = self._writer_with_tombstones(pd.DataFrame({
+            'match_id': ['m1'] * 3,
+            'confirmation_id': ['same-run'] * 3,
+            'confirmed_at': [pd.Timestamp.now(tz='UTC')] * 3,
+        }))
+
+        sets_ = scraper._load_match_id_sets('ENG-Premier League', 2025)
+
+        assert sets_['no_stats'] == set()
+
+    @pytest.mark.unit
+    def test_expired_observations_are_rechecked(self):
+        scraper = StubScraper()
+        old = (
+            pd.Timestamp.now(tz='UTC')
+            - pd.Timedelta(days=scraper.NO_STATS_TOMBSTONE_TTL_DAYS + 1)
+        )
+        scraper._iceberg_writer = self._writer_with_tombstones(pd.DataFrame({
+            'match_id': ['m1'] * 3,
+            'confirmation_id': ['r1', 'r2', 'r3'],
+            'confirmed_at': [old] * 3,
+        }))
+
+        sets_ = scraper._load_match_id_sets('ENG-Premier League', 2025)
+
+        assert sets_['no_stats'] == set()
 
     @pytest.mark.unit
     def test_missing_tombstone_table_yields_empty_set(self):
@@ -837,3 +1125,13 @@ class TestNoStatsTombstone:
         })
 
         assert scraper._get_existing_match_ids('L', 2025) == {'a', 'b'}
+
+    @pytest.mark.unit
+    def test_mass_tombstone_guard_rejects_systemic_layout_failure(self):
+        scraper = StubScraper()
+
+        assert scraper._no_stats_tombstone_guard_reason(10, 10)
+        assert scraper._no_stats_tombstone_guard_reason(5, 5)
+        assert scraper._no_stats_tombstone_guard_reason(4, 4)
+        assert scraper._no_stats_tombstone_guard_reason(6, 100)
+        assert scraper._no_stats_tombstone_guard_reason(1, 20) is None

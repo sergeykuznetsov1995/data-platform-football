@@ -134,21 +134,35 @@ class TestCheckTrafficGuardParameterized:
         assert '750' in str(exc_info.value)
 
     @pytest.mark.unit
-    def test_missing_file_returns_status_missing(self, tmp_path, airflow_ti):
+    def test_missing_file_fails_closed(self, tmp_path, airflow_ti):
+        from airflow.exceptions import AirflowException
         from dags.utils.fbref_callbacks import check_traffic_guard
 
         path = str(tmp_path / "does_not_exist.json")
 
         with patch('airflow.models.Variable') as mock_var:
             mock_var.get.return_value = '500'
-            result = check_traffic_guard(
-                traffic_path=path,
+            with pytest.raises(AirflowException, match='not found'):
+                check_traffic_guard(
+                    traffic_path=path,
+                    label='match_all_data',
+                    ti=airflow_ti,
+                )
+
+    @pytest.mark.unit
+    def test_corrupt_file_fails_closed(self, tmp_path, airflow_ti):
+        from airflow.exceptions import AirflowException
+        from dags.utils.fbref_callbacks import check_traffic_guard
+
+        path = tmp_path / 'fbref_traffic_match_all_data.json'
+        path.write_text('{broken')
+
+        with pytest.raises(AirflowException, match='Could not read'):
+            check_traffic_guard(
+                traffic_path=str(path),
                 label='match_all_data',
                 ti=airflow_ti,
             )
-
-        assert result['status'] == 'missing'
-        assert result['real_proxy_mb'] is None
 
 
 class TestTrafficGuardHttpFastPath:

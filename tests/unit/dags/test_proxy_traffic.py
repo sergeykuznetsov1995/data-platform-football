@@ -158,10 +158,13 @@ class TestReportProxyTrafficCallable:
         # Patch the module the callable imports from (utils.proxy_traffic),
         # which is the same object resolved by its in-function import.
         pt = importlib.import_module("utils.proxy_traffic")
-        monkeypatch.setattr(
-            pt, "summarize_fbref_traffic",
-            lambda: {"source": "fbref", "total_mb": 3.0, "top_domains": []},
-        )
+        seen = {}
+
+        def _summarize(glob_pattern):
+            seen["glob_pattern"] = glob_pattern
+            return {"source": "fbref", "total_mb": 3.0, "top_domains": []}
+
+        monkeypatch.setattr(pt, "summarize_fbref_traffic", _summarize)
         # Phase 2 (#789): the callable now also persists — stub it out so the
         # unit test never reaches a real Trino connection, and assert it fires.
         persisted = {}
@@ -171,17 +174,21 @@ class TestReportProxyTrafficCallable:
         )
         ti = MagicMock()
 
-        result = fbref_callbacks.report_proxy_traffic(ti=ti)
+        result = fbref_callbacks.report_proxy_traffic(
+            glob_pattern='/tmp/current-run/fbref_traffic_*.json',
+            ti=ti,
+        )
 
         assert result["total_mb"] == pytest.approx(3.0)
         assert persisted["total_mb"] == pytest.approx(3.0)
+        assert seen["glob_pattern"] == '/tmp/current-run/fbref_traffic_*.json'
         ti.xcom_push.assert_called_with(key="proxy_total_mb", value=3.0)
 
     @pytest.mark.unit
     def test_never_raises_on_failure(self, monkeypatch):
         from dags.utils import fbref_callbacks
 
-        def _boom():
+        def _boom(**_kwargs):
             raise RuntimeError("disk gone")
 
         pt = importlib.import_module("utils.proxy_traffic")

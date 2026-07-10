@@ -705,6 +705,10 @@ class TestFBrefScraperCombinedMatchData:
             'team': ['Arsenal'],
             'player': ['Ramsdale'],
         })
+        sample_player_stats = pd.DataFrame({
+            'Player': ['Saka', 'Palmer'],
+            'team_side': ['home', 'away'],
+        })
 
         # Mock HTML with tables so validation passes
         fake_html = '<html><body><table id="shots"><tr><td>data</td></tr></table></body></html>'
@@ -719,6 +723,8 @@ class TestFBrefScraperCombinedMatchData:
         with patch('scrapers.fbref.data_readers.parse_shots_table', return_value=sample_shots), \
              patch('scrapers.fbref.data_readers.parse_events_from_scorebox', return_value=sample_events), \
              patch('scrapers.fbref.data_readers.parse_lineup_table', return_value=sample_lineups), \
+             patch('scrapers.fbref.data_readers.parse_player_match_stats_tables',
+                   return_value=sample_player_stats), \
              patch('scrapers.fbref.data_readers.extract_tables_from_comments', return_value={}):
 
             result = scraper.scrape_combined_match_data(max_matches=2)
@@ -730,6 +736,7 @@ class TestFBrefScraperCombinedMatchData:
         assert 'shot_events' in result
         assert 'match_events' in result
         assert 'lineups' in result
+        assert 'match_player_stats' in result
 
     def test_scrape_combined_match_data_default_max_matches(self, mock_scraper_dependencies):
         """Test that combined method has default max_matches=50."""

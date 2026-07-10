@@ -15,6 +15,7 @@ stub ``airflow`` modules into ``sys.modules`` so the DAG module body (operators
 from __future__ import annotations
 
 import importlib
+import re
 import sys
 from pathlib import Path
 
@@ -55,6 +56,11 @@ def _bash_task(task_id):
     return None
 
 
+def _flag_value(command, flag):
+    match = re.search(rf'{re.escape(flag)}\s+"([^"]+)"', command)
+    return match.group(1) if match else None
+
+
 @pytest.fixture
 def dag_module():
     return _reload_dag_module()
@@ -68,27 +74,31 @@ class TestClubPipelineUnchanged:
     def test_season_stats_all_unchanged(self, dag_module):
         task = _bash_task('season_stats_all')
         assert task is not None
-        assert '--leagues "ENG-Premier League"' in task.bash_command
-        assert '--output /tmp/fbref_season_stats.json' in task.bash_command
-        assert (
-            '--traffic-output /tmp/fbref_traffic_season_stats.json'
-            in task.bash_command
+        assert task.env['FBREF_LEAGUES'] == "{{ params.leagues | join(',') }}"
+        assert _flag_value(task.bash_command, '--output').endswith(
+            '/fbref_season_stats.json'
+        )
+        assert _flag_value(task.bash_command, '--traffic-output').endswith(
+            '/fbref_traffic_season_stats.json'
         )
 
     def test_match_schedule_unchanged(self, dag_module):
         task = _bash_task('match_schedule')
         assert task is not None
-        assert '--leagues "ENG-Premier League"' in task.bash_command
-        assert '--output /tmp/fbref_match_schedule.json' in task.bash_command
+        assert task.env['FBREF_LEAGUES'] == "{{ params.leagues | join(',') }}"
+        assert _flag_value(task.bash_command, '--output').endswith(
+            '/fbref_match_schedule.json'
+        )
 
     def test_match_all_data_unchanged(self, dag_module):
         task = _bash_task('match_all_data')
         assert task is not None
-        assert '--leagues "ENG-Premier League"' in task.bash_command
-        assert '--output /tmp/fbref_match_all_data.json' in task.bash_command
-        assert (
-            '--traffic-output /tmp/fbref_traffic_match_all_data.json'
-            in task.bash_command
+        assert task.env['FBREF_LEAGUES'] == "{{ params.leagues | join(',') }}"
+        assert _flag_value(task.bash_command, '--output').endswith(
+            '/fbref_match_all_data.json'
+        )
+        assert _flag_value(task.bash_command, '--traffic-output').endswith(
+            '/fbref_traffic_match_all_data.json'
         )
 
 
@@ -100,29 +110,26 @@ class TestTournamentMiniPipeline:
     def test_tournament_season_stats_task_exists_dedicated(self, dag_module):
         task = _bash_task('season_stats_all_int_world_cup')
         assert task is not None
-        assert '--leagues "INT-World Cup"' in task.bash_command
+        assert task.env['FBREF_LEAGUES'] == 'INT-World Cup'
         assert '--season {{ params.season }}' in task.bash_command
-        assert (
-            '--output /tmp/fbref_season_stats_int_world_cup.json'
-            in task.bash_command
+        assert _flag_value(task.bash_command, '--output').endswith(
+            '/fbref_season_stats_int_world_cup.json'
         )
 
     def test_tournament_match_schedule_task_exists_dedicated(self, dag_module):
         task = _bash_task('match_schedule_int_world_cup')
         assert task is not None
-        assert '--leagues "INT-World Cup"' in task.bash_command
-        assert (
-            '--output /tmp/fbref_match_schedule_int_world_cup.json'
-            in task.bash_command
+        assert task.env['FBREF_LEAGUES'] == 'INT-World Cup'
+        assert _flag_value(task.bash_command, '--output').endswith(
+            '/fbref_match_schedule_int_world_cup.json'
         )
 
     def test_tournament_match_all_data_task_exists_dedicated(self, dag_module):
         task = _bash_task('match_all_data_int_world_cup')
         assert task is not None
-        assert '--leagues "INT-World Cup"' in task.bash_command
-        assert (
-            '--output /tmp/fbref_match_all_data_int_world_cup.json'
-            in task.bash_command
+        assert task.env['FBREF_LEAGUES'] == 'INT-World Cup'
+        assert _flag_value(task.bash_command, '--output').endswith(
+            '/fbref_match_all_data_int_world_cup.json'
         )
 
     def test_traffic_output_paths_never_collide_with_club(self, dag_module):
@@ -140,14 +147,12 @@ class TestTournamentMiniPipeline:
             tournament_task = _bash_task(tournament_id)
             assert club_task is not None and tournament_task is not None
 
-            def _traffic_output(cmd):
-                for line in cmd.splitlines():
-                    if '--traffic-output' in line:
-                        return line.strip().split('--traffic-output')[1].split()[0]
-                return None
-
-            club_traffic = _traffic_output(club_task.bash_command)
-            tournament_traffic = _traffic_output(tournament_task.bash_command)
+            club_traffic = _flag_value(
+                club_task.bash_command, '--traffic-output'
+            )
+            tournament_traffic = _flag_value(
+                tournament_task.bash_command, '--traffic-output'
+            )
             assert club_traffic is not None
             assert tournament_traffic is not None
             assert club_traffic != tournament_traffic
