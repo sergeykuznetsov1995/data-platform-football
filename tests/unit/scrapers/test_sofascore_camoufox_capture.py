@@ -6,6 +6,7 @@ test the pure response-classification / selection logic that decides what counts
 as real data, which has no browser dependency.
 """
 import json
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -297,7 +298,7 @@ def test_extract_tournament_events_empty_for_absent_ut():
 class TestCaptureEventRetry:
     """capture_event re-navigates when a required endpoint (default lineups)
     is missing — the live runner saw ~1/2 lineup misses without retry (a tab
-    XHR or its body-read races). We patch _navigate/_click_tabs so no browser
+    XHR or its body-read races). We patch _navigate so no browser
     is needed and drive the buffer state per attempt.
     """
 
@@ -324,7 +325,6 @@ class TestCaptureEventRetry:
             calls["n"] += 1
 
         cap._navigate = fake_navigate
-        cap._click_tabs = lambda *a, **k: None
 
         # Act
         result = cap.capture_event(eid, required=("lineups",), max_attempts=3)
@@ -347,7 +347,6 @@ class TestCaptureEventRetry:
             calls["n"] += 1
 
         cap._navigate = fake_navigate
-        cap._click_tabs = lambda *a, **k: None
 
         # Act
         result = cap.capture_event(eid, required=("lineups",), max_attempts=3)
@@ -370,7 +369,6 @@ class TestCaptureEventRetry:
             calls["n"] += 1
 
         cap._navigate = fake_navigate
-        cap._click_tabs = lambda *a, **k: None
 
         # Act
         cap.capture_event(eid, required=(), max_attempts=3)
@@ -411,6 +409,55 @@ def test_merge_capture_replaces_good_with_newer_good():
     assert merge_capture(old, new) is new
 
 
+def test_merge_capture_keeps_good_over_later_challenge_json():
+    good = {"status": 200, "json": {"events": [1]}, "challenge": False}
+    challenged = {
+        "status": 403,
+        "json": {"error": {"reason": "challenge"}},
+        "challenge": True,
+    }
+    assert merge_capture(good, challenged) is good
+
+
+def test_merge_capture_keeps_terminal_404_over_later_transport_error():
+    terminal = {"status": 404, "json": None, "challenge": False}
+    retryable = {"status": 503, "json": None, "challenge": False}
+    assert merge_capture(terminal, retryable) is terminal
+
+
+def test_event_endpoint_states_distinguish_terminal_404_from_retryable_503():
+    from scrapers.sofascore.camoufox_capture import SofascoreCamoufoxCapture
+
+    cap = SofascoreCamoufoxCapture(proxy=None)
+    cap._buffer = {
+        "/api/v1/event/7": {
+            "status": 200,
+            "json": {"event": {"id": 7}},
+            "challenge": False,
+        },
+        "/api/v1/event/7/lineups": {
+            "status": 404,
+            "json": None,
+            "challenge": False,
+        },
+        "/api/v1/event/7/statistics": {
+            "status": 503,
+            "json": None,
+            "challenge": False,
+        },
+    }
+
+    assert cap.event_endpoint_states(
+        7,
+        names=("event", "lineups", "statistics", "shotmap"),
+    ) == {
+        "event": "success",
+        "lineups": "not_available",
+        "statistics": "server_error",
+        "shotmap": "missing",
+    }
+
+
 # --------------------------------------------------------------------------- #
 #  _on_response wiring + capture_event accumulation across retries (#751 PR2)  #
 # --------------------------------------------------------------------------- #
@@ -449,33 +496,6 @@ def test_on_response_does_not_clobber_good_capture_with_304():
     assert rec["status"] == 200
 
 
-def test_click_tabs_clicks_statistics_by_testid():
-    # The Statistics tab must be clicked by its stable data-testid (fires both
-    # /statistics and /shotmap); get_by_text grabbed a non-tab node (#751 PR2).
-    from unittest.mock import MagicMock
-    cap = _cap_no_browser()
-    cap._page = MagicMock()
-    cap._page.evaluate.return_value = True
-
-    cap._click_tabs(("Statistics",))
-
-    # evaluate invoked with the tab-statistics testid; text fallback NOT used.
-    assert cap._page.evaluate.call_args[0][1] == "tab-statistics"
-    cap._page.get_by_text.assert_not_called()
-
-
-def test_click_tabs_falls_back_to_text_without_testid():
-    # A tab with no known testid (Player statistics) uses the get_by_text path.
-    from unittest.mock import MagicMock
-    cap = _cap_no_browser()
-    cap._page = MagicMock()
-
-    cap._click_tabs(("Player statistics",))
-
-    cap._page.get_by_text.assert_called_once()
-    assert cap._page.get_by_text.call_args[0][0] == "Player statistics"
-
-
 def test_capture_event_accumulates_statistics_across_retry():
     """The retry that recovers a missing `lineups` must NOT lose a `statistics`
     captured on an earlier pass (re-nav serves it as a 304/no-body). Pre-PR2
@@ -499,7 +519,6 @@ def test_capture_event_accumulates_statistics_across_retry():
         calls["n"] += 1
 
     cap._navigate = fake_navigate
-    cap._click_tabs = lambda *a, **k: None
 
     # Act — require lineups so attempt 1 (no lineups) forces a retry.
     result = cap.capture_event(eid, required=("lineups",), max_attempts=3)
@@ -515,8 +534,7 @@ def test_capture_event_accumulates_statistics_across_retry():
 #  In-page fetch (#842) — fetch_names_for_tabs + fetch_event                   #
 # --------------------------------------------------------------------------- #
 def test_fetch_names_for_tabs_all_event_tabs():
-    names = fetch_names_for_tabs(
-        ("Lineups", "Statistics", "Player statistics", "Shotmap"))
+    names = fetch_names_for_tabs(("Lineups", "Statistics", "Shotmap"))
     assert names == ("event", "lineups", "statistics", "shotmap")
 
 
@@ -787,8 +805,8 @@ def test_extract_player_seasons_map_empty_when_not_captured():
 # --------------------------------------------------------------------------- #
 def _tournament_seasons_payload():
     """Real /unique-tournament/17/seasons response (trimmed, #779). NOTE: this
-    endpoint does NOT fire on the standings landing — only when the matches
-    widget is nudged — so read_league_table falls back to the events."""
+    endpoint does not reliably fire on the standings landing, so the scraper
+    requests it explicitly when the passive buffer lacks it."""
     return {"seasons": [
         {"year": "26/27", "id": 96668},
         {"year": "25/26", "id": 76986},
@@ -975,9 +993,7 @@ def test_select_player_season_stats_ignores_other_players_and_challenges():
 
 
 # --------------------------------------------------------------------------- #
-#  capture_player season buffer (#751 PR3b) — Season tab + picker in ONE nav   #
-#  Browser steps are patched (no Firefox); we assert the buffer FILTERING that #
-#  hands the caller only the season-stats + /statistics/seasons paths.         #
+#  capture_player — one warm navigation + exact season API fetch                #
 # --------------------------------------------------------------------------- #
 class TestCapturePlayerSeasonBuffer:
     def _cap(self):
@@ -992,36 +1008,34 @@ class TestCapturePlayerSeasonBuffer:
         pid = 839981
         cap._navigate = lambda *a, **k: None
         cap._extract_player_next_data = lambda p: {"id": int(p), "name": "Paqueta"}
-        cap._click_tabs = lambda *a, **k: None
+        expected = {
+            "profile": {"id": pid, "name": "Paqueta"},
+            "season_buffer": {"exact": True},
+        }
+        cap.fetch_player = MagicMock(return_value=expected)
 
-        def fake_drive(label):
-            # Simulate the tab + picker firing the season XHRs (+ unrelated noise).
-            cap._buffer = {
-                f"/api/v1/player/{pid}/statistics/seasons":
-                    {"status": 200, "json": {"x": 1}, "challenge": False},
-                f"/api/v1/player/{pid}/unique-tournament/17/season/76986/statistics/overall":
-                    {"status": 200, "json": {"s": 1}, "challenge": False},
-                # unrelated capture (events) — must be filtered OUT.
-                f"/api/v1/player/{pid}/events/last/0":
-                    {"status": 200, "json": {"events": []}, "challenge": False},
-            }
-
-        cap._drive_season_picker = fake_drive
-
-        out = cap.capture_player(pid, season_picker_label="Premier League")
+        out = cap.capture_player(pid, target_ut=17, target_year="25/26")
 
         assert out["profile"]["name"] == "Paqueta"
-        assert set(out["season_buffer"]) == {
-            f"/api/v1/player/{pid}/statistics/seasons",
-            f"/api/v1/player/{pid}/unique-tournament/17/season/76986/statistics/overall",
-        }
+        assert out["season_buffer"] == {"exact": True}
+        cap.fetch_player.assert_called_once_with(
+            pid,
+            target_ut=17,
+            target_year="25/26",
+            profile={"id": pid, "name": "Paqueta"},
+        )
 
-    def test_profile_only_when_no_picker_label(self):
-        # Backward-compatible PR3 path: no picker label → no season capture.
+    def test_profile_only_when_no_target(self):
         cap = self._cap()
         cap._navigate = lambda *a, **k: None
         cap._extract_player_next_data = lambda p: {"id": int(p)}
-        out = cap.capture_player(7, season_picker_label=None)
+        cap.fetch_player = MagicMock(
+            return_value={
+                "profile": {"id": 7},
+                "season_buffer": {},
+            }
+        )
+        out = cap.capture_player(7)
         assert out["season_buffer"] == {}
         assert out["profile"] == {"id": 7}
 
@@ -1051,8 +1065,35 @@ class TestPaginateTournamentSeason:
     def _cap(self, results):
         from scrapers.sofascore.camoufox_capture import SofascoreCamoufoxCapture
         cap = SofascoreCamoufoxCapture(proxy=None)
-        cap._page = self._RecordingPage(results)
+        cap._page = self._RecordingPage([])
         cap._buffer = {"sentinel": 1}
+        pending = list(results)
+
+        def fetch(path):
+            cap._page.paths.append(path)
+            result = (
+                pending.pop(0)
+                if pending
+                else {
+                    "ok": False,
+                    "count": 0,
+                    "more": False,
+                }
+            )
+            if not result["ok"]:
+                return {"status": 503, "json": None, "challenge": None}
+            rec = {
+                "status": 200,
+                "json": {
+                    "events": [{} for _ in range(result["count"])],
+                    "hasNextPage": result["more"],
+                },
+                "challenge": False,
+            }
+            cap._buffer[path] = rec
+            return rec
+
+        cap.fetch_api_json = fetch
         return cap
 
     def test_pages_until_no_next_then_stops(self):
@@ -1068,8 +1109,8 @@ class TestPaginateTournamentSeason:
             "/api/v1/unique-tournament/17/season/12345/events/last/1",
             "/api/v1/unique-tournament/17/season/12345/events/last/2",
         ]
-        # Returns the buffer snapshot (a copy of self._buffer).
-        assert out == {"sentinel": 1}
+        assert out["sentinel"] == 1
+        assert len(out) == 4
 
     def test_stops_on_empty_events_page(self):
         cap = self._cap([

@@ -6,7 +6,8 @@ Airflow DAG for scraping football statistics from SofaScore.
 Uses BashOperator to run scraper in isolated subprocess,
 avoiding LocalExecutor memory issues.
 
-Schedules daily at 11 AM UTC.
+Runs daily through ``dag_master_pipeline`` and has no independent schedule, so
+the residential-proxy source is never invoked twice for the same day.
 
 One source = one DAG (#782): the former weekly ``dag_ingest_sofascore_players``
 is folded in here as a gated branch (pattern #710 MatchHistory / #716 ClubElo —
@@ -17,19 +18,16 @@ Data collected:
 - Per-match capture: player_ratings, event_player_stats, match_stats, shotmap (daily)
 - Per-player profile + season-aggregate stats (weekly — heavy, gated; see below)
 
-The per-player capture (~526 players; since #842 one navigation + in-page
-fetches, ~30-40 min) still isn't worth running daily, so a
-``ShortCircuitOperator`` gates it: it runs only on the DAG's OWN
-Saturday scheduled run, or on a manual "Trigger DAG w/ config" with
-``run_players=True``. It is skipped on weekday scheduled runs and whenever an
-external trigger (e.g. ``dag_master_pipeline``) fires this DAG, so the daily
-pipeline never waits on the heavy player run.
+The per-player capture (~526 players; since #842 one navigation plus in-page
+fetches per bounded session) still is not worth running daily, so a
+``ShortCircuitOperator`` gates it to Saturday master-runs or an explicit manual
+``run_players=True`` invocation.
 
 All data is written to Iceberg Bronze layer tables (via Parquet fallback).
 """
 
 import os
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Any, Dict, List
 
 from airflow import DAG
@@ -315,34 +313,33 @@ def validate_bronze_freshness(**context) -> None:
 
     logger = logging.getLogger(__name__)
 
-    # #842 incremental match_capture: on a clean skip-existing no-op nothing
-    # new is written BY DESIGN (off-season / international break), so
-    # MAX(_ingested_at) ages without the data being stale. Skip the alert —
-    # a failed/fallback capture still falls through to the checks below.
+    # #842 incremental match_capture: on a clean skip-existing no-op the match
+    # tables legitimately do not change. Schedule + standings are still expected
+    # to refresh daily and must never be hidden by that no-op.
     capture_result = _load_result(MATCH_CAPTURE_RESULT_PATH, logger)
-    if _capture_noop(capture_result):
+    capture_noop = _capture_noop(capture_result)
+    if capture_noop:
         logger.info(
-            "validate_bronze_freshness: skipped — match_capture was a clean "
-            "skip-existing no-op (all %d matches already in bronze).",
-            capture_result.get('matches_total', 0),
+            "validate_bronze_freshness: match-grain freshness checks skipped — capture "
+            "was a clean no-op (all %d matches already in bronze).",
+            capture_result.get("matches_total", 0),
         )
-        return
 
     # Global table freshness (MAX(_ingested_at), no season filter) — robust to
     # SofaScore's varchar season slug and catches any ingestion stall. 48h gives
     # one missed daily run of grace before alerting.
     checks = [
         CHECK.freshness(
-            'bronze.sofascore_match_stats',
-            ts_col='_ingested_at', max_age_hours=48, severity='WARNING',
+            "bronze.sofascore_schedule",
+            ts_col="_ingested_at",
+            max_age_hours=48,
+            severity="WARNING",
         ),
         CHECK.freshness(
-            'bronze.sofascore_event_player_stats',
-            ts_col='_ingested_at', max_age_hours=48, severity='WARNING',
-        ),
-        CHECK.freshness(
-            'bronze.sofascore_player_ratings',
-            ts_col='_ingested_at', max_age_hours=48, severity='WARNING',
+            "bronze.sofascore_league_table",
+            ts_col="_ingested_at",
+            max_age_hours=48,
+            severity="WARNING",
         ),
         # #711: a partial /statistics capture (proxy degradation) can write
         # match_stats rows that carry the group + numeric values but NO stat
@@ -357,6 +354,29 @@ def validate_bronze_freshness(**context) -> None:
             name='match_stats_labelled',
         ),
     ]
+    if not capture_noop:
+        checks.extend(
+            [
+                CHECK.freshness(
+                    "bronze.sofascore_match_stats",
+                    ts_col="_ingested_at",
+                    max_age_hours=48,
+                    severity="WARNING",
+                ),
+                CHECK.freshness(
+                    "bronze.sofascore_event_player_stats",
+                    ts_col="_ingested_at",
+                    max_age_hours=48,
+                    severity="WARNING",
+                ),
+                CHECK.freshness(
+                    "bronze.sofascore_player_ratings",
+                    ts_col="_ingested_at",
+                    max_age_hours=48,
+                    severity="WARNING",
+                ),
+            ]
+        )
     report = run_checks(checks, raise_on_error=False)
     logger.info("validate_bronze_freshness: %s", report.summary())
     telegram_dq_summary(report, header='SofaScore Bronze freshness')
@@ -369,15 +389,13 @@ def validate_bronze_freshness(**context) -> None:
 def _gate_player_capture(**context) -> bool:
     """ShortCircuitOperator hook — TRUE means "run the per-player capture".
 
-    The ~526-player capture is heavy (hours, residential proxy). It must NOT
-    run on every daily run, nor when ``dag_master_pipeline`` triggers this DAG
-    (that would stall the daily pipeline). So it runs only when:
+    The ~526-player capture is heavy (hours, residential proxy), so it must not
+    run every day. It runs only when:
 
       - a manual "Trigger DAG w/ config" sets ``run_players=True`` (on demand); or
-      - this is the DAG's OWN Saturday scheduled run (the weekly cadence the
-        former ``dag_ingest_sofascore_players`` had).
+      - the daily master-pipeline run falls on Saturday (weekly cadence).
 
-    Skipped otherwise (weekday scheduled run, or any external/master trigger).
+    Skipped otherwise.
     Returning False short-circuits the downstream player tasks to ``skipped``.
     """
     import logging
@@ -389,17 +407,36 @@ def _gate_player_capture(**context) -> bool:
         logger.info("run_players=True → running per-player capture on demand.")
         return True
 
-    dag_run = context.get('dag_run')
-    if getattr(dag_run, 'external_trigger', False):
-        logger.info(
-            "External trigger (e.g. dag_master_pipeline) → skip per-player "
-            "capture to keep the daily pipeline fast."
-        )
-        return False
-
-    logical_date = context.get('logical_date') or context.get('execution_date')
-    if logical_date is not None and logical_date.weekday() == 5:  # Saturday
-        logger.info("Saturday scheduled run → running weekly per-player capture.")
+    # Master passes its stable data-interval boundary in dag_run.conf. This is
+    # intentionally not child start_date: queue delays/retries must not move the
+    # weekly branch to another weekday.
+    dag_run = context.get("dag_run")
+    run_conf = getattr(dag_run, "conf", None) or {}
+    master_boundary = run_conf.get("master_data_interval_end")
+    if isinstance(master_boundary, str):
+        try:
+            master_boundary = datetime.fromisoformat(
+                master_boundary.replace("Z", "+00:00")
+            )
+        except ValueError:
+            logger.warning(
+                "Invalid master_data_interval_end=%r; using local context.",
+                master_boundary,
+            )
+            master_boundary = None
+    external_boundary = (
+        master_boundary or getattr(dag_run, "start_date", None)
+        if getattr(dag_run, "external_trigger", False)
+        else None
+    )
+    run_boundary = (
+        external_boundary
+        or context.get("data_interval_end")
+        or context.get("logical_date")
+        or context.get("execution_date")
+    )
+    if run_boundary is not None and run_boundary.weekday() == 5:  # Saturday
+        logger.info("Saturday run → running weekly per-player capture.")
         return True
 
     logger.info("Not Saturday and not forced → skip per-player capture.")
@@ -523,8 +560,8 @@ leagues_str = ','.join(CLUB_LEAGUES)
 with DAG(
     dag_id='dag_ingest_sofascore',
     default_args=SCRAPER_ARGS,
-    description='Ingest football statistics from SofaScore (matches daily + players weekly)',
-    schedule=SCHEDULES.get('dag_ingest_sofascore', '0 11 * * *'),
+    description="Ingest football statistics from SofaScore (matches daily + players weekly)",
+    schedule=SCHEDULES.get("dag_ingest_sofascore"),
     start_date=datetime(2024, 1, 1),
     catchup=False,
     tags=DAG_TAGS.get('sofascore', ['scraping', 'sofascore', 'bronze']),
@@ -550,9 +587,9 @@ with DAG(
             ),
         ),
         # #782: force the heavy per-player capture in this run. Normally it
-        # auto-runs only on the DAG's own Saturday scheduled run (see
+        # auto-runs on the Saturday master-pipeline invocation (see
         # _gate_player_capture); set True via "Trigger DAG w/ config" for an
-        # on-demand refresh. Ignored when dag_master_pipeline triggers this DAG.
+        # on-demand refresh.
         'run_players': False,
     },
     doc_md="""
@@ -569,7 +606,7 @@ with DAG(
 
     - **Schedule**: Match dates, teams, scores, venues (daily)
     - **Per-match capture**: player_ratings, event_player_stats, match_stats,
-      shotmap — ONE Camoufox nav/match (daily)
+      shotmap — one warmed session plus exact API fetches (daily)
     - **Per-player**: profile + season-aggregate stats (weekly, gated — see below)
 
     ### One source = one DAG (#782)
@@ -578,10 +615,9 @@ with DAG(
     per-player capture (~526 players; one nav + in-page fetches since #842)
     is gated by a `ShortCircuitOperator`:
 
-    - auto-runs only on the DAG's **own Saturday scheduled run** (weekly cadence);
+    - auto-runs on the **Saturday master-pipeline run** (weekly cadence);
     - or on demand via **"Trigger DAG w/ config"** with `run_players=true`;
-    - **skipped** on weekday scheduled runs and whenever `dag_master_pipeline`
-      triggers this DAG (so the daily pipeline never waits on the heavy run).
+    - **skipped** on weekday runs.
 
     ### Daily limits (issue #69)
 
@@ -591,10 +627,11 @@ with DAG(
 
     ### Incremental full-state refresh (#842)
 
-    The consolidated `match_capture` captures only matches NOT yet in
-    `bronze.sofascore_player_ratings` (finished-match data is immutable;
-    re-capturing the whole season daily burned ~1.6 GB of residential proxy),
-    merges them with the existing partition and rewrites it
+    The consolidated `match_capture` captures only matches not marked complete
+    in `bronze.sofascore_match_capture_status` (finished-match data is immutable;
+    re-capturing the whole season daily burned ~1.6 GB of residential proxy).
+    Endpoint states distinguish terminal empty/404 from transient misses. Data
+    frames are merged with the existing partition and rewritten
     (`replace_partitions=['league','season']` + completeness guard). A day
     with no new finished matches is a clean no-op (zero proxy spend).
 
@@ -659,8 +696,8 @@ python dags/scripts/run_sofascore_scraper.py \\
             append_env=True,
         )
 
-    # #751 PR1 — consolidated per-match capture: ONE Camoufox nav/match writes
-    # BOTH bronze.sofascore_player_ratings and bronze.sofascore_event_player_stats
+    # #751 PR1 — consolidated per-match capture: one Camoufox navigation per
+    # match writes both player_ratings and event_player_stats.
     # from the same /lineups (+/event) payload. Depends on freshly written
     # bronze.sofascore_schedule (runner reads finished match_ids there; falls
     # back to capture discovery when empty). Exit 2 = graceful R0.2B_FALLBACK
@@ -715,8 +752,7 @@ exit $rc
     scrape_match_capture_task = match_capture_tasks[CLUB_LEAGUES[0]]
 
     # #751 PR2: shotmap (#22) + match_stats (#25) no longer have their own tls
-    # tasks — both come from the consolidated Camoufox capture above (same nav
-    # also clicks the Statistics/Shotmap tabs). The dead tls path 403'd silently.
+    # tasks — both come from exact API calls in the consolidated capture above.
 
     validate_data_task = PythonOperator(
         task_id='validate_data',
@@ -734,8 +770,7 @@ exit $rc
 
     # ---- Per-player capture (#782) — gated to Saturday / manual -------------
     # Folded from the former weekly dag_ingest_sofascore_players. The gate
-    # short-circuits the player tasks to `skipped` on weekday runs and on
-    # external/master triggers (keeps the daily pipeline fast).
+    # short-circuits the player tasks to `skipped` on weekday runs.
     gate_player_capture_task = ShortCircuitOperator(
         task_id='gate_player_capture',
         python_callable=_gate_player_capture,
@@ -752,7 +787,7 @@ cd /opt/airflow && \\
 rm -f {PLAYER_CAPTURE_RESULT_PATH} && \\
 python dags/scripts/run_sofascore_scraper.py \\
     --entity player_capture \\
-    --league "{LEAGUES[0]}" \\
+    --league "{CLUB_LEAGUES[0]}" \\
     --season {{{{ params.season }}}} \\
     {_limit_arg(PLAYER_CAPTURE_LIMIT)} \\
     --output {PLAYER_CAPTURE_RESULT_PATH}
@@ -796,7 +831,7 @@ exit $rc
         match_capture_tasks[_t_league] >> validate_data_task
 
     # Per-player branch (weekly/manual), gated after match_capture so the player
-    # ids in bronze.sofascore_player_ratings are fresh; skipped on weekday runs
-    # and on master-pipeline triggers.
+    # ids in bronze.sofascore_player_ratings are fresh; skipped on weekday runs.
+    # The Saturday master-pipeline boundary intentionally opens the gate.
     scrape_match_capture_task >> gate_player_capture_task >> scrape_player_capture_task
     scrape_player_capture_task >> validate_player_data_task >> validate_player_freshness_task

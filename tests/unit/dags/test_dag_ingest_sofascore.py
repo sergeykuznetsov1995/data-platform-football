@@ -98,6 +98,8 @@ class TestBronzeFreshnessGate:
         checks = captured['checks']
         freshness = [c for c in checks if c.kind == 'freshness']
         assert {c.params['table'] for c in freshness} == {
+            'bronze.sofascore_schedule',
+            'bronze.sofascore_league_table',
             'bronze.sofascore_match_stats',
             'bronze.sofascore_event_player_stats',
             'bronze.sofascore_player_ratings',
@@ -118,7 +120,7 @@ class TestBronzeFreshnessGate:
 class TestValidateDataIncrementalNoop:
     """#842 incremental match_capture: a clean skip-existing no-op run (all
     resolved matches already in bronze) reports 0 captured rows by design —
-    the capture row-floors must not WARN and the freshness gate is skipped.
+    the capture row-floors must not WARN; schedule/table freshness still runs.
     A genuinely-low non-noop run still WARNs (incl. the new venue floor)."""
 
     SCHEDULE_OK = {'schedule_rows': 381, 'league_table_rows': 20,
@@ -172,20 +174,43 @@ class TestValidateDataIncrementalNoop:
         assert any('venue' in w for w in validation['warnings'])
         assert len(validation['warnings']) == 1
 
-    def test_freshness_skipped_on_noop(self, dag_module, monkeypatch):
+    def test_noop_still_checks_schedule_and_standings_freshness(
+        self,
+        dag_module,
+        monkeypatch,
+    ):
         captured = {}
         import utils.alerts as al
         import utils.data_quality as dq
+
+        def fake_run_checks(checks, **kwargs):
+            captured["freshness"] = {
+                check.params["table"]
+                for check in checks
+                if check.kind == "freshness"
+            }
+            captured["coverage"] = {
+                check.params["table"]
+                for check in checks
+                if check.kind == "coverage"
+            }
+            return MagicMock()
+
+        monkeypatch.setattr(dq, "run_checks", fake_run_checks)
         monkeypatch.setattr(
-            dq, 'run_checks',
-            lambda *a, **k: captured.setdefault('ran', True) and MagicMock())
-        monkeypatch.setattr(
-            al, 'telegram_dq_summary',
-            lambda *a, **k: captured.setdefault('telegram', True))
+            al,
+            "telegram_dq_summary",
+            lambda *a, **k: captured.setdefault("telegram", True),
+        )
         monkeypatch.setattr(dag_module, '_load_result',
                             lambda *a, **k: self._noop_capture())
         dag_module.validate_bronze_freshness()
-        assert 'ran' not in captured and 'telegram' not in captured
+        assert captured["freshness"] == {
+            "bronze.sofascore_schedule",
+            "bronze.sofascore_league_table",
+        }
+        assert captured["coverage"] == {"bronze.sofascore_match_stats"}
+        assert captured.get("telegram") is True
 
     def test_freshness_runs_on_fallback_capture(self, dag_module, monkeypatch):
         """A failed/fallback capture is NOT a no-op — the stall alert must
@@ -211,8 +236,7 @@ class TestValidateDataIncrementalNoop:
 
 
 class TestPlayerCaptureGate:
-    """#782: the per-player capture is gated to the DAG's own Saturday run or a
-    manual ``run_players=True``; skipped on weekdays and external triggers."""
+    """The player capture runs on Saturday master-runs or when forced."""
 
     def test_gate_callable_exposed(self, dag_module):
         assert hasattr(dag_module, '_gate_player_capture')
@@ -233,6 +257,19 @@ class TestPlayerCaptureGate:
             logical_date=datetime(2024, 1, 6),
         ) is True
 
+    def test_uses_interval_end_for_cron_run_day(self, dag_module):
+        # Airflow cron logical_date is the interval start; the Saturday run can
+        # therefore carry a Friday logical date.
+        assert (
+            dag_module._gate_player_capture(
+                params={},
+                dag_run=SimpleNamespace(external_trigger=False),
+                logical_date=datetime(2024, 1, 5),
+                data_interval_end=datetime(2024, 1, 6),
+            )
+            is True
+        )
+
     def test_weekday_scheduled_run_skips_capture(self, dag_module):
         # 2024-01-01 is a Monday (weekday()==0).
         assert dag_module._gate_player_capture(
@@ -241,14 +278,25 @@ class TestPlayerCaptureGate:
             logical_date=datetime(2024, 1, 1),
         ) is False
 
-    def test_external_trigger_skips_capture_even_on_saturday(self, dag_module):
-        # master_pipeline fires an external trigger → keep the daily pipeline
-        # fast, skip players regardless of the day.
+    def test_saturday_master_trigger_runs_weekly_capture(self, dag_module):
         assert dag_module._gate_player_capture(
             params={},
             dag_run=SimpleNamespace(external_trigger=True),
             logical_date=datetime(2024, 1, 6),
-        ) is False
+        ) is True
+
+    def test_master_uses_actual_start_not_interval_start_day(self, dag_module):
+        # Stable master boundary wins over both prior-interval logical_date and
+        # a delayed child start on Sunday.
+        assert dag_module._gate_player_capture(
+            params={},
+            dag_run=SimpleNamespace(
+                external_trigger=True,
+                start_date=datetime(2024, 1, 7, 1),
+                conf={"master_data_interval_end": "2024-01-06T14:00:00+00:00"},
+            ),
+            logical_date=datetime(2024, 1, 5, 14),
+        ) is True
 
 
 class TestPlayerCaptureTasks:
@@ -259,6 +307,7 @@ class TestPlayerCaptureTasks:
         task = _bash_task('scrape_player_capture')
         assert task is not None
         assert '--entity player_capture' in task.bash_command
+        assert f'--league "{dag_module.CLUB_LEAGUES[0]}"' in task.bash_command
         # exit-2 (R0.2B_FALLBACK) is mapped to soft success by the wrapper.
         assert 'exit 0' in task.bash_command
 
@@ -337,7 +386,7 @@ class TestPlayerCaptureTasks:
 
 class TestSeasonParam:
     """#711 (epic #708): the season must be a UI Param defaulting to
-    CURRENT_SEASON so the scheduled daily run keeps ingesting the current
+    CURRENT_SEASON so the master-triggered daily run ingests the current
     season unchanged, while a "Trigger DAG w/ config" override can backfill a
     past season."""
 
@@ -347,6 +396,11 @@ class TestSeasonParam:
         season_param = dag_module.dag._dag_kwargs['params']['season']
         # conftest's _Param stub stores the default (real Param also exposes it).
         assert season_param.default == CURRENT_SEASON
+
+
+class TestProxyEfficientCadence:
+    def test_source_has_no_duplicate_schedule(self, dag_module):
+        assert dag_module.dag._dag_kwargs["schedule"] is None
 
 
 class TestSeasonRenderedFromParams:
@@ -468,7 +522,7 @@ class TestValidatePlayerData:
     def test_low_season_stats_warns_but_succeeds(
         self, dag_module, monkeypatch, tmp_path,
     ):
-        # Full profile coverage, but the Season-tab picker captured few overall
+        # Full profile coverage, but few exact season aggregates are exposed.
         # rows (#751 PR3b) → WARN-only, the run still succeeds.
         self._write(dag_module, monkeypatch, tmp_path, {
             'rows': 520, 'profile_players': 520,
