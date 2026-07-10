@@ -45,6 +45,12 @@ x-airflow-common: &airflow-common
     # E1 medallion config: team_aliases.yaml + competitions.yaml — read-only
     # for utils/medallion_config.py (default CONFIG_DIR=/opt/airflow/configs/medallion)
     - ./configs/medallion:/opt/airflow/configs/medallion:ro
+    # #920 Phase 3: versioned soccerdata league_dict fragment (ESPN/WhoScored
+    # tournament ids). Read by scrapers/base/soccerdata_config.py, which
+    # merges it into ~/soccerdata/config/league_dict.json inside the
+    # soccerdata_cache volume before soccerdata is imported — replaces the
+    # hand-patched, unversioned file the WC ESPN ingest used to depend on.
+    - ./configs/soccerdata:/opt/airflow/configs/soccerdata:ro
     # SSO-конфиг: читает только webserver, scheduler игнорирует (фаза 6)
     - ./configs/airflow/webserver_config.py:/opt/airflow/webserver_config.py:ro
     - ./scrapers:/opt/airflow/scrapers

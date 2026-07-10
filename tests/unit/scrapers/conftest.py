@@ -18,6 +18,14 @@ def set_trino_password(monkeypatch):
     monkeypatch.setenv('TRINO_PASSWORD', 'test_password')
 
 
+@pytest.fixture(autouse=True)
+def isolated_soccerdata_dir(monkeypatch, tmp_path):
+    """#920 Phase 3: SoccerdataScraper.__init__ installs the repo league_dict
+    fragment into $SOCCERDATA_DIR/config — point it at tmp_path so tests
+    never write the developer's real ~/soccerdata."""
+    monkeypatch.setenv('SOCCERDATA_DIR', str(tmp_path / 'soccerdata'))
+
+
 @pytest.fixture
 def sample_schedule_df():
     """Sample schedule DataFrame."""

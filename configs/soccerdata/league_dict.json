@@ -1,0 +1,37 @@
+{
+  "INT-World Cup": {
+    "FBref": "FIFA World Cup",
+    "FotMob": "INT-World Cup",
+    "WhoScored": "International - FIFA World Cup",
+    "ESPN": "fifa.world",
+    "season_code": "single-year"
+  },
+  "INT-European Championship": {
+    "FBref": "UEFA European Football Championship",
+    "FotMob": "INT-EURO",
+    "Sofascore": "EURO",
+    "WhoScored": "International - European Championship",
+    "ESPN": "uefa.euro",
+    "season_start": "Jun",
+    "season_end": "Jul",
+    "season_code": "single-year"
+  },
+  "INT-Africa Cup of Nations": {
+    "FBref": "Africa Cup of Nations",
+    "FotMob": "INT-Africa Cup of Nations",
+    "WhoScored": "International - Africa Cup of Nations",
+    "ESPN": "caf.nations",
+    "season_start": "Jun",
+    "season_end": "Jul",
+    "season_code": "single-year"
+  },
+  "INT-Copa America": {
+    "FBref": "Copa América",
+    "FotMob": "INT-Copa America",
+    "WhoScored": "International - Copa America",
+    "ESPN": "conmebol.america",
+    "season_start": "Jun",
+    "season_end": "Jul",
+    "season_code": "single-year"
+  }
+}
