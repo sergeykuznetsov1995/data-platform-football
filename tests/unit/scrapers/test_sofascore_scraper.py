@@ -148,6 +148,19 @@ class TestShotmapFlatten:
         assert 'xgot' not in third
         assert 'added_time' not in third
 
+    def test_fallback_ids_stay_unique_for_same_player_and_minute(self):
+        from scrapers.sofascore.scraper import SofaScoreScraper
+
+        shot = {"player": {"id": 7}, "time": 42, "addedTime": 0}
+        rows = SofaScoreScraper._flatten_shotmap(
+            "99",
+            {"shotmap": [dict(shot), dict(shot)]},
+        )
+        assert [row["shot_id"] for row in rows] == [
+            "99-42-7-0",
+            "99-42-7-0-2",
+        ]
+
     def test_flatten_handles_garbage(self):
         from scrapers.sofascore.scraper import SofaScoreScraper
 
@@ -907,14 +920,27 @@ class TestReadPlayerRatingsCapture:
 
     def _lineups(self):
         return {
-            'home': {'players': [
-                {'player': {'id': 11111}, 'position': 'G',
-                 'statistics': {'rating': '7.2'}},
-            ]},
-            'away': {'players': [
-                {'player': {'id': 22222}, 'position': 'F',
-                 'statistics': {'rating': '6.5'}},
-            ]},
+            "home": {
+                "players": [
+                    {
+                        "player": {"id": 11111},
+                        "position": "G",
+                        "captain": True,
+                        "substitute": False,
+                        "shirtNumber": 1,
+                        "statistics": {"rating": "7.2"},
+                    },
+                ]
+            },
+            "away": {
+                "players": [
+                    {
+                        "player": {"id": 22222},
+                        "position": "F",
+                        "statistics": {"rating": "6.5"},
+                    },
+                ]
+            },
         }
 
     @pytest.mark.unit
@@ -938,12 +964,15 @@ class TestReadPlayerRatingsCapture:
         # Assert — one capture per match in order, 2 matches × 2 players.
         assert captured == ['M1', 'M2']
         assert len(df) == 4
-        rows = {(r['match_id'], r['player_id']): r for r in df.to_dict('records')}
-        assert rows[('M1', '11111')]['team_side'] == 'home'
-        assert rows[('M1', '11111')]['rating'] == 7.2
-        assert rows[('M1', '11111')]['position'] == 'G'
-        assert rows[('M1', '22222')]['team_side'] == 'away'
-        assert rows[('M1', '22222')]['rating'] == 6.5
+        rows = {(r["match_id"], r["player_id"]): r for r in df.to_dict("records")}
+        assert rows[("M1", "11111")]["team_side"] == "home"
+        assert rows[("M1", "11111")]["rating"] == 7.2
+        assert rows[("M1", "11111")]["position"] == "G"
+        assert rows[("M1", "11111")]["captain"] is True
+        assert rows[("M1", "11111")]["substitute"] is False
+        assert rows[("M1", "11111")]["shirt_number"] == 1
+        assert rows[("M1", "22222")]["team_side"] == "away"
+        assert rows[("M1", "22222")]["rating"] == 6.5
         # 2025 -> soccerdata short slug '2526' (partition key alignment, #27).
         assert set(df['season']) == {'2526'}
         assert set(df['league']) == {'ENG-Premier League'}
@@ -988,17 +1017,29 @@ class TestReadMatchCapture:
 
     def _endpoints(self):
         return {
-            'lineups': {
-                'home': {'players': [
-                    {'player': {'id': 11111}, 'position': 'G',
-                     'substitute': False, 'captain': True,
-                     'statistics': {'rating': '7.2', 'totalPass': 30}},
-                ]},
-                'away': {'players': [
-                    {'player': {'id': 22222}, 'position': 'F',
-                     'substitute': False,
-                     'statistics': {'rating': '6.5', 'totalShots': 3}},
-                ]},
+            "lineups": {
+                "home": {
+                    "players": [
+                        {
+                            "player": {"id": 11111},
+                            "position": "G",
+                            "substitute": False,
+                            "captain": True,
+                            "shirtNumber": 1,
+                            "statistics": {"rating": "7.2", "totalPass": 30},
+                        },
+                    ]
+                },
+                "away": {
+                    "players": [
+                        {
+                            "player": {"id": 22222},
+                            "position": "F",
+                            "substitute": False,
+                            "statistics": {"rating": "6.5", "totalShots": 3},
+                        },
+                    ]
+                },
             },
             # Live /event/{id} nests the event under "event" (#751 PR2); the
             # venue block is the SofaScore nested-object shape (#753).
@@ -1056,9 +1097,15 @@ class TestReadMatchCapture:
         eps = out['event_player_stats']
         assert len(ratings) == 4   # 2 matches × 2 players
         assert len(eps) == 4
-        assert set(ratings['season']) == {'2526'}
-        assert set(eps['season']) == {'2526'}
-        assert set(eps['_entity_type']) == {'event_player_stats'}
+        assert set(ratings["season"]) == {"2526"}
+        assert set(eps["season"]) == {"2526"}
+        assert set(eps["_entity_type"]) == {"event_player_stats"}
+        status = out["capture_status"]
+        assert status["capture_complete"].all()
+        assert set(status["lineups_status"]) == {"success"}
+        assert {"captain", "substitute", "shirt_number"} <= set(ratings.columns)
+        assert ratings.loc[ratings["player_id"] == "11111", "captain"].all()
+        assert set(ratings["shirt_number"].dropna()) == {1}
 
         erows = {(r['match_id'], r['player_id']): r for r in eps.to_dict('records')}
         home = erows[('M1', '11111')]
@@ -1137,8 +1184,7 @@ class TestReadMatchCapture:
 
     @pytest.mark.unit
     def test_requests_all_tabs_and_event(self):
-        # The "one nav" contract clicks ALL deep tabs and requires event so
-        # team_id is populated — assert _iter_match_captures is invoked so.
+        # The consolidated pass requests every endpoint family.
         scraper = self._scraper()
         captured_kwargs = {}
 
@@ -1153,7 +1199,7 @@ class TestReadMatchCapture:
         )
         assert 'Statistics' in captured_kwargs['tabs']
         assert 'Shotmap' in captured_kwargs['tabs']
-        assert 'event' in captured_kwargs['required']
+        assert set(captured_kwargs['required']) == {'event', 'lineups'}
 
     @pytest.mark.unit
     def test_graceful_empty_when_no_lineups(self):
@@ -1175,6 +1221,57 @@ class TestReadMatchCapture:
         # venue is keyed by game_id (one row per match), not match_id.
         assert out['venue'].empty
         assert 'game_id' in out['venue'].columns
+        status = out['capture_status'].iloc[0]
+        assert not status['capture_complete']
+        assert status['lineups_status'] == 'missing'
+
+    @pytest.mark.unit
+    def test_terminal_empty_payloads_are_manifest_complete(self):
+        scraper = self._scraper()
+        endpoints = {
+            'event': {},
+            'lineups': {'home': {}, 'away': {}},
+            'statistics': {'statistics': []},
+            'shotmap': {'shotmap': []},
+        }
+        scraper._iter_match_captures = lambda match_ids, **kwargs: iter(
+            [('M1', endpoints)]
+        )
+
+        out = scraper.read_match_capture(
+            league='ENG-Premier League',
+            season=2025,
+            match_ids=['M1'],
+        )
+
+        assert out['player_ratings'].empty
+        status = out['capture_status'].iloc[0]
+        assert status['capture_complete']
+        assert status['shotmap_status'] == 'success'
+
+    @pytest.mark.unit
+    def test_keeps_independent_endpoints_when_lineups_miss(self):
+        scraper = self._scraper()
+        endpoints = self._endpoints()
+        endpoints.pop("lineups")
+
+        scraper._iter_match_captures = lambda match_ids, **kwargs: iter(
+            [
+                ("M1", endpoints),
+            ]
+        )
+        out = scraper.read_match_capture(
+            league="ENG-Premier League",
+            season=2025,
+            match_ids=["M1"],
+        )
+
+        assert out["player_ratings"].empty
+        assert out["event_player_stats"].empty
+        assert len(out["match_stats"]) == 1
+        assert len(out["event_shotmap"]) == 1
+        assert len(out["venue"]) == 1
+        assert not out["capture_status"].iloc[0]["capture_complete"]
 
 
 class TestFlattenEventVenue:
@@ -1332,6 +1429,37 @@ class TestCamoufoxProxy:
         assert scraper._camoufox_proxy() is None
         scraper._proxy_manager.get_proxy.assert_not_called()
 
+    @pytest.mark.unit
+    def test_retry_avoids_immediately_reselecting_same_proxy(self):
+        scraper = self._scraper()
+        first = self._proxy(host="1.1.1.1", port=10001)
+        second = self._proxy(host="2.2.2.2", port=10002)
+        scraper._proxy_manager = MagicMock(total_count=2)
+        scraper._proxy_manager.get_proxy.side_effect = [first, first, second]
+
+        assert scraper._camoufox_proxy()["server"] == "http://1.1.1.1:10001"
+        assert scraper._camoufox_proxy()["server"] == "http://2.2.2.2:10002"
+
+    @pytest.mark.unit
+    def test_browser_result_updates_proxy_manager_health(self):
+        scraper = self._scraper()
+        proxy_obj = self._proxy()
+        scraper._proxy_manager = MagicMock(total_count=1)
+        scraper._proxy_manager.get_proxy.return_value = proxy_obj
+        proxy = scraper._camoufox_proxy()
+
+        scraper._record_camoufox_proxy_result(
+            proxy,
+            success=False,
+            error_type="cloudflare",
+        )
+
+        scraper._proxy_manager.record_result.assert_called_once_with(
+            proxy_obj,
+            success=False,
+            error_type="cloudflare",
+        )
+
 
 class TestResolveMatchIdsViaCapture:
     """resolve_finished_match_ids_via_capture navigates the league page through
@@ -1371,7 +1499,7 @@ class TestResolveMatchIdsViaCapture:
         def __exit__(self, *a):
             return False
 
-        def capture_tournament(self, nav_url):
+        def capture_buffer(self, nav_url):
             return self._buffer
 
         def paginate_tournament_season(self, ut_id, season_id, max_pages=25):
@@ -1414,6 +1542,106 @@ class TestResolveMatchIdsViaCapture:
                 'ENG-Premier League', 2025,
             )
         assert out == []
+
+    @pytest.mark.unit
+    def test_retries_when_a_later_finished_page_is_missing(self):
+        scraper = self._scraper()
+        scraper._proxy_manager = None
+        season = {"year": "25/26", "id": 96668}
+        base = {
+            "/api/v1/unique-tournament/17/seasons": {
+                "status": 200,
+                "challenge": False,
+                "json": {"seasons": [season]},
+            },
+            "/api/v1/unique-tournament/17/season/96668/events/last/0": {
+                "status": 200,
+                "challenge": False,
+                "json": {
+                    "events": [
+                        {"id": 101, "season": season, "status": {"type": "finished"}}
+                    ],
+                    "hasNextPage": True,
+                },
+            },
+        }
+        complete = {
+            **base,
+            "/api/v1/unique-tournament/17/season/96668/events/last/1": {
+                "status": 200,
+                "challenge": False,
+                "json": {
+                    "events": [
+                        {"id": 102, "season": season, "status": {"type": "finished"}}
+                    ],
+                    "hasNextPage": False,
+                },
+            },
+        }
+        sessions = []
+
+        class _Cap:
+            def __init__(self, **kwargs):
+                self.buffer = base if not sessions else complete
+                sessions.append(self)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def capture_buffer(self, nav_url):
+                return dict(self.buffer)
+
+            def paginate_tournament_season(self, *args, **kwargs):
+                return dict(self.buffer)
+
+        with patch(
+            "scrapers.sofascore.camoufox_capture.SofascoreCamoufoxCapture",
+            _Cap,
+        ):
+            out = scraper.resolve_finished_match_ids_via_capture(
+                "ENG-Premier League",
+                2025,
+            )
+
+        assert len(sessions) == 2
+        assert out == ["101", "102"]
+
+
+class TestResolveMatchIdsFromSchedule:
+    @pytest.mark.unit
+    def test_integer_2021_matches_2122_schedule_partition(self):
+        import pandas as pd
+
+        with (
+            patch("scrapers.base.base_scraper.get_rate_limiter"),
+            patch("scrapers.base.base_scraper.get_retry_policy"),
+            patch("scrapers.base.base_scraper.get_circuit_breaker"),
+            patch("scrapers.base.base_scraper.IcebergWriter"),
+        ):
+            from scrapers.sofascore.scraper import SofaScoreScraper
+
+            scraper = SofaScoreScraper(
+                leagues=["ENG-Premier League"],
+                seasons=[2021],
+            )
+        scraper.read_schedule = MagicMock(
+            return_value=pd.DataFrame(
+                {
+                    "game_id": [101, 99],
+                    "league": [
+                        "ENG-Premier League",
+                        "ENG-Premier League",
+                    ],
+                    "season": ["2122", "2021"],
+                    "status_type": ["finished", "finished"],
+                }
+            )
+        )
+
+        assert scraper._resolve_match_ids("ENG-Premier League", 2021) == ["101"]
 
 
 class TestReadScheduleViaCapture:
@@ -1480,10 +1708,17 @@ class TestReadScheduleViaCapture:
         def __exit__(self, *a):
             return False
 
-        def capture_tournament(self, nav_url):
+        def capture_buffer(self, nav_url):
             return self._buffer
 
-        def paginate_tournament_season(self, ut_id, season_id, max_pages=25):
+        def paginate_tournament_season(
+            self,
+            ut_id,
+            season_id,
+            max_pages=25,
+            *,
+            include_next=False,
+        ):
             # Real impl pages the target season's events into the buffer; the
             # fixture pre-populates them, so return the buffer unchanged (#824).
             return self._buffer
@@ -1539,6 +1774,46 @@ class TestReadScheduleViaCapture:
         with patch('scrapers.sofascore.camoufox_capture.SofascoreCamoufoxCapture',
                    return_value=self._FakeCap(buf)):
             assert scraper.read_schedule() is None
+
+    @pytest.mark.unit
+    def test_keeps_future_fixtures_when_last_page_is_empty(self):
+        scraper = self._scraper()
+        season = {"year": "25/26", "id": 76668}
+        buf = {
+            "/api/v1/unique-tournament/17/seasons": {
+                "status": 200,
+                "challenge": False,
+                "json": {"seasons": [season]},
+            },
+            "/api/v1/unique-tournament/17/season/76668/events/last/0": {
+                "status": 200,
+                "challenge": False,
+                "json": {"events": []},
+            },
+            "/api/v1/unique-tournament/17/season/76668/events/next/0": {
+                "status": 200,
+                "challenge": False,
+                "json": {
+                    "events": [
+                        {
+                            "id": 501,
+                            "season": season,
+                            "status": {"type": "notstarted"},
+                            "homeTeam": {"name": "A"},
+                            "awayTeam": {"name": "B"},
+                            "startTimestamp": 1800000000,
+                        }
+                    ]
+                },
+            },
+        }
+        with patch(
+            "scrapers.sofascore.camoufox_capture.SofascoreCamoufoxCapture",
+            return_value=self._FakeCap(buf),
+        ):
+            df = scraper.read_schedule()
+        assert df is not None
+        assert df["game_id"].tolist() == [501]
 
     @pytest.mark.unit
     def test_returns_none_when_capture_empty(self):
@@ -1597,10 +1872,17 @@ class TestReadScheduleViaCapture:
             def __exit__(self, *a):
                 return False
 
-            def capture_tournament(self, nav_url):
+            def capture_buffer(self, nav_url):
                 return dict(buf)
 
-            def paginate_tournament_season(self, ut_id, season_id, max_pages=25):
+            def paginate_tournament_season(
+                self,
+                ut_id,
+                season_id,
+                max_pages=25,
+                *,
+                include_next=False,
+            ):
                 return dict(buf)
 
         with patch('scrapers.sofascore.camoufox_capture.SofascoreCamoufoxCapture',
@@ -1614,8 +1896,14 @@ class TestReadScheduleViaCapture:
         # legitimately empty (e.g. fixtures not yet published) → one attempt.
         scraper = self._scraper()
         scraper._camoufox_proxy = MagicMock(return_value=None)
-        buf = self._sid_resolvable_buffer({
-            "status": 200, "challenge": False, "json": {"events": []}})
+        buf = self._sid_resolvable_buffer(
+            {"status": 200, "challenge": False, "json": {"events": []}}
+        )
+        buf["/api/v1/unique-tournament/17/season/76668/events/next/0"] = {
+            "status": 200,
+            "challenge": False,
+            "json": {"events": []},
+        }
 
         df, sessions = self._run_with_session_counter(scraper, buf)
 
@@ -1680,10 +1968,17 @@ class TestReadLeagueTableViaCapture:
         return s
 
     @staticmethod
-    def _row(name, mp, w, d, l, gf, ga, pts):
-        return {"team": {"id": hash(name) % 1000, "name": name}, "matches": mp,
-                "wins": w, "draws": d, "losses": l, "scoresFor": gf,
-                "scoresAgainst": ga, "points": pts}
+    def _row(name, mp, w, d, losses, gf, ga, pts):
+        return {
+            "team": {"id": hash(name) % 1000, "name": name},
+            "matches": mp,
+            "wins": w,
+            "draws": d,
+            "losses": losses,
+            "scoresFor": gf,
+            "scoresAgainst": ga,
+            "points": pts,
+        }
 
     @classmethod
     def _buffer(cls):
@@ -1841,7 +2136,7 @@ class TestReadLeagueTableViaCapture:
 class TestReadPlayerCapture:
     """read_player_capture (#751 PR3 + PR3b): ONE Camoufox nav per player → the
     player_profile frame (bio from __NEXT_DATA__) AND the player_season_stats
-    frame (Season-tab picker capture). We patch the ``_iter_player_captures``
+    frame (exact target-season capture). We patch ``_iter_player_captures``
     seam (no browser) and assert flattening + (league, season) tagging + the
     season-guarded selection of the EPL overall out of the capture buffer."""
 
@@ -1882,10 +2177,10 @@ class TestReadPlayerCapture:
     def test_one_pass_yields_profile_and_season_frames(self):
         scraper = self._scraper()
         seen = []
-        picker_labels = []
+        targets = []
 
-        def fake_iter(player_ids, season_picker_label=None, **kwargs):
-            picker_labels.append(season_picker_label)
+        def fake_iter(player_ids, target_ut=None, target_year=None):
+            targets.append((target_ut, target_year))
             for pid in player_ids:
                 seen.append(str(pid))
                 yield str(pid), self._capture(pid)
@@ -1894,9 +2189,8 @@ class TestReadPlayerCapture:
         out = scraper.read_player_capture(
             league='ENG-Premier League', season=2025, player_ids=['101', '102'])
 
-        assert seen == ['101', '102']   # ONE capture per player ("one nav")
-        # The EPL tournament display name is forwarded to drive the picker.
-        assert picker_labels == ['Premier League']
+        assert seen == ["101", "102"]  # ONE capture per player ("one nav")
+        assert targets == [(17, "25/26")]
 
         prof = out['player_profile']
         assert len(prof) == 2
@@ -1920,12 +2214,50 @@ class TestReadPlayerCapture:
         assert srow['total_goals'] == 3
 
     @pytest.mark.unit
+    def test_world_cup_keeps_literal_target_year_and_partition(self):
+        from scrapers.sofascore.scraper import SofaScoreScraper
+
+        with (
+            patch("scrapers.base.base_scraper.get_rate_limiter"),
+            patch("scrapers.base.base_scraper.get_retry_policy"),
+            patch("scrapers.base.base_scraper.get_circuit_breaker"),
+            patch("scrapers.base.base_scraper.IcebergWriter"),
+        ):
+            scraper = SofaScoreScraper(
+                leagues=["INT-World Cup"],
+                seasons=[2026],
+            )
+
+        targets = []
+
+        def fake_iter(player_ids, target_ut=None, target_year=None):
+            targets.append((target_ut, target_year))
+            yield "101", {
+                "profile": self._capture("101")["profile"],
+                "season_buffer": {},
+            }
+
+        scraper._iter_player_captures = fake_iter
+        with patch(
+            "scrapers.sofascore.scraper._is_single_year",
+            return_value=True,
+        ):
+            out = scraper.read_player_capture(
+                league="INT-World Cup",
+                season=2026,
+                player_ids=["101"],
+            )
+
+        assert targets == [(16, "2026")]
+        assert set(out["player_profile"]["season"]) == {"2026"}
+
+    @pytest.mark.unit
     def test_season_stats_empty_when_picker_missed(self):
         # Profile still lands, but the picker never surfaced the EPL overall
         # (transferred player) → player_season_stats is empty, not a crash.
         scraper = self._scraper()
 
-        def fake_iter(player_ids, season_picker_label=None, **kwargs):
+        def fake_iter(player_ids, **kwargs):
             for pid in player_ids:
                 yield str(pid), self._capture(pid, with_season=False)
 
@@ -1937,10 +2269,53 @@ class TestReadPlayerCapture:
         assert 'player_id' in out['player_season_stats'].columns
 
     @pytest.mark.unit
+    def test_does_not_label_latest_stats_as_requested_season(self):
+        scraper = self._scraper()
+        pid = "101"
+        wrong_buffer = {
+            f"/api/v1/player/{pid}/statistics/seasons": {
+                "status": 200,
+                "challenge": False,
+                "json": {
+                    "uniqueTournamentSeasons": [
+                        {
+                            "uniqueTournament": {"id": 17},
+                            "seasons": [{"year": "24/25", "id": 60000}],
+                        }
+                    ]
+                },
+            },
+            f"/api/v1/player/{pid}/unique-tournament/17/season/60000/statistics/overall": {
+                "status": 200,
+                "challenge": False,
+                "json": {"statistics": {"rating": 9.9}},
+            },
+        }
+        scraper._iter_player_captures = lambda player_ids, **kwargs: iter(
+            [
+                (
+                    pid,
+                    {
+                        "profile": self._capture(pid)["profile"],
+                        "season_buffer": wrong_buffer,
+                    },
+                ),
+            ]
+        )
+
+        out = scraper.read_player_capture(
+            league="ENG-Premier League",
+            season=2025,
+            player_ids=[pid],
+        )
+        assert len(out["player_profile"]) == 1
+        assert out["player_season_stats"].empty
+
+    @pytest.mark.unit
     def test_graceful_empty_when_nothing_captured(self):
         scraper = self._scraper()
 
-        def fake_iter(player_ids, season_picker_label=None, **kwargs):
+        def fake_iter(player_ids, **kwargs):
             for pid in player_ids:
                 yield str(pid), {'profile': None, 'season_buffer': {}}
 
@@ -2117,98 +2492,247 @@ class TestReadLeagueTableCapture:
         assert sessions['n'] == 1
 
 
-class TestCaptureSeasonBuffer:
-    """_capture_season_buffer resolves a target year's SofaScore season_id from
-    the landing buffer and pages that season's events in, so a historical-season
-    backfill is not empty (#824). We fake the capture session (paginate records
-    its args) and drive the resolution paths."""
+class TestTournamentSnapshot:
+    @pytest.mark.unit
+    def test_scrape_all_uses_combined_capture_and_guarded_saves(self):
+        import pandas as pd
 
-    def _scraper(self):
         from scrapers.sofascore.scraper import SofaScoreScraper
-        with patch('scrapers.base.base_scraper.get_rate_limiter'), \
-             patch('scrapers.base.base_scraper.get_retry_policy'), \
-             patch('scrapers.base.base_scraper.get_circuit_breaker'), \
-             patch('scrapers.base.base_scraper.IcebergWriter'):
-            return SofaScoreScraper(leagues=['ENG-Premier League'], seasons=[2024])
 
-    class _RecCap:
-        def __init__(self):
-            self.calls = []
+        with (
+            patch("scrapers.base.base_scraper.get_rate_limiter"),
+            patch("scrapers.base.base_scraper.get_retry_policy"),
+            patch("scrapers.base.base_scraper.get_circuit_breaker"),
+            patch("scrapers.base.base_scraper.IcebergWriter"),
+        ):
+            scraper = SofaScoreScraper(
+                leagues=["ENG-Premier League"],
+                seasons=[2025],
+            )
+        schedule = pd.DataFrame({"game_id": [1]})
+        table = pd.DataFrame({"team": ["A"]})
+        scraper.read_tournament_snapshot = MagicMock(
+            return_value=(schedule, table),
+        )
+        scraper.save_to_iceberg = MagicMock(
+            side_effect=["schedule_path", "table_path"],
+        )
 
-        def paginate_tournament_season(self, ut_id, season_id, max_pages=25):
-            self.calls.append((ut_id, season_id))
-            return {"paged": (ut_id, season_id)}
+        result = scraper.scrape_all()
+
+        assert result == {
+            "schedule": "schedule_path",
+            "league_table": "table_path",
+        }
+        scraper.read_tournament_snapshot.assert_called_once_with()
+        assert scraper.save_to_iceberg.call_count == 2
+        for call in scraper.save_to_iceberg.call_args_list:
+            assert call.kwargs["min_replace_ratio"] == 0.9
 
     @pytest.mark.unit
-    def test_resolves_sid_from_seasons_map_and_pages(self):
-        scraper = self._scraper()
-        cap = self._RecCap()
+    def test_world_cup_keeps_literal_snapshot_target_and_partition(self):
+        from scrapers.sofascore.scraper import SofaScoreScraper
+
+        with (
+            patch("scrapers.base.base_scraper.get_rate_limiter"),
+            patch("scrapers.base.base_scraper.get_retry_policy"),
+            patch("scrapers.base.base_scraper.get_circuit_breaker"),
+            patch("scrapers.base.base_scraper.IcebergWriter"),
+        ):
+            scraper = SofaScoreScraper(
+                leagues=["INT-World Cup"],
+                seasons=[2026],
+            )
+        scraper._capture_tournament_snapshot = MagicMock(
+            return_value={"events": [], "standings": []},
+        )
+
+        with patch(
+            "scrapers.sofascore.scraper._is_single_year",
+            return_value=True,
+        ):
+            schedule, table = scraper.read_tournament_snapshot()
+
+        assert schedule is None and table is None
+        args = scraper._capture_tournament_snapshot.call_args.args
+        assert args[2:] == ("INT-World Cup", "2026", "2026")
+
+    @pytest.mark.unit
+    def test_schedule_and_standings_share_one_browser_session(self):
+        from scrapers.sofascore.scraper import SofaScoreScraper
+
+        with (
+            patch("scrapers.base.base_scraper.get_rate_limiter"),
+            patch("scrapers.base.base_scraper.get_retry_policy"),
+            patch("scrapers.base.base_scraper.get_circuit_breaker"),
+            patch("scrapers.base.base_scraper.IcebergWriter"),
+        ):
+            scraper = SofaScoreScraper(
+                leagues=["ENG-Premier League"],
+                seasons=[2025],
+            )
+        season = {"year": "25/26", "id": 76668}
         buffer = {
             "/api/v1/unique-tournament/17/seasons": {
-                "status": 200, "challenge": False, "json": {"seasons": [
-                    {"year": "24/25", "id": 75612},
-                    {"year": "25/26", "id": 76986},
-                ]}},
+                "status": 200,
+                "challenge": False,
+                "json": {"seasons": [season]},
+            },
+            "/api/v1/unique-tournament/17/season/76668/events/last/0": {
+                "status": 200,
+                "challenge": False,
+                "json": {
+                    "events": [
+                        {
+                            "id": 1,
+                            "season": season,
+                            "status": {"type": "finished"},
+                            "homeTeam": {"name": "A"},
+                            "awayTeam": {"name": "B"},
+                        }
+                    ]
+                },
+            },
+            "/api/v1/unique-tournament/17/season/76668/events/next/0": {
+                "status": 200,
+                "challenge": False,
+                "json": {"events": []},
+            },
+            "/api/v1/unique-tournament/17/season/76668/standings/total": {
+                "status": 200,
+                "challenge": False,
+                "json": {
+                    "standings": [
+                        {
+                            "type": "total",
+                            "rows": [
+                                {
+                                    "team": {"name": "A"},
+                                    "matches": 1,
+                                    "wins": 1,
+                                    "draws": 0,
+                                    "losses": 0,
+                                    "scoresFor": 2,
+                                    "scoresAgainst": 0,
+                                    "points": 3,
+                                }
+                            ],
+                        }
+                    ]
+                },
+            },
         }
-        out = scraper._capture_season_buffer(cap, buffer, 17, "24/25")
-        # /seasons map wins → paginate the 24/25 sid.
-        assert cap.calls == [(17, 75612)]
-        assert out == {"paged": (17, 75612)}
+        sessions = []
 
-    @pytest.mark.unit
-    def test_falls_back_to_event_season_id(self):
-        scraper = self._scraper()
-        cap = self._RecCap()
-        # No /seasons map; the captured events carry season.{year,id}.
-        buffer = {
-            "/api/v1/unique-tournament/17/season/75612/events/last/0": {
-                "status": 200, "challenge": False, "json": {"events": [
-                    {"id": 1, "status": {"type": "finished"},
-                     "season": {"year": "24/25", "id": 75612}},
-                ]}},
-        }
-        scraper._capture_season_buffer(cap, buffer, 17, "24/25")
-        assert cap.calls == [(17, 75612)]
+        class _Cap:
+            def __init__(self, **kwargs):
+                sessions.append(self)
 
-    @pytest.mark.unit
-    def test_returns_buffer_unchanged_when_unresolved(self):
-        scraper = self._scraper()
-        cap = self._RecCap()
-        # Only a DIFFERENT season is present → target unresolved → no paging,
-        # original buffer returned (caller's year-filter then yields nothing).
-        buffer = {
-            "/api/v1/unique-tournament/17/season/96668/events/next/0": {
-                "status": 200, "challenge": False, "json": {"events": [
-                    {"id": 201, "status": {"type": "notstarted"},
-                     "season": {"year": "26/27", "id": 96668}},
-                ]}},
-        }
-        out = scraper._capture_season_buffer(cap, buffer, 17, "24/25")
-        assert cap.calls == []
-        assert out is buffer
+            def __enter__(self):
+                return self
 
-    @pytest.mark.unit
-    def test_resolves_sid_via_in_page_fetch_when_buffer_lacks_it(self):
-        # #879: neither /seasons nor the events carry the target season (the
-        # FRA-2020 backfill hole) — the in-page /seasons fetch resolves it.
-        scraper = self._scraper()
+            def __exit__(self, *args):
+                return False
 
-        class _FetchCap(self._RecCap):
-            def __init__(self):
-                super().__init__()
-                self.fetched = []
+            def capture_buffer(self, nav_url):
+                return dict(buffer)
+
+            def paginate_tournament_season(
+                self,
+                ut_id,
+                sid,
+                max_pages=25,
+                *,
+                include_next=False,
+            ):
+                return dict(buffer)
 
             def fetch_api_json(self, path):
-                self.fetched.append(path)
-                return {"status": 200, "challenge": False, "json": {"seasons": [
-                    {"year": "25/26", "id": 76986},
-                    {"year": "24/25", "id": 75612}]}}
+                return buffer.get(path)
 
-        cap = _FetchCap()
-        out = scraper._capture_season_buffer(cap, {}, 17, "24/25")
-        assert cap.fetched == ["/api/v1/unique-tournament/17/seasons"]
-        assert cap.calls == [(17, 75612)]
-        assert out == {"paged": (17, 75612)}
+        with patch(
+            "scrapers.sofascore.camoufox_capture.SofascoreCamoufoxCapture",
+            _Cap,
+        ):
+            schedule, table = scraper.read_tournament_snapshot()
+
+        assert len(sessions) == 1
+        assert schedule is not None and schedule["game_id"].tolist() == [1]
+        assert table is not None and table["team"].tolist() == ["A"]
+
+    @pytest.mark.unit
+    def test_partial_later_page_retries_on_fresh_session(self):
+        from scrapers.sofascore.scraper import SofaScoreScraper
+
+        with (
+            patch("scrapers.base.base_scraper.get_rate_limiter"),
+            patch("scrapers.base.base_scraper.get_retry_policy"),
+            patch("scrapers.base.base_scraper.get_circuit_breaker"),
+            patch("scrapers.base.base_scraper.IcebergWriter"),
+        ):
+            scraper = SofaScoreScraper(
+                leagues=["ENG-Premier League"],
+                seasons=[2025],
+            )
+        scraper._proxy_manager = None
+        season = {"year": "25/26", "id": 76668}
+        seasons_rec = {
+            "/api/v1/unique-tournament/17/seasons": {
+                "status": 200,
+                "challenge": False,
+                "json": {"seasons": [season]},
+            }
+        }
+        event1 = {"id": 1, "season": season, "status": {"type": "finished"}}
+        event2 = {"id": 2, "season": season, "status": {"type": "finished"}}
+        first = {
+            **seasons_rec,
+            "/api/v1/unique-tournament/17/season/76668/events/last/0": {
+                "status": 200,
+                "challenge": False,
+                "json": {"events": [event1], "hasNextPage": True},
+            },
+            "/api/v1/unique-tournament/17/season/76668/events/next/0": {
+                "status": 200,
+                "challenge": False,
+                "json": {"events": []},
+            },
+        }
+        complete = {
+            **first,
+            "/api/v1/unique-tournament/17/season/76668/events/last/1": {
+                "status": 200,
+                "challenge": False,
+                "json": {"events": [event2], "hasNextPage": False},
+            },
+        }
+        sessions = []
+
+        class _Cap:
+            def __init__(self, **kwargs):
+                self.buffer = first if not sessions else complete
+                sessions.append(self)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def capture_buffer(self, nav_url):
+                return dict(self.buffer)
+
+            def paginate_tournament_season(self, *args, **kwargs):
+                return dict(self.buffer)
+
+        with patch(
+            "scrapers.sofascore.camoufox_capture.SofascoreCamoufoxCapture",
+            _Cap,
+        ):
+            df = scraper.read_schedule()
+
+        assert len(sessions) == 2
+        assert df is not None and sorted(df["game_id"].tolist()) == [1, 2]
 
 
 class TestMatchCaptureSessionRestart:
@@ -2238,8 +2762,9 @@ class TestMatchCaptureSessionRestart:
             def __exit__(self, *a):
                 return False
 
-            def capture_event(self, mid, tabs=(), required=()):
-                return {'lineups': {'home': {}, 'away': {}}, 'event': {}}
+            def capture_event(self, mid, tabs=(), required=(), **kwargs):
+                return {"lineups": {"home": {}, "away": {}}, "event": {}}
+
         return _FakeCap
 
     @pytest.mark.unit
@@ -2269,9 +2794,7 @@ class TestMatchCaptureSessionRestart:
 
     @pytest.mark.unit
     def test_rotates_proxy_after_consecutive_failures(self):
-        # A dead proxy (first session captures nothing) must not abort the run:
-        # after proxy_fail_max consecutive failures the session restarts on a
-        # fresh proxy and finishes the remaining matches (#832).
+        # A dead proxy must rotate immediately and retry the SAME match.
         scraper = self._scraper()
         instances = []
 
@@ -2286,23 +2809,24 @@ class TestMatchCaptureSessionRestart:
             def __exit__(self, *a):
                 return False
 
-            def capture_event(self, mid, tabs=(), required=()):
+            def capture_event(self, mid, tabs=(), required=(), **kwargs):
                 if self.idx == 1:
                     return {}  # dead proxy — no lineups
                 return {'lineups': {'home': {}, 'away': {}}, 'event': {}}
 
         ids = [str(k) for k in range(20)]
-        with patch('scrapers.sofascore.camoufox_capture.SofascoreCamoufoxCapture',
-                   _DeadThenOk):
-            out = list(scraper._iter_match_captures(
-                ids, session_max=100, proxy_fail_max=4))
+        with patch(
+            "scrapers.sofascore.camoufox_capture.SofascoreCamoufoxCapture", _DeadThenOk
+        ):
+            out = list(
+                scraper._iter_match_captures(ids, session_max=100, item_max_attempts=2)
+            )
         # Every match_id is still yielded, in order.
         assert [m for m, _ in out] == ids
         # Rotated to (at least) a second session after the dead one.
         assert len(instances) >= 2
-        # The 4 dead-proxy matches were skipped (empty); the rest captured.
-        assert all(ep == {} for _, ep in out[:4])
-        assert out[4][1].get('lineups') is not None
+        # No hole: match 0 is retried on the second session before advancing.
+        assert all(ep.get("lineups") is not None for _, ep in out)
 
 
 class TestMatchCaptureInPageFetch:
@@ -2336,8 +2860,8 @@ class TestMatchCaptureInPageFetch:
             def __exit__(self, *a):
                 return False
 
-            def capture_event(self, mid, tabs=(), required=()):
-                calls.append(('nav', mid))
+            def capture_event(self, mid, tabs=(), required=(), **kwargs):
+                calls.append(("nav", mid))
                 return good
 
             def fetch_event(self, mid, names=()):
@@ -2371,6 +2895,9 @@ class TestMatchCaptureInPageFetch:
                          ('fetch', '3')]
         # The fallback navigation recovered match 2 — nothing lost.
         assert all(ep.get('lineups') for _, ep in out)
+        assert (
+            scraper.get_traffic_stats()["browser_fallback_navigations"] == 1
+        )
 
     @pytest.mark.unit
     def test_kill_switch_restores_nav_per_match(self, monkeypatch):
@@ -2399,9 +2926,9 @@ class TestMatchCaptureInPageFetch:
             def __exit__(self, *a):
                 return False
 
-            def capture_event(self, mid, tabs=(), required=()):
-                calls.append(('nav', mid))
-                return {'lineups': {'home': {}, 'away': {}}, 'event': {}}
+            def capture_event(self, mid, tabs=(), required=(), **kwargs):
+                calls.append(("nav", mid))
+                return {"lineups": {"home": {}, "away": {}}, "event": {}}
 
         with patch('scrapers.sofascore.camoufox_capture.SofascoreCamoufoxCapture',
                    _NavOnly):
@@ -2409,6 +2936,112 @@ class TestMatchCaptureInPageFetch:
         assert [m for m, _ in out] == ['1', '2']
         assert calls == [('nav', '1'), ('nav', '2')]
         assert all(ep.get('lineups') for _, ep in out)
+
+    @pytest.mark.unit
+    def test_terminal_optional_404_does_not_rotate_proxy(self):
+        scraper = self._scraper()
+        sessions = []
+
+        class _TerminalShotmap404:
+            def __init__(self, *args, **kwargs):
+                sessions.append(self)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def capture_event(self, mid, **kwargs):
+                return {
+                    'event': {},
+                    'lineups': {'home': {}, 'away': {}},
+                    'statistics': {'statistics': []},
+                }
+
+            def event_endpoint_states(self, mid, names=None):
+                return {
+                    'event': 'success',
+                    'lineups': 'success',
+                    'statistics': 'success',
+                    'shotmap': 'not_available',
+                }
+
+        with patch(
+            'scrapers.sofascore.camoufox_capture.SofascoreCamoufoxCapture',
+            _TerminalShotmap404,
+        ):
+            out = list(
+                scraper._iter_match_captures(
+                    ['1'],
+                    required=('event', 'lineups', 'statistics', 'shotmap'),
+                )
+            )
+
+        assert len(sessions) == 1
+        assert out[0][1]['_endpoint_states']['shotmap'] == 'not_available'
+
+    @pytest.mark.unit
+    def test_optional_transient_miss_retries_json_without_navigation(self):
+        scraper = self._scraper()
+        calls = []
+
+        class _CheapOptionalRetry:
+            def __init__(self, *args, **kwargs):
+                self.last_names = ()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def capture_event(self, mid, **kwargs):
+                calls.append(('nav', mid))
+                return self_outer._GOOD
+
+            def fetch_event(self, mid, names=()):
+                self.last_names = tuple(names)
+                calls.append(('fetch', mid, self.last_names))
+                if set(names) == {'statistics', 'shotmap'}:
+                    return {
+                        'statistics': {'statistics': []},
+                        'shotmap': {'shotmap': []},
+                    }
+                return {'event': {}, 'lineups': {'home': {}, 'away': {}}}
+
+            def event_endpoint_states(self, mid, names=None):
+                return {
+                    name: (
+                        'success'
+                        if name in {'event', 'lineups'}
+                        or set(self.last_names) == {'statistics', 'shotmap'}
+                        else 'server_error'
+                    )
+                    for name in names or ()
+                }
+
+        self_outer = self
+        with patch(
+            'scrapers.sofascore.camoufox_capture.SofascoreCamoufoxCapture',
+            _CheapOptionalRetry,
+        ):
+            out = list(
+                scraper._iter_match_captures(
+                    ['1', '2'],
+                    tabs=('Lineups', 'Statistics', 'Shotmap'),
+                    required=('event', 'lineups'),
+                )
+            )
+
+        assert [call[:2] for call in calls] == [
+            ('nav', '1'),
+            ('fetch', '1'),
+            ('fetch', '2'),
+            ('fetch', '2'),
+        ]
+        assert out[1][1]['_endpoint_states']['shotmap'] == 'success'
+        assert scraper.get_traffic_stats()['browser_fallback_navigations'] == 0
 
 
 class TestPlayerCaptureInPageFetch:
@@ -2442,8 +3075,8 @@ class TestPlayerCaptureInPageFetch:
             def __exit__(self, *a):
                 return False
 
-            def capture_player(self, pid, season_picker_label=None):
-                calls.append(('nav', pid))
+            def capture_player(self, pid, target_ut=None, target_year=None):
+                calls.append(("nav", pid, target_ut, target_year))
                 return good
 
             def fetch_player(self, pid, target_ut=None, target_year=None):
@@ -2457,17 +3090,23 @@ class TestPlayerCaptureInPageFetch:
     def test_first_player_navigates_then_fetches_with_target(self):
         scraper = self._scraper()
         calls = []
-        with patch('scrapers.sofascore.camoufox_capture.SofascoreCamoufoxCapture',
-                   self._fakecap_cls(calls)):
-            out = list(scraper._iter_player_captures(
-                ['1', '2', '3'], season_picker_label='Premier League',
-                target_ut=17, target_year='25/26'))
-        assert [p for p, _ in out] == ['1', '2', '3']
+        with patch(
+            "scrapers.sofascore.camoufox_capture.SofascoreCamoufoxCapture",
+            self._fakecap_cls(calls),
+        ):
+            out = list(
+                scraper._iter_player_captures(
+                    ["1", "2", "3"], target_ut=17, target_year="25/26"
+                )
+            )
+        assert [p for p, _ in out] == ["1", "2", "3"]
         # First player warms the session via navigation; the rest fetch with
         # the (ut, year) target for the precise season-stats resolution.
-        assert calls == [('nav', '1'),
-                         ('fetch', '2', 17, '25/26'),
-                         ('fetch', '3', 17, '25/26')]
+        assert calls == [
+            ("nav", "1", 17, "25/26"),
+            ("fetch", "2", 17, "25/26"),
+            ("fetch", "3", 17, "25/26"),
+        ]
 
     @pytest.mark.unit
     def test_fetch_miss_falls_back_to_navigation(self):
@@ -2483,16 +3122,21 @@ class TestPlayerCaptureInPageFetch:
                                           ('fetch', '3')]
         # The fallback navigation recovered player 2 — nothing lost.
         assert all(c.get('profile') for _, c in out)
+        assert (
+            scraper.get_traffic_stats()["browser_fallback_navigations"] == 1
+        )
 
     @pytest.mark.unit
     def test_kill_switch_restores_nav_per_player(self, monkeypatch):
         monkeypatch.setenv('SOFASCORE_INPAGE_FETCH', '0')
         scraper = self._scraper()
         calls = []
-        with patch('scrapers.sofascore.camoufox_capture.SofascoreCamoufoxCapture',
-                   self._fakecap_cls(calls)):
-            list(scraper._iter_player_captures(['1', '2']))
-        assert calls == [('nav', '1'), ('nav', '2')]
+        with patch(
+            "scrapers.sofascore.camoufox_capture.SofascoreCamoufoxCapture",
+            self._fakecap_cls(calls),
+        ):
+            list(scraper._iter_player_captures(["1", "2"]))
+        assert [c[:2] for c in calls] == [("nav", "1"), ("nav", "2")]
 
     @pytest.mark.unit
     def test_cap_without_fetch_player_degrades_to_nav(self):
@@ -2509,9 +3153,9 @@ class TestPlayerCaptureInPageFetch:
             def __exit__(self, *a):
                 return False
 
-            def capture_player(self, pid, season_picker_label=None):
-                calls.append(('nav', pid))
-                return {'profile': {'id': int(pid)}, 'season_buffer': {}}
+            def capture_player(self, pid, target_ut=None, target_year=None):
+                calls.append(("nav", pid))
+                return {"profile": {"id": int(pid)}, "season_buffer": {}}
 
         with patch('scrapers.sofascore.camoufox_capture.SofascoreCamoufoxCapture',
                    _NavOnly):
@@ -2531,15 +3175,19 @@ class TestSeasonToShort:
         return _season_to_short
 
     @pytest.mark.unit
-    @pytest.mark.parametrize('token, expected', [
-        (2024, '2425'),      # year-start int
-        ('2025', '2526'),    # year-start str
-        ('2526', '2526'),    # already-short passthrough (old inline code -> '2627')
-        ('2021', '2021'),    # ambiguous token resolves as short 20/21, like soccerdata
-        (1999, '9900'),      # century wrap
-        ('9900', '9900'),    # already-short century wrap passthrough
-        ('abc', 'abc'),      # non-4-digit passthrough (legacy else branch)
-        ('25/26', '25/26'),  # non-digit passthrough
-    ])
+    @pytest.mark.parametrize(
+        "token, expected",
+        [
+            (2024, "2425"),  # year-start int
+            (2021, "2122"),  # DAG int is the 2021/22 start year
+            ("2025", "2526"),  # year-start str
+            ("2526", "2526"),  # already-short passthrough (old inline code -> '2627')
+            ("2021", "2021"),  # explicit string keeps short 20/21 meaning
+            (1999, "9900"),  # century wrap
+            ("9900", "9900"),  # already-short century wrap passthrough
+            ("abc", "abc"),  # non-4-digit passthrough (legacy else branch)
+            ("25/26", "25/26"),  # non-digit passthrough
+        ],
+    )
     def test_normalizes_tokens(self, season_to_short, token, expected):
         assert season_to_short(token) == expected

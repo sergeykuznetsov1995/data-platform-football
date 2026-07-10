@@ -6,7 +6,7 @@ Central configuration for all Airflow DAGs.
 """
 
 from datetime import datetime
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 
 def get_current_season() -> int:
@@ -96,13 +96,15 @@ SEASONS_STR: str = ','.join(
 SOFIFA_VERSIONS: str = 'latest'
 
 # DAG schedule configuration (cron format, UTC)
-SCHEDULES: Dict[str, str] = {
+SCHEDULES: Dict[str, Optional[str]] = {
     'dag_ingest_fbref': '0 6 * * 1',         # 6:00 UTC Monday (weekly)
     'dag_ingest_fotmob': '0 7 * * *',        # 7:00 UTC daily
     'dag_ingest_matchhistory': '0 8 * * *',  # 8:00 UTC daily
     'dag_ingest_understat': '0 9 * * *',     # 9:00 UTC daily
     'dag_ingest_whoscored': '0 10 * * *',    # 10:00 UTC daily
-    'dag_ingest_sofascore': '0 11 * * *',    # 11:00 UTC daily
+    # Daily ingestion (including the Saturday player branch) is orchestrated by
+    # dag_master_pipeline. A second source cron duplicated billable proxy traffic.
+    'dag_ingest_sofascore': None,
     'dag_ingest_espn': '0 12 * * *',         # 12:00 UTC daily
     'dag_ingest_clubelo': '0 13 * * *',      # 13:00 UTC daily
     'dag_ingest_sofifa': '0 6 * * 0',        # 6:00 UTC Sunday (weekly)
