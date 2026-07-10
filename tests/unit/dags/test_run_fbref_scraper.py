@@ -115,6 +115,115 @@ class TestExitCodeLogic:
         assert len(result['errors']) == 0, "No errors should be recorded on success"
 
 
+class TestTournamentBridge:
+    """#920 bridge, generalized in Phase 3: ANY single_year tournament (not
+    just INT-World Cup) must resolve its own season / no-op out of window /
+    drop out of mixed calls. Representative runner — the other four carry a
+    transcription of the same block keyed on the same helpers.
+
+    get_active_season is patched (the calendar itself is covered by
+    test_medallion_config); is_single_year_competition runs against the real
+    shipped competitions.yaml, so a mis-onboarded tournament fails here."""
+
+    @pytest.fixture
+    def temp_output_file(self):
+        fd, path = tempfile.mkstemp(suffix='.json')
+        os.close(fd)
+        yield path
+        if os.path.exists(path):
+            os.unlink(path)
+
+    def _run(self, args, mock_scraper_class, active_season):
+        sys.argv = ['run_fbref_scraper.py'] + args
+        import importlib
+
+        import utils.medallion_config as mc
+        import dags.scripts.run_fbref_scraper as scraper_module
+        importlib.reload(scraper_module)
+        with patch(
+            'scrapers.nodriver_fbref.NodriverFBrefScraper', mock_scraper_class
+        ), patch.object(mc, 'get_active_season', lambda lg, today=None: active_season):
+            return scraper_module.main()
+
+    def _mock_class(self):
+        scraper = MagicMock()
+        scraper.__enter__ = MagicMock(return_value=scraper)
+        scraper.__exit__ = MagicMock(return_value=False)
+        scraper.scrape_schedule.return_value = {
+            'schedule': 'iceberg.bronze.fbref_schedule'
+        }
+        scraper.get_stats.return_value = {'successes': 1, 'failures': 0}
+        scraper._stats = {'successes': 1, 'failures': 0}
+        return MagicMock(return_value=scraper)
+
+    _EURO_ARGS = [
+        '--scraper-type', 'nodriver',
+        '--mode', 'match_data',
+        '--match-data-type', 'schedule',
+        '--season', '2025',            # club-formula value from the DAG
+    ]
+
+    @pytest.mark.unit
+    def test_dedicated_euro_out_of_window_is_clean_noop(self, temp_output_file):
+        mock_class = self._mock_class()
+        exit_code = self._run(
+            self._EURO_ARGS + [
+                '--leagues', 'INT-European Championship',
+                '--output', temp_output_file,
+            ],
+            mock_class, active_season=None,
+        )
+        assert exit_code == 0
+        with open(temp_output_file) as f:
+            assert json.load(f)['skipped'] == 'out_of_window'
+        mock_class.assert_not_called()
+
+    @pytest.mark.unit
+    def test_dedicated_euro_in_window_overrides_season(self, temp_output_file):
+        mock_class = self._mock_class()
+        exit_code = self._run(
+            self._EURO_ARGS + [
+                '--leagues', 'INT-European Championship',
+                '--output', temp_output_file,
+            ],
+            mock_class, active_season=2028,
+        )
+        assert exit_code == 0
+        _, kwargs = mock_class.call_args
+        assert kwargs['seasons'] == [2028]      # NOT the club-formula 2025
+        assert kwargs['leagues'] == ['INT-European Championship']
+
+    @pytest.mark.unit
+    def test_mixed_call_drops_tournament_keeps_club(self, temp_output_file):
+        mock_class = self._mock_class()
+        exit_code = self._run(
+            self._EURO_ARGS + [
+                '--leagues', 'ENG-Premier League,INT-European Championship',
+                '--output', temp_output_file,
+            ],
+            mock_class, active_season=2028,
+        )
+        assert exit_code == 0
+        _, kwargs = mock_class.call_args
+        assert kwargs['leagues'] == ['ENG-Premier League']
+        assert kwargs['seasons'] == [2025]      # club season untouched
+
+    @pytest.mark.unit
+    def test_all_tournament_mixed_call_exits_clean(self, temp_output_file):
+        mock_class = self._mock_class()
+        exit_code = self._run(
+            self._EURO_ARGS + [
+                '--leagues', 'INT-World Cup,INT-European Championship',
+                '--output', temp_output_file,
+            ],
+            mock_class, active_season=2028,
+        )
+        assert exit_code == 0
+        with open(temp_output_file) as f:
+            assert json.load(f)['skipped'] == 'mixed_tournaments_dropped'
+        mock_class.assert_not_called()
+
+
 class TestSingleStatExitCode:
     """Test exit code behavior for single_stat mode."""
 

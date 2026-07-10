@@ -946,6 +946,28 @@ competitions:
             mod.load_competitions()
 
 
+def test_real_config_onboarded_tournaments(real_config_dir):
+    # #920 Phase 3: Euro 2028 / AFCON 2027 onboarded with confirmed windows;
+    # Copa América 2028 deliberately dateless (host TBA) -> the window can
+    # never open by accident (out-of-window no-op is the safe state).
+    import datetime
+    assert real_config_dir.get_active_season(
+        'INT-European Championship', today=datetime.date(2028, 6, 15)) == 2028
+    assert real_config_dir.get_active_season(
+        'INT-European Championship', today=datetime.date(2026, 7, 10)) is None
+    assert real_config_dir.get_active_season(
+        'INT-Africa Cup of Nations', today=datetime.date(2027, 7, 1)) == 2027
+    assert real_config_dir.get_active_season(
+        'INT-Copa America', today=datetime.date(2028, 6, 15)) is None
+    # Phase 2 floors are derivable for the new blocks (match_count present).
+    assert real_config_dir.get_competition_floor_basis(
+        'INT-European Championship') == (51, 24)
+    assert real_config_dir.get_competition_floor_basis(
+        'INT-Africa Cup of Nations') == (52, 24)
+    assert real_config_dir.get_competition_floor_basis(
+        'INT-Copa America') == (32, 16)
+
+
 def test_real_config_floor_basis_smoke(real_config_dir):
     # Shipped competitions.yaml: every in-scope competition must yield a
     # positive floor basis (the validate tasks call this in prod).
