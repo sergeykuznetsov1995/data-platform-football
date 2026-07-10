@@ -55,9 +55,9 @@ class ESPNScraper(SoccerdataScraper):
         # re-downloaded this run (see _prepare_summary_fetch) — bounds the
         # heal path to one request per match per run.
         self._stale_refetched: Set[int] = set()
-        # #913: guards the one-shot WC calendar rewrite (see
-        # _seed_single_year_cup_calendar).
-        self._wc_calendar_seeded = False
+        # #913 (generalized #920 Phase 3): guards the one-shot single-year
+        # tournament calendar rewrite (see _seed_single_year_cup_calendar).
+        self._cup_calendar_seeded = False
 
     def _get_reader(self):
         """Get soccerdata ESPN reader."""
@@ -121,10 +121,11 @@ class ESPNScraper(SoccerdataScraper):
         """Work around soccerdata's calendar parse for cup tournaments (#913).
 
         Club leagues' ESPN scoreboard carries ``leagues[0].calendar`` as a flat
-        list of date STRINGS; ``fifa.world`` serves a list of STAGE DICTS
-        (``{label, startDate, endDate, entries: [...]}``) instead, and
-        soccerdata's ``read_schedule`` crashes on it with ``strptime() argument
-        1 must be str, not dict``.
+        list of date STRINGS; single-year tournaments (``fifa.world``,
+        ``uefa.euro``, ``caf.nations``, ``conmebol.america`` — T0 recon) serve
+        a list of STAGE DICTS (``{label, startDate, endDate, entries: [...]}``)
+        instead, and soccerdata's ``read_schedule`` crashes on it with
+        ``strptime() argument 1 must be str, not dict``.
 
         Fix (same cache-seeding pattern as ``_seed_2021_season_calendar``):
         fetch the calendar anchor through ``reader.get`` (same proxy/retry
@@ -134,12 +135,17 @@ class ESPNScraper(SoccerdataScraper):
         exactly like a club season. Stage blocks longer than ~3 months are the
         outer season shell (fifa.world pads endDate to Dec 31) and are skipped.
         """
-        if self._wc_calendar_seeded:
+        if self._cup_calendar_seeded:
             return
         from datetime import datetime, timedelta, timezone
 
+        from scrapers.utils.competition_format import is_single_year_competition
+
         for league, lkey in getattr(reader, '_selected_leagues', {}).items():
-            if league != 'INT-World Cup':
+            # #920 Phase 3: every single-year tournament shares the stage-
+            # shaped calendar (was a WC-only literal — Euro/AFCON/Copa would
+            # have crashed soccerdata without the seed).
+            if not is_single_year_competition(league):
                 continue
             for skey in {str(s) for s in (reader.seasons or [])}:
                 # Mirror soccerdata's calendar-anchor formula (espn.py) for the
@@ -192,7 +198,7 @@ class ESPNScraper(SoccerdataScraper):
                     "ESPN #913: rewrote %s calendar into %d day entries "
                     "(season %s)", lkey, len(days), skey,
                 )
-        self._wc_calendar_seeded = True
+        self._cup_calendar_seeded = True
 
     def read_schedule(self) -> Optional[pd.DataFrame]:
         """

@@ -42,6 +42,7 @@ from scrapers.base.flaresolverr_client import (
     FlareSolverrTimeout,
     describe_proxy_mode,
 )
+from scrapers.utils.competition_format import is_single_year_competition
 
 logger = logging.getLogger(__name__)
 
@@ -459,8 +460,11 @@ class WhoScoredScraper(SoccerdataScraper):
         from scrapers.base.trino_manager import TrinoTableManager
 
         leagues = list(self.leagues or [])
-        # #913: for INT-World Cup use literal year '2026' (single-year), do not convert to '2627'
-        if "INT-World Cup" in leagues:
+        # #913 (generalized #920 Phase 3): single-year tournaments store the
+        # literal year ('2026') as the bronze season label — do not convert
+        # to '2627'. The runner guarantees tournament calls are dedicated
+        # (single-league), so one branch per reader instance is exact.
+        if any(is_single_year_competition(lg) for lg in leagues):
             season_strs = [str(s) for s in (self.seasons or [])]
         else:
             season_strs = [_season_to_soccerdata_str(s) for s in (self.seasons or [])]

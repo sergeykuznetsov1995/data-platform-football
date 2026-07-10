@@ -695,7 +695,10 @@ class NodriverFBrefScraper(BaseScraper):
             return None
 
         comment_tables = extract_tables_from_comments(soup)
-        season_str = format_season(season)
+        # league REQUIRED: without it a single_year tournament got the club
+        # '2026-2027' anchor and the sched_ table lookup silently missed
+        # (#920 Phase 3 — this call site was the 4th copy of the bug).
+        season_str = format_season(season, league)
         league_info = LEAGUE_IDS.get(league, {})
         comp_id = league_info.get('comp_id', '9')
 

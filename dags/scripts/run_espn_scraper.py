@@ -59,27 +59,30 @@ def main():
 
     leagues = [l.strip() for l in args.leagues.split(',')]
     # #913 Phase 1 (WC0 recon): soccerdata SeasonCode is per-league.
-    # INT-World Cup is single-year ('2026'), clubs are 2-year ('2627').
+    # Tournaments are single-year ('2026'), clubs are 2-year ('2627').
     # NEVER mix them in one sd.ESPN(leagues=..., seasons=...) call — it silently
-    # forces multi-year and breaks WC season. We build per-league tokens and
-    # scrape each league in its own (tiny) scraper instance.
+    # forces multi-year and breaks the tournament season. We build per-league
+    # tokens and scrape each league in its own (tiny) scraper instance.
+    from utils.medallion_config import (
+        get_active_season, is_single_year_competition,
+    )
     per_league = []
     for lg in leagues:
-        if lg == 'INT-World Cup':
-            # #920 bridge: the DAG passes the club-formula CURRENT_SEASON
-            # (July 2026 -> 2025) — substitute the active tournament year from
+        if is_single_year_competition(lg):
+            # #920 bridge (generalized Phase 3: any single_year tournament):
+            # the DAG passes the club-formula CURRENT_SEASON (July 2026 ->
+            # 2025) — substitute the active tournament year from
             # competitions.yaml; skip the league entirely out of window.
-            from utils.medallion_config import get_active_season
-            _wc_season = get_active_season(lg)
-            if _wc_season is None:
+            _t_season = get_active_season(lg)
+            if _t_season is None:
                 logger.warning(
                     f"{lg}: out of its tournament window — skipping league.")
                 continue
-            if int(args.season) != int(_wc_season):
+            if int(args.season) != int(_t_season):
                 logger.info(
-                    f"{lg}: overriding --season {args.season} -> {_wc_season} "
+                    f"{lg}: overriding --season {args.season} -> {_t_season} "
                     f"(active single_year season, #920 bridge).")
-            tok = str(_wc_season)  # single-year
+            tok = str(_t_season)  # single-year
         else:
             tok = f"{args.season % 100:02d}{(args.season + 1) % 100:02d}"
         per_league.append((lg, tok))

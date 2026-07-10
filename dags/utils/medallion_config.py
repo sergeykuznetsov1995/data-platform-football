@@ -59,10 +59,19 @@ import yaml
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
-# Default container path; override via env var for unit tests on the host.
-# In the Airflow image, configs/ is bind-mounted at /opt/airflow/configs.
+# Default container path; override via env var. On hosts without the container
+# mount (unit tests, console runs) fall back to the repo checkout relative to
+# this file (dags/utils/ -> <repo>/configs/medallion). Without the fallback,
+# every host-side caller of the scraper helpers silently landed in their
+# except-branch club default ('split_year') — the exact silent wrong-season
+# class of the 2026-07-09 WC bronze incident (#920 Phase 3). In the Airflow
+# image both candidates resolve to the same bind-mounted /opt/airflow path.
+_CONTAINER_CONFIG_DIR = Path('/opt/airflow/configs/medallion')
+_REPO_CONFIG_DIR = Path(__file__).resolve().parents[2] / 'configs' / 'medallion'
 CONFIG_DIR = Path(
-    os.environ.get('MEDALLION_CONFIG_DIR', '/opt/airflow/configs/medallion')
+    os.environ.get('MEDALLION_CONFIG_DIR')
+    or (_CONTAINER_CONFIG_DIR if _CONTAINER_CONFIG_DIR.is_dir()
+        else _REPO_CONFIG_DIR)
 )
 
 TEAM_ALIASES_FILE = 'team_aliases.yaml'
@@ -400,6 +409,16 @@ def _validate_competitions_schema(doc: Dict) -> None:
                 f"competitions.yaml: competitions[{i}] ({c.get('id')}) "
                 f"missing/empty 'country' (required for gold.dim_competition)"
             )
+        # Top-level competition_format drives payload-shape scraper branches
+        # (get_competition_format) — a typo would silently fall back to
+        # 'league' and skip group-table parsing (#920 review hardening).
+        comp_fmt = c.get('competition_format')
+        if comp_fmt is not None and comp_fmt not in ('league', 'group_knockout'):
+            raise MedallionConfigError(
+                f"competitions.yaml: competitions[{i}] ({c.get('id')}) "
+                f"competition_format must be 'league' or 'group_knockout' "
+                f"(got {comp_fmt!r})"
+            )
         # Validate seasons list and season_format (issue #913 Phase 2).
         # season_format per-season is optional; default 'split_year' everywhere
         # except explicit single-year tournaments (e.g. INT-World Cup 2026).
@@ -421,6 +440,54 @@ def _validate_competitions_schema(doc: Dict) -> None:
                     f"competitions.yaml: competitions[{i}].seasons[{j}].season_format "
                     f"must be 'single_year' or 'split_year' (got {fmt!r})"
                 )
+            # format + team_count feed the per-competition DQ floors
+            # (#920 Phase 2, get_competition_floor_basis) — enforce at load
+            # time so a mis-onboarded competition fails in tests, not when
+            # the validate task first runs in prod.
+            cfmt = s.get('format')
+            if cfmt not in ('league_round_robin', 'group_knockout'):
+                raise MedallionConfigError(
+                    f"competitions.yaml: competitions[{i}].seasons[{j}].format "
+                    f"must be 'league_round_robin' or 'group_knockout' "
+                    f"(got {cfmt!r})"
+                )
+            tc = s.get('team_count')
+            if not isinstance(tc, int) or isinstance(tc, bool) or tc <= 0:
+                raise MedallionConfigError(
+                    f"competitions.yaml: competitions[{i}].seasons[{j}].team_count "
+                    f"must be positive int (got {tc!r})"
+                )
+            # group_knockout match totals are NOT derivable from team_count
+            # (group size and 3rd-place match vary by tournament), so the
+            # season must state them explicitly.
+            mc = s.get('match_count')
+            if mc is not None and (
+                not isinstance(mc, int) or isinstance(mc, bool) or mc <= 0
+            ):
+                raise MedallionConfigError(
+                    f"competitions.yaml: competitions[{i}].seasons[{j}].match_count "
+                    f"must be positive int (got {mc!r})"
+                )
+            if cfmt == 'group_knockout' and mc is None:
+                raise MedallionConfigError(
+                    f"competitions.yaml: competitions[{i}].seasons[{j}] "
+                    f"({c.get('id')}): group_knockout seasons require an "
+                    f"explicit 'match_count'"
+                )
+        # Cross-check: a group_knockout season under a competition whose
+        # top-level competition_format was forgotten would leave
+        # is_group_knockout() False — group tables silently parsed by the
+        # club branch (#920 review hardening).
+        if comp_fmt != 'group_knockout' and any(
+            s.get('format') == 'group_knockout'
+            for s in (c.get('seasons') or [])
+            if isinstance(s, dict)
+        ):
+            raise MedallionConfigError(
+                f"competitions.yaml: competitions[{i}] ({c.get('id')}) has "
+                f"group_knockout seasons but no top-level "
+                f"'competition_format: group_knockout'"
+            )
 
 
 def _validate_country_codes_schema(doc: Dict) -> None:
@@ -1374,6 +1441,78 @@ def get_competition_season_format(competition_id: str, season_id: int) -> str:
                     return s.get('season_format', 'split_year')
             break
     return 'split_year'
+
+
+def _season_match_count(season: Dict, competition_id: str) -> int:
+    """Scheduled match total for one season entry.
+
+    An explicit ``match_count`` always wins. For league_round_robin it is
+    derivable (``n * (n - 1)`` — double round robin), so club seasons don't
+    have to state the obvious. group_knockout totals depend on group size
+    and whether a 3rd-place match exists, so the schema validator already
+    requires ``match_count`` there — the raise below is a belt for callers
+    that bypass load_competitions().
+    """
+    mc = season.get('match_count')
+    if mc is not None:
+        return int(mc)
+    if season.get('format') == 'league_round_robin':
+        n = int(season['team_count'])
+        return n * (n - 1)
+    raise MedallionConfigError(
+        f"competitions.yaml: {competition_id!r} season {season.get('id')!r} "
+        f"has no derivable match count (format {season.get('format')!r} "
+        f"requires explicit 'match_count')"
+    )
+
+
+def get_competition_floor_basis(competition_id: str) -> Tuple[int, int]:
+    """(match_count, team_count) basis for per-competition DQ floors
+    (#920 Phase 2, consumed by utils.config.get_min_row_threshold).
+
+    Takes the MINIMUM of each across the competition's configured seasons:
+    a floor sized to the smallest season can never false-fail any season
+    actually present in Bronze (e.g. FRA-Ligue 1 shrank 20 -> 18 clubs in
+    2324 — the 18-club basis keeps old 20-club seasons comfortably above).
+
+    Fail-closed: raises MedallionConfigError for an unknown competition or
+    one with no seasons — a floor of 0 would silently pass an empty table,
+    the exact regression class of #102/#110.
+    """
+    doc = load_competitions()
+    for c in doc['competitions']:
+        if c['id'] != competition_id:
+            continue
+        seasons = c.get('seasons') or []
+        if not seasons:
+            raise MedallionConfigError(
+                f"competitions.yaml: {competition_id!r} has no seasons — "
+                f"cannot derive a DQ floor basis for a stub competition"
+            )
+        return (
+            min(_season_match_count(s, competition_id) for s in seasons),
+            min(int(s['team_count']) for s in seasons),
+        )
+    raise MedallionConfigError(
+        f"competition not found in competitions.yaml: {competition_id!r}"
+    )
+
+
+def get_competition_format(competition_id: str) -> str:
+    """Top-level ``competition_format`` ('group_knockout' for cup
+    tournaments), default 'league' — club leagues omit the field.
+
+    Drives scraper branches that depend on PAYLOAD SHAPE (group standings
+    tables, stage-shaped calendars), not on season windows: single-year
+    round-robin leagues exist (Brasileirão class), so this must NOT alias
+    season_format (#920 Phase 3). Unknown competition -> 'league', mirroring
+    get_competition_season_format's silent club default.
+    """
+    doc = load_competitions()
+    for c in doc['competitions']:
+        if c['id'] == competition_id:
+            return c.get('competition_format', 'league')
+    return 'league'
 
 
 def get_active_single_year_season(

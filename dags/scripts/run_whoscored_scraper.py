@@ -316,38 +316,50 @@ def main() -> int:
     leagues = [l.strip() for l in args.leagues.split(',') if l.strip()]
     seasons = _parse_seasons(args)
 
-    # #913 Phase 1: WhoScored (5th source). The DAG always passes multi-year
-    # SEASONS_STR. For INT-World Cup we must use single-year season ('2026')
-    # so that soccerdata and Bronze get the correct partition. soccerdata
-    # silently degrades when single-year and multi-year leagues share one
-    # reader (SeasonCode.from_leagues → UserWarning + wrong parse), and the
-    # old blanket `seasons = [2026]` override corrupted CLUB seasons in mixed
-    # calls — so in a mixed call WC is dropped (scrape it dedicated), and the
-    # single-year override applies only to the dedicated WC call.
-    if 'INT-World Cup' in leagues:
-        if len(leagues) > 1:
+    # #913 Phase 1 (generalized #920 Phase 3: any single_year tournament).
+    # The DAG always passes multi-year SEASONS_STR. Tournaments must use the
+    # single-year season ('2026') so that soccerdata and Bronze get the
+    # correct partition. soccerdata silently degrades when single-year and
+    # multi-year leagues share one reader (SeasonCode.from_leagues →
+    # UserWarning + wrong parse), and the old blanket `seasons = [2026]`
+    # override corrupted CLUB seasons in mixed calls — so in a mixed call
+    # tournaments are dropped (scrape them dedicated), and the single-year
+    # override applies only to a dedicated tournament call.
+    from utils.medallion_config import (
+        get_active_season, is_single_year_competition,
+    )
+    _tournaments = [l for l in leagues if is_single_year_competition(l)]
+    if _tournaments and len(leagues) > 1:
+        logger.warning(
+            "Single-year tournaments require dedicated calls and are "
+            "DROPPED from this mixed run (soccerdata cannot mix single- "
+            f"and multi-year leagues in one reader): {_tournaments} of "
+            f"leagues={leagues}. Scrape them separately."
+        )
+        leagues = [l for l in leagues if l not in _tournaments]
+        if not leagues:
             logger.warning(
-                "INT-World Cup requires a dedicated single-year call and is "
-                "DROPPED from this mixed run (soccerdata cannot mix single- "
-                f"and multi-year leagues in one reader): leagues={leagues}. "
-                "Scrape it separately with --leagues 'INT-World Cup'."
-            )
-            leagues = [l for l in leagues if l != 'INT-World Cup']
-        else:
-            # #920 bridge: the tournament year comes from competitions.yaml
-            # (was a 2026 hardcode); out of window the run is a clean no-op.
-            from utils.medallion_config import get_active_season
-            _wc_season = get_active_season('INT-World Cup')
-            if _wc_season is None:
-                logger.warning(
-                    "INT-World Cup is out of its tournament window — nothing "
-                    "to scrape; exiting 0.")
-                with open(args.output, 'w') as f:
-                    json.dump({'rows': 0, 'errors': [], 'tables': [],
-                               'tables_by_entity': {},
-                               'skipped': 'out_of_window'}, f)
-                return 0
-            seasons = [int(_wc_season)]
+                "No leagues left after dropping tournaments; exiting 0.")
+            with open(args.output, 'w') as f:
+                json.dump({'rows': 0, 'errors': [], 'tables': [],
+                           'tables_by_entity': {},
+                           'skipped': 'mixed_tournaments_dropped'}, f)
+            return 0
+    elif _tournaments:
+        # #920 bridge: the tournament year comes from competitions.yaml
+        # (was a 2026 hardcode); out of window the run is a clean no-op.
+        _t_league = leagues[0]
+        _t_season = get_active_season(_t_league)
+        if _t_season is None:
+            logger.warning(
+                f"{_t_league} is out of its tournament window — nothing "
+                "to scrape; exiting 0.")
+            with open(args.output, 'w') as f:
+                json.dump({'rows': 0, 'errors': [], 'tables': [],
+                           'tables_by_entity': {},
+                           'skipped': 'out_of_window'}, f)
+            return 0
+        seasons = [int(_t_season)]
 
     logger.info(
         f"Starting WhoScored scraper: leagues={leagues}, seasons={seasons}, "

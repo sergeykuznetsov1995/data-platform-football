@@ -128,14 +128,19 @@ class TestValidateDataIncrementalNoop:
 
     @staticmethod
     def _patch_results(dag_module, monkeypatch, schedule_result, capture_result):
-        monkeypatch.setattr(
-            dag_module, '_load_result',
-            lambda path, logger: (
-                capture_result
-                if path == dag_module.MATCH_CAPTURE_RESULT_PATH
-                else schedule_result
-            ),
-        )
+        # Tournament-leg paths (#920 Phase 2) resolve to the runner's healthy
+        # out-of-window marker, so these club-batch tests stay leg-agnostic
+        # (a missing leg file now WARNs — see TestValidateDataTournamentLegs).
+        skipped = {'skipped': 'out_of_window', 'errors': [], 'tables': []}
+
+        def _fake_load(path, logger):
+            if path == dag_module.MATCH_CAPTURE_RESULT_PATH:
+                return capture_result
+            if path == dag_module.SCHEDULE_RESULT_PATH:
+                return schedule_result
+            return dict(skipped)
+
+        monkeypatch.setattr(dag_module, '_load_result', _fake_load)
 
     @staticmethod
     def _noop_capture():
@@ -210,6 +215,101 @@ class TestValidateDataIncrementalNoop:
                             lambda *a, **k: capture)
         dag_module.validate_bronze_freshness()
         assert captured.get('ran') is True
+
+
+class TestValidateDataTournamentLegs:
+    """#920 Phase 2: the Phase-1 fan-out's per-tournament result files are now
+    observed by validate_data — WARN-only (no status escalation) while the
+    first tournament window runs green; missing files and the runner's
+    out-of-window marker stay silent. Club floors are derived from
+    competitions.yaml and must equal the historical literals for
+    CLUB_LEAGUES == ['ENG-Premier League']."""
+
+    SCHEDULE_OK = {'schedule_rows': 381, 'league_table_rows': 20,
+                   'tables': [], 'errors': []}
+    CAPTURE_OK = {'rows': 25000, 'matches_with_ratings': 380,
+                  'eps_rows': 12000, 'match_stats_rows': 34000,
+                  'shotmap_rows': 9500, 'venue_rows': 380,
+                  'matches_total': 380, 'matches_skipped_existing': 0,
+                  'fallback': False, 'errors': [], 'tables': []}
+
+    def _patch(self, dag_module, monkeypatch, t_schedule, t_capture):
+        wc_sched = '/tmp/sofascore_result_int_world_cup.json'
+        wc_capture = '/tmp/sofascore_match_capture_result_int_world_cup.json'
+
+        def _fake_load(path, logger):
+            if path == dag_module.MATCH_CAPTURE_RESULT_PATH:
+                return dict(self.CAPTURE_OK)
+            if path == dag_module.SCHEDULE_RESULT_PATH:
+                return dict(self.SCHEDULE_OK)
+            if path == wc_sched:
+                return t_schedule
+            if path == wc_capture:
+                return t_capture
+            return {}
+
+        monkeypatch.setattr(dag_module, '_load_result', _fake_load)
+
+    def test_club_floors_equal_legacy_literals(self, dag_module):
+        # The pre-#920-Phase-2 inline literals, now derived — exact match for
+        # the current single-club scope (no silent recalibration).
+        assert dag_module._summed_club_floors() == {
+            'schedule_rows': 100,
+            'league_table_rows': 10,
+            'player_ratings_rows': 300,
+            'shotmap_rows': 300,
+            'event_player_stats_rows': 10_000,
+            'match_stats_rows': 10_000,
+            'venue_rows': 300,
+        }
+
+    def test_out_of_window_marker_is_silent(self, dag_module, monkeypatch):
+        skipped = {'skipped': 'out_of_window', 'errors': [], 'tables': []}
+        self._patch(dag_module, monkeypatch, skipped, dict(skipped))
+        validation = dag_module.validate_data()
+        assert validation['status'] == 'success'
+        assert validation['warnings'] == []
+
+    def test_missing_leg_files_warn(self, dag_module, monkeypatch):
+        # The runner ALWAYS writes its output file (out-of-window runs write
+        # the 'skipped' marker) — a missing file means the runner died
+        # before writing and must not pass silently (review hardening).
+        self._patch(dag_module, monkeypatch, {}, {})
+        validation = dag_module.validate_data()
+        assert validation['status'] == 'success'      # WARN-only, no escalation
+        missing = [w for w in validation['warnings'] if 'missing/unreadable' in w]
+        assert len(missing) == 2                       # schedule + capture legs
+
+    def test_low_tournament_leg_warns_but_never_escalates(
+            self, dag_module, monkeypatch):
+        # WC floors: schedule 100*104//380=27, league_table 10*48//20=24.
+        t_sched = {'schedule_rows': 5, 'league_table_rows': 0,
+                   'tables': [], 'errors': []}
+        t_capture = {'rows': 3, 'shotmap_rows': 0, 'eps_rows': 0,
+                     'match_stats_rows': 0, 'venue_rows': 0,
+                     'matches_total': 10, 'matches_skipped_existing': 0,
+                     'fallback': False, 'errors': ['camoufox timeout'],
+                     'tables': []}
+        self._patch(dag_module, monkeypatch, t_sched, t_capture)
+        validation = dag_module.validate_data()
+        assert validation['status'] == 'success'    # WARN-only by design
+        warned = ' '.join(validation['warnings'])
+        assert 'INT-World Cup: low schedule_rows: 5 < 27' in warned
+        assert 'INT-World Cup: low league_table_rows: 0 < 24' in warned
+        assert 'INT-World Cup: camoufox timeout' in warned
+        assert validation['summary'][
+            'tournament_int_world_cup']['schedule_rows'] == 5
+
+    def test_healthy_tournament_leg_no_warnings(self, dag_module, monkeypatch):
+        t_sched = {'schedule_rows': 104, 'league_table_rows': 48,
+                   'tables': [], 'errors': []}
+        t_capture = {'rows': 2600, 'shotmap_rows': 2600, 'eps_rows': 2800,
+                     'match_stats_rows': 9000, 'venue_rows': 104,
+                     'matches_total': 104, 'matches_skipped_existing': 0,
+                     'fallback': False, 'errors': [], 'tables': []}
+        self._patch(dag_module, monkeypatch, t_sched, t_capture)
+        validation = dag_module.validate_data()
+        assert validation['warnings'] == []
 
 
 class TestPlayerCaptureGate:

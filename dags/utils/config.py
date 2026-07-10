@@ -6,7 +6,7 @@ Central configuration for all Airflow DAGs.
 """
 
 from datetime import datetime
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 
 def get_current_season() -> int:
@@ -32,6 +32,13 @@ def get_current_season() -> int:
 LEAGUES: List[str] = [
     'ENG-Premier League',
     'INT-World Cup',  # #913 Phase 1 (single-year WC). Targeting 5 sources: fbref, fotmob, sofascore, espn, whoscored. Club-only sources (sofifa etc) protected in thresholds.
+]
+
+# Club-only slice of LEAGUES — the scope for sources that do not cover
+# international tournaments (sofifa). #920 Phase 2: also the league set the
+# sofifa validate tasks check per-league floors against.
+NON_INTERNATIONAL_LEAGUES: List[str] = [
+    l for l in LEAGUES if not l.startswith('INT-')
 ]
 
 # WhoScored multi-league scope (#708). Deliberately independent of the global
@@ -106,56 +113,123 @@ SCHEDULES: Dict[str, str] = {
     'dag_transform_fotmob_silver': None,    # Trigger only (after ingestion)
 }
 
+# --- Per-competition bronze floors (#920 Phase 2) ---------------------------
+# Historical floors were calibrated against ONE basis: APL — 20 clubs,
+# 380 scheduled matches/season. A 104-match World Cup (or a 51-match Euro)
+# can never satisfy those constants, and the whole-table COUNT(*) let a
+# missing league hide behind the aggregate. Per-league floors scale the same
+# calibrated bases by each competition's own volume from competitions.yaml.
+_APL_MATCHES = 380
+_APL_TEAMS = 20
+
+# threshold_key -> (unit, base floor at the APL basis). Keys here are the
+# league-aware subset of MIN_ROW_THRESHOLDS: tables whose per-league count is
+# deterministic at validation time (schedule-class tables — fixtures known
+# upfront — and full-snapshot per-league sources). Append-only wipe-floors and
+# tables without a league column stay whole-table in MIN_ROW_THRESHOLDS below.
+# unit: 'match'  — scales with the competition's scheduled match count;
+#       'team'   — scales with team_count (player-volume tables track squad
+#                  count, which tracks team_count);
+#       'league' — constant per league (e.g. 1 lookup row).
+PER_LEAGUE_FLOOR_BASES: Dict[str, Tuple[str, int]] = {
+    'whoscored_schedule': ('match', 340),      # 380 fixtures/season - 10% margin
+    'espn_schedule': ('match', 340),           # 380 fixtures/season - 10% margin
+    'understat_schedule': ('match', 340),      # 380 fixtures/season - 10% margin
+    'understat_team_match_stats': ('match', 340),   # 380 team-match rows - 10%
+    'understat_shots': ('match', 8000),        # ~9.8k shots/season - 20% margin
+    'understat_player_match_stats': ('match', 10_000),  # ~11.1k rows/season - 10%
+    'understat_players': ('team', 450),        # ~547 player-season rows - 18%
+    'sofifa_players': ('team', 450),           # 546 players / league edition - 18%
+    'sofifa_teams': ('team', 18),              # 20 clubs / league - 10%
+    'sofifa_team_ratings': ('team', 18),       # 20 clubs / league - 10%
+    'sofifa_leagues': ('league', 1),           # 1 lookup row per league
+}
+
+
+def scale_floor_for_league(unit: str, base: int, league: str) -> int:
+    """Integer-scale an APL-calibrated base floor to another competition.
+
+    Pure integer arithmetic (``base * basis // apl_basis``) so a 20-team
+    club league reduces to ``base`` EXACTLY — the #920 Phase 2 equivalence
+    contract with the pre-per-league constants.
+    """
+    if unit == 'league':
+        return base
+    # Lazy import: utils.config is imported by every DAG and by host tests
+    # without MEDALLION_CONFIG_DIR — competitions.yaml must only be read when
+    # a floor is actually evaluated (same pattern as the runner bridge).
+    from utils.medallion_config import get_competition_floor_basis
+    matches, teams = get_competition_floor_basis(league)
+    if unit == 'match':
+        return base * matches // _APL_MATCHES
+    if unit == 'team':
+        return base * teams // _APL_TEAMS
+    raise ValueError(f"unknown floor unit {unit!r}")
+
+
+def get_min_row_threshold(threshold_key: str, league: str) -> int:
+    """Per-league DQ floor (#920 Phase 2).
+
+    An unknown threshold_key raises KeyError — validate_table wraps it into
+    the same fail-closed AirflowException as the whole-table path (#106/#110).
+    """
+    unit, base = PER_LEAGUE_FLOOR_BASES[threshold_key]
+    return scale_floor_for_league(unit, base, league)
+
+
 # Minimum row thresholds for validation (per single DagRun = 1 league x 1 season).
 # Consumed by validate_table() in dags/utils/bronze_validation.py (fail-closed
 # on a missing key, #106/#110) via the validate tasks in the whoscored / espn /
 # understat / sofifa ingest DAGs.
 #
-# #913 Phase 1: thresholds are still whole-table (not fully per-competition yet).
-# WC has ~104 matches vs ~380 for APL. For now we rely on aggregate counts being
-# high enough + protected sofifa scaling above. Future: make validate league-aware.
-# Currently LEAGUES includes INT-World Cup (for supported sources) + clubs.
+# #920 Phase 2: keys present in PER_LEAGUE_FLOOR_BASES are enforced per league
+# via get_min_row_threshold when the DAG passes its league scope; the values
+# below are the whole-table fallback (validate_table without `leagues`) and
+# the wipe-floors that stay whole-table by design:
+#   - whoscored_events: append-only over nonuniform history (10-season EPL vs
+#     5-season others) — a per-season basis is meaningless;
+#   - whoscored_player_profile: absent from the bronze schema snapshot,
+#     per-league coverage unverified — revisit after #708;
+#   - espn_lineup / espn_matchsheet: accumulating per-match tables sized to
+#     ONE season (~28 lineup / 2 matchsheet rows per match x 340 - margin);
+#     a per-league floor would false-fail early tournament days, while the
+#     10-season live tables (~145k / 7.6k rows) never trip a 1-season floor;
+#   - sofifa_versions / sofifa_player_ratings: no league column in bronze.
 MIN_ROW_THRESHOLDS: Dict[str, int] = {
-    'schedule': 350,        # 380 APL matches/season, allow ~5-10% missing/postponed
-    'player_stats': 500,    # ~600-800 unique player-season rows expected, ~25% margin
-    'team_stats': 18,       # 20 APL clubs, allow ~10% missing per rare stat_type
-    'shots': 8000,          # ~10k shots/season, ~20% margin
-    'elo_ratings': 100,     # ClubElo not in FBref-only roadmap; left unchanged
     # WhoScored (issue #106): hidden-enabler thresholds. Without these keys,
     # validate_table() falls back to 0 and silently passes an empty schedule
     # scrape (root cause of #102). schedule scales with WHOSCORED_LEAGUES
-    # (every league is scraped each run, replace semantics); events /
-    # player_profile floors stay 1-league-sized until the multi-league
-    # backfill lands — they are append-only wipe-floors, and multiplying them
-    # now would false-fail while the new leagues ramp up (#708).
-    'whoscored_schedule': 340 * len(WHOSCORED_LEAGUES),  # 380 fixtures/season/league - margin
+    # (every league is scraped each run, replace semantics).
+    'whoscored_schedule':
+        PER_LEAGUE_FLOOR_BASES['whoscored_schedule'][1] * len(WHOSCORED_LEAGUES),
     'whoscored_events': 20_000_000,  # #895: top-5×10-season backfill landed (27.9M rows, append-only); wipe-floor ~72% of live
     'whoscored_player_profile': 300,  # ~531 players/season/league (#37); raise after #708 backfill
     # ESPN / Understat / SoFIFA (issue #466): same silent-fail class as #102 —
     # read_* swallowed errors and runners exited 0. Floors calibrated against
     # live Bronze counts on 2026-06-11.
-    'espn_schedule': 340,                  # 380 fixtures/season - 10% margin
-    # espn_lineup / espn_matchsheet: the per-match tables were the unguarded
-    # half of the #466 class — only espn_schedule had a floor, so a wiped or
-    # frozen lineup/matchsheet table passed silently. Whole-table wipe-floors
-    # sized to ONE season (~28 lineup rows and 2 matchsheet rows per match
-    # x 340 matches - margin); live tables hold 10 seasons (~145k / 7.6k
-    # rows), so these never false-fail if scope shrinks to a single season.
+    'espn_schedule': PER_LEAGUE_FLOOR_BASES['espn_schedule'][1],
     'espn_lineup': 9000,
     'espn_matchsheet': 620,
-    'understat_schedule': 340,             # 380 fixtures/season - 10% margin
-    'understat_players': 450,              # ~547 player-season rows/season - 18%
-    'understat_shots': 8000,               # ~9.8k shots/season - 20% margin
-    'understat_team_match_stats': 340,     # 380 team-match rows/season - 10%
-    'understat_player_match_stats': 10_000,  # ~11.1k rows/season - 10% margin
-    # sofifa_*: масштабируются от количества клубных лиг (INT-World Cup не покрывается sofifa).
-    # Для #913: считаем только клубные (чтобы floor не завышался при добавлении WC).
-    'sofifa_players': 450 * len([l for l in LEAGUES if not l.startswith('INT-')]),        # 546 players / league edition - 18%
-    'sofifa_teams': 18 * len([l for l in LEAGUES if not l.startswith('INT-')]),           # 20 clubs / league - 10%
-    'sofifa_team_ratings': 18 * len([l for l in LEAGUES if not l.startswith('INT-')]),    # 20 clubs / league - 10%
+    'understat_schedule': PER_LEAGUE_FLOOR_BASES['understat_schedule'][1],
+    'understat_players': PER_LEAGUE_FLOOR_BASES['understat_players'][1],
+    'understat_shots': PER_LEAGUE_FLOOR_BASES['understat_shots'][1],
+    'understat_team_match_stats':
+        PER_LEAGUE_FLOOR_BASES['understat_team_match_stats'][1],
+    'understat_player_match_stats':
+        PER_LEAGUE_FLOOR_BASES['understat_player_match_stats'][1],
+    # sofifa_*: club leagues only (INT-* not covered by sofifa), scaled by the
+    # club-league count so the floor does not inflate when a tournament joins
+    # LEAGUES (#913).
+    'sofifa_players':
+        PER_LEAGUE_FLOOR_BASES['sofifa_players'][1] * len(NON_INTERNATIONAL_LEAGUES),
+    'sofifa_teams':
+        PER_LEAGUE_FLOOR_BASES['sofifa_teams'][1] * len(NON_INTERNATIONAL_LEAGUES),
+    'sofifa_team_ratings':
+        PER_LEAGUE_FLOOR_BASES['sofifa_team_ratings'][1] * len(NON_INTERNATIONAL_LEAGUES),
     'sofifa_versions': 15,                 # ~20 editions (FIFA 07→FC 26) on post-EA-FC homepage (#654/#670); +1/yr
-    'sofifa_leagues': len([l for l in LEAGUES if not l.startswith('INT-')]),              # 1 lookup row per league
-    'sofifa_player_ratings': 450 * len([l for l in LEAGUES if not l.startswith('INT-')]),  # 546 per-player pages / league edition - 18%
+    'sofifa_leagues': len(NON_INTERNATIONAL_LEAGUES),   # 1 lookup row per league
+    'sofifa_player_ratings':
+        450 * len(NON_INTERNATIONAL_LEAGUES),  # 546 per-player pages / league edition - 18%; no league column in bronze
 }
 
 # Tags for DAG organization
