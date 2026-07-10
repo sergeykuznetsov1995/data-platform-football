@@ -254,7 +254,13 @@ seq AS (
     SELECT
         *,
         ROW_NUMBER() OVER (
-            PARTITION BY game_id
+            -- league/season lead for the same pushdown reason as the dedup
+            -- window above: the backfill's outer WHERE must push through
+            -- EVERY window in the chain, or the whole bronze table is
+            -- window-sorted (this second window re-OOM'd the #913 WC run
+            -- after the first one was fixed). game_id is unique per match,
+            -- so the grouping is unchanged.
+            PARTITION BY league, season, game_id
             -- #477: period is VARCHAR; a raw `ORDER BY period` sorts it
             -- lexically, which is only accidentally correct for FirstHalf/
             -- SecondHalf. Cup matches with extra time / shootouts (e.g.
