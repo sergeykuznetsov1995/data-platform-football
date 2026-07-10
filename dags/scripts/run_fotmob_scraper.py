@@ -102,6 +102,33 @@ def main():
     selected = {e.strip() for e in args.entities.split(',') if e.strip()}
     entities = [e for e in ENTITIES if not selected or e[0] in selected]
 
+    # #920 bridge: single_year tournaments must never inherit the club-formula
+    # season (July 2026 -> 2025): FotMob answers a season='2025' WC request
+    # with CURRENT tournament data, silently mislabelling the partition.
+    # Mixed club+WC calls can't carry two seasons -> WC is dropped (dedicated
+    # call), mirroring run_whoscored_scraper / run_fbref_scraper.
+    if 'INT-World Cup' in leagues:
+        from utils.medallion_config import get_active_season
+        _wc_season = get_active_season('INT-World Cup')
+        if len(leagues) > 1:
+            logger.warning(
+                "INT-World Cup dropped from mixed call (needs its own season; "
+                f"leagues={leagues}). Scrape it with --leagues 'INT-World Cup'.")
+            leagues = [l for l in leagues if l != 'INT-World Cup']
+        elif _wc_season is None:
+            logger.warning(
+                "INT-World Cup is out of its tournament window — nothing to "
+                "scrape; exiting 0.")
+            with open(args.output, 'w') as f:
+                json.dump({'tables': [], 'rows': {}, 'errors': [],
+                           'skipped': 'out_of_window'}, f)
+            return 0
+        elif int(args.season) != int(_wc_season):
+            logger.info(
+                f"INT-World Cup: overriding --season {args.season} -> "
+                f"{_wc_season} (active single_year season, #920 bridge).")
+            args.season = _wc_season
+
     logger.info(f"Starting FotMob scraper: leagues={leagues}, season={args.season}")
     logger.info(f"Entities: {[e[0] for e in entities]}")
 

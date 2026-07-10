@@ -1661,10 +1661,12 @@ class TestReadLeagueTableViaCapture:
     patch the capture session so no browser is needed and assert the persisted
     schema + the season_id guard (only the target season's standings are kept)."""
 
-    # The 15 columns of bronze.sofascore_league_table (mirrors bronze_schemas.json).
+    # The 16 columns of bronze.sofascore_league_table (mirrors bronze_schemas.json;
+    # 'group' — WC group support, #913).
     _EXPECTED_COLS = {
         '_batch_id', '_entity_type', '_ingested_at', '_source',
         'team', 'mp', 'w', 'd', 'l', 'gf', 'ga', 'gd', 'pts', 'league', 'season',
+        'group',
     }
 
     def _scraper(self):
@@ -1750,6 +1752,54 @@ class TestReadLeagueTableViaCapture:
         assert arsenal['gd'] == 27 and arsenal['pts'] == 48 and arsenal['mp'] == 20
         for col in ('mp', 'w', 'd', 'l', 'gf', 'ga', 'gd', 'pts'):
             assert str(df[col].dtype) == 'Int64'
+
+    @pytest.mark.unit
+    def test_world_cup_single_year_label_and_groups(self):
+        # #913 regression: the sid RESOLVE was single_year-aware but the row
+        # LABEL used _season_to_short(2026) → WC rows landed under '2627'.
+        # Both must be '2026'; group blocks must all survive.
+        # dags.utils.medallion_config resolves only under the container
+        # PYTHONPATH — stub it the way read_league_table imports it.
+        import sys
+        import types
+        stub = types.ModuleType('dags.utils.medallion_config')
+        stub.get_competition_season_format = lambda league, season: 'single_year'
+        modules = {
+            'dags': types.ModuleType('dags'),
+            'dags.utils': types.ModuleType('dags.utils'),
+            'dags.utils.medallion_config': stub,
+        }
+        from scrapers.sofascore.scraper import SofaScoreScraper
+        with patch('scrapers.base.base_scraper.get_rate_limiter'), \
+             patch('scrapers.base.base_scraper.get_retry_policy'), \
+             patch('scrapers.base.base_scraper.get_circuit_breaker'), \
+             patch('scrapers.base.base_scraper.IcebergWriter'):
+            scraper = SofaScoreScraper(leagues=['INT-World Cup'], seasons=[2026])
+        scraper._proxy_manager = None
+        buf = {
+            "/api/v1/unique-tournament/16/seasons": {
+                "status": 200, "challenge": False, "json": {"seasons": [
+                    {"year": "2026", "id": 58210},
+                    {"year": "2022", "id": 41087},
+                ]}},
+            "/api/v1/unique-tournament/16/season/58210/standings/total": {
+                "status": 200, "challenge": False, "json": {"standings": [
+                    {"type": "total", "name": "Group A", "rows": [
+                        self._row("Mexico", 3, 3, 0, 0, 6, 0, 9)]},
+                    {"type": "total", "name": "Group B", "rows": [
+                        self._row("Canada", 3, 2, 1, 0, 5, 1, 7)]},
+                ]}},
+        }
+        with patch.dict(sys.modules, modules), \
+             patch('scrapers.sofascore.camoufox_capture.SofascoreCamoufoxCapture',
+                   return_value=self._FakeCap(buf)):
+            df = scraper.read_league_table()
+
+        assert df is not None
+        assert set(df['season']) == {'2026'}          # NOT '2627'
+        assert set(df['league']) == {'INT-World Cup'}
+        assert sorted(df['team'].tolist()) == ['Canada', 'Mexico']
+        assert sorted(df['group'].tolist()) == ['Group A', 'Group B']
 
     @pytest.mark.unit
     def test_drops_next_season_when_page_rolled_over(self):

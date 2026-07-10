@@ -555,12 +555,14 @@ class TestOrphanAndCoverageGuards:
         assert ln.params["max_rows"] == int(0.03 * 145_000)
 
     def test_spadl_unknown_rate_capped(self):
-        """spadl_coverage_unknown_rate must cap at 40K rows (R3 baseline 17.5K
-        with headroom for 5-season backfill)."""
+        """spadl_coverage_unknown_rate is a table-wide absolute cap: ~40K
+        (≈5.75% of a ~700K league-season) × 12 league-season headroom
+        (9 EPL + WC-2026 live, #913). Per-season drift is guarded by
+        spadl_unknown_rate[season=...]."""
         checks = e3_dq.build_silver_e3_checks()
         unk = next(c for c in checks if c.name == "spadl_coverage_unknown_rate")
         assert unk.severity == "ERROR"
-        assert unk.params["max_rows"] == 40_000
+        assert unk.params["max_rows"] == 480_000
 
 
 # ===========================================================================

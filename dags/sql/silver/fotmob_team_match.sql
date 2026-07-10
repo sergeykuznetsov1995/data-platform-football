@@ -349,8 +349,12 @@ SELECT
 
     -- ===== Partition keys (season → slug to match other Silver team-match tables) =====
     u.league,
-    LPAD(CAST(MOD(u.season,     100) AS varchar), 2, '0')
-        || LPAD(CAST(MOD(u.season + 1, 100) AS varchar), 2, '0') AS season
+    -- #913 Phase 2
+    CASE WHEN u.league = 'INT-World Cup'
+         THEN LPAD(CAST(u.season AS varchar), 4, '0')
+         ELSE LPAD(CAST(MOD(u.season, 100) AS varchar), 2, '0')
+              || LPAD(CAST(MOD(u.season + 1, 100) AS varchar), 2, '0')
+    END AS season
 
 FROM unioned u
 LEFT JOIN team_xa xa

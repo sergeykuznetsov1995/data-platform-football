@@ -56,12 +56,20 @@ SELECT
     b.goal_diff,
     b.points,
 
+    -- group_id for WC (Фаза 4 #913). NULL for regular leagues.
+    -- "group" is a Trino reserved word — must stay quoted.
+    b."group"                                             AS group_id,
+
     -- ===== Lineage =====
     b._ingested_at AS _bronze_ingested_at,
 
     -- ===== Partition keys (season → slug to match other Silver tables) =====
     b.league,
-    LPAD(CAST(MOD(b.season,     100) AS varchar), 2, '0')
-        || LPAD(CAST(MOD(b.season + 1, 100) AS varchar), 2, '0') AS season
+    -- #913 Phase 2
+    CASE WHEN b.league = 'INT-World Cup'
+         THEN LPAD(CAST(b.season AS varchar), 4, '0')
+         ELSE LPAD(CAST(MOD(b.season, 100) AS varchar), 2, '0')
+              || LPAD(CAST(MOD(b.season + 1, 100) AS varchar), 2, '0')
+    END AS season
 
 FROM bronze_dedup b

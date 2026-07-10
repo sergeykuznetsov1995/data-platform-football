@@ -631,6 +631,34 @@ def main():
 
     leagues = [l.strip() for l in args.leagues.split(',')]
 
+    # #920 bridge: single_year tournaments must never inherit the club-formula
+    # season (July 2026 -> 2025). A 2025-labelled WC run both MISLABELS the
+    # partition and — because match saves replace by match_id — WIPES the
+    # correct 2026 partition. Substitute the active tournament year; a mixed
+    # club+WC call cannot carry two seasons, so WC is dropped with a warning
+    # (scrape it in a dedicated call), mirroring run_whoscored_scraper.
+    if 'INT-World Cup' in leagues:
+        from utils.medallion_config import get_active_season
+        _wc_season = get_active_season('INT-World Cup')
+        if len(leagues) > 1:
+            logger.warning(
+                "INT-World Cup dropped from mixed call (needs its own season; "
+                f"leagues={leagues}). Scrape it with --leagues 'INT-World Cup'.")
+            leagues = [l for l in leagues if l != 'INT-World Cup']
+        elif _wc_season is None:
+            logger.warning(
+                "INT-World Cup is out of its tournament window "
+                f"(competitions.yaml) — nothing to scrape; exiting 0.")
+            with open(args.output, 'w') as f:
+                json.dump({'mode': args.mode, 'tables': [], 'errors': [],
+                           'skipped': 'out_of_window'}, f)
+            return 0
+        elif int(args.season) != int(_wc_season):
+            logger.info(
+                f"INT-World Cup: overriding --season {args.season} -> "
+                f"{_wc_season} (active single_year season, #920 bridge).")
+            args.season = _wc_season
+
     logger.info(f"Starting FBref scraper: scraper_type={args.scraper_type}, mode={args.mode}")
     logger.info(f"Leagues: {leagues}, Season: {args.season}")
     logger.info(f"Proxy file: {args.proxy_file}")

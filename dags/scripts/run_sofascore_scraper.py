@@ -411,7 +411,7 @@ def _run_player_ratings(
     """R0.2b player-ratings entrypoint. Returns process exit code."""
     from scrapers.base.base_scraper import ReplaceGuardError
     from scrapers.sofascore import SofaScoreScraper
-    from scrapers.sofascore.scraper import R0_2B_FALLBACK_MARKER, _season_to_short
+    from scrapers.sofascore.scraper import R0_2B_FALLBACK_MARKER, _season_label
 
     league = leagues[0]  # ratings scrape is single-league per invocation
     # Schedule writer stores season as the soccerdata short form (e.g. "2526")
@@ -422,7 +422,7 @@ def _run_player_ratings(
     # short-form --season (e.g. 2122) the two diverged: resolve fetched the +1
     # season while the label stayed put, silently mislabelling the partition by
     # +1 (#888).
-    season_short = _season_to_short(season_str)
+    season_short = _season_label(league, season_str)
 
     logger.info(
         "R0.2b player_ratings: league=%s season=%s (short=%s) limit=%s",
@@ -600,7 +600,7 @@ def _run_match_capture(
     """
     from scrapers.base.base_scraper import ReplaceGuardError
     from scrapers.sofascore import SofaScoreScraper
-    from scrapers.sofascore.scraper import R0_2B_FALLBACK_MARKER, _season_to_short
+    from scrapers.sofascore.scraper import R0_2B_FALLBACK_MARKER, _season_label
 
     league = leagues[0]
     season_str = str(season)
@@ -610,7 +610,7 @@ def _run_match_capture(
     # short-form --season (e.g. 2122) the two diverged: resolve fetched the +1
     # season while the label stayed put, silently mislabelling the partition by
     # +1 (#888).
-    season_short = _season_to_short(season_str)
+    season_short = _season_label(league, season_str)
 
     logger.info(
         "match_capture: league=%s season=%s (short=%s) limit=%s",
@@ -910,7 +910,7 @@ def _run_player_capture(
     """
     from scrapers.base.base_scraper import ReplaceGuardError
     from scrapers.sofascore import SofaScoreScraper
-    from scrapers.sofascore.scraper import R0_2B_FALLBACK_MARKER, _season_to_short
+    from scrapers.sofascore.scraper import R0_2B_FALLBACK_MARKER, _season_label
 
     league = leagues[0]
     season_str = str(season)
@@ -920,7 +920,7 @@ def _run_player_capture(
     # short-form --season (e.g. 2122) the two diverged: resolve fetched the +1
     # season while the label stayed put, silently mislabelling the partition by
     # +1 (#888).
-    season_short = _season_to_short(season_str)
+    season_short = _season_label(league, season_str)
 
     logger.info(
         "player_capture: league=%s season=%s (short=%s) limit=%s",
@@ -1065,7 +1065,7 @@ def _run_event_endpoint(
     ``player_ids`` for event_player_stats).
     """
     from scrapers.sofascore import SofaScoreScraper
-    from scrapers.sofascore.scraper import R0_2B_FALLBACK_MARKER, _season_to_short
+    from scrapers.sofascore.scraper import R0_2B_FALLBACK_MARKER, _season_label
 
     league = leagues[0]
     season_str = str(season)
@@ -1075,7 +1075,7 @@ def _run_event_endpoint(
     # short-form --season (e.g. 2122) the two diverged: resolve fetched the +1
     # season while the label stayed put, silently mislabelling the partition by
     # +1 (#888).
-    season_short = _season_to_short(season_str)
+    season_short = _season_label(league, season_str)
 
     logger.info(
         "%s: league=%s season=%s (short=%s) limit=%s",
@@ -1492,6 +1492,32 @@ def main():
         leagues = [args.league]
     else:
         leagues = [l.strip() for l in args.leagues.split(',')]
+
+    # #920 bridge: single_year tournaments must never inherit the club-formula
+    # season (July 2026 -> 2025) — the sid resolve would no-op every daily run
+    # while the tournament is live. Mixed club+WC calls can't carry two
+    # seasons -> WC is dropped (dedicated call), as in the other runners.
+    if 'INT-World Cup' in leagues:
+        from utils.medallion_config import get_active_season
+        _wc_season = get_active_season('INT-World Cup')
+        if len(leagues) > 1:
+            logger.warning(
+                "INT-World Cup dropped from mixed call (needs its own season; "
+                "leagues=%s). Scrape it with --league 'INT-World Cup'.", leagues)
+            leagues = [l for l in leagues if l != 'INT-World Cup']
+        elif _wc_season is None:
+            logger.warning(
+                "INT-World Cup is out of its tournament window — nothing to "
+                "scrape; exiting 0.")
+            _write_results(args.output, {'entity': args.entity, 'tables': [],
+                                         'errors': [],
+                                         'skipped': 'out_of_window'})
+            return 0
+        elif int(args.season) != int(_wc_season):
+            logger.info(
+                "INT-World Cup: overriding --season %s -> %s (active "
+                "single_year season, #920 bridge).", args.season, _wc_season)
+            args.season = _wc_season
 
     entity = args.entity.lower()
     if entity not in VALID_ENTITIES and entity != 'all':

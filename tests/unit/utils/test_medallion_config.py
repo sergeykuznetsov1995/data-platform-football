@@ -279,12 +279,14 @@ def test_load_team_aliases_rejects_duplicate_canonical_id(tmp_path, monkeypatch)
         "    short_name: 'X'\n"
         "    aliases:\n"
         "      _generic: ['X']\n"
+        "    competition_scope: ['ENG-Premier League']\n"
         "  - canonical_name: 'Y'\n"
         "    canonical_id: 'x_fc'\n"
         "    country: 'England'\n"
         "    short_name: 'Y'\n"
         "    aliases:\n"
         "      _generic: ['Y']\n"
+        "    competition_scope: ['ENG-Premier League']\n"
     )
     (tmp_path / "competitions.yaml").write_text(_MOCK_COMPETITIONS)
     monkeypatch.setenv("MEDALLION_CONFIG_DIR", str(tmp_path))
@@ -527,7 +529,7 @@ def test_sql_values_raises_on_empty_result(mock_config_dir):
     # Filtering by an unknown source AND an unknown competition produces
     # zero rows — the loader refuses to emit invalid Trino syntax.
     with pytest.raises(mock_config_dir.MedallionConfigError, match="0 pairs"):
-        mock_config_dir.get_team_alias_sql_values(competition="EUR-Champions League")
+        mock_config_dir.get_team_alias_sql_values(competition="EUR-Champions League")  # unknown now that EUR fixed to UEFA; still 0 rows
 
 
 def test_sql_values_rejects_backslash_in_alias(tmp_path, monkeypatch):
@@ -655,6 +657,7 @@ def test_real_config_in_scope_is_top5(real_config_dir):
         "ITA-Serie A",
         "GER-Bundesliga",
         "FRA-Ligue 1",
+        "INT-World Cup",  # #913 Phase 2 (single_year)
     }
     for league in real_config_dir.get_in_scope_competitions():
         assert real_config_dir.get_competition_seasons(league), league
@@ -703,3 +706,88 @@ def test_real_config_savinho_alias_resolves(real_config_dir):
     assert real_config_dir.get_player_alias(
         "transfermarkt", "743591", "2526"
     ) == "fe6e7156"
+
+
+class TestGetActiveSingleYearSeason:
+    """#920 bridge: ingest runners substitute the tournament year for
+    single_year competitions while [start, end + grace] contains today."""
+
+    def _fn(self):
+        from utils.medallion_config import get_active_single_year_season
+        return get_active_single_year_season
+
+    def test_inside_window_returns_tournament_year(self):
+        import datetime
+        assert self._fn()(
+            'INT-World Cup', today=datetime.date(2026, 7, 10)) == 2026
+
+    def test_grace_after_final_keeps_window_open(self):
+        import datetime
+        assert self._fn()(
+            'INT-World Cup', today=datetime.date(2026, 7, 30)) == 2026
+
+    def test_out_of_window_returns_none(self):
+        import datetime
+        assert self._fn()(
+            'INT-World Cup', today=datetime.date(2026, 9, 1)) is None
+
+    def test_split_year_league_returns_none(self):
+        import datetime
+        assert self._fn()(
+            'ENG-Premier League', today=datetime.date(2026, 7, 10)) is None
+
+    def test_unknown_competition_returns_none(self):
+        import datetime
+        assert self._fn()('XX-Nope', today=datetime.date(2026, 7, 10)) is None
+
+
+class TestGetActiveSeason:
+    """#920 Phase 1: unified split_year/single_year season resolver used by
+    the ingest runners' bridge blocks (dags/scripts/run_*_scraper.py)."""
+
+    def _fn(self):
+        from utils.medallion_config import get_active_season
+        return get_active_season
+
+    def test_split_year_before_august_cutoff(self):
+        import datetime
+        # 2026-07-10 -> month < 8 -> still the 2025/26 club season.
+        assert self._fn()(
+            'ENG-Premier League', today=datetime.date(2026, 7, 10)) == 2025
+
+    def test_split_year_after_august_cutoff(self):
+        import datetime
+        # 2026-09-01 -> month >= 8 -> the 2026/27 club season has started.
+        assert self._fn()(
+            'ENG-Premier League', today=datetime.date(2026, 9, 1)) == 2026
+
+    def test_split_year_on_august_cutoff(self):
+        import datetime
+        assert self._fn()(
+            'ENG-Premier League', today=datetime.date(2026, 8, 1)) == 2026
+
+    def test_single_year_inside_window_returns_tournament_year(self):
+        import datetime
+        assert self._fn()(
+            'INT-World Cup', today=datetime.date(2026, 7, 10)) == 2026
+
+    def test_single_year_grace_boundary_last_day_included(self):
+        import datetime
+        # end=2026-07-19, grace=14d -> 2026-08-02 is the last in-window day.
+        assert self._fn()(
+            'INT-World Cup', today=datetime.date(2026, 8, 2)) == 2026
+
+    def test_single_year_grace_boundary_day_after_is_out(self):
+        import datetime
+        assert self._fn()(
+            'INT-World Cup', today=datetime.date(2026, 8, 3)) is None
+
+    def test_single_year_out_of_window_returns_none(self):
+        import datetime
+        assert self._fn()(
+            'INT-World Cup', today=datetime.date(2026, 9, 1)) is None
+
+    def test_unknown_competition_falls_back_to_club_formula(self):
+        import datetime
+        assert self._fn()(
+            'XX-Nope', today=datetime.date(2026, 7, 10)) == 2025

@@ -315,6 +315,40 @@ def main() -> int:
 
     leagues = [l.strip() for l in args.leagues.split(',') if l.strip()]
     seasons = _parse_seasons(args)
+
+    # #913 Phase 1: WhoScored (5th source). The DAG always passes multi-year
+    # SEASONS_STR. For INT-World Cup we must use single-year season ('2026')
+    # so that soccerdata and Bronze get the correct partition. soccerdata
+    # silently degrades when single-year and multi-year leagues share one
+    # reader (SeasonCode.from_leagues → UserWarning + wrong parse), and the
+    # old blanket `seasons = [2026]` override corrupted CLUB seasons in mixed
+    # calls — so in a mixed call WC is dropped (scrape it dedicated), and the
+    # single-year override applies only to the dedicated WC call.
+    if 'INT-World Cup' in leagues:
+        if len(leagues) > 1:
+            logger.warning(
+                "INT-World Cup requires a dedicated single-year call and is "
+                "DROPPED from this mixed run (soccerdata cannot mix single- "
+                f"and multi-year leagues in one reader): leagues={leagues}. "
+                "Scrape it separately with --leagues 'INT-World Cup'."
+            )
+            leagues = [l for l in leagues if l != 'INT-World Cup']
+        else:
+            # #920 bridge: the tournament year comes from competitions.yaml
+            # (was a 2026 hardcode); out of window the run is a clean no-op.
+            from utils.medallion_config import get_active_season
+            _wc_season = get_active_season('INT-World Cup')
+            if _wc_season is None:
+                logger.warning(
+                    "INT-World Cup is out of its tournament window — nothing "
+                    "to scrape; exiting 0.")
+                with open(args.output, 'w') as f:
+                    json.dump({'rows': 0, 'errors': [], 'tables': [],
+                               'tables_by_entity': {},
+                               'skipped': 'out_of_window'}, f)
+                return 0
+            seasons = [int(_wc_season)]
+
     logger.info(
         f"Starting WhoScored scraper: leagues={leagues}, seasons={seasons}, "
         f"skip_events={args.skip_events}, "

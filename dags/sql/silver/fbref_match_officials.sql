@@ -50,8 +50,12 @@ SELECT
     o.match_id,
     o.league,
     -- season → slug ('2526'); bronze fbref_match_officials is year-start bigint (#404).
-    LPAD(CAST(MOD(o.season,     100) AS varchar), 2, '0')
-        || LPAD(CAST(MOD(o.season + 1, 100) AS varchar), 2, '0') AS season,
+    -- #913 Phase 2
+    CASE WHEN o.league = 'INT-World Cup'
+         THEN LPAD(CAST(o.season AS varchar), 4, '0')
+         ELSE LPAD(CAST(MOD(o.season, 100) AS varchar), 2, '0')
+              || LPAD(CAST(MOD(o.season + 1, 100) AS varchar), 2, '0')
+    END AS season,
     r.role,
     r.official_name,
     o._ingested_at AS _bronze_ingested_at

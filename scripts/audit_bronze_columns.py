@@ -326,7 +326,7 @@ EXPECTED_TABLES: dict[str, dict[str, set[str]]] = {
         },
         'sofascore_league_table': {
             'league', 'season', 'team', 'mp', 'w', 'd', 'l',
-            'gf', 'ga', 'gd', 'pts', *META_COLS,
+            'gf', 'ga', 'gd', 'pts', 'group', *META_COLS,
         },
         'sofascore_player_ratings': {
             'league', 'season', 'match_id', 'player_id',
@@ -372,7 +372,7 @@ EXPECTED_TABLES: dict[str, dict[str, set[str]]] = {
         },
         'fotmob_team_stats': {
             'league', 'season', 'team_id', 'team_name',
-            'position', 'played', 'points', *META_COLS,
+            'position', 'played', 'points', 'group', *META_COLS,
         },
         'fotmob_player_stats': {
             'league', 'season', 'participant_id', 'participant_name', 'team_id',

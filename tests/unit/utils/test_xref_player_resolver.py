@@ -748,13 +748,21 @@ class TestSeasonHelpers:
     def test_split_seasons_slug_to_fbref(self):
         # YAML emits slugs like 2425 -> FBref year-of-start 2024 +
         # legacy varchar '2425' for Understat/WhoScored.
-        fbref, legacy = xpr._split_seasons([2425])
+        fbref, legacy = xpr._split_seasons("ENG-Premier League", [2425])
         assert fbref == [2024]
         assert legacy == ['2425']
 
-        fbref, legacy = xpr._split_seasons([2122, 2425, 2526])
+        fbref, legacy = xpr._split_seasons("ENG-Premier League", [2122, 2425, 2526])
         assert fbref == [2021, 2024, 2025]
         assert legacy == ['2122', '2425', '2526']
+
+    def test_single_year_wc_season_helpers_913(self):
+        # #913 Phase 2: single_year keeps literal 2026 for both fbref and slug.
+        assert xpr._slug_to_fbref_year(2026, league="INT-World Cup") == 2026
+        assert xpr._fbref_year_to_slug(2026, league="INT-World Cup") == "2026"
+        fbref, legacy = xpr._split_seasons("INT-World Cup", [2026])
+        assert fbref == [2026]
+        assert legacy == ["2026"]
 
     def test_seasons_in_clause_int(self):
         assert xpr._seasons_in_clause([2024]) == '2024'

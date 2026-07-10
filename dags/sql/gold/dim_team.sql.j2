@@ -2,24 +2,27 @@
 -- Gold: dim_team   (Jinja template — `.sql.j2`, rendered by dim_loaders.py)
 -- =============================================================================
 -- Canonical team dimension, aligned to the star-schema design (issue #425).
--- One row per CLUB — no league/season in the grain: which leagues/seasons a
--- team played is visible from fct_team_season_stats / fct_standings, not
--- from the dictionary (promotions/relegations are events, not attributes).
+-- One row per team (club or national) — no league/season in the grain.
+-- National teams (team_type='national') appear for INT- competitions such as
+-- INT-World Cup (#913 Phase 3); they use nt_* canonical_ids to avoid
+-- collision with clubs. Which leagues/seasons a team played is visible from
+-- fct_team_season_stats / fct_standings, not from the dictionary.
 --
 -- Hybrid build:
---   * row spine   — silver.xref_team (source='fbref'): a club exists in the
+--   * row spine   — silver.xref_team (source='fbref'): a team exists in the
 --     dim iff it was observed in the data; GROUP BY canonical_id collapses
 --     the per-(league, season) xref rows, so no (league, season) JOIN
 --     predicate is needed — the fan-out footgun does not apply here.
 --   * attributes  — configs/medallion/team_aliases.yaml via the
 --     {{ team_meta_values_sql }} placeholder
---     (medallion_config.get_team_meta_sql_values, issue #425): team_name =
---     canonical_name (Wikipedia convention), country, short_name.
+--     (medallion_config.get_team_meta_sql_values, issue #425 + #913 P3):
+--     team_name = canonical_name (Wikipedia convention), country, short_name,
+--     team_type ('club' | 'national').
 --
--- PK:           team_id  (canonical slug, e.g. 'manchester_united')
--- Partitioning: NONE  (≈34-row global dim — star design: dims unpartitioned)
+-- PK:           team_id  (canonical slug, e.g. 'manchester_united' or 'nt_england')
+-- Partitioning: NONE  (global dim — star design: dims unpartitioned)
 --
--- COALESCE fallback: a club observed in xref_team but missing from
+-- COALESCE fallback: a team observed in xref_team but missing from
 -- team_aliases.yaml keeps its xref display_name and NULL country/short_name
 -- (rows are never dropped — the config curates, it does not gate).
 -- =============================================================================
@@ -27,7 +30,7 @@
 WITH team_meta AS (
     SELECT * FROM (VALUES
         {{ team_meta_values_sql }}
-    ) AS t(team_id, team_name, country, short_name)
+    ) AS t(team_id, team_name, country, short_name, team_type)
 ),
 
 xref_clubs AS (
@@ -45,7 +48,8 @@ SELECT
     x.canonical_id                          AS team_id,
     COALESCE(m.team_name, x.display_name)   AS team_name,
     m.country,
-    m.short_name
+    m.short_name,
+    COALESCE(m.team_type, 'club')           AS team_type
 FROM xref_clubs x
 LEFT JOIN team_meta m
     ON m.team_id = x.canonical_id

@@ -216,6 +216,16 @@ def test_normalize_event_flattens_row():
         assert dead not in row
 
 
+def test_normalize_event_pins_season_year_to_str():
+    # #913: clubs carry season.year as '25/26' (str), single-year cups as an
+    # INT (2026) — bronze season_year is varchar; a mixed batch breaks the
+    # Arrow write (same class as the #840 match_stats home/away fix).
+    club = normalize_event({"id": 1, "season": {"year": "25/26"}})
+    cup = normalize_event({"id": 2, "season": {"year": 2026}})
+    assert club["season_year"] == "25/26"
+    assert cup["season_year"] == "2026"
+
+
 def test_normalize_event_missing_round_and_scores():
     # A not-started fixture: no roundInfo, scores absent → those columns absent
     # (#840: absent source key -> absent column, not a None placeholder).
@@ -845,7 +855,51 @@ def test_normalize_standing_flattens_real_liverpool_row():
     rows = extract_tournament_standings(_standings_buffer(), 17, 61627)
     assert normalize_standing(rows[0]) == {
         "team": "Liverpool FC", "mp": 38, "w": 25, "d": 9, "l": 4,
-        "gf": 86, "ga": 41, "gd": 45, "pts": 84}
+        "gf": 86, "ga": 41, "gd": 45, "pts": 84, "group": None}
+
+
+def _wc_group_standings_buffer(ut=16, sid=58210):
+    """A group tournament fires one 'total' block PER GROUP (#913)."""
+    def row(name, pts):
+        return {"team": {"name": name}, "matches": 3, "wins": pts // 3,
+                "draws": pts % 3, "losses": 3 - pts // 3 - pts % 3,
+                "scoresFor": 5, "scoresAgainst": 2, "points": pts}
+    return {
+        f"/api/v1/unique-tournament/{ut}/season/{sid}/standings/total": {
+            "status": 200, "challenge": False, "json": {"standings": [
+                {"type": "total", "name": "Group A",
+                 "rows": [row("Mexico", 9), row("South Africa", 4)]},
+                {"type": "total", "name": "Group B",
+                 "rows": [row("Canada", 7), row("Qatar", 1)]},
+            ]}},
+    }
+
+
+def test_extract_tournament_standings_collects_all_group_blocks():
+    # WC regression (#913): only Group A of 12 survived — the extractor took
+    # the FIRST 'total' block. All group blocks must be collected.
+    from scrapers.sofascore.camoufox_capture import extract_tournament_standings
+    rows = extract_tournament_standings(_wc_group_standings_buffer(), 16, 58210)
+    assert [r["team"]["name"] for r in rows] == [
+        "Mexico", "South Africa", "Canada", "Qatar"]
+    assert [r["group"] for r in rows] == [
+        "Group A", "Group A", "Group B", "Group B"]
+
+
+def test_normalize_standing_carries_group_from_block():
+    from scrapers.sofascore.camoufox_capture import (
+        extract_tournament_standings, normalize_standing)
+    rows = extract_tournament_standings(_wc_group_standings_buffer(), 16, 58210)
+    out = [normalize_standing(r) for r in rows]
+    assert out[0]["group"] == "Group A" and out[-1]["group"] == "Group B"
+
+
+def test_extract_tournament_standings_single_league_block_has_no_group():
+    # A club league (one 'total' block) must NOT get its block name as group.
+    from scrapers.sofascore.camoufox_capture import (
+        extract_tournament_standings, normalize_standing)
+    rows = extract_tournament_standings(_standings_buffer(), 17, 61627)
+    assert all(normalize_standing(r)["group"] is None for r in rows)
 
 
 def test_normalize_standing_invariants_hold_on_all_rows():

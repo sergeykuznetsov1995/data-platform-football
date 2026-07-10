@@ -156,8 +156,12 @@ SELECT
     -- ========= Partition Keys =========
     -- season → slug ('2425'); FotMob bronze stores year-start bigint (2024).
     d.league,
-    LPAD(CAST(MOD(d.season,     100) AS varchar), 2, '0')
-        || LPAD(CAST(MOD(d.season + 1, 100) AS varchar), 2, '0') AS season
+    -- #913 Phase 2
+    CASE WHEN d.league = 'INT-World Cup'
+         THEN LPAD(CAST(d.season AS varchar), 4, '0')
+         ELSE LPAD(CAST(MOD(d.season, 100) AS varchar), 2, '0')
+              || LPAD(CAST(MOD(d.season + 1, 100) AS varchar), 2, '0')
+    END AS season
 
 FROM details_dedup d
 LEFT JOIN stats_pivoted s
