@@ -6,23 +6,29 @@ Functions for building FBref URLs.
 """
 
 from scrapers.fbref.constants import BASE_URL, LEAGUE_IDS
+from scrapers.utils.competition_format import is_single_year
 
 
 def format_season(season: int, league: str = None) -> str:
     """
     Format season year to FBref format.
 
-    For INT-World Cup (single_year) use literal year '2026' (not '2026-2027').
-    Recon (#913 Phase 0) showed FBref single-year paths are /2026/ not /2026-2027/.
+    Single-year tournaments use the literal year '2026' (not '2026-2027') —
+    recon (#913 Phase 0) showed FBref single-year paths are /2026/. Driven
+    by competitions.yaml season_format instead of a hardcoded league name
+    (#920 Phase 3): the old literal silently sent every NEW tournament to
+    the club-formula page (wrong edition) — the bug class that destroyed WC
+    bronze on 2026-07-09.
 
     Args:
-        season: Season identifier (start year for clubs, literal year for WC)
+        season: Season identifier (start year for clubs, literal year for
+            tournaments)
         league: Optional league name to select formatting (single vs split)
 
     Returns:
         Formatted season string for URL path
     """
-    if league == 'INT-World Cup':
+    if league is not None and is_single_year(league, season):
         return str(season)
     return f"{season}-{season + 1}"
 

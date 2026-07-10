@@ -99,6 +99,27 @@ class TestIsSingleYearCompetition:
 
 
 @pytest.mark.unit
+class TestSeasonFormatConsumers:
+    """The two format_season implementations must follow season_format from
+    competitions.yaml, not a league-name literal (#920 Phase 3)."""
+
+    def test_fbref_format_season_single_year(self, reload_medallion):
+        reload_medallion(env=None)
+        from scrapers.fbref.url_builder import format_season
+        assert format_season(2026, 'INT-World Cup') == '2026'
+        assert format_season(2024, 'ENG-Premier League') == '2024-2025'
+        assert format_season(2024) == '2024-2025'   # no league -> club form
+
+    def test_fotmob_format_season_single_year(self, reload_medallion):
+        reload_medallion(env=None)
+        from scrapers.fotmob.scraper import FotMobScraper
+        s = FotMobScraper.__new__(FotMobScraper)   # no network in __init__ path
+        assert s._format_season(2026, 'INT-World Cup') == '2026'
+        assert s._format_season(2024, 'ENG-Premier League') == '2024/2025'
+        assert s._format_season(2024) == '2024/2025'
+
+
+@pytest.mark.unit
 class TestIsGroupKnockout:
     def test_wc_true(self, reload_medallion):
         reload_medallion(env=None)

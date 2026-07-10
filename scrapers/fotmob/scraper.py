@@ -28,6 +28,7 @@ import pandas as pd
 import requests
 
 from scrapers.base.base_scraper import BaseScraper
+from scrapers.utils.competition_format import is_group_knockout, is_single_year
 
 logger = logging.getLogger(__name__)
 
@@ -175,9 +176,13 @@ class FotMobScraper(BaseScraper):
     def _format_season(self, season: int, league: str = None) -> str:
         """Format season year to FotMob format.
 
-        For INT-World Cup (single-year) return '2026', not '2026/2027'.
+        Single-year tournaments use the literal year ('2026', not
+        '2026/2027'). Driven by competitions.yaml season_format instead of a
+        hardcoded league name (#920 Phase 3) — FotMob answers a club-formula
+        season request for a tournament with CURRENT tournament data,
+        silently mislabelling the partition (the 2026-07-09 incident).
         """
-        if league == 'INT-World Cup':
+        if league is not None and is_single_year(league, season):
             return str(season)
         return f"{season}/{season + 1}"
 
@@ -463,7 +468,10 @@ class FotMobScraper(BaseScraper):
                     'away_score': away_score,
                     'is_finished': status.get('finished', False),
                     'round': match.get('round') or match.get('roundName'),
-                    'round_name': (str(match.get('roundName')) if match.get('roundName') is not None else None) if league != 'INT-World Cup' else None,
+                    # group_knockout tournaments: roundName duplicates the
+                    # stage already carried by 'round' — keep it None
+                    # (#913 WC convention, generalized in #920 Phase 3).
+                    'round_name': (str(match.get('roundName')) if match.get('roundName') is not None else None) if not is_group_knockout(league) else None,
                 }
                 matches.append(match_info)
 
@@ -526,8 +534,9 @@ class FotMobScraper(BaseScraper):
                     standings = []
                     group_name = None
 
-                    # WC group tables support (Фаза 4 #913): table[0].data.tables -> Grp. A..L + Best 3rd
-                    if league == 'INT-World Cup':
+                    # Group-tournament tables (Фаза 4 #913, generalized #920
+                    # Phase 3): table[0].data.tables -> Grp. A.. + Best 3rd
+                    if is_group_knockout(league):
                         tables = table.get('data', {}).get('tables') or table.get('tables') or []
                         if isinstance(tables, list) and tables:
                             for tbl in tables:
@@ -561,8 +570,8 @@ class FotMobScraper(BaseScraper):
                             'group': team.get('_group') or team.get('group'),
                         }
                         teams.append(team_info)
-                    # ensure group key for non-WC path
-                    if league != 'INT-World Cup' and teams:
+                    # ensure group key for the non-tournament path
+                    if not is_group_knockout(league) and teams:
                         for ti in teams:
                             ti.setdefault('group', None)
 
