@@ -215,12 +215,15 @@ python dags/scripts/run_understat_scraper.py \\
 
     # Issue #466: hard Trino COUNT(*) floors — run even if the scrape task
     # failed (trigger_rule='all_done'), so an empty/wiped Bronze table can
-    # never pass silently.
+    # never pass silently. #920 Phase 2: floors are per league over the
+    # UNDERSTAT_LEAGUES scope (adding a league here requires backfilling it
+    # before the next scheduled run — the floor now fails loudly instead of
+    # the old silent whole-table gap).
     validate_bronze_tasks = [
         PythonOperator(
             task_id=f'validate_{table}',
             python_callable=validate_table,
-            op_args=[table, table],
+            op_args=[table, table, UNDERSTAT_LEAGUES],
             trigger_rule='all_done',
         )
         for table in UNDERSTAT_BRONZE_TABLES

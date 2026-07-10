@@ -18,6 +18,12 @@ LEAGUE_IDS = {
     'UEFA-Champions League': {'comp_id': '8', 'slug': 'Champions-League'},
     'UEFA-Europa League': {'comp_id': '19', 'slug': 'Europa-League'},
     'INT-World Cup': {'comp_id': '1', 'slug': 'World-Cup'},
+    # #920 Phase 3 — live-verified (docs/research/T0_tournaments_2027_2028_recon.md).
+    # NB AFCON: path-год URL = ОФИЦИАЛЬНЫЙ год розыгрыша (розыгрыш «2023»
+    # игрался в янв-2024, но живёт под /656/2023/) — сезонный ключ = path-год.
+    'INT-European Championship': {'comp_id': '676', 'slug': 'European-Championship'},
+    'INT-Africa Cup of Nations': {'comp_id': '656', 'slug': 'Africa-Cup-of-Nations'},
+    'INT-Copa America': {'comp_id': '685', 'slug': 'Copa-America'},
 }
 
 # Available stat types for players (outfield)

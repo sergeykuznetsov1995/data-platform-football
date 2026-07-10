@@ -26,7 +26,14 @@ from airflow.operators.bash import BashOperator
 from airflow.operators.python import PythonOperator
 
 from utils.bronze_validation import validate_table
-from utils.config import LEAGUES, SOFIFA_VERSIONS, SCHEDULES, DAG_TAGS
+from utils.config import (
+    LEAGUES,
+    NON_INTERNATIONAL_LEAGUES,
+    PER_LEAGUE_FLOOR_BASES,
+    SOFIFA_VERSIONS,
+    SCHEDULES,
+    DAG_TAGS,
+)
 from utils.default_args import WEEKLY_ARGS
 
 # Issue #466: every Bronze table this DAG writes gets a fail-closed Trino
@@ -229,12 +236,21 @@ python dags/scripts/run_sofifa_scraper.py \\
 
     # Issue #466: hard Trino COUNT(*) floors — run even if the scrape task
     # failed (trigger_rule='all_done'), so an empty/wiped Bronze table can
-    # never pass silently.
+    # never pass silently. #920 Phase 2: per-league floors over the club
+    # leagues (sofifa never covers INT-*); sofifa_versions and
+    # sofifa_player_ratings have no league column in bronze — they opt out
+    # of the per-league scope EXPLICITLY (validate_table refuses a silent
+    # whole-table downgrade for unregistered keys).
     validate_bronze_tasks = [
         PythonOperator(
             task_id=f'validate_{table}',
             python_callable=validate_table,
-            op_args=[table, table],
+            op_args=[
+                table,
+                table,
+                NON_INTERNATIONAL_LEAGUES
+                if table in PER_LEAGUE_FLOOR_BASES else None,
+            ],
             trigger_rule='all_done',
         )
         for table in SOFIFA_BRONZE_TABLES

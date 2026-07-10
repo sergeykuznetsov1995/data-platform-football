@@ -54,8 +54,15 @@ WHOSCORED_ARGS = {
 
 
 def validate_schedule(**context) -> Dict[str, Any]:
-    """Hard threshold check for whoscored_schedule (~1900 rows/league)."""
-    return validate_table('whoscored_schedule', 'whoscored_schedule')
+    """Hard threshold check for whoscored_schedule (~1900 rows/league).
+
+    #920 Phase 2: per-league floors — every league in WHOSCORED_LEAGUES must
+    individually clear its competitions.yaml-derived floor (a missing league
+    used to hide behind the whole-table aggregate).
+    """
+    return validate_table(
+        'whoscored_schedule', 'whoscored_schedule', leagues=WHOSCORED_LEAGUES
+    )
 
 
 def validate_events(**context) -> Dict[str, Any]:

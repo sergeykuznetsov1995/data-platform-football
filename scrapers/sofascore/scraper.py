@@ -52,6 +52,11 @@ SOFASCORE_TOURNAMENT_MAP: Dict[str, int] = {
     'ITA-Serie A': 23,
     'FRA-Ligue 1': 34,
     'INT-World Cup': 16,
+    # #920 Phase 3 — live-verified via /unique-tournament/{ut}/seasons
+    # (T0 recon). season_id по-прежнему резолвится в рантайме.
+    'INT-European Championship': 1,
+    'INT-Africa Cup of Nations': 270,
+    'INT-Copa America': 133,
 }
 
 # Canonical SofaScore league-page slug per soccerdata league key. The browser
@@ -65,6 +70,10 @@ SOFASCORE_TOURNAMENT_SLUG: Dict[str, str] = {
     'ITA-Serie A': 'football/italy/serie-a',
     'FRA-Ligue 1': 'football/france/ligue-1',
     'INT-World Cup': 'football/world/world-championship',
+    # #920 Phase 3 — nav-URL live-verified (SPA-редирект не-404, T0 recon).
+    'INT-European Championship': 'football/europe/european-championship',
+    'INT-Africa Cup of Nations': 'football/africa/africa-cup-of-nations',
+    'INT-Copa America': 'football/south-america/copa-america',
 }
 
 # R0.2b — graceful-fallback marker emitted when the lineups endpoint
@@ -98,13 +107,10 @@ def _season_to_short(season) -> str:
 
 def _is_single_year(league: str, season) -> bool:
     """True when (league, season) is a single_year competition per
-    ``competitions.yaml`` (INT-World Cup 2026, #913). False on any lookup
-    failure (medallion config unavailable outside the Airflow container)."""
-    try:
-        from dags.utils.medallion_config import get_competition_season_format
-        return get_competition_season_format(league, int(season)) == 'single_year'
-    except Exception:
-        return False
+    ``competitions.yaml`` (INT-World Cup 2026, #913). Delegates to the shared
+    scraper helper (#920 Phase 3 — one implementation for all scrapers)."""
+    from scrapers.utils.competition_format import is_single_year
+    return is_single_year(league, season)
 
 
 def _season_label(league: str, season) -> str:

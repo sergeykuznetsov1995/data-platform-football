@@ -791,3 +791,226 @@ class TestGetActiveSeason:
         import datetime
         assert self._fn()(
             'XX-Nope', today=datetime.date(2026, 7, 10)) == 2025
+
+
+# ---------------------------------------------------------------------------
+# get_competition_floor_basis — #920 Phase 2 (per-competition DQ floors)
+# ---------------------------------------------------------------------------
+
+_GK_SEASON = """\
+      - id: 2026
+        season_format: single_year
+        format: "group_knockout"
+        team_count: 48
+        match_count: 104
+        start: "2026-06-11"
+        end: "2026-07-19"
+"""
+
+
+def _write_competitions(tmp_path, monkeypatch, body: str):
+    """Point the loader at a tmp competitions.yaml with the given body."""
+    (tmp_path / "team_aliases.yaml").write_text(_MOCK_TEAM_ALIASES)
+    (tmp_path / "competitions.yaml").write_text(body)
+    monkeypatch.setenv("MEDALLION_CONFIG_DIR", str(tmp_path))
+
+    import importlib
+    from utils import medallion_config
+    importlib.reload(medallion_config)
+    medallion_config.reset_cache()
+    return medallion_config
+
+
+class TestGetCompetitionFloorBasis:
+    """#920 Phase 2: (match_count, team_count) basis for per-league floors."""
+
+    def test_club_league_derives_double_round_robin(self, mock_config_dir):
+        # 20 clubs -> 20*19 = 380 matches (no explicit match_count needed).
+        assert mock_config_dir.get_competition_floor_basis(
+            "ENG-Premier League") == (380, 20)
+
+    def test_min_over_seasons_protects_shrunk_league(
+            self, tmp_path, monkeypatch):
+        # FRA-Ligue 1 pattern: 20 clubs through 2223, 18 from 2324. The floor
+        # basis must take the smallest season so no configured season can
+        # false-fail.
+        mod = _write_competitions(tmp_path, monkeypatch, """\
+competitions:
+  - id: "FRA-Ligue 1"
+    name: "French Ligue 1"
+    country: "France"
+    tier: 1
+    seasons:
+      - id: 2223
+        format: "league_round_robin"
+        team_count: 20
+        start: "2022-08-05"
+        end: "2023-06-03"
+      - id: 2324
+        format: "league_round_robin"
+        team_count: 18
+        start: "2023-08-11"
+        end: "2024-06-02"
+    sources: {primary: [], fallback: []}
+    in_scope: true
+""")
+        assert mod.get_competition_floor_basis("FRA-Ligue 1") == (306, 18)
+
+    def test_group_knockout_uses_explicit_match_count(
+            self, tmp_path, monkeypatch):
+        mod = _write_competitions(tmp_path, monkeypatch, f"""\
+competitions:
+  - id: "INT-World Cup"
+    name: "FIFA World Cup"
+    country: "World"
+    tier: 1
+    competition_format: group_knockout
+    is_international: true
+    seasons:
+{_GK_SEASON}
+    sources: {{primary: [], fallback: []}}
+    in_scope: true
+""")
+        assert mod.get_competition_floor_basis("INT-World Cup") == (104, 48)
+
+    def test_stub_competition_raises(self, mock_config_dir):
+        with pytest.raises(
+                mock_config_dir.MedallionConfigError, match="no seasons"):
+            mock_config_dir.get_competition_floor_basis("ESP-La Liga")
+
+    def test_unknown_competition_raises(self, mock_config_dir):
+        with pytest.raises(
+                mock_config_dir.MedallionConfigError, match="not found"):
+            mock_config_dir.get_competition_floor_basis("XX-Nope")
+
+
+class TestCompetitionsSchemaFloorFields:
+    """#920 Phase 2: format/team_count/match_count enforced at load time."""
+
+    def _base(self, season_lines: str) -> str:
+        return f"""\
+competitions:
+  - id: "ENG-Premier League"
+    name: "English Premier League"
+    country: "England"
+    tier: 1
+    seasons:
+{season_lines}
+    sources: {{primary: [], fallback: []}}
+    in_scope: true
+"""
+
+    def test_season_missing_team_count_rejected(self, tmp_path, monkeypatch):
+        mod = _write_competitions(tmp_path, monkeypatch, self._base(
+            """\
+      - id: 2425
+        format: "league_round_robin"
+        start: "2024-08-16"
+        end: "2025-05-25"
+"""))
+        with pytest.raises(mod.MedallionConfigError, match="team_count"):
+            mod.load_competitions()
+
+    def test_season_bad_format_rejected(self, tmp_path, monkeypatch):
+        mod = _write_competitions(tmp_path, monkeypatch, self._base(
+            """\
+      - id: 2425
+        format: "swiss_system"
+        team_count: 20
+"""))
+        with pytest.raises(mod.MedallionConfigError, match="format"):
+            mod.load_competitions()
+
+    def test_group_knockout_without_match_count_rejected(
+            self, tmp_path, monkeypatch):
+        mod = _write_competitions(tmp_path, monkeypatch, self._base(
+            """\
+      - id: 2026
+        season_format: single_year
+        format: "group_knockout"
+        team_count: 48
+"""))
+        with pytest.raises(mod.MedallionConfigError, match="match_count"):
+            mod.load_competitions()
+
+    def test_bad_top_level_competition_format_rejected(
+            self, tmp_path, monkeypatch):
+        # A typo here would silently disable is_group_knockout() — group
+        # standings parsed by the club branch with no load-time signal.
+        mod = _write_competitions(tmp_path, monkeypatch, """\
+competitions:
+  - id: "INT-World Cup"
+    name: "FIFA World Cup"
+    country: "World"
+    tier: 1
+    competition_format: groupknockout
+    seasons: []
+    sources: {primary: [], fallback: []}
+    in_scope: false
+""")
+        with pytest.raises(mod.MedallionConfigError, match="competition_format"):
+            mod.load_competitions()
+
+    def test_gk_seasons_require_top_level_competition_format(
+            self, tmp_path, monkeypatch):
+        mod = _write_competitions(tmp_path, monkeypatch, f"""\
+competitions:
+  - id: "INT-World Cup"
+    name: "FIFA World Cup"
+    country: "World"
+    tier: 1
+    seasons:
+{_GK_SEASON}
+    sources: {{primary: [], fallback: []}}
+    in_scope: true
+""")
+        with pytest.raises(
+                mod.MedallionConfigError,
+                match="no top-level 'competition_format"):
+            mod.load_competitions()
+
+    def test_bool_team_count_rejected(self, tmp_path, monkeypatch):
+        # YAML `team_count: true` is an int subclass in Python — must not
+        # slip through the positive-int check.
+        mod = _write_competitions(tmp_path, monkeypatch, self._base(
+            """\
+      - id: 2425
+        format: "league_round_robin"
+        team_count: true
+"""))
+        with pytest.raises(mod.MedallionConfigError, match="team_count"):
+            mod.load_competitions()
+
+
+def test_real_config_onboarded_tournaments(real_config_dir):
+    # #920 Phase 3: Euro 2028 / AFCON 2027 onboarded with confirmed windows;
+    # Copa América 2028 deliberately dateless (host TBA) -> the window can
+    # never open by accident (out-of-window no-op is the safe state).
+    import datetime
+    assert real_config_dir.get_active_season(
+        'INT-European Championship', today=datetime.date(2028, 6, 15)) == 2028
+    assert real_config_dir.get_active_season(
+        'INT-European Championship', today=datetime.date(2026, 7, 10)) is None
+    assert real_config_dir.get_active_season(
+        'INT-Africa Cup of Nations', today=datetime.date(2027, 7, 1)) == 2027
+    assert real_config_dir.get_active_season(
+        'INT-Copa America', today=datetime.date(2028, 6, 15)) is None
+    # Phase 2 floors are derivable for the new blocks (match_count present).
+    assert real_config_dir.get_competition_floor_basis(
+        'INT-European Championship') == (51, 24)
+    assert real_config_dir.get_competition_floor_basis(
+        'INT-Africa Cup of Nations') == (52, 24)
+    assert real_config_dir.get_competition_floor_basis(
+        'INT-Copa America') == (32, 16)
+
+
+def test_real_config_floor_basis_smoke(real_config_dir):
+    # Shipped competitions.yaml: every in-scope competition must yield a
+    # positive floor basis (the validate tasks call this in prod).
+    for league in real_config_dir.get_in_scope_competitions():
+        matches, teams = real_config_dir.get_competition_floor_basis(league)
+        assert matches > 0 and teams > 0, league
+    assert real_config_dir.get_competition_floor_basis(
+        "INT-World Cup") == (104, 48)
+    assert real_config_dir.get_competition_floor_basis(
+        "GER-Bundesliga") == (306, 18)

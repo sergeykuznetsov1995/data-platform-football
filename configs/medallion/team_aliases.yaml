@@ -2485,7 +2485,7 @@ teams:
     aliases:
       _generic: ["Argentina"]
       fbref: ["Argentina", "ar Argentina"]
-    competition_scope: ["INT-World Cup"]
+    competition_scope: ["INT-World Cup", "INT-Copa America"]
 
   - canonical_name: "Brazil"
     canonical_id: "nt_brazil"
@@ -2495,7 +2495,7 @@ teams:
     aliases:
       _generic: ["Brazil"]
       fbref: ["Brazil", "br Brazil"]
-    competition_scope: ["INT-World Cup"]
+    competition_scope: ["INT-World Cup", "INT-Copa America"]
 
   - canonical_name: "England"
     canonical_id: "nt_england"
@@ -2505,7 +2505,7 @@ teams:
     aliases:
       _generic: ["England"]
       fbref: ["England", "eng England"]
-    competition_scope: ["INT-World Cup"]
+    competition_scope: ["INT-World Cup", "INT-European Championship"]
 
   - canonical_name: "France"
     canonical_id: "nt_france"
@@ -2515,7 +2515,7 @@ teams:
     aliases:
       _generic: ["France"]
       fbref: ["France", "fr France"]
-    competition_scope: ["INT-World Cup"]
+    competition_scope: ["INT-World Cup", "INT-European Championship"]
 
   - canonical_name: "Germany"
     canonical_id: "nt_germany"
@@ -2525,7 +2525,7 @@ teams:
     aliases:
       _generic: ["Germany"]
       fbref: ["Germany", "de Germany"]
-    competition_scope: ["INT-World Cup"]
+    competition_scope: ["INT-World Cup", "INT-European Championship"]
 
   - canonical_name: "Spain"
     canonical_id: "nt_spain"
@@ -2535,7 +2535,7 @@ teams:
     aliases:
       _generic: ["Spain"]
       fbref: ["Spain", "es Spain"]
-    competition_scope: ["INT-World Cup"]
+    competition_scope: ["INT-World Cup", "INT-European Championship"]
 
   - canonical_name: "Portugal"
     canonical_id: "nt_portugal"
@@ -2545,7 +2545,7 @@ teams:
     aliases:
       _generic: ["Portugal"]
       fbref: ["Portugal", "pt Portugal"]
-    competition_scope: ["INT-World Cup"]
+    competition_scope: ["INT-World Cup", "INT-European Championship"]
 
   # --- Remaining national teams for INT-World Cup (Фаза 4 #913). Total 48.
   # canonical_id convention: nt_<lower_snake>, team_type=national, competition_scope only WC.
@@ -2652,7 +2652,7 @@ teams:
     aliases:
       _generic: ["Algeria"]
       fbref: ["Algeria", "dz Algeria"]
-    competition_scope: ["INT-World Cup"]
+    competition_scope: ["INT-World Cup", "INT-Africa Cup of Nations"]
 
   - canonical_name: "Cabo Verde"
     canonical_id: "nt_cabo_verde"
@@ -2662,7 +2662,7 @@ teams:
     aliases:
       _generic: ["Cabo Verde", "Cape Verde"]
       fbref: ["Cabo Verde", "cv Cabo Verde"]
-    competition_scope: ["INT-World Cup"]
+    competition_scope: ["INT-World Cup", "INT-Africa Cup of Nations"]
 
   - canonical_name: "Congo DR"
     canonical_id: "nt_congo_dr"
@@ -2672,7 +2672,7 @@ teams:
     aliases:
       _generic: ["Congo DR", "DR Congo"]
       fbref: ["Congo DR", "cd Congo DR"]
-    competition_scope: ["INT-World Cup"]
+    competition_scope: ["INT-World Cup", "INT-Africa Cup of Nations"]
 
   - canonical_name: "Côte d'Ivoire"
     canonical_id: "nt_cote_divoire"
@@ -2682,7 +2682,7 @@ teams:
     aliases:
       _generic: ["Côte d'Ivoire", "Ivory Coast"]
       fbref: ["Côte d'Ivoire", "ci Côte d'Ivoire"]
-    competition_scope: ["INT-World Cup"]
+    competition_scope: ["INT-World Cup", "INT-Africa Cup of Nations"]
 
   - canonical_name: "Egypt"
     canonical_id: "nt_egypt"
@@ -2692,7 +2692,7 @@ teams:
     aliases:
       _generic: ["Egypt"]
       fbref: ["Egypt", "eg Egypt"]
-    competition_scope: ["INT-World Cup"]
+    competition_scope: ["INT-World Cup", "INT-Africa Cup of Nations"]
 
   - canonical_name: "Ghana"
     canonical_id: "nt_ghana"
@@ -2702,7 +2702,7 @@ teams:
     aliases:
       _generic: ["Ghana"]
       fbref: ["Ghana", "gh Ghana"]
-    competition_scope: ["INT-World Cup"]
+    competition_scope: ["INT-World Cup", "INT-Africa Cup of Nations"]
 
   - canonical_name: "Morocco"
     canonical_id: "nt_morocco"
@@ -2712,7 +2712,7 @@ teams:
     aliases:
       _generic: ["Morocco"]
       fbref: ["Morocco", "ma Morocco"]
-    competition_scope: ["INT-World Cup"]
+    competition_scope: ["INT-World Cup", "INT-Africa Cup of Nations"]
 
   - canonical_name: "Senegal"
     canonical_id: "nt_senegal"
@@ -2722,7 +2722,7 @@ teams:
     aliases:
       _generic: ["Senegal"]
       fbref: ["Senegal", "sn Senegal"]
-    competition_scope: ["INT-World Cup"]
+    competition_scope: ["INT-World Cup", "INT-Africa Cup of Nations"]
 
   - canonical_name: "South Africa"
     canonical_id: "nt_south_africa"
@@ -2732,7 +2732,7 @@ teams:
     aliases:
       _generic: ["South Africa"]
       fbref: ["South Africa", "za South Africa"]
-    competition_scope: ["INT-World Cup"]
+    competition_scope: ["INT-World Cup", "INT-Africa Cup of Nations"]
 
   - canonical_name: "Tunisia"
     canonical_id: "nt_tunisia"
@@ -2742,7 +2742,7 @@ teams:
     aliases:
       _generic: ["Tunisia"]
       fbref: ["Tunisia", "tn Tunisia"]
-    competition_scope: ["INT-World Cup"]
+    competition_scope: ["INT-World Cup", "INT-Africa Cup of Nations"]
 
   # CONCACAF additional (3)
   - canonical_name: "Curaçao"
@@ -2784,7 +2784,7 @@ teams:
     aliases:
       _generic: ["Colombia"]
       fbref: ["Colombia", "co Colombia"]
-    competition_scope: ["INT-World Cup"]
+    competition_scope: ["INT-World Cup", "INT-Copa America"]
 
   - canonical_name: "Ecuador"
     canonical_id: "nt_ecuador"
@@ -2794,7 +2794,7 @@ teams:
     aliases:
       _generic: ["Ecuador"]
       fbref: ["Ecuador", "ec Ecuador"]
-    competition_scope: ["INT-World Cup"]
+    competition_scope: ["INT-World Cup", "INT-Copa America"]
 
   - canonical_name: "Paraguay"
     canonical_id: "nt_paraguay"
@@ -2804,7 +2804,7 @@ teams:
     aliases:
       _generic: ["Paraguay"]
       fbref: ["Paraguay", "py Paraguay"]
-    competition_scope: ["INT-World Cup"]
+    competition_scope: ["INT-World Cup", "INT-Copa America"]
 
   - canonical_name: "Uruguay"
     canonical_id: "nt_uruguay"
@@ -2814,7 +2814,7 @@ teams:
     aliases:
       _generic: ["Uruguay"]
       fbref: ["Uruguay", "uy Uruguay"]
-    competition_scope: ["INT-World Cup"]
+    competition_scope: ["INT-World Cup", "INT-Copa America"]
 
   # OFC (1)
   - canonical_name: "New Zealand"
@@ -2836,7 +2836,7 @@ teams:
     aliases:
       _generic: ["Austria"]
       fbref: ["Austria", "at Austria"]
-    competition_scope: ["INT-World Cup"]
+    competition_scope: ["INT-World Cup", "INT-European Championship"]
 
   - canonical_name: "Belgium"
     canonical_id: "nt_belgium"
@@ -2846,7 +2846,7 @@ teams:
     aliases:
       _generic: ["Belgium"]
       fbref: ["Belgium", "be Belgium"]
-    competition_scope: ["INT-World Cup"]
+    competition_scope: ["INT-World Cup", "INT-European Championship"]
 
   - canonical_name: "Bosnia and Herzegovina"
     canonical_id: "nt_bosnia_and_herzegovina"
@@ -2856,7 +2856,7 @@ teams:
     aliases:
       _generic: ["Bosnia and Herzegovina", "Bosnia"]
       fbref: ["Bosnia and Herzegovina", "ba Bosnia–Herz"]
-    competition_scope: ["INT-World Cup"]
+    competition_scope: ["INT-World Cup", "INT-European Championship"]
 
   - canonical_name: "Croatia"
     canonical_id: "nt_croatia"
@@ -2866,7 +2866,7 @@ teams:
     aliases:
       _generic: ["Croatia"]
       fbref: ["Croatia", "hr Croatia"]
-    competition_scope: ["INT-World Cup"]
+    competition_scope: ["INT-World Cup", "INT-European Championship"]
 
   - canonical_name: "Czechia"
     canonical_id: "nt_czechia"
@@ -2876,7 +2876,7 @@ teams:
     aliases:
       _generic: ["Czechia", "Czech Republic"]
       fbref: ["Czechia", "cz Czechia"]
-    competition_scope: ["INT-World Cup"]
+    competition_scope: ["INT-World Cup", "INT-European Championship"]
 
   - canonical_name: "Netherlands"
     canonical_id: "nt_netherlands"
@@ -2886,7 +2886,7 @@ teams:
     aliases:
       _generic: ["Netherlands", "Holland"]
       fbref: ["Netherlands", "nl Netherlands"]
-    competition_scope: ["INT-World Cup"]
+    competition_scope: ["INT-World Cup", "INT-European Championship"]
 
   - canonical_name: "Norway"
     canonical_id: "nt_norway"
@@ -2896,7 +2896,7 @@ teams:
     aliases:
       _generic: ["Norway"]
       fbref: ["Norway", "no Norway"]
-    competition_scope: ["INT-World Cup"]
+    competition_scope: ["INT-World Cup", "INT-European Championship"]
 
   - canonical_name: "Scotland"
     canonical_id: "nt_scotland"
@@ -2906,7 +2906,7 @@ teams:
     aliases:
       _generic: ["Scotland"]
       fbref: ["Scotland", "sct Scotland"]
-    competition_scope: ["INT-World Cup"]
+    competition_scope: ["INT-World Cup", "INT-European Championship"]
 
   - canonical_name: "Sweden"
     canonical_id: "nt_sweden"
@@ -2916,7 +2916,7 @@ teams:
     aliases:
       _generic: ["Sweden"]
       fbref: ["Sweden", "se Sweden"]
-    competition_scope: ["INT-World Cup"]
+    competition_scope: ["INT-World Cup", "INT-European Championship"]
 
   - canonical_name: "Switzerland"
     canonical_id: "nt_switzerland"
@@ -2926,7 +2926,7 @@ teams:
     aliases:
       _generic: ["Switzerland"]
       fbref: ["Switzerland", "ch Switzerland"]
-    competition_scope: ["INT-World Cup"]
+    competition_scope: ["INT-World Cup", "INT-European Championship"]
 
   - canonical_name: "Türkiye"
     canonical_id: "nt_turkiye"
@@ -2936,8 +2936,114 @@ teams:
     aliases:
       _generic: ["Türkiye", "Turkey"]
       fbref: ["Türkiye", "tr Türkiye"]
-    competition_scope: ["INT-World Cup"]
+    competition_scope: ["INT-World Cup", "INT-European Championship"]
 
-# NOTE: 48 NT entries complete (Фаза 4 #913). Aliases seeded from FIFA names; enrich _generic/fbref/sofascore etc from live Bronze data as needed.
+  # ---------------------------------------------------------------------------
+  # #920 Phase 3 onboarding (Euro 2028 / AFCON 2027 / Copa América 2028).
+  # Existing WC-48 teams got their competition_scope extended by CONFEDERATION
+  # (UEFA -> Euro, CAF -> AFCON, CONMEBOL -> Copa): over-scoping is safe —
+  # scope only PERMITS xref matching (the alias JOIN is guarded by
+  # a.league = rt.league), while under-scoping is the silent-orphan bug class.
+  # Below: tournament hosts + the CONMEBOL teams missing from the WC-48 (all
+  # 10 CONMEBOL nations always play Copa). Full qualified fields = config
+  # followup after each draw (same process as WC alias enrichment).
+  # ---------------------------------------------------------------------------
+
+  # Euro 2028 co-hosts (England/Scotland already in WC-48, scope extended)
+  - canonical_name: "Wales"
+    canonical_id: "nt_wales"
+    country: "Wales"
+    short_name: "WAL"
+    team_type: "national"
+    aliases:
+      _generic: ["Wales"]
+      fbref: ["Wales", "wls Wales"]
+    competition_scope: ["INT-European Championship"]
+
+  - canonical_name: "Republic of Ireland"
+    canonical_id: "nt_republic_of_ireland"
+    country: "Republic of Ireland"
+    short_name: "IRL"
+    team_type: "national"
+    aliases:
+      _generic: ["Republic of Ireland", "Ireland"]
+      fbref: ["Republic of Ireland", "ie Republic of Ireland"]
+    competition_scope: ["INT-European Championship"]
+
+  # AFCON 2027 co-hosts (PAMOJA: Kenya/Uganda/Tanzania)
+  - canonical_name: "Kenya"
+    canonical_id: "nt_kenya"
+    country: "Kenya"
+    short_name: "KEN"
+    team_type: "national"
+    aliases:
+      _generic: ["Kenya"]
+      fbref: ["Kenya", "ke Kenya"]
+    competition_scope: ["INT-Africa Cup of Nations"]
+
+  - canonical_name: "Uganda"
+    canonical_id: "nt_uganda"
+    country: "Uganda"
+    short_name: "UGA"
+    team_type: "national"
+    aliases:
+      _generic: ["Uganda"]
+      fbref: ["Uganda", "ug Uganda"]
+    competition_scope: ["INT-Africa Cup of Nations"]
+
+  - canonical_name: "Tanzania"
+    canonical_id: "nt_tanzania"
+    country: "Tanzania"
+    short_name: "TAN"
+    team_type: "national"
+    aliases:
+      _generic: ["Tanzania"]
+      fbref: ["Tanzania", "tz Tanzania"]
+    competition_scope: ["INT-Africa Cup of Nations"]
+
+  # CONMEBOL completion for Copa América (the other 6 are WC-48, scope extended)
+  - canonical_name: "Chile"
+    canonical_id: "nt_chile"
+    country: "Chile"
+    short_name: "CHI"
+    team_type: "national"
+    aliases:
+      _generic: ["Chile"]
+      fbref: ["Chile", "cl Chile"]
+    competition_scope: ["INT-Copa America"]
+
+  - canonical_name: "Peru"
+    canonical_id: "nt_peru"
+    country: "Peru"
+    short_name: "PER"
+    team_type: "national"
+    aliases:
+      _generic: ["Peru"]
+      fbref: ["Peru", "pe Peru"]
+    competition_scope: ["INT-Copa America"]
+
+  - canonical_name: "Bolivia"
+    canonical_id: "nt_bolivia"
+    country: "Bolivia"
+    short_name: "BOL"
+    team_type: "national"
+    aliases:
+      _generic: ["Bolivia"]
+      fbref: ["Bolivia", "bo Bolivia"]
+    competition_scope: ["INT-Copa America"]
+
+  - canonical_name: "Venezuela"
+    canonical_id: "nt_venezuela"
+    country: "Venezuela"
+    short_name: "VEN"
+    team_type: "national"
+    aliases:
+      _generic: ["Venezuela"]
+      fbref: ["Venezuela", "ve Venezuela"]
+    competition_scope: ["INT-Copa America"]
+
+# NOTE: 48 NT entries complete (Фаза 4 #913) + 9 onboarded for Euro/AFCON/Copa
+# (#920 Phase 3). Aliases seeded from FIFA names; enrich _generic/fbref/sofascore
+# etc from live Bronze data as needed.
 # competition_scope mandatory (enforced in medallion_config validator).
 # team_type used by dim_team (already prepared).
