@@ -35,7 +35,7 @@ Tasks
     start_marker
         |
         v
-    pre_check_bronze         (verify bronze.{whoscored_events, understat_shots,
+    pre_check_bronze         (verify bronze.{whoscored_events_current, understat_shots,
                               espn_lineup} non-empty for the partition)
         |
         v
@@ -199,11 +199,11 @@ def _read_params(context: Dict[str, Any]) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 # The three Bronze tables we MUST verify before kicking off Silver/Gold.
-# whoscored_events is the load-bearing one (drives ~90% of fct_event volume);
+# whoscored_events_current is the load-bearing one (drives ~90% of fct_event volume);
 # the other two are checked but only WARNING — silver.espn_lineup / fct_shot
 # tolerate empty Bronze (rows simply absent, downstream not poisoned).
 _BRONZE_TABLES = [
-    ('iceberg.bronze.whoscored_events', 'ERROR'),
+    ('iceberg.bronze.whoscored_events_current', 'ERROR'),
     ('iceberg.bronze.understat_shots',  'WARNING'),
     ('iceberg.bronze.espn_lineup',      'WARNING'),
 ]
@@ -212,7 +212,7 @@ _BRONZE_TABLES = [
 def _pre_check_bronze(**context) -> Dict[str, Any]:
     """Verify the three Bronze tables have rows for the (season, league) tuple.
 
-    whoscored_events is required (ERROR if empty); the other two are
+    whoscored_events_current is required (ERROR if empty); the other two are
     checked but treated as WARNING — backfill can proceed with degraded
     coverage on understat / espn (matches production tolerance).
 
@@ -270,7 +270,7 @@ def _pre_check_bronze(**context) -> Dict[str, Any]:
 
 
 def _taxonomy_diff_check(**context) -> Dict[str, Any]:
-    """Assert ``DISTINCT type FROM bronze.whoscored_events`` ⊆ 39-mapping.
+    """Assert ``DISTINCT type FROM bronze.whoscored_events_current`` ⊆ 39-mapping.
 
     Wraps :func:`utils.e3_dq.taxonomy_diff_check` and lifts its CheckResult
     into an AirflowException on failure (so the DAG visibly fails before

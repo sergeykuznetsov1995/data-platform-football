@@ -36,7 +36,7 @@ Open TODOs (E1.5 cutover and beyond)
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List
+from typing import Any, List
 
 from utils.data_quality import (
     CHECK,
@@ -78,7 +78,7 @@ SPADL_ACTION_VERSION = 'v1'
 # ---------------------------------------------------------------------------
 # Source: docs/research/E3.5_inventory.md §3 (Bronze taxonomy audit, 2026-05-08).
 # Used by E3.5 backfill DAG: before processing a historical season we run
-# ``SELECT DISTINCT type FROM bronze.whoscored_events WHERE season=...`` and
+# ``SELECT DISTINCT type FROM bronze.whoscored_events_current WHERE season=...`` and
 # assert the result is a subset of this list. A drift (new type seen in a
 # historical season but not mapped in `whoscored_events_spadl.sql`) raises
 # ERROR — the SPADL CASE tree must be extended before backfill can proceed.
@@ -160,7 +160,7 @@ def taxonomy_diff_check(
     season: str,
     league: str = 'ENG-Premier League',
 ) -> CheckResult:
-    """Verify ``bronze.whoscored_events`` types ⊆ 39-mapping for one season.
+    """Verify ``bronze.whoscored_events_current`` types ⊆ 39-mapping for one season.
 
     Used by E3.5 backfill DAG before Silver materialisation. If a new
     WhoScored type appears (e.g. 2122 has a deprecated marker not seen in
@@ -172,11 +172,11 @@ def taxonomy_diff_check(
     Returns a single ERROR-severity :class:`CheckResult` ready to be
     appended to a ``RunReport`` from :mod:`utils.data_quality`.
     """
-    name = f"taxonomy_diff[bronze.whoscored_events season={season}]"
+    name = f"taxonomy_diff[bronze.whoscored_events_current season={season}]"
     safe_season = _safe_predicate_value(season)
     safe_league = _safe_predicate_value(league)
     sql = (
-        "SELECT DISTINCT type FROM iceberg.bronze.whoscored_events "
+        "SELECT DISTINCT type FROM iceberg.bronze.whoscored_events_current "
         f"WHERE season = '{safe_season}' AND league = '{safe_league}' "
         "AND type IS NOT NULL"
     )
@@ -199,7 +199,7 @@ def taxonomy_diff_check(
                 severity='ERROR',
                 passed=False,
                 details=(
-                    f"bronze.whoscored_events has 0 rows for "
+                    f"bronze.whoscored_events_current has 0 rows for "
                     f"season={season!r}, league={league!r} — cannot run "
                     f"taxonomy diff (Bronze likely not yet scraped)"
                 ),
@@ -272,8 +272,8 @@ def parity_check_event_counts_per_season(
     # events, not raw rows (same 17-col key as the spadl dedup window).
     sql = (
         "SELECT "
-        "  (SELECT COUNT(*) FROM (SELECT DISTINCT game_id, period, minute, second, expanded_minute, type, outcome_type, team_id, player_id, x, y, end_x, end_y, qualifiers, related_event_id, related_player_id, team "
-        f"   FROM iceberg.bronze.whoscored_events {where})) AS bronze_cnt, "
+        "  (SELECT COUNT(*) FROM (SELECT DISTINCT game_id, source_event_id, period, minute, second, expanded_minute, type, outcome_type, team_id, player_id, x, y, end_x, end_y, qualifiers, related_event_id, related_player_id, team "
+        f"   FROM iceberg.bronze.whoscored_events_current {where})) AS bronze_cnt, "
         f"  (SELECT COUNT(*) FROM iceberg.silver.whoscored_events_spadl {where}) AS silver_cnt, "
         f"  (SELECT COUNT(*) FROM iceberg.gold.fct_event {where}) AS gold_cnt"
     )
@@ -1334,8 +1334,8 @@ def parity_check_event_counts() -> CheckResult:
     # dedup deliberately.
     sql = (
         "SELECT "
-        "  (SELECT COUNT(*) FROM (SELECT DISTINCT game_id, period, minute, second, expanded_minute, type, outcome_type, team_id, player_id, x, y, end_x, end_y, qualifiers, related_event_id, related_player_id, team "
-        "   FROM iceberg.bronze.whoscored_events)) AS bronze_cnt, "
+        "  (SELECT COUNT(*) FROM (SELECT DISTINCT game_id, source_event_id, period, minute, second, expanded_minute, type, outcome_type, team_id, player_id, x, y, end_x, end_y, qualifiers, related_event_id, related_player_id, team "
+        "   FROM iceberg.bronze.whoscored_events_current)) AS bronze_cnt, "
         "  (SELECT COUNT(*) FROM iceberg.silver.whoscored_events_spadl) AS silver_cnt, "
         "  (SELECT COUNT(*) FROM iceberg.gold.fct_event) AS gold_cnt"
     )
@@ -1362,7 +1362,7 @@ def parity_check_event_counts() -> CheckResult:
                 severity='ERROR',
                 passed=False,
                 details=(
-                    "bronze.whoscored_events is empty — cannot compute parity "
+                    "bronze.whoscored_events_current is empty — cannot compute parity "
                     "(bronze_cnt=0, silver_cnt={}, gold_cnt={})".format(
                         silver_cnt, gold_cnt
                     )

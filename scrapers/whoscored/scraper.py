@@ -46,6 +46,12 @@ from scrapers.base.flaresolverr_client import (
 logger = logging.getLogger(__name__)
 
 
+class WhoScoredRetryableError(RuntimeError):
+    """The V2 service committed partial progress but has retryable gaps."""
+
+    retryable = True
+
+
 def _season_to_soccerdata_str(season) -> str:
     """Normalize a 4-digit season token to soccerdata's short 'YYZZ' form.
 
@@ -65,6 +71,22 @@ def _season_to_soccerdata_str(season) -> str:
     if s[2:] == "99":
         return "9900"
     return s[-2:] + f"{(int(s[-2:]) + 1) % 100:02d}"
+
+
+def _canonical_season_id(league: str, season) -> str:
+    """Return the Bronze season id for one concrete competition.
+
+    Calendar-year competitions must never pass through the split-year
+    converter.  Keeping the competition in this function's signature avoids
+    the old mixed-run bug where the presence of World Cup in ``leagues``
+    changed season handling for every other league in the same scraper.
+    """
+    token = str(season)
+    if league == "INT-World Cup":
+        if len(token) != 4 or not token.isdigit():
+            raise ValueError(f"Unrecognized calendar season token: {season!r}")
+        return token
+    return _season_to_soccerdata_str(season)
 
 
 class WhoScoredScraper(SoccerdataScraper):
@@ -115,6 +137,7 @@ class WhoScoredScraper(SoccerdataScraper):
         season: Optional[int] = None,
         headless: bool = True,
         flaresolverr_url: Optional[str] = None,
+        use_v2: bool = False,
         **kwargs,
     ) -> None:
         if seasons is None and season is not None:
@@ -123,7 +146,10 @@ class WhoScoredScraper(SoccerdataScraper):
 
         self.headless = headless
         self.flaresolverr_url = flaresolverr_url
+        self.use_v2 = bool(use_v2)
         self._reader = None
+        self._v2_service = None
+        self._last_v2_schedule_result = None
         # Tracks the currently-active proxy so record_result() can credit it.
         self._current_proxy_obj = None
         # FlareSolverr traffic-audit snapshot from the last scrape_events run
@@ -131,6 +157,51 @@ class WhoScoredScraper(SoccerdataScraper):
         self._last_events_traffic: Optional[dict] = None
 
     # ---------- Reader ----------
+
+    def _get_v2_service(self):
+        """Build the canonical V2 service lazily for exactly one scope."""
+        if self._v2_service is not None:
+            return self._v2_service
+        if len(self.leagues or []) != 1 or len(self.seasons or []) != 1:
+            raise ValueError(
+                "WhoScored V2 requires exactly one canonical competition-season scope"
+            )
+        from scrapers.whoscored.catalog import WhoScoredCatalog
+        from scrapers.whoscored.service import WhoScoredIngestService
+
+        catalog = WhoScoredCatalog.from_file()
+        resolved = catalog.resolve_scope(self.leagues[0], str(self.seasons[0]))
+        self._v2_service = WhoScoredIngestService(resolved, catalog=catalog)
+        return self._v2_service
+
+    @staticmethod
+    def _v2_result_mapping(result) -> Dict[str, object]:
+        if result.errors:
+            raise RuntimeError("; ".join(result.errors))
+        if result.retryable:
+            raise WhoScoredRetryableError(
+                f"{result.entity} retryable ids: {', '.join(result.retryable)}"
+            )
+        paths = {path.rsplit('.', 1)[-1]: path for path in result.tables}
+        entity_to_table = {
+            'schedule': 'whoscored_schedule',
+            'season_stages': 'whoscored_season_stages',
+            'missing_players': 'whoscored_missing_players',
+            'events': 'whoscored_events',
+            'lineups': 'whoscored_lineups',
+            'match_manifest': 'whoscored_match_ingest_manifest',
+            'player_profile': 'whoscored_player_profile_versions',
+            'profile_manifest': 'whoscored_profile_ingest_manifest',
+        }
+        mapped: Dict[str, object] = {}
+        for entity, rows in result.counts.items():
+            table_name = entity_to_table.get(entity)
+            table_path = paths.get(table_name) if table_name else None
+            mapped[entity] = {
+                'table': table_path,
+                'rows_written': int(rows),
+            }
+        return mapped
 
     def _get_reader(self):
         """Build the FlareSolverr-backed soccerdata WhoScored reader once.
@@ -236,22 +307,50 @@ class WhoScoredScraper(SoccerdataScraper):
 
     def scrape_schedule(self) -> Dict[str, str]:
         """Fixtures for all configured (league, season) pairs."""
+        if self.use_v2:
+            result = self._get_v2_service().sync_schedule()
+            self._last_v2_schedule_result = result
+            mapped = self._v2_result_mapping(result)
+            return {
+                key: value for key, value in mapped.items()
+                if key == 'schedule'
+            }
         logger.info("WhoScored: read_schedule()")
-        df = self._safe_call('read_schedule')
+        df = self._get_reader().read_schedule()
+        if df is None or df.empty:
+            raise RuntimeError("WhoScored schedule returned no rows")
         path = self._save(df, 'whoscored_schedule', 'schedule')
         return {'schedule': path} if path else {}
 
     def scrape_missing_players(self) -> Dict[str, str]:
         """Injuries / suspensions per match (pre-game)."""
+        if self.use_v2:
+            return self._v2_result_mapping(
+                self._get_v2_service().sync_previews()
+            )
         logger.info("WhoScored: read_missing_players()")
-        df = self._safe_call('read_missing_players')
+        df = self._get_reader().read_missing_players()
+        if df is None:
+            raise RuntimeError("WhoScored previews returned no dataset")
         path = self._save(df, 'whoscored_missing_players', 'missing_players')
         return {'missing_players': path} if path else {}
 
     def scrape_season_stages(self) -> Dict[str, str]:
         """Cup-vs-league stage metadata."""
+        if self.use_v2:
+            # sync_schedule commits stages and schedule from the same validated
+            # discovery snapshot.  Avoid a second network traversal.
+            if self._last_v2_schedule_result is None:
+                self._last_v2_schedule_result = self._get_v2_service().sync_schedule()
+            mapped = self._v2_result_mapping(self._last_v2_schedule_result)
+            return {
+                key: value for key, value in mapped.items()
+                if key == 'season_stages'
+            }
         logger.info("WhoScored: read_season_stages()")
-        df = self._safe_call('read_season_stages')
+        df = self._get_reader().read_season_stages()
+        if df is None or df.empty:
+            raise RuntimeError("WhoScored season stages returned no rows")
         path = self._save(df, 'whoscored_season_stages', 'season_stages')
         return {'season_stages': path} if path else {}
 
@@ -309,6 +408,14 @@ class WhoScoredScraper(SoccerdataScraper):
         ``bronze.whoscored_events``. Cross-source validation against the FotMob /
         SofaScore profiles lives in Silver (issue #12), not here.
         """
+        if self.use_v2:
+            if player_ids is not None:
+                raise ValueError(
+                    "V2 profiles are roster-driven; explicit player_ids are unsupported"
+                )
+            return self._v2_result_mapping(
+                self._get_v2_service().sync_profiles(limit=int(limit or 200))
+            )
         from scrapers.whoscored.player_profile_fetcher import (
             fetch_player_profile_html,
             parse_player_profile,
@@ -459,21 +566,26 @@ class WhoScoredScraper(SoccerdataScraper):
         from scrapers.base.trino_manager import TrinoTableManager
 
         leagues = list(self.leagues or [])
-        # #913: for INT-World Cup use literal year '2026' (single-year), do not convert to '2627'
-        if "INT-World Cup" in leagues:
-            season_strs = [str(s) for s in (self.seasons or [])]
-        else:
-            season_strs = [_season_to_soccerdata_str(s) for s in (self.seasons or [])]
-        if not leagues or not season_strs:
+        seasons = list(self.seasons or [])
+        if not leagues or not seasons:
             return []
 
-        leagues_in = ", ".join(f"'{l}'" for l in leagues)
-        seasons_in = ", ".join(f"'{s}'" for s in season_strs)
+        scope_filters = [
+            "(league = "
+            f"'{league.replace(chr(39), chr(39) * 2)}' AND season = "
+            f"'{_canonical_season_id(league, season)}')"
+            for league in leagues
+            for season in seasons
+        ]
         sql = (
             "SELECT game_id, league, season, game "
             "FROM iceberg.bronze.whoscored_schedule "
-            f"WHERE league IN ({leagues_in}) AND season IN ({seasons_in}) "
-            "AND game_id IS NOT NULL"
+            f"WHERE ({' OR '.join(scope_filters)}) "
+            "AND game_id IS NOT NULL "
+            "AND match_is_opta = TRUE "
+            "AND (status = 6 OR ("
+            "status = 1 AND home_score IS NOT NULL AND away_score IS NOT NULL "
+            "AND date <= CAST(CURRENT_TIMESTAMP - INTERVAL '3' HOUR AS TIMESTAMP)))"
         )
         mgr = TrinoTableManager()
         try:
@@ -521,6 +633,13 @@ class WhoScoredScraper(SoccerdataScraper):
                 re-appending events.
             max_matches: Optional cap (smoke / verification runs).
         """
+        if self.use_v2:
+            return self._v2_result_mapping(
+                self._get_v2_service().sync_matches(
+                    match_ids=match_ids,
+                    limit=max_matches,
+                )
+            )
         from scrapers.whoscored.events_fetcher import (
             fetch_match_events_via_flaresolverr,
             parse_matchcentre_to_events_df,
@@ -816,12 +935,21 @@ class WhoScoredScraper(SoccerdataScraper):
         MB, not the proxy MB itself — see
         ``docs/research/flaresolverr-proxy-traffic-audit.md``.
         """
+        v2_service = getattr(self, "_v2_service", None)
+        if v2_service is not None:
+            return v2_service.traffic_stats()
         events = self._last_events_traffic or {}
         schedule: dict = {}
         reader = self._reader
         if reader is not None and getattr(reader, "_fs_client", None) is not None:
             schedule = reader._fs_client.get_traffic_stats()
         return {"events": events, "schedule": schedule}
+
+    def close(self) -> None:
+        if self._v2_service is not None:
+            self._v2_service.close()
+            self._v2_service = None
+        self._close_reader()
 
     def _build_proxy_url(self) -> Optional[str]:
         """Convert ``self.proxy`` (``host:port:user:pass``) to an HTTP proxy URL."""
@@ -838,18 +966,21 @@ class WhoScoredScraper(SoccerdataScraper):
     ) -> set:
         """Query a bronze per-match table for already-saved game_ids."""
         from scrapers.base.trino_manager import TrinoTableManager
-        season_strs = [
-            _season_to_soccerdata_str(s) for s in (self.seasons or [])
-        ]
         leagues = list(self.leagues or [])
-        if not season_strs or not leagues:
+        seasons = list(self.seasons or [])
+        if not seasons or not leagues:
             return set()
-        leagues_in = ", ".join(f"'{l}'" for l in leagues)
-        seasons_in = ", ".join(f"'{s}'" for s in season_strs)
+        scope_filters = [
+            "(league = "
+            f"'{league.replace(chr(39), chr(39) * 2)}' AND season = "
+            f"'{_canonical_season_id(league, season)}')"
+            for league in leagues
+            for season in seasons
+        ]
         sql = (
             f"SELECT DISTINCT game_id "
             f"FROM iceberg.bronze.{table} "
-            f"WHERE league IN ({leagues_in}) AND season IN ({seasons_in})"
+            f"WHERE {' OR '.join(scope_filters)}"
         )
         mgr = TrinoTableManager()
         try:

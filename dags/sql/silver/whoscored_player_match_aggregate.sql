@@ -3,12 +3,13 @@
 -- =============================================================================
 --
 -- One row per (match_id, player_id, league, season) — aggregated WhoScored
--- event-level metrics from `bronze.whoscored_events` via `COUNT(*) FILTER`
+-- event-level metrics from `bronze.whoscored_events_current` via `COUNT(*) FILTER`
 -- per Opta `type`. Mirror of `silver.whoscored_player_season_aggregate`
 -- but at match-grain, so Gold `fct_player_match` can LEFT JOIN.
 --
 -- Sources:
---   bronze.whoscored_events            (Opta-typed JSON events, ~700K rows /
+--   bronze.whoscored_events_current    (latest successful manifest batch;
+--                                       Opta-typed JSON events, ~700K rows /
 --                                       APL season)
 --
 -- Notes:
@@ -32,7 +33,8 @@
 --   * Discipline (offsides): `type='OffsideGiven'` rows attribute to player.
 --   * No xG / xA / rating in WhoScored — those come from Understat /
 --     SofaScore at Gold layer via COALESCE.
---   * Per-event Bronze dedup: ROW_NUMBER on full natural key (game_id,
+--   * The current view hides partial/orphan batches. A defensive legacy dedup
+--     remains: ROW_NUMBER on the full natural key (game_id,
 --     period, minute, second, type, player_id, qualifiers) — same as
 --     whoscored_events_spadl. Without dedup re-scrapes would double-count.
 --   * (league, season) JOIN predicate against xref_player is mandatory
@@ -46,6 +48,7 @@ WITH events_dedup AS (
     FROM (
         SELECT
             game_id,
+            source_event_id,
             type,
             outcome_type,
             qualifiers,
@@ -56,11 +59,11 @@ WITH events_dedup AS (
             _ingested_at,
             ROW_NUMBER() OVER (
                 PARTITION BY
-                    game_id, period, minute, second, type,
+                    game_id, source_event_id, period, minute, second, type,
                     team_id, player_id, qualifiers
                 ORDER BY _ingested_at DESC
             ) AS rn
-        FROM iceberg.bronze.whoscored_events
+        FROM iceberg.bronze.whoscored_events_current
         WHERE player_id IS NOT NULL
     )
     WHERE rn = 1

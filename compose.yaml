@@ -37,6 +37,17 @@ x-airflow-common: &airflow-common
     S3_ACCESS_KEY: ${S3_ACCESS_KEY}
     S3_SECRET_KEY: ${S3_SECRET_KEY}
     FBREF_RAW_STORE_URI: s3://${ICEBERG_WAREHOUSE}/raw/fbref
+    WHOSCORED_RAW_STORE_URI: s3://${ICEBERG_WAREHOUSE}/raw/whoscored
+    WHOSCORED_RAW_S3_ENDPOINT: seaweedfs:8333
+    WHOSCORED_RAW_S3_SCHEME: http
+    # WhoScored V2 uses this endpoint only after two classified direct
+    # Cloudflare failures.  PROXY_FILTER_URL remains the legacy always-proxy
+    # toggle and is deliberately not reused here.
+    # The authenticated data plane is separate from the lease control plane.
+    # Keeping the fallback URL on 8900 makes a missing/malformed control-plane
+    # response fail closed instead of falling back to the legacy no-auth port.
+    WHOSCORED_PAID_PROXY_URL: ${WHOSCORED_PAID_PROXY_URL:-http://proxy_filter:8900}
+    WHOSCORED_PROXY_CONTROL_URL: ${WHOSCORED_PROXY_CONTROL_URL:-http://proxy_filter:8899}
     FBREF_RAW_S3_ENDPOINT: seaweedfs:8333
     FBREF_RAW_S3_SCHEME: http
     # Route FlareSolverr scrapers (WhoScored/SoFIFA) through the ad-tech filter (#652).
@@ -905,12 +916,26 @@ services:
       - --blocklist
       - /opt/airflow/configs/proxy_filter/blocklist.txt
       - --out
-      - /tmp/filter_bytes.json
+      - /opt/airflow/logs/proxy_filter/bytes.json
+      - --daily-budget-mb
+      - ${PROXY_FILTER_DAILY_BUDGET_MB:-100}
+      - --max-lease-mb
+      - ${PROXY_FILTER_MAX_LEASE_MB:-24}
     volumes:
       - ./scripts:/opt/airflow/scripts
       - ./scrapers:/opt/airflow/scrapers
       - ./proxys.txt:/opt/airflow/proxys.txt:ro
       - ./configs/proxy_filter:/opt/airflow/configs/proxy_filter:ro
+      # Mount the already writable Airflow log root. Mounting a missing host
+      # subdirectory directly makes Docker create it as root:root, while this
+      # image intentionally runs as the unprivileged airflow user.
+      - ./logs:/opt/airflow/logs
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://localhost:8899/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
     deploy:
       resources:
         limits:

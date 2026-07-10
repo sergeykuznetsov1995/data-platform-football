@@ -62,7 +62,7 @@ def _translate_trino_to_duckdb(sql: str) -> str:
     """Adapt the Silver SQL for execution on DuckDB.
 
     Adjustments:
-      * ``iceberg.bronze.whoscored_events`` → ``bronze_whoscored_events``
+      * ``iceberg.bronze.whoscored_events_current`` → fixture table
         (single-namespace table seeded by the fixture).
       * ``regexp_like(<col>, <pat>)`` → ``regexp_matches(<col>, <pat>)`` —
         DuckDB's idiomatic spelling. Both treat the second argument as a
@@ -72,7 +72,7 @@ def _translate_trino_to_duckdb(sql: str) -> str:
     """
     # 1. Source table reference.
     sql = sql.replace(
-        "iceberg.bronze.whoscored_events",
+        "iceberg.bronze.whoscored_events_current",
         "bronze_whoscored_events",
     )
 
@@ -92,9 +92,9 @@ def _read_sql() -> str:
 
 
 # Bronze schema mirrors the columns the Silver SELECT consumes from
-# ``iceberg.bronze.whoscored_events`` (per file header L189-L216).
+# ``iceberg.bronze.whoscored_events_current`` (per the Silver SELECT contract).
 _BRONZE_COLUMNS: List[str] = [
-    "game_id", "period", "minute", "second", "expanded_minute",
+    "game_id", "source_event_id", "period", "minute", "second", "expanded_minute",
     "type", "outcome_type", "team_id", "player_id",
     "x", "y", "end_x", "end_y",
     "qualifiers", "related_event_id", "related_player_id", "team",
@@ -105,6 +105,7 @@ _BRONZE_COLUMNS: List[str] = [
 def _row(
     *,
     game_id: int = 100,
+    source_event_id: Optional[int] = None,
     period: str = "FirstHalf",
     minute: int = 5,
     second: int = 12,
@@ -128,6 +129,7 @@ def _row(
     """Build a single bronze fixture row with sensible defaults."""
     return {
         "game_id": game_id,
+        "source_event_id": source_event_id,
         "period": period,
         "minute": minute,
         "second": second,
@@ -178,6 +180,7 @@ def _seed_and_run(con, fixture_rows: List[Dict[str, Any]]) -> List[Dict[str, Any
         """
         CREATE TABLE bronze_whoscored_events (
             game_id           BIGINT,
+            source_event_id    BIGINT,
             period            VARCHAR,
             minute            BIGINT,
             second            BIGINT,
@@ -550,7 +553,15 @@ class TestSchemaVersionLiterals:
 
 
 class TestSyntheticEventId:
-    """event_id = game_id || '_' || LPAD(event_seq, 5, '0') is unique per game."""
+    """V2 uses source IDs; migrated legacy rows retain synthetic sequence IDs."""
+
+    def test_source_event_id_is_preferred(self, duck_conn):
+        out = _seed_and_run(duck_conn, [
+            _row(game_id=200, source_event_id=98765, related_event_id=98764),
+        ])
+        assert out[0]["event_id"] == "ws:200:98765"
+        assert out[0]["source_event_id_raw"] == "98765"
+        assert out[0]["related_event_id_raw"] == "98764"
 
     def test_event_id_format(self, duck_conn):
         out = _seed_and_run(duck_conn, [

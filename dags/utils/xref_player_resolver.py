@@ -895,7 +895,7 @@ def _execute(conn, sql: str, fetch: bool = False):
 # 2024-25 (see docs/research/R2_player_resolver.md). Bronze schemas:
 #   * fbref_player_stats     -> player_id, player, squad, season(int), league
 #   * understat_players      -> player_id, player, team, season(varchar), league
-#   * whoscored_events       -> player_id, player, team, season(varchar), league
+#   * whoscored_events_current -> player_id, player, team, season(varchar), league
 # (squad/team naming difference is REAL — FBref calls it "squad").
 # Re-discovered column names would be a regression so they are pinned here.
 
@@ -1023,7 +1023,7 @@ def _fetch_whoscored_players(
 ) -> List[Dict[str, Any]]:
     # COUNT(DISTINCT game_id) is the games-played proxy used as the dedup
     # tiebreaker in _dedup_canonical_per_season (issue #70). WhoScored is
-    # event-grain; no native minutes column on bronze.whoscored_events.
+    # event-grain; no native minutes column on the Bronze current view.
     sql = f"""
         SELECT CAST(CAST(player_id AS bigint) AS varchar) AS pid,
                MAX(player) AS player,
@@ -1031,7 +1031,7 @@ def _fetch_whoscored_players(
                league,
                season,
                CAST(COUNT(DISTINCT CAST(game_id AS bigint)) AS DOUBLE) AS bronze_signal
-        FROM iceberg.bronze.whoscored_events
+        FROM iceberg.bronze.whoscored_events_current
         WHERE league = '{_sql_escape(league)}'
           AND season IN ({_seasons_in_clause(source_seasons)})
           AND player_id IS NOT NULL
@@ -1531,7 +1531,7 @@ def _fetch_dob_maps(
             WHERE league = '{lg}' AND player_id IS NOT NULL
             GROUP BY CAST(player_id AS varchar)
         """,
-        'sofascore': f"""
+        'sofascore': """
             SELECT CAST(player_id AS varchar),
                    max_by(TRY_CAST(date_of_birth AS DATE), _ingested_at)
             FROM iceberg.bronze.sofascore_player_profile
@@ -1549,7 +1549,7 @@ def _fetch_dob_maps(
         # proven in gold/dim_player.sql.j2 (#584). No league column filter:
         # ratings are keyed (player_id, fifa_edition) and the map is only
         # consulted for anchors already scoped to this league.
-        'sofifa': f"""
+        'sofifa': """
             SELECT CAST(player_id AS varchar),
                    max_by(TRY(CAST(date_parse(dob, '%b %e, %Y') AS DATE)),
                           _ingested_at)
@@ -1557,15 +1557,14 @@ def _fetch_dob_maps(
             WHERE player_id IS NOT NULL AND dob IS NOT NULL
             GROUP BY CAST(player_id AS varchar)
         """,
-        # whoscored_player_profile.date_of_birth is normalised to ISO by the
-        # scraper. player_id cast mirrors _fetch_whoscored_players so map
-        # keys line up with anchor source_ids.
-        'whoscored': f"""
-            SELECT CAST(CAST(player_id AS bigint) AS varchar),
-                   max_by(TRY_CAST(date_of_birth AS DATE), _ingested_at)
-            FROM iceberg.bronze.whoscored_player_profile
+        # WhoScored V2 profiles are global/versioned; the current view exposes
+        # only the latest successfully manifested version per source player.
+        'whoscored': """
+            SELECT CAST(player_id AS varchar),
+                   max_by(date_of_birth, fetched_at)
+            FROM iceberg.silver.whoscored_player_profile_current
             WHERE player_id IS NOT NULL
-            GROUP BY CAST(CAST(player_id AS bigint) AS varchar)
+            GROUP BY CAST(player_id AS varchar)
         """,
     }
     maps = {src: _fetch_dob_map(conn, sql, src) for src, sql in queries.items()}

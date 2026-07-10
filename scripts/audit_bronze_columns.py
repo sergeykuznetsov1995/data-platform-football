@@ -285,13 +285,14 @@ EXPECTED_TABLES: dict[str, dict[str, set[str]]] = {
         },
     },
     'whoscored': {
-        # soccerdata WhoScored reader + FlareSolverr events fetcher. 4 tables,
-        # all partitioned ['league', 'season']. Minimal required = identity keys +
+        # WhoScored v2 schedule/parser/repository contract. Events and lineups
+        # are committed through whoscored_match_ingest_manifest; only successful
+        # batches are exposed through the *_current views consumed downstream.
+        # Match tables are partitioned by ['league', 'season']. Minimal required = identity keys +
         # core + META_COLS; extra live cols are NOT errors; EXPECTED_NULL cols
         # (extratime/penalty/stage/bets on schedule; event-conditional on events)
-        # are excluded here. Verified vs live bronze 2026-06-04 (#278): all 4
-        # tables materialise (schedule 2280, events 709937, missing_players 21874,
-        # season_stages 6 rows) — 0 missing tables/columns.
+        # are excluded here. The v2 payload/manifest additions are mandatory
+        # before the new ingestion DAG is enabled.
         'whoscored_schedule': {
             'league', 'season', 'game', 'game_id', 'date',
             'home_team', 'away_team', 'home_team_id', 'away_team_id',
@@ -300,7 +301,19 @@ EXPECTED_TABLES: dict[str, dict[str, set[str]]] = {
         'whoscored_events': {
             'league', 'season', 'game', 'game_id', 'minute', 'second', 'period',
             'type', 'outcome_type', 'team', 'team_id', 'player', 'player_id',
-            'x', 'y', *META_COLS,
+            'source_event_id', 'x', 'y', '_game_batch_id', '_payload_sha256',
+            '_parser_version', *META_COLS,
+        },
+        'whoscored_lineups': {
+            'league', 'season', 'game', 'game_id', 'team', 'team_id',
+            'player', 'player_id', 'is_starter', 'position', 'shirt_no',
+            '_game_batch_id', '_payload_sha256', '_parser_version', *META_COLS,
+        },
+        'whoscored_match_ingest_manifest': {
+            'league', 'season', 'game_id', 'batch_id', 'payload_sha256',
+            'raw_uri', 'parser_version', 'state', 'events_count',
+            'lineups_count', 'lineups_available', 'transport_mode',
+            'proxy_mode', 'direct_bytes', 'paid_bytes', *META_COLS,
         },
         'whoscored_missing_players': {
             'league', 'season', 'game', 'game_id', 'team',
@@ -820,7 +833,6 @@ SEV_ORDER = {'ERROR': 0, 'WARN': 1, 'INFO': 2}
 
 def render_report(per_table: dict[str, tuple[int, list[dict]]], output: Path) -> None:
     total_tables = len(per_table)
-    total_cols_scanned = sum(len(set(f['col'] for f in fs)) for _, fs in per_table.values())
     err_findings = [f for _, fs in per_table.values() for f in fs if f['sev'] == 'ERROR']
     warn_findings = [f for _, fs in per_table.values() for f in fs if f['sev'] == 'WARN']
     info_findings = [f for _, fs in per_table.values() for f in fs if f['sev'] == 'INFO']

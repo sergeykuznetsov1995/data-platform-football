@@ -56,7 +56,8 @@ Upstream dependencies
 ---------------------
 * Silver: ``silver.xref_match``, ``silver.xref_team``, ``silver.xref_player``
   (built by ``dag_transform_xref``).
-* Bronze: ``bronze.whoscored_events``, ``bronze.understat_shot_events``,
+* Bronze: ``bronze.whoscored_events_current``, ``bronze.whoscored_lineups_current``,
+  ``bronze.understat_shot_events``,
   ``bronze.espn_lineup``, ``bronze.fbref_match_lineups`` (ingested by the
   per-source ingest DAGs).
 
@@ -121,10 +122,8 @@ SILVER_E3_TRANSFORMS = [
         'whoscored_events_spadl',
     ),
     (
-        # issue #693: per-(match, player) lineup INFERRED from bronze.whoscored_events
-        # (appeared & not subbed-on ⇒ starter) + whoscored_schedule team-name bridge.
-        # Feeds the WhoScored branch of gold.fct_lineup (player_id + is_starter only;
-        # position/captain/jersey NULL — WhoScored events have no lineup block).
+        # Real per-(match, player) lineup from the latest successful WhoScored
+        # match batch; includes unused substitutes, position and jersey number.
         'whoscored_lineup',
         'dags/sql/silver/whoscored_lineup.sql',
         'whoscored_lineup',
@@ -155,7 +154,7 @@ SILVER_E3_TRANSFORMS = [
     ),
     (
         # issue #46: per-(canonical_id, match_id, league, season) WhoScored
-        # match-level aggregate. Aggregates bronze.whoscored_events by
+        # match-level aggregate. Aggregates bronze.whoscored_events_current by
         # (game_id, player_id) — shots/passes/tackles/interceptions/fouls/
         # duels/dribbles via COUNT FILTER. Feeds the WhoScored block of
         # gold.fct_player_match. MUST run after dag_transform_xref (joins
