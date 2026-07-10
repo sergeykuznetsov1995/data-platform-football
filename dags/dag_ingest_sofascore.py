@@ -38,7 +38,13 @@ from airflow.models.param import Param
 from airflow.operators.bash import BashOperator
 from airflow.operators.python import PythonOperator, ShortCircuitOperator
 
-from utils.config import LEAGUES, CURRENT_SEASON, SCHEDULES, DAG_TAGS
+from utils.config import (
+    LEAGUES,
+    CURRENT_SEASON,
+    SCHEDULES,
+    DAG_TAGS,
+    scale_floor_for_league as _scale,
+)
 from utils.default_args import SCRAPER_ARGS
 from utils.ingest_helpers import league_slug as _league_slug
 from utils.ingest_helpers import load_result as _load_result
@@ -85,6 +91,38 @@ PLAYER_CAPTURE_LIMIT = _env_int('SS_PLAYER_CAPTURE_LIMIT')
 
 def _limit_arg(limit) -> str:
     return f"--limit {int(limit)}" if limit else ""
+
+
+# #920 Phase 2: validate_data floors derived from the same calibrated bases
+# as utils.config.PER_LEAGUE_FLOOR_BASES instead of inline literals. Keys are
+# the run-JSON summary fields (this validator reads the current run's output,
+# not Trino — see validate_bronze_freshness for the staleness guard).
+# unit 'match' scales with the competition's scheduled match count, 'team'
+# with team_count. WARN-only semantics unchanged.
+_SS_FLOOR_BASES: Dict[str, tuple] = {
+    'schedule_rows': ('match', 100),
+    'league_table_rows': ('team', 10),
+    'player_ratings_rows': ('match', 300),
+    'shotmap_rows': ('match', 300),
+    'event_player_stats_rows': ('match', 10_000),
+    'match_stats_rows': ('match', 10_000),
+    'venue_rows': ('match', 300),
+}
+
+
+def _summed_club_floors() -> Dict[str, int]:
+    """WARN floors for the club batch, summed over CLUB_LEAGUES.
+
+    The club JSON is batch-granular (one result file for the whole batch), so
+    per-league resolution inside it is impossible without a runner refactor —
+    the sum is the honest floor. For the current CLUB_LEAGUES ==
+    ['ENG-Premier League'] every value equals the historical literal exactly
+    (100 / 10 / 300 / 300 / 10000 / 10000 / 300).
+    """
+    return {
+        k: sum(_scale(u, b, lg) for lg in CLUB_LEAGUES)
+        for k, (u, b) in _SS_FLOOR_BASES.items()
+    }
 
 
 def _capture_noop(capture_result: Dict[str, Any]) -> bool:
@@ -171,11 +209,13 @@ def validate_data(**context) -> Dict[str, Any]:
         ])
         validation['status'] = 'partial_success' if total_rows > 0 else 'failed'
 
-    # Minimum thresholds
-    if validation['summary']['schedule_rows'] < 100:
+    # Minimum thresholds (#920 Phase 2: derived per competitions.yaml volumes,
+    # not APL literals — see _SS_FLOOR_BASES).
+    floors = _summed_club_floors()
+    if validation['summary']['schedule_rows'] < floors['schedule_rows']:
         validation['warnings'].append("Low schedule row count - possible scraping issue")
 
-    if validation['summary']['league_table_rows'] < 10:
+    if validation['summary']['league_table_rows'] < floors['league_table_rows']:
         validation['warnings'].append("Low league_table row count - possible scraping issue")
 
     # #842 incremental match_capture: a clean run that skipped every resolved
@@ -191,9 +231,13 @@ def validate_data(**context) -> Dict[str, Any]:
             validation['summary']['matches_total'],
         )
 
-    # APL has ~300 matches/season; ratings emit ~25K rows. Anything < 300 rows
-    # means we scraped at most a handful of matches → DAG defect or hard CF block.
-    if not capture_noop and validation['summary']['player_ratings_rows'] < 300:
+    # APL has ~300 matches/season; ratings emit ~25K rows. A count below the
+    # floor means we scraped at most a handful of matches → DAG defect or
+    # hard CF block.
+    if not capture_noop and (
+        validation['summary']['player_ratings_rows']
+        < floors['player_ratings_rows']
+    ):
         if validation['summary']['player_ratings_fallback']:
             validation['warnings'].append(
                 f"player_ratings R0.2B_FALLBACK: rows="
@@ -207,12 +251,15 @@ def validate_data(**context) -> Dict[str, Any]:
         else:
             validation['warnings'].append(
                 f"Low player_ratings row count: "
-                f"{validation['summary']['player_ratings_rows']} < 300"
+                f"{validation['summary']['player_ratings_rows']} "
+                f"< {floors['player_ratings_rows']}"
             )
 
     # Shotmap: full APL season ≈ 380 matches × ~25 shots/match ≈ 9.5K rows.
-    # WARN-only threshold = 300 (issue #69; covers first few gameweeks too).
-    if not capture_noop and validation['summary']['shotmap_rows'] < 300:
+    # WARN-only floor (issue #69; covers first few gameweeks too).
+    if not capture_noop and (
+        validation['summary']['shotmap_rows'] < floors['shotmap_rows']
+    ):
         if validation['summary']['shotmap_fallback']:
             validation['warnings'].append(
                 f"shotmap R0.2B_FALLBACK: rows="
@@ -224,12 +271,16 @@ def validate_data(**context) -> Dict[str, Any]:
         else:
             validation['warnings'].append(
                 f"Low shotmap row count: "
-                f"{validation['summary']['shotmap_rows']} < 300"
+                f"{validation['summary']['shotmap_rows']} "
+                f"< {floors['shotmap_rows']}"
             )
 
     # event_player_stats: full APL season ≈ 380 matches × ~25 played players
-    # ≈ 9.5K rows. WARN-only threshold = 10K (issue #69).
-    if not capture_noop and validation['summary']['event_player_stats_rows'] < 10000:
+    # ≈ 9.5K rows. WARN-only floor (issue #69).
+    if not capture_noop and (
+        validation['summary']['event_player_stats_rows']
+        < floors['event_player_stats_rows']
+    ):
         if validation['summary']['event_player_stats_fallback']:
             validation['warnings'].append(
                 f"event_player_stats R0.2B_FALLBACK: rows="
@@ -241,12 +292,15 @@ def validate_data(**context) -> Dict[str, Any]:
         else:
             validation['warnings'].append(
                 f"Low event_player_stats row count: "
-                f"{validation['summary']['event_player_stats_rows']} < 10000"
+                f"{validation['summary']['event_player_stats_rows']} "
+                f"< {floors['event_player_stats_rows']}"
             )
 
     # match_stats: full APL season ≈ 380 matches × 3 periods × ~30 stats
-    # ≈ 34K rows. WARN-only threshold = 10K (issue #69).
-    if not capture_noop and validation['summary']['match_stats_rows'] < 10000:
+    # ≈ 34K rows. WARN-only floor (issue #69).
+    if not capture_noop and (
+        validation['summary']['match_stats_rows'] < floors['match_stats_rows']
+    ):
         if validation['summary']['match_stats_fallback']:
             validation['warnings'].append(
                 f"match_stats R0.2B_FALLBACK: rows="
@@ -258,13 +312,14 @@ def validate_data(**context) -> Dict[str, Any]:
         else:
             validation['warnings'].append(
                 f"Low match_stats row count: "
-                f"{validation['summary']['match_stats_rows']} < 10000"
+                f"{validation['summary']['match_stats_rows']} "
+                f"< {floors['match_stats_rows']}"
             )
 
     # venue (#753): one row per match → full APL season ≈ 380 rows. WARN-only
-    # threshold = 300, in line with shotmap. Was previously unvalidated — a
+    # floor in line with shotmap. Was previously unvalidated — a
     # silently-empty venue capture never surfaced.
-    if not capture_noop and validation['summary']['venue_rows'] < 300:
+    if not capture_noop and validation['summary']['venue_rows'] < floors['venue_rows']:
         if validation['summary']['venue_fallback']:
             validation['warnings'].append(
                 f"venue R0.2B_FALLBACK: rows="
@@ -276,11 +331,64 @@ def validate_data(**context) -> Dict[str, Any]:
         else:
             validation['warnings'].append(
                 f"Low venue row count: "
-                f"{validation['summary']['venue_rows']} < 300"
+                f"{validation['summary']['venue_rows']} < {floors['venue_rows']}"
             )
 
     # player_season_stats + player_profile are validated by validate_player_data
     # (the gated weekly branch below), not here.
+
+    # #920 Phase 2: tournament legs — the Phase-1 fan-out writes one result
+    # file per single_year league; until now nothing read them, so a dead
+    # tournament scrape hid behind a green club batch. WARN-only by design:
+    # promotion to the club fail rule is a deliberate follow-up after the
+    # first tournament window runs green end-to-end.
+    for _t_league in TOURNAMENT_LEAGUES:
+        _slug = _league_slug(_t_league)
+        _t_floors = {
+            k: _scale(u, b, _t_league)
+            for k, (u, b) in _SS_FLOOR_BASES.items()
+        }
+        _t_summary: Dict[str, Any] = {}
+
+        _t_schedule = _load_result(f'/tmp/sofascore_result_{_slug}.json', logger)
+        # Missing file or the runner's out-of-window no-op marker: silent
+        # skip — outside the tournament window this is the healthy state.
+        if _t_schedule and not _t_schedule.get('skipped'):
+            for err in _t_schedule.get('errors') or []:
+                validation['warnings'].append(f"{_t_league}: {err}")
+            for key in ('schedule_rows', 'league_table_rows'):
+                rows = _t_schedule.get(key, 0)
+                _t_summary[key] = rows
+                if rows < _t_floors[key]:
+                    validation['warnings'].append(
+                        f"{_t_league}: low {key}: {rows} < {_t_floors[key]}"
+                    )
+
+        _t_capture = _load_result(
+            f'/tmp/sofascore_match_capture_result_{_slug}.json', logger)
+        if (
+            _t_capture
+            and not _t_capture.get('skipped')
+            and not _capture_noop(_t_capture)
+        ):
+            for err in _t_capture.get('errors') or []:
+                validation['warnings'].append(f"{_t_league}: {err}")
+            for key, field in (
+                ('player_ratings_rows', 'rows'),
+                ('shotmap_rows', 'shotmap_rows'),
+                ('event_player_stats_rows', 'eps_rows'),
+                ('match_stats_rows', 'match_stats_rows'),
+                ('venue_rows', 'venue_rows'),
+            ):
+                rows = _t_capture.get(field, 0)
+                _t_summary[key] = rows
+                if rows < _t_floors[key]:
+                    validation['warnings'].append(
+                        f"{_t_league}: low {key}: {rows} < {_t_floors[key]}"
+                    )
+
+        if _t_summary:
+            validation['summary'][f'tournament_{_slug}'] = _t_summary
 
     logger.info(f"Data validation complete: {validation['status']}")
     logger.info(f"Summary: {validation['summary']}")

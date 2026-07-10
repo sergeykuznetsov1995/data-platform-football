@@ -20,7 +20,9 @@
 #   name              — human-readable name
 #   country           — страна лиги ('Europe' для UEFA-турниров); → gold.dim_competition
 #   tier              — 1 = top flight (only tier=1 currently)
-#   seasons           — list of {id, format, team_count, start, end}
+#   seasons           — list of {id, format, team_count, [match_count], start, end}
+#                       match_count обязателен для format: group_knockout
+#                       (число матчей не выводится из team_count; #920 Phase 2)
 #   sources.primary   — sources с >80% coverage (R0.1 verdict)
 #   sources.fallback  — sources с partial coverage / per-metric fallback
 #   in_scope          — true = currently materialized in Gold; false = stub
@@ -409,6 +411,10 @@ competitions:
         season_format: single_year
         format: group_knockout
         team_count: 48
+        # 72 групповых (12 групп x 4 RR) + 32 плей-офф (R32..финал, вкл. матч
+        # за 3-е место). Не выводится из team_count -> обязателен для
+        # group_knockout (#920 Phase 2, get_competition_floor_basis).
+        match_count: 104
         start: "2026-06-11"
         end: "2026-07-19"
     sources:

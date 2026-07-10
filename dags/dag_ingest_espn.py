@@ -84,8 +84,12 @@ def validate_data(**context) -> Dict[str, Any]:
 
 
 def validate_schedule(**context) -> Dict[str, Any]:
-    """Fail-closed Trino COUNT(*) floor for espn_schedule (issue #466)."""
-    return validate_table('espn_schedule', 'espn_schedule')
+    """Fail-closed Trino COUNT(*) floor for espn_schedule (issue #466).
+
+    #920 Phase 2: per-league — each league in LEAGUES must clear its own
+    competitions.yaml-derived floor (APL ~380 fixtures vs WC 104).
+    """
+    return validate_table('espn_schedule', 'espn_schedule', leagues=LEAGUES)
 
 
 def validate_lineup(**context) -> Dict[str, Any]:
