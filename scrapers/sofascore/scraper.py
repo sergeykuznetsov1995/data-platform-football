@@ -25,7 +25,7 @@ from scrapers.base.base_scraper import SoccerdataScraper
 # capture layer (camoufox_capture) can reuse them without importing this heavy
 # module (#840). Re-exported here for existing callers/tests.
 from scrapers.sofascore._flatten import (  # noqa: E402
-    _MAX_FLATTEN_DEPTH,
+    _MAX_FLATTEN_DEPTH as _MAX_FLATTEN_DEPTH,
     _auto_flatten,
     _camel_to_snake,
     _coerce_scalar,
@@ -40,6 +40,7 @@ _LINEUPS_PATH = "/event/{event_id}/lineups"
 _SHOTMAP_PATH = "/event/{event_id}/shotmap"
 _EVENT_PLAYER_STATS_PATH = "/event/{event_id}/player/{player_id}/statistics"
 _MATCH_STATS_PATH = "/event/{event_id}/statistics"
+_TERMINAL_CAPTURE_STATES = frozenset({"success", "not_available"})
 
 
 # SofaScore "unique-tournament" id per soccerdata league key. Discovered
@@ -87,9 +88,11 @@ def _season_to_short(season) -> str:
     """Normalize a season token to soccerdata's short 'YYZZ' form.
 
     Mirrors ``scrapers/whoscored/scraper.py::_season_to_soccerdata_str``:
-    already-short tokens pass through ('2526' -> '2526'; the ambiguous
-    '2021' resolves to the 20/21 season, like soccerdata), year-start
-    values convert (2024 -> '2425', 1999 -> '9900'). The old inline
+    already-short tokens pass through ('2526' -> '2526'). Integer values in
+    the plausible calendar-year range are unambiguously treated as start years
+    (2021 -> '2122', 2024 -> '2425', 1999 -> '9900'); this matches the Airflow
+    ``season`` Param contract. String tokens keep supporting soccerdata's short
+    form, including the otherwise ambiguous ``'2021'`` -> 20/21. The old inline
     conversion mapped '2526' -> '2627' (a nonexistent season), silently
     no-op'ing scrapes triggered with the documented short form.
     Non-4-digit tokens pass through unchanged (legacy behaviour of the
@@ -98,6 +101,12 @@ def _season_to_short(season) -> str:
     s = str(season)
     if len(s) != 4 or not s.isdigit():
         return s
+    # Preserve the input type as the ambiguity boundary: Airflow/CLI passes an
+    # int start year, while callers that intentionally mean the short 20/21
+    # token can pass the string ``"2021"``. Converting to str before this check
+    # was the source of the historical 2021/22 -> 2020/21 mislabelling.
+    if isinstance(season, int) and 1900 <= season <= 2098:
+        return s[-2:] + f"{(season + 1) % 100:02d}"
     if (int(s[:2]) + 1) % 100 == int(s[2:]):
         return s
     if s[2:] == "99":
@@ -125,6 +134,23 @@ def _season_label(league: str, season) -> str:
     if _is_single_year(league, season):
         return str(int(season))
     return _season_to_short(season)
+
+
+def _season_slug_and_target_year(league: str, season) -> Tuple[str, str]:
+    """Return the Bronze partition slug and exact SofaScore API year.
+
+    Split-year leagues use ``25/26`` while single-year tournaments keep the
+    literal ``2026`` for both values. Centralising this prevents shared capture
+    paths from converting tournament years to values such as ``20/26`` and
+    replaces the former duplicated, broad-except config lookups.
+    """
+    from scrapers.sofascore.camoufox_capture import season_short_to_label
+
+    if _is_single_year(league, season):
+        label = str(int(season))
+        return label, label
+    label = _season_to_short(season)
+    return label, season_short_to_label(label)
 
 
 class SofaScoreScraper(SoccerdataScraper):
@@ -159,7 +185,6 @@ class SofaScoreScraper(SoccerdataScraper):
         **kwargs
     ):
         super().__init__(leagues=leagues, seasons=seasons, **kwargs)
-        self._reader = None
         # Residential-proxy traffic audit (#789 + #879). Passive:
         # - response-body bytes of the tls_requests REST path
         #   (`_fetch_json_endpoint`), keyed by host;
@@ -169,6 +194,13 @@ class SofaScoreScraper(SoccerdataScraper):
         self._proxy_bytes: int = 0
         self._proxy_bytes_by_host: Dict[str, int] = defaultdict(int)
         self._camoufox_bytes: int = 0
+        self._camoufox_sessions: int = 0
+        self._browser_navigations: int = 0
+        self._browser_api_fetches: int = 0
+        self._browser_blocked_requests: int = 0
+        self._fallback_navigations: int = 0
+        self._camoufox_proxy_objects: Dict[tuple, object] = {}
+        self._last_camoufox_proxy_key: Optional[tuple] = None
 
     def get_traffic_stats(self) -> Dict:
         """Residential-proxy bytes seen this run (#789 tls path + #879 Camoufox).
@@ -189,6 +221,11 @@ class SofaScoreScraper(SoccerdataScraper):
             'proxy_response_mb': round(total / 1024 / 1024, 4),
             'camoufox_bytes': self._camoufox_bytes,
             'camoufox_mb': round(self._camoufox_bytes / 1024 / 1024, 4),
+            'browser_sessions': self._camoufox_sessions,
+            'browser_navigations': self._browser_navigations,
+            'browser_api_fetches': self._browser_api_fetches,
+            'browser_fallback_navigations': self._fallback_navigations,
+            'browser_blocked_requests': self._browser_blocked_requests,
             'requests': int(self._stats.get('requests', 0)),
             'top_traffic_urls': [
                 {
@@ -220,6 +257,7 @@ class SofaScoreScraper(SoccerdataScraper):
                 yield cap
         finally:
             if cap is not None:
+                self._camoufox_sessions += 1
                 try:
                     nbytes = int(getattr(cap, '_bytes_total', 0) or 0)
                 except (TypeError, ValueError):
@@ -227,6 +265,14 @@ class SofaScoreScraper(SoccerdataScraper):
                 if nbytes > 0:
                     self._camoufox_bytes += nbytes
                     self._proxy_bytes_by_host['camoufox:www.sofascore.com'] += nbytes
+                for attr, target in (
+                    ('_navigation_count', '_browser_navigations'),
+                    ('_api_fetch_count', '_browser_api_fetches'),
+                    ('_blocked_count', '_browser_blocked_requests'),
+                ):
+                    value = getattr(cap, attr, 0)
+                    if isinstance(value, (int, float)) and value > 0:
+                        setattr(self, target, getattr(self, target) + int(value))
 
     def _record_proxy_bytes(self, url: str, resp) -> None:
         """Accumulate response-body bytes for the residential-proxy audit (#789).
@@ -240,69 +286,25 @@ class SofaScoreScraper(SoccerdataScraper):
         self._proxy_bytes += nbytes
         self._proxy_bytes_by_host[urlsplit(url).netloc or url] += nbytes
 
-    def _get_reader(self):
-        """Get soccerdata SofaScore reader."""
-        if self._reader is None:
-            try:
-                import soccerdata as sd
-                self._reader = sd.Sofascore(
-                    leagues=self.leagues,
-                    seasons=self.seasons,
-                    **self._sd_kwargs
-                )
-            except ImportError:
-                logger.error("soccerdata library not installed")
-                raise
-        return self._reader
-
     def read_schedule(self) -> Optional[pd.DataFrame]:
         """Read the match schedule + results via Camoufox capture (#761).
 
         The soccerdata schedule reader is Turnstile-blocked (#757), so for each
-        league we navigate its SofaScore tournament page, let the SPA fire its
-        ``/events/{round,last,next}`` XHRs (nudged toward finished matches), and
-        flatten the captured events into ``bronze.sofascore_schedule`` rows via
-        :func:`camoufox_capture.normalize_event`. The league page serves the
-        CURRENT season, so rows are labelled with ``self.seasons[0]`` in
-        soccerdata short form (``'2526'``); the runner merges this captured
-        window with the existing partition so a partial capture never shrinks it
-        (the completeness guard would otherwise refuse the save).
+        league we navigate its tournament page once to establish Turnstile
+        clearance, resolve the exact target ``season_id``, and fetch that
+        season's ``events/last`` plus ``events/next`` JSON directly. Rows are
+        labelled with ``self.seasons[0]`` in soccerdata short form (``'2526'``);
+        the runner merges this captured window with the existing partition so a
+        partial capture never shrinks it.
 
         Returns ``None`` when nothing is captured (caller then skips the save,
         leaving the existing partition intact).
         """
-        from scrapers.sofascore.camoufox_capture import (
-            normalize_event,
-            season_short_to_label,
-        )
+        from scrapers.sofascore.camoufox_capture import normalize_event
 
         if not self.seasons:
             logger.warning("read_schedule: no season configured — skipping.")
             return None
-
-        # #913 Phase 1/2: single_year support for INT-World Cup etc.
-        # Use medallion config so bronze 'season' is the correct slug ('2026')
-        # and the capture year filter matches what SofaScore actually puts in
-        # event.season.year for that competition.
-        try:
-            from dags.utils.medallion_config import get_competition_season_format
-        except Exception:
-            get_competition_season_format = None
-
-        def _effective_slug_and_year(league: str, raw_season: int) -> tuple[str, str]:
-            if get_competition_season_format is not None:
-                try:
-                    if get_competition_season_format(league, raw_season) == 'single_year':
-                        s = str(raw_season)
-                        return s, s
-                except Exception:
-                    pass
-            # default (split-year club leagues)
-            ss = _season_to_short(raw_season)
-            return ss, season_short_to_label(ss)
-
-        # per-league slug/year decided inside the loop using get_competition_season_format for single_year (#913)
-
         frames: List[pd.DataFrame] = []
         for league in self.leagues:
             ut_id = self._resolve_unique_tournament_id(league)
@@ -313,7 +315,10 @@ class SofaScoreScraper(SoccerdataScraper):
                     "skipped.", league,
                 )
                 continue
-            season_slug, target_year = _effective_slug_and_year(league, self.seasons[0])
+            season_slug, target_year = _season_slug_and_target_year(
+                league,
+                self.seasons[0],
+            )
             nav_url = f"https://www.sofascore.com/tournament/{slug}/{ut_id}"
             events = self._capture_schedule_events(
                 nav_url, ut_id, league, season_slug, target_year)
@@ -340,98 +345,177 @@ class SofaScoreScraper(SoccerdataScraper):
     def _capture_schedule_events(
         self, nav_url: str, ut_id, league: str, season_short: str, target_year: str,
     ) -> list:
-        """Capture ``target_year``'s events for one league page, retrying up to
-        ``_CAPTURE_ATTEMPTS`` times on a FRESH proxy (#879).
+        """Capture only schedule events; see :meth:`_capture_tournament_snapshot`."""
+        return self._capture_tournament_snapshot(
+            nav_url,
+            ut_id,
+            league,
+            season_short,
+            target_year,
+            want_events=True,
+            want_standings=False,
+        )["events"]
 
-        The weekend top-5 backfill lost whole league-seasons to single
-        transient failures (proxy connect refused / NS_ERROR_* timeouts) and to
-        an unresolved season sid — each attempt picks a new residential exit so
-        one dead proxy can't silently no-op the unit. Retryable: a capture
-        exception, an unresolved sid, a resolved sid whose events page never
-        answered. NOT retried: a real 200 answer with zero events for the
-        target season (legitimately empty, e.g. fixtures not yet published).
+    def _capture_tournament_snapshot(
+        self,
+        nav_url: str,
+        ut_id,
+        league: str,
+        season_short: str,
+        target_year: str,
+        *,
+        want_events: bool,
+        want_standings: bool,
+    ) -> Dict[str, list]:
+        """Capture target-season events and/or standings with one browser warm-up.
+
+        ``None`` is the internal "not answered yet" sentinel; ``[]`` is a real
+        200-empty answer. When both entities are requested, a successful entity
+        is retained across retries so a fresh proxy only re-fetches the missing
+        component. This is the shared transport for the daily tournament
+        snapshot and the standalone readers.
         """
-        from scrapers.sofascore.camoufox_capture import extract_tournament_events
+        from scrapers.sofascore.camoufox_capture import (
+            extract_tournament_events,
+            extract_tournament_standings,
+        )
+
+        events = None if want_events else []
+        standings = None if want_standings else []
+        events_by_id: Dict[object, dict] = {}
 
         for attempt in range(1, self._CAPTURE_ATTEMPTS + 1):
-            proxy = self._camoufox_proxy()  # fresh exit per attempt (#879)
+            if events is not None and standings is not None:
+                break
+            proxy = self._camoufox_proxy()
             sid = None
-            buffer = {}
+            buffer: Dict[str, dict] = {}
+            std_path = None
+            fetched_standings = None
             try:
                 self._rate_limiter.acquire()
                 with self._camoufox_session(proxy) as cap:
-                    buffer = cap.capture_tournament(nav_url)
-                    # The landing serves only the CURRENT/next season; page the
-                    # TARGET season's events in so a historical backfill is not
-                    # empty (#824). For the current season this is a no-op-ish
-                    # extra (same sid) the year-filter below keeps consistent.
-                    sid = self._resolve_target_sid(cap, buffer, ut_id, target_year)
-                    if sid is not None:
-                        buffer = cap.paginate_tournament_season(ut_id, int(sid))
-            except Exception as e:  # noqa: BLE001 — capture must not crash the run
+                    # Navigation exists only to establish origin + Turnstile
+                    # clearance. Target data comes from exact same-origin API
+                    # calls, not DOM interactions with hidden tabs.
+                    buffer = cap.capture_buffer(nav_url)
+                    sid = self._resolve_target_sid(
+                        cap,
+                        buffer,
+                        ut_id,
+                        target_year,
+                    )
+                    if sid is not None and events is None:
+                        buffer = cap.paginate_tournament_season(
+                            ut_id,
+                            int(sid),
+                            include_next=True,
+                        )
+                        found = [
+                            ev
+                            for ev in extract_tournament_events(buffer, ut_id)
+                            if (ev.get("season") or {}).get("year") == target_year
+                        ]
+                        for event in found:
+                            events_by_id[event.get("id")] = event
+                        event_prefix = (
+                            f"/api/v1/unique-tournament/{int(ut_id)}/season/"
+                            f"{int(sid)}/events"
+                        )
+                        # Both directions must answer before the schedule is
+                        # complete: before kickoff ``last`` is empty while
+                        # ``next`` contains every published fixture. Partial
+                        # rows are retained across a fresh-proxy retry.
+                        if all(
+                            self._event_direction_complete(
+                                buffer,
+                                event_prefix,
+                                direction,
+                            )
+                            for direction in ("last", "next")
+                        ):
+                            events = list(events_by_id.values())
+
+                    if sid is not None and standings is None:
+                        std_path = (
+                            f"/api/v1/unique-tournament/{int(ut_id)}/season/"
+                            f"{int(sid)}/standings/total"
+                        )
+                        rows = extract_tournament_standings(buffer, ut_id, sid)
+                        if not rows:
+                            fetched_standings = self._fetch_api_rec(cap, std_path)
+                            if fetched_standings is not None:
+                                rows = extract_tournament_standings(
+                                    {std_path: fetched_standings},
+                                    ut_id,
+                                    sid,
+                                )
+                        if rows:
+                            standings = rows
+                        elif self._rec_answered(
+                            buffer.get(std_path),
+                            fetched_standings,
+                        ):
+                            standings = []
+            except Exception as exc:  # noqa: BLE001 — rotate and retry
+                self._record_camoufox_proxy_result(proxy, success=False)
                 logger.warning(
-                    "capture schedule failed for league=%s (attempt %d/%d): %s",
-                    league, attempt, self._CAPTURE_ATTEMPTS, e)
+                    "tournament capture failed league=%s attempt=%d/%d: %s",
+                    league,
+                    attempt,
+                    self._CAPTURE_ATTEMPTS,
+                    exc,
+                )
                 continue
 
-            events = [
-                ev for ev in extract_tournament_events(buffer, ut_id)
-                if (ev.get('season') or {}).get('year') == target_year
-            ]
-            if events:
-                return events
+            if sid is not None:
+                attempt_complete = (
+                    (not want_events or events is not None)
+                    and (not want_standings or standings is not None)
+                )
+                self._record_camoufox_proxy_result(
+                    proxy,
+                    success=attempt_complete,
+                    error_type="unknown",
+                )
+
             if sid is None:
+                self._record_camoufox_proxy_result(
+                    proxy,
+                    success=False,
+                    error_type="unknown",
+                )
                 logger.warning(
-                    "Capture schedule league=%s: 0 events for season=%s "
-                    "(year=%s) — season unresolved, page may serve a different "
-                    "season (attempt %d/%d).",
-                    league, season_short, target_year,
-                    attempt, self._CAPTURE_ATTEMPTS,
+                    "Tournament season unresolved league=%s season=%s "
+                    "(year=%s, attempt %d/%d).",
+                    league,
+                    season_short,
+                    target_year,
+                    attempt,
+                    self._CAPTURE_ATTEMPTS,
                 )
                 continue
-            page0 = (
-                f"/api/v1/unique-tournament/{int(ut_id)}/season/{int(sid)}"
-                "/events/last/0"
-            )
-            if self._rec_answered(buffer.get(page0)):
-                # The season's own events page answered with nothing — a real
-                # empty, not a capture miss. Don't burn retries on it.
+            if events is None:
                 logger.warning(
-                    "Capture schedule league=%s: 0 events for season=%s "
-                    "(year=%s, sid=%s) — season served empty.",
-                    league, season_short, target_year, sid,
+                    "Tournament events unanswered league=%s sid=%s (attempt %d/%d).",
+                    league,
+                    sid,
+                    attempt,
+                    self._CAPTURE_ATTEMPTS,
                 )
-                return []
-            logger.warning(
-                "Capture schedule league=%s: target-season events page missing "
-                "from capture (season=%s, sid=%s, attempt %d/%d).",
-                league, season_short, sid, attempt, self._CAPTURE_ATTEMPTS,
-            )
-        return []
+            if standings is None:
+                logger.warning(
+                    "Tournament standings unanswered league=%s sid=%s (attempt %d/%d).",
+                    league,
+                    sid,
+                    attempt,
+                    self._CAPTURE_ATTEMPTS,
+                )
 
-    def _capture_season_buffer(self, cap, buffer, ut_id, target_year):
-        """Resolve ``target_year``'s SofaScore ``season_id`` from a landing
-        ``buffer`` and page that season's events into the buffer so a historical
-        season is captured (#824).
-
-        The tournament landing only fires the CURRENT/next season's
-        ``/events/...`` XHR, so :func:`extract_tournament_events` finds nothing
-        for a past season. We resolve the target sid via
-        :meth:`_resolve_target_sid` (buffer sources first, then an in-page
-        ``/seasons`` fetch — #879), then drive
-        :meth:`SofascoreCamoufoxCapture.paginate_tournament_season` on the same
-        (already-navigated) page. Returns the extended buffer, or the original
-        unchanged when the season can't be resolved (the caller's
-        ``season.year`` filter then yields nothing → no save, no pollution)."""
-        target_sid = self._resolve_target_sid(cap, buffer, ut_id, target_year)
-        if target_sid is None:
-            logger.warning(
-                "Season %s unresolved from /seasons or events for ut=%s — "
-                "page may serve a different season; skipping season paging.",
-                target_year, ut_id,
-            )
-            return buffer
-        return cap.paginate_tournament_season(ut_id, int(target_sid))
+        return {
+            "events": (events if events is not None else list(events_by_id.values())),
+            "standings": standings if standings is not None else [],
+        }
 
     def _fetch_api_rec(self, cap, path: str) -> Optional[dict]:
         """In-page fetch of an ``/api/v1`` ``path`` via the capture session
@@ -461,6 +545,32 @@ class SofaScoreScraper(SoccerdataScraper):
             and r.get('json') is not None and r.get('challenge') is False
             for r in recs if r is not None
         )
+
+    @classmethod
+    def _event_direction_complete(
+        cls,
+        buffer: Dict[str, dict],
+        event_prefix: str,
+        direction: str,
+        max_pages: int = 25,
+    ) -> bool:
+        """Return True only after a paginated event direction reaches its end.
+
+        Page zero alone is not complete when ``hasNextPage`` is true. Accepting
+        it after a later page failed silently truncated seasons and prevented a
+        fresh-proxy retry.
+        """
+        for page in range(max_pages):
+            rec = buffer.get(f"{event_prefix}/{direction}/{page}")
+            if not cls._rec_answered(rec):
+                return False
+            obj = rec.get("json")
+            events = obj.get("events") if isinstance(obj, dict) else None
+            if not isinstance(events, list):
+                return False
+            if not events or not obj.get("hasNextPage"):
+                return True
+        return False
 
     def _resolve_target_sid(self, cap, buffer, ut_id, target_year) -> Optional[int]:
         """Resolve ``target_year``'s SofaScore ``season_id``: the captured
@@ -512,31 +622,11 @@ class SofaScoreScraper(SoccerdataScraper):
         same guard, no dependency on the SPA firing the XHR spontaneously.
         Returns ``None`` when nothing matches (caller then skips the save).
         """
-        from scrapers.sofascore.camoufox_capture import (
-            normalize_standing,
-            season_short_to_label,
-        )
+        from scrapers.sofascore.camoufox_capture import normalize_standing
 
         if not self.seasons:
             logger.warning("read_league_table: no season configured — skipping.")
             return None
-        # #913: single_year aware (reuse same helper logic as schedule)
-        try:
-            from dags.utils.medallion_config import get_competition_season_format
-        except Exception:
-            get_competition_season_format = None
-
-        def _effective_slug_and_year(league: str, raw_season: int) -> tuple[str, str]:
-            if get_competition_season_format is not None:
-                try:
-                    if get_competition_season_format(league, raw_season) == 'single_year':
-                        s = str(raw_season)
-                        return s, s
-                except Exception:
-                    pass
-            ss = _season_to_short(raw_season)
-            return ss, season_short_to_label(ss)
-
         frames: List[pd.DataFrame] = []
         for league in self.leagues:
             ut_id = self._resolve_unique_tournament_id(league)
@@ -547,7 +637,10 @@ class SofaScoreScraper(SoccerdataScraper):
                     "capture skipped.", league,
                 )
                 continue
-            season_slug, target_y = _effective_slug_and_year(league, self.seasons[0])
+            season_slug, target_y = _season_slug_and_target_year(
+                league,
+                self.seasons[0],
+            )
             nav_url = f"https://www.sofascore.com/tournament/{slug}/{ut_id}"
             rows = self._capture_league_table_rows(
                 nav_url, ut_id, league, season_slug, target_y)
@@ -572,72 +665,105 @@ class SofaScoreScraper(SoccerdataScraper):
     def _capture_league_table_rows(
         self, nav_url: str, ut_id, league: str, season_short: str, target_year: str,
     ) -> list:
-        """Capture ``target_year``'s standings rows for one league page,
-        retrying up to ``_CAPTURE_ATTEMPTS`` times on a FRESH proxy (#879).
+        """Capture only standings; see :meth:`_capture_tournament_snapshot`."""
+        return self._capture_tournament_snapshot(
+            nav_url,
+            ut_id,
+            league,
+            season_short,
+            target_year,
+            want_events=False,
+            want_standings=True,
+        )["standings"]
 
-        The weekend top-5 backfill lost league-seasons to single transient
-        failures (proxy connect refused / NS_ERROR_* timeouts) — each attempt
-        picks a new residential exit so one dead proxy can't no-op the unit.
-        Retryable: a capture exception, an unresolved sid, standings that never
-        answered. NOT retried: a real 200 answer with zero rows for our sid.
+    def read_tournament_snapshot(
+        self,
+    ) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame]]:
+        """Read schedule and standings with one Camoufox session per league.
+
+        The daily runner always needs both entities. Calling the standalone
+        readers used to load the same SPA twice (~2.0 MB + ~1.8 MB in production
+        logs). This explicit combined API shares only the browser warm-up; data
+        extraction, empty-state handling and output frames remain independent.
         """
-        from scrapers.sofascore.camoufox_capture import extract_tournament_standings
+        from scrapers.sofascore.camoufox_capture import (
+            normalize_event,
+            normalize_standing,
+        )
 
-        for attempt in range(1, self._CAPTURE_ATTEMPTS + 1):
-            proxy = self._camoufox_proxy()  # fresh exit per attempt (#879)
-            sid = None
-            rows = []
-            std_path = None
-            fetched_rec = None
-            buffer = {}
-            try:
-                self._rate_limiter.acquire()
-                with self._camoufox_session(proxy) as cap:
-                    buffer = cap.capture_buffer(nav_url)
-                    sid = self._resolve_target_sid(cap, buffer, ut_id, target_year)
-                    if sid is not None:
-                        std_path = (
-                            f"/api/v1/unique-tournament/{int(ut_id)}/season/"
-                            f"{int(sid)}/standings/total"
-                        )
-                        rows = extract_tournament_standings(buffer, ut_id, sid)
-                        if not rows:
-                            # The landing only fires the DEFAULT season's
-                            # standings XHR — fetch the TARGET sid's in-page
-                            # (same session, same Turnstile clearance, #879).
-                            fetched_rec = self._fetch_api_rec(cap, std_path)
-                            if fetched_rec is not None:
-                                rows = extract_tournament_standings(
-                                    {std_path: fetched_rec}, ut_id, sid)
-            except Exception as e:  # noqa: BLE001 — capture must not crash the run
+        if not self.seasons:
+            logger.warning("read_tournament_snapshot: no season configured.")
+            return None, None
+
+        schedule_frames: List[pd.DataFrame] = []
+        standings_frames: List[pd.DataFrame] = []
+
+        for league in self.leagues:
+            ut_id = self._resolve_unique_tournament_id(league)
+            slug = SOFASCORE_TOURNAMENT_SLUG.get(league)
+            if ut_id is None or slug is None:
                 logger.warning(
-                    "capture league_table failed for league=%s "
-                    "(attempt %d/%d): %s",
-                    league, attempt, self._CAPTURE_ATTEMPTS, e)
-                continue
-            if rows:
-                return rows
-            if sid is None:
-                logger.warning(
-                    "Capture league_table league=%s: season %s (year=%s) "
-                    "unresolved from /seasons or events — page may serve a "
-                    "different season (attempt %d/%d).",
-                    league, season_short, target_year,
-                    attempt, self._CAPTURE_ATTEMPTS,
+                    "No SofaScore slug/ut_id for league=%s — tournament "
+                    "snapshot skipped.",
+                    league,
                 )
                 continue
-            if self._rec_answered(buffer.get(std_path), fetched_rec):
-                logger.warning(
-                    "Capture league_table league=%s: 0 standings rows for "
-                    "season=%s (sid=%s).", league, season_short, sid,
-                )
-                return []
-            logger.warning(
-                "Capture league_table league=%s: standings for sid=%s never "
-                "answered (season=%s, attempt %d/%d).",
-                league, sid, season_short, attempt, self._CAPTURE_ATTEMPTS,
+            season_short, target_year = _season_slug_and_target_year(
+                league,
+                self.seasons[0],
             )
-        return []
+            nav_url = f"https://www.sofascore.com/tournament/{slug}/{ut_id}"
+            snapshot = self._capture_tournament_snapshot(
+                nav_url,
+                ut_id,
+                league,
+                season_short,
+                target_year,
+                want_events=True,
+                want_standings=True,
+            )
+
+            events = snapshot["events"]
+            if events:
+                schedule = pd.DataFrame([normalize_event(ev) for ev in events])
+                schedule["league"] = league
+                schedule["season"] = season_short
+                schedule_frames.append(schedule)
+                logger.info(
+                    "Tournament snapshot schedule league=%s season=%s: %d rows.",
+                    league,
+                    season_short,
+                    len(schedule),
+                )
+
+            rows = snapshot["standings"]
+            if rows:
+                table = pd.DataFrame([normalize_standing(row) for row in rows])
+                for col in ("mp", "w", "d", "l", "gf", "ga", "gd", "pts"):
+                    table[col] = table[col].astype("Int64")
+                table["league"] = league
+                table["season"] = season_short
+                standings_frames.append(table)
+                logger.info(
+                    "Tournament snapshot standings league=%s season=%s: %d rows.",
+                    league,
+                    season_short,
+                    len(table),
+                )
+
+        schedule_out = None
+        if schedule_frames:
+            schedule_out = self._add_metadata(
+                pd.concat(schedule_frames, ignore_index=True),
+                "schedule",
+            )
+        standings_out = None
+        if standings_frames:
+            standings_out = self._add_metadata(
+                pd.concat(standings_frames, ignore_index=True),
+                "league_table",
+            )
+        return schedule_out, standings_out
 
     def read_team_season_stats(self) -> Optional[pd.DataFrame]:
         """
@@ -690,25 +816,38 @@ class SofaScoreScraper(SoccerdataScraper):
             return self.resolve_finished_match_ids_via_capture(league, season)
 
         df = df.copy()
-        # Coerce season to soccerdata 'YYZZ' string format if int passed.
-        season_str = str(season)
-        season_short = _season_to_short(season_str)
+        # Preserve the integer type so 2021 means the documented 2021/22 start
+        # year while single-year tournaments retain their literal label.
+        season_short = _season_label(league, season)
+        season_tokens = [season_short]
+        raw_token = str(season)
+        # A raw start-year partition is a legacy alias only when normalising it
+        # yields the exact same canonical season. In particular, int 2021 means
+        # 21/22 while the string token "2021" is the real 20/21 season.
+        if (
+            raw_token != season_short
+            and _season_label(league, raw_token) == season_short
+        ):
+            season_tokens.append(raw_token)
 
         if 'league' in df.columns and 'season' in df.columns:
             mask = (df['league'] == league) & (
-                df['season'].astype(str).isin([season_short, season_str])
+                df['season'].astype(str).isin(season_tokens)
             )
             df = df[mask]
 
-        # Keep only finished matches (have a score) — unplayed games have no
-        # score. #840: read_schedule now emits the raw source key
-        # ``home_score_current`` (was the derived ``home_score``).
-        score_col = next(
-            (c for c in ('home_score_current', 'home_score') if c in df.columns),
-            None,
-        )
-        if score_col is not None:
-            df = df[df[score_col].notna()]
+        # A live match already has ``home_score_current``; score presence is not
+        # a completion signal. Prefer the source status and retain the old score
+        # heuristic only for genuinely legacy frames that predate ``status_type``.
+        if "status_type" in df.columns:
+            df = df[df["status_type"] == "finished"]
+        else:
+            score_col = next(
+                (c for c in ("home_score_current", "home_score") if c in df.columns),
+                None,
+            )
+            if score_col is not None:
+                df = df[df[score_col].notna()]
 
         if 'game_id' not in df.columns:
             return []
@@ -1007,7 +1146,21 @@ class SofaScoreScraper(SoccerdataScraper):
         """
         proxy_obj = None
         if self._proxy_manager is not None and self._proxy_manager.total_count > 0:
-            proxy_obj = self._proxy_manager.get_proxy()
+            # Random pools may hand the just-failed endpoint straight back. Try
+            # a few selections to get a genuinely different exit when possible.
+            tries = min(max(int(self._proxy_manager.total_count), 1), 5)
+            for _ in range(tries):
+                candidate = self._proxy_manager.get_proxy()
+                if candidate is None:
+                    continue
+                key = (
+                    str(candidate.host),
+                    int(candidate.port),
+                    candidate.username or "",
+                )
+                proxy_obj = candidate
+                if self._last_camoufox_proxy_key is None or key != self._last_camoufox_proxy_key:
+                    break
         if proxy_obj is None:
             logger.warning(
                 "No residential proxy configured for SofaScore capture — "
@@ -1018,22 +1171,95 @@ class SofaScoreScraper(SoccerdataScraper):
         if proxy_obj.username and proxy_obj.password:
             d['username'] = proxy_obj.username
             d['password'] = proxy_obj.password
+        key = (str(proxy_obj.host), int(proxy_obj.port), proxy_obj.username or "")
+        self._camoufox_proxy_objects[key] = proxy_obj
+        self._last_camoufox_proxy_key = key
         logger.info("SofaScore capture proxy: %s", proxy_obj.masked_url)
         return d
+
+    def _record_camoufox_proxy_result(
+        self,
+        proxy: Optional[dict],
+        *,
+        success: bool,
+        error_type: str = "connection",
+    ) -> None:
+        """Feed browser outcomes back into ProxyManager health/cooldown state."""
+        if not proxy or self._proxy_manager is None:
+            return
+        server = str(proxy.get("server") or "")
+        parsed = urlsplit(server)
+        key = (
+            parsed.hostname or "",
+            int(parsed.port or 0),
+            proxy.get("username") or "",
+        )
+        proxy_obj = self._camoufox_proxy_objects.get(key)
+        if proxy_obj is None:
+            return
+        record = getattr(self._proxy_manager, "record_result", None)
+        try:
+            if callable(record):
+                record(
+                    proxy_obj,
+                    success=success,
+                    error_type=None if success else error_type,
+                )
+            elif success:
+                proxy_obj.record_success()
+            else:
+                proxy_obj.record_failure(error_type)
+        except Exception:  # noqa: BLE001 — health telemetry must not break capture
+            logger.debug("Could not record Camoufox proxy result", exc_info=True)
+
+    @staticmethod
+    def _event_endpoint_states(cap, event_id: str, endpoints: Dict, names) -> Dict[str, str]:
+        """Read endpoint states from a real capture, with a fake-safe fallback."""
+        states = {
+            name: "success"
+            for name in names
+            if name in (endpoints or {})
+        }
+        read_states = getattr(cap, "event_endpoint_states", None)
+        if callable(read_states):
+            try:
+                observed = read_states(event_id, names=names)
+                if isinstance(observed, dict):
+                    states.update(observed)
+            except Exception:  # noqa: BLE001 — status telemetry must not break data
+                logger.debug("Could not read event endpoint states", exc_info=True)
+        return states
+
+    @staticmethod
+    def _merge_endpoint_states(*state_maps: Dict[str, str]) -> Dict[str, str]:
+        """Merge retries without letting a transient miss erase a terminal answer."""
+        merged: Dict[str, str] = {}
+        for state_map in state_maps:
+            for name, state in (state_map or {}).items():
+                previous = merged.get(name)
+                if previous == "success":
+                    continue
+                if state == "success" or previous not in _TERMINAL_CAPTURE_STATES:
+                    merged[name] = state
+                    continue
+                # Keep an earlier terminal not_available over later transient
+                # noise, but let a later success upgrade it (handled above).
+        return merged
 
     def _iter_match_captures(
         self,
         match_ids: List[str],
         tabs=("Lineups",),
         required=("lineups",),
-        session_max: int = 120,
-        proxy_fail_max: int = 4,
+        session_max: int = 500,
+        item_max_attempts: int = 2,
     ):
         """Yield ``(match_id, endpoints)`` by capturing each match page through a
         Camoufox session, restarted on a FRESH proxy every ``session_max``
-        matches OR after ``proxy_fail_max`` consecutive failures (issue #757 path
-        P2; #829, #832). ``endpoints`` holds whichever of
-        ``event/lineups/statistics/shotmap/incidents`` came back as real JSON
+        matches or immediately after a required-endpoint failure. The SAME match
+        is retried on the fresh proxy up to ``item_max_attempts``; the old loop
+        skipped four paid failures before rotating. ``endpoints`` holds whichever of
+        ``event/lineups/statistics/shotmap`` came back as real JSON
         (see ``camoufox_capture.select_event_endpoints``).
 
         Two failure modes abort a long full-season backfill (380 matches) if the
@@ -1041,13 +1267,8 @@ class SofaScoreScraper(SoccerdataScraper):
         - Firefox accumulates memory across navigations and the browser dies
           ~200 page loads in (#829) — covered by the ``session_max`` restart.
         - the single residential proxy can die mid-run (``NS_ERROR_PROXY_*`` /
-          ``CONNECTION_REFUSED``); since one proxy is picked per session, every
-          later capture then fails and the consecutive-failure breaker aborts at
-          ~half the season (#832). Picking a FRESH proxy on each (re)start and
-          restarting after ``proxy_fail_max`` consecutive failures keeps the run
-          alive across a dead proxy. The handful of matches captured during the
-          dead-proxy burst are skipped (yielded empty) — re-running the season
-          backfills them under the completeness guard.
+          ``CONNECTION_REFUSED``); a required-endpoint miss rotates immediately
+          instead of spending more full navigations on the same exit.
 
         The daily run (a handful of matches) crosses neither threshold, so it
         keeps its single-session behaviour. Generalises the ratings-only lineup
@@ -1081,6 +1302,9 @@ class SofaScoreScraper(SoccerdataScraper):
         match_ids = [str(m) for m in match_ids]
         n = len(match_ids)
         i = 0
+        item_attempts: Dict[str, int] = defaultdict(int)
+        partials: Dict[str, Dict[str, dict]] = defaultdict(dict)
+        partial_states: Dict[str, Dict[str, str]] = defaultdict(dict)
         while i < n:
             proxy = self._camoufox_proxy()  # fresh proxy per (re)start (#832)
             if i:
@@ -1089,61 +1313,204 @@ class SofaScoreScraper(SoccerdataScraper):
                     "at match %d/%d (#829 memory / #832 proxy rotation).", i, n,
                 )
             in_session = 0
-            consec_fail = 0
             warmed = False  # True after this session's first full navigation
-            with self._camoufox_session(proxy) as cap:
-                while i < n and in_session < session_max and consec_fail < proxy_fail_max:
-                    mid = match_ids[i]
-                    self._rate_limiter.acquire()
-                    self._stats['requests'] += 1
-                    endpoints = None
-                    if use_fetch and warmed:
-                        try:
-                            endpoints = cap.fetch_event(mid, names=fetch_names)
-                        except Exception as e:  # noqa: BLE001 — degrade to a full nav
-                            logger.info(
-                                "in-page fetch failed for event=%s: %s", mid, e)
-                            endpoints = None
-                        if endpoints is not None and any(
-                                r not in endpoints for r in required):
-                            logger.info(
-                                "in-page fetch missed a required endpoint for "
-                                "event=%s — falling back to full navigation.", mid)
-                            endpoints = None
-                    if endpoints is None:
-                        try:
-                            endpoints = cap.capture_event(
-                                mid, tabs=tabs, required=required,
-                            )
-                            warmed = True
-                        except Exception as e:  # noqa: BLE001 — one bad event mustn't kill the loop
-                            logger.warning("camoufox capture failed for event=%s: %s", mid, e)
-                            endpoints = {}
-                    if not endpoints.get('lineups'):
-                        self._stats['failures'] += 1
-                        self._last_lineup_error = {
-                            'event_id': mid,
-                            'status': None,
-                            'error': 'lineups_not_captured',
+            rotate_current = False
+            session_had_success = False
+            session_had_failure = False
+            try:
+                with self._camoufox_session(proxy) as cap:
+                    while i < n and in_session < session_max:
+                        mid = match_ids[i]
+                        self._rate_limiter.acquire()
+                        self._stats["requests"] += 1
+                        endpoints = None
+                        fetch_partial: Dict[str, dict] = {}
+                        fetch_states: Dict[str, str] = {}
+                        navigation_states: Dict[str, str] = {}
+                        fetch_attempted = use_fetch and warmed
+                        if use_fetch and warmed:
+                            try:
+                                endpoints = cap.fetch_event(mid, names=fetch_names)
+                            except Exception as e:  # noqa: BLE001 — degrade to a full nav
+                                logger.info(
+                                    "in-page fetch failed for event=%s: %s", mid, e
+                                )
+                                endpoints = None
+                            if endpoints is not None:
+                                fetch_states = self._event_endpoint_states(
+                                    cap,
+                                    mid,
+                                    endpoints,
+                                    fetch_names,
+                                )
+                            if endpoints is not None and any(
+                                fetch_states.get(name) not in _TERMINAL_CAPTURE_STATES
+                                for name in required
+                            ):
+                                fetch_partial = endpoints
+                                logger.info(
+                                    "in-page fetch missed a required endpoint for "
+                                    "event=%s — falling back to full navigation.",
+                                    mid,
+                                )
+                                endpoints = None
+                        if endpoints is None:
+                            try:
+                                if fetch_attempted:
+                                    self._fallback_navigations += 1
+                                endpoints = cap.capture_event(
+                                    mid,
+                                    tabs=tabs,
+                                    required=required,
+                                    max_attempts=1,
+                                )
+                                warmed = True
+                                navigation_states = self._event_endpoint_states(
+                                    cap,
+                                    mid,
+                                    endpoints,
+                                    fetch_names,
+                                )
+                            except Exception as e:  # noqa: BLE001 — one bad event mustn't kill the loop
+                                logger.warning(
+                                    "camoufox capture failed for event=%s: %s", mid, e
+                                )
+                                endpoints = {}
+                        combined = {
+                            **partials[mid],
+                            **fetch_partial,
+                            **(endpoints or {}),
                         }
-                        consec_fail += 1
-                    else:
-                        self._stats['successes'] += 1
-                        consec_fail = 0
-                    yield mid, endpoints
-                    i += 1
-                    in_session += 1
-            if consec_fail >= proxy_fail_max and i < n:
+                        combined_states = self._merge_endpoint_states(
+                            partial_states[mid],
+                            fetch_states,
+                            navigation_states,
+                            {
+                                name: "success"
+                                for name in fetch_names
+                                if name in combined
+                            },
+                        )
+                        optional_retry = [
+                            name
+                            for name in fetch_names
+                            if name not in required
+                            and combined_states.get(name)
+                            not in _TERMINAL_CAPTURE_STATES
+                        ]
+                        if optional_retry and use_fetch and warmed:
+                            # Optional misses must not trigger another ~2 MB SPA
+                            # navigation/proxy rotation. Retry their exact JSON
+                            # paths once on the already-cleared page instead.
+                            try:
+                                optional_payloads = cap.fetch_event(
+                                    mid,
+                                    names=tuple(optional_retry),
+                                )
+                            except Exception as exc:  # noqa: BLE001 — status stays retryable
+                                logger.info(
+                                    "optional endpoint retry failed event=%s names=%s: %s",
+                                    mid,
+                                    optional_retry,
+                                    exc,
+                                )
+                            else:
+                                optional_states = self._event_endpoint_states(
+                                    cap,
+                                    mid,
+                                    optional_payloads,
+                                    optional_retry,
+                                )
+                                combined.update(optional_payloads or {})
+                                combined_states = self._merge_endpoint_states(
+                                    combined_states,
+                                    optional_states,
+                                    {
+                                        name: "success"
+                                        for name in optional_retry
+                                        if name in combined
+                                    },
+                                )
+                        missing = [
+                            name
+                            for name in required
+                            if combined_states.get(name)
+                            not in _TERMINAL_CAPTURE_STATES
+                        ]
+                        if missing:
+                            session_had_failure = True
+                            self._stats["failures"] += 1
+                            self._last_lineup_error = {
+                                "event_id": mid,
+                                "status": None,
+                                "error": "lineups_not_captured",
+                            }
+                            item_attempts[mid] += 1
+                            partials[mid] = combined
+                            partial_states[mid] = combined_states
+                            if item_attempts[mid] < item_max_attempts:
+                                logger.warning(
+                                    "match_capture event=%s missing=%s; rotating "
+                                    "proxy and retrying the same match (%d/%d).",
+                                    mid,
+                                    missing,
+                                    item_attempts[mid],
+                                    item_max_attempts,
+                                )
+                                rotate_current = True
+                                break
+                        else:
+                            session_had_success = True
+                            self._stats["successes"] += 1
+                        yield mid, {
+                            **combined,
+                            "_endpoint_states": combined_states,
+                        }
+                        partials.pop(mid, None)
+                        partial_states.pop(mid, None)
+                        item_attempts.pop(mid, None)
+                        i += 1
+                        in_session += 1
+                if session_had_failure:
+                    self._record_camoufox_proxy_result(
+                        proxy,
+                        success=False,
+                        error_type="unknown",
+                    )
+                elif session_had_success:
+                    self._record_camoufox_proxy_result(proxy, success=True)
+            except Exception as exc:  # session start/browser failure
+                self._record_camoufox_proxy_result(proxy, success=False)
+                if i >= n:
+                    logger.warning(
+                        "match_capture session teardown failed after all items: %s",
+                        exc,
+                    )
+                    break
+                mid = match_ids[i]
+                item_attempts[mid] += 1
                 logger.warning(
-                    "match_capture: %d consecutive failures at match %d/%d — "
-                    "likely a dead proxy; rotating proxy + restarting session "
-                    "(#832).", consec_fail, i, n,
+                    "match_capture session failed at event=%s (%d/%d): %s",
+                    mid,
+                    item_attempts[mid],
+                    item_max_attempts,
+                    exc,
                 )
+                if item_attempts[mid] >= item_max_attempts:
+                    failed_capture = partials.pop(mid, {})
+                    yield mid, {
+                        **failed_capture,
+                        "_endpoint_states": partial_states.pop(mid, {}),
+                    }
+                    item_attempts.pop(mid, None)
+                    i += 1
+            if rotate_current:
+                continue
 
     def _iter_lineup_payloads(self, match_ids: List[str]):
         """Yield ``(match_id, lineups_payload | None)`` — the ratings-only view
         over :meth:`_iter_match_captures` (keeps ``read_player_ratings``
-        unchanged: it clicks just the Lineups tab and consumes ``lineups``)."""
+        unchanged: it requests only the Lineups endpoint family)."""
         captures = self._iter_match_captures(match_ids, tabs=("Lineups",))
         try:
             for mid, endpoints in captures:
@@ -1153,15 +1520,20 @@ class SofaScoreScraper(SoccerdataScraper):
             if callable(close):
                 close()  # tear down the Camoufox session
 
-    def _iter_player_captures(self, player_ids: List[str], season_picker_label=None,
-                              target_ut=None, target_year=None):
+    def _iter_player_captures(
+        self,
+        player_ids: List[str],
+        target_ut=None,
+        target_year=None,
+        session_max: int = 250,
+        item_max_attempts: int = 2,
+    ):
         """Yield ``(player_id, capture)`` through ONE warmed Camoufox session
         (#751 PR3 + PR3b). ``capture`` is the ``{'profile', 'season_buffer'}``
-        dict — the bio plus the season-stats capture. When
-        ``season_picker_label`` is given (the target tournament's display name,
-        e.g. ``'Premier League'``) the navigation path also drives the Season
-        tab + picker in the SAME navigation. Mirrors
-        :meth:`_iter_match_captures`. A ``{'profile': None}`` means the capture
+        dict — the bio plus the season-stats capture. Both warmed-navigation and
+        in-page paths resolve the exact ``target_ut``/``target_year`` APIs; no
+        localized tab/picker interaction is involved. A ``{'profile': None}``
+        means the capture
         missed (page didn't render / proxy dead). The generator owns the browser
         session — the caller MUST ``.close()`` it (try/finally) so it tears down
         even on an early circuit-breaker break.
@@ -1175,44 +1547,116 @@ class SofaScoreScraper(SoccerdataScraper):
         env = os.environ.get('SOFASCORE_INPAGE_FETCH')
         use_fetch = env is None or env.strip().lower() not in ('0', 'false', 'no')
 
-        proxy = self._camoufox_proxy()
-        warmed = False  # True after this session's first full navigation
-        with self._camoufox_session(proxy) as cap:
-            for pid in player_ids:
-                self._rate_limiter.acquire()
-                self._stats['requests'] += 1
-                capture = None
-                if use_fetch and warmed:
-                    try:
-                        capture = cap.fetch_player(
-                            str(pid), target_ut=target_ut,
-                            target_year=target_year)
-                    except Exception as e:  # noqa: BLE001 — degrade to a full nav
-                        logger.info(
-                            "in-page fetch failed for player=%s: %s", pid, e)
+        player_ids = [str(player_id) for player_id in player_ids]
+        attempts: Dict[str, int] = defaultdict(int)
+        i = 0
+        while i < len(player_ids):
+            proxy = self._camoufox_proxy()
+            warmed = False
+            in_session = 0
+            rotate_current = False
+            session_had_success = False
+            session_had_failure = False
+            try:
+                with self._camoufox_session(proxy) as cap:
+                    while i < len(player_ids) and in_session < session_max:
+                        pid = player_ids[i]
+                        self._rate_limiter.acquire()
+                        self._stats["requests"] += 1
                         capture = None
-                    if capture is not None and not capture.get('profile'):
-                        logger.info(
-                            "in-page fetch missed profile for player=%s — "
-                            "falling back to full navigation.", pid)
-                        capture = None
-                if capture is None:
-                    try:
-                        capture = cap.capture_player(
-                            str(pid), season_picker_label=season_picker_label)
-                        warmed = True
-                    except Exception as e:  # noqa: BLE001 — one bad player mustn't kill the loop
-                        logger.warning("camoufox capture failed for player=%s: %s", pid, e)
-                        capture = {'profile': None, 'season_buffer': {}}
-                if not capture.get('profile'):
-                    self._stats['failures'] += 1
-                    self._last_lineup_error = {
-                        'event_id': None, 'player_id': str(pid),
-                        'status': None, 'error': 'player_not_captured',
-                    }
-                else:
-                    self._stats['successes'] += 1
-                yield str(pid), capture
+                        fetch_attempted = use_fetch and warmed
+                        if use_fetch and warmed:
+                            try:
+                                capture = cap.fetch_player(
+                                    str(pid),
+                                    target_ut=target_ut,
+                                    target_year=target_year,
+                                )
+                            except Exception as e:  # noqa: BLE001 — degrade to a full nav
+                                logger.info(
+                                    "in-page fetch failed for player=%s: %s", pid, e
+                                )
+                                capture = None
+                            if capture is not None and not capture.get("profile"):
+                                logger.info(
+                                    "in-page fetch missed profile for player=%s — "
+                                    "falling back to full navigation.",
+                                    pid,
+                                )
+                                capture = None
+                        if capture is None:
+                            try:
+                                if fetch_attempted:
+                                    self._fallback_navigations += 1
+                                capture = cap.capture_player(
+                                    str(pid),
+                                    target_ut=target_ut,
+                                    target_year=target_year,
+                                )
+                                warmed = True
+                            except Exception as e:  # noqa: BLE001 — one bad player mustn't kill the loop
+                                logger.warning(
+                                    "camoufox capture failed for player=%s: %s", pid, e
+                                )
+                                capture = {"profile": None, "season_buffer": {}}
+                        if not capture.get("profile"):
+                            session_had_failure = True
+                            self._stats["failures"] += 1
+                            self._last_lineup_error = {
+                                "event_id": None,
+                                "player_id": str(pid),
+                                "status": None,
+                                "error": "player_not_captured",
+                            }
+                            attempts[pid] += 1
+                            if attempts[pid] < item_max_attempts:
+                                logger.warning(
+                                    "player_capture player=%s missed; rotating proxy and "
+                                    "retrying (%d/%d).",
+                                    pid,
+                                    attempts[pid],
+                                    item_max_attempts,
+                                )
+                                rotate_current = True
+                                break
+                        else:
+                            session_had_success = True
+                            self._stats["successes"] += 1
+                        yield pid, capture
+                        attempts.pop(pid, None)
+                        i += 1
+                        in_session += 1
+                if session_had_failure:
+                    self._record_camoufox_proxy_result(
+                        proxy,
+                        success=False,
+                        error_type="unknown",
+                    )
+                elif session_had_success:
+                    self._record_camoufox_proxy_result(proxy, success=True)
+            except Exception as exc:
+                self._record_camoufox_proxy_result(proxy, success=False)
+                if i >= len(player_ids):
+                    logger.warning(
+                        "player_capture session teardown failed after all items: %s",
+                        exc,
+                    )
+                    break
+                pid = player_ids[i]
+                attempts[pid] += 1
+                logger.warning(
+                    "player_capture session failed at player=%s (%d/%d): %s",
+                    pid,
+                    attempts[pid],
+                    item_max_attempts,
+                    exc,
+                )
+                if attempts[pid] >= item_max_attempts:
+                    yield pid, {"profile": None, "season_buffer": {}}
+                    attempts.pop(pid, None)
+                    i += 1
+            if rotate_current:
+                continue
 
     def resolve_finished_match_ids_via_capture(
         self, league: str, season: int,
@@ -1255,29 +1699,94 @@ class SofaScoreScraper(SoccerdataScraper):
             target_year = season_short_to_label(season_short)  # '2425' -> '24/25'
 
         nav_url = f"https://www.sofascore.com/tournament/{slug}/{ut_id}"
-        proxy = self._camoufox_proxy()
-        try:
-            self._rate_limiter.acquire()
-            with self._camoufox_session(proxy) as cap:
-                buffer = cap.capture_tournament(nav_url)
-                buffer = self._capture_season_buffer(
-                    cap, buffer, ut_id, target_year)
-        except Exception as e:  # noqa: BLE001 — capture failure must not crash the run
-            logger.warning("capture schedule failed for league=%s: %s", league, e)
-            return []
+        for attempt in range(1, self._CAPTURE_ATTEMPTS + 1):
+            proxy = self._camoufox_proxy()
+            try:
+                self._rate_limiter.acquire()
+                with self._camoufox_session(proxy) as cap:
+                    buffer = cap.capture_buffer(nav_url)
+                    sid = self._resolve_target_sid(
+                        cap,
+                        buffer,
+                        ut_id,
+                        target_year,
+                    )
+                    if sid is None:
+                        self._record_camoufox_proxy_result(
+                            proxy,
+                            success=False,
+                            error_type="unknown",
+                        )
+                        logger.warning(
+                            "Finished-match season unresolved league=%s year=%s "
+                            "(attempt %d/%d).",
+                            league,
+                            target_year,
+                            attempt,
+                            self._CAPTURE_ATTEMPTS,
+                        )
+                        continue
+                    buffer = cap.paginate_tournament_season(ut_id, int(sid))
+                    event_prefix = (
+                        f"/api/v1/unique-tournament/{int(ut_id)}/season/"
+                        f"{int(sid)}/events"
+                    )
+                    complete = self._event_direction_complete(
+                        buffer,
+                        event_prefix,
+                        "last",
+                    )
+            except Exception as exc:  # noqa: BLE001 — rotate and retry
+                self._record_camoufox_proxy_result(proxy, success=False)
+                logger.warning(
+                    "Finished-match capture failed league=%s attempt=%d/%d: %s",
+                    league,
+                    attempt,
+                    self._CAPTURE_ATTEMPTS,
+                    exc,
+                )
+                continue
 
-        events = extract_tournament_events(buffer, ut_id)
-        events = [
-            ev for ev in events
-            if (ev.get('season') or {}).get('year') == target_year
-        ]
-        match_ids = finished_event_ids(events)
-        logger.info(
-            "Capture schedule league=%s season=%s (year=%s): %d ut=%d events, "
-            "%d finished.",
-            league, season, target_year, len(events), ut_id, len(match_ids),
+            self._record_camoufox_proxy_result(
+                proxy,
+                success=complete,
+                error_type="unknown",
+            )
+            if not complete:
+                logger.warning(
+                    "Finished-match pagination incomplete league=%s sid=%s "
+                    "(attempt %d/%d).",
+                    league,
+                    sid,
+                    attempt,
+                    self._CAPTURE_ATTEMPTS,
+                )
+                continue
+
+            events = [
+                event
+                for event in extract_tournament_events(buffer, ut_id)
+                if (event.get("season") or {}).get("year") == target_year
+            ]
+            match_ids = finished_event_ids(events)
+            logger.info(
+                "Capture schedule league=%s season=%s (year=%s): %d ut=%d "
+                "events, %d finished.",
+                league,
+                season,
+                target_year,
+                len(events),
+                ut_id,
+                len(match_ids),
+            )
+            return match_ids
+
+        logger.error(
+            "Finished-match pagination exhausted retries league=%s year=%s.",
+            league,
+            target_year,
         )
-        return match_ids
+        return []
 
     def read_player_ratings(
         self,
@@ -1378,12 +1887,12 @@ class SofaScoreScraper(SoccerdataScraper):
                 "%s: zero rating rows materialised across %d match attempts.",
                 R0_2B_FALLBACK_MARKER, len(match_ids),
             )
-            return pd.DataFrame(columns=cols + ['_ingested_at'])
+            return pd.DataFrame(columns=cols + ["_ingested_at"])
 
-        df = pd.DataFrame(all_rows, columns=[
-            'match_id', 'player_id', 'team_side', 'rating', 'position',
-        ])
-        df['league'] = league
+        df = pd.DataFrame(all_rows)
+        anchors = ["match_id", "player_id", "team_side", "rating", "position"]
+        df = df.reindex(columns=anchors + [c for c in df.columns if c not in anchors])
+        df["league"] = league
         # Match the slug used by the schedule writer (soccerdata short form
         # 'YYZZ', e.g. 2025 -> '2526'). Mismatch would split the partition
         # and break replace_partitions dedup — see issue #27.
@@ -1413,8 +1922,8 @@ class SofaScoreScraper(SoccerdataScraper):
     ) -> Dict[str, pd.DataFrame]:
         """ONE Camoufox capture pass per match → five Bronze frames (#751 PR1+PR2, #753).
 
-        Replaces four separate Turnstile-blocked passes with a single navigation
-        per match. The same pass clicks all deep tabs and captures
+        Replaces four separate Turnstile-blocked passes with a warmed browser
+        session plus exact per-match API fetches. The same pass captures
         ``/lineups`` + ``/event`` + ``/statistics`` + ``/shotmap``:
           - ``player_ratings`` — :meth:`_flatten_lineup_side` over ``/lineups``;
           - ``event_player_stats`` — :meth:`_flatten_event_player_stats_from_lineups`
@@ -1428,10 +1937,12 @@ class SofaScoreScraper(SoccerdataScraper):
         statistics/shotmap/venue are best-effort: a pass that doesn't fire them
         just yields an empty frame for that table (the others still materialise).
 
-        Returns ``{'player_ratings', 'event_player_stats', 'match_stats',
-        'event_shotmap', 'venue'}``; all empty on graceful fallback (caller emits
-        ``R0.2B_FALLBACK``). Season slug is coerced to the soccerdata short form
-        (``2526``) so the partition matches the schedule writer (#27).
+        Returns the five data frames plus ``capture_status`` (one endpoint-state
+        row per attempted match). The status manifest distinguishes terminal
+        empty/not-available answers from transient misses, so the runner can
+        retry only genuinely incomplete matches without re-downloading valid
+        no-shot/no-venue matches. Season slug is coerced to the soccerdata short
+        form (``2526``) so the partition matches the schedule writer (#27).
         """
         ratings_cols = [
             # #840: rating/position kept; entry-level fields now preserved too.
@@ -1465,6 +1976,11 @@ class SofaScoreScraper(SoccerdataScraper):
             'venue_coordinates_latitude', 'venue_coordinates_longitude',
             'league', 'season',
         ]
+        status_cols = [
+            'match_id', 'event_status', 'lineups_status',
+            'statistics_status', 'shotmap_status', 'capture_complete',
+            'league', 'season',
+        ]
 
         if match_ids is None:
             match_ids = self._resolve_match_ids(league, season)
@@ -1477,6 +1993,7 @@ class SofaScoreScraper(SoccerdataScraper):
             'match_stats': pd.DataFrame(columns=match_stats_cols + ['_ingested_at']),
             'event_shotmap': pd.DataFrame(columns=shotmap_cols + ['_ingested_at']),
             'venue': pd.DataFrame(columns=venue_cols + ['_ingested_at']),
+            'capture_status': pd.DataFrame(columns=status_cols + ['_ingested_at']),
         }
 
         if not match_ids:
@@ -1499,22 +2016,62 @@ class SofaScoreScraper(SoccerdataScraper):
         stats_rows: List[Dict] = []
         shot_rows: List[Dict] = []
         venue_rows: List[Dict] = []
+        status_rows: List[Dict] = []
         consecutive_failures = 0
         max_consecutive = 10  # ~dead proxy / Turnstile not solved — bail early.
 
-        # Click ALL deep tabs so the SAME navigation also fires statistics +
-        # shotmap (#751 PR2). `event` is required alongside lineups so team_id/
-        # team_name (homeTeam/awayTeam) are populated, not NULL.
+        # Request every endpoint family in the same pass. A terminal 404 counts
+        # as answered; transient misses rotate once and remain incomplete in the
+        # manifest so a later daily run can retry them.
         captures = self._iter_match_captures(
             match_ids,
-            tabs=("Lineups", "Statistics", "Player statistics", "Shotmap"),
+            tabs=("Lineups", "Statistics", "Shotmap"),
             required=("lineups", "event"),
         )
         try:
             for idx, (mid, endpoints) in enumerate(captures, start=1):
                 endpoints = endpoints or {}
-                lineups = endpoints.get('lineups')
+                endpoint_states = dict(endpoints.get("_endpoint_states") or {})
+                for endpoint_name in ("event", "lineups", "statistics", "shotmap"):
+                    if endpoint_name in endpoints:
+                        endpoint_states[endpoint_name] = "success"
+                    else:
+                        endpoint_states.setdefault(endpoint_name, "missing")
+                status_rows.append(
+                    {
+                        "match_id": str(mid),
+                        **{
+                            f"{name}_status": endpoint_states[name]
+                            for name in ("event", "lineups", "statistics", "shotmap")
+                        },
+                        "capture_complete": all(
+                            endpoint_states[name] in _TERMINAL_CAPTURE_STATES
+                            for name in ("event", "lineups", "statistics", "shotmap")
+                        ),
+                    }
+                )
+                event_payload = endpoints.get("event")
+
+                # Materialise independent endpoints even if lineups missed. The
+                # proxy bytes for event/statistics/shotmap have already been
+                # spent; dropping valid payloads here created avoidable holes.
+                venue_row = self._flatten_event_venue(str(mid), event_payload)
+                if venue_row:
+                    venue_rows.append(venue_row)
+                statistics = endpoints.get("statistics")
+                if statistics is not None:
+                    stats_rows.extend(self._flatten_match_stats(str(mid), statistics))
+                shotmap = endpoints.get("shotmap")
+                if shotmap is not None:
+                    shot_rows.extend(self._flatten_shotmap(str(mid), shotmap))
+
+                lineups = endpoints.get("lineups")
                 if lineups is None:
+                    if endpoint_states.get("lineups") in _TERMINAL_CAPTURE_STATES:
+                        # A terminal 404/204 is a completed source answer, not a
+                        # dead proxy. Keep its manifest row and continue.
+                        consecutive_failures = 0
+                        continue
                     consecutive_failures += 1
                     if consecutive_failures >= max_consecutive:
                         logger.error(
@@ -1526,33 +2083,21 @@ class SofaScoreScraper(SoccerdataScraper):
                     continue
 
                 consecutive_failures = 0
-                event_payload = endpoints.get('event')
-                for side in ('home', 'away'):
-                    ratings_rows.extend(self._flatten_lineup_side(
-                        match_id=str(mid),
-                        side=side,
-                        side_payload=lineups.get(side) or {},
-                    ))
-                eps_rows.extend(self._flatten_event_player_stats_from_lineups(
-                    str(mid), lineups, event_payload,
-                ))
-
-                # venue (#753) — one row per match from the SAME `event`
-                # capture; SofaScore carries the per-match stadium (historically
-                # accurate, unlike FotMob's current-ground bias). Best-effort:
-                # a match whose event payload omits venue yields no row.
-                venue_row = self._flatten_event_venue(str(mid), event_payload)
-                if venue_row:
-                    venue_rows.append(venue_row)
-
-                # Best-effort: a match page may not fire statistics/shotmap on
-                # a given pass — absent keys just yield no rows for that table.
-                statistics = endpoints.get('statistics')
-                if statistics is not None:
-                    stats_rows.extend(self._flatten_match_stats(str(mid), statistics))
-                shotmap = endpoints.get('shotmap')
-                if shotmap is not None:
-                    shot_rows.extend(self._flatten_shotmap(str(mid), shotmap))
+                for side in ("home", "away"):
+                    ratings_rows.extend(
+                        self._flatten_lineup_side(
+                            match_id=str(mid),
+                            side=side,
+                            side_payload=lineups.get(side) or {},
+                        )
+                    )
+                eps_rows.extend(
+                    self._flatten_event_player_stats_from_lineups(
+                        str(mid),
+                        lineups,
+                        event_payload,
+                    )
+                )
 
                 if idx % 25 == 0:
                     logger.info("match_capture progress: %d/%d matches",
@@ -1565,16 +2110,18 @@ class SofaScoreScraper(SoccerdataScraper):
         out: Dict[str, pd.DataFrame] = {}
 
         if ratings_rows:
-            rdf = pd.DataFrame(ratings_rows, columns=[
-                'match_id', 'player_id', 'team_side', 'rating', 'position',
-            ])
-            rdf['league'] = league
-            rdf['season'] = season_short
-            rdf['_ingested_at'] = datetime.utcnow()
-            rdf['_source'] = self.SOURCE_NAME
-            rdf['_entity_type'] = 'player_ratings'
-            rdf['_batch_id'] = self._batch_id
-            out['player_ratings'] = rdf
+            rdf = pd.DataFrame(ratings_rows)
+            anchors = ["match_id", "player_id", "team_side", "rating", "position"]
+            rdf = rdf.reindex(
+                columns=anchors + [c for c in rdf.columns if c not in anchors],
+            )
+            rdf["league"] = league
+            rdf["season"] = season_short
+            rdf["_ingested_at"] = datetime.utcnow()
+            rdf["_source"] = self.SOURCE_NAME
+            rdf["_entity_type"] = "player_ratings"
+            rdf["_batch_id"] = self._batch_id
+            out["player_ratings"] = rdf
         else:
             out['player_ratings'] = empty['player_ratings']
 
@@ -1607,12 +2154,28 @@ class SofaScoreScraper(SoccerdataScraper):
             _tag(shot_rows, 'event_shotmap') if shot_rows else empty['event_shotmap'])
         out['venue'] = (
             _tag(venue_rows, 'venue') if venue_rows else empty['venue'])
+        out['capture_status'] = (
+            _tag(status_rows, 'match_capture_status')
+            if status_rows
+            else empty['capture_status']
+        )
 
         if not ratings_rows and not eps_rows:
-            logger.warning(
-                "%s: match_capture materialised zero rows across %d match attempts.",
-                R0_2B_FALLBACK_MARKER, len(match_ids),
+            all_terminal = bool(status_rows) and all(
+                bool(row.get("capture_complete")) for row in status_rows
             )
+            if all_terminal:
+                logger.warning(
+                    "match_capture received terminal empty/not-available answers "
+                    "for all %d attempted matches.",
+                    len(status_rows),
+                )
+            else:
+                logger.warning(
+                    "%s: match_capture materialised zero rows across %d attempts.",
+                    R0_2B_FALLBACK_MARKER,
+                    len(match_ids),
+                )
 
         logger.info(
             "match_capture: %d ratings + %d eps + %d match_stats + %d shots "
@@ -1659,6 +2222,7 @@ class SofaScoreScraper(SoccerdataScraper):
             except (TypeError, ValueError):
                 return None
 
+        fallback_occurrences: Dict[str, int] = defaultdict(int)
         for shot in shots:
             if not isinstance(shot, dict):
                 continue
@@ -1670,12 +2234,17 @@ class SofaScoreScraper(SoccerdataScraper):
             if sid is None:
                 # Fall back to composite (match, time, player) so that
                 # downstream PK stays unique even when SofaScore omits id.
-                sid = (
+                fallback_id = (
                     f"{match_id}-"
                     f"{shot.get('time', 'NA')}-"
                     f"{player.get('id', 'NA')}-"
                     f"{shot.get('addedTime', 0)}"
                 )
+                fallback_occurrences[fallback_id] += 1
+                occurrence = fallback_occurrences[fallback_id]
+                # Preserve the historical id for the first shot; only genuine
+                # collisions receive a deterministic source-order suffix.
+                sid = fallback_id if occurrence == 1 else f"{fallback_id}-{occurrence}"
             shot_id_str = (
                 str(int(sid)) if isinstance(sid, (int, float)) and not isinstance(sid, bool)
                 else str(sid)
@@ -1846,8 +2415,7 @@ class SofaScoreScraper(SoccerdataScraper):
         }
 
         # Auto-flatten every numeric/scalar statistic. Drop the redundant
-        # `position` re-export (already projected above) and the rating
-        # alias we surface explicitly below.
+        # `position` re-export (already projected above).
         for raw_key, raw_val in stats.items():
             if raw_key == 'position':
                 continue
@@ -1856,13 +2424,6 @@ class SofaScoreScraper(SoccerdataScraper):
                 # Don't overwrite anchor columns (player_id, team_id, ...).
                 continue
             row[snake] = _coerce_scalar(raw_val)
-
-        # Convenience aliases — rating is the most-queried metric.
-        if 'rating' not in row and stats.get('rating') is not None:
-            try:
-                row['rating'] = float(stats['rating'])
-            except (TypeError, ValueError):
-                row['rating'] = None
 
         return row
 
@@ -1943,12 +2504,6 @@ class SofaScoreScraper(SoccerdataScraper):
                     if snake in row:
                         continue
                     row[snake] = _coerce_scalar(raw_val)
-
-                if 'rating' not in row and stats.get('rating') is not None:
-                    try:
-                        row['rating'] = float(stats['rating'])
-                    except (TypeError, ValueError):
-                        row['rating'] = None
 
                 rows.append(row)
 
@@ -2381,8 +2936,8 @@ class SofaScoreScraper(SoccerdataScraper):
         )
         return df
 
-    # SofaScore unique-tournament id per league — used by capture-path
-    # targeting (season picker + finished-match discovery).
+    # SofaScore unique-tournament id per league — used for exact season/API
+    # targeting and finished-match discovery.
     def _resolve_unique_tournament_id(self, league: str) -> Optional[int]:
         return SOFASCORE_TOURNAMENT_MAP.get(league)
 
@@ -2522,9 +3077,9 @@ class SofaScoreScraper(SoccerdataScraper):
     ) -> Dict[str, pd.DataFrame]:
         """Per-player capture → the player_profile Bronze frame (#751 PR3).
 
-        Replaces the dead tls player_profile pass (403'd on Turnstile). #842:
-        only the FIRST player navigates its page (solving Turnstile); every
-        later player pulls ``/api/v1/player/{id}`` via same-origin in-page
+        Replaces the blocked tls player_profile pass. #842: only the first
+        player in each bounded browser session navigates (solving Turnstile);
+        later players pull ``/api/v1/player/{id}`` via same-origin in-page
         fetch (~30 KB vs ~2 MB per navigation) — the page SSRs the identical
         ``player`` object into ``__NEXT_DATA__``, so both paths feed
         :meth:`_flatten_player_profile` the same shape. A fetch miss falls
@@ -2532,23 +3087,21 @@ class SofaScoreScraper(SoccerdataScraper):
 
         Season-aggregate stats (``player_season_stats``) come from the SAME
         pass (#751 PR3b): the fetch path resolves the exact ``(ut, season_id)``
-        from ``/statistics/seasons`` and pulls its ``statistics/overall``;
-        the navigation path drives the Season tab + a season-picker (the
-        default Season tab is the player's PRIMARY competition, not
-        necessarily EPL for a transferred player — live-proven Paquetá →
-        World Cup). Either way the right overall is selected season-guarded
+        from ``/statistics/seasons`` and pulls its ``statistics/overall``.
+        This avoids the page's default competition, which is not necessarily
+        the requested league for a transferred player. The right overall is
+        selected season-guarded
         via the pure :func:`select_player_season_stats` /
         :func:`extract_player_seasons_map`.
 
         Returns ``{'player_profile', 'player_season_stats'}``. The profile is the
-        primary deliverable; season-stats may be a strict subset (the picker can
-        miss for some players) — a WARN, not a failure. Empty frames on graceful
+        primary deliverable; season-stats may be a strict subset when no exact
+        aggregate exists — a WARN, not a failure. Empty frames on graceful
         fallback (caller emits ``R0.2B_FALLBACK``). Season slug is coerced to the
         soccerdata short form (``2526``) so the partition matches.
         """
         from scrapers.sofascore.camoufox_capture import (
             extract_player_seasons_map,
-            season_short_to_label,
             select_player_season_stats,
         )
 
@@ -2565,20 +3118,18 @@ class SofaScoreScraper(SoccerdataScraper):
             'team_id', 'team_name', 'league', 'season',
         ]
 
-        season_short = _season_label(league, season)
+        season_short, target_season_label = _season_slug_and_target_year(
+            league,
+            season,
+        )
 
         empty = {
             'player_profile': pd.DataFrame(columns=profile_cols + ['_ingested_at']),
             'player_season_stats': pd.DataFrame(columns=season_cols + ['_ingested_at']),
         }
 
-        # Target competition for the Season-tab picker. Only an in-scope league
-        # (known unique_tournament_id) drives the picker; otherwise profile-only.
-        # 'ENG-Premier League' -> ut=17, picker label 'Premier League'.
+        # Target competition for exact season-statistics API resolution.
         target_ut = SOFASCORE_TOURNAMENT_MAP.get(league)
-        picker_label = league.split('-', 1)[-1] if target_ut else None
-        target_season_label = season_short_to_label(season_short)
-
         if player_ids is None:
             player_ids = self._resolve_player_ids_from_bronze(
                 league, season_short, limit=limit,
@@ -2603,8 +3154,10 @@ class SofaScoreScraper(SoccerdataScraper):
         max_consecutive = 10  # ~dead proxy / page not rendering — bail early.
 
         captures = self._iter_player_captures(
-            player_ids, season_picker_label=picker_label,
-            target_ut=target_ut, target_year=target_season_label)
+            player_ids,
+            target_ut=target_ut,
+            target_year=target_season_label,
+        )
         try:
             for idx, (pid, capture) in enumerate(captures, start=1):
                 profile = (capture or {}).get('profile')
@@ -2624,22 +3177,29 @@ class SofaScoreScraper(SoccerdataScraper):
                 if prow is not None:
                     profile_rows.append(prow)
 
-                # Season-aggregate stats (best-effort: the picker may miss for a
-                # transferred player → no row for them, which is a WARN).
+                # Season-aggregate stats are best-effort: no exact tournament/
+                # season aggregate means no row for that player (a WARN).
                 if target_ut:
                     season_buffer = (capture or {}).get('season_buffer') or {}
                     if season_buffer:
                         seasons_map = extract_player_seasons_map(season_buffer, pid)
                         target_sid = seasons_map.get(target_ut, {}).get(
-                            target_season_label)
-                        sel = select_player_season_stats(
-                            season_buffer, pid, target_ut, target_sid)
-                        if sel is not None:
-                            ut, sid, payload = sel
-                            srow = self._flatten_player_season_stats(
-                                pid, ut, sid, payload)
-                            if srow is not None:
-                                season_rows.append(srow)
+                            target_season_label
+                        )
+                        # Without the exact target sid, selector fallback means
+                        # "latest available". Labelling that payload with the
+                        # requested partition silently contaminates seasons.
+                        if target_sid is not None:
+                            sel = select_player_season_stats(
+                                season_buffer, pid, target_ut, target_sid
+                            )
+                            if sel is not None:
+                                ut, sid, payload = sel
+                                srow = self._flatten_player_season_stats(
+                                    pid, ut, sid, payload
+                                )
+                                if srow is not None:
+                                    season_rows.append(srow)
 
                 if idx % 25 == 0:
                     logger.info("player_capture progress: %d/%d players",
@@ -2687,7 +3247,7 @@ class SofaScoreScraper(SoccerdataScraper):
         return result
 
     def scrape_schedule(self) -> Dict[str, str]:
-        """Scrape match schedule."""
+        """Scrape match schedule through the compatibility entrypoint."""
         df = self.read_schedule()
         if df is not None and not df.empty:
             table_path = self.save_to_iceberg(
@@ -2695,12 +3255,13 @@ class SofaScoreScraper(SoccerdataScraper):
                 table_name='sofascore_schedule',
                 partition_cols=['league', 'season'],
                 replace_partitions=['league', 'season'],
+                min_replace_ratio=0.9,
             )
             return {'schedule': table_path}
         return {}
 
     def scrape_league_table(self) -> Dict[str, str]:
-        """Scrape league table (standings)."""
+        """Scrape league table through the compatibility entrypoint."""
         df = self.read_league_table()
         if df is not None and not df.empty:
             table_path = self.save_to_iceberg(
@@ -2708,13 +3269,10 @@ class SofaScoreScraper(SoccerdataScraper):
                 table_name='sofascore_league_table',
                 partition_cols=['league', 'season'],
                 replace_partitions=['league', 'season'],
+                min_replace_ratio=0.9,
             )
             return {'league_table': table_path}
         return {}
-
-    def scrape_team_stats(self) -> Dict[str, str]:
-        """Scrape team stats (alias for league table)."""
-        return self.scrape_league_table()
 
     def scrape_player_ratings(
         self,
@@ -2772,14 +3330,20 @@ class SofaScoreScraper(SoccerdataScraper):
         )
 
         results = {}
-
-        # Scrape schedule
-        schedule_results = self.scrape_schedule()
-        results.update(schedule_results)
-
-        # Scrape league table (standings)
-        table_results = self.scrape_league_table()
-        results.update(table_results)
+        schedule, league_table = self.read_tournament_snapshot()
+        for entity, frame in (
+            ('schedule', schedule),
+            ('league_table', league_table),
+        ):
+            if frame is None or frame.empty:
+                continue
+            results[entity] = self.save_to_iceberg(
+                df=frame,
+                table_name=f'sofascore_{entity}',
+                partition_cols=['league', 'season'],
+                replace_partitions=['league', 'season'],
+                min_replace_ratio=0.9,
+            )
 
         logger.info(f"SofaScore scrape complete: {list(results.keys())}")
         return results
