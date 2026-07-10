@@ -62,8 +62,12 @@ WITH manager_match_log AS (
         m.manager_name                                    AS raw_manager_name,
         m.league,
         -- season → slug ('2425'); bronze fbref_match_managers is year-start bigint (#404).
-        LPAD(CAST(MOD(m.season, 100) AS varchar), 2, '0')
-            || LPAD(CAST(MOD(m.season + 1, 100) AS varchar), 2, '0')  AS season,
+        -- #913 Phase 2
+        CASE WHEN m.league = 'INT-World Cup'
+             THEN LPAD(CAST(m.season AS varchar), 4, '0')
+             ELSE LPAD(CAST(MOD(m.season, 100) AS varchar), 2, '0')
+                  || LPAD(CAST(MOD(m.season + 1, 100) AS varchar), 2, '0')
+        END  AS season,
         s.date                                            AS match_date,
         CASE m.side WHEN 'home' THEN s.home ELSE s.away END  AS schedule_team,
         xm.canonical_id                                   AS manager_canonical_id
@@ -80,8 +84,11 @@ WITH manager_match_log AS (
         ON  xm.source     = 'fbref'
         AND xm.source_id  = m.manager_name
         AND xm.league     = m.league
-        AND xm.season     = LPAD(CAST(MOD(m.season, 100) AS varchar), 2, '0')
-                            || LPAD(CAST(MOD(m.season + 1, 100) AS varchar), 2, '0')
+        AND xm.season     = CASE WHEN m.league = 'INT-World Cup'
+                                 THEN LPAD(CAST(m.season AS varchar), 4, '0')
+                                 ELSE LPAD(CAST(MOD(m.season, 100) AS varchar), 2, '0')
+                                      || LPAD(CAST(MOD(m.season + 1, 100) AS varchar), 2, '0')
+                            END
     WHERE m.manager_name IS NOT NULL
       AND m.manager_name <> ''
 ),

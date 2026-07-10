@@ -33,19 +33,17 @@ Public API contract (frozen for T2/T3)
 * :func:`get_team_alias_sql_values(source)` -> str  (SQL VALUES body)
 * :func:`get_in_scope_competitions` -> list[str]
 * :func:`get_competition_seasons(competition_id)` -> list[int]
+* :func:`get_competition_season_format(competition_id, season_id)` -> str
 * :func:`render_sql_template(sql_path, **context)` -> str
 
 The signatures above are the only thing T2/T3 may rely on. Internal
 helpers (``_escape_sql_string``, ``_iter_team_aliases``) may change
 without warning.
 
-TODO(multi-league): every ``*_in_scope`` / ``_iter_*_aliases`` helper
-defaults a missing ``competition_scope`` to ``['ENG-Premier League']`` —
-a silent APL fallback that becomes a trap the moment a second league is
-in scope (an unscoped alias would leak into ALL leagues as APL-only, or
-worse, be assumed APL when meant for the new league). Before onboarding
-league #2, make ``competition_scope`` MANDATORY in the YAML schema
-validators and drop the ``or ['ENG-Premier League']`` defaults.
+# competition_scope is now MANDATORY (Фаза 4 #913, INT-World Cup onboarding).
+# All helpers enforce non-empty list; validator in _validate_team_aliases_schema
+# (and mirrors) reject missing/empty. No more silent APL default. This was the
+# last footgun before multi-competition (UCL/Top5 + WC).
 """
 
 from __future__ import annotations
@@ -140,6 +138,15 @@ def _validate_team_aliases_schema(doc: Dict) -> None:
                     f"team_aliases.yaml: teams[{i}] ({t.get('canonical_name')}) "
                     f"missing/empty '{field}' (required for gold.dim_team)"
                 )
+        # competition_scope mandatory (Фаза 4 #913): no more silent default to
+        # ['ENG-Premier League']. Required list of competition ids (strings).
+        scope = t.get('competition_scope')
+        if not isinstance(scope, list) or not scope or not all(isinstance(x, str) and x for x in scope):
+            raise MedallionConfigError(
+                f"team_aliases.yaml: teams[{i}] ({t.get('canonical_name')}) "
+                f"missing/invalid 'competition_scope' (required non-empty list of str; "
+                f"no more silent APL default)"
+            )
 
 
 def _validate_referee_aliases_schema(doc: Dict) -> None:
@@ -393,6 +400,27 @@ def _validate_competitions_schema(doc: Dict) -> None:
                 f"competitions.yaml: competitions[{i}] ({c.get('id')}) "
                 f"missing/empty 'country' (required for gold.dim_competition)"
             )
+        # Validate seasons list and season_format (issue #913 Phase 2).
+        # season_format per-season is optional; default 'split_year' everywhere
+        # except explicit single-year tournaments (e.g. INT-World Cup 2026).
+        for j, s in enumerate(c.get('seasons') or []):
+            if not isinstance(s, dict) or 'id' not in s:
+                raise MedallionConfigError(
+                    f"competitions.yaml: competitions[{i}].seasons[{j}] "
+                    f"must be a mapping with 'id'"
+                )
+            sid = s['id']
+            if not isinstance(sid, int) or sid <= 0:
+                raise MedallionConfigError(
+                    f"competitions.yaml: competitions[{i}].seasons[{j}].id "
+                    f"must be positive int (got {sid!r})"
+                )
+            fmt = s.get('season_format')
+            if fmt is not None and fmt not in ('single_year', 'split_year'):
+                raise MedallionConfigError(
+                    f"competitions.yaml: competitions[{i}].seasons[{j}].season_format "
+                    f"must be 'single_year' or 'split_year' (got {fmt!r})"
+                )
 
 
 def _validate_country_codes_schema(doc: Dict) -> None:
@@ -648,11 +676,11 @@ def load_source_priority() -> Dict:
 
 def _team_in_scope(team: Dict, competition: Optional[str]) -> bool:
     """True if this team's competition_scope contains `competition`,
-    OR if no competition filter was requested. Missing competition_scope
-    is treated as "applies to ENG-Premier League" (default for E1)."""
+    OR if no competition filter was requested.
+    competition_scope is now mandatory (Фаза 4 #913); no default."""
     if competition is None:
         return True
-    scope = team.get('competition_scope') or ['ENG-Premier League']
+    scope = team.get('competition_scope') or []
     return competition in scope
 
 
@@ -672,7 +700,7 @@ def _iter_team_aliases(
       * competition=X    -> teams whose competition_scope contains X.
 
     When ``include_league=True`` each alias is emitted once per competition in
-    the team's ``competition_scope`` (defaulting to ``['ENG-Premier League']``)
+    the team's ``competition_scope`` (mandatory since #913 Phase 4)
     as a 4-tuple ``(raw, canonical, canonical_id, league)``. This lets the
     xref_team alias JOIN add an ``a.league = rt.league`` predicate (issue #148)
     so a bare short name disambiguates by league at worldwide scope. When
@@ -694,7 +722,7 @@ def _iter_team_aliases(
         # In league mode, fan each alias out over the team's scope. The [None]
         # sentinel keeps the non-league path at the historical 3-tuple shape.
         leagues = (
-            (team.get('competition_scope') or ['ENG-Premier League'])
+            (team.get('competition_scope') or [])
             if include_league else [None]
         )
 
@@ -874,7 +902,7 @@ def _referee_in_scope(referee: Dict, competition: Optional[str]) -> bool:
     no competition filter was requested. Missing scope defaults to APL (E1)."""
     if competition is None:
         return True
-    scope = referee.get('competition_scope') or ['ENG-Premier League']
+    scope = referee.get('competition_scope') or []
     return competition in scope
 
 
@@ -899,7 +927,7 @@ def _iter_referee_aliases(
         canonical_id = referee['canonical_id']
         aliases = referee.get('aliases') or {}
         leagues = (
-            (referee.get('competition_scope') or ['ENG-Premier League'])
+            (referee.get('competition_scope') or [])
             if include_league else [None]
         )
 
@@ -986,7 +1014,7 @@ def _manager_in_scope(manager: Dict, competition: Optional[str]) -> bool:
     no competition filter was requested. Missing scope defaults to APL."""
     if competition is None:
         return True
-    scope = manager.get('competition_scope') or ['ENG-Premier League']
+    scope = manager.get('competition_scope') or []
     return competition in scope
 
 
@@ -1012,7 +1040,7 @@ def _iter_manager_aliases(
         canonical_id = manager['canonical_id']
         aliases = manager.get('aliases') or {}
         leagues = (
-            (manager.get('competition_scope') or ['ENG-Premier League'])
+            (manager.get('competition_scope') or [])
             if include_league else [None]
         )
 
@@ -1086,7 +1114,7 @@ def _venue_in_scope(venue: Dict, competition: Optional[str]) -> bool:
     competition filter was requested. Missing scope defaults to APL (E2)."""
     if competition is None:
         return True
-    scope = venue.get('competition_scope') or ['ENG-Premier League']
+    scope = venue.get('competition_scope') or []
     return competition in scope
 
 
@@ -1117,7 +1145,7 @@ def _iter_venue_aliases(
         country = venue['country']
         capacity = venue.get('capacity')
         aliases = venue.get('aliases') or {}
-        leagues = venue.get('competition_scope') or ['ENG-Premier League']
+        leagues = venue.get('competition_scope') or []
 
         buckets: List[str] = [_GENERIC_BUCKET]
         if source is None:
@@ -1188,8 +1216,10 @@ def get_venue_alias_sql_values(
 def get_team_meta_sql_values() -> str:
     """Render team metadata tuples as a Trino VALUES body (issue #425).
 
-    Emits four-tuples ``(team_id, team_name, country, short_name)`` — one per
-    club in team_aliases.yaml — consumed by ``dim_team.sql.j2``. Mirrors
+    Emits five-tuples ``(team_id, team_name, country, short_name, team_type)``
+    — one per team (club or national) in team_aliases.yaml — consumed by
+    ``dim_team.sql.j2`` (Фаза 3 #913). team_type defaults to 'club' for
+    backward compat with existing club-only entries. Mirrors
     :func:`get_venue_alias_sql_values`; empty result raises because an empty
     VALUES clause is invalid Trino.
     """
@@ -1203,7 +1233,8 @@ def get_team_meta_sql_values() -> str:
         f"    ('{_escape_sql_string(t['canonical_id'])}', "
         f"'{_escape_sql_string(t['canonical_name'])}', "
         f"'{_escape_sql_string(t['country'])}', "
-        f"'{_escape_sql_string(t['short_name'])}')"
+        f"'{_escape_sql_string(t['short_name'])}', "
+        f"'{_escape_sql_string(t.get('team_type') or 'club')}')"
         for t in teams
     ]
     return ',\n'.join(lines).lstrip()
@@ -1326,6 +1357,105 @@ def get_competition_seasons(competition_id: str) -> List[int]:
         if c['id'] == competition_id:
             return [s['id'] for s in (c.get('seasons') or [])]
     raise KeyError(f"competition not found in competitions.yaml: {competition_id!r}")
+
+
+def get_competition_season_format(competition_id: str, season_id: int) -> str:
+    """Return 'single_year' or 'split_year' for a (competition, season).
+
+    Default is 'split_year' (the historic club-league convention).
+    Used by Phase 2 (#913) to make slug conversion and dim_season
+    aware of single-year tournaments such as INT-World Cup 2026.
+    """
+    doc = load_competitions()
+    for c in doc['competitions']:
+        if c['id'] == competition_id:
+            for s in (c.get('seasons') or []):
+                if int(s['id']) == int(season_id):
+                    return s.get('season_format', 'split_year')
+            break
+    return 'split_year'
+
+
+def get_active_single_year_season(
+    competition_id: str,
+    today: Optional['datetime.date'] = None,
+    grace_days: int = 14,
+) -> Optional[int]:
+    """The single_year season id whose [start, end + grace] window contains
+    ``today``, or None when the tournament is out of window / unknown.
+
+    Bridge until #920: ingest runners pass the club-formula CURRENT_SEASON
+    (July 2026 -> 2025) to every league, which for INT-World Cup silently
+    fetched the WRONG edition on some sources (ESPN answered the 2018 WC) or
+    mislabelled current data under season=2025 (FotMob/FBref daily runs).
+    Runners call this to substitute the tournament year for single_year
+    competitions while the tournament is running; ``grace_days`` keeps the
+    window open after the final for late re-scrapes/fix-ups.
+    """
+    import datetime as _dt
+
+    if today is None:
+        today = _dt.date.today()
+    doc = load_competitions()
+    for c in doc['competitions']:
+        if c['id'] != competition_id:
+            continue
+        for s in (c.get('seasons') or []):
+            if s.get('season_format') != 'single_year':
+                continue
+            try:
+                start = _dt.date.fromisoformat(str(s['start']))
+                end = _dt.date.fromisoformat(str(s['end']))
+            except (KeyError, ValueError):
+                continue
+            if start <= today <= end + _dt.timedelta(days=grace_days):
+                return int(s['id'])
+        break
+    return None
+
+
+def is_single_year_competition(competition_id: str) -> bool:
+    """True if any season entry for this competition is season_format:
+    single_year (tournaments such as INT-World Cup, as opposed to split_year
+    club leagues). Used by #920 Phase 1 ingest DAGs to route a league to the
+    club batch or to its own dedicated per-tournament task, without any
+    date/window logic (that lives in get_active_season below)."""
+    doc = load_competitions()
+    for c in doc['competitions']:
+        if c['id'] != competition_id:
+            continue
+        return any(
+            s.get('season_format') == 'single_year'
+            for s in (c.get('seasons') or [])
+        )
+    return False
+
+
+def get_active_season(
+    competition_id: str,
+    today: Optional['datetime.date'] = None,
+) -> Optional[int]:
+    """Unify the split_year club formula and single_year tournament windows
+    (#920 Phase 1).
+
+    split_year (default, club leagues): the club-formula season (``today.year``
+    if ``today.month >= 8`` else ``today.year - 1``) — the same formula as
+    ``dags/utils/config.py::get_current_season()``, but parameterized by
+    ``today`` instead of hardcoding ``datetime.now()`` so this function is
+    deterministically testable on both branches via the ``today`` argument.
+
+    single_year (``is_single_year_competition(competition_id)``, e.g.
+    INT-World Cup): delegates to ``get_active_single_year_season`` — the
+    season id whose ``[start, end + grace]`` window contains ``today``, else
+    ``None`` (out of window — caller should treat this league as inactive).
+    """
+    import datetime as _dt
+
+    if today is None:
+        today = _dt.date.today()
+    if is_single_year_competition(competition_id):
+        return get_active_single_year_season(competition_id, today=today)
+    return today.year if today.month >= 8 else today.year - 1
 
 
 # ---------------------------------------------------------------------------

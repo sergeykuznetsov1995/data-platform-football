@@ -12,9 +12,11 @@
 --               column on every fact after #404, so JOINs need no mapping)
 -- Partitioning: NONE  (config-driven dim, a handful of rows)
 --
--- is_current: the latest season already started (max slug with
+-- is_current: the latest season already started (max start_date with
 -- start_date <= today). Exactly one row is TRUE year-round — a plain
 -- "today BETWEEN start AND end" would flag zero rows during the summer gap.
+-- For single_year seasons (e.g. INT-World Cup '2026') season_name and
+-- the slug itself are the literal year (issue #913 Phase 2).
 --
 -- The {{ rows }} placeholder is substituted by render_dim_season_sql();
 -- one tuple per distinct season slug.
@@ -24,9 +26,10 @@
 select * from (values
 {{ rows }}
 ) as t(
-    season,               -- PK, slug e.g. '2425'
-    season_name,          -- e.g. '2024-25'
+    season,               -- PK, slug e.g. '2425' or '2026'
+    season_name,          -- e.g. '2024-25' or '2026'
     start_date,           -- DATE, first matchday from competitions.yaml
     end_date,             -- DATE, last matchday from competitions.yaml
-    is_current            -- BOOLEAN — exactly one row TRUE
+    is_current,           -- BOOLEAN — exactly one row TRUE
+    season_kind           -- 'split_year' | 'single_year' (#913 Phase 2)
 )

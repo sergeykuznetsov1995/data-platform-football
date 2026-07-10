@@ -107,8 +107,12 @@ SELECT
     s.league,
     -- season → slug ('2425'); FBref bronze stores year-start bigint (2024).
     -- JOINs below stay on the native year-start (all intra-FBref), convert once here.
-    LPAD(CAST(MOD(s.season,     100) AS varchar), 2, '0')
-        || LPAD(CAST(MOD(s.season + 1, 100) AS varchar), 2, '0') AS season,
+    -- #913 Phase 2
+    CASE WHEN s.league = 'INT-World Cup'
+         THEN LPAD(CAST(s.season AS varchar), 4, '0')
+         ELSE LPAD(CAST(MOD(s.season, 100) AS varchar), 2, '0')
+              || LPAD(CAST(MOD(s.season + 1, 100) AS varchar), 2, '0')
+    END AS season,
 
     -- ========= Standard stats (s) =========
     s."# pl"                                         AS players_used,

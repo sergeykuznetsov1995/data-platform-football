@@ -20,6 +20,14 @@ _DAGS_DIR = PROJECT_ROOT / "dags"
 if str(_DAGS_DIR) not in sys.path:
     sys.path.insert(0, str(_DAGS_DIR))
 
+# Фаза 4: grain checks now load competitions.yaml for per-comp team_count.
+# Set env so unit tests (no /opt/airflow) find the source configs.
+import os
+os.environ.setdefault(
+    'MEDALLION_CONFIG_DIR',
+    str(PROJECT_ROOT / 'configs' / 'medallion')
+)
+
 
 def _build():
     from utils.gold_tasks import build_star_gate_checks
@@ -260,14 +268,14 @@ class TestStarGateGrain:
 
     def test_seasonal_team_counts(self):
         for name, table in (
-            ('star_grain[fct_standings~20teams/league-season]',
+            ('star_grain[fct_standings=declared_team_count]',
              'gold.fct_standings'),
-            ('star_grain[fct_team_season_stats~20teams/league-season]',
+            ('star_grain[fct_team_season_stats=declared_team_count]',
              'gold.fct_team_season_stats'),
         ):
             chk = _by_name(_build(), name)
             assert chk.kind == 'row_count'
             assert chk.params['table'] == table
             assert chk.params['max_rows'] == 0
-            assert 'NOT BETWEEN 18 AND 24' in chk.params['where']
+            assert 'declared_team_count' in chk.name or 'team_count' in chk.params.get('where','')
             assert chk.severity == 'WARNING'

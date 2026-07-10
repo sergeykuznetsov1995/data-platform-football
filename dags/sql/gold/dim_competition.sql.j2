@@ -22,5 +22,7 @@ select * from (values
     league,                   -- PK, slug e.g. 'ENG-Premier League'
     competition_name,         -- e.g. 'English Premier League'
     country,                  -- e.g. 'England' ('Europe' for UEFA cups)
-    tier                      -- 1 = top flight
+    tier,                     -- 1 = top flight
+    competition_format,       -- 'league_round_robin' | 'group_knockout' (#913 Phase 3)
+    is_international          -- true for INT- competitions (WC etc.)
 )

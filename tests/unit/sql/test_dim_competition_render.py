@@ -40,7 +40,7 @@ _DAGS_DIR = PROJECT_ROOT / "dags"
 if str(_DAGS_DIR) not in sys.path:
     sys.path.insert(0, str(_DAGS_DIR))
 
-EXPECTED_COLUMNS = ["league", "competition_name", "country", "tier"]
+EXPECTED_COLUMNS = ["league", "competition_name", "country", "tier", "competition_format", "is_international"]
 
 _COMPETITIONS_YAML_CONTENT = textwrap.dedent("""\
     competitions:
@@ -134,10 +134,10 @@ class TestDimCompetitionRender:
     def test_league_pk_is_slug_verbatim(self, rendered_sql):
         """PK ``league`` carries the competition slug verbatim — the same
         value as the ``league`` column on every fact (no mapping needed)."""
-        assert "('ENG-Premier League', 'English Premier League', 'England', 1)" \
+        assert "('ENG-Premier League', 'English Premier League', 'England', 1, 'league_round_robin', false)" \
             in rendered_sql
 
-    def test_four_fields_per_tuple(self, rendered_sql):
+    def test_six_fields_per_tuple(self, rendered_sql):
         rows = re.findall(
             r"\(\s*'(?:ENG|ESP|FRA)[^)]*\)",
             rendered_sql,
@@ -147,8 +147,8 @@ class TestDimCompetitionRender:
             # The FRA row contains an escaped apostrophe ('') — strip doubled
             # quotes before the naive comma split.
             fields = row.replace("''", "").split(",")
-            assert len(fields) == 4, (
-                f"expected 4 fields per row, got {len(fields)}: {row!r}"
+            assert len(fields) == 6, (
+                f"expected 6 fields per row, got {len(fields)}: {row!r}"
             )
 
     def test_apostrophe_escaped(self, rendered_sql):

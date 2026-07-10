@@ -171,6 +171,18 @@ KNOWN_PAIRS_BY_LEAGUE: Dict[str, Tuple[Tuple[str, str], ...]] = {
         ('Bruno Guimarães', 'fb_82518f62'),
         ('Joško Gvardiol', 'fb_5ad50391'),
     ),
+    # #913 Phase 4: WC anchors (regression guard). Real fbref IDs for key
+    # participants in 2026 World Cup. Sourced from fbref.com player pages.
+    'INT-World Cup': (
+        ('Lionel Messi', 'fb_d70ce98e'),          # Argentina
+        ('Kylian Mbappé', 'fb_42fd9c7f'),         # France
+        ('Harry Kane', 'fb_21a66f6a'),            # England
+        ('Neymar', 'fb_69384e5d'),                # Brazil
+        ('Virgil van Dijk', 'fb_e06683ca'),       # Netherlands
+        ('Mohamed Salah', 'fb_e342ad68'),         # Egypt
+        ('Luka Modrić', 'fb_6025fab1'),           # Croatia
+        ('Emiliano Martínez', 'fb_7956236f'),     # Argentina GK
+    ),
 }
 
 #: Back-compat alias — the APL anchor set (tests and the proto script refer
@@ -926,7 +938,7 @@ def _fetch_fbref_players(
     out: List[Dict[str, Any]] = []
     seen: set = set()
     for pid, name, squad, lg, season in rows:
-        season_slug = _fbref_year_to_slug(season)
+        season_slug = _fbref_year_to_slug(season, league=lg)
         # Dedup by (pid, squad, season): mid-season transfers (e.g. Palmer
         # Man City->Chelsea in 2023-24) produce two FBref rows in the same
         # season — keep both so spine carries the player in both team
@@ -1070,15 +1082,18 @@ def _fetch_fotmob_players(
     FBref-style year list to slugs for the filter. player_stats season is a
     bigint year-of-start → fold to a slug in-query so the minutes join aligns.
     """
-    season_slugs = [_fbref_year_to_slug(y) for y in fbref_seasons]
+    season_slugs = [_fbref_year_to_slug(y, league=league) for y in fbref_seasons]
     sql = f"""
         WITH stats_slug AS (
             SELECT
                 CAST(participant_id AS VARCHAR) AS player_id,
                 league,
-                LPAD(CAST(MOD(season,     100) AS varchar), 2, '0')
-                    || LPAD(CAST(MOD(season + 1, 100) AS varchar), 2, '0')
-                    AS season,
+                -- #913 Phase 2: single_year (WC stores full year in bronze)
+                CASE WHEN league = 'INT-World Cup'
+                     THEN LPAD(CAST(season AS varchar), 4, '0')
+                     ELSE LPAD(CAST(MOD(season, 100) AS varchar), 2, '0')
+                          || LPAD(CAST(MOD(season + 1, 100) AS varchar), 2, '0')
+                END AS season,
                 minutes_played
             FROM iceberg.bronze.fotmob_player_stats
             WHERE league = '{_sql_escape(league)}'
@@ -2278,6 +2293,13 @@ def _dedup_canonical_per_season(
 #: Core hard-gate source set — the original R2 regression contract.
 _KNOWN_PAIR_CORE_SOURCES = frozenset({'fbref', 'understat', 'whoscored'})
 
+#: Per-league overrides of the core gate sources. Understat covers only the
+#: six club leagues — requiring it for INT-World Cup made the WC anchor gate
+#: structurally unpassable (0/8 on every run, #913 Phase 4).
+_KNOWN_PAIR_CORE_SOURCES_BY_LEAGUE: Dict[str, frozenset] = {
+    'INT-World Cup': frozenset({'fbref', 'whoscored'}),
+}
+
 #: Extended WARNING-only gate: SofaScore names come from a possibly-sparse
 #: profile JOIN and FotMob has a separate ingest, so these were historically
 #: excluded from the hard assertion. Verified softly until live pass-rates
@@ -2318,48 +2340,59 @@ def _verify_known_pairs(
 # ---------------------------------------------------------------------------
 # Season helpers
 # ---------------------------------------------------------------------------
-def _slug_to_fbref_year(slug: int) -> int:
+def _slug_to_fbref_year(slug: int, league: str = None) -> int:
     """Convert season slug (e.g. 2425 for 2024-25) to FBref year-of-start (2024).
 
-    YAML/Bronze varchar use slug; FBref Bronze stores integer year-of-start.
-    Mapping: ``slug // 100 + 2000``.
-
-        2122 -> 2021
-        2425 -> 2024
-        2526 -> 2025
-
-    Raises:
-        ValueError: if slug is not a 4-digit ``yyXX`` value.
+    For single_year competitions (e.g. INT-World Cup slug '2026') the
+    FBref year is the slug itself. When ``league`` is supplied the decision
+    is driven by competitions.yaml season_format (#913 Phase 2).
     """
-    if slug < 100:
-        raise ValueError(f"season slug must be 4-digit yyXX (got {slug})")
-    return (slug // 100) + 2000
+    from utils.medallion_config import get_competition_season_format
+
+    slug_int = int(slug)
+    if league:
+        fmt = get_competition_season_format(league, slug_int)
+        if fmt == 'single_year':
+            return slug_int
+    if slug_int < 100:
+        raise ValueError(f"season slug must be 4-digit yyXX (got {slug_int})")
+    return (slug_int // 100) + 2000
 
 
-def _fbref_year_to_slug(year) -> str:
-    """Inverse of _slug_to_fbref_year. 2024 -> '2425', '2024' -> '2425'."""
+def _fbref_year_to_slug(year, league: str = None) -> str:
+    """Inverse of _slug_to_fbref_year. 2024 -> '2425'; for WC 2026 -> '2026'."""
+    from utils.medallion_config import get_competition_season_format
+
     y = int(year)
+    if league:
+        # For single_year the "year" stored in bronze == the slug we want.
+        # We can use the id (y) directly as season id for lookup.
+        fmt = get_competition_season_format(league, y)
+        if fmt == 'single_year':
+            return f"{y:04d}"
     return f"{(y - 2000):02d}{(y - 2000 + 1):02d}"
 
 
-def _split_seasons(slugs: List[int]) -> Tuple[List[int], List[str]]:
+def _split_seasons(league: str, slugs: List[int]) -> Tuple[List[int], List[str]]:
     """Map slug list ``[2425]`` -> ``(fbref=[2024], legacy=['2425'])``.
 
-    Conventions across the platform:
-      * YAML / public resolver API     -> 4-digit slug ``yyXX`` (``2425``).
-      * FBref Bronze ``season`` (bigint) -> year-of-start (``2024``).
-      * Understat / WhoScored Bronze ``season`` (varchar) -> slug (``'2425'``).
-
-    The split is what lets FBref filters use ``season IN (2024)`` while
-    Understat/WhoScored filters use ``season IN ('2425')`` from a single
-    YAML-derived input list.
+    For single_year league (INT-World Cup) both sides are the literal year.
+    When league is known we consult season_format so WC '2026' is not turned
+    into fbref 2020 / slug '2627'.
     """
+    from utils.medallion_config import get_competition_season_format
+
     fbref: List[int] = []
     legacy: List[str] = []
     for slug in slugs:
         slug_int = int(slug)
-        fbref.append(_slug_to_fbref_year(slug_int))
-        legacy.append(f"{slug_int:04d}")
+        fmt = get_competition_season_format(league, slug_int) if league else 'split_year'
+        if fmt == 'single_year':
+            fbref.append(slug_int)
+            legacy.append(f"{slug_int:04d}")
+        else:
+            fbref.append(_slug_to_fbref_year(slug_int))
+            legacy.append(f"{slug_int:04d}")
     return fbref, legacy
 
 
@@ -2484,7 +2517,7 @@ def run_resolver(
 
     if seasons is None:
         seasons = _default_seasons_from_config(league)
-    fbref_seasons, source_seasons = _split_seasons(seasons)
+    fbref_seasons, source_seasons = _split_seasons(league, seasons)
 
     logger.info(
         "Starting xref_player v2 resolver: target=%s review=%s league=%s "
@@ -2598,8 +2631,10 @@ def run_resolver(
             known_passed = known_total = None
             ext_passed = ext_total = None
         else:
+            core_sources = _KNOWN_PAIR_CORE_SOURCES_BY_LEAGUE.get(
+                league, _KNOWN_PAIR_CORE_SOURCES)
             known_passed, known_total = _verify_known_pairs(
-                rows, pairs=league_pairs
+                rows, required_sources=core_sources, pairs=league_pairs
             )
             if known_passed < KNOWN_PAIR_MIN_PASS:
                 raise ResolverError(

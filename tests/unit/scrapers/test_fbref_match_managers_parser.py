@@ -78,7 +78,7 @@ class TestParseMatchManagers:
 
         home = df[df["side"] == "home"].iloc[0]
         assert home["manager_name"] == "Arsène Wenger"
-        assert home["manager_fbref_id"] is None
+        assert pd.isna(home["manager_fbref_id"])  # None in pandas<3, NaN in pandas 3 object coercion
 
         away = df[df["side"] == "away"].iloc[0]
         assert away["manager_fbref_id"] == "cccccccc"
@@ -168,7 +168,7 @@ class TestParseMatchManagers:
             f"NBSP must be normalised to ASCII space, got "
             f"{home['manager_name']!r}"
         )
-        assert home["manager_fbref_id"] is None
+        assert pd.isna(home["manager_fbref_id"])  # None in pandas<3, NaN in pandas 3 object coercion
 
         assert away["team"] == "Bournemouth"
         assert away["manager_name"] == "Andoni Iraola"

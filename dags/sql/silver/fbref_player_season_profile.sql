@@ -135,8 +135,12 @@ SELECT
     -- season → slug ('2425'); FBref bronze stores year-start bigint (2024).
     -- JOINs above stay on the native year-start (all intra-FBref), convert once here.
     s.league,
-    LPAD(CAST(MOD(s.season,     100) AS varchar), 2, '0')
-        || LPAD(CAST(MOD(s.season + 1, 100) AS varchar), 2, '0') AS season
+    -- #913 Phase 2
+    CASE WHEN s.league = 'INT-World Cup'
+         THEN LPAD(CAST(s.season AS varchar), 4, '0')
+         ELSE LPAD(CAST(MOD(s.season, 100) AS varchar), 2, '0')
+              || LPAD(CAST(MOD(s.season + 1, 100) AS varchar), 2, '0')
+    END AS season
 
 FROM s
 LEFT JOIN sh
@@ -158,3 +162,9 @@ LEFT JOIN mi
     AND s.season    = mi.season
     AND mi.rn       = 1
 WHERE s.rn = 1
+  -- A handful of bronze rows carry an EMPTY player_id (player row without an
+  -- FBref profile link, e.g. Serie A 16/17 youth one-appearance players).
+  -- The Silver PK is (player_id, squad, league, season) and downstream xref
+  -- joins on player_id — a blank key row is unusable and trips the no_nulls
+  -- DQ gate. Same convention as the other silver player tables.
+  AND NULLIF(s.player_id, '') IS NOT NULL
