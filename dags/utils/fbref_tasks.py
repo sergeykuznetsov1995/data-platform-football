@@ -35,6 +35,9 @@ TASK_ENV = {
     # (anti-detect Firefox) Turnstile solver. Overridable per-deploy; unset
     # (or =nodriver) reverts to the legacy path.
     'FBREF_TRANSPORT': os.environ.get('FBREF_TRANSPORT', 'camoufox'),
+    # Logical identity for idempotent no-stats observations. Airflow task
+    # retries render the same run_id instead of inflating confirmation count.
+    'FBREF_RUN_ID': '{{ run_id }}',
 }
 
 
@@ -53,7 +56,7 @@ def _build_nodriver_command(
     stat_type: str | None = None,
     data_category: str | None = None,
     match_data_type: str | None = None,
-    traffic_output: str | None = None,
+    traffic_output_file: str | None = None,
 ) -> str:
     """Build bash command for nodriver scraper type."""
     nodriver_args = []
@@ -67,9 +70,6 @@ def _build_nodriver_command(
     nodriver_args.append(f'--content-timeout {content_timeout}')
     nodriver_args.append(f'--max-retries {max_retries}')
     nodriver_args.append(f'--cf-verify-retries {cf_verify_retries}')
-    if traffic_output:
-        nodriver_args.append(f'--traffic-output {traffic_output}')
-
     mode_args = ''
     if mode == 'single_stat':
         mode_args = (
@@ -83,15 +83,22 @@ def _build_nodriver_command(
             f'    --match-data-type {match_data_type}'
         )
 
+    traffic_arg = (
+        f'--traffic-output "{traffic_output_file}"'
+        if traffic_output_file else ''
+    )
+    output_dir = output_file.rsplit('/', 1)[0]
+
     return f"""
+mkdir -p "{output_dir}" && \\
 cd /opt/airflow && \\
 python dags/scripts/run_fbref_scraper.py \\
     --scraper-type nodriver \\
     {' '.join(nodriver_args)} \\
     {mode_args} \\
-    --leagues "{leagues_str}" \\
-    --season {season} \\
-    --output {output_file}
+    --leagues "$FBREF_LEAGUES" \\
+    --season {season} {traffic_arg} \\
+    --output "{output_file}"
 """
 
 
@@ -109,7 +116,7 @@ def _build_selenium_command(
     data_category: str | None = None,
     match_data_type: str | None = None,
     max_matches: int = 0,
-    traffic_output: str | None = None,
+    traffic_output_file: str | None = None,
 ) -> str:
     """Build bash command for selenium scraper type."""
     selenium_args_list = []
@@ -122,8 +129,6 @@ def _build_selenium_command(
         selenium_args_list.append(f'--nodriver-cloudflare-wait {nodriver_cloudflare_wait}')
     if proxy_file:
         selenium_args_list.append(f'--proxy-file {proxy_file}')
-    if traffic_output:
-        selenium_args_list.append(f'--traffic-output {traffic_output}')
     selenium_args = ' '.join(selenium_args_list)
 
     mode_args = ''
@@ -147,15 +152,22 @@ def _build_selenium_command(
     elif mode == 'combined_season_stats':
         mode_args = '--mode combined_season_stats'
 
+    traffic_arg = (
+        f'--traffic-output "{traffic_output_file}"'
+        if traffic_output_file else ''
+    )
+    output_dir = output_file.rsplit('/', 1)[0]
+
     return f"""
+mkdir -p "{output_dir}" && \\
 cd /opt/airflow && \\
 python dags/scripts/run_fbref_scraper.py \\
     --scraper-type selenium \\
     {selenium_args} \\
     {mode_args} \\
-    --leagues "{leagues_str}" \\
-    --season {season} \\
-    --output {output_file}
+    --leagues "$FBREF_LEAGUES" \\
+    --season {season} {traffic_arg} \\
+    --output "{output_file}"
 """
 
 
@@ -179,6 +191,7 @@ def create_single_stat_task(
     use_tor: bool = False,
     tor_host: str = 'tor',
     tor_port: int = 9050,
+    artifact_dir: str = '/tmp',
 ) -> BashOperator:
     """
     Create a BashOperator task for collecting a single stat_type.
@@ -206,7 +219,8 @@ def create_single_stat_task(
     del use_tor, tor_host, tor_port
 
     task_id = f'{data_category}_{stat_type}'
-    output_file = f'/tmp/fbref_{task_id}.json'
+    output_file = f'{artifact_dir}/fbref_{task_id}.json'
+    traffic_output_file = f'{artifact_dir}/fbref_traffic_{task_id}.json'
 
     if scraper_type == 'nodriver':
         bash_command = _build_nodriver_command(
@@ -223,6 +237,7 @@ def create_single_stat_task(
             cf_verify_retries=nodriver_cf_verify_retries,
             stat_type=stat_type,
             data_category=data_category,
+            traffic_output_file=traffic_output_file,
         )
     else:
         bash_command = _build_selenium_command(
@@ -237,12 +252,17 @@ def create_single_stat_task(
             proxy_file=proxy_file,
             stat_type=stat_type,
             data_category=data_category,
+            traffic_output_file=traffic_output_file,
         )
 
     return BashOperator(
         task_id=task_id,
         bash_command=bash_command,
-        env=TASK_ENV,
+        env={
+            **TASK_ENV,
+            'FBREF_RUN_DIR': artifact_dir,
+            'FBREF_LEAGUES': leagues_str,
+        },
         append_env=True,
     )
 
@@ -268,6 +288,7 @@ def create_match_data_task(
     tor_host: str = 'tor',
     tor_port: int = 9050,
     task_id_suffix: str = '',
+    artifact_dir: str = '/tmp',
 ) -> BashOperator:
     """
     Create a BashOperator task for collecting match-level data.
@@ -302,11 +323,13 @@ def create_match_data_task(
     del use_tor, tor_host, tor_port  # legacy soccerdata kwargs, ignored
 
     task_id = f'match_{data_type}{task_id_suffix}'
-    output_file = f'/tmp/fbref_{task_id}.json'
+    output_file = f'{artifact_dir}/fbref_{task_id}.json'
     # The runner labels its traffic-summary file f'match_{data_type}'
     # regardless of league (run_fbref_scraper.py) — must pass --traffic-output
     # explicitly so a parallel call doesn't clobber the default call's file.
-    traffic_output = f'/tmp/fbref_traffic_match_{data_type}{task_id_suffix}.json'
+    traffic_output_file = (
+        f'{artifact_dir}/fbref_traffic_match_{data_type}{task_id_suffix}.json'
+    )
 
     # For detailed match data, fall back to selenium (nodriver only supports schedule)
     effective_scraper = scraper_type
@@ -328,7 +351,7 @@ def create_match_data_task(
             max_retries=nodriver_max_retries,
             cf_verify_retries=nodriver_cf_verify_retries,
             match_data_type=data_type,
-            traffic_output=traffic_output,
+            traffic_output_file=traffic_output_file,
         )
     else:
         bash_command = _build_selenium_command(
@@ -343,13 +366,17 @@ def create_match_data_task(
             proxy_file=proxy_file,
             match_data_type=data_type,
             max_matches=max_matches,
-            traffic_output=traffic_output,
+            traffic_output_file=traffic_output_file,
         )
 
     return BashOperator(
         task_id=task_id,
         bash_command=bash_command,
-        env=TASK_ENV,
+        env={
+            **TASK_ENV,
+            'FBREF_RUN_DIR': artifact_dir,
+            'FBREF_LEAGUES': leagues_str,
+        },
         append_env=True,
     )
 
@@ -364,6 +391,7 @@ def create_combined_match_data_task(
     nodriver_cloudflare_wait: float = 30.0,
     proxy_file: str | None = None,
     task_id_suffix: str = '',
+    artifact_dir: str = '/tmp',
 ) -> BashOperator:
     """
     Create a BashOperator task for collecting ALL match-level data in one pass.
@@ -395,10 +423,12 @@ def create_combined_match_data_task(
         BashOperator task
     """
     task_id = f'match_all_data{task_id_suffix}'
-    output_file = f'/tmp/fbref_match_all_data{task_id_suffix}.json'
+    output_file = f'{artifact_dir}/fbref_match_all_data{task_id_suffix}.json'
     # Runner labels its traffic-summary file 'match_all_data' regardless of
     # league — must pass --traffic-output explicitly for a parallel call.
-    traffic_output = f'/tmp/fbref_traffic_match_all_data{task_id_suffix}.json'
+    traffic_output_file = (
+        f'{artifact_dir}/fbref_traffic_match_all_data{task_id_suffix}.json'
+    )
 
     bash_command = _build_selenium_command(
         mode='combined_match_data',
@@ -411,13 +441,17 @@ def create_combined_match_data_task(
         nodriver_cloudflare_wait=nodriver_cloudflare_wait,
         proxy_file=proxy_file,
         max_matches=max_matches,
-        traffic_output=traffic_output,
+        traffic_output_file=traffic_output_file,
     )
 
     return BashOperator(
         task_id=task_id,
         bash_command=bash_command,
-        env=TASK_ENV,
+        env={
+            **TASK_ENV,
+            'FBREF_RUN_DIR': artifact_dir,
+            'FBREF_LEAGUES': leagues_str,
+        },
         append_env=True,
         execution_timeout=timedelta(hours=4),
     )
@@ -432,6 +466,7 @@ def create_combined_season_stats_task(
     nodriver_cloudflare_wait: float = 30.0,
     proxy_file: str | None = None,
     task_id_suffix: str = '',
+    artifact_dir: str = '/tmp',
 ) -> BashOperator:
     """
     Create a BashOperator task for ALL season stats in one pass.
@@ -460,10 +495,12 @@ def create_combined_season_stats_task(
         BashOperator task
     """
     task_id = f'season_stats_all{task_id_suffix}'
-    output_file = f'/tmp/fbref_season_stats{task_id_suffix}.json'
+    output_file = f'{artifact_dir}/fbref_season_stats{task_id_suffix}.json'
     # Runner labels its traffic-summary file 'season_stats' regardless of
     # league — must pass --traffic-output explicitly for a parallel call.
-    traffic_output = f'/tmp/fbref_traffic_season_stats{task_id_suffix}.json'
+    traffic_output_file = (
+        f'{artifact_dir}/fbref_traffic_season_stats{task_id_suffix}.json'
+    )
 
     bash_command = _build_selenium_command(
         mode='combined_season_stats',
@@ -475,22 +512,27 @@ def create_combined_season_stats_task(
         use_nodriver=use_nodriver,
         nodriver_cloudflare_wait=nodriver_cloudflare_wait,
         proxy_file=proxy_file,
-        traffic_output=traffic_output,
+        traffic_output_file=traffic_output_file,
     )
 
     # Stale per-stat success files from the pre-combined architecture would
     # otherwise be picked up by validate_all_data (glob fbref_*.json) and
     # mask real failures.
     cleanup_cmd = (
-        'rm -f /tmp/fbref_player_*.json /tmp/fbref_team_*.json '
-        '/tmp/fbref_keeper_*.json'
+        f'rm -f "{artifact_dir}"/fbref_player_*.json '
+        f'"{artifact_dir}"/fbref_team_*.json '
+        f'"{artifact_dir}"/fbref_keeper_*.json'
     )
     bash_command = f'{cleanup_cmd} && {bash_command}'
 
     return BashOperator(
         task_id=task_id,
         bash_command=bash_command,
-        env=TASK_ENV,
+        env={
+            **TASK_ENV,
+            'FBREF_RUN_DIR': artifact_dir,
+            'FBREF_LEAGUES': leagues_str,
+        },
         append_env=True,
         execution_timeout=timedelta(hours=2),
     )

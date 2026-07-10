@@ -166,6 +166,7 @@ class BaseScraper(ABC):
             # Issue #124: curl_cffi HTTP fast-path (FBref _fetch_page_http).
             # Bypasses CDP, so its bytes don't appear in real_bytes_*.
             'http_bytes_downloaded': 0,
+            'http_html_bytes_downloaded': 0,
             'http_requests_count': 0,
             'http_bytes_by_resource_type': {},
             'http_requests_by_resource_type': {},

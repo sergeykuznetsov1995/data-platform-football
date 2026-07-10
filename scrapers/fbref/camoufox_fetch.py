@@ -105,6 +105,23 @@ def is_cloudflare_blocked(html: str, title: str = "") -> bool:
     return any(m in blob for m in _CF_MARKERS)
 
 
+def _navigation_error_type(exc: Exception) -> str:
+    """Classify page.goto failures without immediately banning good proxies."""
+    message = f"{type(exc).__name__}: {exc}".lower()
+    hard_proxy_markers = (
+        'err_proxy_connection_failed', 'err_tunnel_connection_failed',
+    )
+    if any(marker in message for marker in hard_proxy_markers):
+        return 'timeout'
+    transient_network_markers = (
+        'timeout', 'timed out', 'err_connection_reset',
+        'err_connection_timed_out',
+    )
+    if any(marker in message for marker in transient_network_markers):
+        return 'network'
+    return 'browser_error'
+
+
 class CamoufoxFbrefTransport:
     """Warm Camoufox session that fetches FBref HTML through a Turnstile solve.
 
@@ -134,6 +151,9 @@ class CamoufoxFbrefTransport:
         self,
         proxy_provider: Optional[Callable[[], Optional[dict]]] = None,
         proxy: Optional[dict] = None,
+        proxy_result_callback: Optional[
+            Callable[[bool, Optional[str]], None]
+        ] = None,
         geoip: bool = True,
         headless: bool = True,
         humanize: bool = True,
@@ -144,6 +164,7 @@ class CamoufoxFbrefTransport:
         if proxy_provider is None and proxy is not None:
             proxy_provider = lambda: proxy  # noqa: E731
         self._proxy_provider = proxy_provider
+        self._proxy_result_callback = proxy_result_callback
         self._geoip = geoip
         self._headless = headless
         self._humanize = humanize
@@ -164,6 +185,7 @@ class CamoufoxFbrefTransport:
         self.cf_challenge_attempts = 0
         self.cf_challenges_passed = 0
         self.cf_challenges_failed = 0
+        self._last_solve_failure: Optional[str] = None
         # Env-tunables: experimental script blocking + page-count restart
         # (Firefox memory creep on 380+-page backfills). A restart costs a
         # full CF cold-start (~4 MB measured) — keep the limit high.
@@ -175,6 +197,17 @@ class CamoufoxFbrefTransport:
         except ValueError:
             self._max_pages_per_session = 200
         self._pages_this_session = 0
+
+    def _record_proxy_result(
+        self, success: bool, error_type: Optional[str] = None
+    ) -> None:
+        """Notify the owner while the attempted proxy is still current."""
+        if self._proxy_result_callback is None:
+            return
+        try:
+            self._proxy_result_callback(success, error_type)
+        except Exception:  # noqa: BLE001 — diagnostics must not break fetches
+            logger.debug("proxy result callback failed", exc_info=True)
 
     # -- lifecycle -------------------------------------------------------- #
     def _start(self) -> None:
@@ -320,6 +353,7 @@ class CamoufoxFbrefTransport:
         goes empty and would spuriously read as "solved" (returning the 27 KB
         challenge shell instead of the ~500 KB page).
         """
+        self._last_solve_failure = None
         deadline = time.time() + self.CF_SOLVE_TIMEOUT_S
         clicks = 0
         polls = 0
@@ -361,7 +395,25 @@ class CamoufoxFbrefTransport:
                     clicks += 1
         if challenge_seen:
             self.cf_challenges_failed += 1
+            self._last_solve_failure = 'cloudflare'
+        else:
+            self._last_solve_failure = 'page_contract'
         return None
+
+    def _lifecycle_action(self, action, label: str) -> bool:
+        """Start/restart under the same bounded failure policy as navigation."""
+        try:
+            action()
+            return True
+        except Exception as exc:  # noqa: BLE001 — browser process boundary
+            error_type = _navigation_error_type(exc)
+            logger.warning("Camoufox %s failed: %s", label, exc)
+            # Only failures with a network/proxy signature affect proxy
+            # health. Local browser crashes must not burn a healthy exit IP.
+            if error_type in {'timeout', 'network'}:
+                self._record_proxy_result(False, error_type)
+            self._stop()
+            return False
 
     # -- public fetch ----------------------------------------------------- #
     def fetch(self, url: str) -> Optional[str]:
@@ -370,25 +422,32 @@ class CamoufoxFbrefTransport:
         Reuses the warm session (cf_clearance) across calls; on a solve-timeout
         it restarts on a fresh proxy up to ``MAX_PROXY_ROTATIONS`` times.
         """
-        if self._page is None:
-            self._start()
-        elif self._pages_this_session >= self._max_pages_per_session:
+        if (
+            self._page is not None
+            and self._pages_this_session >= self._max_pages_per_session
+        ):
             logger.info(
                 "Camoufox session page limit reached (%d) — restarting to cap "
                 "Firefox memory", self._pages_this_session)
-            self._restart()
+            self._lifecycle_action(self._restart, 'page-limit restart')
 
         for attempt in range(self.MAX_PROXY_ROTATIONS + 1):
+            if self._page is None:
+                if not self._lifecycle_action(self._start, 'start'):
+                    continue
             try:
                 self._page.goto(
                     url, wait_until="domcontentloaded",
                     timeout=self._nav_timeout_ms,
                 )
-            except Exception as e:  # noqa: BLE001 — dead proxy / nav timeout
+            except Exception as e:  # noqa: BLE001 — browser/network boundary
                 logger.warning("Camoufox goto failed (attempt %d): %s",
                                attempt + 1, e)
+                error_type = _navigation_error_type(e)
+                if error_type in {'timeout', 'network'}:
+                    self._record_proxy_result(False, error_type)
                 if attempt < self.MAX_PROXY_ROTATIONS:
-                    self._restart()
+                    self._lifecycle_action(self._restart, 'restart')
                 continue
 
             # CF challenge counters live in _solve_current_page — only navs
@@ -396,14 +455,19 @@ class CamoufoxFbrefTransport:
             html = self._solve_current_page()
             if html is not None:
                 self._pages_this_session += 1
+                self._record_proxy_result(True)
                 logger.info("Camoufox fetched %s (%d bytes html)", url, len(html))
                 return html
 
+            failure_type = self._last_solve_failure or 'page_contract'
             logger.warning(
-                "Camoufox could not solve Turnstile for %s (attempt %d/%d)",
-                url, attempt + 1, self.MAX_PROXY_ROTATIONS + 1)
+                "Camoufox page did not satisfy %s for %s (attempt %d/%d)",
+                failure_type, url, attempt + 1,
+                self.MAX_PROXY_ROTATIONS + 1)
+            if failure_type == 'cloudflare':
+                self._record_proxy_result(False, failure_type)
             if attempt < self.MAX_PROXY_ROTATIONS:
-                self._restart()
+                self._lifecycle_action(self._restart, 'restart')
 
         return None
 

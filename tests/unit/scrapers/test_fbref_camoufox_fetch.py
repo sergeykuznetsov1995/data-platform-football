@@ -253,11 +253,13 @@ class TestFetch:
         def flaky_goto(url, **kw):
             calls["n"] += 1
             if calls["n"] == 1:
-                raise RuntimeError("dead proxy")
+                raise RuntimeError("net::ERR_PROXY_CONNECTION_FAILED")
             orig_goto(url, **kw)
         page.goto = flaky_goto
 
         t = _transport(monkeypatch, page)
+        proxy_result = MagicMock()
+        t._proxy_result_callback = proxy_result
         html = t.fetch("https://fbref.com/x")
         assert html is not None
         # A goto failure is a nav problem, NOT a CF challenge stat — only the
@@ -265,15 +267,84 @@ class TestFetch:
         assert t.cf_challenges_failed == 0
         assert t.cf_challenge_attempts == 1
         assert t.cf_challenges_passed == 1
+        assert proxy_result.call_args_list == [
+            ((False, "timeout"), {}),
+            ((True, None), {}),
+        ]
+
+    @pytest.mark.unit
+    def test_browser_crash_does_not_immediately_ban_proxy(self, monkeypatch):
+        page = _FakePage(table_after=1)
+        calls = {"n": 0}
+        orig_goto = page.goto
+
+        def flaky_goto(url, **kw):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("Target page, context or browser closed")
+            orig_goto(url, **kw)
+
+        page.goto = flaky_goto
+        t = _transport(monkeypatch, page)
+        proxy_result = MagicMock()
+        t._proxy_result_callback = proxy_result
+
+        assert t.fetch("https://fbref.com/x") is not None
+        assert proxy_result.call_args_list == [
+            ((True, None), {}),
+        ]
+
+    @pytest.mark.unit
+    def test_start_crash_is_bounded_and_not_charged_to_proxy(
+        self, monkeypatch
+    ):
+        page = _FakePage(table_after=1)
+        t = CamoufoxFbrefTransport(proxy=None)
+        t.POLL_INTERVAL_S = 0.0
+        t.CF_SOLVE_TIMEOUT_S = 1.0
+        monkeypatch.setattr(cf.time, "sleep", lambda *_: None)
+        calls = {"n": 0}
+
+        def flaky_start():
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("browser process closed")
+            t._page = page
+
+        monkeypatch.setattr(t, "_start", flaky_start)
+        proxy_result = MagicMock()
+        t._proxy_result_callback = proxy_result
+
+        assert t.fetch("https://fbref.com/x") is not None
+        assert calls["n"] == 2
+        assert proxy_result.call_args_list == [
+            ((True, None), {}),
+        ]
+
+    @pytest.mark.unit
+    def test_no_table_without_challenge_does_not_penalize_proxy(
+        self, monkeypatch
+    ):
+        page = _FakePage(table_after=None, frames=[])
+        t = _transport(monkeypatch, page)
+        proxy_result = MagicMock()
+        t._proxy_result_callback = proxy_result
+
+        assert t.fetch("https://fbref.com/x") is None
+        assert proxy_result.call_count == 0
 
     @pytest.mark.unit
     def test_returns_none_after_exhausting_rotations(self, monkeypatch):
         page = _FakePage(table_after=None)  # never solves
         t = _transport(monkeypatch, page)
+        proxy_result = MagicMock()
+        t._proxy_result_callback = proxy_result
         html = t.fetch("https://fbref.com/x")
         assert html is None
         # 1 initial + MAX_PROXY_ROTATIONS retries all failed to solve.
         assert t.cf_challenges_failed == t.MAX_PROXY_ROTATIONS + 1
+        assert proxy_result.call_count == t.MAX_PROXY_ROTATIONS + 1
+        proxy_result.assert_called_with(False, "cloudflare")
 
 
 # ---------------------------------------------------------------------------
@@ -427,10 +498,15 @@ _SEASON_HTML = ('<html><body><table id="stats_standard">'
 _MATCH_OK_HTML = (
     '<html><body>'
     '<table id="stats_18bb7c10_summary"><tr><td>x</td></tr></table>'
+    '<table id="stats_b8fd03ef_summary"><tr><td>y</td></tr></table>'
     + 'x' * 6000 + '</body></html>')
 # Lineup table parsed fine, but no stats_*_summary — the ~5% truncated load.
 _MATCH_TRUNCATED_HTML = (
     '<html><body><table id="lineup_a"><tr><td>x</td></tr></table>'
+    + 'x' * 6000 + '</body></html>')
+_MATCH_ONE_TEAM_HTML = (
+    '<html><body>'
+    '<table id="stats_18bb7c10_summary"><tr><td>x</td></tr></table>'
     + 'x' * 6000 + '</body></html>')
 
 
@@ -494,28 +570,36 @@ class TestCamoufoxPathValidation:
         assert html is None
         assert s._stats['failures'] == 1
         assert s._last_validation_failure == 'no_match_summary'
-        s._proxy_manager.record_result.assert_called_once_with(
-            s._current_proxy_obj, success=False, error_type='cloudflare')
+        # A page-contract failure is not a dead proxy. Per-attempt proxy health
+        # is emitted by CamoufoxFbrefTransport before this validator runs.
+        s._proxy_manager.record_result.assert_not_called()
 
     @pytest.mark.unit
-    def test_valid_match_page_succeeds_and_records_proxy(self):
+    def test_valid_match_page_succeeds(self):
         s, _ = _make_camoufox_host(_MATCH_OK_HTML)
         html = s._fetch_page_camoufox(
             'https://fbref.com/en/matches/x', page_type='match')
         assert html == _MATCH_OK_HTML
         assert s._stats['successes'] == 1
         assert s._last_validation_failure is None
-        s._proxy_manager.record_result.assert_called_once_with(
-            s._current_proxy_obj, success=True)
+        s._proxy_manager.record_result.assert_not_called()
 
     @pytest.mark.unit
-    def test_no_html_records_proxy_failure(self):
+    def test_one_team_summary_is_partial_not_a_tombstone_signal(self):
+        s, _ = _make_camoufox_host(_MATCH_ONE_TEAM_HTML)
+
+        assert s._fetch_page_camoufox(
+            'https://fbref.com/en/matches/x', page_type='match'
+        ) is None
+        assert s._last_validation_failure == 'incomplete_match_summaries'
+
+    @pytest.mark.unit
+    def test_no_html_is_failure_without_double_recording_proxy(self):
         s, _ = _make_camoufox_host(None)
         html = s._fetch_page_camoufox('https://fbref.com/x', page_type='other')
         assert html is None
         assert s._stats['failures'] == 1
-        s._proxy_manager.record_result.assert_called_once_with(
-            s._current_proxy_obj, success=False, error_type='cloudflare')
+        s._proxy_manager.record_result.assert_not_called()
 
 
 class TestCamoufoxHttpFastPath:
@@ -573,6 +657,40 @@ class TestCamoufoxHttpFastPath:
         assert s._http_consecutive_fallbacks == 0
         # Session dropped at threshold, then the transport success re-mints.
         transport.get_clearance.assert_called_once()
+
+    @pytest.mark.unit
+    def test_expired_session_is_dropped_and_reminted(self):
+        s, transport = _make_camoufox_host(_SEASON_HTML)
+        stale = MagicMock()
+        s._http_session = stale
+        s._http_cookies_expired = MagicMock(return_value=True)
+
+        html = s._fetch_page_camoufox('https://fbref.com/x', page_type='other')
+
+        assert html == _SEASON_HTML
+        stale.close.assert_called_once()
+        transport.fetch.assert_called_once()
+        transport.get_clearance.assert_called_once()
+        assert s._stats['http_session_expired'] == 1
+
+    @pytest.mark.unit
+    def test_truncated_http_match_falls_back_to_browser(self):
+        s, transport = _make_camoufox_host(_MATCH_OK_HTML)
+        s._http_session = MagicMock()
+        s._http_cookies_expired = MagicMock(return_value=False)
+        s._fetch_page_http = MagicMock(return_value=_MATCH_TRUNCATED_HTML)
+        s._record_http_diag = MagicMock()
+
+        html = s._fetch_page_camoufox(
+            'https://fbref.com/en/matches/x', page_type='match')
+
+        assert html == _MATCH_OK_HTML
+        assert s._stats.get('http_fetch_ok', 0) == 0
+        assert s._stats['http_fetch_fallback'] == 1
+        transport.fetch.assert_called_once()
+        assert s._record_http_diag.call_args.kwargs['reason'] == (
+            'page_validation_no_match_summary'
+        )
 
 
 class TestMergeCamoufoxTraffic:
