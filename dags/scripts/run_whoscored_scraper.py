@@ -336,8 +336,8 @@ def main() -> int:
         else:
             # #920 bridge: the tournament year comes from competitions.yaml
             # (was a 2026 hardcode); out of window the run is a clean no-op.
-            from utils.medallion_config import get_active_single_year_season
-            _wc_season = get_active_single_year_season('INT-World Cup')
+            from utils.medallion_config import get_active_season
+            _wc_season = get_active_season('INT-World Cup')
             if _wc_season is None:
                 logger.warning(
                     "INT-World Cup is out of its tournament window — nothing "

@@ -40,7 +40,9 @@ from airflow.operators.python import PythonOperator, ShortCircuitOperator
 
 from utils.config import LEAGUES, CURRENT_SEASON, SCHEDULES, DAG_TAGS
 from utils.default_args import SCRAPER_ARGS
+from utils.ingest_helpers import league_slug as _league_slug
 from utils.ingest_helpers import load_result as _load_result
+from utils.medallion_config import is_single_year_competition
 
 
 SCHEDULE_RESULT_PATH = '/tmp/sofascore_result.json'
@@ -51,6 +53,17 @@ MATCH_CAPTURE_RESULT_PATH = '/tmp/sofascore_match_capture_result.json'
 # #782 — per-player profile + season_stats capture (formerly the weekly
 # dag_ingest_sofascore_players) now runs here behind the Saturday/manual gate.
 PLAYER_CAPTURE_RESULT_PATH = '/tmp/sofascore_player_capture_result.json'
+
+# #920 Phase 1: split LEAGUES into club (split_year) and tournament
+# (single_year, e.g. INT-World Cup) leagues. Club leagues stay batched in one
+# call (they share the same club-formula season — no reason to fan them out).
+# Each tournament league needs its own dedicated single-league task, because
+# (a) the runner's #920 bridge requires a dedicated call to resolve its
+# active season correctly (a mixed call drops it), and (b) match_capture's
+# runner only ever reads leagues[0]. New tournaments onboard via
+# competitions.yaml + LEAGUES alone — no further DAG changes (#920 Phase 3).
+CLUB_LEAGUES = [lg for lg in LEAGUES if not is_single_year_competition(lg)]
+TOURNAMENT_LEAGUES = [lg for lg in LEAGUES if is_single_year_competition(lg)]
 
 
 def _env_int(name: str):
@@ -502,8 +515,9 @@ def validate_player_freshness(**context) -> None:
         )
 
 
-# Build arguments for bash command
-leagues_str = ','.join(LEAGUES)
+# Build arguments for bash command — club leagues only (see CLUB_LEAGUES
+# above); tournament leagues get their own dedicated task below.
+leagues_str = ','.join(CLUB_LEAGUES)
 
 # DAG definition
 with DAG(
@@ -614,6 +628,37 @@ python dags/scripts/run_sofascore_scraper.py \\
         append_env=True,
     )
 
+    # #920 Phase 1: one dedicated schedule task per tournament league (e.g.
+    # INT-World Cup) — a mixed --leagues call would drop it (the runner's
+    # #920 bridge needs a dedicated single-league call to resolve the active
+    # tournament season). Reuses the same `{{ params.season }}` Jinja value
+    # as the club task above; the runner itself resolves it to the real
+    # tournament year, or cleanly no-ops (exit 0) outside the tournament
+    # window — so this task stays in the graph year-round as a cheap no-op
+    # rather than appearing/disappearing with the calendar. Onboarding the
+    # next tournament (#920 Phase 3) is a competitions.yaml + LEAGUES entry,
+    # no DAG changes.
+    tournament_schedule_tasks = {}
+    for _t_league in TOURNAMENT_LEAGUES:
+        _t_slug = _league_slug(_t_league)
+        tournament_schedule_tasks[_t_league] = BashOperator(
+            task_id=f'scrape_sofascore_data_{_t_slug}',
+            bash_command=f"""
+cd /opt/airflow && \\
+rm -f /tmp/sofascore_result_{_t_slug}.json && \\
+python dags/scripts/run_sofascore_scraper.py \\
+    --leagues "{_t_league}" \\
+    --season {{{{ params.season }}}} \\
+    --output /tmp/sofascore_result_{_t_slug}.json
+""",
+            env={
+                'PYTHONPATH': '/opt/airflow:/opt/airflow/dags',
+                'PATH': '/usr/local/bin:/usr/bin:/bin:/home/airflow/.local/bin',
+                'HOME': '/home/airflow',
+            },
+            append_env=True,
+        )
+
     # #751 PR1 — consolidated per-match capture: ONE Camoufox nav/match writes
     # BOTH bronze.sofascore_player_ratings and bronze.sofascore_event_player_stats
     # from the same /lineups (+/event) payload. Depends on freshly written
@@ -621,16 +666,34 @@ python dags/scripts/run_sofascore_scraper.py \\
     # back to capture discovery when empty). Exit 2 = graceful R0.2B_FALLBACK
     # (soft success so validate_data runs); exit 3 = completeness-guard refusal
     # (propagates as a real failure).
-    scrape_match_capture_task = BashOperator(
-        task_id='scrape_match_capture',
-        bash_command=f"""
+    # #920 Phase 1: one match_capture task per league in LEAGUES (club +
+    # every tournament) — the runner only ever reads leagues[0]
+    # (_run_match_capture), so a single shared task could never cover more
+    # than one league regardless of how many are configured. The club
+    # league keeps the original task_id/output path (MATCH_CAPTURE_RESULT_PATH)
+    # so validate_data()'s club-calibrated row floors and
+    # TestSeasonRenderedFromParams stay byte-identical; tournament leagues
+    # get their own task + output path, not read by validate_data()
+    # (per-competition floors are #920 Phase 2, out of scope here).
+    match_capture_tasks = {}
+    for _league in LEAGUES:
+        _is_tournament = _league in TOURNAMENT_LEAGUES
+        _mc_slug = _league_slug(_league)
+        _mc_task_id = f'scrape_match_capture_{_mc_slug}' if _is_tournament else 'scrape_match_capture'
+        _mc_output = (
+            f'/tmp/sofascore_match_capture_result_{_mc_slug}.json'
+            if _is_tournament else MATCH_CAPTURE_RESULT_PATH
+        )
+        match_capture_tasks[_league] = BashOperator(
+            task_id=_mc_task_id,
+            bash_command=f"""
 cd /opt/airflow && \\
-rm -f {MATCH_CAPTURE_RESULT_PATH} && \\
+rm -f {_mc_output} && \\
 python dags/scripts/run_sofascore_scraper.py \\
     --entity match_capture \\
-    --league "{LEAGUES[0]}" \\
+    --league "{_league}" \\
     --season {{{{ params.season }}}} \\
-    --output {MATCH_CAPTURE_RESULT_PATH}
+    --output {_mc_output}
 rc=$?
 if [ $rc -eq 2 ]; then
     echo "R0.2B_FALLBACK exit-code 2 (match_capture) — propagating as soft success."
@@ -638,13 +701,18 @@ if [ $rc -eq 2 ]; then
 fi
 exit $rc
 """,
-        env={
-            'PYTHONPATH': '/opt/airflow:/opt/airflow/dags',
-            'PATH': '/usr/local/bin:/usr/bin:/bin:/home/airflow/.local/bin',
-            'HOME': '/home/airflow',
-        },
-        append_env=True,
-    )
+            env={
+                'PYTHONPATH': '/opt/airflow:/opt/airflow/dags',
+                'PATH': '/usr/local/bin:/usr/bin:/bin:/home/airflow/.local/bin',
+                'HOME': '/home/airflow',
+            },
+            append_env=True,
+        )
+
+    # Kept as a plain name for the (unchanged) club-only downstream wiring
+    # below (player_capture is explicitly out of #920 Phase 1 scope and
+    # stays keyed off the club league only, as before).
+    scrape_match_capture_task = match_capture_tasks[CLUB_LEAGUES[0]]
 
     # #751 PR2: shotmap (#22) + match_stats (#25) no longer have their own tls
     # tasks — both come from the consolidated Camoufox capture above (same nav
@@ -718,6 +786,14 @@ exit $rc
     # Matches chain (daily): schedule → match_capture → validate → freshness.
     scrape_data_task >> scrape_match_capture_task
     scrape_match_capture_task >> validate_data_task >> validate_bronze_freshness_task
+
+    # #920 Phase 1: same chain per tournament league, in parallel with the
+    # club chain above — each tournament's own schedule task feeds its own
+    # match_capture task, both converging on the shared validate_data_task
+    # (trigger_rule='all_done' already tolerates multiple upstreams).
+    for _t_league in TOURNAMENT_LEAGUES:
+        tournament_schedule_tasks[_t_league] >> match_capture_tasks[_t_league]
+        match_capture_tasks[_t_league] >> validate_data_task
 
     # Per-player branch (weekly/manual), gated after match_capture so the player
     # ids in bronze.sofascore_player_ratings are fresh; skipped on weekday runs

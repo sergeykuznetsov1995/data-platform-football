@@ -67,6 +67,16 @@ from utils.fbref_callbacks import (
     check_traffic_guard,
     report_proxy_traffic,
 )
+from utils.ingest_helpers import league_slug as _league_slug
+from utils.medallion_config import is_single_year_competition
+
+# #920 Phase 1: split LEAGUES into club (split_year) and tournament
+# (single_year, e.g. INT-World Cup) leagues — see dag_ingest_sofascore.py for
+# the full rationale. Club leagues stay in the existing season_stats_all /
+# match_data pipeline unchanged; each tournament league gets its own parallel
+# mini-pipeline below (its own dedicated single-league runner call).
+CLUB_LEAGUES = [lg for lg in LEAGUES if not is_single_year_competition(lg)]
+TOURNAMENT_LEAGUES = [lg for lg in LEAGUES if is_single_year_competition(lg)]
 
 # =============================================================================
 # SCRAPER CONFIGURATION
@@ -117,8 +127,11 @@ PROXY_FILE = '/opt/airflow/proxys.txt'  # Path to proxy file in container
 # COMMON TASK KWARGS (passed to all task factory functions)
 # =============================================================================
 # Bundled into a dict to avoid repeating the same kwargs in every call.
+# leagues_str = club leagues only; each tournament league gets its own
+# dedicated mini-pipeline below (built from the same kwargs with leagues_str
+# overridden to that one league).
 COMMON_TASK_KWARGS = dict(
-    leagues_str=','.join(LEAGUES),
+    leagues_str=','.join(CLUB_LEAGUES),
     season="{{ params.season }}",
     scraper_type=DEFAULT_SCRAPER_TYPE,
     use_xvfb=USE_XVFB,
@@ -133,7 +146,7 @@ COMMON_TASK_KWARGS = dict(
 
 # Subset of kwargs for combined match data task (doesn't use all options)
 COMBINED_MATCH_KWARGS = dict(
-    leagues_str=','.join(LEAGUES),
+    leagues_str=','.join(CLUB_LEAGUES),
     season="{{ params.season }}",
     use_xvfb=USE_XVFB,
     headless=HEADLESS,
@@ -440,6 +453,56 @@ with DAG(
         trino_check >> schedule_task >> schedule_guard >> trino_check_2 >> match_all_task >> traffic_guard
 
     # =========================================================================
+    # #920 Phase 1: one parallel mini-pipeline per tournament league (e.g.
+    # INT-World Cup) — mirrors the club season_stats_all + match_data
+    # pipeline above exactly, but scoped to a single dedicated league (a
+    # mixed --leagues call would drop it; the runner's #920 bridge needs a
+    # dedicated single-league call to resolve the active tournament season).
+    # Reuses `{{ params.season }}`; the runner resolves it to the real
+    # tournament year or cleanly no-ops (exit 0) outside the tournament
+    # window, so this stays in the graph year-round as a cheap no-op rather
+    # than appearing/disappearing with the calendar. Gated behind the SAME
+    # gate_scrape (fbref's weekly cadence is unchanged — #920 Phase 1 does
+    # not touch that policy). task_id_suffix keeps every task_id/output_file/
+    # traffic_output distinct from the club pipeline's (see fbref_tasks.py).
+    # =========================================================================
+    tournament_match_data_groups = {}
+    for _t_league in TOURNAMENT_LEAGUES:
+        _t_slug = _league_slug(_t_league)
+        _t_suffix = f'_{_t_slug}'
+        _t_common_kwargs = {**COMMON_TASK_KWARGS, 'leagues_str': _t_league}
+        _t_combined_kwargs = {**COMBINED_MATCH_KWARGS, 'leagues_str': _t_league}
+
+        season_stats_task_t = create_combined_season_stats_task(
+            task_id_suffix=_t_suffix, **_t_combined_kwargs,
+        )
+        season_guard_t = _make_traffic_guard(label=f'season_stats{_t_suffix}')
+        season_stats_task_t >> season_guard_t
+
+        with TaskGroup(group_id=f'match_data{_t_suffix}') as match_data_group_t:
+            trino_check_t = create_trino_health_check_task(
+                task_id=f'check_trino_health{_t_suffix}',
+            )
+            schedule_task_t = create_match_data_task(
+                data_type='schedule', task_id_suffix=_t_suffix,
+                **{**_t_common_kwargs, 'scraper_type': 'selenium'},
+            )
+            schedule_guard_t = _make_traffic_guard(label=f'match_schedule{_t_suffix}')
+            trino_check_2_t = create_trino_health_check_task(
+                task_id=f'check_trino_before_match{_t_suffix}',
+            )
+            match_all_task_t = create_combined_match_data_task(
+                task_id_suffix=_t_suffix, max_matches=0, **_t_combined_kwargs,
+            )
+            traffic_guard_t = _make_traffic_guard(label=f'match_all_data{_t_suffix}')
+
+            trino_check_t >> schedule_task_t >> schedule_guard_t >> trino_check_2_t >> match_all_task_t >> traffic_guard_t
+
+        gate_scrape >> season_stats_task_t
+        season_guard_t >> match_data_group_t
+        tournament_match_data_groups[_t_league] = match_data_group_t
+
+    # =========================================================================
     # Validation Task
     # =========================================================================
     validate_task = PythonOperator(
@@ -476,3 +539,10 @@ with DAG(
     # =========================================================================
     start >> gate_scrape >> season_stats_task
     season_guard >> match_data_group >> validate_task >> report_traffic >> trigger_silver
+
+    # #920 Phase 1: each tournament's match_data group converges on the same
+    # shared validate_task (trigger_rule='all_done' already tolerates
+    # multiple upstreams). gate_scrape -> season_stats_task_t was wired
+    # inside the loop above.
+    for _t_league in TOURNAMENT_LEAGUES:
+        tournament_match_data_groups[_t_league] >> validate_task

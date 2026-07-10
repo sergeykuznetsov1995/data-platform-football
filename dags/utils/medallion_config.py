@@ -1414,6 +1414,50 @@ def get_active_single_year_season(
     return None
 
 
+def is_single_year_competition(competition_id: str) -> bool:
+    """True if any season entry for this competition is season_format:
+    single_year (tournaments such as INT-World Cup, as opposed to split_year
+    club leagues). Used by #920 Phase 1 ingest DAGs to route a league to the
+    club batch or to its own dedicated per-tournament task, without any
+    date/window logic (that lives in get_active_season below)."""
+    doc = load_competitions()
+    for c in doc['competitions']:
+        if c['id'] != competition_id:
+            continue
+        return any(
+            s.get('season_format') == 'single_year'
+            for s in (c.get('seasons') or [])
+        )
+    return False
+
+
+def get_active_season(
+    competition_id: str,
+    today: Optional['datetime.date'] = None,
+) -> Optional[int]:
+    """Unify the split_year club formula and single_year tournament windows
+    (#920 Phase 1).
+
+    split_year (default, club leagues): the club-formula season (``today.year``
+    if ``today.month >= 8`` else ``today.year - 1``) — the same formula as
+    ``dags/utils/config.py::get_current_season()``, but parameterized by
+    ``today`` instead of hardcoding ``datetime.now()`` so this function is
+    deterministically testable on both branches via the ``today`` argument.
+
+    single_year (``is_single_year_competition(competition_id)``, e.g.
+    INT-World Cup): delegates to ``get_active_single_year_season`` — the
+    season id whose ``[start, end + grace]`` window contains ``today``, else
+    ``None`` (out of window — caller should treat this league as inactive).
+    """
+    import datetime as _dt
+
+    if today is None:
+        today = _dt.date.today()
+    if is_single_year_competition(competition_id):
+        return get_active_single_year_season(competition_id, today=today)
+    return today.year if today.month >= 8 else today.year - 1
+
+
 # ---------------------------------------------------------------------------
 # SQL template rendering
 # ---------------------------------------------------------------------------

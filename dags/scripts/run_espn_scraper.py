@@ -69,8 +69,8 @@ def main():
             # #920 bridge: the DAG passes the club-formula CURRENT_SEASON
             # (July 2026 -> 2025) — substitute the active tournament year from
             # competitions.yaml; skip the league entirely out of window.
-            from utils.medallion_config import get_active_single_year_season
-            _wc_season = get_active_single_year_season(lg)
+            from utils.medallion_config import get_active_season
+            _wc_season = get_active_season(lg)
             if _wc_season is None:
                 logger.warning(
                     f"{lg}: out of its tournament window — skipping league.")
