@@ -49,6 +49,7 @@ NOTE: As of 2025-2026, FBref uses Cloudflare Turnstile CAPTCHA.
 from datetime import datetime, timedelta
 
 from airflow import DAG
+from airflow.models.param import Param
 from airflow.operators.python import PythonOperator, ShortCircuitOperator
 from airflow.utils.task_group import TaskGroup
 from airflow.operators.empty import EmptyOperator
@@ -122,6 +123,9 @@ CF_VERIFY_INTERVAL = 1.5     # Interval between cf-verify retries (seconds, redu
 
 # Proxy configuration
 PROXY_FILE = '/opt/airflow/proxys.txt'  # Path to proxy file in container
+RUN_ARTIFACT_DIR = (
+    "/tmp/fbref_runs/run_{{ dag_run.id }}"
+)
 
 # =============================================================================
 # COMMON TASK KWARGS (passed to all task factory functions)
@@ -131,7 +135,9 @@ PROXY_FILE = '/opt/airflow/proxys.txt'  # Path to proxy file in container
 # dedicated mini-pipeline below (built from the same kwargs with leagues_str
 # overridden to that one league).
 COMMON_TASK_KWARGS = dict(
-    leagues_str=','.join(CLUB_LEAGUES),
+    # Runtime-selectable club leagues. Single-year competitions use their
+    # dedicated one-league pipelines below so their season IDs stay correct.
+    leagues_str="{{ params.leagues | join(',') }}",
     season="{{ params.season }}",
     scraper_type=DEFAULT_SCRAPER_TYPE,
     use_xvfb=USE_XVFB,
@@ -142,17 +148,19 @@ COMMON_TASK_KWARGS = dict(
     nodriver_max_retries=NODRIVER_MAX_RETRIES,
     nodriver_cf_verify_retries=NODRIVER_CF_VERIFY_RETRIES,
     proxy_file=PROXY_FILE,
+    artifact_dir=RUN_ARTIFACT_DIR,
 )
 
 # Subset of kwargs for combined match data task (doesn't use all options)
 COMBINED_MATCH_KWARGS = dict(
-    leagues_str=','.join(CLUB_LEAGUES),
+    leagues_str="{{ params.leagues | join(',') }}",
     season="{{ params.season }}",
     use_xvfb=USE_XVFB,
     headless=HEADLESS,
     use_nodriver=USE_NODRIVER,
     nodriver_cloudflare_wait=NODRIVER_CLOUDFLARE_WAIT,
     proxy_file=PROXY_FILE,
+    artifact_dir=RUN_ARTIFACT_DIR,
 )
 
 
@@ -169,7 +177,9 @@ def _make_traffic_guard(label: str, group_suffix: str = '') -> PythonOperator:
         task_id=task_id,
         python_callable=check_traffic_guard,
         op_kwargs={
-            'traffic_path': f'/tmp/fbref_traffic_{label}.json',
+            'traffic_path': (
+                f'{RUN_ARTIFACT_DIR}/fbref_traffic_{label}.json'
+            ),
             'label': label,
         },
         trigger_rule='all_done',  # always inspect traffic, even on upstream fail
@@ -228,11 +238,16 @@ with DAG(
     max_active_runs=1,
     concurrency=1,  # Reduced from 3 to prevent OOM - only one task at a time
     params={
-        'leagues': LEAGUES,
-        'season': CURRENT_SEASON,
-        'max_matches': 0,  # 0 = no limit
-        'scraper_type': DEFAULT_SCRAPER_TYPE,  # 'nodriver' or 'selenium'
-        'run_scrape': False,  # True = force the scrape on a manual/external trigger
+        'leagues': Param(
+            CLUB_LEAGUES,
+            type='array',
+            minItems=1,
+            items={'type': 'string', 'minLength': 1, 'maxLength': 160},
+        ),
+        'season': Param(CURRENT_SEASON, type='integer', minimum=1800, maximum=2200),
+        'max_matches': Param(0, type='integer', minimum=0),  # 0 = no limit
+        # True = force the scrape on a manual/external trigger.
+        'run_scrape': Param(False, type='boolean'),
     },
     doc_md="""
     ## FBref Data Ingestion (Refactored + Optimized)
@@ -439,7 +454,9 @@ with DAG(
         # Combined match data task: collects shot_events, match_events, lineups
         # in ONE pass through matches (3x efficiency vs separate tasks)
         match_all_task = create_combined_match_data_task(
-            max_matches=0,  # 0 = no limit, process all matches
+            # 0 = no limit; a positive per-run value is applied after the
+            # incremental skip set so chunked backfills always make progress.
+            max_matches="{{ params.max_matches }}",
             **COMBINED_MATCH_KWARGS,
         )
 
@@ -450,7 +467,9 @@ with DAG(
         # real_proxy_mb, real_proxy_requests, matches_scraped, cf_*, restart_*.
         traffic_guard = _make_traffic_guard(label='match_all_data')
 
-        trino_check >> schedule_task >> schedule_guard >> trino_check_2 >> match_all_task >> traffic_guard
+        trino_check >> schedule_task >> schedule_guard
+        [schedule_task, schedule_guard] >> trino_check_2
+        trino_check_2 >> match_all_task >> traffic_guard
 
     # =========================================================================
     # #920 Phase 1: one parallel mini-pipeline per tournament league (e.g.
@@ -466,7 +485,7 @@ with DAG(
     # not touch that policy). task_id_suffix keeps every task_id/output_file/
     # traffic_output distinct from the club pipeline's (see fbref_tasks.py).
     # =========================================================================
-    tournament_match_data_groups = {}
+    tournament_validation_upstreams = []
     for _t_league in TOURNAMENT_LEAGUES:
         _t_slug = _league_slug(_t_league)
         _t_suffix = f'_{_t_slug}'
@@ -492,15 +511,21 @@ with DAG(
                 task_id=f'check_trino_before_match{_t_suffix}',
             )
             match_all_task_t = create_combined_match_data_task(
-                task_id_suffix=_t_suffix, max_matches=0, **_t_combined_kwargs,
+                task_id_suffix=_t_suffix,
+                max_matches="{{ params.max_matches }}",
+                **_t_combined_kwargs,
             )
             traffic_guard_t = _make_traffic_guard(label=f'match_all_data{_t_suffix}')
 
-            trino_check_t >> schedule_task_t >> schedule_guard_t >> trino_check_2_t >> match_all_task_t >> traffic_guard_t
+            trino_check_t >> schedule_task_t >> schedule_guard_t
+            [schedule_task_t, schedule_guard_t] >> trino_check_2_t
+            trino_check_2_t >> match_all_task_t >> traffic_guard_t
 
         gate_scrape >> season_stats_task_t
-        season_guard_t >> match_data_group_t
-        tournament_match_data_groups[_t_league] = match_data_group_t
+        [season_stats_task_t, season_guard_t] >> trino_check_t
+        tournament_validation_upstreams.append(
+            (match_all_task_t, traffic_guard_t)
+        )
 
     # =========================================================================
     # Validation Task
@@ -508,7 +533,16 @@ with DAG(
     validate_task = PythonOperator(
         task_id='validate_all_data',
         python_callable=validate_all_data,
-        trigger_rule='all_done',  # Run even if some tasks fail
+        op_kwargs={
+            'result_dir': RUN_ARTIFACT_DIR,
+            'manifest_suffixes': [
+                '',
+                *[
+                    f'_{_league_slug(league)}'
+                    for league in TOURNAMENT_LEAGUES
+                ],
+            ],
+        },
     )
 
     # =========================================================================
@@ -520,6 +554,9 @@ with DAG(
     report_traffic = PythonOperator(
         task_id='report_proxy_traffic',
         python_callable=report_proxy_traffic,
+        op_kwargs={
+            'glob_pattern': f'{RUN_ARTIFACT_DIR}/fbref_traffic_*.json',
+        },
         trigger_rule='all_done',
     )
 
@@ -538,11 +575,13 @@ with DAG(
     # Sequential execution to prevent OOM
     # =========================================================================
     start >> gate_scrape >> season_stats_task
-    season_guard >> match_data_group >> validate_task >> report_traffic >> trigger_silver
+    [season_stats_task, season_guard] >> trino_check
+    [match_all_task, traffic_guard] >> validate_task
 
-    # #920 Phase 1: each tournament's match_data group converges on the same
-    # shared validate_task (trigger_rule='all_done' already tolerates
-    # multiple upstreams). gate_scrape -> season_stats_task_t was wired
-    # inside the loop above.
-    for _t_league in TOURNAMENT_LEAGUES:
-        tournament_match_data_groups[_t_league] >> validate_task
+    # Each tournament must pass both its producer and traffic guard. A green
+    # guard cannot hide a failed producer.
+    for _match_task_t, _traffic_guard_t in tournament_validation_upstreams:
+        [_match_task_t, _traffic_guard_t] >> validate_task
+
+    validate_task >> report_traffic
+    [validate_task, report_traffic] >> trigger_silver

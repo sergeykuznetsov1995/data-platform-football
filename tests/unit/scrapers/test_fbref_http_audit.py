@@ -54,6 +54,7 @@ def _make_scraper_stub():
     scraper._http_proxy_minted = None
     scraper._stats = {
         'http_bytes_downloaded': 0,
+        'http_html_bytes_downloaded': 0,
         'http_requests_count': 0,
         'http_bytes_by_resource_type': {},
         'http_requests_by_resource_type': {},
@@ -61,12 +62,23 @@ def _make_scraper_stub():
     return scraper
 
 
-def _make_response(status_code: int, body: str, content_type: str = 'text/html'):
+def _make_response(
+    status_code: int,
+    body: str,
+    content_type: str = 'text/html',
+    *,
+    wire_overhead: int = 0,
+):
     """Build a curl_cffi-like response mock."""
     response = MagicMock()
     response.status_code = status_code
     response.text = body
+    response.content = body.encode('utf-8')
     response.headers = {'content-type': content_type}
+    response.download_size = len(response.content)
+    response.header_size = wire_overhead
+    response.request_size = 0
+    response.upload_size = 0
     return response
 
 
@@ -91,6 +103,7 @@ class TestFetchPageHttpAudit:
         assert scraper._stats['http_bytes_by_resource_type'] == {
             'Document': len(body),
         }
+        assert scraper._stats['http_html_bytes_downloaded'] == len(body)
         assert scraper._stats['http_requests_by_resource_type'] == {
             'Document': 1,
         }
@@ -113,6 +126,21 @@ class TestFetchPageHttpAudit:
         assert scraper._stats['http_bytes_by_resource_type'] == {
             'Document': len(body),
         }
+
+    @pytest.mark.unit
+    def test_counts_curl_wire_overhead_not_decoded_characters(self):
+        body = '<html><body><table>Ł</table></body></html>'
+        scraper = _make_scraper_stub()
+        response = _make_response(200, body, wire_overhead=137)
+        scraper._http_session.get.return_value = response
+
+        assert scraper._fetch_page_http('https://fbref.com/test') == body
+        assert scraper._stats['http_bytes_downloaded'] == (
+            len(body.encode('utf-8')) + 137
+        )
+        assert scraper._stats['http_html_bytes_downloaded'] == len(
+            body.encode('utf-8')
+        )
 
     @pytest.mark.unit
     def test_accumulates_across_multiple_calls(self):
