@@ -397,10 +397,17 @@ def _build_gold_fct_match_rating_checks() -> List[Check]:
             severity='ERROR',
         ),
 
-        # R0.4 canonical completeness.
-        CHECK.canonical_completeness(
-            table, canonical_col='rating_id',
+        # R0.4 canonical completeness. Same shape as fct_match_odds above:
+        # no `*_canonical` column here (PK is rating_id), so express the
+        # invariant as an explicit offender count.
+        CHECK.row_count(
+            table=table,
+            min_rows=0,
+            max_rows=0,
+            where=('rating_id IS NOT NULL '
+                   'AND (rating_source IS NULL OR rating_version IS NULL)'),
             severity='ERROR',
+            name='canonical_completeness[gold.fct_match_rating.rating_id]',
         ),
 
         # Rating bounds — Sofascore [0, 10].
