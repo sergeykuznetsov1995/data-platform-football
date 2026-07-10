@@ -7,25 +7,15 @@ import gzip
 import json
 import statistics
 import sys
+import tempfile
 import time
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
 
-from scrapers.fbref.data_readers import FBrefDataReaderMixin  # noqa: E402
-
-
-class _ReplayParser(FBrefDataReaderMixin):
-    def __init__(self, pages: dict[str, str]) -> None:
-        self._pages = pages
-
-    def _fetch_page(self, url: str, **_: object) -> str | None:
-        return self._pages.get(url.rstrip("/").rsplit("/", 1)[-1])
-
-    @staticmethod
-    def _add_metadata(df, _entity_type: str):
-        return df
+from scrapers.fbref.match_parser import DatasetStatus, parse_match_html  # noqa: E402
+from scrapers.fbref.raw_store import RawPageStore, match_page_target  # noqa: E402
 
 
 def _load_pages(html_dir: Path) -> dict[str, str]:
@@ -39,59 +29,70 @@ def _load_pages(html_dir: Path) -> dict[str, str]:
     return pages
 
 
-def _parse_once(parser: _ReplayParser, match_ids: list[str]) -> tuple[dict, int]:
-    buffers = {
-        name: []
-        for name in (
-            "shot_events",
-            "match_events",
-            "lineups",
-            "match_team_stats",
-            "match_player_stats",
-            "match_managers",
-            "match_officials",
-            "match_keeper_stats",
-        )
-    }
+def _parse_once(
+    store: RawPageStore,
+    pages: dict[str, str],
+) -> tuple[dict, int, int, int]:
+    row_counts = {}
     contracts_passed = 0
-    for match_id in match_ids:
-        got = parser._process_single_match(
+    raw_writes = 0
+    raw_hits = 0
+    for match_id, captured_html in pages.items():
+        target = match_page_target(match_id)
+        html, record, cache_hit = store.get_or_fetch(
+            target, lambda _url, payload=captured_html: payload
+        )
+        raw_hits += int(cache_hit)
+        raw_writes += int(not cache_hit)
+        result = parse_match_html(
+            html,
             match_id=match_id,
             league="ENG-Premier League",
             season=2025,
-            all_shot_events=buffers["shot_events"],
-            all_match_events=buffers["match_events"],
-            all_lineups=buffers["lineups"],
-            all_match_team_stats=buffers["match_team_stats"],
-            all_match_player_stats=buffers["match_player_stats"],
-            all_match_managers=buffers["match_managers"],
-            all_match_officials=buffers["match_officials"],
-            all_match_keeper_stats=buffers["match_keeper_stats"],
         )
-        contracts_passed += "match_player_stats" in got
-
-    row_counts = {
-        name: sum(len(frame) for frame in frames)
-        for name, frames in buffers.items()
-    }
-    return row_counts, contracts_passed
+        store.write_parse_manifests(record, result)
+        contracts_passed += (
+            result.datasets["match_player_stats"].status
+            == DatasetStatus.AVAILABLE
+        )
+        for name, dataset in result.datasets.items():
+            row_counts[name] = row_counts.get(name, 0) + dataset.row_count
+    return row_counts, contracts_passed, raw_writes, raw_hits
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--html-dir", type=Path, required=True)
+    parser.add_argument(
+        "--raw-store-uri",
+        help="file:// or s3:// URI; default is a temporary local store",
+    )
     parser.add_argument("--iterations", type=int, default=5)
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
 
     pages = _load_pages(args.html_dir)
-    replay = _ReplayParser(pages)
+    temporary = None
+    if args.raw_store_uri:
+        store = RawPageStore.from_uri(args.raw_store_uri)
+    else:
+        temporary = tempfile.TemporaryDirectory(prefix="fbref-raw-replay-")
+        store = RawPageStore.from_uri(Path(temporary.name).as_uri())
     durations = []
     row_counts: dict[str, int] = {}
     contracts_passed = 0
+    raw_pages_written = 0
+    raw_page_hits = 0
     for _ in range(max(1, args.iterations)):
         started = time.perf_counter()
-        row_counts, contracts_passed = _parse_once(replay, list(pages))
+        (
+            row_counts,
+            contracts_passed,
+            written,
+            hits,
+        ) = _parse_once(store, pages)
+        raw_pages_written += written
+        raw_page_hits += hits
         durations.append(time.perf_counter() - started)
 
     report = {
@@ -103,12 +104,16 @@ def main() -> None:
         ),
         "player_contracts_passed": contracts_passed,
         "row_counts": row_counts,
+        "raw_pages_written": raw_pages_written,
+        "raw_page_hits": raw_page_hits,
         "proxy_bytes": 0,
     }
     rendered = json.dumps(report, indent=2, sort_keys=True)
     if args.output:
         args.output.write_text(rendered + "\n")
     print(rendered)
+    if temporary is not None:
+        temporary.cleanup()
 
 
 if __name__ == "__main__":

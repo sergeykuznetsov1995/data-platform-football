@@ -29,6 +29,13 @@ from scrapers.fbref.url_builder import (
     get_schedule_url,
     get_stats_url,
 )
+from scrapers.fbref.match_parser import (
+    MATCH_COMPLETION_CONTRACT_VERSION as PARSER_COMPLETION_CONTRACT_VERSION,
+    DatasetStatus,
+    MatchPageParseError,
+    parse_match_html,
+)
+from scrapers.fbref.raw_store import match_page_target
 from scrapers.fbref.html_parser import (
     extract_tables_from_comments,
     parse_table,
@@ -933,7 +940,7 @@ class FBrefDataReaderMixin:
     NO_STATS_TOMBSTONE_MAX_PER_RUN = 5
     NO_STATS_TOMBSTONE_MAX_RATIO = 0.10
     NO_STATS_TOMBSTONE_RATIO_MIN_ATTEMPTS = 10
-    MATCH_COMPLETION_CONTRACT_VERSION = 'match-v2-two-team-marker-last'
+    MATCH_COMPLETION_CONTRACT_VERSION = PARSER_COMPLETION_CONTRACT_VERSION
 
     def _no_stats_tombstone_guard_reason(
         self, confirmed_count: int, attempted_count: int
@@ -974,166 +981,122 @@ class FBrefDataReaderMixin:
         all_match_officials: List[pd.DataFrame] = None,
         all_match_keeper_stats: List[pd.DataFrame] = None,
     ) -> Set[str]:
-        """
-        Process a single match page: extract shots, events, lineups,
-        team match stats, player match stats, and keeper match stats.
-
-        Parses HTML once with BeautifulSoup and calls parsers directly,
-        avoiding redundant BS4 parsing that read_* methods would do.
-
-        Returns set of successfully extracted data type names
-        (e.g. {'lineups', 'match_player_stats'}).  Empty set on total failure.
-        """
+        """Load one page once, parse it offline, and commit only a full result."""
         url = f"{BASE_URL}/en/matches/{match_id}"
         # Reset so a stale reason from a previous match can't leak into the
         # tombstone classification below (cached pages skip validation).
         self._last_validation_failure = None
-        # A retry must be an independent network observation. This pipeline
-        # parses each match once, so caching the HTML has no benefit and can
-        # otherwise replay the same truncated page on the confirmation pass.
-        html = self._fetch_page(url, use_cache=False, page_type='match')
-        if not html:
-            return set()
-
-        # Stage all parser outputs locally. A late parser exception must not
-        # leak early lineups/events into the shared batch buffers.
-        require_player_contract = all_match_player_stats is not None
-        target_buffers = (
-            (all_shot_events, []),
-            (all_match_events, []),
-            (all_lineups, []),
-            (all_match_team_stats, [] if all_match_team_stats is not None else None),
-            (all_match_player_stats, [] if all_match_player_stats is not None else None),
-            (all_match_managers, [] if all_match_managers is not None else None),
-            (all_match_officials, [] if all_match_officials is not None else None),
-            (all_match_keeper_stats, [] if all_match_keeper_stats is not None else None),
-        )
-        (
-            (_, all_shot_events),
-            (_, all_match_events),
-            (_, all_lineups),
-            (_, all_match_team_stats),
-            (_, all_match_player_stats),
-            (_, all_match_managers),
-            (_, all_match_officials),
-            (_, all_match_keeper_stats),
-        ) = target_buffers
-
-        # ONE BS4 parse + ONE comment table extraction
-        soup = BeautifulSoup(html, 'html.parser')
-        comment_tables = extract_tables_from_comments(soup)
-        got_types: Set[str] = set()
-
-        # Shot events (needs comment_tables for shots table)
-        shots_df = parse_shots_table(soup, comment_tables)
-        if shots_df is not None and not shots_df.empty:
-            shots_df['match_id'] = match_id
-            shots_df['league'] = league
-            shots_df['season'] = season
-            shots_df = self._add_metadata(shots_df, 'shot_events')
-            all_shot_events.append(shots_df)
-            got_types.add('shot_events')
-
-        # Match events (from scorebox — no comment_tables needed)
-        events_df = parse_events_from_scorebox(soup)
-        if events_df is not None and not events_df.empty:
-            events_df['match_id'] = match_id
-            events_df['league'] = league
-            events_df['season'] = season
-            events_df = self._add_metadata(events_df, 'match_events')
-            all_match_events.append(events_df)
-            got_types.add('match_events')
-
-        # Lineups (positions enriched from stats summary comment_tables)
-        lineup_df = parse_lineup_table(soup, comment_tables=comment_tables)
-        if lineup_df is not None and not lineup_df.empty:
-            lineup_df['match_id'] = match_id
-            lineup_df['league'] = league
-            lineup_df['season'] = season
-            lineup_df = self._add_metadata(lineup_df, 'lineups')
-            all_lineups.append(lineup_df)
-            got_types.add('lineups')
-
-        # Team match stats (div#team_stats + div#team_stats_extra)
-        if all_match_team_stats is not None:
-            team_stats_df = parse_team_match_stats_table(soup, comment_tables)
-            if team_stats_df is not None and not team_stats_df.empty:
-                team_stats_df['match_id'] = match_id
-                team_stats_df['league'] = league
-                team_stats_df['season'] = season
-                team_stats_df = self._add_metadata(team_stats_df, 'match_team_stats')
-                all_match_team_stats.append(team_stats_df)
-                got_types.add('match_team_stats')
-
-        # Player match stats (stats_*_summary tables)
-        if all_match_player_stats is not None:
-            player_match_df = parse_player_match_stats_tables(soup, comment_tables)
-            if player_match_df is not None and not player_match_df.empty:
-                player_match_df['match_id'] = match_id
-                player_match_df['league'] = league
-                player_match_df['season'] = season
-                player_match_df['parser_contract_version'] = (
-                    self.MATCH_COMPLETION_CONTRACT_VERSION
-                )
-                player_match_df = self._add_metadata(player_match_df, 'match_player_stats')
-                all_match_player_stats.append(player_match_df)
-                got_types.add('match_player_stats')
-
-        # Match managers (scorebox info-table — one row per side)
-        if all_match_managers is not None:
-            managers_df = parse_match_managers(soup)
-            if managers_df is not None and not managers_df.empty:
-                managers_df['match_id'] = match_id
-                managers_df['league'] = league
-                managers_df['season'] = season
-                managers_df = self._add_metadata(managers_df, 'match_managers')
-                all_match_managers.append(managers_df)
-                got_types.add('match_managers')
-
-        # Match officials (scorebox_meta — one wide row: referee/ar1/ar2/4th/var)
-        if all_match_officials is not None:
-            officials_df = parse_match_officials(soup)
-            if officials_df is not None and not officials_df.empty:
-                officials_df['match_id'] = match_id
-                officials_df['league'] = league
-                officials_df['season'] = season
-                officials_df = self._add_metadata(officials_df, 'match_officials')
-                all_match_officials.append(officials_df)
-                got_types.add('match_officials')
-
-        # Keeper match stats (keeper_stats_{team_id} tables — basic GK
-        # columns still populated after the Apr-2026 FBref restriction)
-        if all_match_keeper_stats is not None:
-            keeper_df = parse_keeper_match_stats_tables(soup, comment_tables)
-            if keeper_df is not None and not keeper_df.empty:
-                keeper_df['match_id'] = match_id
-                keeper_df['league'] = league
-                keeper_df['season'] = season
-                keeper_df = self._add_metadata(keeper_df, 'match_keeper_stats')
-                all_match_keeper_stats.append(keeper_df)
-                got_types.add('match_keeper_stats')
-
-        # Commit this match only after every parser returned and the core
-        # two-team player contract passed. A partial retry must never replace
-        # previously good lineups/events with data from a damaged page.
-        if (
-            not require_player_contract
-            or 'match_player_stats' in got_types
-        ):
-            for target, staged in target_buffers:
-                if target is not None and staged:
-                    target.extend(staged)
+        raw_store = getattr(self, '_raw_page_store', None)
+        raw_record = None
+        if raw_store is None:
+            html = self._fetch_page(url, use_cache=False, page_type='match')
+            if not html:
+                return set()
         else:
-            logger.warning(
-                "Discarding staged partial data for %s: player summary "
-                "contract did not pass",
-                match_id,
+            target = match_page_target(match_id)
+            if raw_store.has_page(target):
+                html, raw_record = raw_store.load_html(target)
+                self._stats['raw_page_hits'] = (
+                    self._stats.get('raw_page_hits', 0) + 1
+                )
+            else:
+                html = self._fetch_page(url, use_cache=False, page_type='match')
+                if not html:
+                    return set()
+                raw_record = raw_store.store_html(
+                    target,
+                    html,
+                    fetcher_version='fbref-match-loader-v1',
+                )
+                self._stats['raw_page_writes'] = (
+                    self._stats.get('raw_page_writes', 0) + 1
+                )
+
+        enabled_datasets = {'shot_events', 'match_events', 'lineups'}
+        optional_buffers = {
+            'match_team_stats': all_match_team_stats,
+            'match_player_stats': all_match_player_stats,
+            'match_managers': all_match_managers,
+            'match_officials': all_match_officials,
+            'match_keeper_stats': all_match_keeper_stats,
+        }
+        enabled_datasets.update(
+            name for name, buffer in optional_buffers.items()
+            if buffer is not None
+        )
+        result = parse_match_html(
+            html,
+            match_id=match_id,
+            league=league,
+            season=season,
+            enabled_datasets=enabled_datasets,
+            require_player_contract=(all_match_player_stats is not None),
+            # Keep the long-standing monkeypatch surface used by existing
+            # parser tests while the pure parser owns the production flow.
+            parser_overrides={
+                'extract_tables': extract_tables_from_comments,
+                'shot_events': parse_shots_table,
+                'match_events': parse_events_from_scorebox,
+                'lineups': parse_lineup_table,
+                'match_team_stats': parse_team_match_stats_table,
+                'match_player_stats': parse_player_match_stats_tables,
+                'match_managers': parse_match_managers,
+                'match_officials': parse_match_officials,
+                'match_keeper_stats': parse_keeper_match_stats_tables,
+            },
+        )
+        if raw_store is not None and raw_record is not None:
+            raw_store.write_parse_manifests(raw_record, result)
+        parser_exceptions = [
+            dataset.exception for dataset in result.datasets.values()
+            if dataset.exception is not None
+        ]
+        if parser_exceptions:
+            raise parser_exceptions[0]
+        if result.has_errors and raw_store is not None:
+            errors = [
+                f"{name}:{dataset.reason or dataset.error_type}"
+                for name, dataset in result.datasets.items()
+                if dataset.status == DatasetStatus.ERROR
+            ]
+            raise MatchPageParseError(
+                f"Match {match_id} parse failed: {', '.join(errors)}"
             )
 
-        # Free memory: decompose soup tree (match HTML is never cached).
-        soup.decompose()
-        del comment_tables
+        target_by_dataset = {
+            'shot_events': all_shot_events,
+            'match_events': all_match_events,
+            'lineups': all_lineups,
+            'match_team_stats': all_match_team_stats,
+            'match_player_stats': all_match_player_stats,
+            'match_managers': all_match_managers,
+            'match_officials': all_match_officials,
+            'match_keeper_stats': all_match_keeper_stats,
+        }
+        staged = []
+        got_types: Set[str] = set()
+        for name, dataset in result.datasets.items():
+            target_buffer = target_by_dataset.get(name)
+            if (
+                target_buffer is None
+                or dataset.status != DatasetStatus.AVAILABLE
+                or dataset.frame is None
+            ):
+                continue
+            frame = self._add_metadata(dataset.frame, name)
+            staged.append((target_buffer, frame))
+            got_types.add(name)
 
+        # Legacy in-memory mode keeps its partial diagnostic return so the
+        # existing independent-network retry/tombstone flow stays unchanged.
+        # Raw-first mode above records and raises the same contract failure.
+        if result.has_errors:
+            return got_types
+
+        # The required player contract has already passed. Commit all staged
+        # frames together so no optional parser can leak a partial match.
+        for target_buffer, frame in staged:
+            target_buffer.append(frame)
         return got_types
 
     def _save_fallback_json(
