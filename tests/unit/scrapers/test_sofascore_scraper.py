@@ -1908,6 +1908,41 @@ class TestReadScheduleViaCapture:
         assert sessions == 1
 
     @pytest.mark.unit
+    def test_terminal_404_next_direction_not_retried(self):
+        # Live canary: a finished season had all 381 fixtures in /last while
+        # /next/0 returned a JSON 404. That is a complete empty direction and
+        # must not spend two extra ~2 MB browser warm-ups.
+        scraper = self._scraper()
+        scraper._camoufox_proxy = MagicMock(return_value=None)
+        season = {"year": "25/26", "id": 76668}
+        buf = self._sid_resolvable_buffer(
+            {
+                "status": 200,
+                "challenge": False,
+                "json": {
+                    "events": [
+                        {
+                            "id": 101,
+                            "season": season,
+                            "status": {"type": "finished"},
+                        }
+                    ],
+                    "hasNextPage": False,
+                },
+            }
+        )
+        buf["/api/v1/unique-tournament/17/season/76668/events/next/0"] = {
+            "status": 404,
+            "challenge": False,
+            "json": {"error": {"code": 404, "reason": "Not Found"}},
+        }
+
+        df, sessions = self._run_with_session_counter(scraper, buf)
+
+        assert df is not None and df["game_id"].tolist() == [101]
+        assert sessions == 1
+
+    @pytest.mark.unit
     def test_body_read_race_record_is_retried(self):
         # #879 review (HIGH): a body-read race leaves {'status': 200,
         # 'json': None, 'challenge': None} — a transport failure, NOT a
@@ -2453,6 +2488,61 @@ class TestReadLeagueTableCapture:
 
 class TestTournamentSnapshot:
     @pytest.mark.unit
+    @pytest.mark.parametrize(
+        ("rec", "expected"),
+        [
+            ({"status": 204, "json": None, "challenge": None}, True),
+            (
+                {
+                    "status": 404,
+                    "json": {"error": {"code": 404}},
+                    "challenge": False,
+                },
+                True,
+            ),
+            ({"status": 404, "json": None, "challenge": None}, False),
+            (
+                {
+                    "status": 403,
+                    "json": {"error": {"code": 403}},
+                    "challenge": False,
+                },
+                False,
+            ),
+            ({"status": 429, "json": {}, "challenge": False}, False),
+            ({"status": 503, "json": {}, "challenge": False}, False),
+        ],
+    )
+    def test_terminal_empty_classifier(self, rec, expected):
+        from scrapers.sofascore.scraper import SofaScoreScraper
+
+        assert SofaScoreScraper._rec_terminal_empty(rec) is expected
+
+    @pytest.mark.unit
+    def test_empty_page_that_promises_more_is_incomplete(self):
+        from scrapers.sofascore.scraper import SofaScoreScraper
+
+        prefix = "/api/v1/unique-tournament/17/season/76668/events"
+        buffer = {
+            f"{prefix}/last/0": {
+                "status": 200,
+                "challenge": False,
+                "json": {"events": [{"id": 1}], "hasNextPage": True},
+            },
+            f"{prefix}/last/1": {
+                "status": 200,
+                "challenge": False,
+                "json": {"events": [], "hasNextPage": True},
+            },
+        }
+
+        assert not SofaScoreScraper._event_direction_complete(
+            buffer,
+            prefix,
+            "last",
+        )
+
+    @pytest.mark.unit
     def test_single_year_snapshot_uses_literal_partition_and_api_year(self):
         import sys
         import types
@@ -2625,6 +2715,13 @@ class TestTournamentSnapshot:
                 "status": 200,
                 "challenge": False,
                 "json": {"events": []},
+            },
+            # A terminal response is valid only on page zero. Page one was
+            # promised by hasNextPage=True, so this remains a partial capture.
+            "/api/v1/unique-tournament/17/season/76668/events/last/1": {
+                "status": 404,
+                "challenge": False,
+                "json": {"error": {"code": 404, "reason": "Not Found"}},
             },
         }
         complete = {
