@@ -1073,15 +1073,17 @@ def _build_sofascore_league_table_checks() -> List[Check]:
     """DQ for ``iceberg.silver.sofascore_league_table`` (issue #702).
 
     Conform-only season-grain standings snapshot из bronze.sofascore_league_table
-    (dedup ROW_NUMBER, cast, season-slug as-is). PK = (league, season, team_name) —
-    canonical resolve отложен в Gold (gold.fct_standings джойнит silver.xref_team).
+    (dedup ROW_NUMBER, cast, season-slug as-is). PK = (league, season, team_name,
+    group_id) — у турниров команда легально живёт в двух блоках (группа +
+    «Third-placed teams», #913 Phase 4); canonical resolve отложен в Gold
+    (gold.fct_standings берёт групповую строку per team).
     Floor 18 = минимальный размер одной (league, season) таблицы (18 команд).
     """
     table = 'iceberg.silver.sofascore_league_table'
     return [
         CHECK.no_duplicates(
             table,
-            pk=['league', 'season', 'team_name'],
+            pk=['league', 'season', 'team_name', 'group_id'],
             severity='ERROR',
         ),
         CHECK.no_nulls(

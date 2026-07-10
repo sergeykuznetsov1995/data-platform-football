@@ -2,8 +2,11 @@
 -- Silver: sofascore_league_table   (from bronze.sofascore_league_table)
 -- =============================================================================
 --
--- One row per (league, season, team_name) — conform-only проекция турнирной
--- таблицы из SofaScore. Итоговые показатели сезона (игры / победы / голы / очки).
+-- One row per (league, season, team_name, group_id) — conform-only проекция
+-- турнирной таблицы из SofaScore. Итоговые показатели сезона (игры / победы /
+-- голы / очки). Для турниров SofaScore отдаёт НЕСКОЛЬКО блоков (WC: 12 групп +
+-- «Third-placed teams»), и одна команда легально живёт в двух блоках — поэтому
+-- group_id входит в ключ дедупа (#913 Phase 4).
 -- Это season-grain SNAPSHOT, который SofaScore отдаёт напрямую, НЕ rollup из
 -- match-grain — поэтому conform, а не Gold-факт (ср. charter §2 и
 -- fotmob_team_standings.sql, который делает то же самое для FotMob).
@@ -28,7 +31,11 @@ WITH bronze_dedup AS (
         SELECT
             s.*,
             ROW_NUMBER() OVER (
-                PARTITION BY league, season, team
+                -- COALESCE("group",''): tournament standings come in blocks
+                -- (WC groups + third-placed table) and one team appears in
+                -- two blocks — dedup only WITHIN a block, or 8 group rows
+                -- vanish (#913 Phase 4). "group" is reserved — keep quoted.
+                PARTITION BY league, season, team, COALESCE("group", '')
                 ORDER BY _ingested_at DESC
             ) AS rn
         FROM iceberg.bronze.sofascore_league_table s

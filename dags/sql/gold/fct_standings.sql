@@ -120,6 +120,28 @@ unioned as (
         select 1 from ss_keys k
         where k.league = f.league and k.season = f.season
     )
+),
+
+one_row_per_team as (
+    -- #913 Phase 4: silver keeps EVERY source block (WC: 12 групп +
+    -- «Third-placed teams»), so a team can arrive twice. PK here stays
+    -- (league, season, team_id) — prefer the team's real group row; the
+    -- auxiliary third-place ranking remains queryable in Silver.
+    select *
+    from (
+        select
+            u.*,
+            row_number() over (
+                partition by league, season,
+                    coalesce(canonical_team_id, team_name_raw)
+                order by
+                    case when group_id is null or group_id like 'Group %'
+                         then 0 else 1 end,
+                    snapshot_at desc
+            ) as team_rn
+        from unioned u
+    )
+    where team_rn = 1
 )
 
 select
@@ -157,7 +179,7 @@ select
     cast(points as double) / nullif(played, 0)            as points_per_game,
     snapshot_at,
     cast(snapshot_at as date)                             as as_of_date
-from unioned
+from one_row_per_team
 -- Scope to the canonical season universe (gold.dim_season, rendered from
 -- configs/medallion/competitions.yaml). The Silver standings sources carry
 -- FotMob/SofaScore HISTORICAL seasons beyond the platform's FBref spine
