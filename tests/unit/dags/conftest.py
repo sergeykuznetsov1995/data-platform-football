@@ -391,6 +391,32 @@ _install_airflow_stubs()
 # 3. Shared fixtures
 # ---------------------------------------------------------------------------
 @pytest.fixture
+def real_medallion_config_dir(monkeypatch):
+    """Point ``utils.medallion_config`` at the real shipped
+    ``configs/medallion`` directory.
+
+    Needed by any DAG module that calls a ``medallion_config`` function (e.g.
+    ``is_single_year_competition``, #920 Phase 1) at import/parse time to
+    build its task graph — on the host, ``CONFIG_DIR`` otherwise defaults to
+    ``/opt/airflow/configs/medallion``, which doesn't exist outside the
+    container. ``CONFIG_DIR`` is resolved once at module-import time, so we
+    patch the module attribute directly (not the env var) — mirrors
+    ``tests/unit/sql/test_dim_competition_render.py``.
+    """
+    from pathlib import Path
+
+    from utils import medallion_config
+
+    repo_root = Path(__file__).resolve().parents[3]
+    monkeypatch.setattr(
+        medallion_config, "CONFIG_DIR", repo_root / "configs" / "medallion"
+    )
+    medallion_config.reset_cache()
+    yield
+    medallion_config.reset_cache()
+
+
+@pytest.fixture
 def telegram_env(monkeypatch):
     """Set Telegram env vars so send_telegram_message can dispatch."""
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "test-token-123")

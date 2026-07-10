@@ -53,6 +53,7 @@ def _build_nodriver_command(
     stat_type: str | None = None,
     data_category: str | None = None,
     match_data_type: str | None = None,
+    traffic_output: str | None = None,
 ) -> str:
     """Build bash command for nodriver scraper type."""
     nodriver_args = []
@@ -66,6 +67,8 @@ def _build_nodriver_command(
     nodriver_args.append(f'--content-timeout {content_timeout}')
     nodriver_args.append(f'--max-retries {max_retries}')
     nodriver_args.append(f'--cf-verify-retries {cf_verify_retries}')
+    if traffic_output:
+        nodriver_args.append(f'--traffic-output {traffic_output}')
 
     mode_args = ''
     if mode == 'single_stat':
@@ -106,6 +109,7 @@ def _build_selenium_command(
     data_category: str | None = None,
     match_data_type: str | None = None,
     max_matches: int = 0,
+    traffic_output: str | None = None,
 ) -> str:
     """Build bash command for selenium scraper type."""
     selenium_args_list = []
@@ -118,6 +122,8 @@ def _build_selenium_command(
         selenium_args_list.append(f'--nodriver-cloudflare-wait {nodriver_cloudflare_wait}')
     if proxy_file:
         selenium_args_list.append(f'--proxy-file {proxy_file}')
+    if traffic_output:
+        selenium_args_list.append(f'--traffic-output {traffic_output}')
     selenium_args = ' '.join(selenium_args_list)
 
     mode_args = ''
@@ -261,6 +267,7 @@ def create_match_data_task(
     use_tor: bool = False,
     tor_host: str = 'tor',
     tor_port: int = 9050,
+    task_id_suffix: str = '',
 ) -> BashOperator:
     """
     Create a BashOperator task for collecting match-level data.
@@ -279,6 +286,10 @@ def create_match_data_task(
         nodriver_max_retries: Maximum page load retries
         nodriver_cf_verify_retries: Maximum cf-verify plugin retries
         proxy_file: Path to file with proxy list (format: host:port:user:pass)
+        task_id_suffix: Appended to task_id/output_file/traffic_output (#920
+            Phase 1) so a second, parallel call (e.g. for a single-year
+            tournament) doesn't collide with the default call's files. Empty
+            by default — zero behavior change for existing callers.
 
     Returns:
         BashOperator task
@@ -290,8 +301,12 @@ def create_match_data_task(
     """
     del use_tor, tor_host, tor_port  # legacy soccerdata kwargs, ignored
 
-    task_id = f'match_{data_type}'
+    task_id = f'match_{data_type}{task_id_suffix}'
     output_file = f'/tmp/fbref_{task_id}.json'
+    # The runner labels its traffic-summary file f'match_{data_type}'
+    # regardless of league (run_fbref_scraper.py) — must pass --traffic-output
+    # explicitly so a parallel call doesn't clobber the default call's file.
+    traffic_output = f'/tmp/fbref_traffic_match_{data_type}{task_id_suffix}.json'
 
     # For detailed match data, fall back to selenium (nodriver only supports schedule)
     effective_scraper = scraper_type
@@ -313,6 +328,7 @@ def create_match_data_task(
             max_retries=nodriver_max_retries,
             cf_verify_retries=nodriver_cf_verify_retries,
             match_data_type=data_type,
+            traffic_output=traffic_output,
         )
     else:
         bash_command = _build_selenium_command(
@@ -327,6 +343,7 @@ def create_match_data_task(
             proxy_file=proxy_file,
             match_data_type=data_type,
             max_matches=max_matches,
+            traffic_output=traffic_output,
         )
 
     return BashOperator(
@@ -346,6 +363,7 @@ def create_combined_match_data_task(
     use_nodriver: bool = True,
     nodriver_cloudflare_wait: float = 30.0,
     proxy_file: str | None = None,
+    task_id_suffix: str = '',
 ) -> BashOperator:
     """
     Create a BashOperator task for collecting ALL match-level data in one pass.
@@ -370,12 +388,17 @@ def create_combined_match_data_task(
         use_nodriver: Use nodriver (for selenium scraper type)
         nodriver_cloudflare_wait: Time to wait for Cloudflare challenge (seconds)
         proxy_file: Path to file with proxy list (format: host:port:user:pass)
+        task_id_suffix: Appended to task_id/output_file/traffic_output (#920
+            Phase 1) — see create_match_data_task. Empty by default.
 
     Returns:
         BashOperator task
     """
-    task_id = 'match_all_data'
-    output_file = '/tmp/fbref_match_all_data.json'
+    task_id = f'match_all_data{task_id_suffix}'
+    output_file = f'/tmp/fbref_match_all_data{task_id_suffix}.json'
+    # Runner labels its traffic-summary file 'match_all_data' regardless of
+    # league — must pass --traffic-output explicitly for a parallel call.
+    traffic_output = f'/tmp/fbref_traffic_match_all_data{task_id_suffix}.json'
 
     bash_command = _build_selenium_command(
         mode='combined_match_data',
@@ -388,6 +411,7 @@ def create_combined_match_data_task(
         nodriver_cloudflare_wait=nodriver_cloudflare_wait,
         proxy_file=proxy_file,
         max_matches=max_matches,
+        traffic_output=traffic_output,
     )
 
     return BashOperator(
@@ -407,6 +431,7 @@ def create_combined_season_stats_task(
     use_nodriver: bool = True,
     nodriver_cloudflare_wait: float = 30.0,
     proxy_file: str | None = None,
+    task_id_suffix: str = '',
 ) -> BashOperator:
     """
     Create a BashOperator task for ALL season stats in one pass.
@@ -428,12 +453,17 @@ def create_combined_season_stats_task(
         use_nodriver: Use nodriver (for selenium scraper type)
         nodriver_cloudflare_wait: Time to wait for Cloudflare challenge (seconds)
         proxy_file: Path to file with proxy list (format: host:port:user:pass)
+        task_id_suffix: Appended to task_id/output_file/traffic_output (#920
+            Phase 1) — see create_match_data_task. Empty by default.
 
     Returns:
         BashOperator task
     """
-    task_id = 'season_stats_all'
-    output_file = '/tmp/fbref_season_stats.json'
+    task_id = f'season_stats_all{task_id_suffix}'
+    output_file = f'/tmp/fbref_season_stats{task_id_suffix}.json'
+    # Runner labels its traffic-summary file 'season_stats' regardless of
+    # league — must pass --traffic-output explicitly for a parallel call.
+    traffic_output = f'/tmp/fbref_traffic_season_stats{task_id_suffix}.json'
 
     bash_command = _build_selenium_command(
         mode='combined_season_stats',
@@ -445,6 +475,7 @@ def create_combined_season_stats_task(
         use_nodriver=use_nodriver,
         nodriver_cloudflare_wait=nodriver_cloudflare_wait,
         proxy_file=proxy_file,
+        traffic_output=traffic_output,
     )
 
     # Stale per-stat success files from the pre-combined architecture would

@@ -36,6 +36,15 @@ from airflow.operators.trigger_dagrun import TriggerDagRunOperator
 
 from utils.config import LEAGUES, CURRENT_SEASON, SCHEDULES, DAG_TAGS
 from utils.default_args import SCRAPER_ARGS
+from utils.ingest_helpers import league_slug as _league_slug
+from utils.medallion_config import is_single_year_competition
+
+# #920 Phase 1: split LEAGUES into club (split_year) and tournament
+# (single_year, e.g. INT-World Cup) leagues — see dag_ingest_sofascore.py for
+# the full rationale (mixed calls drop the tournament in the runner's #920
+# bridge, so it needs its own dedicated task).
+CLUB_LEAGUES = [lg for lg in LEAGUES if not is_single_year_competition(lg)]
+TOURNAMENT_LEAGUES = [lg for lg in LEAGUES if is_single_year_competition(lg)]
 
 
 def validate_data(**context) -> Dict[str, Any]:
@@ -123,8 +132,9 @@ def validate_data(**context) -> Dict[str, Any]:
     return validation
 
 
-# Build arguments for bash command
-leagues_str = ','.join(LEAGUES)
+# Build arguments for bash command — club leagues only; tournament leagues
+# get their own dedicated task below.
+leagues_str = ','.join(CLUB_LEAGUES)
 
 with DAG(
     dag_id='dag_ingest_fotmob',
@@ -210,6 +220,35 @@ python dags/scripts/run_fotmob_scraper.py \\
         append_env=True,
     )
 
+    # #920 Phase 1: one dedicated task per tournament league — a mixed
+    # --leagues call would drop it (the runner's #920 bridge needs a
+    # dedicated single-league call to resolve the active tournament season).
+    # Reuses the same `{{ params.season }}` Jinja value as the club task; the
+    # runner resolves it to the real tournament year, or cleanly no-ops
+    # (exit 0) outside the tournament window — the task stays in the graph
+    # year-round as a cheap no-op. Output path is separate from
+    # /tmp/fotmob_result.json, so validate_data() (club-calibrated floors)
+    # never sees it — per-competition floors are #920 Phase 2, out of scope.
+    tournament_tasks = {}
+    for _t_league in TOURNAMENT_LEAGUES:
+        _t_slug = _league_slug(_t_league)
+        tournament_tasks[_t_league] = BashOperator(
+            task_id=f'scrape_fotmob_data_{_t_slug}',
+            bash_command=f"""
+cd /opt/airflow && \\
+python dags/scripts/run_fotmob_scraper.py \\
+    --leagues "{_t_league}" \\
+    --season {{{{ params.season }}}} \\
+    --output /tmp/fotmob_result_{_t_slug}.json
+""",
+            env={
+                'PYTHONPATH': '/opt/airflow:/opt/airflow/dags',
+                'PATH': '/usr/local/bin:/usr/bin:/bin:/home/airflow/.local/bin',
+                'HOME': '/home/airflow',
+            },
+            append_env=True,
+        )
+
     validate_data_task = PythonOperator(
         task_id='validate_data',
         python_callable=validate_data,
@@ -224,3 +263,5 @@ python dags/scripts/run_fotmob_scraper.py \\
     )
 
     scrape_data_task >> validate_data_task >> trigger_silver
+    for _t_league in TOURNAMENT_LEAGUES:
+        tournament_tasks[_t_league] >> validate_data_task
