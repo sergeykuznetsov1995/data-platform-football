@@ -421,6 +421,40 @@ def _validate_competitions_schema(doc: Dict) -> None:
                     f"competitions.yaml: competitions[{i}].seasons[{j}].season_format "
                     f"must be 'single_year' or 'split_year' (got {fmt!r})"
                 )
+            # format + team_count feed the per-competition DQ floors
+            # (#920 Phase 2, get_competition_floor_basis) — enforce at load
+            # time so a mis-onboarded competition fails in tests, not when
+            # the validate task first runs in prod.
+            cfmt = s.get('format')
+            if cfmt not in ('league_round_robin', 'group_knockout'):
+                raise MedallionConfigError(
+                    f"competitions.yaml: competitions[{i}].seasons[{j}].format "
+                    f"must be 'league_round_robin' or 'group_knockout' "
+                    f"(got {cfmt!r})"
+                )
+            tc = s.get('team_count')
+            if not isinstance(tc, int) or isinstance(tc, bool) or tc <= 0:
+                raise MedallionConfigError(
+                    f"competitions.yaml: competitions[{i}].seasons[{j}].team_count "
+                    f"must be positive int (got {tc!r})"
+                )
+            # group_knockout match totals are NOT derivable from team_count
+            # (group size and 3rd-place match vary by tournament), so the
+            # season must state them explicitly.
+            mc = s.get('match_count')
+            if mc is not None and (
+                not isinstance(mc, int) or isinstance(mc, bool) or mc <= 0
+            ):
+                raise MedallionConfigError(
+                    f"competitions.yaml: competitions[{i}].seasons[{j}].match_count "
+                    f"must be positive int (got {mc!r})"
+                )
+            if cfmt == 'group_knockout' and mc is None:
+                raise MedallionConfigError(
+                    f"competitions.yaml: competitions[{i}].seasons[{j}] "
+                    f"({c.get('id')}): group_knockout seasons require an "
+                    f"explicit 'match_count'"
+                )
 
 
 def _validate_country_codes_schema(doc: Dict) -> None:
@@ -1374,6 +1408,61 @@ def get_competition_season_format(competition_id: str, season_id: int) -> str:
                     return s.get('season_format', 'split_year')
             break
     return 'split_year'
+
+
+def _season_match_count(season: Dict, competition_id: str) -> int:
+    """Scheduled match total for one season entry.
+
+    An explicit ``match_count`` always wins. For league_round_robin it is
+    derivable (``n * (n - 1)`` — double round robin), so club seasons don't
+    have to state the obvious. group_knockout totals depend on group size
+    and whether a 3rd-place match exists, so the schema validator already
+    requires ``match_count`` there — the raise below is a belt for callers
+    that bypass load_competitions().
+    """
+    mc = season.get('match_count')
+    if mc is not None:
+        return int(mc)
+    if season.get('format') == 'league_round_robin':
+        n = int(season['team_count'])
+        return n * (n - 1)
+    raise MedallionConfigError(
+        f"competitions.yaml: {competition_id!r} season {season.get('id')!r} "
+        f"has no derivable match count (format {season.get('format')!r} "
+        f"requires explicit 'match_count')"
+    )
+
+
+def get_competition_floor_basis(competition_id: str) -> Tuple[int, int]:
+    """(match_count, team_count) basis for per-competition DQ floors
+    (#920 Phase 2, consumed by utils.config.get_min_row_threshold).
+
+    Takes the MINIMUM of each across the competition's configured seasons:
+    a floor sized to the smallest season can never false-fail any season
+    actually present in Bronze (e.g. FRA-Ligue 1 shrank 20 -> 18 clubs in
+    2324 — the 18-club basis keeps old 20-club seasons comfortably above).
+
+    Fail-closed: raises MedallionConfigError for an unknown competition or
+    one with no seasons — a floor of 0 would silently pass an empty table,
+    the exact regression class of #102/#110.
+    """
+    doc = load_competitions()
+    for c in doc['competitions']:
+        if c['id'] != competition_id:
+            continue
+        seasons = c.get('seasons') or []
+        if not seasons:
+            raise MedallionConfigError(
+                f"competitions.yaml: {competition_id!r} has no seasons — "
+                f"cannot derive a DQ floor basis for a stub competition"
+            )
+        return (
+            min(_season_match_count(s, competition_id) for s in seasons),
+            min(int(s['team_count']) for s in seasons),
+        )
+    raise MedallionConfigError(
+        f"competition not found in competitions.yaml: {competition_id!r}"
+    )
 
 
 def get_active_single_year_season(

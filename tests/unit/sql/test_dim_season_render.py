@@ -89,6 +89,7 @@ _COMPETITIONS_YAML_CONTENT = textwrap.dedent("""\
             season_format: "single_year"
             format: "group_knockout"
             team_count: 48
+            match_count: 104
             start: "2026-06-11"
             end: "2026-07-19"
         sources:

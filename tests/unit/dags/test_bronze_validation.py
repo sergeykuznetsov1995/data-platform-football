@@ -73,3 +73,118 @@ class TestValidateTableFailClosed:
 
         with pytest.raises(AirflowException, match="0 rows < threshold"):
             mod.validate_table("whoscored_schedule", "whoscored_schedule")
+
+
+class TestValidateTablePerLeague:
+    """#920 Phase 2: with a ``leagues`` scope each competition is compared
+    against its own floor — a league missing from the table can no longer
+    hide behind the whole-table aggregate."""
+
+    _LEAGUES = ["ENG-Premier League", "INT-World Cup"]
+
+    def _patched(self, monkeypatch, counts):
+        mod = _load_module()
+        # Floors: EPL 340, WC 93 — the real competitions.yaml-derived values,
+        # pinned here so the test doesn't need MEDALLION_CONFIG_DIR.
+        floors = {"ENG-Premier League": 340, "INT-World Cup": 93}
+        monkeypatch.setattr(
+            mod, "get_min_row_threshold", lambda key, lg: floors[lg]
+        )
+        monkeypatch.setattr(mod, "bronze_count_by_league", lambda _t: counts)
+        return mod
+
+    @pytest.mark.unit
+    def test_all_leagues_above_floor_pass(self, monkeypatch):
+        mod = self._patched(
+            monkeypatch, {"ENG-Premier League": 380, "INT-World Cup": 104}
+        )
+        result = mod.validate_table(
+            "whoscored_schedule", "whoscored_schedule", leagues=self._LEAGUES
+        )
+        assert result["rows"] == 484
+        assert result["per_league"]["INT-World Cup"] == {
+            "rows": 104, "threshold": 93,
+        }
+
+    @pytest.mark.unit
+    def test_missing_league_counts_as_zero_and_fails(self, monkeypatch):
+        """The core #920 Phase 2 guarantee: a league entirely absent from the
+        table fails ITS floor even when the aggregate looks healthy."""
+        mod = self._patched(monkeypatch, {"ENG-Premier League": 9_500})
+        from airflow.exceptions import AirflowException
+
+        with pytest.raises(
+            AirflowException, match="INT-World Cup: 0 rows < 93"
+        ):
+            mod.validate_table(
+                "whoscored_schedule", "whoscored_schedule",
+                leagues=self._LEAGUES,
+            )
+
+    @pytest.mark.unit
+    def test_failure_reports_every_league_below_floor(self, monkeypatch):
+        mod = self._patched(
+            monkeypatch, {"ENG-Premier League": 12, "INT-World Cup": 5}
+        )
+        from airflow.exceptions import AirflowException
+
+        with pytest.raises(AirflowException) as exc:
+            mod.validate_table(
+                "whoscored_schedule", "whoscored_schedule",
+                leagues=self._LEAGUES,
+            )
+        msg = str(exc.value)
+        assert "ENG-Premier League: 12 rows < 340" in msg
+        assert "INT-World Cup: 5 rows < 93" in msg
+
+    @pytest.mark.unit
+    def test_whole_table_key_ignores_leagues(self, monkeypatch):
+        """Wipe-floor keys (no per-league base) must keep whole-table
+        semantics even when the caller passes a league scope — that's how
+        the sofifa loop covers sofifa_versions/player_ratings."""
+        mod = _load_module()
+
+        def _no_group_by(_t):
+            raise AssertionError("per-league count must not run for wipe-floor keys")
+
+        monkeypatch.setattr(mod, "bronze_count_by_league", _no_group_by)
+        monkeypatch.setattr(
+            mod, "bronze_count", lambda _t: mod.MIN_ROW_THRESHOLDS["espn_lineup"]
+        )
+
+        result = mod.validate_table(
+            "espn_lineup", "espn_lineup", leagues=self._LEAGUES
+        )
+        assert result["threshold"] == mod.MIN_ROW_THRESHOLDS["espn_lineup"]
+
+    @pytest.mark.unit
+    def test_unknown_key_with_leagues_still_fails_closed(self, monkeypatch):
+        mod = _load_module()
+        from airflow.exceptions import AirflowException
+
+        monkeypatch.setattr(
+            mod, "bronze_count",
+            lambda _t: (_ for _ in ()).throw(AssertionError("unreachable")),
+        )
+        with pytest.raises(AirflowException, match="missing key 'nope_table'"):
+            mod.validate_table("nope", "nope_table", leagues=self._LEAGUES)
+
+    @pytest.mark.unit
+    def test_floor_derivation_error_wrapped_fail_closed(self, monkeypatch):
+        """A stub/unknown competition in the scope must fail the task, not
+        default to floor 0 (the #102/#110 silent-pass class)."""
+        mod = _load_module()
+        from airflow.exceptions import AirflowException
+        from utils.medallion_config import MedallionConfigError
+
+        def _raise(key, lg):
+            raise MedallionConfigError(f"competition not found: {lg!r}")
+
+        monkeypatch.setattr(mod, "get_min_row_threshold", _raise)
+        with pytest.raises(
+            AirflowException, match="Cannot derive per-league floor"
+        ):
+            mod.validate_table(
+                "whoscored_schedule", "whoscored_schedule",
+                leagues=["XX-Nope"],
+            )

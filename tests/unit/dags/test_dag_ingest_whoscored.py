@@ -29,14 +29,16 @@ def _load_dag_module():
 class TestValidateWrappers:
     @pytest.mark.unit
     @pytest.mark.parametrize(
-        "wrapper, expected_table",
+        # leagues: #920 Phase 2 — schedule is validated per league over
+        # WHOSCORED_LEAGUES; events stays a whole-table wipe-floor (None).
+        "wrapper, expected_table, per_league",
         [
-            ("validate_schedule", "whoscored_schedule"),
-            ("validate_events", "whoscored_events"),
+            ("validate_schedule", "whoscored_schedule", True),
+            ("validate_events", "whoscored_events", False),
         ],
     )
     def test_wrapper_passes_table_and_threshold_key(
-        self, monkeypatch, wrapper, expected_table
+        self, monkeypatch, wrapper, expected_table, per_league
     ):
         mod = _load_dag_module()
         calls = []
@@ -44,9 +46,13 @@ class TestValidateWrappers:
         monkeypatch.setattr(
             mod,
             "validate_table",
-            lambda table, key: calls.append((table, key)) or {"table": table},
+            lambda table, key, leagues=None: calls.append(
+                (table, key, leagues)
+            ) or {"table": table},
         )
 
         getattr(mod, wrapper)()
 
-        assert calls == [(expected_table, expected_table)]
+        from utils.config import WHOSCORED_LEAGUES
+        expected_leagues = WHOSCORED_LEAGUES if per_league else None
+        assert calls == [(expected_table, expected_table, expected_leagues)]
