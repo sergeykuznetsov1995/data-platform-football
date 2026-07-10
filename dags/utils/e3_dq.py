@@ -500,14 +500,15 @@ def _build_whoscored_events_spadl_checks() -> List[Check]:
         # map to 'unknown' by design (Goal moved to the shot family in #462).
         # The registry has no `ratio` primitive, so this is an absolute cap
         # over the WHOLE table: sized as ~40K (≈5.75% of ~700K rows) per
-        # league-season × 12 league-seasons headroom (9 EPL + WC-2026 live
-        # now, #913 measured 230,935 = 3.76% total). Per-season drift is the
-        # job of spadl_unknown_rate[season=...] in build_per_season_e3_checks;
+        # league-season × 60 league-season headroom (51 live after the top-5
+        # spadl backfill: 5 leagues × 10 seasons + WC-2026; measured
+        # 1,091,127 = 3.9% total). Per-season drift is the job of
+        # spadl_unknown_rate[season=...] in build_per_season_e3_checks;
         # this table-wide cap only catches a wholesale taxonomy break.
         CHECK.row_count(
             table=table,
             min_rows=0,
-            max_rows=480_000,
+            max_rows=2_400_000,
             where="action_canonical = 'unknown'",
             severity='ERROR',
             name='spadl_coverage_unknown_rate',
