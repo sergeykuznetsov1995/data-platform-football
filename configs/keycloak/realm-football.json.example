@@ -2,15 +2,69 @@
   "realm": "football",
   "displayName": "Football Data Platform",
   "enabled": true,
-  "registrationAllowed": false,
+  "registrationAllowed": true,
   "resetPasswordAllowed": false,
   "rememberMe": true,
   "sslRequired": "external",
   "bruteForceProtected": true,
+  "browserSecurityHeaders": {
+    "contentSecurityPolicy": "frame-src 'self' https://www.google.com; frame-ancestors 'self'; object-src 'none';",
+    "contentSecurityPolicyReportOnly": "",
+    "xContentTypeOptions": "nosniff",
+    "xFrameOptions": "SAMEORIGIN",
+    "referrerPolicy": "no-referrer",
+    "xRobotsTag": "none",
+    "strictTransportSecurity": "max-age=31536000; includeSubDomains"
+  },
   "groups": [
     { "name": "analysts", "path": "/analysts" },
     { "name": "viewers", "path": "/viewers" },
     { "name": "platform-admins", "path": "/platform-admins" }
+  ],
+  "defaultGroups": ["/viewers"],
+  "authenticatorConfig": [
+    {
+      "alias": "recaptcha",
+      "config": {
+        "site.key": "__KC_RECAPTCHA_SITE_KEY__",
+        "secret.key": "__KC_RECAPTCHA_SECRET_KEY__",
+        "useRecaptchaNet": "false",
+        "recaptcha.v3": "false",
+        "action": "register"
+      }
+    }
+  ],
+  "authenticationFlows": [
+    {
+      "alias": "registration",
+      "description": "Registration flow (копия built-in: reCAPTCHA обязательна; остальные built-in flow Keycloak досоздаёт сам при импорте)",
+      "providerId": "basic-flow",
+      "topLevel": true,
+      "builtIn": true,
+      "authenticationExecutions": [
+        {
+          "authenticator": "registration-page-form",
+          "authenticatorFlow": true,
+          "requirement": "REQUIRED",
+          "priority": 10,
+          "flowAlias": "registration form",
+          "userSetupAllowed": false
+        }
+      ]
+    },
+    {
+      "alias": "registration form",
+      "description": "Registration form",
+      "providerId": "form-flow",
+      "topLevel": false,
+      "builtIn": true,
+      "authenticationExecutions": [
+        { "authenticator": "registration-user-creation", "authenticatorFlow": false, "requirement": "REQUIRED", "priority": 20, "userSetupAllowed": false },
+        { "authenticator": "registration-password-action", "authenticatorFlow": false, "requirement": "REQUIRED", "priority": 50, "userSetupAllowed": false },
+        { "authenticator": "registration-recaptcha-action", "authenticatorConfig": "recaptcha", "authenticatorFlow": false, "requirement": "REQUIRED", "priority": 60, "userSetupAllowed": false },
+        { "authenticator": "registration-terms-and-conditions", "authenticatorFlow": false, "requirement": "DISABLED", "priority": 70, "userSetupAllowed": false }
+      ]
+    }
   ],
   "clientScopes": [
     {

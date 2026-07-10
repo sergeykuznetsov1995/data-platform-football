@@ -515,6 +515,9 @@ services:
       # 4 воркера x gthread; лимит памяти ниже поднят 1500M -> 3G
       # (правило #847: воркеры ~400-500M RSS каждый, тихий memcg-OOM)
       SERVER_WORKER_AMOUNT: "4"
+      # Уведомление админу в Telegram о заявке «Прошу доступ» (superset_config.py)
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
     volumes:
       - ./configs/superset/superset_config.py:/app/pythonpath/superset_config.py:ro
       - ./configs/superset/bootstrap.sh:/app/pythonpath/bootstrap.sh:ro

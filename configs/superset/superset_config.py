@@ -140,6 +140,67 @@ def FLASK_APP_MUTATOR(app):
     def _make_session_permanent() -> None:
         session.permanent = True
 
+    # Заявка «Прошу доступ к данным» (viewers -> analysts). Пишет username+дату
+    # в файл на volume superset_home; читает/обрабатывает scripts/promote.sh.
+    from datetime import datetime, timezone
+
+    from flask import redirect, request
+    from flask_login import current_user
+    from flask_wtf.csrf import generate_csrf
+    from markupsafe import escape
+
+    _REQUESTS_FILE = "/app/superset_home/access_requests.txt"
+
+    @app.route("/access-request", methods=["GET", "POST"])
+    def _access_request():
+        if not current_user.is_authenticated:
+            return redirect("/login/")
+        if request.method == "POST":
+            line = f"{current_user.username}\t{datetime.now(timezone.utc).isoformat(timespec='seconds')}\n"
+            with open(_REQUESTS_FILE, "a", encoding="utf-8") as f:
+                f.write(line)
+            # уведомить админа в Telegram; заявка уже в файле, поэтому не критично
+            _tok = os.environ.get("TELEGRAM_BOT_TOKEN")
+            _chat = os.environ.get("TELEGRAM_CHAT_ID")
+            if _tok and _chat:
+                try:
+                    import json as _json
+                    import urllib.request as _rq
+
+                    _rq.urlopen(_rq.Request(
+                        f"https://api.telegram.org/bot{_tok}/sendMessage",
+                        data=_json.dumps({
+                            "chat_id": _chat,
+                            "text": f"🔑 {current_user.username} просит доступ к данным.\nВыдать: scripts/promote.sh {current_user.username}",
+                        }).encode(),
+                        headers={"Content-Type": "application/json"},
+                    ), timeout=5)
+                except Exception:
+                    app.logger.exception("access-request: telegram-уведомление не ушло")
+            return "<p>Заявка отправлена — администратор выдаст доступ и уведомит вас.</p>"
+        return (
+            f"<p>Вы вошли как <b>{escape(current_user.username)}</b>.</p>"
+            "<form method='post'>"
+            f"<input type='hidden' name='csrf_token' value='{generate_csrf()}'>"
+            "<button type='submit'>Прошу доступ к данным</button>"
+            "</form>"
+        )
+
+    # Пункт меню на форму заявки — иначе юзеру её не найти. Gamma есть у всех
+    # залогиненных (viewers/analysts), menu_access выдаём ей.
+    try:
+        app.appbuilder.add_link("Запросить доступ", href="/access-request")
+        _sm = app.appbuilder.sm
+        # update_perms у Superset выключен — право создаём сами (get-or-create).
+        # Вешаем на отдельную роль viewer_menu: её раздаёт только маппинг группы
+        # viewers ниже, поэтому у analysts пункт меню скрыт.
+        _pv = _sm.add_permission_view_menu("menu_access", "Запросить доступ")
+        _role = _sm.add_role("viewer_menu")
+        if _pv and _role and _pv not in _role.permissions:
+            _sm.add_permission_role(_role, _pv)
+    except Exception:  # пункт меню не стоит падения Superset на старте
+        app.logger.exception("access-request: не удалось добавить пункт меню")
+
 
 # -----------------------------------------------------------------------------
 # SSO через Keycloak (docs/design/analyst-access.md, фаза 7).
@@ -177,8 +238,9 @@ if os.environ.get("SUPERSET_OAUTH_ENABLED", "").lower() == "true":
     AUTH_ROLES_MAPPING = {
         "analysts": ["Gamma", "sql_lab", "analyst_data"],
         # «Простые» юзеры: дашборды без SQL Lab (и без Jupyter/Airflow —
-        # группа viewers не входит в allowed_groups/маппинги этих сервисов)
-        "viewers": ["Gamma", "analyst_data"],
+        # группа viewers не входит в allowed_groups/маппинги этих сервисов);
+        # viewer_menu = пункт меню «Запросить доступ» (создаётся в FLASK_APP_MUTATOR)
+        "viewers": ["Gamma", "analyst_data", "viewer_menu"],
         "platform-admins": ["Admin"],
     }
 

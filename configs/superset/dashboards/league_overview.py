@@ -421,6 +421,20 @@ LEFT JOIN iceberg.gold.fct_standings st
   AND st.league  = b.league
   AND st.season  = b.season"""
 
+    # Источник ОПЦИЙ для фильтров «Куда/Откуда» = клубы самой лиги (≈20 на
+    # сезон), НЕ все пункты назначения из fct_transfer. TM отдаёт всю карьеру,
+    # и to_club/from_club за сезон = 600+ клубов со всего мира (аренды/продажи
+    # молодёжи АПЛ в мелкие клубы) — выпадашка была замусорена «AC Bellinzona»
+    # и т.п. Колонки названы to_club/from_club, чтобы фильтр применялся к
+    # трансферным чартам (там эти колонки); league/season — для каскада.
+    v_league_club = """\
+SELECT DISTINCT
+  ts.league, ts.season,
+  COALESCE(dt.team_name, ts.team_id) AS to_club,
+  COALESCE(dt.team_name, ts.team_id) AS from_club
+FROM iceberg.gold.fct_team_season_stats ts
+LEFT JOIN iceberg.gold.dim_team dt ON dt.team_id = ts.team_id"""
+
     # Таймлайн стоимости (TM) в окне сезона. Чарт режет серии series-limit'ом
     # (топ-10 по пиковой стоимости) — лимит применяется ПОСЛЕ фильтров, так
     # что выбранный в фильтре «Игрок» показывается, даже если он не из топа.
@@ -496,11 +510,11 @@ LEFT JOIN iceberg.gold.dim_team dt ON dt.team_id = tm.team_id
 WHERE tm.is_completed AND tm.gameweek IS NOT NULL"""
 
     # По-матчевая форма игрока. Сырые per-match значения (рейтинг, xG/xA)
-    # линиями не читались (шум 6–8 у рейтинга, пила у xG) — чарты строятся
-    # на оконных колонках: кумулятив Г+А («гонка бомбардиров») и рейтинг,
-    # сглаженный за 5 матчей. Окна строго ORDER BY gameweek (см. v_team_form);
-    # season_minutes — для порога «только регулярные игроки» в форм-чарте.
-    # COALESCE в кумулятиве: NULL-гол в одном матче не дырявит всю сумму.
+    # линиями не читались (шум 6–8 у рейтинга, пила у xG) — чарт строится на
+    # рейтинге, сглаженном окном 5 матчей. Окно строго ORDER BY gameweek (см.
+    # v_team_form); season_minutes — порог «только регулярные игроки».
+    # Кумулятив Г+А («гонка бомбардиров») вынесен в v_player_race (плотная
+    # сетка туров + forward-fill — сплошные линии без разрывов на пропусках).
     v_player_form = f"""\
 SELECT
   fpm.player_id,
@@ -514,10 +528,6 @@ SELECT
   fpm.xg AS expected_goals,
   fpm.xa AS expected_assists,
   fpm.rating, fpm.key_passes,
-  SUM(COALESCE(fpm.goals, 0) + COALESCE(fpm.assists, 0)) OVER (
-    PARTITION BY fpm.player_id, fpm.league, fpm.season
-    ORDER BY dm.gameweek
-  ) AS cum_goal_contrib,
   AVG(fpm.rating) OVER (
     PARTITION BY fpm.player_id, fpm.league, fpm.season
     ORDER BY dm.gameweek
@@ -531,6 +541,57 @@ JOIN iceberg.gold.dim_match dm ON dm.match_id = fpm.match_id
 LEFT JOIN iceberg.gold.dim_player dp ON dp.player_id = fpm.player_id
 LEFT JOIN iceberg.gold.dim_team   dt ON dt.team_id = fpm.team_id
 WHERE dm.gameweek IS NOT NULL"""
+
+    # «Гонка бомбардиров»: кумулятивные Г+А по турам. Ось чарта — тур (общая
+    # сетка всех игроков), но строка есть только за сыгранные туры → на
+    # пропущенных турах (травма/ротация/нет матча) линия рвалась, а у игрока
+    # без матча в последнем туре не доходила до края. Фикс как у v_lo_player_mv:
+    # плотная сетка туров (SEQUENCE от первого сыгранного тура игрока до макс.
+    # тура лиги/сезона) + forward-fill кумулятива (SUM с COALESCE(0) на пустых
+    # турах) → монотонные сплошные линии. Отдельный датасет (не v_player_form):
+    # там грейн «сыгранный матч», плотная сетка сломала бы рейтинг-чарт.
+    # team_name — команда игрока в последнем туре (для фильтра «Команда»).
+    v_player_race = f"""\
+WITH pm AS (
+  SELECT fpm.player_id, fpm.team_id, fpm.league, fpm.season, dm.gameweek,
+         COALESCE(fpm.goals, 0) + COALESCE(fpm.assists, 0) AS ga
+  FROM iceberg.gold.fct_player_match fpm
+  JOIN iceberg.gold.dim_match dm ON dm.match_id = fpm.match_id
+  WHERE dm.gameweek IS NOT NULL
+),
+bounds AS (
+  SELECT league, season, MAX(gameweek) AS max_gw FROM pm GROUP BY league, season
+),
+perweek AS (
+  SELECT player_id, league, season, gameweek, SUM(ga) AS ga_week
+  FROM pm GROUP BY player_id, league, season, gameweek
+),
+span AS (
+  SELECT p.player_id, p.league, p.season, MIN(p.gameweek) AS first_gw, b.max_gw,
+         MAX_BY(p.team_id, p.gameweek) AS team_id
+  FROM pm p JOIN bounds b ON b.league = p.league AND b.season = p.season
+  GROUP BY p.player_id, p.league, p.season, b.max_gw
+),
+grid AS (
+  SELECT s.player_id, s.team_id, s.league, s.season, g AS gameweek
+  FROM span s CROSS JOIN UNNEST(SEQUENCE(s.first_gw, s.max_gw)) AS t(g)
+)
+SELECT
+  g.player_id,
+  COALESCE(dp.player_name, g.player_id) AS player_name,
+  {pos_case} AS position_primary,
+  COALESCE(dt.team_name, g.team_id) AS team_name,
+  g.league, g.season, g.gameweek,
+  SUM(COALESCE(pw.ga_week, 0)) OVER (
+    PARTITION BY g.player_id, g.league, g.season
+    ORDER BY g.gameweek
+  ) AS cum_goal_contrib
+FROM grid g
+LEFT JOIN perweek pw
+  ON  pw.player_id = g.player_id AND pw.league = g.league
+  AND pw.season = g.season AND pw.gameweek = g.gameweek
+LEFT JOIN iceberg.gold.dim_player dp ON dp.player_id = g.player_id
+LEFT JOIN iceberg.gold.dim_team   dt ON dt.team_id = g.team_id"""
 
     v_keeper_season = """\
 SELECT
@@ -588,6 +649,10 @@ LEFT JOIN iceberg.gold.dim_team   dt ON dt.team_id = k.team_id"""
         "player_name": "Игрок", "team_name": "Клуб",
         "month_date": "Месяц", "market_value_eur": "Стоимость (€)",
     }
+    race_labels = {
+        "player_name": "Игрок", "team_name": "Клуб",
+        "gameweek": "Тур", "cum_goal_contrib": "Г+А (кумулятивно)",
+    }
     keeper_labels = {
         "player_name": "Вратарь", "team_name": "Клуб",
         "matches": "Матчи", "minutes": "Минуты",
@@ -616,6 +681,9 @@ LEFT JOIN iceberg.gold.dim_team   dt ON dt.team_id = k.team_id"""
             ctx, database, schema, "v_lo_transfer", v_transfer,
             labels=transfer_labels,
         ),
+        "v_lo_league_club": _ensure_virtual_dataset(
+            ctx, database, schema, "v_lo_league_club", v_league_club
+        ),
         "v_lo_player_mv": _ensure_virtual_dataset(
             ctx, database, schema, "v_lo_player_mv", v_player_mv,
             labels=mv_labels,
@@ -625,6 +693,10 @@ LEFT JOIN iceberg.gold.dim_team   dt ON dt.team_id = k.team_id"""
         ),
         "v_lo_player_form": _ensure_virtual_dataset(
             ctx, database, schema, "v_lo_player_form", v_player_form
+        ),
+        "v_lo_player_race": _ensure_virtual_dataset(
+            ctx, database, schema, "v_lo_player_race", v_player_race,
+            labels=race_labels,
         ),
         "v_lo_keeper_season": _ensure_virtual_dataset(
             ctx, database, schema, "v_lo_keeper_season", v_keeper_season,
@@ -644,6 +716,7 @@ def _build_slices(ctx: _Ctx, vds: dict[str, Any]) -> list[Any]:
     player_mv = vds["v_lo_player_mv"]
     team_form = vds["v_lo_team_form"]
     player_form = vds["v_lo_player_form"]
+    player_race = vds["v_lo_player_race"]
     keeper = vds["v_lo_keeper_season"]
 
     slices: list[Any] = []
@@ -1212,7 +1285,7 @@ def _build_slices(ctx: _Ctx, vds: dict[str, Any]) -> list[Any]:
     # Series limit топ-8 по пиковому кумулятиву; фильтр «Игрок» покажет любого.
     slices.append(_make_slice(ctx,
         "Гонка бомбардиров: Г+А по турам", "echarts_timeseries_line",
-        player_form,
+        player_race,
         {
             "time_range": "No filter",
             "x_axis": "gameweek",
@@ -1552,6 +1625,7 @@ def _build_native_filters(
     team_ds_id = vds["v_lo_team_season"].id
     player_ds_id = vds["v_lo_player_form"].id
     transfer_ds_id = vds["v_lo_transfer"].id
+    league_club_ds_id = vds["v_lo_league_club"].id
 
     ds_columns = {
         t.id: {c.column_name for c in t.columns} for t in vds.values()
@@ -1641,12 +1715,15 @@ def _build_native_filters(
         _filter("NATIVE_FILTER-lo-ttype", "Тип сделки", "transfer_type",
                 transfer_ds_id,
                 multiple=True, target_chart_ids=_charts_with("transfer_type")),
+        # Опции берём из v_lo_league_club (клубы лиги, ≈20), а не из v_lo_transfer
+        # (600+ клубов со всего мира). Колонка to_club/from_club та же → фильтр
+        # по-прежнему применяется к трансферным чартам; каскад по league/season.
         _filter("NATIVE_FILTER-lo-toclub", "Куда (клуб)", "to_club",
-                transfer_ds_id,
+                league_club_ds_id,
                 multiple=True, target_chart_ids=_charts_with("to_club"),
                 cascade_parent_ids=[f_league, f_season]),
         _filter("NATIVE_FILTER-lo-fromclub", "Откуда (клуб)", "from_club",
-                transfer_ds_id,
+                league_club_ds_id,
                 multiple=True, target_chart_ids=_charts_with("from_club"),
                 cascade_parent_ids=[f_league, f_season]),
     ]
