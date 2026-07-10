@@ -287,10 +287,18 @@ def _build_gold_fct_match_odds_checks() -> List[Check]:
             severity='ERROR',
         ),
 
-        # R0.4 canonical completeness.
-        CHECK.canonical_completeness(
-            table, canonical_col='odds_id',
+        # R0.4 canonical completeness. fct_match_odds has no `*_canonical`
+        # column (PK is odds_id), so CHECK.canonical_completeness rejects it
+        # at build time — express the same invariant (id rows must carry
+        # odds_source + odds_version) as an explicit offender count.
+        CHECK.row_count(
+            table=table,
+            min_rows=0,
+            max_rows=0,
+            where=('odds_id IS NOT NULL '
+                   'AND (odds_source IS NULL OR odds_version IS NULL)'),
             severity='ERROR',
+            name='canonical_completeness[gold.fct_match_odds.odds_id]',
         ),
 
         # Decimal-odds bounds (ERROR). Filter NULL via WHERE because
