@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import base64
+import time
 from collections import defaultdict
 from pathlib import Path
 
@@ -121,10 +123,29 @@ def test_dump_writes_expected_report_shape(mod, tmp_path):
     mod._dump(str(out), quiet=True)
     # Assert
     report = json.loads(out.read_text())
-    assert set(report) == {"total_mb", "allowed_hosts", "blocked_hosts"}
+    assert set(report) == {
+        "total_mb", "daily", "leases", "allowed_hosts", "blocked_hosts"
+    }
     assert report["allowed_hosts"][0]["host"] == "sofifa.com"
     assert report["allowed_hosts"][0]["down_mb"] == pytest.approx(1.0, abs=0.01)
     assert report["blocked_hosts"] == [{"host": "doubleclick.net", "attempts": 5}]
+
+
+def test_daily_budget_is_restored_from_atomic_report(mod, tmp_path):
+    out = tmp_path / "report.json"
+    today = mod._utc_day()
+    out.write_text(json.dumps({
+        "daily": {"day": today, "up_bytes": 123, "down_bytes": 456}
+    }))
+    mod._daily_day = ""
+    mod._daily_up_bytes = mod._daily_down_bytes = mod._daily_reserved_bytes = 0
+
+    mod._restore_daily_counter(str(out))
+
+    assert mod._daily_day == today
+    assert mod._daily_up_bytes == 123
+    assert mod._daily_down_bytes == 456
+    assert mod._daily_total_bytes() == 579
 
 
 # --- _pick_upstream / _acquire_upstream (idle-refresh rotation) ---------------
@@ -195,6 +216,83 @@ def test_acquire_upstream_refreshes_for_next_session_once_idle(mod):
     # Assert — a fresh exit is drawn for the new session (#652 idle-refresh)
     assert nxt[1] == 10001
     assert mgr.calls == 2
+
+
+# --- explicit sticky leases ---------------------------------------------------
+
+def test_create_lease_pins_one_upstream_and_has_hard_limits(mod):
+    mgr = _FakeManager(
+        ["http://u:p@pool.proxys.io:10000", "http://u:p@pool.proxys.io:10001"]
+    )
+    mod.LEASES.clear()
+    mod.LEASE_TOKENS.clear()
+    mod._daily_day = ""
+    mod._daily_up_bytes = mod._daily_down_bytes = 0
+
+    lease = mod._create_lease(mgr, max_bytes=4096, ttl_seconds=30)
+
+    assert lease.upstream[1] == 10000
+    assert lease.max_bytes == 4096
+    assert lease.expires_at > lease.created_at
+    assert mod.LEASES[lease.lease_id] is lease
+    assert mod.LEASE_TOKENS[lease.token] == lease.lease_id
+    # Re-reading a lease never asks the pool for a different exit.
+    assert lease.upstream[1] == 10000
+    assert mgr.calls == 1
+
+
+def test_proxy_basic_auth_resolves_only_the_matching_lease(mod):
+    mgr = _FakeManager(["http://u:p@pool.proxys.io:10000"])
+    mod.LEASES.clear()
+    mod.LEASE_TOKENS.clear()
+    mod._daily_day = ""
+    mod._daily_up_bytes = mod._daily_down_bytes = 0
+    lease = mod._create_lease(mgr, max_bytes=4096, ttl_seconds=30)
+    encoded = base64.b64encode(f"lease:{lease.token}".encode()).decode()
+
+    assert mod._lease_from_proxy_authorization(f"Basic {encoded}") is lease
+    assert mod._lease_from_proxy_authorization("Basic bm9wZTpub3Bl") is None
+    assert mod._lease_from_proxy_authorization(None) is None
+
+
+def test_lease_accounting_is_exact_and_budget_is_fail_closed(mod):
+    mgr = _FakeManager(["http://u:p@pool.proxys.io:10000"])
+    mod.LEASES.clear()
+    mod.LEASE_TOKENS.clear()
+    mod.up_bytes = defaultdict(int)
+    mod.down_bytes = defaultdict(int)
+    mod._daily_day = ""
+    mod._daily_up_bytes = mod._daily_down_bytes = 0
+    lease = mod._create_lease(mgr, max_bytes=1000, ttl_seconds=30)
+
+    mod._account_lease_bytes(lease, "www.whoscored.com", "up", 125)
+    mod._account_lease_bytes(lease, "www.whoscored.com", "down", 875)
+
+    assert lease.report()["up_bytes"] == 125
+    assert lease.report()["down_bytes"] == 875
+    assert lease.report()["total_bytes"] == 1000
+    assert lease.report()["hosts"]["www.whoscored.com"] == {
+        "up_bytes": 125,
+        "down_bytes": 875,
+    }
+    assert lease.budget_exceeded is True
+    assert mod._lease_remaining(lease) == 0
+
+
+def test_closed_or_expired_lease_cannot_open_another_tunnel(mod):
+    mgr = _FakeManager(["http://u:p@pool.proxys.io:10000"])
+    mod.LEASES.clear()
+    mod.LEASE_TOKENS.clear()
+    mod._daily_day = ""
+    mod._daily_up_bytes = mod._daily_down_bytes = 0
+    lease = mod._create_lease(mgr, max_bytes=4096, ttl_seconds=30)
+
+    lease.closed = True
+    assert lease.usable is False
+    assert mod._lease_remaining(lease) == 0
+    lease.closed = False
+    lease.expires_at = time.time() - 1
+    assert lease.usable is False
 
 
 # --- shipped blocklist safety -------------------------------------------------

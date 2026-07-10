@@ -189,6 +189,100 @@ class TestRunWhoscoredExitCode:
         assert "iceberg.bronze.whoscored_schedule" in payload["tables"]
 
 
+class TestCanonicalScopeCli:
+    """V2 subcommands use explicit pairs instead of a league/season product."""
+
+    @pytest.fixture
+    def temp_output(self):
+        fd, path = tempfile.mkstemp(suffix=".json", prefix="whoscored_v2_")
+        os.close(fd)
+        yield path
+        if os.path.exists(path):
+            os.unlink(path)
+
+    @pytest.mark.unit
+    def test_matches_runs_only_events_and_emits_v2_report(self, temp_output):
+        scraper_cls = _build_scraper_class(errors=False)
+
+        rc = _run_main(
+            [
+                "matches",
+                "--scope", "ENG-Premier League=2526",
+                "--output", temp_output,
+            ],
+            scraper_cls,
+        )
+
+        assert rc == 0
+        scraper = scraper_cls.return_value
+        scraper.scrape_events.assert_called_once_with(max_matches=None)
+        scraper.scrape_schedule.assert_not_called()
+        scraper.scrape_missing_players.assert_not_called()
+        scraper.scrape_season_stages.assert_not_called()
+        assert scraper_cls.call_args.kwargs["proxy_file"] == ""
+
+        with open(temp_output) as handle:
+            report = json.load(handle)
+        assert report["schema_version"] == 2
+        assert report["status"] == "success"
+        assert report["command"] == "matches"
+        assert report["scopes"][0]["scope"] == "ENG-Premier League=2526"
+
+    @pytest.mark.unit
+    def test_repeated_scope_never_builds_cross_product(self, temp_output):
+        scraper_cls = _build_scraper_class(errors=False)
+
+        rc = _run_main(
+            [
+                "matches",
+                "--scope", "ENG-Premier League=2526",
+                "--scope", "INT-World Cup=2026",
+                "--output", temp_output,
+            ],
+            scraper_cls,
+        )
+
+        assert rc == 0
+        assert scraper_cls.call_count == 2
+        kwargs = [call.kwargs for call in scraper_cls.call_args_list]
+        assert kwargs[0]["leagues"] == ["ENG-Premier League"]
+        assert kwargs[0]["seasons"] == [2526]
+        assert kwargs[1]["leagues"] == ["INT-World Cup"]
+        assert kwargs[1]["seasons"] == [2026]
+
+    @pytest.mark.unit
+    def test_retryable_failure_has_distinct_exit_code(self, temp_output):
+        scraper = MagicMock()
+        scraper.get_traffic_stats.return_value = {}
+        scraper.scrape_events.side_effect = TimeoutError("upstream timeout")
+        scraper.__enter__ = MagicMock(return_value=scraper)
+        scraper.__exit__ = MagicMock(return_value=False)
+        scraper_cls = MagicMock(return_value=scraper)
+
+        rc = _run_main(
+            [
+                "matches",
+                "--scope", "ENG-Premier League=2526",
+                "--output", temp_output,
+            ],
+            scraper_cls,
+        )
+
+        assert rc == 2
+        with open(temp_output) as handle:
+            report = json.load(handle)
+        assert report["status"] == "retryable"
+        assert report["error_details"] == [
+            {
+                "scope": "ENG-Premier League=2526",
+                "entity": "events",
+                "type": "TimeoutError",
+                "message": "upstream timeout",
+                "retryable": True,
+            }
+        ]
+
+
 # ---------------------------------------------------------------------------
 # #878 — fast schedule path + skip-existing probe
 # ---------------------------------------------------------------------------

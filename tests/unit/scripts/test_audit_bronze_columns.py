@@ -158,17 +158,19 @@ def test_understat_contract_lists_all_five_tables(table):
 
 
 # --- WhoScored contract presence guard (#278) ------------------------------
-# Regression guard: the 4 WhoScored bronze tables must stay in the contract so
+# Regression guard: discovery plus v2 payload/manifest tables must stay in the contract so
 # the --source whoscored audit keeps verifying full coverage. whoscored_season_stages
 # is gated by EXPECTED_ABSENT (top-5 leagues have no cup stages) but stays in the
 # contract for completeness.
 @pytest.mark.parametrize('table', [
     'whoscored_schedule',
     'whoscored_events',
+    'whoscored_lineups',
+    'whoscored_match_ingest_manifest',
     'whoscored_missing_players',
     'whoscored_season_stages',
 ])
-def test_whoscored_contract_lists_all_four_tables(table):
+def test_whoscored_contract_lists_all_required_tables(table):
     assert table in mod.EXPECTED_TABLES['whoscored']
 
 

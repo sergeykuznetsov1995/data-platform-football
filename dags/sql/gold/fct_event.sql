@@ -11,7 +11,6 @@
 --   iceberg.silver.whoscored_events_spadl   (input — frozen E3.1 deliverable)
 --   iceberg.silver.xref_team                (team_id resolution)
 --   iceberg.silver.xref_player              (player_id resolution)
---   iceberg.bronze.whoscored_events         (only for team_id → team_name bridge)
 --
 -- DAG-integration note: T3 wraps this SELECT in
 -- `CREATE TABLE iceberg.gold.fct_event AS ... WITH (partitioning=ARRAY['league','season'])`
@@ -73,22 +72,13 @@
 -- now ENABLED in `dags/utils/e3_dq.py::_build_fct_event_checks` because
 -- every WhoScored game_id has a row in xref_match (bridged or orphan).
 --
--- ADR-2: team_id_raw bridge through bronze.whoscored_events
--- ---------------------------------------------------------
--- silver.whoscored_events_spadl carries `team_id_raw` as a numeric Opta id
--- (CAST to varchar). xref_team.source_id is the *team name* (e.g.
--- 'Manchester City') — name-based join surface across all 8 sources.
--- The two are NOT directly joinable.
---
--- Bridge: bronze.whoscored_events has BOTH the numeric `team_id` and the
--- string `team` columns on every row, so we build a (game_id, team_id) →
--- team_name mapping in a CTE and JOIN through that. Per-game uniqueness
--- of the pair (a fixture has exactly 2 teams, never re-aliased) makes
--- this a 1:1 bridge.
---
--- Why not bake the team_name into silver? Silver is a pure normaliser
--- (R3.D scope) — cross-source xref join is a Gold-job concern (silver
--- file header line 173-174 is explicit about this).
+-- ADR-2: team name is carried by Silver
+-- -------------------------------------
+-- silver.whoscored_events_spadl carries both the raw Opta team id and the raw
+-- team name from the manifest-filtered Bronze current view. xref_team is
+-- name-based, so Gold joins directly on `e.team_name_raw`. The former extra
+-- scan/GROUP BY over the append-only Bronze event table was both expensive and
+-- able to re-introduce rows from incomplete batches.
 --
 -- ADR-3: player_id orphan-tolerant LEFT JOIN
 -- ------------------------------------------
@@ -118,42 +108,7 @@
 -- audit. Consumers filter unknown via WHERE action != 'unknown'
 -- in their own queries.
 --
--- ADR-5: dedup of bronze bridge
--- -----------------------------
--- The bronze.whoscored_events bridge CTE GROUP BYs on (game_id, team_id)
--- to collapse multi-event rows of the same team in the same fixture into
--- a single row. MAX(team) is safe because Opta does not re-name a team
--- mid-fixture (verified — silver/whoscored_events_spadl preamble notes
--- 100% PK uniqueness on 15-col natural key).
---
 -- =============================================================================
-
-WITH event_team_names AS (
-    -- ------- ADR-2 bridge: numeric Opta team_id -> team name -------
-    -- One row per (game_id, team_id) pair. ~2 rows per fixture.
-    -- This CTE is small (~760 rows for APL 2425 — 380 fixtures × 2 teams)
-    -- so the downstream JOIN cost is negligible.
-    --
-    -- bronze.whoscored_events.team_id and game_id are DOUBLE; direct
-    -- CAST AS varchar yields scientific notation ('9.5408E4') which
-    -- breaks string equality against the silver-side team_id_raw
-    -- (silver casts via BIGINT first to keep digit form '95408').
-    -- Mirror that double-cast here so the JOIN below resolves.
-    SELECT
-        CAST(CAST(game_id AS BIGINT) AS varchar)  AS match_id,
-        CAST(CAST(team_id AS BIGINT) AS varchar)  AS team_id_raw,
-        MAX(team)                                 AS team_name_raw,
-        league,
-        season
-    FROM iceberg.bronze.whoscored_events
-    WHERE team_id IS NOT NULL
-      AND team    IS NOT NULL
-    GROUP BY
-        CAST(CAST(game_id AS BIGINT) AS varchar),
-        CAST(CAST(team_id AS BIGINT) AS varchar),
-        league,
-        season
-)
 
 SELECT
     -- ============================================================
@@ -184,11 +139,11 @@ SELECT
     e.event_id                                   AS event_id,
 
     -- ============================================================
-    -- team identity — resolved via bronze name bridge + xref_team
+    -- team identity — resolved from the Silver raw-name passthrough
     -- ============================================================
     -- xt.canonical_id is NULL when:
-    --   * team_name_raw missing in bronze bridge (defensive — should
-    --     not happen on validated bronze); OR
+    --   * team_name_raw missing in the Silver passthrough (defensive — should
+    --     not happen on a validated successful match batch); OR
     --   * xref_team has no row for (whoscored, team_name) — alias
     --     YAML drift; DQ in E3.8 catches this.
     xt.canonical_id                              AS team_id,
@@ -239,20 +194,13 @@ SELECT
 
 FROM iceberg.silver.whoscored_events_spadl e
 
--- ---- bronze name bridge — per-fixture team_id -> team_name ----
-LEFT JOIN event_team_names etn
-    ON etn.match_id    = e.match_id
-   AND etn.team_id_raw = e.team_id_raw
-   AND etn.league      = e.league
-   AND etn.season      = e.season
-
 -- ---- team xref (whoscored team-name -> canonical) ----
 -- #506: exclude confidence='orphan' rows — they carry a non-NULL source-
 -- prefixed canonical ('ws_<slug>') that would leak through as a resolved id.
 -- xref_team.sql.j2 contract: orphans are excluded from every cross-source JOIN.
 LEFT JOIN iceberg.silver.xref_team xt
     ON xt.source    = 'whoscored'
-   AND xt.source_id = etn.team_name_raw
+   AND xt.source_id = e.team_name_raw
    AND xt.league    = e.league
    AND xt.season    = e.season
    AND xt.confidence <> 'orphan'

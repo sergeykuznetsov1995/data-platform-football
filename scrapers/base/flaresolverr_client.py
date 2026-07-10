@@ -11,7 +11,7 @@ import logging
 import uuid
 from collections import Counter
 from typing import Optional, Tuple
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import unquote, urlsplit, urlunsplit
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -100,8 +100,11 @@ def _proxy_payload(proxy_url: str) -> dict:
     clean_url = urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
     return {
         "url": clean_url,
-        "username": parts.username or "",
-        "password": parts.password or "",
+        # ``ProxyFilterClient`` percent-encodes its short-lived lease token in
+        # userinfo.  urlsplit intentionally leaves that encoding intact, while
+        # FlareSolverr expects the original credentials in separate fields.
+        "username": unquote(parts.username or ""),
+        "password": unquote(parts.password or ""),
     }
 
 
@@ -173,14 +176,21 @@ class FlareSolverrClient:
 
     @property
     def session(self) -> requests.Session:
-        """Lazily build a requests Session with retry on network errors."""
+        """Lazily build a requests Session.
+
+        Only idempotent GETs (currently ``/health``) are retried.  A POST to
+        FlareSolverr's ``/v1`` is *not* an ordinary API write: ``request.get``
+        drives a complete browser navigation and ``sessions.create`` starts a
+        browser.  Retrying either below the scraper's explicit recovery state
+        machine multiplies traffic and can leave orphan sessions behind.
+        """
         if self._session is None:
             session = requests.Session()
             retry = Retry(
                 total=2,
                 backoff_factor=1.5,
                 status_forcelist=(502, 503, 504),
-                allowed_methods=frozenset(["GET", "POST"]),
+                allowed_methods=frozenset(["GET"]),
                 raise_on_status=False,
             )
             adapter = HTTPAdapter(max_retries=retry)
@@ -278,7 +288,7 @@ class FlareSolverrClient:
         self._sessions_created += 1
         logger.info(
             f"FlareSolverr session created: {session_id}"
-            f"{' (proxy=' + proxy_url + ')' if proxy_url else ''}"
+            f" ({describe_proxy_mode(proxy_url)})"
         )
 
     def destroy_session(self, session_id: str) -> None:
@@ -301,6 +311,7 @@ class FlareSolverrClient:
         session_id: str,
         max_timeout_ms: Optional[int] = None,
         return_only_cookies: bool = False,
+        disable_media: bool = False,
     ) -> dict:
         """GET via FlareSolverr; returns the `solution` subdict (html, cookies, ...)."""
         payload: dict = {
@@ -311,6 +322,11 @@ class FlareSolverrClient:
         }
         if return_only_cookies:
             payload["returnOnlyCookies"] = True
+        if disable_media:
+            # Supported by FlareSolverr 3.x.  This blocks images, stylesheets
+            # and fonts in the browser while preserving the document and the
+            # scripts required to solve Cloudflare challenges.
+            payload["disableMedia"] = True
 
         timeout = (max_timeout_ms / 1000.0 + 30.0) if max_timeout_ms else self.default_timeout
         data = self._post(payload, timeout=timeout)

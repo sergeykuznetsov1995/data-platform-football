@@ -887,9 +887,9 @@ def report_orphan_teams(
 # Cross-source DOB conflicts (companion to the resolver's name_team_dob tier)
 # ---------------------------------------------------------------------------
 
-#: Bronze DOB projections per source: (source, SQL yielding (source_id, dob)).
-#: Mirrors xref_player_resolver._fetch_dob_maps (Bronze only — silver profile
-#: tables depend on xref_player, reading them here would be circular). Trino
+#: Source DOB projections: (source, SQL yielding (source_id, dob)). Most read
+#: Bronze; WhoScored uses its manifest-backed Silver current view, which has no
+#: xref dependency and therefore does not introduce a resolver cycle. Trino
 #: dialect; tests inject DuckDB-compatible projections instead.
 DEFAULT_PLAYER_DOB_PROJECTIONS = (
     ('fotmob',
@@ -914,10 +914,10 @@ DEFAULT_PLAYER_DOB_PROJECTIONS = (
      "WHERE player_id IS NOT NULL AND dob IS NOT NULL "
      "GROUP BY CAST(player_id AS varchar)"),
     ('whoscored',
-     "SELECT CAST(CAST(player_id AS bigint) AS varchar) AS source_id, "
-     "max_by(TRY_CAST(date_of_birth AS DATE), _ingested_at) AS dob "
-     "FROM iceberg.bronze.whoscored_player_profile WHERE player_id IS NOT NULL "
-     "GROUP BY CAST(CAST(player_id AS bigint) AS varchar)"),
+     "SELECT CAST(player_id AS varchar) AS source_id, "
+     "max_by(date_of_birth, fetched_at) AS dob "
+     "FROM iceberg.silver.whoscored_player_profile_current "
+     "WHERE player_id IS NOT NULL GROUP BY CAST(player_id AS varchar)"),
 )
 
 
@@ -1129,7 +1129,7 @@ def evaluate_bronze_xref_freshness_gap(
     Args:
         bronze_tables: Iterable of (source_label, qualified_bronze_table).
             Defaults to Understat + FotMob; WhoScored excluded because the
-            resolver reads players from ``bronze.whoscored_events`` which is
+            resolver reads players from ``bronze.whoscored_events_current`` which is
             too large to scan freshness-per-season cheaply.
         xref_table: Iceberg table whose snapshot timestamp represents the
             last successful resolver run.

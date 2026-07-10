@@ -844,12 +844,15 @@ def test_xref_player_review_rule_enum_includes_dob_veto():
     assert "'dob_veto'" in rule_checks[0].params['where']
 
 
-def test_default_player_dob_projections_are_bronze_only():
-    """Circularity guard: DOB must come from Bronze — silver profile tables
-    depend on xref_player themselves."""
+def test_default_player_dob_projections_do_not_depend_on_xref():
+    """DOB inputs must be raw/manifest-current and never xref-derived."""
     for src, proj in xref_dq.DEFAULT_PLAYER_DOB_PROJECTIONS:
-        assert 'iceberg.bronze.' in proj, f"{src}: non-Bronze DOB projection"
-        assert 'silver' not in proj, f"{src}: circular silver read"
+        if src == 'whoscored':
+            assert 'iceberg.silver.whoscored_player_profile_current' in proj
+        else:
+            assert 'iceberg.bronze.' in proj, f"{src}: non-Bronze DOB projection"
+            assert 'silver' not in proj, f"{src}: circular silver read"
+        assert 'xref_player' not in proj.lower()
     assert {s for s, _ in xref_dq.DEFAULT_PLAYER_DOB_PROJECTIONS} == {
         'fotmob', 'sofascore', 'transfermarkt', 'sofifa', 'whoscored',
     }
