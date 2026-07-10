@@ -228,7 +228,13 @@ WITH src AS (
         season,
         _ingested_at,
         ROW_NUMBER() OVER (
+            -- league/season lead the PARTITION BY on purpose: game_id is
+            -- unique per match so they change no dedup group, but they make
+            -- a backfill's outer WHERE league/season pushdown-legal through
+            -- the window — without them a single-partition INSERT window-sorts
+            -- the ENTIRE bronze table (heap-OOM'd Trino on the #913 WC run).
             PARTITION BY
+                league, season,
                 game_id, period, minute, second, expanded_minute,
                 type, outcome_type, team_id, player_id,
                 x, y, end_x, end_y, qualifiers, related_event_id,
