@@ -341,6 +341,25 @@ dataset. A single average MB/run hides cold-start and retry amplification.
 
 ## Delivery sequence
 
+### Phase B match-page vertical slice (implemented)
+
+The first raw-first slice now covers match pages without changing existing
+Iceberg table contracts or DAG topology:
+
+- canonical match targets map slugged and bare URLs to one match ID;
+- validated UTF-8 HTML is SHA-256 addressed and stored as deterministic gzip
+  in the existing SeaweedFS S3 bucket;
+- target, match-parse, and per-dataset JSON manifests record fetch/parser
+  versions, timestamps, availability, and row counts;
+- replay reads only the stored blob and fails closed on missing or corrupt raw
+  data instead of falling back to the network;
+- the ten captured EPL pages pass the two-team player contract offline with
+  zero proxy bytes; their empty shot sections are recorded as `restricted`.
+
+Still pending in Phase B: a persistent frontier/lease table, manifest
+projection into Iceberg for SQL operations, refresh policy, and raw-first
+coverage for schedules, season pages, squads, players, and match logs.
+
 ### Phase A — stabilize the current collector
 
 Land the fixes in this branch, run a 400+ page proxy soak, and establish

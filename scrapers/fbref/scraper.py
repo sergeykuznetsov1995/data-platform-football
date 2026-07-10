@@ -47,6 +47,7 @@ from scrapers.fbref.url_builder import (
     get_schedule_url,
     get_stats_url,
 )
+from scrapers.fbref.raw_store import RawPageStore
 from scrapers.fbref.html_parser import (
     extract_tables_from_comments,
     parse_table,
@@ -133,6 +134,7 @@ class FBrefScraper(
         proxy_file: Optional[str] = None,
         use_nodriver: bool = False,
         nodriver_cloudflare_wait: float = 30.0,
+        raw_store_uri: Optional[str] = None,
         **kwargs
     ):
         """
@@ -147,6 +149,8 @@ class FBrefScraper(
             use_nodriver: Use nodriver instead of undetected-chromedriver
                          (better Cloudflare bypass, async API)
             nodriver_cloudflare_wait: Time to wait for Cloudflare challenge (nodriver)
+            raw_store_uri: Durable raw-store URI. Defaults to
+                ``FBREF_RAW_STORE_URI``; unset keeps the legacy fetch path.
             **kwargs: Additional arguments for SeleniumScraper
         """
         super().__init__(
@@ -159,6 +163,11 @@ class FBrefScraper(
         )
         self.use_nodriver = use_nodriver
         self.nodriver_cloudflare_wait = nodriver_cloudflare_wait
+        self._raw_page_store = (
+            RawPageStore.from_uri(raw_store_uri)
+            if raw_store_uri
+            else RawPageStore.from_env(optional=True)
+        )
         self._page_cache: Dict[str, str] = {}
         self._pages_fetched: int = 0  # Counter for browser restart
         self._nodriver_browser = None  # Separate instance for nodriver
