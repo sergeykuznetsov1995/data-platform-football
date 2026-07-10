@@ -2126,13 +2126,13 @@ def validate_gold_row_counts() -> Dict[str, Any]:
         # loads — historical snapshots will multiply this by season).
         CHECK.row_count('gold.fct_standings', min_rows=18),
         # dim_competition (#425): one row per competitions.yaml entry —
-        # 8 today (1 in-scope + 7 stubs). Hard equality detects drift the
-        # moment the YAML changes without a corresponding re-run.
-        CHECK.row_count('gold.dim_competition', min_rows=8, max_rows=8),
+        # 9 today (8 club + INT-World Cup, #913). Hard equality detects drift
+        # the moment the YAML changes without a corresponding re-run.
+        CHECK.row_count('gold.dim_competition', min_rows=9, max_rows=9),
         # dim_season (#425): union of seasons across in-scope competitions
-        # in competitions.yaml — 10 APL seasons (1617..2526, full ingested
-        # history). Same drift contract.
-        CHECK.row_count('gold.dim_season',      min_rows=10, max_rows=10),
+        # in competitions.yaml — 10 club seasons (1617..2526) + single-year
+        # '2026' (WC, #913). Same drift contract.
+        CHECK.row_count('gold.dim_season',      min_rows=11, max_rows=11),
     ]
     report = run_checks(checks, raise_on_error=False)
     logger.info(f"Gold row counts: {report.summary()}")
