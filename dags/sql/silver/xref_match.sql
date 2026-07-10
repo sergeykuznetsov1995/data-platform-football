@@ -354,17 +354,23 @@ SELECT
     src.season,
     CASE WHEN fb.canonical_id IS NOT NULL THEN 'date_team_match'
          ELSE 'orphan' END                                             AS confidence,
-    CAST(NULL AS double)                                               AS match_score
+    -- days between source date and matched FBref date (0 = exact); NULL for orphans
+    CAST(MIN(ABS(date_diff('day', fb.match_date, src.match_date))) AS double) AS match_score
 FROM ws_resolved src
 LEFT JOIN fbref_base fb
-       ON fb.match_date        = src.match_date
+       -- #913: ±1 day tolerance — sources stamp UTC dates while FBref uses
+       -- venue-local dates; WC-2026 evening kickoffs in the Americas land on
+       -- the next UTC day (36/100 matches). The final per-(source, source_id)
+       -- dedup prefers the closest date (match_score), so an exact-date hit
+       -- always wins over a ±1 neighbour.
+       ON ABS(date_diff('day', fb.match_date, src.match_date)) <= 1
       AND fb.home_canonical_id = src.home_canonical_id
       AND fb.away_canonical_id = src.away_canonical_id
       AND fb.league            = src.league
       -- season omitted from JOIN: all sources are slug now (#404), but
       -- date+canonical teams already uniquely identify the match, so keeping
       -- season out of the predicate is behaviour-stable (no fan-out).
-GROUP BY 1, 2, 3, 4, 5, 6, 7, 8
+GROUP BY 1, 2, 3, 4, 5, 6, 7
 
 UNION ALL
 
@@ -380,17 +386,23 @@ SELECT
     src.season,
     CASE WHEN fb.canonical_id IS NOT NULL THEN 'date_team_match'
          ELSE 'orphan' END                                             AS confidence,
-    CAST(NULL AS double)                                               AS match_score
+    -- days between source date and matched FBref date (0 = exact); NULL for orphans
+    CAST(MIN(ABS(date_diff('day', fb.match_date, src.match_date))) AS double) AS match_score
 FROM us_resolved src
 LEFT JOIN fbref_base fb
-       ON fb.match_date        = src.match_date
+       -- #913: ±1 day tolerance — sources stamp UTC dates while FBref uses
+       -- venue-local dates; WC-2026 evening kickoffs in the Americas land on
+       -- the next UTC day (36/100 matches). The final per-(source, source_id)
+       -- dedup prefers the closest date (match_score), so an exact-date hit
+       -- always wins over a ±1 neighbour.
+       ON ABS(date_diff('day', fb.match_date, src.match_date)) <= 1
       AND fb.home_canonical_id = src.home_canonical_id
       AND fb.away_canonical_id = src.away_canonical_id
       AND fb.league            = src.league
       -- season omitted from JOIN: all sources are slug now (#404), but
       -- date+canonical teams already uniquely identify the match, so keeping
       -- season out of the predicate is behaviour-stable (no fan-out).
-GROUP BY 1, 2, 3, 4, 5, 6, 7, 8
+GROUP BY 1, 2, 3, 4, 5, 6, 7
 
 UNION ALL
 
@@ -406,17 +418,23 @@ SELECT
     src.season,
     CASE WHEN fb.canonical_id IS NOT NULL THEN 'date_team_match'
          ELSE 'orphan' END                                             AS confidence,
-    CAST(NULL AS double)                                               AS match_score
+    -- days between source date and matched FBref date (0 = exact); NULL for orphans
+    CAST(MIN(ABS(date_diff('day', fb.match_date, src.match_date))) AS double) AS match_score
 FROM ss_resolved src
 LEFT JOIN fbref_base fb
-       ON fb.match_date        = src.match_date
+       -- #913: ±1 day tolerance — sources stamp UTC dates while FBref uses
+       -- venue-local dates; WC-2026 evening kickoffs in the Americas land on
+       -- the next UTC day (36/100 matches). The final per-(source, source_id)
+       -- dedup prefers the closest date (match_score), so an exact-date hit
+       -- always wins over a ±1 neighbour.
+       ON ABS(date_diff('day', fb.match_date, src.match_date)) <= 1
       AND fb.home_canonical_id = src.home_canonical_id
       AND fb.away_canonical_id = src.away_canonical_id
       AND fb.league            = src.league
       -- season omitted from JOIN: all sources are slug now (#404), but
       -- date+canonical teams already uniquely identify the match, so keeping
       -- season out of the predicate is behaviour-stable (no fan-out).
-GROUP BY 1, 2, 3, 4, 5, 6, 7, 8
+GROUP BY 1, 2, 3, 4, 5, 6, 7
 
 UNION ALL
 
@@ -432,17 +450,23 @@ SELECT
     src.season,
     CASE WHEN fb.canonical_id IS NOT NULL THEN 'date_team_match'
          ELSE 'orphan' END                                             AS confidence,
-    CAST(NULL AS double)                                               AS match_score
+    -- days between source date and matched FBref date (0 = exact); NULL for orphans
+    CAST(MIN(ABS(date_diff('day', fb.match_date, src.match_date))) AS double) AS match_score
 FROM fm_resolved src
 LEFT JOIN fbref_base fb
-       ON fb.match_date        = src.match_date
+       -- #913: ±1 day tolerance — sources stamp UTC dates while FBref uses
+       -- venue-local dates; WC-2026 evening kickoffs in the Americas land on
+       -- the next UTC day (36/100 matches). The final per-(source, source_id)
+       -- dedup prefers the closest date (match_score), so an exact-date hit
+       -- always wins over a ±1 neighbour.
+       ON ABS(date_diff('day', fb.match_date, src.match_date)) <= 1
       AND fb.home_canonical_id = src.home_canonical_id
       AND fb.away_canonical_id = src.away_canonical_id
       AND fb.league            = src.league
       -- season omitted from JOIN: all sources are slug now (#404), but
       -- date+canonical teams already uniquely identify the match, so keeping
       -- season out of the predicate is behaviour-stable (no fan-out).
-GROUP BY 1, 2, 3, 4, 5, 6, 7, 8
+GROUP BY 1, 2, 3, 4, 5, 6, 7
 
 UNION ALL
 
@@ -458,17 +482,23 @@ SELECT
     src.season,
     CASE WHEN fb.canonical_id IS NOT NULL THEN 'date_team_match'
          ELSE 'orphan' END                                             AS confidence,
-    CAST(NULL AS double)                                               AS match_score
+    -- days between source date and matched FBref date (0 = exact); NULL for orphans
+    CAST(MIN(ABS(date_diff('day', fb.match_date, src.match_date))) AS double) AS match_score
 FROM mh_resolved src
 LEFT JOIN fbref_base fb
-       ON fb.match_date        = src.match_date
+       -- #913: ±1 day tolerance — sources stamp UTC dates while FBref uses
+       -- venue-local dates; WC-2026 evening kickoffs in the Americas land on
+       -- the next UTC day (36/100 matches). The final per-(source, source_id)
+       -- dedup prefers the closest date (match_score), so an exact-date hit
+       -- always wins over a ±1 neighbour.
+       ON ABS(date_diff('day', fb.match_date, src.match_date)) <= 1
       AND fb.home_canonical_id = src.home_canonical_id
       AND fb.away_canonical_id = src.away_canonical_id
       AND fb.league            = src.league
       -- season omitted from JOIN: all sources are slug now (#404), but
       -- date+canonical teams already uniquely identify the match, so keeping
       -- season out of the predicate is behaviour-stable (no fan-out).
-GROUP BY 1, 2, 3, 4, 5, 6, 7, 8
+GROUP BY 1, 2, 3, 4, 5, 6, 7
 
 UNION ALL
 
@@ -484,17 +514,23 @@ SELECT
     src.season,
     CASE WHEN fb.canonical_id IS NOT NULL THEN 'date_team_match'
          ELSE 'orphan' END                                             AS confidence,
-    CAST(NULL AS double)                                               AS match_score
+    -- days between source date and matched FBref date (0 = exact); NULL for orphans
+    CAST(MIN(ABS(date_diff('day', fb.match_date, src.match_date))) AS double) AS match_score
 FROM es_resolved src
 LEFT JOIN fbref_base fb
-       ON fb.match_date        = src.match_date
+       -- #913: ±1 day tolerance — sources stamp UTC dates while FBref uses
+       -- venue-local dates; WC-2026 evening kickoffs in the Americas land on
+       -- the next UTC day (36/100 matches). The final per-(source, source_id)
+       -- dedup prefers the closest date (match_score), so an exact-date hit
+       -- always wins over a ±1 neighbour.
+       ON ABS(date_diff('day', fb.match_date, src.match_date)) <= 1
       AND fb.home_canonical_id = src.home_canonical_id
       AND fb.away_canonical_id = src.away_canonical_id
       AND fb.league            = src.league
       -- season omitted from JOIN: all sources are slug now (#404), but
       -- date+canonical teams already uniquely identify the match, so keeping
       -- season out of the predicate is behaviour-stable (no fan-out).
-GROUP BY 1, 2, 3, 4, 5, 6, 7, 8
+GROUP BY 1, 2, 3, 4, 5, 6, 7
 
 ),  -- end unioned
 
@@ -518,6 +554,25 @@ fbref_season AS (
     FROM unioned
     WHERE source = 'fbref'
     GROUP BY canonical_id
+),
+
+-- #913: with the ±1-day tolerance a source row can (in theory) hit two FBref
+-- matches — same pair playing twice within the window. Keep exactly one
+-- candidate per (source, source_id): closest date wins (match_score 0 beats 1),
+-- canonical_id as a deterministic tiebreak. Exact-date rows and orphans
+-- (match_score NULL, unique source-prefixed canonical) are unaffected.
+closest AS (
+    SELECT *
+    FROM (
+        SELECT
+            u.*,
+            ROW_NUMBER() OVER (
+                PARTITION BY u.source, u.source_id, u.season
+                ORDER BY u.match_score ASC NULLS LAST, u.canonical_id
+            ) AS _date_rn
+        FROM unioned u
+    )
+    WHERE _date_rn = 1
 )
 SELECT
     canonical_id,
@@ -530,12 +585,13 @@ SELECT
     match_score
 FROM (
     SELECT
-        u.*,
+        u.canonical_id, u.source, u.source_id, u.display_name,
+        u.league, u.season, u.confidence, u.match_score,
         ROW_NUMBER() OVER (
             PARTITION BY u.canonical_id, u.source
             ORDER BY CASE WHEN u.season = fs.fb_season THEN 0 ELSE 1 END, u.season
         ) AS _rn
-    FROM unioned u
+    FROM closest u
     LEFT JOIN fbref_season fs ON fs.canonical_id = u.canonical_id
 )
 WHERE _rn = 1
