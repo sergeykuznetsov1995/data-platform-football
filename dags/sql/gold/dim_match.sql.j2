@@ -125,7 +125,8 @@ SELECT
     m.stage,  -- #913 Phase 3 (FBref round for WC stages; may be league name for clubs)
     CASE
         WHEN m.league = 'INT-World Cup' AND m.stage IS NOT NULL AND m.stage NOT LIKE 'Group%' THEN true
-        WHEN m.stage ILIKE '%final%' OR m.stage ILIKE '%quarter%' OR m.stage ILIKE '%semi%' OR m.stage ILIKE '%round of %' THEN true
+        -- lower() LIKE, not ILIKE: Trino has no ILIKE (DuckDB in unit tests does).
+        WHEN lower(m.stage) LIKE '%final%' OR lower(m.stage) LIKE '%quarter%' OR lower(m.stage) LIKE '%semi%' OR lower(m.stage) LIKE '%round of %' THEN true
         ELSE false
     END AS is_knockout,
     m.attendance,
