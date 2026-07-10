@@ -2453,7 +2453,7 @@ teams:
     team_type: "national"
     aliases:
       _generic: ["Canada"]
-      fbref: ["Canada"]
+      fbref: ["Canada", "ca Canada"]
     competition_scope: ["INT-World Cup"]
 
   - canonical_name: "Mexico"
@@ -2463,7 +2463,7 @@ teams:
     team_type: "national"
     aliases:
       _generic: ["Mexico"]
-      fbref: ["Mexico"]
+      fbref: ["Mexico", "mx Mexico"]
     competition_scope: ["INT-World Cup"]
 
   - canonical_name: "United States"
@@ -2473,7 +2473,7 @@ teams:
     team_type: "national"
     aliases:
       _generic: ["United States", "USA", "USMNT"]
-      fbref: ["United States"]
+      fbref: ["United States", "us United States"]
     competition_scope: ["INT-World Cup"]
 
   # AFC (selected for brevity in plan; full 9 in real fill)
@@ -2484,7 +2484,7 @@ teams:
     team_type: "national"
     aliases:
       _generic: ["Argentina"]
-      fbref: ["Argentina"]
+      fbref: ["Argentina", "ar Argentina"]
     competition_scope: ["INT-World Cup"]
 
   - canonical_name: "Brazil"
@@ -2494,7 +2494,7 @@ teams:
     team_type: "national"
     aliases:
       _generic: ["Brazil"]
-      fbref: ["Brazil"]
+      fbref: ["Brazil", "br Brazil"]
     competition_scope: ["INT-World Cup"]
 
   - canonical_name: "England"
@@ -2504,7 +2504,7 @@ teams:
     team_type: "national"
     aliases:
       _generic: ["England"]
-      fbref: ["England"]
+      fbref: ["England", "eng England"]
     competition_scope: ["INT-World Cup"]
 
   - canonical_name: "France"
@@ -2514,7 +2514,7 @@ teams:
     team_type: "national"
     aliases:
       _generic: ["France"]
-      fbref: ["France"]
+      fbref: ["France", "fr France"]
     competition_scope: ["INT-World Cup"]
 
   - canonical_name: "Germany"
@@ -2524,7 +2524,7 @@ teams:
     team_type: "national"
     aliases:
       _generic: ["Germany"]
-      fbref: ["Germany"]
+      fbref: ["Germany", "de Germany"]
     competition_scope: ["INT-World Cup"]
 
   - canonical_name: "Spain"
@@ -2534,7 +2534,7 @@ teams:
     team_type: "national"
     aliases:
       _generic: ["Spain"]
-      fbref: ["Spain"]
+      fbref: ["Spain", "es Spain"]
     competition_scope: ["INT-World Cup"]
 
   - canonical_name: "Portugal"
@@ -2544,7 +2544,7 @@ teams:
     team_type: "national"
     aliases:
       _generic: ["Portugal"]
-      fbref: ["Portugal"]
+      fbref: ["Portugal", "pt Portugal"]
     competition_scope: ["INT-World Cup"]
 
   # --- Remaining national teams for INT-World Cup (Фаза 4 #913). Total 48.
@@ -2560,7 +2560,7 @@ teams:
     team_type: "national"
     aliases:
       _generic: ["Australia"]
-      fbref: ["Australia"]
+      fbref: ["Australia", "au Australia"]
     competition_scope: ["INT-World Cup"]
 
   - canonical_name: "Iraq"
@@ -2570,7 +2570,7 @@ teams:
     team_type: "national"
     aliases:
       _generic: ["Iraq"]
-      fbref: ["Iraq"]
+      fbref: ["Iraq", "iq Iraq"]
     competition_scope: ["INT-World Cup"]
 
   - canonical_name: "IR Iran"
@@ -2580,7 +2580,7 @@ teams:
     team_type: "national"
     aliases:
       _generic: ["IR Iran", "Iran"]
-      fbref: ["IR Iran"]
+      fbref: ["IR Iran", "ir IR Iran"]
     competition_scope: ["INT-World Cup"]
 
   - canonical_name: "Japan"
@@ -2590,7 +2590,7 @@ teams:
     team_type: "national"
     aliases:
       _generic: ["Japan"]
-      fbref: ["Japan"]
+      fbref: ["Japan", "jp Japan"]
     competition_scope: ["INT-World Cup"]
 
   - canonical_name: "Jordan"
@@ -2600,7 +2600,7 @@ teams:
     team_type: "national"
     aliases:
       _generic: ["Jordan"]
-      fbref: ["Jordan"]
+      fbref: ["Jordan", "jo Jordan"]
     competition_scope: ["INT-World Cup"]
 
   - canonical_name: "Korea Republic"
@@ -2610,7 +2610,7 @@ teams:
     team_type: "national"
     aliases:
       _generic: ["Korea Republic", "South Korea", "Korea"]
-      fbref: ["Korea Republic"]
+      fbref: ["Korea Republic", "kr Korea Republic"]
     competition_scope: ["INT-World Cup"]
 
   - canonical_name: "Qatar"
@@ -2620,7 +2620,7 @@ teams:
     team_type: "national"
     aliases:
       _generic: ["Qatar"]
-      fbref: ["Qatar"]
+      fbref: ["Qatar", "qa Qatar"]
     competition_scope: ["INT-World Cup"]
 
   - canonical_name: "Saudi Arabia"
@@ -2630,7 +2630,7 @@ teams:
     team_type: "national"
     aliases:
       _generic: ["Saudi Arabia"]
-      fbref: ["Saudi Arabia"]
+      fbref: ["Saudi Arabia", "sa Saudi Arabia"]
     competition_scope: ["INT-World Cup"]
 
   - canonical_name: "Uzbekistan"
@@ -2640,7 +2640,7 @@ teams:
     team_type: "national"
     aliases:
       _generic: ["Uzbekistan"]
-      fbref: ["Uzbekistan"]
+      fbref: ["Uzbekistan", "uz Uzbekistan"]
     competition_scope: ["INT-World Cup"]
 
   # CAF (10)
@@ -2651,7 +2651,7 @@ teams:
     team_type: "national"
     aliases:
       _generic: ["Algeria"]
-      fbref: ["Algeria"]
+      fbref: ["Algeria", "dz Algeria"]
     competition_scope: ["INT-World Cup"]
 
   - canonical_name: "Cabo Verde"
@@ -2661,7 +2661,7 @@ teams:
     team_type: "national"
     aliases:
       _generic: ["Cabo Verde", "Cape Verde"]
-      fbref: ["Cabo Verde"]
+      fbref: ["Cabo Verde", "cv Cabo Verde"]
     competition_scope: ["INT-World Cup"]
 
   - canonical_name: "Congo DR"
@@ -2671,7 +2671,7 @@ teams:
     team_type: "national"
     aliases:
       _generic: ["Congo DR", "DR Congo"]
-      fbref: ["Congo DR"]
+      fbref: ["Congo DR", "cd Congo DR"]
     competition_scope: ["INT-World Cup"]
 
   - canonical_name: "Côte d'Ivoire"
@@ -2681,7 +2681,7 @@ teams:
     team_type: "national"
     aliases:
       _generic: ["Côte d'Ivoire", "Ivory Coast"]
-      fbref: ["Côte d'Ivoire"]
+      fbref: ["Côte d'Ivoire", "ci Côte d'Ivoire"]
     competition_scope: ["INT-World Cup"]
 
   - canonical_name: "Egypt"
@@ -2691,7 +2691,7 @@ teams:
     team_type: "national"
     aliases:
       _generic: ["Egypt"]
-      fbref: ["Egypt"]
+      fbref: ["Egypt", "eg Egypt"]
     competition_scope: ["INT-World Cup"]
 
   - canonical_name: "Ghana"
@@ -2701,7 +2701,7 @@ teams:
     team_type: "national"
     aliases:
       _generic: ["Ghana"]
-      fbref: ["Ghana"]
+      fbref: ["Ghana", "gh Ghana"]
     competition_scope: ["INT-World Cup"]
 
   - canonical_name: "Morocco"
@@ -2711,7 +2711,7 @@ teams:
     team_type: "national"
     aliases:
       _generic: ["Morocco"]
-      fbref: ["Morocco"]
+      fbref: ["Morocco", "ma Morocco"]
     competition_scope: ["INT-World Cup"]
 
   - canonical_name: "Senegal"
@@ -2721,7 +2721,7 @@ teams:
     team_type: "national"
     aliases:
       _generic: ["Senegal"]
-      fbref: ["Senegal"]
+      fbref: ["Senegal", "sn Senegal"]
     competition_scope: ["INT-World Cup"]
 
   - canonical_name: "South Africa"
@@ -2731,7 +2731,7 @@ teams:
     team_type: "national"
     aliases:
       _generic: ["South Africa"]
-      fbref: ["South Africa"]
+      fbref: ["South Africa", "za South Africa"]
     competition_scope: ["INT-World Cup"]
 
   - canonical_name: "Tunisia"
@@ -2741,7 +2741,7 @@ teams:
     team_type: "national"
     aliases:
       _generic: ["Tunisia"]
-      fbref: ["Tunisia"]
+      fbref: ["Tunisia", "tn Tunisia"]
     competition_scope: ["INT-World Cup"]
 
   # CONCACAF additional (3)
@@ -2752,7 +2752,7 @@ teams:
     team_type: "national"
     aliases:
       _generic: ["Curaçao"]
-      fbref: ["Curaçao"]
+      fbref: ["Curaçao", "cw Curaçao"]
     competition_scope: ["INT-World Cup"]
 
   - canonical_name: "Haiti"
@@ -2762,7 +2762,7 @@ teams:
     team_type: "national"
     aliases:
       _generic: ["Haiti"]
-      fbref: ["Haiti"]
+      fbref: ["Haiti", "ht Haiti"]
     competition_scope: ["INT-World Cup"]
 
   - canonical_name: "Panama"
@@ -2772,7 +2772,7 @@ teams:
     team_type: "national"
     aliases:
       _generic: ["Panama"]
-      fbref: ["Panama"]
+      fbref: ["Panama", "pa Panama"]
     competition_scope: ["INT-World Cup"]
 
   # CONMEBOL (4 more; Arg+Bra already)
@@ -2783,7 +2783,7 @@ teams:
     team_type: "national"
     aliases:
       _generic: ["Colombia"]
-      fbref: ["Colombia"]
+      fbref: ["Colombia", "co Colombia"]
     competition_scope: ["INT-World Cup"]
 
   - canonical_name: "Ecuador"
@@ -2793,7 +2793,7 @@ teams:
     team_type: "national"
     aliases:
       _generic: ["Ecuador"]
-      fbref: ["Ecuador"]
+      fbref: ["Ecuador", "ec Ecuador"]
     competition_scope: ["INT-World Cup"]
 
   - canonical_name: "Paraguay"
@@ -2803,7 +2803,7 @@ teams:
     team_type: "national"
     aliases:
       _generic: ["Paraguay"]
-      fbref: ["Paraguay"]
+      fbref: ["Paraguay", "py Paraguay"]
     competition_scope: ["INT-World Cup"]
 
   - canonical_name: "Uruguay"
@@ -2813,7 +2813,7 @@ teams:
     team_type: "national"
     aliases:
       _generic: ["Uruguay"]
-      fbref: ["Uruguay"]
+      fbref: ["Uruguay", "uy Uruguay"]
     competition_scope: ["INT-World Cup"]
 
   # OFC (1)
@@ -2824,7 +2824,7 @@ teams:
     team_type: "national"
     aliases:
       _generic: ["New Zealand"]
-      fbref: ["New Zealand"]
+      fbref: ["New Zealand", "nz New Zealand"]
     competition_scope: ["INT-World Cup"]
 
   # UEFA (11 more; Eng/Fra/Ger/Spa/Por already)
@@ -2835,7 +2835,7 @@ teams:
     team_type: "national"
     aliases:
       _generic: ["Austria"]
-      fbref: ["Austria"]
+      fbref: ["Austria", "at Austria"]
     competition_scope: ["INT-World Cup"]
 
   - canonical_name: "Belgium"
@@ -2845,7 +2845,7 @@ teams:
     team_type: "national"
     aliases:
       _generic: ["Belgium"]
-      fbref: ["Belgium"]
+      fbref: ["Belgium", "be Belgium"]
     competition_scope: ["INT-World Cup"]
 
   - canonical_name: "Bosnia and Herzegovina"
@@ -2855,7 +2855,7 @@ teams:
     team_type: "national"
     aliases:
       _generic: ["Bosnia and Herzegovina", "Bosnia"]
-      fbref: ["Bosnia and Herzegovina"]
+      fbref: ["Bosnia and Herzegovina", "ba Bosnia–Herz"]
     competition_scope: ["INT-World Cup"]
 
   - canonical_name: "Croatia"
@@ -2865,7 +2865,7 @@ teams:
     team_type: "national"
     aliases:
       _generic: ["Croatia"]
-      fbref: ["Croatia"]
+      fbref: ["Croatia", "hr Croatia"]
     competition_scope: ["INT-World Cup"]
 
   - canonical_name: "Czechia"
@@ -2875,7 +2875,7 @@ teams:
     team_type: "national"
     aliases:
       _generic: ["Czechia", "Czech Republic"]
-      fbref: ["Czechia"]
+      fbref: ["Czechia", "cz Czechia"]
     competition_scope: ["INT-World Cup"]
 
   - canonical_name: "Netherlands"
@@ -2885,7 +2885,7 @@ teams:
     team_type: "national"
     aliases:
       _generic: ["Netherlands", "Holland"]
-      fbref: ["Netherlands"]
+      fbref: ["Netherlands", "nl Netherlands"]
     competition_scope: ["INT-World Cup"]
 
   - canonical_name: "Norway"
@@ -2895,7 +2895,7 @@ teams:
     team_type: "national"
     aliases:
       _generic: ["Norway"]
-      fbref: ["Norway"]
+      fbref: ["Norway", "no Norway"]
     competition_scope: ["INT-World Cup"]
 
   - canonical_name: "Scotland"
@@ -2905,7 +2905,7 @@ teams:
     team_type: "national"
     aliases:
       _generic: ["Scotland"]
-      fbref: ["Scotland"]
+      fbref: ["Scotland", "sct Scotland"]
     competition_scope: ["INT-World Cup"]
 
   - canonical_name: "Sweden"
@@ -2915,7 +2915,7 @@ teams:
     team_type: "national"
     aliases:
       _generic: ["Sweden"]
-      fbref: ["Sweden"]
+      fbref: ["Sweden", "se Sweden"]
     competition_scope: ["INT-World Cup"]
 
   - canonical_name: "Switzerland"
@@ -2925,7 +2925,7 @@ teams:
     team_type: "national"
     aliases:
       _generic: ["Switzerland"]
-      fbref: ["Switzerland"]
+      fbref: ["Switzerland", "ch Switzerland"]
     competition_scope: ["INT-World Cup"]
 
   - canonical_name: "Türkiye"
@@ -2935,7 +2935,7 @@ teams:
     team_type: "national"
     aliases:
       _generic: ["Türkiye", "Turkey"]
-      fbref: ["Türkiye"]
+      fbref: ["Türkiye", "tr Türkiye"]
     competition_scope: ["INT-World Cup"]
 
 # NOTE: 48 NT entries complete (Фаза 4 #913). Aliases seeded from FIFA names; enrich _generic/fbref/sofascore etc from live Bronze data as needed.

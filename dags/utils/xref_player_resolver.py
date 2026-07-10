@@ -2293,6 +2293,13 @@ def _dedup_canonical_per_season(
 #: Core hard-gate source set — the original R2 regression contract.
 _KNOWN_PAIR_CORE_SOURCES = frozenset({'fbref', 'understat', 'whoscored'})
 
+#: Per-league overrides of the core gate sources. Understat covers only the
+#: six club leagues — requiring it for INT-World Cup made the WC anchor gate
+#: structurally unpassable (0/8 on every run, #913 Phase 4).
+_KNOWN_PAIR_CORE_SOURCES_BY_LEAGUE: Dict[str, frozenset] = {
+    'INT-World Cup': frozenset({'fbref', 'whoscored'}),
+}
+
 #: Extended WARNING-only gate: SofaScore names come from a possibly-sparse
 #: profile JOIN and FotMob has a separate ingest, so these were historically
 #: excluded from the hard assertion. Verified softly until live pass-rates
@@ -2624,8 +2631,10 @@ def run_resolver(
             known_passed = known_total = None
             ext_passed = ext_total = None
         else:
+            core_sources = _KNOWN_PAIR_CORE_SOURCES_BY_LEAGUE.get(
+                league, _KNOWN_PAIR_CORE_SOURCES)
             known_passed, known_total = _verify_known_pairs(
-                rows, pairs=league_pairs
+                rows, required_sources=core_sources, pairs=league_pairs
             )
             if known_passed < KNOWN_PAIR_MIN_PASS:
                 raise ResolverError(
