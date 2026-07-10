@@ -96,10 +96,10 @@ _TABLE_CASES = [
     ("iceberg.gold.dim_player",      1,    None),
     ("iceberg.gold.dim_team",        1,    None),
     ("iceberg.gold.dim_match",       1,    None),
-    # #425: config-driven dims mirror competitions.yaml exactly —
-    # 8 competitions (1 in-scope + 7 stubs), 10 APL seasons (1617..2526).
-    ("iceberg.gold.dim_competition", 8,    8),
-    ("iceberg.gold.dim_season",      10,   10),
+    # #425 + #913: config-driven dims mirror competitions.yaml.
+    # dim_season now includes the single_year '2026' (INT-World Cup) → 11 rows.
+    ("iceberg.gold.dim_competition", 9,    9),  # 6 in-scope (incl WC) + stubs
+    ("iceberg.gold.dim_season",      11,   11),
 ]
 
 
@@ -111,8 +111,8 @@ _TABLE_CASES = [
 def test_dim_table_row_counts(table, min_rows, exact_rows):
     """Each dim table must exist and respect its row-count contract.
 
-    * dim_competition → exactly 8 (one row per competitions.yaml entry)
-    * dim_season      → exactly 10 (union of in-scope seasons in the YAML)
+    * dim_competition → one row per competitions.yaml entry (incl. WC)
+    * dim_season      → union of in-scope seasons (incl. single_year 2026, #913)
     * остальные dims  → at least 1 row (depend on Bronze content)
     """
     count = _scalar(f"SELECT COUNT(*) FROM {table}")

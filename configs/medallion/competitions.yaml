@@ -9,7 +9,10 @@
 # живёт в Gold SQL, не в YAML. См. R1 verdict
 # (docs/MEDALLION_REDESIGN_ROADMAP.md L574-L580).
 #
-# Season ID convention: 4-digit slug — 2024-25 -> 2425, 2025-26 -> 2526
+# Season ID convention: 4-digit slug — 2024-25 -> 2425, 2025-26 -> 2526,
+# or literal year for single_year comps (INT-World Cup 2026 -> 2026).
+# Per-season "season_format: single_year | split_year" (default split_year)
+# drives dim_season + slug conversion in Silver/Gold (#913 Phase 2).
 # (matches Bronze season convention from utils.config.get_current_season).
 #
 # Field reference:
@@ -94,7 +97,7 @@ competitions:
         - "clubelo"
     in_scope: true
 
-  - id: "EUR-Champions League"
+  - id: "UEFA-Champions League"
     name: "UEFA Champions League"
     country: "Europe"
     tier: 1
@@ -384,7 +387,7 @@ competitions:
     in_scope: false
     notes: "stub for E8b (Top-5 sister league — Understat covers it)"
 
-  - id: "EUR-Europa League"
+  - id: "UEFA-Europa League"
     name: "UEFA Europa League"
     country: "Europe"
     tier: 1
@@ -399,6 +402,8 @@ competitions:
     name: "FIFA World Cup"
     country: "World"
     tier: 1
+    competition_format: group_knockout
+    is_international: true
     seasons:
       - id: 2026
         season_format: single_year

@@ -30,7 +30,6 @@ def get_current_season() -> int:
 # After successful test runs, gradually add more leagues back:
 # 'ESP-La Liga', 'GER-Bundesliga', 'ITA-Serie A', 'FRA-Ligue 1'
 LEAGUES: List[str] = [
-    'ENG-Premier League',
     'INT-World Cup',  # #913 Phase 1 (single-year WC). Targeting 5 sources: fbref, fotmob, sofascore, espn, whoscored. Club-only sources (sofifa etc) protected in thresholds.
 ]
 

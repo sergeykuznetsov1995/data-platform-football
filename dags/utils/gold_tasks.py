@@ -685,8 +685,27 @@ def _star_gate_grain_checks() -> List:
     """Grain sanity (issue #432): violations counted via HAVING subqueries.
 
     ``value`` = number of rows living in violating groups (0 = healthy).
+
+    #913 Phase 4: per-competition team_count from competitions.yaml
+    (INT-World Cup = 48, others 18/20/24). No more global 18-24.
     """
     from utils.data_quality import CHECK
+    from utils.medallion_config import load_competitions
+
+    # Build (league, season, team_count) from config for in_scope comps.
+    # Used to validate exact declared count per (l,s).
+    expected_rows: list[str] = []
+    for c in load_competitions().get('competitions', []):
+        if not c.get('in_scope'):
+            continue
+        for s in c.get('seasons') or []:
+            slug = f"{int(s['id']):04d}"
+            tc = int(s.get('team_count') or 0)
+            if tc > 0:
+                expected_rows.append(
+                    f"('{c['id']}', '{slug}', {tc})"
+                )
+    expected_sql = ',\n        '.join(expected_rows) if expected_rows else "('ENG-Premier League','2526',20)"
 
     return [
         # Long format: exactly 2 rows (home + away) per match — by
@@ -711,26 +730,36 @@ def _star_gate_grain_checks() -> List:
             severity='WARNING',
             name='star_coverage[dim_match->fct_team_match]',
         ),
-        # ~20 teams per (league, season): 18 (Bundesliga/Ligue 1) to 24
-        # (Championship). PK uniqueness is asserted separately, so COUNT(*)
-        # equals the team count. WARNING — approximate invariant.
-        # Baseline 2026-06-12: standings 1 group / season-stats 10 groups,
-        # all exactly 20.
+        # Per-competition team count (Фаза 4 #913). Uses declared team_count
+        # from competitions.yaml. WC=48, APL~20, Bundesliga=18 etc.
+        # COUNT(*) must == declared for the (league,season).
         CHECK.row_count(
             'gold.fct_standings', min_rows=0, max_rows=0,
-            where=("(league, season) IN (SELECT league, season "
-                   "FROM iceberg.gold.fct_standings "
-                   "GROUP BY league, season HAVING COUNT(*) NOT BETWEEN 18 AND 24)"),
+            where=(
+                "(league, season) IN ("
+                "  WITH expected(lg, sn, tc) AS (VALUES\n        " + expected_sql + "\n  ) "
+                "  SELECT f.league, f.season FROM iceberg.gold.fct_standings f "
+                "  LEFT JOIN expected e ON e.lg = f.league AND e.sn = f.season "
+                "  GROUP BY f.league, f.season, COALESCE(e.tc, 20) "
+                "  HAVING COUNT(*) <> COALESCE(e.tc, 20)"
+                ")"
+            ),
             severity='WARNING',
-            name='star_grain[fct_standings~20teams/league-season]',
+            name='star_grain[fct_standings=declared_team_count]',
         ),
         CHECK.row_count(
             'gold.fct_team_season_stats', min_rows=0, max_rows=0,
-            where=("(league, season) IN (SELECT league, season "
-                   "FROM iceberg.gold.fct_team_season_stats "
-                   "GROUP BY league, season HAVING COUNT(*) NOT BETWEEN 18 AND 24)"),
+            where=(
+                "(league, season) IN ("
+                "  WITH expected(lg, sn, tc) AS (VALUES\n        " + expected_sql + "\n  ) "
+                "  SELECT f.league, f.season FROM iceberg.gold.fct_team_season_stats f "
+                "  LEFT JOIN expected e ON e.lg = f.league AND e.sn = f.season "
+                "  GROUP BY f.league, f.season, COALESCE(e.tc, 20) "
+                "  HAVING COUNT(*) <> COALESCE(e.tc, 20)"
+                ")"
+            ),
             severity='WARNING',
-            name='star_grain[fct_team_season_stats~20teams/league-season]',
+            name='star_grain[fct_team_season_stats=declared_team_count]',
         ),
     ]
 

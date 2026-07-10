@@ -32,6 +32,8 @@
 -- to the slug ('2425') inline (#404 idiom). The bronze table carries ×2-×5
 -- duplicate scorebox rows per match — ROW_NUMBER dedup per (match_id, side).
 --
+-- #913 Phase 3: stage (from fbref round), home/away_penalty, is_knockout added
+-- for WC knockout support. result_1x2 now respects penalty shoot-outs.
 -- Partitioning: NONE (star design: dims unpartitioned; ~1.9k rows for APL×5).
 -- =============================================================================
 
@@ -67,8 +69,12 @@ managers_dedup AS (
         manager_name,
         league,
         -- year-start bigint -> slug ('2425'), #404 idiom.
-        LPAD(CAST(MOD(season, 100) AS varchar), 2, '0')
-            || LPAD(CAST(MOD(season + 1, 100) AS varchar), 2, '0') AS season,
+        -- #913 Phase 2: single_year support (INT-World Cup bronze season is the slug year)
+        CASE WHEN league = 'INT-World Cup'
+             THEN LPAD(CAST(season AS varchar), 4, '0')
+             ELSE LPAD(CAST(MOD(season, 100) AS varchar), 2, '0')
+                  || LPAD(CAST(MOD(season + 1, 100) AS varchar), 2, '0')
+        END AS season,
         ROW_NUMBER() OVER (
             PARTITION BY match_id, side
             ORDER BY manager_name
@@ -116,10 +122,23 @@ SELECT
     m.date               AS match_date,
     m.time               AS kickoff_time,
     m.gameweek,
+    m.stage,  -- #913 Phase 3 (FBref round for WC stages; may be league name for clubs)
+    CASE
+        WHEN m.league = 'INT-World Cup' AND m.stage IS NOT NULL AND m.stage NOT LIKE 'Group%' THEN true
+        WHEN m.stage ILIKE '%final%' OR m.stage ILIKE '%quarter%' OR m.stage ILIKE '%semi%' OR m.stage ILIKE '%round of %' THEN true
+        ELSE false
+    END AS is_knockout,
     m.attendance,
     m.home_score,
     m.away_score,
+    m.home_penalty,  -- #913 Phase 3
+    m.away_penalty,
     CASE
+        -- Penalty shoot-out decides the winner (goals may be tied)
+        WHEN m.home_penalty IS NOT NULL AND m.away_penalty IS NOT NULL THEN
+            CASE WHEN m.home_penalty > m.away_penalty THEN 'H'
+                 WHEN m.home_penalty < m.away_penalty THEN 'A'
+                 ELSE 'D' END
         WHEN m.home_score > m.away_score THEN 'H'
         WHEN m.home_score < m.away_score THEN 'A'
         WHEN m.home_score = m.away_score THEN 'D'

@@ -14,7 +14,7 @@
 --   iceberg.silver.sofascore_league_table   (primary)
 --   iceberg.silver.fotmob_team_standings     (fallback, 2-й источник)
 --   iceberg.silver.xref_team                 (canonical team-id resolve)
--- PK:           (league, season, team_id)
+-- PK:           (league, season, team_id)   -- group_id is attribute (WC groups)
 -- Partitioning: (league, season)   -- passed by run_gold_transform()
 --
 -- Multi-source dedup (#702 — SofaScore-primary, FotMob whole-table fallback):
@@ -39,6 +39,10 @@
 --   snapshot_at = _bronze_ingested_at сохранившейся строки.
 --   as_of_date  = DATE(snapshot_at) -- daily granularity for downstream joins.
 --
+-- #913 Phase 4: group_id (WC 12 groups of 4). position = ROW_NUMBER() partitioned
+-- by (league, season, group_id) so each group has its own 1..N ranking.
+-- group_id NULL for club leagues and WC knockout. PK remains (league, season, team_id).
+--
 -- Notes:
 --   * SofaScore/FotMob Pts уже post-deduction; R7 trust-check deferred.
 --   * position is derived (ROW_NUMBER) единообразно для обоих источников —
@@ -62,6 +66,7 @@ with ss_raw as (
         s.goals_against,
         s.goal_diff,
         s.points,
+        s.group_id,
         s._bronze_ingested_at                             as snapshot_at,
         x.canonical_id                                    as canonical_team_id,
         'sofascore'                                       as standings_source
@@ -88,6 +93,7 @@ fm_raw as (
         f.goals_against,
         f.goal_diff,
         f.points,
+        f.group_id,
         f._bronze_ingested_at                             as snapshot_at,
         x.canonical_id                                    as canonical_team_id,
         'fotmob'                                          as standings_source
@@ -141,9 +147,10 @@ select
     goals_against,
     goal_diff,
     points,
+    group_id,
     cast(
         row_number() over (
-            partition by league, season
+            partition by league, season, coalesce(group_id, '')
             order by points desc, goal_diff desc, goals_for desc
         ) as integer
     )                                                     as position,

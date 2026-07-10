@@ -849,14 +849,15 @@ def _build_fct_shot_checks() -> List[Check]:
 
         # Volume — APL multi-season ≈ 47K shots smoke-tested. Min 20K
         # WARNING for partial-backfill grace.
-        CHECK.row_count(table, min_rows=20_000, severity='WARNING'),
+        # #913 Phase 4: scope out INT-World Cup (no Understat coverage).
+        CHECK.row_count(table, min_rows=20_000, where="league <> 'INT-World Cup'", severity='WARNING'),
 
         # Player orphan rate guard — see threshold derivation above.
         CHECK.row_count(
             table=table,
             min_rows=0,
             max_rows=shot_orphan_max,
-            where="player_id IS NULL",
+            where="player_id IS NULL AND league <> 'INT-World Cup'",
             severity='WARNING',
             name='shot_orphan_player_rate',
         ),

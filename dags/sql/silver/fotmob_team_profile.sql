@@ -70,7 +70,11 @@ SELECT
 
     -- ===== Partition keys (season → slug to match other Silver tables) =====
     b.league,
-    LPAD(CAST(MOD(b.season,     100) AS varchar), 2, '0')
-        || LPAD(CAST(MOD(b.season + 1, 100) AS varchar), 2, '0') AS season
+    -- #913 Phase 2
+    CASE WHEN b.league = 'INT-World Cup'
+         THEN LPAD(CAST(b.season AS varchar), 4, '0')
+         ELSE LPAD(CAST(MOD(b.season, 100) AS varchar), 2, '0')
+              || LPAD(CAST(MOD(b.season + 1, 100) AS varchar), 2, '0')
+    END AS season
 
 FROM bronze_dedup b

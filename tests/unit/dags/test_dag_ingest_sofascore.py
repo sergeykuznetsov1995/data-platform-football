@@ -110,6 +110,7 @@ class TestBronzeFreshnessGate:
         coverage = [c for c in checks if c.kind == 'coverage']
         assert len(coverage) == 1
         assert coverage[0].params['table'] == 'bronze.sofascore_match_stats'
+        assert len(checks) == len(freshness) + len(coverage)
         # WARNING-only gate must not hard-fail the DAG.
         assert all(c.severity == 'WARNING' for c in checks)
         assert captured['raise_on_error'] is False

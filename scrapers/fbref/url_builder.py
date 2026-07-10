@@ -8,18 +8,22 @@ Functions for building FBref URLs.
 from scrapers.fbref.constants import BASE_URL, LEAGUE_IDS
 
 
-def format_season(season: int) -> str:
+def format_season(season: int, league: str = None) -> str:
     """
     Format season year to FBref format.
 
-    FBref uses format like '2023-2024' for full seasons.
+    For INT-World Cup (single_year) use literal year '2026' (not '2026-2027').
+    Recon (#913 Phase 0) showed FBref single-year paths are /2026/ not /2026-2027/.
 
     Args:
-        season: Season start year (e.g., 2023 for 2023-2024 season)
+        season: Season identifier (start year for clubs, literal year for WC)
+        league: Optional league name to select formatting (single vs split)
 
     Returns:
-        Formatted season string
+        Formatted season string for URL path
     """
+    if league == 'INT-World Cup':
+        return str(season)
     return f"{season}-{season + 1}"
 
 
@@ -43,7 +47,7 @@ def get_schedule_url(league: str, season: int) -> str:
 
     comp_id = league_info['comp_id']
     slug = league_info['slug']
-    season_str = format_season(season)
+    season_str = format_season(season, league)
 
     return (
         f"{BASE_URL}/en/comps/{comp_id}/{season_str}/schedule/"
@@ -78,7 +82,7 @@ def get_stats_url(
 
     comp_id = league_info['comp_id']
     slug = league_info['slug']
-    season_str = format_season(season)
+    season_str = format_season(season, league)
 
     # Map stat_type to FBref URL path (FBref uses different naming)
     url_stat_type_mapping = {

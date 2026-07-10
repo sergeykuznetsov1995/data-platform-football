@@ -117,7 +117,7 @@ class TestDimTeamRender:
         rendered = out_path.read_text()
         medallion_config.reset_cache()
 
-        assert "('x_united', 'X United', 'England', 'X Utd')" in rendered
+        assert "('x_united', 'X United', 'England', 'X Utd', 'club')" in rendered
         # The standalone placeholder must be gone from the VALUES block.
         assert not re.search(
             r"^\s*\{\{\s*team_meta_values_sql\s*\}\}\s*$",
