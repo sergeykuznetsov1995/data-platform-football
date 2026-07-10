@@ -1493,31 +1493,45 @@ def main():
     else:
         leagues = [l.strip() for l in args.leagues.split(',')]
 
-    # #920 bridge: single_year tournaments must never inherit the club-formula
-    # season (July 2026 -> 2025) — the sid resolve would no-op every daily run
-    # while the tournament is live. Mixed club+WC calls can't carry two
-    # seasons -> WC is dropped (dedicated call), as in the other runners.
-    if 'INT-World Cup' in leagues:
-        from utils.medallion_config import get_active_season
-        _wc_season = get_active_season('INT-World Cup')
-        if len(leagues) > 1:
+    # #920 bridge (generalized Phase 3: any single_year tournament):
+    # tournaments must never inherit the club-formula season (July 2026 ->
+    # 2025) — the sid resolve would no-op every daily run while the
+    # tournament is live. Mixed calls can't carry two seasons ->
+    # tournaments are dropped (dedicated call), as in the other runners.
+    from utils.medallion_config import (
+        get_active_season, is_single_year_competition,
+    )
+    _tournaments = [l for l in leagues if is_single_year_competition(l)]
+    if _tournaments and len(leagues) > 1:
+        logger.warning(
+            "Single-year tournaments %s dropped from mixed call (each needs "
+            "its own season; leagues=%s). Scrape them with dedicated "
+            "--league calls.", _tournaments, leagues)
+        leagues = [l for l in leagues if l not in _tournaments]
+        if not leagues:
             logger.warning(
-                "INT-World Cup dropped from mixed call (needs its own season; "
-                "leagues=%s). Scrape it with --league 'INT-World Cup'.", leagues)
-            leagues = [l for l in leagues if l != 'INT-World Cup']
-        elif _wc_season is None:
+                "No leagues left after dropping tournaments; exiting 0.")
+            _write_results(args.output, {'entity': args.entity, 'tables': [],
+                                         'errors': [],
+                                         'skipped': 'mixed_tournaments_dropped'})
+            return 0
+    elif _tournaments:
+        _t_league = leagues[0]
+        _t_season = get_active_season(_t_league)
+        if _t_season is None:
             logger.warning(
-                "INT-World Cup is out of its tournament window — nothing to "
-                "scrape; exiting 0.")
+                "%s is out of its tournament window — nothing to "
+                "scrape; exiting 0.", _t_league)
             _write_results(args.output, {'entity': args.entity, 'tables': [],
                                          'errors': [],
                                          'skipped': 'out_of_window'})
             return 0
-        elif int(args.season) != int(_wc_season):
+        elif int(args.season) != int(_t_season):
             logger.info(
-                "INT-World Cup: overriding --season %s -> %s (active "
-                "single_year season, #920 bridge).", args.season, _wc_season)
-            args.season = _wc_season
+                "%s: overriding --season %s -> %s (active "
+                "single_year season, #920 bridge).",
+                _t_league, args.season, _t_season)
+            args.season = _t_season
 
     entity = args.entity.lower()
     if entity not in VALID_ENTITIES and entity != 'all':
