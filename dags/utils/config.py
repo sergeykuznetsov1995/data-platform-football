@@ -38,7 +38,7 @@ LEAGUES: List[str] = [
 # international tournaments (sofifa). #920 Phase 2: also the league set the
 # sofifa validate tasks check per-league floors against.
 NON_INTERNATIONAL_LEAGUES: List[str] = [
-    l for l in LEAGUES if not l.startswith('INT-')
+    league for league in LEAGUES if not league.startswith('INT-')
 ]
 
 # WhoScored multi-league scope (#708). Deliberately independent of the global
