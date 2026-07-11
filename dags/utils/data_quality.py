@@ -441,9 +441,16 @@ def _run_no_duplicates(conn, check: Check) -> Dict[str, Any]:
     table = _qualify(p['table'])
     pk_cols = [_safe_ident(c, "column") for c in p['pk']]
     pk_list = ", ".join(pk_cols)
+    # SUM(cnt-1) over GROUP BY, not COUNT(DISTINCT (row(...))): the row
+    # constructor materialises per-row objects and heap-OOM'd Trino at 28M
+    # rows (gold.fct_event after the top-5 spadl backfill, #913). A plain
+    # GROUP BY aggregation is columnar and spill-to-disk-capable; NULL keys
+    # group together exactly like DISTINCT row(), so the count is identical.
     sql = (
-        f"SELECT COUNT(*) - COUNT(DISTINCT ({pk_list})) FROM {table}"
-        f"{_where_clause(p.get('where'))}"
+        f"SELECT COALESCE(SUM(cnt - 1), 0) FROM ("
+        f"SELECT COUNT(*) AS cnt FROM {table}"
+        f"{_where_clause(p.get('where'))} GROUP BY {pk_list}"
+        f") g"
     )
     row = _fetchone(conn, sql)
     dup_count = row[0] if row else 0
