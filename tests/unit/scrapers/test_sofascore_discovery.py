@@ -408,6 +408,8 @@ def test_direct_client_ignores_poison_proxy_environment(monkeypatch):
     assert session.trust_env is False
     assert session.proxies == {}
     assert session.calls[0][1]["proxies"] == {}
+    assert session.headers["X-Requested-With"] == "XMLHttpRequest"
+    assert session.headers["Origin"] == "https://www.sofascore.com"
     assert any(
         int(option) == 10004 and value == ""
         for option, value in session.curl_options.items()
