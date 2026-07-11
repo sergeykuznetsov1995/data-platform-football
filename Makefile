@@ -311,6 +311,12 @@ om-cleanup-lineage:
 gen-om-jwt-keys:
 	@bash scripts/gen_om_jwt_keys.sh
 
+# Применить auth-конфиг OM на ЖИВОМ сервере (#866): env недостаточно — OM 1.13
+# хранит конфиг в БД. Нужен OM_ADMIN_PASSWORD (локальный админ OM) + OM_AUTH_*
+# из .env. Сначала прогони с --dry-run (см. configs/openmetadata/README.md).
+om-apply-security-config:
+	@set -a; . ./.env; set +a; python3 scripts/om_apply_security_config.py
+
 # Tail Superset web logs
 logs-superset:
 	@docker compose logs -f --tail=100 superset

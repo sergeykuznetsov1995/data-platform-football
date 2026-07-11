@@ -60,6 +60,15 @@ RSA-ключей (`make gen-om-jwt-keys`) — после неё перевыпу
 бот-токенов — независимые механизмы, пока в `OM_AUTH_PUBLIC_KEYS` остаётся
 собственный JWKS OM (`http://localhost:8585/api/v1/system/config/jwks`).
 
+> **Главный гоч.** OM 1.13 читает auth-конфиг **из своей БД**
+> (`openmetadata_settings`), а env берёт только при первом старте с пустой
+> таблицей. На живом сервере `up -d` с новыми `AUTHENTICATION_*` НИЧЕГО не
+> переключит — в логе будет `Loaded security configuration from database -
+> provider: basic`. Поэтому переключение делает `scripts/om_apply_security_config.py`
+> (штатный `PUT /api/v1/system/security/config`, то же, что UI Settings →
+> Security; применяется на лету, без рестарта). Env в compose остаётся источником
+> истины для чистых стендов и для отката.
+
 Порядок на живом проде (детали значений — секция «OpenMetadata SSO» в
 `.env.example`):
 
@@ -79,26 +88,62 @@ RSA-ключей (`make gen-om-jwt-keys`) — после неё перевыпу
      -s 'defaultClientScopes=["profile","email","basic","groups"]'
    ```
 
-2. Сменить пароль дефолтного `admin/admin` (иначе break-glass возвращает
-   общеизвестный логин): `POST /api/v1/users/login` (пароль base64) →
-   `PUT /api/v1/users/changePassword` с Bearer из ответа.
+2. Сменить пароль дефолтного `admin/admin` — это break-glass-аккаунт, он
+   переживёт переключение (пароль хранится в БД и рестарт его не сбрасывает).
+   Пароли в API: логин — base64, changePassword — plain:
+
+   ```bash
+   TOK=$(curl -s -X POST http://127.0.0.1:8585/api/v1/users/login \
+     -H 'Content-Type: application/json' \
+     -d "{\"email\":\"admin@open-metadata.org\",\"password\":\"$(printf admin | base64)\"}" \
+     | python3 -c 'import sys,json;print(json.load(sys.stdin)["accessToken"])')
+   curl -s -X PUT http://127.0.0.1:8585/api/v1/users/changePassword \
+     -H "Authorization: Bearer $TOK" -H 'Content-Type: application/json' \
+     -d '{"username":"admin","requestType":"SELF","oldPassword":"admin",
+          "newPassword":"<новый>","confirmPassword":"<новый>"}'
+   ```
+
 3. `make gen-om-jwt-keys` + раскомментировать `OM_RSA_*`/`OM_JWT_*` в `.env`
-   (свои ключи подписи бот-JWT вместо публично известных ключей образа).
+   (свои ключи подписи бот-JWT вместо публично известных ключей образа) →
+   `docker compose --profile heavy up -d openmetadata-server`. Смена ключей
+   инвалидирует старые бот-токены — перевыпуск в п.6.
 4. Раскомментировать блок `OM_AUTH_*` + `OPENMETADATA_OIDC_CLIENT_SECRET`
-   в `.env`; раскомментировать meta-блок в `configs/caddy/Caddyfile` →
-   `caddy reload`.
-5. `docker compose --profile heavy up -d openmetadata-server` (migrate
-   перегонится — идемпотентно).
+   в `.env` (для чистых стендов и отката) и **применить конфиг на живом
+   сервере** (иначе он останется basic — см. гоч выше):
+
+   ```bash
+   set -a; . ./.env; set +a
+   OM_ADMIN_PASSWORD='<пароль из п.2>' python3 scripts/om_apply_security_config.py --dry-run
+   OM_ADMIN_PASSWORD='<пароль из п.2>' python3 scripts/om_apply_security_config.py
+   ```
+
+5. Раскомментировать meta-блок в `configs/caddy/Caddyfile` →
+   `docker compose exec caddy caddy reload --config /etc/caddy/Caddyfile`.
 6. Первый вход админа из `OM_ADMIN_PRINCIPALS` через браузер; перевыпустить
    токен `ingestion-bot` (Settings → Bots) → `OM_JWT_TOKEN` в `.env` →
    `up -d openmetadata-ingestion` → `make om-ingest-trino && make om-lineage-trino`.
 
-**Break-glass** (Keycloak лежит / OIDC сломался): закомментировать в `.env`
-блок `OM_AUTH_*` (ключи `OM_RSA_*`/`OM_JWT_*` НЕ трогать — на них живут
-бот-токены), закомментировать meta-блок Caddyfile (`caddy reload` — basic-OM
-наружу нельзя), `docker compose --profile heavy up -d openmetadata-server`.
-Вход — локальный `admin` со СМЕНЁННЫМ паролем через SSH-туннель
-`127.0.0.1:8585`; ingestion продолжает работать без изменений.
+**Break-glass** (Keycloak лежит / OIDC сломался). Через API откатиться нельзя:
+в SSO-режиме basic-логин отвечает 403, а Keycloak может быть недоступен.
+Откат = снять конфиг из БД и дать compose пересоздать его из env-дефолтов
+(они равны basic-режиму):
+
+```bash
+# 1) meta наружу больше не отдаём (basic-OM публиковать нельзя)
+#    закомментировать блок meta в configs/caddy/Caddyfile, затем:
+docker compose exec caddy caddy reload --config /etc/caddy/Caddyfile
+# 2) закомментировать блок OM_AUTH_* в .env
+#    (OM_RSA_*/OM_JWT_*/OM_JWT_TOKEN НЕ трогать — на них живут бот-токены!)
+# 3) снять сохранённый в БД конфиг и пересоздать сервер
+docker compose exec -T postgres psql -U openmetadata -d openmetadata -c \
+  "DELETE FROM openmetadata_settings WHERE configtype IN
+   ('authenticationConfiguration','authorizerConfiguration');"
+docker compose --profile heavy up -d --force-recreate openmetadata-server
+```
+
+Вход — локальный `admin` со СМЕНЁННЫМ паролем (п.2) через SSH-туннель
+`127.0.0.1:8585`; ingestion работает всё это время без изменений (бот-JWT
+не зависит от провайдера логина — проверено на стенде).
 
 Заведение юзеров: self-signup выключен (`OM_AUTH_ENABLE_SELF_SIGNUP=false`) —
 аналитика в OM создаёт админ (UI → Settings → Users → Add User, email =

@@ -735,10 +735,14 @@ services:
       ELASTICSEARCH_PASSWORD: ""
       SEARCH_TYPE: opensearch
       # Authentication / Authorization.
+      # ВАЖНО: OM 1.13 читает эти значения только при первом старте (пустая
+      # таблица openmetadata_settings), дальше конфиг живёт в БД. На живом
+      # сервере провайдер переключает scripts/om_apply_security_config.py
+      # (штатный PUT /api/v1/system/security/config), а env здесь — источник
+      # истины для чистых стендов и для ОТКАТА: снёс строки настроек в БД →
+      # сервер пересоздал конфиг отсюда (см. configs/openmetadata/README.md).
       # Дефолты ${VAR:-…} = basic-режим (один локальный админ) — это и есть
-      # break-glass: закомментировать OM_AUTH_*/OPENMETADATA_OIDC_CLIENT_SECRET
-      # в .env, убрать meta-блок из Caddyfile (basic-OM наружу нельзя!) и
-      # docker compose --profile heavy up -d openmetadata-server.
+      # break-glass.
       # SSO-режим (Keycloak, custom-oidc, #866): секция «OpenMetadata SSO»
       # в .env.example; cutover-ранбук — configs/openmetadata/README.md.
       # Имена env сверены с conf/openmetadata.yaml образа 1.13.1.
