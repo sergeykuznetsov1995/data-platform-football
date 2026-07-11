@@ -14,7 +14,7 @@ import json
 import os
 import re
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import PurePosixPath
 from typing import Callable, Mapping, Optional
 from urllib.parse import urlparse
@@ -267,6 +267,66 @@ class WhoScoredRawStore:
     def has(self, target: RawTarget) -> bool:
         return self._exists(self._target_manifest_key(target))
 
+    def _load_record(self, target: RawTarget) -> RawObjectRecord:
+        manifest_key = self._target_manifest_key(target)
+        if not self._exists(manifest_key):
+            raise RawObjectNotFound(f"No raw manifest for {target.target_id}")
+        payload = self._read_json(manifest_key)
+        try:
+            record = RawObjectRecord(**payload)
+        except TypeError as exc:
+            raise RawObjectCorrupt(f"Invalid raw manifest: {manifest_key}") from exc
+        if record.manifest_version != RAW_MANIFEST_VERSION:
+            raise RawObjectCorrupt(
+                f"Unsupported manifest version {record.manifest_version!r}"
+            )
+        if record.target_id != target.target_id:
+            raise RawObjectCorrupt(f"Target mismatch in raw manifest: {manifest_key}")
+        if (
+            record.hash_algorithm != "sha256"
+            or not isinstance(record.content_hash, str)
+            or re.fullmatch(r"[0-9a-f]{64}", record.content_hash) is None
+            or record.blob_key != self._blob_key(record.content_hash)
+            or record.compression != "gzip"
+        ):
+            raise RawObjectCorrupt(f"Invalid blob identity in raw manifest: {manifest_key}")
+        if not self._exists(record.blob_key):
+            raise RawObjectNotFound(f"Raw blob not found: {record.blob_key}")
+        return record
+
+    def is_fresh(
+        self,
+        target: RawTarget,
+        *,
+        max_age: timedelta,
+        now: Optional[datetime] = None,
+    ) -> bool:
+        """Return whether a committed target is safe for a bounded TTL replay.
+
+        Corrupt/missing manifests fail closed as stale so mutable pages can be
+        refreshed from the source. Time comparisons are always normalized to
+        UTC; naive timestamps are rejected rather than interpreted using the
+        host timezone.
+        """
+        if not isinstance(max_age, timedelta):
+            raise TypeError("max_age must be a datetime.timedelta")
+        if max_age < timedelta(0):
+            raise ValueError("max_age must be non-negative")
+        reference = now or datetime.now(timezone.utc)
+        if reference.tzinfo is None or reference.utcoffset() is None:
+            raise ValueError("now must be timezone-aware")
+        try:
+            _, record = self.load_bytes(target)
+            fetched_at = datetime.fromisoformat(
+                record.fetched_at.strip().replace("Z", "+00:00")
+            )
+        except (RawStoreError, AttributeError, ValueError):
+            return False
+        if fetched_at.tzinfo is None or fetched_at.utcoffset() is None:
+            return False
+        age = reference.astimezone(timezone.utc) - fetched_at.astimezone(timezone.utc)
+        return timedelta(0) <= age <= max_age
+
     def store_bytes(
         self,
         target: RawTarget,
@@ -330,20 +390,7 @@ class WhoScoredRawStore:
         )
 
     def load_bytes(self, target: RawTarget) -> tuple[bytes, RawObjectRecord]:
-        manifest_key = self._target_manifest_key(target)
-        if not self._exists(manifest_key):
-            raise RawObjectNotFound(f"No raw manifest for {target.target_id}")
-        payload = self._read_json(manifest_key)
-        try:
-            record = RawObjectRecord(**payload)
-        except TypeError as exc:
-            raise RawObjectCorrupt(f"Invalid raw manifest: {manifest_key}") from exc
-        if record.manifest_version != RAW_MANIFEST_VERSION:
-            raise RawObjectCorrupt(
-                f"Unsupported manifest version {record.manifest_version!r}"
-            )
-        if record.target_id != target.target_id:
-            raise RawObjectCorrupt(f"Target mismatch in raw manifest: {manifest_key}")
+        record = self._load_record(target)
         try:
             encoded = self._read_bytes(record.blob_key)
             raw = gzip.decompress(encoded)

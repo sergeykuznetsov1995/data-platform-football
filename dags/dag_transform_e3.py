@@ -21,7 +21,7 @@ Topology
         |
         v
     TaskGroup: silver_e3
-        |-- whoscored_events_spadl   (run_silver_transform)
+        |-- whoscored_events_spadl   (partition-staged Silver transform)
         |-- espn_lineup              (run_silver_transform)
         |
         v
@@ -48,9 +48,11 @@ Trigger model
 ``dag_transform_xref`` has produced the Silver xref spine that all three
 Gold facts depend on (E3.10 will wire the ``TriggerDagRunOperator``).
 
-Re-running E3 standalone is safe -- ``run_silver_transform`` /
-``run_gold_transform`` use DROP+CTAS, so each rebuild is atomic at the
-table level and idempotent.
+Re-running E3 standalone is safe: normal transforms use atomic
+``CREATE OR REPLACE``. The 28M-row SPADL transform first materialises bounded
+league/season scopes in a retry-cleaned staging table, proves the ordered
+manifest commit set and exact Bronze parity stayed unchanged, then atomically
+replaces the live table with a window-free stage scan.
 
 Upstream dependencies
 ---------------------
@@ -98,7 +100,7 @@ Notes for maintainers
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Dict
 
 from airflow import DAG
@@ -308,6 +310,35 @@ SILVER_E3_FALLBACKS = {
     },
 }
 
+# Full-corpus SPADL has one necessary per-game ROW_NUMBER window (legacy event
+# id compatibility).  At 28M rows, evaluating it as one CTAS can exhaust the
+# Trino heap even though each match partition is small.  Route only this table
+# through a staging runner that evaluates league/season scopes sequentially,
+# verifies the complete manifest commit set and exact source parity, then
+# atomically replaces the live table from a window-free staging scan. Other E3
+# Silver transforms keep the normal CTAS.
+WHOSCORED_EVENTS_SOURCE_VERSION_SQL = """
+SELECT league, season, game_id, batch_id
+FROM iceberg.bronze.whoscored_match_ingest_latest_success
+ORDER BY league, season, game_id, batch_id
+""".strip()
+
+SILVER_E3_PARTITION_STAGED = {
+    'whoscored_events_spadl': {
+        'partition_source_table': 'iceberg.bronze.whoscored_events_current',
+        'source_version_sql': WHOSCORED_EVENTS_SOURCE_VERSION_SQL,
+    },
+}
+
+SILVER_E3_TASK_OVERRIDES = {
+    # Historical partition builds have taken up to 7h41m. The bounded runner
+    # trades peak heap for sequential work, so it needs an explicit long-task
+    # limit instead of the normal 30-minute single-CTAS timeout.
+    'whoscored_events_spadl': {
+        'execution_timeout': timedelta(hours=8),
+    },
+}
+
 GOLD_E3_TRANSFORMS = [
     (
         'fct_event',
@@ -350,13 +381,15 @@ def _run_silver_e3(
     table_name: str,
     require_bronze=None,
     fallback_sql_file: str = None,
+    partition_source_table: str = None,
+    source_version_sql: str = None,
     **context,
 ) -> Dict[str, Any]:
-    """Run an E3 Silver CTAS via :func:`utils.silver_tasks.run_silver_transform`.
+    """Run an E3 Silver transform with the configured execution strategy.
 
-    Thin wrapper -- exists only so the DAG can hand a uniform callable to
-    every PythonOperator in ``silver_e3`` (and so the row-count returned
-    by the runner is logged in a consistent format).
+    Most tables use :func:`utils.silver_tasks.run_silver_transform`. The SPADL
+    corpus uses the partition-staged runner to bound its necessary legacy-id
+    window without introducing a new event-id formula or format.
 
     Graceful-degrade (#812): when ``require_bronze`` is given and any of those
     Bronze tables is absent (optional source not yet populated, e.g.
@@ -379,13 +412,29 @@ def _run_silver_e3(
             )
             sql_file = fallback_sql_file
 
-    result = run_silver_transform(
-        sql_file=sql_file,
-        table_name=table_name,
-        schema='silver',
-    )
+    if partition_source_table:
+        from utils.silver_tasks import run_silver_transform_partition_staged
+
+        if not source_version_sql:
+            raise ValueError(
+                f"partition-staged transform {table_name} requires "
+                "source_version_sql"
+            )
+        result = run_silver_transform_partition_staged(
+            sql_file=sql_file,
+            table_name=table_name,
+            source_table=partition_source_table,
+            source_version_sql=source_version_sql,
+            schema='silver',
+        )
+    else:
+        result = run_silver_transform(
+            sql_file=sql_file,
+            table_name=table_name,
+            schema='silver',
+        )
     logger.info(
-        "silver_e3.%s CTAS complete: %d rows in %s",
+        "silver_e3.%s transform complete: %d rows in %s",
         table_name,
         result.get('rows', 0),
         result.get('table'),
@@ -535,10 +584,12 @@ with DAG(
             }
             # Optional Bronze source → empty-schema fallback when absent (#812).
             op_kwargs.update(SILVER_E3_FALLBACKS.get(table_name, {}))
+            op_kwargs.update(SILVER_E3_PARTITION_STAGED.get(table_name, {}))
             t = PythonOperator(
                 task_id=task_id,
                 python_callable=_run_silver_e3,
                 op_kwargs=op_kwargs,
+                **SILVER_E3_TASK_OVERRIDES.get(table_name, {}),
             )
             if prev is not None:
                 prev >> t

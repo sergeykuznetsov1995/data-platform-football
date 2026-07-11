@@ -26,12 +26,14 @@ Coverage
 * Goalkeeper actions (Save / KeeperSweeper / Smother / Punch / Claim / ...).
 * Meta / marker events → 'unknown' + confidence='unmappable'.
 * Confidence label cascade (high / medium / low / unmappable).
-* Synthetic ``event_id`` uniqueness within a game.
+* Source-backed V2 and stable chronological legacy ``event_id`` contracts.
+* Strict-current row parity and removal of the redundant wide dedup window.
 * Enum completeness vs ``utils.e3_dq.SPADL_ACTION_ENUM``.
 """
 
 from __future__ import annotations
 
+import ast
 import json
 import re
 import sys
@@ -67,6 +69,8 @@ def _translate_trino_to_duckdb(sql: str) -> str:
       * ``regexp_like(<col>, <pat>)`` → ``regexp_matches(<col>, <pat>)`` —
         DuckDB's idiomatic spelling. Both treat the second argument as a
         POSIX-extended regex, so ``\\s*`` etc. work identically.
+      * Trino's ``sha256(to_utf8(json_format(CAST(ROW(...) AS JSON))))``
+        tie-breaker → DuckDB's equivalent SHA-256 over ``json_array(...)``.
       * ``LPAD`` / ``TRY_CAST`` / ``ROW_NUMBER OVER`` / ``COALESCE`` —
         already DuckDB-compatible, no rewrite needed.
     """
@@ -84,6 +88,23 @@ def _translate_trino_to_duckdb(sql: str) -> str:
         flags=re.IGNORECASE,
     )
 
+    # 3. Trino hashes VARBINARY and therefore needs to_utf8/json_format around
+    # the typed ROW. DuckDB's sha256 accepts VARCHAR directly; json_array keeps
+    # nulls, value boundaries and the migration-key field order deterministic.
+    sql, hash_rewrites = re.subn(
+        r"sha256\s*\(\s*to_utf8\s*\(\s*json_format\s*\(\s*"
+        r"CAST\s*\(\s*ROW\s*\((?P<fields>[a-z0-9_,\s]+?)\)\s*"
+        r"AS\s+JSON\s*\)\s*\)\s*\)\s*\)",
+        lambda match: (
+            "sha256(CAST(json_array("
+            + match.group("fields")
+            + ") AS VARCHAR))"
+        ),
+        sql,
+        flags=re.IGNORECASE,
+    )
+    assert hash_rewrites == 1, "expected one legacy event-id SHA-256 tie-breaker"
+
     return sql
 
 
@@ -100,6 +121,31 @@ _BRONZE_COLUMNS: List[str] = [
     "qualifiers", "related_event_id", "related_player_id", "team",
     "league", "season", "_ingested_at",
 ]
+
+# Must stay byte-for-byte aligned with scripts.migrate_whoscored_v2.EVENT_KEY.
+# The order is part of the JSON-array hash contract, not merely set membership.
+_MIGRATION_EVENT_NATURAL_KEY = (
+    "league",
+    "season",
+    "game_id",
+    "source_event_id",
+    "period",
+    "minute",
+    "second",
+    "expanded_minute",
+    "type",
+    "outcome_type",
+    "team_id",
+    "player_id",
+    "x",
+    "y",
+    "end_x",
+    "end_y",
+    "qualifiers",
+    "related_event_id",
+    "related_player_id",
+    "team",
+)
 
 
 def _row(
@@ -552,8 +598,8 @@ class TestSchemaVersionLiterals:
 # ---------------------------------------------------------------------------
 
 
-class TestSyntheticEventId:
-    """V2 uses source IDs; migrated legacy rows retain synthetic sequence IDs."""
+class TestStableEventId:
+    """V2 uses source IDs; migrated legacy rows retain sequence IDs."""
 
     def test_source_event_id_is_preferred(self, duck_conn):
         out = _seed_and_run(duck_conn, [
@@ -563,11 +609,10 @@ class TestSyntheticEventId:
         assert out[0]["source_event_id_raw"] == "98765"
         assert out[0]["related_event_id_raw"] == "98764"
 
-    def test_event_id_format(self, duck_conn):
+    def test_legacy_event_id_format(self, duck_conn):
         out = _seed_and_run(duck_conn, [
             _row(game_id=200, minute=1, second=0, type_="Pass"),
         ])
-        # LPAD(1, 5, '0') = '00001' with the dedup ROW_NUMBER assigning event_seq=1
         assert out[0]["event_id"] == "200_00001"
 
     def test_event_id_unique_per_game(self, duck_conn):
@@ -588,9 +633,18 @@ class TestSyntheticEventId:
             _row(game_id=302, minute=1, second=0, type_="Pass"),
         ]
         out = _seed_and_run(duck_conn, rows)
-        # Same minute/second but different games → different event_id prefixes.
+        # Same minute/second but different games have different id prefixes.
         prefixes = {r["event_id"].split("_")[0] for r in out}
         assert prefixes == {"301", "302"}
+
+    def test_legacy_id_is_stable_across_ingest_timestamp(self, duck_conn):
+        older = _seed_and_run(duck_conn, [
+            _row(game_id=303, minute=12, ingested_at="2026-05-01 10:00:00"),
+        ])[0]["event_id"]
+        newer = _seed_and_run(duck_conn, [
+            _row(game_id=303, minute=12, ingested_at="2026-07-11 10:00:00"),
+        ])[0]["event_id"]
+        assert older == newer
 
     def test_match_id_is_varchar_game_id(self, duck_conn):
         out = _seed_and_run(duck_conn, [_row(game_id=400)])
@@ -630,15 +684,17 @@ class TestRawPassthroughColumns736:
 
 
 # ---------------------------------------------------------------------------
-# Deduplication of bronze re-scrapes (ROW_NUMBER on natural key)
+# Strict-current row parity
 # ---------------------------------------------------------------------------
 
 
-class TestBronzeDedup:
-    """When two bronze rows share the full natural key, only the freshest survives."""
+class TestStrictCurrentParity:
+    """Silver is a one-for-one projection of the manifest-current view."""
 
-    def test_keeps_latest_ingested(self, duck_conn):
-        # Same natural key (15-col tuple) but different _ingested_at timestamps.
+    def test_does_not_hide_upstream_contract_violation(self, duck_conn):
+        # The migration/current-view contract prevents this duplicate in
+        # production. If it ever regresses, Silver must preserve both rows so
+        # it remains observable instead of silently deduplicating 28M rows.
         rows = [
             _row(
                 game_id=500, minute=1, second=0,
@@ -652,9 +708,9 @@ class TestBronzeDedup:
             ),
         ]
         out = _seed_and_run(duck_conn, rows)
-        # Dedup collapses the duplicate.
-        assert len(out) == 1
-        assert out[0]["action_canonical"] == "cross"
+        assert len(out) == len(rows)
+        assert {r["action_canonical"] for r in out} == {"cross"}
+        assert len({r["event_id"] for r in out}) == len(rows)
 
 
 # ---------------------------------------------------------------------------
@@ -801,28 +857,90 @@ class TestEnumCompleteness:
 
 
 # ---------------------------------------------------------------------------
-# event_seq chronology across periods (#477)
+# Memory-safe plan shape and order independence
 # ---------------------------------------------------------------------------
 
 
-class TestEventSeqChronology:
-    """event_seq must follow true match chronology, NOT lexical period order.
-
-    Regression for #477: the seq CTE used ``ORDER BY period`` where period is a
-    VARCHAR. Lexically 'FirstPeriodOfExtraTime' < 'PenaltyShootout' < 'SecondHalf'
-    < 'SecondPeriodOfExtraTime', so cup matches with extra time / shootouts got a
-    non-monotonic event_seq (extra-time/shootout events sorted BEFORE the second
-    half). The fix replaces the raw period column with an explicit chronological
-    CASE ordinal.
-    """
+class TestMemorySafeProjection:
+    """Only the compatibility-critical, per-match sequence window may remain."""
 
     @staticmethod
-    def _seq(event_id: str) -> int:
-        return int(event_id.split("_")[1])
+    def _executable_sql() -> str:
+        sql = re.sub(r"--[^\n]*", "", _read_sql())
+        return re.sub(r"/\*.*?\*/", "", sql, flags=re.DOTALL)
 
-    def test_extra_time_and_shootout_ordered_after_second_half(self, duck_conn):
-        # Seeded in deliberately NON-chronological insert order; the SQL must
-        # still assign event_seq following real match time.
+    def test_removes_wide_dedup_and_keeps_one_bounded_window(self):
+        sql = self._executable_sql()
+        windows = re.findall(r"\bROW_NUMBER\s*\(", sql, re.IGNORECASE)
+        assert len(windows) == 1
+        assert not re.search(
+            r"\b(?:GROUP\s+BY|DISTINCT|JOIN|WHERE)\b", sql, re.IGNORECASE,
+        )
+        window = re.search(
+            r"ROW_NUMBER\s*\(\s*\)\s*OVER\s*\((.*?)\)\s*AS\s+event_seq",
+            sql,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        assert window
+        body = window.group(1)
+        partition, order = re.split(
+            r"\bORDER\s+BY\b", body, maxsplit=1, flags=re.IGNORECASE,
+        )
+        assert re.search(
+            r"PARTITION\s+BY\s+league\s*,\s*season\s*,\s*game_id\b",
+            partition,
+            re.IGNORECASE,
+        )
+        # The OOMing predecessor put the full natural key — including the
+        # qualifiers JSON payload — in the window partition key.
+        assert "qualifiers" not in partition.lower()
+        assert order.lower().count("sha256") == 1
+
+    def test_tie_breaker_hashes_complete_migration_natural_key(self):
+        sql = self._executable_sql()
+        hashed_row = re.search(
+            r"sha256\s*\(\s*to_utf8\s*\(\s*json_format\s*\(\s*"
+            r"CAST\s*\(\s*ROW\s*\((?P<fields>[a-z0-9_,\s]+?)\)\s*"
+            r"AS\s+JSON\s*\)\s*\)\s*\)\s*\)",
+            sql,
+            flags=re.IGNORECASE,
+        )
+        assert hashed_row, "legacy sequence must end in a typed SHA-256 key"
+        hash_fields = tuple(
+            field.strip() for field in hashed_row.group("fields").split(",")
+        )
+        assert hash_fields == _MIGRATION_EVENT_NATURAL_KEY
+        assert "_ingested_at" not in hash_fields
+
+        migration_tree = ast.parse(
+            (PROJECT_ROOT / "scripts" / "migrate_whoscored_v2.py").read_text(
+                encoding="utf-8"
+            )
+        )
+        migration_key = next(
+            ast.literal_eval(node.value)
+            for node in migration_tree.body
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id == "EVENT_KEY"
+                for target in node.targets
+            )
+        )
+        assert tuple(migration_key) == _MIGRATION_EVENT_NATURAL_KEY
+
+    def test_output_columns_remain_frozen(self, duck_conn):
+        row = _seed_and_run(duck_conn, [_row()])[0]
+        assert list(row) == [
+            "event_id", "match_id", "source_event_id_raw",
+            "related_event_id_raw", "team_id_raw", "team_name_raw",
+            "player_id_raw", "related_player_id_raw", "period",
+            "expanded_minute", "minute", "second", "x", "y", "end_x",
+            "end_y", "action_canonical", "action_source", "action_version",
+            "_action_source_note", "_action_confidence", "outcome_success",
+            "qualifiers_raw", "_bronze_ingested_at", "league", "season",
+        ]
+
+    def test_legacy_ids_do_not_depend_on_input_order(self, duck_conn):
         rows = [
             _row(game_id=700, period="PenaltyShootout",         minute=120, second=0, type_="Pass"),
             _row(game_id=700, period="FirstHalf",               minute=10,  second=0, type_="Pass"),
@@ -830,25 +948,91 @@ class TestEventSeqChronology:
             _row(game_id=700, period="SecondHalf",              minute=80,  second=0, type_="Pass"),
             _row(game_id=700, period="FirstPeriodOfExtraTime",  minute=100, second=0, type_="Pass"),
         ]
-        out = _seed_and_run(duck_conn, rows)
-        seq = {r["period"]: self._seq(r["event_id"]) for r in out}
+        forward = {
+            (r["period"], r["minute"]): r["event_id"]
+            for r in _seed_and_run(duck_conn, rows)
+        }
+        reversed_input = {
+            (r["period"], r["minute"]): r["event_id"]
+            for r in _seed_and_run(duck_conn, list(reversed(rows)))
+        }
+        assert forward == reversed_input
         chronological = [
             "FirstHalf", "SecondHalf", "FirstPeriodOfExtraTime",
             "SecondPeriodOfExtraTime", "PenaltyShootout",
         ]
-        ordered = [seq[p] for p in chronological]
-        assert ordered == sorted(ordered), (
-            f"event_seq not monotonic with match chronology: {seq}"
-        )
+        sequence = [int(forward[(period, next(
+            row["minute"] for row in rows if row["period"] == period
+        ))].split("_")[1]) for period in chronological]
+        assert sequence == sorted(sequence)
 
-    def test_within_period_minute_order_preserved(self, duck_conn):
-        """Within a single period, event_seq still follows ascending minute."""
+    def test_legacy_ties_do_not_depend_on_input_order(self, duck_conn):
+        # Every pre-existing chronological sort field is identical. Only
+        # migration-natural-key fields differ, so this specifically proves the
+        # final SHA-256 tie-breaker rather than the ordinary clock ordering.
         rows = [
-            _row(game_id=701, period="FirstHalf", minute=30, second=0, expanded_minute=30, type_="Pass"),
-            _row(game_id=701, period="FirstHalf", minute=5,  second=0, expanded_minute=5,  type_="Pass"),
-            _row(game_id=701, period="FirstHalf", minute=15, second=0, expanded_minute=15, type_="Pass"),
+            _row(
+                game_id=702,
+                period="FirstHalf",
+                minute=10,
+                second=7,
+                expanded_minute=10,
+                type_="Pass",
+                x=42.0,
+                y=31.0,
+                outcome_type="Successful",
+                team_id=13,
+                player_id=555,
+                end_x=61.0,
+                end_y=32.0,
+                qualifiers=_qualifiers_json(["Cross"]),
+                related_event_id=80,
+                related_player_id=556,
+                team="Arsenal",
+                ingested_at="2026-05-01 10:00:00",
+            ),
+            _row(
+                game_id=702,
+                period="FirstHalf",
+                minute=10,
+                second=7,
+                expanded_minute=10,
+                type_="Pass",
+                x=42.0,
+                y=31.0,
+                outcome_type="Unsuccessful",
+                team_id=14,
+                player_id=777,
+                end_x=25.0,
+                end_y=12.0,
+                qualifiers=_qualifiers_json(["ThrowIn"]),
+                related_event_id=81,
+                related_player_id=778,
+                team="Chelsea",
+                ingested_at="2026-07-11 10:00:00",
+            ),
+        ]
+
+        def mapping(fixture_rows):
+            return {
+                row["player_id_raw"]: row["event_id"]
+                for row in _seed_and_run(duck_conn, fixture_rows)
+            }
+
+        forward = mapping(rows)
+        reversed_input = mapping(list(reversed(rows)))
+        assert forward == reversed_input
+        assert set(forward.values()) == {"702_00001", "702_00002"}
+
+    def test_legacy_sequence_orders_minutes_within_period(self, duck_conn):
+        rows = [
+            _row(game_id=701, period="FirstHalf", minute=30, second=0,
+                 expanded_minute=30, type_="Pass"),
+            _row(game_id=701, period="FirstHalf", minute=5, second=0,
+                 expanded_minute=5, type_="Pass"),
+            _row(game_id=701, period="FirstHalf", minute=15, second=0,
+                 expanded_minute=15, type_="Pass"),
         ]
         out = _seed_and_run(duck_conn, rows)
-        ordered = sorted(out, key=lambda r: self._seq(r["event_id"]))
-        minutes = [r["expanded_minute"] for r in ordered]
-        assert minutes == [5, 15, 30], f"within-period order broken: {minutes}"
+        ordered = sorted(out, key=lambda row: int(row["event_id"].split("_")[1]))
+        assert [row["expanded_minute"] for row in ordered] == [5, 15, 30]

@@ -5,6 +5,8 @@ Event and lineup rows may be appended independently, but downstream readers
 only expose the batch referenced by the latest successful manifest row.  This
 keeps a task crash from replacing a previously complete game with a partial
 one and makes Airflow retries network-free when the raw payload is cached.
+Preview rows use the same append-then-manifest protocol; a successful zero-row
+manifest hides an older non-empty injury snapshot without an Iceberg DELETE.
 """
 
 from __future__ import annotations
@@ -19,10 +21,12 @@ import pandas as pd
 
 from scrapers.base.iceberg_writer import IcebergWriter
 from scrapers.base.trino_manager import TrinoTableManager
+from scrapers.whoscored.domain import WhoScoredScope
 from scrapers.whoscored.parsers import PARSER_VERSION
 
 
 MATCH_MANIFEST_TABLE = "whoscored_match_ingest_manifest"
+PREVIEW_MANIFEST_TABLE = "whoscored_preview_ingest_manifest"
 PROFILE_VERSIONS_TABLE = "whoscored_player_profile_versions"
 PROFILE_MANIFEST_TABLE = "whoscored_profile_ingest_manifest"
 
@@ -44,6 +48,15 @@ def deterministic_game_batch_id(
 ) -> str:
     value = f"{int(game_id)}\0{payload_sha256}\0{parser_version}".encode("utf-8")
     return "ws2-" + hashlib.sha256(value).hexdigest()
+
+
+def deterministic_preview_batch_id(
+    game_id: int, payload_sha256: str, parser_version: str = PARSER_VERSION
+) -> str:
+    value = f"preview\0{int(game_id)}\0{payload_sha256}\0{parser_version}".encode(
+        "utf-8"
+    )
+    return "wsp2-" + hashlib.sha256(value).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -99,6 +112,57 @@ class ManifestFailure:
     http_status: Optional[int] = None
     direct_bytes: int = 0
     paid_bytes: int = 0
+    payload_sha256: Optional[str] = None
+    raw_uri: Optional[str] = None
+    parser_version: str = PARSER_VERSION
+
+
+@dataclass(frozen=True)
+class PreviewCommit:
+    game_id: int
+    league: str
+    season: str
+    game: str
+    payload_sha256: str
+    raw_uri: str
+    missing_players: Sequence[Mapping[str, Any]]
+    transport_mode: str
+    proxy_mode: str = "none"
+    http_status: int = 200
+    direct_bytes: int = 0
+    paid_bytes: int = 0
+    parser_version: str = PARSER_VERSION
+    kickoff: Optional[datetime] = None
+    fetched_at: Optional[datetime] = None
+    attempt_no: int = 1
+
+    @property
+    def batch_id(self) -> str:
+        return deterministic_preview_batch_id(
+            self.game_id, self.payload_sha256, self.parser_version
+        )
+
+
+@dataclass(frozen=True)
+class PreviewFailure:
+    game_id: int
+    league: str
+    season: str
+    game: str
+    state: str
+    failure_code: str
+    error: str
+    retry_after: Optional[datetime]
+    attempt_no: int
+    kickoff: Optional[datetime] = None
+    payload_sha256: Optional[str] = None
+    raw_uri: Optional[str] = None
+    transport_mode: str = "none"
+    proxy_mode: str = "none"
+    http_status: Optional[int] = None
+    direct_bytes: int = 0
+    paid_bytes: int = 0
+    parser_version: str = PARSER_VERSION
 
 
 class WhoScoredRepository:
@@ -125,8 +189,12 @@ class WhoScoredRepository:
     def _manifest(self) -> str:
         return f"{self.catalog}.{self.schema}.{MATCH_MANIFEST_TABLE}"
 
-    def ensure_schema(self) -> None:
-        """Create additive V2 tables/columns and current-batch views."""
+    @property
+    def _preview_manifest(self) -> str:
+        return f"{self.catalog}.{self.schema}.{PREVIEW_MANIFEST_TABLE}"
+
+    def ensure_schema(self, *, create_views: bool = True) -> None:
+        """Create additive V2 storage and, unless deferred, strict views."""
         self.trino._execute(
             f"""
             CREATE TABLE IF NOT EXISTS {self._manifest} (
@@ -186,10 +254,86 @@ class WhoScoredRepository:
                 if name.lower() not in existing:
                     self.trino.add_column(self.schema, table, name, data_type)
 
-        self._create_current_views()
-        self._ensure_profile_schema()
+        self._ensure_preview_schema()
+        if create_views:
+            self._create_current_views()
+        self._ensure_profile_schema(create_views=create_views)
 
-    def _ensure_profile_schema(self) -> None:
+    def _ensure_preview_schema(self) -> None:
+        """Create the append-only preview payload and its logical commit log."""
+        physical = f"{self.catalog}.{self.schema}.whoscored_missing_players"
+        self.trino._execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {physical} (
+                league VARCHAR,
+                season VARCHAR,
+                game VARCHAR,
+                game_id BIGINT,
+                team VARCHAR,
+                player VARCHAR,
+                player_id BIGINT,
+                reason VARCHAR,
+                status VARCHAR,
+                _preview_batch_id VARCHAR,
+                _payload_sha256 VARCHAR,
+                _parser_version VARCHAR,
+                _source VARCHAR,
+                _entity_type VARCHAR,
+                _ingested_at TIMESTAMP(6),
+                _batch_id VARCHAR
+            ) WITH (partitioning = ARRAY['league', 'season'])
+            """
+        )
+        existing = {
+            name.lower()
+            for name in self.trino.get_table_columns(
+                self.schema, "whoscored_missing_players"
+            )
+        }
+        for name, data_type in {
+            "_preview_batch_id": "VARCHAR",
+            "_payload_sha256": "VARCHAR",
+            "_parser_version": "VARCHAR",
+        }.items():
+            if name.lower() not in existing:
+                self.trino.add_column(
+                    self.schema, "whoscored_missing_players", name, data_type
+                )
+
+        self.trino._execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {self._preview_manifest} (
+                league VARCHAR,
+                season VARCHAR,
+                game_id BIGINT,
+                game VARCHAR,
+                kickoff TIMESTAMP(6),
+                batch_id VARCHAR,
+                payload_sha256 VARCHAR,
+                raw_uri VARCHAR,
+                parser_version VARCHAR,
+                state VARCHAR,
+                missing_players_count BIGINT,
+                transport_mode VARCHAR,
+                proxy_mode VARCHAR,
+                http_status INTEGER,
+                failure_code VARCHAR,
+                error VARCHAR,
+                attempt_no INTEGER,
+                retry_after TIMESTAMP(6),
+                fetched_at TIMESTAMP(6),
+                completed_at TIMESTAMP(6),
+                direct_bytes BIGINT,
+                paid_bytes BIGINT,
+                _source VARCHAR,
+                _entity_type VARCHAR,
+                _ingested_at TIMESTAMP(6),
+                _batch_id VARCHAR
+            ) WITH (partitioning = ARRAY['league', 'season'])
+            """
+        )
+
+    def _ensure_profile_schema(self, *, create_views: bool = True) -> None:
         versions = f"{self.catalog}.{self.schema}.{PROFILE_VERSIONS_TABLE}"
         manifest = f"{self.catalog}.{self.schema}.{PROFILE_MANIFEST_TABLE}"
         self.trino._execute(
@@ -243,6 +387,8 @@ class WhoScoredRepository:
             ) WITH (partitioning = ARRAY['bucket(player_id, 32)'])
             """
         )
+        if not create_views:
+            return
         current_lineups = f"{self.catalog}.{self.schema}.whoscored_lineups_current"
         roster = f"{self.catalog}.{self.schema}.whoscored_player_roster"
         if self.trino.table_exists(self.schema, "whoscored_lineups"):
@@ -290,22 +436,40 @@ class WhoScoredRepository:
             """
         )
 
-    def list_profile_candidates(self, *, limit: int = 200) -> list[int]:
-        """Return profile work that is new, refreshable, or due for retry.
+    def list_profile_candidates(
+        self,
+        *,
+        scopes: Sequence[WhoScoredScope],
+        limit: int = 200,
+    ) -> list[int]:
+        """Return unseen or due-retry profiles from the selected rosters.
 
-        ``terminal`` is deliberately sticky across parser versions: a terminal
-        source response (for example HTTP 404) must not consume network again
-        on every parser release.  ``retryable`` work is eligible only after
-        its persisted backoff expires.  Successful legacy/parser-old rows are
-        refreshed once by the current parser.
+        Profile pages are global, but their candidate population is not: only
+        players present in the explicitly selected competition-season scopes
+        are eligible.  Successful and terminal manifests remain sticky across
+        parser releases.  Re-fetching thousands of valid legacy profiles only
+        to obtain a new raw/parser version would waste proxy traffic; refreshes
+        must be introduced separately through an explicit TTL/force policy.
         """
         if int(limit) < 0:
             raise ValueError("profile candidate limit must be non-negative")
+        selected = tuple(
+            dict.fromkeys(
+                (scope.competition_id, scope.season_id) for scope in scopes
+            )
+        )
+        if not selected or int(limit) == 0:
+            return []
         # Profiles can be run as an independent CLI subcommand, before the
         # match task has had a chance to initialize manifests/current views.
         self.ensure_schema()
         manifest = f"{self.catalog}.{self.schema}.{PROFILE_MANIFEST_TABLE}"
         roster = f"{self.catalog}.{self.schema}.whoscored_player_roster"
+        scope_filter = " OR ".join(
+            "(league = "
+            f"{_sql_string(league)} AND season = {_sql_string(season)})"
+            for league, season in selected
+        )
         rows = self.trino.execute_query(
             f"""
             WITH latest AS (
@@ -318,19 +482,25 @@ class WhoScoredRepository:
                 ) WHERE rn = 1
             )
             SELECT r.player_id
-            FROM (SELECT DISTINCT player_id FROM {roster}) r
+            FROM (
+                SELECT DISTINCT player_id
+                FROM {roster}
+                WHERE {scope_filter}
+            ) r
             LEFT JOIN latest m ON m.player_id = r.player_id
             WHERE m.player_id IS NULL
-               OR (
-                    m.state = 'success'
-                    AND m.parser_version IS DISTINCT FROM {_sql_string(PARSER_VERSION)}
-               )
                OR (
                     m.state = 'retryable'
                     AND COALESCE(m.retry_after, TIMESTAMP '1970-01-01 00:00:00')
                         <= CAST(CURRENT_TIMESTAMP AS TIMESTAMP)
                )
-            ORDER BY r.player_id
+               OR (
+                    m.state = 'parse_failed'
+                    AND m.parser_version IS DISTINCT FROM
+                        {_sql_string(PARSER_VERSION)}
+               )
+            ORDER BY CASE WHEN m.player_id IS NULL THEN 0 ELSE 1 END,
+                     r.player_id
             LIMIT {int(limit)}
             """
         )
@@ -354,12 +524,12 @@ class WhoScoredRepository:
         attempt_no: int = 1,
     ) -> None:
         """Persist a failed profile attempt in the current manifest schema."""
-        if state not in {"retryable", "terminal"}:
+        if state not in {"retryable", "terminal", "parse_failed"}:
             raise ValueError(f"unsupported profile failure state: {state}")
         if state == "retryable" and retry_after is None:
             raise ValueError("retryable profile failure requires retry_after")
-        if state == "terminal" and retry_after is not None:
-            raise ValueError("terminal profile failure cannot have retry_after")
+        if state != "retryable" and retry_after is not None:
+            raise ValueError(f"{state} profile failure cannot have retry_after")
         if int(attempt_no) < 1:
             raise ValueError("profile failure attempt_no must be positive")
 
@@ -380,7 +550,7 @@ class WhoScoredRepository:
             "direct_bytes": int(direct_bytes),
             "paid_bytes": int(paid_bytes),
             "fetched_at": now,
-            "completed_at": now if state == "terminal" else None,
+            "completed_at": now if state != "retryable" else None,
             "_entity_type": "profile_manifest",
         }
         self.writer.write_dataframe(
@@ -519,9 +689,6 @@ class WhoScoredRepository:
             current = f"{self.catalog}.{self.schema}.whoscored_{entity}_current"
             if not self.trino.table_exists(self.schema, f"whoscored_{entity}"):
                 continue
-            # The NULL branch is a temporary legacy fallback.  The repair
-            # migration assigns deterministic legacy batch ids and removes it
-            # after all games have a seeded manifest.
             self.trino._execute(
                 f"""
                 CREATE OR REPLACE VIEW {current} AS
@@ -533,17 +700,59 @@ class WhoScoredRepository:
                  AND m.game_id = CAST(d.game_id AS BIGINT)
                  AND m.state = 'success'
                  AND m.batch_id = d._game_batch_id
-                UNION ALL
+                """
+            )
+
+        preview_latest = (
+            f"{self.catalog}.{self.schema}.whoscored_preview_ingest_latest"
+        )
+        preview_latest_success = (
+            f"{self.catalog}.{self.schema}.whoscored_preview_ingest_latest_success"
+        )
+        self.trino._execute(
+            f"""
+            CREATE OR REPLACE VIEW {preview_latest} AS
+            SELECT * FROM (
+                SELECT m.*,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY league, season, game_id
+                           ORDER BY COALESCE(completed_at, fetched_at, _ingested_at) DESC,
+                                    COALESCE(batch_id, '') DESC, _batch_id DESC
+                       ) AS _manifest_rank
+                FROM {self._preview_manifest} m
+            ) WHERE _manifest_rank = 1
+            """
+        )
+        self.trino._execute(
+            f"""
+            CREATE OR REPLACE VIEW {preview_latest_success} AS
+            SELECT * FROM (
+                SELECT m.*,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY league, season, game_id
+                           ORDER BY COALESCE(completed_at, fetched_at, _ingested_at) DESC,
+                                    batch_id DESC, _batch_id DESC
+                       ) AS _manifest_rank
+                FROM {self._preview_manifest} m
+                WHERE state = 'success'
+            ) WHERE _manifest_rank = 1
+            """
+        )
+        if self.trino.table_exists(self.schema, "whoscored_missing_players"):
+            physical = f"{self.catalog}.{self.schema}.whoscored_missing_players"
+            current = (
+                f"{self.catalog}.{self.schema}.whoscored_missing_players_current"
+            )
+            self.trino._execute(
+                f"""
+                CREATE OR REPLACE VIEW {current} AS
                 SELECT d.*
                 FROM {physical} d
-                WHERE d._game_batch_id IS NULL
-                  AND NOT EXISTS (
-                      SELECT 1 FROM {latest_success} m
-                      WHERE m.league = d.league
-                        AND m.season = d.season
-                        AND m.game_id = CAST(d.game_id AS BIGINT)
-                        AND m.state = 'success'
-                  )
+                JOIN {preview_latest_success} m
+                  ON m.league = d.league
+                 AND m.season = d.season
+                 AND m.game_id = CAST(d.game_id AS BIGINT)
+                 AND m.batch_id = d._preview_batch_id
                 """
             )
 
@@ -604,6 +813,11 @@ class WhoScoredRepository:
                         AND COALESCE(m.retry_after, TIMESTAMP '1970-01-01 00:00:00')
                             <= CAST(CURRENT_TIMESTAMP AS TIMESTAMP)
                     )
+                    OR (
+                        m.state = 'parse_failed'
+                        AND m.parser_version IS DISTINCT FROM
+                            {_sql_string(PARSER_VERSION)}
+                    )
               )
               {id_filter}
             ORDER BY s.date, s.game_id
@@ -633,35 +847,6 @@ class WhoScoredRepository:
             "AND season_id IS NOT NULL ORDER BY _ingested_at DESC LIMIT 1"
         )
         return int(rows[0][0]) if rows else None
-
-    def latest_stages(self, league: str, season: str) -> list[dict[str, Any]]:
-        if not self.trino.table_exists(self.schema, "whoscored_season_stages"):
-            return []
-        rows = self.trino.execute_query(
-            f"""
-            SELECT region_id, league_id, season_id, stage_id, stage
-            FROM (
-                SELECT s.*, ROW_NUMBER() OVER (
-                    PARTITION BY league, season, stage_id
-                    ORDER BY _ingested_at DESC
-                ) AS rn
-                FROM {self.catalog}.{self.schema}.whoscored_season_stages s
-                WHERE league = {_sql_string(league)}
-                  AND season = {_sql_string(season)}
-            ) WHERE rn = 1
-            ORDER BY stage_id
-            """
-        )
-        return [
-            {
-                "region_id": int(row[0]),
-                "league_id": int(row[1]),
-                "season_id": int(row[2]),
-                "stage_id": int(row[3]),
-                "stage": row[4],
-            }
-            for row in rows
-        ]
 
     def write_scope_snapshot(
         self,
@@ -738,13 +923,14 @@ class WhoScoredRepository:
         *,
         limit: Optional[int] = None,
     ) -> list[dict[str, Any]]:
+        """Return only unseen, parser-stale, or due-for-retry preview pages."""
         if limit is not None and int(limit) < 0:
             raise ValueError("preview candidate limit must be non-negative")
         limit_sql = f"LIMIT {int(limit)}" if limit is not None else ""
+        latest = f"{self.catalog}.{self.schema}.whoscored_preview_ingest_latest"
         rows = self.trino.execute_query(
             f"""
-            SELECT CAST(game_id AS BIGINT), game, date, home_team, away_team
-            FROM (
+            WITH schedule AS (
                 SELECT s.*, ROW_NUMBER() OVER (
                     PARTITION BY league, season, game_id
                     ORDER BY _ingested_at DESC
@@ -753,10 +939,75 @@ class WhoScoredRepository:
                 WHERE league = {_sql_string(league)}
                   AND season = {_sql_string(season)}
                   AND has_preview = TRUE
-            ) WHERE rn = 1
-              AND date BETWEEN CAST(CURRENT_TIMESTAMP - INTERVAL '48' HOUR AS TIMESTAMP)
-                           AND CAST(CURRENT_TIMESTAMP + INTERVAL '3' HOUR AS TIMESTAMP)
-            ORDER BY date, game_id
+            )
+            SELECT CAST(s.game_id AS BIGINT), s.game, s.date,
+                   s.home_team, s.away_team,
+                   CASE
+                       WHEN m.state = 'retryable'
+                       THEN COALESCE(m.attempt_no, 0) + 1
+                       ELSE 1
+                   END AS attempt_no,
+                   CASE
+                       WHEN m.state = 'success'
+                        AND m.parser_version = {_sql_string(PARSER_VERSION)}
+                        AND s.date >= CAST(
+                            CURRENT_TIMESTAMP - INTERVAL '3' HOUR AS TIMESTAMP
+                        )
+                        AND COALESCE(
+                            m.fetched_at, TIMESTAMP '1970-01-01 00:00:00'
+                        ) <= CAST(
+                            CURRENT_TIMESTAMP - INTERVAL '6' HOUR AS TIMESTAMP
+                        )
+                       THEN TRUE ELSE FALSE
+                   END AS force_refresh
+            FROM schedule s
+            LEFT JOIN {latest} m
+              ON m.league = s.league
+             AND m.season = s.season
+             AND m.game_id = CAST(s.game_id AS BIGINT)
+            WHERE s.rn = 1
+              AND s.game_id IS NOT NULL
+              AND s.date BETWEEN CAST(
+                    CURRENT_TIMESTAMP - INTERVAL '48' HOUR AS TIMESTAMP
+                  ) AND CAST(
+                    CURRENT_TIMESTAMP + INTERVAL '3' HOUR AS TIMESTAMP
+                  )
+              AND (
+                    m.game_id IS NULL
+                    OR (
+                        m.state = 'retryable'
+                        AND COALESCE(
+                            m.retry_after, TIMESTAMP '1970-01-01 00:00:00'
+                        ) <= CAST(CURRENT_TIMESTAMP AS TIMESTAMP)
+                    )
+                    OR (
+                        m.state = 'success'
+                        AND (
+                            m.parser_version IS DISTINCT FROM
+                                {_sql_string(PARSER_VERSION)}
+                            OR (
+                                m.parser_version = {_sql_string(PARSER_VERSION)}
+                                AND s.date >= CAST(
+                                    CURRENT_TIMESTAMP - INTERVAL '3' HOUR
+                                    AS TIMESTAMP
+                                )
+                                AND COALESCE(
+                                    m.fetched_at,
+                                    TIMESTAMP '1970-01-01 00:00:00'
+                                ) <= CAST(
+                                    CURRENT_TIMESTAMP - INTERVAL '6' HOUR
+                                    AS TIMESTAMP
+                                )
+                            )
+                        )
+                    )
+                    OR (
+                        m.state = 'parse_failed'
+                        AND m.parser_version IS DISTINCT FROM
+                            {_sql_string(PARSER_VERSION)}
+                    )
+              )
+            ORDER BY s.date, s.game_id
             {limit_sql}
             """
         )
@@ -767,57 +1018,216 @@ class WhoScoredRepository:
                 "date": row[2],
                 "home_team": row[3],
                 "away_team": row[4],
+                "attempt_no": int(row[5]),
+                "force_refresh": bool(row[6]),
             }
             for row in rows
         ]
 
-    def replace_preview_game(
-        self,
-        *,
-        league: str,
-        season: str,
-        game_id: int,
-        rows: Sequence[Mapping[str, Any]],
-    ) -> str:
-        """Commit a preview result, including a valid zero-row snapshot.
-
-        Preview rows are small and mutable.  Staging in IcebergWriter happens
-        before the delete; an empty successful page intentionally deletes the
-        prior rows for that single game.
-        """
-        where = (
-            f"league = {_sql_string(league)} AND season = {_sql_string(season)} "
-            f"AND game_id = {int(game_id)}"
+    def record_preview_failure(self, failure: PreviewFailure) -> None:
+        if failure.state not in {"retryable", "terminal", "parse_failed"}:
+            raise ValueError(f"unsupported preview failure state: {failure.state}")
+        if failure.state == "retryable" and failure.retry_after is None:
+            raise ValueError("retryable preview failure requires retry_after")
+        if failure.state != "retryable" and failure.retry_after is not None:
+            raise ValueError(
+                f"{failure.state} preview failure cannot have retry_after"
+            )
+        if int(failure.attempt_no) < 1:
+            raise ValueError("preview failure attempt_no must be positive")
+        now = _utc_now()
+        self.writer.write_dataframe(
+            pd.DataFrame(
+                [
+                    {
+                        "league": failure.league,
+                        "season": failure.season,
+                        "game_id": int(failure.game_id),
+                        "game": failure.game,
+                        "kickoff": failure.kickoff,
+                        "batch_id": None,
+                        "payload_sha256": failure.payload_sha256,
+                        "raw_uri": failure.raw_uri,
+                        "parser_version": failure.parser_version,
+                        "state": failure.state,
+                        "missing_players_count": None,
+                        "transport_mode": failure.transport_mode,
+                        "proxy_mode": failure.proxy_mode,
+                        "http_status": failure.http_status,
+                        "failure_code": failure.failure_code,
+                        "error": failure.error[:4000],
+                        "attempt_no": int(failure.attempt_no),
+                        "retry_after": failure.retry_after,
+                        "fetched_at": now,
+                        "completed_at": (
+                            None if failure.state == "retryable" else now
+                        ),
+                        "direct_bytes": int(failure.direct_bytes),
+                        "paid_bytes": int(failure.paid_bytes),
+                        "_entity_type": "preview_manifest",
+                    }
+                ]
+            ),
+            database=self.schema,
+            table=PREVIEW_MANIFEST_TABLE,
+            partition_spec=[("league", "identity"), ("season", "identity")],
+            source="whoscored",
         )
-        if not rows:
-            if self.trino.table_exists(self.schema, "whoscored_missing_players"):
-                self.trino._execute(
-                    f"DELETE FROM {self.catalog}.{self.schema}.whoscored_missing_players "
-                    f"WHERE {where}"
-                )
-            return f"{self.catalog}.{self.schema}.whoscored_missing_players"
-        frame = pd.DataFrame([dict(row) for row in rows])
-        expected_values = {
-            "league": league,
-            "season": season,
-            "game_id": int(game_id),
-        }
-        for column, expected in expected_values.items():
-            if column in frame and frame[column].notna().any():
-                actual = {str(value) for value in frame[column].dropna().unique()}
-                if actual != {str(expected)}:
-                    raise ValueError(
-                        f"preview rows contain {column} values outside {expected!r}: {actual}"
+
+    def _preview_batch_count(self, commit: PreviewCommit) -> int:
+        rows = self.trino.execute_query(
+            f"SELECT COUNT(*) FROM {self.catalog}.{self.schema}."
+            "whoscored_missing_players "
+            f"WHERE _preview_batch_id = {_sql_string(commit.batch_id)} "
+            f"AND league = {_sql_string(commit.league)} "
+            f"AND season = {_sql_string(commit.season)} "
+            f"AND CAST(game_id AS BIGINT) = {int(commit.game_id)}"
+        )
+        return int(rows[0][0]) if rows else 0
+
+    def _write_preview_batch(self, commit: PreviewCommit) -> None:
+        expected = len(commit.missing_players)
+        existing = self._preview_batch_count(commit)
+        if existing == expected:
+            return
+        if existing:
+            raise BatchConflict(
+                f"preview batch {commit.batch_id} has {existing} rows; "
+                f"parser produced {expected}"
+            )
+        if not commit.missing_players:
+            return
+        frame = pd.DataFrame([dict(row) for row in commit.missing_players])
+        frame["league"] = commit.league
+        frame["season"] = commit.season
+        frame["game"] = commit.game
+        frame["game_id"] = int(commit.game_id)
+        frame["_preview_batch_id"] = commit.batch_id
+        frame["_payload_sha256"] = commit.payload_sha256
+        frame["_parser_version"] = commit.parser_version
+        frame["_entity_type"] = "missing_players"
+        for column in frame.columns:
+            if frame[column].map(lambda value: isinstance(value, (dict, list))).any():
+                frame[column] = frame[column].map(
+                    lambda value: json.dumps(
+                        value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
                     )
-            frame[column] = expected
-        return self.writer.write_dataframe(
+                    if isinstance(value, (dict, list))
+                    else value
+                )
+        self.writer.write_dataframe(
             frame,
             database=self.schema,
             table="whoscored_missing_players",
             partition_spec=[("league", "identity"), ("season", "identity")],
             source="whoscored",
-            delete_filter=where,
         )
+        written = self._preview_batch_count(commit)
+        if written != expected:
+            raise BatchConflict(
+                f"preview batch {commit.batch_id}: wrote {written}, expected {expected}"
+            )
+
+    def commit_preview(self, commit: PreviewCommit) -> str:
+        """Append a preview batch, then publish its manifest as commit point.
+
+        A zero-row parsed page is a real successful snapshot: its manifest
+        hides every older batch for the game without issuing an Iceberg DELETE.
+        """
+        if not commit.payload_sha256:
+            raise ValueError("payload_sha256 is required for a preview commit")
+        if not commit.raw_uri:
+            raise ValueError("raw_uri is required for a preview commit")
+        if int(commit.attempt_no) < 1:
+            raise ValueError("preview commit attempt_no must be positive")
+        identities: set[tuple[str, int]] = set()
+        for row in commit.missing_players:
+            for column, expected in (
+                ("league", commit.league),
+                ("season", commit.season),
+                ("game_id", int(commit.game_id)),
+            ):
+                value = row.get(column)
+                if value is not None and str(value) != str(expected):
+                    raise ValueError(
+                        f"preview rows contain {column}={value!r} outside {expected!r}"
+                    )
+            player_id = row.get("player_id")
+            if player_id is None:
+                raise ValueError("preview row has null player_id")
+            identity = (str(row.get("team") or ""), int(player_id))
+            if identity in identities:
+                raise ValueError(
+                    f"preview rows contain duplicate team/player identity {identity!r}"
+                )
+            identities.add(identity)
+
+        expected = len(commit.missing_players)
+        existing = self.trino.execute_query(
+            f"SELECT missing_players_count FROM {self._preview_manifest} "
+            f"WHERE league = {_sql_string(commit.league)} "
+            f"AND season = {_sql_string(commit.season)} "
+            f"AND game_id = {int(commit.game_id)} "
+            f"AND batch_id = {_sql_string(commit.batch_id)} "
+            "AND state = 'success' ORDER BY completed_at DESC LIMIT 1"
+        )
+        physical_count = self._preview_batch_count(commit)
+        if existing:
+            manifest_count = int(existing[0][0])
+            if manifest_count != expected or physical_count != expected:
+                raise BatchConflict(
+                    f"preview {commit.game_id}/{commit.batch_id}: "
+                    f"manifest={manifest_count}, physical={physical_count}, "
+                    f"parser={expected}"
+                )
+        elif physical_count not in {0, expected}:
+            raise BatchConflict(
+                f"preview {commit.game_id}/{commit.batch_id}: orphan physical="
+                f"{physical_count}, parser={expected}"
+            )
+
+        # Even when the payload hash is unchanged, publish a fresh manifest
+        # row. It advances fetched_at after the bounded cadence refresh and
+        # clears a newer retryable failure without duplicating payload rows.
+        self._write_preview_batch(commit)
+        now = _utc_now()
+        fetched_at = commit.fetched_at or now
+        self.writer.write_dataframe(
+            pd.DataFrame(
+                [
+                    {
+                        "league": commit.league,
+                        "season": commit.season,
+                        "game_id": int(commit.game_id),
+                        "game": commit.game,
+                        "kickoff": commit.kickoff,
+                        "batch_id": commit.batch_id,
+                        "payload_sha256": commit.payload_sha256,
+                        "raw_uri": commit.raw_uri,
+                        "parser_version": commit.parser_version,
+                        "state": "success",
+                        "missing_players_count": expected,
+                        "transport_mode": commit.transport_mode,
+                        "proxy_mode": commit.proxy_mode,
+                        "http_status": int(commit.http_status),
+                        "failure_code": None,
+                        "error": None,
+                        "attempt_no": int(commit.attempt_no),
+                        "retry_after": None,
+                        "fetched_at": fetched_at,
+                        "completed_at": now,
+                        "direct_bytes": int(commit.direct_bytes),
+                        "paid_bytes": int(commit.paid_bytes),
+                        "_entity_type": "preview_manifest",
+                    }
+                ]
+            ),
+            database=self.schema,
+            table=PREVIEW_MANIFEST_TABLE,
+            partition_spec=[("league", "identity"), ("season", "identity")],
+            source="whoscored",
+        )
+        return commit.batch_id
 
     def _batch_count(self, table: str, commit: MatchCommit) -> int:
         if not self.trino.table_exists(self.schema, table):
@@ -979,9 +1389,9 @@ class WhoScoredRepository:
                 "game": None,
                 "kickoff": None,
                 "batch_id": None,
-                "payload_sha256": None,
-                "raw_uri": None,
-                "parser_version": PARSER_VERSION,
+                "payload_sha256": failure.payload_sha256,
+                "raw_uri": failure.raw_uri,
+                "parser_version": failure.parser_version,
                 "is_final": failure.state != "retryable",
                 "is_opta": True,
                 "events_count": 0,

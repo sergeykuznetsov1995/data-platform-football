@@ -1050,40 +1050,6 @@ def _source_url_ids(url: str) -> dict[str, Optional[int]]:
     }
 
 
-def parse_regions(html: str) -> ParsedDataset:
-    data = extract_js_assignment(html, "allRegions")
-    if not isinstance(data, list):
-        raise WhoScoredParseError("allRegions must be an array")
-    rows: list[dict[str, Any]] = []
-    for region_index, region in enumerate(data):
-        if not isinstance(region, Mapping):
-            raise WhoScoredParseError(f"allRegions[{region_index}] must be an object")
-        tournaments = region.get("tournaments") or []
-        if not isinstance(tournaments, list):
-            raise WhoScoredParseError(
-                f"allRegions[{region_index}].tournaments must be an array"
-            )
-        region_id = _required_int(region.get("id"), f"allRegions[{region_index}].id")
-        for tournament_index, tournament in enumerate(tournaments):
-            if not isinstance(tournament, Mapping):
-                raise WhoScoredParseError(
-                    f"allRegions[{region_index}].tournaments[{tournament_index}] "
-                    "must be an object"
-                )
-            rows.append(
-                {
-                    "region_id": region_id,
-                    "region": region.get("name"),
-                    "tournament_id": _required_int(
-                        tournament.get("id"), "tournament.id"
-                    ),
-                    "tournament": tournament.get("name"),
-                    "url": tournament.get("url"),
-                }
-            )
-    return _dataset("regions", rows)
-
-
 def _season_label_to_id(label: str, season_format: SeasonFormat) -> str:
     text = re.sub(r"\s+", "", label)
     if season_format is SeasonFormat.SINGLE_YEAR:

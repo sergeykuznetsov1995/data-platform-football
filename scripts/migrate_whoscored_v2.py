@@ -27,6 +27,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from scrapers.base.trino_manager import TrinoTableManager  # noqa: E402
 from scrapers.whoscored.repository import (  # noqa: E402
     MATCH_MANIFEST_TABLE,
+    PREVIEW_MANIFEST_TABLE,
     PROFILE_MANIFEST_TABLE,
     PROFILE_VERSIONS_TABLE,
     WhoScoredRepository,
@@ -199,6 +200,20 @@ def _projection(table: str, columns: Sequence[str]) -> list[str]:
             ),
         }
         result.extend(expression for name, expression in additions.items() if name not in present)
+    elif table == "whoscored_missing_players":
+        additions = {
+            "_payload_sha256": "CAST(NULL AS VARCHAR) AS _payload_sha256",
+            "_parser_version": "'legacy-v1' AS _parser_version",
+            "_preview_batch_id": (
+                "concat('legacy-preview-', lower(to_hex(sha256(to_utf8(concat("
+                '"league", \'|\', "season", \'|\', '
+                'CAST(CAST("game_id" AS BIGINT) AS VARCHAR))))))) '
+                "AS _preview_batch_id"
+            ),
+        }
+        result.extend(
+            expression for name, expression in additions.items() if name not in present
+        )
     return result
 
 
@@ -267,6 +282,10 @@ def build_shadow(
         elif table == "whoscored_lineups":
             expected_columns.update(
                 {"_payload_sha256", "_parser_version", "_game_batch_id"}
+            )
+        elif table == "whoscored_missing_players":
+            expected_columns.update(
+                {"_payload_sha256", "_parser_version", "_preview_batch_id"}
             )
         shadow_count = _scalar(trino, f"SELECT COUNT(*) FROM {_qualified(shadow)}")
         shadow_scopes = {
@@ -464,6 +483,112 @@ def seed_match_manifest(trino: TrinoTableManager) -> int:
     return _scalar(trino, f"SELECT COUNT(*) FROM {manifest} WHERE state = 'success'")
 
 
+def backfill_preview_metadata(trino: TrinoTableManager) -> int:
+    """Assign deterministic legacy preview metadata before strict-view seeding."""
+    table = "whoscored_missing_players"
+    if not trino.table_exists(SCHEMA, table):
+        return 0
+    required = {"league", "season", "game_id", "_preview_batch_id", "_parser_version"}
+    missing = sorted(required - set(_columns(trino, table)))
+    if missing:
+        raise RuntimeError(
+            f"cannot backfill preview metadata; {table} lacks: {', '.join(missing)}"
+        )
+    pending = _scalar(
+        trino,
+        f"SELECT COUNT(*) FROM {_qualified(table)} "
+        "WHERE _preview_batch_id IS NULL OR _parser_version IS NULL",
+    )
+    if not pending:
+        return 0
+    trino._execute(
+        f"""
+        UPDATE {_qualified(table)}
+        SET _preview_batch_id = COALESCE(
+                _preview_batch_id,
+                concat('legacy-preview-', lower(to_hex(sha256(to_utf8(concat(
+                    league, '|', season, '|',
+                    CAST(CAST(game_id AS BIGINT) AS VARCHAR)))))))
+            ),
+            _parser_version = COALESCE(_parser_version, 'legacy-v1')
+        WHERE _preview_batch_id IS NULL OR _parser_version IS NULL
+        """
+    )
+    remaining = _scalar(
+        trino,
+        f"SELECT COUNT(*) FROM {_qualified(table)} "
+        "WHERE _preview_batch_id IS NULL OR _parser_version IS NULL",
+    )
+    if remaining:
+        raise RuntimeError(
+            f"preview metadata backfill left {remaining} incomplete rows"
+        )
+    return pending
+
+
+def seed_preview_manifest(trino: TrinoTableManager) -> int:
+    """Publish legacy non-empty preview batches created by the shadow rebuild.
+
+    Legacy storage cannot prove that a game once had a successful zero-row
+    preview, so only existing physical rows are seeded. Future zero snapshots
+    are represented exactly by the append-only V2 manifest.
+    """
+    source = "whoscored_missing_players"
+    if not trino.table_exists(SCHEMA, source):
+        return 0
+    required = ("whoscored_schedule", PREVIEW_MANIFEST_TABLE)
+    missing = [name for name in required if not trino.table_exists(SCHEMA, name)]
+    if missing:
+        raise RuntimeError(
+            "cannot seed preview manifests; missing tables: " + ", ".join(missing)
+        )
+    manifest = _qualified(PREVIEW_MANIFEST_TABLE)
+    trino._execute(
+        f"""
+        INSERT INTO {manifest} (
+            league, season, game_id, game, kickoff, batch_id,
+            payload_sha256, raw_uri, parser_version, state,
+            missing_players_count, transport_mode, proxy_mode, http_status,
+            failure_code, error, attempt_no, retry_after, fetched_at,
+            completed_at, direct_bytes, paid_bytes, _source, _entity_type,
+            _ingested_at, _batch_id
+        )
+        SELECT
+            p.league, p.season, CAST(p.game_id AS BIGINT), MAX(p.game),
+            MAX(s.date), MAX(p._preview_batch_id), NULL, NULL, 'legacy-v1',
+            'success', COUNT(*), 'legacy', 'unknown', NULL, NULL, NULL, 1,
+            NULL, MAX(p._ingested_at), MAX(p._ingested_at), 0, 0,
+            'whoscored', 'preview_manifest',
+            CAST(CURRENT_TIMESTAMP AS TIMESTAMP(6)),
+            concat('legacy-preview-seed-', lower(to_hex(sha256(to_utf8(concat(
+                p.league, '|', p.season, '|',
+                CAST(CAST(p.game_id AS BIGINT) AS VARCHAR)))))))
+        FROM {_qualified(source)} p
+        LEFT JOIN (
+            SELECT league, season, game_id, MAX_BY(date, _ingested_at) AS date
+            FROM {_qualified('whoscored_schedule')}
+            GROUP BY 1, 2, 3
+        ) s
+          ON s.league = p.league
+         AND s.season = p.season
+         AND s.game_id = CAST(p.game_id AS BIGINT)
+        LEFT JOIN (
+            SELECT league, season, game_id
+            FROM {manifest}
+            WHERE state = 'success'
+            GROUP BY 1, 2, 3
+        ) committed
+          ON committed.league = p.league
+         AND committed.season = p.season
+         AND committed.game_id = CAST(p.game_id AS BIGINT)
+        WHERE p._preview_batch_id IS NOT NULL
+          AND committed.game_id IS NULL
+        GROUP BY p.league, p.season, CAST(p.game_id AS BIGINT)
+        """
+    )
+    return _scalar(trino, f"SELECT COUNT(*) FROM {manifest} WHERE state = 'success'")
+
+
 def seed_profiles(trino: TrinoTableManager) -> int:
     if not trino.table_exists(SCHEMA, "whoscored_player_profile"):
         return 0
@@ -597,7 +722,12 @@ def rollback(trino: TrinoTableManager, suffix: str) -> list[str]:
         return []
 
     v2_actions: list[tuple[str, str]] = []
-    for table in (MATCH_MANIFEST_TABLE, PROFILE_VERSIONS_TABLE, PROFILE_MANIFEST_TABLE):
+    for table in (
+        MATCH_MANIFEST_TABLE,
+        PREVIEW_MANIFEST_TABLE,
+        PROFILE_VERSIONS_TABLE,
+        PROFILE_MANIFEST_TABLE,
+    ):
         failed = f"{table}_v2_failed_{suffix}"
         active_exists = trino.table_exists(SCHEMA, table)
         failed_exists = trino.table_exists(SCHEMA, failed)
@@ -614,6 +744,9 @@ def rollback(trino: TrinoTableManager, suffix: str) -> list[str]:
     for schema, view in (
         ("silver", "whoscored_player_profile_current"),
         (SCHEMA, "whoscored_player_roster"),
+        (SCHEMA, "whoscored_missing_players_current"),
+        (SCHEMA, "whoscored_preview_ingest_latest_success"),
+        (SCHEMA, "whoscored_preview_ingest_latest"),
         (SCHEMA, "whoscored_events_current"),
         (SCHEMA, "whoscored_lineups_current"),
         (SCHEMA, "whoscored_match_ingest_latest_success"),
@@ -652,6 +785,7 @@ def _failed_artifacts(trino: TrinoTableManager, suffix: str) -> list[str]:
             f"{table}_v2_failed_{suffix}"
             for table in (
                 MATCH_MANIFEST_TABLE,
+                PREVIEW_MANIFEST_TABLE,
                 PROFILE_VERSIONS_TABLE,
                 PROFILE_MANIFEST_TABLE,
             )
@@ -799,9 +933,14 @@ def main(
             )
 
         repository = WhoScoredRepository(trino=trino)
-        repository.ensure_schema()
+        # Strict current views must not become visible until every legacy row
+        # has batch metadata and the corresponding manifests are committed.
+        repository.ensure_schema(create_views=False)
         report["match_manifests"] = seed_match_manifest(trino)
+        report["preview_metadata_backfilled"] = backfill_preview_metadata(trino)
+        report["preview_manifests"] = seed_preview_manifest(trino)
         report["profile_versions"] = seed_profiles(trino)
+        repository.ensure_schema()
         report["after"] = capture_state(trino)
         report["status"] = "success"
     except BaseException as exc:

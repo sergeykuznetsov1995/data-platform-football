@@ -61,10 +61,9 @@ def _optional_date(value: Any, field: str) -> Optional[date]:
 class WhoScoredCatalog:
     """Strict read-only projection of ``competitions.yaml``.
 
-    Optional source identifiers can be added without coupling the parser to
-    soccerdata's mutable global registry::
+    Source identifiers live in the source-owned catalog mapping::
 
-        source_ids:
+        sources:
           whoscored: {region_id: 252, tournament_id: 2}
 
     A season may similarly carry ``source_season_id`` once it has been
@@ -109,13 +108,7 @@ class WhoScoredCatalog:
                 sources.get("fallback") or ()
             )
 
-            source_ids = raw_competition.get("source_ids") or {}
-            if not isinstance(source_ids, Mapping):
-                raise CatalogError(f"{competition_id}: source_ids must be a mapping")
-            # ``sources.whoscored`` is the source-owned registry used by the
-            # refactored scraper.  Keep ``source_ids.whoscored`` as a read-only
-            # compatibility input for early catalog fixtures.
-            whoscored_ids = sources.get("whoscored") or source_ids.get("whoscored") or {}
+            whoscored_ids = sources.get("whoscored") or {}
             if not isinstance(whoscored_ids, Mapping):
                 raise CatalogError(
                     f"{competition_id}: sources.whoscored must be a mapping"
@@ -171,9 +164,7 @@ class WhoScoredCatalog:
                         f"{competition_id}.region_id",
                     ),
                     tournament_id=_optional_int(
-                        whoscored_ids.get(
-                            "tournament_id", whoscored_ids.get("league_id")
-                        ),
+                        whoscored_ids.get("tournament_id"),
                         f"{competition_id}.tournament_id",
                     ),
                 )

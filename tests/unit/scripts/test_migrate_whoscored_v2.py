@@ -109,6 +109,27 @@ def test_legacy_batch_id_normalizes_mixed_physical_game_id_types():
 
 
 @pytest.mark.unit
+def test_legacy_preview_projection_adds_logical_commit_metadata():
+    columns = [
+        "league",
+        "season",
+        "game_id",
+        "_ingested_at",
+        "_batch_id",
+    ]
+
+    projection = migration._projection("whoscored_missing_players", columns)
+
+    preview_batch = next(
+        item for item in projection if "AS _preview_batch_id" in item
+    )
+    assert "legacy-preview-" in preview_batch
+    assert 'CAST(CAST("game_id" AS BIGINT) AS VARCHAR)' in preview_batch
+    assert "'legacy-v1' AS _parser_version" in projection
+    assert "CAST(NULL AS VARCHAR) AS _payload_sha256" in projection
+
+
+@pytest.mark.unit
 def test_required_identity_keys_are_fail_closed():
     with pytest.raises(RuntimeError, match="game_id"):
         migration._available_keys(
@@ -293,6 +314,56 @@ def test_match_seed_uses_trino_boolean_aggregate_and_naive_timestamp():
 
 
 @pytest.mark.unit
+def test_preview_seed_commits_exact_legacy_nonempty_batches():
+    tables = {
+        "whoscored_missing_players",
+        "whoscored_schedule",
+        migration.PREVIEW_MANIFEST_TABLE,
+    }
+    trino = _TableTrino(tables)
+    trino.execute_query = MagicMock(return_value=[(1,)])
+
+    assert migration.seed_preview_manifest(trino) == 1
+
+    statement = trino.executed[0]
+    assert "MAX(p._preview_batch_id)" in statement
+    assert "COUNT(*)" in statement
+    assert "p._preview_batch_id IS NOT NULL" in statement
+    assert "committed.game_id IS NULL" in statement
+    assert "'legacy-v1'" in statement
+    assert "'legacy', 'unknown', NULL, NULL, NULL, 1" in statement
+    assert "CAST(CURRENT_TIMESTAMP AS TIMESTAMP(6))" in statement
+
+
+@pytest.mark.unit
+def test_preview_metadata_backfill_is_deterministic_and_idempotent():
+    table = "whoscored_missing_players"
+    columns = {
+        "league": "varchar",
+        "season": "varchar",
+        "game_id": "bigint",
+        "_preview_batch_id": "varchar",
+        "_parser_version": "varchar",
+    }
+    trino = _TableTrino({table}, columns={table: columns})
+    trino.execute_query = MagicMock(side_effect=[[(3,)], [(0,)]])
+
+    assert migration.backfill_preview_metadata(trino) == 3
+
+    statement = trino.executed[0]
+    assert statement.startswith("UPDATE iceberg.bronze.whoscored_missing_players")
+    assert "legacy-preview-" in statement
+    assert "CAST(CAST(game_id AS BIGINT) AS VARCHAR)" in statement
+    assert "COALESCE(_parser_version, 'legacy-v1')" in statement
+    assert "WHERE _preview_batch_id IS NULL OR _parser_version IS NULL" in statement
+
+    already_done = _TableTrino({table}, columns={table: columns})
+    already_done.execute_query = MagicMock(return_value=[(0,)])
+    assert migration.backfill_preview_metadata(already_done) == 0
+    assert already_done.executed == []
+
+
+@pytest.mark.unit
 def test_dry_run_default_suffix_performs_no_ddl(monkeypatch, capsys):
     trino = MagicMock()
     monkeypatch.setattr(migration, "capture_state", lambda manager: {"tables": {}})
@@ -326,7 +397,7 @@ def test_apply_failure_after_swap_triggers_automatic_rollback(monkeypatch):
         def __init__(self, **kwargs):
             pass
 
-        def ensure_schema(self):
+        def ensure_schema(self, **_kwargs):
             raise RuntimeError("schema failure")
 
     monkeypatch.setattr(migration, "WhoScoredRepository", _BrokenRepository)
@@ -357,7 +428,7 @@ def test_resumed_completed_swap_still_triggers_automatic_rollback(monkeypatch):
         def __init__(self, **kwargs):
             pass
 
-        def ensure_schema(self):
+        def ensure_schema(self, **_kwargs):
             raise RuntimeError("schema failure")
 
     monkeypatch.setattr(migration, "WhoScoredRepository", _BrokenRepository)

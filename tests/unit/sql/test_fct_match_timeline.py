@@ -4,7 +4,7 @@ Unit tests for the unified match chronicle ``gold.fct_match_timeline`` (#427).
 Pipeline under test:
   silver.fbref_match_events  (primary)   ──┐
                                             ├─► gold.fct_match_timeline
-  bronze.whoscored_events    (fallback)  ──┘
+  silver.whoscored_events_spadl (fallback) ─┘
 
 Per-match fallback gate: a match takes WhoScored events ONLY when it has zero
 FBref events — no event-level cross-source dedup, no mixed-source matches.

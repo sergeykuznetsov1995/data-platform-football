@@ -1,577 +1,423 @@
-"""
-Unit tests for ``dags/scripts/run_whoscored_scraper.py`` exit-code logic.
-
-Regression target: previously the runner unconditionally returned ``0``,
-even when individual ``scrape_*`` methods raised and were captured into
-``results['errors']``. That made Airflow tasks succeed silently while
-the underlying scrape was partially or wholly broken.
-
-Fix under test (line 209): ::
-
-    return 1 if results.get('errors') else 0
-
-These tests stub the heavy ``scrapers.whoscored.WhoScoredScraper`` import
-so the runner can be exercised without real browser / Trino.
-"""
+"""Contracts for the canonical WhoScored service runner."""
 
 from __future__ import annotations
 
-import importlib
 import json
-import os
-import sys
-import tempfile
-from unittest.mock import MagicMock, patch
+from types import SimpleNamespace
 
 import pytest
 
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-def _build_scraper_class(*, errors: bool):
-    """Return a class whose instances act as a context-manager scraper.
-
-    If ``errors`` is True, every ``scrape_*`` method raises so the runner
-    appends to ``results['errors']``. Otherwise the methods return empty
-    dicts (success, no tables).
-    """
-    scraper = MagicMock()
-    # #616: runner calls scraper.get_traffic_stats(); stub so json.dump stays serializable.
-    scraper.get_traffic_stats.return_value = {}
-
-    if errors:
-        def _boom(*a, **k):
-            raise RuntimeError("forced failure")
-
-        scraper.scrape_schedule.side_effect = _boom
-        scraper.scrape_missing_players.side_effect = _boom
-        scraper.scrape_season_stages.side_effect = _boom
-        scraper.scrape_events.side_effect = _boom
-    else:
-        scraper.scrape_schedule.return_value = {}
-        scraper.scrape_missing_players.return_value = {}
-        scraper.scrape_season_stages.return_value = {}
-        scraper.scrape_events.return_value = {}
-
-    scraper.__enter__ = MagicMock(return_value=scraper)
-    scraper.__exit__ = MagicMock(return_value=False)
-    return MagicMock(return_value=scraper)
+from dags.scripts import run_whoscored_scraper as runner
 
 
-def _run_main(args: list, scraper_cls, pre_main=None) -> int:
-    """Call ``run_whoscored_scraper.main()`` with sys.argv replaced.
-
-    The runner does ``from scrapers.whoscored import WhoScoredScraper``
-    inside ``main()`` (lazy import to avoid heavy ``scrapers/__init__.py``
-    side-effects), so we need to install the stub via ``sys.modules``
-    *before* main() runs. ``patch.dict('sys.modules', ...)`` handles
-    that and cleans up after.
-
-    ``pre_main`` (optional): callable receiving the freshly reloaded module,
-    used to patch module attributes (e.g. the #878 skip-existing probe)
-    before ``main()`` executes.
-    """
-    # Build a minimal fake ``scrapers.whoscored`` package surface.
-    stub_pkg = MagicMock()
-    stub_pkg.WhoScoredScraper = scraper_cls
-
-    sys.argv = ["run_whoscored_scraper.py"] + args
-
-    with patch.dict(
-        sys.modules,
-        {"scrapers.whoscored": stub_pkg},
-    ):
-        sys.modules.pop("dags.scripts.run_whoscored_scraper", None)
-        mod = importlib.import_module("dags.scripts.run_whoscored_scraper")
-        importlib.reload(mod)
-        if pre_main is not None:
-            pre_main(mod)
-        return mod.main()
+def _result(
+    entity: str,
+    *,
+    counts=None,
+    tables=None,
+    errors=None,
+    retryable=None,
+):
+    return SimpleNamespace(
+        entity=entity,
+        counts=dict(counts or {}),
+        tables=list(tables or []),
+        errors=list(errors or []),
+        retryable=list(retryable or []),
+    )
 
 
-# ---------------------------------------------------------------------------
-# Tests
-# ---------------------------------------------------------------------------
-class TestRunWhoscoredExitCode:
-    """Cover the ``return 1 if results.get('errors') else 0`` branch."""
+DEFAULT_RESULTS = {
+    "schedule": _result(
+        "schedule",
+        counts={"schedule": 1, "season_stages": 1},
+        tables=[
+            "iceberg.bronze.whoscored_schedule",
+            "iceberg.bronze.whoscored_season_stages",
+        ],
+    ),
+    "previews": _result(
+        "previews",
+        counts={"missing_players": 0},
+        tables=[
+            "iceberg.bronze.whoscored_missing_players",
+            "iceberg.bronze.whoscored_preview_ingest_manifest",
+        ],
+    ),
+    "matches": _result(
+        "matches",
+        counts={"events": 2, "lineups": 1},
+        tables=[
+            "iceberg.bronze.whoscored_events",
+            "iceberg.bronze.whoscored_lineups",
+            "iceberg.bronze.whoscored_match_ingest_manifest",
+        ],
+    ),
+    "profiles": _result(
+        "profiles",
+        counts={"player_profile": 1},
+        tables=[
+            "iceberg.bronze.whoscored_player_profile_versions",
+            "iceberg.bronze.whoscored_profile_ingest_manifest",
+        ],
+    ),
+}
 
-    @pytest.fixture
-    def temp_output(self):
-        fd, path = tempfile.mkstemp(suffix=".json", prefix="whoscored_")
-        os.close(fd)
-        yield path
-        if os.path.exists(path):
-            os.unlink(path)
 
-    @pytest.mark.unit
-    def test_exit_zero_when_no_errors(self, temp_output):
-        """All scrape_* methods succeed → empty errors list → exit 0."""
-        scraper_cls = _build_scraper_class(errors=False)
-
-        rc = _run_main(
-            [
-                "--leagues", "ENG-Premier League",
-                "--seasons", "2024",
-                "--skip-events",
-                "--output", temp_output,
-            ],
-            scraper_cls,
-        )
-
-        assert rc == 0, "Expected exit 0 when results.errors is empty"
-
-        with open(temp_output) as f:
-            payload = json.load(f)
-        assert payload["errors"] == []
-
-    @pytest.mark.unit
-    def test_exit_one_when_scrape_methods_raise(self, temp_output):
-        """Every scrape_* method raises → results.errors populated → exit 1.
-
-        This is the regression: previously the runner returned 0 here.
-        """
-        scraper_cls = _build_scraper_class(errors=True)
-
-        rc = _run_main(
-            [
-                "--leagues", "ENG-Premier League",
-                "--seasons", "2024",
-                "--skip-events",
-                "--output", temp_output,
-            ],
-            scraper_cls,
-        )
-
-        assert rc == 1, (
-            "Expected exit 1 when results.errors is populated — "
-            "this is the bug fix being verified."
-        )
-
-        with open(temp_output) as f:
-            payload = json.load(f)
-        # 3 cheap tasks ran and each raised once
-        assert len(payload["errors"]) == 3
-        assert any("schedule" in e for e in payload["errors"])
-        assert any("missing_players" in e for e in payload["errors"])
-        assert any("season_stages" in e for e in payload["errors"])
-
-    @pytest.mark.unit
-    def test_exit_one_with_partial_failure(self, temp_output):
-        """Mixed success/failure also yields exit 1 — partial-error must not
-        be reported as success."""
-        scraper = MagicMock()
-        scraper.get_traffic_stats.return_value = {}
-        scraper.scrape_schedule.return_value = {
-            "schedule": "iceberg.bronze.whoscored_schedule"
+class _Catalog:
+    def __init__(self):
+        self._scopes = {
+            ("ENG-Premier League", "2526"): SimpleNamespace(
+                scope=SimpleNamespace(
+                    competition_id="ENG-Premier League",
+                    season_id="2526",
+                    spec="ENG-Premier League=2526",
+                )
+            ),
+            ("INT-World Cup", "2026"): SimpleNamespace(
+                scope=SimpleNamespace(
+                    competition_id="INT-World Cup",
+                    season_id="2026",
+                    spec="INT-World Cup=2026",
+                )
+            ),
         }
-        scraper.scrape_missing_players.side_effect = RuntimeError("502 BAD")
-        scraper.scrape_season_stages.return_value = {}
-        scraper.__enter__ = MagicMock(return_value=scraper)
-        scraper.__exit__ = MagicMock(return_value=False)
-        scraper_cls = MagicMock(return_value=scraper)
 
-        rc = _run_main(
-            [
-                "--leagues", "ENG-Premier League",
-                "--seasons", "2024",
-                "--skip-events",
-                "--output", temp_output,
-            ],
-            scraper_cls,
-        )
+    def resolve_scope(self, competition_id, season_id):
+        try:
+            return self._scopes[(competition_id, str(season_id))]
+        except KeyError as exc:
+            raise ValueError(f"unknown scope {competition_id}={season_id}") from exc
 
-        assert rc == 1
-        with open(temp_output) as f:
-            payload = json.load(f)
-        assert any("missing_players" in e for e in payload["errors"])
-        # schedule succeeded — should still be listed as a written table
-        assert "iceberg.bronze.whoscored_schedule" in payload["tables"]
+    def competition(self, competition_id):
+        if not any(key[0] == competition_id for key in self._scopes):
+            raise ValueError(f"unknown competition {competition_id}")
+        return SimpleNamespace(whoscored_enabled=True)
 
 
-class TestCanonicalScopeCli:
-    """V2 subcommands use explicit pairs instead of a league/season product."""
+def _runtime(behaviors=None):
+    catalog = _Catalog()
+    configured = dict(behaviors or {})
 
-    @pytest.fixture
-    def temp_output(self):
-        fd, path = tempfile.mkstemp(suffix=".json", prefix="whoscored_v2_")
-        os.close(fd)
-        yield path
-        if os.path.exists(path):
-            os.unlink(path)
+    class CatalogClass:
+        @classmethod
+        def from_file(cls):
+            return catalog
 
-    @pytest.mark.unit
-    def test_matches_runs_only_events_and_emits_v2_report(self, temp_output):
-        scraper_cls = _build_scraper_class(errors=False)
+    class Service:
+        instances = []
 
-        rc = _run_main(
-            [
-                "matches",
-                "--scope", "ENG-Premier League=2526",
-                "--output", temp_output,
-            ],
-            scraper_cls,
-        )
+        def __init__(self, scope, *, catalog):
+            self.scope = scope
+            self.catalog = catalog
+            self.calls = []
+            type(self).instances.append(self)
 
-        assert rc == 0
-        scraper = scraper_cls.return_value
-        scraper.scrape_events.assert_called_once_with(max_matches=None)
-        scraper.scrape_schedule.assert_not_called()
-        scraper.scrape_missing_players.assert_not_called()
-        scraper.scrape_season_stages.assert_not_called()
-        assert scraper_cls.call_args.kwargs["proxy_file"] == ""
+        def __enter__(self):
+            return self
 
-        with open(temp_output) as handle:
-            report = json.load(handle)
-        assert report["schema_version"] == 2
-        assert report["status"] == "success"
-        assert report["command"] == "matches"
-        assert report["scopes"][0]["scope"] == "ENG-Premier League=2526"
+        def __exit__(self, *_args):
+            return False
 
-    @pytest.mark.unit
-    def test_repeated_scope_never_builds_cross_product(self, temp_output):
-        scraper_cls = _build_scraper_class(errors=False)
+        def _value(self, operation):
+            value = configured.get(operation, DEFAULT_RESULTS[operation])
+            if isinstance(value, BaseException):
+                raise value
+            return value() if callable(value) else value
 
-        rc = _run_main(
-            [
-                "matches",
-                "--scope", "ENG-Premier League=2526",
-                "--scope", "INT-World Cup=2026",
-                "--output", temp_output,
-            ],
-            scraper_cls,
-        )
+        def sync_schedule(self):
+            self.calls.append(("schedule", None))
+            return self._value("schedule")
 
-        assert rc == 0
-        assert scraper_cls.call_count == 2
-        kwargs = [call.kwargs for call in scraper_cls.call_args_list]
-        assert kwargs[0]["leagues"] == ["ENG-Premier League"]
-        assert kwargs[0]["seasons"] == [2526]
-        assert kwargs[1]["leagues"] == ["INT-World Cup"]
-        assert kwargs[1]["seasons"] == [2026]
+        def sync_previews(self):
+            self.calls.append(("previews", None))
+            return self._value("previews")
 
-    @pytest.mark.unit
-    def test_retryable_failure_has_distinct_exit_code(self, temp_output):
-        scraper = MagicMock()
-        scraper.get_traffic_stats.return_value = {}
-        scraper.scrape_events.side_effect = TimeoutError("upstream timeout")
-        scraper.__enter__ = MagicMock(return_value=scraper)
-        scraper.__exit__ = MagicMock(return_value=False)
-        scraper_cls = MagicMock(return_value=scraper)
+        def sync_matches(self, *, limit):
+            self.calls.append(("matches", limit))
+            return self._value("matches")
 
-        rc = _run_main(
-            [
-                "matches",
-                "--scope", "ENG-Premier League=2526",
-                "--output", temp_output,
-            ],
-            scraper_cls,
-        )
+        def sync_profiles(self, *, limit, candidate_scopes):
+            self.calls.append(("profiles", limit, tuple(candidate_scopes)))
+            return self._value("profiles")
 
-        assert rc == 2
-        with open(temp_output) as handle:
-            report = json.load(handle)
-        assert report["status"] == "retryable"
-        assert report["error_details"] == [
-            {
-                "scope": "ENG-Premier League=2526",
-                "entity": "events",
-                "type": "TimeoutError",
-                "message": "upstream timeout",
-                "retryable": True,
+        def traffic_stats(self):
+            return {
+                "paid_proxy_bytes": 0,
+                "route_requests": {"direct_http": 1},
             }
+
+    return (CatalogClass, Service), catalog
+
+
+def _run(monkeypatch, tmp_path, args, *, behaviors=None):
+    runtime, catalog = _runtime(behaviors)
+    monkeypatch.setattr(runner, "_load_runtime", lambda: runtime)
+    output = tmp_path / "result.json"
+    rc = runner.main([*args, "--output", str(output)])
+    return rc, json.loads(output.read_text(encoding="utf-8")), runtime[1], catalog
+
+
+@pytest.mark.unit
+def test_report_is_group_readable_after_atomic_publish(tmp_path):
+    output = tmp_path / "result.json"
+
+    runner._write_report(str(output), {"status": "success"})
+
+    assert output.stat().st_mode & 0o777 == 0o640
+    assert json.loads(output.read_text(encoding="utf-8")) == {
+        "status": "success"
+    }
+
+
+@pytest.mark.unit
+def test_matches_use_direct_service_and_emit_stable_v2_report(monkeypatch, tmp_path):
+    rc, report, service_cls, _ = _run(
+        monkeypatch,
+        tmp_path,
+        ["matches", "--scope", "ENG-Premier League=2526"],
+    )
+
+    assert rc == 0
+    assert len(service_cls.instances) == 1
+    assert service_cls.instances[0].calls == [("matches", None)]
+    assert report["schema_version"] == 2
+    assert report["status"] == "success"
+    assert report["command"] == "matches"
+    assert report["rows"] == 3
+    assert report["row_counts_complete"] is True
+    assert report["entities"]["events"] == {
+        "table": "iceberg.bronze.whoscored_events",
+        "rows_written": 2,
+        "counts_complete": True,
+    }
+    assert report["tables_by_entity"]["lineups"].endswith(
+        ".whoscored_lineups"
+    )
+    assert "iceberg.bronze.whoscored_match_ingest_manifest" in report["tables"]
+    assert report["traffic"]["paid_proxy_bytes"] == 0
+
+
+@pytest.mark.unit
+def test_repeated_scopes_create_independent_services_not_a_cross_product(
+    monkeypatch, tmp_path
+):
+    rc, report, service_cls, _ = _run(
+        monkeypatch,
+        tmp_path,
+        [
+            "matches",
+            "--scope",
+            "ENG-Premier League=2526",
+            "--scope",
+            "INT-World Cup=2026",
+            "--max-matches",
+            "3",
+        ],
+    )
+
+    assert rc == 0
+    assert [item.scope.scope.spec for item in service_cls.instances] == [
+        "ENG-Premier League=2526",
+        "INT-World Cup=2026",
+    ]
+    assert [item.calls for item in service_cls.instances] == [
+        [("matches", 3)],
+        [("matches", 3)],
+    ]
+    assert [item["status"] for item in report["scopes"]] == [
+        "success",
+        "success",
+    ]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("limit", [0, 200])
+def test_profiles_union_all_scopes_under_one_global_limit(
+    monkeypatch, tmp_path, limit
+):
+    rc, report, service_cls, _ = _run(
+        monkeypatch,
+        tmp_path,
+        [
+            "profiles",
+            "--scope",
+            "ENG-Premier League=2526",
+            "--scope",
+            "INT-World Cup=2026",
+            "--limit",
+            str(limit),
+        ],
+    )
+
+    assert rc == 0
+    assert len(service_cls.instances) == 1
+    call = service_cls.instances[0].calls[0]
+    assert call[:2] == ("profiles", limit)
+    assert [scope.scope.spec for scope in call[2]] == [
+        "ENG-Premier League=2526",
+        "INT-World Cup=2026",
+    ]
+    assert [item["status"] for item in report["scopes"]] == [
+        "success",
+        "success",
+    ]
+    assert report["scopes"][1]["delegated_to"] == (
+        "ENG-Premier League=2526"
+    )
+
+
+@pytest.mark.unit
+def test_profiles_default_limit_is_200(monkeypatch, tmp_path):
+    rc, _, service_cls, _ = _run(
+        monkeypatch,
+        tmp_path,
+        ["profiles", "--scope", "ENG-Premier League=2526"],
+    )
+
+    assert rc == 0
+    assert service_cls.instances[0].calls[0][1] == 200
+
+
+@pytest.mark.unit
+def test_all_runs_each_v2_entity_once_in_order(monkeypatch, tmp_path):
+    rc, report, service_cls, _ = _run(
+        monkeypatch,
+        tmp_path,
+        ["all", "--scope", "ENG-Premier League=2526"],
+    )
+
+    assert rc == 0
+    assert service_cls.instances[0].calls == [
+        ("schedule", None),
+        ("previews", None),
+        ("matches", None),
+    ]
+    assert report["rows"] == 5
+    assert report["scopes"][0]["entities"]["missing_players"][
+        "rows_written"
+    ] == 0
+
+
+@pytest.mark.unit
+def test_retryable_service_result_has_distinct_exit_code(monkeypatch, tmp_path):
+    retryable = _result("matches", retryable=["123"])
+    rc, report, _, _ = _run(
+        monkeypatch,
+        tmp_path,
+        ["matches", "--scope", "ENG-Premier League=2526"],
+        behaviors={"matches": retryable},
+    )
+
+    assert rc == 2
+    assert report["status"] == "retryable"
+    assert report["scopes"][0]["status"] == "retryable"
+    assert report["error_details"] == [
+        {
+            "scope": "ENG-Premier League=2526",
+            "entity": "matches",
+            "type": "RetryableWork",
+            "message": "matches retryable ids: 123",
+            "retryable": True,
+        }
+    ]
+
+
+@pytest.mark.unit
+def test_partial_service_error_is_fatal_but_keeps_committed_counts(
+    monkeypatch, tmp_path
+):
+    partial = _result(
+        "matches",
+        counts={"events": 2},
+        tables=["iceberg.bronze.whoscored_events"],
+        errors=["lineup manifest failed"],
+    )
+    rc, report, _, _ = _run(
+        monkeypatch,
+        tmp_path,
+        ["matches", "--scope", "ENG-Premier League=2526"],
+        behaviors={"matches": partial},
+    )
+
+    assert rc == 1
+    assert report["status"] == "failed"
+    assert report["rows"] == 2
+    assert report["entities"]["events"]["rows_written"] == 2
+    assert report["error_details"][0]["retryable"] is False
+
+
+@pytest.mark.unit
+def test_timeout_exception_is_retryable(monkeypatch, tmp_path):
+    rc, report, _, _ = _run(
+        monkeypatch,
+        tmp_path,
+        ["matches", "--scope", "ENG-Premier League=2526"],
+        behaviors={"matches": TimeoutError("upstream timeout")},
+    )
+
+    assert rc == 2
+    assert report["error_details"][0]["type"] == "TimeoutError"
+    assert report["error_details"][0]["entity"] == "matches"
+
+
+@pytest.mark.unit
+def test_unknown_catalog_scope_fails_closed_without_constructing_service(
+    monkeypatch, tmp_path
+):
+    rc, report, service_cls, _ = _run(
+        monkeypatch,
+        tmp_path,
+        ["matches", "--scope", "UNKNOWN-League=2526"],
+    )
+
+    assert rc == 1
+    assert service_cls.instances == []
+    assert report["scopes"][0]["status"] == "failed"
+    assert report["error_details"][0]["entity"] == "scope"
+
+
+@pytest.mark.unit
+def test_runtime_import_failure_still_publishes_failure_report(
+    monkeypatch, tmp_path
+):
+    def fail_runtime():
+        raise ImportError("pyarrow missing")
+
+    monkeypatch.setattr(runner, "_load_runtime", fail_runtime)
+    output = tmp_path / "result.json"
+    rc = runner.main(
+        [
+            "matches",
+            "--scope",
+            "ENG-Premier League=2526",
+            "--output",
+            str(output),
         ]
+    )
+
+    report = json.loads(output.read_text(encoding="utf-8"))
+    assert rc == 1
+    assert report["status"] == "failed"
+    assert report["error_details"][0]["entity"] == "runtime"
 
 
-# ---------------------------------------------------------------------------
-# #878 — fast schedule path + skip-existing probe
-# ---------------------------------------------------------------------------
-def _import_runner():
-    """Import the runner module fresh, without stubbing scrapers.whoscored.
-
-    Safe for helper-level tests: the heavy ``from scrapers.whoscored import
-    WhoScoredScraper`` lives inside ``main()``, not at module level.
-    """
-    sys.modules.pop("dags.scripts.run_whoscored_scraper", None)
-    return importlib.import_module("dags.scripts.run_whoscored_scraper")
+@pytest.mark.unit
+def test_legacy_cli_and_missing_scope_are_rejected():
+    parser = runner._build_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(["matches", "--leagues", "ENG-Premier League"])
+    with pytest.raises(SystemExit):
+        parser.parse_args(["matches"])
 
 
-class TestSeasonHelpers:
-    """#878: local season-token converters (kept in sync with scraper.py)."""
-
-    @pytest.mark.unit
-    def test_year_start_converts_to_slug(self):
-        mod = _import_runner()
-        assert mod._season_to_bronze_str(2016) == "1617"
-
-    @pytest.mark.unit
-    def test_short_token_passes_through(self):
-        mod = _import_runner()
-        assert mod._season_to_bronze_str(1718) == "1718"
-        assert mod._season_to_bronze_str("2526") == "2526"
-
-    @pytest.mark.unit
-    def test_9900_edge(self):
-        mod = _import_runner()
-        assert mod._season_to_bronze_str(1999) == "9900"
-        assert mod._season_start_year("9900") == 1999
-
-    @pytest.mark.unit
-    def test_start_year_both_forms(self):
-        mod = _import_runner()
-        assert mod._season_start_year(2016) == 2016
-        assert mod._season_start_year("2526") == 2025
-
-    @pytest.mark.unit
-    def test_garbage_raises(self):
-        mod = _import_runner()
-        with pytest.raises(ValueError):
-            mod._season_to_bronze_str("20xx")
-        with pytest.raises(ValueError):
-            mod._season_start_year("20256")
-
-
-class TestCompletedSchedulePairs:
-    """#878: the bronze completeness probe (schedule AND season_stages)."""
-
-    @staticmethod
-    def _fake_conn(sched_rows, stages_rows):
-        """Connection whose cursor returns sched_rows then stages_rows."""
-        cur = MagicMock()
-        cur.fetchall.side_effect = [sched_rows, stages_rows]
-        conn = MagicMock()
-        conn.cursor.return_value = cur
-        return conn
-
-    @pytest.mark.unit
-    def test_pair_complete_when_both_tables_pass_floor(self):
-        mod = _import_runner()
-        conn = self._fake_conn(
-            sched_rows=[("GER-Bundesliga", "1617", 306)],
-            stages_rows=[("GER-Bundesliga", "1617", 2)],
+@pytest.mark.unit
+def test_duplicate_or_malformed_scopes_are_rejected():
+    parser = runner._build_parser()
+    with pytest.raises(SystemExit):
+        runner._resolve_scopes(
+            parser,
+            ["ENG-Premier League=2526", "ENG-Premier League=2526"],
         )
-        with patch.object(mod, "_trino_connect", return_value=conn):
-            done = mod._completed_schedule_pairs(["GER-Bundesliga"], ["1617"])
-        assert done == {("GER-Bundesliga", "1617")}
-
-    @pytest.mark.unit
-    def test_schedule_full_but_stages_empty_is_not_complete(self):
-        """Regression for the rc=124 tail: the backfill timeout kills the
-        unit inside missing_players, AFTER schedule is written but BEFORE
-        season_stages runs. A schedule-only probe would no-op forever and
-        stages would never backfill."""
-        mod = _import_runner()
-        conn = self._fake_conn(
-            sched_rows=[("ESP-La Liga", "1617", 380)],
-            stages_rows=[],
-        )
-        with patch.object(mod, "_trino_connect", return_value=conn):
-            done = mod._completed_schedule_pairs(["ESP-La Liga"], ["1617"])
-        assert done == set()
-
-    @pytest.mark.unit
-    def test_below_schedule_floor_is_not_complete(self):
-        mod = _import_runner()
-        conn = self._fake_conn(
-            sched_rows=[("GER-Bundesliga", "1617", 100)],
-            stages_rows=[("GER-Bundesliga", "1617", 2)],
-        )
-        with patch.object(mod, "_trino_connect", return_value=conn):
-            done = mod._completed_schedule_pairs(["GER-Bundesliga"], ["1617"])
-        assert done == set()
-
-    @pytest.mark.unit
-    def test_trino_error_fails_open(self):
-        mod = _import_runner()
-        conn = MagicMock()
-        conn.cursor.side_effect = RuntimeError("trino down")
-        with patch.object(mod, "_trino_connect", return_value=conn):
-            done = mod._completed_schedule_pairs(["GER-Bundesliga"], ["1617"])
-        assert done == set()
-
-    @pytest.mark.unit
-    def test_no_connection_fails_open(self):
-        mod = _import_runner()
-        with patch.object(mod, "_trino_connect", return_value=None):
-            done = mod._completed_schedule_pairs(["GER-Bundesliga"], ["1617"])
-        assert done == set()
-
-
-class TestSkipMissingPlayersFlag:
-    """#878: --skip-missing-players removes the per-match Preview crawl."""
-
-    @pytest.fixture
-    def temp_output(self):
-        fd, path = tempfile.mkstemp(suffix=".json", prefix="whoscored_")
-        os.close(fd)
-        yield path
-        if os.path.exists(path):
-            os.unlink(path)
-
-    @pytest.mark.unit
-    def test_flag_skips_only_missing_players(self, temp_output):
-        scraper_cls = _build_scraper_class(errors=False)
-        rc = _run_main(
-            [
-                "--leagues", "GER-Bundesliga",
-                "--seasons", "2016",
-                "--skip-events",
-                "--skip-missing-players",
-                "--output", temp_output,
-            ],
-            scraper_cls,
-        )
-        assert rc == 0
-        scraper = scraper_cls.return_value
-        scraper.scrape_schedule.assert_called_once()
-        scraper.scrape_season_stages.assert_called_once()
-        scraper.scrape_missing_players.assert_not_called()
-        scraper.scrape_events.assert_not_called()
-
-    @pytest.mark.unit
-    def test_default_path_still_runs_everything(self, temp_output):
-        """No new flags → prod-DAG behavior unchanged: all subtasks run."""
-        scraper_cls = _build_scraper_class(errors=False)
-        rc = _run_main(
-            [
-                "--leagues", "GER-Bundesliga",
-                "--seasons", "2016",
-                "--output", temp_output,
-            ],
-            scraper_cls,
-        )
-        assert rc == 0
-        scraper = scraper_cls.return_value
-        scraper.scrape_schedule.assert_called_once()
-        scraper.scrape_missing_players.assert_called_once()
-        scraper.scrape_season_stages.assert_called_once()
-        scraper.scrape_events.assert_called_once()
-
-
-class TestSkipExistingGate:
-    """#878: --skip-existing full no-op never constructs the scraper."""
-
-    @pytest.fixture
-    def temp_output(self):
-        fd, path = tempfile.mkstemp(suffix=".json", prefix="whoscored_")
-        os.close(fd)
-        yield path
-        if os.path.exists(path):
-            os.unlink(path)
-
-    FAST_PATH_ARGS = ["--skip-events", "--skip-missing-players", "--skip-existing"]
-
-    @pytest.mark.unit
-    def test_full_noop_skips_scraper_entirely(self, temp_output):
-        scraper_cls = _build_scraper_class(errors=False)
-
-        def _patch_probe(mod):
-            mod._completed_schedule_pairs = MagicMock(
-                return_value={("GER-Bundesliga", "1617")}
-            )
-
-        rc = _run_main(
-            [
-                "--leagues", "GER-Bundesliga",
-                "--seasons", "2016",
-                *self.FAST_PATH_ARGS,
-                "--output", temp_output,
-            ],
-            scraper_cls,
-            pre_main=_patch_probe,
-        )
-        assert rc == 0
-        scraper_cls.assert_not_called()
-
-        with open(temp_output) as f:
-            payload = json.load(f)
-        assert payload["skip_existing"] is True
-        assert payload["skipped_pairs"] == [["GER-Bundesliga", "1617"]]
-        assert payload["errors"] == []
-        sched_traffic = payload["traffic"]["schedule"]
-        assert sched_traffic["requests"] == 0
-        assert sched_traffic["sessions_created"] == 0
-        assert sched_traffic["fs_response_bytes"] == 0
-
-    @pytest.mark.unit
-    def test_partial_pairs_scrape_remaining(self, temp_output):
-        """One of two leagues complete → only the other is scraped."""
-        scraper_cls = _build_scraper_class(errors=False)
-
-        def _patch_probe(mod):
-            mod._completed_schedule_pairs = MagicMock(
-                return_value={("GER-Bundesliga", "1617")}
-            )
-
-        rc = _run_main(
-            [
-                "--leagues", "GER-Bundesliga,ITA-Serie A",
-                "--seasons", "2016",
-                *self.FAST_PATH_ARGS,
-                "--output", temp_output,
-            ],
-            scraper_cls,
-            pre_main=_patch_probe,
-        )
-        assert rc == 0
-        assert scraper_cls.call_count == 1
-        assert scraper_cls.call_args.kwargs["leagues"] == ["ITA-Serie A"]
-        with open(temp_output) as f:
-            payload = json.load(f)
-        assert payload["skipped_pairs"] == [["GER-Bundesliga", "1617"]]
-
-    @pytest.mark.unit
-    def test_current_season_never_skipped(self, temp_output):
-        """A pair whose season is current must scrape even if the probe
-        would call it complete (it keeps growing until season end)."""
-        scraper_cls = _build_scraper_class(errors=False)
-        probe = MagicMock(return_value=set())
-
-        def _patch_probe(mod):
-            mod._completed_schedule_pairs = probe
-            # Freeze "now" so the test doesn't rot: pretend it's 2017-01-15,
-            # making season 2016 (16/17) the CURRENT season.
-            mod.datetime = MagicMock()
-            mod.datetime.now.return_value = MagicMock(year=2017, month=1)
-
-        rc = _run_main(
-            [
-                "--leagues", "GER-Bundesliga",
-                "--seasons", "2016",
-                *self.FAST_PATH_ARGS,
-                "--output", temp_output,
-            ],
-            scraper_cls,
-            pre_main=_patch_probe,
-        )
-        assert rc == 0
-        # Season 2016 is current → not "past" → probe has nothing to check.
-        probe.assert_not_called()
-        scraper_cls.assert_called_once()
-
-    @pytest.mark.unit
-    def test_ignored_without_fast_path_flags(self, temp_output):
-        """--skip-existing without --skip-events --skip-missing-players is
-        ignored: a bronze schedule probe says nothing about events."""
-        scraper_cls = _build_scraper_class(errors=False)
-        probe = MagicMock(return_value={("GER-Bundesliga", "1617")})
-
-        def _patch_probe(mod):
-            mod._completed_schedule_pairs = probe
-
-        rc = _run_main(
-            [
-                "--leagues", "GER-Bundesliga",
-                "--seasons", "2016",
-                "--skip-events",
-                "--skip-existing",
-                "--output", temp_output,
-            ],
-            scraper_cls,
-            pre_main=_patch_probe,
-        )
-        assert rc == 0
-        probe.assert_not_called()
-        scraper_cls.assert_called_once()
-        scraper = scraper_cls.return_value
-        scraper.scrape_missing_players.assert_called_once()
+    with pytest.raises(SystemExit):
+        runner._resolve_scopes(parser, ["ENG-Premier League=2025-26"])

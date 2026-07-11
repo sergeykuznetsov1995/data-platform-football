@@ -183,7 +183,7 @@ STAGE_3_FACTS = [
      'fct_player_market_value', None),
     # issue #427: unified per-event match chronicle (goals/cards/subs in ONE
     # timeline, PK (match_id, event_seq)). silver.fbref_match_events primary
-    # + bronze.whoscored_events per-match fallback. Runs in s3 — after g2c,
+    # + silver.whoscored_events_spadl per-match fallback. Runs in s3 — after g2c,
     # so dim_match (FK target) already exists. No STAGE_3_FALLBACKS entry:
     # silver.fbref_match_events is a core table, and the require_silver
     # mechanism can't guard bronze sources anyway (fct_card precedent).

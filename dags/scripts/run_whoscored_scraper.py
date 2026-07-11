@@ -1,36 +1,22 @@
 #!/usr/bin/env python3
-"""Run the WhoScored ingestion service.
+"""Run the manifest-backed WhoScored ingestion service.
 
-The v2 CLI addresses one important modelling bug in the old runner: a list of
-leagues and a list of seasons were passed to ``soccerdata`` as a Cartesian
-product.  That is invalid for competitions with a calendar-year season (for
-example ``INT-World Cup=2026``).  New callers therefore pass one or more
-explicit, canonical scopes::
-
-    run_whoscored_scraper.py matches \
-        --scope "ENG-Premier League=2526" \
-        --scope "INT-World Cup=2026"
-
-The runner deliberately opens one scraper per scope until the scraper service
-itself accepts ``WhoScoredScope`` objects.  Besides preventing cross-products,
-this isolates caches, browser sessions and failures by competition.
+Every invocation uses explicit canonical competition-season scopes.  This
+prevents the old league/season Cartesian product and keeps discovery, raw
+storage, retries, and proxy budgets inside :class:`WhoScoredIngestService`.
 
 Commands:
 
 ``schedule``
-    Refresh the schedule and season-stage metadata.
+    Refresh schedule and season-stage metadata.
 ``previews``
-    Refresh the targeted missing-player preview set.
+    Refresh targeted missing-player previews.
 ``matches``
     Fetch eligible match events and lineups.
 ``profiles``
-    Fetch player profiles (kept separate because it has its own budget/TTL).
+    Fetch one globally capped union of the selected active rosters.
 ``all``
-    Run schedule, previews and matches.  Profiles remain an explicit command.
-
-The legacy ``--leagues/--seasons`` and ``--skip-*`` interface remains as a
-deprecated bridge for manual backfills.  Production DAGs use only the v2
-scope/subcommand interface.
+    Run schedule, previews, and matches. Profiles stay separately budgeted.
 """
 
 from __future__ import annotations
@@ -44,9 +30,8 @@ import sys
 import tempfile
 import uuid
 from dataclasses import dataclass
-from datetime import datetime
 from pathlib import Path
-from typing import Any, Iterable, List, Mapping, MutableMapping, Optional
+from typing import Any, Iterable, Mapping, MutableMapping, Optional, Sequence
 
 
 logging.basicConfig(
@@ -59,11 +44,25 @@ logger = logging.getLogger(__name__)
 
 REPORT_SCHEMA_VERSION = 2
 COMMANDS = ("schedule", "previews", "matches", "profiles", "all")
+TABLE_NAME_BY_ENTITY = {
+    "schedule": "whoscored_schedule",
+    "season_stages": "whoscored_season_stages",
+    "missing_players": "whoscored_missing_players",
+    "events": "whoscored_events",
+    "lineups": "whoscored_lineups",
+    "player_profile": "whoscored_player_profile_versions",
+}
+
+
+class RetryableWork(RuntimeError):
+    """The service committed progress but retained retryable entity ids."""
+
+    retryable = True
 
 
 @dataclass(frozen=True, order=True)
 class RunnerScope:
-    """Canonical competition/season pair used by runner orchestration."""
+    """Syntax-checked scope used before the runtime catalog is imported."""
 
     competition_id: str
     season_id: str
@@ -90,234 +89,49 @@ class RunnerScope:
 
 
 def _utc_now_iso() -> str:
-    """UTC timestamp isolated from the legacy tests' patched ``datetime``."""
     return datetime_lib.datetime.now(datetime_lib.timezone.utc).isoformat()
 
 
-def _parse_seasons(args: argparse.Namespace) -> List[int]:
-    """Parse the deprecated season flags.
-
-    This helper is intentionally retained for one compatibility release.  New
-    callers must use ``--scope`` and canonical season IDs.
-    """
-    if args.seasons:
-        return [int(s.strip()) for s in args.seasons.split(",") if s.strip()]
-    return [int(args.season)]
-
-
-def _season_to_bronze_str(season: Any) -> str:
-    """Legacy season-token conversion used only by deprecated CLI flags."""
-    s = str(season)
-    if len(s) != 4 or not s.isdigit():
-        raise ValueError(f"Unrecognized season token: {season!r}")
-    if (int(s[:2]) + 1) % 100 == int(s[2:]):
-        return s
-    if s[2:] == "99":
-        return "9900"
-    return s[-2:] + f"{(int(s[-2:]) + 1) % 100:02d}"
-
-
-def _season_start_year(season: Any) -> int:
-    """Return a start year for a legacy split-year season token."""
-    s = str(season)
-    if len(s) != 4 or not s.isdigit():
-        raise ValueError(f"Unrecognized season token: {season!r}")
-    if s == "9900":
-        return 1999
-    if (int(s[:2]) + 1) % 100 == int(s[2:]):
-        return 2000 + int(s[:2])
-    return int(s)
-
-
-def _trino_connect():
-    """Open a Trino connection for the deprecated skip-existing probe."""
-    try:
-        import trino
-        import trino.auth as trino_auth
-    except ImportError as exc:
-        logger.error("trino client unavailable: %s", exc)
-        return None
-
-    user = os.environ.get("TRINO_USER", "airflow")
-    password = os.environ.get("TRINO_PASSWORD")
-    if password:
-        return trino.dbapi.connect(
-            host=os.environ.get("TRINO_HOST", "trino"),
-            port=int(os.environ.get("TRINO_PORT", 8443)),
-            user=user,
-            catalog="iceberg",
-            http_scheme="https",
-            auth=trino_auth.BasicAuthentication(user, password),
-            verify=False,
-        )
-    return trino.dbapi.connect(
-        host=os.environ.get("TRINO_HOST", "trino"),
-        port=int(os.environ.get("TRINO_PORT", 8080)),
-        user=user,
-        catalog="iceberg",
-    )
-
-
-def _completed_schedule_pairs(leagues: List[str], season_strs: List[str]) -> set:
-    """Return legacy schedule scopes that meet both completeness floors."""
-    sched_floor = int(os.environ.get("WHOSCORED_SCHEDULE_MIN_ROWS", "270"))
-    stages_floor = int(os.environ.get("WHOSCORED_STAGES_MIN_ROWS", "1"))
-    conn = _trino_connect()
-    if conn is None:
-        return set()
-    try:
-        cur = conn.cursor()
-        leagues_ph = ", ".join("?" for _ in leagues)
-        seasons_ph = ", ".join("?" for _ in season_strs)
-
-        def _counts(table: str) -> dict:
-            sql = (
-                "SELECT league, season, COUNT(*) "
-                f"FROM iceberg.bronze.{table} "
-                f"WHERE league IN ({leagues_ph}) AND season IN ({seasons_ph}) "
-                "GROUP BY league, season"
-            )
-            cur.execute(sql, (*leagues, *season_strs))
-            return {
-                (row[0], row[1]): row[2]
-                for row in cur.fetchall()
-                if row and row[0] is not None and row[1] is not None
-            }
-
-        schedule = _counts("whoscored_schedule")
-        stages = _counts("whoscored_season_stages")
-        complete = {
-            pair
-            for pair, count in schedule.items()
-            if count >= sched_floor and stages.get(pair, 0) >= stages_floor
-        }
-        logger.info(
-            "legacy skip-existing probe: schedule=%s stages=%s complete=%s",
-            schedule,
-            stages,
-            sorted(complete),
-        )
-        return complete
-    except Exception as exc:
-        logger.warning(
-            "skip-existing probe failed (%s); all requested scopes remain due",
-            exc,
-        )
-        return set()
-    finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
-
-
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Run WhoScored scraper")
-    parser.add_argument("command", nargs="?", choices=COMMANDS)
+    parser = argparse.ArgumentParser(description="Run WhoScored ingestion")
+    parser.add_argument("command", choices=COMMANDS)
     parser.add_argument(
         "--scope",
         action="append",
-        default=[],
+        required=True,
         metavar="COMPETITION=SEASON",
         help=(
             "Canonical scope; repeat for multiple independent scopes, e.g. "
             "--scope 'ENG-Premier League=2526'"
         ),
     )
-
-    # Deprecated compatibility flags.  They are intentionally not used by the
-    # production DAG, but keep old backfill commands operable during rollout.
-    legacy = parser.add_argument_group("deprecated legacy interface")
-    legacy.add_argument("--leagues", default="ENG-Premier League")
-    legacy.add_argument("--seasons", default="")
-    legacy.add_argument("--season", type=int, default=2024)
-    legacy.add_argument("--skip-events", action="store_true")
-    legacy.add_argument("--skip-missing-players", action="store_true")
-    legacy.add_argument("--skip-existing", action="store_true")
-    legacy.add_argument("--events-only", action="store_true")
-    legacy.add_argument("--player-profile", action="store_true")
-    legacy.add_argument("--headless", action="store_true", default=True)
-    legacy.add_argument(
-        "--proxy-file",
-        default="",
-        help=(
-            "Deprecated compatibility option. Empty by default: production "
-            "never silently enables the raw residential proxy list."
-        ),
-    )
-
     parser.add_argument("--max-matches", type=int, default=None)
     parser.add_argument("--limit", type=int, default=None)
-    parser.add_argument(
-        "--flaresolverr-url",
-        default=os.environ.get("FLARESOLVERR_URL", "http://flaresolverr:8191"),
-    )
     parser.add_argument("--output", default="/tmp/whoscored_result.json")
     return parser
 
 
 def _resolve_scopes(
-    parser: argparse.ArgumentParser, args: argparse.Namespace
-) -> tuple[List[RunnerScope], bool]:
-    """Resolve canonical scopes and report whether legacy flags were used."""
-    if args.scope:
-        try:
-            scopes = [RunnerScope.parse(raw) for raw in args.scope]
-        except ValueError as exc:
-            parser.error(str(exc))
-        if len({scope.spec for scope in scopes}) != len(scopes):
-            parser.error("Duplicate --scope values are not allowed")
-        return scopes, False
-
-    if args.command:
-        parser.error(f"the {args.command!r} command requires at least one --scope")
-
-    leagues = [item.strip() for item in args.leagues.split(",") if item.strip()]
-    seasons = _parse_seasons(args)
-    logger.warning(
-        "--leagues/--seasons is deprecated; use a repeatable canonical --scope"
-    )
-
-    scopes: List[RunnerScope] = []
-    for league in leagues:
-        league_seasons = seasons
-        if league == "INT-World Cup":
-            # Preserve the old active-window bridge without mixing its
-            # calendar-year season into club scopes.
-            try:
-                from utils.medallion_config import get_active_season
-
-                active = get_active_season(league)
-            except Exception as exc:
-                logger.warning("Could not resolve World Cup window: %s", exc)
-                active = None
-            if active is None:
-                logger.info("INT-World Cup is outside its configured window")
-                continue
-            league_seasons = [active]
-        for season in league_seasons:
-            season_id = (
-                str(season)
-                if league == "INT-World Cup"
-                else _season_to_bronze_str(season)
-            )
-            scopes.append(RunnerScope(league, season_id))
-    return scopes, True
+    parser: argparse.ArgumentParser, values: Sequence[str]
+) -> list[RunnerScope]:
+    try:
+        scopes = [RunnerScope.parse(raw) for raw in values]
+    except ValueError as exc:
+        parser.error(str(exc))
+    if len({scope.spec for scope in scopes}) != len(scopes):
+        parser.error("Duplicate --scope values are not allowed")
+    return scopes
 
 
-def _resolve_command(args: argparse.Namespace, legacy_mode: bool) -> str:
-    if args.command:
-        return args.command
-    if not legacy_mode:
-        return "all"
-    if args.player_profile:
-        return "profiles"
-    if args.events_only:
-        return "matches"
-    return "legacy" if legacy_mode else "all"
+def _load_runtime() -> tuple[Any, Any]:
+    """Import storage-heavy runtime classes only after CLI validation."""
+    from scrapers.whoscored.catalog import WhoScoredCatalog
+    from scrapers.whoscored.service import WhoScoredIngestService
+
+    return WhoScoredCatalog, WhoScoredIngestService
 
 
-def _new_report(command: str, scopes: Iterable[RunnerScope]) -> dict:
+def _new_report(command: str, scopes: Iterable[RunnerScope]) -> dict[str, Any]:
     started = _utc_now_iso()
     return {
         "schema_version": REPORT_SCHEMA_VERSION,
@@ -342,7 +156,6 @@ def _new_report(command: str, scopes: Iterable[RunnerScope]) -> dict:
         "row_counts_complete": True,
         "errors": [],
         "error_details": [],
-        # Compatibility projections; new consumers should use ``entities``.
         "tables": [],
         "tables_by_entity": {},
         "traffic": {},
@@ -350,18 +163,7 @@ def _new_report(command: str, scopes: Iterable[RunnerScope]) -> dict:
     }
 
 
-def _zero_schedule_traffic() -> dict:
-    return {
-        "fs_response_bytes": 0,
-        "fs_response_mb": 0.0,
-        "requests": 0,
-        "sessions_created": 0,
-        "cf_challenge_failures": 0,
-        "top_traffic_urls": [],
-    }
-
-
-def _scope_record(report: dict, scope: RunnerScope) -> dict:
+def _scope_record(report: Mapping[str, Any], scope: RunnerScope) -> dict[str, Any]:
     return next(item for item in report["scopes"] if item["scope"] == scope.spec)
 
 
@@ -377,8 +179,8 @@ def _is_retryable(exc: BaseException) -> bool:
 
 
 def _record_error(
-    report: dict,
-    scope_record: dict,
+    report: dict[str, Any],
+    scope_record: dict[str, Any],
     scope: RunnerScope,
     entity: str,
     exc: BaseException,
@@ -400,68 +202,81 @@ def _record_error(
         entity,
         scope.spec,
         exc,
-        exc_info=True,
+        exc_info=not isinstance(exc, RetryableWork),
     )
 
 
-def _extract_entity_result(value: Any) -> tuple[Optional[str], Optional[int]]:
-    """Extract a table path/count from both legacy and v2 scraper results."""
-    if isinstance(value, str):
-        return value, None
-    if isinstance(value, Mapping):
-        table = value.get("table") or value.get("path")
-        rows = value.get("rows_written", value.get("rows"))
-        try:
-            rows = int(rows) if rows is not None else None
-        except (TypeError, ValueError):
-            rows = None
-        return table, rows
-    return None, None
+def _table_for_entity(entity: str, tables: Sequence[str]) -> Optional[str]:
+    expected = TABLE_NAME_BY_ENTITY.get(entity)
+    if expected is None:
+        return None
+    return next(
+        (table for table in tables if table.rsplit(".", 1)[-1] == expected),
+        None,
+    )
 
 
-def _merge(
-    report: MutableMapping[str, Any],
-    entity_to_result: Mapping[str, Any],
+def _merge_result(
+    report: dict[str, Any],
+    result: Any,
     *,
-    scope_record: Optional[MutableMapping[str, Any]] = None,
+    scope_record: dict[str, Any],
 ) -> None:
-    """Merge legacy ``{entity: table}`` or v2 entity results into a report."""
-    if not isinstance(entity_to_result, Mapping):
-        return
+    """Merge a typed service result into the stable report-v2 projection."""
+    tables = list(dict.fromkeys(str(table) for table in result.tables))
+    for table in tables:
+        if table not in report["tables"]:
+            report["tables"].append(table)
 
-    # A future service can return a nested v2 result without changing the
-    # runner/report contract.
-    if isinstance(entity_to_result.get("entities"), Mapping):
-        entity_to_result = entity_to_result["entities"]
-
-    for entity, value in entity_to_result.items():
-        table, rows = _extract_entity_result(value)
-        if not table and rows is None:
-            continue
-
+    for entity, raw_rows in result.counts.items():
+        rows = int(raw_rows)
+        table = _table_for_entity(str(entity), tables)
         current = report["entities"].setdefault(
-            entity, {"table": table, "rows_written": 0, "counts_complete": True}
+            str(entity),
+            {"table": table, "rows_written": 0, "counts_complete": True},
         )
         if table:
             current["table"] = table
-            report["tables_by_entity"][entity] = table
-            if table not in report["tables"]:
-                report["tables"].append(table)
-        if rows is None:
-            current["counts_complete"] = False
-            report["row_counts_complete"] = False
-        else:
-            current["rows_written"] += rows
-            report["rows"] += rows
-
-        if scope_record is not None:
-            scope_record["entities"][entity] = {
-                "table": table,
-                "rows_written": rows,
-            }
+            report["tables_by_entity"][str(entity)] = table
+        current["rows_written"] += rows
+        report["rows"] += rows
+        scope_record["entities"][str(entity)] = {
+            "table": table,
+            "rows_written": rows,
+        }
 
 
-def _merge_traffic(target: MutableMapping[str, Any], source: Mapping[str, Any]) -> None:
+def _record_result_state(
+    report: dict[str, Any],
+    scope_record: dict[str, Any],
+    scope: RunnerScope,
+    operation: str,
+    result: Any,
+) -> None:
+    if result.errors:
+        _record_error(
+            report,
+            scope_record,
+            scope,
+            operation,
+            RuntimeError("; ".join(str(item) for item in result.errors)),
+        )
+    elif result.retryable:
+        _record_error(
+            report,
+            scope_record,
+            scope,
+            operation,
+            RetryableWork(
+                f"{result.entity} retryable ids: "
+                + ", ".join(str(item) for item in result.retryable)
+            ),
+        )
+
+
+def _merge_traffic(
+    target: MutableMapping[str, Any], source: Mapping[str, Any]
+) -> None:
     """Add counters recursively while preserving non-additive diagnostics."""
     for key, value in source.items():
         if isinstance(value, Mapping):
@@ -476,80 +291,54 @@ def _merge_traffic(target: MutableMapping[str, Any], source: Mapping[str, Any]) 
             target[key] = value
 
 
-def _operations(command: str, args: argparse.Namespace) -> List[str]:
-    if command == "schedule":
-        return ["schedule", "season_stages"]
-    if command == "previews":
-        return ["missing_players"]
-    if command == "matches":
-        return ["events"]
-    if command == "profiles":
-        return ["player_profile"]
+def _operations(command: str) -> tuple[str, ...]:
     if command == "all":
-        return ["schedule", "missing_players", "season_stages", "events"]
-
-    # Deprecated default path.  Preserve the old flags exactly for one release.
-    operations = ["schedule"]
-    if not args.skip_missing_players:
-        operations.append("missing_players")
-    operations.append("season_stages")
-    if not args.skip_events:
-        operations.append("events")
-    return operations
+        return ("schedule", "previews", "matches")
+    return (command,)
 
 
-def _invoke(scraper: Any, operation: str, args: argparse.Namespace) -> Mapping[str, Any]:
+def _invoke(
+    service: Any,
+    operation: str,
+    args: argparse.Namespace,
+    *,
+    profile_scopes: Optional[Sequence[Any]] = None,
+) -> Any:
     if operation == "schedule":
-        return scraper.scrape_schedule() or {}
-    if operation == "missing_players":
-        return scraper.scrape_missing_players() or {}
-    if operation == "season_stages":
-        return scraper.scrape_season_stages() or {}
-    if operation == "events":
-        return scraper.scrape_events(max_matches=args.max_matches) or {}
-    if operation == "player_profile":
-        return scraper.scrape_player_profile(limit=args.limit) or {}
+        return service.sync_schedule()
+    if operation == "previews":
+        return service.sync_previews()
+    if operation == "matches":
+        return service.sync_matches(limit=args.max_matches)
+    if operation == "profiles":
+        return service.sync_profiles(
+            limit=200 if args.limit is None else args.limit,
+            candidate_scopes=profile_scopes,
+        )
     raise AssertionError(f"Unknown WhoScored operation: {operation}")
 
 
-def _apply_legacy_skip_existing(
-    report: dict,
-    scopes: List[RunnerScope],
-    args: argparse.Namespace,
-    command: str,
-) -> List[RunnerScope]:
-    if not args.skip_existing:
-        return scopes
-    if command != "legacy" or not (args.skip_events and args.skip_missing_players):
-        logger.warning(
-            "--skip-existing is only supported by the deprecated fast schedule path"
-        )
-        return scopes
+def _set_scope_status(scope_record: dict[str, Any]) -> None:
+    errors = scope_record["errors"]
+    if not errors:
+        scope_record["status"] = "success"
+    elif all(error["retryable"] for error in errors):
+        scope_record["status"] = "retryable"
+    else:
+        scope_record["status"] = "failed"
 
-    now = datetime.now()
-    current_start = now.year if now.month >= 8 else now.year - 1
-    past = [scope for scope in scopes if _season_start_year(scope.season_id) < current_start]
-    done = (
-        _completed_schedule_pairs(
-            sorted({scope.competition_id for scope in past}),
-            sorted({scope.season_id for scope in past}),
-        )
-        if past
-        else set()
-    )
-    skipped = [
-        scope for scope in scopes if scope in past and (scope.competition_id, scope.season_id) in done
-    ]
-    if skipped:
-        report["skipped_pairs"] = [
-            [scope.competition_id, scope.season_id] for scope in sorted(skipped)
-        ]
-        skipped_specs = {scope.spec for scope in skipped}
-        for item in report["scopes"]:
-            if item["scope"] in skipped_specs:
-                item["status"] = "up_to_date"
-        logger.info("legacy skip-existing skipped %s", sorted(skipped_specs))
-    return [scope for scope in scopes if scope not in skipped]
+
+def _collect_traffic(
+    report: dict[str, Any], scope: RunnerScope, service: Any
+) -> None:
+    try:
+        traffic = service.traffic_stats() or {}
+    except Exception as exc:
+        logger.warning("traffic_stats failed for %s: %s", scope.spec, exc)
+        traffic = {}
+    report["traffic_by_scope"][scope.spec] = traffic
+    if isinstance(traffic, Mapping):
+        _merge_traffic(report["traffic"], traffic)
 
 
 def _write_report(path: str, report: Mapping[str, Any]) -> None:
@@ -558,6 +347,10 @@ def _write_report(path: str, report: Mapping[str, Any]) -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
     fd, temporary = tempfile.mkstemp(prefix=f".{output.name}.", dir=str(output.parent))
     try:
+        # mkstemp intentionally starts at 0600. Reports contain operational
+        # metadata, not secrets, and must also be readable by the shared
+        # root-group on the host/Airflow log volume.
+        os.fchmod(fd, 0o640)
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             json.dump(report, handle, ensure_ascii=False, sort_keys=True)
             handle.flush()
@@ -571,97 +364,7 @@ def _write_report(path: str, report: Mapping[str, Any]) -> None:
         raise
 
 
-def main(argv: Optional[List[str]] = None) -> int:
-    parser = _build_parser()
-    args = parser.parse_args(argv)
-    scopes, legacy_mode = _resolve_scopes(parser, args)
-    command = _resolve_command(args, legacy_mode)
-    report = _new_report(command, scopes)
-
-    scopes_to_run = _apply_legacy_skip_existing(report, scopes, args, command)
-    if not scopes_to_run:
-        report["status"] = "up_to_date" if scopes else "out_of_window"
-        if scopes:
-            report["skip_existing"] = True
-        report["traffic"] = {
-            "events": {},
-            "schedule": _zero_schedule_traffic(),
-        }
-        report["finished_at"] = _utc_now_iso()
-        _write_report(args.output, report)
-        print(json.dumps(report, ensure_ascii=False))
-        return 0
-
-    operations = _operations(command, args)
-    logger.info(
-        "Starting WhoScored v2 runner: command=%s scopes=%s operations=%s",
-        command,
-        [scope.spec for scope in scopes_to_run],
-        operations,
-    )
-
-    try:
-        # Lazy import keeps --help/report parsing free of browser dependencies.
-        from scrapers.whoscored import WhoScoredScraper
-    except Exception as exc:
-        for scope in scopes_to_run:
-            scope_record = _scope_record(report, scope)
-            _record_error(
-                report,
-                scope_record,
-                scope,
-                "scraper_import",
-                exc,
-            )
-            scope_record["status"] = "failed"
-        report["status"] = "failed"
-        report["finished_at"] = _utc_now_iso()
-        _write_report(args.output, report)
-        return 1
-
-    for scope in scopes_to_run:
-        scope_record = _scope_record(report, scope)
-        scope_record["status"] = "running"
-        try:
-            with WhoScoredScraper(
-                leagues=[scope.competition_id],
-                seasons=[int(scope.season_id)],
-                headless=args.headless,
-                proxy_file=args.proxy_file,
-                flaresolverr_url=args.flaresolverr_url,
-                use_v2=not legacy_mode,
-            ) as scraper:
-                for operation in operations:
-                    try:
-                        result = _invoke(scraper, operation, args)
-                        _merge(report, result, scope_record=scope_record)
-                    except Exception as exc:
-                        _record_error(
-                            report, scope_record, scope, operation, exc
-                        )
-
-                try:
-                    traffic = scraper.get_traffic_stats() or {}
-                except Exception as exc:
-                    logger.warning(
-                        "get_traffic_stats failed for %s: %s", scope.spec, exc
-                    )
-                    traffic = {}
-                report["traffic_by_scope"][scope.spec] = traffic
-                if isinstance(traffic, Mapping):
-                    _merge_traffic(report["traffic"], traffic)
-        except Exception as exc:
-            _record_error(report, scope_record, scope, "scraper", exc)
-
-        if scope_record["errors"]:
-            scope_record["status"] = (
-                "retryable"
-                if all(error["retryable"] for error in scope_record["errors"])
-                else "failed"
-            )
-        else:
-            scope_record["status"] = "success"
-
+def _finish(report: dict[str, Any], output: str) -> int:
     retryable_errors = [
         item for item in report["error_details"] if item["retryable"]
     ]
@@ -677,20 +380,121 @@ def main(argv: Optional[List[str]] = None) -> int:
     else:
         report["status"] = "success"
         exit_code = 0
-
     report["finished_at"] = _utc_now_iso()
-    _write_report(args.output, report)
+    _write_report(output, report)
     logger.info(
-        "WhoScored run complete: status=%s scopes=%d rows=%d "
-        "row_counts_complete=%s errors=%d",
+        "WhoScored run complete: status=%s scopes=%d rows=%d errors=%d",
         report["status"],
-        len(scopes_to_run),
+        len(report["scopes"]),
         report["rows"],
-        report["row_counts_complete"],
         len(report["errors"]),
     )
     print(json.dumps(report, ensure_ascii=False))
     return exit_code
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    parser = _build_parser()
+    args = parser.parse_args(argv)
+    scopes = _resolve_scopes(parser, args.scope)
+    report = _new_report(args.command, scopes)
+
+    try:
+        catalog_cls, service_cls = _load_runtime()
+        catalog = catalog_cls.from_file()
+    except Exception as exc:
+        for scope in scopes:
+            record = _scope_record(report, scope)
+            _record_error(report, record, scope, "runtime", exc)
+            _set_scope_status(record)
+        return _finish(report, args.output)
+
+    resolved: list[tuple[RunnerScope, Any]] = []
+    for scope in scopes:
+        record = _scope_record(report, scope)
+        try:
+            catalog_scope = catalog.resolve_scope(
+                scope.competition_id, scope.season_id
+            )
+            competition = catalog.competition(scope.competition_id)
+            if not competition.whoscored_enabled:
+                raise ValueError(
+                    f"WhoScored is not enabled for {scope.competition_id}"
+                )
+            resolved.append((scope, catalog_scope))
+        except Exception as exc:
+            _record_error(report, record, scope, "scope", exc)
+            _set_scope_status(record)
+
+    logger.info(
+        "Starting WhoScored runner: command=%s scopes=%s operations=%s",
+        args.command,
+        [scope.spec for scope, _ in resolved],
+        _operations(args.command),
+    )
+
+    if args.command == "profiles" and len(resolved) != len(scopes):
+        # A profile run has one global candidate union and one global budget.
+        # Running a subset after one selector failed validation would silently
+        # change that population, so every otherwise-valid selector fails with
+        # the same run instead of remaining in a misleading pending state.
+        for selected_scope, _ in resolved:
+            selected_record = _scope_record(report, selected_scope)
+            selected_record["status"] = "failed"
+            selected_record["blocked_by_scope_validation"] = True
+    elif args.command == "profiles" and resolved:
+        owner, owner_catalog_scope = resolved[0]
+        owner_record = _scope_record(report, owner)
+        owner_record["status"] = "running"
+        try:
+            with service_cls(owner_catalog_scope, catalog=catalog) as service:
+                result = _invoke(
+                    service,
+                    "profiles",
+                    args,
+                    profile_scopes=[item[1] for item in resolved],
+                )
+                _merge_result(report, result, scope_record=owner_record)
+                _record_result_state(
+                    report, owner_record, owner, "player_profile", result
+                )
+                _collect_traffic(report, owner, service)
+        except Exception as exc:
+            _record_error(report, owner_record, owner, "profiles", exc)
+        _set_scope_status(owner_record)
+        for selected_scope, _ in resolved[1:]:
+            selected_record = _scope_record(report, selected_scope)
+            selected_record["status"] = owner_record["status"]
+            selected_record["delegated_to"] = owner.spec
+    elif args.command != "profiles":
+        for scope, catalog_scope in resolved:
+            scope_record = _scope_record(report, scope)
+            scope_record["status"] = "running"
+            try:
+                with service_cls(catalog_scope, catalog=catalog) as service:
+                    for operation in _operations(args.command):
+                        try:
+                            result = _invoke(service, operation, args)
+                            _merge_result(
+                                report, result, scope_record=scope_record
+                            )
+                            _record_result_state(
+                                report,
+                                scope_record,
+                                scope,
+                                operation,
+                                result,
+                            )
+                        except Exception as exc:
+                            _record_error(
+                                report, scope_record, scope, operation, exc
+                            )
+                    _collect_traffic(report, scope, service)
+            except Exception as exc:
+                _record_error(report, scope_record, scope, "service", exc)
+            _set_scope_status(scope_record)
+
+    return _finish(report, args.output)
 
 
 if __name__ == "__main__":

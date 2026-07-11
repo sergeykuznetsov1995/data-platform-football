@@ -9,9 +9,9 @@ Provides:
 - Delays between tests to respect rate limits
 """
 
+import importlib.util
 import socket
 import time
-from typing import Optional
 
 import pytest
 
@@ -23,11 +23,7 @@ import pytest
 @pytest.fixture(scope="session")
 def soccerdata_available() -> bool:
     """Check if soccerdata library is installed."""
-    try:
-        import soccerdata
-        return True
-    except ImportError:
-        return False
+    return importlib.util.find_spec("soccerdata") is not None
 
 
 @pytest.fixture
@@ -325,25 +321,6 @@ def sofifa_scraper_with_tor(soccerdata_available, tor_available, minimal_version
 # =============================================================================
 # Selenium Fixtures
 # =============================================================================
-
-@pytest.fixture
-def whoscored_scraper(soccerdata_available, undetected_chrome_available, minimal_leagues, minimal_seasons):
-    """WhoScored scraper with Selenium."""
-    if not soccerdata_available:
-        pytest.skip("soccerdata library not installed")
-    if not undetected_chrome_available:
-        pytest.skip("undetected-chromedriver not available")
-
-    from scrapers.whoscored import WhoScoredScraper
-
-    scraper = WhoScoredScraper(
-        leagues=minimal_leagues,
-        seasons=minimal_seasons,
-        headless=True,  # Use headless for CI
-    )
-    yield scraper
-    scraper.close()
-
 
 @pytest.fixture
 def cloudflare_bypass(undetected_chrome_available):

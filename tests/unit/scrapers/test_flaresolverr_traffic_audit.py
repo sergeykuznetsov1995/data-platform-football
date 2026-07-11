@@ -241,41 +241,7 @@ class TestGetTrafficStatsShape:
 
 
 class TestScraperTrafficSurface:
-    """Scrapers expose get_traffic_stats() so the runners / bench can surface
-    the audit. WhoScored reports its two FS sessions separately; SoFIFA has one.
-    Methods are pass-throughs, so we call them unbound with a fake ``self`` to
-    avoid constructing the Trino-backed base scraper."""
-
-    @pytest.mark.unit
-    def test_whoscored_merges_events_and_schedule(self):
-        from types import SimpleNamespace
-        from scrapers.whoscored.scraper import WhoScoredScraper
-
-        reader = SimpleNamespace(
-            _fs_client=SimpleNamespace(
-                get_traffic_stats=lambda: {"requests": 12, "fs_response_mb": 0.5}
-            )
-        )
-        fake = SimpleNamespace(
-            _last_events_traffic={"requests": 30, "fs_response_mb": 2.0},
-            _reader=reader,
-        )
-
-        out = WhoScoredScraper.get_traffic_stats(fake)
-
-        assert out["events"] == {"requests": 30, "fs_response_mb": 2.0}
-        assert out["schedule"] == {"requests": 12, "fs_response_mb": 0.5}
-
-    @pytest.mark.unit
-    def test_whoscored_no_reader_no_events_is_empty(self):
-        from types import SimpleNamespace
-        from scrapers.whoscored.scraper import WhoScoredScraper
-
-        fake = SimpleNamespace(_last_events_traffic=None, _reader=None)
-
-        out = WhoScoredScraper.get_traffic_stats(fake)
-
-        assert out == {"events": {}, "schedule": {}}
+    """SoFIFA exposes its FlareSolverr client counters to its runner/bench."""
 
     @pytest.mark.unit
     def test_sofifa_returns_reader_client_stats(self):

@@ -4,11 +4,10 @@
 table:
   fullyQualifiedName: trino_iceberg.iceberg.bronze.whoscored_season_stages
   description: |
-    Справочник стадий турнира из WhoScored (soccerdata
-    WhoScored.read_season_stages через FlareSolverr). Очень маленькая таблица
-    (~6 строк) — различает кубковые стадии и обычный лиговый формат, несёт
-    region/league/season/stage идентификаторы WhoScored. Партиционирование
-    ['league','season'].
+    Справочник стадий турнира из WhoScored, разобранный parser v2 из сохранённой
+    raw-копии season page. Очень маленькая таблица (~6 строк): различает
+    кубковые стадии и лиговый формат, несёт region/tournament/season/stage
+    идентификаторы WhoScored. Партиционирование ['league','season'].
   tags:
     - Tier.Bronze
     - Domain.Football

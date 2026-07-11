@@ -53,6 +53,7 @@ def _get_trino_connection(
     host: str = None,
     port: int = None,
     catalog: str = 'iceberg',
+    session_properties: Optional[Dict[str, str]] = None,
 ) -> trino_lib.dbapi.Connection:
     """Create a Trino DBAPI connection.
 
@@ -71,7 +72,9 @@ def _get_trino_connection(
     # on gold.fct_team_season_stats_audit reading silver.xref_team). DF is a pure
     # optimization, so disabling it preserves correctness — the only cost is
     # un-pruned probe-side scans on these batch-sized transforms.
-    session_properties = {'enable_dynamic_filtering': 'false'}
+    effective_session_properties = {'enable_dynamic_filtering': 'false'}
+    if session_properties:
+        effective_session_properties.update(session_properties)
 
     if password:
         port = port or int(os.environ.get('TRINO_PORT', 8443))
@@ -83,7 +86,7 @@ def _get_trino_connection(
             http_scheme='https',
             auth=trino_lib.auth.BasicAuthentication(user, password),
             verify=False,
-            session_properties=session_properties,
+            session_properties=effective_session_properties,
         )
 
     port = port or int(os.environ.get('TRINO_PORT', 8080))
@@ -93,7 +96,7 @@ def _get_trino_connection(
         port=port,
         user=user,
         catalog=catalog,
-        session_properties=session_properties,
+        session_properties=effective_session_properties,
     )
 
 
@@ -316,6 +319,326 @@ def run_silver_transform(
     return result
 
 
+_PARTITION_STAGED_SESSION_PROPERTIES = {
+    # Bound full-corpus Iceberg writer fan-out. These Trino 479 session
+    # properties were verified through SHOW SESSION in the runtime image.
+    'task_concurrency': '4',
+    'task_max_writer_count': '4',
+    'scale_writers': 'false',
+    'min_hash_partition_count_for_write': '4',
+    'redistribute_writes': 'false',
+}
+
+
+def run_silver_transform_partition_staged(
+    sql_file: str,
+    table_name: str,
+    source_table: str,
+    source_version_sql: str,
+    schema: str = 'silver',
+    catalog: str = 'iceberg',
+    partition_columns: Optional[List[str]] = None,
+    trino_host: str = None,
+    trino_port: int = None,
+    add_timestamp: bool = True,
+) -> Dict[str, Any]:
+    """Atomically rebuild a large transform through bounded partition inserts.
+
+    Some SELECTs legitimately contain a window whose semantic partition is
+    ``(league, season, game_id)``.  Running such a window over the complete
+    28M-row corpus can exceed the coordinator heap even though each match is
+    small.  This runner keeps the live table untouched while it:
+
+      1. clears any failed-run staging residue;
+      2. captures the source's complete, ordered logical commit set, then
+         discovers and counts concrete ``(league, season)`` scopes;
+      3. creates an empty stage and evaluates the SELECT once per scope;
+      4. captures the commit set again, then proves exact source-version and
+         staging/source row-count parity;
+      5. atomically replaces the live table from the already materialised stage.
+
+    The original SELECT must include every ``partition_columns`` value in its
+    window ``PARTITION BY`` keys.  That makes the outer scope predicate safe to
+    push below the window; callers protect this requirement with SQL-shape
+    tests.  The final replace is a streaming Iceberg scan/write with no window.
+
+    ``source_version_sql`` is mandatory and must be a read-only SELECT with a
+    deterministic top-level ORDER BY. Its full result set is compared before
+    and after the partition inserts. A count or hash is deliberately
+    insufficient: replacing one manifest batch with another can preserve the
+    source row count while producing a mixed-snapshot stage.
+
+    The runner is intentionally single-writer: its deterministic stage name
+    lets a retry clean residue even when a JVM OOM prevented in-process cleanup.
+    ``dag_transform_e3`` enforces this with ``max_active_runs=1``. A failure
+    before the final ``CREATE OR REPLACE`` drops only the staging table; the
+    existing live table is never dropped. Unlike
+    :func:`run_silver_transform`, this safety-oriented path deliberately does
+    not auto-heal positional schema drift by dropping the live table.
+    """
+    if partition_columns is None:
+        partition_columns = ['league', 'season']
+    if not partition_columns:
+        raise ValueError("partition_columns must be non-empty for staged rebuild")
+
+    _validate_identifier(catalog, "catalog")
+    _validate_identifier(schema, "schema")
+    _validate_identifier(table_name, "table")
+    for column in partition_columns:
+        _validate_identifier(column, "partition column")
+
+    source_parts = source_table.split('.')
+    if len(source_parts) != 3:
+        raise ValueError(
+            "source_table must be a three-part catalog.schema.table name, "
+            f"got {source_table!r}"
+        )
+    source_qualified = '.'.join(
+        _validate_identifier(part, "source table component")
+        for part in source_parts
+    )
+
+    if not isinstance(source_version_sql, str) or not source_version_sql.strip():
+        raise ValueError("source_version_sql must be a non-empty ordered SELECT")
+    source_version_sql = source_version_sql.strip()
+    if source_version_sql.endswith(';'):
+        source_version_sql = source_version_sql[:-1].rstrip()
+    if ';' in source_version_sql:
+        raise ValueError("source_version_sql must contain exactly one statement")
+    if not re.match(r'^(?:SELECT|WITH)\b', source_version_sql, re.IGNORECASE):
+        raise ValueError("source_version_sql must be a read-only SELECT")
+    if not re.search(r'\bORDER\s+BY\b', source_version_sql, re.IGNORECASE):
+        raise ValueError("source_version_sql must have a deterministic ORDER BY")
+
+    sql_path = _resolve_sql_path(sql_file)
+    select_sql = sql_path.read_text(encoding='utf-8').strip()
+    if not select_sql:
+        raise ValueError(f"SQL file is empty: {sql_path}")
+    if select_sql.endswith(';'):
+        select_sql = select_sql[:-1].rstrip()
+
+    full_table = f"{catalog}.{schema}.{table_name}"
+    staging_name = f"{table_name}_stage"
+    _validate_identifier(staging_name, "staging table")
+    staging_table = f"{catalog}.{schema}.{staging_name}"
+    partition_clause = ''
+    if partition_columns:
+        cols = ", ".join(f"'{column}'" for column in partition_columns)
+        partition_clause = f"WITH (partitioning = ARRAY[{cols}])\n"
+
+    result: Dict[str, Any] = {
+        'table': full_table,
+        'rows': 0,
+        'source_rows': 0,
+        'partitions': 0,
+        'status': 'pending',
+        'error': None,
+    }
+    conn = _get_trino_connection(
+        host=trino_host,
+        port=trino_port,
+        catalog=catalog,
+        session_properties=_PARTITION_STAGED_SESSION_PROPERTIES,
+    )
+    staging_created = False
+    try:
+        _execute(conn, f"CREATE SCHEMA IF NOT EXISTS {catalog}.{schema}")
+        # A coordinator JVM OOM can outlive both the work connection and the
+        # immediate reconnect attempt in finally. Because this runner is
+        # single-writer, every retry can safely reclaim that deterministic
+        # residue before doing any expensive source work.
+        _execute(conn, f"DROP TABLE IF EXISTS {staging_table}")
+
+        source_version_before = tuple(
+            _execute(
+                conn,
+                source_version_sql,
+                fetch=True,
+            ) or []
+        )
+        if not source_version_before:
+            raise RuntimeError(
+                f"source version query returned no rows for {source_qualified}"
+            )
+
+        partition_select = ', '.join(partition_columns)
+        grouped_scopes = _execute(
+            conn,
+            f"SELECT {partition_select}, COUNT(*) AS __row_count "
+            f"FROM {source_qualified} "
+            f"GROUP BY {partition_select} "
+            + f" ORDER BY {', '.join(str(i) for i in range(1, len(partition_columns) + 1))}",
+            fetch=True,
+        )
+        if not grouped_scopes:
+            raise RuntimeError(f"partition source is empty: {source_qualified}")
+        null_scopes = [
+            row for row in grouped_scopes
+            if any(value is None for value in row[:len(partition_columns)])
+        ]
+        if null_scopes:
+            raise RuntimeError(
+                f"partition source contains NULL scope values: {source_qualified}"
+            )
+        scopes = [row[:len(partition_columns)] for row in grouped_scopes]
+        source_rows = sum(int(row[len(partition_columns)]) for row in grouped_scopes)
+        if source_rows <= 0:
+            raise RuntimeError(f"partition source is empty: {source_qualified}")
+        result['source_rows'] = source_rows
+        result['partitions'] = len(scopes)
+
+        empty_select = f"SELECT * FROM (\n{select_sql}\n) AS __src WHERE FALSE"
+        # Mark before execution: if Trino commits CREATE but the client loses
+        # the response, DROP IF EXISTS in finally still cleans up this stage on
+        # reconnect-capable failures.
+        staging_created = True
+        _execute(
+            conn,
+            f"CREATE TABLE {staging_table}\n{partition_clause}AS\n{empty_select}",
+        )
+
+        keys = list(partition_columns)
+        for scope in scopes:
+            values = [str(value) for value in scope]
+            partition_filter = _build_silver_partition_filter(keys, values)
+            insert_select = (
+                f"SELECT * FROM (\n{select_sql}\n) AS __src "
+                f"WHERE {partition_filter}"
+            )
+            logger.info(
+                "Staged partition for %s: %s",
+                full_table,
+                partition_filter,
+            )
+            _execute(conn, f"INSERT INTO {staging_table}\n{insert_select}")
+
+        staging_count_rows = _execute(
+            conn,
+            f"SELECT COUNT(*) FROM {staging_table}",
+            fetch=True,
+        )
+        staging_rows = int(staging_count_rows[0][0]) if staging_count_rows else 0
+
+        # Each scope is a separate statement and therefore can see a newer
+        # Iceberg snapshot. Fail closed if ingestion changed the current view
+        # during the rebuild instead of publishing a mixed-snapshot Silver.
+        final_source_count_rows = _execute(
+            conn,
+            f"SELECT COUNT(*) FROM {source_qualified}",
+            fetch=True,
+        )
+        final_source_rows = (
+            int(final_source_count_rows[0][0])
+            if final_source_count_rows else 0
+        )
+        # Read the logical version last, immediately before the fail-closed
+        # checks and live replacement, to minimise the unguarded publish window.
+        source_version_after = tuple(
+            _execute(
+                conn,
+                source_version_sql,
+                fetch=True,
+            ) or []
+        )
+        if final_source_rows != source_rows:
+            raise RuntimeError(
+                f"source changed during staged rebuild for {full_table}: "
+                f"before={source_rows}, after={final_source_rows}"
+            )
+        if staging_rows != final_source_rows:
+            raise RuntimeError(
+                f"staged row parity failed for {full_table}: "
+                f"source={final_source_rows}, staged={staging_rows}"
+            )
+        if source_version_after != source_version_before:
+            raise RuntimeError(
+                f"source version changed during staged rebuild for {full_table}: "
+                f"before_rows={len(source_version_before)}, "
+                f"after_rows={len(source_version_after)}"
+            )
+
+        # Add the lineage timestamp once, during the final streaming copy. This
+        # preserves the single-CTAS contract (one timestamp for the rebuild)
+        # rather than assigning a different value to every staged scope.
+        if add_timestamp:
+            final_select = (
+                "SELECT *, CURRENT_TIMESTAMP AS _silver_created_at "
+                f"FROM {staging_table}"
+            )
+        else:
+            final_select = f"SELECT * FROM {staging_table}"
+        replace_sql = (
+            f"CREATE OR REPLACE TABLE {full_table}\n"
+            f"{partition_clause}AS\n{final_select}"
+        )
+        _execute(conn, replace_sql)
+
+        live_count_rows = _execute(
+            conn,
+            f"SELECT COUNT(*) FROM {full_table}",
+            fetch=True,
+        )
+        live_rows = int(live_count_rows[0][0]) if live_count_rows else 0
+        if live_rows != source_rows:
+            raise RuntimeError(
+                f"live row parity failed for {full_table}: "
+                f"source={source_rows}, live={live_rows}"
+            )
+
+        result['rows'] = live_rows
+        result['status'] = 'success'
+        logger.info(
+            "Partition-staged transform complete: %s => %d rows across %d scopes",
+            full_table,
+            live_rows,
+            len(scopes),
+        )
+    except Exception as exc:
+        result['status'] = 'failed'
+        result['error'] = str(exc)
+        logger.error("Partition-staged transform FAILED for %s: %s", full_table, exc)
+        raise RuntimeError(
+            f"Partition-staged transform failed for {full_table}: {exc}"
+        ) from exc
+    finally:
+        if staging_created:
+            try:
+                _execute(conn, f"DROP TABLE IF EXISTS {staging_table}")
+            except Exception as cleanup_exc:
+                # The query that failed may also have invalidated its DBAPI
+                # connection. Retry cleanup once through a fresh connection so
+                # an ordinary transport failure does not leave stage residue.
+                logger.warning(
+                    "Staging cleanup failed on the work connection for %s; "
+                    "retrying through a fresh connection: %s",
+                    staging_table,
+                    cleanup_exc,
+                )
+                cleanup_conn = None
+                try:
+                    cleanup_conn = _get_trino_connection(
+                        host=trino_host,
+                        port=trino_port,
+                        catalog=catalog,
+                        session_properties=_PARTITION_STAGED_SESSION_PROPERTIES,
+                    )
+                    _execute(
+                        cleanup_conn,
+                        f"DROP TABLE IF EXISTS {staging_table}",
+                    )
+                except Exception:
+                    logger.exception(
+                        "Could not drop staging table %s through a fresh connection",
+                        staging_table,
+                    )
+                finally:
+                    if cleanup_conn is not None:
+                        cleanup_conn.close()
+        conn.close()
+
+    return result
+
+
 # ---------------------------------------------------------------------------
 # E3.5: per-partition INSERT runner for Silver (wrapper-style)
 # ---------------------------------------------------------------------------
@@ -325,8 +648,8 @@ def run_silver_transform(
 # Mirrors ``gold_tasks.run_gold_partition_insert_wrapped`` but for Silver tables.
 # Used by ``dag_e3_backfill`` to materialise a single (season, league) slice
 # of ``silver.whoscored_events_spadl`` and ``silver.espn_lineup`` without
-# touching other partitions (production E3 DAG keeps using the DROP+CTAS
-# ``run_silver_transform`` for full rebuilds).
+# touching other partitions. Full rebuild strategy is configured separately
+# by the production E3 DAG; SPADL uses the bounded staged runner above.
 #
 # Two engines are offered:
 #   * ``run_silver_partition_insert``           (this function) — *wrapper*
@@ -419,7 +742,7 @@ def run_silver_partition_insert(
     Flow:
       1. CREATE SCHEMA IF NOT EXISTS — idempotent.
       2. If target table doesn't exist yet, fall back to
-         :func:`run_silver_transform` to bootstrap it (DROP+CTAS for the
+         :func:`run_silver_transform` to bootstrap it (atomic CTAS for the
          partition only — produces a single-partition table that subsequent
          partition-runs append to).
       3. DELETE FROM <table> WHERE <partition_filter>  — idempotency.

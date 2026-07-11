@@ -33,7 +33,7 @@
 --   (а) FBref убрал PKwon/PKcon с сезона 2025/26 → у diff'а нет FBref-baseline
 --       (audit-конвенция = FBref − <source>); для текущего сезона он был бы вакуумным;
 --   (б) audit спроектирован дешёвым (Silver-only) и намеренно НЕ сканирует
---       bronze.whoscored_events (именно его читает ws_penalties в main-файле).
+--       silver.whoscored_events_spadl (его читает ws_penalties в main-файле).
 -- ⚠️ Синхронизировать вручную с fct_team_season_stats.sql.
 --
 -- #556: остаётся inline .sql (НЕ мигрирован на source_priority.yaml) — per-source

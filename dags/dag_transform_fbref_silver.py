@@ -93,7 +93,8 @@ SILVER_TRANSFORMS = [
         'fbref_team_season_profile',
     ),
     # E5: WhoScored confirmed-absences feed (per-match player unavailability).
-    # Reads bronze.whoscored_missing_players + bronze.whoscored_schedule.
+    # Reads manifest-filtered bronze.whoscored_missing_players_current plus
+    # bronze.whoscored_schedule.
     # Optional Bronze — see OPTIONAL_BRONZE_TABLES below.
     (
         'whoscored_player_unavailable',
@@ -137,7 +138,7 @@ OPTIONAL_BRONZE_TABLES = {
     # E5: WhoScored ingest is paused on some deployments (see
     # project_whoscored_cloudflare.md) — Silver must skip gracefully when the
     # Bronze source is absent rather than failing the whole DAG.
-    'whoscored_player_unavailable': 'whoscored_missing_players',
+    'whoscored_player_unavailable': 'whoscored_missing_players_current',
     # issue #613: combined_match_data may not have populated officials yet on
     # some deployments — skip the Silver transform gracefully if absent.
     'fbref_match_officials': 'fbref_match_officials',
@@ -369,7 +370,7 @@ def _validate_silver_quality(**context) -> Dict[str, Any]:
     else:
         logger.warning(
             "silver.whoscored_player_unavailable not found — skipping E5 DQ "
-            "checks (Bronze whoscored_missing_players likely paused)."
+            "checks (Bronze whoscored_missing_players_current likely unavailable)."
         )
 
     # issue #613: FBref officials is optional Bronze (combined_match_data may
@@ -460,7 +461,7 @@ with DAG(
     | `fbref_match_events` | Detailed match events | match_events |
     | `fbref_match_lineups` | Detailed lineup entries | lineups |
     | `fbref_shot_events` | Per-shot xG data (optional) | shot_events |
-    | `whoscored_player_unavailable` | Confirmed player absences per match (optional) | whoscored_missing_players |
+    | `whoscored_player_unavailable` | Confirmed player absences per match (optional) | whoscored_missing_players_current |
 
     ### Transformations Applied
 

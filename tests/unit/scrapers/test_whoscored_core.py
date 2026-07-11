@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import gzip
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -65,7 +66,10 @@ class TestCanonicalScopes:
                         "seasons": [{"id": 2526, "start": "2025-08-15"}],
                         "sources": {
                             "fallback": ["whoscored"],
-                            "whoscored": {"region_id": 252, "league_id": 2},
+                            "whoscored": {
+                                "region_id": 252,
+                                "tournament_id": 2,
+                            },
                         },
                     },
                     {
@@ -399,4 +403,60 @@ class TestRawStore:
         record = store.store_text(target, "<html>x</html>")
         store._write_bytes(record.blob_key, b"not-gzip")
         with pytest.raises(RawObjectCorrupt):
+            store.load_bytes(target)
+        assert not store.is_fresh(target, max_age=timedelta(hours=6))
+
+    def test_freshness_normalizes_timezone_offsets_and_expires_once(self, tmp_path):
+        store = self._store(tmp_path)
+        target = match_page_target(2)
+        store.store_text(
+            target,
+            "<html>x</html>",
+            fetched_at="2026-07-11T08:00:00+02:00",
+        )
+
+        assert store.is_fresh(
+            target,
+            max_age=timedelta(hours=1),
+            now=datetime(2026, 7, 11, 6, 30, tzinfo=timezone.utc),
+        )
+        assert not store.is_fresh(
+            target,
+            max_age=timedelta(hours=1),
+            now=datetime(
+                2026,
+                7,
+                11,
+                9,
+                1,
+                tzinfo=timezone(timedelta(hours=2)),
+            ),
+        )
+        with pytest.raises(ValueError, match="timezone-aware"):
+            store.is_fresh(
+                target,
+                max_age=timedelta(hours=1),
+                now=datetime(2026, 7, 11, 6, 30),
+            )
+
+    def test_freshness_fails_closed_for_corrupt_manifest_metadata(self, tmp_path):
+        store = self._store(tmp_path)
+        target = match_page_target(3)
+        store.store_text(target, "<html>x</html>")
+        manifest_key = store._target_manifest_key(target)
+        manifest = store._read_json(manifest_key)
+        manifest["fetched_at"] = "not-a-timestamp"
+        store._write_json(manifest_key, manifest)
+
+        assert not store.is_fresh(target, max_age=timedelta(hours=6))
+
+        store._write_bytes(manifest_key, b"{not-json")
+        assert not store.is_fresh(target, max_age=timedelta(hours=6))
+
+        store.store_text(target, "<html>x</html>")
+        manifest = store._read_json(manifest_key)
+        manifest["blob_key"] = "../outside.raw.gz"
+        store._write_json(manifest_key, manifest)
+        assert not store.is_fresh(target, max_age=timedelta(hours=6))
+        with pytest.raises(RawObjectCorrupt, match="blob identity"):
             store.load_bytes(target)

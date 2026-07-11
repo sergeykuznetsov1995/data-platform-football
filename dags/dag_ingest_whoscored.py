@@ -15,7 +15,6 @@ the committed lineup roster; it never repeats the old daily full-roster crawl.
 from __future__ import annotations
 
 import logging
-import os
 from datetime import datetime, timedelta
 from typing import Any, Dict, List
 
@@ -26,7 +25,7 @@ from airflow.operators.python import PythonOperator
 
 from utils.bronze_validation import bronze_count, validate_table
 from utils.config import DAG_TAGS, SCHEDULES, WHOSCORED_LEAGUES
-from utils.default_args import SELENIUM_ARGS
+from utils.default_args import SCRAPER_ARGS
 from utils.ingest_helpers import league_slug as _league_slug
 from utils.medallion_config import (
     get_active_season,
@@ -78,39 +77,18 @@ def _active_scope_specs() -> List[str]:
 ACTIVE_WHOSCORED_SCOPES = _active_scope_specs()
 
 
-def _whoscored_raw_store_uri() -> str:
-    """Resolve a raw-store URI even in Airflow containers not yet recreated.
-
-    During the rolling v2 deployment an already-running scheduler has the
-    long-standing FBref raw-store variable but not necessarily the new
-    WhoScored variable.  Both stores are siblings under the same raw prefix,
-    so deriving the latter avoids making the first post-deploy task depend on
-    a scheduler restart.
-    """
-    configured = os.environ.get("WHOSCORED_RAW_STORE_URI", "").strip()
-    if configured:
-        return configured
-    # ``football`` is the checked-in Lakekeeper/Trino warehouse name.  The
-    # fallback is only for rolling deployment of containers created before
-    # either raw-store variable existed; recreated containers receive the
-    # interpolated value from compose.
-    fbref_uri = os.environ.get(
-        "FBREF_RAW_STORE_URI", "s3://football/raw/fbref"
-    ).strip().rstrip("/")
-    prefix, separator, _ = fbref_uri.rpartition("/")
-    if not separator:
-        raise ValueError("FBREF_RAW_STORE_URI must contain a path component")
-    return f"{prefix}/whoscored"
-
-
-# Transport retries are explicit and bounded inside the scraper.  One Airflow
-# retry remains for infrastructure/storage failures; raw-first persistence
-# makes a retry network-free once a payload has been captured.
+# Transport retries/backoff are explicit and persisted in source manifests.
+# An Airflow retry before ``retry_after`` would see zero due candidates and
+# incorrectly turn the original retryable exit into a green task, so the next
+# scheduled/manual DagRun owns recovery. Captured raw remains network-free.
 WHOSCORED_ARGS = {
-    **SELENIUM_ARGS,
+    **{
+        key: value
+        for key, value in SCRAPER_ARGS.items()
+        if key not in {"retries", "retry_delay"}
+    },
     "execution_timeout": timedelta(hours=2),
-    "retries": 1,
-    "retry_delay": timedelta(minutes=30),
+    "retries": 0,
 }
 
 
@@ -132,8 +110,8 @@ def validate_events(**_context) -> Dict[str, Any]:
     return validate_table("whoscored_events_current", "whoscored_events")
 
 
-def _validate_nonempty_bronze(table_name: str) -> Dict[str, Any]:
-    """Mandatory presence guard for new v2 tables without global row floors."""
+def _validate_bronze_available(table_name: str) -> Dict[str, Any]:
+    """Fail closed when a required V2 table/view is unavailable."""
     try:
         rows = bronze_count(table_name)
     except Exception as exc:
@@ -141,11 +119,19 @@ def _validate_nonempty_bronze(table_name: str) -> Dict[str, Any]:
             f"Required WhoScored v2 table iceberg.bronze.{table_name} "
             f"is unavailable: {exc}"
         ) from exc
+    return {"table": table_name, "rows": rows}
+
+
+def _validate_nonempty_bronze(table_name: str) -> Dict[str, Any]:
+    """Mandatory non-empty guard for V2 datasets with established history."""
+    result = _validate_bronze_available(table_name)
+    rows = int(result["rows"])
     if rows < 1:
         raise AirflowException(
             f"Required WhoScored v2 table {table_name} is empty"
         )
-    return {"table": table_name, "rows": rows, "threshold": 1}
+    result["threshold"] = 1
+    return result
 
 
 def validate_lineups(**_context) -> Dict[str, Any]:
@@ -212,7 +198,16 @@ def _manifest_integrity_summary() -> Dict[str, int]:
                             COALESCE(e.rows_count, 0) <> l.events_count
                             OR COALESCE(p.rows_count, 0) <> l.lineups_count
                         )
-                    ) AS count_mismatches
+                    ) AS count_mismatches,
+                    (
+                        SELECT COUNT(*)
+                        FROM iceberg.bronze.whoscored_events
+                        WHERE _game_batch_id IS NULL
+                    ) + (
+                        SELECT COUNT(*)
+                        FROM iceberg.bronze.whoscored_lineups
+                        WHERE _game_batch_id IS NULL
+                    ) AS unbatched_payload_rows
                 FROM latest l
                 LEFT JOIN event_counts e
                   ON e.league = l.league AND e.season = l.season
@@ -232,6 +227,7 @@ def _manifest_integrity_summary() -> Dict[str, int]:
         "invalid_states": int(row[1] or 0),
         "invalid_success_rows": int(row[2] or 0),
         "count_mismatches": int(row[3] or 0),
+        "unbatched_payload_rows": int(row[4] or 0),
     }
 
 
@@ -248,11 +244,120 @@ def validate_match_ingest_manifest(**_context) -> Dict[str, Any]:
         raise AirflowException("WhoScored manifest has no successful game commits")
     violations = sum(
         integrity[key]
-        for key in ("invalid_states", "invalid_success_rows", "count_mismatches")
+        for key in (
+            "invalid_states",
+            "invalid_success_rows",
+            "count_mismatches",
+            "unbatched_payload_rows",
+        )
     )
     if violations:
         raise AirflowException(
             f"WhoScored manifest integrity violations: {integrity}"
+        )
+    result["integrity"] = integrity
+    return result
+
+
+def _preview_manifest_integrity_summary() -> Dict[str, int]:
+    """Validate logical preview commits, including valid zero-row snapshots."""
+    from utils.silver_tasks import _get_trino_connection
+
+    conn = _get_trino_connection()
+    try:
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                """
+                WITH latest AS (
+                    SELECT * FROM (
+                        SELECT m.*, ROW_NUMBER() OVER (
+                            PARTITION BY league, season, game_id
+                            ORDER BY COALESCE(completed_at, fetched_at, _ingested_at) DESC,
+                                     COALESCE(batch_id, '') DESC, _batch_id DESC
+                        ) AS rn
+                        FROM iceberg.bronze.whoscored_preview_ingest_manifest m
+                    ) WHERE rn = 1
+                ),
+                latest_success AS (
+                    SELECT * FROM (
+                        SELECT m.*, ROW_NUMBER() OVER (
+                            PARTITION BY league, season, game_id
+                            ORDER BY COALESCE(completed_at, fetched_at, _ingested_at) DESC,
+                                     batch_id DESC, _batch_id DESC
+                        ) AS rn
+                        FROM iceberg.bronze.whoscored_preview_ingest_manifest m
+                        WHERE state = 'success'
+                    ) WHERE rn = 1
+                ),
+                payload_counts AS (
+                    SELECT league, season, CAST(game_id AS BIGINT) AS game_id,
+                           _preview_batch_id AS batch_id, COUNT(*) AS rows_count
+                    FROM iceberg.bronze.whoscored_missing_players
+                    WHERE _preview_batch_id IS NOT NULL
+                    GROUP BY league, season, CAST(game_id AS BIGINT),
+                             _preview_batch_id
+                )
+                SELECT
+                    (SELECT COUNT(*) FROM latest_success) AS successful_games,
+                    (SELECT COUNT(*) FROM latest WHERE state NOT IN (
+                        'success', 'retryable', 'terminal', 'parse_failed'
+                    )) AS invalid_states,
+                    (SELECT COUNT(*) FROM latest_success s
+                     WHERE s.batch_id IS NULL
+                        OR s.missing_players_count < 0
+                        OR (
+                            s.parser_version <> 'legacy-v1'
+                            AND (s.payload_sha256 IS NULL OR s.raw_uri IS NULL)
+                        )) AS invalid_success_rows,
+                    (SELECT COUNT(*)
+                     FROM latest_success s
+                     LEFT JOIN payload_counts p
+                       ON p.league = s.league AND p.season = s.season
+                      AND p.game_id = s.game_id AND p.batch_id = s.batch_id
+                     WHERE COALESCE(p.rows_count, 0) <>
+                           s.missing_players_count) AS count_mismatches,
+                    (SELECT COUNT(*)
+                     FROM iceberg.bronze.whoscored_missing_players
+                     WHERE _preview_batch_id IS NULL) AS null_batch_rows
+                """
+            )
+            row = cur.fetchall()[0]
+        finally:
+            cur.close()
+    finally:
+        conn.close()
+    return {
+        "successful_games": int(row[0] or 0),
+        "invalid_states": int(row[1] or 0),
+        "invalid_success_rows": int(row[2] or 0),
+        "count_mismatches": int(row[3] or 0),
+        "null_batch_rows": int(row[4] or 0),
+    }
+
+
+def validate_preview_ingest_manifest(**_context) -> Dict[str, Any]:
+    """Preview manifests may be empty, but committed batches must be exact."""
+    result = _validate_bronze_available("whoscored_preview_ingest_manifest")
+    _validate_bronze_available("whoscored_missing_players_current")
+    try:
+        integrity = _preview_manifest_integrity_summary()
+    except Exception as exc:
+        raise AirflowException(
+            f"WhoScored preview manifest integrity query failed: {exc}"
+        ) from exc
+    violations = sum(
+        integrity[key]
+        for key in (
+            "invalid_states",
+            "invalid_success_rows",
+            "count_mismatches",
+            "null_batch_rows",
+        )
+    )
+    if violations:
+        raise AirflowException(
+            f"WhoScored preview manifest integrity violations: {integrity}"
         )
     result["integrity"] = integrity
     return result
@@ -282,29 +387,18 @@ with DAG(
     `{', '.join(ACTIVE_WHOSCORED_SCOPES) or '(none)'}`.
 
     Each scope is independent and uses the shared one-slot scraper pool. The
-    runner tries direct HTTP first; no raw proxy file is passed by this DAG.
+    runner calls the direct-first ingestion service with no raw proxy list.
     A task failure is not hidden by a sequential `all_done` chain.
 
     After every scope has finished, validation checks schedule, events,
-    lineups and the match-ingest manifest. The manifest table is mandatory for
-    v2 rollout; the DAG must not be enabled before its additive DDL is applied.
+    lineups, match commits and preview commits. Both manifest tables and their
+    current views are mandatory before the v2 DAG is enabled.
     """,
 ) as dag:
     task_env = {
         "PYTHONPATH": "/opt/airflow:/opt/airflow/dags",
         "PATH": "/usr/local/bin:/usr/bin:/bin:/home/airflow/.local/bin",
         "HOME": "/home/airflow",
-        # Disable the legacy scraper hook: it routes every FlareSolverr request
-        # through PROXY_FILTER_URL. V2 receives the filter endpoint under a
-        # distinct name and opens a paid lease only after classified direct CF.
-        "PROXY_FILTER_URL": "",
-        "WHOSCORED_RAW_STORE_URI": _whoscored_raw_store_uri(),
-        "WHOSCORED_PAID_PROXY_URL": os.environ.get(
-            "WHOSCORED_PAID_PROXY_URL", "http://proxy_filter:8900"
-        ),
-        "WHOSCORED_PROXY_CONTROL_URL": os.environ.get(
-            "WHOSCORED_PROXY_CONTROL_URL", "http://proxy_filter:8899"
-        ),
     }
 
     scrape_tasks: List[BashOperator] = []
@@ -318,12 +412,11 @@ with DAG(
                     "cd /opt/airflow && "
                     "python dags/scripts/run_whoscored_scraper.py all "
                     f"--scope \"{scope_spec}\" "
-                    "--flaresolverr-url http://flaresolverr:8191 "
                     f"--output /tmp/whoscored_result_{task_slug}.json"
                 ),
                 env=task_env,
                 append_env=True,
-                # Tasks are independent.  SELENIUM_ARGS supplies the shared
+                # Tasks are independent. SCRAPER_ARGS supplies the shared
                 # ingest_scraper_pool, which serialises the browser itself.
                 trigger_rule="all_success",
             )
@@ -351,6 +444,11 @@ with DAG(
             trigger_rule="all_done",
         ),
         PythonOperator(
+            task_id="validate_preview_ingest_manifest",
+            python_callable=validate_preview_ingest_manifest,
+            trigger_rule="all_done",
+        ),
+        PythonOperator(
             task_id="validate_profile_manifest",
             python_callable=validate_profile_manifest,
             trigger_rule="all_done",
@@ -359,19 +457,24 @@ with DAG(
 
     profile_task = None
     if ACTIVE_WHOSCORED_SCOPES:
-        profile_scope = ACTIVE_WHOSCORED_SCOPES[0]
+        profile_scope_args = " ".join(
+            f'--scope "{scope}"' for scope in ACTIVE_WHOSCORED_SCOPES
+        )
         profile_task = BashOperator(
             task_id="refresh_whoscored_profiles",
             bash_command=(
                 "cd /opt/airflow && "
                 "python dags/scripts/run_whoscored_scraper.py profiles "
-                f"--scope \"{profile_scope}\" --limit 200 "
-                "--flaresolverr-url http://flaresolverr:8191 "
+                f"{profile_scope_args} --limit 200 "
                 "--output /tmp/whoscored_result_profiles.json"
             ),
             env=task_env,
             append_env=True,
             trigger_rule="all_success",
+            # The 200-player limit is a daily traffic ceiling. Retrying after
+            # partial commits could select the next 200 unseen players, so the
+            # non-critical profile refresh deliberately waits for tomorrow.
+            retries=0,
         )
         for scrape_task in scrape_tasks:
             scrape_task >> profile_task
