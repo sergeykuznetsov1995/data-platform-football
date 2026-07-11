@@ -5,7 +5,8 @@ Master Pipeline DAG
 Airflow DAG for orchestrating all data ingestion DAGs.
 Uses TriggerDagRunOperator to run child DAGs in sequence.
 
-Schedules daily at 2 PM UTC (after all individual DAGs).
+Schedules daily at 2 PM UTC and is the sole schedule owner for trigger-only
+sources such as FotMob.
 
 This DAG:
 1. Triggers all ingestion DAGs in sequence
@@ -160,7 +161,7 @@ with DAG(
     ### Execution Order
 
     1. **FBref** (6:00 UTC) - Selenium-based scraper
-    2. **FotMob** (7:00 UTC) - Selenium-based scraper
+    2. **FotMob** - source-native direct JSON discovery (trigger-only)
     3. **MatchHistory** (8:00 UTC) - Direct HTTP scraper
     4. **Understat** (9:00 UTC) - soccerdata library
     5. **WhoScored** (10:00 UTC) - Selenium with SPADL conversion
@@ -252,13 +253,19 @@ with DAG(
         prev_task = None
 
         for dag_id in INGESTION_DAGS:
+            strict_child_state = dag_id == 'dag_ingest_fotmob'
             trigger_task = TriggerDagRunOperator(
                 task_id=f'trigger_{dag_id.replace("dag_ingest_", "")}',
                 trigger_dag_id=dag_id,
                 wait_for_completion=True,
                 poke_interval=60,  # Check every minute
-                allowed_states=['success', 'failed'],  # Continue on failure
-                failed_states=[],  # Don't fail master if child fails
+                # FotMob emits a strict completeness manifest, so its child
+                # failure must make the master red. Legacy children retain
+                # the existing alert-only policy until they do the same.
+                allowed_states=(
+                    ['success'] if strict_child_state else ['success', 'failed']
+                ),
+                failed_states=(['failed'] if strict_child_state else []),
                 reset_dag_run=True,  # Reset if already running
                 execution_date='{{ ds }}',  # Airflow 2.x uses execution_date
                 conf=(
@@ -266,6 +273,9 @@ with DAG(
                     if dag_id == "dag_ingest_sofascore"
                     else {}
                 ),
+                # Continue independent source ingests even when strict FotMob
+                # fails; the failed trigger task still makes this DAG run red.
+                trigger_rule='all_done',
             )
 
             if prev_task:

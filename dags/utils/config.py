@@ -95,10 +95,16 @@ SEASONS_STR: str = ','.join(
 # Valid values: "latest", "all", or list of version IDs from URL (e.g., 230034)
 SOFIFA_VERSIONS: str = 'latest'
 
+# Lightweight, direct-only FotMob requests must not occupy the serialized
+# browser scraper pool. The pool is bootstrapped by the Airflow deployment.
+FOTMOB_HTTP_POOL: str = 'fotmob_http_pool'
+
 # DAG schedule configuration (cron format, UTC)
 SCHEDULES: Dict[str, Optional[str]] = {
     'dag_ingest_fbref': '0 6 * * 1',         # 6:00 UTC Monday (weekly)
-    'dag_ingest_fotmob': '0 7 * * *',        # 7:00 UTC daily
+    # One schedule owner: the master pipeline triggers FotMob daily.  Keeping
+    # a second source cron doubled the same direct-HTTP work.
+    'dag_ingest_fotmob': None,
     'dag_ingest_matchhistory': '0 8 * * *',  # 8:00 UTC daily
     'dag_ingest_understat': '0 9 * * *',     # 9:00 UTC daily
     'dag_ingest_whoscored': '0 10 * * *',    # 10:00 UTC daily
@@ -237,7 +243,7 @@ MIN_ROW_THRESHOLDS: Dict[str, int] = {
 # Tags for DAG organization
 DAG_TAGS: Dict[str, List[str]] = {
     'fbref': ['scraping', 'fbref', 'bronze', 'football', 'selenium'],
-    'fotmob': ['scraping', 'fotmob', 'bronze', 'football', 'selenium'],
+    'fotmob': ['scraping', 'fotmob', 'bronze', 'football', 'http'],
     'matchhistory': ['scraping', 'matchhistory', 'bronze', 'football', 'odds'],
     'understat': ['scraping', 'understat', 'bronze', 'football', 'xg'],
     'whoscored': ['scraping', 'whoscored', 'bronze', 'football', 'selenium', 'spadl'],

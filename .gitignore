@@ -203,6 +203,14 @@ configs/headscale/config.yaml
 CLAUDE.md
 PLAN.md
 docs/
+# Reproducible FotMob audit evidence is part of the pipeline contract, not
+# local prose. Keep this single runbook visible while other ad-hoc docs remain
+# ignored.
+!docs/
+docs/*
+!docs/research/
+docs/research/*
+!docs/research/fotmob_pipeline_audit_baseline.md
 scrapers/README.md
 
 # Local ad-hoc SQL (not part of pipeline; only dags/sql/ is tracked)

@@ -54,6 +54,11 @@ x-airflow-common: &airflow-common
     # workers only consume explicitly activated entries from this read-only
     # file, so a newly discovered tournament cannot create DAG tasks by itself.
     SOFASCORE_REGISTRY_PATH: /opt/airflow/configs/sofascore/tournaments.json
+    # Source-native FotMob JSON uses the same durable raw-first layout.  The
+    # HTTP transport is direct-only; these variables configure storage only.
+    FOTMOB_RAW_STORE_URI: s3://${ICEBERG_WAREHOUSE}/raw/fotmob
+    FOTMOB_RAW_S3_ENDPOINT: seaweedfs:8333
+    FOTMOB_RAW_S3_SCHEME: http
     # Route FlareSolverr scrapers (WhoScored/SoFIFA) through the ad-tech filter (#652).
     # Off by default — set to http://proxy_filter:8899 to cut residential traffic.
     PROXY_FILTER_URL: ${PROXY_FILTER_URL:-}
@@ -362,6 +367,9 @@ services:
         # two browser/FlareSolverr scrapers at once exhaust VM swap → scheduler
         # stalls → live tasks get orphan-reset (#671). Idempotent (create/update).
         airflow pools set 'ingest_scraper_pool' 1 'Serialize heavy ingest scrapers to avoid VM swap (#671)'
+        # FotMob is lightweight direct HTTP.  A separate bounded pool prevents
+        # browser scrapers from serializing it while limiting source fan-out.
+        airflow pools set 'fotmob_http_pool' 4 'Bounded direct FotMob HTTP work'
         echo "Airflow initialization complete"
     environment:
       <<: *airflow-common-env
