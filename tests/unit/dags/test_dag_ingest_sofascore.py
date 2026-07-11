@@ -58,6 +58,36 @@ def _bash_task(task_id):
     return None
 
 
+def _patch_active_catalog(monkeypatch, competition_ids, source_seasons=None):
+    """Replace the read-only registry consumer for one DAG import."""
+    from scrapers.sofascore.catalog import SofaScoreCatalog
+
+    configured = source_seasons or {}
+
+    class _Catalog:
+        @staticmethod
+        def enabled_competition_ids():
+            return tuple(competition_ids)
+
+        @staticmethod
+        def competition(competition_id):
+            default = "2026" if competition_id.startswith("INT-") else "2526"
+            seasons = configured.get(competition_id, (default,))
+            return SimpleNamespace(seasons=tuple(
+                SimpleNamespace(
+                    canonical_season=season,
+                    activatable=season is not None,
+                )
+                for season in seasons
+            ))
+
+    monkeypatch.setattr(
+        SofaScoreCatalog,
+        "load",
+        classmethod(lambda cls, path=None: _Catalog()),
+    )
+
+
 class TestBronzeFreshnessGate:
     """#751: a ``validate_bronze_freshness`` task must exist, wired after
     ``validate_data``, alerting on stale ``bronze.sofascore_*`` ingestion."""
@@ -504,6 +534,155 @@ class TestProxyEfficientCadence:
         assert dag_module.dag._dag_kwargs["schedule"] is None
 
 
+class TestRegistryActivation:
+    """Discovery is broad; only explicit registry activation shapes the DAG."""
+
+    def test_bootstrap_scope_preserves_epl_and_world_cup(self, dag_module):
+        assert set(dag_module.SOFASCORE_LEAGUES) == {
+            'ENG-Premier League',
+            'INT-World Cup',
+        }
+        assert dag_module.CLUB_LEAGUES == ['ENG-Premier League']
+        assert dag_module.TOURNAMENT_LEAGUES == ['INT-World Cup']
+
+    @pytest.mark.parametrize('task_id', [
+        'scrape_sofascore_data_uefa_champions_league',
+        'scrape_match_capture_uefa_champions_league',
+        'scrape_sofascore_data_rus_premier_league',
+        'scrape_match_capture_rus_premier_league',
+        'scrape_sofascore_data_int_africa_cup_of_nations',
+        'scrape_match_capture_int_africa_cup_of_nations',
+    ])
+    def test_discovered_but_disabled_competitions_create_no_tasks(
+        self, dag_module, task_id,
+    ):
+        assert _bash_task(task_id) is None
+
+    def test_activating_second_club_adds_dedicated_capture_without_renaming_epl(
+        self, monkeypatch, real_medallion_config_dir,
+    ):
+        _patch_active_catalog(monkeypatch, (
+            'ESP-La Liga',
+            'INT-World Cup',
+            'ENG-Premier League',
+        ))
+        module = _reload_dag_module()
+
+        schedule = _bash_task('scrape_sofascore_data')
+        assert '--leagues "ENG-Premier League,ESP-La Liga"' in schedule.bash_command
+
+        epl = _bash_task('scrape_match_capture')
+        assert '--league "ENG-Premier League"' in epl.bash_command
+        assert module.MATCH_CAPTURE_RESULT_PATH in epl.bash_command
+
+        la_liga = _bash_task('scrape_match_capture_esp_la_liga')
+        assert la_liga is not None
+        assert '--league "ESP-La Liga"' in la_liga.bash_command
+        assert (
+            '/tmp/sofascore_match_capture_result_esp_la_liga.json'
+            in la_liga.bash_command
+        )
+
+    def test_secondary_club_capture_is_validated_without_inflating_epl_floor(
+        self, monkeypatch, real_medallion_config_dir,
+    ):
+        _patch_active_catalog(monkeypatch, (
+            'ESP-La Liga',
+            'INT-World Cup',
+            'ENG-Premier League',
+        ))
+        module = _reload_dag_module()
+        schedule = {
+            'schedule_rows': 200,
+            'league_table_rows': 20,
+            'tables': [],
+            'errors': [],
+        }
+        primary = {
+            'rows': 300,
+            'shotmap_rows': 300,
+            'eps_rows': 10_000,
+            'match_stats_rows': 10_000,
+            'venue_rows': 300,
+            'fallback': False,
+            'errors': [],
+            'tables': [],
+        }
+
+        def load(path, logger):
+            if path == module.SCHEDULE_RESULT_PATH:
+                return schedule
+            if path == module.MATCH_CAPTURE_RESULT_PATH:
+                return primary
+            if 'int_world_cup' in path:
+                return {'skipped': True}
+            if 'esp_la_liga' in path:
+                return {}
+            raise AssertionError(path)
+
+        monkeypatch.setattr(module, '_load_result', load)
+        result = module.validate_data()
+
+        assert any(
+            'ESP-La Liga: match_capture result file missing' in warning
+            for warning in result['warnings']
+        )
+        assert not any(
+            warning.startswith('Low player_ratings row count')
+            for warning in result['warnings']
+        )
+
+    def test_empty_active_scope_fails_closed(self, monkeypatch):
+        _patch_active_catalog(monkeypatch, ())
+        with pytest.raises(Exception, match='no usable active tournaments'):
+            _reload_dag_module()
+
+    def test_missing_or_malformed_registry_fails_closed(self, monkeypatch):
+        from scrapers.sofascore.catalog import CatalogError, SofaScoreCatalog
+
+        def _fail(cls, path=None):
+            raise CatalogError('cannot parse tournaments.json')
+
+        monkeypatch.setattr(SofaScoreCatalog, 'load', classmethod(_fail))
+        with pytest.raises(
+            Exception,
+            match='registry is missing or invalid: cannot parse',
+        ):
+            _reload_dag_module()
+
+    def test_active_canonical_stub_fails_before_tasks_are_built(
+        self, monkeypatch, real_medallion_config_dir,
+    ):
+        _patch_active_catalog(monkeypatch, (
+            'ENG-Premier League',
+            'UEFA-Champions League',
+        ))
+        with pytest.raises(Exception, match='no canonical seasons configured'):
+            _reload_dag_module()
+
+    def test_active_tournament_without_source_season_fails_before_paid_access(
+        self, monkeypatch, real_medallion_config_dir,
+    ):
+        _patch_active_catalog(
+            monkeypatch,
+            ('ENG-Premier League', 'INT-World Cup'),
+            source_seasons={'INT-World Cup': ()},
+        )
+        with pytest.raises(Exception, match='no activatable SofaScore seasons'):
+            _reload_dag_module()
+
+    def test_stale_source_season_cannot_activate_current_club_run(
+        self, monkeypatch, real_medallion_config_dir,
+    ):
+        _patch_active_catalog(
+            monkeypatch,
+            ('ENG-Premier League', 'INT-World Cup'),
+            source_seasons={'ENG-Premier League': ('2425',)},
+        )
+        with pytest.raises(Exception, match='scheduled season.*is missing'):
+            _reload_dag_module()
+
+
 class TestSeasonRenderedFromParams:
     """#711: every scrape task must inject the season via Jinja so an
     overridden season (backfill) reaches the scraper — not a baked-in current
@@ -568,7 +747,7 @@ class TestTournamentFanOut:
             in task.bash_command
         )
 
-    def test_club_only_leagues_produce_no_tournament_tasks(
+    def test_global_leagues_does_not_override_registry_activation(
         self, monkeypatch, real_medallion_config_dir,
     ):
         import utils.config as config
@@ -576,9 +755,11 @@ class TestTournamentFanOut:
         monkeypatch.setattr(config, 'LEAGUES', ['ENG-Premier League'])
         _reload_dag_module()
 
-        assert _bash_task('scrape_sofascore_data_int_world_cup') is None
-        assert _bash_task('scrape_match_capture_int_world_cup') is None
-        # the club tasks must still exist untouched
+        # SofaScore no longer inherits this process-wide list. Its registry
+        # still has World Cup active, while the other sources keep seeing the
+        # monkeypatched global value.
+        assert _bash_task('scrape_sofascore_data_int_world_cup') is not None
+        assert _bash_task('scrape_match_capture_int_world_cup') is not None
         assert _bash_task('scrape_sofascore_data') is not None
         assert _bash_task('scrape_match_capture') is not None
 

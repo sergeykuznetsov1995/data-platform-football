@@ -1,13 +1,13 @@
 """
 Coherence guard: source-ID maps vs competitions.yaml (#920 Phase 3).
 
-This test IS the onboarding checklist, executable. Source IDs deliberately
-live in the per-scraper Python constants (the issue's accepted config
-layer) plus configs/soccerdata/league_dict.json for the soccerdata-based
-sources — which means the maps can drift apart. For every competition with
-configured seasons, every source it declares must resolve in its map; a
-new tournament added to competitions.yaml with missing IDs fails here with
-a message naming exactly which map lacks which key.
+This test IS the onboarding checklist, executable. Source IDs live in each
+source-owned registry (SofaScore uses configs/sofascore/tournaments.json) or
+per-scraper map, plus configs/soccerdata/league_dict.json for soccerdata-based
+sources. For every competition with configured seasons, every source it
+declares must resolve; a new tournament added to competitions.yaml with
+missing IDs fails here with a message naming exactly which source registry
+lacks which key.
 
 Also pins soccerdata 1.8.8 merge semantics: custom league_dict entries
 REPLACE built-ins per key, so any fragment entry shadowing a built-in must
@@ -102,10 +102,12 @@ def _resolve(source: str, comp_id: str):
             SOFASCORE_TOURNAMENT_SLUG,
         )
         if not isinstance(SOFASCORE_TOURNAMENT_MAP.get(comp_id), int):
-            return "sofascore SOFASCORE_TOURNAMENT_MAP: missing/non-int ut id"
+            return ("configs/sofascore/tournaments.json: missing/non-int "
+                    "unique_tournament_id")
         slug = SOFASCORE_TOURNAMENT_SLUG.get(comp_id)
         if not slug or slug.count('/') < 2:
-            return "sofascore SOFASCORE_TOURNAMENT_SLUG: missing/malformed nav slug"
+            return ("configs/sofascore/tournaments.json: "
+                    "missing/malformed page_path")
     elif source == 'espn':
         entry = EFFECTIVE_LEAGUE_DICT.get(comp_id)
         if comp_id.startswith('INT-'):
@@ -146,6 +148,21 @@ def test_every_declared_source_resolves_an_id():
     assert not problems, (
         "Onboarding incomplete — fill these maps:\n" + "\n".join(problems)
     )
+
+
+@pytest.mark.unit
+def test_sofascore_ids_are_not_duplicated_in_legacy_league_metadata():
+    """The discovery registry is the sole source for SofaScore ids."""
+    document = yaml.safe_load(
+        (PROJECT_ROOT / 'scrapers' / 'sources' / 'leagues.yaml')
+        .read_text(encoding='utf-8')
+    )
+    duplicates = [
+        league
+        for league, metadata in (document.get('metadata') or {}).items()
+        if 'sofascore_id' in (metadata or {})
+    ]
+    assert duplicates == []
 
 
 @pytest.mark.unit

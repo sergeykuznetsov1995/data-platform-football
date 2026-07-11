@@ -30,6 +30,7 @@ from scrapers.sofascore._flatten import (  # noqa: E402
     _camel_to_snake,
     _coerce_scalar,
 )
+from scrapers.sofascore.catalog import SofaScoreCatalog
 
 logger = logging.getLogger(__name__)
 
@@ -43,39 +44,18 @@ _MATCH_STATS_PATH = "/event/{event_id}/statistics"
 _TERMINAL_CAPTURE_STATES = frozenset({"success", "not_available"})
 
 
-# SofaScore "unique-tournament" id per soccerdata league key. Discovered
-# via `/api/v1/unique-tournament/{id}/seasons` probes during issue #19;
-# stable since at least 2024. Missing league → runtime fallback lookup.
-SOFASCORE_TOURNAMENT_MAP: Dict[str, int] = {
-    'ENG-Premier League': 17,
-    'ESP-La Liga': 8,
-    'GER-Bundesliga': 35,
-    'ITA-Serie A': 23,
-    'FRA-Ligue 1': 34,
-    'INT-World Cup': 16,
-    # #920 Phase 3 — live-verified via /unique-tournament/{ut}/seasons
-    # (T0 recon). season_id по-прежнему резолвится в рантайме.
-    'INT-European Championship': 1,
-    'INT-Africa Cup of Nations': 270,
-    'INT-Copa America': 133,
-}
-
-# Canonical SofaScore league-page slug per soccerdata league key. The browser
-# capture nav URL needs country/competition slug + id — /unique-tournament/{id}
-# alone 404s (#757 B0). Only EPL is live-verified; the rest follow SofaScore's
-# /tournament/<slug>/<ut_id> pattern and should be confirmed before use.
-SOFASCORE_TOURNAMENT_SLUG: Dict[str, str] = {
-    'ENG-Premier League': 'football/england/premier-league',
-    'ESP-La Liga': 'football/spain/laliga',
-    'GER-Bundesliga': 'football/germany/bundesliga',
-    'ITA-Serie A': 'football/italy/serie-a',
-    'FRA-Ligue 1': 'football/france/ligue-1',
-    'INT-World Cup': 'football/world/world-championship',
-    # #920 Phase 3 — nav-URL live-verified (SPA-редирект не-404, T0 recon).
-    'INT-European Championship': 'football/europe/european-championship',
-    'INT-Africa Cup of Nations': 'football/africa/africa-cup-of-nations',
-    'INT-Copa America': 'football/south-america/copa-america',
-}
+# Read-only source metadata comes from the discovery registry.  These computed
+# dicts intentionally preserve the long-standing public imports while removing
+# the second, manually maintained copy of tournament ids and navigation paths.
+# Disabled competitions remain resolvable here: activation controls DAG scope,
+# not whether an explicit/manual scraper call can address a known tournament.
+_SOFASCORE_CATALOG = SofaScoreCatalog.load()
+SOFASCORE_TOURNAMENT_MAP: Dict[str, int] = (
+    _SOFASCORE_CATALOG.tournament_map(enabled_only=False)
+)
+SOFASCORE_TOURNAMENT_SLUG: Dict[str, str] = (
+    _SOFASCORE_CATALOG.slug_map(enabled_only=False)
+)
 
 # R0.2b — graceful-fallback marker emitted when the lineups endpoint
 # is structurally unavailable (HTTP 403 / quota empty / repeated timeouts).
@@ -602,13 +582,18 @@ class SofaScoreScraper(SoccerdataScraper):
 
     def _resolve_target_sid(self, cap, buffer, ut_id, target_year) -> Optional[int]:
         """Resolve ``target_year``'s SofaScore ``season_id``: the captured
-        ``/seasons`` map first, the captured events' own ``season.id`` second,
-        and an in-page ``/seasons`` fetch last (#879 — neither buffer source
-        fires reliably when the landing serves another season)."""
+        discovery registry first, the captured ``/seasons`` map second, the
+        captured events' own ``season.id`` third, and an in-page ``/seasons``
+        fetch last (#879 — neither buffer source fires reliably when the
+        landing serves another season)."""
         from scrapers.sofascore.camoufox_capture import (
             extract_tournament_events,
             extract_tournament_seasons_map,
         )
+
+        sid = _SOFASCORE_CATALOG.resolve_season_id(ut_id, target_year)
+        if sid is not None:
+            return int(sid)
 
         sid = extract_tournament_seasons_map(buffer, ut_id).get(target_year)
         if sid is not None:
@@ -3157,7 +3142,7 @@ class SofaScoreScraper(SoccerdataScraper):
         }
 
         # Target competition for exact season-statistics API resolution.
-        target_ut = SOFASCORE_TOURNAMENT_MAP.get(league)
+        target_ut = self._resolve_unique_tournament_id(league)
         if player_ids is None:
             player_ids = self._resolve_player_ids_from_bronze(
                 league, season_short, limit=limit,

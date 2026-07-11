@@ -2,7 +2,7 @@
 # Data Platform - Makefile
 # =============================================================================
 
-.PHONY: help build up up-lite up-full up-build down restart logs ps clean health test-trino init-storage shell-airflow shell-trino test-fbref-curl test-fbref-nodriver test-fbref-full test-proxy-stats up-bi up-catalog down-bi down-catalog superset-init superset-import superset-dashboards om-ingest-trino om-lineage-trino om-apply-descriptions om-cleanup-lineage logs-superset logs-om shell-superset shell-om
+.PHONY: help build up up-lite up-full up-build down restart logs ps clean health test-trino init-storage shell-airflow shell-trino sofascore-discovery sofascore-discovery-check test-fbref-curl test-fbref-nodriver test-fbref-full test-proxy-stats up-bi up-catalog down-bi down-catalog superset-init superset-import superset-dashboards om-ingest-trino om-lineage-trino om-apply-descriptions om-cleanup-lineage logs-superset logs-om shell-superset shell-om
 
 # Default target
 help:
@@ -21,6 +21,8 @@ help:
 	@echo ""
 	@echo "  make init-storage - Initialize HDFS + Hive schemas (recommended)"
 	@echo "  make test-trino   - Run Trino integration test"
+	@echo "  make sofascore-discovery       - Refresh source metadata via direct JSON"
+	@echo "  make sofascore-discovery-check - Check registry drift without writing"
 	@echo ""
 	@echo "  make shell-airflow - Open shell in Airflow webserver"
 	@echo "  make shell-trino  - Open shell in Trino"
@@ -149,6 +151,27 @@ shell-trino:
 
 shell-namenode:
 	docker compose exec namenode /bin/bash
+
+# Source metadata discovery is deliberately outside the ingestion DAG. The
+# normal Airflow mount stays read-only; this one-shot overrides only the
+# SofaScore registry directory and runs as the checkout owner. New records are
+# still enabled=false, so refreshing source metadata never activates scraping.
+sofascore-discovery:
+	docker compose run --rm --no-deps \
+		--user "$$(id -u):$$(id -g)" \
+		--volume "$(CURDIR)/configs/sofascore:/work/sofascore:rw" \
+		airflow-scheduler \
+		python /opt/airflow/dags/scripts/run_sofascore_discovery.py \
+		--registry /work/sofascore/tournaments.json
+
+sofascore-discovery-check:
+	docker compose run --rm --no-deps \
+		--user "$$(id -u):$$(id -g)" \
+		--volume "$(CURDIR)/configs/sofascore:/work/sofascore:ro" \
+		airflow-scheduler \
+		python /opt/airflow/dags/scripts/run_sofascore_discovery.py \
+		--registry /work/sofascore/tournaments.json \
+		--check
 
 # Show Web UI URLs
 urls:

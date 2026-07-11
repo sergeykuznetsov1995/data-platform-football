@@ -1,0 +1,128 @@
+{
+  "schema_version": 1,
+  "tournaments": [
+    {
+      "unique_tournament_id": 1,
+      "name": "EURO",
+      "slug": "european-championship",
+      "category": {"id": null, "name": "Europe", "slug": "europe"},
+      "sport_slug": "football",
+      "page_path": "football/europe/european-championship",
+      "canonical_id": "INT-European Championship",
+      "enabled": false,
+      "seasons": []
+    },
+    {
+      "unique_tournament_id": 8,
+      "name": "LaLiga",
+      "slug": "laliga",
+      "category": {"id": null, "name": "Spain", "slug": "spain"},
+      "sport_slug": "football",
+      "page_path": "football/spain/laliga",
+      "canonical_id": "ESP-La Liga",
+      "enabled": false,
+      "seasons": []
+    },
+    {
+      "unique_tournament_id": 16,
+      "name": "World Cup",
+      "slug": "world-championship",
+      "category": {"id": null, "name": "World", "slug": "world"},
+      "sport_slug": "football",
+      "page_path": "football/world/world-championship",
+      "canonical_id": "INT-World Cup",
+      "enabled": true,
+      "seasons": [
+        {
+          "season_id": 58210,
+          "name": "World Cup 2026",
+          "year": "2026",
+          "season_format": "single_year",
+          "canonical_season": "2026"
+        }
+      ]
+    },
+    {
+      "unique_tournament_id": 17,
+      "name": "Premier League",
+      "slug": "premier-league",
+      "category": {"id": null, "name": "England", "slug": "england"},
+      "sport_slug": "football",
+      "page_path": "football/england/premier-league",
+      "canonical_id": "ENG-Premier League",
+      "enabled": true,
+      "seasons": [
+        {
+          "season_id": 76986,
+          "name": "Premier League 25/26",
+          "year": "25/26",
+          "season_format": "split_year",
+          "canonical_season": "2526"
+        }
+      ]
+    },
+    {
+      "unique_tournament_id": 23,
+      "name": "Serie A",
+      "slug": "serie-a",
+      "category": {"id": null, "name": "Italy", "slug": "italy"},
+      "sport_slug": "football",
+      "page_path": "football/italy/serie-a",
+      "canonical_id": "ITA-Serie A",
+      "enabled": false,
+      "seasons": []
+    },
+    {
+      "unique_tournament_id": 34,
+      "name": "Ligue 1",
+      "slug": "ligue-1",
+      "category": {"id": null, "name": "France", "slug": "france"},
+      "sport_slug": "football",
+      "page_path": "football/france/ligue-1",
+      "canonical_id": "FRA-Ligue 1",
+      "enabled": false,
+      "seasons": []
+    },
+    {
+      "unique_tournament_id": 35,
+      "name": "Bundesliga",
+      "slug": "bundesliga",
+      "category": {"id": null, "name": "Germany", "slug": "germany"},
+      "sport_slug": "football",
+      "page_path": "football/germany/bundesliga",
+      "canonical_id": "GER-Bundesliga",
+      "enabled": false,
+      "seasons": []
+    },
+    {
+      "unique_tournament_id": 133,
+      "name": "Copa Am\u00e9rica",
+      "slug": "copa-america",
+      "category": {"id": null, "name": "South America", "slug": "south-america"},
+      "sport_slug": "football",
+      "page_path": "football/south-america/copa-america",
+      "canonical_id": "INT-Copa America",
+      "enabled": false,
+      "seasons": []
+    },
+    {
+      "unique_tournament_id": 270,
+      "name": "Africa Cup of Nations",
+      "slug": "africa-cup-of-nations",
+      "category": {"id": null, "name": "Africa", "slug": "africa"},
+      "sport_slug": "football",
+      "page_path": "football/africa/africa-cup-of-nations",
+      "canonical_id": "INT-Africa Cup of Nations",
+      "enabled": false,
+      "seasons": [
+        {
+          "season_id": 71636,
+          "name": "Africa Cup of Nations 2025",
+          "year": "2025",
+          "season_format": "single_year",
+          "canonical_season": "2025"
+        }
+      ]
+    }
+  ]
+}
