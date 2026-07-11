@@ -213,7 +213,8 @@ class _DirectTlsSession:
             from tls_client import Session
         except ImportError as exc:  # pragma: no cover - production dependency
             raise DiscoveryHTTPError(
-                "tls-client-python is required for direct SofaScore discovery"
+                "tls-client-python is required for direct SofaScore discovery: "
+                f"{type(exc).__name__}: {exc}"
             ) from exc
         self._inner = Session(
             client_identifier="chrome_133",

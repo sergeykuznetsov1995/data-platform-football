@@ -47,7 +47,9 @@ jobs:
           python-version: "3.12"
 
       - name: Install direct JSON transport
-        run: python -m pip install --disable-pip-version-check "tls-client-python==1.15.1"
+        run: |
+          python -m pip install --disable-pip-version-check "tls-client-python==1.15.1"
+          python -c "from tls_client import Session; print(Session.__module__)"
 
       - name: Validate direct discovery with poisoned proxy environment
         env:
@@ -102,7 +104,9 @@ jobs:
           python-version: "3.12"
 
       - name: Install direct JSON transport
-        run: python -m pip install --disable-pip-version-check "tls-client-python==1.15.1"
+        run: |
+          python -m pip install --disable-pip-version-check "tls-client-python==1.15.1"
+          python -c "from tls_client import Session; print(Session.__module__)"
 
       - name: Refresh registry without browser or proxy
         id: discovery
