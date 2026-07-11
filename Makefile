@@ -306,6 +306,11 @@ om-bootstrap:
 om-cleanup-lineage:
 	@docker compose exec openmetadata-ingestion python /opt/configs/cleanup_lineage.py
 
+# RSA-ключи подписи бот-JWT OpenMetadata (вместо публично известного дефолта
+# образа) — обязательны до публикации meta (#866). См. configs/openmetadata/README.md.
+gen-om-jwt-keys:
+	@bash scripts/gen_om_jwt_keys.sh
+
 # Tail Superset web logs
 logs-superset:
 	@docker compose logs -f --tail=100 superset
