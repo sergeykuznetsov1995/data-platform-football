@@ -90,7 +90,10 @@ jobs:
     permissions:
       contents: write
       pull-requests: write
-    runs-on: ubuntu-latest
+    # SofaScore currently rejects GitHub's Linux egress range before JSON
+    # handling. The hosted macOS pool is still a direct connection: no proxy,
+    # no browser and the poison-proxy assertions below remain mandatory.
+    runs-on: macos-14
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
