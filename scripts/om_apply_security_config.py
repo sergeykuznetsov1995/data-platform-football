@@ -74,7 +74,13 @@ def load_env() -> None:
 load_env()
 
 OM_URL = os.environ.get("OM_BASE_URL", "http://127.0.0.1:8585")
-ADMIN_EMAIL = os.environ.get("OM_ADMIN_EMAIL", "admin@open-metadata.org")
+# Email локального админа = admin@<AUTHORIZER_PRINCIPAL_DOMAIN>. У нас в compose
+# домен `openmetadata.org`, дефолт образа — `open-metadata.org`: пробуем оба.
+ADMIN_EMAILS = (
+    [os.environ["OM_ADMIN_EMAIL"]]
+    if os.environ.get("OM_ADMIN_EMAIL")
+    else ["admin@openmetadata.org", "admin@open-metadata.org"]
+)
 
 
 def _req(method: str, path: str, token: str | None = None, body: dict | None = None):
@@ -107,22 +113,21 @@ def login() -> str:
     password = os.environ.get("OM_ADMIN_PASSWORD")
     if not password:
         sys.exit("OM_ADMIN_PASSWORD не задан (локальный админ OM, basic-логин)")
-    status, body = _req(
-        "POST",
-        "/api/v1/users/login",
-        body={
-            "email": ADMIN_EMAIL,
-            "password": base64.b64encode(password.encode()).decode(),
-        },
-    )
-    if status == 403:
-        sys.exit(
-            "basic-логин запрещён — сервер уже в SSO-режиме. Повторное применение "
-            "конфига делайте из UI (Settings → Security); откат — см. docstring."
+    encoded = base64.b64encode(password.encode()).decode()
+    last = None
+    for email in ADMIN_EMAILS:
+        status, body = _req(
+            "POST", "/api/v1/users/login", body={"email": email, "password": encoded}
         )
-    if status != 200 or "accessToken" not in body:
-        sys.exit(f"логин админа не прошёл: {status} {body}")
-    return body["accessToken"]
+        if status == 403:
+            sys.exit(
+                "basic-логин запрещён — сервер уже в SSO-режиме. Повторное применение "
+                "конфига делайте из UI (Settings → Security); откат — см. docstring."
+            )
+        if status == 200 and "accessToken" in body:
+            return body["accessToken"]
+        last = (email, status, body)
+    sys.exit(f"логин админа не прошёл ни для одного email: {last}")
 
 
 def build_config(current: dict) -> dict:
