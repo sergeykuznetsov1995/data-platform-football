@@ -3,16 +3,26 @@
 from __future__ import annotations
 
 import json
-import fcntl
 import os
 import re
 import stat
 import tempfile
 import time
+from contextlib import contextmanager
 from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping, Optional
+
+try:  # POSIX production/CI runners.
+    import fcntl as _fcntl
+except ImportError:  # pragma: no cover - exercised by the Windows live runner
+    _fcntl = None
+
+try:  # Windows direct-discovery runner.
+    import msvcrt as _msvcrt
+except ImportError:  # pragma: no cover - POSIX path
+    _msvcrt = None
 
 from scrapers.sofascore.catalog import SofaScoreCatalog
 from scrapers.sofascore.registry import (
@@ -1147,6 +1157,32 @@ def _read_registry_snapshot(path: Path) -> tuple[Mapping[str, Any], int]:
     return current, mode
 
 
+@contextmanager
+def _exclusive_registry_lock(lock_handle):
+    """Hold the one-byte registry lock on POSIX or Windows."""
+
+    if _fcntl is not None:
+        _fcntl.flock(lock_handle.fileno(), _fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            _fcntl.flock(lock_handle.fileno(), _fcntl.LOCK_UN)
+        return
+    if _msvcrt is None:  # pragma: no cover - supported CPython always has one
+        raise DiscoveryError("no supported atomic registry file lock")
+    lock_handle.seek(0, os.SEEK_END)
+    if lock_handle.tell() == 0:
+        lock_handle.write("\0")
+        lock_handle.flush()
+    lock_handle.seek(0)
+    _msvcrt.locking(lock_handle.fileno(), _msvcrt.LK_LOCK, 1)
+    try:
+        yield
+    finally:
+        lock_handle.seek(0)
+        _msvcrt.locking(lock_handle.fileno(), _msvcrt.LK_UNLCK, 1)
+
+
 def write_registry_atomic(
     path: str | Path,
     document: Mapping[str, Any],
@@ -1164,8 +1200,7 @@ def write_registry_atomic(
         # final compare-and-swap shares this short critical section with the
         # review/activation CLI, closing the read->replace race that could
         # otherwise overwrite an operator decision made between those calls.
-        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
-        try:
+        with _exclusive_registry_lock(lock_handle):
             destination_mode = 0o644
             if destination.exists():
                 current, destination_mode = _read_registry_snapshot(destination)
@@ -1185,25 +1220,27 @@ def write_registry_atomic(
                 dir=str(destination.parent),
             )
             try:
-                os.fchmod(fd, destination_mode)
+                if hasattr(os, "fchmod"):
+                    os.fchmod(fd, destination_mode)
                 with os.fdopen(fd, "wb") as handle:
                     handle.write(payload)
                     handle.flush()
                     os.fsync(handle.fileno())
                 os.replace(temporary, destination)
-                directory_fd = os.open(destination.parent, os.O_RDONLY)
-                try:
-                    os.fsync(directory_fd)
-                finally:
-                    os.close(directory_fd)
+                if not hasattr(os, "fchmod"):
+                    os.chmod(destination, destination_mode)
+                if os.name != "nt":
+                    directory_fd = os.open(destination.parent, os.O_RDONLY)
+                    try:
+                        os.fsync(directory_fd)
+                    finally:
+                        os.close(directory_fd)
             except Exception:
                 try:
                     os.unlink(temporary)
                 except FileNotFoundError:
                     pass
                 raise
-        finally:
-            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
     return True
 
 
