@@ -28,7 +28,7 @@ WITH bronze_dedup AS (
         SELECT
             s.*,
             ROW_NUMBER() OVER (
-                PARTITION BY league, season, team
+                PARTITION BY league, season, "group", team
                 ORDER BY _ingested_at DESC
             ) AS rn
         FROM iceberg.bronze.sofascore_league_table s
@@ -54,7 +54,8 @@ SELECT
 
     -- group_id for WC group stage (Фаза 4 #913). NULL for club leagues / knockout.
     -- "group" is a Trino reserved word — must stay quoted.
-    b."group"                                             AS group_id,
+    NULLIF(b."group", '__total__')                       AS group_id,
+    b."group"                                             AS standing_scope,
 
     -- ===== Lineage =====
     b._ingested_at                                        AS _bronze_ingested_at,

@@ -131,8 +131,11 @@ class TestShotmapFlatten:
         # Unknown/extra source fields pass through automatically (the #840 point).
         assert goal['draw'] is True
         assert goal['is_own_goal'] is False
-        # Old derived/renamed column names are gone (moved to Silver).
-        for dead in ('minute', 'period', 'outcome', 'x', 'y', 'goal_x', 'goal_y'):
+        # Frozen compatibility aliases keep fresh-bootstrap Silver SQL valid.
+        assert goal['minute'] == goal['time']
+        assert goal['x'] == goal['player_coordinates_x']
+        assert goal['y'] == goal['player_coordinates_y']
+        for dead in ('period', 'outcome', 'goal_x', 'goal_y'):
             assert dead not in goal
 
     def test_flatten_missing_id_falls_back_to_composite(self):
@@ -168,7 +171,7 @@ class TestShotmapFlatten:
         assert SofaScoreScraper._flatten_shotmap('1', None) == []
         assert SofaScoreScraper._flatten_shotmap('1', {}) == []
         assert SofaScoreScraper._flatten_shotmap('1', {'shotmap': 'oops'}) == []
-        # #840: an empty shot yields anchors only — no None-filled derived cols.
+        # Empty rows still carry the frozen compatibility schema.
         assert SofaScoreScraper._flatten_shotmap('1', {'shotmap': [{}]}) == [
             {
                 'match_id': '1',
@@ -176,6 +179,9 @@ class TestShotmapFlatten:
                 'player_id': None,
                 'team_id': None,
                 'is_home': None,
+                'minute': None,
+                'x': None,
+                'y': None,
             }
         ]
 
@@ -262,8 +268,8 @@ class TestEventPlayerStatsFlatten:
         # Mirrors the real /event/{id}/player/{pid}/statistics response
         # (verified live 2026-06-05, #301): NO `extra` block and NO
         # `statistics.position` — so is_home/captain/substitute/
-        # position_specific cannot be sourced here and stay None. They are
-        # back-filled from /lineups by the overlay (tested below).
+        # position_specific cannot be sourced here and stay None. Production
+        # capture derives these fields directly from the unified lineups parser.
         return {
             'player': {'id': 11111, 'name': 'Player A'},
             'team': {'id': 1, 'name': 'Team X'},
@@ -291,7 +297,7 @@ class TestEventPlayerStatsFlatten:
         assert row['team_id'] == 1
         assert row['team_name'] == 'Team X'
         # No `extra` block in the real statistics payload → these anchors
-        # are None from the flattener alone; the lineup overlay fills them.
+        # remain None in this pure legacy-payload flattener.
         assert row['is_home'] is None
         assert row['captain'] is None
         assert row['substitute'] is None
@@ -317,6 +323,55 @@ class TestEventPlayerStatsFlatten:
         assert row is not None
         assert row['match_id'] == '1'
         assert row['player_id'] == '1'
+
+
+class TestFirstClassLineups:
+    @pytest.mark.unit
+    def test_preserves_starter_used_and_unused_bench(self):
+        from scrapers.sofascore.scraper import SofaScoreScraper
+
+        rows = SofaScoreScraper._flatten_lineup_side(
+            '42',
+            'home',
+            {'players': [
+                {'player': {'id': 1}, 'substitute': False,
+                 'statistics': {'rating': 7.0}},
+                {'player': {'id': 2}, 'substitute': True,
+                 'statistics': {'rating': 6.2}},
+                {'player': {'id': 3}, 'substitute': True},
+            ]},
+        )
+        by_id = {row['player_id']: row for row in rows}
+        assert by_id['1']['participation_status'] == 'starter'
+        assert by_id['2']['participation_status'] == 'substitute_used'
+        assert by_id['3']['participation_status'] == 'unused_substitute'
+        assert by_id['3']['is_unused_substitute'] is True
+
+
+class TestIncidentsFlatten:
+    @pytest.mark.unit
+    def test_goals_cards_substitutions_var_and_derived_key(self):
+        from scrapers.sofascore.scraper import SofaScoreScraper
+
+        payload = {'incidents': [
+            {'id': 10, 'incidentType': 'goal', 'time': 12,
+             'player': {'id': 1}},
+            {'id': 11, 'incidentType': 'card', 'incidentClass': 'yellow'},
+            {'id': 12, 'incidentType': 'substitution',
+             'playerIn': {'id': 2}, 'playerOut': {'id': 3}},
+            {'incidentType': 'varDecision', 'reason': 'offside'},
+        ]}
+        rows = SofaScoreScraper._flatten_incidents('42', payload)
+        assert [row['incident_type'] for row in rows] == [
+            'goal', 'card', 'substitution', 'varDecision',
+        ]
+        assert rows[0]['player_id'] == 1
+        assert rows[1]['incident_class'] == 'yellow'
+        assert rows[2]['player_in_id'] == 2
+        assert rows[3]['incident_id'].startswith('derived-3-')
+        assert SofaScoreScraper._flatten_incidents('42', payload)[3][
+            'incident_id'
+        ] == rows[3]['incident_id']
 
 
 class TestEventPlayerStatsFromLineups:
@@ -428,184 +483,6 @@ class TestEventPlayerStatsFromLineups:
             '1', {'home': {'players': None}, 'away': {}}, None) == []
 
 
-class TestLineupOverlayLookup:
-    """Tests for _build_lineup_overlay_lookup — the /lineups projection
-    that back-fills is_home/captain/substitute/position_specific (#301)."""
-
-    def _lineups(self):
-        # Shape verified live 2026-06-05 (#301): `captain` present only on
-        # the captain entry; `substitute` a real bool everywhere;
-        # `position` the per-event line.
-        return {
-            'home': {'players': [
-                {'player': {'id': 11111}, 'position': 'G',
-                 'substitute': False, 'captain': True},
-                {'player': {'id': 22222}, 'position': 'D',
-                 'substitute': False},
-            ]},
-            'away': {'players': [
-                {'player': {'id': 33333}, 'position': 'M',
-                 'substitute': True},
-            ]},
-        }
-
-    def test_maps_all_four_fields(self):
-        from scrapers.sofascore.scraper import SofaScoreScraper
-        lookup = SofaScoreScraper._build_lineup_overlay_lookup(self._lineups())
-
-        # int id normalised to str key.
-        assert set(lookup) == {'11111', '22222', '33333'}
-
-        # home → is_home True; captain flag promoted to True.
-        assert lookup['11111'] == {
-            'is_home': True, 'captain': True,
-            'substitute': False, 'position_specific': 'G',
-        }
-        # home, no captain key → captain False (not None).
-        assert lookup['22222']['is_home'] is True
-        assert lookup['22222']['captain'] is False
-        assert lookup['22222']['substitute'] is False
-        assert lookup['22222']['position_specific'] == 'D'
-        # away → is_home False; bench → substitute True.
-        assert lookup['33333']['is_home'] is False
-        assert lookup['33333']['substitute'] is True
-        assert lookup['33333']['position_specific'] == 'M'
-
-    def test_missing_position_is_none(self):
-        from scrapers.sofascore.scraper import SofaScoreScraper
-        lookup = SofaScoreScraper._build_lineup_overlay_lookup(
-            {'home': {'players': [{'player': {'id': 7}, 'substitute': False}]}}
-        )
-        assert lookup['7']['position_specific'] is None
-
-    def test_player_without_id_skipped(self):
-        from scrapers.sofascore.scraper import SofaScoreScraper
-        lookup = SofaScoreScraper._build_lineup_overlay_lookup(
-            {'home': {'players': [{'player': {}, 'position': 'F'}]}}
-        )
-        assert lookup == {}
-
-    def test_garbage_payload(self):
-        from scrapers.sofascore.scraper import SofaScoreScraper
-        assert SofaScoreScraper._build_lineup_overlay_lookup(None) == {}
-        assert SofaScoreScraper._build_lineup_overlay_lookup({}) == {}
-        # Missing/empty sides and non-list players → no raise, empty.
-        assert SofaScoreScraper._build_lineup_overlay_lookup(
-            {'home': {}, 'away': {'players': None}}
-        ) == {}
-
-
-class TestApplyLineupOverlay:
-    """Tests for _apply_lineup_overlay — fill-if-None in-place merge."""
-
-    def test_fills_none_anchors(self):
-        from scrapers.sofascore.scraper import SofaScoreScraper
-        row = {'is_home': None, 'captain': None, 'substitute': None,
-               'position_specific': None, 'rating': 7.8}
-        SofaScoreScraper._apply_lineup_overlay(row, {
-            'is_home': True, 'captain': False,
-            'substitute': True, 'position_specific': 'M',
-        })
-        assert row['is_home'] is True
-        assert row['captain'] is False
-        assert row['substitute'] is True
-        assert row['position_specific'] == 'M'
-        assert row['rating'] == 7.8  # untouched
-
-    def test_does_not_overwrite_existing(self):
-        from scrapers.sofascore.scraper import SofaScoreScraper
-        row = {'is_home': False, 'captain': None,
-               'substitute': None, 'position_specific': None}
-        SofaScoreScraper._apply_lineup_overlay(row, {
-            'is_home': True, 'captain': True,
-            'substitute': True, 'position_specific': 'M',
-        })
-        # Primary (already-set) value wins; only None anchors get filled.
-        assert row['is_home'] is False
-        assert row['captain'] is True
-
-    def test_none_overlay_leaves_row_untouched(self):
-        from scrapers.sofascore.scraper import SofaScoreScraper
-        row = {'is_home': None, 'captain': None,
-               'substitute': None, 'position_specific': None}
-        SofaScoreScraper._apply_lineup_overlay(row, None)
-        assert all(row[c] is None for c in row)
-
-    def test_partial_overlay_fills_subset(self):
-        from scrapers.sofascore.scraper import SofaScoreScraper
-        row = {'is_home': None, 'captain': None,
-               'substitute': None, 'position_specific': None}
-        SofaScoreScraper._apply_lineup_overlay(
-            row, {'captain': True, 'substitute': None,
-                  'is_home': None, 'position_specific': None}
-        )
-        assert row['captain'] is True
-        assert row['substitute'] is None
-        assert row['is_home'] is None
-
-
-class TestEventPlayerStatsOverlayWiring:
-    """read_event_player_stats fetches /lineups once per match and overlays
-    the four anchor fields onto each stat row (#301)."""
-
-    def test_overlay_applied_and_lineup_fetched_once_per_match(self):
-        from scrapers.sofascore.scraper import SofaScoreScraper
-        with patch('scrapers.base.base_scraper.get_rate_limiter'), \
-             patch('scrapers.base.base_scraper.get_retry_policy'), \
-             patch('scrapers.base.base_scraper.get_circuit_breaker'), \
-             patch('scrapers.base.base_scraper.IcebergWriter'):
-            scraper = SofaScoreScraper()
-
-        # Two players in one match.
-        players_by_match = {'M1': ['11111', '33333']}
-
-        def fake_stats(event_id, player_id, max_attempts=3):
-            # Real statistics payload: no `extra`, no statistics.position.
-            return {
-                'player': {'id': int(player_id)},
-                'team': {'id': 1, 'name': 'Team X'},
-                'position': 'F',
-                'statistics': {'rating': '7.0'},
-            }
-
-        lineup_calls = []
-
-        def fake_lineup(event_id, max_attempts=3):
-            lineup_calls.append(event_id)
-            return {
-                'home': {'players': [
-                    {'player': {'id': 11111}, 'position': 'G',
-                     'substitute': False, 'captain': True},
-                ]},
-                'away': {'players': [
-                    {'player': {'id': 33333}, 'position': 'M',
-                     'substitute': True},
-                ]},
-            }
-
-        scraper._fetch_event_player_stats_payload = fake_stats
-        scraper._fetch_lineup_payload = fake_lineup
-
-        df = scraper.read_event_player_stats(
-            league='ENG-Premier League', season=2025,
-            player_ids_by_match=players_by_match,
-        )
-
-        # Exactly one lineup fetch for the single match.
-        assert lineup_calls == ['M1']
-
-        rows = {r['player_id']: r for r in df.to_dict('records')}
-        # Home captain.
-        assert rows['11111']['is_home'] is True
-        assert rows['11111']['captain'] is True
-        assert rows['11111']['substitute'] is False
-        assert rows['11111']['position_specific'] == 'G'
-        # Away substitute.
-        assert rows['33333']['is_home'] is False
-        assert rows['33333']['substitute'] is True
-        assert rows['33333']['position_specific'] == 'M'
-
-
 class TestMatchStatsFlatten:
     """Tests for the team-level per-(match, period, stat) flattener (#25)."""
 
@@ -706,9 +583,11 @@ class TestMatchStatsFlatten:
         assert bp_all['away'] == '45%'
         assert bp_all['compare_code'] == 1
         assert bp_all['value_type'] == 'percent'
-        # Old renamed names are gone (moved to Silver).
-        for dead in ('stat_name', 'stat_key', 'home_text', 'away_text'):
-            assert dead not in bp_all
+        assert bp_all['stat_name'] == bp_all['name']
+        assert bp_all['stat_key'] == bp_all['key']
+        assert bp_all['home_text'] == bp_all['home']
+        assert bp_all['away_text'] == bp_all['away']
+        assert bp_all['statistic_key'] == bp_all['key']
 
         xg = next(r for r in rows if r['name'] == 'Expected goals')
         assert xg['home_value'] == 1.8
@@ -904,10 +783,11 @@ class TestPlayerProfileFlatten:
         assert row['team_id'] == 1                        # was current_team_id
         assert row['team_name'] == 'Team X'               # was current_team_name
         assert row['retired'] is False
-        # Old derived/renamed names are gone (moved to Silver).
-        for dead in ('height_cm', 'date_of_birth', 'country_code',
-                     'current_team_id', 'current_team_name'):
-            assert dead not in row
+        assert row['height_cm'] == row['height']
+        assert row['date_of_birth'] == '1990-01-01'
+        assert row['country_code'] == row['country_alpha2']
+        assert row['current_team_id'] == row['team_id']
+        assert row['current_team_name'] == row['team_name']
 
     def test_garbage(self):
         from scrapers.sofascore.scraper import SofaScoreScraper
@@ -925,7 +805,7 @@ class TestPlayerProfileFlatten:
         row = SofaScoreScraper._flatten_player_profile(payload)
         assert row is not None
         assert row['date_of_birth_timestamp'] is None
-        assert 'date_of_birth' not in row
+        assert row['date_of_birth'] is None
 
     def test_country_kept_raw_no_fallback_in_bronze(self):
         from scrapers.sofascore.scraper import SofaScoreScraper
@@ -940,105 +820,8 @@ class TestPlayerProfileFlatten:
         row = SofaScoreScraper._flatten_player_profile(payload)
         assert row['country_name'] == 'Brazil'
         assert row['country_alpha2'] == 'BR'
-        assert 'nationality' not in row     # no country.name fallback in Bronze
-        assert 'country_code' not in row
-
-
-class TestReadPlayerRatingsCapture:
-    """read_player_ratings sources /lineups from the Camoufox capture
-    transport (#757) — the tls_requests REST path is Turnstile-blocked.
-    We patch the ``_iter_lineup_payloads`` seam so no browser is needed;
-    the per-side flatten + (league, season) tagging is what we assert here.
-    """
-
-    def _scraper(self):
-        from scrapers.sofascore.scraper import SofaScoreScraper
-        with patch('scrapers.base.base_scraper.get_rate_limiter'), \
-             patch('scrapers.base.base_scraper.get_retry_policy'), \
-             patch('scrapers.base.base_scraper.get_circuit_breaker'), \
-             patch('scrapers.base.base_scraper.IcebergWriter'):
-            return SofaScoreScraper(leagues=['ENG-Premier League'], seasons=[2025])
-
-    def _lineups(self):
-        return {
-            "home": {
-                "players": [
-                    {
-                        "player": {"id": 11111},
-                        "position": "G",
-                        "captain": True,
-                        "substitute": False,
-                        "shirtNumber": 1,
-                        "statistics": {"rating": "7.2"},
-                    },
-                ]
-            },
-            "away": {
-                "players": [
-                    {
-                        "player": {"id": 22222},
-                        "position": "F",
-                        "statistics": {"rating": "6.5"},
-                    },
-                ]
-            },
-        }
-
-    @pytest.mark.unit
-    def test_builds_rows_from_captured_lineups(self):
-        # Arrange
-        scraper = self._scraper()
-        captured = []
-
-        def fake_iter(match_ids):
-            for mid in match_ids:
-                captured.append(str(mid))
-                yield str(mid), self._lineups()
-
-        scraper._iter_lineup_payloads = fake_iter
-
-        # Act
-        df = scraper.read_player_ratings(
-            league='ENG-Premier League', season=2025, match_ids=['M1', 'M2'],
-        )
-
-        # Assert — one capture per match in order, 2 matches × 2 players.
-        assert captured == ['M1', 'M2']
-        assert len(df) == 4
-        rows = {(r["match_id"], r["player_id"]): r for r in df.to_dict("records")}
-        assert rows[("M1", "11111")]["team_side"] == "home"
-        assert rows[("M1", "11111")]["rating"] == 7.2
-        assert rows[("M1", "11111")]["position"] == "G"
-        assert rows[("M1", "11111")]["captain"] is True
-        assert rows[("M1", "11111")]["substitute"] is False
-        assert rows[("M1", "11111")]["shirt_number"] == 1
-        assert rows[("M1", "22222")]["team_side"] == "away"
-        assert rows[("M1", "22222")]["rating"] == 6.5
-        # 2025 -> soccerdata short slug '2526' (partition key alignment, #27).
-        assert set(df['season']) == {'2526'}
-        assert set(df['league']) == {'ENG-Premier League'}
-        assert set(df['_entity_type']) == {'player_ratings'}
-
-    @pytest.mark.unit
-    def test_graceful_empty_when_no_lineups_captured(self):
-        # Arrange — every capture misses (Turnstile not solved / proxy dead).
-        scraper = self._scraper()
-
-        def fake_iter(match_ids):
-            for mid in match_ids:
-                yield str(mid), None
-
-        scraper._iter_lineup_payloads = fake_iter
-
-        # Act
-        df = scraper.read_player_ratings(
-            league='ENG-Premier League', season=2025, match_ids=['M1'],
-        )
-
-        # Assert — empty frame but column contract preserved (E4.4 stub path).
-        assert df.empty
-        assert 'match_id' in df.columns
-        assert 'rating' in df.columns
+        assert row['nationality'] is None
+        assert row['country_code'] == 'BR'
 
 
 class TestReadMatchCapture:
@@ -1114,6 +897,10 @@ class TestReadMatchCapture:
                  'playerCoordinates': {'x': 90, 'y': 50},
                  'goalMouthCoordinates': {'x': 100, 'y': 50}, 'xg': 0.45},
             ]},
+            'incidents': {'incidents': [
+                {'id': 77, 'incidentType': 'goal', 'time': 23,
+                 'player': {'id': 11111}, 'isHome': True},
+            ]},
         }
 
     @pytest.mark.unit
@@ -1141,6 +928,10 @@ class TestReadMatchCapture:
         assert set(ratings["season"]) == {"2526"}
         assert set(eps["season"]) == {"2526"}
         assert set(eps["_entity_type"]) == {"event_player_stats"}
+        assert len(out['lineups']) == 4
+        assert set(out['lineups']['_entity_type']) == {'lineups'}
+        assert len(out['incidents']) == 2
+        assert set(out['incidents']['incident_type']) == {'goal'}
         status = out["capture_status"]
         assert status["capture_complete"].all()
         assert set(status["lineups_status"]) == {"success"}
@@ -1219,9 +1010,11 @@ class TestReadMatchCapture:
         # Passthrough bonus fields the old fixed list dropped.
         assert row['stadium_capacity'] == 55097
         assert row['country_alpha2'] == 'EN'
-        # Old derived/renamed names are gone (moved to Silver).
-        for dead in ('stadium', 'city', 'country', 'venue_latitude', 'venue_longitude'):
-            assert dead not in row
+        assert row['stadium'] == row['stadium_name']
+        assert row['city'] == row['city_name']
+        assert row['country'] == row['country_name']
+        assert row['venue_latitude'] == row['venue_coordinates_latitude']
+        assert row['venue_longitude'] == row['venue_coordinates_longitude']
 
     @pytest.mark.unit
     def test_requests_all_tabs_and_event(self):
@@ -1343,8 +1136,11 @@ class TestFlattenEventVenue:
         assert row['country_alpha2'] == 'EN'
         assert row['venue_coordinates_latitude'] == 53.483056
         assert row['venue_coordinates_longitude'] == -2.200278
-        for dead in ('stadium', 'city', 'country', 'venue_latitude', 'venue_longitude'):
-            assert dead not in row
+        assert row['stadium'] == row['stadium_name']
+        assert row['city'] == row['city_name']
+        assert row['country'] == row['country_name']
+        assert row['venue_latitude'] == row['venue_coordinates_latitude']
+        assert row['venue_longitude'] == row['venue_coordinates_longitude']
 
     @pytest.mark.unit
     def test_extracts_flat_issue_shape(self):
@@ -1787,8 +1583,8 @@ class TestReadScheduleViaCapture:
         assert {'game_id', 'home_team_name', 'away_team_name',
                 'home_score_current', 'start_timestamp', 'round_info_round',
                 'status_type'} <= cols
-        assert not ({'date', 'home_team', 'away_team', 'home_score',
-                     'away_score', 'round', 'week', 'game'} & cols)
+        assert {'home_team', 'away_team', 'home_score', 'away_score'} <= cols
+        assert not ({'date', 'round', 'week', 'game'} & cols)
         # start_timestamp stays a raw epoch int (no pandas timestamp coercion).
         finished = df[df['game_id'] == 101].iloc[0]
         assert finished['start_timestamp'] == 1719000000
@@ -1969,6 +1765,9 @@ class TestReadScheduleViaCapture:
                             "id": 101,
                             "season": season,
                             "status": {"type": "finished"},
+                            "startTimestamp": 1750000000,
+                            "homeTeam": {"id": 1, "name": "Home"},
+                            "awayTeam": {"id": 2, "name": "Away"},
                         }
                     ],
                     "hasNextPage": False,
@@ -2570,42 +2369,6 @@ class TestReadLeagueTableCapture:
 
 class TestTournamentSnapshot:
     @pytest.mark.unit
-    def test_scrape_all_uses_combined_capture_and_guarded_saves(self):
-        import pandas as pd
-
-        from scrapers.sofascore.scraper import SofaScoreScraper
-
-        with (
-            patch("scrapers.base.base_scraper.get_rate_limiter"),
-            patch("scrapers.base.base_scraper.get_retry_policy"),
-            patch("scrapers.base.base_scraper.get_circuit_breaker"),
-            patch("scrapers.base.base_scraper.IcebergWriter"),
-        ):
-            scraper = SofaScoreScraper(
-                leagues=["ENG-Premier League"],
-                seasons=[2025],
-            )
-        schedule = pd.DataFrame({"game_id": [1]})
-        table = pd.DataFrame({"team": ["A"]})
-        scraper.read_tournament_snapshot = MagicMock(
-            return_value=(schedule, table),
-        )
-        scraper.save_to_iceberg = MagicMock(
-            side_effect=["schedule_path", "table_path"],
-        )
-
-        result = scraper.scrape_all()
-
-        assert result == {
-            "schedule": "schedule_path",
-            "league_table": "table_path",
-        }
-        scraper.read_tournament_snapshot.assert_called_once_with()
-        assert scraper.save_to_iceberg.call_count == 2
-        for call in scraper.save_to_iceberg.call_args_list:
-            assert call.kwargs["min_replace_ratio"] == 0.9
-
-    @pytest.mark.unit
     def test_world_cup_keeps_literal_snapshot_target_and_partition(self):
         from scrapers.sofascore.scraper import SofaScoreScraper
 
@@ -2716,6 +2479,7 @@ class TestTournamentSnapshot:
                             "id": 1,
                             "season": season,
                             "status": {"type": "finished"},
+                            "startTimestamp": 1750000000,
                             "homeTeam": {"name": "A"},
                             "awayTeam": {"name": "B"},
                         }
@@ -2812,8 +2576,22 @@ class TestTournamentSnapshot:
                 "json": {"seasons": [season]},
             }
         }
-        event1 = {"id": 1, "season": season, "status": {"type": "finished"}}
-        event2 = {"id": 2, "season": season, "status": {"type": "finished"}}
+        event1 = {
+            "id": 1,
+            "season": season,
+            "status": {"type": "finished"},
+            "startTimestamp": 1750000000,
+            "homeTeam": {"id": 1, "name": "A"},
+            "awayTeam": {"id": 2, "name": "B"},
+        }
+        event2 = {
+            "id": 2,
+            "season": season,
+            "status": {"type": "finished"},
+            "startTimestamp": 1750003600,
+            "homeTeam": {"id": 3, "name": "C"},
+            "awayTeam": {"id": 4, "name": "D"},
+        }
         first = {
             **seasons_rec,
             "/api/v1/unique-tournament/17/season/76986/events/last/0": {

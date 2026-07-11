@@ -37,6 +37,7 @@ ZERO_TRAFFIC = {
     "direct_response_bytes": 0,
     "paid_proxy_bytes": 0,
     "browser_sessions": 0,
+    "browser_navigations": 0,
 }
 
 
@@ -53,6 +54,15 @@ def _parser() -> argparse.ArgumentParser:
         "--output",
         default=DEFAULT_REPORT_PATH,
         help="Atomic JSON run report",
+    )
+    parser.add_argument(
+        "--scope",
+        choices=("full", "active-reviewed"),
+        default="full",
+        help=(
+            "full weekly catalog scan, or a lightweight refresh of active "
+            "and already-reviewed tournaments"
+        ),
     )
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument(
@@ -131,7 +141,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             raise ValueError("--output must differ from --registry")
         existing = _read_registry(registry)
         client = DirectSofaScoreClient()
-        discovered, discovery_report = discover_registry(existing, client)
+        if args.scope == "full":
+            # Preserve the long-standing two-argument embedding contract.
+            discovered, discovery_report = discover_registry(existing, client)
+        else:
+            discovered, discovery_report = discover_registry(
+                existing, client, scope=args.scope
+            )
         changed = discovered != existing
         report.update(discovery_report)
         report["changed"] = changed
@@ -166,6 +182,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         traffic = report.setdefault("traffic", dict(ZERO_TRAFFIC))
         traffic["paid_proxy_bytes"] = 0
         traffic["browser_sessions"] = 0
+        traffic["browser_navigations"] = 0
         if report_path != registry:
             try:
                 _write_json_atomic(report_path, report)

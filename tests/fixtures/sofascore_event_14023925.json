@@ -1,0 +1,21 @@
+{
+  "event": {
+    "id": 14023925,
+    "startTimestamp": 1784307600,
+    "status": {"code": 100, "type": "finished", "description": "Ended"},
+    "uniqueTournament": {"id": 17, "name": "Premier League"},
+    "season": {"id": 76986, "name": "Premier League 25/26", "year": "25/26"},
+    "homeTeam": {"id": 1, "name": "Home FC", "gender": "M", "teamType": 0},
+    "awayTeam": {"id": 2, "name": "Away FC", "gender": "M", "teamType": 0},
+    "homeScore": {"current": 1, "display": 1},
+    "awayScore": {"current": 0, "display": 0},
+    "roundInfo": {"round": 1},
+    "venue": {
+      "stadium": {"id": 51, "name": "Example Stadium", "capacity": 50000},
+      "city": {"name": "Example City"},
+      "country": {"name": "England", "alpha2": "GB"},
+      "venueCoordinates": {"latitude": 51.5, "longitude": -0.1}
+    },
+    "referee": {"id": 7001, "name": "Example Referee", "country": {"name": "England"}}
+  }
+}

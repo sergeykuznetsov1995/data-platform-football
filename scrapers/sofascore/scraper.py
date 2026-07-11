@@ -7,9 +7,10 @@ Scraper for SofaScore match data, live scores, and statistics.
 Source: https://www.sofascore.com
 """
 
+import hashlib
+import json
 import logging
 import os
-import time
 from collections import defaultdict
 from contextlib import contextmanager
 from datetime import datetime
@@ -35,12 +36,6 @@ from scrapers.sofascore.catalog import SofaScoreCatalog
 logger = logging.getLogger(__name__)
 
 
-# SofaScore public REST API
-_SOFASCORE_API = "https://api.sofascore.com/api/v1"
-_LINEUPS_PATH = "/event/{event_id}/lineups"
-_SHOTMAP_PATH = "/event/{event_id}/shotmap"
-_EVENT_PLAYER_STATS_PATH = "/event/{event_id}/player/{player_id}/statistics"
-_MATCH_STATS_PATH = "/event/{event_id}/statistics"
 _TERMINAL_CAPTURE_STATES = frozenset({"success", "not_available"})
 
 
@@ -143,16 +138,16 @@ class SofaScoreScraper(SoccerdataScraper):
     - Player ratings
     - Heatmaps and position data
 
-    Usage:
-        scraper = SofaScoreScraper(
-            leagues=['ENG-Premier League'],
-            seasons=[2023, 2024]
-        )
-        result = scraper.scrape_all()
+    DAG, CLI and backfill consumers call the unified match/player capture
+    readers and own their manifest-aware incremental writes.
     """
 
     SOURCE_NAME = 'sofascore'
     DEFAULT_RATE_LIMIT = 20  # SofaScore can be strict
+    # Explicitly disable BaseScraper's standalone writer hook. ABCMeta treats
+    # this non-callable override as implemented, while any accidental caller
+    # fails closed instead of bypassing the common runner/manifest.
+    scrape_all = None
     # Camoufox capture attempts per league (schedule / league_table). Each
     # attempt gets a FRESH residential proxy — the weekend top-5 backfill lost
     # whole league-seasons to single transient proxy failures (#879).
@@ -165,13 +160,19 @@ class SofaScoreScraper(SoccerdataScraper):
         **kwargs
     ):
         super().__init__(leagues=leagues, seasons=seasons, **kwargs)
-        # Residential-proxy traffic audit (#789 + #879). Passive:
-        # - response-body bytes of the tls_requests REST path
-        #   (`_fetch_json_endpoint`), keyed by host;
-        # - rx+tx bytes of each Camoufox capture session (schedule/standings/
-        #   lineups), folded in at session teardown via `_camoufox_session`.
-        # Surfaced via get_traffic_stats().
-        self._proxy_bytes: int = 0
+        # Every network-capable entrypoint, including direct library use, is
+        # activation-gated.  Discovery may catalog women/youth/reserve rows,
+        # but an unreviewed or disabled tournament can never reach a browser.
+        for league in self.leagues:
+            tournament = _SOFASCORE_CATALOG.competition(league)
+            if not tournament.capture_allowed:
+                reasons = '; '.join(tournament.activation_eligibility.reasons)
+                raise ValueError(
+                    f"SofaScore capture denied for {league}: "
+                    f"enabled={tournament.enabled}; {reasons}"
+                )
+        # Residential-proxy traffic audit (#879): rx+tx bytes of each Camoufox
+        # session are folded in at teardown via ``_camoufox_session``.
         self._proxy_bytes_by_host: Dict[str, int] = defaultdict(int)
         self._camoufox_bytes: int = 0
         self._camoufox_sessions: int = 0
@@ -179,23 +180,21 @@ class SofaScoreScraper(SoccerdataScraper):
         self._browser_api_fetches: int = 0
         self._browser_blocked_requests: int = 0
         self._fallback_navigations: int = 0
+        self._last_raw_records: Dict[str, dict] = {}
         self._camoufox_proxy_objects: Dict[tuple, object] = {}
         self._last_camoufox_proxy_key: Optional[tuple] = None
 
     def get_traffic_stats(self) -> Dict:
-        """Residential-proxy bytes seen this run (#789 tls path + #879 Camoufox).
+        """Camoufox residential-proxy bytes seen by the compatibility reader.
 
-        ``proxy_response_bytes/mb`` cover BOTH transports; ``camoufox_bytes/mb``
-        break the browser share out. Units caveat: the Camoufox share counts
-        rx+tx including headers (``request.sizes()``), the tls share counts
-        response bodies only — so the total is still a slight lower bound of
-        billable traffic. Shape mirrors ``FlareSolverrClient.get_traffic_stats``
-        so ``utils.proxy_traffic`` can consume it uniformly.
+        Provider-authoritative accounting lives in the common capture engine;
+        this passive rx+tx view remains for browser diagnostics and legacy
+        runner output. Keys remain stable for the shared traffic reporter.
         """
         by_host = sorted(
             self._proxy_bytes_by_host.items(), key=lambda kv: -kv[1]
         )
-        total = self._proxy_bytes + self._camoufox_bytes
+        total = self._camoufox_bytes
         return {
             'proxy_response_bytes': total,
             'proxy_response_mb': round(total / 1024 / 1024, 4),
@@ -233,7 +232,10 @@ class SofaScoreScraper(SoccerdataScraper):
 
         cap = None
         try:
-            with SofascoreCamoufoxCapture(proxy=proxy) as cap:
+            with SofascoreCamoufoxCapture(
+                proxy=proxy,
+                request_limiter=self._acquire_camoufox_request,
+            ) as cap:
                 yield cap
         finally:
             if cap is not None:
@@ -254,17 +256,11 @@ class SofaScoreScraper(SoccerdataScraper):
                     if isinstance(value, (int, float)) and value > 0:
                         setattr(self, target, getattr(self, target) + int(value))
 
-    def _record_proxy_bytes(self, url: str, resp) -> None:
-        """Accumulate response-body bytes for the residential-proxy audit (#789).
-
-        Never raises — a passive traffic counter must not break a scrape.
-        """
-        try:
-            nbytes = len(resp.content or b"")
-        except Exception:  # noqa: BLE001 — counter must never break the fetch
-            return
-        self._proxy_bytes += nbytes
-        self._proxy_bytes_by_host[urlsplit(url).netloc or url] += nbytes
+    def _acquire_camoufox_request(self) -> None:
+        """Rate-limit and count one actual Camoufox navigation/API request."""
+        if self._rate_limiter.acquire() is False:
+            raise RuntimeError("SofaScore request rate limiter refused a request")
+        self._stats["requests"] += 1
 
     def read_schedule(self) -> Optional[pd.DataFrame]:
         """Read the match schedule + results via Camoufox capture (#761).
@@ -312,6 +308,9 @@ class SofaScoreScraper(SoccerdataScraper):
             # partition keys + lineage (added by _add_metadata below).
             df['league'] = league
             df['season'] = season_slug
+            from dags.utils.sofascore_dq import validate_schedule_rows
+
+            validate_schedule_rows(df.to_dict('records')).require()
             logger.info("Capture schedule league=%s season=%s: %d events.",
                         league, season_slug, len(df))
             frames.append(df)
@@ -373,7 +372,6 @@ class SofaScoreScraper(SoccerdataScraper):
             std_path = None
             fetched_standings = None
             try:
-                self._rate_limiter.acquire()
                 with self._camoufox_session(proxy) as cap:
                     # Navigation exists only to establish origin + Turnstile
                     # clearance. Target data comes from exact same-origin API
@@ -475,6 +473,34 @@ class SofaScoreScraper(SoccerdataScraper):
                     self._CAPTURE_ATTEMPTS,
                 )
                 continue
+            for path, record in buffer.items():
+                if not isinstance(record, dict) or record.get('body') is None:
+                    continue
+                self._last_raw_records[
+                    f'{int(ut_id)}:{int(sid)}:{path}'
+                ] = {
+                    'source_tournament_id': str(int(ut_id)),
+                    'source_season_id': str(int(sid)),
+                    'target_type': 'season',
+                    'target_id': str(int(sid)),
+                    'endpoint': path,
+                    'league': league,
+                    'season': season_short,
+                    **dict(record),
+                }
+            if isinstance(fetched_standings, dict) and std_path:
+                self._last_raw_records[
+                    f'{int(ut_id)}:{int(sid)}:{std_path}'
+                ] = {
+                    'source_tournament_id': str(int(ut_id)),
+                    'source_season_id': str(int(sid)),
+                    'target_type': 'season',
+                    'target_id': str(int(sid)),
+                    'endpoint': std_path,
+                    'league': league,
+                    'season': season_short,
+                    **dict(fetched_standings),
+                }
             if events is None:
                 logger.warning(
                     "Tournament events unanswered league=%s sid=%s (attempt %d/%d).",
@@ -741,6 +767,11 @@ class SofaScoreScraper(SoccerdataScraper):
                 schedule = pd.DataFrame([normalize_event(ev) for ev in events])
                 schedule["league"] = league
                 schedule["season"] = season_short
+                from dags.utils.sofascore_dq import validate_schedule_rows
+
+                validate_schedule_rows(
+                    schedule.to_dict('records')
+                ).require()
                 schedule_frames.append(schedule)
                 logger.info(
                     "Tournament snapshot schedule league=%s season=%s: %d rows.",
@@ -777,35 +808,6 @@ class SofaScoreScraper(SoccerdataScraper):
                 "league_table",
             )
         return schedule_out, standings_out
-
-    def read_team_season_stats(self) -> Optional[pd.DataFrame]:
-        """
-        Read team season statistics.
-
-        Note: Sofascore doesn't have this method in soccerdata.
-        Returns league table instead.
-        """
-        return self.read_league_table()
-
-    def read_team_match_stats(self) -> Optional[pd.DataFrame]:
-        """
-        Read team match-level statistics.
-
-        Note: Sofascore doesn't have this method in soccerdata.
-        Returns None.
-        """
-        logger.info("Sofascore team match stats not available in soccerdata")
-        return None
-
-    def read_player_match_stats(self) -> Optional[pd.DataFrame]:
-        """
-        Read player match-level statistics with ratings.
-
-        Note: Sofascore doesn't have this method in soccerdata.
-        Returns None.
-        """
-        logger.info("Sofascore player match stats not available in soccerdata")
-        return None
 
     # ------------------------------------------------------------------
     # R0.2b — player_ratings (Opta scale 0.0–10.0)
@@ -867,164 +869,6 @@ class SofaScoreScraper(SoccerdataScraper):
 
         return [str(int(g)) for g in df['game_id'].dropna().tolist()]
 
-    def _build_tls_session(self):
-        """Create a tls_requests.Client bound to the next residential
-        proxy, mirroring the JA3/JA4 fingerprint workaround the rest of
-        the platform relies on.
-        """
-        import tls_requests
-
-        proxy_url = None
-        proxy_obj = None
-        if self._proxy_manager is not None and self._proxy_manager.total_count > 0:
-            proxy_obj = self._proxy_manager.get_proxy()
-            if proxy_obj is not None:
-                proxy_url = proxy_obj.url
-        elif self.proxy:
-            proxy_url = self.proxy
-
-        client = tls_requests.Client(proxy=proxy_url) if proxy_url else tls_requests.Client()
-        return client, proxy_obj
-
-    def _fetch_json_endpoint(
-        self,
-        url: str,
-        max_attempts: int = 3,
-        label: str = 'endpoint',
-        context: Optional[Dict] = None,
-    ) -> Optional[dict]:
-        """Generic GET → JSON over SofaScore's public REST API with proxy
-        rotation, rate-limit, retry, and graceful 404.
-
-        Parameters
-        ----------
-        url : str
-            Fully-qualified request URL.
-        max_attempts : int
-            Retry budget; matches ``_fetch_lineup_payload`` historical
-            behaviour (3 attempts, exponential backoff on 429).
-        label : str
-            Short tag used in log lines (e.g. ``"lineups"``, ``"shotmap"``).
-        context : dict | None
-            Extra fields stored on ``self._last_endpoint_error`` for
-            R0.2B_FALLBACK classification by the runner (e.g.
-            ``{'event_id': '123'}``).
-
-        Returns
-        -------
-        dict | None
-            Parsed JSON on 200. ``None`` on 404 (legitimate-empty) or
-            after exhausted attempts (structural failure).
-        """
-        import tls_requests
-        from scrapers.utils.proxy_manager import ErrorType
-
-        last_status = None
-        last_error = None
-        for attempt in range(1, max_attempts + 1):
-            self._rate_limiter.acquire()
-            self._stats['requests'] += 1
-
-            client, proxy_obj = self._build_tls_session()
-            try:
-                # (connect, read) — keep wall-clock per attempt < 15s so a
-                # hung proxy rotates instead of stalling the whole backfill
-                # (issue #30).
-                resp = client.get(url, timeout=(5.0, 8.0))
-                self._record_proxy_bytes(url, resp)  # #789
-                last_status = resp.status_code
-                if resp.status_code == 200:
-                    if proxy_obj is not None:
-                        proxy_obj.record_success()
-                    self._stats['successes'] += 1
-                    try:
-                        return resp.json()
-                    except Exception as parse_err:  # pragma: no cover - defensive
-                        last_error = f"json_decode: {parse_err}"
-                        logger.warning(
-                            "%s payload not JSON (%s): %s",
-                            label, context or url, parse_err,
-                        )
-                        break
-                if resp.status_code == 403:
-                    if proxy_obj is not None:
-                        proxy_obj.record_failure(ErrorType.FORBIDDEN.value)
-                    last_error = "HTTP 403 (likely TLS fingerprint / IP block)"
-                elif resp.status_code == 429:
-                    if proxy_obj is not None:
-                        proxy_obj.record_failure(ErrorType.RATE_LIMIT.value)
-                    last_error = "HTTP 429 rate-limited"
-                    time.sleep(2 ** attempt)
-                elif resp.status_code == 404:
-                    # Some events / players / seasons don't expose the
-                    # resource (cancelled match, retired player) — treat
-                    # as legitimate empty.
-                    logger.info("%s not exposed (%s) — 404", label, context or url)
-                    self._stats['successes'] += 1
-                    return None
-                else:
-                    if proxy_obj is not None:
-                        proxy_obj.record_failure(ErrorType.UNKNOWN.value)
-                    last_error = f"HTTP {resp.status_code}"
-            except tls_requests.exceptions.RequestException as e:  # type: ignore[attr-defined]
-                if proxy_obj is not None:
-                    proxy_obj.record_failure(ErrorType.CONNECTION.value)
-                last_error = f"transport: {type(e).__name__}: {e}"
-            except Exception as e:
-                if proxy_obj is not None:
-                    proxy_obj.record_failure(ErrorType.UNKNOWN.value)
-                last_error = f"{type(e).__name__}: {e}"
-            finally:
-                try:
-                    client.close()
-                except Exception:
-                    pass
-
-            logger.warning(
-                "%s attempt %d/%d failed (%s): %s",
-                label, attempt, max_attempts, context or url, last_error,
-            )
-
-        self._stats['failures'] += 1
-        # Surface the structural reason so the runner can decide whether
-        # to emit the R0.2B_FALLBACK marker. Stored under a single rolling
-        # attribute so any endpoint helper can classify the last failure.
-        self._last_endpoint_error = {
-            'label': label,
-            'status': last_status,
-            'error': last_error,
-            **(context or {}),
-        }
-        return None
-
-    def _fetch_lineup_payload(
-        self,
-        event_id: str,
-        max_attempts: int = 3,
-    ) -> Optional[dict]:
-        """Fetch /event/{id}/lineups JSON via the generic endpoint helper.
-
-        Thin wrapper around :meth:`_fetch_json_endpoint` that preserves
-        the historical ``self._last_lineup_error`` attribute the
-        R0.2B player_ratings runner classifies fallbacks against.
-        """
-        url = f"{_SOFASCORE_API}{_LINEUPS_PATH.format(event_id=event_id)}"
-        payload = self._fetch_json_endpoint(
-            url=url,
-            max_attempts=max_attempts,
-            label='lineups',
-            context={'event_id': event_id},
-        )
-        if payload is None:
-            err = getattr(self, '_last_endpoint_error', None)
-            if err is not None:
-                self._last_lineup_error = {
-                    'event_id': event_id,
-                    'status': err.get('status'),
-                    'error': err.get('error'),
-                }
-        return payload
-
     @staticmethod
     def _flatten_lineup_side(
         match_id: str,
@@ -1070,92 +914,29 @@ class SofaScoreScraper(SoccerdataScraper):
                 # rating raw (Silver drops 0.0); position per-event or nominal.
                 'rating': _coerce_scalar(stats.get('rating')),
                 'position': entry.get('position') or player.get('position') or None,
+                # First-class lineup semantics.  An unused substitute is still
+                # part of the player universe and must receive a profile even
+                # though SofaScore supplies no statistics/rating for the match.
+                'is_starter': not bool(entry.get('substitute')),
+                'is_bench': bool(entry.get('substitute')),
+                'is_unused_substitute': bool(entry.get('substitute')) and not bool(stats),
+                'participation_status': (
+                    'starter'
+                    if not bool(entry.get('substitute'))
+                    else ('substitute_used' if bool(stats) else 'unused_substitute')
+                ),
             }
             _auto_flatten(entry, row, skip=('player', 'statistics'))
             rows.append(row)
 
         return rows
 
-    @staticmethod
-    def _build_lineup_overlay_lookup(
-        lineup_payload: dict,
-    ) -> Dict[str, Dict[str, object]]:
-        """Map ``player_id -> {is_home, captain, substitute,
-        position_specific}`` from a ``/event/{id}/lineups`` payload.
-
-        The ``.../player/{pid}/statistics`` endpoint returns ``extra:
-        null`` and no ``statistics.position`` (verified live 2026-06-05,
-        #301), so these four anchor columns are 100% NULL when sourced
-        from there alone. ``/lineups`` carries them per player:
-
-        - ``is_home`` — derived from the side (home -> True, away -> False).
-        - ``captain`` — ``entry['captain']`` is present (``True``) only on
-          the captain's entry; absent elsewhere -> ``bool(...)`` yields
-          ``False`` for every other named player.
-        - ``substitute`` — ``entry['substitute']`` is a real bool on every
-          entry (starters ``False``, bench ``True``).
-        - ``position_specific`` — the per-event line ``entry['position']``
-          (``'G'/'D'/'M'/'F'``).
-
-        Player ids mirror :meth:`_flatten_lineup_side`'s ``str(int(pid))``
-        normalisation so the lookup keys match the ``pids`` resolved from
-        ``bronze.sofascore_player_ratings``. Returns ``{}`` for an empty /
-        non-dict payload (no raise).
-        """
-        lookup: Dict[str, Dict[str, object]] = {}
-        if not isinstance(lineup_payload, dict):
-            return lookup
-
-        for side in ('home', 'away'):
-            side_payload = lineup_payload.get(side) or {}
-            if not isinstance(side_payload, dict):
-                continue
-            for entry in side_payload.get('players', []) or []:
-                if not isinstance(entry, dict):
-                    continue
-                player = entry.get('player') or {}
-                pid = player.get('id')
-                if pid is None:
-                    continue
-                player_id_str = (
-                    str(int(pid)) if isinstance(pid, (int, float)) else str(pid)
-                )
-                lookup[player_id_str] = {
-                    'is_home': side == 'home',
-                    'captain': bool(entry.get('captain')),
-                    'substitute': bool(entry.get('substitute')),
-                    'position_specific': entry.get('position') or None,
-                }
-
-        return lookup
-
-    @staticmethod
-    def _apply_lineup_overlay(
-        row: Dict,
-        overlay: Optional[Dict[str, object]],
-    ) -> None:
-        """Fill ``is_home/captain/substitute/position_specific`` on a
-        stats ``row`` in-place from a per-player lineup ``overlay``.
-
-        Fill-if-None: only writes where ``row`` is currently ``None`` and
-        ``overlay`` provides a non-None value. If SofaScore ever starts
-        returning a populated ``extra`` block on the statistics endpoint,
-        that primary source wins and the overlay stays a pure backfill.
-        ``overlay=None`` (player absent from lineups) leaves the row
-        untouched.
-        """
-        if not overlay:
-            return
-        for col in ('is_home', 'captain', 'substitute', 'position_specific'):
-            if row.get(col) is None and overlay.get(col) is not None:
-                row[col] = overlay[col]
-
     def _camoufox_proxy(self) -> Optional[dict]:
         """Build a Camoufox/Playwright proxy dict (creds split out — browsers
         reject creds embedded in the URL) from the configured residential
         proxy. Returns ``None`` when none is configured; SofaScore's Turnstile
         then 403s every data XHR (#757), so a proxy is required in production.
-        Mirrors :meth:`_build_tls_session`'s proxy selection.
+        Reuses the platform proxy manager's rotation state.
         """
         proxy_obj = None
         if self._proxy_manager is not None and self._proxy_manager.total_count > 0:
@@ -1266,6 +1047,7 @@ class SofaScoreScraper(SoccerdataScraper):
         required=("lineups",),
         session_max: int = 500,
         item_max_attempts: int = 2,
+        endpoint_names_by_match: Optional[Dict[str, Tuple[str, ...]]] = None,
     ):
         """Yield ``(match_id, endpoints)`` by capturing each match page through a
         Camoufox session, restarted on a FRESH proxy every ``session_max``
@@ -1284,13 +1066,10 @@ class SofaScoreScraper(SoccerdataScraper):
           instead of spending more full navigations on the same exit.
 
         The daily run (a handful of matches) crosses neither threshold, so it
-        keeps its single-session behaviour. Generalises the ratings-only lineup
-        iterator so the daily consolidated path (#751 PR1) also gets the
+        keeps its single-session behaviour. The consolidated path gets the
         ``event`` payload (``homeTeam``/``awayTeam`` — team mapping for
-        ``event_player_stats``) from the SAME navigation. Replaces the dead
-        ``tls_requests`` REST path: SofaScore's API is Cloudflare-Turnstile-gated
-        and only a real Firefox (Camoufox) behind a residential proxy passes it;
-        the SPA fires its own XHRs and we capture the responses. ``endpoints``
+        ``event_player_stats``) from the SAME navigation. The SPA fires its own
+        XHRs and the session captures those responses. ``endpoints``
         without ``lineups`` means the capture missed (Turnstile not solved /
         proxy dead). The generator owns the browser session — the caller MUST
         ``.close()`` it (via try/finally) so it tears down even on an early
@@ -1318,6 +1097,7 @@ class SofaScoreScraper(SoccerdataScraper):
         item_attempts: Dict[str, int] = defaultdict(int)
         partials: Dict[str, Dict[str, dict]] = defaultdict(dict)
         partial_states: Dict[str, Dict[str, str]] = defaultdict(dict)
+        partial_records: Dict[str, Dict[str, dict]] = defaultdict(dict)
         while i < n:
             proxy = self._camoufox_proxy()  # fresh proxy per (re)start (#832)
             if i:
@@ -1334,31 +1114,48 @@ class SofaScoreScraper(SoccerdataScraper):
                 with self._camoufox_session(proxy) as cap:
                     while i < n and in_session < session_max:
                         mid = match_ids[i]
-                        self._rate_limiter.acquire()
-                        self._stats["requests"] += 1
+                        current_fetch_names = tuple(
+                            (endpoint_names_by_match or {}).get(mid, fetch_names)
+                        )
+                        current_required = tuple(
+                            name for name in required if name in current_fetch_names
+                        )
                         endpoints = None
                         fetch_partial: Dict[str, dict] = {}
+                        fetch_records: Dict[str, dict] = {}
+                        navigation_records: Dict[str, dict] = {}
                         fetch_states: Dict[str, str] = {}
                         navigation_states: Dict[str, str] = {}
                         fetch_attempted = use_fetch and warmed
                         if use_fetch and warmed:
                             try:
-                                endpoints = cap.fetch_event(mid, names=fetch_names)
+                                endpoints = cap.fetch_event(
+                                    mid, names=current_fetch_names
+                                )
                             except Exception as e:  # noqa: BLE001 — degrade to a full nav
                                 logger.info(
                                     "in-page fetch failed for event=%s: %s", mid, e
                                 )
                                 endpoints = None
                             if endpoints is not None:
+                                read_records = getattr(
+                                    cap, 'event_endpoint_records', None
+                                )
+                                if callable(read_records):
+                                    fetch_records = dict(
+                                        read_records(
+                                            mid, names=current_fetch_names
+                                        ) or {}
+                                    )
                                 fetch_states = self._event_endpoint_states(
                                     cap,
                                     mid,
                                     endpoints,
-                                    fetch_names,
+                                    current_fetch_names,
                                 )
                             if endpoints is not None and any(
                                 fetch_states.get(name) not in _TERMINAL_CAPTURE_STATES
-                                for name in required
+                                for name in current_required
                             ):
                                 fetch_partial = endpoints
                                 logger.info(
@@ -1374,15 +1171,25 @@ class SofaScoreScraper(SoccerdataScraper):
                                 endpoints = cap.capture_event(
                                     mid,
                                     tabs=tabs,
-                                    required=required,
+                                    names=current_fetch_names,
+                                    required=current_required,
                                     max_attempts=1,
                                 )
+                                read_records = getattr(
+                                    cap, 'event_endpoint_records', None
+                                )
+                                if callable(read_records):
+                                    navigation_records = dict(
+                                        read_records(
+                                            mid, names=current_fetch_names
+                                        ) or {}
+                                    )
                                 warmed = True
                                 navigation_states = self._event_endpoint_states(
                                     cap,
                                     mid,
                                     endpoints,
-                                    fetch_names,
+                                    current_fetch_names,
                                 )
                             except Exception as e:  # noqa: BLE001 — one bad event mustn't kill the loop
                                 logger.warning(
@@ -1394,20 +1201,25 @@ class SofaScoreScraper(SoccerdataScraper):
                             **fetch_partial,
                             **(endpoints or {}),
                         }
+                        combined_records = {
+                            **partial_records[mid],
+                            **fetch_records,
+                            **navigation_records,
+                        }
                         combined_states = self._merge_endpoint_states(
                             partial_states[mid],
                             fetch_states,
                             navigation_states,
                             {
                                 name: "success"
-                                for name in fetch_names
+                                for name in current_fetch_names
                                 if name in combined
                             },
                         )
                         optional_retry = [
                             name
-                            for name in fetch_names
-                            if name not in required
+                            for name in current_fetch_names
+                            if name not in current_required
                             and combined_states.get(name)
                             not in _TERMINAL_CAPTURE_STATES
                         ]
@@ -1419,6 +1231,16 @@ class SofaScoreScraper(SoccerdataScraper):
                                 optional_payloads = cap.fetch_event(
                                     mid,
                                     names=tuple(optional_retry),
+                                )
+                                read_records = getattr(
+                                    cap, 'event_endpoint_records', None
+                                )
+                                optional_records = (
+                                    dict(read_records(
+                                        mid, names=tuple(optional_retry)
+                                    ) or {})
+                                    if callable(read_records)
+                                    else {}
                                 )
                             except Exception as exc:  # noqa: BLE001 — status stays retryable
                                 logger.info(
@@ -1435,6 +1257,7 @@ class SofaScoreScraper(SoccerdataScraper):
                                     optional_retry,
                                 )
                                 combined.update(optional_payloads or {})
+                                combined_records.update(optional_records)
                                 combined_states = self._merge_endpoint_states(
                                     combined_states,
                                     optional_states,
@@ -1446,7 +1269,7 @@ class SofaScoreScraper(SoccerdataScraper):
                                 )
                         missing = [
                             name
-                            for name in required
+                            for name in current_required
                             if combined_states.get(name)
                             not in _TERMINAL_CAPTURE_STATES
                         ]
@@ -1461,6 +1284,7 @@ class SofaScoreScraper(SoccerdataScraper):
                             item_attempts[mid] += 1
                             partials[mid] = combined
                             partial_states[mid] = combined_states
+                            partial_records[mid] = combined_records
                             if item_attempts[mid] < item_max_attempts:
                                 logger.warning(
                                     "match_capture event=%s missing=%s; rotating "
@@ -1478,9 +1302,11 @@ class SofaScoreScraper(SoccerdataScraper):
                         yield mid, {
                             **combined,
                             "_endpoint_states": combined_states,
+                            "_endpoint_records": combined_records,
                         }
                         partials.pop(mid, None)
                         partial_states.pop(mid, None)
+                        partial_records.pop(mid, None)
                         item_attempts.pop(mid, None)
                         i += 1
                         in_session += 1
@@ -1514,24 +1340,12 @@ class SofaScoreScraper(SoccerdataScraper):
                     yield mid, {
                         **failed_capture,
                         "_endpoint_states": partial_states.pop(mid, {}),
+                        "_endpoint_records": partial_records.pop(mid, {}),
                     }
                     item_attempts.pop(mid, None)
                     i += 1
             if rotate_current:
                 continue
-
-    def _iter_lineup_payloads(self, match_ids: List[str]):
-        """Yield ``(match_id, lineups_payload | None)`` — the ratings-only view
-        over :meth:`_iter_match_captures` (keeps ``read_player_ratings``
-        unchanged: it requests only the Lineups endpoint family)."""
-        captures = self._iter_match_captures(match_ids, tabs=("Lineups",))
-        try:
-            for mid, endpoints in captures:
-                yield mid, ((endpoints or {}).get('lineups'))
-        finally:
-            close = getattr(captures, 'close', None)
-            if callable(close):
-                close()  # tear down the Camoufox session
 
     def _iter_player_captures(
         self,
@@ -1574,8 +1388,6 @@ class SofaScoreScraper(SoccerdataScraper):
                 with self._camoufox_session(proxy) as cap:
                     while i < len(player_ids) and in_session < session_max:
                         pid = player_ids[i]
-                        self._rate_limiter.acquire()
-                        self._stats["requests"] += 1
                         capture = None
                         fetch_attempted = use_fetch and warmed
                         if use_fetch and warmed:
@@ -1715,7 +1527,6 @@ class SofaScoreScraper(SoccerdataScraper):
         for attempt in range(1, self._CAPTURE_ATTEMPTS + 1):
             proxy = self._camoufox_proxy()
             try:
-                self._rate_limiter.acquire()
                 with self._camoufox_session(proxy) as cap:
                     buffer = cap.capture_buffer(nav_url)
                     sid = self._resolve_target_sid(
@@ -1801,127 +1612,6 @@ class SofaScoreScraper(SoccerdataScraper):
         )
         return []
 
-    def read_player_ratings(
-        self,
-        league: str,
-        season: int,
-        match_ids: Optional[List[str]] = None,
-        limit: Optional[int] = None,
-    ) -> pd.DataFrame:
-        """Fetch per-match player ratings (Opta scale 0.0–10.0) from the
-        SofaScore REST API.
-
-        Parameters
-        ----------
-        league : str
-            soccerdata-style league key, e.g. ``"ENG-Premier League"``.
-        season : int
-            Season (any format ``read_schedule`` understands —
-            ``2526`` / ``"2526"`` / ``2025``).
-        match_ids : list[str] | None
-            Optional explicit match list. When ``None`` we resolve
-            finished matches from ``bronze.sofascore_schedule`` via
-            soccerdata.
-        limit : int | None
-            Smoke-test cap on the number of matches to fetch.
-
-        Returns
-        -------
-        pd.DataFrame
-            Columns: ``match_id, player_id, team_side, rating, position,
-            league, season, _ingested_at``. Empty frame on graceful
-            fallback (caller logs ``R0.2B_FALLBACK``).
-        """
-        cols = [
-            'match_id', 'player_id', 'team_side', 'rating', 'position',
-            'league', 'season',
-        ]
-
-        if match_ids is None:
-            match_ids = self._resolve_match_ids(league, season)
-
-        if not match_ids:
-            logger.warning(
-                "No match_ids resolved for league=%s season=%s — "
-                "ratings scrape skipped.",
-                league, season,
-            )
-            return pd.DataFrame(columns=cols + ['_ingested_at'])
-
-        if limit:
-            match_ids = list(match_ids)[: int(limit)]
-
-        logger.info(
-            "Fetching SofaScore lineups for %d matches (league=%s season=%s)",
-            len(match_ids), league, season,
-        )
-
-        all_rows: List[Dict] = []
-        consecutive_failures = 0
-        # Capture is expensive (browser nav + proxy bytes, ×3 internal retries
-        # per match); 10 consecutive misses ≈ dead proxy / Turnstile not solved
-        # — bail early to save proxy budget rather than grind all match_ids.
-        max_consecutive = 10
-
-        # #757: lineups now come from the Camoufox capture transport (the
-        # tls_requests REST path is Turnstile-blocked). The generator owns one
-        # warmed browser session for all matches — close it on early break.
-        payloads = self._iter_lineup_payloads(match_ids)
-        try:
-            for idx, (mid, payload) in enumerate(payloads, start=1):
-                if payload is None:
-                    consecutive_failures += 1
-                    if consecutive_failures >= max_consecutive:
-                        logger.error(
-                            "%s: %d consecutive lineup capture failures — aborting "
-                            "scrape early to preserve proxy budget.",
-                            R0_2B_FALLBACK_MARKER, consecutive_failures,
-                        )
-                        break
-                    continue
-
-                consecutive_failures = 0
-                for side in ('home', 'away'):
-                    all_rows.extend(self._flatten_lineup_side(
-                        match_id=str(mid),
-                        side=side,
-                        side_payload=payload.get(side) or {},
-                    ))
-
-                if idx % 25 == 0:
-                    logger.info("Lineups progress: %d/%d matches", idx, len(match_ids))
-        finally:
-            close = getattr(payloads, 'close', None)
-            if callable(close):
-                close()  # tear down the Camoufox session
-
-        if not all_rows:
-            logger.warning(
-                "%s: zero rating rows materialised across %d match attempts.",
-                R0_2B_FALLBACK_MARKER, len(match_ids),
-            )
-            return pd.DataFrame(columns=cols + ["_ingested_at"])
-
-        df = pd.DataFrame(all_rows)
-        anchors = ["match_id", "player_id", "team_side", "rating", "position"]
-        df = df.reindex(columns=anchors + [c for c in df.columns if c not in anchors])
-        df["league"] = league
-        # Match the slug used by the schedule writer (soccerdata short form
-        # 'YYZZ', e.g. 2025 -> '2526'). Mismatch would split the partition
-        # and break replace_partitions dedup — see issue #27.
-        season_short = _season_label(league, season)
-        df['season'] = season_short
-        df['_ingested_at'] = datetime.utcnow()
-        df['_source'] = self.SOURCE_NAME
-        df['_entity_type'] = 'player_ratings'
-        df['_batch_id'] = self._batch_id
-
-        logger.info(
-            "Materialised %d player-rating rows across %d unique matches",
-            len(df), df['match_id'].nunique(),
-        )
-        return df
-
     # ------------------------------------------------------------------
     # #751 PR1 — consolidated per-match capture (one nav → ratings + eps)
     # ------------------------------------------------------------------
@@ -1932,7 +1622,8 @@ class SofaScoreScraper(SoccerdataScraper):
         season: int,
         match_ids: Optional[List[str]] = None,
         limit: Optional[int] = None,
-    ) -> Dict[str, pd.DataFrame]:
+        endpoint_names_by_match: Optional[Dict[str, Tuple[str, ...]]] = None,
+    ) -> Dict[str, object]:
         """ONE Camoufox capture pass per match → five Bronze frames (#751 PR1+PR2, #753).
 
         Replaces four separate Turnstile-blocked passes with a warmed browser
@@ -1944,6 +1635,8 @@ class SofaScoreScraper(SoccerdataScraper):
             ``team_name`` from ``/event`` (``homeTeam``/``awayTeam``);
           - ``match_stats`` — :meth:`_flatten_match_stats` over ``/statistics``;
           - ``event_shotmap`` — :meth:`_flatten_shotmap` over ``/shotmap``;
+          - ``events`` / ``event_participants`` / ``venue`` from ``/event``;
+          - ``incidents`` — goals/cards/substitutions/VAR from ``/incidents``;
           - ``venue`` — :meth:`_flatten_event_venue` over ``/event`` (#753:
             one row per match, stadium/city/country/coords).
 
@@ -1962,6 +1655,11 @@ class SofaScoreScraper(SoccerdataScraper):
             'match_id', 'player_id', 'team_side', 'rating', 'position',
             'captain', 'substitute', 'shirt_number', 'league', 'season',
         ]
+        lineup_cols = [
+            'match_id', 'player_id', 'team_side', 'position', 'captain',
+            'substitute', 'shirt_number', 'is_starter', 'is_bench',
+            'is_unused_substitute', 'participation_status', 'league', 'season',
+        ]
         eps_cols = [
             'match_id', 'player_id', 'team_id', 'team_name', 'is_home',
             'position', 'position_specific', 'captain', 'substitute',
@@ -1969,7 +1667,7 @@ class SofaScoreScraper(SoccerdataScraper):
         ]
         match_stats_cols = [
             # #840: source-key names (Bronze as-is); Silver renames/derives.
-            'match_id', 'period', 'stat_group', 'name', 'key',
+            'match_id', 'period', 'stat_group', 'statistic_key', 'name', 'key',
             'statistics_type', 'home_value', 'away_value', 'home', 'away',
             'compare_code', 'value_type', 'render_type', 'league', 'season',
         ]
@@ -1989,9 +1687,24 @@ class SofaScoreScraper(SoccerdataScraper):
             'venue_coordinates_latitude', 'venue_coordinates_longitude',
             'league', 'season',
         ]
+        event_cols = [
+            'match_id', 'id', 'season_id', 'home_team_id', 'away_team_id',
+            'start_timestamp', 'status_type', 'league', 'season',
+        ]
+        participant_cols = [
+            'match_id', 'team_id', 'team_side', 'name', 'slug',
+            'gender', 'team_type', 'league', 'season',
+        ]
+        incident_cols = [
+            'match_id', 'incident_id', 'incident_order', 'incident_type',
+            'time', 'added_time',
+            'is_home', 'player_id', 'player_in_id', 'player_out_id',
+            'incident_class', 'reason', 'league', 'season',
+        ]
         status_cols = [
             'match_id', 'event_status', 'lineups_status',
-            'statistics_status', 'shotmap_status', 'capture_complete',
+            'statistics_status', 'shotmap_status', 'incidents_status',
+            'capture_complete',
             'league', 'season',
         ]
 
@@ -2002,10 +1715,16 @@ class SofaScoreScraper(SoccerdataScraper):
 
         empty = {
             'player_ratings': pd.DataFrame(columns=ratings_cols + ['_ingested_at']),
+            'lineups': pd.DataFrame(columns=lineup_cols + ['_ingested_at']),
             'event_player_stats': pd.DataFrame(columns=eps_cols + ['_ingested_at']),
             'match_stats': pd.DataFrame(columns=match_stats_cols + ['_ingested_at']),
             'event_shotmap': pd.DataFrame(columns=shotmap_cols + ['_ingested_at']),
             'venue': pd.DataFrame(columns=venue_cols + ['_ingested_at']),
+            'events': pd.DataFrame(columns=event_cols + ['_ingested_at']),
+            'event_participants': pd.DataFrame(
+                columns=participant_cols + ['_ingested_at']
+            ),
+            'incidents': pd.DataFrame(columns=incident_cols + ['_ingested_at']),
             'capture_status': pd.DataFrame(columns=status_cols + ['_ingested_at']),
         }
 
@@ -2029,7 +1748,11 @@ class SofaScoreScraper(SoccerdataScraper):
         stats_rows: List[Dict] = []
         shot_rows: List[Dict] = []
         venue_rows: List[Dict] = []
+        event_rows: List[Dict] = []
+        participant_rows: List[Dict] = []
+        incident_rows: List[Dict] = []
         status_rows: List[Dict] = []
+        raw_records: Dict[str, dict] = {}
         consecutive_failures = 0
         max_consecutive = 10  # ~dead proxy / Turnstile not solved — bail early.
 
@@ -2038,28 +1761,58 @@ class SofaScoreScraper(SoccerdataScraper):
         # manifest so a later daily run can retry them.
         captures = self._iter_match_captures(
             match_ids,
-            tabs=("Lineups", "Statistics", "Shotmap"),
+            tabs=("Lineups", "Statistics", "Shotmap", "Incidents"),
             required=("lineups", "event"),
+            endpoint_names_by_match=endpoint_names_by_match,
         )
         try:
             for idx, (mid, endpoints) in enumerate(captures, start=1):
                 endpoints = endpoints or {}
+                for endpoint_name, record in dict(
+                    endpoints.get('_endpoint_records') or {}
+                ).items():
+                    raw_records[f'{mid}:{endpoint_name}'] = {
+                        'match_id': str(mid),
+                        'endpoint': str(endpoint_name),
+                        **dict(record),
+                    }
                 endpoint_states = dict(endpoints.get("_endpoint_states") or {})
-                for endpoint_name in ("event", "lineups", "statistics", "shotmap"):
+                endpoint_names = (
+                    "event", "lineups", "statistics", "shotmap", "incidents"
+                )
+                requested_names = set(
+                    (endpoint_names_by_match or {}).get(str(mid), endpoint_names)
+                )
+                for endpoint_name in endpoint_names:
+                    if endpoint_name not in requested_names:
+                        # endpoint-level resume only omits endpoints already
+                        # terminal in the canonical long manifest.
+                        endpoint_states[endpoint_name] = 'success'
+                        continue
                     if endpoint_name in endpoints:
                         endpoint_states[endpoint_name] = "success"
                     else:
-                        endpoint_states.setdefault(endpoint_name, "missing")
+                        endpoint_states.setdefault(
+                            endpoint_name,
+                            # Compatibility for custom transports built before
+                            # incidents was added. The production transport
+                            # always reports an explicit state, so a real
+                            # transport miss remains retryable.
+                            "not_available"
+                            if endpoint_name == "incidents"
+                            and "_endpoint_states" not in endpoints
+                            else "missing",
+                        )
                 status_rows.append(
                     {
                         "match_id": str(mid),
                         **{
                             f"{name}_status": endpoint_states[name]
-                            for name in ("event", "lineups", "statistics", "shotmap")
+                            for name in endpoint_names
                         },
                         "capture_complete": all(
                             endpoint_states[name] in _TERMINAL_CAPTURE_STATES
-                            for name in ("event", "lineups", "statistics", "shotmap")
+                            for name in endpoint_names
                         ),
                     }
                 )
@@ -2071,12 +1824,23 @@ class SofaScoreScraper(SoccerdataScraper):
                 venue_row = self._flatten_event_venue(str(mid), event_payload)
                 if venue_row:
                     venue_rows.append(venue_row)
+                event_row = self._flatten_full_event(str(mid), event_payload)
+                if event_row:
+                    event_rows.append(event_row)
+                participant_rows.extend(
+                    self._flatten_event_participants(str(mid), event_payload)
+                )
                 statistics = endpoints.get("statistics")
                 if statistics is not None:
                     stats_rows.extend(self._flatten_match_stats(str(mid), statistics))
                 shotmap = endpoints.get("shotmap")
                 if shotmap is not None:
                     shot_rows.extend(self._flatten_shotmap(str(mid), shotmap))
+                incidents = endpoints.get('incidents')
+                if incidents is not None:
+                    incident_rows.extend(
+                        self._flatten_incidents(str(mid), incidents)
+                    )
 
                 lineups = endpoints.get("lineups")
                 if lineups is None:
@@ -2120,11 +1884,12 @@ class SofaScoreScraper(SoccerdataScraper):
             if callable(close):
                 close()  # tear down the Camoufox session
 
-        out: Dict[str, pd.DataFrame] = {}
+        out: Dict[str, object] = {}
+        out['raw_records'] = raw_records
 
         if ratings_rows:
             rdf = pd.DataFrame(ratings_rows)
-            anchors = ["match_id", "player_id", "team_side", "rating", "position"]
+            anchors = list(ratings_cols)
             rdf = rdf.reindex(
                 columns=anchors + [c for c in rdf.columns if c not in anchors],
             )
@@ -2135,11 +1900,23 @@ class SofaScoreScraper(SoccerdataScraper):
             rdf["_entity_type"] = "player_ratings"
             rdf["_batch_id"] = self._batch_id
             out["player_ratings"] = rdf
+
+            # The exact same /lineups payload is materialised a second time at
+            # its natural grain.  This is a zero-network projection and keeps
+            # starters, used bench and unused substitutes queryable without
+            # inferring participation from a nullable rating.
+            lineup_df = rdf.drop(columns=['rating'], errors='ignore').copy()
+            lineup_df['_entity_type'] = 'lineups'
+            out['lineups'] = lineup_df
         else:
             out['player_ratings'] = empty['player_ratings']
+            out['lineups'] = empty['lineups']
 
         if eps_rows:
             edf = pd.DataFrame(eps_rows)
+            edf = edf.reindex(
+                columns=eps_cols + [c for c in edf.columns if c not in eps_cols],
+            )
             edf['league'] = league
             edf['season'] = season_short
             edf['_ingested_at'] = datetime.utcnow()
@@ -2151,8 +1928,18 @@ class SofaScoreScraper(SoccerdataScraper):
             out['event_player_stats'] = empty['event_player_stats']
 
         # match_stats + event_shotmap come from the SAME capture pass (#751 PR2).
-        def _tag(rows: List[Dict], entity_type: str) -> pd.DataFrame:
+        def _tag(
+            rows: List[Dict],
+            entity_type: str,
+            required_columns: List[str],
+        ) -> pd.DataFrame:
             df = pd.DataFrame(rows)
+            df = df.reindex(
+                columns=(
+                    required_columns
+                    + [column for column in df.columns if column not in required_columns]
+                ),
+            )
             df['league'] = league
             df['season'] = season_short
             df['_ingested_at'] = datetime.utcnow()
@@ -2162,16 +1949,73 @@ class SofaScoreScraper(SoccerdataScraper):
             return df
 
         out['match_stats'] = (
-            _tag(stats_rows, 'match_stats') if stats_rows else empty['match_stats'])
+            _tag(stats_rows, 'match_stats', match_stats_cols)
+            if stats_rows else empty['match_stats'])
         out['event_shotmap'] = (
-            _tag(shot_rows, 'event_shotmap') if shot_rows else empty['event_shotmap'])
+            _tag(
+                shot_rows,
+                'event_shotmap',
+                shotmap_cols + ['minute', 'x', 'y'],
+            ) if shot_rows else empty['event_shotmap'])
         out['venue'] = (
-            _tag(venue_rows, 'venue') if venue_rows else empty['venue'])
+            _tag(
+                venue_rows,
+                'venue',
+                venue_cols + [
+                    'stadium', 'city', 'country',
+                    'venue_latitude', 'venue_longitude',
+                ],
+            ) if venue_rows else empty['venue'])
+        out['events'] = (
+            _tag(event_rows, 'events', event_cols)
+            if event_rows else empty['events']
+        )
+        out['event_participants'] = (
+            _tag(
+                participant_rows,
+                'event_participants',
+                participant_cols,
+            ) if participant_rows else empty['event_participants']
+        )
+        out['incidents'] = (
+            _tag(incident_rows, 'incidents', incident_cols)
+            if incident_rows else empty['incidents']
+        )
         out['capture_status'] = (
-            _tag(status_rows, 'match_capture_status')
+            _tag(status_rows, 'match_capture_status', status_cols)
             if status_rows
             else empty['capture_status']
         )
+
+        from dags.utils.sofascore_dq import (
+            validate_event_participants,
+            validate_lineup_semantics,
+        )
+
+        if not out['lineups'].empty:
+            validate_lineup_semantics(
+                out['lineups'].to_dict('records')
+            ).require()
+        if not out['event_participants'].empty:
+            validate_event_participants(
+                out['event_participants'].to_dict('records')
+            ).require()
+        if not out['event_player_stats'].empty:
+            from dags.utils.sofascore_dq import validate_minimum_coverage
+
+            appeared = {
+                (str(row.get('match_id')), str(row.get('player_id')))
+                for row in out['event_player_stats'].to_dict('records')
+                if (row.get('minutes_played') or 0) > 0
+            }
+            rated = {
+                (str(row.get('match_id')), str(row.get('player_id')))
+                for row in out['player_ratings'].to_dict('records')
+                if (row.get('rating') or 0) > 0
+            }
+            validate_minimum_coverage(
+                'player_rating', rated, appeared, threshold=0.95
+            ).require()
 
         if not ratings_rows and not eps_rows:
             all_terminal = bool(status_rows) and all(
@@ -2192,10 +2036,11 @@ class SofaScoreScraper(SoccerdataScraper):
 
         logger.info(
             "match_capture: %d ratings + %d eps + %d match_stats + %d shots "
-            "+ %d venues across %d matches",
+            "+ %d incidents + %d events + %d venues across %d matches",
             len(out['player_ratings']), len(out['event_player_stats']),
             len(out['match_stats']), len(out['event_shotmap']),
-            len(out['venue']), len(match_ids),
+            len(out['incidents']), len(out['events']), len(out['venue']),
+            len(match_ids),
         )
         return out
 
@@ -2282,111 +2127,13 @@ class SofaScoreScraper(SoccerdataScraper):
             # projected as anchors (player.id -> player_id, team.id -> team_id).
             _auto_flatten(shot, row, skip=('player', 'team'))
 
+            row.setdefault('minute', row.get('time'))
+            row.setdefault('x', row.get('player_coordinates_x'))
+            row.setdefault('y', row.get('player_coordinates_y'))
+
             rows.append(row)
 
         return rows
-
-    def _fetch_shotmap_payload(
-        self,
-        event_id: str,
-        max_attempts: int = 3,
-    ) -> Optional[dict]:
-        url = f"{_SOFASCORE_API}{_SHOTMAP_PATH.format(event_id=event_id)}"
-        return self._fetch_json_endpoint(
-            url=url,
-            max_attempts=max_attempts,
-            label='shotmap',
-            context={'event_id': event_id},
-        )
-
-    def read_shotmap(
-        self,
-        league: str,
-        season: int,
-        match_ids: Optional[List[str]] = None,
-        limit: Optional[int] = None,
-    ) -> pd.DataFrame:
-        """Fetch per-shot data (coords + xG + situation + body part) from
-        ``/api/v1/event/{id}/shotmap`` for the given match ids.
-
-        Returns an empty DataFrame on graceful fallback (runner emits
-        ``R0.2B_FALLBACK`` and exits with code 2).
-        """
-        cols = [
-            # #840: source-key names (Bronze as-is); Silver renames/derives.
-            'match_id', 'shot_id', 'player_id', 'team_id', 'is_home',
-            'id', 'time', 'added_time', 'reversed_period_count', 'period',
-            'shot_type', 'situation', 'body_part', 'incident_type', 'goal_type',
-            'player_coordinates_x', 'player_coordinates_y',
-            'goal_mouth_coordinates_x', 'goal_mouth_coordinates_y',
-            'xg', 'xgot', 'league', 'season',
-        ]
-
-        if match_ids is None:
-            match_ids = self._resolve_match_ids(league, season)
-
-        if not match_ids:
-            logger.warning(
-                "No match_ids resolved for shotmap (league=%s season=%s).",
-                league, season,
-            )
-            return pd.DataFrame(columns=cols + ['_ingested_at'])
-
-        if limit:
-            match_ids = list(match_ids)[: int(limit)]
-
-        logger.info(
-            "Fetching SofaScore shotmap for %d matches (league=%s season=%s)",
-            len(match_ids), league, season,
-        )
-
-        all_rows: List[Dict] = []
-        consecutive_failures = 0
-        max_consecutive = 100
-
-        for idx, mid in enumerate(match_ids, start=1):
-            payload = self._fetch_shotmap_payload(str(mid))
-            if payload is None:
-                consecutive_failures += 1
-                if consecutive_failures >= max_consecutive:
-                    logger.error(
-                        "%s: %d consecutive shotmap fetch failures — aborting.",
-                        R0_2B_FALLBACK_MARKER, consecutive_failures,
-                    )
-                    break
-                continue
-
-            consecutive_failures = 0
-            all_rows.extend(self._flatten_shotmap(str(mid), payload))
-
-            if idx % 25 == 0:
-                logger.info("Shotmap progress: %d/%d matches", idx, len(match_ids))
-
-        if not all_rows:
-            logger.warning(
-                "%s: zero shotmap rows materialised across %d matches.",
-                R0_2B_FALLBACK_MARKER, len(match_ids),
-            )
-            return pd.DataFrame(columns=cols + ['_ingested_at'])
-
-        df = pd.DataFrame(all_rows)
-        df['league'] = league
-
-        # Match the slug used by the schedule writer (soccerdata short form
-        # 'YYZZ', e.g. 2025 -> '2526'). Mismatch would split the partition
-        # and break replace_partitions dedup — see issue #27.
-        season_short = _season_label(league, season)
-        df['season'] = season_short
-        df['_ingested_at'] = datetime.utcnow()
-        df['_source'] = self.SOURCE_NAME
-        df['_entity_type'] = 'event_shotmap'
-        df['_batch_id'] = self._batch_id
-
-        logger.info(
-            "Materialised %d shot rows across %d unique matches",
-            len(df), df['match_id'].nunique(),
-        )
-        return df
 
     # ------------------------------------------------------------------
     # #21 event_player_stats — per-match per-player Opta-rich metrics
@@ -2451,11 +2198,10 @@ class SofaScoreScraper(SoccerdataScraper):
         ``/event/{id}/player/{pid}/statistics`` per-player calls (#751).
 
         Live-verified 2026-06-22 (#751): each ``/lineups`` player entry carries
-        the full per-match ``statistics`` block (33 Opta metrics) PLUS the
-        anchors the dedicated endpoint omitted — ``is_home`` (from the side),
-        ``captain``/``substitute``/``position`` (from the entry). So unlike the
-        per-player path (which needed a /lineups overlay to back-fill those NULL
-        anchors, #301), this single payload populates them directly.
+        the full per-match ``statistics`` block (33 Opta metrics) plus
+        ``is_home`` (from the side) and the entry's
+        ``captain``/``substitute``/``position`` anchors. This single payload
+        populates them directly.
 
         ``team_id``/``team_name`` are absent from ``/lineups``; they come from
         the captured ``event_payload`` (``homeTeam``/``awayTeam``). A ``None``
@@ -2523,6 +2269,91 @@ class SofaScoreScraper(SoccerdataScraper):
         return rows
 
     @staticmethod
+    def _unwrap_event_payload(payload) -> Dict:
+        """Return the source event object from either API envelope shape."""
+        value = payload if isinstance(payload, dict) else {}
+        if isinstance(value.get('event'), dict):
+            return value['event']
+        return value
+
+    @classmethod
+    def _flatten_full_event(cls, match_id: str, payload) -> Optional[Dict]:
+        """Preserve every scalar match-metadata field at one-row/event grain."""
+        event = cls._unwrap_event_payload(payload)
+        if not event:
+            return None
+        row: Dict = {'match_id': str(match_id)}
+        _auto_flatten(event, row)
+        for anchor in (
+            'id', 'season_id', 'home_team_id', 'away_team_id',
+            'start_timestamp', 'status_type',
+        ):
+            row.setdefault(anchor, None)
+        return row
+
+    @classmethod
+    def _flatten_event_participants(cls, match_id: str, payload) -> List[Dict]:
+        """Return home/away participant teams from the full event payload."""
+        event = cls._unwrap_event_payload(payload)
+        rows: List[Dict] = []
+        for side, source_key in (('home', 'homeTeam'), ('away', 'awayTeam')):
+            team = event.get(source_key)
+            if not isinstance(team, dict) or team.get('id') is None:
+                continue
+            team_id = team.get('id')
+            row: Dict = {
+                'match_id': str(match_id),
+                'team_id': str(int(team_id)) if isinstance(team_id, (int, float)) else str(team_id),
+                'team_side': side,
+                'name': team.get('name'),
+                'gender': team.get('gender'),
+                'team_type': team.get('teamType') or team.get('type'),
+            }
+            _auto_flatten(team, row)
+            rows.append(row)
+        return rows
+
+    @staticmethod
+    def _flatten_incidents(match_id: str, payload) -> List[Dict]:
+        """Normalize goals, cards, substitutions and VAR without dropping raw.
+
+        Exact source JSON is retained by the raw store; this projection exposes
+        all scalar/nested-object fields and a deterministic natural key when an
+        incident has no source ``id``.
+        """
+        if not isinstance(payload, dict):
+            return []
+        incidents = payload.get('incidents')
+        if not isinstance(incidents, list):
+            return []
+        rows: List[Dict] = []
+        for index, incident in enumerate(incidents):
+            if not isinstance(incident, dict):
+                continue
+            source_id = incident.get('id')
+            if source_id is None:
+                canonical = json.dumps(
+                    incident,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(',', ':'),
+                ).encode('utf-8')
+                source_id = f"derived-{index}-{hashlib.sha256(canonical).hexdigest()[:16]}"
+            row: Dict = {
+                'match_id': str(match_id),
+                'incident_id': str(source_id),
+                'incident_order': index,
+                'incident_type': str(
+                    incident.get('incidentType')
+                    or incident.get('type')
+                    or 'unknown'
+                ),
+            }
+            _auto_flatten(incident, row)
+            rows.append(row)
+        return rows
+
+    @staticmethod
     def _flatten_event_venue(match_id: str, event_payload) -> Optional[Dict]:
         """Project the captured ``/event/{id}`` venue block into ONE Bronze row (#753).
 
@@ -2579,213 +2410,16 @@ class SofaScoreScraper(SoccerdataScraper):
         # stadium/city/country/venue_latitude/venue_longitude.
         row: Dict = {'game_id': game_id}
         _auto_flatten(venue, row)
+        row.setdefault('stadium', row.get('stadium_name'))
+        row.setdefault('city', row.get('city_name'))
+        row.setdefault('country', row.get('country_name'))
+        row.setdefault(
+            'venue_latitude', row.get('venue_coordinates_latitude')
+        )
+        row.setdefault(
+            'venue_longitude', row.get('venue_coordinates_longitude')
+        )
         return row
-
-    def _fetch_event_player_stats_payload(
-        self,
-        event_id: str,
-        player_id: str,
-        max_attempts: int = 3,
-    ) -> Optional[dict]:
-        url = f"{_SOFASCORE_API}{_EVENT_PLAYER_STATS_PATH.format(event_id=event_id, player_id=player_id)}"
-        return self._fetch_json_endpoint(
-            url=url,
-            max_attempts=max_attempts,
-            label='event_player_stats',
-            context={'event_id': event_id, 'player_id': player_id},
-        )
-
-    def _resolve_match_players_from_bronze(
-        self,
-        league: str,
-        season_short: str,
-    ) -> Dict[str, List[str]]:
-        """Group player_ids by match_id from bronze.sofascore_player_ratings.
-
-        Returns ``{match_id: [player_id, ...]}``. Empty dict if Trino
-        unavailable or the ratings partition is missing — caller emits
-        the R0.2B_FALLBACK marker.
-        """
-        try:
-            import os
-            import trino
-            import trino.auth as trino_auth
-        except ImportError as e:  # pragma: no cover - import guard
-            logger.error("trino client unavailable: %s", e)
-            return {}
-
-        user = os.environ.get('TRINO_USER', 'airflow')
-        password = os.environ.get('TRINO_PASSWORD')
-
-        try:
-            if password:
-                conn = trino.dbapi.connect(
-                    host=os.environ.get('TRINO_HOST', 'trino'),
-                    port=int(os.environ.get('TRINO_PORT', 8443)),
-                    user=user,
-                    catalog='iceberg',
-                    http_scheme='https',
-                    auth=trino_auth.BasicAuthentication(user, password),
-                    verify=False,
-                )
-            else:
-                conn = trino.dbapi.connect(
-                    host=os.environ.get('TRINO_HOST', 'trino'),
-                    port=int(os.environ.get('TRINO_PORT', 8080)),
-                    user=user,
-                    catalog='iceberg',
-                )
-
-            cur = conn.cursor()
-            cur.execute(
-                "SELECT match_id, player_id "
-                "FROM iceberg.bronze.sofascore_player_ratings "
-                "WHERE league = ? AND CAST(season AS varchar) = ?",
-                (league, season_short),
-            )
-            rows = cur.fetchall()
-        except Exception as e:
-            logger.warning(
-                "Could not resolve (match, player) pairs from bronze: %s", e,
-            )
-            return {}
-
-        grouped: Dict[str, List[str]] = {}
-        for mid, pid in rows:
-            if mid is None or pid is None:
-                continue
-            grouped.setdefault(str(mid), []).append(str(pid))
-        return grouped
-
-    def read_event_player_stats(
-        self,
-        league: str,
-        season: int,
-        match_ids: Optional[List[str]] = None,
-        player_ids_by_match: Optional[Dict[str, List[str]]] = None,
-        limit: Optional[int] = None,
-    ) -> pd.DataFrame:
-        """Fetch per-(match, player) Opta-rich stats from
-        ``/api/v1/event/{id}/player/{pid}/statistics``.
-
-        Player ids are resolved from ``bronze.sofascore_player_ratings``
-        (players who actually entered the pitch) unless explicitly
-        provided — calling SofaScore with random pids returns 404 and
-        wastes the proxy budget.
-        """
-        anchor_cols = [
-            'match_id', 'player_id', 'team_id', 'team_name', 'is_home',
-            'position', 'position_specific', 'captain', 'substitute',
-            'league', 'season',
-        ]
-
-        season_short = _season_label(league, season)
-
-        if player_ids_by_match is None:
-            player_ids_by_match = self._resolve_match_players_from_bronze(
-                league, season_short,
-            )
-
-        if not player_ids_by_match:
-            logger.warning(
-                "No (match, player) pairs in bronze.sofascore_player_ratings "
-                "for league=%s season=%s — event_player_stats skipped.",
-                league, season_short,
-            )
-            return pd.DataFrame(columns=anchor_cols + ['_ingested_at'])
-
-        if match_ids is not None:
-            wanted = {str(m) for m in match_ids}
-            player_ids_by_match = {
-                m: p for m, p in player_ids_by_match.items() if m in wanted
-            }
-
-        if limit:
-            # Cap by *match count* (not request count) so smoke runs stay
-            # predictable. A single match ≈ 25 played players ≈ 25 HTTP
-            # calls; rate-limited to 20 req/min → ~1.25 min/match.
-            wanted = list(player_ids_by_match.keys())[: int(limit)]
-            player_ids_by_match = {m: player_ids_by_match[m] for m in wanted}
-
-        total_calls = sum(len(p) for p in player_ids_by_match.values())
-        logger.info(
-            "Fetching SofaScore event_player_stats: %d matches, %d "
-            "(match, player) calls (league=%s season=%s)",
-            len(player_ids_by_match), total_calls, league, season,
-        )
-
-        all_rows: List[Dict] = []
-        consecutive_failures = 0
-        max_consecutive = 200
-
-        call_idx = 0
-        lineup_misses = 0
-        for mid, pids in player_ids_by_match.items():
-            # The statistics endpoint returns `extra: null` and no
-            # `statistics.position`, so is_home/captain/substitute/
-            # position_specific must be back-filled from /lineups (#301).
-            # One extra fetch per match (~2.5% overhead vs the per-player
-            # stat calls). A miss leaves those anchors NULL — graceful,
-            # and does NOT count toward the stat-endpoint breaker below.
-            lineup_payload = self._fetch_lineup_payload(str(mid))
-            if lineup_payload is None:
-                lineup_misses += 1
-            overlay_lookup = self._build_lineup_overlay_lookup(lineup_payload or {})
-            for pid in pids:
-                call_idx += 1
-                payload = self._fetch_event_player_stats_payload(str(mid), str(pid))
-                if payload is None:
-                    consecutive_failures += 1
-                    if consecutive_failures >= max_consecutive:
-                        logger.error(
-                            "%s: %d consecutive event_player_stats failures — "
-                            "aborting early.",
-                            R0_2B_FALLBACK_MARKER, consecutive_failures,
-                        )
-                        break
-                    continue
-
-                consecutive_failures = 0
-                row = self._flatten_event_player_stats(str(mid), str(pid), payload)
-                if row is not None:
-                    self._apply_lineup_overlay(row, overlay_lookup.get(str(pid)))
-                    all_rows.append(row)
-
-                if call_idx % 100 == 0:
-                    logger.info(
-                        "event_player_stats progress: %d/%d calls",
-                        call_idx, total_calls,
-                    )
-            else:
-                continue
-            break  # propagate inner break on circuit-breaker trip
-
-        if not all_rows:
-            logger.warning(
-                "%s: zero event_player_stats rows materialised (calls=%d).",
-                R0_2B_FALLBACK_MARKER, total_calls,
-            )
-            return pd.DataFrame(columns=anchor_cols + ['_ingested_at'])
-
-        df = pd.DataFrame(all_rows)
-        df['league'] = league
-        df['season'] = season_short
-        df['_ingested_at'] = datetime.utcnow()
-        df['_source'] = self.SOURCE_NAME
-        df['_entity_type'] = 'event_player_stats'
-        df['_batch_id'] = self._batch_id
-
-        logger.info(
-            "Materialised %d event_player_stats rows across %d unique matches",
-            len(df), df['match_id'].nunique(),
-        )
-        if lineup_misses:
-            logger.warning(
-                "Lineup overlay missing for %d/%d matches — those rows keep "
-                "NULL is_home/captain/substitute/position_specific (#301).",
-                lineup_misses, len(player_ids_by_match),
-            )
-        return df
 
     # ------------------------------------------------------------------
     # #25 match_stats — per-(period, group, stat) team-level metrics
@@ -2815,12 +2449,16 @@ class SofaScoreScraper(SoccerdataScraper):
                 continue
             period = period_block.get('period') or 'ALL'
 
-            for group_block in (period_block.get('groups') or []):
+            for group_index, group_block in enumerate(
+                period_block.get('groups') or []
+            ):
                 if not isinstance(group_block, dict):
                     continue
-                stat_group = group_block.get('groupName')
+                stat_group = str(group_block.get('groupName') or 'ungrouped')
 
-                for item in (group_block.get('statisticsItems') or []):
+                for item_index, item in enumerate(
+                    group_block.get('statisticsItems') or []
+                ):
                     if not isinstance(item, dict):
                         continue
                     # #840: only the position anchors are hard-coded; every
@@ -2833,6 +2471,15 @@ class SofaScoreScraper(SoccerdataScraper):
                         'match_id': str(match_id),
                         'period': str(period),
                         'stat_group': stat_group,
+                        # Stable non-null natural key for incremental MERGE.
+                        # Source keys win; the positional fallback remains
+                        # deterministic within the source-ordered payload.
+                        'statistic_key': str(
+                            item.get('key')
+                            or item.get('statisticsType')
+                            or item.get('name')
+                            or f'{group_index}:{item_index}'
+                        ),
                     }
                     # #840: home/away are SofaScore *display* strings — "55%",
                     # "3 (1)", "91.6 km", "2.61" — heterogeneous units across
@@ -2848,106 +2495,15 @@ class SofaScoreScraper(SoccerdataScraper):
                         if item.get(_disp) is not None:
                             row[_disp] = str(item[_disp])
                     _auto_flatten(item, row)
+                    row.setdefault('stat_name', row.get('name'))
+                    row.setdefault(
+                        'stat_key', row.get('key') or row.get('statistics_type')
+                    )
+                    row.setdefault('home_text', row.get('home'))
+                    row.setdefault('away_text', row.get('away'))
                     rows.append(row)
 
         return rows
-
-    def _fetch_match_stats_payload(
-        self,
-        event_id: str,
-        max_attempts: int = 3,
-    ) -> Optional[dict]:
-        url = f"{_SOFASCORE_API}{_MATCH_STATS_PATH.format(event_id=event_id)}"
-        return self._fetch_json_endpoint(
-            url=url,
-            max_attempts=max_attempts,
-            label='match_stats',
-            context={'event_id': event_id},
-        )
-
-    def read_match_stats(
-        self,
-        league: str,
-        season: int,
-        match_ids: Optional[List[str]] = None,
-        limit: Optional[int] = None,
-    ) -> pd.DataFrame:
-        """Fetch per-match team-level statistics from
-        ``/api/v1/event/{id}/statistics`` and emit long-form rows.
-
-        Long-form (one row per (match, period, group, stat)) is chosen
-        over wide-form because SofaScore evolves its stat catalogue
-        without notice — adding a new metric must not require a Bronze
-        schema migration.
-        """
-        cols = [
-            'match_id', 'period', 'stat_group', 'stat_name', 'stat_key',
-            'home_value', 'away_value', 'home_text', 'away_text',
-            'compare_code', 'value_type', 'league', 'season',
-        ]
-
-        if match_ids is None:
-            match_ids = self._resolve_match_ids(league, season)
-
-        if not match_ids:
-            logger.warning(
-                "No match_ids resolved for match_stats (league=%s season=%s).",
-                league, season,
-            )
-            return pd.DataFrame(columns=cols + ['_ingested_at'])
-
-        if limit:
-            match_ids = list(match_ids)[: int(limit)]
-
-        logger.info(
-            "Fetching SofaScore match_stats for %d matches (league=%s season=%s)",
-            len(match_ids), league, season,
-        )
-
-        all_rows: List[Dict] = []
-        consecutive_failures = 0
-        max_consecutive = 100
-
-        for idx, mid in enumerate(match_ids, start=1):
-            payload = self._fetch_match_stats_payload(str(mid))
-            if payload is None:
-                consecutive_failures += 1
-                if consecutive_failures >= max_consecutive:
-                    logger.error(
-                        "%s: %d consecutive match_stats failures — aborting.",
-                        R0_2B_FALLBACK_MARKER, consecutive_failures,
-                    )
-                    break
-                continue
-
-            consecutive_failures = 0
-            all_rows.extend(self._flatten_match_stats(str(mid), payload))
-
-            if idx % 25 == 0:
-                logger.info("match_stats progress: %d/%d matches", idx, len(match_ids))
-
-        if not all_rows:
-            logger.warning(
-                "%s: zero match_stats rows materialised across %d matches.",
-                R0_2B_FALLBACK_MARKER, len(match_ids),
-            )
-            return pd.DataFrame(columns=cols + ['_ingested_at'])
-
-        df = pd.DataFrame(all_rows)
-        df['league'] = league
-
-        season_short = _season_label(league, season)
-        df['season'] = season_short
-        df['_ingested_at'] = datetime.utcnow()
-        df['_source'] = self.SOURCE_NAME
-        df['_entity_type'] = 'match_stats'
-        df['_batch_id'] = self._batch_id
-
-        logger.info(
-            "Materialised %d match_stats rows across %d unique matches",
-            len(df), df['match_id'].nunique(),
-        )
-        return df
 
     # SofaScore unique-tournament id per league — used for exact season/API
     # targeting and finished-match discovery.
@@ -2960,17 +2516,26 @@ class SofaScoreScraper(SoccerdataScraper):
         season_short: str,
         limit: Optional[int] = None,
     ) -> List[str]:
-        """DISTINCT player_id from bronze.sofascore_player_ratings."""
+        """Resolve the complete match participant universe.
+
+        Ratings are not a player-universe table: unused substitutes commonly
+        have a null rating.  Prefer the first-class lineup table, then the
+        lineup-derived event-player rows, and retain ratings as a deployment
+        compatibility source. Incident actors (including substitutions and
+        assists) close match-only gaps. Missing optional tables are discovered
+        through ``information_schema`` before building the UNION, so a rolling
+        upgrade never turns a missing table into an empty paid player capture.
+        """
         try:
             import os
             import trino
             import trino.auth as trino_auth
         except ImportError as e:  # pragma: no cover
-            logger.error("trino client unavailable: %s", e)
-            return []
+            raise RuntimeError("trino client unavailable for player universe") from e
 
         user = os.environ.get('TRINO_USER', 'airflow')
         password = os.environ.get('TRINO_PASSWORD')
+        conn = None
 
         try:
             if password:
@@ -2992,22 +2557,77 @@ class SofaScoreScraper(SoccerdataScraper):
                 )
 
             cur = conn.cursor()
-            sql = (
-                "SELECT DISTINCT CAST(player_id AS varchar) "
-                "FROM iceberg.bronze.sofascore_player_ratings "
-                "WHERE league = ? AND CAST(season AS varchar) = ? "
-                "  AND rating IS NOT NULL"
+            cur.execute(
+                "SELECT table_name FROM iceberg.information_schema.tables "
+                "WHERE table_schema = 'bronze' AND table_name IN "
+                "('sofascore_lineups', 'sofascore_event_player_stats', "
+                "'sofascore_player_ratings', 'sofascore_incidents')"
             )
+            available = {str(row[0]) for row in cur.fetchall() if row and row[0]}
+            ordered = (
+                'sofascore_lineups',
+                'sofascore_event_player_stats',
+                'sofascore_player_ratings',
+            )
+            sources = [table for table in ordered if table in available]
+            fragments = [
+                (
+                    "SELECT CAST(player_id AS varchar) AS player_id "
+                    f"FROM iceberg.bronze.{table} "
+                    "WHERE league = ? AND CAST(season AS varchar) = ? "
+                    "AND player_id IS NOT NULL"
+                )
+                for table in sources
+            ]
+            if 'sofascore_incidents' in available:
+                cur.execute(
+                    "SELECT column_name FROM iceberg.information_schema.columns "
+                    "WHERE table_schema = 'bronze' "
+                    "AND table_name = 'sofascore_incidents'"
+                )
+                incident_columns = {
+                    str(row[0]) for row in cur.fetchall() if row and row[0]
+                }
+                for column in (
+                    'player_id',
+                    'player_in_id',
+                    'player_out_id',
+                    'assist1_id',
+                    'assist2_id',
+                ):
+                    if column not in incident_columns:
+                        continue
+                    fragments.append(
+                        f"SELECT CAST({column} AS varchar) AS player_id "
+                        "FROM iceberg.bronze.sofascore_incidents "
+                        "WHERE league = ? AND CAST(season AS varchar) = ? "
+                        f"AND {column} IS NOT NULL"
+                    )
+            if not fragments:
+                logger.warning("No SofaScore match-player Bronze tables exist yet")
+                return []
+            union = " UNION ALL ".join(fragments)
+            sql = f"SELECT DISTINCT player_id FROM ({union}) players ORDER BY player_id"
             if limit:
                 sql = sql + f" LIMIT {int(limit)}"
-            cur.execute(sql, (league, season_short))
+            params = tuple(
+                value
+                for _fragment in fragments
+                for value in (league, season_short)
+            )
+            cur.execute(sql, params)
             rows = cur.fetchall()
             return [r[0] for r in rows if r and r[0]]
         except Exception as e:
-            logger.warning(
-                "Could not resolve player_ids from bronze: %s", e,
-            )
-            return []
+            raise RuntimeError(
+                f"could not resolve player_ids from bronze: {e}"
+            ) from e
+        finally:
+            try:
+                if conn is not None:
+                    conn.close()
+            except Exception:
+                pass
 
     @staticmethod
     def _flatten_player_season_stats(
@@ -3075,6 +2695,22 @@ class SofaScoreScraper(SoccerdataScraper):
         # Nested `country`/`team` flatten to country_name/country_alpha2/team_id/
         # team_name/... ; `dateOfBirthTimestamp` stays raw (Silver -> date).
         _auto_flatten(player, row)
+        row.setdefault('height_cm', row.get('height'))
+        dob_timestamp = row.get('date_of_birth_timestamp')
+        if dob_timestamp is not None:
+            try:
+                row.setdefault(
+                    'date_of_birth',
+                    datetime.utcfromtimestamp(int(dob_timestamp)).date().isoformat(),
+                )
+            except (OverflowError, TypeError, ValueError):
+                row.setdefault('date_of_birth', None)
+        else:
+            row.setdefault('date_of_birth', None)
+        row.setdefault('country_code', row.get('country_alpha2'))
+        row.setdefault('nationality', None)
+        row.setdefault('current_team_id', row.get('team_id'))
+        row.setdefault('current_team_name', row.get('team_name'))
         return row
 
     # ------------------------------------------------------------------
@@ -3229,7 +2865,31 @@ class SofaScoreScraper(SoccerdataScraper):
             )
             return empty
 
+        from dags.utils.sofascore_dq import validate_minimum_coverage
+
+        validate_minimum_coverage(
+            'player_profile',
+            {str(row.get('player_id')) for row in profile_rows},
+            {str(player_id) for player_id in player_ids},
+            threshold=0.95,
+        ).require()
+
         df = pd.DataFrame(profile_rows)
+        profile_compat_cols = [
+            'height_cm', 'date_of_birth', 'country_code',
+            'current_team_id', 'current_team_name',
+        ]
+        df = df.reindex(
+            columns=(
+                profile_cols
+                + profile_compat_cols
+                + [
+                    column
+                    for column in df.columns
+                    if column not in profile_cols + profile_compat_cols
+                ]
+            ),
+        )
         df['league'] = league
         df['season'] = season_short
         df['_ingested_at'] = datetime.utcnow()
@@ -3258,105 +2918,3 @@ class SofaScoreScraper(SoccerdataScraper):
             len(player_ids),
         )
         return result
-
-    def scrape_schedule(self) -> Dict[str, str]:
-        """Scrape match schedule through the compatibility entrypoint."""
-        df = self.read_schedule()
-        if df is not None and not df.empty:
-            table_path = self.save_to_iceberg(
-                df=df,
-                table_name='sofascore_schedule',
-                partition_cols=['league', 'season'],
-                replace_partitions=['league', 'season'],
-                min_replace_ratio=0.9,
-            )
-            return {'schedule': table_path}
-        return {}
-
-    def scrape_league_table(self) -> Dict[str, str]:
-        """Scrape league table through the compatibility entrypoint."""
-        df = self.read_league_table()
-        if df is not None and not df.empty:
-            table_path = self.save_to_iceberg(
-                df=df,
-                table_name='sofascore_league_table',
-                partition_cols=['league', 'season'],
-                replace_partitions=['league', 'season'],
-                min_replace_ratio=0.9,
-            )
-            return {'league_table': table_path}
-        return {}
-
-    def scrape_player_ratings(
-        self,
-        league: Optional[str] = None,
-        season: Optional[int] = None,
-        match_ids: Optional[List[str]] = None,
-        limit: Optional[int] = None,
-    ) -> Dict[str, str]:
-        """Scrape per-match player ratings via the lineups REST endpoint.
-
-        Bronze layout: ``iceberg.bronze.sofascore_player_ratings`` is
-        partitioned by ``(league, season)``. The daily DAG passes the
-        full set of finished matches for the season, so we pass
-        ``replace_partitions=['league', 'season']`` to replace each
-        partition wholesale and avoid append-only drift — see
-        ``memory/feedback_replace_partitions_required.md``.
-        """
-        target_league = league or (self.leagues[0] if self.leagues else None)
-        target_season = season if season is not None else (
-            self.seasons[0] if self.seasons else None
-        )
-        if not target_league or target_season is None:
-            logger.error(
-                "scrape_player_ratings: league/season unresolved — "
-                "leagues=%s seasons=%s", self.leagues, self.seasons,
-            )
-            return {}
-
-        df = self.read_player_ratings(
-            league=target_league,
-            season=int(target_season),
-            match_ids=match_ids,
-            limit=limit,
-        )
-        if df is None or df.empty:
-            return {}
-
-        table_path = self.save_to_iceberg(
-            df=df,
-            table_name='sofascore_player_ratings',
-            partition_cols=['league', 'season'],
-            replace_partitions=['league', 'season'],
-        )
-        return {'player_ratings': table_path}
-
-    def scrape_all(self) -> Dict[str, str]:
-        """
-        Scrape all SofaScore data.
-
-        Returns:
-            Dictionary mapping data type to Iceberg table path
-        """
-        logger.info(
-            f"Starting SofaScore scrape: leagues={self.leagues}, seasons={self.seasons}"
-        )
-
-        results = {}
-        schedule, league_table = self.read_tournament_snapshot()
-        for entity, frame in (
-            ('schedule', schedule),
-            ('league_table', league_table),
-        ):
-            if frame is None or frame.empty:
-                continue
-            results[entity] = self.save_to_iceberg(
-                df=frame,
-                table_name=f'sofascore_{entity}',
-                partition_cols=['league', 'season'],
-                replace_partitions=['league', 'season'],
-                min_replace_ratio=0.9,
-            )
-
-        logger.info(f"SofaScore scrape complete: {list(results.keys())}")
-        return results

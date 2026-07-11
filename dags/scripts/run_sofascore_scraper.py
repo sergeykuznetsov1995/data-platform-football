@@ -9,20 +9,14 @@ Called from Airflow via BashOperator to avoid memory issues with PythonOperator.
 Supported entities:
 - ``schedule``        : per-round schedule + final scores (default)
 - ``league_table``    : standings snapshot
-- ``player_ratings``  : per-match player ratings (Opta 0.0-10.0) via
-                       the public ``/api/v1/event/{id}/lineups`` endpoint.
-                       Daily DAG passes the full set of finished matches;
-                       writer uses ``replace_partitions=['league', 'season']``
-                       so each run refreshes the partition wholesale.
-- ``shotmap``         : per-shot coords + xG + situation via
-                       ``/api/v1/event/{id}/shotmap`` (issue #22).
-- ``event_player_stats``: per-(match, player) Opta-rich stats via
-                       ``/api/v1/event/{id}/player/{pid}/statistics`` (#21).
-                       Player ids are resolved from
-                       ``bronze.sofascore_player_ratings`` — that table
-                       must be fresh before this entity runs.
-- ``match_stats``     : team-level per-(match, period, stat) long-form
-                       rows from ``/api/v1/event/{id}/statistics`` (#25).
+- ``match_capture``   : canonical raw-first per-event engine. One warmed
+                       session jointly captures event, lineups/ratings,
+                       player/team statistics, shotmap and incidents, then
+                       incrementally merges every table by its natural key.
+- ``player_ratings``, ``shotmap``, ``event_player_stats``, ``match_stats``:
+                       compatibility aliases of ``match_capture``; they never
+                       invoke a standalone endpoint runner.
+- ``player_capture``  : shared profile and target-season statistics engine.
 
 Exit codes:
     0 — scrape completed successfully (>= 1 row written)
@@ -42,6 +36,7 @@ import logging
 import os
 import sys
 import warnings
+from datetime import datetime, timezone
 from typing import List, Optional
 
 warnings.filterwarnings('ignore', category=DeprecationWarning)
@@ -97,15 +92,45 @@ VALID_ENTITIES = {
     ENTITY_PLAYER_CAPTURE,
 }
 
-# Replace-partitions completeness guard (#513 → #583): refuse a save that would
-# shrink a bronze.sofascore_* (league, season) partition below this share of its
-# existing rows, so a partial/failed scrape can't wipe a good partition.
-# COUNT(*) (no replace_guard_key) — each (league, season) is scraped full-state.
-# ReplaceGuardError → exit 3; bypass with --force-replace. NOTE: the append-only
-# event endpoint (shotmap / event_player_stats / match_stats) is NOT guarded —
-# it has no replace_partitions (rows preserved across runs, #69).
-_MIN_REPLACE_RATIO = 0.9
+# Keep the stable marker/exit code for writer DQ or replace-guard refusals. All
+# live SofaScore paths now publish natural-keyed deltas through Iceberg MERGE;
+# ``--force-replace`` means re-capture source endpoints, not rewrite a partition.
 REPLACE_GUARD_MARKER = 'SOFASCORE_REPLACE_GUARD'
+
+
+def _paid_capture_blocker(capture_runtime) -> str:
+    """Explain why starting a paid browser would be unsafe for this runtime."""
+    if capture_runtime.engine.budget is None:
+        return (
+            capture_runtime.budget_error
+            or 'verified SofaScore provider-byte canary is unavailable'
+        )
+    return (
+        'warmed Camoufox provider-meter token is not wired to the filtering '
+        'proxy for every browser byte'
+    )
+
+
+def _season_freshness_key(
+    capture_runtime,
+    *,
+    force_replace: bool,
+    offline_replay: bool,
+) -> str:
+    key = (
+        os.environ.get("SOFASCORE_SEASON_FRESHNESS_KEY", "").strip()
+        or "day-" + datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    )
+    if force_replace and not offline_replay:
+        return f"repair-{capture_runtime.engine.run_id}"
+    return key
+
+
+def _season_max_pages() -> int:
+    value = int(os.environ.get("SOFASCORE_SEASON_MAX_PAGES", "50"))
+    if value < 1:
+        raise ValueError("SOFASCORE_SEASON_MAX_PAGES must be a positive integer")
+    return value
 
 
 def _trino_connect():
@@ -279,211 +304,6 @@ def _resolve_match_ids_from_bronze(
             pass
 
 
-# Fallback column shape for an EMPTY existing partition (fresh season / Trino
-# unreachable). #840: Bronze is auto-passthrough now, so the live column set
-# evolves — _read_existing_schedule reads it dynamically via SELECT *; this list
-# only shapes the empty DataFrame (which _merge_schedule_partition replaces with
-# the captured rows wholesale anyway).
-_SCHEDULE_COLUMNS = ['game_id', 'league', 'season']
-
-
-def _read_existing_schedule(league: str, season: str):
-    """Read the existing ``bronze.sofascore_schedule`` (league, season) partition
-    into a DataFrame so the captured window can be MERGED with it rather than
-    replacing it (#761). Camoufox capture only surfaces a window of events
-    (current round + recent finished + upcoming), so a straight
-    ``replace_partitions`` would trip the completeness guard once the partition
-    has accumulated more than the window. Returns an EMPTY DataFrame when the
-    table/partition is missing or Trino is unreachable — the caller then saves
-    the captured rows as-is (a fresh-season partition is empty anyway).
-    """
-    import pandas as pd
-
-    empty = pd.DataFrame(columns=_SCHEDULE_COLUMNS)
-    conn = _trino_connect()
-    if conn is None:
-        return empty
-    try:
-        cur = conn.cursor()
-        # #840: schema-agnostic SELECT * — Bronze auto-passthrough evolves the
-        # column set; _merge_schedule_partition reindexes to the captured columns,
-        # so a full-season capture rewrites the partition cleanly on the #840
-        # transition (partial captures then merge in the new schema unchanged).
-        cur.execute(
-            "SELECT * FROM iceberg.bronze.sofascore_schedule "
-            "WHERE league = ? AND CAST(season AS varchar) = ?",
-            (league, season),
-        )
-        rows = cur.fetchall()
-        cols = [d[0] for d in cur.description]
-        return pd.DataFrame(rows, columns=cols)
-    except Exception as e:
-        logger.warning(
-            "Could not read existing schedule partition (league=%s season=%s): "
-            "%s — saving captured rows as-is.", league, season, e,
-        )
-        return empty
-    finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
-
-
-def _merge_schedule_partition(existing, captured):
-    """Union an existing schedule partition with a freshly-captured window,
-    keyed by ``game_id`` with the captured row winning (fresh scores). The
-    result is never smaller than ``existing``, so the completeness guard passes
-    even when the capture only surfaced a window of the season (#761). An empty
-    ``existing`` (fresh season / first run) just returns the captured rows.
-    """
-    import pandas as pd
-
-    if existing is None or existing.empty:
-        return captured.reset_index(drop=True)
-    if "game_id" not in existing.columns:
-        logger.warning(
-            "Existing schedule partition lacks game_id; using captured frame only.",
-        )
-        return captured.reset_index(drop=True)
-    captured_columns = set(captured.columns)
-    columns = list(existing.columns) + [
-        col for col in captured.columns if col not in existing.columns
-    ]
-    existing = existing.reindex(columns=columns)
-    captured = captured.reindex(columns=columns)
-    # When SofaScore omits an evolving field from the whole current window, keep
-    # its last known value for overlapping games. Fresh columns still win when
-    # they are actually present in the captured schema.
-    absent_columns = [
-        col
-        for col in existing.columns
-        if col not in captured_columns and col != "game_id"
-    ]
-    if absent_columns:
-        prior = existing.drop_duplicates("game_id", keep="last").copy()
-        prior.index = prior["game_id"].astype(str)
-        for col in absent_columns:
-            captured[col] = captured["game_id"].astype(str).map(prior[col])
-    return (
-        pd.concat([existing, captured], ignore_index=True)
-        .drop_duplicates(subset='game_id', keep='last')
-        .reset_index(drop=True)
-    )
-
-
-def _read_existing_partition(table: str, league: str, season: str):
-    """Read an existing ``bronze.<table>`` (league, season) partition into a
-    DataFrame so freshly-captured rows can be MERGED with it before a
-    ``replace_partitions`` save (#842 incremental match_capture — generalises
-    ``_read_existing_schedule`` #761). Returns an EMPTY DataFrame when the
-    table/partition is missing or Trino is unreachable — the caller then saves
-    the captured rows as-is, and the completeness guard still protects a
-    non-empty partition from being replaced by a partial frame.
-    """
-    import pandas as pd
-
-    empty = pd.DataFrame()
-    conn = _trino_connect()
-    if conn is None:
-        return empty
-    try:
-        cur = conn.cursor()
-        cur.execute(
-            f"SELECT * FROM iceberg.bronze.{table} "
-            "WHERE league = ? AND CAST(season AS varchar) = ?",
-            (league, season),
-        )
-        rows = cur.fetchall()
-        cols = [d[0] for d in cur.description]
-        return pd.DataFrame(rows, columns=cols)
-    except Exception as e:
-        logger.warning(
-            "Could not read existing bronze.%s partition (league=%s "
-            "season=%s): %s — saving captured rows as-is.",
-            table, league, season, e,
-        )
-        return empty
-    finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
-
-
-def _merge_match_partition(existing, captured, key: str):
-    """Union an existing per-match partition with freshly-captured rows, keyed
-    by ``key`` (``match_id``; ``game_id`` for venue) with the captured match
-    winning wholesale — its existing rows are dropped before the concat so a
-    re-captured match never carries stale partial rows. Same completeness-guard
-    rationale as ``_merge_schedule_partition`` (#761): union >= existing, so the
-    guard passes even though the capture only fetched the NEW matches (#842).
-    """
-    import pandas as pd
-
-    if existing is None or existing.empty:
-        return captured.reset_index(drop=True)
-    if key not in existing.columns:
-        logger.warning(
-            "Existing partition lacks merge key %s; using captured frame only.",
-            key,
-        )
-        return captured.reset_index(drop=True)
-    captured_keys = set(captured[key].astype(str))
-    captured_columns = set(captured.columns)
-    absent_columns = [
-        column
-        for column in existing.columns
-        if column not in captured_columns and column != key
-    ]
-    if absent_columns:
-        common = set(existing.columns) & set(captured.columns)
-        row_keys = [key]
-        if "shot_id" in common:
-            row_keys.append("shot_id")
-        elif "player_id" in common:
-            row_keys.append("player_id")
-            if "team_side" in common:
-                row_keys.append("team_side")
-        elif {"period", "stat_group"} <= common:
-            row_keys.extend(["period", "stat_group"])
-            if "key" in common:
-                row_keys.append("key")
-            elif "name" in common:
-                row_keys.append("name")
-
-        # Preserve values only for columns absent from the entire fresh schema.
-        # Temporary string keys avoid int/varchar mismatches from Trino frames.
-        left = captured.copy()
-        right = existing[row_keys + absent_columns].drop_duplicates(
-            row_keys,
-            keep="last",
-        )
-        temp_keys = []
-        for index, row_key in enumerate(row_keys):
-            temp = f"__merge_key_{index}"
-            temp_keys.append(temp)
-            left[temp] = left[row_key].astype(str)
-            right[temp] = right[row_key].astype(str)
-        prior_names = {
-            column: f"__prior_{column}"
-            for column in absent_columns
-        }
-        right = right[temp_keys + absent_columns].rename(columns=prior_names)
-        left = left.merge(right, on=temp_keys, how="left")
-        for column, prior in prior_names.items():
-            left[column] = left[prior]
-        captured = left.drop(columns=temp_keys + list(prior_names.values()))
-
-    columns = list(existing.columns) + [
-        col for col in captured.columns if col not in existing.columns
-    ]
-    existing = existing.reindex(columns=columns)
-    captured = captured.reindex(columns=columns)
-    keep = existing[~existing[key].astype(str).isin(captured_keys)]
-    return pd.concat([keep, captured], ignore_index=True)
-
-
 def _compatible_legacy_season_alias(
     league: str,
     season,
@@ -504,6 +324,65 @@ def _compatible_legacy_season_alias(
     if _season_label(league, raw) == season_short:
         return raw
     return None
+
+
+def _source_context(league: str, season, canonical_season: str) -> tuple[int, int]:
+    """Resolve registry-owned source IDs; never discover metadata via proxy."""
+    from scrapers.sofascore.catalog import CatalogError, SofaScoreCatalog
+
+    catalog = SofaScoreCatalog.load()
+    tournament = catalog.competition(league)
+    if not tournament.capture_allowed:
+        raise CatalogError(f'{league} is not capture-eligible')
+    source_season = None
+    for token in (canonical_season, season):
+        source_season = catalog.resolve_source_season(
+            tournament.unique_tournament_id, token
+        )
+        if source_season is not None:
+            break
+    if source_season is None:
+        raise CatalogError(
+            f'{league} season {canonical_season!r} has no discovered SofaScore id'
+        )
+    return tournament.unique_tournament_id, source_season.season_id
+
+
+def _complete_manifest_records_for_projection(
+    manifest_store,
+    endpoint_specs,
+    pipeline_results,
+    *,
+    endpoints=('event', 'lineups', 'statistics', 'shotmap', 'incidents'),
+):
+    """Load every long endpoint state for each touched event.
+
+    Endpoint resume returns only newly processed endpoints. Projecting that
+    subset would overwrite the compatibility row with ``missing`` for endpoints
+    that were already terminal, regressing ``capture_complete`` to false.
+    """
+    target_ids = sorted({
+        result.manifest.key.target_id for result in pipeline_results
+    })
+    records = []
+    missing = []
+    for target_id in target_ids:
+        for endpoint in endpoints:
+            spec = endpoint_specs.get((target_id, endpoint))
+            if spec is None:
+                missing.append((target_id, endpoint, 'spec'))
+                continue
+            record = manifest_store.get(spec.key)
+            if record is None:
+                missing.append((target_id, endpoint, 'manifest'))
+                continue
+            records.append(record)
+    if missing:
+        raise RuntimeError(
+            'compatibility projection lacks canonical endpoint states: '
+            + repr(missing)
+        )
+    return records
 
 
 def _filter_new_match_ids(
@@ -579,6 +458,7 @@ def _manifest_frame(
                 "lineups_status": "legacy_complete",
                 "statistics_status": "legacy_complete",
                 "shotmap_status": "legacy_complete",
+                "incidents_status": "legacy_complete",
                 "capture_complete": True,
                 "league": league,
                 "season": season,
@@ -595,6 +475,7 @@ def _manifest_frame(
                 "lineups_status": "pending",
                 "statistics_status": "pending",
                 "shotmap_status": "pending",
+                "incidents_status": "pending",
                 "capture_complete": False,
                 "league": league,
                 "season": season,
@@ -626,8 +507,7 @@ def _prepare_capture_manifest(
         df=frame,
         table_name=_MATCH_CAPTURE_STATUS_TABLE,
         partition_cols=["league", "season"],
-        replace_partitions=["league", "season"],
-        min_replace_ratio=None,
+        natural_keys=['league', 'season', 'match_id'],
     )
 
 
@@ -646,174 +526,118 @@ def _fallback_exit_code(reason: str) -> int:
     return 2
 
 
-def _run_player_ratings(
-    leagues: List[str],
-    season: int,
-    limit: Optional[int],
-    output_path: str,
-    force_replace: bool = False,
-) -> int:
-    """R0.2b player-ratings entrypoint. Returns process exit code."""
-    from scrapers.base.base_scraper import ReplaceGuardError
-    from scrapers.sofascore import SofaScoreScraper
-    from scrapers.sofascore.scraper import R0_2B_FALLBACK_MARKER, _season_label
+def _materialize_endpoint_results(scraper, results, *, league: str, season: str):
+    """Build every match DataFrame from the raw/replay engine datasets."""
+    import pandas as pd
 
-    league = leagues[0]  # ratings scrape is single-league per invocation
-    # Schedule writer stores season as the soccerdata short form (e.g. "2526")
-    # Preserve the integer start-year contract while keeping single-year
-    # competitions on their literal partition (for example WC 2026 -> 2026).
-    season_short = _season_label(league, season)
-    season_alias = _compatible_legacy_season_alias(
-        league,
-        season,
-        season_short,
+    from dags.utils.sofascore_dq import (
+        validate_event_participants,
+        validate_lineup_semantics,
+        validate_season_alignment,
+        validate_table_rows,
     )
+    from scrapers.sofascore.adapters import project_legacy_match_status
 
-    logger.info(
-        "R0.2b player_ratings: league=%s season=%s (short=%s) limit=%s",
-        league, season, season_short, limit,
-    )
+    rows_by_dataset = {}
+    for result in results:
+        raw = result.raw
+        for name, dataset in result.datasets.items():
+            for row in dataset.rows:
+                enriched = dict(row)
+                enriched.update({
+                    'source_tournament_id': result.manifest.key.source_tournament_id,
+                    'source_season_id': result.manifest.key.source_season_id,
+                    'raw_content_hash': (
+                        raw.content_hash if raw else result.manifest.raw_content_hash
+                    ),
+                    'raw_blob_key': (
+                        raw.blob_key if raw else result.manifest.raw_blob_key
+                    ),
+                })
+                rows_by_dataset.setdefault(name, []).append(enriched)
 
-    # 1) Pre-resolve match_ids from bronze.sofascore_schedule — avoids a
-    #    fresh schedule scrape on every run.
-    match_ids = _resolve_match_ids_from_bronze(league, season_short, limit)
-    if not match_ids and season_alias:
-        # try with int-form season too — just in case the writer used int
-        match_ids = _resolve_match_ids_from_bronze(league, season_alias, limit)
-
-    if match_ids:
-        logger.info("Resolved %d match_ids from bronze.sofascore_schedule",
-                    len(match_ids))
-    else:
-        # bronze schedule is empty (e.g. fresh season — soccerdata schedule is
-        # Turnstile-blocked). Defer to the Camoufox capture resolver inside the
-        # scraper session below (#757 B2) before declaring R0.2B fallback.
-        logger.warning(
-            "bronze.sofascore_schedule empty for league=%s season=%s — will "
-            "resolve finished match_ids via Camoufox capture (#757).",
-            league, season_short,
-        )
-
-    proxy_file = os.environ.get('PROXY_FILE', '/opt/airflow/proxys.txt')
-    if not os.path.exists(proxy_file):
-        logger.warning(
-            "Proxy file %s not found — SofaScore is likely to 403 "
-            "without residential proxy.", proxy_file,
-        )
-        proxy_file = None
-
-    results = {
-        'entity': ENTITY_PLAYER_RATINGS,
-        'tables': [],
-        'rows': 0,
-        'matches_attempted': len(match_ids),
-        'matches_with_ratings': 0,
-        'fallback': False,
-        'fallback_reason': None,
-        'errors': [],
+    # The lineups payload supplies player stats while the event payload supplies
+    # team identities. Join them in memory without another source request.
+    participant_lookup = {
+        (str(row.get('match_id')), row.get('team_side')): row
+        for row in rows_by_dataset.get('event_participants', [])
     }
-    scraper = None
-    try:
-        with SofaScoreScraper(
-            leagues=[league],
-            seasons=[season],
-            proxy_file=proxy_file,
-        ) as scraper:
-            if not match_ids:
-                # #757 B2: discover finished match_ids via Camoufox capture when
-                # bronze.sofascore_schedule is empty (Turnstile-blocked soccerdata).
-                match_ids = scraper.resolve_finished_match_ids_via_capture(
-                    league, int(season),
-                )
-                if not match_ids:
-                    logger.error(
-                        "%s: no match_ids from bronze OR capture for "
-                        "league=%s season=%s.",
-                        R0_2B_FALLBACK_MARKER, league, season_short,
-                    )
-                    results['fallback'] = True
-                    results['fallback_reason'] = 'no_match_ids'
-                    results['errors'].append(
-                        f'{R0_2B_FALLBACK_MARKER}: no_match_ids'
-                    )
-                    results['traffic'] = scraper.get_traffic_stats()
-                    _write_results(output_path, results)
-                    return 2
-                if limit:
-                    match_ids = match_ids[: int(limit)]
-                results['matches_attempted'] = len(match_ids)
-                logger.info("Resolved %d finished match_ids via capture",
-                            len(match_ids))
+    for row in rows_by_dataset.get('event_player_stats', []):
+        side = 'home' if row.get('is_home') is True else 'away'
+        participant = participant_lookup.get((str(row.get('match_id')), side), {})
+        row['team_id'] = row.get('team_id') or participant.get('team_id')
+        row['team_name'] = row.get('team_name') or participant.get('name')
 
-            df = scraper.read_player_ratings(
-                league=league,
-                season=int(season),
-                match_ids=match_ids,
-                limit=limit,
-            )
-            results['traffic'] = scraper.get_traffic_stats()  # #789
+    entity_types = {
+        'player_ratings': 'player_ratings',
+        'lineups': 'lineups',
+        'event_player_stats': 'event_player_stats',
+        'match_stats': 'match_stats',
+        'event_shotmap': 'event_shotmap',
+        'venue': 'venue',
+        'events': 'events',
+        'event_participants': 'event_participants',
+        'incidents': 'incidents',
+    }
+    frames = {}
+    for name, entity_type in entity_types.items():
+        rows = rows_by_dataset.get(name, [])
+        frame = pd.DataFrame(rows)
+        if not frame.empty:
+            frame['league'] = league
+            frame['season'] = season
+            frame = scraper._add_metadata(frame, entity_type)
+        frames[name] = frame
 
-            if df is None or df.empty:
-                # Look at scraper's last fetch error to classify the
-                # fallback reason.
-                last_err = getattr(scraper, '_last_lineup_error', None)
-                reason = 'empty_payload'
-                if last_err:
-                    status = last_err.get('status')
-                    if status == 403:
-                        reason = 'http_403'
-                    elif status == 429:
-                        reason = 'http_429'
-                    elif status is None:
-                        reason = 'transport_error'
-                    else:
-                        reason = f'http_{status}'
+    status_rows = project_legacy_match_status(
+        [result.manifest for result in results],
+        league=league,
+        season=season,
+        endpoints=('event', 'lineups', 'statistics', 'shotmap', 'incidents'),
+    )
+    status = pd.DataFrame(status_rows)
+    frames['capture_status'] = (
+        scraper._add_metadata(status, 'match_capture_status')
+        if not status.empty else status
+    )
 
-                logger.error(
-                    "%s: SofaScore ratings unavailable — reason=%s detail=%s",
-                    R0_2B_FALLBACK_MARKER, reason, last_err,
-                )
-                results['fallback'] = True
-                results['fallback_reason'] = reason
-                results['errors'].append(
-                    f'{R0_2B_FALLBACK_MARKER}: {reason}'
-                )
-                _write_results(output_path, results)
-                return _fallback_exit_code(results['fallback_reason'])
-
-            table_path = scraper.save_to_iceberg(
-                df=df,
-                table_name='sofascore_player_ratings',
-                partition_cols=['league', 'season'],
-                replace_partitions=['league', 'season'],
-                min_replace_ratio=(
-                    None if force_replace else _MIN_REPLACE_RATIO
-                ),
-            )
-            results['tables'].append(table_path)
-            results['rows'] = int(len(df))
-            results['matches_with_ratings'] = int(df['match_id'].nunique())
-            logger.info(
-                "Saved %d rating rows for %d matches -> %s",
-                results['rows'], results['matches_with_ratings'], table_path,
-            )
-
-    except ReplaceGuardError as e:
-        if scraper is not None:
-            results['traffic'] = scraper.get_traffic_stats()
-        msg = f"{REPLACE_GUARD_MARKER}: {e}"
-        logger.error(msg)
-        results['errors'].append(msg)
-        _write_results(output_path, results)
-        return 3
-    except Exception as e:
-        logger.error("player_ratings scrape failed hard: %s", e, exc_info=True)
-        results['errors'].append(str(e))
-        _write_results(output_path, results)
-        return 1
-
-    _write_results(output_path, results)
-    return 0
+    dq_tables = {
+        'events': 'bronze.sofascore_events',
+        'event_participants': 'bronze.sofascore_event_participants',
+        'lineups': 'bronze.sofascore_lineups',
+        'incidents': 'bronze.sofascore_incidents',
+    }
+    for dataset, table in dq_tables.items():
+        frame = frames[dataset]
+        if not frame.empty:
+            validate_table_rows(table, frame.to_dict('records')).require()
+    if not frames['lineups'].empty:
+        validate_lineup_semantics(
+            frames['lineups'].to_dict('records')
+        ).require()
+    if not frames['event_participants'].empty:
+        validate_event_participants(
+            frames['event_participants'].to_dict('records')
+        ).require()
+    source_season_ids = {
+        str(result.manifest.key.source_season_id)
+        for result in results
+    }
+    if len(source_season_ids) != 1:
+        raise ValueError(
+            'match materialization received mixed SofaScore seasons: '
+            + repr(sorted(source_season_ids))
+        )
+    expected_source_season_id = next(iter(source_season_ids))
+    for name, frame in frames.items():
+        if name == 'capture_status' or frame.empty:
+            continue
+        validate_season_alignment(
+            frame.to_dict('records'),
+            expected_source_season_id=expected_source_season_id,
+            expected_canonical_season=season,
+        ).require()
+    return frames
 
 
 def _run_match_capture(
@@ -822,6 +646,8 @@ def _run_match_capture(
     limit: Optional[int],
     output_path: str,
     force_replace: bool = False,
+    capture_runtime=None,
+    offline_replay: bool = False,
 ) -> int:
     """#751 PR1+PR2 — consolidated per-match capture entrypoint.
 
@@ -830,8 +656,8 @@ def _run_match_capture(
     ``/lineups`` + ``/event`` + ``/statistics`` + ``/shotmap`` payloads:
     ``sofascore_player_ratings``, ``sofascore_event_player_stats``,
     ``sofascore_match_stats``, ``sofascore_event_shotmap`` and
-    ``sofascore_venue`` — replacing separate
-    separate Turnstile-blocked passes. The secondary tables come essentially
+    ``sofascore_venue`` — replacing separate Turnstile-blocked passes. The
+    secondary tables come essentially
     free with the ratings capture (no per-player ``/player/{pid}/statistics``
     nor per-event ``/statistics`` REST calls). statistics/shotmap are
     best-effort — an empty frame is skipped.
@@ -840,8 +666,9 @@ def _run_match_capture(
     matches (finished-match data is immutable; re-capturing the whole season
     daily burned ~1.6 GB of residential proxy per run). It distinguishes valid
     empty/404 answers from retryable misses. Only incomplete/new matches are
-    captured; each frame is merged with its existing partition.
-    ``--force-replace`` restores a deliberate full re-capture for repairs.
+    captured; each frame is incrementally merged by its natural key.
+    ``--force-replace`` deliberately re-captures endpoints for repairs while
+    retaining the same incremental writer contract.
 
     Exit codes: 0 ok (incl. the nothing-new no-op) / 2 R0.2B_FALLBACK
     (nothing captured) / 3 ReplaceGuard / 1 hard failure.
@@ -880,6 +707,28 @@ def _run_match_capture(
             },
         )
         return 1
+
+    if len(leagues) != 1:
+        error = (
+            'capture requires exactly one registry competition per logical '
+            f'task; received {leagues!r}'
+        )
+        logger.error(error)
+        _write_results(
+            output_path,
+            {
+                'entity': ENTITY_MATCH_CAPTURE,
+                'tables': [],
+                'errors': [f'competition_scope: {error}'],
+                'traffic': {
+                    'paid_proxy_bytes': 0,
+                    'browser_sessions': 0,
+                    'browser_navigations': 0,
+                    'requests': 0,
+                },
+            },
+        )
+        return 1
     if match_ids:
         logger.info("Resolved %d match_ids from bronze.sofascore_schedule",
                     len(match_ids))
@@ -911,6 +760,10 @@ def _run_match_capture(
         'shotmap_matches': 0,
         'venue_rows': 0,
         'venue_matches': 0,
+        'event_rows': 0,
+        'participant_rows': 0,
+        'incident_rows': 0,
+        'incident_matches': 0,
         'capture_status_rows': 0,
         'matches_complete': 0,
         'matches_total': 0,             # resolved before skip-existing (#842)
@@ -922,11 +775,96 @@ def _run_match_capture(
     legacy_seed_ids = set()
     manifest_missing = False
     pending_manifest_ids = []
+    endpoint_plan = None
+    endpoint_specs = {}
+    pipeline_results = []
+
+    if capture_runtime is not None:
+        try:
+            from scrapers.sofascore.pipeline import (
+                EVENT_PATHS,
+                build_event_spec,
+                endpoint_resume_plan,
+            )
+
+            if not match_ids:
+                raise RuntimeError(
+                    'bronze schedule has no finished event ids; tournament '
+                    'schedule raw/replay is not implemented in the common '
+                    'capture engine, refusing browser/source fallback'
+                )
+            source_tournament_id, source_season_id = _source_context(
+                league, season, season_short
+            )
+            production_capture = True
+            freshness_key = (
+                f"repair-{capture_runtime.engine.run_id}"
+                if force_replace else 'final'
+            )
+            specs = [
+                build_event_spec(
+                    source_tournament_id=source_tournament_id,
+                    source_season_id=source_season_id,
+                    target_id=match_id,
+                    endpoint=endpoint,
+                    freshness_key=freshness_key,
+                    paid_proxy=production_capture,
+                )
+                for match_id in match_ids
+                for endpoint in EVENT_PATHS
+            ]
+            endpoint_specs = {
+                (spec.key.target_id, spec.key.endpoint): spec for spec in specs
+            }
+            endpoint_plan = (
+                {str(match_id): tuple(EVENT_PATHS) for match_id in match_ids}
+                if force_replace or offline_replay
+                else endpoint_resume_plan(capture_runtime.manifest_store, specs)
+            )
+            total = len(match_ids)
+            match_ids = [
+                match_id for match_id in match_ids
+                if str(match_id) in endpoint_plan
+            ]
+            results['matches_total'] = total
+            results['matches_skipped_existing'] = total - len(match_ids)
+            if match_ids and not offline_replay and production_capture:
+                # The verified policy and provider-meter token must wrap the
+                # warmed browser before a single byte moves. Until the checked-
+                # in canary is verified and the proxy-filter token is wired,
+                # fail closed rather than silently bypassing the hard budget.
+                raise RuntimeError(
+                    'production paid capture disabled: '
+                    + _paid_capture_blocker(capture_runtime)
+                )
+            if not match_ids:
+                results['traffic'] = {
+                    'paid_proxy_bytes': 0,
+                    'paid_proxy_mb': 0.0,
+                    'browser_sessions': 0,
+                    'browser_navigations': 0,
+                    'request_count': 0,
+                    'cache_hit_rate': 1.0,
+                    'endpoint_completeness': 1.0,
+                }
+                _write_results(output_path, results)
+                return 0
+        except Exception as exc:
+            results['errors'].append(f'capture_engine: {exc}')
+            results['traffic'] = {
+                'paid_proxy_bytes': 0,
+                'paid_proxy_mb': 0.0,
+                'browser_sessions': 0,
+                'browser_navigations': 0,
+                'request_count': 0,
+            }
+            _write_results(output_path, results)
+            return 1
 
     # #842 skip-existing: don't re-capture manifest-complete matches. When
     # nothing is new (off-season / no fixtures since yesterday) exit 0 before
     # even opening the scraper session — zero proxy bytes spent.
-    if match_ids and not force_replace:
+    if match_ids and not force_replace and capture_runtime is None:
         total = len(match_ids)
         try:
             match_ids, skipped, legacy_seed_ids, manifest_missing = _filter_new_match_ids(
@@ -1041,22 +979,80 @@ def _run_match_capture(
                 elif limit:
                     match_ids = match_ids[: int(limit)]
 
-            frames = scraper.read_match_capture(
-                league=league, season=int(season),
-                match_ids=match_ids, limit=limit,
-            )
+            if offline_replay:
+                from scrapers.sofascore.pipeline import replay_event_specs
+
+                replay_specs = [
+                    endpoint_specs[(str(match_id), endpoint)]
+                    for match_id in match_ids
+                    for endpoint in endpoint_plan[str(match_id)]
+                ]
+                pipeline_results = replay_event_specs(
+                    capture_runtime, replay_specs
+                )
+                frames = _materialize_endpoint_results(
+                    scraper,
+                    pipeline_results,
+                    league=league,
+                    season=season_short,
+                )
+            else:
+                frames = scraper.read_match_capture(
+                    league=league, season=int(season),
+                    match_ids=match_ids, limit=limit,
+                    endpoint_names_by_match=endpoint_plan,
+                )
+                if capture_runtime is not None:
+                    from scrapers.sofascore.pipeline import (
+                        ingest_prefetched_records,
+                    )
+
+                    pipeline_results = ingest_prefetched_records(
+                        capture_runtime,
+                        specs=endpoint_specs,
+                        records=frames.get('raw_records') or {},
+                    )
+                    expected = {
+                        (str(match_id), endpoint)
+                        for match_id in match_ids
+                        for endpoint in endpoint_plan[str(match_id)]
+                    }
+                    observed = {
+                        (result.manifest.key.target_id,
+                         result.manifest.key.endpoint)
+                        for result in pipeline_results
+                    }
+                    if expected - observed:
+                        raise RuntimeError(
+                            'raw-first capture lost endpoint records: '
+                            + repr(sorted(expected - observed))
+                        )
+                    frames = _materialize_endpoint_results(
+                        scraper,
+                        pipeline_results,
+                        league=league,
+                        season=season_short,
+                    )
             results['traffic'] = scraper.get_traffic_stats()  # #789 + #879 camoufox
             ratings_df = frames.get('player_ratings')
+            lineup_df = frames.get('lineups')
             eps_df = frames.get('event_player_stats')
             stats_df = frames.get('match_stats')
             shot_df = frames.get('event_shotmap')
             venue_df = frames.get('venue')
+            event_df = frames.get('events')
+            participant_df = frames.get('event_participants')
+            incident_df = frames.get('incidents')
             status_df = frames.get('capture_status')
             ratings_empty = ratings_df is None or ratings_df.empty
+            lineup_empty = lineup_df is None or lineup_df.empty
             eps_empty = eps_df is None or eps_df.empty
             stats_empty = stats_df is None or stats_df.empty
             shot_empty = shot_df is None or shot_df.empty
             venue_empty = venue_df is None or venue_df.empty
+            event_empty = event_df is None or event_df.empty
+            participant_empty = participant_df is None or participant_df.empty
+            incident_empty = incident_df is None or incident_df.empty
             if status_df is None or status_df.empty:
                 # Backward-compatible seam for older/custom scraper builds. The
                 # in-repo scraper always returns explicit endpoint states.
@@ -1099,31 +1095,18 @@ def _run_match_capture(
                     len(status_df),
                 )
 
-            min_ratio = None if force_replace else _MIN_REPLACE_RATIO
-
-            def _merged(df, table, key):
-                """#842: the captured frame holds only NEW matches (skip-
-                existing above) — union it with the existing partition so the
-                replace_partitions save keeps prior matches and the guard
-                passes. --force-replace = write the captured frame as-is."""
-                if force_replace:
-                    return df
-                return _merge_match_partition(
-                    _read_existing_partition(table, league, season_short),
-                    df, key,
-                )
-
-            # match_stats — same merged full-state refresh from the SAME
-            # capture pass (#751 PR2; #842 merges instead of re-capturing).
+            # Every captured frame is a delta over immutable finished matches.
+            # Iceberg MERGE updates/inserts only its natural keys: no pandas
+            # full-partition read, no partition rewrite, and no shrink window.
             if not stats_empty:
-                stats_df = _merged(
-                    stats_df, 'sofascore_match_stats', 'match_id')
                 spath = scraper.save_to_iceberg(
                     df=stats_df,
                     table_name='sofascore_match_stats',
                     partition_cols=['league', 'season'],
-                    replace_partitions=['league', 'season'],
-                    min_replace_ratio=min_ratio,
+                    natural_keys=[
+                        'league', 'season', 'match_id', 'period',
+                        'stat_group', 'statistic_key',
+                    ],
                 )
                 results['tables'].append(spath)
                 results['match_stats_rows'] = int(len(stats_df))
@@ -1134,14 +1117,11 @@ def _run_match_capture(
             # event_shotmap — best-effort optional payload, saved before the
             # lineup-derived completion markers below.
             if not shot_empty:
-                shot_df = _merged(
-                    shot_df, 'sofascore_event_shotmap', 'match_id')
                 shpath = scraper.save_to_iceberg(
                     df=shot_df,
                     table_name='sofascore_event_shotmap',
                     partition_cols=['league', 'season'],
-                    replace_partitions=['league', 'season'],
-                    min_replace_ratio=min_ratio,
+                    natural_keys=['league', 'season', 'match_id', 'shot_id'],
                 )
                 results['tables'].append(shpath)
                 results['shotmap_rows'] = int(len(shot_df))
@@ -1153,13 +1133,11 @@ def _run_match_capture(
             # full-state refresh like the others. Best-effort: empty when the
             # event payload carried no venue.
             if not venue_empty:
-                venue_df = _merged(venue_df, 'sofascore_venue', 'game_id')
                 vpath = scraper.save_to_iceberg(
                     df=venue_df,
                     table_name='sofascore_venue',
                     partition_cols=['league', 'season'],
-                    replace_partitions=['league', 'season'],
-                    min_replace_ratio=min_ratio,
+                    natural_keys=['league', 'season', 'game_id'],
                 )
                 results['tables'].append(vpath)
                 results['venue_rows'] = int(len(venue_df))
@@ -1167,17 +1145,70 @@ def _run_match_capture(
                 logger.info("Saved %d venue rows -> %s",
                             results['venue_rows'], vpath)
 
+            if not event_empty:
+                evpath = scraper.save_to_iceberg(
+                    df=event_df,
+                    table_name='sofascore_events',
+                    partition_cols=['league', 'season'],
+                    natural_keys=['league', 'season', 'match_id'],
+                )
+                results['tables'].append(evpath)
+                results['event_rows'] = int(len(event_df))
+
+            if not participant_empty:
+                eppath = scraper.save_to_iceberg(
+                    df=participant_df,
+                    table_name='sofascore_event_participants',
+                    partition_cols=['league', 'season'],
+                    natural_keys=[
+                        'league', 'season', 'match_id', 'team_id',
+                    ],
+                )
+                results['tables'].append(eppath)
+                results['participant_rows'] = int(len(participant_df))
+
+            if not incident_empty:
+                ipath = scraper.save_to_iceberg(
+                    df=incident_df,
+                    table_name='sofascore_incidents',
+                    partition_cols=['league', 'season'],
+                    natural_keys=[
+                        'league', 'season', 'match_id', 'incident_id',
+                    ],
+                )
+                results['tables'].append(ipath)
+                results['incident_rows'] = int(len(incident_df))
+                results['incident_matches'] = int(
+                    incident_df['match_id'].nunique()
+                )
+
             # Save the two lineup-derived data tables after optional payloads;
             # the explicit status manifest below is the only completion marker.
+            if not lineup_empty:
+                lpath = scraper.save_to_iceberg(
+                    df=lineup_df,
+                    table_name='sofascore_lineups',
+                    partition_cols=['league', 'season'],
+                    natural_keys=[
+                        'league', 'season', 'match_id', 'player_id',
+                    ],
+                )
+                results['tables'].append(lpath)
+                results['lineup_rows'] = int(len(lineup_df))
+                results['lineup_matches'] = int(lineup_df['match_id'].nunique())
+                if 'is_unused_substitute' in lineup_df.columns:
+                    results['unused_substitutes'] = int(
+                        lineup_df['is_unused_substitute'].fillna(False).astype(bool).sum()
+                    )
+
             if not eps_empty:
-                eps_df = _merged(
-                    eps_df, 'sofascore_event_player_stats', 'match_id')
                 epath = scraper.save_to_iceberg(
                     df=eps_df,
                     table_name='sofascore_event_player_stats',
                     partition_cols=['league', 'season'],
-                    replace_partitions=['league', 'season'],
-                    min_replace_ratio=min_ratio,
+                    natural_keys=[
+                        'league', 'season', 'match_id', 'player_id',
+                    ],
                 )
                 results['tables'].append(epath)
                 results['eps_rows'] = int(len(eps_df))
@@ -1186,14 +1217,13 @@ def _run_match_capture(
 
             # Ratings remains the primary data table, but is not used as status.
             if not ratings_empty:
-                ratings_df = _merged(
-                    ratings_df, 'sofascore_player_ratings', 'match_id')
                 rpath = scraper.save_to_iceberg(
                     df=ratings_df,
                     table_name='sofascore_player_ratings',
                     partition_cols=['league', 'season'],
-                    replace_partitions=['league', 'season'],
-                    min_replace_ratio=min_ratio,
+                    natural_keys=[
+                        'league', 'season', 'match_id', 'player_id',
+                    ],
                 )
                 results['tables'].append(rpath)
                 results['rows'] = int(len(ratings_df))
@@ -1204,18 +1234,12 @@ def _run_match_capture(
             # Endpoint-status manifest is the final commit. Complete terminal
             # answers (including optional 404/empty JSON) are skipped forever;
             # transient misses and interrupted saves remain eligible for retry.
-            if not status_empty:
-                status_df = _merged(
-                    status_df,
-                    _MATCH_CAPTURE_STATUS_TABLE,
-                    'match_id',
-                )
+            if not status_empty and not pipeline_results:
                 cpath = scraper.save_to_iceberg(
                     df=status_df,
                     table_name=_MATCH_CAPTURE_STATUS_TABLE,
                     partition_cols=['league', 'season'],
-                    replace_partitions=['league', 'season'],
-                    min_replace_ratio=min_ratio,
+                    natural_keys=['league', 'season', 'match_id'],
                 )
                 results['tables'].append(cpath)
                 results['capture_status_rows'] = int(len(status_df))
@@ -1225,6 +1249,85 @@ def _run_match_capture(
                         'match_id',
                     ].nunique()
                 )
+
+            if pipeline_results:
+                from dags.utils.sofascore_dq import (
+                    CaptureExpectation,
+                    validate_manifest_completeness,
+                )
+                from scrapers.sofascore.pipeline import (
+                    finalize_materialized_results,
+                )
+
+                finalize_materialized_results(
+                    capture_runtime, pipeline_results
+                )
+                observations = []
+                expectations = []
+                for result in pipeline_results:
+                    key = result.manifest.key
+                    committed = capture_runtime.manifest_store.get(key)
+                    if committed is None:
+                        raise RuntimeError(
+                            f'manifest commit missing for {key.stable_id()}'
+                        )
+                    observations.append({
+                        **committed.key.__dict__,
+                        'state': committed.status.value,
+                        'updated_at': committed.updated_at,
+                        'attempt': committed.attempts,
+                    })
+                    expectations.append(CaptureExpectation(
+                        endpoint=key.endpoint,
+                        target_type=key.target_type,
+                        target_id=key.target_id,
+                        source_tournament_id=key.source_tournament_id,
+                        source_season_id=key.source_season_id,
+                        freshness_key=key.freshness_key,
+                    ))
+                from scrapers.sofascore.adapters import (
+                    project_legacy_match_status,
+                )
+
+                compatibility_rows = project_legacy_match_status(
+                    _complete_manifest_records_for_projection(
+                        capture_runtime.manifest_store,
+                        endpoint_specs,
+                        pipeline_results,
+                    ),
+                    league=league,
+                    season=season_short,
+                    endpoints=(
+                        'event', 'lineups', 'statistics',
+                        'shotmap', 'incidents',
+                    ),
+                )
+                if compatibility_rows:
+                    import pandas as pd
+
+                    compatibility = scraper._add_metadata(
+                        pd.DataFrame(compatibility_rows),
+                        'match_capture_status',
+                    )
+                    cpath = scraper.save_to_iceberg(
+                        df=compatibility,
+                        table_name=_MATCH_CAPTURE_STATUS_TABLE,
+                        partition_cols=['league', 'season'],
+                        natural_keys=['league', 'season', 'match_id'],
+                    )
+                    results['tables'].append(cpath)
+                    results['capture_status_rows'] = len(compatibility)
+                    results['matches_complete'] = int(
+                        compatibility.loc[
+                            compatibility['capture_complete'].astype(bool),
+                            'match_id',
+                        ].nunique()
+                    )
+                validate_manifest_completeness(
+                    expectations, observations
+                ).require()
+                results['endpoint_completeness'] = 1.0
+                results['replay_cache'] = capture_runtime.engine.metrics.snapshot()
 
     except ReplaceGuardError as e:
         if scraper is not None:
@@ -1254,14 +1357,15 @@ def _run_player_capture(
     limit: Optional[int],
     output_path: str,
     force_replace: bool = False,
+    capture_runtime=None,
+    offline_replay: bool = False,
 ) -> int:
     """#751 PR3 + PR3b — per-player capture entrypoint (profile + season stats).
 
     One navigation warms each bounded browser session. It writes
     ``sofascore_player_profile`` plus the exact target competition/season stats;
     later players use same-origin JSON fetches instead of another SPA load. Both
-    outputs are full-state (``replace_partitions=['league', 'season']`` plus the
-    completeness guard).
+    outputs are natural-keyed deltas written through Iceberg MERGE.
 
     Season stats are secondary and may be a strict subset of profiles when the
     target competition exposes no aggregate. An empty stats frame is skipped
@@ -1276,20 +1380,6 @@ def _run_player_capture(
 
     league = leagues[0]
     season_short = _season_label(league, season)
-
-    logger.info(
-        "player_capture: league=%s season=%s (short=%s) limit=%s",
-        league, season, season_short, limit,
-    )
-
-    proxy_file = os.environ.get('PROXY_FILE', '/opt/airflow/proxys.txt')
-    if not os.path.exists(proxy_file):
-        logger.warning(
-            "Proxy file %s not found — SofaScore is likely to 403 without "
-            "residential proxy.", proxy_file,
-        )
-        proxy_file = None
-
     results = {
         'entity': ENTITY_PLAYER_CAPTURE,
         'tables': [],
@@ -1301,6 +1391,242 @@ def _run_player_capture(
         'fallback_reason': None,
         'errors': [],
     }
+
+    # The canonical player path can fully replay/no-op before any browser is
+    # considered. Profiles and aggregates are mutable during a season, so the
+    # scheduled weekly task receives a stable ISO-week freshness key: Airflow
+    # retries and same-week reruns are exact zero-traffic resume hits, while a
+    # new weekly snapshot remains eligible for refresh.
+    if capture_runtime is not None:
+        scraper = None
+        try:
+            from dags.utils.sofascore_dq import (
+                validate_minimum_coverage,
+                validate_season_alignment,
+            )
+            from scrapers.sofascore.pipeline import (
+                PLAYER_PATHS,
+                build_player_spec,
+                endpoint_resume_plan,
+                finalize_materialized_results,
+                materialize_player_datasets,
+                replay_player_specs,
+            )
+            from scrapers.sofascore.season_pipeline import (
+                plan_season_partition,
+                squad_player_ids,
+            )
+
+            source_tournament_id, source_season_id = _source_context(
+                league, season, season_short
+            )
+            season_plan = plan_season_partition(
+                capture_runtime.raw_store,
+                capture_runtime.manifest_store,
+                source_tournament_id=source_tournament_id,
+                source_season_id=source_season_id,
+                freshness_key=_season_freshness_key(
+                    capture_runtime,
+                    force_replace=False,
+                    offline_replay=offline_replay,
+                ),
+                event_freshness_key='final',
+                paid_proxy=True,
+                max_pages=_season_max_pages(),
+            )
+            if not season_plan.complete:
+                raise RuntimeError(
+                    'season/squad manifest is incomplete; refusing a partial '
+                    'player universe'
+                )
+            registered_ids = set(
+                squad_player_ids(capture_runtime.raw_store, season_plan)
+            )
+            with SofaScoreScraper(
+                leagues=[league], seasons=[season], proxy_file=None,
+            ) as scraper:
+                observed_ids = {
+                    str(value)
+                    for value in scraper._resolve_player_ids_from_bronze(
+                        league, season_short, limit=None
+                    )
+                }
+                player_ids = sorted(
+                    registered_ids | observed_ids,
+                    key=int,
+                )
+                if limit:
+                    player_ids = player_ids[: int(limit)]
+                if not player_ids:
+                    raise RuntimeError(
+                        'player universe is empty; refusing source/browser '
+                        'fallback outside the common manifest'
+                    )
+
+                freshness_key = (
+                    os.environ.get('SOFASCORE_PLAYER_FRESHNESS_KEY', '').strip()
+                    or 'week-'
+                    + datetime.now(timezone.utc).strftime('%G-W%V')
+                )
+                if force_replace and not offline_replay:
+                    freshness_key = f'repair-{capture_runtime.engine.run_id}'
+                specs = [
+                    build_player_spec(
+                        source_tournament_id=source_tournament_id,
+                        source_season_id=source_season_id,
+                        target_id=player_id,
+                        endpoint=endpoint,
+                        freshness_key=freshness_key,
+                        paid_proxy=True,
+                    )
+                    for player_id in player_ids
+                    for endpoint in PLAYER_PATHS
+                ]
+                pending = endpoint_resume_plan(
+                    capture_runtime.manifest_store, specs
+                )
+                results['players_total'] = len(player_ids)
+                results['registered_players'] = len(registered_ids)
+                results['players_skipped_existing'] = sum(
+                    1 for player_id in player_ids if str(player_id) not in pending
+                )
+                if not offline_replay and not force_replace and not pending:
+                    results['traffic'] = {
+                        'paid_proxy_bytes': 0,
+                        'paid_proxy_mb': 0.0,
+                        'browser_sessions': 0,
+                        'browser_navigations': 0,
+                        'request_count': 0,
+                        'cache_hit_rate': 1.0,
+                        'endpoint_completeness': 1.0,
+                    }
+                    _write_results(output_path, results)
+                    return 0
+                if not offline_replay:
+                    raise RuntimeError(
+                        'production paid player capture disabled: '
+                        + _paid_capture_blocker(capture_runtime)
+                    )
+
+                replayed = replay_player_specs(capture_runtime, specs)
+                frames = materialize_player_datasets(
+                    scraper,
+                    replayed,
+                    league=league,
+                    season=season_short,
+                )
+                profile_df = frames['player_profile']
+                season_df = frames['player_season_stats']
+                profile_ids = (
+                    set(profile_df['player_id'].astype(str))
+                    if not profile_df.empty else set()
+                )
+                validate_minimum_coverage(
+                    'player_profile',
+                    profile_ids,
+                    {str(player_id) for player_id in player_ids},
+                    threshold=0.95,
+                ).require()
+                for frame in (profile_df, season_df):
+                    if not frame.empty:
+                        validate_season_alignment(
+                            frame.to_dict('records'),
+                            expected_source_season_id=source_season_id,
+                            expected_canonical_season=season_short,
+                        ).require()
+
+                import pandas as pd
+
+                universe_df = scraper._add_metadata(
+                    pd.DataFrame(
+                        [
+                            {
+                                'player_id': player_id,
+                                'in_registered_squad': player_id in registered_ids,
+                                'observed_in_match': player_id in observed_ids,
+                                'source_tournament_id': str(source_tournament_id),
+                                'source_season_id': str(source_season_id),
+                                'league': league,
+                                'season': season_short,
+                            }
+                            for player_id in player_ids
+                        ]
+                    ),
+                    'player_universe',
+                )
+                validate_season_alignment(
+                    universe_df.to_dict('records'),
+                    expected_source_season_id=source_season_id,
+                    expected_canonical_season=season_short,
+                ).require()
+                upath = scraper.save_to_iceberg(
+                    df=universe_df,
+                    table_name='sofascore_player_universe',
+                    partition_cols=['league', 'season'],
+                    natural_keys=['league', 'season', 'player_id'],
+                )
+                results['tables'].append(upath)
+                results['universe_players'] = len(universe_df)
+
+                ppath = scraper.save_to_iceberg(
+                    df=profile_df,
+                    table_name='sofascore_player_profile',
+                    partition_cols=['league', 'season'],
+                    natural_keys=['league', 'season', 'player_id'],
+                )
+                results['tables'].append(ppath)
+                results['rows'] = len(profile_df)
+                results['profile_players'] = profile_df['player_id'].nunique()
+                if not season_df.empty:
+                    spath = scraper.save_to_iceberg(
+                        df=season_df,
+                        table_name='sofascore_player_season_stats',
+                        partition_cols=['league', 'season'],
+                        natural_keys=[
+                            'league', 'season', 'player_id',
+                            'unique_tournament_id', 'sofascore_season_id',
+                        ],
+                    )
+                    results['tables'].append(spath)
+                    results['season_stats_rows'] = len(season_df)
+                    results['season_stats_players'] = season_df[
+                        'player_id'
+                    ].nunique()
+
+                finalize_materialized_results(capture_runtime, replayed)
+                results['traffic'] = capture_runtime.engine.metrics.snapshot()
+                results['endpoint_completeness'] = results['traffic'][
+                    'endpoint_completeness'
+                ]
+                _write_results(output_path, results)
+                return 0
+        except Exception as exc:
+            results['errors'].append(f'capture_engine: {exc}')
+            results['traffic'] = (
+                capture_runtime.engine.metrics.snapshot()
+                if capture_runtime is not None
+                else {
+                    'paid_proxy_bytes': 0,
+                    'browser_sessions': 0,
+                    'browser_navigations': 0,
+                    'request_count': 0,
+                }
+            )
+            _write_results(output_path, results)
+            return 1
+
+    logger.info(
+        "player_capture legacy test seam: league=%s season=%s (short=%s) limit=%s",
+        league, season, season_short, limit,
+    )
+
+    proxy_file = os.environ.get('PROXY_FILE', '/opt/airflow/proxys.txt')
+    if not os.path.exists(proxy_file):
+        logger.warning(
+            "Proxy file %s not found — SofaScore is likely to 403 without "
+            "residential proxy.", proxy_file,
+        )
+        proxy_file = None
 
     try:
         with SofaScoreScraper(
@@ -1336,15 +1662,13 @@ def _run_player_capture(
                 _write_results(output_path, results)
                 return _fallback_exit_code(results['fallback_reason'])
 
-            min_ratio = None if force_replace else _MIN_REPLACE_RATIO
-
-            # player_profile — full-state refresh (+ completeness guard).
+            # Profile/stat rows are natural-keyed deltas. MERGE avoids a full
+            # season rewrite and cannot shrink a previously complete universe.
             ppath = scraper.save_to_iceberg(
                 df=profile_df,
                 table_name='sofascore_player_profile',
                 partition_cols=['league', 'season'],
-                replace_partitions=['league', 'season'],
-                min_replace_ratio=min_ratio,
+                natural_keys=['league', 'season', 'player_id'],
             )
             results['tables'].append(ppath)
             results['rows'] = int(len(profile_df))
@@ -1362,8 +1686,10 @@ def _run_player_capture(
                     df=season_df,
                     table_name='sofascore_player_season_stats',
                     partition_cols=['league', 'season'],
-                    replace_partitions=['league', 'season'],
-                    min_replace_ratio=min_ratio,
+                    natural_keys=[
+                        'league', 'season', 'player_id',
+                        'unique_tournament_id', 'sofascore_season_id',
+                    ],
                 )
                 results['tables'].append(spath)
                 results['season_stats_rows'] = int(len(season_df))
@@ -1390,255 +1716,6 @@ def _run_player_capture(
 
     _write_results(output_path, results)
     return 0
-
-
-def _run_event_endpoint(
-    *,
-    entity: str,
-    table_name: str,
-    scraper_method: str,
-    pk_col: str,
-    leagues: List[str],
-    season: int,
-    limit: Optional[int],
-    output_path: str,
-    extra_kwargs: Optional[dict] = None,
-) -> int:
-    """Generic event-grain runner: shotmap, event_player_stats, match_stats.
-
-    Flow:
-
-    1. Resolve finished match_ids from ``bronze.sofascore_schedule``.
-    2. Skip match_ids already in ``bronze.<table_name>`` (issue #69).
-    3. Loop over remaining matches, call ``scraper.<scraper_method>(...)``.
-    4. Write to ``iceberg.bronze.<table_name>`` in APPEND mode
-       (delta-only; replace_partitions is unsafe here).
-    5. Return exit code 2 on empty payload (R0.2B_FALLBACK semantics).
-
-    ``extra_kwargs`` is forwarded to the scraper method (e.g.
-    ``player_ids`` for event_player_stats).
-    """
-    from scrapers.sofascore import SofaScoreScraper
-    from scrapers.sofascore.scraper import R0_2B_FALLBACK_MARKER, _season_label
-
-    league = leagues[0]
-    season_short = _season_label(league, season)
-    season_alias = _compatible_legacy_season_alias(
-        league,
-        season,
-        season_short,
-    )
-
-    logger.info(
-        "%s: league=%s season=%s (short=%s) limit=%s",
-        entity, league, season, season_short, limit,
-    )
-
-    match_ids = _resolve_match_ids_from_bronze(league, season_short, limit)
-    if not match_ids and season_alias:
-        match_ids = _resolve_match_ids_from_bronze(league, season_alias, limit)
-
-    results = {
-        'entity': entity,
-        'tables': [],
-        'rows': 0,
-        'matches_attempted': len(match_ids),
-        'matches_with_rows': 0,
-        'fallback': False,
-        'fallback_reason': None,
-        'errors': [],
-    }
-
-    if not match_ids:
-        logger.error(
-            "%s: no match_ids in bronze.sofascore_schedule for "
-            "league=%s season=%s — run schedule scrape first.",
-            R0_2B_FALLBACK_MARKER, league, season_short,
-        )
-        results['fallback'] = True
-        results['fallback_reason'] = 'no_match_ids_in_bronze'
-        results['errors'].append(f'{R0_2B_FALLBACK_MARKER}: no_match_ids')
-        _write_results(output_path, results)
-        return 2
-
-    # Skip-existing (#69): match_ids already in this endpoint's bronze
-    # are immutable past-result data — refetching wastes the proxy budget.
-    # First run (table absent) returns empty set → fetch all.
-    existing = _existing_match_ids_in_bronze(table_name, league, season_short)
-    if not existing and season_alias:
-        existing = _existing_match_ids_in_bronze(
-            table_name,
-            league,
-            season_alias,
-        )
-    matches_total = len(match_ids)
-    new_match_ids = [m for m in match_ids if str(m) not in existing]
-    skipped = matches_total - len(new_match_ids)
-    logger.info(
-        "%s skip-existing: %d/%d matches already in bronze.%s; fetching %d new.",
-        entity, skipped, matches_total, table_name, len(new_match_ids),
-    )
-    results['matches_skipped_existing'] = skipped
-    results['matches_attempted'] = len(new_match_ids)
-
-    if not new_match_ids:
-        logger.info(
-            "%s: no new match_ids to fetch (bronze.%s already covers all "
-            "schedule matches for league=%s season=%s).",
-            entity, table_name, league, season_short,
-        )
-        results['skipped_existing'] = True
-        _write_results(output_path, results)
-        return 0
-
-    match_ids = new_match_ids
-
-    proxy_file = os.environ.get('PROXY_FILE', '/opt/airflow/proxys.txt')
-    if not os.path.exists(proxy_file):
-        logger.warning(
-            "Proxy file %s not found — SofaScore is likely to 403 "
-            "without residential proxy.", proxy_file,
-        )
-        proxy_file = None
-
-    try:
-        with SofaScoreScraper(
-            leagues=[league],
-            seasons=[season],
-            proxy_file=proxy_file,
-        ) as scraper:
-            method = getattr(scraper, scraper_method)
-            kwargs = {
-                'league': league,
-                'season': int(season),
-                'match_ids': match_ids,
-                'limit': limit,
-            }
-            kwargs.update(extra_kwargs or {})
-            df = method(**kwargs)
-            results['traffic'] = scraper.get_traffic_stats()  # #789
-
-            if df is None or df.empty:
-                last_err = getattr(scraper, '_last_endpoint_error', None)
-                reason = 'empty_payload'
-                if last_err:
-                    status = last_err.get('status')
-                    if status == 403:
-                        reason = 'http_403'
-                    elif status == 429:
-                        reason = 'http_429'
-                    elif status is None:
-                        reason = 'transport_error'
-                    else:
-                        reason = f'http_{status}'
-
-                logger.error(
-                    "%s: %s unavailable — reason=%s detail=%s",
-                    R0_2B_FALLBACK_MARKER, entity, reason, last_err,
-                )
-                results['fallback'] = True
-                results['fallback_reason'] = reason
-                results['errors'].append(f'{R0_2B_FALLBACK_MARKER}: {reason}')
-                _write_results(output_path, results)
-                return _fallback_exit_code(results['fallback_reason'])
-
-            # Skip-existing guarantees the fetched DataFrame contains only
-            # NEW match_ids (no overlap with bronze) → safe APPEND
-            # without replace_partitions. Past matches in bronze are
-            # preserved across runs. Issue #69.
-            table_path = scraper.save_to_iceberg(
-                df=df,
-                table_name=table_name,
-                partition_cols=['league', 'season'],
-            )
-            results['tables'].append(table_path)
-            results['rows'] = int(len(df))
-            if pk_col in df.columns:
-                results['matches_with_rows'] = int(df[pk_col].nunique())
-            logger.info(
-                "Saved %d %s rows -> %s",
-                results['rows'], entity, table_path,
-            )
-
-    except Exception as e:
-        logger.error("%s scrape failed hard: %s", entity, e, exc_info=True)
-        results['errors'].append(str(e))
-        _write_results(output_path, results)
-        return 1
-
-    _write_results(output_path, results)
-    return 0
-
-
-def _run_shotmap(
-    leagues: List[str],
-    season: int,
-    limit: Optional[int],
-    output_path: str,
-) -> int:
-    """#22 — per-shot xG / coords / situation. Reads finished match_ids
-    from bronze.sofascore_schedule and writes to
-    ``iceberg.bronze.sofascore_event_shotmap``.
-    """
-    return _run_event_endpoint(
-        entity=ENTITY_SHOTMAP,
-        table_name='sofascore_event_shotmap',
-        scraper_method='read_shotmap',
-        pk_col='match_id',
-        leagues=leagues,
-        season=season,
-        limit=limit,
-        output_path=output_path,
-    )
-
-
-def _run_event_player_stats(
-    leagues: List[str],
-    season: int,
-    limit: Optional[int],
-    output_path: str,
-) -> int:
-    """#21 — per-(match, player) Opta-rich stats. Reads
-    ``(match_id, player_id)`` pairs from
-    ``bronze.sofascore_player_ratings`` and writes to
-    ``iceberg.bronze.sofascore_event_player_stats``.
-
-    Note: ``limit`` is interpreted as *match count*, not request count.
-    Each match averages ~25 played players; at 20 req/min that's
-    roughly 75 seconds per match.
-    """
-    return _run_event_endpoint(
-        entity=ENTITY_EVENT_PLAYER_STATS,
-        table_name='sofascore_event_player_stats',
-        scraper_method='read_event_player_stats',
-        pk_col='match_id',
-        leagues=leagues,
-        season=season,
-        limit=limit,
-        output_path=output_path,
-    )
-
-
-def _run_match_stats(
-    leagues: List[str],
-    season: int,
-    limit: Optional[int],
-    output_path: str,
-) -> int:
-    """#25 — team-level per-(match, period, stat) statistics.
-    One HTTP call per match; long-form rows so the Bronze table doesn't
-    need re-shaping when SofaScore introduces a new metric.
-    """
-    return _run_event_endpoint(
-        entity=ENTITY_MATCH_STATS,
-        table_name='sofascore_match_stats',
-        scraper_method='read_match_stats',
-        pk_col='match_id',
-        leagues=leagues,
-        season=season,
-        limit=limit,
-        output_path=output_path,
-    )
 
 
 def _write_results(path: str, payload: dict) -> None:
@@ -1676,12 +1753,186 @@ def _write_results(path: str, payload: dict) -> None:
             logger.warning("proxy-traffic log failed: %s", e)
 
 
+def _run_season_capture_engine(
+    leagues: List[str],
+    season: int,
+    output_path: str,
+    *,
+    force_replace: bool,
+    entity: str,
+    capture_runtime,
+    offline_replay: bool,
+) -> int:
+    """Materialize schedule/standings through the canonical raw manifest.
+
+    Planning is network-free and follows only locally committed page-chain,
+    participant, squad and event/referee evidence. An exact terminal plan is a
+    zero-byte no-op. Offline replay validates every retained payload, performs
+    the two incremental Bronze MERGEs, and only then finalizes deferred
+    normalized manifest records.
+    """
+    import pandas as pd
+
+    from scrapers.base.base_scraper import ReplaceGuardError
+    from scrapers.sofascore import SofaScoreScraper
+    from scrapers.sofascore.pipeline import finalize_materialized_results
+    from scrapers.sofascore.scraper import _season_label
+    from scrapers.sofascore.season_pipeline import (
+        materialize_season_partition,
+        plan_season_partition,
+        replay_season_specs,
+    )
+
+    league = leagues[0]
+    canonical_season = _season_label(league, season)
+    results = {
+        "entity": entity,
+        "tables": [],
+        "schedule_rows": 0,
+        "league_table_rows": 0,
+        "errors": [],
+    }
+    try:
+        source_tournament_id, source_season_id = _source_context(
+            league, season, canonical_season
+        )
+        freshness_key = _season_freshness_key(
+            capture_runtime,
+            force_replace=force_replace,
+            offline_replay=offline_replay,
+        )
+        plan = plan_season_partition(
+            capture_runtime.raw_store,
+            capture_runtime.manifest_store,
+            source_tournament_id=source_tournament_id,
+            source_season_id=source_season_id,
+            freshness_key=freshness_key,
+            event_freshness_key="final",
+            paid_proxy=True,
+            max_pages=_season_max_pages(),
+        )
+        results.update(
+            {
+                "source_tournament_id": source_tournament_id,
+                "source_season_id": source_season_id,
+                "freshness_key": freshness_key,
+                "planned_endpoints": len(plan.specs),
+                "pending_endpoints": len(plan.pending_keys),
+                "schedule_events": len(plan.schedule_event_ids),
+                "teams": len(plan.team_ids),
+                "referees": len(plan.referee_ids),
+            }
+        )
+        if plan.complete and not offline_replay and not force_replace:
+            results["endpoint_completeness"] = 1.0
+            results["traffic"] = {
+                "paid_proxy_bytes": 0,
+                "paid_proxy_mb": 0.0,
+                "browser_sessions": 0,
+                "browser_navigations": 0,
+                "request_count": 0,
+                "cache_hit_rate": 1.0,
+                "endpoint_completeness": 1.0,
+            }
+            _write_results(output_path, results)
+            return 0
+        if not offline_replay:
+            raise RuntimeError(
+                "production paid tournament capture disabled: "
+                + _paid_capture_blocker(capture_runtime)
+            )
+
+        replayed = replay_season_specs(
+            capture_runtime.engine,
+            plan.specs,
+        )
+        materialized = materialize_season_partition(
+            plan,
+            replayed,
+            canonical_league=league,
+            canonical_season=canonical_season,
+        )
+        if materialized.endpoint_completeness != 1.0:
+            raise RuntimeError(
+                "offline season replay did not cover every planned endpoint"
+            )
+
+        with SofaScoreScraper(
+            leagues=[league], seasons=[season], proxy_file=None
+        ) as scraper:
+            # The season endpoints are one atomic logical capture. Even a
+            # compatibility ``--entity schedule``/``league_table`` invocation
+            # publishes both normalized datasets before their shared manifest
+            # is finalized; otherwise one endpoint could be marked complete
+            # without its Bronze MERGE.
+            if materialized.schedule_rows:
+                schedule_df = scraper._add_metadata(
+                    pd.DataFrame(materialized.schedule_rows), "schedule"
+                )
+                path = scraper.save_to_iceberg(
+                    df=schedule_df,
+                    table_name="sofascore_schedule",
+                    partition_cols=["league", "season"],
+                    natural_keys=["league", "season", "game_id"],
+                )
+                results["tables"].append(path)
+                results["schedule_rows"] = len(schedule_df)
+            if materialized.standings_rows:
+                standings_df = scraper._add_metadata(
+                    pd.DataFrame(materialized.standings_rows), "league_table"
+                )
+                path = scraper.save_to_iceberg(
+                    df=standings_df,
+                    table_name="sofascore_league_table",
+                    partition_cols=["league", "season"],
+                    natural_keys=["league", "season", "group", "team"],
+                )
+                results["tables"].append(path)
+                results["league_table_rows"] = len(standings_df)
+
+        # This must be the last state mutation. If either MERGE above fails,
+        # normalized endpoints remain replayable and no network retry is needed.
+        finalize_materialized_results(capture_runtime, replayed)
+        committed = plan_season_partition(
+            capture_runtime.raw_store,
+            capture_runtime.manifest_store,
+            source_tournament_id=source_tournament_id,
+            source_season_id=source_season_id,
+            freshness_key=freshness_key,
+            event_freshness_key="final",
+            paid_proxy=True,
+            max_pages=_season_max_pages(),
+        )
+        if not committed.complete:
+            raise RuntimeError(
+                "season manifest stayed nonterminal after successful Bronze MERGEs"
+            )
+        results["pending_endpoints"] = 0
+        results["endpoint_completeness"] = 1.0
+        results["traffic"] = capture_runtime.engine.metrics.snapshot()
+        _write_results(output_path, results)
+        return 0
+    except ReplaceGuardError as exc:
+        results["errors"].append(f"{REPLACE_GUARD_MARKER}: {exc}")
+        results["traffic"] = capture_runtime.engine.metrics.snapshot()
+        _write_results(output_path, results)
+        return 3
+    except Exception as exc:
+        logger.error("season capture engine failed: %s", exc, exc_info=True)
+        results["errors"].append(f"capture_engine: {exc}")
+        results["traffic"] = capture_runtime.engine.metrics.snapshot()
+        _write_results(output_path, results)
+        return 1
+
+
 def _run_legacy(
     leagues: List[str],
     season: int,
     output_path: str,
     force_replace: bool = False,
     entity: str = "all",
+    capture_runtime=None,
+    offline_replay: bool = False,
 ) -> int:
     """Scrape schedule and/or league table.
 
@@ -1689,6 +1940,17 @@ def _run_legacy(
     explicit ``--entity schedule`` or ``league_table`` only calls that reader;
     the old dispatch silently fetched both regardless of the CLI selection.
     """
+    if capture_runtime is not None:
+        return _run_season_capture_engine(
+            leagues,
+            season,
+            output_path,
+            force_replace=force_replace,
+            entity=entity,
+            capture_runtime=capture_runtime,
+            offline_replay=offline_replay,
+        )
+
     want_schedule = entity in ("all", ENTITY_SCHEDULE)
     want_table = entity in ("all", ENTITY_LEAGUE_TABLE)
     results = {
@@ -1700,6 +1962,13 @@ def _run_legacy(
     }
     guard_refused = False
     source_failed = False
+
+    if offline_replay:
+        results['errors'].append(
+            'offline tournament replay requires the common capture runtime'
+        )
+        _write_results(output_path, results)
+        return 1
 
     try:
         from scrapers.base.base_scraper import ReplaceGuardError
@@ -1735,37 +2004,17 @@ def _run_legacy(
 
             if want_schedule:
                 try:
-                    import pandas as pd
-
                     if captured is not None and not captured.empty:
-                        # Merge the captured window with the existing partition so a
-                        # partial capture never shrinks it (#761). Per (league,
-                        # season): union by game_id, captured row wins (fresh
-                        # scores). union >= existing → the completeness guard passes.
-                        parts = []
-                        for (lg, sea), grp in captured.groupby(
-                            ["league", "season"],
-                            sort=False,
-                        ):
-                            existing = _read_existing_schedule(lg, str(sea))
-                            parts.append(_merge_schedule_partition(existing, grp))
-                        df = pd.concat(parts, ignore_index=True)
-
                         table_path = scraper.save_to_iceberg(
-                            df=df,
+                            df=captured,
                             table_name="sofascore_schedule",
                             partition_cols=["league", "season"],
-                            replace_partitions=["league", "season"],
-                            min_replace_ratio=(
-                                None if force_replace else _MIN_REPLACE_RATIO
-                            ),
+                            natural_keys=['league', 'season', 'game_id'],
                         )
                         results["tables"].append(table_path)
-                        results["schedule_rows"] = len(df)
+                        results["schedule_rows"] = len(captured)
                         logger.info(
-                            "Saved %d schedule rows (captured %d, merged with "
-                            "existing partition)",
-                            len(df),
+                            "Incrementally merged %d schedule rows",
                             len(captured),
                         )
                     else:
@@ -1792,10 +2041,7 @@ def _run_legacy(
                             df=df,
                             table_name="sofascore_league_table",
                             partition_cols=["league", "season"],
-                            replace_partitions=["league", "season"],
-                            min_replace_ratio=(
-                                None if force_replace else _MIN_REPLACE_RATIO
-                            ),
+                            natural_keys=['league', 'season', 'group', 'team'],
                         )
                         results["tables"].append(table_path)
                         results["league_table_rows"] = len(df)
@@ -1830,7 +2076,7 @@ def _run_legacy(
     return 1 if source_failed else 0
 
 
-def main():
+def main(argv=None):
     parser = _StrictArgumentParser(description='Run SofaScore scraper')
     parser.add_argument(
         '--entity',
@@ -1857,9 +2103,14 @@ def main():
     )
     parser.add_argument(
         '--season',
-        type=int,
-        default=2024,
-        help='Season year (e.g. 2024 for 24-25, 2526 for 25-26 short)',
+        type=str,
+        default='2024',
+        help='Canonical season or registry alias (2024, 2526, 2025/26, named)',
+    )
+    parser.add_argument(
+        '--allow-inactive-season',
+        action='store_true',
+        help='Backfill-only: resolve an explicit historical/named registry season.',
     )
     parser.add_argument(
         '--limit',
@@ -1874,48 +2125,107 @@ def main():
         help='Output file for results',
     )
     parser.add_argument(
+        '--offline-replay',
+        action='store_true',
+        help='Disable source access and rebuild only from committed raw JSON.',
+    )
+    parser.add_argument(
+        '--raw-store-uri',
+        default=None,
+        help='Override SOFASCORE_RAW_STORE_URI for capture/replay.',
+    )
+    parser.add_argument(
         '--force-replace',
         action='store_true',
-        help='Bypass the completeness guard — write even if the scraped frame '
-             'shrinks the existing partition. Use for a deliberate first '
-             'backfill or a known legitimate shrink.',
+        help='Re-capture source endpoints even when their manifest state is '
+             'terminal; writes remain incremental natural-key merges.',
     )
     try:
-        args = parser.parse_args()
+        args = parser.parse_args(argv)
     except _ArgparseError as exc:
         logger.error("Invalid CLI arguments: %s — failing hard (not a fallback)", exc)
         return 1
+
+    season_token = args.season.strip()
+    if season_token.isdigit() and 1900 <= int(season_token) <= 2098:
+        # Preserve the established CLI meaning: 2021 is the 2021/22 start
+        # year for split-year leagues, while registry aliases such as 2526
+        # and named seasons remain exact strings.
+        args.season = int(season_token)
+    else:
+        args.season = season_token
 
     if args.league:
         leagues = [args.league]
     else:
         leagues = [league.strip() for league in args.leagues.split(",")]
 
+    # Fail before Trino/source/proxy access for every CLI alias.  The registry
+    # can discover any football competition, but capture is restricted to an
+    # enabled, evidenced, operator-approved adult men's tournament.
+    try:
+        from scrapers.sofascore.catalog import SofaScoreCatalog
+
+        catalog = SofaScoreCatalog.load()
+        denied = []
+        for league in leagues:
+            tournament = catalog.competition(league)
+            if not tournament.capture_allowed:
+                denied.append(
+                    f"{league}: enabled={tournament.enabled}; "
+                    + '; '.join(tournament.activation_eligibility.reasons)
+                )
+        if denied:
+            raise ValueError(' | '.join(denied))
+    except Exception as exc:
+        logger.error("SofaScore activation guard denied capture: %s", exc)
+        _write_results(
+            args.output,
+            {
+                'entity': args.entity,
+                'tables': [],
+                'errors': [f'activation_guard: {exc}'],
+                'traffic': {
+                    'paid_proxy_bytes': 0,
+                    'browser_sessions': 0,
+                    'browser_navigations': 0,
+                    'requests': 0,
+                },
+            },
+        )
+        return 1
+
+    if len(leagues) != 1:
+        error = (
+            'capture requires exactly one registry competition per logical '
+            f'task; received {leagues!r}'
+        )
+        logger.error(error)
+        _write_results(
+            args.output,
+            {
+                'entity': args.entity,
+                'tables': [],
+                'errors': [f'competition_scope: {error}'],
+                'traffic': {
+                    'paid_proxy_bytes': 0,
+                    'browser_sessions': 0,
+                    'browser_navigations': 0,
+                    'requests': 0,
+                },
+            },
+        )
+        return 1
+
     # #920 bridge (generalized Phase 3: any single_year tournament):
     # tournaments must never inherit the club-formula season (July 2026 ->
     # 2025) — the sid resolve would no-op every daily run while the
-    # tournament is live. Mixed calls can't carry two seasons ->
-    # tournaments are dropped (dedicated call), as in the other runners.
+    # tournament is live. Every DAG task is already single-competition.
     from utils.medallion_config import (
         get_active_season, is_single_year_competition,
     )
-    _tournaments = [
-        league for league in leagues if is_single_year_competition(league)
-    ]
-    if _tournaments and len(leagues) > 1:
-        logger.warning(
-            "Single-year tournaments %s dropped from mixed call (each needs "
-            "its own season; leagues=%s). Scrape them with dedicated "
-            "--league calls.", _tournaments, leagues)
-        leagues = [league for league in leagues if league not in _tournaments]
-        if not leagues:
-            logger.warning(
-                "No leagues left after dropping tournaments; exiting 0.")
-            _write_results(args.output, {'entity': args.entity, 'tables': [],
-                                         'errors': [],
-                                         'skipped': 'mixed_tournaments_dropped'})
-            return 0
-    elif _tournaments:
+    _is_tournament = is_single_year_competition(leagues[0])
+    if _is_tournament and not args.allow_inactive_season:
         _t_league = leagues[0]
         _t_season = get_active_season(_t_league)
         if _t_season is None:
@@ -1926,7 +2236,9 @@ def main():
                                          'errors': [],
                                          'skipped': 'out_of_window'})
             return 0
-        elif int(args.season) != int(_t_season):
+        elif str(args.season).strip().isdigit() and int(args.season) != int(
+            _t_season
+        ):
             logger.info(
                 "%s: overriding --season %s -> %s (active "
                 "single_year season, #920 bridge).",
@@ -1946,13 +2258,60 @@ def main():
         entity, leagues, args.season, args.limit,
     )
 
-    if entity == ENTITY_MATCH_CAPTURE:
+    capture_runtime = None
+    try:
+        from scrapers.sofascore.pipeline import build_capture_runtime
+
+        capture_runtime = build_capture_runtime(
+            run_id=(
+                os.environ.get('AIRFLOW_CTX_DAG_RUN_ID')
+                or os.environ.get('SOFASCORE_RUN_ID')
+                or f'manual-{os.getpid()}'
+            ),
+            task_id=(
+                os.environ.get('AIRFLOW_CTX_TASK_ID')
+                or f'cli-{entity}'
+            ),
+            raw_store_uri=args.raw_store_uri,
+        )
+    except Exception as exc:
+        logger.error('SofaScore capture runtime failed closed: %s', exc)
+        _write_results(
+            args.output,
+            {
+                'entity': entity,
+                'tables': [],
+                'errors': [f'capture_runtime: {exc}'],
+                'traffic': {
+                    'paid_proxy_bytes': 0,
+                    'browser_sessions': 0,
+                    'browser_navigations': 0,
+                    'requests': 0,
+                },
+            },
+        )
+        return 1
+
+    if entity in {
+        ENTITY_MATCH_CAPTURE,
+        ENTITY_PLAYER_RATINGS,
+        ENTITY_SHOTMAP,
+        ENTITY_EVENT_PLAYER_STATS,
+        ENTITY_MATCH_STATS,
+    }:
+        if entity != ENTITY_MATCH_CAPTURE:
+            logger.info(
+                "Legacy entity %s is an alias of the unified match_capture engine",
+                entity,
+            )
         return _run_match_capture(
             leagues=leagues,
             season=args.season,
             limit=args.limit,
             output_path=args.output,
             force_replace=args.force_replace,
+            capture_runtime=capture_runtime,
+            offline_replay=args.offline_replay,
         )
 
     if entity == ENTITY_PLAYER_CAPTURE:
@@ -1962,39 +2321,8 @@ def main():
             limit=args.limit,
             output_path=args.output,
             force_replace=args.force_replace,
-        )
-
-    if entity == ENTITY_PLAYER_RATINGS:
-        return _run_player_ratings(
-            leagues=leagues,
-            season=args.season,
-            limit=args.limit,
-            output_path=args.output,
-            force_replace=args.force_replace,
-        )
-
-    if entity == ENTITY_SHOTMAP:
-        return _run_shotmap(
-            leagues=leagues,
-            season=args.season,
-            limit=args.limit,
-            output_path=args.output,
-        )
-
-    if entity == ENTITY_EVENT_PLAYER_STATS:
-        return _run_event_player_stats(
-            leagues=leagues,
-            season=args.season,
-            limit=args.limit,
-            output_path=args.output,
-        )
-
-    if entity == ENTITY_MATCH_STATS:
-        return _run_match_stats(
-            leagues=leagues,
-            season=args.season,
-            limit=args.limit,
-            output_path=args.output,
+            capture_runtime=capture_runtime,
+            offline_replay=args.offline_replay,
         )
 
     # Default: legacy schedule+league_table flow.
@@ -2004,6 +2332,8 @@ def main():
         output_path=args.output,
         force_replace=args.force_replace,
         entity=entity,
+        capture_runtime=capture_runtime,
+        offline_replay=args.offline_replay,
     )
 
 

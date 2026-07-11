@@ -1,0 +1,6 @@
+{
+  "teams": [
+    {"id": 42, "name": "Arsenal", "gender": "M"},
+    {"id": 44, "name": "Liverpool", "gender": "M"}
+  ]
+}

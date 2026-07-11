@@ -1,0 +1,103 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": true,
+  "properties": {
+    "meter": {
+      "const": "proxy_filter_provider_path_v2"
+    },
+    "samples": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "budget_eligible": {
+            "type": "boolean"
+          },
+          "cohort": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "endpoint_provider_bytes": {
+            "additionalProperties": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "minProperties": 1,
+            "type": "object"
+          },
+          "endpoint_request_provider_bytes": {
+            "additionalProperties": {
+              "items": {"minimum": 0, "type": "integer"},
+              "minItems": 1,
+              "type": "array"
+            },
+            "minProperties": 1,
+            "type": "object"
+          },
+          "proxy_exit_hash": {
+            "minLength": 12,
+            "type": "string"
+          },
+          "run_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "total_provider_bytes": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "metrics": {
+            "additionalProperties": false,
+            "properties": {
+              "browser_sessions": {"minimum": 0, "type": "integer"},
+              "cache_hit_rate": {"maximum": 1, "minimum": 0, "type": "number"},
+              "endpoint_completeness": {"maximum": 1, "minimum": 0, "type": "number"},
+              "matches_per_second": {"minimum": 0, "type": "number"},
+              "completed_matches": {"minimum": 0, "type": "integer"},
+              "completed_players": {"minimum": 0, "type": "integer"},
+              "navigations": {"minimum": 0, "type": "integer"},
+              "p50_duration_ms": {"minimum": 0, "type": "integer"},
+              "p95_duration_ms": {"minimum": 0, "type": "integer"},
+              "players_per_second": {"minimum": 0, "type": "number"},
+              "replay_hit_rate": {"maximum": 1, "minimum": 0, "type": "number"},
+              "request_count": {"minimum": 0, "type": "integer"}
+            },
+            "type": "object"
+          },
+          "mode": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "run_id",
+          "budget_eligible",
+          "cohort",
+          "mode",
+          "proxy_exit_hash",
+          "total_provider_bytes",
+          "endpoint_provider_bytes",
+          "endpoint_request_provider_bytes"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "schema_version": {
+      "const": 1
+    },
+    "source": {
+      "const": "sofascore"
+    },
+    "verified": {
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "schema_version",
+    "source",
+    "meter",
+    "verified",
+    "samples"
+  ],
+  "type": "object"
+}

@@ -3,7 +3,8 @@ Unit tests for TrinoTableManager.
 """
 
 import pytest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, patch, PropertyMock
+import pandas as pd
 import pyarrow as pa
 
 
@@ -461,17 +462,17 @@ class TestTrinoTableManagerInsertDataFrameAtomic:
 
             # Batches are staged on the throwaway table, not the target.
             mock_insert.assert_called_once()
-            assert mock_insert.call_args[0][1] == 'test_table__stg'
+            stage = mock_insert.call_args[0][1]
+            assert stage.startswith('test_table__stg_')
+            assert len(stage) == len('test_table__stg_') + 12
 
-            # Stage is dropped before (crash leftovers) and after (cleanup).
-            assert mock_drop.call_count == 2
-            for call in mock_drop.call_args_list:
-                assert call[0][1] == 'test_table__stg'
+            # A unique stage needs only the post-success cleanup.
+            mock_drop.assert_called_once_with('bronze', stage, if_exists=True)
 
             executed = [c[0][0] for c in mock_execute.call_args_list]
             # Empty-schema copy of the target.
             assert any(
-                'CREATE TABLE iceberg.bronze.test_table__stg AS SELECT * FROM '
+                f'CREATE TABLE iceberg.bronze.{stage} AS SELECT * FROM '
                 'iceberg.bronze.test_table WHERE false' in sql for sql in executed
             )
             # Exactly ONE INSERT into the target — the merge from stage.
@@ -481,7 +482,7 @@ class TestTrinoTableManagerInsertDataFrameAtomic:
             ]
             assert len(target_inserts) == 1
             assert 'SELECT' in target_inserts[0]
-            assert 'FROM iceberg.bronze.test_table__stg' in target_inserts[0]
+            assert f'FROM iceberg.bronze.{stage}' in target_inserts[0]
             # Plain append → no DELETE issued.
             assert not any('DELETE FROM' in sql for sql in executed)
 
@@ -565,15 +566,16 @@ class TestTrinoTableManagerInsertDataFrameAtomic:
             executed = [c[0][0] for c in mock_execute.call_args_list]
 
             # Staging happens before any DELETE: insert_dataframe targets the stage.
-            assert mock_insert.call_args[0][1] == 'test_table__stg'
+            stage = mock_insert.call_args[0][1]
+            assert stage.startswith('test_table__stg_')
 
             delete_idx = next(i for i, s in enumerate(executed) if 'DELETE FROM iceberg.bronze.test_table ' in s)
             insert_idx = next(i for i, s in enumerate(executed) if 'INSERT INTO iceberg.bronze.test_table ' in s)
             # DELETE is the partition replace, immediately before the merge INSERT.
             assert "WHERE team = 'A' OR team = 'B'" in executed[delete_idx]
             assert delete_idx < insert_idx
-            # Success → stage dropped (leading cleanup + trailing cleanup).
-            assert mock_drop.call_count == 2
+            # Success → unique stage dropped once.
+            mock_drop.assert_called_once_with('bronze', stage, if_exists=True)
 
     def test_replace_partitions_retains_stage_when_swap_insert_fails(self):
         """The #283/#314 wipe scenario: DELETE commits, the merge INSERT then
@@ -604,8 +606,8 @@ class TestTrinoTableManagerInsertDataFrameAtomic:
             executed = [c[0][0] for c in mock_execute.call_args_list]
             # DELETE was issued (the dangerous window opened)...
             assert any('DELETE FROM iceberg.bronze.test_table ' in s for s in executed)
-            # ...but the stage is NOT dropped — only the leading leftover-cleanup ran.
-            assert mock_drop.call_count == 1
+            # ...and the unique recovery stage is retained.
+            mock_drop.assert_not_called()
 
     def test_replace_partitions_drops_stage_when_staging_fails(self):
         """If staging fails before the swap, the target is untouched: no DELETE is
@@ -629,8 +631,8 @@ class TestTrinoTableManagerInsertDataFrameAtomic:
             # Target never touched.
             assert not any('DELETE FROM iceberg.bronze.test_table ' in s for s in executed)
             assert not any('INSERT INTO iceberg.bronze.test_table ' in s for s in executed)
-            # Stage cleaned up: leading leftover-cleanup + staging-failure cleanup.
-            assert mock_drop.call_count == 2
+            # The unique half-built stage is cleaned up once.
+            assert mock_drop.call_count == 1
 
     def test_replace_partitions_aborts_on_stage_count_mismatch(self):
         """If the staged row count != len(df), abort BEFORE the swap — no DELETE,
@@ -653,7 +655,65 @@ class TestTrinoTableManagerInsertDataFrameAtomic:
 
             executed = [c[0][0] for c in mock_execute.call_args_list]
             assert not any('DELETE FROM iceberg.bronze.test_table ' in s for s in executed)
-            assert mock_drop.call_count == 2
+            assert mock_drop.call_count == 1
+
+    def test_merge_keys_emit_incremental_upsert(self):
+        """Natural keys use MERGE and never delete/rewrite a partition."""
+        import pandas as pd
+        with patch.dict('sys.modules', {'trino': MagicMock(), 'trino.dbapi': MagicMock()}):
+            from scrapers.base.trino_manager import TrinoTableManager
+
+            manager = TrinoTableManager()
+            df = pd.DataFrame({
+                'league': ['ENG-Premier League'],
+                'season': ['2526'],
+                'match_id': ['123'],
+                'rating': [7.4],
+            })
+            with patch.object(manager, '_execute', side_effect=self._exec_ok(1)) as execute, \
+                 patch.object(manager, 'insert_dataframe', return_value=1), \
+                 patch.object(manager, 'drop_table'):
+                assert manager.insert_dataframe_atomic(
+                    'bronze', 'sofascore_player_ratings', df,
+                    merge_keys=['league', 'season', 'match_id'],
+                ) == 1
+
+            statements = [call.args[0] for call in execute.call_args_list]
+            merge = next(sql for sql in statements if sql.startswith('MERGE INTO'))
+            assert 't."league" = s."league"' in merge
+            assert 't."season" = s."season"' in merge
+            assert 't."match_id" = s."match_id"' in merge
+            assert 'WHEN MATCHED THEN UPDATE SET' in merge
+            assert 'WHEN NOT MATCHED THEN INSERT' in merge
+            assert not any(sql.startswith('DELETE FROM') for sql in statements)
+
+    @pytest.mark.parametrize(
+        ('frame', 'keys', 'message'),
+        [
+            (pd.DataFrame({'id': [1, 1]}), ['id'], 'duplicate rows'),
+            (pd.DataFrame({'id': [None]}), ['id'], 'contains null'),
+            (pd.DataFrame({'id': [1]}), ['missing'], 'absent from DataFrame'),
+        ],
+    )
+    def test_merge_keys_fail_closed(self, frame, keys, message):
+        from scrapers.base.trino_manager import TrinoTableManager
+
+        manager = TrinoTableManager()
+        with pytest.raises(ValueError, match=message):
+            manager.insert_dataframe_atomic(
+                'bronze', 'target', frame, merge_keys=keys,
+            )
+
+    def test_merge_keys_cannot_mix_with_partition_delete(self):
+        import pandas as pd
+        from scrapers.base.trino_manager import TrinoTableManager
+
+        manager = TrinoTableManager()
+        with pytest.raises(ValueError, match='mutually exclusive'):
+            manager.insert_dataframe_atomic(
+                'bronze', 'target', pd.DataFrame({'id': [1]}),
+                delete_filter='id = 1', merge_keys=['id'],
+            )
 
 
 class TestTrinoTableManagerDropTable:

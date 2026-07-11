@@ -1,0 +1,8 @@
+{
+  "referee": {
+    "id": 900,
+    "name": "Example Referee",
+    "country": {"alpha2": "GB", "name": "England"},
+    "statistics": {"matches": 100, "yellowCards": 350, "redCards": 10}
+  }
+}

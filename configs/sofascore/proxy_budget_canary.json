@@ -1,0 +1,39 @@
+{
+  "historical_observations": [
+    {
+      "context": "pre-PR-927 tournament snapshot",
+      "reported_mb": 6.0393,
+      "usable_as_budget_sample": false
+    },
+    {
+      "context": "post-PR-927 tournament snapshot",
+      "reported_mb": 2.0194,
+      "usable_as_budget_sample": false
+    },
+    {
+      "context": "recent production tournament snapshots",
+      "reported_mb_range": [
+        1.86,
+        2.02
+      ],
+      "usable_as_budget_sample": false
+    }
+  ],
+  "meter": "proxy_filter_provider_path_v2",
+  "requirements": {
+    "minimum_distinct_proxy_exits": 5,
+    "minimum_logical_runs": 20,
+    "required_cohort": "fixed 25 matches plus 50 players",
+    "required_modes": [
+      "cold",
+      "no_op",
+      "offline_replay",
+      "single_endpoint_resume"
+    ]
+  },
+  "samples": [],
+  "schema_version": 1,
+  "source": "sofascore",
+  "verified": false,
+  "verification_blocker": "No >=20-run, >=5-exit provider-metered canary exists yet; historical aggregates are provenance only and cannot authorize a production budget."
+}

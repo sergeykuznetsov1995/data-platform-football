@@ -2,7 +2,7 @@
 Unit tests for Silver ``sofascore_league_table`` SQL logic (#702).
 
 Conform-only projection of ``bronze.sofascore_league_table`` (APPEND-mode
-snapshots): dedup to the latest ``_ingested_at`` per (league, season, team),
+snapshots): dedup to the latest ``_ingested_at`` per (league, season, group, team),
 cast numerics to INTEGER, rename ``team`` → ``team_name`` and ``_ingested_at``
 → ``_bronze_ingested_at``, emit the season slug as-is (#404). The dedup logic
 moved here from gold.fct_standings (#702 — Gold one-hop from Silver).
@@ -36,7 +36,7 @@ def _bootstrap(con) -> None:
     con.execute("CREATE SCHEMA IF NOT EXISTS bronze")
     con.execute("""
         CREATE TABLE bronze.sofascore_league_table (
-            league VARCHAR, season VARCHAR, team VARCHAR,
+            league VARCHAR, season VARCHAR, team VARCHAR, "group" VARCHAR,
             mp BIGINT, w BIGINT, d BIGINT, l BIGINT,
             gf BIGINT, ga BIGINT, gd BIGINT, pts BIGINT,
             _ingested_at TIMESTAMP
@@ -46,17 +46,17 @@ def _bootstrap(con) -> None:
     con.execute("""
         INSERT INTO bronze.sofascore_league_table VALUES
         -- older snapshots (discarded)
-        ('ENG-Premier League', '2425', 'Manchester City', 10, 8, 1, 1, 30, 10, 20, 25,
+        ('ENG-Premier League', '2425', 'Manchester City', '__total__', 10, 8, 1, 1, 30, 10, 20, 25,
          TIMESTAMP '2026-04-26 06:00:00'),
-        ('ENG-Premier League', '2425', 'Liverpool',       10, 7, 2, 1, 25, 12, 13, 23,
+        ('ENG-Premier League', '2425', 'Liverpool',       '__total__', 10, 7, 2, 1, 25, 12, 13, 23,
          TIMESTAMP '2026-04-26 06:00:00'),
         -- latest snapshots (win)
-        ('ENG-Premier League', '2425', 'Manchester City', 12, 10, 1, 1, 35, 11, 24, 31,
+        ('ENG-Premier League', '2425', 'Manchester City', '__total__', 12, 10, 1, 1, 35, 11, 24, 31,
          TIMESTAMP '2026-04-27 06:00:00'),
-        ('ENG-Premier League', '2425', 'Liverpool',       12, 8, 2, 2, 28, 14, 14, 26,
+        ('ENG-Premier League', '2425', 'Liverpool',       '__total__', 12, 8, 2, 2, 28, 14, 14, 26,
          TIMESTAMP '2026-04-27 06:00:00'),
         -- blank team name -> filtered
-        ('ENG-Premier League', '2425', '   ',             12, 0, 0, 12, 0, 50, -50, 0,
+        ('ENG-Premier League', '2425', '   ',             '__total__', 12, 0, 0, 12, 0, 50, -50, 0,
          TIMESTAMP '2026-04-27 06:00:00')
     """)
 
@@ -102,3 +102,7 @@ class TestSofascoreLeagueTableSilver:
     def test_season_slug_as_is(self, silver_rows):
         """#404: SofaScore bronze season is already slug — emitted unchanged."""
         assert {r["season"] for r in silver_rows} == {"2425"}
+
+    def test_total_scope_sentinel_is_not_exposed(self, silver_rows):
+        assert {r["group_id"] for r in silver_rows} == {None}
+        assert {r["standing_scope"] for r in silver_rows} == {"__total__"}

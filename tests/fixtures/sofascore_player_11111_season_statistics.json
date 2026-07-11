@@ -1,0 +1,19 @@
+{
+  "team": {
+    "id": 30,
+    "name": "Brighton & Hove Albion"
+  },
+  "statistics": {
+    "rating": 7.42,
+    "appearances": 31,
+    "totalGoals": 12,
+    "totalAssists": 5,
+    "expectedGoals": 10.8,
+    "expectedAssists": 4.9,
+    "minutesPlayed": 2800,
+    "ratingVersions": {
+      "original": 7.42,
+      "alternative": 7.38
+    }
+  }
+}

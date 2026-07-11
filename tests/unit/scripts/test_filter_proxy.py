@@ -14,9 +14,11 @@ What we cover (the safety-critical, pure logic):
 from __future__ import annotations
 
 import importlib.util
+import asyncio
 import json
 from collections import defaultdict
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -125,6 +127,250 @@ def test_dump_writes_expected_report_shape(mod, tmp_path):
     assert report["allowed_hosts"][0]["host"] == "sofifa.com"
     assert report["allowed_hosts"][0]["down_mb"] == pytest.approx(1.0, abs=0.01)
     assert report["blocked_hosts"] == [{"host": "doubleclick.net", "attempts": 5}]
+
+
+def test_budgeted_dump_exposes_exact_provider_bytes_for_canary(mod, tmp_path):
+    mod.up_bytes = defaultdict(int, {"www.sofascore.com": 19})
+    mod.down_bytes = defaultdict(int, {"www.sofascore.com": 23})
+    mod.provider_budget_guard = object()
+    mod.provider_budget_endpoint = "event"
+    out = tmp_path / "provider.json"
+    mod._dump(str(out), quiet=True)
+    report = json.loads(out.read_text())
+    assert report["total_provider_bytes"] == 42
+    assert report["endpoint_provider_bytes"] == {"event": 42}
+    assert report["endpoint_request_provider_bytes"] == {"event": [42]}
+
+
+def test_pump_charges_provider_guard_before_forwarding(mod):
+    class Reader:
+        def __init__(self):
+            self.chunks = [b"provider-bytes", b""]
+
+        async def read(self, size):
+            return self.chunks.pop(0)
+
+    class Writer:
+        def __init__(self):
+            self.writes = []
+            self.closed = False
+
+        def write(self, chunk):
+            self.writes.append(chunk)
+
+        async def drain(self):
+            return None
+
+        def close(self):
+            self.closed = True
+
+    class Guard:
+        def __init__(self):
+            self.charges = []
+
+        def consume(self, amount):
+            self.charges.append(amount)
+
+    writer = Writer()
+    guard = Guard()
+    counter = defaultdict(int)
+    asyncio.run(mod._pump(Reader(), writer, "www.sofascore.com", counter, guard))
+    assert guard.charges == [len(b"provider-bytes")]
+    assert counter["www.sofascore.com"] == len(b"provider-bytes")
+    assert writer.writes == [b"provider-bytes"]
+    assert writer.closed is True
+
+
+def test_pump_does_not_double_charge_a_preclaimed_provider_read(mod):
+    class Reader:
+        def __init__(self):
+            self.chunks = [b"preclaimed", b""]
+
+        async def read(self, size):
+            return self.chunks.pop(0)
+
+    class Writer:
+        def __init__(self):
+            self.writes = []
+
+        def write(self, chunk):
+            self.writes.append(chunk)
+
+        async def drain(self):
+            return None
+
+        def close(self):
+            return None
+
+    class Guard:
+        def __init__(self):
+            self.claimed = []
+
+        async def read_metered(self, reader, max_bytes):
+            chunk = await reader.read(max_bytes)
+            self.claimed.append(len(chunk))
+            return chunk
+
+        def consume(self, amount):
+            raise AssertionError("preclaimed bytes must not be charged twice")
+
+    writer = Writer()
+    guard = Guard()
+    counter = defaultdict(int)
+    asyncio.run(mod._pump(Reader(), writer, "www.sofascore.com", counter, guard))
+    assert guard.claimed == [len(b"preclaimed"), 0]
+    assert counter["www.sofascore.com"] == len(b"preclaimed")
+    assert writer.writes == [b"preclaimed"]
+
+
+def _initialize_real_metered_guard(mod, monkeypatch, tmp_path):
+    """Run only filter_proxy's budget initialization and return its real guard."""
+    from scripts.proxy_filter.budget import SharedBudgetLedger
+    from tests.unit.scripts.test_sofascore_proxy_budget import _artifact
+
+    artifact = _artifact(tmp_path / "canary.json")
+    policy = mod.load_verified_policy(artifact)
+    ledger_path = tmp_path / "ledger.json"
+    ledger = SharedBudgetLedger(ledger_path, policy)
+    token, limit = ledger.reserve("logical-run", "event")
+    args = SimpleNamespace(
+        listen="127.0.0.1:0",
+        proxy_file=str(tmp_path / "unused-proxies.txt"),
+        blocklist=None,
+        out=str(tmp_path / "meter.json"),
+        pidfile=str(tmp_path / "filter.pid"),
+        budget_artifact=str(artifact),
+        budget_ledger=str(ledger_path),
+        budget_run_id="logical-run",
+        budget_reservation_token=token,
+        budget_endpoint="event",
+    )
+    monkeypatch.setattr(mod.argparse.ArgumentParser, "parse_args", lambda self: args)
+    monkeypatch.setattr(
+        mod,
+        "_residential_manager",
+        lambda path: SimpleNamespace(total_count=1),
+    )
+
+    class Server:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+    async def start_server(*args, **kwargs):
+        return Server()
+
+    class StopEvent:
+        def set(self):
+            return None
+
+        async def wait(self):
+            return None
+
+    monkeypatch.setattr(mod.asyncio, "start_server", start_server)
+    monkeypatch.setattr(mod.asyncio, "Event", StopEvent)
+    monkeypatch.setattr(
+        mod.asyncio,
+        "get_running_loop",
+        lambda: SimpleNamespace(add_signal_handler=lambda *args: None),
+    )
+
+    def discard_background(coro):
+        coro.close()
+        return None
+
+    monkeypatch.setattr(mod.asyncio, "ensure_future", discard_background)
+    asyncio.run(mod.main())
+    assert mod.provider_budget_guard is not None
+    return mod.provider_budget_guard, ledger, token, limit
+
+
+def test_real_metered_read_refunds_short_socket_reads_without_double_charge(
+    mod,
+    monkeypatch,
+    tmp_path,
+):
+    guard, ledger, token, _ = _initialize_real_metered_guard(
+        mod, monkeypatch, tmp_path
+    )
+
+    class ShortReader:
+        def __init__(self):
+            self.chunks = [b"short-read", b""]
+
+        async def read(self, size):
+            chunk = self.chunks.pop(0)
+            assert len(chunk) <= size
+            return chunk
+
+    reader = ShortReader()
+    first = asyncio.run(guard.read_metered(reader, 65536))
+    assert first == b"short-read"
+    assert ledger.snapshot("logical-run")["spent_provider_bytes"] == len(first)
+
+    # EOF is also a short read: its entire preclaim must be refunded.
+    assert asyncio.run(guard.read_metered(reader, 65536)) == b""
+    assert ledger.snapshot("logical-run")["spent_provider_bytes"] == len(first)
+
+    # finish validates the provider report against already-claimed bytes; it
+    # must not add the same traffic a second time.
+    assert ledger.finish(
+        "logical-run", token, reported_provider_bytes=len(first)
+    ) == len(first)
+    assert ledger.snapshot("logical-run")["spent_provider_bytes"] == len(first)
+
+
+def test_pump_forwards_only_the_atomic_final_provider_chunk(
+    mod,
+    monkeypatch,
+    tmp_path,
+):
+    guard, ledger, _, limit = _initialize_real_metered_guard(
+        mod, monkeypatch, tmp_path
+    )
+
+    class Reader:
+        def __init__(self):
+            self.payload = b"x" * (limit + 23)
+
+        async def read(self, size):
+            chunk, self.payload = self.payload[:size], self.payload[size:]
+            return chunk
+
+    class Writer:
+        def __init__(self):
+            self.writes = []
+            self.closed = False
+
+        def write(self, chunk):
+            self.writes.append(chunk)
+
+        async def drain(self):
+            return None
+
+        def close(self):
+            self.closed = True
+
+    writer = Writer()
+    counter = defaultdict(int)
+    asyncio.run(
+        mod._pump(
+            Reader(),
+            writer,
+            "www.sofascore.com",
+            counter,
+            guard,
+        )
+    )
+
+    # The second read is refused before bytes move. _pump must not call
+    # consume after a precharged read and cannot forward the 23-byte tail.
+    assert sum(map(len, writer.writes)) == limit
+    assert counter["www.sofascore.com"] == limit
+    assert ledger.snapshot("logical-run")["spent_provider_bytes"] == limit
+    assert writer.closed is True
 
 
 # --- _pick_upstream / _acquire_upstream (idle-refresh rotation) ---------------
