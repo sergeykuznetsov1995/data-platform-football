@@ -806,7 +806,7 @@ class TestPlayerSeasonStatsFlatten:
 
 
 class TestSofaScoreTournamentMap:
-    """Sanity for the league → unique_tournament_id static map (#24)."""
+    """Sanity for registry-backed legacy lookup views (#24)."""
 
     def test_known_leagues(self):
         from scrapers.sofascore.scraper import SOFASCORE_TOURNAMENT_MAP
@@ -817,6 +817,47 @@ class TestSofaScoreTournamentMap:
         assert 'GER-Bundesliga' in SOFASCORE_TOURNAMENT_MAP
         assert 'ITA-Serie A' in SOFASCORE_TOURNAMENT_MAP
         assert 'FRA-Ligue 1' in SOFASCORE_TOURNAMENT_MAP
+
+    def test_compatibility_views_are_derived_from_registry(self):
+        from scrapers.sofascore.catalog import SofaScoreCatalog
+        from scrapers.sofascore.scraper import (
+            SOFASCORE_TOURNAMENT_MAP,
+            SOFASCORE_TOURNAMENT_SLUG,
+        )
+
+        catalog = SofaScoreCatalog.load()
+        assert SOFASCORE_TOURNAMENT_MAP == catalog.tournament_map(
+            enabled_only=False,
+        )
+        assert SOFASCORE_TOURNAMENT_SLUG == catalog.slug_map(
+            enabled_only=False,
+        )
+
+    def test_registered_season_id_precedes_capture_fallbacks(self):
+        from scrapers.sofascore.scraper import SofaScoreScraper
+
+        catalog = MagicMock()
+        catalog.resolve_season_id.return_value = 76986
+        cap = MagicMock()
+        captured = {
+            "/api/v1/unique-tournament/17/seasons": {
+                "status": 200,
+                "challenge": False,
+                "json": {"seasons": [{"year": "25/26", "id": 99999}]},
+            }
+        }
+
+        with patch(
+            "scrapers.sofascore.scraper._SOFASCORE_CATALOG",
+            catalog,
+        ):
+            sid = SofaScoreScraper._resolve_target_sid(
+                MagicMock(), cap, captured, 17, "25/26",
+            )
+
+        assert sid == 76986
+        catalog.resolve_season_id.assert_called_once_with(17, "25/26")
+        cap.fetch_api_json.assert_not_called()
 
 
 class TestPlayerProfileFlatten:
@@ -1477,11 +1518,11 @@ class TestResolveMatchIdsViaCapture:
 
     @staticmethod
     def _buffer():
-        # season 2025 -> target year '25/26' (sid 96668 in the path); events
+        # season 2025 -> target year '25/26' (sid 76986 in the registry); events
         # carry that season so the season-year guard keeps them (#824).
-        s = {"year": "25/26", "id": 96668}
+        s = {"year": "25/26", "id": 76986}
         return {
-            "/api/v1/unique-tournament/17/season/96668/events/last/0": {
+            "/api/v1/unique-tournament/17/season/76986/events/last/0": {
                 "status": 200, "challenge": False, "json": {"events": [
                     {"id": 101, "status": {"type": "finished"}, "season": s},
                     {"id": 102, "status": {"type": "notstarted"}, "season": s},
@@ -1547,14 +1588,14 @@ class TestResolveMatchIdsViaCapture:
     def test_retries_when_a_later_finished_page_is_missing(self):
         scraper = self._scraper()
         scraper._proxy_manager = None
-        season = {"year": "25/26", "id": 96668}
+        season = {"year": "25/26", "id": 76986}
         base = {
             "/api/v1/unique-tournament/17/seasons": {
                 "status": 200,
                 "challenge": False,
                 "json": {"seasons": [season]},
             },
-            "/api/v1/unique-tournament/17/season/96668/events/last/0": {
+            "/api/v1/unique-tournament/17/season/76986/events/last/0": {
                 "status": 200,
                 "challenge": False,
                 "json": {
@@ -1567,7 +1608,7 @@ class TestResolveMatchIdsViaCapture:
         }
         complete = {
             **base,
-            "/api/v1/unique-tournament/17/season/96668/events/last/1": {
+            "/api/v1/unique-tournament/17/season/76986/events/last/1": {
                 "status": 200,
                 "challenge": False,
                 "json": {
@@ -1664,16 +1705,16 @@ class TestReadScheduleViaCapture:
         # ut=17 (EPL) 25/26 events: one finished (round 7, scores), one
         # not-started (round 8). A 26/27 event (next season) must be filtered out
         # by the season-year guard, and a featured ut=16 event by the ut_id.
-        s2526 = {"year": "25/26", "id": 76668}
+        s2526 = {"year": "25/26", "id": 76986}
         return {
-            "/api/v1/unique-tournament/17/season/76668/events/last/0": {
+            "/api/v1/unique-tournament/17/season/76986/events/last/0": {
                 "status": 200, "challenge": False, "json": {"events": [
                     {"id": 101, "status": {"type": "finished"}, "season": s2526,
                      "homeTeam": {"name": "Arsenal"}, "awayTeam": {"name": "Chelsea"},
                      "homeScore": {"current": 2}, "awayScore": {"current": 1},
                      "startTimestamp": 1719000000, "roundInfo": {"round": 7}},
                 ]}},
-            "/api/v1/unique-tournament/17/season/76668/events/next/0": {
+            "/api/v1/unique-tournament/17/season/76986/events/next/0": {
                 "status": 200, "challenge": False, "json": {"events": [
                     {"id": 102, "status": {"type": "notstarted"}, "season": s2526,
                      "homeTeam": {"name": "Liverpool"}, "awayTeam": {"name": "Everton"},
@@ -1778,19 +1819,19 @@ class TestReadScheduleViaCapture:
     @pytest.mark.unit
     def test_keeps_future_fixtures_when_last_page_is_empty(self):
         scraper = self._scraper()
-        season = {"year": "25/26", "id": 76668}
+        season = {"year": "25/26", "id": 76986}
         buf = {
             "/api/v1/unique-tournament/17/seasons": {
                 "status": 200,
                 "challenge": False,
                 "json": {"seasons": [season]},
             },
-            "/api/v1/unique-tournament/17/season/76668/events/last/0": {
+            "/api/v1/unique-tournament/17/season/76986/events/last/0": {
                 "status": 200,
                 "challenge": False,
                 "json": {"events": []},
             },
-            "/api/v1/unique-tournament/17/season/76668/events/next/0": {
+            "/api/v1/unique-tournament/17/season/76986/events/next/0": {
                 "status": 200,
                 "challenge": False,
                 "json": {
@@ -1855,8 +1896,8 @@ class TestReadScheduleViaCapture:
         return {
             "/api/v1/unique-tournament/17/seasons": {
                 "status": 200, "challenge": False, "json": {"seasons": [
-                    {"year": "25/26", "id": 76668}]}},
-            "/api/v1/unique-tournament/17/season/76668/events/last/0": page0_rec,
+                    {"year": "25/26", "id": 76986}]}},
+            "/api/v1/unique-tournament/17/season/76986/events/last/0": page0_rec,
         }
 
     def _run_with_session_counter(self, scraper, buf):
@@ -1899,7 +1940,7 @@ class TestReadScheduleViaCapture:
         buf = self._sid_resolvable_buffer(
             {"status": 200, "challenge": False, "json": {"events": []}}
         )
-        buf["/api/v1/unique-tournament/17/season/76668/events/next/0"] = {
+        buf["/api/v1/unique-tournament/17/season/76986/events/next/0"] = {
             "status": 200,
             "challenge": False,
             "json": {"events": []},
@@ -1917,7 +1958,7 @@ class TestReadScheduleViaCapture:
         # must not spend two extra ~2 MB browser warm-ups.
         scraper = self._scraper()
         scraper._camoufox_proxy = MagicMock(return_value=None)
-        season = {"year": "25/26", "id": 76668}
+        season = {"year": "25/26", "id": 76986}
         buf = self._sid_resolvable_buffer(
             {
                 "status": 200,
@@ -1934,7 +1975,7 @@ class TestReadScheduleViaCapture:
                 },
             }
         )
-        buf["/api/v1/unique-tournament/17/season/76668/events/next/0"] = {
+        buf["/api/v1/unique-tournament/17/season/76986/events/next/0"] = {
             "status": 404,
             "challenge": False,
             "json": {"error": {"code": 404, "reason": "Not Found"}},
@@ -1969,7 +2010,7 @@ class TestReadScheduleViaCapture:
         buf = {
             "/api/v1/unique-tournament/17/seasons": {
                 "status": 200, "challenge": False, "json": {"seasons": [
-                    {"year": "25/26", "id": 76668}]}},
+                    {"year": "25/26", "id": 76986}]}},
         }
 
         df, sessions = self._run_with_session_counter(scraper, buf)
@@ -2626,7 +2667,7 @@ class TestTournamentSnapshot:
     def test_empty_page_that_promises_more_is_incomplete(self):
         from scrapers.sofascore.scraper import SofaScoreScraper
 
-        prefix = "/api/v1/unique-tournament/17/season/76668/events"
+        prefix = "/api/v1/unique-tournament/17/season/76986/events"
         buffer = {
             f"{prefix}/last/0": {
                 "status": 200,
@@ -2659,14 +2700,14 @@ class TestTournamentSnapshot:
                 leagues=["ENG-Premier League"],
                 seasons=[2025],
             )
-        season = {"year": "25/26", "id": 76668}
+        season = {"year": "25/26", "id": 76986}
         buffer = {
             "/api/v1/unique-tournament/17/seasons": {
                 "status": 200,
                 "challenge": False,
                 "json": {"seasons": [season]},
             },
-            "/api/v1/unique-tournament/17/season/76668/events/last/0": {
+            "/api/v1/unique-tournament/17/season/76986/events/last/0": {
                 "status": 200,
                 "challenge": False,
                 "json": {
@@ -2681,12 +2722,12 @@ class TestTournamentSnapshot:
                     ]
                 },
             },
-            "/api/v1/unique-tournament/17/season/76668/events/next/0": {
+            "/api/v1/unique-tournament/17/season/76986/events/next/0": {
                 "status": 200,
                 "challenge": False,
                 "json": {"events": []},
             },
-            "/api/v1/unique-tournament/17/season/76668/standings/total": {
+            "/api/v1/unique-tournament/17/season/76986/standings/total": {
                 "status": 200,
                 "challenge": False,
                 "json": {
@@ -2763,7 +2804,7 @@ class TestTournamentSnapshot:
                 seasons=[2025],
             )
         scraper._proxy_manager = None
-        season = {"year": "25/26", "id": 76668}
+        season = {"year": "25/26", "id": 76986}
         seasons_rec = {
             "/api/v1/unique-tournament/17/seasons": {
                 "status": 200,
@@ -2775,19 +2816,19 @@ class TestTournamentSnapshot:
         event2 = {"id": 2, "season": season, "status": {"type": "finished"}}
         first = {
             **seasons_rec,
-            "/api/v1/unique-tournament/17/season/76668/events/last/0": {
+            "/api/v1/unique-tournament/17/season/76986/events/last/0": {
                 "status": 200,
                 "challenge": False,
                 "json": {"events": [event1], "hasNextPage": True},
             },
-            "/api/v1/unique-tournament/17/season/76668/events/next/0": {
+            "/api/v1/unique-tournament/17/season/76986/events/next/0": {
                 "status": 200,
                 "challenge": False,
                 "json": {"events": []},
             },
             # A terminal response is valid only on page zero. Page one was
             # promised by hasNextPage=True, so this remains a partial capture.
-            "/api/v1/unique-tournament/17/season/76668/events/last/1": {
+            "/api/v1/unique-tournament/17/season/76986/events/last/1": {
                 "status": 404,
                 "challenge": False,
                 "json": {"error": {"code": 404, "reason": "Not Found"}},
@@ -2795,7 +2836,7 @@ class TestTournamentSnapshot:
         }
         complete = {
             **first,
-            "/api/v1/unique-tournament/17/season/76668/events/last/1": {
+            "/api/v1/unique-tournament/17/season/76986/events/last/1": {
                 "status": 200,
                 "challenge": False,
                 "json": {"events": [event2], "hasNextPage": False},

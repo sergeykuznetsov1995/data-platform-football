@@ -39,6 +39,10 @@ x-airflow-common: &airflow-common
     FBREF_RAW_STORE_URI: s3://${ICEBERG_WAREHOUSE}/raw/fbref
     FBREF_RAW_S3_ENDPOINT: seaweedfs:8333
     FBREF_RAW_S3_SCHEME: http
+    # Versioned SofaScore discovery registry. Discovery runs outside Airflow;
+    # workers only consume explicitly activated entries from this read-only
+    # file, so a newly discovered tournament cannot create DAG tasks by itself.
+    SOFASCORE_REGISTRY_PATH: /opt/airflow/configs/sofascore/tournaments.json
     # Route FlareSolverr scrapers (WhoScored/SoFIFA) through the ad-tech filter (#652).
     # Off by default — set to http://proxy_filter:8899 to cut residential traffic.
     PROXY_FILTER_URL: ${PROXY_FILTER_URL:-}
@@ -58,6 +62,10 @@ x-airflow-common: &airflow-common
     # soccerdata_cache volume before soccerdata is imported — replaces the
     # hand-patched, unversioned file the WC ESPN ingest used to depend on.
     - ./configs/soccerdata:/opt/airflow/configs/soccerdata:ro
+    # SofaScore source metadata + activation flags. Deliberately read-only in
+    # Airflow: discovery writes the host-side versioned registry, never a
+    # scheduler/worker checkout at runtime.
+    - ./configs/sofascore:/opt/airflow/configs/sofascore:ro
     # SSO-конфиг: читает только webserver, scheduler игнорирует (фаза 6)
     - ./configs/airflow/webserver_config.py:/opt/airflow/webserver_config.py:ro
     - ./scrapers:/opt/airflow/scrapers
