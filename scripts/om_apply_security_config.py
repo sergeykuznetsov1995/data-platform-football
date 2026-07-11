@@ -43,13 +43,38 @@ import os
 import sys
 import urllib.error
 import urllib.request
+from pathlib import Path
 
-OM_URL = os.environ.get("OM_BASE_URL", "http://127.0.0.1:8585")
-ADMIN_EMAIL = os.environ.get("OM_ADMIN_EMAIL", "admin@open-metadata.org")
+ENV_FILE = Path(__file__).resolve().parents[1] / ".env"
 
 # Секции, которых нет в нашем сетапе: сервер отдаёт их пустыми болванками,
 # а валидация PUT требует в них обязательные поля (host/port/...) — шлём без них.
 DROP_SECTIONS = ("ldapConfiguration", "samlConfiguration")
+
+
+def load_env() -> None:
+    """Подмешать .env в окружение (реальное окружение имеет приоритет).
+
+    Читаем файл сами, а не через `set -a; . ./.env`: в .env есть значения-заглушки
+    вида `<your-token>`, на которых shell-source падает (`<` = редирект).
+    """
+    if not ENV_FILE.exists():
+        return
+    for line in ENV_FILE.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+load_env()
+
+OM_URL = os.environ.get("OM_BASE_URL", "http://127.0.0.1:8585")
+ADMIN_EMAIL = os.environ.get("OM_ADMIN_EMAIL", "admin@open-metadata.org")
 
 
 def _req(method: str, path: str, token: str | None = None, body: dict | None = None):
