@@ -218,6 +218,23 @@
       "webOrigins": ["https://trino.__PLATFORM_DOMAIN__"],
       "defaultClientScopes": ["profile", "email", "basic", "groups"],
       "optionalClientScopes": ["offline_access"]
+    },
+    {
+      "clientId": "openmetadata",
+      "name": "OpenMetadata",
+      "protocol": "openid-connect",
+      "enabled": true,
+      "publicClient": false,
+      "clientAuthenticatorType": "client-secret",
+      "secret": "__OPENMETADATA_OIDC_CLIENT_SECRET__",
+      "standardFlowEnabled": true,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": false,
+      "redirectUris": ["https://meta.__PLATFORM_DOMAIN__/callback"],
+      "webOrigins": ["https://meta.__PLATFORM_DOMAIN__"],
+      "defaultClientScopes": ["profile", "email", "basic", "groups"],
+      "optionalClientScopes": ["offline_access"]
     }
   ]
 }
