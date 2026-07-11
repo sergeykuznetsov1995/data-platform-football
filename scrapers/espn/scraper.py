@@ -165,6 +165,18 @@ class ESPNScraper(SoccerdataScraper):
                     continue  # already the flat day-string shape
                 days = set()
                 for block in cal:
+                    # Диапазон родительского блока — для обрезки раздутых
+                    # entries (WC1: у ЧМ-2022 entry «Group» растянут
+                    # 2022-04-01..2022-12-03, 246 дней — фильтр >92 терял весь
+                    # групповой этап, скрейпился только плей-офф).
+                    try:
+                        b0 = datetime.strptime(
+                            block['startDate'][:10], '%Y-%m-%d').date()
+                        b1 = datetime.strptime(
+                            block['endDate'][:10], '%Y-%m-%d').date()
+                        block_ok = (b1 - b0).days <= 92
+                    except Exception:  # noqa: BLE001 — блок без дат
+                        block_ok = False
                     for entry in (block.get('entries') or [block]):
                         try:
                             d0 = datetime.strptime(
@@ -173,7 +185,11 @@ class ESPNScraper(SoccerdataScraper):
                                 entry['endDate'][:10], '%Y-%m-%d').date()
                         except Exception:  # noqa: BLE001 — skip malformed entry
                             continue
-                        if (d1 - d0).days > 92:
+                        if (d1 - d0).days > 92 and block_ok:
+                            # раздутый entry внутри тугого блока — обрезаем
+                            d0 = max(d0, b0)
+                            d1 = min(d1, b1)
+                        if (d1 - d0).days > 92 or d0 > d1:
                             continue  # outer season shell, not a stage
                         d = d0
                         while d <= d1:

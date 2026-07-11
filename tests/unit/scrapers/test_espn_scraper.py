@@ -615,6 +615,42 @@ class TestSeedSingleYearCupCalendar:
         assert cal == ['2026-06-11T12:00Z', '2026-06-12T12:00Z',
                        '2026-06-13T12:00Z', '2026-07-19T12:00Z']
 
+    def test_bloated_entry_clipped_to_tight_block_range(
+            self, make_scraper, tmp_path):
+        """WC1: у ЧМ-2022 entry «Group» растянут 2022-04-01..2022-12-03
+        (246 дней) — раньше фильтр >92 терял весь групповой этап и
+        скрейпился только плей-офф (16 матчей из 64). Раздутый entry внутри
+        ТУГОГО блока (20.11–19.12) обрезается по диапазону блока."""
+        payload = {
+            "leagues": [{"calendar": [{
+                "label": "FIFA World Cup",
+                "startDate": "2022-11-20T05:00Z",
+                "endDate": "2022-12-19T04:59Z",   # тугой блок — по нему режем
+                "entries": [
+                    {"label": "Group", "startDate": "2022-04-01T07:00Z",
+                     "endDate": "2022-12-03T06:59Z"},   # раздут (246 дней)
+                    {"label": "Final", "startDate": "2022-12-18T07:00Z",
+                     "endDate": "2022-12-19T04:59Z"},
+                ],
+            }]}],
+            "events": [],
+        }
+        scraper = make_scraper(['2022'])
+        reader = self._reader(tmp_path, payload)
+        reader.seasons = ['2022']
+        scraper._seed_single_year_cup_calendar(reader)
+
+        url = reader.get.call_args[0][0]
+        assert 'dates=20220701' in url
+        fp = tmp_path / 'Schedule_fifa.world_20200701.json'
+        assert fp.exists()
+        cal = json.loads(fp.read_text())['leagues'][0]['calendar']
+        # Group обрезан до 2022-11-20..2022-12-03 (14 дней) + финал 18–19.12.
+        assert cal[0] == '2022-11-20T12:00Z'
+        assert cal[-1] == '2022-12-19T12:00Z'
+        assert len(cal) == 16
+        assert '2022-04-01T12:00Z' not in cal
+
     def test_noop_for_flat_club_calendar(self, make_scraper, tmp_path):
         payload = {"leagues": [{"calendar": ["2025-08-16T14:00Z"]}],
                    "events": []}
