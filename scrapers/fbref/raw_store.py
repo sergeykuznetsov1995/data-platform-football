@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import re
+import uuid
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import PurePosixPath
@@ -20,6 +21,7 @@ RAW_MANIFEST_VERSION = "fbref-raw-v1"
 FETCHER_VERSION = "fbref-match-loader-v1"
 _MATCH_ID_RE = re.compile(r"^[0-9a-fA-F]{8}$")
 _MATCH_URL_RE = re.compile(r"/en/matches/([0-9a-fA-F]{8})(?:/|$)")
+_FBREF_HOSTS = {"fbref.com", "www.fbref.com"}
 
 
 class RawStoreError(RuntimeError):
@@ -67,14 +69,115 @@ def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def canonicalize_fbref_url(url: str) -> str:
+    """Return one stable HTTPS URL for an absolute or relative FBref URL."""
+    candidate = str(url).strip()
+    if not candidate:
+        raise ValueError("FBref URL must not be empty")
+
+    parsed = urlparse(candidate)
+    if parsed.scheme and parsed.scheme.lower() not in {"http", "https"}:
+        raise ValueError(f"Not an HTTP(S) FBref URL: {url!r}")
+    if parsed.scheme and not parsed.netloc:
+        raise ValueError(f"Invalid absolute FBref URL: {url!r}")
+    if parsed.netloc:
+        try:
+            port = parsed.port
+        except ValueError as exc:
+            raise ValueError(f"Invalid FBref URL: {url!r}") from exc
+        if (
+            (parsed.hostname or "").lower() not in _FBREF_HOSTS
+            or parsed.username is not None
+            or parsed.password is not None
+            or port not in {None, 80, 443}
+        ):
+            raise ValueError(f"Not an FBref URL: {url!r}")
+
+    path = parsed.path or "/"
+    if not path.startswith("/"):
+        path = f"/{path}"
+    if path != "/":
+        path = path.rstrip("/")
+    return f"https://fbref.com{path}"
+
+
+def _source_id(value: object, name: str) -> str:
+    normalized = str(value).strip()
+    if not normalized:
+        raise ValueError(f"{name} must not be empty")
+    return normalized
+
+
+def competition_index_target() -> PageTarget:
+    """Return the stable target for FBref's competition index."""
+    return PageTarget(
+        source="fbref",
+        page_kind="competition_index",
+        target_id="fbref:competition_index:all",
+        canonical_url=canonicalize_fbref_url("/en/comps/"),
+        source_ids={"competition_index": "all"},
+    )
+
+
+def competition_page_target(comp_id: object, discovered_url: str) -> PageTarget:
+    """Build a competition target from the exact URL found during discovery."""
+    competition_id = _source_id(comp_id, "comp_id")
+    return PageTarget(
+        source="fbref",
+        page_kind="competition",
+        target_id=f"fbref:competition:{competition_id}",
+        canonical_url=canonicalize_fbref_url(discovered_url),
+        source_ids={"competition_id": competition_id},
+    )
+
+
+def season_page_target(
+    comp_id: object,
+    season_id: object,
+    discovered_url: str,
+) -> PageTarget:
+    """Build a season target without deriving or rewriting its discovered URL."""
+    competition_id = _source_id(comp_id, "comp_id")
+    normalized_season_id = _source_id(season_id, "season_id")
+    return PageTarget(
+        source="fbref",
+        page_kind="season",
+        target_id=f"fbref:season:{competition_id}:{normalized_season_id}",
+        canonical_url=canonicalize_fbref_url(discovered_url),
+        source_ids={
+            "competition_id": competition_id,
+            "season_id": normalized_season_id,
+        },
+    )
+
+
+def schedule_page_target(
+    comp_id: object,
+    season_id: object,
+    discovered_url: str,
+) -> PageTarget:
+    """Build a schedule target without deriving or rewriting its discovered URL."""
+    competition_id = _source_id(comp_id, "comp_id")
+    normalized_season_id = _source_id(season_id, "season_id")
+    return PageTarget(
+        source="fbref",
+        page_kind="schedule",
+        target_id=f"fbref:schedule:{competition_id}:{normalized_season_id}",
+        canonical_url=canonicalize_fbref_url(discovered_url),
+        source_ids={
+            "competition_id": competition_id,
+            "season_id": normalized_season_id,
+        },
+    )
+
+
 def match_page_target(match_or_url: str) -> PageTarget:
     """Normalize a match id or any FBref match URL to one target."""
     candidate = str(match_or_url).strip()
     match_id = candidate if _MATCH_ID_RE.fullmatch(candidate) else None
     if match_id is None:
-        parsed = urlparse(candidate)
-        if parsed.netloc.lower() not in {"fbref.com", "www.fbref.com"}:
-            raise ValueError(f"Not an FBref match URL: {match_or_url!r}")
+        canonical = canonicalize_fbref_url(candidate)
+        parsed = urlparse(canonical)
         found = _MATCH_URL_RE.search(parsed.path)
         match_id = found.group(1) if found else None
     if match_id is None:
@@ -159,16 +262,75 @@ class RawPageStore:
         rendered = json.dumps(
             payload, ensure_ascii=False, indent=2, sort_keys=True
         ).encode("utf-8") + b"\n"
-        self._write_bytes(relative, rendered)
+        if not isinstance(self.filesystem, fs.LocalFileSystem):
+            # S3 objects become visible only after a successful PutObject.
+            self._write_bytes(relative, rendered)
+            return
+
+        path = self._path(relative)
+        parent = str(PurePosixPath(path).parent)
+        temporary = f"{path}.tmp-{os.getpid()}-{uuid.uuid4().hex}"
+        self.filesystem.create_dir(parent, recursive=True)
+        try:
+            with self.filesystem.open_output_stream(
+                temporary,
+                compression=None,
+            ) as stream:
+                stream.write(rendered)
+            os.replace(temporary, path)
+        finally:
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
+
+    @staticmethod
+    def _safe_component(value: object) -> str:
+        """Encode an arbitrary source id as one collision-free path component."""
+        raw = _source_id(value, "path component").encode("utf-8")
+        return "".join(
+            chr(byte)
+            if (
+                ord("a") <= byte <= ord("z")
+                or ord("A") <= byte <= ord("Z")
+                or ord("0") <= byte <= ord("9")
+                or byte in {ord("-"), ord("_")}
+            )
+            else f"%{byte:02X}"
+            for byte in raw
+        )
+
+    @classmethod
+    def _target_key(cls, page_kind: str, source_ids: Mapping[str, str], target_id: str) -> str:
+        if page_kind == "competition_index":
+            return "all"
+        if page_kind == "competition":
+            return cls._safe_component(source_ids["competition_id"])
+        if page_kind in {"season", "schedule"}:
+            return "/".join((
+                cls._safe_component(source_ids["competition_id"]),
+                cls._safe_component(source_ids["season_id"]),
+            ))
+        if page_kind == "match":
+            return cls._safe_component(source_ids["match_id"])
+        return cls._safe_component(target_id)
 
     @staticmethod
     def _target_manifest_key(target: PageTarget) -> str:
-        source_id = target.source_ids.get(target.page_kind)
-        if not source_id and target.page_kind == "match":
-            source_id = target.source_ids.get("match_id")
-        if not source_id:
-            source_id = hashlib.sha256(target.target_id.encode()).hexdigest()
-        return f"targets/{target.page_kind}/{source_id}.json"
+        if target.page_kind == "match":
+            # Preserve the v1 match-manifest path exactly.
+            source_id = target.source_ids.get(target.page_kind)
+            if not source_id:
+                source_id = target.source_ids.get("match_id")
+            if not source_id:
+                source_id = hashlib.sha256(target.target_id.encode()).hexdigest()
+            return f"targets/{target.page_kind}/{source_id}.json"
+        target_key = RawPageStore._target_key(
+            target.page_kind,
+            target.source_ids,
+            target.target_id,
+        )
+        return f"targets/{target.page_kind}/{target_key}.json"
 
     @staticmethod
     def _blob_key(content_hash: str) -> str:
@@ -304,6 +466,139 @@ class RawPageStore:
             "datasets": dataset_keys,
         })
         return match_key
+
+    def write_page_parse_manifests(self, record: RawPageRecord, result) -> str:
+        """Write generic dataset manifests first and the page summary last."""
+
+        def field(value, name: str, default=None):
+            if isinstance(value, Mapping):
+                return value.get(name, default)
+            return getattr(value, name, default)
+
+        def status_value(value):
+            return getattr(value, "value", value)
+
+        page_kind = self._safe_component(record.page_kind)
+        target_key = self._target_key(
+            record.page_kind,
+            record.source_ids,
+            record.target_id,
+        )
+        parser_version = self._safe_component(result.parser_version)
+        content_hash = self._safe_component(record.content_hash)
+        dataset_keys = {}
+        total_rows = 0
+
+        for name, dataset in sorted(result.datasets.items()):
+            dataset_name = self._safe_component(name)
+            key = (
+                f"manifests/datasets/{page_kind}/{dataset_name}/{target_key}/"
+                f"{content_hash}/{parser_version}.json"
+            )
+            row_count = field(dataset, "row_count", 0)
+            total_rows += row_count
+            payload = {
+                "manifest_version": RAW_MANIFEST_VERSION,
+                "target_id": record.target_id,
+                "page_kind": record.page_kind,
+                "source_ids": dict(record.source_ids),
+                "content_hash": record.content_hash,
+                "parser_version": result.parser_version,
+                "parsed_at": result.parsed_at,
+                "dataset": name,
+                "status": status_value(field(dataset, "status")),
+                "row_count": row_count,
+                "reason": field(dataset, "reason"),
+                "error_type": field(dataset, "error_type"),
+                "error_message": field(dataset, "error_message"),
+            }
+            self._write_json(key, payload)
+            dataset_keys[name] = key
+
+        page_key = (
+            f"manifests/pages/{page_kind}/{target_key}/"
+            f"{content_hash}/{parser_version}.json"
+        )
+        self._write_json(page_key, {
+            "manifest_version": RAW_MANIFEST_VERSION,
+            "target_id": record.target_id,
+            "page_kind": record.page_kind,
+            "source_ids": dict(record.source_ids),
+            "canonical_url": record.canonical_url,
+            "content_hash": record.content_hash,
+            "parser_version": result.parser_version,
+            "parsed_at": result.parsed_at,
+            "status": status_value(result.status),
+            "row_count": total_rows,
+            "datasets": dataset_keys,
+        })
+        return page_key
+
+    @classmethod
+    def _discovery_queue_prefix(cls, queue_id: object) -> str:
+        return f"queues/discovery/{cls._safe_component(queue_id)}"
+
+    def discovery_queue_plan_key(self, queue_id: object) -> str:
+        """Return the durable manifest key for one immutable queue plan."""
+        return f"{self._discovery_queue_prefix(queue_id)}/plan.json"
+
+    def discovery_queue_item_key(
+        self,
+        queue_id: object,
+        competition_id: object,
+    ) -> str:
+        """Return the commit-marker key for one competition queue item."""
+        competition = self._safe_component(competition_id)
+        return f"{self._discovery_queue_prefix(queue_id)}/items/{competition}.json"
+
+    def has_discovery_queue_plan(self, queue_id: object) -> bool:
+        return self._exists(self.discovery_queue_plan_key(queue_id))
+
+    def read_discovery_queue_plan(self, queue_id: object) -> dict:
+        return self._read_json(self.discovery_queue_plan_key(queue_id))
+
+    def write_discovery_queue_plan(
+        self,
+        queue_id: object,
+        payload: dict,
+    ) -> str:
+        key = self.discovery_queue_plan_key(queue_id)
+        if self._exists(key):
+            if self._read_json(key) != payload:
+                raise RawStoreError(
+                    f"Discovery queue plan is immutable: {queue_id}"
+                )
+            return key
+        self._write_json(key, payload)
+        return key
+
+    def has_discovery_queue_item(
+        self,
+        queue_id: object,
+        competition_id: object,
+    ) -> bool:
+        return self._exists(
+            self.discovery_queue_item_key(queue_id, competition_id)
+        )
+
+    def read_discovery_queue_item(
+        self,
+        queue_id: object,
+        competition_id: object,
+    ) -> dict:
+        return self._read_json(
+            self.discovery_queue_item_key(queue_id, competition_id)
+        )
+
+    def write_discovery_queue_item(
+        self,
+        queue_id: object,
+        competition_id: object,
+        payload: dict,
+    ) -> str:
+        key = self.discovery_queue_item_key(queue_id, competition_id)
+        self._write_json(key, payload)
+        return key
 
     def read_manifest(self, relative: str) -> dict:
         """Read a manifest for diagnostics and tests."""
