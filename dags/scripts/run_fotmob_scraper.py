@@ -108,13 +108,21 @@ def main():
     # Mixed club+WC calls can't carry two seasons -> WC is dropped (dedicated
     # call), mirroring run_whoscored_scraper / run_fbref_scraper.
     if 'INT-World Cup' in leagues:
-        from utils.medallion_config import get_active_season
+        from utils.medallion_config import get_active_season, get_competition_seasons
         _wc_season = get_active_season('INT-World Cup')
         if len(leagues) > 1:
             logger.warning(
                 "INT-World Cup dropped from mixed call (needs its own season; "
                 f"leagues={leagues}). Scrape it with --leagues 'INT-World Cup'.")
             leagues = [l for l in leagues if l != 'INT-World Cup']
+        elif int(args.season) in get_competition_seasons('INT-World Cup'):
+            # WC1 backfill: an edition explicitly configured in competitions.yaml
+            # is respected as-is. The bridge only guards against the club formula
+            # inventing a season the tournament does not have.
+            if _wc_season is None or int(args.season) != int(_wc_season):
+                logger.info(
+                    f"INT-World Cup: keeping explicit --season {args.season} "
+                    f"(configured edition, WC1 historical backfill).")
         elif _wc_season is None:
             logger.warning(
                 "INT-World Cup is out of its tournament window — nothing to "

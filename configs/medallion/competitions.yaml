@@ -422,6 +422,141 @@ competitions:
     competition_format: group_knockout
     is_international: true
     seasons:
+      # 1930-2022: исторические эдиции (WC1 — бэкфил S1 + S-эпохи). Даты =
+      # официальные окна турниров; 1942/1946 не проводились. 2022 — полный
+      # бэкфил (5 источников), остальные — только FBref schedule (ярус T1).
+      - id: 1930
+        season_format: single_year
+        format: group_knockout
+        team_count: 13
+        start: "1930-07-13"
+        end: "1930-07-30"
+      - id: 1934
+        season_format: single_year
+        format: group_knockout
+        team_count: 16
+        start: "1934-05-27"
+        end: "1934-06-10"
+      - id: 1938
+        season_format: single_year
+        format: group_knockout
+        team_count: 15
+        start: "1938-06-04"
+        end: "1938-06-19"
+      - id: 1950
+        season_format: single_year
+        format: group_knockout
+        team_count: 13
+        start: "1950-06-24"
+        end: "1950-07-16"
+      - id: 1954
+        season_format: single_year
+        format: group_knockout
+        team_count: 16
+        start: "1954-06-16"
+        end: "1954-07-04"
+      - id: 1958
+        season_format: single_year
+        format: group_knockout
+        team_count: 16
+        start: "1958-06-08"
+        end: "1958-06-29"
+      - id: 1962
+        season_format: single_year
+        format: group_knockout
+        team_count: 16
+        start: "1962-05-30"
+        end: "1962-06-17"
+      - id: 1966
+        season_format: single_year
+        format: group_knockout
+        team_count: 16
+        start: "1966-07-11"
+        end: "1966-07-30"
+      - id: 1970
+        season_format: single_year
+        format: group_knockout
+        team_count: 16
+        start: "1970-05-31"
+        end: "1970-06-21"
+      - id: 1974
+        season_format: single_year
+        format: group_knockout
+        team_count: 16
+        start: "1974-06-13"
+        end: "1974-07-07"
+      - id: 1978
+        season_format: single_year
+        format: group_knockout
+        team_count: 16
+        start: "1978-06-01"
+        end: "1978-06-25"
+      - id: 1982
+        season_format: single_year
+        format: group_knockout
+        team_count: 24
+        start: "1982-06-13"
+        end: "1982-07-11"
+      - id: 1986
+        season_format: single_year
+        format: group_knockout
+        team_count: 24
+        start: "1986-05-31"
+        end: "1986-06-29"
+      - id: 1990
+        season_format: single_year
+        format: group_knockout
+        team_count: 24
+        start: "1990-06-08"
+        end: "1990-07-08"
+      - id: 1994
+        season_format: single_year
+        format: group_knockout
+        team_count: 24
+        start: "1994-06-17"
+        end: "1994-07-17"
+      - id: 1998
+        season_format: single_year
+        format: group_knockout
+        team_count: 32
+        start: "1998-06-10"
+        end: "1998-07-12"
+      - id: 2002
+        season_format: single_year
+        format: group_knockout
+        team_count: 32
+        start: "2002-05-31"
+        end: "2002-06-30"
+      - id: 2006
+        season_format: single_year
+        format: group_knockout
+        team_count: 32
+        start: "2006-06-09"
+        end: "2006-07-09"
+      - id: 2010
+        season_format: single_year
+        format: group_knockout
+        team_count: 32
+        start: "2010-06-11"
+        end: "2010-07-11"
+      - id: 2014
+        season_format: single_year
+        format: group_knockout
+        team_count: 32
+        start: "2014-06-12"
+        end: "2014-07-13"
+      - id: 2018
+        season_format: single_year
+        format: group_knockout
+        team_count: 32
+        start: "2018-06-14"
+        end: "2018-07-15"
+      - id: 2022
+        season_format: single_year
+        format: group_knockout
+        team_count: 32
+        start: "2022-11-20"
+        end: "2022-12-18"
       - id: 2026
         season_format: single_year
         format: group_knockout

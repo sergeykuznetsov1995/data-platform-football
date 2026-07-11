@@ -695,7 +695,9 @@ class NodriverFBrefScraper(BaseScraper):
             return None
 
         comment_tables = extract_tables_from_comments(soup)
-        season_str = format_season(season)
+        # #913: pass league so WC table-id matching uses the single-year form
+        # ('2022', not '2022-2023') instead of relying on the sched_all fallback.
+        season_str = format_season(season, league)
         league_info = LEAGUE_IDS.get(league, {})
         comp_id = league_info.get('comp_id', '9')
 

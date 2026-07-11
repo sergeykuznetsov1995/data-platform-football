@@ -2130,9 +2130,9 @@ def validate_gold_row_counts() -> Dict[str, Any]:
         # the moment the YAML changes without a corresponding re-run.
         CHECK.row_count('gold.dim_competition', min_rows=9, max_rows=9),
         # dim_season (#425): union of seasons across in-scope competitions
-        # in competitions.yaml — 10 club seasons (1617..2526) + single-year
-        # '2026' (WC, #913). Same drift contract.
-        CHECK.row_count('gold.dim_season',      min_rows=11, max_rows=11),
+        # in competitions.yaml — 10 club seasons (1617..2526) + 23 single-year
+        # WC editions ('1930'..'2026', #913 + WC1 backfill). Same drift contract.
+        CHECK.row_count('gold.dim_season',      min_rows=33, max_rows=33),
     ]
     report = run_checks(checks, raise_on_error=False)
     logger.info(f"Gold row counts: {report.summary()}")

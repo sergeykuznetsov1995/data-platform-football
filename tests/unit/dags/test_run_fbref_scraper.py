@@ -830,6 +830,49 @@ class TestTournamentOutOfWindow:
         assert traffic_payload['real_proxy_mb'] == 0.0
         assert traffic_payload['skipped'] == 'out_of_window'
 
+    @pytest.mark.unit
+    def test_configured_historical_season_bypasses_window_noop(self, tmp_path):
+        """WC1 backfill: an edition explicitly listed in competitions.yaml
+        (e.g. 2022) must be scraped as-is even when the tournament window is
+        closed — only unconfigured (club-formula) seasons hit the noop/override."""
+        import importlib
+        import dags.scripts.run_fbref_scraper as module
+
+        scraper = MagicMock()
+        scraper._stats = {'successes': 1, 'failures': 0}
+        scraper.get_stats.return_value = scraper._stats
+        scraper.__enter__ = MagicMock(return_value=scraper)
+        scraper.__exit__ = MagicMock(return_value=False)
+        scraper.scrape_schedule.return_value = {
+            'schedule': 'iceberg.bronze.fbref_schedule'
+        }
+        mock_class = MagicMock(return_value=scraper)
+
+        output = tmp_path / 'result.json'
+        sys.argv = ['run_fbref_scraper.py'] + [
+            '--scraper-type', 'nodriver',
+            '--mode', 'match_data',
+            '--match-data-type', 'schedule',
+            '--leagues', 'INT-World Cup',
+            '--season', '2022',
+            '--output', str(output),
+        ]
+
+        with patch(
+            'scrapers.nodriver_fbref.NodriverFBrefScraper', mock_class
+        ), patch(
+            'utils.medallion_config.get_active_season', return_value=None
+        ), patch(
+            'utils.medallion_config.get_competition_seasons',
+            return_value=[1930, 2018, 2022, 2026],
+        ):
+            module = importlib.reload(module)
+            rc = module.main()
+
+        assert rc == 0
+        assert 'skipped' not in json.loads(output.read_text())
+        assert mock_class.call_args.kwargs['seasons'] == [2022]
+
 
 class TestCompletedScheduleLeagues:
     """Issue #877: Trino probe for already-backfilled schedule seasons."""

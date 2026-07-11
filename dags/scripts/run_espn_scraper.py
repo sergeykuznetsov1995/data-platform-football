@@ -69,17 +69,25 @@ def main():
             # #920 bridge: the DAG passes the club-formula CURRENT_SEASON
             # (July 2026 -> 2025) — substitute the active tournament year from
             # competitions.yaml; skip the league entirely out of window.
-            from utils.medallion_config import get_active_season
+            # WC1 backfill: an edition explicitly configured in competitions.yaml
+            # is respected as-is (historical scrape).
+            from utils.medallion_config import get_active_season, get_competition_seasons
             _wc_season = get_active_season(lg)
-            if _wc_season is None:
+            if int(args.season) in get_competition_seasons(lg):
+                if _wc_season is None or int(args.season) != int(_wc_season):
+                    logger.info(
+                        f"{lg}: keeping explicit --season {args.season} "
+                        f"(configured edition, WC1 historical backfill).")
+                tok = str(args.season)  # single-year, historical
+            elif _wc_season is None:
                 logger.warning(
                     f"{lg}: out of its tournament window — skipping league.")
                 continue
-            if int(args.season) != int(_wc_season):
+            else:
                 logger.info(
                     f"{lg}: overriding --season {args.season} -> {_wc_season} "
                     f"(active single_year season, #920 bridge).")
-            tok = str(_wc_season)  # single-year
+                tok = str(_wc_season)  # single-year
         else:
             tok = f"{args.season % 100:02d}{(args.season + 1) % 100:02d}"
         per_league.append((lg, tok))
