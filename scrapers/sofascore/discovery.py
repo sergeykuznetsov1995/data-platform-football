@@ -187,6 +187,64 @@ def _response_bytes(response: Any) -> int:
         return 0
 
 
+class _DirectTlsSession:
+    """Exact direct Chrome-133 HTTP/2 profile used by SofaScore's JSON edge.
+
+    The Go-backed client accepts an explicit ``proxy=None`` and does not consult
+    Requests/libcurl proxy environment variables.  Keeping the tiny adapter
+    requests-shaped lets tests inject a deterministic in-memory session.
+    """
+
+    _HEADERS = {
+        "accept": "*/*",
+        "accept-language": "en-US,en;q=0.9",
+        "origin": "https://www.sofascore.com",
+        "referer": "https://www.sofascore.com/",
+        "user-agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 "
+            "Safari/537.36"
+        ),
+        "x-requested-with": "XMLHttpRequest",
+    }
+
+    def __init__(self, timeout: float) -> None:
+        try:
+            from tls_client import Session
+        except ImportError as exc:  # pragma: no cover - production dependency
+            raise DiscoveryHTTPError(
+                "tls-client-python is required for direct SofaScore discovery"
+            ) from exc
+        self._inner = Session(
+            client_identifier="chrome_133",
+            proxy=None,
+            timeout_milliseconds=max(1, int(timeout * 1000)),
+            disable_http3=True,
+            follow_redirects=False,
+        )
+        self.headers = dict(self._HEADERS)
+        self.trust_env = False
+        self.proxies: dict[str, str] = {}
+        # Preserve the transport-invariant inspection surface used by the
+        # poison-proxy test; 10004 is libcurl's CURLOPT_PROXY numeric value.
+        self.curl_options = {_CURLOPT_PROXY: ""}
+
+    def get(self, url: str, *, timeout: float, proxies: Mapping[str, str]):
+        if proxies or self.proxies or getattr(self._inner, "proxy", None):
+            raise DiscoveryHTTPError("direct TLS session received proxy settings")
+        return self._inner.execute_request(
+            "GET",
+            url,
+            headers=dict(self.headers),
+            header_order=list(self.headers),
+            timeout_milliseconds=max(1, int(timeout * 1000)),
+            proxy=None,
+        )
+
+    def close(self) -> None:
+        self._inner.close()
+
+
 class DirectSofaScoreClient:
     """Bounded direct HTTP client with an invariant zero paid-proxy route."""
 
@@ -217,26 +275,7 @@ class DirectSofaScoreClient:
         if self._session_factory is not None:
             session = self._session_factory()
         else:
-            try:
-                from curl_cffi.const import CurlOpt
-                from curl_cffi.requests import Session
-            except ImportError as exc:  # pragma: no cover - production image
-                raise DiscoveryHTTPError(
-                    "curl_cffi is required for direct SofaScore discovery"
-                ) from exc
-            proxy_option = CurlOpt.PROXY
-            session = Session(
-                # Follow curl_cffi's current stable Chrome fingerprint instead
-                # of freezing the 2023 chrome120 TLS/HTTP2 signature. SofaScore
-                # rejects that stale signature at its JSON edge.
-                impersonate="chrome",
-                trust_env=False,
-                proxies={},
-                # curl_cffi 0.15 stores ``trust_env`` but does not thread it
-                # into libcurl. This option is the transport-level guarantee
-                # that HTTPS_PROXY/ALL_PROXY can never be used.
-                curl_options={proxy_option: ""},
-            )
+            session = _DirectTlsSession(self.timeout)
 
         # Two independent guards: ignore proxy environment variables and clear
         # any proxy mapping a supplied session might carry. Every request also
@@ -265,14 +304,14 @@ class DirectSofaScoreClient:
         headers = getattr(session, "headers", None)
         if headers is not None:
             headers.update({
-                "Accept": "application/json",
-                "Accept-Language": "en-US,en;q=0.9",
-                "Origin": "https://www.sofascore.com",
-                "Referer": "https://www.sofascore.com/",
+                "accept": "*/*",
+                "accept-language": "en-US,en;q=0.9",
+                "origin": "https://www.sofascore.com",
+                "referer": "https://www.sofascore.com/",
                 # Since June 2026 SofaScore's direct JSON edge requires the
                 # same explicit XHR marker its own web client sends. This is a
                 # plain request header, not a browser/session/proxy fallback.
-                "X-Requested-With": "XMLHttpRequest",
+                "x-requested-with": "XMLHttpRequest",
             })
         return session
 
