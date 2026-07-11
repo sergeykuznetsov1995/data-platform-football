@@ -37,7 +37,6 @@ from airflow.operators.bash import BashOperator
 from airflow.operators.python import PythonOperator, ShortCircuitOperator
 
 from utils.config import (
-    LEAGUES,
     CURRENT_SEASON,
     SCHEDULES,
     DAG_TAGS,
@@ -46,7 +45,13 @@ from utils.config import (
 from utils.default_args import SCRAPER_ARGS
 from utils.ingest_helpers import league_slug as _league_slug
 from utils.ingest_helpers import load_result as _load_result
-from utils.medallion_config import is_single_year_competition
+from utils.medallion_config import (
+    get_active_season,
+    get_competition_seasons,
+    is_single_year_competition,
+)
+
+from scrapers.sofascore.catalog import CatalogError, SofaScoreCatalog
 
 
 SCHEDULE_RESULT_PATH = '/tmp/sofascore_result.json'
@@ -58,16 +63,123 @@ MATCH_CAPTURE_RESULT_PATH = '/tmp/sofascore_match_capture_result.json'
 # dag_ingest_sofascore_players) now runs here behind the Saturday/manual gate.
 PLAYER_CAPTURE_RESULT_PATH = '/tmp/sofascore_player_capture_result.json'
 
-# #920 Phase 1: split LEAGUES into club (split_year) and tournament
+# Discovery and activation are deliberately separate: the registry contains
+# every tournament SofaScore exposes, while only entries with enabled=true and
+# a canonical_id may shape this DAG.  Keep this local to SofaScore — global
+# utils.config.LEAGUES remains authoritative for the other ingestion sources.
+def _load_active_sofascore_leagues() -> List[str]:
+    try:
+        catalog = SofaScoreCatalog.load()
+        leagues = list(catalog.enabled_competition_ids())
+    except CatalogError as exc:
+        raise AirflowException(
+            f"SofaScore registry is missing or invalid: {exc}"
+        ) from exc
+
+    if not leagues:
+        raise AirflowException(
+            "SofaScore registry has no usable active tournaments "
+            "(expected enabled=true with a non-empty canonical_id)"
+        )
+
+    # An activation must be complete across source and canonical metadata.
+    # Otherwise row-floor scaling and single-year routing would silently use
+    # club defaults (or fail only after a paid scrape had already started).
+    unusable: List[str] = []
+    for league in leagues:
+        try:
+            seasons = get_competition_seasons(league)
+        except KeyError:
+            unusable.append(f"{league!r} is absent from competitions.yaml")
+            continue
+        if not seasons:
+            unusable.append(f"{league!r} has no canonical seasons configured")
+            continue
+
+        try:
+            source_tournament = catalog.competition(league)
+        except CatalogError:
+            unusable.append(f"{league!r} has no SofaScore registry mapping")
+            continue
+        source_seasons = {
+            season.canonical_season
+            for season in source_tournament.seasons
+            if season.activatable and season.canonical_season is not None
+        }
+        configured_seasons = {str(season) for season in seasons}
+        if not source_seasons:
+            unusable.append(
+                f"{league!r} has no activatable SofaScore seasons"
+            )
+            continue
+        if not source_seasons & configured_seasons:
+            unusable.append(
+                f"{league!r} has no SofaScore season matching "
+                "competitions.yaml"
+            )
+            continue
+
+        if is_single_year_competition(league):
+            active_season = get_active_season(league)
+            target_season = (
+                str(active_season) if active_season is not None else None
+            )
+        else:
+            target_season = (
+                f"{CURRENT_SEASON % 100:02d}"
+                f"{(CURRENT_SEASON + 1) % 100:02d}"
+            )
+        if target_season is not None and target_season not in source_seasons:
+            unusable.append(
+                f"{league!r} scheduled season {target_season!r} is missing "
+                "from the SofaScore registry"
+            )
+    if unusable:
+        raise AirflowException(
+            "SofaScore registry contains unusable active tournaments: "
+            + "; ".join(unusable)
+        )
+    return leagues
+
+
+SOFASCORE_LEAGUES = _load_active_sofascore_leagues()
+
+
+# #920 Phase 1: split the active SofaScore registry scope into club
+# (split_year) and tournament
 # (single_year, e.g. INT-World Cup) leagues. Club leagues stay batched in one
 # call (they share the same club-formula season — no reason to fan them out).
 # Each tournament league needs its own dedicated single-league task, because
 # (a) the runner's #920 bridge requires a dedicated call to resolve its
 # active season correctly (a mixed call drops it), and (b) match_capture's
 # runner only ever reads leagues[0]. New tournaments onboard via
-# competitions.yaml + LEAGUES alone — no further DAG changes (#920 Phase 3).
-CLUB_LEAGUES = [lg for lg in LEAGUES if not is_single_year_competition(lg)]
-TOURNAMENT_LEAGUES = [lg for lg in LEAGUES if is_single_year_competition(lg)]
+# the registry activation flag alone — no further DAG changes.
+CLUB_LEAGUES = [
+    lg for lg in SOFASCORE_LEAGUES if not is_single_year_competition(lg)
+]
+TOURNAMENT_LEAGUES = [
+    lg for lg in SOFASCORE_LEAGUES if is_single_year_competition(lg)
+]
+
+# The consolidated schedule and weekly player branches are still club-shaped.
+# Surface a clear import error instead of failing later at CLUB_LEAGUES[0].
+if not CLUB_LEAGUES:
+    raise AirflowException(
+        "SofaScore registry has active tournaments, but none is a usable "
+        "split-year competition required by the club/player ingestion branch"
+    )
+
+# Preserve the historical EPL task ids/result paths even when another
+# split-year competition is activated ahead of it in the ID-sorted registry.
+_LEGACY_PRIMARY_CLUB = 'ENG-Premier League'
+PRIMARY_CLUB_LEAGUE = (
+    _LEGACY_PRIMARY_CLUB
+    if _LEGACY_PRIMARY_CLUB in CLUB_LEAGUES
+    else CLUB_LEAGUES[0]
+)
+CLUB_LEAGUES = [PRIMARY_CLUB_LEAGUE] + [
+    lg for lg in CLUB_LEAGUES if lg != PRIMARY_CLUB_LEAGUE
+]
 
 
 def _env_int(name: str):
@@ -120,6 +232,14 @@ def _summed_club_floors() -> Dict[str, int]:
     return {
         k: sum(_scale(u, b, lg) for lg in CLUB_LEAGUES)
         for k, (u, b) in _SS_FLOOR_BASES.items()
+    }
+
+
+def _competition_floors(league: str) -> Dict[str, int]:
+    """Per-competition floors for independently captured result files."""
+    return {
+        key: _scale(unit, base, league)
+        for key, (unit, base) in _SS_FLOOR_BASES.items()
     }
 
 
@@ -210,6 +330,7 @@ def validate_data(**context) -> Dict[str, Any]:
     # Minimum thresholds (#920 Phase 2: derived per competitions.yaml volumes,
     # not APL literals — see _SS_FLOOR_BASES).
     floors = _summed_club_floors()
+    capture_floors = _competition_floors(PRIMARY_CLUB_LEAGUE)
     if validation['summary']['schedule_rows'] < floors['schedule_rows']:
         validation['warnings'].append("Low schedule row count - possible scraping issue")
 
@@ -234,7 +355,7 @@ def validate_data(**context) -> Dict[str, Any]:
     # hard CF block.
     if not capture_noop and (
         validation['summary']['player_ratings_rows']
-        < floors['player_ratings_rows']
+        < capture_floors['player_ratings_rows']
     ):
         if validation['summary']['player_ratings_fallback']:
             validation['warnings'].append(
@@ -250,13 +371,13 @@ def validate_data(**context) -> Dict[str, Any]:
             validation['warnings'].append(
                 f"Low player_ratings row count: "
                 f"{validation['summary']['player_ratings_rows']} "
-                f"< {floors['player_ratings_rows']}"
+                f"< {capture_floors['player_ratings_rows']}"
             )
 
     # Shotmap: full APL season ≈ 380 matches × ~25 shots/match ≈ 9.5K rows.
     # WARN-only floor (issue #69; covers first few gameweeks too).
     if not capture_noop and (
-        validation['summary']['shotmap_rows'] < floors['shotmap_rows']
+        validation['summary']['shotmap_rows'] < capture_floors['shotmap_rows']
     ):
         if validation['summary']['shotmap_fallback']:
             validation['warnings'].append(
@@ -270,14 +391,14 @@ def validate_data(**context) -> Dict[str, Any]:
             validation['warnings'].append(
                 f"Low shotmap row count: "
                 f"{validation['summary']['shotmap_rows']} "
-                f"< {floors['shotmap_rows']}"
+                f"< {capture_floors['shotmap_rows']}"
             )
 
     # event_player_stats: full APL season ≈ 380 matches × ~25 played players
     # ≈ 9.5K rows. WARN-only floor (issue #69).
     if not capture_noop and (
         validation['summary']['event_player_stats_rows']
-        < floors['event_player_stats_rows']
+        < capture_floors['event_player_stats_rows']
     ):
         if validation['summary']['event_player_stats_fallback']:
             validation['warnings'].append(
@@ -291,13 +412,14 @@ def validate_data(**context) -> Dict[str, Any]:
             validation['warnings'].append(
                 f"Low event_player_stats row count: "
                 f"{validation['summary']['event_player_stats_rows']} "
-                f"< {floors['event_player_stats_rows']}"
+                f"< {capture_floors['event_player_stats_rows']}"
             )
 
     # match_stats: full APL season ≈ 380 matches × 3 periods × ~30 stats
     # ≈ 34K rows. WARN-only floor (issue #69).
     if not capture_noop and (
-        validation['summary']['match_stats_rows'] < floors['match_stats_rows']
+        validation['summary']['match_stats_rows']
+        < capture_floors['match_stats_rows']
     ):
         if validation['summary']['match_stats_fallback']:
             validation['warnings'].append(
@@ -311,13 +433,15 @@ def validate_data(**context) -> Dict[str, Any]:
             validation['warnings'].append(
                 f"Low match_stats row count: "
                 f"{validation['summary']['match_stats_rows']} "
-                f"< {floors['match_stats_rows']}"
+                f"< {capture_floors['match_stats_rows']}"
             )
 
     # venue (#753): one row per match → full APL season ≈ 380 rows. WARN-only
     # floor in line with shotmap. Was previously unvalidated — a
     # silently-empty venue capture never surfaced.
-    if not capture_noop and validation['summary']['venue_rows'] < floors['venue_rows']:
+    if not capture_noop and (
+        validation['summary']['venue_rows'] < capture_floors['venue_rows']
+    ):
         if validation['summary']['venue_fallback']:
             validation['warnings'].append(
                 f"venue R0.2B_FALLBACK: rows="
@@ -329,11 +453,50 @@ def validate_data(**context) -> Dict[str, Any]:
         else:
             validation['warnings'].append(
                 f"Low venue row count: "
-                f"{validation['summary']['venue_rows']} < {floors['venue_rows']}"
+                f"{validation['summary']['venue_rows']} "
+                f"< {capture_floors['venue_rows']}"
             )
 
     # player_season_stats + player_profile are validated by validate_player_data
     # (the gated weekly branch below), not here.
+
+    # Additional split-year competitions share the schedule snapshot but have
+    # independent match-capture tasks/result files. Validate each one against
+    # its own floor so the legacy primary result is neither over-counted nor
+    # allowed to hide a dead secondary capture.
+    for _club_league in CLUB_LEAGUES[1:]:
+        _slug = _league_slug(_club_league)
+        _club_floors = _competition_floors(_club_league)
+        _club_capture = _load_result(
+            f'/tmp/sofascore_match_capture_result_{_slug}.json', logger)
+        _club_summary: Dict[str, Any] = {}
+        if not _club_capture:
+            validation['warnings'].append(
+                f"{_club_league}: match_capture result file "
+                "missing/unreadable (runner died before writing?)"
+            )
+        elif (
+            not _club_capture.get('skipped')
+            and not _capture_noop(_club_capture)
+        ):
+            for err in _club_capture.get('errors') or []:
+                validation['warnings'].append(f"{_club_league}: {err}")
+            for key, field in (
+                ('player_ratings_rows', 'rows'),
+                ('shotmap_rows', 'shotmap_rows'),
+                ('event_player_stats_rows', 'eps_rows'),
+                ('match_stats_rows', 'match_stats_rows'),
+                ('venue_rows', 'venue_rows'),
+            ):
+                rows = _club_capture.get(field, 0)
+                _club_summary[key] = rows
+                if rows < _club_floors[key]:
+                    validation['warnings'].append(
+                        f"{_club_league}: low {key}: "
+                        f"{rows} < {_club_floors[key]}"
+                    )
+        if _club_summary:
+            validation['summary'][f'club_{_slug}'] = _club_summary
 
     # #920 Phase 2: tournament legs — the Phase-1 fan-out writes one result
     # file per single_year league; until now nothing read them, so a dead
@@ -687,7 +850,7 @@ with DAG(
     tags=DAG_TAGS.get('sofascore', ['scraping', 'sofascore', 'bronze']),
     max_active_runs=1,
     params={
-        'leagues': LEAGUES,
+        'leagues': SOFASCORE_LEAGUES,
         # UI-configurable season for the 10-season backfill (#711, epic #708).
         # Default = CURRENT_SEASON so the daily scheduled run is unchanged;
         # override via "Trigger DAG w/ config" to ingest a past season. The
@@ -792,9 +955,9 @@ python dags/scripts/run_sofascore_scraper.py \\
     # as the club task above; the runner itself resolves it to the real
     # tournament year, or cleanly no-ops (exit 0) outside the tournament
     # window — so this task stays in the graph year-round as a cheap no-op
-    # rather than appearing/disappearing with the calendar. Onboarding the
-    # next tournament (#920 Phase 3) is a competitions.yaml + LEAGUES entry,
-    # no DAG changes.
+    # rather than appearing/disappearing with the calendar. Once canonical
+    # metadata is ready, onboarding the next tournament is an activation flag
+    # change in the SofaScore registry — no global league-list change.
     tournament_schedule_tasks = {}
     for _t_league in TOURNAMENT_LEAGUES:
         _t_slug = _league_slug(_t_league)
@@ -823,23 +986,29 @@ python dags/scripts/run_sofascore_scraper.py \\
     # back to capture discovery when empty). Exit 2 = graceful R0.2B_FALLBACK
     # (soft success so validate_data runs); exit 3 = completeness-guard refusal
     # (propagates as a real failure).
-    # #920 Phase 1: one match_capture task per league in LEAGUES (club +
+    # #920 Phase 1: one match_capture task per active registry league (club +
     # every tournament) — the runner only ever reads leagues[0]
     # (_run_match_capture), so a single shared task could never cover more
     # than one league regardless of how many are configured. The club
     # league keeps the original task_id/output path (MATCH_CAPTURE_RESULT_PATH)
     # so validate_data()'s club-calibrated row floors and
-    # TestSeasonRenderedFromParams stay byte-identical; tournament leagues
-    # get their own task + output path, not read by validate_data()
+    # TestSeasonRenderedFromParams stay byte-identical; every other league
+    # gets its own task + output path, while tournament result files are read
+    # by validate_data()
     # (per-competition floors are #920 Phase 2, out of scope here).
     match_capture_tasks = {}
-    for _league in LEAGUES:
-        _is_tournament = _league in TOURNAMENT_LEAGUES
+    for _league in SOFASCORE_LEAGUES:
+        _is_primary_club = _league == PRIMARY_CLUB_LEAGUE
         _mc_slug = _league_slug(_league)
-        _mc_task_id = f'scrape_match_capture_{_mc_slug}' if _is_tournament else 'scrape_match_capture'
+        _mc_task_id = (
+            'scrape_match_capture'
+            if _is_primary_club
+            else f'scrape_match_capture_{_mc_slug}'
+        )
         _mc_output = (
-            f'/tmp/sofascore_match_capture_result_{_mc_slug}.json'
-            if _is_tournament else MATCH_CAPTURE_RESULT_PATH
+            MATCH_CAPTURE_RESULT_PATH
+            if _is_primary_club
+            else f'/tmp/sofascore_match_capture_result_{_mc_slug}.json'
         )
         match_capture_tasks[_league] = BashOperator(
             task_id=_mc_task_id,
@@ -869,7 +1038,7 @@ exit $rc
     # Kept as a plain name for the (unchanged) club-only downstream wiring
     # below (player_capture is explicitly out of #920 Phase 1 scope and
     # stays keyed off the club league only, as before).
-    scrape_match_capture_task = match_capture_tasks[CLUB_LEAGUES[0]]
+    scrape_match_capture_task = match_capture_tasks[PRIMARY_CLUB_LEAGUE]
 
     # #751 PR2: shotmap (#22) + match_stats (#25) no longer have their own tls
     # tasks — both come from exact API calls in the consolidated capture above.
@@ -907,7 +1076,7 @@ cd /opt/airflow && \\
 rm -f {PLAYER_CAPTURE_RESULT_PATH} && \\
 python dags/scripts/run_sofascore_scraper.py \\
     --entity player_capture \\
-    --league "{CLUB_LEAGUES[0]}" \\
+    --league "{PRIMARY_CLUB_LEAGUE}" \\
     --season {{{{ params.season }}}} \\
     {_limit_arg(PLAYER_CAPTURE_LIMIT)} \\
     --output {PLAYER_CAPTURE_RESULT_PATH}
@@ -938,9 +1107,13 @@ exit $rc
         trigger_rule='all_done',
     )
 
-    # Matches chain (daily): schedule → match_capture → validate → freshness.
-    scrape_data_task >> scrape_match_capture_task
-    scrape_match_capture_task >> validate_data_task >> validate_bronze_freshness_task
+    # Matches chain (daily): one club schedule batch feeds one dedicated
+    # match-capture task per active split-year competition. The legacy primary
+    # keeps its original task id/result path.
+    for _club_league in CLUB_LEAGUES:
+        scrape_data_task >> match_capture_tasks[_club_league]
+        match_capture_tasks[_club_league] >> validate_data_task
+    validate_data_task >> validate_bronze_freshness_task
 
     # #920 Phase 1: same chain per tournament league, in parallel with the
     # club chain above — each tournament's own schedule task feeds its own

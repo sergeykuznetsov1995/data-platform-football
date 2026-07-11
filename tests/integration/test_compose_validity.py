@@ -148,6 +148,33 @@ class TestComposeFile:
         )
 
 
+@pytest.mark.unit
+class TestSofaScoreRegistryMount:
+    """Airflow consumes activation state but must never mutate the registry."""
+
+    @staticmethod
+    def _airflow_services() -> list[dict]:
+        with COMPOSE_FILE.open("r", encoding="utf-8") as fh:
+            services = yaml.safe_load(fh)["services"]
+        return [
+            services[name]
+            for name in ("airflow-init", "airflow-scheduler", "airflow-webserver")
+        ]
+
+    def test_registry_path_is_explicit_in_all_airflow_services(self):
+        for service in self._airflow_services():
+            assert service["environment"]["SOFASCORE_REGISTRY_PATH"] == (
+                "/opt/airflow/configs/sofascore/tournaments.json"
+            )
+
+    def test_registry_directory_is_mounted_read_only(self):
+        for service in self._airflow_services():
+            assert (
+                "./configs/sofascore:/opt/airflow/configs/sofascore:ro"
+                in service["volumes"]
+            )
+
+
 # ---------------------------------------------------------------------------
 # 2. Superset datasources YAML
 # ---------------------------------------------------------------------------
