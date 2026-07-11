@@ -143,8 +143,10 @@ SELECT
     TRY_CAST(TRIM(SPLIT_PART(REGEXP_REPLACE(sch.score, '\(\d+\)\s*', ''), CHR(8211), 2)) AS INTEGER) AS away_score,
     -- #913 Phase 3 (WC knockout): extract penalty shoot-out scores when present in score string.
     -- NULL when regular time or extra time decided the match. Used by dim_match + fct_team_match.points.
-    TRY_CAST(REGEXP_EXTRACT(sch.score, '\((\d+)\)[^0-9]*\((\d+)\)', 1) AS INTEGER) AS home_penalty,
-    TRY_CAST(REGEXP_EXTRACT(sch.score, '\((\d+)\)[^0-9]*\((\d+)\)', 2) AS INTEGER) AS away_penalty,
+    -- The regulation score sits BETWEEN the shoot-out counts ('(3) 1–1 (4)'), so the gap
+    -- pattern must admit digits — [^(]* — or the regex never matches (WC1 Находка 1).
+    TRY_CAST(REGEXP_EXTRACT(sch.score, '\((\d+)\)[^(]*\((\d+)\)', 1) AS INTEGER) AS home_penalty,
+    TRY_CAST(REGEXP_EXTRACT(sch.score, '\((\d+)\)[^(]*\((\d+)\)', 2) AS INTEGER) AS away_penalty,
     sch.notes,
     LOWER(COALESCE(sch.notes, '')) LIKE 'match awarded to%'            AS is_awarded,
     TRY_CAST(TRY_CAST(sch.attendance AS DOUBLE) AS INTEGER) AS attendance,  -- float-strings ('34977.0') from the pandas-parsed bronze schedule

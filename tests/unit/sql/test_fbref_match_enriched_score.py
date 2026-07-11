@@ -237,6 +237,17 @@ class TestScoreParsing:
         assert (out["bbbbbbbb"]["home_score"], out["bbbbbbbb"]["away_score"]) == (0, 3)
         assert (out["cccccccc"]["home_score"], out["cccccccc"]["away_score"]) == (1, 1)
 
+    def test_shootout_counts_are_extracted_as_penalties(self, duck_conn):
+        """WC1 Находка 1: the regulation score sits BETWEEN the shoot-out counts
+        ('(4) 1–1 (5)'), so a digit-free gap pattern never matches — every
+        shoot-out silently lost its penalty score."""
+        _seed(duck_conn)
+        out = _run_silver(duck_conn)
+        assert (out["bbbbbbbb"]["home_penalty"], out["bbbbbbbb"]["away_penalty"]) == (5, 6)
+        assert (out["cccccccc"]["home_penalty"], out["cccccccc"]["away_penalty"]) == (4, 5)
+        assert out["aaaaaaaa"]["home_penalty"] is None  # plain score
+        assert out["ed6efcb0"]["home_penalty"] is None  # awarded, no shoot-out
+
     def test_awarded_match_keeps_official_score_and_is_flagged(self, duck_conn):
         """Sassuolo won 2–1 on the pitch; the official result is 0–3."""
         _seed(duck_conn)
