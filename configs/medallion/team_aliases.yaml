@@ -2855,7 +2855,7 @@ teams:
     team_type: "national"
     aliases:
       _generic: ["Bosnia and Herzegovina", "Bosnia"]
-      fbref: ["Bosnia and Herzegovina", "ba Bosnia–Herz", "Bosnia–Herz ba"]
+      fbref: ["Bosnia and Herzegovina", "ba Bosnia–Herz", "Bosnia–Herz ba", "Bosnia–Herz"]
     competition_scope: ["INT-World Cup"]
 
   - canonical_name: "Croatia"
