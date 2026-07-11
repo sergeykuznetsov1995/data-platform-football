@@ -127,12 +127,10 @@ MIN_ROW_THRESHOLDS: Dict[str, int] = {
     # validate_table() falls back to 0 and silently passes an empty schedule
     # scrape (root cause of #102). schedule scales with WHOSCORED_LEAGUES
     # (every league is scraped each run, replace semantics); events /
-    # player_profile floors stay 1-league-sized until the multi-league
-    # backfill lands — they are append-only wipe-floors, and multiplying them
-    # now would false-fail while the new leagues ramp up (#708).
+    # events stays a whole-history wipe floor; profiles are now guarded by the
+    # version/manifest contract in dag_ingest_whoscored.
     'whoscored_schedule': 340 * len(WHOSCORED_LEAGUES),  # 380 fixtures/season/league - margin
     'whoscored_events': 500_000,  # ~540k events/season - 7% margin; raise after #708 backfill
-    'whoscored_player_profile': 300,  # ~531 players/season/league (#37); raise after #708 backfill
     # ESPN / Understat / SoFIFA (issue #466): same silent-fail class as #102 —
     # read_* swallowed errors and runners exited 0. Floors calibrated against
     # live Bronze counts on 2026-06-11.

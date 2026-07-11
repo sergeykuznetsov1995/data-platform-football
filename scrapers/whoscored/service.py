@@ -34,6 +34,8 @@ from .raw_store import (
 from .repository import (
     ManifestFailure,
     MatchCommit,
+    PreviewCommit,
+    PreviewFailure,
     WhoScoredRepository,
 )
 from .transport import (
@@ -44,6 +46,9 @@ from .transport import (
     WhoScoredTransport,
     WhoScoredTransportError,
 )
+
+
+ACTIVE_SCHEDULE_CACHE_TTL = timedelta(hours=6)
 
 
 @dataclass
@@ -174,14 +179,23 @@ class WhoScoredIngestService:
         validator: Callable[[TransportResponse], Optional[bool]],
         content_type: str = "text/html",
         allow_cache: bool = True,
+        cache_ttl: Optional[timedelta] = None,
     ) -> tuple[TransportResponse, str]:
+        cache_is_fresh = (
+            allow_cache
+            and cache_ttl is not None
+            and self.raw_store.is_fresh(target, max_age=cache_ttl)
+        )
+        cache_load_allowed = allow_cache and (
+            cache_ttl is None or cache_is_fresh
+        )
         adapter = _TargetRawCache(
             self.raw_store,
             target,
-            allow_load=allow_cache,
+            allow_load=cache_load_allowed,
             content_type=content_type,
         )
-        cache_present = allow_cache and self.raw_store.has(target)
+        cache_present = cache_load_allowed and self.raw_store.has(target)
         previous = self.transport.raw_cache
         self.transport.raw_cache = adapter
         try:
@@ -192,6 +206,14 @@ class WhoScoredIngestService:
                 cache_key=target.target_id,
                 validator=validator,
             )
+        except WhoScoredTransportError as exc:
+            # Validator/content failures are persisted by the transport before
+            # they are raised. Carry that raw identity to the failure manifest
+            # so a later parser version can replay it without network traffic.
+            if adapter.record is not None:
+                exc.payload_sha256 = adapter.record.content_hash
+                exc.raw_uri = adapter.raw_uri
+            raise
         finally:
             self.transport.raw_cache = previous
         return response, adapter.raw_uri
@@ -238,7 +260,13 @@ class WhoScoredIngestService:
             find_source_season_id(response.text, self.scope)
             return True
 
-        response, _ = self._fetch(target, validator=validate, allow_cache=True)
+        active = self.catalog_season.end is None or self.catalog_season.end >= date.today()
+        response, _ = self._fetch(
+            target,
+            validator=validate,
+            allow_cache=True,
+            cache_ttl=ACTIVE_SCHEDULE_CACHE_TTL if active else None,
+        )
         return find_source_season_id(response.text, self.scope)
 
     def _bound_paid_fallback(self, eligible_urls: int) -> None:
@@ -261,6 +289,11 @@ class WhoScoredIngestService:
 
     def sync_schedule(self) -> EntityResult:
         result = EntityResult("schedule", self.scope.spec, attempted=1)
+        # Discovery fans out from one season page into calendars/months. A
+        # broad Cloudflare incident must not turn that fan-out into the
+        # transport default of twenty paid URLs; three distinct fallbacks are
+        # the task-wide ceiling, and the proxy filter enforces bytes as well.
+        self._bound_paid_fallback(1)
         try:
             source_season_id = self._source_season_id()
             today = date.today()
@@ -288,9 +321,10 @@ class WhoScoredIngestService:
                 season_target,
                 validator=validate_stages,
                 # Active tournament pages can gain knockout/group stages.
-                # Replaying the first-ever raw copy forever would make those
-                # matches undiscoverable; historical seasons remain offline.
-                allow_cache=not active,
+                # A short TTL keeps same-day retries offline without freezing
+                # discovery; historical seasons remain immutable raw replay.
+                allow_cache=True,
+                cache_ttl=ACTIVE_SCHEDULE_CACHE_TTL if active else None,
             )
             stages = parse_season_stages(
                 season_response.text,
@@ -322,7 +356,8 @@ class WhoScoredIngestService:
                 calendar_response, _ = self._fetch(
                     calendar_target,
                     validator=validate_calendar,
-                    allow_cache=not active,
+                    allow_cache=True,
+                    cache_ttl=ACTIVE_SCHEDULE_CACHE_TTL if active else None,
                 )
                 for month in parse_calendar_months(calendar_response.text):
                     month_target = schedule_month_target(stage_id, month.year, month.month)
@@ -330,9 +365,9 @@ class WhoScoredIngestService:
                         next_month = date(month.year + 1, 1, 1)
                     else:
                         next_month = date(month.year, month.month + 1, 1)
-                    # A month is immutable enough to replay from raw storage
-                    # only after a grace period for postponed games and score
-                    # corrections. Current/future months still refresh daily.
+                    # A month is immutable after a grace period for postponed
+                    # games and corrections. Mutable months use the same short
+                    # TTL, so retries are offline but changes arrive same-day.
                     closed_month = next_month + timedelta(days=7) <= today
 
                     def validate_month(response: TransportResponse) -> bool:
@@ -348,7 +383,12 @@ class WhoScoredIngestService:
                         month_target,
                         validator=validate_month,
                         content_type="application/json",
-                        allow_cache=not active or closed_month,
+                        allow_cache=True,
+                        cache_ttl=(
+                            ACTIVE_SCHEDULE_CACHE_TTL
+                            if active and not closed_month
+                            else None
+                        ),
                     )
                     parsed = parse_schedule_json(
                         month_response.content,
@@ -408,6 +448,8 @@ class WhoScoredIngestService:
         self._bound_paid_fallback(len(candidates))
         for candidate in candidates:
             target = match_page_target(candidate.game_id)
+            response: Optional[TransportResponse] = None
+            raw_uri: Optional[str] = None
 
             def validate(response: TransportResponse) -> bool:
                 parse_match_html(
@@ -472,7 +514,14 @@ class WhoScoredIngestService:
                     result.counts.get("lineups", 0) + parsed.lineups.row_count
                 )
             except WhoScoredTransportError as exc:
-                state = "retryable" if exc.retryable or exc.status_code == 404 else "terminal"
+                if exc.kind is FailureKind.CONTENT:
+                    state = "parse_failed"
+                else:
+                    state = (
+                        "retryable"
+                        if exc.retryable or exc.status_code == 404
+                        else "terminal"
+                    )
                 retry_after = (
                     datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(hours=6)
                     if state == "retryable"
@@ -495,10 +544,19 @@ class WhoScoredIngestService:
                             else "none"
                         ),
                         http_status=exc.status_code,
+                        payload_sha256=getattr(exc, "payload_sha256", None),
+                        raw_uri=getattr(exc, "raw_uri", None),
                     )
                 )
-                target_list = result.retryable if state == "retryable" else result.terminal
-                target_list.append(str(candidate.game_id))
+                if state == "parse_failed":
+                    result.errors.append(f"game {candidate.game_id}: {exc}")
+                else:
+                    target_list = (
+                        result.retryable
+                        if state == "retryable"
+                        else result.terminal
+                    )
+                    target_list.append(str(candidate.game_id))
             except WhoScoredParseError as exc:
                 self.repository.record_failure(
                     ManifestFailure(
@@ -510,6 +568,34 @@ class WhoScoredIngestService:
                         error=str(exc)[:4000],
                         retry_after=None,
                         attempt_no=1,
+                        payload_sha256=(
+                            response.sha256 if response is not None else None
+                        ),
+                        raw_uri=raw_uri,
+                        transport_mode=(
+                            response.route.value if response is not None else "none"
+                        ),
+                        proxy_mode=(
+                            "filtered_paid"
+                            if response is not None
+                            and response.route.value.startswith("paid_")
+                            else "none"
+                        ),
+                        http_status=(
+                            response.status_code if response is not None else None
+                        ),
+                        direct_bytes=(
+                            response.wire_bytes
+                            if response is not None
+                            and not response.route.value.startswith("paid_")
+                            else 0
+                        ),
+                        paid_bytes=(
+                            response.wire_bytes
+                            if response is not None
+                            and response.route.value.startswith("paid_")
+                            else 0
+                        ),
                     )
                 )
                 result.errors.append(f"game {candidate.game_id}: {exc}")
@@ -529,6 +615,7 @@ class WhoScoredIngestService:
 
     def sync_previews(self, *, limit: Optional[int] = None) -> EntityResult:
         result = EntityResult("previews", self.scope.spec)
+        self.repository.ensure_schema()
         candidates = self.repository.list_preview_candidates(
             self.scope.competition_id, self.scope.season_id, limit=limit
         )
@@ -549,9 +636,94 @@ class WhoScoredIngestService:
                 return True
 
             try:
-                response, _ = self._fetch(
-                    target, validator=validate, allow_cache=False
+                # Parser-version refreshes and due retries replay raw first;
+                # a cache miss naturally reaches the source. Only a cadence
+                # refresh after a successful snapshot bypasses that object so
+                # mutable injury news is actually refreshed.
+                response, raw_uri = self._fetch(
+                    target,
+                    validator=validate,
+                    allow_cache=not bool(candidate["force_refresh"]),
                 )
+            except WhoScoredTransportError as exc:
+                if exc.kind is FailureKind.CONTENT:
+                    state = "parse_failed"
+                else:
+                    retryable_kinds = {
+                        FailureKind.BUDGET,
+                        FailureKind.BROWSER,
+                        FailureKind.CACHE,
+                        FailureKind.CLOUDFLARE,
+                        FailureKind.CONFIG,
+                        FailureKind.PROXY,
+                        FailureKind.TIMEOUT,
+                    }
+                    state = (
+                        "retryable"
+                        if (
+                            exc.retryable
+                            or exc.kind in retryable_kinds
+                            or exc.status_code == 404
+                        )
+                        else "terminal"
+                    )
+                attempt_no = int(candidate["attempt_no"])
+                retry_after = None
+                if state == "retryable":
+                    delay_hours = min(6 * (2 ** min(attempt_no - 1, 3)), 48)
+                    retry_after = (
+                        datetime.now(timezone.utc).replace(tzinfo=None)
+                        + timedelta(hours=delay_hours)
+                    )
+                try:
+                    self.repository.record_preview_failure(
+                        PreviewFailure(
+                            game_id=int(candidate["game_id"]),
+                            league=self.scope.competition_id,
+                            season=self.scope.season_id,
+                            game=str(candidate["game"]),
+                            kickoff=candidate["date"],
+                            state=state,
+                            failure_code=exc.kind.value,
+                            error=str(exc),
+                            retry_after=retry_after,
+                            attempt_no=attempt_no,
+                            transport_mode=(
+                                exc.route.value if exc.route else "none"
+                            ),
+                            proxy_mode=(
+                                "filtered_paid"
+                                if exc.route
+                                and exc.route.value.startswith("paid_")
+                                else "none"
+                            ),
+                            http_status=exc.status_code,
+                            payload_sha256=getattr(
+                                exc, "payload_sha256", None
+                            ),
+                            raw_uri=getattr(exc, "raw_uri", None),
+                        )
+                    )
+                except Exception as manifest_exc:
+                    result.errors.append(
+                        f"preview {candidate['game_id']} failure manifest: "
+                        f"{type(manifest_exc).__name__}: {manifest_exc}"
+                    )
+                else:
+                    if state == "retryable":
+                        result.retryable.append(str(candidate["game_id"]))
+                    elif state == "terminal":
+                        result.terminal.append(str(candidate["game_id"]))
+                    else:
+                        # Parser/content drift must fail visibly. Transport
+                        # has already persisted the raw payload and never
+                        # escalates validator failures to paid proxy.
+                        result.errors.append(
+                            f"preview {candidate['game_id']}: {exc}"
+                        )
+                continue
+
+            try:
                 parsed = parse_preview_html(
                     response.text,
                     scope=self.scope,
@@ -560,27 +732,125 @@ class WhoScoredIngestService:
                     home_team=candidate["home_team"],
                     away_team=candidate["away_team"],
                 )
-                self.repository.replace_preview_game(
-                    league=self.scope.competition_id,
-                    season=self.scope.season_id,
-                    game_id=candidate["game_id"],
-                    rows=parsed.rows,
+                paid_route = response.route.value.startswith("paid_")
+                self.repository.commit_preview(
+                    PreviewCommit(
+                        game_id=int(candidate["game_id"]),
+                        league=self.scope.competition_id,
+                        season=self.scope.season_id,
+                        game=str(candidate["game"]),
+                        kickoff=candidate["date"],
+                        payload_sha256=response.sha256,
+                        raw_uri=raw_uri,
+                        missing_players=parsed.rows,
+                        transport_mode=response.route.value,
+                        proxy_mode="filtered_paid" if paid_route else "none",
+                        http_status=response.status_code,
+                        direct_bytes=0 if paid_route else response.wire_bytes,
+                        paid_bytes=response.wire_bytes if paid_route else 0,
+                        attempt_no=int(candidate["attempt_no"]),
+                    )
                 )
                 result.succeeded += 1
                 result.counts["missing_players"] = (
                     result.counts.get("missing_players", 0) + parsed.row_count
                 )
+            except WhoScoredParseError as exc:
+                paid_route = response.route.value.startswith("paid_")
+                try:
+                    self.repository.record_preview_failure(
+                        PreviewFailure(
+                            game_id=int(candidate["game_id"]),
+                            league=self.scope.competition_id,
+                            season=self.scope.season_id,
+                            game=str(candidate["game"]),
+                            kickoff=candidate["date"],
+                            state="parse_failed",
+                            failure_code=FailureKind.CONTENT.value,
+                            error=str(exc),
+                            retry_after=None,
+                            attempt_no=int(candidate["attempt_no"]),
+                            payload_sha256=response.sha256,
+                            raw_uri=raw_uri,
+                            transport_mode=response.route.value,
+                            proxy_mode="filtered_paid" if paid_route else "none",
+                            http_status=response.status_code,
+                            direct_bytes=0 if paid_route else response.wire_bytes,
+                            paid_bytes=response.wire_bytes if paid_route else 0,
+                        )
+                    )
+                except Exception as manifest_exc:
+                    result.errors.append(
+                        f"preview {candidate['game_id']} failure manifest: "
+                        f"{type(manifest_exc).__name__}: {manifest_exc}"
+                    )
+                result.errors.append(f"preview {candidate['game_id']}: {exc}")
             except Exception as exc:
                 result.errors.append(
                     f"preview {candidate['game_id']}: {type(exc).__name__}: {exc}"
                 )
         if candidates:
-            result.tables.append("iceberg.bronze.whoscored_missing_players")
+            result.tables.extend(
+                [
+                    "iceberg.bronze.whoscored_missing_players",
+                    "iceberg.bronze.whoscored_preview_ingest_manifest",
+                ]
+            )
         return result
 
-    def sync_profiles(self, *, limit: int = 200) -> EntityResult:
-        result = EntityResult("profiles", self.scope.spec)
-        player_ids = self.repository.list_profile_candidates(limit=limit)
+    def _profile_candidate_scopes(
+        self,
+        selectors: Optional[Iterable[CatalogSeason | WhoScoredScope | str]],
+    ) -> tuple[WhoScoredScope, ...]:
+        """Resolve and deduplicate the roster scopes for one global profile run."""
+        raw_selectors = (self.scope,) if selectors is None else tuple(selectors)
+        resolved: list[WhoScoredScope] = []
+        seen: set[str] = set()
+        for selector in raw_selectors:
+            if isinstance(selector, CatalogSeason):
+                configured = self.catalog.resolve_scope(
+                    selector.scope.competition_id, selector.scope.season_id
+                )
+            elif isinstance(selector, WhoScoredScope):
+                configured = self.catalog.resolve_scope(
+                    selector.competition_id, selector.season_id
+                )
+            elif isinstance(selector, str):
+                configured = self.catalog.parse_scope_spec(selector)
+            else:
+                raise TypeError(
+                    "profile candidate scopes must be catalog scopes or canonical specs"
+                )
+            competition = self.catalog.competition(
+                configured.scope.competition_id
+            )
+            if not competition.whoscored_enabled:
+                raise ValueError(
+                    f"WhoScored is not enabled for {configured.scope.competition_id}"
+                )
+            if configured.scope.spec not in seen:
+                seen.add(configured.scope.spec)
+                resolved.append(configured.scope)
+        if not resolved:
+            raise ValueError("profile ingestion requires at least one candidate scope")
+        return tuple(resolved)
+
+    def sync_profiles(
+        self,
+        *,
+        limit: int = 200,
+        candidate_scopes: Optional[
+            Iterable[CatalogSeason | WhoScoredScope | str]
+        ] = None,
+    ) -> EntityResult:
+        scopes = self._profile_candidate_scopes(candidate_scopes)
+        result = EntityResult(
+            "profiles", ",".join(scope.spec for scope in scopes)
+        )
+        player_ids = self.repository.list_profile_candidates(
+            scopes=scopes,
+            limit=limit,
+        )
         result.attempted = len(player_ids)
         self._bound_paid_fallback(len(player_ids))
         for player_id in player_ids:
@@ -615,11 +885,14 @@ class WhoScoredIngestService:
                     FailureKind.PROXY,
                     FailureKind.TIMEOUT,
                 }
-                state = (
-                    "retryable"
-                    if exc.retryable or exc.kind in retryable_kinds
-                    else "terminal"
-                )
+                if exc.kind is FailureKind.CONTENT:
+                    state = "parse_failed"
+                else:
+                    state = (
+                        "retryable"
+                        if exc.retryable or exc.kind in retryable_kinds
+                        else "terminal"
+                    )
                 retry_after = (
                     datetime.now(timezone.utc).replace(tzinfo=None)
                     + timedelta(hours=24)
@@ -640,6 +913,8 @@ class WhoScoredIngestService:
                             else "none"
                         ),
                         http_status=exc.status_code,
+                        payload_sha256=getattr(exc, "payload_sha256", None),
+                        raw_uri=getattr(exc, "raw_uri", None),
                     )
                 except Exception as manifest_exc:
                     result.errors.append(
@@ -647,10 +922,15 @@ class WhoScoredIngestService:
                         f"{type(manifest_exc).__name__}: {manifest_exc}"
                     )
                 else:
-                    target_list = (
-                        result.retryable if state == "retryable" else result.terminal
-                    )
-                    target_list.append(str(player_id))
+                    if state == "parse_failed":
+                        result.errors.append(f"profile {player_id}: {exc}")
+                    else:
+                        target_list = (
+                            result.retryable
+                            if state == "retryable"
+                            else result.terminal
+                        )
+                        target_list.append(str(player_id))
                 continue
 
             try:
@@ -665,7 +945,7 @@ class WhoScoredIngestService:
                 try:
                     self.repository.record_profile_failure(
                         player_id=player_id,
-                        state="terminal",
+                        state="parse_failed",
                         failure_code=FailureKind.CONTENT.value,
                         error=str(exc),
                         retry_after=None,
@@ -683,7 +963,7 @@ class WhoScoredIngestService:
                         f"{type(manifest_exc).__name__}: {manifest_exc}"
                     )
                 else:
-                    result.terminal.append(str(player_id))
+                    result.errors.append(f"profile {player_id}: {exc}")
                 continue
 
             try:

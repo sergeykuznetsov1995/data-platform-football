@@ -23,7 +23,7 @@ Main Scrapers:
   schedule (nodriver + cf-verify Cloudflare Turnstile bypass).
 - FotMobScraper: For FotMob data (handles session cookies via Selenium)
 - MatchHistoryScraper: For football-data.co.uk (with Selenium fallback)
-- WhoScoredScraper: For WhoScored data (bypasses Cloudflare)
+- WhoScoredIngestService: Direct-first, raw-backed WhoScored ingestion
 
 Note (Apr 2026): SoccerdataFBrefScraper was removed — curl_cffi cannot bypass
 Cloudflare Turnstile, so the scraper was non-functional in production.
@@ -35,7 +35,7 @@ from scrapers.fbref import FBrefScraper
 from scrapers.nodriver_fbref import NodriverFBrefScraper
 from scrapers.fotmob import FotMobScraper
 from scrapers.matchhistory import MatchHistoryScraper
-from scrapers.whoscored import WhoScoredScraper
+from scrapers.whoscored import WhoScoredIngestService
 
 __all__ = [
     # Base classes
@@ -48,7 +48,7 @@ __all__ = [
     'NodriverFBrefScraper',
     'FotMobScraper',
     'MatchHistoryScraper',
-    'WhoScoredScraper',
+    'WhoScoredIngestService',
 ]
 
 __version__ = '0.1.0'

@@ -4,11 +4,11 @@
 table:
   fullyQualifiedName: trino_iceberg.iceberg.bronze.whoscored_events
   description: |
-    Сырые Opta-события матчей из WhoScored. В отличие от прочих whoscored-таблиц
-    парсится не soccerdata, а кастомным разбором matchCentreData JSON через
-    FlareSolverr (events_fetcher.parse_matchcentre_to_events_df). Grain — один
-    row на событие (~1500-2000 на матч). Несёт тип/исход события, координаты на
-    поле (шкала 0-100) и qualifiers — основу SPADL-разметки в Silver.
+    Append-only Opta-события матчей из WhoScored, разобранные строгим parser v2
+    из matchCentreData. Ответ сначала сохраняется в content-addressed raw store;
+    payload rows становятся видимы через whoscored_events_current только после
+    успешного match manifest commit. Grain — одно событие (~1500-2000 на матч).
+    Несёт тип/исход события, координаты 0-100 и qualifiers для SPADL в Silver.
     Партиционирование ['league','season'].
   tags:
     - Tier.Bronze

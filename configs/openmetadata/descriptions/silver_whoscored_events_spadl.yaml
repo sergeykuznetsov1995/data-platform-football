@@ -5,7 +5,7 @@ table:
   fullyQualifiedName: trino_iceberg.iceberg.silver.whoscored_events_spadl
   description: |
     Событийный поток WhoScored, нормализованный в каноническую SPADL-форму —
-    один row на (match_id, event_id). Источник: bronze.whoscored_events.
+    один row на (match_id, event_id). Источник: bronze.whoscored_events_current.
     Каждый сырой Opta-тип маппится в 25-значный SPADL-словарь действий
     (22 SPADL + проприетарные 'ball_recovery'/'own_goal' + 'unknown') с qualifier-driven
     роутингом пасов (corner/freekick/cross/throw_in) и под-типизацией ударов

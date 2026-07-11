@@ -21,6 +21,45 @@ def _import_silver_tasks():
     return mod
 
 
+STAGED_SOURCE_VERSION_SQL = (
+    "SELECT league, season, game_id, batch_id "
+    "FROM iceberg.bronze.whoscored_match_ingest_latest_success "
+    "ORDER BY league, season, game_id, batch_id"
+)
+STAGED_SOURCE_VERSION = [
+    ("ENG-Premier League", "2526", 101, "batch-a"),
+    ("ESP-La Liga", "2526", 202, "batch-b"),
+]
+
+
+class TestGetTrinoConnection:
+    def test_merges_bounded_writer_session_properties(self, monkeypatch):
+        mod = _import_silver_tasks()
+        monkeypatch.delenv('TRINO_PASSWORD', raising=False)
+        connection = MagicMock()
+
+        with patch.object(
+            mod.trino_lib.dbapi,
+            'connect',
+            return_value=connection,
+        ) as connect:
+            result = mod._get_trino_connection(
+                host='trino',
+                port=8080,
+                session_properties={
+                    'task_concurrency': '4',
+                    'redistribute_writes': 'false',
+                },
+            )
+
+        assert result is connection
+        assert connect.call_args.kwargs['session_properties'] == {
+            'enable_dynamic_filtering': 'false',
+            'task_concurrency': '4',
+            'redistribute_writes': 'false',
+        }
+
+
 class TestResolveSqlPath:
     """Tests for _resolve_sql_path helper."""
 
@@ -315,6 +354,307 @@ class TestRunSilverTransform:
 
         executed = [c[0][0] for c in mock_cursor.execute.call_args_list]
         assert not any(s.startswith("DROP TABLE") for s in executed)
+
+
+class TestRunSilverTransformPartitionStaged:
+    """Bounded-scope staging runner for the 28M-row SPADL rebuild."""
+
+    def test_scopes_windows_then_atomically_replaces_live(self, tmp_path):
+        mod = _import_silver_tasks()
+        sql_file = tmp_path / "spadl.sql"
+        sql_file.write_text(
+            "SELECT league, season, game_id, "
+            "ROW_NUMBER() OVER (PARTITION BY league, season, game_id "
+            "ORDER BY minute) AS event_seq "
+            "FROM iceberg.bronze.whoscored_events_current"
+        )
+        conn = MagicMock()
+        statements = []
+
+        def fake_execute(_conn, sql, fetch=False):
+            statements.append(sql)
+            if sql == STAGED_SOURCE_VERSION_SQL:
+                return list(STAGED_SOURCE_VERSION)
+            if sql.startswith("SELECT league, season, COUNT(*) AS __row_count"):
+                return [
+                    ("ENG-Premier League", "2526", 2),
+                    ("ESP-La Liga", "2526", 1),
+                ]
+            if sql == "SELECT COUNT(*) FROM iceberg.bronze.whoscored_events_current":
+                return [[3]]
+            if sql == "SELECT COUNT(*) FROM iceberg.silver.spadl_stage":
+                return [[3]]
+            if sql == "SELECT COUNT(*) FROM iceberg.silver.spadl":
+                return [[3]]
+            return None
+
+        with (
+            patch.object(
+                mod, '_get_trino_connection', return_value=conn,
+            ) as get_connection,
+            patch.object(mod, '_execute', side_effect=fake_execute),
+        ):
+            result = mod.run_silver_transform_partition_staged(
+                sql_file=str(sql_file),
+                table_name='spadl',
+                source_table='iceberg.bronze.whoscored_events_current',
+                source_version_sql=STAGED_SOURCE_VERSION_SQL,
+            )
+
+        get_connection.assert_called_once_with(
+            host=None,
+            port=None,
+            catalog='iceberg',
+            session_properties=mod._PARTITION_STAGED_SESSION_PROPERTIES,
+        )
+
+        assert result == {
+            'table': 'iceberg.silver.spadl',
+            'rows': 3,
+            'source_rows': 3,
+            'partitions': 2,
+            'status': 'success',
+            'error': None,
+        }
+        inserts = [sql for sql in statements if sql.startswith("INSERT INTO")]
+        assert len(inserts) == 2
+        assert "league = 'ENG-Premier League' AND season = '2526'" in inserts[0]
+        assert "league = 'ESP-La Liga' AND season = '2526'" in inserts[1]
+
+        replacements = [
+            sql for sql in statements
+            if sql.startswith("CREATE OR REPLACE TABLE iceberg.silver.spadl")
+        ]
+        assert len(replacements) == 1
+        assert "CURRENT_TIMESTAMP AS _silver_created_at" in replacements[0]
+        assert "FROM iceberg.silver.spadl_stage" in replacements[0]
+        assert "ROW_NUMBER" not in replacements[0]
+        assert all("CURRENT_TIMESTAMP" not in sql for sql in inserts)
+        assert not any(
+            sql.startswith("DROP TABLE IF EXISTS iceberg.silver.spadl\n")
+            or sql == "DROP TABLE IF EXISTS iceberg.silver.spadl"
+            for sql in statements
+        )
+        stage_drops = [
+            sql for sql in statements
+            if sql == "DROP TABLE IF EXISTS iceberg.silver.spadl_stage"
+        ]
+        # One preflight cleanup makes OOM residue retry-safe; one final cleanup
+        # removes the successfully published stage.
+        assert len(stage_drops) == 2
+        assert statements.count(STAGED_SOURCE_VERSION_SQL) == 2
+        conn.close.assert_called_once()
+
+    def test_parity_failure_leaves_live_table_untouched(self, tmp_path):
+        mod = _import_silver_tasks()
+        sql_file = tmp_path / "spadl.sql"
+        sql_file.write_text("SELECT league, season FROM source")
+        conn = MagicMock()
+        statements = []
+
+        def fake_execute(_conn, sql, fetch=False):
+            statements.append(sql)
+            if sql == STAGED_SOURCE_VERSION_SQL:
+                return list(STAGED_SOURCE_VERSION)
+            if sql.startswith("SELECT league, season, COUNT(*) AS __row_count"):
+                return [("ENG-Premier League", "2526", 10)]
+            if sql == "SELECT COUNT(*) FROM iceberg.bronze.events":
+                return [[10]]
+            if sql == "SELECT COUNT(*) FROM iceberg.silver.spadl_stage":
+                return [[9]]
+            return None
+
+        with (
+            patch.object(mod, '_get_trino_connection', return_value=conn),
+            patch.object(mod, '_execute', side_effect=fake_execute),
+            pytest.raises(RuntimeError, match="staged row parity failed"),
+        ):
+            mod.run_silver_transform_partition_staged(
+                sql_file=str(sql_file),
+                table_name='spadl',
+                source_table='iceberg.bronze.events',
+                source_version_sql=STAGED_SOURCE_VERSION_SQL,
+            )
+
+        assert not any(
+            "CREATE OR REPLACE TABLE iceberg.silver.spadl" in sql
+            for sql in statements
+        )
+        assert statements.count(
+            "DROP TABLE IF EXISTS iceberg.silver.spadl_stage"
+        ) == 2
+        conn.close.assert_called_once()
+
+    def test_source_change_before_replace_fails_closed(self, tmp_path):
+        mod = _import_silver_tasks()
+        sql_file = tmp_path / "spadl.sql"
+        sql_file.write_text("SELECT league, season FROM source")
+        conn = MagicMock()
+        statements = []
+
+        def fake_execute(_conn, sql, fetch=False):
+            statements.append(sql)
+            if sql == STAGED_SOURCE_VERSION_SQL:
+                return list(STAGED_SOURCE_VERSION)
+            if sql.startswith("SELECT league, season, COUNT(*) AS __row_count"):
+                return [("ENG-Premier League", "2526", 10)]
+            if sql == "SELECT COUNT(*) FROM iceberg.silver.spadl_stage":
+                return [[10]]
+            if sql == "SELECT COUNT(*) FROM iceberg.bronze.events":
+                return [[11]]
+            return None
+
+        with (
+            patch.object(mod, '_get_trino_connection', return_value=conn),
+            patch.object(mod, '_execute', side_effect=fake_execute),
+            pytest.raises(RuntimeError, match="source changed during staged rebuild"),
+        ):
+            mod.run_silver_transform_partition_staged(
+                sql_file=str(sql_file),
+                table_name='spadl',
+                source_table='iceberg.bronze.events',
+                source_version_sql=STAGED_SOURCE_VERSION_SQL,
+            )
+
+        assert not any(
+            "CREATE OR REPLACE TABLE iceberg.silver.spadl" in sql
+            for sql in statements
+        )
+        assert statements.count(
+            "DROP TABLE IF EXISTS iceberg.silver.spadl_stage"
+        ) == 2
+        conn.close.assert_called_once()
+
+    def test_same_count_different_source_version_fails_closed(self, tmp_path):
+        mod = _import_silver_tasks()
+        sql_file = tmp_path / "spadl.sql"
+        sql_file.write_text("SELECT league, season FROM source")
+        conn = MagicMock()
+        statements = []
+        version_reads = 0
+
+        def fake_execute(_conn, sql, fetch=False):
+            nonlocal version_reads
+            statements.append(sql)
+            if sql == STAGED_SOURCE_VERSION_SQL:
+                version_reads += 1
+                batch_id = "batch-before" if version_reads == 1 else "batch-after"
+                return [("ENG-Premier League", "2526", 101, batch_id)]
+            if sql.startswith("SELECT league, season, COUNT(*) AS __row_count"):
+                return [("ENG-Premier League", "2526", 10)]
+            if sql == "SELECT COUNT(*) FROM iceberg.silver.spadl_stage":
+                return [[10]]
+            if sql == "SELECT COUNT(*) FROM iceberg.bronze.events":
+                return [[10]]
+            return None
+
+        with (
+            patch.object(mod, '_get_trino_connection', return_value=conn),
+            patch.object(mod, '_execute', side_effect=fake_execute),
+            pytest.raises(RuntimeError, match="source version changed"),
+        ):
+            mod.run_silver_transform_partition_staged(
+                sql_file=str(sql_file),
+                table_name='spadl',
+                source_table='iceberg.bronze.events',
+                source_version_sql=STAGED_SOURCE_VERSION_SQL,
+            )
+
+        assert version_reads == 2
+        assert statements.count(
+            "SELECT COUNT(*) FROM iceberg.bronze.events"
+        ) == 1
+        assert not any(
+            "CREATE OR REPLACE TABLE iceberg.silver.spadl" in sql
+            for sql in statements
+        )
+        assert statements.count(
+            "DROP TABLE IF EXISTS iceberg.silver.spadl_stage"
+        ) == 2
+        conn.close.assert_called_once()
+
+    def test_cleanup_reconnects_when_work_connection_is_broken(self, tmp_path):
+        mod = _import_silver_tasks()
+        sql_file = tmp_path / "spadl.sql"
+        sql_file.write_text("SELECT league, season FROM source")
+        work_conn = MagicMock()
+        cleanup_conn = MagicMock()
+        statements = []
+
+        def fake_execute(conn, sql, fetch=False):
+            statements.append((conn, sql))
+            if sql == STAGED_SOURCE_VERSION_SQL:
+                return list(STAGED_SOURCE_VERSION)
+            if sql.startswith("SELECT league, season, COUNT(*) AS __row_count"):
+                return [("ENG-Premier League", "2526", 1)]
+            if sql == "SELECT COUNT(*) FROM iceberg.silver.spadl_stage":
+                return [[1]]
+            if sql == "SELECT COUNT(*) FROM iceberg.bronze.events":
+                return [[1]]
+            if sql == "SELECT COUNT(*) FROM iceberg.silver.spadl":
+                return [[1]]
+            work_stage_drops = sum(
+                seen_conn is work_conn
+                and seen_sql == "DROP TABLE IF EXISTS iceberg.silver.spadl_stage"
+                for seen_conn, seen_sql in statements
+            )
+            if (
+                conn is work_conn
+                and sql == "DROP TABLE IF EXISTS iceberg.silver.spadl_stage"
+                and work_stage_drops == 2
+            ):
+                raise OSError("connection is closed")
+            return None
+
+        with (
+            patch.object(
+                mod,
+                '_get_trino_connection',
+                side_effect=[work_conn, cleanup_conn],
+            ) as get_connection,
+            patch.object(mod, '_execute', side_effect=fake_execute),
+        ):
+            result = mod.run_silver_transform_partition_staged(
+                sql_file=str(sql_file),
+                table_name='spadl',
+                source_table='iceberg.bronze.events',
+                source_version_sql=STAGED_SOURCE_VERSION_SQL,
+            )
+
+        assert result['status'] == 'success'
+        assert get_connection.call_count == 2
+        cleanup_drops = [
+            sql for conn, sql in statements
+            if conn is cleanup_conn
+            and sql == "DROP TABLE IF EXISTS iceberg.silver.spadl_stage"
+        ]
+        assert len(cleanup_drops) == 1
+        work_conn.close.assert_called_once()
+        cleanup_conn.close.assert_called_once()
+
+    def test_rejects_unqualified_partition_source(self, tmp_path):
+        mod = _import_silver_tasks()
+        sql_file = tmp_path / "spadl.sql"
+        sql_file.write_text("SELECT 1")
+        with pytest.raises(ValueError, match="three-part"):
+            mod.run_silver_transform_partition_staged(
+                sql_file=str(sql_file),
+                table_name='spadl',
+                source_table='bronze.events',
+                source_version_sql=STAGED_SOURCE_VERSION_SQL,
+            )
+
+    def test_rejects_unordered_source_version_sql(self, tmp_path):
+        mod = _import_silver_tasks()
+        sql_file = tmp_path / "spadl.sql"
+        sql_file.write_text("SELECT 1")
+        with pytest.raises(ValueError, match="deterministic ORDER BY"):
+            mod.run_silver_transform_partition_staged(
+                sql_file=str(sql_file),
+                table_name='spadl',
+                source_table='iceberg.bronze.events',
+                source_version_sql="SELECT batch_id FROM manifest",
+            )
 
 
 class TestValidateSilverTables:

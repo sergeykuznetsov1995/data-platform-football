@@ -317,7 +317,14 @@ EXPECTED_TABLES: dict[str, dict[str, set[str]]] = {
         },
         'whoscored_missing_players': {
             'league', 'season', 'game', 'game_id', 'team',
-            'player', 'player_id', 'reason', 'status', *META_COLS,
+            'player', 'player_id', 'reason', 'status', '_preview_batch_id',
+            '_payload_sha256', '_parser_version', *META_COLS,
+        },
+        'whoscored_preview_ingest_manifest': {
+            'league', 'season', 'game_id', 'batch_id', 'payload_sha256',
+            'raw_uri', 'parser_version', 'state', 'missing_players_count',
+            'transport_mode', 'proxy_mode', 'direct_bytes', 'paid_bytes',
+            *META_COLS,
         },
         'whoscored_season_stages': {  # cup/league stage metadata (6 rows live)
             'league', 'season', 'stage_id', *META_COLS,

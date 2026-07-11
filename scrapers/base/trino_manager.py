@@ -440,8 +440,25 @@ WITH (
                 return f"DATE '{safe}'"
 
             if 'TIMESTAMP' in tt:
+                timestamp = None
                 if isinstance(val, (datetime, pd.Timestamp)):
-                    ts_str = val.strftime('%Y-%m-%d %H:%M:%S.%f')
+                    timestamp = pd.Timestamp(val)
+                elif isinstance(val, str):
+                    try:
+                        timestamp = pd.Timestamp(val)
+                    except (TypeError, ValueError):
+                        pass
+                if timestamp is not None and not pd.isna(timestamp):
+                    if 'WITH TIME ZONE' in tt:
+                        if timestamp.tzinfo is None:
+                            timestamp = timestamp.tz_localize('UTC')
+                        else:
+                            timestamp = timestamp.tz_convert('UTC')
+                        ts_str = timestamp.strftime('%Y-%m-%d %H:%M:%S.%f')
+                        return f"TIMESTAMP '{ts_str} UTC'"
+                    if timestamp.tzinfo is not None:
+                        timestamp = timestamp.tz_convert('UTC').tz_localize(None)
+                    ts_str = timestamp.strftime('%Y-%m-%d %H:%M:%S.%f')
                     return f"TIMESTAMP '{ts_str}'"
                 safe = str(val).replace("'", "''")
                 return f"TIMESTAMP '{safe}'"

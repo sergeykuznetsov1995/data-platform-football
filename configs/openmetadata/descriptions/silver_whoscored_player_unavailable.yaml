@@ -5,7 +5,8 @@ table:
   fullyQualifiedName: trino_iceberg.iceberg.silver.whoscored_player_unavailable
   description: |
     Недоступные игроки по матчам из WhoScored (травмы/дисквалификации) — один row
-    на (match_id, team_name, ws_player_id). Источник: bronze.whoscored_missing_players
+    на (match_id, team_name, ws_player_id). Источник:
+    bronze.whoscored_missing_players_current (последний успешно committed preview batch)
     LEFT JOIN bronze.whoscored_schedule (за match_date). Фильтры: только status='Out'
     (слухи 'Doubtful' исключены), reason без 'international duty' (вызовы в сборную —
     не сигнал формы). Сырой ws_player_id и team_name (xref резолвится на Gold,
