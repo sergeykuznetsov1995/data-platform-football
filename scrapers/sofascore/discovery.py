@@ -264,7 +264,12 @@ class DirectSofaScoreClient:
             headers.update({
                 "Accept": "application/json",
                 "Accept-Language": "en-US,en;q=0.9",
+                "Origin": "https://www.sofascore.com",
                 "Referer": "https://www.sofascore.com/",
+                # Since June 2026 SofaScore's direct JSON edge requires the
+                # same explicit XHR marker its own web client sends. This is a
+                # plain request header, not a browser/session/proxy fallback.
+                "X-Requested-With": "XMLHttpRequest",
                 "User-Agent": (
                     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
                     "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"
@@ -748,6 +753,51 @@ def _merge_season_record(
     return merged
 
 
+def _merge_classification_record(
+    previous: Mapping[str, Any], discovered: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Refresh source evidence without erasing a stronger prior observation.
+
+    SofaScore does not return gender/age/team-level fields consistently across
+    its catalog, category and detail endpoints.  A missing field is not
+    evidence that a previously observed value became unknown.  Explicit
+    negative evidence is authoritative and is never retained over.
+    """
+
+    current = deepcopy(dict(discovered))
+    if current.get("status") == "excluded" or current.get("exclusion_reasons"):
+        return current
+
+    prior = dict(previous or {})
+    unknown_tokens = {None, "", "unknown"}
+    for field in ("sport", "gender", "age_group", "team_level"):
+        if current.get(field) in unknown_tokens and prior.get(field) not in unknown_tokens:
+            current[field] = deepcopy(prior[field])
+
+    evidence_by_value = {
+        json.dumps(item, sort_keys=True, ensure_ascii=False): deepcopy(item)
+        for item in [
+            *(prior.get("evidence") or []),
+            *(current.get("evidence") or []),
+        ]
+        if isinstance(item, Mapping)
+    }
+    current["evidence"] = [
+        evidence_by_value[key] for key in sorted(evidence_by_value)
+    ]
+
+    if current.get("sport") != "football" or current.get("gender") != "male":
+        current["status"] = "unknown"
+    elif (
+        current.get("age_group") == "adult"
+        and current.get("team_level") == "first_team"
+    ):
+        current["status"] = "source_confirmed_adult_men"
+    else:
+        current["status"] = "review_required"
+    return current
+
+
 def merge_registry(
     existing: Mapping[str, Any],
     discovered_tournaments: list[Mapping[str, Any]],
@@ -791,6 +841,10 @@ def merge_registry(
         discovered["enabled"] = previous.get("enabled", False)
         discovered["review"] = deepcopy(
             previous.get("review") or pending_review()
+        )
+        discovered["classification"] = _merge_classification_record(
+            previous.get("classification") or {},
+            discovered.get("classification") or {},
         )
         source_fields = {
             "unique_tournament_id", "name", "slug", "category",
