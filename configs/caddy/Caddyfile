@@ -3,7 +3,6 @@
 # Trino — PASSWORD для машинных + OAUTH2 для людей).
 # /admin и master-realm Keycloak закрыты снаружи: админка — через SSH-туннель
 # на 127.0.0.1:8180 (KC_HOSTNAME_ADMIN в compose.yaml).
-# OpenMetadata НЕ публикуется (basic auth, один админ) — SSH-туннель 127.0.0.1:8585.
 # ACME HTTP-01: все A-записи -> ${PUBLIC_IP}, :80 опубликован там же.
 # JSON access-log на /var/log/caddy (bind на хост) — его читает fail2ban.
 
@@ -52,4 +51,13 @@ https://trino.{$PLATFORM_DOMAIN} {
 			tls_insecure_skip_verify
 		}
 	}
+}
+
+# OpenMetadata: каталог данных. Гейт — Keycloak SSO самого OM (custom-oidc,
+# #866); self-signup выключен — входят только заведённые админом юзеры.
+# Break-glass (OM_AUTH_* убраны из .env = basic) — этот блок закомментировать:
+# basic-OM наружу не публикуется, доступ через SSH-туннель 127.0.0.1:8585.
+https://meta.{$PLATFORM_DOMAIN} {
+	import logging
+	reverse_proxy openmetadata-server:8585
 }
