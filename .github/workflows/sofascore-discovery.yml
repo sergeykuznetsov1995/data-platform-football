@@ -24,6 +24,15 @@ on:
         options:
           - full
           - active-reviewed
+      runner:
+        description: Direct runner used for the live egress probe
+        required: true
+        default: windows-latest
+        type: choice
+        options:
+          - windows-latest
+          - ubuntu-latest
+          - macos-14
 
 permissions:
   contents: read
@@ -93,7 +102,7 @@ jobs:
     permissions:
       contents: write
       pull-requests: write
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.event_name == 'workflow_dispatch' && inputs.runner || 'ubuntu-latest' }}
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
