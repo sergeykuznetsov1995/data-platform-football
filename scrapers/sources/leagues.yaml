@@ -43,7 +43,6 @@ metadata:
     matches_per_season: 380
     fbref_id: 9
     whoscored_id: 2
-    sofascore_id: 17
     espn_id: eng.1
 
   ESP-La Liga:
@@ -53,7 +52,6 @@ metadata:
     matches_per_season: 380
     fbref_id: 12
     whoscored_id: 4
-    sofascore_id: 8
     espn_id: esp.1
 
   GER-Bundesliga:
@@ -63,7 +61,6 @@ metadata:
     matches_per_season: 306
     fbref_id: 20
     whoscored_id: 3
-    sofascore_id: 35
     espn_id: ger.1
 
   ITA-Serie A:
@@ -73,7 +70,6 @@ metadata:
     matches_per_season: 380
     fbref_id: 11
     whoscored_id: 5
-    sofascore_id: 23
     espn_id: ita.1
 
   FRA-Ligue 1:
@@ -83,5 +79,4 @@ metadata:
     matches_per_season: 306
     fbref_id: 13
     whoscored_id: 22
-    sofascore_id: 34
     espn_id: fra.1
