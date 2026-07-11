@@ -145,15 +145,9 @@ def _load_active_sofascore_leagues() -> List[str]:
 SOFASCORE_LEAGUES = _load_active_sofascore_leagues()
 
 
-# #920 Phase 1: split the active SofaScore registry scope into club
-# (split_year) and tournament
-# (single_year, e.g. INT-World Cup) leagues. Club leagues stay batched in one
-# call (they share the same club-formula season — no reason to fan them out).
-# Each tournament league needs its own dedicated single-league task, because
-# (a) the runner's #920 bridge requires a dedicated call to resolve its
-# active season correctly (a mixed call drops it), and (b) match_capture's
-# runner only ever reads leagues[0]. New tournaments onboard via
-# the registry activation flag alone — no further DAG changes.
+# Split active registry scope by season convention for floor/window logic.
+# Source IDs, manifests and Bronze partitions are competition-scoped, so every
+# competition is fanned out to its own schedule and match tasks.
 CLUB_LEAGUES = [
     lg for lg in SOFASCORE_LEAGUES if not is_single_year_competition(lg)
 ]
@@ -467,9 +461,28 @@ def validate_data(**context) -> Dict[str, Any]:
     for _club_league in CLUB_LEAGUES[1:]:
         _slug = _league_slug(_club_league)
         _club_floors = _competition_floors(_club_league)
+        _club_schedule = _load_result(
+            f'/tmp/sofascore_result_{_slug}.json', logger
+        )
         _club_capture = _load_result(
             f'/tmp/sofascore_match_capture_result_{_slug}.json', logger)
         _club_summary: Dict[str, Any] = {}
+        if not _club_schedule:
+            validation['warnings'].append(
+                f"{_club_league}: schedule result file missing/unreadable "
+                "(runner died before writing?)"
+            )
+        elif not _club_schedule.get('skipped'):
+            for err in _club_schedule.get('errors') or []:
+                validation['warnings'].append(f"{_club_league}: {err}")
+            for key in ('schedule_rows', 'league_table_rows'):
+                rows = _club_schedule.get(key, 0)
+                _club_summary[key] = rows
+                if rows < _club_floors[key]:
+                    validation['warnings'].append(
+                        f"{_club_league}: low {key}: "
+                        f"{rows} < {_club_floors[key]}"
+                    )
         if not _club_capture:
             validation['warnings'].append(
                 f"{_club_league}: match_capture result file "
@@ -783,6 +796,40 @@ def validate_player_data(**context) -> Dict[str, Any]:
             f"Low player_season_stats row count: {season_rows} < 300 "
             f"(Season-tab picker coverage)")
 
+    for league in SOFASCORE_LEAGUES:
+        if league == PRIMARY_CLUB_LEAGUE:
+            continue
+        slug = _league_slug(league)
+        path = f'/tmp/sofascore_player_capture_result_{slug}.json'
+        extra = _load_result(path, logger)
+        if not extra:
+            validation['warnings'].append(
+                f'{league}: player_capture result file missing/unreadable'
+            )
+            validation['status'] = 'failed'
+            continue
+        if extra.get('skipped'):
+            continue
+        for error in extra.get('errors') or []:
+            validation['warnings'].append(f'{league}: {error}')
+        universe = int(extra.get('players_total') or 0)
+        profiles = int(extra.get('profile_players') or 0)
+        coverage = 1.0 if universe == 0 else profiles / universe
+        validation['summary'][f'player_{slug}'] = {
+            'players_total': universe,
+            'profile_players': profiles,
+            'profile_coverage': coverage,
+            'season_stats_players': int(
+                extra.get('season_stats_players') or 0
+            ),
+        }
+        if universe == 0 or coverage < 0.95 or extra.get('errors'):
+            validation['warnings'].append(
+                f'{league}: profile coverage {profiles}/{universe} '
+                f'({coverage:.2%}) is below 95% or capture reported errors'
+            )
+            validation['status'] = 'failed'
+
     logger.info("Player data validation complete: %s", validation['status'])
     logger.info("Summary: %s", validation['summary'])
     if validation['warnings']:
@@ -834,10 +881,6 @@ def validate_player_freshness(**context) -> None:
             + "; ".join(f"{r.name}: {r.details or r.error}" for r in report.errors)
         )
 
-
-# Build arguments for bash command — club leagues only (see CLUB_LEAGUES
-# above); tournament leagues get their own dedicated task below.
-leagues_str = ','.join(CLUB_LEAGUES)
 
 # DAG definition
 with DAG(
@@ -908,25 +951,24 @@ with DAG(
     `SS_SHOTMAP_LIMIT`, `SS_EPS_LIMIT`, `SS_MATCH_STATS_LIMIT`,
     `SS_PLAYER_CAPTURE_LIMIT` (positive int → cap).
 
-    ### Incremental full-state refresh (#842)
+    ### Raw-first incremental capture (#842)
 
     The consolidated `match_capture` captures only matches not marked complete
     in `bronze.sofascore_match_capture_status` (finished-match data is immutable;
     re-capturing the whole season daily burned ~1.6 GB of residential proxy).
-    Endpoint states distinguish terminal empty/404 from transient misses. Data
-    frames are merged with the existing partition and rewritten
-    (`replace_partitions=['league','season']` + completeness guard). A day
-    with no new finished matches is a clean no-op (zero proxy spend).
+    The canonical long manifest distinguishes success, legitimate empty,
+    unsupported, retryable failure and schema error per endpoint. Exact JSON is
+    retained once and can be replayed with networking disabled. Bronze writes
+    are natural-key Iceberg MERGEs; no full partition is read or rewritten. A
+    completed same-freshness run is a clean no-op (zero proxy/browser spend).
 
-    **Manual full re-capture**: run the scraper with `--force-replace`
-    (bypasses skip-existing AND the guard), or `TRUNCATE
-    iceberg.bronze.sofascore_<table>` via `make shell-trino`, then trigger
-    the DAG.
+    **Manual repair**: run the shared runner/backfill with `--force-replace`;
+    writes remain incremental and the manifest retains raw lineage.
 
     ### Notes
 
-    - Uses soccerdata library wrapper
-    - Written to Parquet fallback (PyIceberg disabled for stability)
+    - Discovery is direct JSON with proxy environment disabled.
+    - Capture activation is registry-gated to reviewed adult men's tournaments.
     """,
 ) as dag:
 
@@ -936,7 +978,7 @@ with DAG(
 cd /opt/airflow && \\
 rm -f {SCHEDULE_RESULT_PATH} && \\
 python dags/scripts/run_sofascore_scraper.py \\
-    --leagues "{leagues_str}" \\
+    --league "{PRIMARY_CLUB_LEAGUE}" \\
     --season {{{{ params.season }}}} \\
     --output {SCHEDULE_RESULT_PATH}
 """,
@@ -948,28 +990,22 @@ python dags/scripts/run_sofascore_scraper.py \\
         append_env=True,
     )
 
-    # #920 Phase 1: one dedicated schedule task per tournament league (e.g.
-    # INT-World Cup) — a mixed --leagues call would drop it (the runner's
-    # #920 bridge needs a dedicated single-league call to resolve the active
-    # tournament season). Reuses the same `{{ params.season }}` Jinja value
-    # as the club task above; the runner itself resolves it to the real
-    # tournament year, or cleanly no-ops (exit 0) outside the tournament
-    # window — so this task stays in the graph year-round as a cheap no-op
-    # rather than appearing/disappearing with the calendar. Once canonical
-    # metadata is ready, onboarding the next tournament is an activation flag
-    # change in the SofaScore registry — no global league-list change.
-    tournament_schedule_tasks = {}
-    for _t_league in TOURNAMENT_LEAGUES:
-        _t_slug = _league_slug(_t_league)
-        tournament_schedule_tasks[_t_league] = BashOperator(
-            task_id=f'scrape_sofascore_data_{_t_slug}',
+    # Preserve the primary EPL task ID/path; add one registry-driven schedule
+    # task for every other club or tournament.
+    schedule_tasks = {PRIMARY_CLUB_LEAGUE: scrape_data_task}
+    for _schedule_league in SOFASCORE_LEAGUES:
+        if _schedule_league == PRIMARY_CLUB_LEAGUE:
+            continue
+        _schedule_slug = _league_slug(_schedule_league)
+        schedule_tasks[_schedule_league] = BashOperator(
+            task_id=f'scrape_sofascore_data_{_schedule_slug}',
             bash_command=f"""
 cd /opt/airflow && \\
-rm -f /tmp/sofascore_result_{_t_slug}.json && \\
+rm -f /tmp/sofascore_result_{_schedule_slug}.json && \\
 python dags/scripts/run_sofascore_scraper.py \\
-    --leagues "{_t_league}" \\
+    --league "{_schedule_league}" \\
     --season {{{{ params.season }}}} \\
-    --output /tmp/sofascore_result_{_t_slug}.json
+    --output /tmp/sofascore_result_{_schedule_slug}.json
 """,
             env={
                 'PYTHONPATH': '/opt/airflow:/opt/airflow/dags',
@@ -1095,6 +1131,42 @@ exit $rc
         append_env=True,
     )
 
+    player_capture_tasks = {
+        PRIMARY_CLUB_LEAGUE: scrape_player_capture_task,
+    }
+    for _player_league in SOFASCORE_LEAGUES:
+        if _player_league == PRIMARY_CLUB_LEAGUE:
+            continue
+        _player_slug = _league_slug(_player_league)
+        _player_output = (
+            f'/tmp/sofascore_player_capture_result_{_player_slug}.json'
+        )
+        player_capture_tasks[_player_league] = BashOperator(
+            task_id=f'scrape_player_capture_{_player_slug}',
+            bash_command=f"""
+cd /opt/airflow && \\
+rm -f {_player_output} && \\
+python dags/scripts/run_sofascore_scraper.py \\
+    --entity player_capture \\
+    --league "{_player_league}" \\
+    --season {{{{ params.season }}}} \\
+    {_limit_arg(PLAYER_CAPTURE_LIMIT)} \\
+    --output {_player_output}
+rc=$?
+if [ $rc -eq 2 ]; then
+    echo "R0.2B_FALLBACK exit-code 2 (player_capture) — propagating as soft success."
+    exit 0
+fi
+exit $rc
+""",
+            env={
+                'PYTHONPATH': '/opt/airflow:/opt/airflow/dags',
+                'PATH': '/usr/local/bin:/usr/bin:/bin:/home/airflow/.local/bin',
+                'HOME': '/home/airflow',
+            },
+            append_env=True,
+        )
+
     validate_player_data_task = PythonOperator(
         task_id='validate_player_data',
         python_callable=validate_player_data,
@@ -1107,11 +1179,9 @@ exit $rc
         trigger_rule='all_done',
     )
 
-    # Matches chain (daily): one club schedule batch feeds one dedicated
-    # match-capture task per active split-year competition. The legacy primary
-    # keeps its original task id/result path.
+    # Matches chain (daily): one dedicated schedule feeds one match capture.
     for _club_league in CLUB_LEAGUES:
-        scrape_data_task >> match_capture_tasks[_club_league]
+        schedule_tasks[_club_league] >> match_capture_tasks[_club_league]
         match_capture_tasks[_club_league] >> validate_data_task
     validate_data_task >> validate_bronze_freshness_task
 
@@ -1120,11 +1190,14 @@ exit $rc
     # match_capture task, both converging on the shared validate_data_task
     # (trigger_rule='all_done' already tolerates multiple upstreams).
     for _t_league in TOURNAMENT_LEAGUES:
-        tournament_schedule_tasks[_t_league] >> match_capture_tasks[_t_league]
+        schedule_tasks[_t_league] >> match_capture_tasks[_t_league]
         match_capture_tasks[_t_league] >> validate_data_task
 
-    # Per-player branch (weekly/manual), gated after match_capture so the player
-    # ids in bronze.sofascore_player_ratings are fresh; skipped on weekday runs.
-    # The Saturday master-pipeline boundary intentionally opens the gate.
-    scrape_match_capture_task >> gate_player_capture_task >> scrape_player_capture_task
-    scrape_player_capture_task >> validate_player_data_task >> validate_player_freshness_task
+    # Per-player branch (weekly/manual). Wait for every competition's match
+    # capture, then fan out profiles/stats over the same registry scope.
+    for _match_task in match_capture_tasks.values():
+        _match_task >> gate_player_capture_task
+    for _player_task in player_capture_tasks.values():
+        gate_player_capture_task >> _player_task
+        _player_task >> validate_player_data_task
+    validate_player_data_task >> validate_player_freshness_task

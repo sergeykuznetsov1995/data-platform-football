@@ -569,7 +569,9 @@ class TestRegistryActivation:
         module = _reload_dag_module()
 
         schedule = _bash_task('scrape_sofascore_data')
-        assert '--leagues "ENG-Premier League,ESP-La Liga"' in schedule.bash_command
+        assert '--league "ENG-Premier League"' in schedule.bash_command
+        la_liga_schedule = _bash_task('scrape_sofascore_data_esp_la_liga')
+        assert '--league "ESP-La Liga"' in la_liga_schedule.bash_command
 
         epl = _bash_task('scrape_match_capture')
         assert '--league "ENG-Premier League"' in epl.bash_command
@@ -582,6 +584,9 @@ class TestRegistryActivation:
             '/tmp/sofascore_match_capture_result_esp_la_liga.json'
             in la_liga.bash_command
         )
+        la_liga_players = _bash_task('scrape_player_capture_esp_la_liga')
+        assert la_liga_players is not None
+        assert '--league "ESP-La Liga"' in la_liga_players.bash_command
 
     def test_secondary_club_capture_is_validated_without_inflating_epl_floor(
         self, monkeypatch, real_medallion_config_dir,
@@ -716,7 +721,7 @@ class TestTournamentFanOut:
     def test_club_schedule_task_excludes_tournament_leagues(self, dag_module):
         task = _bash_task('scrape_sofascore_data')
         assert task is not None
-        assert '--leagues "ENG-Premier League"' in task.bash_command
+        assert '--league "ENG-Premier League"' in task.bash_command
         assert 'INT-World Cup' not in task.bash_command
 
     def test_club_schedule_task_output_path_unchanged(self, dag_module):
@@ -726,7 +731,7 @@ class TestTournamentFanOut:
     def test_tournament_schedule_task_exists_dedicated(self, dag_module):
         task = _bash_task('scrape_sofascore_data_int_world_cup')
         assert task is not None
-        assert '--leagues "INT-World Cup"' in task.bash_command
+        assert '--league "INT-World Cup"' in task.bash_command
         assert '--season {{ params.season }}' in task.bash_command
         assert '/tmp/sofascore_result_int_world_cup.json' in task.bash_command
 
@@ -766,11 +771,15 @@ class TestTournamentFanOut:
 
 class TestValidatePlayerData:
     def _write(self, dag_module, monkeypatch, tmp_path, result):
-        import json
-
-        p = tmp_path / "res.json"
-        p.write_text(json.dumps(result))
-        monkeypatch.setattr(dag_module, 'PLAYER_CAPTURE_RESULT_PATH', str(p))
+        monkeypatch.setattr(
+            dag_module,
+            '_load_result',
+            lambda path, logger: (
+                result
+                if path == dag_module.PLAYER_CAPTURE_RESULT_PATH
+                else {'skipped': 'out_of_window'}
+            ),
+        )
 
     def test_low_rows_without_fallback_warns_but_succeeds(
         self, dag_module, monkeypatch, tmp_path,

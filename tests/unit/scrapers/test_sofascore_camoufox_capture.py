@@ -1,7 +1,7 @@
 """Unit tests for the SofaScore Camoufox capture transport pure helpers (#757).
 
 The browser orchestration (``SofascoreCamoufoxCapture.capture_event``) is live
-integration — covered by ``scripts/research/probe_sofascore_capture.py``. Here we
+integration — represented by saved ``tests/fixtures/sofascore_*`` JSON. Here we
 test the pure response-classification / selection logic that decides what counts
 as real data, which has no browser dependency.
 """
@@ -11,6 +11,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from scrapers.sofascore.camoufox_capture import (
+    SofascoreCamoufoxCapture,
     event_url,
     extract_events,
     extract_player_from_next_data,
@@ -28,6 +29,40 @@ from scrapers.sofascore.camoufox_capture import (
 )
 
 pytestmark = pytest.mark.unit
+
+
+def test_explicit_camoufox_requests_are_rate_limited_individually():
+    calls = []
+    cap = SofascoreCamoufoxCapture(
+        request_limiter=lambda: calls.append("request") or True,
+        settle_ms=0,
+    )
+    cap._page = MagicMock()
+    cap._page.evaluate.side_effect = [
+        {"status": 200, "body": '{"event":{"id":7}}', "headers": {}},
+        {
+            "status": 200,
+            "body": '{"home":{"players":[]},"away":{"players":[]}}',
+            "headers": {},
+        },
+        {"status": 200, "body": '{"statistics":[]}', "headers": {}},
+    ]
+
+    cap.fetch_event(7, names=("event", "lineups"))
+    cap.fetch_api_json("/api/v1/event/7/statistics")
+    for endpoint in ("event/7", "event/7/lineups", "event/7/statistics"):
+        cap._maybe_block(
+            _FakeRoute(
+                "xhr",
+                f"https://www.sofascore.com/api/v1/{endpoint}",
+            )
+        )
+    cap._navigate("https://www.sofascore.com/event/7")
+
+    # Two endpoint fetches + one arbitrary API fetch + one navigation.
+    assert calls == ["request"] * 4
+    assert cap._api_fetch_count == 3
+    assert cap._navigation_count == 1
 
 
 # --------------------------------------------------------------------------- #
@@ -211,9 +246,11 @@ def test_normalize_event_flattens_row():
     assert row["away_score_current"] == 2
     assert row["round_info_round"] == 7
     assert row["status_type"] == "finished"           # passthrough bonus
-    # Old renamed/derived names + dropped soccerdata placeholders are gone.
-    for dead in ("date", "home_team", "away_team", "home_score", "away_score",
-                 "round", "week", "game"):
+    assert row['home_team'] == row['home_team_name']
+    assert row['away_team'] == row['away_team_name']
+    assert row['home_score'] == row['home_score_current']
+    assert row['away_score'] == row['away_score_current']
+    for dead in ("date", "round", "week", "game"):
         assert dead not in row
 
 
@@ -692,7 +729,7 @@ class TestFetchPlayer:
 
 # --------------------------------------------------------------------------- #
 #  Per-player helpers (#751 PR3) — profile snapshot                           #
-#  Shapes mirror the live probe (scripts/research/probe_sofascore_player.py).  #
+#  Shapes mirror the checked-in live SofaScore JSON fixtures.                  #
 # --------------------------------------------------------------------------- #
 def test_player_url_uses_dummy_slug():
     assert player_url(1416535) == "https://www.sofascore.com/player/x/1416535"
@@ -734,7 +771,7 @@ def test_extract_player_from_next_data_none_on_missing(nd):
 
 # --------------------------------------------------------------------------- #
 #  Per-player SEASON STATS helpers (#751 PR3b) — season-tab picker selection   #
-#  Shapes mirror the live probe (scripts/research/probe_sofascore_player.py,   #
+#  Shapes mirror the checked-in live SofaScore JSON fixtures,                  #
 #  FACT 2/4b): the player page captures /statistics/seasons (year→id map) plus #
 #  one /unique-tournament/{ut}/season/{sid}/statistics/overall per tab/picker. #
 # --------------------------------------------------------------------------- #
@@ -873,7 +910,7 @@ def test_normalize_standing_flattens_real_liverpool_row():
     rows = extract_tournament_standings(_standings_buffer(), 17, 61627)
     assert normalize_standing(rows[0]) == {
         "team": "Liverpool FC", "mp": 38, "w": 25, "d": 9, "l": 4,
-        "gf": 86, "ga": 41, "gd": 45, "pts": 84, "group": None}
+        "gf": 86, "ga": 41, "gd": 45, "pts": 84, "group": "__total__"}
 
 
 def _wc_group_standings_buffer(ut=16, sid=58210):
@@ -917,7 +954,7 @@ def test_extract_tournament_standings_single_league_block_has_no_group():
     from scrapers.sofascore.camoufox_capture import (
         extract_tournament_standings, normalize_standing)
     rows = extract_tournament_standings(_standings_buffer(), 17, 61627)
-    assert all(normalize_standing(r)["group"] is None for r in rows)
+    assert all(normalize_standing(r)["group"] == "__total__" for r in rows)
 
 
 def test_normalize_standing_invariants_hold_on_all_rows():

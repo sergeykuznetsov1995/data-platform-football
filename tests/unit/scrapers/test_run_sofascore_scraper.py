@@ -63,21 +63,21 @@ class TestArgparseHardFail:
         assert _main_rc(['--season', 'notanumber']) == 1
 
 
-def _run_main(argv: list, scraper_cls, *, resolver_ids=None,
-              existing_schedule=None, existing_capture_ids=None,
-              existing_partition=None) -> int:
+def _run_main(
+    argv: list,
+    scraper_cls,
+    *,
+    resolver_ids=None,
+    existing_capture_ids=None,
+) -> int:
     """Run ``main()`` with stubbed ``scrapers.sofascore[.scraper]`` modules.
 
     ``scrapers.base.base_scraper`` (for ``ReplaceGuardError``) imports for real.
     ``resolver_ids`` patches ``_resolve_match_ids_from_bronze`` so the
     player_ratings path skips its Trino lookup and reaches save_to_iceberg.
-    ``_read_existing_schedule`` is always patched (it would otherwise hit Trino)
-    to ``existing_schedule`` (default: an empty frame → captured rows save
-    as-is) so the #761 schedule merge runs offline + deterministically.
-    ``existing_capture_ids`` / ``existing_partition`` patch the #842
-    match_capture status-manifest probe and
-    partition merge read (``_read_existing_partition``) — defaults (empty set /
-    empty frame) mean "nothing in bronze yet": no skip, merge is a no-op.
+    ``existing_capture_ids`` patches the compatibility completion-manifest
+    probe. Its default empty set means no event is skipped. Data frames are
+    natural-keyed deltas; the runner never reads or rewrites full partitions.
     """
     so_pkg = MagicMock()
     so_pkg.SofaScoreScraper = scraper_cls
@@ -85,24 +85,30 @@ def _run_main(argv: list, scraper_cls, *, resolver_ids=None,
     so_scraper_mod.R0_2B_FALLBACK_MARKER = 'R0_2B_FALLBACK'
     so_scraper_mod._season_to_short = _season_to_short
     so_scraper_mod._season_label = _season_label
+    so_pipeline_mod = MagicMock()
+    so_pipeline_mod.build_capture_runtime.return_value = None
+    so_catalog_mod = MagicMock()
+    tournament = MagicMock()
+    tournament.capture_allowed = True
+    catalog = MagicMock()
+    catalog.competition.return_value = tournament
+    so_catalog_mod.SofaScoreCatalog.load.return_value = catalog
 
     sys.argv = ["run_sofascore_scraper.py"] + argv
     with patch.dict(sys.modules, {
-        "scrapers.sofascore": so_pkg,
-        "scrapers.sofascore.scraper": so_scraper_mod,
-    }):
+             "scrapers.sofascore": so_pkg,
+             "scrapers.sofascore.scraper": so_scraper_mod,
+             "scrapers.sofascore.pipeline": so_pipeline_mod,
+             "scrapers.sofascore.catalog": so_catalog_mod,
+         }):
         sys.modules.pop("dags.scripts.run_sofascore_scraper", None)
         mod = importlib.import_module("dags.scripts.run_sofascore_scraper")
         importlib.reload(mod)
         if resolver_ids is not None:
             mod._resolve_match_ids_from_bronze = lambda *a, **k: resolver_ids
-        _existing = pd.DataFrame() if existing_schedule is None else existing_schedule
-        mod._read_existing_schedule = lambda *a, **k: _existing
         _ids = set() if existing_capture_ids is None else set(existing_capture_ids)
         mod._existing_match_ids_in_bronze = lambda *a, **k: _ids
         mod._existing_complete_capture_ids = lambda *a, **k: set(_ids)
-        _part = pd.DataFrame() if existing_partition is None else existing_partition
-        mod._read_existing_partition = lambda *a, **k: _part
         return mod.main()
 
 
@@ -122,8 +128,7 @@ def _legacy_scraper(*, guard_blocks: bool = False):
     scraper.read_tournament_snapshot.return_value = (df, df)
     if guard_blocks:
         scraper.save_to_iceberg.side_effect = ReplaceGuardError(
-            'new=1 rows < 90% of existing=380 for bronze.sofascore_schedule '
-            '— refusing replace_partitions save (would shrink the partition)'
+            'writer DQ guard refused the captured schedule delta'
         )
     else:
         scraper.save_to_iceberg.return_value = 'iceberg.bronze.sofascore_schedule'
@@ -132,39 +137,14 @@ def _legacy_scraper(*, guard_blocks: bool = False):
     return scraper
 
 
-def _ratings_scraper(*, guard_blocks: bool = False):
-    """Stub for the player_ratings path (single 2-key save at 16-sp indent)."""
-    from scrapers.base.base_scraper import ReplaceGuardError
-
-    df = pd.DataFrame({
-        'league': ['ENG-Premier League'] * 10,
-        'season': [2024] * 10,
-        'match_id': list(range(10)),
-    })
-    scraper = MagicMock()
-    scraper.read_player_ratings.return_value = df
-    if guard_blocks:
-        scraper.save_to_iceberg.side_effect = ReplaceGuardError(
-            'new=1 rows < 90% of existing=200 for bronze.sofascore_player_ratings '
-            '— refusing replace_partitions save (would shrink the partition)'
-        )
-    else:
-        scraper.save_to_iceberg.return_value = (
-            'iceberg.bronze.sofascore_player_ratings'
-        )
-    scraper.__enter__ = MagicMock(return_value=scraper)
-    scraper.__exit__ = MagicMock(return_value=False)
-    return scraper
-
-
 class TestSofascoreReplaceGuard:
     """#583: completeness-guard wiring in the SofaScore runner.
 
-    Covers the default 'all' path (``_run_legacy``, two 2-key saves) and the
-    ``player_ratings`` path (single save). The guard arithmetic lives in
-    ``BaseScraper.save_to_iceberg`` (covered by ``test_base_scraper.py``); here
-    we cover the runner's handling. The append-only event endpoint is NOT
-    guarded (no replace_partitions, #69) and is not exercised here.
+    Covers the default 'all' path and the compatibility alias from
+    ``player_ratings`` to the common ``match_capture`` engine. The guard
+    arithmetic lives in ``BaseScraper.save_to_iceberg``; here we cover runner
+    handling and prove that the alias cannot resurrect the retired standalone
+    player-ratings capture path.
     """
 
     @pytest.fixture
@@ -193,8 +173,7 @@ class TestSofascoreReplaceGuard:
         assert any("SOFASCORE_REPLACE_GUARD" in e for e in payload["errors"])
 
     @pytest.mark.unit
-    def test_legacy_normal_path_arms_guard_exits_0(self, temp_output):
-        """Non-force 'all' run arms min_replace_ratio=0.9 on the 2-key saves."""
+    def test_legacy_normal_path_uses_incremental_natural_keys(self, temp_output):
         scraper = _legacy_scraper()
 
         rc = _run_main(
@@ -204,14 +183,20 @@ class TestSofascoreReplaceGuard:
         )
 
         assert rc == 0
-        kwargs = scraper.save_to_iceberg.call_args.kwargs
-        assert kwargs["min_replace_ratio"] == 0.9
-        assert kwargs["replace_partitions"] == ["league", "season"]
-        assert "replace_guard_key" not in kwargs
+        calls = {
+            call.kwargs['table_name']: call.kwargs
+            for call in scraper.save_to_iceberg.call_args_list
+        }
+        assert calls['sofascore_schedule']['natural_keys'] == [
+            'league', 'season', 'game_id',
+        ]
+        assert calls['sofascore_league_table']['natural_keys'] == [
+            'league', 'season', 'group', 'team',
+        ]
+        assert all('replace_partitions' not in value for value in calls.values())
 
     @pytest.mark.unit
-    def test_legacy_force_replace_disarms_guard(self, temp_output):
-        """--force-replace must pass min_replace_ratio=None to the legacy saves."""
+    def test_legacy_force_replace_recaptures_but_still_merges(self, temp_output):
         scraper = _legacy_scraper()
 
         rc = _run_main(
@@ -222,7 +207,9 @@ class TestSofascoreReplaceGuard:
 
         assert rc == 0
         kwargs = scraper.save_to_iceberg.call_args.kwargs
-        assert kwargs["min_replace_ratio"] is None
+        assert kwargs['natural_keys'] == [
+            'league', 'season', 'group', 'team',
+        ]
 
     @pytest.mark.unit
     def test_legacy_empty_source_is_hard_failure(self, temp_output):
@@ -275,8 +262,8 @@ class TestSofascoreReplaceGuard:
 
     @pytest.mark.unit
     def test_player_ratings_guard_refusal_exits_3(self, temp_output):
-        """player_ratings save refusal → exit 3 + marker (16-sp save path)."""
-        scraper = _ratings_scraper(guard_blocks=True)
+        """The legacy name keeps match_capture's ReplaceGuard semantics."""
+        scraper = _match_capture_scraper(guard_blocks=True)
 
         rc = _run_main(
             ["--entity", "player_ratings", "--league", "ENG-Premier League",
@@ -286,14 +273,14 @@ class TestSofascoreReplaceGuard:
         )
 
         assert rc == 3
+        scraper.read_match_capture.assert_called_once()
         with open(temp_output) as f:
             payload = json.load(f)
         assert any("SOFASCORE_REPLACE_GUARD" in e for e in payload["errors"])
 
     @pytest.mark.unit
-    def test_player_ratings_normal_path_arms_guard_exits_0(self, temp_output):
-        """player_ratings non-force run arms min_replace_ratio=0.9."""
-        scraper = _ratings_scraper()
+    def test_player_ratings_alias_uses_incremental_match_engine(self, temp_output):
+        scraper = _match_capture_scraper()
 
         rc = _run_main(
             ["--entity", "player_ratings", "--league", "ENG-Premier League",
@@ -303,9 +290,17 @@ class TestSofascoreReplaceGuard:
         )
 
         assert rc == 0
-        kwargs = scraper.save_to_iceberg.call_args.kwargs
-        assert kwargs["min_replace_ratio"] == 0.9
-        assert kwargs["replace_partitions"] == ["league", "season"]
+        scraper.read_match_capture.assert_called_once()
+        calls = scraper.save_to_iceberg.call_args_list
+        assert calls
+        assert all("replace_partitions" not in call.kwargs for call in calls)
+        ratings = next(
+            call for call in calls
+            if call.kwargs["table_name"] == "sofascore_player_ratings"
+        )
+        assert ratings.kwargs["natural_keys"] == [
+            "league", "season", "match_id", "player_id",
+        ]
 
 
 class TestPlayerRatingsCaptureFallback:
@@ -326,7 +321,7 @@ class TestPlayerRatingsCaptureFallback:
     @pytest.mark.unit
     def test_empty_bronze_resolves_via_capture_then_saves(self, temp_output):
         # Arrange — bronze returns [] for both season forms; capture finds ids.
-        scraper = _ratings_scraper()
+        scraper = _match_capture_scraper()
         scraper.resolve_finished_match_ids_via_capture.return_value = ['101', '103']
 
         # Act
@@ -337,15 +332,17 @@ class TestPlayerRatingsCaptureFallback:
             resolver_ids=[],
         )
 
-        # Assert — capture drove the match_ids into read_player_ratings; save ran.
+        # Assert — capture drove the ids into the one common match engine.
         assert rc == 0
         scraper.resolve_finished_match_ids_via_capture.assert_called_once()
-        assert scraper.read_player_ratings.call_args.kwargs['match_ids'] == ['101', '103']
+        assert scraper.read_match_capture.call_args.kwargs['match_ids'] == [
+            '101', '103',
+        ]
 
     @pytest.mark.unit
     def test_empty_bronze_and_empty_capture_exits_2(self, temp_output):
         # Arrange — neither bronze nor capture yields match_ids (off-season).
-        scraper = _ratings_scraper()
+        scraper = _match_capture_scraper()
         scraper.resolve_finished_match_ids_via_capture.return_value = []
 
         # Act
@@ -356,9 +353,9 @@ class TestPlayerRatingsCaptureFallback:
             resolver_ids=[],
         )
 
-        # Assert — graceful R0.2B fallback (soft success), read_player_ratings skipped.
+        # Assert — graceful R0.2B fallback before the common engine opens.
         assert rc == 2
-        scraper.read_player_ratings.assert_not_called()
+        scraper.read_match_capture.assert_not_called()
         with open(temp_output) as f:
             payload = json.load(f)
         assert payload['fallback'] is True
@@ -401,7 +398,7 @@ def _match_capture_scraper(*, guard_blocks: bool = False, empty: bool = False):
     scraper.read_match_capture.return_value = frames
     if guard_blocks:
         scraper.save_to_iceberg.side_effect = ReplaceGuardError(
-            'new=1 rows < 90% of existing=380 — refusing replace_partitions save')
+            'writer DQ guard refused the captured delta')
     else:
         scraper.save_to_iceberg.return_value = (
             'iceberg.bronze.sofascore_player_ratings')
@@ -412,8 +409,8 @@ def _match_capture_scraper(*, guard_blocks: bool = False, empty: bool = False):
 
 class TestMatchCaptureRunner:
     """#751 PR1: the consolidated match_capture entity writes BOTH
-    player_ratings and event_player_stats from one capture pass, each full-state
-    (replace_partitions + completeness guard)."""
+    player_ratings and event_player_stats from one capture pass, with every
+    table saved as a natural-keyed delta."""
 
     @pytest.fixture
     def temp_output(self):
@@ -424,7 +421,7 @@ class TestMatchCaptureRunner:
             os.unlink(path)
 
     @pytest.mark.unit
-    def test_normal_path_saves_five_tables_arms_guard(self, temp_output):
+    def test_normal_path_incrementally_saves_all_tables(self, temp_output):
         scraper = _match_capture_scraper()
         rc = _run_main(
             ["--entity", "match_capture", "--league", "ENG-Premier League",
@@ -449,8 +446,8 @@ class TestMatchCaptureRunner:
             'sofascore_match_capture_status',
         ]
         for c in scraper.save_to_iceberg.call_args_list:
-            assert c.kwargs['replace_partitions'] == ['league', 'season']
-            assert c.kwargs['min_replace_ratio'] == 0.9
+            assert c.kwargs['natural_keys'][:2] == ['league', 'season']
+            assert 'replace_partitions' not in c.kwargs
         with open(temp_output) as f:
             payload = json.load(f)
         assert payload['rows'] == 4 and payload['eps_rows'] == 4
@@ -500,7 +497,7 @@ class TestMatchCaptureRunner:
         assert any("SOFASCORE_REPLACE_GUARD" in e for e in payload["errors"])
 
     @pytest.mark.unit
-    def test_force_replace_disarms_guard(self, temp_output):
+    def test_force_replace_recaptures_with_incremental_merge(self, temp_output):
         scraper = _match_capture_scraper()
         rc = _run_main(
             ["--entity", "match_capture", "--league", "ENG-Premier League",
@@ -510,7 +507,7 @@ class TestMatchCaptureRunner:
         )
         assert rc == 0
         for c in scraper.save_to_iceberg.call_args_list:
-            assert c.kwargs['min_replace_ratio'] is None
+            assert c.kwargs['natural_keys'][:2] == ['league', 'season']
 
     @pytest.mark.unit
     def test_empty_capture_exits_2_and_keeps_incomplete_manifest(self, temp_output):
@@ -663,21 +660,15 @@ class TestMatchCaptureRunner:
         assert payload['matches_skipped_existing'] == 0
 
     @pytest.mark.unit
-    def test_merge_unions_with_existing_partition(self, temp_output):
-        """#842: the captured frame (new matches only) is unioned with the
-        existing partition before the replace_partitions save — the saved
-        frame never shrinks, so the completeness guard passes."""
-        existing = pd.DataFrame({
-            'league': ['ENG-Premier League'] * 4, 'season': ['2526'] * 4,
-            'match_id': ['8', '8', '9', '9'],
-        })
+    def test_incremental_capture_saves_only_the_natural_key_delta(
+        self, temp_output,
+    ):
         scraper = _match_capture_scraper()
         rc = _run_main(
             ["--entity", "match_capture", "--league", "ENG-Premier League",
              "--season", "2025", "--output", temp_output],
             MagicMock(return_value=scraper),
             resolver_ids=['1', '2'],
-            existing_partition=existing,
         )
         assert rc == 0
         ratings_call = next(
@@ -685,11 +676,14 @@ class TestMatchCaptureRunner:
             if c.kwargs['table_name'] == 'sofascore_player_ratings'
         )
         saved = ratings_call.kwargs['df']
-        assert sorted(set(saved['match_id'])) == ['1', '2', '8', '9']
-        assert len(saved) == 8   # 4 existing + 4 captured — never shrinks
+        assert sorted(set(saved['match_id'])) == ['1', '2']
+        assert len(saved) == 4
+        assert ratings_call.kwargs['natural_keys'] == [
+            'league', 'season', 'match_id', 'player_id',
+        ]
         with open(temp_output) as f:
             payload = json.load(f)
-        assert payload['rows'] == 8
+        assert payload['rows'] == 4
 
 
 class TestSeasonTokenNoShift:
@@ -717,10 +711,16 @@ class TestSeasonTokenNoShift:
         so_scraper_mod.R0_2B_FALLBACK_MARKER = 'R0_2B_FALLBACK'
         so_scraper_mod._season_to_short = _season_to_short
         so_scraper_mod._season_label = _season_label
+        so_pipeline_mod = MagicMock()
+        so_pipeline_mod.build_capture_runtime.return_value = None
+        so_catalog_mod = MagicMock()
+        so_catalog_mod.SofaScoreCatalog.load.return_value.competition.return_value.capture_allowed = True
         sys.argv = ["run_sofascore_scraper.py"] + argv
         with patch.dict(sys.modules, {
             "scrapers.sofascore": so_pkg,
             "scrapers.sofascore.scraper": so_scraper_mod,
+            "scrapers.sofascore.pipeline": so_pipeline_mod,
+            "scrapers.sofascore.catalog": so_catalog_mod,
         }):
             sys.modules.pop("dags.scripts.run_sofascore_scraper", None)
             mod = importlib.import_module("dags.scripts.run_sofascore_scraper")
@@ -735,7 +735,6 @@ class TestSeasonTokenNoShift:
             mod._resolve_match_ids_from_bronze = _resolver
             mod._existing_match_ids_in_bronze = lambda *a, **k: set()
             mod._existing_complete_capture_ids = lambda *a, **k: set()
-            mod._read_existing_partition = lambda *a, **k: pd.DataFrame()
             rc = mod.main()
         return rc, seen
 
@@ -835,7 +834,7 @@ def _player_capture_scraper(
     scraper.read_player_capture.return_value = frames
     if guard_blocks:
         scraper.save_to_iceberg.side_effect = ReplaceGuardError(
-            'new=1 rows < 90% of existing=520 — refusing replace_partitions save')
+            'writer DQ guard refused the captured delta')
     else:
         scraper.save_to_iceberg.return_value = (
             'iceberg.bronze.sofascore_player_profile')
@@ -846,8 +845,8 @@ def _player_capture_scraper(
 
 class TestPlayerCaptureRunner:
     """#751 PR3 + PR3b: the player_capture entity writes player_profile AND
-    player_season_stats from one per-player capture pass, full-state
-    (replace_partitions + completeness guard). Season-stats is secondary — its
+    player_season_stats from one per-player capture pass using natural-keyed
+    deltas. Season-stats is secondary — its
     save is skipped (not a fallback) when no exact aggregate was captured."""
 
     @pytest.fixture
@@ -859,7 +858,7 @@ class TestPlayerCaptureRunner:
             os.unlink(path)
 
     @pytest.mark.unit
-    def test_normal_path_saves_both_tables_arms_guard(self, temp_output):
+    def test_normal_path_incrementally_saves_both_tables(self, temp_output):
         scraper = _player_capture_scraper()
         rc = _run_main(
             ["--entity", "player_capture", "--league", "ENG-Premier League",
@@ -872,9 +871,13 @@ class TestPlayerCaptureRunner:
                  for c in scraper.save_to_iceberg.call_args_list}
         assert set(saved) == {'sofascore_player_profile',
                               'sofascore_player_season_stats'}
-        for kwargs in saved.values():
-            assert kwargs['replace_partitions'] == ['league', 'season']
-            assert kwargs['min_replace_ratio'] == 0.9
+        assert saved['sofascore_player_profile']['natural_keys'] == [
+            'league', 'season', 'player_id',
+        ]
+        assert saved['sofascore_player_season_stats']['natural_keys'] == [
+            'league', 'season', 'player_id',
+            'unique_tournament_id', 'sofascore_season_id',
+        ]
         with open(temp_output) as f:
             payload = json.load(f)
         assert payload['rows'] == 3
@@ -913,7 +916,7 @@ class TestPlayerCaptureRunner:
         assert any("SOFASCORE_REPLACE_GUARD" in e for e in payload["errors"])
 
     @pytest.mark.unit
-    def test_force_replace_disarms_guard(self, temp_output):
+    def test_force_replace_still_uses_incremental_merge(self, temp_output):
         scraper = _player_capture_scraper()
         rc = _run_main(
             ["--entity", "player_capture", "--league", "ENG-Premier League",
@@ -922,7 +925,7 @@ class TestPlayerCaptureRunner:
         )
         assert rc == 0
         for c in scraper.save_to_iceberg.call_args_list:
-            assert c.kwargs['min_replace_ratio'] is None
+            assert c.kwargs['natural_keys'][:2] == ['league', 'season']
 
     @pytest.mark.unit
     def test_empty_capture_exits_2_no_save(self, temp_output):
@@ -953,71 +956,15 @@ class TestPlayerCaptureRunner:
         assert payload['fallback_reason'] == 'http_403'
 
 
-def _schedule_module():
+def _runner_module():
     """Import the runner module for direct helper access — its module-level
     imports are stdlib only (scrapers are lazy), so no stubbing is needed."""
     sys.modules.pop("dags.scripts.run_sofascore_scraper", None)
     return importlib.import_module("dags.scripts.run_sofascore_scraper")
 
 
-class TestScheduleMergePartition:
-    """#761 _merge_schedule_partition: union an existing schedule partition with
-    a captured window, keyed by game_id (captured wins). Never shrinks, so the
-    completeness guard passes even on a partial capture."""
-
-    @pytest.mark.unit
-    def test_empty_existing_returns_captured(self):
-        merge = _schedule_module()._merge_schedule_partition
-        captured = pd.DataFrame({'game_id': [1, 2], 'home_score': [1.0, 2.0]})
-        out = merge(pd.DataFrame(), captured)
-        assert sorted(out['game_id']) == [1, 2]
-
-    @pytest.mark.unit
-    def test_none_existing_returns_captured(self):
-        merge = _schedule_module()._merge_schedule_partition
-        captured = pd.DataFrame({'game_id': [1], 'home_score': [3.0]})
-        out = merge(None, captured)
-        assert out['game_id'].tolist() == [1]
-
-    @pytest.mark.unit
-    def test_union_keeps_captured_for_overlap_and_never_shrinks(self):
-        merge = _schedule_module()._merge_schedule_partition
-        existing = pd.DataFrame({
-            'game_id': [1, 2, 4, 5, 6],
-            'home_score': [0.0, 0.0, 3.0, 1.0, 2.0],
-        })
-        captured = pd.DataFrame({
-            'game_id': [1, 2, 3],          # 1,2 overlap (fresh scores); 3 new
-            'home_score': [1.0, 2.0, 9.0],
-        })
-        out = merge(existing, captured)
-        assert sorted(out['game_id']) == [1, 2, 3, 4, 5, 6]
-        assert len(out) >= len(existing)               # never shrinks
-        assert out.set_index('game_id').loc[1, 'home_score'] == 1.0  # captured wins
-        assert out.set_index('game_id').loc[2, 'home_score'] == 2.0
-        assert out.set_index('game_id').loc[4, 'home_score'] == 3.0  # existing kept
-
-    @pytest.mark.unit
-    def test_union_preserves_columns_absent_from_current_capture(self):
-        merge = _schedule_module()._merge_schedule_partition
-        existing = pd.DataFrame(
-            {
-                "game_id": [1, 2],
-                "rare_source_field": ["x", "y"],
-            }
-        )
-        captured = pd.DataFrame({"game_id": [2, 3], "status_type": ["finished"] * 2})
-
-        out = merge(existing, captured).set_index("game_id")
-
-        assert {"rare_source_field", "status_type"} <= set(out.columns)
-        assert out.loc[1, "rare_source_field"] == "x"
-        assert out.loc[2, "rare_source_field"] == "y"
-
-
-class TestScheduleCaptureMergeRunner:
-    """#761 _run_legacy merges the captured schedule window with the existing
-    bronze partition before the replace_partitions save."""
+class TestScheduleCaptureIncrementalRunner:
+    """Schedule capture publishes its natural-keyed delta without a readback."""
 
     @pytest.fixture
     def temp_output(self):
@@ -1028,14 +975,10 @@ class TestScheduleCaptureMergeRunner:
             os.unlink(path)
 
     @pytest.mark.unit
-    def test_merge_unions_with_existing_partition(self, temp_output):
+    def test_schedule_saves_incremental_natural_key_delta(self, temp_output):
         captured = pd.DataFrame({
             'league': ['ENG-Premier League'] * 3, 'season': ['2526'] * 3,
             'game_id': [1, 2, 3], 'home_score': [1.0, 2.0, None],
-        })
-        existing = pd.DataFrame({
-            'league': ['ENG-Premier League'] * 5, 'season': ['2526'] * 5,
-            'game_id': [1, 2, 4, 5, 6], 'home_score': [0.0, 0.0, 3.0, 1.0, 2.0],
         })
         scraper = _legacy_scraper()
         scraper.read_schedule.return_value = captured
@@ -1053,7 +996,6 @@ class TestScheduleCaptureMergeRunner:
                 temp_output,
             ],
             MagicMock(return_value=scraper),
-            existing_schedule=existing,
         )
 
         assert rc == 0
@@ -1062,95 +1004,11 @@ class TestScheduleCaptureMergeRunner:
             if c.kwargs['table_name'] == 'sofascore_schedule'
         )
         saved = schedule_call.kwargs['df']
-        assert sorted(saved['game_id']) == [1, 2, 3, 4, 5, 6]   # union
-        assert len(saved) >= len(existing)                       # never shrinks
+        assert sorted(saved['game_id']) == [1, 2, 3]
+        assert schedule_call.kwargs['natural_keys'] == [
+            'league', 'season', 'game_id',
+        ]
         assert saved.set_index('game_id').loc[1, 'home_score'] == 1.0  # captured wins
-
-
-class TestMergeMatchPartition:
-    """#842 _merge_match_partition: union an existing per-match partition with
-    captured rows for NEW matches, keyed by match_id/game_id. A re-captured
-    match replaces its existing rows wholesale; the union never shrinks, so
-    the completeness guard passes."""
-
-    @pytest.mark.unit
-    def test_empty_existing_returns_captured(self):
-        merge = _schedule_module()._merge_match_partition
-        captured = pd.DataFrame({'match_id': ['1', '1'], 'rating': [6.5, 7.0]})
-        out = merge(pd.DataFrame(), captured, key='match_id')
-        assert len(out) == 2
-
-    @pytest.mark.unit
-    def test_none_existing_returns_captured(self):
-        merge = _schedule_module()._merge_match_partition
-        captured = pd.DataFrame({'match_id': ['1'], 'rating': [6.5]})
-        out = merge(None, captured, key='match_id')
-        assert out['match_id'].tolist() == ['1']
-
-    @pytest.mark.unit
-    def test_union_never_shrinks_and_recaptured_match_wins(self):
-        merge = _schedule_module()._merge_match_partition
-        existing = pd.DataFrame({
-            'match_id': ['1', '1', '2'], 'rating': [5.0, 5.5, 6.0],
-        })
-        captured = pd.DataFrame({
-            'match_id': ['2', '3'],       # 2 re-captured, 3 new
-            'rating': [9.0, 8.0],
-        })
-        out = merge(existing, captured, key='match_id')
-        assert sorted(out['match_id']) == ['1', '1', '2', '3']
-        assert len(out) >= len(existing)                 # never shrinks
-        # the re-captured match's OLD row is dropped wholesale — no stale mix.
-        assert out.set_index('match_id').loc['2', 'rating'] == 9.0
-
-    @pytest.mark.unit
-    def test_key_type_mismatch_coerced_via_str(self):
-        """Trino returns varchar keys; a captured frame may carry ints (venue
-        game_id) — the key comparison must coerce both sides to str."""
-        merge = _schedule_module()._merge_match_partition
-        existing = pd.DataFrame({'game_id': ['1', '2'], 'stadium': ['A', 'B']})
-        captured = pd.DataFrame({'game_id': [2, 3], 'stadium': ['B2', 'C']})
-        out = merge(existing, captured, key='game_id')
-        assert len(out) == 3                             # '2' replaced, not doubled
-        assert set(out['stadium']) == {'A', 'B2', 'C'}
-
-    @pytest.mark.unit
-    def test_preserves_evolving_source_columns(self):
-        merge = _schedule_module()._merge_match_partition
-        existing = pd.DataFrame(
-            {
-                "match_id": ["1"],
-                "rare_source_field": ["kept"],
-            }
-        )
-        captured = pd.DataFrame({"match_id": ["2"], "new_source_field": [7]})
-        out = merge(existing, captured, key="match_id").set_index("match_id")
-        assert out.loc["1", "rare_source_field"] == "kept"
-        assert out.loc["2", "new_source_field"] == 7
-
-    @pytest.mark.unit
-    def test_recaptured_player_keeps_column_absent_from_fresh_schema(self):
-        merge = _schedule_module()._merge_match_partition
-        existing = pd.DataFrame(
-            {
-                'match_id': ['2'],
-                'player_id': ['10'],
-                'rare_source_field': ['kept'],
-                'rating': [6.0],
-            }
-        )
-        captured = pd.DataFrame(
-            {
-                'match_id': ['2'],
-                'player_id': ['10'],
-                'rating': [7.0],
-            }
-        )
-
-        out = merge(existing, captured, key='match_id').iloc[0]
-
-        assert out['rating'] == 7.0
-        assert out['rare_source_field'] == 'kept'
 
 
 class TestFilterNewMatchIds:
@@ -1158,7 +1016,7 @@ class TestFilterNewMatchIds:
 
     @pytest.mark.unit
     def test_filters_and_counts(self, monkeypatch):
-        mod = _schedule_module()
+        mod = _runner_module()
         monkeypatch.setattr(
             mod, '_existing_complete_capture_ids', lambda *a, **k: {'2', '3'})
         new, skipped, seed, missing = mod._filter_new_match_ids(
@@ -1167,7 +1025,7 @@ class TestFilterNewMatchIds:
 
     @pytest.mark.unit
     def test_empty_probe_skips_nothing(self, monkeypatch):
-        mod = _schedule_module()
+        mod = _runner_module()
         monkeypatch.setattr(
             mod, '_existing_complete_capture_ids', lambda *a, **k: set())
         new, skipped, seed, missing = mod._filter_new_match_ids(
@@ -1176,7 +1034,7 @@ class TestFilterNewMatchIds:
 
     @pytest.mark.unit
     def test_int_ids_compared_as_str(self, monkeypatch):
-        mod = _schedule_module()
+        mod = _runner_module()
         monkeypatch.setattr(
             mod, '_existing_complete_capture_ids', lambda *a, **k: {'10'})
         new, skipped, seed, missing = mod._filter_new_match_ids(
@@ -1192,7 +1050,7 @@ class TestSkipExistingRequiresCompleteCapture:
         self,
         monkeypatch,
     ):
-        mod = _schedule_module()
+        mod = _runner_module()
         calls = []
 
         def _probe(table, league, season, id_col='match_id'):
@@ -1224,7 +1082,7 @@ class TestSkipExistingRequiresCompleteCapture:
 
     @pytest.mark.unit
     def test_preflight_manifest_contains_legacy_and_pending_rows(self):
-        mod = _schedule_module()
+        mod = _runner_module()
         scraper = MagicMock()
         scraper._add_metadata.side_effect = lambda frame, entity: frame
 
@@ -1241,12 +1099,12 @@ class TestSkipExistingRequiresCompleteCapture:
         assert bool(frame.loc['1', 'capture_complete']) is True
         assert bool(frame.loc['2', 'capture_complete']) is False
         assert frame.loc['2', 'event_status'] == 'pending'
-        assert call.kwargs['min_replace_ratio'] is None
+        assert call.kwargs['natural_keys'] == ['league', 'season', 'match_id']
 
     @pytest.mark.unit
     def test_probe_sql_selects_the_requested_id_col(self, monkeypatch):
         # Arrange — venue rows are keyed by game_id, not match_id.
-        mod = _schedule_module()
+        mod = _runner_module()
         cur = MagicMock()
         cur.fetchall.return_value = [('101',), ('103',)]
         conn = MagicMock()
@@ -1264,7 +1122,7 @@ class TestSkipExistingRequiresCompleteCapture:
 
     @pytest.mark.unit
     def test_probe_fails_closed_when_trino_is_unavailable(self, monkeypatch):
-        mod = _schedule_module()
+        mod = _runner_module()
         conn = MagicMock()
         conn.cursor.return_value.execute.side_effect = RuntimeError("connection reset")
         monkeypatch.setattr(mod, "_trino_connect", lambda: conn)
@@ -1281,7 +1139,7 @@ class TestSkipExistingRequiresCompleteCapture:
 class TestBronzeMatchResolver:
     @pytest.mark.unit
     def test_filters_by_finished_status_not_live_score(self, monkeypatch):
-        mod = _schedule_module()
+        mod = _runner_module()
         cur = MagicMock()
         cur.fetchall.return_value = [("101",)]
         conn = MagicMock()
@@ -1300,7 +1158,7 @@ class TestBronzeMatchResolver:
 
     @pytest.mark.unit
     def test_operational_error_fails_closed(self, monkeypatch):
-        mod = _schedule_module()
+        mod = _runner_module()
         conn = MagicMock()
         conn.cursor.return_value.execute.side_effect = RuntimeError("connection reset")
         monkeypatch.setattr(mod, "_trino_connect", lambda: conn)

@@ -1,0 +1,20 @@
+{
+  "standings": [
+    {
+      "type": "total",
+      "name": "Group A",
+      "rows": [
+        {"team": {"id": 42, "name": "Arsenal"}, "matches": 2, "wins": 2, "draws": 0, "losses": 0, "scoresFor": 5, "scoresAgainst": 1, "points": 6},
+        {"team": {"id": 44, "name": "Liverpool"}, "matches": 2, "wins": 1, "draws": 0, "losses": 1, "scoresFor": 3, "scoresAgainst": 2, "points": 3}
+      ]
+    },
+    {
+      "type": "total",
+      "name": "Group B",
+      "rows": [
+        {"team": {"id": 17, "name": "Manchester City"}, "matches": 2, "wins": 1, "draws": 1, "losses": 0, "scoresFor": 4, "scoresAgainst": 2, "points": 4},
+        {"team": {"id": 33, "name": "Chelsea"}, "matches": 2, "wins": 0, "draws": 1, "losses": 1, "scoresFor": 1, "scoresAgainst": 3, "points": 1}
+      ]
+    }
+  ]
+}

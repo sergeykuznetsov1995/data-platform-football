@@ -12,8 +12,9 @@ Storage Pipeline:
 import logging
 import os
 import time
+import uuid
 from datetime import date, datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 import numpy as np
 import pandas as pd
@@ -561,6 +562,7 @@ WITH (
         batch_size: int = 1000,
         delete_filter: Optional[str] = None,
         staging_id: Optional[str] = None,
+        merge_keys: Optional[Sequence[str]] = None,
     ) -> int:
         """
         Insert a DataFrame so the target table receives exactly ONE snapshot.
@@ -595,6 +597,9 @@ WITH (
                 are deleted from the target as part of the swap (partition
                 replace) instead of a plain append. A failure here raises — it is
                 never downgraded to a silent append.
+            merge_keys: Optional natural key for an incremental Iceberg MERGE.
+                Mutually exclusive with ``delete_filter``.
+            staging_id: Optional caller-owned unique staging suffix.
 
         Returns:
             Number of rows inserted into the target
@@ -621,19 +626,29 @@ WITH (
             )
             return 0
 
-        # Parallel ingestion shards must never share a predictable staging
-        # table. Existing callers retain the historical name; distributed
-        # callers pass a run/task/map/try/UUID-qualified token.
+        if delete_filter and merge_keys:
+            raise ValueError("delete_filter and merge_keys are mutually exclusive")
+
+        keys = tuple(merge_keys or ())
+        for key in keys:
+            validate_identifier(key, "merge key")
+            if key not in df.columns:
+                raise ValueError(f"merge key {key!r} is absent from DataFrame")
+            if df[key].isna().any():
+                raise ValueError(f"merge key {key!r} contains null values")
+        if keys and df.duplicated(subset=list(keys)).any():
+            raise ValueError(f"duplicate rows for merge keys {list(keys)!r}")
+
+        # Parallel writers must never share a staging table. Distributed
+        # callers may supply their signed run/task suffix; every other caller
+        # receives a process-unique suffix.
         if staging_id:
             validate_identifier(staging_id, "staging id")
             stage = f"{table}__stg_{staging_id}"
         else:
-            stage = f"{table}__stg"  # compatibility for existing callers
+            stage = f"{table}__stg_{uuid.uuid4().hex[:12]}"
         qualified_target = validate_catalog_qualified_name(self.catalog, schema, table)
         qualified_stage = validate_catalog_qualified_name(self.catalog, schema, stage)
-
-        # Clean any leftover stage from a previously crashed run.
-        self.drop_table(schema, stage, if_exists=True)
 
         # Empty copy of the target schema (column names/types incl. metadata).
         self._execute(f"CREATE TABLE {qualified_stage} AS SELECT * FROM {qualified_target} WHERE false")
@@ -660,16 +675,34 @@ WITH (
         # INSERT...SELECT is the whole replace.
         cols = ', '.join(f'"{c}"' for c in df.columns)
         try:
-            if delete_filter:
-                self._execute(f"DELETE FROM {qualified_target} WHERE {delete_filter}")
-                logger.info(
-                    f"Deleted rows matching '{delete_filter}' from {qualified_target}"
+            if keys:
+                on_clause = " AND ".join(
+                    f't."{key}" = s."{key}"' for key in keys
                 )
-            # Single INSERT...SELECT → exactly one snapshot on the target.
-            self._execute(
-                f"INSERT INTO {qualified_target} ({cols}) "
-                f"SELECT {cols} FROM {qualified_stage}"
-            )
+                update_columns = [column for column in df.columns if column not in keys]
+                update_clause = ""
+                if update_columns:
+                    assignments = ", ".join(
+                        f't."{column}" = s."{column}"'
+                        for column in update_columns
+                    )
+                    update_clause = f"WHEN MATCHED THEN UPDATE SET {assignments} "
+                values = ", ".join(f's."{column}"' for column in df.columns)
+                self._execute(
+                    f"MERGE INTO {qualified_target} t USING {qualified_stage} s "
+                    f"ON {on_clause} {update_clause}"
+                    f"WHEN NOT MATCHED THEN INSERT ({cols}) VALUES ({values})"
+                )
+            else:
+                if delete_filter:
+                    self._execute(f"DELETE FROM {qualified_target} WHERE {delete_filter}")
+                    logger.info(
+                        f"Deleted rows matching '{delete_filter}' from {qualified_target}"
+                    )
+                self._execute(
+                    f"INSERT INTO {qualified_target} ({cols}) "
+                    f"SELECT {cols} FROM {qualified_stage}"
+                )
         except Exception:
             # The DELETE may already be committed while the INSERT failed, so the
             # stage is now the only copy of these rows. Do NOT drop it — keep it
@@ -683,7 +716,11 @@ WITH (
         # Swap succeeded — discard the throwaway stage and its snapshot churn.
         self.drop_table(schema, stage, if_exists=True)
 
-        logger.info(f"Inserted {inserted} rows into {qualified_target} (via stage, 1 snapshot)")
+        operation = "Merged" if keys else "Inserted"
+        logger.info(
+            f"{operation} {inserted} rows into {qualified_target} "
+            f"(via unique stage, 1 snapshot)"
+        )
         return inserted
 
     def drop_table(self, schema: str, table: str, if_exists: bool = True) -> None:

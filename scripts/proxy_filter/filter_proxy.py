@@ -34,6 +34,11 @@ from urllib.parse import urlsplit
 
 sys.path.insert(0, "/opt/airflow")
 
+from scripts.proxy_filter.budget import (  # noqa: E402 - standalone script path above
+    SharedBudgetLedger,
+    load_verified_policy,
+)
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s filter_proxy: %(message)s")
 log = logging.getLogger("filter_proxy")
 
@@ -44,6 +49,8 @@ conn_count: dict[str, int] = defaultdict(int)
 blocked_count: dict[str, int] = defaultdict(int)
 
 BLOCKLIST: set[str] = set()
+provider_budget_guard = None
+provider_budget_endpoint: str | None = None
 
 # Idle-refresh rotation state (#652). The residential exit is refreshed only when
 # no tunnel is currently open (``_active == 0``), so one exit IP serves a whole
@@ -112,12 +119,31 @@ def _acquire_upstream(mgr):
     return _current_up
 
 
-async def _pump(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, host: str, counter: dict[str, int]) -> None:
+async def _pump(
+    reader: asyncio.StreamReader,
+    writer: asyncio.StreamWriter,
+    host: str,
+    counter: dict[str, int],
+    budget_guard=None,
+) -> None:
     try:
         while True:
-            chunk = await reader.read(65536)
+            metered_read = getattr(budget_guard, "read_metered", None)
+            precharged = callable(metered_read)
+            if precharged:
+                # Claim the provider window before reading. This is atomic
+                # across both tunnel directions and therefore cannot race over
+                # the final bytes of the logical-run budget.
+                chunk = await metered_read(reader, 65536)
+            else:
+                chunk = await reader.read(65536)
             if not chunk:
                 break
+            # Charge the bytes at the real upstream-provider path before they
+            # are forwarded.  When the measured reservation is exhausted the
+            # tunnel closes here, rather than completing an over-budget retry.
+            if budget_guard is not None and not precharged:
+                budget_guard.consume(len(chunk))
             counter[host] += len(chunk)
             writer.write(chunk)
             await writer.drain()
@@ -186,8 +212,8 @@ async def handle(client_r: asyncio.StreamReader, client_w: asyncio.StreamWriter,
                 client_w.write(b"HTTP/1.1 200 Connection established\r\n\r\n")
                 await client_w.drain()
                 await asyncio.gather(
-                    _pump(client_r, srv_w, host, up_bytes),
-                    _pump(srv_r, client_w, host, down_bytes),
+                    _pump(client_r, srv_w, host, up_bytes, provider_budget_guard),
+                    _pump(srv_r, client_w, host, down_bytes, provider_budget_guard),
                 )
             else:
                 conn_count[host] += 1
@@ -196,8 +222,8 @@ async def handle(client_r: asyncio.StreamReader, client_w: asyncio.StreamWriter,
                 srv_w.write(f"Proxy-Authorization: Basic {auth}\r\n".encode())
                 await srv_w.drain()
                 await asyncio.gather(
-                    _pump(client_r, srv_w, host, up_bytes),
-                    _pump(srv_r, client_w, host, down_bytes),
+                    _pump(client_r, srv_w, host, up_bytes, provider_budget_guard),
+                    _pump(srv_r, client_w, host, down_bytes, provider_budget_guard),
                 )
         finally:
             _active -= 1
@@ -229,6 +255,15 @@ def _dump(out_path: str, quiet: bool = False) -> None:
             key=lambda r: -r["attempts"],
         ),
     }
+    if provider_budget_guard is not None:
+        # Exact bytes, not rounded MB or HTTP body length, are the canary input.
+        report["total_provider_bytes"] = total
+        report["endpoint_provider_bytes"] = {
+            provider_budget_endpoint: total,
+        }
+        report["endpoint_request_provider_bytes"] = {
+            provider_budget_endpoint: [total],
+        }
     tmp = out_path + ".tmp"
     with open(tmp, "w") as fh:
         json.dump(report, fh, indent=2)
@@ -257,18 +292,81 @@ async def main() -> None:
     ap.add_argument("--blocklist", default=None, help="domain blocklist file (omit = observe only)")
     ap.add_argument("--out", default="/tmp/filter_bytes.json")
     ap.add_argument("--pidfile", default="/tmp/filter_proxy.pid")
+    ap.add_argument("--budget-artifact")
+    ap.add_argument("--budget-ledger")
+    ap.add_argument("--budget-run-id")
+    ap.add_argument("--budget-reservation-token")
+    ap.add_argument("--budget-endpoint")
     args = ap.parse_args()
 
     with open(args.pidfile, "w") as fh:
         fh.write(str(os.getpid()))
 
-    global BLOCKLIST
+    global BLOCKLIST, provider_budget_guard, provider_budget_endpoint
     BLOCKLIST = _load_blocklist(args.blocklist)
     log.info("blocklist: %d domains from %s", len(BLOCKLIST), args.blocklist or "(none — observe mode)")
 
     mgr = _residential_manager(args.proxy_file)
     log.info("residential pool = %d proxies (idle-refresh per FS session)", mgr.total_count)
     host, port = args.listen.rsplit(":", 1)
+
+    budget_args = (
+        args.budget_artifact,
+        args.budget_ledger,
+        args.budget_run_id,
+        args.budget_reservation_token,
+        args.budget_endpoint,
+    )
+    if any(budget_args) and not all(budget_args):
+        raise SystemExit("all --budget-* arguments are required together")
+    if all(budget_args):
+        policy = load_verified_policy(args.budget_artifact)
+        ledger = SharedBudgetLedger(args.budget_ledger, policy)
+
+        class _Guard:
+            async def read_metered(
+                self,
+                reader: asyncio.StreamReader,
+                max_bytes: int,
+            ) -> bytes:
+                claimed = ledger.claim(
+                    args.budget_run_id,
+                    args.budget_reservation_token,
+                    max_bytes,
+                )
+                try:
+                    chunk = await reader.read(claimed)
+                except BaseException:
+                    ledger.refund(
+                        args.budget_run_id,
+                        args.budget_reservation_token,
+                        claimed,
+                    )
+                    raise
+                unused = claimed - len(chunk)
+                if unused:
+                    ledger.refund(
+                        args.budget_run_id,
+                        args.budget_reservation_token,
+                        unused,
+                    )
+                return chunk
+
+            def consume(self, amount: int) -> None:
+                ledger.consume(
+                    args.budget_run_id,
+                    args.budget_reservation_token,
+                    amount,
+                )
+
+        provider_budget_guard = _Guard()
+        provider_budget_endpoint = args.budget_endpoint
+        log.info(
+            "hard provider budget active run=%s endpoint=%s artifact=%s",
+            args.budget_run_id,
+            args.budget_endpoint,
+            policy.artifact_id,
+        )
 
     server = await asyncio.start_server(lambda r, w: handle(r, w, mgr), host, int(port))
     log.info("listening on %s (no auth — point FlareSolverr proxy here)", args.listen)

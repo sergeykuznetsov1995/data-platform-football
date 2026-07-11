@@ -1,0 +1,8 @@
+{
+  "currentRound": {"round": 3, "name": "Round 3"},
+  "rounds": [
+    {"round": 1, "name": "Round 1"},
+    {"round": 2, "name": "Round 2"},
+    {"round": 3, "name": "Round 3"}
+  ]
+}

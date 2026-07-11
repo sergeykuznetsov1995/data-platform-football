@@ -1,0 +1,27 @@
+{
+  "positive": [
+    {"id": 17, "name": "Premier League", "gender": "M"},
+    {"id": 7, "name": "UEFA Champions League", "gender": "M"},
+    {"id": 16, "name": "World Cup", "gender": "M"},
+    {"id": 270, "name": "Africa Cup of Nations", "gender": "M"},
+    {"id": 10783, "name": "UEFA Nations League", "gender": "M"},
+    {"id": 1, "name": "EURO", "gender": "M"},
+    {"id": 133, "name": "Copa América", "gender": "M"},
+    {"id": 203, "name": "Premier Liga", "gender": "M"},
+    {"id": 8, "name": "LaLiga", "gender": "M"},
+    {"id": 23, "name": "Serie A", "gender": "M"},
+    {"id": 35, "name": "Bundesliga", "gender": "M"},
+    {"id": 34, "name": "Ligue 1", "gender": "M"}
+  ],
+  "negative": [
+    {"id": 696, "name": "UEFA Women's Champions League", "gender": "F", "sport": "football"},
+    {"id": 9558, "name": "Women's Africa Cup of Nations", "gender": "F", "sport": "football"},
+    {"id": 10020, "name": "U20 World Cup", "gender": "M", "sport": "football"},
+    {"id": 1303, "name": "U21 League", "gender": "M", "sport": "football"},
+    {"id": 849, "name": "Reservecompetitie", "gender": "M", "sport": "football", "isReserve": true},
+    {"id": 50004, "name": "Reserve League", "gender": "M", "sport": "football"},
+    {"id": 50001, "name": "Futsal Champions League", "gender": "M", "sport": "futsal"},
+    {"id": 50002, "name": "Unknown Gender League", "sport": "football"},
+    {"id": 50003, "name": "Mixed League", "gender": "mixed", "sport": "football"}
+  ]
+}

@@ -1,0 +1,107 @@
+name: SofaScore registry discovery
+
+on:
+  schedule:
+    # Refresh reviewed/active source metadata six days a week.  Sunday's run is
+    # a complete category scan that can discover new disabled tournaments.
+    - cron: "17 4 * * 1-6"
+    - cron: "17 4 * * 0"
+  workflow_dispatch:
+    inputs:
+      scope:
+        description: Discovery scope
+        required: true
+        default: full
+        type: choice
+        options:
+          - full
+          - active-reviewed
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: sofascore-registry-discovery
+  cancel-in-progress: false
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install direct JSON transport
+        run: python -m pip install --disable-pip-version-check "curl-cffi==0.15.0"
+
+      - name: Refresh registry without browser or proxy
+        id: discovery
+        env:
+          # A poison environment proves the discovery transport ignores all
+          # inherited proxy settings.  The direct client also clears libcurl's
+          # CURLOPT_PROXY on every session.
+          HTTP_PROXY: http://127.0.0.1:9
+          HTTPS_PROXY: http://127.0.0.1:9
+          ALL_PROXY: http://127.0.0.1:9
+          http_proxy: http://127.0.0.1:9
+          https_proxy: http://127.0.0.1:9
+          all_proxy: http://127.0.0.1:9
+          PROXY_FILE: /does/not/exist
+        shell: bash
+        run: |
+          scope="active-reviewed"
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            scope="${{ inputs.scope }}"
+          elif [[ "${{ github.event.schedule }}" == "17 4 * * 0" ]]; then
+            scope="full"
+          fi
+          python dags/scripts/run_sofascore_discovery.py \
+            --scope "$scope" \
+            --registry configs/sofascore/tournaments.json \
+            --output /tmp/sofascore-discovery-report.json
+          python - <<'PY'
+          import json
+          report = json.load(open("/tmp/sofascore-discovery-report.json"))
+          traffic = report["traffic"]
+          assert report["status"] == "success", report
+          assert traffic["paid_proxy_bytes"] == 0, traffic
+          assert traffic["browser_sessions"] == 0, traffic
+          assert traffic["browser_navigations"] == 0, traffic
+          PY
+
+      - name: Open or update discovery review PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          if git diff --quiet -- configs/sofascore/tournaments.json; then
+            echo "Registry is already current."
+            exit 0
+          fi
+          branch="automation/sofascore-registry-discovery"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -C "$branch"
+          git add configs/sofascore/tournaments.json
+          git commit -m "chore(sofascore): refresh discovery registry"
+          remote_sha="$(git ls-remote --heads origin "$branch" | cut -f1)"
+          git push \
+            --force-with-lease="refs/heads/$branch:$remote_sha" \
+            origin "$branch"
+          number="$(gh pr list --head "$branch" --state open --json number --jq '.[0].number // empty')"
+          if [[ -z "$number" ]]; then
+            gh pr create \
+              --base master \
+              --head "$branch" \
+              --title "chore(sofascore): refresh discovery registry" \
+              --body "Automated direct-JSON discovery. New tournaments remain disabled and require evidenced adult-men review before activation."
+          else
+            gh pr comment "$number" --body "Registry refreshed by the latest zero-proxy discovery run."
+          fi

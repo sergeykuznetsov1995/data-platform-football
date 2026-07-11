@@ -1185,18 +1185,39 @@ def _fetch_sofascore_players(
 ) -> List[Dict[str, Any]]:
     """Read SofaScore player anchor rows for the resolver cascade.
 
-    Bronze ``sofascore_player_season_stats`` does NOT carry a player_name
-    column (the season-stats flattener only emits team_name + IDs + stats).
-    The display name needed for the fuzzy ``name_team`` tier comes from a
-    LEFT JOIN to ``bronze.sofascore_player_profile`` which DOES carry
-    ``name`` / ``short_name``. If profile is sparse, the cascade will
-    silently fall through to orphan — that is expected.
+    The participant spine is the captured player-universe index (registered
+    squads union every match/incident actor), not ratings or season aggregates.
+    Display names still come from the profile snapshot; match rows provide a
+    best-effort current team and minutes signal (#724/#869).
     """
     # Minutes-played proxy via SUM over bronze.sofascore_event_player_stats
     # (per-match grain). Used as dedup tiebreaker in
     # _dedup_canonical_per_season (issue #70). NULL fallback to 0.0.
     sql = f"""
-        WITH mins AS (
+        WITH participants AS (
+            SELECT
+                CAST(player_id AS varchar) AS player_id,
+                league,
+                season
+            FROM iceberg.bronze.sofascore_player_universe
+            WHERE league = '{_sql_escape(league)}'
+              AND season IN ({_seasons_in_clause(source_seasons)})
+              AND player_id IS NOT NULL
+            GROUP BY CAST(player_id AS varchar), league, season
+        ),
+        teams AS (
+            SELECT
+                CAST(player_id AS varchar) AS player_id,
+                league,
+                season,
+                max_by(team_name, _ingested_at) AS team_name
+            FROM iceberg.bronze.sofascore_event_player_stats
+            WHERE league = '{_sql_escape(league)}'
+              AND season IN ({_seasons_in_clause(source_seasons)})
+              AND player_id IS NOT NULL
+            GROUP BY CAST(player_id AS varchar), league, season
+        ),
+        mins AS (
             SELECT
                 player_id,
                 league,
@@ -1211,17 +1232,21 @@ def _fetch_sofascore_players(
         SELECT
             CAST(b.player_id AS varchar) AS pid,
             COALESCE(MAX(p.name), MAX(p.short_name)) AS player_name,
-            MAX(b.team_name) AS team,
+            MAX(t.team_name) AS team,
             b.league,
             b.season,
             COALESCE(MAX(m.minutes_played), 0.0) AS bronze_signal
-        FROM iceberg.bronze.sofascore_player_season_stats b
+        FROM participants b
         LEFT JOIN iceberg.bronze.sofascore_player_profile p
           ON p.player_id = b.player_id
         LEFT JOIN mins m
           ON m.player_id = b.player_id
          AND m.league = b.league
          AND m.season = b.season
+        LEFT JOIN teams t
+          ON t.player_id = b.player_id
+         AND t.league = b.league
+         AND t.season = b.season
         WHERE b.league = '{_sql_escape(league)}'
           AND b.season IN ({_seasons_in_clause(source_seasons)})
           AND b.player_id IS NOT NULL

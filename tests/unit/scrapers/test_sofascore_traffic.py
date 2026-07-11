@@ -1,9 +1,7 @@
-"""SofaScore residential-proxy byte counter (issue #789 Phase 2 + #879).
+"""SofaScore Camoufox traffic diagnostics (issue #879).
 
-Counts response-body bytes of the tls REST path (`_fetch_json_endpoint`) per
-host, plus — since #879 — the rx+tx bytes of each Camoufox capture session,
-folded in at session teardown by `_camoufox_session`. The counter must count
-every status, aggregate by host, and never raise on a malformed response.
+Provider-authoritative budget accounting belongs to the common capture engine;
+this compatibility counter covers browser rx+tx and operation counts only.
 """
 
 from unittest.mock import MagicMock, patch
@@ -13,52 +11,9 @@ import pytest
 from scrapers.sofascore import SofaScoreScraper
 
 
-class _FakeResp:
-    def __init__(self, body: bytes, status: int = 200):
-        self.content = body
-        self.status_code = status
-
-
 @pytest.fixture
 def scraper():
     return SofaScoreScraper(leagues=['ENG-Premier League'], seasons=[2025])
-
-
-@pytest.mark.unit
-def test_record_proxy_bytes_accumulates_by_host(scraper):
-    scraper._record_proxy_bytes('https://api.sofascore.com/a', _FakeResp(b'a' * 1000))
-    scraper._record_proxy_bytes('https://api.sofascore.com/b', _FakeResp(b'b' * 2000))
-
-    stats = scraper.get_traffic_stats()
-
-    assert stats['proxy_response_bytes'] == 3000
-    assert stats['proxy_response_mb'] == round(3000 / 1024 / 1024, 4)
-    assert stats['top_traffic_urls'][0] == {
-        'url': 'api.sofascore.com',
-        'bytes': 3000,
-        'mb': round(3000 / 1024 / 1024, 4),
-    }
-
-
-@pytest.mark.unit
-def test_counts_error_pages_too(scraper):
-    scraper._record_proxy_bytes(
-        'https://api.sofascore.com/z', _FakeResp(b'x' * 500, status=403)
-    )
-
-    assert scraper.get_traffic_stats()['proxy_response_bytes'] == 500
-
-
-@pytest.mark.unit
-def test_counter_never_raises_on_bad_response(scraper):
-    class _Bad:
-        @property
-        def content(self):
-            raise RuntimeError('stream gone')
-
-    scraper._record_proxy_bytes('https://x', _Bad())  # must not raise
-
-    assert scraper.get_traffic_stats()['proxy_response_bytes'] == 0
 
 
 @pytest.mark.unit
@@ -118,22 +73,6 @@ def test_camoufox_operation_counters_fold_into_stats(scraper):
     assert stats['browser_navigations'] == 1
     assert stats['browser_api_fetches'] == 7
     assert stats['browser_blocked_requests'] == 12
-
-
-@pytest.mark.unit
-def test_camoufox_bytes_sum_with_tls_bytes(scraper):
-    fake = MagicMock()
-    fake.__enter__.return_value._bytes_total = 2 * 1024 * 1024
-    scraper._record_proxy_bytes('https://api.sofascore.com/a', _FakeResp(b'a' * 1000))
-
-    with patch('scrapers.sofascore.camoufox_capture.SofascoreCamoufoxCapture',
-               return_value=fake):
-        with scraper._camoufox_session(None):
-            pass
-
-    stats = scraper.get_traffic_stats()
-    assert stats['proxy_response_bytes'] == 2 * 1024 * 1024 + 1000
-    assert stats['camoufox_bytes'] == 2 * 1024 * 1024
 
 
 @pytest.mark.unit

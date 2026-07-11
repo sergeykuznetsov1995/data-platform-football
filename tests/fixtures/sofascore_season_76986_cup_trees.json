@@ -1,0 +1,12 @@
+{
+  "cupTrees": [
+    {
+      "id": 9001,
+      "name": "Main bracket",
+      "nodes": [
+        {"id": 1, "round": 1, "eventId": 14000001},
+        {"id": 2, "round": 2, "children": [1]}
+      ]
+    }
+  ]
+}

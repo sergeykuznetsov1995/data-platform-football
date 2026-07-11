@@ -4,8 +4,7 @@ Camoufox passive-capture transport for SofaScore (issue #757, path P2).
 Why this module exists
 ----------------------
 SofaScore's data API is gated by Cloudflare Turnstile (proven in #757). A cold
-request — ``tls_requests`` (#751), Chromium-FlareSolverr (#751), byparr/Firefox
-(#755) — gets ``403 {"reason":"challenge"}``. The only thing that works is a
+datacenter request gets ``403 {"reason":"challenge"}``. The verified capture is a
 real **Firefox (Camoufox) driven through a residential proxy**, where Turnstile
 passes invisibly and the SPA's own XHRs to **same-origin**
 ``www.sofascore.com/api/v1/*`` return real JSON. An in-page ``fetch()`` 403s
@@ -14,13 +13,14 @@ has passed the challenge, a same-origin fetch carries the clearance cookie and
 succeeds — proven by :meth:`paginate_tournament_season` (#824) and now the
 basis of the cheap per-match path :meth:`fetch_event` (#842). Navigation +
 passive capture (``page.on("response")``) remains the warm-up and fallback.
-See ``scripts/research/probe_sofascore_capture.py`` for the original spike.
+The live-probe shapes are preserved as offline fixtures under
+``tests/fixtures/sofascore_*``.
 
 This transport drives Camoufox via Playwright, uses one SPA navigation to obtain
 Turnstile clearance, then requests exact same-origin JSON paths. Downstream
 parsing reuses the existing helpers on ``SofaScoreScraper``
-(``_flatten_lineup_side``, ``_flatten_shotmap``,
-``_build_lineup_overlay_lookup``).
+(``_flatten_lineup_side``, ``_flatten_event_player_stats_from_lineups``,
+``_flatten_match_stats`` and ``_flatten_shotmap``).
 
 Heavy deps (camoufox/playwright) are imported lazily inside ``__enter__`` so this
 module stays cheap to import (unit tests exercise the pure helpers only).
@@ -38,7 +38,7 @@ import logging
 import os
 import re
 from collections import Counter
-from typing import Dict, Optional
+from typing import Callable, Dict, Optional
 
 from scrapers.sofascore._flatten import _auto_flatten
 
@@ -52,13 +52,14 @@ _NON_DATA_SEGMENTS = ("/image", "/flag", "/logo", "/jersey")
 _CONSENT_BUTTONS = ("Consent", "AGREE", "Agree", "Accept all", "I Accept", "Got it")
 # Logical endpoint groups retained for the existing caller API. No DOM clicks
 # are performed; labels map directly to exact JSON endpoints.
-_EVENT_TABS = ("Lineups", "Statistics", "Shotmap")
+_EVENT_TABS = ("Lineups", "Statistics", "Shotmap", "Incidents")
 # Canonical per-event endpoints we want out of the capture buffer.
 _EVENT_ENDPOINTS = {
     "event": "/api/v1/event/{eid}",
     "lineups": "/api/v1/event/{eid}/lineups",
     "statistics": "/api/v1/event/{eid}/statistics",
     "shotmap": "/api/v1/event/{eid}/shotmap",
+    "incidents": "/api/v1/event/{eid}/incidents",
 }
 
 # Deep-tab label → endpoint name(s) an in-page fetch must pull to match what a
@@ -68,6 +69,7 @@ _TAB_FETCH_NAMES = {
     "Lineups": ("lineups",),
     "Statistics": ("statistics",),
     "Shotmap": ("shotmap",),
+    "Incidents": ("incidents",),
 }
 
 
@@ -249,6 +251,15 @@ def normalize_event(ev: dict) -> dict:
     # class of bug as the #840 match_stats home/away fix). Pin to str.
     if row.get("season_year") is not None:
         row["season_year"] = str(row["season_year"])
+    # Frozen compatibility superset for fresh Bronze bootstrap.  Static Trino
+    # SQL resolves every COALESCE operand before execution, so merely writing
+    # the new source-key names makes a clean install fail on the absent legacy
+    # columns.  Keep both names nullable until the downstream migration drops
+    # the compatibility operands.
+    row.setdefault("home_team", row.get("home_team_name"))
+    row.setdefault("away_team", row.get("away_team_name"))
+    row.setdefault("home_score", row.get("home_score_current"))
+    row.setdefault("away_score", row.get("away_score_current"))
     return row
 
 
@@ -374,7 +385,10 @@ def normalize_standing(row: dict) -> dict:
         "pts": row.get("points"),
         # group support for WC (Фаза 4 #913). Try to pull from row if the
         # standings response includes per-group info (e.g. for INT-World Cup).
-        "group": row.get("group") or None,
+        # Natural-key scope: a team may appear in more than one stage/block.
+        # Keep total-table rows non-null for Iceberg MERGE; Silver maps this
+        # sentinel back to NULL for the public group_id contract.
+        "group": row.get("group") or "__total__",
     }
 
 
@@ -539,6 +553,7 @@ class SofascoreCamoufoxCapture:
         tab_wait_ms: int = 2500,
         nav_timeout_ms: int = 60000,
         block_resources: bool = True,
+        request_limiter: Optional[Callable[[], object]] = None,
     ) -> None:
         self._proxy = proxy
         self._geoip = geoip
@@ -547,6 +562,8 @@ class SofascoreCamoufoxCapture:
         self._tab_wait_ms = tab_wait_ms
         self._nav_timeout_ms = nav_timeout_ms
         self._block_resources = block_resources
+        self._effective_block_resources = block_resources
+        self._request_limiter = request_limiter
         self._cm = None
         self._browser = None
         self._page = None
@@ -582,12 +599,12 @@ class SofascoreCamoufoxCapture:
             # Env kill-switch lets ops disable without a redeploy if Turnstile 403s.
             env = os.environ.get("SOFASCORE_BLOCK_RESOURCES")
             block = self._block_resources if env is None else env.strip().lower() not in ("0", "false", "no")
-            if block:
-                # Trade-off: enabling page.route disables the browser HTTP cache, so a
-                # capture_event retry re-fetches script/document instead of serving
-                # them from cache. Still a net win — image/media/font/CSS dwarf the
-                # re-fetched JS — but the canary must measure bytes/match WITH retries.
-                self._page.route("**/*", self._maybe_block)
+            self._effective_block_resources = block
+            # The route is always installed: besides optional static blocking it
+            # paces every actual /api/v1 request, including passive SPA XHRs.
+            # Trade-off: page.route disables the browser HTTP cache, which is why
+            # the canary measures the routed production configuration.
+            self._page.route("**/*", self._maybe_block)
             self._page.on("response", self._on_response)
             self._page.on("requestfinished", self._on_request_finished)
         except BaseException as e:
@@ -626,7 +643,17 @@ class SofascoreCamoufoxCapture:
         Never lets a routing error stall a navigation (falls back to continue)."""
         try:
             req = route.request
-            if should_block_request(req.resource_type, req.url):
+            if is_data_api_url(req.url):
+                try:
+                    self._before_source_request()
+                except Exception:  # noqa: BLE001 - a refused limiter is fail-closed
+                    self._blocked_count += 1
+                    route.abort()
+                    return
+            if (
+                self._effective_block_resources
+                and should_block_request(req.resource_type, req.url)
+            ):
                 self._blocked_count += 1
                 route.abort()
                 return
@@ -650,17 +677,39 @@ class SofascoreCamoufoxCapture:
             pass
 
     # -- capture ---------------------------------------------------------- #
+    def _before_source_request(self) -> None:
+        """Pace every explicit source request, not merely each logical event."""
+        limiter = getattr(self, "_request_limiter", None)
+        if limiter is not None and limiter() is False:
+            raise RuntimeError("SofaScore request rate limiter refused a request")
+
     def _on_response(self, resp) -> None:
         url = resp.url
         if not is_data_api_url(url):
             return
-        rec = {"status": resp.status, "json": None, "challenge": None}
+        rec = {
+            "status": resp.status,
+            "json": None,
+            "challenge": None,
+            "body": None,
+            "headers": {},
+        }
         try:
-            obj = resp.json()
+            body = resp.body()
+            if not isinstance(body, bytes):
+                body = bytes(body)
+            rec["body"] = body
+            rec["headers"] = dict(resp.headers or {})
+            obj = json.loads(body.decode('utf-8'))
             rec["json"] = obj
             rec["challenge"] = is_challenge(obj)
         except Exception:  # noqa: BLE001 — non-JSON / body unavailable
-            pass
+            try:
+                obj = resp.json()
+                rec["json"] = obj
+                rec["challenge"] = is_challenge(obj)
+            except Exception:
+                pass
         path = response_path(url)
         # Never let a later empty/304 record overwrite a good earlier capture
         # (see merge_capture — re-nav serves cached endpoints as 304/no-body).
@@ -672,6 +721,7 @@ class SofascoreCamoufoxCapture:
         required=("lineups",),
         max_attempts: int = 2,
         tabs=_EVENT_TABS,
+        names=None,
     ) -> Dict[str, dict]:
         """Warm the match page and return requested per-event JSON endpoints.
 
@@ -688,7 +738,7 @@ class SofascoreCamoufoxCapture:
         # (statistics/shotmap vanished while the required lineups survived —
         # #751 PR2). merge_capture keeps the best record per path.
         self._buffer = {}
-        wanted = fetch_names_for_tabs(tabs)
+        wanted = tuple(names) if names is not None else fetch_names_for_tabs(tabs)
         for attempt in range(1, max_attempts + 1):
             # Widen the settle window on retries so the challenge has time to
             # settle before the exact API fetches.
@@ -722,7 +772,8 @@ class SofascoreCamoufoxCapture:
             const r = await fetch(path, {credentials: 'include',
                 headers: {'accept': 'application/json'}});
             const t = await r.text();
-            return {status: r.status, body: t};
+            return {status: r.status, body: t,
+                headers: Object.fromEntries(r.headers.entries())};
         } catch (e) { return {status: null, body: null, error: String(e)}; }
     }"""
 
@@ -765,9 +816,16 @@ class SofascoreCamoufoxCapture:
                 logger.info("sofascore fetch event=%s %s failed: %s",
                             event_id, name, e)
                 res = {}
-            rec = {"status": res.get("status"), "json": None, "challenge": None}
+            rec = {
+                "status": res.get("status"),
+                "json": None,
+                "challenge": None,
+                "body": None,
+                "headers": res.get("headers") or {},
+            }
             body = res.get("body")
             if body:
+                rec["body"] = body.encode('utf-8')
                 try:
                     obj = json.loads(body)
                     rec["json"] = obj
@@ -804,9 +862,16 @@ class SofascoreCamoufoxCapture:
         except Exception as e:  # noqa: BLE001 — a probe fetch mustn't kill the run
             logger.info("sofascore fetch_api_json %s failed: %s", path, e)
             return None
-        rec = {"status": res.get("status"), "json": None, "challenge": None}
+        rec = {
+            "status": res.get("status"),
+            "json": None,
+            "challenge": None,
+            "body": None,
+            "headers": res.get("headers") or {},
+        }
         body = res.get("body")
         if body:
+            rec["body"] = body.encode('utf-8')
             try:
                 obj = json.loads(body)
                 rec["json"] = obj
@@ -815,6 +880,18 @@ class SofascoreCamoufoxCapture:
                 pass
         self._buffer[path] = merge_capture(self._buffer.get(path), rec)
         return rec
+
+    def event_endpoint_records(self, event_id, names=None) -> Dict[str, dict]:
+        """Return exact response records for raw-first processing."""
+        records: Dict[str, dict] = {}
+        for name in tuple(names or _EVENT_ENDPOINTS):
+            template = _EVENT_ENDPOINTS.get(name)
+            if template is None:
+                continue
+            record = self._buffer.get(template.format(eid=event_id))
+            if isinstance(record, dict):
+                records[name] = dict(record)
+        return records
 
     def event_endpoint_states(self, event_id, names=None) -> Dict[str, str]:
         """Classify the last response for each event endpoint.
@@ -1038,6 +1115,7 @@ class SofascoreCamoufoxCapture:
 
     # -- internals -------------------------------------------------------- #
     def _navigate(self, url: str, extra_settle_ms: int = 0) -> None:
+        self._before_source_request()
         self._navigation_count += 1
         self._page.goto(url, wait_until="domcontentloaded", timeout=self._nav_timeout_ms)
         self._dismiss_consent()
