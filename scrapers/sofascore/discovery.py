@@ -226,7 +226,10 @@ class DirectSofaScoreClient:
                 ) from exc
             proxy_option = CurlOpt.PROXY
             session = Session(
-                impersonate="chrome120",
+                # Follow curl_cffi's current stable Chrome fingerprint instead
+                # of freezing the 2023 chrome120 TLS/HTTP2 signature. SofaScore
+                # rejects that stale signature at its JSON edge.
+                impersonate="chrome",
                 trust_env=False,
                 proxies={},
                 # curl_cffi 0.15 stores ``trust_env`` but does not thread it
@@ -270,10 +273,6 @@ class DirectSofaScoreClient:
                 # same explicit XHR marker its own web client sends. This is a
                 # plain request header, not a browser/session/proxy fallback.
                 "X-Requested-With": "XMLHttpRequest",
-                "User-Agent": (
-                    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                    "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"
-                ),
             })
         return session
 
