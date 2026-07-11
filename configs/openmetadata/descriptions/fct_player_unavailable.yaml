@@ -5,7 +5,7 @@ table:
   fullyQualifiedName: trino_iceberg.iceberg.gold.fct_player_unavailable
   description: |
     Pre-match unavailable / injured / suspended players (E5). Source:
-    silver.whoscored_missing_players bridged to FBref match via dim_match
+    silver.whoscored_player_unavailable bridged to FBref match via dim_match
     + dim_player. Orphan-safe: unmapped players keep 'ws_<id>' canonical
     (deferred to E1.5 cross-source player xref). #426 renamed player_id_canonical
     to player_id, dropped match_date / player_name, and added a normalised

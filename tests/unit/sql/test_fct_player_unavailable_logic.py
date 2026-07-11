@@ -105,6 +105,15 @@ def _create_bronze_tables(con: duckdb.DuckDBPyConnection) -> None:
         )
         """
     )
+    # Production exposes only the batch referenced by the latest successful
+    # preview manifest. These logic tests seed one already-current batch, so a
+    # passthrough view keeps the fixture focused on Silver filtering semantics.
+    con.execute(
+        """
+        CREATE VIEW iceberg.bronze.whoscored_missing_players_current AS
+        SELECT * FROM iceberg.bronze.whoscored_missing_players
+        """
+    )
     con.execute(
         """
         CREATE TABLE iceberg.bronze.whoscored_schedule (

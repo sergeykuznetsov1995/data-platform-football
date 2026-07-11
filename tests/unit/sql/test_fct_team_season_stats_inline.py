@@ -10,7 +10,7 @@ fct_team_season_stats_audit.sql (усечённые до diff-колонок, б
 
 * main и audit НЕ читают удалённые gold.*_team_season;
 * оба читают silver.*_team_match напрямую; main дополнительно читает
-  bronze.whoscored_events (penalties #161), audit — НЕТ (избегаем второго
+  silver.whoscored_events_spadl (penalties #161), audit — НЕТ (избегаем второго
   скана event-grain таблицы за DAG-ран);
 * оба файла парсятся sqlglot'ом как Trino (синтакс-смоук; Trino-специфику
   ловит EXPLAIN (TYPE VALIDATE) при верификации — memory #426);

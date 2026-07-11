@@ -3,7 +3,7 @@ Unit tests for TrinoTableManager.
 """
 
 import pytest
-from unittest.mock import MagicMock, patch, PropertyMock
+from unittest.mock import MagicMock, patch
 import pyarrow as pa
 
 
@@ -1091,6 +1091,30 @@ class TestFormatSqlValueHardening:
         m = self._manager()
         val = "2024-01-01 00:00:00' x"
         assert m._format_sql_value(val, "TIMESTAMP") == "TIMESTAMP '" + val.replace("'", "''") + "'"
+
+    def test_timestamp_iso_utc_string_is_normalized_for_trino(self):
+        m = self._manager()
+        assert m._format_sql_value(
+            "2025-08-22T18:30:00Z", "TIMESTAMP(6)"
+        ) == "TIMESTAMP '2025-08-22 18:30:00.000000'"
+
+    def test_timestamp_offset_is_normalized_to_utc(self):
+        m = self._manager()
+        assert m._format_sql_value(
+            "2025-08-22T20:30:00+02:00", "TIMESTAMP(6)"
+        ) == "TIMESTAMP '2025-08-22 18:30:00.000000'"
+
+    def test_timestamp_with_time_zone_preserves_instant(self):
+        m = self._manager()
+        assert m._format_sql_value(
+            "2025-08-22T20:30:00+02:00", "TIMESTAMP(6) WITH TIME ZONE"
+        ) == "TIMESTAMP '2025-08-22 18:30:00.000000 UTC'"
+
+    def test_naive_timestamp_with_time_zone_is_explicitly_utc(self):
+        m = self._manager()
+        assert m._format_sql_value(
+            "2025-08-22 18:30:00", "TIMESTAMP WITH TIME ZONE"
+        ) == "TIMESTAMP '2025-08-22 18:30:00.000000 UTC'"
 
 
 class TestTrinoManagerRestartResilience:

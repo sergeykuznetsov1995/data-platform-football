@@ -168,6 +168,7 @@ def test_understat_contract_lists_all_five_tables(table):
     'whoscored_lineups',
     'whoscored_match_ingest_manifest',
     'whoscored_missing_players',
+    'whoscored_preview_ingest_manifest',
     'whoscored_season_stages',
 ])
 def test_whoscored_contract_lists_all_required_tables(table):

@@ -100,6 +100,7 @@ class TestValidateWrappers:
             "invalid_states": 0,
             "invalid_success_rows": 0,
             "count_mismatches": 0,
+            "unbatched_payload_rows": 0,
         }
         monkeypatch.setattr(
             mod, "_manifest_integrity_summary", lambda: integrity
@@ -109,6 +110,52 @@ class TestValidateWrappers:
 
         assert result["table"] == "whoscored_match_ingest_manifest"
         assert result["integrity"] == integrity
+
+    @pytest.mark.unit
+    def test_preview_manifest_accepts_valid_zero_row_snapshots(self, monkeypatch):
+        mod = _load_dag_module()
+        calls = []
+        monkeypatch.setattr(
+            mod, "bronze_count", lambda table: calls.append(table) or 0
+        )
+        integrity = {
+            "successful_games": 1,
+            "invalid_states": 0,
+            "invalid_success_rows": 0,
+            "count_mismatches": 0,
+            "null_batch_rows": 0,
+        }
+        monkeypatch.setattr(
+            mod, "_preview_manifest_integrity_summary", lambda: integrity
+        )
+
+        result = mod.validate_preview_ingest_manifest()
+
+        assert calls == [
+            "whoscored_preview_ingest_manifest",
+            "whoscored_missing_players_current",
+        ]
+        assert result["rows"] == 0
+        assert result["integrity"] == integrity
+
+    @pytest.mark.unit
+    def test_preview_manifest_rejects_null_physical_batch_ids(self, monkeypatch):
+        mod = _load_dag_module()
+        monkeypatch.setattr(mod, "bronze_count", lambda _table: 1)
+        monkeypatch.setattr(
+            mod,
+            "_preview_manifest_integrity_summary",
+            lambda: {
+                "successful_games": 1,
+                "invalid_states": 0,
+                "invalid_success_rows": 0,
+                "count_mismatches": 0,
+                "null_batch_rows": 2,
+            },
+        )
+
+        with pytest.raises(mod.AirflowException, match="integrity violations"):
+            mod.validate_preview_ingest_manifest()
 
 
 class TestCanonicalDailyScope:
@@ -140,20 +187,39 @@ class TestCanonicalDailyScope:
             assert "--leagues" not in task.bash_command
             assert "--seasons" not in task.bash_command
             assert "--proxy-file" not in task.bash_command
+            assert "--flaresolverr-url" not in task.bash_command
             assert task._init_kwargs["trigger_rule"] == "all_success"
-            assert task.env["PROXY_FILTER_URL"] == ""
-            assert task.env["WHOSCORED_PAID_PROXY_URL"] == (
-                "http://proxy_filter:8900"
-            )
-            assert task.env["WHOSCORED_PROXY_CONTROL_URL"] == (
-                "http://proxy_filter:8899"
-            )
-            assert task.env["WHOSCORED_RAW_STORE_URI"].endswith(
-                "/raw/whoscored"
-            )
+            # Raw-store credentials and optional paid-proxy endpoints come
+            # only from the deployment environment (compose/secrets). The DAG
+            # must not invent rolling-deploy fallbacks that silently enable a
+            # proxy or point at a hard-coded warehouse.
+            assert "WHOSCORED_RAW_STORE_URI" not in task.env
+            assert "WHOSCORED_PAID_PROXY_URL" not in task.env
+            assert "WHOSCORED_PROXY_CONTROL_URL" not in task.env
+            assert task._init_kwargs["append_env"] is True
 
     @pytest.mark.unit
-    def test_browser_pool_and_bounded_airflow_retry(self):
+    def test_browser_pool_and_manifest_backoff_is_not_masked_by_airflow_retry(self):
         mod = _load_dag_module()
         assert mod.WHOSCORED_ARGS["pool"] == "ingest_scraper_pool"
-        assert mod.WHOSCORED_ARGS["retries"] == 1
+        assert mod.WHOSCORED_ARGS["retries"] == 0
+        assert "retry_delay" not in mod.WHOSCORED_ARGS
+
+    @pytest.mark.unit
+    def test_profile_task_uses_all_active_scopes_with_one_global_limit(self):
+        mod = _load_dag_module()
+        from airflow.operators.bash import BashOperator
+
+        profile_task = next(
+            task
+            for task in BashOperator._instances
+            if task.task_id == "refresh_whoscored_profiles"
+        )
+        command = profile_task.bash_command
+        assert "run_whoscored_scraper.py profiles" in command
+        assert command.count("--scope ") == len(mod.ACTIVE_WHOSCORED_SCOPES)
+        for scope in mod.ACTIVE_WHOSCORED_SCOPES:
+            assert f'--scope "{scope}"' in command
+        assert command.count("--limit 200") == 1
+        assert "--flaresolverr-url" not in command
+        assert profile_task._init_kwargs["retries"] == 0
