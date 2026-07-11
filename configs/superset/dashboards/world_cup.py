@@ -4,7 +4,8 @@
 # =============================================================================
 # Тематический дашборд INT-World Cup на шести вкладках (TABS в position_json),
 # макет «C — гибрид» из WC1 (docs/research/WC1_wc_dashboard_viz_audit.md):
-#   1. Паспорт турнира — KPI-ряд, голы по стадиям, стадионы
+#   1. Паспорт турнира — 2 KPI-ряда, голы по стадиям, ритм по дням,
+#                        рекорды турнира, стадионы (город/страна)
 #   2. Групповой этап  — таблицы 12 групп, очки vs разница, лучшие третьи
 #   3. Плей-офф        — сетка (таблица), серии пенальти, голы по минутам/типам
 #   4. Сборные         — стиль (владение×xG), xG vs xGA, реализация, дисциплина
@@ -194,6 +195,14 @@ def _sql_where(expression: str) -> dict:
     }
 
 
+def _ru_plural(expr: str, one: str, few: str, many: str) -> str:
+    """SQL-склонение существительного после числа: 1 гол / 3 гола / 8 голов."""
+    return (f"CASE WHEN {expr} % 100 BETWEEN 11 AND 14 THEN '{many}' "
+            f"WHEN {expr} % 10 = 1 THEN '{one}' "
+            f"WHEN {expr} % 10 BETWEEN 2 AND 4 THEN '{few}' "
+            f"ELSE '{many}' END")
+
+
 # Порядок и подписи стадий: FBref `round` → сортируемый префикс. ELSE-ветка
 # оставляет сырые строки исторических форматов ('First round', 'Final round'…)
 # с order=0 — чарты по стадиям их не теряют, а «эпохи» опираются на is_knockout.
@@ -229,9 +238,23 @@ def _build_virtual_datasets(ctx: _Ctx, database: Any) -> dict[str, Any]:
     stage_order = _STAGE_ORDER_SQL.format(col="m.stage")
     stage_label = _STAGE_LABEL_SQL.format(col="m.stage")
 
+    # ESPN шлёт арены ЧМ с суффиксом « (Neutral Site)» и тремя устаревшими/
+    # спонсорскими именами — из-за этого enrichment dim_venue не сматчился
+    # (city/country/capacity = NULL, venue_source='orphan'). Канонизируем имя
+    # здесь: оно же — ключ моста к silver.sofascore_venue (город/страна).
+    venue_canon = """CASE regexp_replace(dv.venue_name, ' \\(Neutral Site\\)$', '')
+    WHEN 'Reliant Stadium' THEN 'NRG Stadium'
+    WHEN 'Estadio Banorte' THEN 'Estadio Azteca'
+    WHEN 'GEHA Field at Arrowhead Stadium' THEN 'Arrowhead Stadium'
+    WHEN 'BC Place Stadium' THEN 'BC Place'
+    ELSE regexp_replace(dv.venue_name, ' \\(Neutral Site\\)$', '')
+  END"""
+
     # Грейн — матч. Хребет дашборда: счёт, стадии, пенальти, посещаемость.
     # Будущие матчи (полуфиналы/финал до розыгрыша) несут NULL-счёт —
-    # is_completed отсекает их в метриках.
+    # is_completed отсекает их в метриках. Карточки/автоголы/пенальти —
+    # матчевые агрегаты фактов для KPI паспорта; у «эпох» (только расписание
+    # FBref) они NULL — AVG/SUM их честно пропускают, а не рисуют нули.
     v_match = f"""\
 WITH m AS (
   SELECT
@@ -245,6 +268,35 @@ WITH m AS (
   LEFT JOIN iceberg.gold.dim_team th ON th.team_id = dm.home_team_id
   LEFT JOIN iceberg.gold.dim_team ta ON ta.team_id = dm.away_team_id
   WHERE dm.league = 'INT-World Cup'
+),
+sv AS (
+  SELECT season, stadium, MAX(city) AS city, MAX(country) AS country
+  FROM iceberg.silver.sofascore_venue
+  WHERE league = 'INT-World Cup'
+  GROUP BY season, stadium
+),
+cards AS (
+  SELECT match_id, season,
+         SUM(yellow_cards) AS yellow_cards,
+         SUM(red_cards)    AS red_cards
+  FROM iceberg.gold.fct_team_match
+  WHERE league = 'INT-World Cup'
+  GROUP BY match_id, season
+),
+og AS (
+  SELECT match_id, season, SUM(own_goals) AS own_goals
+  FROM iceberg.gold.fct_player_match
+  WHERE league = 'INT-World Cup'
+  GROUP BY match_id, season
+),
+pens AS (
+  SELECT match_id, season,
+         COUNT(*) AS pens_awarded,
+         SUM(CASE WHEN result = 'goal' THEN 1 ELSE 0 END) AS pens_scored
+  FROM iceberg.gold.fct_shot
+  WHERE league = 'INT-World Cup'
+    AND situation = 'penalty' AND minute <= 120
+  GROUP BY match_id, season
 )
 SELECT
   m.match_id, m.season, m.stage, m.is_knockout, m.match_date, m.is_completed,
@@ -269,12 +321,23 @@ SELECT
     ELSE CAST(m.home_score AS varchar) || ':' || CAST(m.away_score AS varchar)
   END AS score_label,
   m.attendance,
-  dv.venue_name, dv.city, dv.capacity,
+  {venue_canon} AS venue_name,
+  COALESCE(dv.city, sv.city)       AS city,
+  COALESCE(dv.country, sv.country) AS country,
+  dv.capacity,
   CASE WHEN dv.capacity > 0
        THEN CAST(m.attendance AS DOUBLE) / dv.capacity END AS fill_pct,
+  c.yellow_cards, c.red_cards,
+  c.yellow_cards + c.red_cards AS cards_total,
+  og.own_goals,
+  pens.pens_awarded, pens.pens_scored,
   dr.referee_name
 FROM m
 LEFT JOIN iceberg.gold.dim_venue   dv ON dv.venue_id   = m.venue_id
+LEFT JOIN sv    ON sv.season = m.season AND sv.stadium = {venue_canon}
+LEFT JOIN cards c    ON c.match_id    = m.match_id AND c.season    = m.season
+LEFT JOIN og         ON og.match_id   = m.match_id AND og.season   = m.season
+LEFT JOIN pens       ON pens.match_id = m.match_id AND pens.season = m.season
 LEFT JOIN iceberg.gold.dim_referee dr ON dr.referee_id = m.referee_id"""
 
     v_match_labels = {
@@ -282,6 +345,7 @@ LEFT JOIN iceberg.gold.dim_referee dr ON dr.referee_id = m.referee_id"""
         "match_date": "Дата", "match_label": "Матч", "score_label": "Счёт",
         "home_team": "Хозяева", "away_team": "Гости",
         "attendance": "Зрители", "venue_name": "Стадион", "city": "Город",
+        "country": "Страна",
         "capacity": "Вместимость", "fill_pct": "Заполняемость",
         "referee_name": "Судья", "total_goals": "Голов",
     }
@@ -819,6 +883,151 @@ LEFT JOIN iceberg.gold.dim_team dt ON dt.team_id = p.team_id"""
         "furthest_stage_order": "Стадия №", "furthest_stage_label": "Дошла до",
     }
 
+    # Грейн — (season, record): «визитная карточка» для паспорта. Одна строка
+    # на рекорд; ties режутся детерминированно (счёт → дата), хвост уходит в
+    # detail («ещё N»). Для эпох строки из фактов (быстрый гол, бомбардир…)
+    # просто не появятся — таблица деградирует до счёта/посещаемости.
+    v_records = f"""\
+WITH m AS (
+  SELECT dm.*,
+         COALESCE(th.team_name, dm.home_team_id) AS home_team,
+         COALESCE(ta.team_name, dm.away_team_id) AS away_team
+  FROM iceberg.gold.dim_match dm
+  LEFT JOIN iceberg.gold.dim_team th ON th.team_id = dm.home_team_id
+  LEFT JOIN iceberg.gold.dim_team ta ON ta.team_id = dm.away_team_id
+  WHERE dm.league = 'INT-World Cup' AND dm.is_completed
+    AND dm.home_score IS NOT NULL
+),
+scored AS (
+  SELECT season, match_id, match_date, attendance, venue_id,
+         home_team || ' ' || CAST(home_score AS varchar) || ':'
+           || CAST(away_score AS varchar) || ' ' || away_team AS match_text,
+         ABS(home_score - away_score) AS margin,
+         home_score + away_score AS total_goals
+  FROM m
+),
+biggest_win AS (
+  SELECT season, 1 AS record_order, 'Крупнейшая победа' AS record,
+         match_text AS holder,
+         '+' || CAST(margin AS varchar) AS value_label,
+         date_format(CAST(match_date AS timestamp), '%d.%m.%Y') AS detail
+  FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY season
+          ORDER BY margin DESC, total_goals DESC, match_date) AS rn
+        FROM scored)
+  WHERE rn = 1 AND margin > 0
+),
+highest_score AS (
+  SELECT season, 2, 'Самый результативный матч',
+         match_text,
+         CAST(total_goals AS varchar) || ' '
+           || {_ru_plural("total_goals", "гол", "гола", "голов")},
+         date_format(CAST(match_date AS timestamp), '%d.%m.%Y')
+  FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY season
+          ORDER BY total_goals DESC, match_date) AS rn
+        FROM scored)
+  WHERE rn = 1 AND total_goals > 0
+),
+attendance_rec AS (
+  SELECT season, 3, 'Рекорд посещаемости',
+         match_text || COALESCE(' · ' || venue, ''),
+         replace(format('%,d', attendance), ',', ' '),
+         date_format(CAST(match_date AS timestamp), '%d.%m.%Y')
+           || CASE WHEN ties > 1
+                THEN ' · ещё ' || CAST(ties - 1 AS varchar) || ' с тем же числом'
+                ELSE '' END
+  FROM (
+    SELECT s.*, {venue_canon} AS venue,
+           ROW_NUMBER() OVER (PARTITION BY s.season
+             ORDER BY s.attendance DESC, s.match_date) AS rn,
+           COUNT(*) OVER (PARTITION BY s.season, s.attendance) AS ties
+    FROM scored s
+    LEFT JOIN iceberg.gold.dim_venue dv ON dv.venue_id = s.venue_id
+    WHERE s.attendance IS NOT NULL
+  )
+  WHERE rn = 1
+),
+fastest_goal AS (
+  SELECT season, 4, 'Самый быстрый гол',
+         player || ' — ' || match_text,
+         CAST(minute AS varchar) || '-я минута',
+         date_format(CAST(match_date AS timestamp), '%d.%m.%Y')
+           || CASE WHEN ties > 1
+                THEN ' · ещё ' || CAST(ties - 1 AS varchar) || ' на той же минуте'
+                ELSE '' END
+  FROM (
+    SELECT sc.season, sc.match_text, sc.match_date, sh.minute,
+           COALESCE(dp.player_name, sh.player_id) AS player,
+           ROW_NUMBER() OVER (PARTITION BY sc.season
+             ORDER BY sh.minute, sc.match_date) AS rn,
+           COUNT(*) OVER (PARTITION BY sc.season, sh.minute) AS ties
+    FROM iceberg.gold.fct_shot sh
+    JOIN scored sc ON sc.match_id = sh.match_id AND sc.season = sh.season
+    LEFT JOIN iceberg.gold.dim_player dp ON dp.player_id = sh.player_id
+    WHERE sh.league = 'INT-World Cup'
+      AND sh.result = 'goal' AND sh.minute <= 120
+  )
+  WHERE rn = 1
+),
+top_scorer AS (
+  SELECT season, 5, 'Лучший бомбардир',
+         array_join(array_agg(player ORDER BY player), ', '),
+         CAST(MAX(goals) AS varchar) || ' '
+           || {_ru_plural("MAX(goals)", "гол", "гола", "голов")},
+         ''
+  FROM (
+    SELECT ps.season, ps.goals,
+           COALESCE(dp.player_name, ps.player_id) AS player,
+           RANK() OVER (PARTITION BY ps.season ORDER BY ps.goals DESC) AS rk
+    FROM iceberg.gold.fct_player_season_stats ps
+    LEFT JOIN iceberg.gold.dim_player dp ON dp.player_id = ps.player_id
+    WHERE ps.league = 'INT-World Cup' AND ps.goals > 0
+  )
+  WHERE rk = 1
+  GROUP BY season
+),
+hat_tricks AS (
+  SELECT season, 6, 'Хет-трики',
+         array_join(array_agg(DISTINCT player ORDER BY player), ', '),
+         CAST(COUNT(*) AS varchar),
+         ''
+  FROM (
+    SELECT pm.season, COALESCE(dp.player_name, pm.player_id) AS player
+    FROM iceberg.gold.fct_player_match pm
+    LEFT JOIN iceberg.gold.dim_player dp ON dp.player_id = pm.player_id
+    WHERE pm.league = 'INT-World Cup' AND pm.goals >= 3
+  )
+  GROUP BY season
+),
+own_goals_rec AS (
+  SELECT season, 7, 'Автоголы', '',
+         CAST(SUM(own_goals) AS varchar), ''
+  FROM iceberg.gold.fct_player_match
+  WHERE league = 'INT-World Cup'
+  GROUP BY season
+  HAVING SUM(own_goals) > 0
+),
+zero_draws AS (
+  SELECT season, 8, 'Нулевые ничьи (0:0)', '',
+         CAST(COUNT(*) AS varchar) || ' '
+           || {_ru_plural("COUNT(*)", "матч", "матча", "матчей")}, ''
+  FROM scored
+  WHERE total_goals = 0
+  GROUP BY season
+)
+SELECT * FROM biggest_win
+UNION ALL SELECT * FROM highest_score
+UNION ALL SELECT * FROM attendance_rec
+UNION ALL SELECT * FROM fastest_goal
+UNION ALL SELECT * FROM top_scorer
+UNION ALL SELECT * FROM hat_tricks
+UNION ALL SELECT * FROM own_goals_rec
+UNION ALL SELECT * FROM zero_draws"""
+
+    v_records_labels = {
+        "season": "ЧМ", "record_order": "№", "record": "Рекорд",
+        "holder": "Кто", "value_label": "Значение", "detail": "Детали",
+    }
+
     return {
         "v_wc_match": _ensure_virtual_dataset(
             ctx, database, schema, "v_wc_match", v_match, v_match_labels),
@@ -838,6 +1047,9 @@ LEFT JOIN iceberg.gold.dim_team dt ON dt.team_id = p.team_id"""
             v_tournament_labels),
         "v_wc_final": _ensure_virtual_dataset(
             ctx, database, schema, "v_wc_final", v_final, v_final_labels),
+        "v_wc_records": _ensure_virtual_dataset(
+            ctx, database, schema, "v_wc_records", v_records,
+            v_records_labels),
         "v_wc_team_progress": _ensure_virtual_dataset(
             ctx, database, schema, "v_wc_team_progress", v_team_progress,
             v_team_progress_labels),
@@ -856,6 +1068,7 @@ def _build_slices(ctx: _Ctx, vds: dict[str, Any]) -> list[Any]:
     tournament = vds["v_wc_tournament"]
     final = vds["v_wc_final"]
     progress = vds["v_wc_team_progress"]
+    records = vds["v_wc_records"]
 
     slices: list[Any] = []
 
@@ -954,14 +1167,15 @@ def _build_slices(ctx: _Ctx, vds: dict[str, Any]) -> list[Any]:
             "x_axis_title": "Стадия",
         },
     ))
-    # city/capacity/fill_pct остаются в датасете, но НЕ в чарте: dim_venue для
-    # арен ЧМ-2026 не обогащён (16 стадионов, city/capacity = NULL) — колонки
-    # рисовались сплошным N/A. Вернуть при обогащении dim_venue.
+    # Город/страна — SofaScore-мост в v_wc_match (dim_venue для арен ЧМ пуст).
+    # capacity/fill_pct по-прежнему вне чарта: вместимость есть только в
+    # bronze.sofascore_venue (Superset bronze не читает) — вернуть, когда
+    # silver-трансформ спроецирует capacity или арены попадут в venue_aliases.
     slices.append(_make_slice(ctx,
         "Стадионы турнира", "table", match,
         {
             "query_mode": "aggregate",
-            "groupby": ["season", "venue_name"],
+            "groupby": ["season", "venue_name", "city", "country"],
             "metrics": [
                 _metric("Матчей", "COUNT", "match_id"),
                 _metric("Ср. зрителей", "AVG", "attendance"),
@@ -1557,6 +1771,102 @@ def _build_slices(ctx: _Ctx, vds: dict[str, Any]) -> list[Any]:
         },
     ))
 
+    # === Паспорт v2 (индексы 41..48 — в конец, чтобы не сдвигать layout) =====
+    slices.append(_make_slice(ctx,  # 41
+        "Зрителей всего", "big_number_total", match,
+        {
+            **_kpi_time,
+            "metric": _metric("Зрителей", "SUM", "attendance"),
+            "adhoc_filters": [_played],
+            "subheader": "суммарно на трибунах",
+            "y_axis_format": "SMART_NUMBER",
+        },
+    ))
+    # NULLIF: у эпох venue/страна = NULL у всех матчей — голый COUNT_DISTINCT
+    # рисовал бы ложный «0» вместо пустой карточки (контракт деградации).
+    slices.append(_make_slice(ctx,  # 42
+        "Стадионов", "big_number_total", match,
+        {
+            **_kpi_time,
+            "metric": _metric("Стадионов", None, None,
+                              sql="NULLIF(COUNT(DISTINCT venue_name), 0)"),
+            "subheader": "принимали матчи",
+            "y_axis_format": ",d",
+        },
+    ))
+    slices.append(_make_slice(ctx,  # 43
+        "Стран-хозяек", "big_number_total", match,
+        {
+            **_kpi_time,
+            "metric": _metric("Стран", None, None,
+                              sql="NULLIF(COUNT(DISTINCT country), 0)"),
+            "subheader": "география турнира",
+            "y_axis_format": ",d",
+        },
+    ))
+    # cards_total NULL у матчей без командной статистики (эпохи) — AVG их
+    # пропускает, а не подмешивает нули.
+    slices.append(_make_slice(ctx,  # 44
+        "Карточек за матч", "big_number_total", match,
+        {
+            **_kpi_time,
+            "metric": _metric("Карточек/матч", "AVG", "cards_total"),
+            "adhoc_filters": [_played],
+            "subheader": "жёлтые + красные",
+            "y_axis_format": ".2f",
+        },
+    ))
+    slices.append(_make_slice(ctx,  # 45
+        "Пенальти с игры", "big_number_total", match,
+        {
+            **_kpi_time,
+            "metric": _metric("Пенальти", "SUM", "pens_awarded"),
+            "adhoc_filters": [_played],
+            "subheader": "назначено (серии не в счёт)",
+            "y_axis_format": ",d",
+        },
+    ))
+    slices.append(_make_slice(ctx,  # 46
+        "Автоголов", "big_number_total", match,
+        {
+            **_kpi_time,
+            "metric": _metric("Автоголов", "SUM", "own_goals"),
+            "adhoc_filters": [_played],
+            "subheader": "за турнир",
+            "y_axis_format": ",d",
+        },
+    ))
+    # tournament_day — относительная ось контракта деградации: дни разных ЧМ
+    # ложатся на общую X-сетку, series=season даёт grouped bars.
+    slices.append(_make_slice(ctx,  # 47
+        "Ритм турнира: голы по дням", "echarts_timeseries_bar", match,
+        {
+            "x_axis": "tournament_day",
+            "metrics": [_metric("Голов", "SUM", "total_goals")],
+            "groupby": ["season"],
+            "adhoc_filters": [_played],
+            "row_limit": 2000,
+            "show_legend": True,
+            "show_value": False,
+            "rich_tooltip": True,
+            "y_axis_format": ",d",
+            "x_axis_title_margin": 30,
+            "x_axis_title": "День турнира",
+        },
+    ))
+    slices.append(_make_slice(ctx,  # 48
+        "Рекорды турнира", "table", records,
+        {
+            "query_mode": "raw",
+            "all_columns": ["season", "record", "holder", "value_label",
+                            "detail"],
+            "order_by_cols": ['["season", true]', '["record_order", true]'],
+            "row_limit": 500,
+            "include_search": False,
+            "show_cell_bars": False,
+        },
+    ))
+
     return slices
 
 
@@ -1654,12 +1964,24 @@ def _build_position_json(slices: list[Any]) -> dict[str, Any]:
     # --- Таб 1. Паспорт турнира ---------------------------------------------
     c, p = _tab("passport", "Паспорт турнира")
     c.append(_row(p, [_chart(slices[i], 2, height=25) for i in range(0, 6)]))
+    c.append(_row(p, [_chart(slices[i], 2, height=25) for i in range(41, 47)]))
     c.append(_markdown(p,
         "## Профиль турнира\n\n"
         "Голы по стадиям — среднее за матч (нормировка per-match: у разных "
-        "ЧМ разное число матчей). Заполняемость = зрители / вместимость.",
+        "ЧМ разное число матчей). Ритм — голы по дням турнира (день 1 = "
+        "матч открытия): видно плотность группового этапа и паузы плей-офф.",
+        height=16,
     ))
-    c.append(_row(p, [_chart(slices[6], 6, height=55), _chart(slices[7], 6, height=55)]))
+    c.append(_row(p, [_chart(slices[6], 6, height=55), _chart(slices[47], 6, height=55)]))
+    c.append(_markdown(p,
+        "## Рекорды и география\n\n"
+        "Рекорды считаются по выбранным ЧМ (строка на турнир). Город и "
+        "страна стадионов — данные SofaScore; имена арен приведены к "
+        "каноническим (ESPN шлёт устаревшие: Reliant = NRG Stadium, "
+        "Estadio Banorte = Estadio Azteca).",
+        height=16,
+    ))
+    c.append(_row(p, [_chart(slices[48], 6, height=70), _chart(slices[7], 6, height=70)]))
 
     # --- Таб 2. Групповой этап ------------------------------------------------
     c, p = _tab("groups", "Групповой этап")
