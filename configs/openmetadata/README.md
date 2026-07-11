@@ -49,7 +49,61 @@ Cadence:
 
 `HTTP 404` on a table = not yet ingested → re-run `om-ingest-trino`.
 `HTTP 404: tag instance for X not found` on every YAML = classifications not bootstrapped → run `make om-bootstrap`.
-`HTTP 401` = bad / expired JWT → re-issue.
+`HTTP 401` = bad / expired JWT → re-issue. Токен также инвалидируется ротацией
+RSA-ключей (`make gen-om-jwt-keys`) — после неё перевыпустить и обновить
+`OM_JWT_TOKEN` в `.env` + `docker compose --profile heavy up -d openmetadata-ingestion`.
+
+## SSO cutover (prod, #866)
+
+С #866 люди входят в OM через Keycloak (`custom-oidc`, confidential client),
+а бот-JWT ingestion-контура продолжает работать: провайдер логина и подпись
+бот-токенов — независимые механизмы, пока в `OM_AUTH_PUBLIC_KEYS` остаётся
+собственный JWKS OM (`http://localhost:8585/api/v1/system/config/jwks`).
+
+Порядок на живом проде (детали значений — секция «OpenMetadata SSO» в
+`.env.example`):
+
+1. **Клиент в живом Keycloak — только kcadm** (`--import-realm` существующий
+   realm не обновляет; шаблон realm — для чистых стендов):
+
+   ```bash
+   docker exec -i keycloak /opt/keycloak/bin/kcadm.sh config credentials \
+     --server http://localhost:8080 --realm master --user admin \
+     --password "$KC_BOOTSTRAP_ADMIN_PASSWORD"
+   docker exec -i keycloak /opt/keycloak/bin/kcadm.sh create clients -r football \
+     -s clientId=openmetadata -s enabled=true -s publicClient=false \
+     -s clientAuthenticatorType=client-secret -s "secret=$OPENMETADATA_OIDC_CLIENT_SECRET" \
+     -s standardFlowEnabled=true -s directAccessGrantsEnabled=false \
+     -s 'redirectUris=["https://meta.<домен>/callback"]' \
+     -s 'webOrigins=["https://meta.<домен>"]' \
+     -s 'defaultClientScopes=["profile","email","basic","groups"]'
+   ```
+
+2. Сменить пароль дефолтного `admin/admin` (иначе break-glass возвращает
+   общеизвестный логин): `POST /api/v1/users/login` (пароль base64) →
+   `PUT /api/v1/users/changePassword` с Bearer из ответа.
+3. `make gen-om-jwt-keys` + раскомментировать `OM_RSA_*`/`OM_JWT_*` в `.env`
+   (свои ключи подписи бот-JWT вместо публично известных ключей образа).
+4. Раскомментировать блок `OM_AUTH_*` + `OPENMETADATA_OIDC_CLIENT_SECRET`
+   в `.env`; раскомментировать meta-блок в `configs/caddy/Caddyfile` →
+   `caddy reload`.
+5. `docker compose --profile heavy up -d openmetadata-server` (migrate
+   перегонится — идемпотентно).
+6. Первый вход админа из `OM_ADMIN_PRINCIPALS` через браузер; перевыпустить
+   токен `ingestion-bot` (Settings → Bots) → `OM_JWT_TOKEN` в `.env` →
+   `up -d openmetadata-ingestion` → `make om-ingest-trino && make om-lineage-trino`.
+
+**Break-glass** (Keycloak лежит / OIDC сломался): закомментировать в `.env`
+блок `OM_AUTH_*` (ключи `OM_RSA_*`/`OM_JWT_*` НЕ трогать — на них живут
+бот-токены), закомментировать meta-блок Caddyfile (`caddy reload` — basic-OM
+наружу нельзя), `docker compose --profile heavy up -d openmetadata-server`.
+Вход — локальный `admin` со СМЕНЁННЫМ паролем через SSH-туннель
+`127.0.0.1:8585`; ingestion продолжает работать без изменений.
+
+Заведение юзеров: self-signup выключен (`OM_AUTH_ENABLE_SELF_SIGNUP=false`) —
+аналитика в OM создаёт админ (UI → Settings → Users → Add User, email =
+email юзера в Keycloak), после чего тот входит через SSO. Админы задаются
+списком `OM_ADMIN_PRINCIPALS` (KC-username; OM OSS не маппит группы в роли).
 
 ## YAML format
 

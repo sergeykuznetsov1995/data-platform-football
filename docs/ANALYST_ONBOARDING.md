@@ -17,9 +17,12 @@
 | JupyterHub | `https://jupyter.sk-vpn-2026.uk` | analysts | свой контейнер (1 ГБ), диск |
 | Airflow | `https://airflow.sk-vpn-2026.uk` | analysts | просмотр DAG'ов (Viewer) |
 | Trino | `https://trino.sk-vpn-2026.uk` | analysts | SQL read-only `silver`/`gold` |
+| OpenMetadata | `https://meta.sk-vpn-2026.uk` | по запросу | каталог данных |
 
-OpenMetadata **не публикуется** (basic auth, один общий админ) — доступ
-только админский, через SSH-туннель (см. ниже). Писать в данные нельзя:
+OpenMetadata — вход через тот же Keycloak (#866), но **по запросу**:
+self-signup в каталоге выключен, юзера в OM заводит админ
+(OM UI → Settings → Users → Add User, email = email юзера в Keycloak),
+после этого работает обычный SSO-вход. Писать в данные нельзя:
 любой не-машинный юзер получает от rules.json только SELECT на
 `silver`/`gold` (catch-all; правки конфигов на нового юзера НЕ нужны).
 Запросы людей идут в ресурсной группе `humans` (лимит 8 одновременно,
@@ -105,8 +108,8 @@ jdbc:trino://trino.sk-vpn-2026.uk:443?SSL=true&externalAuthentication=true
 
 ## Админ-доступ (SSH-туннель)
 
-`/admin` и `/realms/master` Keycloak снаружи закрыты (403), OpenMetadata
-не опубликован. Всё админское — через туннель:
+`/admin` и `/realms/master` Keycloak снаружи закрыты (403). Админское —
+через туннель:
 
 ```bash
 ssh -L 8180:127.0.0.1:8180 -L 8585:127.0.0.1:8585 root@159.195.193.250
@@ -114,7 +117,9 @@ ssh -L 8180:127.0.0.1:8180 -L 8585:127.0.0.1:8585 root@159.195.193.250
 
 - Keycloak-админка: `http://127.0.0.1:8180/admin/` (KC_HOSTNAME_ADMIN
   в compose направляет весь флоу консоли на этот адрес).
-- OpenMetadata: `http://127.0.0.1:8585`.
+- OpenMetadata: обычный вход — публичный `https://meta.sk-vpn-2026.uk`;
+  туннель `http://127.0.0.1:8585` остаётся как break-glass (вход локальным
+  `admin` работает только при откате в basic-режим).
 
 ## Защита публичного входа
 
@@ -132,4 +137,9 @@ ssh -L 8180:127.0.0.1:8180 -L 8585:127.0.0.1:8585 root@159.195.193.250
   `docker compose up -d --no-deps airflow-webserver` → форма пароля (локальный admin).
 - Superset: `SUPERSET_OAUTH_ENABLED=false` → `docker compose up -d --no-deps superset`.
 - Trino: машинные аккаунты и `analyst_svc` работают по password.db всегда.
+- OpenMetadata: закомментировать блок `OM_AUTH_*` в `.env` (ключи `OM_RSA_*`
+  оставить!) + закомментировать meta-блок Caddyfile (`caddy reload`) →
+  `docker compose --profile heavy up -d openmetadata-server` → basic-вход
+  локальным `admin` через SSH-туннель. Ingestion (бот-JWT) не зависит от
+  Keycloak и работает всё это время.
 - Админ-доступ по SSH-туннелям (127.0.0.1-порты) никуда не делся.
