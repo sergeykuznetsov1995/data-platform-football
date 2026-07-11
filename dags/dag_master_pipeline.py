@@ -15,7 +15,7 @@ This DAG:
 """
 
 from datetime import datetime, timedelta
-from typing import Any, Dict, List
+from typing import Any, Dict
 
 from airflow import DAG
 from airflow.operators.python import PythonOperator
@@ -58,10 +58,6 @@ def check_pipeline_success(**context) -> Dict[str, Any]:
     from airflow.utils.state import State
 
     logger = logging.getLogger(__name__)
-
-    ti = context['ti']
-    # Airflow 3.x uses logical_date instead of execution_date
-    logical_date = context.get('logical_date') or context.get('data_interval_end')
 
     results = {
         'status': 'success',
@@ -265,6 +261,11 @@ with DAG(
                 failed_states=[],  # Don't fail master if child fails
                 reset_dag_run=True,  # Reset if already running
                 execution_date='{{ ds }}',  # Airflow 2.x uses execution_date
+                conf=(
+                    {"master_data_interval_end": "{{ data_interval_end }}"}
+                    if dag_id == "dag_ingest_sofascore"
+                    else {}
+                ),
             )
 
             if prev_task:

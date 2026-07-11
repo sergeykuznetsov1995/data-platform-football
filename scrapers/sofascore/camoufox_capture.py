@@ -16,11 +16,11 @@ basis of the cheap per-match path :meth:`fetch_event` (#842). Navigation +
 passive capture (``page.on("response")``) remains the warm-up and fallback.
 See ``scripts/research/probe_sofascore_capture.py`` for the original spike.
 
-This transport drives Camoufox via Playwright, navigates SofaScore SPA pages,
-nudges the deep tabs (Lineups / Statistics / Shotmap) so the SPA fetches them,
-and returns the captured JSON keyed by entity. Downstream parsing reuses the
-existing helpers on ``SofaScoreScraper`` (``_flatten_lineup_side``,
-``_flatten_shotmap``, ``_build_lineup_overlay_lookup``).
+This transport drives Camoufox via Playwright, uses one SPA navigation to obtain
+Turnstile clearance, then requests exact same-origin JSON paths. Downstream
+parsing reuses the existing helpers on ``SofaScoreScraper``
+(``_flatten_lineup_side``, ``_flatten_shotmap``,
+``_build_lineup_overlay_lookup``).
 
 Heavy deps (camoufox/playwright) are imported lazily inside ``__enter__`` so this
 module stays cheap to import (unit tests exercise the pure helpers only).
@@ -50,27 +50,15 @@ _API_PATH = "/api/v1/"
 _NON_DATA_SEGMENTS = ("/image", "/flag", "/logo", "/jersey")
 
 _CONSENT_BUTTONS = ("Consent", "AGREE", "Agree", "Accept all", "I Accept", "Got it")
-# Tabs whose XHRs fire only on interaction (lineups often loads eagerly anyway).
-_EVENT_TABS = ("Lineups", "Statistics", "Player statistics", "Shotmap")
-# Stable data-testid per tab label (live-proven 2026-06-22, #751 PR2). Clicking
-# the Statistics tab fires BOTH /statistics (re-fetch, body captured) AND
-# /shotmap. A plain get_by_text('Statistics') grabbed a non-tab label element
-# (the match page renders two "Statistics" nodes) and fired nothing.
-_TAB_TESTIDS = {
-    "Lineups": "tab-lineups",
-    "Statistics": "tab-statistics",
-    # Player-page Season tab (#751 PR3b) — fires /statistics/seasons + the
-    # default competition's season-statistics/overall.
-    "Season": "tab-season",
-}
-
+# Logical endpoint groups retained for the existing caller API. No DOM clicks
+# are performed; labels map directly to exact JSON endpoints.
+_EVENT_TABS = ("Lineups", "Statistics", "Shotmap")
 # Canonical per-event endpoints we want out of the capture buffer.
 _EVENT_ENDPOINTS = {
     "event": "/api/v1/event/{eid}",
     "lineups": "/api/v1/event/{eid}/lineups",
     "statistics": "/api/v1/event/{eid}/statistics",
     "shotmap": "/api/v1/event/{eid}/shotmap",
-    "incidents": "/api/v1/event/{eid}/incidents",
 }
 
 # Deep-tab label → endpoint name(s) an in-page fetch must pull to match what a
@@ -79,7 +67,6 @@ _EVENT_ENDPOINTS = {
 _TAB_FETCH_NAMES = {
     "Lineups": ("lineups",),
     "Statistics": ("statistics",),
-    "Player statistics": ("statistics",),
     "Shotmap": ("shotmap",),
 }
 
@@ -162,9 +149,23 @@ def merge_capture(existing: Optional[dict], new: dict) -> dict:
     covered by the same rule, order-independent."""
     if existing is None:
         return new
-    if existing.get("json") is not None and new.get("json") is None:
-        return existing
-    return new
+
+    def _quality(rec: dict) -> int:
+        # A real endpoint answer always outranks a later challenge/error JSON;
+        # any parsed JSON in turn outranks an empty 304/body-read race.
+        if (
+            rec.get("status") == 200
+            and rec.get("challenge") is False
+            and rec.get("json") is not None
+        ):
+            return 3
+        if rec.get("status") in (204, 404):
+            return 2
+        if rec.get("json") is not None:
+            return 1
+        return 0
+
+    return existing if _quality(existing) > _quality(new) else new
 
 
 def event_url(event_id) -> str:
@@ -174,7 +175,7 @@ def event_url(event_id) -> str:
 def select_event_endpoints(buffer: Dict[str, dict], event_id) -> Dict[str, dict]:
     """From a capture ``buffer`` (path -> {status, json, challenge}), return the
     canonical per-event endpoints that came back as real JSON, keyed by entity
-    name (``event``/``lineups``/``statistics``/``shotmap``/``incidents``)."""
+    name (``event``/``lineups``/``statistics``/``shotmap``)."""
     out: Dict[str, dict] = {}
     for name, tmpl in _EVENT_ENDPOINTS.items():
         rec = buffer.get(tmpl.format(eid=event_id))
@@ -396,11 +397,8 @@ def parse_proxy_line(line: str) -> Optional[dict]:
 # --------------------------------------------------------------------------- #
 #  Per-player capture helpers (issue #751 PR3) — profile snapshot              #
 # --------------------------------------------------------------------------- #
-# Live-proven (scripts/research/probe_sofascore_player.py, 2026-06-22): the bio
-# is SSR'd at __NEXT_DATA__.props.pageProps.player (NOT an XHR), so the profile
-# capture needs no Turnstile-gated data XHR. Season-aggregate stats (which DO
-# need the Season tab + a season-picker for transferred/multi-competition
-# players) are deferred to PR3b — see memory/feedback_sofascore_player_page_capture.
+# The bio is SSR'd at __NEXT_DATA__.props.pageProps.player and is also available
+# from the exact ``/api/v1/player/{id}`` path once the session is warm.
 def player_url(player_id) -> str:
     """A player page URL with a DUMMY slug — the SPA redirects to the real
     ``/football/player/{real-slug}/{id}`` by trailing id (#751 PR3 spike), so we
@@ -431,15 +429,12 @@ def extract_player_from_next_data(next_data, player_id) -> Optional[dict]:
 
 
 # --------------------------------------------------------------------------- #
-#  Per-player SEASON STATS helpers (issue #751 PR3b) — Season-tab picker       #
+#  Per-player season-stat helpers (issue #751 PR3b)                            #
 # --------------------------------------------------------------------------- #
-# Clicking the Season tab fires /statistics/seasons (a year→season_id map) plus
-# one /unique-tournament/{ut}/season/{sid}/statistics/overall for whatever
-# competition the page defaults to. For transferred/multi-competition players
-# that default is NOT EPL (live-proven: Paquetá → World Cup), so the capture
-# also drives the season-picker to select the target tournament — firing a
-# SECOND overall XHR. These pure helpers pick the right one out of the buffer
-# without any tls fetch (the old tls season-id resolution is no longer needed).
+# ``/statistics/seasons`` provides the year→season-id map. The capture resolves
+# the requested tournament/year in Python and fetches only that exact
+# ``statistics/overall`` path, avoiding the page's often-wrong default
+# competition for transferred players.
 _PLAYER_SEASON_STATS_RE = re.compile(
     r"/api/v1/player/(\d+)/unique-tournament/(\d+)/season/(\d+)/statistics/overall$"
 )
@@ -564,6 +559,8 @@ class SofascoreCamoufoxCapture:
         self._bytes_by_type: Counter = Counter()
         self._blocked_count = 0
         self._blocked_at_event_start = 0
+        self._navigation_count = 0
+        self._api_fetch_count = 0
 
     # -- lifecycle -------------------------------------------------------- #
     def __enter__(self) -> "SofascoreCamoufoxCapture":
@@ -611,8 +608,12 @@ class SofascoreCamoufoxCapture:
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> bool:
         top = ", ".join(f"{t}={b // 1024}KB" for t, b in self._bytes_by_type.most_common(4))
-        logger.info("sofascore capture session total=%.1fMB blocked=%d top=[%s]",
-                    self._bytes_total / 1_048_576, self._blocked_count, top)
+        logger.info(
+            "sofascore capture session total=%.1fMB nav=%d api_fetch=%d "
+            "blocked=%d top=[%s]",
+            self._bytes_total / 1_048_576, self._navigation_count,
+            self._api_fetch_count, self._blocked_count, top,
+        )
         if self._cm is not None:
             try:
                 self._cm.__exit__(exc_type, exc_val, exc_tb)
@@ -670,21 +671,15 @@ class SofascoreCamoufoxCapture:
         self,
         event_id,
         required=("lineups",),
-        max_attempts: int = 3,
+        max_attempts: int = 2,
         tabs=_EVENT_TABS,
     ) -> Dict[str, dict]:
-        """Navigate the match page, nudge the deep tabs, and return the captured
-        per-event endpoints (only those that came back as real JSON).
+        """Warm the match page and return requested per-event JSON endpoints.
 
-        Capture is timing-flaky: a deep-tab XHR (or its body-read) can race and
-        drop an endpoint — the live runner saw ~1/2 lineup misses on a single
-        pass (#757). When any ``required`` endpoint is missing we re-navigate
-        (up to ``max_attempts``), widening the settle window each retry so a
-        slow page still fires the XHR. ``required=()`` takes one pass.
-
-        ``tabs`` narrows which deep tabs to click — a ratings-only caller passes
-        ``tabs=("Lineups",)`` to avoid fetching Statistics/Shotmap it won't use
-        (saves proxy bytes + time). Defaults to all of ``_EVENT_TABS``.
+        Navigation is only the Turnstile warm-up. After it settles, endpoints
+        missing from the passive page load are requested directly by exact API
+        path. This replaces localized/tab DOM clicks and their duplicate XHRs.
+        ``tabs`` now declares which endpoint families the caller wants.
         """
         result: Dict[str, dict] = {}
         required = tuple(required or ())
@@ -694,12 +689,17 @@ class SofascoreCamoufoxCapture:
         # (statistics/shotmap vanished while the required lineups survived —
         # #751 PR2). merge_capture keeps the best record per path.
         self._buffer = {}
+        wanted = fetch_names_for_tabs(tabs)
         for attempt in range(1, max_attempts + 1):
-            # Widen the settle window on retries — a slow page can drop the
-            # tab XHR on the first, tighter pass.
+            # Widen the settle window on retries so the challenge has time to
+            # settle before the exact API fetches.
             self._navigate(event_url(event_id), extra_settle_ms=(attempt - 1) * 2000)
-            self._click_tabs(tabs)
-            self._page.wait_for_timeout(self._tab_wait_ms)
+            result = select_event_endpoints(self._buffer, event_id)
+            for name in wanted:
+                if name in result:
+                    continue
+                path = _EVENT_ENDPOINTS[name].format(eid=event_id)
+                self.fetch_api_json(path)
             result = select_event_endpoints(self._buffer, event_id)
 
             missing_required = [r for r in required if r not in result]
@@ -731,7 +731,7 @@ class SofascoreCamoufoxCapture:
         self,
         event_id,
         names=None,
-        fetch_wait_ms: int = 250,
+        fetch_wait_ms: int = 0,
     ) -> Dict[str, dict]:
         """Pull the per-event endpoints via same-origin in-page ``fetch`` on
         the ALREADY-NAVIGATED page — no re-navigation (#842).
@@ -759,6 +759,7 @@ class SofascoreCamoufoxCapture:
             if tmpl is None:
                 continue
             path = tmpl.format(eid=event_id)
+            self._api_fetch_count += 1
             try:
                 res = self._page.evaluate(self._FETCH_JS, path) or {}
             except Exception as e:  # noqa: BLE001 — one endpoint mustn't kill the pass
@@ -775,10 +776,11 @@ class SofascoreCamoufoxCapture:
                 except Exception:  # noqa: BLE001 — non-JSON body
                     pass
             self._buffer[path] = merge_capture(self._buffer.get(path), rec)
-            try:
-                self._page.wait_for_timeout(fetch_wait_ms)
-            except Exception:  # noqa: BLE001 — pacing must not break the pass
-                pass
+            if fetch_wait_ms > 0:
+                try:
+                    self._page.wait_for_timeout(fetch_wait_ms)
+                except Exception:  # noqa: BLE001 — pacing must not break the pass
+                    pass
         result = select_event_endpoints(self._buffer, event_id)
         self._log_event_capture(event_id, result, kind="fetch")
         return result
@@ -797,6 +799,7 @@ class SofascoreCamoufoxCapture:
         — a 200 record with no usable rows is a legitimate-empty answer, a
         ``None`` return is a transport failure worth retrying.
         """
+        self._api_fetch_count += 1
         try:
             res = self._page.evaluate(self._FETCH_JS, path) or {}
         except Exception as e:  # noqa: BLE001 — a probe fetch mustn't kill the run
@@ -814,6 +817,44 @@ class SofascoreCamoufoxCapture:
         self._buffer[path] = merge_capture(self._buffer.get(path), rec)
         return rec
 
+    def event_endpoint_states(self, event_id, names=None) -> Dict[str, str]:
+        """Classify the last response for each event endpoint.
+
+        ``success`` and ``not_available`` are terminal source answers. All other
+        states are retryable transport/source failures. Keeping this distinction
+        lets the runner persist a completion manifest without treating an
+        optional 404 as a permanent daily re-download or a transient 5xx as a
+        completed match.
+        """
+        names = tuple(names or _EVENT_ENDPOINTS)
+        states: Dict[str, str] = {}
+        for name in names:
+            tmpl = _EVENT_ENDPOINTS.get(name)
+            if tmpl is None:
+                continue
+            rec = self._buffer.get(tmpl.format(eid=event_id))
+            if not isinstance(rec, dict):
+                states[name] = "missing"
+                continue
+            status = rec.get("status")
+            if (
+                status == 200
+                and rec.get("challenge") is False
+                and rec.get("json") is not None
+            ):
+                states[name] = "success"
+            elif status in (204, 404):
+                states[name] = "not_available"
+            elif rec.get("challenge") is True or status == 403:
+                states[name] = "blocked"
+            elif status == 429:
+                states[name] = "rate_limited"
+            elif isinstance(status, int) and status >= 500:
+                states[name] = "server_error"
+            else:
+                states[name] = "transport_error"
+        return states
+
     def _log_event_capture(self, event_id, result, kind: str) -> None:
         """Per-event capture summary + byte/block deltas (#842 accounting)."""
         missing = [k for k in _EVENT_ENDPOINTS if k not in result]
@@ -824,107 +865,38 @@ class SofascoreCamoufoxCapture:
         logger.info("sofascore %s event=%s got=%s missing=%s bytes=%.0fKB blocked=%d",
                     kind, event_id, sorted(result), missing, delta / 1024, blocked)
 
-    def capture_player(self, player_id, *, season_picker_label=None) -> Dict:
-        """Navigate a player page, read the SSR'd bio from ``__NEXT_DATA__``, and
-        (when ``season_picker_label`` is given) drive the Season tab + picker to
-        capture the target competition's season-aggregate stats — all in ONE
-        navigation (#751 PR3 profile + PR3b season stats).
+    def capture_player(
+        self,
+        player_id,
+        *,
+        target_ut=None,
+        target_year=None,
+    ) -> Dict:
+        """Warm the player page once, then fetch the exact target-season APIs.
 
-        Returns ``{'profile': <bio dict | None>, 'season_buffer': {path: rec}}``.
-        The bio is server-rendered (``props.pageProps.player``), NOT an XHR. The
-        ``season_buffer`` is the raw season-stats + ``/statistics/seasons``
-        captures; the caller selects the target ``(ut, season)`` via the pure,
-        season-guarded :func:`select_player_season_stats` /
-        :func:`extract_player_seasons_map`. ``season_picker_label`` is the
-        tournament display text to click in the picker (e.g. ``'Premier
-        League'``) — ``None`` keeps the PR3 profile-only behaviour."""
+        The old fallback clicked a localized Season tab and guessed which of two
+        dropdowns was the tournament picker. That was brittle for transferred
+        players and also fetched the default competition before the target one.
+        The navigation still supplies the SSR profile and Turnstile clearance;
+        deterministic same-origin requests resolve the exact ``(ut, season)``.
+        """
         self._buffer = {}
         self._navigate(player_url(player_id))
         profile = self._extract_player_next_data(player_id)
-
-        season_buffer: Dict[str, dict] = {}
-        if season_picker_label:
-            # Same nav: open the Season tab (fires /statistics/seasons + the
-            # default competition's overall), then switch the picker to the
-            # target tournament so ITS overall fires too.
-            self._click_tabs(("Season",))
-            self._drive_season_picker(season_picker_label)
-            self._page.wait_for_timeout(self._tab_wait_ms)
-            season_buffer = {
-                p: r for p, r in self._buffer.items()
-                if _PLAYER_SEASON_STATS_RE.search(p) or _PLAYER_SEASONS_LIST_RE.search(p)
-            }
-
-        delta = self._bytes_total - self._bytes_at_event_start
-        self._bytes_at_event_start = self._bytes_total
-        blocked = self._blocked_count - self._blocked_at_event_start
-        self._blocked_at_event_start = self._blocked_count
-        logger.info("sofascore capture player=%s profile=%s season_xhrs=%d bytes=%.0fKB blocked=%d",
-                    player_id, profile is not None, len(season_buffer), delta / 1024, blocked)
-        return {"profile": profile, "season_buffer": season_buffer}
-
-    def _drive_season_picker(self, tournament_label: str) -> None:
-        """Best-effort: open the season-statistics TOURNAMENT dropdown and select
-        the target competition so its season-statistics/overall XHR fires.
-
-        The default Season tab shows the player's PRIMARY competition — NOT
-        necessarily EPL for a transferred/multi-competition player (live-proven
-        Paquetá → World Cup, #751 PR3b). Live-proven DOM (probe): the widget has
-        a tournament dropdown — ``button.dropdown__button[aria-haspopup=
-        "listbox"]`` whose label is the current competition NAME (it has letters;
-        the sibling SEASON dropdown shows only a year). Clicking it opens a
-        ``ul.dropdown__list`` of ``li[role="option"]`` tournaments; clicking the
-        target option fires its overall XHR (Paquetá → EPL ut=17/season 76986
-        confirmed). Tournament names are NOT localized (English even under a
-        non-EN proxy), so matching the option by text is locale-safe. A miss just
-        leaves the default tab — :func:`select_player_season_stats` then returns
-        ``None`` for that player (a WARN, not a crash). JS clicks bypass
-        Playwright actionability (same trick as :meth:`_click_tabs`)."""
-        try:
-            opened = self._page.evaluate(
-                """() => {
-                    // The tournament dropdown trigger (NOT the year/season one):
-                    // a dropdown__button whose label carries letters.
-                    const btn = [...document.querySelectorAll(
-                            'button.dropdown__button[aria-haspopup="listbox"],'
-                            + '[aria-haspopup="listbox"]')]
-                        .find(e => /[a-z]/i.test((e.innerText||'')));
-                    if (btn) { btn.click(); return true; }
-                    return false;
-                }"""
-            )
-            if not opened:
-                logger.info("sofascore season-picker: tournament dropdown not found")
-                return
-            self._page.wait_for_timeout(self._tab_wait_ms)
-            clicked = self._page.evaluate(
-                """(label) => {
-                    // ONLY the dropdown options — never the page's plain
-                    // 'Premier League' <a> link (that navigates, fires nothing).
-                    const want = label.toLowerCase();
-                    const opts = [...document.querySelectorAll(
-                        'li[role="option"], .dropdown__listItem')];
-                    let opt = opts.find(
-                        e => (e.innerText||'').trim().toLowerCase() === want);
-                    if (!opt) opt = opts.find(
-                        e => (e.innerText||'').toLowerCase().includes(want));
-                    if (opt) { opt.click(); return true; }
-                    return false;
-                }""",
-                tournament_label,
-            )
-            logger.info("sofascore season-picker select %r -> %s",
-                        tournament_label, clicked)
-            self._page.wait_for_timeout(self._tab_wait_ms)
-        except Exception as e:  # noqa: BLE001 — picker driving is best-effort
-            logger.info("sofascore season-picker drive failed: %s", e)
+        return self.fetch_player(
+            player_id,
+            target_ut=target_ut,
+            target_year=target_year,
+            profile=profile,
+        )
 
     def fetch_player(
         self,
         player_id,
         target_ut=None,
         target_year=None,
-        fetch_wait_ms: int = 250,
+        fetch_wait_ms: int = 0,
+        profile=None,
     ) -> Dict:
         """Pull a player's bio + season-aggregate stats via same-origin
         in-page ``fetch`` — no navigation (#842). Returns the same
@@ -946,6 +918,7 @@ class SofascoreCamoufoxCapture:
         buffer: Dict[str, dict] = {}
 
         def _fetch(path: str) -> dict:
+            self._api_fetch_count += 1
             try:
                 res = self._page.evaluate(self._FETCH_JS, path) or {}
             except Exception as e:  # noqa: BLE001 — one endpoint mustn't kill the pass
@@ -962,18 +935,22 @@ class SofascoreCamoufoxCapture:
                 except Exception:  # noqa: BLE001 — non-JSON body
                     pass
             buffer[path] = rec
-            try:
-                self._page.wait_for_timeout(fetch_wait_ms)
-            except Exception:  # noqa: BLE001 — pacing must not break the pass
-                pass
+            if fetch_wait_ms > 0:
+                try:
+                    self._page.wait_for_timeout(fetch_wait_ms)
+                except Exception:  # noqa: BLE001 — pacing must not break the pass
+                    pass
             return rec
 
-        rec = _fetch(f"/api/v1/player/{pid}")
-        profile = None
-        if (rec.get("status") == 200 and rec.get("challenge") is False
-                and isinstance(rec.get("json"), dict)):
-            p = rec["json"].get("player")
-            profile = p if isinstance(p, dict) else None
+        if profile is None:
+            rec = _fetch(f"/api/v1/player/{pid}")
+            if (
+                rec.get("status") == 200
+                and rec.get("challenge") is False
+                and isinstance(rec.get("json"), dict)
+            ):
+                p = rec["json"].get("player")
+                profile = p if isinstance(p, dict) else None
 
         season_buffer: Dict[str, dict] = {}
         if profile is not None and target_ut is not None:
@@ -1007,119 +984,62 @@ class SofascoreCamoufoxCapture:
         self._navigate(nav_url)
         return dict(self._buffer)
 
-    def capture_tournament(self, nav_url: str) -> Dict[str, dict]:
-        """Navigate a league page, nudge it toward FINISHED results (Matches /
-        previous rounds), and return the whole capture buffer. The caller runs
-        ``extract_tournament_events(buffer, ut_id)`` to pull the match list.
-
-        The default tournament view loads only the upcoming round; finished
-        matches need an interaction to fire their ``/events/{round,last}`` XHR
-        (#757 B1). Interaction is best-effort — a miss yields the default round.
-        """
-        self._buffer = {}
-        self._navigate(nav_url)
-        # Scroll to trigger lazy widgets, then nudge toward finished matches.
-        try:
-            self._page.mouse.wheel(0, 4000)
-            self._page.wait_for_timeout(self._tab_wait_ms)
-        except Exception:
-            pass
-        self._nudge_results()
-        # Let late nudge-triggered XHR (and their body reads) settle into the
-        # buffer before we snapshot it — without this the by-date events race.
-        self._page.wait_for_timeout(self._settle_ms)
-        return dict(self._buffer)
-
     def paginate_tournament_season(
-        self, ut_id, season_id, max_pages: int = 25,
+        self,
+        ut_id,
+        season_id,
+        max_pages: int = 25,
+        *,
+        include_next: bool = False,
     ) -> Dict[str, dict]:
-        """Page a SPECIFIC season's finished events on the ALREADY-NAVIGATED
-        tournament page, so a historical-season backfill sees the target
-        season's matches (#824).
+        """Fetch a SPECIFIC season's events on the ALREADY-NAVIGATED page.
 
         The landing only fires the CURRENT/next season's ``/events/...`` XHR, so
-        :func:`extract_tournament_events` finds nothing for a past season. Here
-        we drive an in-page ``fetch`` of ``/unique-tournament/{ut}/season/{sid}/
-        events/last/{page}`` for page=0.. until a page returns no events or
-        ``hasNextPage`` is false. The page already passed Turnstile on
-        navigation, so a same-origin fetch carries the clearance cookie; each
-        response is captured by :meth:`_on_response` into ``self._buffer`` (keyed
-        by path) and read back by :func:`extract_tournament_events`. Returns the
-        whole buffer. Best-effort: a failed/challenged page stops the loop,
-        leaving whatever paged in. Call within the SAME capture session right
-        after a tournament navigation (no re-nav — that would re-warm Turnstile
-        and burn the rate-limit budget)."""
-        base = (
-            f"/api/v1/unique-tournament/{int(ut_id)}/season/{int(season_id)}"
-            "/events/last/"
-        )
-        pages = 0
-        for page in range(max_pages):
-            try:
-                res = self._page.evaluate(
-                    """async (path) => {
-                        try {
-                            const r = await fetch(path, {credentials: 'include',
-                                headers: {'accept': 'application/json'}});
-                            if (!r.ok) return {ok: false, count: 0, more: false};
-                            const j = await r.json();
-                            const ev = Array.isArray(j.events) ? j.events : [];
-                            return {ok: true, count: ev.length,
-                                    more: !!j.hasNextPage};
-                        } catch (e) { return {ok: false, count: 0, more: false}; }
-                    }""",
-                    base + str(page),
-                )
-            except Exception as e:  # noqa: BLE001 — paging is best-effort
-                logger.info("sofascore season-paging ut=%s sid=%s page=%s: %s",
-                            ut_id, season_id, page, e)
-                break
-            self._page.wait_for_timeout(self._tab_wait_ms)
-            if not res or not res.get("ok") or not res.get("count"):
-                break
-            pages += 1
-            if not res.get("more"):
-                break
-        logger.info("sofascore season-paging ut=%s sid=%s: %d page(s).",
-                    ut_id, season_id, pages)
-        # Let the last response bodies settle into the buffer before snapshot.
-        self._page.wait_for_timeout(self._settle_ms)
-        return dict(self._buffer)
+        :func:`extract_tournament_events` finds nothing for a past season. We
+        request the exact ``events/last`` pages and, for schedule callers,
+        ``events/next`` pages. Each response is parsed and merged synchronously
+        through :meth:`fetch_api_json`; the old response-listener + fixed sleeps
+        raced body reads and added 2.5 seconds per page plus an 8-second tail.
 
-    def _nudge_results(self) -> None:
-        """Surface FINISHED matches: open the 'Matches' top-nav, then switch to
-        the BY DATE view (centres on recent/finished matches for an in-progress
-        season, firing /events/last|next + round XHR).
-
-        The Matches section is collapsed by default (Standings is the landing
-        view), so its toggles (``data-testid=tab-date/tab-round``) render
-        ``display:none`` and a Playwright ``.click()`` times out as non-actionable.
-        A JS ``.click()`` bypasses actionability and follows the SPA's own
-        handlers — live-proven on the EPL page (#757 B1: 10→30 captured events).
-        Best-effort: a miss just leaves the default round.
+        ``include_next=False`` is the traffic-minimal finished-match path.
+        Schedule capture enables it so future fixtures are not lost when the
+        brittle DOM tab-click nudge is removed.
         """
-        # tab-date/tab-round are embedded on the landing page's matches widget
-        # (display:none until activated). Click each DIRECTLY by its stable
-        # data-testid — clicking the 'Matches' top-nav first re-mounts the
-        # section and the toggles vanish before the next click lands. Render
-        # timing varies by proxy exit, so wait for each toggle to mount first.
-        for tid in ("tab-date", "tab-round"):
-            sel = '[data-testid="' + tid + '"]'
-            try:
-                self._page.wait_for_function(
-                    "() => !!document.querySelector('" + sel + "')", timeout=8000,
-                )
-                hit = self._page.evaluate(
-                    "() => { const e = document.querySelector('" + sel + "');"
-                    " if (e) { e.click(); return true; } return false; }"
-                )
-                logger.info("sofascore nudge %s -> %s", tid, hit)
-                self._page.wait_for_timeout(self._tab_wait_ms)
-            except Exception as e:  # noqa: BLE001 — nudge is best-effort
-                logger.info("sofascore nudge %s: not mounted (%s)", tid, e)
+        prefix = (
+            f"/api/v1/unique-tournament/{int(ut_id)}/season/{int(season_id)}/events"
+        )
+        directions = ("last", "next") if include_next else ("last",)
+        page_counts = {}
+        for direction in directions:
+            pages = 0
+            for page in range(max_pages):
+                path = f"{prefix}/{direction}/{page}"
+                rec = self.fetch_api_json(path)
+                if (
+                    not rec
+                    or rec.get("status") != 200
+                    or rec.get("challenge") is not False
+                ):
+                    break
+                obj = rec.get("json")
+                events = obj.get("events") if isinstance(obj, dict) else None
+                if not isinstance(events, list) or not events:
+                    break
+                pages += 1
+                if not obj.get("hasNextPage"):
+                    break
+            page_counts[direction] = pages
+        logger.info(
+            "sofascore season-paging ut=%s sid=%s pages=%s",
+            ut_id,
+            season_id,
+            page_counts,
+        )
+        return dict(self._buffer)
 
     # -- internals -------------------------------------------------------- #
     def _navigate(self, url: str, extra_settle_ms: int = 0) -> None:
+        self._navigation_count += 1
         self._page.goto(url, wait_until="domcontentloaded", timeout=self._nav_timeout_ms)
         self._dismiss_consent()
         self._page.wait_for_timeout(self._settle_ms + extra_settle_ms)
@@ -1132,34 +1052,6 @@ class SofascoreCamoufoxCapture:
                 return
             except Exception:
                 pass
-
-    def _click_tabs(self, tabs=_EVENT_TABS) -> None:
-        for label in tabs:
-            clicked = False
-            # Prefer the stable data-testid via a JS click (bypasses Playwright
-            # actionability and follows the SPA's own handler — same trick as
-            # _nudge_results). get_by_text is a fallback for tabs without a known
-            # testid, but it can grab a non-tab label node (#751 PR2).
-            testid = _TAB_TESTIDS.get(label)
-            if testid:
-                try:
-                    clicked = bool(self._page.evaluate(
-                        "(tid) => { const e = document.querySelector("
-                        "'[data-testid=\"' + tid + '\"]');"
-                        " if (e) { e.scrollIntoView(); e.click(); return true; }"
-                        " return false; }",
-                        testid,
-                    ))
-                except Exception:
-                    clicked = False
-            if not clicked:
-                try:
-                    self._page.get_by_text(label, exact=False).first.click(timeout=3000)
-                    clicked = True
-                except Exception:
-                    pass
-            if clicked:
-                self._page.wait_for_timeout(self._tab_wait_ms)
 
     def _extract_player_next_data(self, player_id) -> Optional[dict]:
         """Read ``__NEXT_DATA__`` off the player page and dig the SSR'd bio out of
