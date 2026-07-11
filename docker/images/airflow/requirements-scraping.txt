@@ -49,6 +49,7 @@ curl_cffi==0.15.0
 # Direct SofaScore discovery only: exact Chrome-133 TLS/HTTP2 fingerprint,
 # never configured with a proxy and never used by paid capture.
 tls-client-python==1.15.1
+typing-extensions==4.15.0
 
 # Pin markdown-it-py to reduce backtracking with rich>=14
 markdown-it-py==3.0.0
