@@ -196,6 +196,9 @@ configs/trino/certs/
 configs/seaweedfs/s3.config.json
 # Keycloak realm с секретами клиентов (рендер из *.example: make render-keycloak-realm)
 configs/keycloak/realm-football.json
+# RSA-ключи бот-JWT OpenMetadata (генерация: make gen-om-jwt-keys; *.der не
+# покрывается паттернами *.pem/*.key выше)
+configs/openmetadata/jwtkeys/
 
 # Documentation (local only)
 CLAUDE.md
