@@ -1278,6 +1278,7 @@ def _build_slices(ctx: _Ctx, vds: dict[str, Any]) -> list[Any]:
             # вершинах налезали друг на друга, значения видны в тултипе.
             "adhoc_filters": [_sql_where(
                 "minutes >= 180 AND goals_p90 IS NOT NULL "
+                "AND xg_p90 IS NOT NULL AND shots_p90 IS NOT NULL "
                 "AND key_passes_p90 IS NOT NULL "
                 "AND dribbles_p90 IS NOT NULL")],
             "row_limit": 5,
