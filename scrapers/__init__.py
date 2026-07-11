@@ -1,20 +1,26 @@
-"""Football data scrapers.
-
-Package exports stay lazy so importing one lightweight production component
-does not initialize every browser scraper, pandas stack, or Iceberg writer in
-the Airflow scheduler process.  Direct module imports remain preferred.
-"""
+"""Football data scrapers with dependency-free lazy package exports."""
 
 from __future__ import annotations
 
 from importlib import import_module
+from typing import TYPE_CHECKING
 
+if TYPE_CHECKING:  # pragma: no cover
+    from scrapers.base.base_scraper import BaseScraper, SeleniumScraper, SoccerdataScraper
+    from scrapers.base.iceberg_writer import IcebergWriter
+    from scrapers.fbref import FBrefScraper
+    from scrapers.fotmob import FotMobScraper
+    from scrapers.matchhistory import MatchHistoryScraper
+    from scrapers.nodriver_fbref import NodriverFBrefScraper
+    from scrapers.whoscored import WhoScoredScraper
 
 _EXPORTS = {
     "BaseScraper": ("scrapers.base.base_scraper", "BaseScraper"),
     "SeleniumScraper": ("scrapers.base.base_scraper", "SeleniumScraper"),
     "SoccerdataScraper": ("scrapers.base.base_scraper", "SoccerdataScraper"),
     "IcebergWriter": ("scrapers.base.iceberg_writer", "IcebergWriter"),
+    "FBrefScraper": ("scrapers.fbref", "FBrefScraper"),
+    "NodriverFBrefScraper": ("scrapers.nodriver_fbref", "NodriverFBrefScraper"),
     "FotMobScraper": ("scrapers.fotmob", "FotMobScraper"),
     "MatchHistoryScraper": ("scrapers.matchhistory", "MatchHistoryScraper"),
     "WhoScoredScraper": ("scrapers.whoscored", "WhoScoredScraper"),
@@ -25,6 +31,8 @@ __version__ = "0.1.0"
 
 
 def __getattr__(name: str):
+    """Load heavy dependencies only when the export is requested."""
+
     try:
         module_name, attribute = _EXPORTS[name]
     except KeyError as exc:
