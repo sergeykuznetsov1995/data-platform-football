@@ -463,6 +463,17 @@ pmv AS (
       ON  mv.player_id      = k.player_id
       AND mv.valuation_date <= ds.start_date
   ) WHERE rn = 1
+),
+pm AS (
+  -- key_passes/dribbles в fct_player_season_stats для ЧМ пусты (0/968 — их
+  -- источник-агрегат sofascore не скрейпился), но fct_player_match несёт их
+  -- на каноничных id (whoscored, 2892/3028) — суммируем сами.
+  SELECT player_id, season,
+         SUM(key_passes)   AS key_passes,
+         SUM(dribbles_won) AS dribbles_won
+  FROM iceberg.gold.fct_player_match
+  WHERE league = 'INT-World Cup'
+  GROUP BY player_id, season
 )
 SELECT
   ps.season,
@@ -481,8 +492,11 @@ SELECT
   ps.goals, ps.assists,
   COALESCE(ps.goals, 0) + COALESCE(ps.assists, 0) AS goal_contrib,
   ps.expected_goals, ps.expected_assists,
-  ps.shots, ps.shots_on_target, ps.key_passes, ps.big_chances_created,
-  ps.successful_dribbles, ps.touches_in_box,
+  ps.shots, ps.shots_on_target,
+  COALESCE(ps.key_passes, pm.key_passes) AS key_passes,
+  ps.big_chances_created,
+  COALESCE(ps.successful_dribbles, pm.dribbles_won) AS successful_dribbles,
+  ps.touches_in_box,
   ps.yellow_cards, ps.red_cards,
   COALESCE(ps.rating_sofascore, mr.rating) AS rating_sofascore,
   pmv.market_value_eur,
@@ -493,12 +507,16 @@ SELECT
   CASE WHEN ps.minutes >= 180
        THEN ps.shots * 90.0 / ps.minutes END AS shots_p90,
   CASE WHEN ps.minutes >= 180
-       THEN ps.key_passes * 90.0 / ps.minutes END AS key_passes_p90,
+       THEN COALESCE(ps.key_passes, pm.key_passes) * 90.0 / ps.minutes
+       END AS key_passes_p90,
   CASE WHEN ps.minutes >= 180
-       THEN ps.successful_dribbles * 90.0 / ps.minutes END AS dribbles_p90
+       THEN COALESCE(ps.successful_dribbles, pm.dribbles_won) * 90.0
+            / ps.minutes
+       END AS dribbles_p90
 FROM iceberg.gold.fct_player_season_stats ps
 LEFT JOIN mr  ON mr.player_id  = ps.player_id AND mr.season  = ps.season
 LEFT JOIN pmv ON pmv.player_id = ps.player_id AND pmv.season = ps.season
+LEFT JOIN pm  ON pm.player_id  = ps.player_id AND pm.season  = ps.season
 LEFT JOIN iceberg.gold.dim_player dp ON dp.player_id = ps.player_id
 LEFT JOIN iceberg.gold.dim_team   dt ON dt.team_id   = ps.team_id
 LEFT JOIN iceberg.gold.dim_season ds ON ds.season    = ps.season
@@ -511,7 +529,7 @@ WHERE ps.league = 'INT-World Cup'"""
         "starts": "В старте", "goals": "Голы", "assists": "Ассисты",
         "goal_contrib": "Г+А", "expected_goals": "xG",
         "expected_assists": "xA", "shots": "Удары",
-        "shots_on_target": "В створ", "key_passes": "КП",
+        "shots_on_target": "В створ", "key_passes": "Ключ. передачи",
         "big_chances_created": "Созданные шансы",
         "successful_dribbles": "Обводки", "touches_in_box": "Касания в штрафной",
         "yellow_cards": "ЖК", "red_cards": "КК",
@@ -557,6 +575,14 @@ SELECT
   CASE WHEN s.minute >= 121 THEN 1 ELSE 0 END AS is_shootout_attempt,
   CASE WHEN s.is_goal THEN 1 ELSE 0 END AS is_goal_int,
   s.is_goal, s.result,
+  CASE s.result
+    WHEN 'goal'       THEN 'Гол'
+    WHEN 'saved'      THEN 'Сейв'
+    WHEN 'blocked'    THEN 'Заблокирован'
+    WHEN 'off_target' THEN 'Мимо'
+    WHEN 'post'       THEN 'Каркас'
+    ELSE COALESCE(s.result, '—')
+  END AS result_label,
   {shot_stage_label} AS stage_label,
   dm.is_knockout,
   COALESCE(th.team_name, dm.home_team_id) || ' — '
@@ -579,7 +605,8 @@ WHERE s.league = 'INT-World Cup'"""
     v_shot_labels = {
         "season": "ЧМ", "minute_bucket": "Минуты", "situation_label": "Тип",
         "team_name": "Сборная", "player_name": "Игрок",
-        "stage_label": "Стадия", "match_label": "Матч", "result": "Исход",
+        "stage_label": "Стадия", "match_label": "Матч",
+        "result": "Исход (raw)", "result_label": "Исход",
     }
 
     # Грейн — season (хребет «эпох»). Всё из dim_match — работает для любого
@@ -923,6 +950,7 @@ def _build_slices(ctx: _Ctx, vds: dict[str, Any]) -> list[Any]:
             "show_value": False,
             "rich_tooltip": True,
             "y_axis_format": ".2f",
+            "x_axis_title_margin": 30,
             "x_axis_title": "Стадия",
         },
     ))
@@ -1051,6 +1079,7 @@ def _build_slices(ctx: _Ctx, vds: dict[str, Any]) -> list[Any]:
             "show_value": False,
             "rich_tooltip": True,
             "y_axis_format": ",d",
+            "x_axis_title_margin": 30,
             "x_axis_title": "Минуты (15-мин корзины)",
         },
     ))
@@ -1067,6 +1096,7 @@ def _build_slices(ctx: _Ctx, vds: dict[str, Any]) -> list[Any]:
             "show_value": False,
             "rich_tooltip": True,
             "y_axis_format": ",d",
+            "x_axis_title_margin": 30,
             "x_axis_title": "ЧМ",
         },
     ))
@@ -1239,14 +1269,20 @@ def _build_slices(ctx: _Ctx, vds: dict[str, Any]) -> list[Any]:
                 _metric("Голы/90", "AVG", "goals_p90"),
                 _metric("xG/90", "AVG", "xg_p90"),
                 _metric("Удары/90", "AVG", "shots_p90"),
-                _metric("КП/90", "AVG", "key_passes_p90"),
+                _metric("Ключ. передачи/90", "AVG", "key_passes_p90"),
                 _metric("Обводки/90", "AVG", "dribbles_p90"),
             ],
             "timeseries_limit_metric": _metric("Г+А", "SUM", "goal_contrib"),
+            # Гейт по всем осям: игрок без КП/обводок рисует ломаный контур
+            # с подписью «null» (жалоба юзера). show_labels=False — цифры на
+            # вершинах налезали друг на друга, значения видны в тултипе.
             "adhoc_filters": [_sql_where(
-                "minutes >= 180 AND goals_p90 IS NOT NULL")],
+                "minutes >= 180 AND goals_p90 IS NOT NULL "
+                "AND key_passes_p90 IS NOT NULL "
+                "AND dribbles_p90 IS NOT NULL")],
             "row_limit": 5,
             "show_legend": True,
+            "show_labels": False,
         },
     ))
     slices.append(_make_slice(ctx,
@@ -1256,9 +1292,11 @@ def _build_slices(ctx: _Ctx, vds: dict[str, Any]) -> list[Any]:
             "all_columns": [
                 "season", "player_name", "team_name", "position_group",
                 "age_at_start", "matches", "minutes", "goals", "assists",
-                "goal_contrib", "expected_goals", "shots", "key_passes",
-                "big_chances_created", "rating_sofascore",
-                "market_value_eur", "yellow_cards", "red_cards",
+                "goal_contrib", "expected_goals", "expected_assists",
+                "shots", "shots_on_target", "key_passes",
+                "successful_dribbles", "big_chances_created",
+                "rating_sofascore", "market_value_eur",
+                "yellow_cards", "red_cards",
             ],
             "order_by_cols": ['["goal_contrib", false]'],
             "row_limit": 1500,
@@ -1266,6 +1304,7 @@ def _build_slices(ctx: _Ctx, vds: dict[str, Any]) -> list[Any]:
             "show_cell_bars": True,
             "column_config": {
                 "expected_goals": {"d3NumberFormat": ".1f"},
+                "expected_assists": {"d3NumberFormat": ".1f"},
                 "rating_sofascore": {"d3NumberFormat": ".2f"},
                 "market_value_eur": {"d3NumberFormat": "SMART_NUMBER"},
             },
@@ -1283,6 +1322,7 @@ def _build_slices(ctx: _Ctx, vds: dict[str, Any]) -> list[Any]:
             **_line_tt,
             "markerEnabled": True,
             "y_axis_format": ".2f",
+            "x_axis_title_margin": 30,
             "x_axis_title": "ЧМ",
         },
     ))
@@ -1298,6 +1338,7 @@ def _build_slices(ctx: _Ctx, vds: dict[str, Any]) -> list[Any]:
             **_line_tt,
             "markerEnabled": True,
             "y_axis_format": ".2f",
+            "x_axis_title_margin": 30,
             "x_axis_title": "ЧМ",
         },
     ))
@@ -1311,6 +1352,7 @@ def _build_slices(ctx: _Ctx, vds: dict[str, Any]) -> list[Any]:
             "show_value": False,
             "rich_tooltip": True,
             "y_axis_format": "SMART_NUMBER",
+            "x_axis_title_margin": 30,
             "x_axis_title": "ЧМ",
         },
     ))
@@ -1324,6 +1366,7 @@ def _build_slices(ctx: _Ctx, vds: dict[str, Any]) -> list[Any]:
             "show_value": False,
             "rich_tooltip": True,
             "y_axis_format": "SMART_NUMBER",
+            "x_axis_title_margin": 30,
             "x_axis_title": "ЧМ",
         },
     ))
@@ -1337,6 +1380,7 @@ def _build_slices(ctx: _Ctx, vds: dict[str, Any]) -> list[Any]:
             "show_value": True,
             "rich_tooltip": True,
             "y_axis_format": ",d",
+            "x_axis_title_margin": 30,
             "x_axis_title": "ЧМ",
         },
     ))
@@ -1353,6 +1397,7 @@ def _build_slices(ctx: _Ctx, vds: dict[str, Any]) -> list[Any]:
             "show_value": False,
             "rich_tooltip": True,
             "y_axis_format": ",d",
+            "x_axis_title_margin": 30,
             "x_axis_title": "ЧМ",
         },
     ))
@@ -1408,6 +1453,7 @@ def _build_slices(ctx: _Ctx, vds: dict[str, Any]) -> list[Any]:
             "show_value": False,
             "rich_tooltip": True,
             "y_axis_format": ".0f",
+            "x_axis_title_margin": 30,
             "x_axis_title": "Очки в группе",
         },
     ))
@@ -1465,7 +1511,7 @@ def _build_slices(ctx: _Ctx, vds: dict[str, Any]) -> list[Any]:
             "query_mode": "raw",
             "all_columns": [
                 "season", "stage_label", "match_label",
-                "team_name", "player_name", "result",
+                "team_name", "player_name", "result_label",
             ],
             "adhoc_filters": [_sql_where("is_shootout_attempt = 1")],
             "order_by_cols": ['["match_label", true]'],
@@ -1483,14 +1529,14 @@ def _build_slices(ctx: _Ctx, vds: dict[str, Any]) -> list[Any]:
             "x": _metric("Длина поля (0→1)", None, None, sql="MIN(1 - x)"),
             "y": _metric("Ширина поля (0→1)", "MIN", "y"),
             "size": _metric("xG", "SUM", "xg"),
-            "series": "result",
+            "series": "result_label",
             "adhoc_filters": [_sql_where("is_shootout_attempt = 0")],
             "row_limit": 5000,
             "max_bubble_size": "10",
             "x_axis_label": "Длина поля (0 = свои ворота, 1 = чужие)",
             "y_axis_label": "Ширина поля",
-            "x_axis_format": ".1f",
-            "y_axis_format": ".1f",
+            "x_axis_format": ".2f",
+            "y_axis_format": ".2f",
             "show_legend": True,
         },
     ))
@@ -1504,6 +1550,7 @@ def _build_slices(ctx: _Ctx, vds: dict[str, Any]) -> list[Any]:
             "adhoc_filters": [_played],
             "whiskerOptions": "Tukey",
             "row_limit": 20000,
+            "x_axis_title_margin": 30,
             "x_axis_title": "ЧМ",
             "y_axis_format": ",d",
         },
@@ -1630,6 +1677,7 @@ def _build_position_json(slices: list[Any]) -> dict[str, Any]:
         "Сетка — таблицей (нативного bracket-виза в Superset нет): стадии "
         "сверху вниз от финала. Счёт — основной + серия пенальти в скобках. "
         "«Голы по минутам» и «по типам» — из шот-данных (современные ЧМ).",
+        height=16,
     ))
     c.append(_row(p, [_chart(slices[11], 7, height=70), _chart(slices[12], 5, height=70)]))
     c.append(_row(p, [_chart(slices[13], 6, height=55), _chart(slices[14], 6, height=55)]))
@@ -1666,6 +1714,7 @@ def _build_position_json(slices: list[Any]) -> dict[str, Any]:
         "сравнить любых (в т.ч. с разных ЧМ). ⚠️ Рейтинг SofaScore пока "
         "подтянут мостом по имени (покрытие ~60% игроков, топы покрыты) — "
         "станет полным после пересборки xref.",
+        height=20,
     ))
     c.append(_row(p, [_chart(slices[20], 6, height=55), _chart(slices[23], 6, height=55)]))
     c.append(_row(p, [_chart(slices[21], 6, height=55), _chart(slices[22], 6, height=55)]))
@@ -1675,6 +1724,7 @@ def _build_position_json(slices: list[Any]) -> dict[str, Any]:
         "Все удары выбранного среза (кроме серий пенальти): размер = xG, "
         "цвет = исход. Подложки поля в Superset нет — атака слева направо, "
         "чужие ворота у x = 1. Выбери игрока или сборную в фильтрах.",
+        height=16,
     ))
     c.append(_row(p, [_chart(slices[39], 12, height=70)]))
 
@@ -1686,6 +1736,7 @@ def _build_position_json(slices: list[Any]) -> dict[str, Any]:
         "загруженные в платформу. Метрики нормированы на матч: форматы "
         "росли с 13 сборных (1930) до 48 (2026), абсолюты несравнимы. "
         "Наполняется по мере бэкфила исторических ЧМ.",
+        height=16,
     ))
     c.append(_row(p, [_chart(slices[26], 6, height=55), _chart(slices[27], 6, height=55)]))
     c.append(_row(p, [_chart(slices[28], 6, height=50), _chart(slices[29], 6, height=50)]))
