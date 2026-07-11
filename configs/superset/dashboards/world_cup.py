@@ -261,7 +261,7 @@ SELECT
   m.home_penalty, m.away_penalty,
   CASE WHEN m.home_penalty IS NOT NULL THEN 1 ELSE 0 END AS went_to_pens,
   CASE
-    WHEN m.home_score IS NULL THEN NULL
+    WHEN m.home_score IS NULL THEN '—'
     WHEN m.home_penalty IS NOT NULL THEN
       CAST(m.home_score AS varchar) || ':' || CAST(m.away_score AS varchar)
       || ' (пен. ' || CAST(m.home_penalty AS varchar) || ':'
@@ -388,7 +388,32 @@ GROUP BY tm.season, COALESCE(dt.team_name, tm.team_id)"""
 
     # Грейн — (season, player): fct_player_season_stats уже турнирный.
     # per-90 гейтится 180 минутами (короткий турнир, лиговый порог 270 жёсток).
+    # Рейтинг: fct_player_season_stats.rating_sofascore для ЧМ пуст (дефект
+    # gold-агрегата, 968/0 — заметка в WC1) — среднее берём напрямую из
+    # fct_match_rating (грейн игрок-матч, для ЧМ заполнен).
+    # ВРЕМЕННЫЙ мост рейтинга (до пересборки xref): fct_match_rating для ЧМ
+    # несёт СЫРЫЕ ss_-id (sofascore-ветки нет в xref_player — для ЧМ не
+    # скрейпился её якорь sofascore_player_season_stats). Мостим через
+    # silver.sofascore_player_profile.canonical_id — профили от КЛУБНЫХ
+    # скрейпов уже канонизированы (покрытие 645/1248 игроков ЧМ, топы
+    # покрыты; superset НЕ имеет прав на bronze — только silver/gold).
+    # Убрать мост после каноничной пересборки xref/gold для ЧМ.
     v_player_tournament = """\
+WITH prof AS (
+  SELECT player_id, MAX(canonical_id) AS canonical_id
+  FROM iceberg.silver.sofascore_player_profile
+  WHERE canonical_id IS NOT NULL
+  GROUP BY player_id
+),
+mr AS (
+  SELECT prof.canonical_id AS player_id, r.season,
+         AVG(r.rating) AS rating, COUNT(*) AS rated_matches
+  FROM iceberg.gold.fct_match_rating r
+  JOIN prof
+    ON 'ss_' || CAST(prof.player_id AS varchar) = r.player_id
+  WHERE r.league = 'INT-World Cup'
+  GROUP BY prof.canonical_id, r.season
+)
 SELECT
   ps.season,
   dp.player_name,
@@ -397,9 +422,9 @@ SELECT
   dp.nationality,
   CASE
     WHEN dp.primary_position = 'GK' THEN 'GK'
-    WHEN dp.primary_position IN ('DF','CB','RB','LB') THEN 'DF'
-    WHEN dp.primary_position IN ('MF','CM','RM','LM','CAM','CDM') THEN 'MF'
-    WHEN dp.primary_position IN ('FW','ST','RW','LW') THEN 'FW'
+    WHEN dp.primary_position IN ('DF','CB','RB','LB','LWB','RWB','WB') THEN 'DF'
+    WHEN dp.primary_position IN ('MF','CM','RM','LM','CAM','CDM','DM','AM') THEN 'MF'
+    WHEN dp.primary_position IN ('FW','ST','RW','LW','CF','SS') THEN 'FW'
   END AS position_group,
   FLOOR(date_diff('day', dp.dob, ds.start_date) / 365.25) AS age_at_start,
   ps.matches, ps.minutes, ps.starts,
@@ -409,7 +434,7 @@ SELECT
   ps.shots, ps.shots_on_target, ps.key_passes, ps.big_chances_created,
   ps.successful_dribbles, ps.touches_in_box,
   ps.yellow_cards, ps.red_cards,
-  ps.rating_sofascore,
+  COALESCE(ps.rating_sofascore, mr.rating) AS rating_sofascore,
   CASE WHEN ps.minutes >= 180
        THEN ps.goals * 90.0 / ps.minutes END AS goals_p90,
   CASE WHEN ps.minutes >= 180
@@ -421,6 +446,7 @@ SELECT
   CASE WHEN ps.minutes >= 180
        THEN ps.successful_dribbles * 90.0 / ps.minutes END AS dribbles_p90
 FROM iceberg.gold.fct_player_season_stats ps
+LEFT JOIN mr ON mr.player_id = ps.player_id AND mr.season = ps.season
 LEFT JOIN iceberg.gold.dim_player dp ON dp.player_id = ps.player_id
 LEFT JOIN iceberg.gold.dim_team   dt ON dt.team_id   = ps.team_id
 LEFT JOIN iceberg.gold.dim_season ds ON ds.season    = ps.season
@@ -462,8 +488,12 @@ SELECT
     WHEN 'free_kick'  THEN 'Прямой штрафной'
     WHEN 'set_piece'  THEN 'Со стандарта'
     WHEN 'penalty'    THEN 'Пенальти'
-    ELSE COALESCE(s.situation, '—')
+    ELSE 'Прочее'
   END AS situation_label,
+  -- Попытки послематчевых серий пенальти: SofaScore пишет их в shotmap с
+  -- minute 121+ и NULL situation (ЧМ-2026: 40 попыток / 25 голов в 4 матчах).
+  -- Они НЕ игровые голы — чарты минут/типов их исключают.
+  CASE WHEN s.minute >= 121 THEN 1 ELSE 0 END AS is_shootout_attempt,
   CASE WHEN s.is_goal THEN 1 ELSE 0 END AS is_goal_int,
   s.is_goal, s.result,
   {shot_stage_label} AS stage_label,
@@ -923,6 +953,7 @@ def _build_slices(ctx: _Ctx, vds: dict[str, Any]) -> list[Any]:
             "row_limit": 200,
             "include_search": True,
             "show_cell_bars": False,
+            "table_timestamp_format": "%d.%m.%Y",
         },
     ))
     slices.append(_make_slice(ctx,
@@ -938,6 +969,7 @@ def _build_slices(ctx: _Ctx, vds: dict[str, Any]) -> list[Any]:
             "row_limit": 100,
             "include_search": False,
             "show_cell_bars": False,
+            "table_timestamp_format": "%d.%m.%Y",
         },
     ))
     slices.append(_make_slice(ctx,
@@ -946,6 +978,7 @@ def _build_slices(ctx: _Ctx, vds: dict[str, Any]) -> list[Any]:
             "x_axis": "minute_bucket",
             "metrics": [_metric("Голов", "SUM", "is_goal_int")],
             "groupby": ["season"],
+            "adhoc_filters": [_sql_where("is_shootout_attempt = 0")],
             "row_limit": 200,
             "show_legend": True,
             "show_value": False,
@@ -961,6 +994,7 @@ def _build_slices(ctx: _Ctx, vds: dict[str, Any]) -> list[Any]:
             "metrics": [_metric("Голов", "SUM", "is_goal_int")],
             "groupby": ["situation_label"],
             "stack": True,
+            "adhoc_filters": [_sql_where("is_shootout_attempt = 0")],
             "row_limit": 200,
             "show_legend": True,
             "show_value": False,
@@ -1023,22 +1057,20 @@ def _build_slices(ctx: _Ctx, vds: dict[str, Any]) -> list[Any]:
         },
     ))
     slices.append(_make_slice(ctx,
+        # Одна метрика — иначе ось не сортируется (см. «Топ-15: гол + пас»).
+        # Разбивка ЖК/КК — в «Сводной таблице сборных».
         "Дисциплина: карточки", "echarts_timeseries_bar", team,
         {
             "x_axis": "team_label",
-            "x_axis_sort": "ЖК",
+            "x_axis_sort": "Карточки (ЖК+КК)",
             "x_axis_sort_asc": True,
-            "metrics": [
-                _metric("ЖК", "SUM", "yellow_cards"),
-                _metric("КК", "SUM", "red_cards"),
-            ],
-            "stack": True,
+            "metrics": [_metric(
+                "Карточки (ЖК+КК)", "SUM", None,
+                sql="SUM(COALESCE(yellow_cards,0) + COALESCE(red_cards,0))",
+            )],
             "adhoc_filters": [_sql_where("yellow_cards IS NOT NULL")],
             "row_limit": 25,
-            "orientation": "horizontal",
-            "show_legend": True,
-            "show_value": False,
-            "rich_tooltip": True,
+            **_hbar,
             "y_axis_format": ",d",
         },
     ))
@@ -1067,21 +1099,17 @@ def _build_slices(ctx: _Ctx, vds: dict[str, Any]) -> list[Any]:
 
     # === Таб 5. Игроки: 20..24 + 25 таблица ==================================
     slices.append(_make_slice(ctx,
+        # Одна метрика: сортировка оси (x_axis_sort) в echarts-барах работает
+        # только для single-metric чартов (проверено на стеке Голы+Ассисты —
+        # ось выходила хаотичной). Разбивка Г/А — в «Сводной таблице игроков».
         "Топ-15: гол + пас", "echarts_timeseries_bar", player,
         {
             "x_axis": "player_label",
-            "x_axis_sort": "Голы",
+            "x_axis_sort": "Г+А",
             "x_axis_sort_asc": True,
-            "metrics": [
-                _metric("Голы", "SUM", "goals"),
-                _metric("Ассисты", "SUM", "assists"),
-            ],
-            "stack": True,
+            "metrics": [_metric("Г+А", "SUM", "goal_contrib")],
             "row_limit": 15,
-            "orientation": "horizontal",
-            "show_legend": True,
-            "show_value": False,
-            "rich_tooltip": True,
+            **_hbar,
             "y_axis_format": ",d",
         },
     ))
@@ -1457,7 +1485,9 @@ def _build_position_json(slices: list[Any]) -> dict[str, Any]:
         "## Игроки\n\n"
         "Scatter'ы — минимум 90 минут; рейтинг и per-90 — минимум 180. "
         "Радар — топ-5 по Г+А; выбери игроков в фильтре «Игрок», чтобы "
-        "сравнить любых (в т.ч. с разных ЧМ).",
+        "сравнить любых (в т.ч. с разных ЧМ). ⚠️ Рейтинг SofaScore пока "
+        "подтянут мостом по имени (покрытие ~60% игроков, топы покрыты) — "
+        "станет полным после пересборки xref.",
     ))
     c.append(_row(p, [_chart(slices[20], 6, height=55), _chart(slices[23], 6, height=55)]))
     c.append(_row(p, [_chart(slices[21], 6, height=55), _chart(slices[22], 6, height=55)]))
