@@ -52,8 +52,7 @@ def test_fotmob_child_failure_is_not_an_allowed_success_state():
 @pytest.mark.parametrize(
     "task_id",
     [
-        "trigger_fbref_silver",
-        "trigger_silver_xref",
+        "wait_for_scheduled_fbref",
         "trigger_e3_transforms",
         "trigger_fbref_gold",
     ],
@@ -69,11 +68,12 @@ def test_required_publication_child_failure_is_not_an_allowed_state(task_id):
 def test_required_source_gate_waits_for_all_ingestion_and_blocks_transforms():
     _reload_master()
     gate = _task("validate_required_sources")
-    fbref_silver = _task("trigger_fbref_silver")
-    xref = _task("trigger_silver_xref")
+    fbref_sensor = _task("wait_for_scheduled_fbref")
+    e3 = _task("trigger_e3_transforms")
 
+    # #933: FBref is externally scheduled at 06:00 and only sensed here — it
+    # must not appear among the master-triggered ingestion tasks.
     expected_ingestion = {
-        "ingestion_triggers.trigger_fbref",
         "ingestion_triggers.trigger_fotmob",
         "ingestion_triggers.trigger_matchhistory",
         "ingestion_triggers.trigger_understat",
@@ -83,13 +83,12 @@ def test_required_source_gate_waits_for_all_ingestion_and_blocks_transforms():
         "ingestion_triggers.trigger_clubelo",
     }
     assert expected_ingestion <= gate.upstream_task_ids
+    assert "ingestion_triggers.trigger_fbref" not in gate.upstream_task_ids
     assert gate._init_kwargs["trigger_rule"] == "all_done"
-    assert gate.task_id in fbref_silver.upstream_task_ids
-    assert fbref_silver.task_id in xref.upstream_task_ids
-    assert fbref_silver._init_kwargs["trigger_dag_id"] == ("dag_transform_fbref_silver")
-    assert fbref_silver._init_kwargs["wait_for_completion"] is True
-    assert fbref_silver._init_kwargs["trigger_rule"] == "all_success"
-    assert xref._init_kwargs["trigger_rule"] == "all_success"
+    assert gate.task_id in fbref_sensor.upstream_task_ids
+    assert fbref_sensor.task_id in e3.upstream_task_ids
+    assert fbref_sensor._init_kwargs["external_dag_id"] == "dag_ingest_fbref"
+    assert e3._init_kwargs["trigger_rule"] == "all_success"
 
 
 @pytest.mark.parametrize("state", ["failed", "upstream_failed", "skipped", "none"])
@@ -136,8 +135,7 @@ def test_required_publication_gate_rejects_every_non_success_state(state):
     from airflow.exceptions import AirflowException
 
     run = _dag_run(
-        trigger_fbref_silver="success",
-        trigger_silver_xref="success",
+        wait_for_scheduled_fbref="success",
         trigger_e3_transforms=state,
         trigger_fbref_gold="success",
     )
@@ -153,15 +151,16 @@ def test_fbref_silver_publication_rejects_every_non_success_state(state):
     module = _reload_master()
     from airflow.exceptions import AirflowException
 
+    # #933: the sensed scheduled FBref run is the Silver/xref evidence — the
+    # external DAG cannot succeed until its blocking Silver -> xref chain does.
     run = _dag_run(
-        trigger_fbref_silver=state,
-        trigger_silver_xref="success",
+        wait_for_scheduled_fbref=state,
         trigger_e3_transforms="success",
         trigger_fbref_gold="success",
     )
     with pytest.raises(
         AirflowException,
-        match=f"dag_transform_fbref_silver={state}",
+        match=f"dag_ingest_fbref={state}",
     ):
         module.enforce_required_publication_success(dag_run=run)
 
@@ -171,13 +170,12 @@ def test_fbref_silver_publication_rejects_missing_current_run_evidence():
     from airflow.exceptions import AirflowException
 
     run = _dag_run(
-        trigger_silver_xref="success",
         trigger_e3_transforms="success",
         trigger_fbref_gold="success",
     )
     with pytest.raises(
         AirflowException,
-        match="dag_transform_fbref_silver=missing",
+        match="dag_ingest_fbref=missing",
     ):
         module.enforce_required_publication_success(dag_run=run)
 
@@ -185,15 +183,13 @@ def test_fbref_silver_publication_rejects_missing_current_run_evidence():
 def test_required_publication_gate_accepts_exact_current_master_success():
     module = _reload_master()
     run = _dag_run(
-        trigger_fbref_silver="success",
-        trigger_silver_xref="success",
+        wait_for_scheduled_fbref="success",
         trigger_e3_transforms="success",
         trigger_fbref_gold="success",
     )
 
     assert module.enforce_required_publication_success(dag_run=run) == {
-        "dag_transform_fbref_silver": "success",
-        "dag_transform_xref": "success",
+        "dag_ingest_fbref": "success",
         "dag_transform_e3": "success",
         "dag_transform_fbref_gold": "success",
     }
@@ -202,8 +198,6 @@ def test_required_publication_gate_accepts_exact_current_master_success():
 def test_no_downstream_publication_task_uses_all_done():
     _reload_master()
     for task_id in (
-        "trigger_fbref_silver",
-        "trigger_silver_xref",
         "trigger_e3_transforms",
         "trigger_e4_transforms",
         "trigger_silver_transfermarkt",
@@ -235,8 +229,7 @@ def test_terminal_check_rejects_failed_downstream_publication():
         **{
             "ingestion_triggers.trigger_fotmob": "success",
             "ingestion_triggers.trigger_whoscored": "success",
-            "trigger_fbref_silver": "success",
-            "trigger_silver_xref": "success",
+            "wait_for_scheduled_fbref": "success",
             "trigger_e3_transforms": "failed",
             "trigger_fbref_gold": "upstream_failed",
         }
