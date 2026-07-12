@@ -50,7 +50,7 @@ jobs:
         shell: bash
         run: |
           python -m pip install --disable-pip-version-check \
-            pytest PyYAML requests \
+            pytest PyYAML requests pandas \
             "typing-extensions==4.15.0" "tls-client-python==1.15.1"
           python -c "from tls_client import Session; print(Session.__module__)"
 
