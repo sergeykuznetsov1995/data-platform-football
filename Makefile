@@ -2,7 +2,7 @@
 # Data Platform - Makefile
 # =============================================================================
 
-.PHONY: help build up up-lite up-full up-build down restart logs ps clean health test-trino init-storage shell-airflow shell-trino sofascore-discovery sofascore-discovery-check test-fbref-curl test-fbref-nodriver test-fbref-full test-proxy-stats up-bi up-catalog down-bi down-catalog superset-init superset-import superset-dashboards om-ingest-trino om-lineage-trino om-apply-descriptions om-cleanup-lineage logs-superset logs-om shell-superset shell-om
+.PHONY: help build up up-lite up-full up-build down restart logs ps clean health test-trino init-storage shell-airflow shell-trino sofascore-discovery sofascore-discovery-check test-fbref-offline test-proxy-stats up-bi up-catalog down-bi down-catalog superset-init superset-import superset-dashboards om-ingest-trino om-lineage-trino om-apply-descriptions om-cleanup-lineage logs-superset logs-om shell-superset shell-om
 
 # Default target
 help:
@@ -28,9 +28,7 @@ help:
 	@echo "  make shell-trino  - Open shell in Trino"
 	@echo ""
 	@echo "FBref Scraping Tests:"
-	@echo "  make test-fbref-curl      - Test curl_cffi with residential proxy"
-	@echo "  make test-fbref-nodriver  - Test nodriver (browser) fallback"
-	@echo "  make test-fbref-full      - Run full test pipeline"
+	@echo "  make test-fbref-offline   - Run raw/parser/control/DAG tests without network"
 	@echo "  make test-proxy-stats     - Show proxy pool statistics"
 	@echo ""
 	@echo "BI / Catalog:"
@@ -187,53 +185,27 @@ urls:
 # FBref Scraping Tests
 # =============================================================================
 
-# Test curl_cffi with residential proxy (basic test)
-test-fbref-curl:
-	@echo "Testing FBref with curl_cffi + residential proxy..."
-	@docker compose exec airflow-webserver python -c "\
-from curl_cffi.requests import Session; \
-import random; \
-proxies = open('/opt/airflow/proxys.txt').readlines(); \
-proxy = random.choice(proxies).strip(); \
-host, port, user, pwd = proxy.split(':'); \
-proxy_url = f'http://{user}:{pwd}@{host}:{port}'; \
-s = Session(impersonate='chrome120'); \
-s.proxies = {'http': proxy_url, 'https': proxy_url}; \
-print(f'Using proxy: {host}:{port}'); \
-r = s.get('https://api.ipify.org?format=json'); \
-print(f'Proxy IP: {r.json()}'); \
-r = s.get('https://fbref.com/en/comps/9/schedule/Premier-League-Scores-and-Fixtures'); \
-print(f'FBref Status: {r.status_code}'); \
-print(f'Has tables: {\"<table\" in r.text}'); \
-print(f'Cloudflare blocked: {\"challenge\" in r.text.lower() or \"just a moment\" in r.text.lower()}'); \
-print(f'Content length: {len(r.text)} chars'); \
-"
-
-# Test nodriver fallback (browser-based)
-test-fbref-nodriver:
-	@echo "Testing FBref with nodriver fallback..."
-	docker compose exec airflow-webserver python dags/scripts/run_fbref_scraper.py \
-		--scraper-type selenium \
-		--use-nodriver \
-		--proxy-file /opt/airflow/proxys.txt \
-		--mode match_data \
-		--match-data-type schedule \
-		--leagues "ENG-Premier League" \
-		--season 2025 \
-		--output /tmp/test_fbref_nodriver.json \
-		--verbose
-
-# Full FBref test pipeline (curl_cffi -> nodriver fallback)
-test-fbref-full:
-	@echo "Running full FBref test pipeline..."
-	@echo ""
-	@echo "=== Step 1: Test curl_cffi ==="
-	@$(MAKE) test-fbref-curl || true
-	@echo ""
-	@echo "=== Step 2: Test nodriver fallback ==="
-	@$(MAKE) test-fbref-nodriver || true
-	@echo ""
-	@echo "Full FBref test pipeline completed!"
+# Deterministic FBref verification. Live traffic requires an explicit bounded
+# canary; this target never opens the production transport.
+test-fbref-offline:
+	docker compose exec airflow-scheduler python -m pytest -q \
+		tests/unit/scrapers/test_fbref_control_store.py \
+		tests/unit/scrapers/test_fbref_raw_store_v2.py \
+		tests/unit/scrapers/test_fbref_page_document.py \
+		tests/unit/scrapers/test_fbref_discovery.py \
+		tests/unit/scrapers/test_fbref_camoufox_transport.py \
+		tests/unit/scrapers/test_fbref_fetcher.py \
+		tests/unit/scrapers/test_fbref_pipeline.py \
+		tests/unit/scrapers/test_fbref_generic_bronze.py \
+		tests/unit/scrapers/test_fbref_typed_bronze.py \
+		tests/unit/dags/test_dag_ingest_fbref.py \
+		tests/unit/dags/test_dag_backfill_fbref.py \
+		tests/unit/dags/test_dag_replay_fbref.py \
+		tests/unit/dags/test_fbref_medallion_order.py \
+		tests/unit/dags/test_fbref_pipeline_tasks.py \
+		tests/unit/scripts/test_fbref_offline_remediation.py \
+		tests/unit/scripts/test_fbref_standalone_tools.py \
+		tests/unit/scripts/test_run_fbref_canary.py
 
 # Test proxy pool statistics
 test-proxy-stats:

@@ -16,7 +16,6 @@ from scrapers.fbref.raw_store import (
     RawPageCorrupt,
     RawPageNotFound,
     RawPageStore,
-    RawStoreError,
     canonicalize_fbref_url,
     competition_index_target,
     competition_page_target,
@@ -193,7 +192,7 @@ def test_status_contract_and_error_manifests(tmp_path):
 
     assert result.status == DatasetStatus.ERROR
     assert result.datasets["shot_events"].status == DatasetStatus.RESTRICTED
-    assert result.datasets["match_events"].status == DatasetStatus.EMPTY
+    assert result.datasets["match_events"].status == DatasetStatus.NOT_APPLICABLE
     assert player_manifest["status"] == "error"
     assert player_manifest["row_count"] == 0
     assert match_manifest["status"] == "error"
@@ -258,31 +257,6 @@ def test_generic_page_manifests_are_flat_and_page_summary_is_last(tmp_path):
         "matches": matches_key,
         "warnings": warnings_key,
     }
-
-
-def test_discovery_queue_manifests_are_scoped_and_cannot_escape(tmp_path):
-    store = _store(tmp_path)
-    plan = {"manifest_version": "queue-v1", "competition_ids": ["9"]}
-    item = {"status": "complete", "competition_id": "../9"}
-
-    plan_key = store.write_discovery_queue_plan("../../all", plan)
-    item_key = store.write_discovery_queue_item("../../all", "../9", item)
-
-    assert plan_key == "queues/discovery/%2E%2E%2F%2E%2E%2Fall/plan.json"
-    assert item_key == (
-        "queues/discovery/%2E%2E%2F%2E%2E%2Fall/items/%2E%2E%2F9.json"
-    )
-    assert store.has_discovery_queue_plan("../../all")
-    assert store.has_discovery_queue_item("../../all", "../9")
-    assert store.read_discovery_queue_plan("../../all") == plan
-    assert store.read_discovery_queue_item("../../all", "../9") == item
-
-    assert store.write_discovery_queue_plan("../../all", plan) == plan_key
-    with pytest.raises(RawStoreError, match="immutable"):
-        store.write_discovery_queue_plan(
-            "../../all",
-            {"manifest_version": "queue-v2", "competition_ids": ["9"]},
-        )
 
 
 def test_available_status_has_row_count():

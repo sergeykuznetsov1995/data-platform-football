@@ -1,172 +1,149 @@
-"""Unit tests for ``dags/dag_ingest_fbref.py``.
-
-#920 Phase 1: the club season_stats_all + match_data pipeline stays
-byte-identical (task_id/output_file/traffic_output unchanged — regression
-guard for "клубные лиги не должны измениться"); each single-year tournament
-(e.g. INT-World Cup) gets its own parallel mini-pipeline with distinct
-task_ids/output files/traffic-output paths, so it never collides with the
-club pipeline's traffic-guard files.
-
-Airflow is not installed on the host; ``tests/unit/dags/conftest.py`` installs
-stub ``airflow`` modules into ``sys.modules`` so the DAG module body (operators
-+ ``>>``/TaskGroup wiring) executes and can be asserted on.
-"""
+"""Topology and fail-closed tests for the production FBref refresh DAG."""
 
 from __future__ import annotations
 
 import importlib
-import re
 import sys
 from pathlib import Path
 
 import pytest
 
 
-def _reload_dag_module():
-    """Force a fresh import of the FBref ingest DAG module."""
-    from airflow.operators.bash import BashOperator
+@pytest.fixture(scope="module")
+def loaded_dag(request):
     from airflow.operators.python import PythonOperator
 
-    BashOperator._instances.clear()
-    PythonOperator._instances.clear()
+    original_init = PythonOperator.__init__
 
-    # #920 Phase 1: the DAG module calls is_single_year_competition() at
-    # import time to build its task graph — point CONFIG_DIR at the real
-    # shipped configs/medallion (on the host, it otherwise defaults to
-    # /opt/airflow/configs/medallion, which only exists in the container).
-    from utils import medallion_config
+    def capturing_init(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        self._captured_kwargs = dict(kwargs)
 
-    medallion_config.CONFIG_DIR = (
-        Path(__file__).resolve().parents[3] / "configs" / "medallion"
+    PythonOperator.__init__ = capturing_init
+    request.addfinalizer(
+        lambda: setattr(PythonOperator, "__init__", original_init)
     )
-    medallion_config.reset_cache()
-
+    PythonOperator._instances.clear()
     sys.modules.pop("dag_ingest_fbref", None)
     sys.modules.pop("dags.dag_ingest_fbref", None)
-
-    return importlib.import_module("dag_ingest_fbref")
-
-
-def _bash_task(task_id):
-    from airflow.operators.bash import BashOperator
-
-    for t in BashOperator._instances:
-        if t.task_id == task_id:
-            return t
-    return None
-
-
-def _flag_value(command, flag):
-    match = re.search(rf'{re.escape(flag)}\s+"([^"]+)"', command)
-    return match.group(1) if match else None
-
-
-@pytest.fixture
-def dag_module():
-    return _reload_dag_module()
+    module = importlib.import_module("dag_ingest_fbref")
+    tasks = {task.task_id: task for task in PythonOperator._instances}
+    return module, tasks
 
 
 @pytest.mark.unit
-class TestClubPipelineUnchanged:
-    """Regression guard: the club pipeline's task_ids/output files/
-    traffic-output paths must stay byte-identical to before #920 Phase 1."""
-
-    def test_season_stats_all_unchanged(self, dag_module):
-        task = _bash_task('season_stats_all')
-        assert task is not None
-        assert task.env['FBREF_LEAGUES'] == "{{ params.leagues | join(',') }}"
-        assert _flag_value(task.bash_command, '--output').endswith(
-            '/fbref_season_stats.json'
+class TestFBrefCurrentTopology:
+    def test_daily_source_discovered_scope(self, loaded_dag):
+        module, _ = loaded_dag
+        assert module.dag.dag_id == "dag_ingest_fbref"
+        assert module.dag.schedule == "0 6 * * *"
+        assert module.dag._dag_kwargs["max_active_runs"] == 1
+        assert module.dag._dag_kwargs["max_active_tasks"] == 1
+        assert (
+            module.dag._dag_kwargs["on_failure_callback"].__name__
+            == "fbref_dag_failure_callback"
         )
-        assert _flag_value(task.bash_command, '--traffic-output').endswith(
-            '/fbref_traffic_season_stats.json'
-        )
+        assert set(module.dag._dag_kwargs["params"]) == {
+            "request_limit",
+            "byte_limit_mb",
+            "shard_size",
+        }
+        source = Path(module.__file__).read_text(encoding="utf-8")
+        assert "LEAGUES" not in source
+        assert "params.leagues" not in source
 
-    def test_match_schedule_unchanged(self, dag_module):
-        task = _bash_task('match_schedule')
-        assert task is not None
-        assert task.env['FBREF_LEAGUES'] == "{{ params.leagues | join(',') }}"
-        assert _flag_value(task.bash_command, '--output').endswith(
-            '/fbref_match_schedule.json'
-        )
+    def test_global_budget_and_shard_bounds(self, loaded_dag):
+        module, tasks = loaded_dag
+        params = module.dag._dag_kwargs["params"]
+        assert params["request_limit"].default == 200
+        assert params["request_limit"]._kw["minimum"] == 22
+        assert params["request_limit"]._kw["maximum"] == 200
+        assert params["byte_limit_mb"].default == 100
+        assert params["byte_limit_mb"]._kw["minimum"] == 7
+        assert params["byte_limit_mb"]._kw["maximum"] == 100
+        assert params["shard_size"].default == 25
+        assert params["shard_size"]._kw["minimum"] == 1
+        assert params["shard_size"]._kw["maximum"] == 25
 
-    def test_match_all_data_unchanged(self, dag_module):
-        task = _bash_task('match_all_data')
-        assert task is not None
-        assert task.env['FBREF_LEAGUES'] == "{{ params.leagues | join(',') }}"
-        assert _flag_value(task.bash_command, '--output').endswith(
-            '/fbref_match_all_data.json'
-        )
-        assert _flag_value(task.bash_command, '--traffic-output').endswith(
-            '/fbref_traffic_match_all_data.json'
-        )
-
-
-@pytest.mark.unit
-class TestTournamentMiniPipeline:
-    """Each single-year tournament in LEAGUES gets its own parallel
-    season_stats_all_{slug} + match_data_{slug} pipeline."""
-
-    def test_tournament_season_stats_task_exists_dedicated(self, dag_module):
-        task = _bash_task('season_stats_all_int_world_cup')
-        assert task is not None
-        assert task.env['FBREF_LEAGUES'] == 'INT-World Cup'
-        assert '--season {{ params.season }}' in task.bash_command
-        assert _flag_value(task.bash_command, '--output').endswith(
-            '/fbref_season_stats_int_world_cup.json'
+        initialize = tasks["initialize_run"]
+        assert initialize.python_callable.__name__ == "initialize_fbref_run"
+        assert initialize.op_kwargs["run_type"] == "current"
+        assert initialize.op_kwargs["request_limit"] == (
+            "{{ params.request_limit }}"
         )
 
-    def test_tournament_match_schedule_task_exists_dedicated(self, dag_module):
-        task = _bash_task('match_schedule_int_world_cup')
-        assert task is not None
-        assert task.env['FBREF_LEAGUES'] == 'INT-World Cup'
-        assert _flag_value(task.bash_command, '--output').endswith(
-            '/fbref_match_schedule_int_world_cup.json'
-        )
+    def test_fixed_fetch_parse_waves_are_strictly_sequential(self, loaded_dag):
+        module, tasks = loaded_dag
+        assert len(tasks) == 2 * module.CURRENT_WAVE_COUNT + 4
+        assert tasks["initialize_run"].downstream_task_ids == {
+            "seed_competition_index"
+        }
+        assert tasks["seed_competition_index"].downstream_task_ids == {
+            "fetch_wave_01"
+        }
 
-    def test_tournament_match_all_data_task_exists_dedicated(self, dag_module):
-        task = _bash_task('match_all_data_int_world_cup')
-        assert task is not None
-        assert task.env['FBREF_LEAGUES'] == 'INT-World Cup'
-        assert _flag_value(task.bash_command, '--output').endswith(
-            '/fbref_match_all_data_int_world_cup.json'
-        )
-
-    def test_traffic_output_paths_never_collide_with_club(self, dag_module):
-        """Regression guard: without --traffic-output plumbing, the club and
-        tournament runs would both write /tmp/fbref_traffic_<label>.json
-        (the runner labels by mode, not by league) — a real race/corruption
-        risk this test protects against."""
-        pairs = [
-            ('season_stats_all', 'season_stats_all_int_world_cup'),
-            ('match_schedule', 'match_schedule_int_world_cup'),
-            ('match_all_data', 'match_all_data_int_world_cup'),
-        ]
-        for club_id, tournament_id in pairs:
-            club_task = _bash_task(club_id)
-            tournament_task = _bash_task(tournament_id)
-            assert club_task is not None and tournament_task is not None
-
-            club_traffic = _flag_value(
-                club_task.bash_command, '--traffic-output'
+        for number in range(1, module.CURRENT_WAVE_COUNT + 1):
+            fetch_id = f"fetch_wave_{number:02d}"
+            parse_id = f"parse_wave_{number:02d}"
+            fetch = tasks[fetch_id]
+            parse = tasks[parse_id]
+            assert fetch.python_callable.__name__ == "fetch_fbref_wave"
+            assert parse.python_callable.__name__ == "parse_fbref_wave"
+            assert fetch.op_kwargs["page_kinds"] == module.PAGE_KINDS
+            assert parse.op_kwargs["page_kinds"] == module.PAGE_KINDS
+            assert fetch.downstream_task_ids == {parse_id}
+            expected_next = (
+                f"fetch_wave_{number + 1:02d}"
+                if number < module.CURRENT_WAVE_COUNT
+                else "validate_run"
             )
-            tournament_traffic = _flag_value(
-                tournament_task.bash_command, '--traffic-output'
-            )
-            assert club_traffic is not None
-            assert tournament_traffic is not None
-            assert club_traffic != tournament_traffic
+            assert parse.downstream_task_ids == {expected_next}
 
-    def test_club_only_leagues_produce_no_tournament_pipeline(self, monkeypatch):
-        import utils.config as config
+    def test_failure_edges_cannot_be_masked(self, loaded_dag):
+        module, tasks = loaded_dag
+        assert all(
+            task._captured_kwargs.get("trigger_rule") == "all_success"
+            for task in tasks.values()
+        )
+        assert tasks["validate_run"].upstream_task_ids == {
+            f"parse_wave_{module.CURRENT_WAVE_COUNT:02d}"
+        }
+        assert tasks["validate_run"].downstream_task_ids == {
+            "trigger_silver_transform"
+        }
+        assert tasks["trigger_silver_transform"].upstream_task_ids == {
+            "validate_run"
+        }
+        source = Path(module.__file__).read_text(encoding="utf-8")
+        assert "all_done" not in source
 
-        monkeypatch.setattr(config, 'LEAGUES', ['ENG-Premier League'])
-        _reload_dag_module()
+    def test_silver_waits_and_propagates_child_failure(self, loaded_dag):
+        _, tasks = loaded_dag
+        kwargs = tasks["trigger_silver_transform"]._captured_kwargs
+        assert kwargs["trigger_dag_id"] == "dag_transform_fbref_silver"
+        assert kwargs["wait_for_completion"] is True
+        assert kwargs["allowed_states"] == ["success"]
+        assert kwargs["failed_states"] == ["failed"]
+        assert kwargs["execution_timeout"].total_seconds() == 12 * 60 * 60
+        assert kwargs["retries"] == 0
+        assert kwargs["reset_dag_run"] is False
+        assert kwargs["trigger_run_id"] == (
+            "fbref_silver__{{ dag.dag_id }}__{{ run_id }}"
+        )
+        assert kwargs["logical_date"] == "{{ ti.start_date }}"
 
-        assert _bash_task('season_stats_all_int_world_cup') is None
-        assert _bash_task('match_schedule_int_world_cup') is None
-        assert _bash_task('match_all_data_int_world_cup') is None
-        # club pipeline must still exist untouched
-        assert _bash_task('season_stats_all') is not None
-        assert _bash_task('match_schedule') is not None
-        assert _bash_task('match_all_data') is not None
+    def test_legacy_transport_tasks_are_absent(self, loaded_dag):
+        _, tasks = loaded_dag
+        legacy = {
+            "season_stats_all",
+            "match_schedule",
+            "match_all_data",
+            "traffic_guard_season_stats",
+            "report_proxy_traffic",
+        }
+        assert legacy.isdisjoint(tasks)
+        assert all(
+            task.python_callable is not None
+            for task_id, task in tasks.items()
+            if task_id != "trigger_silver_transform"
+        )

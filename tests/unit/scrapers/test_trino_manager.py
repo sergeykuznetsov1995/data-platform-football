@@ -501,6 +501,49 @@ class TestTrinoTableManagerInsertDataFrameAtomic:
             mock_execute.assert_not_called()
             mock_drop.assert_not_called()
 
+    def test_insert_dataframe_atomic_empty_replacement_deletes_scope(self):
+        """An explicit zero-row replacement clears only its exact scope."""
+        import pandas as pd
+        with patch.dict('sys.modules', {'trino': MagicMock(), 'trino.dbapi': MagicMock()}):
+            from scrapers.base.trino_manager import TrinoTableManager
+
+            manager = TrinoTableManager()
+            with patch.object(manager, '_execute') as mock_execute, \
+                 patch.object(manager, 'drop_table') as mock_drop:
+                result = manager.insert_dataframe_atomic(
+                    'bronze',
+                    'test_table',
+                    pd.DataFrame(),
+                    delete_filter="match_id = 'abc123'",
+                )
+
+            assert result == 0
+            mock_execute.assert_called_once_with(
+                "DELETE FROM iceberg.bronze.test_table "
+                "WHERE match_id = 'abc123'"
+            )
+            mock_drop.assert_not_called()
+
+    def test_insert_dataframe_atomic_empty_replacement_failure_propagates(self):
+        """A failed zero-row replacement is never reported as success."""
+        import pandas as pd
+        with patch.dict('sys.modules', {'trino': MagicMock(), 'trino.dbapi': MagicMock()}):
+            from scrapers.base.trino_manager import TrinoError, TrinoTableManager
+
+            manager = TrinoTableManager()
+            with patch.object(
+                manager,
+                '_execute',
+                side_effect=TrinoError("delete failed"),
+            ):
+                with pytest.raises(TrinoError, match="delete failed"):
+                    manager.insert_dataframe_atomic(
+                        'bronze',
+                        'test_table',
+                        pd.DataFrame(),
+                        delete_filter="match_id = 'abc123'",
+                    )
+
     def test_replace_partitions_stages_before_delete(self):
         """delete_filter path (#314): the partition DELETE runs only AFTER the
         stage is populated, and the swap is DELETE then INSERT...SELECT on the

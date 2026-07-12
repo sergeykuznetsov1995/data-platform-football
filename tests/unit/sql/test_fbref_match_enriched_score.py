@@ -26,10 +26,12 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 import pytest
+import yaml
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 SILVER_PATH = PROJECT_ROOT / "dags" / "sql" / "silver" / "fbref_match_enriched.sql"
+OVERRIDES_PATH = PROJECT_ROOT / "configs" / "medallion" / "match_result_overrides.yaml"
 
 pytestmark = pytest.mark.unit
 
@@ -45,6 +47,8 @@ _ICEBERG_TO_LOCAL = {
     "iceberg.bronze.fbref_match_team_stats": "bronze_fbref_match_team_stats",
     "iceberg.bronze.fbref_match_events":     "bronze_fbref_match_events",
     "iceberg.bronze.fbref_lineups":          "bronze_fbref_lineups",
+    "iceberg.bronze.fbref_dataset_availability":
+        "bronze_fbref_dataset_availability",
 }
 
 # Trino replaces every occurrence; DuckDB needs the explicit 'g' flag.
@@ -56,7 +60,32 @@ def _translate(sql: str) -> str:
     for k, v in _ICEBERG_TO_LOCAL.items():
         sql = sql.replace(k, v)
     sql = sql.replace(_TRINO_REGEXP_REPLACE, _DUCK_REGEXP_REPLACE)
+    sql = sql.replace("REGEXP_LIKE(", "REGEXP_MATCHES(")
     return sql
+
+
+def _render_overrides(sql: str) -> str:
+    payload = yaml.safe_load(OVERRIDES_PATH.read_text(encoding="utf-8"))
+    rows = []
+
+    def quote(value: Any) -> str:
+        return "'" + str(value).replace("'", "''") + "'"
+
+    for item in payload["overrides"]:
+        rows.append(
+            "(" + ", ".join([
+                quote(item["match_id"]), quote(item["league"]), quote(item["season"]),
+                str(item["official_home_score"]), str(item["official_away_score"]),
+                quote(item["authority"]), quote(item["reference"]), quote(item["reason"]),
+            ]) + ")"
+        )
+    typed_empty = (
+        "(CAST(NULL AS varchar), CAST(NULL AS varchar), CAST(NULL AS varchar),\n"
+        "         CAST(NULL AS integer), CAST(NULL AS integer), CAST(NULL AS varchar),\n"
+        "         CAST(NULL AS varchar), CAST(NULL AS varchar))"
+    )
+    assert sql.count(typed_empty) == 1
+    return sql.replace(typed_empty, ",\n        ".join(rows))
 
 
 # ---------------------------------------------------------------------------
@@ -100,8 +129,17 @@ def _reset_schemas(duck_conn):
             match_url    VARCHAR,
             league       VARCHAR,
             season       BIGINT,
+            source_season_id VARCHAR,
             _ingested_at TIMESTAMP,
             _batch_id    VARCHAR
+        )
+        """
+    )
+    duck_conn.execute(
+        """
+        CREATE TABLE bronze_fbref_dataset_availability (
+            match_id VARCHAR, dataset VARCHAR, availability VARCHAR,
+            reason VARCHAR, _ingested_at TIMESTAMP, _batch_id VARCHAR
         )
         """
     )
@@ -175,6 +213,13 @@ EVENT_ROWS = [
     ("ed6efcb0", "38", "goal", "Grégoire Defrel", "p1", "home"),
     ("ed6efcb0", "67", "goal", "Domenico Berardi", "p2", "home"),
     ("ed6efcb0", "81", "goal", "Rey Manaj", "p3", "away"),
+    # Düsseldorf-Bochum: three on-field away goals plus shoot-out attempts.
+    # Empty-minute penalties must not inflate the additive on_field_* score.
+    ("bbbbbbbb", "18", "goal", "Philipp Hofmann", "p4", "away"),
+    ("bbbbbbbb", "66", "goal", "Philipp Hofmann", "p4", "away"),
+    ("bbbbbbbb", "70", "penalty", "Kevin Stöger", "p5", "away"),
+    ("bbbbbbbb", "", "penalty", "Shootout Home", "p6", "home"),
+    ("bbbbbbbb", "", "penalty", "Shootout Away", "p7", "away"),
 ]
 
 
@@ -201,7 +246,7 @@ def _seed(duck_conn) -> None:
 
 
 def _run_silver(duck_conn) -> Dict[str, Dict[str, Any]]:
-    sql = _translate(SILVER_PATH.read_text(encoding="utf-8"))
+    sql = _translate(_render_overrides(SILVER_PATH.read_text(encoding="utf-8")))
     cur = duck_conn.execute(sql)
     cols = [d[0] for d in cur.description]
     rows: List[Dict[str, Any]] = [dict(zip(cols, r)) for r in cur.fetchall()]
@@ -217,16 +262,28 @@ def test_translation_patched_regexp_replace() -> None:
     """The 'g'-flag patch must still apply — otherwise DuckDB silently keeps
     the trailing shoot-out count and every assertion below becomes vacuous."""
     raw = SILVER_PATH.read_text(encoding="utf-8")
-    assert raw.count(_TRINO_REGEXP_REPLACE) == 2, "score parser was reformatted"
+    assert raw.count(_TRINO_REGEXP_REPLACE) == 6, "score parser was reformatted"
     assert _TRINO_REGEXP_REPLACE not in _translate(raw)
 
 
 class TestScoreParsing:
 
+    def test_source_single_year_season_is_preserved(self, duck_conn):
+        _seed(duck_conn)
+        duck_conn.execute(
+            "UPDATE bronze_fbref_schedule SET source_season_id = '2016' "
+            "WHERE match_url LIKE '%aaaaaaaa%'"
+        )
+        assert _run_silver(duck_conn)["aaaaaaaa"]["season"] == "2016"
+
     def test_plain_score(self, duck_conn):
         _seed(duck_conn)
         row = _run_silver(duck_conn)["aaaaaaaa"]
         assert (row["home_score"], row["away_score"]) == (3, 4)
+        assert (row["source_home_score"], row["source_away_score"]) == (3, 4)
+        assert (row["official_home_score"], row["official_away_score"]) == (3, 4)
+        assert row["official_score_provenance"] == "fbref_schedule"
+        assert row["result_status"] == "played"
         assert row["is_awarded"] is False
         assert row["notes"] is None
 
@@ -236,6 +293,16 @@ class TestScoreParsing:
         out = _run_silver(duck_conn)
         assert (out["bbbbbbbb"]["home_score"], out["bbbbbbbb"]["away_score"]) == (0, 3)
         assert (out["cccccccc"]["home_score"], out["cccccccc"]["away_score"]) == (1, 1)
+        assert (out["bbbbbbbb"]["home_shootout_score"],
+                out["bbbbbbbb"]["away_shootout_score"]) == (5, 6)
+        assert (out["cccccccc"]["home_shootout_score"],
+                out["cccccccc"]["away_shootout_score"]) == (4, 5)
+        assert (out["bbbbbbbb"]["on_field_home_score"],
+                out["bbbbbbbb"]["on_field_away_score"]) == (0, 3)
+        # Legacy counters stay byte-compatible and therefore still include the
+        # empty-minute shootout attempts; new consumers use on_field_*.
+        assert (out["bbbbbbbb"]["home_goals_events"],
+                out["bbbbbbbb"]["away_goals_events"]) == (1, 4)
 
     def test_awarded_match_keeps_official_score_and_is_flagged(self, duck_conn):
         """Sassuolo won 2–1 on the pitch; the official result is 0–3."""
@@ -244,8 +311,15 @@ class TestScoreParsing:
         assert (row["home_score"], row["away_score"]) == (0, 3)
         assert row["is_awarded"] is True
         assert row["notes"] == "Match awarded to Pescara"
+        assert (row["source_home_score"], row["source_away_score"]) == (0, 3)
+        assert (row["official_home_score"], row["official_away_score"]) == (0, 3)
+        assert row["official_score_provenance"] == "medallion_override"
+        assert row["official_score_authority"] == "Lega Serie A, Giudice Sportivo"
+        assert row["official_score_reference"].endswith("/cu24.pdf")
+        assert row["result_status"] == "awarded"
         # the on-pitch result stays reachable via the event counters
         assert (row["home_goals_events"], row["away_goals_events"]) == (2, 1)
+        assert (row["on_field_home_score"], row["on_field_away_score"]) == (2, 1)
 
     def test_cancelled_match_has_no_parsed_score(self, duck_conn):
         _seed(duck_conn)
@@ -253,6 +327,7 @@ class TestScoreParsing:
         assert row["home_score"] is None and row["away_score"] is None
         assert row["is_awarded"] is False
         assert row["notes"] == "Match Cancelled"
+        assert row["result_status"] == "cancelled"
 
     def test_score_roundtrips_to_the_bronze_string(self, duck_conn):
         """Mirrors the DQ gate score_roundtrip[silver.fbref_match_enriched]."""

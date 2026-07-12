@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
+import re
 from typing import Callable, Dict, Optional, Set
 
 import pandas as pd
@@ -81,6 +82,10 @@ def _run_parser(
     empty_status: DatasetStatus = DatasetStatus.EMPTY,
     empty_reason: str = "parser_returned_no_rows",
     required: bool = False,
+    source_present: bool = False,
+    source_has_rows: bool = False,
+    allow_empty_source: bool = False,
+    missing_is_error: bool = False,
 ) -> DatasetParseResult:
     try:
         frame = parser()
@@ -107,11 +112,153 @@ def _run_parser(
             error_type="MatchPlayerContractError",
             error_message="Expected two valid player summary tables",
         )
+    if not source_present:
+        if not missing_is_error:
+            return DatasetParseResult(
+                dataset=dataset,
+                status=DatasetStatus.NOT_APPLICABLE,
+                reason="source_container_not_published",
+            )
+        return DatasetParseResult(
+            dataset=dataset,
+            status=DatasetStatus.ERROR,
+            reason="source_container_missing",
+            error_type="MatchPageContractError",
+            error_message=(
+                f"Expected source container for {dataset} is absent"
+            ),
+        )
+    if source_has_rows:
+        return DatasetParseResult(
+            dataset=dataset,
+            status=DatasetStatus.ERROR,
+            reason="source_container_unparsed",
+            error_type="MatchPageSchemaDriftError",
+            error_message=(
+                f"Source container for {dataset} has rows but parser returned none"
+            ),
+        )
+    if not allow_empty_source:
+        return DatasetParseResult(
+            dataset=dataset,
+            status=DatasetStatus.ERROR,
+            reason="required_source_container_empty",
+            error_type="MatchPageContractError",
+            error_message=f"Source container for {dataset} is unexpectedly empty",
+        )
     return DatasetParseResult(
         dataset=dataset,
         status=empty_status,
         reason=empty_reason,
     )
+
+
+def _table_has_rows(table) -> bool:
+    body = table.find("tbody")
+    rows = (body or table).find_all("tr")
+    return any(
+        "thead" not in set(row.get("class") or [])
+        and bool(row.get_text(" ", strip=True))
+        for row in rows
+    )
+
+
+def _match_source_evidence(soup, comment_tables) -> Dict[str, tuple[bool, bool]]:
+    """Inventory source containers before any parser may collapse them.
+
+    A missing container is schema drift, not proof of a zero-row dataset.  The
+    writer may clear live rows only when the stored page explicitly contains
+    an empty/restricted source section.
+    """
+
+    tables = list(soup.find_all("table")) + list(comment_tables.values())
+    table_pairs = [
+        (str(table.get("id") or ""), table)
+        for table in tables
+    ]
+
+    def matching(pattern: str):
+        compiled = re.compile(pattern, re.IGNORECASE)
+        return [table for table_id, table in table_pairs if compiled.fullmatch(table_id)]
+
+    shot_tables = matching(r"shots?(?:_all|_both)?")
+    summary_tables = matching(r"stats_[a-f0-9]{8}_summary")
+    keeper_tables = matching(r"keeper_stats_[a-f0-9]{8}")
+
+    events_wrap = soup.find("div", id="events_wrap")
+    legacy_events = soup.find(
+        "div",
+        class_=lambda value: value
+        and "event" in str(value).casefold().split(),
+    )
+    lineup_divs = soup.find_all(
+        "div",
+        class_=lambda value: value and "lineup" in str(value).casefold(),
+    )
+    if not lineup_divs:
+        lineup_divs = soup.find_all(
+            "div",
+            id=lambda value: value and "lineup" in str(value).casefold(),
+        )
+    team_stats = soup.find("div", id="team_stats")
+    scorebox = soup.find("div", class_="scorebox") or soup.find(
+        "div", id="scorebox"
+    )
+    officials_label = next(
+        (
+            tag
+            for tag in soup.find_all("small")
+            if tag.get_text(strip=True).casefold() == "officials"
+        ),
+        None,
+    )
+    officials_block = (
+        officials_label.find_parent("div")
+        if officials_label is not None
+        else None
+    )
+
+    return {
+        "shot_events": (
+            bool(shot_tables or soup.find(id="all_shots")),
+            any(_table_has_rows(table) for table in shot_tables),
+        ),
+        "match_events": (
+            bool(events_wrap or legacy_events),
+            bool(
+                (events_wrap and events_wrap.find("div", class_="event"))
+                or legacy_events
+            ),
+        ),
+        "lineups": (
+            bool(lineup_divs),
+            any(
+                div.find("a", href=lambda href: href and "/players/" in href)
+                is not None
+                for div in lineup_divs
+            ),
+        ),
+        "match_team_stats": (
+            team_stats is not None,
+            bool(team_stats and team_stats.get_text(" ", strip=True)),
+        ),
+        "match_player_stats": (
+            len(summary_tables) == 2,
+            any(_table_has_rows(table) for table in summary_tables),
+        ),
+        "match_managers": (
+            scorebox is not None,
+            bool(scorebox and scorebox.get_text(" ", strip=True)),
+        ),
+        "match_officials": (
+            officials_block is not None,
+            bool(officials_block and officials_block.find("span")),
+        ),
+        "match_keeper_stats": (
+            len(keeper_tables) == 2,
+            any(_table_has_rows(table) for table in keeper_tables),
+        ),
+    }
 
 
 def parse_match_html(
@@ -170,10 +317,19 @@ def parse_match_html(
             datasets=datasets,
         )
 
+    source_evidence = _match_source_evidence(soup, comment_tables)
+
     def run(name: str, callback: Callable, **kwargs) -> DatasetParseResult:
         if name not in enabled:
             return not_applicable(name, "dataset_not_requested")
-        return _run_parser(name, callback, **kwargs)
+        present, has_rows = source_evidence[name]
+        return _run_parser(
+            name,
+            callback,
+            source_present=present,
+            source_has_rows=has_rows,
+            **kwargs,
+        )
 
     shots_restricted = soup.find(id="all_shots") is not None
     datasets = {
@@ -188,15 +344,19 @@ def parse_match_html(
                 "source_section_without_shots_table"
                 if shots_restricted else "parser_returned_no_rows"
             ),
+            allow_empty_source=True,
         ),
         "match_events": run(
-            "match_events", lambda: parsers["match_events"](soup)
+            "match_events",
+            lambda: parsers["match_events"](soup),
+            allow_empty_source=True,
         ),
         "lineups": run(
             "lineups",
             lambda: parsers["lineups"](
                 soup, comment_tables=comment_tables
             ),
+            allow_empty_source=True,
         ),
         "match_team_stats": run(
             "match_team_stats",
@@ -208,10 +368,14 @@ def parse_match_html(
             required=require_player_contract,
         ),
         "match_managers": run(
-            "match_managers", lambda: parsers["match_managers"](soup)
+            "match_managers",
+            lambda: parsers["match_managers"](soup),
+            missing_is_error=True,
         ),
         "match_officials": run(
-            "match_officials", lambda: parsers["match_officials"](soup)
+            "match_officials",
+            lambda: parsers["match_officials"](soup),
+            allow_empty_source=True,
         ),
         "match_keeper_stats": run(
             "match_keeper_stats",

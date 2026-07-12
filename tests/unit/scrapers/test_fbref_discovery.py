@@ -3,12 +3,16 @@ from scrapers.fbref.discovery import (
     CompetitionFormat,
     CompetitionGender,
     CompetitionRef,
+    CompetitionEligibility,
     ParticipantType,
     SeasonRef,
     parse_competition_html,
     parse_competition_index_html,
     parse_schedule_html,
     parse_season_html,
+    discover_page_links,
+    partition_competitions,
+    sentinel_coverage,
 )
 from scrapers.fbref.match_parser import DatasetStatus
 
@@ -179,7 +183,7 @@ def test_cup_and_national_team_seasons_are_tournaments_even_with_opaque_labels()
     assert season.calendar_type == CalendarType.TOURNAMENT
 
 
-def test_unknown_league_season_label_is_an_explicit_error():
+def test_unknown_league_season_label_keeps_source_opaque_identity():
     html = """
     <table id="seasons"><tr>
       <th data-stat="season"><a href="/en/comps/9/spring/source-slug">Spring Edition</a></th>
@@ -189,11 +193,11 @@ def test_unknown_league_season_label_is_an_explicit_error():
     result = parse_competition_html(html, _competition())
     dataset = result.datasets["seasons"]
 
-    assert result.has_errors
-    assert dataset.status == DatasetStatus.ERROR
-    assert dataset.reason == "season_row_parse_failed"
-    assert dataset.error_type == "SeasonDiscoveryError"
-    assert "Unsupported season label" in dataset.error_message
+    assert not result.has_errors
+    assert dataset.status == DatasetStatus.AVAILABLE
+    assert dataset.row_count == 1
+    assert dataset.records[0].season_id == "spring"
+    assert dataset.records[0].calendar_type == CalendarType.OPAQUE
 
 
 def test_season_parser_uses_the_exact_discovered_schedule_href():
@@ -308,3 +312,168 @@ def test_schedule_with_only_future_rows_has_empty_non_error_matches():
     assert result.datasets["matches"].status == DatasetStatus.EMPTY
     assert result.datasets["matches"].reason == "no_match_report_links"
     assert not result.has_errors
+
+
+def test_gender_partition_is_decided_before_child_targets():
+    male = _competition(comp_id="1")
+    female = CompetitionRef(
+        **{
+            **male.__dict__,
+            "comp_id": "2",
+            "gender": CompetitionGender.FEMALE,
+        }
+    )
+    unknown = CompetitionRef(
+        **{
+            **male.__dict__,
+            "comp_id": "3",
+            "gender": CompetitionGender.UNKNOWN,
+        }
+    )
+
+    partitioned = partition_competitions([male, female, unknown])
+
+    assert [item.comp_id for item in partitioned[CompetitionEligibility.ELIGIBLE]] == ["1"]
+    assert [item.comp_id for item in partitioned[CompetitionEligibility.SKIPPED_FEMALE]] == ["2"]
+    assert [item.comp_id for item in partitioned[CompetitionEligibility.QUARANTINED_UNKNOWN]] == ["3"]
+
+
+def test_source_link_inventory_covers_graph_and_comments_without_url_synthesis():
+    html = """
+    <a href="/en/comps/8/history/Champions-League-Seasons">History</a>
+    <a href="/en/comps/8/2025-2026/Champions-League-Stats">Overview</a>
+    <a href="/en/comps/8/2025-2026/schedule/source-schedule">Schedule</a>
+    <a href="/en/squads/abcd1234/Team-Stats">Squad</a>
+    <a href="/en/players/1234abcd/Player">Player</a>
+    <!-- <a href="/en/players/1234abcd/matchlogs/2025/summary/Player-Match-Logs">Logs</a>
+         <a href="/en/matches/aaaaaaaa/source-slug">Match</a> -->
+    """
+
+    links = discover_page_links(html)
+    by_kind = {link.page_kind: link for link in links}
+
+    assert set(by_kind) == {
+        "competition", "season", "schedule", "squad", "player", "matchlog", "match"
+    }
+    assert by_kind["match"].canonical_url == "https://fbref.com/en/matches/aaaaaaaa"
+    assert by_kind["season"].source_ids == {
+        "competition_id": "8", "season_id": "2025-2026"
+    }
+    assert by_kind["matchlog"].source_ids == {
+        "player_id": "1234abcd",
+        "matchlog_season_id": "2025",
+        "matchlog_discriminator": "2025/summary",
+    }
+
+
+def test_matchlog_inventory_requires_structural_discriminator():
+    html = """
+    <a href="/en/players/1234abcd/matchlogs/">Root</a>
+    <a href="/en/players/1234abcd/matchlogs/2025">Season nav</a>
+    <a href="/en/players/1234abcd/matchlogs/2025/summary">Type nav</a>
+    <a href="/en/players/1234abcd/matchlogs/2025/summary/Player-Logs">Data</a>
+    """
+
+    matchlogs = [
+        link for link in discover_page_links(html)
+        if link.page_kind == "matchlog"
+    ]
+
+    assert len(matchlogs) == 1
+    assert matchlogs[0].source_ids["matchlog_discriminator"] == "2025/summary"
+
+
+def test_source_id_allowlists_remove_cross_context_inheritance():
+    html = """
+    <a href="/en/players/1234abcd/Player">Player</a>
+    <a href="/en/squads/abcd1234/Team">Squad</a>
+    <a href="/en/comps/8/2025-2026/schedule/Source">Schedule</a>
+    """
+
+    links = discover_page_links(
+        html,
+        parent_source_ids={
+            "competition_id": "wrong-comp",
+            "season_id": "wrong-season",
+            "player_id": "wrong-player",
+            "squad_id": "wrong-squad",
+        },
+    )
+    by_kind = {link.page_kind: link for link in links}
+
+    assert by_kind["player"].source_ids == {"player_id": "1234abcd"}
+    assert by_kind["squad"].source_ids["squad_id"] == "abcd1234"
+    assert len(by_kind["squad"].source_ids["squad_discriminator"]) == 20
+    assert not {
+        "competition_id", "season_id", "player_id"
+    } & set(by_kind["squad"].source_ids)
+    assert by_kind["schedule"].source_ids == {
+        "competition_id": "8",
+        "season_id": "2025-2026",
+    }
+
+
+def test_stat_links_stay_distinct_and_known_empty_routes_are_skipped():
+    html = """
+    <a href="/en/comps/9/2025-2026/Premier-League-Stats">Overview</a>
+    <a href="/en/comps/9/2025-2026/shooting/source-shooting">Shooting</a>
+    <a href="/en/comps/9/2025-2026/misc/source-misc">Misc</a>
+    <a href="/en/comps/9/2025-2026/passing/source-passing">Passing</a>
+    <a href="/en/comps/9/2025-2026/keepersadv/source-keepers">Advanced</a>
+    """
+
+    links = discover_page_links(html)
+
+    assert [link.page_kind for link in links].count("season") == 1
+    assert {
+        link.source_ids.get("stat_route")
+        for link in links
+        if link.page_kind == "season_stats"
+    } == {"shooting", "misc"}
+    assert not any(
+        route in link.canonical_url
+        for link in links
+        for route in ("/passing/", "/keepersadv/")
+    )
+
+
+def test_sentinel_coverage_observes_but_does_not_filter_arbitrary_male_rows():
+    premier = CompetitionRef(
+        **{**_competition(comp_id="9").__dict__, "name": "Premier League"}
+    )
+    arbitrary = CompetitionRef(
+        **{**_competition(comp_id="999").__dict__, "name": "Small Test League"}
+    )
+
+    report = sentinel_coverage(
+        [premier, arbitrary], ["Premier League", "Champions League"]
+    )
+    partitioned = partition_competitions([premier, arbitrary])
+
+    assert report["Premier League"]["published"] is True
+    assert report["Champions League"]["published"] is False
+    assert {item.comp_id for item in partitioned[CompetitionEligibility.ELIGIBLE]} == {
+        "9", "999"
+    }
+
+
+def test_sentinel_coverage_matches_source_governing_body_prefixes():
+    champions = CompetitionRef(
+        **{
+            **_competition(comp_id="8").__dict__,
+            "name": "UEFA Champions League",
+        }
+    )
+    world_cup = CompetitionRef(
+        **{
+            **_competition(comp_id="1").__dict__,
+            "name": "FIFA World Cup",
+        }
+    )
+
+    report = sentinel_coverage(
+        [champions, world_cup], ["Champions League", "World Cup"]
+    )
+
+    assert report["Champions League"]["competition_id"] == "8"
+    assert report["World Cup"]["competition_id"] == "1"

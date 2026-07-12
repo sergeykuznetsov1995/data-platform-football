@@ -6,12 +6,14 @@ table:
   description: |
     Широкий профиль игрока за сезон — один row на (player_id, squad, league,
     season): зимний трансфер внутри лиги даёт по строке на каждый клуб (#463).
-    Денормализованная склейка 4 Bronze-таблиц по (player_id, squad, league,
+    Денормализованная склейка 4 Bronze-таблиц через общий
+    silver.fbref_player_identity по (resolved player_id, squad, league,
     season): fbref_player_stats (стандарт), fbref_player_shooting (удары),
     fbref_player_playingtime (игровое время / +-), fbref_player_misc (фолы,
     отборы, навесы). Каждый источник дедуплицируется через ROW_NUMBER ...
     ORDER BY _ingested_at DESC, _batch_id DESC до JOIN. Все числовые —
-    TRY_CAST. Идентификаторы сырые FBref (canonical-резолюция — в Gold;
+    TRY_CAST. Native IDs сохраняются, exact-recovered и synthetic residual
+    явно маркируются (canonical-резолюция — в Gold;
     Gold-факты схлопывают мульти-squad сезоны до клуба с максимумом минут).
   tags:
     - Tier.Silver
@@ -23,7 +25,13 @@ columns:
     tags:
       - PII.Low
   - name: player_id
-    description: Сырой FBref player_id.
+    description: Native/recovered FBref player_id либо stable noid_ для residual.
+  - name: player_id_resolution
+    description: source_native | recovered_unique_native | synthetic_residual.
+  - name: player_id_is_synthetic
+    description: True только для residual без unique native evidence.
+  - name: player_id_evidence_datasets
+    description: Набор FBref datasets, подтвердивших identity.
   - name: nation
     description: Национальность игрока (код страны как на FBref).
     tags:

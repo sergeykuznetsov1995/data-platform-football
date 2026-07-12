@@ -8,7 +8,7 @@ from FBref HTML elements.
 
 import logging
 import re
-from typing import Dict, Optional
+from typing import Dict
 
 from bs4 import BeautifulSoup
 

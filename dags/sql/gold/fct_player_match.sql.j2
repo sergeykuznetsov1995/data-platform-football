@@ -163,6 +163,14 @@ xref_fm_match AS (
     FROM iceberg.silver.xref_match
     WHERE source = 'fotmob'
       AND confidence <> 'orphan'
+),
+
+-- ===== FBref per-match keeper metrics (#870) =====
+fbref_keeper_match AS (
+    SELECT
+        match_id, player_id, team_side, league, season,
+        minutes, shots_on_target_against, goals_against, saves, save_pct
+    FROM iceberg.silver.fbref_keeper_match_stats
 )
 
 SELECT
@@ -223,6 +231,13 @@ SELECT
     {{ m_penalty_attempts }}
     {{ m_penalties_won }}
     {{ m_penalties_conceded }}
+    -- Additive goalkeeper-only block.  Outfield rows remain NULL; using the
+    -- existing player-match grain avoids a competing keeper-match fact.
+    CAST(gk.minutes AS BIGINT)                    AS gk_minutes,
+    CAST(gk.shots_on_target_against AS BIGINT)    AS gk_shots_on_target_against,
+    CAST(gk.goals_against AS BIGINT)              AS gk_goals_against,
+    CAST(gk.saves AS BIGINT)                      AS gk_saves,
+    CAST(gk.save_pct AS DOUBLE)                   AS gk_save_pct,
     -- SofaScore/WhoScored детали (покрытие 2425+):
     {{ m_passes_completed }}
     {{ m_clearances }}
@@ -254,6 +269,8 @@ INNER JOIN iceberg.silver.fbref_player_match_stats fb
     ON  fb.player_id = xfp.fbref_player_id
     AND fb.league    = xfp.league
     AND fb.season    = xfp.season_year
+INNER JOIN iceberg.gold.dim_match match_scope
+    ON match_scope.match_id = fb.match_id
 
 -- ===== FBref match canonicalisation =====
 LEFT JOIN xref_match_fbref xmf
@@ -266,6 +283,13 @@ LEFT JOIN xref_team_fbref xtf
     ON  xtf.fbref_team_id = fb.team
     AND xtf.league        = xfp.league
     AND xtf.season_slug   = xfp.season_slug
+
+LEFT JOIN fbref_keeper_match gk
+    ON  gk.match_id   = fb.match_id
+    AND gk.player_id  = fb.player_id
+    AND gk.team_side  = fb.team_side
+    AND gk.league     = fb.league
+    AND gk.season     = fb.season
 
 -- ===== SofaScore bridge (LEFT) =====
 LEFT JOIN xref_ss_player xsp

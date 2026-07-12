@@ -1,11 +1,9 @@
 """Residential-proxy traffic reporting (#789).
 
-The scrapers already emit passive byte counters for the residential proxy pool
-(`pool.proxys.io`, billed ~$4/GB): FBref writes ``/tmp/fbref_traffic_<label>.json``
-per task (real CDP bytes + curl_cffi fast-path, #44/#624); the FlareSolverr and
-tls_requests scrapers ship a ``traffic`` key in their run-result JSON. This module
-aggregates those counters into one human-readable per-run Airflow log line so the
-residential spend is finally visible — "who ate how many MB this run".
+The durable FBref pipeline reports its PostgreSQL control-budget total directly.
+FlareSolverr and tls_requests scrapers ship a ``traffic`` key in their run-result
+JSON. This module normalizes those counters into a human-readable per-run
+Airflow log line so residential spend remains visible.
 
 Module-level imports are stdlib only: this runs inside the Airflow scheduler
 process and must NOT pull in ``scrapers/`` (CLAUDE.md memory footgun — importing
@@ -13,7 +11,6 @@ scrapers adds ~1.5 GB to the task).
 """
 from __future__ import annotations
 
-import glob
 import importlib
 import json
 import logging
@@ -47,48 +44,6 @@ def top_domains(domain_mb: Dict[str, float], n: int = 5) -> List[Dict[str, Any]]
     """Top-``n`` (host, mb) rows by MB, dropping zero-byte hosts."""
     rows = sorted(domain_mb.items(), key=lambda kv: -kv[1])[:n]
     return [{"host": h, "mb": round(mb, 2)} for h, mb in rows if mb > 0]
-
-
-def summarize_fbref_traffic(
-    glob_pattern: str = "/tmp/fbref_traffic_*.json",
-) -> Dict[str, Any]:
-    """Aggregate the per-task FBref traffic JSONs into one run-level summary.
-
-    Each FBref task writes ``/tmp/fbref_traffic_<label>.json`` (#44). Real proxy
-    bytes per task = CDP ``real_proxy_mb`` (``loadingFinished``) + curl_cffi
-    ``http_mb_downloaded`` fast-path. We sum both across tasks and merge
-    ``top_traffic_urls`` by host for the per-domain breakdown.
-
-    Returns a summary dict: ``{source, total_mb, top_domains, files_read}``.
-    """
-    total_mb = 0.0
-    domain_mb: Dict[str, float] = defaultdict(float)
-    files = sorted(glob.glob(glob_pattern))
-    read = 0
-    for path in files:
-        try:
-            with open(path) as fh:
-                summary = json.load(fh)
-        except (OSError, json.JSONDecodeError) as exc:
-            logger.warning("proxy_traffic: skipping unreadable %s: %s", path, exc)
-            continue
-        if not isinstance(summary, dict):
-            continue
-        read += 1
-        total_mb += float(summary.get("real_proxy_mb") or 0.0)
-        total_mb += float(summary.get("http_mb_downloaded") or 0.0)
-        for row in summary.get("top_traffic_urls") or []:
-            if not isinstance(row, dict):
-                continue
-            host = _host_of(str(row.get("url", "")))
-            if host:
-                domain_mb[host] += _row_mb(row)
-    return {
-        "source": "fbref",
-        "total_mb": round(total_mb, 2),
-        "top_domains": top_domains(domain_mb),
-        "files_read": read,
-    }
 
 
 def _first_present(mapping: Dict[str, Any], keys: List[str]) -> Any:
@@ -206,10 +161,9 @@ def check_result_traffic_guard(
 ) -> Dict[str, Any]:
     """Exact decoded-byte kill-switch over run-result JSONs.
 
-    Mirrors the FBref guard (``utils.fbref_callbacks.check_traffic_guard``)
-    for scrapers that ship one ``traffic`` dict in their run-result JSON
-    (tls_requests style, e.g. Transfermarkt). Threshold lookup order per
-    entity: Airflow Variable ``<threshold_variable>_<entity>`` →
+    Applies a per-entity guard to scrapers that ship one ``traffic`` dict in
+    their run-result JSON (tls_requests style, e.g. Transfermarkt). Threshold
+    lookup order per entity: Airflow Variable ``<threshold_variable>_<entity>`` →
     Variable ``<threshold_variable>`` → ``default_thresholds[entity]`` →
     ``default_threshold_mb``.
 
@@ -450,15 +404,20 @@ def record_traffic_run(
     summary: Dict[str, Any],
     dag_run_id: str = "",
     conn=None,
+    replace_existing: bool = False,
 ) -> bool:
     """Persist one per-run residential-traffic row to the ops table (#789 Phase 2).
 
-    ``summary`` is what :func:`summarize_fbref_traffic` / :func:`summarize_result_traffic`
-    return. Passive telemetry: **never raises** — a failed insert must not break
-    an ingest run (returns ``False`` and logs a warning).
+    ``summary`` is the normalized source/MB/domain mapping produced by the
+    caller or :func:`summarize_result_traffic`. Passive telemetry: **never
+    raises** — a failed insert must not break an ingest run (returns ``False``
+    and logs a warning).
 
     When ``conn`` is None a connection is opened and closed here; pass one to
-    reuse a connection a caller already holds.
+    reuse a connection a caller already holds. ``replace_existing`` makes a
+    single run-level reporter retry-idempotent by deleting the exact
+    ``(source, dag_run_id)`` row before inserting it. It is opt-in because
+    some legacy DAGs intentionally emit several source rows per DAG run.
     """
     from datetime import datetime
 
@@ -495,6 +454,17 @@ def record_traffic_run(
         now = datetime.now()
         run_ts = now.strftime("%Y-%m-%d %H:%M:%S")
         run_date = now.strftime("%Y-%m-%d")
+
+        if replace_existing:
+            if not str(dag_run_id).strip():
+                raise ValueError(
+                    "replace_existing requires a non-empty dag_run_id"
+                )
+            _execute(
+                conn,
+                f"DELETE FROM {OPS_TABLE} WHERE source = {_sql_str(source)} "
+                f"AND dag_run_id = {_sql_str(dag_run_id)}",
+            )
 
         _execute(
             conn,

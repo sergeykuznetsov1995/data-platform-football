@@ -6,7 +6,7 @@ Utility functions for executing Silver-layer CTAS transformations via Trino.
 
 Uses the `trino` Python library directly (NOT scrapers.base.trino_manager)
 to avoid importing the entire scrapers package with its heavy dependencies
-(nodriver, selenium, soccerdata, curl_cffi ~1.5GB RAM).
+(browser engines, soccerdata, curl_cffi).
 
 Usage:
     from utils.silver_tasks import run_silver_transform

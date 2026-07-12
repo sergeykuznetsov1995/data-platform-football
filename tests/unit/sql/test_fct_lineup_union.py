@@ -23,6 +23,7 @@ someone flips the order.
 
 from __future__ import annotations
 
+import hashlib
 import re
 import sys
 from pathlib import Path
@@ -705,9 +706,6 @@ class TestProjection:
 #   * bronze.espn_schedule read without re-ingest dedup (#461);
 #   * a season predicate on the xref_match JOIN (#809 / #867).
 
-import hashlib
-
-
 def _collapse_call(sql: str, fn_name: str) -> str:
     """Drop a wrapper function call (paren-balanced)."""
     out = []
@@ -753,6 +751,10 @@ _ICEBERG_TO_LOCAL = {
 
 
 def _translate(sql: str) -> str:
+    sql = sql.replace(
+        "iceberg.gold.dim_match",
+        "(SELECT DISTINCT match_id FROM silver_fbref_match_lineups)",
+    )
     for k, v in _ICEBERG_TO_LOCAL.items():
         sql = sql.replace(k, v)
     sql = _collapse_call(sql, "to_utf8")
