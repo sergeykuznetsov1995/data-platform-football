@@ -51,9 +51,11 @@ _COUNTRY_ROUTE_RE = re.compile(
     r"^/wettbewerbe/national/wettbewerbe/[A-Za-z0-9_-]+(?:/.*)?$"
 )
 _COMPETITION_ROUTE_RE = re.compile(
-    r"^/(?P<slug>[^/?#]+)/[^?#]*/(?P<kind>pokalwettbewerb|wettbewerb)/"
+    r"^/(?P<slug>[^/?#]+)/(?:[^?#]*/)?(?P<section>[^/?#]+)/"
+    r"(?P<kind>pokalwettbewerb|wettbewerb)/"
     r"(?P<competition_id>[A-Za-z0-9_-]+)(?:/.*)?$"
 )
+_CANONICAL_SECTION = "startseite"
 _EDITION_PATH_RE = re.compile(r"/saison_id/(?P<edition_id>\d{4})(?:/|$)")
 
 
@@ -137,7 +139,7 @@ def _canonical_url(value: str, *, base_url: str = BASE_URL) -> Optional[str]:
     return urlunsplit(("https", "www.transfermarkt.com", path, query, ""))
 
 
-def _profile_identity(url: str) -> Optional[tuple[str, str, str]]:
+def _profile_identity(url: str) -> Optional[tuple[str, str, str, str]]:
     parsed = urlsplit(url)
     match = _COMPETITION_ROUTE_RE.match(parsed.path)
     if match is None:
@@ -146,6 +148,35 @@ def _profile_identity(url: str) -> Optional[tuple[str, str, str]]:
         match.group("competition_id"),
         match.group("slug"),
         match.group("kind"),
+        match.group("section"),
+    )
+
+
+def _preferred_name(existing: str, candidate: str) -> str:
+    """Pick the fuller label for one competition.
+
+    Cards label the same competition differently (``World Cup`` beside ``FIFA
+    World Cup``, a bare table figure beside the listing name); a trailing year
+    is card context, not part of the name.
+    """
+    return min(
+        (existing, candidate),
+        key=lambda value: (
+            bool(re.search(r"\b(?:19|20)\d{2}$", value)),
+            -len(value),
+            value.casefold(),
+        ),
+    )
+
+
+def _route_rank(url: str) -> tuple[bool, bool, str]:
+    identity = _profile_identity(url)
+    if identity is None:
+        raise DiscoverySchemaError(f"invalid profile route: {url}")
+    return (
+        identity[2] != "wettbewerb",
+        identity[3] != _CANONICAL_SECTION,
+        url,
     )
 
 
@@ -167,6 +198,30 @@ def _is_seed_listing(url: str) -> bool:
     parsed = urlsplit(url)
     path = parsed.path.rstrip("/")
     return path in SEED_ROUTES
+
+
+def _in_site_chrome(anchor: Any) -> bool:
+    """True for anchors in the global navbar, which every page repeats.
+
+    The navbar advertises a fixed set of headline competitions (the World Cup
+    among them).  Reading them as listing entries would attribute the hosting
+    page's country to a competition that merely appears in the site chrome.
+    """
+    for parent in anchor.parents:
+        classes = parent.get("class") or () if hasattr(parent, "get") else ()
+        if any(str(cls).startswith("main-navbar") for cls in classes):
+            return True
+    return False
+
+
+def _has_listing_query_only(url: str) -> bool:
+    """True unless the URL carries query state other than pagination.
+
+    Confederation listings render the same rows under ``?sort=`` links in the
+    table head; following them re-buys an identical page.
+    """
+    query = parse_qsl(urlsplit(url).query, keep_blank_values=True)
+    return all(key == "page" for key, _ in query)
 
 
 def _is_country_listing(url: str) -> bool:
@@ -352,11 +407,14 @@ def _taxonomy_evidence(source_url: str) -> ClassificationEvidence:
 def _listing_links(soup: BeautifulSoup, page_url: str) -> tuple[str, ...]:
     links: set[str] = set()
     for anchor in soup.select("a[href]"):
+        if _in_site_chrome(anchor):
+            continue
         canonical = _canonical_url(str(anchor.get("href")), base_url=page_url)
         if canonical is None:
             continue
         if _is_seed_listing(canonical) or _is_country_listing(canonical):
-            links.add(canonical)
+            if _has_listing_query_only(canonical):
+                links.add(canonical)
             continue
         classes = set(anchor.get("class", ()))
         parent_classes = set(anchor.parent.get("class", ())) if anchor.parent else set()
@@ -382,6 +440,8 @@ def _listing_candidates(
     candidates: list[_CompetitionCandidate] = []
     seen_links = 0
     for anchor in soup.select("a[href]"):
+        if _in_site_chrome(anchor):
+            continue
         profile_url = _profile_url(str(anchor.get("href")))
         if profile_url is None:
             continue
@@ -389,7 +449,7 @@ def _listing_candidates(
         if identity is None:
             continue
         seen_links += 1
-        competition_id, slug, _kind = identity
+        competition_id, slug, _kind, _section = identity
         image = anchor.find("img")
         name = _normalise_text(
             anchor.get_text(" ", strip=True)
@@ -470,12 +530,16 @@ def _merge_candidate(
     if existing is None:
         target[candidate.competition_id] = candidate
         return
-    # Transfermarkt can publish two routes for the same competition ID.  The
-    # current World Cup navigation, for example, contains both the legacy
-    # ``.../pokalwettbewerb/FIWC`` route and the canonical
-    # ``.../wettbewerb/FIWC`` route.  The source ID is the identity; prefer the
-    # generic competition route when this exact legacy/canonical pair occurs.
-    # Conflicts between two slugs of the same route kind remain fail-closed.
+    # Transfermarkt publishes several routes for the same competition ID: the
+    # legacy ``.../pokalwettbewerb/FIWC`` cup route beside the canonical
+    # ``.../wettbewerb/FIWC`` one, a secondary tab
+    # (``.../gastarbeiter/wettbewerb/EGY1``) beside the profile itself, and a
+    # renamed competition under its historical slug (``torneo-intermedio``
+    # beside ``liga-auf-intermedio`` for URUI).  The source ID is the identity
+    # and the slug is only URL decoration, so resolve the route deterministically
+    # rather than failing: prefer the generic competition route, then the
+    # ``startseite`` profile section.  Genuine source disagreement still fails
+    # closed on country/confederation below and on classification conflicts.
     existing_identity = _profile_identity(existing.profile_url)
     candidate_identity = _profile_identity(candidate.profile_url)
     if existing_identity is None or candidate_identity is None:
@@ -483,35 +547,15 @@ def _merge_candidate(
             f"invalid profile route for {candidate.competition_id}"
         )
     if existing.profile_url != candidate.profile_url:
-        existing_kind = existing_identity[2]
-        candidate_kind = candidate_identity[2]
-        if existing_kind == candidate_kind:
-            raise DiscoverySchemaError(
-                f"conflicting slug for {candidate.competition_id}"
-            )
         preferred = min(
             (existing, candidate),
-            key=lambda item: (
-                _profile_identity(item.profile_url)[2] != "wettbewerb",  # type: ignore[index]
-                item.profile_url,
-            ),
+            key=lambda item: _route_rank(item.profile_url),
         )
         existing.slug = preferred.slug
-        existing.name = preferred.name
         existing.profile_url = preferred.profile_url
+        existing.name = _preferred_name(existing.name, candidate.name)
     elif existing.name != candidate.name:
-        # Navigation cards may label the same canonical URL differently (for
-        # example ``World Cup`` and ``FIFA World Cup``).  Prefer the fuller
-        # non-edition label deterministically; a trailing year is card context,
-        # not part of the competition name.
-        existing.name = min(
-            (existing.name, candidate.name),
-            key=lambda value: (
-                bool(re.search(r"\b(?:19|20)\d{2}$", value)),
-                -len(value),
-                value.casefold(),
-            ),
-        )
+        existing.name = _preferred_name(existing.name, candidate.name)
     for name in ("country", "confederation"):
         old = getattr(existing, name)
         new = getattr(candidate, name)

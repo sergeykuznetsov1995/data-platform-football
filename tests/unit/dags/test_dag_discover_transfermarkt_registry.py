@@ -58,13 +58,13 @@ def _packet(
 ) -> ApprovalPacket:
     cap = 15 * 1024 * 1024 if action == "paid_proxy" else 0
     requests = 1024 if action in {"paid_proxy", "production_write"} and cap else 0
-    retries = 12 if requests else 0
+    retries = 96 if requests else 0
     # The Bronze writer shares the discovery command's already bounded proxy
     # process, so its packet carries the same cap/attempt envelope.
     if action == "production_write" and "bronze" in packet_id:
         cap = 15 * 1024 * 1024
         requests = 1024
-        retries = 12
+        retries = 96
     return ApprovalPacket(
         packet_id=packet_id,
         action=action,
@@ -279,7 +279,7 @@ def test_prepare_requires_two_exact_approved_packets_without_consuming_them(
     assert env["TM_PROXY_CONTROL_URL"] == "http://proxy_filter:8899"
     assert env["TM_REQUIRE_METERED_PROXY"] == "true"
     assert int(env["TM_REQUEST_LIMIT"]) == 1024
-    assert int(env["TM_RETRY_LIMIT"]) == 12
+    assert int(env["TM_RETRY_LIMIT"]) == 96
     assert approvals["journal"].get(approvals["paid"].packet_hash).status == "approved"
     assert (
         approvals["journal"].get(approvals["bronze"].packet_hash).status == "approved"

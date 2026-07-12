@@ -153,6 +153,80 @@ def test_discovery_prefers_canonical_route_over_legacy_alias_for_same_id() -> No
     )
 
 
+def test_discovery_prefers_profile_section_over_secondary_tab_for_same_id() -> None:
+    england = (FIXTURES / "england.html").read_text(encoding="utf-8")
+    secondary = (
+        '<a href="/premier-league/gastarbeiter/wettbewerb/GB1">Premier League</a>'
+    )
+    england = england.replace("</body>", secondary + "</body>")
+
+    pages, fetch, *_ = _discover(
+        fetch=FixtureFetch(
+            {BASE_URL + "/wettbewerbe/national/wettbewerbe/189": england}
+        )
+    )
+    snapshot = reconcile_registry_pages(pages)
+    premier_league = next(
+        item for item in snapshot.competitions if item.competition_id == "GB1"
+    )
+
+    assert premier_league.source_url == (
+        BASE_URL + "/premier-league/startseite/wettbewerb/GB1"
+    )
+    assert BASE_URL + "/premier-league/gastarbeiter/wettbewerb/GB1" not in fetch.calls
+
+
+def test_discovery_resolves_renamed_slug_aliases_for_same_id() -> None:
+    navigation = (FIXTURES / "navigation.html").read_text(encoding="utf-8")
+    historical = (
+        '<a href="/torneo-intermedio/startseite/wettbewerb/GB1">3</a>'
+    )
+    navigation = navigation.replace("</body>", historical + "</body>")
+
+    pages, fetch, *_ = _discover(
+        fetch=FixtureFetch({BASE_URL + "/navigation/wettbewerbe": navigation})
+    )
+    snapshot = reconcile_registry_pages(pages)
+    premier_league = next(
+        item for item in snapshot.competitions if item.competition_id == "GB1"
+    )
+
+    assert premier_league.slug == "premier-league"
+    assert premier_league.name == "Premier League"
+    assert BASE_URL + "/torneo-intermedio/startseite/wettbewerb/GB1" not in fetch.calls
+
+
+def test_discovery_ignores_navbar_entries_that_every_page_repeats() -> None:
+    afrika = (FIXTURES / "afrika.html").read_text(encoding="utf-8")
+    navbar = (
+        '<nav class="main-navbar"><a href="/world-cup/startseite/wettbewerb/FIWC">'
+        "World Cup</a></nav>"
+    )
+    afrika = afrika.replace("<body>", "<body>" + navbar)
+
+    pages, fetch, *_ = _discover(
+        fetch=FixtureFetch({BASE_URL + "/wettbewerbe/afrika": afrika})
+    )
+    snapshot = reconcile_registry_pages(pages)
+    world_cup = next(
+        item for item in snapshot.competitions if item.competition_id == "FIWC"
+    )
+
+    assert world_cup.country != "Africa"
+
+
+def test_discovery_does_not_follow_sort_variants_of_a_listing() -> None:
+    afrika = (FIXTURES / "afrika.html").read_text(encoding="utf-8")
+    sorted_link = '<a href="/wettbewerbe/afrika?sort=marktwert">Market value</a>'
+    afrika = afrika.replace("</body>", sorted_link + "</body>")
+
+    _, fetch, *_ = _discover(
+        fetch=FixtureFetch({BASE_URL + "/wettbewerbe/afrika": afrika})
+    )
+
+    assert BASE_URL + "/wettbewerbe/afrika?sort=marktwert" not in fetch.calls
+
+
 def test_discovery_traverses_every_seed_page_country_pagination_and_profile() -> None:
     pages, fetch, checkpoint, ledger = _discover()
 
