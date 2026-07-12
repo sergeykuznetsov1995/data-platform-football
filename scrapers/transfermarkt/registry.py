@@ -158,14 +158,15 @@ def canonical_season(
         raise RegistryError("season_format=unknown cannot produce a season")
 
     if fmt is SeasonFormat.SINGLE_YEAR:
-        match = re.fullmatch(r"(19|20|21)\d{2}", raw)
+        match = re.fullmatch(r"(18|19|20|21)\d{2}", raw)
         if match is None:
             raise RegistryError(f"invalid single-year edition: {raw!r}")
         return raw
 
+    # The oldest leagues in the registry reach back into the 1890s.
     pair = re.fullmatch(
-        r"(?P<start>(?:19|20|21)?\d{2})\s*[/\-]\s*"
-        r"(?P<end>(?:19|20|21)?\d{2})",
+        r"(?P<start>(?:18|19|20|21)?\d{2})\s*[/\-]\s*"
+        r"(?P<end>(?:18|19|20|21)?\d{2})",
         raw,
     )
     if pair is not None:
@@ -653,8 +654,10 @@ class CrawlScope:
             raise UnsafeCrawlError(
                 f"{competition.competition_id}/{edition.edition_id} is inactive"
             )
-        if competition.season_format is not edition.season_format:
-            raise RegistryConflictError("competition/edition season_format mismatch")
+        # A competition's format is the one its current edition runs on, and
+        # older editions legitimately keep theirs (Australia played 1977 as a
+        # calendar year); each edition's canonical_season already carries its
+        # own format, so the two need not agree.
         if (
             competition.registry_snapshot_id
             and edition.registry_snapshot_id
@@ -851,14 +854,6 @@ def reconcile_registry_pages(
             "editions reference undiscovered competitions: "
             + ", ".join(missing_parents)
         )
-    for edition in editions.values():
-        competition = competitions[edition.competition_id]
-        if edition.season_format is not competition.season_format:
-            raise RegistryConflictError(
-                "competition/edition season_format mismatch: "
-                f"{edition.competition_id}/{edition.edition_id}"
-            )
-
     if expected_competition_ids is not None:
         expected_ids = {_required_text("competition_id", item) for item in expected_competition_ids}
         actual_ids = set(competitions)

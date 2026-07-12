@@ -655,24 +655,45 @@ def _selector_options(
     )
 
 
-def _season_format(labels: Iterable[str], profile_url: str) -> SeasonFormat:
-    formats: set[SeasonFormat] = set()
-    for label in labels:
-        if re.fullmatch(r"(?:19|20|21)\d{2}", label):
-            formats.add(SeasonFormat.SINGLE_YEAR)
-        elif re.fullmatch(
-            r"(?:(?:19|20|21)\d{2}|\d{2})\s*[/\-]\s*"
-            r"(?:\d{2}|(?:19|20|21)\d{2})",
-            label,
-        ):
-            formats.add(SeasonFormat.SPLIT_YEAR)
-        else:
-            raise DiscoverySchemaError(
-                f"unrecognised edition label {label!r}: {profile_url}"
-            )
-    if len(formats) != 1:
-        raise DiscoverySchemaError(f"mixed season formats: {profile_url}")
-    return next(iter(formats))
+def _label_season_format(label: str, profile_url: str) -> SeasonFormat:
+    if re.fullmatch(r"(?:18|19|20|21)\d{2}", label):
+        return SeasonFormat.SINGLE_YEAR
+    if re.fullmatch(
+        r"(?:(?:18|19|20|21)\d{2}|\d{2})\s*[/\-]\s*"
+        r"(?:\d{2}|(?:18|19|20|21)\d{2})",
+        label,
+    ):
+        return SeasonFormat.SPLIT_YEAR
+    raise DiscoverySchemaError(
+        f"unrecognised edition label {label!r}: {profile_url}"
+    )
+
+
+def _season_format(
+    options: Iterable[tuple[str, str, bool, Mapping[str, Any]]],
+    profile_url: str,
+) -> SeasonFormat:
+    """The format a competition runs on now.
+
+    Competitions switch format over their history — Australia played 1977 as a
+    calendar year and every season since as a split year — so the format is a
+    property of each edition, and the competition carries the one its current
+    edition uses.
+    """
+    formats = {
+        edition_id: _label_season_format(label, profile_url)
+        for edition_id, label, _selected, _attrs in options
+    }
+    current = [
+        edition_id
+        for edition_id, _label, selected, _attrs in options
+        if selected
+    ]
+    if len(current) != 1:
+        raise DiscoverySchemaError(
+            f"edition selector must mark exactly one current edition: {profile_url}"
+        )
+    return formats[current[0]]
 
 
 def _unique_signal(evidence: Iterable[ClassificationEvidence], name: str, unknown):
@@ -838,9 +859,7 @@ class TransfermarktCompetitionDiscovery:
             options = _selector_options(
                 profile_soup, profile_url=candidate.profile_url
             )
-            season_format = _season_format(
-                (item[1] for item in options), candidate.profile_url
-            )
+            season_format = _season_format(options, candidate.profile_url)
             season_evidence = ClassificationEvidence(
                 source_field="edition_selector",
                 source_value=",".join(item[1] for item in options),
@@ -895,13 +914,14 @@ class TransfermarktCompetitionDiscovery:
                 edition_source_url = (
                     candidate.profile_url.rstrip("/") + f"/saison_id/{edition_id}"
                 )
+                edition_format = _label_season_format(label, candidate.profile_url)
                 editions.append(
                     EditionRecord(
                         competition_id=competition_id,
                         edition_id=edition_id,
                         edition_label=label,
-                        canonical_season=canonical_season(label, season_format),
-                        season_format=season_format,
+                        canonical_season=canonical_season(label, edition_format),
+                        season_format=edition_format,
                         start_date=attrs.get("data-start-date"),
                         end_date=attrs.get("data-end-date"),
                         active="disabled" not in attrs,
