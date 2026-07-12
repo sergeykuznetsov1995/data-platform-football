@@ -61,6 +61,11 @@ _CHALLENGE_MARKERS = (
     "cloudflare ray id",
 )
 
+# Deep catalogue pagination draws sporadic upstream 502/504s; each retry rotates
+# to a fresh exit, so a required page needs more than a couple of exits before a
+# whole cycle is abandoned.  The run-wide retry ledger is the real bound.
+_MAX_FETCH_ATTEMPTS = 6
+
 _URL_CREDENTIALS_RE = re.compile(
     r"(?P<scheme>(?:https?|socks[45])://)(?P<credentials>[^/@\s]+)@",
     re.IGNORECASE,
@@ -974,7 +979,7 @@ class TransfermarktHttpClient:
                 context=context,
             )
 
-        attempts_cap = max(1, min(3, int(max_attempts)))
+        attempts_cap = max(1, min(_MAX_FETCH_ATTEMPTS, int(max_attempts)))
         endpoint_started = self._monotonic()
         decoded_for_endpoint = 0
         wire_for_endpoint = 0

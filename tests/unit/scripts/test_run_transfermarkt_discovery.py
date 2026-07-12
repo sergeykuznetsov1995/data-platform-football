@@ -151,6 +151,7 @@ class _FakeClient:
         self.ledger = kwargs["traffic_ledger"]
         self.retry_budget = kwargs["retry_budget"]
         self.cache = kwargs["cache"]
+        self.rate_limiter = kwargs.get("rate_limiter")
         self.fetch_calls: list[dict] = []
         self.retries = 0
         self.request_budget = None
@@ -491,6 +492,10 @@ def test_approved_production_is_metered_and_writes_one_batch_per_table(
     assert _FakeClient.instances[-1].retry_budget == 2
     assert _FakeClient.instances[-1].ledger.snapshot()["retry_limit"] == 2
     assert _FakeClient.instances[-1].fetch_calls[0]["max_attempts"] == 3
+    limiter = _FakeClient.instances[-1].rate_limiter
+    assert limiter is not None
+    assert limiter.config.max_requests == mod.REQUESTS_PER_MINUTE
+    assert limiter.config.window_seconds == 60
 
 
 def test_incomplete_reconciliation_happens_before_all_writes_and_closes_packet(

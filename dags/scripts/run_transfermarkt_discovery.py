@@ -41,6 +41,7 @@ from scrapers.transfermarkt.client import (
     redact_sensitive,
 )
 from scrapers.transfermarkt.discovery import discover_competition_registry
+from scrapers.utils.rate_limiter import RateLimiter
 from scrapers.transfermarkt.models import (
     FetchOutcome,
     FetchStatus,
@@ -60,7 +61,11 @@ from scrapers.transfermarkt.registry import (
 
 ENTITY = "competition_registry"
 EXPECTED_ENTITIES = ("competitions", "competition_editions")
-MAX_ATTEMPTS = 3
+MAX_ATTEMPTS = 6
+# A lease is sticky, so an unthrottled crawl hits the source from one exit as
+# fast as it can parse; the catalogue then starts answering 502/504. Pace the
+# crawl like the other sources do (scrapers/utils/rate_limiter.py).
+REQUESTS_PER_MINUTE = 20
 CONCURRENCY = 1
 COMPETITIONS_TABLE = "iceberg.bronze.transfermarkt_competitions"
 EDITIONS_TABLE = "iceberg.bronze.transfermarkt_competition_editions"
@@ -873,6 +878,9 @@ def _execute_once(
         },
         lease_ttl_seconds=args.lease_ttl_seconds,
         cache=cache,
+        rate_limiter=RateLimiter(
+            max_requests=REQUESTS_PER_MINUTE, window_seconds=60,
+        ),
     )
     client.begin_request_scope(request_attempt_budget=args.request_limit)
     started = monotonic()
