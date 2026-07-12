@@ -9,7 +9,8 @@ match_outcomes, per-source *_team_season rollups) was dropped in #478.
 Architecture
 ------------
 
-    Triggered by dag_master_pipeline after xref/E3 (or manually)
+    Triggered once by dag_master_pipeline after FBref Silver/xref and all
+    direct Gold prerequisites complete (or by an operator manually)
         |
         v
     dim_competition, dim_season, dim_venue   (config-driven, no dependencies)
@@ -488,7 +489,7 @@ with DAG(
     dag_id='dag_transform_fbref_gold',
     default_args=SILVER_ARGS,
     description='Build Gold star schema (dims + narrow facts) from Silver tables',
-    schedule=None,  # Trigger-only (master-owned after Silver/xref/E3)
+    schedule=None,  # Trigger-only (called once by the master pipeline)
     start_date=datetime(2026, 4, 1),
     catchup=False,
     tags=['transform', 'fbref', 'gold', 'football', 'trino', 'star-schema'],

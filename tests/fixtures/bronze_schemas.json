@@ -319,6 +319,22 @@
         "venue": "varchar"
       }
     },
+    "bronze.fbref_dataset_availability": {
+      "columns": {
+        "_batch_id": "varchar",
+        "_entity_type": "varchar",
+        "_ingested_at": "timestamp(6)",
+        "_source": "varchar",
+        "availability": "varchar",
+        "dataset": "varchar",
+        "league": "varchar",
+        "match_id": "varchar",
+        "reason": "varchar",
+        "season": "bigint",
+        "source_competition_id": "varchar",
+        "source_season_id": "varchar"
+      }
+    },
     "bronze.fbref_keeper_keeper": {
       "columns": {
         "90s": "varchar",
@@ -356,7 +372,9 @@
         "squad": "varchar",
         "starts": "varchar",
         "stat_type": "varchar",
-        "w": "varchar"
+        "w": "varchar",
+        "source_competition_id": "varchar",
+        "source_season_id": "varchar"
       }
     },
     "bronze.fbref_lineups": {
@@ -373,7 +391,9 @@
         "player_id": "varchar",
         "position": "varchar",
         "season": "bigint",
-        "team": "varchar"
+        "team": "varchar",
+        "source_competition_id": "varchar",
+        "source_season_id": "varchar"
       }
     },
     "bronze.fbref_match_events": {
@@ -392,7 +412,9 @@
         "secondary_player": "varchar",
         "secondary_player_id": "varchar",
         "team": "varchar",
-        "team_side": "varchar"
+        "team_side": "varchar",
+        "source_competition_id": "varchar",
+        "source_season_id": "varchar"
       }
     },
     "bronze.fbref_match_managers": {
@@ -407,7 +429,9 @@
         "match_id": "varchar",
         "season": "bigint",
         "side": "varchar",
-        "team": "varchar"
+        "team": "varchar",
+        "source_competition_id": "varchar",
+        "source_season_id": "varchar"
       }
     },
     "bronze.fbref_match_officials": {
@@ -423,7 +447,33 @@
         "match_id": "varchar",
         "referee": "varchar",
         "season": "bigint",
-        "var": "varchar"
+        "var": "varchar",
+        "source_competition_id": "varchar",
+        "source_season_id": "varchar"
+      }
+    },
+    "bronze.fbref_match_keeper_stats": {
+      "columns": {
+        "Age": "varchar",
+        "Min": "bigint",
+        "Nation": "varchar",
+        "Player": "varchar",
+        "Shot Stopping_GA": "bigint",
+        "Shot Stopping_Save%": "double",
+        "Shot Stopping_Saves": "bigint",
+        "Shot Stopping_SoTA": "bigint",
+        "_batch_id": "varchar",
+        "_entity_type": "varchar",
+        "_ingested_at": "timestamp(6)",
+        "_source": "varchar",
+        "league": "varchar",
+        "match_id": "varchar",
+        "player_id": "varchar",
+        "season": "bigint",
+        "team": "varchar",
+        "team_side": "varchar",
+        "source_competition_id": "varchar",
+        "source_season_id": "varchar"
       }
     },
     "bronze.fbref_match_player_stats": {
@@ -460,7 +510,9 @@
         "sot": "bigint",
         "team": "varchar",
         "team_side": "varchar",
-        "tklw": "bigint"
+        "tklw": "bigint",
+        "source_competition_id": "varchar",
+        "source_season_id": "varchar"
       }
     },
     "bronze.fbref_match_team_stats": {
@@ -485,7 +537,9 @@
         "home_yellow_cards": "bigint",
         "league": "varchar",
         "match_id": "varchar",
-        "season": "bigint"
+        "season": "bigint",
+        "source_competition_id": "varchar",
+        "source_season_id": "varchar"
       }
     },
     "bronze.fbref_player_misc": {
@@ -518,7 +572,9 @@
         "season": "bigint",
         "squad": "varchar",
         "stat_type": "varchar",
-        "tklw": "varchar"
+        "tklw": "varchar",
+        "source_competition_id": "varchar",
+        "source_season_id": "varchar"
       }
     },
     "bronze.fbref_player_playingtime": {
@@ -555,7 +611,9 @@
         "starts": "varchar",
         "stat_type": "varchar",
         "subs": "varchar",
-        "unsub": "varchar"
+        "unsub": "varchar",
+        "source_competition_id": "varchar",
+        "source_season_id": "varchar"
       }
     },
     "bronze.fbref_player_shooting": {
@@ -586,7 +644,9 @@
         "sot%": "varchar",
         "sot/90": "varchar",
         "squad": "varchar",
-        "stat_type": "varchar"
+        "stat_type": "varchar",
+        "source_competition_id": "varchar",
+        "source_season_id": "varchar"
       }
     },
     "bronze.fbref_player_stats": {
@@ -624,7 +684,9 @@
         "season": "bigint",
         "squad": "varchar",
         "starts": "varchar",
-        "stat_type": "varchar"
+        "stat_type": "varchar",
+        "source_competition_id": "varchar",
+        "source_season_id": "varchar"
       }
     },
     "bronze.fbref_schedule": {
@@ -648,7 +710,9 @@
         "season": "bigint",
         "time": "varchar",
         "venue": "varchar",
-        "wk": "varchar"
+        "wk": "varchar",
+        "source_competition_id": "varchar",
+        "source_season_id": "varchar"
       }
     },
     "bronze.fbref_team_misc": {
@@ -675,7 +739,9 @@
         "squad": "varchar",
         "stat_type": "varchar",
         "team_id": "varchar",
-        "tklw": "bigint"
+        "tklw": "bigint",
+        "source_competition_id": "varchar",
+        "source_season_id": "varchar"
       }
     },
     "bronze.fbref_team_playingtime": {
@@ -706,7 +772,9 @@
         "stat_type": "varchar",
         "subs": "bigint",
         "team_id": "varchar",
-        "unsub": "bigint"
+        "unsub": "bigint",
+        "source_competition_id": "varchar",
+        "source_season_id": "varchar"
       }
     },
     "bronze.fbref_team_shooting": {
@@ -731,7 +799,9 @@
         "sot/90": "double",
         "squad": "varchar",
         "stat_type": "varchar",
-        "team_id": "varchar"
+        "team_id": "varchar",
+        "source_competition_id": "varchar",
+        "source_season_id": "varchar"
       }
     },
     "bronze.fbref_team_stats": {
@@ -764,7 +834,9 @@
         "squad": "varchar",
         "starts": "bigint",
         "stat_type": "varchar",
-        "team_id": "varchar"
+        "team_id": "varchar",
+        "source_competition_id": "varchar",
+        "source_season_id": "varchar"
       }
     },
     "bronze.fotmob_match_details": {

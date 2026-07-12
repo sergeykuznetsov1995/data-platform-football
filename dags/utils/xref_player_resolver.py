@@ -48,10 +48,9 @@ Trino for IO, never for the fuzzy matching itself.
 
 Why no dependency on ``scrapers/*``?
 ------------------------------------
-Importing ``scrapers/__init__.py`` from an Airflow task pulls in
-nodriver / selenium / soccerdata / curl_cffi, which would push DAG-parse
-RAM to ~1.5 GB and break the scheduler memory cap. This module imports
-only ``trino`` (DBAPI) at module level and lazy-imports ``rapidfuzz`` /
+Importing scraper runtimes from an Airflow task can pull in optional browser
+and soccerdata dependencies and break the scheduler memory cap. This module
+imports only ``trino`` (DBAPI) at module level and lazy-imports ``rapidfuzz`` /
 ``unidecode`` inside :func:`run_resolver` so DAG-parse stays cheap.
 
 Public API contract (frozen for T4 DAG integration)
@@ -936,20 +935,25 @@ def _seasons_in_clause(seasons: List[Any]) -> str:
 def _fetch_fbref_players(
     conn, league: str, fbref_seasons: List[int]
 ) -> List[Dict[str, Any]]:
+    # #916/#926: the canonical FBref universe is materialised by the FBref
+    # Silver DAG from every player-bearing table.  Reading only season
+    # `player_stats` silently excluded keepers/match-only players and all rows
+    # whose profile link was absent.  Identity seasons are already canonical
+    # compact slugs, including single-year competitions.
+    season_slugs = [_fbref_year_to_slug(s, league=league) for s in fbref_seasons]
     sql = f"""
-        SELECT player_id, player, squad, league, CAST(season AS varchar) AS season
-        FROM iceberg.bronze.fbref_player_stats
+        SELECT player_id, player_name, team_name, league, season
+        FROM iceberg.silver.fbref_player_identity
         WHERE league = '{_sql_escape(league)}'
-          AND season IN ({_seasons_in_clause(fbref_seasons)})
-          AND stat_type = 'stats'
+          AND season IN ({_seasons_in_clause(season_slugs)})
           AND player_id IS NOT NULL
-        GROUP BY player_id, player, squad, league, CAST(season AS varchar)
+        GROUP BY player_id, player_name, team_name, league, season
     """
     rows = _execute(conn, sql, fetch=True) or []
     out: List[Dict[str, Any]] = []
     seen: set = set()
     for pid, name, squad, lg, season in rows:
-        season_slug = _fbref_year_to_slug(season, league=lg)
+        season_slug = str(season)
         # Dedup by (pid, squad, season): mid-season transfers (e.g. Palmer
         # Man City->Chelsea in 2023-24) produce two FBref rows in the same
         # season — keep both so spine carries the player in both team

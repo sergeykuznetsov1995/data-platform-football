@@ -1,0 +1,35 @@
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.silver.fbref_keeper_match_stats
+  description: |
+    Typed, latest-ingest per-match goalkeeper metrics. Grain:
+    (match_id, player_id, team_side). Consumed additively by
+    gold.fct_player_match gk_* columns; outfield rows remain NULL.
+  tags: [Tier.Silver, Domain.Football, PII.Low]
+columns:
+  - name: match_id
+    description: FBref match id; FK to silver.fbref_match_enriched.
+  - name: player_id
+    description: Nonblank resolved id; native, recovered native, or residual noid_*.
+  - name: player_id_resolution
+    description: source_native | recovered_unique_native | synthetic_residual.
+  - name: player_id_is_synthetic
+    description: True only for a residual noid_* identity.
+  - name: player_id_evidence_datasets
+    description: FBref datasets used by the shared identity resolver.
+  - name: player_name
+    description: Goalkeeper display name.
+  - name: team_name
+    description: FBref source team name.
+  - name: team_side
+    description: home | away.
+  - name: minutes
+    description: Goalkeeper minutes in the match.
+  - name: shots_on_target_against
+    description: Shots on target faced.
+  - name: goals_against
+    description: Goals conceded.
+  - name: saves
+    description: Saves made.
+  - name: save_pct
+    description: Save percentage in [0,100].
+relationships: []

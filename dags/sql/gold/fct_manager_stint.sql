@@ -61,9 +61,15 @@ WITH manager_match_log AS (
         m.team                                            AS raw_team,
         m.manager_name                                    AS raw_manager_name,
         m.league,
-        -- season → slug ('2425'); bronze fbref_match_managers is year-start bigint (#404).
-        -- #913 Phase 2
-        CASE WHEN m.league = 'INT-World Cup'
+        -- Prefer the source-native season. Single-year cups such as EURO
+        -- must stay '2024'; only split seasons become a '2425' slug.
+        CASE WHEN REGEXP_LIKE(COALESCE(m.source_season_id, ''), '^[0-9]{4}$')
+             THEN m.source_season_id
+             WHEN REGEXP_LIKE(COALESCE(m.source_season_id, ''), '^[0-9]{4}-[0-9]{4}$')
+             THEN SUBSTR(m.source_season_id, 3, 2) || SUBSTR(m.source_season_id, 8, 2)
+             WHEN NULLIF(TRIM(m.source_season_id), '') IS NOT NULL
+                 THEN TRIM(m.source_season_id)
+             WHEN m.league = 'INT-World Cup'
              THEN LPAD(CAST(m.season AS varchar), 4, '0')
              ELSE LPAD(CAST(MOD(m.season, 100) AS varchar), 2, '0')
                   || LPAD(CAST(MOD(m.season + 1, 100) AS varchar), 2, '0')
@@ -76,6 +82,8 @@ WITH manager_match_log AS (
     -- Silver view.
     INNER JOIN iceberg.silver.fbref_match_enriched s
         ON s.match_id = m.match_id
+    INNER JOIN iceberg.gold.dim_match match_scope
+        ON match_scope.match_id = m.match_id
     -- xref_manager has per-(source, source_id, league, season) rows; the
     -- (league, season) predicate is mandatory — without it, a manager who
     -- worked across seasons would fan-out 1.5-4× (memory:
@@ -84,7 +92,13 @@ WITH manager_match_log AS (
         ON  xm.source     = 'fbref'
         AND xm.source_id  = m.manager_name
         AND xm.league     = m.league
-        AND xm.season     = CASE WHEN m.league = 'INT-World Cup'
+        AND xm.season     = CASE WHEN REGEXP_LIKE(COALESCE(m.source_season_id, ''), '^[0-9]{4}$')
+                                 THEN m.source_season_id
+                                 WHEN REGEXP_LIKE(COALESCE(m.source_season_id, ''), '^[0-9]{4}-[0-9]{4}$')
+                                 THEN SUBSTR(m.source_season_id, 3, 2) || SUBSTR(m.source_season_id, 8, 2)
+                                 WHEN NULLIF(TRIM(m.source_season_id), '') IS NOT NULL
+                                     THEN TRIM(m.source_season_id)
+                                 WHEN m.league = 'INT-World Cup'
                                  THEN LPAD(CAST(m.season AS varchar), 4, '0')
                                  ELSE LPAD(CAST(MOD(m.season, 100) AS varchar), 2, '0')
                                       || LPAD(CAST(MOD(m.season + 1, 100) AS varchar), 2, '0')

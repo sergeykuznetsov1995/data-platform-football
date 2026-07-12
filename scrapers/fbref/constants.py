@@ -54,6 +54,20 @@ KEEPER_STAT_TYPES = [
     'keeper',          # Goalkeeper basic stats
 ]
 
+# Source-advertised season routes that are intentionally not fetched.  Live
+# audits found that these pages still exist but their statistical cells are
+# restricted/empty, so following every nav link would spend one paid request
+# per competition-season without producing data.  Discovery must skip them
+# explicitly rather than misclassifying them as season overview pages.
+UNAVAILABLE_SEASON_STAT_ROUTES = frozenset({
+    'passing',
+    'passing_types',
+    'gca',
+    'defense',
+    'possession',
+    'keepersadv',
+})
+
 # Player match-level stat types (per-game statistics)
 #
 # Removed (Apr 2026) for the same reason as PLAYER_STAT_TYPES — the underlying

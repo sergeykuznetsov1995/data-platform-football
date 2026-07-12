@@ -18,7 +18,7 @@ x-airflow-common: &airflow-common
     - CHOWN
     - SETGID
     - SETUID
-    - SYS_PTRACE  # Required for Chrome/nodriver browser automation
+    - SYS_PTRACE  # Required for browser automation
   environment:
     &airflow-common-env
     AIRFLOW__CORE__EXECUTOR: ${AIRFLOW__CORE__EXECUTOR}
@@ -369,7 +369,12 @@ services:
     command:
       - -c
       - |
+        set -euo pipefail
         airflow db migrate
+        # Durable FBref registry/frontier shares Airflow's PostgreSQL server
+        # in an isolated schema.  The migration is advisory-lock protected and
+        # idempotent across init retries and rolling upgrades.
+        python -m scrapers.fbref.control migrate
         airflow users create \
           --username $${_AIRFLOW_WWW_USER_USERNAME} \
           --password $${_AIRFLOW_WWW_USER_PASSWORD} \

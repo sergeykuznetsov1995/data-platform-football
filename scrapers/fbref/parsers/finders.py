@@ -14,11 +14,7 @@ from typing import Dict, Optional
 import pandas as pd
 from bs4 import BeautifulSoup
 
-from scrapers.fbref.parsers.table_parser import (
-    parse_table,
-    _parse_table_element,
-    _table_has_player_header,
-)
+from scrapers.fbref.parsers.table_parser import parse_table
 from scrapers.fbref.parsers.id_extractors import (
     MANAGER_ID_PATTERN,
     PLAYER_ID_PATTERN,
@@ -46,39 +42,58 @@ def find_schedule_table(
     Returns:
         DataFrame or None
     """
-    # Try multiple possible table IDs
-    table_ids = [
-        'sched_all',
-        'sched_ks_all',
-        f'sched_{season_str}_{comp_id}_1',
-    ]
-
-    df = None
-    for table_id in table_ids:
-        df = parse_table(soup, table_id, comment_tables, extract_match_urls=True)
-        if df is not None and not df.empty:
-            return df
-
-    # Try finding any table with 'sched' in ID from regular HTML
-    all_tables = soup.find_all(
-        'table',
-        id=lambda x: x and 'sched' in x.lower()
+    discovered_ids = []
+    for table in soup.find_all(
+        'table', id=lambda value: value and 'sched' in value.lower()
+    ):
+        discovered_ids.append(str(table.get('id')))
+    discovered_ids.extend(
+        str(table_id)
+        for table_id in comment_tables
+        if 'sched' in str(table_id).lower()
     )
-    for table in all_tables:
-        table_id = table.get('id')
-        df = parse_table(soup, table_id, comment_tables, extract_match_urls=True)
-        if df is not None and not df.empty:
-            logger.debug(f"Found schedule table: {table_id}")
-            return df
 
-    # Try parsing any table with 'sched' in ID from comments
-    for key in comment_tables.keys():
-        if 'sched' in key.lower():
-            df = parse_table(soup, key, comment_tables, extract_match_urls=True)
-            if df is not None and not df.empty:
-                return df
+    # ``sched_all`` is FBref's aggregate table.  When it is absent (common on
+    # group + knockout tournaments), every stage table is authoritative and
+    # must be unioned. ``dict.fromkeys`` preserves deterministic source order.
+    aggregate_ids = [
+        table_id
+        for table_id in ('sched_all', 'sched_ks_all')
+        if table_id in discovered_ids
+    ]
+    candidate_ids = aggregate_ids or list(
+        dict.fromkeys(
+            [f'sched_{season_str}_{comp_id}_1', *discovered_ids]
+        )
+    )
 
-    return None
+    frames = []
+    for table_id in candidate_ids:
+        frame = parse_table(
+            soup,
+            table_id,
+            comment_tables,
+            extract_match_urls=True,
+        )
+        if frame is not None and not frame.empty:
+            frames.append(frame)
+            logger.debug("Found schedule table: %s", table_id)
+    if not frames:
+        return None
+    combined = pd.concat(frames, ignore_index=True, sort=False)
+    dedup_columns = [
+        column
+        for column in ('match_url', 'Date', 'Home', 'Away', 'Score')
+        if column in combined.columns
+    ]
+    if dedup_columns:
+        combined = combined.drop_duplicates(
+            subset=dedup_columns,
+            keep='first',
+        )
+    else:
+        combined = combined.drop_duplicates(keep='first')
+    return combined.reset_index(drop=True)
 
 
 def find_team_stats_table(

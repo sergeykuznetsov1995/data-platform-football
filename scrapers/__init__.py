@@ -1,54 +1,38 @@
-"""
-Football Data Scrapers
-======================
+"""Football data scrapers.
 
-This module provides scrapers for collecting football data from various sources
-and writing to Apache Iceberg tables.
-
-Sources:
-- FBref: Match statistics, player stats, advanced metrics
-- Understat: xG data, shot maps
-- WhoScored: Event data in SPADL format
-- FotMob: Match events, lineups
-- SofaScore: Live scores, statistics
-- SoFIFA: FIFA ratings, player attributes
-- ClubElo: Historical ELO ratings
-- ESPN: Schedules, results
-- MatchHistory: Historical match data
-
-Main Scrapers:
-- FBrefScraper: Selenium-based FBref scraper (used for match-level data:
-  shot_events, match_events, lineups, match_team_stats, match_player_stats)
-- NodriverFBrefScraper: Primary FBref scraper for season-level stats and
-  schedule (nodriver + cf-verify Cloudflare Turnstile bypass).
-- FotMobScraper: For FotMob data (handles session cookies via Selenium)
-- MatchHistoryScraper: For football-data.co.uk (with Selenium fallback)
-- WhoScoredIngestService: Direct-first, raw-backed WhoScored ingestion
-
-Note (Apr 2026): SoccerdataFBrefScraper was removed — curl_cffi cannot bypass
-Cloudflare Turnstile, so the scraper was non-functional in production.
+Package exports stay lazy so importing one lightweight production component
+does not initialize every browser scraper, pandas stack, or Iceberg writer in
+the Airflow scheduler process.  Direct module imports remain preferred.
 """
 
-from scrapers.base.base_scraper import BaseScraper, SeleniumScraper, SoccerdataScraper
-from scrapers.base.iceberg_writer import IcebergWriter
-from scrapers.fbref import FBrefScraper
-from scrapers.nodriver_fbref import NodriverFBrefScraper
-from scrapers.fotmob import FotMobScraper
-from scrapers.matchhistory import MatchHistoryScraper
-from scrapers.whoscored import WhoScoredIngestService
+from __future__ import annotations
 
-__all__ = [
-    # Base classes
-    'BaseScraper',
-    'SeleniumScraper',
-    'SoccerdataScraper',
-    'IcebergWriter',
-    # Main scrapers
-    'FBrefScraper',
-    'NodriverFBrefScraper',
-    'FotMobScraper',
-    'MatchHistoryScraper',
-    'WhoScoredIngestService',
-]
+from importlib import import_module
 
-__version__ = '0.1.0'
+
+_EXPORTS = {
+    "BaseScraper": ("scrapers.base.base_scraper", "BaseScraper"),
+    "SeleniumScraper": ("scrapers.base.base_scraper", "SeleniumScraper"),
+    "SoccerdataScraper": ("scrapers.base.base_scraper", "SoccerdataScraper"),
+    "IcebergWriter": ("scrapers.base.iceberg_writer", "IcebergWriter"),
+    "FotMobScraper": ("scrapers.fotmob", "FotMobScraper"),
+    "MatchHistoryScraper": ("scrapers.matchhistory", "MatchHistoryScraper"),
+    "WhoScoredIngestService": ("scrapers.whoscored", "WhoScoredIngestService"),
+}
+
+__all__ = list(_EXPORTS)
+__version__ = "0.1.0"
+
+
+def __getattr__(name: str):
+    try:
+        module_name, attribute = _EXPORTS[name]
+    except KeyError as exc:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}") from exc
+    value = getattr(import_module(module_name), attribute)
+    globals()[name] = value
+    return value
+
+
+def __dir__() -> list[str]:
+    return sorted(set(globals()) | set(__all__))

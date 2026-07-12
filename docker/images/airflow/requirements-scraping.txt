@@ -3,9 +3,9 @@
 # =============================================================================
 #
 # ⚠️  PINNING POLICY (#758)
-# Все версии ниже ЗАПИННЕНЫ (==). nodriver/curl_cffi/DrissionPage/camoufox — ядро
+# Все версии ниже ЗАПИННЕНЫ (==). curl_cffi/DrissionPage/camoufox — ядро
 # CF-байпаса; молчаливый bump при `make up-build` уже ломал нас (см.
-# memory/feedback_nodriver_048_parser_regressions.md).
+# historical browser parser-regression notes).
 # BUMP ТОЛЬКО ОСОЗНАННО: после изменения версии — ОБЯЗАТЕЛЬНО live-прогон
 # FBref + WhoScored в контейнере (CF-байпас) до мержа. Хост держать в синхроне.
 # =============================================================================
@@ -62,28 +62,9 @@ pyvirtualdisplay==3.0
 PySocks==1.7.1
 
 # -----------------------------------------------------------------------------
-# [nodriver] Advanced Cloudflare bypass (successor to undetected-chromedriver)
-# Uses async API and better fingerprint evasion
-# -----------------------------------------------------------------------------
-nodriver==0.50.3
-
-# -----------------------------------------------------------------------------
-# [nodriver-cf-verify] Cloudflare Turnstile automatic bypass plugin for nodriver
-# Clicks Turnstile checkbox automatically instead of passive waiting
-# https://github.com/KlozetLabs/nodriver-cf-bypass
-# Note: Bundled locally in scrapers/base/browser/nodriver_cf_verify/
-# -----------------------------------------------------------------------------
-
-# -----------------------------------------------------------------------------
-# [opencv] OpenCV for native nodriver tab.cf_verify() method
-# Enables image-based Turnstile checkbox detection as fallback
-# -----------------------------------------------------------------------------
-opencv-python-headless==4.13.0.92
-
-# -----------------------------------------------------------------------------
 # [DrissionPage] CDP-based browser automation WITHOUT WebDriver protocol
 # Key advantage: No WebDriver signature that Cloudflare detects
-# Used as primary bypass before falling back to nodriver
+# Retained for the bounded SofaScore token research probe.
 # -----------------------------------------------------------------------------
 DrissionPage==4.1.1.4
 

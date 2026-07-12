@@ -12,9 +12,9 @@ table:
     match_id: реальный hex-slug из match_url, либо синтетический
     'fut_<xxhash64>' для будущих матчей без опубликованной страницы (по
     приоритету gameweek+season+home+away, иначе date+home+away) — гарантирует
-    non-NULL и survive в Gold. home_score/away_score — ОФИЦИАЛЬНЫЙ результат,
-    разобранный из строки score (у присуждённых матчей это техническое
-    поражение, см. is_awarded). Каждый источник дедуплицируется
+    non-NULL и survive в Gold. score/home_score/away_score сохраняют ровно
+    опубликованное FBref значение; официальный и фактический счёт вынесены в
+    отдельные official_* и on_field_* поля. Каждый источник дедуплицируется
     независимо через ROW_NUMBER ... ORDER BY _ingested_at DESC.
     Идентификаторы сырые FBref (canonical-резолюция — в Gold).
   tags:
@@ -42,19 +42,42 @@ columns:
   - name: score
     description: |
       Итоговый счёт строкой, как опубликован FBref (разделитель — EN DASH
-      U+2013). Это ОФИЦИАЛЬНЫЙ результат: у присуждённых матчей здесь стоит
-      техническое поражение ("0–3"), а не счёт на поле. Серия пенальти
-      рендерится как "(4) 1–1 (5)".
+      U+2013). Это source-published значение, не гарантия официального
+      результата. Серия пенальти рендерится как "(4) 1–1 (5)".
   - name: home_score
     description: |
-      Голы хозяев — INTEGER. Официальный результат (см. score): для
-      is_awarded = true это присуждённый счёт. Счёт по пенальти отброшен.
-      Результат на поле — home_goals_events.
+      Legacy source-published голы хозяев — INTEGER; семантика сохранена для
+      совместимости. Для официального результата использовать official_home_score.
   - name: away_score
     description: |
-      Голы гостей — INTEGER. Официальный результат (см. score): для
-      is_awarded = true это присуждённый счёт. Счёт по пенальти отброшен.
-      Результат на поле — away_goals_events.
+      Legacy source-published голы гостей — INTEGER; семантика сохранена для
+      совместимости. Для официального результата использовать official_away_score.
+  - name: source_score_raw
+    description: Строка счёта FBref без изменения (явное имя нового контракта).
+  - name: source_home_score
+    description: Числовой source-published счёт хозяев без серии пенальти.
+  - name: source_away_score
+    description: Числовой source-published счёт гостей без серии пенальти.
+  - name: on_field_home_score
+    description: Счёт хозяев по событиям, включая credited own goals и исключая shootout; NULL без event dataset.
+  - name: on_field_away_score
+    description: Счёт гостей по событиям, включая credited own goals и исключая shootout; NULL без event dataset.
+  - name: official_home_score
+    description: Официальный счёт хозяев; для awarded матчей только из evidence-backed medallion override.
+  - name: official_away_score
+    description: Официальный счёт гостей; для awarded матчей только из evidence-backed medallion override.
+  - name: official_score_provenance
+    description: fbref_schedule | medallion_override | missing_override.
+  - name: official_score_authority
+    description: Орган, подтвердивший официальный результат.
+  - name: official_score_reference
+    description: Durable URL доказательства официального результата.
+  - name: result_status
+    description: scheduled | played | awarded | cancelled | suspended.
+  - name: home_shootout_score
+    description: Голы хозяев в серии пенальти из скобок source_score_raw; иначе NULL.
+  - name: away_shootout_score
+    description: Голы гостей в серии пенальти из скобок source_score_raw; иначе NULL.
   - name: notes
     description: |
       Примечание FBref к матчу, как есть: "Match awarded to <team>",
@@ -105,6 +128,12 @@ columns:
     description: |
       Голы гостей, посчитанные из событий (event_type IN goal/penalty,
       team_side='away'). Независимый счётчик vs away_score.
+  - name: event_row_count
+    description: Число дедуплицированных FBref events; 0/NULL различает отсутствие event dataset.
+  - name: event_availability
+    description: available | empty | restricted | not_applicable из typed dataset evidence.
+  - name: event_availability_reason
+    description: Явная причина отсутствия/ограничения event dataset; NULL при available.
   - name: home_own_goals
     description: Автоголы хозяев (event_type='own_goal', team_side='home').
   - name: away_own_goals
@@ -136,7 +165,7 @@ columns:
   - name: league
     description: Лига (partition key).
   - name: season
-    description: Сезон short-form '2526' (partition key).
+    description: Source-native key; split-year как '2526', single/opaque без выдуманного года.
   - name: _silver_created_at
     description: Технический timestamp создания строки в Silver-слое (добавляется CTAS-раннером).
 relationships: []

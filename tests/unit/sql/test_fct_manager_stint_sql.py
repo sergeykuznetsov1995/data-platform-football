@@ -47,6 +47,10 @@ SQL_PATH = PROJECT_ROOT / "dags" / "sql" / "gold" / "fct_manager_stint.sql"
 
 
 def _translate(sql_text: str) -> str:
+    sql_text = sql_text.replace(
+        "iceberg.gold.dim_match",
+        "(SELECT DISTINCT match_id FROM silver.fbref_match_enriched)",
+    )
     statements = sqlglot.transpile(sql_text, read="trino", write="duckdb")
     if not statements:
         raise RuntimeError("sqlglot transpile produced no output")
@@ -67,7 +71,8 @@ def _bootstrap(con) -> None:
             season         BIGINT,
             team           VARCHAR,
             side           VARCHAR,
-            manager_name   VARCHAR
+            manager_name   VARCHAR,
+            source_season_id VARCHAR
         )
     """)
 
@@ -135,8 +140,8 @@ def _bootstrap(con) -> None:
 
     for r in rows:
         con.execute(
-            "INSERT INTO bronze.fbref_match_managers VALUES (?, ?, ?, ?, ?, ?)",
-            (r[0], r[1], r[2], r[3], r[4], r[5]),
+            "INSERT INTO bronze.fbref_match_managers VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (r[0], r[1], r[2], r[3], r[4], r[5], None),
         )
         # All synthetic rows have side='home' so we use the team as `home`
         # and a placeholder ('Opponent') for `away`. The stint SQL will pick
@@ -326,7 +331,8 @@ def _bootstrap_dirty(con) -> None:
     con.execute("""
         CREATE TABLE bronze.fbref_match_managers (
             match_id VARCHAR, league VARCHAR, season BIGINT,
-            team VARCHAR, side VARCHAR, manager_name VARCHAR
+            team VARCHAR, side VARCHAR, manager_name VARCHAR,
+            source_season_id VARCHAR
         )
     """)
     con.execute("""
@@ -364,8 +370,8 @@ def _bootstrap_dirty(con) -> None:
     ]
     for mid, season, mgr, d in rows:
         con.execute(
-            "INSERT INTO bronze.fbref_match_managers VALUES (?, ?, ?, ?, ?, ?)",
-            (mid, league, season, "Wolverhampton Wanderers", "home", mgr),
+            "INSERT INTO bronze.fbref_match_managers VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (mid, league, season, "Wolverhampton Wanderers", "home", mgr, None),
         )
     # fbref_match_enriched: one row per distinct match_id.
     for mid, d in {("wol1", "2022-08-06"), ("wol2", "2022-09-01"),
@@ -453,3 +459,61 @@ class TestFctManagerStintDedup:
         )
         dups = {k: n for k, n in per_team.items() if n > 1}
         assert not dups, f"two stints share a valid_from (issue #200): {dups}"
+
+
+def test_non_world_cup_single_year_keeps_source_season():
+    """EURO 2024 is season ``2024``; it must never become ``2425``."""
+    con = duckdb.connect(":memory:")
+    con.execute("CREATE SCHEMA bronze")
+    con.execute("CREATE SCHEMA silver")
+    con.execute("""
+        CREATE TABLE bronze.fbref_match_managers (
+            match_id VARCHAR, league VARCHAR, season BIGINT,
+            team VARCHAR, side VARCHAR, manager_name VARCHAR,
+            source_season_id VARCHAR
+        )
+    """)
+    con.execute("""
+        CREATE TABLE silver.fbref_match_enriched (
+            match_id VARCHAR, date DATE, league VARCHAR,
+            season BIGINT, home VARCHAR, away VARCHAR
+        )
+    """)
+    con.execute("""
+        CREATE TABLE silver.xref_manager (
+            canonical_id VARCHAR, source VARCHAR, source_id VARCHAR,
+            display_name VARCHAR, league VARCHAR, season VARCHAR,
+            confidence VARCHAR
+        )
+    """)
+    con.execute("""
+        CREATE TABLE silver.xref_team (
+            canonical_id VARCHAR, source VARCHAR, source_id VARCHAR,
+            display_name VARCHAR, league VARCHAR, season VARCHAR,
+            confidence VARCHAR
+        )
+    """)
+    league = "INT-European Championship"
+    con.execute(
+        "INSERT INTO bronze.fbref_match_managers VALUES (?, ?, ?, ?, ?, ?, ?)",
+        ("euro-final", league, 2024, "Spain", "home", "Luis de la Fuente", "2024"),
+    )
+    con.execute(
+        "INSERT INTO silver.fbref_match_enriched VALUES (?, ?, ?, ?, ?, ?)",
+        ("euro-final", date(2024, 7, 14), league, 2024, "Spain", "England"),
+    )
+    con.execute(
+        "INSERT INTO silver.xref_manager VALUES (?, ?, ?, ?, ?, ?, ?)",
+        ("luis_de_la_fuente", "fbref", "Luis de la Fuente", "Luis de la Fuente", league, "2024", "name_normalize"),
+    )
+    con.execute(
+        "INSERT INTO silver.xref_team VALUES (?, ?, ?, ?, ?, ?, ?)",
+        ("spain", "fbref", "Spain", "Spain", league, "2024", "name_alias"),
+    )
+
+    translated = _translate(SQL_PATH.read_text(encoding="utf-8"))
+    row = con.execute(translated).fetchone()
+    columns = [column[0] for column in con.description]
+
+    assert row is not None
+    assert dict(zip(columns, row))["season"] == "2024"

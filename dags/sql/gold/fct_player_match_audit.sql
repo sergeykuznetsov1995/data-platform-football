@@ -213,6 +213,8 @@ INNER JOIN iceberg.silver.fbref_player_match_stats fb
     ON  fb.player_id = xfp.fbref_player_id
     AND fb.league    = xfp.league
     AND fb.season    = xfp.season_year
+INNER JOIN iceberg.gold.dim_match match_scope
+    ON match_scope.match_id = fb.match_id
 -- Bridge FBref match_id → canonical (mostly identity для source='fbref')
 LEFT JOIN xref_match_fbref xmf
     ON  xmf.fbref_match_id = fb.match_id

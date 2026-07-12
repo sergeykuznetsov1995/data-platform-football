@@ -1,0 +1,28 @@
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.bronze.fbref_match_keeper_stats
+  description: |
+    Raw per-match goalkeeper rows parsed from both keeper_stats_<team_id>
+    tables on an FBref match page. Same-page by-product: no additional request.
+    Grain is approximately (match_id, player_id, team_side); typing and latest
+    ingest dedup happen in silver.fbref_keeper_match_stats.
+  tags: [Tier.Bronze, Domain.Football, PII.Low]
+columns:
+  - name: match_id
+    description: FBref match-page id.
+  - name: Player
+    description: Source goalkeeper display name.
+  - name: player_id
+    description: Native FBref player id extracted from the profile link.
+  - name: team
+    description: Source team name.
+  - name: team_side
+    description: home | away, resolved by scorebox team id.
+  - name: Shot Stopping_SoTA
+    description: Raw shots on target against.
+  - name: Shot Stopping_GA
+    description: Raw goals against.
+  - name: Shot Stopping_Saves
+    description: Raw saves.
+  - name: Shot Stopping_Save%
+    description: Raw save percentage.
+relationships: []

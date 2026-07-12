@@ -220,15 +220,23 @@ class TestE3DagImports:
         )
 
     def test_e3_dag_silver_tasks_sequential_within_group(self, dag_bag):
-        """Within silver_e3, espn_lineup must depend on whoscored_events_spadl."""
+        """ESPN must follow the WhoScored SPADL/lineup chain."""
         dag = dag_bag.dags[self.DAG_ID]
         espn = dag.get_task("silver_e3.espn_lineup")
-        upstream_ids = {t.task_id for t in espn.upstream_list}
-        assert "silver_e3.whoscored_events_spadl" in upstream_ids, (
-            "silver_e3 tasks must run sequentially: espn_lineup must depend on "
-            "whoscored_events_spadl. Got upstream="
-            f"{sorted(upstream_ids)}"
+        seen = set()
+        stack = list(espn.upstream_list)
+        while stack:
+            task = stack.pop()
+            if task.task_id in seen:
+                continue
+            seen.add(task.task_id)
+            stack.extend(task.upstream_list)
+        assert "silver_e3.whoscored_events_spadl" in seen, (
+            "silver_e3 tasks must stay sequential: espn_lineup must follow "
+            "whoscored_events_spadl transitively. Got upstream="
+            f"{sorted(seen)}"
         )
+        assert "silver_e3.whoscored_lineup" in seen
 
     def test_e3_dag_gold_tasks_sequential_within_group(self, dag_bag):
         """Within gold_e3, the three facts run in registration order."""
@@ -288,12 +296,8 @@ class TestE3DagImports:
             f"Candidates inspected: {candidates}"
         )
 
-    def test_master_pipeline_e3_runs_after_xref(self, dag_bag):
-        """E3 trigger must depend (transitively) on the xref trigger.
-
-        Topology: master_pipeline ingest -> xref -> e3. Re-running E3 against
-        a stale xref spine breaks fct_event team_id resolution.
-        """
+    def test_master_pipeline_e3_runs_after_blocking_fbref_identity_chain(self, dag_bag):
+        """E3 follows FBref ingest, whose Silver child blocks on xref DQ."""
         master = dag_bag.dags.get("dag_master_pipeline")
         if master is None:
             pytest.skip("dag_master_pipeline not loaded")
@@ -309,7 +313,9 @@ class TestE3DagImports:
         if e3_trigger is None:
             pytest.skip("No E3 trigger in master pipeline; covered by another test")
 
-        # Walk transitive upstream looking for the xref trigger.
+        # Walk transitive upstream looking for the final FBref ingest trigger.
+        # That child cannot succeed until its blocking Silver -> xref chain
+        # succeeds (asserted against the Silver DAG below).
         seen = set()
         stack = list(e3_trigger.upstream_list)
         while stack:
@@ -319,17 +325,16 @@ class TestE3DagImports:
             seen.add(t.task_id)
             stack.extend(t.upstream_list)
 
-        upstream_trigger_targets = set()
-        for tid in seen:
-            try:
-                tt = master.get_task(tid)
-            except Exception:
-                continue
-            target = getattr(tt, "trigger_dag_id", None)
-            if target:
-                upstream_trigger_targets.add(target)
-
-        assert "dag_transform_xref" in upstream_trigger_targets, (
-            "E3 trigger must run after xref trigger in master pipeline. "
-            f"Upstream trigger targets: {sorted(upstream_trigger_targets)}"
+        assert "wait_for_scheduled_fbref" in seen, (
+            "E3 trigger must run after the scheduled FBref sensor. "
+            f"Transitive upstream tasks: {sorted(seen)}"
         )
+        sensor = master.get_task("wait_for_scheduled_fbref")
+        assert sensor.external_dag_id == "dag_ingest_fbref"
+        assert sensor.allowed_states == ["success"]
+        assert sensor.failed_states == ["failed"]
+
+        silver = dag_bag.dags["dag_transform_fbref_silver"]
+        xref = silver.get_task("trigger_xref_transform")
+        assert getattr(xref, "trigger_dag_id", None) == "dag_transform_xref"
+        assert xref.wait_for_completion is True

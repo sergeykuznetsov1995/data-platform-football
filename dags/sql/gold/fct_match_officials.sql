@@ -32,6 +32,8 @@ SELECT
     o.league,
     o.season
 FROM iceberg.silver.fbref_match_officials o
+INNER JOIN iceberg.gold.dim_match match_scope
+    ON match_scope.match_id = o.match_id
 LEFT JOIN iceberg.silver.xref_referee ref_x
     ON  ref_x.source    = 'fbref'
     AND ref_x.source_id = TRIM(o.official_name)

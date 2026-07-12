@@ -2,8 +2,7 @@
 
 Public entry point: ``TransfermarktScraper``. Imports here are intentionally
 minimal so ``import scrapers.transfermarkt`` stays cheap for Airflow DAG
-parsing — the runtime imports nodriver / BeautifulSoup lazily inside
-``TransfermarktScraper.read_*`` methods.
+parsing; optional parsing/runtime dependencies stay lazy.
 """
 
 from scrapers.transfermarkt.models import (

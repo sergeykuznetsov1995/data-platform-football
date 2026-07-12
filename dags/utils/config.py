@@ -87,7 +87,7 @@ FOTMOB_HTTP_POOL: str = 'fotmob_http_pool'
 
 # DAG schedule configuration (cron format, UTC)
 SCHEDULES: Dict[str, Optional[str]] = {
-    'dag_ingest_fbref': '0 6 * * 1',         # 6:00 UTC Monday (weekly)
+    'dag_ingest_fbref': '0 6 * * *',         # 6:00 UTC daily
     # One schedule owner: the master pipeline triggers FotMob daily.  Keeping
     # a second source cron doubled the same direct-HTTP work.
     'dag_ingest_fotmob': None,

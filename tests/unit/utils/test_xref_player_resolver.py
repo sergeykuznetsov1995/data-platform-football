@@ -43,6 +43,33 @@ rapidfuzz = pytest.importorskip("rapidfuzz")
 unidecode = pytest.importorskip("unidecode")
 
 
+class TestFetchFBrefIdentityUniverse:
+    def test_reads_shared_identity_and_keeps_team_spells(self, monkeypatch):
+        captured = {}
+
+        def fake_execute(conn, sql, fetch=False):
+            captured["sql"] = sql
+            assert fetch is True
+            return [
+                ("98ea5115", "David Raya", "Arsenal", "ENG-Premier League", "2425"),
+                ("98ea5115", "David Raya", "Brentford", "ENG-Premier League", "2425"),
+                ("noid_deadbeef", "Residual Player", "Arsenal", "ENG-Premier League", "2425"),
+            ]
+
+        monkeypatch.setattr(xpr, "_execute", fake_execute)
+        rows = xpr._fetch_fbref_players(object(), "ENG-Premier League", [2024])
+
+        assert "iceberg.silver.fbref_player_identity" in captured["sql"]
+        assert "iceberg.bronze.fbref_player_stats" not in captured["sql"]
+        assert "stat_type" not in captured["sql"]
+        assert "season IN ('2425')" in captured["sql"]
+        assert [(r["source_id"], r["raw_team_name"]) for r in rows] == [
+            ("98ea5115", "Arsenal"),
+            ("98ea5115", "Brentford"),
+            ("noid_deadbeef", "Arsenal"),
+        ]
+
+
 # ---------------------------------------------------------------------------
 # normalize_name
 # ---------------------------------------------------------------------------

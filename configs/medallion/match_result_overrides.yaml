@@ -1,0 +1,74 @@
+# Explicit official-result decisions for FBref matches whose source-published
+# score is not a reliable statement of the competition's official result.
+#
+# Contract:
+#   * match_id is the stable FBref /matches/<id>/ slug.
+#   * every entry must carry an authoritative result and a durable reference;
+#     the Silver renderer rejects missing/duplicate fields before Trino runs.
+#   * this is deliberately a finite evidence registry, not an inference rule.
+#     `notes: Match awarded to ...` identifies candidates, but does not encode
+#     the score (FBref is inconsistent for awarded matches).
+version: 1
+overrides:
+  - match_id: "ed6efcb0"
+    league: "ITA-Serie A"
+    season: "1617"
+    official_home_score: 0
+    official_away_score: 3
+    authority: "Lega Serie A, Giudice Sportivo"
+    reference: "https://img.legaseriea.it/vimages/16fdc34b61783311/cu24.pdf"
+    reason: "Sassuolo sanctioned with loss of the match by 0-3."
+
+  - match_id: "e0a20cfe"
+    league: "ITA-Serie A"
+    season: "2021"
+    official_home_score: 3
+    official_away_score: 0
+    authority: "Lega Serie A"
+    reference: "https://img.legaseriea.it/vimages/6329acfb/2020-21_A_UNICO_UNI_2_ROMJUV.pdf"
+    reason: "Official Lega Serie A matchday document records Hellas Verona-Roma as 3-0."
+
+  - match_id: "171e1d37"
+    league: "GER-Bundesliga"
+    season: "2425"
+    official_home_score: 0
+    official_away_score: 2
+    authority: "DFB-Sportgericht"
+    reference: "https://www.dfb.de/news/dfb-sportgericht-wertet-bundesligaspiel-in-berlin-fuer-bochum"
+    reason: "DFB sporting court awarded the match 2-0 to Bochum."
+
+  - match_id: "b5b2a696"
+    league: "FRA-Ligue 1"
+    season: "1617"
+    official_home_score: 0
+    official_away_score: 3
+    authority: "LFP Commission de Discipline"
+    reference: "https://www.lequipe.fr/Football/Actualites/Discipline-defaite-sur-tapis-vert-pour-bastia-contre-lyon-et-trois-matches-a-huis-clos/798557"
+    reason: "LFP disciplinary decision awarded the match to Lyon; penalty-loss convention is 0-3."
+
+  - match_id: "15ee650c"
+    league: "FRA-Ligue 1"
+    season: "2425"
+    official_home_score: 0
+    official_away_score: 2
+    authority: "LFP Commission de Discipline"
+    reference: "https://ligue1.fr/fr/articles/l1_article_2269-le-point-sur-la-lutte-pour-le-maintien-020425-l1"
+    reason: "LFP confirmed Montpellier's penalty loss and the 0-2 result."
+
+  - match_id: "c34bbc21"
+    league: "GER-Bundesliga"
+    season: "2122"
+    official_home_score: 0
+    official_away_score: 2
+    authority: "DFB Datencenter"
+    reference: "https://datencenter.dfb.de/competitions/bundesliga/seasons/2021-22/teams/vfl-bochum"
+    reason: "DFB Datencenter records VfL Bochum-Borussia Moenchengladbach as 0-2 Wert."
+
+  - match_id: "f7e35659"
+    league: "ITA-Serie A"
+    season: "2425"
+    official_home_score: 3
+    official_away_score: 0
+    authority: "Lega Serie A"
+    reference: "https://img.legaseriea.it/vimages/67a5358b/2024-25_A_UNICO_UNI_14_FIOINT_ENG.pdf"
+    reason: "Official Lega Serie A match report records Fiorentina-Inter as 3-0."

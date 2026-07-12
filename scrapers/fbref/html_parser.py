@@ -11,7 +11,7 @@ continue to work without changes.
 """
 
 from scrapers.fbref.parsers import *  # noqa: F401,F403
-from scrapers.fbref.parsers import (  # noqa: F811 — explicit re-exports for IDEs/type-checkers
+from scrapers.fbref.parsers import (  # noqa: F401,F811 — compatibility re-exports
     MULTIINDEX_PREFIXES,
     PLAYER_ID_PATTERN,
     TEAM_ID_PATTERN,

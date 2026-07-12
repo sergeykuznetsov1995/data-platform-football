@@ -33,6 +33,7 @@ WITH officials_dedup AS (
         match_id,
         league,
         season,
+        source_season_id,
         referee,
         ar1,
         ar2,
@@ -51,8 +52,16 @@ SELECT
     o.league,
     -- season → slug ('2526'); bronze fbref_match_officials is year-start bigint (#404).
     -- #913 Phase 2
-    CASE WHEN o.league = 'INT-World Cup'
-         THEN LPAD(CAST(o.season AS varchar), 4, '0')
+    CASE
+         WHEN REGEXP_LIKE(COALESCE(o.source_season_id, ''), '^\d{4}$')
+             THEN o.source_season_id
+         WHEN REGEXP_LIKE(COALESCE(o.source_season_id, ''), '^\d{4}-\d{4}$')
+             THEN SUBSTR(o.source_season_id, 3, 2)
+                  || SUBSTR(o.source_season_id, 8, 2)
+         WHEN NULLIF(TRIM(o.source_season_id), '') IS NOT NULL
+             THEN TRIM(o.source_season_id)
+         WHEN o.league = 'INT-World Cup'
+             THEN LPAD(CAST(o.season AS varchar), 4, '0')
          ELSE LPAD(CAST(MOD(o.season, 100) AS varchar), 2, '0')
               || LPAD(CAST(MOD(o.season + 1, 100) AS varchar), 2, '0')
     END AS season,

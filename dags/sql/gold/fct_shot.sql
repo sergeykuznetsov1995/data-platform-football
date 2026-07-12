@@ -198,6 +198,8 @@ fb_sched_resolved AS (
         xt_home.canonical_id           AS home_canonical_id,
         xt_away.canonical_id           AS away_canonical_id
     FROM iceberg.silver.fbref_match_enriched fb
+    INNER JOIN iceberg.gold.dim_match match_scope
+        ON match_scope.match_id = fb.match_id
     LEFT JOIN xref_team_dedup xt_home
            ON xt_home.source    = 'fbref'
           AND xt_home.source_id = fb.home
@@ -317,6 +319,8 @@ sofascore_final AS (
         2                                              AS source_priority
 
     FROM iceberg.silver.sofascore_shots ss
+    INNER JOIN iceberg.gold.dim_match match_scope
+        ON match_scope.match_id = ss.match_id
     WHERE ss.match_id NOT LIKE 'sofascore_%'
       AND ss.match_id NOT LIKE 'ss_%'
       AND ss.xg IS NOT NULL

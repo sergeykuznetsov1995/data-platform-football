@@ -1,18 +1,6 @@
-"""
-Integration tests for dag_ingest_fbref.
+"""Production-image DagBag checks for all durable FBref DAGs."""
 
-These tests verify:
-- DAG loads without errors
-- Task structure is correct (combined season stats + match_data group)
-- Task dependencies are properly configured
-- All expected tasks exist
-
-Architecture (Jul 2026): the nine single_stat tasks (player x4, team x4,
-keeper x1 + traffic-guard twins) were replaced by ONE combined
-``season_stats_all`` task — player and team stats share the same season
-page for stats/shooting/misc, so one process fetches 5 unique pages per
-(league, season) instead of 9 and pays a single CF bypass (~2.7 MB each).
-"""
+from __future__ import annotations
 
 import os
 from pathlib import Path
@@ -20,261 +8,143 @@ from pathlib import Path
 import pytest
 
 
-# sys.path setup (project root + dags folder) is centralised in the root conftest.py.
-PROJECT_ROOT = Path(__file__).parent.parent.parent.parent
-DAGS_FOLDER = PROJECT_ROOT / 'dags'
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+DAGS_FOLDER = PROJECT_ROOT / "dags"
 
 
-@pytest.fixture(scope='module')
-def fbref_dag():
-    """Load the FBref DAG for testing."""
-    # Set required Airflow environment variables
-    os.environ.setdefault('AIRFLOW_HOME', str(PROJECT_ROOT / 'airflow_home'))
-    os.environ.setdefault('AIRFLOW__CORE__DAGS_FOLDER', str(DAGS_FOLDER))
-    os.environ.setdefault('AIRFLOW__CORE__LOAD_EXAMPLES', 'False')
-    os.environ.setdefault('AIRFLOW__DATABASE__SQL_ALCHEMY_CONN', 'sqlite:///airflow.db')
-
+@pytest.fixture(scope="module")
+def fbref_dags():
+    os.environ.setdefault("AIRFLOW_HOME", str(PROJECT_ROOT / "airflow_home"))
+    os.environ.setdefault("AIRFLOW__CORE__DAGS_FOLDER", str(DAGS_FOLDER))
+    os.environ.setdefault("AIRFLOW__CORE__LOAD_EXAMPLES", "False")
+    os.environ.setdefault(
+        "AIRFLOW__DATABASE__SQL_ALCHEMY_CONN", "sqlite:///airflow.db"
+    )
     try:
         from airflow.models import DagBag
-        dag_bag = DagBag(dag_folder=str(DAGS_FOLDER), include_examples=False)
-
-        if 'dag_ingest_fbref' not in dag_bag.dags:
-            pytest.skip("dag_ingest_fbref not found in DagBag")
-
-        return dag_bag.dags['dag_ingest_fbref']
     except ImportError:
         pytest.skip("Airflow not installed")
 
+    bag = DagBag(dag_folder=str(DAGS_FOLDER), include_examples=False)
+    expected = {
+        "dag_ingest_fbref",
+        "dag_backfill_fbref",
+        "dag_replay_fbref",
+    }
+    missing = expected.difference(bag.dags)
+    assert not missing, (
+        f"Missing FBref DAGs {sorted(missing)}; import errors: "
+        f"{bag.import_errors}"
+    )
+    return {dag_id: bag.dags[dag_id] for dag_id in expected}
 
-@pytest.mark.integration
-class TestFBrefDAGLoading:
-    """Tests for DAG loading and basic validation."""
 
-    def test_dag_loads_without_errors(self, fbref_dag):
-        """Test that dag_ingest_fbref loads without import errors."""
-        assert fbref_dag is not None
-        assert fbref_dag.dag_id == 'dag_ingest_fbref'
-
-    def test_dag_has_no_import_errors(self, fbref_dag):
-        """Verify DAG has no import errors."""
-        # If we got here, the DAG loaded successfully
-        assert fbref_dag.fileloc is not None
-
-    def test_dag_has_description(self, fbref_dag):
-        """Test that DAG has a description."""
-        assert fbref_dag.description is not None
-        assert len(fbref_dag.description) > 0
-
-    def test_dag_has_correct_schedule(self, fbref_dag):
-        """Test that DAG has the expected schedule."""
-        # Expected schedule from config: '0 6 * * *' (daily at 6 AM UTC)
-        assert fbref_dag.schedule_interval is not None
+def _states(values):
+    return [str(value) for value in values]
 
 
 @pytest.mark.integration
-class TestFBrefTaskStructure:
-    """Tests for the combined-season-stats + match_data structure."""
-
-    def test_season_stats_combined_task_exists(self, fbref_dag):
-        """ONE season_stats_all task replaces the nine single_stat tasks."""
-        task_ids = list(fbref_dag.task_dict.keys())
-
-        assert 'season_stats_all' in task_ids, \
-            f"Expected season_stats_all task, got: {task_ids}"
-        assert 'traffic_guard_season_stats' in task_ids, \
-            f"Expected traffic_guard_season_stats task, got: {task_ids}"
-
-    def test_no_legacy_single_stat_taskgroups(self, fbref_dag):
-        """The old per-stat TaskGroups must be gone (Jul-2026 optimization)."""
-        legacy_prefixes = ('player_stats.', 'team_stats.', 'keeper_stats.')
-        legacy = [
-            task_id for task_id in fbref_dag.task_dict.keys()
-            if task_id.startswith(legacy_prefixes)
+class TestFBrefDagBag:
+    def test_current_is_daily_and_serial(self, fbref_dags):
+        dag = fbref_dags["dag_ingest_fbref"]
+        assert str(dag.schedule_interval) == "0 6 * * *"
+        assert dag.max_active_runs == 1
+        assert dag.max_active_tasks == 1
+        fetch_tasks = [
+            task_id for task_id in dag.task_dict if task_id.startswith("fetch_wave_")
         ]
-        assert not legacy, f"Legacy single_stat tasks still present: {legacy}"
+        assert len(fetch_tasks) == 8
+        assert len(dag.task_dict) == 2 * len(fetch_tasks) + 4
 
-    def test_taskgroup_match_data_structure(self, fbref_dag):
-        """match_data: 2 Trino-чека + schedule(+guard) + combined
-        match_all_data(+guard) — комбинированный таск вместо 5 отдельных
-        (5N → N page loads)."""
-        match_data_tasks = sorted(
-            task_id for task_id in fbref_dag.task_dict.keys()
-            if task_id.startswith('match_data.')
-        )
-
-        expected = sorted([
-            'match_data.check_trino_health',
-            'match_data.match_schedule',
-            'match_data.traffic_guard_match_schedule',
-            'match_data.check_trino_before_match',
-            'match_data.match_all_data',
-            'match_data.traffic_guard_match_all_data',
-        ])
-        assert match_data_tasks == expected, \
-            f"match_data group drifted: {match_data_tasks}"
-
-
-@pytest.mark.integration
-class TestFBrefTaskDependencies:
-    """Tests for task dependencies."""
-
-    def test_match_schedule_followed_by_guard(self, fbref_dag):
-        """schedule → его traffic_guard (#44); комбинированный match_all_data
-        идёт дальше по цепочке (после второго Trino-чека)."""
-        schedule_task = fbref_dag.task_dict.get('match_data.match_schedule')
-
-        if schedule_task is None:
-            pytest.skip("Schedule task not found - may have different naming")
-
-        downstream_ids = [task.task_id for task in schedule_task.downstream_list]
-        assert 'match_data.traffic_guard_match_schedule' in downstream_ids, \
-            f"Expected traffic_guard_match_schedule downstream of schedule, " \
-            f"got: {downstream_ids}"
-
-    def test_season_stats_runs_before_match_data(self, fbref_dag):
-        """season_stats_all → guard → match_data (последовательно, OOM
-        safety); validate берёт upstream из match_data."""
-        season_task = fbref_dag.task_dict['season_stats_all']
-        downstream_ids = [t.task_id for t in season_task.downstream_list]
-        assert 'traffic_guard_season_stats' in downstream_ids, \
-            f"Expected traffic_guard_season_stats downstream of " \
-            f"season_stats_all, got: {downstream_ids}"
-
-        guard = fbref_dag.task_dict['traffic_guard_season_stats']
-        guard_downstream = [t.task_id for t in guard.downstream_list]
-        assert any(tid.startswith('match_data.') for tid in guard_downstream), \
-            f"match_data must run after the season stats guard, " \
-            f"got: {guard_downstream}"
-
-        validate_task = fbref_dag.task_dict.get('validate_all_data')
-        if validate_task is None:
-            pytest.skip("Validate task not found")
-
-        upstream_ids = [task.task_id for task in validate_task.upstream_list]
-        assert any(tid.startswith('match_data.') for tid in upstream_ids), \
-            f"validate_all_data must depend on match_data group, got: {upstream_ids}"
-
-    def test_validate_task_requires_successful_producers(self, fbref_dag):
-        """Validation must not turn a failed producer into a green path."""
-        validate_task = fbref_dag.task_dict.get('validate_all_data')
-
-        if validate_task is None:
-            pytest.skip("Validate task not found")
-
-        assert validate_task.trigger_rule == 'all_success', \
-            f"Expected trigger_rule='all_success', got: {validate_task.trigger_rule}"
-
-        upstream_ids = {t.task_id for t in validate_task.upstream_list}
-        assert upstream_ids == {
-            'match_data.match_all_data',
-            'match_data.traffic_guard_match_all_data',
-        }
-
-    def test_observers_do_not_mask_producer_failures(self, fbref_dag):
-        trino_first = fbref_dag.task_dict['match_data.check_trino_health']
-        trino_second = fbref_dag.task_dict[
-            'match_data.check_trino_before_match'
+    def test_backfill_and_replay_are_manual(self, fbref_dags):
+        backfill = fbref_dags["dag_backfill_fbref"]
+        replay = fbref_dags["dag_replay_fbref"]
+        assert backfill.schedule_interval is None
+        assert replay.schedule_interval is None
+        backfill_waves = [
+            task_id
+            for task_id in backfill.task_dict
+            if task_id.startswith("fetch_wave_")
         ]
-        terminal = fbref_dag.task_dict['ingest_complete']
-
-        assert {t.task_id for t in trino_first.upstream_list} == {
-            'season_stats_all', 'traffic_guard_season_stats',
-        }
-        assert {t.task_id for t in trino_second.upstream_list} == {
-            'match_data.match_schedule',
-            'match_data.traffic_guard_match_schedule',
-        }
-        assert {t.task_id for t in terminal.upstream_list} == {
-            'validate_all_data', 'report_proxy_traffic',
-        }
+        assert len(backfill_waves) == 25
+        assert len(backfill.task_dict) == 2 * len(backfill_waves) + 4
+        replay_waves = [
+            task_id
+            for task_id in replay.task_dict
+            if task_id.startswith("parse_wave_")
+        ]
+        assert len(replay_waves) == 8
+        assert len(replay.task_dict) == len(replay_waves) + 3
 
 
 @pytest.mark.integration
-class TestFBrefTaskConfiguration:
-    """Tests for individual task configuration."""
-
-    def test_season_stats_task_is_bash_operator(self, fbref_dag):
-        """season_stats_all — BashOperator; его traffic_guard — PythonOperator."""
-        from airflow.operators.bash import BashOperator
-
-        season_task = fbref_dag.task_dict['season_stats_all']
-        assert isinstance(season_task, BashOperator), \
-            f"Expected BashOperator for season_stats_all, got {type(season_task)}"
-
-    def test_season_stats_task_mode(self, fbref_dag):
-        """season_stats_all → --mode combined_season_stats + очистка
-        устаревших per-stat JSON результатов старой архитектуры."""
-        season_task = fbref_dag.task_dict['season_stats_all']
-        assert '--mode combined_season_stats' in season_task.bash_command, \
-            "Expected --mode combined_season_stats in season_stats_all bash_command"
-        assert '/fbref_player_' in season_task.bash_command, \
-            "Expected stale per-stat JSON cleanup in season_stats_all bash_command"
-
-    def test_match_data_tasks_modes(self, fbref_dag):
-        """schedule → --mode match_data; комбинированный match_all_data →
-        --mode combined_match_data."""
-        schedule = fbref_dag.task_dict.get('match_data.match_schedule')
-        match_all = fbref_dag.task_dict.get('match_data.match_all_data')
-        assert schedule is not None and match_all is not None
-
-        assert '--mode match_data' in schedule.bash_command, \
-            "Expected --mode match_data in match_schedule bash_command"
-        assert '--mode combined_match_data' in match_all.bash_command, \
-            "Expected --mode combined_match_data in match_all_data bash_command"
-
-    def test_runtime_scope_params_are_rendered(self, fbref_dag):
-        """League and chunk params must affect commands, not be dead UI."""
-        matches = fbref_dag.task_dict['match_data.match_all_data'].bash_command
-
-        assert 'params.leagues' in fbref_dag.task_dict[
-            'season_stats_all'
-        ].env['FBREF_LEAGUES']
-        assert 'params.leagues' in fbref_dag.task_dict[
-            'match_data.match_schedule'
-        ].env['FBREF_LEAGUES']
-        assert 'params.leagues' in fbref_dag.task_dict[
-            'match_data.match_all_data'
-        ].env['FBREF_LEAGUES']
-        assert 'params.max_matches' in matches
-
-    def test_artifacts_are_scoped_to_airflow_run(self, fbref_dag):
-        season = fbref_dag.task_dict['season_stats_all']
-        schedule = fbref_dag.task_dict['match_data.match_schedule']
-        matches = fbref_dag.task_dict['match_data.match_all_data']
-
-        for task in (season, schedule, matches):
-            assert '/tmp/fbref_runs/' in task.bash_command
-            assert 'dag_run.id' in task.bash_command
-            assert '--traffic-output' in task.bash_command
-            assert '/tmp/fbref_runs/' in task.env['FBREF_RUN_DIR']
-
-        validate = fbref_dag.task_dict['validate_all_data']
-        report = fbref_dag.task_dict['report_proxy_traffic']
-        assert '/tmp/fbref_runs/' in validate.op_kwargs['result_dir']
-        assert '/tmp/fbref_runs/' in report.op_kwargs['glob_pattern']
-
-    def test_dag_has_concurrency_limit(self, fbref_dag):
-        """Test that DAG has concurrency limit for rate limiting."""
-        # Concurrency should be set to limit parallel task execution
-        # This is important for FBref rate limiting
-        assert fbref_dag.concurrency is not None or fbref_dag.max_active_tasks is not None, \
-            "Expected DAG to have concurrency limit"
-
-
-@pytest.mark.integration
-class TestFBrefTaskCount:
-    """Tests for total task counts."""
-
-    def test_total_task_count(self, fbref_dag):
-        """Total = season_stats_all + guard + 6 match_data + start +
-        validate_all_data + report_proxy_traffic + ingest_complete."""
-        total_tasks = len(fbref_dag.task_dict)
-
-        expected_min = (
-            2   # season_stats_all + traffic_guard_season_stats
-            + 6  # match_data group
-            + 4  # start + validate + report_proxy_traffic + ingest_complete
+class TestFBrefCurrentFailureEdges:
+    def test_each_fetch_is_immediately_followed_by_parse(self, fbref_dags):
+        dag = fbref_dags["dag_ingest_fbref"]
+        assert dag.task_dict["seed_competition_index"].downstream_task_ids == {
+            "fetch_wave_01"
+        }
+        wave_count = len(
+            [
+                task_id
+                for task_id in dag.task_dict
+                if task_id.startswith("fetch_wave_")
+            ]
         )
+        for number in range(1, wave_count + 1):
+            fetch = dag.task_dict[f"fetch_wave_{number:02d}"]
+            parse = dag.task_dict[f"parse_wave_{number:02d}"]
+            assert fetch.downstream_task_ids == {parse.task_id}
+            expected = (
+                f"fetch_wave_{number + 1:02d}"
+                if number < wave_count
+                else "validate_run"
+            )
+            assert parse.downstream_task_ids == {expected}
 
-        assert total_tasks >= expected_min, \
-            f"Expected at least {expected_min} tasks, got {total_tasks}"
+    def test_validation_is_the_only_silver_parent(self, fbref_dags):
+        dag = fbref_dags["dag_ingest_fbref"]
+        validate = dag.task_dict["validate_run"]
+        trigger = dag.task_dict["trigger_silver_transform"]
+        assert validate.trigger_rule == "all_success"
+        assert trigger.trigger_rule == "all_success"
+        assert trigger.upstream_task_ids == {"validate_run"}
+        assert trigger.wait_for_completion is True
+        assert _states(trigger.allowed_states) == ["success"]
+        assert _states(trigger.failed_states) == ["failed"]
+
+
+@pytest.mark.integration
+class TestFBrefBoundedModes:
+    def test_backfill_has_25_request_cap(self, fbref_dags):
+        dag = fbref_dags["dag_backfill_fbref"]
+        initialize = dag.task_dict["initialize_run"]
+        assert initialize.op_kwargs["run_type"] == "backfill"
+        assert initialize.op_kwargs["request_limit"] == (
+            "{{ params.request_limit }}"
+        )
+        assert dag.task_dict["seed_historical_seasons"].downstream_task_ids == {
+            "fetch_wave_01"
+        }
+
+    def test_replay_has_no_network_task_and_zero_budget(self, fbref_dags):
+        dag = fbref_dags["dag_replay_fbref"]
+        assert not any(task_id.startswith("fetch") for task_id in dag.task_dict)
+        assert not any(task_id.startswith("seed") for task_id in dag.task_dict)
+        initialize = dag.task_dict["initialize_run"]
+        assert initialize.op_kwargs["run_type"] == "replay"
+        assert initialize.op_kwargs["request_limit"] == 0
+        assert initialize.op_kwargs["byte_limit_mb"] == 0
+        for task_id, task in dag.task_dict.items():
+            if task_id.startswith("parse_wave_"):
+                assert task.op_kwargs["source_control_run_id"] == (
+                    "{{ params.source_control_run_id }}"
+                )
+
+    def test_all_three_modes_validate_before_silver(self, fbref_dags):
+        for dag in fbref_dags.values():
+            validate = dag.task_dict["validate_run"]
+            trigger = dag.task_dict["trigger_silver_transform"]
+            assert trigger.upstream_task_ids == {validate.task_id}
+            assert validate.trigger_rule == "all_success"
+            assert trigger.trigger_rule == "all_success"
