@@ -52,6 +52,14 @@ FBref crawl scope.
 
 ### Airflow topology
 
+Every `fetch` task drives Camoufox through `dags/scripts/run_fbref_fetch_wave.py`
+in its own process. Playwright's sync API deadlocks inside a task process forked
+from the multi-threaded scheduler — the browser starts, the navigation never
+opens a socket, and no timeout fires — which is why the repository already
+requires browser scrapers to run in a subprocess. The task callable only relays
+the runner's bounded JSON result, so budgets, leases and gates are unchanged;
+`parse`, `validate` and `seed` tasks touch no browser and stay in-process.
+
 | DAG | Schedule and budget | Static topology | Promotion contract |
 |---|---|---|---|
 | `dag_ingest_fbref` | Daily `06:00` UTC; 200 total requests and 100 MiB per run; default/max shard 25 | 20 tasks: initialize, seed index, eight sequential `fetch -> offline parse` waves, validate, trigger Silver | Every edge is `all_success`; Silver trigger blocks and propagates child failure. |
