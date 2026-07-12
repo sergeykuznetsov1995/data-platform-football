@@ -578,6 +578,28 @@ def _merge_candidate(
             known_evidence.add(serialised)
 
 
+def _has_season_markup(soup: BeautifulSoup) -> bool:
+    return bool(
+        soup.select('select[name*="saison"] option[value]')
+        or soup.select('a[href*="saison_id"]')
+    )
+
+
+def _canonical_profile_route(soup: BeautifulSoup, profile_url: str) -> Optional[str]:
+    """The route the source itself calls canonical, when it differs.
+
+    A cup is listed under both the generic ``/wettbewerb/`` route and its own
+    ``/pokalwettbewerb/`` one, but only the canonical route carries the season
+    selector — the generic one answers with a season-less page.
+    """
+    tag = soup.select_one('link[rel="canonical"]')
+    href = str(tag.get("href") or "") if tag is not None else ""
+    canonical = _profile_url(href) if href else None
+    if canonical is None or canonical == profile_url:
+        return None
+    return canonical
+
+
 def _selector_options(
     soup: BeautifulSoup,
     *,
@@ -776,6 +798,18 @@ class TransfermarktCompetitionDiscovery:
         for candidate in sorted(candidates.values(), key=lambda item: item.competition_id):
             document = self._get(candidate.profile_url)
             soup = self._soup(document)
+            if not _has_season_markup(soup):
+                canonical = _canonical_profile_route(soup, candidate.profile_url)
+                if canonical is not None:
+                    document = self._get(canonical)
+                    soup = self._soup(document)
+                    identity = _profile_identity(canonical)
+                    if identity is None or identity[0] != candidate.competition_id:
+                        raise DiscoverySchemaError(
+                            f"canonical route changes identity: {canonical}"
+                        )
+                    candidate.slug = identity[1]
+                    candidate.profile_url = canonical
             declared_id = soup.select_one("[data-competition-id]")
             if declared_id is not None and str(
                 declared_id.get("data-competition-id")
