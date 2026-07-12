@@ -65,7 +65,7 @@ MAX_ATTEMPTS = 6
 # A lease is sticky, so an unthrottled crawl hits the source from one exit as
 # fast as it can parse; the catalogue then starts answering 502/504. Pace the
 # crawl like the other sources do (scrapers/utils/rate_limiter.py).
-REQUESTS_PER_MINUTE = 20
+REQUESTS_PER_MINUTE = 10
 CONCURRENCY = 1
 COMPETITIONS_TABLE = "iceberg.bronze.transfermarkt_competitions"
 EDITIONS_TABLE = "iceberg.bronze.transfermarkt_competition_editions"
