@@ -21,6 +21,7 @@ from scrapers.transfermarkt.registry import (
     CompetitionType,
     EvidenceOrigin,
     Gender,
+    SeasonFormat,
     UnsafeCrawlError,
     reconcile_registry_pages,
 )
@@ -227,6 +228,38 @@ def test_discovery_follows_the_canonical_route_when_a_profile_has_no_seasons() -
     assert BASE_URL + "/afrika-cup/startseite/pokalwettbewerb/AFCN" in fetch.calls
     editions = [e for e in snapshot.editions if e.competition_id == "AFCN"]
     assert len(editions) == 2
+
+
+def test_discovery_keeps_the_format_of_each_edition_when_it_changed() -> None:
+    profile = (
+        '<!doctype html><html lang="en"><body>'
+        '<h1 data-competition-id="GB1">Premier League</h1>'
+        '<select name="saison_id">'
+        '<option value="2025" selected>25/26</option>'
+        '<option value="1899">1899/00</option>'
+        '<option value="1977">1977</option>'
+        "</select></body></html>"
+    )
+
+    pages, *_ = _discover(
+        fetch=FixtureFetch(
+            {BASE_URL + "/premier-league/startseite/wettbewerb/GB1": profile}
+        )
+    )
+    snapshot = reconcile_registry_pages(pages)
+    competition = next(
+        item for item in snapshot.competitions if item.competition_id == "GB1"
+    )
+    editions = {
+        item.edition_id: item
+        for item in snapshot.editions
+        if item.competition_id == "GB1"
+    }
+
+    assert competition.season_format is SeasonFormat.SPLIT_YEAR
+    assert editions["2025"].season_format is SeasonFormat.SPLIT_YEAR
+    assert editions["1899"].season_format is SeasonFormat.SPLIT_YEAR
+    assert editions["1977"].season_format is SeasonFormat.SINGLE_YEAR
 
 
 def test_discovery_ignores_navbar_entries_that_every_page_repeats() -> None:

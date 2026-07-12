@@ -56,11 +56,14 @@ _STATE_COLUMNS = (
     'state_key', 'registry_snapshot_id', 'source_hash', 'competition_count',
     'edition_count', 'unknown_active_count', 'status', 'revision',
 )
+# A competition's format is the one its current edition runs on; older editions
+# keep theirs, so the two legitimately differ and only each edition's own
+# format-vs-season agreement is checked (canonical_season_violations).
 _DQ_FIELDS = (
     'competition_count', 'competition_distinct_count', 'edition_count',
     'edition_distinct_count', 'orphan_editions',
     'competitions_without_editions', 'current_edition_violations',
-    'season_format_mismatches', 'canonical_season_violations',
+    'canonical_season_violations',
     'classification_evidence_violations', 'classification_field_violations',
     'unknown_active_count', 'content_mismatch_count',
 )
@@ -424,13 +427,9 @@ SELECT
      LEFT JOIN current_counts cc USING (competition_id)
      WHERE COALESCE(cc.current_count, 0) <> 1)
         AS current_edition_violations,
-    (SELECT COUNT(*) FROM e
-     JOIN c USING (competition_id)
-     WHERE e.season_format <> c.season_format)
-        AS season_format_mismatches,
     (SELECT count_if(
         TRY_CAST(edition_id AS integer) IS NULL
-        OR NOT regexp_like(edition_id, '^(19|20|21)[0-9]{{2}}$')
+        OR NOT regexp_like(edition_id, '^(18|19|20|21)[0-9]{{2}}$')
         OR NOT regexp_like(canonical_season, '^[0-9]{{4}}$')
         OR season_format NOT IN ('split_year', 'single_year')
         OR (season_format = 'single_year' AND canonical_season <> edition_id)
