@@ -196,6 +196,39 @@ def test_discovery_resolves_renamed_slug_aliases_for_same_id() -> None:
     assert BASE_URL + "/torneo-intermedio/startseite/wettbewerb/GB1" not in fetch.calls
 
 
+def test_discovery_follows_the_canonical_route_when_a_profile_has_no_seasons() -> None:
+    afrika = (FIXTURES / "afrika.html").read_text(encoding="utf-8")
+    generic_route = '<a href="/afrika-cup/startseite/wettbewerb/AFCN">Africa Cup</a>'
+    afrika = afrika.replace("</body>", generic_route + "</body>")
+    season_less = (
+        '<!doctype html><html lang="en"><head>'
+        '<link rel="canonical" '
+        'href="https://www.transfermarkt.com/afrika-cup/startseite/pokalwettbewerb/AFCN">'
+        '</head><body><h1 data-competition-id="AFCN">Africa Cup of Nations</h1>'
+        "</body></html>"
+    )
+
+    pages, fetch, *_ = _discover(
+        fetch=FixtureFetch(
+            {
+                BASE_URL + "/wettbewerbe/afrika": afrika,
+                BASE_URL + "/afrika-cup/startseite/wettbewerb/AFCN": season_less,
+            }
+        )
+    )
+    snapshot = reconcile_registry_pages(pages)
+    afcn = next(
+        item for item in snapshot.competitions if item.competition_id == "AFCN"
+    )
+
+    assert afcn.source_url == (
+        BASE_URL + "/afrika-cup/startseite/pokalwettbewerb/AFCN"
+    )
+    assert BASE_URL + "/afrika-cup/startseite/pokalwettbewerb/AFCN" in fetch.calls
+    editions = [e for e in snapshot.editions if e.competition_id == "AFCN"]
+    assert len(editions) == 2
+
+
 def test_discovery_ignores_navbar_entries_that_every_page_repeats() -> None:
     afrika = (FIXTURES / "afrika.html").read_text(encoding="utf-8")
     navbar = (
