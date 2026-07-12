@@ -82,6 +82,50 @@ SEASON_STATS_HTML = """
 """
 
 
+# A relegation play-off page as FBref actually ships it: the event columns and
+# the player summary tables are published but carry no rows, while the team
+# stats are complete.  Bronze must read that as a source gap, not schema drift.
+EMPTY_PLAYOFF_MATCH_HTML = """
+<html><body>
+<div class="scorebox">
+  <div><strong><a href="/en/squads/11111111/Alpha">Alpha</a></strong></div>
+  <div><strong><a href="/en/squads/22222222/Beta">Beta</a></strong></div>
+</div>
+<div class="event a" id="a"></div>
+<div class="event b" id="b"></div>
+<div id="team_stats">
+  <table>
+    <tr><th colspan="2">Possession</th></tr>
+    <tr><td><strong>55%</strong></td><td><strong>45%</strong></td></tr>
+  </table>
+</div>
+<table id="stats_11111111_summary">
+  <thead><tr><th data-stat="player">Player</th></tr></thead>
+  <tbody></tbody>
+</table>
+<table id="stats_22222222_summary">
+  <thead><tr><th data-stat="player">Player</th></tr></thead>
+  <tbody></tbody>
+</table>
+</body></html>
+"""
+
+SCORED_EVENT_MATCH_HTML = """
+<html><body>
+<div class="scorebox">
+  <div><strong><a href="/en/squads/11111111/Alpha">Alpha</a></strong></div>
+  <div><strong><a href="/en/squads/22222222/Beta">Beta</a></strong></div>
+</div>
+<div id="events_wrap">
+  <div class="event a">
+    <div>34&#x2bc; &mdash; 1:0</div>
+    <div><a href="/en/players/33333333/A-Scorer">A Scorer</a></div>
+  </div>
+</div>
+</body></html>
+"""
+
+
 class RecordingManager:
     """In-memory description of Trino calls; it performs no external I/O."""
 
@@ -443,6 +487,91 @@ def test_explicit_empty_events_container_is_safe_empty() -> None:
 
     assert parsed.status == DatasetStatus.AVAILABLE
     assert parsed.datasets["match_events"].status == DatasetStatus.EMPTY
+
+
+@pytest.mark.unit
+def test_empty_event_columns_are_a_source_gap_not_schema_drift() -> None:
+    parsed = match_parser.parse_match_html(
+        EMPTY_PLAYOFF_MATCH_HTML,
+        match_id="5492b4b4",
+        league="GER-Bundesliga",
+        season=2017,
+        enabled_datasets={"match_events"},
+        require_player_contract=False,
+    )
+
+    assert parsed.status == DatasetStatus.AVAILABLE
+    assert parsed.datasets["match_events"].status == DatasetStatus.EMPTY
+
+
+@pytest.mark.unit
+def test_populated_event_column_that_parses_to_nothing_is_still_drift() -> None:
+    parsed = match_parser.parse_match_html(
+        SCORED_EVENT_MATCH_HTML,
+        match_id="scored-events",
+        league="GER-Bundesliga",
+        season=2017,
+        enabled_datasets={"match_events"},
+        require_player_contract=False,
+        parser_overrides={"match_events": lambda *_a, **_k: None},
+    )
+
+    assert parsed.datasets["match_events"].status == DatasetStatus.ERROR
+    assert parsed.datasets["match_events"].reason == "source_container_unparsed"
+
+
+@pytest.mark.unit
+def test_published_but_empty_player_tables_are_empty_not_a_contract_failure() -> None:
+    parsed = match_parser.parse_match_html(
+        EMPTY_PLAYOFF_MATCH_HTML,
+        match_id="5492b4b4",
+        league="GER-Bundesliga",
+        season=2017,
+        enabled_datasets={"match_player_stats", "match_team_stats"},
+        require_player_contract=True,
+    )
+
+    assert not parsed.has_errors
+    assert parsed.datasets["match_player_stats"].status == DatasetStatus.EMPTY
+    assert parsed.datasets["match_team_stats"].status == DatasetStatus.AVAILABLE
+
+
+@pytest.mark.unit
+def test_unpublished_player_tables_still_fail_the_required_contract() -> None:
+    parsed = match_parser.parse_match_html(
+        "<html><body><div id='team_stats'>Possession</div></body></html>",
+        match_id="no-player-tables",
+        league="GER-Bundesliga",
+        season=2017,
+        enabled_datasets={"match_player_stats"},
+        require_player_contract=True,
+    )
+
+    assert parsed.datasets["match_player_stats"].status == DatasetStatus.ERROR
+    assert (
+        parsed.datasets["match_player_stats"].reason
+        == "required_dataset_contract_failed"
+    )
+
+
+@pytest.mark.unit
+def test_populated_player_tables_that_parse_to_nothing_fail_the_contract() -> None:
+    html = gzip.decompress(MATCH_FIXTURE.read_bytes())
+    parsed = match_parser.parse_match_html(
+        html,
+        match_id="0701e218",
+        league="ENG-Premier League",
+        season=2025,
+        enabled_datasets={"match_player_stats"},
+        require_player_contract=True,
+        parser_overrides={"match_player_stats": lambda *_a, **_k: None},
+    )
+
+    assert parsed.datasets["match_player_stats"].status == DatasetStatus.ERROR
+    assert (
+        parsed.datasets["match_player_stats"].reason
+        == "required_dataset_contract_failed"
+    )
 
 
 @pytest.mark.unit
