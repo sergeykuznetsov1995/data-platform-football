@@ -1132,11 +1132,19 @@ def discover_registry(
                     f"enabled tournament {source_id} has an incomplete "
                     "season response"
                 ) from exc
-            raise DiscoveryHTTPError(
-                "incomplete season scan for tournament "
-                f"{source_id}: {exc}",
-                status_code=exc.status_code,
-            ) from exc
+            if exc.status_code == 404:
+                # The catalog legitimately lists tournaments the source has no
+                # season index for (e.g. 18789 "KNVB Beker, Women"). An empty
+                # season list is the honest source answer; it cannot be captured
+                # and stays inactivatable. Any other failure is still an
+                # incomplete scan.
+                seasons_payload = {"seasons": []}
+            else:
+                raise DiscoveryHTTPError(
+                    "incomplete season scan for tournament "
+                    f"{source_id}: {exc}",
+                    status_code=exc.status_code,
+                ) from exc
         seasons = parse_seasons_payload(
             seasons_payload,
             source_id,
