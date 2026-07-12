@@ -560,6 +560,7 @@ WITH (
         df: pd.DataFrame,
         batch_size: int = 1000,
         delete_filter: Optional[str] = None,
+        staging_id: Optional[str] = None,
     ) -> int:
         """
         Insert a DataFrame so the target table receives exactly ONE snapshot.
@@ -599,10 +600,35 @@ WITH (
             Number of rows inserted into the target
         """
         if df.empty:
-            logger.warning(f"Empty DataFrame, skipping insert to {schema}.{table}")
+            if not delete_filter:
+                logger.warning(
+                    f"Empty DataFrame, skipping insert to {schema}.{table}"
+                )
+                return 0
+
+            # An explicitly empty replacement is still a state change: the
+            # selected live rows must disappear. There is nothing to stage or
+            # merge, so this DELETE is the complete atomic replacement.
+            qualified_target = validate_catalog_qualified_name(
+                self.catalog, schema, table
+            )
+            self._execute(
+                f"DELETE FROM {qualified_target} WHERE {delete_filter}"
+            )
+            logger.info(
+                f"Replaced rows matching '{delete_filter}' with an empty "
+                f"dataset in {qualified_target}"
+            )
             return 0
 
-        stage = f"{table}__stg"  # matches _IDENTIFIER_RE
+        # Parallel ingestion shards must never share a predictable staging
+        # table. Existing callers retain the historical name; distributed
+        # callers pass a run/task/map/try/UUID-qualified token.
+        if staging_id:
+            validate_identifier(staging_id, "staging id")
+            stage = f"{table}__stg_{staging_id}"
+        else:
+            stage = f"{table}__stg"  # compatibility for existing callers
         qualified_target = validate_catalog_qualified_name(self.catalog, schema, table)
         qualified_stage = validate_catalog_qualified_name(self.catalog, schema, stage)
 

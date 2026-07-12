@@ -10,8 +10,7 @@ Scans every column in every `iceberg.bronze.*` table and flags:
 Usage (inside airflow-webserver container):
     python /opt/airflow/scripts/audit_bronze_columns.py --output /tmp/audit.md
 
-Uses `import trino` directly to skip the heavy scrapers/__init__.py
-(nodriver + selenium ~1.5GB RAM).
+Uses the lightweight Silver Trino helper and never imports scraper runtimes.
 """
 from __future__ import annotations
 
@@ -154,8 +153,8 @@ META_COLS = {'_source', '_entity_type', '_ingested_at', '_batch_id'}
 
 # Per-source parser "contract": minimal REQUIRED tables + columns each source's
 # scraper is expected to emit into bronze. Authored by reading the scraper class
-# (scrapers.* cannot be imported here — scrapers/__init__.py pulls nodriver +
-# selenium, ~1.5GB). Semantics: listed columns are the minimal required set; extra
+# without importing optional browser runtimes. Semantics: listed columns are the
+# minimal required set; extra
 # live columns are NOT errors. Used by the `--source` contract-diff mode.
 # #274 seeds espn only; other sources filled in #276-#286.
 EXPECTED_TABLES: dict[str, dict[str, set[str]]] = {
@@ -820,7 +819,6 @@ SEV_ORDER = {'ERROR': 0, 'WARN': 1, 'INFO': 2}
 
 def render_report(per_table: dict[str, tuple[int, list[dict]]], output: Path) -> None:
     total_tables = len(per_table)
-    total_cols_scanned = sum(len(set(f['col'] for f in fs)) for _, fs in per_table.values())
     err_findings = [f for _, fs in per_table.values() for f in fs if f['sev'] == 'ERROR']
     warn_findings = [f for _, fs in per_table.values() for f in fs if f['sev'] == 'WARN']
     info_findings = [f for _, fs in per_table.values() for f in fs if f['sev'] == 'INFO']

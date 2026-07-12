@@ -111,8 +111,8 @@ def _normalise_url_key(url: str) -> str:
     Groups repeated calls to one endpoint under a single key so the per-URL
     traffic counter (issue #616) stays bounded regardless of cache-busting
     query params (``?d=`` on WhoScored data, ``?r=&set=true`` on SoFIFA).
-    Mirrors ``nodriver_bypass._normalise_url_key`` but kept local so this light
-    client never imports the CDP / nodriver stack. Returns '' for falsy input.
+    Kept local so this lightweight client never imports a browser runtime.
+    Returns '' for falsy input.
     """
     if not url:
         return ""

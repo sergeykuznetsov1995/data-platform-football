@@ -8,11 +8,11 @@ table:
     season): зимний трансфер внутри лиги даёт по строке на каждый клуб (#463).
     Базовая таблица fbref_player_stats отфильтрована до вратарей
     (pos LIKE '%GK%') и склеена с fbref_keeper_keeper (вратарские метрики),
-    fbref_player_shooting и fbref_player_misc по (player_id, squad, league,
-    season). Каждый источник дедуплицируется через ROW_NUMBER ... ORDER BY
+    fbref_player_shooting и fbref_player_misc по восстановленному
+    (player_id, squad, league, season). Пустые source ID сначала разрешаются
+    через silver.fbref_player_identity; остаток получает стабильный noid_ ID
+    (#916). Каждый источник дедуплицируется через ROW_NUMBER ... ORDER BY
     _ingested_at DESC, _batch_id DESC до JOIN. Все числовые — TRY_CAST.
-    Идентификаторы сырые FBref (canonical-резолюция — в Gold; Gold-факты
-    схлопывают мульти-squad сезоны до клуба с максимумом минут).
   tags:
     - Tier.Silver
     - Domain.Football
@@ -23,7 +23,13 @@ columns:
     tags:
       - PII.Low
   - name: player_id
-    description: Сырой FBref player_id.
+    description: FBref player_id, восстановленный native ID либо стабильный noid_ ID.
+  - name: player_id_resolution
+    description: Способ разрешения ID — source_native, recovered_unique_native или synthetic_residual.
+  - name: player_id_is_synthetic
+    description: true, если source ID не удалось восстановить и применён noid_ ID.
+  - name: player_id_evidence_datasets
+    description: FBref datasets, подтвердившие выбранную идентичность.
   - name: nation
     description: Национальность игрока (код страны как на FBref).
     tags:

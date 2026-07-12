@@ -37,8 +37,8 @@ Run (inside airflow-scheduler — 4G; webserver 1G → Chrome OOM):
   docker compose exec airflow-scheduler \\
     python /opt/airflow/scripts/research/probe_sofascore_token_re.py --use-proxy
 
-Self-contained: imports DrissionPage via the platform's browser helper, never
-pulls scrapers/__init__ at module import (heavy nodriver/selenium stack).
+Self-contained: imports DrissionPage via the platform's browser helper and does
+not load unrelated scraper runtimes at module import.
 """
 from __future__ import annotations
 

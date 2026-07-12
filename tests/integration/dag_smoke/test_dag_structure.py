@@ -23,12 +23,15 @@ class TestDagStructure:
                 assert validate_tasks, \
                     f"DAG '{dag_id}' has no validate* task. Tasks: {task_ids}"
 
-    def test_validate_data_has_trigger_rule_all_done(self, dag_bag, ingestion_dag_ids):
+    def test_validate_tasks_follow_declared_failure_policy(
+        self, dag_bag, ingestion_dag_ids
+    ):
         """
-        Test that validate* tasks have trigger_rule='all_done'.
+        Legacy ingestion observers use ``all_done`` to report partial output.
 
-        This ensures validation runs even if scraping tasks fail,
-        allowing us to report partial results.
+        The durable FBref producer is deliberately fail-closed: its validation
+        is also the only parent of Silver, so running it after a red fetch or
+        persistence task could promote partial data.
         """
         for dag_id in ingestion_dag_ids:
             if dag_id in dag_bag.dags:
@@ -36,9 +39,14 @@ class TestDagStructure:
 
                 validate_tasks = [t for t in dag.tasks if t.task_id.startswith('validate')]
                 for validate_task in validate_tasks:
-                    assert validate_task.trigger_rule == 'all_done', \
+                    expected = (
+                        'all_success'
+                        if dag_id == 'dag_ingest_fbref'
+                        else 'all_done'
+                    )
+                    assert validate_task.trigger_rule == expected, \
                         f"DAG '{dag_id}' {validate_task.task_id} has trigger_rule=" \
-                        f"'{validate_task.trigger_rule}', should be 'all_done'"
+                        f"'{validate_task.trigger_rule}', should be '{expected}'"
 
     def test_dags_have_at_least_two_tasks(self, dag_bag, expected_dag_ids):
         """Test that all DAGs have at least 2 tasks."""
@@ -87,8 +95,7 @@ class TestDagStructure:
 
                 for task in dag.tasks:
                     timeout = task.execution_timeout
-                    # Default args should provide timeout
-                    # We don't strictly require it on every task
+                    assert timeout is None or timeout.total_seconds() > 0
 
 
 @pytest.mark.integration

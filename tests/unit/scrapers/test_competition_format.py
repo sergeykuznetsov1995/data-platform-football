@@ -118,15 +118,7 @@ class TestIsSingleYearCompetition:
 
 @pytest.mark.unit
 class TestSeasonFormatConsumers:
-    """The two format_season implementations must follow season_format from
-    competitions.yaml, not a league-name literal (#920 Phase 3)."""
-
-    def test_fbref_format_season_single_year(self, reload_medallion):
-        reload_medallion(env=None)
-        from scrapers.fbref.url_builder import format_season
-        assert format_season(2026, 'INT-World Cup') == '2026'
-        assert format_season(2024, 'ENG-Premier League') == '2024-2025'
-        assert format_season(2024) == '2024-2025'   # no league -> club form
+    """Configured consumers must follow competition season semantics."""
 
     def test_fotmob_format_season_single_year(self, reload_medallion):
         reload_medallion(env=None)
@@ -141,12 +133,10 @@ class TestSeasonFormatConsumers:
         # '2028-2029' page (the exact silent wrong-edition failure that
         # required onboarding to be code, not config).
         reload_medallion(env=None)
-        from scrapers.fbref.url_builder import format_season, get_schedule_url
-        assert format_season(2028, 'INT-European Championship') == '2028'
-        assert '/676/2028/' in get_schedule_url('INT-European Championship', 2028)
         from scrapers.utils.competition_format import (
             is_group_knockout, is_single_year, is_single_year_competition,
         )
+        assert is_single_year('INT-European Championship', 2028) is True
         assert is_single_year_competition('INT-Africa Cup of Nations') is True
         # Copa América: season_format resolvable even while the season is
         # inert (no start/end until CONMEBOL announces).
