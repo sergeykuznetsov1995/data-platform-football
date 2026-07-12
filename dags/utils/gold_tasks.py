@@ -16,10 +16,7 @@ import logging
 from typing import Any, Dict, List, Optional
 
 from utils.silver_tasks import (
-    _execute,
-    _get_trino_connection,
     _resolve_sql_path,
-    _validate_identifier,
     check_bronze_table_exists,
     run_silver_transform,
 )
@@ -202,7 +199,6 @@ def run_gold_partition_insert_wrapped(
         _build_silver_partition_filter,
         _execute,
         _get_trino_connection,
-        _resolve_sql_path,
         _validate_identifier,
     )
 
@@ -428,6 +424,8 @@ def _append_fct_standings_coverage_check(report) -> None:
 # below, NOT via _STAR_FACT_TABLES. #430 added fct_player_salary to the list and
 # moved market_value out of it (market_value dropped league/season). fct_event /
 # fct_match_rating are outside the 17-fact star design (own DQ in e3_dq/e4_dq).
+# Native Transfermarkt v2 also moved fct_transfer out: its global event grain
+# has event_season but deliberately carries no scrape league/season columns.
 # All thresholds carry their live baseline + measure date.
 # ---------------------------------------------------------------------------
 
@@ -445,7 +443,6 @@ _STAR_FACT_TABLES = [
     'gold.fct_team_season_stats',
     'gold.fct_standings',
     'gold.fct_manager_stint',
-    'gold.fct_transfer',
     'gold.fct_player_salary',
 ]
 
@@ -520,7 +517,11 @@ def _star_gate_league_season_fk_checks() -> List:
 
     ERROR severity: both dims render straight from configs/medallion YAMLs
     and facts carry the same partition slugs — an orphan means a config hole,
-    not a data wart. Baseline 2026-06-12: 0 orphans across all 14 facts.
+    not a data wart. Native ``fct_transfer`` has no scrape league/season. Its
+    nullable event-owned season is checked only inside the configured analytics
+    window: global career events older than ``dim_season`` are valid history,
+    and a separate always-passing row-count keeps that volume observable.
+    ``ref_integrity`` ignores NULL keys, preserving undated upcoming events.
     """
     from utils.data_quality import CHECK
 
@@ -529,6 +530,32 @@ def _star_gate_league_season_fk_checks() -> List:
           for t in _STAR_FACT_TABLES],
         *[CHECK.ref_integrity(t, 'gold.dim_season', 'season')
           for t in _STAR_FACT_TABLES],
+        CHECK.ref_integrity(
+            'gold.fct_transfer',
+            'gold.dim_season',
+            'event_season',
+            parent_key='season',
+            where=(
+                'event_season >= (SELECT MIN(season) '
+                'FROM iceberg.gold.dim_season) '
+                'AND event_season <= (SELECT MAX(season) '
+                'FROM iceberg.gold.dim_season)'
+            ),
+            name='star_fk[fct_transfer.event_season->dim_season in-window]',
+        ),
+        CHECK.row_count(
+            'gold.fct_transfer',
+            min_rows=0,
+            where=(
+                'event_season IS NOT NULL AND ('
+                'event_season < (SELECT MIN(season) '
+                'FROM iceberg.gold.dim_season) OR '
+                'event_season > (SELECT MAX(season) '
+                'FROM iceberg.gold.dim_season))'
+            ),
+            severity='WARNING',
+            name='star_observability[fct_transfer.event_season out-of-window]',
+        ),
     ]
 
 
@@ -778,6 +805,78 @@ def build_star_gate_checks() -> List:
         + _star_gate_dim_fk_checks()
         + _star_gate_grain_checks()
     )
+
+
+def _fct_transfer_quality_checks() -> List:
+    """Canonical native-v2 contract for global Transfermarkt events.
+
+    ``transfer_id`` is the stable event key.  ``transfer_date``,
+    ``event_season`` and either club side may legitimately be NULL on an
+    announced/upcoming event, so they are not global NOT NULL columns.  The
+    soft dimension FKs deliberately retain their established WARNING-only
+    orphan-rate thresholds.
+    """
+    from utils.data_quality import CHECK
+
+    return [
+        CHECK.no_duplicates(
+            'gold.fct_transfer',
+            pk=['transfer_id'],
+        ),
+        # Bootstrap rows use a deterministic compatibility hash while a later
+        # CEAPI refresh may expose a source transfer id.  Those identifiers
+        # can differ for the same real-world event, so PK uniqueness alone is
+        # insufficient: fail cutover/runtime DQ if both identities survive.
+        # Mutable fee/value/upcoming fields are deliberately excluded.
+        CHECK.no_duplicates(
+            'gold.fct_transfer',
+            pk=[
+                'player_id', 'transfer_date', 'event_season',
+                'from_team_id', 'to_team_id',
+            ],
+            name='semantic_duplicates[fct_transfer_event_identity]',
+        ),
+        CHECK.no_nulls(
+            'gold.fct_transfer',
+            cols=['transfer_id', 'player_id', 'is_loan', 'is_upcoming'],
+        ),
+        # #432: rate thresholds replace the absolute orphan_players row_count
+        # proxy. player_id: a historized fct_transfer (#788) references players
+        # outside the current dim_player FBref-spine (left the league + non-spine
+        # clubs). #814: the #712 rebuild first surfaced this at 97.6% orphan; the
+        # #788 TM alias-fix + two-pass resolver cut it to 43.7% live (gradient
+        # 2526=10.3% → 1920=57.1%, aggregate pulled up by history). WARNING-only
+        # (never escalate). warn 0.55 re-baselined for historized transfers (was
+        # 0.27, current-season era): passes the honest historical orphan, still
+        # alerts on a regression back toward the resolver-gap state. Full
+        # player-spine historization = #825; orphan share tracked in #815.
+        CHECK.ref_integrity(
+            'gold.fct_transfer',
+            'gold.dim_player',
+            'player_id',
+            warn_rate=0.55,
+            severity='WARNING',
+        ),
+        # Foreign clubs are legitimately outside dim_team.  These established
+        # WARNING-only ceilings alert on a total bridge break without making
+        # nullable event sides a global completeness requirement.
+        CHECK.ref_integrity(
+            'gold.fct_transfer',
+            'gold.dim_team',
+            'from_team_id',
+            parent_key='team_id',
+            warn_rate=0.90,
+            severity='WARNING',
+        ),
+        CHECK.ref_integrity(
+            'gold.fct_transfer',
+            'gold.dim_team',
+            'to_team_id',
+            parent_key='team_id',
+            warn_rate=0.90,
+            severity='WARNING',
+        ),
+    ]
 
 
 def validate_gold_quality() -> Dict[str, Any]:
@@ -1126,43 +1225,10 @@ def validate_gold_quality() -> Dict[str, Any]:
                             'team_id'),
 
         # ============================================================
-        # #429: fct_transfer — player transfers, pure projection of
-        # silver.transfermarkt_transfers. Orphan rows are KEPT with
-        # 'tm_'-prefixed ids (≈18% players, most clubs) — FK checks to
-        # dims are therefore WARNING-severity (dim_match referee/venue
-        # precedent), and the orphan share itself is monitored below.
+        # Native-v2 fct_transfer is global event history keyed by transfer_id.
+        # Upcoming events may not yet have a date or either club side.
         # ============================================================
-        CHECK.no_duplicates(
-            'gold.fct_transfer',
-            pk=['player_id', 'transfer_date', 'from_team_id', 'to_team_id'],
-        ),
-        CHECK.no_nulls(
-            'gold.fct_transfer',
-            cols=['player_id', 'transfer_date', 'from_team_id', 'to_team_id',
-                  'is_loan', 'is_upcoming'],
-        ),
-        # #432: rate thresholds replace the absolute orphan_players row_count
-        # proxy. player_id: a historized fct_transfer (#788) references players
-        # outside the current dim_player FBref-spine (left the league + non-spine
-        # clubs). #814: the #712 rebuild first surfaced this at 97.6% orphan; the
-        # #788 TM alias-fix + two-pass resolver cut it to 43.7% live (gradient
-        # 2526=10.3% → 1920=57.1%, aggregate pulled up by history). WARNING-only
-        # (never escalate). warn 0.55 re-baselined for historized transfers (was
-        # 0.27, current-season era): passes the honest historical orphan, still
-        # alerts on a regression back toward the resolver-gap state. Full
-        # player-spine historization = #825; orphan share tracked in #815.
-        CHECK.ref_integrity('gold.fct_transfer', 'gold.dim_player',
-                            'player_id', warn_rate=0.55,
-                            severity='WARNING'),
-        # from/to team: foreign clubs are legitimately outside dim_team —
-        # baseline 82%/69% orphans. warn 0.90 only alerts on a total break
-        # (no error_rate: never escalate).
-        CHECK.ref_integrity('gold.fct_transfer', 'gold.dim_team',
-                            'from_team_id', parent_key='team_id',
-                            warn_rate=0.90, severity='WARNING'),
-        CHECK.ref_integrity('gold.fct_transfer', 'gold.dim_team',
-                            'to_team_id', parent_key='team_id',
-                            warn_rate=0.90, severity='WARNING'),
+        *_fct_transfer_quality_checks(),
 
         # ============================================================
         # #425: dim_match — soft FK to every star dim. Team / referee / venue
@@ -2140,7 +2206,7 @@ def validate_gold_row_counts() -> Dict[str, Any]:
     if report.errors:
         from airflow.exceptions import AirflowException
         raise AirflowException(
-            f"Gold row counts below threshold: "
+            "Gold row counts below threshold: "
             + "; ".join(f"{r.name}: {r.details}" for r in report.errors[:5])
         )
     return {'results': [(r.name, r.value, r.passed) for r in report.results]}

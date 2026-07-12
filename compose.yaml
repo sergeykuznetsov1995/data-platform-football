@@ -32,6 +32,7 @@ x-airflow-common: &airflow-common
     AIRFLOW__WEBSERVER__EXPOSE_CONFIG: ${AIRFLOW__WEBSERVER__EXPOSE_CONFIG}
     TRINO_PASSWORD: ${TRINO_PASSWORD}
     TRINO_PORT: ${TRINO_PORT}
+    TRINO_HOST: ${TRINO_HOST:-trino}
     # Raw-first FBref pages share the existing SeaweedFS bucket but live
     # outside Iceberg table prefixes. The parser uses pyarrow.fs directly.
     S3_ACCESS_KEY: ${S3_ACCESS_KEY}
@@ -46,12 +47,41 @@ x-airflow-common: &airflow-common
     SOFASCORE_PROXY_CONTROL_TOKEN: ${SOFASCORE_PROXY_CONTROL_TOKEN:-}
     SOFASCORE_PROXY_LEASE_TTL_SECONDS: ${SOFASCORE_PROXY_LEASE_TTL_SECONDS:-3600}
     PROXY_FILTER_SOFASCORE_CANARY_HARD_CAP_BYTES: ${PROXY_FILTER_SOFASCORE_CANARY_HARD_CAP_BYTES:-0}
+    WHOSCORED_RAW_STORE_URI: s3://${ICEBERG_WAREHOUSE}/raw/whoscored
+    WHOSCORED_RAW_S3_ENDPOINT: seaweedfs:8333
+    WHOSCORED_RAW_S3_SCHEME: http
+    # WhoScored V2 uses this endpoint only after two classified direct
+    # Cloudflare failures.  PROXY_FILTER_URL remains the legacy always-proxy
+    # toggle and is deliberately not reused here.
+    # The authenticated data plane is separate from the lease control plane.
+    # Keeping the fallback URL on 8900 makes a missing/malformed control-plane
+    # response fail closed instead of falling back to the legacy no-auth port.
+    WHOSCORED_PAID_PROXY_URL: ${WHOSCORED_PAID_PROXY_URL:-http://proxy_filter:8900}
+    WHOSCORED_PROXY_CONTROL_URL: ${WHOSCORED_PROXY_CONTROL_URL:-http://proxy_filter:8899}
+    WHOSCORED_REQUEST_LEDGER_PATH: /opt/airflow/logs/whoscored/request_ledger.jsonl
+    WHOSCORED_LOCK_DIR: /opt/airflow/logs/whoscored/commit_locks
+    WHOSCORED_RAW_LOCK_DIR: /opt/airflow/logs/whoscored/raw_locks
+    WHOSCORED_RAW_LOCK_TIMEOUT_SECONDS: ${WHOSCORED_RAW_LOCK_TIMEOUT_SECONDS:-55}
+    WHOSCORED_STRUCTURED_REQUESTS_PER_MINUTE: ${WHOSCORED_STRUCTURED_REQUESTS_PER_MINUTE:-60}
+    # Single catalog task, source requests only; hard-capped to 60 with burst 4.
+    WHOSCORED_CATALOG_REQUESTS_PER_MINUTE: ${WHOSCORED_CATALOG_REQUESTS_PER_MINUTE:-60}
+    # Transfermarkt stays disabled and cannot acquire an unmanaged proxy until
+    # an operator supplies the separately approved paid/write packet.
+    TM_NATIVE_V2_ENABLED: ${TM_NATIVE_V2_ENABLED:-false}
+    TM_PROXY_CONTROL_URL: ${TM_PROXY_CONTROL_URL:-}
+    TM_REQUIRE_METERED_PROXY: ${TM_REQUIRE_METERED_PROXY:-false}
+    TM_PROXY_LEASE_TTL_SECONDS: ${TM_PROXY_LEASE_TTL_SECONDS:-3600}
     FBREF_RAW_S3_ENDPOINT: seaweedfs:8333
     FBREF_RAW_S3_SCHEME: http
     # Versioned SofaScore discovery registry. Discovery runs outside Airflow;
     # workers only consume explicitly activated entries from this read-only
     # file, so a newly discovered tournament cannot create DAG tasks by itself.
     SOFASCORE_REGISTRY_PATH: /opt/airflow/configs/sofascore/tournaments.json
+    # Source-native FotMob JSON uses the same durable raw-first layout.  The
+    # HTTP transport is direct-only; these variables configure storage only.
+    FOTMOB_RAW_STORE_URI: s3://${ICEBERG_WAREHOUSE}/raw/fotmob
+    FOTMOB_RAW_S3_ENDPOINT: seaweedfs:8333
+    FOTMOB_RAW_S3_SCHEME: http
     # Route FlareSolverr scrapers (WhoScored/SoFIFA) through the ad-tech filter (#652).
     # Off by default — set to http://proxy_filter:8899 to cut residential traffic.
     PROXY_FILTER_URL: ${PROXY_FILTER_URL:-}
@@ -365,6 +395,14 @@ services:
         # two browser/FlareSolverr scrapers at once exhaust VM swap → scheduler
         # stalls → live tasks get orphan-reset (#671). Idempotent (create/update).
         airflow pools set 'ingest_scraper_pool' 1 'Serialize heavy ingest scrapers to avoid VM swap (#671)'
+        # FotMob is lightweight direct HTTP.  A separate bounded pool prevents
+        # browser scrapers from serializing it while limiting source fan-out.
+        airflow pools set 'fotmob_http_pool' 4 'Bounded direct FotMob HTTP work'
+        # WhoScored daily scopes use one slot each; the resumable backfill
+        # deliberately consumes both slots so it cannot overlap a daily run.
+        # `pools set` is an idempotent create/update operation on fresh and
+        # already-initialised Airflow metadata databases.
+        airflow pools set 'whoscored_direct_pool' 2 'WhoScored direct-only scopes; backfill consumes both slots'
         echo "Airflow initialization complete"
     environment:
       <<: *airflow-common-env
@@ -374,6 +412,14 @@ services:
 
   airflow-scheduler:
     <<: *airflow-common
+    # The live scheduler runtime is Airflow 2.11.2.  Use the narrow
+    # Transfermarkt overlay so a future `compose build airflow-scheduler`
+    # cannot fall back to the repository's older full-image Dockerfile.
+    build:
+      context: ./docker/images/airflow
+      dockerfile: Dockerfile.transfermarkt-runtime
+      args:
+        AIRFLOW_RUNTIME_BASE: ${AIRFLOW_RUNTIME_BASE:-data-platform-airflow-webserver:latest}
     container_name: airflow-scheduler
     command: scheduler
     depends_on:
@@ -417,8 +463,7 @@ services:
       # SSO через Keycloak (webserver_config.py); false = обычная форма логина
       AIRFLOW_OAUTH_ENABLED: ${AIRFLOW_OAUTH_ENABLED:-false}
       AIRFLOW_OIDC_CLIENT_SECRET: ${AIRFLOW_OIDC_CLIENT_SECRET:-}
-      # OIDC_ISSUER в .env переопределяет tailnet-дефолт (гибрид: auth.<домен>)
-      OIDC_ISSUER: ${OIDC_ISSUER:-https://${TS_HOSTNAME:-unset}:8443/realms/football}
+      OIDC_ISSUER: ${OIDC_ISSUER:?}
       # За Caddy: доверять X-Forwarded-* (иначе redirect_uri будет http://)
       AIRFLOW__WEBSERVER__ENABLE_PROXY_FIX: "true"
       # 2 gunicorn-воркера по ~550MB RSS (с SSO) — в 1G ловили memcg-OOM
@@ -465,7 +510,7 @@ services:
       - S3_SECRET_KEY=${S3_SECRET_KEY}
       # OAuth2 (SSO людей через Keycloak; машинные аккаунты — по-прежнему password.db)
       - TRINO_OIDC_CLIENT_SECRET=${TRINO_OIDC_CLIENT_SECRET}
-      - TRINO_OAUTH2_ISSUER=${OIDC_ISSUER:-https://${TS_HOSTNAME}:8443/realms/football}
+      - TRINO_OAUTH2_ISSUER=${OIDC_ISSUER:?}
       # Фикс. ключ шифрования refresh-токенов (иначе рестарт Trino разлогинивает людей)
       - TRINO_OAUTH2_REFRESH_KEY=${TRINO_OAUTH2_REFRESH_KEY}
     ports:
@@ -546,8 +591,7 @@ services:
       # SSO через Keycloak (superset_config.py); false = обычная форма логина
       SUPERSET_OAUTH_ENABLED: ${SUPERSET_OAUTH_ENABLED:-false}
       SUPERSET_OIDC_CLIENT_SECRET: ${SUPERSET_OIDC_CLIENT_SECRET:-}
-      # OIDC_ISSUER в .env переопределяет tailnet-дефолт (гибрид: auth.<домен>)
-      OIDC_ISSUER: ${OIDC_ISSUER:-https://${TS_HOSTNAME:-unset}:8443/realms/football}
+      OIDC_ISSUER: ${OIDC_ISSUER:?}
       # ~100 юзеров (issue #861): дефолт образа — 1 gunicorn-воркер.
       # 4 воркера x gthread; лимит памяти ниже поднят 1500M -> 3G
       # (правило #847: воркеры ~400-500M RSS каждый, тихий memcg-OOM)
@@ -750,16 +794,62 @@ services:
       ELASTICSEARCH_USER: ""
       ELASTICSEARCH_PASSWORD: ""
       SEARCH_TYPE: opensearch
-      # Authentication / Authorization (basic auth, single admin)
-      AUTHENTICATION_PROVIDER: basic
-      AUTHENTICATION_AUTHORITY: https://accounts.google.com
+      # Authentication / Authorization.
+      # ВАЖНО: OM 1.13 читает эти значения только при первом старте (пустая
+      # таблица openmetadata_settings), дальше конфиг живёт в БД. На живом
+      # сервере провайдер переключает scripts/om_apply_security_config.py
+      # (штатный PUT /api/v1/system/security/config), а env здесь — источник
+      # истины для чистых стендов и для ОТКАТА: снёс строки настроек в БД →
+      # сервер пересоздал конфиг отсюда (см. configs/openmetadata/README.md).
+      # Дефолты ${VAR:-…} = basic-режим (один локальный админ) — это и есть
+      # break-glass.
+      # SSO-режим (Keycloak, custom-oidc, #866): секция «OpenMetadata SSO»
+      # в .env.example; cutover-ранбук — configs/openmetadata/README.md.
+      # Имена env сверены с conf/openmetadata.yaml образа 1.13.1.
+      AUTHENTICATION_PROVIDER: ${OM_AUTH_PROVIDER:-basic}
+      AUTHENTICATION_CLIENT_TYPE: ${OM_AUTH_CLIENT_TYPE:-public}
+      AUTHENTICATION_AUTHORITY: ${OM_AUTH_AUTHORITY:-https://accounts.google.com}
+      AUTHENTICATION_CLIENT_ID: ${OM_AUTH_CLIENT_ID:-}
+      AUTHENTICATION_CALLBACK_URL: ${OM_AUTH_CALLBACK_URL:-}
+      # В SSO-режиме список ОБЯЗАН содержать и собственный JWKS OM
+      # (http://localhost:8585/api/v1/system/config/jwks) — иначе бот-JWT
+      # ingestion-контура перестанут валидироваться и каталог замрёт.
+      AUTHENTICATION_PUBLIC_KEYS: "${OM_AUTH_PUBLIC_KEYS:-[http://localhost:8585/api/v1/system/config/jwks]}"
+      # false = входят только заведённые админом юзеры. В Keycloak открыта
+      # саморегистрация (defaultGroup viewers) — «есть KC-аккаунт» не должно
+      # означать «допущен в каталог».
+      AUTHENTICATION_ENABLE_SELF_SIGNUP: ${OM_AUTH_ENABLE_SELF_SIGNUP:-true}
+      # preferred_username первым: principal = KC-username (иначе local-part
+      # email, и OM_ADMIN_PRINCIPALS не совпадёт с юзером).
+      AUTHENTICATION_JWT_PRINCIPAL_CLAIMS: "${OM_AUTH_PRINCIPAL_CLAIMS:-[email,preferred_username,sub]}"
+      CUSTOM_OIDC_AUTHENTICATION_PROVIDER_NAME: ${OM_AUTH_PROVIDER_NAME:-}
+      # oidcConfiguration — confidential client (authorization-code flow)
+      OIDC_CLIENT_ID: ${OM_AUTH_CLIENT_ID:-}
+      OIDC_CLIENT_SECRET: ${OPENMETADATA_OIDC_CLIENT_SECRET:-}
+      OIDC_TYPE: ${OM_AUTH_PROVIDER_NAME:-}
+      OIDC_DISCOVERY_URI: ${OM_OIDC_DISCOVERY_URI:-}
+      OIDC_CALLBACK: ${OM_AUTH_CALLBACK_URL:-http://localhost:8585/callback}
+      OIDC_SERVER_URL: ${OM_PUBLIC_URL:-http://localhost:8585}
+      # Дефолт образа — "consent"; если Keycloak-логин спотыкается о
+      # prompt=consent, выставить OM_OIDC_PROMPT_TYPE= (пусто) в .env.
+      OIDC_PROMPT_TYPE: ${OM_OIDC_PROMPT_TYPE:-consent}
       AUTHORIZER_CLASS_NAME: org.openmetadata.service.security.DefaultAuthorizer
       AUTHORIZER_REQUEST_FILTER: org.openmetadata.service.security.JwtFilter
-      AUTHORIZER_ADMIN_PRINCIPALS: "[admin]"
+      # OM OSS не маппит OIDC-группы в роли: админы перечисляются здесь
+      # (KC-username), остальные — обычные юзеры.
+      AUTHORIZER_ADMIN_PRINCIPALS: "${OM_ADMIN_PRINCIPALS:-[admin]}"
       AUTHORIZER_PRINCIPAL_DOMAIN: openmetadata.org
       AUTHORIZER_INGESTION_PRINCIPALS: "[ingestion-bot]"
       AUTHORIZER_ENFORCE_PRINCIPAL_DOMAIN: "false"
       AUTHORIZER_ENABLE_SECURE_SOCKET_CONNECTION: "false"
+      # Ключи подписи бот-JWT. Дефолт = keypair, зашитый в образ и публично
+      # известный (kid Gb389a-…) — годится только для локалки. Перед публикацией
+      # meta наружу: make gen-om-jwt-keys + OM_RSA_*/OM_JWT_* в .env.
+      # Ротация ключей инвалидирует ВСЕ бот-токены (OM_JWT_TOKEN перевыпустить).
+      RSA_PUBLIC_KEY_FILE_PATH: ${OM_RSA_PUBLIC_KEY_FILE_PATH:-./conf/public_key.der}
+      RSA_PRIVATE_KEY_FILE_PATH: ${OM_RSA_PRIVATE_KEY_FILE_PATH:-./conf/private_key.der}
+      JWT_ISSUER: ${OM_JWT_ISSUER:-open-metadata.org}
+      JWT_KEY_ID: ${OM_JWT_KEY_ID:-Gb389a-9f76-gdjs-a92j-0242bk94356}
       # Server
       OPENMETADATA_CLUSTER_NAME: openmetadata
       SERVER_PORT: 8585
@@ -767,6 +857,10 @@ services:
       LOG_LEVEL: INFO
       # Migrations on startup
       MIGRATION_LIMIT_PARAM: 1200
+    volumes:
+      # RSA-ключи бот-JWT (gitignored, make gen-om-jwt-keys). Пустой каталог
+      # безвреден, пока OM_RSA_* в .env не указывают внутрь него.
+      - ./configs/openmetadata/jwtkeys:/etc/openmetadata/jwtkeys:ro
     restart: "no"
 
   openmetadata-server:
@@ -798,6 +892,9 @@ services:
       - "127.0.0.1:8586:8586"
     environment:
       <<: *openmetadata-env
+    volumes:
+      # RSA-ключи бот-JWT (gitignored, make gen-om-jwt-keys) — см. openmetadata-migrate.
+      - ./configs/openmetadata/jwtkeys:/etc/openmetadata/jwtkeys:ro
     restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://localhost:8586/healthcheck | grep -q '\"healthy\":true' || exit 1"]
@@ -862,6 +959,13 @@ services:
   flaresolverr:
     image: ghcr.io/flaresolverr/flaresolverr:v3.4.6
     container_name: flaresolverr
+    # Stock FlareSolverr cannot issue WhoScored's same-origin statistics XHR.
+    # This entrypoint preserves the upstream API and adds fixed, allow-listed
+    # /v1/xhr and bounded /v1/xhr/batch routes; neither exposes arbitrary
+    # browser automation.
+    command: ["/usr/local/bin/python", "-u", "/app/flaresolverr_extended.py"]
+    volumes:
+      - ./scripts/flaresolverr_extended.py:/app/flaresolverr_extended.py:ro
     restart: unless-stopped
     security_opt:
       - no-new-privileges:true
@@ -924,6 +1028,10 @@ services:
     environment:
       PYTHONPATH: /opt/airflow
       PROXY_FILTER_CONTROL_TOKEN: ${SOFASCORE_PROXY_CONTROL_TOKEN:-}
+      # Secret JSON is injected at runtime. The service fails closed when it is
+      # blank; the legacy file is intentionally not mounted into this container.
+      PROXY_POOL_JSON: ${PROXY_POOL_JSON:-}
+      PROXY_FILTER_ALLOW_FILE_FALLBACK: ${PROXY_FILTER_ALLOW_FILE_FALLBACK:-false}
     command:
       - python
       - /opt/airflow/scripts/proxy_filter/filter_proxy.py
@@ -963,10 +1071,12 @@ services:
       - ./dags:/opt/airflow/dags:ro
       - ./scripts:/opt/airflow/scripts
       - ./scrapers:/opt/airflow/scrapers
-      - ./proxys.txt:/opt/airflow/proxys.txt:ro
       - ./configs/medallion:/opt/airflow/configs/medallion:ro
       - ./configs/proxy_filter:/opt/airflow/configs/proxy_filter:ro
       - ./configs/sofascore:/opt/airflow/configs/sofascore:ro
+      # Mount the already writable Airflow log root. Mounting a missing host
+      # subdirectory directly makes Docker create it as root:root, while this
+      # image intentionally runs as the unprivileged airflow user.
       - ./logs:/opt/airflow/logs
     healthcheck:
       test: ["CMD", "curl", "--fail", "--silent", "http://localhost:8899/health"]
@@ -986,10 +1096,11 @@ services:
       - backend
 
   # ---------------------------------------------------------------------------
-  # Caddy: вход для аналитиков через tailnet (docs/design/analyst-access.md).
-  # Порты публикуются ТОЛЬКО на ${TS_IP} (tailscale-интерфейс) — из интернета
-  # недоступно; все 127.0.0.1-биндинги сервисов остаются для SSH-туннелей.
-  # Alias = tailnet-FQDN: контейнеры резолвят тот же URL, что и ноутбуки (OIDC).
+  # Caddy: публичный вход платформы (docs/design/analyst-access.md).
+  # Все сайты на ${PUBLIC_IP}:443 за Keycloak SSO; OpenMetadata не публикуется,
+  # все 127.0.0.1-биндинги сервисов остаются для SSH-туннелей.
+  # Alias'ы auth./trino.<домен>: контейнеры (backchannel OIDC, ноутбуки)
+  # резолвят публичные имена прямо в Caddy без hairpin через интернет.
   # ---------------------------------------------------------------------------
   caddy:
     image: caddy:2.10-alpine
@@ -1004,31 +1115,25 @@ services:
     networks:
       frontend:
         aliases:
-          - ${TS_HOSTNAME:-caddy-alias-unset}
-          # Гибрид: контейнеры резолвят публичные имена в Caddy (issuer/Trino)
+          # Контейнеры резолвят публичные имена в Caddy (issuer/Trino)
           - auth.${PLATFORM_DOMAIN:-platform-domain-unset}
           - trino.${PLATFORM_DOMAIN:-platform-domain-unset}
       # В сети ноутбуков Caddy — единственный «выход наружу»: через его alias
-      # юзер-контейнеры ходят в Trino (:8444) и Keycloak (:8443)
+      # юзер-контейнеры ходят в Trino и Keycloak (:443)
       analyst:
         aliases:
-          - ${TS_HOSTNAME:-caddy-alias-unset}
           - auth.${PLATFORM_DOMAIN:-platform-domain-unset}
           - trino.${PLATFORM_DOMAIN:-platform-domain-unset}
     ports:
-      # Гибрид (bind-изоляция, docs/HEADSCALE_MIGRATION.md):
-      # публичный вход на PUBLIC_IP (listener :443 = bi/auth/hs) + ACME :80;
-      # VPN-вход на TS_IP:443 -> контейнерный :8443 (listener VPN-сайтов).
-      # Гейт «кто куда» = какой хостовый IP, а не remote_ip (docker подменяет src).
+      # Публичный вход на PUBLIC_IP (listener :443, все сайты) + ACME :80.
       - "${PUBLIC_IP:?PUBLIC_IP not set}:80:80"
       - "${PUBLIC_IP:?}:443:443"
-      - "${TS_IP:?TS_IP not set — tailscale ip -4}:443:8443"
     environment:
-      TS_HOSTNAME: ${TS_HOSTNAME:?TS_HOSTNAME not set — tailscale status --json .Self.DNSName}
       PLATFORM_DOMAIN: ${PLATFORM_DOMAIN:-platform-domain-unset}
     volumes:
       - ./configs/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
-      - /var/run/tailscale/tailscaled.sock:/var/run/tailscale/tailscaled.sock
+      # JSON access-log для fail2ban на хосте (configs/fail2ban/)
+      - /var/log/caddy:/var/log/caddy
       - caddy_data:/data
       - caddy_config:/config
     restart: unless-stopped
@@ -1078,8 +1183,11 @@ services:
       KC_DB_URL: jdbc:postgresql://postgres:5432/keycloak
       KC_DB_USERNAME: keycloak
       KC_DB_PASSWORD: ${KEYCLOAK_DB_PASSWORD:?}
-      # KC_PUBLIC_URL в .env переопределяет tailnet-дефолт (гибрид: https://auth.<домен>)
-      KC_HOSTNAME: ${KC_PUBLIC_URL:-https://${TS_HOSTNAME:?}:8443}
+      KC_HOSTNAME: ${KC_PUBLIC_URL:?KC_PUBLIC_URL not set — https://auth.<домен>}
+      # Админ-консоль (и её OIDC-флоу в master realm) живёт на localhost-бинде:
+      # снаружи /admin и /realms/master закрыты Caddy (403), админ ходит через
+      # SSH-туннель `ssh -L 8180:127.0.0.1:8180 <VM>`.
+      KC_HOSTNAME_ADMIN: http://127.0.0.1:8180
       KC_HTTP_ENABLED: "true"
       KC_PROXY_HEADERS: xforwarded
       KC_HEALTH_ENABLED: "true"
@@ -1125,15 +1233,13 @@ services:
       - frontend
       - analyst
     environment:
-      TS_HOSTNAME: ${TS_HOSTNAME:?}
-      OIDC_ISSUER: ${OIDC_ISSUER:-https://${TS_HOSTNAME:?}:8443/realms/football}
+      OIDC_ISSUER: ${OIDC_ISSUER:?}
       JUPYTERHUB_OIDC_CLIENT_SECRET: ${JUPYTERHUB_OIDC_CLIENT_SECRET:?}
       TRINO_ANALYST_SVC_PASSWORD: ${TRINO_ANALYST_SVC_PASSWORD:?}
-      # Гибрид (docs/HEADSCALE_MIGRATION.md): свой hostname хаба и адрес Trino
-      # для ноутбуков; пусто = tailnet-дефолты (TS_HOSTNAME / :8444)
-      JUPYTER_PUBLIC_HOST: ${JUPYTER_PUBLIC_HOST:-}
-      TRINO_PUBLIC_HOST: ${TRINO_PUBLIC_HOST:-}
-      TRINO_PUBLIC_PORT: ${TRINO_PUBLIC_PORT:-8444}
+      # Публичные FQDN хаба и Trino для ноутбуков (порт 443 — listener Caddy)
+      JUPYTER_PUBLIC_HOST: ${JUPYTER_PUBLIC_HOST:?}
+      TRINO_PUBLIC_HOST: ${TRINO_PUBLIC_HOST:?}
+      TRINO_PUBLIC_PORT: ${TRINO_PUBLIC_PORT:-443}
     command: ["jupyterhub", "-f", "/srv/jupyterhub/jupyterhub_config.py"]
     volumes:
       - ./configs/jupyterhub/jupyterhub_config.py:/srv/jupyterhub/jupyterhub_config.py:ro
@@ -1152,46 +1258,6 @@ services:
           memory: 512M
         reservations:
           memory: 128M
-
-  # ---------------------------------------------------------------------------
-  # Headscale: self-hosted control-plane VPN (docs/HEADSCALE_MIGRATION.md).
-  # Под профилем `headscale` — НЕ стартует, пока в .env нет
-  # COMPOSE_PROFILES=headscale (активация на cutover, нужен домен).
-  # Перед стартом: make render-headscale-config (иначе docker создаст ПАПКУ
-  # вместо config.yaml — та же гоча, что у realm-football.json).
-  # Клиенты ходят на https://hs.<домен> через Caddy; STUN — напрямую (3478/udp).
-  # ---------------------------------------------------------------------------
-  headscale:
-    image: headscale/headscale:0.29.2
-    container_name: headscale
-    hostname: headscale
-    profiles: ["headscale"]
-    command: ["serve"]
-    security_opt:
-      - no-new-privileges:true
-    cap_drop:
-      - ALL
-    networks:
-      - frontend
-    ports:
-      - "3478:3478/udp"
-    volumes:
-      - ./configs/headscale/config.yaml:/etc/headscale/config.yaml:ro
-      - headscale_data:/var/lib/headscale
-    restart: unless-stopped
-    healthcheck:
-      # образ distroless (нет shell) — проверка встроенной командой
-      test: ["CMD", "headscale", "health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 15s
-    deploy:
-      resources:
-        limits:
-          memory: 256M
-        reservations:
-          memory: 64M
 
 # =============================================================================
 # Networks
@@ -1237,5 +1303,3 @@ volumes:
     name: caddy_config
   jupyterhub_data:
     name: jupyterhub_data
-  headscale_data:
-    name: headscale_data

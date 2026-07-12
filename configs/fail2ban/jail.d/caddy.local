@@ -1,0 +1,26 @@
+# fail2ban для публичного ingress Caddy (деплой: cp в /etc/fail2ban/,
+# фильтры — в /etc/fail2ban/filter.d/; см. docs/ANALYST_ONBOARDING.md).
+# Трафик к docker-published портам идёт через FORWARD, а не INPUT —
+# баны обязаны вставляться в цепочку DOCKER-USER, иначе не работают.
+[DEFAULT]
+# 172.16/12 — docker bridge: OIDC-backchannel контейнеров ходит на
+# auth.<домен> через caddy-alias с этих адресов — банить нельзя.
+# 159.195.193.250 — сама VM (hairpin-проверки).
+ignoreip = 127.0.0.1/8 ::1 172.16.0.0/12 159.195.193.250
+banaction = iptables-allports[chain="DOCKER-USER"]
+
+[caddy-4xx]
+enabled  = true
+logpath  = /var/log/caddy/access.log
+filter   = caddy-4xx
+maxretry = 15
+findtime = 120
+bantime  = 3600
+
+[caddy-kc-login]
+enabled  = true
+logpath  = /var/log/caddy/access.log
+filter   = caddy-kc-login
+maxretry = 12
+findtime = 300
+bantime  = 7200

@@ -5,7 +5,8 @@
 -- One row per (match_id, team, ws_player_id).
 --
 -- Sources:
---   iceberg.bronze.whoscored_missing_players  (mp)
+--   iceberg.bronze.whoscored_missing_players_current  (mp; latest successful
+--                                                       preview batch per game)
 --   iceberg.bronze.whoscored_schedule         (s)  — joined for match_date
 --
 -- Architectural filters (D3 + D5):
@@ -37,7 +38,7 @@ WITH mp_dedup AS (
             PARTITION BY mp.game, mp.team, mp.player_id
             ORDER BY mp._ingested_at DESC
         ) AS rn
-    FROM iceberg.bronze.whoscored_missing_players mp
+    FROM iceberg.bronze.whoscored_missing_players_current mp
     WHERE LOWER(mp.status) = 'out'
       AND (mp.reason IS NULL OR LOWER(mp.reason) <> 'international duty')
       AND mp.player_id IS NOT NULL
@@ -55,7 +56,7 @@ sch_dedup AS (
             PARTITION BY league, season, game
             ORDER BY _ingested_at DESC
         ) AS rn
-    FROM iceberg.bronze.whoscored_schedule
+    FROM iceberg.bronze.whoscored_schedule_current
 )
 
 SELECT

@@ -6,26 +6,7 @@
   "collection_source": "sofascore_canary",
   "collector_version": "sofascore-paid-canary-v2",
   "experimental_hard_cap_bytes": 47930410,
-  "historical_observations": [
-    {
-      "context": "pre-PR-927 tournament snapshot",
-      "reported_mb": 6.0393,
-      "usable_as_budget_sample": false
-    },
-    {
-      "context": "post-PR-927 tournament snapshot",
-      "reported_mb": 2.0194,
-      "usable_as_budget_sample": false
-    },
-    {
-      "context": "recent production tournament snapshots",
-      "reported_mb_range": [
-        1.86,
-        2.02
-      ],
-      "usable_as_budget_sample": false
-    }
-  ],
+  "historical_observations": [],
   "meter": "proxy_filter_provider_path_v2",
   "rate_limit_policy": {
     "burst_size": 20,
@@ -56,7 +37,7 @@
       "camoufox": "0.4.11",
       "playwright": "1.59.0"
     },
-    "digest": "960283608cb8d5b6602e7d82236c862ade96f30591dd8497704bc32d388498f1",
+    "digest": "c028d5af448197d9db177d219bc3bd87876f1b6ca28957c033c44abcf3dc4639",
     "files": [
       "configs/medallion/competitions.yaml",
       "configs/proxy_filter/blocklist.txt",
@@ -175,7 +156,6 @@
       ],
       "samples": [],
       "scope": "season",
-      "source_tournament_id": 16,
       "shape": {
         "dynamic_endpoints": [
           "squads",
@@ -201,7 +181,8 @@
           "participants"
         ]
       },
-      "shape_digest": "b345be809034c6927e3783c88d5dca3fe83aca8e7073fe3718693852be6cf0b6"
+      "shape_digest": "b345be809034c6927e3783c88d5dca3fe83aca8e7073fe3718693852be6cf0b6",
+      "source_tournament_id": 16
     },
     "season_17_4a1738f5b7504ec2": {
       "cohort": "enabled_epl_2526_shape",
@@ -220,7 +201,6 @@
       ],
       "samples": [],
       "scope": "season",
-      "source_tournament_id": 17,
       "shape": {
         "dynamic_endpoints": [
           "squads",
@@ -246,7 +226,8 @@
           "participants"
         ]
       },
-      "shape_digest": "4a1738f5b7504ec2b905ea550884ac220cfc1e717e4aee5eca2e6e04699f4e5b"
+      "shape_digest": "4a1738f5b7504ec2b905ea550884ac220cfc1e717e4aee5eca2e6e04699f4e5b",
+      "source_tournament_id": 17
     }
   }
 }

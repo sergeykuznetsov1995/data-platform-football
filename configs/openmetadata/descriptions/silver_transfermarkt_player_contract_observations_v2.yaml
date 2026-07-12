@@ -1,0 +1,49 @@
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.silver.transfermarkt_player_contract_observations_v2
+  description: |
+    Typed and deduplicated contract observations at
+    (competition_id, edition_id, team_id, player_id, observed_at) grain and
+    natural key. Lineage is
+    bronze.transfermarkt_player_contract_observations plus the conflict-safe
+    global player xref. Completeness remains one row per applicable squad
+    membership, including authoritative_empty/not_applicable rows; active
+    edition freshness is eight days.
+  tags: [Tier.Silver, Domain.Football, PII.Low]
+columns:
+  - name: competition_id
+    description: Transfermarkt competition code; natural-key component.
+  - name: edition_id
+    description: Exact source edition id; natural-key component.
+  - name: team_id
+    description: Transfermarkt team id; natural-key component.
+  - name: player_id
+    description: Transfermarkt player id; natural-key component.
+  - name: canonical_id
+    description: Conflict-safe canonical player id; nullable for unresolved players.
+  - name: contract_until
+    description: Typed contract end date; null has explicit applicability semantics.
+  - name: observed_at
+    description: Natural-key component and eight-day freshness anchor.
+  - name: applicability_status
+    description: ok, authoritative_empty, or not_applicable; no silent failure state.
+  - name: source_url
+    description: Squad response URL propagated for lineage.
+  - name: source_body_hash
+    description: Squad response hash propagated for lineage and replay.
+  - name: fetched_at
+    description: Squad response fetch timestamp propagated for lineage.
+  - name: cycle_id
+    description: Parent ingestion-cycle lineage identifier.
+  - name: scope_id
+    description: Exact competition:edition child-cycle lineage scope.
+  - name: _bronze_ingested_at
+    description: Winning Bronze ingest timestamp.
+relationships:
+  - from: trino_iceberg.iceberg.silver.transfermarkt_player_contract_observations_v2.player_id
+    to: trino_iceberg.iceberg.bronze.transfermarkt_player_contract_observations.player_id
+    type: FOREIGN_KEY
+    description: Typed and deduplicated directly from Bronze contract observations.
+  - from: trino_iceberg.iceberg.silver.transfermarkt_player_contract_observations_v2.competition_id
+    to: trino_iceberg.iceberg.silver.transfermarkt_competitions_v2.competition_id
+    type: FOREIGN_KEY
+    description: Contract scope uses the classified competition registry.

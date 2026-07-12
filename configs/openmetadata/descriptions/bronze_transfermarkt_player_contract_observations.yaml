@@ -1,0 +1,47 @@
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.bronze.transfermarkt_player_contract_observations
+  description: |
+    Lossless contract observations parsed from the already-fetched Transfermarkt
+    squad response; this entity adds no proxy request. Grain and natural key are
+    (competition_id, edition_id, team_id, player_id, observed_at). Lineage is
+    preserved by source_url/source_body_hash. For an applicable scope,
+    completeness requires one observation per expected squad membership;
+    contract_until may be null only with an explicit applicability_status.
+    Current-edition freshness is eight days.
+  tags: [Tier.Bronze, Domain.Football, PII.Low]
+columns:
+  - name: competition_id
+    description: Transfermarkt competition code; natural-key component.
+  - name: edition_id
+    description: Exact Transfermarkt edition id; natural-key component.
+  - name: team_id
+    description: Transfermarkt team id; natural-key component.
+  - name: team_name
+    description: Team name observed on the squad page.
+  - name: player_id
+    description: Transfermarkt player id; natural-key component.
+  - name: contract_until
+    description: Source contract end date; nullable only under the explicit applicability contract.
+  - name: observed_at
+    description: Source observation timestamp; natural-key component and eight-day freshness anchor.
+  - name: applicability_status
+    description: ok, authoritative_empty, or not_applicable; transport failures are never empty.
+  - name: source_url
+    description: Squad page URL used as lineage evidence.
+  - name: source_body_hash
+    description: SHA-256 of the reused squad response.
+  - name: fetched_at
+    description: UTC response fetch timestamp retained for source lineage.
+  - name: cycle_id
+    description: Parent ingestion-cycle identifier.
+  - name: scope_id
+    description: Exact competition:edition child-cycle scope.
+  - name: _ingested_at
+    description: Bronze commit timestamp.
+  - name: _batch_id
+    description: Exact child-cycle batch identifier.
+relationships:
+  - from: trino_iceberg.iceberg.bronze.transfermarkt_player_contract_observations.competition_id
+    to: trino_iceberg.iceberg.bronze.transfermarkt_competitions.competition_id
+    type: FOREIGN_KEY
+    description: Contract observation competition lineage.

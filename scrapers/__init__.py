@@ -13,7 +13,7 @@ _EXPORTS = {
     "NodriverFBrefScraper": ("scrapers.nodriver_fbref", "NodriverFBrefScraper"),
     "FotMobScraper": ("scrapers.fotmob", "FotMobScraper"),
     "MatchHistoryScraper": ("scrapers.matchhistory", "MatchHistoryScraper"),
-    "WhoScoredScraper": ("scrapers.whoscored", "WhoScoredScraper"),
+    "WhoScoredIngestService": ("scrapers.whoscored", "WhoScoredIngestService"),
 }
 
 __all__ = list(_EXPORTS)

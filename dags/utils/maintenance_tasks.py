@@ -53,8 +53,17 @@ SESSION_MIN_RETENTION = "1h"
 # daily DAG with retention='3d' against this allowlist.
 HIGH_CHURN_BRONZE: Tuple[str, ...] = (
     "whoscored_events",
+    "whoscored_lineups",
     "whoscored_missing_players",
     "whoscored_schedule",
+    # V2 logical commits/snapshots are append-only, but still create at least
+    # one Iceberg snapshot per daily run.  Keep their metadata bounded along
+    # with the payload tables.  The table filter is applied after SHOW TABLES,
+    # so additive rollout is safe before every manifest table exists.
+    "whoscored_match_ingest_manifest",
+    "whoscored_preview_ingest_manifest",
+    "whoscored_profile_ingest_manifest",
+    "whoscored_player_profile_versions",
     "fbref_match_events",
     "fbref_match_player_stats",
     "fbref_match_team_stats",

@@ -10,7 +10,8 @@ STANDALONE script (NOT a DAG). Run from host:
 Inputs (Bronze, APL 2024-25):
     iceberg.bronze.fbref_player_stats     (season=2024,  stat_type='stats')
     iceberg.bronze.understat_players      (season='2425')
-    iceberg.bronze.whoscored_events       (season='2425', distinct player_id+player+team)
+    iceberg.bronze.whoscored_events_current
+                                             (season='2425', committed players)
 
 Output:
     iceberg.default.r2_xref_player_proto  (CTAS — full rebuild)
@@ -211,7 +212,7 @@ def fetch_whoscored_players(conn) -> List[Tuple[str, str, str]]:
         SELECT CAST(CAST(player_id AS bigint) AS varchar) AS pid,
                MAX(player) AS player,
                MAX(team) AS team
-        FROM iceberg.bronze.whoscored_events
+        FROM iceberg.bronze.whoscored_events_current
         WHERE league = '{LEAGUE}' AND season = '{SOURCE_SEASON}'
           AND player_id IS NOT NULL AND player IS NOT NULL
         GROUP BY CAST(player_id AS bigint)

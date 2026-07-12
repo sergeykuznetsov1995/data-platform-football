@@ -4,11 +4,13 @@
 table:
   fullyQualifiedName: trino_iceberg.iceberg.bronze.whoscored_schedule
   description: |
-    Сырое расписание матчей из WhoScored (soccerdata WhoScored.read_schedule
-    через FlareSolverr). Grain — один row на матч (wide-формат: home_* / away_*
-    в одной строке). Несёт итоговый счёт, карточки, team_id обеих сторон,
-    флаги состояния матча и JSON-поля incidents/bets. Служит источником
-    (game_id, league, season, game) для последующего scrape событий.
+    Сырое расписание матчей из WhoScored, собранное parser v7 из помесячных
+    tournament endpoints. Direct-first transport сохраняет каждый ответ в raw
+    store до разбора; закрытые месяцы повторно проигрываются без сетевого
+    запроса. Grain — один матч (wide home_*/away_*). Таблица служит источником
+    (game_id, league, season, game) для manifest-backed событий и preview.
+    Downstream читает whoscored_schedule_current, где виден только последний
+    успешный scope batch.
     Партиционирование ['league','season'].
   tags:
     - Tier.Bronze
@@ -18,7 +20,7 @@ columns:
   - name: league
     description: Лига (e.g. 'ENG-Premier League'); partition key.
   - name: season
-    description: Сезон в формате WhoScored 'YYZZ' (e.g. '2425'); partition key.
+    description: Канонический scope season ('2526', '2026'; при source-коллизии '2021-single-ws8534'); partition key.
   - name: game
     description: Строковый идентификатор матча WhoScored (slug).
   - name: stage_id

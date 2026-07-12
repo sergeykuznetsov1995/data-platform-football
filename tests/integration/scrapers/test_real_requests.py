@@ -197,32 +197,6 @@ class TestSoFIFAIntegration:
 
 
 # =============================================================================
-# WhoScored Tests (Requires Selenium)
-# =============================================================================
-
-@pytest.mark.integration
-@pytest.mark.slow
-@pytest.mark.cloudflare
-class TestWhoScoredIntegration:
-    """Integration tests for WhoScored scraper.
-
-    WhoScored has Cloudflare protection, requires Selenium.
-    """
-
-    def test_scraper_initialization(self, whoscored_scraper):
-        """Test that WhoScored scraper initializes correctly."""
-        assert whoscored_scraper is not None
-        assert whoscored_scraper.SOURCE_NAME == 'whoscored'
-        assert whoscored_scraper.leagues == ['ENG-Premier League']
-
-    def test_browser_creation(self, whoscored_scraper):
-        """Test that browser can be created."""
-        browser = whoscored_scraper._get_browser()
-        assert browser is not None
-        assert browser.driver is not None
-
-
-# =============================================================================
 # Direct Source Availability Tests
 # =============================================================================
 

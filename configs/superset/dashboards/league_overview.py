@@ -294,6 +294,8 @@ WHERE rn = 1"""
     # иначе фан-аут (см. CLAUDE.md footguns). Стоимость — as-of конец сезона
     # (последняя TM-оценка до dim_season.end_date); contract_until — из silver
     # Transfermarkt (шире, чем Capology contract_status = только EPL 2526).
+    # Это stable canonical reader: его physical legacy/v2 adapter выбирается
+    # migration state, dashboard никогда не читает physical `_v2` напрямую.
     v_player_season = f"""\
 WITH ps AS (
   SELECT * FROM iceberg.gold.fct_player_season_stats
@@ -367,11 +369,13 @@ LEFT JOIN tm
 
     # Трансферы (грейн = сделка). team_name-колонки нет — фильтр «Команда»
     # к этим чартам не применяется (generic scope по колонкам).
-    # fct_transfer.season = окно СКРЕЙПА (TM отдаёт всю карьеру игрока), не
-    # сезон сделки — season здесь пересчитан из transfer_date (июль—июнь);
-    # иначе «Топ покупок сезона» показывал топ сделок за всю карьеру.
+    # Native fct_transfer.event_season = сезон самой сделки, а не окно скрейпа.
+    # league у глобального transfer event отсутствует по определению: для
+    # dashboard она выводится из присутствия принимающего клуба в standings
+    # этого event_season. Так одна career-сделка не дублируется во все лиги,
+    # в которых профиль игрока когда-либо скрейпили.
     # Имена tm_*-орфанов (U21 и т.п., нет в dim_player) добираются из
-    # silver.transfermarkt_players по сырому TM id (покрытие 1324/1325).
+    # stable canonical silver.transfermarkt_players по сырому TM id.
     # is_incoming = to_club играет в лиге в сезон сделки (join к standings):
     # без него «Топ покупок» показывал и продажи в чужие лиги (Diaz → Bayern).
     # Сделки будущего сезона (нет standings) дают false — они и так вне
@@ -385,8 +389,13 @@ WITH tm_names AS (
          ) AS rn
   FROM iceberg.silver.transfermarkt_players
 ),
+team_seasons AS (
+  SELECT DISTINCT team_id, league, season
+  FROM iceberg.gold.fct_standings
+),
 base AS (
   SELECT
+    t.transfer_id,
     t.player_id,
     COALESCE(dp.player_name, tn.name, t.player_id) AS player_name,
     t.transfer_date,
@@ -395,14 +404,8 @@ base AS (
     t.fee_eur,
     t.market_value_at_transfer_eur,
     CASE WHEN t.is_loan THEN 'аренда' ELSE 'трансфер' END AS transfer_type,
-    t.league,
     t.to_team_id,
-    CASE WHEN MONTH(t.transfer_date) >= 7
-         THEN LPAD(CAST(YEAR(t.transfer_date) % 100 AS varchar), 2, '0')
-              || LPAD(CAST((YEAR(t.transfer_date) + 1) % 100 AS varchar), 2, '0')
-         ELSE LPAD(CAST((YEAR(t.transfer_date) - 1) % 100 AS varchar), 2, '0')
-              || LPAD(CAST(YEAR(t.transfer_date) % 100 AS varchar), 2, '0')
-    END AS season
+    t.event_season AS season
   FROM iceberg.gold.fct_transfer t
   LEFT JOIN iceberg.gold.dim_player dp ON dp.player_id = t.player_id
   LEFT JOIN tm_names tn
@@ -411,14 +414,13 @@ base AS (
     AND tn.player_id = SUBSTR(t.player_id, 4)
   LEFT JOIN iceberg.gold.dim_team dtf ON dtf.team_id = t.from_team_id
   LEFT JOIN iceberg.gold.dim_team dtt ON dtt.team_id = t.to_team_id
-  WHERE NOT t.is_upcoming
+  WHERE NOT t.is_upcoming AND t.transfer_date IS NOT NULL
 )
-SELECT b.*, b.player_name || ' → ' || b.to_club AS deal,
+SELECT b.*, st.league, b.player_name || ' → ' || b.to_club AS deal,
        (st.team_id IS NOT NULL) AS is_incoming
 FROM base b
-LEFT JOIN iceberg.gold.fct_standings st
+LEFT JOIN team_seasons st
   ON  st.team_id = b.to_team_id
-  AND st.league  = b.league
   AND st.season  = b.season"""
 
     # Таймлайн стоимости (TM) в окне сезона. Чарт режет серии series-limit'ом

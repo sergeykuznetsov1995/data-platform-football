@@ -45,19 +45,19 @@ columns:
   - name: goals_against_diff_understat
     description: "Diff пропущенных: fb.gk_goals_against - us.goals_against."
 
-  # ─── WhoScored diff (LEFT JOIN → NULL когда отсутствует; #120) ───
+  # ─── WhoScored diff (LEFT JOIN → NULL когда отсутствует) ───
   - name: matches_diff_whoscored
-    description: "Diff матчей: fb.mp - ws.matches_seen. NULL для current seasons (#120)."
+    description: "Diff матчей: fb.mp - ws.matches_seen. NULL при отсутствии WhoScored-записи."
   - name: shots_diff_whoscored
-    description: "Diff ударов: fb.total_shots - ws.shots_total. NULL для current seasons (#120)."
+    description: "Diff ударов: fb.total_shots - ws.shots_total. NULL при отсутствии WhoScored-записи."
   - name: shots_on_target_diff_whoscored
-    description: "Diff ударов в створ: fb.shots_on_target - ws.shots_on_target_proxy. NULL для current seasons (#120)."
+    description: "Diff ударов в створ: fb.shots_on_target - ws.shots_on_target_proxy. NULL при отсутствии WhoScored-записи."
   - name: interceptions_diff_whoscored
-    description: "Diff перехватов: fb.interceptions - ws.interceptions. NULL для current seasons (#120)."
+    description: "Diff перехватов: fb.interceptions - ws.interceptions. NULL при отсутствии WhoScored-записи."
   - name: tackles_won_diff_whoscored
-    description: "Diff отборов: fb.tackles_won - ws.tackle_won. NULL для current seasons (#120)."
+    description: "Diff отборов: fb.tackles_won - ws.tackle_won. NULL при отсутствии WhoScored-записи."
   - name: fouls_committed_diff_whoscored
-    description: "Diff фолов: fb.fouls_committed - ws.fouls_committed. NULL для current seasons (#120)."
+    description: "Diff фолов: fb.fouls_committed - ws.fouls_committed. NULL при отсутствии WhoScored-записи."
 
   # ─── SofaScore diff (LEFT JOIN → NULL когда отсутствует) ───
   - name: matches_diff_sofascore

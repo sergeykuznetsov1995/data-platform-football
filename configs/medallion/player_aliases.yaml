@@ -14,16 +14,54 @@
 #   aliases:
 #     - source: understat | whoscored | sofascore | fotmob | matchhistory | transfermarkt | capology | sofifa
 #       source_id: "<the source's player_id, varchar>"
-#       fbref_player_id: "<FBref player_id, WITHOUT the 'fb_' prefix>"
+#       action: map | orphan  # optional; defaults to map for old entries
+#       fbref_player_id: "<FBref player_id, WITHOUT the 'fb_' prefix>" # map only
 #       season: "<4-digit slug, e.g. '2425'>"  | "*"  (any season)
 #       reason: "<short comment for the reviewer>"
 #
 # Lookup contract (see utils.medallion_config.get_player_alias):
 #   * (source, source_id, season) is matched first.
 #   * If no row matches the exact season, a row with season='*' is tried.
-#   * Returns the FBref player_id without 'fb_' prefix, or None.
+#   * `orphan` is a negative override: it prevents every automatic identity
+#     tier from linking a source row known to be a different person.
+#   * get_player_alias() returns the FBref player_id for map rules, or None.
 
 aliases:
+  # Native-v2 readiness audit — season-scoped DOB contradictions proved these
+  # Transfermarkt rows are not the FBref players selected by the fuzzy tier.
+  # Keep the source identities as tm_* orphans until an independently verified
+  # canonical mapping is available; never weaken the zero-conflict gate.
+  - source: transfermarkt
+    source_id: "1000135"
+    action: orphan
+    season: "2324"
+    reason: "DOB-backed negative override; fuzzy candidate is a different person"
+
+  - source: transfermarkt
+    source_id: "1000626"
+    action: orphan
+    season: "2324"
+    reason: "DOB-backed negative override; fuzzy candidate is a different person"
+
+  - source: transfermarkt
+    source_id: "364405"
+    action: orphan
+    season: "1920"
+    reason: "DOB-backed negative override; fuzzy candidate is a different person"
+
+  - source: transfermarkt
+    source_id: "707271"
+    action: orphan
+    season: "2223"
+    reason: "DOB-backed negative override; fuzzy candidate is a different person"
+
+  - source: transfermarkt
+    source_id: "277118"
+    action: map
+    fbref_player_id: "6ed1a2a2"
+    season: "*"
+    reason: "DOB-backed global mapping to the verified FBref canonical"
+
   # Issue #84 — Capology "Jamie Bynoe-Gittens" (full legal surname) vs
   # FBref "Jamie Gittens" (display-only short surname). Same player; token_set
   # 81.25 < 95, surname-anchor fails (Bynoe-Gittens vs Gittens distinct tokens).

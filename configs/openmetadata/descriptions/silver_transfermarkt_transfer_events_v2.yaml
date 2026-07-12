@@ -1,0 +1,11 @@
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.silver.transfermarkt_transfer_events_v2
+  description: Typed unpartitioned global transfer events at (player_id, transfer_id) grain.
+  tags: [Tier.Silver, Domain.Football, PII.Low]
+columns:
+  - name: transfer_id
+    description: Stable global event id.
+  - name: event_season
+    description: Normalized event season, independent of scrape context.
+  - name: transfer_date
+    description: Nullable for an undated upcoming event.

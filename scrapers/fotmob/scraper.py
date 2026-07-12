@@ -28,6 +28,8 @@ import pandas as pd
 import requests
 
 from scrapers.base.base_scraper import BaseScraper
+from scrapers.fotmob.domain import ScopeRef
+from scrapers.fotmob.parsers import parse_leaderboards, parse_season_bundle, parse_transfers
 from scrapers.utils.competition_format import is_group_knockout, is_single_year
 
 logger = logging.getLogger(__name__)
@@ -195,6 +197,10 @@ class FotMobScraper(BaseScraper):
         """Get or create a plain requests session (no cookies needed)."""
         if self._session is None:
             self._session = requests.Session()
+            # FotMob is a direct-only public JSON source.  Never inherit a
+            # paid/system proxy from HTTP(S)_PROXY or ~/.netrc.
+            self._session.trust_env = False
+            self._session.proxies.clear()
             self._session.headers.update({
                 'User-Agent': (
                     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
@@ -234,7 +240,21 @@ class FotMobScraper(BaseScraper):
         for attempt in range(retry_count):
             try:
                 self._rate_limiter.acquire()
+                self._stats['requests'] += 1
+                self._stats['http_requests_count'] = (
+                    self._stats.get('http_requests_count', 0) + 1
+                )
                 response = session.get(url, params=params, timeout=30)
+                wire_bytes = len(response.content)
+                self._stats['bytes_downloaded'] = (
+                    self._stats.get('bytes_downloaded', 0) + wire_bytes
+                )
+                self._stats['http_bytes_downloaded'] = (
+                    self._stats.get('http_bytes_downloaded', 0) + wire_bytes
+                )
+                self._stats['pages_downloaded'] = (
+                    self._stats.get('pages_downloaded', 0) + 1
+                )
 
                 if response.status_code == 200:
                     self._stats['successes'] += 1
@@ -279,6 +299,19 @@ class FotMobScraper(BaseScraper):
             params={'id': league_id, 'season': self._format_season(season, league)},
         )
         if data is not None:
+            # Only enforce when the source declares the selected season.  Old
+            # unit fixtures and a few legacy competitions omit it; the native
+            # pipeline is strict for every canonical scope.
+            details = data.get('details') or {}
+            selected = details.get('selectedSeason')
+            expected = self._format_season(season, league)
+            if selected is not None and str(selected) != expected:
+                logger.error(
+                    "FotMob silently selected %r for %s; requested exact %r. "
+                    "Refusing to cache/mislabel the response.",
+                    selected, league, expected,
+                )
+                return None
             self._league_data_cache[key] = data
         return data
 
@@ -351,10 +384,27 @@ class FotMobScraper(BaseScraper):
         return self._team_data_cache[key]
 
     def _team_ids_for_league(self, league: str, season: int) -> List[int]:
-        """Extract team ids from the league standings table."""
+        """Extract the complete team universe from every source section."""
         data = self._get_league_data(league, season)
         if not data:
             return []
+        league_id = self.LEAGUE_IDS.get(league)
+        if league_id is not None:
+            try:
+                bundle = parse_season_bundle(
+                    data,
+                    ScopeRef(
+                        int(league_id), self._format_season(season, league)
+                    ),
+                    strict_selected_season=False,
+                )
+                return [int(row['team_id']) for row in bundle.teams]
+            except (TypeError, ValueError, KeyError) as exc:
+                logger.warning(
+                    "Native team-universe parse failed for %s %s (%s); "
+                    "falling back to the legacy table shape.",
+                    league, season, exc,
+                )
         try:
             table = data.get('table') or []
             if not table:
@@ -541,8 +591,6 @@ class FotMobScraper(BaseScraper):
                     table = table_data[0] if isinstance(table_data[0], dict) else {'data': {'table': {'all': table_data}}}
 
                     standings = []
-                    group_name = None
-
                     # Group-tournament tables (Фаза 4 #913, generalized #920
                     # Phase 3): table[0].data.tables -> Grp. A.. + Best 3rd
                     if is_group_knockout(league):
@@ -574,7 +622,8 @@ class FotMobScraper(BaseScraper):
                             'goals_for': team.get('scoresStr', '').split('-')[0] if team.get('scoresStr') else team.get('goalsFor'),
                             'goals_against': team.get('scoresStr', '').split('-')[-1] if team.get('scoresStr') else team.get('goalsAgainst'),
                             'goal_diff': team.get('goalConDiff'),
-                            'points': team.get('pts') or team.get('points'),
+                            # Zero points is a real value, not a missing value.
+                            'points': team['pts'] if 'pts' in team else team.get('points'),
                             'form': team.get('form'),
                             'group': team.get('_group') or team.get('group'),
                         }
@@ -655,29 +704,13 @@ class FotMobScraper(BaseScraper):
                 top_lists = (payload or {}).get('TopLists') or []
                 if not top_lists:
                     continue
-                top = top_lists[0]
-                header = top.get('Title') or cat.get('header')
-                group = top.get('Category') or cat.get('category')
-                stat_name = top.get('StatName') or cat.get('name')
-                for item in top.get('StatList') or []:
-                    rows.append({
-                        # NB: FotMob misspells the player id key as 'ParticiantId'
-                        # (no second 'p') — matches bronze.fotmob_player_details.player_id.
-                        'participant_id': item.get('ParticiantId'),
-                        'participant_name': item.get('ParticipantName'),
-                        'team_id': item.get('TeamId'),
-                        'team_name': item.get('TeamName'),
-                        'country_code': item.get('ParticipantCountryCode'),
-                        'rank': item.get('Rank'),
-                        'stat_value': item.get('StatValue'),
-                        'sub_stat_value': item.get('SubStatValue'),
-                        'stat_value_count': item.get('StatValueCount'),
-                        'matches_played': item.get('MatchesPlayed'),
-                        'minutes_played': item.get('MinutesPlayed'),
-                        'stat_category_header': header,
-                        'stat_category_group': group,
-                        'stat_name': stat_name,
-                    })
+                rows.extend(
+                    parse_leaderboards(
+                        payload,
+                        participant_type='player',
+                        descriptor=cat,
+                    )
+                )
 
             if not rows:
                 logger.warning(f"No player stats found for {league} {season}")
@@ -914,27 +947,13 @@ class FotMobScraper(BaseScraper):
             top_lists = (payload or {}).get('TopLists') or []
             if not top_lists:
                 continue
-            top = top_lists[0]
-            header = top.get('Title') or cat.get('header')
-            group = top.get('Category') or cat.get('category')
-            stat_name = top.get('StatName') or cat.get('name')
-            for item in top.get('StatList') or []:
-                rows.append({
-                    'participant_name': item.get('ParticipantName'),
-                    'team_id': item.get('TeamId'),
-                    'team_name': item.get('TeamName'),
-                    'team_color': item.get('TeamColor'),
-                    'country_code': item.get('ParticipantCountryCode'),
-                    'rank': item.get('Rank'),
-                    'stat_value': item.get('StatValue'),
-                    'sub_stat_value': item.get('SubStatValue'),
-                    'stat_value_count': item.get('StatValueCount'),
-                    'matches_played': item.get('MatchesPlayed'),
-                    'minutes_played': item.get('MinutesPlayed'),
-                    'stat_category_header': header,
-                    'stat_category_group': group,
-                    'stat_name': stat_name,
-                })
+            rows.extend(
+                parse_leaderboards(
+                    payload,
+                    participant_type='team',
+                    descriptor=cat,
+                )
+            )
 
         if not rows:
             logger.warning(f"No team leaderboard rows parsed for {league} {season}")
@@ -969,48 +988,21 @@ class FotMobScraper(BaseScraper):
             return None
 
         logger.info(f"Fetching FotMob transfers: {league} {season}")
-        payload = self._fetch_api_json('transfers', params={'id': league_id})
-        transfers = (payload or {}).get('transfers') or []
-        if not transfers:
+        payload = self._fetch_api_json(
+            'transfers', params={'leagueIds': league_id, 'page': 1}
+        )
+        parsed = parse_transfers(payload or {})
+        if not parsed:
             logger.warning(f"No transfers for {league} {season}")
             return None
 
-        rows = []
-        for tr in transfers:
-            position = tr.get('position') or {}
-            transfer_type = tr.get('transferType') or {}
-            fee = tr.get('fee')
-            if isinstance(fee, dict):
-                fee_text = fee.get('fallback') or fee.get('text')
-                fee_value = fee.get('value')
-            else:
-                fee_text = fee if isinstance(fee, str) else None
-                fee_value = tr.get('amountEuroEstimated')
-            market_value = tr.get('marketValue')
-            if isinstance(market_value, dict):
-                market_value = market_value.get('value')
-
-            rows.append({
-                'player_id': tr.get('playerId'),
-                'player_name': tr.get('name'),
-                'position_label': position.get('label'),
-                'position_key': position.get('key'),
-                'transfer_date': tr.get('transferDate'),
-                'from_club': tr.get('fromClub'),
-                'from_club_full_name': tr.get('fromClubFullName'),
-                'from_club_id': tr.get('fromClubId'),
-                'to_club': tr.get('toClub'),
-                'to_club_full_name': tr.get('toClubFullName'),
-                'to_club_id': tr.get('toClubId'),
-                'fee_text': fee_text,
-                'fee_value': fee_value,
-                'market_value': str(market_value) if market_value is not None else None,
-                'on_loan': tr.get('onLoan'),
-                'transfer_type_key': transfer_type.get('localizationKey'),
-                'transfer_type_text': transfer_type.get('text'),
-            })
-
-        df = pd.DataFrame(rows)
+        df = pd.DataFrame(parsed)
+        # Keep the legacy varchar convention while the canonical event table
+        # uses the source-native value.
+        if 'market_value' in df.columns:
+            df['market_value'] = df['market_value'].map(
+                lambda value: str(value) if value is not None else None
+            )
         df['league'] = league
         df['season'] = season
         df = self._add_metadata(df, 'transfers')
@@ -1021,7 +1013,9 @@ class FotMobScraper(BaseScraper):
     # Match details — 2-step slug-form _next/data
     # ------------------------------------------------------------------ #
 
-    def _fetch_match_details(self, match_id: Any) -> Optional[Dict[str, Any]]:
+    def _fetch_match_details(
+        self, match_id: Any, page_url: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
         """Resolve a match's detail payload via the public ``matchDetails`` API.
 
         Content comes from ``/api/data/matchDetails?matchId=`` — the slimmed
@@ -1031,10 +1025,14 @@ class FotMobScraper(BaseScraper):
         (issue #547). The cheap ``/api/data/match?id=`` call is kept only to
         resolve the canonical ``pageUrl`` stored in Bronze.
         """
-        header = self._fetch_api_json('match', params={'id': str(match_id)})
-        if not header:
-            return None
-        page_url = header.get('pageUrl')
+        # Fixtures already advertise pageUrl for normal and archived matches.
+        # Only the rare missing-pageUrl shape needs the old header request.
+        header = None
+        if not page_url:
+            header = self._fetch_api_json('match', params={'id': str(match_id)})
+            if not header:
+                return None
+            page_url = header.get('pageUrl')
         payload = self._fetch_api_json('matchDetails', params={'matchId': str(match_id)})
         if not payload:
             return None
@@ -1107,7 +1105,12 @@ class FotMobScraper(BaseScraper):
         rows = []
         for i, match in enumerate(to_fetch):
             mid = match.get('id')
-            details = self._fetch_match_details(mid)
+            fixture_page_url = match.get('pageUrl')
+            details = (
+                self._fetch_match_details(mid, fixture_page_url)
+                if fixture_page_url
+                else self._fetch_match_details(mid)
+            )
             if not details:
                 logger.warning(f"No match details for match_id={mid}")
                 continue

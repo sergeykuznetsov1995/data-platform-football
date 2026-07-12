@@ -124,7 +124,7 @@ ws_name_to_id AS (
         home_team                                     AS ws_team_name,
         league,
         season
-    FROM iceberg.bronze.whoscored_schedule
+    FROM iceberg.bronze.whoscored_schedule_current
     WHERE home_team_id IS NOT NULL
     UNION
     SELECT DISTINCT
@@ -132,31 +132,14 @@ ws_name_to_id AS (
         away_team                                     AS ws_team_name,
         league,
         season
-    FROM iceberg.bronze.whoscored_schedule
+    FROM iceberg.bronze.whoscored_schedule_current
     WHERE away_team_id IS NOT NULL
 ),
 
 -- ===== Team-finance sources (issue #192) =====
--- TM/Capology team universe не имеет schedule → bridge через xref_team
--- (source='transfermarkt'/'capology', добавлены в xref_team.sql.j2). Покрытие —
--- только APL season slug '2526'; для прочих сезонов колонки останутся NULL.
--- #814: xref_team может нести 2 transfermarkt-алиаса на один canonical в сезоне
--- (напр. 'Liverpool'/'Liverpool FC', 'Sheff Utd'/'Sheffield United') → canonical-
--- keyed LEFT JOIN xref_tm ниже двоит грейн (team_id,league,season) ×2 (18 дублей
--- в исторических сезонах, всплыли при пересборке #712). Сворачиваем к одному
--- алиасу через MAX+GROUP BY: в текущем сезоне алиас один (no-op), а историч.
--- TM-финансы — только 2526, так что отброшенный алиас данных не несёт.
-xref_tm AS (
-    SELECT
-        canonical_id,
-        MAX(source_id)                                    AS tm_club_name,
-        league,
-        season                                            AS season_slug
-    FROM iceberg.silver.xref_team
-    WHERE source = 'transfermarkt'
-      AND confidence <> 'orphan'
-    GROUP BY canonical_id, league, season
-),
+-- Capology has no schedule universe and therefore still bridges through
+-- xref_team. Transfermarkt is already canonicalised by its state-selected
+-- team-season reader below.
 
 -- Same #814 fan-out guard as xref_tm above: 2 capology-алиаса на один canonical
 -- в сезоне задвоили бы всю строку fct_team_season_stats через LEFT JOIN
@@ -173,16 +156,15 @@ xref_cap AS (
     GROUP BY canonical_id, league, season
 ),
 
--- Squad market value: SUM рыночной стоимости состава (EUR, снимок «сейчас»).
+-- State-selected Transfermarkt value. Legacy reproduces the historical
+-- snapshot SUM; native v2 uses end-of-season assignment + as-of valuation.
 tm_finance AS (
     SELECT
-        current_club_name                                 AS tm_club_name,
+        team_id,
         league,
         season                                            AS season_slug,
-        SUM(current_market_value_eur)                     AS squad_market_value_eur
-    FROM iceberg.silver.transfermarkt_players
-    WHERE current_market_value_eur IS NOT NULL
-    GROUP BY current_club_name, league, season
+        squad_market_value_eur
+    FROM iceberg.gold.transfermarkt_team_season_market_value
 ),
 
 -- Wage bill: SUM годового gross-фонда (GBP + EUR для кросс-валютной сопоставимости
@@ -730,16 +712,11 @@ LEFT JOIN fm_team_season fm
     ON  fm.team_id = xfm.fm_team_name
     AND fm.league  = xf.league
     AND fm.season  = xf.season_slug
--- Transfermarkt squad value (#192): bridge canonical→club name via xref_tm,
--- aggregate via tm_finance. season_slug ('2526') matches xf.season_slug.
-LEFT JOIN xref_tm xtm
-    ON  xtm.canonical_id = xf.canonical_id
-    AND xtm.league       = xf.league
-    AND xtm.season_slug  = xf.season_slug
+-- Transfermarkt squad value is already canonical team/league/season grain.
 LEFT JOIN tm_finance tmf
-    ON  tmf.tm_club_name = xtm.tm_club_name
-    AND tmf.league       = xtm.league
-    AND tmf.season_slug  = xtm.season_slug
+    ON  tmf.team_id      = xf.canonical_id
+    AND tmf.league       = xf.league
+    AND tmf.season_slug  = xf.season_slug
 -- Capology wage bill (#192): same bridge pattern via xref_cap + cap_finance.
 LEFT JOIN xref_cap xcap
     ON  xcap.canonical_id = xf.canonical_id

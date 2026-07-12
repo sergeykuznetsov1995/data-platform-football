@@ -1,0 +1,48 @@
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.silver.transfermarkt_competition_editions_v2
+  description: |
+    Typed Transfermarkt editions at (competition_id, edition_id) grain and
+    natural key. Lineage is bronze.transfermarkt_competition_editions, with the
+    newest source-backed snapshot selected deterministically.
+    Original edition_id/label and canonical season coexist for verifiable
+    season round trips. Completeness requires the expected participant count
+    and hash; current rows have 24h freshness and historical rows are immutable.
+  tags: [Tier.Silver, Domain.Football, PII.None]
+columns:
+  - name: competition_id
+    description: Transfermarkt competition code; natural-key component.
+  - name: edition_id
+    description: Exact source edition id; natural-key component.
+  - name: edition_label
+    description: Exact source edition label.
+  - name: canonical_season
+    description: Season slug produced under the explicit season_format.
+  - name: season_format
+    description: split_year or single_year classification.
+  - name: participant_count
+    description: Expected participant cardinality for completeness DQ.
+  - name: participant_hash
+    description: Expected participant-set hash for completeness DQ.
+  - name: discovered_at
+    description: Current-row freshness timestamp; maximum age 24h.
+  - name: registry_snapshot_id
+    description: Complete registry snapshot used by scope planning.
+  - name: source_body_hash
+    description: Bronze response hash propagated for lineage.
+  - name: fetched_at
+    description: Bronze source fetch timestamp propagated for lineage.
+  - name: cycle_id
+    description: Parent discovery-cycle lineage identifier.
+  - name: scope_id
+    description: Deterministic competition:edition lineage scope.
+  - name: _bronze_ingested_at
+    description: Winning Bronze ingest timestamp.
+relationships:
+  - from: trino_iceberg.iceberg.silver.transfermarkt_competition_editions_v2.competition_id
+    to: trino_iceberg.iceberg.bronze.transfermarkt_competition_editions.competition_id
+    type: FOREIGN_KEY
+    description: Typed and deduplicated directly from the Bronze edition registry.
+  - from: trino_iceberg.iceberg.silver.transfermarkt_competition_editions_v2.competition_id
+    to: trino_iceberg.iceberg.silver.transfermarkt_competitions_v2.competition_id
+    type: FOREIGN_KEY
+    description: Edition belongs to a classified registry competition.

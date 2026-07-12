@@ -9,6 +9,7 @@ directly (pattern: tests/unit/dq/test_e3_dq.py).
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -22,7 +23,6 @@ if str(_DAGS_DIR) not in sys.path:
 
 # Фаза 4: grain checks now load competitions.yaml for per-comp team_count.
 # Set env so unit tests (no /opt/airflow) find the source configs.
-import os
 os.environ.setdefault(
     'MEDALLION_CONFIG_DIR',
     str(PROJECT_ROOT / 'configs' / 'medallion')
@@ -43,7 +43,8 @@ def _by_name(checks, name):
 @pytest.mark.unit
 class TestStarGateComposition:
     def test_total_check_count(self):
-        """Contract: 7 star_pk + 28 league/season FK (14 facts × 2) +
+        """Contract: 7 star_pk + 26 league/season FK (13 facts × 2) +
+        1 transfer event-season FK + 1 historical observability check +
         20 dim-FK + 3 NULL-coverage + 4 grain = 62.
 
         #431 added fct_team_elo pointwise (PK + team_id->dim_team FK). #430
@@ -146,11 +147,26 @@ class TestStarGateLeagueSeasonFk:
                 assert len(found) == 1, f"missing {table}.{key} -> {parent}"
                 assert found[0].severity == 'ERROR'
 
-    def test_star_fact_list_is_14_facts(self):
+    def test_partitioned_star_fact_list_is_13_facts(self):
         from utils.gold_tasks import _STAR_FACT_TABLES
-        assert len(_STAR_FACT_TABLES) == 14
-        assert len(set(_STAR_FACT_TABLES)) == 14
+        assert len(_STAR_FACT_TABLES) == 13
+        assert len(set(_STAR_FACT_TABLES)) == 13
         assert all(t.startswith('gold.fct_') for t in _STAR_FACT_TABLES)
+        assert 'gold.fct_transfer' not in _STAR_FACT_TABLES
+
+    def test_transfer_event_season_fk_is_explicit(self):
+        matches = [
+            check for check in _build()
+            if check.kind == 'ref_integrity'
+            and check.params['child'] == 'gold.fct_transfer'
+            and check.params['key'] == 'event_season'
+        ]
+        assert len(matches) == 1
+        assert matches[0].params['parent'] == 'gold.dim_season'
+        assert matches[0].params['parent_key'] == 'season'
+        assert 'MIN(season)' in matches[0].params['where']
+        assert 'MAX(season)' in matches[0].params['where']
+        assert matches[0].severity == 'ERROR'
 
 
 @pytest.mark.unit

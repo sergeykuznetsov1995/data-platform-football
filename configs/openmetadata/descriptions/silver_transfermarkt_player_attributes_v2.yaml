@@ -1,0 +1,15 @@
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.silver.transfermarkt_player_attributes_v2
+  description: |
+    One shadow row per Transfermarkt player. Immutable fields are selected
+    independently from deterministic complete observations; mutable contract
+    and age come from the newest observation, and current value prefers the
+    latest global market-value point.
+  tags: [Tier.Silver, Domain.Football, PII.Low]
+columns:
+  - name: player_id
+    description: Transfermarkt player id; natural key.
+  - name: canonical_id
+    description: Conflict-safe global canonical id.
+  - name: current_market_value_date
+    description: Date of the preferred latest global valuation point.

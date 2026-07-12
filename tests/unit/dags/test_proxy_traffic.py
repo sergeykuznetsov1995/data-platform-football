@@ -27,6 +27,20 @@ class TestHostOf:
 
 class TestSummarizeResultTraffic:
     @pytest.mark.unit
+    def test_raw_decoded_bytes_override_rounded_mb(self):
+        from dags.utils.proxy_traffic import summarize_result_traffic
+
+        summary = summarize_result_traffic("transfermarkt", {
+            "telemetry_available": True,
+            "decoded_response_body_bytes": 10 * 1024 * 1024 + 1,
+            "decoded_response_body_mb": 10.0,
+        })
+
+        assert summary["decoded_response_body_bytes"] == 10 * 1024 * 1024 + 1
+        assert summary["decoded_bytes_authoritative"] is True
+        assert summary["decoded_response_body_mb"] > 10.0
+
+    @pytest.mark.unit
     def test_reads_tls_proxy_response_mb(self):
         from dags.utils.proxy_traffic import summarize_result_traffic
 
@@ -37,6 +51,7 @@ class TestSummarizeResultTraffic:
 
         assert summary["source"] == "transfermarkt"
         assert summary["total_mb"] == pytest.approx(12.3)
+        assert summary["decoded_bytes_authoritative"] is False
         assert summary["top_domains"][0]["host"] == "transfermarkt.us"
 
     @pytest.mark.unit
@@ -159,6 +174,25 @@ class TestRecordTrafficRun:
         assert fake_silver["closed"] is False
 
     @pytest.mark.unit
+    def test_persists_authoritative_decoded_bytes(self, fake_silver):
+        pt = importlib.import_module("utils.proxy_traffic")
+        summary = pt.summarize_result_traffic("transfermarkt", {
+            "telemetry_available": True,
+            "decoded_response_body_bytes": 10485761,
+            "decoded_response_body_mb": 10.0,
+        })
+
+        assert pt.record_traffic_run(summary, conn=object()) is True
+
+        inserts = [
+            sql for sql in fake_silver["executed"]
+            if sql.startswith("INSERT INTO")
+        ]
+        assert len(inserts) == 1
+        assert "decoded_response_body_bytes" in inserts[0]
+        assert "10485761" in inserts[0]
+
+    @pytest.mark.unit
     def test_replace_existing_is_retry_idempotent(self, fake_silver):
         pt = importlib.import_module("utils.proxy_traffic")
 
@@ -205,6 +239,11 @@ class TestDailyRollup:
         }
         assert "fbref" in out["report"] and "GB" in out["report"]
         assert any("GROUP BY source" in s for s in fake_silver["executed"])
+        assert any(
+            "decoded_response_body_bytes" in s
+            for s in fake_silver["executed"]
+            if s.startswith("SELECT source")
+        )
 
     @pytest.mark.unit
     def test_empty_is_zero_not_error(self, fake_silver):

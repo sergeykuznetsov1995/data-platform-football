@@ -1,0 +1,7 @@
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.silver.transfermarkt_coach_profiles_v2
+  description: Typed unpartitioned global coach profiles, one row per coach_id.
+  tags: [Tier.Silver, Domain.Football, PII.Low]
+columns:
+  - name: coach_id
+    description: Global Transfermarkt coach id.

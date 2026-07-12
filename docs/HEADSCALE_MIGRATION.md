@@ -1,5 +1,12 @@
 # Миграция на Headscale + публичные дашборды (гибрид)
 
+> **⚠️ ДЕМОНТИРОВАНО 2026-07-07.** VPN-схема прожила 4 дня и снята:
+> аналитикам оказалось слишком сложно (клиент, split-DNS, macOS-резолвер).
+> Все сервисы теперь публичные за Keycloak SSO, OpenMetadata — только
+> SSH-туннель; см. [ANALYST_ONBOARDING.md](ANALYST_ONBOARDING.md).
+> Документ оставлен как история решения и справочник по гочам
+> (bind-изоляция, MASQUERADE, split-DNS). Команды деинсталляции — в конце.
+
 Что получится:
 
 ```
@@ -130,3 +137,24 @@ docker compose exec headscale headscale preauthkeys create --user platform --exp
   network-алиасы (compose) — hairpin-NAT не нужен.
 - Rate-limit/CrowdSec для публичных bi/auth — следующий шаг после миграции
   (Keycloak brute-force protection уже включён).
+
+## 6. Деинсталляция (выполнена 2026-07-07)
+
+Порядок: сначала веб переключён на публичную схему (Caddyfile один listener,
+recreate caddy/keycloak/jupyterhub) и проверен, только потом снос VPN —
+до этого момента откат был тривиален.
+
+```bash
+# 1. Контейнер и хостовый tailscale (VM была нодой своего же headscale)
+docker stop headscale && docker rm headscale
+tailscale down && systemctl disable --now tailscaled
+apt-get purge -y tailscale && rm -rf /var/lib/tailscale
+# 2. systemd-зависимость docker от tailscaled (drop-in)
+rm /etc/systemd/system/docker.service.d/<drop-in>.conf && systemctl daemon-reload
+# 3. Спустя rollback-окно (~неделя): ключи сервера headscale
+docker volume rm headscale_data
+```
+
+На клиентах: удалить Tailscale-клиент; macOS — удалить
+`/etc/resolver/sk-vpn-2026.uk` (см. ANALYST_ONBOARDING.md). DNS-записи
+`hs.`/`meta.` в Cloudflare можно удалить (опционально, ни на что не влияют).

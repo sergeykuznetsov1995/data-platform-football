@@ -1,0 +1,32 @@
+# =============================================================================
+# OpenMetadata description: iceberg.bronze.whoscored_stages_current
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.bronze.whoscored_stages_current
+  description: |
+    Канонический каталог стадий WhoScored parser v7. Представление публикует
+    только строки последнего успешного catalog batch; незавершённый discovery
+    batch не меняет видимый каталог. Grain — одна стадия турнира в сезоне.
+  tags:
+    - Tier.Bronze
+    - Domain.Football
+    - PII.None
+columns:
+  - name: competition_id
+    description: Канонический идентификатор турнира в каталоге источника.
+  - name: league
+    description: Канонический код турнира, используемый downstream.
+  - name: season
+    description: Канонический scope season; source-коллизии явно кодируют format и source_season_id.
+  - name: region_id
+    description: Идентификатор региона WhoScored.
+  - name: tournament_id
+    description: Идентификатор турнира WhoScored.
+  - name: source_season_id
+    description: Идентификатор сезона WhoScored.
+  - name: stage_id
+    description: Идентификатор стадии WhoScored.
+  - name: stage
+    description: Название стадии из источника.
+  - name: _catalog_batch_id
+    description: Идентификатор успешно опубликованного catalog batch.
